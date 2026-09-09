@@ -133,6 +133,35 @@ def frame_offset_candidates(frames: dict, word: int = 8) -> list:
     return out
 
 
+def match_frame_candidate(offset: int, candidates: list, word: int = 8):
+    """Match a dynamically-recovered control offset to a static stack-buffer prediction,
+    allowing one saved-frame-pointer word of slack. ABIs that save the frame pointer and
+    return address as a pair below the locals (aarch64 stp x29,x30; and similar) put the
+    controllable return address a word past the buffer's distance to the frame base, which
+    x86-64's Ghidra offsets already fold in. Returns (candidate, fp_slack) or (None, 0)."""
+    for c in candidates:
+        for slack in (0, word):
+            if c["offset"] + slack == offset:
+                return c, slack
+    return None, 0
+
+
+def seed_offsets(candidates: list, word: int = 8, cap=None):
+    """Offsets to try for static-seeded confirmation: each buffer's distance to the frame base
+    and that + a saved-frame-pointer word, smallest first, deduped and within `cap`.
+    Yields (offset, candidate, fp_slack)."""
+    seen, out = set(), []
+    for c in candidates:
+        for slack in (0, word):
+            o = c["offset"] + slack
+            if o in seen or (cap is not None and o + word > cap):
+                continue
+            seen.add(o)
+            out.append((o, c, slack))
+    out.sort(key=lambda t: t[0])
+    return out
+
+
 def controlled_registers(cap: dict, length: int, n: int = 4) -> dict:
     """Which general registers hold attacker-controlled (cyclic) data -> {reg: offset}."""
     out = {}

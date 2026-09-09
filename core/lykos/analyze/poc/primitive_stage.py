@@ -97,7 +97,8 @@ def primitive_stage(ctx) -> dict:
         # a cyclic PC (source "pc") is a hijack and is always trusted.
         if rec is not None and (rec[1] == "pc" or mnem in ("ret", "retq", "retn")):
             offset, source = rec
-            static_match = next((c for c in offset_candidates if c["offset"] == offset), None)
+            static_match, fp_slack = primitive.match_frame_candidate(offset, offset_candidates,
+                                                                     word)
             ctx.progress(msg=f"IP-control offset {offset} ({source}"
                              + (", matches static frame" if static_match else "") + "); confirming")
             control = primitive.control_input(offset, length)
@@ -108,27 +109,26 @@ def primitive_stage(ctx) -> dict:
                     "static_offset": static_match, "static_candidates": offset_candidates}
             extra = f"instruction-pointer control at offset {offset}"
             if static_match:
+                fp = " + saved frame pointer" if fp_slack else " + saved frame"
                 extra += (f"; corroborated by static stack frame -- {static_match['size']}-byte "
-                          f"buffer {static_match['buffer']} + saved frame = offset "
-                          f"{static_match['offset']}")
+                          f"buffer {static_match['buffer']}{fp} = offset {offset}")
             return _finalize(ctx, target, target_bytes, mode, base_argv, cap0, control,
                              prim, confirmed, extra)
 
         # 1b) static-seeded IP control -- the dynamic slot heuristic did not pin an offset, but
         # recovered stack buffers predict where the return address is; try each prediction
         # directly (a confirmed PC==MARKER is proof, discovered from the static frame).
-        for c in offset_candidates:
-            if c["offset"] + word > length:
-                continue
-            control = primitive.control_input(c["offset"], length)
+        for off, c, fp_slack in primitive.seed_offsets(offset_candidates, word, length):
+            control = primitive.control_input(off, length)
             if primitive.marker_confirmed(capture(control)):
-                ctx.progress(msg=f"static-frame IP-control offset {c['offset']} confirmed")
-                prim = {"type": "instruction-pointer-control", "offset": c["offset"],
+                ctx.progress(msg=f"static-frame IP-control offset {off} confirmed")
+                fp = " + saved frame pointer" if fp_slack else ""
+                prim = {"type": "instruction-pointer-control", "offset": off,
                         "source": "static-frame", "marker": primitive.MARKER,
                         "observed_pc": cap0.get("pc", 0), "confirmed": True, "registers": regs,
                         "static_offset": c, "static_candidates": offset_candidates}
-                extra = (f"instruction-pointer control at offset {c['offset']}, predicted from "
-                         f"the recovered {c['size']}-byte stack buffer {c['buffer']} "
+                extra = (f"instruction-pointer control at offset {off}, predicted from the "
+                         f"recovered {c['size']}-byte stack buffer {c['buffer']}{fp} "
                          f"(static RE seeded the dynamic confirmation)")
                 return _finalize(ctx, target, target_bytes, mode, base_argv, cap0, control,
                                  prim, True, extra)

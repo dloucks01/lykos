@@ -268,3 +268,22 @@ def test_frame_offset_candidates_predicts_ip_offset_from_ghidra_coords():
     fb = P.frame_offset_candidates({"0x1": {"vars": [
         {"name": "b", "offset": -40, "size": 32, "is_buffer": True}]}}, 8)
     assert fb[0]["offset"] == 48
+
+
+def test_match_frame_candidate_tolerates_saved_frame_pointer():
+    """aarch64/FP-pair ABIs put the return address one word past the buffer distance that
+    Ghidra reports; the match allows that saved-frame-pointer slack."""
+    cands = [{"offset": 128, "buffer": "acStack_80", "size": 128, "function_addr": "0x8e4"},
+             {"offset": 64, "buffer": "local_40", "size": 64, "function_addr": "0x8a0"}]
+    # exact match (x86-64-style)
+    c, slack = P.match_frame_candidate(64, cands, 8)
+    assert c["buffer"] == "local_40" and slack == 0
+    # +word match (aarch64: 128 + saved FP = 136)
+    c, slack = P.match_frame_candidate(136, cands, 8)
+    assert c["buffer"] == "acStack_80" and slack == 8
+    # no match
+    assert P.match_frame_candidate(999, cands, 8) == (None, 0)
+    # seed_offsets enumerates dist and dist+word, smallest first, deduped
+    seeds = [o for o, _c, _s in P.seed_offsets(cands, 8, cap=4096)]
+    assert 64 in seeds and 72 in seeds and 128 in seeds and 136 in seeds
+    assert seeds == sorted(seeds)
