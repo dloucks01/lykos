@@ -24,3 +24,4 @@ busybox_s390x	s390x	ELF	C	2146952	busybox real-world static stripped
 busybox_sparc	sparc	ELF	C	1177656	busybox real-world static stripped
 busybox_x86-64	x86-64	ELF	C	1131168	busybox real-world static stripped
 vuln_aarch64	aarch64	ELF	C	110576	O0 static-pie stack-overflow (musl cross)
+vuln_mipsel	mipsel	ELF	C	82412	O0 static-pie stack-overflow (musl cross, LE MIPS32)

@@ -19,6 +19,15 @@ TOOL = "primitive"
 TOOL_VERSION = "primitive-1"
 
 
+def _slack_txt(slack):
+    """Describe how the confirmed offset sits relative to the recovered buffer's frame base."""
+    if slack > 0:
+        return " + saved frame pointer"
+    if slack < 0:
+        return " - saved register slot"
+    return " + saved frame"
+
+
 def _hydrate_frames(ctx, target_id):
     """Recovered stack frames per function addr (empty if the target wasn't disassembled)."""
     fdao = FunctionDAO(ctx.conn)
@@ -101,17 +110,17 @@ def primitive_stage(ctx) -> dict:
                                                                      word)
             ctx.progress(msg=f"IP-control offset {offset} ({source}"
                              + (", matches static frame" if static_match else "") + "); confirming")
-            control = primitive.control_input(offset, length)
-            confirmed = primitive.marker_confirmed(capture(control))
+            control = primitive.control_input(offset, length, word)
+            confirmed = primitive.marker_confirmed(capture(control), word)
             prim = {"type": "instruction-pointer-control", "offset": offset, "source": source,
-                    "marker": primitive.MARKER, "observed_pc": cap0.get("pc", 0),
+                    "marker": primitive._ip_marker(word), "observed_pc": cap0.get("pc", 0),
                     "confirmed": confirmed, "registers": regs,
                     "static_offset": static_match, "static_candidates": offset_candidates}
             extra = f"instruction-pointer control at offset {offset}"
             if static_match:
-                fp = " + saved frame pointer" if fp_slack else " + saved frame"
-                extra += (f"; corroborated by static stack frame -- {static_match['size']}-byte "
-                          f"buffer {static_match['buffer']}{fp} = offset {offset}")
+                extra += (f"; corroborated by static stack frame -- {static_match['size']}-byte"
+                          f" buffer {static_match['buffer']}{_slack_txt(fp_slack)}"
+                          f" = offset {offset}")
             return _finalize(ctx, target, target_bytes, mode, base_argv, cap0, control,
                              prim, confirmed, extra)
 
@@ -119,17 +128,16 @@ def primitive_stage(ctx) -> dict:
         # recovered stack buffers predict where the return address is; try each prediction
         # directly (a confirmed PC==MARKER is proof, discovered from the static frame).
         for off, c, fp_slack in primitive.seed_offsets(offset_candidates, word, length):
-            control = primitive.control_input(off, length)
-            if primitive.marker_confirmed(capture(control)):
+            control = primitive.control_input(off, length, word)
+            if primitive.marker_confirmed(capture(control), word):
                 ctx.progress(msg=f"static-frame IP-control offset {off} confirmed")
-                fp = " + saved frame pointer" if fp_slack else ""
                 prim = {"type": "instruction-pointer-control", "offset": off,
-                        "source": "static-frame", "marker": primitive.MARKER,
+                        "source": "static-frame", "marker": primitive._ip_marker(word),
                         "observed_pc": cap0.get("pc", 0), "confirmed": True, "registers": regs,
                         "static_offset": c, "static_candidates": offset_candidates}
                 extra = (f"instruction-pointer control at offset {off}, predicted from the "
-                         f"recovered {c['size']}-byte stack buffer {c['buffer']}{fp} "
-                         f"(static RE seeded the dynamic confirmation)")
+                         f"recovered {c['size']}-byte stack buffer {c['buffer']}"
+                         f"{_slack_txt(fp_slack)} (static RE seeded the dynamic confirmation)")
                 return _finalize(ctx, target, target_bytes, mode, base_argv, cap0, control,
                                  prim, True, extra)
 
