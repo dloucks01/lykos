@@ -147,6 +147,9 @@ tbody tr:hover{background:var(--surface-2)}
 .smedge{stroke:var(--border-strong);stroke-width:1.6}
 .smarrow{fill:var(--border-strong)}
 .smcount{fill:var(--faint);font-size:9px;font-family:var(--mono);text-anchor:middle}
+.smtaint{stroke:var(--danger);stroke-width:2;stroke-dasharray:5 3}
+.smarrowT{fill:var(--danger)}
+.smtaintlbl{fill:var(--danger);font-size:9.5px;font-family:var(--mono);font-weight:700;text-anchor:middle}
 .smnode{cursor:pointer}
 .smnode rect{fill:var(--surface-2);stroke:var(--border-strong);stroke-width:1.2}
 .smnode:hover rect{stroke:var(--accent)}
@@ -469,9 +472,13 @@ function renderSystemMap(){
   const el=document.getElementById("sysmap"); if(!el) return;
   const nodes=SYSMAP.nodes||[], edges=SYSMAP.edges||[];
   const name={}; nodes.forEach(n=>name[n.id]=n.filename);
+  const taintN=edges.filter(e=>e.kind==="taint").length;
   const head=`<div class="cardhead" style="margin-bottom:10px">
-      <span class="eyebrow">Component graph — ${nodes.length} components · ${edges.length} links</span>
-      <button class="btn sm" onclick="loadSystemMap(true)">↻ Re-resolve links</button></div>`;
+      <span class="eyebrow">Component graph — ${nodes.length} components · ${edges.length} links${taintN?` · <span style="color:var(--danger)">${taintN} cross-taint</span>`:''}</span>
+      <span style="display:flex;gap:6px">
+        <button class="btn sm" onclick="loadSystemMap(true)">↻ Re-resolve links</button>
+        <button class="btn sm" id="xtaintbtn" onclick="doCrossTaint()" title="Propagate taint across resolved edges: source in A → sink in B">Analyze cross-binary taint</button>
+      </span></div>`;
   if(!nodes.length){ el.innerHTML=`<div class="card">${head}<div class="empty">No components yet. Upload the program and its shared libraries (or a firmware's carved parts) to this case, then re-resolve.</div></div>`; return; }
   // circular layout
   const W=760,H=Math.max(300,Math.min(520,180+nodes.length*40)),cx=W/2,cy=H/2;
@@ -480,9 +487,14 @@ function renderSystemMap(){
   nodes.forEach((n,i)=>{ const a=-Math.PI/2+i*2*Math.PI/nodes.length;
     pos[n.id]={x:cx+R*Math.cos(a),y:cy+R*Math.sin(a)}; });
   const line=edges.map(e=>{const s=pos[e.src],d=pos[e.dst]; if(!s||!d)return"";
-    const mx=(s.x+d.x)/2,my=(s.y+d.y)/2; const cnt=(e.symbols||[]).length;
-    const lbl=cnt?`<text x="${mx}" y="${my-3}" class="smcount">${cnt} sym${cnt>1?'s':''}</text>`:"";
-    return `<line x1="${s.x}" y1="${s.y}" x2="${d.x}" y2="${d.y}" class="smedge" marker-end="url(#arrow)"/>${lbl}`;
+    const taint=e.kind==="taint";
+    // taint edges bow slightly so they don't hide under the dynamic-link line
+    const mx=(s.x+d.x)/2+(taint?18:0),my=(s.y+d.y)/2; const cnt=(e.symbols||[]).length;
+    const lbl=taint?`<text x="${mx}" y="${my-3}" class="smtaintlbl">⚡ ${esc(e.symbol||'taint')}</text>`
+             :(cnt?`<text x="${mx}" y="${my-3}" class="smcount">${cnt} sym${cnt>1?'s':''}</text>`:"");
+    const cls=taint?"smedge smtaint":"smedge";
+    const mk=taint?"url(#arrowT)":"url(#arrow)";
+    return `<line x1="${s.x}" y1="${s.y}" x2="${d.x}" y2="${d.y}" class="${cls}" marker-end="${mk}"/>${lbl}`;
   }).join("");
   const box=nodes.map(n=>{const p=pos[n.id];const w=150,h=46;
     return `<g class="smnode" onclick="openComponent('${n.id}')">
@@ -491,21 +503,37 @@ function renderSystemMap(){
       <text x="${p.x}" y="${p.y+12}" class="smmeta">${esc(n.arch||'?')} · ${n.findings||0} findings</text></g>`;
   }).join("");
   const svg=`<svg viewBox="0 0 ${W} ${H}" class="smsvg" preserveAspectRatio="xMidYMid meet">
-    <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-      <path d="M0,0 L10,5 L0,10 z" class="smarrow"/></marker></defs>${line}${box}</svg>`;
+    <defs>
+      <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="smarrow"/></marker>
+      <marker id="arrowT" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="smarrowT"/></marker>
+    </defs>${line}${box}</svg>`;
+  const kindCell=e=> e.kind==="taint"
+      ? `<span class="sev high" style="font-size:9px">cross-taint</span>`
+      : `<span class="mono" style="font-size:11px">${esc(e.kind)}</span>`;
+  const symCell=e=> e.kind==="taint"
+      ? esc(e.symbol||'')+`<span class="mono" style="color:var(--danger)"> ⚡ source→sink</span>`
+      : esc((e.symbols||[]).slice(0,6).join(', '))||'—';
+  const ord=[...edges].sort((a,b)=>(a.kind==="taint"?-1:0)-(b.kind==="taint"?-1:0));
   const rows = edges.length ? `<table><thead><tr><th>Importer</th><th></th><th>Exporter</th>
-      <th>Kind</th><th>Resolved symbols</th></tr></thead><tbody>
-    ${edges.map(e=>`<tr><td class="mono">${esc(name[e.src]||e.src.slice(0,8))}</td>
+      <th>Kind</th><th>Symbols</th></tr></thead><tbody>
+    ${ord.map(e=>`<tr><td class="mono">${esc(name[e.src]||e.src.slice(0,8))}</td>
       <td style="color:var(--accent)">→</td>
       <td class="mono">${esc(name[e.dst]||e.dst.slice(0,8))}</td>
-      <td class="mono" style="font-size:11px">${esc(e.kind)}</td>
-      <td class="mono" style="font-size:11px;color:var(--dim)">${esc((e.symbols||[]).slice(0,6).join(', '))||'—'}</td></tr>`).join('')}
+      <td>${kindCell(e)}</td>
+      <td class="mono" style="font-size:11px;color:var(--dim)">${symCell(e)}</td></tr>`).join('')}
     </tbody></table>` : `<div class="empty" style="padding:20px">No cross-binary links resolved. Components share no imported/exported symbols in this case.</div>`;
   el.innerHTML=`<div class="card">${head}<div class="smwrap">${svg}</div></div>
     <div class="card"><div class="cardhead"><span class="eyebrow">Resolved edges</span></div>${rows}</div>`;
 }
 function openComponent(tid){ switchView('wb'); showDetail(tid);
   const dc=document.getElementById('detailcard'); if(dc) dc.scrollIntoView({behavior:'smooth'}); }
+async function doCrossTaint(){
+  const b=document.getElementById("xtaintbtn"); if(b){ b.disabled=true; b.textContent="analyzing…"; }
+  try{
+    await fetch("/runs",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({case_id:CUR,stage:"cross_taint"})});
+  }catch(e){}
+}
 
 let PENDING=null;
 function onUpload(e){
@@ -818,6 +846,8 @@ function openWS(id){
       loadPocs(DETAIL_TID); loadFindings(DETAIL_TID);
     }
     if(e.type==="poc.done" && DETAIL_TID){ loadPocs(DETAIL_TID); loadFindings(DETAIL_TID); }
+    if((e.type==="cross_taint.done"||e.type==="link.done") && BOARD_VIEW==="sysmap"){ loadSystemMap(false); }
+    if(e.type==="cross_taint.done" && e.payload){ logline("xtaint","",`${e.payload.cross_findings} cross-component finding(s)`); }
   };
   WS.onclose = ()=> logline("ws","","disconnected");
 }
@@ -845,6 +875,7 @@ function ACTIONS(){ return [
     {label:"Open System Map", hint:"3", run:()=>switchView("sysmap")},
     {label:"Open Report builder", hint:"4", run:()=>switchView("report")},
     {label:"Resolve component links", run:()=>{switchView("sysmap");loadSystemMap(true);}},
+    {label:"Analyze cross-binary taint", run:()=>{switchView("sysmap");doCrossTaint();}},
     {label:"Open HTML report ↗", run:()=>window.open(reportURL("html",true),"_blank")},
     {label:"Download PDF report", run:()=>dl(reportURL("pdf",true))},
     {label:"Download SARIF export", run:()=>dl(reportURL("sarif",true))},

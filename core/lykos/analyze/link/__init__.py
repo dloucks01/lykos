@@ -4,10 +4,19 @@ Resolves each component's imports against every other component's exports to bui
 merged system graph spanning the case's binaries (Karonte's Binary Dependency Graph
 pattern, deterministic, zero-AI). Importing registers the `link_case` stage.
 """
+from .crosstaint import cross_taint_case  # noqa: F401
 from .resolve import resolve_case, symbol_resolution  # noqa: F401
-from .stage import LINK_STAGE, enqueue_link, link_case_stage  # noqa: F401
+from .stage import (  # noqa: F401
+    CROSS_TAINT_STAGE,
+    LINK_STAGE,
+    enqueue_cross_taint,
+    enqueue_link,
+    link_case_stage,
+)
 from .stage import register as _register
+from .stage import register_cross_taint as _register_ct
 
 
 def register() -> None:
     _register()
+    _register_ct()
