@@ -144,3 +144,35 @@ def test_unsupported_arch_reported_not_crashed(monkeypatch, tmp_path):
     exe = _mini_elf(tmp_path / "x", 0xB7)
     res = sandbox.run(str(exe), arch="aarch64", host="x86-64")
     assert res.isolation == "unsupported-arch" and not res.crashed and "qemu" in (res.note or "")
+
+
+# a file-parsing target: reads argv[1] as a file; overflows a 64-byte buffer on a big length
+_FILE_PARSER = (
+    "#include <stdio.h>\n#include <string.h>\n"
+    "int main(int c,char**v){ if(c<2) return 1; FILE*f=fopen(v[1],\"rb\"); if(!f) return 1;\n"
+    "  char m[4]; if(fread(m,1,4,f)!=4){fclose(f);return 0;} if(memcmp(m,\"IMG\",3)!=0){fclose(f);return 0;}\n"
+    "  unsigned len=0; fread(&len,4,1,f); char buf[64]; fread(buf,1,len,f); fclose(f); return 0; }\n")
+
+
+def test_dynamic_stage_file_input_mode(store, case, pool, gcc, tmp_path):
+    """dynamic_run must deliver a FILE input (write it, pass its path as argv) -- a document/
+    image parser is invoked that way. Regression: file mode was silently ignored."""
+    import base64
+
+    from lykos.analyze.ingest import ingest
+    src = tmp_path / "fp.c"; src.write_text(_FILE_PARSER)
+    exe = tmp_path / "fp"
+    if subprocess.run([gcc, "-O0", "-fno-stack-protector", "-no-pie", "-w", str(src),
+                       "-o", str(exe)], capture_output=True).returncode != 0:
+        pytest.skip("build failed")
+    target = ingest(store, case.id, exe, filename="fp")
+    q = JobQueue(store.conn)
+    good = b"IMG\x00" + (8).to_bytes(4, "little") + b"A" * 8        # valid -> no crash
+    bad = b"IMG\x00" + (300).to_bytes(4, "little") + b"A" * 300     # oversized -> overflow
+    for data, want_crash in ((good, False), (bad, True)):
+        run = enqueue_dynamic(q, target, params={
+            "input_mode": "file", "input_b64": base64.b64encode(data).decode(), "timeout": 5})
+        assert pool.wait_idle(20) and q.runs.get(run.id).status == "done"
+    drs = DynResultDAO(store.conn).list_by_target(target.id)
+    assert any(d.crashed and d.signal_name == "SIGSEGV" for d in drs)   # bad file crashed
+    assert any(not d.crashed for d in drs)                             # good file did not
