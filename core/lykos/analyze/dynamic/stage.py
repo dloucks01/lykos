@@ -71,7 +71,8 @@ def dynamic_stage(ctx) -> dict:
     os.chmod(exe, 0o755)
 
     ctx.progress(msg="detonating in sandbox")
-    res = sandbox.run(exe, argv=argv, stdin=stdin, timeout=timeout, arch=target.arch)
+    res = sandbox.run(exe, argv=argv, stdin=stdin, timeout=timeout, arch=target.arch,
+                      endianness=target.endianness, bits=target.bits)
 
     stdout_sha = ctx.put_artifact("dyn-stdout", data=res.stdout) if res.stdout else None
     stderr_sha = ctx.put_artifact("dyn-stderr", data=res.stderr) if res.stderr else None

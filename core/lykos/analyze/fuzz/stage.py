@@ -60,7 +60,8 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
     ctx.progress(msg=f"{event_prefix} campaign")
     while execs < max_execs and time.time() < deadline and not ctx.should_cancel():
         data = mut.mutate(rng.choice(corpus), corpus)
-        argv, res = run_fn(exe, mode, workfile, exec_timeout, target.arch, data)
+        argv, res = run_fn(exe, mode, workfile, exec_timeout, target.arch, data,
+                              endianness=target.endianness, bits=target.bits)
         execs += 1
         if res.crashed:
             crashes += 1
@@ -70,7 +71,8 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
                 sig = res.signal_name
 
                 def _same(d, _sig=sig):
-                    r = run_fn(exe, mode, workfile, exec_timeout, target.arch, d)[1]
+                    r = run_fn(exe, mode, workfile, exec_timeout, target.arch, d,
+                              endianness=target.endianness, bits=target.bits)[1]
                     return r.crashed and r.signal_name == _sig
 
                 budget = min(200, max(20, max_execs - execs))

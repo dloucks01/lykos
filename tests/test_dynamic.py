@@ -95,3 +95,52 @@ def test_dynamic_stage_clean_no_confirmed(store, case, pool, bins):
     assert dr and not dr[0].crashed
     assert not [f for f in FindingDAO(store.conn).list_by_target(target.id)
                 if f.state == "confirmed"]
+
+
+# ----------------------------------------------------- multi-architecture (qemu-user)
+def test_qemu_routing_honours_endianness_and_bits(monkeypatch):
+    """The ELF arch name is endianness/bit blind, so the sandbox must route little-endian
+    MIPS/PPC64 and RISC-V/S390 to the right qemu-user binary (regression: riscv/s390 were
+    unmapped and LE targets got the big-endian emulator)."""
+    seen = {}
+    monkeypatch.setattr(sandbox.shutil, "which", lambda name: seen.setdefault("q", name))
+    def q(arch, endianness=None, bits=None):
+        seen.clear(); sandbox._qemu_for(arch, endianness, bits); return seen.get("q")
+    assert q("mips", "little") == "qemu-mipsel" and q("mips", "big") == "qemu-mips"
+    assert q("ppc64", "little") == "qemu-ppc64le" and q("ppc64", "big") == "qemu-ppc64"
+    assert q("riscv", bits=64) == "qemu-riscv64" and q("riscv", bits=32) == "qemu-riscv32"
+    assert q("s390") == "qemu-s390x" and q("aarch64") == "qemu-aarch64"
+    assert sandbox._qemu_for("made-up-arch") is None      # unknown -> None, not a crash
+
+
+def _mini_elf(path, e_machine, code=b"\x00\x00\x00\x00", little=True):
+    import struct
+    base, ehsz, phsz = 0x400000, 64, 56
+    entry = base + ehsz + phsz
+    filesz = ehsz + phsz + len(code)
+    ident = b"\x7fELF" + bytes([2, 1 if little else 2, 1, 0, 0]) + b"\x00" * 7
+    eh = ident + struct.pack("<HHIQQQIHHHHHH", 2, e_machine, 1, entry, ehsz, 0, 0,
+                             ehsz, phsz, 1, 0, 0, 0)
+    ph = struct.pack("<IIQQQQQQ", 1, 7, 0, base, base, filesz, filesz, 0x1000)
+    path.write_bytes(eh + ph + code)
+    path.chmod(0o755)
+    return path
+
+
+def test_cross_arch_execution_detects_crash(tmp_path):
+    """Run a foreign-arch (aarch64) binary that executes an illegal instruction, under
+    qemu-user, and confirm the sandbox detects the crash -- proving cross-arch dynamic
+    analysis works end to end (exe staged under /tmp, as the real pipeline does)."""
+    if sandbox.host_arch() == "aarch64" or not sandbox._qemu_for("aarch64"):
+        pytest.skip("needs a non-aarch64 host with qemu-aarch64")
+    exe = _mini_elf(tmp_path / "crash_aarch64", 0xB7)     # EM_AARCH64; 0x00000000 = UDF -> SIGILL
+    res = sandbox.run(str(exe), arch="aarch64", endianness="little", bits=64, timeout=3)
+    assert "qemu" in res.isolation                        # emulated, not native
+    assert res.crashed and res.signal_name == "SIGILL"    # crash detected through emulation
+
+
+def test_unsupported_arch_reported_not_crashed(monkeypatch, tmp_path):
+    monkeypatch.setattr(sandbox.shutil, "which", lambda name: None)   # no qemu at all
+    exe = _mini_elf(tmp_path / "x", 0xB7)
+    res = sandbox.run(str(exe), arch="aarch64", host="x86-64")
+    assert res.isolation == "unsupported-arch" and not res.crashed and "qemu" in (res.note or "")

@@ -1130,10 +1130,10 @@ function renderCodeViewer(){
       <div class="cvname"><b>${esc(f.name||("sub_"+f.addr))}</b>
         <span class="mono" style="color:var(--faint)">${f.addr} · ${f.blocks||blocks.length} blk · ${f.edges||0} edges</span></div></div>
     <div class="cvbody">
-      <div class="cvpane"><div class="cvplabel">Pseudocode</div>
-        <pre class="cvcode">${esc(f.decompiled||"(no decompilation — run Decompile)")}</pre></div>
       <div class="cvpane"><div class="cvplabel">CFG (${blocks.length} blocks · ${f.edges||0} edges)</div>
         <div class="cvcfg">${renderCFGGraph(blocks)}</div></div>
+      <div class="cvpane"><div class="cvplabel">Pseudocode</div>
+        <pre class="cvcode">${esc(f.decompiled||"(no decompilation — run Decompile)")}</pre></div>
     </div>
     <div class="cvcalls"><span class="cvplabel" style="padding:0;margin-right:2px">Calls</span>${calls}</div>`;
 }

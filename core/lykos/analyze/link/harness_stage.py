@@ -56,7 +56,7 @@ def boundary_fuzz_stage(ctx) -> dict:
 
     readiness = float(p.get("readiness", 1.0))
 
-    def run_fn(exe, mode, workfile, timeout, arch, data):
+    def run_fn(exe, mode, workfile, timeout, arch, data, *, endianness=None, bits=None):
         res = channel_run(exe, family, key, data, timeout=timeout, arch=arch,
                           readiness=readiness)
         return [], res
