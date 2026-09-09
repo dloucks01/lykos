@@ -23,6 +23,13 @@ _ALPHA = b"abcdefghijklmnopqrstuvwxyz"
 # a canonical (< 2**47) sentinel address, so `ret` loads it and the fetch faults *at* it,
 # making PC==MARKER definitive proof of control. Reads as "1337c0de1337".
 MARKER = 0x1337C0DE1337
+# 32-bit targets truncate a 48-bit PC, so IP control on i386/arm/mips uses a 4-byte sentinel
+# (an unmapped user address, so the fetch faults at it). Reads as "1337c0de".
+MARKER32 = 0x1337C0DE
+
+
+def _ip_marker(word: int) -> int:
+    return MARKER if word >= 8 else MARKER32
 
 
 def cyclic(length: int, n: int = 4, alphabet: bytes = _ALPHA) -> bytes:
@@ -112,8 +119,7 @@ def frame_offset_candidates(frames: dict, word: int = 8) -> list:
     Returns candidates sorted by offset (smallest/tightest first), deduped by offset:
     [{offset, buffer, size, function_addr}].
     """
-    out, seen = [], set()
-    raw = []
+    by_off = {}
     for addr, fr in (frames or {}).items():
         ret = fr.get("ret_offset")
         for v in (fr.get("vars") or []):
@@ -123,14 +129,14 @@ def frame_offset_candidates(frames: dict, word: int = 8) -> list:
             dist = (ret - o) if ret is not None else (abs(o) + word)
             if dist <= 0:
                 continue
-            raw.append({"offset": dist, "buffer": v.get("name"), "size": v.get("size"),
-                        "function_addr": addr})
-    for c in sorted(raw, key=lambda c: c["offset"]):
-        if c["offset"] in seen:
-            continue
-        seen.add(c["offset"])
-        out.append(c)
-    return out
+            cand = {"offset": dist, "buffer": v.get("name"), "size": v.get("size"),
+                    "function_addr": addr}
+            # when several buffers predict the same offset, keep the largest (the plausible
+            # overflow target, not a coincidental small local at the same frame distance)
+            cur = by_off.get(dist)
+            if cur is None or (cand["size"] or 0) > (cur["size"] or 0):
+                by_off[dist] = cand
+    return sorted(by_off.values(), key=lambda c: c["offset"])
 
 
 def match_frame_candidate(offset: int, candidates: list, word: int = 8):
@@ -138,23 +144,32 @@ def match_frame_candidate(offset: int, candidates: list, word: int = 8):
     allowing one saved-frame-pointer word of slack. ABIs that save the frame pointer and
     return address as a pair below the locals (aarch64 stp x29,x30; and similar) put the
     controllable return address a word past the buffer's distance to the frame base, which
-    x86-64's Ghidra offsets already fold in. Returns (candidate, fp_slack) or (None, 0)."""
+    x86-64's Ghidra offsets already fold in. The saved slot can be a word above (aarch64
+    stp x29,x30) or below (mips saves $ra a word under Ghidra's frame base), so we allow
+    +/- one word of slack. Among candidates within a word, prefer the largest buffer and then
+    the closest -- a linear overflow that reaches the return address came through the biggest
+    buffer at that frame distance, not a coincidental small local that happens to land at the
+    same offset. Returns (candidate, slack) or (None, 0)."""
+    best, best_key, best_slack = None, None, 0
     for c in candidates:
-        for slack in (0, word):
-            if c["offset"] + slack == offset:
-                return c, slack
-    return None, 0
+        d = offset - c["offset"]
+        if abs(d) <= word:
+            key = (-int(c.get("size") or 0), abs(d))     # largest buffer first, then closest
+            if best is None or key < best_key:
+                best, best_key, best_slack = c, key, d
+    return (best, best_slack) if best is not None else (None, 0)
 
 
 def seed_offsets(candidates: list, word: int = 8, cap=None):
     """Offsets to try for static-seeded confirmation: each buffer's distance to the frame base
-    and that + a saved-frame-pointer word, smallest first, deduped and within `cap`.
-    Yields (offset, candidate, fp_slack)."""
+    and that +/- a saved-register word (the return-address slot sits within a word of the
+    frame base across ABIs), smallest first, deduped and within `cap`.
+    Yields (offset, candidate, slack)."""
     seen, out = set(), []
     for c in candidates:
-        for slack in (0, word):
+        for slack in (0, word, -word):
             o = c["offset"] + slack
-            if o in seen or (cap is not None and o + word > cap):
+            if o <= 0 or o in seen or (cap is not None and o + word > cap):
                 continue
             seen.add(o)
             out.append((o, c, slack))
@@ -174,22 +189,25 @@ def controlled_registers(cap: dict, length: int, n: int = 4) -> dict:
     return out
 
 
-def control_input(offset: int, length: int) -> bytes:
-    """cyclic filler up to `offset`, the sentinel at the control slot, padding to `length`."""
+def control_input(offset: int, length: int, word: int = 8) -> bytes:
+    """cyclic filler up to `offset`, the sentinel at the control slot, padding to `length`.
+    `word` is the pointer size: an 8-byte sentinel on 64-bit, 4-byte on 32-bit targets."""
     body = bytearray(cyclic(offset))
-    body += struct.pack("<Q", MARKER)
+    body += struct.pack("<Q", MARKER) if word >= 8 else struct.pack("<I", MARKER32)
     if len(body) < length:
         body += b"C" * (length - len(body))
     return bytes(body)
 
 
-def marker_confirmed(cap: dict) -> bool:
-    """True if the fault shows the program counter (or the SP slot) equal to the sentinel."""
-    if cap.get("pc") == MARKER:
+def marker_confirmed(cap: dict, word: int = 8) -> bool:
+    """True if the fault shows the program counter (or the SP slot) equal to the sentinel.
+    `word` selects the 64- or 32-bit sentinel (a 32-bit PC truncates the 48-bit marker)."""
+    m = _ip_marker(word)
+    if cap.get("pc") == m:
         return True
-    want = struct.pack("<Q", MARKER)
+    want = (struct.pack("<Q", MARKER) if word >= 8 else struct.pack("<I", MARKER32))
     for _rel, w in _stack_words(cap):
-        if w == want:
+        if w[:len(want)] == want:
             return True
     return False
 

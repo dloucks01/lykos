@@ -35,9 +35,14 @@ _LAYOUTS = {
                                                     ("cpsr", 4)],
     "ppc64":   [(f"r{i}", 8) for i in range(32)] + [("pc", 8), ("msr", 8)],
     "s390":    [("pswm", 8), ("pc", 8)] + [(f"r{i}", 8) for i in range(16)],
+    # MIPS32 o32: 32 GPRs then CP0 status/lo/hi/badvaddr/cause and pc (QEMU gdbstub order).
+    # $sp is r29, return address is r31 ($ra). Works big- or little-endian (see `endianness`).
+    "mips":    [(f"r{i}", 4) for i in range(32)]
+               + [("status", 4), ("lo", 4), ("hi", 4), ("badvaddr", 4), ("cause", 4), ("pc", 4)],
 }
-# which register name is the stack pointer / return-address register per ISA
-_SP = {"aarch64": "sp", "riscv": "x2", "riscv64": "x2", "arm": "sp", "ppc64": "r1"}
+# which register name is the stack pointer per ISA
+_SP = {"aarch64": "sp", "riscv": "x2", "riscv64": "x2", "arm": "sp", "ppc64": "r1",
+       "mips": "r29"}
 
 
 def supported(arch: str) -> bool:
@@ -65,16 +70,19 @@ def _txn(sock, data: str, timeout=5.0) -> str:
             return buf[st + 1:h].decode("latin-1", "ignore")
 
 
-def _parse_regs(g_hex: str, arch: str) -> dict:
+def _parse_regs(g_hex: str, arch: str, endianness=None) -> dict:
+    """Slice pc/sp/GP registers out of the g-packet. Each register's bytes are in target byte
+    order, so a big-endian target (mips BE, ppc64) must be read big-endian."""
     layout = _LAYOUTS.get(arch)
     if not layout:
         return {}
+    byteorder = "big" if endianness == "big" else "little"
     regs, pos = {}, 0
     for name, width in layout:
         h = g_hex[pos:pos + width * 2]
         pos += width * 2
         if len(h) == width * 2:
-            regs[name] = int.from_bytes(bytes.fromhex(h), "little")
+            regs[name] = int.from_bytes(bytes.fromhex(h), byteorder)
     return regs
 
 
@@ -110,7 +118,7 @@ def capture(exe, arch, *, argv=(), stdin: bytes = b"", timeout: float = 8.0,
             if sig is None:
                 return {"note": f"target exited without a fault (reply {stop[:8]!r})",
                         "arch": arch}
-            regs = _parse_regs(_txn(sock, "g", timeout=timeout), arch)
+            regs = _parse_regs(_txn(sock, "g", timeout=timeout), arch, endianness)
         finally:
             sock.close()
     finally:

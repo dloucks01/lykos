@@ -287,3 +287,38 @@ def test_match_frame_candidate_tolerates_saved_frame_pointer():
     seeds = [o for o, _c, _s in P.seed_offsets(cands, 8, cap=4096)]
     assert 64 in seeds and 72 in seeds and 128 in seeds and 136 in seeds
     assert seeds == sorted(seeds)
+
+
+def test_word_aware_ip_sentinel_for_32bit():
+    """32-bit targets truncate the 48-bit marker, so IP control uses a 4-byte sentinel."""
+    inp = P.control_input(132, 300, word=4)
+    assert inp[132:136] == struct.pack("<I", P.MARKER32) and len(inp) == 300
+    assert P.marker_confirmed({"pc": P.MARKER32, "stack": "", "stack_base": 0, "sp": 0}, word=4)
+    assert not P.marker_confirmed({"pc": P.MARKER, "stack": "", "stack_base": 0, "sp": 0}, word=4)
+    # 64-bit path unchanged
+    assert P.control_input(72, 256)[72:80] == struct.pack("<Q", P.MARKER)
+
+
+def test_match_frame_candidate_slack_both_directions():
+    """The return-address slot sits within a word of the frame base either way: aarch64 +word,
+    mips -word."""
+    cands = [{"offset": 136, "buffer": "acStack_88", "size": 128, "function_addr": "0x1"}]
+    assert P.match_frame_candidate(136, cands, 4)[1] == 0      # exact
+    assert P.match_frame_candidate(140, cands, 4)[1] == 4      # +word (aarch64-like)
+    assert P.match_frame_candidate(132, cands, 4)[1] == -4     # -word (mips)
+    assert P.match_frame_candidate(200, cands, 4) == (None, 0)
+    seeds = [o for o, _c, _s in P.seed_offsets(cands, 4, cap=4096)]
+    assert {132, 136, 140}.issubset(set(seeds))
+
+
+def test_match_frame_candidate_prefers_largest_overflow_target():
+    """With ±word slack and several buffers, the big buffer is the plausible overflow source
+    even when a small local matches exactly (a 12-byte local doesn't take a 200-byte overflow)."""
+    cands = [{"offset": 132, "buffer": "small", "size": 12, "function_addr": "0x1"},
+             {"offset": 136, "buffer": "big", "size": 128, "function_addr": "0x2"}]
+    # offset 132 is exact for small but -4 from big; the larger buffer still wins
+    c, slack = P.match_frame_candidate(132, cands, 4)
+    assert c["buffer"] == "big" and slack == -4
+    # only the small buffer is within a word -> it is chosen
+    c, slack = P.match_frame_candidate(130, cands, 4)
+    assert c["buffer"] == "small"
