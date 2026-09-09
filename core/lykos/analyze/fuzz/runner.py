@@ -13,6 +13,7 @@ def invocation(mode, workfile, d: bytes):
     return [], d                                        # stdin
 
 
-def run_input(exe, mode, workfile, timeout, arch, d: bytes):
+def run_input(exe, mode, workfile, timeout, arch, d: bytes, *, endianness=None, bits=None):
     argv, stdin = invocation(mode, workfile, d)
-    return argv, sandbox.run(exe, argv=argv, stdin=stdin, timeout=timeout, arch=arch)
+    return argv, sandbox.run(exe, argv=argv, stdin=stdin, timeout=timeout, arch=arch,
+                             endianness=endianness, bits=bits)

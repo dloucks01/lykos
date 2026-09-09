@@ -17,6 +17,7 @@ import signal
 import subprocess
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 CRASH_SIGNALS = {
@@ -25,8 +26,9 @@ CRASH_SIGNALS = {
     int(signal.SIGFPE): "SIGFPE",
 }
 _QEMU = {"x86-64": "x86_64", "x86": "i386", "aarch64": "aarch64", "arm": "arm",
-         "mips": "mips", "mipsel": "mipsel", "ppc": "ppc", "ppc64": "ppc64",
-         "riscv64": "riscv64", "sparc": "sparc"}
+         "mips": "mips", "mipsel": "mipsel", "mips64": "mips64", "ppc": "ppc",
+         "ppc64": "ppc64", "riscv": "riscv64", "riscv64": "riscv64", "s390": "s390x",
+         "sparc": "sparc", "sh": "sh4", "m68k": "m68k", "loongarch": "loongarch64"}
 _HOST = {"x86_64": "x86-64", "amd64": "x86-64", "aarch64": "aarch64", "arm64": "aarch64",
          "armv7l": "arm", "mips": "mips", "ppc64": "ppc64", "ppc64le": "ppc64",
          "riscv64": "riscv64"}
@@ -74,8 +76,20 @@ def classify_rc(rc: Optional[int]):
     return False, None, None, rc
 
 
-def _qemu_for(arch: str) -> Optional[str]:
+def _qemu_for(arch, endianness=None, bits=None) -> Optional[str]:
+    """Pick the qemu-user binary for a target, honouring endianness and word size.
+
+    The ELF arch name is endianness-blind (a little-endian MIPS is still "mips") and
+    bit-blind ("riscv" for both RV32/RV64), so route those to the right qemu here -- otherwise
+    a LE-MIPS target would be handed the big-endian emulator and fail to run.
+    """
     suf = _QEMU.get(arch)
+    if arch in ("mips", "mips64") and endianness == "little":
+        suf = "mipsel" if arch == "mips" else "mips64el"
+    elif arch == "ppc64" and endianness == "little":
+        suf = "ppc64le"
+    elif arch == "riscv":
+        suf = "riscv32" if bits == 32 else "riscv64"
     return shutil.which("qemu-" + suf) if suf else None
 
 
@@ -95,13 +109,35 @@ def _bwrap_usable() -> bool:
     return ok
 
 
-def _rlimits(mem_mb: int, cpu_s: int, set_as: bool):
+_nproc_base: Optional[int] = None
+
+
+def _nproc_cap(emu: bool) -> int:
+    """A process/thread cap that bounds a fork bomb WITHOUT dropping below the machine's live
+    baseline. RLIMIT_NPROC is a per-UID count, so a fixed small value (the old 256) is below
+    the threads a loaded desktop already runs and makes every clone -- including qemu's own
+    worker threads -- fail with EAGAIN. So cap = live baseline + headroom, measured once."""
+    global _nproc_base
+    if _nproc_base is None:
+        try:
+            _nproc_base = sum(len(os.listdir(f"/proc/{p}/task"))
+                              for p in os.listdir("/proc") if p.isdigit())
+        except Exception:
+            _nproc_base = 2048
+    _, hard = resource.getrlimit(resource.RLIMIT_NPROC)
+    cap = _nproc_base + (4096 if emu else 1024)          # emulation spawns extra worker threads
+    return min(cap, hard) if hard != resource.RLIM_INFINITY else cap
+
+
+def _rlimits(mem_mb: int, cpu_s: int, set_as: bool, nproc: Optional[int] = None):
+    if nproc is None:
+        nproc = _nproc_cap(False)              # default: baseline-aware native cap
     def _apply():
         try:
             resource.setrlimit(resource.RLIMIT_CPU, (cpu_s, cpu_s + 1))
             resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
             resource.setrlimit(resource.RLIMIT_FSIZE, (64 << 20, 64 << 20))
-            resource.setrlimit(resource.RLIMIT_NPROC, (256, 256))
+            resource.setrlimit(resource.RLIMIT_NPROC, (nproc, nproc))
             if set_as:
                 lim = mem_mb << 20
                 resource.setrlimit(resource.RLIMIT_AS, (lim, lim))
@@ -144,36 +180,50 @@ def _spawn(cmd, stdin, timeout, preexec):
 
 
 def run(exe, *, argv=(), stdin: bytes = b"", timeout: float = 10.0,
-        arch: Optional[str] = None, host: Optional[str] = None, mem_mb: int = 2048,
+        arch: Optional[str] = None, endianness: Optional[str] = None,
+        bits: Optional[int] = None, host: Optional[str] = None, mem_mb: int = 2048,
         capture: int = 65536) -> RunResult:
     host = host or host_arch()
     emu = None
     if arch and host and arch != host:
-        emu = _qemu_for(arch)
+        emu = _qemu_for(arch, endianness, bits)
         if not emu:
             return RunResult(isolation="unsupported-arch",
-                             note=f"no qemu-user for {arch} on {host}")
+                             note=f"no qemu-user for {arch} ({endianness or '?'}-endian) "
+                                  f"on {host}")
 
     base = [str(exe)] + [str(a) for a in argv]
     inner = [emu] + base if emu else base
+    # emulation is several times slower than native, so give it a longer wall-clock budget or
+    # correct runs would be misreported as timeouts.
+    eff_timeout = max(timeout * 3, 5.0) if emu else timeout
     # emulated processes need a larger address space; don't cap AS then
-    preexec = _rlimits(mem_mb, int(timeout) + 2, set_as=(emu is None))
+    preexec = _rlimits(mem_mb, int(eff_timeout) + 2, set_as=(emu is None),
+                       nproc=_nproc_cap(emu is not None))
 
-    iso = "rlimits-only"
+    iso = "rlimits-only" + ("+qemu" if emu else "")
     cmd = inner
     if _bwrap_usable():
-        cmd = ["bwrap"] + _BWRAP_ARGS + inner
-        iso = "bwrap+netns"
+        # The exe is staged under /tmp, which _BWRAP_ARGS masks with a tmpfs. A native target
+        # then triggers a "bwrap:" exec error and we fall back below; but an EMULATED target
+        # runs qemu (visible) which just can't open the masked guest -> a silent no-crash. So
+        # bind the exe's scratch dir back in read-only when emulating.
+        extra = []
+        if emu:
+            exedir = str(Path(exe).resolve().parent)
+            extra = ["--ro-bind", exedir, exedir]
+        cmd = ["bwrap"] + _BWRAP_ARGS[:-1] + extra + ["--"] + inner
+        iso = ("bwrap+netns" + ("+qemu" if emu else ""))
 
-    rc, out, err, timed, dur = _spawn(cmd, stdin, timeout, preexec)
+    rc, out, err, timed, dur = _spawn(cmd, stdin, eff_timeout, preexec)
 
     # bubblewrap setup failed at runtime (some VMs rate-limit namespace creation) -> fall
     # back to rlimits-only and stop trying bwrap this session.
-    if iso == "bwrap+netns" and not timed and err.startswith(b"bwrap:"):
+    if iso.startswith("bwrap") and not timed and err.startswith(b"bwrap:"):
         global _bwrap_cache
         _bwrap_cache = False
-        cmd, iso = inner, "rlimits-only"
-        rc, out, err, timed, dur = _spawn(cmd, stdin, timeout, preexec)
+        cmd, iso = inner, "rlimits-only" + ("+qemu" if emu else "")
+        rc, out, err, timed, dur = _spawn(cmd, stdin, eff_timeout, preexec)
 
     # crash signal: native subprocess reports -signum; wrappers (bwrap) report 128+signum
     sig = None
