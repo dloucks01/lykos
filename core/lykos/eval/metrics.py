@@ -43,6 +43,29 @@ def matches(ground_truth: str, found_cwes) -> bool:
     return any(same_family(ground_truth, f) for f in found_cwes)
 
 
+def gate(metrics: dict, meta: dict, *, stage: str = "static", min_recall: float = 1.0,
+         max_fp_rate: float = 0.0, require_backend: bool = False):
+    """Release-gate decision over a scored run. Returns (passed, verdict, reason).
+
+    verdict is PASS / FAIL / SKIP. A run whose required backend is absent (static without
+    Ghidra) SKIPs rather than fails, unless `require_backend`, so a CI host lacking the backend
+    doesn't produce a false regression. Otherwise the gate FAILs if recall drops below
+    `min_recall` or the false-positive rate exceeds `max_fp_rate`.
+    """
+    o = metrics.get("overall", {})
+    recall, fp_rate = o.get("recall"), o.get("fp_rate")
+    n_positive = o.get("tp", 0) + o.get("fn", 0)
+    backend_absent = stage == "static" and not meta.get("ghidra")
+    if n_positive == 0:
+        if backend_absent and not require_backend:
+            return True, "SKIP", "static benchmark needs Ghidra (not found)"
+        return False, "FAIL", "no bad cases were scored"
+    ok = (recall is not None and recall >= min_recall
+          and (fp_rate is None or fp_rate <= max_fp_rate))
+    return ok, ("PASS" if ok else "FAIL"), (
+        f"recall {recall} (min {min_recall}), fp_rate {fp_rate} (max {max_fp_rate})")
+
+
 @dataclass
 class Outcome:
     """One scored corpus case."""

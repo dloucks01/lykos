@@ -4,7 +4,7 @@ import shutil
 import pytest
 from lykos.analyze.detect.catalog import CWE
 from lykos.eval import corpus, harness
-from lykos.eval.metrics import Outcome, Report, matches, same_family, score
+from lykos.eval.metrics import Outcome, Report, gate, matches, same_family, score
 
 # ---- a faithful miniature NIST Juliet C drop (real conventions) ----
 _STD_H = ("#ifndef STD_TESTCASE_H\n#define STD_TESTCASE_H\n#include <stdio.h>\n"
@@ -100,6 +100,28 @@ def test_micro_average_aggregates_across_classes():
     o = m["overall"]
     assert o["tp"] == 2 and o["fp"] == 1 and o["tn"] == 1 and o["fn"] == 0
     assert m["n_cwe_classes"] == 2 and m["n_cases"] == 4
+
+
+def test_release_gate_pass_fail_skip():
+    clean = score(_outs([("CWE-120", "bad", True), ("CWE-120", "good", False)]))
+    ok, verdict, _ = gate(clean, {"ghidra": "/x"})
+    assert ok and verdict == "PASS"
+    # a missed bug (recall 0.5) fails the default gate
+    regressed = score(_outs([("CWE-120", "bad", False), ("CWE-120", "bad", True)]))
+    ok, verdict, _ = gate(regressed, {"ghidra": "/x"})
+    assert not ok and verdict == "FAIL"
+    # a false positive fails when max_fp_rate is 0
+    fp = score(_outs([("CWE-120", "bad", True), ("CWE-120", "good", True)]))
+    assert gate(fp, {"ghidra": "/x"})[0] is False
+    # static run with no Ghidra and nothing scored SKIPs (not a false regression)...
+    empty = score([])
+    ok, verdict, _ = gate(empty, {"ghidra": None}, stage="static")
+    assert ok and verdict == "SKIP"
+    # ...unless the backend is required
+    ok, verdict, _ = gate(empty, {"ghidra": None}, stage="static", require_backend=True)
+    assert not ok and verdict == "FAIL"
+    # thresholds are configurable
+    assert gate(regressed, {"ghidra": "/x"}, min_recall=0.5)[0] is True
 
 
 def test_report_table_and_dict_roundtrip():
