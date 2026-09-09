@@ -85,3 +85,61 @@ def test_fuzz_clean_binary_no_crash(store, case, pool, bins):
     assert not [d for d in DynResultDAO(store.conn).list_by_target(target.id) if d.crashed]
     assert not [f for f in FindingDAO(store.conn).list_by_target(target.id)
                 if f.state == "confirmed"]
+
+
+# ---------------------------------------------------- structure-aware (format) mutation
+def test_struct_mutator_roundtrip_and_coordinates_length_with_blob():
+    import struct as _s
+
+    from lykos.analyze.fuzz import structure
+    spec = [{"type": "magic", "value": "IMG\x00"},
+            {"type": "u32", "endian": "little", "name": "len", "length_of": "data"},
+            {"type": "blob", "name": "data"}]
+    model = structure.FormatModel(spec)
+    seed = b"IMG\x00" + _s.pack("<I", 8) + b"A" * 8
+    assert model.serialize(model.parse(seed)) == seed        # parse/serialize roundtrip
+    mut = structure.StructMutator(random.Random(1337), model)
+    kept, overflow_shaped = 0, 0
+    for _ in range(300):
+        out = mut.mutate(seed)
+        if out[:4] == b"IMG\x00":
+            kept += 1
+        if len(out) >= 8:
+            length = _s.unpack("<I", out[4:8])[0]
+            if length > 64 and len(out) - 8 >= 65:            # length AND data both large
+                overflow_shaped += 1
+    assert kept > 250            # magic preserved (format gate passes) most of the time
+    assert overflow_shaped > 20  # coordinates length>buf with matching data -> the overflow
+
+
+_FILE_PARSER = (
+    "#include <stdio.h>\n#include <string.h>\n"
+    "int main(int c,char**v){ if(c<2) return 1; FILE*f=fopen(v[1],\"rb\"); if(!f) return 1;\n"
+    "  char m[4]; if(fread(m,1,4,f)!=4){fclose(f);return 0;}\n"
+    "  if(memcmp(m,\"IMG\",3)!=0){fclose(f);return 0;}\n"
+    "  unsigned len=0; fread(&len,4,1,f); char buf[64];\n"
+    "  fread(buf,1,len,f); fclose(f); return 0; }\n")
+
+
+def test_structure_aware_fuzz_finds_format_overflow(store, case, pool, gcc, tmp_path):
+    """Structure-aware mutation finds a length-driven overflow in a file parser that byte-level
+    havoc misses -- it coordinates the length field with the data size."""
+    import base64
+    import struct as _s
+    src = tmp_path / "fp.c"; src.write_text(_FILE_PARSER)
+    exe = tmp_path / "fp"
+    if subprocess.run([gcc, "-O0", "-fno-stack-protector", "-no-pie", "-w", str(src),
+                       "-o", str(exe)], capture_output=True).returncode != 0:
+        pytest.skip("build failed")
+    target = ingest(store, case.id, exe, filename="fp")
+    q = JobQueue(store.conn)
+    seed = base64.b64encode(b"IMG\x00" + _s.pack("<I", 8) + b"A" * 8).decode()
+    spec = [{"type": "magic", "value": "IMG\x00"},
+            {"type": "u32", "endian": "little", "name": "len", "length_of": "data"},
+            {"type": "blob", "name": "data"}]
+    run = enqueue_fuzz(q, target, params={
+        "input_mode": "file", "max_execs": 400, "max_seconds": 40, "exec_timeout": 1,
+        "seeds": [seed], "format": spec})
+    assert pool.wait_idle(60) and q.runs.get(run.id).status == "done"
+    crashes = [d for d in DynResultDAO(store.conn).list_by_target(target.id) if d.crashed]
+    assert crashes and crashes[0].signal_name == "SIGSEGV"    # the overflow was found

@@ -150,8 +150,10 @@ def test_unsupported_arch_reported_not_crashed(monkeypatch, tmp_path):
 _FILE_PARSER = (
     "#include <stdio.h>\n#include <string.h>\n"
     "int main(int c,char**v){ if(c<2) return 1; FILE*f=fopen(v[1],\"rb\"); if(!f) return 1;\n"
-    "  char m[4]; if(fread(m,1,4,f)!=4){fclose(f);return 0;} if(memcmp(m,\"IMG\",3)!=0){fclose(f);return 0;}\n"
-    "  unsigned len=0; fread(&len,4,1,f); char buf[64]; fread(buf,1,len,f); fclose(f); return 0; }\n")
+    "  char m[4]; if(fread(m,1,4,f)!=4){fclose(f);return 0;}\n"
+    "  if(memcmp(m,\"IMG\",3)!=0){fclose(f);return 0;}\n"
+    "  unsigned len=0; fread(&len,4,1,f); char buf[64];\n"
+    "  fread(buf,1,len,f); fclose(f); return 0; }\n")
 
 
 def test_dynamic_stage_file_input_mode(store, case, pool, gcc, tmp_path):

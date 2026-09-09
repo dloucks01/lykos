@@ -37,7 +37,8 @@ def _mine_dictionary(strings):
 
 
 def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_seconds,
-                  exec_timeout, rng, detector, event_prefix, note_prefix, run_fn=run_input):
+                  exec_timeout, rng, detector, event_prefix, note_prefix, run_fn=run_input,
+                  mutator=None):
     """Shared mutational campaign: mutate -> sandbox -> dedup-by-signal -> minimize ->
     dyn_result + Confirmed finding. Used by both the black-box `fuzz` stage and the directed
     stage (which supplies a corpus/dictionary aimed at specific sinks). Returns stats.
@@ -50,7 +51,7 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
     workfile = ctx.scratch() / "input.bin"
 
     corpus = list(corpus) or list(_DEFAULT_SEEDS)
-    mut = Mutator(rng, dictionary)
+    mut = mutator or Mutator(rng, dictionary)          # structure-aware mutator when supplied
     fd = FindingDAO(ctx.conn)
     dd = DynResultDAO(ctx.conn)
     deadline = time.time() + max_seconds
@@ -119,10 +120,32 @@ def fuzz_stage(ctx) -> dict:
 
     corpus = [base64.b64decode(x) for x in p.get("seeds", [])] or list(_DEFAULT_SEEDS)
     dictionary = _mine_dictionary(StringDAO(ctx.conn).list_by_target(target.id))
+    mutator, note = _structure_mutator(p, rng, dictionary), "found by fuzzing"
+    if mutator:
+        note = "found by structure-aware fuzzing"
+        ctx.emit("fuzz.format", payload={"model": p.get("format_name") or "custom"})
     fuzz_campaign(ctx, target, corpus=corpus, dictionary=dictionary, mode=mode,
                   max_execs=max_execs, max_seconds=max_seconds, exec_timeout=exec_timeout,
-                  rng=rng, detector="fuzz", event_prefix="fuzz", note_prefix="found by fuzzing")
+                  rng=rng, detector="fuzz", event_prefix="fuzz", note_prefix=note,
+                  mutator=mutator)
     return {}
+
+
+def _structure_mutator(p, rng, dictionary):
+    """Build a structure-aware mutator from params.format (a field spec) or params.format_name
+    (a built-in model). params.magic overrides a built-in's placeholder magic. None otherwise."""
+    from . import structure
+    model = None
+    if p.get("format"):
+        model = structure.from_spec(p["format"])
+    elif p.get("format_name"):
+        model = structure.builtin(p["format_name"])
+    if model is None:
+        return None
+    magic = p.get("magic")                             # override the model's magic (e.g. a gate)
+    if magic and model.spec and model.spec[0].get("type") == "magic":
+        model.spec[0]["value"] = base64.b64decode(magic) if p.get("magic_b64") else magic
+    return structure.StructMutator(rng, model, dictionary)
 
 
 def register() -> None:
