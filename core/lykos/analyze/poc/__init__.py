@@ -9,9 +9,12 @@ from .primitive_stage import PRIMITIVE_STAGE, enqueue_primitive  # noqa: F401
 from .primitive_stage import register as _register_prim
 from .stage import BUILD_POC_STAGE, enqueue_build_poc  # noqa: F401
 from .stage import register as _register
+from .synthesize_stage import SYNTH_STAGE, enqueue_synthesize  # noqa: F401
+from .synthesize_stage import register as _register_synth
 
 
 def register() -> None:
     _register()
     _register_prim()
     _register_exploit()
+    _register_synth()
