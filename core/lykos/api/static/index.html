@@ -212,6 +212,26 @@ tbody tr:hover{background:var(--surface-2)}
 .hint{color:var(--faint);font-size:11px;margin-bottom:6px}
 .notewarn{margin-top:8px;color:var(--warn)}
 .code{white-space:pre-wrap;max-height:200px;overflow:auto;margin-top:6px}
+.lt{color:var(--faint);font-variant-numeric:tabular-nums;margin-right:2px}
+.runrow{align-items:center}.runmeta{display:flex;gap:8px;align-items:center}
+.runtime{color:var(--faint);font-size:10.5px}
+.fsearch{width:100%;box-sizing:border-box;background:var(--surface);color:var(--text);
+  border:1px solid var(--border);border-radius:6px;padding:5px 8px;font-family:var(--mono);
+  font-size:11px;margin:6px 0}
+.frow.clk{cursor:pointer;padding:3px 4px;border-radius:5px}
+.frow.clk:hover{background:var(--surface-3)}
+.fcount{color:var(--faint);font-size:10px;margin-left:4px}
+/* ---- findings board: inline detail ---- */
+tr.frow.sel>td{background:var(--surface-3)}
+tr.fdetail>td{background:var(--surface-2);border-bottom:1px solid var(--border-strong);padding:0}
+.fdbody{padding:12px 14px}
+.fdhead{font-size:12.5px;margin-bottom:8px}
+.fdmeta{display:block;color:var(--faint);font-size:11px;margin-top:3px}
+.fdkv{display:flex;gap:10px;font-size:11.5px;padding:1px 0}
+.fdkv>span{color:var(--faint);min-width:66px}
+.evlist{display:flex;flex-direction:column;gap:4px}
+.evrow{font-size:11px;color:var(--dim);font-family:var(--mono);line-height:1.4}
+.evch{display:inline-block;min-width:96px;color:var(--teal)}
 /* ---- system map: toolbar + legend ---- */
 .smtools{display:flex;gap:6px;flex-wrap:wrap}
 .smlegend{display:flex;align-items:center;gap:16px;flex-wrap:wrap;font-size:11px;color:var(--dim);
@@ -415,11 +435,11 @@ function renderBoard(){
       <th>Sev</th><th>CWE</th><th>Finding</th><th>State</th><th>Conf</th>
       <th>Detector</th><th>Target</th><th>PoC</th></tr></thead><tbody>
     ${rows.map(x=>{
-      const st=(x.state||'candidate').replace('poc-backed','poc-backed');
       const conf=Math.round((x.confidence||0)*100);
       const ev=(x.evidence||[]).length;
       const lvl=x.poc_level?`<span class="lvl">${esc(x.poc_level)}</span>`:'';
-      return `<tr class="frow" onclick="openFinding('${x.target_id}')">
+      const sel=x.id===SEL_FINDING;
+      const row=`<tr class="frow${sel?' sel':''}" data-fid="${x.id}" onclick="toggleFindingDetail('${x.id}')">
         <td><span class="sev ${x.severity}">${esc(x.severity)}</span></td>
         <td class="mono">${esc(x.cwe||'-')}</td>
         <td><div class="ttl">${esc(x.title||'')}</div><div class="ev">${ev} evidence</div></td>
@@ -428,6 +448,7 @@ function renderBoard(){
         <td class="mono" style="font-size:11px">${esc(x.detector||'-')}</td>
         <td class="mono" style="font-size:11px">${esc(x.target_name||'-')} <span class="arch">${esc(x.target_arch||'')}</span></td>
         <td>${lvl}</td></tr>`;
+      return row + (sel?findingDetailRow(x):'');
     }).join('')}</tbody></table>` : `<div class="empty">No findings match. Run detection, fuzzing, or PoC stages on the Workbench.</div>`;
   bd.innerHTML = tilesHtml + filters + `<div class="card" style="padding:6px 8px">${body}</div>`;
   const q=document.getElementById('bq'); if(q && document.activeElement!==q){}
@@ -437,10 +458,29 @@ function boardTile(key,val){
   else { BOARD_FILTER[key] = (BOARD_FILTER[key]===val)?'':val; }
   renderBoard();
 }
-async function openFinding(tid){
-  switchView('wb');
-  await showDetail(tid);
-  const dc=document.getElementById('detailcard'); if(dc) dc.scrollIntoView({behavior:'smooth'});
+let SEL_FINDING=null;
+function toggleFindingDetail(id){
+  SEL_FINDING = (SEL_FINDING===id)?null:id;
+  renderBoard();
+  if(SEL_FINDING){ const r=document.querySelector(`tr[data-fid="${SEL_FINDING}"]`);
+    if(r) r.scrollIntoView({block:'nearest',behavior:'smooth'}); }
+}
+function findingDetailRow(x){
+  const conf=Math.round((x.confidence||0)*100);
+  const ev=(x.evidence||[]).map(e=>`<div class="evrow"><span class="evch">${esc(e.channel||'')}</span> ${esc(e.detail||'')}</div>`).join('')
+    || '<div class="hint">No evidence recorded.</div>';
+  const loc = (x.function_addr||x.site_addr)
+    ? `<span class="mono">${esc(x.function_addr||'')}${x.site_addr?(' @ '+esc(x.site_addr)):''}</span>` : '—';
+  return `<tr class="fdetail"><td colspan="8"><div class="fdbody">
+    <div class="fdhead"><b>${esc(x.cwe||'')}</b> — ${esc(x.title||'')}
+      <span class="fdmeta">${esc(x.severity)} · ${conf}% confidence · detector ${esc(x.detector||'-')} · ${esc(x.target_name||'')} <span class="arch">${esc(x.target_arch||'')}</span></span></div>
+    <div class="fdkv"><span>state</span><b><span class="st ${x.state==='poc-backed'?'pocbacked':x.state}">${esc(x.state)}</span></b></div>
+    <div class="fdkv"><span>location</span><b>${loc}</b></div>
+    ${x.poc_level?`<div class="fdkv"><span>PoC</span><b><span class="lvl">${esc(x.poc_level)}</span> verified</b></div>`:''}
+    <div class="eyebrow" style="margin:9px 0 4px">Evidence (${(x.evidence||[]).length})</div>
+    <div class="evlist">${ev}</div>
+    <div style="margin-top:10px"><button class="btn sm" onclick="event.stopPropagation();openComponent('${x.target_id}')">Open target in Workbench →</button></div>
+  </div></td></tr>`;
 }
 
 // ---- report builder ----
@@ -717,8 +757,13 @@ function mits(m){
 function renderRuns(rs){
   const el=document.getElementById("runs");
   if(!rs.length){ el.innerHTML=`<div class="empty">No runs yet.</div>`; return; }
-  el.innerHTML = rs.slice(0,12).map(r=>`<div class="kv"><span class="mono">${r.stage} · ${r.id.slice(0,8)}</span>
-     <b><span class="pill ${r.status}">${r.status}</span></b></div>`).join("");
+  el.innerHTML = rs.slice(0,14).map(r=>{
+    const t=r.ended_at||r.started_at||r.created_at;
+    const dur=(r.started_at&&r.ended_at)?` · ${Math.max(0,r.ended_at-r.started_at)}s`:"";
+    const when=t?`<span class="mono runtime" title="${new Date(t*1000).toLocaleString()}">${fmtAgo(t)}${dur}</span>`:"";
+    return `<div class="kv runrow"><span class="mono">${r.stage} <span style="color:var(--faint)">${r.id.slice(0,8)}</span></span>
+     <span class="runmeta">${when}<span class="pill ${r.status}">${r.status}</span></span></div>`;
+  }).join("");
 }
 
 async function showDetail(targetId){
@@ -950,42 +995,68 @@ async function doDetect(tid){
     body:JSON.stringify({case_id:CUR,target_id:tid,stage:"detect_cwe"})});
 }
 const SEVCOL={critical:"#e4605f",high:"#e58a4c",medium:"#e0b54f",low:"#46cabb",info:"var(--faint)"};
+const _STATEORD={candidate:0,corroborated:1,confirmed:2,"poc-backed":3};
+function _stCls(s){ return s==="poc-backed"||s==="confirmed"?"on":(s==="corroborated"?"partial":"unknown"); }
 async function loadFindings(tid){
   const el=document.getElementById("findings"); if(!el) return;
-  const fs=await api(`/targets/${tid}/findings`);
-  if(!fs.length){ el.innerHTML=""; return; }
-  el.innerHTML=`<div class="eyebrow" style="margin:6px 0">Findings (${fs.length})</div>`+
-    `<div class="sec" style="max-height:180px;overflow:auto">`+
-    fs.map(f=>{
-      const stCls = f.state==="poc-backed"?"on":(f.state==="confirmed"?"on":(f.state==="corroborated"?"partial":"unknown"));
-      return `<div style="padding:2px 0"><span style="color:${SEVCOL[f.severity]||'var(--faint)'}">${esc(f.cwe||'')}</span> `+
-        `<span class="mit ${stCls}" style="text-transform:uppercase">${esc(f.state)}</span> `+
-        `${esc(f.title||'')} <span style="color:var(--faint)">${esc(f.function_addr||f.site_addr||'')}</span></div>`;
-    }).join("")+`</div>`;
-}
-async function loadStrings(tid){
-  const el=document.getElementById("strings"); if(!el) return;
-  const ss = await api(`/targets/${tid}/strings`);
-  if(!ss.length){ el.innerHTML=""; return; }
-  el.innerHTML = `<div class="eyebrow" style="margin:6px 0">Strings (${ss.length})</div>`+
-    `<div class="sec" style="max-height:150px;overflow:auto">`+
-    ss.slice(0,300).map(s=>`${s.addr}  ${esc((s.value||"").slice(0,80))} <span style="color:var(--faint)">[${(s.xrefs||[]).length} xref]</span>`).join("<br>")+
+  const fs=await api(`/targets/${tid}/findings`)||[];
+  if(!fs.length){ el.innerHTML=`<div class="hint" style="margin-top:6px">No findings yet — run Detect CWEs or a fuzzer.</div>`; return; }
+  // dedup for display: group identical (cwe,title); keep the strongest state + all sites
+  const groups={};
+  fs.forEach(f=>{ const k=(f.cwe||'')+"|"+(f.title||'');
+    const g=groups[k]||(groups[k]={cwe:f.cwe,title:f.title,severity:f.severity,state:f.state,n:0,ids:[]});
+    g.n++; g.ids.push(f.id);
+    if((_STATEORD[f.state]||0)>(_STATEORD[g.state]||0)) g.state=f.state; });
+  const arr=Object.values(groups).sort((a,b)=>(_SEVRANK[b.severity]||0)-(_SEVRANK[a.severity]||0));
+  el.innerHTML=`<div class="eyebrow" style="margin:6px 0">Findings (${arr.length}${arr.length!==fs.length?` · ${fs.length} sites`:""})</div>`+
+    `<div class="sec" style="max-height:190px;overflow:auto">`+
+    arr.map(g=>`<div class="frow clk" onclick="openBoardFinding('${g.ids[0]}')" title="Open in the Findings Board">`+
+      `<span style="color:${SEVCOL[g.severity]||'var(--faint)'}">${esc(g.cwe||'')}</span> `+
+      `<span class="mit ${_stCls(g.state)}" style="text-transform:uppercase">${esc(g.state)}</span> `+
+      `${esc(g.title||'')}${g.n>1?`<span class="fcount">×${g.n} sites</span>`:''}</div>`).join("")+
     `</div>`;
+}
+async function openBoardFinding(fid){
+  SEL_FINDING=fid;
+  switchView('board');                       // loadBoard -> renderBoard reads SEL_FINDING
+}
+let STRINGS=[];
+async function loadStrings(tid){ STRINGS = await api(`/targets/${tid}/strings`)||[]; renderStrings(""); }
+function renderStrings(q){
+  const el=document.getElementById("strings"); if(!el) return;
+  if(!STRINGS.length){ el.innerHTML=`<div class="hint">No strings yet — run Decompile.</div>`; return; }
+  q=(q||"").toLowerCase();
+  const list = q ? STRINGS.filter(s=>(s.value||"").toLowerCase().includes(q)) : STRINGS;
+  const cap=400, shown=list.slice(0,cap);
+  el.innerHTML = `<input class="fsearch" placeholder="filter strings…" value="${esc(q)}" oninput="renderStrings(this.value)">`+
+    `<div class="mono" style="color:var(--faint);font-size:10px;margin-bottom:3px">${list.length} of ${STRINGS.length}</div>`+
+    `<div class="sec" style="max-height:170px;overflow:auto">`+
+    (shown.length?shown.map(s=>`${s.addr}  ${esc((s.value||"").slice(0,90))} <span style="color:var(--faint)">[${(s.xrefs||[]).length} xref]</span>`).join("<br>"):`<div class="hint">no match</div>`)+
+    (list.length>cap?`<br><span class="hint">…${list.length-cap} more — refine the filter</span>`:"")+
+    `</div>`;
+  const inp=el.querySelector(".fsearch"); if(q&&inp){ inp.focus(); inp.setSelectionRange(inp.value.length,inp.value.length); }
 }
 async function doDecompile(tid){
   const st=document.getElementById("decostat"); if(st) st.textContent="queued (Ghidra headless is slow)…";
   await fetch("/runs",{method:"POST",headers:{"Content-Type":"application/json"},
     body:JSON.stringify({case_id:CUR,target_id:tid,stage:"disassemble"})});
 }
-async function loadFunctions(tid){
-  const fns = await api(`/targets/${tid}/functions`);
+let FUNCS=[];
+async function loadFunctions(tid){ FUNCS = await api(`/targets/${tid}/functions`)||[]; renderFuncs(""); }
+function renderFuncs(q){
   const el=document.getElementById("funcs"); if(!el) return;
-  if(!fns.length){ el.innerHTML=`<div style="color:var(--faint);font-size:11px">No functions yet — run Decompile.</div>`; return; }
-  el.innerHTML = `<div class="eyebrow" style="margin:6px 0">Functions (${fns.length})</div>`+
-    `<div class="sec" style="max-height:180px;overflow:auto">`+
-    fns.map(f=>`<div class="frow" data-id="${f.id}" style="cursor:pointer;padding:2px 0">${f.addr}  ${esc(f.name||"")} <span style="color:var(--faint)">(${f.size||0})</span></div>`).join("")+
+  if(!FUNCS.length){ el.innerHTML=`<div class="hint" style="margin-top:6px">No functions yet — run Decompile.</div>`; return; }
+  q=(q||"").toLowerCase();
+  const list = q ? FUNCS.filter(f=>((f.name||"")+" "+f.addr).toLowerCase().includes(q)) : FUNCS;
+  const cap=600, shown=list.slice(0,cap);
+  el.innerHTML = `<div class="eyebrow" style="margin:6px 0">Functions (${FUNCS.length})</div>`+
+    `<input class="fsearch" placeholder="filter functions by name or address…" value="${esc(q)}" oninput="renderFuncs(this.value)">`+
+    `<div class="sec" style="max-height:200px;overflow:auto">`+
+    (shown.length?shown.map(f=>`<div class="frow clk" data-id="${f.id}">${f.addr}  ${esc(f.name||"")} <span style="color:var(--faint)">(${f.size||0})</span></div>`).join(""):`<div class="hint">no match</div>`)+
+    (list.length>cap?`<div class="hint">…${list.length-cap} more — refine the filter</div>`:"")+
     `</div>`;
-  el.querySelectorAll(".frow").forEach(d=> d.onclick=()=>showFunc(d.dataset.id));
+  el.querySelectorAll(".frow[data-id]").forEach(d=> d.onclick=()=>showFunc(d.dataset.id));
+  const s=el.querySelector(".fsearch"); if(q&&s){ s.focus(); s.setSelectionRange(s.value.length,s.value.length); }
 }
 async function showFunc(fid){
   const f=await api(`/functions/${fid}`);
@@ -1021,7 +1092,7 @@ function openWS(id){
   WS = new WebSocket(`ws://${location.host}/events?case_id=${id}`);
   WS.onmessage = ev=>{
     let e; try{e=JSON.parse(ev.data);}catch(_){return;}
-    logline(e.type, e.run_id?e.run_id.slice(0,8):"", e.payload);
+    logline(e.type, e.run_id?e.run_id.slice(0,8):"", e.payload, e.ts);
     if(["job.done","job.error","triage.done","job.cachehit","job.started"].includes(e.type)) refresh();
     if(e.type==="re.done" && DETAIL_TID){
       loadFunctions(DETAIL_TID);
@@ -1101,11 +1172,21 @@ function openWS(id){
   };
   WS.onclose = ()=> logline("ws","","disconnected");
 }
-function logline(type, run="", payload=""){
+function fmtClock(ts){
+  const d = ts ? new Date(ts*1000) : new Date();
+  return d.toTimeString().slice(0,8);   // HH:MM:SS (local)
+}
+function fmtAgo(ts){
+  if(!ts) return "";
+  const s=Math.max(0,Math.floor(Date.now()/1000-ts));
+  if(s<60) return s+"s ago"; if(s<3600) return Math.floor(s/60)+"m ago";
+  if(s<86400) return Math.floor(s/3600)+"h ago"; return Math.floor(s/86400)+"d ago";
+}
+function logline(type, run="", payload="", ts){
   const el=document.getElementById("log"); if(!el) return;
   const p = payload && typeof payload==="object" ? JSON.stringify(payload) : (payload||"");
   const d=document.createElement("div"); d.className="logline";
-  d.innerHTML = `<span class="t">${esc(type)}</span> ${run?`<span style="color:var(--faint)">${run}</span> `:""}${esc(p)}`;
+  d.innerHTML = `<span class="lt">${fmtClock(ts)}</span> <span class="t">${esc(type)}</span> ${run?`<span style="color:var(--faint)">${run}</span> `:""}${esc(p)}`;
   el.appendChild(d); el.scrollTop=el.scrollHeight;
 }
 function esc(s){ return String(s==null?"":s).replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c])); }
