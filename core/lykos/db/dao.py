@@ -18,6 +18,7 @@ from .models import (
     Artifact,
     CallEdge,
     Case,
+    ComponentEdge,
     DynResult,
     Event,
     Finding,
@@ -587,3 +588,40 @@ class PocDAO(BaseDAO):
                    created_at=r["created_at"], finding_id=r["finding_id"], level=r["level"],
                    verified=as_bool(r["verified"]), signal_name=r["signal_name"],
                    input_sha=r["input_sha"], bundle_sha=r["bundle_sha"])
+
+
+# ------------------------------------------------------------ ComponentEdge (Phase 8)
+class ComponentEdgeDAO(BaseDAO):
+    def upsert(self, case_id: str, src_target: str, dst_target: str, *, kind: str,
+               symbol: Optional[str] = None, detail: Optional[str] = None) -> None:
+        """Insert an edge, or update its detail if the (case,src,dst,kind,symbol) exists."""
+        self.conn.execute(
+            "INSERT INTO component_edge(id,case_id,src_target,dst_target,kind,symbol,"
+            "detail,created_at) VALUES(?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(case_id,src_target,dst_target,kind,symbol) "
+            "DO UPDATE SET detail=excluded.detail",
+            (new_id(), case_id, src_target, dst_target, kind, symbol, detail, _now()))
+
+    def list_by_case(self, case_id: str) -> list[ComponentEdge]:
+        rows = self.conn.execute(
+            "SELECT * FROM component_edge WHERE case_id=? ORDER BY kind, symbol", (case_id,)
+        ).fetchall()
+        return [self._row(r) for r in rows]
+
+    def clear_case(self, case_id: str, kind: Optional[str] = None) -> None:
+        if kind:
+            self.conn.execute("DELETE FROM component_edge WHERE case_id=? AND kind=?",
+                              (case_id, kind))
+        else:
+            self.conn.execute("DELETE FROM component_edge WHERE case_id=?", (case_id,))
+
+    def count_by_case(self, case_id: str) -> int:
+        r = self.conn.execute("SELECT COUNT(*) AS c FROM component_edge WHERE case_id=?",
+                              (case_id,)).fetchone()
+        return int(r["c"])
+
+    @staticmethod
+    def _row(r) -> ComponentEdge:
+        return ComponentEdge(id=r["id"], case_id=r["case_id"], src_target=r["src_target"],
+                             dst_target=r["dst_target"], created_at=r["created_at"],
+                             kind=r["kind"], symbol=r["symbol"], detail=r["detail"])

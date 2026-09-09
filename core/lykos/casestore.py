@@ -202,6 +202,7 @@ def _case_tables(conn, case_id: str):
     plan += [("finding", "case_id=?", (case_id,)),
              ("dyn_result", "case_id=?", (case_id,)),
              ("poc", "case_id=?", (case_id,)),
+             ("component_edge", "case_id=?", (case_id,)),
              ("event", "case_id=?", (case_id,))]
     return plan
 

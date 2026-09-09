@@ -44,6 +44,9 @@ class ElfInfo:
     sections: list[dict] = field(default_factory=list)
     imports: dict = field(default_factory=lambda: {"libraries": [], "functions_count": 0})
     exports_count: int = 0
+    # Phase 8 (doc 17.1/17.2): dynamic-symbol NAMES for cross-binary import/export resolution.
+    imported_symbols: list = field(default_factory=list)  # undefined dynsym (needs)
+    exported_symbols: list = field(default_factory=list)   # defined STT_FUNC (provides)
     toolchain_hint: str = "unknown"
     mitigations: dict = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
@@ -236,6 +239,8 @@ def parse(data: bytes) -> ElfInfo:
             strblob = data[dstr["offset"]:dstr["offset"] + dstr["size"]]
             count = dsym["size"] // dsym["entsize"]
             imported = 0
+            imp_names: set[str] = set()
+            exp_names: set[str] = set()
             for i in range(count):
                 o = dsym["offset"] + i * dsym["entsize"]
                 if is64:
@@ -248,15 +253,23 @@ def parse(data: bytes) -> ElfInfo:
                 nm = (strblob[st_name:end].decode("utf-8", "replace")
                       if st_name < len(strblob) else "")
                 sttype = st_info & 0xF
+                st_bind = st_info >> 4
                 if st_shndx == 0 and nm:              # undefined => imported
                     imported += 1
+                    imp_names.add(nm)
                     if nm == "__stack_chk_fail":
                         canary = True
                     if nm.endswith("_chk"):
                         fortify = True
                 elif sttype == STT_FUNC and st_shndx != 0:
                     info.exports_count += 1
+                    # GLOBAL(1)/WEAK(2) defined functions are what other components can bind to
+                    if nm and st_bind in (1, 2):
+                        exp_names.add(nm)
             info.imports["functions_count"] = imported
+            info.imports["symbols"] = sorted(imp_names)[:8000]
+            info.imported_symbols = sorted(imp_names)[:8000]
+            info.exported_symbols = sorted(exp_names)[:8000]
     except Exception as e:
         info.errors.append(f"dynsym: {e!r}")
 

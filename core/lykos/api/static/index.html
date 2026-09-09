@@ -141,6 +141,18 @@ tbody tr:hover{background:var(--surface-2)}
 .rptbtns{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
 .rptbtns a.btn{text-decoration:none;display:inline-flex;align-items:center}
 
+/* system map */
+.smwrap{width:100%;overflow-x:auto}
+.smsvg{width:100%;height:auto;display:block}
+.smedge{stroke:var(--border-strong);stroke-width:1.6}
+.smarrow{fill:var(--border-strong)}
+.smcount{fill:var(--faint);font-size:9px;font-family:var(--mono);text-anchor:middle}
+.smnode{cursor:pointer}
+.smnode rect{fill:var(--surface-2);stroke:var(--border-strong);stroke-width:1.2}
+.smnode:hover rect{stroke:var(--accent)}
+.smname{fill:var(--text);font-size:11px;font-weight:700;text-anchor:middle;font-family:var(--mono)}
+.smmeta{fill:var(--faint);font-size:9px;text-anchor:middle;font-family:var(--mono)}
+
 /* command palette */
 .kbd{font-family:var(--mono);font-size:10px;border:1px solid var(--border-strong);border-radius:4px;
   padding:1px 5px;color:var(--dim);background:var(--surface-2)}
@@ -247,6 +259,7 @@ function view(name){ return `
       <div class="tabs" style="margin-top:10px">
         <button class="tab active" id="tab-wb" onclick="switchView('wb')">Workbench</button>
         <button class="tab" id="tab-board" onclick="switchView('board')">Findings Board</button>
+        <button class="tab" id="tab-sysmap" onclick="switchView('sysmap')">System Map</button>
         <button class="tab" id="tab-report" onclick="switchView('report')">Report</button>
       </div>
     </div>
@@ -269,6 +282,7 @@ function view(name){ return `
     </div>
   </div>
   <div id="board" hidden></div>
+  <div id="sysmap" hidden></div>
   <div id="report" hidden></div>`;
 }
 
@@ -276,14 +290,17 @@ let BOARD_VIEW="wb", BOARD_FILTER={sev:"",state:"",q:""};
 function switchView(v){
   BOARD_VIEW=v;
   const wb=document.getElementById("workbench"), bd=document.getElementById("board"),
-        rp=document.getElementById("report");
+        rp=document.getElementById("report"), sm=document.getElementById("sysmap");
   document.getElementById("tab-wb").classList.toggle("active", v==="wb");
   document.getElementById("tab-board").classList.toggle("active", v==="board");
+  document.getElementById("tab-sysmap").classList.toggle("active", v==="sysmap");
   document.getElementById("tab-report").classList.toggle("active", v==="report");
   if(wb) wb.hidden = v!=="wb";
   if(bd) bd.hidden = v!=="board";
+  if(sm) sm.hidden = v!=="sysmap";
   if(rp) rp.hidden = v!=="report";
   if(v==="board") loadBoard();
+  if(v==="sysmap") loadSystemMap(true);
   if(v==="report") renderReport();
 }
 
@@ -438,6 +455,57 @@ async function doImportCase(file){
     await loadCases();
   }catch(e){ if(st) st.textContent="import failed: "+e; }
 }
+
+// ---- system map (component graph, doc 17.1) ----
+let SYSMAP={nodes:[],edges:[]};
+async function loadSystemMap(resolve){
+  const el=document.getElementById("sysmap"); if(!el||!CUR) return;
+  el.innerHTML=`<div class="empty">Resolving component links…</div>`;
+  try{ SYSMAP=await api(`/cases/${CUR}/systemmap${resolve?'?resolve=1':''}`); }
+  catch(e){ SYSMAP={nodes:[],edges:[]}; }
+  renderSystemMap();
+}
+function renderSystemMap(){
+  const el=document.getElementById("sysmap"); if(!el) return;
+  const nodes=SYSMAP.nodes||[], edges=SYSMAP.edges||[];
+  const name={}; nodes.forEach(n=>name[n.id]=n.filename);
+  const head=`<div class="cardhead" style="margin-bottom:10px">
+      <span class="eyebrow">Component graph — ${nodes.length} components · ${edges.length} links</span>
+      <button class="btn sm" onclick="loadSystemMap(true)">↻ Re-resolve links</button></div>`;
+  if(!nodes.length){ el.innerHTML=`<div class="card">${head}<div class="empty">No components yet. Upload the program and its shared libraries (or a firmware's carved parts) to this case, then re-resolve.</div></div>`; return; }
+  // circular layout
+  const W=760,H=Math.max(300,Math.min(520,180+nodes.length*40)),cx=W/2,cy=H/2;
+  const R=nodes.length<=1?0:Math.min(H/2-60,80+nodes.length*10);
+  const pos={};
+  nodes.forEach((n,i)=>{ const a=-Math.PI/2+i*2*Math.PI/nodes.length;
+    pos[n.id]={x:cx+R*Math.cos(a),y:cy+R*Math.sin(a)}; });
+  const line=edges.map(e=>{const s=pos[e.src],d=pos[e.dst]; if(!s||!d)return"";
+    const mx=(s.x+d.x)/2,my=(s.y+d.y)/2; const cnt=(e.symbols||[]).length;
+    const lbl=cnt?`<text x="${mx}" y="${my-3}" class="smcount">${cnt} sym${cnt>1?'s':''}</text>`:"";
+    return `<line x1="${s.x}" y1="${s.y}" x2="${d.x}" y2="${d.y}" class="smedge" marker-end="url(#arrow)"/>${lbl}`;
+  }).join("");
+  const box=nodes.map(n=>{const p=pos[n.id];const w=150,h=46;
+    return `<g class="smnode" onclick="openComponent('${n.id}')">
+      <rect x="${p.x-w/2}" y="${p.y-h/2}" width="${w}" height="${h}" rx="8"/>
+      <text x="${p.x}" y="${p.y-4}" class="smname">${esc((n.filename||'').slice(0,20))}</text>
+      <text x="${p.x}" y="${p.y+12}" class="smmeta">${esc(n.arch||'?')} · ${n.findings||0} findings</text></g>`;
+  }).join("");
+  const svg=`<svg viewBox="0 0 ${W} ${H}" class="smsvg" preserveAspectRatio="xMidYMid meet">
+    <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" class="smarrow"/></marker></defs>${line}${box}</svg>`;
+  const rows = edges.length ? `<table><thead><tr><th>Importer</th><th></th><th>Exporter</th>
+      <th>Kind</th><th>Resolved symbols</th></tr></thead><tbody>
+    ${edges.map(e=>`<tr><td class="mono">${esc(name[e.src]||e.src.slice(0,8))}</td>
+      <td style="color:var(--accent)">→</td>
+      <td class="mono">${esc(name[e.dst]||e.dst.slice(0,8))}</td>
+      <td class="mono" style="font-size:11px">${esc(e.kind)}</td>
+      <td class="mono" style="font-size:11px;color:var(--dim)">${esc((e.symbols||[]).slice(0,6).join(', '))||'—'}</td></tr>`).join('')}
+    </tbody></table>` : `<div class="empty" style="padding:20px">No cross-binary links resolved. Components share no imported/exported symbols in this case.</div>`;
+  el.innerHTML=`<div class="card">${head}<div class="smwrap">${svg}</div></div>
+    <div class="card"><div class="cardhead"><span class="eyebrow">Resolved edges</span></div>${rows}</div>`;
+}
+function openComponent(tid){ switchView('wb'); showDetail(tid);
+  const dc=document.getElementById('detailcard'); if(dc) dc.scrollIntoView({behavior:'smooth'}); }
 
 let PENDING=null;
 function onUpload(e){
@@ -774,7 +842,9 @@ function ACTIONS(){ return [
   ...(CUR?[
     {label:"Open Workbench", hint:"1", run:()=>switchView("wb")},
     {label:"Open Findings Board", hint:"2", run:()=>switchView("board")},
-    {label:"Open Report builder", hint:"3", run:()=>switchView("report")},
+    {label:"Open System Map", hint:"3", run:()=>switchView("sysmap")},
+    {label:"Open Report builder", hint:"4", run:()=>switchView("report")},
+    {label:"Resolve component links", run:()=>{switchView("sysmap");loadSystemMap(true);}},
     {label:"Open HTML report ↗", run:()=>window.open(reportURL("html",true),"_blank")},
     {label:"Download PDF report", run:()=>dl(reportURL("pdf",true))},
     {label:"Download SARIF export", run:()=>dl(reportURL("sarif",true))},
@@ -820,7 +890,8 @@ document.addEventListener("keydown",(e)=>{
   if(CUR){
     if(e.key==="1") switchView("wb");
     else if(e.key==="2") switchView("board");
-    else if(e.key==="3") switchView("report");
+    else if(e.key==="3") switchView("sysmap");
+    else if(e.key==="4") switchView("report");
     else if(e.key==="/" && BOARD_VIEW==="board"){ e.preventDefault(); const q=document.getElementById("bq"); if(q) q.focus(); }
   }
 });
