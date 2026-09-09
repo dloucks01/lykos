@@ -79,6 +79,12 @@ def build_parser() -> argparse.ArgumentParser:
                          "(candidate = rule/sink channel; corroborated = taint-discriminated)")
     ev.add_argument("--out", default=None, help="write the full JSON report to this path")
     ev.add_argument("--workers", type=int, default=2, help="worker count (default 2)")
+    ev.add_argument("--min-recall", type=float, default=1.0,
+                    help="release gate: fail if overall recall is below this (default 1.0)")
+    ev.add_argument("--max-fp-rate", type=float, default=0.0,
+                    help="release gate: fail if the FP-rate exceeds this (default 0.0)")
+    ev.add_argument("--require-backend", action="store_true",
+                    help="fail (not skip) when the static backend (Ghidra) is absent")
     ev.set_defaults(func=_cmd_eval)
     return p
 
@@ -103,7 +109,6 @@ def _cmd_eval(args: argparse.Namespace) -> int:
     for w in rep.meta.get("warnings", []):
         print(f"warning: {w}", file=sys.stderr)
     print(rep.table())
-    o = rep.metrics.get("overall", {})
     backend = (f"ghidra={'yes' if rep.meta.get('ghidra') else 'NO'}, min_state={args.min_state}"
                if args.stage == "static"
                else f"fuzz budget={rep.meta.get('max_execs')} execs/{rep.meta.get('max_seconds')}s")
@@ -113,8 +118,13 @@ def _cmd_eval(args: argparse.Namespace) -> int:
     if args.out:
         Path(args.out).write_text(json.dumps(rep.to_dict(), indent=2))
         print(f"report written to {args.out}")
-    # non-zero exit if any bug was missed or any good case falsely flagged (CI gate)
-    return 0 if (o.get("fn", 0) == 0 and o.get("fp", 0) == 0 and o.get("tp", 0) > 0) else 1
+    # release gate: PASS / FAIL / SKIP (SKIP when the static backend is absent)
+    from .eval.metrics import gate
+    passed, verdict, reason = gate(rep.metrics, rep.meta, stage=args.stage,
+                                   min_recall=args.min_recall, max_fp_rate=args.max_fp_rate,
+                                   require_backend=args.require_backend)
+    print(f"\nGATE: {verdict} -- {reason}", file=sys.stderr)
+    return 0 if passed else 1
 
 
 def main(argv: list[str] | None = None) -> int:
