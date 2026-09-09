@@ -628,8 +628,8 @@ function openWS(id){
     if(e.type==="primitive.done" && DETAIL_TID){
       const st=document.getElementById("fuzzstat");
       if(st&&e.payload){ st.textContent = e.payload.confirmed
-        ? `L2 CONFIRMED: IP control @ offset ${e.payload.offset}`
-        : (e.payload.primitive ? `L2: ${e.payload.primitive}` : (e.payload.note||"no L2 primitive")); }
+        ? `L2 CONFIRMED: ${e.payload.primitive} @ offset ${e.payload.offset}`
+        : (e.payload.primitive ? `L2: ${e.payload.primitive} (unconfirmed)` : (e.payload.note||"no L2 primitive")); }
       loadPocs(DETAIL_TID); loadFindings(DETAIL_TID);
     }
     if(e.type==="poc.done" && DETAIL_TID){ loadPocs(DETAIL_TID); loadFindings(DETAIL_TID); }

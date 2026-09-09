@@ -13,6 +13,15 @@ from lykos.analyze.poc import primitive as P
 from lykos.db.dao import FindingDAO, PocDAO
 from lykos.jobs import JobConfig, JobQueue, WorkerPool
 
+
+def _build(gcc, tmp_path, src, name, flags):
+    c = tmp_path / f"{name}.c"; c.write_text(src)
+    b = tmp_path / name
+    r = subprocess.run([gcc, "-O0", *flags, str(c), "-o", str(b)],
+                       capture_output=True, check=False)
+    return b if r.returncode == 0 else None
+
+
 _VULN = ("#include <unistd.h>\n"
          "void vuln(void){char b[64];read(0,b,400);}\n"
          "int main(void){vuln();return 0;}\n")
@@ -140,3 +149,98 @@ def test_primitive_confirms_ip_control_end_to_end(store, case, pool, gcc, tmp_pa
     assert backed
     assert any("instruction-pointer control" in str(e.get("detail", ""))
                for f in backed for e in (f.evidence or []))
+
+
+# ------------------------------------------------------------------- unit: memory primitives
+def test_parse_mem_access_and_reg64():
+    assert P.parse_mem_access("mov QWORD PTR [rdx],rax") == {
+        "is_write": True, "base": "rdx", "value": "rax"}
+    assert P.parse_mem_access("mov eax,DWORD PTR [rcx]") == {
+        "is_write": False, "base": "rcx", "value": None}
+    assert P.parse_mem_access("mov DWORD PTR [rax+0x10],edx")["base"] == "rax"
+    assert P.parse_mem_access("ret") is None
+    assert P._reg64("edx") == "rdx" and P._reg64("r10d") == "r10"
+
+
+def test_analyze_write_what_where():
+    L = 64
+    seq = P.cyclic(L)
+    addr = int.from_bytes(seq[0:8], "little")
+    val = int.from_bytes(seq[8:16], "little")
+    cap = {"fault_addr": 0, "regs": {"rdx": addr, "rax": val}}
+    prim = P.analyze_memory_primitive(cap, L, "mov QWORD PTR [rdx],rax")
+    assert prim["type"] == "write-what-where"
+    assert prim["addr_offset"] == 0 and prim["value_offset"] == 8
+    assert prim["addr_reg"] == "rdx" and prim["value_reg"] == "rax"
+
+
+def test_analyze_controlled_read():
+    L = 64
+    addr = int.from_bytes(P.cyclic(L)[0:8], "little")
+    cap = {"fault_addr": 0, "regs": {"rax": addr}}
+    prim = P.analyze_memory_primitive(cap, L, "mov eax,DWORD PTR [rax]")
+    assert prim["type"] == "controlled-read" and prim["addr_offset"] == 0
+    assert prim["value_offset"] is None
+
+
+def test_two_marker_input_and_confirm():
+    import struct
+    inp = P.two_marker_input(0, 8, 64)
+    assert inp[0:8] == struct.pack("<Q", P.MARKER)
+    assert inp[8:16] == struct.pack("<Q", P.MARKER_VALUE)
+    cap = {"regs": {"rdx": P.MARKER, "rax": P.MARKER_VALUE}}
+    prim = {"addr_reg": "rdx", "value_reg": "rax", "value_offset": 8}
+    assert P.memory_primitive_confirmed(cap, prim) == (True, True)
+    bad = {"regs": {"rdx": 0x1234, "rax": 0}}
+    assert P.memory_primitive_confirmed(bad, prim) == (False, False)
+
+
+# ------------------------------------------------------------------- integration: WWW / read
+_WWW = ("#include <unistd.h>\n"
+        "int main(void){ unsigned long a[2]={0,0}; read(0,(char*)a,16);"
+        " *(unsigned long*)a[0]=a[1]; return 0; }\n")
+_CREAD = ("#include <unistd.h>\n"
+          "int main(void){ unsigned long a=0; read(0,(char*)&a,8);"
+          " volatile int x=*(int*)a; return x; }\n")
+
+
+def _l2_run(store, case, pool, gcc, tmp_path, src, name, crashing_input):
+    b = _build(gcc, tmp_path, src, name, ["-fno-stack-protector", "-no-pie"])
+    if b is None:
+        pytest.skip("build failed")
+    target = ingest(store, case.id, b)
+    sha, _, _ = store.content.put_bytes(crashing_input)
+    q = JobQueue(store.conn)
+    run = enqueue_primitive(q, target, params={"input_sha": sha, "input_mode": "stdin",
+                                               "timeout": 6})
+    assert pool.wait_idle(50)
+    rec = q.runs.get(run.id)
+    if rec.status != "done":
+        pytest.skip("ptrace unavailable: " + str(rec.error))
+    from lykos.db.dao import PocDAO
+    return (FindingDAO(store.conn).list_by_target(target.id),
+            PocDAO(store.conn).list_by_target(target.id))
+
+
+@pytest.mark.skipif(sandbox.host_arch() not in ("x86-64", "aarch64"),
+                    reason="L2 primitive analysis is native-arch only")
+def test_write_what_where_end_to_end(store, case, pool, gcc, tmp_path):
+    finds, pocs = _l2_run(store, case, pool, gcc, tmp_path, _WWW, "www", b"A" * 16)
+    l2 = [p for p in pocs if p.level == "L2"]
+    if not l2:
+        pytest.skip("no WWW primitive captured on this toolchain")
+    assert l2[0].verified
+    assert any("write-what-where" in str(e.get("detail", ""))
+               for f in finds if f.state == "poc-backed" for e in (f.evidence or []))
+
+
+@pytest.mark.skipif(sandbox.host_arch() not in ("x86-64", "aarch64"),
+                    reason="L2 primitive analysis is native-arch only")
+def test_controlled_read_end_to_end(store, case, pool, gcc, tmp_path):
+    finds, pocs = _l2_run(store, case, pool, gcc, tmp_path, _CREAD, "cr", b"A" * 8)
+    l2 = [p for p in pocs if p.level == "L2"]
+    if not l2:
+        pytest.skip("no controlled-read primitive captured on this toolchain")
+    assert l2[0].verified
+    assert any("controlled-read" in str(e.get("detail", ""))
+               for f in finds if f.state == "poc-backed" for e in (f.evidence or []))
