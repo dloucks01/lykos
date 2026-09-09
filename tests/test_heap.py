@@ -163,3 +163,58 @@ def test_layout_search_verified_on_real_glibc(play_bin):
             p.stdin.write(b"q\n"); p.stdin.flush(); p.wait(timeout=3)
         except Exception:
             p.kill()
+
+
+# ------------------------------------------------- non-tcache bins: fastbin + small-bin order
+def test_bin_class_helpers():
+    assert heap.is_fastbin(0x20) and heap.is_fastbin(0x80) and not heap.is_fastbin(0x90)
+    assert heap.is_smallbin(0x100) and heap.is_smallbin(0x3f0) and not heap.is_smallbin(0x400)
+
+
+def test_model_fastbin_overflow_lifo():
+    m = heap.TcacheModel(base=0x10000)
+    c = [m.malloc(24) for _ in range(9)]               # chunk 0x20 (tcache + fastbin)
+    for x in c:
+        m.free(x)                                      # 0..6 -> tcache, 7,8 -> fastbin
+    order = [m.malloc(24) for _ in range(9)]
+    idx = {v: i for i, v in enumerate(c)}
+    assert [idx[a] for a in order] == [6, 5, 4, 3, 2, 1, 0, 8, 7]   # tcache LIFO, fastbin LIFO
+
+
+def test_model_smallbin_overflow_fifo():
+    m = heap.TcacheModel(base=0x10000)
+    c = [m.malloc(0xf8) for _ in range(9)]             # chunk 0x100 (tcache, NOT fastbin)
+    for x in c:
+        m.free(x)                                      # 0..6 -> tcache, 7,8 -> small bin
+    order = [m.malloc(0xf8) for _ in range(9)]
+    idx = {v: i for i, v in enumerate(c)}
+    assert [idx[a] for a in order] == [6, 5, 4, 3, 2, 1, 0, 7, 8]   # tcache LIFO, small FIFO
+
+
+def test_fastbin_overflow_matches_real_glibc(play_bin):
+    """Free 9 same-size chunks; the model predicts tcache-LIFO then fastbin-LIFO reuse -- verify
+    the exact order on the host's real glibc."""
+    p = subprocess.Popen([str(play_bin)], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    try:
+        _drive(p, b"")
+        allocs = "".join("a 24 %d\n" % i for i in range(9))
+        out = _drive(p, allocs.encode())
+        orig = [int(a, 16) for a in re.findall(r"alloc\[\d+\]=0x([0-9a-f]+)", out)]
+        _drive(p, "".join("f %d\n" % i for i in range(9)).encode())
+        out2 = _drive(p, "".join("a 24 %d\n" % (20 + i) for i in range(9)).encode())
+        got = [int(a, 16) for a in re.findall(r"alloc\[\d+\]=0x([0-9a-f]+)", out2)]
+        idx = {v: i for i, v in enumerate(orig)}
+        real = [idx[a] for a in got]
+
+        m = heap.TcacheModel(base=0x10000)
+        cm = [m.malloc(24) for _ in range(9)]
+        for x in cm:
+            m.free(x)
+        mi = {v: i for i, v in enumerate(cm)}
+        model = [mi[m.malloc(24)] for _ in range(9)]
+        assert real == model == [6, 5, 4, 3, 2, 1, 0, 8, 7]     # model predicts real glibc
+    finally:
+        try:
+            p.stdin.write(b"q\n"); p.stdin.flush(); p.wait(timeout=3)
+        except Exception:
+            p.kill()

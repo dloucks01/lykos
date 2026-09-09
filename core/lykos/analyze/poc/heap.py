@@ -24,6 +24,16 @@ _MINSIZE = 0x20
 SIZE_SZ = 8
 TCACHE_MAX_BINS = 64
 TCACHE_COUNT = 7                       # chunks per size-class bin
+MAX_FAST = 0x80                        # default global_max_fast (chunk size); <= -> fastbin
+MIN_LARGE = 0x400                      # chunk size at/above this is a large bin (else small)
+
+
+def is_fastbin(chunk_size: int) -> bool:
+    return _MINSIZE <= chunk_size <= MAX_FAST
+
+
+def is_smallbin(chunk_size: int) -> bool:
+    return _MINSIZE <= chunk_size < MIN_LARGE
 
 
 def request2size(req: int) -> int:
@@ -60,6 +70,8 @@ class TcacheModel:
     base: int = 0x1000
     bins: dict = field(default_factory=dict)          # tcache_index -> [user_ptr] (LIFO tail=head)
     counts: dict = field(default_factory=dict)
+    fastbins: dict = field(default_factory=dict)      # chunk_size -> [user_ptr] (LIFO tail=head)
+    otherbins: dict = field(default_factory=dict)     # chunk_size -> [user_ptr] (small/large FIFO)
     live: dict = field(default_factory=dict)          # user_ptr -> chunk_size
     poison: dict = field(default_factory=dict)        # user_ptr -> forged next ptr (UAF fd write)
     _top: int = 0
@@ -72,12 +84,20 @@ class TcacheModel:
         i = tcache_index(cs)
         bin_ = self.bins.get(i)
         if in_tcache_range(cs) and bin_:
-            ptr = bin_.pop()                           # LIFO
+            ptr = bin_.pop()                           # tcache LIFO (checked first)
             self.counts[i] = self.counts.get(i, 0) - 1
             # a poisoned fd redirects the bin head to the forged target
             if ptr in self.poison:
                 self.bins.setdefault(i, []).append(self.poison.pop(ptr))
                 self.counts[i] = self.counts.get(i, 0) + 1
+            self.live[ptr] = cs
+            return ptr
+        if is_fastbin(cs) and self.fastbins.get(cs):
+            ptr = self.fastbins[cs].pop()              # fastbin LIFO (after tcache drains)
+            self.live[ptr] = cs
+            return ptr
+        if self.otherbins.get(cs):
+            ptr = self.otherbins[cs].pop(0)            # small/large bins are FIFO
             self.live[ptr] = cs
             return ptr
         ptr = self._top + SIZE_SZ * 2                  # user data after the chunk header
@@ -87,11 +107,17 @@ class TcacheModel:
 
     def free(self, ptr: int) -> None:
         cs = self.live.pop(ptr, None)
-        if cs is None or not in_tcache_range(cs):
+        if cs is None:
             return
         i = tcache_index(cs)
-        self.bins.setdefault(i, []).append(ptr)
-        self.counts[i] = self.counts.get(i, 0) + 1
+        # glibc order: tcache (until full) -> fastbin (small) -> unsorted->small/large (FIFO)
+        if in_tcache_range(cs) and self.counts.get(i, 0) < TCACHE_COUNT:
+            self.bins.setdefault(i, []).append(ptr)
+            self.counts[i] = self.counts.get(i, 0) + 1
+        elif is_fastbin(cs):
+            self.fastbins.setdefault(cs, []).append(ptr)
+        else:
+            self.otherbins.setdefault(cs, []).append(ptr)
 
     def write_fd(self, freed_ptr: int, target: int) -> None:
         """Model a UAF/overflow write of a freed chunk's forward pointer to `target`."""

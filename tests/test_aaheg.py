@@ -129,3 +129,14 @@ def test_aaheg_chain_hijacks_control_flow_on_real_glibc(aaheg_bin):
             p.kill(); p.wait(timeout=3)
         except Exception:
             pass
+
+
+def test_large_and_unsorted_bin_attacks_advised():
+    # a large-bin-sized UAF -> large-bin & unsorted-bin attacks advised (both non-fastbin)
+    plan = plan_exploit(Vuln("uaf", 0x420), Goal("arbitrary_write", target=0x404080),
+                        Env(glibc=(2, 42)))
+    techs = [a["technique"] for a in plan.get("advisory_alternatives", [])]
+    assert "large_bin_attack" in techs and "unsorted_bin_attack" in techs
+    # a fastbin-sized UAF should NOT advise the large-bin attack
+    small = plan_exploit(Vuln("uaf", 24), Goal("arbitrary_write", target=0x404080))
+    assert "large_bin_attack" not in [a["technique"] for a in small["advisory_alternatives"]]
