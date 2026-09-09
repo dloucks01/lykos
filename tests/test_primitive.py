@@ -244,3 +244,27 @@ def test_controlled_read_end_to_end(store, case, pool, gcc, tmp_path):
     assert l2[0].verified
     assert any("controlled-read" in str(e.get("detail", ""))
                for f in finds if f.state == "poc-backed" for e in (f.evidence or []))
+
+
+def test_frame_offset_candidates_predicts_ip_offset_from_ghidra_coords():
+    """Static stack-frame -> predicted IP-control offset = ret_offset - buffer_offset
+    (Ghidra frame coords; ret_offset 0, locals negative). Matches the dynamic cyclic offset
+    for a real overflow (handle(): char[128] at -136, ret_offset 0 -> 136)."""
+    frames = {
+        "0x1287": {"ret_offset": 0, "vars": [
+            {"name": "buf", "offset": -136, "size": 128, "is_buffer": True},
+            {"name": "i", "offset": -8, "size": 4, "is_buffer": False}]},
+        "0x1248": {"ret_offset": 0, "vars": [
+            {"name": "msg", "offset": -72, "size": 64, "is_buffer": True}]},
+    }
+    cands = P.frame_offset_candidates(frames, 8)
+    offs = [c["offset"] for c in cands]
+    assert 136 in offs and 72 in offs           # the two buffers' return-address distances
+    top = next(c for c in cands if c["offset"] == 136)
+    assert top["buffer"] == "buf" and top["size"] == 128
+    # sorted smallest-first, non-buffer locals ignored
+    assert offs == sorted(offs)
+    # fallback when ret_offset is unavailable: |offset| + word
+    fb = P.frame_offset_candidates({"0x1": {"vars": [
+        {"name": "b", "offset": -40, "size": 32, "is_buffer": True}]}}, 8)
+    assert fb[0]["offset"] == 48

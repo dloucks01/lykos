@@ -98,6 +98,41 @@ def recover_ip_offset(cap: dict, length: int, n: int = 4):
     return None
 
 
+def frame_offset_candidates(frames: dict, word: int = 8) -> list:
+    """Predict instruction-pointer-control offsets from recovered stack frames (static RE).
+
+    For a linear stack-buffer overflow, attacker bytes that reach the saved return address
+    start at the buffer and run to the return slot. In Ghidra's stack-frame coordinates that
+    distance is `ret_offset - buffer_offset` (the frame base sits at the return address, so
+    ret_offset is typically 0 and locals are negative); when ret_offset is unavailable we fall
+    back to `|buffer_offset| + word`. Each recovered stack buffer yields one candidate; these
+    corroborate the dynamic cyclic offset and seed a direct control attempt when the dynamic
+    slot heuristic is ambiguous. `word` is the pointer size (8 on 64-bit, 4 on 32-bit).
+
+    Returns candidates sorted by offset (smallest/tightest first), deduped by offset:
+    [{offset, buffer, size, function_addr}].
+    """
+    out, seen = [], set()
+    raw = []
+    for addr, fr in (frames or {}).items():
+        ret = fr.get("ret_offset")
+        for v in (fr.get("vars") or []):
+            if not v.get("is_buffer") or v.get("offset") is None:
+                continue
+            o = int(v["offset"])
+            dist = (ret - o) if ret is not None else (abs(o) + word)
+            if dist <= 0:
+                continue
+            raw.append({"offset": dist, "buffer": v.get("name"), "size": v.get("size"),
+                        "function_addr": addr})
+    for c in sorted(raw, key=lambda c: c["offset"]):
+        if c["offset"] in seen:
+            continue
+        seen.add(c["offset"])
+        out.append(c)
+    return out
+
+
 def controlled_registers(cap: dict, length: int, n: int = 4) -> dict:
     """Which general registers hold attacker-controlled (cyclic) data -> {reg: offset}."""
     out = {}
