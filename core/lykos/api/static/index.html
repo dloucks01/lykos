@@ -884,7 +884,9 @@ async function showDetail(targetId){
               <option value="concolic">Concolic (angr)</option>
               <option value="boundary">Boundary (IPC)</option>
             </select>
+            <label class="btn sm seedlbl" title="Attach valid sample files as fuzzing seeds -- essential for file-format parsers (PDF/image/doc): the mutator starts from real structure">+ seeds<input type="file" id="seedfiles" multiple style="display:none" onchange="onSeedFiles(this.files)"></label>
             <button class="btn sm primary" id="fuzzrun">Fuzz ▶</button>
+            <span class="mono" id="seedcount" style="color:var(--faint);font-size:10.5px"></span>
           </div>
           <div id="dynresults"></div>
         </div>
@@ -898,7 +900,7 @@ async function showDetail(targetId){
         </div>
       </section>
     </div>`;
-  DETAIL_TID = targetId;
+  DETAIL_TID = targetId; SEEDS=[];
   document.getElementById("deco").onclick = ()=>doDecompile(targetId);
   document.getElementById("detect").onclick = ()=>doDetect(targetId);
   document.getElementById("carve").onclick = ()=>doFirmware(targetId);
@@ -916,6 +918,18 @@ function runFuzz(tid){
   const s=(document.getElementById("fuzzstrategy")||{}).value||"fuzz";
   ({fuzz:doFuzz,coverage:doCoverage,directed:doDirected,concolic:doConcolic,boundary:doBoundary}[s]||doFuzz)(tid);
 }
+let SEEDS=[];                                    // base64 sample files seeding the next campaign
+async function onSeedFiles(files){
+  SEEDS=[];
+  for(const f of files){
+    const buf=new Uint8Array(await f.arrayBuffer());
+    let s=""; for(let i=0;i<buf.length;i++) s+=String.fromCharCode(buf[i]);
+    SEEDS.push(btoa(s));
+  }
+  const el=document.getElementById("seedcount");
+  if(el) el.textContent = SEEDS.length?`${SEEDS.length} seed${SEEDS.length!==1?'s':''} attached`:"";
+}
+function seedParams(){ return SEEDS.length ? {seeds:SEEDS} : {}; }   // spread into fuzz params
 async function doPoc(tid, inputSha, mode){
   await fetch("/runs",{method:"POST",headers:{"Content-Type":"application/json"},
     body:JSON.stringify({case_id:CUR,target_id:tid,stage:"build_poc",
@@ -984,14 +998,14 @@ async function doFuzz(tid){
   const st=document.getElementById("fuzzstat"); if(st) st.textContent="fuzzing…";
   await fetch("/runs",{method:"POST",headers:{"Content-Type":"application/json"},
     body:JSON.stringify({case_id:CUR,target_id:tid,stage:"fuzz",
-      params:{input_mode:(mode==="none"?"stdin":mode),max_execs:5000,max_seconds:30}})});
+      params:{input_mode:(mode==="none"?"stdin":mode),max_execs:5000,max_seconds:30,...seedParams()}})});
 }
 async function doCoverage(tid){
   const mode = document.getElementById("dynmode").value;
   const st=document.getElementById("fuzzstat"); if(st) st.textContent="AFL++ coverage fuzzing…";
   const r=await fetch("/runs",{method:"POST",headers:{"Content-Type":"application/json"},
     body:JSON.stringify({case_id:CUR,target_id:tid,stage:"coverage_fuzz",
-      params:{input_mode:(mode==="stdin"?"stdin":"file"),max_seconds:30}})});
+      params:{input_mode:(mode==="stdin"?"stdin":"file"),max_seconds:30,...seedParams()}})});
   if(!r.ok && st) st.textContent="coverage fuzz failed (AFL++ installed?)";
 }
 async function doDirected(tid){
@@ -999,7 +1013,7 @@ async function doDirected(tid){
   const st=document.getElementById("fuzzstat"); if(st) st.textContent="directed fuzzing…";
   await fetch("/runs",{method:"POST",headers:{"Content-Type":"application/json"},
     body:JSON.stringify({case_id:CUR,target_id:tid,stage:"directed_fuzz",
-      params:{input_mode:(mode==="none"?"stdin":mode),max_execs:6000,max_seconds:30}})});
+      params:{input_mode:(mode==="none"?"stdin":mode),max_execs:6000,max_seconds:30,...seedParams()}})});
 }
 async function doBoundary(tid){
   const st=document.getElementById("fuzzstat"); if(st) st.textContent="boundary harness…";
@@ -1011,7 +1025,7 @@ async function doConcolic(tid){
   const st=document.getElementById("fuzzstat"); if(st) st.textContent="concolic (angr)…";
   const r=await fetch("/runs",{method:"POST",headers:{"Content-Type":"application/json"},
     body:JSON.stringify({case_id:CUR,target_id:tid,stage:"concolic",
-      params:{input_mode:(mode==="none"?"stdin":mode),input_size:64,max_seconds:120}})});
+      params:{input_mode:(mode==="none"?"stdin":mode),input_size:64,max_seconds:120,...seedParams()}})});
   if(!r.ok && st) st.textContent="concolic failed (angr installed?)";
 }
 async function loadDyn(tid){
