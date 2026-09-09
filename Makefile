@@ -2,10 +2,10 @@
 PY ?= python3
 export PYTHONPATH := core
 
-.PHONY: test lint typecheck ci bundle verify run clean help
+.PHONY: test lint typecheck ci bundle verify run eval clean help
 
 help:
-	@echo "targets: test lint typecheck ci bundle verify run clean"
+	@echo "targets: test lint typecheck ci bundle verify run eval clean"
 
 test:
 	$(PY) -m pytest tests/ -q
@@ -27,6 +27,9 @@ verify: bundle
 
 run:
 	$(PY) -m lykos serve --http 127.0.0.1:8787 --case-store .cases --workers 2
+
+eval:
+	$(PY) -m lykos eval --out eval-report.json
 
 clean:
 	rm -rf dist .cases core/lykos/**/__pycache__ core/lykos/__pycache__
