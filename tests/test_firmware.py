@@ -63,9 +63,11 @@ def test_detect_cortex_m_vector_table():
 
 
 def test_analyze_blob_inconclusive_on_random():
-    import os
-    d = analyze_blob(os.urandom(2048))
-    assert d["arch"] in (None,) or d["confidence"] < 0.5
+    import hashlib
+    # a deterministic non-code blob (hash-expanded) must not be mistaken for a CPU arch
+    blob = b"".join(hashlib.sha512(bytes([i])).digest() for i in range(64))
+    d = analyze_blob(blob)
+    assert d["arch"] is None and d["method"] == "inconclusive"
 
 
 @pytest.fixture
