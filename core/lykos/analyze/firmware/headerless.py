@@ -103,9 +103,12 @@ def analyze_blob(data: bytes) -> dict:
     scores = score_arch(data)
     best = max(scores, key=scores.get) if scores else None
     best_n = scores.get(best, 0) if best else 0
+    second = sorted(scores.values(), reverse=True)[1] if len(scores) > 1 else 0
     total_words = max(1, len(data) // 4)
     density = best_n / total_words
-    if best and best_n >= 8 and density >= 0.002:
+    # require a dominant, dense prologue signal -- real code has one; random data is uniform
+    # noise (16-bit Thumb patterns especially are frequent by chance)
+    if best and best_n >= 16 and best_n >= 2 * second + 4 and density >= 0.006:
         arch, endian = best.split("/")
         norm = "arm" if arch == "thumb" else arch
         return {
