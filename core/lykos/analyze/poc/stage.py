@@ -56,14 +56,18 @@ def build_poc_stage(ctx) -> dict:
     bundle_sha = ctx.put_artifact("poc-bundle", data=data,
                                   meta={"verified": verified, "level": level})
 
-    PocDAO(ctx.conn).insert(target.id, target.case_id, level=level, verified=verified,
-                            signal_name=res.signal_name, input_sha=input_sha,
-                            bundle_sha=bundle_sha)
+    poc_id = PocDAO(ctx.conn).insert(target.id, target.case_id, level=level,
+                                     verified=verified, signal_name=res.signal_name,
+                                     input_sha=input_sha, bundle_sha=bundle_sha)
 
     if verified:
-        FindingDAO(ctx.conn).upsert(target.id, target.case_id, crash_finding_candidate(
+        fd = FindingDAO(ctx.conn)
+        fd.upsert(target.id, target.case_id, crash_finding_candidate(
             res.signal_name, input_sha, res.isolation, "poc", "(PoC verified)",
             state="poc-backed", confidence=0.95, bundle_sha=bundle_sha))
+        fid = fd.id_for_dedup(target.id, f"dynamic-crash:{res.signal_name}")
+        if fid:
+            PocDAO(ctx.conn).set_finding(poc_id, fid)
 
     ctx.emit("poc.done", payload={"verified": verified, "level": level,
                                   "signal": res.signal_name, "bundle": bundle_sha})

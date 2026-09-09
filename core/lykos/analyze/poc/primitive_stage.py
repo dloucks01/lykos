@@ -126,14 +126,18 @@ def _finalize(ctx, target, target_bytes, mode, base_argv, cap0, control, prim, c
                         cap0.get("signal_name") or "SIGSEGV", primitive=prim)
     bundle_sha = ctx.put_artifact("poc-bundle", data=data,
                                   meta={"level": level, "verified": confirmed})
-    PocDAO(ctx.conn).insert(target.id, target.case_id, level=level, verified=confirmed,
-                            signal_name=cap0.get("signal_name"), input_sha=control_sha,
-                            bundle_sha=bundle_sha)
+    poc_id = PocDAO(ctx.conn).insert(target.id, target.case_id, level=level,
+                                     verified=confirmed, signal_name=cap0.get("signal_name"),
+                                     input_sha=control_sha, bundle_sha=bundle_sha)
     if confirmed:
-        FindingDAO(ctx.conn).upsert(target.id, target.case_id, crash_finding_candidate(
+        fd = FindingDAO(ctx.conn)
+        fd.upsert(target.id, target.case_id, crash_finding_candidate(
             cap0.get("signal_name"), control_sha, "ptrace", "primitive",
             f"(L2 primitive: {extra})", state="poc-backed", confidence=0.98,
             bundle_sha=bundle_sha))
+        fid = fd.id_for_dedup(target.id, f"dynamic-crash:{cap0.get('signal_name')}")
+        if fid:
+            PocDAO(ctx.conn).set_finding(poc_id, fid)
     ctx.emit("primitive.done", payload={
         "primitive": prim["type"], "supported": True, "offset": prim.get("offset"),
         "confirmed": confirmed, "level": level, "bundle": bundle_sha})

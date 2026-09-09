@@ -488,6 +488,11 @@ class FindingDAO(BaseDAO):
         r = self.conn.execute("SELECT * FROM finding WHERE id=?", (finding_id,)).fetchone()
         return self._row(r) if r else None
 
+    def id_for_dedup(self, target_id: str, dedup_key: str) -> Optional[str]:
+        r = self.conn.execute("SELECT id FROM finding WHERE target_id=? AND dedup_key=?",
+                              (target_id, dedup_key)).fetchone()
+        return r["id"] if r else None
+
     def counts_by_state(self, target_id: str) -> dict:
         rows = self.conn.execute(
             "SELECT state, COUNT(*) AS c FROM finding WHERE target_id=? GROUP BY state",
@@ -560,6 +565,10 @@ class PocDAO(BaseDAO):
             (rid, target_id, case_id, finding_id, level, as_int_bool(verified),
              signal_name, input_sha, bundle_sha, _now()))
         return rid
+
+    def set_finding(self, poc_id: str, finding_id: str) -> None:
+        self.conn.execute("UPDATE poc SET finding_id=? WHERE id=?", (finding_id, poc_id))
+        self.conn.commit()
 
     def list_by_target(self, target_id) -> list[Poc]:
         rows = self.conn.execute(
