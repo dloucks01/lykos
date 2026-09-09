@@ -548,7 +548,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"run_id": run.id, "from_cache": run.status == "done"}, 201)
             if stage in (_INGEST, "disassemble", "detect_cwe", "dynamic_run", "fuzz",
                          "coverage_fuzz", "directed_fuzz", "concolic",
-                         "build_poc", "poc_primitive", "boundary_fuzz",
+                         "build_poc", "poc_primitive", "build_exploit", "boundary_fuzz",
                          "root_cause", "multi_debug", "firmware_carve",
                          "firmware_rehost") and target_id:
                 target = s.targets.get(target_id)
@@ -578,6 +578,9 @@ class Handler(BaseHTTPRequestHandler):
                 elif stage == "poc_primitive":
                     from ..analyze.poc import enqueue_primitive
                     run = enqueue_primitive(q, target, params=body.get("params"))
+                elif stage == "build_exploit":
+                    from ..analyze.poc import enqueue_exploit
+                    run = enqueue_exploit(q, target, params=body.get("params"))
                 elif stage == "root_cause":
                     from ..analyze.debug import enqueue_root_cause
                     run = enqueue_root_cause(q, target, params=body.get("params"))
