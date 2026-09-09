@@ -50,3 +50,26 @@ def make_capture(ctx, helper: Path, exe, mode, base_argv, timeout, python):
             return {"ok": False, "reason": "bad helper output: " + out[:200]}
 
     return capture
+
+
+def make_qemu_capture(exe, arch, mode, base_argv, timeout, *, endianness=None, bits=None):
+    """Return capture(data)->dict for an EMULATED target: drive qemu-user's gdbstub to capture
+    the fault-time registers (pc/sp/GP) on the guest ISA. Same interface as make_capture, so
+    the L2 primitive's pc-based offset recovery and marker confirmation work cross-arch. No
+    ptrace helper and no bwrap (qemu is launched directly)."""
+    from ..debug import qemu_gdb
+    work = Path(tempfile.mkdtemp(prefix="lykos-qemucap-"))
+
+    def capture(data: bytes, breakpoints=None) -> dict:
+        argv, stdin = list(base_argv), b""
+        if mode == "stdin":
+            stdin = data
+        elif mode == "arg":
+            argv = argv + [data.decode("latin-1")]
+        elif mode == "file":
+            (work / "input.bin").write_bytes(data)
+            argv = argv + [str(work / "input.bin")]
+        return qemu_gdb.capture(exe, arch, argv=argv, stdin=stdin, timeout=timeout,
+                                endianness=endianness, bits=bits)
+
+    return capture

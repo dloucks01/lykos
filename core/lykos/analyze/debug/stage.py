@@ -1,7 +1,8 @@
 """Phase 6 — the `root_cause` stage: explain a confirmed crash. Uses GDB when installed,
 otherwise the pure-stdlib ptrace helper; produces a structured root-cause report (fault
 classification + backtrace + a static call-graph/taint slice), stores it as an artifact, and
-attaches a root-cause evidence line to the crash finding. Native-arch only."""
+attaches a root-cause evidence line to the crash finding. Cross-arch targets are captured
+via qemu-user's gdbstub."""
 from __future__ import annotations
 
 import json
@@ -11,8 +12,8 @@ import sys
 from ...db.dao import CallEdgeDAO, FindingDAO, FunctionDAO, TargetDAO
 from ...jobs.registry import register_stage
 from ..dynamic import sandbox
-from ..poc.capture import make_capture, materialize_helper
-from . import gdb, rootcause
+from ..poc.capture import make_capture, make_qemu_capture, materialize_helper
+from . import gdb, qemu_gdb, rootcause
 
 ROOT_CAUSE_STAGE = "root_cause"
 TOOL = "rootcause"
@@ -32,10 +33,12 @@ def root_cause_stage(ctx) -> dict:
     timeout = float(p.get("timeout", 10))
 
     host = sandbox.host_arch()
-    if target.arch and target.arch != host:
+    emulated = bool(target.arch and target.arch != host)
+    if emulated and not qemu_gdb.supported(target.arch):
         ctx.emit("rootcause.done", payload={"supported": False,
-                 "note": f"root-cause needs native execution; target {target.arch} != {host}"})
-        ctx.progress(pct=100, msg="root-cause not supported for cross-arch target")
+                 "note": f"root-cause for cross-arch {target.arch}: no qemu gdbstub layout "
+                         f"(host {host})"})
+        ctx.progress(pct=100, msg="root-cause not supported for this cross-arch target")
         return {}
 
     input_bytes = ctx.content.get_bytes(input_sha)
@@ -44,10 +47,15 @@ def root_cause_stage(ctx) -> dict:
     exe.write_bytes(target_bytes)
     exe.chmod(0o755)
 
-    # capture the fault: GDB backend if available, else the ptrace helper
-    gpath = gdb.locate_gdb(p.get("gdb_path"))
+    # capture the fault: qemu-user gdbstub (cross-arch), else GDB, else the ptrace helper
+    gpath = None if emulated else gdb.locate_gdb(p.get("gdb_path"))
     helper_dir = None
-    if gpath is not None:
+    if emulated:
+        ctx.progress(msg=f"capturing fault under qemu-{target.arch} gdbstub")
+        cap = make_qemu_capture(exe, target.arch, mode, base_argv, timeout,
+                                endianness=target.endianness, bits=target.bits)(input_bytes)
+        backend = "qemu-gdbstub"
+    elif gpath is not None:
         ctx.progress(msg="capturing fault under gdb")
         stdin_file = None
         argv = list(base_argv)

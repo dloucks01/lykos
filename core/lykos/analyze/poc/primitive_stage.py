@@ -1,18 +1,18 @@
 """Phase 6 — the `poc_primitive` stage (L2): prove a confirmed crash yields instruction-
 pointer control, via the cyclic-pattern technique and ptrace register capture. On success it
-builds an L2 PoC bundle and promotes the finding. Native-architecture targets only; cross-arch
-(qemu) targets are reported as unsupported rather than failing."""
+builds an L2 PoC bundle and promotes the finding. Native targets use the ptrace helper;
+cross-arch (emulated) targets are captured via qemu-user's gdbstub (pc-based IP control)."""
 from __future__ import annotations
 
 import shutil
 
 from ...db.dao import FindingDAO, PocDAO, TargetDAO
 from ...jobs.registry import register_stage
-from ..debug import rootcause
+from ..debug import qemu_gdb, rootcause
 from ..dynamic import sandbox
 from ..dynamic.stage import crash_finding_candidate
 from . import bundle, primitive
-from .capture import make_capture, materialize_helper
+from .capture import make_capture, make_qemu_capture, materialize_helper
 
 PRIMITIVE_STAGE = "poc_primitive"
 TOOL = "primitive"
@@ -33,11 +33,12 @@ def primitive_stage(ctx) -> dict:
     timeout = float(p.get("timeout", 8))
 
     host = sandbox.host_arch()
-    if target.arch and target.arch != host:
+    emulated = bool(target.arch and target.arch != host)
+    if emulated and not qemu_gdb.supported(target.arch):
         ctx.emit("primitive.done", payload={"primitive": None, "supported": False,
-                 "note": f"L2 primitive analysis needs native execution; target {target.arch}"
-                         f" != host {host} (cross-arch/qemu not supported yet)"})
-        ctx.progress(pct=100, msg="L2 not supported for cross-arch target")
+                 "note": f"L2 for cross-arch {target.arch}: no qemu gdbstub register layout "
+                         f"(host {host})"})
+        ctx.progress(pct=100, msg="L2 not supported for this cross-arch target")
         return {}
 
     orig = ctx.content.get_bytes(input_sha)
@@ -49,10 +50,14 @@ def primitive_stage(ctx) -> dict:
     length = min(max(len(orig) * 2, 256), 4096)
     helper = materialize_helper()
     try:
-        capture = make_capture(ctx, helper, exe, mode, base_argv, timeout,
-                               sys.executable)
-
-        ctx.progress(msg=f"detonating {length}-byte cyclic pattern under ptrace")
+        if emulated:
+            capture = make_qemu_capture(exe, target.arch, mode, base_argv, timeout,
+                                        endianness=target.endianness, bits=target.bits)
+            ctx.progress(msg=f"detonating {length}-byte cyclic pattern under qemu-{target.arch}"
+                             " gdbstub")
+        else:
+            capture = make_capture(ctx, helper, exe, mode, base_argv, timeout, sys.executable)
+            ctx.progress(msg=f"detonating {length}-byte cyclic pattern under ptrace")
         cap0 = capture(primitive.cyclic(length))
         if not cap0.get("ok") or not cap0.get("signal_name"):
             ctx.emit("primitive.done", payload={"primitive": None, "supported": True,
