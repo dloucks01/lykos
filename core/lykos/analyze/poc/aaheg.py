@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .heap import in_tcache_range, mangle, request2size, tcache_index
+from .heap import in_tcache_range, is_fastbin, mangle, request2size, tcache_index
 
 
 @dataclass
@@ -113,6 +113,21 @@ _ADVISORY = [
      "applies": lambda v, e: v.vclass in ("uaf", "heap_overflow"),
      "outline": "free() a pointer into attacker-controlled memory with a forged chunk header "
                 "(valid size, aligned), then malloc returns it."},
+    {"technique": "unsorted_bin_attack",
+     "primitive": "write a libc (main_arena) address to a chosen location",
+     "applies": lambda v, e: v.vclass in ("uaf", "heap_overflow")
+     and not is_fastbin(request2size(v.size)),
+     "outline": "corrupt a free unsorted-bin chunk's bk to (TARGET-0x10); the next malloc that "
+                "scans the unsorted bin writes &main_arena.bins[...] to TARGET (glibc>=2.29 "
+                "added a bk-integrity check -- pair with a large-bin attack on modern libc)."},
+    {"technique": "large_bin_attack",
+     "primitive": "write a heap/controlled address to a chosen location",
+     "applies": lambda v, e: v.vclass in ("uaf", "heap_overflow")
+     and request2size(v.size) >= 0x400,
+     "outline": "with two large chunks sorted into the same large bin, corrupt the first's "
+                "bk_nextsize (and fd_nextsize) so inserting the second writes its address to "
+                "TARGET (bk_nextsize+0x20); the modern go-to for a controlled write on "
+                "glibc>=2.30."},
 ]
 
 
