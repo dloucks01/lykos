@@ -545,7 +545,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"run_id": run.id, "from_cache": run.status == "done"}, 201)
             if stage in (_INGEST, "disassemble", "detect_cwe", "dynamic_run", "fuzz",
                          "coverage_fuzz", "directed_fuzz", "concolic",
-                         "build_poc", "poc_primitive",
+                         "build_poc", "poc_primitive", "boundary_fuzz",
                          "root_cause") and target_id:
                 target = s.targets.get(target_id)
                 if not target:
@@ -577,6 +577,9 @@ class Handler(BaseHTTPRequestHandler):
                 elif stage == "root_cause":
                     from ..analyze.debug import enqueue_root_cause
                     run = enqueue_root_cause(q, target, params=body.get("params"))
+                elif stage == "boundary_fuzz":
+                    from ..analyze.link import enqueue_boundary
+                    run = enqueue_boundary(q, target, params=body.get("params"))
                 else:
                     from ..analyze.poc import enqueue_build_poc
                     run = enqueue_build_poc(q, target, params=body.get("params"))

@@ -643,6 +643,7 @@ async function showDetail(targetId){
       <button class="btn sm" id="covrun" title="Coverage-guided fuzzing (AFL++ qemu-mode)">Coverage Fuzz</button>
       <button class="btn sm" id="dirrun" title="Directed fuzzing steered at statically-flagged sinks">Directed Fuzz</button>
       <button class="btn sm" id="concrun" title="Hybrid concolic execution (angr): solve inputs that reach the flagged sinks">Concolic</button>
+      <button class="btn sm" id="bndrun" title="Boundary-driven harnessing: fuzz this consumer through its IPC endpoint (channel auto-detected from the component graph)">Boundary Fuzz</button>
       <span class="mono" id="fuzzstat" style="color:var(--faint);font-size:11px"></span>
     </div>
     <div id="dynresults"></div>
@@ -660,6 +661,7 @@ async function showDetail(targetId){
   document.getElementById("covrun").onclick = ()=>doCoverage(targetId);
   document.getElementById("dirrun").onclick = ()=>doDirected(targetId);
   document.getElementById("concrun").onclick = ()=>doConcolic(targetId);
+  document.getElementById("bndrun").onclick = ()=>doBoundary(targetId);
   loadFunctions(targetId);
   loadStrings(targetId);
   loadFindings(targetId);
@@ -725,6 +727,11 @@ async function doDirected(tid){
   await fetch("/runs",{method:"POST",headers:{"Content-Type":"application/json"},
     body:JSON.stringify({case_id:CUR,target_id:tid,stage:"directed_fuzz",
       params:{input_mode:(mode==="none"?"stdin":mode),max_execs:6000,max_seconds:30}})});
+}
+async function doBoundary(tid){
+  const st=document.getElementById("fuzzstat"); if(st) st.textContent="boundary harness…";
+  await fetch("/runs",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({case_id:CUR,target_id:tid,stage:"boundary_fuzz"})});
 }
 async function doConcolic(tid){
   const mode = document.getElementById("dynmode").value;
@@ -867,6 +874,9 @@ function openWS(id){
         : (e.payload.primitive ? `L2: ${e.payload.primitive} (unconfirmed)` : (e.payload.note||"no L2 primitive")); }
       loadPocs(DETAIL_TID); loadFindings(DETAIL_TID);
     }
+    if(e.type==="harness.start"){ const st=document.getElementById("fuzzstat"); if(st&&e.payload) st.textContent = e.payload.error?("boundary: "+e.payload.error):`boundary → ${esc(e.payload.family)} ${esc(e.payload.key)}`; }
+    if(e.type==="harness.progress"){ const st=document.getElementById("fuzzstat"); if(st&&e.payload) st.textContent=`boundary: ${e.payload.execs} execs · ${e.payload.crashes} crashes`; }
+    if(e.type==="harness.done" && DETAIL_TID){ const st=document.getElementById("fuzzstat"); if(st&&e.payload) st.textContent = e.payload.error?("boundary: "+e.payload.error):`boundary done: ${e.payload.execs} execs · ${e.payload.unique} unique`; loadDyn(DETAIL_TID); loadFindings(DETAIL_TID); }
     if(e.type==="poc.done" && DETAIL_TID){ loadPocs(DETAIL_TID); loadFindings(DETAIL_TID); }
     if((e.type==="cross_taint.done"||e.type==="link.done"||e.type==="ipc_model.done") && BOARD_VIEW==="sysmap"){ loadSystemMap(false); }
     if(e.type==="cross_taint.done" && e.payload){ logline("xtaint","",`${e.payload.cross_findings} cross-component finding(s)`); }
