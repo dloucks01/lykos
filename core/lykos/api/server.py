@@ -592,7 +592,8 @@ class Handler(BaseHTTPRequestHandler):
             if stage in (_INGEST, "disassemble", "detect_cwe", "dynamic_run", "fuzz",
                          "coverage_fuzz", "directed_fuzz", "concolic",
                          "build_poc", "poc_primitive", "build_exploit", "boundary_fuzz",
-                         "synthesize_poc", "root_cause", "multi_debug", "firmware_carve",
+                         "synthesize_poc", "root_cause", "multi_debug", "debug_monitor",
+                         "firmware_carve",
                          "firmware_rehost") and target_id:
                 target = s.targets.get(target_id)
                 if not target:
@@ -630,6 +631,9 @@ class Handler(BaseHTTPRequestHandler):
                 elif stage == "multi_debug":
                     from ..analyze.debug import enqueue_multi_debug
                     run = enqueue_multi_debug(q, target, params=body.get("params"))
+                elif stage == "debug_monitor":
+                    from ..analyze.debug import enqueue_monitor
+                    run = enqueue_monitor(q, target, params=body.get("params"))
                 elif stage == "firmware_carve":
                     from ..analyze.firmware import enqueue_firmware
                     run = enqueue_firmware(q, target, params=body.get("params"))
