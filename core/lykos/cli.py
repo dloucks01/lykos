@@ -62,6 +62,9 @@ def build_parser() -> argparse.ArgumentParser:
     sv.set_defaults(func=_cmd_serve)
 
     ev = sub.add_parser("eval", help="run the validation benchmark (doc 14) and score it")
+    ev.add_argument("--stage", choices=["static", "dynamic"], default="static",
+                    help="static = candidate-stage CWE detection (Ghidra); "
+                         "dynamic = confirmed-stage crash reproduction via fuzzing")
     ev.add_argument("--corpus", default=None,
                     help="directory of <CWE>__<name>__<good|bad>.c cases (default: bundled)")
     ev.add_argument("--out", default=None, help="write the full JSON report to this path")
@@ -76,15 +79,17 @@ def _cmd_eval(args: argparse.Namespace) -> int:
     from .eval import corpus as corpusmod
     from .eval import harness
     cases = corpusmod.load_dir(args.corpus) if args.corpus else None
-    rep = harness.run(cases, workers=args.workers,
+    rep = harness.run(cases, stage=args.stage, workers=args.workers,
                       progress=lambda m: print(m, file=sys.stderr, flush=True))
     for w in rep.meta.get("warnings", []):
         print(f"warning: {w}", file=sys.stderr)
     print(rep.table())
     o = rep.metrics.get("overall", {})
-    print(f"\n{rep.metrics.get('n_cases', 0)} cases, {rep.metrics.get('n_cwe_classes', 0)} "
-          f"CWE classes, {rep.meta.get('elapsed_s')}s "
-          f"(ghidra={'yes' if rep.meta.get('ghidra') else 'NO'})")
+    backend = (f"ghidra={'yes' if rep.meta.get('ghidra') else 'NO'}" if args.stage == "static"
+               else f"fuzz budget={rep.meta.get('max_execs')} execs/{rep.meta.get('max_seconds')}s")
+    print(f"\n{args.stage}-stage: {rep.metrics.get('n_cases', 0)} cases, "
+          f"{rep.metrics.get('n_cwe_classes', 0)} CWE classes, "
+          f"{rep.meta.get('elapsed_s')}s ({backend})")
     if args.out:
         Path(args.out).write_text(json.dumps(rep.to_dict(), indent=2))
         print(f"report written to {args.out}")

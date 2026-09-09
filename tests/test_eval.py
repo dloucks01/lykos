@@ -92,6 +92,18 @@ def test_compile_uses_neutral_source_name(tmp_path):
     assert b"src.c" not in exe.read_bytes() and exe.name == "prog"
 
 
+# ---------------------------------------------------------------- dynamic (confirmed) corpus
+def test_dynamic_corpus_is_labeled_crash_pairs():
+    cs = corpus.bundled_dynamic()
+    assert len(cs) >= 4
+    by = {}
+    for c in cs:
+        assert c.verdict in ("good", "bad") and c.cwe in CWE
+        by.setdefault(c.cwe, set()).add(c.verdict)
+    for cwe, verds in by.items():
+        assert verds == {"good", "bad"}, f"{cwe} lacks a crash/safe pair"
+
+
 # ---------------------------------------------------------------- live end-to-end (Ghidra)
 def test_harness_scores_a_real_pair_end_to_end():
     """Compile + analyze a bad/good pair through the real pipeline; the bad case is flagged
@@ -106,3 +118,19 @@ def test_harness_scores_a_real_pair_end_to_end():
     assert not by["system_none"].flagged             # safe variant -> no false positive
     assert rep.metrics["per_cwe"]["CWE-78"]["recall"] == 1.0
     assert rep.metrics["per_cwe"]["CWE-78"]["fp_rate"] == 0.0
+
+
+def test_confirmed_stage_reproduces_a_crash_via_fuzzing():
+    """The dynamic harness fuzzes a crash/safe pair: the bug is reproduced as a CONFIRMED
+    finding (recall) and the safe variant is not (~0 FP-rate). Needs gcc; no Ghidra."""
+    if not shutil.which("gcc"):
+        pytest.skip("needs gcc for the confirmed-stage benchmark")
+    pair = [c for c in corpus.bundled_dynamic()
+            if c.name in ("nullderef_crash", "nullderef_safe")]
+    rep = harness.run_dynamic_corpus(pair, max_execs=1200, max_seconds=20, stage_timeout=60)
+    by = {o.name: o for o in rep.outcomes}
+    assert by["nullderef_crash"].flagged                 # reproduced -> Confirmed
+    assert by["nullderef_crash"].state in ("confirmed", "poc-backed")
+    assert not by["nullderef_safe"].flagged              # safe variant -> no confirmed crash
+    assert rep.metrics["per_cwe"]["CWE-476"]["recall"] == 1.0
+    assert rep.metrics["per_cwe"]["CWE-476"]["fp_rate"] == 0.0
