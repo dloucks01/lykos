@@ -224,4 +224,20 @@ CREATE TABLE poc(
 );
 CREATE INDEX ix_poc_target ON poc(target_id);
 """),
+    Migration(version=9, name="component_edges", sql=r"""
+-- Phase 8 (doc 17.1): the component graph. Case-level edges between targets discovered
+-- by resolving imports<->exports (and, later, IPC/exec/file relationships).
+CREATE TABLE component_edge(
+  id          TEXT PRIMARY KEY,
+  case_id     TEXT NOT NULL REFERENCES "case"(id) ON DELETE CASCADE,
+  src_target  TEXT NOT NULL,      -- importer / caller component (A)
+  dst_target  TEXT NOT NULL,      -- exporter / callee component (B)
+  kind        TEXT,               -- dynamic-link | dlopen | ipc | exec | file
+  symbol      TEXT,               -- resolved symbol / channel key (nullable)
+  detail      TEXT,
+  created_at  INTEGER NOT NULL,
+  UNIQUE(case_id, src_target, dst_target, kind, symbol)
+);
+CREATE INDEX ix_component_edge_case ON component_edge(case_id);
+"""),
 ]

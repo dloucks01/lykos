@@ -14,7 +14,7 @@ from . import filetype
 
 SCHEMA_VERSION = 1
 TOOL = "elf-stdlib"
-TOOL_VERSION = "triage-1"          # bump to invalidate the cache when parsing changes
+TOOL_VERSION = "triage-2"          # bump to invalidate the cache when parsing changes
 MITIGATION_ENUM = {"on", "off", "partial", "unknown"}
 _FILE_TYPES = {filetype.ELF, filetype.PE, filetype.MACHO, filetype.RAW, filetype.OTHER}
 _PACK_ENTROPY = 7.2
@@ -52,8 +52,9 @@ def build_triage(path: str | Path, hashes: dict[str, Any], filename: str) -> dic
         "file_type": filetype.RAW, "detected": None,
         "arch": None, "bits": None, "endianness": None, "linking": None,
         "stripped": None, "entry_point": None, "interpreter": None,
-        "sections": [], "imports": {"libraries": [], "functions_count": 0},
-        "exports_count": 0, "toolchain_hint": "unknown", "mitigations": {},
+        "sections": [], "imports": {"libraries": [], "functions_count": 0, "symbols": []},
+        "exports_count": 0, "exports": {"count": 0, "symbols": []},
+        "toolchain_hint": "unknown", "mitigations": {},
         "entropy": {"overall": 0.0, "packed_hint": False, "packer": None, "reasons": []},
         "format_details": {}, "parse_errors": parse_errors,
         "tool": TOOL, "tool_version": TOOL_VERSION,
@@ -76,6 +77,7 @@ def build_triage(path: str | Path, hashes: dict[str, Any], filename: str) -> dic
             "entry_point": (f"0x{info.entry:x}" if info.entry is not None else None),
             "interpreter": info.interpreter, "sections": info.sections,
             "imports": info.imports, "exports_count": info.exports_count,
+            "exports": {"count": info.exports_count, "symbols": info.exported_symbols},
             "toolchain_hint": info.toolchain_hint, "mitigations": info.mitigations,
             "format_details": elfmod.to_format_details(info),
         })

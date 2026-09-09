@@ -183,6 +183,18 @@ class Poc:
 
 
 @dataclass
+class ComponentEdge:
+    id: str
+    case_id: str
+    src_target: str
+    dst_target: str
+    created_at: int
+    kind: Optional[str] = None
+    symbol: Optional[str] = None
+    detail: Optional[str] = None
+
+
+@dataclass
 class Event:
     case_id: Optional[str]
     run_id: Optional[str]

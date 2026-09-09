@@ -85,6 +85,7 @@ _TARGET_DYN = re.compile(r"^/targets/([^/]+)/dynresults$")
 _TARGET_POC = re.compile(r"^/targets/([^/]+)/pocs$")
 _CASE_REPORT = re.compile(r"^/cases/([^/]+)/report$")
 _CASE_EXPORT = re.compile(r"^/cases/([^/]+)/export$")
+_CASE_SYSMAP = re.compile(r"^/cases/([^/]+)/systemmap$")
 
 
 def _read_ui() -> bytes:
@@ -224,6 +225,9 @@ class Handler(BaseHTTPRequestHandler):
             m = _CASE_EXPORT.match(path)
             if m:
                 return self._get_case_export(m.group(1))
+            m = _CASE_SYSMAP.match(path)
+            if m:
+                return self._get_systemmap(m.group(1))
             m = _FIND_ID.match(path)
             if m:
                 s = self._store()
@@ -385,6 +389,33 @@ class Handler(BaseHTTPRequestHandler):
             pass
         return self._bytes(data, "application/gzip", filename=f"{name}.tar.gz")
 
+    def _get_systemmap(self, cid):
+        """The component graph (doc 17.1): nodes are targets, edges are resolved
+        cross-binary relationships. `?resolve=1` recomputes links before returning."""
+        from ..analyze.link.resolve import edge_symbols, resolve_case
+        from ..db.dao import ComponentEdgeDAO, FindingDAO
+        parsed = urlparse(self.path)
+        do_resolve = parse_qs(parsed.query).get("resolve", ["0"])[0] == "1"
+        s = self._store()
+        try:
+            if not s.cases.get(cid):
+                return self._json({"error": "no case"}, 404)
+            if do_resolve:
+                resolve_case(s.conn, s.content, cid, persist=True)
+            fdao = FindingDAO(s.conn)
+            nodes = []
+            for t in s.targets.list_by_case(cid):
+                nodes.append({**_target(t),
+                              "findings": fdao.count_by_target(t.id)})
+            edges = []
+            for e in ComponentEdgeDAO(s.conn).list_by_case(cid):
+                edges.append({"src": e.src_target, "dst": e.dst_target, "kind": e.kind,
+                              "symbol": e.symbol or None,
+                              "symbols": edge_symbols(e.detail)})
+            return self._json({"nodes": nodes, "edges": edges})
+        finally:
+            s.close()
+
     def _import_case(self):
         """Merge an uploaded case archive (per-case or whole-store .tar.gz) into the store."""
         ctype = self.headers.get("Content-Type", "")
@@ -498,6 +529,11 @@ class Handler(BaseHTTPRequestHandler):
             q = JobQueue(s.conn)
             stage = body.get("stage", _INGEST)
             target_id = body.get("target_id")
+            if stage == "link_case":
+                from ..analyze.link import enqueue_link
+                run = enqueue_link(q, body.get("case_id") or (
+                    s.targets.get(target_id).case_id if target_id else None))
+                return self._json({"run_id": run.id, "from_cache": run.status == "done"}, 201)
             if stage in (_INGEST, "disassemble", "detect_cwe", "dynamic_run", "fuzz",
                          "coverage_fuzz", "directed_fuzz", "concolic",
                          "build_poc", "poc_primitive",
