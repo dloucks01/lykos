@@ -57,7 +57,7 @@ def dynamic_stage(ctx) -> dict:
         raise ValueError("dynamic_run requires a target_id")
 
     params = ctx.params or {}
-    mode = params.get("input_mode", "none")      # stdin | arg | none
+    mode = params.get("input_mode", "none")      # stdin | arg | file | none
     argv = list(params.get("argv") or [])
     timeout = float(params.get("timeout", 10))
     input_bytes = base64.b64decode(params["input_b64"]) if params.get("input_b64") else b""
@@ -65,6 +65,10 @@ def dynamic_stage(ctx) -> dict:
     stdin = input_bytes if mode == "stdin" else b""
     if mode == "arg" and input_bytes:
         argv = argv + [input_bytes.decode("latin-1")]
+    elif mode == "file" and input_bytes:         # deliver the input as a file argument
+        infile = ctx.scratch() / "input.bin"
+        infile.write_bytes(input_bytes)
+        argv = argv + [str(infile)]
 
     exe = ctx.scratch() / "target.bin"
     exe.write_bytes(ctx.content.path(target.sha256).read_bytes())
