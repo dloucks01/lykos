@@ -253,6 +253,17 @@ tr.fdetail>td{background:var(--surface-2);border-bottom:1px solid var(--border-s
 .cvcalls span.ext{color:var(--warn);border-color:var(--warn)}
 @media(max-width:920px){.cvbody{grid-template-columns:1fr}
   .cvpane+.cvpane{border-left:0;border-top:1px solid var(--border)}}
+/* ---- CFG graph ---- */
+.cvcfg{overflow:auto;max-height:320px;padding:6px}
+.cfgsvg{display:block;font-family:var(--mono)}
+.cfgnode rect{fill:var(--surface-2);stroke:var(--border-strong);stroke-width:1}
+.cfgnode:hover rect{stroke:var(--accent)}
+.cfghdr{fill:var(--accent);font-size:9px;font-weight:700}
+.cfgins{fill:var(--dim);font-size:8.5px}
+.cfgins.dim{fill:var(--faint)}
+.cfgedge{fill:none;stroke:var(--border-strong);stroke-width:1.4}
+.cfgedge.back{stroke:var(--info);stroke-dasharray:4 3}
+.cfgarh{fill:var(--border-strong)}
 /* ---- system map: toolbar + legend ---- */
 .smtools{display:flex;gap:6px;flex-wrap:wrap}
 .smlegend{display:flex;align-items:center;gap:16px;flex-wrap:wrap;font-size:11px;color:var(--dim);
@@ -1121,10 +1132,49 @@ function renderCodeViewer(){
     <div class="cvbody">
       <div class="cvpane"><div class="cvplabel">Pseudocode</div>
         <pre class="cvcode">${esc(f.decompiled||"(no decompilation — run Decompile)")}</pre></div>
-      <div class="cvpane"><div class="cvplabel">CFG · P-Code (${blocks.length} blocks)</div>
-        <pre class="cvcode">${renderCFG(blocks)||"(no CFG)"}</pre></div>
+      <div class="cvpane"><div class="cvplabel">CFG (${blocks.length} blocks · ${f.edges||0} edges)</div>
+        <div class="cvcfg">${renderCFGGraph(blocks)}</div></div>
     </div>
     <div class="cvcalls"><span class="cvplabel" style="padding:0;margin-right:2px">Calls</span>${calls}</div>`;
+}
+// Vanilla layered SVG CFG: rank blocks by BFS depth, box per basic block with its
+// disassembly, real arrowed edges, back-edges (loops) drawn dashed. No external libs (air-gap).
+function renderCFGGraph(blocks){
+  if(!blocks || !blocks.length) return `<div class="hint" style="padding:10px 12px">no CFG — run Decompile</div>`;
+  const byAddr={}; blocks.forEach(b=>byAddr[b.addr]=b);
+  const rank={}, q=[blocks[0].addr]; rank[blocks[0].addr]=0;   // BFS ranks from the entry block
+  while(q.length){ const a=q.shift(), b=byAddr[a]; if(!b) continue;
+    (b.succ||[]).forEach(s=>{ if(byAddr[s] && rank[s]===undefined){ rank[s]=rank[a]+1; q.push(s); } }); }
+  let maxr=0; Object.values(rank).forEach(r=>maxr=Math.max(maxr,r));
+  blocks.forEach(b=>{ if(rank[b.addr]===undefined) rank[b.addr]=++maxr; });   // unreachable -> tail
+  const rows={}; blocks.forEach(b=>{ (rows[rank[b.addr]]=rows[rank[b.addr]]||[]).push(b); });
+  const ranks=Object.keys(rows).map(Number).sort((a,b)=>a-b);
+  const boxW=176, lineH=12, headH=15, pad=6, maxLines=7, gapX=28, gapY=32;
+  const nins=b=>(b.instructions||[]).length;
+  const boxH=b=>headH+pad+Math.min(nins(b),maxLines)*lineH+(nins(b)>maxLines?lineH:0)+pad;
+  const pos={}; let y=12, maxW=boxW;
+  ranks.forEach(r=>{ const row=rows[r]; maxW=Math.max(maxW,row.length*(boxW+gapX)-gapX);
+    let hmax=0; row.forEach(b=>hmax=Math.max(hmax,boxH(b)));
+    row.forEach((b,i)=>pos[b.addr]={x:i*(boxW+gapX),y:y,w:boxW,h:boxH(b)}); y+=hmax+gapY; });
+  const W=maxW+24, H=y;
+  ranks.forEach(r=>{ const row=rows[r], rowW=row.length*(boxW+gapX)-gapX, off=(W-24-rowW)/2+12;
+    row.forEach(b=>pos[b.addr].x+=off); });
+  const edges=[]; blocks.forEach(b=>(b.succ||[]).forEach(s=>{ const sp=pos[b.addr], dp=pos[s]; if(!dp) return;
+    const x1=sp.x+sp.w/2, y1=sp.y+sp.h, x2=dp.x+dp.w/2, y2=dp.y, back=rank[s]<=rank[b.addr];
+    if(back){ const mx=Math.max(sp.x+sp.w,dp.x+dp.w)+34;
+      edges.push(`<path d="M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}" class="cfgedge back" marker-end="url(#cfgar)"/>`); }
+    else edges.push(`<path d="M${x1},${y1} C${x1},${(y1+y2)/2} ${x2},${(y1+y2)/2} ${x2},${y2}" class="cfgedge" marker-end="url(#cfgar)"/>`);
+  }));
+  const boxes=blocks.map(b=>{ const p=pos[b.addr];
+    const ins=(b.instructions||[]).slice(0,maxLines).map((i,j)=>
+      `<text x="${p.x+pad}" y="${p.y+headH+lineH*(j+1)}" class="cfgins">${esc((i.text||'').slice(0,28))}</text>`).join('');
+    const more=nins(b)>maxLines?`<text x="${p.x+pad}" y="${p.y+headH+lineH*(maxLines+1)}" class="cfgins dim">…${nins(b)-maxLines} more</text>`:'';
+    return `<g class="cfgnode"><rect x="${p.x}" y="${p.y}" width="${p.w}" height="${p.h}" rx="6"/>`+
+      `<text x="${p.x+pad}" y="${p.y+11}" class="cfghdr">${esc(b.addr)}</text>${ins}${more}</g>`;
+  }).join('');
+  return `<svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" class="cfgsvg">`+
+    `<defs><marker id="cfgar" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" class="cfgarh"/></marker></defs>`+
+    edges.join('')+boxes+`</svg>`;
 }
 function renderCFG(blocks){
   return blocks.map(b=>{
