@@ -530,7 +530,7 @@ class Handler(BaseHTTPRequestHandler):
             q = JobQueue(s.conn)
             stage = body.get("stage", _INGEST)
             target_id = body.get("target_id")
-            if stage in ("link_case", "cross_taint", "ipc_model"):
+            if stage in ("link_case", "cross_taint", "ipc_model", "whole_system"):
                 cid = body.get("case_id") or (
                     s.targets.get(target_id).case_id if target_id else None)
                 if stage == "link_case":
@@ -539,6 +539,9 @@ class Handler(BaseHTTPRequestHandler):
                 elif stage == "ipc_model":
                     from ..analyze.link import enqueue_ipc
                     run = enqueue_ipc(q, cid)
+                elif stage == "whole_system":
+                    from ..analyze.link import enqueue_whole_system
+                    run = enqueue_whole_system(q, cid, params=body.get("params"))
                 else:
                     from ..analyze.link import enqueue_cross_taint
                     run = enqueue_cross_taint(q, cid)

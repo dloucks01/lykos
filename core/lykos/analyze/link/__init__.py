@@ -5,6 +5,7 @@ merged system graph spanning the case's binaries (Karonte's Binary Dependency Gr
 pattern, deterministic, zero-AI). Importing registers the `link_case` stage.
 """
 from .crosstaint import cross_taint_case  # noqa: F401
+from .detonate import detonate  # noqa: F401
 from .harness import channel_run  # noqa: F401
 from .harness_stage import BOUNDARY_STAGE, enqueue_boundary  # noqa: F401
 from .harness_stage import register as _register_boundary
@@ -22,6 +23,8 @@ from .stage import (  # noqa: F401
 from .stage import register as _register
 from .stage import register_cross_taint as _register_ct
 from .stage import register_ipc as _register_ipc
+from .whole_system import WHOLE_SYSTEM_STAGE, enqueue_whole_system  # noqa: F401
+from .whole_system import register as _register_system
 
 
 def register() -> None:
@@ -29,3 +32,4 @@ def register() -> None:
     _register_ct()
     _register_ipc()
     _register_boundary()
+    _register_system()
