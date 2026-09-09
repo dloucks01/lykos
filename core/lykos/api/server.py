@@ -83,6 +83,8 @@ _CASE_FIND = re.compile(r"^/cases/([^/]+)/findings$")
 _FIND_ID = re.compile(r"^/findings/([^/]+)$")
 _TARGET_DYN = re.compile(r"^/targets/([^/]+)/dynresults$")
 _TARGET_POC = re.compile(r"^/targets/([^/]+)/pocs$")
+_CASE_REPORT = re.compile(r"^/cases/([^/]+)/report$")
+_CASE_EXPORT = re.compile(r"^/cases/([^/]+)/export$")
 
 
 def _read_ui() -> bytes:
@@ -116,6 +118,16 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _bytes(self, data: bytes, content_type: str, *, status: int = 200,
+               filename: Optional[str] = None) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        if filename:
+            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.end_headers()
+        self.wfile.write(data)
 
     def _read_body(self) -> bytes:
         n = int(self.headers.get("Content-Length", 0))
@@ -206,6 +218,12 @@ class Handler(BaseHTTPRequestHandler):
             m = _CASE_FIND.match(path)
             if m:
                 return self._get_case_findings(m.group(1))
+            m = _CASE_REPORT.match(path)
+            if m:
+                return self._get_report(m.group(1), qs)
+            m = _CASE_EXPORT.match(path)
+            if m:
+                return self._get_case_export(m.group(1))
             m = _FIND_ID.match(path)
             if m:
                 s = self._store()
@@ -276,6 +294,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._upload_target(m.group(1))
             if path == "/runs":
                 return self._create_run()
+            if path == "/import":
+                return self._import_case()
             self._json({"error": "not found"}, 404)
         except Exception as e:
             self._json({"error": repr(e)}, 500)
@@ -304,6 +324,86 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(out)
         finally:
             s.close()
+
+    def _get_report(self, cid, qs):
+        """Generate a report for a case in the requested format (html|pdf|sarif|json).
+
+        Query params: format, min_severity, min_state, states=csv, finding_ids=csv,
+        embed=0|1 (embed PoC bundles into html/json; default on).
+        """
+        from ..report import (
+            DEFAULT_MIN_STATE,
+            build_report,
+            to_html,
+            to_pdf,
+            to_sarif,
+        )
+        from ..report.casejson import to_case_json_bytes
+        fmt = qs.get("format", ["html"])[0]
+        embed = qs.get("embed", ["1"])[0] != "0" and fmt in ("html", "json")
+        states = _csv(qs.get("states"))
+        finding_ids = _csv(qs.get("finding_ids"))
+        s = self._store()
+        try:
+            if not s.cases.get(cid):
+                return self._json({"error": "no case"}, 404)
+            report = build_report(
+                s, cid,
+                min_severity=qs.get("min_severity", [None])[0],
+                min_state=qs.get("min_state", [DEFAULT_MIN_STATE])[0],
+                states=states, finding_ids=finding_ids, embed_pocs=embed,
+            )
+        finally:
+            s.close()
+        name = (report["case"].get("name") or "case").replace(" ", "_")[:40]
+        if fmt == "pdf":
+            return self._bytes(to_pdf(report), "application/pdf",
+                               filename=f"{name}.pdf")
+        if fmt == "sarif":
+            body = json.dumps(to_sarif(report), indent=2).encode("utf-8")
+            return self._bytes(body, "application/json", filename=f"{name}.sarif")
+        if fmt == "json":
+            return self._bytes(to_case_json_bytes(report), "application/json",
+                               filename=f"{name}.json")
+        return self._bytes(to_html(report).encode("utf-8"), "text/html; charset=utf-8")
+
+    def _get_case_export(self, cid):
+        """Stream a portable single-case archive (rows + artifact blobs) as .tar.gz."""
+        s = self._store()
+        try:
+            if not s.cases.get(cid):
+                return self._json({"error": "no case"}, 404)
+            name = (s.cases.get(cid).name or "case").replace(" ", "_")[:40]
+            tmp = Path(tempfile.mkdtemp()) / f"{name}.tar.gz"
+            s.export_case(cid, tmp)
+            data = tmp.read_bytes()
+        finally:
+            s.close()
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return self._bytes(data, "application/gzip", filename=f"{name}.tar.gz")
+
+    def _import_case(self):
+        """Merge an uploaded case archive (per-case or whole-store .tar.gz) into the store."""
+        ctype = self.headers.get("Content-Type", "")
+        body = self._read_body()
+        _, data = extract_file(ctype, body)
+        if data is None:
+            data = body
+        tmp = Path(tempfile.mkdtemp()) / "import.tar.gz"
+        tmp.write_bytes(data)
+        s = self._store()
+        try:
+            ids = s.import_archive(tmp)
+            return self._json({"cases": ids}, 201)
+        finally:
+            s.close()
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
     def _get_case(self, cid):
         s = self._store()
@@ -484,6 +584,16 @@ class Handler(BaseHTTPRequestHandler):
 
 
 # --------------------------------------------------------------------------- serializers
+def _csv(vals):
+    """Parse a repeated/CSV query param into a list, or None if absent."""
+    if not vals:
+        return None
+    out = []
+    for v in vals:
+        out += [x for x in v.split(",") if x]
+    return out or None
+
+
 def _case(c):
     return {"id": c.id, "name": c.name, "notes": c.notes,
             "engagement_ref": c.engagement_ref, "created_at": c.created_at}
