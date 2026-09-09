@@ -60,7 +60,36 @@ def build_parser() -> argparse.ArgumentParser:
     sv.add_argument("--case-store", required=True, help="case directory")
     sv.add_argument("--workers", type=int, default=None, help="worker count (default cores-1)")
     sv.set_defaults(func=_cmd_serve)
+
+    ev = sub.add_parser("eval", help="run the validation benchmark (doc 14) and score it")
+    ev.add_argument("--corpus", default=None,
+                    help="directory of <CWE>__<name>__<good|bad>.c cases (default: bundled)")
+    ev.add_argument("--out", default=None, help="write the full JSON report to this path")
+    ev.add_argument("--workers", type=int, default=2, help="worker count (default 2)")
+    ev.set_defaults(func=_cmd_eval)
     return p
+
+
+def _cmd_eval(args: argparse.Namespace) -> int:
+    import json
+
+    from .eval import corpus as corpusmod
+    from .eval import harness
+    cases = corpusmod.load_dir(args.corpus) if args.corpus else None
+    rep = harness.run(cases, workers=args.workers,
+                      progress=lambda m: print(m, file=sys.stderr, flush=True))
+    for w in rep.meta.get("warnings", []):
+        print(f"warning: {w}", file=sys.stderr)
+    print(rep.table())
+    o = rep.metrics.get("overall", {})
+    print(f"\n{rep.metrics.get('n_cases', 0)} cases, {rep.metrics.get('n_cwe_classes', 0)} "
+          f"CWE classes, {rep.meta.get('elapsed_s')}s "
+          f"(ghidra={'yes' if rep.meta.get('ghidra') else 'NO'})")
+    if args.out:
+        Path(args.out).write_text(json.dumps(rep.to_dict(), indent=2))
+        print(f"report written to {args.out}")
+    # non-zero exit if any bug was missed or any good case falsely flagged (CI gate)
+    return 0 if (o.get("fn", 0) == 0 and o.get("fp", 0) == 0 and o.get("tp", 0) > 0) else 1
 
 
 def main(argv: list[str] | None = None) -> int:
