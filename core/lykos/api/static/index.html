@@ -1089,6 +1089,8 @@ async function showDetail(targetId){
                 <option value="boundary">Boundary (IPC)</option>
               </select>
               <button class="btn sm primary" id="fuzzrun">Fuzz ▶</button>
+              <span class="vsep"></span>
+              <button class="btn sm" id="synthrun" title="Deterministic: synthesize the overflow input from the recovered stack frame (buffer size + offset) and detonate once -- no fuzzing. Needs Decompile first.">Synthesize PoC (no fuzz)</button>
               <span class="fghint" id="strathint"></span>
             </div>
           </div>
@@ -1113,6 +1115,7 @@ async function showDetail(targetId){
   document.getElementById("rehost").onclick = ()=>doRehost(targetId);
   document.getElementById("dynrun").onclick = ()=>doDynamic(targetId);
   document.getElementById("fuzzrun").onclick = ()=>runFuzz(targetId);
+  document.getElementById("synthrun").onclick = ()=>doSynthesize(targetId);
   const fm=document.getElementById("fuzzmetrics"); if(fm){ fm.hidden=true; fm.innerHTML=""; }
   const sc=document.getElementById("seedcount"); if(sc) sc.textContent="";
   CUSTOM_SPEC=null; BUILDER=[]; updateCustomChip();   // a built spec is per-target
@@ -1497,6 +1500,12 @@ async function doDirected(tid){
 async function doBoundary(tid){
   await postRun(tid, "boundary_fuzz", {}, {status:"boundary harness…"});
 }
+async function doSynthesize(tid){
+  const mode = document.getElementById("dynmode").value;
+  await postRun(tid, "synthesize_poc",
+    {input_mode:(mode==="none"?undefined:mode), timeout:8},
+    {status:"synthesizing overflow from recovered frame (no fuzzing)…"});
+}
 async function doConcolic(tid){
   const mode = document.getElementById("dynmode").value;
   await postRun(tid, "concolic", {input_mode:(mode==="none"?"stdin":mode),input_size:64,max_seconds:120,
@@ -1817,6 +1826,14 @@ function openWS(id){
     if(e.type==="harness.progress"){ const st=document.getElementById("fuzzstat"); if(st&&e.payload) st.textContent=`boundary: ${e.payload.execs} execs · ${e.payload.crashes} crashes`; }
     if(e.type==="harness.done" && DETAIL_TID){ const st=document.getElementById("fuzzstat"); if(st&&e.payload) st.textContent = e.payload.error?("boundary: "+e.payload.error):`boundary done: ${e.payload.execs} execs · ${e.payload.unique} unique`; loadDyn(DETAIL_TID); loadFindings(DETAIL_TID); }
     if(e.type==="poc.done" && DETAIL_TID){ loadPocs(DETAIL_TID); loadFindings(DETAIL_TID); }
+    if(e.type==="synth.start"){ const st=document.getElementById("fuzzstat"); if(st&&e.payload) st.textContent=`synthesizing from ${e.payload.candidates.length} recovered buffer(s)…`; }
+    if(e.type==="synth.done" && DETAIL_TID){
+      const st=document.getElementById("fuzzstat");
+      if(st&&e.payload) st.textContent = !e.payload.ok ? (e.payload.note||"no frame")
+        : (e.payload.crashed ? `synthesized crash: ${esc(e.payload.buffer||'')} overflow @ offset ${e.payload.offset} (${esc(e.payload.mode||'')}) → ${esc(e.payload.level||'L1')}`
+           : `no crash from ${e.payload.tried} synthesized inputs (buffer not reached directly)`);
+      loadDyn(DETAIL_TID); loadFindings(DETAIL_TID); loadPocs(DETAIL_TID);
+    }
     if((e.type==="cross_taint.done"||e.type==="link.done"||e.type==="ipc_model.done"||e.type==="system.done") && BOARD_VIEW==="sysmap"){ loadSystemMap(false); }
     if(e.type==="cross_taint.done" && e.payload){ logline("xtaint","",`${e.payload.cross_findings} cross-component finding(s)`); }
     if(e.type==="ipc_model.done" && e.payload){ logline("ipc","",`${e.payload.ipc_edges} channel edge(s), ${e.payload.cross_findings} candidate(s)`); }

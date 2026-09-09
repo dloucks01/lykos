@@ -592,7 +592,7 @@ class Handler(BaseHTTPRequestHandler):
             if stage in (_INGEST, "disassemble", "detect_cwe", "dynamic_run", "fuzz",
                          "coverage_fuzz", "directed_fuzz", "concolic",
                          "build_poc", "poc_primitive", "build_exploit", "boundary_fuzz",
-                         "root_cause", "multi_debug", "firmware_carve",
+                         "synthesize_poc", "root_cause", "multi_debug", "firmware_carve",
                          "firmware_rehost") and target_id:
                 target = s.targets.get(target_id)
                 if not target:
@@ -639,6 +639,9 @@ class Handler(BaseHTTPRequestHandler):
                 elif stage == "boundary_fuzz":
                     from ..analyze.link import enqueue_boundary
                     run = enqueue_boundary(q, target, params=body.get("params"))
+                elif stage == "synthesize_poc":
+                    from ..analyze.poc import enqueue_synthesize
+                    run = enqueue_synthesize(q, target, params=body.get("params"))
                 else:
                     from ..analyze.poc import enqueue_build_poc
                     run = enqueue_build_poc(q, target, params=body.get("params"))
