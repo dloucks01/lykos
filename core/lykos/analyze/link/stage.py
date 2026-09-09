@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from ...jobs.registry import register_stage
 from .crosstaint import cross_taint_case
+from .ipc import model_ipc_case
 from .resolve import resolve_case
 
 LINK_STAGE = "link_case"
@@ -57,3 +58,29 @@ def register_cross_taint() -> None:
 def enqueue_cross_taint(queue, case_id: str, *, force: bool = True):
     return queue.enqueue(case_id, CROSS_TAINT_STAGE, tool=CT_TOOL,
                          tool_version=CT_TOOL_VERSION, resource_class="cpu", force=force)
+
+
+# ------------------------------------------------------------------ ipc_model (doc 17.1/17.3)
+IPC_STAGE = "ipc_model"
+IPC_TOOL = "lykos-ipc"
+IPC_TOOL_VERSION = "ipc-1"
+
+
+def ipc_model_stage(ctx) -> dict:
+    ctx.progress(msg="modelling IPC channels across components")
+    summary = model_ipc_case(ctx.conn, ctx.content, ctx.case_id, persist=True)
+    ctx.emit("ipc_model.done", payload=summary)
+    ctx.progress(pct=100, msg=(f"IPC: {len(summary['channels'])} channel(s), "
+                               f"{summary['ipc_edges']} edge(s), "
+                               f"{summary['cross_findings']} candidate finding(s)"))
+    return {"metrics": summary}
+
+
+def register_ipc() -> None:
+    register_stage(IPC_STAGE, ipc_model_stage, resource_class="quick",
+                   tool=IPC_TOOL, tool_version=IPC_TOOL_VERSION)
+
+
+def enqueue_ipc(queue, case_id: str, *, force: bool = True):
+    return queue.enqueue(case_id, IPC_STAGE, tool=IPC_TOOL,
+                         tool_version=IPC_TOOL_VERSION, resource_class="quick", force=force)

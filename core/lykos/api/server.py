@@ -411,6 +411,7 @@ class Handler(BaseHTTPRequestHandler):
             for e in ComponentEdgeDAO(s.conn).list_by_case(cid):
                 edges.append({"src": e.src_target, "dst": e.dst_target, "kind": e.kind,
                               "symbol": e.symbol or None,
+                              "detail": e.detail if e.kind in ("ipc", "taint") else None,
                               "symbols": edge_symbols(e.detail)})
             return self._json({"nodes": nodes, "edges": edges})
         finally:
@@ -529,12 +530,15 @@ class Handler(BaseHTTPRequestHandler):
             q = JobQueue(s.conn)
             stage = body.get("stage", _INGEST)
             target_id = body.get("target_id")
-            if stage in ("link_case", "cross_taint"):
+            if stage in ("link_case", "cross_taint", "ipc_model"):
                 cid = body.get("case_id") or (
                     s.targets.get(target_id).case_id if target_id else None)
                 if stage == "link_case":
                     from ..analyze.link import enqueue_link
                     run = enqueue_link(q, cid)
+                elif stage == "ipc_model":
+                    from ..analyze.link import enqueue_ipc
+                    run = enqueue_ipc(q, cid)
                 else:
                     from ..analyze.link import enqueue_cross_taint
                     run = enqueue_cross_taint(q, cid)
