@@ -29,6 +29,7 @@ class DetectContext:
     strings: list                    # list[StringRef]
     functions: list = field(default_factory=list)
     mitigations: dict = field(default_factory=dict)   # target's mitigation flags (triage)
+    frames: dict = field(default_factory=dict)        # func addr -> stack frame (from decompiler)
 
 
 def _cand(cwe, title, severity, detector, evidence, *, function_addr=None,
@@ -54,6 +55,48 @@ def dangerous_api(ctx: DetectContext):
             function_addr=e.src_addr, site_addr=e.site_addr,
             dedup_key=f"{cwe}:{e.src_addr}:{e.site_addr}:{n}",
             confidence=0.4))
+    return out
+
+
+# ------------------------------- stack buffer overflow (decompiler stack-frame + unbounded copy)
+# Copies with no length bound; a fixed stack buffer + one of these is the classic smash.
+_UNBOUNDED_COPY = {"strcpy", "strcat", "gets", "sprintf", "vsprintf", "scanf", "sscanf"}
+
+
+@register_detector
+def stack_buffer_overflow(ctx: DetectContext):
+    """Correlate the recovered stack frame with unbounded-copy sinks: a function that owns a
+    fixed-size stack buffer AND calls an unbounded copy is a stack-smash candidate. Reports the
+    recovered buffer size and the (approximate) distance from the buffer to the saved return
+    address -- the offset an exploit would need."""
+    if not ctx.frames:
+        return []
+    sinks_by_func = defaultdict(list)
+    for e in ctx.call_edges:
+        n = normalize(e.dst_name)
+        if n in _UNBOUNDED_COPY:
+            sinks_by_func[e.src_addr].append((n, e.site_addr))
+    out = []
+    for addr, frame in ctx.frames.items():
+        bufs = [v for v in (frame.get("vars") or []) if v.get("is_buffer")]
+        sinks = sinks_by_func.get(addr, [])
+        if not bufs or not sinks:
+            continue
+        buf = min(bufs, key=lambda v: v.get("size", 1 << 30))   # tightest buffer = worst case
+        n, site = sinks[0]
+        off_to_ret = abs(int(buf.get("offset", 0))) + 8         # + saved frame pointer (approx)
+        out.append(_cand(
+            "CWE-121",
+            f"Stack buffer overflow: unbounded {n}() into a {buf.get('size')}-byte stack buffer",
+            "high", "stack_frame",
+            [{"channel": "pattern",
+              "detail": f"{n}() at {site} in a function owning stack buffer "
+                        f"{buf.get('name')} ({buf.get('type')}, {buf.get('size')} B)"},
+             {"channel": "stack-frame",
+              "detail": f"~{off_to_ret} bytes from the buffer to the saved return address "
+                        f"(recovered frame; overflow offset hint)"}],
+            function_addr=addr, site_addr=site,
+            dedup_key=f"CWE-121:{addr}:{site}:{n}", confidence=0.55))
     return out
 
 

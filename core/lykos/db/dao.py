@@ -305,12 +305,27 @@ class EventDAO(BaseDAO):
 
 
 # --------------------------------------------------------------------- Function (Phase 1)
+def _frame_blob(f: dict):
+    """Fold the decompiler-recovered prototype details + stack frame into one blob:
+    frame geometry + vars, plus params / calling_convention / thunk / varargs."""
+    if not f.get("frame") and not f.get("params"):
+        return None
+    blob = dict(f.get("frame") or {})
+    blob["params"] = f.get("params") or []
+    blob["calling_convention"] = f.get("calling_convention") or ""
+    blob["thunk"] = bool(f.get("thunk"))
+    blob["varargs"] = bool(f.get("varargs"))
+    return blob
+
+
 class FunctionDAO(BaseDAO):
     def replace_for_target(self, target_id: str, funcs: list[dict]) -> int:
         """Replace the target's function set (re-disassembly overwrites).
 
-        Each func dict may carry: addr, name, size, decompiled, blocks, edges, and `cfg`
-        (the per-function CFG + P-Code IR), stored as ir_json.
+        Each func dict may carry: addr, name, size, decompiled, blocks, edges, `cfg`
+        (the per-function CFG + P-Code IR, stored as ir_json), `signature`, and the
+        stack-frame layout (params + calling_convention + thunk/varargs + frame geometry
+        + `frame`.vars), collected into frame_json.
         """
         self.conn.execute("BEGIN IMMEDIATE")
         try:
@@ -319,10 +334,11 @@ class FunctionDAO(BaseDAO):
             for f in funcs:
                 self.conn.execute(
                     "INSERT INTO function(id,target_id,addr,name,size,decompiled,"
-                    "blocks,edges,ir_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    "blocks,edges,ir_json,signature,frame_json,created_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                     (new_id(), target_id, f.get("addr", ""), f.get("name"), f.get("size"),
                      f.get("decompiled"), f.get("blocks"), f.get("edges"),
-                     dumps(f.get("cfg")), now))
+                     dumps(f.get("cfg")), f.get("signature"), dumps(_frame_blob(f)), now))
             self.conn.execute("COMMIT")
         except Exception:
             self.conn.execute("ROLLBACK"); raise
@@ -330,12 +346,13 @@ class FunctionDAO(BaseDAO):
 
     def list_by_target(self, target_id: str) -> list[Function]:
         rows = self.conn.execute(
-            "SELECT id,target_id,addr,name,size,blocks,edges,created_at "
+            "SELECT id,target_id,addr,name,size,blocks,edges,signature,created_at "
             "FROM function WHERE target_id=? ORDER BY addr", (target_id,)
         ).fetchall()
         return [Function(id=r["id"], target_id=r["target_id"], addr=r["addr"],
                          created_at=r["created_at"], name=r["name"], size=r["size"],
-                         blocks=r["blocks"], edges=r["edges"]) for r in rows]
+                         blocks=r["blocks"], edges=r["edges"], signature=r["signature"])
+                for r in rows]
 
     def get(self, func_id: str) -> Optional[Function]:
         r = self.conn.execute("SELECT * FROM function WHERE id=?", (func_id,)).fetchone()
@@ -344,6 +361,7 @@ class FunctionDAO(BaseDAO):
         return Function(id=r["id"], target_id=r["target_id"], addr=r["addr"],
                         created_at=r["created_at"], name=r["name"], size=r["size"],
                         decompiled=r["decompiled"], blocks=r["blocks"], edges=r["edges"],
+                        signature=r["signature"], frame=loads(r["frame_json"]),
                         ir=loads(r["ir_json"]))
 
     def count_by_target(self, target_id: str) -> int:

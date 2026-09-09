@@ -315,6 +315,27 @@ tr.fdetail>td{background:var(--surface-2);border-bottom:1px solid var(--border-s
 .cvcalls span.ext{color:var(--warn);border-color:var(--warn)}
 @media(max-width:920px){.cvbody{grid-template-columns:1fr}
   .cvpane+.cvpane{border-left:0;border-top:1px solid var(--border)}}
+/* function list: address + recovered signature */
+#funcs .frow .faddr{color:var(--faint);font-family:var(--mono);font-size:10.5px}
+#funcs .frow .fsig{font-family:var(--mono);font-size:11px;color:var(--dim)}
+#funcs .frow .fnm{font-family:var(--mono);font-size:11px;color:var(--text)}
+#funcs .frow.on .fsig,#funcs .frow.on .fnm{color:var(--text)}
+/* signature line + xrefs + stack frame in the code viewer */
+.cvsig{width:100%;font-family:var(--mono);font-size:11px;color:var(--teal);
+  padding:2px 2px 0;word-break:break-word}
+.cvxrefs{border-top:1px solid var(--border);padding:6px 12px;display:flex;flex-direction:column;gap:4px}
+.cvxr{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.callchip{font-family:var(--mono);font-size:11px;padding:2px 7px;border-radius:5px;cursor:pointer;
+  background:var(--surface-2);border:1px solid var(--border)}
+.callchip:hover{border-color:var(--accent)}
+.callchip.ext{color:var(--warn);border-color:color-mix(in srgb,var(--warn) 45%,transparent)}
+.cvframe{border-top:1px solid var(--border);padding:6px 12px}
+.cvframe>summary{cursor:pointer;font-size:9.5px;text-transform:uppercase;letter-spacing:.08em;color:var(--faint)}
+.frametbl{width:100%;border-collapse:collapse;margin-top:6px;font-size:11px}
+.frametbl th{text-align:left;color:var(--faint);font-weight:600;font-size:9.5px;text-transform:uppercase;padding:2px 8px 2px 0}
+.frametbl td{padding:2px 8px 2px 0;color:var(--dim)}
+.frametbl tr.bufrow td{color:var(--text)}
+.frametbl tr.bufrow{background:color-mix(in srgb,var(--warn) 9%,transparent)}
 /* ---- CFG graph ---- */
 .cvcfg{overflow:auto;max-height:320px;padding:6px}
 .cfgsvg{display:block;font-family:var(--mono)}
@@ -1574,7 +1595,10 @@ function renderFuncs(q){
   el.innerHTML = `<div class="eyebrow" style="margin:6px 0">Functions (${FUNCS.length})</div>`+
     `<input class="fsearch" placeholder="filter functions by name or address…" value="${esc(q)}" oninput="renderFuncs(this.value)">`+
     `<div class="sec" style="max-height:200px;overflow:auto">`+
-    (shown.length?shown.map(f=>`<div class="frow clk" data-id="${f.id}">${f.addr}  ${esc(f.name||"")} <span style="color:var(--faint)">(${f.size||0})</span></div>`).join(""):`<div class="hint">no match</div>`)+
+    (shown.length?shown.map(f=>{
+      const sig=f.signature && f.signature!==f.name ? `<span class="fsig" title="${esc(f.signature)}">${esc(f.signature)}</span>` : `<span class="fnm">${esc(f.name||"")}</span>`;
+      return `<div class="frow clk" data-id="${f.id}"><span class="faddr">${f.addr}</span> ${sig} <span style="color:var(--faint)">(${f.size||0})</span></div>`;
+    }).join(""):`<div class="hint">no match</div>`)+
     (list.length>cap?`<div class="hint">…${list.length-cap} more — refine the filter</div>`:"")+
     `</div>`;
   el.querySelectorAll(".frow[data-id]").forEach(d=> d.onclick=()=>showFunc(d.dataset.id));
@@ -1591,20 +1615,56 @@ function renderCodeViewer(){
   const el=document.getElementById("codeviewer"); if(!el||!CVFUNC) return;
   const f=CVFUNC; el.hidden=false;
   const blocks=(f.ir&&f.ir.blocks)?f.ir.blocks:[];
-  const callees=f.callees||[];
-  const calls = callees.length
-    ? callees.map(c=>`<span class="${c.external?'ext':''}">${esc(c.dst_name||c.dst_addr)}</span>`).join("")
-    : `<span class="hint">no calls</span>`;
+  const callees=f.callees||[], callers=f.callers||[];
+  const norm=a=>String(a||'').toLowerCase().replace(/^0x0*/,'0x');
+  const nameAt=a=>{ const fn=FUNCS.find(x=>norm(x.addr)===norm(a)); return fn&&fn.name; };
+  const chip=(c,dir)=>{
+    const addr = dir==='out' ? (c.dst_addr||'') : (c.src_addr||'');
+    const label = dir==='out' ? (c.dst_name||nameAt(c.dst_addr)||c.dst_addr||'?')
+                              : (nameAt(c.src_addr)||c.src_addr||'?');
+    return `<span class="callchip ${c.external?'ext':''}" title="${esc(String(label)+' @ '+(c.site_addr||''))}" onclick="jumpFunc('${esc(addr)}')">${esc(label)}</span>`;
+  };
+  const calleeHtml = callees.length ? callees.map(c=>chip(c,'out')).join("") : `<span class="hint">none</span>`;
+  const callerHtml = callers.length ? callers.map(c=>chip(c,'in')).join("") : `<span class="hint">none</span>`;
+  const sig = f.signature ? `<div class="cvsig mono">${esc(f.signature)}</div>` : "";
   el.innerHTML=`<div class="cvhead">
       <div class="cvname"><b>${esc(f.name||("sub_"+f.addr))}</b>
-        <span class="mono" style="color:var(--faint)">${f.addr} · ${f.blocks||blocks.length} blk · ${f.edges||0} edges</span></div></div>
+        <span class="mono" style="color:var(--faint)">${f.addr} · ${f.blocks||blocks.length} blk · ${f.edges||0} edges</span></div>
+      ${sig}</div>
     <div class="cvbody">
       <div class="cvpane"><div class="cvplabel">CFG (${blocks.length} blocks · ${f.edges||0} edges)</div>
         <div class="cvcfg">${renderCFGGraph(blocks)}</div></div>
       <div class="cvpane"><div class="cvplabel">Pseudocode</div>
         <pre class="cvcode">${esc(f.decompiled||"(no decompilation — run Decompile)")}</pre></div>
     </div>
-    <div class="cvcalls"><span class="cvplabel" style="padding:0;margin-right:2px">Calls</span>${calls}</div>`;
+    ${renderFramePane(f.frame)}
+    <div class="cvxrefs">
+      <div class="cvxr"><span class="cvplabel">Calls out →</span>${calleeHtml}</div>
+      <div class="cvxr"><span class="cvplabel">← Called by</span>${callerHtml}</div>
+    </div>`;
+}
+// jump the code viewer to a function by its entry address (caller/callee navigation)
+function jumpFunc(addr){
+  if(!addr) return;
+  const norm=a=>String(a||'').toLowerCase().replace(/^0x0*/,'0x');
+  const fn=FUNCS.find(x=>norm(x.addr)===norm(addr));
+  if(fn) showFunc(fn.id);
+}
+// stack-frame panel: locals with offset/size/type, buffers highlighted; the overflow surface
+function renderFramePane(frame){
+  if(!frame) return "";
+  const vars=(frame.vars||[]).slice().sort((a,b)=>a.offset-b.offset);
+  const params=frame.params||[];
+  const buffers=vars.filter(v=>v.is_buffer);
+  const geo=[`frame ${frame.frame_size??'?'} B`, params.length?`${params.length} param${params.length>1?'s':''}`:'',
+             buffers.length?`${buffers.length} buffer${buffers.length>1?'s':''}`:'', frame.calling_convention||'',
+             frame.varargs?'varargs':''].filter(Boolean).join(" · ");
+  if(!vars.length && !params.length) return "";
+  const prow=params.map(p=>`<tr><td class="mono">param</td><td class="mono">${esc(p.name)}</td><td class="mono">${esc(p.type||'')}</td><td class="mono">${p.size||''}</td><td></td></tr>`).join("");
+  const vrow=vars.map(v=>`<tr class="${v.is_buffer?'bufrow':''}"><td class="mono">${v.offset}</td><td class="mono">${esc(v.name)}</td><td class="mono">${esc(v.type||'')}</td><td class="mono">${v.size}</td><td>${v.is_buffer?`<span class="pvbadge no">buffer</span>`:''}</td></tr>`).join("");
+  return `<details class="cvframe" open><summary>Stack frame <span class="fghint">${esc(geo)}</span></summary>
+    <table class="frametbl"><thead><tr><th>offset</th><th>name</th><th>type</th><th>size</th><th></th></tr></thead>
+    <tbody>${prow}${vrow}</tbody></table></details>`;
 }
 // Vanilla layered SVG CFG: rank blocks by BFS depth, box per basic block with its
 // disassembly, real arrowed edges, back-edges (loops) drawn dashed. No external libs (air-gap).

@@ -101,6 +101,11 @@ class Function:
     decompiled: Optional[str] = None
     blocks: Optional[int] = None          # CFG basic-block count
     edges: Optional[int] = None           # CFG edge count
+    signature: Optional[str] = None       # recovered prototype (light: shown in the list)
+    # frame: {frame_size, local_size, param_size, ret_offset,
+    #         calling_convention, thunk, varargs, params:[{name,type,size}],
+    #         vars:[{name, offset, size, type, is_buffer}]}  (heavy: full view only)
+    frame: Optional[dict[str, Any]] = None
     # IR: {"blocks": [{addr, instructions:[{addr, text, pcode:[...]}], succ:[...]}]}
     ir: Optional[dict[str, Any]] = None
 

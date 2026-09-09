@@ -744,9 +744,11 @@ def _stringref(x):
 
 def _function(f, code=False):
     d = {"id": f.id, "target_id": f.target_id, "addr": f.addr, "name": f.name,
-         "size": f.size, "blocks": f.blocks, "edges": f.edges}
+         "size": f.size, "blocks": f.blocks, "edges": f.edges,
+         "signature": getattr(f, "signature", None)}
     if code:
         d["decompiled"] = f.decompiled
+        d["frame"] = getattr(f, "frame", None)   # params + stack-var layout (offsets/sizes/buffers)
         d["ir"] = f.ir          # {blocks:[{addr,instructions:[{addr,text,pcode:[...]}],succ}]}
     return d
 
