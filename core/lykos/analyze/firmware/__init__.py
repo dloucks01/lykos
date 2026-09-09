@@ -14,9 +14,13 @@ that those would consume.
 """
 from .carve import extract_components, scan_signatures  # noqa: F401
 from .headerless import analyze_blob  # noqa: F401
+from .rehost import locate_unicorn_python  # noqa: F401
+from .rehost_stage import REHOST_STAGE, enqueue_rehost, firmware_rehost_stage  # noqa: F401
+from .rehost_stage import register as _register_rehost
 from .stage import FIRMWARE_STAGE, enqueue_firmware, firmware_carve_stage  # noqa: F401
 from .stage import register as _register
 
 
 def register() -> None:
     _register()
+    _register_rehost()
