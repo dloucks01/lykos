@@ -5,10 +5,8 @@ import os
 import re
 import select
 import subprocess
-import time
 
 import pytest
-
 from lykos.analyze.dynamic import sandbox
 from lykos.analyze.poc import heap
 
@@ -25,7 +23,8 @@ int main(void){
   while(fgets(line,sizeof line,stdin)){
     char op; unsigned idx; unsigned long a,b;
     if(sscanf(line," %c",&op)!=1) continue;
-    if(op=='a'){ sscanf(line," a %lu %u",&a,&idx); chunks[idx]=malloc(a); printf("alloc[%u]=%p\n",idx,chunks[idx]); }
+    if(op=='a'){ sscanf(line," a %lu %u",&a,&idx); chunks[idx]=malloc(a);
+                 printf("alloc[%u]=%p\n",idx,chunks[idx]); }
     else if(op=='f'){ sscanf(line," f %u",&idx); free(chunks[idx]); }
     else if(op=='w'){ sscanf(line," w %u %lx",&idx,&b); *(unsigned long*)chunks[idx]=b; }
     else if(op=='q'){ break; }

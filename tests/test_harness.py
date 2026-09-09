@@ -6,7 +6,6 @@ import os
 import subprocess
 
 import pytest
-
 from lykos.analyze import register
 from lykos.analyze.ingest import enqueue_triage, ingest
 from lykos.analyze.link import enqueue_boundary

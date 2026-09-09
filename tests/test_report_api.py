@@ -5,7 +5,6 @@ import http.client
 import json
 
 import pytest
-
 from lykos.api.server import serve, shutdown
 from lykos.casestore import CaseStore
 from lykos.db.dao import FindingDAO, PocDAO

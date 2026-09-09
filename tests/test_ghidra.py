@@ -3,20 +3,20 @@ if Ghidra is not installed)."""
 import json
 
 import pytest
-
+from factories import make_target
 from lykos.analyze import ingest, register
 from lykos.analyze.disassemble import enqueue_disassemble
 from lykos.analyze.ghidra import locate_ghidra, parse_result
 from lykos.db.dao import CallEdgeDAO, FunctionDAO, StringDAO
 from lykos.jobs import JobConfig, JobQueue, WorkerPool
-from factories import make_target
 
 
 @pytest.fixture
 def pool(store):
     register()
     p = WorkerPool(store.db_path, store.content,
-                   JobConfig(workers=2, lease_seconds=8, poll_interval=0.02, heartbeat_interval=2.0))
+                   JobConfig(workers=2, lease_seconds=8, poll_interval=0.02,
+                             heartbeat_interval=2.0))
     p.start()
     try:
         yield p
@@ -51,7 +51,8 @@ def test_function_dao_with_cfg_ir(store, case):
     assert lst[0].blocks == 2 and lst[0].edges == 1              # counts present in list
     full = fd.get(lst[0].id)
     assert full.decompiled and full.ir                           # detail includes code + IR
-    assert full.ir["blocks"][0]["instructions"][0]["pcode"][0].startswith("COPY")  # P-Code round-tripped
+    # P-Code round-tripped
+    assert full.ir["blocks"][0]["instructions"][0]["pcode"][0].startswith("COPY")
     assert full.blocks == 2 and full.edges == 1
     fd.replace_for_target(t.id, [{"addr": "0x1000", "name": "main", "size": 50}])
     assert fd.count_by_target(t.id) == 1                         # replace overwrites

@@ -18,7 +18,8 @@ from lykos.jobs import JobConfig, JobQueue, WorkerPool
 def pool(store):
     register()
     p = WorkerPool(store.db_path, store.content,
-                   JobConfig(workers=2, lease_seconds=8, poll_interval=0.02, heartbeat_interval=2.0))
+                   JobConfig(workers=2, lease_seconds=8, poll_interval=0.02,
+                             heartbeat_interval=2.0))
     p.start()
     try:
         yield p

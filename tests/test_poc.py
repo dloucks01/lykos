@@ -32,7 +32,8 @@ def bins(gcc, tmp_path_factory):
 def pool(store):
     register()
     p = WorkerPool(store.db_path, store.content,
-                   JobConfig(workers=2, lease_seconds=30, poll_interval=0.02, heartbeat_interval=5.0))
+                   JobConfig(workers=2, lease_seconds=30, poll_interval=0.02,
+                             heartbeat_interval=5.0))
     p.start()
     try:
         yield p

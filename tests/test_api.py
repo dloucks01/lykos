@@ -8,7 +8,6 @@ import struct
 import time
 
 import pytest
-
 from lykos.api.server import serve, shutdown
 
 

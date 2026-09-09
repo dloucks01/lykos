@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import pytest
-
 from lykos.analyze import register
 from lykos.analyze.firmware.rehost import locate_unicorn_python, run_rehost
 from lykos.analyze.firmware.rehost_stage import enqueue_rehost
