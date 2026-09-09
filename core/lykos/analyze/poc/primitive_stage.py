@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import shutil
 
-from ...db.dao import FindingDAO, PocDAO, TargetDAO
+from ...db.dao import FindingDAO, FunctionDAO, PocDAO, TargetDAO
 from ...jobs.registry import register_stage
 from ..debug import qemu_gdb, rootcause
 from ..dynamic import sandbox
@@ -17,6 +17,19 @@ from .capture import make_capture, make_qemu_capture, materialize_helper
 PRIMITIVE_STAGE = "poc_primitive"
 TOOL = "primitive"
 TOOL_VERSION = "primitive-1"
+
+
+def _hydrate_frames(ctx, target_id):
+    """Recovered stack frames per function addr (empty if the target wasn't disassembled)."""
+    fdao = FunctionDAO(ctx.conn)
+    frames = {}
+    for f in fdao.list_by_target(target_id):
+        if not f.blocks:
+            continue
+        full = fdao.get(f.id)
+        if full and full.frame and full.frame.get("vars"):
+            frames[f.addr] = full.frame
+    return frames
 
 
 def primitive_stage(ctx) -> dict:
@@ -47,7 +60,15 @@ def primitive_stage(ctx) -> dict:
     exe.write_bytes(target_bytes)
     exe.chmod(0o755)
 
-    length = min(max(len(orig) * 2, 256), 4096)
+    # Static RE corroboration: recovered stack-buffer sizes predict IP-control offsets.
+    word = 8 if (target.bits or 64) >= 64 else 4
+    frames = _hydrate_frames(ctx, target.id)
+    offset_candidates = primitive.frame_offset_candidates(frames, word)
+    if offset_candidates:
+        ctx.emit("primitive.static", payload={"candidates": offset_candidates[:8]})
+
+    need = (max((c["offset"] for c in offset_candidates), default=0) + word + 64)
+    length = min(max(len(orig) * 2, need, 256), 4096)
     helper = materialize_helper()
     try:
         if emulated:
@@ -76,15 +97,41 @@ def primitive_stage(ctx) -> dict:
         # a cyclic PC (source "pc") is a hijack and is always trusted.
         if rec is not None and (rec[1] == "pc" or mnem in ("ret", "retq", "retn")):
             offset, source = rec
-            ctx.progress(msg=f"IP-control offset {offset} ({source}); confirming")
+            static_match = next((c for c in offset_candidates if c["offset"] == offset), None)
+            ctx.progress(msg=f"IP-control offset {offset} ({source}"
+                             + (", matches static frame" if static_match else "") + "); confirming")
             control = primitive.control_input(offset, length)
             confirmed = primitive.marker_confirmed(capture(control))
             prim = {"type": "instruction-pointer-control", "offset": offset, "source": source,
                     "marker": primitive.MARKER, "observed_pc": cap0.get("pc", 0),
-                    "confirmed": confirmed, "registers": regs}
+                    "confirmed": confirmed, "registers": regs,
+                    "static_offset": static_match, "static_candidates": offset_candidates}
             extra = f"instruction-pointer control at offset {offset}"
+            if static_match:
+                extra += (f"; corroborated by static stack frame -- {static_match['size']}-byte "
+                          f"buffer {static_match['buffer']} + saved frame = offset "
+                          f"{static_match['offset']}")
             return _finalize(ctx, target, target_bytes, mode, base_argv, cap0, control,
                              prim, confirmed, extra)
+
+        # 1b) static-seeded IP control -- the dynamic slot heuristic did not pin an offset, but
+        # recovered stack buffers predict where the return address is; try each prediction
+        # directly (a confirmed PC==MARKER is proof, discovered from the static frame).
+        for c in offset_candidates:
+            if c["offset"] + word > length:
+                continue
+            control = primitive.control_input(c["offset"], length)
+            if primitive.marker_confirmed(capture(control)):
+                ctx.progress(msg=f"static-frame IP-control offset {c['offset']} confirmed")
+                prim = {"type": "instruction-pointer-control", "offset": c["offset"],
+                        "source": "static-frame", "marker": primitive.MARKER,
+                        "observed_pc": cap0.get("pc", 0), "confirmed": True, "registers": regs,
+                        "static_offset": c, "static_candidates": offset_candidates}
+                extra = (f"instruction-pointer control at offset {c['offset']}, predicted from "
+                         f"the recovered {c['size']}-byte stack buffer {c['buffer']} "
+                         f"(static RE seeded the dynamic confirmation)")
+                return _finalize(ctx, target, target_bytes, mode, base_argv, cap0, control,
+                                 prim, True, extra)
 
         # 2) memory primitive (write-what-where / controlled read at a faulting mem access)
         memp = primitive.analyze_memory_primitive(cap0, length, disasm)

@@ -84,7 +84,10 @@ def stack_buffer_overflow(ctx: DetectContext):
             continue
         buf = min(bufs, key=lambda v: v.get("size", 1 << 30))   # tightest buffer = worst case
         n, site = sinks[0]
-        off_to_ret = abs(int(buf.get("offset", 0))) + 8         # + saved frame pointer (approx)
+        # distance from the buffer to the saved return address in Ghidra frame coords
+        ret_off = frame.get("ret_offset")
+        off_to_ret = (ret_off - int(buf.get("offset", 0))) if ret_off is not None \
+            else abs(int(buf.get("offset", 0))) + 8
         out.append(_cand(
             "CWE-121",
             f"Stack buffer overflow: unbounded {n}() into a {buf.get('size')}-byte stack buffer",
