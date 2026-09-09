@@ -143,3 +143,56 @@ def test_structure_aware_fuzz_finds_format_overflow(store, case, pool, gcc, tmp_
     assert pool.wait_idle(60) and q.runs.get(run.id).status == "done"
     crashes = [d for d in DynResultDAO(store.conn).list_by_target(target.id) if d.crashed]
     assert crashes and crashes[0].signal_name == "SIGSEGV"    # the overflow was found
+
+
+def test_suggest_spec_autofinds_length_field():
+    """The builder derives a magic + length + blob spec from a real sample, locating the
+    length field by matching an integer to the trailing byte count."""
+    import struct as _s
+
+    from lykos.analyze.fuzz import structure
+    sample = b"%PDF" + _s.pack("<I", 16) + b"A" * 16
+    sug = structure.suggest_spec(sample)
+    spec = sug["spec"]
+    assert spec[0]["type"] == "magic" and spec[0]["value"] == "%PDF"
+    assert spec[1]["type"] == "u32" and spec[1]["endian"] == "little"
+    assert spec[1]["length_of"] == "data" and spec[-1]["type"] == "blob"
+
+
+def test_describe_reports_field_carving_and_length_match():
+    """describe() carves a sample with the real parser and flags whether each length field
+    matches the actual blob size (the truthful preview the GUI shows)."""
+    import struct as _s
+
+    from lykos.analyze.fuzz import structure
+    spec = [{"type": "magic", "value": "%PDF"},
+            {"type": "u32", "endian": "little", "name": "len", "length_of": "data"},
+            {"type": "blob", "name": "data"}]
+    d = structure.describe(spec, b"%PDF" + _s.pack("<I", 16) + b"A" * 16)
+    assert d["ok"] and d["roundtrip"] and d["consumed"] == d["sample_size"]
+    intf = [f for f in d["fields"] if f["type"] == "u32"][0]
+    assert intf["int"] == 16 and intf["length_match"] is True
+    # a mismatched length is reported, not hidden
+    d2 = structure.describe(spec, b"%PDF" + _s.pack("<I", 999) + b"A" * 4)
+    assert [f for f in d2["fields"] if f["type"] == "u32"][0]["length_match"] is False
+
+
+def test_detect_magic_known_signatures():
+    from lykos.analyze.fuzz import structure
+    assert structure.detect_magic(b"\x89PNG\r\n\x1a\nrest")[0] == "PNG"
+    assert structure.detect_magic(b"%PDF-1.7 ...")[0] == "PDF"
+    assert structure.detect_magic(b"nope")[0] is None
+
+
+def test_b64_magic_roundtrips_through_from_spec():
+    """Non-printable magic travels as {"b64": ...}; from_spec/describe must decode it."""
+    import base64
+
+    from lykos.analyze.fuzz import structure
+    magic = b"\x00\x01\x02\xff"
+    spec = [{"type": "magic", "value": {"b64": base64.b64encode(magic).decode()}},
+            {"type": "blob", "name": "data"}]
+    d = structure.describe(spec, magic + b"payload")
+    assert d["ok"] and d["fields"][0]["match"] is True
+    model = structure.from_spec(spec)
+    assert model.serialize(model.parse(magic + b"payload")) == magic + b"payload"

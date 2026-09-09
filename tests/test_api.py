@@ -275,3 +275,20 @@ def test_delete_target_endpoint(api_http, sample_elf):
     assert st == 200 and runs == []                          # its triage run cascaded
     st, res = _tcp_json(api_http, "DELETE", f"/targets/{tid}")
     assert st == 404                                         # already gone
+
+
+def test_format_analyze_suggest_and_preview(api_http):
+    """The custom-format builder endpoint: suggest a spec from a sample (auto-find the length
+    field), then preview how that spec carves a sample."""
+    sample = b"%PDF" + struct.pack("<I", 16) + b"A" * 16
+    b64 = base64.b64encode(sample).decode()
+    st, out = _tcp_json(api_http, "POST", "/format/analyze", {"sample_b64": b64})
+    assert st == 200 and "suggestion" in out
+    spec = out["suggestion"]["spec"]
+    assert spec[0]["type"] == "magic" and spec[1].get("length_of") == "data"
+
+    st, out = _tcp_json(api_http, "POST", "/format/analyze",
+                        {"sample_b64": b64, "spec": spec})
+    assert st == 200 and out["preview"]["ok"] and out["preview"]["roundtrip"]
+    lenf = [f for f in out["preview"]["fields"] if f["type"] == "u32"][0]
+    assert lenf["length_match"] is True

@@ -5,6 +5,7 @@ across threads). The event WebSocket tails the persisted `event` table by cursor
 """
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -298,6 +299,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._upload_target(m.group(1))
             if path == "/runs":
                 return self._create_run()
+            if path == "/format/analyze":
+                return self._format_analyze()
             if path == "/import":
                 return self._import_case()
             self._json({"error": "not found"}, 404)
@@ -546,6 +549,19 @@ class Handler(BaseHTTPRequestHandler):
                                "run_id": run.id}, 201)
         finally:
             s.close()
+
+    def _format_analyze(self):
+        """Custom-format builder support: with just a sample, suggest a starting spec
+        (detect magic, auto-find the length field); with a spec, show how it carves the
+        sample using the real fuzzer parser. No case/target needed."""
+        from ..analyze.fuzz import structure
+        body = json.loads(self._read_body() or b"{}")
+        sample = base64.b64decode(body["sample_b64"]) if body.get("sample_b64") else b""
+        sample = sample[:65536]                          # cap: previews stay fast
+        spec = body.get("spec")
+        if spec is not None:
+            return self._json({"preview": structure.describe(spec, sample)})
+        return self._json({"suggestion": structure.suggest_spec(sample)})
 
     def _create_run(self):
         from ..analyze.detect import enqueue_detect
