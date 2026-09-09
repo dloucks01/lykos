@@ -222,3 +222,36 @@ def test_event_websocket_stream(api, sample_elf):
         assert "job.started" in seen or "triage.done" in seen or "job.done" in seen, seen
     finally:
         ws.close()
+
+
+def test_case_findings_board(tmp_path):
+    """Case-level findings board endpoint aggregates findings across targets, enriched with
+    target filename/arch and best PoC level."""
+    from lykos.casestore import CaseStore
+    from lykos.db.dao import FindingDAO
+
+    cspath = tmp_path / "board-cs"
+    servers, pool = serve(cspath, http=("127.0.0.1", 0), workers=1, block=False)
+    port = servers[0].server_address[1]
+    try:
+        _, c = _tcp_json(port, "POST", "/cases", {"name": "board"})
+        s = CaseStore.open(cspath)
+        try:
+            t = s.targets.upsert(c["id"], "vuln.bin", "deadbeef" * 8, arch="x86-64")
+            fd = FindingDAO(s.conn)
+            fd.upsert(t.id, c["id"], {"cwe": "CWE-121", "title": "stack overflow",
+                      "severity": "critical", "state": "poc-backed", "confidence": 0.98,
+                      "detector": "primitive", "dedup_key": "k1",
+                      "evidence": [{"channel": "poc", "detail": "x"}]})
+            fd.upsert(t.id, c["id"], {"cwe": "CWE-476", "title": "null deref",
+                      "severity": "medium", "state": "candidate", "confidence": 0.4,
+                      "detector": "root_cause", "dedup_key": "k2", "evidence": []})
+        finally:
+            s.close()
+        st, fs = _tcp_json(port, "GET", f"/cases/{c['id']}/findings")
+        assert st == 200 and len(fs) == 2
+        crit = next(x for x in fs if x["cwe"] == "CWE-121")
+        assert crit["target_name"] == "vuln.bin" and crit["target_arch"] == "x86-64"
+        assert crit["state"] == "poc-backed"
+    finally:
+        shutdown(servers, pool)
