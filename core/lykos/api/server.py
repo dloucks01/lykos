@@ -549,7 +549,7 @@ class Handler(BaseHTTPRequestHandler):
             if stage in (_INGEST, "disassemble", "detect_cwe", "dynamic_run", "fuzz",
                          "coverage_fuzz", "directed_fuzz", "concolic",
                          "build_poc", "poc_primitive", "boundary_fuzz",
-                         "root_cause", "multi_debug") and target_id:
+                         "root_cause", "multi_debug", "firmware_carve") and target_id:
                 target = s.targets.get(target_id)
                 if not target:
                     return self._json({"error": "no target"}, 404)
@@ -583,6 +583,9 @@ class Handler(BaseHTTPRequestHandler):
                 elif stage == "multi_debug":
                     from ..analyze.debug import enqueue_multi_debug
                     run = enqueue_multi_debug(q, target, params=body.get("params"))
+                elif stage == "firmware_carve":
+                    from ..analyze.firmware import enqueue_firmware
+                    run = enqueue_firmware(q, target, params=body.get("params"))
                 elif stage == "boundary_fuzz":
                     from ..analyze.link import enqueue_boundary
                     run = enqueue_boundary(q, target, params=body.get("params"))

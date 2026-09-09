@@ -641,6 +641,7 @@ async function showDetail(targetId){
     <div style="margin:6px 0;display:flex;gap:8px;align-items:center">
       <button class="btn sm" id="deco">Decompile (Ghidra)</button>
       <button class="btn sm" id="detect">Detect CWEs</button>
+      <button class="btn sm" id="carve" title="Firmware decomposition: carve embedded components (ELFs, filesystems, keys) and identify a bare-metal blob's arch/base/entry">Carve Firmware</button>
       <span class="mono" style="color:var(--faint);font-size:11px" id="decostat"></span></div>
     <div id="findings"></div>
     <div class="eyebrow" style="margin-top:8px">Dynamic (sandbox)</div>
@@ -665,6 +666,7 @@ async function showDetail(targetId){
     <div id="strings" style="margin-top:8px"></div>`;
   document.getElementById("deco").onclick = ()=>doDecompile(targetId);
   document.getElementById("detect").onclick = ()=>doDetect(targetId);
+  document.getElementById("carve").onclick = ()=>doFirmware(targetId);
   document.getElementById("dynrun").onclick = ()=>doDynamic(targetId);
   document.getElementById("fuzzrun").onclick = ()=>doFuzz(targetId);
   document.getElementById("covrun").onclick = ()=>doCoverage(targetId);
@@ -693,6 +695,11 @@ async function doRootCause(tid, inputSha, mode){
   await fetch("/runs",{method:"POST",headers:{"Content-Type":"application/json"},
     body:JSON.stringify({case_id:CUR,target_id:tid,stage:"root_cause",
       params:{input_sha:inputSha,input_mode:mode||"stdin"}})});
+}
+async function doFirmware(tid){
+  const st=document.getElementById("decostat"); if(st) st.textContent="carving firmware…";
+  await fetch("/runs",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({case_id:CUR,target_id:tid,stage:"firmware_carve"})});
 }
 async function doMultiDebug(tid, inputSha, mode){
   const st=document.getElementById("fuzzstat"); if(st) st.textContent="multi-process debug (follow-fork)…";
@@ -877,6 +884,13 @@ function openWS(id){
     if(e.type==="fuzz.done" && DETAIL_TID){
       const st=document.getElementById("fuzzstat"); if(st&&e.payload) st.textContent=`done: ${e.payload.execs} execs · ${e.payload.unique} unique`;
       loadDyn(DETAIL_TID); loadFindings(DETAIL_TID);
+    }
+    if(e.type==="firmware.done"){
+      const st=document.getElementById("decostat");
+      if(st&&e.payload) st.textContent = `carved ${e.payload.components} component(s), ${e.payload.signatures} signature(s)`
+        + (e.payload.arch?` · ${e.payload.arch} @ ${e.payload.base_addr?('0x'+Number(e.payload.base_addr).toString(16)):'?'}`:'')
+        + (e.payload.keys?` · ${e.payload.keys} key(s)`:'');
+      refresh(); if(DETAIL_TID) loadFindings(DETAIL_TID);
     }
     if(e.type==="multidebug.done" && DETAIL_TID){
       const st=document.getElementById("fuzzstat");
