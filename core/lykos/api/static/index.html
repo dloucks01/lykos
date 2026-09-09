@@ -176,6 +176,41 @@ tbody tr:hover{background:var(--surface-2)}
 .palitem .hint{font-size:10px;color:var(--faint);font-family:var(--mono)}
 .palitem.sel,.palitem:hover{background:var(--surface-2);color:var(--text)}
 .palitem.sel{box-shadow:inset 2px 0 0 var(--accent)}
+/* ---- workbench detail: analysis pipeline ---- */
+.wbhead{display:flex;align-items:center;justify-content:space-between;gap:10px;
+  padding-bottom:10px;margin-bottom:12px;border-bottom:1px solid var(--border)}
+.wbtitle{font-size:12.5px;color:var(--text);font-weight:600}
+.wbmits{display:flex;gap:4px;flex-wrap:wrap}
+.pipe{display:flex;flex-direction:column;gap:10px}
+.stage{border:1px solid var(--border);border-radius:9px;background:var(--surface-2);overflow:hidden}
+.stagehdr{display:flex;align-items:center;gap:9px;padding:9px 12px;background:var(--surface-3);
+  border-bottom:1px solid var(--border)}
+.stagehdr b{font-size:12.5px;font-weight:600}
+.snum{display:inline-flex;align-items:center;justify-content:center;width:19px;height:19px;
+  border-radius:50%;background:var(--surface);border:1px solid var(--border-strong);
+  color:var(--dim);font-size:11px;font-weight:700}
+.schip{margin-left:auto;font-size:11px;color:var(--faint)}
+.schip.done{color:var(--ok)}.schip.run{color:var(--accent)}.schip.warn{color:var(--danger)}
+.sbody{padding:11px 12px}
+.kvgrid{display:grid;grid-template-columns:1fr 1fr;gap:2px 18px}
+.kvgrid .kv{border:0;padding:2px 0}
+.actions{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:8px}
+.actions .inp{flex:1;min-width:110px;background:var(--surface);color:var(--text);
+  border:1px solid var(--border);border-radius:6px;padding:5px 8px;font-family:var(--mono);font-size:11px}
+.actions .sel{background:var(--surface);color:var(--text);border:1px solid var(--border-strong);
+  border-radius:6px;padding:5px 8px;font-size:11.5px;font-weight:600}
+.vsep{width:1px;align-self:stretch;background:var(--border);margin:2px 3px}
+.disc{margin-top:8px}.disc summary{cursor:pointer;font-size:11px;color:var(--dim);
+  text-transform:uppercase;letter-spacing:.08em;font-weight:600}
+.disc summary::marker{color:var(--faint)}
+.menu{position:relative}.menu>summary{list-style:none;display:inline-flex}
+.menu>summary::-webkit-details-marker{display:none}
+.menu .menubody{position:absolute;z-index:5;top:110%;left:0;display:flex;flex-direction:column;
+  gap:5px;padding:7px;background:var(--surface);border:1px solid var(--border-strong);
+  border-radius:8px;min-width:170px;box-shadow:0 8px 24px rgba(0,0,0,.4)}
+.hint{color:var(--faint);font-size:11px;margin-bottom:6px}
+.notewarn{margin-top:8px;color:var(--warn)}
+.code{white-space:pre-wrap;max-height:200px;overflow:auto;margin-top:6px}
 </style>
 </head>
 <body>
@@ -640,61 +675,102 @@ async function showDetail(targetId){
       background:color-mix(in srgb, var(--warn) 12%, transparent);color:var(--text);font-size:12px">
       <b style="color:var(--warn)">⚠ Not analyzable</b> — ${esc(rec.advisory)}</div>` : "";
   det.innerHTML = flag + `
-    <div class="kv"><span>detected</span><b>${esc(rec.detected||"—")}</b></div>
-    <div class="kv"><span>linking</span><b>${rec.linking||"—"} ${rec.stripped?"· stripped":""}</b></div>
-    <div class="kv"><span>entry</span><b>${rec.entry_point||"—"}</b></div>
-    <div class="kv"><span>toolchain</span><b>${rec.toolchain_hint}</b></div>
-    <div class="kv"><span>entropy</span><b>${rec.entropy?.overall} ${rec.entropy?.packed_hint?"· packed?":""}</b></div>
-    <div class="kv"><span>imports</span><b>${(rec.imports?.libraries||[]).join(", ")||"—"} (${rec.imports?.functions_count||0} fns)</b></div>
-    <div style="margin-top:8px" class="eyebrow">Mitigations</div><div style="margin:4px 0 8px">${mits(rec.mitigations)}</div>
-    <div class="eyebrow">Sections (${(rec.sections||[]).length})</div>
-    <div class="sec" style="max-height:150px;overflow:auto;margin-top:4px">${
-      (rec.sections||[]).slice(0,40).map(s=>`${(s.name||"").padEnd(18)} ${String(s.size).padStart(8)}  ${s.perms}  H=${s.entropy??"-"}`).join("<br>")}</div>
-    ${rec.parse_errors?.length?`<div style="margin-top:8px;color:var(--warn)" class="mono">parse notes: ${rec.parse_errors.join("; ")}</div>`:""}`;
-  DETAIL_TID = targetId;
-  det.innerHTML += `<div style="margin-top:12px" class="eyebrow">Reverse engineering</div>
-    <div style="margin:6px 0;display:flex;gap:8px;align-items:center">
-      <button class="btn sm" id="deco">Decompile (Ghidra)</button>
-      <button class="btn sm" id="detect">Detect CWEs</button>
-      <button class="btn sm" id="carve" title="Firmware decomposition: carve embedded components (ELFs, filesystems, keys) and identify a bare-metal blob's arch/base/entry">Carve Firmware</button>
-      <button class="btn sm" id="rehost" title="Rehost a bare-metal ARM Cortex-M image under Unicorn (Fuzzware-style MMIO) and fuzz peripheral inputs for firmware crashes">Rehost</button>
-      <span class="mono" style="color:var(--faint);font-size:11px" id="decostat"></span></div>
-    <div id="findings"></div>
-    <div class="eyebrow" style="margin-top:8px">Dynamic (sandbox)</div>
-    <div style="margin:4px 0;display:flex;gap:6px;align-items:center;flex-wrap:wrap">
-      <input id="dyninput" placeholder="input (optional)" style="flex:1;min-width:120px;background:var(--surface-2);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:5px 8px;font-family:var(--mono);font-size:11px">
-      <select id="dynmode" class="btn sm"><option value="stdin">stdin</option><option value="arg">argv</option><option value="file">file</option><option value="none">none</option></select>
-      <button class="btn sm" id="dynrun">Run</button>
-      <button class="btn sm" id="fuzzrun">Fuzz</button>
-      <button class="btn sm" id="covrun" title="Coverage-guided fuzzing (AFL++ qemu-mode)">Coverage Fuzz</button>
-      <button class="btn sm" id="dirrun" title="Directed fuzzing steered at statically-flagged sinks">Directed Fuzz</button>
-      <button class="btn sm" id="concrun" title="Hybrid concolic execution (angr): solve inputs that reach the flagged sinks">Concolic</button>
-      <button class="btn sm" id="bndrun" title="Boundary-driven harnessing: fuzz this consumer through its IPC endpoint (channel auto-detected from the component graph)">Boundary Fuzz</button>
-      <span class="mono" id="fuzzstat" style="color:var(--faint);font-size:11px"></span>
+    <div class="wbhead">
+      <div class="wbtitle mono">${esc(rec.detected||"—")}</div>
+      <div class="wbmits">${mits(rec.mitigations)}</div>
     </div>
-    <div id="dynresults"></div>
-    <div id="pocs"></div>
-    <div id="funcs"></div>
-    <pre id="funccode" class="sec" style="max-height:180px;overflow:auto;white-space:pre-wrap;margin-top:6px"></pre>
-    <div id="funccalls" class="sec" style="margin-top:4px"></div>
-    <div class="eyebrow" id="cfglabel" style="margin-top:6px"></div>
-    <pre id="funccfg" class="sec" style="max-height:220px;overflow:auto;white-space:pre-wrap"></pre>
-    <div id="strings" style="margin-top:8px"></div>`;
+    <div class="pipe">
+      <section class="stage">
+        <div class="stagehdr"><span class="snum">1</span><b>Triage</b><span class="schip done">done</span></div>
+        <div class="sbody">
+          <div class="kvgrid">
+            <div class="kv"><span>entry</span><b>${rec.entry_point||"—"}</b></div>
+            <div class="kv"><span>linking</span><b>${rec.linking||"—"}${rec.stripped?" · stripped":""}</b></div>
+            <div class="kv"><span>toolchain</span><b>${rec.toolchain_hint||"—"}</b></div>
+            <div class="kv"><span>entropy</span><b>${rec.entropy?.overall??"—"}${rec.entropy?.packed_hint?" · packed?":""}</b></div>
+            <div class="kv"><span>imports</span><b>${(rec.imports?.libraries||[]).join(", ")||"—"} (${rec.imports?.functions_count||0})</b></div>
+          </div>
+          <details class="disc"><summary>Sections (${(rec.sections||[]).length})</summary>
+            <div class="sec" style="max-height:150px;overflow:auto;margin-top:4px">${
+              (rec.sections||[]).slice(0,40).map(s=>`${(s.name||"").padEnd(18)} ${String(s.size).padStart(8)}  ${s.perms}  H=${s.entropy??"-"}`).join("<br>")}</div></details>
+          ${rec.parse_errors?.length?`<div class="notewarn mono">parse notes: ${rec.parse_errors.join("; ")}</div>`:""}
+        </div>
+      </section>
+
+      <section class="stage">
+        <div class="stagehdr"><span class="snum">2</span><b>Reverse engineering</b><span class="schip mono" id="decostat"></span></div>
+        <div class="sbody">
+          <div class="actions">
+            <button class="btn sm" id="deco">Decompile (Ghidra)</button>
+            <details class="menu"><summary class="btn sm">Firmware ▾</summary>
+              <div class="menubody">
+                <button class="btn sm" id="carve" title="Carve embedded components (ELFs, filesystems, keys); identify a bare-metal blob's arch/base/entry">Carve components</button>
+                <button class="btn sm" id="rehost" title="Rehost a bare-metal ARM Cortex-M image under Unicorn (Fuzzware-style MMIO) and fuzz peripheral inputs">Rehost &amp; fuzz</button>
+              </div></details>
+          </div>
+          <div id="funcs"></div>
+          <pre id="funccode" class="sec code"></pre>
+          <div id="funccalls" class="sec" style="margin-top:4px"></div>
+          <div class="eyebrow" id="cfglabel" style="margin-top:6px"></div>
+          <pre id="funccfg" class="sec code"></pre>
+          <details class="disc"><summary>Strings</summary><div id="strings"></div></details>
+        </div>
+      </section>
+
+      <section class="stage">
+        <div class="stagehdr"><span class="snum">3</span><b>CWE detection</b></div>
+        <div class="sbody">
+          <div class="actions"><button class="btn sm" id="detect">Detect CWEs</button></div>
+          <div id="findings"></div>
+        </div>
+      </section>
+
+      <section class="stage">
+        <div class="stagehdr"><span class="snum">4</span><b>Dynamic &amp; fuzzing</b><span class="schip mono" id="fuzzstat"></span></div>
+        <div class="sbody">
+          <div class="actions">
+            <input id="dyninput" class="inp" placeholder="input (optional)">
+            <select id="dynmode" class="sel"><option value="stdin">stdin</option><option value="arg">argv</option><option value="file">file</option><option value="none">none</option></select>
+            <button class="btn sm" id="dynrun">Run once</button>
+            <span class="vsep"></span>
+            <select id="fuzzstrategy" class="sel" title="Fuzzing strategy">
+              <option value="fuzz">Black-box</option>
+              <option value="coverage">Coverage (AFL++)</option>
+              <option value="directed">Directed</option>
+              <option value="concolic">Concolic (angr)</option>
+              <option value="boundary">Boundary (IPC)</option>
+            </select>
+            <button class="btn sm primary" id="fuzzrun">Fuzz ▶</button>
+          </div>
+          <div id="dynresults"></div>
+        </div>
+      </section>
+
+      <section class="stage">
+        <div class="stagehdr"><span class="snum">5</span><b>Confirmation &amp; PoC / exploit</b></div>
+        <div class="sbody">
+          <div class="hint">Build a PoC, assess an L2 primitive, or synthesize an L3 exploit from a crash row above.</div>
+          <div id="pocs"></div>
+        </div>
+      </section>
+    </div>`;
+  DETAIL_TID = targetId;
   document.getElementById("deco").onclick = ()=>doDecompile(targetId);
   document.getElementById("detect").onclick = ()=>doDetect(targetId);
   document.getElementById("carve").onclick = ()=>doFirmware(targetId);
   document.getElementById("rehost").onclick = ()=>doRehost(targetId);
   document.getElementById("dynrun").onclick = ()=>doDynamic(targetId);
-  document.getElementById("fuzzrun").onclick = ()=>doFuzz(targetId);
-  document.getElementById("covrun").onclick = ()=>doCoverage(targetId);
-  document.getElementById("dirrun").onclick = ()=>doDirected(targetId);
-  document.getElementById("concrun").onclick = ()=>doConcolic(targetId);
-  document.getElementById("bndrun").onclick = ()=>doBoundary(targetId);
+  document.getElementById("fuzzrun").onclick = ()=>runFuzz(targetId);
   loadFunctions(targetId);
   loadStrings(targetId);
   loadFindings(targetId);
   loadDyn(targetId);
   loadPocs(targetId);
+}
+
+function runFuzz(tid){
+  const s=(document.getElementById("fuzzstrategy")||{}).value||"fuzz";
+  ({fuzz:doFuzz,coverage:doCoverage,directed:doDirected,concolic:doConcolic,boundary:doBoundary}[s]||doFuzz)(tid);
 }
 async function doPoc(tid, inputSha, mode){
   await fetch("/runs",{method:"POST",headers:{"Content-Type":"application/json"},
