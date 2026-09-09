@@ -738,7 +738,8 @@ def _function(f, code=False):
 def _run(r):
     return {"id": r.id, "case_id": r.case_id, "target_id": r.target_id, "stage": r.stage,
             "status": r.status, "error": r.error, "attempts": r.attempts,
-            "cache_key": r.cache_key}
+            "cache_key": r.cache_key, "created_at": r.created_at,
+            "started_at": r.started_at, "ended_at": r.ended_at}
 
 
 def _event(e):
