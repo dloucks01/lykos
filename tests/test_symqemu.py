@@ -94,10 +94,27 @@ def test_concolic_symqemu_backend_confirms_crash(store, case, pool, gated, tmp_p
 
 
 @pytest.mark.skipif(symqemu.locate_symqemu() is None, reason="symqemu not installed")
-def test_symqemu_real_generates_inputs(store, case, pool, gated):
-    target = ingest(store, case.id, gated)
+def test_symqemu_real_solves_file_gate_and_confirms(store, case, pool, gcc, tmp_path):
+    """Real SymQEMU: from a non-magic seed file, flip the branch constraints to generate an
+    input whose bytes start with the magic gate; replaying it crashes win() -> confirmed."""
+    import base64
+    src = ("#include <stdio.h>\n"
+           "void win(void){ volatile char*p=0; *p=1; }\n"
+           "int main(int argc,char**argv){ if(argc<2) return 0;"
+           " FILE*f=fopen(argv[1],\"rb\"); if(!f) return 0;"
+           " char b[8]={0}; size_t n=fread(b,1,8,f); fclose(f);"
+           " if(n>=4 && b[0]=='M'&&b[1]=='A'&&b[2]=='G'&&b[3]=='C') win(); return 0; }\n")
+    c = tmp_path / "fg.c"; c.write_text(src)
+    b = tmp_path / "fg"
+    if subprocess.run([gcc, "-O0", "-no-pie", str(c), "-o", str(b)],
+                      capture_output=True, check=False).returncode:
+        pytest.skip("build failed")
+    target = ingest(store, case.id, b)
     q = JobQueue(store.conn)
     run = enqueue_concolic(q, target, params={
-        "backend": "symqemu", "input_mode": "stdin", "max_seconds": 60, "exec_timeout": 2,
-        "seeds": ["QUFBQQ=="]})
-    assert pool.wait_idle(120) and q.runs.get(run.id).status == "done"
+        "backend": "symqemu", "input_mode": "file", "max_seconds": 90, "exec_timeout": 2,
+        "rounds": 6, "seeds": [base64.b64encode(b"AAAAAAAA").decode()]})
+    assert pool.wait_idle(180) and q.runs.get(run.id).status == "done"
+    confirmed = [f for f in FindingDAO(store.conn).list_by_target(target.id)
+                 if f.state == "confirmed" and f.detector == "concolic"]
+    assert confirmed, "expected SymQEMU to solve the file gate and confirm a crash"

@@ -33,22 +33,30 @@ a venv the locator checks automatically (`vendor/angr-venv/bin/python`), or set
 `vendor/` is gitignored (machine-specific). angr 9.3.4 works on CPython 3.14 (the unicorn
 engine is disabled, which our directed exploration does not require).
 
-## SymQEMU (from source — not packaged)
+## SymQEMU (built from source, vendored)
 
-SymQEMU has no distribution package; it is a QEMU fork plus the SymCC runtime. On the current
-Kali toolchain the from-source build is blocked by version skew: SymCC's runtime CMake needs a
-Z3 CMake config (Debian's `libz3-dev` ships none) and predates **LLVM 21** (Kali's default;
-only 19/21 are available). Building it therefore requires a supported LLVM (≈15–17) and a Z3
-with CMake support, on a pinned toolchain.
+SymQEMU has no distribution package and, on the current Kali toolchain, its from-source build
+is blocked by version skew (SymCC's runtime CMake needs Z3's CMake config, which Debian's
+`libz3-dev` omits, and it predates Kali's default LLVM 21). It is therefore built in an
+**Ubuntu 22.04 container** (the authors' known-good toolchain: LLVM 14 + Z3) and the resulting
+emulator vendored:
 
-Because the backend is a graceful option, this does not block anything: the `concolic` stage's
-SymQEMU path is fully integrated and covered by a stubbed end-to-end test, and its real-engine
-test is skipped until a `symqemu-<arch>` binary is present (via `LYKOS_SYMQEMU`, a vendored
-copy, or `PATH`). angr remains the default, real-tested concolic backend.
+    ./packaging/build-symqemu.sh      # docker build in 22.04, extract to vendor/symqemu/
+
+This produces `vendor/symqemu/symqemu-x86_64` (the SymQEMU-patched `qemu-x86_64`, 9.1.1) plus
+its `libSymCCRtShared.so`; the locator finds them and the runner sets `LD_LIBRARY_PATH` to the
+vendored directory so the runtime library resolves. `vendor/` is gitignored; the Dockerfile
+(`packaging/symqemu.Dockerfile`) and build script are committed for reproducibility.
+
+Verified working: from a non-magic seed, SymQEMU flips the branch constraints of a 4-byte file
+gate and generates `MAGC…`, which crashes the target in the sandbox -> a Confirmed concolic
+finding. angr remains the default backend; `params.backend=symqemu` selects this engine.
+
 
 ## Test status after provisioning
 
     make -C .. test      # or: python3 -m pytest tests
 
-148 passed, 1 skipped (the real SymQEMU engine). Real-run tests now exercised: Ghidra headless
-decompilation, AFL++ coverage fuzzing, angr branch-solving, and GDB root-cause capture.
+150 passed, 0 skipped. Real-run tests now exercised end-to-end: Ghidra headless
+decompilation, AFL++ coverage fuzzing, angr branch-solving, GDB root-cause capture, and
+SymQEMU concolic solving.
