@@ -105,7 +105,10 @@ def primitive_stage(ctx) -> dict:
         # 1) instruction-pointer control -- trust the stack-slot heuristic only when the fault
         # is actually at a return (else a fuzzed buffer of stack locals looks like a retaddr);
         # a cyclic PC (source "pc") is a hijack and is always trusted.
-        if rec is not None and (rec[1] == "pc" or mnem in ("ret", "retq", "retn")):
+        # a cyclic pc, or a controlled return-address register (lr/x30/$ra on link-register
+        # ABIs), is a hijack and always trusted; a bare stack slot only when the fault is a ret.
+        if rec is not None and (rec[1] in ("pc",) + primitive._RA_REGS
+                                or mnem in ("ret", "retq", "retn")):
             offset, source = rec
             static_match, fp_slack = primitive.match_frame_candidate(offset, offset_candidates,
                                                                      word)

@@ -26,6 +26,8 @@ MARKER = 0x1337C0DE1337
 # 32-bit targets truncate a 48-bit PC, so IP control on i386/arm/mips uses a 4-byte sentinel
 # (an unmapped user address, so the fetch faults at it). Reads as "1337c0de".
 MARKER32 = 0x1337C0DE
+# return-address registers across link-register ABIs, checked as IP-control sources
+_RA_REGS = ("lr", "x30", "r31", "ra")
 
 
 def _ip_marker(word: int) -> int:
@@ -111,6 +113,15 @@ def recover_ip_offset(cap: dict, length: int, n: int = 4, endian: str = "little"
         off = cyclic_find(_reg_window(pc, word, endian, n), length, n)
         if off != -1:
             return off, "pc"
+    # link-register ABIs (PPC lr, ARM/aarch64 lr/x30, MIPS $ra): the branch target the epilogue
+    # loads. On PPC the fetched pc is lr with the low bits masked by aligned fetch, so the pc
+    # search misses but the RA register holds the exact controlled value.
+    regs = cap.get("regs") or {}
+    for rn in _RA_REGS:
+        if rn in regs:
+            off = cyclic_find(_reg_window(regs[rn], word, endian, n), length, n)
+            if off != -1:
+                return off, rn
     # prefer the slot SP points at (the return address the ret tried to load), then neighbors
     words = dict(_stack_words(cap))
     for rel in (0, -8, 8, -16, 16):
@@ -224,8 +235,15 @@ def marker_confirmed(cap: dict, word: int = 8, endian: str = "little") -> bool:
     bytes are raw memory, compared against the sentinel rendered in target byte order.
     `word` selects the 64- or 32-bit sentinel (a 32-bit PC truncates the 48-bit marker)."""
     m = _ip_marker(word)
-    if cap.get("pc") == m:
+    pc = cap.get("pc")
+    # exact PC, or an alignment-masked PC (PPC clears the low 2 bits of a branch target; a
+    # thumb target sets bit 0) -- the branch reached the sentinel either way.
+    if pc == m or pc in (m & ~0b11, m & ~0b1, m | 1):
         return True
+    regs = cap.get("regs") or {}
+    for rn in _RA_REGS:                              # link-register ABIs: LR/x30/$ra holds it
+        if regs.get(rn) == m:
+            return True
     want = _marker_bytes(m, word, endian)
     for _rel, w in _stack_words(cap):
         if w[:len(want)] == want:

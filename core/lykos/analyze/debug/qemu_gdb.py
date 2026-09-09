@@ -33,7 +33,12 @@ _LAYOUTS = {
     "riscv64": [(f"x{i}", 8) for i in range(32)] + [("pc", 8)],
     "arm":     [(f"r{i}", 4) for i in range(13)] + [("sp", 4), ("lr", 4), ("pc", 4),
                                                     ("cpsr", 4)],
-    "ppc64":   [(f"r{i}", 8) for i in range(32)] + [("pc", 8), ("msr", 8)],
+    # PowerPC: 32 GPRs then nip(pc), msr, cr, lr, ctr, xer. On PPC the controllable return
+    # address is the Link Register (lr); the fetched pc is lr with the low 2 bits masked.
+    "ppc":     [(f"r{i}", 4) for i in range(32)]
+               + [("pc", 4), ("msr", 4), ("cr", 4), ("lr", 4), ("ctr", 4), ("xer", 4)],
+    "ppc64":   [(f"r{i}", 8) for i in range(32)]
+               + [("pc", 8), ("msr", 8), ("cr", 8), ("lr", 8), ("ctr", 8), ("xer", 8)],
     "s390":    [("pswm", 8), ("pc", 8)] + [(f"r{i}", 8) for i in range(16)],
     # MIPS32 o32: 32 GPRs then CP0 status/lo/hi/badvaddr/cause and pc (QEMU gdbstub order).
     # $sp is r29, return address is r31 ($ra). Works big- or little-endian (see `endianness`).
@@ -42,7 +47,7 @@ _LAYOUTS = {
 }
 # which register name is the stack pointer per ISA
 _SP = {"aarch64": "sp", "riscv": "x2", "riscv64": "x2", "arm": "sp", "ppc64": "r1",
-       "mips": "r29"}
+       "ppc": "r1", "mips": "r29"}
 
 
 def supported(arch: str) -> bool:
