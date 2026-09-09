@@ -118,3 +118,48 @@ def test_tcache_poison_on_real_glibc(play_bin):
             p.wait(timeout=3)
         except Exception:
             p.kill()
+
+
+# ------------------------------------------------------- automatic layout search (MAZE-style)
+from lykos.analyze.poc import heap_search as hs  # noqa: E402
+
+
+def test_search_reclaim_depth_matches_lifo():
+    st, addrs = hs.prime([24, 24, 24])                 # freed c0,c1,c2 (LIFO head=c2)
+    assert len(hs.search(st, hs.reclaim_goal(addrs[2]), sizes=(24,))) == 1   # head
+    assert len(hs.search(st, hs.reclaim_goal(addrs[1]), sizes=(24,))) == 2
+    assert len(hs.search(st, hs.reclaim_goal(addrs[0]), sizes=(24,))) == 3   # deepest
+
+
+def test_search_adjacency_and_unreachable():
+    ops = hs.search(hs.HeapState(top=0x1000), hs.adjacency_goal(24), sizes=(24,))
+    assert ops == [("alloc", 24), ("alloc", 24)]
+    st, _ = hs.prime([24, 24, 24])
+    assert hs.search(st, hs.reclaim_goal(0xDEAD0000), sizes=(24,), max_steps=6) is None
+
+
+def test_plan_reclaim_returns_ops():
+    ops, addrs = hs.plan_reclaim([24, 24, 24], target_index=1)
+    assert len(ops) == 2 and all(o[0] == "alloc" for o in ops)
+
+
+def test_layout_search_verified_on_real_glibc(play_bin):
+    """The search finds how many allocations reclaim a chosen freed chunk; verify the Nth
+    allocation actually returns that chunk's address on the host's real glibc."""
+    p = subprocess.Popen([str(play_bin)], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    try:
+        _drive(p, b"")                                 # banner
+        out = _drive(p, b"a 24 0\na 24 1\na 24 2\n")
+        addrs = [int(x, 16) for x in re.findall(r"alloc\[\d\]=0x([0-9a-f]+)", out)]
+        _drive(p, b"f 0\nf 1\nf 2\n")                  # free in order -> LIFO head = c2
+        # search: reclaim the middle chunk (c1, freed 2nd) -> should take 2 allocations
+        ops, _model = hs.plan_reclaim([24, 24, 24], target_index=1)
+        assert len(ops) == 2
+        out2 = _drive(p, b"a 24 3\na 24 4\n")          # run the planned allocations
+        got = int(re.search(r"alloc\[4\]=0x([0-9a-f]+)", out2).group(1), 16)
+        assert got == addrs[1]                         # the 2nd alloc reclaimed c1
+    finally:
+        try:
+            p.stdin.write(b"q\n"); p.stdin.flush(); p.wait(timeout=3)
+        except Exception:
+            p.kill()
