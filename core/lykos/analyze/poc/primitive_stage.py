@@ -8,6 +8,7 @@ import shutil
 
 from ...db.dao import FindingDAO, PocDAO, TargetDAO
 from ...jobs.registry import register_stage
+from ..debug import rootcause
 from ..dynamic import sandbox
 from ..dynamic.stage import crash_finding_candidate
 from . import bundle, primitive
@@ -61,54 +62,84 @@ def primitive_stage(ctx) -> dict:
 
         rec = primitive.recover_ip_offset(cap0, length)
         regs = primitive.controlled_registers(cap0, length)
-        if rec is None:
-            ctx.emit("primitive.done", payload={
-                "primitive": ("register-control" if regs else None), "supported": True,
-                "registers": regs, "signal": cap0.get("signal_name"),
-                "note": "crash reproduced but no instruction-pointer control found"})
-            ctx.progress(pct=100, msg="crash without IP control"
-                         + (" (registers controlled)" if regs else ""))
-            return {}
+        disasm = rootcause.disasm_one(bytes.fromhex(cap0.get("pc_bytes", "")),
+                                      target.arch or host)
+        mnem = (disasm or "").split()[0] if disasm else ""
 
-        offset, source = rec
-        ctx.progress(msg=f"IP-control offset {offset} ({source}); confirming with sentinel")
-        control = primitive.control_input(offset, length)
-        cap1 = capture(control)
-        confirmed = primitive.marker_confirmed(cap1)
+        # 1) instruction-pointer control -- trust the stack-slot heuristic only when the fault
+        # is actually at a return (else a fuzzed buffer of stack locals looks like a retaddr);
+        # a cyclic PC (source "pc") is a hijack and is always trusted.
+        if rec is not None and (rec[1] == "pc" or mnem in ("ret", "retq", "retn")):
+            offset, source = rec
+            ctx.progress(msg=f"IP-control offset {offset} ({source}); confirming")
+            control = primitive.control_input(offset, length)
+            confirmed = primitive.marker_confirmed(capture(control))
+            prim = {"type": "instruction-pointer-control", "offset": offset, "source": source,
+                    "marker": primitive.MARKER, "observed_pc": cap0.get("pc", 0),
+                    "confirmed": confirmed, "registers": regs}
+            extra = f"instruction-pointer control at offset {offset}"
+            return _finalize(ctx, target, target_bytes, mode, base_argv, cap0, control,
+                             prim, confirmed, extra)
 
-        prim = {"type": "instruction-pointer-control", "offset": offset, "source": source,
-                "marker": primitive.MARKER, "observed_pc": cap1.get("pc", 0),
-                "confirmed": confirmed, "registers": regs,
-                "signal": cap0.get("signal_name")}
+        # 2) memory primitive (write-what-where / controlled read at a faulting mem access)
+        memp = primitive.analyze_memory_primitive(cap0, length, disasm)
+        if memp is not None:
+            ctx.progress(msg=f"{memp['type']} at addr offset {memp['addr_offset']}; confirming")
+            control = primitive.two_marker_input(memp["addr_offset"], memp.get("value_offset"),
+                                                 length)
+            addr_ok, value_ok = primitive.memory_primitive_confirmed(capture(control), memp)
+            confirmed = addr_ok and (value_ok or memp["type"] != "write-what-where")
+            reg_map = {memp["addr_reg"]: memp["addr_offset"]}
+            if memp.get("value_reg") and memp.get("value_offset") is not None:
+                reg_map[memp["value_reg"]] = memp["value_offset"]
+            prim = {"type": memp["type"], "offset": memp["addr_offset"],
+                    "marker": primitive.MARKER, "observed_pc": cap0.get("pc", 0),
+                    "confirmed": confirmed, "registers": reg_map, "access": memp["access"],
+                    "value_offset": memp.get("value_offset"), "disasm": disasm}
+            extra = (f"{memp['type']}: {memp['access']} through attacker-controlled address "
+                     f"(offset {memp['addr_offset']}"
+                     + (f", value offset {memp['value_offset']}"
+                        if memp.get("value_offset") is not None else "") + f") via `{disasm}`")
+            return _finalize(ctx, target, target_bytes, mode, base_argv, cap0, control,
+                             prim, confirmed, extra)
 
-        control_sha = ctx.put_artifact("poc-l2-input", data=control)
-        meta = {"target_sha256": target.sha256, "arch": target.arch, "input_mode": mode,
-                "level": "L2" if confirmed else "L1", "primitive": prim,
-                "tool_version": TOOL_VERSION}
-        data = bundle.build(target_bytes, control, meta, b"", mode, base_argv,
-                            cap0.get("signal_name") or "SIGSEGV", primitive=prim)
-        level = "L2" if confirmed else "L1"
-        bundle_sha = ctx.put_artifact("poc-bundle", data=data,
-                                      meta={"level": level, "verified": confirmed})
-        PocDAO(ctx.conn).insert(target.id, target.case_id, level=level, verified=confirmed,
-                                signal_name=cap0.get("signal_name"), input_sha=control_sha,
-                                bundle_sha=bundle_sha)
-
-        if confirmed:
-            FindingDAO(ctx.conn).upsert(target.id, target.case_id, crash_finding_candidate(
-                cap0.get("signal_name"), control_sha, "ptrace", "primitive",
-                f"(L2 primitive: instruction-pointer control at offset {offset})",
-                state="poc-backed", confidence=0.98, bundle_sha=bundle_sha))
-
-        ctx.emit("primitive.done", payload={"primitive": prim["type"] if confirmed else
-                 "ip-control-unconfirmed", "supported": True, "offset": offset,
-                 "confirmed": confirmed, "level": level, "bundle": bundle_sha,
-                 "registers": regs})
-        ctx.progress(pct=100, msg=(f"L2 confirmed: IP control at offset {offset}")
-                     if confirmed else f"IP control indicated at {offset} (unconfirmed)")
-        return {"output_shas": [bundle_sha], "output_kind": "poc-bundle"}
+        # 3) crash reproduced but no controllable primitive found
+        ctx.emit("primitive.done", payload={
+            "primitive": ("register-control" if regs else None), "supported": True,
+            "registers": regs, "signal": cap0.get("signal_name"),
+            "note": "crash reproduced but no instruction-pointer / memory primitive found"})
+        ctx.progress(pct=100, msg="crash without a controllable primitive")
+        return {}
     finally:
         shutil.rmtree(helper.parent, ignore_errors=True)
+
+
+def _finalize(ctx, target, target_bytes, mode, base_argv, cap0, control, prim, confirmed,
+              extra):
+    """Bundle the demonstrating input, record an L2 (or L1) PoC, promote the crash finding on
+    confirmation, and emit the result -- shared by every primitive kind."""
+    level = "L2" if confirmed else "L1"
+    control_sha = ctx.put_artifact("poc-l2-input", data=control)
+    meta = {"target_sha256": target.sha256, "arch": target.arch, "input_mode": mode,
+            "level": level, "primitive": prim, "tool_version": TOOL_VERSION}
+    data = bundle.build(target_bytes, control, meta, b"", mode, base_argv,
+                        cap0.get("signal_name") or "SIGSEGV", primitive=prim)
+    bundle_sha = ctx.put_artifact("poc-bundle", data=data,
+                                  meta={"level": level, "verified": confirmed})
+    PocDAO(ctx.conn).insert(target.id, target.case_id, level=level, verified=confirmed,
+                            signal_name=cap0.get("signal_name"), input_sha=control_sha,
+                            bundle_sha=bundle_sha)
+    if confirmed:
+        FindingDAO(ctx.conn).upsert(target.id, target.case_id, crash_finding_candidate(
+            cap0.get("signal_name"), control_sha, "ptrace", "primitive",
+            f"(L2 primitive: {extra})", state="poc-backed", confidence=0.98,
+            bundle_sha=bundle_sha))
+    ctx.emit("primitive.done", payload={
+        "primitive": prim["type"], "supported": True, "offset": prim.get("offset"),
+        "confirmed": confirmed, "level": level, "bundle": bundle_sha})
+    ctx.progress(pct=100, msg=(f"L2 confirmed: {prim['type']}") if confirmed
+                 else f"{prim['type']} indicated (unconfirmed)")
+    return {"output_shas": [bundle_sha], "output_kind": "poc-bundle"}
 
 
 def register() -> None:

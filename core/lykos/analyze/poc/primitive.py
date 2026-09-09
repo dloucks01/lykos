@@ -16,6 +16,7 @@ native-architecture targets only.
 """
 from __future__ import annotations
 
+import re
 import struct
 
 _ALPHA = b"abcdefghijklmnopqrstuvwxyz"
@@ -127,3 +128,114 @@ def marker_confirmed(cap: dict) -> bool:
         if w == want:
             return True
     return False
+
+
+# --------------------------------------------------------------------- L2 memory primitives
+# A second canonical sentinel for the *value* half of a write-what-where.
+MARKER_VALUE = 0x0B16B00B5157
+
+# 32/16/8-bit register names -> their 64-bit container, so a disasm operand like `edx`
+# resolves to the `rdx` value the ptrace capture reports.
+_SUBREG = {}
+# rax/rbx/rcx/rdx with e**/**/**l aliases
+for _q, _b in (("rax", "a"), ("rbx", "b"), ("rcx", "c"), ("rdx", "d")):
+    for _alias in (_q, "e" + _b + "x", _b + "x", _b + "l", _b + "h"):
+        _SUBREG[_alias] = _q
+# rsi/rdi/rbp/rsp with e**/**/**l aliases
+for _q, _b in (("rsi", "si"), ("rdi", "di"), ("rbp", "bp"), ("rsp", "sp")):
+    for _alias in (_q, "e" + _b, _b, _b + "l"):
+        _SUBREG[_alias] = _q
+# r8..r15 with d/w/b aliases
+for _n in range(8, 16):
+    for _sfx in ("", "d", "w", "b"):
+        _SUBREG[f"r{_n}{_sfx}"] = f"r{_n}"
+
+
+def _reg64(name):
+    return _SUBREG.get(name.strip().lower())
+
+
+def _first_reg_in_brackets(operand):
+    """The base register named inside a `[...]` memory operand, as a 64-bit name."""
+    i, j = operand.find("["), operand.find("]")
+    if i < 0 or j < 0:
+        return None
+    inner = operand[i + 1:j]
+    for tok in re.split(r"[+*\-\s]", inner):
+        r = _reg64(tok)
+        if r:
+            return r
+    return None
+
+
+def parse_mem_access(disasm: str):
+    """From an Intel-syntax instruction, return {is_write, base, value} for its memory operand,
+    or None if it does not dereference memory. `base` is the address register (64-bit name),
+    `value` the source register for a store (else None)."""
+    if not disasm or "[" not in disasm:
+        return None
+    parts = disasm.split(None, 1)
+    if len(parts) < 2:
+        return None
+    ops = parts[1]
+    dest, _, src = ops.partition(",")
+    if "[" in dest:                                  # memory is the destination -> a store
+        return {"is_write": True, "base": _first_reg_in_brackets(dest),
+                "value": _reg64(src.strip()) if src.strip() else None}
+    return {"is_write": False, "base": _first_reg_in_brackets(src), "value": None}
+
+
+def analyze_memory_primitive(cap: dict, length: int, disasm, n: int = 4):
+    """Classify an attacker-controlled memory access at the fault: write-what-where (address
+    and stored value both controlled), controlled-write (address only), or controlled-read
+    (arbitrary read address). Returns a primitive dict or None.
+
+    The controlled address is read from the base register (not si_addr): a non-canonical
+    controlled address raises #GP, for which the kernel reports si_addr as 0, so the register
+    value is the reliable signal."""
+    if not disasm:
+        return None
+    acc = parse_mem_access(disasm)
+    if acc is None or not acc["base"]:
+        return None
+    regs = cap.get("regs") or {}
+    if acc["base"] not in regs:
+        return None
+    addr_off = cyclic_find(_le4(int(regs[acc["base"]])), length, n)
+    if addr_off == -1:                               # dereferenced address is not attacker data
+        return None
+    value_off = -1
+    if acc["is_write"] and acc["value"] and acc["value"] in regs:
+        value_off = cyclic_find(_le4(int(regs[acc["value"]])), length, n)
+    if acc["is_write"]:
+        kind = "write-what-where" if value_off != -1 else "controlled-write"
+    else:
+        kind = "controlled-read"
+    return {"type": kind, "access": "write" if acc["is_write"] else "read",
+            "addr_reg": acc["base"], "addr_offset": addr_off, "value_reg": acc["value"],
+            "value_offset": (value_off if value_off != -1 else None),
+            "fault_addr": cap.get("fault_addr"), "disasm": disasm}
+
+
+def two_marker_input(addr_offset: int, value_offset, length: int) -> bytes:
+    """Place the address sentinel at `addr_offset` and (for write-what-where) the value
+    sentinel at `value_offset`, over cyclic filler, padded to `length`."""
+    body = bytearray(cyclic(length))
+    body[addr_offset:addr_offset + 8] = struct.pack("<Q", MARKER)
+    if value_offset is not None:
+        body[value_offset:value_offset + 8] = struct.pack("<Q", MARKER_VALUE)
+    return bytes(body[:length])
+
+
+def memory_primitive_confirmed(cap: dict, prim: dict):
+    """After re-running with `two_marker_input`, verify we steered the dereferenced address to
+    the sentinel (WHERE control) and, for a write, the stored-value register to its sentinel
+    (WHAT control). Returns (addr_ok, value_ok). The address is checked on the base register
+    (robust to non-canonical #GP where si_addr reads 0), falling back to si_addr."""
+    regs = cap.get("regs") or {}
+    addr_ok = (int(regs.get(prim.get("addr_reg"), -1)) == MARKER
+               or cap.get("fault_addr") == MARKER)
+    value_ok = True
+    if prim.get("value_offset") is not None and prim.get("value_reg"):
+        value_ok = int(regs.get(prim["value_reg"], 0)) == MARKER_VALUE
+    return addr_ok, value_ok
