@@ -23,7 +23,7 @@ from ..casestore import CaseStore
 from ..db.dao import FindingDAO
 from ..jobs import JobConfig, JobQueue, WorkerPool
 from .corpus import bundled, bundled_dynamic
-from .metrics import Outcome, Report, score
+from .metrics import Outcome, Report, matches, same_family, score
 
 _CONFIRMED = ("confirmed", "poc-backed")
 
@@ -42,37 +42,47 @@ def compile_case(case, outdir: Path, gcc: str = "gcc"):
     stem = f"{case.cwe}__{case.name}__{case.verdict}"
     build = outdir / stem
     build.mkdir(parents=True, exist_ok=True)
-    src = build / "unit.c"
-    src.write_text(case.source)
     out = build / "prog"
-    r = subprocess.run([gcc, *case.cflags, str(src), "-o", str(out)],
-                       capture_output=True)
+    srcs: list[str] = []
+    if case.source:                                    # inline (bundled) source
+        u = build / "unit.c"
+        u.write_text(case.source)
+        srcs.append(str(u))
+    srcs += list(case.files)                            # extra/multi-file (Juliet) sources
+    cmd = [gcc, *case.cflags]
+    cmd += [f"-I{d}" for d in case.include_dirs]
+    cmd += [f"-D{d}" for d in case.defines]
+    cmd += srcs + ["-o", str(out)]
+    r = subprocess.run(cmd, capture_output=True)
     return out if r.returncode == 0 and out.exists() else None
 
 
 def _best_state(findings, cwe):
-    states = [f.state for f in findings if f.cwe == cwe and f.state]
+    states = [f.state for f in findings if same_family(cwe, f.cwe) and f.state]
     return max(states, key=lambda s: _STATE_RANK.get(s, -1)) if states else ""
 
 
 def run_corpus(cases=None, *, workdir=None, gcc="gcc", workers=2, stage_timeout=180,
-               progress=None) -> Report:
+               min_state="candidate", progress=None) -> Report:
     """Compile + analyze every case and return a scored `Report`.
 
-    `progress(msg)` is an optional callback for a live readout. Requires gcc; Ghidra is
-    strongly recommended (the call-graph detectors are dark without it) and its presence is
-    recorded in the report meta.
+    `min_state` sets the finding state a case must reach to count as detected: "candidate"
+    scores the raw rule/sink channel (flags any dangerous-API use), "corroborated" scores the
+    taint-discriminated channel (a tainted source actually reaches the sink) -- the confidence
+    pipeline's precision lever. `progress(msg)` is an optional live-readout callback. Requires
+    gcc; Ghidra is strongly recommended (the call-graph detectors are dark without it).
     """
     cases = list(cases if cases is not None else bundled())
     gcc_path = shutil.which(gcc)
     ghidra = locate_ghidra()
+    rank_min = _STATE_RANK.get(min_state, 0)
     tmp = Path(workdir) if workdir else Path(tempfile.mkdtemp(prefix="lykos-eval-"))
     tmp.mkdir(parents=True, exist_ok=True)
     say = progress or (lambda _m: None)
 
     meta = {
         "n_cases": len(cases), "gcc": bool(gcc_path),
-        "ghidra": str(ghidra) if ghidra else None,
+        "ghidra": str(ghidra) if ghidra else None, "min_state": min_state,
         "warnings": [],
     }
     if not gcc_path:
@@ -110,9 +120,11 @@ def run_corpus(cases=None, *, workdir=None, gcc="gcc", workers=2, stage_timeout=
             enqueue_detect(q, target, force=True)
             pool.wait_idle(stage_timeout)
             findings = FindingDAO(store.conn).list_by_target(target.id)
-            found = {f.cwe for f in findings}
+            found = {f.cwe for f in findings
+                     if _STATE_RANK.get(f.state, 0) >= rank_min}
             outcomes.append(Outcome(c.name, c.cwe, c.verdict, found,
-                                    state=_best_state(findings, c.cwe), note=c.note))
+                                    state=_best_state(findings, c.cwe),
+                                    matched=matches(c.cwe, found), note=c.note))
     finally:
         pool.stop(grace=3.0)
         store.close()

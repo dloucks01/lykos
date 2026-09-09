@@ -14,6 +14,34 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+# CWE families: a detector naming the sink's generic CWE (e.g. strcpy -> CWE-120) counts as
+# detecting a case labeled with a sibling (e.g. Juliet's CWE-121 stack overflow). Matching is
+# family-wise so external suites that use specific labels still score correctly.
+_FAMILIES = [
+    {"CWE-119", "CWE-120", "CWE-121", "CWE-122", "CWE-123", "CWE-124", "CWE-125", "CWE-126",
+     "CWE-127", "CWE-680", "CWE-786", "CWE-787", "CWE-788"},           # buffer bounds
+    {"CWE-134"},                                                       # format string
+    {"CWE-77", "CWE-78", "CWE-88"},                                    # command/arg injection
+    {"CWE-476"},                                                       # NULL deref
+    {"CWE-415", "CWE-416"},                                            # free/UAF
+    {"CWE-190", "CWE-191", "CWE-192"},                                 # integer wrap
+    {"CWE-259", "CWE-321", "CWE-798"},                                 # hard-coded creds
+    {"CWE-327", "CWE-328"},                                            # weak crypto
+    {"CWE-330", "CWE-338"},                                            # weak RNG
+    {"CWE-242", "CWE-676"},                                            # dangerous function
+]
+
+
+def same_family(a: str, b: str) -> bool:
+    if a == b:
+        return True
+    return any(a in fam and b in fam for fam in _FAMILIES)
+
+
+def matches(ground_truth: str, found_cwes) -> bool:
+    """True if any flagged CWE is in the ground-truth CWE's family."""
+    return any(same_family(ground_truth, f) for f in found_cwes)
+
 
 @dataclass
 class Outcome:
@@ -24,10 +52,13 @@ class Outcome:
     found_cwes: set                # CWEs the platform flagged on this target
     state: str = ""                # best finding state for `cwe` (candidate/…/confirmed)
     note: str = ""
+    matched: bool = None           # set by the harness (family-aware); else exact membership
 
     @property
     def flagged(self) -> bool:
-        return self.cwe in self.found_cwes
+        if self.matched is not None:
+            return self.matched
+        return matches(self.cwe, self.found_cwes)
 
 
 def _prf(tp: int, fp: int, fn: int) -> dict:

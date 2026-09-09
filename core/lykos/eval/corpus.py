@@ -22,9 +22,12 @@ class Case:
     name: str
     cwe: str                       # ground-truth CWE class
     verdict: str                   # "bad" | "good"
-    source: str
+    source: str = ""               # inline source (bundled corpus); may be empty for files=
     cflags: list = field(default_factory=lambda: list(_FLAGS))
     note: str = ""
+    files: list = field(default_factory=list)          # extra .c source paths (multi-file)
+    include_dirs: list = field(default_factory=list)   # -I dirs (Juliet support headers)
+    defines: list = field(default_factory=list)        # -D macros (OMITGOOD/OMITBAD/…)
 
 
 # ---------------------------------------------------------------- bundled micro-corpus
@@ -170,6 +173,65 @@ def bundled_dynamic() -> list[Case]:
 
 
 _FNAME = re.compile(r"^(CWE-\d+)__([A-Za-z0-9_.-]+)__(good|bad)\.c$")
+
+
+# NIST Juliet testcase filename: CWE<NNN>_<Name>__<variant>_<NN>[<letter>].c
+_JULIET = re.compile(r"^(CWE\d+)_.*?__.*_(\d+)([a-z]?)\.c$")
+_JULIET_SUPPORT = {"io.c", "main.c", "std_thread.c"}          # shared support .c files
+# Juliet C support headers/sources live in a `testcasesupport` dir; io.c defines printLine etc.
+_JULIET_FLAGS = ["-O0", "-fno-stack-protector", "-no-pie", "-w", "-DINCLUDEMAIN"]
+
+
+def _juliet_support(root: Path):
+    """Locate Juliet's testcasesupport: the include dir (has std_testcase.h) and io.c."""
+    hdr = next(iter(sorted(root.rglob("std_testcase.h"))), None)
+    io = next(iter(sorted(root.rglob("io.c"))), None)
+    inc = hdr.parent if hdr else None
+    return inc, io
+
+
+def load_juliet(root: str | Path, *, cwes=None, limit=None) -> list[Case]:
+    """Adapt a NIST Juliet C test-suite drop into scored good/bad `Case`s.
+
+    Each testcase compiles TWICE from the same sources: `-DOMITGOOD` builds a binary whose
+    main() exercises only the flaw (the `bad` case), `-DOMITBAD` builds the fixed variant (the
+    `good` case). Multi-file testcases (``…_01a.c`` / ``…_01b.c``) are grouped and compiled
+    together with Juliet's shared support (io.c + testcasesupport headers). `cwes` filters to a
+    set of CWE ids; `limit` caps the number of testcases (drops are huge).
+
+    The real suite is large and separately licensed; point this at an unpacked drop. The
+    on-disk conventions it follows are Juliet's, so it also scores a faithful miniature.
+    """
+    root = Path(root)
+    inc, io = _juliet_support(root)
+    include_dirs = [str(inc)] if inc else []
+    support = [io] if io else []
+
+    groups: dict = {}
+    for f in sorted(root.rglob("CWE*.c")):
+        if f.name in _JULIET_SUPPORT:
+            continue
+        m = _JULIET.match(f.name)
+        if not m:
+            continue
+        cwe = "CWE-" + m.group(1)[3:]                     # "CWE121" -> "CWE-121"
+        if cwes and cwe not in cwes:
+            continue
+        base = f.name[:m.start(3)] if m.group(3) else f.name[:-2]   # strip trailing letter/.c
+        groups.setdefault((cwe, base), []).append(f)
+
+    cases: list[Case] = []
+    for (cwe, base), srcs in sorted(groups.items()):
+        if limit and len(cases) >= 2 * limit:
+            break
+        name = base.rstrip("_")
+        common = dict(files=[str(s) for s in srcs] + [str(p) for p in support],
+                      include_dirs=include_dirs + [str(srcs[0].parent)])
+        cases.append(Case(name, cwe, "bad", cflags=list(_JULIET_FLAGS) + ["-DOMITGOOD"],
+                          note="Juliet testcase (bad variant)", **common))
+        cases.append(Case(name, cwe, "good", cflags=list(_JULIET_FLAGS) + ["-DOMITBAD"],
+                          note="Juliet testcase (good variant)", **common))
+    return cases
 
 
 def load_dir(path: str | Path) -> list[Case]:
