@@ -72,6 +72,21 @@ def _le4(value: int) -> bytes:
     return struct.pack("<I", value & 0xFFFFFFFF)
 
 
+def _reg_window(value: int, word: int, endian: str, n: int = 4) -> bytes:
+    """The first `n` input bytes that produced a controlled register value. A register is an
+    integer; the bytes an attacker placed in memory become that integer in target byte order,
+    so the search key is the value rendered in the target's endianness (big MSB-first == the
+    input order; little LSB-first == the input order too). Works for 4- and 8-byte registers."""
+    order = "big" if endian == "big" else "little"
+    return (int(value) & ((1 << (word * 8)) - 1)).to_bytes(word, order)[:n]
+
+
+def _marker_bytes(marker: int, word: int, endian: str) -> bytes:
+    """Marker rendered so that, loaded from memory into a register, it reconstructs `marker`."""
+    order = "big" if endian == "big" else "little"
+    return marker.to_bytes(word, order)
+
+
 def _stack_words(cap: dict):
     """Yield (relative_offset_to_sp, 8-byte-word) from the captured stack window."""
     stack = bytes.fromhex(cap.get("stack", ""))
@@ -83,15 +98,17 @@ def _stack_words(cap: dict):
         yield (base + i) - sp, stack[i:i + 8]
 
 
-def recover_ip_offset(cap: dict, length: int, n: int = 4):
+def recover_ip_offset(cap: dict, length: int, n: int = 4, endian: str = "little", word: int = 8):
     """Recover the instruction-pointer-control offset from a cyclic-pattern crash capture.
 
     Checks the program counter itself (canonical case), then the return-address slot the
-    stack pointer indexes at the fault, then adjacent slots. Returns (offset, source) or None.
-    """
+    stack pointer indexes at the fault, then adjacent slots. `endian`/`word` describe the
+    target so the PC's bytes are read in the right order (a big-endian PC's bytes are MSB
+    first). Stack-slot bytes are raw memory, already in input order. Returns (offset, source)
+    or None."""
     pc = cap.get("pc")
     if pc is not None:
-        off = cyclic_find(_le4(pc), length, n)
+        off = cyclic_find(_reg_window(pc, word, endian, n), length, n)
         if off != -1:
             return off, "pc"
     # prefer the slot SP points at (the return address the ret tried to load), then neighbors
@@ -99,7 +116,7 @@ def recover_ip_offset(cap: dict, length: int, n: int = 4):
     for rel in (0, -8, 8, -16, 16):
         w = words.get(rel)
         if w:
-            off = cyclic_find(w[:4], length, n)
+            off = cyclic_find(w[:n], length, n)      # raw memory bytes -> already input order
             if off != -1:
                 return off, f"stack[sp{rel:+d}]"
     return None
@@ -177,35 +194,39 @@ def seed_offsets(candidates: list, word: int = 8, cap=None):
     return out
 
 
-def controlled_registers(cap: dict, length: int, n: int = 4) -> dict:
+def controlled_registers(cap: dict, length: int, n: int = 4, endian: str = "little",
+                         word: int = 8) -> dict:
     """Which general registers hold attacker-controlled (cyclic) data -> {reg: offset}."""
     out = {}
     for name, val in (cap.get("regs") or {}).items():
         if name in ("cs", "ss", "ds", "es", "fs", "gs", "eflags", "orig_rax", "pstate"):
             continue
-        off = cyclic_find(_le4(int(val)), length, n)
+        off = cyclic_find(_reg_window(int(val), word, endian, n), length, n)
         if off != -1:
             out[name] = off
     return out
 
 
-def control_input(offset: int, length: int, word: int = 8) -> bytes:
+def control_input(offset: int, length: int, word: int = 8, endian: str = "little") -> bytes:
     """cyclic filler up to `offset`, the sentinel at the control slot, padding to `length`.
-    `word` is the pointer size: an 8-byte sentinel on 64-bit, 4-byte on 32-bit targets."""
+    `word` is the pointer size (8 on 64-bit, 4 on 32-bit); `endian` places the sentinel bytes
+    so a big-endian target loads them back as the sentinel value."""
     body = bytearray(cyclic(offset))
-    body += struct.pack("<Q", MARKER) if word >= 8 else struct.pack("<I", MARKER32)
+    body += _marker_bytes(_ip_marker(word), word, endian)
     if len(body) < length:
         body += b"C" * (length - len(body))
     return bytes(body)
 
 
-def marker_confirmed(cap: dict, word: int = 8) -> bool:
+def marker_confirmed(cap: dict, word: int = 8, endian: str = "little") -> bool:
     """True if the fault shows the program counter (or the SP slot) equal to the sentinel.
+    The PC is compared as an integer (already parsed in target byte order); the stack-slot
+    bytes are raw memory, compared against the sentinel rendered in target byte order.
     `word` selects the 64- or 32-bit sentinel (a 32-bit PC truncates the 48-bit marker)."""
     m = _ip_marker(word)
     if cap.get("pc") == m:
         return True
-    want = (struct.pack("<Q", MARKER) if word >= 8 else struct.pack("<I", MARKER32))
+    want = _marker_bytes(m, word, endian)
     for _rel, w in _stack_words(cap):
         if w[:len(want)] == want:
             return True

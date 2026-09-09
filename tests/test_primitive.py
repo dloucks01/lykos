@@ -322,3 +322,25 @@ def test_match_frame_candidate_prefers_largest_overflow_target():
     # only the small buffer is within a word -> it is chosen
     c, slack = P.match_frame_candidate(130, cands, 4)
     assert c["buffer"] == "small"
+
+
+def test_offset_recovery_is_endianness_aware():
+    """A big-endian target loads input bytes into a register MSB-first, so the offset search
+    and marker placement must use target byte order (regression: was little-endian only)."""
+    length = 512
+    # emulate a BE 32-bit crash: input bytes at offset 132 become the PC as a big-endian word
+    off = 132
+    pat = P.cyclic(length)
+    window = pat[off:off + 4]
+    pc_be = int.from_bytes(window, "big")            # how a BE CPU loads those 4 bytes
+    cap = {"pc": pc_be, "stack": "", "stack_base": 0, "sp": 0}
+    assert P.recover_ip_offset(cap, length, endian="big", word=4) == (off, "pc")
+    # little-endian read of the same value would not be found
+    assert P.recover_ip_offset(cap, length, endian="little", word=4) is None
+    # control_input places the sentinel in target order so the BE CPU reconstructs it
+    be = P.control_input(off, 300, word=4, endian="big")
+    assert be[off:off + 4] == P.MARKER32.to_bytes(4, "big")
+    assert int.from_bytes(be[off:off + 4], "big") == P.MARKER32
+    # and marker_confirmed compares the PC as an integer (order-independent once parsed)
+    assert P.marker_confirmed({"pc": P.MARKER32, "stack": "", "stack_base": 0, "sp": 0},
+                              word=4, endian="big")

@@ -71,6 +71,7 @@ def primitive_stage(ctx) -> dict:
 
     # Static RE corroboration: recovered stack-buffer sizes predict IP-control offsets.
     word = 8 if (target.bits or 64) >= 64 else 4
+    endian = "big" if target.endianness == "big" else "little"
     frames = _hydrate_frames(ctx, target.id)
     offset_candidates = primitive.frame_offset_candidates(frames, word)
     if offset_candidates:
@@ -95,8 +96,8 @@ def primitive_stage(ctx) -> dict:
             ctx.progress(pct=100, msg="no fault under cyclic pattern (no L2 primitive)")
             return {}
 
-        rec = primitive.recover_ip_offset(cap0, length)
-        regs = primitive.controlled_registers(cap0, length)
+        rec = primitive.recover_ip_offset(cap0, length, endian=endian, word=word)
+        regs = primitive.controlled_registers(cap0, length, endian=endian, word=word)
         disasm = rootcause.disasm_one(bytes.fromhex(cap0.get("pc_bytes", "")),
                                       target.arch or host)
         mnem = (disasm or "").split()[0] if disasm else ""
@@ -110,8 +111,8 @@ def primitive_stage(ctx) -> dict:
                                                                      word)
             ctx.progress(msg=f"IP-control offset {offset} ({source}"
                              + (", matches static frame" if static_match else "") + "); confirming")
-            control = primitive.control_input(offset, length, word)
-            confirmed = primitive.marker_confirmed(capture(control), word)
+            control = primitive.control_input(offset, length, word, endian)
+            confirmed = primitive.marker_confirmed(capture(control), word, endian)
             prim = {"type": "instruction-pointer-control", "offset": offset, "source": source,
                     "marker": primitive._ip_marker(word), "observed_pc": cap0.get("pc", 0),
                     "confirmed": confirmed, "registers": regs,
@@ -128,8 +129,8 @@ def primitive_stage(ctx) -> dict:
         # recovered stack buffers predict where the return address is; try each prediction
         # directly (a confirmed PC==MARKER is proof, discovered from the static frame).
         for off, c, fp_slack in primitive.seed_offsets(offset_candidates, word, length):
-            control = primitive.control_input(off, length, word)
-            if primitive.marker_confirmed(capture(control), word):
+            control = primitive.control_input(off, length, word, endian)
+            if primitive.marker_confirmed(capture(control), word, endian):
                 ctx.progress(msg=f"static-frame IP-control offset {off} confirmed")
                 prim = {"type": "instruction-pointer-control", "offset": off,
                         "source": "static-frame", "marker": primitive._ip_marker(word),
