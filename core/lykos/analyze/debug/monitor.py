@@ -105,6 +105,7 @@ class Hit(gdb.Breakpoint):
         HITS.append(rec)
         return len(HITS) >= MAX
 
+gdb.execute("set breakpoint pending on")   # sinks may live in libc (not yet loaded)
 for _n, _spec in FUNCS.items():
     try: Hit(_n, _spec)
     except Exception: pass
@@ -139,8 +140,9 @@ def run_monitor(exe, funcs, arch, *, argv=(), stdin=b"", timeout=20):
             (d / "in.bin").write_bytes(stdin)
             infile = str(d / "in.bin")
         spec = {n: CATALOG[n] for n in funcs if n in CATALOG}
-        script = _SCRIPT % {"argregs": json.dumps(_ARGREGS[arch]),
-                            "funcs": json.dumps(spec), "infile": infile,
+        # embed as Python literals (repr), not JSON -- None must be None, not `null`
+        script = _SCRIPT % {"argregs": repr(_ARGREGS[arch]),
+                            "funcs": repr(spec), "infile": infile,
                             "runargs": " ".join(shlex.quote(a) for a in argv)}
         (d / "mon.py").write_text(script)
         proc = subprocess.run(

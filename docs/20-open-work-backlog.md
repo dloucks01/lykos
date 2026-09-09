@@ -43,7 +43,7 @@ crashing input; many bug classes have a **derivable** input and need no fuzzing.
 - **[DONE] Dangerous-call monitor** — B.1 (the first debugger flavor); native-arch (host GDB).
 - **[DONE] Heap-error detection** — B.2, shipped as the LD_PRELOAD guard-page allocator
   (`heap_check`) rather than breakpoints (more precise: faults at the offending access).
-- **[PLANNED] Comparison / secret extraction**: breakpoint `strcmp`/`memcmp`/`strncmp`, dump the
+- **[DONE] Comparison / secret extraction** (`extract_secrets`): breakpoint `strcmp`/`memcmp`/`strncmp`, dump the
   operand the program compares *our* input against → auto-recover passwords, magic bytes, license
   keys, expected tokens. Classic offensive RE; turns a crackme into an answer in one run.
 - **[PLANNED] Cross-arch breakpoints**: extend the monitor/heap-tracker to emulated targets via
