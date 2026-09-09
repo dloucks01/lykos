@@ -33,6 +33,20 @@ a venv the locator checks automatically (`vendor/angr-venv/bin/python`), or set
 `vendor/` is gitignored (machine-specific). angr 9.3.4 works on CPython 3.14 (the unicorn
 engine is disabled, which our directed exploration does not require).
 
+## Unicorn + Keystone (vendored venv) — firmware rehosting
+
+The `firmware_rehost` stage runs a bare-metal ARM Cortex-M image under the Unicorn CPU
+emulator (Fuzzware-style MMIO modelling) via a standalone driver, keeping the core
+stdlib-only. Provision a venv the locator checks automatically
+(`vendor/unicorn-venv/bin/python`), or set `LYKOS_UNICORN_PYTHON`:
+
+    python3 -m venv vendor/unicorn-venv
+    vendor/unicorn-venv/bin/pip install unicorn keystone-engine
+
+`unicorn` (2.1.4, an abi3 wheel — any CPython ≥3.7) does the emulation; `keystone-engine`
+is only used by the test suite to assemble sample Cortex-M firmware. Absent Unicorn, the
+stage reports rehosting unavailable and everything else still works.
+
 ## SymQEMU (built from source, vendored)
 
 SymQEMU has no distribution package and, on the current Kali toolchain, its from-source build

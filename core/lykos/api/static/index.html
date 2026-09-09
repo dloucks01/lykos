@@ -642,6 +642,7 @@ async function showDetail(targetId){
       <button class="btn sm" id="deco">Decompile (Ghidra)</button>
       <button class="btn sm" id="detect">Detect CWEs</button>
       <button class="btn sm" id="carve" title="Firmware decomposition: carve embedded components (ELFs, filesystems, keys) and identify a bare-metal blob's arch/base/entry">Carve Firmware</button>
+      <button class="btn sm" id="rehost" title="Rehost a bare-metal ARM Cortex-M image under Unicorn (Fuzzware-style MMIO) and fuzz peripheral inputs for firmware crashes">Rehost</button>
       <span class="mono" style="color:var(--faint);font-size:11px" id="decostat"></span></div>
     <div id="findings"></div>
     <div class="eyebrow" style="margin-top:8px">Dynamic (sandbox)</div>
@@ -667,6 +668,7 @@ async function showDetail(targetId){
   document.getElementById("deco").onclick = ()=>doDecompile(targetId);
   document.getElementById("detect").onclick = ()=>doDetect(targetId);
   document.getElementById("carve").onclick = ()=>doFirmware(targetId);
+  document.getElementById("rehost").onclick = ()=>doRehost(targetId);
   document.getElementById("dynrun").onclick = ()=>doDynamic(targetId);
   document.getElementById("fuzzrun").onclick = ()=>doFuzz(targetId);
   document.getElementById("covrun").onclick = ()=>doCoverage(targetId);
@@ -700,6 +702,11 @@ async function doFirmware(tid){
   const st=document.getElementById("decostat"); if(st) st.textContent="carving firmware…";
   await fetch("/runs",{method:"POST",headers:{"Content-Type":"application/json"},
     body:JSON.stringify({case_id:CUR,target_id:tid,stage:"firmware_carve"})});
+}
+async function doRehost(tid){
+  const st=document.getElementById("decostat"); if(st) st.textContent="rehosting under Unicorn…";
+  await fetch("/runs",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({case_id:CUR,target_id:tid,stage:"firmware_rehost"})});
 }
 async function doMultiDebug(tid, inputSha, mode){
   const st=document.getElementById("fuzzstat"); if(st) st.textContent="multi-process debug (follow-fork)…";
@@ -884,6 +891,12 @@ function openWS(id){
     if(e.type==="fuzz.done" && DETAIL_TID){
       const st=document.getElementById("fuzzstat"); if(st&&e.payload) st.textContent=`done: ${e.payload.execs} execs · ${e.payload.unique} unique`;
       loadDyn(DETAIL_TID); loadFindings(DETAIL_TID);
+    }
+    if(e.type==="firmware_rehost.done"){
+      const st=document.getElementById("decostat");
+      if(st&&e.payload) st.textContent = e.payload.supported===false ? ("rehost: "+(e.payload.note||"unsupported"))
+        : `rehosted: ${e.payload.coverage||0} blocks`+(e.payload.crash?` · CRASH ${e.payload.cwe||''}`:` · ${e.payload.iters||0} iters`);
+      if(DETAIL_TID) loadFindings(DETAIL_TID);
     }
     if(e.type==="firmware.done"){
       const st=document.getElementById("decostat");
