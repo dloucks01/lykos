@@ -54,6 +54,33 @@ def test_bundle_contents():
     assert inp == b"AAAA" and b"input.bin" in runner
 
 
+def test_bundle_readme_is_actionable():
+    data = bundle.build(b"\x7fELFbin", b"AAAA", {"target_sha256": "abc", "arch": "x86-64",
+                        "level": "L2"}, b"", "stdin", [], "SIGSEGV")
+    with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as t:
+        readme = t.extractfile("poc/README.txt").read().decode()
+    for section in ("WHAT THIS IS", "HOW TO RUN", "WHAT TO DO WITH IT", "FILES"):
+        assert section in readme
+    assert "sandbox" in readme.lower() and "sh ./runner.sh" in readme
+    assert "PRIMITIVE" in readme      # L2 -> mentions the primitive
+
+
+def test_script_bundle_ships_exploit_py_and_runs_it():
+    """A leak-based (PIE) bundle carries a live exploit.py reproducer, and the runner runs it
+    (a static payload can't re-hijack under fresh ASLR)."""
+    script = b"#!/usr/bin/env python3\nprint('demo')\n"
+    data = bundle.build(b"\x7fELFbin", b"payload", {"target_sha256": "abc", "arch": "x86-64",
+                        "level": "L3"}, b"", "stdin", [], "SIGSEGV",
+                        extra_files={"exploit.py": script},
+                        run_cmd="python3 ./exploit.py ./target.bin")
+    with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as t:
+        assert "poc/exploit.py" in t.getnames()
+        runner = t.extractfile("poc/runner.sh").read().decode()
+        readme = t.extractfile("poc/README.txt").read().decode()
+    assert "python3 ./exploit.py" in runner
+    assert "exploit.py" in readme and "ASLR" in readme
+
+
 def test_build_poc_verifies_and_promotes(store, case, pool, bins):
     if "crash" not in bins:
         pytest.skip("build failed")
