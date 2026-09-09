@@ -108,6 +108,7 @@ tbody tr:hover{background:var(--surface-2)}
   font-weight:700;margin-top:5px}
 .tile.crit .n{color:var(--danger)} .tile.high .n{color:#e07a4e}
 .tile.pocb .n{color:var(--ok)} .tile.conf .n{color:var(--accent)}
+.tile.med .n{color:var(--warn)} .tile.corr .n{color:var(--info)}
 .filters{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:12px}
 .filters input,.filters select{background:var(--surface-2);color:var(--text);border:1px solid var(--border);
   border-radius:6px;padding:6px 9px;font-size:12px;font-family:var(--sans)}
@@ -211,6 +212,15 @@ tbody tr:hover{background:var(--surface-2)}
 .hint{color:var(--faint);font-size:11px;margin-bottom:6px}
 .notewarn{margin-top:8px;color:var(--warn)}
 .code{white-space:pre-wrap;max-height:200px;overflow:auto;margin-top:6px}
+/* ---- system map: toolbar + legend ---- */
+.smtools{display:flex;gap:6px;flex-wrap:wrap}
+.smlegend{display:flex;align-items:center;gap:16px;flex-wrap:wrap;font-size:11px;color:var(--dim);
+  padding:7px 2px 9px;border-bottom:1px solid var(--border);margin-bottom:8px}
+.smlegend span{display:inline-flex;align-items:center;gap:6px}
+.lg{width:16px;height:0;border-top:2px solid var(--faint);display:inline-block}
+.lgdyn{border-top-color:var(--border-strong)}
+.lgtaint{border-top:2px dashed var(--danger)}
+.lgipc{border-top:2px dotted var(--info)}
 </style>
 </head>
 <body>
@@ -374,9 +384,11 @@ function renderBoard(){
   const tile=(cls,n,l,key,val)=>`<div class="tile ${cls} ${
     (f[key]===val)?'active':''}" onclick="boardTile('${key}','${val}')"><div class="n">${n}</div><div class="l">${l}</div></div>`;
   const tilesHtml=`<div class="tiles">
-    <div class="tile ${!f.sev&&!f.state?'active':''}" onclick="boardTile('clear','')"><div class="n">${c.total}</div><div class="l">Findings</div></div>
+    <div class="tile ${!f.sev&&!f.state?'active':''}" onclick="boardTile('clear','')"><div class="n">${c.total}</div><div class="l">All findings</div></div>
     ${tile('crit',c.critical,'Critical','sev','critical')}
     ${tile('high',c.high,'High','sev','high')}
+    ${tile('med',c.medium,'Medium','sev','medium')}
+    ${tile('corr',c.corroborated,'Corroborated','state','corroborated')}
     ${tile('conf',c.confirmed,'Confirmed','state','confirmed')}
     ${tile('pocb',c['poc-backed'],'PoC-backed','state','poc-backed')}
   </div>`;
@@ -515,14 +527,20 @@ function renderSystemMap(){
   const ipcN=edges.filter(e=>e.kind==="ipc").length;
   const badges=[taintN?`<span style="color:var(--danger)">${taintN} cross-taint</span>`:'',
                 ipcN?`<span style="color:var(--info)">${ipcN} IPC</span>`:''].filter(Boolean).join(' · ');
-  const head=`<div class="cardhead" style="margin-bottom:10px">
+  const head=`<div class="cardhead" style="margin-bottom:8px">
       <span class="eyebrow">Component graph — ${nodes.length} components · ${edges.length} links${badges?' · '+badges:''}</span>
-      <span style="display:flex;gap:6px">
-        <button class="btn sm" onclick="loadSystemMap(true)">↻ Re-resolve links</button>
-        <button class="btn sm" id="ipcbtn" onclick="doModelIpc()" title="Discover IPC channels (socket/pipe/shm/mq) and pair producers with consumers">Model IPC channels</button>
-        <button class="btn sm" id="xtaintbtn" onclick="doCrossTaint()" title="Propagate taint across resolved edges: source in A → sink in B">Analyze cross-binary taint</button>
-        <button class="btn sm" id="detbtn" onclick="doWholeSystem()" title="Whole-system detonation: run the components together over their real IPC and blame a crash in one on the input that entered another">Detonate system</button>
-      </span></div>`;
+      <div class="smtools">
+        <button class="btn sm" onclick="loadSystemMap(true)" title="Re-resolve import/export links across all components">↻ Resolve links</button>
+        <button class="btn sm" id="ipcbtn" onclick="doModelIpc()" title="Discover IPC channels (socket/pipe/shm/mq) and pair producers with consumers">Model IPC</button>
+        <button class="btn sm" id="xtaintbtn" onclick="doCrossTaint()" title="Propagate taint across resolved edges: source in A → sink in B">Cross-taint</button>
+        <button class="btn sm" id="detbtn" onclick="doWholeSystem()" title="Whole-system detonation: run the components together over their real IPC and blame a crash in one on the input that entered another">Detonate</button>
+      </div></div>
+    <div class="smlegend">
+      <span><i class="lg lgdyn"></i>dynamic link</span>
+      <span><i class="lg lgtaint"></i>⚡ cross-binary taint</span>
+      <span><i class="lg lgipc"></i>⇄ IPC channel</span>
+      <span class="mono" style="margin-left:auto;color:var(--faint)">click a node to open it in the Workbench</span>
+    </div>`;
   if(!nodes.length){ el.innerHTML=`<div class="card">${head}<div class="empty">No components yet. Upload the program and its shared libraries (or a firmware's carved parts) to this case, then re-resolve.</div></div>`; return; }
   // circular layout
   const W=760,H=Math.max(300,Math.min(520,180+nodes.length*40)),cx=W/2,cy=H/2;
