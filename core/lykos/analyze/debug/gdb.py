@@ -1,8 +1,8 @@
 """Optional GDB backend for root-cause capture (graceful when absent).
 
-When gdb is installed we drive it in batch mode to get a symbolized backtrace, registers, the
-fault address, and the faulting instruction, and normalize that to the same capture dict the
-ptrace helper produces. When gdb is absent the stage falls back to the ptrace helper.
+Drives gdb in batch mode to collect the signal, program counter, fault address, faulting-
+instruction bytes and process mappings, plus a symbolized backtrace, and normalizes them to
+the same capture dict the ptrace helper produces so `rootcause.analyze` is backend-agnostic.
 """
 from __future__ import annotations
 
@@ -14,9 +14,12 @@ from pathlib import Path
 from typing import Optional
 
 _SIG = re.compile(r"received signal (SIG\w+)")
-_FRAME = re.compile(r"^#\d+\s+(?:0x([0-9a-fA-F]+)\s+in\s+)?(\S+)")
-_PC = re.compile(r"=> 0x([0-9a-fA-F]+)")
-_STOP = re.compile(r"0x([0-9a-fA-F]+)\s+in")
+_PC = re.compile(r"LYKOS_PC (0x[0-9a-fA-F]+)")
+_FAULT = re.compile(r"si_addr = (0x[0-9a-fA-F]+)")
+_FRAME = re.compile(r"^#\d+\s+(?:0x0*([0-9a-fA-F]+)\s+in\s+|)")
+_XBYTES = re.compile(r"0x[0-9a-fA-F]+(?:\s*<[^>]*>)?:\s+((?:0x[0-9a-fA-F]{2}\s*)+)")
+_MAPLINE = re.compile(r"^\s*(0x[0-9a-fA-F]+)\s+(0x[0-9a-fA-F]+)\s+0x[0-9a-fA-F]+\s+"
+                      r"0x[0-9a-fA-F]+\s+(\S*)\s*(.*)$")
 
 
 def locate_gdb(config: Optional[str] = None) -> Optional[Path]:
@@ -30,16 +33,22 @@ def locate_gdb(config: Optional[str] = None) -> Optional[Path]:
 
 
 def run_gdb(gdb: Path, exe, argv, stdin_file, *, ctx=None, timeout: int = 30) -> dict:
-    """Run the target under gdb batch, return a normalized capture dict."""
-    cmds = ["set pagination off", "set confirm off",
-            "run" + ((" < " + stdin_file) if stdin_file else "")
-            + ("".join(" " + a for a in argv)),
-            "printf \"LYKOS_SIG %d\\n\", $_siginfo.si_signo",
-            "info registers", "x/1i $pc", "bt", "quit"]
+    run_cmd = "run" + ("".join(" " + a for a in argv)) + (
+        (" < " + stdin_file) if stdin_file else "")
+    cmds = [
+        "set pagination off", "set confirm off", "set height 0", "set width 0",
+        run_cmd,
+        'printf "LYKOS_PC %#lx\\n", $pc',
+        "print $_siginfo",
+        "x/16xb $pc",
+        "info proc mappings",
+        "bt",
+        "quit",
+    ]
     script = tempfile.NamedTemporaryFile("w", suffix=".gdb", delete=False)
     script.write("\n".join(cmds) + "\n")
     script.close()
-    cmd = [str(gdb), "-q", "-batch", "-x", script.name, str(exe)]
+    cmd = [str(gdb), "-q", "-batch", "-nx", "-x", script.name, str(exe)]
     try:
         if ctx is not None:
             proc = ctx.run_subprocess(cmd, timeout=timeout + 15)
@@ -57,19 +66,27 @@ def run_gdb(gdb: Path, exe, argv, stdin_file, *, ctx=None, timeout: int = 30) ->
 
 def _parse(out: str) -> dict:
     sig = _SIG.search(out)
-    frames = []
-    for line in out.splitlines():
-        m = _FRAME.match(line.strip())
-        if m and m.group(1):
-            frames.append(int(m.group(1), 16))
-    pc = None
-    for line in out.splitlines():
-        m = _PC.search(line) or _STOP.search(line)
-        if m:
-            pc = int(m.group(1), 16)
+    if sig is None:
+        return {"ok": False, "reason": "gdb reported no crash", "raw": out[-400:]}
+    pc = _PC.search(out)
+    fault = _FAULT.search(out)
+    pc_bytes = ""
+    for m in _XBYTES.finditer(out):
+        for tok in m.group(1).split():
+            pc_bytes += f"{int(tok, 16):02x}"
+        if len(pc_bytes) >= 32:
             break
-    if sig is None and not frames:
-        return {"ok": False, "reason": "gdb produced no crash", "raw": out[-400:]}
-    return {"ok": True, "source": "gdb", "signal_name": sig.group(1) if sig else "SIGSEGV",
-            "pc": pc, "backtrace": frames[1:] if frames else [], "regs": {}, "maps": [],
-            "pc_bytes": "", "fault_addr": None, "gdb_raw": out[-4000:]}
+    maps = []
+    for line in out.splitlines():
+        m = _MAPLINE.match(line)
+        if m:
+            perms = m.group(3) if any(c in m.group(3) for c in "rwxp-") else ""
+            maps.append({"start": int(m.group(1), 16), "end": int(m.group(2), 16),
+                         "perms": perms, "path": m.group(4).strip()})
+    frames = [int(m.group(1), 16) for line in out.splitlines()
+              if (m := _FRAME.match(line.strip())) and m.group(1)]
+    return {"ok": True, "source": "gdb", "signal_name": sig.group(1),
+            "pc": int(pc.group(1), 16) if pc else None,
+            "fault_addr": int(fault.group(1), 16) if fault else None,
+            "pc_bytes": pc_bytes[:32], "backtrace": frames[1:], "regs": {}, "maps": maps,
+            "gdb_raw": out[-4000:]}

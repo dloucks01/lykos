@@ -38,8 +38,11 @@ def locate_angr_python(config: Optional[str] = None) -> Optional[Path]:
             candidates.append(Path(v))
     if config:
         candidates.append(Path(config))
-    vendor = Path(__file__).resolve().parents[3] / "vendor" / "angr-venv" / "bin" / "python"
-    candidates.append(vendor)
+    # a vendored venv (vendor/angr-venv/bin/python) beside the package or the project root;
+    # search a few parent levels so it is found from source and from an installed layout.
+    here = Path(__file__).resolve()
+    for up in here.parents[2:6]:
+        candidates.append(up / "vendor" / "angr-venv" / "bin" / "python")
     candidates.append(Path(sys.executable))
     which = shutil.which("python3")
     if which:

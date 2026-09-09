@@ -110,9 +110,9 @@ def classify(cap, disasm):
     fault = cap.get("fault_addr")
     maps = cap.get("maps") or []
     pc_map = mapping_for(maps, pc)
-    pc_exec = bool(pc_map and "x" in pc_map.get("perms", ""))
-
-    if not pc_exec:
+    # only conclude "hijack" when we actually have maps and the PC is not in an exec region;
+    # with no map info we cannot claim non-executability, so fall through to signal analysis.
+    if maps and pc is not None and not (pc_map and "x" in pc_map.get("perms", "")):
         return {"class": "control-flow-hijack", "cwe": "CWE-787", "severity": "critical",
                 "detail": f"program counter 0x{(pc or 0):x} is not in executable memory "
                           "(attacker-controlled execution transfer)"}
