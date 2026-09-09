@@ -73,6 +73,8 @@ def test_build_poc_verifies_and_promotes(store, case, pool, bins):
 
     pb = [f for f in FindingDAO(store.conn).list_by_target(target.id) if f.state == "poc-backed"]
     assert pb and any(e["channel"] == "poc" for e in pb[0].evidence)
+    # the PoC row is linked to its finding so the report can attach the bundle (Phase 7)
+    assert pocs[0].finding_id == pb[0].id
 
 
 def test_build_poc_unverified_when_no_crash(store, case, pool, bins):

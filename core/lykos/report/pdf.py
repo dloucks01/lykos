@@ -91,7 +91,7 @@ def _report_lines(report: dict[str, Any]) -> list[_Line]:
     summ = report.get("summary", {})
 
     L.append(_Line("VULNERABILITY ANALYSIS REPORT", "HB", 8, 0, 0, (0.6, 0.6, 0.65)))
-    L += _flow(case.get("name") or "Untitled case", "HB", 20, 0, 4)
+    L += _flow(case.get("name") or "Untitled case", "HB", 20, 0, 13)
     for k, v in (("Generated", report.get("generated_at")),
                  ("Tool", f'{report.get("tool", {}).get("name")} '
                           f'{report.get("tool", {}).get("version")}'),
