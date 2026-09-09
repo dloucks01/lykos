@@ -28,10 +28,11 @@ crashing input; many bug classes have a **derivable** input and need no fuzzing.
   on dangerous sinks, capture concrete args at runtime (copy lengths, command strings, size args)
   → dynamic evidence (a `system("…")` we watched execute; a `strcpy` of N bytes into an S-byte
   frame) without needing a segfault. See doc 08 / debug/monitor.py.
-- **[PLANNED] Heap-error detection** (UAF, double-free, invalid/mismatched free, leak, uninit read):
-  a `malloc`/`free`/`realloc` interposer (an `LD_PRELOAD` shim we ship) *or* breakpoint-based heap
-  state tracker in the debugger *or* Valgrind/QASan when present. These are *silent* corruptions
-  that don't SIGSEGV, so fuzzing-by-crash never sees them. High offensive value.
+- **[DONE] Heap-error detection** (`heap_check`): an LD_PRELOAD guard-page allocator shim
+  (`dynamic/heappoison.c`) catches use-after-free (CWE-416), double-free (CWE-415), heap buffer
+  overflow (CWE-122) and invalid/wild free (CWE-590) at the exact access, plus opt-in leaks
+  (CWE-401). These are silent corruptions that don't SIGSEGV, so fuzzing-by-crash never sees
+  them. Native-arch, dynamically-linked targets; per-arch shim under qemu is future work.
 - **[PLANNED] Dynamic taint tracking**: confirm a source→sink flow at runtime (we only do it
   statically now) — DTA over qemu, or a lightweight taint via the debugger.
 - **[PLANNED] Syscall / behavior tracing**: trace `execve`/`connect`/`open`-for-write etc. →
@@ -40,13 +41,22 @@ crashing input; many bug classes have a **derivable** input and need no fuzzing.
 ## C. Automated debugger ("find things", not just capture a crash)
 
 - **[DONE] Dangerous-call monitor** — B.1 (the first debugger flavor); native-arch (host GDB).
-- **[PLANNED] Heap state tracker via breakpoints** — B.2 implemented through the debugger.
+- **[DONE] Heap-error detection** — B.2, shipped as the LD_PRELOAD guard-page allocator
+  (`heap_check`) rather than breakpoints (more precise: faults at the offending access).
 - **[PLANNED] Comparison / secret extraction**: breakpoint `strcmp`/`memcmp`/`strncmp`, dump the
   operand the program compares *our* input against → auto-recover passwords, magic bytes, license
   keys, expected tokens. Classic offensive RE; turns a crackme into an answer in one run.
 - **[PLANNED] Cross-arch breakpoints**: extend the monitor/heap-tracker to emulated targets via
   `Z0` breakpoint packets over the qemu-gdbstub RSP client we already built (debug/qemu_gdb.py).
   (Monitor v1 is native-only, like root-cause.)
+
+## C2. Execution environment
+
+- **[PLANNED] Interactive detonation console**: a GUI panel to run the target in the sandbox
+  with chosen argv/stdin/env and do live send/receive, so an analyst can reach code behind
+  menus or a protocol handshake (the reachability limit the synthesizer/monitor hit). A
+  recorded session becomes a seed for the fuzzer / heap-check / monitor. (One-shot detonation
+  already exists as `dynamic_run`; every dynamic stage already sandbox-executes the target.)
 
 ## D. Recon / intelligence
 
