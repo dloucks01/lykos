@@ -31,9 +31,11 @@ def locate_symqemu(config: Optional[str] = None, arch: str = "x86-64") -> Option
         hit = p / name
         if hit.exists():
             return hit
-    vendor = Path(__file__).resolve().parents[3] / "vendor" / "symqemu" / name
-    if vendor.exists():
-        return vendor
+    here = Path(__file__).resolve()
+    for up in here.parents[2:6]:                    # vendor/symqemu beside package or project root
+        cand = up / "vendor" / "symqemu" / name
+        if cand.exists():
+            return cand
     w = shutil.which(name) or shutil.which("symqemu")
     return Path(w) if w else None
 
@@ -46,6 +48,10 @@ def run_once(symqemu: Path, target: Path, seed: bytes, out_dir: Path, *, mode: s
     seed_file.write_bytes(seed)
     env = dict(os.environ)
     env["SYMCC_OUTPUT_DIR"] = str(out_dir)
+    # the SymCC runtime (libSymCCRtShared.so) is vendored beside the emulator; make it findable
+    libdir = str(Path(symqemu).resolve().parent)
+    env["LD_LIBRARY_PATH"] = libdir + (":" + env["LD_LIBRARY_PATH"]
+                                       if env.get("LD_LIBRARY_PATH") else "")
     argv = list(base_argv)
     stdin = b""
     if mode == "file":
@@ -85,7 +91,7 @@ def harvest(out_dir: Path) -> list:
 
 
 def run_campaign(symqemu: Path, target: Path, seeds: list, work: Path, *, mode="file",
-                 base_argv=(), rounds: int = 2, timeout: int = 60, cap: int = 64,
+                 base_argv=(), rounds: int = 4, timeout: int = 60, cap: int = 64,
                  ctx=None) -> list:
     """Iterative hybrid loop: expand seeds by feeding SymQEMU's generated inputs back in for a
     few rounds, returning the de-duplicated set of newly generated inputs."""
