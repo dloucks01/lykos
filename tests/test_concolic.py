@@ -6,12 +6,13 @@ the result parser, graceful failure when angr is absent, and the full stage pipe
 stands in for angr's solver on a real binary. The real-angr exploration runs only when angr
 is actually installed (skipped otherwise, matching the Ghidra/AFL++ real-run tests)."""
 import base64
+import shutil
 import subprocess
 
 import pytest
 from lykos.analyze import register
 from lykos.analyze.ingest import ingest
-from lykos.analyze.symbolic import concolic, enqueue_concolic
+from lykos.analyze.symbolic import concolic, enqueue_concolic, symqemu
 from lykos.db.dao import DynResultDAO, FindingDAO
 from lykos.jobs import JobConfig, JobQueue, WorkerPool
 
@@ -98,14 +99,15 @@ def test_run_explore_invokes_driver_and_parses(tmp_path):
 
 
 # ------------------------------------------------------------------- graceful absence
-def test_concolic_errors_clearly_when_angr_absent(store, case, pool, gated, monkeypatch):
+def test_concolic_errors_clearly_when_no_backend(store, case, pool, gated, monkeypatch):
     monkeypatch.setattr(concolic, "locate_angr_python", lambda *a, **k: None)
+    monkeypatch.setattr(symqemu, "locate_symqemu", lambda *a, **k: None)
     target = ingest(store, case.id, gated)
     q = JobQueue(store.conn)
     run = enqueue_concolic(q, target, params={"max_seconds": 5})
     assert pool.wait_idle(30)
     rec = q.runs.get(run.id)
-    assert rec.status == "error" and "angr not found" in (rec.error or "")
+    assert rec.status == "error" and "no concolic backend available" in (rec.error or "")
 
 
 # ------------------------------------------------------------------- full pipeline (stubbed)
@@ -146,14 +148,32 @@ def test_concolic_corroborates_reached_sink_with_stub(store, case, pool, gated, 
     assert any(e.get("channel") == "symbolic" for e in f.evidence)
 
 
+
 @pytest.mark.skipif(concolic.locate_angr_python() is None, reason="angr not installed")
-def test_concolic_real_angr_reaches_gated_sink(store, case, pool, gated):
-    target = ingest(store, case.id, gated)
+def test_concolic_real_angr_solves_branch_and_confirms(store, case, pool, gcc, tmp_path):
+    """Real angr: solve the 4-byte magic gate so the generated input reaches win() and, when
+    replayed concretely in the sandbox, crashes -> a Confirmed concolic finding."""
+    if not shutil.which("nm"):
+        pytest.skip("nm not available")
+    src = ("#include <unistd.h>\n"
+           "void win(void){ volatile char*p=0; *p=1; }\n"
+           "int main(void){ char b[8]; int n=read(0,b,8); "
+           "if(n>=4 && b[0]=='M'&&b[1]=='A'&&b[2]=='G'&&b[3]=='C') win(); return 0; }\n")
+    c = tmp_path / "magc.c"; c.write_text(src)
+    b = tmp_path / "magc"
+    if subprocess.run([gcc, "-O0", "-no-pie", str(c), "-o", str(b)],
+                      capture_output=True, check=False).returncode:
+        pytest.skip("build failed")
+    nm = subprocess.run(["nm", str(b)], capture_output=True, text=True, check=False).stdout
+    win = next((f"0x{ln.split()[0]}" for ln in nm.splitlines()
+                if ln.split()[-1] == "win"), None)
+    assert win, "could not find win() address"
+    target = ingest(store, case.id, b)
     q = JobQueue(store.conn)
     run = enqueue_concolic(q, target, params={
-        "input_mode": "stdin", "input_size": 32, "targets": ["0x2020"],
-        "max_seconds": 120, "exec_timeout": 2})
-    assert pool.wait_idle(180) and q.runs.get(run.id).status == "done"
-    # angr should either reach the sink (corroborate) or solve an overflow (confirm)
-    findings = FindingDAO(store.conn).list_by_target(target.id)
-    assert any(f.state in ("corroborated", "confirmed") for f in findings)
+        "backend": "angr", "input_mode": "stdin", "input_size": 8, "targets": [win],
+        "max_seconds": 90, "exec_timeout": 2})
+    assert pool.wait_idle(150) and q.runs.get(run.id).status == "done"
+    confirmed = [f for f in FindingDAO(store.conn).list_by_target(target.id)
+                 if f.state == "confirmed" and f.detector == "concolic"]
+    assert confirmed, "expected a concolic-confirmed crash from the solved branch"

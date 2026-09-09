@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Optional
 
 _HEADLESS = "analyzeHeadless"
-_SCRIPT = "ExportAnalysis.py"
+_SCRIPT = "ExportAnalysis.java"
 
 
 def locate_ghidra(config_path: Optional[str] = None) -> Optional[Path]:

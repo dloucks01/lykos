@@ -41,7 +41,7 @@ core/lykos/
   api/multipart.py    minimal multipart upload parser                          (P0.2)
   api/static/index.html  operator-console web UI (vanilla, offline)            (P0.7)
   analyze/ghidra.py   Ghidra locator + headless runner + result parser         (Phase 1)
-  analyze/ghidra_scripts/ExportAnalysis.py  Jython export (functions + decomp)  (Phase 1)
+  analyze/ghidra_scripts/ExportAnalysis.java Java export (funcs+CFG+P-Code+calls)(Phase 1)
   analyze/disassemble.py  `disassemble` stage (Ghidra headless)                (Phase 1)
   cli.py              `lykos db init|upgrade|version|serve`                (DM-02, P0.2)
 tests/                migrations, DAO, hashing, casestore + fixtures/factories (DM-19/20)
