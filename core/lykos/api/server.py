@@ -79,6 +79,7 @@ _FUNC_ID = re.compile(r"^/functions/([^/]+)$")
 _TARGET_CG = re.compile(r"^/targets/([^/]+)/callgraph$")
 _TARGET_STR = re.compile(r"^/targets/([^/]+)/strings$")
 _TARGET_FIND = re.compile(r"^/targets/([^/]+)/findings$")
+_CASE_FIND = re.compile(r"^/cases/([^/]+)/findings$")
 _FIND_ID = re.compile(r"^/findings/([^/]+)$")
 _TARGET_DYN = re.compile(r"^/targets/([^/]+)/dynresults$")
 _TARGET_POC = re.compile(r"^/targets/([^/]+)/pocs$")
@@ -202,6 +203,9 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json([_finding(x) for x in fs])
                 finally:
                     s.close()
+            m = _CASE_FIND.match(path)
+            if m:
+                return self._get_case_findings(m.group(1))
             m = _FIND_ID.match(path)
             if m:
                 s = self._store()
@@ -277,6 +281,30 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": repr(e)}, 500)
 
     # ---- route impls ----
+    def _get_case_findings(self, cid):
+        """All findings in a case, enriched with target filename/arch and the target's best
+        PoC level -- the data the case findings board aggregates."""
+        s = self._store()
+        try:
+            tmap = {t.id: t for t in s.targets.list_by_case(cid)}
+            best_poc = {}
+            for t in tmap.values():
+                lvls = [p.level for p in PocDAO(s.conn).list_by_target(t.id)
+                        if p.verified and p.level]
+                if lvls:
+                    best_poc[t.id] = max(lvls)          # "L2" > "L1" lexicographically
+            out = []
+            for f in FindingDAO(s.conn).list_by_case(cid):
+                d = _finding(f)
+                t = tmap.get(f.target_id)
+                d["target_name"] = t.filename if t else None
+                d["target_arch"] = t.arch if t else None
+                d["poc_level"] = best_poc.get(f.target_id)
+                out.append(d)
+            return self._json(out)
+        finally:
+            s.close()
+
     def _get_case(self, cid):
         s = self._store()
         try:

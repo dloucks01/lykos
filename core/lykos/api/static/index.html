@@ -89,6 +89,49 @@ tbody tr:hover{background:var(--surface-2)}
 .kv span{color:var(--dim)} .kv b{font-family:var(--mono)}
 .empty{color:var(--faint);font-size:13px;padding:40px;text-align:center}
 .sec{font-family:var(--mono);font-size:10.5px}
+
+/* view tabs */
+.tabs{display:flex;gap:4px}
+.tab{font-size:12px;font-weight:600;padding:6px 13px;border-radius:6px 6px 0 0;border:1px solid transparent;
+  color:var(--dim);background:transparent}
+.tab:hover{color:var(--text)}
+.tab.active{color:var(--text);background:var(--surface);border-color:var(--border);border-bottom-color:var(--surface)}
+
+/* findings board */
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px;margin-bottom:14px}
+.tile{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:12px 14px;cursor:pointer}
+.tile:hover{border-color:var(--border-strong)}
+.tile.active{box-shadow:inset 0 0 0 1px var(--accent);border-color:var(--accent)}
+.tile .n{font-size:24px;font-weight:800;font-variant-numeric:tabular-nums;line-height:1}
+.tile .l{font-size:10px;text-transform:uppercase;letter-spacing:.07em;color:var(--faint);
+  font-weight:700;margin-top:5px}
+.tile.crit .n{color:var(--danger)} .tile.high .n{color:#e07a4e}
+.tile.pocb .n{color:var(--ok)} .tile.conf .n{color:var(--accent)}
+.filters{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:12px}
+.filters input,.filters select{background:var(--surface-2);color:var(--text);border:1px solid var(--border);
+  border-radius:6px;padding:6px 9px;font-size:12px;font-family:var(--sans)}
+.filters input{flex:1;min-width:150px;font-family:var(--mono);font-size:11px}
+.sev{font-family:var(--sans);text-transform:uppercase;letter-spacing:.04em;font-size:9.5px;font-weight:800;
+  border-radius:4px;padding:2px 7px;border:1px solid;white-space:nowrap}
+.sev.critical{color:#fff;background:var(--danger);border-color:var(--danger)}
+.sev.high{color:#e07a4e;border-color:color-mix(in srgb,#e07a4e 50%,transparent)}
+.sev.medium{color:var(--warn);border-color:color-mix(in srgb,var(--warn) 50%,transparent)}
+.sev.low{color:var(--info);border-color:color-mix(in srgb,var(--info) 50%,transparent)}
+.sev.info{color:var(--faint);border-color:var(--border)}
+.st{font-family:var(--sans);text-transform:uppercase;letter-spacing:.04em;font-size:9.5px;font-weight:700;
+  border-radius:20px;padding:2px 8px;border:1px solid;white-space:nowrap}
+.st.candidate{color:var(--faint);border-color:var(--border)}
+.st.corroborated{color:var(--teal);border-color:color-mix(in srgb,var(--teal) 45%,transparent)}
+.st.confirmed{color:var(--accent);border-color:color-mix(in srgb,var(--accent) 45%,transparent)}
+.st\.poc-backed,.st.pocbacked{color:var(--ok);background:color-mix(in srgb,var(--ok) 16%,transparent);
+  border-color:color-mix(in srgb,var(--ok) 55%,transparent)}
+.cbar{position:relative;height:6px;width:70px;background:var(--surface-3);border-radius:4px;overflow:hidden}
+.cbar i{position:absolute;left:0;top:0;bottom:0;background:linear-gradient(90deg,var(--teal),var(--accent))}
+.lvl{font-family:var(--mono);font-size:9.5px;font-weight:700;color:var(--ok);border:1px solid
+  color-mix(in srgb,var(--ok) 45%,transparent);border-radius:4px;padding:1px 5px}
+.frow td{vertical-align:middle}
+.frow .ttl{font-weight:600}
+.frow .ev{color:var(--faint);font-size:10.5px;font-family:var(--mono)}
 </style>
 </head>
 <body>
@@ -161,7 +204,13 @@ async function selectCase(id, name){
 }
 function view(name){ return `
   <div class="mainhead">
-    <div><h1>${esc(name)}</h1><div class="sub mono" id="casesub"></div></div>
+    <div>
+      <h1>${esc(name)}</h1><div class="sub mono" id="casesub"></div>
+      <div class="tabs" style="margin-top:10px">
+        <button class="tab active" id="tab-wb" onclick="switchView('wb')">Workbench</button>
+        <button class="tab" id="tab-board" onclick="switchView('board')">Findings Board</button>
+      </div>
+    </div>
     <div class="uploader">
       <input type="file" id="file" style="display:none">
       <button class="btn" onclick="document.getElementById('file').click()">Choose binary</button>
@@ -169,7 +218,7 @@ function view(name){ return `
       <button class="btn primary" id="analyze" disabled>Analyze</button>
     </div>
   </div>
-  <div class="grid">
+  <div id="workbench" class="grid">
     <div>
       <div class="card"><div class="cardhead"><span class="eyebrow">Targets</span><span class="mono" id="tcount" style="color:var(--faint)"></span></div>
         <div id="targets"></div></div>
@@ -179,7 +228,98 @@ function view(name){ return `
       <div class="card"><div class="cardhead"><span class="eyebrow">Runs</span></div><div id="runs"></div></div>
       <div class="card"><div class="cardhead"><span class="eyebrow">Live events</span></div><div class="log" id="log"></div></div>
     </div>
+  </div>
+  <div id="board" hidden></div>`;
+}
+
+let BOARD_VIEW="wb", BOARD_FILTER={sev:"",state:"",q:""};
+function switchView(v){
+  BOARD_VIEW=v;
+  const wb=document.getElementById("workbench"), bd=document.getElementById("board");
+  document.getElementById("tab-wb").classList.toggle("active", v==="wb");
+  document.getElementById("tab-board").classList.toggle("active", v==="board");
+  if(wb) wb.hidden = v!=="wb";
+  if(bd) bd.hidden = v!=="board";
+  if(v==="board") loadBoard();
+}
+
+const _SEVRANK={critical:4,high:3,medium:2,low:1,info:0};
+async function loadBoard(){
+  const bd=document.getElementById("board"); if(!bd||!CUR) return;
+  let fs=[];
+  try{ fs=await api(`/cases/${CUR}/findings`); }catch(e){ fs=[]; }
+  BOARD_DATA=fs;
+  renderBoard();
+}
+let BOARD_DATA=[];
+function boardCounts(fs){
+  const c={total:fs.length,critical:0,high:0,medium:0,low:0,info:0,
+    candidate:0,corroborated:0,confirmed:0,"poc-backed":0};
+  fs.forEach(f=>{ c[f.severity]=(c[f.severity]||0)+1; c[f.state]=(c[f.state]||0)+1; });
+  return c;
+}
+function renderBoard(){
+  const bd=document.getElementById("board"); if(!bd) return;
+  const all=BOARD_DATA, c=boardCounts(all);
+  const f=BOARD_FILTER;
+  let rows=all.filter(x=>
+    (!f.sev||x.severity===f.sev) && (!f.state||x.state===f.state) &&
+    (!f.q || ((x.cwe||"")+" "+(x.title||"")+" "+(x.target_name||"")+" "+(x.detector||""))
+      .toLowerCase().includes(f.q.toLowerCase())));
+  rows.sort((a,b)=> (_SEVRANK[b.severity]-_SEVRANK[a.severity]) ||
+    ((b.confidence||0)-(a.confidence||0)));
+  const tile=(cls,n,l,key,val)=>`<div class="tile ${cls} ${
+    (f[key]===val)?'active':''}" onclick="boardTile('${key}','${val}')"><div class="n">${n}</div><div class="l">${l}</div></div>`;
+  const tilesHtml=`<div class="tiles">
+    <div class="tile ${!f.sev&&!f.state?'active':''}" onclick="boardTile('clear','')"><div class="n">${c.total}</div><div class="l">Findings</div></div>
+    ${tile('crit',c.critical,'Critical','sev','critical')}
+    ${tile('high',c.high,'High','sev','high')}
+    ${tile('conf',c.confirmed,'Confirmed','state','confirmed')}
+    ${tile('pocb',c['poc-backed'],'PoC-backed','state','poc-backed')}
   </div>`;
+  const filters=`<div class="filters">
+    <input id="bq" placeholder="filter by CWE, title, target, detector…" value="${esc(f.q)}"
+      oninput="BOARD_FILTER.q=this.value;renderBoard();document.getElementById('bq').focus()">
+    <select id="bsev" onchange="BOARD_FILTER.sev=this.value;renderBoard()">
+      <option value="">all severities</option>
+      ${['critical','high','medium','low','info'].map(s=>`<option ${f.sev===s?'selected':''} value="${s}">${s}</option>`).join('')}
+    </select>
+    <select id="bstate" onchange="BOARD_FILTER.state=this.value;renderBoard()">
+      <option value="">all states</option>
+      ${['candidate','corroborated','confirmed','poc-backed'].map(s=>`<option ${f.state===s?'selected':''} value="${s}">${s}</option>`).join('')}
+    </select>
+    <span class="mono" style="color:var(--faint);font-size:11px">${rows.length} shown</span>
+  </div>`;
+  const body = rows.length ? `<table><thead><tr>
+      <th>Sev</th><th>CWE</th><th>Finding</th><th>State</th><th>Conf</th>
+      <th>Detector</th><th>Target</th><th>PoC</th></tr></thead><tbody>
+    ${rows.map(x=>{
+      const st=(x.state||'candidate').replace('poc-backed','poc-backed');
+      const conf=Math.round((x.confidence||0)*100);
+      const ev=(x.evidence||[]).length;
+      const lvl=x.poc_level?`<span class="lvl">${esc(x.poc_level)}</span>`:'';
+      return `<tr class="frow" onclick="openFinding('${x.target_id}')">
+        <td><span class="sev ${x.severity}">${esc(x.severity)}</span></td>
+        <td class="mono">${esc(x.cwe||'-')}</td>
+        <td><div class="ttl">${esc(x.title||'')}</div><div class="ev">${ev} evidence</div></td>
+        <td><span class="st ${x.state==='poc-backed'?'pocbacked':x.state}">${esc(x.state)}</span></td>
+        <td><div class="cbar" title="${conf}%"><i style="width:${conf}%"></i></div></td>
+        <td class="mono" style="font-size:11px">${esc(x.detector||'-')}</td>
+        <td class="mono" style="font-size:11px">${esc(x.target_name||'-')} <span class="arch">${esc(x.target_arch||'')}</span></td>
+        <td>${lvl}</td></tr>`;
+    }).join('')}</tbody></table>` : `<div class="empty">No findings match. Run detection, fuzzing, or PoC stages on the Workbench.</div>`;
+  bd.innerHTML = tilesHtml + filters + `<div class="card" style="padding:6px 8px">${body}</div>`;
+  const q=document.getElementById('bq'); if(q && document.activeElement!==q){}
+}
+function boardTile(key,val){
+  if(key==='clear'){ BOARD_FILTER.sev=''; BOARD_FILTER.state=''; }
+  else { BOARD_FILTER[key] = (BOARD_FILTER[key]===val)?'':val; }
+  renderBoard();
+}
+async function openFinding(tid){
+  switchView('wb');
+  await showDetail(tid);
+  const dc=document.getElementById('detailcard'); if(dc) dc.scrollIntoView({behavior:'smooth'});
 }
 
 let PENDING=null;
@@ -204,6 +344,7 @@ async function refresh(){
   renderTargets(targets); renderRuns(runs);
   document.getElementById("casesub").textContent = `${targets.length} targets · ${runs.length} runs`;
   document.getElementById("tcount").textContent = targets.length;
+  if(BOARD_VIEW==="board") loadBoard();
 }
 
 function renderTargets(ts){
