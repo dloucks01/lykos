@@ -239,17 +239,20 @@ tr.fdetail>td{background:var(--surface-2);border-bottom:1px solid var(--border-s
 .cvhead{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;
   padding:8px 10px;background:var(--surface-3);border-bottom:1px solid var(--border)}
 .cvname{font-size:12px}
-.cvtabs{display:flex;gap:3px}
-.cvtab{font-size:11px;font-weight:600;padding:3px 9px;border-radius:6px;cursor:pointer;
-  background:transparent;border:1px solid transparent;color:var(--dim)}
-.cvtab:hover{color:var(--text)}
-.cvtab.on{background:var(--surface);border-color:var(--border-strong);color:var(--text)}
-.cvcode{margin:0;padding:10px 12px;white-space:pre-wrap;max-height:340px;overflow:auto;
-  font-family:var(--mono);font-size:11.5px;line-height:1.5;color:var(--text)}
-.cvcalls{padding:10px 12px;display:flex;gap:6px;flex-wrap:wrap}
-.cvcalls span{font-family:var(--mono);font-size:11px;padding:2px 7px;border-radius:5px;
-  background:var(--surface-2);border:1px solid var(--border)}
+.cvbody{display:grid;grid-template-columns:1fr 1fr}
+.cvpane{min-width:0}
+.cvpane+.cvpane{border-left:1px solid var(--border)}
+.cvplabel{font-size:9.5px;text-transform:uppercase;letter-spacing:.08em;color:var(--faint);
+  padding:6px 12px 2px}
+.cvcode{margin:0;padding:4px 12px 10px;white-space:pre-wrap;overflow:auto;max-height:320px;
+  font-family:var(--mono);font-size:11px;line-height:1.5;color:var(--text);word-break:break-word}
+.cvcalls{padding:8px 12px;border-top:1px solid var(--border);display:flex;gap:6px;
+  flex-wrap:wrap;align-items:center}
+.cvcalls span:not(.cvplabel):not(.hint){font-family:var(--mono);font-size:11px;padding:2px 7px;
+  border-radius:5px;background:var(--surface-2);border:1px solid var(--border)}
 .cvcalls span.ext{color:var(--warn);border-color:var(--warn)}
+@media(max-width:920px){.cvbody{grid-template-columns:1fr}
+  .cvpane+.cvpane{border-left:0;border-top:1px solid var(--border)}}
 /* ---- system map: toolbar + legend ---- */
 .smtools{display:flex;gap:6px;flex-wrap:wrap}
 .smlegend{display:flex;align-items:center;gap:16px;flex-wrap:wrap;font-size:11px;color:var(--dim);
@@ -1097,29 +1100,31 @@ function renderFuncs(q){
   el.querySelectorAll(".frow[data-id]").forEach(d=> d.onclick=()=>showFunc(d.dataset.id));
   const s=el.querySelector(".fsearch"); if(q&&s){ s.focus(); s.setSelectionRange(s.value.length,s.value.length); }
 }
-let CVFUNC=null, CVIEW="code";
+let CVFUNC=null;
 async function showFunc(fid){
-  CVFUNC = await api(`/functions/${fid}`); CVIEW="code";
+  CVFUNC = await api(`/functions/${fid}`);
   renderCodeViewer();
   document.querySelectorAll("#funcs .frow").forEach(r=>r.classList.toggle("on", r.dataset.id===fid));
   const cv=document.getElementById("codeviewer"); if(cv) cv.scrollIntoView({block:"nearest",behavior:"smooth"});
 }
-function setCView(v){ CVIEW=v; renderCodeViewer(); }
 function renderCodeViewer(){
   const el=document.getElementById("codeviewer"); if(!el||!CVFUNC) return;
   const f=CVFUNC; el.hidden=false;
   const blocks=(f.ir&&f.ir.blocks)?f.ir.blocks:[];
   const callees=f.callees||[];
-  const tabs=[["code","Pseudocode"],["cfg",`CFG · ${f.blocks||blocks.length}`],["calls",`Calls · ${callees.length}`]];
-  let body;
-  if(CVIEW==="cfg") body=`<pre class="cvcode">${renderCFG(blocks)||"(no CFG — run Decompile)"}</pre>`;
-  else if(CVIEW==="calls") body=`<div class="cvcalls">${callees.length?callees.map(c=>`<span class="${c.external?'ext':''}">${esc(c.dst_name||c.dst_addr)}</span>`).join(""):"<span class='hint'>no calls</span>"}</div>`;
-  else body=`<pre class="cvcode">${esc(f.decompiled||"(no decompilation — run Decompile)")}</pre>`;
+  const calls = callees.length
+    ? callees.map(c=>`<span class="${c.external?'ext':''}">${esc(c.dst_name||c.dst_addr)}</span>`).join("")
+    : `<span class="hint">no calls</span>`;
   el.innerHTML=`<div class="cvhead">
       <div class="cvname"><b>${esc(f.name||("sub_"+f.addr))}</b>
-        <span class="mono" style="color:var(--faint)">${f.addr} · ${f.blocks||blocks.length} blk · ${f.edges||0} edges</span></div>
-      <div class="cvtabs">${tabs.map(([k,l])=>`<button class="cvtab ${CVIEW===k?'on':''}" onclick="setCView('${k}')">${l}</button>`).join("")}</div>
-    </div>${body}`;
+        <span class="mono" style="color:var(--faint)">${f.addr} · ${f.blocks||blocks.length} blk · ${f.edges||0} edges</span></div></div>
+    <div class="cvbody">
+      <div class="cvpane"><div class="cvplabel">Pseudocode</div>
+        <pre class="cvcode">${esc(f.decompiled||"(no decompilation — run Decompile)")}</pre></div>
+      <div class="cvpane"><div class="cvplabel">CFG · P-Code (${blocks.length} blocks)</div>
+        <pre class="cvcode">${renderCFG(blocks)||"(no CFG)"}</pre></div>
+    </div>
+    <div class="cvcalls"><span class="cvplabel" style="padding:0;margin-right:2px">Calls</span>${calls}</div>`;
 }
 function renderCFG(blocks){
   return blocks.map(b=>{
