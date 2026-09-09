@@ -62,9 +62,12 @@ def build_parser() -> argparse.ArgumentParser:
     sv.set_defaults(func=_cmd_serve)
 
     ev = sub.add_parser("eval", help="run the validation benchmark (doc 14) and score it")
-    ev.add_argument("--stage", choices=["static", "dynamic"], default="static",
+    ev.add_argument("--stage", choices=["static", "dynamic", "lava"], default="static",
                     help="static = candidate-stage CWE detection (Ghidra); "
-                         "dynamic = confirmed-stage crash reproduction via fuzzing")
+                         "dynamic = confirmed-stage crash reproduction via fuzzing; "
+                         "lava = LAVA-M injected-bug finding recall")
+    ev.add_argument("--lava", default=None,
+                    help="path to an unpacked NIST LAVA-M drop to fuzz (implies --stage lava)")
     ev.add_argument("--corpus", default=None,
                     help="directory of <CWE>__<name>__<good|bad>.c cases (default: bundled)")
     ev.add_argument("--juliet", default=None,
@@ -123,39 +126,49 @@ def _cmd_eval(args: argparse.Namespace) -> int:
 
     from .eval import corpus as corpusmod
     from .eval import harness
-    if args.juliet:
+    stage = args.stage
+    if args.lava:
+        cases = corpusmod.load_lava(args.lava, limit=args.limit)
+        stage = "lava"
+    elif args.juliet:
         cwes = set(args.cwe.split(",")) if args.cwe else None
         cases = corpusmod.load_juliet(args.juliet, cwes=cwes, limit=args.limit)
     elif args.corpus:
         cases = corpusmod.load_dir(args.corpus)
     else:
         cases = None
-    kw = {"stage": args.stage, "workers": args.workers,
+    kw = {"stage": stage, "workers": args.workers,
           "progress": lambda m: print(m, file=sys.stderr, flush=True)}
-    if args.stage == "static":
+    if stage == "static":
         kw["min_state"] = args.min_state
+    elif stage == "lava":
+        del kw["workers"]                              # lava harness takes no workers arg
     rep = harness.run(cases, **kw)
     for w in rep.meta.get("warnings", []):
         print(f"warning: {w}", file=sys.stderr)
     print(rep.table())
     backend = (f"ghidra={'yes' if rep.meta.get('ghidra') else 'NO'}, min_state={args.min_state}"
-               if args.stage == "static"
+               if stage == "static"
                else f"fuzz budget={rep.meta.get('max_execs')} execs/{rep.meta.get('max_seconds')}s")
-    print(f"\n{args.stage}-stage: {rep.metrics.get('n_cases', 0)} cases, "
-          f"{rep.metrics.get('n_cwe_classes', 0)} CWE classes, "
-          f"{rep.meta.get('elapsed_s')}s ({backend})")
+    ncases, ngroups = rep.metrics.get("n_cases", 0), rep.metrics.get("n_cwe_classes", 0)
+    if stage == "lava":
+        print(f"\nlava-stage: {ncases} injected bugs across {ngroups} program(s), "
+              f"{rep.meta.get('elapsed_s')}s ({backend})")
+    else:
+        print(f"\n{stage}-stage: {ncases} cases, {ngroups} CWE classes, "
+              f"{rep.meta.get('elapsed_s')}s ({backend})")
     if args.out:
         Path(args.out).write_text(json.dumps(rep.to_dict(), indent=2))
         print(f"report written to {args.out}")
     if args.record:
         from .eval import history as histmod
         path = args.history or histmod.DEFAULT_PATH
-        min_state = args.min_state if args.stage == "static" else None
-        histmod.record(path, rep, stage=args.stage, min_state=min_state, label=args.label)
+        min_state = args.min_state if stage == "static" else None
+        histmod.record(path, rep, stage=stage, min_state=min_state, label=args.label)
         print(f"recorded to {path}", file=sys.stderr)
     # release gate: PASS / FAIL / SKIP (SKIP when the static backend is absent)
     from .eval.metrics import gate
-    passed, verdict, reason = gate(rep.metrics, rep.meta, stage=args.stage,
+    passed, verdict, reason = gate(rep.metrics, rep.meta, stage=stage,
                                    min_recall=args.min_recall, max_fp_rate=args.max_fp_rate,
                                    require_backend=args.require_backend)
     print(f"\nGATE: {verdict} -- {reason}", file=sys.stderr)

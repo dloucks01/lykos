@@ -283,6 +283,46 @@ def test_dynamic_corpus_is_labeled_crash_pairs():
         assert verds == {"good", "bad"}, f"{cwe} lacks a crash/safe pair"
 
 
+# ---------------------------------------------------------------- LAVA-M (bug-finding recall)
+def test_load_lava_parses_a_drop(tmp_path):
+    d = tmp_path / "base64"
+    (d / "bin").mkdir(parents=True)
+    (d / "validated_bugs").write_text("11 22 33\n44")
+    (d / "bin" / "base64").write_bytes(b"\x7fELF")          # stand-in binary
+    progs = corpus.load_lava(tmp_path)
+    assert len(progs) == 1
+    p = progs[0]
+    assert p.name == "base64" and p.bug_ids == [11, 22, 33, 44]
+    assert p.binary.endswith("bin/base64") and p.input_mode == "file"
+    assert p.argv == ["-d", "@@"]                           # known base64 convention
+
+
+def test_lava_corpus_has_graded_injected_bugs():
+    progs = corpus.bundled_lava()
+    assert len(progs) == 1 and len(progs[0].bug_ids) >= 6
+    assert progs[0].source and "Successfully triggered bug" in progs[0].source
+
+
+def test_lava_harness_finds_easy_injected_bugs():
+    """Fuzz a program with two single-byte-gated injected bugs; both self-report and are
+    counted (LAVA-M recall). Needs gcc; runs in the sandbox, no Ghidra."""
+    if not shutil.which("gcc"):
+        pytest.skip("needs gcc")
+    src = ('#define _GNU_SOURCE\n#include <stdio.h>\n#include <string.h>\n#include <unistd.h>\n'
+           'int main(void){char b[256];int n=read(0,b,sizeof b-1);if(n<0)n=0;b[n]=0;\n'
+           '  if(memmem(b,n,"A",1)){fprintf(stderr,"Successfully triggered bug 11\\n");'
+           '*(volatile int*)0=1;}\n'
+           '  if(memmem(b,n,"Z",1)){fprintf(stderr,"Successfully triggered bug 22\\n");'
+           '*(volatile int*)0=1;}\n'
+           '  return 0;}\n')
+    prog = corpus.LavaProgram("t", [11, 22], source=src)
+    rep = harness.run_lava_corpus([prog], max_execs=1500, max_seconds=15)
+    pm = rep.meta["programs"][0]
+    assert pm["found"] == 2 and pm["total"] == 2              # both easy bugs found
+    assert rep.metrics["overall"]["recall"] == 1.0
+    assert rep.metrics["per_cwe"]["t"]["tp"] == 2
+
+
 # ---------------------------------------------------------------- live end-to-end (Ghidra)
 def test_harness_scores_a_real_pair_end_to_end():
     """Compile + analyze a bad/good pair through the real pipeline; the bad case is flagged

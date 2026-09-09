@@ -172,6 +172,90 @@ def bundled_dynamic() -> list[Case]:
     return list(_DYN_CASES)
 
 
+# ---------------------------------------------- LAVA-M style injected-bug corpus
+# LAVA-M measures bug-finding RECALL: a program carries many injected bugs, each gated by a
+# magic value in the input and self-reporting "Successfully triggered bug N" (then corrupting
+# memory) when hit. Recall = unique bugs found / total. LAVA-M is built to defeat coverage-
+# blind fuzzers, so magic-gated bugs are hard for a black-box mutator -- the honest result is
+# partial recall (easy single-byte gates found, 4-byte magic gates mostly missed).
+@dataclass
+class LavaProgram:
+    name: str
+    bug_ids: list                                     # ground-truth injected bug IDs
+    source: str = ""                                  # synthetic: compile this C
+    binary: str = ""                                  # real drop: path to a prebuilt binary
+    argv: list = field(default_factory=lambda: ["@@"])   # "@@" = the input file path
+    input_mode: str = "stdin"                         # stdin | file | arg
+    seeds: list = field(default_factory=lambda: [b"the quick brown fox jumps\n"])
+    dictionary: list = field(default_factory=list)
+    cflags: list = field(default_factory=lambda: list(_DYN_FLAGS))
+
+
+# a faithful miniature: bugs gated by triggers of varying difficulty (single byte -> 4-byte
+# magic), each self-reporting like real LAVA before corrupting memory.
+_LAVA_TRIGGERS = [
+    (11, r'"A",1'), (12, r'"Z",1'), (13, r'"*",1'), (14, r'"~",1'),     # single byte (easy)
+    (21, r'"lava",4'), (22, r'"0wn3",4'),                               # 4 printable (medium)
+    (31, r'"\xde\xad\xbe\xef",4'), (32, r'"\x00\x13\x37\xff",4'),       # 4-byte magic (hard)
+]
+
+
+def _lava_source():
+    checks = "\n".join(
+        f'  if(memmem(b,n,{tok})){{ fprintf(stderr,"Successfully triggered bug {bid}\\n"); '
+        f'*(volatile int*)0=1; }}'
+        for bid, tok in _LAVA_TRIGGERS)
+    return ("#define _GNU_SOURCE\n#include <stdio.h>\n#include <string.h>\n#include <unistd.h>\n"
+            "int main(void){ char b[512]; int n=read(0,b,sizeof b-1); if(n<0)n=0; b[n]=0;\n"
+            + checks + "\n  return 0; }\n")
+
+
+def bundled_lava() -> list[LavaProgram]:
+    """The built-in LAVA-M-style miniature (one stdin program with graded injected bugs)."""
+    return [LavaProgram("mini", [bid for bid, _ in _LAVA_TRIGGERS], source=_lava_source())]
+
+
+# known LAVA-M program input conventions (the buggy binaries take the input as a file arg)
+_LAVA_ARGV = {"base64": ["-d", "@@"], "md5sum": ["-c", "@@"], "uniq": ["@@"], "who": ["@@"]}
+
+
+def load_lava(root: str | Path, *, limit=None) -> list[LavaProgram]:
+    """Adapt an unpacked NIST LAVA-M drop into `LavaProgram`s.
+
+    Convention (LAVA-M's own layout): each program lives in a subdir holding a `validated_bugs`
+    file (whitespace-separated bug IDs) and its buggy binary (``bin/<name>`` or ``<name>``);
+    optional seed inputs under ``seeds/``, ``inputs/`` or ``fuzzed/``. Input goes in as a file
+    argument (``@@``), per program's known argv. The suite is large and separately licensed;
+    point this at an unpacked drop.
+    """
+    root = Path(root)
+    out: list[LavaProgram] = []
+    for vb in sorted(root.rglob("validated_bugs")):
+        pdir = vb.parent
+        name = pdir.name
+        try:
+            ids = [int(x) for x in vb.read_text().split()]
+        except ValueError:
+            continue
+        binp = next((p for p in (pdir / "bin" / name, pdir / name,
+                                 *pdir.rglob(f"bin/{name}")) if p.exists()), None)
+        if not binp or not ids:
+            continue
+        seeds = []
+        for sd in ("seeds", "inputs", "fuzzed"):
+            d = pdir / sd
+            if d.is_dir():
+                seeds = [f.read_bytes()[:4096] for f in sorted(d.glob("*"))[:8] if f.is_file()]
+                if seeds:
+                    break
+        out.append(LavaProgram(name, ids, binary=str(binp),
+                               argv=_LAVA_ARGV.get(name, ["@@"]), input_mode="file",
+                               seeds=seeds or [b"AAAA\n"]))
+        if limit and len(out) >= limit:
+            break
+    return out
+
+
 _FNAME = re.compile(r"^(CWE-\d+)__([A-Za-z0-9_.-]+)__(good|bad)\.c$")
 
 

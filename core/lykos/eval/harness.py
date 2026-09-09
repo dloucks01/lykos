@@ -7,6 +7,8 @@ the real detectors, not a mock.
 """
 from __future__ import annotations
 
+import random
+import re
 import shutil
 import subprocess
 import tempfile
@@ -22,10 +24,11 @@ from ..analyze.ingest import enqueue_triage, ingest
 from ..casestore import CaseStore
 from ..db.dao import FindingDAO
 from ..jobs import JobConfig, JobQueue, WorkerPool
-from .corpus import bundled, bundled_dynamic
+from .corpus import Case, bundled, bundled_dynamic, bundled_lava
 from .metrics import Outcome, Report, matches, same_family, score
 
 _CONFIRMED = ("confirmed", "poc-backed")
+_LAVA_MARKER = re.compile(rb"Successfully triggered bug (\d+)")
 
 # finding-state lifecycle order, for reporting the strongest state reached per class
 _STATE_RANK = {"candidate": 0, "corroborated": 1, "confirmed": 2, "poc-backed": 3}
@@ -189,11 +192,83 @@ def run_dynamic_corpus(cases=None, *, workdir=None, gcc="gcc", workers=2, max_ex
     return Report(outcomes=outcomes, metrics=score(outcomes), meta=meta)
 
 
+def _lava_deliver(prog, workfile: Path, data: bytes):
+    """Map a fuzz input onto a program's vector -> (argv, stdin)."""
+    if prog.input_mode == "stdin":
+        return [], data
+    workfile.write_bytes(data)                          # file / arg: "@@" -> the input path
+    argv = [str(workfile) if a == "@@" else a for a in prog.argv]
+    return (argv, b"") if prog.input_mode != "arg" else ([data.decode("latin-1", "ignore")], b"")
+
+
+def run_lava_corpus(programs=None, *, workdir=None, gcc="gcc", max_execs=4000, max_seconds=30,
+                    exec_timeout=2, progress=None) -> Report:
+    """LAVA-M bug-finding recall (doc 14): fuzz each program and count the unique injected
+    bugs triggered (each self-reports "Successfully triggered bug N"). Recall = found / total.
+
+    LAVA-M is built to defeat coverage-blind fuzzers, so a black-box mutator finds the easy
+    (single-byte) gates and misses the 4-byte-magic ones -- partial recall is the honest,
+    expected result, not a defect. Each bug becomes one scored `bad` case (found or missed).
+    """
+    from ..analyze.dynamic import sandbox
+    from ..analyze.fuzz.mutator import Mutator
+    programs = list(programs if programs is not None else bundled_lava())
+    gcc_path = shutil.which(gcc)
+    tmp = Path(workdir) if workdir else Path(tempfile.mkdtemp(prefix="lykos-eval-lava-"))
+    tmp.mkdir(parents=True, exist_ok=True)
+    say = progress or (lambda _m: None)
+    meta = {"n_programs": len(programs), "gcc": bool(gcc_path), "stage": "lava",
+            "max_execs": max_execs, "max_seconds": max_seconds, "programs": [], "warnings": []}
+    outcomes: list[Outcome] = []
+    for prog in programs:
+        exe = prog.binary
+        if not exe:
+            if not gcc_path:
+                meta["warnings"].append(f"{prog.name}: no gcc, skipped")
+                continue
+            built = compile_case(Case(prog.name, "lava", "bad", source=prog.source,
+                                      cflags=prog.cflags), tmp, gcc)
+            if built is None:
+                meta["warnings"].append(f"{prog.name}: compile failed")
+                continue
+            exe = str(built)
+        rng = random.Random(1337)
+        mut = Mutator(rng, prog.dictionary)
+        corpus = [bytes(s) for s in (prog.seeds or [b"\n"])]
+        wf = tmp / f"{prog.name}.in"
+        found: set = set()
+        execs = 0
+        deadline = time.time() + max_seconds
+        say(f"{prog.name}: fuzzing for {len(prog.bug_ids)} injected bugs")
+        while execs < max_execs and time.time() < deadline:
+            data = mut.mutate(rng.choice(corpus), corpus)
+            argv, stdin = _lava_deliver(prog, wf, data)
+            res = sandbox.run(str(exe), argv=argv, stdin=stdin, timeout=exec_timeout)
+            execs += 1
+            new = False
+            for m in _LAVA_MARKER.findall(res.stdout + res.stderr):
+                bid = int(m)
+                if bid not in found:
+                    found.add(bid)
+                    new = True
+            if new or res.crashed:
+                corpus.append(data)                     # explore near interesting inputs
+        gt = set(prog.bug_ids)
+        for bid in prog.bug_ids:
+            hit = bid in found
+            outcomes.append(Outcome(f"{prog.name}#{bid}", prog.name, "bad",
+                                    {prog.name} if hit else set(), matched=hit))
+        meta["programs"].append({"program": prog.name, "found": len(found & gt),
+                                 "total": len(gt), "execs": execs})
+        say(f"{prog.name}: {len(found & gt)}/{len(gt)} bugs in {execs} execs")
+    return Report(outcomes=outcomes, metrics=score(outcomes), meta=meta)
+
+
 def run(cases=None, *, stage="static", **kw) -> Report:
-    """Timed convenience wrapper. `stage`: "static" (candidate detection) or "dynamic"
-    (confirmed-stage crash reproduction via fuzzing)."""
+    """Timed convenience wrapper. `stage`: "static" (candidate detection), "dynamic"
+    (confirmed-stage crash reproduction), or "lava" (LAVA-M bug-finding recall)."""
     t0 = time.time()
-    runner = run_dynamic_corpus if stage == "dynamic" else run_corpus
+    runner = {"dynamic": run_dynamic_corpus, "lava": run_lava_corpus}.get(stage, run_corpus)
     rep = runner(cases, **kw)
     rep.meta["elapsed_s"] = round(time.time() - t0, 1)
     return rep
