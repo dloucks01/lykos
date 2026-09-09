@@ -6,6 +6,7 @@ locator falls back to config/env/PATH, and the stage fails clearly if Ghidra is 
 
 Importing this package registers both stages with the job engine.
 """
+from .debug import register as _register_debug
 from .detect import register as _register_detect
 from .disassemble import DISASSEMBLE_STAGE  # noqa: F401
 from .disassemble import register as _register_disasm
@@ -25,6 +26,7 @@ def register() -> None:
     _register_fuzz()
     _register_poc()
     _register_symbolic()
+    _register_debug()
 
 
 register()

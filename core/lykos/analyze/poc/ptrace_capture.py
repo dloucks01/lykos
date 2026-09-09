@@ -24,8 +24,10 @@ PTRACE_PEEKDATA = 2
 PTRACE_CONT = 7
 PTRACE_GETREGS = 12
 PTRACE_KILL = 8
+PTRACE_GETSIGINFO = 0x4202
 PTRACE_GETREGSET = 0x4204
 NT_PRSTATUS = 1
+_SI_ADDR_OFFSET = 16          # offset of si_addr in siginfo_t (x86-64 / aarch64)
 
 # stack window captured around SP at the fault (bytes): enough to hold the saved return
 # address and adjacent controlled slots, so the offset can be recovered even when a
@@ -91,6 +93,67 @@ def _read_stack(libc, pid, sp):
     return base, out.hex()
 
 
+def _peek(libc, pid, addr):
+    ctypes.set_errno(0)
+    word = libc.ptrace(PTRACE_PEEKDATA, pid, ctypes.c_void_p(addr), 0)
+    if word == -1 and ctypes.get_errno() != 0:
+        return None
+    return word & 0xFFFFFFFFFFFFFFFF
+
+
+def _read_bytes(libc, pid, addr, n):
+    out = bytearray()
+    while len(out) < n:
+        w = _peek(libc, pid, addr + len(out))
+        if w is None:
+            break
+        out += w.to_bytes(8, "little")
+    return bytes(out[:n])
+
+
+def _siginfo_addr(libc, pid):
+    buf = (ctypes.c_ubyte * 256)()
+    if libc.ptrace(PTRACE_GETSIGINFO, pid, 0, ctypes.byref(buf)) != 0:
+        return None
+    return int.from_bytes(bytes(buf[_SI_ADDR_OFFSET:_SI_ADDR_OFFSET + 8]), "little")
+
+
+def _maps(pid):
+    out = []
+    try:
+        with open(f"/proc/{pid}/maps") as fh:
+            for line in fh:
+                parts = line.split(None, 5)
+                if len(parts) < 5:
+                    continue
+                lo, hi = parts[0].split("-")
+                out.append({"start": int(lo, 16), "end": int(hi, 16),
+                            "perms": parts[1], "path": parts[5].strip()
+                            if len(parts) > 5 else ""})
+    except OSError:
+        pass
+    return out
+
+
+def _backtrace(libc, pid, regs, host, maxframes=32):
+    """Return-address chain via the frame pointer (rbp / x29). Best-effort; a smashed stack
+    yields garbage, which the analyzer reads as the root cause."""
+    fp = regs.get("rbp", 0) if host == "x86-64" else regs.get("x29", 0)
+    frames = []
+    for _ in range(maxframes):
+        if not fp:
+            break
+        ret = _peek(libc, pid, fp + 8)
+        nxt = _peek(libc, pid, fp)
+        if ret is None:
+            break
+        frames.append(ret)
+        if nxt is None or nxt <= fp:
+            break                                     # chain must ascend or it is corrupt
+        fp = nxt
+    return frames
+
+
 def _getregs_aarch64(libc, pid):
     buf = _getregset_prstatus(libc, pid, 34)          # x0..x30, sp, pc, pstate
     if buf is None:
@@ -153,11 +216,16 @@ def capture(exe, argv, stdin_file, timeout):
                 if got:
                     regs, pc_name, sp_name = got
                     sp_val = regs[sp_name]
+                    pc_val = regs[pc_name]
                     stack_base, stack_hex = _read_stack(libc, pid, sp_val)
                     result = {"ok": True, "arch": host, "signal": int(sig),
                               "signal_name": FATAL[sig], "pc_name": pc_name,
-                              "sp_name": sp_name, "pc": regs[pc_name], "sp": sp_val,
-                              "regs": regs, "stack_base": stack_base, "stack": stack_hex}
+                              "sp_name": sp_name, "pc": pc_val, "sp": sp_val,
+                              "regs": regs, "stack_base": stack_base, "stack": stack_hex,
+                              "fault_addr": _siginfo_addr(libc, pid),
+                              "pc_bytes": _read_bytes(libc, pid, pc_val, 16).hex(),
+                              "backtrace": _backtrace(libc, pid, regs, host),
+                              "maps": _maps(pid)}
                 else:
                     result = {"ok": False, "reason": "GETREGS failed", "arch": host,
                               "signal_name": FATAL[sig]}
