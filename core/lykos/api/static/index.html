@@ -18,6 +18,7 @@
   --accent:#b5771a;--teal:#0f7d74;--ok:#2f8f5f;--warn:#c08a1f;--danger:#c23434;--info:#2f74c0;
 }
 *{box-sizing:border-box}
+[hidden]{display:none!important}   /* beats .grid/.tiles display so tab-switching hides panels */
 body{margin:0;height:100vh;overflow:hidden;background:var(--bg);color:var(--text);
   font-family:var(--sans);font-size:13.5px;display:grid;grid-template-rows:auto 1fr}
 .mono{font-family:var(--mono);font-variant-numeric:tabular-nums}
@@ -485,6 +486,7 @@ function renderSystemMap(){
         <button class="btn sm" onclick="loadSystemMap(true)">↻ Re-resolve links</button>
         <button class="btn sm" id="ipcbtn" onclick="doModelIpc()" title="Discover IPC channels (socket/pipe/shm/mq) and pair producers with consumers">Model IPC channels</button>
         <button class="btn sm" id="xtaintbtn" onclick="doCrossTaint()" title="Propagate taint across resolved edges: source in A → sink in B">Analyze cross-binary taint</button>
+        <button class="btn sm" id="detbtn" onclick="doWholeSystem()" title="Whole-system detonation: run the components together over their real IPC and blame a crash in one on the input that entered another">Detonate system</button>
       </span></div>`;
   if(!nodes.length){ el.innerHTML=`<div class="card">${head}<div class="empty">No components yet. Upload the program and its shared libraries (or a firmware's carved parts) to this case, then re-resolve.</div></div>`; return; }
   // circular layout
@@ -554,6 +556,13 @@ async function doModelIpc(){
   try{
     await fetch("/runs",{method:"POST",headers:{"Content-Type":"application/json"},
       body:JSON.stringify({case_id:CUR,stage:"ipc_model"})});
+  }catch(e){}
+}
+async function doWholeSystem(){
+  const b=document.getElementById("detbtn"); if(b){ b.disabled=true; b.textContent="detonating…"; }
+  try{
+    await fetch("/runs",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({case_id:CUR,stage:"whole_system",params:{fuzz:true,max_execs:80,max_seconds:25}})});
   }catch(e){}
 }
 
@@ -878,9 +887,12 @@ function openWS(id){
     if(e.type==="harness.progress"){ const st=document.getElementById("fuzzstat"); if(st&&e.payload) st.textContent=`boundary: ${e.payload.execs} execs · ${e.payload.crashes} crashes`; }
     if(e.type==="harness.done" && DETAIL_TID){ const st=document.getElementById("fuzzstat"); if(st&&e.payload) st.textContent = e.payload.error?("boundary: "+e.payload.error):`boundary done: ${e.payload.execs} execs · ${e.payload.unique} unique`; loadDyn(DETAIL_TID); loadFindings(DETAIL_TID); }
     if(e.type==="poc.done" && DETAIL_TID){ loadPocs(DETAIL_TID); loadFindings(DETAIL_TID); }
-    if((e.type==="cross_taint.done"||e.type==="link.done"||e.type==="ipc_model.done") && BOARD_VIEW==="sysmap"){ loadSystemMap(false); }
+    if((e.type==="cross_taint.done"||e.type==="link.done"||e.type==="ipc_model.done"||e.type==="system.done") && BOARD_VIEW==="sysmap"){ loadSystemMap(false); }
     if(e.type==="cross_taint.done" && e.payload){ logline("xtaint","",`${e.payload.cross_findings} cross-component finding(s)`); }
     if(e.type==="ipc_model.done" && e.payload){ logline("ipc","",`${e.payload.ipc_edges} channel edge(s), ${e.payload.cross_findings} candidate(s)`); }
+    if(e.type==="system.start" && e.payload){ logline("detonate","",e.payload.error?("system: "+e.payload.error):`entry ${esc(e.payload.entry||'')} → ${(e.payload.services||[]).join(', ')}`); }
+    if(e.type==="system.progress" && e.payload){ logline("detonate","",`${e.payload.execs} detonations · ${e.payload.cross_boundary} cross-boundary`); }
+    if(e.type==="system.done" && e.payload){ logline("detonate","",e.payload.error?("system: "+e.payload.error):`done: ${e.payload.cross_boundary||e.payload.crashes||0} cross-boundary crash(es)`); }
   };
   WS.onclose = ()=> logline("ws","","disconnected");
 }
@@ -910,6 +922,7 @@ function ACTIONS(){ return [
     {label:"Resolve component links", run:()=>{switchView("sysmap");loadSystemMap(true);}},
     {label:"Analyze cross-binary taint", run:()=>{switchView("sysmap");doCrossTaint();}},
     {label:"Model IPC channels", run:()=>{switchView("sysmap");doModelIpc();}},
+    {label:"Detonate whole system", run:()=>{switchView("sysmap");doWholeSystem();}},
     {label:"Open HTML report ↗", run:()=>window.open(reportURL("html",true),"_blank")},
     {label:"Download PDF report", run:()=>dl(reportURL("pdf",true))},
     {label:"Download SARIF export", run:()=>dl(reportURL("sarif",true))},

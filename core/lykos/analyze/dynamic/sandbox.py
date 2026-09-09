@@ -57,6 +57,23 @@ def host_arch() -> str:
     return _HOST.get(platform.machine().lower(), platform.machine().lower())
 
 
+def classify_rc(rc: Optional[int]):
+    """Map a subprocess returncode to (crashed, signal, signal_name, exit_code).
+
+    Native subprocesses report -signum; wrappers (bwrap/qemu) report 128+signum.
+    """
+    if rc is None:
+        return False, None, None, None
+    sig = None
+    if rc < 0:
+        sig = -rc
+    elif rc > 128 and (rc - 128) in CRASH_SIGNALS:
+        sig = rc - 128
+    if sig in CRASH_SIGNALS:
+        return True, sig, CRASH_SIGNALS[sig], None
+    return False, None, None, rc
+
+
 def _qemu_for(arch: str) -> Optional[str]:
     suf = _QEMU.get(arch)
     return shutil.which("qemu-" + suf) if suf else None
