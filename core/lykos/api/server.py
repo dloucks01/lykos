@@ -372,7 +372,8 @@ class Handler(BaseHTTPRequestHandler):
             target_id = body.get("target_id")
             if stage in (_INGEST, "disassemble", "detect_cwe", "dynamic_run", "fuzz",
                          "coverage_fuzz", "directed_fuzz", "concolic",
-                         "build_poc", "poc_primitive") and target_id:
+                         "build_poc", "poc_primitive",
+                         "root_cause") and target_id:
                 target = s.targets.get(target_id)
                 if not target:
                     return self._json({"error": "no target"}, 404)
@@ -400,6 +401,9 @@ class Handler(BaseHTTPRequestHandler):
                 elif stage == "poc_primitive":
                     from ..analyze.poc import enqueue_primitive
                     run = enqueue_primitive(q, target, params=body.get("params"))
+                elif stage == "root_cause":
+                    from ..analyze.debug import enqueue_root_cause
+                    run = enqueue_root_cause(q, target, params=body.get("params"))
                 else:
                     from ..analyze.poc import enqueue_build_poc
                     run = enqueue_build_poc(q, target, params=body.get("params"))

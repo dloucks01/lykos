@@ -301,6 +301,12 @@ async function doPrimitive(tid, inputSha, mode){
     body:JSON.stringify({case_id:CUR,target_id:tid,stage:"poc_primitive",
       params:{input_sha:inputSha,input_mode:mode||"stdin"}})});
 }
+async function doRootCause(tid, inputSha, mode){
+  const st=document.getElementById("fuzzstat"); if(st) st.textContent="root-cause analysis…";
+  await fetch("/runs",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({case_id:CUR,target_id:tid,stage:"root_cause",
+      params:{input_sha:inputSha,input_mode:mode||"stdin"}})});
+}
 async function loadPocs(tid){
   const el=document.getElementById("pocs"); if(!el) return;
   const ps=await api(`/targets/${tid}/pocs`);
@@ -363,7 +369,8 @@ async function loadDyn(tid){
                  : `<span style="color:#57c88c">exit ${r.exit_code}</span>`;
       const poc = (r.crashed && r.input_sha)
         ? ` <button class="btn sm" onclick="doPoc('${DETAIL_TID}','${r.input_sha}','${r.input_mode||'stdin'}')">Build PoC</button>`
-          + ` <button class="btn sm" title="Assess L2 exploitation primitive (instruction-pointer control)" onclick="doPrimitive('${DETAIL_TID}','${r.input_sha}','${r.input_mode||'stdin'}')">L2</button>` : "";
+          + ` <button class="btn sm" title="Assess L2 exploitation primitive (instruction-pointer control)" onclick="doPrimitive('${DETAIL_TID}','${r.input_sha}','${r.input_mode||'stdin'}')">L2</button>`
+          + ` <button class="btn sm" title="Debugger root-cause analysis (fault classification + slice)" onclick="doRootCause('${DETAIL_TID}','${r.input_sha}','${r.input_mode||'stdin'}')">Root Cause</button>` : "";
       return `${st} <span style="color:var(--faint)">${esc(r.isolation||'')} ${r.duration_ms||0}ms ${esc(r.note||'')}</span>${poc}`;
     }).join("<br>")+`</div>`;
 }
@@ -471,6 +478,11 @@ function openWS(id){
     if(e.type==="fuzz.done" && DETAIL_TID){
       const st=document.getElementById("fuzzstat"); if(st&&e.payload) st.textContent=`done: ${e.payload.execs} execs · ${e.payload.unique} unique`;
       loadDyn(DETAIL_TID); loadFindings(DETAIL_TID);
+    }
+    if(e.type==="rootcause.done" && DETAIL_TID){
+      const st=document.getElementById("fuzzstat");
+      if(st&&e.payload) st.textContent = e.payload.summary ? ("root cause: "+e.payload.summary).slice(0,90) : (e.payload.note||"no fault reproduced");
+      loadFindings(DETAIL_TID);
     }
     if(e.type==="primitive.done" && DETAIL_TID){
       const st=document.getElementById("fuzzstat");

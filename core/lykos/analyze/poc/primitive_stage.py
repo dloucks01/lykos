@@ -4,62 +4,18 @@ builds an L2 PoC bundle and promotes the finding. Native-architecture targets on
 (qemu) targets are reported as unsupported rather than failing."""
 from __future__ import annotations
 
-import json
 import shutil
-import tempfile
-from pathlib import Path
 
 from ...db.dao import FindingDAO, PocDAO, TargetDAO
 from ...jobs.registry import register_stage
 from ..dynamic import sandbox
 from ..dynamic.stage import crash_finding_candidate
 from . import bundle, primitive
+from .capture import make_capture, materialize_helper
 
 PRIMITIVE_STAGE = "poc_primitive"
 TOOL = "primitive"
 TOOL_VERSION = "primitive-1"
-_HELPER = "ptrace_capture.py"
-
-
-def _materialize_helper() -> Path:
-    d = Path(tempfile.mkdtemp(prefix="lykos-ptrace-"))
-    try:
-        from importlib import resources
-        data = (resources.files("lykos.analyze.poc") / _HELPER).read_bytes()
-    except Exception:
-        data = (Path(__file__).parent / _HELPER).read_bytes()
-    p = d / _HELPER
-    p.write_bytes(data)
-    return p
-
-
-def _make_capture(ctx, helper, exe, mode, base_argv, timeout, python):
-    work = helper.parent
-
-    def capture(data: bytes) -> dict:
-        stdin_file = None
-        argv = list(base_argv)
-        if mode == "stdin":
-            stdin_file = str(work / "stdin.bin")
-            (work / "stdin.bin").write_bytes(data)
-        elif mode == "arg":
-            argv = argv + [data.decode("latin-1")]
-        elif mode == "file":
-            (work / "input.bin").write_bytes(data)
-            argv = argv + [str(work / "input.bin")]
-        spec = {"exe": str(exe), "argv": argv, "stdin_file": stdin_file,
-                "timeout": timeout}
-        spec_path = work / "spec.json"
-        spec_path.write_text(json.dumps(spec))
-        proc = ctx.run_subprocess([python, str(helper), str(spec_path)],
-                                  timeout=timeout + 30)
-        out = (proc.stdout or b"").decode("latin-1", "ignore").strip()
-        try:
-            return json.loads(out) if out else {"ok": False, "reason": "no output"}
-        except json.JSONDecodeError:
-            return {"ok": False, "reason": "bad helper output: " + out[:200]}
-
-    return capture
 
 
 def primitive_stage(ctx) -> dict:
@@ -90,9 +46,10 @@ def primitive_stage(ctx) -> dict:
     exe.chmod(0o755)
 
     length = min(max(len(orig) * 2, 256), 4096)
-    helper = _materialize_helper()
+    helper = materialize_helper()
     try:
-        capture = _make_capture(ctx, helper, exe, mode, base_argv, timeout, sys.executable)
+        capture = make_capture(ctx, helper, exe, mode, base_argv, timeout,
+                               sys.executable)
 
         ctx.progress(msg=f"detonating {length}-byte cyclic pattern under ptrace")
         cap0 = capture(primitive.cyclic(length))
