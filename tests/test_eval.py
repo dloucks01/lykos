@@ -124,6 +124,64 @@ def test_release_gate_pass_fail_skip():
     assert gate(regressed, {"ghidra": "/x"}, min_recall=0.5)[0] is True
 
 
+def _report(recall, fp_rate, *, ghidra="/x"):
+    return Report(outcomes=[], meta={"ghidra": ghidra, "max_execs": 2500}, metrics={
+        "n_cases": 4, "n_cwe_classes": 2,
+        "overall": {"tp": 2, "fp": 0, "fn": 0, "tn": 2, "recall": recall,
+                    "precision": 1.0, "f1": 1.0, "fp_rate": fp_rate}})
+
+
+def test_history_record_load_and_series(tmp_path):
+    from lykos.eval import history
+    h = tmp_path / "hist.jsonl"
+    history.record(h, _report(1.0, 0.0), stage="static", min_state="candidate", ts=100)
+    history.record(h, _report(1.0, 0.0), stage="dynamic", ts=101)
+    history.record(h, _report(0.5, 0.0), stage="static", min_state="candidate", ts=102)
+    hist = history.load(h)
+    assert len(hist) == 3
+    ser = history.series(hist)
+    assert set(ser) == {"static/candidate", "dynamic"}
+    # series are ordered by timestamp
+    assert [r["ts"] for r in ser["static/candidate"]] == [100, 102]
+    assert history.load(tmp_path / "nope.jsonl") == []      # missing file -> []
+
+
+def test_history_detects_recall_and_fp_regressions(tmp_path):
+    from lykos.eval import history
+    h = tmp_path / "hist.jsonl"
+    history.record(h, _report(1.0, 0.0), stage="static", min_state="candidate", ts=1)
+    history.record(h, _report(0.7, 0.0), stage="static", min_state="candidate", ts=2)  # recall drop
+    history.record(h, _report(1.0, 0.0), stage="dynamic", ts=1)
+    history.record(h, _report(1.0, 0.5), stage="dynamic", ts=2)                         # fp rise
+    regs = {r["series"]: r for r in history.regressions(h and history.load(h))}
+    assert set(regs) == {"static/candidate", "dynamic"}
+    assert regs["static/candidate"]["recall_delta"] == -0.3
+    assert regs["dynamic"]["fp_rate_delta"] == 0.5
+    # a single run per series cannot regress; a stable series doesn't flag
+    stable = [_recj(1.0, 0.0, "static", 1), _recj(1.0, 0.0, "static", 2)]
+    assert history.regressions(stable) == []
+
+
+def _recj(recall, fp, stage, ts):
+    return {"ts": ts, "stage": stage, "min_state": None, "git": "abc",
+            "overall": {"recall": recall, "fp_rate": fp}}
+
+
+def test_dashboard_renders_text_and_offline_html(tmp_path):
+    from lykos.eval import dashboard, history
+    h = tmp_path / "hist.jsonl"
+    for ts, rec in ((1, 1.0), (2, 1.0), (3, 0.6)):        # last run regresses
+        history.record(h, _report(rec, 0.0), stage="static", min_state="candidate", ts=ts)
+    hist = history.load(h)
+    txt = dashboard.render_text(hist)
+    assert "static/candidate" in txt and "REGRESSION" in txt.upper()
+    html = dashboard.render_html(hist)
+    assert html.startswith("<!doctype html>") and "</html>" in html
+    assert "regression" in html.lower() and "<svg" in html        # sparkline present
+    assert "http://" not in html.split("</style>")[0]             # no external assets in CSS
+    assert dashboard.render_text([]).startswith("no benchmark history")
+
+
 def test_report_table_and_dict_roundtrip():
     outs = _outs([("CWE-120", "bad", True), ("CWE-120", "good", False)])
     rep = Report(outcomes=outs, metrics=score(outs), meta={"ghidra": None})

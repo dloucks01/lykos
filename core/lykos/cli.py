@@ -85,8 +85,37 @@ def build_parser() -> argparse.ArgumentParser:
                     help="release gate: fail if the FP-rate exceeds this (default 0.0)")
     ev.add_argument("--require-backend", action="store_true",
                     help="fail (not skip) when the static backend (Ghidra) is absent")
+    ev.add_argument("--record", action="store_true",
+                    help="append this run's metrics to the history (for the dashboard)")
+    ev.add_argument("--history", default=None,
+                    help="history file for --record (default: eval-history.jsonl)")
+    ev.add_argument("--label", default=None, help="optional label for the recorded run")
     ev.set_defaults(func=_cmd_eval)
+
+    db2 = sub.add_parser("dashboard", help="render the detection-quality regression dashboard")
+    db2.add_argument("--history", default=None,
+                     help="history file to read (default: eval-history.jsonl)")
+    db2.add_argument("--html", default=None, help="write a self-contained HTML dashboard here")
+    db2.add_argument("--fail-on-regression", action="store_true",
+                     help="exit non-zero if the latest run regressed in any series")
+    db2.set_defaults(func=_cmd_dashboard)
     return p
+
+
+def _cmd_dashboard(args: argparse.Namespace) -> int:
+    from .eval import dashboard as dashmod
+    from .eval import history as histmod
+    path = args.history or histmod.DEFAULT_PATH
+    hist = histmod.load(path)
+    print(dashmod.render_text(hist))
+    if args.html:
+        Path(args.html).write_text(dashmod.render_html(hist))
+        print(f"\nHTML dashboard written to {args.html}", file=sys.stderr)
+    regs = histmod.regressions(hist)
+    if args.fail_on_regression and regs:
+        print(f"\nREGRESSION: {len(regs)} series regressed", file=sys.stderr)
+        return 1
+    return 0
 
 
 def _cmd_eval(args: argparse.Namespace) -> int:
@@ -118,6 +147,12 @@ def _cmd_eval(args: argparse.Namespace) -> int:
     if args.out:
         Path(args.out).write_text(json.dumps(rep.to_dict(), indent=2))
         print(f"report written to {args.out}")
+    if args.record:
+        from .eval import history as histmod
+        path = args.history or histmod.DEFAULT_PATH
+        min_state = args.min_state if args.stage == "static" else None
+        histmod.record(path, rep, stage=args.stage, min_state=min_state, label=args.label)
+        print(f"recorded to {path}", file=sys.stderr)
     # release gate: PASS / FAIL / SKIP (SKIP when the static backend is absent)
     from .eval.metrics import gate
     passed, verdict, reason = gate(rep.metrics, rep.meta, stage=args.stage,
