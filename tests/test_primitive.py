@@ -344,3 +344,21 @@ def test_offset_recovery_is_endianness_aware():
     # and marker_confirmed compares the PC as an integer (order-independent once parsed)
     assert P.marker_confirmed({"pc": P.MARKER32, "stack": "", "stack_base": 0, "sp": 0},
                               word=4, endian="big")
+
+
+def test_ip_control_via_link_register_and_masked_pc():
+    """PPC/ARM link-register ABIs: the controlled return address is in LR, and the fetched PC
+    is LR with low bits masked by aligned fetch, so recovery/confirm must use the RA register."""
+    L = 512
+    off = 156
+    lr = int.from_bytes(P.cyclic(L)[off:off + 4], "big")     # BE PPC lr = input at offset 156
+    masked_pc = lr & ~0b11                                    # PPC clears low 2 bits on fetch
+    cap = {"pc": masked_pc, "sp": 0x40000000, "stack_base": 0, "stack": "",
+           "regs": {"lr": lr, "r1": 0x40000000}}
+    # pc search misses (masked), but the lr register yields the exact offset
+    assert P.recover_ip_offset(cap, L, endian="big", word=4) == (off, "lr")
+    # confirmation: lr == marker, and an alignment-masked pc also counts
+    assert P.marker_confirmed({"regs": {"lr": P.MARKER32}, "stack": "", "stack_base": 0,
+                               "sp": 0}, word=4, endian="big")
+    assert P.marker_confirmed({"pc": P.MARKER32 & ~0b11, "regs": {}, "stack": "",
+                               "stack_base": 0, "sp": 0}, word=4, endian="big")

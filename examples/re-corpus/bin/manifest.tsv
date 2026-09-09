@@ -26,3 +26,4 @@ busybox_x86-64	x86-64	ELF	C	1131168	busybox real-world static stripped
 vuln_aarch64	aarch64	ELF	C	110576	O0 static-pie stack-overflow (musl cross)
 vuln_mipsel	mipsel	ELF	C	82412	O0 static-pie stack-overflow (musl cross, LE MIPS32)
 vuln_mips_be	mips	ELF	C	82380	O0 static-pie stack-overflow (musl cross, BE MIPS32)
+vuln_ppc	ppc	ELF	C	98212	O0 static-pie stack-overflow (musl cross, BE PPC32, link-register ABI)
