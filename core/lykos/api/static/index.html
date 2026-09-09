@@ -1,0 +1,498 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lykos Console</title>
+<style>
+:root{
+  --bg:#0c1113;--surface:#121a1d;--surface-2:#172227;--surface-3:#1d2a30;
+  --border:#25353b;--border-strong:#33474e;--text:#e7eef0;--dim:#9db0b7;--faint:#66787f;
+  --accent:#e8ab4e;--teal:#46cabb;--ok:#57c88c;--warn:#e0b54f;--danger:#e4605f;--info:#5ea3e6;
+  --mono:ui-monospace,"Cascadia Code","JetBrains Mono",Menlo,Consolas,monospace;
+  --sans:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+}
+:root[data-theme="light"]{
+  --bg:#eef1f1;--surface:#fff;--surface-2:#f5f7f7;--surface-3:#eaeeef;
+  --border:#d3dadb;--border-strong:#bcc6c7;--text:#12191c;--dim:#4d5c61;--faint:#79888d;
+  --accent:#b5771a;--teal:#0f7d74;--ok:#2f8f5f;--warn:#c08a1f;--danger:#c23434;--info:#2f74c0;
+}
+*{box-sizing:border-box}
+body{margin:0;height:100vh;overflow:hidden;background:var(--bg);color:var(--text);
+  font-family:var(--sans);font-size:13.5px;display:grid;grid-template-rows:auto 1fr}
+.mono{font-family:var(--mono);font-variant-numeric:tabular-nums}
+.eyebrow{font-family:var(--sans);text-transform:uppercase;letter-spacing:.09em;font-size:10.5px;
+  font-weight:700;color:var(--faint)}
+button{font-family:var(--sans);cursor:pointer}
+.btn{font-size:12px;font-weight:600;border-radius:6px;padding:6px 12px;border:1px solid var(--border-strong);
+  background:var(--surface-2);color:var(--text)}
+.btn:hover{border-color:var(--accent)}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:#1a1205}
+.btn.sm{padding:4px 9px;font-size:11px}
+
+/* top bar */
+.top{display:flex;align-items:center;gap:16px;height:50px;padding:0 16px;background:var(--surface);
+  border-bottom:1px solid var(--border);box-shadow:inset 0 2px 0 var(--accent)}
+.logo{font-weight:800;letter-spacing:.03em;font-size:17px}
+.logo b{color:var(--accent)}
+.chip{display:inline-flex;align-items:center;gap:6px;font-family:var(--mono);font-size:10.5px;
+  background:var(--surface-2);border:1px solid var(--border);border-radius:20px;padding:3px 9px;color:var(--dim)}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--ok)}
+.spacer{flex:1}
+
+/* body */
+.body{display:grid;grid-template-columns:230px 1fr;min-height:0}
+.rail{background:var(--surface);border-right:1px solid var(--border);padding:12px 10px;overflow-y:auto;
+  display:flex;flex-direction:column;gap:6px}
+.railhead{display:flex;align-items:center;justify-content:space-between;padding:4px 6px 8px}
+.caseitem{padding:9px 10px;border-radius:6px;cursor:pointer;border:1px solid transparent;color:var(--dim)}
+.caseitem:hover{background:var(--surface-2);color:var(--text)}
+.caseitem.active{background:var(--surface-2);color:var(--text);border-color:var(--border);
+  box-shadow:inset 2px 0 0 var(--accent)}
+.caseitem .cn{font-weight:600;font-size:13px}
+.caseitem .cid{font-family:var(--mono);font-size:9.5px;color:var(--faint)}
+
+.main{overflow-y:auto;padding:18px 22px 40px;min-height:0}
+.mainhead{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;margin-bottom:16px}
+.mainhead h1{margin:0;font-size:19px}
+.mainhead .sub{color:var(--dim);font-size:12px;margin-top:2px}
+.uploader{display:flex;gap:8px;align-items:center}
+.grid{display:grid;grid-template-columns:1.6fr 1fr;gap:14px;align-items:start}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:14px 15px;margin-bottom:14px}
+.cardhead{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}
+
+table{width:100%;border-collapse:collapse;font-size:12px}
+th{text-align:left;text-transform:uppercase;letter-spacing:.05em;font-size:10px;color:var(--faint);
+  font-weight:700;padding:6px 8px;border-bottom:1px solid var(--border)}
+td{padding:7px 8px;border-bottom:1px solid var(--border)}
+tr:last-child td{border-bottom:none}
+tbody tr{cursor:pointer}
+tbody tr:hover{background:var(--surface-2)}
+.arch{font-family:var(--mono);font-size:10px;color:var(--teal);border:1px solid color-mix(in srgb,var(--teal) 40%,var(--border));border-radius:4px;padding:1px 6px}
+.mit{font-family:var(--mono);font-size:9.5px;border-radius:4px;padding:1px 5px;margin-right:3px;border:1px solid}
+.mit.on{color:var(--ok);border-color:color-mix(in srgb,var(--ok) 45%,transparent)}
+.mit.off{color:var(--danger);border-color:color-mix(in srgb,var(--danger) 45%,transparent)}
+.mit.partial{color:var(--warn);border-color:color-mix(in srgb,var(--warn) 45%,transparent)}
+.mit.unknown{color:var(--faint);border-color:var(--border)}
+.pill{font-family:var(--sans);text-transform:uppercase;letter-spacing:.05em;font-size:10px;font-weight:700;
+  border-radius:20px;padding:2px 9px;border:1px solid}
+.pill.queued{color:var(--info);border-color:color-mix(in srgb,var(--info) 45%,transparent)}
+.pill.running{color:var(--accent);border-color:color-mix(in srgb,var(--accent) 45%,transparent)}
+.pill.done{color:var(--ok);border-color:color-mix(in srgb,var(--ok) 45%,transparent)}
+.pill.error{color:var(--danger);border-color:color-mix(in srgb,var(--danger) 45%,transparent)}
+.pill.cancelled{color:var(--faint);border-color:var(--border)}
+
+.log{font-family:var(--mono);font-size:11px;height:280px;overflow-y:auto;display:flex;flex-direction:column;gap:2px}
+.logline{color:var(--dim);white-space:pre-wrap;word-break:break-word}
+.logline .t{color:var(--teal)}
+.kv{display:flex;justify-content:space-between;padding:4px 0;border-bottom:1px dotted var(--border);font-size:12px}
+.kv span{color:var(--dim)} .kv b{font-family:var(--mono)}
+.empty{color:var(--faint);font-size:13px;padding:40px;text-align:center}
+.sec{font-family:var(--mono);font-size:10.5px}
+</style>
+</head>
+<body>
+<div class="top">
+  <span class="logo"><b>LYKOS</b></span>
+  <span class="chip"><span class="dot"></span>air-gapped</span>
+  <span class="spacer"></span>
+  <button class="btn sm" id="theme">theme</button>
+</div>
+<div class="body">
+  <aside class="rail">
+    <div class="railhead"><span class="eyebrow">Cases</span><button class="btn sm" id="newcase">+ New</button></div>
+    <div id="cases"></div>
+  </aside>
+  <main class="main" id="main">
+    <div class="empty">Select or create a case to begin.</div>
+  </main>
+</div>
+
+<script>
+const api = async (path, opts={}) => {
+  const r = await fetch(path, opts);
+  const ct = r.headers.get("content-type")||"";
+  return ct.includes("json") ? r.json() : r.text();
+};
+let CUR = null;      // current case id
+let WS = null;
+let RUNS = [];       // latest runs for the case
+let POLL = null;
+let DETAIL_TID = null;  // target open in the detail panel
+
+// ---- theme ----
+try{const t=localStorage.getItem("theme"); if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}
+document.getElementById("theme").onclick = ()=>{
+  const cur=document.documentElement.getAttribute("data-theme");
+  const next = cur==="light" ? "dark" : "light";
+  document.documentElement.setAttribute("data-theme",next);
+  try{localStorage.setItem("theme",next);}catch(e){}
+};
+
+// ---- cases ----
+async function loadCases(){
+  const cases = await api("/cases");
+  const el = document.getElementById("cases");
+  el.innerHTML = "";
+  cases.forEach(c=>{
+    const d=document.createElement("div");
+    d.className="caseitem"+(c.id===CUR?" active":"");
+    d.innerHTML=`<div class="cn">${esc(c.name)}</div><div class="cid">${c.id.slice(0,12)}</div>`;
+    d.onclick=()=>selectCase(c.id, c.name);
+    el.appendChild(d);
+  });
+}
+document.getElementById("newcase").onclick = async ()=>{
+  const name = prompt("Case name:", "engagement-"+new Date().toISOString().slice(0,10));
+  if(!name) return;
+  const c = await api("/cases",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name})});
+  await loadCases(); selectCase(c.id, c.name);
+};
+
+// ---- case view ----
+async function selectCase(id, name){
+  CUR=id; await loadCases();
+  document.getElementById("main").innerHTML = view(name||id);
+  document.getElementById("file").onchange = onUpload;
+  openWS(id);
+  await refresh();
+  if(POLL) clearInterval(POLL);
+  POLL = setInterval(refresh, 2000);
+}
+function view(name){ return `
+  <div class="mainhead">
+    <div><h1>${esc(name)}</h1><div class="sub mono" id="casesub"></div></div>
+    <div class="uploader">
+      <input type="file" id="file" style="display:none">
+      <button class="btn" onclick="document.getElementById('file').click()">Choose binary</button>
+      <span id="fname" class="mono" style="color:var(--faint);font-size:11px"></span>
+      <button class="btn primary" id="analyze" disabled>Analyze</button>
+    </div>
+  </div>
+  <div class="grid">
+    <div>
+      <div class="card"><div class="cardhead"><span class="eyebrow">Targets</span><span class="mono" id="tcount" style="color:var(--faint)"></span></div>
+        <div id="targets"></div></div>
+      <div class="card" id="detailcard" hidden><div class="cardhead"><span class="eyebrow">Triage detail</span></div><div id="detail"></div></div>
+    </div>
+    <div>
+      <div class="card"><div class="cardhead"><span class="eyebrow">Runs</span></div><div id="runs"></div></div>
+      <div class="card"><div class="cardhead"><span class="eyebrow">Live events</span></div><div class="log" id="log"></div></div>
+    </div>
+  </div>`;
+}
+
+let PENDING=null;
+function onUpload(e){
+  PENDING = e.target.files[0]||null;
+  document.getElementById("fname").textContent = PENDING?PENDING.name:"";
+  const a=document.getElementById("analyze"); a.disabled=!PENDING; a.onclick=doUpload;
+}
+async function doUpload(){
+  if(!PENDING) return;
+  const fd=new FormData(); fd.append("file", PENDING);
+  logline("ui", "uploading "+PENDING.name);
+  await fetch(`/cases/${CUR}/targets`,{method:"POST",body:fd});
+  PENDING=null; document.getElementById("fname").textContent=""; document.getElementById("analyze").disabled=true;
+  await refresh();
+}
+
+async function refresh(){
+  if(!CUR) return;
+  const [targets, runs] = await Promise.all([api(`/cases/${CUR}/targets`), api(`/cases/${CUR}/runs`)]);
+  RUNS = runs;
+  renderTargets(targets); renderRuns(runs);
+  document.getElementById("casesub").textContent = `${targets.length} targets · ${runs.length} runs`;
+  document.getElementById("tcount").textContent = targets.length;
+}
+
+function renderTargets(ts){
+  const el=document.getElementById("targets");
+  if(!ts.length){ el.innerHTML=`<div class="empty">No targets. Choose a binary and Analyze.</div>`; return; }
+  el.innerHTML = `<table><thead><tr><th>File</th><th>Arch</th><th>Bits</th><th>Mitigations</th><th>Stripped</th></tr></thead><tbody>${
+    ts.map(t=>`<tr data-id="${t.id}"><td class="mono">${esc(t.filename)}</td>
+      <td>${t.arch?`<span class="arch">${t.arch}</span>`:"—"}</td>
+      <td class="mono">${t.bits||"—"}${t.endianness?(" "+t.endianness[0].toUpperCase()+"E"):""}</td>
+      <td>${mits(t.mitigations)}</td>
+      <td class="mono">${t.stripped===true?"yes":t.stripped===false?"no":"—"}</td></tr>`).join("")}</tbody></table>`;
+  el.querySelectorAll("tr[data-id]").forEach(tr=> tr.onclick=()=>showDetail(tr.dataset.id));
+}
+function mits(m){
+  if(!m) return `<span class="mit unknown">?</span>`;
+  return ["nx","pie","relro","canary","fortify"].map(k=>{
+    const v=m[k]||"unknown"; return `<span class="mit ${v}">${k}</span>`;
+  }).join("");
+}
+function renderRuns(rs){
+  const el=document.getElementById("runs");
+  if(!rs.length){ el.innerHTML=`<div class="empty">No runs yet.</div>`; return; }
+  el.innerHTML = rs.slice(0,12).map(r=>`<div class="kv"><span class="mono">${r.stage} · ${r.id.slice(0,8)}</span>
+     <b><span class="pill ${r.status}">${r.status}</span></b></div>`).join("");
+}
+
+async function showDetail(targetId){
+  const run = RUNS.find(r=>r.target_id===targetId && r.stage==="ingest_triage" && r.status==="done");
+  const card=document.getElementById("detailcard"), det=document.getElementById("detail");
+  card.hidden=false;
+  if(!run){ det.innerHTML=`<div class="empty">No completed triage for this target yet.</div>`; return; }
+  const full = await api(`/runs/${run.id}`);
+  const out = (full.outputs||[]).find(o=>o.kind==="triage-json");
+  if(!out){ det.innerHTML=`<div class="empty">No triage artifact.</div>`; return; }
+  const rec = await api(`/artifacts/${out.sha256}`);
+  det.innerHTML = `
+    <div class="kv"><span>detected</span><b>${esc(rec.detected||"—")}</b></div>
+    <div class="kv"><span>linking</span><b>${rec.linking||"—"} ${rec.stripped?"· stripped":""}</b></div>
+    <div class="kv"><span>entry</span><b>${rec.entry_point||"—"}</b></div>
+    <div class="kv"><span>toolchain</span><b>${rec.toolchain_hint}</b></div>
+    <div class="kv"><span>entropy</span><b>${rec.entropy?.overall} ${rec.entropy?.packed_hint?"· packed?":""}</b></div>
+    <div class="kv"><span>imports</span><b>${(rec.imports?.libraries||[]).join(", ")||"—"} (${rec.imports?.functions_count||0} fns)</b></div>
+    <div style="margin-top:8px" class="eyebrow">Mitigations</div><div style="margin:4px 0 8px">${mits(rec.mitigations)}</div>
+    <div class="eyebrow">Sections (${(rec.sections||[]).length})</div>
+    <div class="sec" style="max-height:150px;overflow:auto;margin-top:4px">${
+      (rec.sections||[]).slice(0,40).map(s=>`${(s.name||"").padEnd(18)} ${String(s.size).padStart(8)}  ${s.perms}  H=${s.entropy??"-"}`).join("<br>")}</div>
+    ${rec.parse_errors?.length?`<div style="margin-top:8px;color:var(--warn)" class="mono">parse notes: ${rec.parse_errors.join("; ")}</div>`:""}`;
+  DETAIL_TID = targetId;
+  det.innerHTML += `<div style="margin-top:12px" class="eyebrow">Reverse engineering</div>
+    <div style="margin:6px 0;display:flex;gap:8px;align-items:center">
+      <button class="btn sm" id="deco">Decompile (Ghidra)</button>
+      <button class="btn sm" id="detect">Detect CWEs</button>
+      <span class="mono" style="color:var(--faint);font-size:11px" id="decostat"></span></div>
+    <div id="findings"></div>
+    <div class="eyebrow" style="margin-top:8px">Dynamic (sandbox)</div>
+    <div style="margin:4px 0;display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+      <input id="dyninput" placeholder="input (optional)" style="flex:1;min-width:120px;background:var(--surface-2);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:5px 8px;font-family:var(--mono);font-size:11px">
+      <select id="dynmode" class="btn sm"><option value="stdin">stdin</option><option value="arg">argv</option><option value="file">file</option><option value="none">none</option></select>
+      <button class="btn sm" id="dynrun">Run</button>
+      <button class="btn sm" id="fuzzrun">Fuzz</button>
+      <button class="btn sm" id="covrun" title="Coverage-guided fuzzing (AFL++ qemu-mode)">Coverage Fuzz</button>
+      <button class="btn sm" id="dirrun" title="Directed fuzzing steered at statically-flagged sinks">Directed Fuzz</button>
+      <button class="btn sm" id="concrun" title="Hybrid concolic execution (angr): solve inputs that reach the flagged sinks">Concolic</button>
+      <span class="mono" id="fuzzstat" style="color:var(--faint);font-size:11px"></span>
+    </div>
+    <div id="dynresults"></div>
+    <div id="pocs"></div>
+    <div id="funcs"></div>
+    <pre id="funccode" class="sec" style="max-height:180px;overflow:auto;white-space:pre-wrap;margin-top:6px"></pre>
+    <div id="funccalls" class="sec" style="margin-top:4px"></div>
+    <div class="eyebrow" id="cfglabel" style="margin-top:6px"></div>
+    <pre id="funccfg" class="sec" style="max-height:220px;overflow:auto;white-space:pre-wrap"></pre>
+    <div id="strings" style="margin-top:8px"></div>`;
+  document.getElementById("deco").onclick = ()=>doDecompile(targetId);
+  document.getElementById("detect").onclick = ()=>doDetect(targetId);
+  document.getElementById("dynrun").onclick = ()=>doDynamic(targetId);
+  document.getElementById("fuzzrun").onclick = ()=>doFuzz(targetId);
+  document.getElementById("covrun").onclick = ()=>doCoverage(targetId);
+  document.getElementById("dirrun").onclick = ()=>doDirected(targetId);
+  document.getElementById("concrun").onclick = ()=>doConcolic(targetId);
+  loadFunctions(targetId);
+  loadStrings(targetId);
+  loadFindings(targetId);
+  loadDyn(targetId);
+  loadPocs(targetId);
+}
+async function doPoc(tid, inputSha, mode){
+  await fetch("/runs",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({case_id:CUR,target_id:tid,stage:"build_poc",
+      params:{input_sha:inputSha,input_mode:mode||"stdin"}})});
+}
+async function doPrimitive(tid, inputSha, mode){
+  const st=document.getElementById("fuzzstat"); if(st) st.textContent="assessing L2 primitive…";
+  await fetch("/runs",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({case_id:CUR,target_id:tid,stage:"poc_primitive",
+      params:{input_sha:inputSha,input_mode:mode||"stdin"}})});
+}
+async function loadPocs(tid){
+  const el=document.getElementById("pocs"); if(!el) return;
+  const ps=await api(`/targets/${tid}/pocs`);
+  if(!ps.length){ el.innerHTML=""; return; }
+  el.innerHTML=`<div class="eyebrow" style="margin:6px 0">PoC bundles (${ps.length})</div>`+
+    `<div class="sec" style="max-height:120px;overflow:auto">`+
+    ps.slice(0,20).map(x=>{
+      const ok = x.verified ? `<span style="color:#57c88c">${esc(x.level)} verified ${esc(x.signal||'')}</span>`
+                 : `<span style="color:var(--faint)">${esc(x.level)} unverified</span>`;
+      const dl = x.bundle_sha ? ` <a href="/artifacts/${x.bundle_sha}" download="poc.tar.gz" style="color:var(--teal)">download</a>` : "";
+      return ok+dl;
+    }).join("<br>")+`</div>`;
+}
+async function doDynamic(tid){
+  const raw = document.getElementById("dyninput").value || "";
+  const mode = document.getElementById("dynmode").value;
+  const b64 = raw ? btoa(unescape(encodeURIComponent(raw))) : "";
+  await fetch("/runs",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({case_id:CUR,target_id:tid,stage:"dynamic_run",
+      params:{input_b64:b64,input_mode:mode,timeout:10}})});
+}
+async function doFuzz(tid){
+  const mode = document.getElementById("dynmode").value;
+  const st=document.getElementById("fuzzstat"); if(st) st.textContent="fuzzing…";
+  await fetch("/runs",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({case_id:CUR,target_id:tid,stage:"fuzz",
+      params:{input_mode:(mode==="none"?"stdin":mode),max_execs:5000,max_seconds:30}})});
+}
+async function doCoverage(tid){
+  const mode = document.getElementById("dynmode").value;
+  const st=document.getElementById("fuzzstat"); if(st) st.textContent="AFL++ coverage fuzzing…";
+  const r=await fetch("/runs",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({case_id:CUR,target_id:tid,stage:"coverage_fuzz",
+      params:{input_mode:(mode==="stdin"?"stdin":"file"),max_seconds:30}})});
+  if(!r.ok && st) st.textContent="coverage fuzz failed (AFL++ installed?)";
+}
+async function doDirected(tid){
+  const mode = document.getElementById("dynmode").value;
+  const st=document.getElementById("fuzzstat"); if(st) st.textContent="directed fuzzing…";
+  await fetch("/runs",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({case_id:CUR,target_id:tid,stage:"directed_fuzz",
+      params:{input_mode:(mode==="none"?"stdin":mode),max_execs:6000,max_seconds:30}})});
+}
+async function doConcolic(tid){
+  const mode = document.getElementById("dynmode").value;
+  const st=document.getElementById("fuzzstat"); if(st) st.textContent="concolic (angr)…";
+  const r=await fetch("/runs",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({case_id:CUR,target_id:tid,stage:"concolic",
+      params:{input_mode:(mode==="none"?"stdin":mode),input_size:64,max_seconds:120}})});
+  if(!r.ok && st) st.textContent="concolic failed (angr installed?)";
+}
+async function loadDyn(tid){
+  const el=document.getElementById("dynresults"); if(!el) return;
+  const rs=await api(`/targets/${tid}/dynresults`);
+  if(!rs.length){ el.innerHTML=""; return; }
+  el.innerHTML=`<div class="sec" style="max-height:120px;overflow:auto">`+
+    rs.slice(0,20).map(r=>{
+      const st = r.crashed ? `<span style="color:#e4605f">CRASH ${esc(r.signal||'')}</span>`
+                 : r.timed_out ? `<span style="color:#e0b54f">timeout</span>`
+                 : `<span style="color:#57c88c">exit ${r.exit_code}</span>`;
+      const poc = (r.crashed && r.input_sha)
+        ? ` <button class="btn sm" onclick="doPoc('${DETAIL_TID}','${r.input_sha}','${r.input_mode||'stdin'}')">Build PoC</button>`
+          + ` <button class="btn sm" title="Assess L2 exploitation primitive (instruction-pointer control)" onclick="doPrimitive('${DETAIL_TID}','${r.input_sha}','${r.input_mode||'stdin'}')">L2</button>` : "";
+      return `${st} <span style="color:var(--faint)">${esc(r.isolation||'')} ${r.duration_ms||0}ms ${esc(r.note||'')}</span>${poc}`;
+    }).join("<br>")+`</div>`;
+}
+async function doDetect(tid){
+  await fetch("/runs",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({case_id:CUR,target_id:tid,stage:"detect_cwe"})});
+}
+const SEVCOL={critical:"#e4605f",high:"#e58a4c",medium:"#e0b54f",low:"#46cabb",info:"var(--faint)"};
+async function loadFindings(tid){
+  const el=document.getElementById("findings"); if(!el) return;
+  const fs=await api(`/targets/${tid}/findings`);
+  if(!fs.length){ el.innerHTML=""; return; }
+  el.innerHTML=`<div class="eyebrow" style="margin:6px 0">Findings (${fs.length})</div>`+
+    `<div class="sec" style="max-height:180px;overflow:auto">`+
+    fs.map(f=>{
+      const stCls = f.state==="poc-backed"?"on":(f.state==="confirmed"?"on":(f.state==="corroborated"?"partial":"unknown"));
+      return `<div style="padding:2px 0"><span style="color:${SEVCOL[f.severity]||'var(--faint)'}">${esc(f.cwe||'')}</span> `+
+        `<span class="mit ${stCls}" style="text-transform:uppercase">${esc(f.state)}</span> `+
+        `${esc(f.title||'')} <span style="color:var(--faint)">${esc(f.function_addr||f.site_addr||'')}</span></div>`;
+    }).join("")+`</div>`;
+}
+async function loadStrings(tid){
+  const el=document.getElementById("strings"); if(!el) return;
+  const ss = await api(`/targets/${tid}/strings`);
+  if(!ss.length){ el.innerHTML=""; return; }
+  el.innerHTML = `<div class="eyebrow" style="margin:6px 0">Strings (${ss.length})</div>`+
+    `<div class="sec" style="max-height:150px;overflow:auto">`+
+    ss.slice(0,300).map(s=>`${s.addr}  ${esc((s.value||"").slice(0,80))} <span style="color:var(--faint)">[${(s.xrefs||[]).length} xref]</span>`).join("<br>")+
+    `</div>`;
+}
+async function doDecompile(tid){
+  const st=document.getElementById("decostat"); if(st) st.textContent="queued (Ghidra headless is slow)…";
+  await fetch("/runs",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({case_id:CUR,target_id:tid,stage:"disassemble"})});
+}
+async function loadFunctions(tid){
+  const fns = await api(`/targets/${tid}/functions`);
+  const el=document.getElementById("funcs"); if(!el) return;
+  if(!fns.length){ el.innerHTML=`<div style="color:var(--faint);font-size:11px">No functions yet — run Decompile.</div>`; return; }
+  el.innerHTML = `<div class="eyebrow" style="margin:6px 0">Functions (${fns.length})</div>`+
+    `<div class="sec" style="max-height:180px;overflow:auto">`+
+    fns.map(f=>`<div class="frow" data-id="${f.id}" style="cursor:pointer;padding:2px 0">${f.addr}  ${esc(f.name||"")} <span style="color:var(--faint)">(${f.size||0})</span></div>`).join("")+
+    `</div>`;
+  el.querySelectorAll(".frow").forEach(d=> d.onclick=()=>showFunc(d.dataset.id));
+}
+async function showFunc(fid){
+  const f=await api(`/functions/${fid}`);
+  document.getElementById("funccode").textContent = f.decompiled || "(no decompilation)";
+  const blocks = (f.ir && f.ir.blocks) ? f.ir.blocks : [];
+  document.getElementById("cfglabel").textContent =
+    blocks.length ? `CFG · ${f.blocks||blocks.length} blocks · ${f.edges||0} edges · P-Code` : "";
+  document.getElementById("funccfg").textContent = renderCFG(blocks);
+  const callees = f.callees||[];
+  const el = document.getElementById("funccalls");
+  el.innerHTML = callees.length
+    ? `<span class="eyebrow">Calls</span> `+callees.map(c=>{
+        const danger = c.external ? ' style="color:var(--warn)"' : '';
+        return `<span${danger}>${esc(c.dst_name||c.dst_addr)}</span>`;
+      }).join(", ")
+    : "";
+}
+function renderCFG(blocks){
+  return blocks.map(b=>{
+    const succ = (b.succ&&b.succ.length) ? "   -> "+b.succ.join(", ") : "";
+    const insns = (b.instructions||[]).map(i=>{
+      const pc = (i.pcode||[]).map(p=>"          "+p).join("\n");
+      return "  "+i.addr+"  "+esc(i.text)+(pc?"\n"+pc:"");
+    }).join("\n");
+    return `[block ${b.addr}]${succ}\n${insns}`;
+  }).join("\n\n");
+}
+
+// ---- events ----
+function openWS(id){
+  if(WS){ try{WS.close();}catch(e){} }
+  document.getElementById("log").innerHTML="";
+  WS = new WebSocket(`ws://${location.host}/events?case_id=${id}`);
+  WS.onmessage = ev=>{
+    let e; try{e=JSON.parse(ev.data);}catch(_){return;}
+    logline(e.type, e.run_id?e.run_id.slice(0,8):"", e.payload);
+    if(["job.done","job.error","triage.done","job.cachehit","job.started"].includes(e.type)) refresh();
+    if(e.type==="re.done" && DETAIL_TID){
+      loadFunctions(DETAIL_TID);
+      const ds=document.getElementById("decostat"); if(ds) ds.textContent="done: "+((e.payload&&e.payload.functions)||0)+" functions";
+    }
+    if(e.type==="findings.done" && DETAIL_TID){ loadFindings(DETAIL_TID); }
+    if(e.type==="dynamic.done" && DETAIL_TID){ loadDyn(DETAIL_TID); loadFindings(DETAIL_TID); }
+    if(e.type==="fuzz.progress"){ const st=document.getElementById("fuzzstat"); if(st&&e.payload) st.textContent=`${e.payload.execs} execs · ${e.payload.crashes} crashes`; }
+    if(e.type==="coverage.harvest"){ const st=document.getElementById("fuzzstat"); if(st&&e.payload) st.textContent=`AFL++: ${e.payload.crash_inputs} crash inputs`; }
+    if(e.type==="directed.start"){ const st=document.getElementById("fuzzstat"); if(st&&e.payload) st.textContent = e.payload.directed ? `directed → ${e.payload.top_target} (${e.payload.dictionary} toks)` : "directed: no static targets"; }
+    if(e.type==="concolic.start"){ const st=document.getElementById("fuzzstat"); if(st&&e.payload) st.textContent=`concolic → ${e.payload.targets.length} target(s), ${e.payload.seeds} seeds`; }
+    if(e.type==="concolic.explored"){ const st=document.getElementById("fuzzstat"); if(st&&e.payload) st.textContent=`concolic reached ${e.payload.reached.length}, ${e.payload.generated} inputs`; }
+    if(e.type==="concolic.done" && DETAIL_TID){
+      const st=document.getElementById("fuzzstat"); if(st&&e.payload) st.textContent=`concolic done: ${e.payload.confirmed} crashes · ${e.payload.corroborated} corroborated · ${e.payload.new_seeds} seeds`;
+      loadDyn(DETAIL_TID); loadFindings(DETAIL_TID);
+    }
+    if(e.type==="directed.done" && DETAIL_TID){
+      const st=document.getElementById("fuzzstat"); if(st&&e.payload) st.textContent=`directed done: ${e.payload.execs} execs · ${e.payload.unique} unique`;
+      loadDyn(DETAIL_TID); loadFindings(DETAIL_TID);
+    }
+    if(e.type==="coverage.done" && DETAIL_TID){
+      const st=document.getElementById("fuzzstat"); if(st&&e.payload) st.textContent=`AFL++ done: ${e.payload.confirmed} confirmed · ${e.payload.unique} unique`;
+      loadDyn(DETAIL_TID); loadFindings(DETAIL_TID);
+    }
+    if(e.type==="fuzz.done" && DETAIL_TID){
+      const st=document.getElementById("fuzzstat"); if(st&&e.payload) st.textContent=`done: ${e.payload.execs} execs · ${e.payload.unique} unique`;
+      loadDyn(DETAIL_TID); loadFindings(DETAIL_TID);
+    }
+    if(e.type==="primitive.done" && DETAIL_TID){
+      const st=document.getElementById("fuzzstat");
+      if(st&&e.payload){ st.textContent = e.payload.confirmed
+        ? `L2 CONFIRMED: IP control @ offset ${e.payload.offset}`
+        : (e.payload.primitive ? `L2: ${e.payload.primitive}` : (e.payload.note||"no L2 primitive")); }
+      loadPocs(DETAIL_TID); loadFindings(DETAIL_TID);
+    }
+    if(e.type==="poc.done" && DETAIL_TID){ loadPocs(DETAIL_TID); loadFindings(DETAIL_TID); }
+  };
+  WS.onclose = ()=> logline("ws","","disconnected");
+}
+function logline(type, run="", payload=""){
+  const el=document.getElementById("log"); if(!el) return;
+  const p = payload && typeof payload==="object" ? JSON.stringify(payload) : (payload||"");
+  const d=document.createElement("div"); d.className="logline";
+  d.innerHTML = `<span class="t">${esc(type)}</span> ${run?`<span style="color:var(--faint)">${run}</span> `:""}${esc(p)}`;
+  el.appendChild(d); el.scrollTop=el.scrollHeight;
+}
+function esc(s){ return String(s==null?"":s).replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c])); }
+
+loadCases();
+</script>
+</body>
+</html>

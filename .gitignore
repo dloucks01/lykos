@@ -1,0 +1,6 @@
+dist/
+.cases/
+.ruff_cache/
+__pycache__/
+*.pyc
+*.pyz

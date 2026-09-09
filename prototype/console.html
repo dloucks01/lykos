@@ -1,0 +1,966 @@
+<title>Lykos Console</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans+Condensed:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap">
+<style>
+/* ============ TOKENS ============ */
+:root{
+  /* light "daylight" variant */
+  --bg:#eef1f1; --surface:#ffffff; --surface-2:#f5f7f7; --surface-3:#eaeeef;
+  --border:#d3dadb; --border-strong:#bcc6c7;
+  --text:#12191c; --text-dim:#4d5c61; --text-faint:#79888d;
+  --accent:#b5771a;          /* tungsten amber (darkened for light) */
+  --accent-soft:#f3e6cf;
+  --teal:#0f7d74;            /* signal teal */
+  --teal-soft:#d5ebe8;
+  --sev-info:#2f74c0; --sev-low:#2f8f63; --sev-med:#c08a1f; --sev-high:#c25f22; --sev-crit:#c23434;
+  --ok:#2f8f5f; --warn:#c08a1f; --danger:#c23434;
+  --grid:rgba(18,25,28,.07);
+  --shadow:0 1px 2px rgba(18,25,28,.08),0 8px 24px rgba(18,25,28,.06);
+  --mono:"IBM Plex Mono",ui-monospace,Menlo,Consolas,monospace;
+  --sans:"IBM Plex Sans",system-ui,sans-serif;
+  --cond:"IBM Plex Sans Condensed",var(--sans);
+  --r:6px; --r-lg:10px;
+}
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme="light"]){
+    --bg:#0c1113; --surface:#121a1d; --surface-2:#172227; --surface-3:#1d2a30;
+    --border:#25353b; --border-strong:#33474e;
+    --text:#e7eef0; --text-dim:#9db0b7; --text-faint:#66787f;
+    --accent:#e8ab4e; --accent-soft:#2a2416;
+    --teal:#46cabb; --teal-soft:#132a29;
+    --sev-info:#5ea3e6; --sev-low:#5cc08c; --sev-med:#e0b54f; --sev-high:#e58a4c; --sev-crit:#e4605f;
+    --ok:#57c88c; --warn:#e0b54f; --danger:#e4605f;
+    --grid:rgba(231,238,240,.06);
+    --shadow:0 1px 2px rgba(0,0,0,.4),0 10px 30px rgba(0,0,0,.35);
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#0c1113; --surface:#121a1d; --surface-2:#172227; --surface-3:#1d2a30;
+  --border:#25353b; --border-strong:#33474e;
+  --text:#e7eef0; --text-dim:#9db0b7; --text-faint:#66787f;
+  --accent:#e8ab4e; --accent-soft:#2a2416;
+  --teal:#46cabb; --teal-soft:#132a29;
+  --sev-info:#5ea3e6; --sev-low:#5cc08c; --sev-med:#e0b54f; --sev-high:#e58a4c; --sev-crit:#e4605f;
+  --ok:#57c88c; --warn:#e0b54f; --danger:#e4605f;
+  --grid:rgba(231,238,240,.06);
+  --shadow:0 1px 2px rgba(0,0,0,.4),0 10px 30px rgba(0,0,0,.35);
+}
+
+*{box-sizing:border-box}
+html,body{height:100%}
+body{
+  margin:0;background:var(--bg);color:var(--text);
+  font-family:var(--sans);font-size:13.5px;line-height:1.5;
+  -webkit-font-smoothing:antialiased;
+  overflow:hidden;
+}
+.mono{font-family:var(--mono);font-variant-numeric:tabular-nums}
+.num{font-variant-numeric:tabular-nums}
+.eyebrow{font-family:var(--cond);text-transform:uppercase;letter-spacing:.09em;font-weight:600;font-size:11px;color:var(--text-faint)}
+a{color:inherit}
+:focus-visible{outline:2px solid var(--teal);outline-offset:2px;border-radius:3px}
+
+/* ============ APP SHELL ============ */
+.app{display:grid;grid-template-rows:auto auto 1fr;height:100vh}
+
+/* top bar */
+.topbar{
+  display:flex;align-items:center;gap:18px;padding:0 16px;height:52px;
+  background:var(--surface);border-bottom:1px solid var(--border);
+  box-shadow:inset 0 2px 0 var(--accent);
+}
+.brand{display:flex;align-items:baseline;gap:9px;padding-right:16px;border-right:1px solid var(--border)}
+.brand .logo{font-family:var(--cond);font-weight:700;letter-spacing:.04em;font-size:18px}
+.brand .logo b{color:var(--accent)}
+.brand .ver{font-family:var(--mono);font-size:10.5px;color:var(--text-faint)}
+.case-sel{display:flex;align-items:center;gap:10px;background:var(--surface-2);border:1px solid var(--border);
+  border-radius:var(--r);padding:5px 11px;cursor:pointer}
+.case-sel .cid{font-family:var(--mono);font-size:11px;color:var(--text-dim)}
+.case-sel .cname{font-weight:600;font-size:12.5px}
+.case-sel .sample{font-family:var(--cond);font-size:9.5px;text-transform:uppercase;letter-spacing:.08em;
+  color:var(--teal);border:1px solid var(--teal);border-radius:20px;padding:1px 7px}
+.topbar .spacer{flex:1}
+.chips{display:flex;gap:7px;align-items:center}
+.chip{display:inline-flex;align-items:center;gap:6px;font-family:var(--mono);font-size:10.5px;
+  background:var(--surface-2);border:1px solid var(--border);border-radius:20px;padding:3px 9px;color:var(--text-dim)}
+.chip .dot{width:6px;height:6px;border-radius:50%}
+.chip.age-warn{color:var(--warn);border-color:color-mix(in srgb,var(--warn) 45%,var(--border))}
+.dot.live{background:var(--ok);box-shadow:0 0 0 0 color-mix(in srgb,var(--ok) 80%,transparent);animation:pulse 2.4s infinite}
+@keyframes pulse{0%{box-shadow:0 0 0 0 color-mix(in srgb,var(--ok) 60%,transparent)}70%{box-shadow:0 0 0 6px transparent}100%{box-shadow:0 0 0 0 transparent}}
+@media (prefers-reduced-motion:reduce){.dot.live{animation:none}}
+.meters{display:flex;gap:14px;align-items:center}
+.meter{display:flex;flex-direction:column;gap:3px;min-width:66px}
+.meter .mlab{display:flex;justify-content:space-between;font-family:var(--cond);text-transform:uppercase;
+  letter-spacing:.06em;font-size:9.5px;color:var(--text-faint)}
+.meter .mlab b{font-family:var(--mono);color:var(--text-dim);font-weight:500}
+.bar{height:4px;border-radius:3px;background:var(--surface-3);overflow:hidden}
+.bar>i{display:block;height:100%;border-radius:3px;background:var(--teal)}
+.bar.hot>i{background:var(--accent)}
+.iconbtn{display:grid;place-items:center;width:32px;height:32px;border-radius:var(--r);border:1px solid var(--border);
+  background:var(--surface-2);color:var(--text-dim);cursor:pointer}
+.iconbtn:hover{color:var(--text);border-color:var(--border-strong)}
+
+/* pipeline rail */
+.pipe{display:flex;align-items:stretch;gap:0;background:var(--surface-2);border-bottom:1px solid var(--border);
+  padding:0 12px;overflow-x:auto}
+.pstage{display:flex;align-items:center;gap:8px;padding:8px 14px 8px 12px;position:relative;white-space:nowrap}
+.pstage:not(:last-child)::after{content:"";position:absolute;right:-1px;top:50%;transform:translateY(-50%);
+  width:1px;height:20px;background:var(--border)}
+.pstage .st{width:16px;height:16px;border-radius:50%;display:grid;place-items:center;font-size:9px;color:#000;flex:none}
+.pstage .pn{font-family:var(--cond);text-transform:uppercase;letter-spacing:.05em;font-size:10.5px;color:var(--text-dim)}
+.st.done{background:var(--teal)} .st.run{background:var(--accent)} .st.queue{background:var(--border-strong);color:var(--text)} .st.idle{background:transparent;border:1.5px solid var(--border-strong)}
+.pstage.active .pn{color:var(--text);font-weight:700}
+
+/* body layout */
+.body{display:grid;grid-template-columns:196px 1fr;min-height:0}
+.rail{background:var(--surface);border-right:1px solid var(--border);padding:12px 10px;display:flex;flex-direction:column;gap:3px;overflow-y:auto}
+.rail .rlab{padding:8px 8px 5px;margin-top:6px}
+.navitem{display:flex;align-items:center;gap:11px;padding:8px 10px;border-radius:var(--r);cursor:pointer;color:var(--text-dim);
+  border:1px solid transparent;font-size:13px}
+.navitem svg{width:17px;height:17px;flex:none;stroke:currentColor;fill:none;stroke-width:1.7}
+.navitem:hover{background:var(--surface-2);color:var(--text)}
+.navitem.active{background:var(--surface-2);color:var(--text);border-color:var(--border);font-weight:600}
+.navitem.active svg{stroke:var(--accent)}
+.navitem .badge{margin-left:auto;font-family:var(--mono);font-size:10px;background:var(--surface-3);color:var(--text-dim);
+  border-radius:10px;padding:1px 7px;min-width:20px;text-align:center}
+.navitem .badge.hot{background:color-mix(in srgb,var(--sev-crit) 22%,var(--surface-3));color:var(--sev-crit)}
+
+.main{overflow-y:auto;padding:20px 24px 40px;min-height:0}
+.view{display:flex;flex-direction:column;gap:18px}
+.viewhead{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;flex-wrap:wrap}
+.viewhead h1{margin:0;font-size:20px;font-weight:700;letter-spacing:-.01em;text-wrap:balance}
+.viewhead p{margin:3px 0 0;color:var(--text-dim);font-size:12.5px;max-width:62ch}
+
+/* generic bits */
+.grid{display:grid;gap:14px}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--r-lg);padding:15px 16px}
+.card h3{margin:0 0 12px;font-size:11px}
+.cardhead{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
+.cardhead h3{margin:0}
+.btn{font-family:var(--sans);font-size:12px;font-weight:600;border-radius:var(--r);padding:6px 13px;cursor:pointer;
+  border:1px solid var(--border-strong);background:var(--surface-2);color:var(--text)}
+.btn:hover{border-color:var(--accent)}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:#1a1205}
+.btn.ghost{background:transparent;border-color:var(--border)}
+.btn.sm{padding:4px 9px;font-size:11px}
+
+.tiles{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}
+.tile{background:var(--surface);border:1px solid var(--border);border-radius:var(--r-lg);padding:14px 15px;position:relative;overflow:hidden}
+.tile .tl{font-family:var(--cond);text-transform:uppercase;letter-spacing:.07em;font-size:10.5px;color:var(--text-faint)}
+.tile .tv{font-family:var(--mono);font-size:27px;font-weight:600;letter-spacing:-.02em;margin-top:4px;line-height:1}
+.tile .ts{font-size:11px;color:var(--text-dim);margin-top:5px}
+.tile.accent{border-color:color-mix(in srgb,var(--accent) 40%,var(--border))}
+.tile.accent .tv{color:var(--accent)}
+.tile.crit .tv{color:var(--sev-crit)}
+
+/* severity + state visual language */
+.sev{display:inline-flex;align-items:center;gap:6px;font-family:var(--cond);text-transform:uppercase;letter-spacing:.05em;font-size:10.5px;font-weight:600}
+.sev .sd{width:9px;height:9px;border-radius:2px}
+.sev.info{color:var(--sev-info)} .sev.info .sd{background:var(--sev-info)}
+.sev.low{color:var(--sev-low)} .sev.low .sd{background:var(--sev-low)}
+.sev.med{color:var(--sev-med)} .sev.med .sd{background:var(--sev-med)}
+.sev.high{color:var(--sev-high)} .sev.high .sd{background:var(--sev-high)}
+.sev.crit{color:var(--sev-crit)} .sev.crit .sd{background:var(--sev-crit)}
+.state{font-family:var(--cond);text-transform:uppercase;letter-spacing:.05em;font-size:10px;font-weight:700;
+  border-radius:20px;padding:2px 9px;border:1px solid;white-space:nowrap}
+.state.cand{color:var(--sev-info);border-color:color-mix(in srgb,var(--sev-info) 45%,transparent);background:color-mix(in srgb,var(--sev-info) 12%,transparent)}
+.state.corr{color:var(--teal);border-color:color-mix(in srgb,var(--teal) 45%,transparent);background:color-mix(in srgb,var(--teal) 12%,transparent)}
+.state.conf{color:var(--accent);border-color:color-mix(in srgb,var(--accent) 50%,transparent);background:color-mix(in srgb,var(--accent) 12%,transparent)}
+.state.poc{color:var(--ok);border-color:color-mix(in srgb,var(--ok) 50%,transparent);background:color-mix(in srgb,var(--ok) 14%,transparent)}
+.cwe{font-family:var(--mono);font-size:10.5px;font-weight:600;color:var(--text-dim);background:var(--surface-3);border-radius:4px;padding:1px 6px}
+
+/* tables */
+.tbl{width:100%;border-collapse:collapse;font-size:12px}
+.tbl th{text-align:left;font-family:var(--cond);text-transform:uppercase;letter-spacing:.06em;font-size:10px;
+  color:var(--text-faint);font-weight:600;padding:7px 10px;border-bottom:1px solid var(--border)}
+.tbl td{padding:8px 10px;border-bottom:1px solid var(--border)}
+.tbl tr:last-child td{border-bottom:none}
+.tbl tbody tr:hover{background:var(--surface-2)}
+.tbl td.mono,.tbl th.r{text-align:right}
+.arch{font-family:var(--mono);font-size:10px;color:var(--teal);border:1px solid color-mix(in srgb,var(--teal) 40%,var(--border));border-radius:4px;padding:1px 6px}
+/* coverage support-level + feasibility pills */
+.lv{font-family:var(--mono);font-size:9.5px;font-weight:600;border-radius:4px;padding:1px 6px;border:1px solid;display:inline-block;min-width:44px;text-align:center}
+.lv.full{color:var(--ok);border-color:color-mix(in srgb,var(--ok) 45%,transparent);background:color-mix(in srgb,var(--ok) 12%,transparent)}
+.lv.emu{color:var(--teal);border-color:color-mix(in srgb,var(--teal) 45%,transparent);background:color-mix(in srgb,var(--teal) 12%,transparent)}
+.lv.part{color:var(--sev-med);border-color:color-mix(in srgb,var(--sev-med) 45%,transparent);background:color-mix(in srgb,var(--sev-med) 12%,transparent)}
+.lv.rehost{color:var(--accent);border-color:color-mix(in srgb,var(--accent) 45%,transparent);background:color-mix(in srgb,var(--accent) 12%,transparent)}
+.lv.sleigh{color:var(--sev-high);border-color:color-mix(in srgb,var(--sev-high) 45%,transparent);background:color-mix(in srgb,var(--sev-high) 12%,transparent)}
+.lv.na{color:var(--text-faint);border-color:var(--border)}
+.tierlabel{font-family:var(--cond);text-transform:uppercase;letter-spacing:.06em;font-size:10.5px;font-weight:700;color:var(--accent);padding:12px 10px 4px}
+.feas{font-family:var(--cond);text-transform:uppercase;letter-spacing:.04em;font-size:10px;font-weight:700}
+.feas.hi{color:var(--ok)} .feas.med{color:var(--sev-med)} .feas.low{color:var(--text-faint)} .feas.dyn{color:var(--teal)} .feas.manual{color:var(--sev-high)}
+
+/* two-col */
+.cols{display:grid;gap:14px}
+
+/* findings board */
+.board{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;align-items:start}
+.lane{background:var(--surface-2);border:1px solid var(--border);border-radius:var(--r-lg);padding:11px;display:flex;flex-direction:column;gap:10px}
+.lanehead{display:flex;align-items:center;justify-content:space-between}
+.lanehead .lt{display:flex;align-items:center;gap:8px}
+.lanehead .arrow{color:var(--text-faint)}
+.lanehead .ct{font-family:var(--mono);font-size:11px;color:var(--text-faint)}
+.fcard{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:10px 11px;cursor:pointer;display:flex;flex-direction:column;gap:7px}
+.fcard:hover{border-color:var(--border-strong);box-shadow:var(--shadow)}
+.fcard .ftop{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.fcard .fname{font-weight:600;font-size:12.5px;line-height:1.25}
+.fcard .floc{font-family:var(--mono);font-size:10.5px;color:var(--text-faint)}
+.fcard .fev{display:flex;flex-wrap:wrap;gap:4px}
+.evtag{font-family:var(--mono);font-size:9.5px;color:var(--text-dim);background:var(--surface-3);border-radius:3px;padding:1px 5px}
+.confbar{height:4px;border-radius:3px;background:var(--surface-3);overflow:hidden}
+.confbar>i{display:block;height:100%;background:var(--teal)}
+.fcard.is-poc .confbar>i{background:var(--ok)}
+.fcard.is-conf .confbar>i{background:var(--accent)}
+
+/* RE workspace */
+.re{display:grid;grid-template-columns:210px 1fr 300px;gap:12px;align-items:start}
+.fnlist{background:var(--surface);border:1px solid var(--border);border-radius:var(--r-lg);overflow:hidden;max-height:560px;display:flex;flex-direction:column}
+.fnlist .fh{padding:9px 12px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center}
+.fnlist .scroll{overflow-y:auto}
+.fnrow{padding:7px 12px;display:flex;flex-direction:column;gap:1px;cursor:pointer;border-bottom:1px solid var(--border)}
+.fnrow:hover{background:var(--surface-2)}
+.fnrow.sel{background:var(--surface-2);box-shadow:inset 2px 0 0 var(--accent)}
+.fnrow .fnn{font-family:var(--mono);font-size:11.5px}
+.fnrow .fna{font-family:var(--mono);font-size:9.5px;color:var(--text-faint)}
+.fnrow.recovered .fnn::after{content:"~";color:var(--teal);margin-left:4px}
+.tabs{display:flex;gap:2px;border-bottom:1px solid var(--border);padding:0 8px}
+.tab{padding:8px 12px;font-family:var(--cond);text-transform:uppercase;letter-spacing:.05em;font-size:10.5px;font-weight:600;
+  color:var(--text-faint);cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-1px}
+.tab.active{color:var(--text);border-bottom-color:var(--accent)}
+.pane{background:var(--surface);border:1px solid var(--border);border-radius:var(--r-lg);overflow:hidden}
+.codebox{font-family:var(--mono);font-size:12px;line-height:1.65;padding:12px 14px;overflow-x:auto;white-space:pre}
+.codebox .kw{color:var(--accent)} .codebox .fn{color:var(--teal)} .codebox .cm{color:var(--text-faint)} .codebox .st{color:var(--sev-low)} .codebox .nm{color:var(--sev-info)}
+.codebox .vuln{background:color-mix(in srgb,var(--sev-crit) 18%,transparent);display:inline-block;width:100%}
+.dis{font-family:var(--mono);font-size:11.5px;line-height:1.7;padding:10px 12px;overflow-x:auto}
+.dis .row{display:flex;gap:14px;white-space:pre}
+.dis .a{color:var(--text-faint);width:74px;flex:none} .dis .b{color:var(--teal);width:118px;flex:none} .dis .m{color:var(--text)}
+.dis .row.hot{background:color-mix(in srgb,var(--sev-crit) 14%,transparent);border-radius:3px}
+.aside .card{margin-bottom:12px}
+.sug{display:flex;flex-direction:column;gap:9px}
+.sugrow{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 9px;background:var(--surface-2);border:1px solid var(--border);border-radius:var(--r)}
+.sugrow .sl{font-size:11.5px} .sugrow .sl b{font-family:var(--mono);color:var(--teal)}
+.sugrow .conf{font-family:var(--mono);font-size:10px;color:var(--text-faint)}
+.mini-actions{display:flex;gap:5px}
+.a-ok{border-color:color-mix(in srgb,var(--ok) 50%,var(--border));color:var(--ok)}
+.a-no{color:var(--text-faint)}
+
+/* debugger */
+.dbg{display:grid;grid-template-columns:1fr 300px;gap:12px;align-items:start}
+.regs{display:grid;grid-template-columns:1fr 1fr;gap:2px 20px;font-family:var(--mono);font-size:11.5px}
+.regs .r{display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px dotted var(--border)}
+.regs .r span{color:var(--text-faint)}
+.regs .r.changed b{color:var(--accent)}
+.tierpick{display:flex;gap:6px;flex-wrap:wrap}
+.tier{font-family:var(--mono);font-size:10.5px;border:1px solid var(--border);border-radius:var(--r);padding:5px 9px;cursor:pointer;color:var(--text-dim)}
+.tier.on{border-color:var(--accent);color:var(--accent);background:var(--accent-soft)}
+.logline{font-family:var(--mono);font-size:11px;padding:3px 0;color:var(--text-dim);white-space:pre-wrap}
+.logline .sc{color:var(--teal)}
+
+/* fuzzing */
+.fuzzgrid{display:grid;grid-template-columns:1.4fr 1fr;gap:14px;align-items:start}
+canvas{display:block;width:100%;height:auto}
+.crashfeed{display:flex;flex-direction:column;gap:7px;max-height:270px;overflow-y:auto}
+.crashrow{display:flex;align-items:center;gap:10px;padding:7px 9px;background:var(--surface-2);border:1px solid var(--border);border-radius:var(--r);font-size:11.5px}
+.crashrow .cn{font-family:var(--mono);color:var(--text)}
+.crashrow .ct{font-family:var(--mono);font-size:10px;color:var(--text-faint);margin-left:auto}
+.dupe{font-family:var(--mono);font-size:9.5px;color:var(--text-faint);border:1px solid var(--border);border-radius:10px;padding:0 6px}
+
+/* poc ladder */
+.ladder{display:flex;flex-direction:column;gap:8px}
+.rung{display:flex;align-items:center;gap:12px;padding:10px 12px;border:1px solid var(--border);border-radius:var(--r);background:var(--surface-2)}
+.rung .lvl{font-family:var(--mono);font-weight:600;font-size:12px;width:26px}
+.rung .rl{flex:1}
+.rung .rl .rt{font-weight:600;font-size:12.5px} .rung .rl .rd{font-size:11px;color:var(--text-dim)}
+.rung .rs{font-family:var(--cond);text-transform:uppercase;letter-spacing:.05em;font-size:10px;font-weight:700}
+.rung.done{border-color:color-mix(in srgb,var(--ok) 45%,var(--border))} .rung.done .lvl,.rung.done .rs{color:var(--ok)}
+.rung.prog{border-color:color-mix(in srgb,var(--accent) 45%,var(--border))} .rung.prog .lvl,.rung.prog .rs{color:var(--accent)}
+.rung.todo{opacity:.6} .rung.todo .rs{color:var(--text-faint)}
+.slice{font-family:var(--mono);font-size:11px;line-height:1.7;color:var(--text-dim)}
+.slice b{color:var(--sev-crit)}
+
+/* report */
+.report{background:var(--surface);border:1px solid var(--border);border-radius:var(--r-lg);padding:26px 30px;max-width:760px}
+.report h2{font-size:16px;margin:0 0 4px} .report .sub{color:var(--text-dim);font-size:12px;margin-bottom:18px}
+.report .fblock{border-top:1px solid var(--border);padding:14px 0}
+.report .fblock h4{margin:0 0 6px;font-size:13.5px}
+.report .meta{display:flex;gap:14px;flex-wrap:wrap;font-family:var(--mono);font-size:10.5px;color:var(--text-faint);margin-top:6px}
+
+/* agent */
+.agentlog{display:flex;flex-direction:column;gap:8px;font-family:var(--mono);font-size:11.5px}
+.acall{display:flex;gap:10px;padding:8px 10px;border:1px solid var(--border);border-radius:var(--r);background:var(--surface-2)}
+.acall .at{color:var(--text-faint);flex:none;width:52px}
+.acall .fnn{color:var(--teal)} .acall .res{color:var(--text-dim)}
+.acall.hyp{border-color:color-mix(in srgb,var(--accent) 40%,var(--border))}
+.acall.hyp .fnn{color:var(--accent)}
+
+/* footer */
+.foot{grid-column:1/-1}
+.notebar{display:flex;align-items:center;gap:10px;font-size:11px;color:var(--text-faint);padding:10px 0 0}
+.notebar .k{font-family:var(--cond);text-transform:uppercase;letter-spacing:.06em;color:var(--teal)}
+
+.hint{font-size:11px;color:var(--text-faint)}
+/* system map (multi-binary component graph) */
+.sysmap{width:100%;height:auto;overflow:visible}
+.sysmap .node{fill:var(--surface-2);stroke:var(--border-strong);stroke-width:1.2}
+.sysmap .nlabel{fill:var(--text);font-family:var(--mono);font-size:12px;font-weight:500}
+.sysmap .narch{fill:var(--teal);font-family:var(--mono);font-size:9.5px}
+.sysmap .edge{stroke:var(--text-faint);stroke-width:1.5;fill:none}
+.sysmap .edge.crit{stroke:var(--sev-crit);stroke-width:2}
+.sysmap .edge.ipc{stroke:var(--accent);stroke-dasharray:4 3}
+.sysmap .elabel{fill:var(--text-dim);font-family:var(--cond);font-size:10px;text-transform:uppercase;letter-spacing:.04em}
+.sysmap .elabel.crit{fill:var(--sev-crit);font-weight:700}
+.sysmap .mk{fill:var(--text-faint)}
+.sysmap .src{fill:var(--accent)}
+.maplegend{display:flex;gap:16px;flex-wrap:wrap;font-size:11px;color:var(--text-faint);margin-top:10px}
+.maplegend span{display:inline-flex;align-items:center;gap:6px}
+.maplegend i{width:18px;height:0;border-top:2px solid;display:inline-block}
+.split{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+@media (max-width:1180px){.re{grid-template-columns:1fr}.tiles{grid-template-columns:repeat(2,1fr)}.board{grid-template-columns:1fr 1fr}.fuzzgrid,.dbg,.split{grid-template-columns:1fr}}
+</style>
+
+<div class="app">
+  <!-- ===== TOP BAR ===== -->
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo"><b>LYKOS</b></span>
+      <span class="ver">v0.7 · air-gapped build</span>
+    </div>
+    <div class="case-sel" title="Active case (example)">
+      <span class="cid mono">ENG-2026-0847</span>
+      <span class="cname">acme-router-fw</span>
+      <span class="sample">sample</span>
+    </div>
+    <div class="spacer"></div>
+    <div class="chips">
+      <span class="chip"><span class="dot live"></span>AIR-GAPPED · no egress</span>
+      <span class="chip" title="Bundled data-pack ages — staleness is surfaced, never hidden">CWE 41d</span>
+      <span class="chip" title="Signature database age">SIG 41d</span>
+      <span class="chip age-warn" title="CVE reference data is oldest — flagged">CVE 63d</span>
+    </div>
+    <div class="meters">
+      <div class="meter"><div class="mlab">CPU <b>78%</b></div><div class="bar hot"><i style="width:78%"></i></div></div>
+      <div class="meter"><div class="mlab">RAM <b>41/64G</b></div><div class="bar"><i style="width:64%"></i></div></div>
+      <div class="meter"><div class="mlab">JOBS <b>6/8</b></div><div class="bar"><i style="width:75%"></i></div></div>
+    </div>
+    <button class="iconbtn" id="theme" title="Toggle theme" aria-label="Toggle light/dark theme">
+      <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="4.5"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M5 5l1.5 1.5M17.5 17.5L19 19M19 5l-1.5 1.5M6.5 17.5L5 19"/></svg>
+    </button>
+  </header>
+
+  <!-- ===== PIPELINE RAIL ===== -->
+  <nav class="pipe" aria-label="Analysis pipeline">
+    <div class="pstage"><span class="st done">✓</span><span class="pn">Load</span></div>
+    <div class="pstage"><span class="st done">✓</span><span class="pn">Disasm</span></div>
+    <div class="pstage"><span class="st done">✓</span><span class="pn">Decompile</span></div>
+    <div class="pstage"><span class="st done">✓</span><span class="pn">Recover</span></div>
+    <div class="pstage"><span class="st done">✓</span><span class="pn">Static&nbsp;CWE</span></div>
+    <div class="pstage active"><span class="st run">▶</span><span class="pn">Dynamic</span></div>
+    <div class="pstage"><span class="st done">✓</span><span class="pn">Harness</span></div>
+    <div class="pstage active"><span class="st run">▶</span><span class="pn">Fuzz</span></div>
+    <div class="pstage"><span class="st queue">2</span><span class="pn">Triage</span></div>
+    <div class="pstage"><span class="st queue">⧗</span><span class="pn">Symbolic</span></div>
+    <div class="pstage"><span class="st idle"></span><span class="pn">PoC</span></div>
+    <div class="pstage"><span class="st idle"></span><span class="pn">Report</span></div>
+  </nav>
+
+  <!-- ===== BODY ===== -->
+  <div class="body">
+    <aside class="rail">
+      <div class="rlab eyebrow">Workspace</div>
+      <div class="navitem active" data-view="overview"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>Overview</div>
+      <div class="navitem" data-view="re"><svg viewBox="0 0 24 24"><path d="M9 3H4v5M15 3h5v5M9 21H4v-5M15 21h5v-5"/><circle cx="12" cy="12" r="3"/></svg>Reverse Eng.</div>
+      <div class="navitem" data-view="findings"><svg viewBox="0 0 24 24"><path d="M12 2l3 6 6 .9-4.5 4.3 1 6.3L12 17l-5.5 2.5 1-6.3L3 8.9 9 8z"/></svg>Findings<span class="badge hot">8</span></div>
+      <div class="navitem" data-view="dynamic"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="14" rx="2"/><path d="M8 20h8M12 18v2M8 9l3 2-3 2M13 13h3"/></svg>Dynamic / Debug</div>
+      <div class="navitem" data-view="fuzz"><svg viewBox="0 0 24 24"><path d="M3 17c3 0 3-8 6-8s3 8 6 8 3-6 6-6"/><path d="M3 7h4M17 7h4"/></svg>Fuzzing<span class="badge">5</span></div>
+      <div class="navitem" data-view="triage"><svg viewBox="0 0 24 24"><path d="M12 2v6M12 22v-4M4.9 4.9l3 3M19 19l-3-3M2 12h6M22 12h-4"/><circle cx="12" cy="12" r="3"/></svg>Triage &amp; PoC</div>
+      <div class="navitem" data-view="report"><svg viewBox="0 0 24 24"><path d="M6 2h9l3 3v17H6z"/><path d="M9 8h6M9 12h6M9 16h4"/></svg>Report</div>
+      <div class="rlab eyebrow">Intelligence</div>
+      <div class="navitem" data-view="recovery"><svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h10M4 18h7"/><circle cx="18" cy="16" r="3"/><path d="M20.5 18.5L23 21"/></svg>Recovery</div>
+      <div class="navitem" data-view="coverage"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M3 15h18M9 3v18M15 3v18"/></svg>Coverage</div>
+    </aside>
+
+    <main class="main">
+      <!-- ===================== OVERVIEW ===================== -->
+      <section class="view" id="v-overview">
+        <div class="viewhead">
+          <div>
+            <h1>Case overview</h1>
+            <p>Multi-architecture target set for engagement ENG-2026-0847. Findings advance through a confidence lifecycle; nothing is called a vulnerability until it is reproduced.</p>
+          </div>
+          <div style="display:flex;gap:8px"><button class="btn ghost sm">Import target</button><button class="btn primary sm">Run pipeline</button></div>
+        </div>
+
+        <div class="tiles">
+          <div class="tile"><div class="tl">Targets loaded</div><div class="tv">4</div><div class="ts">3 stripped · 3 architectures</div></div>
+          <div class="tile accent"><div class="tl">Findings — confirmed</div><div class="tv">3</div><div class="ts">reproduced dynamically / symbolically</div></div>
+          <div class="tile crit"><div class="tl">PoC-backed</div><div class="tv">1</div><div class="ts">CWE-121 · demonstrable crash (L1)</div></div>
+          <div class="tile"><div class="tl">Fuzz throughput</div><div class="tv">2,340<span style="font-size:13px">/s</span></div><div class="ts">6 instances · edge cov 61%</div></div>
+        </div>
+
+        <div class="split">
+          <div class="card">
+            <div class="cardhead"><h3 class="eyebrow">Targets</h3><span class="hint">custom format = loader plugin</span></div>
+            <table class="tbl">
+              <thead><tr><th>Binary</th><th>Arch</th><th>Format</th><th>Mitigations</th><th class="r">Findings</th></tr></thead>
+              <tbody>
+                <tr><td class="mono">httpd</td><td><span class="arch">AArch64</span></td><td class="mono">ELF · stripped · PIE</td><td class="mono" style="font-size:10.5px">NX RELRO<sup>½</sup></td><td class="mono r">6</td></tr>
+                <tr><td class="mono">libcfg.so</td><td><span class="arch">AArch64</span></td><td class="mono">ELF · stripped</td><td class="mono" style="font-size:10.5px">NX</td><td class="mono r">2</td></tr>
+                <tr><td class="mono">bootloader.bin</td><td><span class="arch">PowerPC</span></td><td class="mono">raw · AXF1 container</td><td class="mono" style="font-size:10.5px">—</td><td class="mono r">0</td></tr>
+                <tr><td class="mono">updater</td><td><span class="arch">x86-64</span></td><td class="mono">ELF</td><td class="mono" style="font-size:10.5px">NX PIE Canary</td><td class="mono r">1</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="card">
+            <h3 class="eyebrow">Confidence lifecycle</h3>
+            <p class="hint" style="margin:-4px 0 12px">The core design principle: candidates from any channel are promoted only when a second channel corroborates and a dynamic/symbolic run reproduces.</p>
+            <div style="display:flex;flex-direction:column;gap:9px">
+              <div style="display:flex;align-items:center;gap:10px"><span class="state cand">Candidate</span><div class="bar" style="flex:1"><i style="width:100%;background:var(--sev-info)"></i></div><span class="mono" style="color:var(--text-faint);font-size:11px">3</span></div>
+              <div style="display:flex;align-items:center;gap:10px"><span class="state corr">Corroborated</span><div class="bar" style="flex:1"><i style="width:66%;background:var(--teal)"></i></div><span class="mono" style="color:var(--text-faint);font-size:11px">2</span></div>
+              <div style="display:flex;align-items:center;gap:10px"><span class="state conf">Confirmed</span><div class="bar" style="flex:1"><i style="width:50%;background:var(--accent)"></i></div><span class="mono" style="color:var(--text-faint);font-size:11px">2</span></div>
+              <div style="display:flex;align-items:center;gap:10px"><span class="state poc">PoC-backed</span><div class="bar" style="flex:1"><i style="width:25%;background:var(--ok)"></i></div><span class="mono" style="color:var(--text-faint);font-size:11px">1</span></div>
+            </div>
+            <div class="notebar"><span class="k">Engines</span><span>Ghidra · rizin · angr · SymQEMU · AFL++/LibAFL · QASan · QEMU · Qiling · CASR · BinDiff · FID/FLIRT sigs · Semgrep</span></div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="cardhead"><h3 class="eyebrow">System map · inter-component</h3><span class="hint">tainted data crosses binary boundaries → cross-component findings</span></div>
+          <svg class="sysmap" viewBox="0 0 720 210" role="img" aria-label="Component graph: httpd links to libcfg.so and execs updater, which flashes the PowerPC bootloader; a cross-binary CWE-787 flows from httpd into libcfg cfg_set">
+            <defs><marker id="arw" markerWidth="9" markerHeight="9" refX="7.5" refY="3" orient="auto"><path class="mk" d="M0,0 L7,3 L0,6 Z"/></marker></defs>
+            <!-- attack surface -->
+            <circle class="src" cx="16" cy="47" r="5"/>
+            <path class="edge ipc" d="M22,47 L30,47" marker-end="url(#arw)"/>
+            <text class="elabel" x="4" y="70">tcp :80 recv</text>
+            <!-- edges -->
+            <path class="edge crit" d="M200,47 L314,47" marker-end="url(#arw)"/>
+            <text class="elabel crit" x="206" y="38">→ cfg_set · CWE-787 (cross-binary)</text>
+            <path class="edge" d="M115,70 L115,126" marker-end="url(#arw)"/>
+            <text class="elabel" x="122" y="104">exec</text>
+            <path class="edge" d="M200,155 L314,155" marker-end="url(#arw)"/>
+            <text class="elabel" x="212" y="146">flash image</text>
+            <!-- nodes -->
+            <g><rect class="node" x="30" y="24" width="170" height="46" rx="8"/><text class="nlabel" x="44" y="45">httpd</text><text class="narch" x="44" y="60">AArch64 · ELF · stripped</text></g>
+            <g><rect class="node" x="320" y="24" width="185" height="46" rx="8"/><text class="nlabel" x="334" y="45">libcfg.so</text><text class="narch" x="334" y="60">AArch64 · dynamic link</text></g>
+            <g><rect class="node" x="30" y="132" width="170" height="46" rx="8"/><text class="nlabel" x="44" y="153">updater</text><text class="narch" x="44" y="168">x86-64 · ELF</text></g>
+            <g><rect class="node" x="320" y="132" width="200" height="46" rx="8"/><text class="nlabel" x="334" y="153">bootloader.bin</text><text class="narch" x="334" y="168">PowerPC · AXF1 · rehosted</text></g>
+          </svg>
+          <div class="maplegend">
+            <span><i style="border-color:var(--text-faint)"></i>link / exec</span>
+            <span><i style="border-color:var(--accent);border-top-style:dashed"></i>IPC (tcp/pipe/shm)</span>
+            <span><i style="border-color:var(--sev-crit)"></i>cross-binary finding</span>
+            <span>PowerPC image rehosted (Fuzzware MMIO models)</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===================== REVERSE ENGINEERING ===================== -->
+      <section class="view" id="v-re" hidden>
+        <div class="viewhead">
+          <div><h1>Reverse-engineering workspace</h1><p>Synchronized disassembly, decompilation and bytes for a stripped AArch64 target. Recovered names and types are suggestions with provenance; the analyst commits them.</p></div>
+        </div>
+        <div class="re">
+          <div class="fnlist">
+            <div class="fh"><span class="eyebrow">Functions · 412</span><span class="hint">~ = recovered</span></div>
+            <div class="scroll">
+              <div class="fnrow sel recovered"><span class="fnn">parse_cookie</span><span class="fna">0x00012f4c · 148B</span></div>
+              <div class="fnrow recovered"><span class="fnn">session_free</span><span class="fna">0x0001a880 · 92B</span></div>
+              <div class="fnrow recovered"><span class="fnn">log_event</span><span class="fna">0x00009b10 · 210B</span></div>
+              <div class="fnrow recovered"><span class="fnn">alloc_body</span><span class="fna">0x000148a0 · 76B</span></div>
+              <div class="fnrow"><span class="fnn">sub_c400</span><span class="fna">0x0000c400 · 340B</span></div>
+              <div class="fnrow"><span class="fnn">sub_7d18</span><span class="fna">0x00007d18 · 54B</span></div>
+              <div class="fnrow recovered"><span class="fnn">aes_key_expand</span><span class="fna">0x00021a00 · 512B</span></div>
+              <div class="fnrow"><span class="fnn">sub_5220</span><span class="fna">0x00005220 · 128B</span></div>
+            </div>
+          </div>
+
+          <div>
+            <div class="tabs"><span class="tab active">Pseudo-C</span><span class="tab">Disassembly</span><span class="tab">Hex</span><span class="tab">CFG</span></div>
+            <div class="pane">
+              <div class="codebox"><span class="cm">/* named via FID signature + prototype archive · Ghidra decompiler */</span>
+<span class="kw">int</span> <span class="fn">parse_cookie</span>(<span class="kw">char</span> *req, <span class="kw">int</span> len) {
+  <span class="kw">char</span> buf[<span class="nm">64</span>];              <span class="cm">// fixed stack buffer</span>
+  <span class="kw">char</span> *val = strchr(req, <span class="st">'='</span>);
+  <span class="kw">int</span> n = len - (val - req);
+<span class="vuln">  memcpy(buf, val + <span class="nm">1</span>, n);       <span class="cm">// n is attacker-controlled, unbounded</span></span>
+  buf[n] = <span class="nm">0</span>;
+  <span class="kw">return</span> <span class="fn">validate</span>(buf);
+}</div>
+            </div>
+          </div>
+
+          <div class="aside">
+            <div class="card">
+              <h3 class="eyebrow">Recovery suggestions</h3>
+              <div class="sug">
+                <div class="sugrow"><div class="sl">rename <b>sub_12f4c</b> → <b>parse_cookie</b><div class="conf">BinDiff vs openssl-sym · 0.94</div></div><div class="mini-actions"><button class="btn sm a-ok">✓</button><button class="btn sm a-no">✕</button></div></div>
+                <div class="sugrow"><div class="sl">type arg1 → <b>char*</b>, arg2 → <b>int</b><div class="conf">prototype archive · exact</div></div><div class="mini-actions"><button class="btn sm a-ok">✓</button><button class="btn sm a-no">✕</button></div></div>
+                <div class="sugrow"><div class="sl">identify <b>aes_key_expand</b><div class="conf">AES S-box constants · exact</div></div><div class="mini-actions"><button class="btn sm a-ok">✓</button><button class="btn sm a-no">✕</button></div></div>
+              </div>
+            </div>
+            <div class="card">
+              <h3 class="eyebrow">Similarity (BinDiff)</h3>
+              <p class="hint" style="margin:-2px 0 8px">Nearest labeled functions in the bundled corpus.</p>
+              <table class="tbl"><tbody>
+                <tr><td class="mono">glibc strncpy-ish</td><td class="mono r" style="color:var(--teal)">0.71</td></tr>
+                <tr><td class="mono">CVE-2021-xxxx parse</td><td class="mono r" style="color:var(--sev-high)">0.94</td></tr>
+              </tbody></table>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===================== FINDINGS ===================== -->
+      <section class="view" id="v-findings" hidden>
+        <div class="viewhead">
+          <div><h1>Findings board</h1><p>Cards advance left to right as evidence accumulates. Each card shows its CWE, severity, location, confidence and the analysis channels that fired.</p></div>
+          <div style="display:flex;gap:8px"><button class="btn ghost sm">Filter: all CWE</button><button class="btn ghost sm">Severity ▾</button></div>
+        </div>
+        <div class="board">
+          <div class="lane">
+            <div class="lanehead"><div class="lt"><span class="state cand">Candidate</span></div><span class="ct">3</span></div>
+            <div class="fcard">
+              <div class="ftop"><span class="cwe">CWE-190</span><span class="sev med"><span class="sd"></span>Medium</span></div>
+              <div><div class="fname">Integer overflow → undersized alloc</div><div class="floc">httpd · alloc_body · 0x000148a0</div></div>
+              <div class="fev"><span class="evtag">static-pattern</span><span class="evtag">static-taint</span></div>
+              <div class="confbar"><i style="width:34%"></i></div>
+            </div>
+            <div class="fcard">
+              <div class="ftop"><span class="cwe">CWE-798</span><span class="sev med"><span class="sd"></span>Medium</span></div>
+              <div><div class="fname">Hardcoded credential in .rodata</div><div class="floc">libcfg.so · 0x0003e120</div></div>
+              <div class="fev"><span class="evtag">string</span><span class="evtag">entropy</span></div>
+              <div class="confbar"><i style="width:40%"></i></div>
+            </div>
+            <div class="fcard">
+              <div class="ftop"><span class="cwe">CWE-476</span><span class="sev low"><span class="sd"></span>Low</span></div>
+              <div><div class="fname">NULL deref on patch failure</div><div class="floc">updater · apply_patch · 0x0040a1c0</div></div>
+              <div class="fev"><span class="evtag">static-pattern</span></div>
+              <div class="confbar"><i style="width:28%"></i></div>
+            </div>
+          </div>
+
+          <div class="lane">
+            <div class="lanehead"><div class="lt"><span class="arrow">→</span><span class="state corr">Corroborated</span></div><span class="ct">2</span></div>
+            <div class="fcard">
+              <div class="ftop"><span class="cwe">CWE-134</span><span class="sev high"><span class="sd"></span>High</span></div>
+              <div><div class="fname">Format string — tainted fmt arg</div><div class="floc">httpd · log_event · 0x00009b10</div></div>
+              <div class="fev"><span class="evtag">static-pattern</span><span class="evtag">taint→printf</span></div>
+              <div class="confbar"><i style="width:58%"></i></div>
+            </div>
+            <div class="fcard">
+              <div class="ftop"><span class="cwe">CWE-22</span><span class="sev med"><span class="sd"></span>Medium</span></div>
+              <div><div class="fname">Path traversal to open()</div><div class="floc">httpd · sub_c400 · 0x0000c400</div></div>
+              <div class="fev"><span class="evtag">taint→open</span><span class="evtag">dyn-probe</span></div>
+              <div class="confbar"><i style="width:62%"></i></div>
+            </div>
+          </div>
+
+          <div class="lane">
+            <div class="lanehead"><div class="lt"><span class="arrow">→</span><span class="state conf">Confirmed</span></div><span class="ct">2</span></div>
+            <div class="fcard is-conf">
+              <div class="ftop"><span class="cwe">CWE-416</span><span class="sev high"><span class="sd"></span>High</span></div>
+              <div><div class="fname">Use-after-free of session object</div><div class="floc">httpd · session_free · 0x0001a880</div></div>
+              <div class="fev"><span class="evtag">QASan-UAF</span><span class="evtag">directed-fuzz</span><span class="evtag">angr</span></div>
+              <div class="confbar"><i style="width:82%"></i></div>
+            </div>
+            <div class="fcard is-conf">
+              <div class="ftop"><span class="cwe">CWE-787</span><span class="sev high"><span class="sd"></span>High</span></div>
+              <div><div class="fname">Out-of-bounds write in config setter</div><div class="floc">libcfg.so · cfg_set · 0x00003210</div></div>
+              <div class="fev"><span class="evtag">QASan</span><span class="evtag">fuzz-crash</span></div>
+              <div class="confbar"><i style="width:80%"></i></div>
+            </div>
+          </div>
+
+          <div class="lane">
+            <div class="lanehead"><div class="lt"><span class="arrow">→</span><span class="state poc">PoC-backed</span></div><span class="ct">1</span></div>
+            <div class="fcard is-poc" data-goto="triage">
+              <div class="ftop"><span class="cwe">CWE-121</span><span class="sev crit"><span class="sd"></span>Critical</span></div>
+              <div><div class="fname">Stack overflow in cookie parser</div><div class="floc">httpd · parse_cookie · 0x00012f4c</div></div>
+              <div class="fev"><span class="evtag">static-taint</span><span class="evtag">AFL++</span><span class="evtag">QASan</span><span class="evtag">angr</span><span class="evtag">PoC L1</span></div>
+              <div class="confbar"><i style="width:97%"></i></div>
+              <div class="hint" style="color:var(--ok)">CVSS 9.8 · reproducible bundle → open in Triage</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===================== DYNAMIC / DEBUG ===================== -->
+      <section class="view" id="v-dynamic" hidden>
+        <div class="viewhead">
+          <div><h1>Dynamic analysis &amp; debugger</h1><p>Untrusted targets detonate in tiered isolation. This AArch64 target runs full-system under QEMU with no network egress and per-run snapshot rollback.</p></div>
+        </div>
+        <div class="card">
+          <div class="cardhead"><h3 class="eyebrow">Isolation tier</h3><span class="chip"><span class="dot live"></span>snapshot armed · egress blocked</span></div>
+          <div class="tierpick">
+            <span class="tier">T0 · Unicorn/Qiling</span>
+            <span class="tier">T1 · nsjail+seccomp</span>
+            <span class="tier">T2 · microVM (KVM)</span>
+            <span class="tier on">T3 · QEMU-system AArch64</span>
+          </div>
+        </div>
+        <div class="dbg">
+          <div style="display:flex;flex-direction:column;gap:12px">
+            <div class="card">
+              <div class="cardhead"><h3 class="eyebrow">Execution · httpd @ parse_cookie</h3>
+                <div style="display:flex;gap:5px"><button class="btn sm">Step</button><button class="btn sm">Continue</button><button class="btn sm ghost">Reverse-step</button></div></div>
+              <div class="dis">
+                <div class="row"><span class="a">0x12f80</span><span class="b">ldrb w1,[x2,x0]</span><span class="m">; load body byte</span></div>
+                <div class="row"><span class="a">0x12f84</span><span class="b">strb w1,[sp,x0]</span><span class="m">; store into buf[64]</span></div>
+                <div class="row hot"><span class="a">0x12f88</span><span class="b">add x0,x0,#1</span><span class="m">; i++  ← no bound vs 64</span></div>
+                <div class="row"><span class="a">0x12f8c</span><span class="b">cmp x0,x3</span><span class="m">; i &lt; n (n=268)</span></div>
+                <div class="row"><span class="a">0x12f90</span><span class="b">b.lt 0x12f80</span><span class="m">; loop</span></div>
+              </div>
+            </div>
+            <div class="card">
+              <h3 class="eyebrow">Syscall &amp; API trace</h3>
+              <div style="max-height:150px;overflow-y:auto">
+                <div class="logline"><span class="sc">recv</span>(4, 0x7ff…, 512, 0) = 268</div>
+                <div class="logline"><span class="sc">strchr</span>(req, '=') = 0x7ff…2c</div>
+                <div class="logline"><span class="sc">memcpy</span>(buf=sp+0x10, src, n=268)  <span style="color:var(--sev-crit)">▲ QASan: stack-buffer-overflow (WRITE 268 &gt; 64)</span></div>
+                <div class="logline" style="color:var(--sev-crit)">SIGSEGV @ 0x12f88 · faulting write sp+0x50</div>
+              </div>
+            </div>
+          </div>
+          <div class="card">
+            <h3 class="eyebrow">Registers</h3>
+            <div class="regs">
+              <div class="r"><span>x0</span><b>0x000000ac</b></div>
+              <div class="r"><span>x1</span><b>0x00000041</b></div>
+              <div class="r changed"><span>x2</span><b>0x7ffff620</b></div>
+              <div class="r"><span>x3</span><b>0x0000010c</b></div>
+              <div class="r"><span>sp</span><b>0x7ffff5b0</b></div>
+              <div class="r changed"><span>lr</span><b>0x41414141</b></div>
+              <div class="r changed"><span>pc</span><b>0x00012f88</b></div>
+              <div class="r"><span>pstate</span><b>nzcv</b></div>
+            </div>
+            <div class="notebar"><span class="k">Stack</span><span class="mono" style="font-size:10.5px">saved LR overwritten with 0x41…41 @ sp+0x50</span></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===================== FUZZING ===================== -->
+      <section class="view" id="v-fuzz" hidden>
+        <div class="viewhead">
+          <div><h1>Fuzzing campaign</h1><p>Auto-generated file/stdin harness on <span class="mono">parse_cookie</span>, six LibAFL instances sharing one corpus, with a directed instance steered at open candidate sites via CFG/callgraph distance (AFLGo-style).</p></div>
+          <div style="display:flex;gap:8px"><button class="btn ghost sm">Pause</button><button class="btn ghost sm">Checkpoint</button><button class="btn sm">Add instance</button></div>
+        </div>
+        <div class="tiles">
+          <div class="tile accent"><div class="tl">Edge coverage</div><div class="tv">61%</div><div class="ts">18,742 edges · +37 last 6m</div></div>
+          <div class="tile"><div class="tl">Total execs</div><div class="tv">4.21M</div><div class="ts">2,340 exec/s · 3h12m</div></div>
+          <div class="tile crit"><div class="tl">Unique crashes</div><div class="tv">5</div><div class="ts">47 raw → CASR dedup</div></div>
+          <div class="tile"><div class="tl">Corpus</div><div class="tv">1,204</div><div class="ts">seeded from strings + format grammar</div></div>
+        </div>
+        <div class="fuzzgrid">
+          <div class="card">
+            <div class="cardhead"><h3 class="eyebrow">Edge coverage over time</h3><span class="hint">hybrid concolic kicked in at plateau (2h05m)</span></div>
+            <canvas id="covChart" width="720" height="240" aria-label="Coverage rising then plateauing then rising again after concolic assist"></canvas>
+          </div>
+          <div class="card">
+            <div class="cardhead"><h3 class="eyebrow">Unique crashes</h3><span class="hint">click → triage</span></div>
+            <div class="crashfeed">
+              <div class="crashrow" data-goto="triage"><span class="sev crit"><span class="sd"></span></span><span class="cn">crash_001 · stack-overflow</span><span class="dupe">×31</span><span class="ct">parse_cookie</span></div>
+              <div class="crashrow"><span class="sev high"><span class="sd"></span></span><span class="cn">crash_002 · heap-UAF</span><span class="dupe">×9</span><span class="ct">session_free</span></div>
+              <div class="crashrow"><span class="sev high"><span class="sd"></span></span><span class="cn">crash_003 · OOB-write</span><span class="dupe">×4</span><span class="ct">cfg_set</span></div>
+              <div class="crashrow"><span class="sev med"><span class="sd"></span></span><span class="cn">crash_004 · assert-abort</span><span class="dupe">×2</span><span class="ct">alloc_body</span></div>
+              <div class="crashrow"><span class="sev low"><span class="sd"></span></span><span class="cn">crash_005 · null-deref</span><span class="dupe">×1</span><span class="ct">sub_5220</span></div>
+            </div>
+          </div>
+        </div>
+        <div class="card">
+          <h3 class="eyebrow">Instances</h3>
+          <table class="tbl">
+            <thead><tr><th>Instance</th><th>Mode</th><th class="r">exec/s</th><th class="r">new paths</th><th>last find</th></tr></thead>
+            <tbody>
+              <tr><td class="mono">fuzz-0 (main)</td><td class="mono">AFL++ qemu · CmpLog</td><td class="mono r">512</td><td class="mono r">143</td><td class="mono">6m ago</td></tr>
+              <tr><td class="mono">fuzz-1..3</td><td class="mono">LibAFL qemu · havoc</td><td class="mono r">1,410</td><td class="mono r">201</td><td class="mono">11m ago</td></tr>
+              <tr><td class="mono">fuzz-dir</td><td class="mono">directed → 0x148a0</td><td class="mono r">190</td><td class="mono r">12</td><td class="mono">2m ago</td></tr>
+              <tr><td class="mono">concolic</td><td class="mono">SymQEMU (Driller)</td><td class="mono r">28</td><td class="mono r">44</td><td class="mono">just now</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- ===================== TRIAGE / POC ===================== -->
+      <section class="view" id="v-triage" hidden>
+        <div class="viewhead">
+          <div><h1>Triage &amp; PoC studio</h1><p>Crash <span class="mono">crash_001</span> → CWE-121. Minimized, root-caused and promoted to PoC-backed. Every PoC is re-executed from its bundle in a clean sandbox before it is trusted.</p></div>
+          <button class="btn primary sm">Build L2 primitive</button>
+        </div>
+        <div class="split">
+          <div style="display:flex;flex-direction:column;gap:14px">
+            <div class="card">
+              <div class="cardhead"><h3 class="eyebrow">Crash classification</h3><span class="sev crit"><span class="sd"></span>Critical · CVSS 9.8</span></div>
+              <table class="tbl"><tbody>
+                <tr><td>Faulting IP</td><td class="mono r">0x00012f88 (write)</td></tr>
+                <tr><td>Signal / sanitizer</td><td class="mono r">SIGSEGV · QASan stack-overflow</td></tr>
+                <tr><td>Overflow offset → saved LR</td><td class="mono r">268 bytes (buf=64)</td></tr>
+                <tr><td>Exploitability</td><td class="mono r" style="color:var(--sev-crit)">PC control</td></tr>
+                <tr><td>Dedup cluster</td><td class="mono r">31 inputs → 1</td></tr>
+              </tbody></table>
+            </div>
+            <div class="card">
+              <h3 class="eyebrow">Root-cause slice</h3>
+              <div class="slice">recv() → req[0..268] <b>tainted</b>
+  → n = len − (val − req)   <span style="color:var(--text-faint)">/* no clamp */</span>
+  → memcpy(buf[64], val+1, <b>n=268</b>)
+  → saved LR @ sp+0x50 = 0x41414141
+<span style="color:var(--text-faint)">Fix: bound n to sizeof(buf)-1 before copy.</span></div>
+            </div>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:14px">
+            <div class="card">
+              <div class="cardhead"><h3 class="eyebrow">PoC ladder</h3><span class="hint">tool claims only what it achieved</span></div>
+              <div class="ladder">
+                <div class="rung done"><span class="lvl">L0</span><div class="rl"><div class="rt">Reproducer</div><div class="rd">input reaches the vulnerable memcpy</div></div><span class="rs">✓ done</span></div>
+                <div class="rung done"><span class="lvl">L1</span><div class="rl"><div class="rt">Crash + sanitizer</div><div class="rd">minimized 268-byte input · QASan report</div></div><span class="rs">✓ done</span></div>
+                <div class="rung prog"><span class="lvl">L2</span><div class="rl"><div class="rt">Control primitive</div><div class="rd">PC control demonstrated · gadget search running</div></div><span class="rs">▶ 62%</span></div>
+                <div class="rung todo"><span class="lvl">L3</span><div class="rl"><div class="rt">Working exploit</div><div class="rd">template AEG · analyst-in-the-loop (frontier)</div></div><span class="rs">not started</span></div>
+              </div>
+            </div>
+            <div class="card">
+              <div class="cardhead"><h3 class="eyebrow">PoC bundle</h3><span class="chip"><span class="dot live"></span>re-verified · clean sandbox</span></div>
+              <table class="tbl"><tbody>
+                <tr><td class="mono">poc_input.bin</td><td class="mono r">268 B</td></tr>
+                <tr><td class="mono">harness.py</td><td class="mono r">stdin vector</td></tr>
+                <tr><td class="mono">runner.sh + env</td><td class="mono r">QEMU-system arm64</td></tr>
+                <tr><td class="mono">demo.cast</td><td class="mono r">asciinema 0:14</td></tr>
+                <tr><td class="mono">expected</td><td class="mono r">pc=0x41414141</td></tr>
+              </tbody></table>
+              <div style="margin-top:10px;display:flex;gap:8px"><button class="btn sm">Replay demo</button><button class="btn ghost sm">Export bundle</button></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===================== REPORT ===================== -->
+      <section class="view" id="v-report" hidden>
+        <div class="viewhead">
+          <div><h1>Report</h1><p>Assemble findings into a shareable, reproducible report. Every entry embeds the tool, signature-DB and rule/tool versions plus input hashes so a colleague on another air-gapped host reproduces it exactly.</p></div>
+          <div style="display:flex;gap:8px"><button class="btn ghost sm">Export SARIF</button><button class="btn ghost sm">Export HTML</button><button class="btn primary sm">Export PDF</button></div>
+        </div>
+        <div class="report">
+          <h2>ENG-2026-0847 — acme-router-fw</h2>
+          <div class="sub mono">4 targets · 3 architectures · 8 findings (1 PoC-backed, 2 confirmed) · generated 2026-09-08</div>
+          <div class="fblock">
+            <h4><span class="cwe">CWE-121</span> &nbsp;Stack-based buffer overflow in cookie parser <span class="sev crit" style="float:right"><span class="sd"></span>Critical</span></h4>
+            <p style="margin:2px 0;color:var(--text-dim);font-size:12.5px">An unbounded <span class="mono">memcpy</span> in <span class="mono">parse_cookie</span> (httpd, AArch64) copies attacker-controlled cookie data into a 64-byte stack buffer, overwriting the saved link register at offset 268 and yielding full PC control. Demonstrated with a reproducible L1 crash bundle.</p>
+            <div class="meta"><span>state: PoC-backed</span><span>CVSS 9.8</span><span>evidence: static-taint · AFL++ · QASan · angr</span><span>ghidra 11.x · sig 2026-07 · llm4decompile-6.7b-q5</span></div>
+          </div>
+          <div class="fblock">
+            <h4><span class="cwe">CWE-416</span> &nbsp;Use-after-free of session object <span class="sev high" style="float:right"><span class="sd"></span>High</span></h4>
+            <p style="margin:2px 0;color:var(--text-dim);font-size:12.5px">Freed session reused after <span class="mono">session_free</span>; confirmed by QASan under directed fuzzing. Remediation: null the handle on free and gate reuse.</p>
+            <div class="meta"><span>state: Confirmed</span><span>evidence: QASan-UAF · directed-fuzz · angr</span></div>
+          </div>
+          <div class="fblock">
+            <h4><span class="cwe">CWE-787</span> &nbsp;Out-of-bounds write in config setter <span class="sev high" style="float:right"><span class="sd"></span>High</span></h4>
+            <p style="margin:2px 0;color:var(--text-dim);font-size:12.5px">Confirmed OOB write in <span class="mono">cfg_set</span> (libcfg.so). Corroborated statically, reproduced by fuzzing + sanitizer.</p>
+            <div class="meta"><span>state: Confirmed</span><span>evidence: QASan · fuzz-crash</span></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===================== RECOVERY (deterministic) ===================== -->
+      <section class="view" id="v-recovery" hidden>
+        <div class="viewhead">
+          <div><h1>Deterministic recovery</h1><p>Names come from signatures, symbolized-corpus diffing, language-runtime metadata, and behavioral heuristics — no AI (decision doc 15). Custom application logic stays unnamed until a human reverses it; the tool surfaces the dangerous calls inside it.</p></div>
+          <span class="chip">zero-AI · no GPU</span>
+        </div>
+        <div class="split">
+          <div class="card">
+            <h3 class="eyebrow">Recovery sources · httpd (AArch64, stripped)</h3>
+            <table class="tbl">
+              <thead><tr><th>Technique</th><th class="r">Named</th><th>Detail</th></tr></thead>
+              <tbody>
+                <tr><td>Runtime metadata (Go/C++/DWARF)</td><td class="mono r">0</td><td class="mono" style="font-size:10.5px">plain C, stripped — none present</td></tr>
+                <tr><td>FID / FLIRT / zignature</td><td class="mono r">128</td><td class="mono" style="font-size:10.5px">musl libc + zlib static</td></tr>
+                <tr><td>libc fingerprint</td><td class="mono r">✓</td><td class="mono" style="font-size:10.5px">musl 1.2.x (offset DB)</td></tr>
+                <tr><td>BinDiff vs symbolized corpus</td><td class="mono r">46</td><td class="mono" style="font-size:10.5px">openssl 1.1.1 reference build</td></tr>
+                <tr><td>Crypto-constant ID</td><td class="mono r">3</td><td class="mono" style="font-size:10.5px">AES S-box · SHA-256 K · CRC32</td></tr>
+                <tr><td>Behavioral heuristics</td><td class="mono r">22</td><td class="mono" style="font-size:10.5px">net / io / parse tags from strings+imports</td></tr>
+              </tbody>
+            </table>
+            <div class="notebar"><span class="k">Known-vuln</span><span class="mono" style="font-size:10.5px">BinDiff flagged parse_cookie ≈ 0.94 to a known-buggy version → candidate.</span></div>
+          </div>
+          <div class="card">
+            <h3 class="eyebrow">Naming coverage · 412 functions</h3>
+            <div style="display:flex;flex-direction:column;gap:9px;margin-top:2px">
+              <div style="display:flex;align-items:center;gap:10px"><span style="width:150px;font-size:11.5px">Library / known (sigs)</span><div class="bar" style="flex:1"><i style="width:42%;background:var(--teal)"></i></div><span class="mono" style="font-size:11px;color:var(--text-faint)">174</span></div>
+              <div style="display:flex;align-items:center;gap:10px"><span style="width:150px;font-size:11.5px">Corpus-diff transfer</span><div class="bar" style="flex:1"><i style="width:11%;background:var(--teal)"></i></div><span class="mono" style="font-size:11px;color:var(--text-faint)">46</span></div>
+              <div style="display:flex;align-items:center;gap:10px"><span style="width:150px;font-size:11.5px">Heuristic-tagged</span><div class="bar" style="flex:1"><i style="width:5%;background:var(--accent)"></i></div><span class="mono" style="font-size:11px;color:var(--text-faint)">22</span></div>
+              <div style="display:flex;align-items:center;gap:10px"><span style="width:150px;font-size:11.5px">Custom · unnamed</span><div class="bar" style="flex:1"><i style="width:41%;background:var(--border-strong)"></i></div><span class="mono" style="font-size:11px;color:var(--text-faint)">170</span></div>
+            </div>
+            <div class="notebar" style="border-top:1px solid var(--border);margin-top:12px;padding-top:10px"><span class="k">Focus</span><span>The 170 unnamed custom functions are where manual RE goes. Dangerous calls inside them are already flagged (doc 05), so the analyst is pointed straight at the risk.</span></div>
+            <div class="notebar"><span class="k">Reproducible</span><span>Every name records its source + confidence; committing propagates types through the IR and re-runs dependent analyses.</span></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===================== COVERAGE ===================== -->
+      <section class="view" id="v-coverage" hidden>
+        <div class="viewhead">
+          <div><h1>Coverage matrix</h1><p>Live capability map so an analyst always knows the real support level for the target in front of them. Detectors run on architecture-neutral IR, so CWE coverage holds across every architecture; only dynamic confirmation depends on per-arch emulation and sanitizers.</p></div>
+        </div>
+
+        <div class="card">
+          <div class="cardhead"><h3 class="eyebrow">Architectures · by pipeline stage</h3>
+            <span class="hint">
+              <span class="lv full">FULL</span> <span class="lv emu">EMU</span> <span class="lv rehost">REHOST</span> <span class="lv part">PART</span> <span class="lv sleigh">SLEIGH</span> <span class="lv na">N/A</span>
+            </span>
+          </div>
+          <div style="overflow-x:auto">
+          <table class="tbl" style="min-width:720px">
+            <thead><tr><th>Architecture</th><th>Disasm</th><th>Decomp</th><th>Emulate</th><th>Sanitize</th><th>Fuzz</th><th>Symbolic</th><th>PoC</th></tr></thead>
+            <tbody>
+              <tr><td colspan="8" class="tierlabel">Tier 1 · first-class (MVP depth)</td></tr>
+              <tr><td class="mono">x86 / x86-64</td><td><span class="lv full">FULL</span></td><td><span class="lv full">FULL</span></td><td><span class="lv full">FULL</span></td><td><span class="lv full">FULL</span></td><td><span class="lv full">FULL</span></td><td><span class="lv full">FULL</span></td><td><span class="lv full">FULL</span></td></tr>
+              <tr><td class="mono">ARM A32 / Thumb</td><td><span class="lv full">FULL</span></td><td><span class="lv full">FULL</span></td><td><span class="lv emu">EMU</span></td><td><span class="lv emu">EMU</span></td><td><span class="lv full">FULL</span></td><td><span class="lv full">FULL</span></td><td><span class="lv full">FULL</span></td></tr>
+              <tr><td class="mono">AArch64</td><td><span class="lv full">FULL</span></td><td><span class="lv full">FULL</span></td><td><span class="lv emu">EMU</span></td><td><span class="lv full">FULL</span></td><td><span class="lv full">FULL</span></td><td><span class="lv full">FULL</span></td><td><span class="lv full">FULL</span></td></tr>
+              <tr><td colspan="8" class="tierlabel">Tier 2 · full analysis via emulation</td></tr>
+              <tr><td class="mono">MIPS 32/64 (BE/LE)</td><td><span class="lv full">FULL</span></td><td><span class="lv full">FULL</span></td><td><span class="lv emu">EMU</span></td><td><span class="lv emu">EMU</span></td><td><span class="lv emu">EMU</span></td><td><span class="lv full">FULL</span></td><td><span class="lv full">FULL</span></td></tr>
+              <tr><td class="mono">PowerPC 32/64</td><td><span class="lv full">FULL</span></td><td><span class="lv full">FULL</span></td><td><span class="lv emu">EMU</span></td><td><span class="lv emu">EMU</span></td><td><span class="lv emu">EMU</span></td><td><span class="lv full">FULL</span></td><td><span class="lv full">FULL</span></td></tr>
+              <tr><td class="mono">RISC-V 32/64</td><td><span class="lv full">FULL</span></td><td><span class="lv full">FULL</span></td><td><span class="lv emu">EMU</span></td><td><span class="lv emu">EMU</span></td><td><span class="lv emu">EMU</span></td><td><span class="lv emu">EMU</span></td><td><span class="lv part">PART</span></td></tr>
+              <tr><td class="mono">SPARC 32/64</td><td><span class="lv full">FULL</span></td><td><span class="lv full">FULL</span></td><td><span class="lv emu">EMU</span></td><td><span class="lv emu">EMU</span></td><td><span class="lv emu">EMU</span></td><td><span class="lv full">FULL</span></td><td><span class="lv full">FULL</span></td></tr>
+              <tr><td colspan="8" class="tierlabel">Tier 3 · embedded / MCU / DSP (firmware track)</td></tr>
+              <tr><td class="mono">Cortex-M bare-metal</td><td><span class="lv full">FULL</span></td><td><span class="lv full">FULL</span></td><td><span class="lv rehost">REHOST</span></td><td><span class="lv part">PART</span></td><td><span class="lv rehost">REHOST</span></td><td><span class="lv part">PART</span></td><td><span class="lv part">PART</span></td></tr>
+              <tr><td class="mono">AVR · MSP430 · Xtensa · ARC</td><td><span class="lv part">PART</span></td><td><span class="lv part">PART</span></td><td><span class="lv rehost">REHOST</span></td><td><span class="lv na">N/A</span></td><td><span class="lv rehost">REHOST</span></td><td><span class="lv part">PART</span></td><td><span class="lv part">PART</span></td></tr>
+              <tr><td colspan="8" class="tierlabel">Tier 4 · legacy / rare / custom</td></tr>
+              <tr><td class="mono">m68k · s390x · SuperH</td><td><span class="lv full">FULL</span></td><td><span class="lv part">PART</span></td><td><span class="lv emu">EMU</span></td><td><span class="lv part">PART</span></td><td><span class="lv emu">EMU</span></td><td><span class="lv part">PART</span></td><td><span class="lv part">PART</span></td></tr>
+              <tr><td class="mono">Hexagon · LoongArch · OpenRISC</td><td><span class="lv part">PART</span></td><td><span class="lv part">PART</span></td><td><span class="lv part">PART</span></td><td><span class="lv na">N/A</span></td><td><span class="lv part">PART</span></td><td><span class="lv part">PART</span></td><td><span class="lv na">N/A</span></td></tr>
+              <tr><td class="mono">Unknown / custom ISA</td><td><span class="lv sleigh">SLEIGH</span></td><td><span class="lv sleigh">SLEIGH</span></td><td><span class="lv part">PART</span></td><td><span class="lv na">N/A</span></td><td><span class="lv part">PART</span></td><td><span class="lv part">PART</span></td><td><span class="lv na">N/A</span></td></tr>
+              <tr><td colspan="8" class="tierlabel">Bytecode / managed VM · separate front-end</td></tr>
+              <tr><td class="mono">JVM · .NET · Dalvik · WASM · eBPF</td><td><span class="lv na">N/A</span></td><td><span class="lv full">FULL</span></td><td><span class="lv emu">VM</span></td><td><span class="lv part">lang</span></td><td><span class="lv part">PART</span></td><td><span class="lv part">PART</span></td><td><span class="lv na">N/A</span></td></tr>
+            </tbody>
+          </table>
+          </div>
+          <div class="notebar"><span class="k">Adding an arch</span><span>= wiring loader + SLEIGH/capstone + QEMU/Unicorn + QASan + fuzz backend + gadget profile. Never new analysis logic — detectors are written once on IR.</span></div>
+        </div>
+
+        <div class="split">
+          <div class="card">
+            <div class="cardhead"><h3 class="eyebrow">CWE families · detection channel</h3><span class="hint">full catalog → docs/19</span></div>
+            <div style="overflow-x:auto">
+            <table class="tbl" style="min-width:480px">
+              <thead><tr><th>Family</th><th>Examples</th><th>Channel</th><th class="r">Feasibility</th></tr></thead>
+              <tbody>
+                <tr><td>Memory buffer</td><td class="mono">119·121·122·125·787</td><td class="mono">taint+dyn</td><td class="r"><span class="feas hi">high</span></td></tr>
+                <tr><td>Lifetime / UAF</td><td class="mono">416·415·590·401</td><td class="mono">QASan</td><td class="r"><span class="feas dyn">high·dyn</span></td></tr>
+                <tr><td>Uninit / null / type</td><td class="mono">457·476·824·843</td><td class="mono">symbolic+dyn</td><td class="r"><span class="feas med">med</span></td></tr>
+                <tr><td>Numeric</td><td class="mono">190·191·193·369</td><td class="mono">taint+symbolic</td><td class="r"><span class="feas hi">high</span></td></tr>
+                <tr><td>Injection</td><td class="mono">78·88·134·94</td><td class="mono">taint→sink</td><td class="r"><span class="feas hi">high</span></td></tr>
+                <tr><td>Path / link</td><td class="mono">22·59·73</td><td class="mono">taint→file</td><td class="r"><span class="feas hi">high</span></td></tr>
+                <tr><td>Concurrency</td><td class="mono">362·367·364</td><td class="mono">pattern+dyn</td><td class="r"><span class="feas med">med</span></td></tr>
+                <tr><td>Resource / DoS</td><td class="mono">400·674·835·789</td><td class="mono">symbolic+dyn</td><td class="r"><span class="feas med">med</span></td></tr>
+                <tr><td>Error handling</td><td class="mono">252·754·390</td><td class="mono">pattern</td><td class="r"><span class="feas hi">high</span></td></tr>
+                <tr><td>Cryptography</td><td class="mono">327·328·330·347</td><td class="mono">const-ID</td><td class="r"><span class="feas hi">high</span></td></tr>
+                <tr><td>Secrets / creds</td><td class="mono">798·321·312</td><td class="mono">string+entropy</td><td class="r"><span class="feas hi">high</span></td></tr>
+                <tr><td>Auth / privilege</td><td class="mono">306·863·250·732</td><td class="mono">manual+dyn</td><td class="r"><span class="feas manual">low·manual</span></td></tr>
+                <tr><td>Firmware / hw (1194)</td><td class="mono">1277·1329·1240</td><td class="mono">rehost+manual</td><td class="r"><span class="feas med">med</span></td></tr>
+              </tbody>
+            </table>
+            </div>
+          </div>
+          <div class="card">
+            <h3 class="eyebrow">Scope honesty</h3>
+            <p style="font-size:12.5px;color:var(--text-dim);margin:0 0 10px">We track detectable <b>families</b> and their real feasibility, not a hollow "supports 900 CWEs." High/dyn families reach the analyst only after reproduction; low/manual families are labeled analyst leads, never confirmed findings.</p>
+            <div class="notebar" style="border-top:1px solid var(--border);padding-top:10px"><span class="k">Out of scope</span><span>Web/app CWEs with no visible parser (XSS·SQLi·CSRF·SSRF·XXE), design/process weaknesses, and physical side-channels — recorded as "known-not-covered" so gaps show, not silence.</span></div>
+            <div class="notebar"><span class="k">Managed VMs</span><span>Bytecode targets drop memory-safety CWEs (VM-managed) and gain deserialization / reflection / injection — the engine reports the applicable set only.</span></div>
+            <div class="notebar"><span class="k">Measured</span><span>Per-family precision/recall tracked on Juliet · LAVA-M · Magma · CGC (docs/14).</span></div>
+          </div>
+        </div>
+      </section>
+
+      <div class="foot">
+        <div class="notebar" style="border-top:1px solid var(--border);margin-top:8px">
+          <span class="k">Example data</span>
+          <span>Illustrative prototype of the BinAnalysis operator console. All targets, findings and metrics are fabricated samples. Offline / air-gapped build.</span>
+        </div>
+      </div>
+    </main>
+  </div>
+</div>
+
+<script>
+(function(){
+  /* theme toggle (persist, guarded) */
+  var root=document.documentElement;
+  try{var s=localStorage.getItem('lykos-theme'); if(s)root.setAttribute('data-theme',s);}catch(e){}
+  document.getElementById('theme').addEventListener('click',function(){
+    var cur=root.getAttribute('data-theme');
+    var next = cur==='dark' ? 'light' : (cur==='light' ? 'dark' : (matchMedia('(prefers-color-scheme: dark)').matches?'light':'dark'));
+    root.setAttribute('data-theme',next);
+    try{localStorage.setItem('lykos-theme',next);}catch(e){}
+  });
+
+  /* view switching */
+  var items=document.querySelectorAll('.navitem');
+  function show(view){
+    document.querySelectorAll('.view').forEach(function(v){v.hidden = (v.id!=='v-'+view);});
+    items.forEach(function(n){n.classList.toggle('active', n.dataset.view===view);});
+    document.querySelector('.main').scrollTop=0;
+  }
+  items.forEach(function(n){n.addEventListener('click',function(){show(n.dataset.view);});});
+  document.querySelectorAll('[data-goto]').forEach(function(el){
+    el.addEventListener('click',function(){show(el.dataset.goto);});
+  });
+
+  /* RE tabs (visual only) */
+  document.querySelectorAll('.tabs .tab').forEach(function(t){
+    t.addEventListener('click',function(){
+      t.parentElement.querySelectorAll('.tab').forEach(function(x){x.classList.remove('active');});
+      t.classList.add('active');
+    });
+  });
+
+  /* coverage chart on canvas */
+  function css(v){return getComputedStyle(document.body).getPropertyValue(v).trim();}
+  function drawCoverage(){
+    var c=document.getElementById('covChart'); if(!c)return;
+    var ctx=c.getContext('2d'); var W=c.width,H=c.height; ctx.clearRect(0,0,W,H);
+    var padL=8,padR=8,padT=12,padB=18;
+    var accent=css('--accent')||'#e8ab4e', teal=css('--teal')||'#46cabb', grid=css('--grid')||'rgba(255,255,255,.06)', faint=css('--text-faint')||'#888';
+    /* data: rise, plateau, rise again after concolic */
+    var pts=[]; var n=60;
+    for(var i=0;i<=n;i++){
+      var x=i/n, y;
+      if(x<0.35) y=1-Math.exp(-x*7);
+      else if(x<0.68) y=(1-Math.exp(-0.35*7)) + (x-0.35)*0.18;
+      else y=Math.min(0.62,(1-Math.exp(-0.35*7))+ (0.68-0.35)*0.18 + (x-0.68)*0.55);
+      pts.push(y);
+    }
+    var maxY=0.66;
+    function X(i){return padL + (W-padL-padR)*(i/n);}
+    function Y(v){return padT + (H-padT-padB)*(1 - v/maxY);}
+    /* grid */
+    ctx.strokeStyle=grid; ctx.lineWidth=1;
+    for(var g=0;g<=4;g++){var yy=padT+(H-padT-padB)*g/4; ctx.beginPath();ctx.moveTo(padL,yy);ctx.lineTo(W-padR,yy);ctx.stroke();}
+    /* plateau marker */
+    var px=X(n*0.68); ctx.strokeStyle=faint; ctx.setLineDash([3,3]); ctx.beginPath();ctx.moveTo(px,padT);ctx.lineTo(px,H-padB);ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle=faint; ctx.font='10px "IBM Plex Mono",monospace'; ctx.fillText('concolic assist', px+4, padT+10);
+    /* area */
+    ctx.beginPath(); ctx.moveTo(X(0),Y(pts[0]));
+    for(var i=1;i<=n;i++)ctx.lineTo(X(i),Y(pts[i]));
+    ctx.lineTo(X(n),H-padB); ctx.lineTo(X(0),H-padB); ctx.closePath();
+    var grad=ctx.createLinearGradient(0,padT,0,H-padB);
+    grad.addColorStop(0, hexA(teal,0.28)); grad.addColorStop(1, hexA(teal,0.02));
+    ctx.fillStyle=grad; ctx.fill();
+    /* line */
+    ctx.beginPath(); ctx.moveTo(X(0),Y(pts[0]));
+    for(var i=1;i<=n;i++)ctx.lineTo(X(i),Y(pts[i]));
+    ctx.strokeStyle=teal; ctx.lineWidth=2; ctx.stroke();
+    /* endpoint */
+    ctx.fillStyle=accent; ctx.beginPath(); ctx.arc(X(n),Y(pts[n]),3.5,0,7); ctx.fill();
+    ctx.fillStyle=css('--text-dim')||'#999'; ctx.font='10px "IBM Plex Mono",monospace';
+    ctx.fillText('61%', X(n)-26, Y(pts[n])-8);
+  }
+  function hexA(hex,a){
+    hex=hex.replace('#',''); if(hex.length===3)hex=hex.split('').map(function(c){return c+c;}).join('');
+    var r=parseInt(hex.substr(0,2),16),g=parseInt(hex.substr(2,2),16),b=parseInt(hex.substr(4,2),16);
+    if(isNaN(r))return 'rgba(70,202,187,'+a+')';
+    return 'rgba('+r+','+g+','+b+','+a+')';
+  }
+  drawCoverage();
+  /* redraw on theme change so chart colors track tokens */
+  new MutationObserver(drawCoverage).observe(root,{attributes:true,attributeFilter:['data-theme']});
+  if(window.matchMedia){matchMedia('(prefers-color-scheme: dark)').addEventListener('change',drawCoverage);}
+})();
+</script>
