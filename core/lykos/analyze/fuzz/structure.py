@@ -141,5 +141,178 @@ def builtin(name: str):
 
 
 def from_spec(spec) -> FormatModel:
-    """Build a model from an analyst-supplied spec (list of field dicts, e.g. from JSON)."""
-    return FormatModel(list(spec))
+    """Build a model from an analyst-supplied spec (list of field dicts, e.g. from JSON).
+    Magic values may arrive as plain strings or as {"b64": ...} from the GUI builder."""
+    out = []
+    for f in spec:
+        f = dict(f)
+        if f.get("type") == "magic":
+            f["value"] = _coerce_value(f.get("value", b""))
+        out.append(f)
+    return FormatModel(out)
+
+
+# ---------------------------------------------------------------------------
+# Spec builder support: detect a format from a real sample, auto-find the
+# length field, and describe how a spec carves a sample. Powers the GUI's
+# custom-format builder so the analyst never has to guess the raw bytes.
+# ---------------------------------------------------------------------------
+
+# (name, magic bytes) -- longest/most specific first
+_SIGNATURES = [
+    ("PDF", b"%PDF-"), ("PNG", b"\x89PNG\r\n\x1a\n"), ("GIF", b"GIF89a"),
+    ("GIF", b"GIF87a"), ("JPEG", b"\xff\xd8\xff"), ("BMP", b"BM"),
+    ("GZIP", b"\x1f\x8b"), ("ZIP", b"PK\x03\x04"), ("ELF", b"\x7fELF"),
+    ("RIFF", b"RIFF"), ("TIFF", b"II*\x00"), ("TIFF", b"MM\x00*"),
+    ("CLASS", b"\xca\xfe\xba\xbe"), ("OGG", b"OggS"), ("FLAC", b"fLaC"),
+    ("7Z", b"7z\xbc\xaf\x27\x1c"), ("XZ", b"\xfd7zXZ\x00"), ("WASM", b"\x00asm"),
+    ("CAB", b"MSCF"), ("MACHO", b"\xcf\xfa\xed\xfe"), ("SQLITE", b"SQLite format 3\x00"),
+]
+
+
+def detect_magic(sample: bytes):
+    """Return (name, magic_bytes) for the first known signature the sample starts with."""
+    for name, sig in _SIGNATURES:
+        if sample.startswith(sig):
+            return name, sig
+    return None, b""
+
+
+def find_length_fields(sample: bytes, *, max_off: int = 64):
+    """Heuristic: scan header offsets for an integer whose value equals the number of
+    bytes that follow it (data-length) or the total size -- i.e. a real length field.
+    Returns candidates sorted best-first, each {offset,size,endian,value,kind}."""
+    out = []
+    n = len(sample)
+    for size, code in ((4, "I"), (2, "H"), (8, "Q")):
+        for off in range(0, min(max_off, max(0, n - size)) + 1):
+            for endian, sym in (("little", "<"), ("big", ">")):
+                val = struct.unpack(sym + code, sample[off:off + size])[0]
+                after = n - (off + size)
+                if val == after and after > 0:
+                    out.append({"offset": off, "size": size, "endian": endian,
+                                "value": val, "kind": "data-length"})
+                elif val == n:
+                    out.append({"offset": off, "size": size, "endian": endian,
+                                "value": val, "kind": "total-size"})
+    # prefer data-length matches, then smaller offsets, then 4-byte fields
+    rank = {"data-length": 0, "total-size": 1}
+    out.sort(key=lambda c: (rank[c["kind"]], c["offset"], 0 if c["size"] == 4 else 1))
+    return out
+
+
+_INTNAME = {1: "u8", 2: "u16", 4: "u32", 8: "u64"}
+
+
+def suggest_spec(sample: bytes) -> dict:
+    """Build a starting spec from a real sample: fix the detected header as magic, put a
+    length field where the bytes say one is, and let the rest be the sized blob."""
+    sample = sample or b""
+    name, sig = detect_magic(sample)
+    cands = find_length_fields(sample)
+    notes = []
+    if cands:
+        c = cands[0]
+        prefix = sample[:c["offset"]] or sig      # everything before the length int is fixed
+        spec = [{"type": "magic", "value": _b64safe(prefix)}]
+        spec.append({"type": _INTNAME[c["size"]], "endian": c["endian"],
+                     "name": "len", "length_of": "data"})
+        spec.append({"type": "blob", "name": "data"})
+        notes.append(f"auto-found a {c['size']*8}-bit {c['endian']}-endian length field at "
+                     f"offset {c['offset']} (value {c['value']} == trailing bytes)")
+    else:
+        prefix = sig or sample[:min(8, len(sample))]
+        spec = [{"type": "magic", "value": _b64safe(prefix)},
+                {"type": "blob", "name": "data"}]
+        notes.append("no length field auto-found -- add an integer field and watch the "
+                     "preview's length match, or fuzz the blob as-is")
+    return {"detected": name, "magic_len": len(sig), "spec": spec, "notes": notes,
+            "sample_size": len(sample)}
+
+
+def _b64safe(b: bytes):
+    """Represent magic bytes so they survive JSON: latin-1 str if printable-ish, else base64."""
+    import base64
+    try:
+        s = b.decode("latin-1")
+        # keep it a plain string only if it round-trips and is mostly printable
+        if all(32 <= c < 127 or c in (9, 10, 13) for c in b):
+            return s
+    except Exception:
+        pass
+    return {"b64": base64.b64encode(b).decode("ascii")}
+
+
+def _coerce_value(v):
+    """Accept a magic value as str, bytes, or {"b64": ...} from the builder."""
+    import base64
+    if isinstance(v, dict) and "b64" in v:
+        return base64.b64decode(v["b64"])
+    return v
+
+
+def describe(spec, sample: bytes) -> dict:
+    """Parse a sample against a spec and report how it carves -- per-field offset/size/value,
+    whether each length field matches the real blob length, and roundtrip fidelity. This is
+    exactly the model the fuzzer uses, so the preview is truthful."""
+    spec = [dict(f) for f in spec]
+    for f in spec:                                # normalize magic values from the builder
+        if f.get("type") == "magic":
+            f["value"] = _coerce_value(f.get("value", b""))
+    model = FormatModel(spec)
+    fields_out = []
+    ok = True
+    err = None
+    try:
+        parsed = model.parse(sample or b"")
+        pos = 0
+        # index blobs by name for length checks
+        blob_len = {fd["f"].get("name"): len(fd["val"])
+                    for fd in parsed if fd["f"]["type"] not in _INT and fd["f"]["type"] != "magic"}
+        for fd in parsed:
+            f = fd["f"]
+            t = f["type"]
+            if t == "magic":
+                raw = _as_bytes(fd["val"])
+                want = _as_bytes(f.get("value", b""))
+                size = len(want)
+                fields_out.append({"type": "magic", "name": f.get("name", "magic"),
+                                   "offset": pos, "size": size,
+                                   "value": _preview_bytes(raw),
+                                   "match": raw == want})
+                if raw != want:
+                    ok = False
+                pos += size
+            elif t in _INT:
+                size = _INT[t][0]
+                lo = f.get("length_of")
+                match = None
+                if lo is not None:
+                    match = (int(fd["val"]) == blob_len.get(lo))
+                fields_out.append({"type": t, "name": f.get("name", t),
+                                   "offset": pos, "size": size, "int": int(fd["val"]),
+                                   "endian": f.get("endian", "little"),
+                                   "length_of": lo, "length_match": match})
+                pos += size
+            else:
+                data = _as_bytes(fd["val"])
+                fields_out.append({"type": "blob", "name": f.get("name", "data"),
+                                   "offset": pos, "size": len(data),
+                                   "value": _preview_bytes(data)})
+                pos += len(data)
+        roundtrip = model.serialize(parsed) == (sample or b"")
+    except Exception as e:                        # noqa: BLE001 - report parse failure to UI
+        ok = False
+        err = str(e)
+        roundtrip = False
+    return {"fields": fields_out, "ok": ok, "roundtrip": roundtrip,
+            "consumed": sum(f["size"] for f in fields_out), "sample_size": len(sample or b""),
+            "error": err}
+
+
+def _preview_bytes(b: bytes, cap: int = 24):
+    import base64
+    head = b[:cap]
+    printable = "".join(chr(c) if 32 <= c < 127 else "." for c in head)
+    return {"hex": head.hex(), "ascii": printable, "b64": base64.b64encode(b[:64]).decode("ascii"),
+            "truncated": len(b) > cap}
