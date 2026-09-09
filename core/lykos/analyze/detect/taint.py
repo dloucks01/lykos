@@ -90,8 +90,17 @@ def build_callmap(call_edges):
     return {e.site_addr: normalize(e.dst_name) for e in call_edges if e.site_addr}
 
 
-def _run(ir, abi, callmap, dstmap, func_addrs, entry_params, ret_tainted):
-    """Analyze one function. Returns (flagged_sink_sites, return_is_tainted, callee_contribs)."""
+def _run(ir, abi, callmap, dstmap, func_addrs, entry_params, ret_tainted, *,
+         seed_sources=True, extmap=None, ext_out=None):
+    """Analyze one function. Returns (flagged_sink_sites, return_is_tainted, callee_contribs).
+
+    Cross-binary hooks (Phase 8, doc 17.2):
+      * seed_sources=False disables SOURCES seeding so taint originates only from the
+        seeded entry params -- used to summarise a callee export (does tainting its
+        parameter reach a sink?).
+      * extmap {site: imported_symbol} + ext_out set: record imported symbols called with
+        tainted arguments -- used to summarise a caller (which imports does it taint?).
+    """
     argregs_list = abi["args"]
     argregs_all = _arg_regs(abi)
     retregs = abi["ret"]
@@ -119,13 +128,17 @@ def _run(ir, abi, callmap, dstmap, func_addrs, entry_params, ret_tainted):
         internal = dst in func_addrs
         if ext in DANGEROUS and _args_tainted(cur, argregs_all):
             flagged.add(addr)
+        if extmap is not None and ext_out is not None:
+            esym = extmap.get(addr)
+            if esym and _args_tainted(cur, argregs_all):
+                ext_out.add(esym)
         tainted_params = set()
         if internal:
             for i, regset in enumerate(argregs_list):
                 if any(("reg", r) in cur for r in regset):
                     tainted_params.add(i)
         _apply(cur, instr.get("pcode", []))
-        if ext in SOURCES:
+        if seed_sources and ext in SOURCES:
             cur |= {("reg", r) for r in retregs}
         if internal:
             if tainted_params:
@@ -219,3 +232,97 @@ def analyze_program(func_irs, call_edges, arch):
                         entry_params[f], ret_tainted)
         flagged |= ff
     return flagged
+
+
+# ---------------------------------------------------- cross-binary summaries (Phase 8, 17.2)
+def _program(func_irs, call_edges, arch, *, seed_params=None, seed_sources=True):
+    """Inter-procedural fixpoint with optional entry-param seeds and SOURCES toggle.
+
+    Returns (flagged_sink_sites, tainted_imported_symbols). `seed_params` maps a function
+    entry addr -> set of tainted parameter indices; `seed_sources=False` makes the seed the
+    only taint origin (callee-export summary).
+    """
+    ak = _arch_key(arch)
+    if not ak or not _arg_regs(ARCH_ABI[ak]):
+        return set(), set()
+    abi = ARCH_ABI[ak]
+    func_addrs = set(func_irs)
+    if not func_addrs or len(func_addrs) > _MAX_FUNCS:
+        return set(), set()
+    callmap = build_callmap(call_edges)
+    dstmap = {e.site_addr: e.dst_addr for e in call_edges if e.site_addr and e.dst_addr}
+    extmap = {e.site_addr: normalize(e.dst_name) for e in call_edges
+              if e.site_addr and e.external and e.dst_name}
+    callers = defaultdict(set)
+    for e in call_edges:
+        if e.dst_addr and e.src_addr:
+            callers[e.dst_addr].add(e.src_addr)
+
+    entry_params = {a: set() for a in func_addrs}
+    for a, ps in (seed_params or {}).items():
+        if a in entry_params:
+            entry_params[a] |= set(ps)
+    ret_tainted = {a: False for a in func_addrs}
+    wl = deque(func_addrs)
+    inq = set(func_addrs)
+    cap = len(func_addrs) * 8 + 200
+    while wl and cap > 0:
+        cap -= 1
+        f = wl.popleft()
+        inq.discard(f)
+        _, retf, contribs = _run(func_irs[f], abi, callmap, dstmap, func_addrs,
+                                 entry_params[f], ret_tainted, seed_sources=seed_sources)
+        if retf and not ret_tainted[f]:
+            ret_tainted[f] = True
+            for c in callers.get(f, ()):
+                if c in func_addrs and c not in inq:
+                    wl.append(c); inq.add(c)
+        for g, params in contribs.items():
+            if g in entry_params and (params - entry_params[g]):
+                entry_params[g] |= params
+                if g not in inq:
+                    wl.append(g); inq.add(g)
+
+    flagged, ext = set(), set()
+    for f in func_addrs:
+        ff, _, _ = _run(func_irs[f], abi, callmap, dstmap, func_addrs, entry_params[f],
+                        ret_tainted, seed_sources=seed_sources, extmap=extmap, ext_out=ext)
+        flagged |= ff
+    return flagged, ext
+
+
+def caller_tainted_imports(func_irs, call_edges, arch) -> set:
+    """Imported-symbol names this component calls with tainted (untrusted-input) arguments.
+    These are the outbound boundaries where tainted data leaves this component."""
+    _, ext = _program(func_irs, call_edges, arch, seed_sources=True)
+    return ext
+
+
+def callee_sink_exports(func_irs, call_edges, arch, name_to_addr, export_names,
+                        max_exports=96) -> dict:
+    """For each exported function named in `export_names`, does tainting its parameters
+    reach a dangerous sink? Returns {export_name: set((cwe, sink_symbol))}."""
+    ak = _arch_key(arch)
+    if not ak or not _arg_regs(ARCH_ABI[ak]):
+        return {}
+    nargs = len(ARCH_ABI[ak]["args"]) or 6
+    callmap = build_callmap(call_edges)
+    out: dict = {}
+    n = 0
+    for name in export_names:
+        addr = name_to_addr.get(name)
+        if not addr or addr not in func_irs:
+            continue
+        n += 1
+        if n > max_exports:
+            break
+        flagged, _ = _program(func_irs, call_edges, arch,
+                              seed_params={addr: set(range(nargs))}, seed_sources=False)
+        sinks = set()
+        for site in flagged:
+            sym = callmap.get(site)
+            if sym in DANGEROUS:
+                sinks.add((DANGEROUS[sym][0], sym))
+        if sinks:
+            out[name] = sinks
+    return out

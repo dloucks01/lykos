@@ -529,10 +529,15 @@ class Handler(BaseHTTPRequestHandler):
             q = JobQueue(s.conn)
             stage = body.get("stage", _INGEST)
             target_id = body.get("target_id")
-            if stage == "link_case":
-                from ..analyze.link import enqueue_link
-                run = enqueue_link(q, body.get("case_id") or (
-                    s.targets.get(target_id).case_id if target_id else None))
+            if stage in ("link_case", "cross_taint"):
+                cid = body.get("case_id") or (
+                    s.targets.get(target_id).case_id if target_id else None)
+                if stage == "link_case":
+                    from ..analyze.link import enqueue_link
+                    run = enqueue_link(q, cid)
+                else:
+                    from ..analyze.link import enqueue_cross_taint
+                    run = enqueue_cross_taint(q, cid)
                 return self._json({"run_id": run.id, "from_cache": run.status == "done"}, 201)
             if stage in (_INGEST, "disassemble", "detect_cwe", "dynamic_run", "fuzz",
                          "coverage_fuzz", "directed_fuzz", "concolic",
