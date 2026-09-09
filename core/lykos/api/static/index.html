@@ -1092,6 +1092,7 @@ async function showDetail(targetId){
               <span class="vsep"></span>
               <button class="btn sm" id="synthrun" title="Deterministic: synthesize the overflow input from the recovered stack frame (buffer size + offset) and detonate once -- no fuzzing. Needs Decompile first.">Synthesize PoC (no fuzz)</button>
               <button class="btn sm" id="monitorrun" title="Run under GDB with breakpoints on dangerous sinks; capture what the program passes them at runtime (command strings, copy lengths) -- finds executed commands and overflows without a crash. Native-arch only.">Runtime monitor</button>
+              <button class="btn sm" id="heaprun" title="Run under a guard-page heap allocator (LD_PRELOAD) that catches use-after-free, double-free, heap overflow and invalid free at the exact access -- silent corruptions that don't crash. Native-arch, dynamically-linked targets.">Heap check</button>
               <span class="fghint" id="strathint"></span>
             </div>
           </div>
@@ -1118,6 +1119,7 @@ async function showDetail(targetId){
   document.getElementById("fuzzrun").onclick = ()=>runFuzz(targetId);
   document.getElementById("synthrun").onclick = ()=>doSynthesize(targetId);
   document.getElementById("monitorrun").onclick = ()=>doMonitor(targetId);
+  document.getElementById("heaprun").onclick = ()=>doHeapCheck(targetId);
   const fm=document.getElementById("fuzzmetrics"); if(fm){ fm.hidden=true; fm.innerHTML=""; }
   const sc=document.getElementById("seedcount"); if(sc) sc.textContent="";
   CUSTOM_SPEC=null; BUILDER=[]; updateCustomChip();   // a built spec is per-target
@@ -1513,6 +1515,11 @@ async function doMonitor(tid){
   await postRun(tid, "debug_monitor", {input_mode:(mode==="none"?"stdin":mode), timeout:20},
     {status:"monitoring dangerous calls under GDB…"});
 }
+async function doHeapCheck(tid){
+  const mode = document.getElementById("dynmode").value;
+  await postRun(tid, "heap_check", {input_mode:(mode==="none"?"stdin":mode), timeout:15},
+    {status:"heap check under guard-page allocator…"});
+}
 async function doConcolic(tid){
   const mode = document.getElementById("dynmode").value;
   await postRun(tid, "concolic", {input_mode:(mode==="none"?"stdin":mode),input_size:64,max_seconds:120,
@@ -1837,6 +1844,13 @@ function openWS(id){
       const st=document.getElementById("fuzzstat");
       if(st&&e.payload) st.textContent = !e.payload.ok ? (e.payload.note||"monitor unavailable")
         : `monitor: ${e.payload.calls||0} dangerous call(s), ${e.payload.findings||0} finding(s)`;
+      loadFindings(DETAIL_TID);
+    }
+    if(e.type==="heap.done" && DETAIL_TID){
+      const st=document.getElementById("fuzzstat");
+      if(st&&e.payload) st.textContent = !e.payload.ok ? (e.payload.note||"heap check unavailable")
+        : (e.payload.errors ? `heap: ${e.payload.findings} finding(s) — ${(e.payload.kinds||[]).join(', ')}`
+           : (e.payload.note||"no heap errors on this input"));
       loadFindings(DETAIL_TID);
     }
     if(e.type==="synth.start"){ const st=document.getElementById("fuzzstat"); if(st&&e.payload) st.textContent=`synthesizing from ${e.payload.candidates.length} recovered buffer(s)…`; }
