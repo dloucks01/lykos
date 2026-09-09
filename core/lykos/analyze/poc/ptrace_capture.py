@@ -20,7 +20,9 @@ import struct
 import sys
 
 PTRACE_TRACEME = 0
+PTRACE_PEEKTEXT = 1
 PTRACE_PEEKDATA = 2
+PTRACE_POKETEXT = 4
 PTRACE_CONT = 7
 PTRACE_GETREGS = 12
 PTRACE_KILL = 8
@@ -101,6 +103,21 @@ def _peek(libc, pid, addr):
     return word & 0xFFFFFFFFFFFFFFFF
 
 
+def _set_breakpoint(libc, pid, addr):
+    """Write a 0xCC (int3) at addr, returning the original byte, or None on failure."""
+    ctypes.set_errno(0)
+    word = libc.ptrace(PTRACE_PEEKTEXT, pid, ctypes.c_void_p(addr), 0)
+    if word == -1 and ctypes.get_errno() != 0:
+        return None
+    word &= 0xFFFFFFFFFFFFFFFF
+    orig = word & 0xFF
+    patched = (word & ~0xFF) | 0xCC
+    if libc.ptrace(PTRACE_POKETEXT, pid, ctypes.c_void_p(addr),
+                   ctypes.c_void_p(patched)) != 0:
+        return None
+    return orig
+
+
 def _read_bytes(libc, pid, addr, n):
     out = bytearray()
     while len(out) < n:
@@ -163,10 +180,15 @@ def _getregs_aarch64(libc, pid):
     return regs, "pc", "sp"
 
 
-def capture(exe, argv, stdin_file, timeout):
+def capture(exe, argv, stdin_file, timeout, breakpoints=None):
+    """Run `exe` under ptrace and capture the fault. When `breakpoints` (x86-64 VAs) are given,
+    set software breakpoints and, if execution reaches one, report `breakpoint_hit` instead of
+    (or before) a fault -- used to confirm a control-flow hijack reached a chosen function."""
     host = _host()
     if host not in ("x86-64", "aarch64"):
         return {"ok": False, "reason": f"unsupported host arch {host}", "arch": host}
+    if breakpoints and host != "x86-64":
+        breakpoints = None                             # software int3 breakpoints: x86-64 only
     libc = _libc()
 
     pid = os.fork()
@@ -199,6 +221,12 @@ def capture(exe, argv, stdin_file, timeout):
     signal.alarm(max(1, int(timeout)))
 
     os.waitpid(pid, 0)                                 # initial stop at execv (SIGTRAP)
+    bp_orig = {}
+    if breakpoints:                                    # loaded image is now mapped
+        for addr in breakpoints:
+            o = _set_breakpoint(libc, pid, int(addr))
+            if o is not None:
+                bp_orig[int(addr)] = o
     libc.ptrace(PTRACE_CONT, pid, 0, 0)
     result = {"ok": False, "reason": "no fatal signal", "arch": host}
     while True:
@@ -210,6 +238,17 @@ def capture(exe, argv, stdin_file, timeout):
             break
         if os.WIFSTOPPED(status):
             sig = os.WSTOPSIG(status)
+            if bp_orig and sig == signal.SIGTRAP:
+                got = _getregs_x86_64(libc, pid)
+                pc = got[0][got[1]] if got else 0
+                hit = (pc - 1) if (pc - 1) in bp_orig else (pc if pc in bp_orig else None)
+                if hit is not None:
+                    result = {"ok": True, "arch": host, "breakpoint_hit": hit,
+                              "pc": pc, "regs": got[0] if got else {}}
+                    libc.ptrace(PTRACE_KILL, pid, 0, 0)
+                    break
+                libc.ptrace(PTRACE_CONT, pid, 0, 0)    # not our breakpoint; keep going
+                continue
             if sig in FATAL:
                 got = _getregs_x86_64(libc, pid) if host == "x86-64" \
                     else _getregs_aarch64(libc, pid)
@@ -244,7 +283,7 @@ def main(spec_path):
     spec = json.load(open(spec_path))
     try:
         res = capture(spec["exe"], spec.get("argv", []), spec.get("stdin_file"),
-                      float(spec.get("timeout", 10)))
+                      float(spec.get("timeout", 10)), breakpoints=spec.get("breakpoints"))
     except Exception as e:                             # noqa: BLE001
         res = {"ok": False, "reason": f"{type(e).__name__}: {e}"}
     sys.stdout.write(json.dumps(res))

@@ -692,6 +692,12 @@ async function doPrimitive(tid, inputSha, mode){
     body:JSON.stringify({case_id:CUR,target_id:tid,stage:"poc_primitive",
       params:{input_sha:inputSha,input_mode:mode||"stdin"}})});
 }
+async function doExploit(tid, mode){
+  const st=document.getElementById("fuzzstat"); if(st) st.textContent="synthesizing L3 exploit (ret2win)…";
+  await fetch("/runs",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({case_id:CUR,target_id:tid,stage:"build_exploit",
+      params:{input_mode:mode||"stdin"}})});
+}
 async function doRootCause(tid, inputSha, mode){
   const st=document.getElementById("fuzzstat"); if(st) st.textContent="root-cause analysis…";
   await fetch("/runs",{method:"POST",headers:{"Content-Type":"application/json"},
@@ -782,6 +788,7 @@ async function loadDyn(tid){
       const poc = (r.crashed && r.input_sha)
         ? ` <button class="btn sm" onclick="doPoc('${DETAIL_TID}','${r.input_sha}','${r.input_mode||'stdin'}')">Build PoC</button>`
           + ` <button class="btn sm" title="Assess L2 exploitation primitive (instruction-pointer control)" onclick="doPrimitive('${DETAIL_TID}','${r.input_sha}','${r.input_mode||'stdin'}')">L2</button>`
+          + ` <button class="btn sm" title="L3 assisted exploit: synthesize a ret2win control-flow hijack and confirm it (no-PIE x86-64)" onclick="doExploit('${DETAIL_TID}','${r.input_mode||'stdin'}')">L3</button>`
           + ` <button class="btn sm" title="Debugger root-cause analysis (fault classification + slice)" onclick="doRootCause('${DETAIL_TID}','${r.input_sha}','${r.input_mode||'stdin'}')">Root Cause</button>`
           + ` <button class="btn sm" title="Multi-process debug: follow fork/exec into spawned children and blame the crash on this input" onclick="doMultiDebug('${DETAIL_TID}','${r.input_sha}','${r.input_mode||'stdin'}')">Multi-debug</button>` : "";
       return `${st} <span style="color:var(--faint)">${esc(r.isolation||'')} ${r.duration_ms||0}ms ${esc(r.note||'')}</span>${poc}`;
@@ -915,6 +922,13 @@ function openWS(id){
       const st=document.getElementById("fuzzstat");
       if(st&&e.payload) st.textContent = e.payload.summary ? ("root cause: "+e.payload.summary).slice(0,90) : (e.payload.note||"no fault reproduced");
       loadFindings(DETAIL_TID);
+    }
+    if(e.type==="exploit.done" && DETAIL_TID){
+      const st=document.getElementById("fuzzstat");
+      if(st&&e.payload){ st.textContent = e.payload.supported===false ? ("L3: "+(e.payload.note||"unsupported"))
+        : (e.payload.confirmed ? `L3 CONFIRMED: ret2win → ${esc(e.payload.win||'')} @ offset ${e.payload.offset}`
+           : `L3: ${esc(e.payload.win||'win')} not reached (${esc(e.payload.note||'')})`.slice(0,110)); }
+      loadPocs(DETAIL_TID); loadFindings(DETAIL_TID);
     }
     if(e.type==="primitive.done" && DETAIL_TID){
       const st=document.getElementById("fuzzstat");

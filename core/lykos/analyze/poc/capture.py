@@ -26,7 +26,7 @@ def make_capture(ctx, helper: Path, exe, mode, base_argv, timeout, python):
     """Return capture(data)->dict: run `exe` on `data` (via `mode`) under the ptrace helper."""
     work = helper.parent
 
-    def capture(data: bytes) -> dict:
+    def capture(data: bytes, breakpoints=None) -> dict:
         stdin_file = None
         argv = list(base_argv)
         if mode == "stdin":
@@ -38,6 +38,8 @@ def make_capture(ctx, helper: Path, exe, mode, base_argv, timeout, python):
             (work / "input.bin").write_bytes(data)
             argv = argv + [str(work / "input.bin")]
         spec = {"exe": str(exe), "argv": argv, "stdin_file": stdin_file, "timeout": timeout}
+        if breakpoints:
+            spec["breakpoints"] = [int(a) for a in breakpoints]
         spec_path = work / "spec.json"
         spec_path.write_text(json.dumps(spec))
         proc = ctx.run_subprocess([python, str(helper), str(spec_path)], timeout=timeout + 30)
