@@ -221,6 +221,12 @@ tbody tr:hover{background:var(--surface-2)}
 .lgdyn{border-top-color:var(--border-strong)}
 .lgtaint{border-top:2px dashed var(--danger)}
 .lgipc{border-top:2px dotted var(--info)}
+/* ---- report: export format grid ---- */
+.fmtgrid{display:grid;grid-template-columns:1fr;gap:8px}
+.fmt{display:flex;align-items:center;gap:12px}
+.fmt>.btn,.fmt>a.btn{min-width:120px;justify-content:center;text-align:center}
+.fmt>span{font-size:11.5px;color:var(--dim)}
+@media(min-width:720px){.fmtgrid{grid-template-columns:1fr 1fr}}
 </style>
 </head>
 <body>
@@ -450,40 +456,76 @@ function renderReport(){
   const sevs=['','critical','high','medium','low','info'];
   const states=['candidate','corroborated','confirmed','poc-backed'];
   rp.innerHTML=`
-   <div class="card">
-     <div class="cardhead"><span class="eyebrow">Report builder</span>
-       <span class="mono" style="color:var(--faint);font-size:11px">shareable · reproducible · air-gapped</span></div>
-     <div class="filters">
-       <label class="fld">min severity
-         <select id="rsev" onchange="REPORT_FILTER.min_severity=this.value;refreshPreview()">
-           ${sevs.map(s=>`<option value="${s}" ${REPORT_FILTER.min_severity===s?'selected':''}>${s||'any'}</option>`).join('')}
-         </select></label>
-       <div class="statechks">${states.map(s=>`<label class="chk"><input type="checkbox" value="${s}"
-          ${REPORT_FILTER.states.includes(s)?'checked':''} onchange="toggleState('${s}',this.checked)">
-          <span class="st ${s==='poc-backed'?'pocbacked':s}">${s}</span></label>`).join('')}</div>
-     </div>
-     <div class="rptbtns">
-       <button class="btn primary" onclick="window.open(reportURL('html',true),'_blank')">Open HTML ↗</button>
-       <a class="btn" id="dlpdf" download>PDF</a>
-       <a class="btn" id="dlsarif" download>SARIF</a>
-       <a class="btn" id="dljson" download>Case JSON</a>
-       <button class="btn sm" onclick="refreshPreview()">↻ Preview</button>
-     </div>
+   <div class="wbhead">
+     <div class="wbtitle">Report builder</div>
+     <div class="mono" style="color:var(--faint);font-size:11px">shareable · reproducible · air-gapped</div>
    </div>
-   <div class="card">
-     <div class="cardhead"><span class="eyebrow">Case portability (sneakernet)</span></div>
-     <div class="rptbtns">
-       <a class="btn" href="/cases/${CUR}/export" download>Export case (.tar.gz)</a>
-       <button class="btn" onclick="document.getElementById('impfile').click()">Import archive…</button>
-       <input type="file" id="impfile" accept=".gz,.tgz,.tar" style="display:none" onchange="doImportCase(this.files[0])">
-       <span class="mono" id="impstat" style="color:var(--faint);font-size:11px"></span>
-     </div>
-   </div>
-   <div class="card" style="padding:0;overflow:hidden">
-     <div class="cardhead" style="padding:11px 14px 0"><span class="eyebrow">Live preview</span></div>
-     <iframe id="rpreview" title="report preview" style="width:100%;height:540px;border:0;background:#fff;margin-top:8px"></iframe>
+   <div class="pipe">
+     <section class="stage">
+       <div class="stagehdr"><span class="snum">1</span><b>Scope</b><span class="schip mono" id="rcount"></span></div>
+       <div class="sbody">
+         <div class="filters">
+           <label class="fld">min severity
+             <select id="rsev" onchange="REPORT_FILTER.min_severity=this.value;refreshPreview()">
+               ${sevs.map(s=>`<option value="${s}" ${REPORT_FILTER.min_severity===s?'selected':''}>${s||'any'}</option>`).join('')}
+             </select></label>
+           <div class="statechks">${states.map(s=>`<label class="chk"><input type="checkbox" value="${s}"
+              ${REPORT_FILTER.states.includes(s)?'checked':''} onchange="toggleState('${s}',this.checked)">
+              <span class="st ${s==='poc-backed'?'pocbacked':s}">${s}</span></label>`).join('')}</div>
+         </div>
+         <div class="hint">No state selected includes every state; "any" severity includes all.</div>
+       </div>
+     </section>
+
+     <section class="stage">
+       <div class="stagehdr"><span class="snum">2</span><b>Live preview</b>
+         <span class="schip"><button class="btn sm" onclick="refreshPreview()">↻ Refresh</button></span></div>
+       <div class="sbody" style="padding:0">
+         <iframe id="rpreview" title="report preview" style="width:100%;height:520px;border:0;background:#fff;display:block"></iframe>
+       </div>
+     </section>
+
+     <section class="stage">
+       <div class="stagehdr"><span class="snum">3</span><b>Export &amp; share</b></div>
+       <div class="sbody">
+         <div class="fmtgrid">
+           <div class="fmt"><button class="btn primary" onclick="window.open(reportURL('html',true),'_blank')">Open HTML ↗</button>
+             <span>Self-contained &amp; interactive, embeds the PoC bundles — the primary shareable format.</span></div>
+           <div class="fmt"><a class="btn" id="dlpdf" download>PDF</a><span>Paginated, print-ready.</span></div>
+           <div class="fmt"><a class="btn" id="dlsarif" download>SARIF 2.1</a><span>Static-analysis interchange for other tools / CI.</span></div>
+           <div class="fmt"><a class="btn" id="dljson" download>Case JSON</a><span>Machine-readable case dump.</span></div>
+         </div>
+       </div>
+     </section>
+
+     <section class="stage">
+       <div class="stagehdr"><span class="snum">4</span><b>Case portability</b><span class="schip mono">sneakernet</span></div>
+       <div class="sbody">
+         <div class="actions">
+           <a class="btn" href="/cases/${CUR}/export" download>Export case (.tar.gz)</a>
+           <button class="btn" onclick="document.getElementById('impfile').click()">Import archive…</button>
+           <input type="file" id="impfile" accept=".gz,.tgz,.tar" style="display:none" onchange="doImportCase(this.files[0])">
+           <span class="mono" id="impstat" style="color:var(--faint);font-size:11px"></span>
+         </div>
+         <div class="hint">Move a whole engagement between air-gapped stores. Import is an idempotent merge.</div>
+       </div>
+     </section>
    </div>`;
+  loadReportFindings();
   refreshPreview();
+}
+
+let REPORT_FINDINGS=[];
+async function loadReportFindings(){
+  try{ REPORT_FINDINGS = await api(`/cases/${CUR}/findings`); }catch(e){ REPORT_FINDINGS=[]; }
+  updateReportCount();
+}
+function updateReportCount(){
+  const el=document.getElementById("rcount"); if(!el) return;
+  const f=REPORT_FILTER, minR=f.min_severity?_SEVRANK[f.min_severity]:-1;
+  const inc=REPORT_FINDINGS.filter(x=>
+    (minR<0||_SEVRANK[x.severity]>=minR) && (!f.states.length||f.states.includes(x.state))).length;
+  el.textContent=`${inc} of ${REPORT_FINDINGS.length} findings`;
 }
 function syncReportLinks(){
   const set=(id,fmt)=>{const a=document.getElementById(id); if(a) a.href=reportURL(fmt,true);};
@@ -495,7 +537,7 @@ function toggleState(s,on){
   refreshPreview();
 }
 function refreshPreview(){
-  syncReportLinks();
+  syncReportLinks(); updateReportCount();
   const f=document.getElementById("rpreview"); if(f) f.src=reportURL('html',false);
 }
 async function doImportCase(file){
