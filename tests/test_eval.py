@@ -4,7 +4,64 @@ import shutil
 import pytest
 from lykos.analyze.detect.catalog import CWE
 from lykos.eval import corpus, harness
-from lykos.eval.metrics import Outcome, Report, score
+from lykos.eval.metrics import Outcome, Report, matches, same_family, score
+
+# ---- a faithful miniature NIST Juliet C drop (real conventions) ----
+_STD_H = ("#ifndef STD_TESTCASE_H\n#define STD_TESTCASE_H\n#include <stdio.h>\n"
+          "#include <stdlib.h>\n#include <string.h>\nvoid printLine(const char*);\n#endif\n")
+_IO_C = ('#include "std_testcase.h"\nvoid printLine(const char*l){ if(l) puts(l); }\n')
+_CWE121 = r"""#include "std_testcase.h"
+#ifndef OMITBAD
+void CWE121_Stack_Based_Buffer_Overflow__char_environment_cpy_01_bad(){
+    char * data = getenv("ADD"); char dest[16];
+    if(data){ strcpy(dest, data); printLine(dest); } }
+#endif
+#ifndef OMITGOOD
+static void goodG2B(){ char * data = "fixed"; char dest[16]; strcpy(dest, data); printLine(dest); }
+void CWE121_Stack_Based_Buffer_Overflow__char_environment_cpy_01_good(){ goodG2B(); }
+#endif
+#ifdef INCLUDEMAIN
+int main(int c,char**v){ (void)c;(void)v;
+#ifndef OMITGOOD
+  CWE121_Stack_Based_Buffer_Overflow__char_environment_cpy_01_good();
+#endif
+#ifndef OMITBAD
+  CWE121_Stack_Based_Buffer_Overflow__char_environment_cpy_01_bad();
+#endif
+  return 0; }
+#endif
+"""
+_CWE134 = r"""#include "std_testcase.h"
+#ifndef OMITBAD
+void CWE134_Uncontrolled_Format_String__char_environment_printf_01_bad(){
+    char * data = getenv("ADD"); if(data) printf(data); }
+#endif
+#ifndef OMITGOOD
+static void goodG2B(){ printf("%s", "fixed"); }
+void CWE134_Uncontrolled_Format_String__char_environment_printf_01_good(){ goodG2B(); }
+#endif
+#ifdef INCLUDEMAIN
+int main(int c,char**v){ (void)c;(void)v;
+#ifndef OMITGOOD
+  CWE134_Uncontrolled_Format_String__char_environment_printf_01_good();
+#endif
+#ifndef OMITBAD
+  CWE134_Uncontrolled_Format_String__char_environment_printf_01_bad();
+#endif
+  return 0; }
+#endif
+"""
+
+
+def _mini_juliet(root):
+    sup = root / "C" / "testcasesupport"; sup.mkdir(parents=True)
+    (sup / "std_testcase.h").write_text(_STD_H)
+    (sup / "io.c").write_text(_IO_C)
+    d1 = root / "C" / "testcases" / "CWE121_x" / "s01"; d1.mkdir(parents=True)
+    (d1 / "CWE121_Stack_Based_Buffer_Overflow__char_environment_cpy_01.c").write_text(_CWE121)
+    d2 = root / "C" / "testcases" / "CWE134_x" / "s01"; d2.mkdir(parents=True)
+    (d2 / "CWE134_Uncontrolled_Format_String__char_environment_printf_01.c").write_text(_CWE134)
+    return root
 
 
 # ---------------------------------------------------------------- metrics (pure, fast)
@@ -68,6 +125,48 @@ def test_bundled_corpus_is_labeled_good_bad_pairs():
         by.setdefault(c.cwe, set()).add(c.verdict)
     for cwe, verds in by.items():
         assert verds == {"good", "bad"}, f"{cwe} lacks a good/bad pair"
+
+
+def test_cwe_family_matching():
+    # a sink's generic CWE credits a case labeled with a sibling (Juliet uses specific labels)
+    assert same_family("CWE-121", "CWE-120") and same_family("CWE-787", "CWE-119")
+    assert not same_family("CWE-121", "CWE-78")
+    assert matches("CWE-121", {"CWE-120", "CWE-693"})     # strcpy(CWE-120) detects CWE-121
+    assert not matches("CWE-134", {"CWE-120"})
+
+
+def test_load_juliet_parses_and_pairs(tmp_path):
+    _mini_juliet(tmp_path)
+    cases = corpus.load_juliet(tmp_path)
+    assert len(cases) == 4                                # 2 testcases x good/bad
+    by = {(c.cwe, c.verdict): c for c in cases}
+    assert set(by) == {("CWE-121", "bad"), ("CWE-121", "good"),
+                       ("CWE-134", "bad"), ("CWE-134", "good")}
+    bad = by[("CWE-121", "bad")]
+    assert any(f.endswith("io.c") for f in bad.files)     # links Juliet support
+    assert "-DOMITGOOD" in bad.cflags and "-DINCLUDEMAIN" in bad.cflags
+    assert "-DOMITBAD" in by[("CWE-121", "good")].cflags
+    # a CWE filter narrows the drop
+    only134 = corpus.load_juliet(tmp_path, cwes={"CWE-134"})
+    assert {c.cwe for c in only134} == {"CWE-134"}
+
+
+def test_juliet_taint_channel_lifts_precision_end_to_end(tmp_path):
+    """Score a Juliet testcase whose good variant calls the same API safely: the rule channel
+    (candidate) false-positives on it, but the taint channel (corroborated) does not -- the
+    confidence pipeline's precision lever, measured end to end. Needs gcc + Ghidra."""
+    from lykos.analyze.ghidra import locate_ghidra
+    if not shutil.which("gcc") or not locate_ghidra():
+        pytest.skip("needs gcc + Ghidra")
+    cases = corpus.load_juliet(_mini_juliet(tmp_path), cwes={"CWE-121"})  # 1 testcase, 2 bins
+    cand = harness.run_corpus(cases, min_state="candidate", stage_timeout=180)
+    corr = harness.run_corpus(cases, min_state="corroborated", stage_timeout=180)
+    cbad = {o.verdict: o for o in cand.outcomes}
+    assert cbad["bad"].flagged and cbad["good"].flagged        # rule flags BOTH (both strcpy)
+    assert cand.metrics["overall"]["fp_rate"] == 1.0          # ...so precision suffers
+    rbad = {o.verdict: o for o in corr.outcomes}
+    assert rbad["bad"].flagged and not rbad["good"].flagged   # taint flags only the real flaw
+    assert corr.metrics["overall"]["recall"] == 1.0 and corr.metrics["overall"]["fp_rate"] == 0.0
 
 
 def test_load_dir_parses_named_cases(tmp_path):

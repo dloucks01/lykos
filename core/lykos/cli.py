@@ -67,6 +67,16 @@ def build_parser() -> argparse.ArgumentParser:
                          "dynamic = confirmed-stage crash reproduction via fuzzing")
     ev.add_argument("--corpus", default=None,
                     help="directory of <CWE>__<name>__<good|bad>.c cases (default: bundled)")
+    ev.add_argument("--juliet", default=None,
+                    help="path to an unpacked NIST Juliet C drop to score")
+    ev.add_argument("--cwe", default=None,
+                    help="comma-separated CWE filter for --juliet, e.g. CWE-121,CWE-134")
+    ev.add_argument("--limit", type=int, default=None,
+                    help="cap the number of Juliet testcases (drops are huge)")
+    ev.add_argument("--min-state", choices=["candidate", "corroborated", "confirmed"],
+                    default="candidate",
+                    help="finding state a static case must reach to count as detected "
+                         "(candidate = rule/sink channel; corroborated = taint-discriminated)")
     ev.add_argument("--out", default=None, help="write the full JSON report to this path")
     ev.add_argument("--workers", type=int, default=2, help="worker count (default 2)")
     ev.set_defaults(func=_cmd_eval)
@@ -78,14 +88,24 @@ def _cmd_eval(args: argparse.Namespace) -> int:
 
     from .eval import corpus as corpusmod
     from .eval import harness
-    cases = corpusmod.load_dir(args.corpus) if args.corpus else None
-    rep = harness.run(cases, stage=args.stage, workers=args.workers,
-                      progress=lambda m: print(m, file=sys.stderr, flush=True))
+    if args.juliet:
+        cwes = set(args.cwe.split(",")) if args.cwe else None
+        cases = corpusmod.load_juliet(args.juliet, cwes=cwes, limit=args.limit)
+    elif args.corpus:
+        cases = corpusmod.load_dir(args.corpus)
+    else:
+        cases = None
+    kw = {"stage": args.stage, "workers": args.workers,
+          "progress": lambda m: print(m, file=sys.stderr, flush=True)}
+    if args.stage == "static":
+        kw["min_state"] = args.min_state
+    rep = harness.run(cases, **kw)
     for w in rep.meta.get("warnings", []):
         print(f"warning: {w}", file=sys.stderr)
     print(rep.table())
     o = rep.metrics.get("overall", {})
-    backend = (f"ghidra={'yes' if rep.meta.get('ghidra') else 'NO'}" if args.stage == "static"
+    backend = (f"ghidra={'yes' if rep.meta.get('ghidra') else 'NO'}, min_state={args.min_state}"
+               if args.stage == "static"
                else f"fuzz budget={rep.meta.get('max_execs')} execs/{rep.meta.get('max_seconds')}s")
     print(f"\n{args.stage}-stage: {rep.metrics.get('n_cases', 0)} cases, "
           f"{rep.metrics.get('n_cwe_classes', 0)} CWE classes, "
