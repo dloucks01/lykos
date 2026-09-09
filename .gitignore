@@ -8,3 +8,5 @@ vendor/
 eval-report.json
 eval-history.jsonl
 eval-dashboard.html
+examples/re-corpus/bin/*
+!examples/re-corpus/bin/manifest.tsv

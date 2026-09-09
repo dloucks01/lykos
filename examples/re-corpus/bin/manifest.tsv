@@ -1,0 +1,25 @@
+file	arch	format	lang	size	notes
+vuln_x86-64	x86-64	ELF	C	16424	O0 with dangerous sinks
+vuln_x86-64_stripped	x86-64	ELF	C	14528	O0 stripped
+vuln_x86-64_O3	x86-64	ELF	C	16384	O3 optimized
+vuln_x86-64_static	x86-64	ELF	C	698760	O2 static stripped
+vuln_x86-64_upx	x86-64	ELF	C	301488	UPX packed
+parser_x86-64	x86-64	ELF	C	16160	file-format parser
+shapes_x86-64_cpp	x86-64	ELF	C++	18336	vtables + exceptions
+vuln_win64.exe	x86-64	PE	C	268635	mingw
+vuln_win32.exe	i386	PE	C	250960	mingw
+vuln_win64_stripped.exe	x86-64	PE	C	44032	mingw stripped
+hello_rust_ripgrep	x86-64	ELF	Rust	5268784	ripgrep (real-world, PIE)
+busybox_aarch64	aarch64	ELF	C	1975064	busybox real-world static stripped
+busybox_armv4l	armv4l	ELF	C	1099124	busybox real-world static stripped
+busybox_armv5l	armv5l	ELF	C	1123632	busybox real-world static stripped
+busybox_armv6l	armv6l	ELF	C	1107664	busybox real-world static stripped
+busybox_i686	i686	ELF	C	1061344	busybox real-world static stripped
+busybox_mips	mips	ELF	C	1498452	busybox real-world static stripped
+busybox_mipsel	mipsel	ELF	C	1498448	busybox real-world static stripped
+busybox_powerpc	powerpc	ELF	C	1173436	busybox real-world static stripped
+busybox_ppc64le	ppc64le	ELF	C	2565024	busybox real-world static stripped
+busybox_riscv64	riscv64	ELF	C	1614632	busybox real-world static stripped
+busybox_s390x	s390x	ELF	C	2146952	busybox real-world static stripped
+busybox_sparc	sparc	ELF	C	1177656	busybox real-world static stripped
+busybox_x86-64	x86-64	ELF	C	1131168	busybox real-world static stripped

@@ -240,4 +240,11 @@ CREATE TABLE component_edge(
 );
 CREATE INDEX ix_component_edge_case ON component_edge(case_id);
 """),
+    Migration(version=10, name="function_signature_frame", sql=r"""
+-- Phase 1 deepening: decompiler-recovered prototype + stack-frame layout.
+-- signature is light (shown in the function list); frame_json (params + stack variables
+-- with offsets/sizes/buffer flags + frame geometry) is heavy, hydrated on the full view.
+ALTER TABLE function ADD COLUMN signature  TEXT;
+ALTER TABLE function ADD COLUMN frame_json TEXT;
+"""),
 ]

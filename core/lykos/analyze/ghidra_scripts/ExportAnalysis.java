@@ -16,8 +16,12 @@ import ghidra.program.model.block.CodeBlock;
 import ghidra.program.model.block.CodeBlockIterator;
 import ghidra.program.model.block.CodeBlockReference;
 import ghidra.program.model.block.CodeBlockReferenceIterator;
+import ghidra.program.model.data.Array;
 import ghidra.program.model.data.DataType;
 import ghidra.program.model.lang.Register;
+import ghidra.program.model.listing.Parameter;
+import ghidra.program.model.listing.StackFrame;
+import ghidra.program.model.listing.Variable;
 import ghidra.program.model.listing.Data;
 import ghidra.program.model.listing.DataIterator;
 import ghidra.program.model.listing.Function;
@@ -25,8 +29,13 @@ import ghidra.program.model.listing.FunctionManager;
 import ghidra.program.model.listing.Instruction;
 import ghidra.program.model.listing.InstructionIterator;
 import ghidra.program.model.listing.Listing;
+import ghidra.program.model.pcode.FunctionPrototype;
+import ghidra.program.model.pcode.HighFunction;
+import ghidra.program.model.pcode.HighSymbol;
+import ghidra.program.model.pcode.LocalSymbolMap;
 import ghidra.program.model.pcode.PcodeOp;
 import ghidra.program.model.pcode.Varnode;
+import ghidra.program.model.listing.VariableStorage;
 import ghidra.program.model.symbol.Reference;
 import ghidra.program.model.symbol.ReferenceIterator;
 import ghidra.program.model.symbol.ReferenceManager;
@@ -197,6 +206,110 @@ public class ExportAnalysis extends GhidraScript {
         return out.toString();
     }
 
+    private static boolean isBuffer(DataType dt) {
+        if (dt instanceof Array) {
+            DataType el = ((Array) dt).getDataType();
+            // char/byte arrays are the classic overflow target; any array >= 8 counts
+            return dt.getLength() >= 8 || (el != null && el.getLength() == 1);
+        }
+        return dt != null && dt.getLength() >= 16;   // a large scalar local, treated as a buffer
+    }
+
+    private static String dtName(DataType dt) { return dt == null ? "undefined" : dt.getName(); }
+
+    // ---- decompiler (HighFunction) based recovery: refined types, real params, char[N] arrays ----
+    // Falls back to the listing-level Function view when the decompiler has no high function.
+
+    private String signatureHF(Function f, HighFunction hf) {
+        try {
+            if (hf != null && hf.getFunctionPrototype() != null) {
+                FunctionPrototype p = hf.getFunctionPrototype();
+                StringBuilder s = new StringBuilder();
+                s.append(dtName(p.getReturnType())).append(" ").append(f.getName()).append("(");
+                int n = p.getNumParams();
+                for (int i = 0; i < n; i++) {
+                    if (i > 0) s.append(", ");
+                    HighSymbol hs = p.getParam(i);
+                    s.append(dtName(hs.getDataType())).append(" ").append(hs.getName());
+                }
+                if (n == 0) s.append("void");
+                s.append(")");
+                return esc(s.toString());
+            }
+        } catch (Exception e) { /* fall through */ }
+        try { return esc(f.getPrototypeString(true, false)); }
+        catch (Exception e) { return esc(f.getName()); }
+    }
+
+    private String paramsHF(Function f, HighFunction hf) {
+        StringBuilder s = new StringBuilder("[");
+        try {
+            if (hf != null && hf.getFunctionPrototype() != null) {
+                FunctionPrototype p = hf.getFunctionPrototype();
+                for (int i = 0; i < p.getNumParams(); i++) {
+                    if (i > 0) s.append(",");
+                    HighSymbol hs = p.getParam(i);
+                    DataType dt = hs.getDataType();
+                    s.append("{\"name\":\"").append(esc(hs.getName()))
+                     .append("\",\"type\":\"").append(esc(dtName(dt)))
+                     .append("\",\"size\":").append(hs.getSize()).append("}");
+                }
+                return s.append("]").toString();
+            }
+            Parameter[] ps = f.getParameters();
+            for (int i = 0; i < ps.length; i++) {
+                if (i > 0) s.append(",");
+                s.append("{\"name\":\"").append(esc(ps[i].getName()))
+                 .append("\",\"type\":\"").append(esc(dtName(ps[i].getDataType())))
+                 .append("\",\"size\":").append(ps[i].getLength()).append("}");
+            }
+        } catch (Exception e) { /* partial */ }
+        return s.append("]").toString();
+    }
+
+    // stack-frame layout: every stack local with signed offset, size, refined type, buffer flag.
+    // This is what lets overflow detection reason about buffer sizes and offset-to-return.
+    private String frameHF(Function f, HighFunction hf) {
+        StringBuilder s = new StringBuilder("{");
+        StackFrame sf = f.getStackFrame();
+        try {
+            s.append("\"frame_size\":").append(sf.getFrameSize())
+             .append(",\"local_size\":").append(sf.getLocalSize())
+             .append(",\"param_size\":").append(sf.getParameterSize())
+             .append(",\"ret_offset\":").append(sf.getReturnAddressOffset())
+             .append(",\"vars\":[");
+            boolean first = true;
+            if (hf != null && hf.getLocalSymbolMap() != null) {
+                LocalSymbolMap lsm = hf.getLocalSymbolMap();
+                java.util.Iterator<HighSymbol> it = lsm.getSymbols();
+                while (it.hasNext()) {
+                    HighSymbol hs = it.next();
+                    if (hs.isParameter()) continue;
+                    VariableStorage st = hs.getStorage();
+                    if (st == null || !st.isStackStorage()) continue;
+                    DataType dt = hs.getDataType();
+                    if (!first) s.append(","); first = false;
+                    s.append("{\"name\":\"").append(esc(hs.getName()))
+                     .append("\",\"offset\":").append(st.getStackOffset())
+                     .append(",\"size\":").append(hs.getSize())
+                     .append(",\"type\":\"").append(esc(dtName(dt)))
+                     .append("\",\"is_buffer\":").append(isBuffer(dt)).append("}");
+                }
+            } else {                                      // listing-level fallback
+                for (Variable v : sf.getStackVariables()) {
+                    if (!first) s.append(","); first = false;
+                    s.append("{\"name\":\"").append(esc(v.getName()))
+                     .append("\",\"offset\":").append(v.getStackOffset())
+                     .append(",\"size\":").append(v.getLength())
+                     .append(",\"type\":\"").append(esc(dtName(v.getDataType())))
+                     .append("\",\"is_buffer\":").append(isBuffer(v.getDataType())).append("}");
+                }
+            }
+            s.append("]");
+        } catch (Exception e) { return "{\"frame_size\":0,\"vars\":[]}"; }
+        return s.append("}").toString();
+    }
+
     @Override
     public void run() throws Exception {
         String[] args = getScriptArgs();
@@ -215,10 +328,14 @@ public class ExportAnalysis extends GhidraScript {
         for (Function f : fm.getFunctions(true)) {
             long size = f.getBody() != null ? f.getBody().getNumAddresses() : 0;
             String code = "";
+            HighFunction hf = null;
             try {
                 DecompileResults res = deco.decompileFunction(f, 30, monitor);
-                if (res != null && res.decompileCompleted() && res.getDecompiledFunction() != null)
-                    code = res.getDecompiledFunction().getC();
+                if (res != null && res.decompileCompleted()) {
+                    if (res.getDecompiledFunction() != null)
+                        code = res.getDecompiledFunction().getC();
+                    hf = res.getHighFunction();       // refined types, real params, char[N] arrays
+                }
             } catch (Exception e) { code = ""; }
             String blocksJson = "[]"; int edges = 0, nblocks = 0;
             try {
@@ -227,10 +344,24 @@ public class ExportAnalysis extends GhidraScript {
             } catch (Exception e) { /* keep defaults */ }
             String callsJson;
             try { callsJson = calls(f); } catch (Exception e) { callsJson = "[]"; }
+            String sigJson, paramsJson, frameJson;
+            try { sigJson = signatureHF(f, hf); } catch (Exception e) { sigJson = esc(f.getName()); }
+            try { paramsJson = paramsHF(f, hf); } catch (Exception e) { paramsJson = "[]"; }
+            try { frameJson = frameHF(f, hf); } catch (Exception e) { frameJson = "{\"vars\":[]}"; }
+            boolean thunk = false, varargs = false; String cc = "";
+            try { thunk = f.isThunk(); varargs = f.hasVarArgs();
+                  cc = f.getCallingConventionName() == null ? "" : f.getCallingConventionName(); }
+            catch (Exception e) { /* keep defaults */ }
             if (!first) funcs.append(","); first = false;
             funcs.append("{\"addr\":\"").append(hex(f.getEntryPoint().getOffset()))
                  .append("\",\"name\":\"").append(esc(f.getName()))
                  .append("\",\"size\":").append(size)
+                 .append(",\"signature\":\"").append(sigJson)
+                 .append("\",\"calling_convention\":\"").append(esc(cc))
+                 .append("\",\"thunk\":").append(thunk)
+                 .append(",\"varargs\":").append(varargs)
+                 .append(",\"params\":").append(paramsJson)
+                 .append(",\"frame\":").append(frameJson)
                  .append(",\"decompiled\":\"").append(esc(code))
                  .append("\",\"blocks\":").append(nblocks)
                  .append(",\"edges\":").append(edges)

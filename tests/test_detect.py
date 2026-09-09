@@ -163,3 +163,47 @@ def test_hardening_detector():
     assert {c["cwe"] for c in cands} == {"CWE-693"}
     assert len(cands) == 3           # nx off + canary off + relro partial (pie on -> none)
     assert cands[0]["detector"] == "hardening"
+
+
+def test_stack_buffer_overflow_detector_uses_recovered_frame():
+    """A function that owns a fixed stack buffer AND calls an unbounded copy is flagged
+    CWE-121, citing the recovered buffer size and offset-to-return."""
+    from lykos.analyze.detect.detectors import stack_buffer_overflow
+    ctx = DetectContext(
+        target_id="t", case_id="c",
+        call_edges=[_edge("0x1000", "0x1010", None, "strcpy", 1)],
+        strings=[],
+        frames={"0x1000": {"frame_size": 88, "vars": [
+            {"name": "msg", "offset": -72, "size": 64, "type": "char[64]", "is_buffer": True},
+            {"name": "i", "offset": -8, "size": 4, "type": "int", "is_buffer": False}]}})
+    out = stack_buffer_overflow(ctx)
+    assert len(out) == 1
+    f = out[0]
+    assert f["cwe"] == "CWE-121" and f["function_addr"] == "0x1000"
+    assert "64-byte" in f["title"]
+    assert any("return address" in e["detail"] for e in f["evidence"])
+    # a function with the sink but NO stack buffer is not flagged
+    novar = {"name": "x", "offset": -8, "size": 4, "type": "int", "is_buffer": False}
+    ctx2 = DetectContext(target_id="t", case_id="c",
+                         call_edges=[_edge("0x2000", "0x2010", None, "strcpy", 1)],
+                         strings=[], frames={"0x2000": {"vars": [novar]}})
+    assert stack_buffer_overflow(ctx2) == []
+
+
+def test_function_dao_roundtrips_signature_and_frame(store, case):
+    t = make_target(store, case.id)
+    fd = FunctionDAO(store.conn)
+    fd.replace_for_target(t.id, [{
+        "addr": "0x1000", "name": "greet", "size": 40, "blocks": 3, "edges": 2,
+        "signature": "void greet(char * who)",
+        "params": [{"name": "who", "type": "char *", "size": 8}],
+        "calling_convention": "__stdcall", "thunk": False, "varargs": False,
+        "frame": {"frame_size": 88, "ret_offset": 8, "vars": [
+            {"name": "msg", "offset": -72, "size": 64, "type": "char[64]", "is_buffer": True}]},
+        "cfg": {"blocks": []}}])
+    light = fd.list_by_target(t.id)[0]
+    assert light.signature == "void greet(char * who)"   # signature is in the light list view
+    full = fd.get(light.id)
+    assert full.frame["vars"][0]["is_buffer"] is True and full.frame["vars"][0]["size"] == 64
+    assert full.frame["params"][0]["name"] == "who"
+    assert full.frame["calling_convention"] == "__stdcall"

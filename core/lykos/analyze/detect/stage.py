@@ -16,12 +16,23 @@ def detect_stage(ctx) -> dict:
     if target is None:
         raise ValueError("detect_cwe requires a target_id")
 
+    fdao = FunctionDAO(ctx.conn)
+    functions = fdao.list_by_target(target.id)
+    # hydrate decompiler stack frames (heavy; omitted from the list view) for size-aware detection
+    frames = {}
+    for f in functions:
+        if not f.blocks:
+            continue
+        full = fdao.get(f.id)
+        if full and full.frame and (full.frame.get("vars") or full.frame.get("params")):
+            frames[f.addr] = full.frame
+
     dctx = DetectContext(
         target_id=target.id, case_id=target.case_id,
         call_edges=CallEdgeDAO(ctx.conn).list_by_target(target.id),
         strings=StringDAO(ctx.conn).list_by_target(target.id),
-        functions=FunctionDAO(ctx.conn).list_by_target(target.id),
-        mitigations=target.mitigations or {})
+        functions=functions,
+        mitigations=target.mitigations or {}, frames=frames)
 
     ctx.progress(msg="running CWE detectors")
     cands = []
@@ -32,7 +43,6 @@ def detect_stage(ctx) -> dict:
     # inter-procedural data-flow taint over P-Code: flag sink sites whose argument
     # registers carry tainted data (across function boundaries), and upgrade findings.
     ctx.progress(msg="data-flow taint analysis (inter-procedural)")
-    fdao = FunctionDAO(ctx.conn)
     func_irs = {}
     for f in dctx.functions:
         if not f.blocks:
