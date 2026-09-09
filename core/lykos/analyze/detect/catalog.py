@@ -3,9 +3,14 @@ from __future__ import annotations
 
 # CWE id -> (name, default severity)
 CWE = {
+    "CWE-119": ("Improper Restriction of Operations within Memory Buffer Bounds", "high"),
     "CWE-120": ("Buffer Copy without Checking Size ('Classic Buffer Overflow')", "high"),
     "CWE-121": ("Stack-based Buffer Overflow", "high"),
     "CWE-122": ("Heap-based Buffer Overflow", "high"),
+    "CWE-125": ("Out-of-bounds Read", "high"),
+    "CWE-416": ("Use After Free", "high"),
+    "CWE-476": ("NULL Pointer Dereference", "medium"),
+    "CWE-787": ("Out-of-bounds Write", "high"),
     "CWE-134": ("Uncontrolled Format String", "high"),
     "CWE-242": ("Use of Inherently Dangerous Function", "high"),
     "CWE-676": ("Use of Potentially Dangerous Function", "medium"),

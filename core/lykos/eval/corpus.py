@@ -104,9 +104,69 @@ int main(int c, char**v){ const char*k=getenv("APP_CFG");
 ]
 
 
+# -------------------------------------------- dynamic (confirmed-stage) crash corpus
+# Memory-safety bugs reached over a whole-program vector (stdin) that the fuzzer reproduces
+# as a real crash -> a Confirmed finding. Each `bad` faults deterministically on a single
+# interesting trigger byte (so the seeded fuzzer finds it in a bounded budget); each `good`
+# is the safe variant that never faults (the confirmed-stage FP check, which should be ~0).
+_DYN_FLAGS = ["-O0", "-fno-stack-protector", "-no-pie", "-w"]
+
+
+def _dcase(name, cwe, verdict, source, note=""):
+    return Case(name, cwe, verdict, source, list(_DYN_FLAGS), note)
+
+
+_DYN_CASES: list[Case] = [
+    # ---- CWE-476: NULL-pointer dereference ----
+    _dcase("nullderef_crash", "CWE-476", "bad", r"""
+#include <unistd.h>
+int main(void){ char b[128]; int n=read(0,b,sizeof b-1);
+  for(int i=0;i<n;i++) if(b[i]=='A'){ volatile int*p=0; *p=1; } return 0; }
+""", "derefs NULL when the input contains 'A'"),
+    _dcase("nullderef_safe", "CWE-476", "good", r"""
+#include <unistd.h>
+int main(void){ char b[128]; int n=read(0,b,sizeof b-1); int s=0;
+  for(int i=0;i<n;i++) s+=b[i]; return s & 1; }
+""", "sums the bytes, never dereferences NULL"),
+
+    # ---- CWE-787: out-of-bounds write ----
+    _dcase("oobwrite_crash", "CWE-787", "bad", r"""
+#include <unistd.h>
+#include <stdlib.h>
+int main(void){ char b[128]; int n=read(0,b,sizeof b-1);
+  for(int i=0;i<n;i++) if(b[i]=='Z'){ char*p=malloc(16); p[0x4000000]=1; } return 0; }
+""", "writes 64 MB past a heap allocation (unmapped) when the input contains 'Z'"),
+    _dcase("oobwrite_safe", "CWE-787", "good", r"""
+#include <unistd.h>
+#include <stdlib.h>
+int main(void){ char b[128]; int n=read(0,b,sizeof b-1);
+  char*p=malloc(16); if(p && n>0){ p[0]=b[0]; free(p);} return 0; }
+""", "bounded heap write, then frees"),
+
+    # ---- CWE-121: stack-based buffer overflow ----
+    _dcase("stacksmash_crash", "CWE-121", "bad", r"""
+#include <unistd.h>
+#include <string.h>
+int main(void){ char b[128]; int n=read(0,b,sizeof b-1);
+  for(int i=0;i<n;i++) if(b[i]=='*'){ char big[512]; memset(big,0x2a,512);
+    char small[16]; memcpy(small,big,512); return small[0]; } return 0; }
+""", "overflows a 16-byte stack buffer (return address) when the input contains '*'"),
+    _dcase("stacksmash_safe", "CWE-121", "good", r"""
+#include <unistd.h>
+int main(void){ char small[16]; int n=read(0,small,sizeof small-1);
+  if(n>0) small[n<15?n:15]=0; return 0; }
+""", "bounded stack read, no overflow"),
+]
+
+
 def bundled() -> list[Case]:
-    """The built-in labeled micro-corpus (deterministic order)."""
+    """The built-in labeled micro-corpus for STATIC (candidate-stage) detection."""
     return list(_CASES)
+
+
+def bundled_dynamic() -> list[Case]:
+    """The built-in crash corpus for DYNAMIC (confirmed-stage) reproduction via fuzzing."""
+    return list(_DYN_CASES)
 
 
 _FNAME = re.compile(r"^(CWE-\d+)__([A-Za-z0-9_.-]+)__(good|bad)\.c$")
