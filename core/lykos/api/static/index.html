@@ -885,6 +885,12 @@ async function showDetail(targetId){
               <option value="boundary">Boundary (IPC)</option>
             </select>
             <label class="btn sm seedlbl" title="Attach valid sample files as fuzzing seeds -- essential for file-format parsers (PDF/image/doc): the mutator starts from real structure">+ seeds<input type="file" id="seedfiles" multiple style="display:none" onchange="onSeedFiles(this.files)"></label>
+            <select id="fuzzformat" class="sel" title="Structure-aware mutation: keeps the format valid and coordinates length fields with data (finds format-parser overflows byte-mutation misses)" onchange="onFmtChange()">
+              <option value="">byte-level</option>
+              <option value="png">PNG (structure)</option>
+              <option value="lv32">length-prefixed (structure)</option>
+            </select>
+            <input id="fuzzmagic" class="inp" placeholder="magic e.g. %PDF" style="max-width:120px;display:none">
             <button class="btn sm primary" id="fuzzrun">Fuzz ▶</button>
             <span class="mono" id="seedcount" style="color:var(--faint);font-size:10.5px"></span>
           </div>
@@ -930,6 +936,18 @@ async function onSeedFiles(files){
   if(el) el.textContent = SEEDS.length?`${SEEDS.length} seed${SEEDS.length!==1?'s':''} attached`:"";
 }
 function seedParams(){ return SEEDS.length ? {seeds:SEEDS} : {}; }   // spread into fuzz params
+function onFmtChange(){                                              // magic box only for structure models
+  const m=document.getElementById("fuzzmagic");
+  if(m) m.style.display = document.getElementById("fuzzformat").value ? "" : "none";
+}
+function fmtParams(){                                                // structure-aware mutation model
+  const name=(document.getElementById("fuzzformat")||{}).value||"";
+  if(!name) return {};
+  const p={format_name:name};
+  const mg=((document.getElementById("fuzzmagic")||{}).value||"").trim();
+  if(mg) p.magic=mg;                                                 // override the model's magic gate
+  return p;
+}
 async function doPoc(tid, inputSha, mode){
   await fetch("/runs",{method:"POST",headers:{"Content-Type":"application/json"},
     body:JSON.stringify({case_id:CUR,target_id:tid,stage:"build_poc",
@@ -998,14 +1016,14 @@ async function doFuzz(tid){
   const st=document.getElementById("fuzzstat"); if(st) st.textContent="fuzzing…";
   await fetch("/runs",{method:"POST",headers:{"Content-Type":"application/json"},
     body:JSON.stringify({case_id:CUR,target_id:tid,stage:"fuzz",
-      params:{input_mode:(mode==="none"?"stdin":mode),max_execs:5000,max_seconds:30,...seedParams()}})});
+      params:{input_mode:(mode==="none"?"stdin":mode),max_execs:5000,max_seconds:30,...seedParams(),...fmtParams()}})});
 }
 async function doCoverage(tid){
   const mode = document.getElementById("dynmode").value;
   const st=document.getElementById("fuzzstat"); if(st) st.textContent="AFL++ coverage fuzzing…";
   const r=await fetch("/runs",{method:"POST",headers:{"Content-Type":"application/json"},
     body:JSON.stringify({case_id:CUR,target_id:tid,stage:"coverage_fuzz",
-      params:{input_mode:(mode==="stdin"?"stdin":"file"),max_seconds:30,...seedParams()}})});
+      params:{input_mode:(mode==="stdin"?"stdin":"file"),max_seconds:30,...seedParams(),...fmtParams()}})});
   if(!r.ok && st) st.textContent="coverage fuzz failed (AFL++ installed?)";
 }
 async function doDirected(tid){
@@ -1013,7 +1031,7 @@ async function doDirected(tid){
   const st=document.getElementById("fuzzstat"); if(st) st.textContent="directed fuzzing…";
   await fetch("/runs",{method:"POST",headers:{"Content-Type":"application/json"},
     body:JSON.stringify({case_id:CUR,target_id:tid,stage:"directed_fuzz",
-      params:{input_mode:(mode==="none"?"stdin":mode),max_execs:6000,max_seconds:30,...seedParams()}})});
+      params:{input_mode:(mode==="none"?"stdin":mode),max_execs:6000,max_seconds:30,...seedParams(),...fmtParams()}})});
 }
 async function doBoundary(tid){
   const st=document.getElementById("fuzzstat"); if(st) st.textContent="boundary harness…";
@@ -1025,7 +1043,7 @@ async function doConcolic(tid){
   const st=document.getElementById("fuzzstat"); if(st) st.textContent="concolic (angr)…";
   const r=await fetch("/runs",{method:"POST",headers:{"Content-Type":"application/json"},
     body:JSON.stringify({case_id:CUR,target_id:tid,stage:"concolic",
-      params:{input_mode:(mode==="none"?"stdin":mode),input_size:64,max_seconds:120,...seedParams()}})});
+      params:{input_mode:(mode==="none"?"stdin":mode),input_size:64,max_seconds:120,...seedParams(),...fmtParams()}})});
   if(!r.ok && st) st.textContent="concolic failed (angr installed?)";
 }
 async function loadDyn(tid){

@@ -34,7 +34,7 @@ from ...db.dao import (
 )
 from ...jobs.registry import register_stage
 from ..detect.catalog import SOURCES, normalize
-from .stage import _DEFAULT_SEEDS, _mine_dictionary, fuzz_campaign
+from .stage import _DEFAULT_SEEDS, _mine_dictionary, _structure_mutator, fuzz_campaign
 
 DIRECTED_STAGE = "directed_fuzz"
 TOOL = "directed"
@@ -243,10 +243,14 @@ def directed_stage(ctx) -> dict:
 
     note_prefix = ("found by directed fuzzing (target: " + _target_label(plan["targets"]) + ")"
                    if plan["directed"] else "found by directed fuzzing (undirected fallback)")
+    mutator = _structure_mutator(p, rng, plan["dictionary"])   # structure-aware if format set
+    if mutator:
+        note_prefix += " [structure-aware]"
+        ctx.emit("directed.format", payload={"model": p.get("format_name") or "custom"})
     fuzz_campaign(ctx, target, corpus=corpus, dictionary=plan["dictionary"], mode=mode,
                   max_execs=max_execs, max_seconds=max_seconds, exec_timeout=exec_timeout,
                   rng=rng, detector="directed_fuzz", event_prefix="directed",
-                  note_prefix=note_prefix)
+                  note_prefix=note_prefix, mutator=mutator)
     return {}
 
 
