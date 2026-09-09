@@ -232,6 +232,24 @@ tr.fdetail>td{background:var(--surface-2);border-bottom:1px solid var(--border-s
 .evlist{display:flex;flex-direction:column;gap:4px}
 .evrow{font-size:11px;color:var(--dim);font-family:var(--mono);line-height:1.4}
 .evch{display:inline-block;min-width:96px;color:var(--teal)}
+/* ---- reverse-engineering code viewer ---- */
+#funcs .frow.on{background:var(--surface-3);box-shadow:inset 2px 0 0 var(--accent)}
+.cv{margin:8px 0 4px;border:1px solid var(--border-strong);border-radius:8px;
+  background:var(--bg);overflow:hidden}
+.cvhead{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;
+  padding:8px 10px;background:var(--surface-3);border-bottom:1px solid var(--border)}
+.cvname{font-size:12px}
+.cvtabs{display:flex;gap:3px}
+.cvtab{font-size:11px;font-weight:600;padding:3px 9px;border-radius:6px;cursor:pointer;
+  background:transparent;border:1px solid transparent;color:var(--dim)}
+.cvtab:hover{color:var(--text)}
+.cvtab.on{background:var(--surface);border-color:var(--border-strong);color:var(--text)}
+.cvcode{margin:0;padding:10px 12px;white-space:pre-wrap;max-height:340px;overflow:auto;
+  font-family:var(--mono);font-size:11.5px;line-height:1.5;color:var(--text)}
+.cvcalls{padding:10px 12px;display:flex;gap:6px;flex-wrap:wrap}
+.cvcalls span{font-family:var(--mono);font-size:11px;padding:2px 7px;border-radius:5px;
+  background:var(--surface-2);border:1px solid var(--border)}
+.cvcalls span.ext{color:var(--warn);border-color:var(--warn)}
 /* ---- system map: toolbar + legend ---- */
 .smtools{display:flex;gap:6px;flex-wrap:wrap}
 .smlegend{display:flex;align-items:center;gap:16px;flex-wrap:wrap;font-size:11px;color:var(--dim);
@@ -479,8 +497,18 @@ function findingDetailRow(x){
     ${x.poc_level?`<div class="fdkv"><span>PoC</span><b><span class="lvl">${esc(x.poc_level)}</span> verified</b></div>`:''}
     <div class="eyebrow" style="margin:9px 0 4px">Evidence (${(x.evidence||[]).length})</div>
     <div class="evlist">${ev}</div>
-    <div style="margin-top:10px"><button class="btn sm" onclick="event.stopPropagation();openComponent('${x.target_id}')">Open target in Workbench →</button></div>
+    <div style="margin-top:10px"><button class="btn sm" onclick="event.stopPropagation();openFindingInWorkbench('${x.target_id}', ${JSON.stringify(x.function_addr||'')})">View in Workbench${x.function_addr?' → function':''}</button></div>
   </div></td></tr>`;
+}
+async function openFindingInWorkbench(tid, faddr){
+  switchView('wb');
+  await showDetail(tid);                         // loads triage + functions (async)
+  const dc=document.getElementById('detailcard'); if(dc) dc.scrollIntoView({behavior:'smooth'});
+  if(!faddr) return;
+  const norm=a=>String(a||'').toLowerCase().replace(/^0x0*/,'0x');
+  for(let i=0;i<25 && !FUNCS.length;i++) await new Promise(r=>setTimeout(r,80));  // await decompile load
+  const fn=FUNCS.find(f=>norm(f.addr)===norm(faddr));
+  if(fn) showFunc(fn.id);                        // jump straight to the vulnerable function's code
 }
 
 // ---- report builder ----
@@ -814,16 +842,13 @@ async function showDetail(targetId){
               </div></details>
           </div>
           <div id="funcs"></div>
-          <pre id="funccode" class="sec code"></pre>
-          <div id="funccalls" class="sec" style="margin-top:4px"></div>
-          <div class="eyebrow" id="cfglabel" style="margin-top:6px"></div>
-          <pre id="funccfg" class="sec code"></pre>
+          <div id="codeviewer" class="cv" hidden></div>
           <details class="disc"><summary>Strings</summary><div id="strings"></div></details>
         </div>
       </section>
 
       <section class="stage">
-        <div class="stagehdr"><span class="snum">3</span><b>CWE detection</b></div>
+        <div class="stagehdr"><span class="snum">3</span><b>CWE detection</b><span class="schip mono" id="detectstat"></span></div>
         <div class="sbody">
           <div class="actions"><button class="btn sm" id="detect">Detect CWEs</button></div>
           <div id="findings"></div>
@@ -852,7 +877,7 @@ async function showDetail(targetId){
       </section>
 
       <section class="stage">
-        <div class="stagehdr"><span class="snum">5</span><b>Confirmation &amp; PoC / exploit</b></div>
+        <div class="stagehdr"><span class="snum">5</span><b>Confirmation &amp; PoC / exploit</b><span class="schip mono" id="pocstat"></span></div>
         <div class="sbody">
           <div class="hint">Build a PoC, assess an L2 primitive, or synthesize an L3 exploit from a crash row above.</div>
           <div id="pocs"></div>
@@ -918,7 +943,10 @@ async function doMultiDebug(tid, inputSha, mode){
 }
 async function loadPocs(tid){
   const el=document.getElementById("pocs"); if(!el) return;
-  const ps=await api(`/targets/${tid}/pocs`);
+  const ps=await api(`/targets/${tid}/pocs`)||[];
+  const pst=document.getElementById("pocstat");
+  if(pst){ const best=ps.filter(p=>p.verified).map(p=>p.level).sort().pop();
+    pst.textContent = ps.length?(best?`${best} verified`:`${ps.length} bundle${ps.length!==1?'s':''}`):""; }
   if(!ps.length){ el.innerHTML=""; return; }
   el.innerHTML=`<div class="eyebrow" style="margin:6px 0">PoC bundles (${ps.length})</div>`+
     `<div class="sec" style="max-height:120px;overflow:auto">`+
@@ -974,7 +1002,10 @@ async function doConcolic(tid){
 }
 async function loadDyn(tid){
   const el=document.getElementById("dynresults"); if(!el) return;
-  const rs=await api(`/targets/${tid}/dynresults`);
+  const rs=await api(`/targets/${tid}/dynresults`)||[];
+  const fst=document.getElementById("fuzzstat");
+  if(fst && !fst.textContent){ const cr=rs.filter(r=>r.crashed).length;
+    fst.textContent = rs.length?`${cr} crash${cr!==1?'es':''} in ${rs.length} runs`:""; }
   if(!rs.length){ el.innerHTML=""; return; }
   el.innerHTML=`<div class="sec" style="max-height:120px;overflow:auto">`+
     rs.slice(0,20).map(r=>{
@@ -1000,7 +1031,9 @@ function _stCls(s){ return s==="poc-backed"||s==="confirmed"?"on":(s==="corrobor
 async function loadFindings(tid){
   const el=document.getElementById("findings"); if(!el) return;
   const fs=await api(`/targets/${tid}/findings`)||[];
-  if(!fs.length){ el.innerHTML=`<div class="hint" style="margin-top:6px">No findings yet — run Detect CWEs or a fuzzer.</div>`; return; }
+  const dstat=document.getElementById("detectstat");
+  if(!fs.length){ el.innerHTML=`<div class="hint" style="margin-top:6px">No findings yet — run Detect CWEs or a fuzzer.</div>`;
+    if(dstat) dstat.textContent=""; return; }
   // dedup for display: group identical (cwe,title); keep the strongest state + all sites
   const groups={};
   fs.forEach(f=>{ const k=(f.cwe||'')+"|"+(f.title||'');
@@ -1008,6 +1041,7 @@ async function loadFindings(tid){
     g.n++; g.ids.push(f.id);
     if((_STATEORD[f.state]||0)>(_STATEORD[g.state]||0)) g.state=f.state; });
   const arr=Object.values(groups).sort((a,b)=>(_SEVRANK[b.severity]||0)-(_SEVRANK[a.severity]||0));
+  if(dstat) dstat.textContent = `${arr.length} finding${arr.length!==1?'s':''}`+(arr.length!==fs.length?` · ${fs.length} sites`:"");
   el.innerHTML=`<div class="eyebrow" style="margin:6px 0">Findings (${arr.length}${arr.length!==fs.length?` · ${fs.length} sites`:""})</div>`+
     `<div class="sec" style="max-height:190px;overflow:auto">`+
     arr.map(g=>`<div class="frow clk" onclick="openBoardFinding('${g.ids[0]}')" title="Open in the Findings Board">`+
@@ -1027,10 +1061,10 @@ function renderStrings(q){
   if(!STRINGS.length){ el.innerHTML=`<div class="hint">No strings yet — run Decompile.</div>`; return; }
   q=(q||"").toLowerCase();
   const list = q ? STRINGS.filter(s=>(s.value||"").toLowerCase().includes(q)) : STRINGS;
-  const cap=400, shown=list.slice(0,cap);
+  const cap=2000, shown=list.slice(0,cap);
   el.innerHTML = `<input class="fsearch" placeholder="filter strings…" value="${esc(q)}" oninput="renderStrings(this.value)">`+
-    `<div class="mono" style="color:var(--faint);font-size:10px;margin-bottom:3px">${list.length} of ${STRINGS.length}</div>`+
-    `<div class="sec" style="max-height:170px;overflow:auto">`+
+    `<div class="mono" style="color:var(--faint);font-size:10px;margin-bottom:3px">${list.length===STRINGS.length?STRINGS.length:list.length+" of "+STRINGS.length} strings</div>`+
+    `<div class="sec" style="max-height:240px;overflow:auto">`+
     (shown.length?shown.map(s=>`${s.addr}  ${esc((s.value||"").slice(0,90))} <span style="color:var(--faint)">[${(s.xrefs||[]).length} xref]</span>`).join("<br>"):`<div class="hint">no match</div>`)+
     (list.length>cap?`<br><span class="hint">…${list.length-cap} more — refine the filter</span>`:"")+
     `</div>`;
@@ -1042,7 +1076,12 @@ async function doDecompile(tid){
     body:JSON.stringify({case_id:CUR,target_id:tid,stage:"disassemble"})});
 }
 let FUNCS=[];
-async function loadFunctions(tid){ FUNCS = await api(`/targets/${tid}/functions`)||[]; renderFuncs(""); }
+async function loadFunctions(tid){
+  FUNCS = await api(`/targets/${tid}/functions`)||[];
+  CVFUNC=null; const cv=document.getElementById("codeviewer"); if(cv){ cv.hidden=true; cv.innerHTML=""; }
+  const ds=document.getElementById("decostat"); if(ds) ds.textContent = FUNCS.length?`${FUNCS.length} functions`:"";
+  renderFuncs("");
+}
 function renderFuncs(q){
   const el=document.getElementById("funcs"); if(!el) return;
   if(!FUNCS.length){ el.innerHTML=`<div class="hint" style="margin-top:6px">No functions yet — run Decompile.</div>`; return; }
@@ -1058,21 +1097,29 @@ function renderFuncs(q){
   el.querySelectorAll(".frow[data-id]").forEach(d=> d.onclick=()=>showFunc(d.dataset.id));
   const s=el.querySelector(".fsearch"); if(q&&s){ s.focus(); s.setSelectionRange(s.value.length,s.value.length); }
 }
+let CVFUNC=null, CVIEW="code";
 async function showFunc(fid){
-  const f=await api(`/functions/${fid}`);
-  document.getElementById("funccode").textContent = f.decompiled || "(no decompilation)";
-  const blocks = (f.ir && f.ir.blocks) ? f.ir.blocks : [];
-  document.getElementById("cfglabel").textContent =
-    blocks.length ? `CFG · ${f.blocks||blocks.length} blocks · ${f.edges||0} edges · P-Code` : "";
-  document.getElementById("funccfg").textContent = renderCFG(blocks);
-  const callees = f.callees||[];
-  const el = document.getElementById("funccalls");
-  el.innerHTML = callees.length
-    ? `<span class="eyebrow">Calls</span> `+callees.map(c=>{
-        const danger = c.external ? ' style="color:var(--warn)"' : '';
-        return `<span${danger}>${esc(c.dst_name||c.dst_addr)}</span>`;
-      }).join(", ")
-    : "";
+  CVFUNC = await api(`/functions/${fid}`); CVIEW="code";
+  renderCodeViewer();
+  document.querySelectorAll("#funcs .frow").forEach(r=>r.classList.toggle("on", r.dataset.id===fid));
+  const cv=document.getElementById("codeviewer"); if(cv) cv.scrollIntoView({block:"nearest",behavior:"smooth"});
+}
+function setCView(v){ CVIEW=v; renderCodeViewer(); }
+function renderCodeViewer(){
+  const el=document.getElementById("codeviewer"); if(!el||!CVFUNC) return;
+  const f=CVFUNC; el.hidden=false;
+  const blocks=(f.ir&&f.ir.blocks)?f.ir.blocks:[];
+  const callees=f.callees||[];
+  const tabs=[["code","Pseudocode"],["cfg",`CFG · ${f.blocks||blocks.length}`],["calls",`Calls · ${callees.length}`]];
+  let body;
+  if(CVIEW==="cfg") body=`<pre class="cvcode">${renderCFG(blocks)||"(no CFG — run Decompile)"}</pre>`;
+  else if(CVIEW==="calls") body=`<div class="cvcalls">${callees.length?callees.map(c=>`<span class="${c.external?'ext':''}">${esc(c.dst_name||c.dst_addr)}</span>`).join(""):"<span class='hint'>no calls</span>"}</div>`;
+  else body=`<pre class="cvcode">${esc(f.decompiled||"(no decompilation — run Decompile)")}</pre>`;
+  el.innerHTML=`<div class="cvhead">
+      <div class="cvname"><b>${esc(f.name||("sub_"+f.addr))}</b>
+        <span class="mono" style="color:var(--faint)">${f.addr} · ${f.blocks||blocks.length} blk · ${f.edges||0} edges</span></div>
+      <div class="cvtabs">${tabs.map(([k,l])=>`<button class="cvtab ${CVIEW===k?'on':''}" onclick="setCView('${k}')">${l}</button>`).join("")}</div>
+    </div>${body}`;
 }
 function renderCFG(blocks){
   return blocks.map(b=>{
