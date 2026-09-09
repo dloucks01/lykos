@@ -95,7 +95,8 @@ def test_html_self_contained(store, case):
     assert "Stack overflow in main" in html
     assert "CWE-121" in html
     assert "data:application/gzip;base64," in html   # embedded PoC download
-    assert "http://" not in html.split("</style>")[0].replace("http://www.w3", "")  # no ext assets in css
+    # no ext assets in css
+    assert "http://" not in html.split("</style>")[0].replace("http://www.w3", "")
     assert "SIGSEGV reproduced" in html
 
 

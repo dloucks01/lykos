@@ -2,7 +2,6 @@
 import json
 
 import pytest
-
 from lykos.analyze import ingest, register
 from lykos.analyze.ingest import enqueue_triage
 from lykos.analyze.triage import validate
@@ -24,7 +23,7 @@ def pool(store):
 
 def _triage_output_bytes(store, run_id):
     links = store.run_artifacts.list_by_run(run_id)
-    outs = [l for l in links if l.role == "output"]
+    outs = [a for a in links if a.role == "output"]
     assert outs, "no output artifact linked"
     return store.content.get_bytes(outs[0].artifact_sha256)
 
@@ -50,11 +49,11 @@ def test_ingest_triage_cache_hit(store, case, pool, sample_elf):
     q = JobQueue(store.conn)
     r1 = enqueue_triage(q, target)
     assert pool.wait_idle(8) and q.runs.get(r1.id).status == "done"
-    first = [l.artifact_sha256 for l in store.run_artifacts.list_by_run(r1.id)]
+    first = [a.artifact_sha256 for a in store.run_artifacts.list_by_run(r1.id)]
 
     r2 = enqueue_triage(q, target)          # identical -> cache hit at enqueue time
     assert r2.id != r1.id and r2.status == "done"
-    second = [l.artifact_sha256 for l in store.run_artifacts.list_by_run(r2.id)]
+    second = [a.artifact_sha256 for a in store.run_artifacts.list_by_run(r2.id)]
     assert second == first                  # same triage output reused
     hits = [e for e in q.events.list(case_id=case.id, limit=1000)
             if e.type == "job.cachehit"]

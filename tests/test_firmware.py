@@ -6,7 +6,6 @@ import struct
 import subprocess
 
 import pytest
-
 from lykos.analyze import register
 from lykos.analyze.firmware.carve import extract_components, scan_signatures
 from lykos.analyze.firmware.headerless import analyze_blob, detect_cortex_m
@@ -115,9 +114,9 @@ def test_firmware_carve_headerless_cortex_m(store, case, pool, tmp_path):
     run = enqueue_firmware(q, target)
     assert pool.wait_idle(30) and q.runs.get(run.id).status == "done"
     # the decomposition report identified the bare-metal architecture
-    outs = q.runs.get(run.id)
-    from lykos.db.dao import RunArtifactDAO, ArtifactDAO
     import json
+
+    from lykos.db.dao import ArtifactDAO, RunArtifactDAO
     art = None
     for link in RunArtifactDAO(store.conn).list_by_run(run.id):
         a = ArtifactDAO(store.conn).get(link.artifact_sha256)

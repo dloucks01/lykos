@@ -1,0 +1,11 @@
+# Repo-wide lint config (P0.11). Governs core/ and tests/ uniformly.
+# Runtime is stdlib-only; these are style/correctness gates, not deps.
+line-length = 100
+target-version = "py311"
+
+# The phase-0 exit demo is a narrative walkthrough script, not a maintained test.
+extend-exclude = ["tests/phase0_exit_demo.py"]
+
+[lint]
+select = ["E", "F", "W", "I"]   # pycodestyle, pyflakes, isort
+ignore = ["E402", "E702"]       # deliberate lazy imports; compact `stmt; return` guards

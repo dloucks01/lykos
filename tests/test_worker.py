@@ -2,7 +2,6 @@
 import time
 
 import pytest
-
 from lykos.jobs import JobConfig, JobQueue, WorkerPool
 from lykos.jobs.registry import clear_stages, register_stage
 

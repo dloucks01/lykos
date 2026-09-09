@@ -11,7 +11,7 @@ test:
 	$(PY) -m pytest tests/ -q
 
 lint:
-	@if command -v ruff >/dev/null 2>&1; then ruff check core; else echo "ruff not installed; skipping lint"; fi
+	@if command -v ruff >/dev/null 2>&1; then ruff check core tests; else echo "ruff not installed; skipping lint"; fi
 
 typecheck:
 	@if command -v mypy >/dev/null 2>&1; then mypy --ignore-missing-imports core/lykos; else echo "mypy not installed; skipping typecheck"; fi

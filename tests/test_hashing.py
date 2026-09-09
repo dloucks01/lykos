@@ -1,8 +1,7 @@
 """DM-19 — hashing + canonical serialization (DM-16/DM-17)."""
 import hashlib
 
-from lykos.hashing import (canonical_json, compute_cache_key, hash_all_file,
-                               hash_bytes)
+from lykos.hashing import canonical_json, compute_cache_key, hash_all_file, hash_bytes
 
 
 def test_hash_bytes_matches_hashlib():

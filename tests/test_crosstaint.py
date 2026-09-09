@@ -3,10 +3,10 @@ from __future__ import annotations
 
 import json
 
+from factories import make_target
 from lykos.analyze.detect import taint
 from lykos.analyze.link.crosstaint import cross_taint_case
 from lykos.db.dao import CallEdgeDAO, ComponentEdgeDAO, FindingDAO, FunctionDAO
-from factories import make_target
 
 
 def _i(addr, pcode):

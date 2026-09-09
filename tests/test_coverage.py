@@ -63,7 +63,8 @@ def test_coverage_stage_errors_clearly_when_afl_absent(store, case, pool, gcc, t
     monkeypatch.setattr(aflpp, "locate_afl", lambda *a, **k: None)
     c = tmp_path / "t.c"; c.write_text(_CRASH_ON_A)
     b = tmp_path / "t"
-    if subprocess.run([gcc, "-O0", str(c), "-o", str(b)], capture_output=True, check=False).returncode:
+    r = subprocess.run([gcc, "-O0", str(c), "-o", str(b)], capture_output=True, check=False)
+    if r.returncode:
         pytest.skip("build failed")
     target = ingest(store, case.id, b)
     q = JobQueue(store.conn)

@@ -85,7 +85,7 @@ def test_cache_short_circuit(store, case):
     r2 = q.enqueue(case.id, "triage", input_hashes=["fixed"], tool_version="v1")
     assert r2.id != r1.id and r2.status == "done"
     links = q.runs and store.run_artifacts.list_by_run(r2.id)
-    assert [l.artifact_sha256 for l in links] == [art.sha256]
+    assert [a.artifact_sha256 for a in links] == [art.sha256]
     assert len(_events(q, case.id, "job.cachehit")) == 1
 
 
@@ -110,8 +110,10 @@ def test_no_double_claim_under_concurrency(store, case):
             c.close()
 
     threads = [threading.Thread(target=worker) for _ in range(6)]
-    for t in threads: t.start()
-    for t in threads: t.join()
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
 
     assert len(claimed) == N
     assert len(set(claimed)) == N          # every job claimed exactly once

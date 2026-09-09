@@ -4,7 +4,6 @@ import struct
 import subprocess
 
 import pytest
-
 from lykos.analyze.triage import build_triage, validate
 from lykos.hashing import canonical_json, hash_all_file
 
@@ -87,9 +86,11 @@ def _elf_header(bits=64, big=False, machine=0xB7, etype=2):
     ei[6] = 1
     endc = ">" if big else "<"
     if bits == 64:
-        rest = struct.pack(endc + "HHIQQQIHHHHHH", etype, machine, 1, 0, 0, 0, 0, 64, 56, 0, 64, 0, 0)
+        rest = struct.pack(endc + "HHIQQQIHHHHHH",
+                           etype, machine, 1, 0, 0, 0, 0, 64, 56, 0, 64, 0, 0)
     else:
-        rest = struct.pack(endc + "HHIIIIIHHHHHH", etype, machine, 1, 0, 0, 0, 0, 52, 32, 0, 40, 0, 0)
+        rest = struct.pack(endc + "HHIIIIIHHHHHH",
+                           etype, machine, 1, 0, 0, 0, 0, 52, 32, 0, 40, 0, 0)
     return bytes(ei) + rest
 
 

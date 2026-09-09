@@ -1,11 +1,11 @@
 """Phase 3 — true intra-procedural data-flow taint over P-Code."""
 import pytest
+from factories import make_target
 from lykos.analyze import register
 from lykos.analyze.detect.stage import enqueue_detect
 from lykos.analyze.detect.taint import analyze_function
 from lykos.db.dao import CallEdgeDAO, FindingDAO, FunctionDAO
 from lykos.jobs import JobConfig, JobQueue, WorkerPool
-from factories import make_target
 
 
 def _i(addr, pcode):
@@ -67,7 +67,8 @@ def test_unknown_arch_skips():
 def pool(store):
     register()
     p = WorkerPool(store.db_path, store.content,
-                   JobConfig(workers=2, lease_seconds=8, poll_interval=0.02, heartbeat_interval=2.0))
+                   JobConfig(workers=2, lease_seconds=8, poll_interval=0.02,
+                             heartbeat_interval=2.0))
     p.start()
     try:
         yield p

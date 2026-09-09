@@ -8,7 +8,6 @@ if str(_CORE) not in sys.path:
     sys.path.insert(0, str(_CORE))
 
 import pytest  # noqa: E402
-
 from lykos.casestore import CaseStore  # noqa: E402
 
 

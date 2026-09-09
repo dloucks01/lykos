@@ -49,9 +49,38 @@ artifacts for confirmed findings. It ships with a highly styled analyst GUI.
 | 18 | `docs/18-architecture-coverage.md` | **All-architecture** coverage matrix, tiers, per-arch backends |
 | 19 | `docs/19-cwe-coverage.md` | **All-CWE** coverage matrix by family + channel + feasibility |
 | 21 | `docs/21-crs-harvest-review.md` | CRS harvest-review memo *template* (Phase 0 P0.8 deliverable) |
+| 22 | `docs/22-toolchain-setup.md` | Optional toolchain setup + status (Ghidra/AFL++/angr/GDB/SymQEMU) |
 
 ## Start here
 1. Read `docs/01-gap-analysis.md` — it reframes the scope and is the most important document.
 2. Answer the open questions in `docs/15-risks-open-questions.md` (they change the architecture).
 3. Then `docs/13-roadmap-milestones.md` for the build order, and `tasks/phase-0-foundations.md` for the
    concrete first-milestone task breakdown.
+
+## Running it
+
+The core is stdlib-only and runs offline. Requires Python 3.11+. Optional heavy backends
+(angr/Unicorn/SymQEMU) live in vendored venvs under `vendor/` and are auto-detected when present;
+everything runs without them.
+
+```sh
+make test        # run the full test suite (PYTHONPATH=core pytest)
+make lint        # ruff check over core + tests
+make run         # serve the API + UI on 127.0.0.1:8787 (case store in .cases/)
+make bundle      # build the standalone dist/lykos.pyz zipapp
+make verify      # build the zipapp, then prove it serves the UI + triages a binary offline
+```
+
+Run the server directly and drive it over HTTP:
+
+```sh
+PYTHONPATH=core python3 -m lykos serve --http 127.0.0.1:8787 --case-store .cases --workers 2
+# then, from another shell:
+curl -s -X POST http://127.0.0.1:8787/cases -d '{"name":"demo"}'                       # -> {"id": ...}
+curl -s -X POST http://127.0.0.1:8787/cases/<CASE_ID>/targets \
+     -H 'X-Filename: ls' --data-binary @/bin/ls                                        # ingest + triage
+curl -s http://127.0.0.1:8787/runs/<RUN_ID>                                            # poll run status
+```
+
+Open `http://127.0.0.1:8787/` in a browser for the analyst UI. The packaged zipapp runs the same way:
+`python3 dist/lykos.pyz serve --http 127.0.0.1:8787 --case-store .cases`.

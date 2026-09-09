@@ -87,7 +87,6 @@ def test_no_match_when_both_receive():
 import subprocess  # noqa: E402
 
 import pytest  # noqa: E402
-
 from lykos.analyze import register  # noqa: E402
 from lykos.analyze.ingest import enqueue_triage, ingest  # noqa: E402
 from lykos.analyze.link.ipc import model_ipc_case  # noqa: E402

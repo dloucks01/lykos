@@ -1,6 +1,5 @@
 """JE-01 — status state machine."""
 import pytest
-
 from lykos.jobs.states import can_transition, check_transition
 
 

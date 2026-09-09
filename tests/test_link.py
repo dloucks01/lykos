@@ -4,7 +4,6 @@ from __future__ import annotations
 import subprocess
 
 import pytest
-
 from lykos.analyze import register
 from lykos.analyze.elf import parse
 from lykos.analyze.ingest import enqueue_triage, ingest

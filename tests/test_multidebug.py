@@ -6,7 +6,6 @@ import shutil
 import subprocess
 
 import pytest
-
 from lykos.analyze import register
 from lykos.analyze.debug import gdb
 from lykos.analyze.debug.multidebug import enqueue_multi_debug
