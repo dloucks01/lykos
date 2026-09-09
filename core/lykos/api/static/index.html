@@ -594,13 +594,24 @@ async function refresh(){
 function renderTargets(ts){
   const el=document.getElementById("targets");
   if(!ts.length){ el.innerHTML=`<div class="empty">No targets. Choose a binary and Analyze.</div>`; return; }
-  el.innerHTML = `<table><thead><tr><th>File</th><th>Arch</th><th>Bits</th><th>Mitigations</th><th>Stripped</th></tr></thead><tbody>${
+  el.innerHTML = `<table><thead><tr><th>File</th><th>Arch</th><th>Bits</th><th>Mitigations</th><th>Stripped</th><th></th></tr></thead><tbody>${
     ts.map(t=>`<tr data-id="${t.id}"><td class="mono">${esc(t.filename)}</td>
       <td>${t.arch?`<span class="arch">${t.arch}</span>`:"—"}</td>
       <td class="mono">${t.bits||"—"}${t.endianness?(" "+t.endianness[0].toUpperCase()+"E"):""}</td>
       <td>${mits(t.mitigations)}</td>
-      <td class="mono">${t.stripped===true?"yes":t.stripped===false?"no":"—"}</td></tr>`).join("")}</tbody></table>`;
-  el.querySelectorAll("tr[data-id]").forEach(tr=> tr.onclick=()=>showDetail(tr.dataset.id));
+      <td class="mono">${t.stripped===true?"yes":t.stripped===false?"no":"—"}</td>
+      <td style="text-align:right"><button class="btn sm rm" title="Remove this target from the case (deletes its findings, runs, PoCs and System Map links)" onclick="removeTarget('${t.id}', ${JSON.stringify(t.filename)}, event)">Remove</button></td></tr>`).join("")}</tbody></table>`;
+  el.querySelectorAll("tr[data-id]").forEach(tr=> tr.onclick=(e)=>{ if(!e.target.closest(".rm")) showDetail(tr.dataset.id); });
+}
+
+async function removeTarget(id, name, ev){
+  if(ev) ev.stopPropagation();
+  if(!confirm(`Remove "${name}" from this case?\n\nThis permanently deletes its triage, findings, runs, PoCs, and any System Map links. This cannot be undone.`)) return;
+  const res = await api(`/targets/${id}`, {method:"DELETE"});
+  if(res && res.error){ alert("Remove failed: "+res.error); return; }
+  if(DETAIL_TID===id){ DETAIL_TID=null; const c=document.getElementById("detailcard"); if(c) c.hidden=true; }
+  await refresh();
+  if(typeof SYSMAP!=="undefined" && SYSMAP) loadSystemMap(true);   // keep the System Map consistent
 }
 function mits(m){
   if(!m) return `<span class="mit unknown">?</span>`;
@@ -624,7 +635,11 @@ async function showDetail(targetId){
   const out = (full.outputs||[]).find(o=>o.kind==="triage-json");
   if(!out){ det.innerHTML=`<div class="empty">No triage artifact.</div>`; return; }
   const rec = await api(`/artifacts/${out.sha256}`);
-  det.innerHTML = `
+  const flag = (rec.analyzable===false && rec.advisory) ? `
+    <div style="margin:0 0 10px;padding:8px 10px;border-radius:8px;border:1px solid var(--warn);
+      background:color-mix(in srgb, var(--warn) 12%, transparent);color:var(--text);font-size:12px">
+      <b style="color:var(--warn)">⚠ Not analyzable</b> — ${esc(rec.advisory)}</div>` : "";
+  det.innerHTML = flag + `
     <div class="kv"><span>detected</span><b>${esc(rec.detected||"—")}</b></div>
     <div class="kv"><span>linking</span><b>${rec.linking||"—"} ${rec.stripped?"· stripped":""}</b></div>
     <div class="kv"><span>entry</span><b>${rec.entry_point||"—"}</b></div>

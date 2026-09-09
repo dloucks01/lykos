@@ -154,3 +154,35 @@ def test_cross_check_readelf(variants):
     assert ("ELF64" in out) == (rec["bits"] == 64)
     assert ("little endian" in out) == (rec["endianness"] == "little")
     assert "X86-64" in out.upper() and rec["arch"] == "x86-64"
+
+
+# ---------------------------------------------------------- non-binary upload flag (UX)
+def test_non_binary_is_flagged_not_denied(tmp_path):
+    """A shell script is imported and hashed, but clearly flagged as not analyzable."""
+    s = tmp_path / "pdfman"
+    s.write_text("#!/bin/bash\nman -Tpdf \"$@\" >/tmp/x; xdg-open /tmp/x\n")
+    rec = _triage(s)
+    assert rec["file_type"] == "other"
+    assert rec["analyzable"] is False
+    assert rec["advisory"] and "not a supported executable binary" in rec["advisory"]
+    assert "shell script" in rec["detected"].lower()
+    assert validate(rec) == []                       # still a valid, complete record
+    assert "_data_head" not in rec                   # transient field is stripped
+
+
+def test_content_classification_variants(tmp_path):
+    def det(name, data):
+        p = tmp_path / name
+        p.write_bytes(data)
+        return _triage(p)["detected"]
+    assert "Python script" in det("a.py", b"#!/usr/bin/env python3\nprint(1)\n")
+    assert "Perl script" in det("a.pl", b"#!/usr/bin/perl\nprint 1;\n")
+    assert "ZIP archive" in det("a.zip", b"PK\x03\x04rest")
+    assert "text" in det("a.txt", b"just some ascii text here\n" * 4).lower()
+
+
+def test_elf_is_analyzable(variants):
+    if "default" not in variants:
+        pytest.skip("no gcc build")
+    rec = _triage(variants["default"])
+    assert rec["analyzable"] is True and rec["advisory"] is None

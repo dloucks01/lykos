@@ -304,6 +304,33 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             self._json({"error": repr(e)}, 500)
 
+    # ---- DELETE ----
+    def do_DELETE(self):
+        path = urlparse(self.path).path
+        try:
+            m = _TARGET_ID.match(path)
+            if m:
+                return self._delete_target(m.group(1))
+            self._json({"error": "not found"}, 404)
+        except Exception as e:
+            self._json({"error": repr(e)}, 500)
+
+    def _delete_target(self, tid):
+        """Remove a target and everything derived from it (rows cascade; component edges
+        touching it are removed too, so the System Map stays consistent)."""
+        s = self._store()
+        try:
+            t = s.targets.get(tid)
+            if not t:
+                return self._json({"error": "no target"}, 404)
+            case_id, name = t.case_id, t.filename
+            ok = s.targets.delete(tid)
+            s.events.append("target.removed", case_id=case_id,
+                            payload={"target_id": tid, "filename": name})
+            return self._json({"deleted": ok, "id": tid})
+        finally:
+            s.close()
+
     # ---- route impls ----
     def _get_case_findings(self, cid):
         """All findings in a case, enriched with target filename/arch and the target's best

@@ -83,3 +83,35 @@ def test_fk_cascade_delete_case(store):
     assert store.runs.list_by_case(c.id) == []
     assert store.artifacts.list_by_case(c.id) == []
     assert store.events.list(case_id=c.id) == []
+
+
+def test_target_delete_cascades_and_clears_component_edges(store, case):
+    """Deleting a target removes its rows (findings, runs) and any System Map edges that
+    touch it, while leaving other targets and their edges intact."""
+    from factories import make_run, make_target
+    from lykos.db.dao import ComponentEdgeDAO, FindingDAO
+
+    a = make_target(store, case.id, content=b"\x7fELFaaa", file_type="elf")
+    b = make_target(store, case.id, content=b"\x7fELFbbb", file_type="elf")
+    findings = FindingDAO(store.conn)
+    findings.upsert(a.id, case.id, {
+        "cwe": "CWE-120", "title": "x", "severity": "high", "detector": "rule",
+        "evidence": [], "dedup_key": "k-a", "state": "candidate", "confidence": 0.4})
+    findings.upsert(b.id, case.id, {
+        "cwe": "CWE-78", "title": "y", "severity": "high", "detector": "rule",
+        "evidence": [], "dedup_key": "k-b", "state": "candidate", "confidence": 0.4})
+    make_run(store, case.id, target_id=a.id, stage="ingest_triage", status="done")
+    edges = ComponentEdgeDAO(store.conn)
+    edges.upsert(case.id, a.id, b.id, kind="dynamic-link", symbol="foo")   # a -> b
+    edges.upsert(case.id, b.id, a.id, kind="ipc", symbol="mq:/q")          # b -> a
+    assert len(edges.list_by_case(case.id)) == 2
+
+    assert store.targets.delete(a.id) is True
+
+    assert store.targets.get(a.id) is None                   # gone
+    assert store.targets.get(b.id) is not None               # sibling survives
+    assert findings.list_by_target(a.id) == []               # cascaded
+    assert len(findings.list_by_target(b.id)) == 1           # untouched
+    assert store.runs.list_by_case(case.id) == []            # a's run cascaded
+    assert edges.list_by_case(case.id) == []                 # BOTH edges (a in either slot) gone
+    assert store.targets.delete(a.id) is False               # idempotent: already gone

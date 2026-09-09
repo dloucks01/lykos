@@ -9,6 +9,7 @@ import time
 from typing import Optional
 
 from ..hashing import new_id
+from .connection import transaction
 from .models import (
     ARTIFACT_ROLES,
     FINDING_STATES,
@@ -108,6 +109,24 @@ class TargetDAO(BaseDAO):
 
     def update_triage(self, target_id: str, **fields) -> None:
         self._update_fields(target_id, fields)
+
+    def delete(self, target_id: str) -> bool:
+        """Remove a target and everything derived from it, atomically.
+
+        Row cascades (ON DELETE CASCADE) take out its functions, call edges, string refs,
+        findings, dyn results, PoCs, runs, run-artifact links, and run events. Component
+        edges reference targets by plain id (no FK), so any edge touching this target is
+        deleted explicitly here -- keeping the System Map consistent. Content-addressed
+        artifact blobs are shared/dedup'd and are intentionally left in the store.
+        """
+        if self.get(target_id) is None:
+            return False
+        with transaction(self.conn):
+            self.conn.execute(
+                "DELETE FROM component_edge WHERE src_target=? OR dst_target=?",
+                (target_id, target_id))
+            self.conn.execute("DELETE FROM target WHERE id=?", (target_id,))
+        return True
 
     def get(self, target_id: str) -> Optional[Target]:
         r = self.conn.execute("SELECT * FROM target WHERE id=?", (target_id,)).fetchone()
