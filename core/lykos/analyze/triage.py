@@ -14,7 +14,7 @@ from . import filetype
 
 SCHEMA_VERSION = 1
 TOOL = "elf-stdlib"
-TOOL_VERSION = "triage-2"          # bump to invalidate the cache when parsing changes
+TOOL_VERSION = "triage-3"          # bump to invalidate the cache when parsing changes
 MITIGATION_ENUM = {"on", "off", "partial", "unknown"}
 _FILE_TYPES = {filetype.ELF, filetype.PE, filetype.MACHO, filetype.RAW, filetype.OTHER}
 _PACK_ENTROPY = 7.2
@@ -28,6 +28,58 @@ def _shannon(data: bytes) -> float:
         freq[b] += 1
     n = len(data)
     return round(-sum((c / n) * math.log2(c / n) for c in freq if c), 3)
+
+
+# leading-byte signatures for common non-executable container/text formats, so a mistaken
+# upload is described helpfully rather than dismissed as "unknown data".
+_CONTENT_MAGIC = [
+    (b"PK\x03\x04", "ZIP archive (or ZIP-based document)"),
+    (b"PK\x05\x06", "empty ZIP archive"),
+    (b"\x1f\x8b", "gzip-compressed data"),
+    (b"BZh", "bzip2-compressed data"),
+    (b"\xfd7zXZ\x00", "xz-compressed data"),
+    (b"7z\xbc\xaf\x27\x1c", "7-Zip archive"),
+    (b"Rar!\x1a\x07", "RAR archive"),
+    (b"!<arch>\n", "ar/deb archive"),
+    (b"%PDF-", "PDF document"),
+    (b"\x89PNG\r\n", "PNG image"),
+    (b"\xff\xd8\xff", "JPEG image"),
+    (b"<?xml", "XML document"),
+    (b"{\n", "JSON/text data"),
+]
+
+# interpreter basename -> friendly language name (for shebang scripts)
+_SCRIPT_LANG = {
+    "sh": "shell", "bash": "Bourne-Again shell", "dash": "shell", "zsh": "Z shell",
+    "ksh": "Korn shell", "python": "Python", "python2": "Python", "python3": "Python",
+    "perl": "Perl", "ruby": "Ruby", "node": "Node.js", "php": "PHP", "lua": "Lua",
+    "awk": "AWK", "tclsh": "Tcl", "Rscript": "R", "pwsh": "PowerShell",
+}
+
+
+def _classify_content(data: bytes) -> str:
+    """Human description of a non-binary blob (script / archive / text / data)."""
+    if not data:
+        return "empty file"
+    if data[:2] == b"#!":
+        line = data[:256].split(b"\n", 1)[0].decode("latin-1", "ignore")
+        toks = line[2:].strip().split()
+        interp = ""
+        for t in toks:                                # skip `/usr/bin/env`
+            base = t.rsplit("/", 1)[-1]
+            if base and base != "env" and not base.startswith("-"):
+                interp = base
+                break
+        lang = _SCRIPT_LANG.get(interp, interp or "script")
+        return f"{lang} script" if lang != "script" else "shell/interpreter script"
+    for magic, desc in _CONTENT_MAGIC:
+        if data[:len(magic)] == magic:
+            return desc
+    sample = data[:4096]
+    printable = sum(1 for b in sample if 9 <= b <= 13 or 32 <= b <= 126)
+    if printable / len(sample) >= 0.95:
+        return "plain-text / source file"
+    return "unrecognized data (not a known binary format)"
 
 
 def _packer_heuristic(overall: float, sections: list[dict]) -> dict:
@@ -50,6 +102,7 @@ def build_triage(path: str | Path, hashes: dict[str, Any], filename: str) -> dic
         "sha256": hashes.get("sha256"), "md5": hashes.get("md5"),
         "sha1": hashes.get("sha1"), "size": hashes.get("size"),
         "file_type": filetype.RAW, "detected": None,
+        "analyzable": False, "advisory": None,
         "arch": None, "bits": None, "endianness": None, "linking": None,
         "stripped": None, "entry_point": None, "interpreter": None,
         "sections": [], "imports": {"libraries": [], "functions_count": 0, "symbols": []},
@@ -66,6 +119,7 @@ def build_triage(path: str | Path, hashes: dict[str, Any], filename: str) -> dic
         return rec
 
     rec["file_type"] = filetype.detect(data[:64])
+    rec["_data_head"] = data[:4096]                     # transient: for non-binary classify
     rec["entropy"] = _packer_heuristic(_shannon(data), [])
 
     if rec["file_type"] == filetype.ELF:
@@ -83,11 +137,25 @@ def build_triage(path: str | Path, hashes: dict[str, Any], filename: str) -> dic
         })
         rec["entropy"] = _packer_heuristic(rec["entropy"]["overall"], info.sections)
         rec["detected"] = _describe(rec)
+        rec["analyzable"] = True                       # ELF is the fully-supported format
+        rec["advisory"] = None
     elif rec["file_type"] in (filetype.PE, filetype.MACHO):
+        fmt = rec["file_type"].upper()
         parse_errors.append(f"{rec['file_type']} parsing pending LIEF backend (detected only)")
-        rec["detected"] = rec["file_type"].upper()
+        rec["detected"] = f"{fmt} (detected only)"
+        rec["analyzable"] = False
+        rec["advisory"] = (f"{fmt} binary detected, but this build fully analyzes ELF only. "
+                           "Format and hashes were recorded; disassembly, CWE detection, and "
+                           "the dynamic/fuzzing stages are not yet available for this format.")
     else:
-        rec["detected"] = rec["file_type"]
+        desc = _classify_content(rec["_data_head"])
+        rec["detected"] = f"Not a binary — {desc}"
+        rec["analyzable"] = False
+        rec["advisory"] = (f"This file is not a supported executable binary ({desc}). It was "
+                           "imported and hashed, but there is no machine code to analyze: "
+                           "disassembly, CWE detection, and the dynamic/fuzzing/PoC stages do "
+                           "not apply. Import an ELF executable or shared object to analyze.")
+    rec.pop("_data_head", None)
     return rec
 
 

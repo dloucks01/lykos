@@ -254,3 +254,24 @@ def test_case_findings_board(tmp_path):
         assert crit["state"] == "poc-backed"
     finally:
         shutdown(servers, pool)
+
+
+def test_delete_target_endpoint(api_http, sample_elf):
+    """DELETE /targets/{id} removes the target and its runs; a second delete is 404."""
+    _, c = _tcp_json(api_http, "POST", "/cases", {"name": "del"})
+    boundary = "----lykostest"
+    pre = (f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; "
+           f"filename=\"ls\"\r\nContent-Type: application/octet-stream\r\n\r\n").encode()
+    body = pre + sample_elf.read_bytes() + f"\r\n--{boundary}--\r\n".encode()
+    st, up = _tcp(api_http, "POST", f"/cases/{c['id']}/targets", body,
+                  {"Content-Type": f"multipart/form-data; boundary={boundary}"})
+    assert st == 201
+    tid = json.loads(up)["id"]
+    st, res = _tcp_json(api_http, "DELETE", f"/targets/{tid}")
+    assert st == 200 and res["deleted"] is True and res["id"] == tid
+    st, targets = _tcp_json(api_http, "GET", f"/cases/{c['id']}/targets")
+    assert st == 200 and targets == []                       # gone from the case
+    st, runs = _tcp_json(api_http, "GET", f"/cases/{c['id']}/runs")
+    assert st == 200 and runs == []                          # its triage run cascaded
+    st, res = _tcp_json(api_http, "DELETE", f"/targets/{tid}")
+    assert st == 404                                         # already gone
