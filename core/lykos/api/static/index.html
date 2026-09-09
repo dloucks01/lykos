@@ -694,6 +694,12 @@ async function doRootCause(tid, inputSha, mode){
     body:JSON.stringify({case_id:CUR,target_id:tid,stage:"root_cause",
       params:{input_sha:inputSha,input_mode:mode||"stdin"}})});
 }
+async function doMultiDebug(tid, inputSha, mode){
+  const st=document.getElementById("fuzzstat"); if(st) st.textContent="multi-process debug (follow-fork)…";
+  await fetch("/runs",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({case_id:CUR,target_id:tid,stage:"multi_debug",
+      params:{input_sha:inputSha,input_mode:mode||"stdin"}})});
+}
 async function loadPocs(tid){
   const el=document.getElementById("pocs"); if(!el) return;
   const ps=await api(`/targets/${tid}/pocs`);
@@ -762,7 +768,8 @@ async function loadDyn(tid){
       const poc = (r.crashed && r.input_sha)
         ? ` <button class="btn sm" onclick="doPoc('${DETAIL_TID}','${r.input_sha}','${r.input_mode||'stdin'}')">Build PoC</button>`
           + ` <button class="btn sm" title="Assess L2 exploitation primitive (instruction-pointer control)" onclick="doPrimitive('${DETAIL_TID}','${r.input_sha}','${r.input_mode||'stdin'}')">L2</button>`
-          + ` <button class="btn sm" title="Debugger root-cause analysis (fault classification + slice)" onclick="doRootCause('${DETAIL_TID}','${r.input_sha}','${r.input_mode||'stdin'}')">Root Cause</button>` : "";
+          + ` <button class="btn sm" title="Debugger root-cause analysis (fault classification + slice)" onclick="doRootCause('${DETAIL_TID}','${r.input_sha}','${r.input_mode||'stdin'}')">Root Cause</button>`
+          + ` <button class="btn sm" title="Multi-process debug: follow fork/exec into spawned children and blame the crash on this input" onclick="doMultiDebug('${DETAIL_TID}','${r.input_sha}','${r.input_mode||'stdin'}')">Multi-debug</button>` : "";
       return `${st} <span style="color:var(--faint)">${esc(r.isolation||'')} ${r.duration_ms||0}ms ${esc(r.note||'')}</span>${poc}`;
     }).join("<br>")+`</div>`;
 }
@@ -870,6 +877,12 @@ function openWS(id){
     if(e.type==="fuzz.done" && DETAIL_TID){
       const st=document.getElementById("fuzzstat"); if(st&&e.payload) st.textContent=`done: ${e.payload.execs} execs · ${e.payload.unique} unique`;
       loadDyn(DETAIL_TID); loadFindings(DETAIL_TID);
+    }
+    if(e.type==="multidebug.done" && DETAIL_TID){
+      const st=document.getElementById("fuzzstat");
+      if(st&&e.payload) st.textContent = e.payload.supported===false ? ("multi-debug: "+(e.payload.note||"unsupported"))
+        : (e.payload.blame ? ("multi-debug: "+e.payload.blame).slice(0,100) : (e.payload.note||"no fault"));
+      loadFindings(DETAIL_TID);
     }
     if(e.type==="rootcause.done" && DETAIL_TID){
       const st=document.getElementById("fuzzstat");

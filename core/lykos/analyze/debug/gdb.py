@@ -64,6 +64,56 @@ def run_gdb(gdb: Path, exe, argv, stdin_file, *, ctx=None, timeout: int = 30) ->
     return _parse(out)
 
 
+_FORK = re.compile(r"fork to child process (\d+)")
+_EXECED = re.compile(r"is executing new program:\s*(\S+)")
+_CRASH_THREAD = re.compile(r"Thread (\d+)\.\d+[^\n]*received signal")
+
+
+def run_gdb_follow(gdb: Path, exe, argv, stdin_file, *, ctx=None, timeout: int = 30) -> dict:
+    """Multi-process capture (doc 17.3): follow fork/exec into spawned children and capture
+    the fault of whichever process actually crashes. Adds fork/exec attribution to the
+    normal `run_gdb` capture dict."""
+    run_cmd = "run" + ("".join(" " + a for a in argv)) + (
+        (" < " + stdin_file) if stdin_file else "")
+    cmds = [
+        "set pagination off", "set confirm off", "set height 0", "set width 0",
+        "set follow-fork-mode child",     # trace the child on fork...
+        "set detach-on-fork on",          # ...detaching the parent
+        "set follow-exec-mode new",       # follow through execve into the new image
+        run_cmd,
+        'printf "LYKOS_PC %#lx\\n", $pc',
+        "print $_siginfo",
+        "x/16xb $pc",
+        "info proc mappings",
+        "bt",
+        "quit",
+    ]
+    script = tempfile.NamedTemporaryFile("w", suffix=".gdb", delete=False)
+    script.write("\n".join(cmds) + "\n")
+    script.close()
+    cmd = [str(gdb), "-q", "-batch", "-nx", "-x", script.name, str(exe)]
+    try:
+        if ctx is not None:
+            proc = ctx.run_subprocess(cmd, timeout=timeout + 15)
+        else:
+            import subprocess
+            proc = subprocess.run(cmd, capture_output=True, timeout=timeout + 15, check=False)
+        out = (proc.stdout or b"").decode("latin-1", "ignore")
+    finally:
+        try:
+            os.unlink(script.name)
+        except OSError:
+            pass
+    cap = _parse(out)
+    fork = _FORK.search(out)
+    execed = _EXECED.search(out)
+    cap["forked"] = bool(fork)
+    cap["child_pid"] = int(fork.group(1)) if fork else None
+    cap["execed"] = execed.group(1) if execed else None
+    cap["multiproc"] = bool(fork or execed)
+    return cap
+
+
 def _parse(out: str) -> dict:
     sig = _SIG.search(out)
     if sig is None:
