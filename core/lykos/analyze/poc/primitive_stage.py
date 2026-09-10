@@ -102,48 +102,74 @@ def primitive_stage(ctx) -> dict:
                                       target.arch or host)
         mnem = (disasm or "").split()[0] if disasm else ""
 
-        # 1) instruction-pointer control -- trust the stack-slot heuristic only when the fault
-        # is actually at a return (else a fuzzed buffer of stack locals looks like a retaddr);
-        # a cyclic PC (source "pc") is a hijack and is always trusted.
-        # a cyclic pc, or a controlled return-address register (lr/x30/$ra on link-register
-        # ABIs), is a hijack and always trusted; a bare stack slot only when the fault is a ret.
-        if rec is not None and (rec[1] in ("pc",) + primitive._RA_REGS
-                                or mnem in ("ret", "retq", "retn")):
+        # 1) instruction-pointer control. Trust the dynamic slot heuristic only when the fault
+        # is actually at a return (else a fuzzed buffer of stack locals looks like a retaddr); a
+        # cyclic pc, or a controlled return-address register (lr/x30/$ra on link-register ABIs),
+        # is a hijack and always trusted. We then CONFIRM by placing the marker at the control
+        # slot -- and confirmation, not the raw heuristic, decides the reported offset, so an
+        # off-by-a-word recovery self-corrects.
+        #
+        # Build the confirm candidates in priority order:
+        #   - the dynamic offset (when trusted);
+        #   - on ARM/AArch64, its Thumb-alias sibling: `pop {pc}`/`bx` masks bit 0 of the loaded
+        #     PC (interworking select), so the captured PC is `value & ~1`, whose cyclic window
+        #     can alias one word early -- searching `(pc | 1)` restores the exact slot;
+        #   - the static-frame predictions (also the sole source when the fault isn't a ret).
+        trusted = rec is not None and (rec[1] in ("pc",) + primitive._RA_REGS
+                                       or mnem in ("ret", "retq", "retn"))
+        confirm_cands = []                         # (offset, source, static_match, fp_slack)
+        if trusted:
+            off0, src0 = rec
+            sm0, sl0 = primitive.match_frame_candidate(off0, offset_candidates, word)
+            confirm_cands.append((off0, src0, sm0, sl0))
+            if (target.arch or "") in ("arm", "aarch64") and src0 == "pc":
+                alt = primitive.cyclic_find(
+                    primitive._reg_window((cap0.get("pc") or 0) | 1, word, endian, 4), length, 4)
+                if alt != -1 and alt != off0:
+                    sm1, sl1 = primitive.match_frame_candidate(alt, offset_candidates, word)
+                    confirm_cands.append((alt, "pc(thumb)", sm1, sl1))
+        for off, c, fp_slack in primitive.seed_offsets(offset_candidates, word, length):
+            confirm_cands.append((off, "static-frame", c, fp_slack))
+
+        seen_off = set()
+        for off, source, static_match, fp_slack in confirm_cands:
+            if off in seen_off:
+                continue
+            seen_off.add(off)
+            ctx.progress(msg=f"confirming IP-control at offset {off} ({source})")
+            control = primitive.control_input(off, length, word, endian)
+            if not primitive.marker_confirmed(capture(control), word, endian):
+                continue
+            prim = {"type": "instruction-pointer-control", "offset": off, "source": source,
+                    "marker": primitive._ip_marker(word), "observed_pc": cap0.get("pc", 0),
+                    "confirmed": True, "registers": regs,
+                    "static_offset": static_match, "static_candidates": offset_candidates}
+            extra = f"instruction-pointer control at offset {off} ({source})"
+            if static_match:
+                extra += (f"; corroborated by static stack frame -- {static_match['size']}-byte"
+                          f" buffer {static_match['buffer']}{_slack_txt(fp_slack)}"
+                          f" = offset {off}")
+            return _finalize(ctx, target, target_bytes, mode, base_argv, cap0, control,
+                             prim, True, extra)
+
+        # 1c) nothing confirmed -- if we had a trusted dynamic offset, still report it as an
+        # unconfirmed IP-control primitive (the crash reproduces; the marker just didn't pin).
+        if trusted:
             offset, source = rec
             static_match, fp_slack = primitive.match_frame_candidate(offset, offset_candidates,
                                                                      word)
-            ctx.progress(msg=f"IP-control offset {offset} ({source}"
-                             + (", matches static frame" if static_match else "") + "); confirming")
             control = primitive.control_input(offset, length, word, endian)
-            confirmed = primitive.marker_confirmed(capture(control), word, endian)
             prim = {"type": "instruction-pointer-control", "offset": offset, "source": source,
                     "marker": primitive._ip_marker(word), "observed_pc": cap0.get("pc", 0),
-                    "confirmed": confirmed, "registers": regs,
+                    "confirmed": False, "registers": regs,
                     "static_offset": static_match, "static_candidates": offset_candidates}
-            extra = f"instruction-pointer control at offset {offset}"
+            extra = f"instruction-pointer control at offset {offset} ({source})"
             if static_match:
                 extra += (f"; corroborated by static stack frame -- {static_match['size']}-byte"
                           f" buffer {static_match['buffer']}{_slack_txt(fp_slack)}"
                           f" = offset {offset}")
             return _finalize(ctx, target, target_bytes, mode, base_argv, cap0, control,
-                             prim, confirmed, extra)
-
-        # 1b) static-seeded IP control -- the dynamic slot heuristic did not pin an offset, but
-        # recovered stack buffers predict where the return address is; try each prediction
-        # directly (a confirmed PC==MARKER is proof, discovered from the static frame).
-        for off, c, fp_slack in primitive.seed_offsets(offset_candidates, word, length):
-            control = primitive.control_input(off, length, word, endian)
-            if primitive.marker_confirmed(capture(control), word, endian):
-                ctx.progress(msg=f"static-frame IP-control offset {off} confirmed")
-                prim = {"type": "instruction-pointer-control", "offset": off,
-                        "source": "static-frame", "marker": primitive._ip_marker(word),
-                        "observed_pc": cap0.get("pc", 0), "confirmed": True, "registers": regs,
-                        "static_offset": c, "static_candidates": offset_candidates}
-                extra = (f"instruction-pointer control at offset {off}, predicted from the "
-                         f"recovered {c['size']}-byte stack buffer {c['buffer']}"
-                         f"{_slack_txt(fp_slack)} (static RE seeded the dynamic confirmation)")
-                return _finalize(ctx, target, target_bytes, mode, base_argv, cap0, control,
-                                 prim, True, extra)
+                             prim, False, extra)
 
         # 2) memory primitive (write-what-where / controlled read at a faulting mem access)
         memp = primitive.analyze_memory_primitive(cap0, length, disasm)

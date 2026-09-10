@@ -47,6 +47,37 @@ for entry in $CC_MATRIX; do
   $CC $FLAGS -O2 -static -w "$SRC/vuln.c"                -o "$OUT/vuln_${arch}_static" 2>/dev/null && strip "$OUT/vuln_${arch}_static" 2>/dev/null && emit "vuln_${arch}_static" "$arch" ELF C "O2 static stripped"
 done
 
+# == musl cross toolchains (static-pie, self-contained -> ideal for qemu-user) ==
+# The distro cross-GCC family is often absent; musl.cc ships static prebuilt toolchains that
+# produce self-contained static-pie binaries qemu-user runs with no target libs. Point
+# MUSL_CROSS_ROOT at a dir holding extracted <triple>-cross/ trees (e.g. arm-linux-musleabihf-cross)
+# to (re)build the cross vuln_<arch> matrix. `-static` (musl links it static-pie) + keep symbols.
+#   arch label  : musl triple
+MUSL_MATRIX="
+arm:arm-linux-musleabihf
+aarch64:aarch64-linux-musl
+mipsel:mipsel-linux-musl
+mips_be:mips-linux-musl
+ppc:powerpc-linux-musl
+riscv64:riscv64-linux-musl
+"
+if [ -n "${MUSL_CROSS_ROOT:-}" ] && [ -d "$MUSL_CROSS_ROOT" ]; then
+  echo "== musl cross matrix (MUSL_CROSS_ROOT=$MUSL_CROSS_ROOT) =="
+  for entry in $MUSL_MATRIX; do
+    arch="${entry%%:*}"; triple="${entry#*:}"
+    MCC="$MUSL_CROSS_ROOT/${triple}-cross/bin/${triple}-gcc"
+    MSTRIP="$MUSL_CROSS_ROOT/${triple}-cross/bin/${triple}-strip"
+    [ -x "$MCC" ] || { echo "  (skip $arch: ${triple}-gcc absent)"; continue; }
+    if "$MCC" -O0 -fno-stack-protector -static -w "$SRC/vuln.c" -o "$OUT/vuln_${arch}" 2>/dev/null; then
+      emit "vuln_${arch}" "$arch" ELF C "O0 static-pie stack-overflow (musl cross)"
+      cp "$OUT/vuln_${arch}" "$OUT/vuln_${arch}_stripped"
+      "$MSTRIP" "$OUT/vuln_${arch}_stripped" 2>/dev/null && emit "vuln_${arch}_stripped" "$arch" ELF C "O0 static-pie stripped"
+    fi
+  done
+else
+  echo "== musl cross matrix skipped (set MUSL_CROSS_ROOT to a dir of <triple>-cross toolchains; get them from musl.cc) =="
+fi
+
 echo "== Windows PE via MinGW =="
 have x86_64-w64-mingw32-gcc && x86_64-w64-mingw32-gcc -O2 -w "$SRC/vuln.c" -o "$OUT/vuln_win64.exe" 2>/dev/null && emit "vuln_win64.exe" "x86-64" PE C "mingw"
 have i686-w64-mingw32-gcc   && i686-w64-mingw32-gcc   -O2 -w "$SRC/vuln.c" -o "$OUT/vuln_win32.exe" 2>/dev/null && emit "vuln_win32.exe" "i386"   PE C "mingw"

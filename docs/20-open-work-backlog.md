@@ -148,9 +148,26 @@ crashing input; many bug classes have a **derivable** input and need no fuzzing.
 ## E. Corpus & coverage
 
 - **[DONE] Multi-arch RE corpus** (`examples/re-corpus/`): busybox across 13 arches + PE/C++/Rust/
-  stripped/static/UPX; plus `vuln_{aarch64,mipsel,mips_be,ppc}` cross-built via musl toolchains.
-- **[PLANNED] More cross-arch vuln binaries**: riscv64 / s390x / arm / sparc small stack-overflow
-  builds (musl cross toolchains) to keep extending the offset/L2 cross-arch matrix.
+  stripped/static/UPX; plus `vuln_{aarch64,arm,mipsel,mips_be,ppc}` cross-built via musl toolchains.
+- **[DONE] 32-bit ARM (armhf) deepened end-to-end** — `vuln_arm` + `vuln_arm_stripped` (ARMv7 EABI5,
+  static-pie, musl cross from musl.cc; `build_corpus.sh` gained a `MUSL_CROSS_ROOT` matrix). Verified
+  live across the whole pipeline: triage (arm/32/LE), Ghidra disasm + signatures/frames, detect_cwe
+  (CWE-121 128-byte buffer, CWE-78 system, CWE-120, CWE-134), the cross-arch dangerous-call monitor
+  (captured `system("echo unlocked")` → corroborated CWE-78), `behavior_trace` (exec `/bin/sh` via
+  qemu-arm `-strace`), `synthesize_poc` (verified L1 SIGSEGV), `poc_primitive` (**verified L2
+  IP-control**), and the `sink_addrs` escape hatch on the stripped twin (PIE-rebased). **Fixed a real
+  ARM Thumb-interworking L2 bug**: `pop {pc}`/`bx` masks bit 0 of the loaded PC (Thumb/ARM state
+  select), so the captured fault PC is `value & ~1`; when that aliases the neighbouring De Bruijn word
+  (differs only in bit 0), the naive offset search pinned the return-address slot one word early and
+  the marker never confirmed. `primitive_stage` now also searches `(pc | 1)` to restore the masked
+  bit, and lets **confirmation** (not the raw heuristic) decide the reported offset — trying the
+  dynamic offset, its Thumb-alias sibling, then the static-frame predictions, and self-correcting an
+  off-by-a-word recovery. Regression-tested (`tests/test_arm.py`). General robustness win for every
+  arch (a mis-recovered dynamic offset now gets a static-seeded second chance before finalizing
+  unconfirmed).
+- **[PLANNED] More cross-arch vuln binaries**: riscv64 / s390x / sparc small stack-overflow
+  builds (musl cross toolchains) to keep extending the offset/L2 cross-arch matrix (arm/aarch64/
+  mipsel/mips_be/ppc done).
 - **[PLANNED] Go / Rust deeper coverage**: currently one Rust real-world binary (ripgrep); add a Go
   binary and exercise the RE views against runtime-heavy, monomorphized code.
 
