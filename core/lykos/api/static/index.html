@@ -1132,6 +1132,7 @@ async function showDetail(targetId){
               <button class="btn sm" id="monitorrun" title="Run under GDB with breakpoints on dangerous sinks; capture what the program passes them at runtime (command strings, copy lengths) -- finds executed commands and overflows without a crash. Native-arch only.">Runtime monitor</button>
               <button class="btn sm" id="heaprun" title="Run under a guard-page heap allocator (LD_PRELOAD) that catches use-after-free, double-free, heap overflow and invalid free at the exact access -- silent corruptions that don't crash. Native-arch, dynamically-linked targets.">Heap check</button>
               <button class="btn sm" id="secretrun" title="Breakpoint the comparison functions and dump both operands -- recovers the constants the program checks input against (passwords, magic bytes, tokens). Native-arch only.">Extract secrets</button>
+              <button class="btn sm" id="behaviorrun" title="Trace the security-relevant syscalls the binary makes (exec, network, file writes, anti-debug, W^X) -- a behavioral capability inventory. Native x86-64.">Behavior trace</button>
               <button class="btn sm" id="consolerun" title="Interactive detonation: run the target in the sandbox and drive it live (send/receive) to reach menus/protocols; save what you send as a seed.">Console ▸</button>
               <span class="fghint" id="strathint"></span>
             </div>
@@ -1163,6 +1164,7 @@ async function showDetail(targetId){
   document.getElementById("monitorrun").onclick = ()=>doMonitor(targetId);
   document.getElementById("heaprun").onclick = ()=>doHeapCheck(targetId);
   document.getElementById("secretrun").onclick = ()=>doExtract(targetId);
+  document.getElementById("behaviorrun").onclick = ()=>doBehavior(targetId);
   document.getElementById("consolerun").onclick = ()=>openConsole(targetId);
   const fm=document.getElementById("fuzzmetrics"); if(fm){ fm.hidden=true; fm.innerHTML=""; }
   const sc=document.getElementById("seedcount"); if(sc) sc.textContent="";
@@ -1574,6 +1576,11 @@ async function doExtract(tid){
   await postRun(tid, "extract_secrets", {input_mode:(mode==="none"?"stdin":mode), timeout:20},
     {status:"extracting comparison constants under GDB…"});
 }
+async function doBehavior(tid){
+  const mode = document.getElementById("dynmode").value;
+  await postRun(tid, "behavior_trace", {input_mode:(mode==="none"?"stdin":mode), timeout:25},
+    {status:"tracing syscalls under GDB…"});
+}
 // ---- interactive detonation console ----
 let CONWS=null, CON_TID=null;
 function openConsole(tid){ CON_TID=tid; document.getElementById("console").hidden=false;
@@ -1967,6 +1974,12 @@ function openWS(id){
         ? `injection CONFIRMED: `+(e.payload.results||[]).map(r=>r.cwe+" via "+r.mode).join(", ")
         : (e.payload.note||"no injection confirmed");
       loadFindings(DETAIL_TID); loadPocs(DETAIL_TID);
+    }
+    if(e.type==="behavior.done" && DETAIL_TID){
+      const st=document.getElementById("fuzzstat"); const iv=e.payload&&e.payload.inventory;
+      if(st) st.textContent = !e.payload||!e.payload.ok ? ((e.payload&&e.payload.note)||"behavior trace unavailable")
+        : `behavior: ${e.payload.syscalls} syscalls -- exec ${iv.exec.length}, net ${iv.network.length}${iv.anti_debug?", anti-debug":""}${iv.wx?", W^X":""}`;
+      loadFindings(DETAIL_TID);
     }
     if(e.type==="synth.start"){ const st=document.getElementById("fuzzstat"); if(st&&e.payload) st.textContent=`synthesizing from ${e.payload.candidates.length} recovered buffer(s)…`; }
     if(e.type==="synth.done" && DETAIL_TID){

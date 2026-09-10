@@ -11,6 +11,8 @@ from .multidebug import MULTI_DEBUG_STAGE, enqueue_multi_debug  # noqa: F401
 from .multidebug import register as _register_multi
 from .stage import ROOT_CAUSE_STAGE, enqueue_root_cause  # noqa: F401
 from .stage import register as _register
+from .trace_stage import TRACE_STAGE, enqueue_behavior_trace  # noqa: F401
+from .trace_stage import register as _register_trace
 
 
 def register() -> None:
@@ -18,3 +20,4 @@ def register() -> None:
     _register_multi()
     _register_monitor()
     _register_extract()
+    _register_trace()
