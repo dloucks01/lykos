@@ -37,7 +37,12 @@ def build_poc_stage(ctx) -> dict:
     if mode == "stdin":
         stdin = input_bytes
     elif mode == "arg":
-        run_argv = [input_bytes.decode("latin-1")]
+        try:
+            run_argv = [sandbox.argv_arg(input_bytes)]
+        except sandbox.ArgvNulError as e:
+            ctx.emit("poc.done", payload={"verified": False, "note": str(e)})
+            ctx.progress(pct=100, msg="payload undeliverable via argv")
+            return {"metrics": {"verified": False, "undeliverable": True}}
     elif mode == "file":
         wf = ctx.scratch() / "input.bin"
         wf.write_bytes(input_bytes)

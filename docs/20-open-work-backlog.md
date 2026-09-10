@@ -304,6 +304,12 @@ None of these are hypothetical; each was read off the code, but none has a repro
   (duplicate work), but it defeats the dedup it exists for.
 - **[PLANNED] Temp-directory leak per request.** `_upload_target`, `_import_case` and
   `_get_case_export` each `mkdtemp()` and only `unlink()` the file inside, never the directory.
+- **[PLANNED] Stage input parameters are inconsistent and fail silently.** `dynamic_run`
+  reads its input from `params["input_b64"]`; `build_poc` and `poc_primitive` read
+  `params["input_sha"]`. Passing the wrong one is not an error -- `dynamic_run` simply runs
+  the target with NO input and records a clean exit, which is indistinguishable from a
+  genuine no-crash result. This is reachable straight from the HTTP API, which forwards
+  `params` verbatim. Either accept both spellings or reject an unknown input key.
 - **[PLANNED] `api/server.py:_create_run` is a ~90-line `elif` chain** over 25 stage names, when
   `jobs/registry.py` already exists to dispatch by name.
 - **[PLANNED] `sandbox.run()` re-implements `classify_rc()` inline** at its tail.

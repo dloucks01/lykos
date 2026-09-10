@@ -64,7 +64,12 @@ def dynamic_stage(ctx) -> dict:
     input_sha = ctx.put_artifact("dyn-input", data=input_bytes) if input_bytes else None
     stdin = input_bytes if mode == "stdin" else b""
     if mode == "arg" and input_bytes:
-        argv = argv + [input_bytes.decode("latin-1")]
+        try:
+            argv = argv + [sandbox.argv_arg(input_bytes)]
+        except sandbox.ArgvNulError as e:
+            ctx.emit("dynamic.done", payload={"crashed": False, "note": str(e)})
+            ctx.progress(pct=100, msg="payload undeliverable via argv")
+            return {"metrics": {"undeliverable": True}}
     elif mode == "file" and input_bytes:         # deliver the input as a file argument
         infile = ctx.scratch() / "input.bin"
         infile.write_bytes(input_bytes)
