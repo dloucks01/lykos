@@ -35,7 +35,7 @@ crashing input; many bug classes have a **derivable** input and need no fuzzing.
   them. Native-arch, dynamically-linked targets; per-arch shim under qemu is future work.
 - **[PLANNED] Dynamic taint tracking**: confirm a source→sink flow at runtime (we only do it
   statically now) — DTA over qemu, or a lightweight taint via the debugger.
-- **[PLANNED] Syscall / behavior tracing**: trace `execve`/`connect`/`open`-for-write etc. →
+- **[DONE] Syscall / behavior tracing** (`behavior_trace`): trace `execve`/`connect`/`open`-for-write etc. →
   behavioral capability inventory (backdoors, anti-analysis, network beacons).
 
 ## C. Automated debugger ("find things", not just capture a crash)
