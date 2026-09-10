@@ -16,7 +16,6 @@ import resource
 import shutil
 import signal
 import subprocess
-import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -213,9 +212,13 @@ def _is_pe(exe) -> bool:
 
 
 def _default_wineprefix() -> str:
-    # one persistent prefix (bootstrapped once) reused across runs -- re-bootstrapping per exec
+    # One persistent prefix (bootstrapped once) reused across runs -- re-bootstrapping per exec
     # would make fuzzing unusably slow; wineserver is keyed by prefix so workers can share it.
-    return os.path.join(tempfile.gettempdir(), "lykos-wineprefix")
+    # It must live in a directory the invoking user OWNS: wine refuses to create a prefix under a
+    # world-writable sticky dir like /tmp ("'/tmp' is not owned by you"), so use ~/.cache. A
+    # freshly bootstrapped prefix also gets the WoW64 (32-bit) DLLs, so PE32 targets run too.
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
+    return os.path.join(base, "lykos", "wineprefix")
 
 
 def _ensure_wineprefix(wine: str, prefix: str) -> None:
