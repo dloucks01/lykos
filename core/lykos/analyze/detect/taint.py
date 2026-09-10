@@ -31,8 +31,16 @@ ARCH_ABI = {
                "args": [{"RDI", "EDI"}, {"RSI", "ESI"}, {"RDX", "EDX"},
                         {"RCX", "ECX"}, {"R8", "R8D"}, {"R9", "R9D"}],
                "frame": {"RBP", "RSP"}},
-    "x86":    {"ret": {"EAX"}, "args": [],                  # cdecl: stack args (not tracked)
-               "frame": {"EBP", "ESP"}},
+    # cdecl passes everything on the stack, so "args" is empty and the two "stack_*" keys
+    # carry the convention instead (see _arg_taints / _push_taint):
+    #   stack_params -- the callee sees its own parameters at [EBP + 8 + 4i] once the standard
+    #                   prologue has run, which the frame-slot tracker already resolves.
+    #   stack_call   -- the caller PUSHes arguments right-to-left, so at the CALL the most
+    #                   recent push is argument 0.
+    "x86":    {"ret": {"EAX"}, "args": [],
+               "frame": {"EBP", "ESP"},
+               "stack_params": {"base": "EBP", "offset0": 8, "stride": 4},
+               "stack_call": {"base": "ESP", "stride": 4}},
     "aarch64": {"ret": {"X0", "W0"},
                 "args": [{"X%d" % i, "W%d" % i} for i in range(8)],
                 "frame": {"X29", "SP"}},
@@ -194,6 +202,11 @@ def _apply(taint, ops, bases=()):
         _define(taint, outk, any(k in taint for k in ins))
 
 
+def _has_abi(abi):
+    """A usable calling convention: argument registers, or a stack convention."""
+    return bool(_arg_regs(abi) or abi.get("stack_call"))
+
+
 def _arg_regs(abi):
     regs = set()
     for a in abi["args"]:
@@ -201,11 +214,21 @@ def _arg_regs(abi):
     return regs
 
 
-def _args_tainted(taint, argregs):
-    return any(("reg", r) in taint for r in argregs)
+_MAX_STACK_ARGS = 8
 
 
-def _sink_tainted(taint, sink, argregs_list, argregs_all):
+def _arg_taints(taint, argregs_list, pushes):
+    """Taint of each argument position, as a list of bools.
+
+    Register ABIs read the argument registers directly. Stack ABIs (cdecl) read the pending
+    push list: arguments go right-to-left, so the most recent push is argument 0.
+    """
+    if argregs_list:
+        return [any(("reg", r) in taint for r in grp) for grp in argregs_list]
+    return [pushes[-1 - i] for i in range(min(len(pushes), _MAX_STACK_ARGS))]
+
+
+def _sink_tainted(argt, sink):
     """Is the argument that MAKES this sink a bug tainted?
 
     Falls back to "any argument" for sinks with no declared position (see
@@ -213,10 +236,38 @@ def _sink_tainted(taint, sink, argregs_list, argregs_all):
     """
     idx = SINK_TAINT_ARGS.get(sink)
     if idx is None:
-        return _args_tainted(taint, argregs_all)
-    return any(("reg", r) in taint
-               for i in idx if i < len(argregs_list)
-               for r in argregs_list[i])
+        return any(argt)
+    return any(argt[i] for i in idx if i < len(argt))
+
+
+def _push_taint(ops, taint, base):
+    """If this instruction is a `PUSH <value>` onto `base`, return that value's taint.
+
+    The cdecl idiom is a stack-pointer decrement plus a store through it, in one instruction:
+
+        COPY    reg:EAX:4 -> unique:0x41500:4
+        INT_SUB reg:ESP:4 const:0x4:4 -> reg:ESP:4
+        STORE   const:0x1a1:8 reg:ESP:4 unique:0x41500:4
+
+    Read AFTER _apply, so the COPY has already propagated taint into the unique. Returns None
+    when the instruction is not a push. ESP-relative slot KEYS are deliberately not used:
+    the stack pointer moves, so ("stack","ESP",0) names different memory at different points.
+    """
+    dec = False
+    val = None
+    for pc in ops:
+        try:
+            mnem, _, outk, toks = _parse(pc)
+        except Exception:
+            continue
+        if mnem == "INT_SUB" and outk == ("reg", base) and len(toks) >= 2 \
+                and _key(toks[1]) == ("reg", base):
+            dec = True
+        elif mnem == "STORE" and len(toks) >= 4 and _key(toks[2]) == ("reg", base):
+            val = _key(toks[3])
+    if not dec:
+        return None
+    return val is not None and val in taint
 
 
 def build_callmap(call_edges):
@@ -235,8 +286,9 @@ def _run(ir, abi, callmap, dstmap, func_addrs, entry_params, ret_tainted, *,
         tainted arguments -- used to summarise a caller (which imports does it taint?).
     """
     argregs_list = abi["args"]
-    argregs_all = _arg_regs(abi)
     retregs = abi["ret"]
+    stack_call = abi.get("stack_call")
+    stack_params = abi.get("stack_params")
     blocks = (ir or {}).get("blocks", [])
     if not blocks or len(blocks) > _MAX_BLOCKS:
         return set(), False, {}
@@ -253,24 +305,31 @@ def _run(ir, abi, callmap, dstmap, func_addrs, entry_params, ret_tainted, *,
         if i < len(argregs_list):
             for r in argregs_list[i]:
                 pre.add(("reg", r))
+        if stack_params is not None:
+            # cdecl: the callee reads parameter i from [EBP + 8 + 4i] after its prologue
+            pre.add(("stack", stack_params["base"],
+                     stack_params["offset0"] + stack_params["stride"] * i))
 
-    def transfer(cur, instr, flagged, contribs):
+    def transfer(cur, instr, flagged, contribs, pushes):
         addr = instr.get("addr")
         ext = callmap.get(addr)
         dst = dstmap.get(addr)
         internal = dst in func_addrs
-        if ext in DANGEROUS and _sink_tainted(cur, ext, argregs_list, argregs_all):
+        # Argument taint is read BEFORE this instruction's own p-code runs: for a CALL the
+        # arguments were staged by earlier instructions (registers, or pushes).
+        argt = _arg_taints(cur, argregs_list, pushes)
+        if ext in DANGEROUS and _sink_tainted(argt, ext):
             flagged.add(addr)
         if extmap is not None and ext_out is not None:
             esym = extmap.get(addr)
-            if esym and _args_tainted(cur, argregs_all):
+            if esym and any(argt):
                 ext_out.add(esym)
-        tainted_params = set()
-        if internal:
-            for i, regset in enumerate(argregs_list):
-                if any(("reg", r) in cur for r in regset):
-                    tainted_params.add(i)
+        tainted_params = {i for i, t in enumerate(argt) if t} if internal else set()
         _apply(cur, instr.get("pcode", []), abi.get("frame", ()))
+        if stack_call is not None:
+            pushed = _push_taint(instr.get("pcode", []), cur, stack_call["base"])
+            if pushed is not None:
+                pushes.append(pushed)
         if seed_sources and ext in SOURCES:
             cur |= {("reg", r) for r in retregs}
         if internal:
@@ -278,6 +337,10 @@ def _run(ir, abi, callmap, dstmap, func_addrs, entry_params, ret_tainted, *,
                 contribs[dst] = contribs.get(dst, set()) | tainted_params
             if ret_tainted.get(dst):
                 cur |= {("reg", r) for r in retregs}
+        if ext is not None or internal:
+            # the call consumed its staged arguments (and a CALL also pushes a return
+            # address, which must not be mistaken for the next call's argument 0)
+            del pushes[:]
 
     OUT = {a: set() for a in order}
     for _ in range(len(blocks) * 4 + 10):
@@ -288,9 +351,9 @@ def _run(ir, abi, callmap, dstmap, func_addrs, entry_params, ret_tainted, *,
                 cur |= OUT[p]
             if a == entry:
                 cur |= pre
-            f, c = set(), {}
+            f, c, pushes = set(), {}, []
             for instr in by_addr[a]["instructions"]:
-                transfer(cur, instr, f, c)
+                transfer(cur, instr, f, c, pushes)
             if cur != OUT[a]:
                 OUT[a] = cur
                 changed = True
@@ -304,8 +367,9 @@ def _run(ir, abi, callmap, dstmap, func_addrs, entry_params, ret_tainted, *,
             cur |= OUT[p]
         if a == entry:
             cur |= pre
+        pushes = []
         for instr in by_addr[a]["instructions"]:
-            transfer(cur, instr, flagged, contribs)
+            transfer(cur, instr, flagged, contribs, pushes)
 
     exits = [a for a in order if not by_addr[a].get("succ")] or order
     ret_bool = any(("reg", r) in OUT[a] for a in exits for r in retregs)
@@ -315,7 +379,7 @@ def _run(ir, abi, callmap, dstmap, func_addrs, entry_params, ret_tainted, *,
 def analyze_function(ir, callmap, arch):
     """Intra-procedural only (kept for direct use/tests)."""
     ak = _arch_key(arch)
-    if not ak or not _arg_regs(ARCH_ABI[ak]):
+    if not ak or not _has_abi(ARCH_ABI[ak]):
         return set()
     flagged, _, _ = _run(ir, ARCH_ABI[ak], callmap, {}, set(), set(), {})
     return flagged
@@ -331,7 +395,7 @@ def analyze_program(func_irs, call_edges, arch, *, entry_seeds=None):
     nothing can be corroborated.
     """
     ak = _arch_key(arch)
-    if not ak or not _arg_regs(ARCH_ABI[ak]):
+    if not ak or not _has_abi(ARCH_ABI[ak]):
         return set()
     abi = ARCH_ABI[ak]
     func_addrs = set(func_irs.keys())
@@ -386,7 +450,7 @@ def _program(func_irs, call_edges, arch, *, seed_params=None, seed_sources=True)
     only taint origin (callee-export summary).
     """
     ak = _arch_key(arch)
-    if not ak or not _arg_regs(ARCH_ABI[ak]):
+    if not ak or not _has_abi(ARCH_ABI[ak]):
         return set(), set()
     abi = ARCH_ABI[ak]
     func_addrs = set(func_irs)
@@ -446,7 +510,7 @@ def callee_sink_exports(func_irs, call_edges, arch, name_to_addr, export_names,
     """For each exported function named in `export_names`, does tainting its parameters
     reach a dangerous sink? Returns {export_name: set((cwe, sink_symbol))}."""
     ak = _arch_key(arch)
-    if not ak or not _arg_regs(ARCH_ABI[ak]):
+    if not ak or not _has_abi(ARCH_ABI[ak]):
         return {}
     nargs = len(ARCH_ABI[ak]["args"]) or 6
     callmap = build_callmap(call_edges)

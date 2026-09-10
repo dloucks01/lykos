@@ -197,16 +197,29 @@ candidate recall 1.00 / fp_rate 0.571; corroborated recall 0.833 / fp_rate 0.214
   register that changes at every call (test guards the disjointness). Verified end-to-end: a
   RISC-V binary now corroborates CWE-120 across a function boundary and CWE-78 in main, both
   via `taint-dataflow`; aarch64 and 32-bit ARM confirmed too; x86-64 corpus numbers unchanged.
-- **[PLANNED] Taint is still INERT on x86 (32-bit), s390, sparc, sparcv9, sh, m68k and
-  loongarch** — 7 of the 14 arch strings `analyze/elf.py` can emit. s390/sparc/sh/loongarch
-  need only an `ARCH_ABI` row (r2-r6, o0-o5, r4-r7, a0-a7 respectively), but the register
-  NAMES must be read off real Ghidra output first — the RISC-V row was guessed as `a0` and
-  happened to be right, which is not a method. No cross-compiler for any of them is installed,
-  so this needs toolchains (or prebuilt corpus binaries) before it can be done honestly.
-  x86 (32-bit) and m68k pass arguments on the stack and additionally need call-site stack-slot
-  argument tracking; the constant-offset frame-slot support now in `_apply` makes that
-  tractable (cdecl args are `[ESP + 4i]` at the call, the same shape as a spill), and
-  `i686-w64-mingw32-gcc` can produce 32-bit x86 P-Code to develop against without multilib.
+- **[DONE] 32-bit x86 (cdecl) taint channel** — `ARCH_ABI["x86"]["args"]` was empty because
+  cdecl passes everything on the stack, so the channel was inert for the entire architecture.
+  Added a stack calling convention alongside the register one: `stack_params` (the callee
+  reads parameter *i* from `[EBP + 8 + 4i]` after its prologue, which the frame-slot tracker
+  already resolves) and `stack_call` (the caller PUSHes right-to-left, so the most recent push
+  at a CALL is argument 0). Argument taint is now an abstraction — `_arg_taints()` returns a
+  per-position list from either registers or the pending push list — so `SINK_TAINT_ARGS`,
+  callee-parameter propagation and the cross-binary import summary all work unchanged on a
+  stack ABI. ESP-relative slot *keys* are deliberately not used: the stack pointer moves, so
+  `("stack","ESP",0)` names different memory at different points; the push sequence is modelled
+  explicitly instead, and cleared per call so a CALL's own return-address push is never read as
+  the next call's argument 0. Verified end-to-end on a real i386 ELF: `strcpy` reached through
+  a function boundary from `argv[1]`, `printf(argv[1])` and `system(argv[1])` all corroborate,
+  while `strcpy(b,"constant")`, `printf("%s\n",b)` and `system("/bin/date")` correctly stay at
+  `candidate`. (`gcc -m32 -nostdlib` builds a usable 32-bit ELF without multilib — the missing
+  pieces were only the libc startup objects.)
+- **[PLANNED] Taint is still INERT on s390, sparc, sparcv9, sh, m68k and loongarch** — 6 of the
+  14 arch strings `analyze/elf.py` can emit. s390/sparc/sh/loongarch need only an `ARCH_ABI`
+  row (r2-r6, o0-o5, r4-r7, a0-a7 respectively), but the register NAMES must be read off real
+  Ghidra output first — the RISC-V row was guessed as `a0` and happened to be right, which is
+  not a method. No cross-compiler for any of them is installed here, so this needs toolchains
+  (or prebuilt corpus binaries) before it can be done honestly. m68k additionally passes
+  arguments on the stack, but the cdecl work above now gives it a model to reuse.
 - **[DONE] Verified argv seeding off x86-64** — confirmed end-to-end on riscv64, aarch64 and
   32-bit ARM. This is what surfaced the materialised-displacement bug above: the seed was
   arch-independent, but the spill tracking it depends on was not.
