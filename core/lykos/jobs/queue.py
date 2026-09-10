@@ -68,8 +68,11 @@ class JobQueue:
             "ORDER BY created_at ASC LIMIT 1", (cache_key,)).fetchone()
         return AnalysisRunDAO._row(r) if r else None
 
-    def _materialize_cache_hit(self, case_id, stage, target_id, params, tool, tool_version,
-                               ck, cached, priority, resource_class, max_attempts) -> AnalysisRun:
+    def _materialize_cache_hit(self, case_id: str, stage: str, target_id: Optional[str],
+                               params: Optional[dict], tool: Optional[str],
+                               tool_version: Optional[str], ck: str, cached: AnalysisRun,
+                               priority: int, resource_class: str,
+                               max_attempts: int) -> AnalysisRun:
         self.conn.execute("BEGIN IMMEDIATE")
         try:
             run = self.runs.create(case_id, stage, target_id=target_id, params=params,
@@ -208,7 +211,7 @@ class JobQueue:
         return True
 
     # ------------------------------------------------------- reaper / recovery (JE-04/07)
-    def _requeue_or_error(self, r, error: str) -> None:
+    def _requeue_or_error(self, r: sqlite3.Row, error: str) -> None:
         rid, cid = r["id"], r["case_id"]
         if r["attempts"] < r["max_attempts"]:
             self.conn.execute(

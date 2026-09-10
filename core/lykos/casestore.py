@@ -10,10 +10,14 @@ Export/import archive the whole directory so a case moves intact between air-gap
 from __future__ import annotations
 
 import shutil
+import sqlite3
 import tarfile
 import tempfile
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
+
+# (table, WHERE clause, bound params) -- one copy step of a per-case export.
+_CasePlan = tuple[str, str, tuple[Any, ...]]
 
 from .db.dao import AnalysisRunDAO, ArtifactDAO, CaseDAO, EventDAO, RunArtifactDAO, TargetDAO
 from .db.migrations import init_db
@@ -184,7 +188,7 @@ def _safe_extract(tar: tarfile.TarFile, dest: Path) -> None:
 # self-contained (doc 12), independent of the whole-store archive above.
 
 # Tables to copy for a case, with the WHERE that selects its rows. Order respects FKs.
-def _case_tables(conn, case_id: str):
+def _case_tables(conn: sqlite3.Connection, case_id: str) -> list[_CasePlan]:
     tids = [r["id"] for r in
             conn.execute("SELECT id FROM target WHERE case_id=?", (case_id,))]
     rids = [r["id"] for r in
@@ -207,7 +211,8 @@ def _case_tables(conn, case_id: str):
     return plan
 
 
-def _copy_rows(sc, dc, table: str, where: str, params, *, drop_cols=()) -> None:
+def _copy_rows(sc: sqlite3.Connection, dc: sqlite3.Connection, table: str, where: str,
+               params: tuple[Any, ...], *, drop_cols: tuple[str, ...] = ()) -> None:
     rows = sc.execute(f"SELECT * FROM {table} WHERE {where}", params).fetchall()
     if not rows:
         return

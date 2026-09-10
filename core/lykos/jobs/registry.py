@@ -8,7 +8,10 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
+
+if TYPE_CHECKING:
+    from ..casestore import CaseStore
 
 # fn(ctx: JobContext) -> Optional[dict]
 StageFn = Callable[[Any], Optional[dict]]
@@ -43,7 +46,7 @@ def register_stage(name: str, fn: StageFn, *, resource_class: str = "quick",
     return sd
 
 
-def cached_output_json(store, run_id: str):
+def cached_output_json(store: "CaseStore", run_id: str) -> Any:
     """The parsed JSON of a run's first 'output' artifact, or None. Shared by cache-hit
     reprojection hooks, which rebuild per-target DB rows from a cloned output artifact."""
     for link in store.run_artifacts.list_by_run(run_id):
@@ -55,7 +58,8 @@ def cached_output_json(store, run_id: str):
     return None
 
 
-def reproject_cache_hit(store, stage: str, target_id: str, run_id: str) -> bool:
+def reproject_cache_hit(store: "CaseStore", stage: str, target_id: str,
+                        run_id: str) -> bool:
     """Re-apply a cached stage's per-target DB denormalization onto a (possibly new) target row.
 
     A content-addressed cache hit clones the prior run's output artifacts to the new run but

@@ -109,7 +109,8 @@ class JobContext:
 
     # -- managed subprocess (JE-20) --
     def run_subprocess(self, cmd: list[str], timeout: Optional[float] = None,
-                       poll: float = 0.1, **popen_kw) -> subprocess.CompletedProcess:
+                       poll: float = 0.1,
+                       **popen_kw: Any) -> subprocess.CompletedProcess:
         """Run a child in its own process group; kill the group on cancel/timeout/deadline."""
         start = time.time()
         proc = subprocess.Popen(cmd, start_new_session=True,

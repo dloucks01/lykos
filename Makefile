@@ -10,11 +10,19 @@ help:
 test:
 	$(PY) -m pytest tests/ -q
 
+# lint/typecheck are gates, not suggestions: a missing tool FAILS rather than passing
+# quietly, so `make ci` can never go green without actually having run them.
 lint:
-	@if command -v ruff >/dev/null 2>&1; then ruff check core tests; else echo "ruff not installed; skipping lint"; fi
+	@command -v ruff >/dev/null 2>&1 || { \
+	  echo "ruff not installed -- gate cannot run. pip install ruff" >&2; exit 1; }
+	ruff check core tests
 
+# Two-tier gate (see mypy.ini): strict over the infra core (db/jobs/hashing/casestore),
+# errors not reported for the dict-passing analysis/API/report/eval layers.
 typecheck:
-	@if command -v mypy >/dev/null 2>&1; then mypy --ignore-missing-imports core/lykos; else echo "mypy not installed; skipping typecheck"; fi
+	@command -v mypy >/dev/null 2>&1 || { \
+	  echo "mypy not installed -- gate cannot run. pip install mypy" >&2; exit 1; }
+	mypy core/lykos
 
 ci: lint typecheck test
 	@echo "CI complete"
