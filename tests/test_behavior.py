@@ -136,3 +136,24 @@ def test_cross_arch_behavior_trace_captures_execve():
     assert elfsyms.read(_AARCH64)["pie"]                 # sanity: it's the expected binary
     execs = [e for e in r["events"] if e["syscall"] == "execve"]
     assert execs and execs[0]["path"] == "/bin/sh"
+
+
+def test_clone3_in_catch_set_and_qemu_tracked():
+    assert syscalls.NR.get(435) == "clone3"            # native GDB catches the modern fork path
+    ev = syscalls._parse_qemu_strace("1 clone3({flags=CLONE_VM},88) = 1234\n")
+    assert ev and ev[0]["syscall"] == "clone3"
+
+
+_X64_STRIPPED = os.path.join(os.path.dirname(__file__), "..", "examples", "re-corpus", "bin",
+                             "vuln_x86-64_stripped")
+
+
+@pytest.mark.skipif(not os.path.exists(_X64_STRIPPED) or not sandbox._qemu_for("x86-64"),
+                    reason="needs the x86-64 corpus binary and qemu-x86_64")
+def test_qemu_backend_follows_forked_exec_on_native():
+    """system() forks (clone/clone3) and execs in the child; the qemu backend follows the child
+    and captures execve, which the native GDB backend cannot (it only sees the parent's spawn)."""
+    r = syscalls.trace_qemu(_X64_STRIPPED, "x86-64", argv=["4242"], stdin=b"", timeout=25)
+    assert r["ok"], r.get("note")
+    execs = [e for e in r["events"] if e["syscall"] == "execve"]
+    assert execs and execs[0]["path"] == "/bin/sh"

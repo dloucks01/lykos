@@ -41,7 +41,11 @@ crashing input; many bug classes have a **derivable** input and need no fuzzing.
   arch qemu supports — the gdbstub has no `catch syscall`). Same event shape / inventory / findings
   either way. Live-verified on aarch64 (`system` → `execve(/bin/sh)`). qemu-strace limit: it does
   not decode the `connect()` sockaddr, so a connection's family is inferred from the fd's prior
-  `socket()` and the destination is reported undecoded (native still decodes ip:port).
+  `socket()` and the destination is reported undecoded (native still decodes ip:port). A
+  `params.backend` override (auto|gdb|qemu) lets an analyst run a *native* target under the qemu
+  backend too: the native GDB `catch syscall` can't follow a forked child's exec (glibc `system()`
+  forks with `clone3` and execs in the child), so it records only the spawn; the qemu backend
+  follows the child and captures the exec target. `clone3` added to the native catch set.
 
 ## C. Automated debugger ("find things", not just capture a crash)
 
