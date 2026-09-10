@@ -2,10 +2,13 @@
 syscalls it makes (process exec, network, file writes/deletes, permission changes, anti-debug,
 W^X). A behavioral capability report -- what the binary *does* -- plus findings for the
 high-signal behaviors (outbound network, anti-debugging, self-modifying code, process exec).
-Deterministic. Native x86-64 runs under GDB `catch syscall`; cross-arch targets run under
-qemu-user's own `-strace` (ABI-aware for any arch qemu supports). Child processes across fork
-are not followed in v1; the qemu backend can't decode the connect() sockaddr (destination
-unknown), and only the native backend enriches paths beyond what qemu prints.
+Deterministic. Three backends behind one stage: native x86-64 ELF under GDB `catch syscall`;
+cross-arch ELF under qemu-user's `-strace` (ABI-aware for any arch qemu supports); and Windows
+PE under Wine's `+relay` API trace (`winapi`, the Windows analog -- process exec, network egress,
+W^X, self-injection, anti-debug). Child processes across fork aren't followed in v1; the qemu
+backend can't decode the connect() sockaddr; the PE backend attributes calls to the target by
+thread + return address into the exe's mapped range (registry/file I/O are deferred -- Wine's own
+session init populates them unpredictably; see winapi.py).
 """
 from __future__ import annotations
 
@@ -15,11 +18,11 @@ import os
 from ...db.dao import FindingDAO, TargetDAO
 from ...jobs.registry import register_stage
 from ..dynamic import sandbox
-from . import syscalls
+from . import syscalls, winapi
 
 TRACE_STAGE = "behavior_trace"
 TOOL = "behavior"
-TOOL_VERSION = "behavior-3"        # bump: cross-arch qemu backend, clone3, backend override
+TOOL_VERSION = "behavior-5"        # Windows PE Win32-API trace (exec/net/wx/inject/antidbg)
 
 
 def _private(ip: str) -> bool:
@@ -35,18 +38,106 @@ def _finding(fd, target, cwe, sev, title, detail, key):
         "state": "corroborated", "confidence": 0.8})
 
 
+def _win_behavior_trace(ctx, target, p) -> dict:
+    """Windows PE branch: trace the target's own Win32 API calls under Wine (+relay) and turn the
+    high-signal ones (exec, network, registry persistence, W^X/injection, anti-debug) into
+    findings -- the Windows analog of the syscall inventory."""
+    if not winapi.supported():
+        ctx.emit("behavior.done", payload={"ok": False, "supported": False,
+                 "note": "wine not installed; cannot trace a Windows PE's API calls here"})
+        ctx.progress(pct=100, msg="behavior trace needs wine for PE targets")
+        return {}
+    exe = ctx.scratch() / "target.bin"
+    exe.write_bytes(ctx.content.path(target.sha256).read_bytes())
+    os.chmod(exe, 0o755)
+    mode = p.get("input_mode", "stdin")
+    argv = list(p.get("argv") or [])
+    timeout = float(p.get("timeout", 45))
+    data = ctx.content.get_bytes(p["input_sha"]) if p.get("input_sha") else b""
+    run_argv = argv + [data.decode("latin-1")] if (mode == "arg" and data) else argv
+    stdin = data if mode == "stdin" else b""
+
+    ctx.progress(msg="tracing Win32 API calls under Wine (+relay)")
+    res = winapi.trace(exe, argv=run_argv, stdin=stdin, timeout=timeout)
+    if not res.get("ok"):
+        ctx.emit("behavior.done", payload={"ok": False, "note": res.get("note")})
+        ctx.progress(pct=100, msg="win32 trace could not run: " + str(res.get("note")))
+        return {}
+
+    ev = res.get("events", [])
+    inv = {"exec": [], "network": [], "wx": False, "inject": False, "anti_debug": False}
+    for e in ev:
+        c, d = e.get("category"), e.get("detail")
+        if c == "exec":
+            inv["exec"].append(d or e["api"])
+        elif c == "network":
+            inv["network"].append(d or e["api"])
+        elif c == "wx":
+            inv["wx"] = True
+        elif c == "inject":
+            inv["inject"] = True
+        elif c == "antidebug":
+            inv["anti_debug"] = True
+    for k in ("exec", "network"):
+        inv[k] = sorted(set(inv[k]))
+
+    report_sha = ctx.put_artifact("behavior-trace",
+                                  data=json.dumps({"events": ev, "inventory": inv,
+                                                   "platform": "windows"},
+                                                  indent=2, default=str).encode())
+    fd = FindingDAO(ctx.conn)
+    findings = 0
+    for cmd in inv["exec"]:
+        _finding(fd, target, "BEHAVIOR", "medium", f"Process execution: {cmd[:120]}",
+                 f"the PE launched a process via a Win32 exec API: {cmd!r}",
+                 f"BEHAVIOR:win:exec:{cmd[:60]}")
+        findings += 1
+    if inv["network"]:
+        _finding(fd, target, "BEHAVIOR", "medium",
+                 "Outbound network activity (Win32 sockets/WinINet)",
+                 "the PE called a Win32 network API (connect/WSAConnect/InternetConnect/…): "
+                 + ", ".join(inv["network"][:5]), "BEHAVIOR:win:net")
+        findings += 1
+    if inv["inject"]:
+        _finding(fd, target, "BEHAVIOR", "high", "Process injection primitive",
+                 "the PE used WriteProcessMemory/CreateRemoteThread/VirtualAllocEx (code "
+                 "injection into another process)", "BEHAVIOR:win:inject")
+        findings += 1
+    if inv["wx"]:
+        _finding(fd, target, "BEHAVIOR", "low",
+                 "Writable+executable memory (self-modifying / shellcode surface)",
+                 "the PE made memory executable via VirtualProtect(PAGE_EXECUTE_*)",
+                 "BEHAVIOR:win:wx")
+        findings += 1
+    if inv["anti_debug"]:
+        _finding(fd, target, "BEHAVIOR", "low", "Anti-debugging check",
+                 "the PE called an anti-debug API (IsDebuggerPresent/CheckRemoteDebuggerPresent/"
+                 "NtQueryInformationProcess)", "BEHAVIOR:win:antidebug")
+        findings += 1
+
+    ctx.emit("behavior.done", payload={"ok": True, "platform": "windows", "calls": len(ev),
+             "inventory": inv, "findings": findings, "report": report_sha,
+             "note": None if ev else "no monitored Win32 API calls observed on this input"})
+    ctx.progress(pct=100, msg=f"{len(ev)} Win32 call(s); exec={len(inv['exec'])} "
+                 f"net={bool(inv['network'])} inject={inv['inject']} "
+                 f"antidbg={inv['anti_debug']}")
+    return {"output_shas": [report_sha], "output_kind": "behavior-trace"}
+
+
 def behavior_trace_stage(ctx) -> dict:
     target = TargetDAO(ctx.conn).get(ctx.target_id) if ctx.target_id else None
     if target is None:
         raise ValueError("behavior_trace requires a target_id")
     p = ctx.params or {}
     host = sandbox.host_arch()
-    # substrate is ELF (native GDB or qemu-user); reject PE/Mach-O clearly.
     fmt = (target.file_type or "").lower()
-    if fmt and fmt != "elf":
+    # Windows PE -> the Win32 API tracer (Wine +relay); ELF -> the syscall tracer below.
+    if fmt == "pe":
+        return _win_behavior_trace(ctx, target, p)
+    if fmt and fmt != "elf":                              # Mach-O etc.: no substrate here
         ctx.emit("behavior.done", payload={"ok": False, "supported": False,
-                 "note": f"behavior trace runs Linux ELF binaries only; this target is "
-                         f"{fmt.upper()} (Windows/macOS needs Wine or a full-system VM)."})
+                 "note": f"behavior trace runs Linux ELF or Windows PE (via Wine); this target "
+                         f"is {fmt.upper()} (macOS needs a full-system VM)."})
         ctx.progress(pct=100, msg=f"behavior trace does not support {fmt.upper()} targets")
         return {}
     emulated = bool(target.arch and target.arch != host)

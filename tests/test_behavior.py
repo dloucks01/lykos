@@ -157,3 +157,52 @@ def test_qemu_backend_follows_forked_exec_on_native():
     assert r["ok"], r.get("note")
     execs = [e for e in r["events"] if e["syscall"] == "execve"]
     assert execs and execs[0]["path"] == "/bin/sh"
+
+
+# --- Windows PE: Win32 API trace via Wine +relay -------------------------------------------
+from lykos.analyze.debug import winapi  # noqa: E402
+
+_RELAY = (
+    '0100:trace:module:map_image_into_view mapping PE file L"vuln.exe" '
+    'at 0x140000000-0x140041000\n'
+    '0100:Call msvcrt.system(14000a01f "echo pwn") ret=140008caf\n'        # target -> kept
+    '0100:Call KERNEL32.CreateProcessW(0,0,0) ret=6fffaaaa\n'              # ret in DLL -> drop
+    '0200:Call advapi32.RegSetValueExW(0,"BIOSVendor") ret=140002000\n'    # other thread -> drop
+    '0100:Call KERNEL32.CreateProcessW(0,7ff L"evilcmd",0) ret=140008d00\n'  # target -> kept
+    '0100:Call ws2_32.connect(3,7ffe,16) ret=140008e00\n'                 # target -> kept
+    '0300:Call KERNEL32.CreateProcessW(0,L"services.exe",0) ret=140001000\n'  # helper -> drop(tid)
+)
+
+
+def test_winapi_parse_attributes_to_target_thread_and_range():
+    tm = winapi._target_map(_RELAY, "vuln.exe")
+    assert tm and tm[0] == "0100" and tm[1] == 0x140000000 and tm[2] == 0x140041000
+    ev = winapi.parse(_RELAY, *tm)
+    execs = {e["detail"] for e in ev if e["category"] == "exec"}
+    nets = [e for e in ev if e["category"] == "network"]
+    # system("echo pwn") + CreateProcessW(evilcmd) kept; the msvcrt-internal call (ret out of
+    # range), the other-thread RegSetValue, and the services.exe helper (other thread) excluded.
+    assert execs == {"echo pwn", "evilcmd"}
+    assert len(nets) == 1 and nets[0]["api"] == "connect"
+
+
+def test_winapi_helper_exec_filtered():
+    # a Wine service exe on the target thread is still dropped by the helper blocklist
+    txt = ('0100:trace:module:map_image_into_view mapping PE file L"t.exe" at 0x400000-0x410000\n'
+           '0100:Call KERNEL32.CreateProcessW(0,L"plugplay.exe",0) ret=401000\n'
+           '0100:Call msvcrt.system(0 "real") ret=402000\n')
+    ev = winapi.parse(txt, "0100", 0x400000, 0x410000)
+    assert [e["detail"] for e in ev if e["category"] == "exec"] == ["real"]
+
+
+_WIN64_PE = os.path.join(os.path.dirname(__file__), "..", "examples", "re-corpus", "bin",
+                         "vuln_win64.exe")
+
+
+@pytest.mark.skipif(not os.path.exists(_WIN64_PE) or not winapi.supported(),
+                    reason="needs the win64 corpus PE and wine")
+def test_winapi_live_captures_system_exec():
+    r = winapi.trace(_WIN64_PE, argv=["4242"], timeout=90)
+    assert r["ok"], r.get("note")
+    execs = [e for e in r["events"] if e["category"] == "exec"]
+    assert any(e["detail"] == "echo unlocked" for e in execs)
