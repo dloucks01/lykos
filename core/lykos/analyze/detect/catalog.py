@@ -68,6 +68,122 @@ SOURCES = {
     "fscanf", "sscanf", "getenv", "getchar", "fgetc", "getline", "readv",
 }
 
+# ------------------------------------------------------- which sink argument must be tainted
+# A sink is only a data-flow finding if the attacker controls the argument that MAKES it a
+# bug -- not merely some argument. `printf("%s", user)` is safe; `printf(user)` is CWE-134.
+# Checking "any argument register is tainted" conflates the two and mislabels most printf
+# calls in any program that touches input.
+#
+# Maps a normalized sink name -> the argument indices whose taint constitutes the finding.
+# A sink ABSENT from this table falls back to "any argument", which is the conservative
+# behaviour -- add an entry only where the position is unambiguous.
+SINK_TAINT_ARGS = {
+    # CWE-134 format strings: the FORMAT argument, and only it.
+    "printf":   frozenset({0}),                   # printf(fmt, ...)
+    "fprintf":  frozenset({1}),                   # fprintf(stream, fmt, ...)
+    "snprintf": frozenset({2}),                   # snprintf(buf, size, fmt, ...)
+    "syslog":   frozenset({1}),                   # syslog(priority, fmt, ...)
+    # CWE-120 copies: the SOURCE and/or the LENGTH. A tainted DESTINATION pointer says
+    # nothing about whether the copy overflows.
+    "strcpy":   frozenset({1}),                   # strcpy(dst, src)
+    "strcat":   frozenset({1}),
+    "strncpy":  frozenset({1, 2}),                # strncpy(dst, src, n)
+    "memcpy":   frozenset({1, 2}),                # memcpy(dst, src, n)
+    "memmove":  frozenset({1, 2}),
+    "sprintf":  frozenset({1, 2, 3, 4, 5}),       # sprintf(dst, fmt, ...) -- fmt and varargs
+    "vsprintf": frozenset({1, 2}),
+    "scanf":    frozenset({0}),                   # scanf(fmt, ...)
+    "sscanf":   frozenset({0, 1}),                # sscanf(src, fmt, ...)
+    "alloca":   frozenset({0}),                   # alloca(size)
+    # CWE-78 execution: the COMMAND / program path.
+    "system":   frozenset({0}),
+    "popen":    frozenset({0}),                   # popen(cmd, mode)
+    "execve":   frozenset({0, 1}),                # execve(path, argv, envp)
+    "execl":    frozenset({0, 1}),
+    "execlp":   frozenset({0, 1}),
+    "execvp":   frozenset({0, 1}),
+    # `gets` is intentionally absent: its only argument is the destination, so no argument
+    # position makes it "more" of a bug -- it is unconditionally unsafe and the rule channel
+    # already reports it.
+}
+
+
+# ---------------------------------------------------------------- entry-point taint sources
+# SOURCES above covers input that arrives through a CALL. The other way untrusted input
+# enters a program is as a PARAMETER of its entry point: argv/envp are handed to main by the
+# loader, with no source function to observe. Without this a CLI binary -- the common case,
+# and the one `strcpy(buf, argv[1])` lives in -- has no taint origin at all, so nothing can
+# ever be corroborated (findings stay at `candidate` forever).
+#
+# Maps an entry-point name to the parameter indices that carry untrusted DATA.
+#
+# argc (index 0) is deliberately NOT seeded. It is attacker-influenced, but it is a count,
+# not data: seeding it pushes taint through loop bounds and `if (argc > 1)` guards into
+# values that carry no attacker bytes, which costs precision for very little detection. A
+# size/bounds channel is the right home for argc, not the data-flow one.
+ENTRY_PARAM_SOURCES = {
+    "main":    {1, 2},        # main(argc, argv, envp)      -> argv, envp
+    "wmain":   {1, 2},        # wide-char variant
+    "tmain":   {1, 2},        # _tmain (normalize() strips the leading underscore)
+    "winmain":  {2},          # WinMain(hInst, hPrev, lpCmdLine, nShow) -> lpCmdLine
+    "wwinmain": {2},
+}
+
+
+def _declared_param_count(frame, signature):
+    """How many parameters the decompiler says this function actually takes.
+
+    Prefers the recovered parameter list; falls back to counting the signature's argument
+    list (`int main(int argc, char **argv)` -> 2, `undefined8 main(void)` -> 0). Returns
+    None when neither is available -- "unknown", which is not the same as zero.
+    """
+    if frame and isinstance(frame.get("params"), list):
+        return len(frame["params"])
+    if signature and "(" in signature and signature.rstrip().endswith(")"):
+        args = signature[signature.index("(") + 1:signature.rstrip().rindex(")")].strip()
+        if not args or args == "void":
+            return 0
+        depth, n = 0, 1
+        for ch in args:                      # top-level commas only (skip nested templates)
+            if ch in "(<":
+                depth += 1
+            elif ch in ")>":
+                depth -= 1
+            elif ch == "," and depth == 0:
+                n += 1
+        return n
+    return None
+
+
+def entry_seed_params(functions, frames=None):
+    """Map entry-point function addr -> tainted parameter indices, for the taint seed.
+
+    `functions` is any iterable of objects with `.name`/`.addr` (and optionally `.signature`);
+    `frames` maps addr -> recovered stack frame, whose "params" list is the authoritative
+    parameter count. Matching is on the normalized, lower-cased name, so `_main` and `main`
+    both resolve.
+
+    A parameter index is seeded ONLY if the entry point actually declares it. `main(void)`
+    takes no argv, so seeding one would mark a callee-argument register tainted at entry and
+    every downstream sink would inherit it -- turning a program that reads no input at all
+    into a wall of corroborated findings. Where the parameter count is unknown (no decompiler
+    output at all) nothing is seeded: no data, no claim.
+    """
+    seeds = {}
+    for f in functions or ():
+        idx = ENTRY_PARAM_SOURCES.get(normalize(getattr(f, "name", "") or "").lower())
+        addr = getattr(f, "addr", None)
+        if not idx or not addr:
+            continue
+        declared = _declared_param_count((frames or {}).get(addr),
+                                         getattr(f, "signature", None))
+        if declared is None:
+            continue
+        keep = {i for i in idx if i < declared}
+        if keep:
+            seeds[addr] = keep
+    return seeds
+
 
 def normalize(fname):
     """Normalize a callee name to a plain libc symbol (strip decorations)."""

@@ -4,6 +4,7 @@ from __future__ import annotations
 from ...db.dao import CallEdgeDAO, FindingDAO, FunctionDAO, StringDAO, TargetDAO
 from ...jobs.registry import register_stage
 from . import taint
+from .catalog import entry_seed_params
 from .detectors import DETECTORS, DetectContext, correlate
 
 DETECT_STAGE = "detect_cwe"
@@ -50,7 +51,9 @@ def detect_stage(ctx) -> dict:
         full = fdao.get(f.id)
         if full and full.ir:
             func_irs[f.addr] = full.ir
-    tainted_sites = taint.analyze_program(func_irs, dctx.call_edges, target.arch)
+    entry_seeds = entry_seed_params(dctx.functions, dctx.frames)   # argv/envp at main
+    tainted_sites = taint.analyze_program(func_irs, dctx.call_edges, target.arch,
+                                          entry_seeds=entry_seeds)
     for c in cands:
         if c["detector"] == "dangerous_api" and c.get("site_addr") in tainted_sites:
             c["state"] = "corroborated"

@@ -6,14 +6,20 @@ tainted call arguments into callees' entry parameters, and (b) pulls tainted ret
 back to callers. So a source in a caller reaching a sink deep in a callee, and source-wrapper
 functions, are handled.
 
+Taint origins are (a) calls to catalog.SOURCES (read/fgets/getenv/...) and (b) the entry
+point's own parameters -- argv/envp, which the loader hands to main with no call site to
+observe (see catalog.ENTRY_PARAM_SOURCES).
+
 Honest limits: register-granularity (no precise memory/points-to model, so buffer taint via
 pointer args is not tracked) and raw low-P-Code (call args inferred from ABI registers).
+Path-insensitive: a flow guarded by a correct bounds check still reports as a flow, because
+the analysis models where attacker bytes GO, not whether the destination is large enough.
 """
 from __future__ import annotations
 
 from collections import defaultdict, deque
 
-from .catalog import DANGEROUS, SOURCES, normalize
+from .catalog import DANGEROUS, SINK_TAINT_ARGS, SOURCES, normalize
 
 # Per-arch calling convention (register NAMES, upper-cased; families cover sub-registers).
 ARCH_ABI = {
@@ -28,6 +34,17 @@ ARCH_ABI = {
     "ppc":    {"ret": {"R3"}, "args": [{"R%d" % i} for i in range(3, 11)]},
     "ppc64":  {"ret": {"R3"}, "args": [{"R%d" % i} for i in range(3, 11)]},
 }
+# Sub-register aliasing. The ABI table groups a parameter's register with its narrower
+# alias ({"RSI", "ESI"}), and a seed marks the whole group -- but a later write names only
+# one of them, so killing just that name would leave the alias tainted for the rest of the
+# function and every downstream sink would inherit it. Writing either name defines the other
+# (a 32-bit write zero-extends), so define and kill operate on the whole family.
+_REG_FAMILY = {}
+for _abi in ARCH_ABI.values():
+    for _grp in list(_abi["args"]) + [_abi["ret"]]:
+        for _r in _grp:
+            _REG_FAMILY.setdefault(_r, set()).update(_grp)
+
 _MAX_BLOCKS = 3000
 _MAX_FUNCS = 6000
 
@@ -56,23 +73,100 @@ def _parse(pc):
         left, outk = pc, None
     toks = left.split()
     if not toks:
-        return None, [], None
+        return None, [], None, []
     ins = [k for k in (_key(t) for t in toks[1:]) if k is not None]
-    return toks[0], ins, outk
+    return toks[0], ins, outk, toks
+
+
+# --------------------------------------------------------------- frame-slot (spill) tracking
+# At -O0 a function's parameters are spilled to the stack in its prologue and reloaded on
+# every use, so register-only taint dies at the first spill: `main`'s argv lands in
+# [RBP-0x10] and every later read comes from memory the analysis does not model. That makes
+# the entry-param seed useless for anything in main itself.
+#
+# The tractable subset of a memory model is a CONSTANT-OFFSET FRAME SLOT. Ghidra emits the
+# address arithmetic as p-code in the SAME instruction as the access:
+#
+#     INT_ADD reg:RBP const:0xfffffffffffffff0 -> unique:0x8f00
+#     STORE   const:0x1b1 unique:0x8f00 unique:0xd500     (spill)
+#     ...
+#     INT_ADD reg:RBP const:0xfffffffffffffff0 -> unique:0x8f00
+#     LOAD    const:0x1b1 unique:0x8f00 -> unique:0x23e00  (reload)
+#
+# so recognising `[BASE + const]` needs no cross-instruction state: the map is rebuilt per
+# instruction and the taint itself lives in the caller's set, keyed ("stack", BASE, offset).
+# Anything more general (aliasing, computed indices, heap) stays out of scope by design.
+_FRAME_BASES = ("RBP", "RSP", "EBP", "ESP", "X29", "SP", "R11", "FP")
+
+
+def _const_val(tok):
+    parts = tok.split(":")
+    if len(parts) >= 2 and parts[0] == "const":
+        try:
+            return int(parts[1], 0)
+        except ValueError:
+            return None
+    return None
+
+
+def _frame_slot(toks):
+    """Recognise `INT_ADD <frame base> <const>` and return its slot key, else None."""
+    if len(toks) < 3:
+        return None
+    a, b = _key(toks[1]), _key(toks[2])
+    if a and a[0] == "reg" and a[1] in _FRAME_BASES:
+        off = _const_val(toks[2])
+        return ("stack", a[1], off) if off is not None else None
+    if b and b[0] == "reg" and b[1] in _FRAME_BASES:     # const on the left
+        off = _const_val(toks[1])
+        return ("stack", b[1], off) if off is not None else None
+    return None
+
+
+def _define(taint, key, tainted):
+    """Define `key` (and its sub-register aliases) as tainted or clean."""
+    keys = [key]
+    if key[0] == "reg":
+        keys = [("reg", r) for r in _REG_FAMILY.get(key[1], (key[1],))]
+    for k in keys:
+        taint.add(k) if tainted else taint.discard(k)
 
 
 def _apply(taint, ops):
+    slots = {}                       # varnode key -> frame-slot key (this instruction only)
     for pc in ops:
         try:
-            mnem, ins, outk = _parse(pc)
+            mnem, ins, outk, toks = _parse(pc)
         except Exception:
             continue
-        if outk is None or mnem == "STORE":
+
+        if mnem == "INT_ADD" and outk is not None:
+            slot = _frame_slot(toks)
+            if slot is not None:
+                slots[outk] = slot
+
+        if mnem == "STORE":
+            # STORE space, addr, value -- spill a value into a frame slot (kill on overwrite)
+            if len(toks) >= 4:
+                dst = slots.get(_key(toks[2]))
+                if dst is not None:
+                    val = _key(toks[3])
+                    _define(taint, dst, val is not None and val in taint)
             continue
-        if any(k in taint for k in ins):
-            taint.add(outk)
-        else:
-            taint.discard(outk)
+
+        if outk is None:
+            continue
+
+        if mnem == "LOAD" and len(toks) >= 3:
+            # LOAD space, addr -> out. A known frame slot answers definitively; any other
+            # address falls through to the generic rule, which keeps "load through a tainted
+            # pointer yields tainted data" (that is how argv[1] stays tainted).
+            src = slots.get(_key(toks[2]))
+            if src is not None:
+                _define(taint, outk, src in taint)
+                continue
+
+        _define(taint, outk, any(k in taint for k in ins))
 
 
 def _arg_regs(abi):
@@ -84,6 +178,20 @@ def _arg_regs(abi):
 
 def _args_tainted(taint, argregs):
     return any(("reg", r) in taint for r in argregs)
+
+
+def _sink_tainted(taint, sink, argregs_list, argregs_all):
+    """Is the argument that MAKES this sink a bug tainted?
+
+    Falls back to "any argument" for sinks with no declared position (see
+    catalog.SINK_TAINT_ARGS), so an unlisted sink keeps the old conservative behaviour.
+    """
+    idx = SINK_TAINT_ARGS.get(sink)
+    if idx is None:
+        return _args_tainted(taint, argregs_all)
+    return any(("reg", r) in taint
+               for i in idx if i < len(argregs_list)
+               for r in argregs_list[i])
 
 
 def build_callmap(call_edges):
@@ -126,7 +234,7 @@ def _run(ir, abi, callmap, dstmap, func_addrs, entry_params, ret_tainted, *,
         ext = callmap.get(addr)
         dst = dstmap.get(addr)
         internal = dst in func_addrs
-        if ext in DANGEROUS and _args_tainted(cur, argregs_all):
+        if ext in DANGEROUS and _sink_tainted(cur, ext, argregs_list, argregs_all):
             flagged.add(addr)
         if extmap is not None and ext_out is not None:
             esym = extmap.get(addr)
@@ -188,8 +296,15 @@ def analyze_function(ir, callmap, arch):
     return flagged
 
 
-def analyze_program(func_irs, call_edges, arch):
-    """Inter-procedural: fixpoint over the call graph. Returns all flagged sink sites."""
+def analyze_program(func_irs, call_edges, arch, *, entry_seeds=None):
+    """Inter-procedural: fixpoint over the call graph. Returns all flagged sink sites.
+
+    `entry_seeds` maps an entry-point function addr -> the parameter indices that arrive
+    already tainted (see catalog.entry_seed_params). This is how argv/envp enter the
+    analysis: they are handed to main by the loader, so unlike SOURCES input there is no
+    call site to observe. Without a seed an argv-driven program has no taint origin and
+    nothing can be corroborated.
+    """
     ak = _arch_key(arch)
     if not ak or not _arg_regs(ARCH_ABI[ak]):
         return set()
@@ -205,6 +320,9 @@ def analyze_program(func_irs, call_edges, arch):
             callers[e.dst_addr].add(e.src_addr)
 
     entry_params = {a: set() for a in func_addrs}
+    for a, idx in (entry_seeds or {}).items():        # argv/envp at the program entry point
+        if a in entry_params:
+            entry_params[a] |= set(idx)
     ret_tainted = {a: False for a in func_addrs}
     wl = deque(func_addrs)
     inq = set(func_addrs)

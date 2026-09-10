@@ -88,13 +88,29 @@ real pipeline. The corpus carries two kinds of negative, and only the second kin
   a `strlen() < sizeof` guard, clamped memcpy, literal-format printf, constant-command
   `system`). These are what make `fp_rate` a measurement instead of a constant.
 
-Current measured numbers (x86-64, Ghidra 12.1): at `--min-state candidate`, recall **1.00**,
-fp_rate **0.57** — a rule-only channel flags the safe uses too, which is honest behaviour for
-a pattern rule. At `--min-state corroborated`, recall is **0.00**: the taint channel seeds
-only from `SOURCES` library calls (`read`/`fgets`/`getenv`/…) and does not model `argv`, so
-argv-driven programs never promote past `candidate`. The corroborated line is recorded but
-not gated until that gap is closed. The corpus is 20 cases over 4 CWE classes — a regression
-tripwire, not a benchmark; use `lykos eval --juliet` / `--lava` for real measurement.
+Current measured numbers (x86-64, Ghidra 12.1.2), 20 cases over 4 CWE classes:
+
+| stage | recall | fp_rate | precision |
+|---|---|---|---|
+| `--min-state candidate` (rule channel) | 1.00 | 0.571 | 0.43 |
+| `--min-state corroborated` (data-flow channel) | 0.833 | 0.214 | 0.62 |
+
+That gap is the confidence lifecycle earning its keep: the rule channel flags every safe use
+too (honest behaviour for a pattern rule), and the taint channel discards most of them —
+perfect precision and recall on CWE-78 and CWE-134, where it separates `system(argv[1])` from
+`system("/bin/date")` and `printf(user)` from `printf("%s", user)`.
+
+The three CWE-120 false positives that remain are path-insensitivity: attacker bytes really
+do reach the `strcpy`, and the `strlen() < sizeof` guard that makes it safe is a value-range
+fact the taint model does not carry. Corroborated means "two channels agree attacker data
+reaches a dangerous sink" — which is true of them — and promotion to *confirmed* still
+requires dynamic evidence. Corroborated recall is capped at 0.833 by the CWE-798 case:
+hard-coded secrets have no call site to corroborate and are promoted by `synthesize_secret`
+instead, which this static-only benchmark does not run.
+
+All three gates are ratchets at the measured values, so each fails in either direction. The
+corpus is a regression tripwire, not a benchmark — use `lykos eval --juliet` / `--lava` for
+real measurement.
 
 Run the server directly and drive it over HTTP:
 

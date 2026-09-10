@@ -53,18 +53,30 @@ eval:
 # any code change -- the gate was decorative.)
 STATIC_FP_BUDGET ?= 0.60
 
+# Corroborated stage: the data-flow channel, and the reason the confidence lifecycle exists.
+# It trades a little recall for a large precision gain over the rule channel -- measured
+# x86-64 / Ghidra 12.1: recall 1.00 -> 0.83, fp_rate 0.571 -> 0.214, precision 0.43 -> 0.62.
+# Both thresholds are ratchets at the measured values, so this fails in EITHER direction: a
+# regression in argv seeding or frame-slot tracking drops recall, and a detector that fires
+# more broadly raises fp_rate.
+#
+# Recall is capped at 0.83 (5/6) by the CWE-798 hard-coded-secret case, and that is
+# structural rather than a gap: hardcoded_secrets is a string detector with no call site, so
+# neither the reachability nor the data-flow channel can corroborate it. Secrets are promoted
+# by the `synthesize_secret` stage instead (straight to poc-backed), which this static-only
+# benchmark does not run. Raise this only if that changes.
+CORROB_MIN_RECALL ?= 0.80
+CORROB_FP_BUDGET  ?= 0.25
+
 eval-gate:
 	@echo "== release gate: confirmed-stage recall (dynamic; gcc only) =="
 	$(PY) -m lykos eval --stage dynamic --record
 	@echo "== release gate: candidate-stage detection + FP ratchet (static; needs Ghidra) =="
 	$(PY) -m lykos eval --stage static --min-state candidate --record \
 	      --min-recall 1.0 --max-fp-rate $(STATIC_FP_BUDGET)
-	@echo "== tracked, not gated: corroborated-stage discrimination =="
-	@echo "   (recall here is 0.00 today: the taint channel seeds from SOURCES library calls"
-	@echo "    and does not model argv, so argv-driven cases never promote past candidate."
-	@echo "    Recorded so the fix shows up as a jump in the dashboard.)"
+	@echo "== release gate: corroborated-stage discrimination (static; needs Ghidra) =="
 	$(PY) -m lykos eval --stage static --min-state corroborated --record \
-	      --min-recall 0.0 --max-fp-rate 1.0
+	      --min-recall $(CORROB_MIN_RECALL) --max-fp-rate $(CORROB_FP_BUDGET)
 
 # Render the detection-quality regression dashboard from the recorded history.
 dashboard:
