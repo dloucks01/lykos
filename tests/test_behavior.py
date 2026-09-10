@@ -206,3 +206,19 @@ def test_winapi_live_captures_system_exec():
     assert r["ok"], r.get("note")
     execs = [e for e in r["events"] if e["category"] == "exec"]
     assert any(e["detail"] == "echo unlocked" for e in execs)
+
+
+_WIN32_PE = os.path.join(os.path.dirname(__file__), "..", "examples", "re-corpus", "bin",
+                         "vuln_win32.exe")
+
+
+@pytest.mark.skipif(not os.path.exists(_WIN32_PE) or not winapi.supported(),
+                    reason="needs the win32 corpus PE and wine")
+def test_winapi_win32_runs_or_reports_wow64_gap():
+    """A 32-bit PE either traces (if the i386 WoW64 runtime is installed) or is HONESTLY reported
+    as un-launchable -- never a misleading 'no behavior' / clean result."""
+    r = winapi.trace(_WIN32_PE, argv=["4242"], timeout=90)
+    if r["ok"]:
+        assert "events" in r                            # i386 runtime present -> it traced
+    else:
+        assert "32-bit" in (r.get("note") or "")        # honest launch-failure report

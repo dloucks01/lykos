@@ -250,6 +250,16 @@ def _run_windows(exe, *, argv, stdin, timeout, mem_mb, capture, wineprefix) -> R
     code = m.group(1).decode().lower() if m else None
     crashed = code is not None
     name = ("EXCEPTION_" + _WINE_EXC.get(code, code.upper())) if code else None
+    # a launch failure (esp. a 32-bit PE with no i386 WoW64 runtime) must not read as a clean run.
+    # key only on the loader's "failed to load" message (a bare c0000135 is a benign DLL-probe miss)
+    low = (err or b"").lower()
+    if not crashed and b"wine: failed to load" in low:
+        wow = b"syswow64" in low or b"wine32" in low
+        note = "wine could not launch this PE" + (
+            " -- it is 32-bit; install the i386 WoW64 runtime (wine32:i386)" if wow else "")
+        return RunResult(isolation="wine-launch-failed", crashed=False, timed_out=timed,
+                         exit_code=rc, stdout=(out or b"")[:capture],
+                         stderr=(err or b"")[:capture], duration_ms=dur, cmd=cmd, note=note)
     return RunResult(
         isolation="wine", crashed=crashed, timed_out=timed,
         exit_code=(None if crashed else rc), signal=None, signal_name=name,
