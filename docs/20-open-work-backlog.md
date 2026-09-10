@@ -185,19 +185,34 @@ The `corroborated` state is the platform's precision lever: it is what separates
 reaches. Measured on the bundled corpus (20 cases / 4 CWE classes, x86-64, Ghidra 12.1.2):
 candidate recall 1.00 / fp_rate 0.571; corroborated recall 0.833 / fp_rate 0.214.
 
-- **[PLANNED] Taint is INERT on x86 (32-bit), riscv64 and s390.** `taint.ARCH_ABI` has no entry
-  for riscv64 or s390 (`_arch_key` returns None), and `x86` is present with `"args": []` because
-  cdecl passes on the stack. `analyze_program` returns an empty set for all three, so on those
-  targets *nothing* can ever be corroborated by data flow and every finding stays `candidate` —
-  the same failure argv seeding just fixed for x86-64, but arch-wide. riscv64/s390 need only an
-  ABI row (a0-a7 / r2-r6). x86 needs stack-argument tracking, which the new constant-offset
-  frame-slot support in `_apply` makes tractable: cdecl arguments are `[ESP + k]` at the call,
-  the same shape as a spill. Highest-value item in this section — it is pure reach, not a
-  precision trade, and it is squarely in the multi-arch push.
-- **[PLANNED] Verify argv seeding on non-x86-64.** The seed (`catalog.ENTRY_PARAM_SOURCES` ->
-  `analyze_program(entry_seeds=)`) is arch-independent and rides on `ARCH_ABI`, but every
-  measurement so far is x86-64. The corpus should grow an aarch64/arm case so the ARM work and
-  the taint channel are covered together rather than assumed compatible.
+- **[DONE] RISC-V taint channel** — `riscv` had no `ARCH_ABI` row, so `analyze_program`
+  returned empty and no RISC-V finding could ever leave `candidate`. Added the row (a0-a7 args,
+  a0 return; Ghidra emits them lowercase) plus two fixes it exposed. First, `_frame_slot` only
+  recognised x86's folded displacement (`INT_ADD reg:RBP const:-0x10`); RISC encodings
+  materialise the constant first (`COPY const -> unique`, then `INT_ADD reg:s0 unique`), so
+  spill tracking — the thing that makes the argv seed survive a prologue — was silently doing
+  nothing off x86-64. `_apply` now resolves constants through single-instruction uniques.
+  Second, the frame-base list was global; it is now per-arch, because R1 is the stack pointer
+  on PowerPC but an *argument* register on ARM, and a shared list keys spill slots on a
+  register that changes at every call (test guards the disjointness). Verified end-to-end: a
+  RISC-V binary now corroborates CWE-120 across a function boundary and CWE-78 in main, both
+  via `taint-dataflow`; aarch64 and 32-bit ARM confirmed too; x86-64 corpus numbers unchanged.
+- **[PLANNED] Taint is still INERT on x86 (32-bit), s390, sparc, sparcv9, sh, m68k and
+  loongarch** — 7 of the 14 arch strings `analyze/elf.py` can emit. s390/sparc/sh/loongarch
+  need only an `ARCH_ABI` row (r2-r6, o0-o5, r4-r7, a0-a7 respectively), but the register
+  NAMES must be read off real Ghidra output first — the RISC-V row was guessed as `a0` and
+  happened to be right, which is not a method. No cross-compiler for any of them is installed,
+  so this needs toolchains (or prebuilt corpus binaries) before it can be done honestly.
+  x86 (32-bit) and m68k pass arguments on the stack and additionally need call-site stack-slot
+  argument tracking; the constant-offset frame-slot support now in `_apply` makes that
+  tractable (cdecl args are `[ESP + 4i]` at the call, the same shape as a spill), and
+  `i686-w64-mingw32-gcc` can produce 32-bit x86 P-Code to develop against without multilib.
+- **[DONE] Verified argv seeding off x86-64** — confirmed end-to-end on riscv64, aarch64 and
+  32-bit ARM. This is what surfaced the materialised-displacement bug above: the seed was
+  arch-independent, but the spill tracking it depends on was not.
+- **[PLANNED] Cross-arch cases in the bundled corpus.** The verification above was manual
+  (`riscv64-unknown-elf-gcc` freestanding, `aarch64/arm-linux-gnueabihf-gcc -static`); nothing
+  in `eval-gate` measures any arch but x86-64, so an arch regression would not trip a gate.
 - **[PLANNED] CWE-120 path-insensitivity — the 3 remaining corroborated false positives.**
   `strcpy` behind `strlen() < sizeof`, `strncpy` bounded to `sizeof-1`, `memcpy` with a clamped
   length: attacker bytes genuinely reach the sink, so the taint channel is right to see a flow;

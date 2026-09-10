@@ -22,17 +22,32 @@ from collections import defaultdict, deque
 from .catalog import DANGEROUS, SINK_TAINT_ARGS, SOURCES, normalize
 
 # Per-arch calling convention (register NAMES, upper-cased; families cover sub-registers).
+# Per-arch calling convention. "frame" lists the registers that legitimately serve as a
+# stack/frame base, so [BASE + const] spill slots can be tracked (see _frame_slot). It is
+# per-arch on purpose: R1 is the stack pointer on PowerPC but an ARGUMENT register on ARM, so
+# a shared list would invent slots keyed on a register that changes on every call.
 ARCH_ABI = {
     "x86-64": {"ret": {"RAX", "EAX"},
                "args": [{"RDI", "EDI"}, {"RSI", "ESI"}, {"RDX", "EDX"},
-                        {"RCX", "ECX"}, {"R8", "R8D"}, {"R9", "R9D"}]},
-    "x86":    {"ret": {"EAX"}, "args": []},                 # cdecl: stack args (not tracked)
+                        {"RCX", "ECX"}, {"R8", "R8D"}, {"R9", "R9D"}],
+               "frame": {"RBP", "RSP"}},
+    "x86":    {"ret": {"EAX"}, "args": [],                  # cdecl: stack args (not tracked)
+               "frame": {"EBP", "ESP"}},
     "aarch64": {"ret": {"X0", "W0"},
-                "args": [{"X%d" % i, "W%d" % i} for i in range(8)]},
-    "arm":    {"ret": {"R0"}, "args": [{"R0"}, {"R1"}, {"R2"}, {"R3"}]},
-    "mips":   {"ret": {"V0"}, "args": [{"A0"}, {"A1"}, {"A2"}, {"A3"}]},
-    "ppc":    {"ret": {"R3"}, "args": [{"R%d" % i} for i in range(3, 11)]},
-    "ppc64":  {"ret": {"R3"}, "args": [{"R%d" % i} for i in range(3, 11)]},
+                "args": [{"X%d" % i, "W%d" % i} for i in range(8)],
+                "frame": {"X29", "SP"}},
+    "arm":    {"ret": {"R0"}, "args": [{"R0"}, {"R1"}, {"R2"}, {"R3"}],
+               "frame": {"R11", "FP", "SP"}},
+    "mips":   {"ret": {"V0"}, "args": [{"A0"}, {"A1"}, {"A2"}, {"A3"}],
+               "frame": {"FP", "S8", "SP"}},
+    "ppc":    {"ret": {"R3"}, "args": [{"R%d" % i} for i in range(3, 11)],
+               "frame": {"R1", "R31"}},
+    "ppc64":  {"ret": {"R3"}, "args": [{"R%d" % i} for i in range(3, 11)],
+               "frame": {"R1", "R31"}},
+    # RV32/RV64 share register names (verified against Ghidra: lowercase a0..a7, s0 = frame
+    # pointer), so one row covers both -- the ELF machine id does not distinguish them either.
+    "riscv":  {"ret": {"A0"}, "args": [{"A%d" % i} for i in range(8)],
+               "frame": {"S0", "SP"}},
 }
 # Sub-register aliasing. The ABI table groups a parameter's register with its narrower
 # alias ({"RSI", "ESI"}), and a seed marks the whole group -- but a later write names only
@@ -96,29 +111,33 @@ def _parse(pc):
 # so recognising `[BASE + const]` needs no cross-instruction state: the map is rebuilt per
 # instruction and the taint itself lives in the caller's set, keyed ("stack", BASE, offset).
 # Anything more general (aliasing, computed indices, heap) stays out of scope by design.
-_FRAME_BASES = ("RBP", "RSP", "EBP", "ESP", "X29", "SP", "R11", "FP")
+def _const_val(tok, consts):
+    """The literal value of an operand: a `const:` token, or a unique holding one.
 
-
-def _const_val(tok):
+    Only x86 puts the displacement straight into the INT_ADD. RISC-V (and other RISC
+    encodings) materialise it first -- `COPY const:-0x20 -> unique:U` then
+    `INT_ADD reg:s0 unique:U` -- so resolving through single-instruction uniques is what
+    makes frame-slot tracking work off x86 at all.
+    """
     parts = tok.split(":")
     if len(parts) >= 2 and parts[0] == "const":
         try:
             return int(parts[1], 0)
         except ValueError:
             return None
-    return None
+    return consts.get(_key(tok))
 
 
-def _frame_slot(toks):
-    """Recognise `INT_ADD <frame base> <const>` and return its slot key, else None."""
+def _frame_slot(toks, consts, bases):
+    """Recognise `INT_ADD <frame base> <displacement>` and return its slot key, else None."""
     if len(toks) < 3:
         return None
     a, b = _key(toks[1]), _key(toks[2])
-    if a and a[0] == "reg" and a[1] in _FRAME_BASES:
-        off = _const_val(toks[2])
+    if a and a[0] == "reg" and a[1] in bases:
+        off = _const_val(toks[2], consts)
         return ("stack", a[1], off) if off is not None else None
-    if b and b[0] == "reg" and b[1] in _FRAME_BASES:     # const on the left
-        off = _const_val(toks[1])
+    if b and b[0] == "reg" and b[1] in bases:            # displacement on the left
+        off = _const_val(toks[1], consts)
         return ("stack", b[1], off) if off is not None else None
     return None
 
@@ -132,16 +151,22 @@ def _define(taint, key, tainted):
         taint.add(k) if tainted else taint.discard(k)
 
 
-def _apply(taint, ops):
+def _apply(taint, ops, bases=()):
     slots = {}                       # varnode key -> frame-slot key (this instruction only)
+    consts = {}                      # varnode key -> literal value  (this instruction only)
     for pc in ops:
         try:
             mnem, ins, outk, toks = _parse(pc)
         except Exception:
             continue
 
+        if outk is not None and mnem == "COPY" and len(toks) >= 2:
+            cv = _const_val(toks[1], consts)             # const materialised into a unique
+            if cv is not None:
+                consts[outk] = cv
+
         if mnem == "INT_ADD" and outk is not None:
-            slot = _frame_slot(toks)
+            slot = _frame_slot(toks, consts, bases)
             if slot is not None:
                 slots[outk] = slot
 
@@ -245,7 +270,7 @@ def _run(ir, abi, callmap, dstmap, func_addrs, entry_params, ret_tainted, *,
             for i, regset in enumerate(argregs_list):
                 if any(("reg", r) in cur for r in regset):
                     tainted_params.add(i)
-        _apply(cur, instr.get("pcode", []))
+        _apply(cur, instr.get("pcode", []), abi.get("frame", ()))
         if seed_sources and ext in SOURCES:
             cur |= {("reg", r) for r in retregs}
         if internal:
