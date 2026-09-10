@@ -1,16 +1,23 @@
-"""Syscall / behavior tracer: run a target under GDB and record the security-relevant syscalls
-it makes -- process execution, network, file writes/deletes, permission changes, anti-debug,
-and W^X violations. A behavioral capability inventory (what the binary *does*), useful for
-backdoors, beacons, anti-analysis and persistence. Deterministic, no strace needed, native x86-64.
+"""Syscall / behavior tracer: run a target and record the security-relevant syscalls it makes
+-- process execution, network, file writes/deletes, permission changes, anti-debug, and W^X
+violations. A behavioral capability inventory (what the binary *does*), useful for backdoors,
+beacons, anti-analysis and persistence. Deterministic; two backends behind one event shape:
 
-GDB `catch syscall` stops at each syscall's entry and exit; at entry the kernel leaves the
-return register as -ENOSYS, which we use to read the arguments once. Args come from the syscall
-ABI registers (x86-64: rdi, rsi, rdx, r10, r8, r9; number in orig_rax).
+- native (x86-64): GDB `catch syscall` stops at each syscall's entry/exit; at entry the kernel
+  leaves the return register as -ENOSYS, which we use to read the arguments once. Args come from
+  the syscall ABI registers (x86-64: rdi, rsi, rdx, r10, r8, r9; number in orig_rax). Decodes the
+  connect() sockaddr to ip:port by reading target memory.
+- cross-arch (`trace_qemu`): qemu-user's own `-strace`, which decodes syscall names + most args
+  per the target ABI (no gdbstub `catch syscall` exists). It does NOT decode the connect()
+  sockaddr (shown as a raw pointer), so a connection's family is inferred from the fd's prior
+  socket() call and the destination is left undecoded.
 """
 from __future__ import annotations
 
 import json
+import re
 import shlex
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -114,7 +121,98 @@ print("LYKOS_SYS " + json.dumps(EV))
 
 
 def supported(arch):
-    return arch in ("x86-64", None)            # x86-64 numbers/ABI for v1
+    return arch in ("x86-64", None)            # native GDB backend: x86-64 numbers/ABI
+
+
+# --- cross-arch backend: qemu-user's own -strace (ABI-aware, any arch qemu supports) ---------
+_TRACKED = set(NR.values())
+_QLINE = re.compile(r'^\s*(?:\d+\s+)?([a-z_][a-z0-9_]*)\((.*)\)\s*=\s*'
+                    r'(-?\d+|0x[0-9a-fA-F]+)?', re.I)
+_QSTR = re.compile(r'"((?:[^"\\]|\\.)*)"')
+
+
+def _q_first_str(args):
+    m = _QSTR.search(args)
+    return m.group(1) if m else None
+
+
+def _q_first_int(args):
+    tok = args.split(",", 1)[0].strip()
+    try:
+        return int(tok, 0)
+    except ValueError:
+        return None
+
+
+def _parse_qemu_strace(text):
+    """Parse qemu-user -strace output into the same event shape as the native GDB backend.
+    qemu decodes syscall names + most args per the target ABI; it does NOT decode the connect()
+    sockaddr (shown as a raw pointer), so a connection's family is inferred from the fd's prior
+    socket() call and the destination is left undecoded."""
+    ev, inet_fds = [], set()
+    for line in text.splitlines():
+        m = _QLINE.match(line)
+        if not m:
+            continue
+        name, args, ret = m.group(1), m.group(2), m.group(3)
+        if name not in _TRACKED:
+            continue
+        rv = None
+        if ret is not None:
+            try:
+                rv = int(ret, 0)
+            except ValueError:
+                rv = None
+        e = {"syscall": name}
+        if name in ("execve", "execveat"):
+            e["path"] = _q_first_str(args)
+        elif name in ("open", "openat"):
+            e["path"] = _q_first_str(args)
+            e["write"] = any(f in args for f in ("O_WRONLY", "O_RDWR", "O_CREAT"))
+        elif name == "socket":
+            inet = "PF_INET" in args or "AF_INET" in args
+            e["family"] = "inet" if inet else args.split(",", 1)[0].strip()
+            if inet and rv is not None and rv >= 0:
+                inet_fds.add(rv)
+        elif name in ("connect", "sendto"):
+            fam = "inet" if _q_first_int(args) in inet_fds else "unknown"
+            e["dest"] = {"family": fam, "addr": None, "port": None}   # sockaddr not decoded
+        elif name == "mprotect":
+            e["exec"] = "PROT_EXEC" in args
+        elif name in ("unlink", "unlinkat", "chmod", "fchmodat", "rename"):
+            e["path"] = _q_first_str(args)
+        elif name == "ptrace":
+            e["request"] = _q_first_int(args)          # 0 == PTRACE_TRACEME
+        elif name in ("setuid", "setgid"):
+            e["id"] = _q_first_int(args)
+        elif name == "kill":
+            e["pid"] = _q_first_int(args)
+        ev.append(e)
+        if len(ev) >= 4000:
+            break
+    return ev
+
+
+def trace_qemu(exe, arch, *, endianness=None, bits=None, argv=(), stdin=b"", timeout=25):
+    """Cross-arch syscall trace via qemu-user's -strace (its log goes to a -D file, kept separate
+    from the target's own stdout/stderr). ABI-aware for any arch qemu supports."""
+    from ..dynamic import sandbox
+    qemu = sandbox._qemu_for(arch, endianness, bits)
+    if not qemu:
+        return {"ok": False, "note": f"no qemu-user for {arch}"}
+    d = Path(tempfile.mkdtemp(prefix="lykos-qsys-"))
+    try:
+        log = d / "strace.log"
+        cmd = [qemu, "-strace", "-D", str(log), str(exe), *[str(a) for a in argv]]
+        note = None
+        try:
+            subprocess.run(cmd, input=stdin, capture_output=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            note = "trace timed out"                    # still parse what was logged
+        text = log.read_text("latin-1", "ignore") if log.exists() else ""
+        return {"ok": True, "events": _parse_qemu_strace(text), "note": note}
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
 
 
 def trace(exe, arch, *, argv=(), stdin=b"", timeout=25):
@@ -143,5 +241,4 @@ def trace(exe, arch, *, argv=(), stdin=b"", timeout=25):
     except subprocess.TimeoutExpired:
         return {"ok": True, "events": [], "note": "trace timed out"}
     finally:
-        import shutil
         shutil.rmtree(d, ignore_errors=True)

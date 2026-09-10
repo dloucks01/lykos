@@ -74,3 +74,65 @@ def test_behavior_trace_inventories_and_flags(store, case, pool, gcc, tmp_path):
     assert "anti-debug" in titles.lower()              # ptrace(TRACEME)
     assert "executable memory" in titles.lower()       # mprotect +X (W^X)
     assert "/bin/true" in titles                       # execve
+
+
+# --- cross-arch backend: qemu-user -strace parser + live trace ------------------------------
+import os
+
+from lykos.analyze.debug import elfsyms  # noqa: E402
+
+_QEMU_STRACE = """\
+1 brk(NULL) = 0x555555559000
+1 execve("/bin/sh",{"sh","-c","echo hi",NULL}) = 0
+1 openat(AT_FDCWD,"/tmp/out.txt",O_WRONLY|O_CREAT,0644) = 5
+1 openat(-100,"/etc/passwd",O_RDONLY|O_CLOEXEC) = 3
+1 socket(PF_INET,SOCK_STREAM,IPPROTO_IP) = 4
+1 connect(4,0xdeadbeef,16) = 0
+1 mprotect(0x1000,4096,PROT_EXEC|PROT_READ) = 0
+1 ptrace(0,0,0,0,4294967295,0) = -1 errno=38 (Function not implemented)
+1 unlink("/tmp/x") = 0
+1 setuid(0) = 0
+1 kill(1234,SIGKILL) = 0
+1 clone(CLONE_VM|CLONE_VFORK,child_stack=0x7f00) = 99
+"""
+
+
+def test_parse_qemu_strace_shapes():
+    got = syscalls._parse_qemu_strace(_QEMU_STRACE)
+    by = {}
+    for e in got:
+        by.setdefault(e["syscall"], []).append(e)
+    assert "brk" not in by                                # not a tracked syscall
+    assert by["execve"][0]["path"] == "/bin/sh"
+    writes = {e["path"]: e["write"] for e in by["openat"]}
+    assert writes["/tmp/out.txt"] is True and writes["/etc/passwd"] is False
+    assert by["socket"][0]["family"] == "inet"
+    assert by["connect"][0]["dest"] == {"family": "inet", "addr": None, "port": None}  # fd 4 known
+    assert by["mprotect"][0]["exec"] is True
+    assert by["ptrace"][0]["request"] == 0               # PTRACE_TRACEME
+    assert by["unlink"][0]["path"] == "/tmp/x"
+    assert by["setuid"][0]["id"] == 0
+    assert by["kill"][0]["pid"] == 1234
+    assert by["clone"]
+
+
+def test_parse_qemu_connect_family_unknown_without_socket():
+    # a connect on an fd we never saw as an AF_INET socket -> family unknown (not falsely inet)
+    ev = syscalls._parse_qemu_strace("1 connect(9,0x1234,16) = 0\n")
+    assert ev and ev[0]["dest"]["family"] == "unknown"
+
+
+_AARCH64 = os.path.join(os.path.dirname(__file__), "..", "examples", "re-corpus", "bin",
+                        "vuln_aarch64")
+
+
+@pytest.mark.skipif(not os.path.exists(_AARCH64) or not sandbox._qemu_for("aarch64"),
+                    reason="needs the aarch64 corpus binary and qemu-aarch64")
+def test_cross_arch_behavior_trace_captures_execve():
+    """system("echo unlocked") on aarch64 surfaces as execve(/bin/sh) via qemu -strace."""
+    r = syscalls.trace_qemu(_AARCH64, "aarch64", endianness="little", bits=64,
+                            argv=["4242"], timeout=25)
+    assert r["ok"], r.get("note")
+    assert elfsyms.read(_AARCH64)["pie"]                 # sanity: it's the expected binary
+    execs = [e for e in r["events"] if e["syscall"] == "execve"]
+    assert execs and execs[0]["path"] == "/bin/sh"

@@ -36,7 +36,12 @@ crashing input; many bug classes have a **derivable** input and need no fuzzing.
 - **[PLANNED] Dynamic taint tracking**: confirm a source→sink flow at runtime (we only do it
   statically now) — DTA over qemu, or a lightweight taint via the debugger.
 - **[DONE] Syscall / behavior tracing** (`behavior_trace`): trace `execve`/`connect`/`open`-for-write etc. →
-  behavioral capability inventory (backdoors, anti-analysis, network beacons).
+  behavioral capability inventory (backdoors, anti-analysis, network beacons). Native x86-64 uses
+  GDB `catch syscall`; **cross-arch now runs under qemu-user's own `-strace`** (ABI-aware for any
+  arch qemu supports — the gdbstub has no `catch syscall`). Same event shape / inventory / findings
+  either way. Live-verified on aarch64 (`system` → `execve(/bin/sh)`). qemu-strace limit: it does
+  not decode the `connect()` sockaddr, so a connection's family is inferred from the fd's prior
+  `socket()` and the destination is reported undecoded (native still decodes ip:port).
 
 ## C. Automated debugger ("find things", not just capture a crash)
 
@@ -55,8 +60,8 @@ crashing input; many bug classes have a **derivable** input and need no fuzzing.
   CWE-78 (executed command) and CWE-242 (`gets`) findings. Live-verified on aarch64: captured
   `system("echo unlocked")` and the `strcpy`/`strcat` copies. Limits: needs static function
   symbols (stripped/PLT-only cross-arch binaries yield no sinks); no backtrace over the stub, so
-  the CWE-121 caller-buffer overflow predicate stays native-only. Syscall/behavior tracing remains
-  x86-64-only (catch-syscall ABI numbers), tracked separately.
+  the CWE-121 caller-buffer overflow predicate stays native-only. (Syscall/behavior tracing is now
+  cross-arch too, via qemu-user `-strace` — see the behavior-tracing item above.)
 - **[DONE] Analyst `sink_addrs` escape hatch**: a stripped, *statically-linked* binary loses sink
   identity entirely (no `.symtab`, and Ghidra recovers the functions only as `FUN_xxxx`), so
   name-based resolution finds nothing on either path. `debug_monitor` now accepts
