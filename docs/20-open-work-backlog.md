@@ -46,9 +46,17 @@ crashing input; many bug classes have a **derivable** input and need no fuzzing.
 - **[DONE] Comparison / secret extraction** (`extract_secrets`): breakpoint `strcmp`/`memcmp`/`strncmp`, dump the
   operand the program compares *our* input against → auto-recover passwords, magic bytes, license
   keys, expected tokens. Classic offensive RE; turns a crackme into an answer in one run.
-- **[PLANNED] Cross-arch breakpoints**: extend the monitor/heap-tracker to emulated targets via
-  `Z0` breakpoint packets over the qemu-gdbstub RSP client we already built (debug/qemu_gdb.py).
-  (Monitor v1 is native-only, like root-cause.)
+- **[DONE] Cross-arch breakpoints**: the `debug_monitor` stage now runs emulated targets under the
+  qemu-user gdbstub. `qemu_gdb.monitor_calls` places `Z0` breakpoints at the dangerous sinks
+  (resolved from the ELF's own `.symtab` via `debug/elfsyms.py`, rebased by the runtime entry the
+  stub reports), reads the arch's argument registers at each hit, and dereferences pointer args as
+  C-strings over `m` memory reads -- all endianness/bit aware (`_ARG_REGS`/`_BP_KIND`,
+  `breakpoints_supported`). Hits decode through the same `monitor.CATALOG` as native, yielding
+  CWE-78 (executed command) and CWE-242 (`gets`) findings. Live-verified on aarch64: captured
+  `system("echo unlocked")` and the `strcpy`/`strcat` copies. Limits: needs static function
+  symbols (stripped/PLT-only cross-arch binaries yield no sinks); no backtrace over the stub, so
+  the CWE-121 caller-buffer overflow predicate stays native-only. Syscall/behavior tracing remains
+  x86-64-only (catch-syscall ABI numbers), tracked separately.
 
 ## C2. Execution environment
 

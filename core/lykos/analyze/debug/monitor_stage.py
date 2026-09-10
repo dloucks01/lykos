@@ -8,7 +8,10 @@ more bytes than the destination function's stack buffer holds -- without needing
 Sound signals become findings: an executed command (CWE-78), a `gets` call (CWE-242), and an
 unbounded copy whose observed length exceeds the caller's recovered stack buffer (CWE-121,
 matched by function name so it survives PIE). Every observed call is emitted as a runtime log.
-Native-arch only (host GDB); cross-arch via the qemu-gdbstub is future work (doc 20 §C).
+
+Native targets run under host GDB (full backtrace, so CWE-121 is available). Cross-arch targets
+run under the qemu-user gdbstub via `qemu_gdb.monitor_calls`, breakpointing sinks resolved from
+the ELF's own symbols (`elfsyms`); the stub gives no backtrace, so CWE-121 is skipped there.
 """
 from __future__ import annotations
 
@@ -18,7 +21,7 @@ from ...db.dao import CallEdgeDAO, FindingDAO, FunctionDAO, TargetDAO
 from ...jobs.registry import register_stage
 from ..detect.catalog import normalize
 from ..dynamic import sandbox
-from . import monitor
+from . import elfsyms, monitor, qemu_gdb
 
 MONITOR_STAGE = "debug_monitor"
 TOOL = "monitor"
@@ -47,40 +50,53 @@ def _finding(cwe, title, sev, detail, *, func_addr=None, dedup, conf=0.75, state
             "state": state, "confidence": conf}
 
 
+def _decode_xarch(raw):
+    """Convert cross-arch monitor_calls arg data into the native hit shape (kind/func/cmd/length)
+    using the sink catalog. Caller name isn't available over the gdbstub -> None."""
+    out = []
+    for h in raw:
+        spec = monitor.CATALOG.get(h["func"])
+        if not spec:
+            continue
+        ai, as_ = h.get("argints", []), h.get("argstrs", [])
+        rec = {"func": h["func"], "kind": spec["kind"], "cwe": spec["cwe"], "caller_name": None}
+        k = spec["kind"]
+        if k == "exec":
+            i = spec["cmd"]; rec["cmd"] = as_[i] if i < len(as_) else None
+        elif k == "format":
+            i = spec["fmt"]; rec["fmt"] = as_[i] if i < len(as_) else None
+        else:
+            if spec.get("strlen") is not None and spec["strlen"] < len(as_):
+                rec["length"] = len(as_[spec["strlen"]])
+            elif spec.get("len_arg") is not None and spec["len_arg"] < len(ai):
+                rec["length"] = ai[spec["len_arg"]]
+            else:
+                rec["length"] = None
+        out.append(rec)
+    return out
+
+
 def monitor_stage(ctx) -> dict:
     target = TargetDAO(ctx.conn).get(ctx.target_id) if ctx.target_id else None
     if target is None:
         raise ValueError("debug_monitor requires a target_id")
     p = ctx.params or {}
     host = sandbox.host_arch()
-    if target.arch and target.arch != host:
+    emulated = bool(target.arch and target.arch != host)
+    if emulated and not qemu_gdb.breakpoints_supported(target.arch):
         ctx.emit("monitor.done", payload={"ok": False, "supported": False,
-                 "note": f"runtime monitor is native-arch only (target {target.arch}, host "
-                         f"{host}); cross-arch via qemu-gdbstub is future work"})
+                 "note": f"no cross-arch breakpoint support for {target.arch} (host {host})"})
         ctx.progress(pct=100, msg="monitor not supported for this cross-arch target")
         return {}
-    if not monitor.supported(target.arch or host):
+    if not emulated and not monitor.supported(host):
         ctx.emit("monitor.done", payload={"ok": False, "supported": False,
-                 "note": f"no GDB argument map for {target.arch or host}"})
-        return {}
-
-    # which dangerous sinks does the binary actually import? (only breakpoint those)
-    names = {normalize(e.dst_name) for e in CallEdgeDAO(ctx.conn).list_by_target(target.id)
-             if e.dst_name}
-    funcs = sorted(names & set(monitor.CATALOG))
-    if not funcs:
-        ctx.emit("monitor.done", payload={"ok": True, "hits": [], "findings": 0,
-                 "note": "no monitored dangerous sinks imported by this binary"})
-        ctx.progress(pct=100, msg="no dangerous sinks to monitor")
+                 "note": f"no GDB argument map for {host}"})
         return {}
 
     mode = p.get("input_mode", "stdin")
     argv = list(p.get("argv") or [])
     timeout = float(p.get("timeout", 20))
-    if p.get("input_sha"):
-        data = ctx.content.get_bytes(p["input_sha"])
-    else:
-        data = b"A" * 256                              # a probing input to drive the copies
+    data = ctx.content.get_bytes(p["input_sha"]) if p.get("input_sha") else b"A" * 256
     stdin = data if mode == "stdin" else b""
     run_argv = argv + [data.decode("latin-1")] if (mode == "arg" and data) else argv
 
@@ -88,15 +104,39 @@ def monitor_stage(ctx) -> dict:
     exe.write_bytes(ctx.content.path(target.sha256).read_bytes())
     os.chmod(exe, 0o755)
 
-    ctx.progress(msg=f"monitoring {len(funcs)} sink(s) under GDB: {', '.join(funcs)}")
-    res = monitor.run_monitor(exe, funcs, target.arch or host, argv=run_argv, stdin=stdin,
-                              timeout=timeout)
+    if emulated:
+        # cross-arch: breakpoint the sinks defined in the ELF's own symbols, under qemu-gdbstub
+        info = elfsyms.read(exe)
+        funcs = sorted(set(info["symbols"]) & set(monitor.CATALOG))
+        if not funcs:
+            ctx.emit("monitor.done", payload={"ok": True, "hits": [], "findings": 0,
+                     "note": "no monitored sinks found in the binary's symbols "
+                             "(stripped or dynamically linked; cross-arch needs static syms)"})
+            ctx.progress(pct=100, msg="no dangerous sinks to monitor")
+            return {}
+        ctx.progress(msg=f"monitoring {len(funcs)} sink(s) under qemu-{target.arch} gdbstub")
+        res = qemu_gdb.monitor_calls(exe, target.arch, symbols=info["symbols"],
+                                     entry=info["entry"], pie=info["pie"], sink_names=set(funcs),
+                                     endianness=target.endianness, bits=target.bits,
+                                     argv=run_argv, stdin=stdin, timeout=timeout)
+        hits = _decode_xarch(res.get("hits", [])) if res.get("ok") else []
+    else:
+        names = {normalize(e.dst_name) for e in CallEdgeDAO(ctx.conn).list_by_target(target.id)
+                 if e.dst_name}
+        funcs = sorted(names & set(monitor.CATALOG))
+        if not funcs:
+            ctx.emit("monitor.done", payload={"ok": True, "hits": [], "findings": 0,
+                     "note": "no monitored dangerous sinks imported by this binary"})
+            ctx.progress(pct=100, msg="no dangerous sinks to monitor")
+            return {}
+        ctx.progress(msg=f"monitoring {len(funcs)} sink(s) under GDB: {', '.join(funcs)}")
+        res = monitor.run_monitor(exe, funcs, host, argv=run_argv, stdin=stdin, timeout=timeout)
+        hits = res.get("hits", [])
     if not res.get("ok"):
         ctx.emit("monitor.done", payload={"ok": False, "note": res.get("note")})
         ctx.progress(pct=100, msg="monitor could not run: " + str(res.get("note")))
         return {}
 
-    hits = res.get("hits", [])
     bufsz = _smallest_buffer_by_func(ctx, target.id)
     fd = FindingDAO(ctx.conn)
     findings = 0

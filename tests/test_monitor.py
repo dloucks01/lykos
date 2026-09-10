@@ -38,3 +38,41 @@ def test_monitor_unsupported_arch():
     assert not monitor.supported("mips")
     r = monitor.run_monitor("/bin/true", ["system"], "mips")
     assert r["ok"] is False and "native-arch" in r["note"]
+
+
+# --- cross-arch (qemu-user gdbstub) ----------------------------------------------------------
+import os
+
+from lykos.analyze.debug import elfsyms, monitor_stage, qemu_gdb
+
+_CORPUS = os.path.join(os.path.dirname(__file__), "..", "examples", "re-corpus", "bin")
+_AARCH64 = os.path.join(_CORPUS, "vuln_aarch64")
+
+
+@pytest.mark.skipif(not os.path.exists(_AARCH64) or not sandbox._qemu_for("aarch64")
+                    or not qemu_gdb.breakpoints_supported("aarch64"),
+                    reason="needs the aarch64 corpus binary and qemu-aarch64")
+def test_cross_arch_monitor_captures_system_and_copy():
+    info = elfsyms.read(_AARCH64)
+    assert info["pie"] and "system" in info["symbols"]
+    r = qemu_gdb.monitor_calls(_AARCH64, "aarch64", symbols=info["symbols"], entry=info["entry"],
+                               pie=info["pie"], sink_names={"strcpy", "strcat", "system"},
+                               argv=["4242"], timeout=30)
+    assert r["ok"], r.get("note")
+    execs = [h for h in r["hits"] if h["func"] == "system"]
+    assert execs and execs[0]["argstrs"][0] == "echo unlocked"
+    copies = [h for h in r["hits"] if h["func"] == "strcpy"]
+    assert copies and any("4242" in (s or "") for h in copies for s in h["argstrs"])
+
+
+def test_decode_xarch_maps_hits_to_native_shape():
+    raw = [
+        {"func": "system", "argints": [0x1000], "argstrs": ["id"]},
+        {"func": "strcpy", "argints": [0x2000, 0x3000], "argstrs": ["", "A" * 200]},
+        {"func": "sprintf", "argints": [0x4000, 0x5000], "argstrs": ["", "%s%n"]},
+    ]
+    out = {h["func"]: h for h in monitor_stage._decode_xarch(raw)}
+    assert out["system"]["kind"] == "exec" and out["system"]["cmd"] == "id"
+    assert out["strcpy"]["kind"] == "copy" and out["strcpy"]["length"] == 200
+    assert out["strcpy"]["caller_name"] is None
+    assert out["sprintf"]["kind"] == "format" and out["sprintf"]["fmt"] == "%s%n"
