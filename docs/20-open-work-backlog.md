@@ -52,7 +52,7 @@ crashing input; many bug classes have a **derivable** input and need no fuzzing.
 
 ## C2. Execution environment
 
-- **[PLANNED] Interactive detonation console**: a GUI panel to run the target in the sandbox
+- **[DONE] Interactive detonation console** (`/console` WebSocket): a GUI panel to run the target in the sandbox
   with chosen argv/stdin/env and do live send/receive, so an analyst can reach code behind
   menus or a protocol handshake (the reachability limit the synthesizer/monitor hit). A
   recorded session becomes a seed for the fuzzer / heap-check / monitor. (One-shot detonation
