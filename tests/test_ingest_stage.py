@@ -58,3 +58,32 @@ def test_ingest_triage_cache_hit(store, case, pool, sample_elf):
     hits = [e for e in q.events.list(case_id=case.id, limit=1000)
             if e.type == "job.cachehit"]
     assert len(hits) == 1
+
+
+def test_cache_hit_backfills_new_target_row(store, case, pool, sample_elf):
+    """Regression: the same bytes ingested into a second target row (e.g. a new case) hit the
+    triage cache, so the stage body -- which denormalizes arch/bits/... onto the row -- is
+    skipped and the new row keeps NULL arch. backfill_triage_denorm recovers it from the cached
+    output artifact, so arch-branching stages (cross-arch monitor, disassembly) read it right."""
+    from lykos.analyze.ingest import backfill_triage_denorm
+
+    # first case: normal path populates the row
+    t1 = ingest(store, case.id, sample_elf)
+    q = JobQueue(store.conn)
+    r1 = enqueue_triage(q, t1)
+    assert pool.wait_idle(8) and q.runs.get(r1.id).status == "done"
+    assert store.targets.get(t1.id).arch == "x86-64"
+
+    # second case: same bytes -> new target row, triage is a cache hit at enqueue time
+    c2 = store.cases.create("case-2")
+    t2 = ingest(store, c2.id, sample_elf)
+    assert t2.id != t1.id
+    r2 = enqueue_triage(q, t2)
+    assert r2.status == "done"                       # cache hit, body never ran for this row
+    assert store.targets.get(t2.id).arch is None     # the bug: row not denormalized
+
+    assert backfill_triage_denorm(store, t2.id, r2.id) is True
+    t2b = store.targets.get(t2.id)
+    assert t2b.arch == "x86-64" and t2b.bits == 64 and t2b.file_type == "elf"
+    # idempotent: a second call is a no-op once arch is set
+    assert backfill_triage_denorm(store, t2.id, r2.id) is False

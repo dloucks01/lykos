@@ -7,15 +7,48 @@ the stage into the job engine.
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Optional
 
-from ..db.dao import TargetDAO
+from ..db.dao import RunArtifactDAO, TargetDAO
 from ..hashing import canonical_json, hash_all_file
 from ..jobs.registry import register_stage
 from .triage import TOOL, TOOL_VERSION, build_triage
 
 INGEST_TRIAGE_STAGE = "ingest_triage"
+
+
+def _apply_triage_denorm(targets: TargetDAO, target_id: str, rec: dict) -> None:
+    targets.update_triage(
+        target_id, file_type=rec["file_type"], arch=rec["arch"], bits=rec["bits"],
+        endianness=rec["endianness"], linking=rec["linking"], stripped=rec["stripped"],
+        mitigations=rec["mitigations"], entropy=rec["entropy"]["overall"])
+
+
+def backfill_triage_denorm(store, target_id: str, run_id: str) -> bool:
+    """Recover a target row's denormalized triage columns from a triage run's cached output.
+
+    The triage stage denormalizes arch/bits/endianness/... onto the target row from inside its
+    body. On a *cache hit* the job engine clones the prior run's output artifacts to the new run
+    but never re-runs the body -- so a freshly uploaded copy of an already-analyzed binary (same
+    bytes, new target row, e.g. a second case) would keep NULL arch, and arch-branching stages
+    (the cross-arch monitor, disassembly routing) would misread it as native. This reads the
+    linked triage-json artifact and writes the columns onto the new row. Returns True if it did.
+    """
+    if store.targets.get(target_id).arch is not None:
+        return False
+    for link in RunArtifactDAO(store.conn).list_by_run(run_id):
+        if link.role != "output":
+            continue
+        try:
+            rec = json.loads(store.content.get_bytes(link.artifact_sha256))
+        except Exception:
+            continue
+        if isinstance(rec, dict) and "arch" in rec and "entropy" in rec:
+            _apply_triage_denorm(store.targets, target_id, rec)
+            return True
+    return False
 
 
 def ingest(store, case_id: str, path: str | Path, filename: Optional[str] = None):
@@ -45,10 +78,7 @@ def ingest_triage_stage(ctx) -> dict:
     ctx.check_cancel()
 
     # denormalize the triage subset onto the target row
-    targets.update_triage(
-        target.id, file_type=rec["file_type"], arch=rec["arch"], bits=rec["bits"],
-        endianness=rec["endianness"], linking=rec["linking"], stripped=rec["stripped"],
-        mitigations=rec["mitigations"], entropy=rec["entropy"]["overall"])
+    _apply_triage_denorm(targets, target.id, rec)
 
     sha = ctx.put_artifact("triage-json", data=canonical_json(rec))
     ctx.progress(pct=100, msg="triage complete")

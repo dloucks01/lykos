@@ -534,7 +534,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _upload_target(self, cid):
         from ..analyze import ingest
-        from ..analyze.ingest import enqueue_triage
+        from ..analyze.ingest import backfill_triage_denorm, enqueue_triage
         ctype = self.headers.get("Content-Type", "")
         body = self._read_body()
         filename, data = extract_file(ctype, body)
@@ -547,6 +547,8 @@ class Handler(BaseHTTPRequestHandler):
             tmp.write_bytes(data)
             target = ingest(s, cid, tmp, filename=filename)
             run = enqueue_triage(JobQueue(s.conn), target)
+            if run.status == "done":   # cache hit: body skipped, backfill the row's triage denorm
+                backfill_triage_denorm(s, target.id, run.id)
             os.unlink(tmp)
             return self._json({"id": target.id, "sha256": target.sha256,
                                "run_id": run.id}, 201)
