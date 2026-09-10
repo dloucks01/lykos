@@ -190,10 +190,10 @@ def test_winapi_multi_mapping_attributes_both():
     # new-Wine maps a DYNAMICBASE exe twice (loader inspection + real run on another thread);
     # a call on the SECOND mapping's thread/range must be attributed to the target
     txt = ('0024:trace:module:map_image_into_view mapping PE file L"t.exe" at 0x110000-0x132000\n'
-           '0128:trace:module:map_image_into_view mapping PE file L"t.exe" at 0x140000000-0x140022000\n'
+           '0128:trace:module:map_image_into_view mapping PE file L"t.exe" at 0x140000000-0x140022000\n'  # noqa: E501
            '0128:Call advapi32.RegCreateKeyExW(ffffffff80000001,140004000 '
-           'L"Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Run",0,0,0,2,0,7ff,0) ret=140002000\n'
-           '002c:Call advapi32.RegCreateKeyExW(ffffffff80000002,0 L"Hardware\\\\Description",0) ret=140005000\n')
+           'L"Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Run",0,0,0,2,0,7ff,0) ret=140002000\n'  # noqa: E501
+           '002c:Call advapi32.RegCreateKeyExW(ffffffff80000002,0 L"Hardware\\\\Description",0) ret=140005000\n')  # noqa: E501
     ev = winapi.parse(txt, winapi._target_maps(txt, "t.exe"))
     keys = [e["detail"] for e in ev if e["category"] == "regkey"]
     assert keys == ["HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run"]  # 2nd map; noise off

@@ -1129,6 +1129,7 @@ async function showDetail(targetId){
               <span class="vsep"></span>
               <button class="btn sm" id="synthrun" title="Deterministic: synthesize the overflow input from the recovered stack frame (buffer size + offset) and detonate once -- no fuzzing. Needs Decompile first.">Synthesize PoC (no fuzz)</button>
               <button class="btn sm" id="injectrun" title="Deterministic: probe command-injection / format-string / path-traversal on the sinks the binary imports, and confirm by effect -- no fuzzing.">Injection PoC</button>
+              <button class="btn sm" id="secretpocrun" title="Package a hard-coded secret (CWE-798/321) into a verified PoC: locate the credential's byte offset in the binary, re-extract it offline to verify, and bundle a self-contained reproducer -- the demonstrating artifact is the secret itself, no execution or fuzzing. Needs Decompile first (for strings).">Package secret PoC</button>
               <button class="btn sm" id="monitorrun" title="Breakpoint the dangerous sinks and capture what the program passes them at runtime (command strings, copy lengths) -- finds executed commands and overflows without a crash. Native (host GDB), cross-arch (qemu gdbstub), and Windows PE (Wine +relay, captures the command/URL/copy args).">Runtime monitor</button>
               <input id="monargv" class="inp" placeholder="monitor argv (optional)" style="max-width:130px" title="Arguments passed to the target for the runtime monitor, space-separated (e.g. a PIN that reaches system())">
               <input id="monsinks" class="inp" placeholder="sink addrs: name=0xADDR,… (optional)" style="max-width:180px" title="Analyst escape hatch: breakpoint sinks by address when the binary is stripped/statically-linked and has no symbols (e.g. system=0xc5c,strcpy=0x3250). Recover the addresses from a non-stripped twin or manual RE.">
@@ -1175,6 +1176,7 @@ async function showDetail(targetId){
   document.getElementById("secretrun").onclick = ()=>doExtract(targetId);
   document.getElementById("behaviorrun").onclick = ()=>doBehavior(targetId);
   document.getElementById("taintrun").onclick = ()=>doTaint(targetId);
+  document.getElementById("secretpocrun").onclick = ()=>doSecretPoc(targetId);
   document.getElementById("consolerun").onclick = ()=>openConsole(targetId);
   const fm=document.getElementById("fuzzmetrics"); if(fm){ fm.hidden=true; fm.innerHTML=""; }
   const sc=document.getElementById("seedcount"); if(sc) sc.textContent="";
@@ -1600,6 +1602,11 @@ async function doTaint(tid){
     {status:"confirming input\u2192sink flows with a marker\u2026"});
 }
 
+async function doSecretPoc(tid){
+  await postRun(tid, "synthesize_secret", {},
+    {status:"packaging hard-coded secret(s) into a verified PoC…"});
+}
+
 async function doBehavior(tid){
   const mode = document.getElementById("dynmode").value;
   const backend = document.getElementById("behavbackend").value;
@@ -2014,6 +2021,14 @@ function openWS(id){
              + (e.payload.flows||[]).map(f=>`${esc(f.sink)}(${f.cwe})`).join(", ")
            : "no input→sink flow confirmed (marker did not reach a monitored sink)");
       loadFindings(DETAIL_TID);
+    }
+    if(e.type==="secret.done" && DETAIL_TID){
+      const st=document.getElementById("fuzzstat");
+      if(st) st.textContent = !e.payload||!e.payload.ok ? ((e.payload&&e.payload.note)||"secret PoC unavailable")
+        : (e.payload.packaged ? `packaged ${e.payload.packaged} hard-coded secret(s) → verified L0-secret PoC — `
+             + (e.payload.secrets||[]).map(s=>`${esc(s.title||s.cwe)}`).join(", ")
+           : (e.payload.note||"no hard-coded secrets to package"));
+      loadFindings(DETAIL_TID); loadPocs(DETAIL_TID);
     }
     if(e.type==="synth.start"){ const st=document.getElementById("fuzzstat"); if(st&&e.payload) st.textContent=`synthesizing from ${e.payload.candidates.length} recovered buffer(s)…`; }
     if(e.type==="synth.done" && DETAIL_TID){
