@@ -48,10 +48,27 @@ _LAYOUTS = {
 # which register name is the stack pointer per ISA
 _SP = {"aarch64": "sp", "riscv": "x2", "riscv64": "x2", "arm": "sp", "ppc64": "r1",
        "ppc": "r1", "mips": "r29"}
+# integer argument registers per ISA calling convention (in order), named as in _LAYOUTS
+_ARG_REGS = {
+    "aarch64": [f"x{i}" for i in range(8)],
+    "arm": [f"r{i}" for i in range(4)],
+    "mips": ["r4", "r5", "r6", "r7"],
+    "ppc": [f"r{i}" for i in range(3, 11)],
+    "ppc64": [f"r{i}" for i in range(3, 11)],
+    "riscv": [f"x{i}" for i in range(10, 18)],
+    "riscv64": [f"x{i}" for i in range(10, 18)],
+    "s390": [f"r{i}" for i in range(2, 7)],
+}
+_BP_KIND = {"arm": 4, "aarch64": 4, "mips": 4, "ppc": 4, "ppc64": 4,
+            "riscv": 4, "riscv64": 4, "s390": 2}     # software-breakpoint length hint
 
 
 def supported(arch: str) -> bool:
     return arch in _LAYOUTS
+
+
+def breakpoints_supported(arch: str) -> bool:
+    return arch in _LAYOUTS and arch in _ARG_REGS
 
 
 def _pkt(data: str) -> bytes:
@@ -136,6 +153,115 @@ def capture(exe, arch, *, argv=(), stdin: bytes = b"", timeout: float = 8.0,
         "regs": {k: v for k, v in regs.items() if k not in ("cpsr", "msr", "pswm")},
         "fault_addr": None, "maps": [], "backtrace": [],   # not available over the stub
     }
+
+
+def _read_mem(sock, addr: int, n: int) -> bytes:
+    r = _txn(sock, f"m{addr:x},{n:x}")
+    if not r or r.startswith("E"):
+        return b""
+    try:
+        return bytes.fromhex(r)
+    except ValueError:
+        return b""
+
+
+def _cstr(sock, addr: int, cap: int = 200) -> str:
+    if not addr:
+        return ""
+    out = bytearray()
+    while len(out) < cap:
+        chunk = _read_mem(sock, addr + len(out), min(64, cap - len(out)))
+        if not chunk:
+            break
+        nul = chunk.find(b"\x00")
+        if nul != -1:
+            out += chunk[:nul]
+            break
+        out += chunk
+    return out.decode("latin-1", "ignore")
+
+
+def _stop_sig(reply: str):
+    """(kind, sig) for an RSP stop reply: kind in {trap, exit, term, none}."""
+    if not reply:
+        return "none", None
+    if reply[0] in ("T", "S"):
+        try:
+            return "trap", int(reply[1:3], 16)
+        except ValueError:
+            return "trap", None
+    if reply[0] == "W":
+        return "exit", None
+    if reply[0] == "X":
+        return "term", None
+    return "none", None
+
+
+def monitor_calls(exe, arch, *, symbols, entry, pie, sink_names, endianness=None, bits=None,
+                  argv=(), stdin: bytes = b"", timeout: float = 20.0, max_hits: int = 400):
+    """Cross-arch call monitor: breakpoint the named sink functions (resolved from the ELF's own
+    symbols, rebased by the emulator's load base) under qemu-user's gdbstub, and at each hit read
+    the argument registers + deref them as C-strings. Returns generic per-hit arg data; the caller
+    decodes it (copy length / command / operands) like the native monitor.
+    """
+    if not breakpoints_supported(arch):
+        return {"ok": False, "note": f"no cross-arch breakpoint support for {arch}"}
+    qemu = sandbox._qemu_for(arch, endianness, bits)
+    if not qemu:
+        return {"ok": False, "note": f"no qemu-user for {arch}"}
+    targets = {n: v for n, v in symbols.items() if n in sink_names}
+    if not targets:
+        return {"ok": True, "hits": [], "note": "none of the requested sinks are in the symbols"}
+    argregs = _ARG_REGS[arch]
+    kind = _BP_KIND.get(arch, 4)
+    port = _free_port()
+    proc = subprocess.Popen([qemu, "-g", str(port), str(exe), *[str(a) for a in argv]],
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, start_new_session=True)
+    try:
+        if proc.stdin:
+            try:
+                proc.stdin.write(stdin)
+                proc.stdin.close()
+            except BrokenPipeError:
+                pass
+        sock = _connect(port, deadline=time.time() + 5)
+        if not sock:
+            return {"ok": False, "note": "gdbstub did not accept a connection"}
+        deadline = time.time() + timeout
+        try:
+            regs0 = _parse_regs(_txn(sock, "g"), arch, endianness)
+            rt_entry = regs0.get("pc")
+            if rt_entry is None:
+                return {"ok": False, "note": "could not read the runtime entry point"}
+            base = (rt_entry - entry) if pie else 0
+            bp_by_addr = {(v + base): n for n, v in targets.items()}
+            for a in bp_by_addr:
+                _txn(sock, f"Z0,{a:x},{kind}")
+            hits = []
+            reply = _txn(sock, "c", timeout=timeout)
+            while len(hits) < max_hits and time.time() < deadline:
+                kindr, sig = _stop_sig(reply)
+                if kindr in ("exit", "term", "none"):
+                    break
+                regs = _parse_regs(_txn(sock, "g"), arch, endianness)
+                pc = regs.get("pc")
+                name = bp_by_addr.get(pc)
+                if name:
+                    ints = [regs.get(r, 0) for r in argregs]
+                    strs = [_cstr(sock, v) for v in ints]
+                    hits.append({"func": name, "argints": ints, "argstrs": strs})
+                # step over: remove bp, single-step the original insn, re-arm, continue
+                if pc in bp_by_addr:
+                    _txn(sock, f"z0,{pc:x},{kind}")
+                    _stop_sig(_txn(sock, "s", timeout=timeout))
+                    _txn(sock, f"Z0,{pc:x},{kind}")
+                reply = _txn(sock, "c", timeout=timeout)
+            return {"ok": True, "hits": hits, "base": base}
+        finally:
+            sock.close()
+    finally:
+        _kill(proc)
 
 
 def _free_port() -> int:
