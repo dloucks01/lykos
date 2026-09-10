@@ -222,6 +222,13 @@ def correlate(cands: list, ctx: DetectContext) -> list:
     the call graph (candidate -> corroborated). Approximate: reachability, not data flow."""
     edges = ctx.call_edges
     source_fns = {e.src_addr for e in edges if normalize(e.dst_name) in SOURCES}
+    # NB: the entry point is deliberately NOT a source here, even though argv/envp really do
+    # arrive as main's parameters. This channel is REACHABILITY, not data flow, and every
+    # function is reachable from main -- so seeding it promotes essentially every candidate
+    # in any program that takes arguments, which is precision loss with no detection gain
+    # (measured: CWE-134 precision 0.33 with it, 1.00 without). argv is modelled in the
+    # data-flow channel instead (catalog.ENTRY_PARAM_SOURCES -> taint.analyze_program), which
+    # tracks where the bytes actually go and catches these cases on its own.
     callers = defaultdict(set)          # callee entry -> {caller entries}
     for e in edges:
         if e.dst_addr:
