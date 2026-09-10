@@ -245,7 +245,7 @@ _WIN_RELAY = (
 
 
 def test_winmonitor_parse_captures_sink_args():
-    ev = winmonitor.parse(_WIN_RELAY, "0100", 0x140000000, 0x140041000)
+    ev = winmonitor.parse(_WIN_RELAY, [("0100", 0x140000000, 0x140041000)])
     by = {}
     for e in ev:
         by.setdefault(e["kind"], []).append(e)
