@@ -1912,7 +1912,8 @@ function openWS(id){
     }
     if(e.type==="rootcause.done" && DETAIL_TID){
       const st=document.getElementById("fuzzstat");
-      if(st&&e.payload) st.textContent = e.payload.summary ? ("root cause: "+e.payload.summary).slice(0,90) : (e.payload.note||"no fault reproduced");
+      if(st&&e.payload){ const ex=e.payload.exploitability?` [${e.payload.exploitability}]`:"";
+        st.textContent = e.payload.summary ? ("root cause"+ex+": "+e.payload.summary).slice(0,100) : (e.payload.note||"no fault reproduced"); }
       loadFindings(DETAIL_TID);
     }
     if(e.type==="exploit.done" && DETAIL_TID){
