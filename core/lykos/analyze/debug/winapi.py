@@ -139,10 +139,13 @@ def parse(text, tid, lo, hi):
     return ev
 
 
-def trace(exe, *, argv=(), stdin: bytes = b"", timeout: float = 40.0, wineprefix=None) -> dict:
+def _relay(exe, *, argv, stdin, timeout, wineprefix) -> dict:
+    """Run the PE under Wine `+relay,+module`, and resolve the target's own thread + module range
+    (the attribution key). Returns {ok, text, tid, lo, hi} or {ok: False, note}. Shared by the
+    behavior tracer and the dangerous-call monitor."""
     wine = _wine()
     if not wine:
-        return {"ok": False, "note": "wine not installed; cannot trace a Windows PE here"}
+        return {"ok": False, "note": "wine not installed; cannot run a Windows PE here"}
     from ..dynamic import sandbox
     prefix = wineprefix or sandbox._default_wineprefix()   # user-owned, WoW64-capable prefix
     os.makedirs(prefix, exist_ok=True)
@@ -157,21 +160,26 @@ def trace(exe, *, argv=(), stdin: bytes = b"", timeout: float = 40.0, wineprefix
         text = (e.stderr or b"").decode("latin-1", "ignore")
     tm = _target_map(text, exe)
     if tm:                                              # ASLR-robust: thread + runtime range
-        tid, lo, hi = tm
-    elif "wine: failed to load" in text.lower():
-        # The loader could not start the image -- it never ran. The common cause is a 32-bit PE
-        # with no i386 WoW64 runtime (wine: failed to load ...\syswow64\ntdll.dll). Report it
-        # honestly rather than as "no behavior". (A benign `LdrGetDllHandleEx retval=c0000135`
-        # is NOT this -- that is a normal DLL-probe miss, so we key only on the loader's message.)
+        return {"ok": True, "text": text, "tid": tm[0], "lo": tm[1], "hi": tm[2]}
+    if "wine: failed to load" in text.lower():
+        # The loader could not start the image -- it never ran. Common cause: a 32-bit PE with no
+        # i386 WoW64 runtime (wine: failed to load ...\syswow64\ntdll.dll). Report it honestly
+        # rather than as "no behavior". (A benign `LdrGetDllHandleEx retval=c0000135` is NOT this
+        # -- a normal DLL-probe miss -- so we key only on the loader's message.)
         low = text.lower()
         note = "wine could not launch this PE"
         if "syswow64" in low or "wine32" in low:
             note += (" -- it is 32-bit and the i386 WoW64 runtime is missing (install wine32: "
                      "dpkg --add-architecture i386 && apt-get install wine32:i386)")
         return {"ok": False, "note": note + "."}
-    else:
-        rng = _pe_image_range(exe)                      # fallback: static ImageBase, no thread tid
-        if not rng:
-            return {"ok": False, "note": "could not determine the target's module range"}
-        tid, (lo, hi) = None, rng
-    return {"ok": True, "events": parse(text, tid, lo, hi)}
+    rng = _pe_image_range(exe)                           # fallback: static ImageBase, no thread
+    if not rng:
+        return {"ok": False, "note": "could not determine the target's module range"}
+    return {"ok": True, "text": text, "tid": None, "lo": rng[0], "hi": rng[1]}
+
+
+def trace(exe, *, argv=(), stdin: bytes = b"", timeout: float = 40.0, wineprefix=None) -> dict:
+    r = _relay(exe, argv=argv, stdin=stdin, timeout=timeout, wineprefix=wineprefix)
+    if not r.get("ok"):
+        return r
+    return {"ok": True, "events": parse(r["text"], r["tid"], r["lo"], r["hi"])}

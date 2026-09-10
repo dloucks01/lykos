@@ -12,6 +12,9 @@ matched by function name so it survives PIE). Every observed call is emitted as 
 Native targets run under host GDB (full backtrace, so CWE-121 is available). Cross-arch targets
 run under the qemu-user gdbstub via `qemu_gdb.monitor_calls`, breakpointing sinks resolved from
 the ELF's own symbols (`elfsyms`); the stub gives no backtrace, so CWE-121 is skipped there.
+Windows PE targets run under Wine and capture the dangerous-sink arguments from the `+relay` log
+(`winmonitor`, the Windows analog): executed command (CWE-78), format string (CWE-134), remote
+download (CWE-494), plus a copy/arg call log.
 """
 from __future__ import annotations
 
@@ -21,7 +24,7 @@ from ...db.dao import CallEdgeDAO, FindingDAO, FunctionDAO, TargetDAO
 from ...jobs.registry import register_stage
 from ..detect.catalog import normalize
 from ..dynamic import sandbox
-from . import elfsyms, monitor, qemu_gdb
+from . import elfsyms, monitor, qemu_gdb, winmonitor
 
 MONITOR_STAGE = "debug_monitor"
 TOOL = "monitor"
@@ -48,6 +51,64 @@ def _finding(cwe, title, sev, detail, *, func_addr=None, dedup, conf=0.75, state
             "evidence": [{"channel": "runtime-monitor", "detail": detail}],
             "function_addr": func_addr, "site_addr": None, "dedup_key": dedup,
             "state": state, "confidence": conf}
+
+
+def _win_monitor(ctx, target, p) -> dict:
+    """Windows PE branch: run under Wine and capture the concrete arguments at dangerous Win32
+    sinks (the Windows analog of the GDB monitor). Sound signals -> findings; the rest is a log."""
+    if not winmonitor.supported():
+        ctx.emit("monitor.done", payload={"ok": False, "supported": False,
+                 "note": "wine not installed; cannot monitor a Windows PE's calls here"})
+        ctx.progress(pct=100, msg="runtime monitor needs wine for PE targets")
+        return {}
+    exe = ctx.scratch() / "target.bin"
+    exe.write_bytes(ctx.content.path(target.sha256).read_bytes())
+    os.chmod(exe, 0o755)
+    mode = p.get("input_mode", "stdin")
+    argv = list(p.get("argv") or [])
+    timeout = float(p.get("timeout", 45))
+    data = ctx.content.get_bytes(p["input_sha"]) if p.get("input_sha") else b""
+    run_argv = argv + [data.decode("latin-1")] if (mode == "arg" and data) else argv
+    stdin = data if mode == "stdin" else b""
+
+    ctx.progress(msg="monitoring Win32 dangerous calls under Wine (+relay)")
+    res = winmonitor.monitor(exe, argv=run_argv, stdin=stdin, timeout=timeout)
+    if not res.get("ok"):
+        ctx.emit("monitor.done", payload={"ok": False, "note": res.get("note")})
+        ctx.progress(pct=100, msg="win32 monitor could not run: " + str(res.get("note")))
+        return {}
+
+    hits = res.get("hits", [])
+    fd = FindingDAO(ctx.conn)
+    findings = 0
+    for h in hits:
+        kind, api, val = h.get("kind"), h.get("api"), h.get("value")
+        if kind == "exec" and val:
+            fd.upsert(target.id, target.case_id, _finding(
+                "CWE-78", f"Command executed at runtime via {api}()", "high",
+                f'{api}("{val[:160]}") observed executing under the Wine monitor',
+                dedup=f"CWE-78:win:{api}:{val[:60]}", conf=0.8))
+            findings += 1
+        elif kind == "format" and val and ("%n" in val or "%s" in val):
+            fd.upsert(target.id, target.case_id, _finding(
+                "CWE-134", f"Format string reaches {api}() at runtime", "high",
+                f'{api}(fmt="{val[:120]}") -- attacker-influenced format specifiers',
+                dedup=f"CWE-134:win:{api}:{val[:40]}", conf=0.7))
+            findings += 1
+        elif kind == "download" and val:
+            fd.upsert(target.id, target.case_id, _finding(
+                "CWE-494", f"Remote file download via {api}()", "medium",
+                f'{api}("{val[:200]}") -- fetches a remote resource at runtime',
+                dedup=f"CWE-494:win:{val[:80]}", conf=0.7))
+            findings += 1
+
+    log = [{k: v for k, v in h.items() if k in ("api", "kind", "value", "length")}
+           for h in hits[:60]]
+    ctx.emit("monitor.done", payload={"ok": True, "platform": "windows", "calls": len(hits),
+             "findings": findings, "log": log,
+             "note": None if hits else "no monitored Win32 sink calls observed on this input"})
+    ctx.progress(pct=100, msg=f"{len(hits)} Win32 sink call(s), {findings} finding(s)")
+    return {}
 
 
 def _decode_xarch(raw):
@@ -97,15 +158,14 @@ def monitor_stage(ctx) -> dict:
         raise ValueError("debug_monitor requires a target_id")
     p = ctx.params or {}
     host = sandbox.host_arch()
-    # the monitor's execution substrate is Linux ELF -- host GDB (native) or qemu-user (cross-arch).
-    # a Windows PE / macOS Mach-O can't be run here (no Wine / full-system VM), so reject it
-    # clearly rather than silently returning "0 calls" from a GDB that can't load it.
+    # ELF runs under host GDB (native) / qemu-user (cross-arch); a Windows PE runs under Wine.
     fmt = (target.file_type or "").lower()
-    if fmt and fmt != "elf":
+    if fmt == "pe":
+        return _win_monitor(ctx, target, p)
+    if fmt and fmt != "elf":                              # Mach-O etc.: no substrate here
         ctx.emit("monitor.done", payload={"ok": False, "supported": False,
-                 "note": f"the runtime monitor runs Linux ELF binaries only (host GDB / "
-                         f"qemu-user); this target is {fmt.upper()}. Running Windows/macOS "
-                         f"binaries needs Wine or a full-system VM, which isn't available here."})
+                 "note": f"the runtime monitor runs Linux ELF (GDB/qemu-user) or Windows PE "
+                         f"(Wine); this target is {fmt.upper()} (macOS needs a full-system VM)."})
         ctx.progress(pct=100, msg=f"monitor does not support {fmt.upper()} targets")
         return {}
     emulated = bool(target.arch and target.arch != host)
