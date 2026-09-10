@@ -112,9 +112,9 @@ for _n, _spec in FUNCS.items():
 gdb.execute("set pagination off")
 gdb.execute("set height 0")
 try:
-    if RUN_ARGS:
-        gdb.execute("set args " + RUN_ARGS)
-    gdb.execute("run" + (" < " + INPUT_FILE if INPUT_FILE else ""))
+    # args must be inline on `run`: `set args X` followed by `run < file` makes gdb reset the
+    # argument list to empty (the redirect-only form), silently dropping argv.
+    gdb.execute("run " + RUN_ARGS + ((" < " + INPUT_FILE) if INPUT_FILE else ""))
 except gdb.error:
     pass
 print("LYKOS_MON " + json.dumps(HITS))

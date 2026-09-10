@@ -73,8 +73,8 @@ for _n, _li in FUNCS.items():
 gdb.execute("set pagination off")
 gdb.execute("set height 0")
 try:
-    if RUN_ARGS: gdb.execute("set args " + RUN_ARGS)
-    gdb.execute("run" + (" < " + INPUT_FILE if INPUT_FILE else ""))
+    # args inline: `set args X` then `run < file` resets args to empty (gdb quirk) -> argv lost
+    gdb.execute("run " + RUN_ARGS + ((" < " + INPUT_FILE) if INPUT_FILE else ""))
 except gdb.error:
     pass
 print("LYKOS_CMP " + json.dumps(HITS))

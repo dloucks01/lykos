@@ -534,7 +534,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def _upload_target(self, cid):
         from ..analyze import ingest
-        from ..analyze.ingest import backfill_triage_denorm, enqueue_triage
+        from ..analyze.ingest import enqueue_triage
+        from ..jobs.registry import reproject_cache_hit
         ctype = self.headers.get("Content-Type", "")
         body = self._read_body()
         filename, data = extract_file(ctype, body)
@@ -547,8 +548,8 @@ class Handler(BaseHTTPRequestHandler):
             tmp.write_bytes(data)
             target = ingest(s, cid, tmp, filename=filename)
             run = enqueue_triage(JobQueue(s.conn), target)
-            if run.status == "done":   # cache hit: body skipped, backfill the row's triage denorm
-                backfill_triage_denorm(s, target.id, run.id)
+            if run.status == "done":   # cache hit: body skipped, re-project its per-target rows
+                reproject_cache_hit(s, run.stage, target.id, run.id)
             os.unlink(tmp)
             return self._json({"id": target.id, "sha256": target.sha256,
                                "run_id": run.id}, 201)
@@ -572,6 +573,7 @@ class Handler(BaseHTTPRequestHandler):
         from ..analyze.detect import enqueue_detect
         from ..analyze.disassemble import enqueue_disassemble
         from ..analyze.ingest import enqueue_triage
+        from ..jobs.registry import reproject_cache_hit
         body = json.loads(self._read_body() or b"{}")
         s = self._store()
         try:
@@ -673,6 +675,8 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 run = q.enqueue(body["case_id"], stage, target_id=target_id,
                                 params=body.get("params"))
+            if run.status == "done" and target_id:   # cache hit: re-project its per-target rows
+                reproject_cache_hit(s, stage, target_id, run.id)
             return self._json({"run_id": run.id, "from_cache": run.status == "done"}, 201)
         finally:
             s.close()
