@@ -66,6 +66,57 @@ Columns = pipeline stages. Cells = target support level.
 | Unknown / custom ISA | wizard | SLEIGH | SLEIGH | Unicorn-via-SLEIGH | N/A | PART | PART | N/A |
 | JVM / .NET / Dalvik / WASM / eBPF | FULL | N/A(bytecode) | FULL | managed VM | lang-level | PART | PART | N/A |
 
+## MEASURED end-to-end results (September 2026)
+
+The matrix above is the *plan*. This one is ground truth: `examples/re-corpus/src/vuln.c`
+built per architecture (`-O0 -static -fno-stack-protector`) and driven through the real
+pipeline -- triage -> disassemble (Ghidra 12.1.2) -> detect_cwe -> dynamic_run -> build_poc
+-> poc_primitive -- on an x86-64 host, so every non-native arch runs under qemu-user.
+
+| label | arch | funcs | findings | corrob | taint | crash | L1 | L2 |
+|---|---|---|---|---|---|---|---|---|
+| aarch64 | aarch64 | 1015 | 17 | 10 | yes | SIGSEGV | yes | **yes** (off 136) |
+| arm | arm | 959 | 25 | 13 | yes | SIGSEGV | yes | **yes** (off 132) |
+| loongarch | loongarch | 1007 | 15 | 10 | yes | SIGSEGV | yes | no layout |
+| m68k | m68k | 961 | 193 | 72 | yes | SIGSEGV | yes | no layout |
+| ppc | ppc | 1231 | 175 | 93 | yes | SIGSEGV | yes | **yes** (off 156) |
+| ppc64 (BE) | ppc64 | 978 | 226 | 156 | yes | SIGSEGV | yes | not confirmed |
+| ppc64le | ppc64 | 1829 | 193 | **0** | yes | SIGSEGV | yes | **yes** (off 176) |
+| riscv | riscv | 984 | 23 | 10 | yes | SIGSEGV | yes | **yes** (off 136) |
+| s390 | s390 | 0 | 3 | 0 | no | SIGILL | yes | not confirmed |
+| sh | sh | 969 | 200 | 120 | yes | SIGSEGV | yes | no layout |
+| sparcv9 | sparcv9 | 954 | 198 | 75 | yes | SIGBUS | yes | no layout |
+| x86 (32) | x86 | 1100 | 90 | 37 | yes | SIGSEGV | yes | no layout |
+| x86-64 | x86-64 | 1166 | 100 | 69 | yes | SIGSEGV | yes | **yes** (off 136) |
+
+**All 13 reach a verified L1** (crash reproducer, `poc-backed` finding). Six reach a verified
+L2 instruction-pointer-control primitive. Reading the table:
+
+* **s390 decompiles to nothing** (funcs 0) because Ghidra 12.1.2 ships no SystemZ processor --
+  yet it still reaches L1, which is the useful demonstration that the dynamic ladder does not
+  depend on the decompiler at all.
+* **L2 needs a qemu gdbstub register layout** (`debug/qemu_gdb.py:_LAYOUTS`). Missing for
+  loongarch, m68k, sh, sparcv9 and -- notably -- **32-bit x86**, which is emulated on an
+  x86-64 host and so takes the cross-arch path. These report "no qemu gdbstub register layout"
+  honestly rather than failing. qemu can be *asked* for its own layout over the wire
+  (`qXfer:features:read:target.xml`), which is a better source than a hand-written table:
+  verified working for loongarch, m68k and sparcv9; qemu-sh4's stub does not serve it.
+* **sparcv9 needs a far larger overflow** than any other arch (~2KB vs ~200B): the SysV SPARC
+  frame puts the register save area BELOW the locals, so an upward overflow travels away from
+  the saved `%i7`. The stdin path (`fgets`, capped at 255) therefore cannot reach L2 on SPARC
+  at all -- a property of the test program, not of the tool.
+* **ppc64 big-endian did not confirm L2** while ppc64le did, from the same source. Unexplained.
+
+### Open bug: ppc64le yields zero data-flow findings
+
+`taint.analyze_program` returns **0 flagged sinks** on little-endian ppc64 and **139** on
+big-endian, for the same `ARCH_ABI["ppc64"]` row, near-identical call-edge counts (4828 vs
+4849), the same P-Code register names, and comparable P-Code volume (635k vs 829k ops). The
+`corrob` column above shows the effect end-to-end: 0 vs 156. Reproduce with the corpus binaries
+by calling `analyze_program` directly on both stores. Suspect the ELFv2 ABI (TOC/r2 handling,
+local vs global entry points) changes the shape Ghidra emits, but the cause is NOT yet
+identified -- do not assume the ABI row is wrong, it is shared and works big-endian.
+
 ## Cross-cutting per-architecture concerns (must be modeled, not assumed)
 These vary by ISA and silently break analysis/PoC if hardcoded to x86:
 - **Endianness** (BE vs LE; bi-endian MIPS/PPC/ARM) — affects every byte-level detector and input crafting.
