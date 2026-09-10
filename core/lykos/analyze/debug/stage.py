@@ -95,18 +95,24 @@ def root_cause_stage(ctx) -> dict:
         report_sha = ctx.put_artifact("root-cause", data=json.dumps(report, indent=2,
                                       sort_keys=True, default=str).encode(),
                                       meta={"cwe": report["classification"]["cwe"]})
-        # attach a root-cause evidence line to the crash finding (keyed by signal)
+        # attach root-cause + exploitability evidence to the crash finding (keyed by signal)
         v = report["classification"]
+        ex = report["exploitability"]
+        ex_line = (f"exploitability: {ex['rating']} ({ex['score']}/100) -- "
+                   + "; ".join(ex["reasons"]))
         FindingDAO(ctx.conn).upsert(target.id, target.case_id, {
-            "cwe": v["cwe"], "title": f"Root cause: {v['class']}", "severity": v["severity"],
+            "cwe": v["cwe"], "title": f"Root cause: {v['class']} [{ex['rating']}]",
+            "severity": v["severity"],
             "state": "confirmed", "confidence": 0.9, "detector": "root_cause",
             "site_addr": None, "function_addr": None,
             "dedup_key": f"dynamic-crash:{cap['signal_name']}",
-            "evidence": [{"channel": "root-cause", "detail": report["summary"]}]})
+            "evidence": [{"channel": "root-cause", "detail": report["summary"]},
+                         {"channel": "exploitability", "detail": ex_line}]})
 
         ctx.emit("rootcause.done", payload={
             "supported": True, "backend": backend, "cwe": v["cwe"],
             "classification": v["class"], "summary": report["summary"],
+            "exploitability": ex["rating"], "exploit_score": ex["score"],
             "reachable_from_source": report["slice"]["reachable_from_source"],
             "report": report_sha})
         ctx.progress(pct=100, msg=report["summary"][:80])

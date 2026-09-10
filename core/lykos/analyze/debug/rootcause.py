@@ -193,13 +193,16 @@ def build_slice(cap, functions, call_edges, findings, maps, target_path):
 
 
 def analyze(cap, functions, call_edges, findings, target_path, arch):
+    from . import exploitability
     disasm = disasm_one(bytes.fromhex(cap.get("pc_bytes", "")), arch)
     verdict = classify(cap, disasm)
+    exploit = exploitability.rate(cap, verdict)
     sl = build_slice(cap, functions, call_edges, findings, cap.get("maps") or [], target_path)
     summary = _summary(verdict, sl, cap, disasm)
     return {"signal": cap.get("signal_name"), "pc": cap.get("pc"),
             "fault_addr": cap.get("fault_addr"), "faulting_instruction": disasm,
-            "classification": verdict, "slice": sl, "summary": summary}
+            "classification": verdict, "exploitability": exploit, "slice": sl,
+            "summary": summary}
 
 
 def _summary(verdict, sl, cap, disasm):
