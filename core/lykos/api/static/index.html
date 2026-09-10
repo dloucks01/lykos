@@ -336,6 +336,12 @@ tr.fdetail>td{background:var(--surface-2);border-bottom:1px solid var(--border-s
 .frametbl td{padding:2px 8px 2px 0;color:var(--dim)}
 .frametbl tr.bufrow td{color:var(--text)}
 .frametbl tr.bufrow{background:color-mix(in srgb,var(--warn) 9%,transparent)}
+/* interactive console */
+.conout{flex:1;min-height:300px;max-height:52vh;overflow:auto;margin:0;padding:10px 12px;
+  background:#0b0f14;color:#d6e2ef;font-family:var(--mono);font-size:12px;line-height:1.4;
+  white-space:pre-wrap;word-break:break-word}
+.conrow{display:flex;gap:8px;align-items:center;padding:8px 12px;border-top:1px solid var(--border)}
+.conrow .inp{flex:1}
 /* ---- CFG graph ---- */
 .cvcfg{overflow:auto;max-height:320px;padding:6px}
 .cfgsvg{display:block;font-family:var(--mono)}
@@ -428,6 +434,35 @@ tr.fdetail>td{background:var(--surface-2);border-bottom:1px solid var(--border-s
       <span style="flex:1"></span>
       <button class="btn sm" onclick="closeSpecBuilder()">Cancel</button>
       <button class="btn sm primary" id="sbuse" onclick="useBuilderSpec()">Use this spec</button>
+    </div>
+  </div>
+</div>
+
+<div class="palette" id="console" hidden>
+  <div class="sbbox" role="dialog" aria-label="Interactive detonation console">
+    <div class="sbhead">
+      <div><b>Interactive console</b> <span class="fghint" id="constatus">disconnected</span>
+        <div class="fghint">Drive the target live in the sandbox to reach menus/protocols; save what you send as a seed.</div></div>
+      <button class="btn sm" onclick="closeConsole()">✕</button>
+    </div>
+    <div class="sbtop">
+      <input id="conargv" class="inp" placeholder="argv (comma-separated, optional)" style="max-width:260px">
+      <button class="btn sm primary" id="conconnect" onclick="consoleConnect()">▶ Run</button>
+      <button class="btn sm" onclick="consoleSignal('INT')" title="Send Ctrl-C (SIGINT)">Ctrl-C</button>
+      <button class="btn sm" onclick="consoleEof()" title="Send EOF">EOF</button>
+      <button class="btn sm" onclick="consoleSave()" title="Save the bytes you've sent as a reusable seed">Save as seed</button>
+      <span class="fghint" id="consaved"></span>
+    </div>
+    <div class="sbgrid" style="grid-template-columns:1fr">
+      <div style="padding:0;display:flex;flex-direction:column;min-height:0">
+        <pre id="conout" class="conout"></pre>
+        <div class="conrow">
+          <input id="conin" class="inp" placeholder="type input, Enter to send…" autocomplete="off"
+                 onkeydown="if(event.key==='Enter'){consoleSend();event.preventDefault();}">
+          <label class="fghint" style="display:flex;gap:4px;align-items:center"><input type="checkbox" id="connl" checked>+newline</label>
+          <button class="btn sm" onclick="consoleSend()">Send</button>
+        </div>
+      </div>
     </div>
   </div>
 </div>
@@ -1094,6 +1129,7 @@ async function showDetail(targetId){
               <button class="btn sm" id="monitorrun" title="Run under GDB with breakpoints on dangerous sinks; capture what the program passes them at runtime (command strings, copy lengths) -- finds executed commands and overflows without a crash. Native-arch only.">Runtime monitor</button>
               <button class="btn sm" id="heaprun" title="Run under a guard-page heap allocator (LD_PRELOAD) that catches use-after-free, double-free, heap overflow and invalid free at the exact access -- silent corruptions that don't crash. Native-arch, dynamically-linked targets.">Heap check</button>
               <button class="btn sm" id="secretrun" title="Breakpoint the comparison functions and dump both operands -- recovers the constants the program checks input against (passwords, magic bytes, tokens). Native-arch only.">Extract secrets</button>
+              <button class="btn sm" id="consolerun" title="Interactive detonation: run the target in the sandbox and drive it live (send/receive) to reach menus/protocols; save what you send as a seed.">Console ▸</button>
               <span class="fghint" id="strathint"></span>
             </div>
           </div>
@@ -1122,6 +1158,7 @@ async function showDetail(targetId){
   document.getElementById("monitorrun").onclick = ()=>doMonitor(targetId);
   document.getElementById("heaprun").onclick = ()=>doHeapCheck(targetId);
   document.getElementById("secretrun").onclick = ()=>doExtract(targetId);
+  document.getElementById("consolerun").onclick = ()=>openConsole(targetId);
   const fm=document.getElementById("fuzzmetrics"); if(fm){ fm.hidden=true; fm.innerHTML=""; }
   const sc=document.getElementById("seedcount"); if(sc) sc.textContent="";
   CUSTOM_SPEC=null; BUILDER=[]; updateCustomChip();   // a built spec is per-target
@@ -1527,6 +1564,40 @@ async function doExtract(tid){
   await postRun(tid, "extract_secrets", {input_mode:(mode==="none"?"stdin":mode), timeout:20},
     {status:"extracting comparison constants under GDB…"});
 }
+// ---- interactive detonation console ----
+let CONWS=null, CON_TID=null;
+function openConsole(tid){ CON_TID=tid; document.getElementById("console").hidden=false;
+  const o=document.getElementById("conout"); if(o) o.textContent=""; setConStatus("disconnected");
+  document.getElementById("consaved").textContent=""; }
+function closeConsole(){ if(CONWS){ try{CONWS.close();}catch(e){} CONWS=null; } document.getElementById("console").hidden=true; }
+function setConStatus(s){ const el=document.getElementById("constatus"); if(el) el.textContent=s; }
+function conAppend(txt){ const o=document.getElementById("conout"); if(!o) return;
+  o.textContent += txt; if(o.textContent.length>200000) o.textContent=o.textContent.slice(-150000);
+  o.scrollTop=o.scrollHeight; }
+function consoleConnect(){
+  if(CONWS){ try{CONWS.close();}catch(e){} }
+  const argv=(document.getElementById("conargv").value||"").trim();
+  const qs = `target_id=${encodeURIComponent(CON_TID)}` + (argv?`&argv=${encodeURIComponent(argv)}`:"");
+  setConStatus("connecting…");
+  CONWS=new WebSocket(`ws://${location.host}/console?${qs}`);
+  CONWS.onopen=()=>setConStatus("running");
+  CONWS.onclose=()=>setConStatus("disconnected");
+  CONWS.onerror=()=>setConStatus("error");
+  CONWS.onmessage=ev=>{
+    let m; try{m=JSON.parse(ev.data);}catch(_){return;}
+    if(m.t==="out"){ try{ conAppend(new TextDecoder().decode(Uint8Array.from(atob(m.b64),c=>c.charCodeAt(0)))); }catch(e){} }
+    else if(m.t==="info"){ conAppend(`\n[·] ${m.msg}\n`); }
+    else if(m.t==="exit"){ conAppend(`\n[exited${m.code!=null?" code "+m.code:""}${m.signal!=null?" signal "+m.signal:""}]\n`); setConStatus("exited"); }
+    else if(m.t==="saved"){ document.getElementById("consaved").textContent=`seed saved (${m.bytes} B): ${m.sha.slice(0,12)}`; }
+  };
+}
+function conSendMsg(o){ if(CONWS && CONWS.readyState===1) CONWS.send(JSON.stringify(o)); }
+function consoleSend(){ const i=document.getElementById("conin"); if(!i) return;
+  let s=i.value; if(document.getElementById("connl").checked) s+="\n";
+  conSendMsg({t:"in", b64: btoa(unescape(encodeURIComponent(s)))}); i.value=""; i.focus(); }
+function consoleSignal(sig){ conSendMsg({t:"signal", sig}); }
+function consoleEof(){ conSendMsg({t:"eof"}); }
+function consoleSave(){ conSendMsg({t:"save"}); }
 async function doConcolic(tid){
   const mode = document.getElementById("dynmode").value;
   await postRun(tid, "concolic", {input_mode:(mode==="none"?"stdin":mode),input_size:64,max_seconds:120,

@@ -156,6 +156,9 @@ class Handler(BaseHTTPRequestHandler):
         # WebSocket upgrade for /events
         if path == "/events" and "websocket" in self.headers.get("Upgrade", "").lower():
             return self._ws_events(qs.get("case_id", [None])[0])
+        # WebSocket upgrade for the interactive detonation console
+        if path == "/console" and "websocket" in self.headers.get("Upgrade", "").lower():
+            return self._ws_console(qs)
         try:
             if path in ("/", "/index.html"):
                 return self._static()
@@ -663,6 +666,53 @@ class Handler(BaseHTTPRequestHandler):
             s.close()
 
     # ---- WebSocket event stream ----
+    def _ws_console(self, qs):
+        """Interactive detonation console: spawn the target under a PTY in the sandbox and proxy
+        it live over the WebSocket (send/receive), with a save-as-seed hook."""
+        import shutil
+        import tempfile
+
+        from . import console
+        key = self.headers.get("Sec-WebSocket-Key")
+        target_id = qs.get("target_id", [None])[0]
+        if not key or not target_id:
+            return self._json({"error": "console needs target_id + WebSocket"}, 400)
+        s = self._store()
+        try:
+            target = s.targets.get(target_id)
+            if not target:
+                return self._json({"error": "no target"}, 404)
+            case_id = target.case_id
+            blob = s.content.path(target.sha256).read_bytes()
+            arch, endianness, bits = target.arch, target.endianness, target.bits
+        finally:
+            s.close()
+
+        self.send_response(101, "Switching Protocols")
+        self.send_header("Upgrade", "websocket")
+        self.send_header("Connection", "Upgrade")
+        self.send_header("Sec-WebSocket-Accept", ws.accept_key(key))
+        self.end_headers()
+
+        workdir = Path(tempfile.mkdtemp(prefix="lykos-console-"))
+        exe = workdir / "target.bin"
+        exe.write_bytes(blob)
+        os.chmod(exe, 0o755)
+        argv = _csv(qs.get("argv")) or []
+
+        def put_seed(data: bytes) -> str:
+            st = CaseStore(self.server.case_dir)
+            try:
+                return st.put_artifact(case_id, "console-seed", data=data).sha256
+            finally:
+                st.close()
+
+        try:
+            console.serve(self.connection, exe, argv=argv, arch=arch, endianness=endianness,
+                          bits=bits, cwd=str(workdir), put_seed=put_seed)
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
+
     def _ws_events(self, case_id: Optional[str]):
         key = self.headers.get("Sec-WebSocket-Key")
         if not key:
