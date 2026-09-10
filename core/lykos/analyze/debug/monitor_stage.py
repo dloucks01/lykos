@@ -97,6 +97,17 @@ def monitor_stage(ctx) -> dict:
         raise ValueError("debug_monitor requires a target_id")
     p = ctx.params or {}
     host = sandbox.host_arch()
+    # the monitor's execution substrate is Linux ELF -- host GDB (native) or qemu-user (cross-arch).
+    # a Windows PE / macOS Mach-O can't be run here (no Wine / full-system VM), so reject it
+    # clearly rather than silently returning "0 calls" from a GDB that can't load it.
+    fmt = (target.file_type or "").lower()
+    if fmt and fmt != "elf":
+        ctx.emit("monitor.done", payload={"ok": False, "supported": False,
+                 "note": f"the runtime monitor runs Linux ELF binaries only (host GDB / "
+                         f"qemu-user); this target is {fmt.upper()}. Running Windows/macOS "
+                         f"binaries needs Wine or a full-system VM, which isn't available here."})
+        ctx.progress(pct=100, msg=f"monitor does not support {fmt.upper()} targets")
+        return {}
     emulated = bool(target.arch and target.arch != host)
     if emulated and not qemu_gdb.breakpoints_supported(target.arch):
         ctx.emit("monitor.done", payload={"ok": False, "supported": False,

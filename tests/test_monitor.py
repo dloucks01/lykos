@@ -204,3 +204,26 @@ def test_native_addr_sinks_rebased_for_pie(gcc, tmp_path):
     assert r["ok"], r.get("note")
     execs = [h for h in r["hits"] if h["kind"] == "exec"]
     assert execs and execs[0]["cmd"] == "echo pie-rebased"
+
+
+class _FakeCtx:
+    """Minimal JobContext stand-in: the non-ELF guard returns before touching content/scratch."""
+    def __init__(self, conn, target_id, params=None):
+        self.conn, self.target_id, self.params = conn, target_id, params or {}
+        self.events = []
+    def emit(self, kind, payload=None): self.events.append((kind, payload))
+    def progress(self, pct=None, msg=None): pass
+
+
+def test_monitor_rejects_non_elf(store, case):
+    """A Windows PE / macOS Mach-O can't be run under host GDB or qemu-user here, so the monitor
+    must reject it with a clear note rather than silently returning zero calls."""
+    from lykos.analyze.debug.monitor_stage import monitor_stage
+    t = store.targets.upsert(case.id, "vuln.exe", "cd" * 32, size=10)
+    store.targets.update_triage(t.id, file_type="pe", arch=None, bits=None, endianness=None,
+                                linking=None, stripped=None, mitigations=None, entropy=0.0)
+    ctx = _FakeCtx(store.conn, t.id, {"argv": ["4242"], "sink_addrs": {"system": "0x1400"}})
+    monitor_stage(ctx)
+    done = [p for k, p in ctx.events if k == "monitor.done"]
+    assert done and done[0]["ok"] is False
+    assert "ELF" in done[0]["note"] and "PE" in done[0]["note"]
