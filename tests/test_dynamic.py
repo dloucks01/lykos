@@ -242,3 +242,22 @@ def test_qemu_selection_covers_every_supported_arch():
         elif arch == "sparc" and bits == 64:
             suf = "sparc64"
         assert suf == want, f"{arch}/{endian}/{bits}: got qemu-{suf}, want qemu-{want}"
+
+
+def test_argv_arg_refuses_a_nul_payload_with_a_usable_reason():
+    """execve() argument strings are NUL-terminated, so an argv element cannot carry a NUL.
+
+    Any L2/L3 confirmation payload that embeds an address contains one, so delivering it via
+    input_mode="arg" is impossible in principle -- not a bug to work around. It previously
+    surfaced as a bare ValueError("embedded null byte") raised from inside subprocess, which
+    failed the whole stage and read like a crash in the tool rather than a property of the
+    delivery channel.
+    """
+    from lykos.analyze.dynamic import sandbox
+    payload = b"A" * 72 + (0x400544).to_bytes(8, "little")
+    assert b"\x00" in payload
+    with pytest.raises(sandbox.ArgvNulError) as ei:
+        sandbox.argv_arg(payload)
+    msg = str(ei.value)
+    assert "NUL" in msg and "stdin" in msg          # says what is wrong AND what to do
+    assert sandbox.argv_arg(b"AAAA") == "AAAA"      # ordinary payloads are unaffected

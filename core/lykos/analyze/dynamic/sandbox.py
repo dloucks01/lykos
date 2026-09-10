@@ -57,6 +57,29 @@ class RunResult:
     note: Optional[str] = None
 
 
+class ArgvNulError(ValueError):
+    """A payload that cannot be delivered as a command-line argument."""
+
+
+def argv_arg(data: bytes) -> str:
+    """Render a payload as ONE argv element, or refuse with a clear reason.
+
+    execve() argument strings are NUL-terminated, so an argument cannot contain a NUL byte --
+    the kernel truncates there. This is not a Python limitation to work around: any payload
+    that embeds an address (an L2/L3 confirmation payload almost always does) is undeliverable
+    via argv on most ABIs and must go over stdin or a file. Raising a NAMED error lets callers
+    report that honestly instead of surfacing a bare ValueError("embedded null byte") from
+    inside subprocess, which reads like a crash in the tool rather than a property of the
+    delivery channel.
+    """
+    if b"\x00" in data:
+        raise ArgvNulError(
+            "payload contains a NUL byte at offset %d and cannot be delivered as a command-"
+            "line argument (execve truncates at NUL); use input_mode 'stdin' or 'file'"
+            % data.index(b"\x00"))
+    return data.decode("latin-1")
+
+
 def host_arch() -> str:
     return _HOST.get(platform.machine().lower(), platform.machine().lower())
 

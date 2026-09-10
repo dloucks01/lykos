@@ -7,6 +7,8 @@ import json
 import tempfile
 from pathlib import Path
 
+from ..dynamic import sandbox
+
 _HELPER = "ptrace_capture.py"
 
 
@@ -33,7 +35,10 @@ def make_capture(ctx, helper: Path, exe, mode, base_argv, timeout, python):
             stdin_file = str(work / "stdin.bin")
             (work / "stdin.bin").write_bytes(data)
         elif mode == "arg":
-            argv = argv + [data.decode("latin-1")]
+            try:
+                argv = argv + [sandbox.argv_arg(data)]
+            except sandbox.ArgvNulError as e:
+                return {"ok": False, "reason": str(e)}
         elif mode == "file":
             (work / "input.bin").write_bytes(data)
             argv = argv + [str(work / "input.bin")]
@@ -65,7 +70,10 @@ def make_qemu_capture(exe, arch, mode, base_argv, timeout, *, endianness=None, b
         if mode == "stdin":
             stdin = data
         elif mode == "arg":
-            argv = argv + [data.decode("latin-1")]
+            try:
+                argv = argv + [sandbox.argv_arg(data)]
+            except sandbox.ArgvNulError as e:
+                return {"ok": False, "reason": str(e)}
         elif mode == "file":
             (work / "input.bin").write_bytes(data)
             argv = argv + [str(work / "input.bin")]
