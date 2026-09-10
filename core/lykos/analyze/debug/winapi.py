@@ -24,7 +24,6 @@ import re
 import shutil
 import struct
 import subprocess
-import tempfile
 
 # api name -> behavior category. v1 traces the categories that attribute *cleanly* to the target
 # under Wine (TID + ret-range). Registry writes and file I/O are deliberately NOT here: Wine's
@@ -144,9 +143,9 @@ def trace(exe, *, argv=(), stdin: bytes = b"", timeout: float = 40.0, wineprefix
     wine = _wine()
     if not wine:
         return {"ok": False, "note": "wine not installed; cannot trace a Windows PE here"}
-    prefix = wineprefix or os.path.join(tempfile.gettempdir(), "lykos-wineprefix")
-    os.makedirs(prefix, exist_ok=True)
     from ..dynamic import sandbox
+    prefix = wineprefix or sandbox._default_wineprefix()   # user-owned, WoW64-capable prefix
+    os.makedirs(prefix, exist_ok=True)
     env = {**os.environ, "WINEPREFIX": prefix, "DISPLAY": ""}
     cmd = [wine, str(exe)] + [str(a) for a in argv]
     sandbox._ensure_wineprefix(wine, prefix)            # boot once (only if the prefix is cold)

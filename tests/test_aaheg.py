@@ -247,9 +247,20 @@ def test_house_of_spirit_allocates_over_controlled_memory_on_real_glibc(gcc, tmp
         p.kill(); p.wait(timeout=3)
 
 
+def _host_glibc():
+    try:
+        return tuple(int(x) for x in os.confstr("CS_GNU_LIBC_VERSION").split()[-1].split(".")[:2])
+    except Exception:
+        return (0, 0)
+
+
+@pytest.mark.skipif(_host_glibc() > (2, 42),
+                    reason="glibc 2.43+ detects this fastbin double-free (aborts); the technique "
+                           "and its live confirmation target glibc <= 2.42")
 def test_fastbin_dup_returns_duplicate_on_real_glibc(gcc, tmp_path):
     """Drive the generated fastbin_dup chain's core: fill the tcache, double-free a fastbin
-    chunk, and observe the same address handed out twice -- confirmed on the host's glibc."""
+    chunk, and observe the same address handed out twice -- confirmed on glibc <= 2.42 (2.43
+    added a tcache double-free check that aborts this)."""
     exe = _build(gcc, tmp_path, _FDUP, "fdup")
     plan = plan_exploit(Vuln("double_free", 0x50), Goal("arbitrary_alloc"), Env(glibc=(2, 42)))
     fd = next(a for a in plan["advisory_alternatives"] if a["technique"] == "fastbin_dup")

@@ -51,7 +51,7 @@ crashing input; many bug classes have a **derivable** input and need no fuzzing.
   injection / anti-debug), attributed by the target's thread + return-address-in-exe-range so
   Wine's own service processes (same ImageBase) are excluded. Live-verified: `system("echo
   unlocked")` on `vuln_win64.exe` → a process-execution finding. **[PLANNED]** registry-write /
-  file-I/O attribution (Wine's session init pollutes those; relay lacks the full key path).
+  file-I/O attribution (Wine's session init pollutes those; relay lacks the full key path). Runs both PE32+ (64-bit) and **PE32 (32-bit)** -- the latter needs the i386 WoW64 runtime (`wine32:i386`); a 32-bit PE without it is reported honestly (not "no behavior"). The wine prefix lives under `~/.cache/lykos/wineprefix` (user-owned: wine refuses to *create* a prefix under a world-writable `/tmp`), and a fresh prefix carries the WoW64 32-bit DLLs so PE32 targets run. Live-verified: `vuln_win32.exe` (i386 PE) traces the same process-execution finding.
 
 ## C. Automated debugger ("find things", not just capture a crash)
 

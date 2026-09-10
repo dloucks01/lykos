@@ -190,9 +190,19 @@ def test_model_smallbin_overflow_fifo():
     assert [idx[a] for a in order] == [6, 5, 4, 3, 2, 1, 0, 7, 8]   # tcache LIFO, small FIFO
 
 
+def _host_glibc():
+    try:
+        return tuple(int(x) for x in os.confstr("CS_GNU_LIBC_VERSION").split()[-1].split(".")[:2])
+    except Exception:
+        return (0, 0)
+
+
+@pytest.mark.skipif(_host_glibc() > (2, 42),
+                    reason="fastbin reuse order changed after glibc 2.42; this cross-check "
+                           "validates the 2.42 tcache/fastbin model")
 def test_fastbin_overflow_matches_real_glibc(play_bin):
     """Free 9 same-size chunks; the model predicts tcache-LIFO then fastbin-LIFO reuse -- verify
-    the exact order on the host's real glibc."""
+    the exact order on the host's real glibc (2.42; 2.43+ hardened/reordered fastbins)."""
     p = subprocess.Popen([str(play_bin)], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
     try:
         _drive(p, b"")
