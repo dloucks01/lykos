@@ -57,6 +57,16 @@ crashing input; many bug classes have a **derivable** input and need no fuzzing.
   symbols (stripped/PLT-only cross-arch binaries yield no sinks); no backtrace over the stub, so
   the CWE-121 caller-buffer overflow predicate stays native-only. Syscall/behavior tracing remains
   x86-64-only (catch-syscall ABI numbers), tracked separately.
+- **[DONE] Analyst `sink_addrs` escape hatch**: a stripped, *statically-linked* binary loses sink
+  identity entirely (no `.symtab`, and Ghidra recovers the functions only as `FUN_xxxx`), so
+  name-based resolution finds nothing on either path. `debug_monitor` now accepts
+  `params.sink_addrs` ({catalog-name: vaddr}, hex or int) to breakpoint sinks by address:
+  cross-arch merges them into the symbol map (rebased by the runtime entry like any symbol),
+  native breakpoints `*addr` via a new `run_monitor(addr_sinks=...)`. Each is decoded with that
+  name's CATALOG spec. Analyst-in-the-loop (addresses come from a non-stripped twin or manual RE).
+  UI: optional "sink addrs" + "monitor argv" fields by the Runtime-monitor button. Live-verified
+  on a stripped static-pie aarch64: `system=0xc5c,strcpy=0x3250,strcat=0x3220` → captured
+  `system("echo unlocked")` → CWE-78, on a symbol-less binary.
 
 ## C2. Execution environment
 
