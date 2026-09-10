@@ -19,7 +19,7 @@ from . import syscalls
 
 TRACE_STAGE = "behavior_trace"
 TOOL = "behavior"
-TOOL_VERSION = "behavior-2"        # bump: added cross-arch qemu -strace backend
+TOOL_VERSION = "behavior-3"        # bump: cross-arch qemu backend, clone3, backend override
 
 
 def _private(ip: str) -> bool:
@@ -50,14 +50,25 @@ def behavior_trace_stage(ctx) -> dict:
         ctx.progress(pct=100, msg=f"behavior trace does not support {fmt.upper()} targets")
         return {}
     emulated = bool(target.arch and target.arch != host)
-    if emulated and not sandbox._qemu_for(target.arch, target.endianness, target.bits):
+    # backend: auto (native->gdb, cross->qemu), or forced. The gdb backend decodes the connect()
+    # sockaddr (ip:port) but can't follow a forked child's exec (system/popen via clone3); the
+    # qemu backend follows children (captures that exec) but leaves the connect dest undecoded.
+    backend = (ctx.params or {}).get("backend", "auto").lower()
+    use_qemu = backend == "qemu" or (backend == "auto" and emulated)
+    if use_qemu and not sandbox._qemu_for(target.arch or host, target.endianness, target.bits):
         ctx.emit("behavior.done", payload={"ok": False, "supported": False,
-                 "note": f"no qemu-user for {target.arch} (cross-arch behavior trace needs it)"})
-        ctx.progress(pct=100, msg="behavior trace not supported for this cross-arch target")
+                 "note": f"no qemu-user for {target.arch or host} (qemu behavior trace needs it)"})
+        ctx.progress(pct=100, msg="behavior trace not supported (no qemu-user)")
         return {}
-    if not emulated and not syscalls.supported(host):
+    if not use_qemu and emulated:
         ctx.emit("behavior.done", payload={"ok": False, "supported": False,
-                 "note": f"native behavior trace has no syscall map for {host}"})
+                 "note": f"the gdb behavior backend is native-only (target {target.arch}); "
+                         f"use backend=qemu for cross-arch"})
+        ctx.progress(pct=100, msg="gdb backend can't trace this cross-arch target")
+        return {}
+    if not use_qemu and not syscalls.supported(host):
+        ctx.emit("behavior.done", payload={"ok": False, "supported": False,
+                 "note": f"native gdb behavior trace has no syscall map for {host}"})
         ctx.progress(pct=100, msg="behavior trace not supported for this target")
         return {}
 
@@ -71,9 +82,10 @@ def behavior_trace_stage(ctx) -> dict:
     run_argv = argv + [data.decode("latin-1")] if (mode == "arg" and data) else argv
     stdin = data if mode == "stdin" else b""
 
-    if emulated:
-        ctx.progress(msg=f"tracing syscalls under qemu-{target.arch} (-strace)")
-        res = syscalls.trace_qemu(exe, target.arch, endianness=target.endianness,
+    if use_qemu:
+        arch = target.arch or host
+        ctx.progress(msg=f"tracing syscalls under qemu-{arch} (-strace)")
+        res = syscalls.trace_qemu(exe, arch, endianness=target.endianness,
                                   bits=target.bits, argv=run_argv, stdin=stdin, timeout=timeout)
     else:
         ctx.progress(msg="tracing syscalls under GDB")
@@ -109,7 +121,7 @@ def behavior_trace_stage(ctx) -> dict:
             inv["wx"] = True
         elif s in ("setuid", "setgid"):
             inv["priv"].append(f"{s}({e.get('id')})")
-        elif s in ("clone", "fork", "vfork"):
+        elif s in ("clone", "clone3", "fork", "vfork"):
             inv["spawned"] += 1
     for k in ("exec", "network", "files_written", "deleted", "chmod", "sockets", "priv"):
         inv[k] = sorted(set(inv[k]))

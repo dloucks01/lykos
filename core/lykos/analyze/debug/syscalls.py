@@ -27,8 +27,9 @@ from .monitor import _locate_gdb
 # x86-64 syscall numbers for the curated catch set (stable ABI)
 NR = {59: "execve", 322: "execveat", 42: "connect", 41: "socket", 49: "bind", 43: "accept",
       44: "sendto", 2: "open", 257: "openat", 87: "unlink", 263: "unlinkat", 82: "rename",
-      90: "chmod", 268: "fchmodat", 101: "ptrace", 56: "clone", 57: "fork", 58: "vfork",
-      10: "mprotect", 105: "setuid", 106: "setgid", 62: "kill", 165: "mount", 155: "pivot_root"}
+      90: "chmod", 268: "fchmodat", 101: "ptrace", 56: "clone", 435: "clone3", 57: "fork",
+      58: "vfork", 10: "mprotect", 105: "setuid", 106: "setgid", 62: "kill", 165: "mount",
+      155: "pivot_root"}
 _NAMES = sorted(set(NR.values()))
 
 _SCRIPT = r'''
