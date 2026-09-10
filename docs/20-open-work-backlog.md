@@ -27,7 +27,15 @@ crashing input; many bug classes have a **derivable** input and need no fuzzing.
 - **[DONE] Instrumented dangerous-call monitor** (`debug_monitor`): runs under GDB with breakpoints
   on dangerous sinks, capture concrete args at runtime (copy lengths, command strings, size args)
   → dynamic evidence (a `system("…")` we watched execute; a `strcpy` of N bytes into an S-byte
-  frame) without needing a segfault. See doc 08 / debug/monitor.py.
+  frame) without needing a segfault. See doc 08 / debug/monitor.py. **Windows PE branch**
+  (`debug/winmonitor.py`, the Windows analog): runs the PE under Wine `+relay` and captures the
+  concrete arguments at dangerous Win32 sinks — the command to CreateProcess/WinExec/ShellExecute/
+  system → CWE-78, the format string to wsprintf (`%n`/`%s`) → CWE-134, the URL to
+  URLDownloadToFile → CWE-494, plus the target's string-copy args (with length) as a call log.
+  Attributed by the target's own thread + return-address in the exe's range (same as the PE
+  behavior trace). Live-verified: `system("echo unlocked")` + the `strcpy("4242")` copies captured
+  on `vuln_win64.exe` → CWE-78. Overflow verdicts on copies need the caller's PE stack-buffer size
+  (not recovered yet); LoadLibrary is omitted (Wine's driver loads dominate it).
 - **[DONE] Heap-error detection** (`heap_check`): an LD_PRELOAD guard-page allocator shim
   (`dynamic/heappoison.c`) catches use-after-free (CWE-416), double-free (CWE-415), heap buffer
   overflow (CWE-122) and invalid/wild free (CWE-590) at the exact access, plus opt-in leaks

