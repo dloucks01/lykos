@@ -11,10 +11,12 @@ from __future__ import annotations
 
 import os
 import platform
+import re
 import resource
 import shutil
 import signal
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -156,12 +158,12 @@ def _killpg(p):
             pass
 
 
-def _spawn(cmd, stdin, timeout, preexec):
+def _spawn(cmd, stdin, timeout, preexec, env=None):
     start = time.monotonic()
     try:
         p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                              stderr=subprocess.PIPE, start_new_session=True,
-                             preexec_fn=preexec)
+                             preexec_fn=preexec, env=env)
     except Exception as e:
         return None, b"", ("spawn failed: %r" % e).encode(), False, 0
     timed = False
@@ -179,11 +181,91 @@ def _spawn(cmd, stdin, timeout, preexec):
     return rc, out or b"", err or b"", timed, dur
 
 
+# --- Windows PE substrate: Wine (optional, like qemu-user for cross-arch ELF) ----------------
+# Wine surfaces a guest crash not as a Unix signal but as a non-zero exit plus an stderr line
+# `err:seh:NtRaiseException Unhandled exception code cXXXXXXXX`; we classify from that NT status.
+_WINE_EXC = {
+    "c0000005": "ACCESS_VIOLATION", "c00000fd": "STACK_OVERFLOW",
+    "c000001d": "ILLEGAL_INSTRUCTION", "c0000094": "INT_DIVIDE_BY_ZERO",
+    "c0000409": "STACK_BUFFER_OVERRUN", "c0000374": "HEAP_CORRUPTION",
+    "c0000025": "NONCONTINUABLE_EXCEPTION", "c0000602": "FAIL_FAST_EXCEPTION",
+    "80000003": "BREAKPOINT",
+}
+_WINE_EXC_RE = re.compile(rb"Unhandled exception code ([0-9a-fA-F]{8})")
+
+
+def _wine() -> Optional[str]:
+    return shutil.which("wine") or shutil.which("wine64")
+
+
+def _is_pe(exe) -> bool:
+    """A PE (Windows) image: 'MZ' DOS stub then a 'PE\\0\\0' signature at the e_lfanew offset."""
+    try:
+        with open(exe, "rb") as f:
+            head = f.read(0x40)
+            if head[:2] != b"MZ" or len(head) < 0x40:
+                return False
+            off = int.from_bytes(head[0x3C:0x40], "little")
+            f.seek(off)
+            return f.read(4) == b"PE\x00\x00"
+    except Exception:
+        return False
+
+
+def _default_wineprefix() -> str:
+    # one persistent prefix (bootstrapped once) reused across runs -- re-bootstrapping per exec
+    # would make fuzzing unusably slow; wineserver is keyed by prefix so workers can share it.
+    return os.path.join(tempfile.gettempdir(), "lykos-wineprefix")
+
+
+def _ensure_wineprefix(wine: str, prefix: str) -> None:
+    if os.path.exists(os.path.join(prefix, "system.reg")):
+        return
+    os.makedirs(prefix, exist_ok=True)
+    env = {**os.environ, "WINEPREFIX": prefix, "WINEDEBUG": "-all", "DISPLAY": ""}
+    try:
+        subprocess.run([wine, "wineboot", "--init"], env=env,
+                       capture_output=True, timeout=180)
+    except Exception:
+        pass
+
+
+def _run_windows(exe, *, argv, stdin, timeout, mem_mb, capture, wineprefix) -> RunResult:
+    wine = _wine()
+    if not wine:
+        return RunResult(isolation="unsupported-windows",
+                         note="wine not installed; cannot run a Windows PE here "
+                              "(install wine, or analyze statically)")
+    prefix = wineprefix or _default_wineprefix()
+    _ensure_wineprefix(wine, prefix)
+    # WINEDEBUG=fixme-all drops the noisy fixme channel but keeps err:/warn: (the unhandled-
+    # exception marker we classify on). DISPLAY="" avoids GUI popups on headless hosts.
+    env = {**os.environ, "WINEPREFIX": prefix, "WINEDEBUG": "fixme-all", "DISPLAY": ""}
+    cmd = [wine, str(exe)] + [str(a) for a in argv]
+    eff_timeout = max(timeout, 10.0)                   # wine bootstraps a wineserver -> headroom
+    # wine + wineserver need many fds/threads and a large AS; don't cap AS, widen nproc.
+    preexec = _rlimits(mem_mb, int(eff_timeout) + 5, set_as=False, nproc=_nproc_cap(True))
+    rc, out, err, timed, dur = _spawn(cmd, stdin, eff_timeout, preexec, env=env)
+    m = _WINE_EXC_RE.search(err or b"")
+    code = m.group(1).decode().lower() if m else None
+    crashed = code is not None
+    name = ("EXCEPTION_" + _WINE_EXC.get(code, code.upper())) if code else None
+    return RunResult(
+        isolation="wine", crashed=crashed, timed_out=timed,
+        exit_code=(None if crashed else rc), signal=None, signal_name=name,
+        stdout=(out or b"")[:capture], stderr=(err or b"")[:capture],
+        duration_ms=dur, cmd=cmd,
+        note=None if crashed or not timed else "timed out")
+
+
 def run(exe, *, argv=(), stdin: bytes = b"", timeout: float = 10.0,
         arch: Optional[str] = None, endianness: Optional[str] = None,
         bits: Optional[int] = None, host: Optional[str] = None, mem_mb: int = 2048,
-        capture: int = 65536) -> RunResult:
+        capture: int = 65536, wineprefix: Optional[str] = None) -> RunResult:
     host = host or host_arch()
+    if _is_pe(exe):                                     # Windows PE -> Wine substrate
+        return _run_windows(exe, argv=argv, stdin=stdin, timeout=timeout, mem_mb=mem_mb,
+                            capture=capture, wineprefix=wineprefix)
     emu = None
     if arch and host and arch != host:
         emu = _qemu_for(arch, endianness, bits)
