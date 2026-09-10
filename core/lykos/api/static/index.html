@@ -1135,7 +1135,7 @@ async function showDetail(targetId){
 
               <button class="btn sm" id="heaprun" title="Run under a guard-page heap allocator (LD_PRELOAD) that catches use-after-free, double-free, heap overflow and invalid free at the exact access -- silent corruptions that don't crash. Native-arch, dynamically-linked targets.">Heap check</button>
               <button class="btn sm" id="secretrun" title="Breakpoint the comparison functions and dump both operands -- recovers the constants the program checks input against (passwords, magic bytes, tokens). Native-arch only.">Extract secrets</button>
-              <button class="btn sm" id="behaviorrun" title="Trace the security-relevant syscalls the binary makes (exec, network, file writes, anti-debug, W^X) -- a behavioral capability inventory. Native x86-64.">Behavior trace</button>
+              <button class="btn sm" id="behaviorrun" title="Trace the security-relevant syscalls the binary makes (exec, network, file writes, anti-debug, W^X) -- a behavioral capability inventory. Native x86-64 (GDB) and cross-arch (qemu-user -strace).">Behavior trace</button>
               <button class="btn sm" id="consolerun" title="Interactive detonation: run the target in the sandbox and drive it live (send/receive) to reach menus/protocols; save what you send as a seed.">Console ▸</button>
               <span class="fghint" id="strathint"></span>
             </div>
