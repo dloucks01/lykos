@@ -41,8 +41,17 @@ crashing input; many bug classes have a **derivable** input and need no fuzzing.
   overflow (CWE-122) and invalid/wild free (CWE-590) at the exact access, plus opt-in leaks
   (CWE-401). These are silent corruptions that don't SIGSEGV, so fuzzing-by-crash never sees
   them. Native-arch, dynamically-linked targets; per-arch shim under qemu is future work.
-- **[PLANNED] Dynamic taint tracking**: confirm a source→sink flow at runtime (we only do it
-  statically now) — DTA over qemu, or a lightweight taint via the debugger.
+- **[DONE] Dynamic taint tracking** (`dynamic_taint`): confirm a source→sink flow at runtime
+  (marker-based, #3). Feeds a unique ASCII marker as the program's input, runs the target under
+  the dangerous-call monitor (native GDB / cross-arch qemu-gdbstub, same routing as
+  debug_monitor), and reports a **Confirmed** flow wherever the marker turns up in a sink's
+  captured argument: input→exec (system/popen) → CWE-78, input→format (printf) → CWE-134,
+  input→string-copy source → CWE-120. Not full byte-level DTA, but a sound observation of the
+  flow the static taint only approximated; keyed by sink so it promotes the matching static
+  finding. The monitor now also captures the copy *source* string (not just its length) for the
+  match. Live-verified: cross-arch aarch64 (marker → strcpy/strcat/memcpy) and native
+  command-injection (marker → strcpy → **system**, CWE-78). ELF native + cross-arch; PE taint
+  is future work. UI: a "Dynamic taint" button.
 - **[DONE] Syscall / behavior tracing** (`behavior_trace`): trace `execve`/`connect`/`open`-for-write etc. →
   behavioral capability inventory (backdoors, anti-analysis, network beacons). Native x86-64 uses
   GDB `catch syscall`; **cross-arch now runs under qemu-user's own `-strace`** (ABI-aware for any

@@ -601,7 +601,7 @@ class Handler(BaseHTTPRequestHandler):
                          "build_poc", "poc_primitive", "build_exploit", "boundary_fuzz",
                          "synthesize_poc", "synthesize_injection", "heap_check", "root_cause",
                          "multi_debug", "debug_monitor", "extract_secrets", "behavior_trace",
-                         "cve_scan", "firmware_carve",
+                         "dynamic_taint", "cve_scan", "firmware_carve",
                          "firmware_rehost") and target_id:
                 target = s.targets.get(target_id)
                 if not target:
@@ -651,6 +651,9 @@ class Handler(BaseHTTPRequestHandler):
                 elif stage == "behavior_trace":
                     from ..analyze.debug import enqueue_behavior_trace
                     run = enqueue_behavior_trace(q, target, params=body.get("params"))
+                elif stage == "dynamic_taint":
+                    from ..analyze.debug import enqueue_taint
+                    run = enqueue_taint(q, target, params=body.get("params"))
                 elif stage == "cve_scan":
                     from ..analyze.fingerprint import enqueue_cve_scan
                     run = enqueue_cve_scan(q, target, params=body.get("params"))
