@@ -177,3 +177,101 @@ crashing input; many bug classes have a **derivable** input and need no fuzzing.
   across x86-64 / aarch64 / mips (LE+BE) / ppc, 32- & 64-bit, stripped, both byte orders, and the
   x86 / link-register (aarch64 stp, mips $ra, ppc lr) frame conventions. 32-bit sentinel,
   endianness-aware register capture + offset search, ±word ABI slack, largest-buffer attribution.
+
+## G. Static-taint channel — reach and precision
+
+The `corroborated` state is the platform's precision lever: it is what separates
+`system(argv[1])` from `system("/bin/date")`. Everything here bounds how far that lever
+reaches. Measured on the bundled corpus (20 cases / 4 CWE classes, x86-64, Ghidra 12.1.2):
+candidate recall 1.00 / fp_rate 0.571; corroborated recall 0.833 / fp_rate 0.214.
+
+- **[PLANNED] Taint is INERT on x86 (32-bit), riscv64 and s390.** `taint.ARCH_ABI` has no entry
+  for riscv64 or s390 (`_arch_key` returns None), and `x86` is present with `"args": []` because
+  cdecl passes on the stack. `analyze_program` returns an empty set for all three, so on those
+  targets *nothing* can ever be corroborated by data flow and every finding stays `candidate` —
+  the same failure argv seeding just fixed for x86-64, but arch-wide. riscv64/s390 need only an
+  ABI row (a0-a7 / r2-r6). x86 needs stack-argument tracking, which the new constant-offset
+  frame-slot support in `_apply` makes tractable: cdecl arguments are `[ESP + k]` at the call,
+  the same shape as a spill. Highest-value item in this section — it is pure reach, not a
+  precision trade, and it is squarely in the multi-arch push.
+- **[PLANNED] Verify argv seeding on non-x86-64.** The seed (`catalog.ENTRY_PARAM_SOURCES` ->
+  `analyze_program(entry_seeds=)`) is arch-independent and rides on `ARCH_ABI`, but every
+  measurement so far is x86-64. The corpus should grow an aarch64/arm case so the ARM work and
+  the taint channel are covered together rather than assumed compatible.
+- **[PLANNED] CWE-120 path-insensitivity — the 3 remaining corroborated false positives.**
+  `strcpy` behind `strlen() < sizeof`, `strncpy` bounded to `sizeof-1`, `memcpy` with a clamped
+  length: attacker bytes genuinely reach the sink, so the taint channel is right to see a flow;
+  what makes them safe is a value-range fact it does not carry. Needs bounds/value-range
+  reasoning over the same P-Code (relate the copy length to the destination's recovered frame
+  size). Biggest single precision win available, and the biggest piece of work here.
+- **[PLANNED] CWE-798 cannot be corroborated at all** — caps corroborated recall at 0.833 (5/6).
+  `hardcoded_secrets` is a string detector with no call site, so neither the reachability nor the
+  data-flow channel applies. Secrets are promoted by `synthesize_secret` (straight to poc-backed)
+  instead. Either give the string channel its own second-channel notion or exclude it from
+  corroborated-stage scoring; today the benchmark reads as a recall gap that is really a
+  structural mismatch.
+- **[PLANNED] Memory model beyond constant-offset frame slots.** `_apply` now tracks
+  `[BASE + const]` spills (which is what made argv usable at -O0), but heap buffers, computed
+  indices and aliasing are still invisible, and a `STORE` through a non-slot address drops taint.
+- **[PLANNED] `argc` is not a taint source** (deliberate — a count, not data; see
+  `ENTRY_PARAM_SOURCES`). Integer-overflow and bounds classes want it; it belongs in a size/range
+  channel rather than the data-flow one, where it would push taint through every `argc` guard.
+- **[PLANNED] `correlate.reaches_source` shares one `seen` set across a depth-limited DFS**, so a
+  function first reached at exhausted depth is never re-explored via a shorter path -> false
+  negatives in the reachability channel. Small fix (depth-aware visited set or BFS).
+
+## H. Benchmark & CI enforcement
+
+- **[PLANNED] Ghidra in CI so `eval-gate` is enforced on push.** `.github/workflows/ci.yml` runs
+  lint / typecheck / tests / packaging on 3.11 + 3.13 and installs gcc, gdb, qemu-user-static and
+  bubblewrap — but not Ghidra (~1 GB), so all three detection gates run only locally. Needs a
+  cached install step.
+- **[PLANNED] Real benchmark corpora.** The bundled 20-case corpus is a regression tripwire, not a
+  measurement. The `--juliet` and `--lava` loaders exist and are tested; wire a pinned drop in so
+  recall/precision are quoted against something external.
+- **[PLANNED] 32-bit ARM tests skip everywhere but a dev box** — `tests/test_arm.py` needs
+  `examples/re-corpus/bin/vuln_arm`, which is gitignored and built out of band, so the freshest
+  arch work has no CI coverage at all.
+
+## I. Engine correctness (found in the September 2026 audit, unfixed)
+
+None of these are hypothetical; each was read off the code, but none has a reproducer yet.
+
+- **[PLANNED] `reap()` can requeue a job whose worker is still running it.** The worker's
+  `complete()` then finds `status != 'running'`, returns False, and silently discards the result
+  while a second worker re-runs the job. Heartbeats make it unlikely, not impossible.
+- **[PLANNED] `JobQueue._emit` fires `on_event` before `COMMIT`** inside
+  `_materialize_cache_hit`/`complete`/`fail`, so an SSE/WebSocket consumer can observe an event
+  that a rollback then erases.
+- **[PLANNED] `enqueue()` cache/dedup is check-then-insert**, racy between workers. Benign
+  (duplicate work), but it defeats the dedup it exists for.
+- **[PLANNED] Temp-directory leak per request.** `_upload_target`, `_import_case` and
+  `_get_case_export` each `mkdtemp()` and only `unlink()` the file inside, never the directory.
+- **[PLANNED] `api/server.py:_create_run` is a ~90-line `elif` chain** over 25 stage names, when
+  `jobs/registry.py` already exists to dispatch by name.
+- **[PLANNED] `sandbox.run()` re-implements `classify_rc()` inline** at its tail.
+
+## J. Product-security posture (accepted risk — recorded, not scheduled)
+
+Decision (September 2026): single operator, single workstation, so these are **accepted**, not
+planned. Recorded because the threat model would change the moment a second person runs the UI,
+analyses a sample someone else supplied, or the API binds anything but loopback.
+
+- Upload filename is used unsanitised as a path (`api/server.py` `_upload_target` +
+  `api/multipart.py`), giving arbitrary file write/delete via `X-Filename: ../..`. Demonstrated.
+- No authentication and no `Origin`/`Host` check on the HTTP API or either WebSocket. WebSockets
+  are not subject to CORS, so any page the operator visits can drive `/console` (which spawns the
+  target under a PTY) or export a case. `--http` also accepts a non-loopback bind.
+- `esc()` in `api/static/index.html` escapes `& < >` but not quotes, and is used inside
+  double-quoted attributes carrying decompiler output (`title="${esc(f.signature)}"`, callee
+  names); `f.addr`/`f.id`/`s.addr` are interpolated unescaped. A crafted symbol name in an
+  analysed binary is stored XSS in the operator's UI — which, combined with the item above, is
+  the hostile-sample-to-workstation chain the README's threat model assumes.
+- `casestore._safe_extract` uses a string-prefix containment check and ignores symlink members;
+  `extractall` runs without `filter="data"`. Python 3.14's default filter blocks both, but the
+  project supports 3.11+, where it does not.
+- Sandbox: `--ro-bind / /` exposes the whole host filesystem to the detonated binary, the full
+  environment is inherited (`env=None`), and when bubblewrap is missing or fails `run()` silently
+  drops to `rlimits-only` — native execution with network access. Wine targets get no bwrap.
+- `sandbox._spawn` uses `preexec_fn` from threaded workers (`ThreadingHTTPServer` + thread pool),
+  which CPython documents as unsafe.
