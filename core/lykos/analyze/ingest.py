@@ -7,13 +7,12 @@ the stage into the job engine.
 """
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Optional
 
-from ..db.dao import RunArtifactDAO, TargetDAO
+from ..db.dao import TargetDAO
 from ..hashing import canonical_json, hash_all_file
-from ..jobs.registry import register_stage
+from ..jobs.registry import cached_output_json, register_stage
 from .triage import TOOL, TOOL_VERSION, build_triage
 
 INGEST_TRIAGE_STAGE = "ingest_triage"
@@ -38,16 +37,10 @@ def backfill_triage_denorm(store, target_id: str, run_id: str) -> bool:
     """
     if store.targets.get(target_id).arch is not None:
         return False
-    for link in RunArtifactDAO(store.conn).list_by_run(run_id):
-        if link.role != "output":
-            continue
-        try:
-            rec = json.loads(store.content.get_bytes(link.artifact_sha256))
-        except Exception:
-            continue
-        if isinstance(rec, dict) and "arch" in rec and "entropy" in rec:
-            _apply_triage_denorm(store.targets, target_id, rec)
-            return True
+    rec = cached_output_json(store, run_id)
+    if isinstance(rec, dict) and "arch" in rec and "entropy" in rec:
+        _apply_triage_denorm(store.targets, target_id, rec)
+        return True
     return False
 
 
@@ -89,7 +82,8 @@ def ingest_triage_stage(ctx) -> dict:
 
 def register() -> None:
     register_stage(INGEST_TRIAGE_STAGE, ingest_triage_stage, resource_class="quick",
-                   tool=TOOL, tool_version=TOOL_VERSION)
+                   tool=TOOL, tool_version=TOOL_VERSION,
+                   on_cache_hit=backfill_triage_denorm)
 
 
 def enqueue_triage(queue, target, *, force: bool = False):

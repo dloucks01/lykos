@@ -76,3 +76,27 @@ def test_decode_xarch_maps_hits_to_native_shape():
     assert out["strcpy"]["kind"] == "copy" and out["strcpy"]["length"] == 200
     assert out["strcpy"]["caller_name"] is None
     assert out["sprintf"]["kind"] == "format" and out["sprintf"]["fmt"] == "%s%n"
+
+
+_ARGV_VULN = ("#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n"
+              "int main(int argc,char**argv){char in[64];\n"
+              "  if(argc>1 && !strcmp(argv[1],\"go\")) system(\"echo unlocked\");\n"
+              "  if(fgets(in,sizeof in,stdin)){}\n  return 0;}\n")
+
+
+@pytest.mark.skipif(not monitor._locate_gdb() or sandbox.host_arch() != "x86-64",
+                    reason="needs gdb on x86-64")
+def test_monitor_delivers_argv_even_with_stdin(gcc, tmp_path):
+    """Regression: `set args X` then `run < file` makes gdb reset args to empty, silently
+    dropping argv when a stdin file is also supplied. The monitor must still deliver argv."""
+    c = tmp_path / "a.c"; c.write_text(_ARGV_VULN)
+    b = tmp_path / "a"
+    if subprocess.run([gcc, "-O0", str(c), "-o", str(b)],
+                      capture_output=True, check=False).returncode:
+        pytest.skip("build failed")
+    # argv reaches system() AND a stdin file is present at the same time
+    r = monitor.run_monitor(str(b), ["system", "fgets"], "x86-64",
+                            argv=["go"], stdin=b"A" * 64, timeout=20)
+    assert r["ok"], r.get("note")
+    execs = [h for h in r["hits"] if h["kind"] == "exec"]
+    assert execs and "echo unlocked" in execs[0]["cmd"]

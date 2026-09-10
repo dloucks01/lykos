@@ -7,13 +7,51 @@ from __future__ import annotations
 
 from ..db.dao import CallEdgeDAO, FunctionDAO, StringDAO, TargetDAO
 from ..hashing import canonical_json
-from ..jobs.registry import register_stage
+from ..jobs.registry import cached_output_json, register_stage
 from . import ghidra
 
 DISASSEMBLE_STAGE = "disassemble"
 TOOL = "ghidra"
 TOOL_VERSION = "ghidra-headless-1"
 _TIMEOUT = 1800
+
+
+def _edges_from_funcs(funcs) -> list:
+    edges = []
+    for f in funcs:
+        for c in f.get("calls", []):
+            edges.append({"src_addr": f.get("addr"), "site_addr": c.get("site_addr"),
+                          "dst_addr": c.get("dst_addr"), "dst_name": c.get("dst_name"),
+                          "external": c.get("external")})
+    return edges
+
+
+def _persist_analysis(conn, target_id: str, result: dict) -> tuple:
+    """Write the recovered functions / call edges / strings onto a target row. Shared by the
+    stage body and the cache-hit reprojection so both project identical DB state."""
+    funcs = result.get("functions", [])
+    FunctionDAO(conn).replace_for_target(target_id, funcs)
+    edges = _edges_from_funcs(funcs)
+    CallEdgeDAO(conn).replace_for_target(target_id, edges)
+    strings = result.get("strings", [])
+    StringDAO(conn).replace_for_target(target_id, strings)
+    return funcs, edges, strings
+
+
+def reproject_disassemble(store, target_id: str, run_id: str) -> bool:
+    """Rebuild a target row's function/call-edge/string rows from a disassemble run's cached
+    output. A content-addressed cache hit clones the ghidra-analysis artifact but never re-runs
+    the body, so a freshly uploaded copy of the same bytes (e.g. the same binary in a second
+    case) has none of these rows -- and consumers (the native runtime monitor's sink resolution,
+    CWE detection, the call-graph UI) would see an empty program. Returns True if it rebuilt."""
+    if CallEdgeDAO(store.conn).list_by_target(target_id) or \
+            FunctionDAO(store.conn).list_by_target(target_id):
+        return False
+    result = cached_output_json(store, run_id)
+    if not isinstance(result, dict) or "functions" not in result:
+        return False
+    _persist_analysis(store.conn, target_id, result)
+    return True
 
 
 def disassemble_stage(ctx) -> dict:
@@ -34,19 +72,8 @@ def disassemble_stage(ctx) -> dict:
     ctx.check_cancel()
 
     result = ghidra.parse_result(out)
-    funcs = result.get("functions", [])
-    FunctionDAO(ctx.conn).replace_for_target(target.id, funcs)
-
-    # call graph + xrefs (reachability + taint sinks for Phase 3)
-    edges = []
-    for f in funcs:
-        for c in f.get("calls", []):
-            edges.append({"src_addr": f.get("addr"), "site_addr": c.get("site_addr"),
-                          "dst_addr": c.get("dst_addr"), "dst_name": c.get("dst_name"),
-                          "external": c.get("external")})
-    CallEdgeDAO(ctx.conn).replace_for_target(target.id, edges)
-    strings = result.get("strings", [])
-    StringDAO(ctx.conn).replace_for_target(target.id, strings)
+    # functions + call graph/xrefs (reachability + taint sinks for Phase 3) + strings
+    funcs, edges, strings = _persist_analysis(ctx.conn, target.id, result)
 
     sha = ctx.put_artifact("ghidra-analysis", data=canonical_json(result))
     ctx.emit("re.done", payload={"functions": len(funcs), "call_edges": len(edges),
@@ -59,7 +86,8 @@ def disassemble_stage(ctx) -> dict:
 
 def register() -> None:
     register_stage(DISASSEMBLE_STAGE, disassemble_stage, resource_class="cpu",
-                   tool=TOOL, tool_version=TOOL_VERSION, timeout=_TIMEOUT)
+                   tool=TOOL, tool_version=TOOL_VERSION, timeout=_TIMEOUT,
+                   on_cache_hit=reproject_disassemble)
 
 
 def enqueue_disassemble(queue, target, *, force: bool = False):
