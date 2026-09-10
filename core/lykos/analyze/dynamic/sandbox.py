@@ -29,7 +29,8 @@ CRASH_SIGNALS = {
 _QEMU = {"x86-64": "x86_64", "x86": "i386", "aarch64": "aarch64", "arm": "arm",
          "mips": "mips", "mipsel": "mipsel", "mips64": "mips64", "ppc": "ppc",
          "ppc64": "ppc64", "riscv": "riscv64", "riscv64": "riscv64", "s390": "s390x",
-         "sparc": "sparc", "sh": "sh4", "m68k": "m68k", "loongarch": "loongarch64"}
+         "sparc": "sparc", "sparcv9": "sparc64", "sh": "sh4", "m68k": "m68k",
+         "loongarch": "loongarch64"}
 _HOST = {"x86_64": "x86-64", "amd64": "x86-64", "aarch64": "aarch64", "arm64": "aarch64",
          "armv7l": "arm", "mips": "mips", "ppc64": "ppc64", "ppc64le": "ppc64",
          "riscv64": "riscv64"}
@@ -91,6 +92,8 @@ def _qemu_for(arch, endianness=None, bits=None) -> Optional[str]:
         suf = "ppc64le"
     elif arch == "riscv":
         suf = "riscv32" if bits == 32 else "riscv64"
+    elif arch == "sparc" and bits == 64:      # EM_SPARC with a 64-bit class -> v9
+        suf = "sparc64"
     return shutil.which("qemu-" + suf) if suf else None
 
 
