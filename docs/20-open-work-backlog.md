@@ -86,6 +86,16 @@ crashing input; many bug classes have a **derivable** input and need no fuzzing.
 
 ## C2. Execution environment
 
+- **[DONE] Windows PE execution substrate (Wine)**: `sandbox.run` detects a PE by image magic and runs it
+  under Wine (persistent WINEPREFIX, rlimits tier, timeout, process-group kill), classifying guest
+  crashes from Wine's `Unhandled exception code cXXXXXXXX` (NT status → ACCESS_VIOLATION/STACK_
+  OVERFLOW/…). Routing is by magic in the shared choke point, so **`dynamic_run` and full fuzzing**
+  work on PEs unchanged. Optional tool (like Ghidra/angr): absent → `unsupported-windows`, not a
+  false result. Live-verified on `vuln_win64.exe`: clean run, an access-violation crash → Confirmed
+  CWE-119, and a fuzz campaign that found + minimized (1100→619B) the crash. Scope so far is
+  execution + crash detection + fuzzing; **[PLANNED]** the monitor / behavior_trace on PE would need
+  Win32 API hooking (`WINEDEBUG=+relay` parse, or a Detours-style shim) — a separate effort. Wine is
+  ~150–300ms/exec so PE fuzzing is slower than native.
 - **[DONE] Interactive detonation console** (`/console` WebSocket): a GUI panel to run the target in the sandbox
   with chosen argv/stdin/env and do live send/receive, so an analyst can reach code behind
   menus or a protocol handshake (the reachability limit the synthesizer/monitor hit). A

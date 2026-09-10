@@ -178,3 +178,41 @@ def test_dynamic_stage_file_input_mode(store, case, pool, gcc, tmp_path):
     drs = DynResultDAO(store.conn).list_by_target(target.id)
     assert any(d.crashed and d.signal_name == "SIGSEGV" for d in drs)   # bad file crashed
     assert any(not d.crashed for d in drs)                             # good file did not
+
+
+# --- Windows PE substrate via Wine (optional, like qemu-user for cross-arch ELF) -------------
+import os
+
+_WIN64 = os.path.join(os.path.dirname(__file__), "..", "examples", "re-corpus", "bin",
+                      "vuln_win64.exe")
+
+
+def test_is_pe_detects_pe_vs_elf():
+    assert sandbox._is_pe(_WIN64) if os.path.exists(_WIN64) else True
+    # an ELF is not a PE
+    assert not sandbox._is_pe("/bin/true")
+    # too-short / non-MZ content
+    import tempfile
+    with tempfile.NamedTemporaryFile() as f:
+        f.write(b"not an exe"); f.flush()
+        assert not sandbox._is_pe(f.name)
+
+
+@pytest.mark.skipif(not os.path.exists(_WIN64) or not sandbox._wine(),
+                    reason="needs the win64 corpus PE and wine")
+def test_wine_runs_pe_and_detects_crash():
+    # normal run: the pin argv prints and exits cleanly under wine
+    r = sandbox.run(_WIN64, argv=["4242"], timeout=40)
+    assert r.isolation == "wine" and not r.crashed and not r.timed_out
+    assert b"hello, 4242" in r.stdout
+    # overflow: a long argv corrupts the return address -> Wine unhandled access violation
+    r2 = sandbox.run(_WIN64, argv=["A" * 4000], timeout=40)
+    assert r2.crashed and r2.signal_name == "EXCEPTION_ACCESS_VIOLATION"
+
+
+def test_wine_absent_is_reported_not_crashed(monkeypatch):
+    # when wine isn't installed, a PE run is reported unsupported (not a false crash/clean)
+    monkeypatch.setattr(sandbox, "_wine", lambda: None)
+    r = sandbox._run_windows("/nonexistent.exe", argv=[], stdin=b"", timeout=5,
+                             mem_mb=512, capture=4096, wineprefix=None)
+    assert r.isolation == "unsupported-windows" and not r.crashed and "wine" in r.note
