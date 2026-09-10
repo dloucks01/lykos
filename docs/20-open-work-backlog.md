@@ -13,11 +13,11 @@ crashing input; many bug classes have a **derivable** input and need no fuzzing.
 - **[DONE] Directed overflow-PoC synthesis** (`synthesize_poc`): from a static CWE-121 (recovered
   stack frame → buffer size + offset), synthesize the overflow input, auto-detect the input
   channel, detonate once, build a verified L1 PoC. Feeds L2/L3 unchanged.
-- **[PLANNED] Command-injection PoC synthesis** (CWE-78): for a reachable `system`/`popen`/`exec*`
+- **[DONE] Command-injection PoC synthesis** (`synthesize_injection`) (CWE-78): for a reachable `system`/`popen`/`exec*`
   whose argument is input-derived, construct an input that injects `; id` and confirm dynamically.
-- **[PLANNED] Format-string PoC synthesis** (CWE-134): for a reachable `printf(user)`, build a
+- **[DONE] Format-string PoC synthesis** (`synthesize_injection`) (CWE-134): for a reachable `printf(user)`, build a
   `%p…%n` payload; confirm the leak/write dynamically.
-- **[PLANNED] Path-traversal PoC synthesis** (CWE-22): `../../etc/passwd` into a reachable
+- **[DONE] Path-traversal PoC synthesis** (`synthesize_injection`) (CWE-22): `../../etc/passwd` into a reachable
   `fopen(user)`; confirm the out-of-tree open.
 - **[PLANNED] Secret-extraction "PoC"** (CWE-798/321): already found statically — package the
   extracted key/credential as the demonstrating artifact.
