@@ -125,3 +125,120 @@ def build(target_bytes: bytes, input_bytes: bytes, meta: dict, stderr: bytes,
             _add(tar, "poc/PRIMITIVE.txt", _primitive_txt(primitive))
         _add(tar, "poc/README.txt", readme)
     return buf.getvalue()
+
+
+# ------------------------------------------------------------------ secret-extraction PoC
+# The offline re-extractor shipped in the bundle: it re-derives each secret from the binary
+# alone (seek the recorded file offset, read the C-string; fall back to a printable-run scan),
+# proving the credential is really embedded -- deterministically, with NO execution of the
+# target. Pure stdlib so it runs on any air-gapped box.
+_EXTRACT_PY = r'''#!/usr/bin/env python3
+"""Re-extract the hard-coded secret(s) from the target binary -- offline, no execution."""
+import json, os, sys, re
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+TARGET = sys.argv[1] if len(sys.argv) > 1 else os.path.join(HERE, "target.bin")
+SECRETS = json.load(open(os.path.join(HERE, "secrets.json")))
+blob = open(TARGET, "rb").read()
+
+def cstr_at(off):
+    end = blob.find(b"\x00", off)
+    return blob[off:(end if end >= 0 else len(blob))]
+
+ok = 0
+for s in SECRETS:
+    want = s["value"].encode("latin-1", "replace")
+    got, how = None, None
+    off = s.get("file_offset")
+    if off is not None and 0 <= off <= len(blob):
+        cand = cstr_at(off)
+        if cand.startswith(want) or want in cand:
+            got, how = cand.split(b"\x00", 1)[0], "offset 0x%x" % off
+    if got is None:                                    # content scan fallback
+        i = blob.find(want)
+        if i >= 0:
+            got, how = cstr_at(i).split(b"\x00", 1)[0], "found at 0x%x" % i
+    label = "%s [%s]" % (s.get("title") or "secret", s.get("cwe") or "")
+    if got is not None and want in got:
+        ok += 1
+        print("[+] %s (%s):\n      %s" % (label, how, got.decode("latin-1", "replace")))
+    else:
+        print("[-] %s: NOT found in this binary" % label)
+print("\n%d/%d secret(s) re-extracted from the binary." % (ok, len(SECRETS)))
+sys.exit(0 if ok else 2)
+'''
+
+
+def _secret_readme(meta: dict, secrets: list) -> bytes:
+    lines = [
+        "LYKOS PROOF-OF-CONCEPT BUNDLE  (hard-coded secret extraction)",
+        "============================================================",
+        "Level L0-secret: a demonstrated finding -- the credential is embedded in the binary",
+        "and is recoverable offline, deterministically, WITHOUT running the target.",
+        "",
+        f"Target sha256: {meta.get('target_sha256')}    arch: {meta.get('arch')}",
+        "",
+        "WHAT THIS IS",
+        "  Proof that a secret (credential / key / token) is baked into the binary. Anyone can",
+        "  independently recover it from target.bin alone -- no execution, no fuzzing, no this",
+        "  tool. That extractability IS the vulnerability (CWE-798 / CWE-321): the secret ships",
+        "  to every holder of the binary and cannot be rotated without a rebuild.",
+        "",
+        "HOW TO RUN  (safe -- it only reads the file; it does NOT execute the target)",
+        "  $ tar -xzf <bundle>.tar.gz && cd poc && sh ./runner.sh",
+        "  Success = the secret(s) below are printed back, re-derived from the binary.",
+        "",
+        "EXTRACTED SECRET(S)",
+    ]
+    for s in secrets:
+        loc = ("file offset 0x%x" % s["file_offset"]) if s.get("file_offset") is not None \
+            else "by content scan"
+        lines += [f"  - {s.get('title')} [{s.get('cwe')}] @ {loc}",
+                  f"      {s.get('value')}"]
+    lines += [
+        "",
+        "FILES",
+        "  target.bin   - the exact analyzed binary (self-contained)",
+        "  secret.txt   - the extracted secret(s), human-readable",
+        "  secrets.json - machine-readable: value, cwe, file offset",
+        "  extract.py   - re-derives the secret(s) from target.bin (the reproducer)",
+        "  runner.sh    - runs extract.py for you",
+        "  meta.json    - target hash, arch, tool version",
+        "",
+        "REMEDIATION",
+        "  Remove the secret from the source; load it at runtime from a secrets manager or",
+        "  an operator-supplied config/env; rotate the exposed credential immediately.",
+        "",
+        "Authorized use only.",
+    ]
+    return ("\n".join(lines) + "\n").encode()
+
+
+def build_secret(target_bytes: bytes, secrets: list, meta: dict) -> bytes:
+    """Bundle a hard-coded-secret PoC: the binary, the extracted secret(s), and a pure-stdlib
+    offline re-extractor that proves the credential is embedded (no target execution).
+
+    `secrets` = [{value, cwe, title, severity, file_offset|None}] (verified re-extractable).
+    """
+    txt = ["Hard-coded secrets extracted from the target binary", "=" * 51, ""]
+    for s in secrets:
+        loc = ("file offset 0x%x" % s["file_offset"]) if s.get("file_offset") is not None \
+            else "content scan"
+        txt += [f"{s.get('title')} [{s.get('cwe')} / {s.get('severity')}]  ({loc}):",
+                f"    {s.get('value')}", ""]
+    secrets_json = [{"value": s["value"], "cwe": s.get("cwe"), "title": s.get("title"),
+                     "severity": s.get("severity"), "file_offset": s.get("file_offset")}
+                    for s in secrets]
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        _add(tar, "poc/target.bin", target_bytes, mode=0o755)
+        _add(tar, "poc/secret.txt", ("\n".join(txt)).encode())
+        _add(tar, "poc/secrets.json", json.dumps(secrets_json, indent=2).encode())
+        _add(tar, "poc/extract.py", _EXTRACT_PY.encode(), mode=0o755)
+        _add(tar, "poc/runner.sh",
+             (b'#!/bin/sh\n# Re-extract the embedded secret(s). Reads the file only; does not '
+              b'execute it.\ncd "$(dirname "$0")"\npython3 ./extract.py ./target.bin\n'),
+             mode=0o755)
+        _add(tar, "poc/meta.json", json.dumps(meta, indent=2, sort_keys=True).encode())
+        _add(tar, "poc/README.txt", _secret_readme(meta, secrets))
+    return buf.getvalue()

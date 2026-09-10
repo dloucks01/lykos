@@ -9,6 +9,8 @@ from .inject_stage import INJECT_STAGE, enqueue_inject  # noqa: F401
 from .inject_stage import register as _register_inject
 from .primitive_stage import PRIMITIVE_STAGE, enqueue_primitive  # noqa: F401
 from .primitive_stage import register as _register_prim
+from .secret_stage import SECRET_STAGE, enqueue_secret  # noqa: F401
+from .secret_stage import register as _register_secret
 from .stage import BUILD_POC_STAGE, enqueue_build_poc  # noqa: F401
 from .stage import register as _register
 from .synthesize_stage import SYNTH_STAGE, enqueue_synthesize  # noqa: F401
@@ -21,3 +23,4 @@ def register() -> None:
     _register_exploit()
     _register_synth()
     _register_inject()
+    _register_secret()

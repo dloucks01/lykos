@@ -19,8 +19,20 @@ crashing input; many bug classes have a **derivable** input and need no fuzzing.
   `%p…%n` payload; confirm the leak/write dynamically.
 - **[DONE] Path-traversal PoC synthesis** (`synthesize_injection`) (CWE-22): `../../etc/passwd` into a reachable
   `fopen(user)`; confirm the out-of-tree open.
-- **[PLANNED] Secret-extraction "PoC"** (CWE-798/321): already found statically — package the
-  extracted key/credential as the demonstrating artifact.
+- **[DONE] Secret-extraction "PoC"** (`synthesize_secret`) (CWE-798/321): a hard-coded credential
+  needs no crash and no fuzzing — it is already in the binary, so the demonstrating artifact is the
+  secret itself (the deterministic analog of a crash reproducer). The stage re-runs the static
+  detector's exact predicate (so dedup keys match and the existing candidate is **promoted**, not
+  duplicated), locates each secret's concrete **byte offset** in the file, **verifies** it by
+  re-extracting those exact bytes, and packages a self-contained PoC bundle: the binary, the
+  extracted secret(s), and a **pure-stdlib offline re-extractor** (`extract.py`) any analyst can run
+  to independently recover the credential from the binary alone — no execution, no fuzzing, no this
+  tool. The finding is promoted to **poc-backed** with a verified `L0-secret` PoC. Safe (reads the
+  file only; never runs the target) and falsifiable (the reproducer reports failure on a binary that
+  lacks the secret). UI: a "Package secret PoC" button. Live-verified end-to-end: a binary with a
+  planted AWS key + DB password → both candidates promoted to poc-backed, and the bundle pulled from
+  the live artifact store re-extracts both secrets offline. Honest limit: it proves the credential is
+  embedded and recoverable; whether it is still live on a real service is out of scope (rotate it).
 
 ## B. Dynamic detection of classes the crash-only pipeline misses
 
