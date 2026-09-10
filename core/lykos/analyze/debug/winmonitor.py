@@ -35,9 +35,10 @@ def supported() -> bool:
     return winapi.supported()
 
 
-def parse(text, tid, lo, hi):
-    """Dangerous-sink calls the target makes directly (thread + ret-in-range), with the concrete
-    argument captured -- the first decoded string (command / URL / format / src / module)."""
+def parse(text, maps):
+    """Dangerous-sink calls the target makes directly (on one of its mapping threads, ret in that
+    mapping's range), with the concrete argument captured -- the first decoded string (command /
+    URL / format / src)."""
     hits = []
     for line in text.splitlines():
         m = winapi._CALL.match(line)
@@ -45,7 +46,7 @@ def parse(text, tid, lo, hi):
             continue
         ltid, fn, args, ret = m.group(1), m.group(2), m.group(3), int(m.group(4), 16)
         cat = _CAT.get(fn)
-        if not cat or (tid is not None and ltid != tid) or not (lo <= ret < hi):
+        if not cat or not winapi._in_target(maps, ltid, ret):
             continue
         if cat == "exec" and winapi._is_wine_helper(winapi._first_str(args)):
             continue                                     # Wine's own service startup, not target
@@ -63,4 +64,4 @@ def monitor(exe, *, argv=(), stdin: bytes = b"", timeout: float = 40.0, winepref
     r = winapi._relay(exe, argv=argv, stdin=stdin, timeout=timeout, wineprefix=wineprefix)
     if not r.get("ok"):
         return r
-    return {"ok": True, "hits": parse(r["text"], r["tid"], r["lo"], r["hi"])}
+    return {"ok": True, "hits": parse(r["text"], r["maps"])}

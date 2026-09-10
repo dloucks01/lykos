@@ -175,9 +175,9 @@ _RELAY = (
 
 
 def test_winapi_parse_attributes_to_target_thread_and_range():
-    tm = winapi._target_map(_RELAY, "vuln.exe")
-    assert tm and tm[0] == "0100" and tm[1] == 0x140000000 and tm[2] == 0x140041000
-    ev = winapi.parse(_RELAY, *tm)
+    maps = winapi._target_maps(_RELAY, "vuln.exe")
+    assert maps == [("0100", 0x140000000, 0x140041000)]
+    ev = winapi.parse(_RELAY, maps)
     execs = {e["detail"] for e in ev if e["category"] == "exec"}
     nets = [e for e in ev if e["category"] == "network"]
     # system("echo pwn") + CreateProcessW(evilcmd) kept; the msvcrt-internal call (ret out of
@@ -186,12 +186,38 @@ def test_winapi_parse_attributes_to_target_thread_and_range():
     assert len(nets) == 1 and nets[0]["api"] == "connect"
 
 
+def test_winapi_multi_mapping_attributes_both():
+    # new-Wine maps a DYNAMICBASE exe twice (loader inspection + real run on another thread);
+    # a call on the SECOND mapping's thread/range must be attributed to the target
+    txt = ('0024:trace:module:map_image_into_view mapping PE file L"t.exe" at 0x110000-0x132000\n'
+           '0128:trace:module:map_image_into_view mapping PE file L"t.exe" at 0x140000000-0x140022000\n'
+           '0128:Call advapi32.RegCreateKeyExW(ffffffff80000001,140004000 '
+           'L"Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Run",0,0,0,2,0,7ff,0) ret=140002000\n'
+           '002c:Call advapi32.RegCreateKeyExW(ffffffff80000002,0 L"Hardware\\\\Description",0) ret=140005000\n')
+    ev = winapi.parse(txt, winapi._target_maps(txt, "t.exe"))
+    keys = [e["detail"] for e in ev if e["category"] == "regkey"]
+    assert keys == ["HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run"]  # 2nd map; noise off
+
+
+def test_winapi_registry_file_capture():
+    txt = ('0100:trace:module:map_image_into_view mapping PE file L"t.exe" at 0x400000-0x410000\n'
+           '0100:Call advapi32.RegSetValueExW(38,140004074 L"EvilPayload",0,1,14,18) ret=401000\n'
+           '0100:Call KERNEL32.CreateFileW(140 L"C:\\\\tmp\\\\drop.dat",40000000,0) ret=402000\n'
+           '0100:Call KERNEL32.CreateFileW(140 L"C:\\\\readonly",80000000,0) ret=402100\n'
+           '0100:Call KERNEL32.DeleteFileW(140 L"C:\\\\old.dat") ret=403000\n')
+    ev = winapi.parse(txt, [("0100", 0x400000, 0x410000)])
+    files = {e["detail"]: e["write"] for e in ev if e["category"] == "file"}
+    assert files["C:\\tmp\\drop.dat"] is True and files["C:\\readonly"] is False   # GENERIC_WRITE
+    assert any(e["detail"] == "C:\\old.dat" for e in ev if e["category"] == "delete")
+    assert any(e["detail"] == "EvilPayload" for e in ev if e["category"] == "regvalue")
+
+
 def test_winapi_helper_exec_filtered():
     # a Wine service exe on the target thread is still dropped by the helper blocklist
     txt = ('0100:trace:module:map_image_into_view mapping PE file L"t.exe" at 0x400000-0x410000\n'
            '0100:Call KERNEL32.CreateProcessW(0,L"plugplay.exe",0) ret=401000\n'
            '0100:Call msvcrt.system(0 "real") ret=402000\n')
-    ev = winapi.parse(txt, "0100", 0x400000, 0x410000)
+    ev = winapi.parse(txt, [("0100", 0x400000, 0x410000)])
     assert [e["detail"] for e in ev if e["category"] == "exec"] == ["real"]
 
 
@@ -222,3 +248,44 @@ def test_winapi_win32_runs_or_reports_wow64_gap():
         assert "events" in r                            # i386 runtime present -> it traced
     else:
         assert "32-bit" in (r.get("note") or "")        # honest launch-failure report
+
+
+_PERSIST_C = r"""
+#include <windows.h>
+int main(void){
+    HKEY k;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER,
+            L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+            0,NULL,0,KEY_SET_VALUE,NULL,&k,NULL)==ERROR_SUCCESS){
+        const wchar_t *c=L"C:\\evil.exe";
+        RegSetValueExW(k,L"EvilPayload",0,REG_SZ,(const BYTE*)c,(lstrlenW(c)+1)*2);
+        RegCloseKey(k);
+    }
+    HANDLE h=CreateFileW(L"C:\\windows\\temp\\dropped.dat",GENERIC_WRITE,0,NULL,
+                         CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL,NULL);
+    if(h!=INVALID_HANDLE_VALUE){DWORD w;WriteFile(h,"p",1,&w,NULL);CloseHandle(h);}
+    DeleteFileW(L"C:\\windows\\temp\\old.dat");
+    return 0;
+}
+"""
+
+
+@pytest.mark.skipif(not shutil.which("x86_64-w64-mingw32-gcc") or not winapi.supported(),
+                    reason="needs mingw + wine")
+def test_winapi_live_persistence_and_file_ops(tmp_path):
+    """A PE that writes a Run key + drops/deletes files: the target's persistence and file ops are
+    captured cleanly (Wine's own in-process session-init registry noise is not mistaken for it)."""
+    c = tmp_path / "p.c"; c.write_text(_PERSIST_C)
+    exe = tmp_path / "p.exe"
+    if subprocess.run(["x86_64-w64-mingw32-gcc", "-O2", str(c), "-o", str(exe)],
+                      capture_output=True, check=False).returncode:
+        pytest.skip("mingw build failed")
+    from lykos.analyze.debug.trace_stage import _WIN_PERSIST
+    r = winapi.trace(str(exe), argv=[], timeout=120)
+    assert r["ok"], r.get("note")
+    keys = {e["detail"] for e in r["events"] if e["category"] == "regkey" and e["detail"]}
+    persist = [k for k in keys if any(p in k.lower() for p in _WIN_PERSIST)]
+    assert persist == ["HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run"]
+    assert any(e["detail"].endswith("dropped.dat") and e["write"]
+               for e in r["events"] if e["category"] == "file")
+    assert any(e["detail"].endswith("old.dat") for e in r["events"] if e["category"] == "delete")

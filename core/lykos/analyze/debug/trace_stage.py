@@ -5,10 +5,11 @@ high-signal behaviors (outbound network, anti-debugging, self-modifying code, pr
 Deterministic. Three backends behind one stage: native x86-64 ELF under GDB `catch syscall`;
 cross-arch ELF under qemu-user's `-strace` (ABI-aware for any arch qemu supports); and Windows
 PE under Wine's `+relay` API trace (`winapi`, the Windows analog -- process exec, network egress,
-W^X, self-injection, anti-debug). Child processes across fork aren't followed in v1; the qemu
-backend can't decode the connect() sockaddr; the PE backend attributes calls to the target by
-thread + return address into the exe's mapped range (registry/file I/O are deferred -- Wine's own
-session init populates them unpredictably; see winapi.py).
+registry autostart persistence, file writes/deletes, W^X, self-injection, anti-debug). Child
+processes across fork aren't followed in v1; the qemu backend can't decode the connect() sockaddr;
+the PE backend attributes calls to the target by thread(s) + return address into the exe's mapped
+range(s), and reports only full-path autostart-persistence keys (Wine's in-process session init
+touches the registry too, so the raw key list stays in the events artifact, not the inventory).
 """
 from __future__ import annotations
 
@@ -23,6 +24,16 @@ from . import syscalls, winapi
 TRACE_STAGE = "behavior_trace"
 TOOL = "behavior"
 TOOL_VERSION = "behavior-5"        # Windows PE Win32-API trace (exec/net/wx/inject/antidbg)
+
+
+# Registry key paths that grant code execution at logon/boot -- the classic persistence locations,
+# as the *full* path form (root + subkey). Wine's own session init creates/opens some autostart
+# containers too, but with bare relative subkeys or under CurrentControlSet\Services (which it
+# always enumerates), so those are deliberately NOT here -- only the full CurrentVersion\Run(Once),
+# Winlogon, IFEO, AppInit_DLLs forms the target writes, which Wine boot does not.
+_WIN_PERSIST = ("currentversion\\run", "currentversion\\runonce", "currentversion\\policies\\run",
+                "winlogon\\userinit", "winlogon\\shell", "image file execution options",
+                "appinit_dlls")
 
 
 def _private(ip: str) -> bool:
@@ -65,21 +76,33 @@ def _win_behavior_trace(ctx, target, p) -> dict:
         return {}
 
     ev = res.get("events", [])
-    inv = {"exec": [], "network": [], "wx": False, "inject": False, "anti_debug": False}
+    # persistence is the clean registry signal: a write under a full-path autostart key. The raw
+    # registry activity is polluted by Wine's in-process session init (BIOS/CPU/service
+    # enumeration), so we report `persistence` rather than the whole key list (the full activity
+    # stays in the events artifact). File writes/deletes are clean (Wine's own reads are write=0).
+    inv = {"exec": [], "network": [], "persistence": [], "files_written": [],
+           "deleted": [], "wx": False, "inject": False, "anti_debug": False}
     for e in ev:
         c, d = e.get("category"), e.get("detail")
         if c == "exec":
             inv["exec"].append(d or e["api"])
         elif c == "network":
             inv["network"].append(d or e["api"])
+        elif c == "regkey" and d and any(pat in d.lower() for pat in _WIN_PERSIST):
+            inv["persistence"].append(d)
+        elif c == "file" and e.get("write") and d:
+            inv["files_written"].append(d)
+        elif c == "delete" and d:
+            inv["deleted"].append(d)
         elif c == "wx":
             inv["wx"] = True
         elif c == "inject":
             inv["inject"] = True
         elif c == "antidebug":
             inv["anti_debug"] = True
-    for k in ("exec", "network"):
+    for k in ("exec", "network", "persistence", "files_written", "deleted"):
         inv[k] = sorted(set(inv[k]))
+    persist = inv["persistence"]
 
     report_sha = ctx.put_artifact("behavior-trace",
                                   data=json.dumps({"events": ev, "inventory": inv,
@@ -114,13 +137,27 @@ def _win_behavior_trace(ctx, target, p) -> dict:
                  "the PE called an anti-debug API (IsDebuggerPresent/CheckRemoteDebuggerPresent/"
                  "NtQueryInformationProcess)", "BEHAVIOR:win:antidebug")
         findings += 1
+    for key in persist:
+        _finding(fd, target, "BEHAVIOR", "high",
+                 f"Registry autostart persistence: {key[:110]}",
+                 f"the PE created/opened a known autostart persistence key ({key!r}) and wrote to "
+                 "the registry at runtime", f"BEHAVIOR:win:persist:{key[:70]}")
+        findings += 1
+    for path in inv["files_written"]:
+        _finding(fd, target, "BEHAVIOR", "low", f"File write: {path[:110]}",
+                 f"the PE opened a file for writing: {path!r}", f"BEHAVIOR:win:file:{path[:70]}")
+        findings += 1
+    for path in inv["deleted"]:
+        _finding(fd, target, "BEHAVIOR", "low", f"File deletion: {path[:110]}",
+                 f"the PE deleted a file: {path!r}", f"BEHAVIOR:win:del:{path[:70]}")
+        findings += 1
 
     ctx.emit("behavior.done", payload={"ok": True, "platform": "windows", "calls": len(ev),
              "inventory": inv, "findings": findings, "report": report_sha,
              "note": None if ev else "no monitored Win32 API calls observed on this input"})
     ctx.progress(pct=100, msg=f"{len(ev)} Win32 call(s); exec={len(inv['exec'])} "
-                 f"net={bool(inv['network'])} inject={inv['inject']} "
-                 f"antidbg={inv['anti_debug']}")
+                 f"net={bool(inv['network'])} persist={len(persist)} "
+                 f"files={len(inv['files_written'])} del={len(inv['deleted'])}")
     return {"output_shas": [report_sha], "output_kind": "behavior-trace"}
 
 

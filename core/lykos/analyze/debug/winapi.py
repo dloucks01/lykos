@@ -42,7 +42,24 @@ _INJECT = {"WriteProcessMemory", "CreateRemoteThread", "VirtualAllocEx", "QueueU
            "SetThreadContext", "NtMapViewOfSection", "NtUnmapViewOfSection"}
 _ANTIDBG = {"IsDebuggerPresent", "CheckRemoteDebuggerPresent", "NtQueryInformationProcess",
             "NtSetInformationThread"}
-_DANGER = _EXEC | _NET | _WX | _INJECT | _ANTIDBG
+# registry + file: now attributable (target mapping threads exclude Wine's session-init writes),
+# and the full key path is recovered from the subkey arg of RegCreateKey/RegOpenKey + its HKEY
+# root. Persistence is flagged from the key path; RegSetValueEx is a registry write.
+_REG_OPEN = {"RegCreateKeyExW", "RegCreateKeyExA", "RegCreateKeyW", "RegCreateKeyA",
+             "RegOpenKeyExW", "RegOpenKeyExA"}
+_REG_SET = {"RegSetValueExW", "RegSetValueExA", "RegSetValueW", "RegSetValueA"}
+_FILE_W = {"CreateFileW", "CreateFileA"}
+_FILE_DEL = {"DeleteFileW", "DeleteFileA"}
+_DANGER = (_EXEC | _NET | _WX | _INJECT | _ANTIDBG | _REG_OPEN | _REG_SET | _FILE_W | _FILE_DEL)
+
+_REG_ROOTS = {"80000000": "HKCR", "80000001": "HKCU", "80000002": "HKLM",
+              "80000003": "HKU", "80000005": "HKCC"}
+_FILE_WRITE_ACCESS = ("40000000", "10000000", "c0000000")  # GENERIC_WRITE / ALL / READ|WRITE
+
+
+def _reg_root(args):
+    tok = args.split(",", 1)[0].strip().lower()[-8:]
+    return _REG_ROOTS.get(tok, "")
 
 _CALL = re.compile(r'^\s*([0-9a-fA-F]+):Call\s+[A-Za-z0-9_]+\.([A-Za-z0-9_]+)\((.*)\)\s+'
                    r'ret=([0-9a-fA-F]+)\s*$')
@@ -96,30 +113,44 @@ def _first_str(args):
     return m.group(1) if m else None
 
 
-def _target_map(text, exe):
-    """(thread-id, lo, hi) of the target exe's own image from +module's map_image line. The
-    thread-id identifies the target PROCESS (Wine's service processes -- services/explorer/... --
-    run on other threads, and share the same numeric ImageBase, so a range check alone can't
-    separate them; the thread does)."""
+def _winpath(s):
+    """Wine relay prints wide-string backslashes escaped (`Software\\\\Microsoft`); collapse the
+    doubled backslashes so a captured registry key / file path matches on real path substrings."""
+    return s.replace("\\\\", "\\") if s else s
+
+
+def _target_maps(text, exe):
+    """All (thread-id, lo, hi) mappings of the target exe from +module's map_image lines. New-Wine
+    (WoW64) maps a DYNAMICBASE exe TWICE -- a transient loader inspection at a low base, then the
+    real run at 0x140000000 (a different thread) -- so we must attribute against every mapping,
+    not just the first. The thread-id identifies the target PROCESS (Wine's service processes run
+    on other threads and share the numeric ImageBase, so a range check alone can't separate them);
+    a tid of None (static-range fallback) matches any thread."""
     base = os.path.basename(str(exe)).lower()
-    for m in _MAP.finditer(text):
-        if m.group(2).lower() == base:
-            return m.group(1), int(m.group(3), 16), int(m.group(4), 16)
-    return None
+    out = []
+    for line in text.splitlines():                      # _MAP is ^-anchored: match per line
+        m = _MAP.match(line)
+        if m and m.group(2).lower() == base:
+            out.append((m.group(1), int(m.group(3), 16), int(m.group(4), 16)))
+    return out
 
 
-def parse(text, tid, lo, hi):
-    """Relay lines that are (a) on the target's own thread `tid` (excludes Wine's service
-    processes) and (b) a dangerous API called *directly* by the target -- caller ret inside the
-    exe's [lo,hi) range (excludes the target's own DLLs' internal calls, e.g. system()'s inner
-    CreateProcessW, on the same thread but returning into msvcrt). Returns behavior events."""
+def _in_target(maps, ltid, ret):
+    return any((tid is None or ltid == tid) and lo <= ret < hi for tid, lo, hi in maps)
+
+
+def parse(text, maps):
+    """Relay lines that are (a) on one of the target's own mapping threads (excludes Wine's
+    service processes) and (b) a dangerous API called *directly* by the target -- caller ret
+    inside that mapping's range (excludes the target's own DLLs' internal calls, e.g. system()'s
+    inner CreateProcessW, returning into msvcrt). Returns behavior events."""
     ev = []
     for line in text.splitlines():
         m = _CALL.match(line)
         if not m:
             continue
         ltid, fn, args, ret = m.group(1), m.group(2), m.group(3), int(m.group(4), 16)
-        if fn not in _DANGER or (tid is not None and ltid != tid) or not (lo <= ret < hi):
+        if fn not in _DANGER or not _in_target(maps, ltid, ret):
             continue
         s = _first_str(args)
         if fn in _EXEC:
@@ -134,6 +165,18 @@ def parse(text, tid, lo, hi):
             ev.append({"api": fn, "category": "inject", "detail": None})
         elif fn in _ANTIDBG:
             ev.append({"api": fn, "category": "antidebug", "detail": None})
+        elif fn in _REG_OPEN:
+            root, sub = _reg_root(args), _winpath(s)
+            key = (root + "\\" + sub) if (root and sub) else (sub or root)
+            if key:
+                ev.append({"api": fn, "category": "regkey", "detail": key})
+        elif fn in _REG_SET:
+            ev.append({"api": fn, "category": "regvalue", "detail": s})
+        elif fn in _FILE_W:
+            write = any(a in args.lower() for a in _FILE_WRITE_ACCESS)
+            ev.append({"api": fn, "category": "file", "detail": _winpath(s), "write": write})
+        elif fn in _FILE_DEL:
+            ev.append({"api": fn, "category": "delete", "detail": _winpath(s)})
         if len(ev) >= 2000:
             break
     return ev
@@ -158,9 +201,9 @@ def _relay(exe, *, argv, stdin, timeout, wineprefix) -> dict:
         text = proc.stderr.decode("latin-1", "ignore")
     except subprocess.TimeoutExpired as e:
         text = (e.stderr or b"").decode("latin-1", "ignore")
-    tm = _target_map(text, exe)
-    if tm:                                              # ASLR-robust: thread + runtime range
-        return {"ok": True, "text": text, "tid": tm[0], "lo": tm[1], "hi": tm[2]}
+    maps = _target_maps(text, exe)
+    if maps:                                            # ASLR-robust: thread(s) + runtime range(s)
+        return {"ok": True, "text": text, "maps": maps}
     if "wine: failed to load" in text.lower():
         # The loader could not start the image -- it never ran. Common cause: a 32-bit PE with no
         # i386 WoW64 runtime (wine: failed to load ...\syswow64\ntdll.dll). Report it honestly
@@ -172,14 +215,14 @@ def _relay(exe, *, argv, stdin, timeout, wineprefix) -> dict:
             note += (" -- it is 32-bit and the i386 WoW64 runtime is missing (install wine32: "
                      "dpkg --add-architecture i386 && apt-get install wine32:i386)")
         return {"ok": False, "note": note + "."}
-    rng = _pe_image_range(exe)                           # fallback: static ImageBase, no thread
+    rng = _pe_image_range(exe)                           # fallback: static ImageBase, any thread
     if not rng:
         return {"ok": False, "note": "could not determine the target's module range"}
-    return {"ok": True, "text": text, "tid": None, "lo": rng[0], "hi": rng[1]}
+    return {"ok": True, "text": text, "maps": [(None, rng[0], rng[1])]}
 
 
 def trace(exe, *, argv=(), stdin: bytes = b"", timeout: float = 40.0, wineprefix=None) -> dict:
     r = _relay(exe, argv=argv, stdin=stdin, timeout=timeout, wineprefix=wineprefix)
     if not r.get("ok"):
         return r
-    return {"ok": True, "events": parse(r["text"], r["tid"], r["lo"], r["hi"])}
+    return {"ok": True, "events": parse(r["text"], r["maps"])}
