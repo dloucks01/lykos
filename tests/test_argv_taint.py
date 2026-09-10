@@ -207,3 +207,85 @@ def test_frame_bases_never_overlap_argument_registers():
     for arch, abi in ARCH_ABI.items():
         overlap = set(abi.get("frame", ())) & _arg_regs(abi)
         assert not overlap, f"{arch}: frame base(s) {overlap} are also argument registers"
+
+
+# --------------------------------------------------------------- cdecl (stack-argument ABI)
+# 32-bit x86 passes everything on the stack, so ARCH_ABI["x86"]["args"] is empty and the
+# channel used to be inert for the whole architecture. Verified against Ghidra's i386 output:
+#
+#   PUSH EAX     COPY    reg:EAX:4 -> unique:0x41500:4
+#                INT_SUB reg:ESP:4 const:0x4:4 -> reg:ESP:4
+#                STORE   const:0x1a1:8 reg:ESP:4 unique:0x41500:4
+#   CALL ...
+#
+# Arguments go right-to-left, so the most recent push is argument 0. ESP-relative slot keys
+# are unusable here (the stack pointer moves), hence the explicit push model.
+def _push(src):
+    return ["COPY %s -> unique:0x41500:4" % src,
+            "INT_SUB reg:ESP:4 const:0x4:4 -> reg:ESP:4",
+            "STORE const:0x1a1:8 reg:ESP:4 unique:0x41500:4"]
+
+
+# main reads argv from [EBP+0xc] (parameter 1 after the standard prologue) and dereferences it
+_X86_LOAD_ARGV = [
+    "INT_ADD reg:EBP:4 const:0xc:4 -> unique:0x6600:4",
+    "LOAD const:0x1a1:4 unique:0x6600:4 -> unique:0x17200:4",
+    "COPY unique:0x17200:4 -> reg:EAX:4",
+]
+
+
+def _x86(instrs):
+    return {"blocks": [{"addr": _MAIN, "succ": [], "instructions": instrs}]}
+
+
+def _x86run(ir, edges, seeds={_MAIN: {1}}):
+    return taint.analyze_program({_MAIN: ir}, edges, "x86", entry_seeds=seeds)
+
+
+def test_x86_cdecl_stack_argument_reaches_sink():
+    """argv[1] loaded from [EBP+0xc], pushed, then CALL system -> argument 0 is tainted."""
+    ir = _x86([_i("0x1000", _X86_LOAD_ARGV),
+               _i("0x1004", _push("reg:EAX:4")),
+               _i("0x1008", ["CALL ram:0x9000:4"])])
+    assert _x86run(ir, [_edge("0x1008", "system")]) == {"0x1008"}
+
+
+def test_x86_channel_is_inert_without_the_entry_seed():
+    ir = _x86([_i("0x1000", _X86_LOAD_ARGV),
+               _i("0x1004", _push("reg:EAX:4")),
+               _i("0x1008", ["CALL ram:0x9000:4"])])
+    assert _x86run(ir, [_edge("0x1008", "system")], seeds=None) == set()
+
+
+def test_x86_argument_position_is_respected():
+    """strcpy(dst, src) takes its source as argument 1, so the pushes are: src, then dst.
+    A tainted DESTINATION must not flag; a tainted SOURCE must."""
+    tainted_dst = _x86([_i("0x1000", _X86_LOAD_ARGV),
+                        _i("0x1002", _push("const:0x8000:4")),    # src = literal  (arg1)
+                        _i("0x1004", _push("reg:EAX:4")),         # dst = argv[1]  (arg0)
+                        _i("0x1008", ["CALL ram:0x9000:4"])])
+    assert _x86run(tainted_dst, [_edge("0x1008", "strcpy")]) == set()
+
+    tainted_src = _x86([_i("0x1000", _X86_LOAD_ARGV),
+                        _i("0x1002", _push("reg:EAX:4")),         # src = argv[1]  (arg1)
+                        _i("0x1004", _push("const:0x8000:4")),    # dst = literal  (arg0)
+                        _i("0x1008", ["CALL ram:0x9000:4"])])
+    assert _x86run(tainted_src, [_edge("0x1008", "strcpy")]) == {"0x1008"}
+
+
+def test_x86_call_consumes_its_pushes():
+    """A CALL also pushes a return address. If pushes were not cleared per call, that return
+    address (or a previous call's arguments) would be read as the next call's argument 0."""
+    ir = _x86([_i("0x1000", _X86_LOAD_ARGV),
+               _i("0x1002", _push("reg:EAX:4")),
+               _i("0x1004", ["CALL ram:0x9000:4"]),               # consumes the tainted push
+               _i("0x1006", _push("const:0x8000:4")),             # clean argument
+               _i("0x1008", ["CALL ram:0x9100:4"])])
+    edges = [_edge("0x1004", "system"), _edge("0x1008", "system", dst="0x9100")]
+    assert _x86run(ir, edges) == {"0x1004"}                       # only the first
+
+
+def test_x86_abi_is_usable():
+    from lykos.analyze.detect.taint import ARCH_ABI, _arg_regs, _has_abi
+    assert not _arg_regs(ARCH_ABI["x86"])          # cdecl: no argument registers at all
+    assert _has_abi(ARCH_ABI["x86"])               # ...but still a usable convention
