@@ -15,7 +15,8 @@ from typing import Any, Optional
 _MACHINES = {
     0x02: "sparc", 0x03: "x86", 0x08: "mips", 0x14: "ppc", 0x15: "ppc64",
     0x16: "s390", 0x28: "arm", 0x2A: "sh", 0x04: "m68k", 0x2B: "sparcv9",
-    0x3E: "x86-64", 0xB7: "aarch64", 0xF3: "riscv", 0x101: "loongarch",
+    0x3E: "x86-64", 0xB7: "aarch64", 0xF3: "riscv", 0x102: "loongarch",
+    0x12: "sparc",          # EM_SPARC32PLUS (v8plus) -- same ISA family as EM_SPARC
 }
 _ETYPES = {0: "none", 1: "rel", 2: "exec", 3: "dyn", 4: "core"}
 

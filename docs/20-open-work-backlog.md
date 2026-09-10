@@ -213,13 +213,42 @@ candidate recall 1.00 / fp_rate 0.571; corroborated recall 0.833 / fp_rate 0.214
   while `strcpy(b,"constant")`, `printf("%s\n",b)` and `system("/bin/date")` correctly stay at
   `candidate`. (`gcc -m32 -nostdlib` builds a usable 32-bit ELF without multilib — the missing
   pieces were only the libc startup objects.)
-- **[PLANNED] Taint is still INERT on s390, sparc, sparcv9, sh, m68k and loongarch** — 6 of the
-  14 arch strings `analyze/elf.py` can emit. s390/sparc/sh/loongarch need only an `ARCH_ABI`
-  row (r2-r6, o0-o5, r4-r7, a0-a7 respectively), but the register NAMES must be read off real
-  Ghidra output first — the RISC-V row was guessed as `a0` and happened to be right, which is
-  not a method. No cross-compiler for any of them is installed here, so this needs toolchains
-  (or prebuilt corpus binaries) before it can be done honestly. m68k additionally passes
-  arguments on the stack, but the cdecl work above now gives it a model to reuse.
+- **[DONE] LoongArch, m68k and SuperH taint channels; SPARC partially.** Cross toolchains
+  installed (`gcc-{m68k,sh4,sparc64,loongarch64}-linux-gnu`) so every row below is verified
+  against real P-Code rather than guessed. Register names and calling conventions were taken
+  from Ghidra's own `.cspec` files — note the integer argument registers sit *after* the float
+  pentries in those lists, so reading the first N entries gives the wrong answer.
+    * **loongarch** — a0-a7 / a0, fp+sp frame bases. Row only; same `INT_ADD reg:fp const`
+      shape as RISC-V. argv and call-source flows both corroborate.
+    * **m68k** — no argument registers at all (SysV m68k is stack-passing, exactly like
+      cdecl), so it reuses the `stack_params`/`stack_call` model added for 32-bit x86
+      unchanged: parameters at `[A6 + 8 + 4i]` after `link A6`, arguments pushed onto SP.
+      Full argv support. Good evidence the stack abstraction generalises.
+    * **sh** — r4-r7 / r0, r14+r15 frame. Needed real engine work: SuperH stages a scratch
+      pointer instead of addressing the frame register (`mov r14,r1; add #-0x38,r1;
+      mov.l r4,@(0x3c,r1)`), so `_apply` now tracks `register -> (frame base, offset)`
+      aliases and resolves the slot to an R14-relative key. Without it SH produced no data
+      flow whatsoever. The alias dies on any other define, so a reused scratch register cannot
+      keep a stale frame identity (regression-tested).
+    * **sparc / sparcv9** — PARTIAL. Call-based sources work (`getenv() -> system()`
+      corroborates), but entry-point argv does not: Ghidra models `save` by spilling the whole
+      register window into a synthetic memory space at computed addresses
+      (`0x8000 + CWP*16*8 + n*8`) and reloading the rotated window, which redefines i0-i5 and
+      wipes the seed. Closing it needs a memory model for that computed-address space, which
+      is a much larger job than an ABI row. `args` (o0-o5, caller side) and `param_regs`
+      (i0-i5, callee side) are split correctly and ready for when it is.
+- **[WONTFIX] s390 has no taint channel because Ghidra cannot decompile it** — there is no
+  SystemZ processor module in Ghidra 12.1.2 at all, so no IR is produced and an ABI row would
+  be dead code. Revisit only if a SystemZ processor ships.
+- **[DONE] Fixed a real ELF-parser bug found while doing the above**: `analyze/elf.py` mapped
+  LoongArch to machine `0x101` (257); `EM_LOONGARCH` is **258 (0x102)**, confirmed by Ghidra's
+  loader opinion file and by a real `loongarch64-linux-gnu-gcc` binary, which triaged as
+  `em-258` (unknown) before the fix. Also added `EM_SPARC32PLUS` (18), which Ghidra maps and
+  we did not.
+- **[PLANNED] Arch coverage is still not gated.** 13 of the 14 arch strings now have a working
+  or partial channel (up from 6), but `eval-gate` only ever measures x86-64, so an arch
+  regression would trip nothing. The verification above was manual; it should become corpus
+  cases.
 - **[DONE] Verified argv seeding off x86-64** — confirmed end-to-end on riscv64, aarch64 and
   32-bit ARM. This is what surfaced the materialised-displacement bug above: the seed was
   arch-independent, but the spill tracking it depends on was not.
