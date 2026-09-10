@@ -2,16 +2,20 @@
 
 `catch syscall` / qemu-strace see only the *Linux* syscalls Wine makes translating Win32 calls,
 which is meaningless for Windows behavior. Instead we run the PE under `WINEDEBUG=+relay,+module`
-(Wine logs every inter-DLL call) and keep only the calls the TARGET module makes *directly* --
-attributed by the caller return address landing inside the exe's runtime-mapped range, which
-+module's `map_image_into_view` line gives us (so it is ASLR/relocation robust). A curated set of
-dangerous Win32 APIs then maps to behavior findings: process execution, network, registry
-persistence, W^X / self-injection, anti-debugging.
+(Wine logs every inter-DLL call) and keep only the calls the TARGET makes *directly*.
 
-Two practical necessities: (1) warm the wineserver first so Wine's own multi-process service
-startup isn't in the trace (that alone is ~750k relay lines; warm it and a trivial PE is ~4k);
-(2) relay logs Wine's own debug helpers (`GetProcAddress(__wine_dbg_*)`) and console WriteFile --
-those are dropped, and only high-signal APIs raise findings.
+Attribution is the crux, because Wine's own service processes (services/plugplay/explorer/...) are
+PE32+ images at the *same* ImageBase (0x140000000) as the target, so a return-address range check
+alone can't separate them. Two conditions isolate the target: (a) the call is on the target's own
+thread -- the thread that emits +module's `map_image_into_view` line for the exe (which also gives
+the ASLR-robust runtime range); and (b) its caller return address is inside the exe's range (drops
+the target's own DLLs' internal calls, e.g. system()'s inner CreateProcessW). A curated set of
+dangerous Win32 APIs then maps to behavior findings.
+
+Scope: process execution, network egress, W^X, self-injection, anti-debug. Registry writes and
+file I/O are deliberately omitted -- Wine's own session/CRT init populates the hardware/environment
+registry (and reads sysfs) unpredictably, and relay yields only the value name, not the full key
+path, so they can't yet be told apart from a target's real persistence write.
 """
 from __future__ import annotations
 
@@ -88,19 +92,6 @@ def _pe_image_range(exe):
         return None
 
 
-def _warm(wine, env):
-    """Fully boot the prefix (start + populate the hardware/environment registry) BEFORE the
-    traced run, synchronously, so that first-boot work isn't logged as the target's behavior --
-    it is done by Wine's own service processes, which are PE32+ images at the same ImageBase
-    (0x140000000) as the target, so a return-address filter alone can't tell them apart. Once the
-    registry is populated and persisted by wineboot, a subsequent run finds it warm and silent.
-    """
-    try:
-        subprocess.run([wine, "wineboot"], env=env, capture_output=True, timeout=180)
-    except Exception:
-        pass
-
-
 def _first_str(args):
     m = _STR.search(args)
     return m.group(1) if m else None
@@ -155,9 +146,10 @@ def trace(exe, *, argv=(), stdin: bytes = b"", timeout: float = 40.0, wineprefix
         return {"ok": False, "note": "wine not installed; cannot trace a Windows PE here"}
     prefix = wineprefix or os.path.join(tempfile.gettempdir(), "lykos-wineprefix")
     os.makedirs(prefix, exist_ok=True)
+    from ..dynamic import sandbox
     env = {**os.environ, "WINEPREFIX": prefix, "DISPLAY": ""}
     cmd = [wine, str(exe)] + [str(a) for a in argv]
-    _warm(wine, {**env, "WINEDEBUG": "-all"})               # full boot so the trace is clean
+    sandbox._ensure_wineprefix(wine, prefix)            # boot once (only if the prefix is cold)
     env["WINEDEBUG"] = "+relay,+module"
     try:
         proc = subprocess.run(cmd, input=stdin, capture_output=True, timeout=timeout, env=env)
@@ -167,8 +159,19 @@ def trace(exe, *, argv=(), stdin: bytes = b"", timeout: float = 40.0, wineprefix
     tm = _target_map(text, exe)
     if tm:                                              # ASLR-robust: thread + runtime range
         tid, lo, hi = tm
-    else:                                               # fallback: static ImageBase, no thread
-        rng = _pe_image_range(exe)
+    elif "wine: failed to load" in text.lower():
+        # The loader could not start the image -- it never ran. The common cause is a 32-bit PE
+        # with no i386 WoW64 runtime (wine: failed to load ...\syswow64\ntdll.dll). Report it
+        # honestly rather than as "no behavior". (A benign `LdrGetDllHandleEx retval=c0000135`
+        # is NOT this -- that is a normal DLL-probe miss, so we key only on the loader's message.)
+        low = text.lower()
+        note = "wine could not launch this PE"
+        if "syswow64" in low or "wine32" in low:
+            note += (" -- it is 32-bit and the i386 WoW64 runtime is missing (install wine32: "
+                     "dpkg --add-architecture i386 && apt-get install wine32:i386)")
+        return {"ok": False, "note": note + "."}
+    else:
+        rng = _pe_image_range(exe)                      # fallback: static ImageBase, no thread tid
         if not rng:
             return {"ok": False, "note": "could not determine the target's module range"}
         tid, (lo, hi) = None, rng
