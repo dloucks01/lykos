@@ -117,3 +117,33 @@ def test_build_poc_unverified_when_no_crash(store, case, pool, bins):
     assert pocs and not pocs[0].verified and pocs[0].level == "L0"
     assert not [f for f in FindingDAO(store.conn).list_by_target(target.id)
                 if f.state == "poc-backed"]
+
+
+def test_build_poc_forwards_endianness_and_bits(store, case, pool, monkeypatch, bins):
+    """_qemu_for routes ppc64->ppc64le, mips->mipsel and riscv->riscv32/64 on endianness and
+    bits. build_poc omitted both, so a little-endian ppc64 target was handed the BIG-endian
+    emulator, could not run, produced no crash, and was filed as an unverified L0 instead of
+    a verified L1 -- silently, since "did not reproduce" is a legitimate outcome.
+    """
+    if "crash" not in bins:
+        pytest.skip("no C compiler")
+    from lykos.analyze.poc import stage as poc_stage
+
+    seen = {}
+    real = poc_stage.sandbox.run
+
+    def spy(exe, **kw):
+        seen.update(kw)
+        return real(exe, **kw)
+
+    monkeypatch.setattr(poc_stage.sandbox, "run", spy)
+
+    t = ingest(store, case.id, bins["crash"], filename="crash")
+    store.targets.update_triage(t.id, arch="ppc64", endianness="little", bits=64)
+    sha = store.put_artifact(case.id, "seed", data=b"A" * 64).sha256
+    q = JobQueue(store.conn)
+    enqueue_build_poc(q, t, params={"input_sha": sha, "input_mode": "stdin"})
+    assert pool.wait_idle(60)
+
+    assert seen.get("endianness") == "little", "build_poc dropped endianness"
+    assert seen.get("bits") == 64, "build_poc dropped bits"

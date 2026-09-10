@@ -44,7 +44,12 @@ def build_poc_stage(ctx) -> dict:
         run_argv = [str(wf)]
 
     ctx.progress(msg="verifying PoC in a clean sandbox")
-    res = sandbox.run(exe, argv=run_argv, stdin=stdin, timeout=timeout, arch=target.arch)
+    # endianness/bits are load-bearing, not decoration: _qemu_for routes ppc64->ppc64le,
+    # mips->mipsel and riscv->riscv32/64 on them. Omitting them hands a little-endian target
+    # to the big-endian emulator, which cannot run it -- so the PoC "fails to reproduce" and
+    # is filed as an unverified L0 rather than a verified L1.
+    res = sandbox.run(exe, argv=run_argv, stdin=stdin, timeout=timeout, arch=target.arch,
+                      endianness=target.endianness, bits=target.bits)
     verified = res.crashed
     level = "L1" if verified else "L0"
 
