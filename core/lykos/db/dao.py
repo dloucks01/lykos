@@ -5,8 +5,10 @@ columns are (de)serialized via repository helpers.
 """
 from __future__ import annotations
 
+import sqlite3
 import time
-from typing import Optional
+from collections.abc import Sequence
+from typing import Any, Optional
 
 from ..hashing import new_id
 from .connection import transaction
@@ -29,7 +31,7 @@ from .models import (
     StringRef,
     Target,
 )
-from .repository import BaseDAO, as_bool, as_int_bool, dumps, loads
+from .repository import BaseDAO, as_bool, as_flag, as_int_bool, dumps, loads
 
 _TABLE_CASE = '"case"'  # reserved word — must be quoted everywhere
 
@@ -63,14 +65,14 @@ class CaseDAO(BaseDAO):
         self.conn.execute(f'DELETE FROM {_TABLE_CASE} WHERE id=?', (case_id,))
 
     @staticmethod
-    def _row(r) -> Case:
+    def _row(r: sqlite3.Row) -> Case:
         return Case(id=r["id"], name=r["name"], created_at=r["created_at"],
                     notes=r["notes"], engagement_ref=r["engagement_ref"])
 
 
 # ------------------------------------------------------------------------- Target (DM-12)
 class TargetDAO(BaseDAO):
-    def upsert(self, case_id: str, filename: str, sha256: str, **fields) -> Target:
+    def upsert(self, case_id: str, filename: str, sha256: str, **fields: Any) -> Target:
         """Insert, or return the existing target for (case_id, sha256), updating fields.
 
         Implements per-case dedup by content hash (IT-05).
@@ -93,7 +95,7 @@ class TargetDAO(BaseDAO):
         )
         return t
 
-    def _update_fields(self, target_id: str, fields: dict) -> None:
+    def _update_fields(self, target_id: str, fields: dict[str, Any]) -> None:
         cols, vals = [], []
         for k, v in fields.items():
             if k == "stripped":
@@ -107,7 +109,7 @@ class TargetDAO(BaseDAO):
         vals.append(target_id)
         self.conn.execute(f"UPDATE target SET {','.join(cols)} WHERE id=?", vals)
 
-    def update_triage(self, target_id: str, **fields) -> None:
+    def update_triage(self, target_id: str, **fields: Any) -> None:
         self._update_fields(target_id, fields)
 
     def delete(self, target_id: str) -> bool:
@@ -144,7 +146,7 @@ class TargetDAO(BaseDAO):
         return [self._row(r) for r in rows]
 
     @staticmethod
-    def _row(r) -> Target:
+    def _row(r: sqlite3.Row) -> Target:
         return Target(
             id=r["id"], case_id=r["case_id"], filename=r["filename"], sha256=r["sha256"],
             ingested_at=r["ingested_at"], md5=r["md5"], sha1=r["sha1"], size=r["size"],
@@ -177,7 +179,7 @@ class ArtifactDAO(BaseDAO):
         return [self._row(r) for r in rows]
 
     @staticmethod
-    def _row(r) -> Artifact:
+    def _row(r: sqlite3.Row) -> Artifact:
         return Artifact(sha256=r["sha256"], case_id=r["case_id"], kind=r["kind"],
                         rel_path=r["rel_path"], created_at=r["created_at"], size=r["size"],
                         meta=loads(r["meta_json"]))
@@ -255,7 +257,7 @@ class AnalysisRunDAO(BaseDAO):
         return self._row(r) if r else None
 
     @staticmethod
-    def _row(r) -> AnalysisRun:
+    def _row(r: sqlite3.Row) -> AnalysisRun:
         return AnalysisRun(
             id=r["id"], case_id=r["case_id"], stage=r["stage"], status=r["status"],
             created_at=r["created_at"], target_id=r["target_id"],
@@ -280,13 +282,16 @@ class EventDAO(BaseDAO):
             "INSERT INTO event(case_id,run_id,ts,level,type,payload_json) VALUES(?,?,?,?,?,?)",
             (ev.case_id, ev.run_id, ev.ts, ev.level, ev.type, dumps(ev.payload)),
         )
+        if cur.lastrowid is None:                  # AUTOINCREMENT always assigns one
+            raise RuntimeError("event insert produced no rowid")
         ev.id = int(cur.lastrowid)
         return ev
 
     def list(self, *, case_id: Optional[str] = None, run_id: Optional[str] = None,
              after_id: int = 0, limit: int = 100) -> list[Event]:
         """Cursor pagination by monotonic id (feeds the UI log panel + WS backfill)."""
-        clauses, params = ["id > ?"], [after_id]
+        clauses: list[str] = ["id > ?"]
+        params: list[Any] = [after_id]
         if case_id is not None:
             clauses.append("case_id = ?"); params.append(case_id)
         if run_id is not None:
@@ -299,13 +304,13 @@ class EventDAO(BaseDAO):
         return [self._row(r) for r in rows]
 
     @staticmethod
-    def _row(r) -> Event:
+    def _row(r: sqlite3.Row) -> Event:
         return Event(id=r["id"], case_id=r["case_id"], run_id=r["run_id"], ts=r["ts"],
                      level=r["level"], type=r["type"], payload=loads(r["payload_json"]))
 
 
 # --------------------------------------------------------------------- Function (Phase 1)
-def _frame_blob(f: dict):
+def _frame_blob(f: dict[str, Any]) -> Optional[dict[str, Any]]:
     """Fold the decompiler-recovered prototype details + stack frame into one blob:
     frame geometry + vars, plus params / calling_convention / thunk / varargs."""
     if not f.get("frame") and not f.get("params"):
@@ -419,7 +424,7 @@ class CallEdgeDAO(BaseDAO):
         return int(r["c"])
 
     @staticmethod
-    def _row(r) -> CallEdge:
+    def _row(r: sqlite3.Row) -> CallEdge:
         return CallEdge(id=r["id"], target_id=r["target_id"], created_at=r["created_at"],
                         src_addr=r["src_addr"], site_addr=r["site_addr"],
                         dst_addr=r["dst_addr"], dst_name=r["dst_name"],
@@ -459,7 +464,7 @@ class StringDAO(BaseDAO):
 
 
 # -------------------------------------------------------------------- Finding (Phase 3)
-def _rank(seq, val, default=0):
+def _rank(seq: Sequence[str], val: Optional[str], default: int = 0) -> int:
     try:
         return seq.index(val)
     except ValueError:
@@ -543,7 +548,7 @@ class FindingDAO(BaseDAO):
         return int(r["c"])
 
     @staticmethod
-    def _row(r) -> Finding:
+    def _row(r: sqlite3.Row) -> Finding:
         return Finding(id=r["id"], target_id=r["target_id"], case_id=r["case_id"],
                        dedup_key=r["dedup_key"], created_at=r["created_at"],
                        updated_at=r["updated_at"], cwe=r["cwe"], title=r["title"],
@@ -554,10 +559,14 @@ class FindingDAO(BaseDAO):
 
 # ------------------------------------------------------------------ DynResult (Phase 4)
 class DynResultDAO(BaseDAO):
-    def insert(self, target_id: str, case_id: str, *, run_id=None, input_sha=None,
-               input_mode=None, argv=None, exit_code=None, signal=None, signal_name=None,
-               crashed=False, timed_out=False, isolation=None, duration_ms=None,
-               stdout_sha=None, stderr_sha=None, note=None) -> str:
+    def insert(self, target_id: str, case_id: str, *, run_id: Optional[str] = None,
+               input_sha: Optional[str] = None,
+               input_mode: Optional[str] = None, argv: Optional[list] = None,
+               exit_code: Optional[int] = None, signal: Optional[int] = None,
+               signal_name: Optional[str] = None, crashed: bool = False,
+               timed_out: bool = False, isolation: Optional[str] = None,
+               duration_ms: Optional[int] = None, stdout_sha: Optional[str] = None,
+               stderr_sha: Optional[str] = None, note: Optional[str] = None) -> str:
         rid = new_id()
         self.conn.execute(
             "INSERT INTO dyn_result(id,target_id,case_id,run_id,input_sha,input_mode,argv,"
@@ -581,21 +590,23 @@ class DynResultDAO(BaseDAO):
         return int(r["c"])
 
     @staticmethod
-    def _row(r) -> DynResult:
+    def _row(r: sqlite3.Row) -> DynResult:
         return DynResult(id=r["id"], target_id=r["target_id"], case_id=r["case_id"],
                          created_at=r["created_at"], run_id=r["run_id"],
                          input_sha=r["input_sha"], input_mode=r["input_mode"],
                          argv=loads(r["argv"]), exit_code=r["exit_code"], signal=r["signal"],
-                         signal_name=r["signal_name"], crashed=as_bool(r["crashed"]),
-                         timed_out=as_bool(r["timed_out"]), isolation=r["isolation"],
+                         signal_name=r["signal_name"], crashed=as_flag(r["crashed"]),
+                         timed_out=as_flag(r["timed_out"]), isolation=r["isolation"],
                          duration_ms=r["duration_ms"], stdout_sha=r["stdout_sha"],
                          stderr_sha=r["stderr_sha"], note=r["note"])
 
 
 # ------------------------------------------------------------------------ Poc (Phase 6)
 class PocDAO(BaseDAO):
-    def insert(self, target_id, case_id, *, finding_id=None, level=None, verified=False,
-               signal_name=None, input_sha=None, bundle_sha=None) -> str:
+    def insert(self, target_id: str, case_id: str, *, finding_id: Optional[str] = None,
+               level: Optional[str] = None, verified: bool = False,
+               signal_name: Optional[str] = None, input_sha: Optional[str] = None,
+               bundle_sha: Optional[str] = None) -> str:
         rid = new_id()
         self.conn.execute(
             "INSERT INTO poc(id,target_id,case_id,finding_id,level,verified,signal_name,"
@@ -608,22 +619,22 @@ class PocDAO(BaseDAO):
         self.conn.execute("UPDATE poc SET finding_id=? WHERE id=?", (finding_id, poc_id))
         self.conn.commit()
 
-    def list_by_target(self, target_id) -> list[Poc]:
+    def list_by_target(self, target_id: str) -> list[Poc]:
         rows = self.conn.execute(
             "SELECT * FROM poc WHERE target_id=? ORDER BY created_at DESC", (target_id,)
         ).fetchall()
         return [self._row(r) for r in rows]
 
-    def count_by_target(self, target_id) -> int:
+    def count_by_target(self, target_id: str) -> int:
         r = self.conn.execute("SELECT COUNT(*) AS c FROM poc WHERE target_id=?",
                               (target_id,)).fetchone()
         return int(r["c"])
 
     @staticmethod
-    def _row(r) -> Poc:
+    def _row(r: sqlite3.Row) -> Poc:
         return Poc(id=r["id"], target_id=r["target_id"], case_id=r["case_id"],
                    created_at=r["created_at"], finding_id=r["finding_id"], level=r["level"],
-                   verified=as_bool(r["verified"]), signal_name=r["signal_name"],
+                   verified=as_flag(r["verified"]), signal_name=r["signal_name"],
                    input_sha=r["input_sha"], bundle_sha=r["bundle_sha"])
 
 
@@ -658,7 +669,7 @@ class ComponentEdgeDAO(BaseDAO):
         return int(r["c"])
 
     @staticmethod
-    def _row(r) -> ComponentEdge:
+    def _row(r: sqlite3.Row) -> ComponentEdge:
         return ComponentEdge(id=r["id"], case_id=r["case_id"], src_target=r["src_target"],
                              dst_target=r["dst_target"], created_at=r["created_at"],
                              kind=r["kind"], symbol=r["symbol"], detail=r["detail"])
