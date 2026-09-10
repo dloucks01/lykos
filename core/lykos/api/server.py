@@ -595,8 +595,9 @@ class Handler(BaseHTTPRequestHandler):
             if stage in (_INGEST, "disassemble", "detect_cwe", "dynamic_run", "fuzz",
                          "coverage_fuzz", "directed_fuzz", "concolic",
                          "build_poc", "poc_primitive", "build_exploit", "boundary_fuzz",
-                         "synthesize_poc", "heap_check", "root_cause", "multi_debug",
-                         "debug_monitor", "extract_secrets", "cve_scan", "firmware_carve",
+                         "synthesize_poc", "synthesize_injection", "heap_check", "root_cause",
+                         "multi_debug", "debug_monitor", "extract_secrets", "cve_scan",
+                         "firmware_carve",
                          "firmware_rehost") and target_id:
                 target = s.targets.get(target_id)
                 if not target:
@@ -658,6 +659,9 @@ class Handler(BaseHTTPRequestHandler):
                 elif stage == "synthesize_poc":
                     from ..analyze.poc import enqueue_synthesize
                     run = enqueue_synthesize(q, target, params=body.get("params"))
+                elif stage == "synthesize_injection":
+                    from ..analyze.poc import enqueue_inject
+                    run = enqueue_inject(q, target, params=body.get("params"))
                 else:
                     from ..analyze.poc import enqueue_build_poc
                     run = enqueue_build_poc(q, target, params=body.get("params"))

@@ -5,6 +5,8 @@
 """
 from .exploit_stage import EXPLOIT_STAGE, enqueue_exploit  # noqa: F401
 from .exploit_stage import register as _register_exploit
+from .inject_stage import INJECT_STAGE, enqueue_inject  # noqa: F401
+from .inject_stage import register as _register_inject
 from .primitive_stage import PRIMITIVE_STAGE, enqueue_primitive  # noqa: F401
 from .primitive_stage import register as _register_prim
 from .stage import BUILD_POC_STAGE, enqueue_build_poc  # noqa: F401
@@ -18,3 +20,4 @@ def register() -> None:
     _register_prim()
     _register_exploit()
     _register_synth()
+    _register_inject()

@@ -1128,6 +1128,7 @@ async function showDetail(targetId){
               <button class="btn sm primary" id="fuzzrun">Fuzz ▶</button>
               <span class="vsep"></span>
               <button class="btn sm" id="synthrun" title="Deterministic: synthesize the overflow input from the recovered stack frame (buffer size + offset) and detonate once -- no fuzzing. Needs Decompile first.">Synthesize PoC (no fuzz)</button>
+              <button class="btn sm" id="injectrun" title="Deterministic: probe command-injection / format-string / path-traversal on the sinks the binary imports, and confirm by effect -- no fuzzing.">Injection PoC</button>
               <button class="btn sm" id="monitorrun" title="Run under GDB with breakpoints on dangerous sinks; capture what the program passes them at runtime (command strings, copy lengths) -- finds executed commands and overflows without a crash. Native-arch only.">Runtime monitor</button>
               <button class="btn sm" id="heaprun" title="Run under a guard-page heap allocator (LD_PRELOAD) that catches use-after-free, double-free, heap overflow and invalid free at the exact access -- silent corruptions that don't crash. Native-arch, dynamically-linked targets.">Heap check</button>
               <button class="btn sm" id="secretrun" title="Breakpoint the comparison functions and dump both operands -- recovers the constants the program checks input against (passwords, magic bytes, tokens). Native-arch only.">Extract secrets</button>
@@ -1158,6 +1159,7 @@ async function showDetail(targetId){
   document.getElementById("dynrun").onclick = ()=>doDynamic(targetId);
   document.getElementById("fuzzrun").onclick = ()=>runFuzz(targetId);
   document.getElementById("synthrun").onclick = ()=>doSynthesize(targetId);
+  document.getElementById("injectrun").onclick = ()=>doInject(targetId);
   document.getElementById("monitorrun").onclick = ()=>doMonitor(targetId);
   document.getElementById("heaprun").onclick = ()=>doHeapCheck(targetId);
   document.getElementById("secretrun").onclick = ()=>doExtract(targetId);
@@ -1557,6 +1559,11 @@ async function doMonitor(tid){
   await postRun(tid, "debug_monitor", {input_mode:(mode==="none"?"stdin":mode), timeout:20},
     {status:"monitoring dangerous calls under GDB…"});
 }
+async function doInject(tid){
+  const mode = document.getElementById("dynmode").value;
+  await postRun(tid, "synthesize_injection", {input_mode:(mode==="none"?undefined:mode), timeout:8},
+    {status:"probing injection (cmdi/format/traversal) — no fuzzing…"});
+}
 async function doHeapCheck(tid){
   const mode = document.getElementById("dynmode").value;
   await postRun(tid, "heap_check", {input_mode:(mode==="none"?"stdin":mode), timeout:15},
@@ -1953,6 +1960,13 @@ function openWS(id){
         : (e.payload.findings ? `recovered ${e.payload.findings} constant(s): `+(e.payload.recovered||[]).slice(0,3).map(r=>JSON.stringify(r.value)).join(', ')
            : (e.payload.note||"no comparisons observed"));
       loadFindings(DETAIL_TID);
+    }
+    if(e.type==="inject.done" && DETAIL_TID){
+      const st=document.getElementById("fuzzstat");
+      if(st&&e.payload) st.textContent = e.payload.confirmed
+        ? `injection CONFIRMED: `+(e.payload.results||[]).map(r=>r.cwe+" via "+r.mode).join(", ")
+        : (e.payload.note||"no injection confirmed");
+      loadFindings(DETAIL_TID); loadPocs(DETAIL_TID);
     }
     if(e.type==="synth.start"){ const st=document.getElementById("fuzzstat"); if(st&&e.payload) st.textContent=`synthesizing from ${e.payload.candidates.length} recovered buffer(s)…`; }
     if(e.type==="synth.done" && DETAIL_TID){
