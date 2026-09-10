@@ -154,3 +154,56 @@ def test_unlisted_sink_falls_back_to_any_argument():
         _i("0x100c", ["CALL ram:0x9000:8"]),                # RSI (arg1) tainted by the seed
     ]}]}
     assert _run(ir, [_edge("0x100c", "gets")], {_MAIN: {1}}) == {"0x100c"}
+
+
+# ------------------------------------------------------- RISC-style constant materialisation
+# x86 folds the displacement into the address arithmetic (`INT_ADD reg:RBP const:-0x10`), but
+# RISC encodings materialise it first. Verified against Ghidra's RISC-V output:
+#
+#     COPY    const:0xffffffffffffffe0:8 -> unique:0x1000:8
+#     INT_ADD reg:s0:8 unique:0x1000:8   -> unique:0x1b500:8
+#     STORE   const:0x1b1:8 unique:0x1b500:8 reg:a1:8
+#
+# Without resolving through the unique, frame-slot tracking silently does nothing off x86 --
+# which is to say the argv seed never survives a spill on any RISC target.
+_RV_SPILL = [
+    "COPY const:0xffffffffffffffe0:8 -> unique:0x1000:8",
+    "INT_ADD reg:s0:8 unique:0x1000:8 -> unique:0x1b500:8",
+    "STORE const:0x1b1:8 unique:0x1b500:8 reg:a1:8",
+]
+_RV_RELOAD = [
+    "COPY const:0xffffffffffffffe0:8 -> unique:0xf00:8",
+    "INT_ADD reg:s0:8 unique:0xf00:8 -> unique:0x6700:8",
+    "LOAD const:0x1b1:8 unique:0x6700:8 -> unique:0x6800:8",
+    "COPY unique:0x6800:8 -> reg:a0:8",
+]
+
+
+def test_riscv_frame_slot_survives_materialised_displacement():
+    """argv (a1) spilled to [s0-0x20] and reloaded into a0 still reaches the sink."""
+    ir = {"blocks": [{"addr": _MAIN, "succ": [], "instructions": [
+        _i("0x1000", _RV_SPILL),
+        _i("0x1004", _RV_RELOAD),
+        _i("0x100c", ["CALL ram:0x9000:8"]),
+    ]}]}
+    edges = [_edge("0x100c", "system")]
+    got = taint.analyze_program({_MAIN: ir}, edges, "riscv", entry_seeds={_MAIN: {1}})
+    assert got == {"0x100c"}
+
+
+def test_riscv_abi_is_wired_up():
+    """riscv was absent from ARCH_ABI entirely, so analyze_program returned empty for every
+    RISC-V target and nothing could ever leave `candidate`."""
+    from lykos.analyze.detect.taint import ARCH_ABI, _arch_key, _arg_regs
+    assert _arch_key("riscv") == "riscv"           # the ELF parser emits "riscv" for RV32+RV64
+    assert _arg_regs(ARCH_ABI["riscv"])            # non-empty, or the channel is inert
+
+
+def test_frame_bases_never_overlap_argument_registers():
+    """R1 is the stack pointer on PowerPC and an ARGUMENT register on ARM. A shared frame-base
+    list would key spill slots on a register that changes at every call, so the sets must stay
+    per-arch and disjoint from the ABI's own argument registers."""
+    from lykos.analyze.detect.taint import ARCH_ABI, _arg_regs
+    for arch, abi in ARCH_ABI.items():
+        overlap = set(abi.get("frame", ())) & _arg_regs(abi)
+        assert not overlap, f"{arch}: frame base(s) {overlap} are also argument registers"
