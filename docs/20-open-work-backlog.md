@@ -46,6 +46,12 @@ crashing input; many bug classes have a **derivable** input and need no fuzzing.
   backend too: the native GDB `catch syscall` can't follow a forked child's exec (glibc `system()`
   forks with `clone3` and execs in the child), so it records only the spawn; the qemu backend
   follows the child and captures the exec target. `clone3` added to the native catch set.
+  **Windows PE now supported via a third backend** (`debug/winapi.py`, Wine `+relay,+module`): the
+  Windows analog, capturing the target's own Win32 calls (exec / network egress / W^X / self-
+  injection / anti-debug), attributed by the target's thread + return-address-in-exe-range so
+  Wine's own service processes (same ImageBase) are excluded. Live-verified: `system("echo
+  unlocked")` on `vuln_win64.exe` → a process-execution finding. **[PLANNED]** registry-write /
+  file-I/O attribution (Wine's session init pollutes those; relay lacks the full key path).
 
 ## C. Automated debugger ("find things", not just capture a crash)
 
