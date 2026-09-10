@@ -66,7 +66,14 @@ crashing input; many bug classes have a **derivable** input and need no fuzzing.
   name's CATALOG spec. Analyst-in-the-loop (addresses come from a non-stripped twin or manual RE).
   UI: optional "sink addrs" + "monitor argv" fields by the Runtime-monitor button. Live-verified
   on a stripped static-pie aarch64: `system=0xc5c,strcpy=0x3250,strcat=0x3220` → captured
-  `system("echo unlocked")` → CWE-78, on a symbol-less binary.
+  `system("echo unlocked")` → CWE-78, on a symbol-less binary. Verified in the GUI across the
+  corpus: stripped aarch64 / mipsel / mips_be / ppc (cross-arch) and stripped static x86-64
+  (native). Both paths are **PIE-aware**: analyst addresses are ELF vaddrs rebased by the runtime
+  load base (cross-arch: `runtime_entry − e_entry` from the gdbstub; native: `AT_ENTRY − e_entry`
+  from auxv, robust even for dynamic PIE where `starti` stops in ld.so), so they hit under ASLR.
+  Caveat: glibc string functions are IFUNCs, so their `nm` symbol is the resolver, not the impl —
+  `system` (a normal function) is the reliable address to supply on glibc; musl builds don't
+  IFUNC, so `strcpy`/`strcat` addresses work there.
 
 ## C2. Execution environment
 

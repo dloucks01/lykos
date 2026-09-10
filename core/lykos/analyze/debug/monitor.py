@@ -18,6 +18,8 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+from . import elfsyms
+
 # arg registers by arch (GDB names), in calling-convention order
 _ARGREGS = {
     "x86-64": ["rdi", "rsi", "rdx", "rcx", "r8", "r9"],
@@ -53,6 +55,7 @@ import gdb, json
 ARGREGS = %(argregs)s
 FUNCS = %(funcs)s
 ADDR_SINKS = %(addrsinks)s
+STATIC_ENTRY = %(entry)d
 INPUT_FILE = %(infile)r
 RUN_ARGS = %(runargs)r
 HITS, MAX = [], 400
@@ -106,19 +109,39 @@ class Hit(gdb.Breakpoint):
         HITS.append(rec)
         return len(HITS) >= MAX
 
+def _load_base():
+    """Load base of the main executable = AT_ENTRY (the kernel-reported runtime entry, which is
+    the *executable's* entry even under a dynamic loader) minus the static e_entry. 0 for non-PIE.
+    Robust where `starti`'s $pc is not (dynamic PIE stops in ld.so, not the program)."""
+    try:
+        for line in gdb.execute("info auxv", to_string=True).splitlines():
+            if "AT_ENTRY" in line:
+                return (int(line.split()[-1], 0) & ((1 << 64) - 1)) - STATIC_ENTRY
+    except Exception:
+        pass
+    return 0
+
 gdb.execute("set breakpoint pending on")   # sinks may live in libc (not yet loaded)
 for _n, _spec in FUNCS.items():
     try: Hit(_n, _n, _spec)             # by name (resolves via symbols / PLT)
     except Exception: pass
-for _n, (_addr, _spec) in ADDR_SINKS.items():
-    try: Hit("*" + hex(_addr), _n, _spec)   # analyst-supplied address (stripped: no symbol)
-    except Exception: pass
 gdb.execute("set pagination off")
 gdb.execute("set height 0")
+# args must be inline on `run`/`starti`: `set args X` then `run < file` makes gdb reset the
+# argument list to empty (the redirect-only form), silently dropping argv.
+_RUN = RUN_ARGS + ((" < " + INPUT_FILE) if INPUT_FILE else "")
 try:
-    # args must be inline on `run`: `set args X` followed by `run < file` makes gdb reset the
-    # argument list to empty (the redirect-only form), silently dropping argv.
-    gdb.execute("run " + RUN_ARGS + ((" < " + INPUT_FILE) if INPUT_FILE else ""))
+    if ADDR_SINKS:
+        # analyst-supplied addresses are static ELF vaddrs -> rebase by the runtime load base
+        # (PIE-aware): start at the entry so the process/auxv exist, set the breakpoints, run on.
+        gdb.execute("starti " + _RUN)
+        _base = _load_base()
+        for _n, (_addr, _spec) in ADDR_SINKS.items():
+            try: Hit("*" + hex(_addr + _base), _n, _spec)
+            except Exception: pass
+        gdb.execute("continue")
+    else:
+        gdb.execute("run " + _RUN)
 except gdb.error:
     pass
 print("LYKOS_MON " + json.dumps(HITS))
@@ -147,9 +170,13 @@ def run_monitor(exe, funcs, arch, *, argv=(), stdin=b"", timeout=20, addr_sinks=
             infile = str(d / "in.bin")
         spec = {n: CATALOG[n] for n in funcs if n in CATALOG}
         addr_spec = {n: (a, CATALOG[n]) for n, a in (addr_sinks or {}).items() if n in CATALOG}
+        # static e_entry: analyst addr_sinks are ELF vaddrs, rebased by (AT_ENTRY - e_entry) at
+        # runtime so they hit under PIE too. Read it from the ELF (0 -> no rebase).
+        entry = elfsyms.read(exe).get("entry") or 0 if addr_spec else 0
         # embed as Python literals (repr), not JSON -- None must be None, not `null`
         script = _SCRIPT % {"argregs": repr(_ARGREGS[arch]),
-                            "funcs": repr(spec), "addrsinks": repr(addr_spec), "infile": infile,
+                            "funcs": repr(spec), "addrsinks": repr(addr_spec),
+                            "entry": entry, "infile": infile,
                             "runargs": " ".join(shlex.quote(a) for a in argv)}
         (d / "mon.py").write_text(script)
         proc = subprocess.run(

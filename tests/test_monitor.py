@@ -171,3 +171,36 @@ def test_native_addr_sinks_breakpoints_by_address(gcc, tmp_path):
     assert r["ok"], r.get("note")
     execs = [h for h in r["hits"] if h["kind"] == "exec"]
     assert execs and execs[0]["cmd"] == "echo hi"
+
+
+_PIE_SINK_C = ("#include <stdlib.h>\n#include <string.h>\n"
+               "void danger(const char*c){ system(c); }\n"
+               "int main(int argc,char**argv){ if(argc>1) danger(argv[1]); return 0; }\n")
+
+
+@pytest.mark.skipif(not monitor._locate_gdb() or sandbox.host_arch() != "x86-64"
+                    or not shutil.which("nm"),
+                    reason="needs gdb + nm on x86-64")
+def test_native_addr_sinks_rebased_for_pie(gcc, tmp_path):
+    """PIE rebasing: analyst sink_addrs are static ELF vaddrs; on a PIE binary the load base is
+    nonzero, so the monitor must rebase by (AT_ENTRY - e_entry). Build static-pie, break `system`
+    at its static vaddr, and confirm it fires at runtime."""
+    c = tmp_path / "p.c"; c.write_text(_PIE_SINK_C)
+    b = tmp_path / "p"
+    if subprocess.run([gcc, "-O2", "-static-pie", str(c), "-o", str(b)],
+                      capture_output=True, check=False).returncode:
+        pytest.skip("no -static-pie toolchain")
+    nm = subprocess.run(["nm", str(b)], capture_output=True, text=True)
+    row = next((ln.split() for ln in nm.stdout.splitlines()
+                if ln.split() and ln.split()[-1] == "system"), None)
+    if not row or row[1] not in ("T", "t", "W", "w"):     # skip if system is an IFUNC ('i')
+        pytest.skip("no direct system symbol")
+    from lykos.analyze.debug import elfsyms
+    if not elfsyms.read(b)["pie"]:
+        pytest.skip("binary is not PIE")
+    subprocess.run(["strip", str(b)], capture_output=True)
+    r = monitor.run_monitor(str(b), [], "x86-64", argv=["echo pie-rebased"], stdin=b"",
+                            addr_sinks={"system": int(row[0], 16)}, timeout=20)
+    assert r["ok"], r.get("note")
+    execs = [h for h in r["hits"] if h["kind"] == "exec"]
+    assert execs and execs[0]["cmd"] == "echo pie-rebased"
