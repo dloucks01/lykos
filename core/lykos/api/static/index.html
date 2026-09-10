@@ -1072,7 +1072,9 @@ async function showDetail(targetId){
       <section class="stage">
         <div class="stagehdr"><span class="snum">3</span><b>CWE detection</b><span class="schip mono" id="detectstat"></span></div>
         <div class="sbody">
-          <div class="actions"><button class="btn sm" id="detect">Detect CWEs</button></div>
+          <div class="actions"><button class="btn sm" id="detect">Detect CWEs</button>
+            <button class="btn sm" id="cverun" title="Fingerprint embedded library versions (OpenSSL/zlib/libpng/busybox/…) and match a vendored offline CVE database — no execution. Great for static/firmware binaries.">CVE scan</button>
+            <span class="schip mono" id="cvestat"></span></div>
           <div id="findings"></div>
         </div>
       </section>
@@ -1150,6 +1152,7 @@ async function showDetail(targetId){
   DETAIL_TID = targetId; SEEDS=[];
   document.getElementById("deco").onclick = ()=>doDecompile(targetId);
   document.getElementById("detect").onclick = ()=>doDetect(targetId);
+  document.getElementById("cverun").onclick = ()=>doCveScan(targetId);
   document.getElementById("carve").onclick = ()=>doFirmware(targetId);
   document.getElementById("rehost").onclick = ()=>doRehost(targetId);
   document.getElementById("dynrun").onclick = ()=>doDynamic(targetId);
@@ -1628,6 +1631,11 @@ async function doDetect(tid){
   await fetch("/runs",{method:"POST",headers:{"Content-Type":"application/json"},
     body:JSON.stringify({case_id:CUR,target_id:tid,stage:"detect_cwe"})});
 }
+async function doCveScan(tid){
+  const st=document.getElementById("cvestat"); if(st) st.textContent="fingerprinting components…";
+  await fetch("/runs",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({case_id:CUR,target_id:tid,stage:"cve_scan"})});
+}
 const SEVCOL={critical:"#e4605f",high:"#e58a4c",medium:"#e0b54f",low:"#46cabb",info:"var(--faint)"};
 const _STATEORD={candidate:0,corroborated:1,confirmed:2,"poc-backed":3};
 function _stCls(s){ return s==="poc-backed"||s==="confirmed"?"on":(s==="corroborated"?"partial":"unknown"); }
@@ -1850,6 +1858,13 @@ function openWS(id){
       const ds=document.getElementById("decostat"); if(ds) ds.textContent="done: "+((e.payload&&e.payload.functions)||0)+" functions";
     }
     if(e.type==="findings.done" && DETAIL_TID){ loadFindings(DETAIL_TID); }
+    if(e.type==="cve.done" && DETAIL_TID){
+      const st=document.getElementById("cvestat");
+      if(st&&e.payload) st.textContent = (e.payload.components||[]).length
+        ? `${e.payload.components.map(c=>c.library+" "+c.version).join(", ")} → ${e.payload.findings} CVE(s)`
+        : (e.payload.note||"no component banners found");
+      loadFindings(DETAIL_TID);
+    }
     if(e.type==="dynamic.done" && DETAIL_TID){ loadDyn(DETAIL_TID); loadFindings(DETAIL_TID); }
     if(e.type==="fuzz.progress"){ const st=document.getElementById("fuzzstat"); if(st&&e.payload) st.textContent=`${e.payload.execs} execs · ${e.payload.crashes} crashes`; }
     if(e.type==="coverage.harvest"){ const st=document.getElementById("fuzzstat"); if(st&&e.payload) st.textContent=`AFL++: ${e.payload.crash_inputs} crash inputs`; }

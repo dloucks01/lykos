@@ -596,7 +596,7 @@ class Handler(BaseHTTPRequestHandler):
                          "coverage_fuzz", "directed_fuzz", "concolic",
                          "build_poc", "poc_primitive", "build_exploit", "boundary_fuzz",
                          "synthesize_poc", "heap_check", "root_cause", "multi_debug",
-                         "debug_monitor", "extract_secrets", "firmware_carve",
+                         "debug_monitor", "extract_secrets", "cve_scan", "firmware_carve",
                          "firmware_rehost") and target_id:
                 target = s.targets.get(target_id)
                 if not target:
@@ -643,6 +643,9 @@ class Handler(BaseHTTPRequestHandler):
                 elif stage == "extract_secrets":
                     from ..analyze.debug import enqueue_extract
                     run = enqueue_extract(q, target, params=body.get("params"))
+                elif stage == "cve_scan":
+                    from ..analyze.fingerprint import enqueue_cve_scan
+                    run = enqueue_cve_scan(q, target, params=body.get("params"))
                 elif stage == "firmware_carve":
                     from ..analyze.firmware import enqueue_firmware
                     run = enqueue_firmware(q, target, params=body.get("params"))
