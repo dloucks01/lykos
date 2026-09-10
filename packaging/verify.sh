@@ -17,7 +17,10 @@ for i in $(seq 1 100); do [ -S "$SOCK" ] && break; sleep 0.05; done
 [ -S "$SOCK" ] || fail "socket never appeared"
 
 curl -sf --unix-socket "$SOCK" http://localhost/health >/dev/null || fail "health"
-curl -s  --unix-socket "$SOCK" http://localhost/ | grep -q '<title>Lykos' || fail "UI not served from pyz"
+# capture-then-grep (not `curl | grep -q`): grep -q exits on first match and SIGPIPEs curl
+# mid-body, which under `set -o pipefail` would fail the pipeline on a large page.
+UI="$(curl -s --unix-socket "$SOCK" http://localhost/)"
+case "$UI" in *"<title>Lykos"*) ;; *) fail "UI not served from pyz";; esac
 CID=$(curl -s --unix-socket "$SOCK" -H 'Content-Type: application/json' -d '{"name":"verify"}' \
       http://localhost/cases | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
 RUN=$(curl -s --unix-socket "$SOCK" -F "file=@$SAMPLE" http://localhost/cases/$CID/targets \
