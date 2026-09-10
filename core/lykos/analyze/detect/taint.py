@@ -56,6 +56,33 @@ ARCH_ABI = {
     # pointer), so one row covers both -- the ELF machine id does not distinguish them either.
     "riscv":  {"ret": {"A0"}, "args": [{"A%d" % i} for i in range(8)],
                "frame": {"S0", "SP"}},
+    # Verified against Ghidra's lp64d.cspec and real P-Code: integer args a0-a7 (the cspec
+    # lists fa0-fa7 ahead of them, but those are the FLOAT pentries), fp/sp as frame bases.
+    "loongarch": {"ret": {"A0"}, "args": [{"A%d" % i} for i in range(8)],
+                  "frame": {"FP", "SP"}},
+    # m68k has no argument registers at all (68000.cspec declares none) -- SysV m68k passes
+    # everything on the stack, exactly like cdecl. `link A6` establishes the frame, so the
+    # callee reads parameters from [A6 + 8 + 4i], and calls push onto SP.
+    "m68k":   {"ret": {"D0"}, "args": [],
+               "frame": {"A6", "SP"},
+               "stack_params": {"base": "A6", "offset0": 8, "stride": 4},
+               "stack_call": {"base": "SP", "stride": 4}},
+    # SPARC register windows: the CALLER writes arguments to o0-o5, then `save` rotates the
+    # window and the CALLEE reads the very same values as i0-i5. "args" is the caller side
+    # (what a call site stages) and "param_regs" the callee side (what an entry point
+    # receives) -- without the split, seeding main's argv would mark the wrong register file.
+    # Verified against real P-Code: `mov i0,g1` / `stx i1,[fp+0x887]` in main's prologue.
+    "sparc":  {"ret": {"O0"}, "args": [{"O%d" % i} for i in range(6)],
+               "param_regs": [{"I%d" % i} for i in range(6)],
+               "frame": {"FP", "SP"}},
+    "sparcv9": {"ret": {"O0"}, "args": [{"O%d" % i} for i in range(6)],
+                "param_regs": [{"I%d" % i} for i in range(6)],
+                "frame": {"FP", "SP"}},
+    # SuperH: verified against superh.cspec and real P-Code -- integer args r4-r7 (the cspec
+    # lists fr4-fr11/dr4-dr10 first, which are the FLOAT pentries), r0 return, r14 frame
+    # pointer / r15 stack pointer.
+    "sh":     {"ret": {"R0"}, "args": [{"R%d" % i} for i in range(4, 8)],
+               "frame": {"R14", "R15"}},
 }
 # Sub-register aliasing. The ABI table groups a parameter's register with its narrower
 # alias ({"RSI", "ESI"}), and a seed marks the whole group -- but a later write names only
@@ -136,18 +163,55 @@ def _const_val(tok, consts):
     return consts.get(_key(tok))
 
 
-def _frame_slot(toks, consts, bases):
-    """Recognise `INT_ADD <frame base> <displacement>` and return its slot key, else None."""
+def _base_of(k, bases, aliases):
+    """Resolve a varnode to (frame base, offset), directly or through a derived alias."""
+    if k is None or k[0] != "reg":
+        return None
+    if k[1] in bases:
+        return (k[1], 0)
+    return aliases.get(k)
+
+
+def _frame_slot(toks, consts, bases, aliases):
+    """Recognise `INT_ADD <frame base or alias> <displacement>` -> slot key, else None."""
     if len(toks) < 3:
         return None
     a, b = _key(toks[1]), _key(toks[2])
-    if a and a[0] == "reg" and a[1] in bases:
-        off = _const_val(toks[2], consts)
-        return ("stack", a[1], off) if off is not None else None
-    if b and b[0] == "reg" and b[1] in bases:            # displacement on the left
-        off = _const_val(toks[1], consts)
-        return ("stack", b[1], off) if off is not None else None
+    for reg_tok, disp_tok in ((a, toks[2]), (b, toks[1])):    # either operand order
+        base = _base_of(reg_tok, bases, aliases)
+        if base is None:
+            continue
+        off = _const_val(disp_tok, consts)
+        if off is not None:
+            return ("stack", base[0], base[1] + off)
     return None
+
+
+def _track_alias(outk, mnem, toks, consts, bases, aliases):
+    """Maintain `register -> (frame base, offset)` for DERIVED frame bases.
+
+    SuperH (and others) stage a scratch pointer instead of addressing the frame register
+    directly:  `mov r14,r1` ; `add #-0x38,r1` ; `mov.l r4,@(0x3c,r1)`. Without following r1
+    the spill is invisible and the whole architecture yields no data flow. Resolving it to an
+    R14-relative offset keeps the slot key stable (which a raw ("stack","R1",0x3c) key would
+    not be, since r1 is a scratch register).
+
+    Any define that is not a recognised base/alias propagation clears the alias, so a
+    reused scratch register cannot keep a stale frame identity.
+    """
+    if outk is None or outk[0] != "reg":
+        return
+    if mnem == "COPY" and len(toks) >= 2:
+        src = _base_of(_key(toks[1]), bases, aliases)
+        if src is not None:
+            aliases[outk] = src
+            return
+    elif mnem == "INT_ADD" and len(toks) >= 3:
+        slot = _frame_slot(toks, consts, bases, aliases)
+        if slot is not None:
+            aliases[outk] = (slot[1], slot[2])
+            return
+    aliases.pop(outk, None)
 
 
 def _define(taint, key, tainted):
@@ -159,9 +223,10 @@ def _define(taint, key, tainted):
         taint.add(k) if tainted else taint.discard(k)
 
 
-def _apply(taint, ops, bases=()):
+def _apply(taint, ops, bases=(), aliases=None):
     slots = {}                       # varnode key -> frame-slot key (this instruction only)
     consts = {}                      # varnode key -> literal value  (this instruction only)
+    aliases = {} if aliases is None else aliases         # reg -> (base, off), per BLOCK
     for pc in ops:
         try:
             mnem, ins, outk, toks = _parse(pc)
@@ -174,9 +239,11 @@ def _apply(taint, ops, bases=()):
                 consts[outk] = cv
 
         if mnem == "INT_ADD" and outk is not None:
-            slot = _frame_slot(toks, consts, bases)
+            slot = _frame_slot(toks, consts, bases, aliases)
             if slot is not None:
                 slots[outk] = slot
+
+        _track_alias(outk, mnem, toks, consts, bases, aliases)
 
         if mnem == "STORE":
             # STORE space, addr, value -- spill a value into a frame slot (kill on overwrite)
@@ -300,17 +367,18 @@ def _run(ir, abi, callmap, dstmap, func_addrs, entry_params, ret_tainted, *,
     for b in blocks:
         for s in b.get("succ", []):
             preds[s].add(b["addr"])
+    paramregs_list = abi.get("param_regs") or argregs_list
     pre = set()
     for i in entry_params:
-        if i < len(argregs_list):
-            for r in argregs_list[i]:
+        if i < len(paramregs_list):
+            for r in paramregs_list[i]:
                 pre.add(("reg", r))
         if stack_params is not None:
             # cdecl: the callee reads parameter i from [EBP + 8 + 4i] after its prologue
             pre.add(("stack", stack_params["base"],
                      stack_params["offset0"] + stack_params["stride"] * i))
 
-    def transfer(cur, instr, flagged, contribs, pushes):
+    def transfer(cur, instr, flagged, contribs, pushes, aliases):
         addr = instr.get("addr")
         ext = callmap.get(addr)
         dst = dstmap.get(addr)
@@ -325,7 +393,7 @@ def _run(ir, abi, callmap, dstmap, func_addrs, entry_params, ret_tainted, *,
             if esym and any(argt):
                 ext_out.add(esym)
         tainted_params = {i for i, t in enumerate(argt) if t} if internal else set()
-        _apply(cur, instr.get("pcode", []), abi.get("frame", ()))
+        _apply(cur, instr.get("pcode", []), abi.get("frame", ()), aliases)
         if stack_call is not None:
             pushed = _push_taint(instr.get("pcode", []), cur, stack_call["base"])
             if pushed is not None:
@@ -351,9 +419,9 @@ def _run(ir, abi, callmap, dstmap, func_addrs, entry_params, ret_tainted, *,
                 cur |= OUT[p]
             if a == entry:
                 cur |= pre
-            f, c, pushes = set(), {}, []
+            f, c, pushes, aliases = set(), {}, [], {}
             for instr in by_addr[a]["instructions"]:
-                transfer(cur, instr, f, c, pushes)
+                transfer(cur, instr, f, c, pushes, aliases)
             if cur != OUT[a]:
                 OUT[a] = cur
                 changed = True
@@ -367,9 +435,9 @@ def _run(ir, abi, callmap, dstmap, func_addrs, entry_params, ret_tainted, *,
             cur |= OUT[p]
         if a == entry:
             cur |= pre
-        pushes = []
+        pushes, aliases = [], {}
         for instr in by_addr[a]["instructions"]:
-            transfer(cur, instr, flagged, contribs, pushes)
+            transfer(cur, instr, flagged, contribs, pushes, aliases)
 
     exits = [a for a in order if not by_addr[a].get("succ")] or order
     ret_bool = any(("reg", r) in OUT[a] for a in exits for r in retregs)

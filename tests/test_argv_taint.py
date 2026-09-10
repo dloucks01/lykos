@@ -289,3 +289,66 @@ def test_x86_abi_is_usable():
     from lykos.analyze.detect.taint import ARCH_ABI, _arg_regs, _has_abi
     assert not _arg_regs(ARCH_ABI["x86"])          # cdecl: no argument registers at all
     assert _has_abi(ARCH_ABI["x86"])               # ...but still a usable convention
+
+
+# ------------------------------------------------------------- derived frame bases (SuperH)
+# SuperH stages a scratch pointer rather than addressing the frame register directly:
+#     mov r14,r1 ; add #-0x38,r1 ; mov.l r4,@(0x3c,r1)
+# Verified against Ghidra's SH4 output. Without following r1 the spill is invisible and the
+# architecture produces no data flow at all; resolving it to an R14-relative offset also keeps
+# the slot key stable, which a raw ("stack","R1",0x3c) key would not be.
+def test_derived_frame_base_is_followed():
+    ir = {"blocks": [{"addr": _MAIN, "succ": [], "instructions": [
+        _i("0x1000", ["COPY reg:r14:4 -> reg:r1:4"]),                     # r1 = fp
+        _i("0x1002", ["COPY const:0xffffffc8:4 -> unique:0x5500:4",
+                      "INT_ADD unique:0x5500:4 reg:r1:4 -> reg:r1:4"]),   # r1 = fp - 0x38
+        _i("0x1004", ["COPY const:0x3c:4 -> unique:0x6800:4",             # spill argv (r5)
+                      "INT_ADD unique:0x6800:4 reg:r1:4 -> unique:0x22000:4",
+                      "STORE const:0x1a1:8 unique:0x22000:4 reg:r5:4"]),
+        _i("0x1006", ["COPY reg:r14:4 -> reg:r1:4",                       # recompute + reload
+                      "COPY const:0xffffffc8:4 -> unique:0x5500:4",
+                      "INT_ADD unique:0x5500:4 reg:r1:4 -> reg:r1:4",
+                      "COPY const:0x3c:4 -> unique:0x6800:4",
+                      "INT_ADD unique:0x6800:4 reg:r1:4 -> unique:0x22000:4",
+                      "LOAD const:0x1a1:4 unique:0x22000:4 -> reg:r4:4"]),
+        _i("0x100c", ["CALL ram:0x9000:4"]),                              # r4 = arg0
+    ]}]}
+    edges = [_edge("0x100c", "system")]
+    got = taint.analyze_program({_MAIN: ir}, edges, "sh", entry_seeds={_MAIN: {1}})
+    assert got == {"0x100c"}, "derived frame base (r1 = r14 - 0x38) must resolve to an R14 slot"
+
+
+def test_scratch_register_loses_its_frame_identity_when_reused():
+    """An alias must die as soon as the register is redefined by anything else, or a reused
+    scratch pointer would keep addressing the old frame slot."""
+    ir = {"blocks": [{"addr": _MAIN, "succ": [], "instructions": [
+        _i("0x1000", ["COPY reg:r14:4 -> reg:r1:4"]),
+        _i("0x1002", ["COPY const:0x3c:4 -> unique:0x6800:4",
+                      "INT_ADD unique:0x6800:4 reg:r1:4 -> unique:0x22000:4",
+                      "STORE const:0x1a1:8 unique:0x22000:4 reg:r5:4"]),   # taint -> slot
+        _i("0x1004", ["LOAD const:0x1a1:4 reg:r2:4 -> reg:r1:4"]),         # r1 = unrelated
+        _i("0x1006", ["COPY const:0x3c:4 -> unique:0x6800:4",
+                      "INT_ADD unique:0x6800:4 reg:r1:4 -> unique:0x22000:4",
+                      "LOAD const:0x1a1:4 unique:0x22000:4 -> reg:r4:4"]),
+        _i("0x100c", ["CALL ram:0x9000:4"]),
+    ]}]}
+    got = taint.analyze_program({_MAIN: ir}, [_edge("0x100c", "system")],
+                                "sh", entry_seeds={_MAIN: {1}})
+    assert got == set(), "a redefined scratch register must not keep its frame alias"
+
+
+def test_sparc_separates_caller_and_callee_register_files():
+    """SPARC register windows: the caller stages arguments in o0-o5 and the callee reads the
+    same values as i0-i5 after `save`. args/param_regs must not be the same list."""
+    from lykos.analyze.detect.taint import ARCH_ABI
+    abi = ARCH_ABI["sparcv9"]
+    assert abi["args"][0] == {"O0"} and abi["param_regs"][0] == {"I0"}
+    assert abi["args"] != abi["param_regs"]
+
+
+def test_every_arch_row_has_a_usable_convention():
+    """A row that parses but yields no argument locations is worse than no row: the channel
+    looks active and silently finds nothing."""
+    from lykos.analyze.detect.taint import ARCH_ABI, _has_abi
+    for arch, abi in ARCH_ABI.items():
+        assert _has_abi(abi), f"{arch} has neither argument registers nor a stack convention"
