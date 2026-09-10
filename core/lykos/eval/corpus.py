@@ -1,9 +1,28 @@
 """A bundled, compilable good/bad micro-corpus (Juliet-style) + a directory loader.
 
 Each `Case` is a small, self-contained C program with a ground-truth label: a `bad` case
-contains a real instance of its CWE (expect the platform to flag that CWE), a `good` case is
-the safe variant that deliberately uses NO dangerous API for that class (expect no flag). The
-corpus is small but real -- every case is actually compiled and analyzed by the harness.
+contains a real instance of its CWE (expect the platform to flag that CWE), a `good` case does
+not (expect no flag). The corpus is small but real -- every case is actually compiled and
+analyzed by the harness.
+
+Two KINDS of negative, and the difference matters:
+
+  * **absence negatives** -- the safe variant simply does not use the dangerous API (a manual
+    bounds-checked loop instead of strcpy). These prove the detector does not fire at random,
+    but they cannot fail: nothing in `DANGEROUS` is present to be flagged.
+
+  * **discrimination negatives** -- the safe variant DOES call the dangerous sink, correctly:
+    a strcpy behind an explicit `strlen() < sizeof` guard, a memcpy with a clamped length, a
+    printf whose format string is a literal, a system() whose command is a compile-time
+    constant. These are the ones that can produce a false positive, and they are the reason
+    `fp_rate` is a real measurement rather than a number pinned at zero by construction.
+
+A rule-only detector flags the discrimination negatives at `candidate` state -- that is the
+honest, expected behaviour of a pattern rule, not a defect. What must NOT happen is a
+discrimination negative reaching `corroborated` or higher, because that is the platform
+claiming a second channel agreed. So score them at BOTH states: `--min-state candidate`
+measures rule noise, `--min-state corroborated` measures whether the correlation actually
+discriminates. The release gate uses the latter (see Makefile `eval-gate`).
 
 Point the loader at a directory of `<cwe>__<name>__<good|bad>.c` files (or a manifest) to
 score a larger drop (e.g. a Juliet subset) with the same harness.
@@ -31,9 +50,10 @@ class Case:
 
 
 # ---------------------------------------------------------------- bundled micro-corpus
-# NB: `good` variants use only non-flagged libc (write/fputs/fgets/strlen/strcmp/getenv);
-# they must not call any function in detect/catalog.py:DANGEROUS, or they would (correctly)
-# be flagged and count as a false positive.
+# The ABSENCE negatives below use only non-flagged libc (write/fputs/fgets/strlen/strcmp/
+# getenv) so no sink is present at all. The DISCRIMINATION negatives further down do the
+# opposite on purpose: they call the sink correctly, so a rule-only detector will flag them
+# and `fp_rate` can actually move. See the module docstring.
 _CASES: list[Case] = [
     # ---- CWE-120: buffer copy without bounds ----
     Case("strcpy_overflow", "CWE-120", "bad", r"""
@@ -104,6 +124,81 @@ int main(int c, char**v){ if(c>1 && strcmp(v[1], KEY)==0) write(1, "ok", 2); ret
 int main(int c, char**v){ const char*k=getenv("APP_CFG");
   if(c>1 && k && strcmp(v[1], k)==0) write(1, "ok", 2); return 0; }
 """, note="credential read from the environment, no literal"),
+
+    # ================================================================================
+    # DISCRIMINATION NEGATIVES -- these CALL the dangerous sink, correctly.
+    #
+    # Unlike the absence negatives above, these can produce a false positive, so they are
+    # what makes `fp_rate` a measurement instead of a constant. Each note states WHY the
+    # use is safe; that justification is the ground truth. Every one of these is a pattern
+    # that occurs constantly in real code, so a detector that cannot tell them apart from
+    # the `bad` cases above would be unusable on a real target.
+    #
+    # gcc note: several of these are written to survive -O0 constant folding (e.g. printf
+    # with a literal "%s\n" is rewritten to puts(), erasing the sink we mean to test, so
+    # the format carries a second argument). Compile and check the PLT before adding one.
+    # ================================================================================
+
+    # ---- CWE-120: bounded / guarded copies (the sink is present and correct) ----
+    Case("strcpy_length_guarded", "CWE-120", "good", r"""
+#include <string.h>
+#include <unistd.h>
+int main(int c, char**v){ char b[64];
+  if(c>1 && strlen(v[1]) < sizeof b){ strcpy(b, v[1]); write(1,b,strlen(b)); }
+  return 0; }
+""", note="strcpy behind an explicit strlen() < sizeof guard -- the copy cannot overflow"),
+    Case("strncpy_bounded", "CWE-120", "good", r"""
+#include <string.h>
+#include <unistd.h>
+int main(int c, char**v){ char b[64];
+  if(c>1){ strncpy(b, v[1], sizeof b - 1); b[sizeof b - 1]=0; write(1,b,strlen(b)); }
+  return 0; }
+""", note="strncpy bounded to sizeof-1 with an explicit NUL terminator"),
+    Case("memcpy_clamped", "CWE-120", "good", r"""
+#include <string.h>
+#include <unistd.h>
+int main(int c, char**v){ char b[64];
+  if(c>1){ size_t n=strlen(v[1]); if(n > sizeof b) n = sizeof b; memcpy(b, v[1], n);
+           write(1,b,n); }
+  return 0; }
+""", note="memcpy length clamped to the destination size before the copy"),
+
+    # ---- CWE-134: format strings that are literals (the sink is present and correct) ----
+    Case("printf_literal_format", "CWE-134", "good", r"""
+#include <stdio.h>
+#include <string.h>
+int main(int c, char**v){ if(c>1) printf("arg=%s len=%u\n", v[1], (unsigned)strlen(v[1]));
+  return 0; }
+""", note="printf format is a string literal; untrusted data is a %s argument, not the format"),
+    Case("snprintf_bounded", "CWE-134", "good", r"""
+#include <stdio.h>
+int main(int c, char**v){ char b[64];
+  if(c>1){ snprintf(b, sizeof b, "arg=%s", v[1]); fputs(b, stdout); }
+  return 0; }
+""", note="snprintf bounded by sizeof with a literal format"),
+
+    # ---- CWE-78: process execution with no attacker-controlled component ----
+    Case("system_constant_cmd", "CWE-78", "good", r"""
+#include <stdlib.h>
+int main(void){ return system("/bin/date +%Y") == 0 ? 0 : 1; }
+""", note="system() command is a compile-time constant; no input reaches it"),
+    Case("execl_fixed_argv", "CWE-78", "good", r"""
+#include <unistd.h>
+int main(void){ execl("/bin/date", "date", "+%Y", (char*)0); return 1; }
+""", note="execl with a fixed path and fixed argv; no input reaches it"),
+
+    # ---- CWE-798: credential-SHAPED strings that are not credentials ----
+    Case("password_prompt_string", "CWE-798", "good", r"""
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+int main(int c, char**v){ char pw[64];
+  fputs("Enter your password: ", stdout);
+  if(fgets(pw, sizeof pw, stdin)){ pw[strcspn(pw,"\n")]=0;
+    if(c>1 && strcmp(pw, v[1])==0) write(1,"ok",2); }
+  return 0; }
+""", note="a UI prompt containing the word 'password' -- matches the secret keyword regex "
+         "but is not a credential; the binary embeds no secret"),
 ]
 
 
