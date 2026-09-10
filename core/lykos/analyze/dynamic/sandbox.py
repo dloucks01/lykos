@@ -302,14 +302,14 @@ def run(exe, *, argv=(), stdin: bytes = b"", timeout: float = 10.0,
     iso = "rlimits-only" + ("+qemu" if emu else "")
     cmd = inner
     if _bwrap_usable():
-        # The exe is staged under /tmp, which _BWRAP_ARGS masks with a tmpfs. A native target
-        # then triggers a "bwrap:" exec error and we fall back below; but an EMULATED target
-        # runs qemu (visible) which just can't open the masked guest -> a silent no-crash. So
-        # bind the exe's scratch dir back in read-only when emulating.
-        extra = []
-        if emu:
-            exedir = str(Path(exe).resolve().parent)
-            extra = ["--ro-bind", exedir, exedir]
+        # The exe is staged under /tmp (ctx.scratch()), which _BWRAP_ARGS masks with a tmpfs,
+        # so the guest binary vanishes inside the sandbox. Bind its directory back in
+        # read-only -- for NATIVE targets as well as emulated ones. Doing this only for the
+        # emulated case meant a native target hit a "bwrap:" exec error and silently fell back
+        # to the rlimits-only tier: no network namespace and no read-only root, precisely
+        # where it matters most (running hostile code on the host CPU).
+        exedir = str(Path(exe).resolve().parent)
+        extra = ["--ro-bind", exedir, exedir]
         cmd = ["bwrap"] + _BWRAP_ARGS[:-1] + extra + ["--"] + inner
         iso = ("bwrap+netns" + ("+qemu" if emu else ""))
 
