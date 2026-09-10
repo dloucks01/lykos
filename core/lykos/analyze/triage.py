@@ -14,7 +14,8 @@ from . import filetype
 
 SCHEMA_VERSION = 1
 TOOL = "elf-stdlib"
-TOOL_VERSION = "triage-3"          # bump to invalidate the cache when parsing changes
+TOOL_VERSION = "triage-4"          # bump to invalidate the cache when parsing changes
+#   triage-4: static-pie linking classification (PT_DYNAMIC no longer implies dynamic)
 MITIGATION_ENUM = {"on", "off", "partial", "unknown"}
 _FILE_TYPES = {filetype.ELF, filetype.PE, filetype.MACHO, filetype.RAW, filetype.OTHER}
 _PACK_ENTROPY = 7.2
@@ -168,8 +169,8 @@ def _describe(rec: dict) -> str:
     if rec["arch"]:
         parts.append(rec["arch"])
     if rec["linking"]:
-        parts.append("dynamically linked" if rec["linking"] == "dynamic"
-                     else "statically linked")
+        parts.append({"dynamic": "dynamically linked", "static-pie": "statically linked (PIE)",
+                      "static": "statically linked"}.get(rec["linking"], "statically linked"))
     if rec["stripped"]:
         parts.append("stripped")
     return ", ".join(parts)

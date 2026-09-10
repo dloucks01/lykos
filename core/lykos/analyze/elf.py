@@ -274,8 +274,13 @@ def parse(data: bytes) -> ElfInfo:
         info.errors.append(f"dynsym: {e!r}")
 
     # --- linking ---
-    if has_interp or info.imports["libraries"] or has_dynamic:
+    # PT_DYNAMIC alone does NOT mean dynamically linked: every PIE (static-pie included) carries
+    # it for self-relocation. Dynamic linking is signalled by an interpreter (PT_INTERP) or
+    # needed external libraries (DT_NEEDED). A PIE with PT_DYNAMIC but neither is static-pie.
+    if has_interp or info.imports["libraries"]:
         info.linking = "dynamic"
+    elif has_dynamic and info.elf_type == "dyn":
+        info.linking = "static-pie"
     elif sh:
         info.linking = "static"
 

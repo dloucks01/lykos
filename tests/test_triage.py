@@ -31,6 +31,8 @@ def variants(gcc, tmp_path_factory):
     build("hardened", ["-O2", "-fstack-protector-all", "-fPIE", "-pie",
                        "-Wl,-z,relro,-z,now"])
     build("weak", ["-O0", "-no-pie", "-fno-stack-protector", "-Wl,-z,norelro"])
+    build("static", ["-O2", "-static"])
+    build("static_pie", ["-O2", "-static-pie"])
     if "default" in made:
         stripped = d / "stripped"
         stripped.write_bytes(made["default"].read_bytes())
@@ -49,6 +51,17 @@ def test_default_x86_64(variants):
     assert any("c" in lib for lib in rec["imports"]["libraries"])  # libc.so.6
     assert rec["linking"] == "dynamic"
     assert validate(rec) == []
+
+
+def test_static_vs_static_pie_linking(variants):
+    """PT_DYNAMIC alone (present in every PIE) must not read as dynamically linked: a -static-pie
+    binary is static-pie, a -static binary is static, only interp/DT_NEEDED means dynamic."""
+    if "static" not in variants and "static_pie" not in variants:
+        pytest.skip("no static toolchain")
+    if "static" in variants:
+        assert _triage(variants["static"])["linking"] == "static"
+    if "static_pie" in variants:
+        assert _triage(variants["static_pie"])["linking"] == "static-pie"
 
 
 def test_hardened_mitigations(variants):
