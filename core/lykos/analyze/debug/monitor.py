@@ -52,6 +52,7 @@ _SCRIPT = r'''
 import gdb, json
 ARGREGS = %(argregs)s
 FUNCS = %(funcs)s
+ADDR_SINKS = %(addrsinks)s
 INPUT_FILE = %(infile)r
 RUN_ARGS = %(runargs)r
 HITS, MAX = [], 400
@@ -73,9 +74,9 @@ def _slen(reg):
         return -1
 
 class Hit(gdb.Breakpoint):
-    def __init__(self, name, spec):
-        super().__init__(name, gdb.BP_BREAKPOINT, internal=True)
-        self.fname, self.spec = name, spec
+    def __init__(self, location, fname, spec):
+        super().__init__(location, gdb.BP_BREAKPOINT, internal=True)
+        self.fname, self.spec = fname, spec
     def stop(self):
         rec = {"func": self.fname, "kind": self.spec["kind"], "cwe": self.spec["cwe"]}
         try:
@@ -107,7 +108,10 @@ class Hit(gdb.Breakpoint):
 
 gdb.execute("set breakpoint pending on")   # sinks may live in libc (not yet loaded)
 for _n, _spec in FUNCS.items():
-    try: Hit(_n, _spec)
+    try: Hit(_n, _n, _spec)             # by name (resolves via symbols / PLT)
+    except Exception: pass
+for _n, (_addr, _spec) in ADDR_SINKS.items():
+    try: Hit("*" + hex(_addr), _n, _spec)   # analyst-supplied address (stripped: no symbol)
     except Exception: pass
 gdb.execute("set pagination off")
 gdb.execute("set height 0")
@@ -125,9 +129,11 @@ def supported(arch):
     return arch in _ARGREGS
 
 
-def run_monitor(exe, funcs, arch, *, argv=(), stdin=b"", timeout=20):
+def run_monitor(exe, funcs, arch, *, argv=(), stdin=b"", timeout=20, addr_sinks=None):
     """Run `exe` under GDB, breakpoint each name in `funcs` (subset of CATALOG present in the
-    binary), and return the list of observed call records."""
+    binary), and return the list of observed call records. `addr_sinks` is an analyst escape
+    hatch -- a {catalog-name: vaddr} map to breakpoint sinks by address in a stripped binary
+    whose symbols/PLT names are gone; each is decoded with that name's CATALOG spec."""
     if arch not in _ARGREGS:
         return {"ok": False, "note": f"monitor is native-arch only (no GDB arg map for {arch})"}
     gdb_bin = _locate_gdb()
@@ -140,9 +146,10 @@ def run_monitor(exe, funcs, arch, *, argv=(), stdin=b"", timeout=20):
             (d / "in.bin").write_bytes(stdin)
             infile = str(d / "in.bin")
         spec = {n: CATALOG[n] for n in funcs if n in CATALOG}
+        addr_spec = {n: (a, CATALOG[n]) for n, a in (addr_sinks or {}).items() if n in CATALOG}
         # embed as Python literals (repr), not JSON -- None must be None, not `null`
         script = _SCRIPT % {"argregs": repr(_ARGREGS[arch]),
-                            "funcs": repr(spec), "infile": infile,
+                            "funcs": repr(spec), "addrsinks": repr(addr_spec), "infile": infile,
                             "runargs": " ".join(shlex.quote(a) for a in argv)}
         (d / "mon.py").write_text(script)
         proc = subprocess.run(

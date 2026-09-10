@@ -76,6 +76,21 @@ def _decode_xarch(raw):
     return out
 
 
+def _parse_sink_addrs(raw) -> dict:
+    """Analyst escape hatch: {catalog-name: vaddr} to breakpoint sinks a stripped/static binary
+    lost (no symbols/PLT names). vaddr may be an int or a hex/dec string. Only catalog names are
+    kept -- others can't be decoded. Bad entries are skipped rather than failing the run."""
+    out = {}
+    for name, addr in (raw or {}).items():
+        if name not in monitor.CATALOG:
+            continue
+        try:
+            out[name] = int(addr, 0) if isinstance(addr, str) else int(addr)
+        except (ValueError, TypeError):
+            continue
+    return out
+
+
 def monitor_stage(ctx) -> dict:
     target = TargetDAO(ctx.conn).get(ctx.target_id) if ctx.target_id else None
     if target is None:
@@ -95,6 +110,7 @@ def monitor_stage(ctx) -> dict:
 
     mode = p.get("input_mode", "stdin")
     argv = list(p.get("argv") or [])
+    sink_addrs = _parse_sink_addrs(p.get("sink_addrs"))
     timeout = float(p.get("timeout", 20))
     data = ctx.content.get_bytes(p["input_sha"]) if p.get("input_sha") else b"A" * 256
     stdin = data if mode == "stdin" else b""
@@ -105,17 +121,21 @@ def monitor_stage(ctx) -> dict:
     os.chmod(exe, 0o755)
 
     if emulated:
-        # cross-arch: breakpoint the sinks defined in the ELF's own symbols, under qemu-gdbstub
+        # cross-arch: breakpoint the sinks defined in the ELF's own symbols, under qemu-gdbstub.
+        # analyst-supplied sink_addrs are merged in (a stripped/static binary has no .symtab).
         info = elfsyms.read(exe)
-        funcs = sorted(set(info["symbols"]) & set(monitor.CATALOG))
+        symbols = {**info["symbols"], **sink_addrs}
+        funcs = sorted(set(symbols) & set(monitor.CATALOG))
         if not funcs:
             ctx.emit("monitor.done", payload={"ok": True, "hits": [], "findings": 0,
-                     "note": "no monitored sinks found in the binary's symbols "
-                             "(stripped or dynamically linked; cross-arch needs static syms)"})
+                     "note": "no monitored sinks found in the binary's symbols (stripped or "
+                             "dynamically linked). Supply params.sink_addrs {name: vaddr} to "
+                             "breakpoint sinks by address (cross-arch needs static syms)."})
             ctx.progress(pct=100, msg="no dangerous sinks to monitor")
             return {}
-        ctx.progress(msg=f"monitoring {len(funcs)} sink(s) under qemu-{target.arch} gdbstub")
-        res = qemu_gdb.monitor_calls(exe, target.arch, symbols=info["symbols"],
+        via = " (+%d analyst addr)" % len(sink_addrs) if sink_addrs else ""
+        ctx.progress(msg=f"monitoring {len(funcs)} sink(s) under qemu-{target.arch} gdbstub{via}")
+        res = qemu_gdb.monitor_calls(exe, target.arch, symbols=symbols,
                                      entry=info["entry"], pie=info["pie"], sink_names=set(funcs),
                                      endianness=target.endianness, bits=target.bits,
                                      argv=run_argv, stdin=stdin, timeout=timeout)
@@ -124,13 +144,18 @@ def monitor_stage(ctx) -> dict:
         names = {normalize(e.dst_name) for e in CallEdgeDAO(ctx.conn).list_by_target(target.id)
                  if e.dst_name}
         funcs = sorted(names & set(monitor.CATALOG))
-        if not funcs:
+        if not funcs and not sink_addrs:
             ctx.emit("monitor.done", payload={"ok": True, "hits": [], "findings": 0,
-                     "note": "no monitored dangerous sinks imported by this binary"})
+                     "note": "no monitored dangerous sinks imported by this binary. Supply "
+                             "params.sink_addrs {name: vaddr} to breakpoint sinks by address "
+                             "(e.g. a stripped statically-linked binary)."})
             ctx.progress(pct=100, msg="no dangerous sinks to monitor")
             return {}
-        ctx.progress(msg=f"monitoring {len(funcs)} sink(s) under GDB: {', '.join(funcs)}")
-        res = monitor.run_monitor(exe, funcs, host, argv=run_argv, stdin=stdin, timeout=timeout)
+        via = " (+%d analyst addr)" % len(sink_addrs) if sink_addrs else ""
+        shown = ", ".join(funcs) or "sink_addrs only"
+        ctx.progress(msg=f"monitoring {len(funcs)} sink(s) under GDB: {shown}{via}")
+        res = monitor.run_monitor(exe, funcs, host, argv=run_argv, stdin=stdin, timeout=timeout,
+                                  addr_sinks=sink_addrs)
         hits = res.get("hits", [])
     if not res.get("ok"):
         ctx.emit("monitor.done", payload={"ok": False, "note": res.get("note")})

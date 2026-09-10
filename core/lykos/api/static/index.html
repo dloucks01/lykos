@@ -1129,7 +1129,10 @@ async function showDetail(targetId){
               <span class="vsep"></span>
               <button class="btn sm" id="synthrun" title="Deterministic: synthesize the overflow input from the recovered stack frame (buffer size + offset) and detonate once -- no fuzzing. Needs Decompile first.">Synthesize PoC (no fuzz)</button>
               <button class="btn sm" id="injectrun" title="Deterministic: probe command-injection / format-string / path-traversal on the sinks the binary imports, and confirm by effect -- no fuzzing.">Injection PoC</button>
-              <button class="btn sm" id="monitorrun" title="Run under GDB with breakpoints on dangerous sinks; capture what the program passes them at runtime (command strings, copy lengths) -- finds executed commands and overflows without a crash. Native-arch only.">Runtime monitor</button>
+              <button class="btn sm" id="monitorrun" title="Breakpoint the dangerous sinks and capture what the program passes them at runtime (command strings, copy lengths) -- finds executed commands and overflows without a crash. Native (host GDB) and cross-arch (qemu gdbstub).">Runtime monitor</button>
+              <input id="monargv" class="inp" placeholder="monitor argv (optional)" style="max-width:130px" title="Arguments passed to the target for the runtime monitor, space-separated (e.g. a PIN that reaches system())">
+              <input id="monsinks" class="inp" placeholder="sink addrs: name=0xADDR,… (optional)" style="max-width:180px" title="Analyst escape hatch: breakpoint sinks by address when the binary is stripped/statically-linked and has no symbols (e.g. system=0xc5c,strcpy=0x3250). Recover the addresses from a non-stripped twin or manual RE.">
+
               <button class="btn sm" id="heaprun" title="Run under a guard-page heap allocator (LD_PRELOAD) that catches use-after-free, double-free, heap overflow and invalid free at the exact access -- silent corruptions that don't crash. Native-arch, dynamically-linked targets.">Heap check</button>
               <button class="btn sm" id="secretrun" title="Breakpoint the comparison functions and dump both operands -- recovers the constants the program checks input against (passwords, magic bytes, tokens). Native-arch only.">Extract secrets</button>
               <button class="btn sm" id="behaviorrun" title="Trace the security-relevant syscalls the binary makes (exec, network, file writes, anti-debug, W^X) -- a behavioral capability inventory. Native x86-64.">Behavior trace</button>
@@ -1558,8 +1561,16 @@ async function doSynthesize(tid){
 }
 async function doMonitor(tid){
   const mode = document.getElementById("dynmode").value;
-  await postRun(tid, "debug_monitor", {input_mode:(mode==="none"?"stdin":mode), timeout:20},
-    {status:"monitoring dangerous calls under GDB…"});
+  const params = {input_mode:(mode==="none"?"stdin":mode), timeout:20};
+  const argvRaw = (document.getElementById("monargv").value||"").trim();
+  if(argvRaw) params.argv = argvRaw.split(/\s+/);
+  const sinksRaw = (document.getElementById("monsinks").value||"").trim();
+  if(sinksRaw){
+    const sa = {};
+    sinksRaw.split(",").forEach(p=>{ const [n,a]=p.split("="); if(n&&a&&a.trim()) sa[n.trim()]=a.trim(); });
+    if(Object.keys(sa).length) params.sink_addrs = sa;
+  }
+  await postRun(tid, "debug_monitor", params, {status:"monitoring dangerous calls…"});
 }
 async function doInject(tid){
   const mode = document.getElementById("dynmode").value;

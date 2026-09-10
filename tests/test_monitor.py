@@ -100,3 +100,74 @@ def test_monitor_delivers_argv_even_with_stdin(gcc, tmp_path):
     assert r["ok"], r.get("note")
     execs = [h for h in r["hits"] if h["kind"] == "exec"]
     assert execs and "echo unlocked" in execs[0]["cmd"]
+
+
+# --- analyst sink_addrs escape hatch (stripped / no-symbol binaries) --------------------------
+import shutil
+
+from lykos.analyze.debug import monitor_stage as _mstage
+
+
+def test_parse_sink_addrs_forms_and_filtering():
+    got = _mstage._parse_sink_addrs(
+        {"system": "0xc5c", "strcpy": 12880, "printf": "0x10",   # printf: not in CATALOG -> drop
+         "strcat": "bogus", "gets": None})                        # unparseable -> dropped
+    assert got == {"system": 0xc5c, "strcpy": 12880}
+
+
+@pytest.mark.skipif(not os.path.exists(_AARCH64) or not sandbox._qemu_for("aarch64")
+                    or not qemu_gdb.breakpoints_supported("aarch64")
+                    or not (shutil.which("llvm-strip") or shutil.which("aarch64-linux-gnu-strip")),
+                    reason="needs the aarch64 corpus binary, qemu-aarch64, and a cross strip")
+def test_cross_arch_sink_addrs_on_stripped(tmp_path):
+    """The escape hatch: a stripped static-pie aarch64 binary has no .symtab, so name-based sink
+    resolution finds nothing; analyst-supplied sink_addrs breakpoint them by address anyway."""
+    exe = tmp_path / "stripped"
+    exe.write_bytes(open(_AARCH64, "rb").read())
+    os.chmod(exe, 0o755)                                  # qemu-user needs the execute bit
+    strip = shutil.which("llvm-strip") or shutil.which("aarch64-linux-gnu-strip")
+    if subprocess.run([strip, "--strip-all", str(exe)], capture_output=True).returncode:
+        pytest.skip("strip failed")
+    info = elfsyms.read(exe)
+    if info["symbols"]:
+        pytest.skip("symbols survived strip")            # need a truly symbol-less binary
+    # addresses recovered from the (named) twin -- the analyst-in-the-loop input
+    twin = elfsyms.read(_AARCH64)["symbols"]
+    sink_addrs = {n: twin[n] for n in ("system", "strcpy", "strcat") if n in twin}
+    assert sink_addrs, "twin lacks the expected sinks"
+    r = qemu_gdb.monitor_calls(str(exe), "aarch64", symbols=sink_addrs, entry=info["entry"],
+                               pie=info["pie"], sink_names=set(sink_addrs), argv=["4242"],
+                               timeout=30)
+    assert r["ok"], r.get("note")
+    execs = [h for h in r["hits"] if h["func"] == "system"]
+    assert execs and execs[0]["argstrs"][0] == "echo unlocked"
+
+
+_ADDR_C = ("#include <stdlib.h>\n"
+           "void run_cmd(const char*c){ volatile const char*x=c; (void)x; }\n"
+           "int main(int argc,char**argv){ if(argc>1) run_cmd(argv[1]); return 0; }\n")
+
+
+@pytest.mark.skipif(not monitor._locate_gdb() or sandbox.host_arch() != "x86-64"
+                    or not shutil.which("nm"),
+                    reason="needs gdb + nm on x86-64")
+def test_native_addr_sinks_breakpoints_by_address(gcc, tmp_path):
+    """Native path: addr_sinks breakpoints a sink by address (stripped: no symbol to name).
+    We point the 'system' spec at a local function whose arg0 is a string and confirm the
+    address breakpoint fires and decodes arg0 as the command."""
+    c = tmp_path / "d.c"; c.write_text(_ADDR_C)
+    b = tmp_path / "d"
+    if subprocess.run([gcc, "-O0", "-no-pie", str(c), "-o", str(b)],
+                      capture_output=True, check=False).returncode:
+        pytest.skip("build failed")
+    nm = subprocess.run(["nm", str(b)], capture_output=True, text=True)
+    addr = next((int(line.split()[0], 16) for line in nm.stdout.splitlines()
+                 if line.split()[-1] == "run_cmd"), None)
+    if addr is None:
+        pytest.skip("could not find run_cmd address")
+    subprocess.run(["strip", str(b)], capture_output=True)     # prove it works without symbols
+    r = monitor.run_monitor(str(b), [], "x86-64", argv=["echo hi"], stdin=b"",
+                            addr_sinks={"system": addr}, timeout=20)
+    assert r["ok"], r.get("note")
+    execs = [h for h in r["hits"] if h["kind"] == "exec"]
+    assert execs and execs[0]["cmd"] == "echo hi"
