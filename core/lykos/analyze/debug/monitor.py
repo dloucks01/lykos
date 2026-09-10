@@ -101,6 +101,7 @@ class Hit(gdb.Breakpoint):
                 rec["dest"] = _u(ARGREGS[self.spec["dest"]])
                 if self.spec.get("strlen") is not None:
                     rec["length"] = _slen(ARGREGS[self.spec["strlen"]])
+                    rec["src"] = _s(ARGREGS[self.spec["strlen"]])   # source content (for taint)
                 elif self.spec.get("len_arg") is not None:
                     rec["length"] = _u(ARGREGS[self.spec["len_arg"]])
                 else:
