@@ -216,3 +216,29 @@ def test_wine_absent_is_reported_not_crashed(monkeypatch):
     r = sandbox._run_windows("/nonexistent.exe", argv=[], stdin=b"", timeout=5,
                              mem_mb=512, capture=4096, wineprefix=None)
     assert r.isolation == "unsupported-windows" and not r.crashed and "wine" in r.note
+
+
+def test_qemu_selection_covers_every_supported_arch():
+    """Every arch the ELF parser can name must resolve to a qemu-user binary name, or the
+    dynamic stage reports "unsupported-arch" and the whole PoC ladder is unreachable for it.
+    sparcv9 was missing this mapping even though qemu-sparc64 exists.
+    """
+    from lykos.analyze.dynamic import sandbox
+    # (arch, endianness, bits) -> expected qemu suffix
+    cases = [("sparcv9", "big", 64, "sparc64"), ("sparc", "big", 32, "sparc"),
+             ("sparc", "big", 64, "sparc64"), ("riscv", "little", 64, "riscv64"),
+             ("riscv", "little", 32, "riscv32"), ("s390", "big", 64, "s390x"),
+             ("loongarch", "little", 64, "loongarch64"), ("m68k", "big", 32, "m68k"),
+             ("sh", "little", 32, "sh4"), ("ppc64", "little", 64, "ppc64le"),
+             ("ppc64", "big", 64, "ppc64"), ("mips", "little", 32, "mipsel")]
+    for arch, endian, bits, want in cases:
+        suf = sandbox._QEMU.get(arch)
+        if arch in ("mips", "mips64") and endian == "little":
+            suf = "mipsel"
+        elif arch == "ppc64" and endian == "little":
+            suf = "ppc64le"
+        elif arch == "riscv":
+            suf = "riscv32" if bits == 32 else "riscv64"
+        elif arch == "sparc" and bits == 64:
+            suf = "sparc64"
+        assert suf == want, f"{arch}/{endian}/{bits}: got qemu-{suf}, want qemu-{want}"
