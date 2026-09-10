@@ -40,13 +40,31 @@ eval:
 	$(PY) -m lykos eval --out eval-report.json
 
 # Release gate: benchmark detection quality (doc 14) and fail on regression.
-# The dynamic (confirmed-stage) gate needs only gcc; the static (candidate-stage)
-# gate needs Ghidra and SKIPs cleanly when it is absent (see `lykos eval` gate logic).
+# The dynamic (confirmed-stage) gate needs only gcc; the static gates need Ghidra and SKIP
+# cleanly when it is absent (see `lykos eval` gate logic).
+#
+# On the static FP budget: the corpus carries DISCRIMINATION negatives -- good cases that
+# call the dangerous sink correctly (guarded strcpy, clamped memcpy, literal-format printf,
+# constant-command system). A rule-only detector flags those at `candidate`, which is honest
+# behaviour for a pattern rule, so the candidate-stage budget is a RATCHET at the currently
+# measured rate rather than 0: it cannot pass a detector that fires more broadly than today's
+# does. Tighten the number whenever the real rate drops. (Before those negatives existed the
+# corpus had no false-positive surface at all, so `--max-fp-rate 0.0` could not fail under
+# any code change -- the gate was decorative.)
+STATIC_FP_BUDGET ?= 0.60
+
 eval-gate:
 	@echo "== release gate: confirmed-stage recall (dynamic; gcc only) =="
 	$(PY) -m lykos eval --stage dynamic --record
-	@echo "== release gate: candidate-stage detection (static; Ghidra, skipped if absent) =="
-	$(PY) -m lykos eval --stage static --record
+	@echo "== release gate: candidate-stage detection + FP ratchet (static; needs Ghidra) =="
+	$(PY) -m lykos eval --stage static --min-state candidate --record \
+	      --min-recall 1.0 --max-fp-rate $(STATIC_FP_BUDGET)
+	@echo "== tracked, not gated: corroborated-stage discrimination =="
+	@echo "   (recall here is 0.00 today: the taint channel seeds from SOURCES library calls"
+	@echo "    and does not model argv, so argv-driven cases never promote past candidate."
+	@echo "    Recorded so the fix shows up as a jump in the dashboard.)"
+	$(PY) -m lykos eval --stage static --min-state corroborated --record \
+	      --min-recall 0.0 --max-fp-rate 1.0
 
 # Render the detection-quality regression dashboard from the recorded history.
 dashboard:

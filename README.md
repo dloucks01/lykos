@@ -66,10 +66,35 @@ everything runs without them.
 ```sh
 make test        # run the full test suite (PYTHONPATH=core pytest)
 make lint        # ruff check over core + tests
+make typecheck   # mypy: strict over the infra core, off for the stage layers (see mypy.ini)
+make ci          # lint + typecheck + test
 make run         # serve the API + UI on 127.0.0.1:8787 (case store in .cases/)
 make bundle      # build the standalone dist/lykos.pyz zipapp
 make verify      # build the zipapp, then prove it serves the UI + triages a binary offline
+make eval-gate   # detection-quality gate over the bundled corpus (see below)
 ```
+
+`make lint` and `make typecheck` FAIL when their tool is missing rather than skipping, so
+`make ci` cannot go green without having actually run them. CI (`.github/workflows/ci.yml`)
+runs the same targets on 3.11 and 3.13 and prints every test skip, so gaps stay visible.
+
+### What the detection gate measures
+
+`make eval-gate` scores the bundled micro-corpus (`core/lykos/eval/corpus.py`) through the
+real pipeline. The corpus carries two kinds of negative, and only the second kind can fail:
+
+* **absence negatives** — the safe variant omits the dangerous API entirely.
+* **discrimination negatives** — the safe variant *calls* the sink correctly (strcpy behind
+  a `strlen() < sizeof` guard, clamped memcpy, literal-format printf, constant-command
+  `system`). These are what make `fp_rate` a measurement instead of a constant.
+
+Current measured numbers (x86-64, Ghidra 12.1): at `--min-state candidate`, recall **1.00**,
+fp_rate **0.57** — a rule-only channel flags the safe uses too, which is honest behaviour for
+a pattern rule. At `--min-state corroborated`, recall is **0.00**: the taint channel seeds
+only from `SOURCES` library calls (`read`/`fgets`/`getenv`/…) and does not model `argv`, so
+argv-driven programs never promote past `candidate`. The corroborated line is recorded but
+not gated until that gap is closed. The corpus is 20 cases over 4 CWE classes — a regression
+tripwire, not a benchmark; use `lykos eval --juliet` / `--lava` for real measurement.
 
 Run the server directly and drive it over HTTP:
 

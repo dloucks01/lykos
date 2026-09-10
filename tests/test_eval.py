@@ -207,6 +207,25 @@ def test_bundled_corpus_is_labeled_good_bad_pairs():
         assert verds == {"good", "bad"}, f"{cwe} lacks a good/bad pair"
 
 
+def test_corpus_keeps_discrimination_negatives():
+    """The good cases must include some that CALL a dangerous sink safely.
+
+    Without these the corpus has no false-positive surface: every `good` case simply omits
+    the sink, so `fp_rate` is pinned at 0.0 by construction and `--max-fp-rate 0.0` cannot
+    fail under any detector change. This test is the guard on that property -- it fails if
+    the negatives are ever reverted to absence-only.
+    """
+    from lykos.analyze.detect.catalog import DANGEROUS, normalize
+    goods = [c for c in corpus.bundled() if c.verdict == "good"]
+    with_sink = [c for c in goods
+                 if any(normalize(fn) + "(" in c.source for fn in DANGEROUS)]
+    assert len(with_sink) >= 5, (
+        "corpus lost its discrimination negatives; fp_rate is no longer measurable. "
+        f"good cases calling a DANGEROUS sink: {[c.name for c in with_sink]}")
+    # and they must span more than one CWE class, or only one detector is exercised
+    assert len({c.cwe for c in with_sink}) >= 3
+
+
 def test_cwe_family_matching():
     # a sink's generic CWE credits a case labeled with a sibling (Juliet uses specific labels)
     assert same_family("CWE-121", "CWE-120") and same_family("CWE-787", "CWE-119")
