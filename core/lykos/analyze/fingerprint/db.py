@@ -1,0 +1,142 @@
+"""Offline component-CVE database + version matching (deterministic, no network).
+
+`COMPONENTS` maps a library to the byte patterns that reveal its version in a binary and a
+curated list of well-known CVEs with affected version ranges. This is a *seed* set (high-profile
+CVEs, ranges best-effort) meant to be extended -- an operator can drop a JSON file at
+$LYKOS_CVEDB (same shape) and it is merged in at scan time, so a fuller offline NVD-derived
+feed can be vendored without code changes. Everything here is air-gapped and rule-based.
+"""
+from __future__ import annotations
+
+import re
+
+# library -> {patterns: [regex with one version group], cves: [ {id,name,cvss,severity,cwe,
+#             ranges:[{ge?,gt?,le?,lt?,eq?}], summary} ]}
+COMPONENTS = {
+    "openssl": {
+        "patterns": [r"OpenSSL (\d+\.\d+\.\d+[a-z]{0,2})"],
+        "cves": [
+            {"id": "CVE-2014-0160", "name": "Heartbleed", "cvss": 7.5, "severity": "high",
+             "cwe": "CWE-125", "ranges": [{"ge": "1.0.1", "lt": "1.0.1g"}],
+             "summary": "TLS heartbeat out-of-bounds read leaks memory (Heartbleed)"},
+            {"id": "CVE-2016-2107", "cvss": 5.9, "severity": "medium", "cwe": "CWE-203",
+             "ranges": [{"ge": "1.0.1", "lt": "1.0.1t"}, {"ge": "1.0.2", "lt": "1.0.2h"}],
+             "summary": "Padding-oracle in AES-NI CBC MAC check"},
+            {"id": "CVE-2022-3602", "name": "punycode overflow", "cvss": 7.5,
+             "severity": "high", "cwe": "CWE-787",
+             "ranges": [{"ge": "3.0.0", "lt": "3.0.7"}],
+             "summary": "X.509 email-address punycode 4-byte stack buffer overflow"},
+        ],
+    },
+    "zlib": {
+        "patterns": [r"(?:in|de)flate (\d+\.\d+\.\d+) Copyright",
+                     r"\bzlib version (\d+\.\d+\.\d+)"],
+        "cves": [
+            {"id": "CVE-2018-25032", "cvss": 7.5, "severity": "high", "cwe": "CWE-787",
+             "ranges": [{"ge": "1.2.0", "lt": "1.2.12"}],
+             "summary": "Memory corruption on deflate with certain memLevel/window settings"},
+            {"id": "CVE-2022-37434", "cvss": 9.8, "severity": "critical", "cwe": "CWE-787",
+             "ranges": [{"lt": "1.2.12"}],
+             "summary": "Heap over-read/overflow in inflate() via a large gzip header extra field"},
+        ],
+    },
+    "libpng": {
+        "patterns": [r"libpng version (\d+\.\d+\.\d+)"],
+        "cves": [
+            {"id": "CVE-2015-8126", "cvss": 9.8, "severity": "critical", "cwe": "CWE-120",
+             "ranges": [{"lt": "1.6.20"}],
+             "summary": "Multiple buffer overflows in png_set_PLTE/png_get_PLTE"},
+            {"id": "CVE-2018-13785", "cvss": 5.3, "severity": "medium", "cwe": "CWE-190",
+             "ranges": [{"lt": "1.6.35"}],
+             "summary": "Integer overflow / divide-by-zero in png_check_chunk_length"},
+        ],
+    },
+    "busybox": {
+        "patterns": [r"BusyBox v(\d+\.\d+\.\d+)"],
+        "cves": [
+            {"id": "CVE-2021-42374", "cvss": 5.3, "severity": "medium", "cwe": "CWE-125",
+             "ranges": [{"lt": "1.34.0"}],
+             "summary": "Out-of-bounds read in the unlzma decompressor"},
+            {"id": "CVE-2021-42378", "cvss": 7.2, "severity": "high", "cwe": "CWE-416",
+             "ranges": [{"lt": "1.34.0"}],
+             "summary": "Use-after-free in awk (getvar_i)"},
+        ],
+    },
+    "sqlite": {
+        "patterns": [r"3\.\d+\.\d+ [0-9a-f]{40}", r"SQLite version (\d+\.\d+\.\d+)"],
+        "cves": [
+            {"id": "CVE-2019-5018", "cvss": 8.1, "severity": "high", "cwe": "CWE-416",
+             "ranges": [{"lt": "3.28.0"}],
+             "summary": "Use-after-free in window-function handling"},
+            {"id": "CVE-2020-13631", "cvss": 5.5, "severity": "medium", "cwe": "CWE-476",
+             "ranges": [{"lt": "3.32.0"}],
+             "summary": "Virtual table can be renamed into itself (crash)"},
+        ],
+    },
+    "curl": {
+        "patterns": [r"libcurl/(\d+\.\d+\.\d+)", r"curl (\d+\.\d+\.\d+)"],
+        "cves": [
+            {"id": "CVE-2023-38545", "name": "SOCKS5 overflow", "cvss": 9.8,
+             "severity": "critical", "cwe": "CWE-787",
+             "ranges": [{"ge": "7.69.0", "lt": "8.4.0"}],
+             "summary": "SOCKS5 proxy hostname heap buffer overflow"},
+        ],
+    },
+    "expat": {
+        "patterns": [r"expat_(\d+\.\d+\.\d+)", r"libexpat.*?(\d+\.\d+\.\d+)"],
+        "cves": [
+            {"id": "CVE-2022-25235", "cvss": 9.8, "severity": "critical", "cwe": "CWE-116",
+             "ranges": [{"lt": "2.4.5"}],
+             "summary": "Malformed UTF-8 / encoding handling enables injection"},
+        ],
+    },
+    "dropbear": {
+        "patterns": [r"[Dd]ropbear[ _](\d+\.\d+)"],
+        "cves": [
+            {"id": "CVE-2018-15599", "cvss": 5.3, "severity": "medium", "cwe": "CWE-200",
+             "ranges": [{"lt": "2018.76"}],
+             "summary": "recv_msg_userauth_request username enumeration"},
+        ],
+    },
+}
+
+
+# ------------------------------------------------------------------ version comparison
+def vkey(v: str):
+    """Sortable key for versions like 1.2.11 / 1.0.2k / 2018.76: each dotted part -> (int, str)
+    so numeric ordering dominates and a letter suffix (openssl) tie-breaks."""
+    out = []
+    for part in str(v).split("."):
+        m = re.match(r"(\d*)([a-zA-Z]*)", part)
+        num = int(m.group(1)) if m.group(1) else 0
+        out.append((num, m.group(2)))
+    return out
+
+
+def vcmp(a: str, b: str) -> int:
+    ka, kb = vkey(a), vkey(b)
+    n = max(len(ka), len(kb))
+    ka += [(0, "")] * (n - len(ka))
+    kb += [(0, "")] * (n - len(kb))
+    return -1 if ka < kb else (1 if ka > kb else 0)
+
+
+def in_range(v: str, r: dict) -> bool:
+    """All bounds in a range dict must hold (AND)."""
+    ok = True
+    if "eq" in r:
+        ok = ok and vcmp(v, r["eq"]) == 0
+    if "lt" in r:
+        ok = ok and vcmp(v, r["lt"]) < 0
+    if "le" in r:
+        ok = ok and vcmp(v, r["le"]) <= 0
+    if "gt" in r:
+        ok = ok and vcmp(v, r["gt"]) > 0
+    if "ge" in r:
+        ok = ok and vcmp(v, r["ge"]) >= 0
+    return ok
+
+
+def affected(version: str, cve: dict) -> bool:
+    """A CVE hits if the version falls in ANY of its ranges (OR)."""
+    return any(in_range(version, r) for r in cve.get("ranges", []))

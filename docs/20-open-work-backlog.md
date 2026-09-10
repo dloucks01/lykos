@@ -60,7 +60,7 @@ crashing input; many bug classes have a **derivable** input and need no fuzzing.
 
 ## D. Recon / intelligence
 
-- **[PLANNED] Embedded-library fingerprinting → offline CVE matching**: detect statically-linked
+- **[DONE] Embedded-library fingerprinting → offline CVE matching** (`cve_scan`): detect statically-linked
   library versions (zlib/openssl/busybox/…) from version strings/symbols and match a **vendored,
   offline** CVE DB. For static/stripped firmware this is often the fastest path to a real vuln and
   needs zero fuzzing.
