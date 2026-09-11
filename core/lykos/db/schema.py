@@ -247,4 +247,22 @@ CREATE INDEX ix_component_edge_case ON component_edge(case_id);
 ALTER TABLE function ADD COLUMN signature  TEXT;
 ALTER TABLE function ADD COLUMN frame_json TEXT;
 """),
+    Migration(version=11, name="finding_sites", sql=r"""
+-- A finding is a DEFECT, not a call site. Before this, one dangerous call site was one
+-- finding row, so a binary's finding count tracked compiler inlining rather than risk:
+-- jhead 3.06 built with distro flags produced 27 findings and the SAME PROGRAM at -O0
+-- produced 230, because -O0 does not inline memcpy. Sites are now evidence hanging off the
+-- defect, which is also how the Workbench already presented them ("x12 sites") while the
+-- findings board showed 12 separate rows of identical text.
+CREATE TABLE finding_site(
+  id            TEXT PRIMARY KEY,
+  finding_id    TEXT NOT NULL REFERENCES finding(id) ON DELETE CASCADE,
+  function_addr TEXT,
+  site_addr     TEXT,
+  detail        TEXT,
+  created_at    INTEGER NOT NULL,
+  UNIQUE(finding_id, function_addr, site_addr)
+);
+CREATE INDEX ix_finding_site ON finding_site(finding_id);
+"""),
 ]

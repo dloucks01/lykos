@@ -623,21 +623,27 @@ function renderBoard(){
     <span class="mono" style="color:var(--faint);font-size:11px">${rows.length} shown</span>
   </div>`;
   const body = rows.length ? `<table><thead><tr>
-      <th>Sev</th><th>CWE</th><th>Finding</th><th>State</th><th>Conf</th>
-      <th>Detector</th><th>Target</th><th>PoC</th></tr></thead><tbody>
+      <th>Sev</th><th>CWE</th><th>Finding</th><th>Sites</th><th>Where</th><th>State</th>
+      <th>Conf</th><th>Detector</th><th>PoC</th></tr></thead><tbody>
     ${rows.map(x=>{
       const conf=Math.round((x.confidence||0)*100);
       const ev=(x.evidence||[]).length;
       const lvl=x.poc_level?`<span class="lvl">${esc(x.poc_level)}</span>`:'';
+      // A finding is a DEFECT; `site_count` is how many places it occurs. The board used to
+      // print one row per site, so 12 identical "strncpy" rows with no location at all.
+      const n=x.site_count||0;
+      const where = x.function_addr ? (x.function_addr + (n>1?` +${n-1} more`:''))
+                                    : (x.target_name||'-');
       const sel=x.id===SEL_FINDING;
       const row=`<tr class="frow${sel?' sel':''}" data-fid="${x.id}" onclick="toggleFindingDetail('${x.id}')">
         <td><span class="sev ${x.severity}">${esc(x.severity)}</span></td>
         <td class="mono">${esc(x.cwe||'-')}</td>
         <td><div class="ttl">${esc(x.title||'')}</div><div class="ev">${ev} evidence</div></td>
+        <td class="mono">${n>1?`&times;${n}`:(n===1?'1':'-')}</td>
+        <td class="mono" style="font-size:11px">${esc(where)}</td>
         <td><span class="st ${x.state==='poc-backed'?'pocbacked':x.state}">${esc(x.state)}</span></td>
         <td><div class="cbar" title="${conf}%"><i style="width:${conf}%"></i></div></td>
         <td class="mono" style="font-size:11px">${esc(x.detector||'-')}</td>
-        <td class="mono" style="font-size:11px">${esc(x.target_name||'-')} <span class="arch">${esc(x.target_arch||'')}</span></td>
         <td>${lvl}</td></tr>`;
       return row + (sel?findingDetailRow(x):'');
     }).join('')}</tbody></table>` : `<div class="empty">No findings match. Run detection, fuzzing, or PoC stages on the Workbench.</div>`;
@@ -650,8 +656,13 @@ function boardTile(key,val){
   renderBoard();
 }
 let SEL_FINDING=null;
-function toggleFindingDetail(id){
+let SITES={};
+async function toggleFindingDetail(id){
   SEL_FINDING = (SEL_FINDING===id)?null:id;
+  if(SEL_FINDING && !SITES[id]){
+    const f = await api(`/findings/${id}`);           // the detail endpoint carries the sites
+    if(f && f.sites) SITES[id] = f.sites;
+  }
   renderBoard();
   if(SEL_FINDING){ const r=document.querySelector(`tr[data-fid="${SEL_FINDING}"]`);
     if(r) r.scrollIntoView({block:'nearest',behavior:'smooth'}); }
@@ -667,6 +678,9 @@ function findingDetailRow(x){
       <span class="fdmeta">${esc(x.severity)} · ${conf}% confidence · detector ${esc(x.detector||'-')} · ${esc(x.target_name||'')} <span class="arch">${esc(x.target_arch||'')}</span></span></div>
     <div class="fdkv"><span>state</span><b><span class="st ${x.state==='poc-backed'?'pocbacked':x.state}">${esc(x.state)}</span></b></div>
     <div class="fdkv"><span>location</span><b>${loc}</b></div>
+    ${(x.site_count||0) > 1 ? `<div class="fdkv"><span>sites</span><b>${x.site_count} places in this target${SITES[x.id]?'':' — open to list'}</b></div>` : ''}
+    ${SITES[x.id] ? `<div class="eyebrow" style="margin:9px 0 4px">Sites (${SITES[x.id].length})</div>
+      <div class="evlist">${SITES[x.id].map(sv=>`<div class="evrow"><span class="mono">${esc(sv.function_addr||'?')}</span>${sv.site_addr?` @ <span class="mono">${esc(sv.site_addr)}</span>`:''}${sv.detail?` — ${esc(sv.detail)}`:''}</div>`).join('')}</div>` : ''}
     ${x.poc_level?`<div class="fdkv"><span>PoC</span><b><span class="lvl">${esc(x.poc_level)}</span> verified</b></div>`:''}
     <div class="eyebrow" style="margin:9px 0 4px">Evidence (${(x.evidence||[]).length})</div>
     <div class="evlist">${ev}</div>
