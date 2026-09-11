@@ -274,3 +274,54 @@ def test_reachability_uses_shortest_distance_not_first_path_found():
     assert reaches_within("src", {"src"}, {}, depth=0) is True          # start IS a source
     assert reaches_within("sink", {"src"}, {}, depth=4) is False        # no edges at all
     assert reaches_within("a", {"src"}, {"a": {"b"}, "b": {"a"}}, depth=9) is False  # cycle
+
+
+def test_a_finding_is_a_defect_and_call_sites_are_its_evidence(store, case):
+    """One dangerous call site used to be one finding, so the finding COUNT tracked compiler
+    inlining rather than risk: jhead 3.06 built with distro flags produced 27 findings and the
+    same program at -O0 produced 230, because -O0 does not inline memcpy. The findings board
+    showed 12 identical `strncpy` rows with no location, while the workbench showed one row
+    saying "x12 sites" -- two views of one API disagreeing about what a finding is.
+    """
+    from lykos.analyze.detect.detectors import DetectContext, dangerous_api
+    from lykos.db.dao import FindingDAO
+    from lykos.db.models import CallEdge
+
+    t = make_target(store, case.id, content=b"\x7fELFgrain1")
+    edges = [CallEdge(id=f"e{i}", target_id=t.id, src_addr=f"0x1{i:03x}",
+                      site_addr=f"0x2{i:03x}", dst_addr=None, dst_name="strcpy",
+                      external=True, created_at=0) for i in range(7)]
+    ctx = DetectContext(target_id=t.id, case_id=case.id, call_edges=edges, strings=[])
+    fd = FindingDAO(store.conn)
+    for c in dangerous_api(ctx):
+        fd.upsert(t.id, case.id, c)
+
+    fs = fd.list_by_target(t.id)
+    assert len(fs) == 1, f"7 call sites of one sink must be ONE defect, got {len(fs)}"
+    sites = fd.sites(fs[0].id)
+    assert len(sites) == 7, "every call site is kept as evidence"
+    assert fd.site_counts(t.id)[fs[0].id] == 7
+    # the finding still carries a representative location for existing consumers
+    assert fs[0].function_addr and fs[0].site_addr
+    # and each site is individually addressable, which the board needs for its Where column
+    assert {s["site_addr"] for s in sites} == {f"0x2{i:03x}" for i in range(7)}
+
+
+def test_distinct_sinks_stay_distinct_findings(store, case):
+    """Grouping must not over-merge: strcpy and system are different defects."""
+    from lykos.analyze.detect.detectors import DetectContext, dangerous_api
+    from lykos.db.dao import FindingDAO
+    from lykos.db.models import CallEdge
+
+    t = make_target(store, case.id, content=b"\x7fELFgrain2")
+    edges = [CallEdge(id="a", target_id=t.id, src_addr="0x100", site_addr="0x200",
+                      dst_addr=None, dst_name="strcpy", external=True, created_at=0),
+             CallEdge(id="b", target_id=t.id, src_addr="0x100", site_addr="0x204",
+                      dst_addr=None, dst_name="system", external=True, created_at=0)]
+    ctx = DetectContext(target_id=t.id, case_id=case.id, call_edges=edges, strings=[])
+    fd = FindingDAO(store.conn)
+    for c in dangerous_api(ctx):
+        fd.upsert(t.id, case.id, c)
+    fs = fd.list_by_target(t.id)
+    assert len(fs) == 2, "different sinks are different defects"
+    assert {f.cwe for f in fs} == {"CWE-120", "CWE-78"}

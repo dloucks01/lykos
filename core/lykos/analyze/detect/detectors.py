@@ -33,11 +33,18 @@ class DetectContext:
 
 
 def _cand(cwe, title, severity, detector, evidence, *, function_addr=None,
-          site_addr=None, dedup_key, state="candidate", confidence=0.4):
+          site_addr=None, dedup_key, state="candidate", confidence=0.4, site_detail=None):
+    """One OCCURRENCE of a defect.
+
+    `dedup_key` names the defect, not the place: occurrences sharing a key merge into one
+    finding and each contributes a site. Keying on the address made every call site its own
+    finding, so the count tracked compiler inlining -- the same program at -O0 produced 230
+    findings where the distro build produced 27.
+    """
     return {"cwe": cwe, "title": title, "severity": severity, "detector": detector,
             "evidence": list(evidence), "function_addr": function_addr,
             "site_addr": site_addr, "dedup_key": dedup_key, "state": state,
-            "confidence": confidence}
+            "confidence": confidence, "site_detail": site_detail}
 
 
 # ------------------------------------------------------------- dangerous-API sinks (rule)
@@ -53,7 +60,7 @@ def dangerous_api(ctx: DetectContext):
             cwe, f"{desc}", sev, "dangerous_api",
             [{"channel": "pattern", "detail": f"call to {n}() at {e.site_addr}"}],
             function_addr=e.src_addr, site_addr=e.site_addr,
-            dedup_key=f"{cwe}:{e.src_addr}:{e.site_addr}:{n}",
+            dedup_key=f"{cwe}:dangerous_api:{n}",
             confidence=0.4))
     return out
 
@@ -99,7 +106,7 @@ def stack_buffer_overflow(ctx: DetectContext):
               "detail": f"~{off_to_ret} bytes from the buffer to the saved return address "
                         f"(recovered frame; overflow offset hint)"}],
             function_addr=addr, site_addr=site,
-            dedup_key=f"CWE-121:{addr}:{site}:{n}", confidence=0.55))
+            dedup_key=f"CWE-121:{addr}:{n}", confidence=0.55))
     return out
 
 
@@ -163,7 +170,7 @@ def weak_crypto(ctx: DetectContext):
                     cwe, f"Use of {desc}", "medium", "weak_crypto",
                     [{"channel": "pattern", "detail": f"call to {call}() at {e.site_addr}"}],
                     function_addr=e.src_addr, site_addr=e.site_addr,
-                    dedup_key=f"{cwe}:crypto:{e.src_addr}:{e.site_addr}:{tok}", confidence=0.5))
+                    dedup_key=f"{cwe}:crypto:{tok}", confidence=0.5))
                 break
     return out
 
@@ -178,7 +185,7 @@ def weak_random(ctx: DetectContext):
                 "CWE-330", "Use of an insecure/predictable PRNG", "medium", "weak_random",
                 [{"channel": "pattern", "detail": f"call to {n}() at {e.site_addr}"}],
                 function_addr=e.src_addr, site_addr=e.site_addr,
-                dedup_key=f"CWE-330:{e.src_addr}:{e.site_addr}", confidence=0.4))
+                dedup_key=f"CWE-330:{n}", confidence=0.4))
     return out
 
 
@@ -192,7 +199,7 @@ def insecure_tmp(ctx: DetectContext):
                 "CWE-377", f"Insecure temporary file via {n}()", "medium", "insecure_tmp",
                 [{"channel": "pattern", "detail": f"call to {n}() at {e.site_addr}"}],
                 function_addr=e.src_addr, site_addr=e.site_addr,
-                dedup_key=f"CWE-377:{e.src_addr}:{e.site_addr}", confidence=0.5))
+                dedup_key=f"CWE-377:{n}", confidence=0.5))
     return out
 
 

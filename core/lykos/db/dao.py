@@ -477,6 +477,10 @@ class FindingDAO(BaseDAO):
 
         Merge = union of evidence, and take the *higher* state/severity/confidence. This is
         how the confidence lifecycle advances when multiple channels agree (doc 05).
+
+        A finding is a DEFECT; each occurrence is recorded as a SITE against it (see the
+        finding_site migration). `function_addr`/`site_addr` on the finding row stay as the
+        first site seen, so existing consumers keep working.
         """
         self.conn.execute("BEGIN IMMEDIATE")
         try:
@@ -511,9 +515,34 @@ class FindingDAO(BaseDAO):
                      c.get("severity", "info"), c.get("state", "candidate"),
                      c.get("confidence", 0.0), c.get("function_addr"), c.get("site_addr"),
                      c.get("detector"), key, dumps(ev_new), now, now))
+            fid = self.conn.execute(
+                "SELECT id FROM finding WHERE target_id=? AND dedup_key=?",
+                (target_id, key)).fetchone()["id"]
+            if c.get("function_addr") or c.get("site_addr"):
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO finding_site(id,finding_id,function_addr,"
+                    "site_addr,detail,created_at) VALUES(?,?,?,?,?,?)",
+                    (new_id(), fid, c.get("function_addr"), c.get("site_addr"),
+                     c.get("site_detail"), now))
             self.conn.execute("COMMIT")
         except Exception:
             self.conn.execute("ROLLBACK"); raise
+
+    def sites(self, finding_id: str) -> list[dict]:
+        """Every place this defect occurs, oldest first."""
+        rows = self.conn.execute(
+            "SELECT function_addr, site_addr, detail FROM finding_site "
+            "WHERE finding_id=? ORDER BY created_at, rowid", (finding_id,)).fetchall()
+        return [{"function_addr": r["function_addr"], "site_addr": r["site_addr"],
+                 "detail": r["detail"]} for r in rows]
+
+    def site_counts(self, target_id: str) -> dict:
+        """finding id -> number of recorded sites, for the whole target in one query."""
+        rows = self.conn.execute(
+            "SELECT f.id AS fid, COUNT(s.id) AS n FROM finding f "
+            "LEFT JOIN finding_site s ON s.finding_id = f.id "
+            "WHERE f.target_id=? GROUP BY f.id", (target_id,)).fetchall()
+        return {r["fid"]: int(r["n"]) for r in rows}
 
     def list_by_target(self, target_id: str) -> list[Finding]:
         rows = self.conn.execute(

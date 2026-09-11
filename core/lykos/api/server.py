@@ -216,8 +216,11 @@ class Handler(BaseHTTPRequestHandler):
             if m:
                 s = self._store()
                 try:
-                    fs = FindingDAO(s.conn).list_by_target(m.group(1))
-                    return self._json([_finding(x) for x in fs])
+                    fd = FindingDAO(s.conn)
+                    fs = fd.list_by_target(m.group(1))
+                    counts = fd.site_counts(m.group(1))
+                    return self._json([_finding(x, site_count=counts.get(x.id, 0))
+                                       for x in fs])
                 finally:
                     s.close()
             m = _CASE_FIND.match(path)
@@ -236,10 +239,11 @@ class Handler(BaseHTTPRequestHandler):
             if m:
                 s = self._store()
                 try:
-                    f = FindingDAO(s.conn).get(m.group(1))
+                    fd = FindingDAO(s.conn)
+                    f = fd.get(m.group(1))
                     if not f:
                         return self._json({"error": "no finding"}, 404)
-                    return self._json(_finding(f))
+                    return self._json(_finding(f, sites=fd.sites(f.id)))
                 finally:
                     s.close()
             m = _TARGET_DYN.match(path)
@@ -351,8 +355,12 @@ class Handler(BaseHTTPRequestHandler):
                 if lvls:
                     best_poc[t.id] = max(lvls)          # "L2" > "L1" lexicographically
             out = []
-            for f in FindingDAO(s.conn).list_by_case(cid):
-                d = _finding(f)
+            fd = FindingDAO(s.conn)
+            counts = {}
+            for tid in tmap:
+                counts.update(fd.site_counts(tid))
+            for f in fd.list_by_case(cid):
+                d = _finding(f, site_count=counts.get(f.id, 0))
                 t = tmap.get(f.target_id)
                 d["target_name"] = t.filename if t else None
                 d["target_arch"] = t.arch if t else None
@@ -773,11 +781,17 @@ def _dynresult(d):
             "duration_ms": d.duration_ms, "note": d.note, "created_at": d.created_at}
 
 
-def _finding(f):
-    return {"id": f.id, "target_id": f.target_id, "case_id": f.case_id, "cwe": f.cwe,
-            "title": f.title, "severity": f.severity, "state": f.state,
-            "confidence": f.confidence, "function_addr": f.function_addr,
-            "site_addr": f.site_addr, "detector": f.detector, "evidence": f.evidence}
+def _finding(f, sites=None, site_count=None):
+    """Serialize a finding. `sites` is the list of places the defect occurs; `site_count` is
+    the cheap aggregate for list views. A finding is a DEFECT -- the sites are evidence."""
+    d = {"id": f.id, "target_id": f.target_id, "case_id": f.case_id, "cwe": f.cwe,
+         "title": f.title, "severity": f.severity, "state": f.state,
+         "confidence": f.confidence, "function_addr": f.function_addr,
+         "site_addr": f.site_addr, "detector": f.detector, "evidence": f.evidence}
+    if sites is not None:
+        d["sites"] = sites
+    d["site_count"] = len(sites) if sites is not None else (site_count or 0)
+    return d
 
 
 def _call_edge(e):
