@@ -319,14 +319,17 @@ candidate recall 1.00 / fp_rate 0.571; corroborated recall 0.833 / fp_rate 0.214
 
 None of these are hypothetical; each was read off the code, but none has a reproducer yet.
 
-- **[PLANNED] `reap()` can requeue a job whose worker is still running it.** The worker's
-  `complete()` then finds `status != 'running'`, returns False, and silently discards the result
-  while a second worker re-runs the job. Heartbeats make it unlikely, not impossible.
-- **[PLANNED] `JobQueue._emit` fires `on_event` before `COMMIT`** inside
-  `_materialize_cache_hit`/`complete`/`fail`, so an SSE/WebSocket consumer can observe an event
-  that a rollback then erases.
-- **[PLANNED] `enqueue()` cache/dedup is check-then-insert**, racy between workers. Benign
-  (duplicate work), but it defeats the dedup it exists for.
+- **[DONE] `reap()` requeuing a job whose worker is still running it** no longer loses the
+  result silently. The drop itself is unavoidable (another worker may already own the row), but
+  it now emits a `job.result_discarded` warning naming the reason and the worker, and
+  completion is guarded by claim identity so a stale worker cannot overwrite the new owner's
+  job. Regression-tested both ways.
+- **[DONE] `JobQueue._emit` fired `on_event` before `COMMIT`** — callbacks are now queued and
+  delivered only after the transaction commits, and dropped on rollback, so a consumer can
+  never observe an event the database does not contain.
+- **[DONE] `enqueue()` cache/dedup check-then-insert race** — the lookup and the insert that
+  depends on it now run under one `BEGIN IMMEDIATE`. Tested with six concurrent enqueues of the
+  same cache key producing exactly one row.
 - **[PLANNED] Temp-directory leak per request.** `_upload_target`, `_import_case` and
   `_get_case_export` each `mkdtemp()` and only `unlink()` the file inside, never the directory.
 - **[PLANNED] Stage input parameters are inconsistent and fail silently.** `dynamic_run`
