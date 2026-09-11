@@ -28,6 +28,11 @@ COPY_ARGS = {
     "snprintf": (0, 1), "strlcpy": (0, 2), "strlcat": (0, 2),
 }
 
+# Sinks that copy until NUL: the bound is the SOURCE's length, not an argument. (dst, src).
+# strcat is deliberately absent -- it appends, so bounding strlen(src) says nothing without
+# also knowing what the destination already holds.
+NUL_COPY_ARGS = {"strcpy": (0, 1), "stpcpy": (0, 1)}
+
 UNKNOWN = "unknown"
 SAFE = "bounded"
 SUSPECT = "exceeds-recovered-size"
@@ -433,15 +438,159 @@ def classify_site(instrs, site_addr, sink, frame, arch, bits=64,
             "why": f"copies a constant {n} bytes into {name} ({room} available)"}
 
 
+def _spill_slot(instrs, after_addr, regs, bases, bits, sp=None):
+    """Where a call's return value is stored, scanning FORWARD from the call.
+
+    `strlen`'s result has to land in a frame slot before a guard can compare it, and that
+    spill happens after the call -- which is past where the backward slice stops.
+    """
+    live = False
+    held = set(regs)
+    for ins in instrs:
+        if ins.get("addr") == after_addr:
+            live = True
+            continue
+        if not live:
+            continue
+        consts, slots = {}, {}
+        for pc in ins.get("pcode", []) or []:
+            try:
+                mnem, _i, outk, toks = _parse(pc)
+            except Exception:
+                continue
+            if mnem == "COPY" and outk is not None and len(toks) >= 2:
+                c = _const_of(toks[1])
+                if c is not None:
+                    consts[outk] = c
+                elif _key(toks[1]) in held:
+                    held.add(outk)
+                continue
+            if mnem == "INT_ADD" and outk is not None and len(toks) >= 3:
+                for regk, dtok in ((_key(toks[1]), toks[2]), (_key(toks[2]), toks[1])):
+                    if regk and regk[0] == "reg" and regk[1] in bases:
+                        d = _const_of(dtok)
+                        if d is None and _key(dtok) in consts:
+                            d = consts[_key(dtok)]
+                        if d is not None:
+                            slots[outk] = (regk[1], _signed(d, bits))
+                continue
+            if mnem in ("INT_SEXT", "INT_ZEXT", "SUBPIECE") and outk is not None and \
+                    len(toks) >= 2 and _key(toks[1]) in held:
+                held.add(outk)
+                continue
+            if mnem == "STORE" and len(toks) >= 4:
+                dst = slots.get(_key(toks[2]))
+                if dst is not None and _key(toks[3]) in held:
+                    return dst
+        if any(pc.startswith("CALL") for pc in ins.get("pcode", []) or []):
+            return None                           # another call clobbers the return register
+    return None
+
+
+def strlen_bound(blocks, site_block, site_addr, src, strlen_sites, bases, bits, abi, dom):
+    """Largest source length a dominating guard permits at this copy, or None.
+
+    `strcpy` has no length argument, which is why COPY_ARGS excludes it -- the bound is the
+    source, "which this pass cannot see". It can see one very common case: the program
+    measures the source with `strlen`, spills the result, and a dominating check compares
+    that slot against a constant. Both of gzip 1.3.5's high-severity CWE-121 candidates are
+    exactly this and both are safe -- `get_suffix` guards `strcpy(suffix,name)` with
+    `nlen <= MAX_SUFFIX+2`, and `treat_dir` guards `strcpy(nbuf,dir)` with a check on
+    `strlen(dir)`.
+
+    The measured string must be the one being copied: bounding some OTHER string's length
+    would demote a real overflow on the strength of an unrelated check.
+    """
+    argregs = abi.get("args") or []
+    retregs = abi.get("ret") or set()
+    if not argregs or not retregs or src is None:
+        return None
+    by_addr = {b["addr"]: b for b in blocks}
+    for sl_site, sl_block in strlen_sites:
+        blk = by_addr.get(sl_block)
+        if blk is None:
+            continue
+        ins = blk.get("instructions", []) or []
+        vals, _ = _slice_block(ins, sl_site, bases, bits)
+        measured = None
+        for r in argregs[0]:
+            if vals.get(("reg", r)) is not None:
+                measured = vals[("reg", r)]
+                break
+        if measured is None or measured != src:
+            continue                              # a different string: proves nothing here
+        slot = _spill_slot(ins, sl_site, {("reg", r) for r in retregs}, bases, bits)
+        if slot is None:
+            continue
+        g = guard_bound(blocks, site_block, slot, bases=bases, dom=dom)
+        if g:
+            return g
+    return None
+
+
+def classify_nul_site(instrs, site_addr, sink, frame, arch, bits, blocks, site_block,
+                      dom, base_offs, strlen_sites):
+    """Verdict for a strcpy-class site, bounded by a dominating check on strlen(source)."""
+    ak = _arch_key(arch)
+    if not ak or sink not in NUL_COPY_ARGS:
+        return None
+    abi = ARCH_ABI[ak]
+    argregs = abi.get("args") or []
+    if not argregs:
+        return None                                   # stack-passing ABI: out of scope here
+    bases = abi.get("frame", ())
+    dst_i, src_i = NUL_COPY_ARGS[sink]
+    if src_i >= len(argregs):
+        return None
+    vals, _ = _slice_block(instrs, site_addr, bases, bits)
+
+    def arg(i):
+        for r in argregs[i]:
+            if vals.get(("reg", r)) is not None:
+                return vals[("reg", r)]
+        return None
+
+    dst, src = arg(dst_i), arg(src_i)
+    if not dst or dst[0] != "frame":
+        return None                                   # not a recovered stack destination
+    word = (bits or 64) // 8
+    goff = (base_offs[dst[1]] + dst[2]) if (base_offs and dst[1] in base_offs) \
+        else _ghidra_offset(frame, dst[1], dst[2], word, ak)
+    cap = _capacity(frame, dst[1], goff)
+    if cap is None:
+        return None
+    name, room = cap
+    g = strlen_bound(blocks, site_block, site_addr, src, strlen_sites, bases, bits, abi, dom)
+    if not g:
+        return None                                   # no bound found: leave the finding alone
+    gmax = g["bound"]
+    if gmax < room:
+        return {"verdict": SAFE, "buffer": name, "capacity": room, "bound": gmax,
+                "guard": True,
+                "why": (f"the source length is measured with strlen and {g['why']}; "
+                        f"{name} holds {room}")}
+    return {"verdict": UNKNOWN, "buffer": name, "capacity": room,
+            "why": (f"a dominating check permits a source length of {gmax}, which {name} "
+                    f"({room} bytes) does not clear")}
+
+
 def classify_program(func_irs: dict, call_edges, frames: dict, arch, bits=64) -> dict:
     """site_addr -> verdict, for every copy sink whose call site we can read."""
     from .catalog import normalize
     out: dict = {}
     by_site = {}
+    nul_by_site = {}
+    strlen_by_func: dict = {}
     for e in call_edges:
         n = normalize(e.dst_name)
-        if n in COPY_ARGS and e.site_addr and e.src_addr:
+        if not (e.site_addr and e.src_addr):
+            continue
+        if n in COPY_ARGS:
             by_site[e.site_addr] = (e.src_addr, n)
+        elif n in NUL_COPY_ARGS:
+            nul_by_site[e.site_addr] = (e.src_addr, n)
+        elif n == "strlen":
+            strlen_by_func.setdefault(e.src_addr, []).append(e.site_addr)
     ak = _arch_key(arch)
     bases = (ARCH_ABI.get(ak) or {}).get("frame", ()) if ak else ()
     for faddr, ir in (func_irs or {}).items():
@@ -451,12 +600,30 @@ def classify_program(func_irs: dict, call_edges, frames: dict, arch, bits=64) ->
         for b in blocks:
             bins = b.get("instructions", [])
             for i in bins:
-                hit = by_site.get(i.get("addr"))
+                hit = by_site.get(i.get("addr")) or nul_by_site.get(i.get("addr"))
                 if not hit or hit[0] != faddr:
+                    continue
+                if i.get("addr") in nul_by_site:
+                    if dom is None:
+                        dom = dominators(blocks)
+                        base_offs = base_offsets(blocks, bases, ak)
+                        sl_sites = [(a, b2["addr"]) for b2 in blocks
+                                    for i2 in b2.get("instructions", [])
+                                    for a in [i2.get("addr")]
+                                    if a in set(strlen_by_func.get(faddr, ()))]
+                    v = classify_nul_site(bins, i["addr"], hit[1], frames.get(faddr) or {},
+                                          arch, bits, blocks, b.get("addr"), dom, base_offs,
+                                          sl_sites)
+                    if v:
+                        out[i["addr"]] = {**v, "sink": hit[1], "function_addr": faddr}
                     continue
                 if dom is None:
                     dom = dominators(blocks)
                     base_offs = base_offsets(blocks, bases, ak)
+                    sl_sites = [(a, b2["addr"]) for b2 in blocks
+                                for i2 in b2.get("instructions", [])
+                                for a in [i2.get("addr")]
+                                if a in set(strlen_by_func.get(faddr, ()))]
                 v = classify_site(bins, i["addr"], hit[1], frames.get(faddr) or {},
                                   arch, bits=bits, blocks=blocks, site_block=b.get("addr"),
                                   dom=dom, base_offs=base_offs)

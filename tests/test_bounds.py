@@ -389,3 +389,83 @@ def test_a_copy_that_fits_the_frame_does_not_claim_an_overflow():
 def test_a_guard_that_overruns_the_whole_frame_is_surfaced():
     v = _classify(_x86_guard(1 << 20, "JA", "0x3000", "0x2000"))
     assert v["verdict"] == bounds.SUSPECT and "does not protect the buffer" in v["why"]
+
+
+# ------------------------------------------------- strcpy, bounded by a check on strlen(src)
+# COPY_ARGS excludes strcpy because "the bound is the SOURCE, which this pass cannot see". It
+# can see one very common case: the program measures the source with strlen, spills the
+# result, and a dominating check compares that slot against a constant. Both of gzip 1.3.5's
+# high-severity CWE-121 candidates are that shape and both are safe -- `get_suffix` guards
+# `strcpy(suffix,name)` with `nlen <= MAX_SUFFIX+2` against a 33-byte buffer.
+def test_strcat_is_deliberately_not_bounded_this_way():
+    """strcat APPENDS, so bounding strlen(src) says nothing without knowing what the
+    destination already holds. Treating it like strcpy would demote real overflows."""
+    assert "strcat" not in bounds.NUL_COPY_ARGS
+    assert "strcpy" in bounds.NUL_COPY_ARGS
+
+
+def test_a_spilled_return_value_is_found_after_the_call():
+    """The backward slice stops at the call, but strlen's result is stored AFTER it -- which
+    is the only place a guard can read it from."""
+    instrs = [
+        _i("0x100", ["CALL ram:0x9000:8"], "CALL strlen"),
+        _i("0x104", [f"INT_ADD reg:RBP:8 const:{_SLOT_DISP}:8 -> unique:0x10:8",
+                     "STORE const:0x1b1:4 unique:0x10:8 reg:RAX:8"], "MOV [RBP-4],EAX"),
+    ]
+    assert bounds._spill_slot(instrs, "0x100", {("reg", "RAX")}, ("RBP",), 64) == ("RBP", -4)
+
+
+def test_a_return_value_clobbered_by_another_call_is_not_tracked():
+    """Once a second call runs, the return register no longer holds the length."""
+    instrs = [
+        _i("0x100", ["CALL ram:0x9000:8"], "CALL strlen"),
+        _i("0x104", ["CALL ram:0x9100:8"], "CALL something_else"),
+        _i("0x108", [f"INT_ADD reg:RBP:8 const:{_SLOT_DISP}:8 -> unique:0x10:8",
+                     "STORE const:0x1b1:4 unique:0x10:8 reg:RAX:8"], "MOV [RBP-4],EAX"),
+    ]
+    assert bounds._spill_slot(instrs, "0x100", {("reg", "RAX")}, ("RBP",), 64) is None
+
+
+def _strlen_block(src_disp, guard_k):
+    """`nlen = strlen(name); if (nlen <= K) ...` as gcc -O0 emits it."""
+    return {"addr": "0x1000", "succ": ["0x3000", "0x2000"], "instructions": [
+        _i("0x1000", [f"INT_ADD reg:RBP:8 const:{src_disp}:8 -> unique:0x20:8",
+                      "LOAD const:0x1b1:8 unique:0x20:8 -> reg:RDI:8"], "MOV RDI,[RBP+src]"),
+        _i("0x1004", ["CALL ram:0x9000:8"], "CALL strlen"),
+        _i("0x1008", [f"INT_ADD reg:RBP:8 const:{_SLOT_DISP}:8 -> unique:0x10:8",
+                      "STORE const:0x1b1:4 unique:0x10:8 reg:RAX:8"], "MOV [RBP-4],EAX"),
+        _i("0x100c", _x86_cmp(guard_k), f"CMP dword ptr [RBP-4],{guard_k:#x}"),
+        _i("0x1010", _X86_COND["JA"][0] + ["CBRANCH ram:0x3000:8 unique:0x19000:1"],
+           "JA 0x3000"),
+    ]}
+
+
+_SRC_DISP = "0xffffffffffffffe8"          # RBP-0x18, where the source pointer lives
+
+
+def test_a_dominating_strlen_check_bounds_a_strcpy():
+    blk = _strlen_block(_SRC_DISP, 32)
+    blocks = _blocks(blk)
+    src = ("load", "RBP", -0x18)
+    got = bounds.strlen_bound(blocks, "0x2000", "0x200c", src, [("0x1004", "0x1000")],
+                              ("RBP", "RSP"), 64, bounds.ARCH_ABI["x86-64"],
+                              bounds.dominators(blocks))
+    assert got is not None and got["bound"] == 32
+
+
+def test_measuring_a_DIFFERENT_string_proves_nothing():
+    """Bounding some other string's length would demote a real overflow on the strength of an
+    unrelated check -- the exact failure this module exists to avoid."""
+    blocks = _blocks(_strlen_block(_SRC_DISP, 32))
+    other = ("load", "RBP", -0x40)                # not the pointer strlen measured
+    assert bounds.strlen_bound(blocks, "0x2000", "0x200c", other, [("0x1004", "0x1000")],
+                               ("RBP", "RSP"), 64, bounds.ARCH_ABI["x86-64"],
+                               bounds.dominators(blocks)) is None
+
+
+def test_an_unmeasured_strcpy_stays_unknown():
+    """No strlen, no bound -- the finding is left exactly as the rule left it."""
+    blocks = _blocks(_strlen_block(_SRC_DISP, 32))
+    assert bounds.strlen_bound(blocks, "0x2000", "0x200c", ("load", "RBP", -0x18), [],
+                               ("RBP", "RSP"), 64, bounds.ARCH_ABI["x86-64"],
+                               bounds.dominators(blocks)) is None

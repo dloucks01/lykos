@@ -9,39 +9,16 @@ import json
 import shutil
 import sys
 
-from ...db.dao import CallEdgeDAO, DynResultDAO, FindingDAO, FunctionDAO, TargetDAO
+from ...db.dao import CallEdgeDAO, FindingDAO, FunctionDAO, TargetDAO
 from ...jobs.registry import register_stage
 from .. import elf
 from ..dynamic import sandbox
-from ..poc.capture import make_capture, make_qemu_capture, materialize_helper
+from ..poc.capture import MODES, how_to_feed, make_capture, make_qemu_capture, materialize_helper
 from . import gdb, qemu_gdb, rootcause
 
 ROOT_CAUSE_STAGE = "root_cause"
 TOOL = "rootcause"
 TOOL_VERSION = "rootcause-1"
-
-
-# Every way a target can be handed its input. Order matters only as a fallback sweep.
-_MODES = ("stdin", "file", "arg")
-
-
-def _how_to_feed(ctx, target, input_sha, params):
-    """(mode, argv, why) -- how this input reached the program when it crashed.
-
-    This used to default to stdin unconditionally, so a file parser silently reported "no
-    fault reproduced": a crashing input fed the wrong way is indistinguishable from an input
-    that does not crash, and the stage announced the second when it meant the first.
-
-    The dynamic run that FOUND the input already recorded the mode and argv it used, which is
-    authoritative whenever the crash came from this pipeline. Anything else is only a starting
-    guess -- the caller sweeps the remaining modes before concluding anything.
-    """
-    if params.get("input_mode"):
-        return params["input_mode"], list(params.get("argv") or []), "given"
-    for r in DynResultDAO(ctx.conn).list_by_target(target.id):
-        if r.input_sha == input_sha and r.input_mode:
-            return r.input_mode, list(r.argv or []), "recorded by the run that found it"
-    return _MODES[0], list(params.get("argv") or []), "no record of how it was found"
 
 
 def _hex(v):
@@ -58,7 +35,7 @@ def root_cause_stage(ctx) -> dict:
     if not input_sha:
         raise ValueError("root_cause requires params.input_sha (a crashing input)")
     timeout = float(p.get("timeout", 10))
-    mode, base_argv, mode_why = _how_to_feed(ctx, target, input_sha, p)
+    mode, base_argv, mode_why = how_to_feed(ctx.conn, target, input_sha, p)
 
     host = sandbox.host_arch()
     emulated = bool(target.arch and target.arch != host)
@@ -107,7 +84,7 @@ def root_cause_stage(ctx) -> dict:
     # Try the mode we believe in, then the others. A crashing input fed the wrong way looks
     # exactly like an input that does not crash, and reporting that as "no fault reproduced"
     # turns a wrong setup into what reads as a clean negative result.
-    order = [mode] + [m for m in _MODES if m != mode]
+    order = [mode] + [m for m in MODES if m != mode]
     tried = []
     for m in order:
         ctx.progress(msg=f"capturing fault under {backend} ({m})")

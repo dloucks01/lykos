@@ -318,9 +318,43 @@ actionable.
   NUL, and execve truncates at the first NUL regardless, so the shell hands over exactly the
   bytes the kernel would. The bundle is the deliverable; one that does not reproduce is worse
   than none.
-- **[PLANNED] `poc_primitive` still defaults `input_mode` to stdin.** `root_cause` learned to
-  consult the run that found the input and then sweep the remaining modes; the L2 stage has the
-  same silent failure and should share that helper.
+- **[DONE] The silent stdin default was in THREE stages, not one.** `root_cause`,
+  `poc_primitive` and `build_poc` each defaulted `input_mode` to stdin, so an argv- or
+  file-driven target reported "did not fault" / "no L2 primitive" / an unverified L0 — all of
+  which read as real negative results and all of which meant "we fed it the wrong way". The
+  rule now lives once in `poc.capture.how_to_feed` (consult the dynamic run that FOUND the
+  input, else guess) and every one of the three sweeps the remaining modes before concluding
+  anything. Measured: with `params={'input_sha': ...}` and nothing else — exactly what the GUI
+  sends — ncompress now goes L1 → **L2 confirmed**, where before `build_poc` filed an
+  unverified L0.
+- **[DONE] CWE-121 false positives from guarded `strcpy`.** `stack_buffer_overflow` flags a
+  function that owns a fixed stack buffer and calls an unbounded copy; it cannot see a
+  dominating length check, so a correctly written program still reads as a high-severity stack
+  smash. gzip 1.3.5 gave two real examples — `get_suffix` guards `strcpy(suffix,name)` with
+  `nlen <= MAX_SUFFIX+2`, and `treat_dir` guards `strcpy(nbuf,dir)` with a check on
+  `strlen(dir)`.
+  `bounds.strlen_bound` closes the gap the module documented as out of reach ("the bound is the
+  SOURCE, which this pass cannot see"): when the program measures the source with `strlen`,
+  spills the result, and a dominating check compares that slot against a constant, the copy is
+  bounded. The measured string must be the one being copied — bounding some other string's
+  length would demote a real overflow on the strength of an unrelated check. `strcat` is
+  deliberately excluded: it appends, so `strlen(src)` alone proves nothing.
+  Measured: gzip's `get_suffix` demotes to `info`/0.15 with the arithmetic attached;
+  `treat_dir` correctly stays high (its guard is `len + NAMLEN(dp) + 1`, an expression this
+  cannot read); **ncompress 4.2.4's real overflow is untouched at high**, which is the check
+  that matters.
+- **[PLANNED] A demotion cannot take effect on re-analysis.** `FindingDAO.upsert` merges by
+  taking the HIGHER state/severity/confidence — deliberate, it is how the confidence lifecycle
+  advances when channels agree — but it also means improving the analysis can never lower an
+  existing finding. gzip's `get_suffix` demotes correctly on a fresh case and stays `high` on a
+  re-run of the same one. Needs a way for a channel to retract its own earlier verdict without
+  breaking cross-channel promotion.
+- **[PLANNED] A second POSITIVE L2 target is still open.** gzip 1.3.5 was analysed end to end
+  and correctly yields no exploitable stack overflow — both candidates are guarded, one now
+  provably so — which is a true negative and a useful test, but not a second demonstration.
+  Three other candidates failed for build-era reasons rather than analysis ones: gif2png 2.5.8
+  is patched, gif2png 2.5.2 needs libpng 1.2 APIs that 1.6 removed, and lha 1.14i ships its own
+  `DIR`/`opendir` that clashes with modern headers. Worth a target that builds cleanly today.
 - **[DONE] The static channel could not see a bug that is not a function call.** All seven
   detectors keyed on a call edge, a string, or a triage mitigation. jhead's only demonstrated
   bug — the one AFL++ found, the debugger root-caused and the L1 PoC reproduces — is an

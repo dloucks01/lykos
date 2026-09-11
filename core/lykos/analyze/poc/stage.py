@@ -9,6 +9,7 @@ from ...jobs.registry import register_stage
 from ..dynamic import sandbox
 from ..dynamic.stage import crash_finding_candidate
 from . import bundle
+from .capture import MODES, how_to_feed
 
 BUILD_POC_STAGE = "build_poc"
 TOOL = "poc"
@@ -23,9 +24,8 @@ def build_poc_stage(ctx) -> dict:
     input_sha = p.get("input_sha")
     if not input_sha:
         raise ValueError("build_poc requires params.input_sha (a crashing input)")
-    mode = p.get("input_mode", "stdin")
-    argv = list(p.get("argv") or [])
     timeout = float(p.get("timeout", 10))
+    mode, argv, mode_why = how_to_feed(ctx.conn, target, input_sha, p)
 
     input_bytes = ctx.content.get_bytes(input_sha)
     target_bytes = ctx.content.path(target.sha256).read_bytes()
@@ -33,28 +33,39 @@ def build_poc_stage(ctx) -> dict:
     exe.write_bytes(target_bytes)
     os.chmod(exe, 0o755)
 
-    run_argv, stdin = [], b""
-    if mode == "stdin":
-        stdin = input_bytes
-    elif mode == "arg":
-        try:
-            run_argv = [sandbox.argv_arg(input_bytes)]
-        except sandbox.ArgvNulError as e:
-            ctx.emit("poc.done", payload={"verified": False, "note": str(e)})
-            ctx.progress(pct=100, msg="payload undeliverable via argv")
-            return {"metrics": {"verified": False, "undeliverable": True}}
-    elif mode == "file":
+    def _delivery(m):
+        """(argv, stdin) for one delivery channel."""
+        if m == "stdin":
+            return list(argv), input_bytes
+        if m == "arg":
+            # truncate: execve cuts the argument at the first NUL anyway, so this is what the
+            # program would actually receive -- refusing outright discarded payloads whose
+            # control slot sits safely before it (see sandbox.argv_arg).
+            return argv + [sandbox.argv_arg(input_bytes, truncate=True)], b""
         wf = ctx.scratch() / "input.bin"
         wf.write_bytes(input_bytes)
-        run_argv = [str(wf)]
+        return argv + [str(wf)], b""
 
     ctx.progress(msg="verifying PoC in a clean sandbox")
     # endianness/bits are load-bearing, not decoration: _qemu_for routes ppc64->ppc64le,
     # mips->mipsel and riscv->riscv32/64 on them. Omitting them hands a little-endian target
     # to the big-endian emulator, which cannot run it -- so the PoC "fails to reproduce" and
     # is filed as an unverified L0 rather than a verified L1.
-    res = sandbox.run(exe, argv=run_argv, stdin=stdin, timeout=timeout, arch=target.arch,
-                      endianness=target.endianness, bits=target.bits)
+    # Try the mode we believe in, then the others. A crashing input fed the wrong way does
+    # not crash, and filing that as an unverified L0 turns a wrong setup into what reads as
+    # "the input does not reproduce".
+    tried = []
+    for m in [mode] + [x for x in MODES if x != mode]:
+        run_argv, stdin = _delivery(m)
+        res = sandbox.run(exe, argv=run_argv, stdin=stdin, timeout=timeout, arch=target.arch,
+                          endianness=target.endianness, bits=target.bits)
+        tried.append(m)
+        if res.crashed:
+            if m != mode:
+                mode_why = f"{mode_why}, but it only crashed via {m}"
+            mode = m
+            break
+    run_argv, stdin = _delivery(mode)
     verified = res.crashed
     level = "L1" if verified else "L0"
 
@@ -80,7 +91,9 @@ def build_poc_stage(ctx) -> dict:
             PocDAO(ctx.conn).set_finding(poc_id, fid)
 
     ctx.emit("poc.done", payload={"verified": verified, "level": level,
-                                  "signal": res.signal_name, "bundle": bundle_sha})
+                                  "signal": res.signal_name, "bundle": bundle_sha,
+                                  "input_mode": mode, "input_mode_why": mode_why,
+                                  "input_modes_tried": tried})
     ctx.progress(pct=100, msg=("PoC verified (%s)" % level) if verified
                  else "PoC not reproduced (input did not crash)")
     return {"output_shas": [bundle_sha], "output_kind": "poc-bundle"}
