@@ -249,6 +249,15 @@ candidate recall 1.00 / fp_rate 0.571; corroborated recall 0.833 / fp_rate 0.214
   PowerPC ELFv2 local-entry dots (`.main`, `.strcpy`), Ghidra PLT thunk names
   (`00000397.plt_call.strcat`) or glibc `_IO_` aliases. ppc64le went 0 -> 146 corroborated;
   big-endian ppc64 also gained from the PLT-thunk half. See doc 18.
+- **[DONE] Cross-architecture L3** — `build_exploit` was gated to native x86-64; ret2win is
+  ISA-neutral (overwrite the saved return address with a symbol-table address, confirm arrival
+  with a breakpoint) and now runs on any architecture the gdbstub speaks for: **10 of 13**, up
+  from 1. ROP/mprotect/PIE-leak remain x86-64 machine code and stay native-only. Four bugs had
+  to be fixed to get there — target-aware address packing, link-register control being
+  rejected as "not a ret overwrite", the LSB-alias offset candidate missing, and breakpoints
+  placed at odd Thumb symbol addresses where they never fire. L3 now reads the offset L2
+  already confirmed rather than re-deriving it (the local recovery lands word-1 bytes early on
+  big-endian targets).
 - **[DONE] L2 register layouts derived from the gdbstub** rather than hand-written — qemu
   serves a target description (`qXfer:features:read:target.xml`) listing registers in regnum
   order with widths. loongarch, m68k, sparcv9 and 32-bit x86 now need no table; L2 went from 6
@@ -260,7 +269,7 @@ candidate recall 1.00 / fp_rate 0.571; corroborated recall 0.833 / fp_rate 0.214
   through the real sandbox and drives the real PoC stages, asserting the level each is expected
   to reach; an absent cross-compiler SKIPs rather than fails. Deliberately skips Ghidra —
   decompilation is the slow part and nearly every arch regression lives in the dynamic path.
-  Current bar: **13 architectures, 9 at L2 and 4 at L1**, and every row below L2 must record a
+  Current bar: **13 architectures, 10 at L3 and 3 at L1**, and every row below L2 must record a
   reason (a test enforces that, so the bar cannot drift down quietly). It caught a real RISC-V
   bug on its first full run: JALR clears the low bit of its target, so a fault with full IP
   control read as unconfirmed — the ARM/AArch64 Thumb masking already handled this, but the

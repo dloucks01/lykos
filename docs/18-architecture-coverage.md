@@ -90,34 +90,30 @@ pipeline -- triage -> disassemble (Ghidra 12.1.2) -> detect_cwe -> dynamic_run -
 | x86-64 | x86-64 | 1166 | 100 | 69 | yes | SIGSEGV | yes | **yes** (off 136) |
 
 **All 13 reach a verified L1** (crash reproducer, `poc-backed` finding). **Nine reach a
-verified L2** instruction-pointer-control primitive. Reading the table:
+verified L2** instruction-pointer-control primitive, and **ten reach a confirmed L3**
+control-flow hijack -- up from one (native x86-64) before the cross-arch work. L3 uses
+**ret2win**: overwrite the saved return address with a chosen function's address read from the
+target's own symbol table, and prove arrival with a breakpoint. All three steps are ISA-neutral
+over the qemu gdbstub; the other L3 strategies (ROP gadget search, mprotect shellcode, the PIE
+info-leak) are x86-64 machine code and stay native-only.
 
-* **s390 decompiles to nothing** (funcs 0) because Ghidra 12.1.2 ships no SystemZ processor --
-  yet it still reaches L1, which is the useful demonstration that the dynamic ladder does not
-  depend on the decompiler at all.
-* **L2 layouts are now DERIVED from the stub, not transcribed.** Every `_LAYOUTS` entry is
-  hand-written, which is how a register order gets subtly wrong. But the emulator that answers
-  the `g` packet also describes it: `qXfer:features:read:target.xml` lists every register in
-  regnum order with its width. loongarch, m68k, sparcv9 and 32-bit x86 now fetch their layout
-  at connect time and needed no table at all -- which took L2 from 6 architectures to 9
-  (loongarch off 136, m68k off 132, x86 off 140). Only what the description cannot carry stays
-  declared: which register is the stack pointer and the program counter (i386 calls them
-  esp/eip; LoongArch has no `sp` at all, its stack pointer is r3), plus argument registers,
-  which are a calling-convention fact rather than a hardware one.
-  A wrong layout cannot produce a false L2: `primitive_stage` confirms a recovered offset by
-  re-running with a marker, so a bad slice fails confirmation instead of being believed.
-* **sh has no L2 because qemu-sh4 serves no target description at all** (verified). It stays
-  unsupported rather than guessed at.
-* **\* sparcv9 L2 is supported but unreachable with this corpus binary**, and the reason is
-  worth keeping: SPARC needs ~2KB of overflow, so the stdin path cannot reach it (`fgets` caps
-  at 255), and the L2 confirmation payload embeds an address, so it contains NUL bytes and
-  cannot travel via argv either (execve truncates at NUL). A target that reads through `read()`
-  or a file would reach L2 on SPARC; `vuln.c` offers neither channel.
-* **sparcv9 needs a far larger overflow** than any other arch (~2KB vs ~200B): the SysV SPARC
-  frame puts the register save area BELOW the locals, so an upward overflow travels away from
-  the saved `%i7`. The stdin path (`fgets`, capped at 255) therefore cannot reach L2 on SPARC
-  at all -- a property of the test program, not of the tool.
-* **ppc64 big-endian did not confirm L2** while ppc64le did, from the same source. Unexplained.
+| arch | L1 | L2 | L3 (ret2win offset) |
+|---|---|---|---|
+| x86-64 | yes | yes | **yes** (72) |
+| x86 (32) | yes | yes | **yes** (76) |
+| aarch64 | yes | yes | **yes** (72) |
+| arm | yes | yes | **yes** (68) |
+| ppc | yes | yes | **yes** (92) |
+| ppc64 (BE) | yes | yes | **yes** (96) |
+| ppc64le | yes | yes | **yes** (112) |
+| riscv | yes | yes | **yes** (72) |
+| loongarch | yes | yes | **yes** (72) |
+| m68k | yes | yes | **yes** (68) |
+| s390 | yes | no | no |
+| sh | yes | no | no |
+| sparcv9 | yes | no | no |
+
+Reading the table:
 
 ### Resolved: ppc64le yielded zero data-flow findings (callee-name decoration)
 

@@ -14,13 +14,11 @@ from ..dynamic.stage import crash_finding_candidate
 from . import bundle, primitive
 from .capture import make_capture, make_qemu_capture, materialize_helper
 
-# ISAs whose indirect branch MASKS bit 0 of the loaded PC, so a captured fault PC is
-# `value & ~1` and its cyclic window can alias one word early. ARM/AArch64 mask it to select
-# Thumb vs ARM state (interworking); RISC-V's JALR is *specified* to clear the low bit of the
-# computed target outright. Different reasons, identical consequence for offset recovery --
-# and a missed entry here looks like "IP control not confirmed" on an architecture that in
-# fact has full control (riscv captured pc=0x4141414141414140 from an all-'A' overflow).
-_LSB_MASKED_PC = ("arm", "aarch64", "riscv", "riscv64")
+# ISAs whose indirect branch MASKS bit 0 of the loaded PC (ARM/AArch64 for Thumb interworking,
+# RISC-V because JALR is specified to clear it), so a captured fault PC is `value & ~1` and its
+# cyclic window can alias one word early. Defined once, next to the gdbstub that also has to
+# account for it when placing breakpoints.
+_LSB_MASKED_PC = qemu_gdb.LSB_MASKED_PC
 
 PRIMITIVE_STAGE = "poc_primitive"
 TOOL = "primitive"

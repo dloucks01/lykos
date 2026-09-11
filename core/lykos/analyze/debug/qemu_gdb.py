@@ -63,7 +63,8 @@ _ARG_REGS = {
     "sparcv9": [f"o{i}" for i in range(6)],           # caller side; the callee sees i0-i5
 }
 _BP_KIND = {"arm": 4, "aarch64": 4, "mips": 4, "ppc": 4, "ppc64": 4,
-            "riscv": 4, "riscv64": 4, "s390": 2}     # software-breakpoint length hint
+            "riscv": 4, "riscv64": 4, "s390": 2,     # software-breakpoint length hint
+            "loongarch": 4, "sparcv9": 4, "m68k": 2, "sh": 2, "x86": 1}
 
 # ---------------------------------------------------------------- derived layouts
 # Every _LAYOUTS entry above is hand-written, which is how the register order gets subtly
@@ -83,6 +84,12 @@ _BP_KIND = {"arm": 4, "aarch64": 4, "mips": 4, "ppc": 4, "ppc64": 4,
 #
 # qemu-sh4 is deliberately absent: its stub serves no target description at all (verified),
 # so SuperH stays honestly unsupported rather than guessed at.
+# ISAs whose indirect branch masks bit 0 of the target. Two consequences here: a captured
+# fault PC is `value & ~1`, and a FUNCTION SYMBOL may carry bit 0 set to mean "Thumb" -- so a
+# breakpoint must be placed at the even code address even though the payload must keep the bit
+# (it selects the instruction set). Placing it at the odd address simply never fires.
+LSB_MASKED_PC = ("arm", "aarch64", "riscv", "riscv64")
+
 _STUB_ABI = {
     "loongarch": {"sp": "r3", "pc": "pc"},            # a0-a7 are r4-r11
     "m68k": {"sp": "sp", "pc": "pc"},                 # SysV m68k passes arguments on the stack
@@ -192,7 +199,7 @@ def _parse_regs(g_hex: str, arch: str, endianness=None) -> dict:
 
 
 def capture(exe, arch, *, argv=(), stdin: bytes = b"", timeout: float = 8.0,
-            endianness=None, bits=None, port: int = 0) -> dict:
+            endianness=None, bits=None, port: int = 0, breakpoints=None) -> dict:
     """Run `exe` under qemu-<arch>'s gdbstub and capture the register state at its fatal signal.
 
     Returns {} with a `note` when qemu for the arch is unavailable or the ISA layout is unknown.
@@ -218,6 +225,17 @@ def capture(exe, arch, *, argv=(), stdin: bytes = b"", timeout: float = 8.0,
         if not sock:
             return {"note": "gdbstub did not accept a connection", "arch": arch}
         try:
+            bp_alias = {}
+            if breakpoints:
+                # Confirming a control-flow hijack means proving execution REACHED a chosen
+                # address, which a fault alone cannot show. Software breakpoints do that on
+                # any ISA the stub speaks for.
+                kind = _BP_KIND.get(arch, 4)
+                for a in breakpoints:
+                    a = int(a)
+                    placed = a & ~1 if arch in LSB_MASKED_PC else a
+                    bp_alias[placed] = a          # report back what the CALLER asked for
+                    _txn(sock, f"Z0,{placed:x},{kind}")
             stop = _txn(sock, "c", timeout=timeout)  # continue until the guest stops
             sig = int(stop[1:3], 16) if stop[:1] in ("T", "S") else None
             if sig is None:
@@ -233,8 +251,15 @@ def capture(exe, arch, *, argv=(), stdin: bytes = b"", timeout: float = 8.0,
         _kill(proc)
     pc = regs.get(_pc_name(arch))
     sp = regs.get(_sp_name(arch))
+    hit = None
+    if breakpoints and pc is not None:
+        for cand in (pc, pc & ~1, pc | 1):
+            if cand in bp_alias:
+                hit = bp_alias[cand]              # the caller's address, bit 0 and all
+                break
     return {
         "ok": True, "arch": arch, "isolation": "qemu-gdbstub", "signal": sig,
+        "breakpoint_hit": hit,
         "signal_name": _SIGNALS.get(sig), "pc": pc, "sp": sp,
         "regs": {k: v for k, v in regs.items() if k not in ("cpsr", "msr", "pswm")},
         "fault_addr": None, "maps": [], "backtrace": [],   # not available over the stub
