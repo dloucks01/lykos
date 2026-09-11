@@ -443,6 +443,29 @@ actionable.
   reproduces it and faults at exactly `0x40bf0b`; attribution promotes that finding to
   `poc-backed` at 0.97 with the site named. Static prediction → dynamic proof, on unmodified
   Debian source.
+- **[DONE] The blind fuzzer could not reach a length-triggered bug.** First stage of the
+  breadth-first sweep over the 21 ungated stages, and the front of the funnel was broken.
+  Growth was a single operator duplicating at most 64 bytes at 6% probability, cancelled by an
+  equally likely truncate, so from seeds of 0–16 bytes the length random-walked around nothing:
+  **20,000 mutations never passed 109 bytes, p99 = 32**. ncompress 4.2.4 faults at an argv
+  length of ~1050 and a campaign found **0 crashes in 3,000 execs**; jhead's earlier run was
+  98,500 execs for 0 unique. A stack overflow needs kilobytes — precisely the class the L2/L3
+  ladder exists to exploit — and the fuzzer in front of it could not produce them.
+  Added an EXTEND operator (exponential size draw, 8–4096 bytes, usually a repeated byte since
+  that is what smashes a frame) and long default seeds, so the class is in range from the first
+  exec rather than only by growing into it. Measured: ≥1050 bytes goes from **0 of 20,000 to
+  3,955**, max 8192, while the median mutation stays at 29 bytes so short inputs are still
+  explored. On ncompress the campaign now finds the overflow in **909 execs — 429 crashes, 1
+  unique** — where 3,000 execs previously found none.
+- **[PLANNED] The blind fuzzer still cannot pass a format gate.** jhead stays at 0 finds:
+  its bug is a structured EXIF parse, not length-triggered, and the generic seeds never satisfy
+  the JPEG magic. `fuzz` supports a format model (`params.format`) and a seed corpus; neither is
+  supplied by default, and `advise` does not recommend one. AFL++ found jhead's crash in 60s
+  with a real seed, so the gap is seeding and structure, not the mutator.
+- **[PLANNED] `coverage_fuzz` still cannot run on this machine.** It fails loudly now
+  ("afl-fuzz aborted: Fork server handshake failed") rather than silently succeeding, which is
+  the earlier guard working — but `/usr/local/bin/afl-qemu-trace` is a qemu-aarch64 5.2.50
+  binary, so the qemu-mode path is untested end to end.
 - **[DONE] Verdicts are about a PLACE** (migration 13, `finding_site.state/verdict/confidence`).
   Moving the board to defect grain was right — it collapsed jhead 24 → 19 findings — but every
   ruling the analysis makes is about ONE occurrence: bounds proves a particular copy bounded, a

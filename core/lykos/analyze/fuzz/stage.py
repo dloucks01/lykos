@@ -24,7 +24,11 @@ from .runner import invocation, run_input
 FUZZ_STAGE = "fuzz"
 TOOL = "fuzz"
 TOOL_VERSION = "fuzz-1"
-_DEFAULT_SEEDS = [b"", b"A" * 8, b"%s%s%s%n", b"0", b"-1", b"../../etc/passwd"]
+# Long seeds are not a luxury: a blind mutator keeps nothing, so without one the campaign can
+# only reach a length-triggered bug by growing into it, and it never does. These put the
+# overflow class in range from the first exec.
+_DEFAULT_SEEDS = [b"", b"A" * 8, b"%s%s%s%n", b"0", b"-1", b"../../etc/passwd",
+                  b"A" * 256, b"A" * 1024, b"A" * 4096]
 
 
 def _mine_dictionary(strings):
