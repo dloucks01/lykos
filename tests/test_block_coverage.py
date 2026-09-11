@@ -111,3 +111,48 @@ def test_the_sandbox_lets_the_tracer_plant_breakpoints():
         "the tracer cannot plant a breakpoint in this sandbox: "
         f"{done.stderr.decode('utf-8', 'replace')[:200]}")
     assert "--proc" in sandbox._BWRAP_ARGS, "a fresh procfs is what makes it writable"
+
+
+def test_a_signal_the_program_handles_is_not_a_crash(tmp_path):
+    """Under ptrace every signal stops the tracee and is the tracer's to decide on. Killing on
+    sight reported a program that catches SIGSEGV and recovers as crashed -- so the same input
+    got two different verdicts depending on whether block coverage happened to be switched on,
+    and anything that uses SIGSEGV deliberately (a JIT, a guard page, lazy mapping) would have
+    produced a finding and a PoC for a bug that is not there."""
+    import shutil
+    import subprocess
+    import textwrap
+
+    from lykos.analyze.dynamic import sandbox
+    gcc = shutil.which("gcc")
+    if not gcc or not shutil.which("nm") or not sandbox._bwrap_usable():
+        pytest.skip("needs gcc, nm and bubblewrap")
+    src = tmp_path / "h.c"
+    src.write_text(textwrap.dedent("""
+        #include <signal.h>
+        #include <stdio.h>
+        #include <setjmp.h>
+        static jmp_buf jb;
+        static void onsegv(int s){ (void)s; longjmp(jb, 1); }
+        int main(void){
+            signal(SIGSEGV, onsegv);
+            if (setjmp(jb) == 0) { *(volatile int*)0 = 1; }
+            printf("recovered\\n");
+            return 0;
+        }
+    """))
+    exe = tmp_path / "h"
+    if subprocess.run([gcc, "-O0", "-w", str(src), "-o", str(exe)],
+                      capture_output=True, timeout=120).returncode != 0:
+        pytest.skip("cannot build the fixture")
+    nm = subprocess.run(["nm", str(exe)], capture_output=True, text=True, timeout=60).stdout
+    blocks = tuple(sorted({int(f[0], 16) for f in (x.split() for x in nm.splitlines())
+                           if len(f) == 3 and f[1] in "tT"}))
+    assert blocks, "need real function entries -- invented addresses corrupt the code"
+    traced = sandbox.run_batch(exe, [b""], mode="stdin", timeout=10, blocks=blocks)
+    plain = sandbox.run_batch(exe, [b""], mode="stdin", timeout=10)
+    if traced is None or plain is None:
+        pytest.skip("batch runner unavailable here")
+    assert not plain[0].crashed
+    assert not traced[0].crashed, "tracing must not invent a crash the program recovered from"
+    assert b"recovered" in (traced[0].stdout or b""), "and the program must run to completion"

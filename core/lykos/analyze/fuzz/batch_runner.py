@@ -91,6 +91,19 @@ def _maps_base(pid, exe):
     return 0
 
 
+def _handles(pid, sig) -> bool:
+    """Does the tracee catch this signal? SigCgt in /proc/<pid>/status is the mask it has
+    handlers installed for, so there is no need to deliver the signal to find out."""
+    try:
+        with open(f"/proc/{pid}/status", "rb") as fh:
+            for line in fh:
+                if line.startswith(b"SigCgt:"):
+                    return bool(int(line.split()[1], 16) & (1 << (sig - 1)))
+    except (OSError, ValueError, IndexError):
+        pass
+    return False
+
+
 def _open_mem(pid):
     try:
         return os.open(f"/proc/{pid}/mem", os.O_RDWR)
@@ -195,9 +208,10 @@ def _trace_one(libc, argv, stdin_data, timeout, blocks, exe, plan=None):
 
     reached, regs = [], _Regs()
     deadline = _now() + timeout
-    rc, flags = 0, 0
+    rc, flags, deliver = 0, 0, 0
     while True:
-        libc.ptrace(PTRACE_CONT, pid, 0, 0)
+        libc.ptrace(PTRACE_CONT, pid, 0, ctypes.c_void_p(deliver))
+        deliver = 0
         try:
             _wpid, status = os.waitpid(pid, os.WNOHANG)
             while _wpid == 0 and _now() < deadline:
@@ -216,9 +230,18 @@ def _trace_one(libc, argv, stdin_data, timeout, blocks, exe, plan=None):
             rc = -os.WTERMSIG(status)
             break
         sig = os.WSTOPSIG(status)
-        if sig != 5:                                    # a real fault: report it as the signal
-            rc = -sig
-            libc.ptrace(PTRACE_KILL, pid, 0, 0)
+        if sig != 5:
+            # A signal the program HANDLES is not a crash. Under ptrace every signal stops the
+            # tracee and is ours to decide on, and killing on sight reported a program that
+            # catches SIGSEGV and recovers as crashed -- the same input then had two different
+            # verdicts depending on whether block coverage happened to be switched on.
+            # Anything using SIGSEGV deliberately (a JIT, a guard page, lazy mapping) would
+            # have produced a finding and a PoC for a bug that is not there.
+            if _handles(pid, sig):
+                deliver = sig                           # let the program have it, and see
+                continue
+            rc = -sig                                   # fatal: report it, and do not deliver,
+            libc.ptrace(PTRACE_KILL, pid, 0, 0)         # so no core dump handler runs
             try:
                 os.waitpid(pid, 0)
             except ChildProcessError:
