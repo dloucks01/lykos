@@ -239,6 +239,7 @@ def test_entry_seeding_finds_the_powerpc_local_entry():
     """`.main` must be recognised as an entry point, or argv is seeded onto the 8-byte
     global-entry TOC stub (which uses no parameters) and reaches nothing."""
     from types import SimpleNamespace
+
     from lykos.analyze.detect.catalog import entry_seed_params
     fns = [SimpleNamespace(name=".main", addr="0x10000b68",
                            signature="undefined8 main(int param_1, long param_2)")]
