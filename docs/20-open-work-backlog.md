@@ -551,6 +551,23 @@ actionable.
   reaches **`ProcessGpsInfo`** (verified under gdb — the same `process_EXIF → ProcessExifDir →
   ProcessGpsInfo` chain the real crash's backtrace shows), and 115 of 200 mutants parse EXIF
   cleanly with 27 more reaching `ProcessExifDir`.
+- **[DONE] The campaign now learns, and aims at every plausible channel.** Two things kept it
+  from ever getting deeper than its seeds.
+  *It was purely blind.* The corpus grew only on a CRASH, so an input that reached new parser
+  code without crashing was discarded and the search random-walked around its seeds forever —
+  `unique: 0` on every jhead run was that, not bad luck. Real coverage needs instrumentation we
+  do not have for an arbitrary binary, but a parser announces which path it took, so exit status
+  plus the SHAPE of its output is a usable proxy (digits collapsed, so "Extraneous 16 padding
+  bytes" and "Extraneous 56" are one path rather than two). An input producing an unseen
+  behaviour is kept; when the corpus is full it ROTATES rather than freezing around whatever
+  shallow behaviours were found first. On jhead: **2,573 behaviours** discovered where the
+  corpus previously never grew at all.
+  *It committed to one input channel.* Being right about what a program reads is not the same
+  as being right about where its bug is: ncompress genuinely parses files, and its overflow is
+  in the filename it was handed on the command line. The campaign now splits its budget across
+  the ranked channels and stops early on a crash. This caught a regression the same hour it was
+  introduced — ncompress went to 0 crashes when `fuzz` started inferring `file`, and back to
+  **302 crashes / 1 unique** once it swept.
 - **[PLANNED] jhead's own bug is still not found by the built-in fuzzer.** The campaign now
   executes the target's parser rather than bouncing off its magic, but 23,000 executions from
   the generated seed produce no crash. jhead 3.04 guards the GPS value pointer with
