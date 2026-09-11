@@ -259,11 +259,42 @@ actionable.
   segfaults at `n = -1` (exit 139), while `u_lt` (unsigned) and `s_ge0` (`n >= 0 &&`) reject the
   same input and return cleanly. jhead 3.04 is unchanged at 36/4/2 — no signed hazards there,
   and no new false positives on real code.
-- **[PLANNED] Signedness is read from x86 mnemonics only.** `_CC_TAKEN`/`_CC_SIGNED` are x86
-  tables, so guard reasoning — and with it the signed-length check — is inert on the other 12
-  supported architectures. The p-code op (`INT_SLESS` vs `INT_LESS`) carries the same fact
-  ISA-independently and is the portable way in; the mnemonic tables were chosen first because
-  x86 builds its conditions out of flag algebra that is painful to evaluate symbolically.
+- **[DONE] Guard reasoning across architectures.** The mnemonic tables were replaced with an
+  abstract evaluator over P-Code (`bounds.branch_predicate`), which is the same IR on every ISA
+  and carries the signed/unsigned fact explicitly. Scored against a ten-site ground-truth
+  fixture built for all 13 architectures: **8 at 9/9** (x86-64, x86-32, aarch64, arm, loongarch,
+  m68k, ppc, ppc64), sh at 8/9, and the rest blocked upstream of this pass. Full matrix and the
+  three ISA idioms are in `docs/18-architecture-coverage.md`.
+  Getting there turned up seven distinct bugs, none of which were about guards:
+  a frame base resolved as a VALUE double-counted aarch64's prologue adjustment, so no slot ever
+  matched; the frame-coordinate mapping was a per-ISA delta table that got loongarch backwards
+  (its FP addresses the top of the frame) and is now derived from the prologue; ARM Thumb's
+  frame pointer is r7, which was missing from `ARCH_ABI`; SuperH copies the base into a scratch
+  register before offsetting it; PowerPC's register move is `or rX,rY,rY`; PowerPC and loongarch
+  name narrow register views `_r9` and `t0_lo`; and the slicer consumed the call instruction's
+  own P-Code, which pushes the return address and shifted every stack argument by one slot.
+- **[DONE] Stack-passing ABIs.** x86-32 and m68k pass every memcpy argument in the outgoing
+  argument area rather than in registers, and the pass previously returned `None` for them.
+  `_slice_block` now tracks the stack pointer through the block and captures argument stores as
+  they happen — necessary because x86 reuses one P-Code temporary for all three pushes, so the
+  block's final state gives the last argument three times.
+- **[DONE] An overflow claim must clear the whole frame.** Ghidra fragments buffers: on ppc64le
+  it reports the fixture's `char[64]` as four separate 8-byte locals, so every correct function
+  read as an overflow of an 8-byte variable. The address is right and the size is not. A copy
+  that exceeds the recovered variable but still fits the frame below it stays `unknown`; only a
+  copy past the end of the frame is surfaced, because past there is no variable it could have
+  been. This also removed the last two false positives on jhead 3.04 — the `ProcessFile`
+  `Comment[16001]`/`st` slot-reuse artifact documented above — taking it to 38 unknown / 4
+  bounded / 0 suspect.
+- **[PLANNED] Three architectures are blocked upstream of the bounds pass.** riscv resolves one
+  `memcpy` call edge in the whole binary, so no site is scored; s390 recovers 0 functions at
+  disassembly and has no `ARCH_ABI` entry at all; sparcv9's register windows give a recovered
+  `frame_size` of 2223. Each is a disassembly- or frame-recovery-layer gap, and none of them
+  produce a WRONG verdict — the pass returns `unknown` when it cannot trust its inputs.
+- **[PLANNED] Constants that live in a PC-relative pool are unreadable.** SuperH materialises a
+  4096 immediate with `mov.l @(disp,PC),r1`, which the evaluator cannot follow without reading
+  the literal out of the binary's data. One site on the fixture (`bad_guard`) stays `unknown`
+  as a result. Needs the section bytes plumbed into the pass.
 - **[PLANNED] Guard reasoning is intra-procedural and constant-only.** A length bounded by
   `sizeof buf` through a variable, by a caller's check, or by a loop induction variable still
   reads as unknown. That is most of the remaining 36.

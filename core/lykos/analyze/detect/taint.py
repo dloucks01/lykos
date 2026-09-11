@@ -44,8 +44,11 @@ ARCH_ABI = {
     "aarch64": {"ret": {"X0", "W0"},
                 "args": [{"X%d" % i, "W%d" % i} for i in range(8)],
                 "frame": {"X29", "SP"}},
+    # R7 is the Thumb frame pointer. Measured on a gcc -O0 Thumb build of the guard fixture:
+    # every local is addressed [r7,#n] and r11 never appears, so without R7 no stack argument
+    # on this ISA resolves at all.
     "arm":    {"ret": {"R0"}, "args": [{"R0"}, {"R1"}, {"R2"}, {"R3"}],
-               "frame": {"R11", "FP", "SP"}},
+               "frame": {"R11", "FP", "R7", "SP"}},
     "mips":   {"ret": {"V0"}, "args": [{"A0"}, {"A1"}, {"A2"}, {"A3"}],
                "frame": {"FP", "S8", "SP"}},
     "ppc":    {"ret": {"R3"}, "args": [{"R%d" % i} for i in range(3, 11)],

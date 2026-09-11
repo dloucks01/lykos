@@ -209,6 +209,11 @@ def normalize(fname):
     for suffix in ("@plt", ".plt"):
         if n.endswith(suffix):
             n = n[:-len(suffix)]
+    if "@@" in n or "@" in n:
+        # Symbol VERSION suffix: `memcpy@@GLIBC_2.17`. Ghidra keeps it on the PLT thunks of
+        # both ppc64 flavours, where it was hiding 9 of the 10 memcpy call sites -- the sink
+        # matched only the one unversioned definition, so the ISA looked clean.
+        n = n.split("@", 1)[0]
     n = n.lstrip(".")                    # PowerPC local entry point: .main -> main
     n = n.lstrip("_")
     if n.startswith("isoc99_"):          # __isoc99_scanf -> scanf
