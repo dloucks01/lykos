@@ -180,6 +180,24 @@ def _getregs_aarch64(libc, pid):
     return regs, "pc", "sp"
 
 
+def _argv_bytes(a):
+    """An argv element as bytes, without re-encoding a binary payload.
+
+    argv arrives through JSON as latin-1 text -- the lossless round-trip for arbitrary bytes.
+    os.execv encodes str with the filesystem encoding, so UTF-8 turns every byte >= 0x80 into
+    two and silently corrupts any payload carrying an address. (Mirrors sandbox.argv_bytes;
+    this file is materialised as a standalone helper and cannot import it.)
+    """
+    if isinstance(a, bytes):
+        return a
+    if not isinstance(a, str):
+        a = str(a)
+    try:
+        return a.encode("latin-1")
+    except UnicodeEncodeError:
+        return a.encode("utf-8", "surrogateescape")
+
+
 def capture(exe, argv, stdin_file, timeout, breakpoints=None):
     """Run `exe` under ptrace and capture the fault. When `breakpoints` (x86-64 VAs) are given,
     set software breakpoints and, if execution reaches one, report `breakpoint_hit` instead of
@@ -206,7 +224,12 @@ def capture(exe, argv, stdin_file, timeout, breakpoints=None):
             except Exception:
                 pass
             libc.ptrace(PTRACE_TRACEME, 0, 0, 0)
-            os.execv(exe, [exe] + list(argv))
+            # argv elements arrive through JSON as latin-1 text (the lossless round-trip
+            # for arbitrary bytes). They MUST go back to bytes the same way: os.execv
+            # encodes str with the filesystem encoding, so UTF-8 turns every byte >= 0x80
+            # into two, silently corrupting any payload carrying an address. That is most of
+            # them -- it broke argv-delivered IP control outright.
+            os.execv(exe, [exe] + [_argv_bytes(a) for a in argv])
         except Exception:
             pass
         os._exit(127)

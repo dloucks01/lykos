@@ -13,6 +13,8 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 
+from ..dynamic import sandbox
+
 _SIG = re.compile(r"received signal (SIG\w+)")
 _PC = re.compile(r"LYKOS_PC (0x[0-9a-fA-F]+)")
 _FAULT = re.compile(r"si_addr = (0x[0-9a-fA-F]+)")
@@ -33,8 +35,10 @@ def locate_gdb(config: Optional[str] = None) -> Optional[Path]:
 
 
 def run_gdb(gdb: Path, exe, argv, stdin_file, *, ctx=None, timeout: int = 30) -> dict:
-    run_cmd = "run" + ("".join(" " + a for a in argv)) + (
-        (" < " + stdin_file) if stdin_file else "")
+    # Arguments go on gdb's OWN command line via --args, not spliced into the `run` line:
+    # that line is parsed as a gdb command, so a binary payload is mangled by quoting long
+    # before execve ever sees it.
+    run_cmd = "run" + ((" < " + stdin_file) if stdin_file else "")
     cmds = [
         "set pagination off", "set confirm off", "set height 0", "set width 0",
         run_cmd,
@@ -48,7 +52,8 @@ def run_gdb(gdb: Path, exe, argv, stdin_file, *, ctx=None, timeout: int = 30) ->
     script = tempfile.NamedTemporaryFile("w", suffix=".gdb", delete=False)
     script.write("\n".join(cmds) + "\n")
     script.close()
-    cmd = [str(gdb), "-q", "-batch", "-nx", "-x", script.name, str(exe)]
+    cmd = ([str(gdb), "-q", "-batch", "-nx", "-x", script.name, "--args", str(exe)]
+           + [sandbox.argv_bytes(a) for a in argv])
     try:
         if ctx is not None:
             proc = ctx.run_subprocess(cmd, timeout=timeout + 15)
@@ -73,8 +78,10 @@ def run_gdb_follow(gdb: Path, exe, argv, stdin_file, *, ctx=None, timeout: int =
     """Multi-process capture (doc 17.3): follow fork/exec into spawned children and capture
     the fault of whichever process actually crashes. Adds fork/exec attribution to the
     normal `run_gdb` capture dict."""
-    run_cmd = "run" + ("".join(" " + a for a in argv)) + (
-        (" < " + stdin_file) if stdin_file else "")
+    # Arguments go on gdb's OWN command line via --args, not spliced into the `run` line:
+    # that line is parsed as a gdb command, so a binary payload is mangled by quoting long
+    # before execve ever sees it.
+    run_cmd = "run" + ((" < " + stdin_file) if stdin_file else "")
     cmds = [
         "set pagination off", "set confirm off", "set height 0", "set width 0",
         "set follow-fork-mode child",     # trace the child on fork...
@@ -91,7 +98,8 @@ def run_gdb_follow(gdb: Path, exe, argv, stdin_file, *, ctx=None, timeout: int =
     script = tempfile.NamedTemporaryFile("w", suffix=".gdb", delete=False)
     script.write("\n".join(cmds) + "\n")
     script.close()
-    cmd = [str(gdb), "-q", "-batch", "-nx", "-x", script.name, str(exe)]
+    cmd = ([str(gdb), "-q", "-batch", "-nx", "-x", script.name, "--args", str(exe)]
+           + [sandbox.argv_bytes(a) for a in argv])
     try:
         if ctx is not None:
             proc = ctx.run_subprocess(cmd, timeout=timeout + 15)

@@ -211,6 +211,12 @@ def _parse_regs(g_hex: str, arch: str, endianness=None) -> dict:
     return regs
 
 
+def _argv_bytes(a):
+    """See sandbox.argv_bytes: a payload must not be re-encoded on its way to execve."""
+    from ..dynamic.sandbox import argv_bytes
+    return argv_bytes(a)
+
+
 def capture(exe, arch, *, argv=(), stdin: bytes = b"", timeout: float = 8.0,
             endianness=None, bits=None, port: int = 0, breakpoints=None) -> dict:
     """Run `exe` under qemu-<arch>'s gdbstub and capture the register state at its fatal signal.
@@ -224,7 +230,7 @@ def capture(exe, arch, *, argv=(), stdin: bytes = b"", timeout: float = 8.0,
         return {"note": f"no gdbstub register layout for {arch}", "arch": arch}
     port = port or _free_port()
     proc = subprocess.Popen(
-        [qemu, "-g", str(port), str(exe), *[str(a) for a in argv]],
+        [qemu, "-g", str(port), str(exe), *[_argv_bytes(a) for a in argv]],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         start_new_session=True)
     try:
@@ -339,7 +345,7 @@ def monitor_calls(exe, arch, *, symbols, entry, pie, sink_names, endianness=None
     argregs = _ARG_REGS[arch]
     kind = _BP_KIND.get(arch, 4)
     port = _free_port()
-    proc = subprocess.Popen([qemu, "-g", str(port), str(exe), *[str(a) for a in argv]],
+    proc = subprocess.Popen([qemu, "-g", str(port), str(exe), *[_argv_bytes(a) for a in argv]],
                             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, start_new_session=True)
     try:
