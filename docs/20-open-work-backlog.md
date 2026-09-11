@@ -214,10 +214,37 @@ actionable.
   would have fabricated a critical finding in correct code. The error is asymmetric: too-small
   a recovered size invents an overflow, too-large merely misses one, and a fabricated finding
   costs the reader's trust in every other finding in the report.
-- **[PLANNED] Bounds analysis only resolves constant lengths** — 37 of jhead's 42 copy sites
-  have a length that is a local or a computed value, which needs dominating-guard / value-range
-  reasoning (`if (n < sizeof buf) memcpy(...)`). That is the next increment, and the thing that
-  would make the LOW tier genuinely small.
+- **[DONE] Dominating-guard reasoning** (`bounds.guard_bound`). `if (n < sizeof buf) memcpy(buf,
+  s, n)` is the shape of nearly every real bounds check, and it leaves the length a local rather
+  than a constant — 37 of jhead's 42 copy sites. The pass computes dominator sets over the
+  function CFG, and for each block that dominates the copy, reads a comparison of the length's
+  frame slot against a constant plus the branch that acts on it. Polarity comes from the branch
+  mnemonic (x86 builds `JG` out of flag algebra, which is painful to evaluate symbolically and
+  completely stable to read off the mnemonic), and from which edge actually reaches the copy —
+  the guarded body is as often the fall-through (`JGE skip`) as the taken edge. The comparison
+  scan is block-wide, not per-instruction: gcc emits `cmpl $64,-4(%rbp)` and
+  `movl -4(%rbp),%eax; cmpl $64,%eax` about equally, and tracking only within one instruction
+  missed every split form.
+  `n < K` bounds at K-1, `n <= K` at K, a lower bound yields nothing, and an unreadable polarity
+  returns None rather than a guess — claiming a bound that is not there would manufacture a
+  "safe" verdict over a real overflow, the one error this whole channel is built to avoid. Two
+  further refusals earned the same way: a comparison against 0 is a null test, not a size bound
+  (reading it as one produced "at most 0 bytes reach this copy" on jhead's `DoCommand`), and a
+  check that dominates but permits more than the buffer holds is SUSPECT, not SAFE — a guard
+  that exists reads as careful code and can still be wrong.
+  Measured on jhead 3.04: 37 unknown → 36, with the newly resolved site landing in
+  `ProcessFile` on the same `Comment`/`st` slot-reuse artifact documented above (surfaced for
+  review, never asserted). On a controlled fixture with known ground truth all four shapes
+  resolve correctly: `n<64` → at most 63, `n<=64` → at most 64, `n<4096` into `buf[64]` →
+  exceeds-recovered-size, unguarded → unknown.
+- **[PLANNED] Guards on a signed length are not checked for the negative case.** `if (n < 64)`
+  on a signed `int` admits every negative `n`, which `memcpy` reads as a huge `size_t`. The pass
+  reports "at most 63 bytes" and is wrong about the bug. Needs the lower-bound half of the
+  relation (`n >= 0` or an unsigned compare) before a guard-derived SAFE can be trusted on a
+  signed slot; today it is a known unsoundness, not a claim.
+- **[PLANNED] Guard reasoning is intra-procedural and constant-only.** A length bounded by
+  `sizeof buf` through a variable, by a caller's check, or by a loop induction variable still
+  reads as unknown. That is most of the remaining 36.
 - **[PLANNED] Frame recovery is not trustworthy enough to assert sizes.** The slot-reuse
   problem above is not a Ghidra bug, it is inherent to stack-slot sharing. Distinguishing
   "which variable lives here at THIS program point" needs liveness, not just the frame table.
