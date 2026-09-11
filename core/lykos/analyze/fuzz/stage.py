@@ -10,15 +10,17 @@ a targeted corpus/dictionary aimed at statically-flagged sinks.
 from __future__ import annotations
 
 import base64
+import hashlib
 import os
 import random
+import re
 import time
 
-from ...db.dao import DynResultDAO, FindingDAO, StringDAO, TargetDAO
+from ...db.dao import CallEdgeDAO, DynResultDAO, FindingDAO, StringDAO, TargetDAO
 from ...jobs.registry import register_stage
 from ..dynamic.minimize import minimize
 from ..dynamic.stage import crash_finding_candidate
-from ..poc.capture import how_to_feed
+from ..poc.capture import modes_for
 from . import structure
 from .mutator import Mutator
 from .runner import invocation, run_input
@@ -42,6 +44,31 @@ def _mine_dictionary(strings):
     return toks[:500]
 
 
+# How many inputs the corpus may retain, and how big one may be. A blind campaign that keeps
+# everything spends its budget re-running near-duplicates of one enormous input.
+_MAX_CORPUS = 256
+_MAX_KEEP = 16384
+
+
+def behaviour_of(res):
+    """A coarse signature of what the program DID -- a coverage proxy with no instrumentation.
+
+    The campaign was purely blind: the corpus only ever grew on a CRASH, so an input that
+    reached new parser code without crashing was discarded and the search random-walked around
+    its seeds forever. `unique: 0` on every jhead run was that, not bad luck.
+
+    Real coverage needs instrumentation we do not have for an arbitrary binary, but a parser
+    announces which path it took: jhead prints "Illegal subdirectory link", "Illegal value
+    pointer", "Invalid Exif alignment marker" and so on. Exit status plus the SHAPE of the
+    output is therefore a usable proxy -- digits are collapsed so that "Extraneous 16 padding
+    bytes" and "Extraneous 56" count as the same path rather than two.
+    """
+    blob = (res.stderr or b"") + b"\x00" + (res.stdout or b"")
+    shape = re.sub(rb"\d+", b"#", blob[:512])
+    return (res.exit_code, res.signal_name,
+            hashlib.blake2b(shape, digest_size=8).digest())
+
+
 def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_seconds,
                   exec_timeout, rng, detector, event_prefix, note_prefix, run_fn=run_input,
                   mutator=None):
@@ -63,6 +90,7 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
     deadline = time.time() + max_seconds
     execs = crashes = 0
     seen_sigs = set()
+    seen_behaviour, kept = set(), 0
 
     ctx.progress(msg=f"{event_prefix} campaign")
     while execs < max_execs and time.time() < deadline and not ctx.should_cancel():
@@ -70,6 +98,21 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
         argv, res = run_fn(exe, mode, workfile, exec_timeout, target.arch, data,
                               endianness=target.endianness, bits=target.bits)
         execs += 1
+        # Keep anything that made the program behave in a way we have not seen. This is the
+        # ratchet: without it the corpus never grows and a deeper path is reachable only by a
+        # single lucky mutation from a seed.
+        b = behaviour_of(res)
+        if b not in seen_behaviour:
+            seen_behaviour.add(b)
+            if not res.crashed and len(data) <= _MAX_KEEP:
+                if len(corpus) < _MAX_CORPUS:
+                    corpus.append(data)
+                else:
+                    # Full: ROTATE rather than stop learning. Capping without replacement
+                    # freezes the corpus around whatever shallow behaviours were found first,
+                    # which is most of them -- the interesting paths are discovered late.
+                    corpus[rng.randrange(len(corpus))] = data
+                kept += 1
         if res.crashed:
             crashes += 1
             corpus.append(data)                        # explore near crashers
@@ -104,12 +147,18 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
                           duration_ms=res.duration_ms)
         if execs % 250 == 0:
             ctx.emit(f"{event_prefix}.progress", payload={"execs": execs, "crashes": crashes,
-                                                          "unique": len(seen_sigs)})
+                                                          "unique": len(seen_sigs),
+                                                          "behaviours": len(seen_behaviour),
+                                                          "corpus": len(corpus)})
 
-    ctx.emit(f"{event_prefix}.done", payload={"execs": execs, "crashes": crashes,
-                                              "unique": len(seen_sigs)})
-    ctx.progress(pct=100, msg=f"{execs} execs, {crashes} crashes, {len(seen_sigs)} unique")
-    return {"execs": execs, "crashes": crashes, "unique": len(seen_sigs)}
+    elapsed = max(1e-3, max_seconds - max(0.0, deadline - time.time()))
+    stats = {"execs": execs, "crashes": crashes, "unique": len(seen_sigs),
+             "behaviours": len(seen_behaviour), "corpus": len(corpus), "kept": kept,
+             "execs_per_sec": round(execs / elapsed)}
+    ctx.emit(f"{event_prefix}.done", payload=stats)
+    ctx.progress(pct=100, msg=f"{execs} execs, {crashes} crashes, {len(seen_sigs)} unique, "
+                             f"{len(seen_behaviour)} behaviours")
+    return stats
 
 
 def fuzz_stage(ctx) -> dict:
@@ -118,7 +167,12 @@ def fuzz_stage(ctx) -> dict:
         raise ValueError("fuzz requires a target_id")
 
     p = ctx.params or {}
-    mode = how_to_feed(ctx.conn, target, p.get("input_sha"), p)[0]   # stdin | arg | file
+    # Which channels to fuzz. Committing to one is wrong even when the inference is right
+    # about what the program READS: ncompress genuinely parses files, and its overflow is in
+    # the filename it was handed on the command line. A campaign aimed at the wrong channel
+    # does no work and reports a clean zero.
+    channels = ([p["input_mode"]] if p.get("input_mode")
+                else modes_for(CallEdgeDAO(ctx.conn).list_by_target(target.id)))
     max_execs = int(p.get("max_execs", 3000))
     max_seconds = float(p.get("max_seconds", 30))
     exec_timeout = float(p.get("exec_timeout", 2))
@@ -146,10 +200,21 @@ def fuzz_stage(ctx) -> dict:
         note = "found by structure-aware fuzzing"
         ctx.emit("fuzz.format", payload={"model": fmt or "custom", "auto": not (
             p.get("format") or p.get("format_name"))})
-    fuzz_campaign(ctx, target, corpus=corpus, dictionary=dictionary, mode=mode,
-                  max_execs=max_execs, max_seconds=max_seconds, exec_timeout=exec_timeout,
-                  rng=rng, detector="fuzz", event_prefix="fuzz", note_prefix=note,
-                  mutator=mutator)
+    # Split the budget across them, stopping early on a crash. A bug is usually reachable
+    # through one channel only, and which one is not knowable in advance.
+    share_execs = max(1, max_execs // len(channels))
+    share_secs = max(1.0, max_seconds / len(channels))
+    totals = {"execs": 0, "crashes": 0, "unique": 0, "behaviours": 0}
+    for ch in channels:
+        st = fuzz_campaign(ctx, target, corpus=list(corpus), dictionary=dictionary, mode=ch,
+                           max_execs=share_execs, max_seconds=share_secs,
+                           exec_timeout=exec_timeout, rng=rng, detector="fuzz",
+                           event_prefix="fuzz", note_prefix=note, mutator=mutator)
+        for k in totals:
+            totals[k] += st.get(k, 0)
+        if st.get("crashes"):
+            break
+    ctx.emit("fuzz.channels", payload={"channels": channels, **totals})
     return {}
 
 
