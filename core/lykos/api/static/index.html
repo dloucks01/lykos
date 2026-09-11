@@ -1233,41 +1233,39 @@ function _importsText(){
   const im=(TRIAGE&&TRIAGE.imports)||{};
   return ((im.symbols||[]).join(" ")+" "+(im.libraries||[]).join(" ")).toLowerCase();
 }
-function recommendFuzz(){
+async function recommendFuzz(){
+  // The recommendation is computed SERVER-SIDE (/targets/<id>/advice) so the API and CLI get
+  // the same answer. It used to live here, which is why a scripted run could pick black-box
+  // fuzzing on a parser and burn 98,500 execs for nothing while this panel said otherwise.
   const g=document.getElementById("fuzzguide"); if(!g) return;
   const sh=document.getElementById("strathint");
   const strat=(document.getElementById("fuzzstrategy")||{}).value||"fuzz";
   if(sh) sh.textContent=_STRAT_HINT[strat]||"";
-  if(!TRIAGE){ g.hidden=true; return; }
-  const imp=_importsText();
-  const readsFile=/fopen|fread|open64|mmap|freopen|getline/.test(imp);
-  const readsStdin=/\bread\b|fgets|scanf|getchar|gets\b/.test(imp);
-  const decompiled=FUNCS.length>0;
-  const staticFindings=(TFINDINGS||[]).filter(f=>f.function_addr||f.site_addr).length;
-  const hasSeeds=SEEDS.length>0, fmt=(document.getElementById("fuzzformat")||{}).value;
-  // pick input mode + strategy
-  let mode = readsFile?"file":(readsStdin?"stdin":(TRIAGE.imports?"stdin":"stdin"));
-  let rec = staticFindings>0 ? "directed" : "fuzz";
-  let why = staticFindings>0
-    ? `${staticFindings} static finding${staticFindings>1?'s':''} to aim at — <b>Directed</b> concentrates execs on those sinks.`
-    : `no static findings yet — start with <b>Black-box</b> (or run Detect CWEs first, then Directed).`;
-  const fileParser = readsFile || mode==="file";
-  const recFmt = fileParser ? (fmt||"a structure model (lv32 / PNG, magic set)") : null;
-  // checklist
-  const ck=[];
-  ck.push([decompiled,`decompiled — ${decompiled?FUNCS.length+' functions':'run Decompile to enable Directed'}`]);
-  ck.push([staticFindings>0,`static findings — ${staticFindings>0?staticFindings+' to target':'run Detect CWEs for Directed'}`]);
-  if(fileParser){
-    ck.push([hasSeeds,`seeds — ${hasSeeds?SEEDS.length+' attached':'attach a valid sample (file parsers need real structure)'}`]);
-    ck.push([!!fmt,`structure model — ${fmt?fmt+' selected':'pick one so the mutator coordinates length+data'}`]);
-  }
-  const checks=ck.map(([ok,t])=>`<li><span class="ck ${ok?'ok':'no'}">${ok?'✓':'!'}</span><span>${t}</span></li>`).join("");
+  if(!TRIAGE || !DETAIL_TID){ g.hidden=true; return; }
+  let a=null;
+  try{ a = await api(`/targets/${DETAIL_TID}/advice`); }catch(e){ }
+  if(!a){ g.hidden=true; return; }
+  ADVICE=a;
+  const checks=(a.checks||[]).map(c=>
+    `<li><span class="ck ${c.ok?'ok':'no'}">${c.ok?'✓':'!'}</span><span>${esc(c.text)}</span></li>`).join("");
+  const plan=(a.plan||[]).map((st,i)=>{
+    const cls = st.done?'ok':(st.ready?'':'no');
+    const mark = st.done?'✓':(st.ready?(i+1):'·');
+    return `<li><span class="ck ${cls}">${mark}</span><span><b>${esc(st.stage)}</b> — ${esc(st.why)}</span></li>`;
+  }).join("");
   g.innerHTML=`<div class="ghd">◈ Recommended setup</div>
-    <div class="grec">Input looks like <b>${fileParser?'a file parser':(readsStdin?'stdin':'argv/none')}</b>. ${why}
-    ${fileParser?` This is a parser — attach a valid sample as a seed${recFmt?` and use ${esc(String(recFmt))}`:''}.`:''}</div>
+    <div class="grec">${esc(a.headline)}</div>
     <ul class="gcheck">${checks}</ul>
-    <button class="btn sm gapply" onclick="applyFuzzRecommendation('${mode}','${rec}',${fileParser})">Apply this setup</button>`;
+    <div class="ghd" style="margin-top:8px">◈ Plan — evidence first</div>
+    <ul class="gcheck">${plan}</ul>
+    <button class="btn sm gapply" onclick="applyFuzzRecommendation('${esc(a.input_mode)}','${esc(_stratOpt(a.backend))}',${!!a.file_parser})">Apply this setup</button>`;
   g.hidden=false;
+}
+let ADVICE=null;
+// the server names stages; the strategy <select> uses short option values
+function _stratOpt(stage){
+  return {coverage_fuzz:"coverage", directed_fuzz:"directed", fuzz:"fuzz",
+          concolic:"concolic", boundary_fuzz:"boundary"}[stage] || "fuzz";
 }
 function applyFuzzRecommendation(mode, strat, fileParser){
   const dm=document.getElementById("dynmode"); if(dm) dm.value=mode;

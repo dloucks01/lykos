@@ -84,6 +84,7 @@ _CASE_FIND = re.compile(r"^/cases/([^/]+)/findings$")
 _FIND_ID = re.compile(r"^/findings/([^/]+)$")
 _TARGET_DYN = re.compile(r"^/targets/([^/]+)/dynresults$")
 _TARGET_POC = re.compile(r"^/targets/([^/]+)/pocs$")
+_TARGET_ADVICE = re.compile(r"^/targets/([^/]+)/advice$")
 _CASE_REPORT = re.compile(r"^/cases/([^/]+)/report$")
 _CASE_EXPORT = re.compile(r"^/cases/([^/]+)/export$")
 _CASE_SYSMAP = re.compile(r"^/cases/([^/]+)/systemmap$")
@@ -254,6 +255,9 @@ class Handler(BaseHTTPRequestHandler):
                                        for x in DynResultDAO(s.conn).list_by_target(m.group(1))])
                 finally:
                     s.close()
+            m = _TARGET_ADVICE.match(path)
+            if m:
+                return self._get_advice(m.group(1))
             m = _TARGET_POC.match(path)
             if m:
                 s = self._store()
@@ -342,6 +346,46 @@ class Handler(BaseHTTPRequestHandler):
             s.close()
 
     # ---- route impls ----
+    def _get_advice(self, tid):
+        """What to do next with this target, and why.
+
+        This lived in the GUI, so anything driving the API had to guess -- and guessing wrong
+        is expensive: a scripted run picked black-box fuzzing and burned 98,500 executions on
+        a parser for nothing while the GUI was recommending a seed and a structure model.
+        """
+        from ..analyze import advise as advise_mod
+        s = self._store()
+        try:
+            t = s.targets.get(tid)
+            if not t:
+                return self._json({"error": "no target"}, 404)
+            fd = FindingDAO(s.conn)
+            findings = fd.list_by_target(tid)
+            imports = []
+            run = next((r for r in s.runs.list_by_case(t.case_id)
+                        if r.target_id == tid and r.stage == _INGEST
+                        and r.status == "done"), None)
+            if run:
+                from ..jobs.registry import cached_output_json
+                rec = cached_output_json(s, run.id) or {}
+                # triage stores imports as {"libraries": [...], "symbols": [...]}
+                imp = rec.get("imports") or {}
+                imports = list(imp.get("symbols") or []) if isinstance(imp, dict) else list(imp)
+            crashes = sum(1 for d in DynResultDAO(s.conn).list_by_target(tid) if d.crashed)
+            pocs = [p for p in PocDAO(s.conn).list_by_target(tid) if p.verified]
+            out = advise_mod.advise(
+                imports=[str(x) for x in imports],
+                functions=len(FunctionDAO(s.conn).list_by_target(tid)),
+                findings=len(findings),
+                seeds=sum(1 for a in s.artifacts.list_by_case(t.case_id)
+                          if a.kind in ("seed", "console-seed", "afl-crash")),
+                has_format=False,
+                afl_usable=advise_mod.afl_usable(),
+                crashes=crashes, pocs=len(pocs))
+            return self._json(out)
+        finally:
+            s.close()
+
     def _get_case_findings(self, cid):
         """All findings in a case, enriched with target filename/arch and the target's best
         PoC level -- the data the case findings board aggregates."""
