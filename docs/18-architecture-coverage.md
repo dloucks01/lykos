@@ -80,8 +80,8 @@ pipeline -- triage -> disassemble (Ghidra 12.1.2) -> detect_cwe -> dynamic_run -
 | loongarch | loongarch | 1007 | 15 | 10 | yes | SIGSEGV | yes | no layout |
 | m68k | m68k | 961 | 193 | 72 | yes | SIGSEGV | yes | no layout |
 | ppc | ppc | 1231 | 175 | 93 | yes | SIGSEGV | yes | **yes** (off 156) |
-| ppc64 (BE) | ppc64 | 978 | 226 | 156 | yes | SIGSEGV | yes | not confirmed |
-| ppc64le | ppc64 | 1829 | 193 | **0** | yes | SIGSEGV | yes | **yes** (off 176) |
+| ppc64 (BE) | ppc64 | 978 | 229 | 158 | yes | SIGSEGV | yes | not confirmed |
+| ppc64le | ppc64 | 1829 | 220 | 146 | yes | SIGSEGV | yes | **yes** (off 176) |
 | riscv | riscv | 984 | 23 | 10 | yes | SIGSEGV | yes | **yes** (off 136) |
 | s390 | s390 | 0 | 3 | 0 | no | SIGILL | yes | not confirmed |
 | sh | sh | 969 | 200 | 120 | yes | SIGSEGV | yes | no layout |
@@ -107,15 +107,29 @@ L2 instruction-pointer-control primitive. Reading the table:
   at all -- a property of the test program, not of the tool.
 * **ppc64 big-endian did not confirm L2** while ppc64le did, from the same source. Unexplained.
 
-### Open bug: ppc64le yields zero data-flow findings
+### Resolved: ppc64le yielded zero data-flow findings (callee-name decoration)
 
-`taint.analyze_program` returns **0 flagged sinks** on little-endian ppc64 and **139** on
-big-endian, for the same `ARCH_ABI["ppc64"]` row, near-identical call-edge counts (4828 vs
-4849), the same P-Code register names, and comparable P-Code volume (635k vs 829k ops). The
-`corrob` column above shows the effect end-to-end: 0 vs 156. Reproduce with the corpus binaries
-by calling `analyze_program` directly on both stores. Suspect the ELFv2 ABI (TOC/r2 handling,
-local vs global entry points) changes the shape Ghidra emits, but the cause is NOT yet
-identified -- do not assume the ABI row is wrong, it is shared and works big-endian.
+Recorded here because the cause is worth knowing. ppc64le produced **0** flagged sinks where
+big-endian ppc64 produced 139, from identical source. It was not the ABI row (shared, and
+working big-endian) and not endianness: it was `catalog.normalize()`.
+
+ELFv2 -- which every little-endian ppc64 system uses -- gives each function a *global* entry
+that sets up the TOC and a *local* entry 8 bytes later holding the actual body. Ghidra models
+that as two functions: `main` (8 bytes, `lis r2` / `addi r2`, no calls) and `.main` (the real
+184-byte, 6-block body). On the corpus binary **845 of 1829 functions and 3659 of 4828 call
+targets carried the leading dot**, so `.strcpy` matched no sink, `._IO_fgets` matched no
+source, and `.main` matched no entry point -- the seed landed on the 8-byte TOC stub, which
+uses no parameters and reaches nothing. Big-endian ppc64 is ELFv1, has no dots, and was
+unaffected, which is exactly why the matrix showed one healthy arch and one dead one.
+
+Fixed by normalising three more decorations: a leading `.` (PowerPC local entry), Ghidra's PLT
+thunk form `<hex>.plt_call.<symbol>`, and glibc's `_IO_` stdio aliases. ppc64le now reports
+146 corroborated findings against big-endian's 158. The PLT-thunk part also recovered sinks on
+big-endian ppc64 (`greet` calls `00000397.plt_call.strcat`, previously unmatched), so an
+architecture that *looked* healthy was quietly losing findings too.
+
+Lesson for adding an architecture: verify that recovered callee names actually match the
+catalog. A silent zero here is indistinguishable from "this binary has no bugs".
 
 ## Cross-cutting per-architecture concerns (must be modeled, not assumed)
 These vary by ISA and silently break analysis/PoC if hardcoded to x86:
