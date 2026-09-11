@@ -14,6 +14,14 @@ from ..dynamic.stage import crash_finding_candidate
 from . import bundle, primitive
 from .capture import make_capture, make_qemu_capture, materialize_helper
 
+# ISAs whose indirect branch MASKS bit 0 of the loaded PC, so a captured fault PC is
+# `value & ~1` and its cyclic window can alias one word early. ARM/AArch64 mask it to select
+# Thumb vs ARM state (interworking); RISC-V's JALR is *specified* to clear the low bit of the
+# computed target outright. Different reasons, identical consequence for offset recovery --
+# and a missed entry here looks like "IP control not confirmed" on an architecture that in
+# fact has full control (riscv captured pc=0x4141414141414140 from an all-'A' overflow).
+_LSB_MASKED_PC = ("arm", "aarch64", "riscv", "riscv64")
+
 PRIMITIVE_STAGE = "poc_primitive"
 TOOL = "primitive"
 TOOL_VERSION = "primitive-1"
@@ -111,9 +119,9 @@ def primitive_stage(ctx) -> dict:
         #
         # Build the confirm candidates in priority order:
         #   - the dynamic offset (when trusted);
-        #   - on ARM/AArch64, its Thumb-alias sibling: `pop {pc}`/`bx` masks bit 0 of the loaded
-        #     PC (interworking select), so the captured PC is `value & ~1`, whose cyclic window
-        #     can alias one word early -- searching `(pc | 1)` restores the exact slot;
+        #   - on an LSB-masking ISA, its alias sibling (see _LSB_MASKED_PC): the captured PC
+        #     is `value & ~1`, whose cyclic window can alias one word early -- searching
+        #     `(pc | 1)` restores the exact slot;
         #   - the static-frame predictions (also the sole source when the fault isn't a ret).
         trusted = rec is not None and (rec[1] in ("pc",) + primitive._RA_REGS
                                        or mnem in ("ret", "retq", "retn"))
@@ -122,12 +130,12 @@ def primitive_stage(ctx) -> dict:
             off0, src0 = rec
             sm0, sl0 = primitive.match_frame_candidate(off0, offset_candidates, word)
             confirm_cands.append((off0, src0, sm0, sl0))
-            if (target.arch or "") in ("arm", "aarch64") and src0 == "pc":
+            if (target.arch or "") in _LSB_MASKED_PC and src0 == "pc":
                 alt = primitive.cyclic_find(
                     primitive._reg_window((cap0.get("pc") or 0) | 1, word, endian, 4), length, 4)
                 if alt != -1 and alt != off0:
                     sm1, sl1 = primitive.match_frame_candidate(alt, offset_candidates, word)
-                    confirm_cands.append((alt, "pc(thumb)", sm1, sl1))
+                    confirm_cands.append((alt, "pc(lsb-masked)", sm1, sl1))
         for off, c, fp_slack in primitive.seed_offsets(offset_candidates, word, length):
             confirm_cands.append((off, "static-frame", c, fp_slack))
 
