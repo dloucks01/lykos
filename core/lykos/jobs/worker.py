@@ -145,7 +145,7 @@ class WorkerPool:
         try:
             sd = get_stage(run.stage)
         except KeyError as e:
-            q.fail(run_id, f"{e}", retryable=False)
+            q.fail(run_id, f"{e}", retryable=False, worker_id=wid)
             self._bump("error")
             return
 
@@ -158,16 +158,16 @@ class WorkerPool:
             result = sd.fn(ctx)
             ctx.check_cancel()  # honor cancel/timeout requested during the stage
             outputs = [(sha, "output") for sha in (result or {}).get("output_shas", [])]
-            q.complete(run_id, outputs or None)
+            q.complete(run_id, outputs or None, worker_id=wid)
             self._bump("done")
         except StageCancelled:
             q.set_cancelled(run_id)
             self._bump("cancelled")
         except StageTimeout:
-            q.fail(run_id, "timeout", retryable=False)
+            q.fail(run_id, "timeout", retryable=False, worker_id=wid)
             self._bump("timeout")
         except Exception as e:  # crashing stage: fail the job, keep the worker alive
-            q.fail(run_id, repr(e))
+            q.fail(run_id, repr(e), worker_id=wid)
             self._bump("error")
         finally:
             hb.stop()
