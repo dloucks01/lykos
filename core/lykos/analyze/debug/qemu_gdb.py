@@ -15,6 +15,7 @@ primitive.recover_ip_offset: {pc, sp, regs, signal, signal_name, arch, isolation
 from __future__ import annotations
 
 import os
+import re
 import signal as _signal
 import socket
 import subprocess
@@ -58,17 +59,99 @@ _ARG_REGS = {
     "riscv": [f"x{i}" for i in range(10, 18)],
     "riscv64": [f"x{i}" for i in range(10, 18)],
     "s390": [f"r{i}" for i in range(2, 7)],
+    "loongarch": [f"r{i}" for i in range(4, 12)],     # a0-a7
+    "sparcv9": [f"o{i}" for i in range(6)],           # caller side; the callee sees i0-i5
 }
 _BP_KIND = {"arm": 4, "aarch64": 4, "mips": 4, "ppc": 4, "ppc64": 4,
             "riscv": 4, "riscv64": 4, "s390": 2}     # software-breakpoint length hint
 
+# ---------------------------------------------------------------- derived layouts
+# Every _LAYOUTS entry above is hand-written, which is how the register order gets subtly
+# wrong. But the emulator that answers the `g` packet will also DESCRIBE it: the GDB remote
+# protocol serves a target description over qXfer:features:read:target.xml listing every
+# register, in regnum order, with its bit width. Deriving the layout from that is strictly
+# better than transcribing it -- so architectures below are fetched at connect time instead.
+#
+# Only the pieces the description does NOT carry stay hard-coded: which register is the stack
+# pointer and which is the program counter (the names vary -- i386 calls them esp/eip,
+# LoongArch has no "sp" at all, its stack pointer is r3), plus the argument registers, which
+# are a calling-convention fact rather than a hardware one.
+#
+# A wrong layout cannot silently produce a false L2: primitive_stage CONFIRMS a recovered
+# offset by re-running with a marker, so a bad slice fails confirmation and is reported
+# unconfirmed rather than believed.
+#
+# qemu-sh4 is deliberately absent: its stub serves no target description at all (verified),
+# so SuperH stays honestly unsupported rather than guessed at.
+_STUB_ABI = {
+    "loongarch": {"sp": "r3", "pc": "pc"},            # a0-a7 are r4-r11
+    "m68k": {"sp": "sp", "pc": "pc"},                 # SysV m68k passes arguments on the stack
+    "sparcv9": {"sp": "sp", "pc": "pc"},              # sp is o6; caller args o0-o5
+    "x86": {"sp": "esp", "pc": "eip"},                # cdecl passes arguments on the stack
+}
+_DERIVED: dict = {}                                   # arch -> layout, fetched once per process
+_REG_RE = re.compile(r'<reg\s+name="([^"]+)"[^>]*?bitsize="(\d+)"')
+_INCLUDE_RE = re.compile(r'<xi:include\s+href="([^"]+)"')
+
+
+def _pc_name(arch: str) -> str:
+    return _STUB_ABI.get(arch, {}).get("pc", "pc")
+
+
+def _sp_name(arch: str) -> str:
+    if arch in _SP:
+        return _SP[arch]
+    return _STUB_ABI.get(arch, {}).get("sp", "sp")
+
+
+def _layout_for(arch: str):
+    return _LAYOUTS.get(arch) or _DERIVED.get(arch)
+
+
+def _fetch_layout(sock) -> list:
+    """Read the stub's own target description and return [(register, width_bytes)] in g-packet
+    order. Returns [] when the stub serves no description (qemu-sh4)."""
+    docs, todo, seen = [], ["target.xml"], set()
+    while todo:
+        name = todo.pop(0)
+        if name in seen:
+            continue
+        seen.add(name)
+        body, off = "", 0
+        while True:                                   # qXfer replies are chunked: m=more, l=last
+            r = _txn(sock, f"qXfer:features:read:{name}:{off:x},7ff")
+            if not r or r[0] not in "ml":
+                break
+            body += r[1:]
+            if r[0] == "l":
+                break
+            off += len(r) - 1
+        docs.append(body)
+        todo += _INCLUDE_RE.findall(body)
+    out = []
+    for body in docs:
+        for m in _REG_RE.finditer(body):
+            out.append((m.group(1), (int(m.group(2)) + 7) // 8))
+    return out
+
+
+def _ensure_layout(arch: str, sock) -> list:
+    """Layout for `arch`, fetching it from the live stub the first time it is needed."""
+    have = _layout_for(arch)
+    if have:
+        return have
+    lay = _fetch_layout(sock)
+    if lay:
+        _DERIVED[arch] = lay
+    return lay
+
 
 def supported(arch: str) -> bool:
-    return arch in _LAYOUTS
+    return arch in _LAYOUTS or arch in _STUB_ABI
 
 
 def breakpoints_supported(arch: str) -> bool:
-    return arch in _LAYOUTS and arch in _ARG_REGS
+    return supported(arch) and arch in _ARG_REGS
 
 
 def _pkt(data: str) -> bytes:
@@ -95,7 +178,7 @@ def _txn(sock, data: str, timeout=5.0) -> str:
 def _parse_regs(g_hex: str, arch: str, endianness=None) -> dict:
     """Slice pc/sp/GP registers out of the g-packet. Each register's bytes are in target byte
     order, so a big-endian target (mips BE, ppc64) must be read big-endian."""
-    layout = _LAYOUTS.get(arch)
+    layout = _layout_for(arch)
     if not layout:
         return {}
     byteorder = "big" if endianness == "big" else "little"
@@ -117,7 +200,7 @@ def capture(exe, arch, *, argv=(), stdin: bytes = b"", timeout: float = 8.0,
     qemu = sandbox._qemu_for(arch, endianness, bits)
     if not qemu:
         return {"note": f"no qemu-user for {arch}", "arch": arch}
-    if arch not in _LAYOUTS:
+    if not supported(arch):
         return {"note": f"no gdbstub register layout for {arch}", "arch": arch}
     port = port or _free_port()
     proc = subprocess.Popen(
@@ -140,13 +223,16 @@ def capture(exe, arch, *, argv=(), stdin: bytes = b"", timeout: float = 8.0,
             if sig is None:
                 return {"note": f"target exited without a fault (reply {stop[:8]!r})",
                         "arch": arch}
+            if not _ensure_layout(arch, sock):
+                return {"note": f"gdbstub for {arch} serves no target description",
+                        "arch": arch}
             regs = _parse_regs(_txn(sock, "g", timeout=timeout), arch, endianness)
         finally:
             sock.close()
     finally:
         _kill(proc)
-    pc = regs.get("pc")
-    sp = regs.get(_SP.get(arch, "sp"))
+    pc = regs.get(_pc_name(arch))
+    sp = regs.get(_sp_name(arch))
     return {
         "ok": True, "arch": arch, "isolation": "qemu-gdbstub", "signal": sig,
         "signal_name": _SIGNALS.get(sig), "pc": pc, "sp": sp,

@@ -109,3 +109,61 @@ def test_root_cause_on_emulated_target(store, case, pool, tmp_path):
     assert payload["supported"] and payload["backend"] == "qemu-gdbstub"
     assert any(f.detector == "root_cause" and f.state == "confirmed"
                for f in FindingDAO(store.conn).list_by_target(t.id))
+
+
+# ------------------------------------------------- stub-derived register layouts (no table)
+def test_stub_abi_declares_what_the_description_cannot():
+    """A target description lists registers and widths, but not WHICH one is the stack pointer
+    or program counter -- and the names are not guessable: i386 calls them esp/eip, and
+    LoongArch has no register named "sp" at all (its stack pointer is r3). Those stay declared.
+    """
+    from lykos.analyze.debug import qemu_gdb as qg
+    assert qg._sp_name("x86") == "esp" and qg._pc_name("x86") == "eip"
+    assert qg._sp_name("loongarch") == "r3" and qg._pc_name("loongarch") == "pc"
+    assert qg._sp_name("m68k") == "sp" and qg._pc_name("m68k") == "pc"
+    # hand-written layouts keep their existing sp names and the default pc
+    assert qg._sp_name("aarch64") == "sp" and qg._pc_name("aarch64") == "pc"
+    assert qg._sp_name("mips") == "r29"
+
+
+def test_derivable_arches_report_supported_without_a_hardcoded_layout():
+    """These have no _LAYOUTS entry -- support comes from fetching the stub's description."""
+    from lykos.analyze.debug import qemu_gdb as qg
+    for arch in ("loongarch", "m68k", "sparcv9", "x86"):
+        assert arch not in qg._LAYOUTS
+        assert qg.supported(arch), f"{arch} should be supported via the stub description"
+    # qemu-sh4 serves no description at all, so SuperH stays honestly unsupported
+    assert not qg.supported("sh")
+
+
+def test_fetch_layout_parses_a_target_description():
+    """Register order and widths come from the description, including xi:include expansion."""
+    from lykos.analyze.debug import qemu_gdb as qg
+
+    core = ('<target><xi:include href="core.xml"/>'
+            '<reg name="pc" bitsize="32"/></target>')
+    inc = ('<feature><reg name="d0" bitsize="32"/><reg name="a0" bitsize="32"/>'
+           '<reg name="fp80" bitsize="80"/></feature>')
+    replies = {"target.xml": core, "core.xml": inc}
+
+    class FakeSock:
+        def __init__(self):
+            self.n = 0
+
+        def _reply(self, req):
+            # qXfer:features:read:<name>:<off>,<len>
+            name = req.split(":")[3]
+            off = int(req.split(":")[4].split(",")[0], 16)
+            body = replies[name]
+            return "l" + body[off:]
+
+    sock = FakeSock()
+    orig = qg._txn
+    qg._txn = lambda s, data, timeout=5.0: sock._reply(data)
+    try:
+        lay = qg._fetch_layout(sock)
+    finally:
+        qg._txn = orig
+    # target.xml's own regs first, then the include, in document order
+    assert ("pc", 4) in lay and ("d0", 4) in lay and ("a0", 4) in lay
+    assert ("fp80", 10) in lay          # 80 bits rounds up to 10 bytes

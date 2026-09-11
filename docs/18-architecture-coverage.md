@@ -77,30 +77,42 @@ pipeline -- triage -> disassemble (Ghidra 12.1.2) -> detect_cwe -> dynamic_run -
 |---|---|---|---|---|---|---|---|---|
 | aarch64 | aarch64 | 1015 | 17 | 10 | yes | SIGSEGV | yes | **yes** (off 136) |
 | arm | arm | 959 | 25 | 13 | yes | SIGSEGV | yes | **yes** (off 132) |
-| loongarch | loongarch | 1007 | 15 | 10 | yes | SIGSEGV | yes | no layout |
-| m68k | m68k | 961 | 193 | 72 | yes | SIGSEGV | yes | no layout |
+| loongarch | loongarch | 1007 | 15 | 10 | yes | SIGSEGV | yes | **yes** (off 136) |
+| m68k | m68k | 961 | 193 | 72 | yes | SIGSEGV | yes | **yes** (off 132) |
 | ppc | ppc | 1231 | 175 | 93 | yes | SIGSEGV | yes | **yes** (off 156) |
 | ppc64 (BE) | ppc64 | 978 | 229 | 158 | yes | SIGSEGV | yes | not confirmed |
 | ppc64le | ppc64 | 1829 | 220 | 146 | yes | SIGSEGV | yes | **yes** (off 176) |
 | riscv | riscv | 984 | 23 | 10 | yes | SIGSEGV | yes | **yes** (off 136) |
 | s390 | s390 | 0 | 3 | 0 | no | SIGILL | yes | not confirmed |
-| sh | sh | 969 | 200 | 120 | yes | SIGSEGV | yes | no layout |
-| sparcv9 | sparcv9 | 954 | 198 | 75 | yes | SIGBUS | yes | no layout |
-| x86 (32) | x86 | 1100 | 90 | 37 | yes | SIGSEGV | yes | no layout |
+| sh | sh | 969 | 200 | 120 | yes | SIGSEGV | yes | no description |
+| sparcv9 | sparcv9 | 954 | 198 | 75 | yes | SIGBUS | yes | supported, unreachable* |
+| x86 (32) | x86 | 1100 | 90 | 37 | yes | SIGSEGV | yes | **yes** (off 140) |
 | x86-64 | x86-64 | 1166 | 100 | 69 | yes | SIGSEGV | yes | **yes** (off 136) |
 
-**All 13 reach a verified L1** (crash reproducer, `poc-backed` finding). Six reach a verified
-L2 instruction-pointer-control primitive. Reading the table:
+**All 13 reach a verified L1** (crash reproducer, `poc-backed` finding). **Nine reach a
+verified L2** instruction-pointer-control primitive. Reading the table:
 
 * **s390 decompiles to nothing** (funcs 0) because Ghidra 12.1.2 ships no SystemZ processor --
   yet it still reaches L1, which is the useful demonstration that the dynamic ladder does not
   depend on the decompiler at all.
-* **L2 needs a qemu gdbstub register layout** (`debug/qemu_gdb.py:_LAYOUTS`). Missing for
-  loongarch, m68k, sh, sparcv9 and -- notably -- **32-bit x86**, which is emulated on an
-  x86-64 host and so takes the cross-arch path. These report "no qemu gdbstub register layout"
-  honestly rather than failing. qemu can be *asked* for its own layout over the wire
-  (`qXfer:features:read:target.xml`), which is a better source than a hand-written table:
-  verified working for loongarch, m68k and sparcv9; qemu-sh4's stub does not serve it.
+* **L2 layouts are now DERIVED from the stub, not transcribed.** Every `_LAYOUTS` entry is
+  hand-written, which is how a register order gets subtly wrong. But the emulator that answers
+  the `g` packet also describes it: `qXfer:features:read:target.xml` lists every register in
+  regnum order with its width. loongarch, m68k, sparcv9 and 32-bit x86 now fetch their layout
+  at connect time and needed no table at all -- which took L2 from 6 architectures to 9
+  (loongarch off 136, m68k off 132, x86 off 140). Only what the description cannot carry stays
+  declared: which register is the stack pointer and the program counter (i386 calls them
+  esp/eip; LoongArch has no `sp` at all, its stack pointer is r3), plus argument registers,
+  which are a calling-convention fact rather than a hardware one.
+  A wrong layout cannot produce a false L2: `primitive_stage` confirms a recovered offset by
+  re-running with a marker, so a bad slice fails confirmation instead of being believed.
+* **sh has no L2 because qemu-sh4 serves no target description at all** (verified). It stays
+  unsupported rather than guessed at.
+* **\* sparcv9 L2 is supported but unreachable with this corpus binary**, and the reason is
+  worth keeping: SPARC needs ~2KB of overflow, so the stdin path cannot reach it (`fgets` caps
+  at 255), and the L2 confirmation payload embeds an address, so it contains NUL bytes and
+  cannot travel via argv either (execve truncates at NUL). A target that reads through `read()`
+  or a file would reach L2 on SPARC; `vuln.c` offers neither channel.
 * **sparcv9 needs a far larger overflow** than any other arch (~2KB vs ~200B): the SysV SPARC
   frame puts the register save area BELOW the locals, so an upward overflow travels away from
   the saved `%i7`. The stdin path (`fgets`, capped at 255) therefore cannot reach L2 on SPARC

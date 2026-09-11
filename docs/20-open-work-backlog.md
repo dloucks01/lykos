@@ -249,6 +249,12 @@ candidate recall 1.00 / fp_rate 0.571; corroborated recall 0.833 / fp_rate 0.214
   PowerPC ELFv2 local-entry dots (`.main`, `.strcpy`), Ghidra PLT thunk names
   (`00000397.plt_call.strcat`) or glibc `_IO_` aliases. ppc64le went 0 -> 146 corroborated;
   big-endian ppc64 also gained from the PLT-thunk half. See doc 18.
+- **[DONE] L2 register layouts derived from the gdbstub** rather than hand-written — qemu
+  serves a target description (`qXfer:features:read:target.xml`) listing registers in regnum
+  order with widths. loongarch, m68k, sparcv9 and 32-bit x86 now need no table; L2 went from 6
+  architectures to 9. sh is the exception: qemu-sh4 serves no description, so it stays
+  unsupported. Future architectures need only an sp/pc name and (if register-passing) an
+  argument-register list.
 - **[PLANNED] Arch coverage is still not gated.** 13 of the 14 arch strings now have a working
   or partial channel (up from 6), but `eval-gate` only ever measures x86-64, so an arch
   regression would trip nothing. The verification above was manual; it should become corpus
