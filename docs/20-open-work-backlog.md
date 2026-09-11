@@ -255,10 +255,16 @@ candidate recall 1.00 / fp_rate 0.571; corroborated recall 0.833 / fp_rate 0.214
   architectures to 9. sh is the exception: qemu-sh4 serves no description, so it stays
   unsupported. Future architectures need only an sp/pc name and (if register-passing) an
   argument-register list.
-- **[PLANNED] Arch coverage is still not gated.** 13 of the 14 arch strings now have a working
-  or partial channel (up from 6), but `eval-gate` only ever measures x86-64, so an arch
-  regression would trip nothing. The verification above was manual; it should become corpus
-  cases.
+- **[DONE] Architecture coverage is gated** — `make arch-gate` / `lykos archgate`, also part of
+  `make release`. Builds a vulnerable program per ISA with the cross toolchain, detonates it
+  through the real sandbox and drives the real PoC stages, asserting the level each is expected
+  to reach; an absent cross-compiler SKIPs rather than fails. Deliberately skips Ghidra —
+  decompilation is the slow part and nearly every arch regression lives in the dynamic path.
+  Current bar: **13 architectures, 9 at L2 and 4 at L1**, and every row below L2 must record a
+  reason (a test enforces that, so the bar cannot drift down quietly). It caught a real RISC-V
+  bug on its first full run: JALR clears the low bit of its target, so a fault with full IP
+  control read as unconfirmed — the ARM/AArch64 Thumb masking already handled this, but the
+  arch list did not include RISC-V.
 - **[DONE] Verified argv seeding off x86-64** — confirmed end-to-end on riscv64, aarch64 and
   32-bit ARM. This is what surfaced the materialised-displacement bug above: the seed was
   arch-independent, but the spill tracking it depends on was not.
