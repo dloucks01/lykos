@@ -197,3 +197,62 @@ def test_a_pair_is_only_driven_when_the_model_says_it_is_one():
     fields = model.parse(b"\x01\x00\x00\x00\x02\x00\x00\x00")
     mut._drive_pair(fields, fields[0], "size")          # no role declared anywhere
     assert [f["val"] for f in fields] == [1, 2], "nothing to pair with, nothing changed"
+
+
+def test_every_builtin_survives_its_own_mutations():
+    """A model that parses its seed but throws on a mutant silently falls back to byte havoc
+    -- or takes the stage down. `length_of` naming a GROUP (a ZIP's central directory) hit the
+    "grow the sized blob" path, which assumed bytes and got a list of fields."""
+    import random
+    for name in S.builtin_names():
+        model, seed = S.builtin(name), S.seed_for_name(name) or b""
+        mut = S.StructMutator(random.Random(3), model)
+        for _ in range(200):
+            mut.mutate(seed, [seed])
+        assert model.serialize(model.parse(seed)) == seed, f"{name} must round-trip its seed"
+
+
+def test_an_archive_directory_is_found_by_a_derived_offset():
+    """A ZIP is not a local header: every tool finds the files through the central directory,
+    located by absolute offset from the end-of-central-directory record. A model that stops at
+    the local header generates something unzip refuses outright, so the campaign never starts."""
+    model = S.builtin("zip")
+    seed = S.seed_for_name("zip")
+    fields = model.parse(seed)
+    cdoff = next(f for f in fields if f["f"].get("name") == "cdoff")["val"]
+    assert seed[cdoff:cdoff + 4] == b"PK\x01\x02", "the offset must land on the directory"
+    localoff = next(f for f in next(f for f in fields if f["f"].get("name") == "cd")["val"]
+                    if f["f"].get("name") == "localoff")["val"]
+    assert seed[localoff:localoff + 4] == b"PK\x03\x04", "and its entry on the local header"
+
+
+def test_a_derived_offset_is_computed_across_nesting():
+    """The offset is into the FILE, not into the group the field happens to live in."""
+    model = S.builtin("zip")
+    fields = model.parse(S.seed_for_name("zip"))
+    # make the stored file bigger; everything after it must shift
+    next(f for f in next(f for f in fields if f["f"].get("name") == "local")["val"]
+         if f["f"].get("name") == "data")["val"] = b"B" * 100
+    S._fix_covers(model, fields, lengths=True)
+    out = model.serialize(fields)
+    cdoff = next(f for f in fields if f["f"].get("name") == "cdoff")["val"]
+    assert out[cdoff:cdoff + 4] == b"PK\x01\x02"
+
+
+def test_a_length_prefixed_blob_does_not_eat_what_follows_it():
+    """`length_of` has to bound the blob on the way back IN too. A GIF's sub-block is followed
+    by the block terminator and the trailer, and those decide whether it is a GIF at all."""
+    model = S.builtin("gif")
+    seed = S.seed_for_name("gif")
+    fields = model.parse(seed)
+    lzw = next(f for f in fields if f["f"].get("name") == "lzw")
+    blen = next(f for f in fields if f["f"].get("name") == "blen")
+    assert len(lzw["val"]) == blen["val"]
+    assert seed.endswith(b"\x00\x3b"), "terminator and trailer survive the blob"
+
+
+def test_a_two_character_token_does_not_claim_a_binary():
+    """"BM" appears as a substring of all sorts of things; it picked BMP for unzip, which then
+    fuzzed a ZIP tool with bitmaps -- 354 blocks against 1,162 with the right model."""
+    unzipish = ["End-of-central-directory", "central directory", "zipfile", "SUBMIT", "BM"]
+    assert S.detect_format(unzipish) == "zip"

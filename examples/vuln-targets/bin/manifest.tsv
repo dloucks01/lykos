@@ -1,0 +1,15 @@
+file	arch	target	format	bug
+jhead_aarch64	aarch64	jhead 3.04	JPEG/EXIF	CWE-125 OOB read in ProcessGpsInfo (offset+count wraps the bounds check)
+jhead_arm	arm	jhead 3.04	JPEG/EXIF	CWE-125 OOB read in ProcessGpsInfo (offset+count wraps the bounds check)
+jhead_loongarch64	loongarch64	jhead 3.04	JPEG/EXIF	CWE-125 OOB read in ProcessGpsInfo (offset+count wraps the bounds check)
+jhead_m68k	m68k	jhead 3.04	JPEG/EXIF	CWE-125 OOB read in ProcessGpsInfo (offset+count wraps the bounds check)
+jhead_ppc	ppc	jhead 3.04	JPEG/EXIF	CWE-125 OOB read in ProcessGpsInfo (offset+count wraps the bounds check)
+jhead_ppc64	ppc64	jhead 3.04	JPEG/EXIF	CWE-125 OOB read in ProcessGpsInfo (offset+count wraps the bounds check)
+jhead_ppc64le	ppc64le	jhead 3.04	JPEG/EXIF	CWE-125 OOB read in ProcessGpsInfo (offset+count wraps the bounds check)
+jhead_riscv64	riscv64	jhead 3.04	JPEG/EXIF	CWE-125 OOB read in ProcessGpsInfo (offset+count wraps the bounds check)
+jhead_s390x	s390x	jhead 3.04	JPEG/EXIF	CWE-125 OOB read in ProcessGpsInfo (offset+count wraps the bounds check)
+jhead_sh4	sh4	jhead 3.04	JPEG/EXIF	CWE-125 OOB read in ProcessGpsInfo (offset+count wraps the bounds check)
+jhead_sparc64	sparc64	jhead 3.04	JPEG/EXIF	CWE-125 OOB read in ProcessGpsInfo (offset+count wraps the bounds check)
+jhead_x86-64	x86-64	jhead 3.04	JPEG/EXIF	CWE-125 OOB read in ProcessGpsInfo (offset+count wraps the bounds check)
+gif2rgb_x86-64	x86-64	giflib 5.1.4	GIF	none known -- negative case, already carries the screen-confinement check
+unzip_x86-64	x86-64	Info-ZIP 6.0	ZIP	none reached yet -- 3705 blocks, 1162 covered
