@@ -12,6 +12,59 @@ TOOL = "detect"
 TOOL_VERSION = "detect-1"
 
 
+# Attacker-influenced dereference. Every other detector keys on a CALL, so this whole class
+# was invisible: jhead's only demonstrated bug is an out-of-bounds READ at
+# `movzx eax,BYTE PTR [rax]`, which is not a call to anything and which nothing could see.
+_DEREF = {
+    "load": ("CWE-125", "low",
+             "Out-of-bounds read candidate: dereferences a pointer computed from "
+             "attacker-controlled input"),
+    "store": ("CWE-787", "medium",
+              "Out-of-bounds write candidate: writes through a pointer computed from "
+              "attacker-controlled input"),
+}
+
+
+def _deref_candidates(derefs, functions):
+    """One finding per KIND, carrying every site -- the grain the rest of the channel uses.
+
+    Deliberately filed as low-confidence inventory, not an assertion. Whether any particular
+    dereference is actually unchecked needs a bound on the INDEX, which this does not have;
+    what it does have is the exact set of places attacker data reaches a pointer, which is
+    where the out-of-bounds reads and writes live. A reproduced crash landing on one of these
+    sites promotes it (see rootcause.attribute) -- that is what turns the inventory into a
+    finding.
+    """
+    names = {f.addr: f.name for f in functions}
+    out = []
+    for kind in ("load", "store"):
+        hits = [d for d in derefs if d["kind"] == kind]
+        if not hits:
+            continue
+        cwe, sev, title = _DEREF[kind]
+        where = sorted({names.get(d["function_addr"]) or str(d["function_addr"])
+                        for d in hits})
+        # One candidate per site sharing a dedup_key: upsert merges them into a single
+        # finding and records each as a site, which is how the call-sink detectors already
+        # report a defect that occurs in many places.
+        summary = {"channel": "taint-dataflow",
+                   "detail": (f"{len(hits)} attacker-influenced {kind}"
+                              f"{'s' if len(hits) != 1 else ''} across {len(where)} "
+                              f"functions: " + ", ".join(where[:8])
+                              + (" ..." if len(where) > 8 else ""))}
+        for d in hits:
+            fn = names.get(d["function_addr"]) or str(d["function_addr"])
+            out.append({
+                "cwe": cwe, "title": title, "severity": sev, "state": "candidate",
+                "confidence": 0.35, "detector": "tainted_deref",
+                "function_addr": d["function_addr"], "site_addr": d["site_addr"],
+                "dedup_key": f"{cwe}:tainted_deref:{kind}",
+                "site_detail": f"attacker-influenced {kind} through a computed pointer in {fn}",
+                "evidence": [summary],
+            })
+    return out
+
+
 def detect_stage(ctx) -> dict:
     target = TargetDAO(ctx.conn).get(ctx.target_id) if ctx.target_id else None
     if target is None:
@@ -52,8 +105,10 @@ def detect_stage(ctx) -> dict:
         if full and full.ir:
             func_irs[f.addr] = full.ir
     entry_seeds = entry_seed_params(dctx.functions, dctx.frames)   # argv/envp at main
+    derefs: list = []
     tainted_sites = taint.analyze_program(func_irs, dctx.call_edges, target.arch,
-                                          entry_seeds=entry_seeds)
+                                          entry_seeds=entry_seeds, mem_out=derefs)
+    cands += _deref_candidates(derefs, dctx.functions)
     for c in cands:
         if c["detector"] == "dangerous_api" and c.get("site_addr") in tainted_sites:
             c["state"] = "corroborated"

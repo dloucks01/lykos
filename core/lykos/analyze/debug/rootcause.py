@@ -207,6 +207,19 @@ def attribute(frames, findings, sites_by_finding=None):
                       f"call stack -- proximity, not proof", o.get("site_addr"))
                 break
 
+    # The faulting instruction IS a recorded site. This is the only match available to a
+    # finding that is not a call -- an out-of-bounds read is a `mov`, and matching return
+    # addresses to call sites can never reach it. It is also the strongest match there is:
+    # not "the call that faulted" but "the instruction that faulted".
+    if frames and frames[0].get("fault_pc"):
+        pc = frames[0].get("static_addr")
+        if pc is not None:
+            for sa, f, o in sites:
+                if sa == pc:
+                    offer(f, "fault-site",
+                          f"the faulting instruction IS this site ({where(o)})",
+                          o.get("site_addr"))
+
     # Frame 0 is the faulting instruction; every later frame is a RETURN address, which sits
     # just past the call it came from. That is what ties a frame to a recorded call site.
     returns = frames[1:] if (frames and frames[0].get("fault_pc")) else frames

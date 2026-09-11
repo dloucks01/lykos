@@ -255,3 +255,34 @@ def test_attribution_keeps_the_original_detector():
     up = rootcause.attribution_upsert(
         f, {"tier": "fault-site", "detail": "d", "site": _SITE}, "SIGSEGV")
     assert up["detector"] == "dangerous_api" and up["dedup_key"] == f.dedup_key
+
+
+# ---------------------------------------------------------------- the faulting instruction
+# A finding that is not a CALL can never be reached by matching return addresses to call
+# sites. jhead's only demonstrated bug is an out-of-bounds read -- a `mov`, not a call to
+# anything -- so without this the one bug the tool actually proved could not be attributed to
+# anything it had predicted.
+def test_the_faulting_instruction_itself_is_the_strongest_match():
+    f = _F("a", fn="0x900", site="0x1234", cwe="CWE-125")
+    frames = [_frame(0x1234, func="0x900", symbol="ProcessGpsInfo", fault_pc=True)]
+    got = rootcause.attribute(frames, [f])
+    assert [a["tier"] for a in got] == ["fault-site"]
+    assert "faulting instruction IS this site" in got[0]["detail"]
+    assert "0x1234 in ProcessGpsInfo" in got[0]["detail"]
+
+
+def test_a_nearby_instruction_is_not_the_faulting_one():
+    """Exact match only. A dereference two instructions later is a different statement, and
+    calling it proven would put a PoC behind the wrong line."""
+    f = _F("a", fn="0x900", site="0x1230")
+    frames = [_frame(0x1234, func="0x900", symbol="fn", fault_pc=True)]
+    assert [a["tier"] for a in rootcause.attribute(frames, [f])] == ["crash-function"]
+
+
+def test_a_pc_match_needs_the_frame_to_be_the_fault():
+    """A return address that happens to equal a site is a call that RETURNED there, not the
+    instruction that faulted."""
+    f = _F("a", fn="0x900", site="0x1234")
+    frames = [_frame(0x2000, func="0xb00", symbol="inner", fault_pc=True),
+              _frame(0x1234, func="0x900", symbol="fn")]
+    assert [a["tier"] for a in rootcause.attribute(frames, [f])] != ["fault-site"]

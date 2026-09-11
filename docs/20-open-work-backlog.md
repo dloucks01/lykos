@@ -286,6 +286,32 @@ actionable.
   been. This also removed the last two false positives on jhead 3.04 — the `ProcessFile`
   `Comment[16001]`/`st` slot-reuse artifact documented above — taking it to 38 unknown / 4
   bounded / 0 suspect.
+- **[DONE] The static channel could not see a bug that is not a function call.** All seven
+  detectors keyed on a call edge, a string, or a triage mitigation. jhead's only demonstrated
+  bug — the one AFL++ found, the debugger root-caused and the L1 PoC reproduces — is an
+  out-of-bounds read at `movzx eax,BYTE PTR [rax]`, which is not a call to anything. So a
+  reproduced crash had nothing to promote, not because attribution was weak but because no
+  finding existed for the only bug proven in real software.
+  `tainted_deref` reports attacker-influenced dereferences: the taint pass now also collects
+  every LOAD/STORE whose address is tainted and is NOT a recovered frame slot (a frame slot's
+  address is a fixed displacement; an input cannot move it). Filed at the grain the call-sink
+  detectors use — one defect per kind carrying every site — so jhead gains 2 findings with 122
+  sites rather than 122 findings. Deliberately low-confidence inventory: whether a given
+  dereference is unchecked needs a bound on the INDEX, which this does not have.
+  Attribution gained the match that makes it pay off: **the faulting instruction IS a recorded
+  site**. Matching return addresses to call sites can never reach a non-call finding, and this
+  is a stronger statement than any of them — not "the call that faulted" but "the instruction
+  that faulted". Exact match only; a dereference two instructions later is a different
+  statement.
+  **The loop now closes on real software.** jhead 3.04: the detector predicts an OOB-read
+  candidate at `0x40bf0b` in `ProcessGpsInfo`; AFL++ finds a crashing input; `root_cause`
+  reproduces it and faults at exactly `0x40bf0b`; attribution promotes that finding to
+  `poc-backed` at 0.97 with the site named. Static prediction → dynamic proof, on unmodified
+  Debian source.
+- **[PLANNED] `tainted_deref` cannot say which dereference is unchecked.** It reports where
+  attacker data reaches a pointer (122 sites on jhead), not which of those lack a bound. The
+  index needs the same treatment the copy lengths got — `guard_bound` on the OFFSET rather than
+  on the pointer — which is the next increment and the thing that would make this tier small.
 - **[DONE] Crash-to-finding attribution** (`rootcause.attribute`). A verified PoC used to land
   as an orphan row keyed on the signal, sitting beside an undifferentiated pile of static
   findings — on jhead, one "out-of-bounds read" next to 38 unknown copy sites, several of them
