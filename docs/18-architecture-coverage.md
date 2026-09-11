@@ -83,15 +83,14 @@ pipeline -- triage -> disassemble (Ghidra 12.1.2) -> detect_cwe -> dynamic_run -
 | ppc64 (BE) | ppc64 | 978 | 229 | 158 | yes | SIGSEGV | yes | not confirmed |
 | ppc64le | ppc64 | 1829 | 220 | 146 | yes | SIGSEGV | yes | **yes** (off 176) |
 | riscv | riscv | 984 | 23 | 10 | yes | SIGSEGV | yes | **yes** (off 136) |
-| s390 | s390 | 0 | 3 | 0 | no | SIGILL | yes | not confirmed |
-| sh | sh | 969 | 200 | 120 | yes | SIGSEGV | yes | no description |
+| s390 | s390 | 0 | 3 | 0 | no | SIGILL | yes | yes (off 176) |
+| sh | sh | 969 | 200 | 120 | yes | SIGSEGV | yes | yes (off 64) |
 | sparcv9 | sparcv9 | 954 | 198 | 75 | yes | SIGBUS | yes | supported, unreachable* |
 | x86 (32) | x86 | 1100 | 90 | 37 | yes | SIGSEGV | yes | **yes** (off 140) |
 | x86-64 | x86-64 | 1166 | 100 | 69 | yes | SIGSEGV | yes | **yes** (off 136) |
 
-**All 13 reach a verified L1** (crash reproducer, `poc-backed` finding). **Nine reach a
-verified L2** instruction-pointer-control primitive, and **ten reach a confirmed L3**
-control-flow hijack -- up from one (native x86-64) before the cross-arch work. L3 uses
+**All 13 reach a verified L1** (crash reproducer, `poc-backed` finding), and **twelve of
+thirteen reach a confirmed L3** control-flow hijack -- up from one (native x86-64) before the cross-arch work. L3 uses
 **ret2win**: overwrite the saved return address with a chosen function's address read from the
 target's own symbol table, and prove arrival with a breakpoint. All three steps are ISA-neutral
 over the qemu gdbstub; the other L3 strategies (ROP gadget search, mprotect shellcode, the PIE
@@ -109,11 +108,31 @@ info-leak) are x86-64 machine code and stay native-only.
 | riscv | yes | yes | **yes** (72) |
 | loongarch | yes | yes | **yes** (72) |
 | m68k | yes | yes | **yes** (68) |
-| s390 | yes | no | no |
-| sh | yes | no | no |
+| s390 | yes | yes | **yes** (176) |
+| sh | yes | yes | **yes** (64) |
 | sparcv9 | yes | no | no |
 
 Reading the table:
+
+### Two architectures that needed more than a table row
+
+**SuperH is the one layout that cannot be derived.** qemu-sh4 serves no target description at
+all, so it is written by hand -- transcribed from qemu's SH4 gdbstub and then VERIFIED against
+a live g-packet rather than trusted: 59 32-bit registers (236 bytes), with an all-'A' overflow
+landing at indices 14, 16 and 17, i.e. exactly r14 (frame pointer), pc and pr (link register),
+which is what that order predicts. sp is r15, the return address is pr, arguments are r4-r7.
+
+**s390 reaches L3 despite decompiling to nothing** (Ghidra ships no SystemZ processor), which
+is the clearest demonstration that the dynamic ladder does not depend on the decompiler. Two
+things were in the way, both ours: its link register is `r14`, which the shared
+return-address list did not contain -- that list is now per-ISA, because r14 is the link
+register on s390 and ARM but an ordinary callee-saved register on PowerPC and MIPS and so
+cannot be guessed globally; and `exploit_stage` recovered the control offset with
+little-endian 64-bit defaults, which reads a big-endian PC backwards.
+
+**sparcv9 is the one architecture still at L1**, for an architectural reason rather than a
+gap: register windows keep the return address in `%i7` and off the stack entirely, so a
+stack-buffer overflow does not corrupt control flow there at all.
 
 ### Resolved: ppc64le yielded zero data-flow findings (callee-name decoration)
 
