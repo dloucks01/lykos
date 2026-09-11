@@ -81,7 +81,7 @@ def behaviour_of(res, data: bytes = b""):
 
 def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_seconds,
                   exec_timeout, rng, detector, event_prefix, note_prefix, run_fn=run_input,
-                  mutator=None, cover_blocks=()):
+                  mutator=None, cover_blocks=(), cover_flags=()):
     """Shared mutational campaign: mutate -> sandbox -> dedup-by-signal -> minimize ->
     dyn_result + Confirmed finding. Used by both the black-box `fuzz` stage and the directed
     stage (which supplies a corpus/dictionary aimed at specific sinks). Returns stats.
@@ -113,6 +113,11 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
     # tens of thousands of distinct paths.
     all_blocks = set(cover_blocks or ())
     seen_blocks: set = set()
+    # Flag fuzzing runs ONLY under the batched sandbox. An option like jhead's `-cmd` executes
+    # a command built from our input; that is the point (it is where CVE-2020-6624 lives) and
+    # it is only acceptable inside the unshared-net, read-only-root namespace. On the
+    # rlimits-only fallback the target keeps the plain argv it was given.
+    flags = list(cover_flags or ())
     ctx.progress(msg=f"{event_prefix} campaign")
     while execs < max_execs and time.time() < deadline and not ctx.should_cancel():
         want = min(batch_n if batchable else 1, max_execs - execs)
@@ -122,9 +127,13 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
             # Only ever arm blocks we have not reached: the breakpoints are one-shot, so
             # the cost decays as coverage saturates instead of being paid in full forever.
             arm = sorted(all_blocks - seen_blocks) if all_blocks else ()
+            # One flag combination per batch: run_batch takes a single argv prefix, and many
+            # batches cover many combinations.
+            prefix = ([] if not flags or rng.random() < 0.25
+                      else rng.sample(flags, min(len(flags), rng.randint(1, 3))))
             results = sandbox.run_batch(exe, inputs, mode=mode, timeout=exec_timeout,
                                         arch=target.arch, endianness=target.endianness,
-                                        bits=target.bits, blocks=arm)
+                                        bits=target.bits, blocks=arm, base_argv=prefix)
             if results is None:
                 batchable = False                     # not available here; stay per-exec
         if results is None:
@@ -207,6 +216,33 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
     return stats
 
 
+_FLAG_RE = re.compile(rb"(?<![\w%/.-])(-{1,2}[A-Za-z][A-Za-z0-9_]{0,20})(?![\w/.-])")
+_FLAG_CAP = 64
+
+
+def mine_flags(data: bytes) -> list:
+    """Command-line options the binary understands, read out of its own bytes.
+
+    A campaign only ever passed the input, so every path behind a flag was unreachable by
+    construction. On jhead that is ~200 blocks across six functions -- `DoFileRenaming`,
+    `DoCommand`, `ReplaceThumbnail`, `ClearOrientation`, `DiscardAllButExif`, `WriteJpegFile` --
+    and `DoCommand` is where CVE-2020-6624 lives. Real CLI tools put most of their behaviour
+    behind options; a fuzzer that only hands over a filename explores the parser and nothing
+    else.
+    Mined from the RAW bytes rather than the extracted string table, which truncates the usage
+    blob where the short flags live: measured on jhead, the string table yields 40% of the real
+    flags and the raw bytes yield all 42. False positives (a build string's `-O0`, a helper
+    command's `-outfile`) cost nothing -- an unknown flag makes the target print usage, and
+    coverage simply does not reward it.
+    """
+    found: dict = {}
+    for run in re.findall(rb"[ -~\t\n]{4,}", data):
+        for m in _FLAG_RE.findall(run):
+            tok = m.decode("latin-1")
+            found[tok] = found.get(tok, 0) + 1
+    return sorted(found, key=lambda k: (-found[k], k))[:_FLAG_CAP]
+
+
 def _recovered_blocks(ctx, target):
     """Basic-block addresses as FILE vaddrs, or () when the target has not been disassembled.
 
@@ -257,6 +293,7 @@ def fuzz_stage(ctx) -> dict:
 
     strings = StringDAO(ctx.conn).list_by_target(target.id)
     blocks = _recovered_blocks(ctx, target)
+    flags = mine_flags(ctx.content.path(target.sha256).read_bytes())
     corpus = [base64.b64decode(x) for x in p.get("seeds", [])] or list(_DEFAULT_SEEDS)
     dictionary = _mine_dictionary(strings)
     mutator, note = _structure_mutator(p, rng, dictionary), "found by fuzzing"
@@ -288,12 +325,12 @@ def fuzz_stage(ctx) -> dict:
                            max_execs=share_execs, max_seconds=share_secs,
                            exec_timeout=exec_timeout, rng=rng, detector="fuzz",
                            event_prefix="fuzz", note_prefix=note, mutator=mutator,
-                           cover_blocks=blocks)
+                           cover_blocks=blocks, cover_flags=flags)
         for k in totals:
             totals[k] += st.get(k, 0)
         if st.get("crashes"):
             break
-    ctx.emit("fuzz.channels", payload={"channels": channels, **totals})
+    ctx.emit("fuzz.channels", payload={"channels": channels, "flags": len(flags), **totals})
     return {}
 
 
