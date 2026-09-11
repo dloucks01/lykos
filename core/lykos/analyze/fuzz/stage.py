@@ -16,7 +16,7 @@ import random
 import re
 import time
 
-from ...db.dao import CallEdgeDAO, DynResultDAO, FindingDAO, StringDAO, TargetDAO
+from ...db.dao import CallEdgeDAO, DynResultDAO, FindingDAO, FunctionDAO, StringDAO, TargetDAO
 from ...jobs.registry import register_stage
 from ..dynamic import sandbox
 from ..dynamic.minimize import minimize
@@ -81,7 +81,7 @@ def behaviour_of(res, data: bytes = b""):
 
 def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_seconds,
                   exec_timeout, rng, detector, event_prefix, note_prefix, run_fn=run_input,
-                  mutator=None):
+                  mutator=None, cover_blocks=()):
     """Shared mutational campaign: mutate -> sandbox -> dedup-by-signal -> minimize ->
     dyn_result + Confirmed finding. Used by both the black-box `fuzz` stage and the directed
     stage (which supplies a corpus/dictionary aimed at specific sinks). Returns stats.
@@ -107,15 +107,24 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
     # own delivery (boundary harnessing) is not a series of independent executions.
     batchable = run_fn is run_input
     batch_n = 64
+    # Real path coverage when the target has been disassembled. An output-shape proxy notices
+    # that a parser printed something new; block coverage notices that it took a branch it has
+    # never taken -- which is the difference between a few thousand distinct behaviours and
+    # tens of thousands of distinct paths.
+    all_blocks = set(cover_blocks or ())
+    seen_blocks: set = set()
     ctx.progress(msg=f"{event_prefix} campaign")
     while execs < max_execs and time.time() < deadline and not ctx.should_cancel():
         want = min(batch_n if batchable else 1, max_execs - execs)
         inputs = [mut.mutate(rng.choice(corpus), corpus) for _ in range(max(1, want))]
         results = None
         if batchable:
+            # Only ever arm blocks we have not reached: the breakpoints are one-shot, so
+            # the cost decays as coverage saturates instead of being paid in full forever.
+            arm = sorted(all_blocks - seen_blocks) if all_blocks else ()
             results = sandbox.run_batch(exe, inputs, mode=mode, timeout=exec_timeout,
                                         arch=target.arch, endianness=target.endianness,
-                                        bits=target.bits)
+                                        bits=target.bits, blocks=arm)
             if results is None:
                 batchable = False                     # not available here; stay per-exec
         if results is None:
@@ -128,10 +137,19 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
             # Keep anything that made the program behave in a way we have not seen. This is the
             # ratchet: without it the corpus never grows and a deeper path is reachable only by a
             # single lucky mutation from a seed.
+            new_blocks = set()
+            if all_blocks and res.note:
+                try:
+                    new_blocks = {int(x) for x in res.note.split(",") if x} - seen_blocks
+                except ValueError:
+                    new_blocks = set()
+                seen_blocks |= new_blocks
             b = behaviour_of(res, data)
+            novel = bool(new_blocks) if all_blocks else (b not in seen_behaviour)
             if b not in seen_behaviour:
                 seen_behaviour.add(b)
-                if not res.crashed and len(data) <= _MAX_KEEP:
+            if novel:
+                if not res.crashed and len(data) <= _MAX_KEEP:  # noqa: SIM102
                     if len(corpus) < _MAX_CORPUS:
                         corpus.append(data)
                     else:
@@ -181,11 +199,43 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
     elapsed = max(1e-3, max_seconds - max(0.0, deadline - time.time()))
     stats = {"execs": execs, "crashes": crashes, "unique": len(seen_sigs),
              "behaviours": len(seen_behaviour), "corpus": len(corpus), "kept": kept,
-             "execs_per_sec": round(execs / elapsed)}
+             "execs_per_sec": round(execs / elapsed),
+             "blocks_hit": len(seen_blocks), "blocks_known": len(all_blocks)}
     ctx.emit(f"{event_prefix}.done", payload=stats)
     ctx.progress(pct=100, msg=f"{execs} execs, {crashes} crashes, {len(seen_sigs)} unique, "
                              f"{len(seen_behaviour)} behaviours")
     return stats
+
+
+def _recovered_blocks(ctx, target):
+    """Basic-block addresses as FILE vaddrs, or () when the target has not been disassembled.
+
+    The decompiler already walked this binary; its block list is coverage instrumentation we
+    have already paid for. Addresses are shifted out of the decompiler's image base so the
+    runner can place them whether the target is position-independent or not.
+    """
+    from ..debug import rootcause
+    from ..elf import parse as parse_elf
+    fd = FunctionDAO(ctx.conn)
+    fns = fd.list_by_target(target.id)
+    if not fns:
+        return ()
+    try:
+        entry = parse_elf(ctx.content.path(target.sha256).read_bytes()).entry
+    except Exception:
+        entry = None
+    base = rootcause.image_base(fns, entry) or 0
+    out = set()
+    for f in fns:
+        if not f.blocks:
+            continue
+        full = fd.get(f.id)
+        for b in ((full.ir or {}).get("blocks") or []):
+            try:
+                out.add(int(b["addr"], 16) - base)
+            except (KeyError, TypeError, ValueError):
+                continue
+    return sorted(out)
 
 
 def fuzz_stage(ctx) -> dict:
@@ -206,6 +256,7 @@ def fuzz_stage(ctx) -> dict:
     rng = random.Random(int(p.get("seed", 1337)))
 
     strings = StringDAO(ctx.conn).list_by_target(target.id)
+    blocks = _recovered_blocks(ctx, target)
     corpus = [base64.b64decode(x) for x in p.get("seeds", [])] or list(_DEFAULT_SEEDS)
     dictionary = _mine_dictionary(strings)
     mutator, note = _structure_mutator(p, rng, dictionary), "found by fuzzing"
@@ -236,7 +287,8 @@ def fuzz_stage(ctx) -> dict:
         st = fuzz_campaign(ctx, target, corpus=list(corpus), dictionary=dictionary, mode=ch,
                            max_execs=share_execs, max_seconds=share_secs,
                            exec_timeout=exec_timeout, rng=rng, detector="fuzz",
-                           event_prefix="fuzz", note_prefix=note, mutator=mutator)
+                           event_prefix="fuzz", note_prefix=note, mutator=mutator,
+                           cover_blocks=blocks)
         for k in totals:
             totals[k] += st.get(k, 0)
         if st.get("crashes"):

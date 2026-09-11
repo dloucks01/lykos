@@ -117,59 +117,22 @@ def argv_bytes(a):
 
 # One namespace, many executions. Spawning bubblewrap costs 3.18 ms of a 3.55 ms execution --
 # a 9.5x tax paid on EVERY input -- which is why a campaign managed 256 exec/s against AFL++'s
-# 6,100. This runs inside a single sandbox and executes the target once per input, so the
-# namespace is paid for once per batch instead of once per input. Isolation is unchanged:
-# every target process is still a child inside the same unshared-net, read-only-root namespace.
-_BATCH_RUNNER = r"""
-import os, struct, subprocess, sys
-def readn(n):
-    b = b""
-    while len(b) < n:
-        c = sys.stdin.buffer.read(n - len(b))
-        if not c:
-            break
-        b += c
-    return b
-mode = sys.argv[1]
-per_timeout = float(sys.argv[2])
-cmd_prefix = sys.argv[3:]
-# A FIXED path: /tmp is a fresh tmpfs inside this namespace, and a name that changed per
-# batch leaked into any diagnostic that echoes the filename -- which made every batch's
-# output look novel to the campaign's coverage proxy.
-wf = "/tmp/lykos-fuzz-input.bin"
-out = sys.stdout.buffer
-(count,) = struct.unpack("<I", readn(4))
-for _ in range(count):
-    (ln,) = struct.unpack("<I", readn(4))
-    data = readn(ln)
-    if mode == "arg":
-        argv = cmd_prefix + [data.split(b"\x00", 1)[0].decode("latin-1")]
-        stdin = b""
-    elif mode == "file":
-        with open(wf, "wb") as fh:
-            fh.write(data)
-        argv = cmd_prefix + [wf]
-        stdin = b""
-    else:
-        argv, stdin = list(cmd_prefix), data
-    try:
-        pr = subprocess.run(argv, input=stdin, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, timeout=per_timeout)
-        rc, so, se, to = pr.returncode, pr.stdout[:4096], pr.stderr[:4096], 0
-    except subprocess.TimeoutExpired:
-        rc, so, se, to = 0, b"", b"", 1
-    except Exception:
-        rc, so, se, to = 0, b"", b"", 2
-    out.write(struct.pack("<iIIB", rc, len(so), len(se), to))
-    out.write(so)
-    out.write(se)
-out.flush()
-"""
+# 6,100. The runner lives in a real module rather than an embedded string, because it now also
+# carries a ptrace tracer and that does not belong in a quoted blob.
+def _batch_runner_path() -> str:
+    from ..fuzz import batch_runner
+    return str(Path(batch_runner.__file__).resolve())
 
 
 def run_batch(exe, payloads, *, mode="stdin", base_argv=(), timeout: float = 2.0,
-              arch=None, endianness=None, bits=None, host=None, mem_mb: int = 2048):
+              arch=None, endianness=None, bits=None, host=None, mem_mb: int = 2048,
+              blocks=()):
     """Execute many inputs inside ONE sandbox. Returns a list of RunResult, or None.
+
+    `blocks` are image-relative basic-block addresses to watch; each result then carries the
+    ones this input REACHED, in `RunResult.note` as a comma-separated list. Breakpoints are
+    one-shot per execution and the caller passes only blocks it has not seen, so the cost
+    decays as coverage saturates.
 
     None means "not available here" -- no bubblewrap, no python3, an emulated or PE target, a
     malformed reply -- and the caller falls back to `run()` per input. Speed is never a reason
@@ -183,10 +146,14 @@ def run_batch(exe, payloads, *, mode="stdin", base_argv=(), timeout: float = 2.0
     if not py or not _bwrap_usable() or not payloads:
         return None
     exedir = str(Path(exe).resolve().parent)
-    inner = [py, "-c", _BATCH_RUNNER, mode, str(timeout), str(exe),
+    runner = _batch_runner_path()
+    inner = [py, runner, mode, str(timeout), str(exe),
              *[argv_bytes(a).decode("latin-1") for a in base_argv]]
     cmd = (["bwrap"] + _BWRAP_ARGS[:-1] + ["--ro-bind", exedir, exedir, "--"] + inner)
-    blob = bytearray(struct.pack("<I", len(payloads)))
+    blocks = list(blocks)
+    blob = bytearray(struct.pack("<II", len(payloads), len(blocks)))
+    if blocks:
+        blob += struct.pack("<%dQ" % len(blocks), *blocks)
     for d in payloads:
         blob += struct.pack("<I", len(d)) + d
     budget = timeout * len(payloads) + 15.0
@@ -199,17 +166,24 @@ def run_batch(exe, payloads, *, mode="stdin", base_argv=(), timeout: float = 2.0
     per_ms = int((time.time() - t0) * 1000 / max(1, len(payloads)))
     results, off = [], 0
     for _ in payloads:
-        if off + 13 > len(out):
+        if off + 17 > len(out):
             return None                               # truncated reply: fall back rather than
-        code, nso, nse, to = struct.unpack("<iIIB", out[off:off + 13])   # invent results
-        off += 13
+        code, nso, nse, flags, nnew = struct.unpack("<iIIBI", out[off:off + 17])  # invent one
+        off += 17
         so, se = out[off:off + nso], out[off + nso:off + nso + nse]
         off += nso + nse
+        reached = ()
+        if nnew:
+            if off + 8 * nnew > len(out):
+                return None
+            reached = struct.unpack("<%dQ" % nnew, out[off:off + 8 * nnew])
+            off += 8 * nnew
         crashed, sig, signame, exit_code = classify_rc(code)
         results.append(RunResult(isolation="bwrap+netns+batch", crashed=bool(crashed),
-                                 timed_out=bool(to), exit_code=exit_code, signal=sig,
+                                 timed_out=bool(flags & 1), exit_code=exit_code, signal=sig,
                                  signal_name=signame, stdout=so, stderr=se,
-                                 duration_ms=per_ms))
+                                 duration_ms=per_ms,
+                                 note=(",".join(str(x) for x in reached) or None)))
     return results
 
 
