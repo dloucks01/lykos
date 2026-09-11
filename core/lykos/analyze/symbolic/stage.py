@@ -24,6 +24,7 @@ from ..dynamic import sandbox
 from ..dynamic.stage import crash_finding_candidate
 from ..fuzz.directed import select_targets
 from ..fuzz.runner import invocation
+from ..poc.capture import how_to_feed
 from . import concolic, symqemu
 
 CONCOLIC_STAGE = "concolic"
@@ -169,7 +170,7 @@ def concolic_stage(ctx) -> dict:
     if target is None:
         raise ValueError("concolic requires a target_id")
     p = ctx.params or {}
-    mode = p.get("input_mode", "stdin")
+    mode = how_to_feed(ctx.conn, target, p.get("input_sha"), p)[0]
     base_argv = list(p.get("argv") or [])
     exec_timeout = float(p.get("exec_timeout", 2))
 
