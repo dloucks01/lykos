@@ -16,7 +16,7 @@ from typing import Optional
 _SIG = re.compile(r"received signal (SIG\w+)")
 _PC = re.compile(r"LYKOS_PC (0x[0-9a-fA-F]+)")
 _FAULT = re.compile(r"si_addr = (0x[0-9a-fA-F]+)")
-_FRAME = re.compile(r"^#\d+\s+(?:0x0*([0-9a-fA-F]+)\s+in\s+|)")
+_FRAME = re.compile(r"^#(\d+)\s+(?:0x0*([0-9a-fA-F]+)\s+in\s+|)")
 _XBYTES = re.compile(r"0x[0-9a-fA-F]+(?:\s*<[^>]*>)?:\s+((?:0x[0-9a-fA-F]{2}\s*)+)")
 _MAPLINE = re.compile(r"^\s*(0x[0-9a-fA-F]+)\s+(0x[0-9a-fA-F]+)\s+0x[0-9a-fA-F]+\s+"
                       r"0x[0-9a-fA-F]+\s+(\S*)\s*(.*)$")
@@ -133,10 +133,17 @@ def _parse(out: str) -> dict:
             perms = m.group(3) if any(c in m.group(3) for c in "rwxp-") else ""
             maps.append({"start": int(m.group(1), 16), "end": int(m.group(2), 16),
                          "perms": perms, "path": m.group(4).strip()})
-    frames = [int(m.group(1), 16) for line in out.splitlines()
-              if (m := _FRAME.match(line.strip())) and m.group(1)]
+    # Drop frame #0 BY NUMBER, not by position. gdb omits the address for the innermost
+    # frame ("#0  __memcpy_avx512_unaligned_erms () at ..."), so it never parsed, and slicing
+    # the first element off the parsed list threw away frame #1 instead -- the caller that
+    # actually names the faulting call site.
+    frames = []
+    for line in out.splitlines():
+        m = _FRAME.match(line.strip())
+        if m and m.group(2) and m.group(1) != "0":
+            frames.append(int(m.group(2), 16))
     return {"ok": True, "source": "gdb", "signal_name": sig.group(1),
             "pc": int(pc.group(1), 16) if pc else None,
             "fault_addr": int(fault.group(1), 16) if fault else None,
-            "pc_bytes": pc_bytes[:32], "backtrace": frames[1:], "regs": {}, "maps": maps,
+            "pc_bytes": pc_bytes[:32], "backtrace": frames, "regs": {}, "maps": maps,
             "gdb_raw": out[-4000:]}

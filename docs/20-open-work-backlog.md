@@ -286,6 +286,46 @@ actionable.
   been. This also removed the last two false positives on jhead 3.04 — the `ProcessFile`
   `Comment[16001]`/`st` slot-reuse artifact documented above — taking it to 38 unknown / 4
   bounded / 0 suspect.
+- **[DONE] Crash-to-finding attribution** (`rootcause.attribute`). A verified PoC used to land
+  as an orphan row keyed on the signal, sitting beside an undifferentiated pile of static
+  findings — on jhead, one "out-of-bounds read" next to 38 unknown copy sites, several of them
+  in the very function the fault was in, with nothing joining them. `rootcause.analyze` was
+  already handed the findings and already computed the faulting PC and backtrace; it just never
+  made the join, and wrote `site_addr: None, function_addr: None`.
+  The backtrace records which calls were executing, so it is read and graded. Only the top tier
+  is a proof: **fault-site** (the faulting PC is inside the call this finding names — the sink
+  itself faulted) promotes to `poc-backed` at 0.97; **on-stack** (that call was somewhere on the
+  stack) and **crash-function** (the site merely sits in a function the stack runs through)
+  attach evidence and change nothing. Every tier names the SITE, because findings are deduped
+  at defect grain — one CWE-120 row covers twenty memcpy sites — so "this defect occurs in a
+  function on the stack" is close to vacuous on its own.
+  Validated end-to-end on a PIE fixture whose `memcpy` faults on its source read: the CWE-120
+  finding carried two sites (a PLT thunk and the real call at `0x10120f`), the backtrace
+  resolved to `0x101214` in `parse`, and `0x101214 - 0x10120f = 5` — exactly an x86 `call
+  rel32` — so the right site was picked and promoted. On jhead it promotes **nothing**, which is
+  correct: that fault is a direct `movzx` load, not inside a flagged call. It attributes 8 sites
+  at proximity tier, narrowing 21 findings to the ones in demonstrably reached functions.
+  The dedup key stays `dynamic-crash:{signal}` — eight PoC stages look findings up by it — so
+  the crash row's own `function_addr`/`site_addr` are the first crash site seen for a signal,
+  which is how `upsert` treats every other finding.
+- **[DONE] Two bugs that silently disabled attribution before it could work.**
+  *gdb dropped the frame that matters.* The capture parsed the backtrace and then took
+  `frames[1:]` to skip frame #0 — but gdb omits the address for the innermost frame, so `#0`
+  never parsed and the slice threw away `#1` instead, the caller that names the faulting call
+  site. Frame 0 is now dropped by NUMBER. On the worked example this alone turned a provable
+  finding into an unattributed crash.
+  *Symbolization was absolute-only.* Ghidra rebases a position-independent image (0x100000 for
+  ET_DYN here), so a runtime address minus its load base is a FILE OFFSET, not a decompiler
+  address, and no frame in a PIE target ever resolved. The base is now DERIVED — the ELF header
+  gives the entry as a file vaddr, the function table gives the same function's decompiler
+  address, and the difference is the base. Guessing it (rounding the lowest function down to a
+  boundary) would resolve frames to the wrong functions whenever the guess was off.
+- **[PLANNED] `multidebug` does not attribute.** The multi-input debug path writes the same
+  signal-keyed crash finding and never calls `attribute`, so crashes found that way stay
+  unjoined.
+- **[PLANNED] The crash finding is still one row per signal.** Two unrelated SIGSEGVs merge, so
+  the row's site is whichever ran first. Splitting it by crash function would be more honest but
+  changes a key eight PoC stages depend on.
 - **[PLANNED] Three architectures are blocked upstream of the bounds pass.** riscv resolves one
   `memcpy` call edge in the whole binary, so no site is scored; s390 recovers 0 functions at
   disassembly and has no `ARCH_ABI` entry at all; sparcv9's register windows give a recovered

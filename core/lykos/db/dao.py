@@ -536,6 +536,23 @@ class FindingDAO(BaseDAO):
         return [{"function_addr": r["function_addr"], "site_addr": r["site_addr"],
                  "detail": r["detail"]} for r in rows]
 
+    def sites_by_target(self, target_id: str) -> dict:
+        """finding_id -> every (function_addr, site_addr) it occurs at, in one query.
+
+        Findings are deduped at DEFECT grain, so the row's own `site_addr` is just the first
+        occurrence. Anything matching a finding against an address -- crash attribution, for
+        one -- has to look here or it silently sees one site out of dozens.
+        """
+        rows = self.conn.execute(
+            "SELECT fs.finding_id, fs.function_addr, fs.site_addr FROM finding_site fs "
+            "JOIN finding f ON f.id = fs.finding_id WHERE f.target_id=? "
+            "ORDER BY fs.created_at, fs.rowid", (target_id,)).fetchall()
+        out: dict = {}
+        for r in rows:
+            out.setdefault(r["finding_id"], []).append(
+                {"function_addr": r["function_addr"], "site_addr": r["site_addr"]})
+        return out
+
     def site_counts(self, target_id: str) -> dict:
         """finding id -> number of recorded sites, for the whole target in one query."""
         rows = self.conn.execute(

@@ -11,6 +11,7 @@ import sys
 
 from ...db.dao import CallEdgeDAO, FindingDAO, FunctionDAO, TargetDAO
 from ...jobs.registry import register_stage
+from .. import elf
 from ..dynamic import sandbox
 from ..poc.capture import make_capture, make_qemu_capture, materialize_helper
 from . import gdb, qemu_gdb, rootcause
@@ -18,6 +19,11 @@ from . import gdb, qemu_gdb, rootcause
 ROOT_CAUSE_STAGE = "root_cause"
 TOOL = "rootcause"
 TOOL_VERSION = "rootcause-1"
+
+
+def _hex(v):
+    """Addresses reach the finding table as hex strings; the slice carries them as ints."""
+    return None if v is None else (v if isinstance(v, str) else hex(v))
 
 
 def root_cause_stage(ctx) -> dict:
@@ -87,9 +93,18 @@ def root_cause_stage(ctx) -> dict:
 
         functions = FunctionDAO(ctx.conn).list_by_target(target.id)
         call_edges = CallEdgeDAO(ctx.conn).list_by_target(target.id)
-        findings = FindingDAO(ctx.conn).list_by_target(target.id)
+        # Exclude the crash rows themselves: a previous root_cause run leaves a finding at
+        # the faulting address, which would otherwise attribute the crash to itself.
+        findings = [f for f in FindingDAO(ctx.conn).list_by_target(target.id)
+                    if not (f.dedup_key or "").startswith("dynamic-crash:")]
+        sites_by_finding = FindingDAO(ctx.conn).sites_by_target(target.id)
+        elf_entry = None
+        try:
+            elf_entry = elf.parse(target_bytes).entry
+        except Exception:
+            pass                                  # not an ELF, or unreadable: match absolutely
         report = rootcause.analyze(cap, functions, call_edges, findings,
-                                   str(exe), target.arch or host)
+                                   str(exe), target.arch or host, sites_by_finding, elf_entry)
         report["backend"] = backend
 
         report_sha = ctx.put_artifact("root-cause", data=json.dumps(report, indent=2,
@@ -100,18 +115,46 @@ def root_cause_stage(ctx) -> dict:
         ex = report["exploitability"]
         ex_line = (f"exploitability: {ex['rating']} ({ex['score']}/100) -- "
                    + "; ".join(ex["reasons"]))
-        FindingDAO(ctx.conn).upsert(target.id, target.case_id, {
+        crash_fn = (report["slice"].get("crash_function") or {})
+        fdao = FindingDAO(ctx.conn)
+        fdao.upsert(target.id, target.case_id, {
             "cwe": v["cwe"], "title": f"Root cause: {v['class']} [{ex['rating']}]",
             "severity": v["severity"],
             "state": "confirmed", "confidence": 0.9, "detector": "root_cause",
-            "site_addr": None, "function_addr": None,
+            # The crash is now locatable. The dedup key stays keyed on the signal alone --
+            # eight PoC stages look the finding up by it -- so these are the FIRST crash site
+            # seen for a signal, which is also how upsert treats every other finding.
+            "site_addr": _hex(crash_fn.get("static_addr")),
+            "function_addr": crash_fn.get("func_addr"),
             "dedup_key": f"dynamic-crash:{cap['signal_name']}",
             "evidence": [{"channel": "root-cause", "detail": report["summary"]},
                          {"channel": "exploitability", "detail": ex_line}]})
 
+        # Attribute the crash to the static findings it actually demonstrates. Without this a
+        # verified PoC sits beside the static inventory instead of ranking it: on jhead, one
+        # crash next to 38 unknown copy sites, several in the faulting function.
+        by_id = {f.id: f for f in findings}
+        promoted = 0
+        for a in report["slice"].get("attributed") or []:
+            f = by_id.get(a["finding_id"])
+            if f is None:
+                continue
+            proven = a["tier"] == "fault-site"
+            fdao.upsert(target.id, target.case_id, {
+                "dedup_key": f.dedup_key, "cwe": f.cwe, "severity": f.severity,
+                "detector": f.detector,       # upsert rewrites detector on merge; keep it
+                "state": "poc-backed" if proven else f.state,
+                "confidence": 0.97 if proven else f.confidence,
+                "evidence": [{"channel": "crash-attribution",
+                              "detail": (f"{a['detail']} -- reproduced "
+                                         f"{cap['signal_name']} crash")}]})
+            promoted += proven
+
         ctx.emit("rootcause.done", payload={
             "supported": True, "backend": backend, "cwe": v["cwe"],
             "classification": v["class"], "summary": report["summary"],
+            "attributed": len(report["slice"].get("attributed") or []),
+            "poc_backed": promoted,
             "exploitability": ex["rating"], "exploit_score": ex["score"],
             "reachable_from_source": report["slice"]["reachable_from_source"],
             "report": report_sha})
