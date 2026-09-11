@@ -14,12 +14,17 @@ import os
 
 from ...db.dao import CallEdgeDAO, FindingDAO, FunctionDAO, TargetDAO
 from ...jobs.registry import register_stage
+from .. import elf
 from ..dynamic import sandbox
 from . import gdb, rootcause
 
 MULTI_DEBUG_STAGE = "multi_debug"
 TOOL = "lykos-multidebug"
 TOOL_VERSION = "multidebug-1"
+
+
+def _hex(v):
+    return None if v is None else (v if isinstance(v, str) else hex(v))
 
 
 def _crash_binary(cap):
@@ -101,9 +106,18 @@ def multi_debug_stage(ctx) -> dict:
 
     functions = FunctionDAO(ctx.conn).list_by_target(victim.id)
     call_edges = CallEdgeDAO(ctx.conn).list_by_target(victim.id)
-    findings = FindingDAO(ctx.conn).list_by_target(victim.id)
+    fdao = FindingDAO(ctx.conn)
+    # Exclude the crash rows themselves, or an earlier run's finding at the faulting address
+    # attributes the crash to itself.
+    findings = [f for f in fdao.list_by_target(victim.id)
+                if not (f.dedup_key or "").startswith("dynamic-crash:")]
+    elf_entry = None
+    try:
+        elf_entry = elf.parse(exe.read_bytes()).entry
+    except Exception:
+        pass                                  # not an ELF, or unreadable: match absolutely
     rc = rootcause.analyze(cap, functions, call_edges, findings, str(exe),
-                           victim.arch or host)
+                           victim.arch or host, fdao.sites_by_target(victim.id), elf_entry)
     v = rc["classification"]
 
     relation = ("execve" if cap.get("execed") else "fork") if cap.get("multiproc") \
@@ -126,17 +140,33 @@ def multi_debug_stage(ctx) -> dict:
     detail = (f"multi-process debug: {blame}; {v['class']} — {rc['summary']}"
               if report["multiproc"]
               else f"debug: {v['class']} — {rc['summary']}")
-    FindingDAO(ctx.conn).upsert(victim.id, victim.case_id, {
+    crash_fn = (rc["slice"].get("crash_function") or {})
+    fdao.upsert(victim.id, victim.case_id, {
         "cwe": v["cwe"], "title": f"Root cause ({relation}): {v['class']}",
         "severity": v["severity"], "state": "confirmed", "confidence": 0.9,
-        "detector": "multi_debug", "site_addr": None, "function_addr": None,
+        "detector": "multi_debug",
+        "site_addr": _hex(crash_fn.get("static_addr")),
+        "function_addr": crash_fn.get("func_addr"),
         "dedup_key": f"dynamic-crash:{cap['signal_name']}",
         "evidence": [{"channel": "multi-process-debug", "detail": detail}]})
+
+    # A crash found through a forked child demonstrates the child's findings just as much.
+    by_id = {f.id: f for f in findings}
+    promoted = 0
+    for a in rc["slice"].get("attributed") or []:
+        f = by_id.get(a["finding_id"])
+        if f is None:
+            continue
+        fdao.upsert(victim.id, victim.case_id,
+                    rootcause.attribution_upsert(f, a, cap["signal_name"]))
+        promoted += a["tier"] == "fault-site"
+    report["attributed"] = rc["slice"].get("attributed") or []
 
     ctx.emit("multidebug.done", payload={
         "supported": True, "multiproc": report["multiproc"], "relation": relation,
         "entry": target.filename, "crashing": victim.filename, "cwe": v["cwe"],
-        "classification": v["class"], "blame": blame, "report": report_sha})
+        "classification": v["class"], "blame": blame, "report": report_sha,
+        "attributed": len(report["attributed"]), "poc_backed": promoted})
     ctx.progress(pct=100, msg=blame[:90])
     return {"output_shas": [report_sha], "output_kind": "multi-debug"}
 

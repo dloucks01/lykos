@@ -302,6 +302,23 @@ def _callgraph_path(call_edges, sources_callers, crash_fn_addr, maxdepth=8):
     return None
 
 
+def attribution_upsert(f, a, signal_name):
+    """The finding row an attribution produces. Pure -- the caller owns the DAO.
+
+    Only `fault-site` promotes: the fault happened inside the call the finding names, so the
+    crash IS that finding. The weaker tiers attach the evidence and leave the state alone,
+    because being near a crash is not being the crash.
+    """
+    proven = a["tier"] == "fault-site"
+    return {
+        "dedup_key": f.dedup_key, "cwe": f.cwe, "severity": f.severity,
+        "detector": f.detector,          # upsert rewrites detector on merge; keep the original
+        "state": "poc-backed" if proven else f.state,
+        "confidence": 0.97 if proven else f.confidence,
+        "evidence": [{"channel": "crash-attribution",
+                      "detail": f"{a['detail']} -- reproduced {signal_name} crash"}]}
+
+
 def build_slice(cap, functions, call_edges, findings, maps, target_path,
                 sites_by_finding=None, elf_entry=None):
     ranges = _fn_ranges(functions)
