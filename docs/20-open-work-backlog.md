@@ -392,12 +392,29 @@ actionable.
   `treat_dir` correctly stays high (its guard is `len + NAMLEN(dp) + 1`, an expression this
   cannot read); **ncompress 4.2.4's real overflow is untouched at high**, which is the check
   that matters.
-- **[PLANNED] A demotion cannot take effect on re-analysis.** `FindingDAO.upsert` merges by
-  taking the HIGHER state/severity/confidence — deliberate, it is how the confidence lifecycle
-  advances when channels agree — but it also means improving the analysis can never lower an
-  existing finding. gzip's `get_suffix` demotes correctly on a fresh case and stays `high` on a
-  re-run of the same one. Needs a way for a channel to retract its own earlier verdict without
-  breaking cross-channel promotion.
+- **[DONE] A channel can now revise its own verdict** (migration 12, `finding_verdict`). The
+  merge took the higher state/severity/confidence and kept it forever. That is right for
+  promotion — it is how a finding climbs candidate → corroborated → confirmed → poc-backed when
+  channels agree — and wrong for everything else: a channel could never lower its own verdict,
+  so every demotion was computed and thrown away. `enqueue_detect` forces by default
+  ("re-detect after re-analysis should re-run rather than cache-hit"), so that was the designed
+  path, not an edge case — the bounds, dominating-guard and `strlen`-bounding work only ever
+  helped targets nobody had analysed yet.
+  Each channel now records its own verdict and the finding is the **maximum over what the
+  channels currently say**, rather than the high-water mark of everything they have ever said.
+  Within one run a channel speaks once per site and those max-merge (nine sites of a sink must
+  not leave whichever was written last); a LATER run replaces what that channel said before.
+  A caller that does not stamp its run keeps the old monotonic behaviour, which is what every
+  existing caller gets. Crash attribution moved to its own `crash-attribution` channel so a
+  promotion from a reproduced crash neither overwrites what the static detector says nor is
+  undone when that detector next re-runs. The migration seeds a verdict from each existing row,
+  or the first upsert afterwards would recompute a finding from one channel and drop the
+  standing verdicts of every channel that had not yet re-run.
+  Measured: a stale `confirmed/critical/0.99` verdict from an older run is replaced by
+  `candidate/high/0.55` on re-detect. `FindingDAO.verdicts()` exposes the trail.
+  One nuance the defect-grain change surfaced: gzip's `get_suffix` (provably bounded) and
+  `treat_dir` (guard is an expression we cannot read) are now sites of the SAME defect, so the
+  finding correctly stays high — the defect does still occur unbounded at one of its sites.
 - **[PLANNED] A second POSITIVE L2 target is still open.** gzip 1.3.5 was analysed end to end
   and correctly yields no exploitable stack overflow — both candidates are guarded, one now
   provably so — which is a true negative and a useful test, but not a second demonstration.

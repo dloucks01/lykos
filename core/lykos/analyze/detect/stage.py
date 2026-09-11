@@ -149,6 +149,10 @@ def detect_stage(ctx) -> dict:
 
     fd = FindingDAO(ctx.conn)
     for c in cands:
+        # Stamp the run: this channel's verdicts from an EARLIER run are replaced rather than
+        # max-merged, which is what lets a demotion (a copy proven bounded, say) actually take
+        # effect. Sites within this run still take the strongest.
+        c["run_id"] = ctx.run_id
         fd.upsert(target.id, target.case_id, c)
     counts = fd.counts_by_state(target.id)
     ctx.emit("findings.done", payload={"candidates": len(cands), "states": counts})

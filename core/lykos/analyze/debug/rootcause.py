@@ -325,6 +325,9 @@ def attribution_upsert(f, a, signal_name):
     proven = a["tier"] == "fault-site"
     return {
         "dedup_key": f.dedup_key, "cwe": f.cwe, "severity": f.severity,
+        # Its OWN channel: a promotion from a reproduced crash must not overwrite what the
+        # static detector says, and must not be undone when that detector next re-runs.
+        "channel": "crash-attribution",
         "detector": f.detector,          # upsert rewrites detector on merge; keep the original
         "state": "poc-backed" if proven else f.state,
         "confidence": 0.97 if proven else f.confidence,
