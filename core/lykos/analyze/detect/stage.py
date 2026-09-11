@@ -127,7 +127,10 @@ def detect_stage(ctx) -> dict:
                                        bits=target.bits or 64)
     for c in cands:
         v = verdicts.get(c.get("site_addr"))
-        if not v or c.get("detector") != "dangerous_api":
+        # stack_buffer_overflow reports the same strcpy sites at CWE-121/high, so a bounds
+        # verdict has to reach it too -- otherwise a copy proven safe still shows up as a
+        # high-severity stack smash. Both of gzip 1.3.5's CWE-121 candidates were that.
+        if not v or c.get("detector") not in ("dangerous_api", "stack_frame"):
             continue
         if v["verdict"] == bounds.SAFE:
             # provably bounded: demote out of the headline, keep as inventory with the reason

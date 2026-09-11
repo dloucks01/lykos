@@ -184,14 +184,10 @@ def test_an_addressed_frame_zero_is_still_dropped():
 # ---------------------------------------------------------------- how the input is fed back in
 # The stage defaulted to stdin, so a file parser reported "no fault reproduced" -- which reads
 # as a clean negative and actually meant "we fed it the wrong way". On jhead that silently
-# discarded a real, reproducible crash until the mode was passed by hand.
-from lykos.analyze.debug import stage as dbg_stage  # noqa: E402
+# discarded a real, reproducible crash until the mode was passed by hand. Three stages had it
+# (root_cause, build_poc, poc_primitive), so the rule lives in one shared place now.
+from lykos.analyze.poc import capture as feed  # noqa: E402
 from lykos.db.dao import DynResultDAO  # noqa: E402
-
-
-class _Ctx:
-    def __init__(self, conn):
-        self.conn = conn
 
 
 def _target(store, case):
@@ -201,7 +197,7 @@ def _target(store, case):
 
 def test_an_explicit_mode_wins(store, case):
     t = _target(store, case)
-    got = dbg_stage._how_to_feed(_Ctx(store.conn), t, "s" * 64,
+    got = feed.how_to_feed(store.conn, t, "s" * 64,
                                  {"input_mode": "arg", "argv": ["-x"]})
     assert got == ("arg", ["-x"], "given")
 
@@ -212,7 +208,7 @@ def test_the_run_that_found_the_crash_says_how_it_fed_it(store, case):
     t = _target(store, case)
     DynResultDAO(store.conn).insert(t.id, case.id, input_sha="c" * 64, input_mode="file",
                                     argv=["-v"], crashed=True, signal_name="SIGSEGV")
-    assert dbg_stage._how_to_feed(_Ctx(store.conn), t, "c" * 64, {}) == (
+    assert feed.how_to_feed(store.conn, t, "c" * 64, {}) == (
         "file", ["-v"], "recorded by the run that found it")
 
 
@@ -220,14 +216,14 @@ def test_an_unrelated_run_is_not_consulted(store, case):
     t = _target(store, case)
     DynResultDAO(store.conn).insert(t.id, case.id, input_sha="d" * 64, input_mode="file",
                                     crashed=True, signal_name="SIGSEGV")
-    mode, _argv, why = dbg_stage._how_to_feed(_Ctx(store.conn), t, "c" * 64, {})
-    assert why == "no record of how it was found" and mode in dbg_stage._MODES
+    mode, _argv, why = feed.how_to_feed(store.conn, t, "c" * 64, {})
+    assert why == "no record of how it was found" and mode in feed.MODES
 
 
 def test_every_mode_is_a_candidate_for_the_sweep():
     """Correctness must not rest on the opening guess -- the stage tries the rest before it
     concludes anything, so "no fault reproduced" finally means what it says."""
-    assert set(dbg_stage._MODES) == {"stdin", "file", "arg"}
+    assert set(feed.MODES) == {"stdin", "file", "arg"}
 
 
 # ---------------------------------------------------------------- the promotion rule

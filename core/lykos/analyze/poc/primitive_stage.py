@@ -12,7 +12,7 @@ from ..debug import qemu_gdb, rootcause
 from ..dynamic import sandbox
 from ..dynamic.stage import crash_finding_candidate
 from . import bundle, primitive
-from .capture import make_capture, make_qemu_capture, materialize_helper
+from .capture import MODES, how_to_feed, make_capture, make_qemu_capture, materialize_helper
 
 # ISAs whose indirect branch MASKS bit 0 of the loaded PC (ARM/AArch64 for Thumb interworking,
 # RISC-V because JALR is specified to clear it), so a captured fault PC is `value & ~1` and its
@@ -56,9 +56,8 @@ def primitive_stage(ctx) -> dict:
     input_sha = p.get("input_sha")
     if not input_sha:
         raise ValueError("poc_primitive requires params.input_sha (a crashing input)")
-    mode = p.get("input_mode", "stdin")
-    base_argv = list(p.get("argv") or [])
     timeout = float(p.get("timeout", 8))
+    mode, base_argv, mode_why = how_to_feed(ctx.conn, target, input_sha, p)
 
     host = sandbox.host_arch()
     emulated = bool(target.arch and target.arch != host)
@@ -87,19 +86,36 @@ def primitive_stage(ctx) -> dict:
     length = min(max(len(orig) * 2, need, 256), 4096)
     helper = materialize_helper()
     try:
-        if emulated:
-            capture = make_qemu_capture(exe, target.arch, mode, base_argv, timeout,
-                                        endianness=target.endianness, bits=target.bits)
-            ctx.progress(msg=f"detonating {length}-byte cyclic pattern under qemu-{target.arch}"
-                             " gdbstub")
-        else:
-            capture = make_capture(ctx, helper, exe, mode, base_argv, timeout, sys.executable)
-            ctx.progress(msg=f"detonating {length}-byte cyclic pattern under ptrace")
-        cap0 = capture(primitive.cyclic(length))
+        def _capture_for(m):
+            if emulated:
+                return make_qemu_capture(exe, target.arch, m, base_argv, timeout,
+                                         endianness=target.endianness, bits=target.bits)
+            return make_capture(ctx, helper, exe, m, base_argv, timeout, sys.executable)
+
+        ctx.progress(msg=f"detonating {length}-byte cyclic pattern under "
+                         + (f"qemu-{target.arch} gdbstub" if emulated else "ptrace"))
+        # Try the mode we believe in, then the others. A crashing input fed the wrong way
+        # does not fault, and reporting that as "no L2 primitive" turns a wrong setup into
+        # what reads as a real negative result.
+        pattern = primitive.cyclic(length)
+        tried = []
+        for m in [mode] + [x for x in MODES if x != mode]:
+            capture = _capture_for(m)
+            cap0 = capture(pattern)
+            tried.append(m)
+            if cap0.get("ok") and cap0.get("signal_name"):
+                if m != mode:
+                    mode_why = f"{mode_why}, but it only faulted via {m}"
+                mode = m
+                break
+        capture = _capture_for(mode)
         if not cap0.get("ok") or not cap0.get("signal_name"):
-            ctx.emit("primitive.done", payload={"primitive": None, "supported": True,
-                     "note": "cyclic pattern did not fault: " + str(cap0.get("reason", ""))})
-            ctx.progress(pct=100, msg="no fault under cyclic pattern (no L2 primitive)")
+            ctx.emit("primitive.done", payload={
+                "primitive": None, "supported": True, "input_modes_tried": tried,
+                "note": ("cyclic pattern did not fault via any of " + ", ".join(tried)
+                         + ": " + str(cap0.get("reason", "")))})
+            ctx.progress(pct=100, msg="no fault under cyclic pattern (tried %s)"
+                         % ", ".join(tried))
             return {}
 
         rec = primitive.recover_ip_offset(cap0, length, endian=endian, word=word)

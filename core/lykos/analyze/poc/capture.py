@@ -81,3 +81,25 @@ def make_qemu_capture(exe, arch, mode, base_argv, timeout, *, endianness=None, b
                                 endianness=endianness, bits=bits, breakpoints=breakpoints)
 
     return capture
+
+
+# Every way a target can be handed its input. Order matters only as a fallback sweep.
+MODES = ("stdin", "file", "arg")
+
+
+def how_to_feed(conn, target, input_sha, params):
+    """(mode, argv, why) -- how this input reached the program when it crashed.
+
+    Both the root-cause and the L2 stages used to default to stdin, so a file parser or an
+    argv-driven target reported "did not fault" -- a clean-looking negative that really meant
+    "we fed it the wrong way". The dynamic run that FOUND the input already recorded the mode
+    and argv it used, which is authoritative whenever the crash came from this pipeline;
+    anything else is a starting guess that the caller sweeps past.
+    """
+    from ...db.dao import DynResultDAO
+    if params.get("input_mode"):
+        return params["input_mode"], list(params.get("argv") or []), "given"
+    for r in DynResultDAO(conn).list_by_target(target.id):
+        if r.input_sha == input_sha and r.input_mode:
+            return r.input_mode, list(r.argv or []), "recorded by the run that found it"
+    return MODES[0], list(params.get("argv") or []), "no record of how it was found"
