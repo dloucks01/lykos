@@ -118,24 +118,51 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
     # it is only acceptable inside the unshared-net, read-only-root namespace. On the
     # rlimits-only fallback the target keeps the plain argv it was given.
     flags = list(cover_flags or ())
+    # Some options make the target launch something INTERACTIVE -- jhead's `-ce` opens an
+    # editor, `-cmd` spawns a shell -- and those run at about a second each against 0.5 ms for
+    # a plain parse. A single 64-input batch under `-ce` measured 60 seconds: one unlucky
+    # option can eat an entire campaign's budget. So probe an option the campaign has not
+    # priced on a SMALL batch, and retire any that proves to cost orders more than the norm.
+    flag_cost: dict = {}
+    retired: set = set()
+    suspect: list = []
+    cheap_ms = [1.0]
     ctx.progress(msg=f"{event_prefix} campaign")
     while execs < max_execs and time.time() < deadline and not ctx.should_cancel():
-        want = min(batch_n if batchable else 1, max_execs - execs)
+        prefix: list = []
+        base_ms = sorted(cheap_ms)[len(cheap_ms) // 2]
+        if batchable and flags:
+            live = [f for f in flags if f not in retired
+                    and not _dear(flag_cost.get(f), base_ms)]
+            if suspect:
+                # An expensive batch names several options but only one is usually to blame,
+                # so settle it alone rather than retiring the bystanders it travelled with.
+                prefix = [suspect.pop(0)]
+            else:
+                # One flag combination per batch: run_batch takes a single argv prefix, and
+                # many batches cover many combinations.
+                prefix = ([] if not live or rng.random() < 0.25
+                          else rng.sample(live, min(len(live), rng.randint(1, 3))))
+        # A small batch while an option's cost is unknown OR known to be bad: an option under
+        # suspicion is still worth running (it reaches code nothing else does) but not at 64
+        # executions a batch, which is how one interactive option ate a whole campaign.
+        risky = any(f not in flag_cost or _dear(flag_cost.get(f), base_ms) for f in prefix)
+        want = min((_PROBE_N if risky else batch_n) if batchable else 1, max_execs - execs)
         inputs = [mut.mutate(rng.choice(corpus), corpus) for _ in range(max(1, want))]
         results = None
         if batchable:
             # Only ever arm blocks we have not reached: the breakpoints are one-shot, so
             # the cost decays as coverage saturates instead of being paid in full forever.
             arm = sorted(all_blocks - seen_blocks) if all_blocks else ()
-            # One flag combination per batch: run_batch takes a single argv prefix, and many
-            # batches cover many combinations.
-            prefix = ([] if not flags or rng.random() < 0.25
-                      else rng.sample(flags, min(len(flags), rng.randint(1, 3))))
+            t_batch = time.time()
             results = sandbox.run_batch(exe, inputs, mode=mode, timeout=exec_timeout,
                                         arch=target.arch, endianness=target.endianness,
                                         bits=target.bits, blocks=arm, base_argv=prefix)
             if results is None:
                 batchable = False                     # not available here; stay per-exec
+            else:
+                _price(prefix, (time.time() - t_batch) * 1000 / max(1, len(inputs)),
+                       flag_cost, retired, suspect, cheap_ms, ctx, event_prefix)
         if results is None:
             inputs = inputs[:1]
             results = [run_fn(exe, mode, workfile, exec_timeout, target.arch, inputs[0],
@@ -214,6 +241,47 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
     ctx.progress(pct=100, msg=f"{execs} execs, {crashes} crashes, {len(seen_sigs)} unique, "
                              f"{len(seen_behaviour)} behaviours")
     return stats
+
+
+_PROBE_N = 8                    # batch size while an option's cost is still unknown
+_COST_FACTOR = 40               # "orders more than the norm", measured against plain batches
+_COST_FLOOR_MS = 100.0          # never retire an option that is fast in absolute terms
+
+
+def _dear(per_ms, base_ms) -> bool:
+    return per_ms is not None and per_ms > max(_COST_FLOOR_MS, base_ms * _COST_FACTOR)
+
+
+def _price(prefix, per_ms, flag_cost, retired, suspect, cheap_ms, ctx, event_prefix):
+    """Record what a batch cost, and retire options that are pathologically slow.
+
+    A batch's cost is only attributable to the whole prefix, so an expensive one with several
+    options merely makes each a SUSPECT: they get re-run alone, and only an option that is
+    still expensive by itself is retired. Retiring the whole prefix instead loses the innocent
+    options that happened to travel with it -- measured on jhead, `-ce` (which opens an editor)
+    took `-orp` and `-rgt` down with it.
+    """
+    if not prefix:
+        cheap_ms.append(per_ms)
+        del cheap_ms[:-16]
+        return
+    base = sorted(cheap_ms)[len(cheap_ms) // 2]
+    expensive = _dear(per_ms, base)
+    for f in prefix:
+        prev = flag_cost.get(f)
+        flag_cost[f] = per_ms if prev is None else min(prev, per_ms)
+    if not expensive:
+        return
+    if len(prefix) > 1:
+        suspect.extend(f for f in prefix if f not in retired and f not in suspect)
+        return
+    f = prefix[0]
+    retired.add(f)
+    ctx.emit(f"{event_prefix}.flag_retired",
+             payload={"flag": f, "ms_per_exec": round(per_ms), "baseline_ms": round(base, 2),
+                      "why": "this option makes the target run something interactive (an "
+                             "editor, a shell); at this cost it would consume the campaign "
+                             "budget for a handful of executions"})
 
 
 _FLAG_RE = re.compile(rb"(?<![\w%/.-])(-{1,2}[A-Za-z][A-Za-z0-9_]{0,20})(?![\w/.-])")

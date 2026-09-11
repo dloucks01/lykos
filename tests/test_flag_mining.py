@@ -63,3 +63,49 @@ def test_the_most_repeated_options_come_first():
     mentioned once, so frequency is a usable ordering."""
     data = b"-real -real -real other text -incidental more text    "
     assert mine_flags(data)[0] == "-real"
+
+
+def _ctx():
+    class C:
+        events = []
+
+        def emit(self, typ, payload=None, **k):
+            self.events.append((typ, payload))
+    return C()
+
+
+def test_an_option_is_not_retired_for_the_company_it_keeps():
+    """jhead's `-ce` opens an editor: a second per execution against half a millisecond for a
+    parse, and one 64-input batch of it measured 60 seconds -- an entire campaign's budget. But
+    a batch's cost is only attributable to its whole prefix, and retiring the prefix threw away
+    `-orp` and `-rgt`, which are fine on their own and reach code nothing else does."""
+    from lykos.analyze.fuzz.stage import _price
+    cost, retired, suspect, cheap, ctx = {}, set(), [], [1.0], _ctx()
+    _price([], 1.0, cost, retired, suspect, cheap, ctx, "fuzz")
+    _price(["-ce", "-orp", "-rgt"], 1000.0, cost, retired, suspect, cheap, ctx, "fuzz")
+    assert not retired, "a multi-option batch names suspects, it does not convict"
+    assert suspect == ["-ce", "-orp", "-rgt"]
+
+    _price(["-orp"], 1.2, cost, retired, suspect, cheap, ctx, "fuzz")    # cheap alone
+    _price(["-ce"], 1000.0, cost, retired, suspect, cheap, ctx, "fuzz")  # expensive alone
+    assert retired == {"-ce"}
+    assert ctx.events and ctx.events[-1][1]["flag"] == "-ce"
+
+
+def test_cost_is_the_best_a_flag_has_managed():
+    """An option that shared one slow batch must be able to clear its name, or the first
+    unlucky pairing quarantines it for the rest of the campaign."""
+    from lykos.analyze.fuzz.stage import _dear, _price
+    cost, retired, suspect, cheap, ctx = {}, set(), [], [1.0], _ctx()
+    _price(["-a", "-ce"], 900.0, cost, retired, suspect, cheap, ctx, "fuzz")
+    assert _dear(cost["-a"], 1.0)
+    _price(["-a"], 0.9, cost, retired, suspect, cheap, ctx, "fuzz")
+    assert not _dear(cost["-a"], 1.0), "a cheap solo run must exonerate it"
+
+
+def test_a_fast_option_is_never_retired_for_being_relatively_slower():
+    """Twice the cost of a no-op parse is still thousands of executions a second; retiring on a
+    ratio alone would drop most of a program's options and most of its code with them."""
+    from lykos.analyze.fuzz.stage import _dear
+    assert not _dear(2.0, 0.02), "40x a 20us baseline is still 2ms -- keep it"
+    assert _dear(500.0, 1.0)

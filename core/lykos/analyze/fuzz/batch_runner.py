@@ -31,6 +31,7 @@ import sys
 PTRACE_TRACEME, PTRACE_PEEKTEXT, PTRACE_POKETEXT = 0, 1, 4
 PTRACE_CONT, PTRACE_KILL, PTRACE_GETREGS = 7, 8, 12
 _INT3 = 0xCC
+_SPAN_CAP = 32 << 20            # refuse to slurp a span so wide it is cheaper per block
 
 
 def _readn(n):
@@ -90,6 +91,61 @@ def _maps_base(pid, exe):
     return 0
 
 
+def _open_mem(pid):
+    try:
+        return os.open(f"/proc/{pid}/mem", os.O_RDWR)
+    except OSError:
+        return None
+
+
+def _poke_byte(libc, pid, mem, addr, value):
+    """Write one byte into the tracee, preferring /proc/pid/mem over a read-modify-write word."""
+    if mem is not None:
+        try:
+            os.pwrite(mem, bytes([value]), addr)
+            return
+        except OSError:
+            pass
+    word = libc.ptrace(PTRACE_PEEKTEXT, pid, ctypes.c_void_p(addr), 0)
+    if word == -1:
+        return
+    libc.ptrace(PTRACE_POKETEXT, pid, ctypes.c_void_p(addr),
+                ctypes.c_void_p(((word & ~0xFF) | value) & 0xFFFFFFFFFFFFFFFF))
+
+
+def _arm(libc, pid, mem, base, blocks, original):
+    """Plant an INT3 at every block, recording the byte it replaced.
+
+    Done one block at a time this is two ptrace syscalls each, and a campaign re-arms every
+    block it has not yet reached on every single execution: on jhead that is ~1,900 syscalls
+    before the program starts, which cost more than the execution and held a coverage campaign
+    to 23 exec/s against 2,000 without tracing. /proc/pid/mem reads the whole span once and
+    writes it back once -- the patched bytes are scattered, but rewriting the untouched ones
+    with their own values is free next to a syscall apiece.
+    """
+    addrs = [base + rel for rel in blocks]
+    if mem is not None and len(addrs) > 8:
+        lo, hi = min(addrs), max(addrs) + 1
+        if hi - lo <= _SPAN_CAP:
+            try:
+                text = bytearray(os.pread(mem, hi - lo, lo))
+                if len(text) == hi - lo:
+                    for addr in addrs:
+                        original[addr] = text[addr - lo]
+                        text[addr - lo] = _INT3
+                    os.pwrite(mem, bytes(text), lo)
+                    return
+            except OSError:
+                original.clear()                        # fall through to the per-block path
+    for addr in addrs:
+        word = libc.ptrace(PTRACE_PEEKTEXT, pid, ctypes.c_void_p(addr), 0)
+        if word == -1:
+            continue
+        original[addr] = word & 0xFF
+        libc.ptrace(PTRACE_POKETEXT, pid, ctypes.c_void_p(addr),
+                    ctypes.c_void_p(((word & ~0xFF) | _INT3) & 0xFFFFFFFFFFFFFFFF))
+
+
 def _trace_one(libc, argv, stdin_data, timeout, blocks, exe):
     """Run one input under ptrace. Returns (rc, out, err, flags, reached)."""
     r_out, w_out = os.pipe()
@@ -117,16 +173,8 @@ def _trace_one(libc, argv, stdin_data, timeout, blocks, exe):
     os.waitpid(pid, 0)                                  # stop at execve
 
     base = _maps_base(pid, exe) - _elf_min_vaddr(exe)
-    original = {}
-    for rel in blocks:
-        addr = base + rel
-        word = libc.ptrace(PTRACE_PEEKTEXT, pid, ctypes.c_void_p(addr), 0)
-        if word == -1:
-            continue
-        original[addr] = word & 0xFF
-        patched = (word & ~0xFF) | _INT3
-        libc.ptrace(PTRACE_POKETEXT, pid, ctypes.c_void_p(addr),
-                    ctypes.c_void_p(patched & 0xFFFFFFFFFFFFFFFF))
+    original, mem = {}, _open_mem(pid)
+    _arm(libc, pid, mem, base, blocks, original)
 
     reached, regs = [], _Regs()
     deadline = _now() + timeout
@@ -163,13 +211,15 @@ def _trace_one(libc, argv, stdin_data, timeout, blocks, exe):
             break
         hit = regs.rip - 1
         if hit in original:                             # one-shot: restore and never re-arm
-            word = libc.ptrace(PTRACE_PEEKTEXT, pid, ctypes.c_void_p(hit), 0)
-            libc.ptrace(PTRACE_POKETEXT, pid, ctypes.c_void_p(hit),
-                        ctypes.c_void_p(((word & ~0xFF) | original.pop(hit))
-                                        & 0xFFFFFFFFFFFFFFFF))
+            _poke_byte(libc, pid, mem, hit, original.pop(hit))
             regs.rip = hit
             libc.ptrace(13, pid, 0, ctypes.byref(regs))  # PTRACE_SETREGS
             reached.append(hit - base)
+    if mem is not None:
+        try:
+            os.close(mem)
+        except OSError:
+            pass
     out = _drain(r_out); err = _drain(r_err)
     return rc, out, err, flags, reached
 
