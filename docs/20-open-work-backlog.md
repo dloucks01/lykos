@@ -298,9 +298,11 @@ candidate recall 1.00 / fp_rate 0.571; corroborated recall 0.833 / fp_rate 0.214
 - **[PLANNED] `argc` is not a taint source** (deliberate — a count, not data; see
   `ENTRY_PARAM_SOURCES`). Integer-overflow and bounds classes want it; it belongs in a size/range
   channel rather than the data-flow one, where it would push taint through every `argc` guard.
-- **[PLANNED] `correlate.reaches_source` shares one `seen` set across a depth-limited DFS**, so a
-  function first reached at exhausted depth is never re-explored via a shorter path -> false
-  negatives in the reachability channel. Small fix (depth-aware visited set or BFS).
+- **[DONE] `correlate.reaches_source` shared one `seen` set across a depth-limited DFS** — now
+  `reaches_within`, breadth-first, so every node is visited at its shortest distance. Extracted
+  to module level and unit-tested, because whether the old code lost a real source depended on
+  the order a Python set iterated: it never reproduced reliably, and a missed source is
+  invisible (the finding just stays `candidate`).
 
 ## H. Benchmark & CI enforcement
 
@@ -330,17 +332,23 @@ None of these are hypothetical; each was read off the code, but none has a repro
 - **[DONE] `enqueue()` cache/dedup check-then-insert race** — the lookup and the insert that
   depends on it now run under one `BEGIN IMMEDIATE`. Tested with six concurrent enqueues of the
   same cache key producing exactly one row.
-- **[PLANNED] Temp-directory leak per request.** `_upload_target`, `_import_case` and
-  `_get_case_export` each `mkdtemp()` and only `unlink()` the file inside, never the directory.
+- **[DONE] Temp-directory leak per request** — `_upload_target`, `_import_case` and
+  `_get_case_export` now use `TemporaryDirectory`, which also cleans up on the error paths an
+  explicit `unlink` never reached.
 - **[PLANNED] Stage input parameters are inconsistent and fail silently.** `dynamic_run`
   reads its input from `params["input_b64"]`; `build_poc` and `poc_primitive` read
   `params["input_sha"]`. Passing the wrong one is not an error -- `dynamic_run` simply runs
   the target with NO input and records a clean exit, which is indistinguishable from a
   genuine no-crash result. This is reachable straight from the HTTP API, which forwards
   `params` verbatim. Either accept both spellings or reject an unknown input key.
-- **[PLANNED] `api/server.py:_create_run` is a ~90-line `elif` chain** over 25 stage names, when
-  `jobs/registry.py` already exists to dispatch by name.
-- **[PLANNED] `sandbox.run()` re-implements `classify_rc()` inline** at its tail.
+- **[DONE] `api/server.py:_create_run` elif chain** replaced by two dispatch tables (imports
+  stay lazy, since stages pull in heavy optional backends). A test resolves every entry and
+  asserts the tables and the engine registry name exactly the same 29 stages in both
+  directions, so a stage can no longer be runnable-but-unreachable or vice versa. An unknown
+  stage now returns 400 listing the valid names; it used to be enqueued as a run no worker
+  could ever execute, sitting queued forever instead of reporting the typo.
+- **[DONE] `sandbox.run()` re-implemented `classify_rc()` inline** — now calls it; the two
+  copies had already drifted.
 
 ## J. Product-security posture (accepted risk — recorded, not scheduled)
 

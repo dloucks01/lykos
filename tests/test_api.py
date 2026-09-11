@@ -292,3 +292,42 @@ def test_format_analyze_suggest_and_preview(api_http):
     assert st == 200 and out["preview"]["ok"] and out["preview"]["roundtrip"]
     lenf = [f for f in out["preview"]["fields"] if f["type"] == "u32"][0]
     assert lenf["length_match"] is True
+
+
+# ------------------------------------------------- stage dispatch (replaced a 90-line chain)
+def test_every_dispatch_entry_resolves_to_a_real_enqueue_function():
+    """The table replaced an elif chain that had to be edited in two places per stage. A typo
+    in a module path or function name would previously surface only when a user asked for that
+    stage; resolve them all up front instead."""
+    from lykos.api.server import Handler
+    table = {**Handler._CASE_STAGES, **Handler._TARGET_STAGES}
+    assert len(table) >= 25
+    for stage, entry in table.items():
+        fn = Handler._enqueue_fn(entry)
+        assert callable(fn), f"{stage} -> {entry} is not callable"
+
+
+def test_dispatch_covers_every_registered_stage():
+    """A stage the engine can run but the API cannot reach is a silent capability gap."""
+    from lykos.analyze import register
+    from lykos.api.server import Handler
+    from lykos.jobs import registry
+    register()
+    reachable = set(Handler._CASE_STAGES) | set(Handler._TARGET_STAGES)
+    registered = set(registry.list_stages())
+    assert registered, "no stages registered -- the check would pass vacuously"
+    assert not registered - reachable, \
+        f"registered stages unreachable over the API: {sorted(registered - reachable)}"
+    assert not reachable - registered, \
+        f"dispatch names no engine stage: {sorted(reachable - registered)}"
+
+
+def test_unknown_stage_is_rejected_at_the_edge(api):
+    """The old final `else` enqueued ANY name, creating a run no worker could execute -- it
+    sat queued forever instead of reporting the typo."""
+    st, case = _json(api, "POST", "/cases", {"name": "x"})
+    st, body = _json(api, "POST", "/runs",
+                     {"case_id": case["id"], "stage": "definitely_not_a_stage"})
+    assert st == 400, body
+    assert "unknown stage" in body["error"]
+    assert "detect_cwe" in body["stages"]          # tells the caller what IS valid

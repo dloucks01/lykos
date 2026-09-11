@@ -411,15 +411,12 @@ class Handler(BaseHTTPRequestHandler):
             if not s.cases.get(cid):
                 return self._json({"error": "no case"}, 404)
             name = (s.cases.get(cid).name or "case").replace(" ", "_")[:40]
-            tmp = Path(tempfile.mkdtemp()) / f"{name}.tar.gz"
-            s.export_case(cid, tmp)
-            data = tmp.read_bytes()
+            with tempfile.TemporaryDirectory(prefix="lykos-export-") as td:
+                tmp = Path(td) / f"{name}.tar.gz"
+                s.export_case(cid, tmp)
+                data = tmp.read_bytes()
         finally:
             s.close()
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
         return self._bytes(data, "application/gzip", filename=f"{name}.tar.gz")
 
     def _get_systemmap(self, cid):
@@ -457,18 +454,15 @@ class Handler(BaseHTTPRequestHandler):
         _, data = extract_file(ctype, body)
         if data is None:
             data = body
-        tmp = Path(tempfile.mkdtemp()) / "import.tar.gz"
-        tmp.write_bytes(data)
-        s = self._store()
-        try:
-            ids = s.import_archive(tmp)
-            return self._json({"cases": ids}, 201)
-        finally:
-            s.close()
+        with tempfile.TemporaryDirectory(prefix="lykos-import-") as td:
+            tmp = Path(td) / "import.tar.gz"
+            tmp.write_bytes(data)
+            s = self._store()
             try:
-                os.unlink(tmp)
-            except OSError:
-                pass
+                ids = s.import_archive(tmp)
+                return self._json({"cases": ids}, 201)
+            finally:
+                s.close()
 
     def _get_case(self, cid):
         s = self._store()
@@ -544,13 +538,16 @@ class Handler(BaseHTTPRequestHandler):
             data = body
         s = self._store()
         try:
-            tmp = Path(tempfile.mkdtemp()) / (filename or "upload.bin")
-            tmp.write_bytes(data)
-            target = ingest(s, cid, tmp, filename=filename)
+            # TemporaryDirectory, not mkdtemp: the old code unlinked the FILE and left the
+            # directory behind, leaking one empty directory per upload for the life of the
+            # process. It is also removed on the error paths, which an explicit unlink was not.
+            with tempfile.TemporaryDirectory(prefix="lykos-upload-") as td:
+                tmp = Path(td) / (filename or "upload.bin")
+                tmp.write_bytes(data)
+                target = ingest(s, cid, tmp, filename=filename)
             run = enqueue_triage(JobQueue(s.conn), target)
             if run.status == "done":   # cache hit: body skipped, re-project its per-target rows
                 reproject_cache_hit(s, run.stage, target.id, run.id)
-            os.unlink(tmp)
             return self._json({"id": target.id, "sha256": target.sha256,
                                "run_id": run.id}, 201)
         finally:
@@ -569,10 +566,51 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"preview": structure.describe(spec, sample)})
         return self._json({"suggestion": structure.suggest_spec(sample)})
 
+    # Stage dispatch. Each entry is (module, enqueue-function name). The bodies were a
+    # ~90-line elif chain over 25 names, which had to be edited in two places to add a stage
+    # and silently accepted any unknown name through its final else. Imports stay lazy (they
+    # pull in heavy optional backends), so the value is the module path, not the function.
+    _CASE_STAGES = {
+        "link_case": ("..analyze.link", "enqueue_link"),
+        "ipc_model": ("..analyze.link", "enqueue_ipc"),
+        "whole_system": ("..analyze.link", "enqueue_whole_system"),
+        "cross_taint": ("..analyze.link", "enqueue_cross_taint"),
+    }
+    _TARGET_STAGES = {
+        _INGEST: ("..analyze.ingest", "enqueue_triage"),
+        "disassemble": ("..analyze.disassemble", "enqueue_disassemble"),
+        "detect_cwe": ("..analyze.detect", "enqueue_detect"),
+        "dynamic_run": ("..analyze.dynamic", "enqueue_dynamic"),
+        "fuzz": ("..analyze.fuzz", "enqueue_fuzz"),
+        "coverage_fuzz": ("..analyze.fuzz", "enqueue_coverage_fuzz"),
+        "directed_fuzz": ("..analyze.fuzz", "enqueue_directed_fuzz"),
+        "concolic": ("..analyze.symbolic", "enqueue_concolic"),
+        "build_poc": ("..analyze.poc", "enqueue_build_poc"),
+        "poc_primitive": ("..analyze.poc", "enqueue_primitive"),
+        "build_exploit": ("..analyze.poc", "enqueue_exploit"),
+        "synthesize_poc": ("..analyze.poc", "enqueue_synthesize"),
+        "synthesize_injection": ("..analyze.poc", "enqueue_inject"),
+        "synthesize_secret": ("..analyze.poc", "enqueue_secret"),
+        "boundary_fuzz": ("..analyze.link", "enqueue_boundary"),
+        "heap_check": ("..analyze.dynamic", "enqueue_heap_check"),
+        "root_cause": ("..analyze.debug", "enqueue_root_cause"),
+        "multi_debug": ("..analyze.debug", "enqueue_multi_debug"),
+        "debug_monitor": ("..analyze.debug", "enqueue_monitor"),
+        "extract_secrets": ("..analyze.debug", "enqueue_extract"),
+        "behavior_trace": ("..analyze.debug", "enqueue_behavior_trace"),
+        "dynamic_taint": ("..analyze.debug", "enqueue_taint"),
+        "cve_scan": ("..analyze.fingerprint", "enqueue_cve_scan"),
+        "firmware_carve": ("..analyze.firmware", "enqueue_firmware"),
+        "firmware_rehost": ("..analyze.firmware", "enqueue_rehost"),
+    }
+
+    @staticmethod
+    def _enqueue_fn(entry):
+        from importlib import import_module
+        mod, fn = entry
+        return getattr(import_module(mod, __package__), fn)
+
     def _create_run(self):
-        from ..analyze.detect import enqueue_detect
-        from ..analyze.disassemble import enqueue_disassemble
-        from ..analyze.ingest import enqueue_triage
         from ..jobs.registry import reproject_cache_hit
         body = json.loads(self._read_body() or b"{}")
         s = self._store()
@@ -580,108 +618,31 @@ class Handler(BaseHTTPRequestHandler):
             q = JobQueue(s.conn)
             stage = body.get("stage", _INGEST)
             target_id = body.get("target_id")
-            if stage in ("link_case", "cross_taint", "ipc_model", "whole_system"):
+            params = body.get("params")
+
+            if stage in self._CASE_STAGES:            # case-scoped: no target needed
                 cid = body.get("case_id") or (
                     s.targets.get(target_id).case_id if target_id else None)
-                if stage == "link_case":
-                    from ..analyze.link import enqueue_link
-                    run = enqueue_link(q, cid)
-                elif stage == "ipc_model":
-                    from ..analyze.link import enqueue_ipc
-                    run = enqueue_ipc(q, cid)
-                elif stage == "whole_system":
-                    from ..analyze.link import enqueue_whole_system
-                    run = enqueue_whole_system(q, cid, params=body.get("params"))
-                else:
-                    from ..analyze.link import enqueue_cross_taint
-                    run = enqueue_cross_taint(q, cid)
+                fn = self._enqueue_fn(self._CASE_STAGES[stage])
+                run = fn(q, cid) if stage in ("link_case", "ipc_model", "cross_taint") \
+                    else fn(q, cid, params=params)
                 return self._json({"run_id": run.id, "from_cache": run.status == "done"}, 201)
-            if stage in (_INGEST, "disassemble", "detect_cwe", "dynamic_run", "fuzz",
-                         "coverage_fuzz", "directed_fuzz", "concolic",
-                         "build_poc", "poc_primitive", "build_exploit", "boundary_fuzz",
-                         "synthesize_poc", "synthesize_injection", "synthesize_secret",
-                         "heap_check", "root_cause",
-                         "multi_debug", "debug_monitor", "extract_secrets", "behavior_trace",
-                         "dynamic_taint", "cve_scan", "firmware_carve",
-                         "firmware_rehost") and target_id:
+
+            if stage in self._TARGET_STAGES and target_id:
                 target = s.targets.get(target_id)
                 if not target:
                     return self._json({"error": "no target"}, 404)
-                if stage == _INGEST:
-                    run = enqueue_triage(q, target)
-                elif stage == "disassemble":
-                    run = enqueue_disassemble(q, target)
-                elif stage == "detect_cwe":
-                    run = enqueue_detect(q, target)
-                elif stage == "dynamic_run":
-                    from ..analyze.dynamic import enqueue_dynamic
-                    run = enqueue_dynamic(q, target, params=body.get("params"))
-                elif stage == "fuzz":
-                    from ..analyze.fuzz import enqueue_fuzz
-                    run = enqueue_fuzz(q, target, params=body.get("params"))
-                elif stage == "coverage_fuzz":
-                    from ..analyze.fuzz import enqueue_coverage_fuzz
-                    run = enqueue_coverage_fuzz(q, target, params=body.get("params"))
-                elif stage == "directed_fuzz":
-                    from ..analyze.fuzz import enqueue_directed_fuzz
-                    run = enqueue_directed_fuzz(q, target, params=body.get("params"))
-                elif stage == "concolic":
-                    from ..analyze.symbolic import enqueue_concolic
-                    run = enqueue_concolic(q, target, params=body.get("params"))
-                elif stage == "poc_primitive":
-                    from ..analyze.poc import enqueue_primitive
-                    run = enqueue_primitive(q, target, params=body.get("params"))
-                elif stage == "build_exploit":
-                    from ..analyze.poc import enqueue_exploit
-                    run = enqueue_exploit(q, target, params=body.get("params"))
-                elif stage == "root_cause":
-                    from ..analyze.debug import enqueue_root_cause
-                    run = enqueue_root_cause(q, target, params=body.get("params"))
-                elif stage == "multi_debug":
-                    from ..analyze.debug import enqueue_multi_debug
-                    run = enqueue_multi_debug(q, target, params=body.get("params"))
-                elif stage == "debug_monitor":
-                    from ..analyze.debug import enqueue_monitor
-                    run = enqueue_monitor(q, target, params=body.get("params"))
-                elif stage == "heap_check":
-                    from ..analyze.dynamic import enqueue_heap_check
-                    run = enqueue_heap_check(q, target, params=body.get("params"))
-                elif stage == "extract_secrets":
-                    from ..analyze.debug import enqueue_extract
-                    run = enqueue_extract(q, target, params=body.get("params"))
-                elif stage == "behavior_trace":
-                    from ..analyze.debug import enqueue_behavior_trace
-                    run = enqueue_behavior_trace(q, target, params=body.get("params"))
-                elif stage == "dynamic_taint":
-                    from ..analyze.debug import enqueue_taint
-                    run = enqueue_taint(q, target, params=body.get("params"))
-                elif stage == "cve_scan":
-                    from ..analyze.fingerprint import enqueue_cve_scan
-                    run = enqueue_cve_scan(q, target, params=body.get("params"))
-                elif stage == "firmware_carve":
-                    from ..analyze.firmware import enqueue_firmware
-                    run = enqueue_firmware(q, target, params=body.get("params"))
-                elif stage == "firmware_rehost":
-                    from ..analyze.firmware import enqueue_rehost
-                    run = enqueue_rehost(q, target, params=body.get("params"))
-                elif stage == "boundary_fuzz":
-                    from ..analyze.link import enqueue_boundary
-                    run = enqueue_boundary(q, target, params=body.get("params"))
-                elif stage == "synthesize_poc":
-                    from ..analyze.poc import enqueue_synthesize
-                    run = enqueue_synthesize(q, target, params=body.get("params"))
-                elif stage == "synthesize_injection":
-                    from ..analyze.poc import enqueue_inject
-                    run = enqueue_inject(q, target, params=body.get("params"))
-                elif stage == "synthesize_secret":
-                    from ..analyze.poc import enqueue_secret
-                    run = enqueue_secret(q, target, params=body.get("params"))
-                else:
-                    from ..analyze.poc import enqueue_build_poc
-                    run = enqueue_build_poc(q, target, params=body.get("params"))
+                fn = self._enqueue_fn(self._TARGET_STAGES[stage])
+                run = fn(q, target) if stage in (_INGEST, "disassemble", "detect_cwe") \
+                    else fn(q, target, params=params)
+            elif stage in self._TARGET_STAGES:
+                return self._json({"error": f"stage {stage!r} requires a target_id"}, 400)
             else:
-                run = q.enqueue(body["case_id"], stage, target_id=target_id,
-                                params=body.get("params"))
+                # An unregistered name used to fall through to a bare enqueue, creating a run
+                # no worker can ever execute; it now fails at the edge with the valid names.
+                known = sorted(set(self._CASE_STAGES) | set(self._TARGET_STAGES))
+                return self._json({"error": f"unknown stage {stage!r}", "stages": known}, 400)
+
             if run.status == "done" and target_id:   # cache hit: re-project its per-target rows
                 reproject_cache_hit(s, stage, target_id, run.id)
             return self._json({"run_id": run.id, "from_cache": run.status == "done"}, 201)
