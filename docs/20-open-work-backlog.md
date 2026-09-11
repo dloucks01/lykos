@@ -443,6 +443,32 @@ actionable.
   reproduces it and faults at exactly `0x40bf0b`; attribution promotes that finding to
   `poc-backed` at 0.97 with the site named. Static prediction → dynamic proof, on unmodified
   Debian source.
+- **[DONE] Sweep, batch 2 — eight more ungated stages run against a real target.** `concolic`
+  (angr, 6 new seeds), `behavior_trace`, `cve_scan` and `heap_check` all behaved and reported
+  honestly. Three did not:
+  *The stdin default was in SIX more stages* — `monitor_stage` (×2), `taint_stage`,
+  `heap_stage`, `trace_stage` (×2), `extract_stage`. So it was **nine** stages, not the three
+  fixed earlier. `dynamic_taint` reported "the marker input did not reach any monitored sink"
+  on ncompress, whose argv reaches `strcpy` in one hop, because it fed the payload to stdin.
+  All six now use the shared `how_to_feed`.
+  *`extract_secrets` filed 56 findings, every one a dynamic-loader string* —
+  `/lib64/ld-linux-x86-64.so.2`, `__vdso_clock_gettime` — at `corroborated`/0.85. When neither
+  operand is our input the comparison says nothing about how the program handles input, and
+  the probe sees ld.so's own `strcmp` calls long before the program runs. Those are now RE
+  inventory in the event rather than findings (`worth_filing`). Verified it did not break the
+  capability: on a fixture with `strcmp(argv[1], "hunter2-s3cret-password")` it goes from 167
+  comparison hits to exactly **1 finding, CWE-798, the real credential**. ncompress goes 56 → 0.
+  *`extract_secrets` reported "the binary imports no comparison functions to probe" for a
+  target that simply had not been disassembled yet* — it reads the call graph, which does not
+  exist before `disassemble`. Same clean-looking wrong answer as "no fault reproduced" was; it
+  now says which of the two it means.
+- **[PLANNED] `boundary_fuzz` reports `error` for an inapplicable target.** On a single binary
+  there is no IPC channel to fuzz, and it emits `{'error': 'no channel', execs: 0}` while the
+  job status is `done`. That is a "not applicable", not an error, and it should say so the way
+  the cross-arch stages do.
+- **[PLANNED] `debug_monitor` mostly watches the dynamic loader.** Its 13 recorded calls on
+  ncompress are `_dl_new_object` and friends; `winmonitor` already filters to callers inside
+  the exe's own mapping and the Linux path does not.
 - **[DONE] The blind fuzzer could not reach a length-triggered bug.** First stage of the
   breadth-first sweep over the 21 ungated stages, and the front of the funnel was broken.
   Growth was a single operator duplicating at most 64 bytes at 6% probability, cancelled by an

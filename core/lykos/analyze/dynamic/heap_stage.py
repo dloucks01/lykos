@@ -19,6 +19,7 @@ from pathlib import Path
 
 from ...db.dao import FindingDAO, TargetDAO
 from ...jobs.registry import register_stage
+from ..poc.capture import how_to_feed
 from . import sandbox
 
 HEAP_STAGE = "heap_check"
@@ -84,7 +85,7 @@ def heap_stage(ctx) -> dict:
         exe.write_bytes(ctx.content.path(target.sha256).read_bytes())
         os.chmod(exe, 0o755)
 
-        mode = p.get("input_mode", "stdin")
+        mode = how_to_feed(ctx.conn, target, p.get("input_sha"), p)[0]
         argv = list(p.get("argv") or [])
         timeout = float(p.get("timeout", 15))
         data = ctx.content.get_bytes(p["input_sha"]) if p.get("input_sha") else b"A" * 128

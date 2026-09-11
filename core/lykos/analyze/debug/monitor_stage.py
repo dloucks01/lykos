@@ -24,6 +24,7 @@ from ...db.dao import CallEdgeDAO, FindingDAO, FunctionDAO, TargetDAO
 from ...jobs.registry import register_stage
 from ..detect.catalog import normalize
 from ..dynamic import sandbox
+from ..poc.capture import how_to_feed
 from . import elfsyms, monitor, qemu_gdb, winmonitor
 
 MONITOR_STAGE = "debug_monitor"
@@ -64,7 +65,7 @@ def _win_monitor(ctx, target, p) -> dict:
     exe = ctx.scratch() / "target.bin"
     exe.write_bytes(ctx.content.path(target.sha256).read_bytes())
     os.chmod(exe, 0o755)
-    mode = p.get("input_mode", "stdin")
+    mode = how_to_feed(ctx.conn, target, p.get("input_sha"), p)[0]
     argv = list(p.get("argv") or [])
     timeout = float(p.get("timeout", 45))
     data = ctx.content.get_bytes(p["input_sha"]) if p.get("input_sha") else b""
@@ -179,7 +180,7 @@ def monitor_stage(ctx) -> dict:
                  "note": f"no GDB argument map for {host}"})
         return {}
 
-    mode = p.get("input_mode", "stdin")
+    mode = how_to_feed(ctx.conn, target, p.get("input_sha"), p)[0]
     argv = list(p.get("argv") or [])
     sink_addrs = _parse_sink_addrs(p.get("sink_addrs"))
     timeout = float(p.get("timeout", 20))

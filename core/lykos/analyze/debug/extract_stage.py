@@ -14,6 +14,7 @@ from ...db.dao import CallEdgeDAO, FindingDAO, TargetDAO
 from ...jobs.registry import register_stage
 from ..detect.catalog import normalize
 from ..dynamic import sandbox
+from ..poc.capture import how_to_feed
 from . import secrets
 
 EXTRACT_STAGE = "extract_secrets"
@@ -34,6 +35,22 @@ def _ours(v):
                         _PROBE.decode("latin-1").startswith(v[:8]))
 
 
+def worth_filing(value: str, is_gate: bool, caller: str | None) -> bool:
+    """Is this recovered constant a FINDING, or just reverse-engineering inventory?
+
+    A comparison is evidence about the program's handling of input only when our input was one
+    of the operands (`is_gate`). Everything else is a constant the process happened to compare
+    while we watched -- and the probe sees the dynamic loader's own strcmp calls, which is most
+    of them. ncompress filed 56 corroborated findings that way, every one a loader path like
+    '/lib64/ld-linux-x86-64.so.2'.
+
+    A value or caller that NAMES a secret is kept even ungated: `strcmp(x, "api_key")` is worth
+    surfacing however it was reached.
+    """
+    return bool(is_gate or _SECRET_KW.search(value or "")
+                or _SECRET_KW.search(caller or ""))
+
+
 def extract_stage(ctx) -> dict:
     target = TargetDAO(ctx.conn).get(ctx.target_id) if ctx.target_id else None
     if target is None:
@@ -47,16 +64,22 @@ def extract_stage(ctx) -> dict:
         ctx.progress(pct=100, msg="secret extraction not supported for this target")
         return {}
 
-    names = {normalize(e.dst_name) for e in CallEdgeDAO(ctx.conn).list_by_target(target.id)
-             if e.dst_name}
+    edges = CallEdgeDAO(ctx.conn).list_by_target(target.id)
+    names = {normalize(e.dst_name) for e in edges if e.dst_name}
     funcs = sorted(names & set(secrets.CMP))
     if not funcs:
-        ctx.emit("secrets.done", payload={"ok": True, "hits": 0, "findings": 0,
-                 "note": "the binary imports no comparison functions to probe"})
+        # Distinguish "nothing to probe" from "we have not looked yet". The call graph only
+        # exists after disassembly, and reporting an un-disassembled target as having no
+        # comparison functions is the same clean-looking wrong answer as "no fault reproduced"
+        # was for an input fed the wrong way.
+        note = ("the binary imports no comparison functions to probe" if edges else
+                "no call graph for this target yet -- run disassemble before extract_secrets")
+        ctx.emit("secrets.done", payload={"ok": bool(edges), "hits": 0, "findings": 0,
+                 "note": note})
         ctx.progress(pct=100, msg="no comparison sinks to probe")
         return {}
 
-    mode = p.get("input_mode", "stdin")
+    mode = how_to_feed(ctx.conn, target, p.get("input_sha"), p)[0]
     argv = list(p.get("argv") or [])
     timeout = float(p.get("timeout", 20))
     data = ctx.content.get_bytes(p["input_sha"]) if p.get("input_sha") else _PROBE
@@ -98,8 +121,14 @@ def extract_stage(ctx) -> dict:
             seen.add(val)
             recovered.append({"value": val, "gate": is_gate, "via": h.get("func"),
                               "func": h.get("caller")})
-            secretish = is_gate or bool(_SECRET_KW.search(val)) or \
-                bool(_SECRET_KW.search(h.get("caller") or ""))
+            secretish = worth_filing(val, is_gate, h.get("caller"))
+            if not secretish:
+                # Neither operand was our input, so this comparison says nothing about how the
+                # program handles input -- and the probe sees the dynamic loader's own strcmp
+                # calls, which is most of them. ncompress filed 56 corroborated findings this
+                # way, every one of them a loader path like '/lib64/ld-linux-x86-64.so.2'.
+                # It stays in `recovered` as RE inventory; it is not a finding.
+                continue
             cwe = "CWE-798" if secretish else "CWE-547"
             sev = "medium" if secretish else "low"
             title = (f"Input compared against hard-coded value '{val}'" if is_gate
