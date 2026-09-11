@@ -237,11 +237,33 @@ actionable.
   review, never asserted). On a controlled fixture with known ground truth all four shapes
   resolve correctly: `n<64` → at most 63, `n<=64` → at most 64, `n<4096` into `buf[64]` →
   exceeds-recovered-size, unguarded → unknown.
-- **[PLANNED] Guards on a signed length are not checked for the negative case.** `if (n < 64)`
-  on a signed `int` admits every negative `n`, which `memcpy` reads as a huge `size_t`. The pass
-  reports "at most 63 bytes" and is wrong about the bug. Needs the lower-bound half of the
-  relation (`n >= 0` or an unsigned compare) before a guard-derived SAFE can be trusted on a
-  signed slot; today it is a known unsoundness, not a claim.
+- **[DONE] Signed-length hazard** (`bounds.SIGNED`, verdict `signed-length`). An upper bound
+  alone is not a bound. `if (n < 64) memcpy(buf, s, n)` on an `int` admits `n = -1`, which the
+  sink's `size_t` parameter takes as `0xFFFFFFFFFFFFFFFF` — the check reads as careful code and
+  the copy is unbounded. `guard_bound` now returns the two halves separately, `{bound, nonneg}`,
+  and a guard-derived SAFE requires both.
+  `nonneg` comes from the branch mnemonic, the same authority the polarity does: `JB`/`JA` are
+  unsigned and prove `0 <= n` for free, `JL`/`JG` are signed and prove nothing below. A signed
+  upper bound therefore needs a *separate* dominating check, which the pass looks for via
+  `_LOWER` (`n >= 0`, `n > 0`, `n == K`). `JS`/`JNS` had to be added to `_CC_TAKEN` because gcc
+  -O0 compiles the `n >= 0` half of `if (n >= 0 && n < 64)` to `cmp $0,n; js skip` — the one
+  idiom that fixes the hazard was the one the table could not read. A `!=` is deliberately not a
+  lower bound: `-1 != 0`.
+  Ordering matters — a bound that already exceeds the buffer stays SUSPECT, since that is the
+  more concrete statement and does not depend on the length being negative at all. The stage
+  treats `signed-length` like SUSPECT: evidence attached, never promoted, and critically never
+  *demoted*, which is the actual fix. These sites previously demoted to `info` at confidence
+  0.15, burying a live defect underneath its own guard.
+  Validated by execution, not by reading. A 10-shape fixture compiled at `-O0` matches ground
+  truth on all 10, and a driver confirms the semantics: the site this used to call `bounded`
+  segfaults at `n = -1` (exit 139), while `u_lt` (unsigned) and `s_ge0` (`n >= 0 &&`) reject the
+  same input and return cleanly. jhead 3.04 is unchanged at 36/4/2 — no signed hazards there,
+  and no new false positives on real code.
+- **[PLANNED] Signedness is read from x86 mnemonics only.** `_CC_TAKEN`/`_CC_SIGNED` are x86
+  tables, so guard reasoning — and with it the signed-length check — is inert on the other 12
+  supported architectures. The p-code op (`INT_SLESS` vs `INT_LESS`) carries the same fact
+  ISA-independently and is the portable way in; the mnemonic tables were chosen first because
+  x86 builds its conditions out of flag algebra that is painful to evaluate symbolically.
 - **[PLANNED] Guard reasoning is intra-procedural and constant-only.** A length bounded by
   `sizeof buf` through a variable, by a caller's check, or by a loop induction variable still
   reads as unknown. That is most of the remaining 36.
