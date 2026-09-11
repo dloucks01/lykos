@@ -589,6 +589,25 @@ actionable.
   what it was given has said nothing about which branch it took.
   Measured on jhead: file 53% -> **5.9%**, argv 40% -> **10.9%**, stdin **0.2%** (it ignores
   stdin, which is the correct answer).
+- **[DONE] Real block coverage, from the decompiler's own block list.** The proxy was the
+  SHAPE of the program's output — it notices a parser printing something new, not a parser
+  taking a branch it has never taken. There is no x86-64 `afl-qemu-trace` on this machine
+  (both copies are `qemu-aarch64`) and the packaged AFL++ ships only compiler instrumentation,
+  so binary-only coverage had to come from somewhere else. It came from an asset already paid
+  for: Ghidra walked the binary, so its basic-block list IS instrumentation.
+  The batch runner (now a real module rather than an embedded string, since it carries a ptrace
+  tracer) arms INT3 at each watched block, records what the child reached, and restores the
+  byte. Breakpoints are ONE-SHOT and the campaign only ever arms blocks it has not reached, so
+  the cost decays as coverage saturates — and "did this input reach anywhere new?" is exactly
+  the question, rather than a hit count needing a diff. The address contract is handled in the
+  runner by reading the ELF's own minimum `PT_LOAD` vaddr, so a caller passes file vaddrs and
+  need not know whether the target is position-independent.
+  Measured — the campaign can now state coverage, which it previously could not do at all:
+  jhead **378 of 1,887 blocks**, ncompress **83–148 of 433** depending on channel. The corpus
+  became far more selective: 35 inputs earned a place by reaching new blocks, where the output
+  proxy kept 2,126. And it finds more: ncompress goes from 341 crashes / **1** unique signal to
+  7,615 / **2**. Throughput is the cost — ~500 exec/s against ~1,300 — which is the price of
+  arming ~1,900 breakpoints per execution early in a run.
 - **[PLANNED] jhead's own bug is still not found by the built-in fuzzer.** The campaign now
   executes the target's parser rather than bouncing off its magic, but 23,000 executions from
   the generated seed produce no crash. jhead 3.04 guards the GPS value pointer with
