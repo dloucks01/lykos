@@ -608,6 +608,30 @@ actionable.
   proxy kept 2,126. And it finds more: ncompress goes from 341 crashes / **1** unique signal to
   7,615 / **2**. Throughput is the cost — ~500 exec/s against ~1,300 — which is the price of
   arming ~1,900 breakpoints per execution early in a run.
+- **[DONE] The fuzzer now tries the program's own options.** A campaign passed exactly one
+  thing — the input — so every path behind a flag was unreachable by construction. On jhead
+  that is ~200 blocks across six functions, and `DoCommand` among them is where CVE-2020-6624
+  lives. Real CLI tools put most of their behaviour behind options; a fuzzer that only hands
+  over a filename explores the parser and nothing else.
+  The flags are in the binary, so `mine_flags` reads them out of the RAW bytes — the extracted
+  string table truncates the usage blob where the short options live, and measured on jhead it
+  yields 40% of the 42 real flags while the raw bytes yield **all 42** (with 11 harmless false
+  positives: a build string's `-O0`, a helper command's `-outfile`). Each batch gets a random
+  combination. Flag fuzzing runs ONLY under the batched sandbox: an option like jhead's `-cmd`
+  executes a command built from our input, which is the point and is acceptable only inside
+  the unshared-net, read-only-root namespace.
+  Measured on jhead's file channel: coverage **378 → 583 blocks** (20% → 31%).
+- **[FINDING] A seed the parser accepts and the program's options are MULTIPLICATIVE, not
+  independent.** The option-gated functions are downstream of a successful parse, so unlocking
+  them needs both. Measured on jhead, functions entered: skeleton seed alone **41/114**;
+  skeleton + flags **50/114**; a valid JPEG + flags **83/114**, which reaches `ShowImageInfo`,
+  `DoFileRenaming`, `WriteJpegFile` and `process_DQT`. This refuted the guess that the
+  unreached quarter was EXIF grammar the model does not describe — it is mostly "the file never
+  parsed" and "we never passed a flag".
+- **[PLANNED] The generated seed is not a complete file.** `ShowImageInfo` alone is 210 blocks
+  and is unreachable because our 94-byte skeleton never satisfies jhead's completeness check.
+  Extending the JPEG model with DQT/SOS and a minimal scan is now the highest-value increment,
+  and the numbers above say what it is worth: the gap between 50 and 83 functions.
 - **[PLANNED] jhead's own bug is still not found by the built-in fuzzer.** The campaign now
   executes the target's parser rather than bouncing off its magic, but 23,000 executions from
   the generated seed produce no crash. jhead 3.04 guards the GPS value pointer with
