@@ -194,17 +194,19 @@ def attribute(frames, findings, sites_by_finding=None):
         name = sym_of.get(fa) or (f"0x{fa:x}" if fa is not None else "?")
         return f"0x{sa:x} in {name}" if sa is not None else name
 
-    def offer(f, tier, detail, site):
+    def offer(f, tier, detail, occ):
         cur = best.get(f.id)
         if cur is None or _TIERS.index(tier) > _TIERS.index(cur["tier"]):
-            best[f.id] = {"finding": f, "tier": tier, "detail": detail, "site": site}
+            best[f.id] = {"finding": f, "tier": tier, "detail": detail,
+                          "site": (occ or {}).get("site_addr"),
+                          "function_addr": (occ or {}).get("function_addr")}
 
     for f in findings:
         for o in occ_of.get(f.id, ()):
             if _to_int(o.get("function_addr")) in fn_addrs:
                 offer(f, "crash-function",
                       f"a site of this defect ({where(o)}) sits in a function on the crashing "
-                      f"call stack -- proximity, not proof", o.get("site_addr"))
+                      f"call stack -- proximity, not proof", o)
                 break
 
     # The faulting instruction IS a recorded site. This is the only match available to a
@@ -218,7 +220,7 @@ def attribute(frames, findings, sites_by_finding=None):
                 if sa == pc:
                     offer(f, "fault-site",
                           f"the faulting instruction IS this site ({where(o)})",
-                          o.get("site_addr"))
+                          o)
 
     # Frame 0 is the faulting instruction; every later frame is a RETURN address, which sits
     # just past the call it came from. That is what ties a frame to a recorded call site.
@@ -234,11 +236,11 @@ def attribute(frames, findings, sites_by_finding=None):
         if depth == 0:
             offer(f, "fault-site",
                   f"the fault occurred inside the call this finding names at {where(o)}",
-                  o.get("site_addr"))
+                  o)
         else:
             offer(f, "on-stack",
                   f"the call at {where(o)} was on the stack when the fault occurred",
-                  o.get("site_addr"))
+                  o)
     return sorted(best.values(), key=lambda a: -_TIERS.index(a["tier"]))
 
 
@@ -323,7 +325,17 @@ def attribution_upsert(f, a, signal_name):
     because being near a crash is not being the crash.
     """
     proven = a["tier"] == "fault-site"
+    # Mark the SITE, not just the defect: a 99-site finding with one proven occurrence must
+    # not render like one where all 99 are proven.
+    # `attribute()` returns "site"; the slice serialises it as "site_addr". Accept both, or
+    # the promotion lands on the finding and never reaches the occurrence it proved.
+    sa = a.get("site") or a.get("site_addr")
+    site = {"function_addr": a.get("function_addr"), "site_addr": sa,
+            "site_verdict": "proven" if proven else a["tier"],
+            "site_state": "poc-backed" if proven else None,
+            "site_confidence": 0.97 if proven else None} if sa else {}
     return {
+        **site,
         "dedup_key": f.dedup_key, "cwe": f.cwe, "severity": f.severity,
         # Its OWN channel: a promotion from a reproduced crash must not overwrite what the
         # static detector says, and must not be undone when that detector next re-runs.
@@ -367,6 +379,7 @@ def build_slice(cap, functions, call_edges, findings, maps, target_path,
             "reachable_from_source": bool(path),
             "attributed": [{"finding_id": a["finding"].id, "tier": a["tier"],
                             "detail": a["detail"], "site_addr": a["site"],
+                            "function_addr": a.get("function_addr"),
                             "title": a["finding"].title,
                             "cwe": a["finding"].cwe} for a in attributed]}
 

@@ -113,3 +113,76 @@ def test_a_retracting_channel_falls_back_to_what_others_still_say(store, case):
                                 confidence=0.1, run_id="b2"))
     f = _f(store, t.id, case.id)
     assert f.severity == "high" and f.confidence == 0.8, "taint's verdict still stands"
+
+
+# ---------------------------------------------------------------- verdicts about a PLACE
+# Every ruling the analysis makes is about one occurrence -- bounds proves a particular copy
+# bounded, a dominating guard bounds a particular index, crash attribution proves a particular
+# instruction -- and all of it used to collapse into one badge on the finding. jhead's
+# poc-backed CWE-125 has 99 sites and exactly ONE is proven; all 99 carried the identical
+# detail string, so a 99-site finding with one proven site rendered like one with 99.
+def _site(key="k", fn="0x900", site="0x1000", **kw):
+    return _c(key, function_addr=fn, site_addr=site, **kw)
+
+
+def test_a_site_carries_its_own_verdict(store, case):
+    t = _target(store, case)
+    fd = FindingDAO(store.conn)
+    fd.upsert(t.id, case.id, _site(site_verdict="bounded", site_state="candidate"))
+    s = fd.sites(_f(store, t.id, case.id).id)[0]
+    assert s["verdict"] == "bounded" and s["state"] == "candidate"
+
+
+def test_only_the_proven_occurrence_is_marked(store, case):
+    """The whole point: one site proven out of many must be distinguishable from the rest."""
+    t = _target(store, case)
+    fd = FindingDAO(store.conn)
+    for a in ("0x1000", "0x2000", "0x3000"):
+        fd.upsert(t.id, case.id, _site(site=a))
+    fd.upsert(t.id, case.id, _site(site="0x2000", site_state="poc-backed",
+                                   site_verdict="proven", site_confidence=0.97))
+    f = _f(store, t.id, case.id)
+    assert fd.proven_sites(t.id) == {f.id: 1}
+    assert len(fd.sites(f.id)) == 3, "marking a site must not create a new one"
+
+
+def test_the_proven_occurrence_sorts_first(store, case):
+    """Oldest-first was the only order available when a site was just an address."""
+    t = _target(store, case)
+    fd = FindingDAO(store.conn)
+    for a in ("0x1000", "0x2000", "0x3000"):
+        fd.upsert(t.id, case.id, _site(site=a))
+    fd.upsert(t.id, case.id, _site(site="0x3000", site_state="poc-backed",
+                                   site_verdict="proven"))
+    assert fd.sites(_f(store, t.id, case.id).id)[0]["site_addr"] == "0x3000"
+
+
+def test_a_channel_may_only_raise_a_site(store, case):
+    """Same asymmetry the finding row uses: a later weak channel cannot unprove a site."""
+    t = _target(store, case)
+    fd = FindingDAO(store.conn)
+    fd.upsert(t.id, case.id, _site(site_state="poc-backed", site_verdict="proven"))
+    fd.upsert(t.id, case.id, _site(site_state="candidate", site_verdict="unknown"))
+    s = fd.sites(_f(store, t.id, case.id).id)[0]
+    assert s["state"] == "poc-backed"
+
+
+def test_a_channel_that_says_nothing_about_a_site_blanks_nothing(store, case):
+    """Most channels have no opinion on most fields; silence must not erase another's work."""
+    t = _target(store, case)
+    fd = FindingDAO(store.conn)
+    fd.upsert(t.id, case.id, _site(site_state="poc-backed", site_verdict="proven",
+                                   site_detail="the faulting instruction"))
+    fd.upsert(t.id, case.id, _site())                 # no site_* fields at all
+    s = fd.sites(_f(store, t.id, case.id).id)[0]
+    assert s["state"] == "poc-backed" and s["verdict"] == "proven"
+    assert s["detail"] == "the faulting instruction"
+
+
+def test_sites_of_different_findings_are_counted_separately(store, case):
+    t = _target(store, case)
+    fd = FindingDAO(store.conn)
+    fd.upsert(t.id, case.id, _site("k1", site="0x1000", site_state="poc-backed"))
+    fd.upsert(t.id, case.id, _site("k2", site="0x2000"))
+    by = {f.dedup_key: f.id for f in FindingDAO(store.conn).list_by_target(t.id)}
+    assert fd.proven_sites(t.id) == {by["k1"]: 1}
