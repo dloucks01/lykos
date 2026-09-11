@@ -408,7 +408,12 @@ class Handler(BaseHTTPRequestHandler):
                 t = tmap.get(f.target_id)
                 d["target_name"] = t.filename if t else None
                 d["target_arch"] = t.arch if t else None
-                d["poc_level"] = best_poc.get(f.target_id)
+                # Only on a finding that IS PoC-backed. This was the TARGET's best level
+                # pinned to every finding of that target, so all 24 of jhead's rows wore an
+                # "L1" badge and the one finding actually backed by a PoC looked no different
+                # from the 23 that were not.
+                if f.state == "poc-backed":
+                    d["poc_level"] = best_poc.get(f.target_id)
                 out.append(d)
             return self._json(out)
         finally:
