@@ -10,11 +10,13 @@ from lykos.eval import archgate
 def test_matrix_is_coherent():
     labels = [c.label for c in archgate.MATRIX]
     assert len(labels) == len(set(labels)), "duplicate architecture label"
+    top = max(archgate._RANK[c.expect] for c in archgate.MATRIX)
     for c in archgate.MATRIX:
-        assert c.expect in ("L1", "L2"), f"{c.label}: unexpected level {c.expect}"
+        assert c.expect in ("L1", "L2", "L3"), f"{c.label}: unexpected level {c.expect}"
         assert c.cc, f"{c.label}: no compiler"
-        # anything expected below L2 must say why, or the bar silently drifts down
-        if c.expect != "L2":
+        # anything expected below the best any arch achieves must say why, or the bar
+        # silently drifts down one architecture at a time
+        if archgate._RANK[c.expect] < top:
             assert c.note, f"{c.label} expects only {c.expect} but records no reason"
 
 

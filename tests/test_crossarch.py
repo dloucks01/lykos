@@ -167,3 +167,31 @@ def test_fetch_layout_parses_a_target_description():
     # target.xml's own regs first, then the include, in document order
     assert ("pc", 4) in lay and ("d0", 4) in lay and ("a0", 4) in lay
     assert ("fp80", 10) in lay          # 80 bits rounds up to 10 bytes
+
+
+def test_breakpoints_go_at_the_even_address_on_lsb_masking_isas():
+    """ARM marks a Thumb function by setting bit 0 of its SYMBOL value, but the code lives at
+    the even address. A breakpoint placed at the odd address never fires -- verified against
+    qemu-arm: bp at 0x10355 produced no stop at all, bp at 0x10354 hit immediately -- so a
+    ret2win that genuinely redirected execution was reported as "hijack not reached".
+
+    The payload must still carry the ODD address (bit 0 selects Thumb state), so the two
+    cannot simply be normalised together: place even, report back what the caller asked for.
+    """
+    from lykos.analyze.debug import qemu_gdb as qg
+    assert "arm" in qg.LSB_MASKED_PC and "aarch64" in qg.LSB_MASKED_PC
+    assert "riscv" in qg.LSB_MASKED_PC
+    # x86 code addresses are arbitrary bytes; masking one would move the breakpoint
+    assert "x86" not in qg.LSB_MASKED_PC and "x86-64" not in qg.LSB_MASKED_PC
+    assert "m68k" not in qg.LSB_MASKED_PC and "ppc64" not in qg.LSB_MASKED_PC
+
+
+def test_win_address_packing_follows_the_target_not_the_host():
+    """A 4-byte big-endian return address written as 8 little-endian bytes lands nowhere."""
+    from lykos.analyze.poc import exploit
+    be32 = exploit.ret2win_input(8, 0x80000420, 32, word=4, endian="big")
+    assert be32[8:12] == b"\x80\x00\x04\x20"
+    le64 = exploit.ret2win_input(8, 0x401146, 32, word=8, endian="little")
+    assert le64[8:16] == (0x401146).to_bytes(8, "little")
+    # the default stays x86-64 so existing callers are unaffected
+    assert exploit.ret2win_input(8, 0x401146, 32)[8:16] == le64[8:16]

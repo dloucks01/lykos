@@ -12,6 +12,8 @@ stages, asserting the level it is expected to reach:
     L1  a verified crash reproducer      (needs qemu-user for the ISA)
     L2  instruction-pointer control      (additionally needs a gdbstub register layout,
                                           hard-coded or derived from the stub)
+    L3  a confirmed control-flow hijack  (ret2win: redirect to a chosen function and prove
+                                          arrival with a breakpoint)
 
 Deliberately does NOT run Ghidra: decompilation is the slow part, and nearly every
 architecture regression lives in the dynamic path. That keeps this cheap enough to gate on.
@@ -41,6 +43,9 @@ from typing import Optional
 _SRC = r"""
 #include <string.h>
 #include <unistd.h>
+#include <stdlib.h>
+/* never called: the L3 ret2win target. __attribute__((used)) keeps it past the linker. */
+__attribute__((used)) void win(void){ write(1, "LYKOS-L3-WIN\n", 13); _exit(7); }
 static void sink(const char *s, long n){ char b[64]; memcpy(b, s, n); write(1, b, 1); }
 int main(void){ static char in[1<<16]; long n = read(0, in, sizeof in);
                 if(n > 0) sink(in, n); return 0; }
@@ -61,21 +66,22 @@ class ArchCase:
 # Expected level per architecture. Lower it only with a recorded reason -- a drop here is the
 # regression this gate exists to catch.
 MATRIX = [
-    ArchCase("x86-64", "gcc", "L2"),
-    ArchCase("x86", "gcc", "L2", flags=("-m32",),
+    ArchCase("x86-64", "gcc", "L3"),
+    ArchCase("x86", "gcc", "L3", flags=("-m32",),
              note="cross-arch on an x86-64 host: takes the qemu path, layout from the stub"),
-    ArchCase("aarch64", "aarch64-linux-gnu-gcc", "L2"),
-    ArchCase("arm", "arm-linux-gnueabihf-gcc", "L2"),
-    ArchCase("ppc", "powerpc-linux-gnu-gcc", "L2"),
-    ArchCase("ppc64", "powerpc64-linux-gnu-gcc", "L1",
-             note="big-endian ppc64 does not confirm IP control on this program"),
-    ArchCase("ppc64le", "powerpc64le-linux-gnu-gcc", "L2",
+    ArchCase("aarch64", "aarch64-linux-gnu-gcc", "L3"),
+    ArchCase("arm", "arm-linux-gnueabihf-gcc", "L3",
+             note="Thumb: the win symbol is odd, the breakpoint goes at the even address"),
+    ArchCase("ppc", "powerpc-linux-gnu-gcc", "L3"),
+    ArchCase("ppc64", "powerpc64-linux-gnu-gcc", "L3"),
+    ArchCase("ppc64le", "powerpc64le-linux-gnu-gcc", "L3",
              note="regression canary for endianness reaching the sandbox"),
-    ArchCase("riscv", "riscv64-linux-gnu-gcc", "L2"),
+    ArchCase("riscv", "riscv64-linux-gnu-gcc", "L3"),
     ArchCase("s390", "s390x-linux-gnu-gcc", "L1",
-             note="Ghidra ships no SystemZ processor; the dynamic ladder still works"),
-    ArchCase("loongarch", "loongarch64-linux-gnu-gcc", "L2", note="layout derived from the stub"),
-    ArchCase("m68k", "m68k-linux-gnu-gcc", "L2", note="layout derived from the stub"),
+             note="Ghidra ships no SystemZ processor, and the cyclic recovery does not pin a "
+                  "control slot on this program; the dynamic ladder still reaches L1"),
+    ArchCase("loongarch", "loongarch64-linux-gnu-gcc", "L3", note="layout derived from the stub"),
+    ArchCase("m68k", "m68k-linux-gnu-gcc", "L3", note="layout derived from the stub"),
     ArchCase("sh", "sh4-linux-gnu-gcc", "L1", note="qemu-sh4 serves no target description"),
     ArchCase("sparcv9", "sparc64-linux-gnu-gcc", "L1",
              note="register windows keep the return address in %i7, not on the stack: a "
@@ -102,6 +108,7 @@ def run_case(case: ArchCase, exe: Path, *, timeout: float = 30.0,
     """Drive one architecture through the real stages. Returns a result dict."""
     from ..analyze import register as register_stages
     from ..analyze.ingest import enqueue_triage, ingest
+    from ..analyze.poc.exploit_stage import enqueue_exploit
     from ..analyze.poc.primitive_stage import enqueue_primitive
     from ..analyze.poc.stage import enqueue_build_poc
     from ..casestore import CaseStore
@@ -155,6 +162,23 @@ def run_case(case: ArchCase, exe: Path, *, timeout: float = 30.0,
                            for e in store.events.list(run_id=r.id, limit=40)
                            if e.type == "primitive.done"]
                     res["l2_note"] = (str(evs[-1].payload)[:160] if evs
+                                      else (runs[-1].error if runs else None))
+            if _RANK[case.expect] >= _RANK["L3"] and res["reached"] == "L2":
+                # L3 reads the offset L2 just confirmed (see exploit_stage._l2_offset), so it
+                # must run after it -- which is the documented ladder order anyway.
+                enqueue_exploit(q, target, params={"input_mode": "stdin",
+                                                   "timeout": timeout}, force=True)
+                pool.wait_idle(timeout * 80)
+                pocs = PocDAO(store.conn).list_by_target(target.id)
+                if any(p.verified and p.level == "L3" for p in pocs):
+                    res["reached"] = "L3"
+                else:
+                    runs = [r for r in store.runs.list_by_case(cid)
+                            if r.stage == "build_exploit"]
+                    evs = [e for r in runs
+                           for e in store.events.list(run_id=r.id, limit=40)
+                           if e.type == "exploit.done"]
+                    res["l3_note"] = (str(evs[-1].payload)[:160] if evs
                                       else (runs[-1].error if runs else None))
         finally:
             pool.stop()

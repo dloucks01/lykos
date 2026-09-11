@@ -78,6 +78,6 @@ def make_qemu_capture(exe, arch, mode, base_argv, timeout, *, endianness=None, b
             (work / "input.bin").write_bytes(data)
             argv = argv + [str(work / "input.bin")]
         return qemu_gdb.capture(exe, arch, argv=argv, stdin=stdin, timeout=timeout,
-                                endianness=endianness, bits=bits)
+                                endianness=endianness, bits=bits, breakpoints=breakpoints)
 
     return capture
