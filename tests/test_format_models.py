@@ -65,7 +65,7 @@ def test_the_model_round_trips_a_sized_blob():
     seed = S.seed_for_name("jpeg")
     fields = model.parse(seed)
     assert model.serialize(fields) == seed
-    seg = next(f for f in fields if f["f"].get("name") == "seg")
+    seg = next(f for f in fields if f["f"].get("name") == "gpsdata")
     assert len(seg["val"]) < len(seed) - 20, "the blob must be sized, not the whole remainder"
 
 
@@ -102,3 +102,98 @@ def test_a_mutant_is_still_recognisably_the_format():
     seed = S.seed_for_name("jpeg")
     kept = sum(1 for _ in range(200) if mut.mutate(seed, [seed]).startswith(b"\xff\xd8"))
     assert kept > 150, "the magic is usually kept so the format gate passes"
+
+
+def _jpeg_gps_entries(fields, model):
+    gps = next(f for f in fields if f["f"].get("name") == "gps")["val"]
+    return next(f for f in gps if f["f"].get("name") == "gpsent")["val"]
+
+
+def test_a_format_inside_a_format_is_fields_not_payload():
+    """EXIF's directories used to sit inside one opaque blob, so the only way to change an
+    entry was byte havoc over the whole region -- which alters the entry AND wrecks the
+    directory around it. jhead then rejects the directory before it ever reads the entry."""
+    model = S.builtin("jpeg")
+    seed = S.seed_for_name("jpeg")
+    fields = model.parse(seed)
+    ents = _jpeg_gps_entries(fields, model)
+    assert len(ents) == 2, "the GPS sub-directory's entries are addressable"
+    names = [f["f"]["name"] for f in ents[0]]
+    assert names == ["tag", "fmt", "count", "value"]
+    assert model.serialize(fields) == seed, "and it all round-trips byte for byte"
+
+
+def test_changing_one_nested_field_leaves_every_other_byte_alone():
+    """The whole point of describing a sub-structure: an edit is surgical. If a change to one
+    entry's count moves or corrupts anything else, the parser rejects the file for the other
+    reason and the value under test is never reached."""
+    model = S.builtin("jpeg")
+    seed = S.seed_for_name("jpeg")
+    fields = model.parse(seed)
+    ent = _jpeg_gps_entries(fields, model)[0]
+    next(f for f in ent if f["f"]["name"] == "count")["val"] = 0xFF000002
+    out = model.serialize(fields)
+    assert len(out) == len(seed)
+    differing = [i for i, (a, b) in enumerate(zip(out, seed)) if a != b]
+    assert len(differing) <= 4, f"one u32 should change, {len(differing)} bytes did"
+
+
+def test_an_array_reads_as_many_records_as_its_count_claims():
+    model = S.builtin("jpeg")
+    seed = bytearray(S.seed_for_name("jpeg"))
+    fields = model.parse(bytes(seed))
+    ifd0 = next(f for f in fields if f["f"].get("name") == "ifd0")
+    assert len(ifd0["val"]) == 1
+    next(f for f in fields if f["f"].get("name") == "nent")["val"] = 3
+    grown = model.parse(model.serialize(fields))
+    assert len(next(f for f in grown if f["f"].get("name") == "ifd0")["val"]) == 3, \
+        "a count field drives how many records are read back"
+
+
+def test_a_count_field_cannot_make_the_parser_read_forever():
+    """An array's count is attacker data -- a four-billion entry claim must not be believed."""
+    model = S.builtin("jpeg")
+    fields = model.parse(S.seed_for_name("jpeg"))
+    next(f for f in fields if f["f"].get("name") == "nent")["val"] = 0xFFFFFFFF
+    again = model.parse(model.serialize(fields))
+    got = next(f for f in again if f["f"].get("name") == "ifd0")["val"]
+    assert len(got) <= S._MAXREC
+
+
+def test_an_offset_and_its_size_are_driven_together_to_overflow():
+    """A parser that reads `size` bytes from `base + offset` checks the pair first, and the
+    check is the bug: computed in the field's own width it WRAPS, so a sum that looks tiny
+    passes while the offset still points far outside the buffer. jhead's GPS read is exactly
+    this -- 0x00ffffff + 0xff000002 is 1 in 32 bits. Neither half does it alone (both are
+    refused), and guessing both independently never lands it, so it has to be constructed."""
+    import random
+    model = S.builtin("jpeg")
+    seed = S.seed_for_name("jpeg")
+    mut = S.StructMutator(random.Random(9), model)
+    wrapped = 0
+    for _ in range(400):
+        d = mut.mutate(seed, [seed])
+        try:
+            fields = model.parse(d)
+            ents = _jpeg_gps_entries(fields, model)
+        except (StopIteration, IndexError, KeyError):
+            continue
+        for rec in ents:
+            v = {f["f"]["name"]: f["val"] for f in rec}
+            if v["value"] > 0xFFFF and (v["value"] + v["count"]) & 0xFFFFFFFF <= 0x20:
+                wrapped += 1
+                break
+    assert wrapped > 10, f"only {wrapped}/400 mutants carried a wrapping offset/size pair"
+
+
+def test_a_pair_is_only_driven_when_the_model_says_it_is_one():
+    """The roles are declared. Driving any two integers that happen to sit next to each other
+    would wreck formats where they are unrelated."""
+    import random
+    spec = [{"type": "u32", "endian": "little", "name": "a"},
+            {"type": "u32", "endian": "little", "name": "b"}]
+    model = S.FormatModel(spec)
+    mut = S.StructMutator(random.Random(1), model)
+    fields = model.parse(b"\x01\x00\x00\x00\x02\x00\x00\x00")
+    mut._drive_pair(fields, fields[0], "size")          # no role declared anywhere
+    assert [f["val"] for f in fields] == [1, 2], "nothing to pair with, nothing changed"
