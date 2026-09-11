@@ -50,7 +50,21 @@ class Mutator:
             i = self.rng.randrange(n)
             ln = self.rng.randint(1, min(64, n))
             b[i:i] = bytes(b[i:i + ln])
-        elif r < 0.94 and n > 1:                       # truncate
+        elif r < 0.94:                                 # EXTEND by a long run
+            # Growth used to be one operator that duplicated at most 64 bytes, cancelled by an
+            # equally likely truncate, so from seeds of 0-16 bytes the length random-walked
+            # around nothing: 20,000 mutations never passed 109 bytes, p99 = 32. A stack
+            # overflow needs kilobytes -- ncompress faults at ~1050 and jhead's campaign ran
+            # 98,500 execs for 0 unique finds. A length-triggered bug was unreachable, which
+            # is precisely the class the L2/L3 ladder exists to exploit.
+            # The size is an exponential draw so a single mutation can cross an order of
+            # magnitude, and a REPEATED byte is what actually smashes a frame.
+            ln = 1 << self.rng.randint(3, 12)          # 8 .. 4096
+            fill = (bytes([self.rng.randrange(256)]) * ln if self.rng.random() < 0.7
+                    else bytes(self.rng.randrange(256) for _ in range(min(ln, 256))))
+            pos = self.rng.randrange(n + 1)
+            b[pos:pos] = fill
+        elif r < 0.97 and n > 1:                       # truncate
             cut = self.rng.randrange(1, n)
             del b[cut:]
         else:                                          # splice with another corpus entry
