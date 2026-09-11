@@ -596,7 +596,12 @@ function renderBoard(){
     (!f.sev||x.severity===f.sev) && (!f.state||x.state===f.state) &&
     (!f.q || ((x.cwe||"")+" "+(x.title||"")+" "+(x.target_name||"")+" "+(x.detector||""))
       .toLowerCase().includes(f.q.toLowerCase())));
-  rows.sort((a,b)=> (_SEVRANK[b.severity]-_SEVRANK[a.severity]) ||
+  // Evidence first, then severity. Sorting on severity alone buried the only PROVEN finding
+  // on jhead -- a reproduced, attributed out-of-bounds read -- fifteenth, under a dozen
+  // unproven pattern matches, because tainted_deref files reads as low severity.
+  const _STRANK={"poc-backed":4,"confirmed":3,"corroborated":2,"candidate":1};
+  rows.sort((a,b)=> ((_STRANK[b.state]||0)-(_STRANK[a.state]||0)) ||
+    (_SEVRANK[b.severity]-_SEVRANK[a.severity]) ||
     ((b.confidence||0)-(a.confidence||0)));
   const tile=(cls,n,l,key,val)=>`<div class="tile ${cls} ${
     (f[key]===val)?'active':''}" onclick="boardTile('${key}','${val}')"><div class="n">${n}</div><div class="l">${l}</div></div>`;

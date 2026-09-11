@@ -180,14 +180,37 @@ def test_stack_buffer_overflow_detector_uses_recovered_frame():
     assert len(out) == 1
     f = out[0]
     assert f["cwe"] == "CWE-121" and f["function_addr"] == "0x1000"
-    assert "64-byte" in f["title"]
-    assert any("return address" in e["detail"] for e in f["evidence"])
+    # The recovered size and the offset-to-return describe THIS occurrence, so they belong to
+    # the site. The title names the defect, which is what the dedup key groups on.
+    assert "64-byte" not in f["title"], "the title is the defect, not one buffer"
+    assert "64 B" in f["site_detail"] and "return address" in f["site_detail"]
     # a function with the sink but NO stack buffer is not flagged
     novar = {"name": "x", "offset": -8, "size": 4, "type": "int", "is_buffer": False}
     ctx2 = DetectContext(target_id="t", case_id="c",
                          call_edges=[_edge("0x2000", "0x2010", None, "strcpy", 1)],
                          strings=[], frames={"0x2000": {"vars": [novar]}})
     assert stack_buffer_overflow(ctx2) == []
+
+
+def test_stack_buffer_overflow_reports_at_defect_grain():
+    """Keying on the FUNCTION made every call site its own high-severity finding: seven
+    near-identical rows on jhead, most of its HIGH count, reading as seven separate bugs.
+    Every other sink detector groups by defect and records each place as a site."""
+    from lykos.analyze.detect.detectors import stack_buffer_overflow
+    buf = {"name": "msg", "offset": -72, "size": 64, "type": "char[64]", "is_buffer": True}
+    ctx = DetectContext(
+        target_id="t", case_id="c", strings=[],
+        call_edges=[_edge("0x1000", "0x1010", None, "strcpy", 1),
+                    _edge("0x2000", "0x2010", None, "strcpy", 1),
+                    _edge("0x3000", "0x3010", None, "sprintf", 1)],
+        frames={a: {"frame_size": 88, "vars": [buf]} for a in ("0x1000", "0x2000", "0x3000")})
+    out = stack_buffer_overflow(ctx)
+    assert len(out) == 3, "one candidate per occurrence"
+    keys = {c["dedup_key"] for c in out}
+    assert len(keys) == 2, "strcpy and sprintf are two defects, not three findings"
+    assert all("0x1000" not in k and "0x2000" not in k for k in keys), \
+        "the key must not carry the function address"
+    assert len({c["site_addr"] for c in out}) == 3
 
 
 def test_function_dao_roundtrips_signature_and_frame(store, case):

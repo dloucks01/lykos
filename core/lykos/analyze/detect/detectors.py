@@ -95,18 +95,21 @@ def stack_buffer_overflow(ctx: DetectContext):
         ret_off = frame.get("ret_offset")
         off_to_ret = (ret_off - int(buf.get("offset", 0))) if ret_off is not None \
             else abs(int(buf.get("offset", 0))) + 8
+        # Defect grain, like every other sink detector: one finding per unbounded copy
+        # routine, each occurrence a SITE. Keying on the function address made every call
+        # site its own high-severity finding -- seven near-identical rows on jhead, which was
+        # most of its HIGH count and read as seven separate bugs.
         out.append(_cand(
             "CWE-121",
-            f"Stack buffer overflow: unbounded {n}() into a {buf.get('size')}-byte stack buffer",
+            f"Stack buffer overflow: unbounded {n}() into a fixed-size stack buffer",
             "high", "stack_frame",
             [{"channel": "pattern",
-              "detail": f"{n}() at {site} in a function owning stack buffer "
-                        f"{buf.get('name')} ({buf.get('type')}, {buf.get('size')} B)"},
-             {"channel": "stack-frame",
-              "detail": f"~{off_to_ret} bytes from the buffer to the saved return address "
-                        f"(recovered frame; overflow offset hint)"}],
+              "detail": f"{n}() called in a function owning a fixed-size stack buffer"}],
             function_addr=addr, site_addr=site,
-            dedup_key=f"CWE-121:{addr}:{n}", confidence=0.55))
+            site_detail=(f"{n}() at {site} into {buf.get('name')} "
+                         f"({buf.get('type')}, {buf.get('size')} B); ~{off_to_ret} bytes from "
+                         f"the buffer to the saved return address"),
+            dedup_key=f"CWE-121:stack_frame:{n}", confidence=0.55))
     return out
 
 

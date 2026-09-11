@@ -318,6 +318,25 @@ actionable.
   NUL, and execve truncates at the first NUL regardless, so the shell hands over exactly the
   bytes the kernel would. The bundle is the deliverable; one that does not reproduce is worse
   than none.
+- **[DONE] The board buried the only proven finding.** Opening the GUI on jhead after this
+  session's work showed the ranking inverted: the one `POC-BACKED` finding — a reproduced,
+  attributed out-of-bounds read, the single thing actually demonstrated — sat **fifteenth**,
+  below a dozen unproven pattern matches, because `tainted_deref` files reads as `low` severity
+  and the board sorted on severity alone. Three defects, all of which quietly undid the
+  evidence-first restructuring:
+  *The sort ignored state.* It is now state → severity → confidence, so what is PROVEN outranks
+  what is merely severe.
+  *Every row wore a PoC badge.* `poc_level` was the TARGET's best level pinned to every finding
+  of that target, so all 24 of jhead's rows showed `L1` and the one finding actually backed by a
+  PoC looked no different from the 23 that were not. It is now set only on a finding that is
+  itself `poc-backed`.
+  *`stack_frame` reported at site grain* (`dedup_key=CWE-121:{addr}:{sink}`) while every other
+  sink detector groups by defect, so each call site became its own high-severity finding —
+  seven near-identical rows on jhead, most of its HIGH count, reading as seven separate bugs.
+  Now one defect per copy routine with each place a site; the per-occurrence buffer size and
+  offset-to-return moved from the title to `site_detail`, where they describe the occurrence.
+  Measured on jhead: 24 findings → **19**, HIGH 12 → **7**, 349 sites preserved, and the
+  `POC-BACKED` row is first with the only PoC badge on the board.
 - **[DONE] A full-chain release gate** (`make real-gate`, `lykos realgate`). The existing
   gates each cover a slice and between them left the join uncovered: `test` is unit tests over
   synthetic P-Code and never runs a program; `eval-gate` scores detection on inline micro-cases
