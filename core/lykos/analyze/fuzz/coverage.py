@@ -41,6 +41,15 @@ def coverage_stage(ctx) -> dict:
     seconds = int(p.get("max_seconds", 30))
     exec_timeout = float(p.get("exec_timeout", 2))
     use_qemu = bool(p.get("qemu", True))              # qemu-mode: fuzz an uninstrumented bin
+    if use_qemu and aflpp.locate_qemu_trace(afl) is None:
+        # Checking only for afl-fuzz is not enough: -Q needs afl-qemu-trace, which ships
+        # separately (Ubuntu's afl++ package omits it). Without this check the campaign
+        # aborts at the fork-server handshake and still reports a clean "0 crashes" run.
+        raise RuntimeError(
+            "AFL++ qemu-mode needs afl-qemu-trace, which is not installed next to "
+            f"{afl} or on PATH. Build it with AFL++'s build-qemu-support.sh, pass "
+            "params.qemu=false to fuzz an afl-instrumented build, or use the built-in "
+            "black-box `fuzz` stage.")
 
     exe = ctx.scratch() / "target.bin"
     exe.write_bytes(ctx.content.path(target.sha256).read_bytes())
@@ -65,6 +74,10 @@ def coverage_stage(ctx) -> dict:
         raise RuntimeError(f"afl-fuzz failed (rc={proc.returncode}): {tail}")
 
     raw = aflpp.harvest_crashes(out_dir)
+    failed = aflpp.campaign_failed(proc)
+    if failed:
+        raise RuntimeError(
+            f"{failed}. No inputs were executed, so this is NOT a clean 'no crashes' result.")
     ctx.emit("coverage.harvest", payload={"crash_inputs": len(raw)})
 
     fd = FindingDAO(ctx.conn)

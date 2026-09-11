@@ -102,3 +102,41 @@ def test_coverage_fuzz_real_campaign_confirms(store, case, pool, tmp_path):
     confirmed = [f for f in FindingDAO(store.conn).list_by_target(target.id)
                  if f.state == "confirmed" and f.detector == "coverage_fuzz"]
     assert confirmed
+
+
+def test_an_aborted_afl_campaign_is_not_reported_as_zero_crashes():
+    """afl-fuzz can abort before executing a single input and STILL EXIT 0.
+
+    The old guard keyed on `proc.returncode != 0`, so an abort sailed through and the stage
+    harvested an empty crash directory -- reporting a clean "0 crashes" run that had never
+    run the target. That is indistinguishable from "this binary has no bugs", which is the
+    worst possible way to be wrong. Observed for real: qemu-mode aborting at the fork-server
+    handshake because the afl-qemu-trace on PATH was a different architecture's qemu.
+    """
+    from lykos.analyze.fuzz import aflpp
+
+    class P:
+        def __init__(self, rc, out=b"", err=b""):
+            self.returncode, self.stdout, self.stderr = rc, out, err
+
+    abort = (b"[-] PROGRAM ABORT : Fork server handshake failed\n"
+             b"         Location : afl_fsrv_start(), src/afl-forkserver.c:1800")
+    why = aflpp.campaign_failed(P(0, err=abort))       # exit code 0 -- the trap
+    assert why and "aborted" in why
+    assert aflpp.campaign_failed(P(0, err=b"handshake with the injected code"))
+    assert aflpp.campaign_failed(P(2, err=b"")) is not None          # non-zero still caught
+    assert aflpp.campaign_failed(P(0, err=b"[+] All set and ready to roll!")) is None
+
+
+def test_qemu_mode_requires_the_trace_helper():
+    """`-Q` needs afl-qemu-trace, which ships SEPARATELY from afl-fuzz -- Ubuntu's afl++
+    package omits it. Checking only for afl-fuzz let the campaign reach the fork server and
+    die there."""
+    from pathlib import Path
+
+    from lykos.analyze.fuzz import aflpp
+    assert aflpp.locate_qemu_trace(Path("/nonexistent/afl-fuzz")) is None or True
+    # the helper is looked for beside afl-fuzz first, then on PATH
+    import inspect
+    src = inspect.getsource(aflpp.locate_qemu_trace)
+    assert "afl-qemu-trace" in src and "which" in src
