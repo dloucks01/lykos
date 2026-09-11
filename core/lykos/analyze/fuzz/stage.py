@@ -48,6 +48,7 @@ def _mine_dictionary(strings):
 # How many inputs the corpus may retain, and how big one may be. A blind campaign that keeps
 # everything spends its budget re-running near-duplicates of one enormous input.
 _MAX_CORPUS = 256
+_MAX_CRASH_ROWS = 8      # examples kept per signal; a reproducible crash recurs thousands of times
 _MAX_KEEP = 16384
 
 
@@ -99,7 +100,7 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
     dd = DynResultDAO(ctx.conn)
     deadline = time.time() + max_seconds
     execs = crashes = 0
-    seen_sigs = set()
+    seen_sigs: dict = {}
     seen_behaviour, kept = set(), 0
 
     # Batching pays the sandbox namespace once per BATCH instead of once per input, which is
@@ -196,9 +197,18 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
                     kept += 1
             if res.crashed:
                 crashes += 1
-                corpus.append(data)                        # explore near crashers
+                # Explore near crashers -- while they are still telling us something. Kept
+                # unconditionally, one reproducible crash takes the corpus over: jhead crashed
+                # on 8,516 of 20,000 executions, all the same defect, and block coverage fell
+                # from 978 to 796 because almost every parent was a crasher. So keep the first
+                # few of each signal and let the rest through the normal rotation.
+                if seen_sigs.get(res.signal_name, 0) < _MAX_CRASH_ROWS:
+                    if len(corpus) < _MAX_CORPUS:
+                        corpus.append(data)
+                    else:
+                        corpus[rng.randrange(len(corpus))] = data
                 if res.signal_name not in seen_sigs:
-                    seen_sigs.add(res.signal_name)
+                    seen_sigs[res.signal_name] = 1
                     sig = res.signal_name
 
                     def _same(d, _sig=sig):
@@ -220,7 +230,12 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
                     extra = "(" + note_prefix + ("; " + note if note else "") + ")"
                     fd.upsert(target.id, target.case_id, crash_finding_candidate(
                         sig, input_sha, res.isolation, detector, extra))
-                else:
+                elif seen_sigs[res.signal_name] < _MAX_CRASH_ROWS:
+                    # A campaign that finds a REPRODUCIBLE crash finds it thousands of times:
+                    # 8,128 of 20,000 executions on jhead. Storing every one buries the case in
+                    # rows that all describe the same defect and say nothing new, so keep a
+                    # handful of examples per signal and count the rest.
+                    seen_sigs[res.signal_name] += 1
                     input_sha = ctx.put_artifact("fuzz-crash-input", data=data)
                     dd.insert(target.id, target.case_id, run_id=ctx.run_id, input_sha=input_sha,
                               input_mode=mode, argv=argv, signal=res.signal,

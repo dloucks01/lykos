@@ -21,7 +21,10 @@ from .mutator import Mutator
 _INT = {"u8": (1, "B"), "u16": (2, "H"), "u32": (4, "I"), "u64": (8, "Q")}
 # values that break length/count fields: zero, off-by-one, and huge (overflow/overread)
 _EDGE = [0, 1, 63, 64, 65, 127, 128, 255, 256, 1024, 4096, 0x7FFFFFFF, 0xFFFFFFFF]
+# offsets a parser will happily add to a base pointer and then read from
+_FAR = [0, 1, 0x40, 0xFF, 0x100, 0xFFFF, 0x10000, 0x00FFFFFF, 0x7FFFFFFF, 0xFFFFFFF0, 0xFFFFFFFF]
 _MAXBLOB = 8192
+_MAXREC = 4096          # an array's count field is attacker data: parse it, but bound it
 
 
 def _as_bytes(v):
@@ -43,9 +46,17 @@ class FormatModel:
         self.spec = spec
 
     def parse(self, data: bytes):
-        pos, fields = 0, []
-        covered = {}                     # blob name -> (declared span, offset of the length)
-        for f in self.spec:
+        fields, _pos = self._parse_spec(self.spec, data, 0)
+        return fields
+
+    def _parse_spec(self, spec, data: bytes, pos: int):
+        """Parse one SCOPE. Groups and arrays recurse, so a format inside a format is fields
+        rather than opaque bytes -- which is what lets a mutation change one of them and leave
+        every other field intact."""
+        fields: list = []
+        covered: dict = {}               # blob name -> (declared span, offset of the length)
+        seen: dict = {}                  # name -> value, for an array's count field
+        for f in spec:
             t = f["type"]
             if t == "magic":
                 v = _as_bytes(f["value"])
@@ -59,8 +70,27 @@ class FormatModel:
                 cov = f.get("covers")
                 if cov and cov != "rest":
                     covered[cov] = (val, pos)
+                seen[f.get("name")] = val
                 fields.append({"f": f, "val": val})
                 pos += sz
+            elif t == "group":
+                sub, pos = self._parse_spec(f["spec"], data, pos)
+                fields.append({"f": f, "val": sub})
+            elif t == "array":
+                # However many the count field claims -- but only as many as the data holds. A
+                # count that outruns its own records is a mutation worth making, not a reason
+                # to give up on the input.
+                want = min(int(seen.get(f.get("count"), 0) or 0), _MAXREC)
+                recs = []
+                for _ in range(want):
+                    if pos >= len(data):
+                        break
+                    sub, nxt = self._parse_spec(f["spec"], data, pos)
+                    if nxt > len(data):
+                        break
+                    recs.append(sub)
+                    pos = nxt
+                fields.append({"f": f, "val": recs})
             else:
                 # A blob NAMED by a length field ends where that length says, so the fields
                 # after it can be parsed. Without this every blob ate the remainder, so a
@@ -75,7 +105,7 @@ class FormatModel:
                     stop = len(data)
                 fields.append({"f": f, "val": data[pos:stop]})
                 pos = stop
-        return fields
+        return fields, pos
 
     def serialize(self, fields) -> bytes:
         out = bytearray()
@@ -87,6 +117,11 @@ class FormatModel:
                 sz, code = _INT[t]
                 end = "<" if f.get("endian", "little") == "little" else ">"
                 out += struct.pack(end + code, int(fd["val"]) & ((1 << (sz * 8)) - 1))
+            elif t == "group":
+                out += self.serialize(fd["val"])
+            elif t == "array":
+                for rec in fd["val"]:
+                    out += self.serialize(rec)
             else:
                 out += _as_bytes(fd["val"] or b"")
         return bytes(out)
@@ -126,15 +161,11 @@ def seed_for_name(name: str) -> bytes | None:
                     tail=entry.get("tail"))
 
 
-def seed_for(model: "FormatModel", payload: bytes = b"A" * 64, tail: bytes = None) -> bytes:
-    """A minimal input the format's own gate accepts.
-
-    The model already declares the magic and which integer sizes which blob, so a valid
-    skeleton falls straight out of `serialize` -- there is no need for an analyst to attach a
-    sample before a campaign can start doing work.
-    """
-    fields, blobs = [], []
-    for f in model.spec:
+def _seed_spec(spec, payload):
+    """A seed for one scope, returning its fields and the blobs in it (outermost first)."""
+    fields: list = []
+    blobs: list = []
+    for f in spec:
         t = f["type"]
         if t == "magic":
             fields.append({"f": f, "val": _as_bytes(f["value"])})
@@ -142,11 +173,38 @@ def seed_for(model: "FormatModel", payload: bytes = b"A" * 64, tail: bytes = Non
             # A count that must agree with the seed's own payload -- an IFD entry count of 0
             # alongside one entry is rejected before the parser reaches anything interesting.
             fields.append({"f": f, "val": f.get("seed_value", 0)})
+        elif t == "group":
+            sub, sub_blobs = _seed_spec(f["spec"], payload)
+            fields.append({"f": f, "val": sub})
+            blobs += sub_blobs
+        elif t == "array":
+            # Records differ from one another -- two IFD entries are two different tags -- so
+            # the model names each one's field values rather than repeating a single template.
+            recs = []
+            for values in f.get("seed_records") or []:
+                sub, sub_blobs = _seed_spec(f["spec"], payload)
+                for fd in sub:
+                    if fd["f"].get("name") in values:
+                        fd["val"] = values[fd["f"]["name"]]
+                recs.append(sub)
+                blobs += sub_blobs
+            fields.append({"f": f, "val": recs})
         else:
             # the LAST blob gets the format's tail when it declares one (a JPEG's entropy data
             # and end-of-image marker); earlier blobs get the payload
             fields.append({"f": f, "val": payload})
             blobs.append(fields[-1])
+    return fields, blobs
+
+
+def seed_for(model: "FormatModel", payload: bytes = b"A" * 64, tail: bytes = None) -> bytes:
+    """A minimal input the format's own gate accepts.
+
+    The model already declares the magic and which integer sizes which blob, so a valid
+    skeleton falls straight out of `serialize` -- there is no need for an analyst to attach a
+    sample before a campaign can start doing work.
+    """
+    fields, blobs = _seed_spec(model.spec, payload)
     # length fields describe the blob they name, so the skeleton parses rather than truncating
     by_name = {fd["f"].get("name"): fd for fd in fields}
     for fd in fields:
@@ -161,6 +219,27 @@ def seed_for(model: "FormatModel", payload: bytes = b"A" * 64, tail: bytes = Non
         blobs[-1]["val"] = tail
     _fix_covers(model, fields)
     return model.serialize(fields)
+
+
+def _scopes(fields):
+    """Every scope in a parsed input: the top level, and each group and array record.
+
+    A mutation picks a scope and then a field in it, so a leaf buried in a sub-structure is as
+    reachable as a top-level one -- and, crucially, changing it leaves every other field
+    exactly as it was. Byte havoc over the same bytes cannot do that: measured on jhead, it
+    produced the value that triggers the bug 259 times in 20,000 mutations and crashed on none
+    of them, because the same havoc wrecked the surrounding directory and the parser gave up
+    before reaching the code that reads the value.
+    """
+    out = [fields]
+    for fd in fields:
+        t = fd["f"]["type"]
+        if t == "group":
+            out += _scopes(fd["val"])
+        elif t == "array":
+            for rec in fd["val"]:
+                out += _scopes(rec)
+    return out
 
 
 class StructMutator:
@@ -179,8 +258,9 @@ class StructMutator:
         if not fields:
             return self.byte.mutate(data, corpus)
         drove_cover = False
+        scopes = _scopes(fields)
         for _ in range(self.rng.randint(1, 3)):
-            drove_cover |= self._mutate_field(fields) == "cover"
+            drove_cover |= self._mutate_field(self.rng.choice(scopes)) == "cover"
         if not drove_cover:
             # Keep "covers: rest" lengths honest unless this round deliberately drove one.
             # A segment length that no longer spans the segment is not a bug the parser will
@@ -192,12 +272,42 @@ class StructMutator:
         except Exception:
             return self.byte.mutate(data, corpus)
 
+    def _drive_pair(self, fields, fd, role):
+        """Drive a record's offset and size TOGETHER.
+
+        A parser that reads `size` bytes from `base + offset` usually checks the pair first,
+        and the check is where the bug is: computing `offset + size` in the field's own width
+        wraps, so a sum that looks tiny passes while the offset still points far outside the
+        buffer. That is jhead's GPS read -- 0x00ffffff + 0xff000002 is 1 in 32 bits -- and
+        neither half does it alone: a huge size is refused, a far offset is refused, and only
+        the pair gets through. Guessing both independently effectively never lands it, so the
+        complementary value is CONSTRUCTED.
+        """
+        mate = next((x for x in fields
+                     if x["f"].get("role") == ("offset" if role == "size" else "size")
+                     and x is not fd), None)
+        if mate is None:
+            return
+        off_fd, siz_fd = (fd, mate) if role == "offset" else (mate, fd)
+        width = min(_INT[off_fd["f"]["type"]][0], _INT[siz_fd["f"]["type"]][0]) * 8
+        mask = (1 << width) - 1
+        if self.rng.random() < 0.5:
+            off = self.rng.choice([x for x in _FAR if 0xFFFF < x <= mask]) & mask
+            # the wrapped sum has to survive the check too, so aim it just past zero
+            off_fd["val"] = off
+            siz_fd["val"] = (mask + 1 - off + self.rng.choice((0, 1, 2, 4, 8, 16))) & mask
+        else:
+            off_fd["val"] = self.rng.choice(_FAR) & mask
+            siz_fd["val"] = self.rng.choice(_EDGE) & mask
+
     def _blob_by_name(self, fields, name):
         return next((fd for fd in fields if fd["f"].get("name") == name), None)
 
     def _mutate_field(self, fields):
         fd = self.rng.choice(fields)
         t = fd["f"]["type"]
+        if t in ("group", "array"):
+            return None                                 # its own fields are a scope of their own
         if t == "magic":
             if self.rng.random() < 0.08:               # usually KEEP so the format gate passes
                 fd["val"] = self.byte.mutate(fd["val"] or b"", ())
@@ -205,6 +315,15 @@ class StructMutator:
             fd["val"] = self.rng.choice(_EDGE)
             if fd["f"].get("covers") == "rest":
                 return "cover"                          # driving it IS the interesting case
+            # A record that says WHERE data is and HOW MUCH of it there is is the classic
+            # out-of-bounds read, and it needs both halves at once: jhead survives a GPS entry
+            # with a four-billion-byte count, and survives one pointing off the end of the
+            # segment, but reading that many bytes FROM there walks off the mapping. Driving
+            # one field at a time never lands both, so the roles are declared and driven
+            # together -- the same coordination `length_of` already does for a sized blob.
+            role = fd["f"].get("role")
+            if role in ("size", "offset") and self.rng.random() < 0.6:
+                self._drive_pair(fields, fd, role)
             target = fd["f"].get("length_of")
             if target and self.rng.random() < 0.6:      # coordinate: grow the sized blob to match
                 blob = self._blob_by_name(fields, target)
@@ -220,15 +339,6 @@ class StructMutator:
 # A model is a spec plus the printable tokens that betray a parser for it in a binary's
 # strings. Byte magic (0xFFD8) never survives into a string table; the format's textual
 # markers do, which is what makes auto-detection possible at all.
-# One well-formed IFD entry (ASCII "Make"), the next-IFD terminator and an EOI, so the seed
-# lands inside ProcessExifDir rather than being rejected at the alignment marker.
-def _exif_entry(tag, typ, count, value):
-    """One 12-byte IFD entry. A value of four bytes or fewer sits INLINE; anything larger is
-    stored as an offset, and a parser rejects the entry if the two disagree."""
-    raw = value if isinstance(value, bytes) else struct.pack("<I", value)
-    return struct.pack("<HHI", tag, typ, count) + raw
-
-
 def _jpeg_frame():
     """DQT + SOF0 + DHT + SOS: the smallest tail that makes jhead call the file complete."""
     def seg(marker, body):
@@ -243,32 +353,19 @@ def _jpeg_frame():
 _JPEG_FRAME = _jpeg_frame()
 
 
-def _jpeg_seed_tail():
-    """An EXIF payload that reaches the GPS parser, not merely the front door.
-
-    A seed has to exercise a format's FEATURES, not just satisfy its magic. Reaching
-    `ProcessExifDir` is not enough to find jhead's bug: that lives in `ProcessGpsInfo`, behind
-    a GPS sub-directory pointer (tag 0x8825) and a sub-IFD at a valid offset. Random mutation
-    does not invent a 16-bit tag number and a self-consistent offset, so a campaign that starts
-    without one never executes the function at all.
-
-    Offsets are relative to the TIFF header, which the model emits as a magic: an 8-byte header
-    then IFD0 at offset 8 (its count comes from the model's `nent` field).
-    """
-    ifd0_off, ifd0_len = 8, 2 + 12 + 4          # one entry: the GPS pointer, then next-IFD
-    gps_off = ifd0_off + ifd0_len
-    gps_len = 2 + 12 * 2 + 4
-    rat_off = gps_off + gps_len
-    ifd0_rest = _exif_entry(0x8825, 4, 1, gps_off) + struct.pack("<I", 0)
-    gps = (struct.pack("<H", 2)
-           + _exif_entry(0x0001, 2, 2, b"N\x00\x00\x00")     # GPSLatitudeRef
-           + _exif_entry(0x0002, 5, 3, rat_off)                # GPSLatitude: 3 rationals
-           + struct.pack("<I", 0))
-    rationals = b"".join(struct.pack("<II", n, d) for n, d in ((51, 1), (30, 1), (0, 1)))
-    return ifd0_rest + gps + rationals
+# Offsets inside an EXIF payload are relative to the TIFF header, which the model emits as a
+# magic: an 8-byte header, then IFD0 starts at offset 8 -- exactly where the model's `nent`
+# field sits. Everything after it follows from the entry counts the seed declares.
+_IFD0_OFF = 8
+_GPS_OFF = _IFD0_OFF + 2 + 12 + 4                 # count + one entry (the GPS pointer) + next
+_RAT_OFF = _GPS_OFF + 2 + 12 * 2 + 4              # count + two entries + next
+_RATIONALS = b"".join(struct.pack("<II", n, d) for n, d in ((51, 1), (30, 1), (0, 1)))
+_IFD_ENTRY = [{"type": "u16", "endian": "little", "name": "tag"},
+              {"type": "u16", "endian": "little", "name": "fmt"},
+              {"type": "u32", "endian": "little", "name": "count", "role": "size"},
+              {"type": "u32", "endian": "little", "name": "value", "role": "offset"}]
 
 
-_JPEG_SEED_TAIL = _jpeg_seed_tail()
 
 _BUILTINS = {
     # generic "magic + u32-LE length + payload" container (matches many toy/real headers)
@@ -289,16 +386,34 @@ _BUILTINS = {
              # The TIFF header and the IFD entry count are part of the GATE, not the payload:
              # an EXIF reader rejects the file before either unless both are well formed, and
              # the entry count is one of the most productive fields a parser fuzzer can drive.
-             "seed": _JPEG_SEED_TAIL, "tail": b"\x00" * 8 + b"\xff\xd9",
+             "seed": _RATIONALS, "tail": b"\x00" * 8 + b"\xff\xd9",
              "spec": [
                  {"type": "magic", "value": b"\xff\xd8\xff\xe1"},
                  # the APP1 length spans itself through the end of the EXIF payload, which is
-                 # also what bounds `seg` on the way back in
-                 {"type": "u16", "endian": "big", "name": "seglen", "covers": "seg"},
+                 # also what bounds `gpsdata` on the way back in
+                 {"type": "u16", "endian": "big", "name": "seglen", "covers": "gpsdata"},
                  {"type": "magic", "value": b"Exif\x00\x00"},
                  {"type": "magic", "value": b"II*\x00\x08\x00\x00\x00"},
+                 # IFD0 and the GPS sub-directory it points at are FIELDS, not payload. As one
+                 # opaque blob the mutator could only flip bytes in them, which produces a
+                 # broken directory and a bad value at the same time -- and jhead rejects the
+                 # directory long before it reads the value. Described, a mutation changes one
+                 # entry's count and leaves every other field exactly as it was, which is the
+                 # single edit that crashes it.
                  {"type": "u16", "endian": "little", "name": "nent", "seed_value": 1},
-                 {"type": "blob", "name": "seg"},
+                 {"type": "array", "name": "ifd0", "count": "nent", "spec": _IFD_ENTRY,
+                  "seed_records": [{"tag": 0x8825, "fmt": 4, "count": 1, "value": _GPS_OFF}]},
+                 {"type": "u32", "endian": "little", "name": "next_ifd"},
+                 {"type": "group", "name": "gps", "spec": [
+                     {"type": "u16", "endian": "little", "name": "ngps", "seed_value": 2},
+                     {"type": "array", "name": "gpsent", "count": "ngps", "spec": _IFD_ENTRY,
+                      "seed_records": [
+                          # GPSLatitudeRef: two ASCII bytes, "N", stored inline
+                          {"tag": 0x0001, "fmt": 2, "count": 2, "value": 0x4E},
+                          # GPSLatitude: three rationals, too big to inline, so an offset
+                          {"tag": 0x0002, "fmt": 5, "count": 3, "value": _RAT_OFF}]},
+                     {"type": "u32", "endian": "little", "name": "next_gps"}]},
+                 {"type": "blob", "name": "gpsdata"},
                  # Everything past EXIF is what makes the file COMPLETE. jhead rejects a file
                  # with no frame and scan header as "Unexpected end of file" and never reaches
                  # ShowImageInfo -- 210 blocks, its largest function -- nor anything gated
