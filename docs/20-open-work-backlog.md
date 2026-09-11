@@ -200,10 +200,27 @@ actionable.
   leads with execution: fuzz -> root_cause -> build_poc -> poc_primitive, with disassemble
   and detect_cwe demoted to "explain what execution found". Static analysis is supporting
   evidence, ranked below anything demonstrated. The GUI renders it as "Plan — evidence first".
-- **[PLANNED] Severity should require a demonstration or a bounds argument.** 20 of jhead's
-  27 findings were LOW rows that amount to "this program calls memcpy". Those are INVENTORY,
-  not findings: they belong behind a toggle, not in the headline count. Needs the CWE-120
-  bounds reasoning (section G) to tell a guarded copy from an unguarded one.
+- **[DONE] CWE-120 bounds reasoning** (`detect/bounds.py`). At a copy sink it resolves the
+  destination to a recovered stack variable and the length to a compile-time constant, then
+  compares them. `memcpy(buf, src, sizeof buf)` and `strncpy(buf, src, sizeof buf - 1)` both
+  compile to exactly that shape, so the safe idioms become provably safe and demote out of the
+  headline with the arithmetic attached. A length it cannot pin stays UNKNOWN and the finding
+  is left untouched — it only ever moves a verdict when it has a reason.
+  It DEMOTES but never asserts an overflow, and the reason is worth keeping: C locals in
+  disjoint scopes share stack slots, so a recovered frame can attribute the wrong variable and
+  size to an address. jhead's ProcessFile is the worked example — the source has
+  `char Comment[16001]` at RBP-0x3f50 and copies 16000 into it (safe), while Ghidra's frame
+  names that exact offset `st`, a 144-byte struct stat from a sibling scope. Asserting there
+  would have fabricated a critical finding in correct code. The error is asymmetric: too-small
+  a recovered size invents an overflow, too-large merely misses one, and a fabricated finding
+  costs the reader's trust in every other finding in the report.
+- **[PLANNED] Bounds analysis only resolves constant lengths** — 37 of jhead's 42 copy sites
+  have a length that is a local or a computed value, which needs dominating-guard / value-range
+  reasoning (`if (n < sizeof buf) memcpy(...)`). That is the next increment, and the thing that
+  would make the LOW tier genuinely small.
+- **[PLANNED] Frame recovery is not trustworthy enough to assert sizes.** The slot-reuse
+  problem above is not a Ghidra bug, it is inherent to stack-slot sharing. Distinguishing
+  "which variable lives here at THIS program point" needs liveness, not just the frame table.
 - **[PLANNED] Runs list shows DONE regardless of yield.** `fuzz · 177s · DONE` found nothing;
   a wasted run looks exactly like a productive one. Needs an outcome column.
 - **[PLANNED] Live Events is empty for a case with history** — the WebSocket starts at the

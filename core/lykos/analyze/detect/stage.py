@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from ...db.dao import CallEdgeDAO, FindingDAO, FunctionDAO, StringDAO, TargetDAO
 from ...jobs.registry import register_stage
-from . import taint
+from . import bounds, taint
 from .catalog import entry_seed_params
 from .detectors import DETECTORS, DetectContext, correlate
 
@@ -61,6 +61,31 @@ def detect_stage(ctx) -> dict:
             c["evidence"].append({"channel": "taint-dataflow",
                                   "detail": "tainted value reaches a sink argument "
                                             "(intra-procedural P-Code taint)"})
+
+    # Bounds channel: can this copy actually exceed its destination? The rule channel flags
+    # every memcpy/strncpy and the taint channel confirms "attacker data reaches it", which on
+    # a parser is true of nearly everything -- on jhead that was 20 LOW findings amounting to
+    # "this program calls memcpy". A copy whose length is a compile-time constant that FITS
+    # the recovered destination is not a defect, and saying so turns that noise into inventory.
+    ctx.progress(msg="bounds analysis on copy sinks")
+    verdicts = bounds.classify_program(func_irs, dctx.call_edges, frames, target.arch,
+                                       bits=target.bits or 64)
+    for c in cands:
+        v = verdicts.get(c.get("site_addr"))
+        if not v or c.get("detector") != "dangerous_api":
+            continue
+        if v["verdict"] == bounds.SAFE:
+            # provably bounded: demote out of the headline, keep as inventory with the reason
+            c["severity"] = "info"
+            c["state"] = "candidate"
+            c["confidence"] = min(c.get("confidence", 0.4), 0.15)
+            c["evidence"].append({"channel": "bounds", "detail": v["why"]})
+            c["site_detail"] = v["why"]
+        elif v["verdict"] == bounds.SUSPECT:
+            # surfaced for review -- NOT promoted, because a recovered frame can name the
+            # wrong variable for a reused stack slot (see bounds.py)
+            c["evidence"].append({"channel": "bounds", "detail": v["why"]})
+            c["site_detail"] = v["why"]
 
     fd = FindingDAO(ctx.conn)
     for c in cands:
