@@ -113,8 +113,8 @@ def _poke_byte(libc, pid, mem, addr, value):
                 ctypes.c_void_p(((word & ~0xFF) | value) & 0xFFFFFFFFFFFFFFFF))
 
 
-def _arm(libc, pid, mem, base, blocks, original):
-    """Plant an INT3 at every block, recording the byte it replaced.
+def _arm(libc, pid, mem, base, blocks, plan):
+    """Plant an INT3 at every block. Returns {relative address: replaced byte}.
 
     Done one block at a time this is two ptrace syscalls each, and a campaign re-arms every
     block it has not yet reached on every single execution: on jhead that is ~1,900 syscalls
@@ -122,31 +122,46 @@ def _arm(libc, pid, mem, base, blocks, original):
     to 23 exec/s against 2,000 without tracing. /proc/pid/mem reads the whole span once and
     writes it back once -- the patched bytes are scattered, but rewriting the untouched ones
     with their own values is free next to a syscall apiece.
+
+    With the syscalls gone the cost became PYTHON: a statically linked binary carries its libc,
+    so Ghidra recovers 38,418 blocks instead of 1,887, and building a 36,000-entry patch map
+    per execution held the same campaign to 15 exec/s. The patched image is identical for every
+    input in a batch -- same binary, same blocks -- so it is built once and replayed, which is
+    a single write per execution after the first.
     """
-    addrs = [base + rel for rel in blocks]
-    if mem is not None and len(addrs) > 8:
-        lo, hi = min(addrs), max(addrs) + 1
-        if hi - lo <= _SPAN_CAP:
+    if mem is not None and len(blocks) > 8 and plan is not None:
+        if not plan:
+            lo, hi = min(blocks), max(blocks) + 1
+            if hi - lo <= _SPAN_CAP:
+                try:
+                    text = bytearray(os.pread(mem, hi - lo, base + lo))
+                    if len(text) == hi - lo:
+                        orig = {}
+                        for rel in blocks:
+                            orig[rel] = text[rel - lo]
+                            text[rel - lo] = _INT3
+                        plan.update(lo=lo, text=bytes(text), orig=orig)
+                except OSError:
+                    pass
+        if plan:
             try:
-                text = bytearray(os.pread(mem, hi - lo, lo))
-                if len(text) == hi - lo:
-                    for addr in addrs:
-                        original[addr] = text[addr - lo]
-                        text[addr - lo] = _INT3
-                    os.pwrite(mem, bytes(text), lo)
-                    return
+                os.pwrite(mem, plan["text"], base + plan["lo"])
+                return plan["orig"]
             except OSError:
-                original.clear()                        # fall through to the per-block path
-    for addr in addrs:
+                pass
+    original = {}
+    for rel in blocks:
+        addr = base + rel
         word = libc.ptrace(PTRACE_PEEKTEXT, pid, ctypes.c_void_p(addr), 0)
         if word == -1:
             continue
-        original[addr] = word & 0xFF
+        original[rel] = word & 0xFF
         libc.ptrace(PTRACE_POKETEXT, pid, ctypes.c_void_p(addr),
                     ctypes.c_void_p(((word & ~0xFF) | _INT3) & 0xFFFFFFFFFFFFFFFF))
+    return original
 
 
-def _trace_one(libc, argv, stdin_data, timeout, blocks, exe):
+def _trace_one(libc, argv, stdin_data, timeout, blocks, exe, plan=None):
     """Run one input under ptrace. Returns (rc, out, err, flags, reached)."""
     r_out, w_out = os.pipe()
     r_err, w_err = os.pipe()
@@ -173,8 +188,10 @@ def _trace_one(libc, argv, stdin_data, timeout, blocks, exe):
     os.waitpid(pid, 0)                                  # stop at execve
 
     base = _maps_base(pid, exe) - _elf_min_vaddr(exe)
-    original, mem = {}, _open_mem(pid)
-    _arm(libc, pid, mem, base, blocks, original)
+    mem = _open_mem(pid)
+    # `original` is shared across the batch and keyed by RELATIVE address; what this execution
+    # has already put back is per-execution, so the shared map is never mutated
+    original, restored = _arm(libc, pid, mem, base, blocks, plan), set()
 
     reached, regs = [], _Regs()
     deadline = _now() + timeout
@@ -210,11 +227,13 @@ def _trace_one(libc, argv, stdin_data, timeout, blocks, exe):
         if libc.ptrace(PTRACE_GETREGS, pid, 0, ctypes.byref(regs)) != 0:
             break
         hit = regs.rip - 1
-        if hit in original:                             # one-shot: restore and never re-arm
-            _poke_byte(libc, pid, mem, hit, original.pop(hit))
+        rel = hit - base
+        if rel in original and rel not in restored:     # one-shot: restore and never re-arm
+            restored.add(rel)
+            _poke_byte(libc, pid, mem, hit, original[rel])
             regs.rip = hit
             libc.ptrace(13, pid, 0, ctypes.byref(regs))  # PTRACE_SETREGS
-            reached.append(hit - base)
+            reached.append(rel)
     if mem is not None:
         try:
             os.close(mem)
@@ -259,6 +278,7 @@ def main():
         libc.ptrace.argtypes = [ctypes.c_long, ctypes.c_long, ctypes.c_void_p,
                                 ctypes.c_void_p]
     out = sys.stdout.buffer
+    plan: dict = {}          # the patched image, built on the first traced run and replayed
     for _ in range(count):
         (ln,) = struct.unpack("<I", _readn(4))
         data = _readn(ln)
@@ -275,7 +295,7 @@ def main():
         reached = []
         if blocks:
             rc, so, se, flags, reached = _trace_one(libc, argv, stdin, per_timeout,
-                                                    blocks, exe)
+                                                    blocks, exe, plan)
         else:
             try:
                 pr = subprocess.run(argv, input=stdin, stdout=subprocess.PIPE,

@@ -84,3 +84,30 @@ def test_coverage_is_recorded_only_when_blocks_are_asked_for(tmp_path, gcc):
     traced = sandbox.run_batch(exe, [b"hi\n"], mode="stdin", timeout=5.0,
                                blocks=[0x1000, 0x1040, 0x1080])
     assert traced is not None and traced[0].exit_code == 0, "tracing must not break the run"
+
+
+def test_the_sandbox_lets_the_tracer_plant_breakpoints():
+    """Breakpoints are planted by writing to /proc/<pid>/mem, and the sandbox mounts the host
+    root READ-ONLY. Without a fresh procfs over it, that open fails with EROFS and the tracer
+    falls back to two ptrace syscalls per block -- silently, since the fallback is correct.
+
+    On a statically linked target (38,418 recovered blocks, because the binary carries its own
+    libc) that was 72,000 syscalls per execution: the campaign ran at 15 exec/s inside the
+    sandbox against 506 outside it, and a whole architecture corpus is statically linked.
+    """
+    import shutil
+    import subprocess
+
+    from lykos.analyze.dynamic import sandbox
+    if not shutil.which("bwrap") or not sandbox._bwrap_usable():
+        pytest.skip("bubblewrap not available here")
+    probe = ("import os\n"
+             "fd = os.open('/proc/self/mem', os.O_RDWR)\n"
+             "os.close(fd)\n"
+             "print('writable')\n")
+    cmd = ["bwrap"] + list(sandbox._BWRAP_ARGS) + ["python3", "-c", probe]
+    done = subprocess.run(cmd, capture_output=True, timeout=60)
+    assert done.returncode == 0 and b"writable" in done.stdout, (
+        "the tracer cannot plant a breakpoint in this sandbox: "
+        f"{done.stderr.decode('utf-8', 'replace')[:200]}")
+    assert "--proc" in sandbox._BWRAP_ARGS, "a fresh procfs is what makes it writable"

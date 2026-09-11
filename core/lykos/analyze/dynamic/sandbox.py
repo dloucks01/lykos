@@ -39,7 +39,13 @@ _bwrap_cache: Optional[bool] = None
 # Shared flag set for the probe AND the real run (so the probe predicts reality). No PID
 # namespace / procfs: those need privileges some VMs restrict; net isolation + ro-root +
 # tmpfs is the portable T1.
-_BWRAP_ARGS = ["--ro-bind", "/", "/", "--tmpfs", "/tmp", "--dev", "/dev",
+# `--proc /proc` overlays a FRESH procfs on the read-only root. Without it /proc comes in
+# through the read-only bind, and opening /proc/<pid>/mem O_RDWR fails with EROFS -- which is
+# how the block-coverage tracer plants breakpoints. It fell back silently to two ptrace
+# syscalls per block, 72,000 of them per execution on a statically linked target, and ran 25x
+# slower inside the sandbox than outside it. A fresh procfs is also the more correct mount for
+# a sandbox than a view of the host's.
+_BWRAP_ARGS = ["--ro-bind", "/", "/", "--proc", "/proc", "--tmpfs", "/tmp", "--dev", "/dev",
                "--unshare-net", "--die-with-parent", "--chdir", "/tmp", "--"]
 
 
