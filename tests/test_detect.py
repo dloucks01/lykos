@@ -207,3 +207,39 @@ def test_function_dao_roundtrips_signature_and_frame(store, case):
     assert full.frame["vars"][0]["is_buffer"] is True and full.frame["vars"][0]["size"] == 64
     assert full.frame["params"][0]["name"] == "who"
     assert full.frame["calling_convention"] == "__stdcall"
+
+
+def test_normalize_strips_powerpc_and_plt_decorations():
+    """Callee-name decorations that silently cost whole architectures.
+
+    A LEADING DOT is the PowerPC local-entry convention: under ELFv2 (every little-endian
+    ppc64 system) a function has a global entry that sets up the TOC and a local entry 8 bytes
+    later holding the body, which Ghidra names `.main`. On a real ppc64le binary 845/1829
+    functions and 3659/4828 call targets carry it, so leaving it on meant `.strcpy` matched no
+    sink and `.main` matched no entry point: the architecture produced ZERO data-flow findings
+    while big-endian ppc64 produced 139 from identical source.
+
+    Ghidra's PLT thunks (`00000397.plt_call.strcat`) matched nothing either, costing sinks
+    even on architectures that looked healthy.
+    """
+    from lykos.analyze.detect.catalog import DANGEROUS, SOURCES, normalize
+    assert normalize(".main") == "main"                       # ppc64le ELFv2 local entry
+    assert normalize(".strcpy") in DANGEROUS
+    assert normalize("00000397.plt_call.strcat") in DANGEROUS  # Ghidra PLT thunk
+    assert normalize("._IO_fgets") in SOURCES                  # dot + glibc stdio alias
+    assert normalize("_IO_fgets") in SOURCES
+    # existing behaviour must be untouched
+    assert normalize("strcpy@plt") in DANGEROUS
+    assert normalize("__isoc99_scanf") in DANGEROUS
+    assert normalize("main") == "main"
+    assert normalize("") == "" and normalize(None) == ""
+
+
+def test_entry_seeding_finds_the_powerpc_local_entry():
+    """`.main` must be recognised as an entry point, or argv is seeded onto the 8-byte
+    global-entry TOC stub (which uses no parameters) and reaches nothing."""
+    from types import SimpleNamespace
+    from lykos.analyze.detect.catalog import entry_seed_params
+    fns = [SimpleNamespace(name=".main", addr="0x10000b68",
+                           signature="undefined8 main(int param_1, long param_2)")]
+    assert entry_seed_params(fns) == {"0x10000b68": {1}}

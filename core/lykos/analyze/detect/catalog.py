@@ -186,14 +186,33 @@ def entry_seed_params(functions, frames=None):
 
 
 def normalize(fname):
-    """Normalize a callee name to a plain libc symbol (strip decorations)."""
+    """Normalize a callee name to a plain libc symbol (strip decorations).
+
+    Two decorations here are not cosmetic -- without them whole architectures go dark:
+
+    * A LEADING DOT is the PowerPC local-entry convention. Under ELFv2 (which is what every
+      little-endian ppc64 system uses) a function has a global entry that sets up the TOC and
+      a local entry 8 bytes later holding the actual body; Ghidra names the body `.main`.
+      On a real ppc64le binary 845 of 1829 functions and 3659 of 4828 call targets carry the
+      dot, so leaving it on meant `.strcpy` never matched a sink, `.main` never matched an
+      entry point, and the architecture produced ZERO data-flow findings while big-endian
+      ppc64 -- ELFv1, no dots -- produced 139 from the same source.
+    * Ghidra names a PLT thunk `<hex>.plt_call.<symbol>` (e.g. `00000397.plt_call.strcat`),
+      which matched nothing either. Seen on ppc64 big-endian, so this one was costing sinks
+      on an architecture that otherwise looked healthy.
+    """
     if not fname:
         return ""
     n = fname.strip()
+    if ".plt_call." in n:                # Ghidra PLT thunk: 00000397.plt_call.strcat
+        n = n.rsplit(".plt_call.", 1)[-1]
     for suffix in ("@plt", ".plt"):
         if n.endswith(suffix):
             n = n[:-len(suffix)]
+    n = n.lstrip(".")                    # PowerPC local entry point: .main -> main
     n = n.lstrip("_")
     if n.startswith("isoc99_"):          # __isoc99_scanf -> scanf
         n = n[len("isoc99_"):]
+    if n.startswith("IO_"):              # glibc stdio alias: _IO_fgets -> fgets
+        n = n[len("IO_"):]
     return n

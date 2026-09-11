@@ -245,6 +245,10 @@ candidate recall 1.00 / fp_rate 0.571; corroborated recall 0.833 / fp_rate 0.214
   loader opinion file and by a real `loongarch64-linux-gnu-gcc` binary, which triaged as
   `em-258` (unknown) before the fix. Also added `EM_SPARC32PLUS` (18), which Ghidra maps and
   we did not.
+- **[DONE] ppc64le zero-data-flow bug** — root-caused to `catalog.normalize()` not stripping
+  PowerPC ELFv2 local-entry dots (`.main`, `.strcpy`), Ghidra PLT thunk names
+  (`00000397.plt_call.strcat`) or glibc `_IO_` aliases. ppc64le went 0 -> 146 corroborated;
+  big-endian ppc64 also gained from the PLT-thunk half. See doc 18.
 - **[PLANNED] Arch coverage is still not gated.** 13 of the 14 arch strings now have a working
   or partial channel (up from 6), but `eval-gate` only ever measures x86-64, so an arch
   regression would trip nothing. The verification above was manual; it should become corpus
