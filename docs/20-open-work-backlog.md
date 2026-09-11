@@ -532,11 +532,32 @@ actionable.
   3,955**, max 8192, while the median mutation stays at 29 bytes so short inputs are still
   explored. On ncompress the campaign now finds the overflow in **909 execs — 429 crashes, 1
   unique** — where 3,000 execs previously found none.
-- **[PLANNED] The blind fuzzer still cannot pass a format gate.** jhead stays at 0 finds:
-  its bug is a structured EXIF parse, not length-triggered, and the generic seeds never satisfy
-  the JPEG magic. `fuzz` supports a format model (`params.format`) and a seed corpus; neither is
-  supplied by default, and `advise` does not recommend one. AFL++ found jhead's crash in 60s
-  with a real seed, so the gap is seeding and structure, not the mutator.
+- **[DONE] The fuzzer can now get past a format gate.** `advise` already diagnosed this — it
+  exists to sit there saying "this is a parser, attach a seed and use a structure model" — but
+  nothing acted on it: there were two builtin models (`lv32`, `png`), nothing selected one, and
+  nothing could produce a seed. A blind mutator cannot invent four valid magic bytes, so a
+  parser rejected everything and the campaign did no work.
+  Now: seven models (jpeg, png, gif, bmp, riff, zip, lv32); **auto-detection from the target's
+  own strings** (byte magic never survives into a string table, a format's textual markers do)
+  — jhead → `jpeg`, ncompress and a plain heap fixture → `None`, no false positives; and
+  **seed generation from the model**, so no analyst sample is needed to start.
+  Two model capabilities were needed to make a seed a parser accepts. `covers: "rest"` is the
+  length shape real formats use — a JPEG segment length spans itself and everything after it,
+  not one named blob — and the mutator now keeps it honest unless a round deliberately drives
+  it, because a stale length makes the parser discard the rest as padding and throw away every
+  other mutation in the round. And a field can declare a `seed_value`, since an IFD entry count
+  of 0 beside one entry is rejected before anything interesting runs.
+  Measured on jhead with NO hints: the format is detected automatically, the generated seed
+  reaches **`ProcessGpsInfo`** (verified under gdb — the same `process_EXIF → ProcessExifDir →
+  ProcessGpsInfo` chain the real crash's backtrace shows), and 115 of 200 mutants parse EXIF
+  cleanly with 27 more reaching `ProcessExifDir`.
+- **[PLANNED] jhead's own bug is still not found by the built-in fuzzer.** The campaign now
+  executes the target's parser rather than bouncing off its magic, but 23,000 executions from
+  the generated seed produce no crash. jhead 3.04 guards the GPS value pointer with
+  `OffsetVal > 0x1000000 || OffsetVal+ByteCount > ExifLength` and bounds the entry loop against
+  `OffsetBase+ExifLength`, so the over-read needs a condition a 94-byte skeleton does not
+  reach — AFL++ found it from a real photograph. The likely next step is a richer seed (several
+  IFDs, more tags, real image data) or coverage feedback, not more mutator tuning.
 - **[PLANNED] `coverage_fuzz` still cannot run on this machine.** It fails loudly now
   ("afl-fuzz aborted: Fork server handshake failed") rather than silently succeeding, which is
   the earlier guard working — but `/usr/local/bin/afl-qemu-trace` is a qemu-aarch64 5.2.50
