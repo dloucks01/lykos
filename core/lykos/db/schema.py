@@ -265,4 +265,40 @@ CREATE TABLE finding_site(
 );
 CREATE INDEX ix_finding_site ON finding_site(finding_id);
 """),
+    Migration(version=12, name="finding_verdicts", sql=r"""
+-- A finding's state is the STRONGEST thing any channel currently says about it -- not the
+-- strongest thing any channel has EVER said. The old merge took the higher state/severity/
+-- confidence and kept it forever, which is right for promotion (that is how a finding climbs
+-- candidate -> corroborated -> confirmed -> poc-backed when channels agree) and wrong for
+-- everything else: a channel could never revise its own verdict downward.
+--
+-- That silently discarded every demotion. `enqueue_detect` forces by default -- "re-detect
+-- after re-analysis should re-run rather than cache-hit" -- so detect re-running is the
+-- designed path, and the bounds channel's "provably bounded, demote to info" was computed and
+-- thrown away on every one of those runs. gzip 1.3.5's guarded strcpy demotes correctly on a
+-- fresh case and stays high on a re-run of the same one.
+--
+-- Each channel now records its own verdict and the finding is the maximum over them, so a
+-- channel can lower ITS OWN contribution without being able to lower anyone else's. A weak
+-- late channel still cannot undo a crash-proven promotion.
+CREATE TABLE finding_verdict(
+  finding_id  TEXT NOT NULL REFERENCES finding(id) ON DELETE CASCADE,
+  channel     TEXT NOT NULL,
+  run_id      TEXT,
+  state       TEXT NOT NULL,
+  severity    TEXT NOT NULL,
+  confidence  REAL NOT NULL,
+  updated_at  INTEGER NOT NULL,
+  PRIMARY KEY(finding_id, channel)
+);
+CREATE INDEX ix_finding_verdict ON finding_verdict(finding_id);
+
+-- Seed from what already exists, or the first upsert after this migration would recompute a
+-- finding from ONE channel and drop the standing verdicts of every channel that has not
+-- re-run yet.
+INSERT INTO finding_verdict(finding_id, channel, run_id, state, severity, confidence,
+                            updated_at)
+  SELECT id, COALESCE(detector, 'legacy'), NULL, state, severity, confidence, updated_at
+    FROM finding;
+"""),
 ]

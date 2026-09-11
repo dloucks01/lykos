@@ -496,11 +496,8 @@ class FindingDAO(BaseDAO):
                 for e in ev_new:
                     if (e.get("channel"), e.get("detail")) not in seen:
                         evidence.append(e)
-                state = FINDING_STATES[max(_rank(FINDING_STATES, row["state"]),
-                                           _rank(FINDING_STATES, c.get("state", "candidate")))]
-                severity = SEVERITIES[max(_rank(SEVERITIES, row["severity"]),
-                                          _rank(SEVERITIES, c.get("severity", "info")))]
-                confidence = max(row["confidence"] or 0.0, c.get("confidence", 0.0))
+                self._record_verdict(row["id"], c, now)
+                state, severity, confidence = self._recompute(row["id"])
                 self.conn.execute(
                     "UPDATE finding SET state=?, severity=?, confidence=?, evidence_json=?, "
                     "detector=?, updated_at=? WHERE id=?",
@@ -518,6 +515,8 @@ class FindingDAO(BaseDAO):
             fid = self.conn.execute(
                 "SELECT id FROM finding WHERE target_id=? AND dedup_key=?",
                 (target_id, key)).fetchone()["id"]
+            if not row:
+                self._record_verdict(fid, c, now)
             if c.get("function_addr") or c.get("site_addr"):
                 self.conn.execute(
                     "INSERT OR IGNORE INTO finding_site(id,finding_id,function_addr,"
@@ -535,6 +534,54 @@ class FindingDAO(BaseDAO):
             "WHERE finding_id=? ORDER BY created_at, rowid", (finding_id,)).fetchall()
         return [{"function_addr": r["function_addr"], "site_addr": r["site_addr"],
                  "detail": r["detail"]} for r in rows]
+
+    def _record_verdict(self, fid: str, c: dict, now: int) -> None:
+        """Store what THIS channel currently says about the finding.
+
+        A channel is identified by `channel`, falling back to `detector`. Within one run the
+        same channel speaks many times -- one candidate per site -- so those max-merge; a
+        LATER run replaces what the channel said before, which is what lets it revise itself
+        downward. Without the run check, nine sites of one sink would leave whichever was
+        written last, rather than the strongest.
+        """
+        chan = c.get("channel") or c.get("detector") or "?"
+        run_id = c.get("run_id")
+        state = c.get("state", "candidate")
+        severity = c.get("severity", "info")
+        confidence = float(c.get("confidence", 0.0) or 0.0)
+        prev = self.conn.execute(
+            "SELECT * FROM finding_verdict WHERE finding_id=? AND channel=?",
+            (fid, chan)).fetchone()
+        if prev is not None and (run_id is None or prev["run_id"] == run_id):
+            state = FINDING_STATES[max(_rank(FINDING_STATES, prev["state"]),
+                                       _rank(FINDING_STATES, state))]
+            severity = SEVERITIES[max(_rank(SEVERITIES, prev["severity"]),
+                                      _rank(SEVERITIES, severity))]
+            confidence = max(prev["confidence"] or 0.0, confidence)
+        self.conn.execute(
+            "INSERT INTO finding_verdict(finding_id,channel,run_id,state,severity,confidence,"
+            "updated_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(finding_id,channel) DO UPDATE SET "
+            "run_id=excluded.run_id, state=excluded.state, severity=excluded.severity, "
+            "confidence=excluded.confidence, updated_at=excluded.updated_at",
+            (fid, chan, run_id, state, severity, confidence, now))
+
+    def _recompute(self, fid: str) -> tuple:
+        """The finding is the STRONGEST thing any channel currently says about it."""
+        rows = self.conn.execute(
+            "SELECT state, severity, confidence FROM finding_verdict WHERE finding_id=?",
+            (fid,)).fetchall()
+        if not rows:
+            return "candidate", "info", 0.0
+        state = FINDING_STATES[max(_rank(FINDING_STATES, r["state"]) for r in rows)]
+        severity = SEVERITIES[max(_rank(SEVERITIES, r["severity"]) for r in rows)]
+        return state, severity, max((r["confidence"] or 0.0) for r in rows)
+
+    def verdicts(self, finding_id: str) -> list[dict]:
+        """What each channel currently says -- the audit trail behind the finding's state."""
+        rows = self.conn.execute(
+            "SELECT channel, state, severity, confidence, updated_at FROM finding_verdict "
+            "WHERE finding_id=? ORDER BY channel", (finding_id,)).fetchall()
+        return [dict(r) for r in rows]
 
     def sites_by_target(self, target_id: str) -> dict:
         """finding_id -> every (function_addr, site_addr) it occurs at, in one query.
