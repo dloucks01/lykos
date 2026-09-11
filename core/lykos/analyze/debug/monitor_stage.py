@@ -32,6 +32,21 @@ TOOL = "monitor"
 TOOL_VERSION = "monitor-1"
 
 
+def program_calls(hits):
+    """(the program's own calls, the ones that were not).
+
+    The loader resolves symbols through the same libc entry points long before `main` runs, so
+    an unfiltered log is mostly ld.so startup: on ncompress 11 of 13 recorded calls came from
+    `_dl_new_object` and friends, burying the two the program actually made. `winmonitor`
+    already attributes this way; the Linux path did not.
+
+    A hit whose origin could not be determined is KEPT -- absence of attribution is not
+    evidence the program did not make the call.
+    """
+    return ([h for h in hits if h.get("in_target") is not False],
+            [h for h in hits if h.get("in_target") is False])
+
+
 def _smallest_buffer_by_func(ctx, target_id):
     """function name -> smallest recovered stack-buffer size (for the overflow predicate)."""
     fdao = FunctionDAO(ctx.conn)
@@ -228,7 +243,7 @@ def monitor_stage(ctx) -> dict:
         ctx.progress(msg=f"monitoring {len(funcs)} sink(s) under GDB: {shown}{via}")
         res = monitor.run_monitor(exe, funcs, host, argv=run_argv, stdin=stdin, timeout=timeout,
                                   addr_sinks=sink_addrs)
-        hits = res.get("hits", [])
+        hits, loader = program_calls(res.get("hits", []))
     if not res.get("ok"):
         ctx.emit("monitor.done", payload={"ok": False, "note": res.get("note")})
         ctx.progress(pct=100, msg="monitor could not run: " + str(res.get("note")))
@@ -266,6 +281,7 @@ def monitor_stage(ctx) -> dict:
     log = [{k: v for k, v in h.items() if k in
             ("func", "kind", "cmd", "length", "caller_name")} for h in hits[:40]]
     ctx.emit("monitor.done", payload={"ok": True, "sinks": funcs, "calls": len(hits),
+             "loader_calls_excluded": len(loader),
              "findings": findings, "log": log})
     ctx.progress(pct=100, msg=f"{len(hits)} dangerous call(s) observed, {findings} finding(s)")
     return {}

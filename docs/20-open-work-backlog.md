@@ -460,10 +460,16 @@ actionable.
   which is a stage correctly having nothing to do — not a stage that broke. Both now report
   `applicable: False` with a note saying what a case would need. Same conflation "no fault
   reproduced" made.
-- **[PLANNED] `debug_monitor` mostly watches the dynamic loader** — its recorded calls on
-  ncompress are nearly all `_dl_new_object` and friends. `winmonitor` already filters to
-  callers inside the exe's own mapping; the Linux path does not, so its call log is dominated
-  by ld.so startup before the program runs.
+- **[DONE] `debug_monitor` was mostly watching the dynamic loader.** The loader resolves
+  symbols through the same libc entry points long before `main` runs, so an unfiltered log is
+  ld.so startup: on ncompress **11 of 13** recorded calls came from `_dl_new_object` and
+  friends, burying the two the program actually made (`read` from `compress`). `winmonitor`
+  already attributed this way — only calls whose caller is inside the exe's own mapping — and
+  the Linux path did not. The gdb probe now records `in_target` from `gdb.solib_name(caller)`,
+  which is `None` for the main executable and a path for any shared object, so no maps
+  plumbing is needed. Excluded calls are COUNTED and reported (`loader_calls_excluded`) so a
+  log of 2 is not mistaken for a monitor that barely ran, and a hit whose origin could not be
+  determined is kept: absence of attribution is not evidence the program did not make the call.
 - **[DONE] Sweep, batch 3 — the synthesize family, `multi_debug` and the multi-target stages.**
   `cross_taint`, `ipc_model`, `link_case` and `synthesize_secret` all reported honestly for a
   single binary with nothing to link. Two were broken, both by the same root cause in different
