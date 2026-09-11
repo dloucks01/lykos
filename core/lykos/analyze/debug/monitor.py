@@ -88,6 +88,12 @@ class Hit(gdb.Breakpoint):
                 older = f.older()
                 rec["caller"] = int(older.pc())
                 rec["caller_name"] = older.name()      # None if stripped
+                # Whether the CALLER is the program or something that ran before it. gdb
+                # returns None for the main executable and a path for any shared object, so
+                # this is the same attribution winmonitor already uses. Without it the log is
+                # dominated by ld.so resolving symbols before main() -- on ncompress every
+                # recorded call was _dl_new_object and friends.
+                rec["in_target"] = gdb.solib_name(rec["caller"]) is None
             except Exception:
                 rec["caller"] = rec["caller_name"] = None
         except Exception: pass
