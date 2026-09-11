@@ -18,6 +18,7 @@ import time
 
 from ...db.dao import CallEdgeDAO, DynResultDAO, FindingDAO, StringDAO, TargetDAO
 from ...jobs.registry import register_stage
+from ..dynamic import sandbox
 from ..dynamic.minimize import minimize
 from ..dynamic.stage import crash_finding_candidate
 from ..poc.capture import modes_for
@@ -50,7 +51,7 @@ _MAX_CORPUS = 256
 _MAX_KEEP = 16384
 
 
-def behaviour_of(res):
+def behaviour_of(res, data: bytes = b""):
     """A coarse signature of what the program DID -- a coverage proxy with no instrumentation.
 
     The campaign was purely blind: the corpus only ever grew on a CRASH, so an input that
@@ -65,6 +66,15 @@ def behaviour_of(res):
     """
     blob = (res.stderr or b"") + b"\x00" + (res.stdout or b"")
     shape = re.sub(rb"\d+", b"#", blob[:512])
+    # Paths too: a program that echoes the file it was given would otherwise report a new
+    # behaviour for every input, and a proxy that fires on everything is noise.
+    shape = re.sub(rb"[/\\][^\s'\"]*", b"#PATH", shape)
+    # Drop anything the program merely ECHOED back. A parser handed its input as a filename
+    # prints that filename in the diagnostic, so every distinct payload looked like a distinct
+    # path: 40% of inputs counted as new behaviour in argv mode, which is noise, not coverage.
+    if data:
+        shape = b" ".join(t for t in re.split(rb"[^A-Za-z#]+", shape)
+                          if len(t) > 2 and t not in data)
     return (res.exit_code, res.signal_name,
             hashlib.blake2b(shape, digest_size=8).digest())
 
@@ -92,59 +102,76 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
     seen_sigs = set()
     seen_behaviour, kept = set(), 0
 
+    # Batching pays the sandbox namespace once per BATCH instead of once per input, which is
+    # 3.18 ms of every 3.55 ms execution. Only for the plain runner: a stage that supplies its
+    # own delivery (boundary harnessing) is not a series of independent executions.
+    batchable = run_fn is run_input
+    batch_n = 64
     ctx.progress(msg=f"{event_prefix} campaign")
     while execs < max_execs and time.time() < deadline and not ctx.should_cancel():
-        data = mut.mutate(rng.choice(corpus), corpus)
-        argv, res = run_fn(exe, mode, workfile, exec_timeout, target.arch, data,
-                              endianness=target.endianness, bits=target.bits)
-        execs += 1
-        # Keep anything that made the program behave in a way we have not seen. This is the
-        # ratchet: without it the corpus never grows and a deeper path is reachable only by a
-        # single lucky mutation from a seed.
-        b = behaviour_of(res)
-        if b not in seen_behaviour:
-            seen_behaviour.add(b)
-            if not res.crashed and len(data) <= _MAX_KEEP:
-                if len(corpus) < _MAX_CORPUS:
-                    corpus.append(data)
+        want = min(batch_n if batchable else 1, max_execs - execs)
+        inputs = [mut.mutate(rng.choice(corpus), corpus) for _ in range(max(1, want))]
+        results = None
+        if batchable:
+            results = sandbox.run_batch(exe, inputs, mode=mode, timeout=exec_timeout,
+                                        arch=target.arch, endianness=target.endianness,
+                                        bits=target.bits)
+            if results is None:
+                batchable = False                     # not available here; stay per-exec
+        if results is None:
+            inputs = inputs[:1]
+            results = [run_fn(exe, mode, workfile, exec_timeout, target.arch, inputs[0],
+                              endianness=target.endianness, bits=target.bits)[1]]
+        for data, res in zip(inputs, results):
+            argv = invocation(mode, workfile, data)[0]
+            execs += 1
+            # Keep anything that made the program behave in a way we have not seen. This is the
+            # ratchet: without it the corpus never grows and a deeper path is reachable only by a
+            # single lucky mutation from a seed.
+            b = behaviour_of(res, data)
+            if b not in seen_behaviour:
+                seen_behaviour.add(b)
+                if not res.crashed and len(data) <= _MAX_KEEP:
+                    if len(corpus) < _MAX_CORPUS:
+                        corpus.append(data)
+                    else:
+                        # Full: ROTATE rather than stop learning. Capping without replacement
+                        # freezes the corpus around whatever shallow behaviours were found first,
+                        # which is most of them -- the interesting paths are discovered late.
+                        corpus[rng.randrange(len(corpus))] = data
+                    kept += 1
+            if res.crashed:
+                crashes += 1
+                corpus.append(data)                        # explore near crashers
+                if res.signal_name not in seen_sigs:
+                    seen_sigs.add(res.signal_name)
+                    sig = res.signal_name
+
+                    def _same(d, _sig=sig):
+                        r = run_fn(exe, mode, workfile, exec_timeout, target.arch, d,
+                                  endianness=target.endianness, bits=target.bits)[1]
+                        return r.crashed and r.signal_name == _sig
+
+                    budget = min(200, max(20, max_execs - execs))
+                    mdata, mexecs = minimize(_same, data, cap=budget)
+                    execs += mexecs
+                    note = (f"minimized {len(data)}->{len(mdata)}B"
+                            if len(mdata) < len(data) else None)
+                    margv = invocation(mode, workfile, mdata)[0]
+                    input_sha = ctx.put_artifact("fuzz-crash-input", data=mdata)
+                    dd.insert(target.id, target.case_id, run_id=ctx.run_id, input_sha=input_sha,
+                              input_mode=mode, argv=margv, signal=res.signal, signal_name=sig,
+                              crashed=True, isolation=res.isolation,
+                              duration_ms=res.duration_ms, note=note)
+                    extra = "(" + note_prefix + ("; " + note if note else "") + ")"
+                    fd.upsert(target.id, target.case_id, crash_finding_candidate(
+                        sig, input_sha, res.isolation, detector, extra))
                 else:
-                    # Full: ROTATE rather than stop learning. Capping without replacement
-                    # freezes the corpus around whatever shallow behaviours were found first,
-                    # which is most of them -- the interesting paths are discovered late.
-                    corpus[rng.randrange(len(corpus))] = data
-                kept += 1
-        if res.crashed:
-            crashes += 1
-            corpus.append(data)                        # explore near crashers
-            if res.signal_name not in seen_sigs:
-                seen_sigs.add(res.signal_name)
-                sig = res.signal_name
-
-                def _same(d, _sig=sig):
-                    r = run_fn(exe, mode, workfile, exec_timeout, target.arch, d,
-                              endianness=target.endianness, bits=target.bits)[1]
-                    return r.crashed and r.signal_name == _sig
-
-                budget = min(200, max(20, max_execs - execs))
-                mdata, mexecs = minimize(_same, data, cap=budget)
-                execs += mexecs
-                note = (f"minimized {len(data)}->{len(mdata)}B"
-                        if len(mdata) < len(data) else None)
-                margv = invocation(mode, workfile, mdata)[0]
-                input_sha = ctx.put_artifact("fuzz-crash-input", data=mdata)
-                dd.insert(target.id, target.case_id, run_id=ctx.run_id, input_sha=input_sha,
-                          input_mode=mode, argv=margv, signal=res.signal, signal_name=sig,
-                          crashed=True, isolation=res.isolation,
-                          duration_ms=res.duration_ms, note=note)
-                extra = "(" + note_prefix + ("; " + note if note else "") + ")"
-                fd.upsert(target.id, target.case_id, crash_finding_candidate(
-                    sig, input_sha, res.isolation, detector, extra))
-            else:
-                input_sha = ctx.put_artifact("fuzz-crash-input", data=data)
-                dd.insert(target.id, target.case_id, run_id=ctx.run_id, input_sha=input_sha,
-                          input_mode=mode, argv=argv, signal=res.signal,
-                          signal_name=res.signal_name, crashed=True, isolation=res.isolation,
-                          duration_ms=res.duration_ms)
+                    input_sha = ctx.put_artifact("fuzz-crash-input", data=data)
+                    dd.insert(target.id, target.case_id, run_id=ctx.run_id, input_sha=input_sha,
+                              input_mode=mode, argv=argv, signal=res.signal,
+                              signal_name=res.signal_name, crashed=True, isolation=res.isolation,
+                              duration_ms=res.duration_ms)
         if execs % 250 == 0:
             ctx.emit(f"{event_prefix}.progress", payload={"execs": execs, "crashes": crashes,
                                                           "unique": len(seen_sigs),
