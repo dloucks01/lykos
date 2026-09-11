@@ -443,6 +443,28 @@ actionable.
   reproduces it and faults at exactly `0x40bf0b`; attribution promotes that finding to
   `poc-backed` at 0.97 with the site named. Static prediction → dynamic proof, on unmodified
   Debian source.
+- **[DONE] Sweep, batch 3 — the synthesize family, `multi_debug` and the multi-target stages.**
+  `cross_taint`, `ipc_model`, `link_case` and `synthesize_secret` all reported honestly for a
+  single binary with nothing to link. Two were broken, both by the same root cause in different
+  code paths:
+  *`synthesize_poc` reported "no crash from 42 synthesized inputs" on ncompress* — whose
+  argv-only overflow it had itself detected statically and which is already confirmed to L2.
+  Its `_deliver` passed the payload to argv as a raw `decode("latin-1")`, and a synthesized
+  payload always carries a sentinel, and a sentinel always contains NUL bytes. It now goes
+  through `argv_arg(truncate=True)` like the capture path. It synthesizes a crash **with no
+  fuzzing at all**: offset 1040 from the recovered 1024-byte frame `local_418`, verified L1.
+  *`multi_debug` reported "no fault reproduced"* on an input already verified to crash: same
+  raw-decode bug, plus no mode sweep. Both fixed; it now reproduces and classifies the fault as
+  CWE-787 out-of-bounds-write.
+  **The raw `decode("latin-1")` shape was in four places, not one.** Fixing the capture helpers
+  earlier left `synthesize_poc`, `multi_debug` and `build_poc` each building argv their own way.
+  The symptom was never an exception — it was a clean "no crash".
+- **[DONE] One shared channel inference.** `synthesize_poc` already ranked channels by the
+  input functions a binary imports (`_modes_for`) while nine other stages defaulted blindly to
+  stdin. That inference now lives once in `poc.capture.modes_for` and backs `how_to_feed`, so a
+  stage with no recorded run infers from the call graph instead of guessing: ncompress ranks
+  `['file','stdin','arg']`, and a file parser is no longer fuzzed over stdin — which is a
+  campaign that cannot do any work and reports a clean zero.
 - **[DONE] Sweep, batch 2 — eight more ungated stages run against a real target.** `concolic`
   (angr, 6 new seeds), `behavior_trace`, `cve_scan` and `heap_check` all behaved and reported
   honestly. Three did not:

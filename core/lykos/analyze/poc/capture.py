@@ -87,6 +87,34 @@ def make_qemu_capture(exe, arch, mode, base_argv, timeout, *, endianness=None, b
 MODES = ("stdin", "file", "arg")
 
 
+_STDIN_FUNCS = {"read", "fgets", "gets", "scanf", "__isoc99_scanf", "fread", "getchar",
+                "getline", "getc", "fgetc"}
+_FILE_FUNCS = {"fopen", "fopen64", "open", "open64", "freopen"}
+
+
+def modes_for(call_edges, given=None):
+    """The input channels to try, best first, always ending with all three attempted.
+
+    Ranked by the input functions the binary actually imports, because "default to stdin" is
+    a coin flip that loses on most real targets: a file parser reads nothing from stdin, so a
+    campaign or a probe aimed there does no work at all and reports a clean zero.
+    """
+    from ..detect.catalog import normalize
+    if given:
+        return [given]
+    names = {normalize(e.dst_name) for e in call_edges if e.dst_name}
+    ordered = []
+    if names & _FILE_FUNCS:
+        ordered.append("file")
+    if names & _STDIN_FUNCS:
+        ordered.append("stdin")
+    ordered.append("arg")
+    for m in MODES:                          # ensure every channel is attempted
+        if m not in ordered:
+            ordered.append(m)
+    return ordered
+
+
 def how_to_feed(conn, target, input_sha, params):
     """(mode, argv, why) -- how this input reached the program when it crashed.
 
@@ -102,4 +130,11 @@ def how_to_feed(conn, target, input_sha, params):
     for r in DynResultDAO(conn).list_by_target(target.id):
         if r.input_sha == input_sha and r.input_mode:
             return r.input_mode, list(r.argv or []), "recorded by the run that found it"
-    return MODES[0], list(params.get("argv") or []), "no record of how it was found"
+    # Nothing recorded: rank the channels by what the binary imports rather than assuming
+    # stdin. A file parser given its input on stdin looks exactly like a program with no bug.
+    from ...db.dao import CallEdgeDAO
+    try:
+        ranked = modes_for(CallEdgeDAO(conn).list_by_target(target.id))
+    except Exception:
+        ranked = list(MODES)
+    return ranked[0], list(params.get("argv") or []), "inferred from the imported input calls"

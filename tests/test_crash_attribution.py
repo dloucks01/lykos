@@ -213,11 +213,28 @@ def test_the_run_that_found_the_crash_says_how_it_fed_it(store, case):
 
 
 def test_an_unrelated_run_is_not_consulted(store, case):
+    """A different input's run says nothing about this one, so the answer falls through to
+    inference rather than borrowing a mode that was never used for this payload."""
     t = _target(store, case)
     DynResultDAO(store.conn).insert(t.id, case.id, input_sha="d" * 64, input_mode="file",
                                     crashed=True, signal_name="SIGSEGV")
     mode, _argv, why = feed.how_to_feed(store.conn, t, "c" * 64, {})
-    assert why == "no record of how it was found" and mode in feed.MODES
+    assert "recorded by the run" not in why and mode in feed.MODES
+
+
+def test_the_fallback_infers_rather_than_assuming_stdin(store, case):
+    """"Default to stdin" is a coin flip that loses on most real targets: a file parser reads
+    nothing from stdin, so a campaign or probe aimed there does no work and reports a clean
+    zero. The channels are ranked by the input functions the binary actually imports."""
+    assert feed.modes_for([], None)[0] == "arg", "no input imports at all: argv is all that is left"
+
+    class _E:
+        def __init__(self, n):
+            self.dst_name = n
+    assert feed.modes_for([_E("fopen"), _E("fread")])[0] == "file"
+    assert feed.modes_for([_E("fgets")])[0] == "stdin"
+    # every channel is still attempted, whatever the ranking
+    assert set(feed.modes_for([_E("fopen")])) == set(feed.MODES)
 
 
 def test_every_mode_is_a_candidate_for_the_sweep():

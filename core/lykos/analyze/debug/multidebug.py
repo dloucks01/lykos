@@ -16,6 +16,7 @@ from ...db.dao import CallEdgeDAO, FindingDAO, FunctionDAO, TargetDAO
 from ...jobs.registry import register_stage
 from .. import elf
 from ..dynamic import sandbox
+from ..poc.capture import MODES, how_to_feed
 from . import gdb, rootcause
 
 MULTI_DEBUG_STAGE = "multi_debug"
@@ -49,7 +50,7 @@ def multi_debug_stage(ctx) -> dict:
     input_sha = p.get("input_sha")
     if not input_sha and not p.get("input"):
         raise ValueError("multi_debug requires params.input_sha or params.input")
-    mode = p.get("input_mode", "stdin")
+    mode = how_to_feed(ctx.conn, target, p.get("input_sha"), p)[0]
     base_argv = list(p.get("argv") or [])
     timeout = float(p.get("timeout", 12))
 
@@ -73,25 +74,41 @@ def multi_debug_stage(ctx) -> dict:
     exe.write_bytes(ctx.content.path(target.sha256).read_bytes())
     exe.chmod(0o755)
 
-    stdin_file = None
-    argv = list(base_argv)
-    if mode == "stdin":
-        stdin_file = str(ctx.scratch() / "stdin.bin")
-        (ctx.scratch() / "stdin.bin").write_bytes(input_bytes)
-    elif mode == "arg":
-        argv = argv + [input_bytes.decode("latin-1")]
-    elif mode == "file":
-        (ctx.scratch() / "input.bin").write_bytes(input_bytes)
-        argv = argv + [str(ctx.scratch() / "input.bin")]
+    def _deliver(m):
+        stdin_file, argv = None, list(base_argv)
+        if m == "stdin":
+            stdin_file = str(ctx.scratch() / "stdin.bin")
+            (ctx.scratch() / "stdin.bin").write_bytes(input_bytes)
+        elif m == "arg":
+            # execve truncates at the first NUL; a raw decode raises instead, so every payload
+            # carrying an address was undeliverable here.
+            argv = argv + [sandbox.argv_arg(input_bytes, truncate=True)]
+        else:
+            (ctx.scratch() / "input.bin").write_bytes(input_bytes)
+            argv = argv + [str(ctx.scratch() / "input.bin")]
+        return argv, stdin_file
 
-    ctx.progress(msg="detonating entry under gdb (follow-fork/exec)")
-    cap = gdb.run_gdb_follow(gpath, exe, argv, stdin_file, ctx=ctx, timeout=int(timeout))
+    # Try the believed channel, then the rest. A crashing input fed the wrong way does not
+    # fault, and "no fault reproduced" then means "we fed it wrong" while reading as a real
+    # negative -- the same defect root_cause and build_poc had.
+    tried = []
+    for m in [mode] + [x for x in MODES if x != mode]:
+        argv, stdin_file = _deliver(m)
+        ctx.progress(msg=f"detonating entry under gdb (follow-fork/exec, {m})")
+        cap = gdb.run_gdb_follow(gpath, exe, argv, stdin_file, ctx=ctx, timeout=int(timeout))
+        tried.append(m)
+        if cap.get("ok") and cap.get("signal_name"):
+            mode = m
+            break
+    argv, stdin_file = _deliver(mode)
 
     if not cap.get("ok") or not cap.get("signal_name"):
         ctx.emit("multidebug.done", payload={
             "supported": True, "multiproc": cap.get("multiproc", False),
-            "note": "no fault reproduced under the debugger: " + str(cap.get("reason", ""))})
-        ctx.progress(pct=100, msg="no fault reproduced")
+            "input_modes_tried": tried,
+            "note": ("no fault reproduced under the debugger via any of "
+                     + ", ".join(tried) + ": " + str(cap.get("reason", "")))})
+        ctx.progress(pct=100, msg="no fault reproduced (tried %s)" % ", ".join(tried))
         return {}
 
     # which component crashed -- match the crashing image to a case target

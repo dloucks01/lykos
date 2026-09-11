@@ -85,3 +85,38 @@ def test_the_other_modes_are_unchanged():
 def test_a_script_reproducer_still_wins():
     sh = bundle._runner("arg", [], "SIGSEGV", run_cmd="python3 ./exploit.py").decode()
     assert "python3 ./exploit.py" in sh and "cat ./input.bin" not in sh
+
+
+# ---------------------------------------------------------------- every argv path, not one
+# The raw `payload.decode("latin-1")` shape appeared in FOUR places. Fixing it in the capture
+# helpers left three others: synthesize_poc, multi_debug and build_poc each built argv their
+# own way, and each raised "embedded null byte" on any payload carrying an address -- which is
+# every synthesized overflow and every L2/L3 confirmation payload. The symptom was never an
+# error: it was "no crash from 42 synthesized inputs" on ncompress, whose argv-only overflow
+# was already confirmed to L2.
+def test_the_synthesized_delivery_goes_through_argv_arg():
+    import inspect
+
+    from lykos.analyze.poc import synthesize_stage
+    src = inspect.getsource(synthesize_stage._deliver)
+    assert "argv_arg" in src, "a synthesized payload always carries a NUL-bearing sentinel"
+    assert 'payload.decode("latin-1")' not in src
+
+
+def test_multidebug_delivery_goes_through_argv_arg():
+    import inspect
+
+    from lykos.analyze.debug import multidebug
+    src = inspect.getsource(multidebug.multi_debug_stage)
+    assert "argv_arg" in src
+    assert 'input_bytes.decode("latin-1")' not in src
+
+
+def test_a_sentinel_payload_survives_argv_delivery():
+    """The end-to-end property all three needed: the control slot arrives intact."""
+    from lykos.analyze.dynamic import sandbox
+    from lykos.analyze.poc import primitive
+    payload = primitive.control_input(1040, 1200, 8, "little")
+    delivered = sandbox.argv_arg(payload, truncate=True).encode("latin-1")
+    assert len(delivered) > 1040, "truncation must not cut before the control slot"
+    assert delivered[:1040] == payload[:1040]
