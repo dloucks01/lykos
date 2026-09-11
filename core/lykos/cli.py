@@ -103,6 +103,14 @@ def build_parser() -> argparse.ArgumentParser:
     ag.add_argument("--out", default=None, help="write the JSON report here")
     ag.set_defaults(func=_cmd_archgate)
 
+    rg = sub.add_parser("realgate",
+                        help="full-chain gate: detect -> PoC -> attribution on a real program")
+    rg.add_argument("--timeout", type=float, default=30.0, help="per-detonation timeout")
+    rg.add_argument("--only", default=None,
+                    help="comma-separated case labels to check (default: all)")
+    rg.add_argument("--out", default=None, help="write the JSON report here")
+    rg.set_defaults(func=_cmd_realgate)
+
     db2 = sub.add_parser("dashboard", help="render the detection-quality regression dashboard")
     db2.add_argument("--history", default=None,
                      help="history file to read (default: eval-history.jsonl)")
@@ -125,6 +133,25 @@ def _cmd_archgate(args: argparse.Namespace) -> int:
                        progress=lambda m: print(m, file=sys.stderr, flush=True))
     print(archgate.table(rep))
     passed, verdict, reason = archgate.gate(rep)
+    if args.out:
+        Path(args.out).write_text(json.dumps(rep, indent=2))
+        print(f"report written to {args.out}", file=sys.stderr)
+    print(f"\nGATE: {verdict} -- {reason}", file=sys.stderr)
+    return 0 if passed else 1
+
+
+def _cmd_realgate(args: argparse.Namespace) -> int:
+    import json
+
+    from .eval import realgate
+    cases = realgate.MATRIX
+    if args.only:
+        want = {x.strip() for x in args.only.split(",") if x.strip()}
+        cases = [c for c in cases if c.label in want]
+    rep = realgate.run(cases, timeout=args.timeout,
+                       progress=lambda m: print(m, file=sys.stderr, flush=True))
+    print(realgate.table(rep))
+    passed, verdict, reason = realgate.gate(rep)
     if args.out:
         Path(args.out).write_text(json.dumps(rep, indent=2))
         print(f"report written to {args.out}", file=sys.stderr)

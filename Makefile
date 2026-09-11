@@ -86,12 +86,18 @@ eval-gate:
 arch-gate:
 	$(PY) -m lykos archgate
 
+# The full chain on a program that behaves like real software: detect -> PoC ladder ->
+# crash attribution, with NO stage told how to feed the target and the produced bundle
+# actually run. The other gates each cover a slice and leave the join uncovered.
+real-gate:
+	$(PY) -m lykos realgate
+
 # Render the detection-quality regression dashboard from the recorded history.
 dashboard:
 	$(PY) -m lykos dashboard --html eval-dashboard.html
 
 # Full release bar: code checks + packaged-artifact verify + detection-quality gate.
-release: ci verify eval-gate arch-gate
+release: ci verify eval-gate arch-gate real-gate
 	@echo "release gate complete"
 
 clean:
