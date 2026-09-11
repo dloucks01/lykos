@@ -29,6 +29,19 @@ def locate_afl(config: Optional[str] = None) -> Optional[Path]:
     return Path(w) if w else None
 
 
+def locate_qemu_trace(afl: Path) -> Optional[Path]:
+    """afl-qemu-trace, which `-Q` (binary-only) mode requires.
+
+    Shipped separately from afl-fuzz -- Ubuntu's afl++ package does NOT include it, it comes
+    from AFL++'s build-qemu-support.sh. Without it `-Q` dies at the fork-server handshake.
+    """
+    cand = Path(afl).parent / "afl-qemu-trace"
+    if cand.exists():
+        return cand
+    found = shutil.which("afl-qemu-trace")
+    return Path(found) if found else None
+
+
 def run_campaign(afl: Path, exe, seeds_dir, out_dir, *, seconds: int = 30,
                  mode: str = "file", qemu: bool = True):
     target = [str(exe)] + (["@@"] if mode == "file" else [])
@@ -43,6 +56,28 @@ def run_campaign(afl: Path, exe, seeds_dir, out_dir, *, seconds: int = 30,
         "AFL_BENCH_JUST_ONE": "0",
     })
     return subprocess.run(cmd, env=env, capture_output=True, timeout=int(seconds) + 90)
+
+
+# afl-fuzz exits 0 after printing these, so the return code alone does not tell you it failed
+_ABORTED = (b"PROGRAM ABORT", b"Fork server handshake failed",
+            b"handshake with the injected code")
+
+
+def campaign_failed(proc) -> Optional[str]:
+    """A one-line reason the campaign did not actually fuzz, or None if it ran.
+
+    afl-fuzz can abort having produced no queue and no crashes, and STILL exit 0. Reading
+    only the crash directory then reports a clean "0 crashes" run that never executed the
+    target once -- which is indistinguishable from "this binary has no bugs".
+    """
+    err = (proc.stderr or b"") + (proc.stdout or b"")
+    for marker in _ABORTED:
+        if marker in err:
+            tail = err.split(b"PROGRAM ABORT")[-1][:200].decode("utf-8", "replace").strip()
+            return f"afl-fuzz aborted: {tail or marker.decode()}"
+    if proc.returncode not in (0, None):
+        return f"afl-fuzz exited {proc.returncode}"
+    return None
 
 
 def harvest_crashes(out_dir) -> list:
