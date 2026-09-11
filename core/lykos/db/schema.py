@@ -301,4 +301,22 @@ INSERT INTO finding_verdict(finding_id, channel, run_id, state, severity, confid
   SELECT id, COALESCE(detector, 'legacy'), NULL, state, severity, confidence, updated_at
     FROM finding;
 """),
+    Migration(version=13, name="finding_site_verdicts", sql=r"""
+-- A finding is a defect and its sites are the places it occurs -- but every verdict the
+-- analysis computes is about ONE PLACE. bounds proves a particular copy bounded, a dominating
+-- guard bounds a particular index, crash attribution proves a particular instruction. All of
+-- that was being written as prose into `detail` and then collapsed to a single badge on the
+-- finding.
+--
+-- The cost was overclaiming. jhead's poc-backed CWE-125 has 99 sites and exactly ONE of them
+-- is proven -- the instruction the crash landed on -- yet all 99 carried the identical detail
+-- string, so nothing in the data said which. A 99-site finding with one proven site rendered
+-- exactly like one with 99.
+--
+-- Sites now carry their own state and verdict, so they can be ranked within the finding and
+-- the finding can say "1 of 99 proven" instead of a flat badge.
+ALTER TABLE finding_site ADD COLUMN state TEXT;
+ALTER TABLE finding_site ADD COLUMN confidence REAL;
+ALTER TABLE finding_site ADD COLUMN verdict TEXT;
+"""),
 ]

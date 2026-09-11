@@ -113,6 +113,8 @@ def detect_stage(ctx) -> dict:
         if c["detector"] == "dangerous_api" and c.get("site_addr") in tainted_sites:
             c["state"] = "corroborated"
             c["confidence"] = max(c["confidence"], 0.8)
+            c["site_state"] = "corroborated"      # THIS site is the one taint reaches
+            c["site_confidence"] = 0.8
             c["evidence"].append({"channel": "taint-dataflow",
                                   "detail": "tainted value reaches a sink argument "
                                             "(intra-procedural P-Code taint)"})
@@ -132,6 +134,7 @@ def detect_stage(ctx) -> dict:
         # high-severity stack smash. Both of gzip 1.3.5's CWE-121 candidates were that.
         if not v or c.get("detector") not in ("dangerous_api", "stack_frame"):
             continue
+        c["site_verdict"] = v["verdict"]          # the ruling is about THIS place
         if v["verdict"] == bounds.SAFE:
             # provably bounded: demote out of the headline, keep as inventory with the reason
             c["severity"] = "info"

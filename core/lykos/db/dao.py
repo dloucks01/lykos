@@ -518,22 +518,78 @@ class FindingDAO(BaseDAO):
             if not row:
                 self._record_verdict(fid, c, now)
             if c.get("function_addr") or c.get("site_addr"):
-                self.conn.execute(
-                    "INSERT OR IGNORE INTO finding_site(id,finding_id,function_addr,"
-                    "site_addr,detail,created_at) VALUES(?,?,?,?,?,?)",
-                    (new_id(), fid, c.get("function_addr"), c.get("site_addr"),
-                     c.get("site_detail"), now))
+                self._record_site(fid, c, now)
             self.conn.execute("COMMIT")
         except Exception:
             self.conn.execute("ROLLBACK"); raise
 
-    def sites(self, finding_id: str) -> list[dict]:
-        """Every place this defect occurs, oldest first."""
+    def _record_site(self, fid: str, c: dict, now: int) -> None:
+        """Record one occurrence, keeping the STRONGEST verdict any channel has given it.
+
+        Every verdict the analysis computes is about one PLACE -- bounds proves a particular
+        copy bounded, a dominating guard bounds a particular index, crash attribution proves a
+        particular instruction -- and all of it used to collapse into a single badge on the
+        finding. jhead's poc-backed CWE-125 has 99 sites and exactly one is proven.
+
+        A channel may only RAISE a site's state, the same asymmetry the finding row uses, and
+        a channel that says nothing about a field cannot blank what another established.
+        """
+        fa, sa = c.get("function_addr"), c.get("site_addr")
+        prev = self.conn.execute(
+            "SELECT id, state FROM finding_site WHERE finding_id=? AND function_addr IS ? "
+            "AND site_addr IS ?", (fid, fa, sa)).fetchone()
+        want = c.get("site_state")
+        if prev is None:
+            self.conn.execute(
+                "INSERT INTO finding_site(id,finding_id,function_addr,site_addr,detail,"
+                "created_at,state,confidence,verdict) VALUES(?,?,?,?,?,?,?,?,?)",
+                (new_id(), fid, fa, sa, c.get("site_detail"), now, want,
+                 c.get("site_confidence"), c.get("site_verdict")))
+            return
+        keep = (want is not None
+                and _rank(FINDING_STATES, want) >= _rank(FINDING_STATES, prev["state"] or ""))
+        sets, args = [], []
+        for col, val in (("detail", c.get("site_detail")),
+                         ("verdict", c.get("site_verdict")),
+                         ("confidence", c.get("site_confidence"))):
+            if val is not None:
+                sets.append(f"{col}=?")
+                args.append(val)
+        if keep:
+            sets.append("state=?")
+            args.append(want)
+        if not sets:
+            return
+        self.conn.execute(f"UPDATE finding_site SET {', '.join(sets)} WHERE id=?",
+                          (*args, prev["id"]))
+
+    def proven_sites(self, target_id: str) -> dict:
+        """finding_id -> how many of its sites are individually proven.
+
+        The difference between "this defect is PoC-backed" and "one of its 99 occurrences is".
+        """
         rows = self.conn.execute(
-            "SELECT function_addr, site_addr, detail FROM finding_site "
-            "WHERE finding_id=? ORDER BY created_at, rowid", (finding_id,)).fetchall()
+            "SELECT fs.finding_id AS fid, COUNT(*) AS n FROM finding_site fs "
+            "JOIN finding f ON f.id=fs.finding_id WHERE f.target_id=? AND fs.state=? "
+            "GROUP BY fs.finding_id", (target_id, "poc-backed")).fetchall()
+        return {r["fid"]: r["n"] for r in rows}
+
+    def sites(self, finding_id: str) -> list[dict]:
+        """Every place this defect occurs, WORST FIRST.
+
+        Oldest-first was the only order available when a site was just an address; now that a
+        site carries a verdict, the proven occurrence belongs at the top rather than wherever
+        the decompiler happened to walk it.
+        """
+        rows = self.conn.execute(
+            "SELECT function_addr, site_addr, detail, state, confidence, verdict "
+            "FROM finding_site WHERE finding_id=? ORDER BY "
+            "  CASE state WHEN 'poc-backed' THEN 0 WHEN 'confirmed' THEN 1 "
+            "             WHEN 'corroborated' THEN 2 ELSE 3 END, "
+            "  COALESCE(confidence,0) DESC, created_at, rowid", (finding_id,)).fetchall()
         return [{"function_addr": r["function_addr"], "site_addr": r["site_addr"],
-                 "detail": r["detail"]} for r in rows]
+                 "detail": r["detail"], "state": r["state"],
+                 "confidence": r["confidence"], "verdict": r["verdict"]} for r in rows]
 
     def _record_verdict(self, fid: str, c: dict, now: int) -> None:
         """Store what THIS channel currently says about the finding.

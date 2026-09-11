@@ -443,6 +443,21 @@ actionable.
   reproduces it and faults at exactly `0x40bf0b`; attribution promotes that finding to
   `poc-backed` at 0.97 with the site named. Static prediction → dynamic proof, on unmodified
   Debian source.
+- **[DONE] Verdicts are about a PLACE** (migration 13, `finding_site.state/verdict/confidence`).
+  Moving the board to defect grain was right — it collapsed jhead 24 → 19 findings — but every
+  ruling the analysis makes is about ONE occurrence: bounds proves a particular copy bounded, a
+  dominating guard bounds a particular index, crash attribution proves a particular instruction.
+  All of it was written as prose into `detail` and then collapsed into a single badge.
+  The cost was overclaiming. jhead's `poc-backed` CWE-125 has **99 sites and exactly one is
+  proven** — the instruction the crash landed on — yet all 99 carried the identical detail
+  string, so nothing in the data said which, and a 99-site finding with one proven site
+  rendered exactly like one with 99.
+  Sites now carry their own state, verdict and confidence; a channel may only RAISE a site (the
+  same asymmetry the finding row uses) and a channel that says nothing about a field cannot
+  blank what another established. `sites()` returns them worst-first, `proven_sites()` counts
+  them, and the board reads `×99 / 1 proven` with the proven occurrence at the top of the list
+  marked PROVEN. bounds writes its verdict per site, taint marks the site it actually reaches,
+  and attribution marks the instruction it proved.
 - **[PLANNED] `tainted_deref` cannot say which dereference is unchecked.** It reports where
   attacker data reaches a pointer (122 sites on jhead), not which of those lack a bound. The
   index needs the same treatment the copy lengths got — `guard_bound` on the OFFSET rather than

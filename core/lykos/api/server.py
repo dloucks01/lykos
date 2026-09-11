@@ -220,7 +220,9 @@ class Handler(BaseHTTPRequestHandler):
                     fd = FindingDAO(s.conn)
                     fs = fd.list_by_target(m.group(1))
                     counts = fd.site_counts(m.group(1))
-                    return self._json([_finding(x, site_count=counts.get(x.id, 0))
+                    prov = fd.proven_sites(m.group(1))
+                    return self._json([_finding(x, site_count=counts.get(x.id, 0),
+                                                proven=prov.get(x.id, 0))
                                        for x in fs])
                 finally:
                     s.close()
@@ -400,11 +402,13 @@ class Handler(BaseHTTPRequestHandler):
                     best_poc[t.id] = max(lvls)          # "L2" > "L1" lexicographically
             out = []
             fd = FindingDAO(s.conn)
-            counts = {}
+            counts, proven = {}, {}
             for tid in tmap:
                 counts.update(fd.site_counts(tid))
+                proven.update(fd.proven_sites(tid))
             for f in fd.list_by_case(cid):
-                d = _finding(f, site_count=counts.get(f.id, 0))
+                d = _finding(f, site_count=counts.get(f.id, 0),
+                             proven=proven.get(f.id, 0))
                 t = tmap.get(f.target_id)
                 d["target_name"] = t.filename if t else None
                 d["target_arch"] = t.arch if t else None
@@ -830,7 +834,7 @@ def _dynresult(d):
             "duration_ms": d.duration_ms, "note": d.note, "created_at": d.created_at}
 
 
-def _finding(f, sites=None, site_count=None):
+def _finding(f, sites=None, site_count=None, proven=0):
     """Serialize a finding. `sites` is the list of places the defect occurs; `site_count` is
     the cheap aggregate for list views. A finding is a DEFECT -- the sites are evidence."""
     d = {"id": f.id, "target_id": f.target_id, "case_id": f.case_id, "cwe": f.cwe,
@@ -840,6 +844,10 @@ def _finding(f, sites=None, site_count=None):
     if sites is not None:
         d["sites"] = sites
     d["site_count"] = len(sites) if sites is not None else (site_count or 0)
+    # How many of those places are individually PROVEN. A poc-backed finding with 99 sites and
+    # one proven occurrence must not read like one where all 99 are.
+    d["proven_sites"] = len([s for s in sites if s.get("state") == "poc-backed"]) \
+        if sites is not None else (proven or 0)
     return d
 
 
