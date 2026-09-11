@@ -226,7 +226,7 @@ def _define(taint, key, tainted):
         taint.add(k) if tainted else taint.discard(k)
 
 
-def _apply(taint, ops, bases=(), aliases=None):
+def _apply(taint, ops, bases=(), aliases=None, mem_out=None):
     slots = {}                       # varnode key -> frame-slot key (this instruction only)
     consts = {}                      # varnode key -> literal value  (this instruction only)
     aliases = {} if aliases is None else aliases         # reg -> (base, off), per BLOCK
@@ -255,6 +255,8 @@ def _apply(taint, ops, bases=(), aliases=None):
                 if dst is not None:
                     val = _key(toks[3])
                     _define(taint, dst, val is not None and val in taint)
+                elif mem_out is not None:
+                    _note_access(mem_out, "store", toks[2], taint, slots)
             continue
 
         if outk is None:
@@ -268,8 +270,23 @@ def _apply(taint, ops, bases=(), aliases=None):
             if src is not None:
                 _define(taint, outk, src in taint)
                 continue
+            if mem_out is not None:
+                _note_access(mem_out, "load", toks[2], taint, slots)
 
         _define(taint, outk, any(k in taint for k in ins))
+
+
+def _note_access(mem_out, kind, addr_tok, taint, slots):
+    """Record a memory access whose address is attacker-influenced.
+
+    A recovered frame slot is excluded by the caller: its address is a fixed displacement,
+    not something an input can move. What is left is a dereference through a pointer the
+    input had a hand in computing, which is the shape of every out-of-bounds read and write
+    -- and the shape the rule channel cannot see at all, because it is not a CALL.
+    """
+    ak = _key(addr_tok)
+    if ak is not None and ak in taint:
+        mem_out.append({"kind": kind, "addr_key": ak})
 
 
 def _has_abi(abi):
@@ -345,7 +362,7 @@ def build_callmap(call_edges):
 
 
 def _run(ir, abi, callmap, dstmap, func_addrs, entry_params, ret_tainted, *,
-         seed_sources=True, extmap=None, ext_out=None):
+         seed_sources=True, extmap=None, ext_out=None, mem_out=None):
     """Analyze one function. Returns (flagged_sink_sites, return_is_tainted, callee_contribs).
 
     Cross-binary hooks (Phase 8, doc 17.2):
@@ -381,7 +398,7 @@ def _run(ir, abi, callmap, dstmap, func_addrs, entry_params, ret_tainted, *,
             pre.add(("stack", stack_params["base"],
                      stack_params["offset0"] + stack_params["stride"] * i))
 
-    def transfer(cur, instr, flagged, contribs, pushes, aliases):
+    def transfer(cur, instr, flagged, contribs, pushes, aliases, collect=None):
         addr = instr.get("addr")
         ext = callmap.get(addr)
         dst = dstmap.get(addr)
@@ -396,7 +413,10 @@ def _run(ir, abi, callmap, dstmap, func_addrs, entry_params, ret_tainted, *,
             if esym and any(argt):
                 ext_out.add(esym)
         tainted_params = {i for i, t in enumerate(argt) if t} if internal else set()
-        _apply(cur, instr.get("pcode", []), abi.get("frame", ()), aliases)
+        seen = [] if collect is not None else None
+        _apply(cur, instr.get("pcode", []), abi.get("frame", ()), aliases, seen)
+        for acc in (seen or ()):
+            collect.append({**acc, "site_addr": addr})
         if stack_call is not None:
             pushed = _push_taint(instr.get("pcode", []), cur, stack_call["base"])
             if pushed is not None:
@@ -439,8 +459,11 @@ def _run(ir, abi, callmap, dstmap, func_addrs, entry_params, ret_tainted, *,
         if a == entry:
             cur |= pre
         pushes, aliases = [], {}
+        acc = [] if mem_out is not None else None
         for instr in by_addr[a]["instructions"]:
-            transfer(cur, instr, flagged, contribs, pushes, aliases)
+            transfer(cur, instr, flagged, contribs, pushes, aliases, acc)
+        for x in (acc or ()):
+            mem_out.append({**x, "block_addr": a})
 
     exits = [a for a in order if not by_addr[a].get("succ")] or order
     ret_bool = any(("reg", r) in OUT[a] for a in exits for r in retregs)
@@ -456,7 +479,7 @@ def analyze_function(ir, callmap, arch):
     return flagged
 
 
-def analyze_program(func_irs, call_edges, arch, *, entry_seeds=None):
+def analyze_program(func_irs, call_edges, arch, *, entry_seeds=None, mem_out=None):
     """Inter-procedural: fixpoint over the call graph. Returns all flagged sink sites.
 
     `entry_seeds` maps an entry-point function addr -> the parameter indices that arrive
@@ -464,6 +487,11 @@ def analyze_program(func_irs, call_edges, arch, *, entry_seeds=None):
     analysis: they are handed to main by the loader, so unlike SOURCES input there is no
     call site to observe. Without a seed an argv-driven program has no taint origin and
     nothing can be corroborated.
+
+    `mem_out`, when given, also collects every attacker-influenced memory access -- a
+    dereference through a pointer the input helped compute. Those are invisible to every
+    other detector, which all key on CALLS, and they are where the out-of-bounds reads and
+    writes live.
     """
     ak = _arch_key(arch)
     if not ak or not _has_abi(ARCH_ABI[ak]):
@@ -506,9 +534,12 @@ def analyze_program(func_irs, call_edges, arch, *, entry_seeds=None):
 
     flagged = set()
     for f in func_addrs:
+        acc = [] if mem_out is not None else None
         ff, _, _ = _run(func_irs[f], abi, callmap, dstmap, func_addrs,
-                        entry_params[f], ret_tainted)
+                        entry_params[f], ret_tainted, mem_out=acc)
         flagged |= ff
+        for x in (acc or ()):
+            mem_out.append({**x, "function_addr": f})
     return flagged
 
 
