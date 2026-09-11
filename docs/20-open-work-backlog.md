@@ -443,6 +443,27 @@ actionable.
   reproduces it and faults at exactly `0x40bf0b`; attribution promotes that finding to
   `poc-backed` at 0.97 with the site named. Static prediction → dynamic proof, on unmodified
   Debian source.
+- **[DONE] Sweep complete — all 29 stages exercised.** Batch 4 covered the two firmware
+  stages and, more usefully, went back to verify the stages that had reported ZERO. The
+  `extract_secrets` lesson was that a zero can mean broken, so each was re-run against a target
+  that actually has the bug:
+  `heap_check` on a file-driven heap overflow → **CWE-122 critical, `heap-buffer-overflow`**,
+  corroborated. `synthesize_injection` on `system("echo " + argv[1])` → **CWE-78 critical,
+  poc-backed, confirmed via `arg`** (the channel inference picking the right one). Both zeros
+  on ncompress were therefore correct, not silent failures.
+  `firmware_carve` on a synthesised image → 3 signatures, carved the embedded ELF into a new
+  case target, and filed **CWE-321 embedded private key**. `firmware_rehost` refuses clearly
+  ("supports ARM Cortex-M images, no reset vector table detected"), which is the honest answer
+  for a non-Cortex-M blob.
+- **[DONE] "Not applicable" is no longer reported as an error.** `boundary_fuzz` emitted
+  `{'error': 'no channel'}` and `whole_system` `{'error': 'no scenario'}` for a single binary,
+  which is a stage correctly having nothing to do — not a stage that broke. Both now report
+  `applicable: False` with a note saying what a case would need. Same conflation "no fault
+  reproduced" made.
+- **[PLANNED] `debug_monitor` mostly watches the dynamic loader** — its recorded calls on
+  ncompress are nearly all `_dl_new_object` and friends. `winmonitor` already filters to
+  callers inside the exe's own mapping; the Linux path does not, so its call log is dominated
+  by ld.so startup before the program runs.
 - **[DONE] Sweep, batch 3 — the synthesize family, `multi_debug` and the multi-target stages.**
   `cross_taint`, `ipc_model`, `link_case` and `synthesize_secret` all reported honestly for a
   single binary with nothing to link. Two were broken, both by the same root cause in different

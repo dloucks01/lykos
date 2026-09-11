@@ -90,10 +90,12 @@ def whole_system_stage(ctx) -> dict:
     if not entry or not services:
         entry, services, channel = _scenario_from_ipc(ctx, tdao)
     if not entry or not services:
-        ctx.emit("system.done", payload={"error": "no scenario", "crashes": 0})
-        ctx.progress(pct=100, msg="no whole-system scenario (need an entry + service or an "
-                                  "IPC edge)")
-        return {"metrics": {"error": "no scenario"}}
+        # Not applicable, not an error: one binary is not a whole system.
+        ctx.emit("system.done", payload={"applicable": False, "crashes": 0,
+                 "note": "no whole-system scenario on this case (needs an entry plus a "
+                         "service, or an IPC edge between linked components)"})
+        ctx.progress(pct=100, msg="not applicable: no whole-system scenario")
+        return {"metrics": {"applicable": False}}
 
     comps = _components(ctx, entry, services)
     timeout = float(p.get("exec_timeout", 6))
