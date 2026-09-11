@@ -70,6 +70,14 @@ class FormatModel:
                 cov = f.get("covers")
                 if cov and cov != "rest":
                     covered[cov] = (val, pos)
+                ln = f.get("length_of")
+                if ln and ln not in covered:
+                    # `length_of` sizes the blob exactly, where `covers` spans from the length
+                    # field itself. Both have to bound the blob on the way back IN, or the
+                    # blob eats the remainder and nothing can follow it -- a GIF's sub-block
+                    # is followed by the block terminator and the trailer, which is what
+                    # decides whether the file is a GIF at all.
+                    covered[ln] = (val, None)
                 seen[f.get("name")] = val
                 fields.append({"f": f, "val": val})
                 pos += sz
@@ -100,7 +108,10 @@ class FormatModel:
                 name = f.get("name")
                 if name in covered:
                     total, start = covered[name]
-                    stop = min(max(start + int(total), pos), len(data))
+                    # `length_of` sizes the blob from its own start; `covers` spans from the
+                    # length field itself, so the blob ends at that field's start plus the span
+                    stop = pos + int(total) if start is None else max(start + int(total), pos)
+                    stop = min(max(stop, pos), len(data))
                 else:
                     stop = len(data)
                 fields.append({"f": f, "val": data[pos:stop]})
@@ -127,27 +138,79 @@ class FormatModel:
         return bytes(out)
 
 
-def _fix_covers(model, fields) -> None:
-    """Recompute every `covers` length so the structure stays parseable.
+def _layout(model, fields, pos=0, out=None, names=None):
+    """Absolute (offset, length) of every field, including nested ones, plus a name index.
 
-    `covers: "rest"` spans to the end of the input; `covers: <field name>` spans from the
-    length field's own start through the end of that field, which is what a JPEG segment
-    length actually means.
+    Derived fields have to be computed over the whole tree, not one scope: a ZIP's central
+    directory entry names a size that lives in the local header, and the end-of-central-
+    directory record names an offset into the file, not into its own group.
     """
-    idx = {fd["f"].get("name"): j for j, fd in enumerate(fields)}
-    for i, fd in enumerate(fields):
-        cov = fd["f"].get("covers")
-        if not cov:
-            continue
-        start = len(model.serialize(fields[:i]))
-        if cov == "rest":
-            stop = len(model.serialize(fields))
+    out = {} if out is None else out
+    names = {} if names is None else names
+    for fd in fields:
+        t, start = fd["f"]["type"], pos
+        if t == "group":
+            _, _, pos = _layout(model, fd["val"], pos, out, names)
+        elif t == "array":
+            for rec in fd["val"]:
+                _, _, pos = _layout(model, rec, pos, out, names)
         else:
-            j = idx.get(cov)
-            if j is None:
+            pos += len(model.serialize([fd]))
+        out[id(fd)] = (start, pos - start)
+        nm = fd["f"].get("name")
+        if nm and nm not in names:
+            names[nm] = fd
+    return out, names, pos
+
+
+def _every_field(fields):
+    for fd in fields:
+        yield fd
+        t = fd["f"]["type"]
+        if t == "group":
+            yield from _every_field(fd["val"])
+        elif t == "array":
+            for rec in fd["val"]:
+                yield from _every_field(rec)
+
+
+def _fix_covers(model, fields, lengths: bool = False) -> None:
+    """Recompute every derived field so the structure stays parseable.
+
+    `covers: "rest"` spans to the end of the input; `covers: <field>` spans from the length
+    field's own start through the end of that field, which is what a JPEG segment length
+    actually means; `offset_of: <field>` is where that field starts, which is how every
+    archive format finds its directory.
+
+    `length_of` is recomputed only when generating a SEED. During mutation a length that no
+    longer matches what it sizes is the whole point -- driving it is how a length-prefixed
+    parser gets tested -- so the fixup must not quietly put it back.
+    """
+    for _ in range(2):            # an offset depends on lengths that may themselves have moved
+        spans, names, total = _layout(model, fields)
+        for fd in _every_field(fields):
+            f = fd["f"]
+            if f["type"] not in _INT:
                 continue
-            stop = len(model.serialize(fields[:j + 1]))
-        fd["val"] = max(0, stop - start)
+            target = f.get("offset_of") or (f.get("length_of") if lengths else None)
+            if target:
+                mate = names.get(target)
+                if mate is not None:
+                    off, ln = spans[id(mate)]
+                    fd["val"] = off if f.get("offset_of") else ln
+                continue
+            cov = f.get("covers")
+            if not cov:
+                continue
+            start = spans[id(fd)][0]
+            if cov == "rest":
+                stop = total
+            else:
+                mate = names.get(cov)
+                if mate is None:
+                    continue
+                stop = sum(spans[id(mate)])
+            fd["val"] = max(0, stop - start)
 
 
 def seed_for_name(name: str) -> bytes | None:
@@ -191,9 +254,13 @@ def _seed_spec(spec, payload):
             fields.append({"f": f, "val": recs})
         else:
             # the LAST blob gets the format's tail when it declares one (a JPEG's entropy data
-            # and end-of-image marker); earlier blobs get the payload
-            fields.append({"f": f, "val": payload})
-            blobs.append(fields[-1])
+            # and end-of-image marker); earlier blobs get the payload, unless the model gives
+            # one its own value -- a ZIP's "extra field" and comment have to start EMPTY, or
+            # their length fields describe bytes the format says are not there
+            val = f["seed_value"] if "seed_value" in f else payload
+            fields.append({"f": f, "val": _as_bytes(val)})
+            if "seed_value" not in f:
+                blobs.append(fields[-1])
     return fields, blobs
 
 
@@ -205,19 +272,14 @@ def seed_for(model: "FormatModel", payload: bytes = b"A" * 64, tail: bytes = Non
     sample before a campaign can start doing work.
     """
     fields, blobs = _seed_spec(model.spec, payload)
-    # length fields describe the blob they name, so the skeleton parses rather than truncating
-    by_name = {fd["f"].get("name"): fd for fd in fields}
-    for fd in fields:
-        ln = fd["f"].get("length_of")
-        if ln and ln in by_name:
-            fd["val"] = len(_as_bytes(by_name[ln]["val"]))
+
     # `covers: "rest"` is the other length shape real formats use: a JPEG segment length spans
     # the length field itself and everything after it, not one named blob. Getting it wrong is
     # not cosmetic -- the parser reads a short segment and treats the remainder as padding,
     # so the seed never reaches the structure the rest of the model describes.
     if tail is not None and blobs:
         blobs[-1]["val"] = tail
-    _fix_covers(model, fields)
+    _fix_covers(model, fields, lengths=True)
     return model.serialize(fields)
 
 
@@ -313,7 +375,7 @@ class StructMutator:
                 fd["val"] = self.byte.mutate(fd["val"] or b"", ())
         elif t in _INT:
             fd["val"] = self.rng.choice(_EDGE)
-            if fd["f"].get("covers") == "rest":
+            if fd["f"].get("covers") == "rest" or fd["f"].get("offset_of"):
                 return "cover"                          # driving it IS the interesting case
             # A record that says WHERE data is and HOW MUCH of it there is is the classic
             # out-of-bounds read, and it needs both halves at once: jhead survives a GPS entry
@@ -326,8 +388,10 @@ class StructMutator:
                 self._drive_pair(fields, fd, role)
             target = fd["f"].get("length_of")
             if target and self.rng.random() < 0.6:      # coordinate: grow the sized blob to match
+                # a length can now name a GROUP as well -- a ZIP's central-directory size --
+                # and a group's value is its fields, not bytes, so there is nothing to grow
                 blob = self._blob_by_name(fields, target)
-                if blob is not None:
+                if blob is not None and blob["f"]["type"] not in ("group", "array"):
                     want = min(int(fd["val"]), _MAXBLOB)
                     base = bytes(blob["val"] or b"A")
                     blob["val"] = (base * (want // max(1, len(base)) + 1))[:want] if want else base
@@ -422,12 +486,38 @@ _BUILTINS = {
                  # process_DQT and process_DHT, another 69 blocks.
                  {"type": "magic", "value": _JPEG_FRAME},
                  {"type": "blob", "name": "scan"}]},
-    "gif": {"tokens": ("GIF87a", "GIF89a"), "spec": [
-        {"type": "magic", "value": b"GIF89a"},
-        {"type": "u16", "endian": "little", "name": "w"},
-        {"type": "u16", "endian": "little", "name": "h"},
-        {"type": "blob", "name": "data"}]},
-    "bmp": {"tokens": ("BM",), "spec": [
+    # GIF: the real block structure, not just the signature. A stub model (magic, width,
+    # height, payload) generates a seed the target rejects outright -- giflib's gif2rgb
+    # answers "Image of width or height 0" and stops -- so the campaign never reaches the
+    # decoder. This is a complete 35-byte GIF89a: screen descriptor, global colour table, an
+    # image descriptor and one LZW sub-block, which gif2rgb decodes.
+    "gif": {"tokens": ("GIF87a", "GIF89a"), "seed": b"\x44\x01",
+            "spec": [
+                {"type": "magic", "value": b"GIF89a"},
+                # the screen says how big the canvas is; the image descriptor says how big the
+                # image is, and a decoder that trusts one while indexing the other is the
+                # classic GIF bug -- so both are fields
+                {"type": "u16", "endian": "little", "name": "sw", "seed_value": 1},
+                {"type": "u16", "endian": "little", "name": "sh", "seed_value": 1},
+                # bit 7 set: a global colour table follows, of 2 entries (bits 0-2 = 0)
+                {"type": "u8", "name": "packed", "seed_value": 0x80},
+                {"type": "u8", "name": "bg"},
+                {"type": "u8", "name": "aspect"},
+                {"type": "magic", "value": b"\x00\x00\x00\xff\xff\xff"},
+                {"type": "magic", "value": b"\x2c"},              # image separator
+                {"type": "u16", "endian": "little", "name": "left"},
+                {"type": "u16", "endian": "little", "name": "top"},
+                {"type": "u16", "endian": "little", "name": "iw", "seed_value": 1},
+                {"type": "u16", "endian": "little", "name": "ih", "seed_value": 1},
+                {"type": "u8", "name": "ipacked"},
+                {"type": "u8", "name": "lzwmin", "seed_value": 2},
+                {"type": "u8", "name": "blen", "length_of": "lzw"},
+                {"type": "blob", "name": "lzw"},
+                {"type": "magic", "value": b"\x00\x3b"}]},        # terminator + trailer
+    # NOT "BM": a two-character token matches as a substring of anything, and it picked BMP
+    # for unzip, which then fuzzed a ZIP tool with bitmaps. A format's token has to be a
+    # string only a parser for that format would carry.
+    "bmp": {"tokens": ("BITMAPINFOHEADER", "BITMAPFILEHEADER", ".bmp"), "spec": [
         {"type": "magic", "value": b"BM"},
         {"type": "u32", "endian": "little", "name": "size", "length_of": "data"},
         {"type": "blob", "name": "data"}]},
@@ -436,11 +526,56 @@ _BUILTINS = {
         {"type": "u32", "endian": "little", "name": "size", "length_of": "data"},
         {"type": "magic", "value": b"WAVE"},
         {"type": "blob", "name": "data"}]},
-    "zip": {"tokens": ("PK\x03\x04", "End of central directory"), "spec": [
-        {"type": "magic", "value": b"PK\x03\x04\x14\x00\x00\x00\x00\x00"},
-        {"type": "u32", "endian": "little", "name": "crc"},
-        {"type": "u32", "endian": "little", "name": "csize", "length_of": "data"},
-        {"type": "blob", "name": "data"}]},
+    # ZIP: a local header is not an archive. Every tool finds the files through the central
+    # directory, located by absolute offset from the end-of-central-directory record, so a
+    # model that stops at the local header generates something unzip refuses before parsing
+    # anything: "End-of-central-directory signature not found". Described in full, the
+    # directory's offsets and lengths are derived -- which is what makes them mutable: a
+    # directory that points at the wrong place is a real archive with one field wrong, not
+    # a file the parser discards.
+    # byte magic never survives into a string table, and unzip writes the phrase hyphenated,
+    # so the old tokens matched nothing at all and the strongest accidental match won instead
+    "zip": {"tokens": ("End-of-central-directory", "central directory", "zipfile"), "seed": b"A",
+            "spec": [
+                {"type": "group", "name": "local", "spec": [
+                    {"type": "magic", "value": b"PK\x03\x04"},
+                    {"type": "magic", "value": b"\x14\x00\x00\x00\x00\x00"},
+                    {"type": "magic", "value": b"\x00\x00\x00\x00"},      # mod time, date
+                    {"type": "u32", "endian": "little", "name": "crc"},
+                    {"type": "u32", "endian": "little", "name": "csize", "length_of": "data"},
+                    {"type": "u32", "endian": "little", "name": "usize", "length_of": "data"},
+                    {"type": "u16", "endian": "little", "name": "namelen",
+                     "length_of": "lname"},
+                    {"type": "u16", "endian": "little", "name": "extralen",
+                     "length_of": "lextra"},
+                    {"type": "blob", "name": "lname"},
+                    {"type": "blob", "name": "lextra", "seed_value": b""},
+                    {"type": "blob", "name": "data"}]},
+                {"type": "group", "name": "cd", "spec": [
+                    {"type": "magic", "value": b"PK\x01\x02"},
+                    {"type": "magic", "value": b"\x14\x00\x14\x00\x00\x00\x00\x00"},
+                    {"type": "magic", "value": b"\x00\x00\x00\x00"},      # mod time, date
+                    {"type": "u32", "endian": "little", "name": "ccrc"},
+                    {"type": "u32", "endian": "little", "name": "ccsize", "length_of": "data"},
+                    {"type": "u32", "endian": "little", "name": "cusize", "length_of": "data"},
+                    {"type": "u16", "endian": "little", "name": "cnamelen",
+                     "length_of": "cname"},
+                    {"type": "u16", "endian": "little", "name": "cextralen",
+                     "length_of": "cextra"},
+                    {"type": "u16", "endian": "little", "name": "ccommentlen",
+                     "length_of": "ccomment"},
+                    {"type": "magic", "value": b"\x00\x00\x00\x00\x00\x00\x00\x00"},
+                    # where the file's local header is -- derived, and therefore drivable
+                    {"type": "u32", "endian": "little", "name": "localoff",
+                     "offset_of": "local"},
+                    {"type": "blob", "name": "cname"},
+                    {"type": "blob", "name": "cextra", "seed_value": b""},
+                    {"type": "blob", "name": "ccomment", "seed_value": b""}]},
+                {"type": "magic", "value": b"PK\x05\x06"},
+                {"type": "magic", "value": b"\x00\x00\x00\x00\x01\x00\x01\x00"},
+                {"type": "u32", "endian": "little", "name": "cdsize", "length_of": "cd"},
+                {"type": "u32", "endian": "little", "name": "cdoff", "offset_of": "cd"},
+                {"type": "magic", "value": b"\x00\x00"}]},
 }
 
 
@@ -465,7 +600,9 @@ def detect_format(strings) -> str | None:
     blob = "\n".join(s for s in strings if s)
     best, score = None, 0
     for name, entry in _BUILTINS.items():
-        hits = sum(1 for t in entry["tokens"] if t and t in blob)
+        # a longer token is stronger evidence: "GIF89a" in a binary means something, two
+        # characters mean nothing, so weight each hit by the length of what matched
+        hits = sum(len(t) for t in entry["tokens"] if t and t in blob)
         if hits > score:
             best, score = name, hits
     return best

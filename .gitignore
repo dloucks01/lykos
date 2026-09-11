@@ -10,3 +10,6 @@ eval-history.jsonl
 eval-dashboard.html
 examples/re-corpus/bin/*
 !examples/re-corpus/bin/manifest.tsv
+examples/vuln-targets/bin/*
+!examples/vuln-targets/bin/manifest.tsv
+examples/vuln-targets/src/
