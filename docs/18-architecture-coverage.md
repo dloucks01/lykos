@@ -190,6 +190,58 @@ These vary by ISA and silently break analysis/PoC if hardcoded to x86:
 - **Tier 3** rides the firmware track (Phase 8, doc 17.5).
 - **Tier 4 / custom ISA / bytecode** are additive plugin efforts, prioritized by real engagement demand.
 
+## MEASURED bounds + guard reasoning (September 2026)
+
+Ground-truth fixture (`signed/s.c`): ten copy sites whose correct verdict is known from the
+source — four genuinely bounded, three signed-length hazards, one guard that does not protect
+the buffer, one unguarded, one constant. Built at `-O0` for all 13 architectures and scored
+against that truth. `9/9` means every scored site matched.
+
+| arch | score | what is still in the way |
+|---|---|---|
+| x86-64 | **9/9** | — |
+| x86 (32) | **9/9** | stack-passing ABI; PIC puts a call in the guard block |
+| aarch64 | **9/9** | — |
+| arm (Thumb) | **9/9** | — |
+| loongarch | **9/9** | — |
+| m68k | **9/9** | stack-passing ABI |
+| ppc | **9/9** | — |
+| ppc64 (BE) | **9/9** | — |
+| sh | 8/9 | a 4096 immediate comes from a PC-relative constant pool the evaluator cannot read; the site stays `unknown`, which is the correct conservative answer |
+| ppc64le | 2/9 | Ghidra reports the fixture's `char[64]` as four separate 8-byte locals, so the destination SIZE is unreliable. Verdicts are `unknown` rather than wrong — see the frame-headroom rule below |
+| riscv | 0/9 | Ghidra resolved one `memcpy` call edge in the whole binary; the per-site edges never reach the detector, so no site is scored at all |
+| s390 | 0/9 | disassembly recovers **0 functions** (see the end-to-end table above), and there is no `ARCH_ABI` entry |
+| sparcv9 | 2/9 | register windows; the recovered frame reports `frame_size=2223` |
+
+The three failures are all upstream of the bounds pass — call-graph naming, function recovery,
+and frame recovery — not guard reasoning. Where the pass cannot trust its inputs it returns
+`unknown`; no architecture produces a wrong verdict.
+
+**How the condition is read.** Out of P-Code, not off the branch mnemonic. Mnemonic tables are
+an x86 fiction, and the ISAs split three ways:
+
+* **flag registers** (x86, x86-32, aarch64, arm, m68k) — `CF`/`OF`/`SF`/`ZF` are each defined
+  by an explicit comparison, then combined with boolean algebra. x86's `JA` is `!(CF|ZF)` and
+  aarch64's `b.hi` is `CY & !ZR`: the same relation, different algebra, neither readable
+  without evaluating it. `SF != OF` is the signed less-than; `SF` alone is sound only against
+  zero, which is exactly the `n >= 0` idiom.
+* **direct compare** (riscv, loongarch, sh) — no flags. The constant lives in a **register**
+  and the operands are **reversed**: `li a5,0x3f; blt a5,a4` is `63 < n`.
+* **condition bitfield** (ppc, ppc64) — `cmplwi` packs lt/gt/eq into `cr0` with shifts and
+  `bgt` extracts one bit. The unrelated `xer_so` bit is OR'd in from a value the evaluator
+  cannot see, so it tracks which bit POSITIONS are unknown instead of discarding the field.
+
+**Frame coordinates are derived, not tabulated.** `ghidra_offset = base_offset + displacement`,
+where the base's offset from the entry stack pointer is read out of the prologue. One rule,
+three conventions: x86-64 `PUSH RBP; MOV RBP,RSP` gives RBP = -8; aarch64 `stp x29,x30,[sp,#-0x60]!`
+gives SP = -96; loongarch `addi.d fp,sp,0x60` gives FP = 0. A per-ISA delta table got the first
+two right and loongarch wrong, because its frame pointer addresses the top of the frame.
+
+**An overflow claim must clear the whole frame.** ppc64le fragments buffers, so a copy that
+exceeds the recovered variable but still fits the frame below it cannot be told apart from a
+buffer the decompiler split up. Those stay `unknown`. This also removed both remaining false
+positives on jhead 3.04 (`ProcessFile`, the `Comment[16001]`/`st` slot-reuse artifact).
+
 ## Honest limits
 - Sanitization quality degrades off Tier 1 (no MMU/ASan for MCUs → fault-based detection only).
 - Symbolic execution on obscure ISAs relies on the P-Code engine (slower, less battle-tested than VEX).
