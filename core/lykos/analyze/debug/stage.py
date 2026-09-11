@@ -9,7 +9,7 @@ import json
 import shutil
 import sys
 
-from ...db.dao import CallEdgeDAO, FindingDAO, FunctionDAO, TargetDAO
+from ...db.dao import CallEdgeDAO, DynResultDAO, FindingDAO, FunctionDAO, TargetDAO
 from ...jobs.registry import register_stage
 from .. import elf
 from ..dynamic import sandbox
@@ -19,6 +19,29 @@ from . import gdb, qemu_gdb, rootcause
 ROOT_CAUSE_STAGE = "root_cause"
 TOOL = "rootcause"
 TOOL_VERSION = "rootcause-1"
+
+
+# Every way a target can be handed its input. Order matters only as a fallback sweep.
+_MODES = ("stdin", "file", "arg")
+
+
+def _how_to_feed(ctx, target, input_sha, params):
+    """(mode, argv, why) -- how this input reached the program when it crashed.
+
+    This used to default to stdin unconditionally, so a file parser silently reported "no
+    fault reproduced": a crashing input fed the wrong way is indistinguishable from an input
+    that does not crash, and the stage announced the second when it meant the first.
+
+    The dynamic run that FOUND the input already recorded the mode and argv it used, which is
+    authoritative whenever the crash came from this pipeline. Anything else is only a starting
+    guess -- the caller sweeps the remaining modes before concluding anything.
+    """
+    if params.get("input_mode"):
+        return params["input_mode"], list(params.get("argv") or []), "given"
+    for r in DynResultDAO(ctx.conn).list_by_target(target.id):
+        if r.input_sha == input_sha and r.input_mode:
+            return r.input_mode, list(r.argv or []), "recorded by the run that found it"
+    return _MODES[0], list(params.get("argv") or []), "no record of how it was found"
 
 
 def _hex(v):
@@ -34,9 +57,8 @@ def root_cause_stage(ctx) -> dict:
     input_sha = p.get("input_sha")
     if not input_sha:
         raise ValueError("root_cause requires params.input_sha (a crashing input)")
-    mode = p.get("input_mode", "stdin")
-    base_argv = list(p.get("argv") or [])
     timeout = float(p.get("timeout", 10))
+    mode, base_argv, mode_why = _how_to_feed(ctx, target, input_sha, p)
 
     host = sandbox.host_arch()
     emulated = bool(target.arch and target.arch != host)
@@ -56,39 +78,54 @@ def root_cause_stage(ctx) -> dict:
     # capture the fault: qemu-user gdbstub (cross-arch), else GDB, else the ptrace helper
     gpath = None if emulated else gdb.locate_gdb(p.get("gdb_path"))
     helper_dir = None
-    if emulated:
-        ctx.progress(msg=f"capturing fault under qemu-{target.arch} gdbstub")
-        cap = make_qemu_capture(exe, target.arch, mode, base_argv, timeout,
-                                endianness=target.endianness, bits=target.bits)(input_bytes)
-        backend = "qemu-gdbstub"
-    elif gpath is not None:
-        ctx.progress(msg="capturing fault under gdb")
-        stdin_file = None
-        argv = list(base_argv)
-        if mode == "stdin":
-            stdin_file = str(ctx.scratch() / "stdin.bin")
-            (ctx.scratch() / "stdin.bin").write_bytes(input_bytes)
-        elif mode == "arg":
-            argv = argv + [input_bytes.decode("latin-1")]
-        elif mode == "file":
-            (ctx.scratch() / "input.bin").write_bytes(input_bytes)
-            argv = argv + [str(ctx.scratch() / "input.bin")]
-        cap = gdb.run_gdb(gpath, exe, argv, stdin_file, ctx=ctx, timeout=int(timeout))
-        backend = "gdb"
-    else:
-        ctx.progress(msg="capturing fault under ptrace (gdb not installed)")
+    helper = None
+    if not emulated and gpath is None:
         helper = materialize_helper()
         helper_dir = helper.parent
-        capture = make_capture(ctx, helper, exe, mode, base_argv, timeout, sys.executable)
-        cap = capture(input_bytes)
-        backend = "ptrace"
+    backend = ("qemu-gdbstub" if emulated else "gdb" if gpath is not None else "ptrace")
+
+    def _capture_with(m):
+        if emulated:
+            return make_qemu_capture(exe, target.arch, m, base_argv, timeout,
+                                     endianness=target.endianness,
+                                     bits=target.bits)(input_bytes)
+        if gpath is not None:
+            stdin_file = None
+            argv = list(base_argv)
+            if m == "stdin":
+                stdin_file = str(ctx.scratch() / "stdin.bin")
+                (ctx.scratch() / "stdin.bin").write_bytes(input_bytes)
+            elif m == "arg":
+                argv = argv + [input_bytes.decode("latin-1")]
+            elif m == "file":
+                (ctx.scratch() / "input.bin").write_bytes(input_bytes)
+                argv = argv + [str(ctx.scratch() / "input.bin")]
+            return gdb.run_gdb(gpath, exe, argv, stdin_file, ctx=ctx, timeout=int(timeout))
+        return make_capture(ctx, helper, exe, m, base_argv, timeout, sys.executable)(
+            input_bytes)
+
+    # Try the mode we believe in, then the others. A crashing input fed the wrong way looks
+    # exactly like an input that does not crash, and reporting that as "no fault reproduced"
+    # turns a wrong setup into what reads as a clean negative result.
+    order = [mode] + [m for m in _MODES if m != mode]
+    tried = []
+    for m in order:
+        ctx.progress(msg=f"capturing fault under {backend} ({m})")
+        cap = _capture_with(m)
+        tried.append(m)
+        if cap.get("ok") and cap.get("signal_name"):
+            if m != mode:
+                mode_why = f"{mode_why}, but it only faulted via {m}"
+            mode = m
+            break
 
     try:
         if not cap.get("ok") or not cap.get("signal_name"):
             ctx.emit("rootcause.done", payload={"supported": True, "backend": backend,
-                     "note": "input did not fault under the debugger: "
-                             + str(cap.get("reason", ""))})
-            ctx.progress(pct=100, msg="no fault reproduced")
+                     "input_modes_tried": tried,
+                     "note": ("input did not fault under the debugger via any of "
+                              + ", ".join(tried) + ": " + str(cap.get("reason", "")))})
+            ctx.progress(pct=100, msg="no fault reproduced (tried %s)" % ", ".join(tried))
             return {}
 
         functions = FunctionDAO(ctx.conn).list_by_target(target.id)
@@ -139,20 +176,14 @@ def root_cause_stage(ctx) -> dict:
             f = by_id.get(a["finding_id"])
             if f is None:
                 continue
-            proven = a["tier"] == "fault-site"
-            fdao.upsert(target.id, target.case_id, {
-                "dedup_key": f.dedup_key, "cwe": f.cwe, "severity": f.severity,
-                "detector": f.detector,       # upsert rewrites detector on merge; keep it
-                "state": "poc-backed" if proven else f.state,
-                "confidence": 0.97 if proven else f.confidence,
-                "evidence": [{"channel": "crash-attribution",
-                              "detail": (f"{a['detail']} -- reproduced "
-                                         f"{cap['signal_name']} crash")}]})
-            promoted += proven
+            fdao.upsert(target.id, target.case_id,
+                        rootcause.attribution_upsert(f, a, cap["signal_name"]))
+            promoted += a["tier"] == "fault-site"
 
         ctx.emit("rootcause.done", payload={
             "supported": True, "backend": backend, "cwe": v["cwe"],
             "classification": v["class"], "summary": report["summary"],
+            "input_mode": mode, "input_mode_why": mode_why,
             "attributed": len(report["slice"].get("attributed") or []),
             "poc_backed": promoted,
             "exploitability": ex["rating"], "exploit_score": ex["score"],

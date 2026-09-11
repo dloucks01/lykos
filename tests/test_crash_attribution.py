@@ -179,3 +179,79 @@ def test_an_addressed_frame_zero_is_still_dropped():
         if m and m.group(2) and m.group(1) != "0":
             frames.append(int(m.group(2), 16))
     assert frames == [0x555555555214]
+
+
+# ---------------------------------------------------------------- how the input is fed back in
+# The stage defaulted to stdin, so a file parser reported "no fault reproduced" -- which reads
+# as a clean negative and actually meant "we fed it the wrong way". On jhead that silently
+# discarded a real, reproducible crash until the mode was passed by hand.
+from lykos.analyze.debug import stage as dbg_stage  # noqa: E402
+from lykos.db.dao import DynResultDAO  # noqa: E402
+
+
+class _Ctx:
+    def __init__(self, conn):
+        self.conn = conn
+
+
+def _target(store, case):
+    return store.targets.upsert(case.id, filename="t", sha256="a" * 64, size=1,
+                                arch="x86-64", bits=64)
+
+
+def test_an_explicit_mode_wins(store, case):
+    t = _target(store, case)
+    got = dbg_stage._how_to_feed(_Ctx(store.conn), t, "s" * 64,
+                                 {"input_mode": "arg", "argv": ["-x"]})
+    assert got == ("arg", ["-x"], "given")
+
+
+def test_the_run_that_found_the_crash_says_how_it_fed_it(store, case):
+    """Authoritative whenever the crash came from this pipeline: the dynamic run recorded the
+    mode and argv it actually used."""
+    t = _target(store, case)
+    DynResultDAO(store.conn).insert(t.id, case.id, input_sha="c" * 64, input_mode="file",
+                                    argv=["-v"], crashed=True, signal_name="SIGSEGV")
+    assert dbg_stage._how_to_feed(_Ctx(store.conn), t, "c" * 64, {}) == (
+        "file", ["-v"], "recorded by the run that found it")
+
+
+def test_an_unrelated_run_is_not_consulted(store, case):
+    t = _target(store, case)
+    DynResultDAO(store.conn).insert(t.id, case.id, input_sha="d" * 64, input_mode="file",
+                                    crashed=True, signal_name="SIGSEGV")
+    mode, _argv, why = dbg_stage._how_to_feed(_Ctx(store.conn), t, "c" * 64, {})
+    assert why == "no record of how it was found" and mode in dbg_stage._MODES
+
+
+def test_every_mode_is_a_candidate_for_the_sweep():
+    """Correctness must not rest on the opening guess -- the stage tries the rest before it
+    concludes anything, so "no fault reproduced" finally means what it says."""
+    assert set(dbg_stage._MODES) == {"stdin", "file", "arg"}
+
+
+# ---------------------------------------------------------------- the promotion rule
+def test_only_a_fault_site_promotes():
+    f = _F("a", fn="0x900", site=_SITE)
+    up = rootcause.attribution_upsert(
+        f, {"tier": "fault-site", "detail": "d", "site": _SITE}, "SIGSEGV")
+    assert up["state"] == "poc-backed" and up["confidence"] == 0.97
+
+
+def test_a_weaker_tier_leaves_the_state_alone():
+    """Being near a crash is not being the crash."""
+    f = _F("a", fn="0x900", site=_SITE)
+    for tier in ("on-stack", "crash-function"):
+        up = rootcause.attribution_upsert(f, {"tier": tier, "detail": "d", "site": _SITE},
+                                          "SIGSEGV")
+        assert up["state"] == f.state and up["confidence"] == f.confidence
+
+
+def test_attribution_keeps_the_original_detector():
+    """upsert rewrites the detector on merge, so a crash attributed to a `dangerous_api`
+    finding would relabel it as the debugger that noticed."""
+    f = _F("a", fn="0x900", site=_SITE)
+    f.detector = "dangerous_api"
+    up = rootcause.attribution_upsert(
+        f, {"tier": "fault-site", "detail": "d", "site": _SITE}, "SIGSEGV")
+    assert up["detector"] == "dangerous_api" and up["dedup_key"] == f.dedup_key

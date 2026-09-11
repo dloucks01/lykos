@@ -320,9 +320,19 @@ actionable.
   gives the entry as a file vaddr, the function table gives the same function's decompiler
   address, and the difference is the base. Guessing it (rounding the lowest function down to a
   boundary) would resolve frames to the wrong functions whenever the guess was off.
-- **[PLANNED] `multidebug` does not attribute.** The multi-input debug path writes the same
-  signal-keyed crash finding and never calls `attribute`, so crashes found that way stay
-  unjoined.
+- **[DONE] A crashing input fed the wrong way looked exactly like one that does not crash.**
+  `root_cause` defaulted `input_mode` to `stdin`, so a file parser reported "no fault
+  reproduced" — a clean-looking negative that actually meant "we fed it the wrong way". On
+  jhead this silently discarded a real, reproducible crash until the mode was passed by hand,
+  and the GUI passes no mode at all. Two changes: the dynamic run that FOUND the input already
+  recorded the mode and argv it used, so that is consulted first; and whatever mode is chosen,
+  the stage now SWEEPS the remaining ones before concluding anything. Correctness no longer
+  rests on the opening guess, "no fault reproduced" names the modes it tried, and the event
+  reports which mode worked and why it was picked. Measured: the exact call the GUI makes —
+  `params={'input_sha': ...}` and nothing else — now reproduces jhead and attributes 8 sites.
+- **[DONE] `multidebug` attributes too.** It writes the same signal-keyed crash finding, so a
+  crash in a forked child now promotes and annotates the child's findings the same way, via a
+  shared `rootcause.attribution_upsert()` rather than a second copy of the rule.
 - **[PLANNED] The crash finding is still one row per signal.** Two unrelated SIGSEGVs merge, so
   the row's site is whichever ran first. Splitting it by crash function would be more honest but
   changes a key eight PoC stages depend on.
