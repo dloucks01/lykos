@@ -26,8 +26,39 @@ MARKER = 0x1337C0DE1337
 # 32-bit targets truncate a 48-bit PC, so IP control on i386/arm/mips uses a 4-byte sentinel
 # (an unmapped user address, so the fetch faults at it). Reads as "1337c0de".
 MARKER32 = 0x1337C0DE
-# return-address registers across link-register ABIs, checked as IP-control sources
+# Return-address registers across link-register ABIs, checked as IP-control sources.
+# Fallback list, used when the capture does not say which ISA it came from.
 _RA_REGS = ("lr", "x30", "r31", "ra")
+
+# Per-ISA return-address register, named the way that ISA's gdbstub layout names it. A single
+# shared list cannot be right: r14 is the LINK register on s390 and ARM but an ordinary
+# callee-saved register on PowerPC and MIPS, so guessing globally would attribute
+# instruction-pointer control to a register that merely happens to hold cyclic bytes.
+# s390's absence here was why it recovered a nonsense offset (2004) and never reached L2.
+_RA_BY_ARCH = {
+    "aarch64": ("x30",),
+    "arm": ("lr", "r14"),
+    "ppc": ("lr",),
+    "ppc64": ("lr",),
+    "mips": ("r31",),
+    "riscv": ("x1", "ra"),                 # the RISC-V layout names ra as x1
+    "riscv64": ("x1", "ra"),
+    "s390": ("r14",),
+    "loongarch": ("r1", "ra"),
+    "sparcv9": ("i7", "o7"),
+    "sh": ("pr",),                         # SuperH link register
+    "m68k": (),                            # m68k keeps the return address on the stack
+    "x86": (),
+    "x86-64": (),
+}
+
+
+def ra_regs(cap: dict) -> tuple:
+    """Return-address registers to check for this capture's ISA."""
+    arch = (cap or {}).get("arch")
+    if arch in _RA_BY_ARCH:
+        return _RA_BY_ARCH[arch]
+    return _RA_REGS
 
 
 def _ip_marker(word: int) -> int:
@@ -117,7 +148,7 @@ def recover_ip_offset(cap: dict, length: int, n: int = 4, endian: str = "little"
     # loads. On PPC the fetched pc is lr with the low bits masked by aligned fetch, so the pc
     # search misses but the RA register holds the exact controlled value.
     regs = cap.get("regs") or {}
-    for rn in _RA_REGS:
+    for rn in ra_regs(cap):
         if rn in regs:
             off = cyclic_find(_reg_window(regs[rn], word, endian, n), length, n)
             if off != -1:
@@ -241,7 +272,7 @@ def marker_confirmed(cap: dict, word: int = 8, endian: str = "little") -> bool:
     if pc == m or pc in (m & ~0b11, m & ~0b1, m | 1):
         return True
     regs = cap.get("regs") or {}
-    for rn in _RA_REGS:                              # link-register ABIs: LR/x30/$ra holds it
+    for rn in ra_regs(cap):                          # link-register ABIs: LR/x30/$ra holds it
         if regs.get(rn) == m:
             return True
     want = _marker_bytes(m, word, endian)

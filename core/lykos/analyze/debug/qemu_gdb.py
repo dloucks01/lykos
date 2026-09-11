@@ -45,10 +45,22 @@ _LAYOUTS = {
     # $sp is r29, return address is r31 ($ra). Works big- or little-endian (see `endianness`).
     "mips":    [(f"r{i}", 4) for i in range(32)]
                + [("status", 4), ("lo", 4), ("hi", 4), ("badvaddr", 4), ("cause", 4), ("pc", 4)],
+    # SuperH is the one ISA here that must stay hand-written: qemu-sh4's stub serves NO target
+    # description, so nothing can be derived from it. Transcribed from qemu's SH4 gdbstub and
+    # then verified against a live g-packet -- 59 32-bit registers (236 bytes), with an
+    # all-'A' overflow landing at indices 14, 16 and 17, i.e. exactly r14 (frame pointer), pc
+    # and pr (link register). $sp is r15 and the return address is pr.
+    "sh":      [(f"r{i}", 4) for i in range(16)]
+               + [("pc", 4), ("pr", 4), ("gbr", 4), ("vbr", 4), ("mach", 4), ("macl", 4),
+                  ("sr", 4), ("fpul", 4), ("fpscr", 4)]
+               + [(f"fr{i}", 4) for i in range(16)]
+               + [("ssr", 4), ("spc", 4)]
+               + [(f"r{i}_bank0", 4) for i in range(8)]
+               + [(f"r{i}_bank1", 4) for i in range(8)],
 }
 # which register name is the stack pointer per ISA
 _SP = {"aarch64": "sp", "riscv": "x2", "riscv64": "x2", "arm": "sp", "ppc64": "r1",
-       "ppc": "r1", "mips": "r29"}
+       "ppc": "r1", "mips": "r29", "sh": "r15"}
 # integer argument registers per ISA calling convention (in order), named as in _LAYOUTS
 _ARG_REGS = {
     "aarch64": [f"x{i}" for i in range(8)],
@@ -61,6 +73,7 @@ _ARG_REGS = {
     "s390": [f"r{i}" for i in range(2, 7)],
     "loongarch": [f"r{i}" for i in range(4, 12)],     # a0-a7
     "sparcv9": [f"o{i}" for i in range(6)],           # caller side; the callee sees i0-i5
+    "sh": [f"r{i}" for i in range(4, 8)],             # SuperH passes r4-r7
 }
 _BP_KIND = {"arm": 4, "aarch64": 4, "mips": 4, "ppc": 4, "ppc64": 4,
             "riscv": 4, "riscv64": 4, "s390": 2,     # software-breakpoint length hint
