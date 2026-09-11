@@ -18,6 +18,8 @@ from ...db.dao import DynResultDAO, FindingDAO, StringDAO, TargetDAO
 from ...jobs.registry import register_stage
 from ..dynamic.minimize import minimize
 from ..dynamic.stage import crash_finding_candidate
+from ..poc.capture import how_to_feed
+from . import structure
 from .mutator import Mutator
 from .runner import invocation, run_input
 
@@ -116,18 +118,34 @@ def fuzz_stage(ctx) -> dict:
         raise ValueError("fuzz requires a target_id")
 
     p = ctx.params or {}
-    mode = p.get("input_mode", "stdin")               # stdin | arg | file
+    mode = how_to_feed(ctx.conn, target, p.get("input_sha"), p)[0]   # stdin | arg | file
     max_execs = int(p.get("max_execs", 3000))
     max_seconds = float(p.get("max_seconds", 30))
     exec_timeout = float(p.get("exec_timeout", 2))
     rng = random.Random(int(p.get("seed", 1337)))
 
+    strings = StringDAO(ctx.conn).list_by_target(target.id)
     corpus = [base64.b64decode(x) for x in p.get("seeds", [])] or list(_DEFAULT_SEEDS)
-    dictionary = _mine_dictionary(StringDAO(ctx.conn).list_by_target(target.id))
+    dictionary = _mine_dictionary(strings)
     mutator, note = _structure_mutator(p, rng, dictionary), "found by fuzzing"
+    fmt = p.get("format_name") or ("custom" if p.get("format") else None)
+    if mutator is None and not p.get("format"):
+        # Nobody supplied a model, so ask the binary. A parser rejects random bytes before it
+        # reaches any of its own logic -- jhead ran 98,500 executions for zero finds while
+        # AFL++ reached the same bug in 60 seconds WITH a valid sample -- and the target's own
+        # strings say which format it reads. The model then yields a seed that passes the gate,
+        # so the campaign starts inside the parser instead of at its front door.
+        fmt = structure.detect_format([x.value for x in strings])
+        if fmt:
+            model = structure.builtin(fmt)
+            mutator = structure.StructMutator(rng, model, dictionary)
+            seed = structure.seed_for_name(fmt)
+            if seed:
+                corpus = [seed] + list(corpus)
     if mutator:
         note = "found by structure-aware fuzzing"
-        ctx.emit("fuzz.format", payload={"model": p.get("format_name") or "custom"})
+        ctx.emit("fuzz.format", payload={"model": fmt or "custom", "auto": not (
+            p.get("format") or p.get("format_name"))})
     fuzz_campaign(ctx, target, corpus=corpus, dictionary=dictionary, mode=mode,
                   max_execs=max_execs, max_seconds=max_seconds, exec_timeout=exec_timeout,
                   rng=rng, detector="fuzz", event_prefix="fuzz", note_prefix=note,

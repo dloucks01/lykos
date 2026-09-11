@@ -77,6 +77,56 @@ class FormatModel:
         return bytes(out)
 
 
+def _fix_covers(model, fields) -> None:
+    """Recompute every `covers: "rest"` length so the structure stays parseable."""
+    for i, fd in enumerate(fields):
+        if fd["f"].get("covers") != "rest":
+            continue
+        before = model.serialize(fields[:i])
+        fd["val"] = len(model.serialize(fields)) - len(before)
+
+
+def seed_for_name(name: str) -> bytes | None:
+    """A valid seed for a builtin, using that format's own tail when it declares one."""
+    entry = _BUILTINS.get(name)
+    if not entry:
+        return None
+    model = FormatModel([dict(f) for f in entry["spec"]])
+    return seed_for(model, entry.get("seed") or b"A" * 64)
+
+
+def seed_for(model: "FormatModel", payload: bytes = b"A" * 64) -> bytes:
+    """A minimal input the format's own gate accepts.
+
+    The model already declares the magic and which integer sizes which blob, so a valid
+    skeleton falls straight out of `serialize` -- there is no need for an analyst to attach a
+    sample before a campaign can start doing work.
+    """
+    fields = []
+    for f in model.spec:
+        t = f["type"]
+        if t == "magic":
+            fields.append({"f": f, "val": _as_bytes(f["value"])})
+        elif t in _INT:
+            # A count that must agree with the seed's own payload -- an IFD entry count of 0
+            # alongside one entry is rejected before the parser reaches anything interesting.
+            fields.append({"f": f, "val": f.get("seed_value", 0)})
+        else:
+            fields.append({"f": f, "val": payload})
+    # length fields describe the blob they name, so the skeleton parses rather than truncating
+    by_name = {fd["f"].get("name"): fd for fd in fields}
+    for fd in fields:
+        ln = fd["f"].get("length_of")
+        if ln and ln in by_name:
+            fd["val"] = len(_as_bytes(by_name[ln]["val"]))
+    # `covers: "rest"` is the other length shape real formats use: a JPEG segment length spans
+    # the length field itself and everything after it, not one named blob. Getting it wrong is
+    # not cosmetic -- the parser reads a short segment and treats the remainder as padding,
+    # so the seed never reaches the structure the rest of the model describes.
+    _fix_covers(model, fields)
+    return model.serialize(fields)
+
+
 class StructMutator:
     """Field-aware mutator with the byte Mutator's interface. Falls back to byte havoc when the
     input does not fit the model."""
@@ -92,8 +142,15 @@ class StructMutator:
             return self.byte.mutate(data, corpus)
         if not fields:
             return self.byte.mutate(data, corpus)
+        drove_cover = False
         for _ in range(self.rng.randint(1, 3)):
-            self._mutate_field(fields)
+            drove_cover |= self._mutate_field(fields) == "cover"
+        if not drove_cover:
+            # Keep "covers: rest" lengths honest unless this round deliberately drove one.
+            # A segment length that no longer spans the segment is not a bug the parser will
+            # chase: it reads a short segment and discards the mutated tail as padding, so
+            # every other mutation in the round is thrown away before it is ever parsed.
+            _fix_covers(self.model, fields)
         try:
             return self.model.serialize(fields)
         except Exception:
@@ -110,6 +167,8 @@ class StructMutator:
                 fd["val"] = self.byte.mutate(fd["val"] or b"", ())
         elif t in _INT:
             fd["val"] = self.rng.choice(_EDGE)
+            if fd["f"].get("covers") == "rest":
+                return "cover"                          # driving it IS the interesting case
             target = fd["f"].get("length_of")
             if target and self.rng.random() < 0.6:      # coordinate: grow the sized blob to match
                 blob = self._blob_by_name(fields, target)
@@ -122,22 +181,119 @@ class StructMutator:
 
 
 # a few ready-made models (analyst can also pass a custom spec)
+# A model is a spec plus the printable tokens that betray a parser for it in a binary's
+# strings. Byte magic (0xFFD8) never survives into a string table; the format's textual
+# markers do, which is what makes auto-detection possible at all.
+# One well-formed IFD entry (ASCII "Make"), the next-IFD terminator and an EOI, so the seed
+# lands inside ProcessExifDir rather than being rejected at the alignment marker.
+def _exif_entry(tag, typ, count, value):
+    """One 12-byte IFD entry. A value of four bytes or fewer sits INLINE; anything larger is
+    stored as an offset, and a parser rejects the entry if the two disagree."""
+    raw = value if isinstance(value, bytes) else struct.pack("<I", value)
+    return struct.pack("<HHI", tag, typ, count) + raw
+
+
+def _jpeg_seed_tail():
+    """An EXIF payload that reaches the GPS parser, not merely the front door.
+
+    A seed has to exercise a format's FEATURES, not just satisfy its magic. Reaching
+    `ProcessExifDir` is not enough to find jhead's bug: that lives in `ProcessGpsInfo`, behind
+    a GPS sub-directory pointer (tag 0x8825) and a sub-IFD at a valid offset. Random mutation
+    does not invent a 16-bit tag number and a self-consistent offset, so a campaign that starts
+    without one never executes the function at all.
+
+    Offsets are relative to the TIFF header, which the model emits as a magic: an 8-byte header
+    then IFD0 at offset 8 (its count comes from the model's `nent` field).
+    """
+    ifd0_off, ifd0_len = 8, 2 + 12 + 4          # one entry: the GPS pointer, then next-IFD
+    gps_off = ifd0_off + ifd0_len
+    gps_len = 2 + 12 * 2 + 4
+    rat_off = gps_off + gps_len
+    ifd0_rest = _exif_entry(0x8825, 4, 1, gps_off) + struct.pack("<I", 0)
+    gps = (struct.pack("<H", 2)
+           + _exif_entry(0x0001, 2, 2, b"N\x00\x00\x00")     # GPSLatitudeRef
+           + _exif_entry(0x0002, 5, 3, rat_off)                # GPSLatitude: 3 rationals
+           + struct.pack("<I", 0))
+    rationals = b"".join(struct.pack("<II", n, d) for n, d in ((51, 1), (30, 1), (0, 1)))
+    return ifd0_rest + gps + rationals + b"\xff\xd9"
+
+
+_JPEG_SEED_TAIL = _jpeg_seed_tail()
+
 _BUILTINS = {
     # generic "magic + u32-LE length + payload" container (matches many toy/real headers)
-    "lv32": [{"type": "magic", "value": "\x00"},        # placeholder magic, override via params
-             {"type": "u32", "endian": "little", "name": "len", "length_of": "data"},
-             {"type": "blob", "name": "data"}],
+    "lv32": {"tokens": (), "spec": [
+        {"type": "magic", "value": "\x00"},          # placeholder magic, override via params
+        {"type": "u32", "endian": "little", "name": "len", "length_of": "data"},
+        {"type": "blob", "name": "data"}]},
     # PNG: 8-byte signature, then the mutator drives the first chunk's length/type
-    "png": [{"type": "magic", "value": b"\x89PNG\r\n\x1a\n"},
-            {"type": "u32", "endian": "big", "name": "clen", "length_of": "cdata"},
-            {"type": "magic", "value": "IHDR"},
-            {"type": "blob", "name": "cdata"}],
+    "png": {"tokens": ("IHDR", "IEND", "PNG"), "spec": [
+        {"type": "magic", "value": b"\x89PNG\r\n\x1a\n"},
+        {"type": "u32", "endian": "big", "name": "clen", "length_of": "cdata"},
+        {"type": "magic", "value": "IHDR"},
+        {"type": "blob", "name": "cdata"}]},
+    # JPEG/EXIF: SOI + APP1, a BIG-endian segment length, then the Exif header the EXIF
+    # parsers key on. This is the shape jhead reads, and the length field is exactly the
+    # length-driven relationship the structure mutator exists to drive.
+    "jpeg": {"tokens": ("Exif", "JFIF", "JPEG"),
+             # The TIFF header and the IFD entry count are part of the GATE, not the payload:
+             # an EXIF reader rejects the file before either unless both are well formed, and
+             # the entry count is one of the most productive fields a parser fuzzer can drive.
+             "seed": _JPEG_SEED_TAIL,
+             "spec": [
+                 {"type": "magic", "value": b"\xff\xd8\xff\xe1"},
+                 {"type": "u16", "endian": "big", "name": "seglen", "covers": "rest"},
+                 {"type": "magic", "value": b"Exif\x00\x00"},
+                 {"type": "magic", "value": b"II*\x00\x08\x00\x00\x00"},
+                 {"type": "u16", "endian": "little", "name": "nent", "seed_value": 1},
+                 {"type": "blob", "name": "seg"}]},
+    "gif": {"tokens": ("GIF87a", "GIF89a"), "spec": [
+        {"type": "magic", "value": b"GIF89a"},
+        {"type": "u16", "endian": "little", "name": "w"},
+        {"type": "u16", "endian": "little", "name": "h"},
+        {"type": "blob", "name": "data"}]},
+    "bmp": {"tokens": ("BM",), "spec": [
+        {"type": "magic", "value": b"BM"},
+        {"type": "u32", "endian": "little", "name": "size", "length_of": "data"},
+        {"type": "blob", "name": "data"}]},
+    "riff": {"tokens": ("RIFF", "WAVE", "fmt "), "spec": [
+        {"type": "magic", "value": b"RIFF"},
+        {"type": "u32", "endian": "little", "name": "size", "length_of": "data"},
+        {"type": "magic", "value": b"WAVE"},
+        {"type": "blob", "name": "data"}]},
+    "zip": {"tokens": ("PK\x03\x04", "End of central directory"), "spec": [
+        {"type": "magic", "value": b"PK\x03\x04\x14\x00\x00\x00\x00\x00"},
+        {"type": "u32", "endian": "little", "name": "crc"},
+        {"type": "u32", "endian": "little", "name": "csize", "length_of": "data"},
+        {"type": "blob", "name": "data"}]},
 }
 
 
 def builtin(name: str):
-    spec = _BUILTINS.get(name)
-    return FormatModel([dict(f) for f in spec]) if spec else None
+    entry = _BUILTINS.get(name)
+    return FormatModel([dict(f) for f in entry["spec"]]) if entry else None
+
+
+def builtin_names() -> list:
+    return sorted(_BUILTINS)
+
+
+def detect_format(strings) -> str | None:
+    """Which builtin format this binary looks like a parser for, by its own strings.
+
+    A blind mutator cannot invent four valid magic bytes, so a parser rejects everything it is
+    given and the campaign does no work: jhead ran 98,500 executions for zero finds against a
+    bug AFL++ reached in 60 seconds WITH a valid seed. The binary itself says which format it
+    reads -- an EXIF reader carries the string "Exif" -- so the model and the seed can both be
+    chosen without an analyst supplying either.
+    """
+    blob = "\n".join(s for s in strings if s)
+    best, score = None, 0
+    for name, entry in _BUILTINS.items():
+        hits = sum(1 for t in entry["tokens"] if t and t in blob)
+        if hits > score:
+            best, score = name, hits
+    return best
 
 
 def from_spec(spec) -> FormatModel:
