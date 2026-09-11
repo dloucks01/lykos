@@ -318,6 +318,36 @@ actionable.
   NUL, and execve truncates at the first NUL regardless, so the shell hands over exactly the
   bytes the kernel would. The bundle is the deliverable; one that does not reproduce is worse
   than none.
+- **[DONE] A full-chain release gate** (`make real-gate`, `lykos realgate`). The existing
+  gates each cover a slice and between them left the join uncovered: `test` is unit tests over
+  synthetic P-Code and never runs a program; `eval-gate` scores detection on inline micro-cases
+  and stops at detect; `arch-gate` IS end to end across 13 ISAs but never runs `detect` or
+  `root_cause`, hands every stage an explicit `input_mode="stdin"`, and never runs a produced
+  bundle. Six confident-but-wrong results shipped through that gap in a single session.
+  The new gate asserts exactly what those bugs broke: **no stage is told how to feed the
+  target** (`input_sha` and nothing else, which is what the API sends, and each case is
+  reachable through exactly ONE channel so the sweep is load-bearing); the fixtures are **PIE**,
+  so symbolisation has to rebase; the produced **bundle is extracted and run**, because the
+  bundle is the deliverable; and detect, root_cause and the PoC ladder run **together**, because
+  attribution is the join and no other gate ran either half.
+  Two cases, covering the two channels no other gate touches: `argv_ip_control` (unchecked
+  `strcpy` of a command-line name — the ncompress CVE-2001-1413 shape) expects CWE-121, L1, **L2
+  confirmed**, and a reproducing bundle; `file_attribution` (file-positioned `memcpy` source,
+  faulting inside the call) expects CWE-120, L1, and a crash **attributed and promoted** to
+  `poc-backed`. Measured on first run: `mode=arg, offset=1032` and `mode=file, attributed=3,
+  promoted=1`, both `pie=on` — every mode discovered by the sweep, not supplied.
+  Fixtures are built, not downloaded: this is an air-gapped platform and a gate that needs the
+  network is not one.
+  **Mutation-tested, because a gate that only ever passes is a green light and not a test.**
+  Each fixed defect was reintroduced and the gate caught all four with the right diagnostic:
+  argv UTF-8 corruption → missing `L2`, `bundle_reproduces`; bundle runner ignoring the input →
+  missing `bundle_reproduces`; `build_poc`'s stdin default → missing `L1`; gdb dropping
+  backtrace frame #1 → missing `poc_backed`.
+- **[PLANNED] The real-chain gate uses built fixtures, not third-party software.** They
+  reproduce the shapes validated by hand against ncompress 4.2.4 and jhead 3.04 and would have
+  caught all six defects, but they cannot catch "real compilers and real code shapes surprise
+  us". A vendored or locally-cached real binary, skipped when absent, would add that without
+  costing the air-gap property.
 - **[DONE] The silent stdin default was in THREE stages, not one.** `root_cause`,
   `poc_primitive` and `build_poc` each defaulted `input_mode` to stdin, so an argv- or
   file-driven target reported "did not fault" / "no L2 primitive" / an unverified L0 — all of
