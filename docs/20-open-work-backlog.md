@@ -178,6 +178,37 @@ crashing input; many bug classes have a **derivable** input and need no fuzzing.
   x86 / link-register (aarch64 stp, mips $ra, ppc lr) frame conventions. 32-bit sentinel,
   endianness-aware register capture + offset search, ±word ABI slack, largest-buffer attribution.
 
+## K. Product restructuring (September 2026, from running the GUI against real code)
+
+Driven by a walkthrough of the web GUI against jhead (real third-party source, not a program
+we wrote), which produced "27 findings, 0 confirmed, 0 poc-backed" — nice information, not
+actionable.
+
+- **[DONE] A finding is a DEFECT; call sites are evidence.** One call site was one finding,
+  so the count tracked compiler inlining: jhead 3.06 with distro flags gave 27 findings, the
+  same program at -O0 gave 230. Migration 11 adds `finding_site`. Measured: 27 findings ->
+  5 findings / 27 sites. The board gained SITES and WHERE columns; board, workbench and
+  report finally agree on what a finding is.
+- **[DONE] "What to do next" moved out of the GUI** into `analyze/advise.py` + a real
+  endpoint (`GET /targets/<id>/advice`), so the API and CLI get the same answer. It also
+  fixes what the GUI logic got wrong: it recommended `directed` whenever static findings
+  existed and never mentioned coverage-guided fuzzing, but `directed` is still blind mutation
+  biased toward sink addresses (~195 execs/sec, no feedback, nothing found in 505s on jhead),
+  while AFL++ on the same program did ~15,000 execs/sec with edge coverage and found five
+  SIGSEGV crashes in 60s.
+- **[DONE] The default pipeline is dynamic-first.** `advise()` returns an ordered PLAN that
+  leads with execution: fuzz -> root_cause -> build_poc -> poc_primitive, with disassemble
+  and detect_cwe demoted to "explain what execution found". Static analysis is supporting
+  evidence, ranked below anything demonstrated. The GUI renders it as "Plan — evidence first".
+- **[PLANNED] Severity should require a demonstration or a bounds argument.** 20 of jhead's
+  27 findings were LOW rows that amount to "this program calls memcpy". Those are INVENTORY,
+  not findings: they belong behind a toggle, not in the headline count. Needs the CWE-120
+  bounds reasoning (section G) to tell a guarded copy from an unguarded one.
+- **[PLANNED] Runs list shows DONE regardless of yield.** `fuzz · 177s · DONE` found nothing;
+  a wasted run looks exactly like a productive one. Needs an outcome column.
+- **[PLANNED] Live Events is empty for a case with history** — the WebSocket starts at the
+  current tail and nothing backfills from `/cases/<id>/events`.
+
 ## G. Static-taint channel — reach and precision
 
 The `corroborated` state is the platform's precision lever: it is what separates
