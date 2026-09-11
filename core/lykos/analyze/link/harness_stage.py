@@ -45,9 +45,14 @@ def boundary_fuzz_stage(ctx) -> dict:
         family = "tcp"
 
     if not family or not key:
-        ctx.emit("harness.done", payload={"error": "no channel", "execs": 0, "crashes": 0})
-        ctx.progress(pct=100, msg="no IPC channel to drive (supply family+key or model IPC)")
-        return {"metrics": {"error": "no channel"}}
+        # Not applicable, not an error. A single binary has no IPC channel to drive, and
+        # reporting that as an error makes a stage that correctly had nothing to do look like
+        # a stage that broke -- the same conflation "no fault reproduced" made.
+        ctx.emit("harness.done", payload={"applicable": False, "execs": 0, "crashes": 0,
+                 "note": "no IPC channel on this target (supply family+key, or run ipc_model "
+                         "on a linked case first)"})
+        ctx.progress(pct=100, msg="not applicable: no IPC channel to drive")
+        return {"metrics": {"applicable": False}}
     if family not in DRIVABLE:
         ctx.emit("harness.done", payload={"error": f"cannot drive {family}", "family": family,
                                           "execs": 0, "crashes": 0})
