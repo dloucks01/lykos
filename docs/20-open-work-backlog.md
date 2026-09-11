@@ -251,7 +251,7 @@ candidate recall 1.00 / fp_rate 0.571; corroborated recall 0.833 / fp_rate 0.214
   big-endian ppc64 also gained from the PLT-thunk half. See doc 18.
 - **[DONE] Cross-architecture L3** — `build_exploit` was gated to native x86-64; ret2win is
   ISA-neutral (overwrite the saved return address with a symbol-table address, confirm arrival
-  with a breakpoint) and now runs on any architecture the gdbstub speaks for: **10 of 13**, up
+  with a breakpoint) and now runs on any architecture the gdbstub speaks for: **12 of 13**, up
   from 1. ROP/mprotect/PIE-leak remain x86-64 machine code and stay native-only. Four bugs had
   to be fixed to get there — target-aware address packing, link-register control being
   rejected as "not a ret overwrite", the LSB-alias offset candidate missing, and breakpoints
@@ -269,7 +269,7 @@ candidate recall 1.00 / fp_rate 0.571; corroborated recall 0.833 / fp_rate 0.214
   through the real sandbox and drives the real PoC stages, asserting the level each is expected
   to reach; an absent cross-compiler SKIPs rather than fails. Deliberately skips Ghidra —
   decompilation is the slow part and nearly every arch regression lives in the dynamic path.
-  Current bar: **13 architectures, 10 at L3 and 3 at L1**, and every row below L2 must record a
+  Current bar: **13 architectures, 12 at L3 and 1 at L1**, and every row below L2 must record a
   reason (a test enforces that, so the bar cannot drift down quietly). It caught a real RISC-V
   bug on its first full run: JALR clears the low bit of its target, so a fault with full IP
   control read as unconfirmed — the ARM/AArch64 Thumb masking already handled this, but the
