@@ -244,3 +244,33 @@ def test_entry_seeding_finds_the_powerpc_local_entry():
     fns = [SimpleNamespace(name=".main", addr="0x10000b68",
                            signature="undefined8 main(int param_1, long param_2)")]
     assert entry_seed_params(fns) == {"0x10000b68": {1}}
+
+
+def test_reachability_uses_shortest_distance_not_first_path_found():
+    """`reaches_within` answers "is a source within N call levels", which must mean the
+    SHORTEST distance.
+
+    The previous implementation was a depth-limited DFS sharing one `seen` set across the
+    whole search: a node first reached with the budget nearly spent was marked visited and
+    never re-explored along a shorter path that still had budget. Whether that lost a real
+    source depended on the order a Python set happened to iterate, so it never reproduced
+    reliably -- and a missed source is invisible, it just looks like a finding that stayed
+    `candidate`. These assertions hold for every exploration order.
+    """
+    from lykos.analyze.detect.detectors import reaches_within
+
+    # sink <- A <- {B, X}; B <- X; X <- src.  src sits at distance 3 by the short route
+    # (sink->A->X->src) and 4 by the long one (sink->A->B->X->src).
+    callers = {"sink": {"A"}, "A": {"B", "X"}, "B": {"X"}, "X": {"src"}}
+    assert reaches_within("sink", {"src"}, callers, depth=3) is True
+    assert reaches_within("sink", {"src"}, callers, depth=2) is False   # genuinely too far
+
+    # a long dead-end branch must never mask a short live one
+    callers2 = {"sink": {"L1", "S1"}, "L1": {"L2"}, "L2": {"L3"}, "L3": {"L4"},
+                "S1": {"src"}}
+    assert reaches_within("sink", {"src"}, callers2, depth=2) is True
+
+    # boundary + degenerate cases
+    assert reaches_within("src", {"src"}, {}, depth=0) is True          # start IS a source
+    assert reaches_within("sink", {"src"}, {}, depth=4) is False        # no edges at all
+    assert reaches_within("a", {"src"}, {"a": {"b"}, "b": {"a"}}, depth=9) is False  # cycle

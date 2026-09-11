@@ -346,19 +346,11 @@ def run(exe, *, argv=(), stdin: bytes = b"", timeout: float = 10.0,
         cmd, iso = inner, "rlimits-only" + ("+qemu" if emu else "")
         rc, out, err, timed, dur = _spawn(cmd, stdin, eff_timeout, preexec)
 
-    # crash signal: native subprocess reports -signum; wrappers (bwrap) report 128+signum
-    sig = None
-    exit_code = None
-    if rc is not None:
-        if rc < 0:
-            sig = -rc
-        elif rc > 128 and (rc - 128) in CRASH_SIGNALS:
-            sig = rc - 128
-        else:
-            exit_code = rc
+    # classify_rc() holds the one copy of this: native subprocesses report -signum while
+    # wrappers (bwrap/qemu) report 128+signum, and the two had drifted apart here.
+    crashed, sig, sig_name, exit_code = classify_rc(rc)
     return RunResult(
-        isolation=iso, crashed=(sig in CRASH_SIGNALS if sig else False), timed_out=timed,
-        exit_code=exit_code, signal=sig,
-        signal_name=CRASH_SIGNALS.get(sig) if sig else None,
+        isolation=iso, crashed=crashed, timed_out=timed,
+        exit_code=exit_code, signal=sig, signal_name=sig_name,
         stdout=(out or b"")[:capture], stderr=(err or b"")[:capture],
         duration_ms=dur, cmd=cmd)

@@ -216,6 +216,34 @@ def hardening(ctx: DetectContext):
     return out
 
 
+def reaches_within(start, targets: set, callers: dict, depth: int = 4) -> bool:
+    """Is `start` within `depth` call levels below any function in `targets`?
+
+    Breadth-first, so every node is visited at its SHORTEST distance from `start`. The
+    previous implementation was a depth-limited DFS sharing ONE `seen` set across the whole
+    search: a node first reached with the budget nearly spent was marked visited and never
+    re-explored along a shorter path that still had budget, so reachability that genuinely
+    existed could be reported as absent. Whether it happened depended on the order a set
+    iterated, which is why it never showed up as a reproducible failure -- the worst kind of
+    wrong answer, since a missed source just looks like a finding that stayed `candidate`.
+    """
+    if start in targets:
+        return True
+    frontier = {start}
+    seen = {start}
+    for _ in range(depth):
+        nxt: set = set()
+        for node in frontier:
+            nxt |= callers.get(node, set()) - seen
+        if not nxt:
+            return False
+        if nxt & targets:
+            return True
+        seen |= nxt
+        frontier = nxt
+    return False
+
+
 # ----------------------------------- input->sink reachability (approximate taint channel)
 def correlate(cands: list, ctx: DetectContext) -> list:
     """Promote dangerous_api sinks that are reachable from an untrusted-input source over
@@ -234,19 +262,8 @@ def correlate(cands: list, ctx: DetectContext) -> list:
         if e.dst_addr:
             callers[e.dst_addr].add(e.src_addr)
 
-    def reaches_source(fn_addr, depth=4, seen=None):
-        if fn_addr in source_fns:
-            return True
-        if depth <= 0:
-            return False
-        seen = seen if seen is not None else set()
-        for c in callers.get(fn_addr, ()):
-            if c in seen:
-                continue
-            seen.add(c)
-            if reaches_source(c, depth - 1, seen):
-                return True
-        return False
+    def reaches_source(fn_addr, depth=4):
+        return reaches_within(fn_addr, source_fns, callers, depth)
 
     for c in cands:
         if c["detector"] == "dangerous_api" and c.get("function_addr") \
