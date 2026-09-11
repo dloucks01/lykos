@@ -2,10 +2,10 @@
 PY ?= python3
 export PYTHONPATH := core
 
-.PHONY: test lint typecheck ci bundle verify run eval eval-gate dashboard release clean help
+.PHONY: test lint typecheck ci bundle verify run eval eval-gate arch-gate dashboard release clean help
 
 help:
-	@echo "targets: test lint typecheck ci bundle verify run eval eval-gate dashboard release clean"
+	@echo "targets: test lint typecheck ci bundle verify run eval eval-gate arch-gate dashboard release clean"
 
 test:
 	$(PY) -m pytest tests/ -q
@@ -78,12 +78,20 @@ eval-gate:
 	$(PY) -m lykos eval --stage static --min-state corroborated --record \
 	      --min-recall $(CORROB_MIN_RECALL) --max-fp-rate $(CORROB_FP_BUDGET)
 
+# Architecture coverage gate: every supported ISA still reaches its expected PoC level.
+# Builds a vulnerable program per architecture with the cross toolchain, detonates it through
+# the real sandbox and drives the real PoC stages. Skips (does not fail) an architecture whose
+# cross-compiler is absent. Does NOT need Ghidra -- decompilation is the slow part and nearly
+# every arch regression lives in the dynamic path, which keeps this cheap enough to gate on.
+arch-gate:
+	$(PY) -m lykos archgate
+
 # Render the detection-quality regression dashboard from the recorded history.
 dashboard:
 	$(PY) -m lykos dashboard --html eval-dashboard.html
 
 # Full release bar: code checks + packaged-artifact verify + detection-quality gate.
-release: ci verify eval-gate
+release: ci verify eval-gate arch-gate
 	@echo "release gate complete"
 
 clean:

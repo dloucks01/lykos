@@ -95,6 +95,14 @@ def build_parser() -> argparse.ArgumentParser:
     ev.add_argument("--label", default=None, help="optional label for the recorded run")
     ev.set_defaults(func=_cmd_eval)
 
+    ag = sub.add_parser("archgate",
+                        help="architecture coverage gate: every ISA still reaches its PoC level")
+    ag.add_argument("--timeout", type=float, default=30.0, help="per-detonation timeout")
+    ag.add_argument("--only", default=None,
+                    help="comma-separated arch labels to check (default: all)")
+    ag.add_argument("--out", default=None, help="write the JSON report here")
+    ag.set_defaults(func=_cmd_archgate)
+
     db2 = sub.add_parser("dashboard", help="render the detection-quality regression dashboard")
     db2.add_argument("--history", default=None,
                      help="history file to read (default: eval-history.jsonl)")
@@ -103,6 +111,25 @@ def build_parser() -> argparse.ArgumentParser:
                      help="exit non-zero if the latest run regressed in any series")
     db2.set_defaults(func=_cmd_dashboard)
     return p
+
+
+def _cmd_archgate(args: argparse.Namespace) -> int:
+    import json
+
+    from .eval import archgate
+    cases = archgate.MATRIX
+    if args.only:
+        want = {x.strip() for x in args.only.split(",") if x.strip()}
+        cases = [c for c in cases if c.label in want]
+    rep = archgate.run(cases, timeout=args.timeout,
+                       progress=lambda m: print(m, file=sys.stderr, flush=True))
+    print(archgate.table(rep))
+    passed, verdict, reason = archgate.gate(rep)
+    if args.out:
+        Path(args.out).write_text(json.dumps(rep, indent=2))
+        print(f"report written to {args.out}", file=sys.stderr)
+    print(f"\nGATE: {verdict} -- {reason}", file=sys.stderr)
+    return 0 if passed else 1
 
 
 def _cmd_dashboard(args: argparse.Namespace) -> int:

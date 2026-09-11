@@ -362,3 +362,19 @@ def test_ip_control_via_link_register_and_masked_pc():
                                "sp": 0}, word=4, endian="big")
     assert P.marker_confirmed({"pc": P.MARKER32 & ~0b11, "regs": {}, "stack": "",
                                "stack_base": 0, "sp": 0}, word=4, endian="big")
+
+
+def test_lsb_masked_pc_covers_riscv_as_well_as_arm():
+    """ISAs whose indirect branch clears bit 0 of the loaded PC need their cyclic window
+    searched at `(pc | 1)`, or a fault with FULL instruction-pointer control reads as
+    unconfirmed.
+
+    ARM/AArch64 mask it to select Thumb vs ARM state; RISC-V's JALR is specified to clear the
+    low bit of the computed target. The list originally covered only the ARM family, so RISC-V
+    captured pc=0x4141414141414140 from an all-'A' overflow -- unmistakable IP control -- and
+    still reported L1 instead of L2.
+    """
+    from lykos.analyze.poc.primitive_stage import _LSB_MASKED_PC
+    assert {"arm", "aarch64", "riscv", "riscv64"} <= set(_LSB_MASKED_PC)
+    # ISAs that do NOT mask must stay out, or a genuine off-by-one alias gets accepted
+    assert not ({"x86-64", "x86", "ppc64", "s390", "m68k"} & set(_LSB_MASKED_PC))
