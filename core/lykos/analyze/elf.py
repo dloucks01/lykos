@@ -6,6 +6,7 @@ robust: every sub-parse is guarded; failures are appended to `errors` and never 
 """
 from __future__ import annotations
 
+import bisect
 import math
 import struct
 from dataclasses import dataclass, field
@@ -295,6 +296,127 @@ def parse(data: bytes) -> ElfInfo:
                         "canary": "on" if canary else "off",
                         "fortify": "on" if fortify else "off"}
     return info
+
+
+STT_OBJECT, STT_FUNC, STT_FILE, STT_GNU_IFUNC = 1, 2, 4, 10
+_LIB_FILE = "crtstuff.c"          # the compiler's own glue, linked into every program
+
+
+def program_ranges(data: bytes) -> list:
+    """Address ranges that belong to the program's OWN source, not to code linked in with it.
+
+    A statically linked binary carries its libc, so the decompiler recovers every block of it:
+    jhead is 1,887 blocks dynamically linked and 38,418 statically, of which 36,000 are library
+    code the fuzzer will never meaningfully explore. Counting those as coverage understates the
+    program by more than an order of magnitude, and worse, an input that wanders into a new
+    printf path scores as "novel" and earns a place in the corpus.
+
+    ELF says who owns what. A symbol table groups local symbols under an STT_FILE symbol naming
+    the object they came from -- `exif.c` for the program, `iofclose.o` for a libc archive
+    member -- so every function is attributed to the nearest preceding local symbol's file.
+    Measured against the dynamically linked build's own symbols, across all twelve
+    architectures jhead is built for: 56 of 56 program functions found, five adjacent crt glue
+    symbols over-claimed, nothing from libc.
+
+    Returns [(start, end)] sorted, or [] when the binary cannot say -- stripped, no local
+    symbols, or a result too degenerate to trust -- in which case the caller must fall back to
+    using everything rather than pretending the program is tiny.
+    """
+    try:
+        if any(sec.get("name") == ".opd" for sec in parse(data).sections):
+            # PowerPC64 ELFv1: a function symbol's value is the address of its OPD descriptor,
+            # not of its code, so every range this derived would be in the wrong address space.
+            return []
+        marks, funcs, end = _symbol_owners(data)
+    except Exception:
+        return []
+    if not marks or not funcs:
+        return []
+    addrs = [a for a, _ in marks]
+    owned, total = [], 0
+    for addr, size in funcs:
+        total += 1
+        i = bisect.bisect_right(addrs, addr) - 1
+        if i < 0:
+            continue
+        owner = marks[i][1]
+        if owner.endswith(".c") and owner != _LIB_FILE:
+            owned.append((addr, addr + (size or 1)))
+    # A small program really is a handful of functions -- a single .c file with one static
+    # anchors three -- so there is no ratio to test here. The failure this has to catch is
+    # attributing NOTHING, which would hide the whole program from coverage.
+    if not owned or total < 2:
+        return []
+    owned.sort()
+    merged = [list(owned[0])]
+    for lo, hi in owned[1:]:
+        if lo <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], hi)
+        else:
+            merged.append([lo, hi])
+    return [(lo, min(hi, end) if end else hi) for lo, hi in merged]
+
+
+def _symbol_owners(data: bytes):
+    """(local-symbol -> owning file marks, function (addr, size) list, end of text)."""
+    info = parse(data)
+    is64 = info.bits == 64
+    endc = "<" if info.endianness == "little" else ">"
+    # ARM tags a Thumb function by setting bit 0 of its symbol value; the address the code
+    # actually lives at is even. Left in, every range started one byte late and lost whichever
+    # function sat exactly on its edge.
+    mask = ~1 if (info.arch or "").startswith("arm") else ~0
+    e_shoff, e_shentsize, e_shnum = _section_header_table(data, is64, endc)
+    sections = []
+    for i in range(e_shnum):
+        off = e_shoff + i * e_shentsize
+        fmt = endc + ("IIQQQQIIQQ" if is64 else "IIIIIIIIII")
+        (_nm, typ, _fl, _ad, s_off, s_sz, link, _inf, _al, ent) = struct.unpack_from(fmt, data, off)
+        sections.append((typ, s_off, s_sz, link, ent))
+    sym = next((s for s in sections if s[0] == SHT_SYMTAB), None)
+    if sym is None:
+        return [], [], 0
+    _t, s_off, s_sz, link, ent = sym
+    if link >= len(sections):
+        return [], [], 0
+    str_off, str_sz = sections[link][1], sections[link][2]
+    strtab = data[str_off:str_off + str_sz]
+
+    def name_at(o):
+        e = strtab.find(b"\x00", o)
+        return strtab[o:e].decode("utf-8", "replace") if 0 <= o < len(strtab) else ""
+
+    ent = ent or (24 if is64 else 16)
+    marks, funcs, cur, end = [], [], None, 0
+    for off in range(s_off, min(s_off + s_sz, len(data)) - ent + 1, ent):
+        if is64:
+            nm, info_b, _oth, shndx, val, size = struct.unpack_from(endc + "IBBHQQ", data, off)
+        else:
+            nm, val, size, info_b, _oth, shndx = struct.unpack_from(endc + "IIIBBH", data, off)
+        typ, bind = info_b & 0xF, info_b >> 4
+        if typ == STT_FILE:
+            cur = name_at(nm)
+            continue
+        if not shndx or not val:                       # undefined, or absolute with no address
+            continue
+        val &= mask
+        if typ in (STT_FUNC, STT_GNU_IFUNC):
+            funcs.append((val, size))
+            end = max(end, val + (size or 1))
+        if bind == 0 and cur and typ in (STT_FUNC, STT_GNU_IFUNC, STT_OBJECT):   # STB_LOCAL
+            marks.append((val, cur))
+    marks.sort()
+    return marks, funcs, end
+
+
+def _section_header_table(data: bytes, is64: bool, endc: str):
+    if is64:
+        (e_shoff,) = struct.unpack_from(endc + "Q", data, 0x28)
+        (e_shentsize, e_shnum) = struct.unpack_from(endc + "HH", data, 0x3A)
+    else:
+        (e_shoff,) = struct.unpack_from(endc + "I", data, 0x20)
+        (e_shentsize, e_shnum) = struct.unpack_from(endc + "HH", data, 0x2E)
+    return e_shoff, e_shentsize, e_shnum
 
 
 def to_format_details(info: ElfInfo) -> dict[str, Any]:

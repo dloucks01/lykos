@@ -10,6 +10,7 @@ a targeted corpus/dictionary aimed at statically-flagged sinks.
 from __future__ import annotations
 
 import base64
+import bisect
 import hashlib
 import os
 import random
@@ -335,18 +336,26 @@ def _recovered_blocks(ctx, target):
     """
     from ..debug import rootcause
     from ..elf import parse as parse_elf
+    from ..elf import program_ranges
     fd = FunctionDAO(ctx.conn)
     fns = fd.list_by_target(target.id)
     if not fns:
         return ()
+    blob = ctx.content.path(target.sha256).read_bytes()
     try:
-        entry = parse_elf(ctx.content.path(target.sha256).read_bytes()).entry
+        entry = parse_elf(blob).entry
     except Exception:
         entry = None
     base = rootcause.image_base(fns, entry) or 0
+    ranges = program_ranges(blob)
     out = set()
     for f in fns:
         if not f.blocks:
+            continue
+        # ranges come from the ELF's own symbols, so compare in ELF vaddr space: on a PIE the
+        # decompiler's addresses sit at a different image base, and comparing raw dropped every
+        # function in the binary
+        if ranges and not _in_program(_addr_of(f) - base, ranges):
             continue
         full = fd.get(f.id)
         for b in ((full.ir or {}).get("blocks") or []):
@@ -355,6 +364,19 @@ def _recovered_blocks(ctx, target):
             except (KeyError, TypeError, ValueError):
                 continue
     return sorted(out)
+
+
+def _addr_of(f):
+    a = getattr(f, "addr", None)
+    try:
+        return int(a, 16) if isinstance(a, str) else int(a or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _in_program(addr, ranges) -> bool:
+    i = bisect.bisect_right([lo for lo, _ in ranges], addr) - 1
+    return i >= 0 and addr < ranges[i][1]
 
 
 def fuzz_stage(ctx) -> dict:
