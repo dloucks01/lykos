@@ -36,7 +36,7 @@ def make_capture(ctx, helper: Path, exe, mode, base_argv, timeout, python):
             (work / "stdin.bin").write_bytes(data)
         elif mode == "arg":
             try:
-                argv = argv + [sandbox.argv_arg(data)]
+                argv = argv + [sandbox.argv_arg(data, truncate=True)]
             except sandbox.ArgvNulError as e:
                 return {"ok": False, "reason": str(e)}
         elif mode == "file":
@@ -71,7 +71,7 @@ def make_qemu_capture(exe, arch, mode, base_argv, timeout, *, endianness=None, b
             stdin = data
         elif mode == "arg":
             try:
-                argv = argv + [sandbox.argv_arg(data)]
+                argv = argv + [sandbox.argv_arg(data, truncate=True)]
             except sandbox.ArgvNulError as e:
                 return {"ok": False, "reason": str(e)}
         elif mode == "file":

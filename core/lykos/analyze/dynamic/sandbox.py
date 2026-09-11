@@ -61,7 +61,7 @@ class ArgvNulError(ValueError):
     """A payload that cannot be delivered as a command-line argument."""
 
 
-def argv_arg(data: bytes) -> str:
+def argv_arg(data: bytes, *, truncate: bool = False) -> str:
     """Render a payload as ONE argv element, or refuse with a clear reason.
 
     execve() argument strings are NUL-terminated, so an argument cannot contain a NUL byte --
@@ -71,13 +71,47 @@ def argv_arg(data: bytes) -> str:
     report that honestly instead of surfacing a bare ValueError("embedded null byte") from
     inside subprocess, which reads like a crash in the tool rather than a property of the
     delivery channel.
+
+    `truncate` delivers what the kernel WOULD deliver -- everything up to the first NUL --
+    instead of refusing. Refusing outright was too strong for the case that matters: an
+    argv-reachable `strcpy` overflow copies until the NUL anyway, so a payload whose control
+    slot sits BEFORE the first NUL is delivered perfectly intact. That is not a hypothetical
+    -- it is CVE-2001-1413 in ncompress, where the return address lands at offset 1048 and
+    the marker's own high zero bytes are the first NUL at 1054. Nothing is assumed by
+    truncating: if the control slot does not survive, the marker check simply fails and no
+    primitive is claimed.
     """
     if b"\x00" in data:
+        if truncate:
+            return data.split(b"\x00", 1)[0].decode("latin-1")
         raise ArgvNulError(
             "payload contains a NUL byte at offset %d and cannot be delivered as a command-"
             "line argument (execve truncates at NUL); use input_mode 'stdin' or 'file'"
             % data.index(b"\x00"))
     return data.decode("latin-1")
+
+
+def argv_bytes(a):
+    """One argv element as BYTES, without re-encoding a binary payload.
+
+    `argv_arg` renders a payload as latin-1 text because that is the lossless round-trip for
+    arbitrary bytes through JSON. Handing that str to subprocess/execv undoes it: they encode
+    with the filesystem encoding, so every byte >= 0x80 becomes two UTF-8 bytes and any
+    payload carrying an address is silently corrupted. That is most L2/L3 payloads, and it is
+    why argv-delivered instruction-pointer control never confirmed.
+
+    A latin-1-decoded payload only ever holds code points <= U+00FF, so encoding it back with
+    latin-1 is exact. A genuine non-ASCII path (real text, code points above that) cannot be
+    a payload and is encoded the way the filesystem expects.
+    """
+    if isinstance(a, bytes):
+        return a
+    if not isinstance(a, str):
+        a = str(a)
+    try:
+        return a.encode("latin-1")
+    except UnicodeEncodeError:
+        return a.encode("utf-8", "surrogateescape")
 
 
 def host_arch() -> str:
@@ -313,7 +347,7 @@ def run(exe, *, argv=(), stdin: bytes = b"", timeout: float = 10.0,
                              note=f"no qemu-user for {arch} ({endianness or '?'}-endian) "
                                   f"on {host}")
 
-    base = [str(exe)] + [str(a) for a in argv]
+    base = [str(exe)] + [argv_bytes(a) for a in argv]
     inner = [emu] + base if emu else base
     # emulation is several times slower than native, so give it a longer wall-clock budget or
     # correct runs would be misreported as timeouts.

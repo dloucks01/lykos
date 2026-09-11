@@ -286,6 +286,41 @@ actionable.
   been. This also removed the last two false positives on jhead 3.04 — the `ProcessFile`
   `Comment[16001]`/`st` slot-reuse artifact documented above — taking it to 38 unknown / 4
   bounded / 0 suspect.
+- **[DONE] L2 on a REAL target.** Until now instruction-pointer control was only ever
+  demonstrated on the arch gate's synthetic ret2win fixtures. ncompress 4.2.4 — the
+  historically released version, built from upstream git at tag `v4.2.4` using only the
+  source's own build switches — carries CVE-2001-1413: `char tempname[MAXPATHLEN]` with an
+  unchecked `strcpy(tempname, *fileptr)`, reachable from a command-line filename.
+  Full chain, measured end to end: triage/disassemble/detect flags **"Stack buffer overflow:
+  unbounded strcpy() into a 1032-byte buffer"** (CWE-121, high) plus no-canary and no-PIE;
+  `build_poc` verifies L1; `poc_primitive` recovers offset **1048** and **confirms** it,
+  reporting `instruction-pointer-control`, level **L2**. The static frame prediction agrees
+  independently — the bundle's `static_candidates` carry
+  `{buffer: local_418, size: 1024, offset: 1048}`. The bundle reproduces standalone (exit 139),
+  and `rip = 0x1337c0de1337` verified under gdb outside lykos entirely.
+  Hardening was disabled at build time (`-fno-stack-protector -no-pie`), which is stated here
+  because a canary would block the return-address overwrite outright; triage reports both, so
+  the claim is never made against a build that has them.
+- **[DONE] Three silent defects sat between a working primitive and a confirmed one**, all
+  found by running the real target rather than by reading:
+  *argv payloads were corrupted in transit.* `argv_arg` renders a payload as latin-1 text (the
+  lossless round-trip through JSON), but `os.execv` and `subprocess` encode `str` with the
+  filesystem encoding — UTF-8 turns every byte >= 0x80 into two. The sentinel `0x1337c0de1337`
+  arrived as eight bytes instead of six, so the return address was wrong and confirmation
+  failed while the offset was perfectly correct. `sandbox.argv_bytes` is now the single rule,
+  applied in the ptrace helper, `sandbox.run`, `qemu_gdb` and `gdb`. **This broke argv-delivered
+  L2/L3 everywhere, not just here.**
+  *`gdb` spliced arguments into its `run` command line*, where a binary payload is mangled by
+  gdb's own parsing before execve sees it; arguments now go on gdb's command line via `--args`.
+  *The L2 bundle did not reproduce.* The arg-mode runner emitted the stage's BASE argv — nearly
+  always empty — so every argv-mode reproducer ran `./target.bin ''` and demonstrated nothing.
+  It now delivers `"$(cat ./input.bin)"`: command substitution is byte-transparent apart from
+  NUL, and execve truncates at the first NUL regardless, so the shell hands over exactly the
+  bytes the kernel would. The bundle is the deliverable; one that does not reproduce is worse
+  than none.
+- **[PLANNED] `poc_primitive` still defaults `input_mode` to stdin.** `root_cause` learned to
+  consult the run that found the input and then sweep the remaining modes; the L2 stage has the
+  same silent failure and should share that helper.
 - **[DONE] The static channel could not see a bug that is not a function call.** All seven
   detectors keyed on a call edge, a string, or a triage mitigation. jhead's only demonstrated
   bug — the one AFL++ found, the debugger root-caused and the L1 PoC reproduces — is an

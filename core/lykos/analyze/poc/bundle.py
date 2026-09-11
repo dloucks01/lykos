@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import io
 import json
+import shlex
 import tarfile
 import time
 
@@ -23,8 +24,14 @@ def _runner(mode: str, argv, signal_name: str, run_cmd=None) -> bytes:
     elif mode == "file":
         invoke = './target.bin ./input.bin'
     elif mode == "arg":
-        arg = argv[0] if argv else ""
-        invoke = f'./target.bin {arg!r}'
+        # The INPUT is the argument. This used to emit the stage's BASE argv -- normally
+        # empty -- so the reproducer ran `./target.bin ''` and demonstrated nothing, which
+        # made every argv-mode bundle useless as a deliverable.
+        # Command substitution is byte-transparent apart from NUL, which it drops, and
+        # execve truncates an argument at the first NUL regardless: the shell therefore
+        # delivers exactly the bytes the kernel would.
+        pre = "".join(shlex.quote(str(a)) + " " for a in (argv or []))
+        invoke = f'./target.bin {pre}"$(cat ./input.bin)"'
     else:
         invoke = './target.bin'
     return ("#!/bin/sh\n"
