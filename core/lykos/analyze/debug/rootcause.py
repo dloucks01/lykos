@@ -80,17 +80,153 @@ def _fn_at(ranges, addr):
     return None
 
 
-def symbolize(addr, maps, ranges, target_path):
+def module_base(maps, target_path):
+    """Runtime load base of the target's OWN module."""
+    if not maps or not target_path:
+        return 0
+    want = os.path.basename(target_path)
+    starts = [m["start"] for m in maps
+              if m.get("path") and os.path.basename(m["path"]) == want]
+    return min(starts) if starts else 0
+
+
+_ENTRY_NAMES = ("entry", "_start", "__start")
+
+
+def image_base(functions, elf_entry):
+    """The address the DECOMPILER placed file offset 0 at, or None if it cannot be derived.
+
+    Ghidra rebases a position-independent image -- 0x100000 for ET_DYN on this toolchain --
+    so a runtime address minus its load base is a FILE OFFSET, not a decompiler address. That
+    is derived here rather than assumed: the ELF header gives the entry point as a file vaddr
+    and the function table gives the same function's decompiler address, and the difference
+    between them is the base. Guessing it (rounding the lowest function down to a boundary)
+    would resolve frames to the wrong functions whenever the guess was off.
+    """
+    if elf_entry is None:
+        return None
+    for f in functions:
+        if (f.name or "").lstrip("_").lower() in ("entry", "start"):
+            a = _to_int(f.addr)
+            if a is not None and a >= elf_entry:
+                return a - elf_entry
+    return None
+
+
+def rebase_delta(maps, target_path, functions, elf_entry):
+    """How much to subtract from a runtime address to get a decompiler address.
+
+    0 for a non-PIE image (the two coincide) and None when it cannot be established, in which
+    case frames are matched absolutely and a PIE target simply resolves nothing -- which is
+    what it did before, and is at least honest.
+    """
+    rb = module_base(maps, target_path)
+    ib = image_base(functions, elf_entry)
+    if not rb or ib is None:
+        return None
+    return rb - ib
+
+
+def symbolize(addr, maps, ranges, target_path, delta=None):
     m = mapping_for(maps, addr)
     module = os.path.basename(m["path"]) if (m and m["path"]) else (
         "[anon]" if m else "??")
     entry = {"addr": addr, "module": module,
              "offset": (addr - m["start"]) if m else None, "symbol": None}
     f = _fn_at(ranges, addr)                      # absolute match (no-PIE)
+    static = addr
+    if f is None and delta and module == os.path.basename(target_path or ""):
+        f = _fn_at(ranges, addr - delta)          # PIE: rebase into the decompiler's image
+        if f is not None:
+            static = addr - delta
     if f is not None:
         entry["symbol"] = f.name or f"sub_{f.addr}"
         entry["func_addr"] = f.addr
+        entry["static_addr"] = static
     return entry
+
+
+# Widest call encoding across the supported ISAs (m68k `jsr` reaches 6 bytes; SuperH's return
+# address clears a delay slot), so a return address sits within this much of its call.
+_CALL_WINDOW = 16
+# Weakest to strongest. The distinction is the whole point: being in the same function as a
+# crash is proximity, while faulting inside the call a finding names is a demonstration.
+_TIERS = ("crash-function", "on-stack", "fault-site")
+
+
+def attribute(frames, findings, sites_by_finding=None):
+    """Which static findings does this crash actually demonstrate, and at which site?
+
+    A verified PoC used to land as an orphan row keyed on the signal, next to an undifferen-
+    tiated pile of static findings -- on jhead, one "out-of-bounds read" beside 38 unknown
+    copy sites, several in the very function the fault was in, with nothing joining them.
+    The backtrace already says which calls were executing; this reads it.
+
+    Strength is graded and only the top tier is a proof:
+      fault-site     the faulting PC is inside the call this site makes -- the sink itself
+                     faulted, so the finding is demonstrated
+      on-stack       that call was somewhere on the stack, so the site is on the crash path
+      crash-function the site merely sits in a function the stack runs through
+
+    Every tier NAMES THE SITE. Findings are deduped at defect grain -- one CWE-120 row covers
+    twenty memcpy sites -- so "this defect occurs in a function on the stack" is close to
+    vacuous on its own; which occurrence is the whole content of the claim.
+    """
+    by_finding = sites_by_finding or {}
+    occ_of, sites = {}, []
+    for f in findings:
+        occ = [o for o in (by_finding.get(f.id) or []) if o.get("site_addr")]
+        if not occ and f.site_addr:
+            occ = [{"function_addr": f.function_addr, "site_addr": f.site_addr}]
+        occ_of[f.id] = occ
+        for o in occ:
+            sa = _to_int(o.get("site_addr"))
+            if sa is not None:
+                sites.append((sa, f, o))
+    fn_addrs = {_to_int(fr.get("func_addr")) for fr in frames}
+    fn_addrs.discard(None)
+    sym_of = {_to_int(fr.get("func_addr")): fr.get("symbol") for fr in frames
+              if fr.get("func_addr")}
+    best: dict = {}
+
+    def where(o):
+        fa, sa = _to_int(o.get("function_addr")), _to_int(o.get("site_addr"))
+        name = sym_of.get(fa) or (f"0x{fa:x}" if fa is not None else "?")
+        return f"0x{sa:x} in {name}" if sa is not None else name
+
+    def offer(f, tier, detail, site):
+        cur = best.get(f.id)
+        if cur is None or _TIERS.index(tier) > _TIERS.index(cur["tier"]):
+            best[f.id] = {"finding": f, "tier": tier, "detail": detail, "site": site}
+
+    for f in findings:
+        for o in occ_of.get(f.id, ()):
+            if _to_int(o.get("function_addr")) in fn_addrs:
+                offer(f, "crash-function",
+                      f"a site of this defect ({where(o)}) sits in a function on the crashing "
+                      f"call stack -- proximity, not proof", o.get("site_addr"))
+                break
+
+    # Frame 0 is the faulting instruction; every later frame is a RETURN address, which sits
+    # just past the call it came from. That is what ties a frame to a recorded call site.
+    returns = frames[1:] if (frames and frames[0].get("fault_pc")) else frames
+    for depth, fr in enumerate(returns):
+        ra = fr.get("static_addr")
+        if ra is None:
+            continue
+        near = [t for t in sites if 0 < ra - t[0] <= _CALL_WINDOW]
+        if not near:
+            continue
+        sa, f, o = max(near, key=lambda t: t[0])   # closest call before the return address
+        if depth == 0:
+            offer(f, "fault-site",
+                  f"the fault occurred inside the call this finding names at {where(o)}",
+                  o.get("site_addr"))
+        else:
+            offer(f, "on-stack",
+                  f"the call at {where(o)} was on the stack when the fault occurred",
+                  o.get("site_addr"))
+    return sorted(best.values(), key=lambda a: -_TIERS.index(a["tier"]))
 
 
 def _is_memory_write(disasm):
@@ -166,10 +302,15 @@ def _callgraph_path(call_edges, sources_callers, crash_fn_addr, maxdepth=8):
     return None
 
 
-def build_slice(cap, functions, call_edges, findings, maps, target_path):
+def build_slice(cap, functions, call_edges, findings, maps, target_path,
+                sites_by_finding=None, elf_entry=None):
     ranges = _fn_ranges(functions)
-    chain = [cap.get("pc")] + list(cap.get("backtrace") or [])
-    frames = [symbolize(a, maps, ranges, target_path) for a in chain if a is not None]
+    delta = rebase_delta(maps, target_path, functions, elf_entry)
+    pc = cap.get("pc")
+    chain = [pc] + list(cap.get("backtrace") or [])
+    frames = [symbolize(a, maps, ranges, target_path, delta) for a in chain if a is not None]
+    if pc is not None and frames:
+        frames[0]["fault_pc"] = True              # the rest are return addresses
     crash_fn = next((fr for fr in frames if fr.get("func_addr")), None)
 
     sources_callers = {_to_int(e.src_addr) for e in call_edges
@@ -187,17 +328,24 @@ def build_slice(cap, functions, call_edges, findings, maps, target_path):
     for lo, _hi, fn in ranges:
         addr_to_name[lo] = fn.name or f"sub_{fn.addr}"
     named_path = [{"addr": hex(a), "symbol": addr_to_name.get(a)} for a in (path or [])]
+    attributed = attribute(frames, findings, sites_by_finding)
     return {"backtrace": frames, "crash_function": crash_fn,
             "source_path": named_path, "input_tainted": tainted,
-            "reachable_from_source": bool(path)}
+            "reachable_from_source": bool(path),
+            "attributed": [{"finding_id": a["finding"].id, "tier": a["tier"],
+                            "detail": a["detail"], "site_addr": a["site"],
+                            "title": a["finding"].title,
+                            "cwe": a["finding"].cwe} for a in attributed]}
 
 
-def analyze(cap, functions, call_edges, findings, target_path, arch):
+def analyze(cap, functions, call_edges, findings, target_path, arch,
+            sites_by_finding=None, elf_entry=None):
     from . import exploitability
     disasm = disasm_one(bytes.fromhex(cap.get("pc_bytes", "")), arch)
     verdict = classify(cap, disasm)
     exploit = exploitability.rate(cap, verdict)
-    sl = build_slice(cap, functions, call_edges, findings, cap.get("maps") or [], target_path)
+    sl = build_slice(cap, functions, call_edges, findings, cap.get("maps") or [], target_path,
+                     sites_by_finding, elf_entry)
     summary = _summary(verdict, sl, cap, disasm)
     return {"signal": cap.get("signal_name"), "pc": cap.get("pc"),
             "fault_addr": cap.get("fault_addr"), "faulting_instruction": disasm,
