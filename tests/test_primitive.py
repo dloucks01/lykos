@@ -378,3 +378,22 @@ def test_lsb_masked_pc_covers_riscv_as_well_as_arm():
     assert {"arm", "aarch64", "riscv", "riscv64"} <= set(_LSB_MASKED_PC)
     # ISAs that do NOT mask must stay out, or a genuine off-by-one alias gets accepted
     assert not ({"x86-64", "x86", "ppc64", "s390", "m68k"} & set(_LSB_MASKED_PC))
+
+
+def test_return_address_registers_are_per_isa_not_a_shared_guess():
+    """r14 is the LINK register on s390 and ARM but an ordinary callee-saved register on
+    PowerPC and MIPS. A single shared list either misses s390 (which is what happened: it
+    recovered a nonsense offset and never reached L2) or attributes instruction-pointer
+    control to a PowerPC register that merely happens to hold cyclic bytes.
+    """
+    from lykos.analyze.poc import primitive
+    assert primitive.ra_regs({"arch": "s390"}) == ("r14",)
+    assert "r14" not in primitive.ra_regs({"arch": "ppc"})
+    assert "r14" not in primitive.ra_regs({"arch": "mips"})
+    assert primitive.ra_regs({"arch": "ppc"}) == ("lr",)
+    assert primitive.ra_regs({"arch": "aarch64"}) == ("x30",)
+    assert primitive.ra_regs({"arch": "sh"}) == ("pr",)
+    assert primitive.ra_regs({"arch": "riscv"}) == ("x1", "ra")   # the layout names ra as x1
+    assert primitive.ra_regs({"arch": "m68k"}) == ()              # return address on the stack
+    # an unknown / absent arch falls back to the generic list rather than losing all of them
+    assert primitive.ra_regs({}) == primitive._RA_REGS

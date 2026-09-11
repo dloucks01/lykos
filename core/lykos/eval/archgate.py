@@ -77,12 +77,14 @@ MATRIX = [
     ArchCase("ppc64le", "powerpc64le-linux-gnu-gcc", "L3",
              note="regression canary for endianness reaching the sandbox"),
     ArchCase("riscv", "riscv64-linux-gnu-gcc", "L3"),
-    ArchCase("s390", "s390x-linux-gnu-gcc", "L1",
-             note="Ghidra ships no SystemZ processor, and the cyclic recovery does not pin a "
-                  "control slot on this program; the dynamic ladder still reaches L1"),
+    ArchCase("s390", "s390x-linux-gnu-gcc", "L3",
+             note="Ghidra ships no SystemZ processor, yet the whole dynamic ladder works: "
+                  "r14 is its link register and the PC reads big-endian"),
     ArchCase("loongarch", "loongarch64-linux-gnu-gcc", "L3", note="layout derived from the stub"),
     ArchCase("m68k", "m68k-linux-gnu-gcc", "L3", note="layout derived from the stub"),
-    ArchCase("sh", "sh4-linux-gnu-gcc", "L1", note="qemu-sh4 serves no target description"),
+    ArchCase("sh", "sh4-linux-gnu-gcc", "L3",
+             note="qemu-sh4 serves no target description, so its layout is the one that stays "
+                  "hand-written (verified against a live g-packet)"),
     ArchCase("sparcv9", "sparc64-linux-gnu-gcc", "L1",
              note="register windows keep the return address in %i7, not on the stack: a "
                   "bounded overflow never corrupts control flow, so only a copy that runs off "

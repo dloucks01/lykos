@@ -121,7 +121,7 @@ def primitive_stage(ctx) -> dict:
         #     is `value & ~1`, whose cyclic window can alias one word early -- searching
         #     `(pc | 1)` restores the exact slot;
         #   - the static-frame predictions (also the sole source when the fault isn't a ret).
-        trusted = rec is not None and (rec[1] in ("pc",) + primitive._RA_REGS
+        trusted = rec is not None and (rec[1] in ("pc",) + primitive.ra_regs(cap0)
                                        or mnem in ("ret", "retq", "retn"))
         confirm_cands = []                         # (offset, source, static_match, fp_slack)
         if trusted:

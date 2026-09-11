@@ -132,8 +132,9 @@ def test_derivable_arches_report_supported_without_a_hardcoded_layout():
     for arch in ("loongarch", "m68k", "sparcv9", "x86"):
         assert arch not in qg._LAYOUTS
         assert qg.supported(arch), f"{arch} should be supported via the stub description"
-    # qemu-sh4 serves no description at all, so SuperH stays honestly unsupported
-    assert not qg.supported("sh")
+    # SuperH is the counterexample: qemu-sh4 serves no description, so it is the one layout
+    # that has to be hand-written -- and it IS written, so the arch is supported.
+    assert "sh" in qg._LAYOUTS and qg.supported("sh")
 
 
 def test_fetch_layout_parses_a_target_description():
@@ -195,3 +196,19 @@ def test_win_address_packing_follows_the_target_not_the_host():
     assert le64[8:16] == (0x401146).to_bytes(8, "little")
     # the default stays x86-64 so existing callers are unaffected
     assert exploit.ret2win_input(8, 0x401146, 32)[8:16] == le64[8:16]
+
+
+def test_superh_layout_is_hand_written_and_self_consistent():
+    """qemu-sh4 serves no target description, so SuperH is the one layout that cannot be
+    derived. Transcribed from qemu's SH4 gdbstub and verified against a live g-packet: 59
+    32-bit registers (236 bytes), with an all-'A' overflow landing at indices 14, 16 and 17 --
+    r14 (frame pointer), pc and pr (link register).
+    """
+    from lykos.analyze.debug import qemu_gdb as qg
+    lay = qg._LAYOUTS["sh"]
+    assert len(lay) == 59, "SuperH g-packet is 59 registers"
+    assert sum(w for _, w in lay) == 236, "236 bytes total"
+    names = [n for n, _ in lay]
+    assert names[14] == "r14" and names[16] == "pc" and names[17] == "pr"
+    assert qg._sp_name("sh") == "r15"
+    assert qg.supported("sh") and qg.breakpoints_supported("sh")
