@@ -568,6 +568,27 @@ actionable.
   the ranked channels and stops early on a crash. This caught a regression the same hour it was
   introduced — ncompress went to 0 crashes when `fuzz` started inferring `file`, and back to
   **302 crashes / 1 unique** once it swept.
+- **[DONE] Execution throughput: 256 -> ~1,500 exec/s.** Profiling the exec path rather than
+  guessing showed where it all went: a raw subprocess costs 0.37 ms and `sandbox.run` costs
+  3.55 ms, so **bubblewrap was 3.18 ms of every execution — a 9.5x tax paid per input.**
+  `sandbox.run_batch` now executes many inputs inside ONE namespace: a small runner reads
+  length-prefixed payloads on stdin and executes the target once per payload. Isolation is
+  unchanged — every target process is still a child inside the same unshared-net,
+  read-only-root namespace — because speed is never a reason to run a hostile binary with less
+  containment. It returns `None` (and the caller falls back per-input) for anything it cannot
+  serve: no bwrap, no python3, an emulated or PE target, or a truncated reply.
+  Measured: 6.1x on the primitive (282 -> 1,728 exec/s) and **4.2x end to end** — jhead goes
+  from 26,833 executions in a campaign to **113,344**.
+- **[DONE] The coverage proxy was mostly noise, and the batching made it worse.** 53% of
+  inputs registered as "new behaviour" — a proxy that fires on half of everything is not a
+  signal. Two causes, both found by measuring the distinct-signature rate rather than assuming:
+  the batch runner created a NEW temp dir per batch and jhead prints the filename it was given,
+  so every batch looked novel; and in argv mode the filename IS the payload, so the program was
+  echoing its input back into the signature. The input path is now fixed inside the namespace,
+  and anything the program merely echoed is dropped from the signature — a program repeating
+  what it was given has said nothing about which branch it took.
+  Measured on jhead: file 53% -> **5.9%**, argv 40% -> **10.9%**, stdin **0.2%** (it ignores
+  stdin, which is the correct answer).
 - **[PLANNED] jhead's own bug is still not found by the built-in fuzzer.** The campaign now
   executes the target's parser rather than bouncing off its magic, but 23,000 executions from
   the generated seed produce no crash. jhead 3.04 guards the GPS value pointer with

@@ -70,3 +70,18 @@ def test_an_explicit_channel_is_honoured_alone():
     """An analyst who names the channel does not want two thirds of the budget elsewhere."""
     from lykos.analyze.poc.capture import modes_for
     assert modes_for([], "arg") == ["arg"]
+
+
+def test_echoed_input_is_not_new_behaviour():
+    """A parser handed its input as a filename prints that filename back, so every distinct
+    payload looked like a distinct path -- 40% of inputs counted as new behaviour in argv mode.
+    A program repeating what it was given has told us nothing about which branch it took."""
+    a = behaviour_of(_R(err=b"Error : cannot open 'AAAABBBB'"), b"AAAABBBB")
+    b = behaviour_of(_R(err=b"Error : cannot open 'CCCCDDDD'"), b"CCCCDDDD")
+    assert a == b
+
+
+def test_a_real_difference_still_registers_when_the_input_is_echoed():
+    a = behaviour_of(_R(err=b"Error : cannot open 'AAAA'"), b"AAAA")
+    b = behaviour_of(_R(err=b"Illegal subdirectory link 'AAAA'"), b"AAAA")
+    assert a != b

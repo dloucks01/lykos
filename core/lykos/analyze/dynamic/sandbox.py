@@ -15,6 +15,7 @@ import re
 import resource
 import shutil
 import signal
+import struct
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -112,6 +113,104 @@ def argv_bytes(a):
         return a.encode("latin-1")
     except UnicodeEncodeError:
         return a.encode("utf-8", "surrogateescape")
+
+
+# One namespace, many executions. Spawning bubblewrap costs 3.18 ms of a 3.55 ms execution --
+# a 9.5x tax paid on EVERY input -- which is why a campaign managed 256 exec/s against AFL++'s
+# 6,100. This runs inside a single sandbox and executes the target once per input, so the
+# namespace is paid for once per batch instead of once per input. Isolation is unchanged:
+# every target process is still a child inside the same unshared-net, read-only-root namespace.
+_BATCH_RUNNER = r"""
+import os, struct, subprocess, sys
+def readn(n):
+    b = b""
+    while len(b) < n:
+        c = sys.stdin.buffer.read(n - len(b))
+        if not c:
+            break
+        b += c
+    return b
+mode = sys.argv[1]
+per_timeout = float(sys.argv[2])
+cmd_prefix = sys.argv[3:]
+# A FIXED path: /tmp is a fresh tmpfs inside this namespace, and a name that changed per
+# batch leaked into any diagnostic that echoes the filename -- which made every batch's
+# output look novel to the campaign's coverage proxy.
+wf = "/tmp/lykos-fuzz-input.bin"
+out = sys.stdout.buffer
+(count,) = struct.unpack("<I", readn(4))
+for _ in range(count):
+    (ln,) = struct.unpack("<I", readn(4))
+    data = readn(ln)
+    if mode == "arg":
+        argv = cmd_prefix + [data.split(b"\x00", 1)[0].decode("latin-1")]
+        stdin = b""
+    elif mode == "file":
+        with open(wf, "wb") as fh:
+            fh.write(data)
+        argv = cmd_prefix + [wf]
+        stdin = b""
+    else:
+        argv, stdin = list(cmd_prefix), data
+    try:
+        pr = subprocess.run(argv, input=stdin, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, timeout=per_timeout)
+        rc, so, se, to = pr.returncode, pr.stdout[:4096], pr.stderr[:4096], 0
+    except subprocess.TimeoutExpired:
+        rc, so, se, to = 0, b"", b"", 1
+    except Exception:
+        rc, so, se, to = 0, b"", b"", 2
+    out.write(struct.pack("<iIIB", rc, len(so), len(se), to))
+    out.write(so)
+    out.write(se)
+out.flush()
+"""
+
+
+def run_batch(exe, payloads, *, mode="stdin", base_argv=(), timeout: float = 2.0,
+              arch=None, endianness=None, bits=None, host=None, mem_mb: int = 2048):
+    """Execute many inputs inside ONE sandbox. Returns a list of RunResult, or None.
+
+    None means "not available here" -- no bubblewrap, no python3, an emulated or PE target, a
+    malformed reply -- and the caller falls back to `run()` per input. Speed is never a reason
+    to run a hostile binary with less containment than usual, so this buys throughput by
+    amortising the namespace, not by giving one up.
+    """
+    host = host or host_arch()
+    if _is_pe(exe) or (arch and host and arch != host):
+        return None                                   # Wine / qemu paths stay per-exec
+    py = shutil.which("python3")
+    if not py or not _bwrap_usable() or not payloads:
+        return None
+    exedir = str(Path(exe).resolve().parent)
+    inner = [py, "-c", _BATCH_RUNNER, mode, str(timeout), str(exe),
+             *[argv_bytes(a).decode("latin-1") for a in base_argv]]
+    cmd = (["bwrap"] + _BWRAP_ARGS[:-1] + ["--ro-bind", exedir, exedir, "--"] + inner)
+    blob = bytearray(struct.pack("<I", len(payloads)))
+    for d in payloads:
+        blob += struct.pack("<I", len(d)) + d
+    budget = timeout * len(payloads) + 15.0
+    t0 = time.time()
+    rc, out, err, timed, _dur = _spawn(cmd, bytes(blob), budget,
+                                       _rlimits(mem_mb, int(budget) + 5, set_as=False,
+                                                nproc=_nproc_cap(False)))
+    if timed or rc != 0 or err.startswith(b"bwrap:"):
+        return None
+    per_ms = int((time.time() - t0) * 1000 / max(1, len(payloads)))
+    results, off = [], 0
+    for _ in payloads:
+        if off + 13 > len(out):
+            return None                               # truncated reply: fall back rather than
+        code, nso, nse, to = struct.unpack("<iIIB", out[off:off + 13])   # invent results
+        off += 13
+        so, se = out[off:off + nso], out[off + nso:off + nso + nse]
+        off += nso + nse
+        crashed, sig, signame, exit_code = classify_rc(code)
+        results.append(RunResult(isolation="bwrap+netns+batch", crashed=bool(crashed),
+                                 timed_out=bool(to), exit_code=exit_code, signal=sig,
+                                 signal_name=signame, stdout=so, stderr=se,
+                                 duration_ms=per_ms))
+    return results
 
 
 def host_arch() -> str:
