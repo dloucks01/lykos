@@ -44,6 +44,7 @@ class FormatModel:
 
     def parse(self, data: bytes):
         pos, fields = 0, []
+        covered = {}                     # blob name -> (declared span, offset of the length)
         for f in self.spec:
             t = f["type"]
             if t == "magic":
@@ -55,11 +56,25 @@ class FormatModel:
                 end = "<" if f.get("endian", "little") == "little" else ">"
                 raw = data[pos:pos + sz]
                 val = struct.unpack(end + code, raw.ljust(sz, b"\0"))[0] if raw else 0
+                cov = f.get("covers")
+                if cov and cov != "rest":
+                    covered[cov] = (val, pos)
                 fields.append({"f": f, "val": val})
                 pos += sz
-            else:                                       # blob: take the remainder
-                fields.append({"f": f, "val": data[pos:]})
-                pos = len(data)
+            else:
+                # A blob NAMED by a length field ends where that length says, so the fields
+                # after it can be parsed. Without this every blob ate the remainder, so a
+                # model could describe at most one variable region -- which is not enough for
+                # a real container: a JPEG's EXIF segment is followed by the frame and scan
+                # headers that decide whether the file parses at all.
+                name = f.get("name")
+                if name in covered:
+                    total, start = covered[name]
+                    stop = min(max(start + int(total), pos), len(data))
+                else:
+                    stop = len(data)
+                fields.append({"f": f, "val": data[pos:stop]})
+                pos = stop
         return fields
 
     def serialize(self, fields) -> bytes:
@@ -78,12 +93,26 @@ class FormatModel:
 
 
 def _fix_covers(model, fields) -> None:
-    """Recompute every `covers: "rest"` length so the structure stays parseable."""
+    """Recompute every `covers` length so the structure stays parseable.
+
+    `covers: "rest"` spans to the end of the input; `covers: <field name>` spans from the
+    length field's own start through the end of that field, which is what a JPEG segment
+    length actually means.
+    """
+    idx = {fd["f"].get("name"): j for j, fd in enumerate(fields)}
     for i, fd in enumerate(fields):
-        if fd["f"].get("covers") != "rest":
+        cov = fd["f"].get("covers")
+        if not cov:
             continue
-        before = model.serialize(fields[:i])
-        fd["val"] = len(model.serialize(fields)) - len(before)
+        start = len(model.serialize(fields[:i]))
+        if cov == "rest":
+            stop = len(model.serialize(fields))
+        else:
+            j = idx.get(cov)
+            if j is None:
+                continue
+            stop = len(model.serialize(fields[:j + 1]))
+        fd["val"] = max(0, stop - start)
 
 
 def seed_for_name(name: str) -> bytes | None:
@@ -92,17 +121,19 @@ def seed_for_name(name: str) -> bytes | None:
     if not entry:
         return None
     model = FormatModel([dict(f) for f in entry["spec"]])
-    return seed_for(model, entry.get("seed") or b"A" * 64)
+    seed = entry.get("seed")
+    return seed_for(model, seed if seed is not None else b"A" * 64,
+                    tail=entry.get("tail"))
 
 
-def seed_for(model: "FormatModel", payload: bytes = b"A" * 64) -> bytes:
+def seed_for(model: "FormatModel", payload: bytes = b"A" * 64, tail: bytes = None) -> bytes:
     """A minimal input the format's own gate accepts.
 
     The model already declares the magic and which integer sizes which blob, so a valid
     skeleton falls straight out of `serialize` -- there is no need for an analyst to attach a
     sample before a campaign can start doing work.
     """
-    fields = []
+    fields, blobs = [], []
     for f in model.spec:
         t = f["type"]
         if t == "magic":
@@ -112,7 +143,10 @@ def seed_for(model: "FormatModel", payload: bytes = b"A" * 64) -> bytes:
             # alongside one entry is rejected before the parser reaches anything interesting.
             fields.append({"f": f, "val": f.get("seed_value", 0)})
         else:
+            # the LAST blob gets the format's tail when it declares one (a JPEG's entropy data
+            # and end-of-image marker); earlier blobs get the payload
             fields.append({"f": f, "val": payload})
+            blobs.append(fields[-1])
     # length fields describe the blob they name, so the skeleton parses rather than truncating
     by_name = {fd["f"].get("name"): fd for fd in fields}
     for fd in fields:
@@ -123,6 +157,8 @@ def seed_for(model: "FormatModel", payload: bytes = b"A" * 64) -> bytes:
     # the length field itself and everything after it, not one named blob. Getting it wrong is
     # not cosmetic -- the parser reads a short segment and treats the remainder as padding,
     # so the seed never reaches the structure the rest of the model describes.
+    if tail is not None and blobs:
+        blobs[-1]["val"] = tail
     _fix_covers(model, fields)
     return model.serialize(fields)
 
@@ -193,6 +229,20 @@ def _exif_entry(tag, typ, count, value):
     return struct.pack("<HHI", tag, typ, count) + raw
 
 
+def _jpeg_frame():
+    """DQT + SOF0 + DHT + SOS: the smallest tail that makes jhead call the file complete."""
+    def seg(marker, body):
+        return b"\xff" + bytes([marker]) + struct.pack(">H", len(body) + 2) + body
+    dqt = seg(0xDB, b"\x00" + bytes(range(1, 65)))
+    sof0 = seg(0xC0, b"\x08" + struct.pack(">HH", 8, 8) + b"\x01" + b"\x01\x11\x00")
+    dht = seg(0xC4, b"\x00" + bytes(16))
+    sos = seg(0xDA, b"\x01" + b"\x01\x00" + b"\x00\x3f\x00")
+    return dqt + sof0 + dht + sos
+
+
+_JPEG_FRAME = _jpeg_frame()
+
+
 def _jpeg_seed_tail():
     """An EXIF payload that reaches the GPS parser, not merely the front door.
 
@@ -215,7 +265,7 @@ def _jpeg_seed_tail():
            + _exif_entry(0x0002, 5, 3, rat_off)                # GPSLatitude: 3 rationals
            + struct.pack("<I", 0))
     rationals = b"".join(struct.pack("<II", n, d) for n, d in ((51, 1), (30, 1), (0, 1)))
-    return ifd0_rest + gps + rationals + b"\xff\xd9"
+    return ifd0_rest + gps + rationals
 
 
 _JPEG_SEED_TAIL = _jpeg_seed_tail()
@@ -239,14 +289,24 @@ _BUILTINS = {
              # The TIFF header and the IFD entry count are part of the GATE, not the payload:
              # an EXIF reader rejects the file before either unless both are well formed, and
              # the entry count is one of the most productive fields a parser fuzzer can drive.
-             "seed": _JPEG_SEED_TAIL,
+             "seed": _JPEG_SEED_TAIL, "tail": b"\x00" * 8 + b"\xff\xd9",
              "spec": [
                  {"type": "magic", "value": b"\xff\xd8\xff\xe1"},
-                 {"type": "u16", "endian": "big", "name": "seglen", "covers": "rest"},
+                 # the APP1 length spans itself through the end of the EXIF payload, which is
+                 # also what bounds `seg` on the way back in
+                 {"type": "u16", "endian": "big", "name": "seglen", "covers": "seg"},
                  {"type": "magic", "value": b"Exif\x00\x00"},
                  {"type": "magic", "value": b"II*\x00\x08\x00\x00\x00"},
                  {"type": "u16", "endian": "little", "name": "nent", "seed_value": 1},
-                 {"type": "blob", "name": "seg"}]},
+                 {"type": "blob", "name": "seg"},
+                 # Everything past EXIF is what makes the file COMPLETE. jhead rejects a file
+                 # with no frame and scan header as "Unexpected end of file" and never reaches
+                 # ShowImageInfo -- 210 blocks, its largest function -- nor anything gated
+                 # behind an option, because those run downstream of a successful parse.
+                 # Measured minimum: SOF0 + SOS. DQT and DHT are not required but reach
+                 # process_DQT and process_DHT, another 69 blocks.
+                 {"type": "magic", "value": _JPEG_FRAME},
+                 {"type": "blob", "name": "scan"}]},
     "gif": {"tokens": ("GIF87a", "GIF89a"), "spec": [
         {"type": "magic", "value": b"GIF89a"},
         {"type": "u16", "endian": "little", "name": "w"},
