@@ -81,9 +81,11 @@ def detect_stage(ctx) -> dict:
             c["confidence"] = min(c.get("confidence", 0.4), 0.15)
             c["evidence"].append({"channel": "bounds", "detail": v["why"]})
             c["site_detail"] = v["why"]
-        elif v["verdict"] == bounds.SUSPECT:
-            # surfaced for review -- NOT promoted, because a recovered frame can name the
-            # wrong variable for a reused stack slot (see bounds.py)
+        elif v["verdict"] in (bounds.SUSPECT, bounds.SIGNED):
+            # Surfaced for review -- NOT promoted, because a recovered frame can name the
+            # wrong variable for a reused stack slot (see bounds.py). Critically also NOT
+            # demoted: a SIGNED verdict means a bounds check exists and does not bound, so
+            # treating it as "bounded" would bury the defect under its own guard.
             c["evidence"].append({"channel": "bounds", "detail": v["why"]})
             c["site_detail"] = v["why"]
 

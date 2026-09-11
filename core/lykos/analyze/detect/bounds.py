@@ -31,6 +31,10 @@ COPY_ARGS = {
 UNKNOWN = "unknown"
 SAFE = "bounded"
 SUSPECT = "exceeds-recovered-size"
+# A signed bounds check with nothing excluding a negative length. `if (n < 64)` on an `int`
+# admits n = -1, which memcpy's size_t parameter reads as 0xFFFFFFFFFFFFFFFF. The check looks
+# careful, the upper bound is real, and the copy is still unbounded.
+SIGNED = "signed-length"
 
 # Why this pass DEMOTES but never asserts an overflow.
 #
@@ -218,15 +222,22 @@ def classify_site(instrs, site_addr, sink, frame, arch, bits=64,
         if ln and ln[0] == "load" and blocks and site_block:
             g = guard_bound(blocks, site_block, (ln[1], ln[2]))
             if g:
-                gmax, why = g
-                if gmax <= room:
-                    return {"verdict": SAFE, "buffer": name, "capacity": room,
-                            "bound": gmax, "guard": True,
-                            "why": f"{why}; {name} holds {room}"}
-                return {"verdict": SUSPECT, "buffer": name, "capacity": room,
-                        "bound": gmax, "guard": True,
-                        "why": (f"{why}, but {name} holds only {room} -- the check does not "
-                                f"protect the buffer")}
+                gmax, why = g["bound"], g["why"]
+                common = {"buffer": name, "capacity": room, "bound": gmax, "guard": True}
+                if gmax > room:
+                    return {"verdict": SUSPECT, **common,
+                            "why": (f"{why}, but {name} holds only {room} -- the check does "
+                                    f"not protect the buffer")}
+                if not g["nonneg"]:
+                    # The upper bound is real and it is not a bound: the comparison is signed
+                    # and nothing dominating excludes a negative length, which the sink reads
+                    # as a 64-bit unsigned size.
+                    return {"verdict": SIGNED, **common, "signed": True,
+                            "why": (f"{why}, but the check is SIGNED and nothing excludes a "
+                                    f"negative length: n = -1 passes it and {sink} takes the "
+                                    f"length as an unsigned size, so {name} ({room} bytes) "
+                                    f"overflows")}
+                return {"verdict": SAFE, **common, "why": f"{why}; {name} holds {room}"}
         return {"verdict": UNKNOWN, "buffer": name, "capacity": room,
                 "why": f"length is not a compile-time constant ({name}, {room} bytes)"}
     n = ln[1]
@@ -279,9 +290,26 @@ _CC_TAKEN = {
     "JLE": "le", "JNG": "le", "JBE": "le", "JNA": "le",
     "JE": "eq", "JZ": "eq", "JNE": "ne", "JNZ": "ne",
 }
+# `JS`/`JNS` test the sign flag of `cmp n, K` directly, which is how gcc -O0 compiles the
+# `n >= 0` half of `if (n >= 0 && n < 64)` -- measured, not assumed. Without them the lower
+# bound in the one idiom that fixes this hazard reads as absent.
+_CC_TAKEN.update({"JS": "lt", "JNS": "ge"})
+
+# Signedness of the comparison, read off the same mnemonic. This is the whole hazard: JL and
+# JB are the same branch on different flags, and only the unsigned one proves `n >= 0`.
+# Equality branches order nothing, so they are neither.
+_CC_SIGNED = {
+    "JG": True, "JNLE": True, "JGE": True, "JNL": True, "JL": True, "JNGE": True,
+    "JLE": True, "JNG": True, "JS": True, "JNS": True,
+    "JA": False, "JNBE": False, "JAE": False, "JNB": False, "JNC": False,
+    "JB": False, "JNAE": False, "JC": False, "JBE": False, "JNA": False,
+}
 _NEGATE = {"gt": "le", "ge": "lt", "lt": "ge", "le": "gt", "eq": "ne", "ne": "eq"}
 # relation -> the largest value it still permits, given the compared constant K
 _UPPER = {"lt": lambda k: k - 1, "le": lambda k: k, "eq": lambda k: k}
+# relation -> the smallest value it still permits. Only used to prove `n >= 0`; a `!=` tells
+# us nothing, since -1 != 0.
+_LOWER = {"gt": lambda k: k + 1, "ge": lambda k: k, "eq": lambda k: k}
 
 
 def _preds(blocks):
@@ -378,15 +406,22 @@ def _branch_mnemonic(instr) -> str:
 
 
 def guard_bound(blocks, site_block, slot):
-    """Largest value the guards permit for `slot` on every path reaching `site_block`.
+    """What the dominating guards prove about `slot` on every path reaching `site_block`.
 
-    Returns (max_value, describing text) or None when no dominating comparison pins it. A
-    polarity we cannot read yields None rather than a guess: claiming a bound that is not
-    there would manufacture a "safe" verdict over a real overflow.
+    Returns {"bound": max value permitted, "why": text, "nonneg": bool} or None when no
+    dominating comparison pins an upper bound. A polarity we cannot read yields None rather
+    than a guess: claiming a bound that is not there would manufacture a "safe" verdict over
+    a real overflow.
+
+    `nonneg` is the other half of the proof and is tracked separately, because an upper bound
+    alone is not a bound. `if (n < 64)` on a signed int admits n = -1, which every copy sink
+    takes as a 64-bit unsigned size. Only an UNSIGNED comparison bounds both ends at once; a
+    signed one needs a separate dominating check (`n >= 0`, `n > 0`) to close the hazard.
     """
     by_addr = {b["addr"]: b for b in blocks}
     dom = dominators(blocks)
     best = None
+    nonneg = False
     for d in dom.get(site_block, ()):                 # every block that dominates the copy
         if d == site_block:
             continue
@@ -406,7 +441,8 @@ def guard_bound(blocks, site_block, slot):
                     target = "0x%x" % int(toks[1].split(":")[1], 16)
         if target is None:
             continue
-        rel = _CC_TAKEN.get(_branch_mnemonic(branch))
+        mnem = _branch_mnemonic(branch)
+        rel = _CC_TAKEN.get(mnem)
         if rel is None:
             continue                                  # unknown polarity -> no claim
         succ = blk.get("succ", []) or []
@@ -418,9 +454,14 @@ def guard_bound(blocks, site_block, slot):
             holds = _NEGATE[rel]
         else:
             continue
+        # A dominating lower bound is what makes a signed upper bound trustworthy. This runs
+        # before the zero-test rejection below, because `n >= 0` compares against exactly 0.
+        lo = _LOWER.get(holds)
+        if lo is not None and lo(k) >= 0:
+            nonneg = True
         fn = _UPPER.get(holds)
         if fn is None:
-            continue                                  # a lower bound tells us nothing here
+            continue                                  # a lower bound tells us nothing more
         if k <= 0:
             # `cmp slot, 0` is a null/zero test, not a size bound. Reading it as one produced
             # "at most 0 bytes reach this copy" on jhead's DoCommand -- a safe-looking verdict
@@ -430,6 +471,12 @@ def guard_bound(blocks, site_block, slot):
         cand = fn(k)
         if cand <= 0:
             continue
+        # An unsigned compare bounds both ends; so does `==`, whose value is exactly k >= 0.
+        if _CC_SIGNED.get(mnem) is False or holds == "eq":
+            nonneg = True
         if best is None or cand < best[0]:
-            best = (cand, f"guarded by a dominating check: at most {cand} bytes reach this copy")
-    return best
+            best = (cand, f"guarded by a dominating check: at most {cand} bytes reach this copy",
+                    _CC_SIGNED.get(mnem, True))
+    if best is None:
+        return None
+    return {"bound": best[0], "why": best[1], "nonneg": nonneg or best[2] is False}

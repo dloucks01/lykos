@@ -131,27 +131,30 @@ def _classify(guard):
 
 
 _LESS_64 = ["INT_SLESS unique:0x8f10:4 const:0x40:4 -> unique:0x8f20:1"]
-_LESSEQ_64 = ["INT_SLESSEQUAL unique:0x8f10:4 const:0x40:4 -> unique:0x8f20:1"]
+# Unsigned forms (`unsigned`/`size_t` lengths). These isolate the bound ARITHMETIC from the
+# signedness question, which has its own section below: an unsigned check bounds both ends, so
+# a SAFE verdict here turns purely on whether the limit was computed correctly.
+_BELOW_64 = ["INT_LESS unique:0x8f10:4 const:0x40:4 -> unique:0x8f20:1"]
+_BELOWEQ_64 = ["INT_LESSEQUAL unique:0x8f10:4 const:0x40:4 -> unique:0x8f20:1"]
 
 
 def test_a_dominating_less_than_check_bounds_the_copy():
     """`if (n < 64) memcpy(buf, s, n)` on a 64-byte buf: the largest n that reaches is 63."""
-    v = _classify(_guard(_LESS_64, "JL"))
+    v = _classify(_guard(_BELOW_64, "JB"))
     assert v["verdict"] == bounds.SAFE and v["bound"] == 63 and v["guard"] is True
 
 
 def test_the_bound_is_inclusive_for_a_less_or_equal_check():
     """`n <= 64` admits exactly 64, which still fits -- off by one here would be a false alarm."""
-    v = _classify(_guard(_LESSEQ_64, "JLE"))
+    v = _classify(_guard(_BELOWEQ_64, "JBE"))
     assert v["verdict"] == bounds.SAFE and v["bound"] == 64
 
 
 def test_polarity_is_read_from_the_branch_not_assumed():
-    """The guarded body is just as often the fall-through (`JGE skip`). Taking the taken-edge
+    """The guarded body is just as often the fall-through (`JAE skip`). Taking the taken-edge
     relation regardless of which way control went would invert every one of those, turning an
     unbounded copy into a confident 'safe'."""
-    g = _guard(["INT_SLESS unique:0x8f10:4 const:0x40:4 -> unique:0x8f20:1"], "JGE",
-               taken="0x3000", fallthrough="0x2000")
+    g = _guard(_BELOW_64, "JAE", taken="0x3000", fallthrough="0x2000")
     v = _classify(g)
     assert v["verdict"] == bounds.SAFE and v["bound"] == 63
 
@@ -197,14 +200,14 @@ def test_a_non_dominating_check_is_ignored():
 
 def test_the_tightest_dominating_bound_wins():
     """Nested checks intersect: two guards mean the smaller limit is the one that holds."""
-    outer = _guard(["INT_SLESS unique:0x8f10:4 const:0x1000:4 -> unique:0x8f20:1"], "JL",
+    outer = _guard(["INT_LESS unique:0x8f10:4 const:0x1000:4 -> unique:0x8f20:1"], "JB",
                    taken="0x1800")
-    inner = _guard(_LESS_64, "JL")
+    inner = _guard(_BELOW_64, "JB")
     inner["addr"] = "0x1800"
     blks = [outer, inner,
             {"addr": "0x2000", "succ": [], "instructions": _len_from_slot()},
             {"addr": "0x3000", "succ": [], "instructions": []}]
-    assert bounds.guard_bound(blks, "0x2000", ("RBP", -4))[0] == 63
+    assert bounds.guard_bound(blks, "0x2000", ("RBP", -4))["bound"] == 63
 
 
 def test_dominators_are_computed_over_the_real_cfg():
@@ -212,3 +215,95 @@ def test_dominators_are_computed_over_the_real_cfg():
             {"addr": "c", "succ": ["d"]}, {"addr": "d", "succ": []}]
     dom = bounds.dominators(blks)
     assert dom["d"] == {"a", "d"} and dom["b"] == {"a", "b"}
+
+
+# ------------------------------------------------------- signed lengths are not bounded
+# `if (n < 64) memcpy(buf, s, n)` on an `int` reads as a careful bounds check and is not one:
+# n = -1 passes it, and memcpy's size_t parameter takes that as 0xFFFFFFFFFFFFFFFF. Measured
+# on a compiled fixture -- the site this used to call "bounded" segfaults at n = -1 (exit 139)
+# while the two it still calls bounded reject it and return cleanly.
+#
+# gcc -O0 emits the distinction in the branch mnemonic: `ja` for unsigned, `jg` for signed,
+# and `js` for the `n >= 0` half of `if (n >= 0 && n < 64)`. All three verified with objdump.
+_JG_63 = (["INT_SLESS const:0x3f:4 unique:0x8f10:4 -> unique:0x8f20:1"], "JG")
+_JA_63 = (["INT_LESS const:0x3f:4 unique:0x8f10:4 -> unique:0x8f20:1"], "JA")
+
+
+def _skipping(cmp_pcode, mnemonic):
+    """The measured shape: the branch is taken to SKIP the copy, so the copy path holds the
+    negation. gcc emits `cmp $0x3f,n; jg skip` for `if (n < 64)`."""
+    return _guard(cmp_pcode, mnemonic, taken="0x3000", fallthrough="0x2000")
+
+
+def test_a_signed_upper_bound_alone_is_not_a_bound():
+    """The regression this whole section exists for: previously `bounded`, and wrong."""
+    v = _classify(_skipping(*_JG_63))
+    assert v["verdict"] == bounds.SIGNED
+    assert v["bound"] == 63, "the upper bound is real -- it is just not the whole bound"
+    assert "SIGNED" in v["why"] and "negative" in v["why"]
+
+
+def test_an_unsigned_check_bounds_both_ends_at_once():
+    """`unsigned n` / `size_t n` compile to `ja`, and there `n < 64` really does prove
+    0 <= n <= 63. Flagging these would make the check useless on correct code."""
+    v = _classify(_skipping(*_JA_63))
+    assert v["verdict"] == bounds.SAFE and v["bound"] == 63
+
+
+def test_a_dominating_non_negative_check_closes_the_hazard():
+    """`if (n >= 0 && n < 64)` -- gcc -O0 compiles the first half to `cmp $0,n; js skip`."""
+    lo = _guard(["INT_SLESS const:0x0:4 unique:0x8f10:4 -> unique:0x8f20:1"], "JS",
+                taken="0x3000", fallthrough="0x1800")
+    hi = _skipping(*_JG_63)
+    hi["addr"] = "0x1800"
+    blks = [lo, hi,
+            {"addr": "0x2000", "succ": [], "instructions": _len_from_slot()},
+            {"addr": "0x3000", "succ": [], "instructions": []}]
+    v = bounds.classify_site(_len_from_slot(), "0x200c", "memcpy", _FRAME, "x86-64",
+                             blocks=blks, site_block="0x2000")
+    assert v["verdict"] == bounds.SAFE and v["bound"] == 63
+
+
+def test_a_strictly_positive_check_also_closes_it():
+    """`if (n > 0 && n < 64)` -- `cmp $0,n; jle skip`, so the copy path holds n >= 1."""
+    lo = _guard(["INT_SLESSEQUAL const:0x0:4 unique:0x8f10:4 -> unique:0x8f20:1"], "JLE",
+                taken="0x3000", fallthrough="0x1800")
+    hi = _skipping(*_JG_63)
+    hi["addr"] = "0x1800"
+    blks = [lo, hi,
+            {"addr": "0x2000", "succ": [], "instructions": _len_from_slot()},
+            {"addr": "0x3000", "succ": [], "instructions": []}]
+    v = bounds.classify_site(_len_from_slot(), "0x200c", "memcpy", _FRAME, "x86-64",
+                             blocks=blks, site_block="0x2000")
+    assert v["verdict"] == bounds.SAFE
+
+
+def test_a_non_zero_check_is_not_a_lower_bound():
+    """`if (n != 0 && n < 64)` still admits -1. The zero-compare is there, it just proves
+    nothing about the sign -- and reading it as a lower bound would reopen the hazard."""
+    lo = _guard(["INT_EQUAL const:0x0:4 unique:0x8f10:4 -> unique:0x8f20:1"], "JE",
+                taken="0x3000", fallthrough="0x1800")
+    hi = _skipping(*_JG_63)
+    hi["addr"] = "0x1800"
+    blks = [lo, hi,
+            {"addr": "0x2000", "succ": [], "instructions": _len_from_slot()},
+            {"addr": "0x3000", "succ": [], "instructions": []}]
+    v = bounds.classify_site(_len_from_slot(), "0x200c", "memcpy", _FRAME, "x86-64",
+                             blocks=blks, site_block="0x2000")
+    assert v["verdict"] == bounds.SIGNED
+
+
+def test_exceeding_the_buffer_outranks_the_signed_hazard():
+    """When the permitted bound already overflows, that is the more concrete statement --
+    the length need not even be negative for it to be wrong."""
+    g = _skipping(["INT_SLESS const:0xfff:4 unique:0x8f10:4 -> unique:0x8f20:1"], "JG")
+    v = _classify(g)
+    assert v["verdict"] == bounds.SUSPECT and "does not protect the buffer" in v["why"]
+
+
+def test_guard_bound_reports_the_two_halves_separately():
+    assert bounds.guard_bound(_blocks(_skipping(*_JA_63)), "0x2000", ("RBP", -4)) == {
+        "bound": 63, "nonneg": True,
+        "why": "guarded by a dominating check: at most 63 bytes reach this copy"}
+    assert bounds.guard_bound(_blocks(_skipping(*_JG_63)), "0x2000",
+                              ("RBP", -4))["nonneg"] is False
