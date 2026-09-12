@@ -14,6 +14,8 @@ import shutil
 from pathlib import Path
 from typing import Optional
 
+from ..fuzz.runner import place
+
 _ARCH_SUFFIX = {"x86-64": "x86_64", "x86": "i386", "aarch64": "aarch64", "arm": "arm",
                 "mips": "mips", "mipsel": "mipsel", "ppc": "ppc", "ppc64": "ppc64",
                 "riscv64": "riscv64"}
@@ -56,7 +58,7 @@ def run_once(symqemu: Path, target: Path, seed: bytes, out_dir: Path, *, mode: s
     stdin = b""
     if mode == "file":
         env["SYMCC_INPUT_FILE"] = str(seed_file)
-        argv = argv + [str(seed_file)]
+        argv = place(argv, str(seed_file))
     else:                                              # stdin: SymCC treats stdin as symbolic
         stdin = seed
     cmd = [str(symqemu), str(target)] + argv

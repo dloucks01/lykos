@@ -19,6 +19,7 @@ from pathlib import Path
 
 from ...db.dao import FindingDAO, TargetDAO
 from ...jobs.registry import register_stage
+from ..fuzz.runner import place
 from ..poc.capture import how_to_feed
 from . import sandbox
 
@@ -93,7 +94,7 @@ def heap_stage(ctx) -> dict:
         stdin = data if mode == "stdin" else b""
         if mode == "file":
             (workdir / "input.bin").write_bytes(data)
-            run_argv = argv + [str(workdir / "input.bin")]
+            run_argv = place(argv, str(workdir / "input.bin"))
 
         report = workdir / "heap.json"
         env = dict(os.environ)

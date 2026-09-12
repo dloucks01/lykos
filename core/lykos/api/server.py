@@ -368,12 +368,14 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(self._read_body() or b"{}")
             found = invmod.discover(self._target_strings(s, tid),
                                     usage_hint=body.get("usage_hint"))
-            argv = body.get("argv") or invmod.propose_argv(found)
-            found["proposed_argv"] = argv
-            if not body.get("verify", True) or not argv:
-                return self._json(found)
             d = Path(tempfile.mkdtemp(prefix="lykos-invocation-"))
             try:
+                # Into the EXE's directory: the sandbox masks /tmp and binds back only that
+                # one, so a jar or config written elsewhere does not exist for the target.
+                argv = body.get("argv") or invmod.materialize(found, d)
+                found["proposed_argv"] = argv
+                if not body.get("verify", True) or not argv:
+                    return self._json(found)
                 exe = d / "target.bin"
                 exe.write_bytes(s.content.path(t.sha256).read_bytes())
                 os.chmod(exe, 0o755)

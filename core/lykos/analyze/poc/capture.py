@@ -8,6 +8,7 @@ import tempfile
 from pathlib import Path
 
 from ..dynamic import sandbox
+from ..fuzz.runner import place
 
 _HELPER = "ptrace_capture.py"
 
@@ -36,12 +37,12 @@ def make_capture(ctx, helper: Path, exe, mode, base_argv, timeout, python):
             (work / "stdin.bin").write_bytes(data)
         elif mode == "arg":
             try:
-                argv = argv + [sandbox.argv_arg(data, truncate=True)]
+                argv = place(argv, sandbox.argv_arg(data, truncate=True))
             except sandbox.ArgvNulError as e:
                 return {"ok": False, "reason": str(e)}
         elif mode == "file":
             (work / "input.bin").write_bytes(data)
-            argv = argv + [str(work / "input.bin")]
+            argv = place(argv, str(work / "input.bin"))
         spec = {"exe": str(exe), "argv": argv, "stdin_file": stdin_file, "timeout": timeout}
         if breakpoints:
             spec["breakpoints"] = [int(a) for a in breakpoints]
@@ -71,12 +72,12 @@ def make_qemu_capture(exe, arch, mode, base_argv, timeout, *, endianness=None, b
             stdin = data
         elif mode == "arg":
             try:
-                argv = argv + [sandbox.argv_arg(data, truncate=True)]
+                argv = place(argv, sandbox.argv_arg(data, truncate=True))
             except sandbox.ArgvNulError as e:
                 return {"ok": False, "reason": str(e)}
         elif mode == "file":
             (work / "input.bin").write_bytes(data)
-            argv = argv + [str(work / "input.bin")]
+            argv = place(argv, str(work / "input.bin"))
         return qemu_gdb.capture(exe, arch, argv=argv, stdin=stdin, timeout=timeout,
                                 endianness=endianness, bits=bits, breakpoints=breakpoints)
 

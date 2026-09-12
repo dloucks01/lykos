@@ -209,6 +209,15 @@ _TOCTOU_USE = {"open", "open64", "fopen", "fopen64", "freopen", "creat", "unlink
                "rename", "chmod", "chown", "truncate", "symlink", "link", "mkdir", "rmdir"}
 
 
+
+
+# A credential is a credential whatever the substrate: this detector reads only strings,
+# so it works on a jar's constant pool exactly as it works on an ELF's .rodata. The other
+# detectors need call edges or mitigation flags, neither of which a JVM target has -- and
+# `hardening` in particular would report "no PIE, no NX" about a runtime that has neither
+# concept.
+hardcoded_secrets.jvm_safe = True  # type: ignore[attr-defined]
+
 @register_detector
 def toctou(ctx: DetectContext):
     """A path checked with access()/stat() and then opened or modified in the same function.

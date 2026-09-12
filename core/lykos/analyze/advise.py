@@ -101,7 +101,12 @@ def advise(*, imports: list, functions: int, findings: int, seeds: int,
     # evidence there is.
     cfg_flag = next((f for f in ((invocation or {}).get("flags") or [])
                      if f.get("kind") == "config" and not f.get("optional")), None)
-    if cfg_flag and mode is None:
+    if cfg_flag:
+        # This WINS over the import guess rather than only filling a gap. The import heuristic
+        # infers a channel from the presence of `fopen` or `read`, which a program that does
+        # several things has all of; a REQUIRED flag in the binary's own usage line says which
+        # channel the program insists on. On a jar the imports are method names, so `read`
+        # and `readObject` made a config-driven service look stdin-driven.
         mode, shape = "file", f"a config file behind {cfg_flag['flag']}"
     backend, backend_why = fuzz_backend(afl_usable, findings)
     if mode is None:
@@ -123,7 +128,18 @@ def advise(*, imports: list, functions: int, findings: int, seeds: int,
                                                          "can still show which sinks exist",
                           "params": {}, "ready": True, "done": functions > 0}],
                 "file_parser": False, "afl_usable": afl_usable}
-    if file_format == "pe":
+    if file_format in ("jar", "class"):
+        # AFL++ instruments native code; there is nothing for it to instrument here, and
+        # recommending it would be the same confident plan for something that cannot work as
+        # recommending it for a PE. Black-box mutation over the JVM is what is actually
+        # available, and it is workable: ~36 executions/second measured, against Wine's ~1.
+        backend, backend_why = "fuzz", (
+            "a Java target runs under the JVM, which AFL++ cannot instrument, so there is no "
+            "coverage feedback to be had. Black-box mutation is the real option and it is a "
+            "practical one here (~36 executions/second measured): a defect surfaces as an "
+            "uncaught exception, and the constant pool supplies the dictionary and the "
+            "config keys for free")
+    elif file_format == "pe":
         # AFL++ instruments ELF; it cannot drive a Windows PE here, and the Wine path runs at
         # about one execution a second (measured: 1,249 ms per run against ~580/s native), so
         # a campaign is thousands of executions, not millions. Recommending coverage_fuzz for
@@ -145,8 +161,10 @@ def advise(*, imports: list, functions: int, findings: int, seeds: int,
          "text": ("structure model — set" if has_format else
                   "structure model — lets the mutator keep length and payload coherent "
                   "(less critical with coverage feedback, which learns structure)")},
-        {"ok": functions > 0,
-         "text": (f"decompiled — {functions} functions" if functions else
+        {"ok": functions > 0 or file_format in ("jar", "class"),
+         "text": ("constant pool — every string and call is already in the clear; there is no "
+                  "machine code to decompile" if file_format in ("jar", "class")
+                  else f"decompiled — {functions} functions" if functions else
                   "decompiled — not yet; needed to explain a crash, not to find one")},
         {"ok": findings > 0,
          "text": (f"static findings — {findings}" if findings else
@@ -175,13 +193,17 @@ def advise(*, imports: list, functions: int, findings: int, seeds: int,
     else:
         plan.append({"stage": "root_cause", "why": "runs once a crashing input exists",
                      "params": {"input_mode": mode}, "ready": False})
-    plan += [
+    plan += ([] if file_format in ("jar", "class") else [
         {"stage": "disassemble", "why": "explain what execution found, and enable the "
                                         "static channels", "params": {},
-         "ready": True, "done": functions > 0},
-        {"stage": "detect_cwe", "why": "static findings — supporting evidence, ranked below "
-                                       "anything demonstrated", "params": {},
-         "ready": functions > 0, "done": findings > 0},
+         "ready": True, "done": functions > 0}]) + [
+        {"stage": "detect_cwe",
+         "why": ("the constant pool names every dangerous API this code calls — capability "
+                 "findings, ranked below anything demonstrated"
+                 if file_format in ("jar", "class") else
+                 "static findings — supporting evidence, ranked below anything demonstrated"),
+         "params": {},
+         "ready": functions > 0 or file_format in ("jar", "class"), "done": findings > 0},
     ]
 
     headline = (f"Input looks like {shape}. Start with {backend} — {backend_why}."

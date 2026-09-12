@@ -17,6 +17,7 @@ from ...jobs.registry import register_stage
 from .. import elf
 from ..dynamic import sandbox
 from ..dynamic.stage import crash_dedup_key
+from ..fuzz.runner import place
 from ..poc.capture import MODES, how_to_feed
 from . import gdb, rootcause
 
@@ -83,10 +84,10 @@ def multi_debug_stage(ctx) -> dict:
         elif m == "arg":
             # execve truncates at the first NUL; a raw decode raises instead, so every payload
             # carrying an address was undeliverable here.
-            argv = argv + [sandbox.argv_arg(input_bytes, truncate=True)]
+            argv = place(argv, sandbox.argv_arg(input_bytes, truncate=True))
         else:
             (ctx.scratch() / "input.bin").write_bytes(input_bytes)
-            argv = argv + [str(ctx.scratch() / "input.bin")]
+            argv = place(argv, str(ctx.scratch() / "input.bin"))
         return argv, stdin_file
 
     # Try the believed channel, then the rest. A crashing input fed the wrong way does not

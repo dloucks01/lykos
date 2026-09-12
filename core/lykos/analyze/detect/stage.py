@@ -192,10 +192,59 @@ def _program_only(ctx, target, functions):
     return keep_fn, keep_ed, dropped
 
 
+def _detect_jvm(ctx, target) -> dict:
+    """Detection for a Java target, which has no machine code for the P-Code channels.
+
+    Every channel this stage normally runs -- taint, bounds, integer overflow, the deref
+    classifier -- needs decompiled functions, and a jar has none, so `detect_cwe` on a Java
+    target did all its work and filed nothing. The constant pool answers a different but
+    overlapping question directly: which dangerous APIs this code calls, and with what
+    arguments, stated outright rather than recovered.
+    """
+    from .. import invocation as invmod
+    from .. import jvm as jvmmod
+    from . import jvmdetect
+    data = ctx.content.path(target.sha256).read_bytes()
+    info = jvmmod.parse(data)
+    cands = jvmdetect.analyze(info)
+    # The string-based detectors are substrate-independent -- hardcoded credentials are
+    # hardcoded credentials -- and the constant pool feeds them exactly as a .rodata scan
+    # feeds them for an ELF.
+    # Attribute each constant to the class holding it, so a credential finding names the
+    # class rather than an offset that does not exist in a jar.
+    rows = []
+    seen: set = set()
+    for cls, d in (info.by_class or {}).items():
+        rows += invmod.string_rows([v for v in d.get("strings", []) if v not in seen],
+                                   where=cls.replace("/", "."))
+        seen.update(d.get("strings", []))
+    rows += invmod.string_rows([v for v in info.strings if v not in seen], where="const-pool")
+    dctx = DetectContext(target_id=target.id, case_id=target.case_id, call_edges=[],
+                         strings=rows, functions=[], mitigations={}, frames={})
+    for det in DETECTORS:
+        if getattr(det, "jvm_safe", False):
+            cands += det(dctx)
+    fdao = FindingDAO(ctx.conn)
+    for c in cands:
+        fdao.upsert(target.id, target.case_id, c)
+    ctx.emit("detect.done", payload={
+        "findings": len(cands), "substrate": "jvm-constant-pool",
+        "classes": len(info.classes), "calls": len(info.calls),
+        "note": ("Java target: findings come from the constant pool, which names every call "
+                 "and string in the clear. There is no machine code, so the taint, bounds and "
+                 "integer-overflow channels do not run -- these are capability findings and "
+                 "rank below anything execution demonstrates.")})
+    ctx.progress(pct=100, msg=f"{len(cands)} findings from {len(info.classes)} classes")
+    return {}
+
+
 def detect_stage(ctx) -> dict:
     target = TargetDAO(ctx.conn).get(ctx.target_id) if ctx.target_id else None
     if target is None:
         raise ValueError("detect_cwe requires a target_id")
+
+    if (target.file_type or "").lower() in ("jar", "class"):
+        return _detect_jvm(ctx, target)
 
     fdao = FunctionDAO(ctx.conn)
     functions = fdao.list_by_target(target.id)

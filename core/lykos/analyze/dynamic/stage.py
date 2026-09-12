@@ -8,6 +8,7 @@ import os
 
 from ...db.dao import DynResultDAO, FindingDAO, TargetDAO
 from ...jobs.registry import register_stage
+from ..fuzz.runner import place
 from . import sandbox
 
 DYNAMIC_STAGE = "dynamic_run"
@@ -57,7 +58,9 @@ def crash_finding_candidate(signal_name, input_sha, isolation, detector, extra="
     than duplicate, so the faulting address is taken from the crash itself, not from whichever
     stage happened to observe it.
     """
-    cwe, sev = _SIG_CWE.get(signal_name, ("CWE-119", "high"))
+    from ..jvm import cwe_for_exception
+    cwe, sev = _SIG_CWE.get(signal_name) or cwe_for_exception(signal_name) \
+        or ("CWE-119", "high")
     short = input_sha[:12] if input_sha else "(none)"
     detail = f"{signal_name} with input {short} [{isolation}]"
     if fault_pc:
@@ -71,7 +74,9 @@ def crash_finding_candidate(signal_name, input_sha, isolation, detector, extra="
     return {
         "cwe": cwe, "severity": sev, "state": state, "confidence": confidence,
         "detector": detector,
-        "title": f"Reproduced crash ({signal_name}) under dynamic execution",
+        "title": (f"Reproduced fault ({signal_name}) under the JVM"
+                  if cwe_for_exception(signal_name) and signal_name not in _SIG_CWE
+                  else f"Reproduced crash ({signal_name}) under dynamic execution"),
         "site_addr": (hex(fault_pc) if fault_pc else None), "function_addr": None,
         "dedup_key": crash_dedup_key(signal_name, fault_pc),
         "evidence": evidence,
@@ -95,7 +100,7 @@ def dynamic_stage(ctx) -> dict:
     stdin = input_bytes if mode == "stdin" else b""
     if mode == "arg" and input_bytes:
         try:
-            argv = argv + [sandbox.argv_arg(input_bytes)]
+            argv = place(argv, sandbox.argv_arg(input_bytes))
         except sandbox.ArgvNulError as e:
             ctx.emit("dynamic.done", payload={"crashed": False, "note": str(e)})
             ctx.progress(pct=100, msg="payload undeliverable via argv")
@@ -103,7 +108,7 @@ def dynamic_stage(ctx) -> dict:
     elif mode == "file" and input_bytes:         # deliver the input as a file argument
         infile = ctx.scratch() / "input.bin"
         infile.write_bytes(input_bytes)
-        argv = argv + [str(infile)]
+        argv = place(argv, str(infile))
 
     exe = ctx.scratch() / "target.bin"
     exe.write_bytes(ctx.content.path(target.sha256).read_bytes())

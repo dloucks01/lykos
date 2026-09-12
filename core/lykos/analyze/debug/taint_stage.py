@@ -23,6 +23,7 @@ from ...db.dao import CallEdgeDAO, FindingDAO, TargetDAO
 from ...jobs.registry import register_stage
 from ..detect.catalog import normalize
 from ..dynamic import sandbox
+from ..fuzz.runner import place
 from ..poc.capture import how_to_feed
 from . import elfsyms, monitor, qemu_gdb
 
@@ -113,7 +114,7 @@ def taint_stage(ctx) -> dict:
     elif mode == "file":
         infile = ctx.scratch() / "taint-input.bin"
         infile.write_text(marker)
-        run_argv = argv + [str(infile)]
+        run_argv = place(argv, str(infile))
 
     if emulated:
         info = elfsyms.read(exe)

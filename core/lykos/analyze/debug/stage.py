@@ -14,6 +14,7 @@ from ...jobs.registry import register_stage
 from .. import elf
 from ..dynamic import sandbox
 from ..dynamic.stage import crash_dedup_key
+from ..fuzz.runner import place
 from ..poc.capture import MODES, how_to_feed, make_capture, make_qemu_capture, materialize_helper
 from . import gdb, qemu_gdb, rootcause
 
@@ -27,6 +28,83 @@ def _hex(v):
     return None if v is None else (v if isinstance(v, str) else hex(v))
 
 
+def _root_cause_jvm(ctx, target, input_sha, base_argv, mode, timeout) -> dict:
+    """Root cause for a Java target -- where the JVM hands it to you.
+
+    The native path attaches a debugger to recover a backtrace from a fault address. A JVM
+    fault arrives with the backtrace already attached, symbolised, with line numbers, and
+    naming the exception class: `Svc.setOpt(Svc.java:14)` is strictly more than the native
+    channel can produce even when it works. What it does NOT have is an address, so the
+    finding is keyed on the application frame instead -- and on the application frame rather
+    than the top one, because `Integer.parseInt("abc")` throws three JDK frames deep and
+    blaming java.base would merge every such defect in the program into one.
+
+    Without this the stage declined with "no qemu gdbstub layout for jvm", which is true of
+    qemu and irrelevant here: nothing needed emulating.
+    """
+    import json as _json
+
+    from ..fuzz.runner import place
+    from ..jvm import cwe_for_exception
+    input_bytes = ctx.content.get_bytes(input_sha)
+    exe = ctx.scratch() / "target.bin"
+    exe.write_bytes(ctx.content.path(target.sha256).read_bytes())
+    wf = ctx.scratch() / "input.bin"
+    wf.write_bytes(input_bytes)
+    tried = []
+    res = None
+    for m in [mode] + [x for x in MODES if x != mode]:
+        argv, stdin = (place(base_argv, str(wf)), b"") if m != "stdin" else (
+            list(base_argv), input_bytes)
+        ctx.progress(msg=f"reproducing under the JVM ({m})")
+        res = sandbox.run(exe, argv=argv, stdin=stdin, timeout=timeout)
+        tried.append(m)
+        if res.crashed:
+            mode = m
+            break
+    if res is None or not res.crashed:
+        ctx.emit("rootcause.done", payload={
+            "supported": True, "backend": "jvm", "input_modes_tried": tried,
+            "note": "the input did not fault under the JVM via any of " + ", ".join(tried)})
+        ctx.progress(pct=100, msg="no fault reproduced (tried %s)" % ", ".join(tried))
+        return {}
+
+    kind, detail, frames = sandbox.jvm_exception(res.stderr, res.exit_code, res.stdout)
+    blame = sandbox.app_frame(frames)
+    cwe, sev = cwe_for_exception(kind) or ("CWE-248", "medium")
+    summary = detail or f"uncaught {kind}"
+    report = {
+        "backend": "jvm", "signal": kind, "summary": summary,
+        "classification": {"cwe": cwe, "class": kind, "severity": sev},
+        "stack": [f"{a}({b})" for a, b in frames],
+        "blame_frame": f"{blame[0]}({blame[1]})" if blame else None,
+        "input_mode": mode, "stderr": (res.stderr or b"")[:4000].decode("utf-8", "replace"),
+        # Say what this level of evidence is and is not. The JVM owns the instruction
+        # pointer, so no amount of work here produces L2/L3 -- that is the runtime, not a gap.
+        "exploitability": {
+            "rating": "denial-of-service", "score": 35,
+            "reasons": ["an uncaught exception terminates the process, which for a service is "
+                        "denial of service",
+                        "the JVM checks every array access and owns every pointer, so this "
+                        "cannot be escalated to control-flow hijack (no L2/L3 for Java)"]},
+    }
+    report_sha = ctx.put_artifact("root-cause", data=_json.dumps(
+        report, indent=2, sort_keys=True).encode(), meta={"cwe": cwe})
+    FindingDAO(ctx.conn).upsert(target.id, target.case_id, {
+        "cwe": cwe, "title": f"Root cause: uncaught {kind}", "severity": sev,
+        "state": "confirmed", "confidence": 0.9, "detector": "root_cause",
+        "site_addr": report["blame_frame"], "function_addr": None,
+        "dedup_key": crash_dedup_key(kind, res.fault_pc),
+        "evidence": [{"channel": "root-cause", "detail": summary},
+                     {"channel": "stack", "detail": " <- ".join(report["stack"][:6])}]})
+    ctx.emit("rootcause.done", payload={
+        "supported": True, "backend": "jvm", "cwe": cwe, "classification": kind,
+        "summary": summary, "input_mode": mode, "blame_frame": report["blame_frame"],
+        "exploitability": "denial-of-service", "report": report_sha})
+    ctx.progress(pct=100, msg=summary[:80])
+    return {"output_shas": [report_sha], "output_kind": "root-cause"}
+
+
 def root_cause_stage(ctx) -> dict:
     target = TargetDAO(ctx.conn).get(ctx.target_id) if ctx.target_id else None
     if target is None:
@@ -37,6 +115,9 @@ def root_cause_stage(ctx) -> dict:
         raise ValueError("root_cause requires params.input_sha (a crashing input)")
     timeout = float(p.get("timeout", 10))
     mode, base_argv, mode_why = how_to_feed(ctx.conn, target, input_sha, p)
+
+    if (target.file_type or "").lower() in ("jar", "class"):
+        return _root_cause_jvm(ctx, target, input_sha, base_argv, mode, timeout)
 
     host = sandbox.host_arch()
     emulated = bool(target.arch and target.arch != host)
@@ -74,10 +155,10 @@ def root_cause_stage(ctx) -> dict:
                 stdin_file = str(ctx.scratch() / "stdin.bin")
                 (ctx.scratch() / "stdin.bin").write_bytes(input_bytes)
             elif m == "arg":
-                argv = argv + [input_bytes.decode("latin-1")]
+                argv = place(argv, input_bytes.decode("latin-1"))
             elif m == "file":
                 (ctx.scratch() / "input.bin").write_bytes(input_bytes)
-                argv = argv + [str(ctx.scratch() / "input.bin")]
+                argv = place(argv, str(ctx.scratch() / "input.bin"))
             return gdb.run_gdb(gpath, exe, argv, stdin_file, ctx=ctx, timeout=int(timeout))
         return make_capture(ctx, helper, exe, m, base_argv, timeout, sys.executable)(
             input_bytes)

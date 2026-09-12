@@ -11,6 +11,7 @@ from typing import Any
 
 from . import elf as elfmod
 from . import filetype
+from . import jvm as jvmmod
 from . import pe as pemod
 
 SCHEMA_VERSION = 1
@@ -18,7 +19,8 @@ TOOL = "elf-stdlib"
 TOOL_VERSION = "triage-4"          # bump to invalidate the cache when parsing changes
 #   triage-4: static-pie linking classification (PT_DYNAMIC no longer implies dynamic)
 MITIGATION_ENUM = {"on", "off", "partial", "unknown"}
-_FILE_TYPES = {filetype.ELF, filetype.PE, filetype.MACHO, filetype.RAW, filetype.OTHER}
+_FILE_TYPES = {filetype.ELF, filetype.PE, filetype.MACHO, filetype.JAR,
+               filetype.CLASS, filetype.RAW, filetype.OTHER}
 _PACK_ENTROPY = 7.2
 
 
@@ -121,6 +123,12 @@ def build_triage(path: str | Path, hashes: dict[str, Any], filename: str) -> dic
         return rec
 
     rec["file_type"] = filetype.detect(data[:64])
+    if rec["file_type"] == filetype.JAR and not jvmmod.is_jar(data):
+        # `PK\x03\x04` is every zip, not only a Java one: a firmware bundle, a .docx and an
+        # archive of source all start with it. Deciding this here rather than inside the JAR
+        # branch keeps the branch chain honest -- resetting the type mid-branch skipped the
+        # not-a-binary description entirely and left `detected` as None.
+        rec["file_type"] = filetype.OTHER
     rec["_data_head"] = data[:4096]                     # transient: for non-binary classify
     rec["entropy"] = _packer_heuristic(_shannon(data), [])
 
@@ -166,6 +174,39 @@ def build_triage(path: str | Path, hashes: dict[str, Any], filename: str) -> dic
             "work. Not available for PE: the LD_PRELOAD heap checker and P-Code dynamic "
             "taint (both Linux/ELF), and fuzzing runs at Wine speed (~1 execution/second) "
             "with no coverage feedback, so it is not a practical campaign.")
+    elif rec["file_type"] in (filetype.JAR, filetype.CLASS):
+        info = jvmmod.parse(data)
+        parse_errors.extend(info.errors)
+        rec.update({
+            "arch": "jvm", "bits": 64, "endianness": "big", "linking": "dynamic",
+            "stripped": False,
+            "entry_point": info.main_class,
+            "imports": {"libraries": sorted({c.split(".")[0].rsplit("/", 1)[0]
+                                             for c in info.calls if "/" in c})[:64],
+                        "functions_count": len(info.calls),
+                        "symbols": [c.split(".")[-1] for c in info.calls][:512]},
+            "exports_count": len(info.classes),
+            "exports": {"count": len(info.classes), "symbols": info.classes[:512]},
+            "toolchain_hint": f"javac (class file v{info.major})" if info.major
+                              else "javac",
+            "format_details": jvmmod.to_format_details(info),
+        })
+        rec["detected"] = _describe_jvm(info, rec["file_type"])
+        rec["analyzable"] = True
+        # Say exactly where the ladder stops. A managed runtime checks every array access
+        # and owns every pointer, so there is no instruction pointer to take -- claiming
+        # otherwise would be a lie about the runtime, not a missing feature.
+        rec["advisory"] = (
+            "Java analysed: the constant pool gives every string and every method call in "
+            "the clear, which is more than a stripped ELF yields, so invocation discovery, "
+            "the fuzzing dictionary and the string-based detectors all work. Execution is "
+            "under the JVM, where a defect surfaces as an uncaught exception rather than a "
+            "signal; JVM startup dominates each execution (~27 ms measured), so a campaign "
+            "runs at roughly 36 executions/second rather than hundreds. Not available "
+            "for Java: Ghidra "
+            "disassembly and P-Code analysis (there is no machine code), and PoC levels "
+            "L2/L3 -- the JVM owns the instruction pointer, so control-flow hijack is not "
+            "a claim this format can support.")
     elif rec["file_type"] == filetype.MACHO:
         parse_errors.append("mach-o parsing pending (detected only)")
         rec["detected"] = "MACHO (detected only)"
@@ -182,6 +223,20 @@ def build_triage(path: str | Path, hashes: dict[str, Any], filename: str) -> dic
                            "not apply. Import an ELF executable or shared object to analyze.")
     rec.pop("_data_head", None)
     return rec
+
+
+def _describe_jvm(info, ftype) -> str:
+    kind = "JAR" if ftype == filetype.JAR else "Java class"
+    parts = [kind]
+    if info.java_version:
+        parts.append(f"Java {info.java_version}")
+    if info.main_class:
+        parts.append(f"main-class {info.main_class}")
+    if info.classes:
+        parts.append(f"{len(info.classes)} class" + ("es" if len(info.classes) != 1 else ""))
+    if info.signed:
+        parts.append("signed")
+    return ", ".join(parts)
 
 
 def _describe(rec: dict) -> str:
