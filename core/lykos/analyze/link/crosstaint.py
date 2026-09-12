@@ -126,10 +126,17 @@ def cross_taint_case(conn, content, case_id: str, *, persist: bool = True,
     # diagnosis: on a program/library pair with a resolved edge it said 1, because the loop
     # stopped before ever loading the callee.
     why: dict = {"no_components": len(targets) < 2, "no_links": not dyn,
-                 "edges_without_tainted_symbol": 0, "edges_with_clean_callee": 0}
+                 "edges_without_tainted_symbol": 0, "edges_with_clean_callee": 0,
+                 "callers_without_ir": 0}
     for e in dyn:
         a, b = targets.get(e.src_target), targets.get(e.dst_target)
         if not a or not b:
+            continue
+        # No decompilation on the caller means no IR to trace, which is a different problem
+        # from "the data does not reach the boundary" -- and only one of the two is something
+        # the operator can act on. Carved firmware components arrive with neither.
+        if not comp(e.src_target)[0]:
+            why["callers_without_ir"] += 1
             continue
         syms = set(edge_symbols(e.detail)) & imports(e.src_target)
         if not syms:
@@ -173,6 +180,12 @@ def _why_nothing(why: dict, found: int):
     if why["no_links"]:
         return ("no dynamic-link edges are resolved, so there is no boundary to chase taint "
                 "across. Run link_case first.")
+    if why["callers_without_ir"]:
+        return (f"{why['callers_without_ir']} caller component"
+                f"{'s have' if why['callers_without_ir'] != 1 else ' has'} not been "
+                f"decompiled, so there is no data flow to trace across the boundary. Run "
+                f"disassemble on the components first -- carved firmware components arrive "
+                f"without it.")
     if why["edges_without_tainted_symbol"]:
         return (f"{why['edges_without_tainted_symbol']} linked boundar"
                 f"{'ies' if why['edges_without_tainted_symbol'] != 1 else 'y'} carried no "

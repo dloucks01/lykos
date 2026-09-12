@@ -88,6 +88,28 @@ def advise(*, imports: list, functions: int, findings: int, seeds: int,
     real rather than to speculate, and anything never reached at runtime ranks below
     anything that was.
     """
+    if file_format == "firmware":
+        # A container, and the plan for one is already right -- but the headline said it was
+        # "not a recognised ... firmware image", about an image carve then extracted two
+        # executables and an RSA private key from. The plan and the sentence above it
+        # disagreed, and the sentence is what gets read.
+        return {"input_mode": None, "shape": "a firmware image", "backend": "firmware_carve",
+                "backend_why": "the components inside it are what can be run and decompiled",
+                "analysable": True, "file_parser": False, "afl_usable": afl_usable,
+                "headline": ("This is a firmware image -- a container, not a program. Carve "
+                             "it: the executables, filesystems and keys inside become targets "
+                             "of their own, and the analysis runs on those."),
+                "checks": [{"ok": True,
+                            "text": "format -- recognised firmware container"},
+                           {"ok": False,
+                            "text": "components -- run firmware_carve to extract them"}],
+                "plan": [{"stage": "firmware_carve",
+                          "why": "extract the components as targets of their own",
+                          "params": {}, "ready": True, "done": False},
+                         {"stage": "firmware_rehost",
+                          "why": "if this is a bare-metal Cortex-M image, run it under "
+                                 "Unicorn and fuzz its peripheral inputs",
+                          "params": {}, "ready": True, "done": False}]}
     if executable is False:
         # Recommending a fuzzing backend for a file we could not even identify is a confident
         # plan for nothing: a text file uploaded by mistake was answered with "AFL++ is

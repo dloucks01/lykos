@@ -186,7 +186,7 @@ def test_cross_taint_says_what_stopped_it():
     `components_analyzed`, which reads as a count, not a diagnosis: on a program/library pair
     with a resolved edge it said 1, because the loop stopped before loading the callee."""
     from lykos.analyze.link.crosstaint import _why_nothing
-    base = {"no_components": False, "no_links": False,
+    base = {"no_components": False, "no_links": False, "callers_without_ir": 0,
             "edges_without_tainted_symbol": 0, "edges_with_clean_callee": 0}
     assert "only one component" in _why_nothing({**base, "no_components": True}, 0)
     assert "Run link_case" in _why_nothing({**base, "no_links": True}, 0)
@@ -195,5 +195,50 @@ def test_cross_taint_says_what_stopped_it():
     # the case that is a RESULT rather than a gap, and must not read like one
     clean = _why_nothing({**base, "edges_with_clean_callee": 1}, 0)
     assert "real negative, not a missing analysis" in clean
+    # "not decompiled yet" is a different problem from "the data does not reach the
+    # boundary", and only one of the two is actionable. Carved firmware components arrive
+    # with no IR at all, and the message used to blame the data flow.
+    noir = _why_nothing({**base, "callers_without_ir": 1}, 0)
+    assert "not been decompiled" in noir and "Run disassemble" in noir
     # nothing to explain when something was found
     assert _why_nothing({**base, "no_components": True}, 3) is None
+
+
+def test_a_firmware_container_is_recognised_not_dismissed():
+    """A U-Boot image was `other`, so advice said "this file is not a recognised executable,
+    library or firmware image, so there is nothing to run or decompile" -- about an image the
+    carve stage then pulled two executables and an RSA private key out of. The plan underneath
+    already said firmware_carve; the sentence above it disagreed, and the sentence is what
+    gets read."""
+    from lykos.analyze import filetype
+    from lykos.analyze.advise import advise
+    uimage = b"\x27\x05\x19\x56" + b"\x00" * 60
+    assert filetype.detect(uimage) == filetype.FIRMWARE
+    assert filetype.firmware_kind(uimage) == "U-Boot uImage"
+    out = advise(imports=[], functions=0, findings=0, seeds=0, has_format=False,
+                 afl_usable=False, executable=True, file_format="firmware")
+    assert out["analysable"] is True
+    assert out["backend"] == "firmware_carve"
+    assert "container, not a program" in out["headline"]
+    assert [p["stage"] for p in out["plan"]] == ["firmware_carve", "firmware_rehost"]
+
+
+def test_the_firmware_magics_agree_with_what_carve_scans_for():
+    """Two lists, one truth. filetype decides what a file IS (container magic at offset 0);
+    carve scans for anything embedded at any offset, so it is a superset -- but every
+    container magic must appear in both or a format is detectable and uncarvable, or the
+    reverse."""
+    from lykos.analyze import filetype
+    from lykos.analyze.firmware.carve import SIGNATURES
+    known = {m for m, _t, _d in SIGNATURES}
+    for magic, desc in filetype.FIRMWARE_MAGICS:
+        assert magic in known, f"{desc} is detected but carve does not scan for it"
+
+
+def test_an_elf_is_still_an_elf():
+    """The firmware check runs before the zip check and after the executable ones; a
+    regression here would reclassify real binaries."""
+    from lykos.analyze import filetype
+    assert filetype.detect(b"\x7fELF" + b"\x00" * 60) == filetype.ELF
+    assert filetype.detect(b"MZ" + b"\x00" * 62) == filetype.PE
+    assert filetype.detect(b"PK\x03\x04" + b"\x00" * 60) == filetype.JAR
