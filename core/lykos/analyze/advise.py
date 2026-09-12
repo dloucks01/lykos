@@ -56,7 +56,7 @@ def fuzz_backend(afl_usable: bool, static_findings: int) -> tuple:
 
 def advise(*, imports: list, functions: int, findings: int, seeds: int,
            has_format: bool, afl_usable: bool, crashes: int = 0,
-           pocs: int = 0) -> dict:
+           pocs: int = 0, executable: Optional[bool] = None) -> dict:
     """A recommendation and an ORDERED PLAN for this target.
 
     The plan is dynamic-first on purpose. Running decompile -> detect -> maybe-fuzz produces
@@ -65,6 +65,23 @@ def advise(*, imports: list, functions: int, findings: int, seeds: int,
     real rather than to speculate, and anything never reached at runtime ranks below
     anything that was.
     """
+    if executable is False:
+        # Recommending a fuzzing backend for a file we could not even identify is a confident
+        # plan for nothing: a text file uploaded by mistake was answered with "AFL++ is
+        # available -- coverage-guided fuzzing explores new paths instead of mutating
+        # blindly". Say what is actually known instead.
+        return {"input_mode": None, "shape": "unrecognised",
+                "backend": None, "backend_why": None,
+                "headline": ("This file is not a recognised executable, library or firmware "
+                             "image, so there is nothing to run or decompile. Check it is "
+                             "the artefact you meant to upload; if it is a raw dump, carve "
+                             "it first."),
+                "checks": [{"ok": False,
+                            "text": "format — no ELF, PE, Mach-O or firmware magic found"}],
+                "plan": [{"stage": "firmware_carve", "why": "if this is a raw dump or blob, "
+                                                            "carve the components out of it",
+                          "params": {}, "ready": True, "done": False}],
+                "file_parser": False, "afl_usable": afl_usable, "analysable": False}
     mode, shape = _input_mode(imports)
     backend, backend_why = fuzz_backend(afl_usable, findings)
     file_parser = mode == "file"
@@ -119,7 +136,7 @@ def advise(*, imports: list, functions: int, findings: int, seeds: int,
     return {"input_mode": mode, "shape": shape, "backend": backend,
             "backend_why": backend_why, "headline": headline,
             "checks": checks, "plan": plan,
-            "file_parser": file_parser, "afl_usable": afl_usable}
+            "file_parser": file_parser, "afl_usable": afl_usable, "analysable": True}
 
 
 def afl_usable(afl_path: Optional[str] = None) -> bool:

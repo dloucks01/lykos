@@ -69,6 +69,7 @@ class TcpHTTPServer(ThreadingHTTPServer):
 
 # --------------------------------------------------------------------------- handler
 _RUN_ID = re.compile(r"^/runs/([^/]+)$")
+_RUN_CANCEL = re.compile(r"^/runs/([^/]+)/cancel$")
 _CASE_ID = re.compile(r"^/cases/([^/]+)$")
 _TARGET_ID = re.compile(r"^/targets/([^/]+)$")
 _ARTIFACT = re.compile(r"^/artifacts/([0-9a-fA-F]+)$")
@@ -312,6 +313,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._upload_target(m.group(1))
             if path == "/runs":
                 return self._create_run()
+            m = _RUN_CANCEL.match(path)
+            if m:
+                return self._cancel_run(m.group(1))
             if path == "/format/analyze":
                 return self._format_analyze()
             if path == "/import":
@@ -319,6 +323,28 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": "not found"}, 404)
         except Exception as e:
             self._json({"error": repr(e)}, 500)
+
+    def _cancel_run(self, run_id):
+        """Stop a running stage.
+
+        The job engine has had `JobQueue.cancel` and `ctx.should_cancel()` all along and
+        nothing exposed them, so a campaign started from the UI could not be stopped -- a
+        ten-minute fuzz had to be waited out or the server killed.
+        """
+        s = self._store()
+        try:
+            run = s.runs.get(run_id)
+            if not run:
+                return self._json({"error": "no run"}, 404)
+            if run.status in ("done", "error", "cancelled"):
+                # not an error: the user clicked as it finished
+                return self._json({"cancelled": False, "status": run.status,
+                                   "note": f"run already {run.status}"})
+            ok = JobQueue(s.conn).cancel(run_id)
+            after = s.runs.get(run_id)
+            return self._json({"cancelled": bool(ok), "status": after.status if after else None})
+        finally:
+            s.close()
 
     # ---- DELETE ----
     def do_DELETE(self):
@@ -383,6 +409,8 @@ class Handler(BaseHTTPRequestHandler):
                           if a.kind in ("seed", "console-seed", "afl-crash")),
                 has_format=False,
                 afl_usable=advise_mod.afl_usable(),
+                # triage could not name a format, so there is nothing here to run
+                executable=bool(t.file_type and t.file_type not in ("raw", "other")),
                 crashes=crashes, pocs=len(pocs))
             return self._json(out)
         finally:
@@ -588,8 +616,9 @@ class Handler(BaseHTTPRequestHandler):
             s.close()
 
     def _upload_target(self, cid):
-        from ..analyze import ingest
-        from ..analyze.ingest import enqueue_triage
+        # `..analyze` re-exports `ingest` as a FUNCTION, so importing the module under an
+        # alias binds the function and the exception lookup fails at runtime
+        from ..analyze.ingest import NotAnalysable, enqueue_triage, ingest
         from ..jobs.registry import reproject_cache_hit
         ctype = self.headers.get("Content-Type", "")
         body = self._read_body()
@@ -605,7 +634,12 @@ class Handler(BaseHTTPRequestHandler):
             with tempfile.TemporaryDirectory(prefix="lykos-upload-") as td:
                 tmp = Path(td) / (filename or "upload.bin")
                 tmp.write_bytes(data)
-                target = ingest(s, cid, tmp, filename=filename)
+                try:
+                    target = ingest(s, cid, tmp, filename=filename)
+                except NotAnalysable as e:
+                    # 400, not 500: the upload was understood and refused, and the reason is
+                    # for the person who picked the file
+                    return self._json({"error": str(e)}, 400)
             run = enqueue_triage(JobQueue(s.conn), target)
             if run.status == "done":   # cache hit: body skipped, re-project its per-target rows
                 reproject_cache_hit(s, run.stage, target.id, run.id)

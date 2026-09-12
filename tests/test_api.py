@@ -331,3 +331,62 @@ def test_unknown_stage_is_rejected_at_the_edge(api):
     assert st == 400, body
     assert "unknown stage" in body["error"]
     assert "detect_cwe" in body["stages"]          # tells the caller what IS valid
+
+
+def test_a_run_can_be_stopped(tmp_path):
+    """The job engine has had `JobQueue.cancel` and `ctx.should_cancel()` all along and
+    nothing exposed them, so a ten-minute campaign started from the UI had to be waited out or
+    the server killed. Cancelling twice is not an error, and neither is cancelling a run that
+    just finished -- the user clicked at the wrong moment, which is not a failure."""
+    from lykos.casestore import CaseStore
+    from lykos.jobs import JobQueue
+    store = CaseStore.open(tmp_path / "case")
+    try:
+        cid = store.cases.create("c").id
+        q = JobQueue(store.conn)
+        run = q.enqueue(cid, "detect_cwe", params={}, tool="detect", tool_version="t",
+                        resource_class="cpu")
+        assert q.cancel(run.id) is True
+        assert store.runs.get(run.id).status == "cancelled"
+        assert q.cancel(run.id) is False, "already cancelled: reported, not an error"
+        assert q.cancel("nosuchrun") is False
+    finally:
+        store.close()
+
+
+def test_an_empty_upload_is_refused_with_a_reason(tmp_path):
+    """Accepting one produced a target whose every triage field was null, a detect_cwe run
+    that reported "done", and an advice panel recommending coverage-guided fuzzing -- a
+    confident plan for nothing at all."""
+    import pytest
+    from lykos.analyze.ingest import NotAnalysable, ingest
+    from lykos.casestore import CaseStore
+    store = CaseStore.open(tmp_path / "case")
+    try:
+        cid = store.cases.create("c").id
+        empty = tmp_path / "empty.bin"
+        empty.write_bytes(b"")
+        with pytest.raises(NotAnalysable) as e:
+            ingest(store, cid, empty, filename="empty.bin")
+        assert "0 bytes" in str(e.value) and "empty.bin" in str(e.value)
+        # anything with content is still accepted: a raw dump is a legitimate target
+        blob = tmp_path / "dump.bin"
+        blob.write_bytes(b"\x00\x01\x02\x03")
+        assert ingest(store, cid, blob, filename="dump.bin").size == 4
+    finally:
+        store.close()
+
+
+def test_advice_does_not_plan_for_a_file_it_cannot_identify():
+    """A text file uploaded by mistake was answered with "AFL++ is available -- coverage-guided
+    fuzzing explores new paths instead of mutating blindly"."""
+    from lykos.analyze.advise import advise
+    out = advise(imports=[], functions=0, findings=0, seeds=0, has_format=False,
+                 afl_usable=True, executable=False)
+    assert out["analysable"] is False
+    assert out["backend"] is None, "no strategy for something we cannot identify"
+    assert "not a recognised executable" in out["headline"]
+    # a real target is unaffected
+    ok = advise(imports=["fopen"], functions=40, findings=2, seeds=0, has_format=False,
+                afl_usable=True, executable=True)
+    assert ok["analysable"] is True and ok["backend"]

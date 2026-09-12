@@ -44,10 +44,22 @@ def backfill_triage_denorm(store, target_id: str, run_id: str) -> bool:
     return False
 
 
+class NotAnalysable(ValueError):
+    """A file that cannot be a target, with a reason fit to show a user."""
+
+
 def ingest(store, case_id: str, path: str | Path, filename: Optional[str] = None):
-    """IT-03/05: store the file (content-addressed) + create/dedup the target row."""
+    """IT-03/05: store the file (content-addressed) + create/dedup the target row.
+
+    An empty file is refused here rather than downstream. Accepting one produced a target
+    whose every triage field was null, a `detect_cwe` run that reported "done", and an advice
+    panel recommending coverage-guided fuzzing -- a confident plan for nothing at all. There
+    is no analysis anywhere in this platform that can say something true about zero bytes.
+    """
     path = Path(path)
     info = hash_all_file(path)
+    if not info["size"]:
+        raise NotAnalysable(f"{filename or path.name} is empty (0 bytes) -- nothing to analyse")
     store.put_artifact(case_id, "target-blob", src=path)
     return store.targets.upsert(case_id, filename or path.name, info["sha256"],
                                 md5=info["md5"], sha1=info["sha1"], size=info["size"])
