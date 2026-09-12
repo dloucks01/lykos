@@ -78,7 +78,7 @@ def _validate(ctx, target, exe, mode, workfile, generated, exec_timeout):
                         timeout=exec_timeout, arch=target.arch)
         input_sha = ctx.put_artifact("concolic-input", data=data)
         dd.insert(target.id, target.case_id, run_id=ctx.run_id, input_sha=input_sha,
-                  input_mode=mode, argv=argv, exit_code=r.exit_code, signal=r.signal,
+                  input_mode=mode, argv=[], exit_code=r.exit_code, signal=r.signal,
                   signal_name=r.signal_name, crashed=r.crashed, isolation=r.isolation,
                   duration_ms=r.duration_ms,
                   note="concolic-generated" + (f"; reached {g['reached']}"

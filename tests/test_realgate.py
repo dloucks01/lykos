@@ -89,52 +89,25 @@ def test_the_table_reports_what_is_missing():
 
 
 def test_the_recorded_argv_is_a_prefix_not_the_whole_invocation():
-    """The dynamic run records the argv it crashed with, and that argv ENDS with the thing
-    carrying the input -- the workfile path for a file target, the payload for an argv one.
-    Handing the whole thing back as a prefix made the replay
+    """`dyn_result.argv` is the FLAG PREFIX, never the thing carrying the input. The carrier is
+    a scratch path that no longer exists by the time anything replays the crash, and every
+    replay appends its own. Recording the whole invocation made the replay
 
         jhead /tmp/<gone>/input.bin /tmp/new/input.bin
 
-    and jhead stops at the missing first file without ever reaching the crashing one. A real
-    crash was filed as "did not reproduce", which is the confident-wrong-answer shape this
-    gate exists to catch."""
-    from lykos.analyze.poc.capture import how_to_feed
+    and jhead stops at the missing first file without ever reaching the crashing one, so a real
+    crash was filed as "did not reproduce" -- the confident-wrong-answer shape this gate exists
+    for. Every stage that records a crash has to honour the convention, so this pins the two
+    that build an argv by appending."""
+    import inspect
 
-    class _Row:
-        def __init__(self, mode, argv):
-            self.input_sha, self.input_mode, self.argv = "s" * 64, mode, argv
+    from lykos.analyze.dynamic import stage as dyn
+    src = inspect.getsource(dyn.dynamic_stage)
+    assert "argv=prefix" in src, "dynamic_run must record the prefix it started from"
+    assert "prefix = list(argv)" in src, "captured before the carrier is appended"
 
-    class _Conn:
-        pass
-
-    class _Target:
-        id = 1
-
-    import lykos.analyze.poc.capture as cap
-    rows = []
-
-    class _DAO:
-        def __init__(self, _conn):
-            pass
-
-        def list_by_target(self, _tid):
-            return rows
-    old = cap.DynResultDAO if hasattr(cap, "DynResultDAO") else None
-    import lykos.db.dao as dao
-    real = dao.DynResultDAO
-    dao.DynResultDAO = _DAO
-    try:
-        rows[:] = [_Row("file", ["-autorot", "/tmp/old/input.bin"])]
-        mode, argv, why = how_to_feed(_Conn(), _Target(), "s" * 64, {})
-        assert mode == "file" and argv == ["-autorot"], argv
-
-        rows[:] = [_Row("arg", ["-x", "AAAAPAYLOAD"])]
-        _m, argv, _w = how_to_feed(_Conn(), _Target(), "s" * 64, {})
-        assert argv == ["-x"], "the payload is not part of the setup"
-
-        rows[:] = [_Row("stdin", ["-q", "-v"])]
-        _m, argv, _w = how_to_feed(_Conn(), _Target(), "s" * 64, {})
-        assert argv == ["-q", "-v"], "stdin carries no argv, so all of it is flags"
-    finally:
-        dao.DynResultDAO = real
-        assert old is None or True
+    from lykos.analyze.fuzz import stage as fz
+    src = inspect.getsource(fz.fuzz_campaign)
+    assert "argv = list(prefix)" in src, "fuzz must record the flag prefix it ran under"
+    assert "invocation(mode, workfile, data)[0]" not in src, \
+        "recording the invocation puts a dead scratch path in front of the real input"

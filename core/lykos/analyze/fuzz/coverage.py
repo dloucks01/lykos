@@ -96,7 +96,9 @@ def coverage_stage(ctx) -> dict:
         if sig in seen_sigs:
             input_sha = ctx.put_artifact("afl-crash-input", data=data)
             dd.insert(target.id, target.case_id, run_id=ctx.run_id, input_sha=input_sha,
-                      input_mode=mode, argv=invocation(mode, workfile, data)[0],
+                      # the flag prefix, which for an AFL replay is empty: the invocation
+                      # is nothing but the carrier, and that is scratch
+                      input_mode=mode, argv=[],
                       signal=res.signal, signal_name=sig, crashed=True,
                       isolation=res.isolation, duration_ms=res.duration_ms)
             continue
