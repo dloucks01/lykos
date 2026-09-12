@@ -37,16 +37,20 @@ _HOST = {"x86_64": "x86-64", "amd64": "x86-64", "aarch64": "aarch64", "arm64": "
          "armv7l": "arm", "mips": "mips", "ppc64": "ppc64", "ppc64le": "ppc64",
          "riscv64": "riscv64"}
 _bwrap_cache: Optional[bool] = None
-# Shared flag set for the probe AND the real run (so the probe predicts reality). No PID
-# namespace / procfs: those need privileges some VMs restrict; net isolation + ro-root +
-# tmpfs is the portable T1.
-# `--proc /proc` overlays a FRESH procfs on the read-only root. Without it /proc comes in
-# through the read-only bind, and opening /proc/<pid>/mem O_RDWR fails with EROFS -- which is
+# Shared flag set for the probe AND the real run (so the probe predicts reality).
+#
+# `--proc /proc` overlays a FRESH procfs on the read-only root. Without it /proc arrives
+# through the read-only bind and opening /proc/<pid>/mem O_RDWR fails with EROFS -- which is
 # how the block-coverage tracer plants breakpoints. It fell back silently to two ptrace
-# syscalls per block, 72,000 of them per execution on a statically linked target, and ran 25x
-# slower inside the sandbox than outside it. A fresh procfs is also the more correct mount for
-# a sandbox than a view of the host's.
-_BWRAP_ARGS = ["--ro-bind", "/", "/", "--proc", "/proc", "--tmpfs", "/tmp", "--dev", "/dev",
+# syscalls per block, 72,000 of them per execution on a statically linked target.
+#
+# `--unshare-pid` is what makes that procfs mean anything. A fresh procfs without a PID
+# namespace still lists every process on the host: a target could read 564 entries of
+# /proc/<pid>/cmdline and, for anything running as the same user, /proc/<pid>/environ. With
+# the namespace it sees four, and the tracer is unaffected because a pid namespace is exactly
+# the scope ptrace and /proc/<pid>/mem already work in.
+_BWRAP_ARGS = ["--ro-bind", "/", "/", "--unshare-pid", "--proc", "/proc",
+               "--tmpfs", "/tmp", "--dev", "/dev",
                "--unshare-net", "--die-with-parent", "--chdir", "/tmp", "--"]
 
 
