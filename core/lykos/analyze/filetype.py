@@ -4,6 +4,8 @@ from __future__ import annotations
 ELF = "elf"
 PE = "pe"
 MACHO = "macho"
+JAR = "jar"
+CLASS = "class"
 RAW = "raw"
 OTHER = "other"
 
@@ -20,8 +22,23 @@ def detect(head: bytes) -> str:
         return ELF
     if head[:2] == b"MZ":
         return PE          # DOS/PE stub; full PE-header check happens in a PE parser
+    if head[:4] == b"\xca\xfe\xba\xbe" and len(head) >= 8:
+        # CAFEBABE is BOTH the Java class-file magic and Mach-O's universal-binary magic --
+        # chosen independently, and identical. Whichever check runs first claims every file of
+        # the other kind. The next four bytes separate them: Java writes minor then MAJOR
+        # version (45 = Java 1.0 .. 65 = Java 21), Mach-O writes a 32-bit count of
+        # architectures, which is a handful. Nothing has 45 architectures.
+        major = (head[6] << 8) | head[7]
+        if 45 <= major <= 90:
+            return CLASS
+        return MACHO
     if head[:4] in _MACHO_MAGICS:
         return MACHO
+    if head[:4] == b"PK\x03\x04":
+        # A zip. Whether it is a JAR is decided by looking inside it, which needs the whole
+        # file; the caller confirms with jvm.is_jar and falls back if it is an ordinary
+        # archive.
+        return JAR
     if not head:
         return RAW
     return OTHER

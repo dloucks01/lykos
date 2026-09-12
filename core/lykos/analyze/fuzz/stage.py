@@ -84,15 +84,6 @@ def behaviour_of(res, data: bytes = b""):
             hashlib.blake2b(shape, digest_size=8).digest())
 
 
-class _Str:
-    """A StringDAO row's shape, for strings scanned straight out of the file."""
-
-    __slots__ = ("value", "addr", "section")
-
-    def __init__(self, value):
-        self.value, self.addr, self.section = value, None, None
-
-
 def _strings_for(ctx, target):
     """The target's strings -- from the DB when `disassemble` has run, else scanned.
 
@@ -108,7 +99,7 @@ def _strings_for(ctx, target):
         return rows
     from .. import invocation as invmod
     data = ctx.content.path(target.sha256).read_bytes()
-    return [_Str(v) for v in invmod.raw_strings(data)]
+    return invmod.string_rows(invmod.raw_strings(data), where="scan")
 
 
 def _discover_argv(ctx, target, exec_timeout):
@@ -131,11 +122,13 @@ def _discover_argv(ctx, target, exec_timeout):
     try:
         data = ctx.content.path(target.sha256).read_bytes()
         found = invmod.discover([x.value for x in _strings_for(ctx, target)])
-        argv = invmod.propose_argv(found)
+        d = ctx.scratch() / "argvprobe"
+        # Real files behind every value that names one, or the proposal cannot be tested: a
+        # service required to be given `-j <app.jar>` refuses the literal string "app.jar",
+        # and the run then throws away an invocation that was right apart from a missing file.
+        argv = invmod.materialize(found, d)
         if not argv:
             return [], None, False
-        d = ctx.scratch() / "argvprobe"
-        d.mkdir(parents=True, exist_ok=True)
         exe = d / "target.bin"
         exe.write_bytes(data)
         exe.chmod(0o755)
@@ -585,6 +578,17 @@ def fuzz_stage(ctx) -> dict:
     elif any(a for a in base_argv):
         wants_config = "@@" in base_argv
 
+    if "@@" in base_argv and not p.get("input_mode"):
+        # `@@` means "the PATH of the input file goes here". Delivering the input as a raw
+        # argv string or over stdin then leaves the placeholder holding payload bytes where a
+        # filename belongs, and the target fails to open it -- on every single input. That is
+        # not a clean negative and it is worse than one: the JVM target reported 526 crashes,
+        # all of them IOException/FileSystemException from a config path that never existed,
+        # all at the same site. A harness that cannot deliver the input is not a finding.
+        channels = ["file"]
+        ctx.emit("fuzz.channel", payload={"mode": "file", "why": (
+            "argv carries @@, which is the path of the input file, so the input has to be "
+            "delivered as a file")})
     # A PE runs under Wine at about one execution a second (measured: 1,249 ms against ~580/s
     # native) with no coverage feedback, so a campaign manages a few dozen executions and then
     # reports "0 crashes" exactly like a thorough one that found nothing. Say what it is.
@@ -595,6 +599,18 @@ def fuzz_stage(ctx) -> dict:
                 "second and there is no coverage feedback, so this campaign will manage a few "
                 "dozen executions rather than thousands. Prefer synthesize_poc, which derives "
                 "the overflow from the recovered stack frame without executing at all.")})
+    if (target.file_type or "").lower() in ("jar", "class"):
+        # Measured on a trivial jar: 27 ms per execution with startup flags tuned, against
+        # ~1.7 ms native. That is ~36 executions/second, so a campaign here is thousands of
+        # inputs rather than millions -- slow, but three dozen times more workable than the
+        # PE/Wine path, and worth saying rather than letting the number surprise someone.
+        ctx.emit("fuzz.slow", payload={
+            "format": "jvm", "note": (
+                "this is a Java target: every execution pays JVM startup (~27 ms measured, "
+                "so roughly 36 executions/second against ~580/s native) and there is no "
+                "coverage feedback. A defect surfaces as an uncaught exception rather than a "
+                "signal. Budget thousands of executions, not millions, and lean on the "
+                "constant pool -- it names every string and call in the clear.")})
     strings = _strings_for(ctx, target)
     blocks = _recovered_blocks(ctx, target)
     flags = mine_flags(ctx.content.path(target.sha256).read_bytes())

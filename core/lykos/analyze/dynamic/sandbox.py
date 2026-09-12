@@ -9,6 +9,7 @@ inputs into; stronger tiers (microVM) come later.
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import platform
 import re
@@ -154,8 +155,11 @@ def run_batch(exe, payloads, *, mode="stdin", base_argv=(), timeout: float = 2.0
     amortising the namespace, not by giving one up.
     """
     host = host or host_arch()
-    if _is_pe(exe) or (arch and host and arch != host):
-        return None                                   # Wine / qemu paths stay per-exec
+    if _is_pe(exe) or _is_jvm(exe) or (arch and host and arch != host):
+        # Wine, the JVM and qemu stay per-exec. The batch runner execs the target directly and
+        # traces it with ptrace; a jar is not executable and the JVM is not the target, so
+        # batching it would run the wrong program under breakpoints meant for another.
+        return None
     py = shutil.which("python3")
     if not py or not _bwrap_usable() or not payloads:
         return None
@@ -369,6 +373,178 @@ def wine_exception(stderr: bytes):
     return None, None, None
 
 
+# ---- JVM: a defect surfaces as an uncaught exception, not a signal -----------------------
+#
+# Exception in thread "main" java.lang.ArrayIndexOutOfBoundsException: Index 99 out of ...
+# 	at Svc.setOpt(Svc.java:14)
+#
+# The "Exception in thread" prefix is the load-bearing part. A program that catches its own
+# exception and calls printStackTrace() writes a nearly identical block to stderr and then
+# carries on and exits 0 -- reporting that as a crash would turn correct error handling into
+# a finding, which is the same defect as counting a usage message as a crash.
+_JVM_EXC_RE = re.compile(
+    r'Exception in thread "([^"]*)"\s+([A-Za-z_$][\w.$]*(?:Exception|Error|Throwable))'
+    r'(?::\s*(.*))?')
+_JVM_FRAME_RE = re.compile(r"^\s+at\s+([\w.$/<>]+)\(([^)]*)\)", re.M)
+# The JVM itself dying -- a JNI bug, or a VM defect. This IS memory corruption, and it is a
+# far stronger result than any Java-level exception.
+_JVM_FATAL_RE = re.compile(
+    r"A fatal error has been detected by the Java Runtime Environment", re.I)
+_JVM_FATAL_SIG = re.compile(r"(SIG[A-Z]+)\s*\(", re.I)
+# -XX:+ExitOnOutOfMemoryError makes the VM die immediately instead of unwinding, which is what
+# we want (an unbounded allocation must fail fast rather than let the host absorb it) -- but it
+# prints THIS instead of a stack trace, so matching only "Exception in thread" made
+# uncontrolled memory allocation, one of the most common real Java defects, invisible.
+_JVM_TERM_RE = re.compile(r"^Terminating due to (java\.lang\.\w*(?:Error|Exception))"
+                          r"(?::\s*(.*))?", re.M)
+# Frames inside the JDK are where an exception is CONSTRUCTED, not where the defect is. Every
+# NumberFormatException in every program is thrown from
+# java.base/java.lang.NumberFormatException.forInputString, so blaming the top frame blames
+# the JDK and dedups every such bug in the target into one finding.
+_JDK_FRAME = re.compile(r"^(?:java\.base/|java\.\w+/|jdk\.|sun\.|com\.sun\.|javax\.)")
+
+
+def jvm_exception(stderr: bytes, exit_code: Optional[int] = None, stdout: bytes = b""):
+    """(kind, detail, frames) for an uncaught JVM fault, else (None, None, []).
+
+    `kind` is the exception class name, which is this runtime's equivalent of a signal name:
+    ArrayIndexOutOfBoundsException says far more about the defect than SIGSEGV does.
+
+    Which STREAM each thing is read from is load-bearing, and the two are not interchangeable.
+    An uncaught exception always goes to stderr -- that is what the JVM's default handler
+    does. But -XX:+ExitOnOutOfMemoryError prints "Terminating due to ..." to STDOUT, so
+    reading stderr alone made unbounded allocation invisible.
+
+    The obvious fix -- scan both streams for everything -- opens a hole a fuzzer finds on its
+    own: a target that echoes its input would report a crash the moment a mutation contains
+    the text `Exception in thread`, and a mutator that is rewarded for crashes will produce
+    that string deliberately. So the exception trace is read from stderr only, where a target
+    cannot put it by echoing, and the VM's termination line is corroborated by a non-zero exit
+    -- a program echoing text exits 0.
+    """
+    text = (stderr or b"").decode("utf-8", "replace")
+    vm_text = text + "\n" + (stdout or b"").decode("utf-8", "replace")
+    if _JVM_FATAL_RE.search(vm_text) and exit_code not in (0, None):
+        sig = _JVM_FATAL_SIG.search(vm_text)
+        return ("JVM-FATAL-" + (sig.group(1).upper() if sig else "ABORT"),
+                "the JVM itself crashed -- native memory corruption, not a Java exception",
+                _JVM_FRAME_RE.findall(vm_text))
+    m = _JVM_EXC_RE.search(text)
+    if not m:
+        t = _JVM_TERM_RE.search(vm_text)
+        if t and exit_code not in (0, None):
+            short = t.group(1).rsplit(".", 1)[-1]
+            return short, (f"the VM terminated on {short}"
+                           + (f": {t.group(2).strip()}" if t.group(2) else "")
+                           + " -- an allocation the input controls"), []
+        return None, None, []
+    thread, cls, msg = m.group(1), m.group(2), (m.group(3) or "").strip()
+    frames = _JVM_FRAME_RE.findall(text)
+    short = cls.rsplit(".", 1)[-1]
+    blame = app_frame(frames)
+    where = f" at {blame[0]}({blame[1]})" if blame else ""
+    detail = f"uncaught {short} in thread \"{thread}\"" + (f": {msg}" if msg else "") + where
+    return short, detail, frames
+
+
+def app_frame(frames):
+    """The first frame that is the TARGET's code rather than the JDK's.
+
+    `Integer.parseInt("abc")` throws from three JDK frames deep. The defect is not in
+    java.base -- it is the line that passed unvalidated input to it, which is the first frame
+    below them.
+    """
+    for fr in frames or ():
+        if not _JDK_FRAME.match(fr[0]):
+            return fr
+    return frames[0] if frames else None
+
+
+def jvm_site(frames) -> Optional[int]:
+    """A stable id for WHERE the exception was thrown, used where a native crash uses the
+    faulting PC. Two ArrayIndexOutOfBoundsExceptions thrown from different methods are two
+    defects, and without this they dedup into one -- so this keys on the application frame,
+    not the JDK frame that constructed the exception."""
+    fr = app_frame(frames)
+    if not fr:
+        return None
+    return int(hashlib.sha256(f"{fr[0]}({fr[1]})".encode()).hexdigest()[:8], 16)
+
+
+# Startup dominates a Java execution, so these are not cosmetic: measured on a trivial jar,
+# 37 ms plain against 27 ms with them, and a fuzzing campaign pays it on every input.
+# -Xmx/-Xss are bounds, not tuning: an unbounded allocation is one of the defects being
+# hunted, and without a heap cap the host absorbs it instead of the target failing fast.
+_JVM_FLAGS = ("-XX:TieredStopAtLevel=1", "-XX:+UseSerialGC", "-XX:-UsePerfData",
+              "-Xshare:auto", "-Xmx256m", "-Xss512k", "-Djava.awt.headless=true",
+              "-XX:+ExitOnOutOfMemoryError")
+
+
+def _java() -> Optional[str]:
+    return shutil.which("java")
+
+
+def _is_jvm(path) -> bool:
+    try:
+        head = Path(path).open("rb").read(8)
+    except Exception:
+        return False
+    from ..jvm import is_class
+    if is_class(head + b"\x00" * 8):
+        return True
+    return head[:4] == b"PK\x03\x04" and _looks_like_jar(path)
+
+
+def _looks_like_jar(path) -> bool:
+    import zipfile
+    try:
+        with zipfile.ZipFile(path) as z:
+            names = z.namelist()
+        return any(n.endswith(".class") for n in names) or "META-INF/MANIFEST.MF" in names
+    except Exception:
+        return False
+
+
+def _run_java(exe, *, argv, stdin, timeout, mem_mb, capture, main_class=None) -> RunResult:
+    java = _java()
+    if not java:
+        return RunResult(isolation="jvm-missing",
+                         note="no JVM found; install a JDK/JRE to run a Java target "
+                              "(or analyse it statically -- the constant pool needs no JVM)")
+    exe = Path(exe)
+    if _looks_like_jar(exe):
+        launch = ["-jar", str(exe)]
+    else:
+        # a bare .class: the class name is its own, and the classpath is its directory
+        cls = main_class or exe.stem
+        launch = ["-cp", str(exe.parent), cls]
+    cmd = [java, *_JVM_FLAGS, *launch] + [argv_bytes(a) for a in argv]
+    eff_timeout = max(timeout, 10.0)                 # JVM startup is tens of milliseconds
+    preexec = _rlimits(max(mem_mb, 2048), int(eff_timeout) + 2, set_as=False,
+                       nproc=_nproc_cap(True))       # the JVM is threaded; don't cap AS
+    iso = "rlimits-only+jvm"
+    run = cmd
+    if _bwrap_usable():
+        exedir = str(exe.resolve().parent)
+        run = ["bwrap"] + _BWRAP_ARGS[:-1] + ["--ro-bind", exedir, exedir] + ["--"] + cmd
+        iso = "bwrap+netns+jvm"
+    rc, out, err, timed, dur = _spawn(run, stdin, eff_timeout, preexec)
+    if iso.startswith("bwrap") and not timed and err.startswith(b"bwrap:"):
+        # namespace creation is rate-limited on some VMs: drop to rlimits-only for the session
+        global _bwrap_cache
+        _bwrap_cache = False
+        rc, out, err, timed, dur = _spawn(cmd, stdin, eff_timeout, preexec)
+        iso = "rlimits-only+jvm"
+    kind, detail, frames = jvm_exception(err, rc, out)
+    crashed = kind is not None
+    return RunResult(
+        isolation=iso, crashed=crashed, timed_out=timed,
+        exit_code=(None if crashed else rc), signal=None, signal_name=kind,
+        stdout=out[:capture], stderr=err[:capture], duration_ms=dur, cmd=run,
+        fault_pc=jvm_site(frames) if crashed else None,
+        note=(detail if crashed else (None if not timed else "timed out")))
+
+
 def _wine() -> Optional[str]:
     return shutil.which("wine") or shutil.which("wine64")
 
@@ -458,6 +634,9 @@ def run(exe, *, argv=(), stdin: bytes = b"", timeout: float = 10.0,
     if _is_pe(exe):                                     # Windows PE -> Wine substrate
         return _run_windows(exe, argv=argv, stdin=stdin, timeout=timeout, mem_mb=mem_mb,
                             capture=capture, wineprefix=wineprefix)
+    if _is_jvm(exe):                                    # jar / .class -> the JVM
+        return _run_java(exe, argv=argv, stdin=stdin, timeout=timeout, mem_mb=mem_mb,
+                         capture=capture)
     emu = None
     if arch and host and arch != host:
         emu = _qemu_for(arch, endianness, bits)

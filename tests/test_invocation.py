@@ -117,3 +117,20 @@ def test_a_crash_counts_as_getting_past_the_argument_gate():
     def run(argv):
         return _R(None, b"", crashed=True) if argv else _R(2, b"usage: svc -c <cfg>\n")
     assert invocation.verify(run, "svc", ["-c", "@@"], "/tmp/cfg")["accepted"]
+
+
+def test_a_flag_that_names_a_file_gets_a_real_file(tmp_path):
+    """A service required to be given `-j <app.jar>` was handed the literal string "app.jar",
+    refused it because no such file exists, and the run concluded the whole invocation was
+    wrong -- leaving the operator exactly where they started. The proposal cannot be tested
+    until the files it names are real."""
+    import zipfile
+    found = invocation.discover(
+        ["usage: svc -c <config> -d <display-id> -j <app.jar> -i <cslid>", "c:d:j:i:v"])
+    argv = invocation.materialize(found, tmp_path)
+    jar = argv[argv.index("-j") + 1]
+    assert jar.startswith(str(tmp_path)) and zipfile.is_zipfile(jar)
+    # ...and `@@` is untouched, because the campaign substitutes its own mutated input there
+    assert argv[argv.index("-c") + 1] == "@@"
+    # a display id or an instance id names nothing on disk and stays a literal
+    assert argv[argv.index("-d") + 1] == ":0"

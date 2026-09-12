@@ -23,6 +23,8 @@ meant to be reviewed, not a guess presented as fact.
 """
 from __future__ import annotations
 
+import hashlib
+import pathlib
 import re
 import uuid
 from typing import Optional
@@ -35,6 +37,11 @@ from typing import Optional
 # "0123456789ABCDEF", which match the letters-only shape perfectly and contributed sixty
 # imaginary switches. An option string with no value-taking option at all is possible, but
 # missing one of those costs far less than inventing an option for every letter.
+# The one definition of the input-placeholder contract, shared with the fuzzing runner and the
+# PoC bundle: `@@` marks where the input belongs in an argv that is not simply "the last
+# argument".
+INPUT_PLACEHOLDER = "@@"
+
 _OPTSTRING = re.compile(r"^[+-]?:?(?=[^:]*:)([A-Za-z0-9]:{0,2}){2,24}$")
 # usage: prog -c <config> --jar=FILE
 _USAGE_FLAG = re.compile(r"(--?[A-Za-z][A-Za-z0-9_-]*)(?:[= ]+([<\[]?[A-Za-z0-9_.<>\[\]-]+))?")
@@ -58,6 +65,36 @@ _HINTS = (
 _PRINTABLE = bytes(range(0x20, 0x7F)) + b"\t"
 
 
+class PlainString:
+    """A `StringDAO` row's shape for a string that did not come from the database.
+
+    Strings reach the DB only via `disassemble`, and three separate consumers need them
+    before that -- the fuzzing dictionary, the format detector and the CWE detectors that read
+    only strings. Each grew its own stand-in, and each was missing a different field: one
+    lacked `xrefs` and crashed the credential detector outright, and a stand-in with `addr =
+    None` gave every finding the dedup key `CWE-798:None`, collapsing every credential in a
+    jar into one. `addr` is therefore a stable synthetic location, not a number -- for a jar
+    that is the class the constant lives in, which is more use to a reader than an offset.
+    """
+
+    __slots__ = ("value", "addr", "xrefs", "section")
+
+    def __init__(self, value, addr=None, xrefs=(), section=None):
+        self.value = value
+        self.addr = addr
+        self.xrefs = list(xrefs)
+        self.section = section
+
+
+def string_rows(values, *, where=None):
+    """`PlainString` rows for a flat list of strings, each with a distinguishing location."""
+    out = []
+    for v in values:
+        loc = where or "const"
+        out.append(PlainString(v, addr=f"{loc}:{hashlib.sha1(v.encode()).hexdigest()[:8]}"))
+    return out
+
+
 def raw_strings(data: bytes, *, minlen: int = 4, limit: int = 200000) -> list:
     """Printable runs straight out of the file bytes.
 
@@ -68,6 +105,13 @@ def raw_strings(data: bytes, *, minlen: int = 4, limit: int = 200000) -> list:
     from the first input. A usage line is plain ASCII in .rodata, so scanning for it needs no
     decompiler.
     """
+    from . import jvm
+    if jvm.is_class(data) or jvm.is_jar(data):
+        # A jar is a zip: scanning it for printable runs reads DEFLATE output and finds
+        # nothing, so every consumer of a target's strings -- this module, the fuzzing
+        # dictionary, the format detector, the credential detector -- quietly concluded there
+        # was nothing there. The constant pool holds them all in the clear.
+        return jvm.strings_of(data)[:limit]
     out, cur = [], bytearray()
     for b in data[:limit * 8]:
         if b in _PRINTABLE:
@@ -277,6 +321,56 @@ def _concrete(f: dict) -> str:
     if f.get("kind") == "id" and d.startswith("00000000"):
         return str(uuid.UUID(int=0))
     return d
+
+
+# Kinds whose value NAMES A FILE. A proposal that points at a file which does not exist cannot
+# be verified and cannot be used: a service required to be given `-j <app.jar>` was handed the
+# literal string "app.jar", refused it because no such file exists, and the run concluded the
+# whole invocation was wrong -- leaving the operator exactly where they started. The file has
+# to be real before the proposal can be tested.
+_FILE_KINDS = {"config", "jar", "path"}
+
+# A jar with a manifest and no classes is a structurally valid jar: enough for a launcher that
+# checks the file opens, and if the service actually loads a class from it the failure is
+# reported honestly rather than hidden.
+_MIN_MANIFEST = b"Manifest-Version: 1.0\nCreated-By: lykos\n\n"
+
+
+def materialize(found: dict, directory, *, sample=None) -> list:
+    """A proposed argv with real files on disk behind every value that names one.
+
+    Returns the argv; `@@` is left in place, because the campaign substitutes its own mutated
+    input there. Everything else that names a file becomes a path that exists.
+
+    `directory` MUST be the directory the target executable is staged in. The sandbox masks
+    /tmp with a private tmpfs and binds back only the executable's own directory, so a file
+    written anywhere else exists on the host and not inside the sandbox -- the target then
+    reports "cannot open jar", which looks exactly like a wrong proposal and is not one.
+    """
+    import zipfile
+    d = pathlib.Path(directory)
+    d.mkdir(parents=True, exist_ok=True)
+    argv = propose_argv(found)
+    out: list = []
+    i = 0
+    kinds = {f["flag"]: f.get("kind") for f in found.get("flags") or []}
+    while i < len(argv):
+        a = argv[i]
+        out.append(a)
+        kind = kinds.get(a)
+        if i + 1 < len(argv) and kind in _FILE_KINDS and argv[i + 1] != INPUT_PLACEHOLDER:
+            if kind == "jar":
+                path = d / "app.jar"
+                with zipfile.ZipFile(path, "w") as z:
+                    z.writestr("META-INF/MANIFEST.MF", _MIN_MANIFEST.decode())
+            else:
+                path = d / ("lykos.conf" if kind == "config" else "lykos.dat")
+                path.write_bytes(sample if sample is not None else b"# lykos\n")
+            out.append(str(path))
+            i += 2
+            continue
+        i += 1
+    return out
 
 
 _REJECT = re.compile(r"(?i)\b(usage|invalid option|unrecogni[sz]ed|unknown option|"

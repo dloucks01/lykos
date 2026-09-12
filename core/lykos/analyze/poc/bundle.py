@@ -16,13 +16,47 @@ def _add(tar, name, data: bytes, mode=0o644):
     tar.addfile(info, io.BytesIO(data))
 
 
-def _runner(mode: str, argv, signal_name: str, run_cmd=None) -> bytes:
+INPUT_PLACEHOLDER = "@@"
+
+
+def _argv_text(argv, *, carrier=None) -> str:
+    """The recorded flag prefix as shell text, with `@@` replaced by the input.
+
+    `@@` is the contract the fuzzer and the runner already share -- it marks where the input
+    belongs when it is not simply the last argument. The bundle did not honour it, and file
+    mode ignored argv ENTIRELY, so a target that needs `-c <config>` got a reproducer reading
+    `./target.bin ./input.bin`: it prints its usage, exits 2, and the bundle that was supposed
+    to prove the crash proves nothing.
+    """
+    out = []
+    for a in argv or []:
+        a = str(a)
+        out.append("./input.bin" if (a == INPUT_PLACEHOLDER and carrier) else shlex.quote(a))
+    return " ".join(out)
+
+
+def _runner(mode: str, argv, signal_name: str, run_cmd=None, runtime: str = "native",
+            main_class: str | None = None) -> bytes:
+    argv = list(argv or [])
+    placed = INPUT_PLACEHOLDER in [str(a) for a in argv]
+    # A jar is not executable and the JVM is not the target: `./target.bin` is a zip file, and
+    # the reproducer has to name the runtime that reads it.
+    exe, setup = "./target.bin", "chmod +x ./target.bin\n"
+    if runtime == "jar":
+        exe, setup = "java -jar ./target.bin", ""
+    elif runtime == "class":
+        # The JVM resolves a class by FILE NAME, so `target.bin` cannot be run as-is: it has
+        # to be put back under the name the class declares.
+        cls = (main_class or "Main").replace("/", ".")
+        exe = f"java -cp . {shlex.quote(cls)}"
+        setup = f"cp ./target.bin ./{cls.rsplit('.', 1)[-1]}.class\n"
+    pre = _argv_text(argv, carrier="./input.bin")
     if run_cmd:                                          # script-based reproducer (e.g. PIE)
         invoke = run_cmd
     elif mode == "stdin":
-        invoke = './target.bin < ./input.bin'
+        invoke = f'{exe}{" " + pre if pre else ""} < ./input.bin'
     elif mode == "file":
-        invoke = './target.bin ./input.bin'
+        invoke = f'{exe} {pre}' if placed else f'{exe}{" " + pre if pre else ""} ./input.bin'
     elif mode == "arg":
         # The INPUT is the argument. This used to emit the stage's BASE argv -- normally
         # empty -- so the reproducer ran `./target.bin ''` and demonstrated nothing, which
@@ -30,19 +64,31 @@ def _runner(mode: str, argv, signal_name: str, run_cmd=None) -> bytes:
         # Command substitution is byte-transparent apart from NUL, which it drops, and
         # execve truncates an argument at the first NUL regardless: the shell therefore
         # delivers exactly the bytes the kernel would.
-        pre = "".join(shlex.quote(str(a)) + " " for a in (argv or []))
-        invoke = f'./target.bin {pre}"$(cat ./input.bin)"'
+        if placed:
+            invoke = (exe + " " + " ".join(
+                '"$(cat ./input.bin)"' if str(a) == INPUT_PLACEHOLDER else shlex.quote(str(a))
+                for a in argv))
+        else:
+            invoke = f'{exe}{" " + pre if pre else ""} "$(cat ./input.bin)"'
     else:
-        invoke = './target.bin'
+        invoke = f'{exe}{" " + pre if pre else ""}'
+    if runtime in ("jar", "class"):
+        # A JVM fault is an uncaught exception on stderr and an exit code of 1, not a signal.
+        # Telling the reader to look for 128+signum would have them conclude the reproducer
+        # failed when it worked.
+        hint = (f'echo "exit status: $rc -- {signal_name} appears on stderr above as an '
+                'uncaught exception; the JVM exits 1 (or 3 on OutOfMemoryError)"')
+    else:
+        hint = (f'echo "exit status: $rc (a crash by {signal_name} shows as 128+signum, '
+                'e.g. 139=SIGSEGV)"')
     return ("#!/bin/sh\n"
             f"# PoC reproducer. Expected result: {signal_name}. RUN IN A SANDBOX/VM --\n"
             "# this executes an untrusted binary. Authorized use only.\n"
             'cd "$(dirname "$0")"\n'
-            "chmod +x ./target.bin\n"
+            f"{setup}"
             f"{invoke}\n"
             'rc=$?\n'
-            f'echo "exit status: $rc (a crash by {signal_name} shows as 128+signum, '
-            'e.g. 139=SIGSEGV)"\n').encode()
+            + hint + "\n").encode()
 
 
 def _primitive_txt(prim: dict) -> bytes:
@@ -77,7 +123,8 @@ _LEVEL_MEANING = {
 
 def build(target_bytes: bytes, input_bytes: bytes, meta: dict, stderr: bytes,
           mode: str, argv, signal_name: str, primitive: dict | None = None,
-          extra_files: dict | None = None, run_cmd: str | None = None) -> bytes:
+          extra_files: dict | None = None, run_cmd: str | None = None,
+          runtime: str = "native", main_class: str | None = None) -> bytes:
     level = meta.get("level", "L1")
     script = extra_files and "exploit.py" in extra_files
     prim_line = ""
@@ -85,7 +132,10 @@ def build(target_bytes: bytes, input_bytes: bytes, meta: dict, stderr: bytes,
         prim_line = (f"\nPrimitive: {primitive.get('type')} at control offset "
                      f"{primitive.get('offset')} (confirmed={primitive.get('confirmed')}). "
                      "See PRIMITIVE.txt.\n")
-    files = ["target.bin  - the exact analyzed binary (self-contained; runs anywhere)"]
+    files = ["target.bin  - the exact analyzed binary (self-contained; runs anywhere)"
+             if runtime == "native" else
+             "target.bin  - the exact analyzed " + ("jar" if runtime == "jar" else "class")
+             + " (needs a JVM on the machine that replays it)"]
     if script:
         files += ["exploit.py  - the reproducer: leaks a runtime address, defeats ASLR, and "
                   "delivers the exploit live (the payload is base-specific so it cannot be "
@@ -125,7 +175,8 @@ def build(target_bytes: bytes, input_bytes: bytes, meta: dict, stderr: bytes,
         _add(tar, "poc/input.bin", input_bytes)
         for name, data in (extra_files or {}).items():
             _add(tar, f"poc/{name}", data, mode=0o755 if name.endswith(".py") else 0o644)
-        _add(tar, "poc/runner.sh", _runner(mode, argv, signal_name, run_cmd), mode=0o755)
+        _add(tar, "poc/runner.sh",
+             _runner(mode, argv, signal_name, run_cmd, runtime, main_class), mode=0o755)
         _add(tar, "poc/meta.json", json.dumps(meta, indent=2, sort_keys=True).encode())
         _add(tar, "poc/stderr.txt", stderr or b"")
         if primitive:
