@@ -574,6 +574,79 @@ def classify_nul_site(instrs, site_addr, sink, frame, arch, bits, blocks, site_b
                     f"({room} bytes) does not clear")}
 
 
+GUARDED = "guarded-index"
+
+
+def classify_derefs(func_irs: dict, derefs, arch) -> dict:
+    """site_addr -> verdict, for attacker-influenced dereferences.
+
+    `tainted_deref` reports every place input reaches a pointer -- 122 of them on jhead -- and
+    says nothing about which is unchecked, so the list is inventory rather than a finding. The
+    dominating-guard reasoning built for copy lengths answers exactly that question about an
+    index: does every path here pass a comparison that pins the value the address is built
+    from?
+
+    A guarded site is not proof of safety -- the bound may still exceed the object -- so it is
+    reported as what it is. The ranking is the point: the unguarded sites are where the
+    out-of-bounds accesses live.
+    """
+    ak = _arch_key(arch)
+    if not ak:
+        return {}
+    bases = (ARCH_ABI.get(ak) or {}).get("frame", ())
+    by_func: dict = {}
+    for d in derefs:
+        if d.get("site_addr") and d.get("block_addr"):
+            by_func.setdefault(d.get("function_addr"), []).append(d)
+    out: dict = {}
+    for faddr, hits in by_func.items():
+        blocks = ((func_irs or {}).get(faddr) or {}).get("blocks", []) or []
+        if not blocks:
+            continue
+        dom = dominators(blocks)
+        for d in hits:
+            g = None
+            for slot in _guard_slots(d):
+                g = guard_bound(blocks, d["block_addr"], slot, bases=bases, dom=dom)
+                if g:
+                    break
+            if g:
+                extra = ("" if g["nonneg"] else
+                         ", but the check is SIGNED and nothing excludes a negative index")
+                out[d["site_addr"]] = {
+                    "verdict": GUARDED, "bound": g["bound"], "nonneg": g["nonneg"],
+                    "why": f"{g['why']} -- bounds the value this address is built from{extra}",
+                }
+            else:
+                out[d["site_addr"]] = {
+                    "verdict": UNKNOWN,
+                    "why": "no dominating check bounds the value this address is built from",
+                }
+    return out
+
+
+def _guard_slots(d):
+    """The frame slots feeding this address, in the shape `branch_predicate` resolves.
+
+    Taint keys a slot `("stack", base, offset)` while the guard evaluator matches
+    `(base, offset)` -- the address it computed from the frame register. Passing taint's key
+    through unconverted matched nothing at all, which reads exactly like "no guard here".
+    """
+    out = []
+    for k in (d.get("via") or ()):
+        if isinstance(k, (list, tuple)) and len(k) == 3 and k[0] == "stack":
+            off = int(k[2])
+            # taint carries the displacement as the raw unsigned constant the p-code held;
+            # the guard evaluator adds SIGNED displacements to the frame base, so -4 arrives
+            # here as 18446744073709551612 and matches nothing
+            for bits in (64, 32):
+                if off >= (1 << (bits - 1)):
+                    off -= (1 << bits)
+                    break
+            out.append((k[1], off))
+    return out
+
+
 def classify_program(func_irs: dict, call_edges, frames: dict, arch, bits=64) -> dict:
     """site_addr -> verdict, for every copy sink whose call site we can read."""
     from .catalog import normalize

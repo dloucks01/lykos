@@ -469,3 +469,22 @@ def test_an_unmeasured_strcpy_stays_unknown():
     assert bounds.strlen_bound(blocks, "0x2000", "0x200c", ("load", "RBP", -0x18), [],
                                ("RBP", "RSP"), 64, bounds.ARCH_ABI["x86-64"],
                                bounds.dominators(blocks)) is None
+
+
+def test_a_dereference_with_a_dominating_bound_is_separated_from_one_without():
+    """`tainted_deref` reports every place input reaches a pointer -- 122 of them on jhead --
+    and said nothing about which was unchecked, so the list was inventory. The dominating-guard
+    reasoning built for copy lengths answers exactly that about an index.
+
+    Two shapes had to line up for this to work at all, and neither is obvious. Taint keys a
+    frame slot `("stack", base, offset)` while the guard evaluator matches `(base, offset)`;
+    and taint carries the displacement as the raw UNSIGNED constant, so -4 arrives as
+    18446744073709551612. Either mismatch matches nothing, which reads exactly like "no guard
+    here" -- the failure is silent and looks like a result."""
+    from lykos.analyze.detect.bounds import _guard_slots
+    d = {"via": [("reg", "RAX"), ("stack", "RBP", 18446744073709551612)]}
+    assert _guard_slots(d) == [("RBP", -4)], "unsigned displacement, signed slot"
+    assert _guard_slots({"via": [("reg", "RAX")]}) == [], "a register is not a frame slot"
+    assert _guard_slots({}) == []
+    # a 32-bit target's displacement wraps at 2**32
+    assert _guard_slots({"via": [("stack", "EBP", 0xFFFFFFFC)]}) == [("EBP", -4)]

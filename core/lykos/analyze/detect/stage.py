@@ -25,7 +25,7 @@ _DEREF = {
 }
 
 
-def _deref_candidates(derefs, functions):
+def _deref_candidates(derefs, functions, guards=None):
     """One finding per KIND, carrying every site -- the grain the rest of the channel uses.
 
     Deliberately filed as low-confidence inventory, not an assertion. Whether any particular
@@ -54,12 +54,21 @@ def _deref_candidates(derefs, functions):
                               + (" ..." if len(where) > 8 else ""))}
         for d in hits:
             fn = names.get(d["function_addr"]) or str(d["function_addr"])
+            # WHICH of these is unchecked? A dominating comparison on the value the address is
+            # built from is the difference between inventory and a finding.
+            g = (guards or {}).get(d["site_addr"]) or {}
+            detail = f"attacker-influenced {kind} through a computed pointer in {fn}"
+            if g.get("why"):
+                detail += f"; {g['why']}"
             out.append({
                 "cwe": cwe, "title": title, "severity": sev, "state": "candidate",
-                "confidence": 0.35, "detector": "tainted_deref",
+                # an unguarded site outranks a guarded one -- that ranking is the whole point
+                "confidence": 0.3 if g.get("verdict") == bounds.GUARDED else 0.4,
+                "detector": "tainted_deref",
                 "function_addr": d["function_addr"], "site_addr": d["site_addr"],
                 "dedup_key": f"{cwe}:tainted_deref:{kind}",
-                "site_detail": f"attacker-influenced {kind} through a computed pointer in {fn}",
+                "site_detail": detail,
+                "site_verdict": g.get("verdict"),
                 "evidence": [summary],
             })
     return out
@@ -228,7 +237,9 @@ def detect_stage(ctx) -> dict:
     derefs: list = []
     tainted_sites = taint.analyze_program(func_irs, dctx.call_edges, target.arch,
                                           entry_seeds=entry_seeds, mem_out=derefs)
-    cands += _deref_candidates(derefs, dctx.functions)
+    guards = bounds.classify_derefs(func_irs, derefs, target.arch)
+    n_guarded = sum(1 for v in guards.values() if v.get("verdict") == bounds.GUARDED)
+    cands += _deref_candidates(derefs, dctx.functions, guards)
     # only where attacker data demonstrably lands: a function that dereferences input, or one
     # whose call to a dangerous sink taint reaches
     touched = {d["function_addr"] for d in derefs}
@@ -285,7 +296,8 @@ def detect_stage(ctx) -> dict:
         fd.upsert(target.id, target.case_id, c)
     counts = fd.counts_by_state(target.id)
     ctx.emit("findings.done", payload={"candidates": len(cands), "states": counts,
-                                       "library_sites_skipped": dropped})
+                                       "library_sites_skipped": dropped,
+                                       "derefs": len(guards), "guarded_derefs": n_guarded})
     ctx.progress(pct=100, msg="%d candidate findings" % len(cands))
     return {}
 
