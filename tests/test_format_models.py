@@ -8,6 +8,7 @@ but nothing acted on it: there were two builtin models, nothing selected one, an
 produce a seed.
 """
 
+import pytest
 from lykos.analyze.fuzz import structure as S
 
 
@@ -256,3 +257,66 @@ def test_a_two_character_token_does_not_claim_a_binary():
     fuzzed a ZIP tool with bitmaps -- 354 blocks against 1,162 with the right model."""
     unzipish = ["End-of-central-directory", "central directory", "zipfile", "SUBMIT", "BM"]
     assert S.detect_format(unzipish) == "zip"
+
+
+def test_a_generated_seed_is_accepted_by_a_real_decoder(tmp_path):
+    """The point of a model is a seed the TARGET accepts. jhead, gif2rgb and unzip accept the
+    jpeg, gif and zip seeds; these three are checked against decoders that ship with the
+    system, so the assertion does not depend on a fixture being built."""
+    import wave
+    seeds = {n: S.seed_for_name(n) for n in ("png", "bmp", "riff")}
+
+    w = tmp_path / "t.wav"
+    w.write_bytes(seeds["riff"])
+    with wave.open(str(w)) as fh:
+        assert fh.getnchannels() == 1 and fh.getframerate() == 8000
+
+    try:
+        import PIL.Image as Image
+    except ImportError:
+        pytest.skip("Pillow not installed; RIFF checked above")
+    for name, mode in (("png", "L"), ("bmp", "RGB")):
+        f = tmp_path / f"t.{name}"
+        f.write_bytes(seeds[name])
+        with Image.open(f) as im:
+            im.load()
+            assert im.size == (1, 1) and im.mode == mode, name
+
+
+def test_a_checksum_is_derived_so_the_parser_gets_past_the_door():
+    """A format that checksums its own chunks cannot be fuzzed blind: a decoder rejects a bad
+    CRC before reading anything else, so every other mutation in the round is discarded at the
+    door. PNG's CRC covers the chunk TYPE as well as its data, which is why the body is a group
+    -- the checksum names it."""
+    import struct
+    import zlib
+    seed = S.seed_for_name("png")
+    body = seed[8:]
+    checked = 0
+    while len(body) >= 12:
+        (ln,) = struct.unpack(">I", body[:4])
+        chunk, crc = body[4:8 + ln], struct.unpack(">I", body[8 + ln:12 + ln])[0]
+        assert zlib.crc32(chunk) & 0xFFFFFFFF == crc, chunk[:4]
+        checked += 1
+        body = body[12 + ln:]
+    assert checked == 3, "IHDR, IDAT and IEND"
+
+
+def test_every_builtin_describes_more_than_its_magic():
+    """A stub model -- signature plus a payload blob -- generates a file the target rejects
+    outright, so the campaign never reaches a parser. gif2rgb answered "Image of width or
+    height 0" and unzip "End-of-central-directory signature not found"."""
+    def described(spec):
+        """Fields anywhere in the tree -- PNG's structure lives inside its chunk groups."""
+        n = 0
+        for f in spec:
+            n += 1
+            if f["type"] in ("group", "array"):
+                n += described(f["spec"])
+        return n
+
+    for name in S.builtin_names():
+        if name == "lv32":
+            continue            # deliberately generic: a magic + length + payload container
+        n = described(S.builtin(name).spec)
+        assert n >= 10, f"{name} is still a stub: {n} fields"
