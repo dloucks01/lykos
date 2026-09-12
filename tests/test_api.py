@@ -554,3 +554,52 @@ def test_capabilities_says_what_can_run_and_why_not(api, tmp_path):
 
     st, missing = _json(api, "GET", "/targets/doesnotexist/capabilities")
     assert st == 404
+
+
+def test_a_missing_case_is_404_not_an_empty_list(api):
+    """A case that does not exist is not a case with no targets. Returning [] with 200 made a
+    typo'd or deleted id indistinguishable from an empty case, and a caller polling for its
+    targets would wait forever on nothing."""
+    st, body = _json(api, "GET", "/cases/deadbeefdeadbeef/targets")
+    assert st == 404, body
+    st, case = _json(api, "POST", "/cases", {"name": "real"})
+    st, body = _json(api, "GET", f"/cases/{case['id']}/targets")
+    assert st == 200 and body == []
+
+
+def test_an_unknown_report_format_is_refused_rather_than_silently_html(api):
+    """`?format=md` returned 200 and a web page, so a caller asking for something this build
+    does not produce got a plausible-looking answer in the wrong format."""
+    st, case = _json(api, "POST", "/cases", {"name": "fmt"})
+    cid = case["id"]
+    st, body = _json(api, "GET", f"/cases/{cid}/report?format=md")
+    assert st == 400, body
+    assert "unknown report format" in body["error"]
+    assert set(body["formats"]) == {"html", "json", "pdf", "sarif"}
+    # the real ones still work
+    code, _ = _req(api, "GET", f"/cases/{cid}/report?format=html")
+    assert code == 200
+
+
+def test_a_crash_row_carries_how_it_was_fed_and_where_it_faulted():
+    """Both are recorded and neither was projected. argv is HOW the input was delivered --
+    now that a target may need `-c @@` to run at all, "which invocation produced this" is not
+    a detail -- and fault_pc is WHERE it faulted, which is what the dedup key is built from,
+    so two rows that look identical were distinguishable only by a field the API withheld."""
+    from lykos.api.server import _dynresult
+
+    class _D:
+        id, crashed, timed_out = "d1", True, False
+        signal_name, exit_code, isolation = "SIGSEGV", None, "bwrap"
+        input_mode, input_sha, duration_ms = "file", "ab" * 32, 12
+        note, created_at = None, 1
+        argv = ["-c", "@@"]
+        fault_pc = 0x1234
+    got = _dynresult(_D())
+    assert got["argv"] == ["-c", "@@"]
+    assert got["fault_pc"] == "0x1234"
+
+    class _Old(_D):
+        argv, fault_pc = None, None
+    old = _dynresult(_Old())
+    assert old["argv"] == [] and old["fault_pc"] is None

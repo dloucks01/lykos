@@ -29,6 +29,10 @@ from . import ws
 from .multipart import extract_file
 
 _INGEST = "ingest_triage"
+# What `_get_report` can actually produce. Anything else used to fall through to
+# HTML, so `?format=md` returned 200 and a web page rather than saying it is not a
+# format this build makes.
+_REPORT_FORMATS = {"html", "pdf", "sarif", "json"}
 
 
 # --------------------------------------------------------------------------- server
@@ -184,6 +188,11 @@ class Handler(BaseHTTPRequestHandler):
             if m:
                 s = self._store()
                 try:
+                    # A case that does not exist is not a case with no targets. Returning []
+                    # with 200 makes a typo'd or deleted id indistinguishable from an empty
+                    # case, and a caller polling for its targets waits forever on nothing.
+                    if not s.cases.get(m.group(1)):
+                        return self._json({"error": "no case"}, 404)
                     return self._json([_target(t) for t in s.targets.list_by_case(m.group(1))])
                 finally:
                     s.close()
@@ -614,6 +623,12 @@ class Handler(BaseHTTPRequestHandler):
         )
         from ..report.casejson import to_case_json_bytes
         fmt = qs.get("format", ["html"])[0]
+        # An unknown format fell through to HTML. `?format=csv` then returned 200 and a web
+        # page, so a caller that asked for something this build does not produce got a
+        # plausible-looking answer in the wrong format and no indication of the typo.
+        if fmt not in _REPORT_FORMATS:
+            return self._json({"error": f"unknown report format {fmt!r}",
+                               "formats": sorted(_REPORT_FORMATS)}, 400)
         embed = qs.get("embed", ["1"])[0] != "0" and fmt in ("html", "json")
         states = _csv(qs.get("states"))
         finding_ids = _csv(qs.get("finding_ids"))
@@ -1019,9 +1034,16 @@ def _poc(x):
 
 
 def _dynresult(d):
+    # argv and fault_pc are recorded and were not projected. Both matter to a reader looking
+    # at a crash row: argv is HOW the input was delivered -- now that a target may need
+    # `-c @@` to run at all, "which invocation produced this" is not a detail -- and fault_pc
+    # is WHERE it faulted, which is what the dedup key is built from, so two rows that look
+    # identical are distinguishable only by a field the API did not return.
     return {"id": d.id, "crashed": d.crashed, "timed_out": d.timed_out,
             "signal": d.signal_name, "exit_code": d.exit_code, "isolation": d.isolation,
             "input_mode": d.input_mode, "input_sha": d.input_sha,
+            "argv": list(getattr(d, "argv", None) or []),
+            "fault_pc": (hex(d.fault_pc) if getattr(d, "fault_pc", None) else None),
             "duration_ms": d.duration_ms, "note": d.note, "created_at": d.created_at}
 
 
