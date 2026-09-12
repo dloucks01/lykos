@@ -6,8 +6,26 @@ PE = "pe"
 MACHO = "macho"
 JAR = "jar"
 CLASS = "class"
+FIRMWARE = "firmware"
 RAW = "raw"
 OTHER = "other"
+
+# Container formats that identify a file as a FIRMWARE IMAGE at offset 0. Not the whole of
+# `firmware.carve.SIGNATURES`, which also scans for things embedded at any offset (a gzip
+# member, a certificate, a PNG) -- those say "this file contains one", not "this file IS one".
+#
+# Without this a firmware image was `other`, and `advise` told the operator "this file is not a
+# recognised executable, library or firmware image, so there is nothing to run or decompile"
+# about an image the carve stage then pulled two executables and an RSA private key out of.
+# A test binds this list to carve.SIGNATURES so the two cannot drift.
+FIRMWARE_MAGICS = (
+    (b"\x27\x05\x19\x56", "U-Boot uImage"),
+    (b"hsqs", "SquashFS (little-endian)"),
+    (b"sqsh", "SquashFS (big-endian)"),
+    (b"\x45\x3d\xcd\x28", "CramFS"),
+    (b"\xd0\x0d\xfe\xed", "Flattened Device Tree"),
+    (b"UBI#", "UBI image"),
+)
 
 _MACHO_MAGICS = {
     b"\xfe\xed\xfa\xce", b"\xce\xfa\xed\xfe",   # 32-bit
@@ -34,6 +52,9 @@ def detect(head: bytes) -> str:
         return MACHO
     if head[:4] in _MACHO_MAGICS:
         return MACHO
+    for magic, _desc in FIRMWARE_MAGICS:
+        if head[:len(magic)] == magic:
+            return FIRMWARE
     if head[:4] == b"PK\x03\x04":
         # A zip. Whether it is a JAR is decided by looking inside it, which needs the whole
         # file; the caller confirms with jvm.is_jar and falls back if it is an ordinary
@@ -42,3 +63,11 @@ def detect(head: bytes) -> str:
     if not head:
         return RAW
     return OTHER
+
+
+def firmware_kind(head: bytes):
+    """Human name of the firmware container, or None."""
+    for magic, desc in FIRMWARE_MAGICS:
+        if head[:len(magic)] == magic:
+            return desc
+    return None

@@ -20,7 +20,7 @@ TOOL_VERSION = "triage-4"          # bump to invalidate the cache when parsing c
 #   triage-4: static-pie linking classification (PT_DYNAMIC no longer implies dynamic)
 MITIGATION_ENUM = {"on", "off", "partial", "unknown"}
 _FILE_TYPES = {filetype.ELF, filetype.PE, filetype.MACHO, filetype.JAR,
-               filetype.CLASS, filetype.RAW, filetype.OTHER}
+               filetype.CLASS, filetype.FIRMWARE, filetype.RAW, filetype.OTHER}
 _PACK_ENTROPY = 7.2
 
 
@@ -207,6 +207,19 @@ def build_triage(path: str | Path, hashes: dict[str, Any], filename: str) -> dic
             "disassembly and P-Code analysis (there is no machine code), and PoC levels "
             "L2/L3 -- the JVM owns the instruction pointer, so control-flow hijack is not "
             "a claim this format can support.")
+    elif rec["file_type"] == filetype.FIRMWARE:
+        kind = filetype.firmware_kind(data[:64]) or "firmware image"
+        rec["detected"] = f"Firmware image — {kind}"
+        # Analysable, but not by the stages that want machine code: the image is a CONTAINER,
+        # and what is in it becomes analysable once carved. Saying "not a recognised
+        # executable, library or firmware image" about a file the carve stage then pulls two
+        # executables and a private key out of is a confident wrong answer.
+        rec["analyzable"] = True
+        rec["advisory"] = (
+            f"{kind} detected. This is a container, not a program: run firmware_carve to "
+            f"extract the components (executables, filesystems, keys) as targets of their "
+            f"own, then analyse those. Disassembly and the dynamic stages apply to the "
+            f"carved components, not to the image.")
     elif rec["file_type"] == filetype.MACHO:
         parse_errors.append("mach-o parsing pending (detected only)")
         rec["detected"] = "MACHO (detected only)"
