@@ -93,6 +93,53 @@ int main(int argc, char **argv){
 """
 
 
+# A Java service in the shape most real ones have: a MANDATORY `-c <config>` behind a flag, a
+# key=value parser, and an unchecked index in it. Reachable through exactly one channel like
+# every other case here -- stdin is never read and argv holds a path, not the payload.
+#
+# This is the only case whose substrate is not machine code, and that is the point: the JVM
+# path has its own triage, its own executor, its own crash oracle (an uncaught exception, not
+# a signal), its own CWE mapping and its own bundle runner, and none of it was covered by a
+# gate. Its unit tests pass; so did the unit tests for every defect listed at the top of this
+# file.
+_SRC_JAVA = r"""
+import java.io.*;
+import java.nio.file.*;
+public class Svc {
+    static String[] slots = new String[8];          // fixed: the bug lives here
+    static void setOpt(String k, String v) {
+        if (k.equals("slot")) {
+            String[] p = v.split(",");
+            slots[Integer.parseInt(p[0])] = p[1];   // unchecked index
+        }
+    }
+    static void load(String path) throws IOException {
+        for (String line : Files.readAllLines(Paths.get(path))) {
+            if (line.startsWith("#")) continue;
+            int eq = line.indexOf('=');
+            if (eq < 0) continue;
+            setOpt(line.substring(0, eq), line.substring(eq + 1));
+        }
+    }
+    public static void main(String[] args) throws Exception {
+        String cfg = null, display = null;
+        for (int i = 0; i < args.length; i++) {
+            if (args[i].equals("-c") && i + 1 < args.length) cfg = args[++i];
+            else if (args[i].equals("-d") && i + 1 < args.length) display = args[++i];
+        }
+        if (cfg == null || display == null) {
+            System.err.println("usage: Svc -c <config> -d <display-id>");
+            System.exit(2);
+        }
+        load(cfg);
+        System.out.println("slot0=" + slots[0] + " display=" + display);
+    }
+}
+"""
+
+_JDK = ("javac", "jar", "java")
+
+
 @dataclass
 class RealCase:
     label: str
@@ -104,12 +151,20 @@ class RealCase:
     flags: list = field(default_factory=list)
     prebuilt: str = ""            # repo-relative binary to use INSTEAD of compiling `source`
     fuzz: bool = False            # find the crashing input rather than being handed one
+    lang: str = "c"               # "c" -> gcc; "java" -> javac + jar
 
     @property
     def optional(self) -> bool:
         """A prebuilt fixture is not committed (large, reproducible), so its absence skips.
         A case that fails to COMPILE still fails the gate -- that is an opt-out, not a
-        missing download."""
+        missing download.
+
+        A Java case skips only when there is no JDK at all, on the same rule the arch gate
+        uses for an absent cross-compiler: a toolchain this machine does not have is not a
+        regression. If javac IS present and the build fails, that is a hard failure.
+        """
+        if self.lang == "java":
+            return not all(shutil.which(t) for t in _JDK)
         return bool(self.prebuilt)
 
 
@@ -149,6 +204,18 @@ MATRIX = [
         {"cwe121": True, "L1": True, "L2": True, "bundle_reproduces": True},
         prebuilt="examples/vuln-targets/bin/ncompress_x86-64_cve",
         note="ncompress CVE-2001-1413: unchecked strcpy of an argv pathname, to L2"),
+    # The only case whose substrate is not machine code. Java has its own triage, executor,
+    # crash oracle, CWE mapping and bundle runner, and every one of them was uncovered by a
+    # gate -- including a bundle that ran `./target.bin` on a zip file and a reproducer that
+    # appended the input instead of putting it behind `-c`.
+    RealCase(
+        "real_jvm_config", _SRC_JAVA, b"", "file",
+        {"found_by_fuzzing": True, "cwe129": True, "not_memory_corruption": True,
+         "L1": True, "bundle_reproduces": True,
+         "fault": "ArrayIndexOutOfBoundsException"},
+        lang="java", fuzz=True,
+        note="a Java service behind a mandatory -c <config>: found from the jar alone, and "
+             "the bundle replays as `java -jar ./target.bin -c ./input.bin -d :0`"),
     # The NEGATIVE case, and the only measurement of precision on real code anywhere in the
     # gates: giflib 5.1.4 already carries the check CVE-2016-3977 defeated. Every precision
     # number quoted for a real binary so far came from reading output by hand -- including the
@@ -161,7 +228,28 @@ MATRIX = [
 ]
 
 
+def _build_jar(case: RealCase, outdir: Path):
+    """javac + jar. The target this platform analyses is the JAR, not a class directory:
+    that is what an operator has, and `java -jar` is how it runs."""
+    d = outdir / case.label
+    classes = d / "classes"
+    classes.mkdir(parents=True, exist_ok=True)
+    src = d / "Svc.java"
+    src.write_text(case.source)
+    if subprocess.run(["javac", "-d", str(classes), str(src)],
+                      capture_output=True).returncode != 0:
+        return None
+    mf = d / "manifest.txt"
+    mf.write_text("Main-Class: Svc\n")
+    jar = d / f"{case.label}.jar"
+    r = subprocess.run(["jar", "cfm", str(jar), str(mf), "-C", str(classes), "."],
+                       capture_output=True)
+    return jar if r.returncode == 0 and jar.exists() else None
+
+
 def compile_case(case: RealCase, outdir: Path, cc: str = "gcc"):
+    if case.lang == "java":
+        return _build_jar(case, outdir) if not case.optional else None
     if case.prebuilt:
         exe = _REPO / case.prebuilt
         return exe if exe.exists() else None
@@ -173,9 +261,18 @@ def compile_case(case: RealCase, outdir: Path, cc: str = "gcc"):
     return out if r.returncode == 0 and out.exists() else None
 
 
-def _bundle_reproduces(store, bundle_sha) -> bool:
+def _bundle_reproduces(store, bundle_sha, *, runtime: str = "native",
+                       expect: str = "") -> bool:
     """Extract the PoC bundle and RUN it. The bundle is the deliverable; one that does not
-    reproduce is worse than none, and for argv targets it silently was not."""
+    reproduce is worse than none, and for argv targets it silently was not.
+
+    What counts as "reproduced" depends on the runtime, and conflating them would make this
+    check vacuous for Java: a JVM fault is an uncaught exception on stderr with an exit code
+    of 1 (or 3 on OutOfMemoryError), never 128+signum. A check that only knows about signals
+    would fail every correct Java bundle -- or, worse, if it were loosened to "non-zero exit",
+    would pass a bundle whose target merely printed its usage and exited 2, which is exactly
+    the failure this gate exists to catch.
+    """
     d = Path(tempfile.mkdtemp(prefix="lykos-realgate-bundle-"))
     try:
         data = store.content.get_bytes(bundle_sha)
@@ -189,6 +286,13 @@ def _bundle_reproduces(store, bundle_sha) -> bool:
         r = subprocess.run(["sh", str(runner)], capture_output=True, timeout=120,
                            cwd=str(runner.parent))
         out = (r.stdout or b"").decode("latin-1", "ignore")
+        err = (r.stderr or b"").decode("latin-1", "ignore")
+        if runtime in ("jar", "class"):
+            # the exception itself, from the JVM's own handler -- not merely a non-zero exit,
+            # which a usage message also produces
+            if "Exception in thread" not in err and "Terminating due to" not in out:
+                return False
+            return (not expect) or expect in err or expect in out
         # runner.sh reports the child's status; a crash shows as 128+signum
         return any(f"exit status: {128 + s}" in out for s in (4, 6, 7, 8, 11))
     except Exception:
@@ -227,8 +331,16 @@ def run_case(case: RealCase, exe: Path, *, timeout: float = 30.0) -> dict:
             pool.wait_idle(timeout * 4)
             target = store.targets.get(target.id)
             res["detail"]["pie"] = (target.mitigations or {}).get("pie")
-            enqueue_disassemble(q, target)
-            pool.wait_idle(timeout * 120)
+            runtime = {"jar": "jar", "class": "class"}.get(
+                (target.file_type or "").lower(), "native")
+            if runtime == "native":
+                enqueue_disassemble(q, target)
+                pool.wait_idle(timeout * 120)
+            else:
+                # There is no machine code to decompile. Running Ghidra over a zip would burn
+                # the gate's whole time budget to produce nothing, and `detect` reads the
+                # constant pool directly.
+                res["detail"]["substrate"] = runtime
             enqueue_detect(q, target)
             pool.wait_idle(timeout * 40)
 
@@ -263,14 +375,26 @@ def run_case(case: RealCase, exe: Path, *, timeout: float = 30.0) -> dict:
                 res["detail"]["model"] = _done_field(store, cid, "fuzz", "fuzz.format", "model")
                 res["detail"]["crashes"] = len(crashes)
                 if "no_crash" in case.expect:
-                    res["ok"] = all(got.get(k) == v for k, v in case.expect.items())
-                    res["missing"] = [k for k, v in case.expect.items() if got.get(k) != v]
+                    res["ok"] = all(got.get(k) == v for k, v in _asserts(case).items())
+                    res["missing"] = [k for k, v in _asserts(case).items()
+                                      if got.get(k) != v]
                     return res
                 if not crashes:
                     res["ok"] = False
-                    res["missing"] = [k for k, v in case.expect.items() if got.get(k) != v]
+                    res["missing"] = [k for k, v in _asserts(case).items()
+                                      if got.get(k) != v]
                     return res
                 sha = crashes[0].input_sha
+                if "cwe129" in case.expect or "not_memory_corruption" in case.expect:
+                    # Recomputed AFTER the crash: the fault's CWE comes from the exception,
+                    # and the native table falls through to CWE-119 "critical" for anything it
+                    # does not recognise. An ArrayIndexOutOfBoundsException is the JVM CATCHING
+                    # the out-of-bounds access, so filing it as memory corruption would be a
+                    # lie about the runtime -- and a plausible one to reintroduce.
+                    after = {f.cwe for f in fd.list_by_target(target.id)}
+                    got["cwe129"] = "CWE-129" in after
+                    got["not_memory_corruption"] = "CWE-119" not in after
+                    res["detail"]["fault"] = crashes[0].signal_name
 
             # NOTE: input_sha and nothing else. The stage must work out the channel itself --
             # every case here is reachable through exactly one, so the sweep is load-bearing.
@@ -288,6 +412,18 @@ def run_case(case: RealCase, exe: Path, *, timeout: float = 30.0) -> dict:
                 res["detail"]["why"] = _done_field(store, cid, "build_poc", "poc.done",
                                                    "input_mode_why")
                 res["detail"]["crash_input"] = sha[:12]
+
+            if "bundle_reproduces" in case.expect and "L2" not in case.expect:
+                # The L1 bundle IS the deliverable when the ladder stops there, which for a
+                # managed runtime it always does. For a jar this is the assertion that matters
+                # most: it proves the reproducer names the runtime (`java -jar ./target.bin`,
+                # not `./target.bin`) and places the input where argv says (`-c ./input.bin`,
+                # not appended), both of which were wrong.
+                l1 = [x for x in pocs if x.verified and x.level == "L1" and x.bundle_sha]
+                if l1:
+                    got["bundle_reproduces"] = _bundle_reproduces(
+                        store, l1[-1].bundle_sha, runtime=runtime,
+                        expect=case.expect.get("fault") or "")
 
             if "L2" in case.expect:
                 enqueue_primitive(q, target, params={"input_sha": sha, "timeout": timeout},
@@ -316,9 +452,15 @@ def run_case(case: RealCase, exe: Path, *, timeout: float = 30.0) -> dict:
     finally:
         store.close()
         shutil.rmtree(d, ignore_errors=True)
-    res["ok"] = all(got.get(k) == v for k, v in case.expect.items())
-    res["missing"] = [k for k, v in case.expect.items() if got.get(k) != v]
+    res["ok"] = all(got.get(k) == v for k, v in _asserts(case).items())
+    res["missing"] = [k for k, v in _asserts(case).items() if got.get(k) != v]
     return res
+
+
+def _asserts(case: RealCase) -> dict:
+    """The boolean assertions. `fault` carries the exception the bundle must show, which is a
+    parameter to the check rather than something `got` reports."""
+    return {k: v for k, v in case.expect.items() if k != "fault"}
 
 
 def _done_field(store, cid, stage, event_type, field_name):

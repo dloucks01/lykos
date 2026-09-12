@@ -43,6 +43,20 @@ def test_the_gate_returns_the_shape_the_cli_expects():
 
 
 # ---------------------------------------------------------------- the matrix's invariants
+def test_a_substrate_that_is_not_machine_code_is_covered():
+    """Java has its own triage, executor, crash oracle, CWE mapping and bundle runner, and
+    none of it was covered by a gate -- including a bundle that ran `./target.bin` on a zip.
+    A gate over native ELF only cannot see any of that."""
+    jvm = [c for c in realgate.MATRIX if c.lang == "java"]
+    assert jvm, "the real gate has to cover the JVM path"
+    c = jvm[0]
+    assert c.fuzz, "found from the jar alone, like the other real cases"
+    # the assertion that the ladder's ceiling is stated honestly: no L2 is claimed for a
+    # runtime that owns the instruction pointer
+    assert "L2" not in c.expect and "L3" not in c.expect
+    assert c.expect["not_memory_corruption"] is True
+
+
 def test_both_delivery_channels_are_covered():
     """arg and file are exactly the channels no other gate exercises -- arch-gate is
     stdin-only, which is why three stages could default to stdin undetected."""
@@ -58,10 +72,13 @@ def test_each_case_is_reachable_through_exactly_one_channel():
     exactly as many cases as channels."""
     assert all(c.channel in ("arg", "file", "stdin") for c in realgate.MATRIX)
     assert {c.channel for c in realgate.MATRIX} >= {"arg", "file"}
-    # the synthetic cases are single-channel BY CONSTRUCTION: stdin is ignored and the other
-    # channel cannot carry enough bytes to reach the bug
-    synthetic = [c for c in realgate.MATRIX if not c.prebuilt]
-    assert len({c.channel for c in synthetic}) == len(synthetic)
+    # Each case names exactly one channel. Cases used to be required to have channels DISTINCT
+    # from each other, which the docstring above already flagged as an accident of there being
+    # as many cases as channels -- and it expired the moment a second file-driven case existed
+    # (the Java service, whose input is a config path behind `-c`). Single-channel-ness is a
+    # property of the fixture's source, not of the matrix, so it cannot be asserted here; what
+    # can be is that no case hedges by naming more than one.
+    assert all(isinstance(c.channel, str) and c.channel for c in realgate.MATRIX)
 
 
 def test_the_expectations_cover_the_defects_this_gate_exists_for():
