@@ -2,10 +2,10 @@
 PY ?= python3
 export PYTHONPATH := core
 
-.PHONY: test lint typecheck ci bundle verify run eval eval-gate arch-gate dashboard release clean help
+.PHONY: test lint typecheck gui ci bundle verify run eval eval-gate arch-gate dashboard release clean help
 
 help:
-	@echo "targets: test lint typecheck ci bundle verify run eval eval-gate arch-gate dashboard release clean"
+	@echo "targets: test lint typecheck gui ci bundle verify run eval eval-gate arch-gate dashboard release clean"
 
 test:
 	$(PY) -m pytest tests/ -q
@@ -24,7 +24,26 @@ typecheck:
 	  echo "mypy not installed -- gate cannot run. pip install mypy" >&2; exit 1; }
 	mypy core/lykos
 
-ci: lint typecheck test
+# The GUI harnesses render the page's own script against a stubbed DOM and assert what comes
+# out. They run under pytest too, but there they SKIP when node is absent -- and a skip is
+# invisible in a green run, which is the same "decorative gate" failure this file already
+# warns about for lint/typecheck and for the FP budget. So node missing FAILS here.
+#
+# They exist because every other GUI assertion in the suite checks that source text EXISTS --
+# a function is named, a label appears -- and none of them would notice a board that renders
+# zero rows. One such bug got as far as a commit: `t.open || ... || BOARD_OPEN[k]`
+# short-circuits, so the chevron on a default-open tier did nothing at all.
+GUI_PAGE ?= core/lykos/api/static/index.html
+
+gui:
+	@command -v node >/dev/null 2>&1 || { \
+	  echo "node not installed -- GUI gate cannot run. Install node (or run the harnesses" >&2; \
+	  echo "via 'make test', where they skip rather than fail)." >&2; exit 1; }
+	@for h in tests/js/*.js; do \
+	  echo "== $$h"; node "$$h" "$(GUI_PAGE)" || exit 1; \
+	done
+
+ci: lint typecheck gui test
 	@echo "CI complete"
 
 bundle:
