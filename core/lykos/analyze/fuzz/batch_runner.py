@@ -20,7 +20,8 @@ Run as: python3 batch_runner.py <mode> <per_timeout> <exe> [base argv...]
 stdin:  u32 count, u32 n_blocks, then n_blocks * u64 block addresses (image-relative),
         then per input: u32 length + bytes
 stdout: per input: i32 rc, u32 stdout_len, u32 stderr_len, u8 flags, u32 n_new,
-        then stdout, stderr, and n_new * u64 newly reached block addresses
+        u64 fault_pc (image-relative, 0 if unknown), then stdout, stderr, and
+        n_new * u64 newly reached block addresses
 """
 import ctypes
 import os
@@ -175,7 +176,7 @@ def _arm(libc, pid, mem, base, blocks, plan):
 
 
 def _trace_one(libc, argv, stdin_data, timeout, blocks, exe, plan=None):
-    """Run one input under ptrace. Returns (rc, out, err, flags, reached)."""
+    """Run one input under ptrace. Returns (rc, out, err, flags, reached, fault_pc)."""
     r_out, w_out = os.pipe()
     r_err, w_err = os.pipe()
     r_in, w_in = os.pipe()
@@ -208,7 +209,7 @@ def _trace_one(libc, argv, stdin_data, timeout, blocks, exe, plan=None):
 
     reached, regs = [], _Regs()
     deadline = _now() + timeout
-    rc, flags, deliver = 0, 0, 0
+    rc, flags, deliver, fault_pc = 0, 0, 0, 0
     while True:
         libc.ptrace(PTRACE_CONT, pid, 0, ctypes.c_void_p(deliver))
         deliver = 0
@@ -240,6 +241,11 @@ def _trace_one(libc, argv, stdin_data, timeout, blocks, exe, plan=None):
             if _handles(pid, sig):
                 deliver = sig                           # let the program have it, and see
                 continue
+            # Where it faulted, which is what tells two bugs apart. Bucketing crashes by
+            # signal alone collapsed 8,516 of them into one "unique" -- every SIGSEGV in the
+            # program is the same finding, however many distinct defects produced them.
+            if libc.ptrace(PTRACE_GETREGS, pid, 0, ctypes.byref(regs)) == 0:
+                fault_pc = regs.rip - base
             rc = -sig                                   # fatal: report it, and do not deliver,
             libc.ptrace(PTRACE_KILL, pid, 0, 0)         # so no core dump handler runs
             try:
@@ -263,7 +269,7 @@ def _trace_one(libc, argv, stdin_data, timeout, blocks, exe, plan=None):
         except OSError:
             pass
     out = _drain(r_out); err = _drain(r_err)
-    return rc, out, err, flags, reached
+    return rc, out, err, flags, reached, fault_pc
 
 
 def _now():
@@ -315,10 +321,10 @@ def main():
             stdin = b""
         else:
             argv, stdin = [exe] + base_argv, data
-        reached = []
+        reached, fault_pc = [], 0
         if blocks:
-            rc, so, se, flags, reached = _trace_one(libc, argv, stdin, per_timeout,
-                                                    blocks, exe, plan)
+            rc, so, se, flags, reached, fault_pc = _trace_one(libc, argv, stdin, per_timeout,
+                                                              blocks, exe, plan)
         else:
             try:
                 pr = subprocess.run(argv, input=stdin, stdout=subprocess.PIPE,
@@ -328,7 +334,7 @@ def main():
                 rc, so, se, flags = 0, b"", b"", 1
             except Exception:
                 rc, so, se, flags = 0, b"", b"", 2
-        out.write(struct.pack("<iIIBI", rc, len(so), len(se), flags, len(reached)))
+        out.write(struct.pack("<iIIBIQ", rc, len(so), len(se), flags, len(reached), fault_pc))
         out.write(so); out.write(se)
         if reached:
             out.write(struct.pack("<%dQ" % len(reached), *reached))

@@ -248,6 +248,13 @@ def run_case(case: RealCase, exe: Path, *, timeout: float = 30.0) -> dict:
             got["L1"] = any(p.verified and p.level == "L1" for p in pocs)
             res["detail"]["mode"] = _done_field(store, cid, "build_poc", "poc.done",
                                                 "input_mode")
+            if not got["L1"]:
+                # a gate that only says "L1 missing" sends you back to reproduce it by hand
+                res["detail"]["tried"] = _done_field(store, cid, "build_poc", "poc.done",
+                                                     "input_modes_tried")
+                res["detail"]["why"] = _done_field(store, cid, "build_poc", "poc.done",
+                                                   "input_mode_why")
+                res["detail"]["crash_input"] = sha[:12]
 
             if "L2" in case.expect:
                 enqueue_primitive(q, target, params={"input_sha": sha, "timeout": timeout},

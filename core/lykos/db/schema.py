@@ -319,4 +319,16 @@ ALTER TABLE finding_site ADD COLUMN state TEXT;
 ALTER TABLE finding_site ADD COLUMN confidence REAL;
 ALTER TABLE finding_site ADD COLUMN verdict TEXT;
 """),
+    Migration(version=14, name="dyn_result_fault_pc", sql=r"""
+-- WHERE a crash faulted, image-relative, when the run that found it was traced.
+--
+-- Crash findings were keyed by signal alone, so every SIGSEGV in a program was one finding:
+-- 8,516 crashes in a jhead campaign reported as a single "unique". Two defects that both
+-- segfault are two defects, and the faulting instruction is what separates them.
+--
+-- It lives on the crash row rather than in the stage that observed it because every later
+-- stage -- build_poc, root_cause, synthesize -- has to derive the SAME key from the same
+-- input, or it files a second finding for a crash that is already recorded.
+ALTER TABLE dyn_result ADD COLUMN fault_pc INTEGER;
+"""),
 ]

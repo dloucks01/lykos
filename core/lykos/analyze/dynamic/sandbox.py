@@ -62,6 +62,9 @@ class RunResult:
     duration_ms: int = 0
     cmd: list = field(default_factory=list)
     note: Optional[str] = None
+    # Image-relative address of the faulting instruction, when the target was traced. Two
+    # crashes at different addresses are different defects, however alike their signals look.
+    fault_pc: Optional[int] = None
 
 
 class ArgvNulError(ValueError):
@@ -172,10 +175,11 @@ def run_batch(exe, payloads, *, mode="stdin", base_argv=(), timeout: float = 2.0
     per_ms = int((time.time() - t0) * 1000 / max(1, len(payloads)))
     results, off = [], 0
     for _ in payloads:
-        if off + 17 > len(out):
+        if off + 25 > len(out):
             return None                               # truncated reply: fall back rather than
-        code, nso, nse, flags, nnew = struct.unpack("<iIIBI", out[off:off + 17])  # invent one
-        off += 17
+        code, nso, nse, flags, nnew, fault_pc = struct.unpack(   # invent one
+            "<iIIBIQ", out[off:off + 25])
+        off += 25
         so, se = out[off:off + nso], out[off + nso:off + nso + nse]
         off += nso + nse
         reached = ()
@@ -188,7 +192,7 @@ def run_batch(exe, payloads, *, mode="stdin", base_argv=(), timeout: float = 2.0
         results.append(RunResult(isolation="bwrap+netns+batch", crashed=bool(crashed),
                                  timed_out=bool(flags & 1), exit_code=exit_code, signal=sig,
                                  signal_name=signame, stdout=so, stderr=se,
-                                 duration_ms=per_ms,
+                                 duration_ms=per_ms, fault_pc=(fault_pc or None),
                                  note=(",".join(str(x) for x in reached) or None)))
     return results
 

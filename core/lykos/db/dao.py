@@ -706,6 +706,14 @@ class FindingDAO(BaseDAO):
                        detector=r["detector"], evidence=loads(r["evidence_json"]) or [])
 
 
+def _opt_col(row: sqlite3.Row, name: str) -> Any:
+    """A column that older rows predate. sqlite3.Row raises rather than returning None."""
+    try:
+        return row[name]
+    except (IndexError, KeyError):
+        return None
+
+
 # ------------------------------------------------------------------ DynResult (Phase 4)
 class DynResultDAO(BaseDAO):
     def insert(self, target_id: str, case_id: str, *, run_id: Optional[str] = None,
@@ -715,17 +723,30 @@ class DynResultDAO(BaseDAO):
                signal_name: Optional[str] = None, crashed: bool = False,
                timed_out: bool = False, isolation: Optional[str] = None,
                duration_ms: Optional[int] = None, stdout_sha: Optional[str] = None,
-               stderr_sha: Optional[str] = None, note: Optional[str] = None) -> str:
+               stderr_sha: Optional[str] = None, note: Optional[str] = None,
+               fault_pc: Optional[int] = None) -> str:
         rid = new_id()
         self.conn.execute(
             "INSERT INTO dyn_result(id,target_id,case_id,run_id,input_sha,input_mode,argv,"
             "exit_code,signal,signal_name,crashed,timed_out,isolation,duration_ms,"
-            "stdout_sha,stderr_sha,note,created_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "stdout_sha,stderr_sha,note,fault_pc,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (rid, target_id, case_id, run_id, input_sha, input_mode, dumps(argv),
              exit_code, signal, signal_name, as_int_bool(crashed), as_int_bool(timed_out),
-             isolation, duration_ms, stdout_sha, stderr_sha, note, _now()))
+             isolation, duration_ms, stdout_sha, stderr_sha, note, fault_pc, _now()))
         return rid
+
+    def fault_pc_for(self, target_id: str, input_sha: str) -> Optional[int]:
+        """Where this input faulted, as recorded by the run that found it.
+
+        Every stage that files a crash finding has to derive the SAME dedup key, or a verified
+        PoC files a second finding beside the crash it just proved instead of promoting it.
+        """
+        r = self.conn.execute(
+            "SELECT fault_pc FROM dyn_result WHERE target_id=? AND input_sha=? "
+            "AND fault_pc IS NOT NULL ORDER BY created_at DESC LIMIT 1",
+            (target_id, input_sha)).fetchone()
+        return int(r["fault_pc"]) if r and r["fault_pc"] is not None else None
 
     def list_by_target(self, target_id: str) -> list[DynResult]:
         rows = self.conn.execute(
@@ -747,7 +768,8 @@ class DynResultDAO(BaseDAO):
                          signal_name=r["signal_name"], crashed=as_flag(r["crashed"]),
                          timed_out=as_flag(r["timed_out"]), isolation=r["isolation"],
                          duration_ms=r["duration_ms"], stdout_sha=r["stdout_sha"],
-                         stderr_sha=r["stderr_sha"], note=r["note"])
+                         stderr_sha=r["stderr_sha"], note=r["note"],
+                         fault_pc=_opt_col(r, "fault_pc"))
 
 
 # ------------------------------------------------------------------------ Poc (Phase 6)

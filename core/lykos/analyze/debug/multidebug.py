@@ -12,10 +12,11 @@ from __future__ import annotations
 import json
 import os
 
-from ...db.dao import CallEdgeDAO, FindingDAO, FunctionDAO, TargetDAO
+from ...db.dao import CallEdgeDAO, DynResultDAO, FindingDAO, FunctionDAO, TargetDAO
 from ...jobs.registry import register_stage
 from .. import elf
 from ..dynamic import sandbox
+from ..dynamic.stage import crash_dedup_key
 from ..poc.capture import MODES, how_to_feed
 from . import gdb, rootcause
 
@@ -158,13 +159,15 @@ def multi_debug_stage(ctx) -> dict:
               if report["multiproc"]
               else f"debug: {v['class']} — {rc['summary']}")
     crash_fn = (rc["slice"].get("crash_function") or {})
+    _fault_pc = (DynResultDAO(ctx.conn).fault_pc_for(victim.id, input_sha)
+                 if input_sha else None)
     fdao.upsert(victim.id, victim.case_id, {
         "cwe": v["cwe"], "title": f"Root cause ({relation}): {v['class']}",
         "severity": v["severity"], "state": "confirmed", "confidence": 0.9,
         "detector": "multi_debug",
         "site_addr": _hex(crash_fn.get("static_addr")),
         "function_addr": crash_fn.get("func_addr"),
-        "dedup_key": f"dynamic-crash:{cap['signal_name']}",
+        "dedup_key": crash_dedup_key(cap["signal_name"], _fault_pc),
         "evidence": [{"channel": "multi-process-debug", "detail": detail}]})
 
     # A crash found through a forked child demonstrates the child's findings just as much.
