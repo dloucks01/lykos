@@ -438,3 +438,74 @@ def test_detection_skips_the_libc_linked_into_a_static_binary():
     assert "program_ranges" in src
     assert "return functions, edges, 0" in src, \
         "with no attribution available nothing may be filtered -- hiding the program is worse"
+
+
+def test_a_bounds_check_that_can_wrap_is_reported():
+    """jhead's out-of-bounds read is an integer overflow IN THE BOUNDS CHECK:
+    `OffsetVal + ByteCount > ExifLength` in 32 bits, where 0x00ffffff + 0xff000002 is 1 -- the
+    sum looks tiny, the check passes, and the offset still points far outside the buffer. The
+    platform found that dynamically and could not see it statically."""
+    from lykos.analyze.detect.stage import _intover_candidates
+
+    def ir(*pcode):
+        return {"blocks": [{"addr": "0x1000", "instructions": [
+            {"addr": "0x1004", "pcode": list(pcode)}]}]}
+
+    class _F:
+        addr, name = "0x1000", "parse"
+
+    wraps = ir("INT_ADD unique:0x100:4 unique:0x200:4 -> unique:0x300:4",
+               "INT_LESS unique:0x300:4 unique:0x400:4 -> reg:CF:1")
+    got = _intover_candidates({"0x1000": wraps}, [_F()])
+    assert len(got) == 1 and got[0]["cwe"] == "CWE-190"
+
+    # a loop counter is not a hazard: one addend is a constant
+    loop = ir("INT_ADD unique:0x100:4 const:0x1:4 -> unique:0x300:4",
+              "INT_LESS unique:0x300:4 unique:0x400:4 -> reg:CF:1")
+    assert _intover_candidates({"0x1000": loop}, [_F()]) == []
+
+    # pointer arithmetic at full width cannot wrap into a small value
+    wide = ir("INT_ADD unique:0x100:8 unique:0x200:8 -> unique:0x300:8",
+              "INT_LESS unique:0x300:8 unique:0x400:8 -> reg:CF:1")
+    assert _intover_candidates({"0x1000": wide}, [_F()]) == []
+
+    # a sum nothing compares is just arithmetic
+    plain = ir("INT_ADD unique:0x100:4 unique:0x200:4 -> unique:0x300:4")
+    assert _intover_candidates({"0x1000": plain}, [_F()]) == []
+
+
+def test_the_wrapping_check_is_only_reported_where_input_reaches():
+    """Eighteen of jhead's functions do 32-bit arithmetic in a comparison, most of it loop and
+    buffer bookkeeping no input can steer. Reporting all of them doubles the report to say so."""
+    from lykos.analyze.detect.stage import _intover_candidates
+
+    class _F:
+        addr, name = "0x1000", "parse"
+    ir = {"blocks": [{"addr": "0x1000", "instructions": [{"addr": "0x1004", "pcode": [
+        "INT_ADD unique:0x100:4 unique:0x200:4 -> unique:0x300:4",
+        "INT_LESS unique:0x300:4 unique:0x400:4 -> reg:CF:1"]}]}]}
+    assert _intover_candidates({"0x1000": ir}, [_F()], only={"0x1000"})
+    assert _intover_candidates({"0x1000": ir}, [_F()], only=set()) == []
+
+
+def test_a_path_checked_then_used_is_a_toctou_candidate():
+    """access() then fopen() on a NAME are two operations on a name, not on a file, and the
+    safe form of this code does not exist -- the fix is to drop the check and handle the error
+    from the use."""
+    from lykos.analyze.detect.detectors import DetectContext, toctou
+
+    class _E:
+        def __init__(self, site, name):
+            self.src_addr, self.site_addr = "0x1000", site
+            self.dst_name, self.dst_addr = name, "0x9"
+    ctx = DetectContext(target_id="t", case_id="c", functions=[], strings=[], mitigations={},
+                        frames={}, call_edges=[_E("0x1010", "access"), _E("0x1020", "fopen")])
+    got = toctou(ctx)
+    assert len(got) == 1 and got[0]["cwe"] == "CWE-367"
+
+    # use BEFORE check is not the pattern
+    ctx.call_edges = [_E("0x1010", "fopen"), _E("0x1020", "access")]
+    assert toctou(ctx) == []
+    # a check with no use is just a check
+    ctx.call_edges = [_E("0x1010", "access")]
+    assert toctou(ctx) == []

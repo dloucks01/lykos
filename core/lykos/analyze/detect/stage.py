@@ -65,6 +65,83 @@ def _deref_candidates(derefs, functions):
     return out
 
 
+# A bounds check that can WRAP is not a bounds check. jhead's out-of-bounds read is exactly
+# this: `if (OffsetVal + ByteCount > ExifLength)` computed in 32 bits, where 0x00ffffff +
+# 0xff000002 is 1 -- the sum looks tiny, the check passes, and the offset still points far
+# outside the buffer. The platform FOUND that bug dynamically and could not see it statically,
+# which is the gap this closes.
+_CMP_OPS = {"INT_LESS", "INT_LESSEQUAL", "INT_SLESS", "INT_SLESSEQUAL", "INT_EQUAL",
+            "INT_NOTEQUAL"}
+_ADD_OPS = {"INT_ADD", "INT_MULT", "INT_LEFT"}
+
+
+def _intover_candidates(func_irs, functions, only=None, width=4):
+    """Sums narrower than a pointer that are then COMPARED: a check the sum can wrap past.
+
+    `only` restricts this to the functions attacker data actually reaches. Without it the
+    pattern is everywhere -- eighteen of jhead's functions do 32-bit arithmetic in a
+    comparison, most of it loop and buffer bookkeeping that no input can steer -- and a report
+    that doubles in size to say so is the inventory-as-findings mistake again.
+    """
+    names = {f.addr: f.name for f in functions}
+    out = []
+    for faddr, ir in (func_irs or {}).items():
+        if only is not None and faddr not in only:
+            continue
+        for b in ((ir or {}).get("blocks") or []):
+            for i in b.get("instructions", []) or []:
+                produced: dict = {}
+                for pc in i.get("pcode", []) or []:
+                    mnem, args, outk = _pcode(pc)
+                    if mnem in _ADD_OPS and outk and _tok_width(outk) == width:
+                        # BOTH addends must be values. `i + 1 < n` is a loop, not a hazard,
+                        # and allowing a constant addend flagged sixteen extra functions in
+                        # jhead -- a pointer bump or a loop counter in nearly every one. The
+                        # shape that wraps is two attacker-sized quantities added together:
+                        # an offset plus a count, which is jhead's bug exactly.
+                        if all(not t.startswith("const:") for t in args):
+                            produced[outk] = mnem
+                    elif mnem in _CMP_OPS:
+                        hit = next((k for k in args if k in produced), None)
+                        if hit is None:
+                            continue
+                        fn = names.get(faddr) or str(faddr)
+                        out.append({
+                            "cwe": "CWE-190", "severity": "low", "state": "candidate",
+                            # inventory grade on purpose: this is the SHAPE of a check that
+                            # can wrap, not evidence that this one does. What makes it worth
+                            # reporting is that the platform found jhead's wrapping check
+                            # dynamically and could not see it statically at all.
+                            "confidence": 0.3, "detector": "int_overflow_check",
+                            "title": ("Bounds check on a sum that can wrap "
+                                      f"({width * 8}-bit arithmetic)"),
+                            "function_addr": faddr, "site_addr": i.get("addr"),
+                            "dedup_key": f"CWE-190:int_overflow_check:{faddr}",
+                            "site_detail": (f"{produced[hit]} at {width * 8} bits feeds a "
+                                            f"comparison in {fn}: if the sum wraps, the check "
+                                            f"passes on a value that is far too large"),
+                            "evidence": [{"channel": "pcode",
+                                          "detail": (f"{produced[hit]} -> {mnem} at "
+                                                     f"{i.get('addr')} in {fn}")}],
+                        })
+                        break
+    return out
+
+
+def _pcode(pc):
+    """(mnemonic, operand tokens, output token) -- output is None for a branch or store."""
+    left, _, out = pc.partition(" -> ")
+    parts = left.split()
+    return (parts[0] if parts else ""), parts[1:], (out.strip() or None)
+
+
+def _tok_width(tok):
+    try:
+        return int(tok.rsplit(":", 1)[1])
+    except (IndexError, ValueError):
+        return 0
+
+
 def _program_only(ctx, target, functions):
     """(functions, call_edges, dropped) restricted to the program's own code where possible."""
     from ..elf import program_ranges
@@ -152,6 +229,12 @@ def detect_stage(ctx) -> dict:
     tainted_sites = taint.analyze_program(func_irs, dctx.call_edges, target.arch,
                                           entry_seeds=entry_seeds, mem_out=derefs)
     cands += _deref_candidates(derefs, dctx.functions)
+    # only where attacker data demonstrably lands: a function that dereferences input, or one
+    # whose call to a dangerous sink taint reaches
+    touched = {d["function_addr"] for d in derefs}
+    touched |= {c["function_addr"] for c in cands
+                if c.get("site_addr") in tainted_sites and c.get("function_addr")}
+    cands += _intover_candidates(func_irs, dctx.functions, only=touched)
     for c in cands:
         if c["detector"] == "dangerous_api" and c.get("site_addr") in tainted_sites:
             c["state"] = "corroborated"
