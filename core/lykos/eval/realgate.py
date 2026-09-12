@@ -102,6 +102,18 @@ class RealCase:
     expect: dict                  # assertion name -> required value
     note: str = ""
     flags: list = field(default_factory=list)
+    prebuilt: str = ""            # repo-relative binary to use INSTEAD of compiling `source`
+    fuzz: bool = False            # find the crashing input rather than being handed one
+
+    @property
+    def optional(self) -> bool:
+        """A prebuilt fixture is not committed (large, reproducible), so its absence skips.
+        A case that fails to COMPILE still fails the gate -- that is an opt-out, not a
+        missing download."""
+        return bool(self.prebuilt)
+
+
+_REPO = Path(__file__).resolve().parents[3]
 
 
 MATRIX = [
@@ -114,10 +126,25 @@ MATRIX = [
         (1 << 40).to_bytes(8, "little") + b"payload" * 8, "file",
         {"cwe120": True, "L1": True, "attributed": True, "poc_backed": True},
         note="file-positioned memcpy source; fault inside the call names the finding"),
+    # The synthetic cases above are shapes VALIDATED against real software. This one is the
+    # real software: third-party C, its own CVE-class bug, and nothing supplied but the
+    # binary. It is the only case that exercises format detection, seed generation and
+    # structure-aware mutation, which is the difference between "the chain works when handed a
+    # crashing input" and "the platform finds the bug".
+    RealCase(
+        "real_jhead", "", b"", "file",
+        {"cwe125": True, "found_by_fuzzing": True, "L1": True,
+         "attributed": True, "poc_backed": True},
+        prebuilt="examples/vuln-targets/bin/jhead_x86-64", fuzz=True,
+        note="jhead 3.04 CWE-125 in ProcessGpsInfo, found from the binary alone "
+             "(run examples/vuln-targets/fetch_build.sh to enable)"),
 ]
 
 
 def compile_case(case: RealCase, outdir: Path, cc: str = "gcc"):
+    if case.prebuilt:
+        exe = _REPO / case.prebuilt
+        return exe if exe.exists() else None
     src = outdir / f"{case.label}.c"
     src.write_text(case.source)
     out = outdir / case.label
@@ -189,6 +216,28 @@ def run_case(case: RealCase, exe: Path, *, timeout: float = 30.0) -> dict:
             cwes = {f.cwe for f in fd.list_by_target(target.id)}
             got["cwe121"] = "CWE-121" in cwes
             got["cwe120"] = "CWE-120" in cwes
+            got["cwe125"] = "CWE-125" in cwes
+
+            if case.fuzz:
+                # Nothing supplied but the binary: the campaign has to work out the format
+                # from the target's own strings, generate a seed its parser accepts, and
+                # mutate it into a crash. Then the ladder continues from what it found.
+                from ..analyze.fuzz import enqueue_fuzz
+                from ..db.dao import DynResultDAO
+                enqueue_fuzz(q, target, params={"input_mode": case.channel,
+                                                "max_execs": 20000, "max_seconds": timeout * 4,
+                                                "exec_timeout": 2}, force=True)
+                pool.wait_idle(timeout * 40)
+                crashes = [d for d in DynResultDAO(store.conn).list_by_target(target.id)
+                           if d.crashed]
+                got["found_by_fuzzing"] = bool(crashes)
+                res["detail"]["model"] = _done_field(store, cid, "fuzz", "fuzz.format", "model")
+                res["detail"]["crashes"] = len(crashes)
+                if not crashes:
+                    res["ok"] = False
+                    res["missing"] = [k for k, v in case.expect.items() if got.get(k) != v]
+                    return res
+                sha = crashes[0].input_sha
 
             # NOTE: input_sha and nothing else. The stage must work out the channel itself --
             # every case here is reachable through exactly one, so the sweep is load-bearing.
@@ -252,7 +301,10 @@ def run(cases=None, *, timeout: float = 30.0, cc: str = "gcc", progress=None) ->
                 progress(f"[{i}/{len(cases)}] {case.label}")
             exe = compile_case(case, workdir, cc)
             if exe is None:
-                skipped.append({"label": case.label, "why": "did not compile"})
+                skipped.append({"label": case.label, "optional": case.optional,
+                                "why": ("fixture not built -- run "
+                                        "examples/vuln-targets/fetch_build.sh"
+                                        if case.optional else "did not compile")})
                 continue
             out.append(run_case(case, exe, timeout=timeout))
     finally:
@@ -266,14 +318,17 @@ def gate(report: dict) -> tuple:
     A case that did not build FAILS rather than skipping: this gate exists to be run, and a
     silent opt-out is the same failure mode it was written to catch.
     """
-    if report["skipped"]:
+    hard = [s for s in report["skipped"] if not s.get("optional")]
+    if hard:
         return False, "FAIL", "did not build: " + ", ".join(
-            f"{s['label']} ({s['why']})" for s in report["skipped"])
+            f"{s['label']} ({s['why']})" for s in hard)
     bad = [r for r in report["results"] if not r["ok"]]
     if bad:
         return False, "FAIL", "; ".join(
             f"{r['label']} missing {r['missing']}" for r in bad)
-    return True, "PASS", f"{len(report['results'])} real-chain cases passed"
+    absent = [s["label"] for s in report["skipped"]]
+    note = f" ({len(absent)} fixture(s) absent: {', '.join(absent)})" if absent else ""
+    return True, "PASS", f"{len(report['results'])} real-chain cases passed" + note
 
 
 def table(report: dict) -> str:
