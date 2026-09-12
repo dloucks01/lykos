@@ -11,7 +11,7 @@ import re
 from collections import defaultdict
 from dataclasses import dataclass, field
 
-from .catalog import DANGEROUS, SOURCES, normalize
+from .catalog import ADVISORY, DANGEROUS, SOURCES, normalize
 
 DETECTORS = []
 
@@ -56,12 +56,14 @@ def dangerous_api(ctx: DetectContext):
         if n not in DANGEROUS:
             continue
         cwe, sev, desc = DANGEROUS[n]
-        out.append(_cand(
+        cand = _cand(
             cwe, f"{desc}", sev, "dangerous_api",
             [{"channel": "pattern", "detail": f"call to {n}() at {e.site_addr}"}],
             function_addr=e.src_addr, site_addr=e.site_addr,
             dedup_key=f"{cwe}:dangerous_api:{n}",
-            confidence=0.4))
+            confidence=0.4)
+        cand["api"] = n
+        out.append(cand)
     return out
 
 
@@ -309,6 +311,8 @@ def correlate(cands: list, ctx: DetectContext) -> list:
         return reaches_within(fn_addr, source_fns, callers, depth)
 
     for c in cands:
+        if c["detector"] == "dangerous_api" and c.get("api") in ADVISORY:
+            continue                        # reachability cannot corroborate "verify this"
         if c["detector"] == "dangerous_api" and c.get("function_addr") \
                 and reaches_source(c["function_addr"]):
             c["state"] = "corroborated"
