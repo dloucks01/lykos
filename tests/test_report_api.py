@@ -118,3 +118,69 @@ def test_export_then_import(srv):
     st2, body2 = _post(port, "/import", archive)
     assert st2 == 201
     assert json.loads(body2)["cases"] == [cid]
+
+
+def test_a_bundle_is_embedded_once_and_within_a_budget(tmp_path):
+    """A PoC bundle carries the target binary so it reproduces standalone, which is the point
+    of it -- 660 KB of a 694 KB jhead report was one bundle. The per-bundle cap says nothing
+    about how many there are, and several findings can share one PoC, so ten PoCs on that
+    target would have produced a 7 MB page with the same binary in it repeatedly."""
+    from lykos.report import model
+
+    class _Store:
+        class content:
+            @staticmethod
+            def exists(_sha):
+                return True
+
+            @staticmethod
+            def get_bytes(_sha):
+                return b"\x00" * (1024 * 1024)       # 1 MiB -> ~1.37 MiB of base64
+    budget = {"left": model._MAX_EMBED_TOTAL}
+    embedded = set()
+    got = []
+    for i in range(6):
+        sha = "%064x" % i
+        b64 = model._embed(_Store(), sha, budget)
+        if b64:
+            embedded.add(sha)
+            budget["left"] -= len(b64)
+        got.append(bool(b64))
+    assert got[0] is True, "the first bundle is always embedded"
+    assert not all(got), "the budget has to stop somewhere"
+    assert budget["left"] >= 0
+    total = model._MAX_EMBED_TOTAL - budget["left"]
+    assert total <= model._MAX_EMBED_TOTAL
+
+    # one bundle larger than the per-bundle cap is refused regardless of budget
+    class _Big(_Store):
+        class content:
+            @staticmethod
+            def exists(_sha):
+                return True
+
+            @staticmethod
+            def get_bytes(_sha):
+                return b"\x00" * (model._MAX_EMBED_BUNDLE + 1)
+    assert model._embed(_Big(), "f" * 64, {"left": 1 << 40}) is None
+
+
+def test_a_bundle_that_is_not_embedded_says_where_to_get_it():
+    """With embedding off, or the budget spent, the report showed a bare hash and nothing to
+    do about it. Air-gapped does not mean unhelpful: the bundle is still on the analysis
+    server, and the report can say where."""
+    from lykos.report.html import to_html
+    base = {"case": {"name": "c", "id": "1"}, "generated_at": "now", "summary": {},
+            "targets": [{"filename": "t", "sha256": "a" * 64, "findings": [
+                {"id": "f1", "cwe": "CWE-125", "title": "oob", "severity": "high",
+                 "state": "poc-backed", "confidence": 0.9, "detector": "d", "evidence": [],
+                 "crashes": [], "pocs": [{"level": "L1", "verified": True, "signal": "SIGSEGV",
+                                          "bundle_sha": "b" * 64,
+                                          "bundle_href": "/artifacts/" + "b" * 64}]}]}]}
+    html = to_html(base)
+    assert "not embedded" in html and "/artifacts/" + "b" * 64 in html
+    # and a bundle shared by a second finding is named, not silently dropped
+    base["targets"][0]["findings"][0]["pocs"][0] = {
+        "level": "L1", "verified": True, "signal": "SIGSEGV",
+        "bundle_sha": "b" * 64, "bundle_same_as": "b" * 64}
+    assert "same bundle as above" in to_html(base)
