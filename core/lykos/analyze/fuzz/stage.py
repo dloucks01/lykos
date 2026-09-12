@@ -167,9 +167,18 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
                 _price(prefix, (time.time() - t_batch) * 1000 / max(1, len(inputs)),
                        flag_cost, retired, suspect, cheap_ms, ctx, event_prefix)
         if results is None:
+            # Per-execution fallback -- an emulated target, or no bubblewrap. Coverage still
+            # travels: the ptrace tracer cannot reach inside qemu, but qemu logs the guest PC
+            # of every block it translates, so a cross-architecture campaign is no longer
+            # blind. Eleven of the twelve architectures the platform builds real targets for
+            # were running on output shape alone.
             inputs = inputs[:1]
+            kw = {"endianness": target.endianness, "bits": target.bits}
+            if run_fn is run_input:
+                kw["base_argv"] = prefix
+                kw["blocks"] = tuple(all_blocks - seen_blocks) if all_blocks else ()
             results = [run_fn(exe, mode, workfile, exec_timeout, target.arch, inputs[0],
-                              endianness=target.endianness, bits=target.bits)[1]]
+                              **kw)[1]]
         for data, res in zip(inputs, results):
             # What gets RECORDED is the flag prefix, not the invocation: the workfile path
             # is scratch and means nothing to a later replay. A crash found under an option
