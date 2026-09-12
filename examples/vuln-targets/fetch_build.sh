@@ -72,6 +72,35 @@ if fetch unzip.tar.gz https://deb.debian.org/debian/pool/main/u/unzip/unzip_6.0.
    && cp unzip "$W/bin/unzip_x86-64") && echo "  + unzip_x86-64" || echo "  x unzip_x86-64"
 fi
 
+# ---------------------------------------------------------------- ncompress (CVE-2001-1413)
+# An unchecked `strcpy` of a command-line pathname into a 1024-byte stack buffer -- the one
+# shape in this corpus that gives INSTRUCTION-POINTER CONTROL rather than an out-of-bounds
+# read, which is what the L2 and L3 rungs of the PoC ladder need.
+#
+# Upstream 4.2.4.4 carries the fix and the historical vulnerable release is not on the
+# mirrors, so this reverts that one check from the pinned tarball. It is a deliberate,
+# documented un-patch of a known CVE for test material: the binary is named `_cve` to keep
+# that visible, it is never installed, and nothing here is redistributed.
+NC_SHA=b00ba28d3f332b38aa75478a15c1b789957aa6c02d6453471f452c0ec3e6517a
+if fetch ncompress.tar.gz http://archive.ubuntu.com/ubuntu/pool/universe/n/ncompress/ncompress_4.2.4.4.orig.tar.gz $NC_SHA; then
+  rm -rf src/ncompress-4.2.4.4; tar xzf src/ncompress.tar.gz -C src
+  echo "== ncompress 4.2.4.4, CVE-2001-1413 reverted =="
+  C=src/ncompress-4.2.4.4/compress42.c
+  if grep -q 'strlen(\*fileptr) > sizeof(tempname)' "$C"; then
+    sed -i '/if (strlen(\*fileptr) > sizeof(tempname) - 3) {/,/^\t\t}$/d' "$C"
+    # -std=gnu89: K&R declarations that a modern gcc rejects, same as unzip.
+    # -fno-stack-protector and -no-pie so the saved return address is reachable and the
+    # offset is stable, which is what the L2 rung measures.
+    # NOFUNCDEF/UTIME_H/COMPILE_DATE are what upstream's own makefile passes.
+    (cd src/ncompress-4.2.4.4 && gcc -O0 -w -std=gnu89 -DNOFUNCDEF -DUTIME_H \
+        -DCOMPILE_DATE='"cve-revert"' -fno-stack-protector -no-pie \
+        -o "$W/bin/ncompress_x86-64_cve" compress42.c) 2>/dev/null \
+      && echo "  + ncompress_x86-64_cve" || echo "  x ncompress_x86-64_cve (build failed)"
+  else
+    echo "  x length check not found -- upstream changed, not reverting"
+  fi
+fi
+
 echo
 echo "== self-check: the crasher must fault, the seed must parse =="
 for f in bin/jhead_*; do

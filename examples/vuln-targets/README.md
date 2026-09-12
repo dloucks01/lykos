@@ -21,6 +21,21 @@ Binaries are not committed (reproducible); `bin/manifest.tsv` is.
 | **jhead 3.04** × 12 ISAs | JPEG/EXIF | CWE-125 out-of-bounds read, reproduces on every ISA |
 | **giflib 5.1.4** `gif2rgb` | GIF | negative case: a real parser the chain should run clean on |
 | **Info-ZIP 6.0** `unzip` | ZIP | a large real parser (3,705 blocks) for the ZIP model |
+| **ncompress 4.2.4.4** (CVE reverted) | argv | CWE-121 stack overflow; the only target here that reaches **L2** |
+
+### The reverted CVE
+
+`ncompress_x86-64_cve` is upstream 4.2.4.4 with the CVE-2001-1413 length check removed --
+one `if` around the `strcpy` of an argv pathname into a 1024-byte stack buffer. Upstream
+carries the fix and the historical vulnerable release is no longer on the mirrors, so the
+build script reverts it from the pinned tarball and names the binary `_cve` to keep that
+visible. It is test material: never installed, never redistributed.
+
+It is here because every other target's bug is an out-of-bounds *read*, which cannot give
+instruction-pointer control. This one does: the ladder reaches **L2, confirmed at offset
+1048**, and the release gate asserts it. L3 is not reached on any real target yet -- the
+platform reports precisely why ("no win function, and no pop-rdi gadget + /bin/sh +
+system@plt for a ROP chain") rather than failing quietly.
 
 `x86` (32-bit) is skipped unless gcc multilib is installed; every other toolchain absence is
 reported and skipped, the same rule the arch gate uses.
