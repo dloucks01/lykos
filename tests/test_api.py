@@ -390,3 +390,73 @@ def test_advice_does_not_plan_for_a_file_it_cannot_identify():
     ok = advise(imports=["fopen"], functions=40, findings=2, seeds=0, has_format=False,
                 afl_usable=True, executable=True)
     assert ok["analysable"] is True and ok["backend"]
+
+
+def test_a_proven_finding_is_not_badged_low(tmp_path):
+    """Severity means demonstrated impact, and a working reproducer is the strongest evidence
+    of it the platform can produce. jhead's proven out-of-bounds read kept the severity its
+    pattern detector guessed -- low -- so the one finding in the report backed by a verified
+    PoC sorted below unproven advisories."""
+    from lykos.casestore import CaseStore
+    from lykos.db.dao import FindingDAO
+    store = CaseStore.open(tmp_path / "case")
+    try:
+        cid = store.cases.create("c").id
+        t = store.targets.upsert(cid, "t", "a" * 64)
+        fd = FindingDAO(store.conn)
+        base = {"cwe": "CWE-125", "title": "oob read", "severity": "low",
+                "detector": "tainted_deref", "dedup_key": "k1", "evidence": [],
+                "function_addr": None, "site_addr": None}
+        fd.upsert(t.id, cid, {**base, "state": "candidate", "confidence": 0.35})
+        f = fd.list_by_target(t.id)[0]
+        assert f.severity == "low", "unproven: the detector's own guess stands"
+        fd.upsert(t.id, cid, {**base, "state": "poc-backed", "confidence": 0.95})
+        f = fd.list_by_target(t.id)[0]
+        assert f.state == "poc-backed" and f.severity == "high"
+        # something already worse is not dragged down to high
+        crit = {**base, "dedup_key": "k2", "severity": "critical", "state": "poc-backed",
+                "confidence": 0.95}
+        fd.upsert(t.id, cid, crit)
+        got = next(x for x in fd.list_by_target(t.id) if x.dedup_key == "k2")
+        assert got.severity == "critical"
+    finally:
+        store.close()
+
+
+def test_strings_can_be_paged_past_the_cap(tmp_path):
+    """A binary can hold far more strings than the cap returns -- jhead has 3,805 and the
+    response stopped at exactly 2,000 with nothing saying so, indistinguishable from "that is
+    all of them"."""
+    from lykos.casestore import CaseStore
+    from lykos.db.dao import StringDAO
+    store = CaseStore.open(tmp_path / "case")
+    try:
+        cid = store.cases.create("c").id
+        t = store.targets.upsert(cid, "t", "b" * 64)
+        sd = StringDAO(store.conn)
+        sd.replace_for_target(t.id, [{"addr": "0x%06x" % i, "value": f"s{i}"}
+                                     for i in range(50)])
+        assert sd.count_by_target(t.id) == 50
+        first = sd.list_by_target(t.id, limit=10)
+        rest = sd.list_by_target(t.id, limit=10, offset=10)
+        assert len(first) == len(rest) == 10
+        assert first[0].addr != rest[0].addr, "offset must actually move the window"
+        assert sd.list_by_target(t.id, limit=10, offset=45) and \
+            len(sd.list_by_target(t.id, limit=10, offset=45)) == 5
+    finally:
+        store.close()
+
+
+def test_a_check_that_could_not_run_does_not_report_ok():
+    """heap_check returned `ok: true, "no heap errors observed"` on a statically linked target
+    where the LD_PRELOAD shim can never load -- a clean bill of health from a check that never
+    ran. The caveat was in the note while the verdict said the opposite."""
+    import inspect
+
+    from lykos.analyze.dynamic import heap_stage
+    src = inspect.getsource(heap_stage)
+    assert '"applicable": False' in src
+    assert 'linking or ""' in src, "the static case has to be tested for explicitly"
+    i_guard = src.index('"applicable": False')
+    i_ok = src.index('"ok": True, "errors": len(errors)')
+    assert i_guard < i_ok, "the not-applicable verdict must come before the ok one"
