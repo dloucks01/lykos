@@ -368,6 +368,15 @@ tr.fdetail>td{background:var(--surface-2);border-bottom:1px solid var(--border-s
 .fmt>.btn,.fmt>a.btn{min-width:120px;justify-content:center;text-align:center}
 .fmt>span{font-size:11.5px;color:var(--dim)}
 @media(min-width:720px){.fmtgrid{grid-template-columns:1fr 1fr}}
+/* A stage that cannot run on this substrate: visibly out, but still legible and still
+   carrying its reason in the tooltip. Hiding it entirely would make a capability the tester
+   knows exists look missing, with no way to discover why. */
+.btn.unavail, .btn:disabled{opacity:.42;cursor:not-allowed;filter:grayscale(.7)}
+.btn.unavail:hover{opacity:.6}
+/* The recommended next step, so it is findable without reading twenty labels. */
+.btn.planned{box-shadow:inset 0 0 0 1px var(--teal,#3aa);border-color:var(--teal,#3aa)}
+#substrate{opacity:.85}
+#laddernote b{color:var(--teal,#3aa)}
 </style>
 </head>
 <body>
@@ -1095,7 +1104,7 @@ async function showDetail(targetId){
     </div>
     <div class="pipe">
       <section class="stage">
-        <div class="stagehdr"><span class="snum">1</span><b>Triage</b><span class="schip done">done</span></div>
+        <div class="stagehdr"><b>Triage</b><span class="schip done">done</span><span class="schip mono" id="substrate"></span></div>
         <div class="sbody">
           <div class="kvgrid">
             <div class="kv"><span>entry</span><b>${rec.entry_point||"—"}</b></div>
@@ -1111,41 +1120,16 @@ async function showDetail(targetId){
         </div>
       </section>
 
+      <!-- (1) FEED -- how the target is invoked and what it is given. This decides whether
+           anything below can work at all, and it used to be the second of twenty-two controls
+           in a single panel: a service needing "-c @@" that is fuzzed bare prints its usage on
+           every execution and reports a clean campaign against a program never entered. -->
       <section class="stage">
-        <div class="stagehdr"><span class="snum">2</span><b>Reverse engineering</b><span class="schip mono" id="decostat"></span></div>
+        <div class="stagehdr"><span class="snum">1</span><b>Feed</b><span class="schip mono" id="feedstat"></span></div>
         <div class="sbody">
-          <div class="actions">
-            <button class="btn sm" id="deco">Decompile (Ghidra)</button>
-            <details class="menu"><summary class="btn sm">Firmware ▾</summary>
-              <div class="menubody">
-                <button class="btn sm" id="carve" title="Carve embedded components (ELFs, filesystems, keys); identify a bare-metal blob's arch/base/entry">Carve components</button>
-                <button class="btn sm" id="rehost" title="Rehost a bare-metal ARM Cortex-M image under Unicorn (Fuzzware-style MMIO) and fuzz peripheral inputs">Rehost &amp; fuzz</button>
-              </div></details>
-          </div>
-          <div id="funcs"></div>
-          <div id="codeviewer" class="cv" hidden></div>
-          <details class="disc"><summary>Strings</summary><div id="strings"></div></details>
-        </div>
-      </section>
-
-      <section class="stage">
-        <div class="stagehdr"><span class="snum">3</span><b>CWE detection</b><span class="schip mono" id="detectstat"></span></div>
-        <div class="sbody">
-          <div class="actions"><button class="btn sm" id="detect">Detect CWEs</button>
-            <button class="btn sm" id="cverun" title="Fingerprint embedded library versions (OpenSSL/zlib/libpng/busybox/…) and match a vendored offline CVE database — no execution. Great for static/firmware binaries.">CVE scan</button>
-            <span class="schip mono" id="cvestat"></span></div>
-          <div id="findings"></div>
-        </div>
-      </section>
-
-      <section class="stage">
-        <div class="stagehdr"><span class="snum">4</span><b>Dynamic &amp; fuzzing</b><span class="schip mono" id="fuzzstat"></span></div>
-        <div class="sbody">
-          <!-- guided recommendation: reads triage + findings + what's attached -->
           <div id="fuzzguide" class="guide" hidden></div>
-
           <div class="fgroup">
-            <div class="fglabel">1 · How does the target take input?</div>
+            <div class="fglabel">Invocation <span class="fghint">how the target takes input</span></div>
             <div class="actions">
               <select id="dynmode" class="sel" title="Where the target reads its input" onchange="recommendFuzz()">
                 <option value="stdin">stdin</option><option value="arg">argv</option>
@@ -1156,12 +1140,11 @@ async function showDetail(targetId){
               <span class="mono" id="seedcount" style="color:var(--faint);font-size:10.5px"></span>
               <span class="vsep"></span>
               <input id="dyninput" class="inp" placeholder="one concrete input (optional)" style="max-width:170px">
-              <button class="btn sm" id="dynrun" title="Detonate the target once on this exact input (or none) -- a quick smoke test before a campaign">Run once ▶</button>
+              <button class="btn sm" id="dynrun" title="Detonate the target once on this exact input (or none) -- a quick smoke test before a campaign">Run once &#9654;</button>
             </div>
           </div>
-
           <div class="fgroup">
-            <div class="fglabel">2 · Structure-aware mutation <span class="fghint">(for file-format parsers)</span></div>
+            <div class="fglabel">Structure model <span class="fghint">keeps a parser's input valid enough to reach its own logic</span></div>
             <div class="actions">
               <select id="fuzzformat" class="sel" title="Keeps the format valid and coordinates length fields with their data -- finds format-parser overflows byte mutation misses" onchange="onFmtChange();recommendFuzz()">
                 <option value="">byte-level (no model)</option>
@@ -1170,13 +1153,21 @@ async function showDetail(targetId){
                 <option value="custom">custom (built from a sample)</option>
               </select>
               <input id="fuzzmagic" class="inp" placeholder="magic e.g. %PDF" style="max-width:120px;display:none">
-              <button class="btn sm" id="specbuild" onclick="openSpecBuilder()" title="Build a format spec visually -- auto-detect it from a real sample and see how it carves">⚙ Build from sample…</button>
+              <button class="btn sm" id="specbuild" onclick="openSpecBuilder()" title="Build a format spec visually -- auto-detect it from a real sample and see how it carves">&#9881; Build from sample&#8230;</button>
               <span class="fghint" id="customchip"></span>
             </div>
           </div>
+        </div>
+      </section>
 
+      <!-- (2) FIND -- discover a defect, by execution or statically. Both belong together:
+           the platform's order is evidence first, and a static finding is supporting evidence
+           for something run, not a separate activity. -->
+      <section class="stage">
+        <div class="stagehdr"><span class="snum">2</span><b>Find</b><span class="schip mono" id="fuzzstat"></span></div>
+        <div class="sbody">
           <div class="fgroup">
-            <div class="fglabel">3 · Run a campaign</div>
+            <div class="fglabel">Campaign</div>
             <div class="actions">
               <select id="fuzzstrategy" class="sel" title="Fuzzing strategy" onchange="recommendFuzz()">
                 <option value="fuzz">Black-box (no tools needed)</option>
@@ -1185,38 +1176,67 @@ async function showDetail(targetId){
                 <option value="concolic">Concolic (angr)</option>
                 <option value="boundary">Boundary (IPC)</option>
               </select>
-              <button class="btn sm primary" id="fuzzrun">Fuzz ▶</button>
+              <button class="btn sm primary" id="fuzzrun">Fuzz &#9654;</button>
               <span class="vsep"></span>
-              <button class="btn sm" id="synthrun" title="Deterministic: synthesize the overflow input from the recovered stack frame (buffer size + offset) and detonate once -- no fuzzing. Needs Decompile first.">Synthesize PoC (no fuzz)</button>
+              <button class="btn sm" id="synthrun" title="Deterministic: synthesize the overflow input from the recovered stack frame (buffer size + offset) and detonate once -- no fuzzing. Needs Decompile first.">Synthesize PoC</button>
               <button class="btn sm" id="injectrun" title="Deterministic: probe command-injection / format-string / path-traversal on the sinks the binary imports, and confirm by effect -- no fuzzing.">Injection PoC</button>
-              <button class="btn sm" id="secretpocrun" title="Package a hard-coded secret (CWE-798/321) into a verified PoC: locate the credential's byte offset in the binary, re-extract it offline to verify, and bundle a self-contained reproducer -- the demonstrating artifact is the secret itself, no execution or fuzzing. Needs Decompile first (for strings).">Package secret PoC</button>
-              <button class="btn sm" id="monitorrun" title="Breakpoint the dangerous sinks and capture what the program passes them at runtime (command strings, copy lengths) -- finds executed commands and overflows without a crash. Native (host GDB), cross-arch (qemu gdbstub), and Windows PE (Wine +relay, captures the command/URL/copy args).">Runtime monitor</button>
-              <input id="monargv" class="inp" placeholder="monitor argv (optional)" style="max-width:130px" title="Arguments passed to the target for the runtime monitor, space-separated (e.g. a PIN that reaches system())">
-              <input id="monsinks" class="inp" placeholder="sink addrs: name=0xADDR,… (optional)" style="max-width:180px" title="Analyst escape hatch: breakpoint sinks by address when the binary is stripped/statically-linked and has no symbols (e.g. system=0xc5c,strcpy=0x3250). Recover the addresses from a non-stripped twin or manual RE.">
+              <button class="btn sm" id="secretpocrun" title="Package a hard-coded secret (CWE-798/321) into a verified PoC: locate the credential's byte offset in the binary, re-extract it offline to verify, and bundle a self-contained reproducer -- no execution. Needs Decompile first (for strings).">Secret PoC</button>
+              <span class="fghint" id="strathint"></span>
+            </div>
+            <div id="fuzzmetrics" class="fmetrics" hidden></div>
+          </div>
 
-              <button class="btn sm" id="heaprun" title="Run under a guard-page heap allocator (LD_PRELOAD) that catches use-after-free, double-free, heap overflow and invalid free at the exact access -- silent corruptions that don't crash. Native-arch, dynamically-linked targets.">Heap check</button>
-              <button class="btn sm" id="secretrun" title="Breakpoint the comparison functions and dump both operands -- recovers the constants the program checks input against (passwords, magic bytes, tokens). Native-arch only.">Extract secrets</button>
-              <button class="btn sm" id="taintrun" title="Confirm at runtime that program INPUT reaches a dangerous sink: feed a unique marker as input and report a Confirmed flow wherever it turns up in a sink argument (input→system CWE-78, →printf CWE-134, →strcpy CWE-120). ELF native + cross-arch. Run Decompile first for native.">Dynamic taint</button>
-              <button class="btn sm" id="behaviorrun" title="Trace the security-relevant syscalls the binary makes (exec, network, file writes, anti-debug, W^X) -- a behavioral capability inventory. Native x86-64 (GDB), cross-arch (qemu-user -strace), and Windows PE (Wine +relay Win32-API trace).">Behavior trace</button>
-              <select id="behavbackend" class="sel" title="Trace backend. auto: GDB for native, qemu -strace for cross-arch. gdb: native only, decodes connect() ip:port but can't follow a forked child's exec (system/popen). qemu: any arch, follows children so it captures the exec target, but leaves the connect destination undecoded.">
+          <div class="fgroup">
+            <div class="fglabel">Static channels <span class="fghint">supporting evidence; ranks below anything demonstrated</span></div>
+            <div class="actions">
+              <button class="btn sm" id="deco">Decompile (Ghidra)</button>
+              <span class="schip mono" id="decostat"></span>
+              <button class="btn sm" id="detect">Detect CWEs</button>
+              <span class="schip mono" id="detectstat"></span>
+              <button class="btn sm" id="cverun" title="Fingerprint embedded library versions (OpenSSL/zlib/libpng/busybox/&#8230;) and match a vendored offline CVE database -- no execution.">CVE scan</button>
+              <span class="schip mono" id="cvestat"></span>
+              <details class="menu"><summary class="btn sm">Firmware &#9662;</summary>
+                <div class="menubody">
+                  <button class="btn sm" id="carve" title="Carve embedded components (ELFs, filesystems, keys); identify a bare-metal blob's arch/base/entry">Carve components</button>
+                  <button class="btn sm" id="rehost" title="Rehost a bare-metal ARM Cortex-M image under Unicorn (Fuzzware-style MMIO) and fuzz peripheral inputs">Rehost &amp; fuzz</button>
+                </div></details>
+            </div>
+          </div>
+
+          <div class="fgroup">
+            <div class="fglabel">Observe a live run</div>
+            <div class="actions">
+              <button class="btn sm" id="monitorrun" title="Breakpoint the dangerous sinks and capture what the program passes them at runtime (command strings, copy lengths) -- finds executed commands and overflows without a crash.">Runtime monitor</button>
+              <input id="monargv" class="inp" placeholder="monitor argv (optional)" style="max-width:130px" title="Arguments passed to the target for the runtime monitor, space-separated (e.g. a PIN that reaches system())">
+              <input id="monsinks" class="inp" placeholder="sink addrs: name=0xADDR,&#8230; (optional)" style="max-width:180px" title="Analyst escape hatch: breakpoint sinks by address when the binary is stripped/statically-linked and has no symbols.">
+              <button class="btn sm" id="heaprun" title="Run under a guard-page heap allocator (LD_PRELOAD) that catches use-after-free, double-free, heap overflow and invalid free at the exact access. Native-arch, dynamically-linked targets.">Heap check</button>
+              <button class="btn sm" id="secretrun" title="Breakpoint the comparison functions and dump both operands -- recovers the constants the program checks input against. Native-arch only.">Extract secrets</button>
+              <button class="btn sm" id="taintrun" title="Confirm at runtime that program INPUT reaches a dangerous sink: feed a unique marker and report a Confirmed flow wherever it turns up in a sink argument.">Dynamic taint</button>
+              <button class="btn sm" id="behaviorrun" title="Trace the security-relevant syscalls the binary makes (exec, network, file writes, anti-debug, W^X) -- a behavioral capability inventory.">Behaviour trace</button>
+              <select id="behavbackend" class="sel" title="Trace backend. auto: GDB for native, qemu -strace for cross-arch.">
                 <option value="auto">trace: auto</option>
                 <option value="gdb">gdb (native; ip:port)</option>
                 <option value="qemu">qemu (follows exec)</option>
               </select>
-              <button class="btn sm" id="consolerun" title="Interactive detonation: run the target in the sandbox and drive it live (send/receive) to reach menus/protocols; save what you send as a seed.">Console ▸</button>
-              <span class="fghint" id="strathint"></span>
+              <button class="btn sm" id="consolerun" title="Interactive detonation: run the target in the sandbox and drive it live (send/receive) to reach menus/protocols; save what you send as a seed.">Console &#9656;</button>
             </div>
           </div>
 
-          <div id="fuzzmetrics" class="fmetrics" hidden></div>
-          <div id="dynresults"></div>
+          <div id="funcs"></div>
+          <div id="codeviewer" class="cv" hidden></div>
+          <details class="disc"><summary>Strings</summary><div id="strings"></div></details>
+          <div id="findings"></div>
         </div>
       </section>
 
+      <!-- (3) PROVE -- the crash rows live here, not under Find, because this is where you
+           act on one: root-cause it, package it, ask whether it controls the instruction
+           pointer. The ladder's ceiling for this substrate is stated rather than implied. -->
       <section class="stage">
-        <div class="stagehdr"><span class="snum">5</span><b>Confirmation &amp; PoC / exploit</b><span class="schip mono" id="pocstat"></span></div>
+        <div class="stagehdr"><span class="snum">3</span><b>Prove</b><span class="schip mono" id="pocstat"></span></div>
         <div class="sbody">
-          <div class="hint">Build a PoC, assess an L2 primitive, or synthesize an L3 exploit from a crash row above.</div>
+          <div class="hint" id="laddernote">Run something under Find first &#8212; every action here starts from a crash.</div>
+          <div id="dynresults"></div>
           <div id="pocs"></div>
         </div>
       </section>
@@ -1242,6 +1262,7 @@ async function showDetail(targetId){
   const sc=document.getElementById("seedcount"); if(sc) sc.textContent="";
   CUSTOM_SPEC=null; BUILDER=[]; updateCustomChip();   // a built spec is per-target
   onFmtChangeSilent();
+  applyCapabilities(targetId);                   // what CAN run here, before anything is clicked
   recommendFuzz();                               // TRIAGE is set; findings/funcs refine it as they load
   loadFunctions(targetId);
   loadStrings(targetId);
@@ -1309,6 +1330,86 @@ async function recommendFuzz(){
   g.hidden=false;
 }
 let ADVICE=null;
+let CAPS=null;
+
+// stage name -> the control that launches it. The buttons stay static HTML with their
+// handlers; what is data-driven is whether each one can work on THIS target.
+const _STAGE_BTN = {
+  disassemble:"deco", detect_cwe:"detect", cve_scan:"cverun", dynamic_run:"dynrun",
+  synthesize_poc:"synthrun", synthesize_injection:"injectrun", synthesize_secret:"secretpocrun",
+  debug_monitor:"monitorrun", heap_check:"heaprun", extract_secrets:"secretrun",
+  dynamic_taint:"taintrun", behavior_trace:"behaviorrun", firmware_carve:"carve",
+  firmware_rehost:"rehost",
+};
+// the fuzzing strategies are <option>s on one control, not buttons of their own
+const _STAGE_OPT = {fuzz:"fuzz", directed_fuzz:"directed", coverage_fuzz:"coverage",
+                    concolic:"concolic", boundary_fuzz:"boundary"};
+
+// Disable what cannot run here, and say WHY on the control itself.
+//
+// The GUI used to be substrate-blind while the engine was substrate-aware: file_type appeared
+// nowhere in this file, so an ELF, a PE, a jar and a firmware image all rendered the same
+// twenty-two controls. Clicking the wrong one cost a Ghidra run that ended in
+// FileNotFoundError, or an AFL++ campaign that completed having executed nothing. The reasons
+// are the STAGES' OWN gates, served by /capabilities -- not a second copy of the rules here,
+// which would drift.
+async function applyCapabilities(tid){
+  let c=null;
+  try{ c = await api(`/targets/${tid}/capabilities`); }catch(e){ }
+  CAPS=c; if(!c) return;
+  const byStage={};
+  for(const g of Object.keys(c.stages||{})) for(const st of c.stages[g]) byStage[st.stage]=st;
+
+  for(const [stage, id] of Object.entries(_STAGE_BTN)){
+    const el=document.getElementById(id); const st=byStage[stage]; if(!el||!st) continue;
+    el.disabled = !st.available;
+    el.classList.toggle("unavail", !st.available);
+    el.classList.toggle("planned", st.available && st.planned!==null && st.planned!==undefined);
+    // the reason replaces the tooltip: a disabled control whose tooltip still describes what
+    // it would have done tells the reader nothing about why it is grey
+    if(!st.available) el.title = "Not available for this target — "+(st.why||"");
+    else if(el.dataset.tip) el.title = el.dataset.tip;
+    else el.dataset.tip = el.title;
+  }
+  const sel=document.getElementById("fuzzstrategy");
+  if(sel) for(const opt of sel.options){
+    const stage=Object.keys(_STAGE_OPT).find(k=>_STAGE_OPT[k]===opt.value);
+    const st=stage?byStage[stage]:null; if(!st) continue;
+    opt.disabled = !st.available;
+    opt.textContent = opt.textContent.replace(/ — unavailable.*$/,"")
+                      + (st.available?"":" — unavailable here");
+    if(!st.available && sel.value===opt.value) sel.value="fuzz";
+  }
+  renderSubstrate(c);
+  renderLadderNote(c, byStage);
+}
+
+// What this target IS, and what that rules out — on the target header, before anything is
+// clicked. "9 of 22 stages unavailable" is a fact the operator should not have to discover by
+// clicking nine times.
+function renderSubstrate(c){
+  const el=document.getElementById("substrate"); if(!el) return;
+  const n=(c.unavailable||[]).length;
+  const bits=[c.file_type?esc(c.file_type.toUpperCase()):null, c.arch?esc(c.arch):null]
+             .filter(Boolean).join(" · ");
+  el.innerHTML = bits + (n?` <span class="dim" title="${esc((c.unavailable||[]).join(", "))}">`
+                          +`· ${n} stage${n!==1?"s":""} not available here</span>`:"");
+}
+
+// Say where the ladder stops for this substrate, in the panel whose job is the ladder. For a
+// managed runtime L2/L3 are not missing features, they are the runtime: the JVM owns the
+// instruction pointer. Leaving the buttons merely greyed invites the reader to wonder what is
+// broken.
+function renderLadderNote(c, byStage){
+  const el=document.getElementById("laddernote"); if(!el) return;
+  const ip=byStage["poc_primitive"];
+  if(ip && !ip.available){
+    el.innerHTML = `<b>L1 is the ceiling for this target.</b> ${esc(ip.why||"")}`;
+  }else{
+    el.textContent = "Act on a crash below: root-cause it, package a reproducer (L1), "
+                   + "then ask whether it controls the instruction pointer (L2/L3).";
+  }
+}
 
 // ---- how this target has to be INVOKED -------------------------------------------------
 // A service behind "-c <config> -d <display> -j <app.jar>" prints its usage and exits without

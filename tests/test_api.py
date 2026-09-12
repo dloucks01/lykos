@@ -504,3 +504,53 @@ def test_advice_carries_the_discovered_invocation_and_checks_it(api, tmp_path):
     v = got["verified"]
     assert v["bare_rejected"], "bare svc prints its usage and exits 2"
     assert v["accepted"], v["why"]
+
+
+def test_capabilities_says_what_can_run_and_why_not(api, tmp_path):
+    """Separate from /advice on purpose: advice says what to do NEXT, this says what is
+    POSSIBLE. The workbench needs both -- it highlights the recommendation and disables the
+    impossible with its reason, instead of rendering the same twenty-two controls for an ELF,
+    a PE, a jar and a firmware image."""
+    import shutil as _sh
+    import subprocess
+    if not all(_sh.which(t) for t in ("javac", "jar")):
+        pytest.skip("no JDK")
+    src = tmp_path / "A.java"
+    src.write_text("public class A { public static void main(String[] a){} }")
+    cl = tmp_path / "c"
+    cl.mkdir()
+    if subprocess.run(["javac", "-d", str(cl), str(src)], capture_output=True).returncode:
+        pytest.skip("javac failed")
+    mf = tmp_path / "m"
+    mf.write_text("Main-Class: A\n")
+    jar = tmp_path / "a.jar"
+    subprocess.run(["jar", "cfm", str(jar), str(mf), "-C", str(cl), "."], check=True,
+                   capture_output=True)
+
+    st, case = _json(api, "POST", "/cases", {"name": "caps"})
+    st, t = _upload(api, case["id"], "a.jar", jar.read_bytes())
+    assert st in (200, 201), t
+    # the server enqueues triage on upload; wait for it the way the GUI does
+    for _ in range(300):
+        st, cur = _json(api, "GET", f"/targets/{t['id']}")
+        if (cur or {}).get("file_type"):
+            break
+        time.sleep(0.1)
+    assert (cur or {}).get("file_type") == "jar", cur
+
+    st, caps = _json(api, "GET", f"/targets/{t['id']}/capabilities")
+    assert st == 200, caps
+    assert caps["file_type"] == "jar"
+    assert {g["key"] for g in caps["groups"]} == {"feed", "find", "prove"}
+    flat = {s["stage"]: s for g in caps["stages"].values() for s in g}
+    assert flat["disassemble"]["available"] is False
+    assert "constant pool" in flat["disassemble"]["why"]
+    assert flat["poc_primitive"]["available"] is False
+    assert "instruction pointer" in flat["poc_primitive"]["why"]
+    # what works is not disabled, and the reason field is empty for it
+    assert flat["fuzz"]["available"] is True and flat["fuzz"]["why"] is None
+    assert flat["build_poc"]["available"] is True
+    assert "disassemble" in caps["unavailable"]
+
+    st, missing = _json(api, "GET", "/targets/doesnotexist/capabilities")
+    assert st == 404
