@@ -49,6 +49,9 @@ def _mine_dictionary(strings):
 # How many inputs the corpus may retain, and how big one may be. A blind campaign that keeps
 # everything spends its budget re-running near-duplicates of one enormous input.
 _MAX_CORPUS = 256
+# Below this share of the binary, a call-graph closure is not telling us about dead code --
+# it is telling us the call graph could not be read (stripped, or indirect-heavy).
+_LIVE_FLOOR = 0.25
 _MAX_CRASH_ROWS = 8      # examples kept per signal; a reproducible crash recurs thousands of times
 _MAX_KEEP = 16384
 
@@ -395,9 +398,12 @@ def _recovered_blocks(ctx, target):
         entry = None
     base = rootcause.image_base(fns, entry) or 0
     ranges = program_ranges(blob)
+    live = _reachable_functions(ctx, target, fns)
     out = set()
     for f in fns:
         if not f.blocks:
+            continue
+        if live is not None and f.addr not in live:
             continue
         # ranges come from the ELF's own symbols, so compare in ELF vaddr space: on a PIE the
         # decompiler's addresses sit at a different image base, and comparing raw dropped every
@@ -411,6 +417,47 @@ def _recovered_blocks(ctx, target):
             except (KeyError, TypeError, ValueError):
                 continue
     return sorted(out)
+
+
+def _reachable_functions(ctx, target, functions):
+    """Functions the entry point can actually call, or None when the call graph cannot say.
+
+    A program linked against a library carries all of it: gif2rgb only DECODES GIFs, but
+    giflib's whole encoder is in the binary, and 36 of the 62 functions the campaign never
+    reached were EGifPutLine, EGifCompressLine, EGifSpew and friends -- code no input can
+    reach because nothing calls it. Counting it made a campaign covering half of what it can
+    reach look like one covering a quarter of the program.
+
+    Closure from the entry point, so it UNDER-approximates wherever calls are indirect -- and
+    hiding live code is much worse than counting dead code, because it makes a campaign that
+    reaches almost nothing look complete. On stripped unzip the closure reached 100 of 3,705
+    blocks: a 46/100 result that measures nothing. So the answer is only used when the call
+    graph explains most of the binary; below that it is not evidence of dead code, it is
+    evidence that the call graph is too sparse to read.
+    """
+    edges = CallEdgeDAO(ctx.conn).list_by_target(target.id)
+    if not edges:
+        return None
+    known = {f.addr for f in functions}
+    entries = [f.addr for f in functions if (f.name or "") in ("main", "_start", "entry")]
+    if not entries:
+        return None
+    out_edges: dict = {}
+    called = set()
+    for e in edges:
+        if e.dst_addr:
+            out_edges.setdefault(e.src_addr, set()).add(e.dst_addr)
+            called.add(e.dst_addr)
+    live, stack = set(entries), list(entries)
+    while stack:
+        cur = stack.pop()
+        for dst in out_edges.get(cur, ()):
+            if dst in known and dst not in live:
+                live.add(dst)
+                stack.append(dst)
+    if len(live) < _LIVE_FLOOR * len(known):
+        return None
+    return live if len(live) < len(known) else None
 
 
 def _addr_of(f):

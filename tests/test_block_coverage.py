@@ -224,3 +224,53 @@ def test_the_sandbox_does_not_show_the_target_the_host_process_table():
                               capture_output=True, text=True, timeout=60).stdout.strip() or 0)
     assert 0 < inside < 16, f"{inside} processes visible inside the sandbox"
     assert inside < host, "the target must not see the host's process table"
+
+
+def test_code_nothing_can_call_is_not_counted_as_coverage():
+    """A program linked against a library carries all of it. gif2rgb only DECODES GIFs, but
+    giflib's whole encoder is in the binary -- 36 of the 62 functions the campaign never
+    reached were EGifPutLine, EGifCompressLine, EGifSpew and friends, which no input can reach
+    because nothing calls them. Counting them made a campaign covering 38% of what it can
+    reach look like one covering 26% of the program."""
+    from lykos.analyze.fuzz import stage as fz
+
+    class _F:
+        def __init__(self, addr, name):
+            self.addr, self.name, self.blocks = addr, name, 1
+
+    class _E:
+        def __init__(self, src, dst):
+            self.src_addr, self.dst_addr = src, dst
+
+    fns = [_F("0x1000", "main"), _F("0x2000", "decode"), _F("0x3000", "EGifPutLine")]
+    edges = [_E("0x1000", "0x2000")]
+
+    class _DAO:
+        def __init__(self, _c):
+            pass
+
+        def list_by_target(self, _t):
+            return edges
+    import lykos.analyze.fuzz.stage as st
+    real, st.CallEdgeDAO = st.CallEdgeDAO, _DAO
+
+    class _Ctx:
+        conn = None
+
+    class _T:
+        id = 1
+    try:
+        live = fz._reachable_functions(_Ctx(), _T(), fns)
+        assert live == {"0x1000", "0x2000"}, live
+
+        # A call graph that explains almost nothing is not evidence of dead code -- it is a
+        # stripped binary. Trusting it took unzip from 3,705 blocks to 100, a 46/100 result
+        # that measures nothing.
+        many = [_F("0x%x" % (0x1000 + i * 16), None) for i in range(100)]
+        many[0].name = "main"
+        assert fz._reachable_functions(_Ctx(), _T(), many) is None
+
+        edges = []
+        assert fz._reachable_functions(_Ctx(), _T(), fns) is None, "no edges, no claim"
+    finally:
+        st.CallEdgeDAO = real

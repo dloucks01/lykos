@@ -84,6 +84,11 @@ class FormatModel:
                 seen[f.get("name")] = val
                 fields.append({"f": f, "val": val})
                 pos += sz
+            elif t == "shadow":
+                # Bytes that exist for DERIVATION and are never written: a ZIP stores the CRC
+                # of the UNCOMPRESSED data, which appears nowhere in the file. Without this a
+                # checksum field can only name bytes the format happens to contain.
+                fields.append({"f": f, "val": _as_bytes(f.get("seed_value", b""))})
             elif t == "group":
                 sub, pos = self._parse_spec(f["spec"], data, pos, covered)
                 fields.append({"f": f, "val": sub})
@@ -131,6 +136,8 @@ class FormatModel:
                 sz, code = _INT[t]
                 end = "<" if f.get("endian", "little") == "little" else ">"
                 out += struct.pack(end + code, int(fd["val"]) & ((1 << (sz * 8)) - 1))
+            elif t == "shadow":
+                continue
             elif t == "group":
                 out += self.serialize(fd["val"])
             elif t == "array":
@@ -144,6 +151,8 @@ class FormatModel:
 def _serialize_field(model, fd) -> bytes:
     """The bytes one field contributes, whether it is a leaf, a group or an array."""
     t = fd["f"]["type"]
+    if t == "shadow":
+        return _as_bytes(fd["val"] or b"")
     if t == "group":
         return model.serialize(fd["val"])
     if t == "array":
@@ -167,6 +176,8 @@ def _layout(model, fields, pos=0, out=None, names=None):
         elif t == "array":
             for rec in fd["val"]:
                 _, _, pos = _layout(model, rec, pos, out, names)
+        elif t == "shadow":
+            pass                                       # occupies no bytes in the output
         else:
             pos += len(model.serialize([fd]))
         out[id(fd)] = (start, pos - start)
@@ -259,6 +270,8 @@ def _seed_spec(spec, payload):
             # A count that must agree with the seed's own payload -- an IFD entry count of 0
             # alongside one entry is rejected before the parser reaches anything interesting.
             fields.append({"f": f, "val": f.get("seed_value", 0)})
+        elif t == "shadow":
+            fields.append({"f": f, "val": _as_bytes(f.get("seed_value", b""))})
         elif t == "group":
             sub, sub_blobs = _seed_spec(f["spec"], payload)
             fields.append({"f": f, "val": sub})
@@ -448,6 +461,28 @@ _IFD0_OFF = 8
 _GPS_OFF = _IFD0_OFF + 2 + 12 + 4                 # count + one entry (the GPS pointer) + next
 _RAT_OFF = _GPS_OFF + 2 + 12 * 2 + 4              # count + two entries + next
 _RATIONALS = b"".join(struct.pack("<II", n, d) for n, d in ((51, 1), (30, 1), (0, 1)))
+# A ZIP whose only entry is STORED never reaches the decompressor, and unzip is mostly
+# decompressor: the campaign covered 1,162 of 3,705 blocks and found nothing. This is a real
+# raw-deflate stream, so method 8 is exercised, and with the CRC derived `unzip -t` verifies
+# it instead of stopping at "bad CRC".
+_ZIP_PLAIN = b"lykos test payload, compressible compressible compressible\n"
+
+
+def _deflate(data: bytes) -> bytes:
+    c = zlib.compressobj(9, zlib.DEFLATED, -15)        # raw: no zlib header, as ZIP stores it
+    return c.compress(data) + c.flush()
+
+
+_ZIP_DEFLATED = _deflate(_ZIP_PLAIN)
+
+# A one-pixel GIF never runs the LZW decoder, which is most of what a GIF reader IS: the
+# campaign covered 377 of gif2rgb's 1,340 blocks. This is a real 16x16 image -- four-entry
+# colour table, a genuine compressed stream -- so decoding actually happens.
+_GIF_GCT = b"\x00\x00\x00\xff\xff\xff\x00\x00\x00\x00\x00\x00"
+_GIF_LZW_MIN = 8
+_GIF_LZW = (b"\x00\x01\x08\x1cH\xb0\xa0\xc1\x83\x08\x13*\\\xc8\xb0\xa1\xc3\x87\t\x03"
+            b"\x00\x90Hq\xa2\xc5\x8a\x18/j\xcc\xc8q\xa3\xc7\x8e ?\x8a\x0cIr\xe4\xc6\x80")
+
 _PNG_IHDR = struct.pack(">IIBBBBB", 1, 1, 8, 0, 0, 0, 0)
 _PNG_IDAT = zlib.compress(b"\x00\x00")      # one filter byte + one greyscale pixel
 
@@ -537,26 +572,26 @@ _BUILTINS = {
     # answers "Image of width or height 0" and stops -- so the campaign never reaches the
     # decoder. This is a complete 35-byte GIF89a: screen descriptor, global colour table, an
     # image descriptor and one LZW sub-block, which gif2rgb decodes.
-    "gif": {"tokens": ("GIF87a", "GIF89a"), "seed": b"\x44\x01",
+    "gif": {"tokens": ("GIF87a", "GIF89a"), "seed": _GIF_LZW,
             "spec": [
                 {"type": "magic", "value": b"GIF89a"},
                 # the screen says how big the canvas is; the image descriptor says how big the
                 # image is, and a decoder that trusts one while indexing the other is the
                 # classic GIF bug -- so both are fields
-                {"type": "u16", "endian": "little", "name": "sw", "seed_value": 1},
-                {"type": "u16", "endian": "little", "name": "sh", "seed_value": 1},
-                # bit 7 set: a global colour table follows, of 2 entries (bits 0-2 = 0)
-                {"type": "u8", "name": "packed", "seed_value": 0x80},
+                {"type": "u16", "endian": "little", "name": "sw", "seed_value": 16},
+                {"type": "u16", "endian": "little", "name": "sh", "seed_value": 16},
+                # bit 7: a global colour table follows; bits 0-2 = 1 -> four entries
+                {"type": "u8", "name": "packed", "seed_value": 0x81},
                 {"type": "u8", "name": "bg"},
                 {"type": "u8", "name": "aspect"},
-                {"type": "magic", "value": b"\x00\x00\x00\xff\xff\xff"},
+                {"type": "magic", "value": _GIF_GCT},
                 {"type": "magic", "value": b"\x2c"},              # image separator
                 {"type": "u16", "endian": "little", "name": "left"},
                 {"type": "u16", "endian": "little", "name": "top"},
-                {"type": "u16", "endian": "little", "name": "iw", "seed_value": 1},
-                {"type": "u16", "endian": "little", "name": "ih", "seed_value": 1},
+                {"type": "u16", "endian": "little", "name": "iw", "seed_value": 16},
+                {"type": "u16", "endian": "little", "name": "ih", "seed_value": 16},
                 {"type": "u8", "name": "ipacked"},
-                {"type": "u8", "name": "lzwmin", "seed_value": 2},
+                {"type": "u8", "name": "lzwmin", "seed_value": _GIF_LZW_MIN},
                 {"type": "u8", "name": "blen", "length_of": "lzw"},
                 {"type": "blob", "name": "lzw"},
                 {"type": "magic", "value": b"\x00\x3b"}]},        # terminator + trailer
@@ -619,25 +654,31 @@ _BUILTINS = {
             "spec": [
                 {"type": "group", "name": "local", "spec": [
                     {"type": "magic", "value": b"PK\x03\x04"},
-                    {"type": "magic", "value": b"\x14\x00\x00\x00\x00\x00"},
+                    # version, flags, and method 8 -- DEFLATE, so the decompressor runs
+                    {"type": "magic", "value": b"\x14\x00\x00\x00\x08\x00"},
                     {"type": "magic", "value": b"\x00\x00\x00\x00"},      # mod time, date
-                    {"type": "u32", "endian": "little", "name": "crc"},
+                    {"type": "u32", "endian": "little", "name": "crc", "crc32_of": "plain"},
                     {"type": "u32", "endian": "little", "name": "csize", "length_of": "data"},
-                    {"type": "u32", "endian": "little", "name": "usize", "length_of": "data"},
+                    {"type": "u32", "endian": "little", "name": "usize",
+                     "seed_value": len(_ZIP_PLAIN)},
                     {"type": "u16", "endian": "little", "name": "namelen",
                      "length_of": "lname"},
                     {"type": "u16", "endian": "little", "name": "extralen",
                      "length_of": "lextra"},
                     {"type": "blob", "name": "lname"},
                     {"type": "blob", "name": "lextra", "seed_value": b""},
-                    {"type": "blob", "name": "data"}]},
+                    {"type": "blob", "name": "data", "seed_value": _ZIP_DEFLATED},
+                    # never serialised: the uncompressed bytes, so the CRC field can name
+                    # what a decompressor will actually check it against
+                    {"type": "shadow", "name": "plain", "seed_value": _ZIP_PLAIN}]},
                 {"type": "group", "name": "cd", "spec": [
                     {"type": "magic", "value": b"PK\x01\x02"},
-                    {"type": "magic", "value": b"\x14\x00\x14\x00\x00\x00\x00\x00"},
+                    {"type": "magic", "value": b"\x14\x00\x14\x00\x00\x00\x08\x00"},
                     {"type": "magic", "value": b"\x00\x00\x00\x00"},      # mod time, date
-                    {"type": "u32", "endian": "little", "name": "ccrc"},
+                    {"type": "u32", "endian": "little", "name": "ccrc", "crc32_of": "plain"},
                     {"type": "u32", "endian": "little", "name": "ccsize", "length_of": "data"},
-                    {"type": "u32", "endian": "little", "name": "cusize", "length_of": "data"},
+                    {"type": "u32", "endian": "little", "name": "cusize",
+                     "seed_value": len(_ZIP_PLAIN)},
                     {"type": "u16", "endian": "little", "name": "cnamelen",
                      "length_of": "cname"},
                     {"type": "u16", "endian": "little", "name": "cextralen",
