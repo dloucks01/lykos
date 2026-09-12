@@ -60,12 +60,20 @@ STATIC_FP_BUDGET ?= 0.60
 # regression in argv seeding or frame-slot tracking drops recall, and a detector that fires
 # more broadly raises fp_rate.
 #
-# Recall is capped at 0.83 (5/6) by the CWE-798 hard-coded-secret case, and that is
-# structural rather than a gap: hardcoded_secrets is a string detector with no call site, so
-# neither the reachability nor the data-flow channel can corroborate it. Secrets are promoted
-# by the `synthesize_secret` stage instead (straight to poc-backed), which this static-only
-# benchmark does not run. Raise this only if that changes.
-CORROB_MIN_RECALL ?= 0.80
+# Recall WAS capped at 0.83 (5/6) by the CWE-798 hard-coded-secret case: hardcoded_secrets is
+# a string detector with no call site, so neither the reachability nor the data-flow channel
+# could corroborate it, and the threshold sat at 0.80 to leave room for that. String-xref
+# corroboration removed the cap -- a secret the code demonstrably READS is corroborated by the
+# xref itself -- and the measured rate has been 1.00 on every run since (eval-history.jsonl:
+# 0.833, 0.833, then 1.00, 1.00, 1.00).
+#
+# So the threshold moves to the measured value, because that is what a ratchet is. Left at
+# 0.80 it carried 0.20 of slack: a regression losing a case outright would have dropped recall
+# to 0.83 and passed silently, which is precisely the decorative-gate failure described above
+# for the FP budget. At 1.0 any lost case fails the gate, which is the point -- if a case
+# legitimately stops being corroborable, that is a deliberate decision to record here with the
+# reason, not something to absorb into unused headroom.
+CORROB_MIN_RECALL ?= 1.0
 CORROB_FP_BUDGET  ?= 0.25
 
 eval-gate:
