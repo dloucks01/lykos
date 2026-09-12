@@ -183,6 +183,58 @@ def hardcoded_secrets(ctx: DetectContext):
     return out
 
 
+# ---------------------------------------------------------------- TOCTOU (CWE-367/CWE-362)
+# Checking a path and then acting on it are two operations on a NAME, not on a file, and
+# anything can change what the name refers to in between. The check-then-use pair in one
+# function is the shape; the window is whatever runs between them.
+_TOCTOU_CHECK = {"access", "stat", "lstat", "faccessat", "statx", "euidaccess", "eaccess"}
+_TOCTOU_USE = {"open", "open64", "fopen", "fopen64", "freopen", "creat", "unlink", "remove",
+               "rename", "chmod", "chown", "truncate", "symlink", "link", "mkdir", "rmdir"}
+
+
+@register_detector
+def toctou(ctx: DetectContext):
+    """A path checked with access()/stat() and then opened or modified in the same function.
+
+    Deliberately reported as a candidate: this is reachability and ordering, not a proof that
+    both calls name the same path. What makes it worth reporting anyway is that the safe form
+    of this code does not exist -- the fix is to stop checking and handle the error from the
+    use itself -- so the pair being present at all is the signal.
+    """
+    by_func: dict = defaultdict(list)
+    for e in ctx.call_edges:
+        n = normalize(e.dst_name)
+        if n in _TOCTOU_CHECK or n in _TOCTOU_USE:
+            by_func[e.src_addr].append((e.site_addr, n))
+    out = []
+    for faddr, calls in by_func.items():
+        ordered = sorted(calls, key=lambda c: _addr_int(c[0]))
+        checks = [c for c in ordered if c[1] in _TOCTOU_CHECK]
+        if not checks:
+            continue
+        first = _addr_int(checks[0][0])
+        uses = [c for c in ordered if c[1] in _TOCTOU_USE and _addr_int(c[0]) > first]
+        if not uses:
+            continue
+        chk, use = checks[0], uses[0]
+        out.append(_cand(
+            "CWE-367", f"Check with {chk[1]}() then use with {use[1]}() (TOCTOU)", "medium",
+            "toctou",
+            [{"channel": "pattern",
+              "detail": f"{chk[1]}() at {chk[0]} then {use[1]}() at {use[0]} in the same "
+                        f"function -- the path can change in between"}],
+            function_addr=faddr, site_addr=use[0],
+            dedup_key=f"CWE-367:toctou:{faddr}", confidence=0.4))
+    return out
+
+
+def _addr_int(a) -> int:
+    try:
+        return int(a, 16) if isinstance(a, str) else int(a or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 # ------------------------------------------------- weak crypto / RNG / temp files (rules)
 _WEAK_CRYPTO = {
     "md5": ("CWE-328", "weak hash MD5"), "md4": ("CWE-328", "weak hash MD4"),
