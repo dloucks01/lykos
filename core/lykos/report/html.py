@@ -181,8 +181,19 @@ def _finding_html(f: dict) -> str:
                 fn = f'poc-{(pc.get("bundle_sha") or lvl)[:12]}.tar.gz'
                 dl = (f' <a class="dl" download="{esc(fn)}" '
                       f'href="data:application/gzip;base64,{pc["bundle_b64"]}">download bundle</a>')
+            elif pc.get("bundle_same_as"):
+                # the same PoC backs several findings; the bundle is embedded once above
+                dl = (f' <span class="muted mono">same bundle as above '
+                      f'({esc(pc["bundle_same_as"][:12])}…)</span>')
             elif pc.get("bundle_sha"):
+                # Not embedded (too large, or the report's embed budget is spent). Say where
+                # it is instead of showing a bare hash with nothing to do about it.
+                where = pc.get("bundle_href")
                 dl = f' <span class="muted mono">bundle {esc(pc["bundle_sha"][:16])}…</span>'
+                if where:
+                    dl += (f' <span class="muted">not embedded — fetch from '
+                           f'<span class="mono">{esc(where)}</span> on the analysis server'
+                           f'</span>')
             p.append(f'<div class="poc">{_badge(lvl, "#8e4ec6")} '
                      f'<span class="mono">{esc(pc.get("signal") or "")}</span> '
                      f'<span class="muted">{ok}</span>{dl}</div>')

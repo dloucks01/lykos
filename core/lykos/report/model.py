@@ -24,7 +24,12 @@ from ..db.models import FINDING_STATES, SEVERITIES
 # everything that cleared pure candidate). Callers can widen or narrow it.
 DEFAULT_MIN_STATE = "candidate"
 
-_MAX_EMBED_BUNDLE = 8 * 1024 * 1024   # cap self-embedded PoC bundles at 8 MiB
+_MAX_EMBED_BUNDLE = 8 * 1024 * 1024   # cap ONE self-embedded PoC bundle at 8 MiB
+# ...and the whole report at this, because the per-bundle cap says nothing about how many
+# there are. A PoC bundle carries the target binary so it can reproduce standalone, which is
+# the point of it -- 660 KB of a 694 KB jhead report was one bundle. Ten PoCs on that target
+# would have produced a 7 MB page that a browser has to base64-decode before it renders.
+_MAX_EMBED_TOTAL = 4 * 1024 * 1024
 
 
 def _rank(order: list[str], value: Optional[str]) -> int:
@@ -94,6 +99,12 @@ def build_report(
                 crash_by_input[d.input_sha] = d
 
         findings_out: list[dict] = []
+
+        # one embed per distinct bundle, and a budget for the whole report
+
+        embedded: set = set()
+
+        budget = {"left": _MAX_EMBED_TOTAL}
         for f in fdao.list_by_target(t.id):
             if sel_ids is not None and f.id not in sel_ids:
                 continue
@@ -112,8 +123,24 @@ def build_report(
                     "signal": p.signal_name, "input_sha": p.input_sha,
                     "bundle_sha": p.bundle_sha, "created_at": _iso(p.created_at),
                 }
+                if p.bundle_sha:
+                    # Where to get it, in every mode. With embedding off the report showed a
+                    # bare hash and nothing to do about it -- which is the same dead end as a
+                    # bundle that was too large to embed.
+                    pd["bundle_href"] = f"/artifacts/{p.bundle_sha}"
                 if embed_pocs and p.bundle_sha:
-                    pd["bundle_b64"] = _embed(store, p.bundle_sha)
+                    # Each distinct bundle is embedded ONCE. Several findings can be backed by
+                    # the same PoC -- jhead's crash backs two -- and embedding per finding
+                    # duplicates the target binary for no gain.
+                    if p.bundle_sha in embedded:
+                        pd["bundle_same_as"] = p.bundle_sha
+                    else:
+                        b64 = _embed(store, p.bundle_sha, budget)
+                        if b64:
+                            pd["bundle_b64"] = b64
+                            embedded.add(p.bundle_sha)
+                            budget["left"] -= len(b64)
+
                 f_pocs.append(pd)
                 d = crash_by_input.get(p.input_sha)
                 if d:
@@ -195,7 +222,7 @@ def _engines(rdao, case_id: str) -> list[dict]:
     return sorted(seen.values(), key=lambda e: (e["tool"], e["version"] or ""))
 
 
-def _embed(store, sha: str) -> Optional[str]:
+def _embed(store, sha: str, budget: Optional[dict] = None) -> Optional[str]:
     import base64
     try:
         if not store.content.exists(sha):
@@ -205,4 +232,7 @@ def _embed(store, sha: str) -> Optional[str]:
         return None
     if len(data) > _MAX_EMBED_BUNDLE:
         return None
-    return base64.b64encode(data).decode("ascii")
+    b64 = base64.b64encode(data).decode("ascii")
+    if budget is not None and len(b64) > budget.get("left", 0):
+        return None
+    return b64
