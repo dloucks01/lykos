@@ -120,6 +120,7 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
     # it is only acceptable inside the unshared-net, read-only-root namespace. On the
     # rlimits-only fallback the target keeps the plain argv it was given.
     flags = list(cover_flags or ())
+    flaky = 0
     # Some options make the target launch something INTERACTIVE -- jhead's `-ce` opens an
     # editor, `-cmd` spawns a shell -- and those run at about a second each against 0.5 ms for
     # a plain parse. A single 64-input batch under `-ce` measured 60 seconds: one unlucky
@@ -202,18 +203,31 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
                     kept += 1
             if res.crashed:
                 crashes += 1
+                # A crash that does not happen again is not a finding. Some targets REWRITE
+                # their input: jhead's `-dc` and `-zt` edit the file in place, so it faulted on
+                # bytes it had produced itself and the input we hold is the original, which
+                # runs clean. Filing those left every downstream stage chasing a crash that
+                # cannot be reproduced, and the release gate failing with "PoC not reproduced".
+                if not _reproduces(run_fn, exe, mode, workfile, exec_timeout,
+                                   target, data, prefix):
+                    flaky += 1
+                    continue
+                # A bucket is (signal, faulting address): the same signal from a different
+                # instruction is a different defect, and treating them as one hid every bug
+                # after the first behind whichever crashed soonest.
+                bucket = (res.signal_name, res.fault_pc)
                 # Explore near crashers -- while they are still telling us something. Kept
                 # unconditionally, one reproducible crash takes the corpus over: jhead crashed
                 # on 8,516 of 20,000 executions, all the same defect, and block coverage fell
                 # from 978 to 796 because almost every parent was a crasher. So keep the first
-                # few of each signal and let the rest through the normal rotation.
-                if seen_sigs.get(res.signal_name, 0) < _MAX_CRASH_ROWS:
+                # few of each BUCKET and let the rest through the normal rotation.
+                if seen_sigs.get(bucket, 0) < _MAX_CRASH_ROWS:
                     if len(corpus) < _MAX_CORPUS:
                         corpus.append(data)
                     else:
                         corpus[rng.randrange(len(corpus))] = data
-                if res.signal_name not in seen_sigs:
-                    seen_sigs[res.signal_name] = 1
+                if bucket not in seen_sigs:
+                    seen_sigs[bucket] = 1
                     sig = res.signal_name
 
                     def _same(d, _sig=sig):
@@ -231,21 +245,24 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
                     dd.insert(target.id, target.case_id, run_id=ctx.run_id, input_sha=input_sha,
                               input_mode=mode, argv=margv, signal=res.signal, signal_name=sig,
                               crashed=True, isolation=res.isolation,
-                              duration_ms=res.duration_ms, note=note)
+                              duration_ms=res.duration_ms, note=note,
+                              fault_pc=res.fault_pc)
                     extra = "(" + note_prefix + ("; " + note if note else "") + ")"
                     fd.upsert(target.id, target.case_id, crash_finding_candidate(
-                        sig, input_sha, res.isolation, detector, extra))
-                elif seen_sigs[res.signal_name] < _MAX_CRASH_ROWS:
+                        sig, input_sha, res.isolation, detector, extra,
+                        fault_pc=res.fault_pc))
+                elif seen_sigs[bucket] < _MAX_CRASH_ROWS:
                     # A campaign that finds a REPRODUCIBLE crash finds it thousands of times:
                     # 8,128 of 20,000 executions on jhead. Storing every one buries the case in
                     # rows that all describe the same defect and say nothing new, so keep a
                     # handful of examples per signal and count the rest.
-                    seen_sigs[res.signal_name] += 1
+                    seen_sigs[bucket] += 1
                     input_sha = ctx.put_artifact("fuzz-crash-input", data=data)
                     dd.insert(target.id, target.case_id, run_id=ctx.run_id, input_sha=input_sha,
                               input_mode=mode, argv=argv, signal=res.signal,
-                              signal_name=res.signal_name, crashed=True, isolation=res.isolation,
-                              duration_ms=res.duration_ms)
+                              signal_name=res.signal_name, crashed=True,
+                              isolation=res.isolation, duration_ms=res.duration_ms,
+                              fault_pc=res.fault_pc)
         if execs % 250 == 0:
             ctx.emit(f"{event_prefix}.progress", payload={"execs": execs, "crashes": crashes,
                                                           "unique": len(seen_sigs),
@@ -253,7 +270,7 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
                                                           "corpus": len(corpus)})
 
     elapsed = max(1e-3, max_seconds - max(0.0, deadline - time.time()))
-    stats = {"execs": execs, "crashes": crashes, "unique": len(seen_sigs),
+    stats = {"execs": execs, "crashes": crashes, "flaky": flaky, "unique": len(seen_sigs),
              "behaviours": len(seen_behaviour), "corpus": len(corpus), "kept": kept,
              "execs_per_sec": round(execs / elapsed),
              "blocks_hit": len(seen_blocks), "blocks_known": len(all_blocks)}
@@ -261,6 +278,23 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
     ctx.progress(pct=100, msg=f"{execs} execs, {crashes} crashes, {len(seen_sigs)} unique, "
                              f"{len(seen_behaviour)} behaviours")
     return stats
+
+
+def _reproduces(run_fn, exe, mode, workfile, exec_timeout, target, data, prefix) -> bool:
+    """Does this input crash again, on its own, the way it was found?
+
+    Through the campaign's OWN runner: a boundary-harness campaign delivers its input through a
+    generated harness, and the default runner cannot deliver it at all -- checking with the
+    wrong one discards every crash it finds.
+    """
+    kw = {"endianness": target.endianness, "bits": target.bits}
+    if run_fn is run_input:
+        kw["base_argv"] = prefix
+    try:
+        _argv, res = run_fn(exe, mode, workfile, exec_timeout, target.arch, data, **kw)
+    except Exception:
+        return False
+    return bool(res.crashed)
 
 
 _PROBE_N = 8                    # batch size while an option's cost is still unknown

@@ -171,6 +171,9 @@ class DynResult:
     stdout_sha: Optional[str] = None
     stderr_sha: Optional[str] = None
     note: Optional[str] = None
+    # Image-relative address of the faulting instruction, when the run was traced. Two crashes
+    # at different addresses are different defects however alike their signals look.
+    fault_pc: Optional[int] = None
 
 
 @dataclass

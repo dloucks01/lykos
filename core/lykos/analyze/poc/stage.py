@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import os
 
-from ...db.dao import FindingDAO, PocDAO, TargetDAO
+from ...db.dao import DynResultDAO, FindingDAO, PocDAO, TargetDAO
 from ...jobs.registry import register_stage
 from ..dynamic import sandbox
-from ..dynamic.stage import crash_finding_candidate
+from ..dynamic.stage import crash_dedup_key, crash_finding_candidate
 from . import bundle
 from .capture import MODES, how_to_feed
 
@@ -54,16 +54,27 @@ def build_poc_stage(ctx) -> dict:
     # Try the mode we believe in, then the others. A crashing input fed the wrong way does
     # not crash, and filing that as an unverified L0 turns a wrong setup into what reads as
     # "the input does not reproduce".
-    tried = []
-    for m in [mode] + [x for x in MODES if x != mode]:
-        run_argv, stdin = _delivery(m)
-        res = sandbox.run(exe, argv=run_argv, stdin=stdin, timeout=timeout, arch=target.arch,
-                          endianness=target.endianness, bits=target.bits)
-        tried.append(m)
-        if res.crashed:
-            if m != mode:
-                mode_why = f"{mode_why}, but it only crashed via {m}"
-            mode = m
+    # The options the crash was found under come first, because a crash found under an option
+    # may need it -- but then WITHOUT them, for two reasons: a simpler reproducer is a better
+    # PoC, and a mined flag that consumes the next argument (`-cmd`, `-o`) swallows the file
+    # path, so replaying faithfully is the one thing that cannot work.
+    prefixes = [list(argv)] + ([[]] if argv else [])
+    tried, res = [], None
+    for pre in prefixes:
+        argv = pre
+        for m in [mode] + [x for x in MODES if x != mode]:
+            run_argv, stdin = _delivery(m)
+            res = sandbox.run(exe, argv=run_argv, stdin=stdin, timeout=timeout,
+                              arch=target.arch, endianness=target.endianness, bits=target.bits)
+            tried.append(m if not pre else f"{m}+{' '.join(pre)}")
+            if res.crashed:
+                if m != mode:
+                    mode_why = f"{mode_why}, but it only crashed via {m}"
+                mode = m
+                break
+        if res is not None and res.crashed:
+            if not pre and prefixes[0]:
+                mode_why = f"{mode_why}; reproduces without {' '.join(prefixes[0])}"
             break
     run_argv, stdin = _delivery(mode)
     verified = res.crashed
@@ -83,10 +94,13 @@ def build_poc_stage(ctx) -> dict:
 
     if verified:
         fd = FindingDAO(ctx.conn)
+        # the SAME key the run that found this input filed it under, or a verified PoC opens a
+        # second finding beside the crash it just proved instead of promoting it
+        fault_pc = DynResultDAO(ctx.conn).fault_pc_for(target.id, input_sha)
         fd.upsert(target.id, target.case_id, crash_finding_candidate(
             res.signal_name, input_sha, res.isolation, "poc", "(PoC verified)",
-            state="poc-backed", confidence=0.95, bundle_sha=bundle_sha))
-        fid = fd.id_for_dedup(target.id, f"dynamic-crash:{res.signal_name}")
+            state="poc-backed", confidence=0.95, bundle_sha=bundle_sha, fault_pc=fault_pc))
+        fid = fd.id_for_dedup(target.id, crash_dedup_key(res.signal_name, fault_pc))
         if fid:
             PocDAO(ctx.conn).set_finding(poc_id, fid)
 

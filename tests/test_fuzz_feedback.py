@@ -85,3 +85,61 @@ def test_a_real_difference_still_registers_when_the_input_is_echoed():
     a = behaviour_of(_R(err=b"Error : cannot open 'AAAA'"), b"AAAA")
     b = behaviour_of(_R(err=b"Illegal subdirectory link 'AAAA'"), b"AAAA")
     assert a != b
+
+
+def test_an_option_travels_with_the_input_it_crashed(tmp_path):
+    """A crash found under an option only means something WITH that option, so the re-run that
+    checks it reproduces has to use the same prefix."""
+    from lykos.analyze.fuzz.runner import run_input
+    seen = {}
+
+    class _Sandbox:
+        @staticmethod
+        def run(exe, argv=(), stdin=b"", **kw):
+            seen["argv"] = list(argv)
+
+            class R:
+                crashed = False
+                signal_name = None
+            return R()
+    import lykos.analyze.fuzz.runner as runner
+    real, runner.sandbox = runner.sandbox, _Sandbox()
+    try:
+        wf = tmp_path / "in.bin"
+        run_input(tmp_path / "t", "file", wf, 1.0, "x86-64", b"data",
+                  base_argv=["-exonly", "-v"])
+        assert seen["argv"][:2] == ["-exonly", "-v"], seen["argv"]
+        assert seen["argv"][-1] == str(wf), "the carrier still comes last"
+        run_input(tmp_path / "t", "file", wf, 1.0, "x86-64", b"data")
+        assert seen["argv"] == [str(wf)], "and no prefix when none was given"
+    finally:
+        runner.sandbox = real
+
+
+def test_a_crash_that_does_not_happen_again_is_not_filed():
+    """Some targets REWRITE their input -- jhead's `-dc` and `-zt` edit the file in place --
+    so the program faults on bytes it produced itself while the input we hold runs clean. On
+    one jhead campaign 36 of 137 crashes were like that: a quarter of everything downstream
+    was chasing a crash nobody could reproduce, and the release gate failed with "PoC not
+    reproduced"."""
+    from lykos.analyze.fuzz.stage import _reproduces
+
+    class _T:
+        arch, endianness, bits = "x86-64", "little", 64
+
+    calls = []
+
+    def _fake(exe, mode, wf, timeout, arch, data, **kw):
+        calls.append(kw.get("base_argv"))
+
+        class R:
+            crashed = False
+        return [], R()
+    import lykos.analyze.fuzz.stage as st
+    real, st.run_input = st.run_input, _fake
+    try:
+        assert _reproduces(st.run_input, "exe", "file", None, 1.0, _T(), b"x",
+                           ["-dc"]) is False
+        assert calls == [["-dc"]], "re-run under the same options it was found with"
+    finally:
+        st.run_input = real

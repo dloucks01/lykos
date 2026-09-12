@@ -17,10 +17,10 @@ from __future__ import annotations
 
 import os
 
-from ...db.dao import CallEdgeDAO, FindingDAO, PocDAO, TargetDAO
+from ...db.dao import CallEdgeDAO, DynResultDAO, FindingDAO, PocDAO, TargetDAO
 from ...jobs.registry import register_stage
 from ..dynamic import sandbox
-from ..dynamic.stage import crash_finding_candidate
+from ..dynamic.stage import crash_dedup_key, crash_finding_candidate
 from . import bundle, primitive
 from .capture import modes_for
 from .primitive_stage import _hydrate_frames
@@ -114,10 +114,11 @@ def _finalize(ctx, target, target_bytes, payload, mode, run_argv, res, cand, off
                                      signal_name=res.signal_name, input_sha=input_sha,
                                      bundle_sha=bundle_sha)
     fd = FindingDAO(ctx.conn)
+    fault_pc = DynResultDAO(ctx.conn).fault_pc_for(target.id, input_sha)
     fd.upsert(target.id, target.case_id, crash_finding_candidate(
         res.signal_name, input_sha, res.isolation, "synth_overflow", f"({detail})",
-        state="poc-backed", confidence=0.95, bundle_sha=bundle_sha))
-    fid = fd.id_for_dedup(target.id, f"dynamic-crash:{res.signal_name}")
+        state="poc-backed", confidence=0.95, bundle_sha=bundle_sha, fault_pc=fault_pc))
+    fid = fd.id_for_dedup(target.id, crash_dedup_key(res.signal_name, fault_pc))
     if fid:
         PocDAO(ctx.conn).set_finding(poc_id, fid)
 

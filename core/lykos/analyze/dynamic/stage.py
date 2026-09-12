@@ -23,16 +23,45 @@ _SIG_CWE = {
 }
 
 
+def crash_dedup_key(signal_name, fault_pc=None) -> str:
+    """The bucket a crash belongs to. Every stage that files one must agree, or a verified PoC
+    opens a second finding beside the crash it just proved."""
+    return (f"dynamic-crash:{signal_name}:{fault_pc:x}" if fault_pc
+            else f"dynamic-crash:{signal_name}")
+
+
+def find_crash_finding(conn, target_id, signal_name, input_sha=None):
+    """The id of the crash finding for this crash, precise key first then the legacy one.
+
+    Stages look the crash finding up to attach a PoC to it. Once the key carries a faulting
+    address, a lookup by signal alone stops matching -- and cases recorded before that still
+    only have the signal -- so both are tried.
+    """
+    from ...db.dao import DynResultDAO, FindingDAO
+    fd = FindingDAO(conn)
+    pc = DynResultDAO(conn).fault_pc_for(target_id, input_sha) if input_sha else None
+    return (fd.id_for_dedup(target_id, crash_dedup_key(signal_name, pc)) if pc else None) \
+        or fd.id_for_dedup(target_id, crash_dedup_key(signal_name))
+
+
 def crash_finding_candidate(signal_name, input_sha, isolation, detector, extra="",
-                            state="confirmed", confidence=0.9, bundle_sha=None):
+                            state="confirmed", confidence=0.9, bundle_sha=None,
+                            fault_pc=None):
     """Crash finding shared by the dynamic / fuzz / poc stages.
 
-    dedup_key is (signal, input) so building a verified PoC from the same crashing input
-    merges into and promotes the finding that dynamic/fuzz already confirmed.
+    Keyed by WHERE it faulted when that is known, so two defects that both raise SIGSEGV stay
+    two findings. Keyed by signal alone otherwise -- which is what every crash used to get, and
+    it collapsed 8,516 crashes in one jhead campaign into a single "unique" finding.
+
+    A later stage that reproduces the same input must land on the same key to promote rather
+    than duplicate, so the faulting address is taken from the crash itself, not from whichever
+    stage happened to observe it.
     """
     cwe, sev = _SIG_CWE.get(signal_name, ("CWE-119", "high"))
     short = input_sha[:12] if input_sha else "(none)"
     detail = f"{signal_name} with input {short} [{isolation}]"
+    if fault_pc:
+        detail += f" faulting at +0x{fault_pc:x}"
     if extra:
         detail += " " + extra
     evidence = [{"channel": "dynamic", "detail": detail}]
@@ -43,10 +72,8 @@ def crash_finding_candidate(signal_name, input_sha, isolation, detector, extra="
         "cwe": cwe, "severity": sev, "state": state, "confidence": confidence,
         "detector": detector,
         "title": f"Reproduced crash ({signal_name}) under dynamic execution",
-        "site_addr": None, "function_addr": None,
-        # keyed by signal alone: without a faulting address we treat same-signal crashes as
-        # one finding, so a verified PoC promotes the crash that dynamic/fuzz confirmed.
-        "dedup_key": f"dynamic-crash:{signal_name}",
+        "site_addr": (hex(fault_pc) if fault_pc else None), "function_addr": None,
+        "dedup_key": crash_dedup_key(signal_name, fault_pc),
         "evidence": evidence,
     }
 

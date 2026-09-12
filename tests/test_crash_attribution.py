@@ -299,3 +299,50 @@ def test_a_pc_match_needs_the_frame_to_be_the_fault():
     frames = [_frame(0x2000, func="0xb00", symbol="inner", fault_pc=True),
               _frame(0x1234, func="0x900", symbol="fn")]
     assert [a["tier"] for a in rootcause.attribute(frames, [f])] != ["fault-site"]
+
+
+def test_two_defects_that_both_segfault_are_two_findings():
+    """Crash findings were keyed by signal alone, so every SIGSEGV in a program was one
+    finding: a jhead campaign reported 8,516 crashes as a single "unique". The faulting
+    instruction is what separates two defects that raise the same signal."""
+    from lykos.analyze.dynamic.stage import crash_dedup_key, crash_finding_candidate
+    a = crash_finding_candidate("SIGSEGV", "a" * 64, "bwrap", "fuzz", fault_pc=0x40637A)
+    b = crash_finding_candidate("SIGSEGV", "b" * 64, "bwrap", "fuzz", fault_pc=0x4099C0)
+    assert a["dedup_key"] != b["dedup_key"]
+    assert a["site_addr"] == "0x40637a", "and the finding says where"
+    # the same defect found twice is still one finding, however many inputs reach it
+    c = crash_finding_candidate("SIGSEGV", "c" * 64, "bwrap", "poc", fault_pc=0x40637A)
+    assert c["dedup_key"] == a["dedup_key"]
+    # no address (an untraced run): the old behaviour, not a third bucket per input
+    assert crash_dedup_key("SIGSEGV") == "dynamic-crash:SIGSEGV"
+    assert crash_finding_candidate("SIGSEGV", "d" * 64, "rlimit", "fuzz")["dedup_key"] == \
+        crash_dedup_key("SIGSEGV")
+
+
+def test_every_stage_derives_the_same_key(store, case):
+    """A verified PoC must PROMOTE the crash it just proved, not file a second finding beside
+    it. The address therefore lives on the crash row, so build_poc, root_cause and synthesize
+    all read the same value rather than each deriving its own."""
+    from lykos.analyze.dynamic.stage import crash_dedup_key, find_crash_finding
+    from lykos.db.dao import DynResultDAO, FindingDAO
+    t = _target(store, case)
+    dd = DynResultDAO(store.conn)
+    dd.insert(t.id, case.id, input_sha="e" * 64, input_mode="file", crashed=True,
+              signal_name="SIGSEGV", fault_pc=0x40637A)
+    assert dd.fault_pc_for(t.id, "e" * 64) == 0x40637A
+    assert dd.fault_pc_for(t.id, "f" * 64) is None, "a different input says nothing"
+
+    fd = FindingDAO(store.conn)
+    from lykos.analyze.dynamic.stage import crash_finding_candidate
+    fd.upsert(t.id, case.id, crash_finding_candidate(
+        "SIGSEGV", "e" * 64, "bwrap", "fuzz", fault_pc=0x40637A))
+    found = find_crash_finding(store.conn, t.id, "SIGSEGV", "e" * 64)
+    assert found and found == fd.id_for_dedup(t.id, crash_dedup_key("SIGSEGV", 0x40637A))
+
+
+def test_a_legacy_crash_finding_is_still_found():
+    """Cases recorded before the key carried an address only have the signal, and the lookup
+    has to keep matching them or a re-run files a duplicate."""
+    from lykos.analyze.dynamic.stage import crash_dedup_key
+    assert crash_dedup_key("SIGABRT", None) == "dynamic-crash:SIGABRT"
+    assert crash_dedup_key("SIGABRT", 0) == "dynamic-crash:SIGABRT", "0 is not an address"

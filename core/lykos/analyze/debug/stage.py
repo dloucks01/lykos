@@ -9,10 +9,11 @@ import json
 import shutil
 import sys
 
-from ...db.dao import CallEdgeDAO, FindingDAO, FunctionDAO, TargetDAO
+from ...db.dao import CallEdgeDAO, DynResultDAO, FindingDAO, FunctionDAO, TargetDAO
 from ...jobs.registry import register_stage
 from .. import elf
 from ..dynamic import sandbox
+from ..dynamic.stage import crash_dedup_key
 from ..poc.capture import MODES, how_to_feed, make_capture, make_qemu_capture, materialize_helper
 from . import gdb, qemu_gdb, rootcause
 
@@ -124,23 +125,26 @@ def root_cause_stage(ctx) -> dict:
         report_sha = ctx.put_artifact("root-cause", data=json.dumps(report, indent=2,
                                       sort_keys=True, default=str).encode(),
                                       meta={"cwe": report["classification"]["cwe"]})
-        # attach root-cause + exploitability evidence to the crash finding (keyed by signal)
+        # attach root-cause + exploitability evidence to the crash finding
         v = report["classification"]
         ex = report["exploitability"]
         ex_line = (f"exploitability: {ex['rating']} ({ex['score']}/100) -- "
                    + "; ".join(ex["reasons"]))
         crash_fn = (report["slice"].get("crash_function") or {})
         fdao = FindingDAO(ctx.conn)
+        # from the run that FOUND the input, not from this capture, so every stage that files
+        # a crash finding derives the same key and they merge instead of multiplying
+        _fault_pc = DynResultDAO(ctx.conn).fault_pc_for(target.id, input_sha)
         fdao.upsert(target.id, target.case_id, {
             "cwe": v["cwe"], "title": f"Root cause: {v['class']} [{ex['rating']}]",
             "severity": v["severity"],
             "state": "confirmed", "confidence": 0.9, "detector": "root_cause",
-            # The crash is now locatable. The dedup key stays keyed on the signal alone --
-            # eight PoC stages look the finding up by it -- so these are the FIRST crash site
-            # seen for a signal, which is also how upsert treats every other finding.
+            # The crash is now locatable, and the key carries WHERE it faulted so two
+            # defects that both segfault stay two findings. The address comes from the run
+            # that found the input, not from this capture, so every stage derives the same key.
             "site_addr": _hex(crash_fn.get("static_addr")),
             "function_addr": crash_fn.get("func_addr"),
-            "dedup_key": f"dynamic-crash:{cap['signal_name']}",
+            "dedup_key": crash_dedup_key(cap["signal_name"], _fault_pc),
             "evidence": [{"channel": "root-cause", "detail": report["summary"]},
                          {"channel": "exploitability", "detail": ex_line}]})
 
