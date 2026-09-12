@@ -52,7 +52,7 @@ def synthesize_stage(ctx) -> dict:
     word = 8 if (target.bits or 64) >= 64 else 4
     endian = "big" if target.endianness == "big" else "little"
 
-    frames = _hydrate_frames(ctx, target.id)
+    frames = _hydrate_frames(ctx, target.id, target)
     candidates = primitive.frame_offset_candidates(frames, word)
     if not candidates:
         ctx.emit("synth.done", payload={"ok": False, "crashed": False,
