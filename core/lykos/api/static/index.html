@@ -955,9 +955,26 @@ function onUpload(e){
 async function doUpload(){
   if(!PENDING) return;
   const fd=new FormData(); fd.append("file", PENDING);
-  logline("ui", "uploading "+PENDING.name);
-  await fetch(`/cases/${CUR}/targets`,{method:"POST",body:fd});
-  PENDING=null; document.getElementById("fname").textContent=""; document.getElementById("analyze").disabled=true;
+  const name=PENDING.name;
+  logline("ui", "uploading "+name);
+  // The response was never checked: a refused or failed upload cleared the filename,
+  // re-enabled the button and refreshed exactly like a successful one, so the only sign
+  // anything went wrong was a target that never appeared.
+  let r;
+  try{ r=await fetch(`/cases/${CUR}/targets`,{method:"POST",body:fd}); }
+  catch(e){ logline("ui", `upload of ${name} failed: ${e}`); return; }
+  if(!r.ok){
+    let why=`HTTP ${r.status}`;
+    try{ const d=await r.json(); if(d && d.error) why=d.error; }catch(e){}
+    logline("ui", `upload of ${name} refused — ${why}`);
+    const fn=document.getElementById("fname");
+    if(fn){ fn.textContent=why; fn.style.color="var(--bad,#d33)"; }
+    return;                       // keep the selection so the user can see what they picked
+  }
+  PENDING=null;
+  const fn=document.getElementById("fname");
+  if(fn){ fn.textContent=""; fn.style.color=""; }
+  document.getElementById("analyze").disabled=true;
   await refresh();
 }
 
@@ -1017,10 +1034,29 @@ function renderRuns(rs){
       bar=`<div class="pbwrap"><div class="pbar${ind}" id="pbar-${r.id}"><i style="width:${pct==null?0:pct}%"></i></div>
         <div class="pbmeta" id="pbmeta-${r.id}"><span>${esc(msg)}</span><span>${pct==null?"":pct+"%"}</span></div></div>`;
     }
+    // A running stage had no stop control anywhere in the UI, so a ten-minute campaign
+    // started by mistake had to be waited out or the server killed. The job engine has
+    // supported cancellation all along.
+    const stop = running
+      ? `<button class="btn sm" title="Stop this run" onclick="cancelRun('${r.id}')">Stop</button>`
+      : "";
     return `<div class="runrowbox"><div class="kv runrow"><span class="mono">${r.stage} <span style="color:var(--faint)">${r.id.slice(0,8)}</span></span>
-     <span class="runmeta">${when}<span class="pill ${r.status}">${r.status}</span></span></div>${bar}</div>`;
+     <span class="runmeta">${when}<span class="pill ${r.status}">${r.status}</span>${stop}</span></div>${bar}</div>`;
   }).join("");
 }
+async function cancelRun(id){
+  logline("ui", "stopping run "+id.slice(0,8));
+  let r;
+  try{ r=await fetch(`/runs/${id}/cancel`,{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"}); }
+  catch(e){ logline("ui", `stop failed: ${e}`); return; }
+  let d={}; try{ d=await r.json(); }catch(e){}
+  if(!r.ok){ logline("ui", `stop failed — ${d.error||("HTTP "+r.status)}`); return; }
+  // a stage checks for cancellation between units of work, so it stops shortly rather than
+  // instantly -- say so instead of leaving the row looking stuck
+  logline("ui", d.cancelled ? `run ${id.slice(0,8)} cancelling…` : (d.note||`run already ${d.status}`));
+  await refresh();
+}
+
 // live-update a single run's progress bar without a full re-render
 function updateRunBar(run_id){
   const bar=document.getElementById("pbar-"+run_id), meta=document.getElementById("pbmeta-"+run_id);
