@@ -88,6 +88,13 @@ def _why_unavailable(stage: str, target) -> Optional[str]:
         if ftype in _JVM:
             return "the JVM manages its own heap; the LD_PRELOAD guard-page allocator does " \
                    "not apply."
+        if ftype and ftype != "elf":
+            # The stage says this itself at runtime; the map did not know, so the workbench
+            # offered Heap check on a Windows PE and the operator learned by waiting for a
+            # decline. Same shape as the jar case, one substrate over.
+            return (f"the guard-page heap checker is a Linux/ELF LD_PRELOAD shim and cannot "
+                    f"load into a {ftype.upper()} image -- nothing would be checked, which is "
+                    f"not the same as nothing found.")
         if arch and host and arch != host:
             return (f"heap check is native-arch only (target {arch}, host {host}); a per-arch "
                     f"shim under qemu is future work.")
@@ -109,6 +116,15 @@ def _why_unavailable(stage: str, target) -> Optional[str]:
         return ("this channel works on machine code (P-Code / ptrace / angr); a Java target "
                 "has none. The constant pool gives detect_cwe the same call inventory "
                 "directly.")
+
+    if stage == "dynamic_taint" and ftype and ftype != "elf":
+        return f"dynamic taint runs Linux ELF only (this target is {ftype.upper()})."
+
+    # These two DO cover Windows: behaviour tracing and the runtime monitor both have Wine
+    # relay paths. Everything else -- Mach-O, a raw image -- has no substrate to run on, which
+    # is the stages' own wording.
+    if stage in ("behavior_trace", "debug_monitor") and ftype not in ("elf", "pe", ""):
+        return f"no execution substrate for a {ftype.upper()} image here (ELF and PE only)."
 
     return None
 
