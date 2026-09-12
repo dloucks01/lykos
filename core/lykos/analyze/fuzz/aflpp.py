@@ -78,19 +78,86 @@ def locate_qemu_trace(afl: Path) -> Optional[Path]:
     Shipped separately from afl-fuzz -- Ubuntu's afl++ package does NOT include it, it comes
     from AFL++'s qemu_mode/build_qemu_support.sh. Without it `-Q` dies at the fork-server handshake.
     """
-    cand = Path(afl).parent / "afl-qemu-trace"
-    if cand.exists():
-        return cand
+    return locate_qemu_trace_for(afl, None)
+
+
+def _trace_candidates(afl: Path, arch: Optional[str]):
+    """Where an afl-qemu-trace for `arch` might be, strongest first.
+
+    One machine can hold several: afl-qemu-trace is an emulator and each build targets a
+    single guest, so covering ARM and AArch64 and x86-64 means three binaries. AFL++ installs
+    them all under the same name, which is why they have to be kept apart by directory or by
+    suffix -- and why looking only for the bare name finds whichever was installed last.
+    """
+    here = Path(afl).parent if afl else None
+    if arch:
+        # an explicit override wins, and names the file directly
+        env = os.environ.get("LYKOS_AFL_QEMU_" + arch.upper().replace("-", "_"))
+        if env:
+            yield Path(env)
+        # ...then arch-suffixed neighbours, in both our spelling and qemu's
+        spellings = {arch, {"x86-64": "x86_64", "x86": "i386"}.get(arch, arch)}
+        for sp in sorted(spellings):
+            for d in ([here] if here else []) + [None]:
+                name = f"afl-qemu-trace-{sp}"
+                cand = (d / name) if d else shutil.which(name)
+                if cand:
+                    yield Path(cand)
+    if here:
+        yield here / "afl-qemu-trace"
     found = shutil.which("afl-qemu-trace")
-    return Path(found) if found else None
+    if found:
+        yield Path(found)
+
+
+def locate_qemu_trace_for(afl: Optional[Path], arch: Optional[str]) -> Optional[Path]:
+    """An afl-qemu-trace that can run `arch`, or None.
+
+    When `arch` is given the candidate's GUEST is verified before it is accepted -- a binary
+    named afl-qemu-trace-arm that was actually built for something else would otherwise abort
+    at the fork-server handshake, which is the failure this whole path exists to avoid.
+    """
+    seen = set()
+    for cand in _trace_candidates(afl, arch):
+        key = str(cand)
+        if key in seen or not cand.exists():
+            continue
+        seen.add(key)
+        if arch is None or qemu_trace_arch(cand) == arch:
+            return cand
+    return None
+
+
+def stage_qemu_trace(trace: Path, workdir) -> str:
+    """Put `trace` where afl-fuzz will find it, and return the AFL_PATH to use.
+
+    afl-fuzz looks for its helper under the single name `afl-qemu-trace` (in AFL_PATH, then
+    its own directory, then PATH). A machine holding one emulator per guest cannot satisfy
+    that with names alone, so the chosen one is linked under the expected name in a private
+    directory and AFL_PATH is pointed at it. Nothing is copied: a symlink keeps the 9 MB
+    binary in one place and makes the indirection visible if anyone looks.
+    """
+    d = Path(workdir) / "aflpath"
+    d.mkdir(parents=True, exist_ok=True)
+    link = d / "afl-qemu-trace"
+    if link.exists() or link.is_symlink():
+        link.unlink()
+    try:
+        link.symlink_to(Path(trace).resolve())
+    except OSError:
+        shutil.copy2(Path(trace).resolve(), link)     # no symlinks here (some sandboxes)
+        link.chmod(0o755)
+    return str(d)
 
 
 def run_campaign(afl: Path, exe, seeds_dir, out_dir, *, seconds: int = 30,
-                 mode: str = "file", qemu: bool = True):
+                 mode: str = "file", qemu: bool = True, afl_path: Optional[str] = None):
     target = [str(exe)] + (["@@"] if mode == "file" else [])
     cmd = [str(afl)] + (["-Q"] if qemu else []) + \
         ["-i", str(seeds_dir), "-o", str(out_dir), "-V", str(int(seconds)), "--"] + target
     env = dict(os.environ)
+    if afl_path:
+        env["AFL_PATH"] = afl_path
     env.update({
         "AFL_SKIP_CPUFREQ": "1",
         "AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES": "1",
@@ -121,6 +188,34 @@ def campaign_failed(proc) -> Optional[str]:
     if proc.returncode not in (0, None):
         return f"afl-fuzz exited {proc.returncode}"
     return None
+
+
+def campaign_stats(out_dir) -> dict:
+    """AFL's own fuzzer_stats: how much work actually happened.
+
+    Without this a campaign reports "0 crashes" whether it executed two million inputs or
+    none, and those are opposite conclusions -- one says the target looks robust, the other
+    says nothing ran. afl-fuzz can also exit 0 having aborted, which `campaign_failed` catches,
+    but a campaign that merely ran badly (a seed the target rejects, a timeout per exec that
+    swallows the budget) leaves no marker at all.
+    """
+    out: dict = {}
+    for name in ("fuzzer_stats", "default/fuzzer_stats"):
+        f = Path(out_dir) / name
+        if not f.exists():
+            continue
+        try:
+            for line in f.read_text(errors="replace").splitlines():
+                k, _, v = line.partition(":")
+                k, v = k.strip(), v.strip()
+                if k in ("execs_done", "execs_per_sec", "unique_crashes", "corpus_count",
+                         "unique_hangs", "cycles_done", "paths_total"):
+                    out[k] = v
+        except OSError:
+            pass
+        if out:
+            break
+    return out
 
 
 def harvest_crashes(out_dir) -> list:
