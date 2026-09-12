@@ -17,6 +17,7 @@ import shutil
 import signal
 import struct
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -417,7 +418,11 @@ def _run_windows(exe, *, argv, stdin, timeout, mem_mb, capture, wineprefix) -> R
 def run(exe, *, argv=(), stdin: bytes = b"", timeout: float = 10.0,
         arch: Optional[str] = None, endianness: Optional[str] = None,
         bits: Optional[int] = None, host: Optional[str] = None, mem_mb: int = 2048,
-        capture: int = 65536, wineprefix: Optional[str] = None) -> RunResult:
+        capture: int = 65536, wineprefix: Optional[str] = None, blocks=()) -> RunResult:
+    """`blocks` asks for coverage. On an EMULATED target that is the only way to get it: the
+    ptrace tracer the batch runner uses cannot reach inside qemu, so every non-native campaign
+    was running blind on output shape alone -- eleven of the twelve architectures the platform
+    builds real targets for. qemu logs the guest PC of each translated block itself."""
     host = host or host_arch()
     if _is_pe(exe):                                     # Windows PE -> Wine substrate
         return _run_windows(exe, argv=argv, stdin=stdin, timeout=timeout, mem_mb=mem_mb,
@@ -431,7 +436,13 @@ def run(exe, *, argv=(), stdin: bytes = b"", timeout: float = 10.0,
                                   f"on {host}")
 
     base = [str(exe)] + [argv_bytes(a) for a in argv]
-    inner = [emu] + base if emu else base
+    trace_log = None
+    if emu and blocks:
+        tdir = tempfile.mkdtemp(prefix="lykos-qtrace-")
+        trace_log = str(Path(tdir) / "exec.log")
+        inner = [emu, "-d", "exec", "-D", trace_log] + base
+    else:
+        inner = [emu] + base if emu else base
     # emulation is several times slower than native, so give it a longer wall-clock budget or
     # correct runs would be misreported as timeouts.
     eff_timeout = max(timeout * 3, 5.0) if emu else timeout
@@ -450,6 +461,13 @@ def run(exe, *, argv=(), stdin: bytes = b"", timeout: float = 10.0,
         # where it matters most (running hostile code on the host CPU).
         exedir = str(Path(exe).resolve().parent)
         extra = ["--ro-bind", exedir, exedir]
+        if trace_log:
+            # qemu writes its block log to a FILE, and /tmp inside the sandbox is a private
+            # tmpfs -- the log is created there and gone the moment the sandbox exits, which
+            # is why every traced emulated run reported zero blocks. Bind the log's own
+            # directory writable; it holds nothing else.
+            tdir = str(Path(trace_log).parent)
+            extra += ["--bind", tdir, tdir]
         cmd = ["bwrap"] + _BWRAP_ARGS[:-1] + extra + ["--"] + inner
         iso = ("bwrap+netns" + ("+qemu" if emu else ""))
 
@@ -466,8 +484,35 @@ def run(exe, *, argv=(), stdin: bytes = b"", timeout: float = 10.0,
     # classify_rc() holds the one copy of this: native subprocesses report -signum while
     # wrappers (bwrap/qemu) report 128+signum, and the two had drifted apart here.
     crashed, sig, sig_name, exit_code = classify_rc(rc)
+    note = None
+    if trace_log:
+        reached = _qemu_reached(trace_log, blocks)
+        note = ",".join(str(x) for x in reached) or None
+        shutil.rmtree(Path(trace_log).parent, ignore_errors=True)
     return RunResult(
         isolation=iso, crashed=crashed, timed_out=timed,
         exit_code=exit_code, signal=sig, signal_name=sig_name,
         stdout=(out or b"")[:capture], stderr=(err or b"")[:capture],
-        duration_ms=dur, cmd=cmd)
+        duration_ms=dur, cmd=cmd, note=note)
+
+
+_TRACE_PC = re.compile(rb"^Trace \d+: 0x[0-9a-f]+ \[[^/]*/([0-9a-f]+)/", re.M)
+
+
+def _qemu_reached(path, blocks):
+    """Which of `blocks` qemu executed, from its own -d exec log.
+
+    The log line is `Trace 0: <host addr> [<flags>/<GUEST PC>/...] <symbol>`, so the guest PC
+    is the second bracketed field -- the host translation address in front of it is not an
+    address in the target at all.
+    """
+    want = set(blocks)
+    if not want:
+        return ()
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read()
+    except OSError:
+        return ()
+    seen = {int(m.group(1), 16) for m in _TRACE_PC.finditer(data)}
+    return sorted(seen & want)

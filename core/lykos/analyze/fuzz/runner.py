@@ -14,10 +14,11 @@ def invocation(mode, workfile, d: bytes):
 
 
 def run_input(exe, mode, workfile, timeout, arch, d: bytes, *, endianness=None, bits=None,
-              base_argv=()):
+              base_argv=(), blocks=()):
     """One execution. `base_argv` is the option prefix the campaign is running under: a crash
-    found with an option has to be re-run with it to mean anything."""
+    found with an option has to be re-run with it to mean anything. `blocks` asks for coverage,
+    which on an emulated target comes from qemu's own block log."""
     argv, stdin = invocation(mode, workfile, d)
     argv = list(base_argv) + argv
     return argv, sandbox.run(exe, argv=argv, stdin=stdin, timeout=timeout, arch=arch,
-                             endianness=endianness, bits=bits)
+                             endianness=endianness, bits=bits, blocks=blocks)

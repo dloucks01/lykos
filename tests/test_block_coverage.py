@@ -156,3 +156,48 @@ def test_a_signal_the_program_handles_is_not_a_crash(tmp_path):
     assert not plain[0].crashed
     assert not traced[0].crashed, "tracing must not invent a crash the program recovered from"
     assert b"recovered" in (traced[0].stdout or b""), "and the program must run to completion"
+
+
+def test_qemu_block_log_is_parsed_for_the_guest_pc(tmp_path):
+    """The ptrace tracer cannot reach inside qemu, so every non-native campaign ran blind on
+    output shape alone -- eleven of the twelve architectures the platform builds real targets
+    for. qemu logs the guest PC of each block it translates, and the log line is
+
+        Trace 0: <host translation addr> [<flags>/<GUEST PC>/...] <symbol>
+
+    The host address in front is not an address in the target at all: reading it instead of
+    the bracketed guest PC matches nothing, which is indistinguishable from no coverage."""
+    from lykos.analyze.dynamic.sandbox import _qemu_reached
+    log = tmp_path / "exec.log"
+    log.write_bytes(b"".join([
+        b"Trace 0: 0x7fdc04000100 [80081009231/0000000000400740/00000001/00000000] _start\n",
+        b"Linking TBs 0x7fdc040002c0 index 1 -> 0x7fdc04000600\n",
+        b"Trace 0: 0x7fdc040002c0 [80081009231/000000000040f924/00000001/00000000] main\n",
+    ]))
+    assert _qemu_reached(str(log), (0x400740, 0x40F924, 0xDEAD)) == [0x400740, 0x40F924]
+    assert _qemu_reached(str(log), ()) == (), "nothing asked for, nothing reported"
+    assert _qemu_reached(str(tmp_path / "missing.log"), (0x400740,)) == ()
+    # the host translation address must never be mistaken for a guest block
+    assert _qemu_reached(str(log), (0x7FDC04000100,)) == []
+
+
+def test_an_emulated_target_reports_the_blocks_it_reached():
+    """End to end: a real cross-architecture binary, under qemu, through the sandbox."""
+    import pathlib
+    import shutil
+    import subprocess
+
+    from lykos.analyze.dynamic import sandbox
+    exe = pathlib.Path("examples/vuln-targets/bin/jhead_aarch64").resolve()
+    seed = pathlib.Path("examples/vuln-targets/inputs/jhead-ok.jpg").resolve()
+    if not exe.exists() or not shutil.which("qemu-aarch64") or not shutil.which("readelf"):
+        pytest.skip("run examples/vuln-targets/fetch_build.sh, and qemu-aarch64 is needed")
+    out = subprocess.run(["readelf", "-sW", str(exe)], capture_output=True, text=True).stdout
+    blocks = tuple(sorted({int(f[1], 16) for f in (ln.split() for ln in out.splitlines())
+                           if len(f) >= 8 and f[3] in ("FUNC", "IFUNC") and f[6] != "UND"
+                           and int(f[1], 16)}))
+    assert blocks
+    res = sandbox.run(exe, argv=[str(seed)], arch="aarch64", timeout=30, blocks=blocks)
+    reached = [x for x in (res.note or "").split(",") if x]
+    assert res.exit_code == 0, res.stderr[:200]
+    assert 20 < len(reached) < len(blocks), f"{len(reached)} of {len(blocks)}"
