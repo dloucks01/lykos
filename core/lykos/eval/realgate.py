@@ -138,6 +138,14 @@ MATRIX = [
         prebuilt="examples/vuln-targets/bin/jhead_x86-64", fuzz=True,
         note="jhead 3.04 CWE-125 in ProcessGpsInfo, found from the binary alone "
              "(run examples/vuln-targets/fetch_build.sh to enable)"),
+    # The ladder above L1 on REAL code. jhead's bug is an out-of-bounds read, so it cannot
+    # reach L2 at all; this is the shape that gives instruction-pointer control, and until now
+    # the only evidence for L2 outside a synthetic fixture was a hand-run measurement.
+    RealCase(
+        "real_ncompress", "", b"A" * 1400, "arg",
+        {"cwe121": True, "L1": True, "L2": True, "bundle_reproduces": True},
+        prebuilt="examples/vuln-targets/bin/ncompress_x86-64_cve",
+        note="ncompress CVE-2001-1413: unchecked strcpy of an argv pathname, to L2"),
 ]
 
 
