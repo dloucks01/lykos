@@ -339,6 +339,34 @@ _WINE_EXC = {
     "80000003": "BREAKPOINT",
 }
 _WINE_EXC_RE = re.compile(rb"Unhandled exception code ([0-9a-fA-F]{8})")
+# Wine has a SECOND format for the commonest crash there is, and matching only the first meant
+# every PE access violation read as a clean exit -- so no PE crash was ever recorded and the
+# whole PoC ladder was unreachable for Windows targets:
+#   wine: Unhandled page fault on read access to 00007FFFFF8A0C77 at address 000000014000547D
+# A page fault IS c0000005; the access word (read/write/execute) is kept for the note.
+_WINE_FAULT_RE = re.compile(
+    rb"Unhandled page fault on (read|write|execute)(?:-inclusive)? access"
+    rb"(?: to ([0-9a-fA-F]+))?(?: at address ([0-9a-fA-F]+))?")
+
+
+def wine_exception(stderr: bytes):
+    """(nt status, human name, detail) for a Wine guest crash, or (None, None, None).
+
+    Two formats, one meaning. Anything that says "Unhandled" and names a fault is a crash:
+    reporting it as a clean run is the worst possible answer, because the input that caused
+    it then looks uninteresting.
+    """
+    m = _WINE_EXC_RE.search(stderr or b"")
+    if m:
+        code = m.group(1).decode().lower()
+        return code, "EXCEPTION_" + _WINE_EXC.get(code, code.upper()), None
+    m = _WINE_FAULT_RE.search(stderr or b"")
+    if m:
+        how = m.group(1).decode()
+        at = (m.group(3) or m.group(2) or b"").decode()
+        detail = f"page fault on {how} access" + (f" at 0x{at}" if at else "")
+        return "c0000005", "EXCEPTION_ACCESS_VIOLATION", detail
+    return None, None, None
 
 
 def _wine() -> Optional[str]:
@@ -397,10 +425,8 @@ def _run_windows(exe, *, argv, stdin, timeout, mem_mb, capture, wineprefix) -> R
     # wine + wineserver need many fds/threads and a large AS; don't cap AS, widen nproc.
     preexec = _rlimits(mem_mb, int(eff_timeout) + 5, set_as=False, nproc=_nproc_cap(True))
     rc, out, err, timed, dur = _spawn(cmd, stdin, eff_timeout, preexec, env=env)
-    m = _WINE_EXC_RE.search(err or b"")
-    code = m.group(1).decode().lower() if m else None
+    code, name, detail = wine_exception(err or b"")
     crashed = code is not None
-    name = ("EXCEPTION_" + _WINE_EXC.get(code, code.upper())) if code else None
     # a launch failure (esp. a 32-bit PE with no i386 WoW64 runtime) must not read as a clean run.
     # key only on the loader's "failed to load" message (a bare c0000135 is a benign DLL-probe miss)
     low = (err or b"").lower()
@@ -416,7 +442,8 @@ def _run_windows(exe, *, argv, stdin, timeout, mem_mb, capture, wineprefix) -> R
         exit_code=(None if crashed else rc), signal=None, signal_name=name,
         stdout=(out or b"")[:capture], stderr=(err or b"")[:capture],
         duration_ms=dur, cmd=cmd,
-        note=None if crashed or not timed else "timed out")
+        note=(detail if crashed and detail else
+              (None if crashed or not timed else "timed out")))
 
 
 def run(exe, *, argv=(), stdin: bytes = b"", timeout: float = 10.0,

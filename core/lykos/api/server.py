@@ -422,6 +422,7 @@ class Handler(BaseHTTPRequestHandler):
                 afl_usable=advise_mod.afl_usable(),
                 # triage could not name a format, so there is nothing here to run
                 executable=bool(t.file_type and t.file_type not in ("raw", "other")),
+                file_format=t.file_type,
                 crashes=crashes, pocs=len(pocs))
             return self._json(out)
         finally:
