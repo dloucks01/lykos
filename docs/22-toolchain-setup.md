@@ -5,6 +5,28 @@ each stage locates its tool, runs it, parses the result, and fails clearly (or f
 when it is absent. This note records how the toolchain was provisioned and real-run tested on
 the Kali development VM, and the one engine that is a from-source build.
 
+## What is actually required
+
+Only two things are hard requirements. Everything else buys a capability, and its absence is
+reported rather than hidden -- the workbench greys the control and names the reason, and the
+stage declines with the same text if you launch it anyway.
+
+| | Needed for | Without it |
+|---|---|---|
+| **python3** | the platform | — (runtime is stdlib-only; no pip packages) |
+| **bubblewrap** (`bwrap`) | every sandboxed execution | the sandbox drops to rlimits-only: no network namespace, no read-only root. It still runs, which is the problem -- this is the one degradation you do not want silent when the binary is hostile |
+| **Ghidra** | `disassemble`, and so `detect_cwe`, taint, bounds, integer overflow, directed fuzzing | the whole static half. Fuzzing still finds crashes; nothing explains one |
+| **qemu-user** | executing any non-host binary | cross-architecture targets cannot run at all |
+| **gcc/cc** | building the eval corpus and real-gate fixtures | `make eval-gate` / `real-gate` skip |
+| **gdb** | `root_cause` detail, `multi_debug`, runtime monitor | root_cause falls back to the stdlib ptrace helper; multi_debug declines |
+| **afl-fuzz** + a per-guest `afl-qemu-trace` | `coverage_fuzz` | black-box `fuzz` only -- measured 40x slower on ARM (see below) |
+| **java** | JAR/class targets | Java targets triage and analyse statically but cannot be run |
+| **wine** | Windows PE execution | PE analyses statically; `synthesize_poc` still derives an overflow from the frame |
+| **symqemu**, **angr**, **Unicorn** | `concolic`, `firmware_rehost` | those stages decline |
+
+Python: verified on 3.14 here. The code uses no 3.10+ syntax and no third-party packages, so
+older 3.x very likely works -- but that is inference, not a tested claim.
+
 ## Installed via apt (Kali)
 
     sudo apt-get install -y gdb afl++ ghidra default-jdk qemu-user qemu-user-binfmt
@@ -15,8 +37,10 @@ the Kali development VM, and the one engine that is a from-source build.
   (`ExportAnalysis.java`), which Ghidra compiles on the fly and which works on every Ghidra
   version. No PyGhidra/Jython setup required.
 - **AFL++** — `afl-fuzz` plus the instrumenting compilers (`afl-cc`). The `coverage_fuzz`
-  stage uses qemu-mode (`-Q`) by default; if `afl-qemu-trace` is not packaged, pass
-  `params.qemu=false` and compile the target with `afl-cc` (instrumented mode).
+  stage uses qemu-mode (`-Q`) by default. See **one emulator per guest** below: a distribution
+  package ships at most one `afl-qemu-trace`, and which architecture it can run is not what
+  `file` says. If none matches, pass `params.qemu=false` and compile the target with `afl-cc`
+  (instrumented mode), or use the black-box `fuzz` stage.
 - **GDB** — the primary `root_cause` backend (fault address via `$_siginfo`, mappings, and
   faulting-instruction bytes). The pure-stdlib ptrace helper is the fallback.
 - **QEMU user** — cross-architecture execution in the sandbox.
@@ -67,10 +91,57 @@ gate and generates `MAGC…`, which crashes the target in the sandbox -> a Confi
 finding. angr remains the default backend; `params.backend=symqemu` selects this engine.
 
 
+## One emulator per guest (afl-qemu-trace)
+
+`afl-qemu-trace` is an emulator. It is always built for the **host**, and the **guest** it can
+run is fixed at build time by `CPU_TARGET`. So `file afl-qemu-trace` reporting "ELF 64-bit
+x86-64" tells you nothing about which binaries it can execute. Ask qemu:
+
+    $ afl-qemu-trace --version
+    qemu-aarch64 version 5.2.50
+
+That distinction is not academic. The packaged `afl-qemu-trace` on this host emulates
+**aarch64**, so `coverage_fuzz` worked on ARM64 targets and aborted at the fork-server
+handshake on x86-64 ones -- the reverse of what the file command suggests.
+
+Lykos therefore resolves one **per target**: an arch-suffixed neighbour
+(`afl-qemu-trace-arm`) or an explicit `LYKOS_AFL_QEMU_<ARCH>`, and it verifies the guest from
+that version banner before using it. Naming a file `-arm` does not make it emulate ARM, and an
+unverified one aborts mid-campaign. When nothing matches, the stage declines and prints the
+build command instead of running a campaign that cannot work.
+
+Build one per architecture you care about:
+
+    examples/afl-qemu/build.sh arm        # -> /usr/local/bin/afl-qemu-trace-arm
+    examples/afl-qemu/build.sh x86_64     # -> /usr/local/bin/afl-qemu-trace-x86-64
+    examples/afl-qemu/build.sh aarch64
+
+Build-time only (not needed at runtime): `ninja`, `meson`, `bison`, `flex`,
+`libglib2.0-dev`, `libpixman-1-dev`, `python3-dev`. Note that qemu's configure does not get on
+with very new CPython, so the script pins `/usr/bin/python3` -- if your `python3` is a venv,
+that matters.
+
+Why bother, measured on jhead:
+
+| path | exec/s |
+|---|---|
+| black-box `fuzz` through qemu-user, coverage armed | ~39 |
+| `coverage_fuzz`, AFL++ fork server (32-bit ARM) | **~1,965** |
+
+The fork server is the whole difference: it removes process startup from every execution,
+which is ~50% of a cross-architecture run. Batching the sandbox instead was measured at +20%
+and is not implemented for that reason.
+
+
 ## Test status after provisioning
 
-    make -C .. test      # or: python3 -m pytest tests
+    make ci              # lint + typecheck + GUI harnesses + tests
+    make release         # the above, plus the packaged artifact and every quality gate
 
-150 passed, 0 skipped. Real-run tests now exercised end-to-end: Ghidra headless
-decompilation, AFL++ coverage fuzzing, angr branch-solving, GDB root-cause capture, and
-SymQEMU concolic solving.
+718 passed, 14 skipped at the time of writing. The skips are the stages whose tool is absent
+on the host running them -- that is the intended behaviour, not a gap. Real-run tests exercise
+end to end: Ghidra headless decompilation, AFL++ coverage fuzzing (per-guest qemu), angr
+branch-solving, GDB root-cause capture, SymQEMU concolic solving, and the JVM path.
+
+A count in a document goes stale the moment someone adds a test; `make ci` is the answer that
+cannot.
