@@ -39,19 +39,31 @@ def test_the_ladder_ceiling_is_explained_not_just_greyed():
 
 def test_a_cross_architecture_target_loses_only_what_is_native_bound():
     un = set(cap.unavailable_summary(T("elf", OTHER, "dynamic")))
-    assert "coverage_fuzz" in un, "afl-qemu-trace is built for the host"
+    # coverage_fuzz is deliberately NOT asserted here: whether AFL++ can drive an
+    # architecture depends on which guest the installed afl-qemu-trace was built for, and on
+    # this machine that is aarch64 rather than the host. Asserting "cross-arch means no
+    # coverage" is the belief that produced a gate blocking the one architecture that worked.
     assert "heap_check" in un
     assert "fuzz" not in un, "black-box fuzzing routes through qemu-user and works"
     assert "disassemble" not in un, "Ghidra decompiles any supported ISA"
     assert "detect_cwe" not in un
 
 
-def test_a_native_dynamic_elf_has_essentially_everything():
+def test_a_native_dynamic_elf_loses_nothing_without_a_stated_reason():
     """The map must not INVENT restrictions. A wrong "unavailable" hides a capability that
     works and the operator has no way to discover the mistake, which is worse than an
-    available button that declines for itself."""
-    un = cap.unavailable_summary(T("elf", HOST, "dynamic"))
-    assert un == [] or un == ["multi_debug"], un      # multi_debug only if gdb is absent
+    available button that declines for itself.
+
+    The list is not hard-coded because two entries are properties of the MACHINE rather than
+    of the target: gdb may not be installed, and whether AFL++ can drive this architecture
+    depends on which guest its afl-qemu-trace was built for. What must hold is that every
+    exclusion names a real, checkable reason."""
+    t = T("elf", HOST, "dynamic")
+    un = cap.unavailable_summary(t)
+    assert set(un) <= {"multi_debug", "coverage_fuzz"}, un
+    for stage in un:
+        why = cap._why_unavailable(stage, t)
+        assert why and len(why) > 40, (stage, why)
 
 
 def test_static_linking_only_blocks_the_preload_checker():
