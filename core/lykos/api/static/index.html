@@ -387,6 +387,18 @@ tr.tierhd b{font-size:11.5px;letter-spacing:.04em;text-transform:uppercase}
 .tcount{display:inline-block;min-width:18px;padding:0 5px;margin-left:6px;border-radius:8px;
   background:var(--line,#2a3038);font-size:10.5px}
 .thint{margin-left:10px;color:var(--faint);font-size:10.5px;font-weight:400;text-transform:none}
+/* Runs grouped by the binary they ran against. A flat list of 28 across four targets says
+   nothing about which belongs to which, and truncating it silently swallowed the only
+   failure. */
+.rungrp{margin-bottom:8px}
+.rungrphd{display:flex;justify-content:space-between;align-items:center;padding:3px 6px;
+  border-bottom:1px solid var(--line,#2a3038);margin-bottom:4px;font-size:11px}
+.rungrphd .dim{color:var(--faint);font-size:10.5px}
+.runmore{text-align:center;padding:5px;color:var(--faint);font-size:11px;cursor:pointer;
+  border:1px dashed var(--line,#2a3038);border-radius:5px;margin-top:4px}
+.runmore:hover{color:var(--fg);border-color:var(--teal,#3aa)}
+.runerr{margin:3px 0 0 6px;padding:4px 6px;border-left:2px solid #c4564f;
+  background:rgba(196,86,79,.09);color:#e0a9a5;font-size:10.5px;white-space:pre-wrap}
 </style>
 </head>
 <body>
@@ -588,7 +600,7 @@ function switchView(v){
   if(sm) sm.hidden = v!=="sysmap";
   if(rp) rp.hidden = v!=="report";
   if(v==="board") loadBoard();
-  if(v==="sysmap") loadSystemMap(true);
+  if(v==="sysmap") loadSystemMap(false);   // show what is known; resolving is a stage
   if(v==="report") renderReport();
 }
 
@@ -876,6 +888,25 @@ async function doImportCase(file){
 
 // ---- system map (component graph, doc 17.1) ----
 let SYSMAP={nodes:[],edges:[]};
+// Resolving links is the `link_case` STAGE, not a side effect of fetching the map.
+//
+// `GET /systemmap?resolve=1` calls resolve_case() -- the same function link_case_stage calls
+// -- but synchronously, inside the HTTP request. So the one stage of the twenty-nine that the
+// GUI could not launch was in fact reachable, and doing it that way cost everything the job
+// queue provides: no run row, no progress, no cancel, no cached result, and no event, so
+// nothing in the run list or the report ever recorded that linking had happened. On a case
+// with many components the request simply blocks.
+async function doResolveLinks(){
+  const b=document.getElementById("resolvebtn");
+  if(b){ b.disabled=true; b.textContent="resolving…"; }
+  const d=await postRun(null, "link_case", {});
+  if(!d){ if(b){ b.disabled=false; b.textContent="↻ Resolve links"; } return; }
+  // link.done already refreshes the map (see the event handler); this is the fallback for a
+  // run that finishes before the socket delivers it
+  setTimeout(()=>{ loadSystemMap(false);
+    if(b){ b.disabled=false; b.textContent="↻ Resolve links"; } }, 1200);
+}
+
 async function loadSystemMap(resolve){
   const el=document.getElementById("sysmap"); if(!el||!CUR) return;
   el.innerHTML=`<div class="empty">Resolving component links…</div>`;
@@ -894,7 +925,7 @@ function renderSystemMap(){
   const head=`<div class="cardhead" style="margin-bottom:8px">
       <span class="eyebrow">Component graph — ${nodes.length} components · ${edges.length} links${badges?' · '+badges:''}</span>
       <div class="smtools">
-        <button class="btn sm" onclick="loadSystemMap(true)" title="Re-resolve import/export links across all components">↻ Resolve links</button>
+        <button class="btn sm" id="resolvebtn" onclick="doResolveLinks()" title="Re-resolve import/export links across all components">↻ Resolve links</button>
         <button class="btn sm" id="ipcbtn" onclick="doModelIpc()" title="Discover IPC channels (socket/pipe/shm/mq) and pair producers with consumers">Model IPC</button>
         <button class="btn sm" id="xtaintbtn" onclick="doCrossTaint()" title="Propagate taint across resolved edges: source in A → sink in B">Cross-taint</button>
         <button class="btn sm" id="detbtn" onclick="doWholeSystem()" title="Whole-system detonation: run the components together over their real IPC and blame a crash in one on the input that entered another">Detonate</button>
@@ -1040,6 +1071,7 @@ async function refresh(){
   if(!CUR) return;
   const [targets, runs] = await Promise.all([api(`/cases/${CUR}/targets`), api(`/cases/${CUR}/runs`)]);
   RUNS = runs;
+  TARGET_NAME={}; for(const t of targets) TARGET_NAME[t.id]=t.filename;
   renderTargets(targets); renderRuns(runs);
   document.getElementById("casesub").textContent = `${targets.length} targets · ${runs.length} runs`;
   document.getElementById("tcount").textContent = targets.length;
@@ -1066,7 +1098,7 @@ async function removeTarget(id, name, ev){
   if(res && res.error){ alert("Remove failed: "+res.error); return; }
   if(DETAIL_TID===id){ DETAIL_TID=null; const c=document.getElementById("detailcard"); if(c) c.hidden=true; }
   await refresh();
-  if(typeof SYSMAP!=="undefined" && SYSMAP) loadSystemMap(true);   // keep the System Map consistent
+  if(typeof SYSMAP!=="undefined" && SYSMAP) loadSystemMap(false);  // keep the System Map consistent
 }
 function mits(m){
   if(!m) return `<span class="mit unknown">?</span>`;
@@ -1074,10 +1106,51 @@ function mits(m){
     const v=m[k]||"unknown"; return `<span class="mit ${v}">${k}</span>`;
   }).join("");
 }
+// filename by target id, so a run row can say WHICH binary it ran against
+let TARGET_NAME={};
+let RUNS_ALL=false;
+function toggleAllRuns(){ RUNS_ALL=!RUNS_ALL; renderRuns(RUNS); }
+
+// One walkthrough left 28 runs across 24 stages in a flat list truncated to 14, with no
+// target name on any row. With four binaries in the case you could not tell which run
+// belonged to which, and the fourteen oldest -- including the one that ERRORED -- were simply
+// not rendered, with nothing on screen saying so.
 function renderRuns(rs){
   const el=document.getElementById("runs");
   if(!rs.length){ el.innerHTML=`<div class="empty">No runs yet.</div>`; return; }
-  el.innerHTML = rs.slice(0,14).map(r=>{
+  const live=r=>r.status==="running"||r.status==="queued";
+  const bad=r=>r.status==="error";
+  // Group FIRST, then cap within each group. Capping the flat list first lets one busy target
+  // crowd another out entirely -- with four binaries and ten slots, the last two show no runs
+  // at all, which is the "which run belongs to which binary" problem in a new shape.
+  const groups=new Map();
+  for(const r of rs){
+    const k=r.target_id||"__case__";
+    if(!groups.has(k)) groups.set(k,[]);
+    groups.get(k).push(r);
+  }
+  const PER=5;
+  let hidden=0;
+  const sec=[...groups.entries()].map(([k,all])=>{
+    // Never hide a failure or something still moving, whatever the cap: a truncation that can
+    // swallow the only error is worse than a long list.
+    const list = RUNS_ALL ? all : all.filter((r,i)=>i<PER||live(r)||bad(r));
+    hidden += all.length-list.length;
+    const nm = k==="__case__" ? "case-level" : (TARGET_NAME[k]||k.slice(0,8));
+    const nerr=all.filter(bad).length, nlive=all.filter(live).length;
+    const chips=(nerr?`<span class="pill error">${nerr} error${nerr!==1?"s":""}</span>`:"")
+              +(nlive?`<span class="pill running">${nlive} active</span>`:"");
+    return `<div class="rungrp"><div class="rungrphd"><span class="mono">${esc(nm)}</span>
+      <span class="runmeta"><span class="dim">${all.length} run${all.length!==1?"s":""}</span>${chips}</span></div>`
+      + list.map(_runRowHtml).join("") + `</div>`;
+  }).join("");
+  el.innerHTML = sec + (hidden>0||RUNS_ALL
+    ? `<div class="runmore" onclick="toggleAllRuns()">${RUNS_ALL
+        ? "show fewer" : `show ${hidden} older run${hidden!==1?"s":""}`}</div>`
+    : "");
+}
+
+function _runRowHtml(r){
     const t=r.ended_at||r.started_at||r.created_at;
     const dur=(r.started_at&&r.ended_at)?` · ${Math.max(0,r.ended_at-r.started_at)}s`:"";
     const when=t?`<span class="mono runtime" title="${new Date(t*1000).toLocaleString()}">${fmtAgo(t)}${dur}</span>`:"";
@@ -1098,9 +1171,12 @@ function renderRuns(rs){
     const stop = running
       ? `<button class="btn sm" title="Stop this run" onclick="cancelRun('${r.id}')">Stop</button>`
       : "";
+    // A failed run said "error" and nothing else; the reason was in the API response and
+    // nowhere on screen, so the only way to see it was to re-run and watch.
+    const err = (r.status==="error" && r.error)
+      ? `<div class="runerr mono">${esc(String(r.error).slice(0,300))}</div>` : "";
     return `<div class="runrowbox"><div class="kv runrow"><span class="mono">${r.stage} <span style="color:var(--faint)">${r.id.slice(0,8)}</span></span>
-     <span class="runmeta">${when}<span class="pill ${r.status}">${r.status}</span>${stop}</span></div>${bar}</div>`;
-  }).join("");
+     <span class="runmeta">${when}<span class="pill ${r.status}">${r.status}</span>${stop}</span></div>${bar}${err}</div>`;
 }
 async function cancelRun(id){
   logline("ui", "stopping run "+id.slice(0,8));
@@ -1774,10 +1850,12 @@ async function loadPocs(tid){
 }
 // shared run launcher: POSTs, returns {run_id}, and seeds a live progress bar
 async function postRun(tid, stage, params, {liveMax=null, status=null}={}){
+  // a case-level stage (link_case, ipc_model, cross_taint, whole_system) has no target
   const st=document.getElementById("fuzzstat"); if(st && status) st.textContent=status;
   let r;
   try{ r=await fetch("/runs",{method:"POST",headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({case_id:CUR,target_id:tid,stage,params})}); }
+    body:JSON.stringify(tid?{case_id:CUR,target_id:tid,stage,params}
+                            :{case_id:CUR,stage,params})}); }
   catch(e){ if(st) st.textContent=stage+" failed to start"; return null; }
   if(!r.ok){ if(st) st.textContent=`${stage} failed to start (HTTP ${r.status})`; return null; }
   let d={}; try{ d=await r.json(); }catch(e){}
@@ -2381,7 +2459,7 @@ function ACTIONS(){ return [
     {label:"Open Findings Board", hint:"2", run:()=>switchView("board")},
     {label:"Open System Map", hint:"3", run:()=>switchView("sysmap")},
     {label:"Open Report builder", hint:"4", run:()=>switchView("report")},
-    {label:"Resolve component links", run:()=>{switchView("sysmap");loadSystemMap(true);}},
+    {label:"Resolve component links", run:()=>{switchView("sysmap");doResolveLinks();}},
     {label:"Analyze cross-binary taint", run:()=>{switchView("sysmap");doCrossTaint();}},
     {label:"Model IPC channels", run:()=>{switchView("sysmap");doModelIpc();}},
     {label:"Detonate whole system", run:()=>{switchView("sysmap");doWholeSystem();}},
