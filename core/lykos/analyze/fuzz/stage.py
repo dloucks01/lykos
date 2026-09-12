@@ -170,7 +170,10 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
             results = [run_fn(exe, mode, workfile, exec_timeout, target.arch, inputs[0],
                               endianness=target.endianness, bits=target.bits)[1]]
         for data, res in zip(inputs, results):
-            argv = invocation(mode, workfile, data)[0]
+            # A crash found under an option only reproduces WITH that option: jhead's `-cmd`
+            # runs a command built from the input, and replaying without it is a different
+            # program. The prefix is per-batch, so it is recorded with the input it crashed.
+            argv = list(prefix) + invocation(mode, workfile, data)[0]
             execs += 1
             # Keep anything that made the program behave in a way we have not seen. This is the
             # ratchet: without it the corpus never grows and a deeper path is reachable only by a
@@ -222,7 +225,7 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
                     execs += mexecs
                     note = (f"minimized {len(data)}->{len(mdata)}B"
                             if len(mdata) < len(data) else None)
-                    margv = invocation(mode, workfile, mdata)[0]
+                    margv = list(prefix) + invocation(mode, workfile, mdata)[0]
                     input_sha = ctx.put_artifact("fuzz-crash-input", data=mdata)
                     dd.insert(target.id, target.case_id, run_id=ctx.run_id, input_sha=input_sha,
                               input_mode=mode, argv=margv, signal=res.signal, signal_name=sig,
