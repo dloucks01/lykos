@@ -348,10 +348,17 @@ def detect_stage(ctx) -> dict:
         c["run_id"] = ctx.run_id
         fd.upsert(target.id, target.case_id, c)
     counts = fd.counts_by_state(target.id)
-    ctx.emit("findings.done", payload={"candidates": len(cands), "states": counts,
+    total = sum(counts.values()) if counts else 0
+    ctx.emit("findings.done", payload={"findings": total, "sites": len(cands),
+                                       "states": counts,
                                        "library_sites_skipped": dropped,
                                        "derefs": len(guards), "guarded_derefs": n_guarded})
-    ctx.progress(pct=100, msg="%d candidate findings" % len(cands))
+    # The number the OPERATOR will see on the board, not the pre-dedup candidate list.
+    # `cands` is one entry per SITE and upsert merges them by dedup_key, so jhead reported
+    # "404 candidate findings" for a board holding 24 -- a 17x mismatch between the progress
+    # line and the screen, which costs trust in both numbers rather than just the wrong one.
+    ctx.progress(pct=100, msg="%d finding%s from %d site%s" % (
+        total, "" if total == 1 else "s", len(cands), "" if len(cands) == 1 else "s"))
     return {}
 
 

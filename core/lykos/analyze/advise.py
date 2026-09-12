@@ -44,13 +44,23 @@ def _input_mode(imports: list) -> tuple:
     return "arg", "argv/none"
 
 
-def fuzz_backend(afl_usable: bool, static_findings: int) -> tuple:
+def fuzz_backend(afl_usable: bool, static_findings: int,
+                 coverage_blocked: Optional[str] = None) -> tuple:
     """(stage, why) -- which fuzzer to reach for first.
 
     Coverage feedback beats sink-direction by a wide margin on real code, and unlike
     `directed` it does not need the target decompiled and detected first, so it also
     shortens the path to the first crash.
+
+    `coverage_blocked` is the reason AFL++ cannot drive THIS target -- a cross-architecture
+    binary, a PE, a jar. "AFL++ is installed" and "AFL++ can run this" are different
+    questions, and conflating them made coverage_fuzz the first recommendation for every one
+    of the eleven non-host architectures in the corpus, where it completes and reports zero
+    crashes without having executed anything.
     """
+    if afl_usable and coverage_blocked:
+        return ("fuzz", f"coverage-guided fuzzing is not available for this target -- "
+                        f"{coverage_blocked} Black-box mutation is what can actually run it")
     if afl_usable:
         return ("coverage_fuzz",
                 "AFL++ is available — coverage-guided fuzzing explores new paths instead of "
@@ -68,7 +78,8 @@ def advise(*, imports: list, functions: int, findings: int, seeds: int,
            has_format: bool, afl_usable: bool, crashes: int = 0,
            pocs: int = 0, executable: Optional[bool] = None,
            file_format: Optional[str] = None,
-           invocation: Optional[dict] = None) -> dict:
+           invocation: Optional[dict] = None,
+           coverage_blocked: Optional[str] = None) -> dict:
     """A recommendation and an ORDERED PLAN for this target.
 
     The plan is dynamic-first on purpose. Running decompile -> detect -> maybe-fuzz produces
@@ -95,6 +106,7 @@ def advise(*, imports: list, functions: int, findings: int, seeds: int,
                           "params": {}, "ready": True, "done": False}],
                 "file_parser": False, "afl_usable": afl_usable, "analysable": False}
     mode, shape = _input_mode(imports)
+    blocked = coverage_blocked
     # A binary that documents a REQUIRED `-c <config>` has told us what its input is, and it
     # said so in a channel that survives both stripping and static linking. That is exactly the
     # target the import-table check cannot read, so this is not a tie-break -- it is the only
@@ -108,7 +120,7 @@ def advise(*, imports: list, functions: int, findings: int, seeds: int,
         # channel the program insists on. On a jar the imports are method names, so `read`
         # and `readObject` made a config-driven service look stdin-driven.
         mode, shape = "file", f"a config file behind {cfg_flag['flag']}"
-    backend, backend_why = fuzz_backend(afl_usable, findings)
+    backend, backend_why = fuzz_backend(afl_usable, findings, blocked)
     if mode is None:
         # Say what is missing and what to do, rather than guessing a channel. Feeding a target
         # the wrong way is the failure that looks exactly like a program with no bug.

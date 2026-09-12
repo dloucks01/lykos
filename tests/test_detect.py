@@ -531,3 +531,17 @@ def test_a_credential_the_code_reads_is_corroborated():
     assert by_addr["0x3000"]["state"] == "corroborated", "the code reads this one"
     assert any(e["channel"] == "xref" for e in by_addr["0x3000"]["evidence"])
     assert by_addr["0x3100"]["state"] == "candidate", "nothing references this one"
+
+
+def test_the_progress_line_counts_findings_not_sites():
+    """detect_cwe reported "404 candidate findings" for a board holding 24: `cands` is one
+    entry per SITE and upsert merges them by dedup_key. A 17x mismatch between the progress
+    line and the screen costs trust in both numbers, not just the wrong one."""
+    import inspect
+
+    from lykos.analyze.detect import stage as dstage
+    src = inspect.getsource(dstage.detect_stage)
+    assert 'msg="%d candidate findings" % len(cands)' not in src
+    assert "%d finding%s from %d site%s" in src
+    # the event carries both, separately named
+    assert '"findings": total' in src and '"sites": len(cands)' in src

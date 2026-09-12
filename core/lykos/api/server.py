@@ -340,6 +340,13 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             self._json({"error": repr(e)}, 500)
 
+    def _coverage_blocked(self, t):
+        try:
+            from ..analyze.fuzz.coverage import _unsupported
+            return _unsupported(t)
+        except Exception:
+            return None
+
     def _target_strings(self, s, tid):
         """The target's strings -- from the DB if `disassemble` has run, else scanned from the
         bytes. Requiring Ghidra first would put the answer to "how do I run this" behind the
@@ -500,7 +507,11 @@ class Handler(BaseHTTPRequestHandler):
                 # triage could not name a format, so there is nothing here to run
                 executable=bool(t.file_type and t.file_type not in ("raw", "other")),
                 file_format=t.file_type,
-                crashes=crashes, pocs=len(pocs), invocation=found)
+                crashes=crashes, pocs=len(pocs), invocation=found,
+                # One source of truth for "can AFL++ run THIS target": the stage's own gate.
+                # Advice that says coverage_fuzz while the stage declines it is a plan that
+                # dead-ends one click later.
+                coverage_blocked=self._coverage_blocked(t))
             if found and found.get("flags"):
                 out["invocation"] = found
             return self._json(out)
