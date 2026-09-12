@@ -311,16 +311,23 @@ def main():
     for _ in range(count):
         (ln,) = struct.unpack("<I", _readn(4))
         data = _readn(ln)
+        # "@@" marks where the target wants its input; without it the carrier is appended.
         if mode == "arg":
-            argv = [exe] + base_argv + [data.split(b"\x00", 1)[0].decode("latin-1")]
-            stdin = b""
+            carrier = data.split(b"\x00", 1)[0].decode("latin-1")
         elif mode == "file":
             with open(wf, "wb") as fh:
                 fh.write(data)
-            argv = [exe] + base_argv + [wf]
+            carrier = wf
+        else:
+            carrier = None
+        if carrier is None:
+            argv, stdin = [exe] + base_argv, data
+        elif "@@" in base_argv:
+            argv = [exe] + [carrier if a == "@@" else a for a in base_argv]
             stdin = b""
         else:
-            argv, stdin = [exe] + base_argv, data
+            argv = [exe] + base_argv + [carrier]
+            stdin = b""
         reached, fault_pc = [], 0
         if blocks:
             rc, so, se, flags, reached, fault_pc = _trace_one(libc, argv, stdin, per_timeout,

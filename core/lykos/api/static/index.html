@@ -1151,6 +1151,7 @@ async function showDetail(targetId){
                 <option value="stdin">stdin</option><option value="arg">argv</option>
                 <option value="file">file (parser)</option><option value="none">no input</option>
               </select>
+              <input id="dynargv" class="inp" placeholder="argv, e.g. -c @@" style="max-width:190px" title="How the target must be invoked. Space-separated. Use @@ where the input belongs -- a service that needs a config path is &quot;-c @@&quot;. Without this a target that requires a flag prints its usage and exits on every execution, which looks exactly like a campaign that found nothing.">
               <label class="btn sm seedlbl" title="Attach valid sample files as fuzzing seeds -- essential for file-format parsers (PDF/image/doc): the mutator starts from real structure">+ seeds<input type="file" id="seedfiles" multiple style="display:none" onchange="onSeedFiles(this.files)"></label>
               <span class="mono" id="seedcount" style="color:var(--faint);font-size:10.5px"></span>
               <span class="vsep"></span>
@@ -1303,10 +1304,54 @@ async function recommendFuzz(){
     <ul class="gcheck">${checks}</ul>
     <div class="ghd" style="margin-top:8px">◈ Plan — evidence first</div>
     <ul class="gcheck">${plan}</ul>
+    ${invocationBlock(a.invocation)}
     <button class="btn sm gapply" onclick="applyFuzzRecommendation('${esc(a.input_mode)}','${esc(_stratOpt(a.backend))}',${!!a.file_parser})">Apply this setup</button>`;
   g.hidden=false;
 }
 let ADVICE=null;
+
+// ---- how this target has to be INVOKED -------------------------------------------------
+// A service behind "-c <config> -d <display> -j <app.jar>" prints its usage and exits without
+// them, so every execution is identical and the campaign reports a clean run. These flags are
+// read off the binary's own usage line and getopt string; the values are a TEMPLATE, because
+// an instance id or a display is site-specific and no binary can tell us yours.
+function invocationBlock(inv){
+  if(!inv || !(inv.flags||[]).length) return "";
+  const argv=(inv.proposed_argv||[]).join(" ");
+  const flags=inv.flags.map(f=>`<li><span class="ck ${f.takes_value?'':'ok'}">${f.takes_value?'·':'✓'}</span>`
+    +`<span><code>${esc(f.flag)}</code> — ${esc(f.takes_value?(f.kind||"value"):"switch")}`
+    +`${f.default?` <span class="dim">(${esc(f.default)})</span>`:""}</span></li>`).join("");
+  return `<div class="ghd" style="margin-top:8px">◈ Invocation — ${esc(inv.confidence)} confidence
+      <span class="dim">(from ${esc((inv.sources||[]).join(" + ")||"—")})</span></div>
+    ${inv.usage?`<div class="grec mono" style="font-size:11px">${esc(inv.usage)}</div>`:""}
+    <ul class="gcheck">${flags}</ul>
+    ${argv?`<div class="grec mono" style="font-size:11px">${esc(argv)}</div>`:""}
+    <div class="dim" style="font-size:11px;margin:4px 0">Values are placeholders — an id or a
+      display is specific to your deployment. Check it before you trust it.</div>
+    <button class="btn sm" onclick="useInvocation()">Use this argv</button>
+    <button class="btn sm" onclick="checkInvocation()">Check it runs</button>
+    <span id="invverdict" class="dim" style="font-size:11px"></span>`;
+}
+function useInvocation(){
+  const d=document.getElementById("dynargv");
+  if(d) d.value=((ADVICE&&ADVICE.invocation&&ADVICE.invocation.proposed_argv)||[]).join(" ");
+}
+// Run it. A proposal read off the strings is a hypothesis, and applying one unchecked is the
+// failure it exists to prevent -- unzip needs no flags at all, and "-d <dir> -x x" is a worse
+// command line than none. The target's own refusal is quoted back.
+async function checkInvocation(){
+  const v=document.getElementById("invverdict"); if(!v) return;
+  const argv=(document.getElementById("dynargv")?.value||"").trim().split(/\s+/).filter(Boolean);
+  v.textContent=" running…";
+  try{
+    const r=await api(`/targets/${DETAIL_TID}/invocation`, {method:"POST",
+      body:JSON.stringify({argv:argv.length?argv:undefined})});
+    const ver=r.verified||{};
+    v.innerHTML = ver.accepted
+      ? ` <span class="ck ok">✓</span> ${esc(ver.why)}`
+      : ` <span class="ck no">!</span> ${esc(ver.why)}`;
+  }catch(e){ v.textContent=" check failed: "+e; }
+}
 // the server names stages; the strategy <select> uses short option values
 function _stratOpt(stage){
   return {coverage_fuzz:"coverage", directed_fuzz:"directed", fuzz:"fuzz",
@@ -1599,11 +1644,18 @@ async function doDynamic(tid){
   const b64 = raw ? btoa(unescape(encodeURIComponent(raw))) : "";
   await postRun(tid, "dynamic_run", {input_b64:b64,input_mode:mode,timeout:10}, {status:"running once…"});
 }
+// How the target must be invoked. "@@" marks where the input goes; a service that takes a
+// config path is "-c @@". Ignoring this ran such a target as `daemon <workfile>`, which
+// prints usage and exits -- 8,000 executions reporting one behaviour and no crashes.
+function argvParams(){
+  const raw=(document.getElementById("dynargv")?.value||"").trim();
+  return raw ? {argv: raw.split(/\s+/)} : {};
+}
 async function doFuzz(tid){
   const mode = document.getElementById("dynmode").value;
   const max_execs=5000;
   await postRun(tid, "fuzz", {input_mode:(mode==="none"?"stdin":mode),max_execs,max_seconds:30,
-    ...seedParams(),...fmtParams()}, {liveMax:max_execs, status:"black-box fuzzing…"});
+    ...argvParams(),...seedParams(),...fmtParams()}, {liveMax:max_execs, status:"black-box fuzzing…"});
 }
 async function doCoverage(tid){
   const mode = document.getElementById("dynmode").value;
@@ -1614,7 +1666,7 @@ async function doDirected(tid){
   const mode = document.getElementById("dynmode").value;
   const max_execs=6000;
   await postRun(tid, "directed_fuzz", {input_mode:(mode==="none"?"stdin":mode),max_execs,max_seconds:30,
-    ...seedParams(),...fmtParams()}, {liveMax:max_execs, status:"directed fuzzing…"});
+    ...argvParams(),...seedParams(),...fmtParams()}, {liveMax:max_execs, status:"directed fuzzing…"});
 }
 async function doBoundary(tid){
   await postRun(tid, "boundary_fuzz", {}, {status:"boundary harness…"});
@@ -1622,7 +1674,7 @@ async function doBoundary(tid){
 async function doSynthesize(tid){
   const mode = document.getElementById("dynmode").value;
   await postRun(tid, "synthesize_poc",
-    {input_mode:(mode==="none"?undefined:mode), timeout:8},
+    {input_mode:(mode==="none"?undefined:mode), timeout:8, ...argvParams()},
     {status:"synthesizing overflow from recovered frame (no fuzzing)…"});
 }
 async function doMonitor(tid){

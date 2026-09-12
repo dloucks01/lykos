@@ -460,3 +460,47 @@ def test_a_check_that_could_not_run_does_not_report_ok():
     i_guard = src.index('"applicable": False')
     i_ok = src.index('"ok": True, "errors": len(errors)')
     assert i_guard < i_ok, "the not-applicable verdict must come before the ok one"
+
+
+def test_advice_carries_the_discovered_invocation_and_checks_it(api, tmp_path):
+    """A service behind `-c <config> -d <display>` prints its usage and exits without them, so
+    every execution is identical and the campaign reports a clean run against a program it
+    never entered. The advice now carries the flags the binary itself documents -- and the
+    proposal is CHECKED by running it, because a proposal read off the strings is a hypothesis
+    and applying one unchecked is the failure it exists to prevent."""
+    import shutil as _sh
+    import subprocess
+    if not _sh.which("cc"):
+        pytest.skip("no C compiler")
+    src = tmp_path / "svc.c"
+    src.write_text(
+        "#include <stdio.h>\n#include <unistd.h>\n"
+        "int main(int argc,char**argv){int o;char*c=0,*d=0;\n"
+        " while((o=getopt(argc,argv,\"c:d:v\"))!=-1){"
+        "if(o=='c')c=optarg; else if(o=='d')d=optarg;}\n"
+        " if(!c||!d){fprintf(stderr,\"usage: %s -c <config> -d <display-id>\\n\",argv[0]);"
+        "return 2;}\n"
+        " FILE*f=fopen(c,\"rb\"); if(f){char b[4096];fread(b,1,sizeof b,f);fclose(f);}\n"
+        " return 0;}\n")
+    exe = tmp_path / "svc"
+    if subprocess.run(["cc", "-w", "-o", str(exe), str(src)]).returncode != 0:
+        pytest.skip("compile failed")
+
+    st, case = _json(api, "POST", "/cases", {"name": "inv"})
+    st, t = _upload(api, case["id"], "svc", exe.read_bytes())
+    tid = t["id"]
+    # deliberately WITHOUT running disassemble: how to invoke a target is the first question
+    # an operator has, and putting it behind a Ghidra run would answer it after the campaign
+    # it was needed to set up.
+    st, adv = _json(api, "GET", f"/targets/{tid}/advice")
+    assert st == 200, adv
+    inv = adv.get("invocation")
+    assert inv, "advice should carry the invocation read off the binary"
+    assert {f["flag"] for f in inv["flags"]} >= {"-c", "-d"}
+    assert "@@" in inv["proposed_argv"], inv["proposed_argv"]
+
+    st, got = _json(api, "POST", f"/targets/{tid}/invocation", {"timeout": 30})
+    assert st == 200, got
+    v = got["verified"]
+    assert v["bare_rejected"], "bare svc prints its usage and exits 2"
+    assert v["accepted"], v["why"]

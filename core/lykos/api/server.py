@@ -10,6 +10,7 @@ import json
 import os
 import re
 import select
+import shutil
 import signal
 import socket
 import tarfile
@@ -71,6 +72,7 @@ class TcpHTTPServer(ThreadingHTTPServer):
 # --------------------------------------------------------------------------- handler
 _RUN_ID = re.compile(r"^/runs/([^/]+)$")
 _RUN_CANCEL = re.compile(r"^/runs/([^/]+)/cancel$")
+_TARGET_INVOKE = re.compile(r"^/targets/([^/]+)/invocation$")
 _CASE_ID = re.compile(r"^/cases/([^/]+)$")
 _TARGET_ID = re.compile(r"^/targets/([^/]+)$")
 _ARTIFACT = re.compile(r"^/artifacts/([0-9a-fA-F]+)$")
@@ -327,6 +329,9 @@ class Handler(BaseHTTPRequestHandler):
             m = _RUN_CANCEL.match(path)
             if m:
                 return self._cancel_run(m.group(1))
+            m = _TARGET_INVOKE.match(path)
+            if m:
+                return self._check_invocation(m.group(1))
             if path == "/format/analyze":
                 return self._format_analyze()
             if path == "/import":
@@ -334,6 +339,57 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": "not found"}, 404)
         except Exception as e:
             self._json({"error": repr(e)}, 500)
+
+    def _target_strings(self, s, tid):
+        """The target's strings -- from the DB if `disassemble` has run, else scanned from the
+        bytes. Requiring Ghidra first would put the answer to "how do I run this" behind the
+        analysis it is needed to set up."""
+        from ..analyze import invocation as invmod
+        rows = [x.value for x in StringDAO(s.conn).list_by_target(tid) if x.value]
+        if rows:
+            return rows
+        t = s.targets.get(tid)
+        return invmod.raw_strings(s.content.path(t.sha256).read_bytes()) if t else []
+
+    def _check_invocation(self, tid):
+        """Propose a command line for this target -- and RUN it to see if the target accepts.
+
+        A proposal read off the strings is a hypothesis. Applying one unchecked produces the
+        exact failure it exists to fix: unzip needs no flags, and `-d <dir> -x x` is a worse
+        command line than none at all. The target's own refusal is quoted back.
+        """
+        from ..analyze import invocation as invmod
+        from ..analyze.dynamic import sandbox
+        s = self._store()
+        try:
+            t = s.targets.get(tid)
+            if not t:
+                return self._json({"error": "no target"}, 404)
+            body = json.loads(self._read_body() or b"{}")
+            found = invmod.discover(self._target_strings(s, tid),
+                                    usage_hint=body.get("usage_hint"))
+            argv = body.get("argv") or invmod.propose_argv(found)
+            found["proposed_argv"] = argv
+            if not body.get("verify", True) or not argv:
+                return self._json(found)
+            d = Path(tempfile.mkdtemp(prefix="lykos-invocation-"))
+            try:
+                exe = d / "target.bin"
+                exe.write_bytes(s.content.path(t.sha256).read_bytes())
+                os.chmod(exe, 0o755)
+                sample = d / "sample.bin"
+                sample.write_bytes(base64.b64decode(body["sample_b64"])
+                                   if body.get("sample_b64") else b"name=lykos\n")
+
+                def _run(a):
+                    return sandbox.run(exe, argv=a, stdin=b"", timeout=float(body.get(
+                        "timeout", 15)), arch=t.arch, endianness=t.endianness, bits=t.bits)
+                found["verified"] = invmod.verify(_run, exe, argv, str(sample))
+            finally:
+                shutil.rmtree(d, ignore_errors=True)
+            return self._json(found)
+        finally:
+            s.close()
 
     def _cancel_run(self, run_id):
         """Stop a running stage.
@@ -410,6 +466,25 @@ class Handler(BaseHTTPRequestHandler):
                 # triage stores imports as {"libraries": [...], "symbols": [...]}
                 imp = rec.get("imports") or {}
                 imports = list(imp.get("symbols") or []) if isinstance(imp, dict) else list(imp)
+            if not imports:
+                # A statically linked binary has no import table, but its symbol table still
+                # names fopen/fgets/read -- the same evidence, in the other place. Without
+                # this a config-driven daemon was reported as "argv/none".
+                try:
+                    from ..analyze.poc.exploit import elf_functions
+                    blob = s.content.path(t.sha256).read_bytes()
+                    imports = list(elf_functions(blob))
+                except Exception:
+                    imports = []
+            # How to invoke it, read off the binary's own usage line and option string. Static
+            # only here: advice must stay fast, and running the target to CHECK the proposal
+            # is what POST /targets/<id>/invocation is for.
+            try:
+                from ..analyze import invocation as invmod
+                found = invmod.discover(self._target_strings(s, tid))
+                found["proposed_argv"] = invmod.propose_argv(found)
+            except Exception:
+                found = None
             crashes = sum(1 for d in DynResultDAO(s.conn).list_by_target(tid) if d.crashed)
             pocs = [p for p in PocDAO(s.conn).list_by_target(tid) if p.verified]
             out = advise_mod.advise(
@@ -423,7 +498,9 @@ class Handler(BaseHTTPRequestHandler):
                 # triage could not name a format, so there is nothing here to run
                 executable=bool(t.file_type and t.file_type not in ("raw", "other")),
                 file_format=t.file_type,
-                crashes=crashes, pocs=len(pocs))
+                crashes=crashes, pocs=len(pocs), invocation=found)
+            if found and found.get("flags"):
+                out["invocation"] = found
             return self._json(out)
         finally:
             s.close()
