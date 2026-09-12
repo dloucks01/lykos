@@ -19,7 +19,13 @@ from __future__ import annotations
 
 from collections import defaultdict, deque
 
-from .catalog import DANGEROUS, SINK_TAINT_ARGS, SOURCES, normalize
+from .catalog import (
+    DANGEROUS,
+    OUT_PARAM_SOURCES,
+    SINK_TAINT_ARGS,
+    SOURCES,
+    normalize,
+)
 
 # Per-arch calling convention (register NAMES, upper-cased; families cover sub-registers).
 # Per-arch calling convention. "frame" lists the registers that legitimately serve as a
@@ -190,7 +196,7 @@ def _frame_slot(toks, consts, bases, aliases):
     return None
 
 
-def _track_alias(outk, mnem, toks, consts, bases, aliases):
+def _track_alias(outk, mnem, toks, consts, bases, aliases, slots=None):
     """Maintain `register -> (frame base, offset)` for DERIVED frame bases.
 
     SuperH (and others) stage a scratch pointer instead of addressing the frame register
@@ -206,6 +212,17 @@ def _track_alias(outk, mnem, toks, consts, bases, aliases):
         return
     if mnem == "COPY" and len(toks) >= 2:
         src = _base_of(_key(toks[1]), bases, aliases)
+        if src is None and slots is not None:
+            # The address was computed into a UNIQUE earlier in this same instruction:
+            #   INT_ADD RBP,-0x210 -> unique ; COPY unique -> RAX
+            # `slots` holds that fact, but this function only consulted `aliases`, and
+            # `aliases` is never written for a unique (it returns early unless the output is a
+            # register). So the chain unique -> RAX -> RDI never started, and no register ever
+            # became a known pointer into the frame -- which is why a buffer's address could
+            # not be recognised at a call site.
+            sl = slots.get(_key(toks[1]))
+            if sl is not None:
+                src = (sl[1], sl[2])
         if src is not None:
             aliases[outk] = src
             return
@@ -250,7 +267,7 @@ def _apply(taint, ops, bases=(), aliases=None, mem_out=None, via=None):
             if slot is not None:
                 slots[outk] = slot
 
-        _track_alias(outk, mnem, toks, consts, bases, aliases)
+        _track_alias(outk, mnem, toks, consts, bases, aliases, slots)
 
         if mnem == "STORE":
             # STORE space, addr, value -- spill a value into a frame slot (kill on overwrite)
@@ -281,6 +298,20 @@ def _apply(taint, ops, bases=(), aliases=None, mem_out=None, via=None):
         if outk is not None and mnem in _ADDR_ARITH:
             via[outk] = [k for k in ins if k is not None]
         _define(taint, outk, any(k in taint for k in ins))
+
+        # The ADDRESS of tainted memory is itself a tainted pointer -- and this has to come
+        # AFTER the generic rule, which otherwise clears it: `RBP + const` has no tainted
+        # input, so the frame base looks clean even when the slot it names holds attacker
+        # bytes, and `_define(..., False)` discards the fact on the same instruction that
+        # established it.
+        #
+        # Without this the out-parameter seeding above is unreachable in practice.
+        # `strcpy(dst, line)` passes the ADDRESS of `line`; the argument register holds a
+        # pointer, not the bytes, so the sink check -- which asks whether an argument register
+        # is tainted -- never sees it. This is the rule that already makes argv work, applied
+        # to a buffer the program filled itself.
+        if outk is not None and slots.get(outk) in taint:
+            _define(taint, outk, True)
 
 
 # Operations that build an address out of a base and something else.
@@ -440,6 +471,11 @@ def _run(ir, abi, callmap, dstmap, func_addrs, entry_params, ret_tainted, *,
         # Argument taint is read BEFORE this instruction's own p-code runs: for a CALL the
         # arguments were staged by earlier instructions (registers, or pushes).
         argt = _arg_taints(cur, argregs_list, pushes)
+        if ext in DANGEROUS:
+            import os as _os2
+            if _os2.environ.get("LYKOS_TAINT_DEBUG"):
+                print("SINK", ext, addr, "argt:", argt[:3],
+                      "stack-taint:", [k for k in cur if k[0]=="stack"][:3])
         if ext in DANGEROUS and _sink_tainted(argt, ext):
             flagged.add(addr)
         if extmap is not None and ext_out is not None:
@@ -458,6 +494,38 @@ def _run(ir, abi, callmap, dstmap, func_addrs, entry_params, ret_tainted, *,
                 pushes.append(pushed)
         if seed_sources and ext in SOURCES:
             cur |= {("reg", r) for r in retregs}
+            # ...and, for the ones that fill a CALLER-SUPPLIED BUFFER, the buffer itself.
+            # `read(fd, buf, n)` returns a byte COUNT; the untrusted data lands in `buf`.
+            # Tainting only the return register modelled getchar() correctly and every
+            # file-reading parser not at all -- measured on a fixture with two paths to the
+            # same sink, the argv path was corroborated and the fread path was not flagged.
+            import os as _os
+            if _os.environ.get("LYKOS_TAINT_DEBUG"):
+                print("SRC", ext, "regaliases:",
+                      {k[1]: v for k, v in aliases.items() if k[0]=="reg"})
+            _bi = OUT_PARAM_SOURCES.get(ext)
+            if _bi is not None and argregs_list and _bi < len(argregs_list):
+                for _r in argregs_list[_bi]:
+                    _slot = aliases.get(("reg", _r))
+                    if _slot is not None:
+                        cur.add(("stack", _slot[0], _slot[1]))
+                        break
+            # ...and, for the ones that fill a CALLER-SUPPLIED BUFFER, the buffer itself.
+            # `read(fd, buf, n)` returns a byte count; the untrusted data is in `buf`, and
+            # tainting only the return register modelled getchar() correctly and every
+            # file-reading parser not at all. `aliases` already resolves an argument register
+            # to the frame slot it points at, which is exactly what is needed here.
+            import os as _os
+            if _os.environ.get("LYKOS_TAINT_DEBUG"):
+                print("SRC", ext, "regaliases:",
+                      {k[1]: v for k, v in aliases.items() if k[0]=="reg"})
+            _bi = OUT_PARAM_SOURCES.get(ext)
+            if _bi is not None and argregs_list and _bi < len(argregs_list):
+                for _r in argregs_list[_bi]:
+                    _slot = aliases.get(("reg", _r))
+                    if _slot is not None:
+                        cur.add(("stack", _slot[0], _slot[1]))
+                        break
         if internal:
             if tainted_params:
                 contribs[dst] = contribs.get(dst, set()) | tainted_params
