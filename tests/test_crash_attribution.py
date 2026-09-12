@@ -346,3 +346,33 @@ def test_a_legacy_crash_finding_is_still_found():
     from lykos.analyze.dynamic.stage import crash_dedup_key
     assert crash_dedup_key("SIGABRT", None) == "dynamic-crash:SIGABRT"
     assert crash_dedup_key("SIGABRT", 0) == "dynamic-crash:SIGABRT", "0 is not an address"
+
+
+def test_an_emulated_crash_still_gets_a_fault_locus():
+    """The ptrace tracer cannot reach inside qemu, so a cross-architecture crash had no
+    faulting address and every SIGSEGV in the program bucketed as one finding -- on eleven of
+    the twelve architectures the platform builds real targets for. qemu's own block log stops
+    at the fault, so the last block it translated is the closest thing to a locus available
+    there: a block address rather than the exact instruction, which is enough to tell two
+    defects apart."""
+    import pathlib
+    import shutil
+    import subprocess
+
+    import pytest
+    from lykos.analyze.dynamic import sandbox
+    exe = pathlib.Path("examples/vuln-targets/bin/jhead_aarch64").resolve()
+    bad = pathlib.Path("examples/vuln-targets/inputs/jhead-crash.jpg").resolve()
+    if not exe.exists() or not shutil.which("qemu-aarch64") or not shutil.which("readelf"):
+        pytest.skip("run examples/vuln-targets/fetch_build.sh; qemu-aarch64 needed")
+    out = subprocess.run(["readelf", "-sW", str(exe)], capture_output=True, text=True).stdout
+    blocks = tuple(sorted({int(f[1], 16) for f in (ln.split() for ln in out.splitlines())
+                           if len(f) >= 8 and f[3] in ("FUNC", "IFUNC") and f[6] != "UND"
+                           and int(f[1], 16)}))
+    res = sandbox.run(exe, argv=[str(bad)], arch="aarch64", timeout=30, blocks=blocks)
+    assert res.crashed
+    assert res.fault_pc, "a crash under emulation must still say where it died"
+    # a clean run has nowhere to point
+    ok = pathlib.Path("examples/vuln-targets/inputs/jhead-ok.jpg").resolve()
+    clean = sandbox.run(exe, argv=[str(ok)], arch="aarch64", timeout=30, blocks=blocks)
+    assert not clean.crashed and clean.fault_pc is None

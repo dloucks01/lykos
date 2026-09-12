@@ -114,6 +114,9 @@ class RealCase:
 
 
 _REPO = Path(__file__).resolve().parents[3]
+# A real parser with no known bug should produce a report an analyst can read. unzip's
+# fifteen findings were two thirds false; this is the ceiling that would have caught it.
+_REPORT_CEILING = 12
 
 
 MATRIX = [
@@ -146,6 +149,15 @@ MATRIX = [
         {"cwe121": True, "L1": True, "L2": True, "bundle_reproduces": True},
         prebuilt="examples/vuln-targets/bin/ncompress_x86-64_cve",
         note="ncompress CVE-2001-1413: unchecked strcpy of an argv pathname, to L2"),
+    # The NEGATIVE case, and the only measurement of precision on real code anywhere in the
+    # gates: giflib 5.1.4 already carries the check CVE-2016-3977 defeated. Every precision
+    # number quoted for a real binary so far came from reading output by hand -- including the
+    # ten false credentials in unzip, which shipped.
+    RealCase(
+        "real_gif2rgb_clean", "", b"", "file",
+        {"no_crash": True, "no_credentials": True, "bounded_report": True},
+        prebuilt="examples/vuln-targets/bin/gif2rgb_x86-64", fuzz=True,
+        note="giflib 5.1.4 gif2rgb: a real parser with no known bug -- it must stay quiet"),
 ]
 
 
@@ -226,6 +238,14 @@ def run_case(case: RealCase, exe: Path, *, timeout: float = 30.0) -> dict:
             got["cwe120"] = "CWE-120" in cwes
             got["cwe125"] = "CWE-125" in cwes
 
+            if "no_credentials" in case.expect:
+                # Precision on real code: a clean binary must not accumulate findings it
+                # cannot support. Counted at CANDIDATE, because that is where noise lands.
+                findings = fd.list_by_target(target.id)
+                got["no_credentials"] = not any(f.cwe == "CWE-798" for f in findings)
+                got["bounded_report"] = len(findings) <= _REPORT_CEILING
+                res["detail"]["findings"] = len(findings)
+
             if case.fuzz:
                 # Nothing supplied but the binary: the campaign has to work out the format
                 # from the target's own strings, generate a seed its parser accepts, and
@@ -239,8 +259,13 @@ def run_case(case: RealCase, exe: Path, *, timeout: float = 30.0) -> dict:
                 crashes = [d for d in DynResultDAO(store.conn).list_by_target(target.id)
                            if d.crashed]
                 got["found_by_fuzzing"] = bool(crashes)
+                got["no_crash"] = not crashes
                 res["detail"]["model"] = _done_field(store, cid, "fuzz", "fuzz.format", "model")
                 res["detail"]["crashes"] = len(crashes)
+                if "no_crash" in case.expect:
+                    res["ok"] = all(got.get(k) == v for k, v in case.expect.items())
+                    res["missing"] = [k for k, v in case.expect.items() if got.get(k) != v]
+                    return res
                 if not crashes:
                     res["ok"] = False
                     res["missing"] = [k for k, v in case.expect.items() if got.get(k) != v]
