@@ -169,17 +169,34 @@ def _secretish(val: str) -> bool:
 
 @register_detector
 def hardcoded_secrets(ctx: DetectContext):
+    """Credentials built into the binary.
+
+    A string the code REFERENCES is a different claim from a string that merely sits in the
+    file: one is a credential the program uses, the other could be a sample, a message
+    template or data that happens to look like a key. The reference is a second channel, so it
+    corroborates -- without it this detector had none at all and a hard-coded credential could
+    never leave `candidate`, which is why the eval corpus measured CWE-798 recall at 0.00 for
+    the state the release gate scores.
+    """
     out = []
     for s in ctx.strings:
         hit = _secret(s.value or "")
         if not hit:
             continue
         cwe, sev, title = hit
-        out.append(_cand(
-            cwe, title, sev, "hardcoded_secrets",
-            [{"channel": "string", "detail": f"{(s.value or '')[:60]!r} @ {s.addr}"}],
-            function_addr=None, site_addr=s.addr,
-            dedup_key=f"{cwe}:{s.addr}", confidence=0.5))
+        evidence = [{"channel": "string", "detail": f"{(s.value or '')[:60]!r} @ {s.addr}"}]
+        used = [x for x in (s.xrefs or []) if x]
+        state, conf = "candidate", 0.5
+        if used:
+            state, conf = "corroborated", 0.7
+            where = ", ".join(str(x) for x in used[:4]) + (" ..." if len(used) > 4 else "")
+            evidence.append({"channel": "xref",
+                             "detail": f"the code reads this string at {where}"})
+        cand = _cand(cwe, title, sev, "hardcoded_secrets", evidence,
+                     function_addr=None, site_addr=s.addr,
+                     dedup_key=f"{cwe}:{s.addr}", confidence=conf)
+        cand["state"] = state
+        out.append(cand)
     return out
 
 

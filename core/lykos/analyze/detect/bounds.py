@@ -575,6 +575,9 @@ def classify_nul_site(instrs, site_addr, sink, frame, arch, bits, blocks, site_b
 
 
 GUARDED = "guarded-index"
+# Not "no guard" -- "no question could be asked here". Keeping the two apart is the difference
+# between a measurement and a silence that looks like one.
+UNCHECKABLE = "index-not-tracked"
 
 
 def classify_derefs(func_irs: dict, derefs, arch) -> dict:
@@ -605,8 +608,22 @@ def classify_derefs(func_irs: dict, derefs, arch) -> dict:
             continue
         dom = dominators(blocks)
         for d in hits:
+            slots = _guard_slots(d)
+            if not slots:
+                # Nothing was ASKED, so nothing can be concluded. The guard evaluator resolves
+                # a frame slot -- it recognises a load from `base + displacement` -- and an
+                # index the compiler keeps in a register never becomes one. Measured on a
+                # fixture with an explicit `if (i >= 0 && i < 256)`: found at -O0, invisible at
+                # -O2. Reporting that as "no dominating check" would be a silent failure that
+                # reads exactly like a real absence of one.
+                out[d["site_addr"]] = {
+                    "verdict": UNCHECKABLE,
+                    "why": ("the value this address is built from is not a frame slot here, "
+                            "so no dominating check could be looked for"),
+                }
+                continue
             g = None
-            for slot in _guard_slots(d):
+            for slot in slots:
                 g = guard_bound(blocks, d["block_addr"], slot, bases=bases, dom=dom)
                 if g:
                     break
