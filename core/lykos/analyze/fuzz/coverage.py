@@ -14,7 +14,6 @@ import os
 
 from ...db.dao import DynResultDAO, FindingDAO, TargetDAO
 from ...jobs.registry import register_stage
-from ..dynamic import sandbox
 from ..dynamic.minimize import minimize
 from ..dynamic.stage import crash_finding_candidate
 from . import aflpp
@@ -24,6 +23,26 @@ from .stage import _DEFAULT_SEEDS
 COVERAGE_STAGE = "coverage_fuzz"
 TOOL = "aflpp"
 TOOL_VERSION = "aflpp-1"
+
+
+def toolchain_missing():
+    """Why coverage-guided fuzzing cannot run on this MACHINE, or None if it can.
+
+    Separate from `_unsupported`, which answers about the TARGET. The distinction matters:
+    "this jar has no machine code" is permanent and belongs in a decline, while "afl-qemu-trace
+    is not installed" is an environment defect the operator can fix in ten minutes, and a
+    stage that quietly reports zero crashes for it is the failure this codebase keeps hunting.
+    """
+    afl = aflpp.locate_afl(None)
+    if afl is None:
+        return ("AFL++ not found (looked at LYKOS_AFL, AFL_PATH, PATH). Install afl++ with "
+                "afl-qemu, or use the built-in black-box `fuzz` stage instead.")
+    if aflpp.locate_qemu_trace(afl) is None:
+        return (f"AFL++ qemu-mode needs afl-qemu-trace, which is not installed next to {afl} "
+                f"or on PATH. Build it with AFL++'s qemu_mode/build_qemu_support.sh, pass "
+                f"params.qemu=false to fuzz an afl-instrumented build, or use the built-in "
+                f"black-box `fuzz` stage.")
+    return None
 
 
 def _unsupported(target):
@@ -42,12 +61,27 @@ def _unsupported(target):
         return ("AFL++ cannot instrument a Windows PE here, and the Wine path runs at about "
                 "one execution a second. Use `synthesize_poc`, which derives the overflow "
                 "from the recovered stack frame without executing at all.")
-    host = sandbox.host_arch()
-    if target.arch and host and target.arch != host:
-        return (f"AFL++ qemu-mode runs afl-qemu-trace, which is built for the host "
-                f"({host}); it cannot execute a {target.arch} binary. Use the black-box "
-                f"`fuzz` stage, which routes through qemu-user for this architecture and "
-                f"takes its coverage from qemu's own block log.")
+    # Which guest can the installed afl-qemu-trace actually run? Not "the host": it is an
+    # EMULATOR, always built for the host and targeting one guest chosen at build time. This
+    # check previously assumed host == guest, which blocked coverage-guided fuzzing on the one
+    # architecture the installed trace binary could drive (aarch64 here) and permitted it on
+    # the one that aborts at the fork-server handshake (x86-64, the host).
+    afl = aflpp.locate_afl(None)
+    trace = aflpp.locate_qemu_trace(afl) if afl else None
+    if trace is None:
+        # Missing TOOLING is not a property of the target -- it is a fixable defect in this
+        # machine, and the stage still raises for it so it stays loud. Reported here only so
+        # the workbench can grey the control with a reason instead of offering it.
+        return toolchain_missing()
+    guest = aflpp.qemu_trace_arch(trace)
+    if guest and target.arch and guest != target.arch:
+        cpu = {"x86-64": "x86_64", "x86": "i386"}.get(target.arch, target.arch)
+        return (f"the installed afl-qemu-trace emulates {guest}, and this target is "
+                f"{target.arch} -- it would abort at the fork-server handshake. Build a "
+                f"matching one (CPU_TARGET={cpu} ./qemu_mode/build_qemu_support.sh in "
+                f"AFL++) and point LYKOS_AFL at it, or use the black-box `fuzz` stage, "
+                f"which routes through qemu-user for any architecture and takes coverage "
+                f"from qemu's own block log.")
     return None
 
 
@@ -65,6 +99,9 @@ def coverage_stage(ctx) -> dict:
     # a thorough campaign that found nothing. The `advise` endpoint recommended it first for
     # every one of the eleven non-host architectures in the corpus.
     why = _unsupported(target)
+    if why and why == toolchain_missing():
+        # environment, not target: raise so the run is visibly broken rather than a clean zero
+        raise RuntimeError(why)
     if why:
         ctx.emit("coverage.done", payload={"supported": False, "backend": "aflpp",
                                            "crash_inputs": 0, "unique": 0, "confirmed": 0,
@@ -87,7 +124,7 @@ def coverage_stage(ctx) -> dict:
         # aborts at the fork-server handshake and still reports a clean "0 crashes" run.
         raise RuntimeError(
             "AFL++ qemu-mode needs afl-qemu-trace, which is not installed next to "
-            f"{afl} or on PATH. Build it with AFL++'s build-qemu-support.sh, pass "
+            f"{afl} or on PATH. Build it with AFL++'s qemu_mode/build_qemu_support.sh, pass "
             "params.qemu=false to fuzz an afl-instrumented build, or use the built-in "
             "black-box `fuzz` stage.")
 

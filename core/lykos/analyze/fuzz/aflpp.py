@@ -7,6 +7,7 @@ minimize/finding pipeline. AFL++ (with afl-qemu) ships in the full offline bundl
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -29,11 +30,53 @@ def locate_afl(config: Optional[str] = None) -> Optional[Path]:
     return Path(w) if w else None
 
 
+# qemu names its guest architecture in its own version banner: "qemu-aarch64 version 5.2.50".
+# That is the ONLY reliable way to ask what an afl-qemu-trace can run, because the binary
+# itself is always built for the HOST -- it is an emulator. Reading `file` output and seeing
+# "ELF 64-bit x86-64" says nothing about the guest, and concluding otherwise is how this
+# platform ended up blocking coverage-guided fuzzing on the one architecture its installed
+# afl-qemu-trace could actually drive, while recommending it for the one that aborts at the
+# fork-server handshake.
+_QEMU_GUEST = re.compile(rb"qemu-([a-z0-9_]+)\s+version")
+# qemu's spelling -> ours (the inverse of sandbox._QEMU)
+_GUEST_ARCH = {
+    "x86_64": "x86-64", "i386": "x86", "aarch64": "aarch64", "arm": "arm",
+    "mips": "mips", "mipsel": "mips", "mips64": "mips64", "mips64el": "mips64",
+    "ppc": "ppc", "ppc64": "ppc64", "ppc64le": "ppc64", "riscv32": "riscv32",
+    "riscv64": "riscv64", "s390x": "s390x", "sparc": "sparc", "sparc64": "sparc64",
+    "sh4": "sh4", "m68k": "m68k", "loongarch64": "loongarch64", "hppa": "hppa",
+    "alpha": "alpha", "xtensa": "xtensa", "microblaze": "microblaze",
+}
+_guest_cache: dict = {}
+
+
+def qemu_trace_arch(trace: Optional[Path]) -> Optional[str]:
+    """Which guest architecture this afl-qemu-trace emulates, or None if it cannot say.
+
+    Cached: the capabilities endpoint asks once per target, and this is a subprocess.
+    """
+    if trace is None:
+        return None
+    key = str(trace)
+    if key in _guest_cache:
+        return _guest_cache[key]
+    arch = None
+    try:
+        r = subprocess.run([key, "--version"], capture_output=True, timeout=10)
+        m = _QEMU_GUEST.search((r.stdout or b"") + (r.stderr or b""))
+        if m:
+            arch = _GUEST_ARCH.get(m.group(1).decode("ascii", "replace").lower())
+    except Exception:
+        arch = None
+    _guest_cache[key] = arch
+    return arch
+
+
 def locate_qemu_trace(afl: Path) -> Optional[Path]:
     """afl-qemu-trace, which `-Q` (binary-only) mode requires.
 
     Shipped separately from afl-fuzz -- Ubuntu's afl++ package does NOT include it, it comes
-    from AFL++'s build-qemu-support.sh. Without it `-Q` dies at the fork-server handshake.
+    from AFL++'s qemu_mode/build_qemu_support.sh. Without it `-Q` dies at the fork-server handshake.
     """
     cand = Path(afl).parent / "afl-qemu-trace"
     if cand.exists():

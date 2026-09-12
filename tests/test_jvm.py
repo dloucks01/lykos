@@ -299,21 +299,20 @@ def test_a_jar_is_analysed_run_and_cracked_from_the_file_alone(tmp_path):
     assert "CWE-129" in cwes and "CWE-119" not in cwes
 
 
-def test_afl_cannot_drive_a_jvm_or_cross_arch_target():
+def test_afl_cannot_drive_a_jvm_or_a_pe():
     """The stage's own gate, which is also what `advise` consults -- one source of truth for
-    "can AFL++ run this", so advice cannot recommend a backend the stage then declines."""
+    "can AFL++ run this", so advice cannot recommend a backend the stage then declines.
+
+    Only the substrate rules are asserted here. Whether a given ARCHITECTURE is available
+    depends on which guest the installed afl-qemu-trace was built for, which is a property of
+    the machine, not of Java -- see test_afl_arch.py."""
     from lykos.analyze.fuzz.coverage import _unsupported
 
     class T:
         def __init__(self, ft=None, arch=None):
             self.file_type, self.arch = ft, arch
-    from lykos.analyze.dynamic import sandbox as sb
-    host = sb.host_arch()
     assert "JVM" in (_unsupported(T("jar")) or "")
     assert "PE" in (_unsupported(T("pe")) or "")
-    assert "afl-qemu-trace" in (_unsupported(T("elf", "aarch64" if host != "aarch64"
-                                               else "x86-64")) or "")
-    assert _unsupported(T("elf", host)) is None
 
 
 def test_disassembling_a_jar_declines_instead_of_raising(tmp_path):
