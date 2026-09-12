@@ -114,10 +114,9 @@ def stack_buffer_overflow(ctx: DetectContext):
 
 
 # ------------------------------------------------------------- hard-coded secrets (string)
-_SECRET_KW = re.compile(
-    r"(pass(word|wd)?|secret|api[_-]?key|auth[_-]?token|access[_-]?key|credential|"
-    r"private[_-]?key)", re.I)
 _AWS = re.compile(r"AKIA[0-9A-Z]{16}")
+_PLACEHOLDERS = {"password", "secret", "changeme", "yourpassword", "xxxxxxxx",
+                 "none", "null", "empty", "required", "optional", "unknown"}
 
 
 def _secret(v: str):
@@ -127,9 +126,43 @@ def _secret(v: str):
         return ("CWE-321", "high", "Hard-coded private key material")
     if _AWS.search(v):
         return ("CWE-798", "high", "Hard-coded AWS access key")
-    if _SECRET_KW.search(v) and (":" in v or "=" in v or len(v) >= 8):
+    m = _ASSIGNED.search(v)
+    if m and _secretish(m.group("val")) and not _FMT.search(v):
         return ("CWE-798", "medium", "Possible hard-coded credential")
     return None
+
+
+# A credential is a keyword BOUND TO A VALUE. Matching the keyword alone flagged ten strings in
+# unzip -- "Enter password: ", "incorrect password", "-P p Use password p to decrypt files" --
+# all of them messages ABOUT passwords, none of them a secret. That was two thirds of every
+# finding reported for that binary.
+_ASSIGNED = re.compile(
+    r"""(?ix)
+    (?:pass(?:wd|word)? | secret | token | api[_-]?key | auth[_-]?key | credential |
+       access[_-]?key | private[_-]?key)
+    ["']? \s* [:=] \s* ["']?
+    (?P<val>[^\s"']+)
+    """)
+_TOKEN = re.compile(r"[A-Za-z0-9+/=_.-]+$")
+# A printf template is a message, not a value: "[%s] %s password: " says nothing secret.
+_FMT = re.compile(r"%[-#0 +']*[0-9]*(?:\.[0-9]+)?(?:hh|h|ll|l|L|q|j|z|t)?[diouxXeEfgGaAcsp]")
+
+
+def _secretish(val: str) -> bool:
+    """Does the bound value look like a secret rather than a word of prose or a placeholder?"""
+    if not 6 <= len(val) <= 256:
+        return False
+    if val.startswith("-"):                       # a command-line option, not a value
+        return False
+    if val.lower() in _PLACEHOLDERS:
+        return False
+    # A long single-alphabet token is the commonest credential shape there is -- a hex API key
+    # or a base64 blob has no mixed case and no punctuation at all.
+    if len(val) >= 12 and _TOKEN.match(val):
+        return True
+    kinds = (any(c.islower() for c in val), any(c.isupper() for c in val),
+             any(c.isdigit() for c in val), any(not c.isalnum() for c in val))
+    return sum(kinds) >= 2                        # mixed case, digits or punctuation
 
 
 @register_detector
