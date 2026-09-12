@@ -117,16 +117,23 @@ def _target_html(t: dict) -> str:
     p.append(f'<h2 class="tname mono">{esc(t.get("filename"))}</h2>')
     mits = t.get("mitigations") or {}
     mit_txt = " ".join(f"{k}={v}" for k, v in mits.items()) if mits else "—"
-    p.append(_kv([
-        ("SHA-256", t.get("sha256")),
-        ("MD5", t.get("md5")),
-        ("Size", t.get("size")),
-        ("Type", t.get("file_type")),
-        ("Arch", f'{t.get("arch") or "?"}/{t.get("bits") or "?"} '
-                 f'{t.get("endianness") or ""}'.strip()),
-        ("Linking", ("stripped " if t.get("stripped") else "") + (t.get("linking") or "")),
-        ("Mitigations", mit_txt),
-    ]))
+    rt = t.get("runtime") or {}
+    rows = [("SHA-256", t.get("sha256")), ("MD5", t.get("md5")), ("Size", t.get("size")),
+            ("Type", t.get("file_type"))]
+    if rt.get("describes_cpu", True):
+        rows += [("Arch", f'{t.get("arch") or "?"}/{t.get("bits") or "?"} '
+                          f'{t.get("endianness") or ""}'.strip()),
+                 ("Linking", ("stripped " if t.get("stripped") else "")
+                             + (t.get("linking") or "")),
+                 ("Mitigations", mit_txt)]
+    else:
+        # arch/bits/endianness are placeholders triage fills for a substrate that has no
+        # processor; printing "jvm/64 big" describes nothing and reads like a CPU.
+        rows.append(("Runtime", rt.get("label")))
+    p.append(_kv(rows))
+    if rt.get("ceiling_why"):
+        p.append(f'<p class="ceiling"><b>Analysis ceiling — {esc(rt.get("ceiling"))}.</b> '
+                 f'{esc(rt["ceiling_why"])}</p>')
     findings = t.get("findings", [])
     if not findings:
         p.append('<p class="muted">No reportable findings for this target.</p></section>')
@@ -222,6 +229,8 @@ body{margin:0;background:var(--bg);color:var(--text);font-family:var(--sans);
 .wrap{max-width:900px;margin:0 auto;padding:32px 24px 64px}
 .mono{font-family:var(--mono);font-size:.85em}
 .muted{color:var(--muted)}
+.ceiling{margin:8px 0 0;padding:8px 10px;border-left:3px solid #7aa2c8;
+  background:rgba(122,162,200,.08);font-size:12.5px;line-height:1.5}
 .eyebrow{text-transform:uppercase;letter-spacing:.08em;font-size:11px;color:var(--faint);
   font-weight:600}
 h1{font-size:26px;margin:6px 0 14px;letter-spacing:-.02em}

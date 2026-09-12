@@ -377,6 +377,16 @@ tr.fdetail>td{background:var(--surface-2);border-bottom:1px solid var(--border-s
 .btn.planned{box-shadow:inset 0 0 0 1px var(--teal,#3aa);border-color:var(--teal,#3aa)}
 #substrate{opacity:.85}
 #laddernote b{color:var(--teal,#3aa)}
+/* Evidence tiers on the board. The boundary between "we demonstrated this" and "a pattern
+   matched" is the single most important thing the list has to communicate, and 24 rows in one
+   table communicate none of it. */
+tr.tierhd td{background:var(--panel2,#1b1f24);cursor:pointer;padding:5px 8px;
+  border-top:1px solid var(--line,#2a3038);user-select:none}
+tr.tierhd b{font-size:11.5px;letter-spacing:.04em;text-transform:uppercase}
+.tchev{display:inline-block;width:12px;color:var(--faint)}
+.tcount{display:inline-block;min-width:18px;padding:0 5px;margin-left:6px;border-radius:8px;
+  background:var(--line,#2a3038);font-size:10.5px}
+.thint{margin-left:10px;color:var(--faint);font-size:10.5px;font-weight:400;text-transform:none}
 </style>
 </head>
 <body>
@@ -636,35 +646,74 @@ function renderBoard(){
     </select>
     <span class="mono" style="color:var(--faint);font-size:11px">${rows.length} shown</span>
   </div>`;
+  // Evidence TIERS, not one undifferentiated list. The sort has been evidence-first for a
+  // while, but 24 rows in a single table give the reader no idea where demonstrated stops and
+  // pattern-matching starts -- and on a real parser the speculative tier is most of the list
+  // (jhead: 1 confirmed, 7 corroborated, 16 candidates). Collapsing it puts the evidence on
+  // screen and the inventory one click away, instead of the other way round.
+  const TIERS=[
+    {key:"proven", label:"Demonstrated", hint:"reproduced, and the reproducer was run",
+     states:["poc-backed","confirmed"], open:true},
+    {key:"corr", label:"Corroborated", hint:"a second channel agrees -- data flow, a taint "
+     +"path, an xref", states:["corroborated"], open:true},
+    {key:"cand", label:"Unproven", hint:"a pattern matched; nothing has demonstrated it",
+     states:["candidate"], open:false},
+  ];
   const body = rows.length ? `<table><thead><tr>
       <th>Sev</th><th>CWE</th><th>Finding</th><th>Sites</th><th>Where</th><th>State</th>
       <th>Conf</th><th>Detector</th><th>PoC</th></tr></thead><tbody>
-    ${rows.map(x=>{
-      const conf=Math.round((x.confidence||0)*100);
-      const ev=(x.evidence||[]).length;
-      const lvl=x.poc_level?`<span class="lvl">${esc(x.poc_level)}</span>`:'';
-      // A finding is a DEFECT; `site_count` is how many places it occurs. The board used to
-      // print one row per site, so 12 identical "strncpy" rows with no location at all.
-      const n=x.site_count||0;
-      const where = x.function_addr ? (x.function_addr + (n>1?` +${n-1} more`:''))
-                                    : (x.target_name||'-');
-      const sel=x.id===SEL_FINDING;
-      const row=`<tr class="frow${sel?' sel':''}" data-fid="${x.id}" onclick="toggleFindingDetail('${x.id}')">
-        <td><span class="sev ${x.severity}">${esc(x.severity)}</span></td>
-        <td class="mono">${esc(x.cwe||'-')}</td>
-        <td><div class="ttl">${esc(x.title||'')}</div><div class="ev">${ev} evidence</div></td>
-        <td class="mono">${n>1?`&times;${n}`:(n===1?'1':'-')}${
-          (x.proven_sites||0) ? `<div class="ev">${x.proven_sites} proven</div>` : ''}</td>
-        <td class="mono" style="font-size:11px">${esc(where)}</td>
-        <td><span class="st ${x.state==='poc-backed'?'pocbacked':x.state}">${esc(x.state)}</span></td>
-        <td><div class="cbar" title="${conf}%"><i style="width:${conf}%"></i></div></td>
-        <td class="mono" style="font-size:11px">${esc(x.detector||'-')}</td>
-        <td>${lvl}</td></tr>`;
-      return row + (sel?findingDetailRow(x):'');
-    }).join('')}</tbody></table>` : `<div class="empty">No findings match. Run detection, fuzzing, or PoC stages on the Workbench.</div>`;
+    ${TIERS.map(t=>{
+      const mine=rows.filter(x=>t.states.includes(x.state));
+      if(!mine.length) return "";
+      // A hand toggle is an OVERRIDE, not one more thing OR-ed in: written as
+      // `t.open || ... || BOARD_OPEN[k]` the two open-by-default tiers could never be
+      // collapsed, because the first term short-circuits and the chevron does nothing.
+      // An explicit state/text filter means the user asked for exactly this tier, so it opens.
+      const dflt = t.open || !!f.state || !!f.q;
+      const open = (t.key in BOARD_OPEN) ? BOARD_OPEN[t.key] : dflt;
+      const head=`<tr class="tierhd" data-tier="${t.key}" onclick="toggleTier('${t.key}')">
+        <td colspan="9"><span class="tchev">${open?"▾":"▸"}</span>
+          <b>${esc(t.label)}</b> <span class="tcount">${mine.length}</span>
+          <span class="thint">${esc(t.hint)}</span></td></tr>`;
+      return head + (open ? mine.map(x=>_boardRow(x)).join("") : "");
+    }).join("")}
+    </tbody></table>` : `<div class="empty">No findings match. Run detection, fuzzing, or PoC stages on the Workbench.</div>`;
   bd.innerHTML = tilesHtml + filters + `<div class="card" style="padding:6px 8px">${body}</div>`;
   const q=document.getElementById('bq'); if(q && document.activeElement!==q){}
 }
+function _boardRow(x){
+  const conf=Math.round((x.confidence||0)*100);
+  const ev=(x.evidence||[]).length;
+  const lvl=x.poc_level?`<span class="lvl">${esc(x.poc_level)}</span>`:'';
+  // A finding is a DEFECT; `site_count` is how many places it occurs. The board used to
+  // print one row per site, so 12 identical "strncpy" rows with no location at all.
+  const n=x.site_count||0;
+  const where = x.function_addr ? (x.function_addr + (n>1?` +${n-1} more`:''))
+                                : (x.target_name||'-');
+  const sel=x.id===SEL_FINDING;
+  const row=`<tr class="frow${sel?' sel':''}" data-fid="${x.id}" onclick="toggleFindingDetail('${x.id}')">
+    <td><span class="sev ${x.severity}">${esc(x.severity)}</span></td>
+    <td class="mono">${esc(x.cwe||'-')}</td>
+    <td><div class="ttl">${esc(x.title||'')}</div><div class="ev">${ev} evidence</div></td>
+    <td class="mono">${n>1?`&times;${n}`:(n===1?'1':'-')}${
+      (x.proven_sites||0) ? `<div class="ev">${x.proven_sites} proven</div>` : ''}</td>
+    <td class="mono" style="font-size:11px">${esc(where)}</td>
+    <td><span class="st ${x.state==='poc-backed'?'pocbacked':x.state}">${esc(x.state)}</span></td>
+    <td><div class="cbar" title="${conf}%"><i style="width:${conf}%"></i></div></td>
+    <td class="mono" style="font-size:11px">${esc(x.detector||'-')}</td>
+    <td>${lvl}</td></tr>`;
+  return row + (sel?findingDetailRow(x):'');
+}
+// Which evidence tiers the reader has opened by hand. Demonstrated and Corroborated start
+// open; the unproven inventory starts closed, because on a real parser it IS the list and
+// putting it first buries the one finding that was actually shown to happen.
+let BOARD_OPEN={};
+function toggleTier(k){
+  const cur=document.querySelector(`tr.tierhd[data-tier="${k}"] .tchev`);
+  BOARD_OPEN[k] = !(cur && cur.textContent.trim()==="▾");
+  renderBoard();
+}
+
 function boardTile(key,val){
   if(key==='clear'){ BOARD_FILTER.sev=''; BOARD_FILTER.state=''; }
   else { BOARD_FILTER[key] = (BOARD_FILTER[key]===val)?'':val; }

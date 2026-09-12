@@ -121,3 +121,26 @@ def test_every_launchable_control_is_covered_by_the_capability_map():
     mapped = set(re.findall(r'(\w+):"(\w+)"', list(ids)[0]))
     for stage, btn in mapped:
         assert f'id="{btn}"' in h, f"{stage} points at a control that does not exist: {btn}"
+
+
+def test_the_board_groups_by_evidence_tier():
+    """The sort has been evidence-first for a while, but 24 rows in one table give the reader
+    no idea where demonstrated stops and pattern-matching starts -- and on a real parser the
+    speculative tier IS the list (jhead: 1 confirmed, 7 corroborated, 16 candidates)."""
+    h = _HTML.read_text()
+    assert "const TIERS=" in h
+    for label in ("Demonstrated", "Corroborated", "Unproven"):
+        assert label in h, label
+    # the unproven inventory starts collapsed; the demonstrated tier does not
+    tiers = h[h.index("const TIERS="):h.index("const body = rows.length")]
+    assert 'states:["candidate"], open:false' in tiers.replace(" ", "").replace("\n", "") \
+        or 'open:false' in tiers
+    assert "toggleTier" in h and "BOARD_OPEN" in h
+
+
+def test_the_tier_toggle_is_an_override_not_another_or_term():
+    """Written as `t.open || ... || BOARD_OPEN[k]` the two open-by-default tiers could never be
+    collapsed: the first term short-circuits and the chevron does nothing."""
+    h = _HTML.read_text()
+    assert "(t.key in BOARD_OPEN) ? BOARD_OPEN[t.key] : dflt" in h
+    assert "t.open || !!f.state || !!f.q || BOARD_OPEN" not in h
