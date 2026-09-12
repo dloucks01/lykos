@@ -488,3 +488,26 @@ def test_a_dereference_with_a_dominating_bound_is_separated_from_one_without():
     assert _guard_slots({}) == []
     # a 32-bit target's displacement wraps at 2**32
     assert _guard_slots({"via": [("stack", "EBP", 0xFFFFFFFC)]}) == [("EBP", -4)]
+
+
+def test_an_index_that_cannot_be_checked_is_not_reported_as_unguarded():
+    """The guard evaluator resolves a FRAME SLOT -- it recognises a load from
+    `base + displacement` -- so an index the compiler keeps in a register is never asked
+    about. Measured on a fixture with an explicit `if (i >= 0 && i < 256)`: the guard is found
+    at -O0 and invisible at -O2.
+
+    Reporting that as "no dominating check bounds this" is a silent failure that reads exactly
+    like a real absence of one. On jhead it was 61 of 149 sites -- 41% of the verdicts were
+    silence wearing the shape of a measurement."""
+    from lykos.analyze.detect.bounds import GUARDED, UNCHECKABLE, classify_derefs
+
+    # a dereference whose address came from a register only: nothing to ask about
+    derefs = [{"kind": "load", "site_addr": "0x1004", "block_addr": "0x1000",
+               "function_addr": "0x1000", "addr_key": ("reg", "RAX"),
+               "via": [("reg", "RAX"), ("unique", "0x100")]}]
+    irs = {"0x1000": {"blocks": [{"addr": "0x1000", "succ": [],
+                                  "instructions": [{"addr": "0x1004", "pcode": []}]}]}}
+    got = classify_derefs(irs, derefs, "x86-64")
+    assert got["0x1004"]["verdict"] == UNCHECKABLE
+    assert "not a frame slot" in got["0x1004"]["why"]
+    assert GUARDED != UNCHECKABLE

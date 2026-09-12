@@ -509,3 +509,25 @@ def test_a_path_checked_then_used_is_a_toctou_candidate():
     # a check with no use is just a check
     ctx.call_edges = [_E("0x1010", "access")]
     assert toctou(ctx) == []
+
+
+def test_a_credential_the_code_reads_is_corroborated():
+    """A string the code REFERENCES is a different claim from one that merely sits in the
+    file: one is a credential the program uses, the other could be a sample, a message
+    template, or data that happens to look like a key. Without that second channel this
+    detector had none at all, so a hard-coded credential could never leave `candidate` -- the
+    eval corpus measured CWE-798 recall at 0.00 for the state the release gate scores."""
+    from lykos.analyze.detect.detectors import DetectContext, hardcoded_secrets
+
+    class _S:
+        def __init__(self, value, addr, xrefs=None):
+            self.value, self.addr, self.xrefs = value, addr, xrefs
+
+    ctx = DetectContext(target_id="t", case_id="c", call_edges=[], functions=[],
+                        mitigations={}, frames={},
+                        strings=[_S("api_key=deadbeefcafebabe", "0x3000", ["0x1200"]),
+                                 _S("db_password=S3cr3t!", "0x3100", None)])
+    by_addr = {c["site_addr"]: c for c in hardcoded_secrets(ctx)}
+    assert by_addr["0x3000"]["state"] == "corroborated", "the code reads this one"
+    assert any(e["channel"] == "xref" for e in by_addr["0x3000"]["evidence"])
+    assert by_addr["0x3100"]["state"] == "candidate", "nothing references this one"
