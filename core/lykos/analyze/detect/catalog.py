@@ -77,6 +77,28 @@ SOURCES = {
     "fscanf", "sscanf", "getenv", "getchar", "fgetc", "getline", "readv",
 }
 
+# ----------------------------------------------- which ARGUMENT a source fills, when it does
+# Most of these do not RETURN the untrusted bytes -- they write them into a caller-supplied
+# buffer and return a count or a pointer to that same buffer. Seeding taint on the return
+# register alone therefore models `getchar()` correctly and `read(fd, buf, n)` not at all, and
+# the difference is not academic: every file parser this platform targets reads its input with
+# one of these.
+#
+# Measured on a fixture with two paths to the SAME sink carrying the SAME untrusted data --
+# one via argv, one via fread into a buffer -- the argv path was corroborated and the fread
+# path was not flagged at all. The taint channel silently under-reported every file-driven
+# flow, and cross-component taint never fired on the commonest shape there is: a program that
+# reads a file and hands the buffer to a library.
+#
+# name -> index of the argument that receives the data.
+OUT_PARAM_SOURCES = {
+    "read": 1, "readv": 1, "recv": 1, "recvfrom": 1, "recvmsg": 1,
+    "fread": 0, "fgets": 0, "gets": 0, "getline": 0,
+    # *scanf write through their variadic arguments; the first one after the format is the
+    # earliest that can receive data, and taking just that is the conservative choice.
+    "scanf": 1, "fscanf": 2, "sscanf": 2,
+}
+
 # ------------------------------------------------------- which sink argument must be tainted
 # A sink is only a data-flow finding if the attacker controls the argument that MAKES it a
 # bug -- not merely some argument. `printf("%s", user)` is safe; `printf(user)` is CWE-134.
