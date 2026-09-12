@@ -297,3 +297,54 @@ def test_a_jar_is_analysed_run_and_cracked_from_the_file_alone(tmp_path):
     # ...and the fault is NOT filed as native memory corruption
     cwes = {f.cwe for f in FindingDAO(store.conn).list_by_target(target.id)}
     assert "CWE-129" in cwes and "CWE-119" not in cwes
+
+
+def test_afl_cannot_drive_a_jvm_or_cross_arch_target():
+    """The stage's own gate, which is also what `advise` consults -- one source of truth for
+    "can AFL++ run this", so advice cannot recommend a backend the stage then declines."""
+    from lykos.analyze.fuzz.coverage import _unsupported
+
+    class T:
+        def __init__(self, ft=None, arch=None):
+            self.file_type, self.arch = ft, arch
+    from lykos.analyze.dynamic import sandbox as sb
+    host = sb.host_arch()
+    assert "JVM" in (_unsupported(T("jar")) or "")
+    assert "PE" in (_unsupported(T("pe")) or "")
+    assert "afl-qemu-trace" in (_unsupported(T("elf", "aarch64" if host != "aarch64"
+                                               else "x86-64")) or "")
+    assert _unsupported(T("elf", host)) is None
+
+
+def test_disassembling_a_jar_declines_instead_of_raising(tmp_path):
+    """It surfaced `FileNotFoundError(2, 'No such file or directory')` to the operator --
+    a raw stdlib exception, in a pipeline whose other stages say "heap check not applicable:
+    target is statically linked"."""
+    jar = _build_jar(tmp_path)
+
+    from lykos.analyze import register as register_stages
+    from lykos.analyze.disassemble import enqueue_disassemble
+    from lykos.analyze.ingest import enqueue_triage, ingest
+    from lykos.casestore import CaseStore
+    from lykos.jobs import JobConfig, JobQueue, WorkerPool
+
+    register_stages()
+    store = CaseStore.open(tmp_path / "case")
+    cid = store.cases.create("jvm-dis").id
+    target = ingest(store, cid, jar, filename=jar.name)
+    pool = WorkerPool(store.db_path, store.content, JobConfig(workers=1))
+    pool.start()
+    try:
+        q = JobQueue(store.conn)
+        enqueue_triage(q, target)
+        pool.wait_idle(180)
+        target = store.targets.get(target.id)
+        enqueue_disassemble(q, target)
+        pool.wait_idle(180)
+    finally:
+        pool.stop()
+    runs = [r for r in store.runs.list_by_case(cid) if r.stage == "disassemble"]
+    assert runs and runs[-1].status == "done", (runs[-1].status, runs[-1].error)
+    ev = [e for e in store.events.list(case_id=cid, limit=500) if e.type == "re.done"]
+    assert ev and ev[-1].payload.get("supported") is False
+    assert "constant pool" in ev[-1].payload.get("note", "")

@@ -148,3 +148,22 @@ def test_an_optional_flag_is_not_evidence_of_anything():
     out = advise(imports=[], functions=0, findings=0, seeds=0, has_format=False,
                  afl_usable=False, executable=True, invocation=inv)
     assert out["input_mode"] is None and out.get("input_unknown")
+
+
+def test_coverage_fuzz_is_not_recommended_where_afl_cannot_run():
+    """"AFL++ is installed" and "AFL++ can run this target" are different questions, and
+    conflating them made coverage_fuzz the first recommendation for every one of the eleven
+    non-host architectures in the corpus. Measured on an aarch64 target: the campaign ran to
+    completion and reported crash_inputs 0, unique 0, status done -- which reads exactly like
+    a thorough campaign that found nothing."""
+    from lykos.analyze.advise import advise, fuzz_backend
+    blocked = "afl-qemu-trace is built for the host (x86-64); it cannot execute aarch64."
+    assert fuzz_backend(True, 3, blocked)[0] == "fuzz"
+    assert "not available for this target" in fuzz_backend(True, 3, blocked)[1]
+    # unchanged where it CAN run
+    assert fuzz_backend(True, 3, None)[0] == "coverage_fuzz"
+    assert fuzz_backend(False, 3, None)[0] == "directed_fuzz"
+    out = advise(imports=["fopen"], functions=10, findings=1, seeds=0, has_format=False,
+                 afl_usable=True, executable=True, coverage_blocked=blocked)
+    assert out["backend"] == "fuzz"
+    assert out["plan"][0]["stage"] == "fuzz"

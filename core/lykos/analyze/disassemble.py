@@ -59,6 +59,22 @@ def disassemble_stage(ctx) -> dict:
     if target is None:
         raise ValueError("disassemble requires a target_id referencing an ingested blob")
 
+    # A substrate with no machine code has nothing to decompile, and saying so is the whole
+    # job here. Ghidra imported the jar, produced no analysis file, and the stage surfaced
+    # `FileNotFoundError(2, 'No such file or directory')` to the operator -- a raw stdlib
+    # exception, in a pipeline whose other stages say things like "heap check not applicable:
+    # target is statically linked". The constant pool is read by `detect_cwe` instead, which
+    # needs no decompiler at all.
+    ftype = (target.file_type or "").lower()
+    if ftype in ("jar", "class"):
+        note = ("a Java target has no machine code to decompile -- its classes, strings and "
+                "every method it calls are already in the constant pool, which `detect_cwe` "
+                "reads directly. Run detect_cwe instead; disassembly is not a step here.")
+        ctx.emit("re.done", payload={"supported": False, "substrate": ftype, "functions": 0,
+                                     "call_edges": 0, "strings": 0, "note": note})
+        ctx.progress(pct=100, msg="no machine code to decompile (Java target)")
+        return {}
+
     headless = ghidra.locate_ghidra()
     if headless is None:
         raise RuntimeError(

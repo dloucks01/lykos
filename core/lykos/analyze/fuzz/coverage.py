@@ -14,6 +14,7 @@ import os
 
 from ...db.dao import DynResultDAO, FindingDAO, TargetDAO
 from ...jobs.registry import register_stage
+from ..dynamic import sandbox
 from ..dynamic.minimize import minimize
 from ..dynamic.stage import crash_finding_candidate
 from . import aflpp
@@ -25,12 +26,51 @@ TOOL = "aflpp"
 TOOL_VERSION = "aflpp-1"
 
 
+def _unsupported(target):
+    """Why AFL++ cannot drive this target, or None if it can.
+
+    Returning a REASON rather than silently producing an empty campaign is the whole point:
+    the operator needs to know the difference between "nothing was found" and "nothing was
+    run", and those two are otherwise identical on screen.
+    """
+    ftype = (target.file_type or "").lower()
+    if ftype in ("jar", "class"):
+        return ("AFL++ instruments native code and cannot drive a JVM target. Use the "
+                "black-box `fuzz` stage, which runs the JVM directly (~36 exec/s measured) "
+                "and reads uncaught exceptions as faults.")
+    if ftype == "pe":
+        return ("AFL++ cannot instrument a Windows PE here, and the Wine path runs at about "
+                "one execution a second. Use `synthesize_poc`, which derives the overflow "
+                "from the recovered stack frame without executing at all.")
+    host = sandbox.host_arch()
+    if target.arch and host and target.arch != host:
+        return (f"AFL++ qemu-mode runs afl-qemu-trace, which is built for the host "
+                f"({host}); it cannot execute a {target.arch} binary. Use the black-box "
+                f"`fuzz` stage, which routes through qemu-user for this architecture and "
+                f"takes its coverage from qemu's own block log.")
+    return None
+
+
 def coverage_stage(ctx) -> dict:
     target = TargetDAO(ctx.conn).get(ctx.target_id) if ctx.target_id else None
     if target is None:
         raise ValueError("coverage_fuzz requires a target_id")
 
     p = ctx.params or {}
+    # Can AFL++ drive this target AT ALL? afl-qemu-trace is built for the HOST architecture
+    # and AFL++ instruments native code, so a cross-architecture ELF, a Windows PE and a jar
+    # are all outside what this backend can execute -- and the failure is the quiet kind:
+    # measured on an aarch64 target, the campaign ran to completion and reported
+    # `crash_inputs: 0, unique: 0, confirmed: 0` with status `done`, which reads exactly like
+    # a thorough campaign that found nothing. The `advise` endpoint recommended it first for
+    # every one of the eleven non-host architectures in the corpus.
+    why = _unsupported(target)
+    if why:
+        ctx.emit("coverage.done", payload={"supported": False, "backend": "aflpp",
+                                           "crash_inputs": 0, "unique": 0, "confirmed": 0,
+                                           "note": why})
+        ctx.progress(pct=100, msg=why[:90])
+        return {}
     afl = aflpp.locate_afl(p.get("afl_path"))
     if afl is None:
         raise RuntimeError(
