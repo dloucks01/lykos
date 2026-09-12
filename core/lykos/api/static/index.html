@@ -1771,8 +1771,15 @@ async function openBoardFinding(fid){
   SEL_FINDING=fid;
   switchView('board');                       // loadBoard -> renderBoard reads SEL_FINDING
 }
-let STRINGS=[];
-async function loadStrings(tid){ STRINGS = await api(`/targets/${tid}/strings`)||[]; renderStrings(""); }
+let STRINGS=[]; let STRINGS_TOTAL=0;
+async function loadStrings(tid){
+  // The endpoint now pages and reports the true total, so the panel can say when it is
+  // showing a slice rather than stopping silently at the cap.
+  const r = await api(`/targets/${tid}/strings`);
+  if(Array.isArray(r)){ STRINGS = r; STRINGS_TOTAL = r.length; }        // older stores
+  else { STRINGS = (r && r.items) || []; STRINGS_TOTAL = (r && r.total) || STRINGS.length; }
+  renderStrings("");
+}
 function renderStrings(q){
   const el=document.getElementById("strings"); if(!el) return;
   if(!STRINGS.length){ el.innerHTML=`<div class="hint">No strings yet — run Decompile.</div>`; return; }
@@ -1780,7 +1787,9 @@ function renderStrings(q){
   const list = q ? STRINGS.filter(s=>(s.value||"").toLowerCase().includes(q)) : STRINGS;
   const cap=2000, shown=list.slice(0,cap);
   el.innerHTML = `<input class="fsearch" placeholder="filter strings…" value="${esc(q)}" oninput="renderStrings(this.value)">`+
-    `<div class="mono" style="color:var(--faint);font-size:10px;margin-bottom:3px">${list.length===STRINGS.length?STRINGS.length:list.length+" of "+STRINGS.length} strings</div>`+
+    `<div class="mono" style="color:var(--faint);font-size:10px;margin-bottom:3px">${
+      list.length===STRINGS.length?STRINGS.length:list.length+" of "+STRINGS.length} strings${
+      (STRINGS_TOTAL>STRINGS.length)?` · showing the first ${STRINGS.length} of ${STRINGS_TOTAL} in this binary`:""}</div>`+
     `<div class="sec" style="max-height:240px;overflow:auto">`+
     (shown.length?shown.map(s=>`${s.addr}  ${esc((s.value||"").slice(0,90))} <span style="color:var(--faint)">[${(s.xrefs||[]).length} xref]</span>`).join("<br>"):`<div class="hint">no match</div>`)+
     (list.length>cap?`<br><span class="hint">…${list.length-cap} more — refine the filter</span>`:"")+

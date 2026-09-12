@@ -144,6 +144,17 @@ def heap_stage(ctx) -> dict:
                 "dedup_key": key, "state": "corroborated", "confidence": 0.9})
             findings += 1
 
+        # A STATIC target cannot load the shim at all, so "no heap errors observed" would be a
+        # clean bill of health from a check that never ran -- the caveat was in the note while
+        # the verdict said the opposite. Nothing observed is not the same as nothing there.
+        if not errors and (target.linking or "").lower() == "static":
+            ctx.emit("heap.done", payload={
+                "ok": False, "applicable": False, "errors": 0, "findings": 0, "kinds": [],
+                "note": ("this target is statically linked, so the LD_PRELOAD guard-page "
+                         "allocator never loaded -- nothing was checked, which is not the "
+                         "same as nothing found. Use a dynamically-linked build.")})
+            ctx.progress(pct=100, msg="heap check not applicable: target is statically linked")
+            return {"metrics": {"applicable": False}}
         ctx.emit("heap.done", payload={"ok": True, "errors": len(errors), "findings": findings,
                  "kinds": sorted({e.get("error") for e in errors if e.get("error") in _MAP}),
                  "note": None if errors else "no heap errors observed on this input "

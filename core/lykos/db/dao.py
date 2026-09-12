@@ -449,10 +449,11 @@ class StringDAO(BaseDAO):
             self.conn.execute("ROLLBACK"); raise
         return len(strings)
 
-    def list_by_target(self, target_id: str, limit: int = 2000) -> list[StringRef]:
+    def list_by_target(self, target_id: str, limit: int = 2000,
+                       offset: int = 0) -> list[StringRef]:
         rows = self.conn.execute(
-            "SELECT * FROM string_ref WHERE target_id=? ORDER BY addr LIMIT ?",
-            (target_id, limit)).fetchall()
+            "SELECT * FROM string_ref WHERE target_id=? ORDER BY addr LIMIT ? OFFSET ?",
+            (target_id, limit, max(0, int(offset)))).fetchall()
         return [StringRef(id=r["id"], target_id=r["target_id"], addr=r["addr"],
                           created_at=r["created_at"], value=r["value"],
                           xrefs=loads(r["xrefs_json"])) for r in rows]
@@ -630,6 +631,13 @@ class FindingDAO(BaseDAO):
             return "candidate", "info", 0.0
         state = FINDING_STATES[max(_rank(FINDING_STATES, r["state"]) for r in rows)]
         severity = SEVERITIES[max(_rank(SEVERITIES, r["severity"]) for r in rows)]
+        # A finding with a working reproducer is not "low", whatever the rule that first
+        # spotted it guessed. jhead's proven out-of-bounds read carried the severity its
+        # pattern detector assigned -- low -- so the one finding in the report with a verified
+        # PoC was badged below unproven advisories. Severity here means demonstrated impact,
+        # and a PoC is the strongest evidence of it the platform can produce.
+        if state == "poc-backed" and _rank(SEVERITIES, severity) < _rank(SEVERITIES, "high"):
+            severity = "high"
         return state, severity, max((r["confidence"] or 0.0) for r in rows)
 
     def verdicts(self, finding_id: str) -> list[dict]:

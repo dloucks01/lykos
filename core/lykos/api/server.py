@@ -12,6 +12,7 @@ import re
 import select
 import signal
 import socket
+import tarfile
 import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -210,8 +211,18 @@ class Handler(BaseHTTPRequestHandler):
             if m:
                 s = self._store()
                 try:
-                    strs = StringDAO(s.conn).list_by_target(m.group(1))
-                    return self._json([_stringref(x) for x in strs])
+                    # A binary can hold far more strings than the cap returns, and the old
+                    # response was indistinguishable from "that is all of them" -- it stopped
+                    # at exactly 2000 with nothing saying so.
+                    q = parse_qs(urlparse(self.path).query)
+                    limit = max(1, min(int((q.get("limit") or ["2000"])[0]), 5000))
+                    offset = max(0, int((q.get("offset") or ["0"])[0]))
+                    sd = StringDAO(s.conn)
+                    strs = sd.list_by_target(m.group(1), limit=limit, offset=offset)
+                    total = sd.count_by_target(m.group(1))
+                    return self._json({"total": total, "offset": offset, "limit": limit,
+                                       "truncated": offset + len(strs) < total,
+                                       "items": [_stringref(x) for x in strs]})
                 finally:
                     s.close()
             m = _TARGET_FIND.match(path)
@@ -421,6 +432,11 @@ class Handler(BaseHTTPRequestHandler):
         PoC level -- the data the case findings board aggregates."""
         s = self._store()
         try:
+            # A mistyped or deleted case returned `200 []`, so the board rendered "no
+            # findings" for a case that does not exist -- indistinguishable from a real case
+            # that has none.
+            if not s.cases.get(cid):
+                return self._json({"error": "no case"}, 404)
             tmap = {t.id: t for t in s.targets.list_by_case(cid)}
             best_poc = {}
             for t in tmap.values():
@@ -548,7 +564,16 @@ class Handler(BaseHTTPRequestHandler):
             tmp.write_bytes(data)
             s = self._store()
             try:
-                ids = s.import_archive(tmp)
+                try:
+                    ids = s.import_archive(tmp)
+                except tarfile.ReadError:
+                    # this endpoint takes a case ARCHIVE, and the name invites people to try a
+                    # binary here; `ReadError('not a gzip file')` is a Python repr, not an
+                    # answer. Binaries go to POST /cases/<id>/targets.
+                    return self._json({"error": (
+                        "this is not a lykos case archive (expected a .tar.gz produced by "
+                        "export). To add a binary to a case, upload it to "
+                        "/cases/<case-id>/targets instead.")}, 400)
                 return self._json({"cases": ids}, 201)
             finally:
                 s.close()
