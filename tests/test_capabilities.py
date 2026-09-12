@@ -37,6 +37,27 @@ def test_the_ladder_ceiling_is_explained_not_just_greyed():
     assert "runtime, not a" in why, "it is the runtime, not a gap to be closed later"
 
 
+def test_a_windows_pe_loses_the_two_linux_only_channels():
+    """The stages already knew: heap_check declines with "the guard-page heap checker is a
+    Linux/ELF LD_PRELOAD shim" and dynamic_taint with "runs Linux ELF only". The map did not,
+    so the workbench offered both on a PE and the operator found out by waiting for a
+    decline -- the exact friction the map exists to remove."""
+    un = set(cap.unavailable_summary(T("pe", "x86-64", "dynamic")))
+    assert {"heap_check", "dynamic_taint"} <= un
+    # ...but the two channels that DO cover Windows stay available: behaviour tracing and the
+    # runtime monitor both have Wine relay paths
+    assert "behavior_trace" not in un and "debug_monitor" not in un
+    # and Ghidra decompiles PE, so the static half is intact
+    assert "disassemble" not in un and "detect_cwe" not in un
+
+
+def test_a_substrate_with_no_runner_loses_the_execution_channels():
+    un = set(cap.unavailable_summary(T("macho", "x86-64")))
+    assert {"behavior_trace", "debug_monitor", "dynamic_taint", "heap_check"} <= un
+    why = cap._why_unavailable("behavior_trace", T("macho", "x86-64"))
+    assert "ELF and PE only" in why
+
+
 def test_a_cross_architecture_target_loses_only_what_is_native_bound():
     un = set(cap.unavailable_summary(T("elf", OTHER, "dynamic")))
     # coverage_fuzz is deliberately NOT asserted here: whether AFL++ can drive an
