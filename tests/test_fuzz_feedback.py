@@ -143,3 +143,41 @@ def test_a_crash_that_does_not_happen_again_is_not_filed():
         assert calls == [["-dc"]], "re-run under the same options it was found with"
     finally:
         st.run_input = real
+
+
+def test_the_input_goes_where_the_target_wants_it(tmp_path):
+    """A service that takes `-c <config>` cannot be fuzzed by appending the input to argv: with
+    any other flag present you get `-c -v <path>` and the flag eats the file. `@@` marks the
+    position, the convention the eval harness already used."""
+    from lykos.analyze.fuzz.runner import invocation
+    wf = tmp_path / "in.bin"
+    argv, stdin = invocation("file", wf, b"name=x", ["-c", "@@"])
+    assert argv == ["-c", str(wf)] and stdin == b""
+    argv, _ = invocation("file", wf, b"name=x", ["-c", "@@", "-v"])
+    assert argv == ["-c", str(wf), "-v"], "position is preserved, not appended"
+    # no placeholder: appended, which is what every existing caller expects
+    argv, _ = invocation("file", wf, b"x", ["-v"])
+    assert argv == ["-v", str(wf)]
+    argv, _ = invocation("file", wf, b"x")
+    assert argv == [str(wf)]
+    # stdin carries no carrier at all, so argv passes through untouched
+    argv, stdin = invocation("stdin", wf, b"payload", ["-q"])
+    assert argv == ["-q"] and stdin == b"payload"
+
+
+def test_the_fuzz_stage_honours_the_operator_argv():
+    """It read `params.argv` nowhere: a target requiring a flag was run as `daemon <workfile>`,
+    printed its usage and exited -- 8,000 executions, `behaviours: 1`, reported as a clean
+    campaign that found nothing. The mined flags are exploration and go in front; the
+    operator's argv is the contract."""
+    import inspect
+
+    from lykos.analyze.fuzz import stage as fz
+    src = inspect.getsource(fz.fuzz_stage)
+    assert 'p.get("argv")' in src, "the stage has to read it"
+    assert "base_argv=base_argv" in src, "...and pass it to the campaign"
+    camp = inspect.getsource(fz.fuzz_campaign)
+    assert "run_argv = prefix + base_argv" in camp
+    for used in ("base_argv=run_argv", 'kw["base_argv"] = run_argv',
+                 "argv = list(run_argv)"):
+        assert used in camp, used

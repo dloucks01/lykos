@@ -108,7 +108,7 @@ def test_the_recorded_argv_is_a_prefix_not_the_whole_invocation():
 
     from lykos.analyze.fuzz import stage as fz
     src = inspect.getsource(fz.fuzz_campaign)
-    assert "argv = list(prefix)" in src, "fuzz must record the flag prefix it ran under"
+    assert "argv = list(run_argv)" in src, "fuzz must record the argv it ran under"
     assert "invocation(mode, workfile, data)[0]" not in src, \
         "recording the invocation puts a dead scratch path in front of the real input"
 

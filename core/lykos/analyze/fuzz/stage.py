@@ -23,7 +23,7 @@ from ..dynamic import sandbox
 from ..dynamic.minimize import minimize
 from ..dynamic.stage import crash_finding_candidate
 from ..poc.capture import modes_for
-from . import structure
+from . import structure, textconf
 from .mutator import Mutator
 from .runner import run_input
 
@@ -84,9 +84,85 @@ def behaviour_of(res, data: bytes = b""):
             hashlib.blake2b(shape, digest_size=8).digest())
 
 
+class _Str:
+    """A StringDAO row's shape, for strings scanned straight out of the file."""
+
+    __slots__ = ("value", "addr", "section")
+
+    def __init__(self, value):
+        self.value, self.addr, self.section = value, None, None
+
+
+def _strings_for(ctx, target):
+    """The target's strings -- from the DB when `disassemble` has run, else scanned.
+
+    The string table is written by `disassemble`, which means Ghidra. Fuzzing before that is a
+    perfectly reasonable thing to do -- the whole point of leading with execution is that it
+    needs no decompilation -- but it silently cost the campaign both of the things it mines
+    from strings: the dictionary and the format model. Against a config parser that reads
+    `name=`, `listen=`, `workers=`, a dictionary-less mutator has to invent those tokens byte
+    by byte and never does.
+    """
+    rows = [x for x in StringDAO(ctx.conn).list_by_target(target.id) if x.value]
+    if rows:
+        return rows
+    from .. import invocation as invmod
+    data = ctx.content.path(target.sha256).read_bytes()
+    return [_Str(v) for v in invmod.raw_strings(data)]
+
+
+def _discover_argv(ctx, target, exec_timeout):
+    """Work out the target's required arguments -- and CHECK them before using them.
+
+    A service behind `-c <config>` that is fuzzed bare prints its usage and exits on every
+    execution: 8,000 runs, one distinct behaviour, no crashes, reported as a clean campaign
+    against a program the fuzzer never entered. The flags are written in the binary's own
+    usage line, so nobody has to know them in advance.
+
+    But a proposal read off the strings is a hypothesis, and applying one unchecked produces
+    the same failure pointing the other way -- unzip needs no flags at all, and `-d <dir> -x x`
+    is a command line it refuses. So the proposal costs two executions to verify against the
+    target's own no-argument behaviour, and is used only if the target accepts it. Returns
+    (argv, note-or-None, takes-a-config) -- an unverified proposal yields ([], note, False) so
+    the run still says what was considered and why it was dropped. The third value says the
+    binary documents a REQUIRED config path, which is also what says its input is text.
+    """
+    from .. import invocation as invmod
+    try:
+        data = ctx.content.path(target.sha256).read_bytes()
+        found = invmod.discover([x.value for x in _strings_for(ctx, target)])
+        argv = invmod.propose_argv(found)
+        if not argv:
+            return [], None, False
+        d = ctx.scratch() / "argvprobe"
+        d.mkdir(parents=True, exist_ok=True)
+        exe = d / "target.bin"
+        exe.write_bytes(data)
+        exe.chmod(0o755)
+        sample = d / "sample"
+        sample.write_bytes(b"# lykos\n")
+
+        def _run(a):
+            return sandbox.run(exe, argv=a, stdin=b"", timeout=max(4.0, exec_timeout * 2),
+                               arch=target.arch, endianness=target.endianness,
+                               bits=target.bits)
+        v = invmod.verify(_run, exe, argv, str(sample))
+    except Exception as e:                     # discovery is an optimisation, never a blocker
+        return [], f"invocation discovery failed: {e}", False
+    if v["accepted"] and v["bare_rejected"]:
+        conf = any(f.get("kind") == "config" and not f.get("optional")
+                   for f in found["flags"])
+        return argv, (f"discovered from the binary's usage line and verified by running it: "
+                      f"{' '.join(argv)}"), conf
+    if not v["bare_rejected"]:
+        return [], ("the target runs with no arguments, so no flags were added "
+                    f"(it does document {' '.join(argv)})"), False
+    return [], f"proposed {' '.join(argv)} but the target refused it -- {v['why']}", False
+
+
 def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_seconds,
                   exec_timeout, rng, detector, event_prefix, note_prefix, run_fn=run_input,
-                  mutator=None, cover_blocks=(), cover_flags=()):
+                  mutator=None, cover_blocks=(), cover_flags=(), base_argv=()):
     """Shared mutational campaign: mutate -> sandbox -> dedup-by-signal -> minimize ->
     dyn_result + Confirmed finding. Used by both the black-box `fuzz` stage and the directed
     stage (which supplies a corpus/dictionary aimed at specific sinks). Returns stats.
@@ -123,6 +199,12 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
     # it is only acceptable inside the unshared-net, read-only-root namespace. On the
     # rlimits-only fallback the target keeps the plain argv it was given.
     flags = list(cover_flags or ())
+    # How the TARGET has to be invoked, as the operator gave it. This was ignored entirely:
+    # a service that requires `-c <config>` was run as `daemon <workfile>`, printed its usage
+    # and exited -- 8,000 times, reported as a clean campaign with `behaviours: 1`. Mined
+    # flags are exploratory and go in front; the operator's argv is the contract and keeps its
+    # order, including where `@@` puts the input.
+    base_argv = list(base_argv or ())
     flaky = 0
     # Some options make the target launch something INTERACTIVE -- jhead's `-ce` opens an
     # editor, `-cmd` spawns a shell -- and those run at about a second each against 0.5 ms for
@@ -153,6 +235,7 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
         # suspicion is still worth running (it reaches code nothing else does) but not at 64
         # executions a batch, which is how one interactive option ate a whole campaign.
         risky = any(f not in flag_cost or _dear(flag_cost.get(f), base_ms) for f in prefix)
+        run_argv = prefix + base_argv          # exploration first, the contract last
         want = min((_PROBE_N if risky else batch_n) if batchable else 1, max_execs - execs)
         inputs = [mut.mutate(rng.choice(corpus), corpus) for _ in range(max(1, want))]
         results = None
@@ -163,7 +246,7 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
             t_batch = time.time()
             results = sandbox.run_batch(exe, inputs, mode=mode, timeout=exec_timeout,
                                         arch=target.arch, endianness=target.endianness,
-                                        bits=target.bits, blocks=arm, base_argv=prefix)
+                                        bits=target.bits, blocks=arm, base_argv=run_argv)
             if results is None:
                 batchable = False                     # not available here; stay per-exec
             else:
@@ -178,7 +261,7 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
             inputs = inputs[:1]
             kw = {"endianness": target.endianness, "bits": target.bits}
             if run_fn is run_input:
-                kw["base_argv"] = prefix
+                kw["base_argv"] = run_argv
                 kw["blocks"] = tuple(all_blocks - seen_blocks) if all_blocks else ()
             results = [run_fn(exe, mode, workfile, exec_timeout, target.arch, inputs[0],
                               **kw)[1]]
@@ -187,7 +270,7 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
             # is scratch and means nothing to a later replay. A crash found under an option
             # only reproduces WITH that option -- jhead's `-cmd` runs a command built from the
             # input -- so the prefix travels with the input it crashed.
-            argv = list(prefix)
+            argv = list(run_argv)
             execs += 1
             # Keep anything that made the program behave in a way we have not seen. This is the
             # ratchet: without it the corpus never grows and a deeper path is reachable only by a
@@ -221,7 +304,7 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
                 # runs clean. Filing those left every downstream stage chasing a crash that
                 # cannot be reproduced, and the release gate failing with "PoC not reproduced".
                 if not _reproduces(run_fn, exe, mode, workfile, exec_timeout,
-                                   target, data, prefix):
+                                   target, data, run_argv):
                     flaky += 1
                     continue
                 # A bucket is (signal, faulting address): the same signal from a different
@@ -252,7 +335,7 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
                     execs += mexecs
                     note = (f"minimized {len(data)}->{len(mdata)}B"
                             if len(mdata) < len(data) else None)
-                    margv = list(prefix)
+                    margv = list(run_argv)
                     input_sha = ctx.put_artifact("fuzz-crash-input", data=mdata)
                     dd.insert(target.id, target.case_id, run_id=ctx.run_id, input_sha=input_sha,
                               input_mode=mode, argv=margv, signal=res.signal, signal_name=sig,
@@ -493,6 +576,14 @@ def fuzz_stage(ctx) -> dict:
     max_seconds = float(p.get("max_seconds", 30))
     exec_timeout = float(p.get("exec_timeout", 2))
     rng = random.Random(int(p.get("seed", 1337)))
+    # How to invoke the target. `@@` marks where the input goes -- `["-c", "@@"]` for a
+    # service that takes a config path behind a flag; without it the input is appended.
+    base_argv = [str(a) for a in (p.get("argv") or [])]
+    auto_argv, wants_config = None, False
+    if not base_argv and p.get("discover_argv", True):
+        base_argv, auto_argv, wants_config = _discover_argv(ctx, target, exec_timeout)
+    elif any(a for a in base_argv):
+        wants_config = "@@" in base_argv
 
     # A PE runs under Wine at about one execution a second (measured: 1,249 ms against ~580/s
     # native) with no coverage feedback, so a campaign manages a few dozen executions and then
@@ -504,13 +595,24 @@ def fuzz_stage(ctx) -> dict:
                 "second and there is no coverage feedback, so this campaign will manage a few "
                 "dozen executions rather than thousands. Prefer synthesize_poc, which derives "
                 "the overflow from the recovered stack frame without executing at all.")})
-    strings = StringDAO(ctx.conn).list_by_target(target.id)
+    strings = _strings_for(ctx, target)
     blocks = _recovered_blocks(ctx, target)
     flags = mine_flags(ctx.content.path(target.sha256).read_bytes())
     corpus = [base64.b64decode(x) for x in p.get("seeds", [])] or list(_DEFAULT_SEEDS)
     dictionary = _mine_dictionary(strings)
     mutator, note = _structure_mutator(p, rng, dictionary), "found by fuzzing"
     fmt = p.get("format_name") or ("custom" if p.get("format") else None)
+    if mutator is None and not p.get("format") and wants_config:
+        # The binary documents a required `-c <config>`, so its input is a config file, and a
+        # config file is text: `key=value` lines. No binary format model describes that, and a
+        # byte mutator cannot reach the `strcpy` behind a key it has to invent first -- 2,000
+        # executions against one produced 826 distinct behaviours and no crashes.
+        keys = textconf.keys_from([x.value for x in strings])
+        mutator, fmt = textconf.KeyValueMutator(rng, keys, dictionary), "keyvalue"
+        corpus = [textconf.seed_for(keys)] + list(corpus)
+        ctx.emit("fuzz.format", payload={"model": "keyvalue", "auto": True,
+                                         "keys": keys[:16],
+                                         "why": "the binary requires a config path"})
     if mutator is None and not p.get("format"):
         # Nobody supplied a model, so ask the binary. A parser rejects random bytes before it
         # reaches any of its own logic -- jhead ran 98,500 executions for zero finds while
@@ -524,6 +626,13 @@ def fuzz_stage(ctx) -> dict:
             seed = structure.seed_for_name(fmt)
             if seed:
                 corpus = [seed] + list(corpus)
+    # Always, not only when a format model was chosen: a wrong invocation is the failure that
+    # looks most like a clean campaign, so it has to be visible in the run's own events.
+    ctx.emit("fuzz.invocation", payload={
+        "argv": base_argv, "placeholder": "@@" in base_argv,
+        "discovered": auto_argv,
+        "note": ("the input is appended to argv; use \"@@\" to place it elsewhere"
+                 if base_argv and "@@" not in base_argv else None)})
     if mutator:
         note = "found by structure-aware fuzzing"
         ctx.emit("fuzz.format", payload={"model": fmt or "custom", "auto": not (
@@ -538,7 +647,7 @@ def fuzz_stage(ctx) -> dict:
                            max_execs=share_execs, max_seconds=share_secs,
                            exec_timeout=exec_timeout, rng=rng, detector="fuzz",
                            event_prefix="fuzz", note_prefix=note, mutator=mutator,
-                           cover_blocks=blocks, cover_flags=flags)
+                           cover_blocks=blocks, cover_flags=flags, base_argv=base_argv)
         for k in totals:
             totals[k] += st.get(k, 0)
         if st.get("crashes"):

@@ -101,3 +101,50 @@ def test_afl_usable_requires_the_qemu_helper_too(monkeypatch):
     assert A.afl_usable() is False
     monkeypatch.setattr(aflpp, "locate_qemu_trace", lambda *a, **k: "/usr/bin/afl-qemu-trace")
     assert A.afl_usable() is True
+
+
+def test_an_empty_import_table_is_not_evidence_of_argv():
+    """A statically linked binary has no import table, and falling through to "argv/none" made
+    a config-driven daemon -- whose entire input is a file -- report as argv-driven with full
+    confidence. Absence of evidence is not evidence."""
+    from lykos.analyze.advise import _input_mode, advise
+    assert _input_mode([])[0] is None
+    assert _input_mode(None)[0] is None
+    assert "not determinable" in _input_mode([])[1]
+    # the same names from a symbol table still work
+    assert _input_mode(["fopen", "fgets", "malloc"])[0] == "file"
+    assert _input_mode(["read", "memcpy"])[0] == "stdin"
+    assert _input_mode(["getpid", "malloc"])[0] == "arg"
+
+    out = advise(imports=[], functions=900, findings=2, seeds=0, has_format=False,
+                 afl_usable=True, executable=True)
+    assert out["input_unknown"] is True and out["input_mode"] is None
+    assert "@@" in out["headline"], "tell the operator how to supply the invocation"
+
+
+def test_a_required_config_flag_says_what_the_input_is():
+    """A statically linked daemon has no import table, so the import-based guess returns
+    "not determinable" and the operator is told to work it out themselves. But the binary
+    documents `-c <config>` in its own usage line, which survives stripping and static linking
+    -- and a required config path IS the input channel."""
+    from lykos.analyze.advise import advise
+    inv = {"flags": [{"flag": "-c", "kind": "config", "takes_value": True, "optional": False}],
+           "proposed_argv": ["-c", "@@"]}
+    out = advise(imports=[], functions=0, findings=0, seeds=0, has_format=False,
+                 afl_usable=False, executable=True, invocation=inv)
+    assert out["input_mode"] == "file"
+    assert "-c" in out["shape"]
+    assert out["plan"][0]["params"]["argv"] == ["-c", "@@"], \
+        "the plan has to carry the argv, or running it repeats the failure"
+    assert any("required -c" in c["text"] for c in out["checks"])
+
+
+def test_an_optional_flag_is_not_evidence_of_anything():
+    """unzip documents `[-d exdir]`; reading that as a requirement produced a command line
+    unzip refuses."""
+    from lykos.analyze.advise import advise
+    inv = {"flags": [{"flag": "-d", "kind": "path", "takes_value": True, "optional": True}],
+           "proposed_argv": []}
+    out = advise(imports=[], functions=0, findings=0, seeds=0, has_format=False,
+                 afl_usable=False, executable=True, invocation=inv)
+    assert out["input_mode"] is None and out.get("input_unknown")

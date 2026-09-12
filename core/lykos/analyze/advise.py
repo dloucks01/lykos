@@ -25,8 +25,18 @@ _STDIN_RE = re.compile(r"\bread\b|fgets|scanf|getchar|\bgets\b", re.I)
 
 
 def _input_mode(imports: list) -> tuple:
-    """(mode, human description) from the import table."""
-    blob = " ".join(imports or [])
+    """(mode, human description) from the names of the functions the binary calls.
+
+    Falling through to "argv/none" when the list is EMPTY was the bug: a statically linked
+    binary has no import table at all, so a config-driven daemon whose whole input is a file
+    came back as "Input looks like argv/none" with full confidence. An empty list is not
+    evidence of argv, it is the absence of evidence, and the caller can often supply the same
+    names from the symbol table instead.
+    """
+    names = [x for x in (imports or []) if x]
+    if not names:
+        return None, "not determinable from this binary"
+    blob = " ".join(names)
     if _FILE_RE.search(blob):
         return "file", "a file parser"
     if _STDIN_RE.search(blob):
@@ -57,7 +67,8 @@ def fuzz_backend(afl_usable: bool, static_findings: int) -> tuple:
 def advise(*, imports: list, functions: int, findings: int, seeds: int,
            has_format: bool, afl_usable: bool, crashes: int = 0,
            pocs: int = 0, executable: Optional[bool] = None,
-           file_format: Optional[str] = None) -> dict:
+           file_format: Optional[str] = None,
+           invocation: Optional[dict] = None) -> dict:
     """A recommendation and an ORDERED PLAN for this target.
 
     The plan is dynamic-first on purpose. Running decompile -> detect -> maybe-fuzz produces
@@ -84,7 +95,34 @@ def advise(*, imports: list, functions: int, findings: int, seeds: int,
                           "params": {}, "ready": True, "done": False}],
                 "file_parser": False, "afl_usable": afl_usable, "analysable": False}
     mode, shape = _input_mode(imports)
+    # A binary that documents a REQUIRED `-c <config>` has told us what its input is, and it
+    # said so in a channel that survives both stripping and static linking. That is exactly the
+    # target the import-table check cannot read, so this is not a tie-break -- it is the only
+    # evidence there is.
+    cfg_flag = next((f for f in ((invocation or {}).get("flags") or [])
+                     if f.get("kind") == "config" and not f.get("optional")), None)
+    if cfg_flag and mode is None:
+        mode, shape = "file", f"a config file behind {cfg_flag['flag']}"
     backend, backend_why = fuzz_backend(afl_usable, findings)
+    if mode is None:
+        # Say what is missing and what to do, rather than guessing a channel. Feeding a target
+        # the wrong way is the failure that looks exactly like a program with no bug.
+        return {"input_mode": None, "shape": shape, "backend": backend,
+                "backend_why": backend_why, "analysable": True, "input_unknown": True,
+                "invocation_hint": (invocation or {}).get("proposed_argv"),
+                "headline": ("Nothing in this binary says how it takes input -- it is "
+                             "statically linked or stripped, so there is no import table to "
+                             "read. Set the invocation yourself: give the fuzzer an argv with "
+                             "\"@@\" where the input belongs (for example -c @@ for a service "
+                             "that takes a config path), and attach a known-good input as a "
+                             "seed."),
+                "checks": [{"ok": False,
+                            "text": "input channel -- unknown; supply argv (use @@ for the "
+                                    "input) and a seed"}],
+                "plan": [{"stage": "disassemble", "why": "recover functions; the call graph "
+                                                         "can still show which sinks exist",
+                          "params": {}, "ready": True, "done": functions > 0}],
+                "file_parser": False, "afl_usable": afl_usable}
     if file_format == "pe":
         # AFL++ instruments ELF; it cannot drive a Windows PE here, and the Wine path runs at
         # about one execution a second (measured: 1,249 ms per run against ~580/s native), so
@@ -114,9 +152,15 @@ def advise(*, imports: list, functions: int, findings: int, seeds: int,
          "text": (f"static findings — {findings}" if findings else
                   "static findings — none yet")},
     ]
+    if cfg_flag:
+        checks.insert(0, {"ok": True, "text": (
+            f"invocation — the binary documents a required {cfg_flag['flag']} "
+            f"<{cfg_flag.get('kind')}>, so the input is that file")})
 
-    plan = [{"stage": backend, "why": backend_why, "params": {"input_mode": mode},
-             "ready": True}]
+    params = {"input_mode": mode}
+    if invocation and invocation.get("proposed_argv"):
+        params["argv"] = list(invocation["proposed_argv"])
+    plan = [{"stage": backend, "why": backend_why, "params": params, "ready": True}]
     if crashes or pocs:
         plan += [
             {"stage": "root_cause", "why": "name the faulting function and CWE",
