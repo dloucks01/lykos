@@ -125,7 +125,11 @@ def _intover_candidates(func_irs, functions, only=None, width=4):
                             "title": ("Bounds check on a sum that can wrap "
                                       f"({width * 8}-bit arithmetic)"),
                             "function_addr": faddr, "site_addr": i.get("addr"),
-                            "dedup_key": f"CWE-190:int_overflow_check:{faddr}",
+                            # ONE finding with many sites, the grain every other channel
+                            # uses. Keyed per function it filed fourteen findings on jhead and
+                            # took the report from 19 to 37 -- the same inventory read as a
+                            # list of defects.
+                            "dedup_key": "CWE-190:int_overflow_check",
                             "site_detail": (f"{produced[hit]} at {width * 8} bits feeds a "
                                             f"comparison in {fn}: if the sum wraps, the check "
                                             f"passes on a value that is far too large"),

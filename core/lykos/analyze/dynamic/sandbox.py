@@ -488,22 +488,29 @@ def run(exe, *, argv=(), stdin: bytes = b"", timeout: float = 10.0,
     # classify_rc() holds the one copy of this: native subprocesses report -signum while
     # wrappers (bwrap/qemu) report 128+signum, and the two had drifted apart here.
     crashed, sig, sig_name, exit_code = classify_rc(rc)
-    note = None
+    note, fault_pc = None, None
     if trace_log:
-        reached = _qemu_reached(trace_log, blocks)
+        reached, last = _qemu_reached(trace_log, blocks, want_last=True)
         note = ",".join(str(x) for x in reached) or None
+        # Where it died, for an EMULATED target. The ptrace tracer cannot reach inside qemu,
+        # so a cross-architecture crash had no faulting address and every SIGSEGV in the
+        # program bucketed as one finding. qemu's log stops at the fault, so the last block it
+        # translated is the closest thing to a fault locus available here -- a block address,
+        # not the exact instruction, which is enough to tell two defects apart.
+        if crashed:
+            fault_pc = last
         shutil.rmtree(Path(trace_log).parent, ignore_errors=True)
     return RunResult(
         isolation=iso, crashed=crashed, timed_out=timed,
         exit_code=exit_code, signal=sig, signal_name=sig_name,
         stdout=(out or b"")[:capture], stderr=(err or b"")[:capture],
-        duration_ms=dur, cmd=cmd, note=note)
+        duration_ms=dur, cmd=cmd, note=note, fault_pc=fault_pc)
 
 
 _TRACE_PC = re.compile(rb"^Trace \d+: 0x[0-9a-f]+ \[[^/]*/([0-9a-f]+)/", re.M)
 
 
-def _qemu_reached(path, blocks):
+def _qemu_reached(path, blocks, want_last: bool = False):
     """Which of `blocks` qemu executed, from its own -d exec log.
 
     The log line is `Trace 0: <host addr> [<flags>/<GUEST PC>/...] <symbol>`, so the guest PC
@@ -511,12 +518,18 @@ def _qemu_reached(path, blocks):
     address in the target at all.
     """
     want = set(blocks)
+    empty: tuple = ((), None) if want_last else ()
     if not want:
-        return ()
+        return empty
     try:
         with open(path, "rb") as fh:
             data = fh.read()
     except OSError:
-        return ()
-    seen = {int(m.group(1), 16) for m in _TRACE_PC.finditer(data)}
-    return sorted(seen & want)
+        return empty
+    seen, last = set(), None
+    for m in _TRACE_PC.finditer(data):
+        pc = int(m.group(1), 16)
+        seen.add(pc)
+        last = pc
+    hit = sorted(seen & want)
+    return (hit, last) if want_last else hit
