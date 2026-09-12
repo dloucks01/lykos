@@ -201,3 +201,26 @@ def test_an_emulated_target_reports_the_blocks_it_reached():
     reached = [x for x in (res.note or "").split(",") if x]
     assert res.exit_code == 0, res.stderr[:200]
     assert 20 < len(reached) < len(blocks), f"{len(reached)} of {len(blocks)}"
+
+
+def test_the_sandbox_does_not_show_the_target_the_host_process_table():
+    """A fresh procfs without a PID namespace still lists every process on the host: a target
+    could read 564 entries of /proc/<pid>/cmdline, and /proc/<pid>/environ for anything running
+    as the same user. The namespace is what makes the mount mean something -- and it does not
+    cost the tracer anything, because a pid namespace is exactly the scope ptrace and
+    /proc/<pid>/mem already work in."""
+    import shutil
+    import subprocess
+
+    from lykos.analyze.dynamic import sandbox
+    if not shutil.which("bwrap") or not sandbox._bwrap_usable():
+        pytest.skip("bubblewrap not available here")
+    assert "--unshare-pid" in sandbox._BWRAP_ARGS
+    cmd = ["bwrap"] + list(sandbox._BWRAP_ARGS) + [
+        "sh", "-c", 'ls /proc | grep -c "^[0-9]"']
+    inside = int(subprocess.run(cmd, capture_output=True, text=True,
+                                timeout=60).stdout.strip() or 0)
+    host = int(subprocess.run(["sh", "-c", 'ls /proc | grep -c "^[0-9]"'],
+                              capture_output=True, text=True, timeout=60).stdout.strip() or 0)
+    assert 0 < inside < 16, f"{inside} processes visible inside the sandbox"
+    assert inside < host, "the target must not see the host's process table"
