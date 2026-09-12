@@ -59,6 +59,9 @@ def dynamic_stage(ctx) -> dict:
     params = ctx.params or {}
     mode = params.get("input_mode", "none")      # stdin | arg | file | none
     argv = list(params.get("argv") or [])
+    # what gets RECORDED is this prefix, never the carrier appended below: a scratch path
+    # means nothing to whatever replays the crash later
+    prefix = list(argv)
     timeout = float(params.get("timeout", 10))
     input_bytes = base64.b64decode(params["input_b64"]) if params.get("input_b64") else b""
     input_sha = ctx.put_artifact("dyn-input", data=input_bytes) if input_bytes else None
@@ -87,7 +90,7 @@ def dynamic_stage(ctx) -> dict:
     stderr_sha = ctx.put_artifact("dyn-stderr", data=res.stderr) if res.stderr else None
     DynResultDAO(ctx.conn).insert(
         target.id, target.case_id, run_id=ctx.run_id, input_sha=input_sha, input_mode=mode,
-        argv=argv, exit_code=res.exit_code, signal=res.signal, signal_name=res.signal_name,
+        argv=prefix, exit_code=res.exit_code, signal=res.signal, signal_name=res.signal_name,
         crashed=res.crashed, timed_out=res.timed_out, isolation=res.isolation,
         duration_ms=res.duration_ms, stdout_sha=stdout_sha, stderr_sha=stderr_sha,
         note=res.note)

@@ -129,16 +129,13 @@ def how_to_feed(conn, target, input_sha, params):
         return params["input_mode"], list(params.get("argv") or []), "given"
     for r in DynResultDAO(conn).list_by_target(target.id):
         if r.input_sha == input_sha and r.input_mode:
-            # The recorded argv ends with the thing that CARRIES the input -- the workfile
-            # path for a file target, the payload itself for an argv one -- and the caller
-            # appends its own. Handing the whole thing back as a prefix made the replay
+            # dyn_result.argv is the FLAG PREFIX, never the thing carrying the input: the
+            # carrier is a scratch path that no longer exists by the time anything replays it,
+            # and the caller appends its own. Recording the whole invocation made the replay
             # `jhead /tmp/<gone>/input.bin /tmp/new/input.bin`; jhead stops at the missing
-            # first file and never reaches the crashing one, so a perfectly good crash was
-            # filed as "did not reproduce". Only the flags in front of it belong to the setup.
-            argv = list(r.argv or [])
-            if r.input_mode in ("file", "arg") and argv:
-                argv = argv[:-1]
-            return r.input_mode, argv, "recorded by the run that found it"
+            # first file and never reaches the crashing one, so a real crash was filed as
+            # "did not reproduce".
+            return r.input_mode, list(r.argv or []), "recorded by the run that found it"
     # Nothing recorded: rank the channels by what the binary imports rather than assuming
     # stdin. A file parser given its input on stdin looks exactly like a program with no bug.
     from ...db.dao import CallEdgeDAO
