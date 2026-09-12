@@ -348,3 +348,43 @@ def test_distinct_sinks_stay_distinct_findings(store, case):
     fs = fd.list_by_target(t.id)
     assert len(fs) == 2, "different sinks are different defects"
     assert {f.cwe for f in fs} == {"CWE-120", "CWE-78"}
+
+
+def test_a_message_about_a_password_is_not_a_hard_coded_password():
+    """Matching the keyword alone flagged ten strings in unzip -- "Enter password: ",
+    "incorrect password", "-P p Use password p to decrypt files" -- every one of them a message
+    ABOUT passwords and none of them a secret. That was two thirds of every finding reported
+    for that binary, which is how a real report becomes unreadable."""
+    from lykos.analyze.detect.detectors import _secret
+    for prose in ("error:  must give decryption password with -P option",
+                  "  -P p Use password p to decrypt files.  THIS IS INSECURE!  ",
+                  "  funzip [-password] [input[.zip|.gz]]",
+                  "%lu file%s skipped because of incorrect password.",
+                  "   skipping: %-22s  incorrect password",
+                  "password incorrect--reenter: ",
+                  "Enter password: ",
+                  "[%s] %s password: "):
+        assert _secret(prose) is None, f"still fires on {prose!r}"
+
+
+def test_a_credential_bound_to_a_value_is_still_found():
+    """The point is precision, not silence: a keyword bound to a secret-shaped value is the
+    thing worth reporting."""
+    from lykos.analyze.detect.detectors import _secret
+    for real in ("db_password=S3cr3t!", "api_key: AKIAIOSFODNN7EXAMPLE",
+                 '"password": "hunter2A"', "SECRET_TOKEN=abc123XYZ", "ftp_pass=Tr0ub4dor",
+                 # a hex or base64 token has no mixed case and no punctuation: it is still
+                 # the commonest credential shape there is
+                 "api_key=deadbeefcafebabe", "token=aGVsbG93b3JsZGhlbGxv"):
+        hit = _secret(real)
+        assert hit and hit[0] == "CWE-798", f"missed {real!r}"
+    assert _secret("AKIAIOSFODNN7EXAMPLE")[0] == "CWE-798"
+    assert _secret("-----BEGIN RSA PRIVATE KEY-----")[0] == "CWE-321"
+
+
+def test_a_placeholder_is_not_a_credential():
+    """`password=password` in a sample config is documentation, not a leak."""
+    from lykos.analyze.detect.detectors import _secret
+    assert _secret("password=password") is None
+    assert _secret("secret = changeme") is None
+    assert _secret("api_key=-v") is None, "a command-line option is not a value"
