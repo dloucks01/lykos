@@ -73,6 +73,7 @@ class TcpHTTPServer(ThreadingHTTPServer):
 _RUN_ID = re.compile(r"^/runs/([^/]+)$")
 _RUN_CANCEL = re.compile(r"^/runs/([^/]+)/cancel$")
 _TARGET_INVOKE = re.compile(r"^/targets/([^/]+)/invocation$")
+_TARGET_CAPS = re.compile(r"^/targets/([^/]+)/capabilities$")
 _CASE_ID = re.compile(r"^/cases/([^/]+)$")
 _TARGET_ID = re.compile(r"^/targets/([^/]+)$")
 _ARTIFACT = re.compile(r"^/artifacts/([0-9a-fA-F]+)$")
@@ -274,6 +275,9 @@ class Handler(BaseHTTPRequestHandler):
             m = _TARGET_ADVICE.match(path)
             if m:
                 return self._get_advice(m.group(1))
+            m = _TARGET_CAPS.match(path)
+            if m:
+                return self._get_capabilities(m.group(1))
             m = _TARGET_POC.match(path)
             if m:
                 s = self._store()
@@ -339,6 +343,37 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": "not found"}, 404)
         except Exception as e:
             self._json({"error": repr(e)}, 500)
+
+    def _get_capabilities(self, tid):
+        """What this target can and cannot have done to it, and why not.
+
+        Separate from /advice on purpose: advice says what to do NEXT, this says what is
+        POSSIBLE at all. The workbench needs both -- it highlights the recommendation and
+        disables the impossible with its reason, instead of rendering the same twenty-two
+        controls for an ELF, a PE, a jar and a firmware image.
+        """
+        from ..analyze import capabilities as capmod
+        s = self._store()
+        try:
+            t = s.targets.get(tid)
+            if not t:
+                return self._json({"error": "no target"}, 404)
+            plan = []
+            try:
+                plan = (self._advice_for(s, t) or {}).get("plan") or []
+            except Exception:
+                pass
+            done = {r.stage for r in s.runs.list_by_case(t.case_id)
+                    if r.target_id == tid and r.status == "done"}
+            return self._json({
+                "target": tid, "file_type": t.file_type, "arch": t.arch,
+                "groups": [{"key": k, "label": lab, "why": why}
+                           for k, lab, why in capmod.GROUPS],
+                "stages": capmod.for_target(t, plan=plan, done=done),
+                "unavailable": capmod.unavailable_summary(t),
+            })
+        finally:
+            s.close()
 
     def _coverage_blocked(self, t):
         try:
@@ -457,66 +492,72 @@ class Handler(BaseHTTPRequestHandler):
         is expensive: a scripted run picked black-box fuzzing and burned 98,500 executions on
         a parser for nothing while the GUI was recommending a seed and a structure model.
         """
-        from ..analyze import advise as advise_mod
         s = self._store()
         try:
             t = s.targets.get(tid)
             if not t:
                 return self._json({"error": "no target"}, 404)
-            fd = FindingDAO(s.conn)
-            findings = fd.list_by_target(tid)
-            imports = []
-            run = next((r for r in s.runs.list_by_case(t.case_id)
-                        if r.target_id == tid and r.stage == _INGEST
-                        and r.status == "done"), None)
-            if run:
-                from ..jobs.registry import cached_output_json
-                rec = cached_output_json(s, run.id) or {}
-                # triage stores imports as {"libraries": [...], "symbols": [...]}
-                imp = rec.get("imports") or {}
-                imports = list(imp.get("symbols") or []) if isinstance(imp, dict) else list(imp)
-            if not imports:
-                # A statically linked binary has no import table, but its symbol table still
-                # names fopen/fgets/read -- the same evidence, in the other place. Without
-                # this a config-driven daemon was reported as "argv/none".
-                try:
-                    from ..analyze.poc.exploit import elf_functions
-                    blob = s.content.path(t.sha256).read_bytes()
-                    imports = list(elf_functions(blob))
-                except Exception:
-                    imports = []
-            # How to invoke it, read off the binary's own usage line and option string. Static
-            # only here: advice must stay fast, and running the target to CHECK the proposal
-            # is what POST /targets/<id>/invocation is for.
-            try:
-                from ..analyze import invocation as invmod
-                found = invmod.discover(self._target_strings(s, tid))
-                found["proposed_argv"] = invmod.propose_argv(found)
-            except Exception:
-                found = None
-            crashes = sum(1 for d in DynResultDAO(s.conn).list_by_target(tid) if d.crashed)
-            pocs = [p for p in PocDAO(s.conn).list_by_target(tid) if p.verified]
-            out = advise_mod.advise(
-                imports=[str(x) for x in imports],
-                functions=len(FunctionDAO(s.conn).list_by_target(tid)),
-                findings=len(findings),
-                seeds=sum(1 for a in s.artifacts.list_by_case(t.case_id)
-                          if a.kind in ("seed", "console-seed", "afl-crash")),
-                has_format=False,
-                afl_usable=advise_mod.afl_usable(),
-                # triage could not name a format, so there is nothing here to run
-                executable=bool(t.file_type and t.file_type not in ("raw", "other")),
-                file_format=t.file_type,
-                crashes=crashes, pocs=len(pocs), invocation=found,
-                # One source of truth for "can AFL++ run THIS target": the stage's own gate.
-                # Advice that says coverage_fuzz while the stage declines it is a plan that
-                # dead-ends one click later.
-                coverage_blocked=self._coverage_blocked(t))
-            if found and found.get("flags"):
-                out["invocation"] = found
-            return self._json(out)
+            return self._json(self._advice_for(s, t))
         finally:
             s.close()
+
+    def _advice_for(self, s, t) -> dict:
+        """The advice DICT, so /capabilities can reuse it. It needs the plan to know which
+        stage is recommended, and computing it twice would be two answers to one question."""
+        from ..analyze import advise as advise_mod
+        tid = t.id
+        fd = FindingDAO(s.conn)
+        findings = fd.list_by_target(tid)
+        imports = []
+        run = next((r for r in s.runs.list_by_case(t.case_id)
+                    if r.target_id == tid and r.stage == _INGEST
+                    and r.status == "done"), None)
+        if run:
+            from ..jobs.registry import cached_output_json
+            rec = cached_output_json(s, run.id) or {}
+            # triage stores imports as {"libraries": [...], "symbols": [...]}
+            imp = rec.get("imports") or {}
+            imports = list(imp.get("symbols") or []) if isinstance(imp, dict) else list(imp)
+        if not imports:
+            # A statically linked binary has no import table, but its symbol table still
+            # names fopen/fgets/read -- the same evidence, in the other place. Without
+            # this a config-driven daemon was reported as "argv/none".
+            try:
+                from ..analyze.poc.exploit import elf_functions
+                blob = s.content.path(t.sha256).read_bytes()
+                imports = list(elf_functions(blob))
+            except Exception:
+                imports = []
+        # How to invoke it, read off the binary's own usage line and option string. Static
+        # only here: advice must stay fast, and running the target to CHECK the proposal
+        # is what POST /targets/<id>/invocation is for.
+        try:
+            from ..analyze import invocation as invmod
+            found = invmod.discover(self._target_strings(s, tid))
+            found["proposed_argv"] = invmod.propose_argv(found)
+        except Exception:
+            found = None
+        crashes = sum(1 for d in DynResultDAO(s.conn).list_by_target(tid) if d.crashed)
+        pocs = [p for p in PocDAO(s.conn).list_by_target(tid) if p.verified]
+        out = advise_mod.advise(
+            imports=[str(x) for x in imports],
+            functions=len(FunctionDAO(s.conn).list_by_target(tid)),
+            findings=len(findings),
+            seeds=sum(1 for a in s.artifacts.list_by_case(t.case_id)
+                      if a.kind in ("seed", "console-seed", "afl-crash")),
+            has_format=False,
+            afl_usable=advise_mod.afl_usable(),
+            # triage could not name a format, so there is nothing here to run
+            executable=bool(t.file_type and t.file_type not in ("raw", "other")),
+            file_format=t.file_type,
+            crashes=crashes, pocs=len(pocs), invocation=found,
+            # One source of truth for "can AFL++ run THIS target": the stage's own gate.
+            # Advice that says coverage_fuzz while the stage declines it is a plan that
+            # dead-ends one click later.
+            coverage_blocked=self._coverage_blocked(t))
+        if found and found.get("flags"):
+            out["invocation"] = found
+        return out
 
     def _get_case_findings(self, cid):
         """All findings in a case, enriched with target filename/arch and the target's best
