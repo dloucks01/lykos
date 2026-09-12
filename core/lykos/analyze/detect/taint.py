@@ -226,9 +226,13 @@ def _define(taint, key, tainted):
         taint.add(k) if tainted else taint.discard(k)
 
 
-def _apply(taint, ops, bases=(), aliases=None, mem_out=None):
+def _apply(taint, ops, bases=(), aliases=None, mem_out=None, via=None):
     slots = {}                       # varnode key -> frame-slot key (this instruction only)
     consts = {}                      # varnode key -> literal value  (this instruction only)
+    # What each computed value was built FROM. A dominating guard compares the INDEX, not the
+    # finished pointer, and at -O0 the index reaches its dereference as
+    # slot -> unique -> register -> unique, so this is per BLOCK, like aliases.
+    via = {} if via is None else via
     aliases = {} if aliases is None else aliases         # reg -> (base, off), per BLOCK
     for pc in ops:
         try:
@@ -256,7 +260,7 @@ def _apply(taint, ops, bases=(), aliases=None, mem_out=None):
                     val = _key(toks[3])
                     _define(taint, dst, val is not None and val in taint)
                 elif mem_out is not None:
-                    _note_access(mem_out, "store", toks[2], taint, slots)
+                    _note_access(mem_out, "store", toks[2], taint, slots, via)
             continue
 
         if outk is None:
@@ -268,15 +272,23 @@ def _apply(taint, ops, bases=(), aliases=None, mem_out=None):
             # pointer yields tainted data" (that is how argv[1] stays tainted).
             src = slots.get(_key(toks[2]))
             if src is not None:
+                via[outk] = [src]        # this value IS that frame slot, as a guard sees it
                 _define(taint, outk, src in taint)
                 continue
             if mem_out is not None:
-                _note_access(mem_out, "load", toks[2], taint, slots)
+                _note_access(mem_out, "load", toks[2], taint, slots, via)
 
+        if outk is not None and mnem in _ADDR_ARITH:
+            via[outk] = [k for k in ins if k is not None]
         _define(taint, outk, any(k in taint for k in ins))
 
 
-def _note_access(mem_out, kind, addr_tok, taint, slots):
+# Operations that build an address out of a base and something else.
+_ADDR_ARITH = {"INT_ADD", "INT_SUB", "INT_MULT", "INT_LEFT", "PTRADD", "PTRSUB", "COPY",
+               "INT_ZEXT", "INT_SEXT", "SUBPIECE", "MULTIEQUAL"}
+
+
+def _note_access(mem_out, kind, addr_tok, taint, slots, via=None):
     """Record a memory access whose address is attacker-influenced.
 
     A recovered frame slot is excluded by the caller: its address is a fixed displacement,
@@ -286,7 +298,28 @@ def _note_access(mem_out, kind, addr_tok, taint, slots):
     """
     ak = _key(addr_tok)
     if ak is not None and ak in taint:
-        mem_out.append({"kind": kind, "addr_key": ak})
+        mem_out.append({"kind": kind, "addr_key": ak, "via": _origins(ak, via)})
+
+
+def _origins(key, via, depth=8):
+    """Every value this address was computed from, followed back through the block.
+
+    Transitively: one hop is not enough, and the frame slot the guard compares sits at the far
+    end of the chain.
+    """
+    seen, order, frontier = {key}, [key], [key]
+    for _ in range(depth):
+        nxt = []
+        for k in frontier:
+            for src in (via or {}).get(k, ()):
+                if src is not None and src not in seen:
+                    seen.add(src)
+                    order.append(src)
+                    nxt.append(src)
+        if not nxt:
+            break
+        frontier = nxt
+    return order
 
 
 def _has_abi(abi):
@@ -398,7 +431,8 @@ def _run(ir, abi, callmap, dstmap, func_addrs, entry_params, ret_tainted, *,
             pre.add(("stack", stack_params["base"],
                      stack_params["offset0"] + stack_params["stride"] * i))
 
-    def transfer(cur, instr, flagged, contribs, pushes, aliases, collect=None):
+    def transfer(cur, instr, flagged, contribs, pushes, aliases, collect=None,
+                 via=None):
         addr = instr.get("addr")
         ext = callmap.get(addr)
         dst = dstmap.get(addr)
@@ -414,7 +448,8 @@ def _run(ir, abi, callmap, dstmap, func_addrs, entry_params, ret_tainted, *,
                 ext_out.add(esym)
         tainted_params = {i for i, t in enumerate(argt) if t} if internal else set()
         seen = [] if collect is not None else None
-        _apply(cur, instr.get("pcode", []), abi.get("frame", ()), aliases, seen)
+        _apply(cur, instr.get("pcode", []), abi.get("frame", ()), aliases, seen,
+               via)
         for acc in (seen or ()):
             collect.append({**acc, "site_addr": addr})
         if stack_call is not None:
@@ -460,8 +495,9 @@ def _run(ir, abi, callmap, dstmap, func_addrs, entry_params, ret_tainted, *,
             cur |= pre
         pushes, aliases = [], {}
         acc = [] if mem_out is not None else None
+        via: dict = {}                  # per block, like aliases: the chain spans instructions
         for instr in by_addr[a]["instructions"]:
-            transfer(cur, instr, flagged, contribs, pushes, aliases, acc)
+            transfer(cur, instr, flagged, contribs, pushes, aliases, acc, via)
         for x in (acc or ()):
             mem_out.append({**x, "block_addr": a})
 
