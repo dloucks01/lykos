@@ -67,6 +67,11 @@ def _unsupported(target):
     # architecture the installed trace binary could drive (aarch64 here) and permitted it on
     # the one that aborts at the fork-server handshake (x86-64, the host).
     afl = aflpp.locate_afl(None)
+    if afl is not None and target.arch:
+        # an emulator for THIS guest, wherever it lives -- an arch-suffixed neighbour or a
+        # LYKOS_AFL_QEMU_<ARCH> override. One machine can hold several.
+        if aflpp.locate_qemu_trace_for(afl, target.arch) is not None:
+            return None
     trace = aflpp.locate_qemu_trace(afl) if afl else None
     if trace is None:
         # Missing TOOLING is not a property of the target -- it is a fixable defect in this
@@ -118,7 +123,14 @@ def coverage_stage(ctx) -> dict:
     seconds = int(p.get("max_seconds", 30))
     exec_timeout = float(p.get("exec_timeout", 2))
     use_qemu = bool(p.get("qemu", True))              # qemu-mode: fuzz an uninstrumented bin
-    if use_qemu and aflpp.locate_qemu_trace(afl) is None:
+    trace = aflpp.locate_qemu_trace_for(afl, target.arch) if target.arch else None
+    afl_path = None
+    if use_qemu and trace is not None:
+        afl_path = aflpp.stage_qemu_trace(trace, ctx.scratch())
+        ctx.emit("coverage.backend", payload={
+            "afl_qemu_trace": str(trace), "guest": aflpp.qemu_trace_arch(trace),
+            "target_arch": target.arch})
+    if use_qemu and trace is None and aflpp.locate_qemu_trace(afl) is None:
         # Checking only for afl-fuzz is not enough: -Q needs afl-qemu-trace, which ships
         # separately (Ubuntu's afl++ package omits it). Without this check the campaign
         # aborts at the fork-server handshake and still reports a clean "0 crashes" run.
@@ -143,7 +155,7 @@ def coverage_stage(ctx) -> dict:
     ctx.progress(msg=f"AFL++ qemu-mode, {seconds}s budget")
     ctx.emit("coverage.start", payload={"backend": "aflpp", "seconds": seconds,
                                         "afl": str(afl)})
-    proc = aflpp.run_campaign(afl, exe, seeds_dir, out_dir, seconds=seconds,
+    proc = aflpp.run_campaign(afl, exe, seeds_dir, out_dir, seconds=seconds, afl_path=afl_path,
                               mode=mode, qemu=use_qemu)
     if proc.returncode != 0 and not (out_dir / "default").exists() \
             and not (out_dir / "crashes").exists():
@@ -155,7 +167,17 @@ def coverage_stage(ctx) -> dict:
     if failed:
         raise RuntimeError(
             f"{failed}. No inputs were executed, so this is NOT a clean 'no crashes' result.")
-    ctx.emit("coverage.harvest", payload={"crash_inputs": len(raw)})
+    # What the campaign actually DID -- "0 crashes" after two million executions and "0
+    # crashes" after none are opposite conclusions, and the event could not tell them apart.
+    stats = aflpp.campaign_stats(out_dir)
+    ctx.emit("coverage.harvest", payload={"crash_inputs": len(raw), **stats})
+    if stats.get("execs_done", "").isdigit() and int(stats["execs_done"]) < 100:
+        ctx.emit("coverage.starved", payload={
+            "execs_done": stats.get("execs_done"),
+            "note": ("the campaign executed almost nothing -- the seeds may be rejected by "
+                     "this target, or each execution may be hitting the timeout. A clean "
+                     "'0 crashes' from a campaign that never ran says nothing about the "
+                     "binary.")})
 
     fd = FindingDAO(ctx.conn)
     dd = DynResultDAO(ctx.conn)
