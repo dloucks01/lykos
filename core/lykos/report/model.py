@@ -45,6 +45,41 @@ def _iso(ts: Optional[int]) -> Optional[str]:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
 
 
+def _runtime(t) -> dict:
+    """What this target RUNS ON, and what that means for the evidence in the report.
+
+    A 47 KB report over a case holding a jar mentioned "Java" zero times and printed
+    `Arch: jvm/64 big` -- placeholder fields from triage rendered as though they described a
+    processor. A reader could not tell that a finding came from a managed runtime, nor why no
+    L2/L3 appears for it, and "no exploit was produced" reads as a gap rather than as the
+    runtime's own guarantee.
+    """
+    from ..analyze import capabilities as capmod
+    ftype = (t.file_type or "").lower()
+    if ftype in ("jar", "class"):
+        return {
+            "substrate": "jvm",
+            "label": "Java (JVM)" + (" — JAR" if ftype == "jar" else " — class file"),
+            "describes_cpu": False,
+            "ceiling": "L1",
+            "ceiling_why": (
+                "The JVM checks every array access and owns the instruction pointer, so a "
+                "defect surfaces as an uncaught exception that terminates the process -- "
+                "denial of service -- and cannot be escalated to control-flow hijack. L1 (a "
+                "verified, reproducible fault) is the ceiling this runtime supports; the "
+                "absence of an L2 or L3 result is the runtime's guarantee, not a gap in the "
+                "analysis."),
+            "unavailable": capmod.unavailable_summary(t),
+        }
+    if ftype == "pe":
+        return {"substrate": "windows", "label": "Windows PE", "describes_cpu": True,
+                "ceiling": "L3", "ceiling_why": "",
+                "unavailable": capmod.unavailable_summary(t)}
+    return {"substrate": "native", "label": "Native machine code", "describes_cpu": True,
+            "ceiling": "L3", "ceiling_why": "",
+            "unavailable": capmod.unavailable_summary(t)}
+
+
 def build_report(
     store,
     case_id: str,
@@ -168,6 +203,7 @@ def build_report(
                 "sha1": t.sha1, "size": t.size, "file_type": t.file_type, "arch": t.arch,
                 "bits": t.bits, "endianness": t.endianness, "linking": t.linking,
                 "stripped": t.stripped, "mitigations": t.mitigations or {},
+                "runtime": _runtime(t),
                 "entropy": t.entropy, "ingested_at": _iso(t.ingested_at),
                 "findings": findings_out,
             })
