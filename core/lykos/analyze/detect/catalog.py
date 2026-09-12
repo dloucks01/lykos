@@ -62,6 +62,15 @@ DANGEROUS = {
     "syslog":   ("CWE-134", "low",    "syslog -- check the format string is not tainted"),
 }
 
+# APIs whose presence is worth REPORTING but is not by itself a defect claim. `memcpy` is a
+# defect only if its length is attacker-controlled and `printf` only if its FORMAT is, and
+# neither question is answered by "untrusted input reaches this function". Reachability
+# corroborates an unbounded copy -- there the sink itself is the bug -- but promoting these
+# on it made two thirds of jhead's report read "corroborated", which should mean a second
+# channel agreed a defect exists. The channels that CAN answer them are bounds (a proven
+# length) and taint (which argument the bytes reach).
+ADVISORY = {"strncpy", "memcpy", "memmove", "printf", "fprintf", "snprintf", "syslog"}
+
 # untrusted-input source functions (normalized) for reachability correlation
 SOURCES = {
     "recv", "recvfrom", "recvmsg", "read", "fread", "fgets", "gets", "scanf",

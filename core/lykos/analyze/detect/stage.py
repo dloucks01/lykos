@@ -65,6 +65,43 @@ def _deref_candidates(derefs, functions):
     return out
 
 
+def _program_only(ctx, target, functions):
+    """(functions, call_edges, dropped) restricted to the program's own code where possible."""
+    from ..elf import program_ranges
+    edges = CallEdgeDAO(ctx.conn).list_by_target(target.id)
+    try:
+        blob = ctx.content.path(target.sha256).read_bytes()
+        ranges = program_ranges(blob)
+    except Exception:
+        ranges = []
+    if not ranges:
+        return functions, edges, 0
+    from ..debug import rootcause
+    from ..elf import parse as parse_elf
+    try:
+        entry = parse_elf(blob).entry
+    except Exception:
+        entry = None
+    base = rootcause.image_base(functions, entry) or 0
+    los = [lo for lo, _ in ranges]
+
+    def own(addr) -> bool:
+        import bisect
+        try:
+            a = (int(addr, 16) if isinstance(addr, str) else int(addr or 0)) - base
+        except (TypeError, ValueError):
+            return True                      # unparseable: keep it rather than hide it
+        i = bisect.bisect_right(los, a) - 1
+        return i >= 0 and a < ranges[i][1]
+
+    keep_fn = [f for f in functions if own(f.addr)]
+    keep_ed = [e for e in edges if own(e.src_addr)]
+    dropped = (len(functions) - len(keep_fn)) + (len(edges) - len(keep_ed))
+    if not keep_fn or not keep_ed:
+        return functions, edges, 0           # attribution said nothing useful; do not blind it
+    return keep_fn, keep_ed, dropped
+
+
 def detect_stage(ctx) -> dict:
     target = TargetDAO(ctx.conn).get(ctx.target_id) if ctx.target_id else None
     if target is None:
@@ -72,6 +109,12 @@ def detect_stage(ctx) -> dict:
 
     fdao = FunctionDAO(ctx.conn)
     functions = fdao.list_by_target(target.id)
+    # A statically linked binary carries its libc, and the decompiler recovers all of it, so
+    # the report fills with the LIBRARY's own calls: jhead's memcpy finding carried 95 sites,
+    # nearly all of them inside glibc, which says nothing about jhead. Where the symbol table
+    # can say which code is the program's own, detection listens to it -- the same attribution
+    # coverage uses. When it cannot (stripped, no local symbols), nothing is filtered.
+    functions, edges, dropped = _program_only(ctx, target, functions)
     # hydrate decompiler stack frames (heavy; omitted from the list view) for size-aware detection
     frames = {}
     for f in functions:
@@ -83,7 +126,7 @@ def detect_stage(ctx) -> dict:
 
     dctx = DetectContext(
         target_id=target.id, case_id=target.case_id,
-        call_edges=CallEdgeDAO(ctx.conn).list_by_target(target.id),
+        call_edges=edges,
         strings=StringDAO(ctx.conn).list_by_target(target.id),
         functions=functions,
         mitigations=target.mitigations or {}, frames=frames)
@@ -158,7 +201,8 @@ def detect_stage(ctx) -> dict:
         c["run_id"] = ctx.run_id
         fd.upsert(target.id, target.case_id, c)
     counts = fd.counts_by_state(target.id)
-    ctx.emit("findings.done", payload={"candidates": len(cands), "states": counts})
+    ctx.emit("findings.done", payload={"candidates": len(cands), "states": counts,
+                                       "library_sites_skipped": dropped})
     ctx.progress(pct=100, msg="%d candidate findings" % len(cands))
     return {}
 

@@ -388,3 +388,53 @@ def test_a_placeholder_is_not_a_credential():
     assert _secret("password=password") is None
     assert _secret("secret = changeme") is None
     assert _secret("api_key=-v") is None, "a command-line option is not a value"
+
+
+def test_reachability_does_not_corroborate_an_advisory():
+    """`corroborated` should mean a second channel agreed a DEFECT exists. `memcpy` is a defect
+    only if its length is attacker-controlled and `printf` only if its FORMAT is, and neither
+    question is answered by "untrusted input reaches this function". Promoting them on
+    reachability made two thirds of jhead's report read corroborated."""
+    from lykos.analyze.detect.catalog import ADVISORY, DANGEROUS
+    assert ADVISORY <= set(DANGEROUS), "every advisory is a known API"
+    for api in ("memcpy", "memmove", "strncpy", "printf", "fprintf", "snprintf"):
+        assert api in ADVISORY, api
+    # the sinks where the CALL ITSELF is the defect must stay promotable
+    for api in ("strcpy", "strcat", "sprintf", "gets", "system", "popen"):
+        assert api not in ADVISORY, api
+
+
+def test_an_advisory_stays_a_candidate_but_a_real_sink_is_promoted():
+    from lykos.analyze.detect.detectors import DetectContext, correlate
+
+    def _cand_for(api, fn="0x1000"):
+        return {"cwe": "CWE-120", "title": api, "severity": "low", "state": "candidate",
+                "confidence": 0.4, "detector": "dangerous_api", "api": api,
+                "function_addr": fn, "site_addr": "0x1004", "evidence": [],
+                "dedup_key": f"CWE-120:dangerous_api:{api}"}
+
+    class _E:
+        def __init__(self, src, dst, name):
+            self.src_addr, self.dst_addr, self.dst_name = src, dst, name
+            self.site_addr = src
+    edges = [_E("0x1000", "0x2000", "read"), _E("0x1000", "0x3000", "memcpy")]
+    ctx = DetectContext(target_id="t", case_id="c", call_edges=edges, strings=[],
+                        functions=[], mitigations={}, frames={})
+    out = correlate([_cand_for("memcpy"), _cand_for("strcpy")], ctx)
+    by = {c["api"]: c for c in out}
+    assert by["memcpy"]["state"] == "candidate", "reachability says nothing about a length"
+    assert by["strcpy"]["state"] == "corroborated", "here the call itself is the defect"
+
+
+def test_detection_skips_the_libc_linked_into_a_static_binary():
+    """The decompiler recovers every block of a statically linked libc, so the report fills
+    with the LIBRARY's calls: jhead's memcpy finding carried 95 sites, nearly all inside glibc
+    and none of them about jhead. With attribution available that drops to 17, and 6,806
+    library sites are skipped outright."""
+    import inspect
+
+    from lykos.analyze.detect import stage
+    src = inspect.getsource(stage._program_only)
+    assert "program_ranges" in src
+    assert "return functions, edges, 0" in src, \
+        "with no attribution available nothing may be filtered -- hiding the program is worse"
