@@ -15,6 +15,7 @@ the input does not parse.
 from __future__ import annotations
 
 import struct
+import zlib
 
 from .mutator import Mutator
 
@@ -49,12 +50,14 @@ class FormatModel:
         fields, _pos = self._parse_spec(self.spec, data, 0)
         return fields
 
-    def _parse_spec(self, spec, data: bytes, pos: int):
+    def _parse_spec(self, spec, data: bytes, pos: int, covered=None):
         """Parse one SCOPE. Groups and arrays recurse, so a format inside a format is fields
         rather than opaque bytes -- which is what lets a mutation change one of them and leave
         every other field intact."""
         fields: list = []
-        covered: dict = {}               # blob name -> (declared span, offset of the length)
+        # Shared with nested scopes: a PNG chunk's length sits OUTSIDE the group its data is
+        # in, so a scope-local map left the blob unbounded and it swallowed the whole file.
+        covered = {} if covered is None else covered
         seen: dict = {}                  # name -> value, for an array's count field
         for f in spec:
             t = f["type"]
@@ -82,7 +85,7 @@ class FormatModel:
                 fields.append({"f": f, "val": val})
                 pos += sz
             elif t == "group":
-                sub, pos = self._parse_spec(f["spec"], data, pos)
+                sub, pos = self._parse_spec(f["spec"], data, pos, covered)
                 fields.append({"f": f, "val": sub})
             elif t == "array":
                 # However many the count field claims -- but only as many as the data holds. A
@@ -93,7 +96,7 @@ class FormatModel:
                 for _ in range(want):
                     if pos >= len(data):
                         break
-                    sub, nxt = self._parse_spec(f["spec"], data, pos)
+                    sub, nxt = self._parse_spec(f["spec"], data, pos, covered)
                     if nxt > len(data):
                         break
                     recs.append(sub)
@@ -136,6 +139,16 @@ class FormatModel:
             else:
                 out += _as_bytes(fd["val"] or b"")
         return bytes(out)
+
+
+def _serialize_field(model, fd) -> bytes:
+    """The bytes one field contributes, whether it is a leaf, a group or an array."""
+    t = fd["f"]["type"]
+    if t == "group":
+        return model.serialize(fd["val"])
+    if t == "array":
+        return b"".join(model.serialize(rec) for rec in fd["val"])
+    return model.serialize([fd])
 
 
 def _layout(model, fields, pos=0, out=None, names=None):
@@ -191,6 +204,16 @@ def _fix_covers(model, fields, lengths: bool = False) -> None:
         for fd in _every_field(fields):
             f = fd["f"]
             if f["type"] not in _INT:
+                continue
+            # A format that checksums its own chunks cannot be fuzzed blind: a parser rejects
+            # a bad CRC before reading anything else, so every mutation is thrown away at the
+            # door. Derived like a length, and drivable for the same reason -- a deliberately
+            # wrong checksum is its own test.
+            crc = f.get("crc32_of")
+            if crc:
+                mate = names.get(crc)
+                if mate is not None:
+                    fd["val"] = zlib.crc32(_serialize_field(model, mate)) & 0xFFFFFFFF
                 continue
             target = f.get("offset_of") or (f.get("length_of") if lengths else None)
             if target:
@@ -375,7 +398,8 @@ class StructMutator:
                 fd["val"] = self.byte.mutate(fd["val"] or b"", ())
         elif t in _INT:
             fd["val"] = self.rng.choice(_EDGE)
-            if fd["f"].get("covers") == "rest" or fd["f"].get("offset_of"):
+            if (fd["f"].get("covers") == "rest" or fd["f"].get("offset_of")
+                    or fd["f"].get("crc32_of")):
                 return "cover"                          # driving it IS the interesting case
             # A record that says WHERE data is and HOW MUCH of it there is is the classic
             # out-of-bounds read, and it needs both halves at once: jhead survives a GPS entry
@@ -424,6 +448,9 @@ _IFD0_OFF = 8
 _GPS_OFF = _IFD0_OFF + 2 + 12 + 4                 # count + one entry (the GPS pointer) + next
 _RAT_OFF = _GPS_OFF + 2 + 12 * 2 + 4              # count + two entries + next
 _RATIONALS = b"".join(struct.pack("<II", n, d) for n, d in ((51, 1), (30, 1), (0, 1)))
+_PNG_IHDR = struct.pack(">IIBBBBB", 1, 1, 8, 0, 0, 0, 0)
+_PNG_IDAT = zlib.compress(b"\x00\x00")      # one filter byte + one greyscale pixel
+
 _IFD_ENTRY = [{"type": "u16", "endian": "little", "name": "tag"},
               {"type": "u16", "endian": "little", "name": "fmt"},
               {"type": "u32", "endian": "little", "name": "count", "role": "size"},
@@ -437,12 +464,31 @@ _BUILTINS = {
         {"type": "magic", "value": "\x00"},          # placeholder magic, override via params
         {"type": "u32", "endian": "little", "name": "len", "length_of": "data"},
         {"type": "blob", "name": "data"}]},
-    # PNG: 8-byte signature, then the mutator drives the first chunk's length/type
+    # PNG: every chunk is length + type + data + CRC32 over type AND data, and a decoder
+    # checks the CRC before it reads anything -- so a model that stops at the signature
+    # generates a file that is rejected at the door. The chunk body is a GROUP precisely so
+    # the checksum can name it.
     "png": {"tokens": ("IHDR", "IEND", "PNG"), "spec": [
         {"type": "magic", "value": b"\x89PNG\r\n\x1a\n"},
-        {"type": "u32", "endian": "big", "name": "clen", "length_of": "cdata"},
-        {"type": "magic", "value": "IHDR"},
-        {"type": "blob", "name": "cdata"}]},
+        {"type": "group", "name": "ihdr", "spec": [
+            {"type": "u32", "endian": "big", "name": "ihdr_len", "length_of": "ihdr_data"},
+            {"type": "group", "name": "ihdr_body", "spec": [
+                {"type": "magic", "value": b"IHDR"},
+                # 1x1, 8-bit greyscale, no interlace
+                {"type": "blob", "name": "ihdr_data", "seed_value": _PNG_IHDR}]},
+            {"type": "u32", "endian": "big", "name": "ihdr_crc", "crc32_of": "ihdr_body"}]},
+        {"type": "group", "name": "idat", "spec": [
+            {"type": "u32", "endian": "big", "name": "idat_len", "length_of": "idat_data"},
+            {"type": "group", "name": "idat_body", "spec": [
+                {"type": "magic", "value": b"IDAT"},
+                {"type": "blob", "name": "idat_data", "seed_value": _PNG_IDAT}]},
+            {"type": "u32", "endian": "big", "name": "idat_crc", "crc32_of": "idat_body"}]},
+        {"type": "group", "name": "iend", "spec": [
+            {"type": "u32", "endian": "big", "name": "iend_len", "length_of": "iend_data"},
+            {"type": "group", "name": "iend_body", "spec": [
+                {"type": "magic", "value": b"IEND"},
+                {"type": "blob", "name": "iend_data", "seed_value": b""}]},
+            {"type": "u32", "endian": "big", "name": "iend_crc", "crc32_of": "iend_body"}]}]},
     # JPEG/EXIF: SOI + APP1, a BIG-endian segment length, then the Exif header the EXIF
     # parsers key on. This is the shape jhead reads, and the length field is exactly the
     # length-driven relationship the structure mutator exists to drive.
@@ -517,15 +563,49 @@ _BUILTINS = {
     # NOT "BM": a two-character token matches as a substring of anything, and it picked BMP
     # for unzip, which then fuzzed a ZIP tool with bitmaps. A format's token has to be a
     # string only a parser for that format would carry.
-    "bmp": {"tokens": ("BITMAPINFOHEADER", "BITMAPFILEHEADER", ".bmp"), "spec": [
-        {"type": "magic", "value": b"BM"},
-        {"type": "u32", "endian": "little", "name": "size", "length_of": "data"},
-        {"type": "blob", "name": "data"}]},
-    "riff": {"tokens": ("RIFF", "WAVE", "fmt "), "spec": [
-        {"type": "magic", "value": b"RIFF"},
-        {"type": "u32", "endian": "little", "name": "size", "length_of": "data"},
-        {"type": "magic", "value": b"WAVE"},
-        {"type": "blob", "name": "data"}]},
+    # BMP: a file header whose `off` says where the pixels start and a DIB header that says
+    # how many there are. A decoder indexes pixels using width/height/bpp while trusting the
+    # offset, which is exactly the pair that goes wrong -- so both are fields.
+    "bmp": {"tokens": ("BITMAPINFOHEADER", "BITMAPFILEHEADER", ".bmp"), "seed": b"\x00" * 4,
+            "spec": [
+                {"type": "magic", "value": b"BM"},
+                {"type": "u32", "endian": "little", "name": "filesize", "covers": "rest"},
+                {"type": "magic", "value": b"\x00\x00\x00\x00"},      # reserved
+                {"type": "u32", "endian": "little", "name": "pixoff",
+                 "offset_of": "pixels", "role": "offset"},
+                {"type": "group", "name": "dib", "spec": [
+                    {"type": "u32", "endian": "little", "name": "dibsize", "seed_value": 40},
+                    {"type": "u32", "endian": "little", "name": "width", "seed_value": 1},
+                    {"type": "u32", "endian": "little", "name": "height", "seed_value": 1},
+                    {"type": "u16", "endian": "little", "name": "planes", "seed_value": 1},
+                    {"type": "u16", "endian": "little", "name": "bpp", "seed_value": 24},
+                    {"type": "u32", "endian": "little", "name": "compression"},
+                    {"type": "u32", "endian": "little", "name": "imgsize",
+                     "length_of": "pixels", "role": "size"},
+                    {"type": "u32", "endian": "little", "name": "xppm", "seed_value": 2835},
+                    {"type": "u32", "endian": "little", "name": "yppm", "seed_value": 2835},
+                    {"type": "u32", "endian": "little", "name": "ncolours"},
+                    {"type": "u32", "endian": "little", "name": "nimportant"}]},
+                {"type": "blob", "name": "pixels"}]},
+    # RIFF/WAVE: a container of chunks, each `fourcc + size + data`, inside an outer chunk
+    # whose own size covers everything after it. A decoder walks them by trusting those sizes.
+    "riff": {"tokens": ("RIFF", "WAVE", "fmt "), "seed": b"\x00" * 4,
+             "spec": [
+                 {"type": "magic", "value": b"RIFF"},
+                 {"type": "u32", "endian": "little", "name": "riffsize", "covers": "rest"},
+                 {"type": "magic", "value": b"WAVE"},
+                 {"type": "group", "name": "fmt", "spec": [
+                     {"type": "magic", "value": b"fmt "},
+                     {"type": "u32", "endian": "little", "name": "fmtsize",
+                      "length_of": "fmtdata", "role": "size"},
+                     {"type": "blob", "name": "fmtdata",
+                      # PCM, mono, 8 kHz, 8-bit
+                      "seed_value": struct.pack("<HHIIHH", 1, 1, 8000, 8000, 1, 8)}]},
+                 {"type": "group", "name": "data", "spec": [
+                     {"type": "magic", "value": b"data"},
+                     {"type": "u32", "endian": "little", "name": "datasize",
+                      "length_of": "samples", "role": "size"},
+                     {"type": "blob", "name": "samples"}]}]},
     # ZIP: a local header is not an archive. Every tool finds the files through the central
     # directory, located by absolute offset from the end-of-central-directory record, so a
     # model that stops at the local header generates something unzip refuses before parsing
