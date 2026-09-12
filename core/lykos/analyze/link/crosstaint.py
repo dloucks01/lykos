@@ -119,19 +119,30 @@ def cross_taint_case(conn, content, case_id: str, *, persist: bool = True,
     if persist:
         ce_dao.clear_case(case_id, kind="taint")
     findings = []
+    # Why a run found nothing. "cross_findings: 0" is the same answer whether there were no
+    # components, no resolved links, no tainted data reaching the boundary, or a boundary the
+    # callee simply does not misuse -- and those call for four different next actions. The
+    # only clue used to be `components_analyzed`, which reads as a count rather than a
+    # diagnosis: on a program/library pair with a resolved edge it said 1, because the loop
+    # stopped before ever loading the callee.
+    why: dict = {"no_components": len(targets) < 2, "no_links": not dyn,
+                 "edges_without_tainted_symbol": 0, "edges_with_clean_callee": 0}
     for e in dyn:
         a, b = targets.get(e.src_target), targets.get(e.dst_target)
         if not a or not b:
             continue
         syms = set(edge_symbols(e.detail)) & imports(e.src_target)
         if not syms:
+            why["edges_without_tainted_symbol"] += 1
             continue
         b_sinks = sinks(e.dst_target)
         _fi, n2a, _ce = comp(e.dst_target)
+        clean = True
         for sym in sorted(syms):
             hit = b_sinks.get(sym)
             if not hit:
                 continue
+            clean = False
             # pick the highest-severity sink reached, deterministically
             cwe, sink_name = max(sorted(hit),
                                  key=lambda cs: _sev_rank(DANGEROUS.get(cs[1], (0, "info"))[1]))
@@ -142,7 +153,35 @@ def cross_taint_case(conn, content, case_id: str, *, persist: bool = True,
                 fd.upsert(b.id, case_id, cand)
                 ce_dao.upsert(case_id, a.id, b.id, kind="taint", symbol=sym,
                               detail=f"{sink_name} via {sym}")
+        # per EDGE, at the end of its own iteration -- not after the loop, where `clean`
+        # belongs to whichever edge happened to be last, and does not exist at all if every
+        # edge took a `continue` above
+        why["edges_with_clean_callee"] += int(clean)
     if persist:
         conn.commit()
     return {"edges_examined": len(dyn), "cross_findings": len(findings),
-            "components_analyzed": len(comps)}
+            "components_analyzed": len(comps), "note": _why_nothing(why, len(findings))}
+
+
+def _why_nothing(why: dict, found: int):
+    """One sentence naming what stopped this, or None when something was found."""
+    if found:
+        return None
+    if why["no_components"]:
+        return ("only one component in this case -- cross-component taint needs at least two "
+                "(a program and a library it calls, or a client and a server).")
+    if why["no_links"]:
+        return ("no dynamic-link edges are resolved, so there is no boundary to chase taint "
+                "across. Run link_case first.")
+    if why["edges_without_tainted_symbol"]:
+        return (f"{why['edges_without_tainted_symbol']} linked boundar"
+                f"{'ies' if why['edges_without_tainted_symbol'] != 1 else 'y'} carried no "
+                f"tainted argument: the caller does not reach the imported symbol with data "
+                f"this analysis can trace from an input source.")
+    if why["edges_with_clean_callee"]:
+        return (f"the caller does pass untrusted data across "
+                f"{why['edges_with_clean_callee']} boundar"
+                f"{'ies' if why['edges_with_clean_callee'] != 1 else 'y'}, but the callee "
+                f"does not carry it into a dangerous sink -- which is a real negative, not a "
+                f"missing analysis.")
+    return "nothing to examine."

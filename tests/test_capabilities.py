@@ -156,3 +156,23 @@ def test_the_tier_toggle_is_an_override_not_another_or_term():
     h = _HTML.read_text()
     assert "(t.key in BOARD_OPEN) ? BOARD_OPEN[t.key] : dflt" in h
     assert "t.open || !!f.state || !!f.q || BOARD_OPEN" not in h
+
+
+def test_cross_taint_says_what_stopped_it():
+    """"cross_findings: 0" is the same answer whether there were no components, no resolved
+    links, no tainted data reaching the boundary, or a boundary the callee simply does not
+    misuse -- and those call for four different next actions. The only clue was
+    `components_analyzed`, which reads as a count, not a diagnosis: on a program/library pair
+    with a resolved edge it said 1, because the loop stopped before loading the callee."""
+    from lykos.analyze.link.crosstaint import _why_nothing
+    base = {"no_components": False, "no_links": False,
+            "edges_without_tainted_symbol": 0, "edges_with_clean_callee": 0}
+    assert "only one component" in _why_nothing({**base, "no_components": True}, 0)
+    assert "Run link_case" in _why_nothing({**base, "no_links": True}, 0)
+    assert "no tainted argument" in _why_nothing(
+        {**base, "edges_without_tainted_symbol": 2}, 0)
+    # the case that is a RESULT rather than a gap, and must not read like one
+    clean = _why_nothing({**base, "edges_with_clean_callee": 1}, 0)
+    assert "real negative, not a missing analysis" in clean
+    # nothing to explain when something was found
+    assert _why_nothing({**base, "no_components": True}, 3) is None
