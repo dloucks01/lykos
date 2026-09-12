@@ -49,7 +49,7 @@ artifacts for confirmed findings. It ships with a highly styled analyst GUI.
 | 18 | `docs/18-architecture-coverage.md` | **All-architecture** coverage matrix, tiers, per-arch backends |
 | 19 | `docs/19-cwe-coverage.md` | **All-CWE** coverage matrix by family + channel + feasibility |
 | 21 | `docs/21-crs-harvest-review.md` | CRS harvest-review memo *template* (Phase 0 P0.8 deliverable) |
-| 22 | `docs/22-toolchain-setup.md` | Optional toolchain setup + status (Ghidra/AFL++/angr/GDB/SymQEMU) |
+| 22 | `docs/22-toolchain-setup.md` | **What to install and why** — required vs optional, what each unlocks, per-guest AFL++ emulators |
 
 ## Start here
 1. Read `docs/01-gap-analysis.md` — it reframes the scope and is the most important document.
