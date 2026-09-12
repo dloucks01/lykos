@@ -34,17 +34,48 @@ def _slack_txt(slack):
     return " + saved frame"
 
 
-def _hydrate_frames(ctx, target_id):
-    """Recovered stack frames per function addr (empty if the target wasn't disassembled)."""
+def _hydrate_frames(ctx, target_id, target=None):
+    """Recovered stack frames per function addr (empty if the target wasn't disassembled).
+
+    Restricted to the PROGRAM's own functions where the symbol table can say which those are.
+    A statically linked binary carries its libc, and the candidate ranking prefers the
+    tightest buffer -- so on jhead every attempt went into 8-byte scratch buffers inside
+    glibc, and the stage spent its whole budget without touching jhead's own frames.
+    """
     fdao = FunctionDAO(ctx.conn)
+    functions = fdao.list_by_target(target_id)
+    ranges, base = (), 0
+    if target is not None:
+        try:
+            from ..debug import rootcause
+            from ..elf import parse as parse_elf
+            from ..elf import program_ranges
+            blob = ctx.content.path(target.sha256).read_bytes()
+            ranges = program_ranges(blob)
+            base = rootcause.image_base(functions, parse_elf(blob).entry) or 0
+        except Exception:
+            ranges = ()
     frames = {}
-    for f in fdao.list_by_target(target_id):
+    for f in functions:
         if not f.blocks:
+            continue
+        if ranges and not _own_code(f.addr, base, ranges):
             continue
         full = fdao.get(f.id)
         if full and full.frame and full.frame.get("vars"):
             frames[f.addr] = full.frame
     return frames
+
+
+def _own_code(addr, base, ranges) -> bool:
+    import bisect
+    try:
+        a = (int(addr, 16) if isinstance(addr, str) else int(addr or 0)) - base
+    except (TypeError, ValueError):
+        return True
+    los = [lo for lo, _ in ranges]
+    i = bisect.bisect_right(los, a) - 1
+    return i >= 0 and a < ranges[i][1]
 
 
 def primitive_stage(ctx) -> dict:
@@ -77,7 +108,7 @@ def primitive_stage(ctx) -> dict:
     # Static RE corroboration: recovered stack-buffer sizes predict IP-control offsets.
     word = 8 if (target.bits or 64) >= 64 else 4
     endian = "big" if target.endianness == "big" else "little"
-    frames = _hydrate_frames(ctx, target.id)
+    frames = _hydrate_frames(ctx, target.id, target)
     offset_candidates = primitive.frame_offset_candidates(frames, word)
     if offset_candidates:
         ctx.emit("primitive.static", payload={"candidates": offset_candidates[:8]})

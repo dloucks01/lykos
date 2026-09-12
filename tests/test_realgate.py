@@ -111,3 +111,30 @@ def test_the_recorded_argv_is_a_prefix_not_the_whole_invocation():
     assert "argv = list(prefix)" in src, "fuzz must record the flag prefix it ran under"
     assert "invocation(mode, workfile, data)[0]" not in src, \
         "recording the invocation puts a dead scratch path in front of the real input"
+
+
+def test_a_real_binary_usually_has_no_shell_to_jump_to():
+    """L3 is "redirect to a chosen function and prove arrival", and the target has to be one
+    the program would NOT have reached. Real code rarely offers one: ncompress has a reachable
+    stack overflow and confirmed instruction-pointer control but imports nothing that spawns a
+    shell and has no function called `win`, so L3 is honestly unavailable there.
+
+    Relaxing this to "any named function" does produce an L3 -- it picks `Usage` -- but
+    redirecting into a function the program calls anyway is a far weaker claim than the badge
+    implies, so the strict rule stands."""
+    from lykos.analyze.poc.exploit import find_win
+    funcs = {"main": 0x1000, "Usage": 0x2000, "_start": 0x3000, "comprexx": 0x4000}
+    assert find_win(funcs) == (None, None)
+    assert find_win({"win": 0x5000, **funcs})[0] == "win", "a real win target is still found"
+
+
+def test_an_unreached_hijack_says_why_it_was_unreached():
+    """"alignment/mitigations?" sent me reading exploit code when the answer was in the bytes:
+    a non-PIE x86-64 win address like 0x4019f5 is f5 19 40 00 00 00 00 00, so the first NUL
+    sits THREE BYTES INTO the eight-byte slot and an argv-delivered strcpy stops there."""
+    from lykos.analyze.poc.exploit import ret2win_input
+    from lykos.analyze.poc.exploit_stage import _nul_cuts_the_slot
+    payload = ret2win_input(1048, 0x4019F5, 2096)
+    assert _nul_cuts_the_slot(payload, 1048, 8)
+    # a NUL-free address is delivered whole
+    assert not _nul_cuts_the_slot(ret2win_input(1048, 0x1337C0DE1337, 2096), 1048, 6)
