@@ -24,6 +24,7 @@ import re
 import shutil
 import struct
 import subprocess
+import tempfile
 
 # api name -> behavior category. v1 traces the categories that attribute *cleanly* to the target
 # under Wine (TID + ret-range). Registry writes and file I/O are deliberately NOT here: Wine's
@@ -50,7 +51,18 @@ _REG_OPEN = {"RegCreateKeyExW", "RegCreateKeyExA", "RegCreateKeyW", "RegCreateKe
 _REG_SET = {"RegSetValueExW", "RegSetValueExA", "RegSetValueW", "RegSetValueA"}
 _FILE_W = {"CreateFileW", "CreateFileA"}
 _FILE_DEL = {"DeleteFileW", "DeleteFileA"}
-_DANGER = (_EXEC | _NET | _WX | _INJECT | _ANTIDBG | _REG_OPEN | _REG_SET | _FILE_W | _FILE_DEL)
+# The C runtime is how a large class of Windows binaries actually does I/O, and the Win32 call
+# underneath happens inside msvcrt -- which is NOT the target's image, so it is correctly not
+# attributed to it. Watching only the Win32 names meant a mingw-built jhead, which opens and
+# reads the file it is given, reported "calls: 0, ok: true" out of 368 attributed calls: a
+# behaviour inventory that says a file parser touches no files.
+_CRT_FILE = {"fopen", "_wfopen", "fopen_s", "freopen", "_open", "_wopen", "_sopen",
+             "fread", "fwrite", "fputc", "fgetc", "fgets", "fputs"}
+_CRT_FILE_W = {"remove", "_unlink", "_wunlink", "rename", "_wrename"}
+_CRT_EXEC = {"_popen", "_wpopen", "_spawnl", "_spawnv", "_spawnve", "_execv", "_execve"}
+_EXEC = _EXEC | _CRT_EXEC
+_DANGER = (_EXEC | _NET | _WX | _INJECT | _ANTIDBG | _REG_OPEN | _REG_SET | _FILE_W
+           | _FILE_DEL | _CRT_FILE | _CRT_FILE_W)
 
 _REG_ROOTS = {"80000000": "HKCR", "80000001": "HKCU", "80000002": "HKLM",
               "80000003": "HKU", "80000005": "HKCC"}
@@ -177,9 +189,21 @@ def parse(text, maps):
             ev.append({"api": fn, "category": "file", "detail": _winpath(s), "write": write})
         elif fn in _FILE_DEL:
             ev.append({"api": fn, "category": "delete", "detail": _winpath(s)})
+        elif fn in _CRT_FILE:
+            # A CRT call carries a path only when it opens; fread/fputc name a FILE* the trace
+            # cannot resolve to a name, so those are recorded as file activity without one
+            # rather than dropped -- "this program reads files" is the inventory's job.
+            write = fn in ("fwrite", "fputs", "fputc") or '"w' in args or '"a' in args
+            ev.append({"api": fn, "category": "file", "detail": _winpath(s) or None,
+                       "write": write})
+        elif fn in _CRT_FILE_W:
+            ev.append({"api": fn, "category": "delete", "detail": _winpath(s)})
         if len(ev) >= 2000:
             break
     return ev
+
+
+_RELAY_CAP = 32 << 20          # bytes of +relay trace to keep; the rest is not worth the RAM
 
 
 def _relay(exe, *, argv, stdin, timeout, wineprefix) -> dict:
@@ -196,14 +220,28 @@ def _relay(exe, *, argv, stdin, timeout, wineprefix) -> dict:
     cmd = [wine, str(exe)] + [str(a) for a in argv]
     sandbox._ensure_wineprefix(wine, prefix)            # boot once (only if the prefix is cold)
     env["WINEDEBUG"] = "+relay,+module"
-    try:
-        proc = subprocess.run(cmd, input=stdin, capture_output=True, timeout=timeout, env=env)
-        text = proc.stderr.decode("latin-1", "ignore")
-    except subprocess.TimeoutExpired as e:
-        text = (e.stderr or b"").decode("latin-1", "ignore")
+    # +relay logs EVERY Win32 call: one second of jhead produces 24 MB on a warm prefix, and
+    # several times that while Wine boots a cold one. Buffering it in the parent held it as
+    # bytes and then again as a str. Spill it to a file and read back a bounded prefix, so a
+    # long-running or chatty target cannot take the server down -- and say when it was cut,
+    # because a trace that was cut means a partial inventory.
+    truncated = False
+    with tempfile.TemporaryFile() as errf:
+        try:
+            subprocess.run(cmd, input=stdin, stdout=subprocess.DEVNULL, stderr=errf,
+                           timeout=timeout, env=env)
+        except subprocess.TimeoutExpired:
+            pass
+        # the CHILD wrote to this fd, so the parent's own file position never moved --
+        # tell() returns 0 and the truncation flag could never fire
+        size = os.fstat(errf.fileno()).st_size
+        errf.seek(0)
+        raw = errf.read(_RELAY_CAP)
+        truncated = size > _RELAY_CAP
+    text = raw.decode("latin-1", "ignore")
     maps = _target_maps(text, exe)
     if maps:                                            # ASLR-robust: thread(s) + runtime range(s)
-        return {"ok": True, "text": text, "maps": maps}
+        return {"ok": True, "text": text, "maps": maps, "truncated": truncated}
     if "wine: failed to load" in text.lower():
         # The loader could not start the image -- it never ran. Common cause: a 32-bit PE with no
         # i386 WoW64 runtime (wine: failed to load ...\syswow64\ntdll.dll). Report it honestly
@@ -225,4 +263,5 @@ def trace(exe, *, argv=(), stdin: bytes = b"", timeout: float = 40.0, wineprefix
     r = _relay(exe, argv=argv, stdin=stdin, timeout=timeout, wineprefix=wineprefix)
     if not r.get("ok"):
         return r
-    return {"ok": True, "events": parse(r["text"], r["maps"])}
+    return {"ok": True, "events": parse(r["text"], r["maps"]),
+            "truncated": bool(r.get("truncated"))}

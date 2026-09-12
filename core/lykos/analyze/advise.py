@@ -56,7 +56,8 @@ def fuzz_backend(afl_usable: bool, static_findings: int) -> tuple:
 
 def advise(*, imports: list, functions: int, findings: int, seeds: int,
            has_format: bool, afl_usable: bool, crashes: int = 0,
-           pocs: int = 0, executable: Optional[bool] = None) -> dict:
+           pocs: int = 0, executable: Optional[bool] = None,
+           file_format: Optional[str] = None) -> dict:
     """A recommendation and an ORDERED PLAN for this target.
 
     The plan is dynamic-first on purpose. Running decompile -> detect -> maybe-fuzz produces
@@ -84,6 +85,17 @@ def advise(*, imports: list, functions: int, findings: int, seeds: int,
                 "file_parser": False, "afl_usable": afl_usable, "analysable": False}
     mode, shape = _input_mode(imports)
     backend, backend_why = fuzz_backend(afl_usable, findings)
+    if file_format == "pe":
+        # AFL++ instruments ELF; it cannot drive a Windows PE here, and the Wine path runs at
+        # about one execution a second (measured: 1,249 ms per run against ~580/s native), so
+        # a campaign is thousands of executions, not millions. Recommending coverage_fuzz for
+        # a PE was a confident plan that cannot work -- the same shape as recommending it for
+        # an empty file.
+        backend, backend_why = "synthesize_poc", (
+            "a Windows PE runs under Wine at roughly one execution per second and AFL++ "
+            "cannot instrument it, so fuzzing is not a practical campaign here. "
+            "synthesize_poc derives the overflow from the recovered stack frame instead and "
+            "needs no executions at all")
     file_parser = mode == "file"
 
     checks = [

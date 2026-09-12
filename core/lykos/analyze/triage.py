@@ -11,6 +11,7 @@ from typing import Any
 
 from . import elf as elfmod
 from . import filetype
+from . import pe as pemod
 
 SCHEMA_VERSION = 1
 TOOL = "elf-stdlib"
@@ -140,14 +141,37 @@ def build_triage(path: str | Path, hashes: dict[str, Any], filename: str) -> dic
         rec["detected"] = _describe(rec)
         rec["analyzable"] = True                       # ELF is the fully-supported format
         rec["advisory"] = None
-    elif rec["file_type"] in (filetype.PE, filetype.MACHO):
-        fmt = rec["file_type"].upper()
-        parse_errors.append(f"{rec['file_type']} parsing pending LIEF backend (detected only)")
-        rec["detected"] = f"{fmt} (detected only)"
+    elif rec["file_type"] == filetype.PE:
+        info = pemod.parse(data)
+        parse_errors.extend(info.errors)
+        rec.update({
+            "arch": info.arch, "bits": info.bits, "endianness": info.endianness,
+            "linking": info.linking, "stripped": info.stripped,
+            "entry_point": (f"0x{info.entry:x}" if info.entry is not None else None),
+            "sections": info.sections, "imports": info.imports,
+            "exports_count": info.exports_count,
+            "exports": {"count": info.exports_count, "symbols": info.exported_symbols},
+            "toolchain_hint": info.toolchain_hint, "mitigations": info.mitigations,
+            "format_details": pemod.to_format_details(info),
+        })
+        rec["entropy"] = _packer_heuristic(rec["entropy"]["overall"], info.sections)
+        rec["detected"] = _describe(rec)
+        # The old advisory said disassembly, CWE detection and the dynamic stages were "not
+        # yet available for this format" -- while the platform was disassembling 282 functions
+        # out of this very binary, producing findings from it and running it under Wine. What
+        # is actually missing is narrower, so say that instead.
+        rec["analyzable"] = True
+        rec["advisory"] = (
+            "PE analysed: headers, disassembly, CWE detection and execution under Wine all "
+            "work. Not available for PE: the LD_PRELOAD heap checker and P-Code dynamic "
+            "taint (both Linux/ELF), and fuzzing runs at Wine speed (~1 execution/second) "
+            "with no coverage feedback, so it is not a practical campaign.")
+    elif rec["file_type"] == filetype.MACHO:
+        parse_errors.append("mach-o parsing pending (detected only)")
+        rec["detected"] = "MACHO (detected only)"
         rec["analyzable"] = False
-        rec["advisory"] = (f"{fmt} binary detected, but this build fully analyzes ELF only. "
-                           "Format and hashes were recorded; disassembly, CWE detection, and "
-                           "the dynamic/fuzzing stages are not yet available for this format.")
+        rec["advisory"] = ("Mach-O binary detected, but this build parses ELF and PE headers "
+                           "only. Format and hashes were recorded.")
     else:
         desc = _classify_content(rec["_data_head"])
         rec["detected"] = f"Not a binary — {desc}"
@@ -161,7 +185,9 @@ def build_triage(path: str | Path, hashes: dict[str, Any], filename: str) -> dic
 
 
 def _describe(rec: dict) -> str:
-    parts = ["ELF"]
+    # was hardcoded "ELF", which described a Windows PE as an ELF the moment PE triage
+    # started filling these fields in
+    parts = [{"pe": "PE", "macho": "Mach-O"}.get(rec.get("file_type"), "ELF")]
     if rec["bits"]:
         parts.append(f"{rec['bits']}-bit")
     if rec["endianness"]:
@@ -173,6 +199,9 @@ def _describe(rec: dict) -> str:
                       "static": "statically linked"}.get(rec["linking"], "statically linked"))
     if rec["stripped"]:
         parts.append("stripped")
+    sub = (rec.get("format_details") or {}).get("subsystem")
+    if sub:
+        parts.append(sub)
     return ", ".join(parts)
 
 

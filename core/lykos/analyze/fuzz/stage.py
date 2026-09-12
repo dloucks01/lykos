@@ -282,7 +282,11 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
                                                           "corpus": len(corpus)})
 
     elapsed = max(1e-3, max_seconds - max(0.0, deadline - time.time()))
+    # An execution rate this low means the campaign barely ran, and "0 crashes" from 16
+    # executions must not read like "0 crashes" from 20,000.
+    rate = execs / max(1e-3, max_seconds - max(0.0, deadline - time.time()))
     stats = {"execs": execs, "crashes": crashes, "flaky": flaky, "unique": len(seen_sigs),
+             "starved": bool(execs < 200 and rate < 20),
              "behaviours": len(seen_behaviour), "corpus": len(corpus), "kept": kept,
              "execs_per_sec": round(execs / elapsed),
              "blocks_hit": len(seen_blocks), "blocks_known": len(all_blocks)}
@@ -490,6 +494,16 @@ def fuzz_stage(ctx) -> dict:
     exec_timeout = float(p.get("exec_timeout", 2))
     rng = random.Random(int(p.get("seed", 1337)))
 
+    # A PE runs under Wine at about one execution a second (measured: 1,249 ms against ~580/s
+    # native) with no coverage feedback, so a campaign manages a few dozen executions and then
+    # reports "0 crashes" exactly like a thorough one that found nothing. Say what it is.
+    if (target.file_type or "").lower() == "pe":
+        ctx.emit("fuzz.slow", payload={
+            "format": "pe", "note": (
+                "this is a Windows PE: every execution goes through Wine at roughly one per "
+                "second and there is no coverage feedback, so this campaign will manage a few "
+                "dozen executions rather than thousands. Prefer synthesize_poc, which derives "
+                "the overflow from the recovered stack frame without executing at all.")})
     strings = StringDAO(ctx.conn).list_by_target(target.id)
     blocks = _recovered_blocks(ctx, target)
     flags = mine_flags(ctx.content.path(target.sha256).read_bytes())

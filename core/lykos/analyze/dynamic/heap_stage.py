@@ -109,7 +109,16 @@ def heap_stage(ctx) -> dict:
         except subprocess.TimeoutExpired:
             pass
         except OSError as e:
-            ctx.emit("heap.done", payload={"ok": False, "note": f"could not run target: {e}"})
+            # "[Errno 8] Exec format error: '/tmp/lykos-heap-.../target.bin'" is a Python
+            # traceback fragment, not an answer -- and the answer was knowable before running
+            # anything. The taint stage next door already says "runs Linux ELF only (this
+            # target is PE)"; this one leaked the errno instead.
+            note = f"could not run target: {e}"
+            if e.errno == 8:
+                note = (f"this target is {(target.file_type or 'not an ELF').upper()}, and the "
+                        f"guard-page heap checker is a Linux/ELF LD_PRELOAD shim -- it cannot "
+                        f"load into it. Nothing was checked.")
+            ctx.emit("heap.done", payload={"ok": False, "applicable": False, "note": note})
             return {}
 
         errors = []
