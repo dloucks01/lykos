@@ -105,3 +105,31 @@ def test_an_uncaught_exception_on_a_channel_is_a_crash():
     from lykos.analyze.link import harness
     src = inspect.getsource(harness.channel_run)
     assert "jvm_exception" in src and "jvm_site" in src
+
+
+def test_a_persistent_session_serves_many_payloads_from_one_process():
+    """Restarting the target per input is what makes network fuzzing slow: a listener does not
+    exit when it is done with an input, so every non-crashing execution pays startup, group
+    join AND the full timeout. Measured on a JVM multicast receiver: 0.12 exec/s one-shot
+    against 12.2 persistent."""
+    import inspect
+
+    from lykos.analyze.link import harness
+    assert hasattr(harness, "ChannelSession")
+    src = inspect.getsource(harness.ChannelSession)
+    # the trade is attribution, and the safeguard is that a crash kills the session so the
+    # campaign's own re-run starts fresh and delivers only the suspect
+    assert "SUSPECT" in src and "fresh process" in src
+    assert "self.proc = None" in inspect.getsource(harness.ChannelSession._dead_result)
+
+
+def test_slow_is_not_the_same_as_starved():
+    """An emulated target runs at ~40 exec/s and a network listener at ~3, legitimately. A
+    persistent multicast campaign did 120 executions, found and confirmed a CWE-129, and still
+    reported `starved: true` on rate alone -- telling the reader to distrust a sound result."""
+    import inspect
+
+    from lykos.analyze.fuzz import stage
+    src = inspect.getsource(stage.fuzz_campaign)
+    assert "did_work = crashes > 0 or len(seen_behaviour) > 1" in src
+    assert "and not did_work" in src

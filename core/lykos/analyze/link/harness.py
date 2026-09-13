@@ -111,6 +111,14 @@ def _deliver(family, key, payload, readiness):
             s.close()
 
 
+def _deliver_once(family, key, payload):
+    """One delivery, no waiting. `_deliver` repeats across the readiness window because a
+    fresh process may not have bound yet; inside a session the listener is already up, so the
+    repeat is pure cost -- and a duplicate datagram would make the next payload's attribution
+    ambiguous."""
+    _deliver(family, key, payload, 0.0)
+
+
 def _mkfifo(key) -> Optional[str]:
     try:
         if not os.path.exists(key):
@@ -119,6 +127,132 @@ def _mkfifo(key) -> Optional[str]:
     except OSError:
         return None
     return None
+
+
+def _launch_cmd(exe, arch, argv, host=None):
+    """(cmd, jvm, error) -- how to start this target, shared by the one-shot and session
+    paths so the two cannot drift on substrate dispatch. Substrate BEFORE architecture."""
+    jvm = sandbox._is_jvm(exe)
+    emu = None
+    host = host or sandbox.host_arch()
+    if not jvm and arch and host and arch != host:
+        emu = sandbox._qemu_for(arch)
+        if not emu:
+            return None, jvm, f"no qemu-user for {arch} on {host}"
+    if jvm:
+        launch = [sandbox._java() or "java", *sandbox._JVM_FLAGS, "-jar", str(exe)]
+    elif emu:
+        launch = [emu, str(exe)]
+    else:
+        launch = [str(exe)]
+    return launch + [str(a) for a in (argv or ())], jvm, None
+
+
+def _classify(jvm, rc, out, err):
+    """(crashed, signal, signal_name, exit_code, fault_pc, detail) from one finished run."""
+    sig = -rc if rc is not None and rc < 0 else (rc - 128 if rc and rc > 128 else None)
+    exit_code = None if sig else rc
+    crashed = sig in sandbox.CRASH_SIGNALS if sig else False
+    signame = sandbox.CRASH_SIGNALS.get(sig) if sig else None
+    fault_pc = detail = None
+    if jvm and not crashed:
+        kind, why, frames = sandbox.jvm_exception(err or b"", exit_code, out or b"")
+        if kind:
+            crashed, signame = True, kind
+            fault_pc, detail = sandbox.jvm_site(frames), why
+    return crashed, sig, signame, exit_code, fault_pc, detail
+
+
+class ChannelSession:
+    """One listener process, many payloads.
+
+    Restarting the target per input is what makes network fuzzing slow: a JVM receiver costs
+    ~1 execution/second because every packet pays process startup, group join and then the
+    full timeout, since a listener does not exit when it is finished with an input -- only a
+    crash ends it. Keeping the process alive and sending the next datagram turns that into a
+    settle delay.
+
+    The trade is attribution: when the process dies, the payload in flight is the SUSPECT, not
+    a proven cause -- an earlier packet may have left it primed. That is why the session marks
+    itself dead on a crash, so the campaign's own re-run starts a fresh process and delivers
+    only that payload. A crash that does not survive that is not recorded.
+    """
+
+    def __init__(self, exe, family, key, *, argv=(), arch=None, readiness=2.0,
+                 settle=0.08, mem_mb=2048, capture=65536):
+        self.exe, self.family, self.key = exe, family, key
+        self.argv, self.arch = list(argv or ()), arch
+        self.readiness, self.settle = float(readiness), float(settle)
+        self.mem_mb, self.capture = mem_mb, capture
+        self.proc = None
+        self.jvm = False
+        self.error = None
+        self.restarts = 0
+
+    def _start(self):
+        cmd, jvm, err = _launch_cmd(self.exe, self.arch, self.argv)
+        self.jvm = jvm
+        if err:
+            self.error = err
+            return False
+        preexec = sandbox._rlimits(self.mem_mb, int(self.readiness) + 30, set_as=False)
+        self.proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                     start_new_session=True, preexec_fn=preexec)
+        self.cmd = cmd
+        self.restarts += 1
+        time.sleep(self.readiness)          # no readiness signal on a datagram socket
+        return self.proc.poll() is None
+
+    def send(self, payload: bytes) -> RunResult:
+        if self.error:
+            return RunResult(isolation="unsupported-arch", note=self.error)
+        if self.proc is None or self.proc.poll() is not None:
+            self._reap()
+            if not self._start():
+                return self._dead_result(note="target exited during startup")
+        try:
+            _deliver_once(self.family, self.key, payload)
+        except OSError as e:
+            return RunResult(isolation="rlimits-only(session)", note=f"deliver failed: {e}")
+        end = time.time() + self.settle
+        while time.time() < end:
+            if self.proc.poll() is not None:
+                return self._dead_result()
+            time.sleep(0.01)
+        return RunResult(isolation="rlimits-only(session)" + ("+jvm" if self.jvm else ""),
+                         crashed=False, exit_code=None,
+                         note=f"channel={self.family}:{self.key} (session)")
+
+    def _dead_result(self, note="") -> RunResult:
+        try:
+            out, err = self.proc.communicate(timeout=3)
+        except Exception:
+            out, err = b"", b""
+        rc = self.proc.returncode
+        self.proc = None
+        crashed, sig, signame, exit_code, fault_pc, detail = _classify(self.jvm, rc, out, err)
+        n = f"channel={self.family}:{self.key} (session)"
+        if detail:
+            n += f"; {detail}"
+        if note:
+            n += f"; {note}"
+        return RunResult(isolation="rlimits-only(session)" + ("+jvm" if self.jvm else ""),
+                         crashed=crashed, exit_code=exit_code, signal=sig,
+                         signal_name=signame, fault_pc=fault_pc,
+                         stdout=(out or b"")[:self.capture], stderr=(err or b"")[:self.capture],
+                         cmd=getattr(self, "cmd", []), note=n)
+
+    def _reap(self):
+        if self.proc is not None and self.proc.poll() is None:
+            try:
+                self.proc.kill()
+            except Exception:
+                pass
+        self.proc = None
+
+    def close(self):
+        self._reap()
 
 
 def channel_run(exe, family, key, payload: bytes, *, timeout: float = 5.0,

@@ -15,7 +15,7 @@ from ...db.dao import ComponentEdgeDAO, StringDAO, TargetDAO
 from ...jobs.registry import register_stage
 from ..fuzz import structure
 from ..fuzz.stage import _mine_dictionary, fuzz_campaign
-from .harness import DRIVABLE, channel_run
+from .harness import DRIVABLE, ChannelSession, channel_run
 
 BOUNDARY_STAGE = "boundary_fuzz"
 TOOL = "lykos-harness"
@@ -135,10 +135,30 @@ def boundary_fuzz_stage(ctx) -> dict:
         ctx.emit("harness.invocation", payload={"argv": base_argv, "family": family,
                                                 "key": key})
 
+    # One listener, many payloads. Restarting the target per input is what makes network
+    # fuzzing slow -- a listener does not exit when it is done with an input, so every
+    # non-crashing execution pays startup, group join AND the full timeout. Measured on a JVM
+    # multicast receiver: 0.12 exec/s one-shot against 12.2 persistent, a 98x difference.
+    #
+    # The trade is attribution: when the process dies, the payload in flight is a SUSPECT, not
+    # a proven cause. The session marks itself dead on a crash, so the campaign's own
+    # `_reproduces` check -- which calls this same run_fn -- starts a fresh process and
+    # delivers only that payload. A crash that does not survive that is not recorded.
+    persistent = p.get("persistent")
+    if persistent is None:
+        persistent = family in ("udp", "multicast")
+    session = {"s": None}
+
     def run_fn(exe, mode, workfile, timeout, arch, data, *, endianness=None, bits=None):
-        res = channel_run(exe, family, key, data, timeout=timeout, arch=arch,
-                          readiness=readiness, argv=base_argv)
-        return [], res
+        if not persistent:
+            res = channel_run(exe, family, key, data, timeout=timeout, arch=arch,
+                              readiness=readiness, argv=base_argv)
+            return [], res
+        if session["s"] is None:
+            session["s"] = ChannelSession(exe, family, key, argv=base_argv, arch=arch,
+                                          readiness=readiness,
+                                          settle=float(p.get("settle", 0.08)))
+        return [], session["s"].send(data)
 
     rng = random.Random(int(p.get("seed", 1337)))
     corpus = [base64.b64decode(x) for x in p.get("seeds", [])] or list(_SEEDS)
@@ -164,6 +184,11 @@ def boundary_fuzz_stage(ctx) -> dict:
                 corpus = [seed] + list(corpus)
         ctx.emit("harness.format", payload={"model": fmt})
     ctx.emit("harness.start", payload={"family": family, "key": key})
+    if persistent:
+        ctx.emit("harness.persistent", payload={
+            "family": family, "settle": float(p.get("settle", 0.08)),
+            "note": ("one listener process serves many payloads; a crash is re-checked "
+                     "against a fresh process before it is recorded")})
     stats = fuzz_campaign(
         ctx, target, corpus=corpus, dictionary=dictionary, mode="channel",
         max_execs=int(p.get("max_execs", 800)), max_seconds=float(p.get("max_seconds", 30)),
@@ -173,7 +198,11 @@ def boundary_fuzz_stage(ctx) -> dict:
         # first thing anyone replaying a network crash needs -- `-g 239.9.9.9 -p 5004` is not
         # recoverable from the payload -- and the campaign records this, not run_fn's return.
         run_fn=run_fn, mutator=mutator, base_argv=base_argv)
-    return {"metrics": {**stats, "family": family, "key": key}}
+    if session["s"] is not None:
+        ctx.emit("harness.restarts", payload={"restarts": session["s"].restarts})
+        session["s"].close()
+    return {"metrics": {**stats, "family": family, "key": key,
+                        "persistent": bool(persistent)}}
 
 
 def register() -> None:
