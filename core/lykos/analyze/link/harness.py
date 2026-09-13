@@ -131,8 +131,14 @@ def channel_run(exe, family, key, payload: bytes, *, timeout: float = 5.0,
                          note=f"cannot drive {family} channels "
                               f"(try {'/'.join(sorted(DRIVABLE))})")
     host = host or sandbox.host_arch()
+    # Substrate BEFORE architecture, the order sandbox.run uses. A jar's recorded arch is
+    # "jvm", which is not a processor and has no qemu -- so asking for an emulator first
+    # rejected every Java target with "no qemu-user for jvm on x86-64" before the JVM branch
+    # below could run it. The campaign then reported 30 executions at 24,000/second, because
+    # each one returned that error immediately without starting anything.
+    jvm = sandbox._is_jvm(exe)
     emu = None
-    if arch and host and arch != host:
+    if not jvm and arch and host and arch != host:
         emu = sandbox._qemu_for(arch)
         if not emu:
             return RunResult(isolation="unsupported-arch",
@@ -141,7 +147,17 @@ def channel_run(exe, family, key, payload: bytes, *, timeout: float = 5.0,
     # prints its usage and exits, and every payload is delivered to a process that is already
     # gone -- which looks exactly like a channel the target ignores. The flags come from the
     # same invocation discovery the fuzzer uses.
-    cmd = ([emu, str(exe)] if emu else [str(exe)]) + [str(a) for a in (argv or ())]
+    # A jar is not executable and the JVM is not the target: exec'ing it directly starts
+    # nothing, and the run comes back with no exit code, no output and no crash -- which is
+    # indistinguishable from a channel the target ignores. Java multicast receivers are a real
+    # target class here, so the runtime has to be named, exactly as sandbox.run does.
+    if jvm:
+        launch = [sandbox._java() or "java", *sandbox._JVM_FLAGS, "-jar", str(exe)]
+    elif emu:
+        launch = [emu, str(exe)]
+    else:
+        launch = [str(exe)]
+    cmd = launch + [str(a) for a in (argv or ())]
     preexec = sandbox._rlimits(mem_mb, int(timeout) + 2, set_as=(emu is None))
 
     made_fifo = _mkfifo(key) if family == "fifo" else None
@@ -194,11 +210,21 @@ def channel_run(exe, family, key, payload: bytes, *, timeout: float = 5.0,
     note = f"channel={family}:{key}"
     if derr[0]:
         note += f"; deliver={derr[0]}"
+    crashed = sig in sandbox.CRASH_SIGNALS if sig else False
+    signame = sandbox.CRASH_SIGNALS.get(sig) if sig else None
+    fault_pc = None
+    if jvm and not crashed:
+        # A Java program does not segfault, it throws -- so the wait status says nothing and
+        # an uncaught ArrayIndexOutOfBoundsException would have been recorded as a clean run.
+        kind, detail, frames = sandbox.jvm_exception(err or b"", exit_code, out or b"")
+        if kind:
+            crashed, signame = True, kind
+            fault_pc = sandbox.jvm_site(frames)
+            note += f"; {detail}"
     return RunResult(
-        isolation="rlimits-only(channel)",
-        crashed=(sig in sandbox.CRASH_SIGNALS if sig else False), timed_out=timed,
-        exit_code=exit_code, signal=sig,
-        signal_name=sandbox.CRASH_SIGNALS.get(sig) if sig else None,
+        isolation="rlimits-only(channel)" + ("+jvm" if jvm else ""),
+        crashed=crashed, timed_out=timed,
+        exit_code=exit_code, signal=sig, signal_name=signame, fault_pc=fault_pc,
         stdout=(out or b"")[:capture], stderr=(err or b"")[:capture],
         duration_ms=dur, cmd=cmd, note=note)
 

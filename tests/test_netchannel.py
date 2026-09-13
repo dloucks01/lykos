@@ -68,3 +68,40 @@ def test_the_adaptation_length_is_a_field_the_mutator_can_drive():
     all_names = names(structure.builtin("mpegts").spec)
     assert "af_len" in all_names, all_names
     assert "adaptation" in all_names, "the adaptation field is a group, not a loose byte"
+
+
+def test_the_channel_harness_dispatches_on_substrate_before_architecture():
+    """A jar's recorded arch is "jvm", which is not a processor and has no qemu. Asking for an
+    emulator FIRST rejected every Java target with "no qemu-user for jvm on x86-64" before the
+    JVM branch could run it -- and the campaign then reported 30 executions at 24,000/second,
+    because each returned that error immediately without starting anything. sandbox.run has
+    always dispatched substrate-first; this did not."""
+    import inspect
+
+    from lykos.analyze.link import harness
+    src = inspect.getsource(harness.channel_run)
+    jvm_at = src.index("_is_jvm(exe)")
+    qemu_at = src.index("_qemu_for(arch)")
+    assert jvm_at < qemu_at, "the JVM check must come before the emulator lookup"
+    assert "not jvm and arch and host" in src, "and must exclude the JVM from it"
+
+
+def test_a_java_target_is_launched_under_the_jvm_on_a_channel():
+    """A jar is not executable: exec'ing it starts nothing and the run comes back with no exit
+    code, no output and no crash -- indistinguishable from a channel the target ignores."""
+    import inspect
+
+    from lykos.analyze.link import harness
+    src = inspect.getsource(harness.channel_run)
+    assert '"-jar"' in src and "_JVM_FLAGS" in src
+
+
+def test_an_uncaught_exception_on_a_channel_is_a_crash():
+    """A Java program does not segfault, it throws, so the wait status says nothing. Without
+    reading stderr an uncaught ArrayIndexOutOfBoundsException was recorded as a clean run --
+    and on this path that is the bug a video receiver actually has."""
+    import inspect
+
+    from lykos.analyze.link import harness
+    src = inspect.getsource(harness.channel_run)
+    assert "jvm_exception" in src and "jvm_site" in src
