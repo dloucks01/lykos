@@ -115,7 +115,27 @@ class FormatModel:
                 # a real container: a JPEG's EXIF segment is followed by the frame and scan
                 # headers that decide whether the file parses at all.
                 name = f.get("name")
-                if name in covered:
+                if f.get("until") is not None:
+                    # A blob that ends at a DELIMITER rather than at a length. H.264 in
+                    # Annex-B framing has no length field at all -- a NAL unit runs until the
+                    # next 00 00 00 01 start code -- and without this the first NAL body ate
+                    # the whole stream, so the model described three NAL units and the
+                    # mutator could only ever reach the first one's header.
+                    delim = _as_bytes(f["until"])
+                    nxt = data.find(delim, pos) if delim else -1
+                    stop = nxt if nxt >= 0 else len(data)
+                elif f.get("size_from"):
+                    # A blob whose length lives in part of ANOTHER field: RTP's CSRC list is
+                    # four bytes per unit of CC, and CC is the low nibble of byte 0. `covers`
+                    # and `length_of` both need a whole integer field to point at, so a count
+                    # packed into a bitfield -- which is most of how binary network protocols
+                    # are shaped -- could not be expressed at all.
+                    sf = f["size_from"]
+                    raw = int(seen.get(sf.get("field")) or 0)
+                    n = ((raw >> int(sf.get("shift", 0))) & int(sf.get("mask", 0xFFFFFFFF))
+                         ) * int(sf.get("scale", 1))
+                    stop = min(pos + max(n, 0), len(data))
+                elif name in covered:
                     total, start = covered[name]
                     # `length_of` sizes the blob from its own start; `covers` spans from the
                     # length field itself, so the blob ends at that field's start plus the span
@@ -294,9 +314,17 @@ def _seed_spec(spec, payload):
             # and end-of-image marker); earlier blobs get the payload, unless the model gives
             # one its own value -- a ZIP's "extra field" and comment have to start EMPTY, or
             # their length fields describe bytes the format says are not there
-            val = f["seed_value"] if "seed_value" in f else payload
+            if "seed_value" in f:
+                val = f["seed_value"]
+            elif f.get("size_from"):
+                # its length is whatever the seeded count field says, which for a baseline is
+                # zero -- handing it the payload would contradict the count and the parser
+                # would reject the seed it was given to start from
+                val = b""
+            else:
+                val = payload
             fields.append({"f": f, "val": _as_bytes(val)})
-            if "seed_value" not in f:
+            if "seed_value" not in f and not f.get("size_from"):
                 blobs.append(fields[-1])
     return fields, blobs
 
@@ -640,6 +668,98 @@ _BUILTINS = {
                    ]},
                    {"type": "blob", "name": "payload"},
                ]},
+    # RTP (RFC 3550): the packet a network video receiver actually gets, and the one place
+    # the mpegts model does not reach -- an RTP receiver parses the RTP header BEFORE it ever
+    # sees a TS packet, so a bug in that header is hit first and by every stream.
+    #
+    # Two fields here are the classic shape: chosen by the sender, trusted by the receiver,
+    # and used as a count.
+    #   * CC, the low nibble of byte 0, says how many 4-byte CSRC identifiers follow. A
+    #     receiver that reads CC and then reads CC*4 bytes -- without checking them against
+    #     the datagram it actually received -- walks off the end. Byte 0 is a whole u8 here
+    #     rather than a bitfield because the spec language has no bitfields; mutating the
+    #     byte drives CC through its whole 0..15 range, which is the point.
+    #   * the extension length, which counts 32-bit WORDS of header extension.
+    #
+    # Both are `size_from` rather than `covers`, because both are counts in a unit that is
+    # not bytes -- four bytes per CC, four bytes per extension word -- and `covers` is bytes.
+    # `size_from` bounds the blob on the way back IN without forcing the field to agree on
+    # the way out, which is the whole point: the baseline stays a packet the receiver
+    # accepts, and the mutator is still free to drive the count past what the datagram holds.
+    # Without a bound the blob after each of them swallowed the rest of the packet, so the
+    # payload was unreachable and the extension fields only ever moved when something before
+    # them shifted.
+    #
+    # Seeded X=1 (byte 0 = 0x90) so the extension path is parsed at all, and PT=33/MP2T
+    # (byte 1 = 0x21) with a real TS packet as the payload, which is how video over RTP is
+    # carried in practice -- so a receiver that demuxes reaches its TS parser too.
+    "rtp": {"tokens": ("RTP/AVP", "rtpmap", "rtcp", "ssrc", "rtp"),
+            "seed": b"\x47\x00\x21\x10" + b"\x00" * 184,
+            "spec": [
+                # V=2, P=0, X=1, CC=0
+                {"type": "u8", "name": "v_p_x_cc", "seed_value": 0x90},
+                # M=0, PT=33 (MP2T)
+                {"type": "u8", "name": "m_pt", "seed_value": 0x21},
+                {"type": "u16", "endian": "big", "name": "seq", "seed_value": 1},
+                {"type": "u32", "endian": "big", "name": "timestamp", "seed_value": 0},
+                {"type": "u32", "endian": "big", "name": "ssrc", "seed_value": 0xDEADBEEF},
+                # present only when CC > 0; the mutator grows this as it drives byte 0
+                # four bytes per unit of CC, which is the low nibble of byte 0
+                {"type": "blob", "name": "csrc",
+                 "size_from": {"field": "v_p_x_cc", "mask": 0x0F, "scale": 4}},
+                {"type": "group", "name": "ext", "spec": [
+                    # 0xBEDE: the one-byte-header extension profile of RFC 5285
+                    {"type": "u16", "endian": "big", "name": "ext_profile",
+                     "seed_value": 0xBEDE},
+                    # in 32-bit WORDS, which is why `covers` cannot express it:
+                    # covers is measured in bytes, so it would make the baseline four times
+                    # too large and the receiver would reject every unmutated packet
+                    {"type": "u16", "endian": "big", "name": "ext_len", "seed_value": 1,
+                     "role": "size"},
+                    {"type": "blob", "name": "ext_data",
+                     "size_from": {"field": "ext_len", "scale": 4},
+                     "seed_value": b"\x00" * 4}]},
+                {"type": "blob", "name": "payload"},
+            ]},
+    # H.264 in Annex-B framing: the elementary stream inside an RTP or TS payload, and what a
+    # decoder is handed once the transport is stripped. There is no length field in Annex-B --
+    # a NAL unit runs until the next start code -- so unlike every other model here the value
+    # is not in keeping a length coherent. It is in keeping the START CODES intact: a decoder
+    # scans for 00 00 01 and discards everything before it, so blind byte mutation destroys
+    # the framing and the decoder never parses anything. Exactly the mpegts sync-byte
+    # argument, which is why the start codes are `magic` and the NAL bodies are not.
+    #
+    # The seeded SPS and PPS are real (baseline, 16x16): a decoder that rejects a malformed
+    # parameter set never reaches slice decoding, so the interesting code is only reachable
+    # if the stream is valid up to that point. The IDR slice body is the mutable blob.
+    "h264": {"tokens": ("h264", "H.264", "nal_unit_type", "avcC", "AVC"),
+             "seed": b"\x88\x80\x10\x00",
+             "spec": [
+                 {"type": "magic", "value": b"\x00\x00\x00\x01"},
+                 # nal_ref_idc=3, nal_unit_type=7 (SPS)
+                 {"type": "u8", "name": "sps_hdr", "seed_value": 0x67},
+                 {"type": "blob", "name": "sps", "until": b"\x00\x00\x00\x01",
+                  "seed_value": b"\x42\x00\x0a\xf8\x41\xa2"},
+                 {"type": "magic", "value": b"\x00\x00\x00\x01"},
+                 # nal_ref_idc=3, nal_unit_type=8 (PPS)
+                 {"type": "u8", "name": "pps_hdr", "seed_value": 0x68},
+                 {"type": "blob", "name": "pps", "until": b"\x00\x00\x00\x01",
+                  "seed_value": b"\xce\x3c\x80"},
+                 {"type": "magic", "value": b"\x00\x00\x00\x01"},
+                 # nal_ref_idc=3, nal_unit_type=5 (IDR slice) -- mutating this byte walks the
+                 # decoder's nal_unit_type dispatch, which is where the reserved and
+                 # unhandled types live
+                 {"type": "u8", "name": "idr_hdr", "seed_value": 0x65},
+                 {"type": "blob", "name": "idr_slice", "until": b"\x00\x00\x00\x01",
+                  "seed_value": b"\x88\x80\x10\x00"},
+                 {"type": "magic", "value": b"\x00\x00\x00\x01"},
+                 # nal_ref_idc=2, nal_unit_type=1 (non-IDR slice): a real stream is one IDR
+                 # followed by P-slices, and a decoder only reaches its inter-prediction and
+                 # reference-list code on a non-IDR one -- an IDR-only stream leaves the
+                 # larger half of the slice decoder unvisited
+                 {"type": "u8", "name": "slice_hdr", "seed_value": 0x41},
+                 {"type": "blob", "name": "slice"},
+             ]},
     "bmp": {"tokens": ("BITMAPINFOHEADER", "BITMAPFILEHEADER", ".bmp"), "seed": b"\x00" * 4,
             "spec": [
                 {"type": "magic", "value": b"BM"},
@@ -812,6 +932,8 @@ _SIGNATURES = [
     ("CLASS", b"\xca\xfe\xba\xbe"), ("OGG", b"OggS"), ("FLAC", b"fLaC"),
     ("7Z", b"7z\xbc\xaf\x27\x1c"), ("XZ", b"\xfd7zXZ\x00"), ("WASM", b"\x00asm"),
     ("CAB", b"MSCF"), ("MACHO", b"\xcf\xfa\xed\xfe"), ("SQLITE", b"SQLite format 3\x00"),
+    ("H264", b"\x00\x00\x00\x01"),
+
 ]
 
 

@@ -153,13 +153,41 @@ def _win_behavior_trace(ctx, target, p) -> dict:
                  f"the PE deleted a file: {path!r}", f"BEHAVIOR:win:del:{path[:70]}")
         findings += 1
 
+    # A trace that was CUT SHORT is a partial inventory, and an empty partial inventory looks
+    # exactly like a clean program. Both flags were computed and then dropped on the floor:
+    # `_relay` knew it had killed the target at the timeout, `trace` passed the fact along, and
+    # nothing here read it -- so "no persistence, no network, no exec" was reported with the
+    # same confidence whether we had watched the whole program or the first second of it.
+    partial = _partial_note(res)
+    note = partial
+    if not ev:
+        note = ("no monitored Win32 API calls observed on this input" if not partial
+                else partial)
     ctx.emit("behavior.done", payload={"ok": True, "platform": "windows", "calls": len(ev),
              "inventory": inv, "findings": findings, "report": report_sha,
-             "note": None if ev else "no monitored Win32 API calls observed on this input"})
+             "partial": bool(partial), "truncated": bool(res.get("truncated")),
+             "timed_out": bool(res.get("timed_out")), "note": note})
     ctx.progress(pct=100, msg=f"{len(ev)} Win32 call(s); exec={len(inv['exec'])} "
                  f"net={bool(inv['network'])} persist={len(persist)} "
-                 f"files={len(inv['files_written'])} del={len(inv['deleted'])}")
+                 f"files={len(inv['files_written'])} del={len(inv['deleted'])}"
+                 + (f" -- {partial}" if partial else ""))
     return {"output_shas": [report_sha], "output_kind": "behavior-trace"}
+
+
+def _partial_note(res) -> str:
+    """Why this behaviour inventory may be incomplete, or "" when it is not.
+
+    An absence of evidence is only evidence of absence if we were watching the whole time.
+    """
+    why = []
+    if res.get("timed_out"):
+        why.append("the target was still running when the trace timeout expired")
+    if res.get("truncated"):
+        why.append("the +relay log exceeded the capture cap")
+    if not why:
+        return ""
+    return ("PARTIAL TRACE (" + "; ".join(why) + "): absence of a behaviour here does not "
+            "mean the program does not have it -- raise params.timeout and re-run")
 
 
 def behavior_trace_stage(ctx) -> dict:

@@ -71,6 +71,12 @@ class RunResult:
     # Image-relative address of the faulting instruction, when the target was traced. Two
     # crashes at different addresses are different defects, however alike their signals look.
     fault_pc: Optional[int] = None
+    # Which of the requested coverage blocks this run reached, or None when coverage was not
+    # asked for. This used to travel in `note`, parsed back out of a comma-joined string --
+    # which worked only because nothing else ever put anything in `note`. The channel runner
+    # has something to say there (which endpoint, which session, why the process died), so the
+    # two uses collided: one of them had to lose, and coverage losing is silent.
+    blocks_hit: Optional[tuple] = None
 
 
 class ArgvNulError(ValueError):
@@ -694,10 +700,11 @@ def run(exe, *, argv=(), stdin: bytes = b"", timeout: float = 10.0,
     # classify_rc() holds the one copy of this: native subprocesses report -signum while
     # wrappers (bwrap/qemu) report 128+signum, and the two had drifted apart here.
     crashed, sig, sig_name, exit_code = classify_rc(rc)
-    note, fault_pc = None, None
+    note, fault_pc, blocks_hit = None, None, None
     if trace_log:
         reached, last = _qemu_reached(trace_log, blocks, want_last=True)
         note = ",".join(str(x) for x in reached) or None
+        blocks_hit = tuple(reached)
         # Where it died, for an EMULATED target. The ptrace tracer cannot reach inside qemu,
         # so a cross-architecture crash had no faulting address and every SIGSEGV in the
         # program bucketed as one finding. qemu's log stops at the fault, so the last block it
@@ -710,7 +717,7 @@ def run(exe, *, argv=(), stdin: bytes = b"", timeout: float = 10.0,
         isolation=iso, crashed=crashed, timed_out=timed,
         exit_code=exit_code, signal=sig, signal_name=sig_name,
         stdout=(out or b"")[:capture], stderr=(err or b"")[:capture],
-        duration_ms=dur, cmd=cmd, note=note, fault_pc=fault_pc)
+        duration_ms=dur, cmd=cmd, note=note, fault_pc=fault_pc, blocks_hit=blocks_hit)
 
 
 _TRACE_PC = re.compile(rb"^Trace \d+: 0x[0-9a-f]+ \[[^/]*/([0-9a-f]+)/", re.M)

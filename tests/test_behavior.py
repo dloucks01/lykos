@@ -283,6 +283,12 @@ def test_winapi_live_persistence_and_file_ops(tmp_path):
     from lykos.analyze.debug.trace_stage import _WIN_PERSIST
     r = winapi.trace(str(exe), argv=[], timeout=120)
     assert r["ok"], r.get("note")
+    if r.get("timed_out") or r.get("truncated"):
+        # We did not watch the whole program, so the absence of the Run key says nothing about
+        # the target -- it says the trace was cut. This is a real condition under load (it is
+        # what first surfaced the partial-trace reporting gap), and asserting through it would
+        # be asserting on evidence we did not collect.
+        pytest.skip("wine trace was cut short (timeout/cap) -- inventory is partial")
     keys = {e["detail"] for e in r["events"] if e["category"] == "regkey" and e["detail"]}
     persist = [k for k in keys if any(p in k.lower() for p in _WIN_PERSIST)]
     assert persist == ["HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run"]

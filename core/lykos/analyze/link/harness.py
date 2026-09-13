@@ -14,10 +14,13 @@ fsize limits + process-group kill + wall-clock). Whole-system detonation under a
 from __future__ import annotations
 
 import os
+import shutil
 import socket
 import subprocess
+import tempfile
 import threading
 import time
+from pathlib import Path
 from typing import Optional
 
 from ..dynamic import sandbox
@@ -129,9 +132,15 @@ def _mkfifo(key) -> Optional[str]:
     return None
 
 
-def _launch_cmd(exe, arch, argv, host=None):
+def _launch_cmd(exe, arch, argv, host=None, trace_log=None):
     """(cmd, jvm, error) -- how to start this target, shared by the one-shot and session
-    paths so the two cannot drift on substrate dispatch. Substrate BEFORE architecture."""
+    paths so the two cannot drift on substrate dispatch. Substrate BEFORE architecture.
+
+    `trace_log` asks an EMULATED target for its basic-block log, which is the only way to get
+    coverage out of a listener: there is no instrumented rebuild of a binary we were handed,
+    and the process is not restarted per input, so qemu's own `-d exec` log is the signal.
+    It is ignored for a native or JVM target, which have no emulator to ask.
+    """
     jvm = sandbox._is_jvm(exe)
     emu = None
     host = host or sandbox.host_arch()
@@ -142,7 +151,7 @@ def _launch_cmd(exe, arch, argv, host=None):
     if jvm:
         launch = [sandbox._java() or "java", *sandbox._JVM_FLAGS, "-jar", str(exe)]
     elif emu:
-        launch = [emu, str(exe)]
+        launch = [emu] + (["-d", "exec", "-D", str(trace_log)] if trace_log else []) + [str(exe)]
     else:
         launch = [str(exe)]
     return launch + [str(a) for a in (argv or ())], jvm, None
@@ -179,7 +188,7 @@ class ChannelSession:
     """
 
     def __init__(self, exe, family, key, *, argv=(), arch=None, readiness=2.0,
-                 settle=0.15, mem_mb=2048, capture=65536):
+                 settle=0.15, mem_mb=2048, capture=65536, blocks=()):
         self.exe, self.family, self.key = exe, family, key
         self.argv, self.arch = list(argv or ()), arch
         self.readiness, self.settle = float(readiness), float(settle)
@@ -188,9 +197,19 @@ class ChannelSession:
         self.jvm = False
         self.error = None
         self.restarts = 0
+        # Coverage on a persistent listener, for an emulated target. One process serves many
+        # payloads, so the block log is cumulative and a whole-file read would credit every
+        # payload with everything reached before it -- which is not coverage, it is a running
+        # total that only ever grows. Reading only what the log gained since the last send is
+        # what makes it per-payload.
+        self.blocks = tuple(blocks or ())
+        self._tdir = tempfile.mkdtemp(prefix="lykos-chtrace-") if self.blocks else None
+        self._trace_log = str(Path(self._tdir) / "exec.log") if self._tdir else None
+        self._log_pos = 0
 
     def _start(self):
-        cmd, jvm, err = _launch_cmd(self.exe, self.arch, self.argv)
+        cmd, jvm, err = _launch_cmd(self.exe, self.arch, self.argv,
+                                    trace_log=self._trace_log)
         self.jvm = jvm
         if err:
             self.error = err
@@ -201,6 +220,7 @@ class ChannelSession:
                                      start_new_session=True, preexec_fn=preexec)
         self.cmd = cmd
         self.restarts += 1
+        self._log_pos = 0                   # a fresh qemu truncates the log it writes
         time.sleep(self.readiness)          # no readiness signal on a datagram socket
         return self.proc.poll() is None
 
@@ -228,8 +248,29 @@ class ChannelSession:
                 return self._dead_result()
             time.sleep(0.01)
         return RunResult(isolation="rlimits-only(session)" + ("+jvm" if self.jvm else ""),
-                         crashed=False, exit_code=None,
+                         crashed=False, exit_code=None, blocks_hit=self._new_blocks(),
                          note=f"channel={self.family}:{self.key} (session)")
+
+    def _new_blocks(self):
+        """Which of the wanted blocks appeared in the log SINCE THE LAST SEND.
+
+        None when coverage was not asked for, so the campaign can tell "no coverage available"
+        from "this payload reached nothing" -- the first means fall back to behaviour novelty,
+        the second means the payload was genuinely uninteresting, and treating them alike
+        would have every native target look like a target that never reaches new code.
+        """
+        if not self._trace_log:
+            return None
+        try:
+            with open(self._trace_log, "rb") as fh:
+                fh.seek(self._log_pos)
+                data = fh.read()
+                self._log_pos = fh.tell()
+        except OSError:
+            return ()
+        want = set(self.blocks)
+        return tuple(sorted({int(m.group(1), 16)
+                             for m in sandbox._TRACE_PC.finditer(data)} & want))
 
     def _dead_result(self, note="") -> RunResult:
         try:
@@ -246,7 +287,7 @@ class ChannelSession:
             n += f"; {note}"
         return RunResult(isolation="rlimits-only(session)" + ("+jvm" if self.jvm else ""),
                          crashed=crashed, exit_code=exit_code, signal=sig,
-                         signal_name=signame, fault_pc=fault_pc,
+                         signal_name=signame, fault_pc=fault_pc, blocks_hit=self._new_blocks(),
                          stdout=(out or b"")[:self.capture], stderr=(err or b"")[:self.capture],
                          cmd=getattr(self, "cmd", []), note=n)
 
@@ -260,45 +301,45 @@ class ChannelSession:
 
     def close(self):
         self._reap()
+        if self._tdir:
+            shutil.rmtree(self._tdir, ignore_errors=True)
+            self._tdir = self._trace_log = None
 
 
 def channel_run(exe, family, key, payload: bytes, *, timeout: float = 5.0,
                 arch: Optional[str] = None, host: Optional[str] = None,
                 readiness: float = _READINESS, mem_mb: int = 2048,
-                capture: int = 65536, argv=()) -> RunResult:
-    """Launch the consumer and deliver one payload over its channel; detect a crash."""
+                capture: int = 65536, argv=(), blocks=()) -> RunResult:
+    """Launch the consumer and deliver one payload over its channel; detect a crash.
+
+    `blocks` asks for coverage, and is only answerable for an emulated target -- see
+    `_launch_cmd`. A fresh process per payload means the block log IS this payload's coverage.
+    """
     if family not in DRIVABLE:
         return RunResult(isolation="unsupported-channel",
                          note=f"cannot drive {family} channels "
                               f"(try {'/'.join(sorted(DRIVABLE))})")
     host = host or sandbox.host_arch()
-    # Substrate BEFORE architecture, the order sandbox.run uses. A jar's recorded arch is
-    # "jvm", which is not a processor and has no qemu -- so asking for an emulator first
-    # rejected every Java target with "no qemu-user for jvm on x86-64" before the JVM branch
-    # below could run it. The campaign then reported 30 executions at 24,000/second, because
-    # each one returned that error immediately without starting anything.
-    jvm = sandbox._is_jvm(exe)
-    emu = None
-    if not jvm and arch and host and arch != host:
-        emu = sandbox._qemu_for(arch)
-        if not emu:
-            return RunResult(isolation="unsupported-arch",
-                             note=f"no qemu-user for {arch} on {host}")
-    # A listener needs to be told what to listen ON. Launched bare, a multicast receiver
+    # Substrate BEFORE architecture, and via _launch_cmd so the one-shot and session paths
+    # cannot disagree about it. A jar's recorded arch is "jvm", which is not a processor and
+    # has no qemu -- so asking for an emulator first rejected every Java target with "no
+    # qemu-user for jvm on x86-64" before the JVM branch could run it, and the campaign
+    # reported 30 executions at 24,000/second because each returned that error immediately
+    # without starting anything. This function used to carry its own copy of that dispatch:
+    # _launch_cmd's docstring promised the two could not drift while nothing here called it.
+    #
+    # A listener also needs to be told what to listen ON. Launched bare, a multicast receiver
     # prints its usage and exits, and every payload is delivered to a process that is already
     # gone -- which looks exactly like a channel the target ignores. The flags come from the
     # same invocation discovery the fuzzer uses.
-    # A jar is not executable and the JVM is not the target: exec'ing it directly starts
-    # nothing, and the run comes back with no exit code, no output and no crash -- which is
-    # indistinguishable from a channel the target ignores. Java multicast receivers are a real
-    # target class here, so the runtime has to be named, exactly as sandbox.run does.
-    if jvm:
-        launch = [sandbox._java() or "java", *sandbox._JVM_FLAGS, "-jar", str(exe)]
-    elif emu:
-        launch = [emu, str(exe)]
-    else:
-        launch = [str(exe)]
-    cmd = launch + [str(a) for a in (argv or ())]
+    tdir = tempfile.mkdtemp(prefix="lykos-chtrace-") if blocks else None
+    trace_log = str(Path(tdir) / "exec.log") if tdir else None
+    cmd, jvm, err = _launch_cmd(exe, arch, argv, host=host, trace_log=trace_log)
+    if err:
+        if tdir:
+            shutil.rmtree(tdir, ignore_errors=True)
+        return RunResult(isolation="unsupported-arch", note=err)
+    emu = None if (jvm or cmd[0] == str(exe)) else cmd[0]
     preexec = sandbox._rlimits(mem_mb, int(timeout) + 2, set_as=(emu is None))
 
     made_fifo = _mkfifo(key) if family == "fifo" else None
@@ -362,12 +403,21 @@ def channel_run(exe, family, key, payload: bytes, *, timeout: float = 5.0,
             crashed, signame = True, kind
             fault_pc = sandbox.jvm_site(frames)
             note += f"; {detail}"
+    blocks_hit = None
+    if trace_log:
+        reached, last = sandbox._qemu_reached(trace_log, blocks, want_last=True)
+        blocks_hit = tuple(reached)
+        # An emulated listener has no ptrace tracer either, so the last block qemu translated
+        # is the only fault locus available -- the same bargain sandbox.run makes.
+        if crashed and fault_pc is None:
+            fault_pc = last
+        shutil.rmtree(tdir, ignore_errors=True)
     return RunResult(
         isolation="rlimits-only(channel)" + ("+jvm" if jvm else ""),
         crashed=crashed, timed_out=timed,
         exit_code=exit_code, signal=sig, signal_name=signame, fault_pc=fault_pc,
         stdout=(out or b"")[:capture], stderr=(err or b"")[:capture],
-        duration_ms=dur, cmd=cmd, note=note)
+        duration_ms=dur, cmd=cmd, note=note, blocks_hit=blocks_hit)
 
 
 def _rm(path):

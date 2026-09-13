@@ -320,3 +320,150 @@ def test_every_builtin_describes_more_than_its_magic():
             continue            # deliberately generic: a magic + length + payload container
         n = described(S.builtin(name).spec)
         assert n >= 10, f"{name} is still a stub: {n} fields"
+
+
+# --- delimited and derived-size blobs, and the two video models built on them ----------
+
+def test_a_blob_can_end_at_a_delimiter_instead_of_a_length():
+    """Annex-B framing has no length field: a NAL unit runs until the next start code.
+    Without `until` the first blob ate the whole stream, so a model could describe three NAL
+    units and the mutator could still only ever reach the first one."""
+    m = S.FormatModel([
+        {"type": "magic", "value": b"##"},
+        {"type": "blob", "name": "first", "until": b"##"},
+        {"type": "magic", "value": b"##"},
+        {"type": "blob", "name": "second"}])
+    fields = m.parse(b"##abc##defgh")
+    vals = {f["f"].get("name"): f["val"] for f in fields if f["f"].get("name")}
+    assert vals["first"] == b"abc"
+    assert vals["second"] == b"defgh"
+    assert m.serialize(fields) == b"##abc##defgh"
+
+
+def test_a_delimited_blob_with_no_delimiter_left_takes_the_rest():
+    m = S.FormatModel([{"type": "blob", "name": "only", "until": b"##"}])
+    fields = m.parse(b"nothing here")
+    assert fields[0]["val"] == b"nothing here"
+
+
+def test_a_blob_can_take_its_length_from_a_bitfield_of_another_field():
+    """RTP's CSRC list is four bytes per unit of CC, and CC is the low nibble of byte 0.
+    `covers` and `length_of` both need a whole integer field to point at, so a count packed
+    into a bitfield -- most of how binary network protocols are shaped -- had no expression."""
+    spec = [{"type": "u8", "name": "flags"},
+            {"type": "blob", "name": "list",
+             "size_from": {"field": "flags", "mask": 0x0F, "scale": 4}},
+            {"type": "blob", "name": "rest"}]
+    m = S.FormatModel(spec)
+    fields = m.parse(b"\x02" + b"AAAABBBB" + b"tail")
+    vals = {f["f"].get("name"): f["val"] for f in fields if f["f"].get("name")}
+    assert vals["list"] == b"AAAABBBB"          # CC=2 -> 8 bytes
+    assert vals["rest"] == b"tail"
+    # the high nibble is masked off, not read as part of the count
+    fields = m.parse(b"\x92" + b"AAAABBBB" + b"tail")
+    vals = {f["f"].get("name"): f["val"] for f in fields if f["f"].get("name")}
+    assert vals["list"] == b"AAAABBBB"
+
+
+def test_a_derived_size_that_outruns_the_input_is_clamped_not_fatal():
+    """A count past the end of the datagram is the bug being hunted, so parsing it has to
+    survive: the mutator drives CC to 15 on purpose."""
+    m = S.FormatModel([{"type": "u8", "name": "flags"},
+                       {"type": "blob", "name": "list",
+                        "size_from": {"field": "flags", "mask": 0x0F, "scale": 4}},
+                       {"type": "blob", "name": "rest"}])
+    fields = m.parse(b"\x0f" + b"AAAA")
+    vals = {f["f"].get("name"): f["val"] for f in fields if f["f"].get("name")}
+    assert vals["list"] == b"AAAA" and vals["rest"] == b""
+
+
+def test_a_derived_size_blob_seeds_empty_so_the_baseline_agrees_with_its_count():
+    """Seeding it with the payload would contradict the count field and the parser would
+    reject the very input the campaign starts from."""
+    m = S.FormatModel([{"type": "u8", "name": "flags", "seed_value": 0},
+                       {"type": "blob", "name": "list",
+                        "size_from": {"field": "flags", "mask": 0x0F, "scale": 4}},
+                       {"type": "blob", "name": "rest"}])
+    assert S.seed_for(m, b"PAYLOAD") == b"\x00PAYLOAD"
+
+
+def _named_fields(fields, pre=""):
+    out = {}
+    for fd in fields:
+        f = fd["f"]
+        name = pre + (f.get("name") or f["type"])
+        if f["type"] == "group":
+            out.update(_named_fields(fd["val"], name + "."))
+        else:
+            out[name] = fd["val"]
+    return out
+
+
+def test_the_rtp_seed_is_a_packet_a_receiver_accepts():
+    m = S.builtin("rtp")
+    seed = S.seed_for_name("rtp")
+    v = _named_fields(m.parse(seed))
+    assert v["v_p_x_cc"] >> 6 == 2          # RFC 3550 version
+    assert v["v_p_x_cc"] & 0x10             # X=1, so the extension is parsed at all
+    assert v["v_p_x_cc"] & 0x0F == 0        # CC=0, so CSRC is legitimately empty
+    assert v["csrc"] == b""
+    assert v["ext.ext_profile"] == 0xBEDE
+    assert v["ext.ext_len"] * 4 == len(v["ext.ext_data"])
+    # PT 33 is MP2T, and the payload really is a transport-stream packet
+    assert v["m_pt"] & 0x7F == 33
+    assert v["payload"][:1] == b"\x47"
+
+
+def test_the_rtp_mutator_reaches_the_payload_behind_both_variable_regions():
+    """The regression this guards: an unbounded CSRC list or extension swallowed everything
+    after it, so the payload -- the transport-stream packet a video receiver demuxes -- was
+    parsed as empty and never mutated once."""
+    import random
+    m = S.builtin("rtp")
+    seed = S.seed_for_name("rtp")
+    base = _named_fields(m.parse(seed))
+    mut = S.StructMutator(random.Random(11), m)
+    touched = {k: 0 for k in base}
+    for _ in range(600):
+        out = mut.mutate(seed)
+        for k, val in _named_fields(m.parse(out)).items():
+            if k in base and val != base[k]:
+                touched[k] += 1
+    assert all(touched[k] > 0 for k in base), \
+        f"never mutated: {[k for k in base if not touched[k]]}"
+
+
+def test_the_h264_model_keeps_its_start_codes_and_reaches_every_nal():
+    import random
+    m = S.builtin("h264")
+    seed = S.seed_for_name("h264")
+    assert seed.startswith(b"\x00\x00\x00\x01")
+    assert seed.count(b"\x00\x00\x00\x01") == 4      # SPS, PPS, IDR, non-IDR
+    base = _named_fields(m.parse(seed))
+    mut = S.StructMutator(random.Random(3), m)
+    kept = 0
+    touched = {k: 0 for k in base if k != "magic"}
+    for _ in range(600):
+        out = mut.mutate(seed)
+        if out.startswith(b"\x00\x00\x00\x01"):
+            kept += 1
+        for k, val in _named_fields(m.parse(out)).items():
+            if k in touched and val != base[k]:
+                touched[k] += 1
+    # a decoder scans for a start code and discards everything before it, so mutation that
+    # destroys the framing is mutation the decoder never parses
+    assert kept > 500, kept
+    assert all(v > 0 for v in touched.values()), \
+        f"never mutated: {[k for k, v in touched.items() if not v]}"
+
+
+def test_a_video_receivers_own_strings_pick_the_right_model():
+    assert S.detect_format(["rtpmap", "a=RTP/AVP 33", "ssrc"]) == "rtp"
+    assert S.detect_format(["nal_unit_type", "avcC", "h264 decoder"]) == "h264"
+    assert S.detect_format(["transport_stream", "adaptation_field"]) == "mpegts"
+
+
+def test_an_annex_b_sample_suggests_the_h264_model_to_the_builder():
+    spec = S.suggest_spec(S.seed_for_name("h264"))
+    assert spec["builtin"] == "h264"
+    assert any("h264" in n.lower() or "H264" in n for n in [spec["detected"]])

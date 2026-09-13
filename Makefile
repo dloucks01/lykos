@@ -2,13 +2,34 @@
 PY ?= python3
 export PYTHONPATH := core
 
-.PHONY: test lint typecheck gui ci bundle verify run eval eval-gate arch-gate dashboard release clean help
+.PHONY: test coverage lint typecheck gui ci bundle verify run eval eval-gate arch-gate dashboard release clean help
 
 help:
-	@echo "targets: test lint typecheck gui ci bundle verify run eval eval-gate arch-gate dashboard release clean"
+	@echo "targets: test coverage lint typecheck gui ci bundle verify run eval eval-gate arch-gate dashboard release clean"
 
 test:
 	$(PY) -m pytest tests/ -q
+
+# Line/branch coverage INCLUDING the capabilities that only exist as subprocesses. Without
+# the sitecustomize shim below, the ptrace helper, the AFL++ batch runner and the angr and
+# unicorn drivers all report 0% -- not because nothing drives them, but because a subprocess
+# started by a test is not measured by the test's own interpreter. That reads as "five
+# untested modules" when the truth is "five unobservable ones", and the two call for opposite
+# work. COVERAGE_PROCESS_START plus a sitecustomize on PYTHONPATH makes every child write its
+# own data file, which `coverage combine` then merges.
+COV_DIR := .coverage-shim
+coverage:
+	@command -v coverage >/dev/null 2>&1 || $(PY) -c "import coverage" 2>/dev/null || { \
+	  echo "coverage not installed. pip install coverage" >&2; exit 1; }
+	@mkdir -p $(COV_DIR)
+	@printf 'import coverage\ncoverage.process_startup()\n' > $(COV_DIR)/sitecustomize.py
+	@rm -f .coverage .coverage.*
+	COVERAGE_PROCESS_START=$(CURDIR)/.coveragerc \
+	PYTHONPATH=$(CURDIR)/$(COV_DIR):$(CURDIR)/core \
+	  $(PY) -m coverage run -m pytest tests/ -q
+	$(PY) -m coverage combine
+	$(PY) -m coverage report --skip-covered --sort=miss
+	@echo "(full report: coverage report; annotated: coverage html)"
 
 # lint/typecheck are gates, not suggestions: a missing tool FAILS rather than passing
 # quietly, so `make ci` can never go green without actually having run them.
