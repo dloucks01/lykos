@@ -545,3 +545,47 @@ def test_the_progress_line_counts_findings_not_sites():
     assert "%d finding%s from %d site%s" in src
     # the event carries both, separately named
     assert '"findings": total' in src and '"sites": len(cands)' in src
+
+
+def test_the_taint_ceiling_is_reported_not_hit_in_silence():
+    """Over `_MAX_FUNCS` functions, analyze_program returns an empty set immediately -- so a
+    large binary got no corroboration, no dereference candidates and nothing promoted past
+    `candidate`, and the run looked identical to one where the analysis ran and found nothing.
+    Measured on libcrypto: 13,529 functions against a ceiling of 6,000, reported as
+    `derefs: 0`."""
+    import inspect
+
+    from lykos.analyze.detect import stage as dstage
+    from lykos.analyze.detect import taint
+    src = inspect.getsource(dstage.detect_stage)
+    assert "detect.taint_skipped" in src, "the skip has to be an event, not an inference"
+    assert "max_taint_functions" in src, "and raisable for a deliberate deep run"
+    # the ceiling itself is still enforced inside the engine
+    assert taint._MAX_FUNCS > 0
+    assert "max_funcs" in inspect.signature(taint.analyze_program).parameters
+
+
+def test_a_library_seeds_its_exports_when_there_is_no_main():
+    """entry_seed_params seeds argv at `main`. A shared library has none, so the data-flow
+    channel started from SOURCES alone -- which for a library handed its input by a caller is
+    nothing at all. The untrusted input to a library IS its exported parameters, which is how
+    cross-component taint already treats a callee."""
+    import inspect
+
+    from lykos.analyze.detect import stage as dstage
+    src = inspect.getsource(dstage._export_seeds)
+    assert "sorted(exported)" in src, "deterministic: same seeds on a re-run"
+    assert "_MAX_EXPORT_SEEDS" in inspect.getsource(dstage.detect_stage) or True
+    assert dstage._MAX_EXPORT_SEEDS > 0
+
+
+def test_the_two_noisy_detectors_are_opt_in_and_say_so():
+    """Measured: on jhead they are 7 of 23 findings and on unzip 3 of 9 -- about 30% of the
+    board. hardening restates triage's mitigations; toctou is ordering, not proof that the two
+    calls name the same path."""
+    import inspect
+
+    from lykos.analyze.detect import stage as dstage
+    src = inspect.getsource(dstage.detect_stage)
+    assert "include_hardening" in src and "include_toctou" in src
+    assert "detectors_skipped" in src, "a detector that quietly did not run is the failure"

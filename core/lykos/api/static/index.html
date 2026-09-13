@@ -1676,6 +1676,15 @@ function closeSpecBuilder(){ document.getElementById("specbuilder").hidden=true;
 function _seedBytesLen(b64){ try{return atob(b64).length;}catch(e){return 0;} }
 function builderSampleB64(){ return SEEDS.length?SEEDS[0]:""; }
 
+// The field types this editor can represent and round-trip. Anything else -- the nested
+// `group`/`array`/`shadow` a builtin model uses -- would fall through specToBuilder's catch-all
+// and come back as a plain blob, so loading a builtin here and pressing "Use this spec" would
+// hand back a WORSE model than the one the campaign picks on its own: a downgrade wearing the
+// clothes of a customisation.
+const _BUILDER_TYPES = new Set(["magic","blob","u8","u16","u32","u64","i8","i16","i32","i64"]);
+function builderCanEdit(spec){
+  return (spec||[]).every(f => _BUILDER_TYPES.has(f.type));
+}
 function specToBuilder(spec){
   return spec.map(f=>{
     if(f.type==="magic"){
@@ -1746,8 +1755,20 @@ async function builderAutodetect(){
     const r=await api("/format/analyze",{method:"POST",headers:{"Content-Type":"application/json"},
       body:JSON.stringify({sample_b64:sample})});
     const sug=(typeof r==="string"?JSON.parse(r):r).suggestion;
-    if(sug){ BUILDER=specToBuilder(sug.spec);
-      if(hint) hint.textContent=(sug.detected?`detected ${sug.detected}. `:"")+(sug.notes&&sug.notes[0]||""); }
+    if(sug){
+      const note=(sug.detected?`detected ${sug.detected}. `:"")+(sug.notes&&sug.notes[0]||"");
+      if(sug.builtin && !builderCanEdit(sug.spec)){
+        // A model this editor cannot express faithfully: say so and leave the list empty,
+        // rather than loading a lossy copy the operator would then apply over the good one.
+        BUILDER=[];
+        if(hint) hint.textContent = note + " This editor cannot represent that model's "
+          + "nested fields, so it is not loaded -- the campaign already uses it. Build a "
+          + "custom spec here only for a format it does not know.";
+      } else {
+        BUILDER=specToBuilder(sug.spec);
+        if(hint) hint.textContent=note;
+      }
+    }
   }catch(e){ if(hint) hint.textContent="auto-detect failed"; }
   renderBuilderFields(); builderPreview();
 }

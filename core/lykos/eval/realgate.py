@@ -139,6 +139,41 @@ public class Svc {
 
 _JDK = ("javac", "jar", "java")
 
+# The shape most of this platform's real targets have, on the architecture most of them use:
+# a mandatory `-c <config>` behind a flag, a key=value parser, an unchecked copy in it. Built
+# STATIC because the ARM dynamic loader is not installed on an x86-64 host, and the PoC bundle
+# has to run `./target.bin` directly -- binfmt_misc routes it to qemu-arm, but only a static
+# image needs no /lib/ld-linux-armhf.so.3.
+_SRC_CONFIG = r"""
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+struct cfg { char name[64]; char listen[32]; int workers; };
+static void set_opt(struct cfg *c, const char *k, const char *v) {
+    if (!strcmp(k, "name"))         strcpy(c->name, v);      /* unchecked: the bug */
+    else if (!strcmp(k, "listen"))  strncpy(c->listen, v, sizeof c->listen - 1);
+    else if (!strcmp(k, "workers")) c->workers = atoi(v);
+}
+int main(int argc, char **argv) {
+    struct cfg c; const char *path = NULL; char line[512]; FILE *f;
+    memset(&c, 0, sizeof c);
+    for (int i = 1; i < argc; i++)
+        if (!strcmp(argv[i], "-c") && i + 1 < argc) path = argv[++i];
+    if (!path) { fprintf(stderr, "usage: %s -c <config>\n", argv[0]); return 2; }
+    if (!(f = fopen(path, "r"))) { fprintf(stderr, "cannot open config\n"); return 1; }
+    while (fgets(line, sizeof line, f)) {
+        char *eq, *nl;
+        if (line[0] == '#') continue;
+        if ((nl = strchr(line, '\n'))) *nl = 0;
+        if (!(eq = strchr(line, '='))) continue;
+        *eq = 0; set_opt(&c, line, eq + 1);
+    }
+    fclose(f);
+    printf("name=%s listen=%s workers=%d\n", c.name, c.listen, c.workers);
+    return 0;
+}
+"""
+
 
 @dataclass
 class RealCase:
@@ -152,6 +187,7 @@ class RealCase:
     prebuilt: str = ""            # repo-relative binary to use INSTEAD of compiling `source`
     fuzz: bool = False            # find the crashing input rather than being handed one
     lang: str = "c"               # "c" -> gcc; "java" -> javac + jar
+    cc: str = ""                  # a cross-compiler for this case, instead of the host cc
 
     @property
     def optional(self) -> bool:
@@ -165,6 +201,10 @@ class RealCase:
         """
         if self.lang == "java":
             return not all(shutil.which(t) for t in _JDK)
+        if self.cc:
+            # a cross toolchain this machine does not have is not a regression -- the same
+            # rule arch-gate uses
+            return shutil.which(self.cc) is None
         return bool(self.prebuilt)
 
 
@@ -204,6 +244,27 @@ MATRIX = [
         {"cwe121": True, "L1": True, "L2": True, "bundle_reproduces": True},
         prebuilt="examples/vuln-targets/bin/ncompress_x86-64_cve",
         note="ncompress CVE-2001-1413: unchecked strcpy of an argv pathname, to L2"),
+    # The architecture this platform is most often pointed at, and the one where the most
+    # changed: coverage-guided fuzzing went from refused outright to ~1,965 exec/s, on the
+    # strength of a per-guest emulator lookup that nothing else here covers. Every other real
+    # case is x86-64, so the quality bar was measuring a corpus that is not the one in use.
+    #
+    # This one case exercises, together: invocation discovery reading `-c <config>` off the
+    # binary and verifying it by running the target, the text-config mutation model, the
+    # cross-architecture sandbox, and a PoC bundle that has to replay an ARM binary.
+    RealCase(
+        "real_arm_config", _SRC_CONFIG, b"", "file",
+        {"found_by_fuzzing": True, "cwe120": True, "L1": True, "bundle_reproduces": True},
+        cc="arm-linux-gnueabihf-gcc", flags=["-static"], fuzz=True,
+        note="a config-driven ARM service: found from the binary alone, argv discovered from "
+             "its own usage line, and the bundle replays under binfmt/qemu"),
+    # CWE-120 rather than CWE-121 here, and the difference is the FIXTURE, not the
+    # architecture. `stack_buffer_overflow` needs a function that owns a local buffer; this
+    # service keeps its state in a `struct cfg` that main owns and passes by pointer, so the
+    # function doing the strcpy has no local array and the specific stack-overflow
+    # classification does not apply. Verified by building the same source for x86-64, which
+    # also yields no CWE-121 -- checked because "ARM detects less" would have been an easy and
+    # wrong conclusion to draw from one failing assertion.
     # The only case whose substrate is not machine code. Java has its own triage, executor,
     # crash oracle, CWE mapping and bundle runner, and every one of them was uncovered by a
     # gate -- including a bundle that ran `./target.bin` on a zip file and a reproducer that
@@ -256,7 +317,7 @@ def compile_case(case: RealCase, outdir: Path, cc: str = "gcc"):
     src = outdir / f"{case.label}.c"
     src.write_text(case.source)
     out = outdir / case.label
-    r = subprocess.run([cc, *_CFLAGS, *case.flags, str(src), "-o", str(out)],
+    r = subprocess.run([case.cc or cc, *_CFLAGS, *case.flags, str(src), "-o", str(out)],
                        capture_output=True)
     return out if r.returncode == 0 and out.exists() else None
 

@@ -192,6 +192,40 @@ def _program_only(ctx, target, functions):
     return keep_fn, keep_ed, dropped
 
 
+# Enough to reach a sink through a few frames, without seeding thousands of exports on a
+# library like libcrypto and spending the budget proving that a crypto primitive copies bytes.
+_MAX_EXPORT_SEEDS = 96
+
+
+def _export_seeds(ctx, target, functions, func_irs):
+    """({addr: tainted param indices}, count) for a library's exported functions.
+
+    Ordered by name so a re-run seeds the same set: an analysis whose findings depend on dict
+    iteration order is not one anybody can act on twice.
+    """
+    from ..detect import taint as taintmod
+    try:
+        from ..poc.exploit import _elf_symbols
+        blob = ctx.content.path(target.sha256).read_bytes()
+        exported = set(_elf_symbols(blob, 2))              # STT_FUNC
+    except Exception:
+        return {}, 0
+    if not exported:
+        return {}, 0
+    ak = taintmod._arch_key(target.arch)
+    nargs = len(taintmod.ARCH_ABI[ak]["args"]) if ak else 6
+    by_name = {f.name: f.addr for f in functions if f.name}
+    seeds = {}
+    for name in sorted(exported):
+        addr = by_name.get(name)
+        if addr is None or addr not in func_irs:
+            continue
+        seeds[addr] = set(range(nargs or 6))
+        if len(seeds) >= _MAX_EXPORT_SEEDS:
+            break
+    return seeds, len(seeds)
+
+
 def _detect_jvm(ctx, target) -> dict:
     """Detection for a Java target, which has no machine code for the P-Code channels.
 
@@ -242,6 +276,7 @@ def detect_stage(ctx) -> dict:
     target = TargetDAO(ctx.conn).get(ctx.target_id) if ctx.target_id else None
     if target is None:
         raise ValueError("detect_cwe requires a target_id")
+    p_det = ctx.params or {}
 
     if (target.file_type or "").lower() in ("jar", "class"):
         return _detect_jvm(ctx, target)
@@ -271,8 +306,28 @@ def detect_stage(ctx) -> dict:
         mitigations=target.mitigations or {}, frames=frames)
 
     ctx.progress(msg="running CWE detectors")
+    # Two detectors are OPT-IN, and the reason is measured rather than felt. On jhead they are
+    # 7 of 23 findings and on unzip 3 of 9 -- about 30% of the board -- and neither earns it:
+    #
+    #   hardening  restates `ctx.mitigations`, which comes straight from triage. "No PIE" is
+    #              already on the target card and in the report's mitigations row; filing it
+    #              again as CWE-693 is the same fact twice, and it outranks nothing.
+    #   toctou     is ordering and reachability, not proof the two calls name the same path.
+    #              Real TOCTOU needs a privilege boundary; in a CLI image tool an access()
+    #              before an fopen() on a user-named file is how the program is supposed to
+    #              work.
+    #
+    # Off by default, available per run, and the skip is REPORTED -- a detector that quietly
+    # did not run is the failure mode this codebase keeps finding, so it is named in the event
+    # rather than left to be inferred from a smaller number.
+    optional = {"hardening": bool(p_det.get("include_hardening")),
+                "toctou": bool(p_det.get("include_toctou"))}
+    skipped = [n for n, on in optional.items() if not on]
     cands = []
     for det in DETECTORS:
+        name = getattr(det, "__name__", "")
+        if name in optional and not optional[name]:
+            continue
         cands += det(dctx)
     cands = correlate(cands, dctx)
 
@@ -287,9 +342,44 @@ def detect_stage(ctx) -> dict:
         if full and full.ir:
             func_irs[f.addr] = full.ir
     entry_seeds = entry_seed_params(dctx.functions, dctx.frames)   # argv/envp at main
+    # A shared library has no `main`, so that returns nothing and the data-flow channel starts
+    # from SOURCES alone -- which for a library that is handed its input by a caller means it
+    # starts from nothing at all. Measured on libcrypto (13,715 functions): 0 derefs, 0
+    # guarded derefs, and the whole corroboration channel silently idle on a first-class
+    # target type.
+    #
+    # The untrusted input to a library IS its exported parameters, which is exactly how
+    # cross-component taint already treats a callee. Same treatment here when there is no
+    # entry point to seed from.
+    lib_seeded = 0
+    if not entry_seeds:
+        entry_seeds, lib_seeded = _export_seeds(ctx, target, dctx.functions, func_irs)
     derefs: list = []
-    tainted_sites = taint.analyze_program(func_irs, dctx.call_edges, target.arch,
-                                          entry_seeds=entry_seeds, mem_out=derefs)
+    # The data-flow channel has a hard ceiling and used to hit it in silence: over
+    # `_MAX_FUNCS` functions `analyze_program` returns an empty set immediately, so a large
+    # binary got no corroboration, no dereference candidates and nothing promoted above
+    # `candidate` -- and the run looked identical to one where the analysis ran and found
+    # nothing. Measured on libcrypto: 13,529 functions against a ceiling of 6,000, reported as
+    # `derefs: 0`.
+    #
+    # The ceiling stays (it is there for runtime), but it is now reported, and raisable for a
+    # deliberate deep run.
+    taint_cap = int(p_det.get("max_taint_functions") or taint._MAX_FUNCS)
+    taint_skipped = None
+    if len(func_irs) > taint_cap:
+        taint_skipped = {
+            "functions": len(func_irs), "cap": taint_cap,
+            "note": (f"{len(func_irs)} functions exceeds the data-flow ceiling of {taint_cap}, "
+                     f"so taint, the dereference channel and bounds corroboration did not "
+                     f"run. Findings below are rule-channel only and cannot be promoted past "
+                     f"candidate. Raise it with params.max_taint_functions for a deep run, or "
+                     f"analyse a component rather than the whole image.")}
+        ctx.emit("detect.taint_skipped", payload=taint_skipped)
+        tainted_sites = set()
+    else:
+        tainted_sites = taint.analyze_program(func_irs, dctx.call_edges, target.arch,
+                                              entry_seeds=entry_seeds, mem_out=derefs,
+                                              max_funcs=taint_cap)
     guards = bounds.classify_derefs(func_irs, derefs, target.arch)
     n_guarded = sum(1 for v in guards.values() if v.get("verdict") == bounds.GUARDED)
     cands += _deref_candidates(derefs, dctx.functions, guards)
@@ -351,6 +441,13 @@ def detect_stage(ctx) -> dict:
     total = sum(counts.values()) if counts else 0
     ctx.emit("findings.done", payload={"findings": total, "sites": len(cands),
                                        "states": counts,
+                                       "detectors_skipped": skipped,
+                                       "library_exports_seeded": lib_seeded,
+                                       "taint_skipped": taint_skipped,
+                                       "skipped_why": ("opt-in: hardening restates triage's "
+                                                       "mitigations, toctou is ordering not "
+                                                       "proof. Pass include_hardening / "
+                                                       "include_toctou to run them."),
                                        "library_sites_skipped": dropped,
                                        "derefs": len(guards), "guarded_derefs": n_guarded})
     # The number the OPERATOR will see on the board, not the pre-dedup candidate list.
