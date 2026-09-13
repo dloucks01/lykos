@@ -360,9 +360,17 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
     elapsed = max(1e-3, max_seconds - max(0.0, deadline - time.time()))
     # An execution rate this low means the campaign barely ran, and "0 crashes" from 16
     # executions must not read like "0 crashes" from 20,000.
+    #
+    # But slow is not the same as starved, and the flag means the second. An emulated target
+    # runs at ~40 executions/second and a network listener at ~3, legitimately -- so a
+    # campaign that found a crash, or saw the program behave in more than one way, did real
+    # work however slowly it went. Measured: a persistent multicast campaign did 120
+    # executions, found and confirmed a CWE-129, and still reported `starved: true` on rate
+    # alone, which tells the reader to distrust a result that is sound.
     rate = execs / max(1e-3, max_seconds - max(0.0, deadline - time.time()))
+    did_work = crashes > 0 or len(seen_behaviour) > 1
     stats = {"execs": execs, "crashes": crashes, "flaky": flaky, "unique": len(seen_sigs),
-             "starved": bool(execs < 200 and rate < 20),
+             "starved": bool(execs < 200 and rate < 20 and not did_work),
              "behaviours": len(seen_behaviour), "corpus": len(corpus), "kept": kept,
              "execs_per_sec": round(execs / elapsed),
              "blocks_hit": len(seen_blocks), "blocks_known": len(all_blocks)}
