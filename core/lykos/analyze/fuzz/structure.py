@@ -601,6 +601,41 @@ _BUILTINS = {
     # BMP: a file header whose `off` says where the pixels start and a DIB header that says
     # how many there are. A decoder indexes pixels using width/height/bpp while trusting the
     # offset, which is exactly the pair that goes wrong -- so both are fields.
+    # MPEG transport stream: the shape a multicast video receiver parses, and one where blind
+    # mutation is worse than useless. A TS packet is 188 bytes beginning with sync byte 0x47,
+    # and a parser drops anything that does not -- so byte mutation destroys the packet before
+    # any parsing code sees it. Measured on a receiver with a planted overflow: 60 executions
+    # over multicast produced 3 distinct behaviours and no crash, because almost every mutant
+    # was rejected at the sync byte.
+    #
+    # The field that matters is the adaptation-field length: it is one byte, it is chosen by
+    # the STREAM, and a receiver that trusts it copies that many bytes out of a 188-byte
+    # packet. Keeping the sync byte fixed and driving that length is the whole game.
+    "mpegts": {"tokens": ("mpegts", "MPEG-TS", "adaptation_field", "transport_stream",
+                          "PAT", "PMT"),
+               "seed": b"\x00" * 164,
+               "spec": [
+                   {"type": "magic", "value": b"\x47"},          # sync byte: never mutate
+                   # transport_error / payload_unit_start / priority, then the 13-bit PID
+                   {"type": "u8", "name": "pid_hi", "seed_value": 0x00},
+                   {"type": "u8", "name": "pid_lo", "seed_value": 0x21},
+                   # scrambling control, adaptation_field_control, continuity counter
+                   {"type": "u8", "name": "afc", "seed_value": 0x20},
+                   {"type": "group", "name": "adaptation", "spec": [
+                       # The field the bug lives behind: one byte, chosen by the STREAM, and a
+                       # receiver that trusts it copies that many bytes out of a 188-byte
+                       # packet. `covers` lets the mutator keep it coherent most rounds and
+                       # deliberately drive it out of range on the others.
+                       {"type": "u8", "name": "af_len", "covers": "rest", "role": "size"},
+                       {"type": "u8", "name": "af_flags", "seed_value": 0x10},
+                       # PCR, when the flags say it is present: 33-bit base + extension,
+                       # carried as six bytes
+                       {"type": "u32", "endian": "big", "name": "pcr_base", "seed_value": 0},
+                       {"type": "u16", "endian": "big", "name": "pcr_ext", "seed_value": 0},
+                       {"type": "blob", "name": "af_stuffing"},
+                   ]},
+                   {"type": "blob", "name": "payload"},
+               ]},
     "bmp": {"tokens": ("BITMAPINFOHEADER", "BITMAPFILEHEADER", ".bmp"), "seed": b"\x00" * 4,
             "spec": [
                 {"type": "magic", "value": b"BM"},
