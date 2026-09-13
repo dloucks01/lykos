@@ -127,7 +127,7 @@ def cross_taint_case(conn, content, case_id: str, *, persist: bool = True,
     # stopped before ever loading the callee.
     why: dict = {"no_components": len(targets) < 2, "no_links": not dyn,
                  "edges_without_tainted_symbol": 0, "edges_with_clean_callee": 0,
-                 "callers_without_ir": 0}
+                 "callers_without_ir": 0, "components_over_cap": 0}
     for e in dyn:
         a, b = targets.get(e.src_target), targets.get(e.dst_target)
         if not a or not b:
@@ -135,8 +135,17 @@ def cross_taint_case(conn, content, case_id: str, *, persist: bool = True,
         # No decompilation on the caller means no IR to trace, which is a different problem
         # from "the data does not reach the boundary" -- and only one of the two is something
         # the operator can act on. Carved firmware components arrive with neither.
-        if not comp(e.src_target)[0]:
+        src_ir = comp(e.src_target)[0]
+        if not src_ir:
             why["callers_without_ir"] += 1
+            continue
+        # The data-flow engine returns an empty result above its function ceiling, and says
+        # nothing. Without this check the diagnosis below could report "the callee does not
+        # carry it into a dangerous sink -- a real negative" about an analysis that never ran,
+        # which is a false negative stated with confidence. libcrypto is 13,529 functions
+        # against a ceiling of 6,000.
+        if len(src_ir) > taint._MAX_FUNCS or len(comp(e.dst_target)[0]) > taint._MAX_FUNCS:
+            why["components_over_cap"] += 1
             continue
         syms = set(edge_symbols(e.detail)) & imports(e.src_target)
         if not syms:
@@ -180,6 +189,12 @@ def _why_nothing(why: dict, found: int):
     if why["no_links"]:
         return ("no dynamic-link edges are resolved, so there is no boundary to chase taint "
                 "across. Run link_case first.")
+    n = why["components_over_cap"]
+    if n:
+        return (f"{n} boundar{'ies join' if n != 1 else 'y joins'} a component larger than "
+                f"the data-flow ceiling ({taint._MAX_FUNCS} functions), so the analysis did "
+                f"not run across {'them' if n != 1 else 'it'}. This is not a negative "
+                f"result -- nothing was examined.")
     if why["callers_without_ir"]:
         return (f"{why['callers_without_ir']} caller component"
                 f"{'s have' if why['callers_without_ir'] != 1 else ' has'} not been "
