@@ -14,6 +14,7 @@ the input does not parse.
 """
 from __future__ import annotations
 
+import re
 import struct
 import zlib
 
@@ -611,8 +612,11 @@ _BUILTINS = {
     # The field that matters is the adaptation-field length: it is one byte, it is chosen by
     # the STREAM, and a receiver that trusts it copies that many bytes out of a 188-byte
     # packet. Keeping the sync byte fixed and driving that length is the whole game.
-    "mpegts": {"tokens": ("mpegts", "MPEG-TS", "adaptation_field", "transport_stream",
-                          "PAT", "PMT"),
+    # NOT "PAT"/"PMT": they are real MPEG-TS terms and useless as evidence, because a
+    # three-character substring matches anything. "PAT" hit "MAX_PATHS reached" and detected
+    # xmllint as a transport-stream parser -- which is worse than detecting nothing, since the
+    # campaign would then generate TS packets for an XML parser.
+    "mpegts": {"tokens": ("mpegts", "MPEG-TS", "adaptation_field", "transport_stream"),
                "seed": b"\x00" * 164,
                "spec": [
                    {"type": "magic", "value": b"\x47"},          # sync byte: never mutate
@@ -758,10 +762,27 @@ def detect_format(strings) -> str | None:
     for name, entry in _BUILTINS.items():
         # a longer token is stronger evidence: "GIF89a" in a binary means something, two
         # characters mean nothing, so weight each hit by the length of what matched
-        hits = sum(len(t) for t in entry["tokens"] if t and t in blob)
+        hits = sum(len(t) for t in entry["tokens"] if t and _token_hit(t, blob))
         if hits > score:
             best, score = name, hits
     return best
+
+
+# Below this, a substring match is not evidence of anything -- it is a coincidence waiting to
+# happen. Short tokens have to match as WORDS: "PNG" in "PNG image" is a signal, "PAT" inside
+# "MAX_PATHS" is not, and the difference is a word boundary rather than a length.
+_SHORT_TOKEN = 5
+_WORD_CACHE: dict = {}
+
+
+def _token_hit(token: str, blob: str) -> bool:
+    if len(token) >= _SHORT_TOKEN:
+        return token in blob
+    rx = _WORD_CACHE.get(token)
+    if rx is None:
+        rx = _WORD_CACHE[token] = re.compile(r"(?<![A-Za-z0-9_])%s(?![A-Za-z0-9_])"
+                                             % re.escape(token))
+    return rx.search(blob) is not None
 
 
 def from_spec(spec) -> FormatModel:
