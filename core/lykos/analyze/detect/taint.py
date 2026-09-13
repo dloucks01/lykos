@@ -583,7 +583,8 @@ def analyze_function(ir, callmap, arch):
     return flagged
 
 
-def analyze_program(func_irs, call_edges, arch, *, entry_seeds=None, mem_out=None):
+def analyze_program(func_irs, call_edges, arch, *, entry_seeds=None, mem_out=None,
+                    max_funcs=None):
     """Inter-procedural: fixpoint over the call graph. Returns all flagged sink sites.
 
     `entry_seeds` maps an entry-point function addr -> the parameter indices that arrive
@@ -602,7 +603,7 @@ def analyze_program(func_irs, call_edges, arch, *, entry_seeds=None, mem_out=Non
         return set()
     abi = ARCH_ABI[ak]
     func_addrs = set(func_irs.keys())
-    if not func_addrs or len(func_addrs) > _MAX_FUNCS:
+    if not func_addrs or len(func_addrs) > (max_funcs or _MAX_FUNCS):
         return set()
     callmap = build_callmap(call_edges)
     dstmap = {e.site_addr: e.dst_addr for e in call_edges if e.site_addr and e.dst_addr}

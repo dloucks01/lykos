@@ -793,11 +793,65 @@ def find_length_fields(sample: bytes, *, max_off: int = 64):
 _INTNAME = {1: "u8", 2: "u16", 4: "u32", 8: "u64"}
 
 
+def _jsonable_spec(spec):
+    """A builtin's field list, safe to put in a JSON response (magic values are bytes)."""
+    out = []
+    for f in spec:
+        g = dict(f)
+        if "value" in g and isinstance(g["value"], (bytes, bytearray)):
+            g["value"] = _b64safe(bytes(g["value"]))
+        if isinstance(g.get("fields"), list):
+            g["fields"] = _jsonable_spec(g["fields"])
+        out.append(g)
+    return out
+
+
+# Line-oriented text is not a byte grammar, and offering to carve it into magic + blob invites
+# the operator to build a spec that cannot describe it. The campaign already picks the
+# key=value mutator for these on its own.
+def _looks_like_text_config(sample: bytes) -> bool:
+    head = sample[:2048]
+    if not head or b"\x00" in head:
+        return False
+    try:
+        text = head.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    lines = [ln for ln in text.splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
+    if len(lines) < 2:
+        return False
+    return sum(1 for ln in lines if "=" in ln or ":" in ln) >= max(2, len(lines) // 2)
+
+
 def suggest_spec(sample: bytes) -> dict:
-    """Build a starting spec from a real sample: fix the detected header as magic, put a
-    length field where the bytes say one is, and let the rest be the sized blob."""
+    """Build a starting spec from a real sample.
+
+    A builtin model FIRST, when one matches. The generic path below derives magic and hunts a
+    length field from the bytes alone, which for a JPEG produced two fields -- magic and a
+    blob -- while `builtin("jpeg")` describes the segment chain and the nested IFD arrays and
+    is what the campaign would choose anyway. Two places answered "what is this format" and
+    the one the builder called was the weaker.
+    """
     sample = sample or b""
     name, sig = detect_magic(sample)
+    key = (name or "").lower()
+    if key in _BUILTINS:
+        entry = _BUILTINS[key]
+        return {"detected": name, "magic_len": len(sig), "builtin": key,
+                "spec": _jsonable_spec(entry["spec"]),
+                "notes": [f"{name} is a built-in model: this is the full grammar the fuzzer "
+                          f"uses, not a guess from the bytes. Edit it if this file is a "
+                          f"dialect, or leave it and the campaign keeps lengths and offsets "
+                          f"coherent while it mutates."],
+                "sample_size": len(sample)}
+    if _looks_like_text_config(sample):
+        return {"detected": "line-oriented text", "magic_len": 0, "builtin": "keyvalue",
+                "spec": [],
+                "notes": ["this is key=value text, not a byte grammar -- a magic/length/blob "
+                          "spec cannot describe it. The campaign detects this and uses the "
+                          "key=value mutator automatically, mining the keys from the target's "
+                          "own strings; there is nothing to build here."],
+                "sample_size": len(sample)}
     cands = find_length_fields(sample)
     notes = []
     if cands:

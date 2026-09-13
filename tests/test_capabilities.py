@@ -242,3 +242,40 @@ def test_an_elf_is_still_an_elf():
     assert filetype.detect(b"\x7fELF" + b"\x00" * 60) == filetype.ELF
     assert filetype.detect(b"MZ" + b"\x00" * 62) == filetype.PE
     assert filetype.detect(b"PK\x03\x04" + b"\x00" * 60) == filetype.JAR
+
+
+def test_the_builder_suggests_the_real_model_when_one_exists():
+    """The builder derived magic and hunted a length field from the bytes alone, which for a
+    JPEG produced two fields -- magic and a blob -- while builtin("jpeg") describes the segment
+    chain and the nested IFD arrays and is what the campaign would choose anyway. Two places
+    answered "what format is this" and the one the GUI called was the weaker."""
+    from lykos.analyze.fuzz import structure
+    jpeg = bytes.fromhex("ffd8ffe000104a46494600010100000100010000") + b"\xff" * 200
+    got = structure.suggest_spec(jpeg)
+    assert got["builtin"] == "jpeg"
+    assert len(got["spec"]) > 5, got["spec"]
+    assert "built-in model" in got["notes"][0]
+    # JSON-safe: magic values are bytes in the model and must survive the response
+    import json
+    json.dumps(got)
+
+
+def test_the_builder_says_a_text_config_is_not_a_byte_grammar():
+    """A magic/length/blob spec cannot describe key=value text, and offering to build one
+    invites the operator to make something that cannot work. This is the shape most
+    config-driven targets take."""
+    from lykos.analyze.fuzz import structure
+    got = structure.suggest_spec(b"# cfg\nname=prod\nlisten=0.0.0.0:80\nworkers=4\n")
+    assert got["builtin"] == "keyvalue"
+    assert got["spec"] == []
+    assert "not a byte grammar" in got["notes"][0]
+    assert "automatically" in got["notes"][0]
+
+
+def test_an_unknown_binary_still_gets_a_starting_spec():
+    """The generic path has to survive: that is what the builder is FOR."""
+    from lykos.analyze.fuzz import structure
+    got = structure.suggest_spec(b"\x01\x02\x03\x04" + b"ZZZZ" * 40)
+    assert got.get("builtin") is None
+    assert [f["type"] for f in got["spec"]][:1] == ["magic"]
+    assert got["notes"]
