@@ -59,8 +59,14 @@ _LAYOUTS = {
                + [(f"r{i}_bank1", 4) for i in range(8)],
 }
 # which register name is the stack pointer per ISA
+# The stack pointer's name in each ISA's own g-packet layout. A name the layout does not have
+# is not an error: `capture` does regs.get(_sp_name(arch)), so it comes back None and the
+# capture reports no stack pointer at all. s390 was exactly that -- its SP is r15, the default
+# "sp" matched nothing, and every s390 capture returned sp=None while the value sat unread in
+# regs["r15"]. The arch gate did not catch it because s390's PoC path goes through r14, its
+# link register, and never asks for the stack.
 _SP = {"aarch64": "sp", "riscv": "x2", "riscv64": "x2", "arm": "sp", "ppc64": "r1",
-       "ppc": "r1", "mips": "r29", "sh": "r15"}
+       "ppc": "r1", "mips": "r29", "sh": "r15", "s390": "r15"}
 # integer argument registers per ISA calling convention (in order), named as in _LAYOUTS
 _ARG_REGS = {
     "aarch64": [f"x{i}" for i in range(8)],

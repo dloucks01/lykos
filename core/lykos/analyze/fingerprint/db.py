@@ -63,7 +63,10 @@ COMPONENTS = {
         ],
     },
     "sqlite": {
-        "patterns": [r"3\.\d+\.\d+ [0-9a-f]{40}", r"SQLite version (\d+\.\d+\.\d+)"],
+        # The sourceid banner needs its CAPTURE GROUP: `scan` skips any pattern that
+        # matches without one, so this contributed nothing at all and SQLite CVEs only
+        # ever fired on the rarer literal "SQLite version" text.
+        "patterns": [r"(3\.\d+\.\d+) [0-9a-f]{40}", r"SQLite version (\d+\.\d+\.\d+)"],
         "cves": [
             {"id": "CVE-2019-5018", "cvss": 8.1, "severity": "high", "cwe": "CWE-416",
              "ranges": [{"lt": "3.28.0"}],

@@ -77,7 +77,7 @@ def score_arch(data: bytes) -> dict:
     for (arch, endian), pats in _PATTERNS.items():
         endc = "<" if endian == "little" else ">"
         cnt = 0
-        for off in range(0, n - 4, 4):
+        for off in range(0, n - 3, 4):          # `n - 4` never scanned the final word
             w = struct.unpack_from(endc + "I", data, off)[0]
             for val, mask in pats:
                 if (w & mask) == val:
@@ -86,7 +86,7 @@ def score_arch(data: bytes) -> dict:
         scores[f"{arch}/{endian}"] = cnt
     # Thumb (16-bit), little-endian
     tcnt = 0
-    for off in range(0, n - 2, 2):
+    for off in range(0, n - 1, 2):              # likewise the final halfword
         h = struct.unpack_from("<H", data, off)[0]
         if (h & _THUMB_PUSH[1]) == _THUMB_PUSH[0]:
             tcnt += 1
@@ -104,8 +104,17 @@ def analyze_blob(data: bytes) -> dict:
     best = max(scores, key=scores.get) if scores else None
     best_n = scores.get(best, 0) if best else 0
     second = sorted(scores.values(), reverse=True)[1] if len(scores) > 1 else 0
-    total_words = max(1, len(data) // 4)
-    density = best_n / total_words
+    # Density has to be measured against the population the score was COLLECTED from. The
+    # 32-bit patterns are counted once per word; the Thumb pattern is 16-bit and counted once
+    # per halfword, so there are twice as many chances to hit it. Dividing both by the word
+    # count doubled Thumb's apparent density and let pure noise through the "dominant, dense"
+    # gate this function exists to enforce: 16 KB of random bytes scored 33 Thumb hits where
+    # chance predicts 32.0, measured as 0.806% against words (over the 0.6% floor) where the
+    # honest figure is 0.403% (under it). The blob came back as ARM/Thumb at 0.32 confidence
+    # -- and a headerless verdict is load-bearing, because everything after it is addresses
+    # computed from a base this guess invented.
+    positions = max(1, len(data) // (2 if best and best.startswith("thumb") else 4))
+    density = best_n / positions
     # require a dominant, dense prologue signal -- real code has one; random data is uniform
     # noise (16-bit Thumb patterns especially are frequent by chance)
     if best and best_n >= 16 and best_n >= 2 * second + 4 and density >= 0.006:
