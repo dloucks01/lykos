@@ -23,7 +23,7 @@ from ..dynamic import sandbox
 from ..dynamic.minimize import minimize
 from ..dynamic.stage import crash_finding_candidate
 from ..poc.capture import modes_for
-from . import structure, textconf
+from . import structure, textconf, xmlgrammar
 from .mutator import Mutator
 from .runner import run_input
 
@@ -626,6 +626,16 @@ def fuzz_stage(ctx) -> dict:
     dictionary = _mine_dictionary(strings)
     mutator, note = _structure_mutator(p, rng, dictionary), "found by fuzzing"
     fmt = p.get("format_name") or ("custom" if p.get("format") else None)
+    if mutator is None and not p.get("format") and any(
+            xmlgrammar.looks_like_xml(c) for c in corpus[:8]):
+        # XML is a grammar, not a byte layout, and byte mutation does not work on it: measured
+        # against xmllint, 2 of 200 mutants parsed cleanly and the other 198 died in the
+        # tokeniser. The campaign does not look starved while that happens -- 3,000 executions
+        # produced 759 distinct "behaviours", because a parser has a great many ways to say no
+        # and the behaviour proxy is output shape. Distinct output is not distinct code.
+        mutator, fmt = xmlgrammar.XmlMutator(rng, dictionary), "xml"
+        ctx.emit("fuzz.format", payload={"model": "xml", "auto": True,
+                                         "why": "the seed is an XML document"})
     if mutator is None and not p.get("format") and wants_config:
         # The binary documents a required `-c <config>`, so its input is a config file, and a
         # config file is text: `key=value` lines. No binary format model describes that, and a

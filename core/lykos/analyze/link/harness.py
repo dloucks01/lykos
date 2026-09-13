@@ -179,7 +179,7 @@ class ChannelSession:
     """
 
     def __init__(self, exe, family, key, *, argv=(), arch=None, readiness=2.0,
-                 settle=0.08, mem_mb=2048, capture=65536):
+                 settle=0.15, mem_mb=2048, capture=65536):
         self.exe, self.family, self.key = exe, family, key
         self.argv, self.arch = list(argv or ()), arch
         self.readiness, self.settle = float(readiness), float(settle)
@@ -207,7 +207,14 @@ class ChannelSession:
     def send(self, payload: bytes) -> RunResult:
         if self.error:
             return RunResult(isolation="unsupported-arch", note=self.error)
-        if self.proc is None or self.proc.poll() is not None:
+        if self.proc is not None and self.proc.poll() is not None:
+            # It died since the last send and the settle window closed before it did -- a slow
+            # or loaded machine, an emulated target, a JVM. This used to be swallowed: the
+            # next send saw a dead process, restarted it, and the crash was never reported at
+            # all. Report it as the suspect for THIS payload instead and let the campaign's
+            # re-run adjudicate, which is the same bargain the in-window case already makes.
+            return self._dead_result(note="died after the previous payload")
+        if self.proc is None:
             self._reap()
             if not self._start():
                 return self._dead_result(note="target exited during startup")

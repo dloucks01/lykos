@@ -157,7 +157,7 @@ def boundary_fuzz_stage(ctx) -> dict:
         if session["s"] is None:
             session["s"] = ChannelSession(exe, family, key, argv=base_argv, arch=arch,
                                           readiness=readiness,
-                                          settle=float(p.get("settle", 0.08)))
+                                          settle=float(p.get("settle", 0.15)))
         return [], session["s"].send(data)
 
     rng = random.Random(int(p.get("seed", 1337)))
@@ -186,7 +186,7 @@ def boundary_fuzz_stage(ctx) -> dict:
     ctx.emit("harness.start", payload={"family": family, "key": key})
     if persistent:
         ctx.emit("harness.persistent", payload={
-            "family": family, "settle": float(p.get("settle", 0.08)),
+            "family": family, "settle": float(p.get("settle", 0.15)),
             "note": ("one listener process serves many payloads; a crash is re-checked "
                      "against a fresh process before it is recorded")})
     stats = fuzz_campaign(
