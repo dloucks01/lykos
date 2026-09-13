@@ -24,7 +24,16 @@ from ..dynamic import sandbox
 from ..dynamic.sandbox import RunResult
 
 # families this harness can drive (others: report unsupported)
-DRIVABLE = {"fifo", "unix", "tcp", "socket"}
+# Datagram channels matter for a whole class of target this platform is pointed at: a
+# receiver that joins a multicast group and parses a video stream never reads stdin, a file or
+# argv, so every existing channel delivers nothing and the campaign starves. It is also a
+# channel the stream CONTROLS -- an MPEG-TS adaptation-field length or an RTP header comes
+# straight off the wire -- which is exactly where the bugs are.
+DRIVABLE = {"fifo", "unix", "tcp", "socket", "udp", "multicast"}
+_DGRAM = {"udp", "multicast"}
+# How often to repeat a datagram while waiting for the receiver to bind. Short
+# enough that a fast target gets its packet promptly, long enough not to flood.
+_DGRAM_INTERVAL = 0.05
 _READINESS = 2.0
 
 
@@ -78,6 +87,28 @@ def _deliver(family, key, payload, readiness):
             s.sendall(payload)
         finally:
             s.close()
+    elif family in _DGRAM:
+        # A datagram receiver is not "listening" in the TCP sense: there is no connect to
+        # retry against and nothing that reports readiness, and a datagram sent before the
+        # socket is bound is dropped with nobody told. So REPEAT across the readiness window
+        # rather than guessing an interval -- measured, the target needs appreciably longer to
+        # bind and join a group than a single short sleep allows, and a one-shot send arrives
+        # to nothing and reads exactly like a channel the target ignores.
+        host, port = _hostport(key)
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if family == "multicast":
+                # loopback on, so a receiver on this host sees it; TTL 1 so nothing leaves it
+                s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 1)
+                s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 1)
+            while True:
+                s.sendto(payload, (host, port))
+                if time.time() >= end:
+                    break
+                time.sleep(_DGRAM_INTERVAL)
+        finally:
+            s.close()
 
 
 def _mkfifo(key) -> Optional[str]:
@@ -93,11 +124,12 @@ def _mkfifo(key) -> Optional[str]:
 def channel_run(exe, family, key, payload: bytes, *, timeout: float = 5.0,
                 arch: Optional[str] = None, host: Optional[str] = None,
                 readiness: float = _READINESS, mem_mb: int = 2048,
-                capture: int = 65536) -> RunResult:
+                capture: int = 65536, argv=()) -> RunResult:
     """Launch the consumer and deliver one payload over its channel; detect a crash."""
     if family not in DRIVABLE:
         return RunResult(isolation="unsupported-channel",
-                         note=f"cannot drive {family} channels (try fifo/unix/tcp)")
+                         note=f"cannot drive {family} channels "
+                              f"(try {'/'.join(sorted(DRIVABLE))})")
     host = host or sandbox.host_arch()
     emu = None
     if arch and host and arch != host:
@@ -105,7 +137,11 @@ def channel_run(exe, family, key, payload: bytes, *, timeout: float = 5.0,
         if not emu:
             return RunResult(isolation="unsupported-arch",
                              note=f"no qemu-user for {arch} on {host}")
-    cmd = ([emu, str(exe)] if emu else [str(exe)])
+    # A listener needs to be told what to listen ON. Launched bare, a multicast receiver
+    # prints its usage and exits, and every payload is delivered to a process that is already
+    # gone -- which looks exactly like a channel the target ignores. The flags come from the
+    # same invocation discovery the fuzzer uses.
+    cmd = ([emu, str(exe)] if emu else [str(exe)]) + [str(a) for a in (argv or ())]
     preexec = sandbox._rlimits(mem_mb, int(timeout) + 2, set_as=(emu is None))
 
     made_fifo = _mkfifo(key) if family == "fifo" else None

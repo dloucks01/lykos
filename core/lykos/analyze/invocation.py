@@ -55,7 +55,11 @@ _HINTS = (
     (re.compile(r"(?i)uuid|guid|cslid|clsid|\bid\b|instance"), "id",
      "00000000-0000-4000-8000-000000000000"),
     (re.compile(r"(?i)port"), "port", "8080"),
-    (re.compile(r"(?i)host|addr|ip\b"), "host", "127.0.0.1"),
+    # A multicast group is an address, and a receiver that takes one is a whole class of
+    # target here -- video over multicast. Without this `-g <group>` got no kind at all, so
+    # nothing could fill it in and the receiver joined a group named "x" while the harness
+    # sent to the real one.
+    (re.compile(r"(?i)host|addr|ip\b|group|grp|mcast|multicast"), "host", "127.0.0.1"),
     (re.compile(r"(?i)user|login"), "user", "lykos"),
     (re.compile(r"(?i)path|dir|file|out|log"), "path", "@@"),
     (re.compile(r"(?i)num|count|size|len|threads|workers"), "number", "1"),
