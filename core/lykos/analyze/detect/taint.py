@@ -425,7 +425,7 @@ def build_callmap(call_edges):
     return {e.site_addr: normalize(e.dst_name) for e in call_edges if e.site_addr}
 
 
-def _run(ir, abi, callmap, dstmap, func_addrs, entry_params, ret_tainted, *,
+def _run(ir, abi, callmap, dstmap, func_addrs, entry_params, ret_tainted, *, oversized=None,
          seed_sources=True, extmap=None, ext_out=None, mem_out=None):
     """Analyze one function. Returns (flagged_sink_sites, return_is_tainted, callee_contribs).
 
@@ -442,6 +442,12 @@ def _run(ir, abi, callmap, dstmap, func_addrs, entry_params, ret_tainted, *,
     stack_params = abi.get("stack_params")
     blocks = (ir or {}).get("blocks", [])
     if not blocks or len(blocks) > _MAX_BLOCKS:
+        # A function past the block ceiling is skipped whole, and the callers could not tell
+        # that from "this function has no tainted flow" -- the same shape as the
+        # whole-analysis ceiling, one level down. `oversized` counts them so the stage can
+        # say how much of the program was not looked at.
+        if len(blocks) > _MAX_BLOCKS and oversized is not None:
+            oversized.append(len(blocks))
         return set(), False, {}
 
     by_addr = {b["addr"]: b for b in blocks}
@@ -584,7 +590,7 @@ def analyze_function(ir, callmap, arch):
 
 
 def analyze_program(func_irs, call_edges, arch, *, entry_seeds=None, mem_out=None,
-                    max_funcs=None):
+                    max_funcs=None, skipped_out=None):
     """Inter-procedural: fixpoint over the call graph. Returns all flagged sink sites.
 
     `entry_seeds` maps an entry-point function addr -> the parameter indices that arrive
@@ -638,13 +644,16 @@ def analyze_program(func_irs, call_edges, arch, *, entry_seeds=None, mem_out=Non
                     wl.append(g); inq.add(g)
 
     flagged = set()
+    big: list = []
     for f in func_addrs:
         acc = [] if mem_out is not None else None
         ff, _, _ = _run(func_irs[f], abi, callmap, dstmap, func_addrs,
-                        entry_params[f], ret_tainted, mem_out=acc)
+                        entry_params[f], ret_tainted, mem_out=acc, oversized=big)
         flagged |= ff
         for x in (acc or ()):
             mem_out.append({**x, "function_addr": f})
+    if big and skipped_out is not None:
+        skipped_out.extend(big)
     return flagged
 
 

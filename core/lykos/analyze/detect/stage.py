@@ -377,9 +377,21 @@ def detect_stage(ctx) -> dict:
         ctx.emit("detect.taint_skipped", payload=taint_skipped)
         tainted_sites = set()
     else:
+        oversized: list = []
         tainted_sites = taint.analyze_program(func_irs, dctx.call_edges, target.arch,
                                               entry_seeds=entry_seeds, mem_out=derefs,
-                                              max_funcs=taint_cap)
+                                              max_funcs=taint_cap, skipped_out=oversized)
+        if oversized:
+            # One level down from the whole-analysis ceiling: a single function past the block
+            # limit is skipped entire, and "no tainted flow here" was indistinguishable from
+            # "this function was never looked at". Generated and obfuscated code hits it.
+            ctx.emit("detect.functions_skipped", payload={
+                "count": len(oversized), "block_cap": taint._MAX_BLOCKS,
+                "largest": max(oversized),
+                "note": (f"{len(oversized)} function(s) exceed the {taint._MAX_BLOCKS}-block "
+                         f"per-function ceiling (largest {max(oversized)}) and were not "
+                         f"analysed for data flow. Findings inside them, if any, are "
+                         f"rule-channel only.")})
     guards = bounds.classify_derefs(func_irs, derefs, target.arch)
     n_guarded = sum(1 for v in guards.values() if v.get("verdict") == bounds.GUARDED)
     cands += _deref_candidates(derefs, dctx.functions, guards)

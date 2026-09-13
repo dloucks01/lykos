@@ -589,3 +589,34 @@ def test_the_two_noisy_detectors_are_opt_in_and_say_so():
     src = inspect.getsource(dstage.detect_stage)
     assert "include_hardening" in src and "include_toctou" in src
     assert "detectors_skipped" in src, "a detector that quietly did not run is the failure"
+
+
+def test_a_function_past_the_block_ceiling_is_counted_not_dropped():
+    """One level down from the whole-analysis ceiling, and the same shape: `_run` skips a
+    function with more than _MAX_BLOCKS blocks entire, and "no tainted flow here" was
+    indistinguishable from "this function was never looked at". Generated and obfuscated code
+    hits it."""
+    from lykos.analyze.detect import taint
+    big = {"blocks": [{"addr": hex(i), "instructions": []}
+                      for i in range(taint._MAX_BLOCKS + 5)]}
+    small = {"blocks": [{"addr": "0x10", "instructions": []}]}
+    skipped = []
+    taint.analyze_program({"0x1000": big, "0x2000": small}, [], "x86-64",
+                          skipped_out=skipped)
+    assert skipped == [taint._MAX_BLOCKS + 5]
+    # and nothing is reported when every function fits
+    none = []
+    taint.analyze_program({"0x2000": small}, [], "x86-64", skipped_out=none)
+    assert none == []
+
+
+def test_every_data_flow_ceiling_is_reported_to_the_operator():
+    """Both ceilings, in one assertion, because the failure they share is the reason they
+    exist as events at all: an analysis that did not run must not look like one that ran and
+    found nothing."""
+    import inspect
+
+    from lykos.analyze.detect import stage as dstage
+    src = inspect.getsource(dstage.detect_stage)
+    assert "detect.taint_skipped" in src        # whole analysis over the function ceiling
+    assert "detect.functions_skipped" in src    # one function over the block ceiling
