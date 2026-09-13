@@ -511,3 +511,124 @@ def test_an_index_that_cannot_be_checked_is_not_reported_as_unguarded():
     assert got["0x1004"]["verdict"] == UNCHECKABLE
     assert "not a frame slot" in got["0x1004"]["why"]
     assert GUARDED != UNCHECKABLE
+
+
+# --- architectures that pass arguments on the STACK ---------------------------------------
+# x86-32 and m68k put every memcpy argument in the outgoing argument area rather than in
+# registers. Without the stack-argument pass the two produced no verdict at all -- every copy
+# on them read as "destination is not a recovered stack buffer", which is indistinguishable
+# from a copy into a heap pointer and silently gave up on two of the thirteen architectures.
+#
+# The P-Code is Ghidra's real i386 shape, verified against its output (see test_argv_taint):
+#   PUSH EAX     COPY    reg:EAX:4 -> unique:0x41500:4
+#                INT_SUB reg:ESP:4 const:0x4:4 -> reg:ESP:4
+#                STORE   const:0x1a1:8 reg:ESP:4 unique:0x41500:4
+# cdecl pushes right-to-left, so for memcpy(dst, src, len) the order is len, src, dst and the
+# arguments end up at ESP+0, +4, +8 relative to the stack pointer AT THE CALL.
+
+_X86_FRAME = {"ret_offset": 0, "vars": [{"name": "buf", "size": 64, "offset": -0x50,
+                                         "is_buffer": True, "type": "char[64]"}]}
+_X86_DISP = "0xffffffb4"           # -0x4c == frame offset -0x50 + 4 (one word for the ret slot)
+
+
+def _push(src):
+    return ["COPY %s -> unique:0x41500:4" % src,
+            "INT_SUB reg:ESP:4 const:0x4:4 -> reg:ESP:4",
+            "STORE const:0x1a1:8 reg:ESP:4 unique:0x41500:4"]
+
+
+def _x86_copy_block(length, site="0x100c", len_is_const=True, dst_disp=_X86_DISP):
+    ln = f"const:{length:#x}:4" if len_is_const else "reg:ECX:4"
+    return [
+        _i("0x1000", _push(ln), "PUSH len"),
+        _i("0x1004", _push("reg:EAX:4"), "PUSH src"),
+        _i("0x1008", [f"INT_ADD reg:EBP:4 const:{dst_disp}:4 -> unique:0x9000:4"]
+           + _push("unique:0x9000:4"), "LEA/PUSH &buf"),
+        _i(site, ["CALL ram:0x9000:4"], "CALL memcpy"),
+    ]
+
+
+def test_a_stack_passed_copy_that_fits_is_bounded_on_x86_32():
+    v = bounds.classify_site(_x86_copy_block(64), "0x100c", "memcpy", _X86_FRAME,
+                             "x86", bits=32)
+    assert v is not None, "x86-32 produced no verdict at all"
+    assert v["verdict"] == bounds.SAFE, v
+    assert v["buffer"] == "buf" and v["capacity"] == 64 and v["length"] == 64
+
+
+def test_a_stack_passed_copy_that_overruns_the_frame_is_surfaced_on_x86_32():
+    v = bounds.classify_site(_x86_copy_block(0x400), "0x100c", "memcpy", _X86_FRAME,
+                             "x86", bits=32)
+    assert v is not None
+    assert v["verdict"] in (bounds.SUSPECT, bounds.UNKNOWN)
+    assert v.get("length") == 0x400
+
+
+def test_a_non_constant_stack_passed_length_stays_unknown_on_x86_32():
+    """Same shape, length in a register the block never defines: nothing is known about it,
+    and a guess either way would be a claim the evidence does not support."""
+    v = bounds.classify_site(_x86_copy_block(0, len_is_const=False), "0x100c", "memcpy",
+                             _X86_FRAME, "x86", bits=32)
+    assert v is not None
+    assert v["verdict"] == bounds.UNKNOWN
+
+
+def test_each_stack_argument_keeps_its_own_value():
+    """The regression this guards: x86 reuses ONE P-Code temporary for all three pushes, so
+    reading the block's final state gives the LAST argument three times -- the length would
+    come back as the destination address and every site on the architecture would misjudge.
+    The values have to be captured as the stores happen."""
+    _vals, stack = bounds._slice_block(_x86_copy_block(64), "0x100c", {"EBP", "ESP"}, 32,
+                                       sp="ESP")
+    assert stack.get(0) is not None and stack[0][0] == "frame", f"dst slot {stack.get(0)!r}"
+    assert stack.get(8) == ("const", 64), f"length slot {stack.get(8)!r}"
+    assert stack[0] != stack[8], "all three pushes collapsed to one value"
+
+
+def test_stack_slots_are_keyed_from_the_stack_pointer_at_the_call():
+    """Each push moves ESP, so a slot key taken at the wrong moment reads the wrong argument.
+    cdecl pushes right-to-left, which puts dst at +0 and len at +8 by the time CALL runs."""
+    _vals, stack = bounds._slice_block(_x86_copy_block(64), "0x100c", {"EBP", "ESP"}, 32,
+                                       sp="ESP")
+    assert set(stack) >= {0, 8}, f"argument slots came out at {sorted(stack)}"
+
+
+def test_the_slice_stops_before_the_call_instruction():
+    """The CALL's own P-Code pushes the return address on x86 and m68k, which shifted every
+    stack argument by one slot."""
+    _vals, stack = bounds._slice_block(_x86_copy_block(64), "0x100c", {"EBP", "ESP"}, 32,
+                                       sp="ESP")
+    assert stack.get(8) == ("const", 64), "the call's own push shifted the arguments"
+
+
+def test_a_store_of_an_unknown_value_clears_the_slot_rather_than_keeping_a_stale_one():
+    """A slot written with something unknown must become unknown. Leaving the previous value
+    there would have a later call read an argument that belonged to an earlier one."""
+    instrs = [
+        _i("0x1000", _push("const:0x40:4")),
+        # overwrite the same slot with a value the block knows nothing about
+        _i("0x1004", ["COPY reg:EDI:4 -> unique:0x41500:4",
+                      "STORE const:0x1a1:8 reg:ESP:4 unique:0x41500:4"]),
+        _i("0x1008", ["CALL ram:0x9000:4"]),
+    ]
+    _vals, stack = bounds._slice_block(instrs, "0x1008", {"EBP", "ESP"}, 32, sp="ESP")
+    assert stack.get(0) is None, f"a stale value survived an unknown store: {stack.get(0)!r}"
+
+
+def test_an_architecture_with_neither_argument_registers_nor_a_stack_abi_declines():
+    """Better no verdict than a verdict read out of the wrong place."""
+    assert bounds.classify_site(_copy_block(_DISP, 64), "0x100c", "memcpy", _FRAME,
+                                "nosucharch") is None
+
+
+def test_a_sink_that_is_not_a_bounded_copy_is_out_of_scope():
+    assert bounds.classify_site(_copy_block(_DISP, 64), "0x100c", "printf", _FRAME,
+                                "x86-64") is None
+
+
+def test_every_architecture_can_find_its_copy_arguments_somehow():
+    """An ABI with neither argument registers nor a stack convention is inert for the whole
+    architecture, and silently: every site reads as "not a recovered stack buffer"."""
+    for arch, abi in bounds.ARCH_ABI.items():
+        assert abi.get("args") or (abi.get("stack_call") or {}).get("base"), \
+            f"{arch} can locate no call arguments at all"

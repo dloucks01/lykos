@@ -208,6 +208,9 @@ def run_batch(exe, payloads, *, mode="stdin", base_argv=(), timeout: float = 2.0
                                  timed_out=bool(flags & 1), exit_code=exit_code, signal=sig,
                                  signal_name=signame, stdout=so, stderr=se,
                                  duration_ms=per_ms, fault_pc=(fault_pc or None),
+                                 # both channels, like run(): `blocks_hit` is the explicit
+                                 # one, `note` stays for a reader that has not been moved over
+                                 blocks_hit=tuple(reached) if blocks else None,
                                  note=(",".join(str(x) for x in reached) or None)))
     return results
 
