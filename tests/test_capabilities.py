@@ -187,6 +187,7 @@ def test_cross_taint_says_what_stopped_it():
     with a resolved edge it said 1, because the loop stopped before loading the callee."""
     from lykos.analyze.link.crosstaint import _why_nothing
     base = {"no_components": False, "no_links": False, "callers_without_ir": 0,
+            "components_over_cap": 0,
             "edges_without_tainted_symbol": 0, "edges_with_clean_callee": 0}
     assert "only one component" in _why_nothing({**base, "no_components": True}, 0)
     assert "Run link_case" in _why_nothing({**base, "no_links": True}, 0)
@@ -195,6 +196,13 @@ def test_cross_taint_says_what_stopped_it():
     # the case that is a RESULT rather than a gap, and must not read like one
     clean = _why_nothing({**base, "edges_with_clean_callee": 1}, 0)
     assert "real negative, not a missing analysis" in clean
+    # The dangerous one: the data-flow engine returns empty above its function ceiling and
+    # says nothing, so without this check the "real negative" message below could be printed
+    # about an analysis that never ran -- a false negative stated with confidence, in a
+    # message added to explain zeros. It has to outrank the negative claim.
+    cap = _why_nothing({**base, "components_over_cap": 1, "edges_with_clean_callee": 1}, 0)
+    assert "did not run" in cap and "not a negative result" in cap
+    assert "real negative" not in cap, "the ceiling must outrank the clean-callee claim"
     # "not decompiled yet" is a different problem from "the data does not reach the
     # boundary", and only one of the two is actionable. Carved firmware components arrive
     # with no IR at all, and the message used to blame the data flow.
