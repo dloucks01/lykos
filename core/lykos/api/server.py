@@ -36,6 +36,20 @@ _REPORT_FORMATS = {"html", "pdf", "sarif", "json"}
 
 
 # --------------------------------------------------------------------------- server
+
+def _int_param(q, name, default: int) -> int:
+    """A query parameter as an int, falling back to the default when it is not one.
+
+    The UI builds these from its own controls, but the URL is typed by hand as often as not --
+    and `?limit=abc` reaching int() raised straight out of the handler and returned a 500.
+    A malformed parameter is a bad request at worst, never a server fault.
+    """
+    try:
+        return int((q.get(name) or [str(default)])[0])
+    except (TypeError, ValueError):
+        return default
+
+
 class UnixHTTPServer(ThreadingHTTPServer):
     address_family = socket.AF_UNIX
     daemon_threads = True
@@ -227,8 +241,8 @@ class Handler(BaseHTTPRequestHandler):
                     # response was indistinguishable from "that is all of them" -- it stopped
                     # at exactly 2000 with nothing saying so.
                     q = parse_qs(urlparse(self.path).query)
-                    limit = max(1, min(int((q.get("limit") or ["2000"])[0]), 5000))
-                    offset = max(0, int((q.get("offset") or ["0"])[0]))
+                    limit = max(1, min(_int_param(q, "limit", 2000), 5000))
+                    offset = max(0, _int_param(q, "offset", 0))
                     sd = StringDAO(s.conn)
                     strs = sd.list_by_target(m.group(1), limit=limit, offset=offset)
                     total = sd.count_by_target(m.group(1))
@@ -322,7 +336,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._get_artifact(m.group(1))
             m = _CASE_EVENTS.match(path)
             if m:
-                after = int(qs.get("after", ["0"])[0])
+                after = _int_param(qs, "after", 0)
                 return self._get_events(m.group(1), after)
             self._json({"error": "not found"}, 404)
         except Exception as e:  # never crash the server thread

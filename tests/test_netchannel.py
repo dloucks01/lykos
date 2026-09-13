@@ -6,6 +6,7 @@ while looking busy. Measured before this existed: 8 executions, 1 distinct behav
 `starved: true`, and an input_mode of "argv/none" for a program that reads a socket.
 """
 import pytest
+from lykos.analyze.fuzz import structure as S_MOD
 from lykos.analyze.link.harness import DRIVABLE, _hostport
 from lykos.analyze.link.harness_stage import _hostport_of
 
@@ -71,30 +72,60 @@ def test_the_adaptation_length_is_a_field_the_mutator_can_drive():
     assert "adaptation" in all_names, "the adaptation field is a group, not a loose byte"
 
 
-def test_the_channel_harness_dispatches_on_substrate_before_architecture():
+def test_the_channel_harness_dispatches_on_substrate_before_architecture(tmp_path):
     """A jar's recorded arch is "jvm", which is not a processor and has no qemu. Asking for an
     emulator FIRST rejected every Java target with "no qemu-user for jvm on x86-64" before the
     JVM branch could run it -- and the campaign then reported 30 executions at 24,000/second,
     because each returned that error immediately without starting anything. sandbox.run has
     always dispatched substrate-first; this did not."""
-    import inspect
+    import zipfile
 
-    from lykos.analyze.link import harness
-    src = inspect.getsource(harness.channel_run)
-    jvm_at = src.index("_is_jvm(exe)")
-    qemu_at = src.index("_qemu_for(arch)")
-    assert jvm_at < qemu_at, "the JVM check must come before the emulator lookup"
-    assert "not jvm and arch and host" in src, "and must exclude the JVM from it"
+    from lykos.analyze.link.harness import _launch_cmd
+    # a jar whose recorded arch is "jvm" on an x86-64 host: the emulator lookup must never
+    # be reached, because there is no processor called "jvm". The substrate is read from the
+    # target's BYTES, so this needs a real jar -- which is the point: the dispatch cannot be
+    # decided from the arch column alone.
+    jar = tmp_path / "recv.jar"
+    with zipfile.ZipFile(jar, "w") as z:
+        z.writestr("META-INF/MANIFEST.MF", "Manifest-Version: 1.0\n")
+    cmd, jvm, err = _launch_cmd(jar, "jvm", (), host="x86-64")
+    assert err is None, err
+    assert jvm is True and "-jar" in cmd
+    # and a NATIVE target of an arch with no emulator is still the honest error
+    native = tmp_path / "recv.bin"
+    native.write_bytes(b"\x7fELF" + b"\x00" * 60)
+    _cmd, _jvm, err2 = _launch_cmd(native, "nosucharch", (), host="x86-64")
+    assert err2 and "nosucharch" in err2
 
 
-def test_a_java_target_is_launched_under_the_jvm_on_a_channel():
+def test_a_java_target_is_launched_under_the_jvm_on_a_channel(tmp_path):
     """A jar is not executable: exec'ing it starts nothing and the run comes back with no exit
     code, no output and no crash -- indistinguishable from a channel the target ignores."""
+    import zipfile
+
+    from lykos.analyze.link.harness import _launch_cmd
+    jar = tmp_path / "x.jar"
+    with zipfile.ZipFile(jar, "w") as z:
+        z.writestr("META-INF/MANIFEST.MF", "Manifest-Version: 1.0\n")
+    cmd, jvm, err = _launch_cmd(jar, "jvm", ["-g", "239.1.1.1"], host="x86-64")
+    assert jvm is True and err is None
+    assert "-jar" in cmd and str(jar) in cmd
+    assert cmd[-2:] == ["-g", "239.1.1.1"], "the listener's own flags still go last"
+
+
+def test_the_one_shot_and_session_paths_launch_a_target_the_same_way(tmp_path):
+    """`_launch_cmd`'s docstring promised the two could not drift on substrate dispatch while
+    `channel_run` carried its own copy of that logic and never called it -- a guarantee that
+    was simply not in force. Assert the shared launcher is the only one there is."""
     import inspect
 
     from lykos.analyze.link import harness
-    src = inspect.getsource(harness.channel_run)
-    assert '"-jar"' in src and "_JVM_FLAGS" in src
+    one_shot = inspect.getsource(harness.channel_run)
+    session = inspect.getsource(harness.ChannelSession)
+    assert "_launch_cmd(" in one_shot and "_launch_cmd(" in session
+    # neither may re-derive the substrate for itself
+    for src, who in ((one_shot, "channel_run"), (session, "ChannelSession")):
+        assert "_qemu_for(" not in src, f"{who} re-derives the emulator instead of sharing it"
 
 
 def test_an_uncaught_exception_on_a_channel_is_a_crash():
@@ -281,3 +312,135 @@ def test_the_same_receiver_on_arm_under_qemu(tmp_path):
                     argv=argv, arch="arm", readiness=2.5)
     assert r.cmd and "qemu-arm" in r.cmd[0], f"should run under qemu: {r.cmd[:1]}"
     assert r.crashed and r.signal_name == "SIGSEGV", (r.note, r.stderr[:140])
+
+
+# --- coverage on the wire ----------------------------------------------------------------
+
+_RTP_C = r"""
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+/* trusts the CC nibble: copies cc*4 bytes into a four-entry table */
+static void handle(unsigned char *p, int n) {
+    if (n < 12) return;
+    if ((p[0] >> 6) != 2) return;
+    int cc = p[0] & 0x0F;
+    unsigned int csrc[4];
+    memcpy(csrc, p + 12, cc * 4);
+    fprintf(stderr, "cc=%d\n", cc);
+}
+int main(int argc, char **argv) {
+    const char *g = NULL; int port = 0;
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "-g") && i + 1 < argc) g = argv[++i];
+        else if (!strcmp(argv[i], "-p") && i + 1 < argc) port = atoi(argv[++i]);
+    }
+    if (!g || !port) return 2;
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in a; memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_ANY); a.sin_port = htons(port);
+    int on = 1; setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &on, sizeof on);
+    if (bind(s, (struct sockaddr*)&a, sizeof a) < 0) return 1;
+    unsigned char buf[2048];
+    for (int i = 0; i < 256; i++) { ssize_t n = recv(s, buf, sizeof buf, 0);
+        if (n <= 0) break; handle(buf, (int)n); }
+    return 0;
+}
+"""
+
+
+def _cross_rtp(tmp_path):
+    """A static aarch64 receiver, or None. Coverage on a channel is only answerable for an
+    EMULATED target -- qemu's block log is the instrumentation -- so this is the case the
+    feature exists for, and the one it has to be proved on."""
+    import shutil
+    import subprocess
+    cc = shutil.which("aarch64-linux-gnu-gcc")
+    if not cc or not shutil.which("qemu-aarch64"):
+        return None
+    src = tmp_path / "rtp.c"
+    src.write_text(_RTP_C)
+    out = tmp_path / "rtp-a64"
+    r = subprocess.run([cc, "-O0", "-static", "-fno-stack-protector", "-w",
+                        str(src), "-o", str(out)], capture_output=True)
+    return out if r.returncode == 0 else None
+
+
+def test_a_persistent_channel_reports_coverage_per_payload_not_cumulatively(tmp_path):
+    """The bug this guards is subtle and silent: one process serves many payloads, so qemu's
+    block log is CUMULATIVE. Read whole, it credits every payload with everything reached
+    before it -- a number that only ever grows, in which no payload is ever novel and the
+    corpus never ratchets. Only the bytes the log gained since the last send are this
+    payload's coverage."""
+    exe = _cross_rtp(tmp_path)
+    if exe is None:
+        pytest.skip("no aarch64 cross toolchain + qemu-aarch64 on this host")
+    from lykos.analyze.link.harness import ChannelSession
+    blocks = tuple(range(0x400000, 0x420000, 4))
+    port = 51873
+    s = ChannelSession(exe, "udp", f"127.0.0.1:{port}",
+                       argv=["-g", "127.0.0.1", "-p", str(port)], arch="aarch64",
+                       readiness=3.0, settle=0.25, blocks=blocks)
+    try:
+        seed = S_MOD.seed_for_name("rtp")
+        sends = [s.send(seed) for _ in range(4)]
+        assert all(r.blocks_hit is not None for r in sends)
+        counts = [len(r.blocks_hit) for r in sends]
+        startup = counts[0]
+        assert startup > 0, "an emulated listener has to report the blocks it ran"
+        # The same payload, four times. Every send after the first reaches the parse loop and
+        # NOT the process startup, so it must report far fewer blocks. Read cumulatively they
+        # would all report `startup` or more.
+        assert max(counts[1:]) < startup / 2, (
+            f"per-send block counts {counts}: after the first send these should be the parse "
+            f"loop alone, so the log is being re-read from the top and startup is credited "
+            f"to every payload")
+        # ...and the same code each time, so nothing is new. qemu buffers its log writes, so
+        # the tail of one send can land in the next send's window; sends 3 and 4 are clear of
+        # that boundary and must add nothing at all.
+        seen = set(sends[0].blocks_hit) | set(sends[1].blocks_hit)
+        for i, r in enumerate(sends[2:], start=3):
+            assert not (set(r.blocks_hit) - seen), \
+                f"send {i} reported blocks never seen before for an identical payload"
+    finally:
+        s.close()
+
+
+def test_a_channel_without_coverage_says_so_rather_than_reporting_none_reached(tmp_path):
+    """None and () are different answers: the first means "no coverage available here, judge
+    this payload on its behaviour", the second means "this payload reached nothing". Collapsed
+    together, every native target looks like a target that never reaches new code -- so the
+    campaign would keep nothing and the corpus would never grow."""
+    exe = _build(tmp_path)
+    if exe is None:
+        pytest.skip("no C compiler")
+    from lykos.analyze.link.harness import ChannelSession
+    port = 51872
+    s = ChannelSession(exe, "udp", f"127.0.0.1:{port}",
+                       argv=["-g", "127.0.0.1", "-p", str(port)], readiness=1.0, settle=0.1)
+    try:
+        assert s.send(b"\x47" + b"\x00" * 187).blocks_hit is None
+    finally:
+        s.close()
+
+
+def test_the_campaign_offers_blocks_to_any_runner_that_takes_them():
+    """Gated on `run_fn is run_input`, a network campaign could not be given coverage at all,
+    however well the runner underneath it supported the idea."""
+    from lykos.analyze.fuzz.stage import _takes_blocks, run_input
+
+    def channel_like(exe, mode, workfile, timeout, arch, data, *, endianness=None,
+                     bits=None, blocks=()):
+        return [], None
+
+    def old_style(exe, mode, workfile, timeout, arch, data, *, endianness=None, bits=None):
+        return [], None
+
+    assert _takes_blocks(run_input)
+    assert _takes_blocks(channel_like)
+    assert not _takes_blocks(old_style)
+    assert not _takes_blocks(object())          # never raises on something odd

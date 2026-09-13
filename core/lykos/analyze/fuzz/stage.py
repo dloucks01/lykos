@@ -12,6 +12,7 @@ from __future__ import annotations
 import base64
 import bisect
 import hashlib
+import inspect
 import os
 import random
 import re
@@ -153,6 +154,16 @@ def _discover_argv(ctx, target, exec_timeout):
     return [], f"proposed {' '.join(argv)} but the target refused it -- {v['why']}", False
 
 
+def _takes_blocks(run_fn) -> bool:
+    """Does this runner accept coverage blocks? Asked of the signature rather than of the
+    function's identity, so a runner other than `run_input` -- the channel harness, above all
+    -- can be given them without this having to learn its name."""
+    try:
+        return "blocks" in inspect.signature(run_fn).parameters
+    except (TypeError, ValueError):
+        return False
+
+
 def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_seconds,
                   exec_timeout, rng, detector, event_prefix, note_prefix, run_fn=run_input,
                   mutator=None, cover_blocks=(), cover_flags=(), base_argv=()):
@@ -255,7 +266,12 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
             kw = {"endianness": target.endianness, "bits": target.bits}
             if run_fn is run_input:
                 kw["base_argv"] = run_argv
-                kw["blocks"] = tuple(all_blocks - seen_blocks) if all_blocks else ()
+            # Only ever arm blocks we have not reached: the breakpoints are one-shot. Asked by
+            # SIGNATURE rather than by identity, because the channel runner takes them too --
+            # gated on `run_fn is run_input`, a network campaign could not be given coverage at
+            # all, and every payload was judged on output shape alone.
+            if all_blocks and _takes_blocks(run_fn):
+                kw["blocks"] = tuple(all_blocks - seen_blocks)
             results = [run_fn(exe, mode, workfile, exec_timeout, target.arch, inputs[0],
                               **kw)[1]]
         for data, res in zip(inputs, results):
@@ -269,11 +285,18 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
             # ratchet: without it the corpus never grows and a deeper path is reachable only by a
             # single lucky mutation from a seed.
             new_blocks = set()
-            if all_blocks and res.note:
-                try:
-                    new_blocks = {int(x) for x in res.note.split(",") if x} - seen_blocks
-                except ValueError:
-                    new_blocks = set()
+            if all_blocks:
+                # `blocks_hit` is the explicit answer; `note` is the old channel, kept for a
+                # runner that has not been taught the field. A runner with something else to
+                # say in `note` -- the channel harness names its endpoint there -- silently
+                # reported no coverage for as long as the two shared one string.
+                if res.blocks_hit is not None:
+                    new_blocks = set(res.blocks_hit) - seen_blocks
+                elif res.note:
+                    try:
+                        new_blocks = {int(x) for x in res.note.split(",") if x} - seen_blocks
+                    except ValueError:
+                        new_blocks = set()
                 seen_blocks |= new_blocks
             b = behaviour_of(res, data)
             novel = bool(new_blocks) if all_blocks else (b not in seen_behaviour)

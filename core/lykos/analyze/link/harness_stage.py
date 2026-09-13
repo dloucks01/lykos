@@ -14,7 +14,7 @@ import random
 from ...db.dao import ComponentEdgeDAO, StringDAO, TargetDAO
 from ...jobs.registry import register_stage
 from ..fuzz import structure
-from ..fuzz.stage import _mine_dictionary, fuzz_campaign
+from ..fuzz.stage import _mine_dictionary, _recovered_blocks, fuzz_campaign
 from .harness import DRIVABLE, ChannelSession, channel_run
 
 BOUNDARY_STAGE = "boundary_fuzz"
@@ -149,17 +149,22 @@ def boundary_fuzz_stage(ctx) -> dict:
         persistent = family in ("udp", "multicast")
     session = {"s": None}
 
-    def run_fn(exe, mode, workfile, timeout, arch, data, *, endianness=None, bits=None):
+    def run_fn(exe, mode, workfile, timeout, arch, data, *, endianness=None, bits=None,
+               blocks=()):
         if not persistent:
             res = channel_run(exe, family, key, data, timeout=timeout, arch=arch,
-                              readiness=readiness, argv=base_argv)
+                              readiness=readiness, argv=base_argv, blocks=blocks)
             return [], res
         if session["s"] is None:
+            # The session is built once and lives for the campaign, so it is armed with EVERY
+            # block rather than with the shrinking "not yet seen" set the one-shot path gets.
+            # It reads its own log incrementally, so per-payload coverage still falls out.
             session["s"] = ChannelSession(exe, family, key, argv=base_argv, arch=arch,
-                                          readiness=readiness,
+                                          readiness=readiness, blocks=cover_blocks,
                                           settle=float(p.get("settle", 0.15)))
         return [], session["s"].send(data)
 
+    cover_blocks = _recovered_blocks(ctx, target)
     rng = random.Random(int(p.get("seed", 1337)))
     corpus = [base64.b64decode(x) for x in p.get("seeds", [])] or list(_SEEDS)
     dictionary = _mine_dictionary(StringDAO(ctx.conn).list_by_target(target.id))
@@ -191,6 +196,12 @@ def boundary_fuzz_stage(ctx) -> dict:
                      "against a fresh process before it is recorded")})
     stats = fuzz_campaign(
         ctx, target, corpus=corpus, dictionary=dictionary, mode="channel",
+        # Coverage on the wire. A network campaign judged every payload on output shape alone
+        # -- a listener that answers nothing looks identical whether it parsed the packet or
+        # dropped it at the first byte -- so the corpus never grew and a deeper path was
+        # reachable only by one lucky mutation from a seed. Only an emulated target can answer
+        # (qemu's block log is the instrumentation); a native one falls back to behaviour.
+        cover_blocks=cover_blocks,
         max_execs=int(p.get("max_execs", 800)), max_seconds=float(p.get("max_seconds", 30)),
         exec_timeout=float(p.get("exec_timeout", 2)), rng=rng, detector="boundary",
         event_prefix="harness", note_prefix=f"found by boundary harness ({family} channel {key})",

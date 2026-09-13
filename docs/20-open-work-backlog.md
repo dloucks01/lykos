@@ -551,6 +551,85 @@ actionable.
   reaches **`ProcessGpsInfo`** (verified under gdb — the same `process_EXIF → ProcessExifDir →
   ProcessGpsInfo` chain the real crash's backtrace shows), and 115 of 200 mutants parse EXIF
   cleanly with 27 more reaching `ProcessExifDir`.
+- **[DONE] Coverage measurement that tells the truth, and the gaps it actually found.**
+  `make coverage` measures the suite including the capabilities that exist only as
+  **subprocesses** — the ptrace helper (which must not fork from a threaded worker), the AFL++
+  batch runner, and the angr and unicorn drivers (isolated so a third-party import cannot take
+  the worker down with it). Measured in-process those five read **0%**, which says *untested*
+  when the truth is *unobservable*, and the two call for opposite work. `COVERAGE_PROCESS_START`
+  plus a sitecustomize shim on `PYTHONPATH` makes each child write its own data file. `make
+  test` is untouched and still needs nothing installed.
+  Two corrections came out of measuring rather than assuming:
+  * "Eight stages have no test" was an artifact of grepping for stage *name strings*. Asked by
+    entry function or `enqueue_*` helper instead, **all 29 capabilities are exercised** — the
+    real gap was depth, not breadth.
+  * `angr_driver` and `unicorn_driver` still read 0% even with subprocess measurement, because
+    production materialises them into a temp directory and coverage cannot attribute those
+    lines back to the source file. Exercised, not attributable — a third category worth naming.
+  What the pass found, which line counts alone would not have:
+  * `cli.py` — the command the operator actually types — had **no test at all** (0%, 172
+    statements). Now 89%: `db init/upgrade/version`, the `--only` filters, `--out`, history
+    recording, and the exit code coming from the gate rather than from the run.
+  * `ptrace_capture.py` — the L2/L3 register capture the whole PoC ladder rests on — likewise
+    had none. Now driven as a subprocess exactly as production does, including the **breakpoint
+    path** that is what makes an L3 claim checkable ("the hijack reached `win()`" is a
+    breakpoint report, not an inference from a register value).
+  * `?limit=abc` on `/targets/<id>/strings` reached `int()` inside the handler and returned a
+    **500**; same bug on `/cases/<id>/events?after=`. A malformed query parameter is a bad
+    request at worst, never a server fault.
+  * The strings endpoint's paging had no test because the fixture had no strings — they come
+    from the `disassemble` stage, so a triage-only target has none and every paging assertion
+    skipped on a host without Ghidra. Seeded directly, the paging is now actually exercised:
+    a full walk must return every row exactly once, since a reader that repeats or drops rows
+    is worse than one that truncates — nothing in the response says it happened.
+  * The `debug_monitor` and `dynamic_taint` STAGES were untested (the libraries under them were
+    not). Both now run end-to-end; taint is checked on all three delivery channels, because a
+    marker placed the wrong way does not reach the sink and that reads exactly like a clean
+    target.
+- **[DONE] Video-stream models, and two bounding forms the spec language was missing.**
+  The named target class here is a receiver of multicast or network video — so `mpegts` was
+  only the inner layer. An RTP receiver parses the RTP header *before* it ever reaches a TS
+  packet, so a bug there is hit first and by every stream; an H.264 decoder is what sees the
+  elementary stream once the transport is stripped. Both are now builtin models (`rtp`,
+  `h264`), auto-detected from the target's own strings alongside the existing seven.
+  Building them surfaced a real limitation: **a non-terminal blob with no length field ate the
+  rest of the input**, so a model could describe at most one variable region. Annex-B framing
+  has no length field at all — a NAL unit runs until the next start code — and RTP's CSRC list
+  is four bytes per unit of CC, a count packed into a *nibble* that neither `covers` nor
+  `length_of` can point at. Two forms close that:
+  * `until: <bytes>` — the blob ends at the next occurrence of a delimiter. H.264's three NAL
+    bodies were one blob before this; the mutator could only ever reach the first NAL's header.
+  * `size_from: {field, mask, shift, scale}` — the blob's length is derived from part of
+    another field. It bounds the blob on the way back IN without forcing the field to agree on
+    the way out, which is exactly what a fuzzer wants: the baseline stays a packet the receiver
+    accepts, and the mutator is still free to drive the count past what the datagram holds.
+  Both were needed for the payload to be reachable at all: with RTP's extension unbounded, the
+  transport-stream payload behind it parsed as empty and was never mutated once in 2,000 rounds.
+  Measured on a receiver that trusts CC (copies `cc * 4` bytes into a four-entry table), 120
+  executions over multicast, four seeds: the model found **26–55 crashes** against blind byte
+  mutation's **4–9**, and reached the first crash sooner in three of the four.
+- **[DONE] Coverage on the wire.** A network campaign judged every payload on output shape
+  alone — a listener that answers nothing looks identical whether it parsed the packet or
+  dropped it at the first byte — so the corpus never grew and a deeper path was reachable only
+  by one lucky mutation from a seed. Three things were in the way, each silent:
+  `fuzz_campaign` passed `blocks` only when the runner *was* `run_input` (now asked of the
+  signature, so any runner that accepts them gets them); coverage travelled in `RunResult.note`,
+  a field the channel runner already uses for its own text, so the two collided and coverage
+  was the one that lost (now an explicit `blocks_hit`, with `note` kept as a fallback); and a
+  persistent listener's block log is **cumulative** — read whole it credits every payload with
+  everything reached before it, a number that only ever grows in which no payload is ever
+  novel. `ChannelSession` now reads only what the log gained since the last send.
+  Only an emulated target can answer at all (qemu's `-d exec` log is the instrumentation, and
+  there is no instrumented rebuild of a binary we were handed) — which is the ARM/AArch64 case
+  this exists for. `None` and `()` are kept distinct: "no coverage available here, judge this
+  payload on its behaviour" is not "this payload reached nothing", and collapsing them would
+  make every native target look like one that never reaches new code.
+  Verified on an aarch64 receiver under qemu: send 1 reports 728 blocks, sends 2–5 report 41
+  each with **zero new**, and the payload that crashed reported 2 blocks no other payload
+  reached — the signal the campaign previously had no way to see.
+  Closing this also fixed a guarantee that was not in force: `_launch_cmd`'s docstring said it
+  was "shared by the one-shot and session paths so the two cannot drift on substrate dispatch",
+  while `channel_run` carried its own copy of that dispatch and never called it.
 - **[DONE] The campaign now learns, and aims at every plausible channel.** Two things kept it
   from ever getting deeper than its seeds.
   *It was purely blind.* The corpus grew only on a CRASH, so an input that reached new parser

@@ -225,13 +225,17 @@ def _relay(exe, *, argv, stdin, timeout, wineprefix) -> dict:
     # bytes and then again as a str. Spill it to a file and read back a bounded prefix, so a
     # long-running or chatty target cannot take the server down -- and say when it was cut,
     # because a trace that was cut means a partial inventory.
-    truncated = False
+    truncated = timed_out = False
     with tempfile.TemporaryFile() as errf:
         try:
             subprocess.run(cmd, input=stdin, stdout=subprocess.DEVNULL, stderr=errf,
                            timeout=timeout, env=env)
         except subprocess.TimeoutExpired:
-            pass
+            # We stopped watching; the program did not stop running. Swallowed silently, this
+            # is indistinguishable from a program that ran to completion and did nothing --
+            # so a PE killed mid-run reported "no persistence, no network, no exec" and the
+            # inventory read as a clean bill of health. Record it and let the caller say so.
+            timed_out = True
         # the CHILD wrote to this fd, so the parent's own file position never moved --
         # tell() returns 0 and the truncation flag could never fire
         size = os.fstat(errf.fileno()).st_size
@@ -241,7 +245,8 @@ def _relay(exe, *, argv, stdin, timeout, wineprefix) -> dict:
     text = raw.decode("latin-1", "ignore")
     maps = _target_maps(text, exe)
     if maps:                                            # ASLR-robust: thread(s) + runtime range(s)
-        return {"ok": True, "text": text, "maps": maps, "truncated": truncated}
+        return {"ok": True, "text": text, "maps": maps, "truncated": truncated,
+                "timed_out": timed_out}
     if "wine: failed to load" in text.lower():
         # The loader could not start the image -- it never ran. Common cause: a 32-bit PE with no
         # i386 WoW64 runtime (wine: failed to load ...\syswow64\ntdll.dll). Report it honestly
@@ -256,7 +261,8 @@ def _relay(exe, *, argv, stdin, timeout, wineprefix) -> dict:
     rng = _pe_image_range(exe)                           # fallback: static ImageBase, any thread
     if not rng:
         return {"ok": False, "note": "could not determine the target's module range"}
-    return {"ok": True, "text": text, "maps": [(None, rng[0], rng[1])]}
+    return {"ok": True, "text": text, "maps": [(None, rng[0], rng[1])],
+            "truncated": truncated, "timed_out": timed_out}
 
 
 def trace(exe, *, argv=(), stdin: bytes = b"", timeout: float = 40.0, wineprefix=None) -> dict:
@@ -264,4 +270,4 @@ def trace(exe, *, argv=(), stdin: bytes = b"", timeout: float = 40.0, wineprefix
     if not r.get("ok"):
         return r
     return {"ok": True, "events": parse(r["text"], r["maps"]),
-            "truncated": bool(r.get("truncated"))}
+            "truncated": bool(r.get("truncated")), "timed_out": bool(r.get("timed_out"))}

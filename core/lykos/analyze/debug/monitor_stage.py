@@ -120,10 +120,18 @@ def _win_monitor(ctx, target, p) -> dict:
 
     log = [{k: v for k, v in h.items() if k in ("api", "kind", "value", "length")}
            for h in hits[:60]]
+    # A monitor run we cut short is a partial call list; an empty one is not the same claim
+    # as "this PE calls no dangerous sink". The flags existed and were dropped here.
+    from .trace_stage import _partial_note
+    partial = _partial_note(res)
     ctx.emit("monitor.done", payload={"ok": True, "platform": "windows", "calls": len(hits),
              "findings": findings, "log": log,
-             "note": None if hits else "no monitored Win32 sink calls observed on this input"})
-    ctx.progress(pct=100, msg=f"{len(hits)} Win32 sink call(s), {findings} finding(s)")
+             "partial": bool(partial), "truncated": bool(res.get("truncated")),
+             "timed_out": bool(res.get("timed_out")),
+             "note": partial or (None if hits else
+                     "no monitored Win32 sink calls observed on this input")})
+    ctx.progress(pct=100, msg=f"{len(hits)} Win32 sink call(s), {findings} finding(s)"
+                 + (f" -- {partial}" if partial else ""))
     return {}
 
 

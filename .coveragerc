@@ -1,0 +1,24 @@
+# Coverage config for `make coverage`. NOT used by `make test` -- the normal suite runs
+# unmeasured so nothing about it depends on coverage being installed.
+[run]
+source = core/lykos
+branch = True
+# Several capabilities are SUBPROCESSES by design and cannot be otherwise: the ptrace helper
+# must not fork from a threaded worker, the AFL++ batch runner is driven by afl-fuzz, and the
+# angr and unicorn drivers are isolated so a third-party import cannot take the worker down
+# with it. Measured in-process they read as 0%, which says they are untested when what is
+# actually true is that they are unobservable. `parallel` plus the sitecustomize shim that
+# `make coverage` puts on PYTHONPATH makes each of those processes write its own data file.
+parallel = True
+sigterm = True
+
+[paths]
+source =
+    core/lykos
+    */core/lykos
+
+[report]
+exclude_also =
+    if TYPE_CHECKING:
+    raise NotImplementedError
+    if __name__ == .__main__.:
