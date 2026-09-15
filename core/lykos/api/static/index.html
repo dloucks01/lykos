@@ -763,7 +763,7 @@ function findingDetailRow(x){
     ${x.poc_level?`<div class="fdkv"><span>PoC</span><b><span class="lvl">${esc(x.poc_level)}</span> verified</b></div>`:''}
     <div class="eyebrow" style="margin:9px 0 4px">Evidence (${(x.evidence||[]).length})</div>
     <div class="evlist">${ev}</div>
-    <div style="margin-top:10px"><button class="btn sm" onclick="event.stopPropagation();openFindingInWorkbench('${x.target_id}', ${JSON.stringify(x.function_addr||'')})">View in Workbench${x.function_addr?' → function':''}</button></div>
+    <div style="margin-top:10px"><button class="btn sm" data-tid="${esc(x.target_id)}" data-faddr="${esc(x.function_addr||'')}" onclick="event.stopPropagation();openFindingInWorkbench(this.dataset.tid, this.dataset.faddr)">View in Workbench${x.function_addr?' → function':''}</button></div>
   </div></td></tr>`;
 }
 async function openFindingInWorkbench(tid, faddr){
@@ -1087,12 +1087,13 @@ function renderTargets(ts){
       <td class="mono">${t.bits||"—"}${t.endianness?(" "+t.endianness[0].toUpperCase()+"E"):""}</td>
       <td>${mits(t.mitigations)}</td>
       <td class="mono">${t.stripped===true?"yes":t.stripped===false?"no":"—"}</td>
-      <td style="text-align:right"><button class="btn sm rm" title="Remove this target from the case (deletes its findings, runs, PoCs and System Map links)" onclick="removeTarget('${t.id}', ${JSON.stringify(t.filename)}, event)">Remove</button></td></tr>`).join("")}</tbody></table>`;
+      <td style="text-align:right"><button class="btn sm rm" data-fn="${esc(t.filename)}" title="Remove this target from the case (deletes its findings, runs, PoCs and System Map links)" onclick="removeTarget('${t.id}', this, event)">Remove</button></td></tr>`).join("")}</tbody></table>`;
   el.querySelectorAll("tr[data-id]").forEach(tr=> tr.onclick=(e)=>{ if(!e.target.closest(".rm")) showDetail(tr.dataset.id); });
 }
 
-async function removeTarget(id, name, ev){
+async function removeTarget(id, btn, ev){
   if(ev) ev.stopPropagation();
+  const name=(btn && btn.dataset && btn.dataset.fn) || id;   // read from data-fn, not interpolated into the handler
   if(!confirm(`Remove "${name}" from this case?\n\nThis permanently deletes its triage, findings, runs, PoCs, and any System Map links. This cannot be undone.`)) return;
   const res = await api(`/targets/${id}`, {method:"DELETE"});
   if(res && res.error){ alert("Remove failed: "+res.error); return; }
@@ -1236,12 +1237,12 @@ async function showDetail(targetId){
             <div class="kv"><span>linking</span><b>${rec.linking||"—"}${rec.stripped?" · stripped":""}</b></div>
             <div class="kv"><span>toolchain</span><b>${rec.toolchain_hint||"—"}</b></div>
             <div class="kv"><span>entropy</span><b>${rec.entropy?.overall??"—"}${rec.entropy?.packed_hint?" · packed?":""}</b></div>
-            <div class="kv"><span>imports</span><b>${(rec.imports?.libraries||[]).join(", ")||"—"} (${rec.imports?.functions_count||0})</b></div>
+            <div class="kv"><span>imports</span><b>${(rec.imports?.libraries||[]).map(esc).join(", ")||"—"} (${rec.imports?.functions_count||0})</b></div>
           </div>
           <details class="disc"><summary>Sections (${(rec.sections||[]).length})</summary>
             <div class="sec" style="max-height:150px;overflow:auto;margin-top:4px">${
-              (rec.sections||[]).slice(0,40).map(s=>`${(s.name||"").padEnd(18)} ${String(s.size).padStart(8)}  ${s.perms}  H=${s.entropy??"-"}`).join("<br>")}</div></details>
-          ${rec.parse_errors?.length?`<div class="notewarn mono">parse notes: ${rec.parse_errors.join("; ")}</div>`:""}
+              (rec.sections||[]).slice(0,40).map(s=>`${esc((s.name||"").padEnd(18))} ${String(s.size).padStart(8)}  ${esc(s.perms||"")}  H=${s.entropy??"-"}`).join("<br>")}</div></details>
+          ${rec.parse_errors?.length?`<div class="notewarn mono">parse notes: ${rec.parse_errors.map(esc).join("; ")}</div>`:""}
         </div>
       </section>
 
@@ -2092,7 +2093,7 @@ function renderStrings(q){
       list.length===STRINGS.length?STRINGS.length:list.length+" of "+STRINGS.length} strings${
       (STRINGS_TOTAL>STRINGS.length)?` · showing the first ${STRINGS.length} of ${STRINGS_TOTAL} in this binary`:""}</div>`+
     `<div class="sec" style="max-height:240px;overflow:auto">`+
-    (shown.length?shown.map(s=>`${s.addr}  ${esc((s.value||"").slice(0,90))} <span style="color:var(--faint)">[${(s.xrefs||[]).length} xref]</span>`).join("<br>"):`<div class="hint">no match</div>`)+
+    (shown.length?shown.map(s=>`${esc(s.addr)}  ${esc((s.value||"").slice(0,90))} <span style="color:var(--faint)">[${(s.xrefs||[]).length} xref]</span>`).join("<br>"):`<div class="hint">no match</div>`)+
     (list.length>cap?`<br><span class="hint">…${list.length-cap} more — refine the filter</span>`:"")+
     `</div>`;
   const inp=el.querySelector(".fsearch"); if(q&&inp){ inp.focus(); inp.setSelectionRange(inp.value.length,inp.value.length); }
@@ -2120,7 +2121,7 @@ function renderFuncs(q){
     `<div class="sec" style="max-height:200px;overflow:auto">`+
     (shown.length?shown.map(f=>{
       const sig=f.signature && f.signature!==f.name ? `<span class="fsig" title="${esc(f.signature)}">${esc(f.signature)}</span>` : `<span class="fnm">${esc(f.name||"")}</span>`;
-      return `<div class="frow clk" data-id="${f.id}"><span class="faddr">${f.addr}</span> ${sig} <span style="color:var(--faint)">(${f.size||0})</span></div>`;
+      return `<div class="frow clk" data-id="${f.id}"><span class="faddr">${esc(f.addr)}</span> ${sig} <span style="color:var(--faint)">(${f.size||0})</span></div>`;
     }).join(""):`<div class="hint">no match</div>`)+
     (list.length>cap?`<div class="hint">…${list.length-cap} more — refine the filter</div>`:"")+
     `</div>`;
@@ -2152,7 +2153,7 @@ function renderCodeViewer(){
   const sig = f.signature ? `<div class="cvsig mono">${esc(f.signature)}</div>` : "";
   el.innerHTML=`<div class="cvhead">
       <div class="cvname"><b>${esc(f.name||("sub_"+f.addr))}</b>
-        <span class="mono" style="color:var(--faint)">${f.addr} · ${f.blocks||blocks.length} blk · ${f.edges||0} edges</span></div>
+        <span class="mono" style="color:var(--faint)">${esc(f.addr)} · ${f.blocks||blocks.length} blk · ${f.edges||0} edges</span></div>
       ${sig}</div>
     <div class="cvbody">
       <div class="cvpane"><div class="cvplabel">CFG (${blocks.length} blocks · ${f.edges||0} edges)</div>
@@ -2464,7 +2465,10 @@ function logline(type, run="", payload="", ts){
   while(el.childElementCount>600) el.removeChild(el.firstChild);
   el.scrollTop=el.scrollHeight;
 }
-function esc(s){ return String(s==null?"":s).replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c])); }
+// Escapes for BOTH text nodes and quoted attribute values: & < > and both quote styles
+// (plus backtick). A crafted symbol/string from an analysed binary can carry any of these, so
+// esc() must be safe wherever it is interpolated -- element text or `attr="${esc(x)}"`.
+function esc(s){ return String(s==null?"":s).replace(/[&<>"'`]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;","`":"&#96;"}[c])); }
 
 // ---- case import (rail) ----
 document.getElementById("impcase").onclick=()=>document.getElementById("impfilerail").click();

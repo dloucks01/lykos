@@ -1000,11 +1000,18 @@ single-operator posture (**[ACCEPTED]**), each with why it is still open.
   that could otherwise drive `/console` or export a case. **[ACCEPTED]** There is still no
   authentication (single operator), and `--http` can still be pointed at a non-loopback address —
   but a non-loopback `Host`/`Origin` is refused by the guard.
-- **[ACCEPTED]** `esc()` in `api/static/index.html` escapes `& < >` but not quotes, and is used
-  inside double-quoted attributes carrying decompiler output (`title="${esc(f.signature)}"`,
-  callee names); `f.addr`/`f.id`/`s.addr` are interpolated unescaped. A crafted symbol name in an
-  analysed binary is stored XSS in the operator's UI. The static UI was outside the audit's scope;
-  this is the remaining half of the hostile-sample-to-workstation chain and is worth fixing next.
+- **[FIXED]** `esc()` in `api/static/index.html` now also escapes both quote styles and the
+  backtick, so it is safe inside `attr="${esc(x)}"` as well as text. The addresses that were
+  interpolated raw (`f.addr`/`s.addr` in the function/string lists and the code viewer) are now
+  `esc()`'d, as are section names, section perms, import library names and parse-error text. The
+  two inline handlers that passed untrusted data through `JSON.stringify` into a double-quoted
+  `onclick` (`removeTarget` filename, `openFindingInWorkbench` address) now carry it in `data-*`
+  attributes and read it via `dataset`, which the earlier esc() could not have made safe (an
+  entity in an inline handler is re-decoded before the JS runs). Regression test:
+  `tests/js/esc_xss.js` (runs under pytest as `test_gui_harness[esc_xss]` and under `make gui`)
+  asserts `esc()` neutralises an `"><img onerror>` payload and that `renderFuncs` escapes a
+  hostile symbol name and address. This closes the remaining half of the
+  hostile-sample-to-workstation chain.
 - **[FIXED]** `casestore._safe_extract` now uses path-component containment (`dest not in
   target.parents`) instead of a string prefix, closing the sibling-directory traversal
   (`/tmp/abc` vs `/tmp/abc-evil`). **[ACCEPTED]** Symlink members and an explicit
