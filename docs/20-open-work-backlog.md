@@ -985,25 +985,37 @@ None of these are hypothetical; each was read off the code, but none has a repro
 
 ## J. Product-security posture (accepted risk — recorded, not scheduled)
 
-Decision (September 2026): single operator, single workstation, so these are **accepted**, not
+Decision (September 2026): single operator, single workstation, so these were **accepted**, not
 planned. Recorded because the threat model would change the moment a second person runs the UI,
 analyses a sample someone else supplied, or the API binds anything but loopback.
 
-- Upload filename is used unsanitised as a path (`api/server.py` `_upload_target` +
-  `api/multipart.py`), giving arbitrary file write/delete via `X-Filename: ../..`. Demonstrated.
-- No authentication and no `Origin`/`Host` check on the HTTP API or either WebSocket. WebSockets
-  are not subject to CORS, so any page the operator visits can drive `/console` (which spawns the
-  target under a PTY) or export a case. `--http` also accepts a non-loopback bind.
-- `esc()` in `api/static/index.html` escapes `& < >` but not quotes, and is used inside
-  double-quoted attributes carrying decompiler output (`title="${esc(f.signature)}"`, callee
-  names); `f.addr`/`f.id`/`s.addr` are interpolated unescaped. A crafted symbol name in an
-  analysed binary is stored XSS in the operator's UI — which, combined with the item above, is
-  the hostile-sample-to-workstation chain the README's threat model assumes.
-- `casestore._safe_extract` uses a string-prefix containment check and ignores symlink members;
-  `extractall` runs without `filter="data"`. Python 3.14's default filter blocks both, but the
+**Update (2026-09-15) — audit-hardening pass.** A full audit revisited this list. Several items
+were fixed rather than left accepted (marked **[FIXED]** below); the rest remain accepted for the
+single-operator posture (**[ACCEPTED]**), each with why it is still open.
+
+- **[FIXED]** Upload filename is now reduced to a bare basename before use as a path
+  (`api/server.py` `_upload_target`), so `X-Filename: ../..` can no longer escape the temp dir.
+- **[FIXED]** `Origin`/`Host` is now checked on every REST read, write, and both WebSocket
+  upgrades (`_guard_local` in `do_GET`/`do_POST`/`do_DELETE`), defeating the DNS-rebinding page
+  that could otherwise drive `/console` or export a case. **[ACCEPTED]** There is still no
+  authentication (single operator), and `--http` can still be pointed at a non-loopback address —
+  but a non-loopback `Host`/`Origin` is refused by the guard.
+- **[ACCEPTED]** `esc()` in `api/static/index.html` escapes `& < >` but not quotes, and is used
+  inside double-quoted attributes carrying decompiler output (`title="${esc(f.signature)}"`,
+  callee names); `f.addr`/`f.id`/`s.addr` are interpolated unescaped. A crafted symbol name in an
+  analysed binary is stored XSS in the operator's UI. The static UI was outside the audit's scope;
+  this is the remaining half of the hostile-sample-to-workstation chain and is worth fixing next.
+- **[FIXED]** `casestore._safe_extract` now uses path-component containment (`dest not in
+  target.parents`) instead of a string prefix, closing the sibling-directory traversal
+  (`/tmp/abc` vs `/tmp/abc-evil`). **[ACCEPTED]** Symlink members and an explicit
+  `filter="data"` are still not handled; Python 3.14's default filter blocks them here, but the
   project supports 3.11+, where it does not.
-- Sandbox: `--ro-bind / /` exposes the whole host filesystem to the detonated binary, the full
-  environment is inherited (`env=None`), and when bubblewrap is missing or fails `run()` silently
-  drops to `rlimits-only` — native execution with network access. Wine targets get no bwrap.
-- `sandbox._spawn` uses `preexec_fn` from threaded workers (`ThreadingHTTPServer` + thread pool),
-  which CPython documents as unsafe.
+- **[FIXED, partial]** Sandbox: `_secret_mask_args()` now tmpfs-masks `/root`, the invoking
+  user's credential dotfiles, and the case store (via `protect_dir`), so the detonated binary can
+  no longer read host secrets through the `--ro-bind / /` mount; a `bwrap:` line from the target
+  no longer disables isolation session-wide (`run()` re-probes with `_bwrap_probe_fresh()` and
+  degrades only for that run); and the heap/native paths pass a minimal env instead of the full
+  host environment. **[ACCEPTED]** `--ro-bind / /` itself is kept (masking all of `/home` breaks
+  the platform), and Wine targets still run rlimits-only without bwrap.
+- **[ACCEPTED]** `sandbox._spawn` uses `preexec_fn` from threaded workers (`ThreadingHTTPServer` +
+  thread pool), which CPython documents as unsafe.

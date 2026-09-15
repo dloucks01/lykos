@@ -3,11 +3,17 @@
 Air-gap is a hard constraint on *every* component. Nothing may fetch at runtime.
 
 ## 11.1 The installer bundle (single, verifiable, offline)
-- Ships **all** binaries/toolchains (Ghidra, QEMU, AFL++/LibAFL, angr + wheels, GDB, CASR, etc.), the
-  desktop app, and all data below. Distributed as a signed archive / offline package repo (Nix closure or
-  `apt`/Podman offline mirror) so installation itself needs no network.
-- Pin **exact versions** of everything; record them so findings are reproducible (doc 12).
-- Verify integrity on install (detached signature + hash manifest).
+- Ships the optional engines (Ghidra, QEMU-user, AFL++, GDB, Wine, cross compilers, the
+  angr/Unicorn venvs) plus the data below. The stdlib-only core and the desktop UI travel with
+  the repo itself, not the bundle (doc 23). Built inside a container matching the target distro
+  and distributed as one `.tar.zst` so installation needs no network.
+- Pin **exact versions** of everything; record them so findings are reproducible (doc 12). The
+  bundle's `manifest/BUNDLE.txt` records the target distro, glibc, Python and build date.
+- Verify integrity on install. **Current state:** the bundle carries an *unsigned* `SHA256SUMS`
+  manifest; `install.sh` checks every listed file's hash and refuses any file present but not
+  listed, so the guarantee is corruption-resistance and no-added-files — not authenticity. Carry
+  the bundle over a trusted channel. **Planned:** sign `SHA256SUMS` and verify the signature at
+  install time, upgrading the guarantee to authenticity.
 
 ## 11.2 Bundled data packs (versioned + dated)
 | Pack | Contents | Why dated matters |

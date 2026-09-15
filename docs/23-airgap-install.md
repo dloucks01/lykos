@@ -25,7 +25,9 @@ cross-architecture execution (qemu-user), and the coverage-guided and symbolic e
 git clone <lykos> && cd lykos
 make test                       # confirm the repo is sound before bundling anything
 bash packaging/collect-toolchain.sh
-# -> dist/lykos-toolchain-<date>-<arch>.tar.zst  (+ its sha256)
+# collects inside a container matching the target distro (Kali rolling by default; needs
+# podman or docker), or pass --target native to collect from an ABI-identical host.
+# -> dist/lykos-toolchain-<distro>-<date>-<arch>.tar.zst  (+ its sha256)
 ```
 
 The collector takes its package list from `lykos.toolchain` — the same table `lykos doctor`
@@ -55,9 +57,16 @@ mkdir -p /tmp/lt && tar xf lykos-toolchain-*.tar.zst -C /tmp/lt
 LYKOS_ROOT=$PWD /tmp/lt/install.sh          # verifies, installs, then re-runs doctor
 ```
 
-`install.sh` refuses to install if any checksum fails. It finishes by printing the capability
-report, so the outcome of an install is a list of what you can now do — not a claim that it
-worked.
+`install.sh` verifies before it installs: every file the manifest lists must match its hash,
+**and** the set of files in the bundle must equal the set the manifest names — an unlisted file
+(one an attacker added to ride along on the `debs/*.deb` install) is refused, not installed. It
+then finishes by printing the capability report, so the outcome of an install is a list of what
+you can now do — not a claim that it worked.
+
+The manifest (`SHA256SUMS`) is **unsigned**: it proves the bundle arrived un-corrupted and
+un-added-to, not that it is authentic. An attacker who can rewrite the whole bundle can rewrite
+the manifest to match, so carry the bundle over a trusted channel. (Future step: sign
+`SHA256SUMS` and verify the signature here.)
 
 ## 3. Confirm
 
