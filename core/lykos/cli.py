@@ -88,6 +88,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="release gate: fail if the FP-rate exceeds this (default 0.0)")
     ev.add_argument("--require-backend", action="store_true",
                     help="fail (not skip) when the static backend (Ghidra) is absent")
+    ev.add_argument("--min-negative", type=int, default=0,
+                    help="release gate: fail if fewer than this many 'good' cases were scored "
+                         "(guards against a vacuous fp_rate; default 0 = off)")
     ev.add_argument("--record", action="store_true",
                     help="append this run's metrics to the history (for the dashboard)")
     ev.add_argument("--history", default=None,
@@ -110,6 +113,15 @@ def build_parser() -> argparse.ArgumentParser:
                     help="comma-separated case labels to check (default: all)")
     rg.add_argument("--out", default=None, help="write the JSON report here")
     rg.set_defaults(func=_cmd_realgate)
+
+    dr = sub.add_parser("doctor",
+                        help="what this host can and cannot do, and how to fix the gaps")
+    dr.add_argument("--json", action="store_true", help="machine-readable output")
+    dr.add_argument("-v", "--verbose", action="store_true",
+                    help="also say what each present tool unlocks")
+    dr.add_argument("--strict", action="store_true",
+                    help="exit non-zero unless every REQUIRED tool is present")
+    dr.set_defaults(func=_cmd_doctor)
 
     db2 = sub.add_parser("dashboard", help="render the detection-quality regression dashboard")
     db2.add_argument("--history", default=None,
@@ -157,6 +169,21 @@ def _cmd_realgate(args: argparse.Namespace) -> int:
         print(f"report written to {args.out}", file=sys.stderr)
     print(f"\nGATE: {verdict} -- {reason}", file=sys.stderr)
     return 0 if passed else 1
+
+
+def _cmd_doctor(args: argparse.Namespace) -> int:
+    """What works on THIS host. On an air-gapped workstation there is no package manager to
+    ask, and "the stage declined" is a poor way to find out Ghidra was never installed."""
+    import json
+
+    from . import toolchain
+    if args.json:
+        print(json.dumps(toolchain.as_dict(), indent=2))
+    else:
+        print(toolchain.report(verbose=args.verbose))
+    if args.strict:
+        return 1 if toolchain.missing("required") else 0
+    return 0
 
 
 def _cmd_dashboard(args: argparse.Namespace) -> int:
@@ -224,7 +251,8 @@ def _cmd_eval(args: argparse.Namespace) -> int:
     from .eval.metrics import gate
     passed, verdict, reason = gate(rep.metrics, rep.meta, stage=stage,
                                    min_recall=args.min_recall, max_fp_rate=args.max_fp_rate,
-                                   require_backend=args.require_backend)
+                                   require_backend=args.require_backend,
+                                   min_negative=args.min_negative)
     print(f"\nGATE: {verdict} -- {reason}", file=sys.stderr)
     return 0 if passed else 1
 

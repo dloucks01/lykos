@@ -34,6 +34,18 @@ def test_monitor_captures_command_and_copy_length(gcc, tmp_path):
     assert scpy and scpy[0]["length"] > 64
 
 
+@pytest.mark.skipif(not monitor._locate_gdb() or sandbox.host_arch() != "x86-64",
+                    reason="needs gdb on x86-64")
+def test_monitor_reports_when_target_never_ran(tmp_path):
+    """A target that cannot be executed under gdb (here a non-ELF) must be reported as such --
+    ok:False with a note -- not as ok:True with zero hits, which reads as 'no dangerous calls'."""
+    notelf = tmp_path / "s.sh"
+    notelf.write_text("#!/bin/sh\necho hi\n")
+    notelf.chmod(0o755)
+    r = monitor.run_monitor(str(notelf), ["system"], "x86-64", stdin=b"x", timeout=10)
+    assert r["ok"] is False and r.get("hits") == [] and r.get("note")
+
+
 def test_monitor_unsupported_arch():
     assert not monitor.supported("mips")
     r = monitor.run_monitor("/bin/true", ["system"], "mips")

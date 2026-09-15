@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from . import elf as elfmod
 from . import filetype
@@ -22,6 +22,9 @@ MITIGATION_ENUM = {"on", "off", "partial", "unknown"}
 _FILE_TYPES = {filetype.ELF, filetype.PE, filetype.MACHO, filetype.JAR,
                filetype.CLASS, filetype.FIRMWARE, filetype.RAW, filetype.OTHER}
 _PACK_ENTROPY = 7.2
+# Entropy is a whole-file scan in pure Python; on every ingest that is a DoS on a large upload.
+# A 2 MB prefix is representative for the packer heuristic and matches the ELF/PE section cap.
+_ENTROPY_CAP = 2 * 1024 * 1024
 
 
 def _shannon(data: bytes) -> float:
@@ -86,6 +89,52 @@ def _classify_content(data: bytes) -> str:
     return "unrecognized data (not a known binary format)"
 
 
+# A headerless firmware scan runs on every file that matched no format magic, so bound the
+# bytes it inspects: the pure-Python prologue scoring in `headerless` walks the whole blob,
+# and firmware images that need this path are small (flash/SRAM sized). 16 MiB is far above
+# any bare-metal image and keeps the every-ingest cost bounded.
+_FW_SCAN_CAP = 16 * 1024 * 1024
+
+
+def _firmware_fallback(data: bytes) -> Optional[dict]:
+    """Second opinion for a blob that matched no container magic: is it actually firmware?
+
+    `filetype.detect` only knows the six firmware containers by their offset-0 magic. A
+    bare-metal Cortex-M image, a raw flash dump, or a blob with a gzipped kernel embedded at a
+    non-zero offset has none of those, so it fell through to "not a binary, import an ELF" --
+    the exact confident-wrong-answer this platform has a history of giving about images the
+    carve stage then pulls executables and keys out of. Consult the headerless loader (which
+    can name the CPU) and the carve signature scan (which finds embedded components), and only
+    then decide. Returns None when neither finds anything -- it really is not a binary.
+    """
+    blob = data[:_FW_SCAN_CAP]
+    try:
+        from .firmware.headerless import analyze_blob
+    except Exception:
+        analyze_blob = None
+    if analyze_blob is not None:
+        try:
+            hl = analyze_blob(blob)
+        except Exception:
+            hl = None
+        if hl and hl.get("arch"):
+            return {"mode": "headerless", "headerless": hl}
+    try:
+        from .firmware.carve import scan_signatures
+    except Exception:
+        scan_signatures = None
+    if scan_signatures is not None:
+        try:
+            hits = scan_signatures(blob)
+        except Exception:
+            hits = []
+        # offset 0 would already have been a container magic; we want EMBEDDED content
+        embedded = [h for h in hits if (h.get("offset") or 0) > 0]
+        if embedded:
+            return {"mode": "carve", "hits": embedded}
+    return None
+
+
 def _packer_heuristic(overall: float, sections: list[dict]) -> dict:
     reasons, packer = [], None
     if overall >= _PACK_ENTROPY:
@@ -130,7 +179,7 @@ def build_triage(path: str | Path, hashes: dict[str, Any], filename: str) -> dic
         # not-a-binary description entirely and left `detected` as None.
         rec["file_type"] = filetype.OTHER
     rec["_data_head"] = data[:4096]                     # transient: for non-binary classify
-    rec["entropy"] = _packer_heuristic(_shannon(data), [])
+    rec["entropy"] = _packer_heuristic(_shannon(data[:_ENTROPY_CAP]), [])
 
     if rec["file_type"] == filetype.ELF:
         info = elfmod.parse(data)
@@ -227,13 +276,51 @@ def build_triage(path: str | Path, hashes: dict[str, Any], filename: str) -> dic
         rec["advisory"] = ("Mach-O binary detected, but this build parses ELF and PE headers "
                            "only. Format and hashes were recorded.")
     else:
-        desc = _classify_content(rec["_data_head"])
-        rec["detected"] = f"Not a binary — {desc}"
-        rec["analyzable"] = False
-        rec["advisory"] = (f"This file is not a supported executable binary ({desc}). It was "
-                           "imported and hashed, but there is no machine code to analyze: "
-                           "disassembly, CWE detection, and the dynamic/fuzzing/PoC stages do "
-                           "not apply. Import an ELF executable or shared object to analyze.")
+        # Before calling this "not a binary", ask the headerless loader and the carve scan --
+        # a firmware image without a container magic at offset 0 is still firmware, and saying
+        # otherwise is the confident wrong answer this platform has a history of giving.
+        fw = _firmware_fallback(data)
+        if fw is not None:
+            rec["file_type"] = filetype.FIRMWARE
+            rec["analyzable"] = True
+            if fw["mode"] == "headerless":
+                hl = fw["headerless"]
+                sub = hl.get("sub")
+                kind = ("bare-metal " + (hl.get("arch") or "?")
+                        + (f"/{sub}" if sub else "") + " firmware")
+                rec.update({"arch": hl.get("arch"), "bits": hl.get("bits"),
+                            "endianness": hl.get("endianness"),
+                            "entry_point": (f"0x{hl['entry']:x}"
+                                            if hl.get("entry") is not None else None)})
+                rec["detected"] = (
+                    f"Firmware image — {kind} (headerless: {hl.get('method')}, "
+                    f"confidence {hl.get('confidence')})")
+                rec["advisory"] = (
+                    f"{kind} identified by the headerless loader "
+                    f"({hl.get('evidence') or hl.get('method')}). This is a raw image, not an "
+                    f"ELF/PE: run firmware_carve to extract any embedded components, or "
+                    f"firmware_rehost to run a bare-metal image under emulation. Machine-code "
+                    f"disassembly and the ELF/PE dynamic stages apply to carved components, "
+                    f"not to the raw image.")
+            else:
+                types = sorted({h.get("type") for h in fw["hits"] if h.get("type")})
+                rec["detected"] = ("Firmware image — embedded components ("
+                                   + ", ".join(types) + ")")
+                rec["advisory"] = (
+                    "This image carries embedded components ("
+                    + ", ".join(types) + ") at non-zero offsets. It is a container, not a "
+                    "program: run firmware_carve to extract them (executables, filesystems, "
+                    "keys) as targets of their own, then analyse those. Disassembly and the "
+                    "dynamic stages apply to the carved components, not to the raw image.")
+        else:
+            desc = _classify_content(rec["_data_head"])
+            rec["detected"] = f"Not a binary — {desc}"
+            rec["analyzable"] = False
+            rec["advisory"] = (f"This file is not a supported executable binary ({desc}). It "
+                               "was imported and hashed, but there is no machine code to "
+                               "analyze: disassembly, CWE detection, and the "
+                               "dynamic/fuzzing/PoC stages do not apply. Import an ELF "
+                               "executable or shared object to analyze.")
     rec.pop("_data_head", None)
     return rec
 

@@ -175,6 +175,35 @@ def test_the_xxe_finding_is_suppressed_when_the_hardening_call_is_there():
     assert not any(f["cwe"] == "CWE-611" for f in jvmdetect.analyze(guarded))
 
 
+def test_the_xxe_guard_is_per_class_not_program_wide():
+    """A parser hardened with setFeature in ONE class must not suppress an unhardened parser
+    in ANOTHER. The guard lives with the factory that uses it, so it is checked per class."""
+    factory = "javax/xml/parsers/DocumentBuilderFactory.newInstance"
+    guard = "javax/xml/parsers/DocumentBuilderFactory.setFeature"
+    info = _Info(
+        calls=[factory, guard],
+        by_class={
+            "com/app/Safe": {"calls": [factory, guard], "strings": []},
+            "com/app/Vuln": {"calls": [factory], "strings": []},
+        })
+    xxe = [f for f in jvmdetect.analyze(info) if f["cwe"] == "CWE-611"]
+    assert xxe, "the unhardened parser in com.app.Vuln must still be reported"
+    # the finding names the unguarded class, not the hardened one
+    detail = xxe[0]["evidence"][0]["detail"]
+    assert "com.app.Vuln" in detail and "com.app.Safe" not in detail
+
+
+def test_the_xxe_guard_still_suppresses_when_both_are_in_the_same_class():
+    """Per-class evaluation must not lose the real suppression: a class that hardens the
+    parser it creates is the fixed form and stays suppressed."""
+    factory = "javax/xml/parsers/SAXParserFactory.newInstance"
+    guard = "javax/xml/parsers/SAXParserFactory.setFeature"
+    info = _Info(
+        calls=[factory, guard],
+        by_class={"com/app/Safe": {"calls": [factory, guard], "strings": []}})
+    assert not any(f["cwe"] == "CWE-611" for f in jvmdetect.analyze(info))
+
+
 def test_weak_crypto_is_the_algorithm_string_not_the_factory_call():
     """Cipher.getInstance is not a defect; "DES" is."""
     weak = _Info(["javax/crypto/Cipher.getInstance"], ["DES/ECB/PKCS5Padding"])

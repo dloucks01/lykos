@@ -16,6 +16,12 @@ TOOL = "sandbox"
 TOOL_VERSION = "sandbox-1"
 _MARGIN = 30
 
+# Isolation labels sandbox.run() returns when the target NEVER EXECUTED (no qemu for the arch,
+# no wine/JVM, a PE that could not be launched). A non-crash from one of these is "could not
+# run", not "ran and exited cleanly" -- absence of evidence is not evidence of absence.
+_DID_NOT_RUN = frozenset({"unsupported-arch", "unsupported-windows", "wine-launch-failed",
+                          "jvm-missing"})
+
 # fatal signal -> (cwe, severity) for the confirmed crash finding
 _SIG_CWE = {
     "SIGSEGV": ("CWE-119", "critical"), "SIGBUS": ("CWE-119", "critical"),
@@ -114,6 +120,9 @@ def dynamic_stage(ctx) -> dict:
     exe.write_bytes(ctx.content.path(target.sha256).read_bytes())
     os.chmod(exe, 0o755)
 
+    # mask the case store (other targets' extracted secrets) inside the sandbox; the target is
+    # copied out to scratch above, so it never needs to reach the store.
+    sandbox.protect_dir(getattr(ctx.content, "root", None))
     ctx.progress(msg="detonating in sandbox")
     res = sandbox.run(exe, argv=argv, stdin=stdin, timeout=timeout, arch=target.arch,
                       endianness=target.endianness, bits=target.bits)
@@ -127,16 +136,26 @@ def dynamic_stage(ctx) -> dict:
         duration_ms=res.duration_ms, stdout_sha=stdout_sha, stderr_sha=stderr_sha,
         note=res.note)
 
+    ran = res.isolation not in _DID_NOT_RUN
     ctx.emit("dynamic.done", payload={"crashed": res.crashed, "signal": res.signal_name,
                                       "timed_out": res.timed_out, "isolation": res.isolation,
-                                      "note": res.note})
+                                      "ran": ran, "note": res.note})
 
     if res.crashed:
         FindingDAO(ctx.conn).upsert(target.id, target.case_id, crash_finding_candidate(
             res.signal_name, input_sha, res.isolation, "dynamic"))
 
-    ctx.progress(pct=100, msg=("crash " + (res.signal_name or "")) if res.crashed
-                 else ("timeout" if res.timed_out else "clean exit"))
+    if not ran:
+        # never executed: do not label this "clean exit" -- it is "could not run", and the note
+        # says why (no qemu for the arch, no wine/JVM, PE launch failed).
+        msg = "did not run" + (": " + res.note if res.note else "")
+    elif res.crashed:
+        msg = "crash " + (res.signal_name or "")
+    elif res.timed_out:
+        msg = "timeout"
+    else:
+        msg = "clean exit"
+    ctx.progress(pct=100, msg=msg)
     return {"output_shas": [x for x in (stdout_sha, stderr_sha) if x],
             "output_kind": "dyn-output"}
 

@@ -13,6 +13,7 @@ import re
 import select
 import subprocess
 import time
+from pathlib import Path
 
 from ..dynamic import sandbox
 
@@ -39,8 +40,13 @@ def leak_and_exploit(exe, base_argv, *, leak_regex: str, leak_base_offset: int,
     rx = re.compile(leak_regex.encode("latin-1"))
     ok = re.compile(success_regex.encode("latin-1"))
     preexec = sandbox._rlimits(mem_mb, int(timeout) + 2, set_as=True)
+    # The leak harness reads only the target's stdout, so it needs no control channel: contain
+    # it fully (read-only fs, tmpfs, private pid + network namespace) when bwrap is available.
+    exedir = str(Path(exe).resolve().parent)
+    cmd = sandbox.isolate_prefix(exedir, net=False) + \
+        [str(exe)] + [str(a) for a in base_argv]
     try:
-        p = subprocess.Popen([str(exe)] + [str(a) for a in base_argv],
+        p = subprocess.Popen(cmd,
                              stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                              stderr=subprocess.STDOUT, start_new_session=True,
                              preexec_fn=preexec)

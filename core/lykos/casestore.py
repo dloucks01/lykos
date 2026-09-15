@@ -13,12 +13,14 @@ import shutil
 import sqlite3
 import tarfile
 import tempfile
+import warnings
 from pathlib import Path
 from typing import Any, Optional, Tuple
 
 # (table, WHERE clause, bound params) -- one copy step of a per-case export.
 _CasePlan = tuple[str, str, tuple[Any, ...]]
 
+from .db.connection import transaction
 from .db.dao import AnalysisRunDAO, ArtifactDAO, CaseDAO, EventDAO, RunArtifactDAO, TargetDAO
 from .db.migrations import init_db
 from .db.models import Artifact
@@ -151,7 +153,18 @@ class CaseStore:
             try:
                 ids = [r["id"] for r in src.conn.execute('SELECT id FROM "case"')]
                 for cid in ids:
-                    copy_case(src, self, cid)
+                    conflicts = copy_case(src, self, cid)
+                    if conflicts:
+                        # Import is add-only: these rows changed in the source but the
+                        # destination already had a differing copy, which was kept. Surface it
+                        # rather than let a stale finding/target/run pass unnoticed.
+                        warnings.warn(
+                            f"import kept {len(conflicts)} stale row(s) for case {cid!r} "
+                            f"(add-only import does not overwrite): "
+                            + ", ".join(f"{c['table']}{tuple(c['pk'].values())}"
+                                        for c in conflicts[:8])
+                            + (" ..." if len(conflicts) > 8 else ""),
+                            stacklevel=2)
             finally:
                 src.close()
             return ids
@@ -177,7 +190,9 @@ def _safe_extract(tar: tarfile.TarFile, dest: Path) -> None:
     dest = dest.resolve()
     for m in tar.getmembers():
         target = (dest / m.name).resolve()
-        if not str(target).startswith(str(dest)):
+        # Containment by path components, not string prefix: a startswith check lets a member
+        # resolving to a SIBLING (dest="/tmp/abc", target="/tmp/abc-evil/x") pass.
+        if target != dest and dest not in target.parents:
             raise IOError(f"unsafe path in archive: {m.name}")
     tar.extractall(dest)
 
@@ -188,14 +203,35 @@ def _safe_extract(tar: tarfile.TarFile, dest: Path) -> None:
 # self-contained (doc 12), independent of the whole-store archive above.
 
 # Tables to copy for a case, with the WHERE that selects its rows. Order respects FKs.
+def _case_artifact_shas(conn: sqlite3.Connection, case_id: str) -> list[str]:
+    """Every artifact blob the case needs to be self-contained: the ones it OWNS
+    (artifact.case_id) plus the ones its runs merely REFERENCE through run_artifact. A cache
+    hit (queue._materialize_cache_hit) links a blob first registered under another case, so
+    selecting artifacts by case_id alone leaves run_artifact rows pointing at blobs the export
+    omitted -- a foreign-key failure on import, or a case that is missing its own outputs."""
+    shas = {r["sha256"] for r in
+            conn.execute("SELECT sha256 FROM artifact WHERE case_id=?", (case_id,))}
+    shas |= {r["artifact_sha256"] for r in conn.execute(
+        "SELECT ra.artifact_sha256 FROM run_artifact ra "
+        "JOIN analysis_run r ON r.id=ra.run_id WHERE r.case_id=?", (case_id,))}
+    return sorted(shas)
+
+
 def _case_tables(conn: sqlite3.Connection, case_id: str) -> list[_CasePlan]:
     tids = [r["id"] for r in
             conn.execute("SELECT id FROM target WHERE case_id=?", (case_id,))]
     rids = [r["id"] for r in
             conn.execute("SELECT id FROM analysis_run WHERE case_id=?", (case_id,))]
+    # finding_site / finding_verdict carry no case_id -- they hang off finding(id). Select
+    # them by the case's finding ids, or export/import silently drops which sites are proven
+    # and every channel's standing verdict (the exact loss migration 12's seed guards against).
+    fids = [r["id"] for r in
+            conn.execute("SELECT id FROM finding WHERE case_id=?", (case_id,))]
+    shas = _case_artifact_shas(conn, case_id)
+    art_where = f"sha256 IN ({','.join('?' * len(shas))})" if shas else "0=1"
     plan = [('"case"', "id=?", (case_id,)),
             ("target", "case_id=?", (case_id,)),
-            ("artifact", "case_id=?", (case_id,)),
+            ("artifact", art_where, tuple(shas)),
             ("analysis_run", "case_id=?", (case_id,))]
     for tid in tids:
         plan += [("function", "target_id=?", (tid,)),
@@ -203,35 +239,87 @@ def _case_tables(conn: sqlite3.Connection, case_id: str) -> list[_CasePlan]:
                  ("string_ref", "target_id=?", (tid,))]
     for rid in rids:
         plan.append(("run_artifact", "run_id=?", (rid,)))
-    plan += [("finding", "case_id=?", (case_id,)),
-             ("dyn_result", "case_id=?", (case_id,)),
+    plan.append(("finding", "case_id=?", (case_id,)))
+    # Must follow `finding` (FK finding_id -> finding.id, foreign_keys=ON on import).
+    fid_where = f"finding_id IN ({','.join('?' * len(fids))})" if fids else "0=1"
+    plan += [("finding_site", fid_where, tuple(fids)),
+             ("finding_verdict", fid_where, tuple(fids))]
+    plan += [("dyn_result", "case_id=?", (case_id,)),
              ("poc", "case_id=?", (case_id,)),
              ("component_edge", "case_id=?", (case_id,)),
              ("event", "case_id=?", (case_id,))]
     return plan
 
 
+# Mutable tables whose rows can legitimately CHANGE in the source between exports (a finding
+# gets promoted, triage fields are refined, a run finishes). Import is add-only (INSERT OR
+# IGNORE), so a changed row is silently skipped and the destination keeps the stale copy. For
+# these we detect that case by primary key and surface it as a conflict rather than swallowing
+# it. Content-addressed / append-only tables are not listed: artifact is deliberately re-homed
+# on conflict, and event ids are reassigned so every row is genuinely new.
+_MUTABLE_PK: dict[str, tuple[str, ...]] = {
+    "finding": ("id",),
+    "target": ("id",),
+    "analysis_run": ("id",),
+}
+
+
 def _copy_rows(sc: sqlite3.Connection, dc: sqlite3.Connection, table: str, where: str,
-               params: tuple[Any, ...], *, drop_cols: tuple[str, ...] = ()) -> None:
+               params: tuple[Any, ...], *, drop_cols: tuple[str, ...] = (),
+               override: Optional[dict[str, Any]] = None,
+               conflicts: Optional[list[dict[str, Any]]] = None) -> None:
     rows = sc.execute(f"SELECT * FROM {table} WHERE {where}", params).fetchall()
     if not rows:
         return
     cols = [c for c in rows[0].keys() if c not in drop_cols]
     collist = ",".join(f'"{c}"' for c in cols)
     ph = ",".join("?" * len(cols))
-    dc.executemany(f'INSERT OR IGNORE INTO {table}({collist}) VALUES({ph})',
-                   [tuple(r[c] for c in cols) for r in rows])
+    ov = override or {}
+    vals = [tuple(ov[c] if c in ov else r[c] for c in cols) for r in rows]
+
+    pk = _MUTABLE_PK.get(table)
+    if pk and conflicts is not None:
+        # Add-only import: report any row whose PK already exists in dst with DIFFERING content,
+        # so a stale skip is visible instead of silent. (Detection only -- the INSERT OR IGNORE
+        # below still keeps the destination row; import does not overwrite.)
+        idx = {c: i for i, c in enumerate(cols)}
+        for v in vals:
+            pkwhere = " AND ".join(f'"{c}"=?' for c in pk)
+            pkvals = tuple(v[idx[c]] for c in pk)
+            existing = dc.execute(
+                f'SELECT {collist} FROM {table} WHERE {pkwhere}', pkvals).fetchone()
+            if existing is not None and tuple(existing) != v:
+                conflicts.append({"table": table,
+                                  "pk": {c: v[idx[c]] for c in pk}})
+
+    dc.executemany(f'INSERT OR IGNORE INTO {table}({collist}) VALUES({ph})', vals)
 
 
-def copy_case(src: "CaseStore", dst: "CaseStore", case_id: str) -> None:
-    """Copy one logical case (rows + artifact blobs) from src into dst (idempotent)."""
-    for table, where, params in _case_tables(src.conn, case_id):
-        # event.id is per-store autoincrement -> drop it so dst assigns fresh ids
-        drop = ("id",) if table == "event" else ()
-        _copy_rows(src.conn, dst.conn, table, where, params, drop_cols=drop)
-    dst.conn.commit()
-    for r in dst.conn.execute("SELECT DISTINCT sha256 FROM artifact WHERE case_id=?",
-                              (case_id,)):
-        sha = r["sha256"]
+def copy_case(src: "CaseStore", dst: "CaseStore", case_id: str) -> list[dict[str, Any]]:
+    """Copy one logical case (rows + artifact blobs) from src into dst (idempotent).
+
+    Import is ADD-ONLY: rows are inserted with INSERT OR IGNORE, so a row already present in
+    dst is kept as-is and never overwritten. When the source has a CHANGED version of a mutable
+    row (a promoted finding, refined triage, a finished run), that change is skipped -- this
+    returns the list of such conflicts so the caller can surface them instead of losing them
+    silently. Returns [] on a clean copy.
+
+    The row copy is one transaction: a mid-copy failure (e.g. a foreign-key violation) must
+    leave dst untouched rather than a half-imported case. Blobs are content-addressed and
+    copied after commit -- putting an already-present blob is a no-op."""
+    shas = _case_artifact_shas(src.conn, case_id)
+    conflicts: list[dict[str, Any]] = []
+    with transaction(dst.conn):
+        for table, where, params in _case_tables(src.conn, case_id):
+            # event.id is per-store autoincrement -> drop it so dst assigns fresh ids
+            drop = ("id",) if table == "event" else ()
+            # An artifact may be owned by another case (a cache hit shares one content-addressed
+            # blob); re-home it to THIS case so the export is self-contained and artifact.case_id
+            # still references a case that travels with it. ON CONFLICT keeps an existing owner.
+            override = {"case_id": case_id} if table == "artifact" else None
+            _copy_rows(src.conn, dst.conn, table, where, params,
+                       drop_cols=drop, override=override, conflicts=conflicts)
+    for sha in shas:
         if src.content.exists(sha) and not dst.content.exists(sha):
             dst.content.put_bytes(src.content.get_bytes(sha))
+    return conflicts

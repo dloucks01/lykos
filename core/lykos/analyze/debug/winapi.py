@@ -228,8 +228,8 @@ def _relay(exe, *, argv, stdin, timeout, wineprefix) -> dict:
     truncated = timed_out = False
     with tempfile.TemporaryFile() as errf:
         try:
-            subprocess.run(cmd, input=stdin, stdout=subprocess.DEVNULL, stderr=errf,
-                           timeout=timeout, env=env)
+            sandbox.run_reaped(cmd, input=stdin, stdout=subprocess.DEVNULL, stderr=errf,
+                               timeout=timeout, env=env)
         except subprocess.TimeoutExpired:
             # We stopped watching; the program did not stop running. Swallowed silently, this
             # is indistinguishable from a program that ran to completion and did nothing --

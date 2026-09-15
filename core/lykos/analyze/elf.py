@@ -32,6 +32,23 @@ DF_BIND_NOW, DF_1_NOW, DF_1_PIE = 0x08, 0x00000001, 0x08000000
 SHF_WRITE, SHF_ALLOC, SHF_EXEC = 0x1, 0x2, 0x4
 STT_FUNC = 2
 
+# Per-section entropy is a pure-Python byte loop, and e_shnum is attacker-controlled (u16, up
+# to 65535). A crafted ELF whose sections all point at one 2 MiB high-entropy region would
+# otherwise run that loop tens of thousands of times -- ~137 GB of work from a ~6 MiB file.
+# Cap both the number of sections scanned (mirroring the PE parser's 96) and the cumulative
+# bytes hashed. Real ELFs have a few dozen sections and never approach either bound.
+_MAX_ENTROPY_SECTIONS = 96
+_MAX_ENTROPY_BYTES = 64 << 20
+
+
+def _fits(data: bytes, base: int, entsize: int, claimed: int) -> int:
+    """How many `entsize`-byte records starting at `base` the file can actually hold, capped
+    to what the header claims. Bounds a hostile e_phnum/e_shnum to reality so a struct error
+    mid-loop cannot discard the records that DID parse."""
+    if entsize <= 0 or base < 0 or base >= len(data):
+        return 0
+    return min(claimed, max(0, (len(data) - base) // entsize))
+
 
 @dataclass
 class ElfInfo:
@@ -78,6 +95,14 @@ def parse(data: bytes) -> ElfInfo:
         ei_class, ei_data = data[4], data[5]
         info.bits = {1: 32, 2: 64}.get(ei_class)
         info.endianness = {1: "little", 2: "big"}.get(ei_data)
+        # A valid ELF ident says 32/64-bit (EI_CLASS 1/2) and little/big-endian (EI_DATA 1/2).
+        # Anything else means we do not know the layout: defaulting to 32-bit little/big and
+        # reading e_machine anyway hands downstream a guessed arch dressed as fact. Stop, and
+        # let the null bits/endianness plus the error speak for themselves.
+        if ei_class not in (1, 2) or ei_data not in (1, 2):
+            info.errors.append(
+                f"invalid ELF ident: EI_CLASS={ei_class}, EI_DATA={ei_data}")
+            return info
         endc = "<" if ei_data == 1 else ">"
         is64 = ei_class == 2
     except Exception as e:  # pragma: no cover - defensive
@@ -107,8 +132,11 @@ def parse(data: bytes) -> ElfInfo:
     gnu_relro = False
 
     # --- program headers (mitigations: NX/RELRO, interp) ---
+    n_ph = _fits(data, e_phoff, e_phentsize, e_phnum)
+    if n_ph < e_phnum:
+        info.errors.append(f"e_phnum={e_phnum} exceeds file; parsing {n_ph}")
     try:
-        for i in range(e_phnum):
+        for i in range(n_ph):
             off = e_phoff + i * e_phentsize
             if is64:
                 p_type, p_flags, p_offset, _va, _pa, p_filesz = struct.unpack_from(
@@ -133,8 +161,11 @@ def parse(data: bytes) -> ElfInfo:
     # --- section headers (names, symtab/stripped, comment, dynsym, dynamic) ---
     sh = []
     shstr = b""
+    n_sh = _fits(data, e_shoff, e_shentsize, e_shnum)
+    if n_sh < e_shnum:
+        info.errors.append(f"e_shnum={e_shnum} exceeds file; parsing {n_sh}")
     try:
-        for i in range(e_shnum):
+        for i in range(n_sh):
             off = e_shoff + i * e_shentsize
             if is64:
                 (sh_name, sh_type, sh_flags, sh_addr, sh_offset, sh_size, sh_link,
@@ -152,10 +183,16 @@ def parse(data: bytes) -> ElfInfo:
         info.errors.append(f"shdrs: {e!r}")
 
     def _name(off: int) -> str:
+        if not 0 <= off < len(shstr):
+            return ""
         end = shstr.find(b"\x00", off)
-        return shstr[off:end].decode("utf-8", "replace") if off < len(shstr) else ""
+        if end < 0:                              # unterminated: run to the end, don't drop a byte
+            end = len(shstr)
+        return shstr[off:end].decode("utf-8", "replace")
 
     by_name: dict[str, dict] = {}
+    ent_scanned = 0
+    ent_budget = _MAX_ENTROPY_BYTES
     try:
         for s in sh:
             nm = _name(s["name_off"])
@@ -165,9 +202,13 @@ def parse(data: bytes) -> ElfInfo:
                              ("w" if s["flags"] & SHF_WRITE else "-"),
                              ("x" if s["flags"] & SHF_EXEC else "-")])
             ent = None
-            if s["type"] == SHT_PROGBITS and s["size"]:
-                blob = data[s["offset"]:s["offset"] + min(s["size"], 2 << 20)]
+            if (s["type"] == SHT_PROGBITS and s["size"]
+                    and ent_scanned < _MAX_ENTROPY_SECTIONS and ent_budget > 0):
+                take = min(s["size"], 2 << 20, ent_budget)
+                blob = data[s["offset"]:s["offset"] + take]
                 ent = _entropy(blob)
+                ent_scanned += 1
+                ent_budget -= len(blob)
             info.sections.append({"name": nm, "size": s["size"], "perms": perms,
                                   "entropy": ent})
     except Exception as e:
@@ -225,8 +266,10 @@ def parse(data: bytes) -> ElfInfo:
             blob = data[ds["offset"]:ds["offset"] + ds["size"]]
             libs = []
             for no in needed_offs:
-                end = blob.find(b"\x00", no)
                 if 0 <= no < len(blob):
+                    end = blob.find(b"\x00", no)
+                    if end < 0:                  # unterminated: take the whole remaining span
+                        end = len(blob)
                     libs.append(blob[no:end].decode("utf-8", "replace"))
             info.imports["libraries"] = libs
     except Exception as e:
@@ -237,9 +280,18 @@ def parse(data: bytes) -> ElfInfo:
     try:
         dsym = by_name.get(".dynsym")
         dstr = by_name.get(".dynstr")
-        if dsym and dstr and dsym["entsize"]:
+        _symsize = 24 if is64 else 16            # sizeof(Elf64_Sym) / sizeof(Elf32_Sym)
+        if dsym and dstr and dsym["entsize"] >= _symsize:
             strblob = data[dstr["offset"]:dstr["offset"] + dstr["size"]]
             count = dsym["size"] // dsym["entsize"]
+            # A hostile header can claim a huge sh_size with a tiny entsize, turning this into
+            # an O(file) loop that scans the whole string blob each pass. Cap to what the file
+            # can actually hold, so the work is bounded by the real bytes present.
+            fits = max(0, (len(data) - dsym["offset"]) // dsym["entsize"])
+            if count > fits:
+                info.errors.append(
+                    f".dynsym claims {count} symbols; file holds at most {fits}")
+                count = fits
             imported = 0
             imp_names: set[str] = set()
             exp_names: set[str] = set()
@@ -251,9 +303,13 @@ def parse(data: bytes) -> ElfInfo:
                 else:
                     st_name, _val, _sz, st_info, _o, st_shndx = struct.unpack_from(
                         endc + "IIIBBH", data, o)
-                end = strblob.find(b"\x00", st_name)
-                nm = (strblob[st_name:end].decode("utf-8", "replace")
-                      if st_name < len(strblob) else "")
+                if st_name < len(strblob):
+                    end = strblob.find(b"\x00", st_name)
+                    if end < 0:                  # unterminated: take the whole remaining span
+                        end = len(strblob)
+                    nm = strblob[st_name:end].decode("utf-8", "replace")
+                else:
+                    nm = ""
                 sttype = st_info & 0xF
                 st_bind = st_info >> 4
                 if st_shndx == 0 and nm:              # undefined => imported

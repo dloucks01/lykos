@@ -25,14 +25,26 @@ stdout: per input: i32 rc, u32 stdout_len, u32 stderr_len, u8 flags, u32 n_new,
 """
 import ctypes
 import os
+import signal
 import struct
 import subprocess
 import sys
+import time
 
 PTRACE_TRACEME, PTRACE_PEEKTEXT, PTRACE_POKETEXT = 0, 1, 4
 PTRACE_CONT, PTRACE_KILL, PTRACE_GETREGS = 7, 8, 12
 _INT3 = 0xCC
+# Signals whose default action is a core-dumping fault -- the only ones that mean "crash". A
+# non-fault signal the program does not catch (SIGALRM, SIGTERM, SIGPIPE, SIGCHLD, SIGWINCH...)
+# is ordinary termination or is ignored, never a bug. Matches sandbox.CRASH_SIGNALS.
+_CRASH_SIGS = {int(signal.SIGSEGV), int(signal.SIGABRT), int(signal.SIGBUS),
+               int(signal.SIGILL), int(signal.SIGFPE)}
 _SPAN_CAP = 32 << 20            # refuse to slurp a span so wide it is cheaper per block
+# A handled fault signal (SIGSEGV caught by a JIT/GC, a guard page re-faulted) is forwarded and
+# the program runs on. A program that re-faults in a tight loop would forward one forever, and
+# the per-input deadline alone does not stop it because each stop is ready immediately and the
+# wait loop that checks the clock never runs. Cap how many we forward, then treat it as a hang.
+_MAX_DELIVER = 4096
 
 
 def _readn(n):
@@ -183,6 +195,17 @@ def _trace_one(libc, argv, stdin_data, timeout, blocks, exe, plan=None):
     pid = os.fork()
     if pid == 0:                                        # child
         try:
+            try:
+                import resource
+                # Bound each input's memory and disk writes. The batch path runs native targets
+                # directly, so per-exec RLIMIT_AS is the only place a memory bomb is capped
+                # (the shared runner cannot set it without capping itself).
+                lim = 4096 << 20
+                resource.setrlimit(resource.RLIMIT_AS, (lim, lim))
+                resource.setrlimit(resource.RLIMIT_FSIZE, (64 << 20, 64 << 20))
+                resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+            except Exception:
+                pass
             libc.ptrace(PTRACE_TRACEME, 0, 0, 0)
             os.dup2(r_in, 0); os.dup2(w_out, 1); os.dup2(w_err, 2)
             for fd in (r_out, w_out, r_err, w_err, r_in, w_in):
@@ -209,17 +232,48 @@ def _trace_one(libc, argv, stdin_data, timeout, blocks, exe, plan=None):
 
     reached, regs = [], _Regs()
     deadline = _now() + timeout
-    rc, flags, deliver, fault_pc = 0, 0, 0, 0
+    rc, flags, deliver, fault_pc, delivered = 0, 0, 0, 0, 0
+
+    def _kill_reap():
+        try:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+        except (ChildProcessError, ProcessLookupError, OSError):
+            pass
+    # Drain stdout/stderr WHILE the tracee runs. If we only read after it finished, a target
+    # that writes more than one pipe buffer (~64 KB) would block in write(), never reach the
+    # next trap, and be killed at the deadline -- a normal verbose run misreported as a hang.
+    os.set_blocking(r_out, False); os.set_blocking(r_err, False)
+    out_buf, err_buf = bytearray(), bytearray()
+
+    def _pump(cap=4096):
+        for fd, buf in ((r_out, out_buf), (r_err, err_buf)):
+            try:
+                c = os.read(fd, 65536)
+            except (BlockingIOError, OSError):
+                continue
+            if c and len(buf) < cap:
+                buf += c[:cap - len(buf)]          # keep a bounded prefix; discard the rest
+
     while True:
+        # Enforce the per-input deadline on EVERY iteration, not only while waiting. A tracee
+        # that produces back-to-back stops (a handler that re-faults, a flood of coverage traps)
+        # keeps `waitpid(WNOHANG)` returning immediately, so the inner wait loop -- the only
+        # place the old code checked the clock -- never runs, and one input could spin forever.
+        if _now() >= deadline:
+            _kill_reap()                          # reliable, unlike deprecated PTRACE_KILL
+            flags = 1
+            break
         libc.ptrace(PTRACE_CONT, pid, 0, ctypes.c_void_p(deliver))
         deliver = 0
         try:
             _wpid, status = os.waitpid(pid, os.WNOHANG)
             while _wpid == 0 and _now() < deadline:
+                _pump()
+                time.sleep(0.0005)                # don't spin a core between traps
                 _wpid, status = os.waitpid(pid, os.WNOHANG)
             if _wpid == 0:
-                libc.ptrace(PTRACE_KILL, pid, 0, 0)
-                os.waitpid(pid, 0)
+                _kill_reap()
                 flags = 1
                 break
         except ChildProcessError:
@@ -237,8 +291,19 @@ def _trace_one(libc, argv, stdin_data, timeout, blocks, exe, plan=None):
             # catches SIGSEGV and recovers as crashed -- the same input then had two different
             # verdicts depending on whether block coverage happened to be switched on.
             # Anything using SIGSEGV deliberately (a JIT, a guard page, lazy mapping) would
-            # have produced a finding and a PoC for a bug that is not there.
-            if _handles(pid, sig):
+            # have produced a finding and a PoC for a bug that is not there. A non-fault signal
+            # the program does not catch (SIGALRM, SIGTERM, SIGPIPE, SIGCHLD, SIGWINCH...) is
+            # ordinary termination or is ignored -- deliver it and let the program's default
+            # action stand, rather than killing here and inventing a fault_pc for a non-bug.
+            if _handles(pid, sig) or sig not in _CRASH_SIGS:
+                delivered += 1
+                if delivered > _MAX_DELIVER:
+                    # A program re-raising a handled signal without end -- kill it and mark it a
+                    # hang rather than forward signal number 4097. This is the one path that
+                    # defeats the deadline when each stop is ready the instant we continue.
+                    _kill_reap()
+                    flags = 1
+                    break
                 deliver = sig                           # let the program have it, and see
                 continue
             # Where it faulted, which is what tells two bugs apart. Bucketing crashes by
@@ -247,7 +312,7 @@ def _trace_one(libc, argv, stdin_data, timeout, blocks, exe, plan=None):
             if libc.ptrace(PTRACE_GETREGS, pid, 0, ctypes.byref(regs)) == 0:
                 fault_pc = regs.rip - base
             rc = -sig                                   # fatal: report it, and do not deliver,
-            libc.ptrace(PTRACE_KILL, pid, 0, 0)         # so no core dump handler runs
+            os.kill(pid, signal.SIGKILL)                # so no core dump handler runs
             try:
                 os.waitpid(pid, 0)
             except ChildProcessError:
@@ -268,29 +333,18 @@ def _trace_one(libc, argv, stdin_data, timeout, blocks, exe, plan=None):
             os.close(mem)
         except OSError:
             pass
-    out = _drain(r_out); err = _drain(r_err)
+    _pump()                                             # anything written just before it stopped
+    out, err = bytes(out_buf), bytes(err_buf)
+    for fd in (r_out, r_err):
+        try:
+            os.close(fd)
+        except OSError:
+            pass
     return rc, out, err, flags, reached, fault_pc
 
 
 def _now():
-    import time
     return time.time()
-
-
-def _drain(fd, cap=4096):
-    os.set_blocking(fd, False)
-    data = b""
-    try:
-        while len(data) < cap:
-            c = os.read(fd, cap - len(data))
-            if not c:
-                break
-            data += c
-    except (BlockingIOError, OSError):
-        pass
-    finally:
-        os.close(fd)
-    return data
 
 
 def main():

@@ -13,6 +13,8 @@ fsize limits + process-group kill + wall-clock). Whole-system detonation under a
 """
 from __future__ import annotations
 
+import errno
+import fcntl
 import os
 import shutil
 import socket
@@ -67,9 +69,30 @@ def _connect_retry(sock, addr, deadline):
 def _deliver(family, key, payload, readiness):
     end = time.time() + readiness
     if family == "fifo":
-        # opening the write end blocks until the consumer opens the read end -- natural sync
-        fd = os.open(key, os.O_WRONLY)
+        # Open the write end NON-BLOCKING with a bounded retry against the readiness deadline.
+        # A blocking O_WRONLY open on a FIFO hangs until a reader appears -- and when the
+        # consumer never opens the read end (it crashed/failed at startup) that open never
+        # returns, wedging this delivery. Under the one-shot channel_run each such delivery is
+        # a daemon thread, so a campaign leaked one stuck thread (and fd) PER execution.
+        # O_NONBLOCK makes the open return ENXIO instead of blocking when there is no reader
+        # yet; we retry until one appears or the window closes, which is the same rendezvous
+        # the blocking open used to give, minus the unbounded hang.
+        fd = None
+        while True:
+            try:
+                fd = os.open(key, os.O_WRONLY | os.O_NONBLOCK)
+                break
+            except OSError as e:
+                if e.errno != errno.ENXIO:
+                    raise
+                if time.time() >= end:
+                    return                             # no reader opened the fifo in time
+                time.sleep(0.02)
         try:
+            # switch back to blocking for the write, so a large payload is delivered whole
+            # rather than risking EAGAIN on a full pipe buffer
+            flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+            fcntl.fcntl(fd, fcntl.F_SETFL, flags & ~os.O_NONBLOCK)
             os.write(fd, payload)
         finally:
             os.close(fd)
@@ -158,11 +181,17 @@ def _launch_cmd(exe, arch, argv, host=None, trace_log=None):
 
 
 def _classify(jvm, rc, out, err):
-    """(crashed, signal, signal_name, exit_code, fault_pc, detail) from one finished run."""
-    sig = -rc if rc is not None and rc < 0 else (rc - 128 if rc and rc > 128 else None)
-    exit_code = None if sig else rc
-    crashed = sig in sandbox.CRASH_SIGNALS if sig else False
-    signame = sandbox.CRASH_SIGNALS.get(sig) if sig else None
+    """(crashed, signal, signal_name, exit_code, fault_pc, detail) from one finished run.
+
+    Signal classification goes through the shared `sandbox.classify_rc` so the one-shot and
+    session paths cannot disagree (they used to: this function synthesised a signal from ANY
+    positive returncode without the CRASH_SIGNALS filter `channel_run` applied, so a target
+    that merely exits with a status like 139 or 200 was recorded as a crash and, worse, lost
+    its exit code). A NEGATIVE returncode is -signum; a positive one is a signal only in the
+    128+signum wrapper form AND only when that signum is a real crash signal; every other
+    positive value is a plain exit status, never a fabricated crash.
+    """
+    crashed, sig, signame, exit_code = sandbox.classify_rc(rc)
     fault_pc = detail = None
     if jvm and not crashed:
         kind, why, frames = sandbox.jvm_exception(err or b"", exit_code, out or b"")
@@ -214,6 +243,13 @@ class ChannelSession:
         if err:
             self.error = err
             return False
+        # Only an emulator writes the exec log. A native or JVM launch never will, so drop the
+        # trace here: _new_blocks then reports None ("no coverage available") instead of ()
+        # ("reached nothing"), which is what lets the campaign fall back to behaviour novelty.
+        emu = not (jvm or (cmd and cmd[0] == str(self.exe)))
+        if not emu and self._tdir:
+            shutil.rmtree(self._tdir, ignore_errors=True)
+            self._tdir = self._trace_log = None
         preexec = sandbox._rlimits(self.mem_mb, int(self.readiness) + 30, set_as=False)
         self.proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -267,7 +303,7 @@ class ChannelSession:
                 data = fh.read()
                 self._log_pos = fh.tell()
         except OSError:
-            return ()
+            return None                     # log unreadable -> no coverage, not "reached nothing"
         want = set(self.blocks)
         return tuple(sorted({int(m.group(1), 16)
                              for m in sandbox._TRACE_PC.finditer(data)} & want))
@@ -351,6 +387,8 @@ def channel_run(exe, family, key, payload: bytes, *, timeout: float = 5.0,
     except Exception as e:
         if made_fifo:
             _rm(made_fifo)
+        if tdir:
+            shutil.rmtree(tdir, ignore_errors=True)
         return RunResult(isolation="rlimits-only(channel)",
                          note=f"spawn failed: {e!r}")
 
@@ -381,19 +419,13 @@ def channel_run(exe, family, key, payload: bytes, *, timeout: float = 5.0,
     if made_fifo:
         _rm(made_fifo)
 
-    sig = exit_code = None
-    if rc is not None:
-        if rc < 0:
-            sig = -rc
-        elif rc > 128 and (rc - 128) in sandbox.CRASH_SIGNALS:
-            sig = rc - 128
-        else:
-            exit_code = rc
+    # Shared with the session path via sandbox.classify_rc: a negative returncode is -signum,
+    # a positive one is a signal only in the 128+signum wrapper form for an actual crash
+    # signal, and any other positive value stays an exit code (never a fabricated crash).
+    crashed, sig, signame, exit_code = sandbox.classify_rc(rc)
     note = f"channel={family}:{key}"
     if derr[0]:
         note += f"; deliver={derr[0]}"
-    crashed = sig in sandbox.CRASH_SIGNALS if sig else False
-    signame = sandbox.CRASH_SIGNALS.get(sig) if sig else None
     fault_pc = None
     if jvm and not crashed:
         # A Java program does not segfault, it throws -- so the wait status says nothing and
@@ -404,13 +436,18 @@ def channel_run(exe, family, key, payload: bytes, *, timeout: float = 5.0,
             fault_pc = sandbox.jvm_site(frames)
             note += f"; {detail}"
     blocks_hit = None
-    if trace_log:
+    # Only an emulator writes the exec log; a native or JVM launch (emu is None) never
+    # produces one, so `blocks_hit` must stay None -- "no coverage available" -- rather than
+    # become () -- "reached nothing" -- which would make every native payload look
+    # uninteresting and stop the campaign falling back to behaviour novelty (see stage.py).
+    if trace_log and emu:
         reached, last = sandbox._qemu_reached(trace_log, blocks, want_last=True)
         blocks_hit = tuple(reached)
         # An emulated listener has no ptrace tracer either, so the last block qemu translated
         # is the only fault locus available -- the same bargain sandbox.run makes.
         if crashed and fault_pc is None:
             fault_pc = last
+    if tdir:
         shutil.rmtree(tdir, ignore_errors=True)
     return RunResult(
         isolation="rlimits-only(channel)" + ("+jvm" if jvm else ""),

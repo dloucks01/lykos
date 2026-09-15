@@ -516,22 +516,6 @@ def _run(ir, abi, callmap, dstmap, func_addrs, entry_params, ret_tainted, *, ove
                     if _slot is not None:
                         cur.add(("stack", _slot[0], _slot[1]))
                         break
-            # ...and, for the ones that fill a CALLER-SUPPLIED BUFFER, the buffer itself.
-            # `read(fd, buf, n)` returns a byte count; the untrusted data is in `buf`, and
-            # tainting only the return register modelled getchar() correctly and every
-            # file-reading parser not at all. `aliases` already resolves an argument register
-            # to the frame slot it points at, which is exactly what is needed here.
-            import os as _os
-            if _os.environ.get("LYKOS_TAINT_DEBUG"):
-                print("SRC", ext, "regaliases:",
-                      {k[1]: v for k, v in aliases.items() if k[0]=="reg"})
-            _bi = OUT_PARAM_SOURCES.get(ext)
-            if _bi is not None and argregs_list and _bi < len(argregs_list):
-                for _r in argregs_list[_bi]:
-                    _slot = aliases.get(("reg", _r))
-                    if _slot is not None:
-                        cur.add(("stack", _slot[0], _slot[1]))
-                        break
         if internal:
             if tainted_params:
                 contribs[dst] = contribs.get(dst, set()) | tainted_params

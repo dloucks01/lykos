@@ -372,3 +372,37 @@ def test_confirmed_stage_reproduces_a_crash_via_fuzzing():
     assert not by["nullderef_safe"].flagged              # safe variant -> no confirmed crash
     assert rep.metrics["per_cwe"]["CWE-476"]["recall"] == 1.0
     assert rep.metrics["per_cwe"]["CWE-476"]["fp_rate"] == 0.0
+
+
+# ---------------------------------------------------------------- gate: exact-metric ratchet
+def test_gate_ratchets_on_exact_recall_not_rounded_display():
+    # 2499/2500 recall = 0.9996, which rounds to 1.000 -- but the ratchet must see the true
+    # value and FAIL a min-recall of 1.0 (a sub-0.05% regression must not slip through).
+    m = {"overall": {"tp": 2499, "fp": 0, "fn": 1, "tn": 10,
+                     "recall": round(2499 / 2500, 3), "fp_rate": 0.0}}
+    ok, verdict, _ = gate(m, {"ghidra": "/x"})
+    assert not ok and verdict == "FAIL"
+
+
+def test_gate_ratchets_on_exact_fp_rate_not_rounded_display():
+    # 1 FP in 3001 negatives = 0.00033, which rounds to 0.0 -- a real false positive must not
+    # pass a 0.0 ceiling.
+    m = {"overall": {"tp": 10, "fp": 1, "fn": 0, "tn": 3000,
+                     "recall": 1.0, "fp_rate": round(1 / 3001, 3)}}
+    assert gate(m, {"ghidra": "/x"})[0] is False
+
+
+def test_gate_min_negative_guards_vacuous_precision():
+    # no good cases -> fp_rate None -> precision axis passes vacuously unless min_negative set
+    m = {"overall": {"tp": 4, "fp": 0, "fn": 0, "tn": 0, "recall": 1.0, "fp_rate": None}}
+    assert gate(m, {"ghidra": "/x"})[0] is True                    # off by default
+    ok, verdict, reason = gate(m, {"ghidra": "/x"}, min_negative=1)
+    assert not ok and verdict == "FAIL" and "negative" in reason
+
+
+def test_gate_dynamic_skips_without_a_compiler():
+    m = {"overall": {"tp": 0, "fp": 0, "fn": 4, "tn": 0, "recall": 0.0, "fp_rate": None}}
+    ok, verdict, _ = gate(m, {"gcc": False}, stage="dynamic")
+    assert ok and verdict == "SKIP"                               # mirrors the static Ghidra SKIP
+    assert gate(m, {"gcc": False}, stage="dynamic", require_backend=True)[1] == "FAIL"
+    assert gate(m, {"gcc": True}, stage="dynamic")[1] == "FAIL"   # compiler present -> real miss

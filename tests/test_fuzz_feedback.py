@@ -181,3 +181,66 @@ def test_the_fuzz_stage_honours_the_operator_argv():
     for used in ("base_argv=run_argv", 'kw["base_argv"] = run_argv',
                  "argv = list(run_argv)"):
         assert used in camp, used
+
+
+def test_coverage_novelty_falls_back_when_blocks_are_armed_but_never_reported():
+    """If blocks were recovered and armed but the runner reports no coverage for any input
+    (ptrace refused in this sandbox, a runner that cannot answer), block-only novelty is dead
+    and the corpus would freeze forever. The campaign latches whether coverage ever answered
+    and falls back to behaviour novelty when it never did -- and says so, rather than reporting
+    a silently frozen 'no crashes' campaign."""
+    import inspect
+
+    from lykos.analyze.fuzz import stage as fz
+    camp = inspect.getsource(fz.fuzz_campaign)
+    assert "cover_reported" in camp, "must latch whether coverage ever answered"
+    assert "if all_blocks and cover_reported:" in camp, "trust blocks only once they answer"
+    assert "novel = b not in seen_behaviour" in camp, "otherwise fall back to behaviour novelty"
+    assert "coverage_unavailable" in camp, "armed-but-silent coverage must be surfaced"
+    assert '"coverage":' in camp, "stats distinguish live / unavailable / none"
+
+
+def test_minimize_reproduces_under_the_same_invocation_it_was_found_with():
+    """A crash behind an option (jhead's `-cmd`) does not reproduce without it. The confirm
+    step already re-ran with the flag prefix, but the minimizer predicate did not -- so a
+    flag-triggered crash minimized against an invocation that never crashes, reducing nothing
+    or, worse, to a non-crashing input. The predicate now carries the same run_argv."""
+    import inspect
+
+    from lykos.analyze.fuzz import stage as fz
+    camp = inspect.getsource(fz.fuzz_campaign)
+    assert "def _same(d, _sig=sig, _prefix=run_argv):" in camp
+    assert 'kw["base_argv"] = _prefix' in camp
+
+
+def test_starved_means_never_entered_not_merely_slow():
+    """`starved` must catch the campaign that ran plenty but never got past the gate -- 8,000
+    executions, one behaviour -- and the one whose coverage was armed and reached nothing, not
+    only the one that barely ran. Reaching any block, more than one behaviour, or a crash all
+    clear it, so a slow-but-productive campaign is never falsely flagged."""
+    import inspect
+
+    from lykos.analyze.fuzz import stage as fz
+    camp = inspect.getsource(fz.fuzz_campaign)
+    # the original slow-but-not-starved guard is preserved
+    assert "did_work = crashes > 0 or len(seen_behaviour) > 1" in camp
+    assert "execs < 200 and rate < 20 and not did_work" in camp
+    # ...and the new not-entered triggers are added
+    assert "entered = did_work or len(seen_blocks) > 0" in camp
+    assert "execs >= 200 and not entered" in camp
+    assert "coverage_dead and not did_work" in camp
+
+
+def test_only_reproducible_crashes_count_and_stop_the_channel_sweep():
+    """A target that rewrites its own input produces crashes that never reproduce. Counting
+    those in the headline and letting them halt the channel sweep reported `crashes > 0,
+    unique: 0` and stopped probing the channel that actually carries the bug. The reproducible
+    count is tracked separately and drives both the report and the early break."""
+    import inspect
+
+    from lykos.analyze.fuzz import stage as fz
+    camp = inspect.getsource(fz.fuzz_campaign)
+    assert "crashes_reproducible += 1" in camp
+    assert '"crashes_reproducible": crashes_reproducible' in camp
+    stg = inspect.getsource(fz.fuzz_stage)
+    assert 'if st.get("crashes_reproducible"):' in stg, "early break gates on reproducible"

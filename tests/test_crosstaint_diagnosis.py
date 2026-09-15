@@ -20,7 +20,8 @@ from lykos.analyze.link.crosstaint import _why_nothing
 
 def _why(**over):
     base = {"no_components": False, "no_links": False, "edges_without_tainted_symbol": 0,
-            "edges_with_clean_callee": 0, "callers_without_ir": 0, "components_over_cap": 0}
+            "edges_with_clean_callee": 0, "callers_without_ir": 0, "callees_without_ir": 0,
+            "components_over_cap": 0}
     base.update(over)
     return base
 
@@ -62,6 +63,27 @@ def test_an_undecompiled_caller_names_the_stage_that_fixes_it():
     assert "firmware" in msg, "carved firmware is the common cause and is worth naming"
     assert "has not been" in msg
     assert "have" in _why_nothing(_why(callers_without_ir=2), 0)
+
+
+def test_an_undecompiled_callee_is_not_reported_as_a_real_negative():
+    """The bug this text exists for, on the far side of the boundary: a callee with no IR was
+    never searched for a sink, so 'no sink reached' is a MISSING analysis, not a clean callee.
+    Reporting it as a real negative is a false all-clear about code that was never examined."""
+    msg = _why_nothing(_why(callees_without_ir=1), 0)
+    assert "not been decompiled" in msg
+    assert "missing analysis" in msg and "not a real" in msg
+    assert "disassemble" in msg
+    assert "have" in _why_nothing(_why(callees_without_ir=2), 0)
+
+
+def test_an_undecompiled_callee_outranks_a_clean_callee():
+    """Both true at once: some callees were examined and were fine, another was never
+    decompiled. The un-examined one must win, or 'we did not look' becomes 'we looked and it
+    was fine'."""
+    msg = _why_nothing(_why(callees_without_ir=1, edges_with_clean_callee=5), 0)
+    assert "not been decompiled" in msg and "missing analysis" in msg
+    # the clean-callee message (the real-negative one) must NOT be what is returned
+    assert "does not carry it into a dangerous sink" not in msg
 
 
 def test_a_boundary_with_no_tainted_argument_is_described_as_such():

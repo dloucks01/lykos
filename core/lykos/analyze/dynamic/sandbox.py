@@ -50,9 +50,55 @@ _bwrap_cache: Optional[bool] = None
 # /proc/<pid>/cmdline and, for anything running as the same user, /proc/<pid>/environ. With
 # the namespace it sees four, and the tracer is unaffected because a pid namespace is exactly
 # the scope ptrace and /proc/<pid>/mem already work in.
+#
+# `--ro-bind / /` gives the target the shared libraries and loader it needs -- and, since the
+# platform itself commonly runs from a user's home (a venv interpreter, the lykos package, the
+# batch-runner script, the analyst's target and its input files all live under /home), the root
+# bind stays whole so those keep working. What must NOT leak is host SECRETS: a bare read-only
+# root also hands hostile code READ access to ~/.ssh, ~/.aws, /root and the lykos case store
+# (other targets' extracted secrets), and a target's stdout/stderr is captured and persisted as
+# an artifact, so "read a secret and print it" is a real exfil path even with no network. Those
+# specific locations are masked with an empty tmpfs by `_secret_mask_args()`, injected right
+# after this bind by every command builder below -- not a blanket /home mask, which would hide
+# the platform's own interpreter and code.
 _BWRAP_ARGS = ["--ro-bind", "/", "/", "--unshare-pid", "--proc", "/proc",
                "--tmpfs", "/tmp", "--dev", "/dev",
                "--unshare-net", "--die-with-parent", "--chdir", "/tmp", "--"]
+
+# Directories registered at runtime (the case store) to mask in every sandbox. The target is
+# copied OUT of the store before it runs, so masking the store never denies it anything it needs.
+_EXTRA_PROTECTED: set = set()
+# Well-known credential/secret directories under the invoking user's home. A denylist, so it can
+# miss an unusual location -- but the alternative (masking all of /home) breaks a platform that
+# runs from there, and general home files are exposed read-only regardless of this.
+_SECRET_DOTFILES = (".ssh", ".aws", ".gnupg", ".config/gcloud", ".config/gh", ".kube",
+                    ".docker", ".azure", ".netrc", ".git-credentials", ".password-store",
+                    ".mozilla", ".thunderbird", ".pki", ".cargo/credentials")
+
+
+def protect_dir(path) -> None:
+    """Register a directory (e.g. the case store) to be masked with an empty tmpfs inside every
+    sandbox, so hostile code cannot read it through the read-only root."""
+    try:
+        if path:
+            _EXTRA_PROTECTED.add(str(Path(path).resolve()))
+    except Exception:
+        pass
+
+
+def _secret_mask_args() -> list:
+    """`--tmpfs` masks for host secrets the read-only root would otherwise expose: /root, the
+    invoking user's credential dotfiles, and every dir registered with protect_dir()."""
+    home = os.path.expanduser("~")
+    dirs = ["/root"] + [os.path.join(home, n) for n in _SECRET_DOTFILES] + sorted(_EXTRA_PROTECTED)
+    out = []
+    for d in dirs:
+        try:
+            if os.path.isdir(d):
+                out += ["--tmpfs", d]
+        except OSError:
+            pass
+    return out
 
 
 @dataclass
@@ -173,7 +219,8 @@ def run_batch(exe, payloads, *, mode="stdin", base_argv=(), timeout: float = 2.0
     runner = _batch_runner_path()
     inner = [py, runner, mode, str(timeout), str(exe),
              *[argv_bytes(a).decode("latin-1") for a in base_argv]]
-    cmd = (["bwrap"] + _BWRAP_ARGS[:-1] + ["--ro-bind", exedir, exedir, "--"] + inner)
+    cmd = (["bwrap"] + _BWRAP_ARGS[:-1] + _secret_mask_args()
+           + ["--ro-bind", exedir, exedir, "--"] + inner)
     blocks = list(blocks)
     blob = bytearray(struct.pack("<II", len(payloads), len(blocks)))
     if blocks:
@@ -185,7 +232,7 @@ def run_batch(exe, payloads, *, mode="stdin", base_argv=(), timeout: float = 2.0
     rc, out, err, timed, _dur = _spawn(cmd, bytes(blob), budget,
                                        _rlimits(mem_mb, int(budget) + 5, set_as=False,
                                                 nproc=_nproc_cap(False)))
-    if timed or rc != 0 or err.startswith(b"bwrap:"):
+    if timed or rc != 0 or (err.startswith(b"bwrap:") and not _bwrap_probe_fresh()):
         return None
     per_ms = int((time.time() - t0) * 1000 / max(1, len(payloads)))
     results, off = [], 0
@@ -316,6 +363,67 @@ def _killpg(p):
             p.kill()
         except Exception:
             pass
+
+
+def _bwrap_probe_fresh() -> bool:
+    """Run a trusted /bin/true under the real bwrap args, ignoring the cache. Lets a genuine
+    namespace-setup failure be told apart from a target that merely printed 'bwrap:' on its own
+    stderr to trick us into stripping its sandbox."""
+    try:
+        r = subprocess.run(["bwrap"] + _BWRAP_ARGS + ["/bin/true"],
+                           capture_output=True, timeout=5)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def isolate_prefix(exedir: str, *, net: bool, ro_binds=(), rw_binds=()) -> list:
+    """bwrap argv prefix that contains a target for the debug/PoC paths that spawn it directly
+    (the gdb stub, the native gdb tools, the leak harness). Read-only root (with /home and /root
+    masked), tmpfs /tmp, pid namespace and die-with-parent, plus the target's own directory
+    bound read-only so a target staged under the tmpfs'd /tmp stays visible. `net=True` KEEPS
+    the network namespace so a loopback gdb control channel still connects; `net=False` unshares
+    it (strictly more isolation, and exactly the config `_bwrap_usable` probes -- use it for any
+    path that does not need loopback).
+
+    `ro_binds` / `rw_binds` are extra directories to re-expose over the tmpfs masks -- a native
+    gdb tool binds the read-only dir holding its script and input file; a tracer that writes a
+    log binds that dir writable. They come AFTER the exedir bind, so a later rw bind wins over an
+    earlier ro bind of the same path (bwrap is last-wins).
+
+    Returns [] when bwrap is unusable, so the caller runs unwrapped (rlimits still apply)."""
+    if not _bwrap_usable():
+        return []
+    args = [a for a in _BWRAP_ARGS[:-1] if not (net and a == "--unshare-net")]
+    cmd = ["bwrap"] + args + _secret_mask_args() + ["--ro-bind", exedir, exedir]
+    for d in ro_binds:
+        cmd += ["--ro-bind", str(d), str(d)]
+    for d in rw_binds:
+        cmd += ["--bind", str(d), str(d)]
+    return cmd + ["--"]
+
+
+def run_reaped(cmd, *, input=None, timeout=None, capture_output=False, **kw):
+    """subprocess.run, but the child gets its own session and, on timeout, the WHOLE process
+    group is killed before TimeoutExpired propagates -- so a launcher's children (wineserver, a
+    qemu worker, a gdb inferior) cannot outlive the trace and keep running on the host. Callers
+    catch TimeoutExpired exactly as with subprocess.run."""
+    if capture_output:
+        kw["stdout"] = subprocess.PIPE
+        kw["stderr"] = subprocess.PIPE
+    kw.setdefault("start_new_session", True)
+    stdin = subprocess.PIPE if input is not None else kw.pop("stdin", None)
+    proc = subprocess.Popen(cmd, stdin=stdin, **kw)
+    try:
+        out, err = proc.communicate(input=input, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _killpg(proc)
+        try:
+            proc.communicate(timeout=5)
+        except Exception:
+            pass
+        raise
+    return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
 
 
 def _spawn(cmd, stdin, timeout, preexec, env=None):
@@ -535,13 +643,14 @@ def _run_java(exe, *, argv, stdin, timeout, mem_mb, capture, main_class=None) ->
     run = cmd
     if _bwrap_usable():
         exedir = str(exe.resolve().parent)
-        run = ["bwrap"] + _BWRAP_ARGS[:-1] + ["--ro-bind", exedir, exedir] + ["--"] + cmd
+        run = (["bwrap"] + _BWRAP_ARGS[:-1] + _secret_mask_args()
+               + ["--ro-bind", exedir, exedir] + ["--"] + cmd)
         iso = "bwrap+netns+jvm"
     rc, out, err, timed, dur = _spawn(run, stdin, eff_timeout, preexec)
-    if iso.startswith("bwrap") and not timed and err.startswith(b"bwrap:"):
-        # namespace creation is rate-limited on some VMs: drop to rlimits-only for the session
-        global _bwrap_cache
-        _bwrap_cache = False
+    if (iso.startswith("bwrap") and not timed and err.startswith(b"bwrap:")
+            and not _bwrap_probe_fresh()):
+        # A fresh /bin/true probe confirms bwrap genuinely cannot set up a namespace here (not
+        # the target spoofing "bwrap:" on stderr). Degrade to rlimits-only for THIS run only.
         rc, out, err, timed, dur = _spawn(cmd, stdin, eff_timeout, preexec)
         iso = "rlimits-only+jvm"
     kind, detail, frames = jvm_exception(err, rc, out)
@@ -609,6 +718,9 @@ def _run_windows(exe, *, argv, stdin, timeout, mem_mb, capture, wineprefix) -> R
     eff_timeout = max(timeout, 10.0)                   # wine bootstraps a wineserver -> headroom
     # wine + wineserver need many fds/threads and a large AS; don't cap AS, widen nproc.
     preexec = _rlimits(mem_mb, int(eff_timeout) + 5, set_as=False, nproc=_nproc_cap(True))
+    # NB: the wine path runs UNWRAPPED (rlimits only, like the original) -- wine needs a writable
+    # prefix under ~/.cache and its own service processes, so the bwrap secret-masking that
+    # hardens the ELF/JVM paths is deliberately not applied here.
     rc, out, err, timed, dur = _spawn(cmd, stdin, eff_timeout, preexec, env=env)
     code, name, detail = wine_exception(err or b"")
     crashed = code is not None
@@ -679,7 +791,7 @@ def run(exe, *, argv=(), stdin: bytes = b"", timeout: float = 10.0,
         # to the rlimits-only tier: no network namespace and no read-only root, precisely
         # where it matters most (running hostile code on the host CPU).
         exedir = str(Path(exe).resolve().parent)
-        extra = ["--ro-bind", exedir, exedir]
+        extra = _secret_mask_args() + ["--ro-bind", exedir, exedir]
         if trace_log:
             # qemu writes its block log to a FILE, and /tmp inside the sandbox is a private
             # tmpfs -- the log is created there and gone the moment the sandbox exits, which
@@ -694,9 +806,12 @@ def run(exe, *, argv=(), stdin: bytes = b"", timeout: float = 10.0,
 
     # bubblewrap setup failed at runtime (some VMs rate-limit namespace creation) -> fall
     # back to rlimits-only and stop trying bwrap this session.
-    if iso.startswith("bwrap") and not timed and err.startswith(b"bwrap:"):
-        global _bwrap_cache
-        _bwrap_cache = False
+    if (iso.startswith("bwrap") and not timed and err.startswith(b"bwrap:")
+            and not _bwrap_probe_fresh()):
+        # bwrap genuinely cannot create a namespace here (confirmed by re-probing with a trusted
+        # /bin/true -- so this is not the target spoofing "bwrap:" on its own stderr to strip its
+        # sandbox). Fall back to rlimits-only for THIS run only; do NOT disable bwrap for the
+        # rest of the session on the strength of one run's output.
         cmd, iso = inner, "rlimits-only" + ("+qemu" if emu else "")
         rc, out, err, timed, dur = _spawn(cmd, stdin, eff_timeout, preexec)
 

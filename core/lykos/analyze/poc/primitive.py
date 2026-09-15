@@ -17,7 +17,6 @@ native-architecture targets only.
 from __future__ import annotations
 
 import re
-import struct
 
 _ALPHA = b"abcdefghijklmnopqrstuvwxyz"
 # a canonical (< 2**47) sentinel address, so `ret` loads it and the fetch faults *at* it,
@@ -99,10 +98,6 @@ def cyclic_find(sub: bytes, length: int, n: int = 4) -> int:
     if len(sub) < n:
         return -1
     return cyclic(length, n).find(sub[:n])
-
-
-def _le4(value: int) -> bytes:
-    return struct.pack("<I", value & 0xFFFFFFFF)
 
 
 def _reg_window(value: int, word: int, endian: str, n: int = 4) -> bytes:
@@ -285,6 +280,14 @@ def marker_confirmed(cap: dict, word: int = 8, endian: str = "little") -> bool:
 # --------------------------------------------------------------------- L2 memory primitives
 # A second canonical sentinel for the *value* half of a write-what-where.
 MARKER_VALUE = 0x0B16B00B5157
+# 32-bit targets truncate a 48-bit sentinel, so the value half needs a 4-byte variant too --
+# otherwise a genuine write-what-where on i386/arm/mips could never confirm (the register can
+# never hold a 48-bit value). Reads as "b00b5157".
+MARKER_VALUE32 = 0xB00B5157
+
+
+def _value_marker(word: int) -> int:
+    return MARKER_VALUE if word >= 8 else MARKER_VALUE32
 
 # 32/16/8-bit register names -> their 64-bit container, so a disasm operand like `edx`
 # resolves to the `rdx` value the ptrace capture reports.
@@ -337,14 +340,17 @@ def parse_mem_access(disasm: str):
     return {"is_write": False, "base": _first_reg_in_brackets(src), "value": None}
 
 
-def analyze_memory_primitive(cap: dict, length: int, disasm, n: int = 4):
+def analyze_memory_primitive(cap: dict, length: int, disasm, n: int = 4,
+                             endian: str = "little", word: int = 8):
     """Classify an attacker-controlled memory access at the fault: write-what-where (address
     and stored value both controlled), controlled-write (address only), or controlled-read
     (arbitrary read address). Returns a primitive dict or None.
 
     The controlled address is read from the base register (not si_addr): a non-canonical
     controlled address raises #GP, for which the kernel reports si_addr as 0, so the register
-    value is the reliable signal."""
+    value is the reliable signal. `word`/`endian` describe the TARGET so the register bytes are
+    matched in the cyclic pattern in its width and byte order (a 32-bit target's address
+    register is 4 bytes, not 8)."""
     if not disasm:
         return None
     acc = parse_mem_access(disasm)
@@ -353,12 +359,12 @@ def analyze_memory_primitive(cap: dict, length: int, disasm, n: int = 4):
     regs = cap.get("regs") or {}
     if acc["base"] not in regs:
         return None
-    addr_off = cyclic_find(_le4(int(regs[acc["base"]])), length, n)
+    addr_off = cyclic_find(_reg_window(int(regs[acc["base"]]), word, endian, n), length, n)
     if addr_off == -1:                               # dereferenced address is not attacker data
         return None
     value_off = -1
     if acc["is_write"] and acc["value"] and acc["value"] in regs:
-        value_off = cyclic_find(_le4(int(regs[acc["value"]])), length, n)
+        value_off = cyclic_find(_reg_window(int(regs[acc["value"]]), word, endian, n), length, n)
     if acc["is_write"]:
         kind = "write-what-where" if value_off != -1 else "controlled-write"
     else:
@@ -369,25 +375,35 @@ def analyze_memory_primitive(cap: dict, length: int, disasm, n: int = 4):
             "fault_addr": cap.get("fault_addr"), "disasm": disasm}
 
 
-def two_marker_input(addr_offset: int, value_offset, length: int) -> bytes:
+def two_marker_input(addr_offset: int, value_offset, length: int,
+                     word: int = 8, endian: str = "little") -> bytes:
     """Place the address sentinel at `addr_offset` and (for write-what-where) the value
-    sentinel at `value_offset`, over cyclic filler, padded to `length`."""
+    sentinel at `value_offset`, over cyclic filler, padded to `length`. `word`/`endian` are the
+    TARGET's, so a 32-bit or big-endian target loads the bytes back as the sentinel value."""
     body = bytearray(cyclic(length))
-    body[addr_offset:addr_offset + 8] = struct.pack("<Q", MARKER)
+    addr_bytes = _marker_bytes(_ip_marker(word), word, endian)
+    body[addr_offset:addr_offset + word] = addr_bytes
     if value_offset is not None:
-        body[value_offset:value_offset + 8] = struct.pack("<Q", MARKER_VALUE)
+        val_bytes = _marker_bytes(_value_marker(word), word, endian)
+        body[value_offset:value_offset + word] = val_bytes
     return bytes(body[:length])
 
 
-def memory_primitive_confirmed(cap: dict, prim: dict):
+def memory_primitive_confirmed(cap: dict, prim: dict, word: int = 8, endian: str = "little"):
     """After re-running with `two_marker_input`, verify we steered the dereferenced address to
     the sentinel (WHERE control) and, for a write, the stored-value register to its sentinel
     (WHAT control). Returns (addr_ok, value_ok). The address is checked on the base register
-    (robust to non-canonical #GP where si_addr reads 0), falling back to si_addr."""
+    (robust to non-canonical #GP where si_addr reads 0), falling back to si_addr. Comparisons
+    are masked to the target's pointer width so a 32-bit register (which cannot hold a 48-bit
+    sentinel) confirms against the 32-bit sentinel rather than always failing."""
+    marker = _ip_marker(word)
+    vmarker = _value_marker(word)
+    mask = (1 << (word * 8)) - 1
     regs = cap.get("regs") or {}
-    addr_ok = (int(regs.get(prim.get("addr_reg"), -1)) == MARKER
-               or cap.get("fault_addr") == MARKER)
+    fault = cap.get("fault_addr")
+    addr_ok = ((int(regs.get(prim.get("addr_reg"), -1)) & mask) == (marker & mask)
+               or (fault is not None and (int(fault) & mask) == (marker & mask)))
     value_ok = True
     if prim.get("value_offset") is not None and prim.get("value_reg"):
-        value_ok = int(regs.get(prim["value_reg"], 0)) == MARKER_VALUE
+        value_ok = (int(regs.get(prim["value_reg"], 0)) & mask) == (vmarker & mask)
     return addr_ok, value_ok

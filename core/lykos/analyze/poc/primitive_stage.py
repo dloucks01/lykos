@@ -225,18 +225,20 @@ def primitive_stage(ctx) -> dict:
                              prim, False, extra)
 
         # 2) memory primitive (write-what-where / controlled read at a faulting mem access)
-        memp = primitive.analyze_memory_primitive(cap0, length, disasm)
+        memp = primitive.analyze_memory_primitive(cap0, length, disasm, endian=endian,
+                                                  word=word)
         if memp is not None:
             ctx.progress(msg=f"{memp['type']} at addr offset {memp['addr_offset']}; confirming")
             control = primitive.two_marker_input(memp["addr_offset"], memp.get("value_offset"),
-                                                 length)
-            addr_ok, value_ok = primitive.memory_primitive_confirmed(capture(control), memp)
+                                                 length, word=word, endian=endian)
+            addr_ok, value_ok = primitive.memory_primitive_confirmed(capture(control), memp,
+                                                                     word=word, endian=endian)
             confirmed = addr_ok and (value_ok or memp["type"] != "write-what-where")
             reg_map = {memp["addr_reg"]: memp["addr_offset"]}
             if memp.get("value_reg") and memp.get("value_offset") is not None:
                 reg_map[memp["value_reg"]] = memp["value_offset"]
             prim = {"type": memp["type"], "offset": memp["addr_offset"],
-                    "marker": primitive.MARKER, "observed_pc": cap0.get("pc", 0),
+                    "marker": primitive._ip_marker(word), "observed_pc": cap0.get("pc", 0),
                     "confirmed": confirmed, "registers": reg_map, "access": memp["access"],
                     "value_offset": memp.get("value_offset"), "disasm": disasm}
             extra = (f"{memp['type']}: {memp['access']} through attacker-controlled address "

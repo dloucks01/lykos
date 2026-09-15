@@ -92,7 +92,6 @@ def stack_buffer_overflow(ctx: DetectContext):
         if not bufs or not sinks:
             continue
         buf = min(bufs, key=lambda v: v.get("size", 1 << 30))   # tightest buffer = worst case
-        n, site = sinks[0]
         # distance from the buffer to the saved return address in Ghidra frame coords
         ret_off = frame.get("ret_offset")
         off_to_ret = (ret_off - int(buf.get("offset", 0))) if ret_off is not None \
@@ -101,17 +100,28 @@ def stack_buffer_overflow(ctx: DetectContext):
         # routine, each occurrence a SITE. Keying on the function address made every call
         # site its own high-severity finding -- seven near-identical rows on jhead, which was
         # most of its HIGH count and read as seven separate bugs.
-        out.append(_cand(
-            "CWE-121",
-            f"Stack buffer overflow: unbounded {n}() into a fixed-size stack buffer",
-            "high", "stack_frame",
-            [{"channel": "pattern",
-              "detail": f"{n}() called in a function owning a fixed-size stack buffer"}],
-            function_addr=addr, site_addr=site,
-            site_detail=(f"{n}() at {site} into {buf.get('name')} "
-                         f"({buf.get('type')}, {buf.get('size')} B); ~{off_to_ret} bytes from "
-                         f"the buffer to the saved return address"),
-            dedup_key=f"CWE-121:stack_frame:{n}", confidence=0.55))
+        #
+        # But every DISTINCT sink is its own defect: a function that calls both gets() and
+        # sprintf() into the same frame is two stack-smashes, and reporting only sinks[0]
+        # silently dropped the rest. Iterate the distinct sink names (sorted, for a stable
+        # run), emitting a candidate per call site; the per-name dedup_key still merges
+        # occurrences across functions into one finding per unbounded-copy routine.
+        sites_by_name: dict = defaultdict(list)
+        for n, site in sinks:
+            sites_by_name[n].append(site)
+        for n in sorted(sites_by_name):
+            for site in sites_by_name[n]:
+                out.append(_cand(
+                    "CWE-121",
+                    f"Stack buffer overflow: unbounded {n}() into a fixed-size stack buffer",
+                    "high", "stack_frame",
+                    [{"channel": "pattern",
+                      "detail": f"{n}() called in a function owning a fixed-size stack buffer"}],
+                    function_addr=addr, site_addr=site,
+                    site_detail=(f"{n}() at {site} into {buf.get('name')} "
+                                 f"({buf.get('type')}, {buf.get('size')} B); ~{off_to_ret} "
+                                 f"bytes from the buffer to the saved return address"),
+                    dedup_key=f"CWE-121:stack_frame:{n}", confidence=0.55))
     return out
 
 

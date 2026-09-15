@@ -107,3 +107,11 @@ def test_the_out_param_table_agrees_with_the_source_list():
         assert name not in OUT_PARAM_SOURCES, name
     for name in ("read", "fread", "recv", "fgets", "gets"):
         assert name in OUT_PARAM_SOURCES, name
+
+
+def test_the_out_param_seeding_is_not_duplicated():
+    """The out-parameter buffer seeding was once pasted twice inside the SOURCES branch (a
+    botched merge that ran the debug import/print twice). Guard against it coming back."""
+    import inspect
+    src = inspect.getsource(taint._run)
+    assert src.count("_bi = OUT_PARAM_SOURCES.get(ext)") == 1

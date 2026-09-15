@@ -88,6 +88,31 @@ class TcpHTTPServer(ThreadingHTTPServer):
 
 
 # --------------------------------------------------------------------------- handler
+# Loopback hosts the browser UI legitimately reaches us on. A request whose Host or Origin is
+# anything else is a cross-site or DNS-rebinding attempt against 127.0.0.1:8787.
+_LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
+# Ceiling on a single request body (uploads, case-archive imports). Bounds memory; firmware
+# images fit comfortably under this.
+_MAX_BODY = 1 * 1024 * 1024 * 1024  # 1 GiB
+# Chunk size for streaming request bodies and file responses.
+_CHUNK = 1 << 20  # 1 MiB
+
+
+class _TruncatedBody(Exception):
+    """Client declared a Content-Length but delivered fewer bytes: the body is incomplete and
+    must never be treated as if it were the whole request (a truncated upload would otherwise
+    be ingested as a real -- but different -- target)."""
+
+
+def _hostname_only(value: str) -> str:
+    """Host header -> bare hostname (strip port, unwrap [::1])."""
+    v = value.strip()
+    if v.startswith("["):
+        end = v.find("]")
+        return v[1:end] if end != -1 else v[1:]
+    return v.rsplit(":", 1)[0] if ":" in v else v
+
+
 _RUN_ID = re.compile(r"^/runs/([^/]+)$")
 _RUN_CANCEL = re.compile(r"^/runs/([^/]+)/cancel$")
 _TARGET_INVOKE = re.compile(r"^/targets/([^/]+)/invocation$")
@@ -137,11 +162,17 @@ class Handler(BaseHTTPRequestHandler):
         return self.server.case_dir / "case.db"
 
     # ---- helpers ----
-    def _json(self, obj: Any, status: int = 200) -> None:
+    def _json(self, obj: Any, status: int = 200, *, close: bool = False) -> None:
         body = json.dumps(obj).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        if close:
+            # Early-return error paths often have an unread request body still in the socket.
+            # On an HTTP/1.1 keep-alive connection that leftover would be parsed as the next
+            # request line and desync the stream, so tear the connection down instead.
+            self.close_connection = True
+            self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(body)
 
@@ -151,13 +182,87 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
         if filename:
-            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+            # The filename is derived from a user-controlled case name; CR/LF/quote in a header
+            # value would split the response (header injection). Strip them.
+            safe = filename.replace("\r", "").replace("\n", "").replace('"', "")
+            self.send_header("Content-Disposition", f'attachment; filename="{safe}"')
         self.end_headers()
         self.wfile.write(data)
 
-    def _read_body(self) -> bytes:
-        n = int(self.headers.get("Content-Length", 0))
-        return self.rfile.read(n) if n else b""
+    def _stream_file(self, path: Path, content_type: str, *,
+                     filename: Optional[str] = None) -> None:
+        """Send a file straight from disk in fixed-size chunks with a known Content-Length.
+        Artifacts (and case exports) can approach the 1 GiB body ceiling; reading the whole
+        blob into memory per request would multiply resident memory by the thread count."""
+        size = path.stat().st_size
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(size))
+        if filename:
+            safe = filename.replace("\r", "").replace("\n", "").replace('"', "")
+            self.send_header("Content-Disposition", f'attachment; filename="{safe}"')
+        self.end_headers()
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(_CHUNK)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+
+    def _guard_local(self) -> bool:
+        """Refuse cross-site browser requests (CSRF) and DNS-rebinding for state-changing calls.
+        A same-origin UI request carries a loopback Origin; a non-browser client (curl) sends no
+        Origin and is allowed. A request whose Host or Origin is not loopback is refused, which
+        also defeats a rebinding page that points a hostname at 127.0.0.1. Returns True if the
+        request may proceed; otherwise it has already sent a 403."""
+        host = _hostname_only(self.headers.get("Host", ""))
+        if host and host not in _LOCAL_HOSTS:
+            self._json({"error": "host not allowed"}, 403, close=True)
+            return False
+        origin = self.headers.get("Origin")
+        if origin:
+            o = urlparse(origin)
+            if (o.hostname or "") not in _LOCAL_HOSTS:
+                self._json({"error": "cross-origin request refused"}, 403, close=True)
+                return False
+        return True
+
+    def _read_body(self, max_bytes: int = _MAX_BODY) -> Optional[bytes]:
+        """Read the request body, bounded. Returns None (caller sends 413) when Content-Length is
+        malformed or exceeds the ceiling; reads in chunks so a lying huge length cannot
+        pre-allocate. Prevents an unbounded body from exhausting memory.
+
+        Raises _TruncatedBody when the client sent FEWER bytes than it declared: a partial read
+        must surface as an error, never as a shorter-but-plausible body (invariant 4)."""
+        try:
+            n = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            return None
+        if n < 0 or n > max_bytes:
+            return None
+        buf = bytearray()
+        remaining = n
+        while remaining > 0:
+            chunk = self.rfile.read(min(remaining, _CHUNK))
+            if not chunk:
+                # short read: the declared body never fully arrived
+                raise _TruncatedBody(f"expected {n} bytes, got {len(buf)}")
+            buf += chunk
+            remaining -= len(chunk)
+        return bytes(buf)
+
+    def _json_body(self) -> Optional[dict]:
+        """Parse a JSON request body, or send the right error and return None. An over-limit or
+        malformed-length body is a 413 (not silently coerced to {}); invalid JSON is a 400."""
+        raw = self._read_body()
+        if raw is None:
+            self._json({"error": "request body too large or malformed"}, 413, close=True)
+            return None
+        try:
+            return json.loads(raw or b"{}")
+        except ValueError:
+            self._json({"error": "invalid JSON body"}, 400)
+            return None
 
     def _store(self) -> CaseStore:
         return CaseStore(self.server.case_dir)
@@ -175,13 +280,25 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- GET ----
     def do_GET(self):
+        # Reads leak case data too: findings, artifact blobs, the whole-case export. A
+        # DNS-rebinding page (Host set to an attacker name that resolves to 127.0.0.1) is
+        # same-origin with itself and could otherwise exfiltrate all of it, so the read side
+        # gets the same Host/Origin guard the WS upgrades and the write side already have.
+        if not self._guard_local():
+            return
         parsed = urlparse(self.path)
         path, qs = parsed.path, parse_qs(parsed.query)
-        # WebSocket upgrade for /events
+        # WebSocket upgrade for /events. Guard first: a WS handshake is not subject to the
+        # same-origin policy, so without this any page the analyst visits could open the stream
+        # (or, on /console, drive a target) against 127.0.0.1:8787.
         if path == "/events" and "websocket" in self.headers.get("Upgrade", "").lower():
+            if not self._guard_local():
+                return
             return self._ws_events(qs.get("case_id", [None])[0])
         # WebSocket upgrade for the interactive detonation console
         if path == "/console" and "websocket" in self.headers.get("Upgrade", "").lower():
+            if not self._guard_local():
+                return
             return self._ws_console(qs)
         try:
             if path in ("/", "/index.html"):
@@ -339,11 +456,15 @@ class Handler(BaseHTTPRequestHandler):
                 after = _int_param(qs, "after", 0)
                 return self._get_events(m.group(1), after)
             self._json({"error": "not found"}, 404)
+        except _TruncatedBody as e:
+            self._json({"error": f"request body truncated: {e}"}, 400, close=True)
         except Exception as e:  # never crash the server thread
             self._json({"error": repr(e)}, 500)
 
     # ---- POST ----
     def do_POST(self):
+        if not self._guard_local():
+            return
         path = urlparse(self.path).path
         try:
             if path == "/cases":
@@ -363,9 +484,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._format_analyze()
             if path == "/import":
                 return self._import_case()
-            self._json({"error": "not found"}, 404)
+            self._json({"error": "not found"}, 404, close=True)
+        except _TruncatedBody as e:
+            self._json({"error": f"request body truncated: {e}"}, 400, close=True)
         except Exception as e:
-            self._json({"error": repr(e)}, 500)
+            self._json({"error": repr(e)}, 500, close=True)
 
     def _get_capabilities(self, tid):
         """What this target can and cannot have done to it, and why not.
@@ -425,12 +548,14 @@ class Handler(BaseHTTPRequestHandler):
         """
         from ..analyze import invocation as invmod
         from ..analyze.dynamic import sandbox
+        body = self._json_body()
+        if body is None:
+            return
         s = self._store()
         try:
             t = s.targets.get(tid)
             if not t:
                 return self._json({"error": "no target"}, 404)
-            body = json.loads(self._read_body() or b"{}")
             found = invmod.discover(self._target_strings(s, tid),
                                     usage_hint=body.get("usage_hint"))
             d = Path(tempfile.mkdtemp(prefix="lykos-invocation-"))
@@ -482,14 +607,18 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- DELETE ----
     def do_DELETE(self):
+        if not self._guard_local():
+            return
         path = urlparse(self.path).path
         try:
             m = _TARGET_ID.match(path)
             if m:
                 return self._delete_target(m.group(1))
-            self._json({"error": "not found"}, 404)
+            self._json({"error": "not found"}, 404, close=True)
+        except _TruncatedBody as e:
+            self._json({"error": f"request body truncated: {e}"}, 400, close=True)
         except Exception as e:
-            self._json({"error": repr(e)}, 500)
+            self._json({"error": repr(e)}, 500, close=True)
 
     def _delete_target(self, tid):
         """Remove a target and everything derived from it (rows cascade; component edges
@@ -680,10 +809,11 @@ class Handler(BaseHTTPRequestHandler):
             with tempfile.TemporaryDirectory(prefix="lykos-export-") as td:
                 tmp = Path(td) / f"{name}.tar.gz"
                 s.export_case(cid, tmp)
-                data = tmp.read_bytes()
+                # Stream from the temp file (inside the with-block, before cleanup) rather than
+                # slurping the whole archive into memory.
+                self._stream_file(tmp, "application/gzip", filename=f"{name}.tar.gz")
         finally:
             s.close()
-        return self._bytes(data, "application/gzip", filename=f"{name}.tar.gz")
 
     def _get_systemmap(self, cid):
         """The component graph (doc 17.1): nodes are targets, edges are resolved
@@ -717,6 +847,8 @@ class Handler(BaseHTTPRequestHandler):
         """Merge an uploaded case archive (per-case or whole-store .tar.gz) into the store."""
         ctype = self.headers.get("Content-Type", "")
         body = self._read_body()
+        if body is None:
+            return self._json({"error": "request body too large or malformed"}, 413, close=True)
         _, data = extract_file(ctype, body)
         if data is None:
             data = body
@@ -773,15 +905,12 @@ class Handler(BaseHTTPRequestHandler):
             s.close()
 
     def _get_artifact(self, sha):
-        try:
-            data = self.server.content.get_bytes(sha)
-        except Exception:
+        path = self.server.content.path(sha)
+        if not path.exists():
             return self._json({"error": "no artifact"}, 404)
-        self.send_response(200)
-        self.send_header("Content-Type", "application/octet-stream")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
+        # Stream from disk in chunks -- an artifact may be a firmware image near the 1 GiB
+        # ceiling, and get_bytes() would load the whole blob into memory per concurrent request.
+        return self._stream_file(path, "application/octet-stream")
 
     def _get_events(self, cid, after):
         s = self._store()
@@ -792,7 +921,9 @@ class Handler(BaseHTTPRequestHandler):
             s.close()
 
     def _create_case(self):
-        body = json.loads(self._read_body() or b"{}")
+        body = self._json_body()
+        if body is None:
+            return
         s = self._store()
         try:
             c = s.cases.create(body.get("name", "case"), notes=body.get("notes"),
@@ -808,20 +939,25 @@ class Handler(BaseHTTPRequestHandler):
         from ..jobs.registry import reproject_cache_hit
         ctype = self.headers.get("Content-Type", "")
         body = self._read_body()
+        if body is None:
+            return self._json({"error": "request body too large or malformed"}, 413, close=True)
         filename, data = extract_file(ctype, body)
         if data is None:  # allow raw octet-stream fallback
             filename = self.headers.get("X-Filename", "upload.bin")
             data = body
+        # The client-supplied filename must never influence where we write: an absolute path or
+        # `../` would escape the temp dir (arbitrary file write). Reduce it to a bare basename.
+        safe_name = Path(filename or "upload.bin").name or "upload.bin"
         s = self._store()
         try:
             # TemporaryDirectory, not mkdtemp: the old code unlinked the FILE and left the
             # directory behind, leaking one empty directory per upload for the life of the
             # process. It is also removed on the error paths, which an explicit unlink was not.
             with tempfile.TemporaryDirectory(prefix="lykos-upload-") as td:
-                tmp = Path(td) / (filename or "upload.bin")
+                tmp = Path(td) / safe_name
                 tmp.write_bytes(data)
                 try:
-                    target = ingest(s, cid, tmp, filename=filename)
+                    target = ingest(s, cid, tmp, filename=safe_name)
                 except NotAnalysable as e:
                     # 400, not 500: the upload was understood and refused, and the reason is
                     # for the person who picked the file
@@ -839,7 +975,9 @@ class Handler(BaseHTTPRequestHandler):
         (detect magic, auto-find the length field); with a spec, show how it carves the
         sample using the real fuzzer parser. No case/target needed."""
         from ..analyze.fuzz import structure
-        body = json.loads(self._read_body() or b"{}")
+        body = self._json_body()
+        if body is None:
+            return
         sample = base64.b64decode(body["sample_b64"]) if body.get("sample_b64") else b""
         sample = sample[:65536]                          # cap: previews stay fast
         spec = body.get("spec")
@@ -893,7 +1031,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def _create_run(self):
         from ..jobs.registry import reproject_cache_hit
-        body = json.loads(self._read_body() or b"{}")
+        body = self._json_body()
+        if body is None:
+            return
         s = self._store()
         try:
             q = JobQueue(s.conn)
@@ -988,16 +1128,20 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Sec-WebSocket-Accept", ws.accept_key(key))
         self.end_headers()
 
-        conn = connect(self.db_path)
-        ed = EventDAO(conn)
         sock = self.connection
-        # start after the current tail so the client sees live events
-        row = conn.execute(
-            "SELECT MAX(id) AS m FROM event WHERE case_id IS ? OR ? IS NULL",
-            (case_id, case_id)).fetchone()
-        cursor = int(row["m"]) if row and row["m"] is not None else 0
-        stop: threading.Event = self.server.stop_event
+        # A server started outside serve() may not have set stop_event; default to a
+        # never-set Event rather than an AttributeError after the 101 is already on the wire.
+        stop: threading.Event = getattr(self.server, "stop_event", None) or threading.Event()
+        # Open the connection INSIDE the try so a failure in the initial cursor query can't
+        # leak it (the SELECT ran before the finally that closes it).
+        conn = connect(self.db_path)
         try:
+            ed = EventDAO(conn)
+            # start after the current tail so the client sees live events
+            row = conn.execute(
+                "SELECT MAX(id) AS m FROM event WHERE case_id IS ? OR ? IS NULL",
+                (case_id, case_id)).fetchone()
+            cursor = int(row["m"]) if row and row["m"] is not None else 0
             while not stop.is_set():
                 evs = ed.list(case_id=case_id, after_id=cursor, limit=200) if case_id \
                     else ed.list(after_id=cursor, limit=200)

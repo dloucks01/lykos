@@ -155,3 +155,27 @@ def test_an_unreached_hijack_says_why_it_was_unreached():
     assert _nul_cuts_the_slot(payload, 1048, 8)
     # a NUL-free address is delivered whole
     assert not _nul_cuts_the_slot(ret2win_input(1048, 0x1337C0DE1337, 2096), 1048, 6)
+
+
+def test_last_done_field_reads_a_terminal_event_past_the_window(tmp_path):
+    """A `no_crash` verdict is credited only when the fuzzer actually ran, read from the fuzz
+    stage's TERMINAL summary. That event sits past _done_field's small window (fuzz emits a
+    progress event every 250 execs), so realgate scans to the end for it."""
+    from lykos.casestore import CaseStore
+
+    store = CaseStore.open(tmp_path / "case")
+    try:
+        c = store.cases.create("x")
+        run = store.runs.create(c.id, "fuzz", status="done")
+        for i in range(200):                      # bury the terminal event past the window
+            store.events.append("fuzz.progress", case_id=c.id, run_id=run.id,
+                                payload={"execs": i})
+        store.events.append("fuzz.channels", case_id=c.id, run_id=run.id,
+                            payload={"execs": 12345})
+        # the small-window reader cannot see the terminal summary ...
+        assert realgate._done_field(store, c.id, "fuzz", "fuzz.channels", "execs") is None
+        # ... the paginating reader finds it, so a real campaign is distinguishable from none
+        assert realgate._last_done_field(
+            store, c.id, "fuzz", "fuzz.channels", "execs") == 12345
+    finally:
+        store.close()

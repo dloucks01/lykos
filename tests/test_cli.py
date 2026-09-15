@@ -148,7 +148,7 @@ def test_eval_wiring_records_history_and_honours_the_gate(tmp_path, capsys, monk
 
     class Rep:
         meta = {"max_execs": 2500, "max_seconds": 25, "elapsed_s": 12.5,
-                "warnings": ["short budget"]}
+                "gcc": True, "warnings": ["short budget"]}
         metrics = {"n_cases": 6, "n_cwe_classes": 3, "per_cwe": {},
                    "overall": {"recall": 1.0, "fp_rate": 0.0, "tp": 3, "fn": 0}}
 
@@ -209,7 +209,7 @@ def test_eval_exit_code_follows_the_gate_not_the_run(capsys, monkeypatch):
     from lykos.eval import harness
 
     class Rep:
-        meta = {"max_execs": 100, "max_seconds": 5, "elapsed_s": 5.0, "warnings": []}
+        meta = {"max_execs": 100, "max_seconds": 5, "elapsed_s": 5.0, "gcc": True, "warnings": []}
         metrics = {"n_cases": 6, "n_cwe_classes": 3, "per_cwe": {},
                    "overall": {"recall": 0.5, "fp_rate": 0.0, "tp": 3, "fn": 3}}
 
@@ -223,3 +223,49 @@ def test_eval_exit_code_follows_the_gate_not_the_run(capsys, monkeypatch):
     # recall 0.5 under a 1.0 floor is a FAIL, and the process must say so
     assert cli.main(["eval", "--stage", "dynamic", "--min-recall", "1.0"]) == 1
     assert "GATE: FAIL" in capsys.readouterr().err
+
+
+# ---- doctor ------------------------------------------------------------------------------
+
+def test_doctor_reports_the_host_and_exits_zero(capsys):
+    """It must succeed even where nothing is installed -- reporting a bare host IS the job."""
+    assert cli.main(["doctor"]) == 0
+    out = capsys.readouterr().out
+    assert "REQUIRED" in out and "present." in out
+
+
+def test_doctor_json_is_machine_readable(capsys):
+    assert cli.main(["doctor", "--json"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["tools"] and all("present" in t for t in data["tools"])
+
+
+def test_doctor_strict_fails_only_on_a_missing_REQUIRED_tool(capsys, monkeypatch):
+    """`--strict` is what a provisioning script keys on, so it must not fire for an optional
+    engine that is simply not installed."""
+    from lykos import toolchain
+    real = toolchain.TOOLS
+
+    def only(keys):
+        return tuple(t for t in real if t.key in keys)
+
+    monkeypatch.setattr(toolchain, "TOOLS", only({"python"}))       # required, always present
+    assert cli.main(["doctor", "--strict"]) == 0
+    capsys.readouterr()
+
+    missing_req = toolchain.Tool("ghost", "Ghost Tool", "nothing at all",
+                                 "nothing is lost", "cannot be installed",
+                                 lambda: None, tier="required")
+    monkeypatch.setattr(toolchain, "TOOLS", only({"python"}) + (missing_req,))
+    assert cli.main(["doctor", "--strict"]) == 1
+    out = capsys.readouterr().out
+    assert "Ghost Tool" in out and "cannot be installed" in out
+
+
+def test_doctor_without_strict_is_a_report_not_a_gate(capsys, monkeypatch):
+    from lykos import toolchain
+    missing_req = toolchain.Tool("ghost", "Ghost Tool", "nothing", "nothing lost",
+                                 "cannot be installed", lambda: None, tier="required")
+    monkeypatch.setattr(toolchain, "TOOLS", (missing_req,))
+    assert cli.main(["doctor"]) == 0, "a plain report must not fail the shell"
+    capsys.readouterr()

@@ -603,3 +603,96 @@ def test_a_crash_row_carries_how_it_was_fed_and_where_it_faulted():
         argv, fault_pc = None, None
     old = _dynresult(_Old())
     assert old["argv"] == [] and old["fault_pc"] is None
+
+
+# ---- security / framing regressions ----
+def test_get_reads_reject_a_nonlocal_host(api_http):
+    """DNS-rebinding: a data-READ GET whose Host is an attacker name (resolved to 127.0.0.1)
+    must be refused, exactly as the write side and the WS upgrades already are."""
+    st, _ = _tcp(api_http, "GET", "/cases", headers={"Host": "evil.example.com"})
+    assert st == 403
+
+
+def test_get_reads_allow_a_loopback_host(api_http):
+    st, _ = _tcp(api_http, "GET", "/cases", headers={"Host": "127.0.0.1"})
+    assert st == 200
+
+
+def _raw_request(port, raw: bytes) -> bytes:
+    s = socket.create_connection(("127.0.0.1", port))
+    try:
+        s.sendall(raw)
+        s.shutdown(socket.SHUT_WR)   # signal EOF so a short body is seen as truncated
+        s.settimeout(3.0)
+        resp = b""
+        while True:
+            try:
+                chunk = s.recv(4096)
+            except socket.timeout:
+                break
+            if not chunk:
+                break
+            resp += chunk
+        return resp
+    finally:
+        s.close()
+
+
+def test_a_truncated_body_is_rejected_not_read_as_complete(api_http):
+    """Content-Length promises 100 bytes; only 12 arrive. The server must 400, never treat the
+    partial body as a complete (but shorter) request."""
+    raw = (b"POST /cases HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+           b"Content-Type: application/json\r\nContent-Length: 100\r\n\r\n"
+           b'{"name":"x"}')
+    resp = _raw_request(api_http, raw)
+    status_line = resp.split(b"\r\n", 1)[0]
+    assert b" 400 " in status_line, resp[:120]
+    assert b"truncated" in resp.lower()
+
+
+def test_a_refused_cross_host_request_closes_the_connection(api_http):
+    """An early-return error path with an unread body must tear the keep-alive connection down
+    (Connection: close) so the leftover body can't desync the next request on the socket."""
+    raw = (b"POST /cases HTTP/1.1\r\nHost: evil.example.com\r\n"
+           b"Content-Type: application/json\r\nContent-Length: 9\r\n\r\n"
+           b'{"a":"b"}')
+    resp = _raw_request(api_http, raw)
+    assert b" 403 " in resp.split(b"\r\n", 1)[0], resp[:120]
+    assert b"connection: close" in resp.lower()
+
+
+class _FakeSock:
+    """Feeds queued bytes to ws.read_frame one recv() at a time."""
+    def __init__(self, data: bytes):
+        self._d = data
+
+    def recv(self, n: int) -> bytes:
+        chunk, self._d = self._d[:n], self._d[n:]
+        return chunk
+
+
+def _client_frame(opcode: int, payload: bytes, fin: bool = True) -> bytes:
+    b0 = (0x80 if fin else 0) | opcode
+    n = len(payload)
+    if n < 126:
+        hdr = bytes([b0, 0x80 | n])
+    elif n < 65536:
+        hdr = bytes([b0, 0x80 | 126]) + struct.pack("!H", n)
+    else:
+        hdr = bytes([b0, 0x80 | 127]) + struct.pack("!Q", n)
+    return hdr + b"\x00\x00\x00\x00" + payload   # zero mask: XOR is identity
+
+
+def test_read_frame_reassembles_fragmented_messages():
+    from lykos.api import ws
+    data = _client_frame(0x1, b"hel", fin=False) + _client_frame(0x0, b"lo", fin=True)
+    op, payload = ws.read_frame(_FakeSock(data))
+    assert op == 0x1 and payload == b"hello"
+
+
+def test_read_frame_returns_control_frames_inline():
+    from lykos.api import ws
+    op, payload = ws.read_frame(_FakeSock(_client_frame(0x9, b"ping!")))   # ping
+    assert op == 0x9 and payload == b"ping!"
+    op, _ = ws.read_frame(_FakeSock(_client_frame(0x8, b"")))             # close
+    assert op == 0x8
