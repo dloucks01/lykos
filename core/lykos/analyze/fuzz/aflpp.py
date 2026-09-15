@@ -6,6 +6,7 @@ minimize/finding pipeline. AFL++ (with afl-qemu) ships in the full offline bundl
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import shutil
@@ -233,7 +234,10 @@ def harvest_crashes(out_dir) -> list:
                 data = f.read_bytes()
             except OSError:
                 continue
-            key = (len(data), data[:64])
+            # Full-content digest, not a 64-byte prefix: two distinct crashing inputs of equal
+            # length that share their first 64 bytes (common for one file format) hashed to the
+            # same key and one was dropped before it could be replayed.
+            key = hashlib.sha256(data).digest()
             if key in seen:
                 continue
             seen.add(key)

@@ -1,127 +1,147 @@
-# Project: BinAnalysis — Air-Gapped Binary Vulnerability Analysis Platform
+# lykos — air-gapped binary vulnerability analysis platform
 
-> **Authorized use only.** Offensive-security tool for use exclusively on binaries and systems you are
-> authorized to test. Authorization is an operator-process matter and is intentionally not modeled in the
-> software (see `docs/15-risks-open-questions.md`).
+> **Authorized use only.** An offensive-security tool, for binaries and systems you are
+> authorized to test. Authorization is an operator-process matter and is deliberately not
+> modelled in the software (see `docs/15-risks-open-questions.md`).
 
-BinAnalysis is a standalone, fully offline (air-gapped) Linux workstation application that ingests a
-binary — including stripped and custom-format binaries — reverse engineers it, detects CWE-class
-vulnerabilities through combined static + dynamic + symbolic analysis, builds a fuzzing/debug harness
-and sandboxed execution environment around it, and produces reproducible, demonstrable Proof-of-Concept
-artifacts for confirmed findings. It ships with a highly styled analyst GUI.
+lykos ingests a binary — stripped, cross-architecture, firmware, JAR, or PE — recovers its
+structure, detects CWE-class defects through static, dynamic and symbolic analysis, builds a
+fuzzing harness around it, and produces a **reproducible proof-of-concept** for what it
+confirms. It runs entirely offline and has no network code paths at all.
 
-## Design philosophy (read this first)
+```sh
+git clone <lykos> && cd lykos
+PYTHONPATH=core python3 -m lykos doctor    # what this host can do, and how to fix the gaps
+make run                                   # the analyst UI on 127.0.0.1:8787
+```
 
-1. **Orchestrate, don't reinvent.** The world already has Ghidra, angr, AFL++, QEMU, GDB, rizin, etc.
-   Our value is the *glue*: a unified data model, correlation across tools, automated harnessing,
-   confidence scoring, PoC synthesis, and a first-class analyst UI. We do **not** rewrite a decompiler.
-2. **Every finding must be earned.** Static analysis over-reports. A "finding" is only promoted to
-   *Confirmed* when dynamic or symbolic evidence reproduces it. We track a confidence lifecycle, not a
-   flat list of warnings.
-3. **Assume the binary is hostile.** Dynamic analysis runs untrusted, possibly malicious code.
-   Isolation is not optional — it is the backbone of the dynamic subsystem.
-4. **Air-gap is a first-class constraint, not an afterthought.** No component may assume network access.
-   Everything (toolchains, signatures, models, CVE/libc DBs) is bundled and updated via signed
-   sneakernet packages.
+Nothing to install to get that far: the core is **stdlib-only**, no pip packages. The heavy
+engines (Ghidra, qemu-user, AFL++, GDB, angr…) are optional and separately bundled — see
+**[docs/23-airgap-install.md](docs/23-airgap-install.md)**.
 
-## Document index
+## Design philosophy
+
+1. **Orchestrate, don't reinvent.** Ghidra, angr, AFL++, QEMU and GDB already exist. The value
+   is the glue: one data model, correlation across tools, automated harnessing, a confidence
+   lifecycle, PoC synthesis, and an analyst UI.
+2. **Every finding must be earned.** Static analysis over-reports. A finding is promoted to
+   *confirmed* only when dynamic or symbolic evidence reproduces it — `candidate →
+   corroborated → confirmed → poc-backed`.
+3. **Assume the binary is hostile.** Dynamic analysis runs untrusted code; isolation is the
+   backbone of the dynamic subsystem, not a wrapper around it.
+4. **Absence of evidence is not evidence of absence.** A stage that could not run says so, in
+   its own words, and never as a clean result. This is the single most load-bearing rule in
+   the codebase and most of its hard-won bug fixes are instances of it.
+5. **Air-gap is a constraint, not a feature.** No component may assume network access.
+
+## Commands
+
+```sh
+make doctor            # capability report for this host
+make test              # the full suite
+make lint typecheck    # ruff; mypy (strict over the infra core — see mypy.ini)
+make gui               # headless GUI harnesses (needs node)
+make ci                # lint + typecheck + gui + test
+make coverage          # line/branch coverage INCLUDING the subprocess-only engines
+make run               # serve the API + UI on 127.0.0.1:8787 (case store in .cases/)
+make bundle            # build the standalone dist/lykos.pyz zipapp
+make verify            # build it, then prove it serves the UI and triages offline
+make eval-gate         # detection-quality gate over the bundled corpus
+make arch-gate         # every architecture still reaches its PoC level
+make real-gate         # full chain on real programs (detect -> PoC -> attribution)
+make release           # ci + verify + all four gates
+make toolchain-bundle  # build the air-gap toolchain tarball (on a CONNECTED machine)
+make dashboard         # detection-quality regression dashboard from eval-history.jsonl
+make clean             # remove build artifacts and caches
+```
+
+`make lint` and `make typecheck` **fail** when their tool is missing rather than skipping, so
+`make ci` cannot go green without having actually run them.
+
+## Where things are
+
+```
+core/lykos/        the platform (stdlib only)
+  analyze/         the 29 analysis stages, grouped by what they do
+  api/             HTTP + WebSocket server and the single-page UI
+  db/              schema, migrations, DAOs
+  eval/            benchmark corpora and the quality gates
+  jobs/            the job queue and worker pool
+  toolchain.py     one inventory of every external tool  <- `lykos doctor` reads this
+tests/             the suite (~1180), incl. js/ harnesses for the UI
+docs/              design docs 00-23; archive/ is historical, not maintained
+examples/          runnable demos and fixture builders
+packaging/         zipapp build, offline verify, air-gap bundle scripts
+```
+
+## Documents
 
 | # | Doc | What it covers |
 |---|-----|----------------|
-| 00 | `docs/00-overview-goals.md` | Vision, users, non-goals, capability tiers, honest feasibility |
-| 01 | `docs/01-gap-analysis.md` | **Gaps in the current plan** + everything that must be added |
-| 02 | `docs/02-architecture.md` | Layered architecture, pipeline/job engine, module boundaries |
-| 03 | `docs/03-static-analysis.md` | Loading, disasm, decompile, CFG/callgraph, type recovery |
-| 04 | `docs/04-stripped-binary-recovery.md` | Function ID, signatures, ML embeddings, custom ISAs |
-| 05 | `docs/05-cwe-detection.md` | CWE taxonomy engine, per-class detection strategies |
+| 00 | `docs/00-overview-goals.md` | Vision, users, non-goals, capability tiers |
+| 01 | `docs/01-gap-analysis.md` | Gaps in the original plan and what had to be added |
+| 02 | `docs/02-architecture.md` | Layers, pipeline/job engine, module boundaries |
+| 03 | `docs/03-static-analysis.md` | Loading, disasm, decompile, CFG/callgraph, types |
+| 04 | `docs/04-stripped-binary-recovery.md` | Function ID, signatures, custom ISAs |
+| 05 | `docs/05-cwe-detection.md` | CWE taxonomy engine, per-class strategies |
 | 06 | `docs/06-dynamic-analysis-sandbox.md` | Isolation, emulation, tracing, coverage, debugging |
-| 07 | `docs/07-harness-fuzzing.md` | Input-vector discovery, harness synthesis, fuzzing orchestration |
+| 07 | `docs/07-harness-fuzzing.md` | Input-vector discovery, harness synthesis, fuzzing |
 | 08 | `docs/08-triage-poc.md` | Crash dedup, exploitability, root cause, PoC synthesis |
-| 09 | `docs/09-gui-design.md` | GUI architecture, views, visual/interaction design system |
-| 10 | `docs/10-tech-stack.md` | Concrete technology choices + rationale + licensing |
-| 11 | `docs/11-airgap-packaging.md` | Offline packaging, bundled deps, signed update channel |
-| 12 | `docs/12-data-model.md` | Case/project model, DB schema, artifact store, notes |
-| 13 | `docs/13-roadmap-milestones.md` | Phased delivery (MVP → v1 → v2) with exit criteria |
-| 14 | `docs/14-validation-benchmarks.md` | How we measure detection quality (Juliet, LAVA-M, CGC…) |
-| 15 | `docs/15-risks-open-questions.md` | Risks, legal/ethical gating, decisions you must make |
-| 16 | `docs/16-sota-references.md` | State-of-the-art survey (2022-2026) incl. DARPA AIxCC / CRS |
-| 17 | `docs/17-multibinary-firmware.md` | Multi-binary/inter-component analysis + firmware rehosting |
-| 18 | `docs/18-architecture-coverage.md` | **All-architecture** coverage matrix, tiers, per-arch backends |
-| 19 | `docs/19-cwe-coverage.md` | **All-CWE** coverage matrix by family + channel + feasibility |
-| 21 | `docs/21-crs-harvest-review.md` | CRS harvest-review memo *template* (Phase 0 P0.8 deliverable) |
-| 22 | `docs/22-toolchain-setup.md` | **What to install and why** — required vs optional, what each unlocks, per-guest AFL++ emulators |
+| 09 | `docs/09-gui-design.md` | GUI architecture, views, design system |
+| 10 | `docs/10-tech-stack.md` | Technology choices, rationale, licensing |
+| 11 | `docs/11-airgap-packaging.md` | Air-gap *design position* (procedure is doc 23) |
+| 12 | `docs/12-data-model.md` | Case model, DB schema, artifact store |
+| 13 | `docs/13-roadmap-milestones.md` | Phased delivery with exit criteria |
+| 14 | `docs/14-validation-benchmarks.md` | How detection quality is measured |
+| 15 | `docs/15-risks-open-questions.md` | Risks, legal/ethical gating, open decisions |
+| 16 | `docs/16-sota-references.md` | State-of-the-art survey incl. DARPA AIxCC |
+| 17 | `docs/17-multibinary-firmware.md` | Multi-binary analysis + firmware rehosting |
+| 18 | `docs/18-architecture-coverage.md` | All-architecture coverage matrix and tiers |
+| 19 | `docs/19-cwe-coverage.md` | All-CWE coverage matrix by family and channel |
+| 20 | `docs/20-open-work-backlog.md` | **What is done, what is not, and what was measured** |
+| 21 | `docs/21-crs-harvest-review.md` | CRS harvest-review memo template |
+| 22 | `docs/22-toolchain-setup.md` | What each engine is and how it was provisioned |
+| 23 | `docs/23-airgap-install.md` | **Air-gap install runbook** — bundle, carry, verify |
 
-## Start here
-1. Read `docs/01-gap-analysis.md` — it reframes the scope and is the most important document.
-2. Answer the open questions in `docs/15-risks-open-questions.md` (they change the architecture).
-3. Then `docs/13-roadmap-milestones.md` for the build order, and `tasks/phase-0-foundations.md` for the
-   concrete first-milestone task breakdown.
+New here? `docs/20-open-work-backlog.md` is the honest state of the system: what works, what
+was measured, and what is still open. `docs/02-architecture.md` for the shape of it.
 
-## Running it
+## What the detection gate measures
 
-The core is stdlib-only and runs offline. Requires Python 3.11+. Optional heavy backends
-(angr/Unicorn/SymQEMU) live in vendored venvs under `vendor/` and are auto-detected when present;
-everything runs without them.
-
-```sh
-make test        # run the full test suite (PYTHONPATH=core pytest)
-make lint        # ruff check over core + tests
-make typecheck   # mypy: strict over the infra core, off for the stage layers (see mypy.ini)
-make ci          # lint + typecheck + test
-make run         # serve the API + UI on 127.0.0.1:8787 (case store in .cases/)
-make bundle      # build the standalone dist/lykos.pyz zipapp
-make verify      # build the zipapp, then prove it serves the UI + triages a binary offline
-make eval-gate   # detection-quality gate over the bundled corpus (see below)
-```
-
-`make lint` and `make typecheck` FAIL when their tool is missing rather than skipping, so
-`make ci` cannot go green without having actually run them. CI (`.github/workflows/ci.yml`)
-runs the same targets on 3.11 and 3.13 and prints every test skip, so gaps stay visible.
-
-### What the detection gate measures
-
-`make eval-gate` scores the bundled micro-corpus (`core/lykos/eval/corpus.py`) through the
-real pipeline. The corpus carries two kinds of negative, and only the second kind can fail:
+`make eval-gate` scores a micro-corpus through the real pipeline. It carries two kinds of
+negative, and only the second can fail:
 
 * **absence negatives** — the safe variant omits the dangerous API entirely.
-* **discrimination negatives** — the safe variant *calls* the sink correctly (strcpy behind
-  a `strlen() < sizeof` guard, clamped memcpy, literal-format printf, constant-command
-  `system`). These are what make `fp_rate` a measurement instead of a constant.
+* **discrimination negatives** — the safe variant *calls* the sink correctly (`strcpy` behind
+  a `strlen() < sizeof` guard, clamped `memcpy`, literal-format `printf`, constant-command
+  `system`). These are what make `fp_rate` a measurement rather than a constant.
 
-Current measured numbers (x86-64, Ghidra 12.1.2), 20 cases over 4 CWE classes:
+Measured on x86-64 with Ghidra, 20 cases over 4 CWE classes:
 
-| stage | recall | fp_rate | precision |
-|---|---|---|---|
-| `--min-state candidate` (rule channel) | 1.00 | 0.571 | 0.43 |
-| `--min-state corroborated` (data-flow channel) | 0.833 | 0.214 | 0.62 |
+| stage | recall | fp_rate |
+|---|---|---|
+| `--min-state candidate` (rule channel) | 1.00 | 0.571 |
+| `--min-state corroborated` (data-flow channel) | 1.00 | 0.214 |
 
 That gap is the confidence lifecycle earning its keep: the rule channel flags every safe use
-too (honest behaviour for a pattern rule), and the taint channel discards most of them —
-perfect precision and recall on CWE-78 and CWE-134, where it separates `system(argv[1])` from
-`system("/bin/date")` and `printf(user)` from `printf("%s", user)`.
+too — honest behaviour for a pattern rule — and the taint channel discards most of them. The
+CWE-120 false positives that remain are path-insensitivity: attacker bytes really do reach the
+`strcpy`, and the guard that makes it safe is a value-range fact the taint model does not
+carry. Promotion to *confirmed* still requires dynamic evidence.
 
-The three CWE-120 false positives that remain are path-insensitivity: attacker bytes really
-do reach the `strcpy`, and the `strlen() < sizeof` guard that makes it safe is a value-range
-fact the taint model does not carry. Corroborated means "two channels agree attacker data
-reaches a dangerous sink" — which is true of them — and promotion to *confirmed* still
-requires dynamic evidence. Corroborated recall is capped at 0.833 by the CWE-798 case:
-hard-coded secrets have no call site to corroborate and are promoted by `synthesize_secret`
-instead, which this static-only benchmark does not run.
+All gates are ratchets at their measured values and fail in **either** direction. The corpus
+is a regression tripwire, not a benchmark — use `lykos eval --juliet` / `--lava` for real
+measurement.
 
-All three gates are ratchets at the measured values, so each fails in either direction. The
-corpus is a regression tripwire, not a benchmark — use `lykos eval --juliet` / `--lava` for
-real measurement.
-
-Run the server directly and drive it over HTTP:
+## Driving it over HTTP
 
 ```sh
 PYTHONPATH=core python3 -m lykos serve --http 127.0.0.1:8787 --case-store .cases --workers 2
-# then, from another shell:
-curl -s -X POST http://127.0.0.1:8787/cases -d '{"name":"demo"}'                       # -> {"id": ...}
+curl -s -X POST http://127.0.0.1:8787/cases -d '{"name":"demo"}'            # -> {"id": ...}
 curl -s -X POST http://127.0.0.1:8787/cases/<CASE_ID>/targets \
-     -H 'X-Filename: ls' --data-binary @/bin/ls                                        # ingest + triage
-curl -s http://127.0.0.1:8787/runs/<RUN_ID>                                            # poll run status
+     -H 'X-Filename: ls' --data-binary @/bin/ls                            # ingest + triage
+curl -s http://127.0.0.1:8787/runs/<RUN_ID>                                # poll
 ```
 
-Open `http://127.0.0.1:8787/` in a browser for the analyst UI. The packaged zipapp runs the same way:
+The packaged zipapp runs identically:
 `python3 dist/lykos.pyz serve --http 127.0.0.1:8787 --case-store .cases`.

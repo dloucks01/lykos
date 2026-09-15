@@ -56,6 +56,45 @@ def test_harvest_crashes_dedups(tmp_path):
     assert sorted(got) == [b"AAAA", b"BBBBBB"]               # deduped, README skipped
 
 
+def test_arg_mode_is_fed_over_stdin_not_argv(monkeypatch, tmp_path):
+    """AFL++ cannot inject the fuzz input into argv -- run_campaign adds the `@@` file
+    placeholder only for file mode, so any other mode is fed over stdin. A replay that then
+    delivers via argv would never reproduce, and every real arg-mode crash would be dropped as
+    a clean zero, so both must agree the delivery is stdin."""
+    from pathlib import Path
+
+    captured = {}
+
+    class _P:
+        returncode = 0
+        stdout = b""
+        stderr = b""
+
+    def fake_run(cmd, **kw):
+        captured["cmd"] = list(cmd)
+        return _P()
+
+    monkeypatch.setattr(aflpp.subprocess, "run", fake_run)
+    aflpp.run_campaign(Path("/bin/true"), Path("/bin/true"), tmp_path, tmp_path,
+                       seconds=1, mode="arg", qemu=False)
+    assert "@@" not in captured["cmd"], "arg mode must be fed over stdin, not placed in argv"
+    aflpp.run_campaign(Path("/bin/true"), Path("/bin/true"), tmp_path, tmp_path,
+                       seconds=1, mode="file", qemu=False)
+    assert "@@" in captured["cmd"], "file mode delivers via the @@ placeholder"
+
+
+def test_coverage_stage_normalises_a_non_stdin_non_file_mode_to_stdin():
+    """Since AFL feeds a non-file mode over stdin, the stage must replay over stdin too. It
+    normalises anything that is not file/stdin to stdin so the crash is found and replayed the
+    same way, instead of fuzzing via stdin and replaying via argv."""
+    import inspect
+
+    from lykos.analyze.fuzz import coverage
+    src = inspect.getsource(coverage.coverage_stage)
+    assert 'mode not in ("file", "stdin")' in src
+    assert 'mode = "stdin"' in src
+
+
 def test_coverage_stage_errors_clearly_when_afl_absent(store, case, pool, gcc, tmp_path,
                                                        monkeypatch):
     monkeypatch.delenv("AFL_PATH", raising=False)

@@ -127,7 +127,8 @@ def cross_taint_case(conn, content, case_id: str, *, persist: bool = True,
     # stopped before ever loading the callee.
     why: dict = {"no_components": len(targets) < 2, "no_links": not dyn,
                  "edges_without_tainted_symbol": 0, "edges_with_clean_callee": 0,
-                 "callers_without_ir": 0, "components_over_cap": 0}
+                 "callers_without_ir": 0, "callees_without_ir": 0,
+                 "components_over_cap": 0}
     for e in dyn:
         a, b = targets.get(e.src_target), targets.get(e.dst_target)
         if not a or not b:
@@ -138,6 +139,15 @@ def cross_taint_case(conn, content, case_id: str, *, persist: bool = True,
         src_ir = comp(e.src_target)[0]
         if not src_ir:
             why["callers_without_ir"] += 1
+            continue
+        # Symmetric to the caller guard, and the bug this fixes: a callee with no IR (never
+        # decompiled -- a stripped .so or a component carved from firmware) has no functions to
+        # search for a dangerous sink, so `callee_sink_exports` returns nothing and the loop
+        # below would set `clean=True` and report "the callee does not misuse the data -- a
+        # real negative". That is a false negative stated with confidence about an analysis
+        # that never ran. Count it as a missing analysis and skip, exactly as the caller side.
+        if not comp(e.dst_target)[0]:
+            why["callees_without_ir"] += 1
             continue
         # The data-flow engine returns an empty result above its function ceiling, and says
         # nothing. Without this check the diagnosis below could report "the callee does not
@@ -201,6 +211,13 @@ def _why_nothing(why: dict, found: int):
                 f"decompiled, so there is no data flow to trace across the boundary. Run "
                 f"disassemble on the components first -- carved firmware components arrive "
                 f"without it.")
+    if why.get("callees_without_ir"):
+        n = why["callees_without_ir"]
+        return (f"{n} callee component{'s have' if n != 1 else ' has'} not been decompiled, "
+                f"so there is no code on the far side of the boundary to search for a "
+                f"dangerous sink. 'No sink reached' here is a missing analysis, not a real "
+                f"negative -- run disassemble on the callee (carved firmware and stripped "
+                f"libraries arrive without it).")
     if why["edges_without_tainted_symbol"]:
         return (f"{why['edges_without_tainted_symbol']} linked boundar"
                 f"{'ies' if why['edges_without_tainted_symbol'] != 1 else 'y'} carried no "

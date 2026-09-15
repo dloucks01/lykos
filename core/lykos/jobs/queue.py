@@ -81,7 +81,7 @@ class JobQueue:
                     self._commit()
                     return self.runs.get(run.id)  # type: ignore[return-value]
                 if dedup:
-                    pending = self._find_pending(ck)
+                    pending = self._find_pending(ck, case_id)
                     if pending:
                         self._rollback(mark)
                         return pending
@@ -95,10 +95,16 @@ class JobQueue:
             self._rollback(mark); raise
         return run
 
-    def _find_pending(self, cache_key: str) -> Optional[AnalysisRun]:
+    def _find_pending(self, cache_key: str, case_id: str) -> Optional[AnalysisRun]:
+        # Scoped to the case: cache_key is deliberately case-independent (hashing.py), so a
+        # cross-case match here would hand case B a run that belongs to case A -- B would then
+        # get no run of its own, and none of its per-case rows/events/reprojection. A second
+        # case with the same input instead gets its own queued run and cache-hits off the
+        # first once it completes (find_cached, above, is the cross-case sharing path).
         r = self.conn.execute(
-            "SELECT * FROM analysis_run WHERE cache_key=? AND status IN ('queued','running') "
-            "ORDER BY created_at ASC LIMIT 1", (cache_key,)).fetchone()
+            "SELECT * FROM analysis_run WHERE cache_key=? AND case_id=? "
+            "AND status IN ('queued','running') "
+            "ORDER BY created_at ASC LIMIT 1", (cache_key, case_id)).fetchone()
         return AnalysisRunDAO._row(r) if r else None
 
     def _materialize_cache_hit(self, case_id: str, stage: str, target_id: Optional[str],

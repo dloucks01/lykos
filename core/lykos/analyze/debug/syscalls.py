@@ -104,11 +104,13 @@ def record():
 gdb.execute("set pagination off")
 gdb.execute("set height 0")
 gdb.execute("catch syscall " + " ".join(sorted(set(NR.values()))))
+RAN, ERR = False, ""
 try:
     # args inline: `set args X` then `run < file` resets args to empty (gdb quirk) -> argv lost
     gdb.execute("run " + RUN_ARGS + ((" < " + INPUT_FILE) if INPUT_FILE else ""))
-except gdb.error:
-    pass
+    RAN = True            # the inferior executed (run reached the first catchpoint or exit)
+except gdb.error as _e:
+    ERR = str(_e)         # never ran (exec-format / cannot-execute / ptrace-denied)
 inf = gdb.selected_inferior()
 while inf.threads() and len(EV) < MAX:
     if sreg("rax") == -38:                      # -ENOSYS: syscall ENTRY (args valid)
@@ -117,6 +119,9 @@ while inf.threads() and len(EV) < MAX:
         gdb.execute("continue")
     except gdb.error:
         break
+# LYKOS_STATUS separates "ran and made no tracked syscall" from "never ran": an empty trace from
+# a target that could not be executed must not read as "does nothing security-relevant".
+print("LYKOS_STATUS " + json.dumps({"ran": RAN, "error": ERR}))
 print("LYKOS_SYS " + json.dumps(EV))
 '''
 
@@ -204,14 +209,28 @@ def trace_qemu(exe, arch, *, endianness=None, bits=None, argv=(), stdin=b"", tim
     d = Path(tempfile.mkdtemp(prefix="lykos-qsys-"))
     try:
         log = d / "strace.log"
-        cmd = [qemu, "-strace", "-D", str(log), str(exe), *[str(a) for a in argv]]
-        note = None
+        exe_abs = str(Path(exe).resolve())            # absolute: bwrap chdirs to /tmp
+        exedir = str(Path(exe_abs).parent)
+        inner = [qemu, "-strace", "-D", str(log), exe_abs, *[str(a) for a in argv]]
+        # Contain the (hostile) guest: bwrap read-only root, net unshared, rlimits. qemu writes
+        # its -strace log to a file under `d`, so `d` is bound WRITABLE; the exe dir is read-only.
+        cmd = sandbox.isolate_prefix(exedir, net=False, rw_binds=[str(d)]) + inner
+        note = timed_out = None
         try:
-            subprocess.run(cmd, input=stdin, capture_output=True, timeout=timeout)
+            sandbox.run_reaped(cmd, input=stdin, capture_output=True, timeout=timeout,
+                               preexec_fn=sandbox._rlimits(4096, int(timeout) + 5, set_as=False,
+                                                           nproc=sandbox._nproc_cap(True)))
         except subprocess.TimeoutExpired:
-            note = "trace timed out"                    # still parse what was logged
+            note, timed_out = "trace timed out", True    # still parse what was logged
         text = log.read_text("latin-1", "ignore") if log.exists() else ""
-        return {"ok": True, "events": _parse_qemu_strace(text), "note": note}
+        if not text.strip() and not timed_out:
+            # qemu-user logs the loader's own startup syscalls the instant the guest executes, so
+            # an empty log with no timeout means the guest never ran (bad image / arch mismatch)
+            # -- not "clean, no behavior".
+            return {"ok": False, "note": "the target produced no trace under qemu-user -- it "
+                    "did not execute; no behavior was observed"}
+        return {"ok": True, "events": _parse_qemu_strace(text), "note": note,
+                "timed_out": bool(timed_out)}
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
@@ -231,15 +250,32 @@ def trace(exe, arch, *, argv=(), stdin=b"", timeout=25):
         script = _SCRIPT % {"nr": repr(NR), "infile": infile,
                             "runargs": " ".join(shlex.quote(a) for a in argv)}
         (d / "sys.py").write_text(script)
-        proc = subprocess.run([gdb_bin, "-batch", "-nx", "-x", str(d / "sys.py"), str(exe)],
-                              capture_output=True, timeout=timeout + 20)
+        from ..dynamic import sandbox
+        # Contain the (hostile) target under GDB: bwrap read-only root (net unshared -- ptrace
+        # needs no loopback) + rlimits. The script/input dir is re-bound read-only for gdb.
+        exe_abs = str(Path(exe).resolve())            # absolute: bwrap chdirs to /tmp
+        exedir = str(Path(exe_abs).parent)
+        inner = [gdb_bin, "-batch", "-nx", "-x", str(d / "sys.py"), exe_abs]
+        cmd = sandbox.isolate_prefix(exedir, net=False, ro_binds=[str(d)]) + inner
+        proc = sandbox.run_reaped(cmd, capture_output=True, timeout=timeout + 20,
+                                  preexec_fn=sandbox._rlimits(2048, int(timeout) + 20,
+                                                              set_as=False))
         out = proc.stdout.decode("latin-1", "ignore")
-        ev = []
+        ev = status = None
         for line in out.splitlines():
             if line.startswith("LYKOS_SYS "):
                 ev = json.loads(line[len("LYKOS_SYS "):])
+            elif line.startswith("LYKOS_STATUS "):
+                status = json.loads(line[len("LYKOS_STATUS "):])
+        if ev is None or status is None:
+            return {"ok": False, "note": "gdb did not run to completion (no result marker) -- "
+                    "the target could not be traced; no behavior was observed"}
+        if not status.get("ran"):
+            return {"ok": False, "note": "the target never executed under gdb (%s) -- no "
+                    "syscalls traced, which is not the same as no behavior"
+                    % (status.get("error") or "unknown reason")}
         return {"ok": True, "events": ev}
     except subprocess.TimeoutExpired:
-        return {"ok": True, "events": [], "note": "trace timed out"}
+        return {"ok": False, "note": "syscall trace timed out before completing"}
     finally:
         shutil.rmtree(d, ignore_errors=True)

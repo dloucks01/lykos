@@ -212,6 +212,11 @@ _REPO = Path(__file__).resolve().parents[3]
 # A real parser with no known bug should produce a report an analyst can read. unzip's
 # fifteen findings were two thirds false; this is the ceiling that would have caught it.
 _REPORT_CEILING = 12
+# A `no_crash` negative only means something if the fuzzer ACTUALLY RAN. An empty crash set
+# from a campaign that never executed (mis-config, sandbox down) is indistinguishable from a
+# genuinely quiet target -- the "absence of evidence" trap. Require this many real executions
+# before crediting a clean result; matches the stage's own "starved" floor.
+_MIN_FUZZ_EXECS = 200
 
 
 MATRIX = [
@@ -432,10 +437,22 @@ def run_case(case: RealCase, exe: Path, *, timeout: float = 30.0) -> dict:
                 crashes = [d for d in DynResultDAO(store.conn).list_by_target(target.id)
                            if d.crashed]
                 got["found_by_fuzzing"] = bool(crashes)
-                got["no_crash"] = not crashes
                 res["detail"]["model"] = _done_field(store, cid, "fuzz", "fuzz.format", "model")
                 res["detail"]["crashes"] = len(crashes)
+                # The campaign's total executions come from its TERMINAL summary event, which
+                # sits past _done_field's small window (fuzz emits a progress event every 250
+                # execs), so scan to the end for it.
+                fuzz_execs = _last_done_field(store, cid, "fuzz", "fuzz.channels", "execs")
+                res["detail"]["execs"] = fuzz_execs
+                ran = isinstance(fuzz_execs, int) and fuzz_execs >= _MIN_FUZZ_EXECS
+                # A clean result is only credited when the fuzzer both ran and found nothing.
+                # A campaign that did not run FAILS the negative case rather than passing it.
+                got["no_crash"] = (not crashes) and ran
                 if "no_crash" in case.expect:
+                    if not ran:
+                        res["detail"]["why_no_crash"] = (
+                            f"fuzz campaign did not run (execs={fuzz_execs}); a clean verdict "
+                            "cannot be credited")
                     res["ok"] = all(got.get(k) == v for k, v in _asserts(case).items())
                     res["missing"] = [k for k, v in _asserts(case).items()
                                       if got.get(k) != v]
@@ -531,6 +548,29 @@ def _done_field(store, cid, stage, event_type, field_name):
         for e in store.events.list(run_id=r.id, limit=60):
             if e.type == event_type and isinstance(e.payload, dict):
                 return e.payload.get(field_name)
+    return None
+
+
+def _last_done_field(store, cid, stage, event_type, field_name):
+    """Like `_done_field`, but scans ALL of a run's events to the end and returns the LAST
+    match. Needed for a TERMINAL event of a high-volume stage: fuzz emits a progress event
+    every 250 execs, so its final `fuzz.channels` summary sits far past a small page window."""
+    runs = [r for r in store.runs.list_by_case(cid) if r.stage == stage]
+    for r in reversed(runs):
+        found = None
+        after = 0
+        while True:
+            batch = store.events.list(run_id=r.id, after_id=after, limit=500)
+            if not batch:
+                break
+            for e in batch:
+                if e.type == event_type and isinstance(e.payload, dict):
+                    found = e.payload.get(field_name)
+            after = batch[-1].id
+            if len(batch) < 500:
+                break
+        if found is not None:
+            return found
     return None
 
 

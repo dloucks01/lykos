@@ -221,6 +221,12 @@ def capture(exe, argv, stdin_file, timeout, breakpoints=None):
                 import resource
                 resource.setrlimit(resource.RLIMIT_CPU, (int(timeout) + 1, int(timeout) + 2))
                 resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+                # Bound a hostile target's memory and disk writes -- not just its CPU. (NPROC is
+                # left to the outer runner's baseline-aware cap; a fixed value here would fail
+                # execv with EAGAIN on a busy host.)
+                lim = 4096 << 20
+                resource.setrlimit(resource.RLIMIT_AS, (lim, lim))
+                resource.setrlimit(resource.RLIMIT_FSIZE, (64 << 20, 64 << 20))
             except Exception:
                 pass
             libc.ptrace(PTRACE_TRACEME, 0, 0, 0)

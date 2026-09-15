@@ -244,6 +244,59 @@ def test_qemu_selection_covers_every_supported_arch():
         assert suf == want, f"{arch}/{endian}/{bits}: got qemu-{suf}, want qemu-{want}"
 
 
+def test_secret_mask_args_covers_root_dotfiles_and_registered_dirs(tmp_path):
+    """The read-only root exposes the whole host fs; host SECRETS (ssh keys, the case store)
+    must be masked with an empty tmpfs so hostile code cannot read and exfil them via stdout."""
+    import os
+    store = tmp_path / "casestore"; store.mkdir()
+    sandbox.protect_dir(str(store))
+    masks = sandbox._secret_mask_args()
+    # a registered dir (the case store) is masked
+    assert "--tmpfs" in masks and str(store) in masks
+    # /root is masked when it exists on the host
+    if os.path.isdir("/root"):
+        assert "/root" in masks
+    # and the mask is actually injected into the bwrap prefix the debug/PoC paths build
+    if sandbox._bwrap_usable():
+        pre = sandbox.isolate_prefix(str(tmp_path), net=False)
+        assert str(store) in pre
+
+
+def test_hostile_target_cannot_read_a_masked_secret(gcc, tmp_path, monkeypatch):
+    """End to end: a target run in the sandbox cannot open a file inside a protected dir even
+    though the read-only root would otherwise expose it (isolation is real, not advisory)."""
+    if not sandbox._bwrap_usable():
+        pytest.skip("bwrap unavailable")
+    secret = tmp_path / "secretstore"; secret.mkdir()
+    (secret / "creds").write_text("TOPSECRET")
+    sandbox.protect_dir(str(secret))
+    exedir = tmp_path / "bin"; exedir.mkdir()
+    src = tmp_path / "r.c"; src.write_text(
+        '#include <stdio.h>\n#include <stdlib.h>\n'
+        'int main(){FILE*f=fopen(getenv("S"),"rb");printf("R%d\\n",f?1:0);'
+        'if(f)fclose(f);return 0;}\n')
+    exe = exedir / "r"
+    if subprocess.run([gcc, "-O0", str(src), "-o", str(exe)], capture_output=True).returncode:
+        pytest.skip("build failed")
+    monkeypatch.setenv("S", str(secret / "creds"))
+    res = sandbox.run(str(exe), timeout=10)
+    assert res.isolation.startswith("bwrap")     # actually contained, not the rlimits fallback
+    assert b"R0" in res.stdout                    # the masked secret could NOT be opened
+
+
+def test_dynamic_stage_marks_never_run_distinct_from_clean(monkeypatch, tmp_path):
+    """A target that never executed (no qemu for its arch) must be reported as 'did not run',
+    not 'clean exit' -- absence of evidence is not evidence of absence."""
+    monkeypatch.setattr(sandbox.shutil, "which", lambda name: None)   # no qemu at all
+    exe = _mini_elf(tmp_path / "x", 0xB7)
+    res = sandbox.run(str(exe), arch="aarch64", host="x86-64")
+    assert res.isolation == "unsupported-arch"
+    # the stage's classifier: this isolation is in the "did not run" set, so ran is False
+    from lykos.analyze.dynamic import stage
+    assert res.isolation in stage._DID_NOT_RUN
+    assert "bwrap+netns" not in stage._DID_NOT_RUN     # a real run is not in the set
+
+
 def test_argv_arg_refuses_a_nul_payload_with_a_usable_reason():
     """execve() argument strings are NUL-terminated, so an argv element cannot carry a NUL.
 

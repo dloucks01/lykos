@@ -84,16 +84,24 @@ _CMP_OPS = {"INT_LESS", "INT_LESSEQUAL", "INT_SLESS", "INT_SLESSEQUAL", "INT_EQU
 _ADD_OPS = {"INT_ADD", "INT_MULT", "INT_LEFT"}
 
 
-def _intover_candidates(func_irs, functions, only=None, width=4):
+def _intover_candidates(func_irs, functions, only=None, width=4, ptr_bytes=8):
     """Sums narrower than a pointer that are then COMPARED: a check the sum can wrap past.
 
     `only` restricts this to the functions attacker data actually reaches. Without it the
     pattern is everywhere -- eighteen of jhead's functions do 32-bit arithmetic in a
     comparison, most of it loop and buffer bookkeeping that no input can steer -- and a report
     that doubles in size to say so is the inventory-as-findings mistake again.
+
+    `ptr_bytes` is the target's pointer width. The hazard is a sum computed NARROWER than a
+    pointer that then feeds a pointer-width comparison/index: the sum wraps, the check passes.
+    A `width`-byte add is only that hazard when `width < ptr_bytes`; on a 32-bit target a
+    32-bit add is pointer-width and cannot wrap past a pointer, so flagging it as CWE-190 was
+    a false positive. When the sum is not narrower than a pointer, this channel emits nothing.
     """
     names = {f.addr: f.name for f in functions}
     out = []
+    if width >= ptr_bytes:
+        return out                           # not narrower than a pointer: cannot wrap past it
     for faddr, ir in (func_irs or {}).items():
         if only is not None and faddr not in only:
             continue
@@ -366,7 +374,19 @@ def detect_stage(ctx) -> dict:
     # deliberate deep run.
     taint_cap = int(p_det.get("max_taint_functions") or taint._MAX_FUNCS)
     taint_skipped = None
-    if len(func_irs) > taint_cap:
+    if not taint._arch_key(target.arch):
+        # No ABI model for this arch (e.g. mips64/s390x/sparc64 that ingest still accepts):
+        # analyze_program would return an empty set with no notice, indistinguishable from
+        # "ran and found nothing". Say the channel could not run.
+        taint_skipped = {
+            "arch": target.arch,
+            "note": (f"taint has no ABI model for arch {target.arch!r}, so the data-flow "
+                     f"channel, the dereference channel and bounds corroboration did not run. "
+                     f"Findings below are rule-channel only and cannot be promoted past "
+                     f"candidate.")}
+        ctx.emit("detect.taint_skipped", payload=taint_skipped)
+        tainted_sites = set()
+    elif len(func_irs) > taint_cap:
         taint_skipped = {
             "functions": len(func_irs), "cap": taint_cap,
             "note": (f"{len(func_irs)} functions exceeds the data-flow ceiling of {taint_cap}, "
@@ -400,7 +420,8 @@ def detect_stage(ctx) -> dict:
     touched = {d["function_addr"] for d in derefs}
     touched |= {c["function_addr"] for c in cands
                 if c.get("site_addr") in tainted_sites and c.get("function_addr")}
-    cands += _intover_candidates(func_irs, dctx.functions, only=touched)
+    cands += _intover_candidates(func_irs, dctx.functions, only=touched,
+                                 ptr_bytes=(target.bits or 64) // 8)
     for c in cands:
         if c["detector"] == "dangerous_api" and c.get("site_addr") in tainted_sites:
             c["state"] = "corroborated"

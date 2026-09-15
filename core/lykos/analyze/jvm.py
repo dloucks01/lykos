@@ -201,6 +201,29 @@ def parse_manifest(text: str) -> dict:
 _APP_PREFIXES = ("BOOT-INF/classes/", "WEB-INF/classes/")
 
 
+# A jar is untrusted: a member a few KB compressed can inflate to gigabytes (a "zip bomb").
+# Cap every member read so one hostile entry cannot exhaust memory. 8 MB is far above any real
+# class file (a single method's bytecode maxes at 64 KB) or manifest.
+_MAX_ENTRY_BYTES = 8 * 1024 * 1024
+
+
+def _safe_read(z: "zipfile.ZipFile", name: str) -> Optional[bytes]:
+    """Read a zip member, refusing to inflate a decompression bomb. Returns None if the member
+    is absent, unreadable, or larger than the per-entry cap. The read itself is bounded, so a
+    member that LIES about its uncompressed size in the central directory is still contained."""
+    try:
+        if z.getinfo(name).file_size > _MAX_ENTRY_BYTES:
+            return None
+    except KeyError:
+        return None
+    try:
+        with z.open(name) as fh:
+            buf = fh.read(_MAX_ENTRY_BYTES + 1)
+    except Exception:
+        return None
+    return None if len(buf) > _MAX_ENTRY_BYTES else buf
+
+
 def parse(data: bytes, *, max_classes: int = 4000) -> JvmInfo:
     """A jar (or a bare .class) -- manifest, entry point, classes, strings and calls."""
     if is_class(data):
@@ -216,11 +239,12 @@ def parse(data: bytes, *, max_classes: int = 4000) -> JvmInfo:
         info.entries = len(names)
         info.signed = any(n.startswith("META-INF/") and n.endswith((".SF", ".RSA", ".DSA"))
                           for n in names)
-        try:
-            info.manifest = parse_manifest(
-                z.read("META-INF/MANIFEST.MF").decode("utf-8", "replace"))
-        except Exception:
-            pass
+        mf = _safe_read(z, "META-INF/MANIFEST.MF")
+        if mf is not None:
+            try:
+                info.manifest = parse_manifest(mf.decode("utf-8", "replace"))
+            except Exception:
+                pass
         info.main_class = (info.manifest.get("Main-Class")
                            or info.manifest.get("Start-Class"))
         cp = info.manifest.get("Class-Path") or ""
@@ -234,8 +258,12 @@ def parse(data: bytes, *, max_classes: int = 4000) -> JvmInfo:
         seen: set = set()
         calls: set = set()
         for n in app[:max_classes]:
+            raw = _safe_read(z, n)
+            if raw is None:
+                info.errors.append(f"{n}: skipped (entry too large or unreadable)")
+                continue
             try:
-                sub = parse_class(z.read(n))
+                sub = parse_class(raw)
             except Exception as e:
                 info.errors.append(f"{n}: {e!r}")
                 continue

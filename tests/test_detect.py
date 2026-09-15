@@ -213,6 +213,25 @@ def test_stack_buffer_overflow_reports_at_defect_grain():
     assert len({c["site_addr"] for c in out}) == 3
 
 
+def test_stack_buffer_overflow_reports_every_distinct_sink_in_one_function():
+    """A function that owns a fixed buffer and calls BOTH gets() and sprintf() is two
+    distinct stack-smashes. Reporting only sinks[0] silently dropped the rest."""
+    from lykos.analyze.detect.detectors import stack_buffer_overflow
+    buf = {"name": "msg", "offset": -72, "size": 64, "type": "char[64]", "is_buffer": True}
+    ctx = DetectContext(
+        target_id="t", case_id="c", strings=[],
+        call_edges=[_edge("0x1000", "0x1010", None, "gets", 1),
+                    _edge("0x1000", "0x1020", None, "sprintf", 1),
+                    _edge("0x1000", "0x1030", None, "gets", 1)],
+        frames={"0x1000": {"frame_size": 88, "vars": [buf]}})
+    out = stack_buffer_overflow(ctx)
+    # both sink NAMES are reported, and every call site is recorded as an occurrence
+    assert {c["dedup_key"] for c in out} == {"CWE-121:stack_frame:gets",
+                                             "CWE-121:stack_frame:sprintf"}
+    assert {c["site_addr"] for c in out} == {"0x1010", "0x1020", "0x1030"}
+    assert sum(1 for c in out if c["dedup_key"].endswith("gets")) == 2
+
+
 def test_function_dao_roundtrips_signature_and_frame(store, case):
     t = make_target(store, case.id)
     fd = FunctionDAO(store.conn)
@@ -472,6 +491,23 @@ def test_a_bounds_check_that_can_wrap_is_reported():
     # a sum nothing compares is just arithmetic
     plain = ir("INT_ADD unique:0x100:4 unique:0x200:4 -> unique:0x300:4")
     assert _intover_candidates({"0x1000": plain}, [_F()]) == []
+
+
+def test_a_pointer_width_sum_is_not_a_wrap_on_a_32_bit_target():
+    """On a 32-bit target a 32-bit add IS pointer-width and cannot wrap PAST a pointer, so
+    the same shape that is a hazard on a 64-bit target is ordinary pointer arithmetic here.
+    Flagging it CWE-190 was a false positive; the width must come from the target's bits."""
+    from lykos.analyze.detect.stage import _intover_candidates
+
+    class _F:
+        addr, name = "0x1000", "parse"
+    wraps = {"blocks": [{"addr": "0x1000", "instructions": [{"addr": "0x1004", "pcode": [
+        "INT_ADD unique:0x100:4 unique:0x200:4 -> unique:0x300:4",
+        "INT_LESS unique:0x300:4 unique:0x400:4 -> reg:CF:1"]}]}]}
+    # 64-bit pointer: 32-bit sum is narrower than a pointer -> hazard
+    assert _intover_candidates({"0x1000": wraps}, [_F()], ptr_bytes=8)
+    # 32-bit pointer: 32-bit sum is pointer-width -> nothing to report
+    assert _intover_candidates({"0x1000": wraps}, [_F()], ptr_bytes=4) == []
 
 
 def test_the_wrapping_check_is_only_reported_where_input_reaches():

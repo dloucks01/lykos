@@ -35,6 +35,15 @@ int main(void){ char b[16]; char line[512];
   if(n > 32) strcpy(b,line);            /* overflows only for a long input */
   printf("%zu\\n", n); return 0; }
 """
+# A handler that returns from SIGSEGV without fixing the fault: the kernel re-runs the faulting
+# instruction, which faults again, forever. Under ptrace this is a flood of back-to-back stops
+# that the per-input deadline used to miss entirely (it was only checked while WAITING for a
+# stop), so one such input could spin the runner without end.
+_REFAULT_C = """
+#include <signal.h>
+static void h(int s){ (void)s; }
+int main(void){ signal(SIGSEGV, h); volatile int *p = 0; *p = 1; return 0; }
+"""
 # two branches, so a block list can tell one input's path from another's
 _BRANCH_C = """
 #include <stdio.h>
@@ -129,6 +138,37 @@ def test_a_crashing_input_carries_its_fault_address(gcc, tmp_path):
     if not res[0].crashed:
         pytest.skip("the fixture did not fault on this toolchain")
     assert res[0].isolation == "bwrap+netns+batch"
+
+
+def _libc_for_trace():
+    import ctypes
+    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    libc.ptrace.restype = ctypes.c_long
+    libc.ptrace.argtypes = [ctypes.c_long, ctypes.c_long, ctypes.c_void_p, ctypes.c_void_p]
+    return libc
+
+
+def test_a_refaulting_handler_is_killed_at_the_deadline_not_spun_forever(gcc, tmp_path):
+    """A program whose SIGSEGV handler returns without fixing the fault re-faults on every
+    instruction retry, producing back-to-back ptrace stops. The deadline used to be consulted
+    only inside the wait loop -- which never runs when a stop is always ready -- so `_trace_one`
+    looped without end. It must now enforce the deadline at the top of every iteration and cap
+    forwarded signals, terminating bounded and reporting a hang."""
+    import time
+
+    exe = _build(gcc, tmp_path, _REFAULT_C, "refault", extra=["-no-pie"])
+    blocks = _blocks_of(exe)                              # force the traced path
+    if not blocks:
+        pytest.skip("no function entries recovered")
+    libc = _libc_for_trace()
+    start = time.time()
+    rc, out, err, flags, reached, fault_pc = batch_runner._trace_one(
+        libc, [str(exe)], b"", 2.0, blocks, str(exe), {})
+    elapsed = time.time() - start
+    # the regression: without the fix this never returns
+    assert elapsed < 20, f"re-fault loop was not bounded ({elapsed:.1f}s); deadline not enforced"
+    # when it did loop, it is a hang, not a single clean crash
+    assert flags == 1 or elapsed < 1.0, "a bounded re-fault loop must be reported as a hang"
 
 
 def test_isolation_is_not_traded_away_for_speed(gcc, tmp_path):

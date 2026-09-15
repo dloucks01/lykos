@@ -44,26 +44,55 @@ def matches(ground_truth: str, found_cwes) -> bool:
 
 
 def gate(metrics: dict, meta: dict, *, stage: str = "static", min_recall: float = 1.0,
-         max_fp_rate: float = 0.0, require_backend: bool = False):
+         max_fp_rate: float = 0.0, require_backend: bool = False, min_negative: int = 0):
     """Release-gate decision over a scored run. Returns (passed, verdict, reason).
 
     verdict is PASS / FAIL / SKIP. A run whose required backend is absent (static without
-    Ghidra) SKIPs rather than fails, unless `require_backend`, so a CI host lacking the backend
-    doesn't produce a false regression. Otherwise the gate FAILs if recall drops below
-    `min_recall` or the false-positive rate exceeds `max_fp_rate`.
+    Ghidra, dynamic/lava without a compiler) SKIPs rather than fails, unless `require_backend`,
+    so a CI host lacking the backend doesn't produce a false regression. Otherwise the gate
+    FAILs if recall drops below `min_recall` or the false-positive rate exceeds `max_fp_rate`.
+
+    Recall and fp_rate are recomputed here from the exact integer confusion-matrix counts, NOT
+    read from `overall`'s rounded display floats: rounding recall to 3 dp lets a 0.9996 recall
+    pass a 1.0 ratchet, and rounding fp_rate lets a handful of false positives in a large
+    negative set pass a 0.0 ceiling. The ratchet must see the true value.
+
+    `min_negative` guards the precision axis: fp_rate is None when no `good` cases were scored,
+    which otherwise passes the fp check vacuously. Require a floor of negatives so a corpus that
+    lost its discrimination negatives FAILs instead of silently passing precision.
     """
     o = metrics.get("overall", {})
-    recall, fp_rate = o.get("recall"), o.get("fp_rate")
-    n_positive = o.get("tp", 0) + o.get("fn", 0)
-    backend_absent = stage == "static" and not meta.get("ghidra")
+    tp, fp = o.get("tp", 0), o.get("fp", 0)
+    fn, tn = o.get("fn", 0), o.get("tn", 0)
+    n_positive = tp + fn
+    n_negative = fp + tn
+    recall = tp / n_positive if n_positive else None
+    fp_rate = fp / n_negative if n_negative else None
+
+    # A static run needs Ghidra; a dynamic/lava run needs a compiler for the crash corpus (the
+    # sandbox runs the native binaries -- there is no qemu in that path). Check backend-absence
+    # FIRST: the corpus still "scores" with the backend missing (every bad case a false
+    # negative), so n_positive > 0 and the recall check below would FAIL a CI host that simply
+    # lacks the backend. That is the false regression the SKIP exists to avoid.
+    if stage == "static":
+        backend_absent, need = (not meta.get("ghidra")), "Ghidra"
+    elif stage in ("dynamic", "lava"):
+        backend_absent, need = (not meta.get("gcc")), "a compiler"
+    else:
+        backend_absent, need = False, ""
+    if backend_absent and not require_backend:
+        return True, "SKIP", f"{stage} benchmark needs {need} (not found)"
     if n_positive == 0:
-        if backend_absent and not require_backend:
-            return True, "SKIP", "static benchmark needs Ghidra (not found)"
         return False, "FAIL", "no bad cases were scored"
+    if n_negative < min_negative:
+        return False, "FAIL", (
+            f"only {n_negative} negative case(s) scored (need >= {min_negative}); "
+            "fp_rate is not measurable")
     ok = (recall is not None and recall >= min_recall
           and (fp_rate is None or fp_rate <= max_fp_rate))
     return ok, ("PASS" if ok else "FAIL"), (
-        f"recall {recall} (min {min_recall}), fp_rate {fp_rate} (max {max_fp_rate})")
+        f"recall {_round(recall)} (min {min_recall}), "
+        f"fp_rate {_round(fp_rate)} (max {max_fp_rate})")
 
 
 @dataclass

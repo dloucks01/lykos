@@ -200,6 +200,30 @@ def test_a_pair_is_only_driven_when_the_model_says_it_is_one():
     assert [f["val"] for f in fields] == [1, 2], "nothing to pair with, nothing changed"
 
 
+def test_a_narrow_offset_size_pair_does_not_crash_the_mutator():
+    """A u8/u16 size+offset pair leaves the wrap-the-sum branch with no far-offset candidate
+    that fits the field, so `rng.choice([])` used to raise -- and because the mutation loop was
+    not guarded, that IndexError propagated straight out of `mutate` and took the whole campaign
+    down. An analyst spec must never be able to do that: the driver falls back, and any residual
+    error degrades to byte havoc like a parse/serialize failure already does."""
+    import random
+    spec = [{"type": "magic", "value": b"HH"},
+            {"type": "u8", "name": "off", "role": "offset"},
+            {"type": "u8", "name": "siz", "role": "size"},
+            {"type": "blob", "name": "data"}]
+    model = S.FormatModel(spec)
+    mut = S.StructMutator(random.Random(0), model)
+    seed = b"HH\x01\x01payload"
+    for _ in range(500):
+        out = mut.mutate(seed, [seed])                   # must never raise
+        assert isinstance(out, (bytes, bytearray))
+    # and the driver itself, called directly, is safe when the field is too narrow to wrap
+    fields = model.parse(seed)
+    leaves = [f for f in fields if f["f"].get("role") in ("offset", "size")]
+    for _ in range(200):
+        mut._drive_pair(fields, leaves[0], "offset")     # u8 offset: no candidate > 0xFFFF
+
+
 def test_every_builtin_survives_its_own_mutations():
     """A model that parses its seed but throws on a mutant silently falls back to byte havoc
     -- or takes the stage down. `length_of` naming a GROUP (a ZIP's central directory) hit the

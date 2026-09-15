@@ -1,4 +1,6 @@
 dist/
+.mypy_cache/
+.pytest_cache/
 .cases/
 .ruff_cache/
 __pycache__/

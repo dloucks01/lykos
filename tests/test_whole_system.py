@@ -149,3 +149,35 @@ def test_whole_system_auto_derives_from_ipc_edge(store, case, pool, sys_bins):
         assert [d for d in DynResultDAO(store.conn).list_by_target(cons.id) if d.crashed]
     finally:
         _clean()
+
+
+def test_blame_needs_a_service_crash_the_benign_baseline_did_not_show():
+    """Cross-boundary blame is only earned when the test input CAUSED the service crash. A
+    service that also crashes on a benign baseline crashes regardless of input and must not be
+    attributed to it -- inferring causation from mere coincidence is the false positive the
+    baseline control exists to stop."""
+    from lykos.analyze.link.detonate import CompOutcome, _blame
+
+    entry = {"filename": "prod", "target_id": "tp"}
+    svc_crash = [
+        CompOutcome(target_id="tp", filename="prod", role="entry"),
+        CompOutcome(target_id="tc", filename="cons", role="service", crashed=True,
+                    signal_name="SIGSEGV"),
+    ]
+    # the service crashed ONLY with the test input -> cross-boundary blame
+    b = _blame(entry, svc_crash, baseline_crashers=set())
+    assert b and b["cross_boundary"] and b["crashed"] == "cons"
+
+    # the SAME crash, but the service also died on the benign baseline -> not attributable
+    assert _blame(entry, svc_crash, baseline_crashers={"cons"}) is None
+
+    # the entry crashing directly is always attributable (it received the input), even if a
+    # baseline-crashing service is also down -- but that is a direct crash, not cross-boundary
+    both = [
+        CompOutcome(target_id="tp", filename="prod", role="entry", crashed=True,
+                    signal_name="SIGSEGV"),
+        CompOutcome(target_id="tc", filename="cons", role="service", crashed=True,
+                    signal_name="SIGABRT"),
+    ]
+    b3 = _blame(entry, both, baseline_crashers={"cons"})
+    assert b3 and not b3["cross_boundary"] and b3["crashed"] == "prod"

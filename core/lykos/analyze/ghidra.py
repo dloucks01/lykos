@@ -70,9 +70,18 @@ def run_headless(headless: Path, binary: Path, out_json: Path, *, ctx=None,
            "-analysisTimeoutPerFile", str(timeout)]
     try:
         if ctx is not None:
-            ctx.run_subprocess(cmd, timeout=timeout + 120)
+            res = ctx.run_subprocess(cmd, timeout=timeout + 120)
         else:
-            subprocess.run(cmd, timeout=timeout + 120, capture_output=True)
+            res = subprocess.run(cmd, timeout=timeout + 120, capture_output=True)
+        # A non-zero exit means analysis failed; a stale or partial out_json from a previous
+        # run (or a post-script that aborted mid-write) must not be read as success -- surface
+        # the failure instead of silently handing parse_result degraded data.
+        if res.returncode != 0:
+            tail = res.stderr or b""
+            if isinstance(tail, bytes):
+                tail = tail.decode("utf-8", "replace")
+            raise RuntimeError(
+                f"ghidra headless exited {res.returncode}: {tail.strip()[-500:]}")
     finally:
         shutil.rmtree(scripts, ignore_errors=True)
         shutil.rmtree(proj, ignore_errors=True)

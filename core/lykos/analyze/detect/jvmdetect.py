@@ -96,12 +96,33 @@ def analyze(info, *, max_sites: int = 40) -> list:
         return sorted(hit)[:max_sites]
 
     for cwe, sev, title, names, why in _SINKS:
-        present = [n for n in names if n in all_calls]
-        if not present:
-            continue
-        if cwe == "CWE-611" and any(g in all_calls for g in _XXE_GUARDS):
-            continue                         # the hardening call is there; not a finding
-        where = classes_calling(names)
+        if cwe == "CWE-611":
+            # The XXE hardening guard is evaluated PER CLASS, not program-wide: a parser
+            # hardened with setFeature(...) in one class must NOT suppress an unhardened
+            # parser in another. Testing the whole-program call set let a single guarded
+            # parser hide a real XXE elsewhere in the jar.
+            factory = set(names)
+            unguarded = sorted(
+                c for c, d in by_class.items()
+                if any(n in d["calls"] for n in factory)
+                and not any(g in d["calls"] for g in _XXE_GUARDS))
+            present_set = {n for c in unguarded for n in factory if n in by_class[c]["calls"]}
+            # Factory calls the by_class map does not account for (a bare .class has no
+            # by_class map at all): per-class guarding cannot be checked, so fall back to the
+            # program-wide guard decision rather than inventing either verdict.
+            attributed = {n for _c, d in by_class.items() for n in factory if n in d["calls"]}
+            unattributed = [n for n in names if n in all_calls and n not in attributed]
+            if unattributed and not any(g in all_calls for g in _XXE_GUARDS):
+                present_set |= set(unattributed)
+            if not present_set:
+                continue                     # every parser we can see is hardened; not a finding
+            present = sorted(present_set)
+            where = unguarded[:max_sites]
+        else:
+            present = [n for n in names if n in all_calls]
+            if not present:
+                continue
+            where = classes_calling(names)
         detail = why + " -- calls: " + ", ".join(sorted(present)[:4])
         if where:
             detail += "; in " + ", ".join(w.replace("/", ".") for w in where[:6])

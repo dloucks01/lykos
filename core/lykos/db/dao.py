@@ -95,9 +95,17 @@ class TargetDAO(BaseDAO):
         )
         return t
 
+    # Columns update_triage/upsert may set. Interpolated into SQL below (identifiers cannot be
+    # bound as parameters), so it is whitelisted: an unknown key is rejected rather than
+    # trusted. Excludes identity/provenance columns (id, case_id, sha256, ingested_at).
+    _UPDATABLE = frozenset({"filename", "md5", "sha1", "size", "file_type", "arch", "bits",
+                            "endianness", "linking", "stripped", "mitigations", "entropy"})
+
     def _update_fields(self, target_id: str, fields: dict[str, Any]) -> None:
         cols, vals = [], []
         for k, v in fields.items():
+            if k not in self._UPDATABLE:
+                raise ValueError(f"cannot update unknown/forbidden target column {k!r}")
             if k == "stripped":
                 v = as_int_bool(v)
             elif k == "mitigations":
@@ -332,8 +340,7 @@ class FunctionDAO(BaseDAO):
         stack-frame layout (params + calling_convention + thunk/varargs + frame geometry
         + `frame`.vars), collected into frame_json.
         """
-        self.conn.execute("BEGIN IMMEDIATE")
-        try:
+        with transaction(self.conn, immediate=True):
             self.conn.execute("DELETE FROM function WHERE target_id=?", (target_id,))
             now = _now()
             for f in funcs:
@@ -344,9 +351,6 @@ class FunctionDAO(BaseDAO):
                     (new_id(), target_id, f.get("addr", ""), f.get("name"), f.get("size"),
                      f.get("decompiled"), f.get("blocks"), f.get("edges"),
                      dumps(f.get("cfg")), f.get("signature"), dumps(_frame_blob(f)), now))
-            self.conn.execute("COMMIT")
-        except Exception:
-            self.conn.execute("ROLLBACK"); raise
         return len(funcs)
 
     def list_by_target(self, target_id: str) -> list[Function]:
@@ -378,8 +382,7 @@ class FunctionDAO(BaseDAO):
 # ------------------------------------------------------------------- CallEdge (Phase 1)
 class CallEdgeDAO(BaseDAO):
     def replace_for_target(self, target_id: str, edges: list[dict]) -> int:
-        self.conn.execute("BEGIN IMMEDIATE")
-        try:
+        with transaction(self.conn, immediate=True):
             self.conn.execute("DELETE FROM call_edge WHERE target_id=?", (target_id,))
             now = _now()
             for e in edges:
@@ -388,9 +391,6 @@ class CallEdgeDAO(BaseDAO):
                     "dst_name,external,created_at) VALUES(?,?,?,?,?,?,?,?)",
                     (new_id(), target_id, e.get("src_addr"), e.get("site_addr"),
                      e.get("dst_addr"), e.get("dst_name"), as_int_bool(e.get("external")), now))
-            self.conn.execute("COMMIT")
-        except Exception:
-            self.conn.execute("ROLLBACK"); raise
         return len(edges)
 
     def list_by_target(self, target_id: str) -> list[CallEdge]:
@@ -434,8 +434,7 @@ class CallEdgeDAO(BaseDAO):
 # ------------------------------------------------------------------ StringRef (Phase 1)
 class StringDAO(BaseDAO):
     def replace_for_target(self, target_id: str, strings: list[dict]) -> int:
-        self.conn.execute("BEGIN IMMEDIATE")
-        try:
+        with transaction(self.conn, immediate=True):
             self.conn.execute("DELETE FROM string_ref WHERE target_id=?", (target_id,))
             now = _now()
             for s in strings:
@@ -444,9 +443,6 @@ class StringDAO(BaseDAO):
                     "VALUES(?,?,?,?,?,?)",
                     (new_id(), target_id, s.get("addr", ""), s.get("value"),
                      dumps(s.get("xrefs")), now))
-            self.conn.execute("COMMIT")
-        except Exception:
-            self.conn.execute("ROLLBACK"); raise
         return len(strings)
 
     def list_by_target(self, target_id: str, limit: int = 2000,
@@ -483,8 +479,7 @@ class FindingDAO(BaseDAO):
         finding_site migration). `function_addr`/`site_addr` on the finding row stay as the
         first site seen, so existing consumers keep working.
         """
-        self.conn.execute("BEGIN IMMEDIATE")
-        try:
+        with transaction(self.conn, immediate=True):
             now = _now()
             key = c["dedup_key"]
             row = self.conn.execute(
@@ -517,12 +512,17 @@ class FindingDAO(BaseDAO):
                 "SELECT id FROM finding WHERE target_id=? AND dedup_key=?",
                 (target_id, key)).fetchone()["id"]
             if not row:
+                # Record this channel's verdict, then recompute the finding from its verdicts
+                # exactly as the merge path does -- so a finding filed DIRECTLY at poc-backed
+                # gets the same poc-backed->high severity floor a promoted one does, instead of
+                # keeping whatever severity the detector first guessed.
                 self._record_verdict(fid, c, now)
+                state, severity, confidence = self._recompute(fid)
+                self.conn.execute(
+                    "UPDATE finding SET state=?, severity=?, confidence=? WHERE id=?",
+                    (state, severity, confidence, fid))
             if c.get("function_addr") or c.get("site_addr"):
                 self._record_site(fid, c, now)
-            self.conn.execute("COMMIT")
-        except Exception:
-            self.conn.execute("ROLLBACK"); raise
 
     def _record_site(self, fid: str, c: dict, now: int) -> None:
         """Record one occurrence, keeping the STRONGEST verdict any channel has given it.

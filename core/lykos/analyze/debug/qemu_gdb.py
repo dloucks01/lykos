@@ -20,6 +20,7 @@ import signal as _signal
 import socket
 import subprocess
 import time
+from pathlib import Path
 
 from ..dynamic import sandbox
 
@@ -235,10 +236,19 @@ def capture(exe, arch, *, argv=(), stdin: bytes = b"", timeout: float = 8.0,
     if not supported(arch):
         return {"note": f"no gdbstub register layout for {arch}", "arch": arch}
     port = port or _free_port()
+    exedir = str(Path(exe).resolve().parent)
+    # Detonating a hostile guest: contain the filesystem and cap resources. The network
+    # namespace is KEPT (net=True) so the loopback gdb stub is still reachable; on an air-gapped
+    # host loopback is not egress. rlimits bound memory-adjacent abuse (forks, file size, CPU)
+    # without RLIMIT_AS, which qemu-user needs generously.
+    cmd = sandbox.isolate_prefix(exedir, net=True) + \
+        [qemu, "-g", str(port), str(exe), *[_argv_bytes(a) for a in argv]]
     proc = subprocess.Popen(
-        [qemu, "-g", str(port), str(exe), *[_argv_bytes(a) for a in argv]],
+        cmd,
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        start_new_session=True)
+        start_new_session=True,
+        preexec_fn=sandbox._rlimits(4096, int(timeout) + 30, set_as=False,
+                                    nproc=sandbox._nproc_cap(True)))
     try:
         if proc.stdin:                               # deliver input; the guest reads it once run
             try:
@@ -270,6 +280,10 @@ def capture(exe, arch, *, argv=(), stdin: bytes = b"", timeout: float = 8.0,
                 return {"note": f"gdbstub for {arch} serves no target description",
                         "arch": arch}
             regs = _parse_regs(_txn(sock, "g", timeout=timeout), arch, endianness)
+        except socket.timeout:
+            # The guest never reached a stop within the budget (hang / long loop). A raised
+            # exception here is not a clean capture -- report it as "could not run", honestly.
+            return {"note": "guest did not stop within timeout", "arch": arch}
         finally:
             sock.close()
     finally:
@@ -351,9 +365,14 @@ def monitor_calls(exe, arch, *, symbols, entry, pie, sink_names, endianness=None
     argregs = _ARG_REGS[arch]
     kind = _BP_KIND.get(arch, 4)
     port = _free_port()
-    proc = subprocess.Popen([qemu, "-g", str(port), str(exe), *[_argv_bytes(a) for a in argv]],
+    exedir = str(Path(exe).resolve().parent)
+    cmd = sandbox.isolate_prefix(exedir, net=True) + \
+        [qemu, "-g", str(port), str(exe), *[_argv_bytes(a) for a in argv]]
+    proc = subprocess.Popen(cmd,
                             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, start_new_session=True)
+                            stderr=subprocess.PIPE, start_new_session=True,
+                            preexec_fn=sandbox._rlimits(4096, int(timeout) + 30, set_as=False,
+                                                        nproc=sandbox._nproc_cap(True)))
     try:
         if proc.stdin:
             try:
@@ -394,6 +413,11 @@ def monitor_calls(exe, arch, *, symbols, entry, pie, sink_names, endianness=None
                     _txn(sock, f"Z0,{pc:x},{kind}")
                 reply = _txn(sock, "c", timeout=timeout)
             return {"ok": True, "hits": hits, "base": base}
+        except socket.timeout:
+            # A hang between breakpoints. Return what we captured, flagged as incomplete rather
+            # than raising -- an unfinished trace is not a clean "nothing more happened".
+            return {"ok": False, "note": "guest did not stop within timeout (trace incomplete)",
+                    "hits": hits}
         finally:
             sock.close()
     finally:

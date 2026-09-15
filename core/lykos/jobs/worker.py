@@ -11,6 +11,7 @@ helper (context.run_subprocess) already isolates + kills child process groups.
 """
 from __future__ import annotations
 
+import logging
 import os
 import threading
 import time
@@ -24,6 +25,8 @@ from .config import JobConfig
 from .context import JobContext, StageCancelled, StageTimeout
 from .queue import JobQueue
 from .registry import get_stage
+
+_log = logging.getLogger("lykos.jobs.worker")
 
 
 class _Heartbeat(threading.Thread):
@@ -39,7 +42,15 @@ class _Heartbeat(threading.Thread):
         q = JobQueue(conn)
         try:
             while not self._stop.wait(self._cfg.heartbeat_interval):
-                q.heartbeat(self._run, self._wid, self._cfg.lease_seconds)
+                # A transient failure (e.g. "database is locked") must not kill the heartbeat
+                # thread: if it dies the lease expires, the reaper requeues a job that is in
+                # fact still running, and the running worker's result is then discarded. Log
+                # and retry on the next tick instead.
+                try:
+                    q.heartbeat(self._run, self._wid, self._cfg.lease_seconds)
+                except Exception:
+                    _log.warning("heartbeat failed for run %s (worker %s); will retry",
+                                 self._run, self._wid, exc_info=True)
         finally:
             conn.close()
 
@@ -57,6 +68,7 @@ class WorkerPool:
         self.on_event = on_event
         self._stopping = threading.Event()
         self._threads: list[threading.Thread] = []
+        self._tlock = threading.Lock()   # guards _threads against the supervisor respawn race
         self._supervisor: Optional[threading.Thread] = None
         self._reaper: Optional[threading.Thread] = None
         # per-class concurrency caps shared across workers
@@ -75,8 +87,9 @@ class WorkerPool:
         finally:
             conn.close()
         self._stopping.clear()
-        for i in range(self.cfg.workers):
-            self._threads.append(self._spawn_worker(i))
+        with self._tlock:
+            for i in range(self.cfg.workers):
+                self._threads.append(self._spawn_worker(i))
         self._reaper = threading.Thread(target=self._reaper_loop, daemon=True, name="reaper")
         self._reaper.start()
         self._supervisor = threading.Thread(target=self._supervise, daemon=True, name="supervisor")
@@ -85,11 +98,13 @@ class WorkerPool:
     def stop(self, grace: Optional[float] = None) -> None:
         """JE-13 graceful shutdown: stop claiming, drain within grace."""
         grace = self.cfg.shutdown_grace if grace is None else grace
-        self._stopping.set()
+        self._stopping.set()   # supervisor observes this and stops respawning
         deadline = time.time() + grace
-        for t in self._threads:
+        with self._tlock:
+            threads = list(self._threads)
+            self._threads.clear()
+        for t in threads:
             t.join(timeout=max(0.0, deadline - time.time()))
-        self._threads.clear()
 
     # ------------------------------------------------------------------ workers
     def _spawn_worker(self, idx: int) -> threading.Thread:
@@ -158,8 +173,12 @@ class WorkerPool:
             result = sd.fn(ctx)
             ctx.check_cancel()  # honor cancel/timeout requested during the stage
             outputs = [(sha, "output") for sha in (result or {}).get("output_shas", [])]
-            q.complete(run_id, outputs or None, worker_id=wid)
-            self._bump("done")
+            # complete() returns False when the lease was lost (reaped/re-claimed) and the
+            # result was discarded -- don't count that as a completed job.
+            if q.complete(run_id, outputs or None, worker_id=wid):
+                self._bump("done")
+            else:
+                self._bump("discarded")
         except StageCancelled:
             q.set_cancelled(run_id)
             self._bump("cancelled")
@@ -188,10 +207,14 @@ class WorkerPool:
     def _supervise(self) -> None:
         """JE-10 respawn dead worker threads."""
         while not self._stopping.is_set():
-            for i, t in enumerate(list(self._threads)):
-                if not t.is_alive():
-                    self._threads[i] = self._spawn_worker(i)
-                    self._bump("respawned")
+            # Hold the lock across the check-and-respawn and re-test _stopping inside it, so a
+            # respawn can't race stop()'s clear() and leak an unjoined worker after shutdown.
+            with self._tlock:
+                if not self._stopping.is_set():
+                    for i, t in enumerate(self._threads):
+                        if not t.is_alive():
+                            self._threads[i] = self._spawn_worker(i)
+                            self._bump("respawned")
             self._stopping.wait(1.0)
 
     # ------------------------------------------------------------------ metrics + helpers

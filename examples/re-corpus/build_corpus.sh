@@ -121,9 +121,6 @@ fi
 
 echo "== Download real multi-arch busybox (stripped, static, real-world) =="
 # Official prebuilt busybox binaries (busybox.net) -- real, stripped, statically linked.
-BB=https://busybox.net/downloads/binaries/1.35.0-x86_64-linux-musl
-for pair in \
-  "busybox-x86_64:x86-64:${BB/x86_64/x86_64}/busybox" ; do :; done
 declare -A BBURL=(
   [busybox_x86-64]="https://busybox.net/downloads/binaries/1.35.0-x86_64-linux-musl/busybox"
   [busybox_armv7]="https://busybox.net/downloads/binaries/1.35.0-armv7l-linux-musleabihf/busybox"
@@ -133,9 +130,23 @@ declare -A BBURL=(
   [busybox_powerpc]="https://busybox.net/downloads/binaries/1.35.0-powerpc-linux-musl/busybox"
   [busybox_i686]="https://busybox.net/downloads/binaries/1.35.0-i686-linux-musl/busybox"
 )
+# These downloads are NOT reproducible unless pinned. A known-good sha256 listed in BBSHA is
+# verified (mismatch => rejected); otherwise the computed hash is recorded to DOWNLOADED.sha256
+# and flagged UNVERIFIED so it can be pinned. These are analysis TARGETS, but they are still the
+# inputs detection quality is measured against, so their provenance matters.
+declare -A BBSHA=(
+  # [busybox_x86-64]="<sha256>"   # fill in to pin a download
+)
+: > "$OUT/DOWNLOADED.sha256"
 for name in "${!BBURL[@]}"; do
   arch="${name#busybox_}"
   if timeout 40 curl -fsSL "${BBURL[$name]}" -o "$OUT/$name" 2>/dev/null && [ -s "$OUT/$name" ]; then
+    got="$(sha256sum "$OUT/$name" | cut -d' ' -f1)"; want="${BBSHA[$name]:-}"
+    if [ -n "$want" ] && [ "$got" != "$want" ]; then
+      echo "  x $name: sha256 mismatch (want $want got $got) -- rejected"; rm -f "$OUT/$name"; continue
+    fi
+    [ -z "$want" ] && echo "  ! $name UNVERIFIED sha256 $got (record & pin in BBSHA)"
+    echo "$got  ${BBURL[$name]}" >> "$OUT/DOWNLOADED.sha256"
     chmod -x "$OUT/$name" 2>/dev/null
     emit "$name" "$arch" ELF C "busybox real-world stripped static"
   else

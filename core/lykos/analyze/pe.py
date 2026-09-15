@@ -86,6 +86,7 @@ def parse(data: bytes) -> PeInfo:
 
     opt = coff + 20
     magic = 0
+    dir_off = None          # data-directory offset; stays None if the optional header is short
     try:
         (magic,) = struct.unpack_from("<H", data, opt)
         is64 = magic == 0x20B
@@ -153,18 +154,10 @@ def _mitigations(dllchar: int, magic: int) -> dict:
     }
 
 
-def _rva_to_off(info: PeInfo, rva: int) -> Optional[int]:
-    for s in info.sections:
-        start = s.get("vaddr") or 0
-        if start <= rva < start + max(s.get("vsize") or 0, s.get("size") or 0):
-            return (s.get("_roff") if s.get("_roff") is not None else None)
-    return None
-
-
-def _imports(data: bytes, info: PeInfo, dir_off: int) -> dict:
+def _imports(data: bytes, info: PeInfo, dir_off: Optional[int]) -> dict:
     """{libraries: [...], symbols: [...]} from the import directory."""
     out: dict = {"libraries": [], "symbols": []}
-    if dir_off + 8 > len(data):
+    if dir_off is None or dir_off + 8 > len(data):
         return out
     imp_rva, imp_size = struct.unpack_from("<II", data, dir_off)
     if not imp_rva or not imp_size:
@@ -191,7 +184,10 @@ def _imports(data: bytes, info: PeInfo, dir_off: int) -> dict:
             break
         no = off_of(name_rva) if name_rva else None
         if no is not None and no < len(data):
-            lib = data[no:data.find(b"\0", no)].decode("utf-8", "replace")
+            end = data.find(b"\0", no)
+            if end < 0:                                 # unterminated: run to the end of file
+                end = len(data)
+            lib = data[no:end].decode("utf-8", "replace")
             if lib:
                 out["libraries"].append(lib)
         thunk = off_of(ilt or iat)
@@ -213,7 +209,9 @@ def _imports(data: bytes, info: PeInfo, dir_off: int) -> dict:
             if ho is None or ho + 2 >= len(data):
                 continue
             end = data.find(b"\0", ho + 2)
-            sym = data[ho + 2:end].decode("utf-8", "replace") if end > 0 else ""
+            if end < 0:                                 # unterminated: run to the end of file
+                end = len(data)
+            sym = data[ho + 2:end].decode("utf-8", "replace")
             if sym:
                 out["symbols"].append(sym)
     return out

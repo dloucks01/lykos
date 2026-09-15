@@ -120,6 +120,16 @@ def coverage_stage(ctx) -> dict:
             "afl-qemu, or use the built-in black-box `fuzz` stage instead.")
 
     mode = p.get("input_mode", "file")                # file (@@) | stdin | arg
+    if mode not in ("file", "stdin"):
+        # AFL++ qemu-mode delivers input as a file (@@) or over stdin ONLY -- it cannot inject
+        # into argv. `run_campaign` passes no @@ for a non-file mode, so an "arg" request is
+        # actually fuzzed over stdin. Replaying it through argv would then never reproduce, and
+        # every real crash would be dropped as a clean zero. Normalise it, and say so, so the
+        # crash is found and replayed the same way.
+        ctx.emit("coverage.mode", payload={"requested": mode, "used": "stdin", "why": (
+            "AFL++ delivers input as a file (@@) or over stdin only; it cannot inject into "
+            "argv, so this campaign fuzzes and replays over stdin")})
+        mode = "stdin"
     seconds = int(p.get("max_seconds", 30))
     exec_timeout = float(p.get("exec_timeout", 2))
     use_qemu = bool(p.get("qemu", True))              # qemu-mode: fuzz an uninstrumented bin
@@ -182,7 +192,7 @@ def coverage_stage(ctx) -> dict:
     fd = FindingDAO(ctx.conn)
     dd = DynResultDAO(ctx.conn)
     workfile = ctx.scratch() / "input.bin"
-    seen_sigs = set()
+    seen_crashes = set()
     confirmed = 0
 
     for data in raw:
@@ -192,7 +202,11 @@ def coverage_stage(ctx) -> dict:
         if not res.crashed:
             continue                                  # not reproducible in our sandbox
         sig = res.signal_name
-        if sig in seen_sigs:
+        # Bucket by (signal, fault site), not signal alone: every SIGSEGV in a program is the
+        # same signal but not the same bug, and de-duping on the name collapsed distinct
+        # defects into one finding. AFL's crashes/ are already coverage-unique.
+        key = (sig, res.fault_pc)
+        if key in seen_crashes:
             input_sha = ctx.put_artifact("afl-crash-input", data=data)
             dd.insert(target.id, target.case_id, run_id=ctx.run_id, input_sha=input_sha,
                       # the flag prefix, which for an AFL replay is empty: the invocation
@@ -201,7 +215,7 @@ def coverage_stage(ctx) -> dict:
                       signal=res.signal, signal_name=sig, crashed=True,
                       isolation=res.isolation, duration_ms=res.duration_ms)
             continue
-        seen_sigs.add(sig)
+        seen_crashes.add(key)
 
         def _same(d, _sig=sig):
             r = run_input(exe, mode, workfile, exec_timeout, target.arch, d)[1]
@@ -222,8 +236,8 @@ def coverage_stage(ctx) -> dict:
         confirmed += 1
 
     ctx.emit("coverage.done", payload={"crash_inputs": len(raw),
-                                       "unique": len(seen_sigs), "confirmed": confirmed})
-    ctx.progress(pct=100, msg=f"{len(raw)} crash inputs, {len(seen_sigs)} unique signals")
+                                       "unique": len(seen_crashes), "confirmed": confirmed})
+    ctx.progress(pct=100, msg=f"{len(raw)} crash inputs, {len(seen_crashes)} unique crashes")
     return {}
 
 

@@ -186,3 +186,16 @@ def test_sites_of_different_findings_are_counted_separately(store, case):
     fd.upsert(t.id, case.id, _site("k2", site="0x2000"))
     by = {f.dedup_key: f.id for f in FindingDAO(store.conn).list_by_target(t.id)}
     assert fd.proven_sites(t.id) == {by["k1"]: 1}
+
+
+def test_a_finding_filed_directly_at_poc_backed_gets_the_severity_floor(store, case):
+    """A first-time finding created straight at poc-backed must get the same poc-backed->high
+    severity floor a promoted one does -- not the detector's low guess. Before the fix the new-
+    finding path stored the raw severity and only the merge path recomputed."""
+    t = _target(store, case)
+    fd = FindingDAO(store.conn)
+    fd.upsert(t.id, case.id, _c(key="direct", state="poc-backed", severity="low",
+                                confidence=0.9, detector="dynamic"))
+    f = _f(store, t.id, case.id)
+    assert f.state == "poc-backed"
+    assert f.severity == "high"          # bumped on the very first upsert, not just on merge

@@ -2,10 +2,20 @@
 PY ?= python3
 export PYTHONPATH := core
 
-.PHONY: test coverage lint typecheck gui ci bundle verify run eval eval-gate arch-gate dashboard release clean help
+.PHONY: doctor toolchain-bundle test coverage lint typecheck gui ci bundle verify run eval eval-gate arch-gate real-gate dashboard release clean help
 
 help:
-	@echo "targets: test coverage lint typecheck gui ci bundle verify run eval eval-gate arch-gate dashboard release clean"
+	@echo "targets: doctor toolchain-bundle test coverage lint typecheck gui ci bundle verify run eval eval-gate arch-gate dashboard release clean"
+
+# What this host can and cannot do, and the install line for anything missing. On an
+# air-gapped workstation there is no package manager to ask, and "the stage declined" is a
+# poor way to discover an engine was never installed.
+doctor:
+	@$(PY) -m lykos doctor
+
+# Build the air-gap toolchain bundle (run on a CONNECTED machine). See docs/23.
+toolchain-bundle:
+	bash packaging/collect-toolchain.sh
 
 test:
 	$(PY) -m pytest tests/ -q
@@ -149,4 +159,5 @@ release: ci verify eval-gate arch-gate real-gate
 	@echo "release gate complete"
 
 clean:
-	rm -rf dist .cases core/lykos/**/__pycache__ core/lykos/__pycache__
+	rm -rf dist .cases
+	find core -type d -name __pycache__ -exec rm -rf {} +

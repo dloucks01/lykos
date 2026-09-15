@@ -137,6 +137,7 @@ gdb.execute("set height 0")
 # args must be inline on `run`/`starti`: `set args X` then `run < file` makes gdb reset the
 # argument list to empty (the redirect-only form), silently dropping argv.
 _RUN = RUN_ARGS + ((" < " + INPUT_FILE) if INPUT_FILE else "")
+RAN, ERR = False, ""
 try:
     if ADDR_SINKS:
         # analyst-supplied addresses are static ELF vaddrs -> rebase by the runtime load base
@@ -149,8 +150,12 @@ try:
         gdb.execute("continue")
     else:
         gdb.execute("run " + _RUN)
-except gdb.error:
-    pass
+    RAN = True            # the inferior actually executed (run/continue returned no gdb.error)
+except gdb.error as _e:
+    ERR = str(_e)         # e.g. exec-format / cannot-execute / ptrace-denied: it never ran
+# LYKOS_STATUS lets the caller tell "ran and saw nothing" from "never ran" -- an empty HITS
+# from a target that could not be executed must NOT read as a clean, dangerous-call-free run.
+print("LYKOS_STATUS " + json.dumps({"ran": RAN, "error": ERR}))
 print("LYKOS_MON " + json.dumps(HITS))
 '''
 
@@ -186,17 +191,37 @@ def run_monitor(exe, funcs, arch, *, argv=(), stdin=b"", timeout=20, addr_sinks=
                             "entry": entry, "infile": infile,
                             "runargs": " ".join(shlex.quote(a) for a in argv)}
         (d / "mon.py").write_text(script)
-        proc = subprocess.run(
-            [gdb_bin, "-batch", "-nx", "-x", str(d / "mon.py"), str(exe)],
-            capture_output=True, timeout=timeout + 15)
+        from ..dynamic import sandbox
+        # Detonate the (hostile) target under GDB with real containment: bwrap read-only root
+        # (net unshared -- ptrace needs no loopback), plus rlimits so a fork bomb / runaway
+        # allocation cannot take the host down. The script + input dir is re-bound read-only over
+        # the tmpfs so gdb can read them; the exe dir is bound by isolate_prefix.
+        exe_abs = str(Path(exe).resolve())            # absolute: bwrap chdirs to /tmp
+        exedir = str(Path(exe_abs).parent)
+        inner = [gdb_bin, "-batch", "-nx", "-x", str(d / "mon.py"), exe_abs]
+        cmd = sandbox.isolate_prefix(exedir, net=False, ro_binds=[str(d)]) + inner
+        proc = sandbox.run_reaped(
+            cmd, capture_output=True, timeout=timeout + 15,
+            preexec_fn=sandbox._rlimits(2048, int(timeout) + 15, set_as=False))
         out = proc.stdout.decode("latin-1", "ignore")
-        hits = []
+        hits = status = None
         for line in out.splitlines():
             if line.startswith("LYKOS_MON "):
                 hits = json.loads(line[len("LYKOS_MON "):])
+            elif line.startswith("LYKOS_STATUS "):
+                status = json.loads(line[len("LYKOS_STATUS "):])
+        if hits is None or status is None:
+            return {"ok": False, "hits": [], "note": "gdb did not run to completion (no result "
+                    "marker) -- the target could not be monitored; nothing was observed"}
+        if not status.get("ran"):
+            return {"ok": False, "hits": [], "note": "the target never executed under gdb (%s) "
+                    "-- nothing was observed, which is not the same as no dangerous calls"
+                    % (status.get("error") or "unknown reason")}
         return {"ok": True, "hits": hits}
     except subprocess.TimeoutExpired:
-        return {"ok": True, "hits": [], "note": "monitor run timed out"}
+        # We stopped watching; the target did not necessarily stop. A partial/absent result is
+        # not a clean run -- report it as unable to complete, not as ok with zero hits.
+        return {"ok": False, "hits": [], "note": "monitor run timed out before completing"}
     finally:
         import shutil
         shutil.rmtree(d, ignore_errors=True)

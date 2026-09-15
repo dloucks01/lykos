@@ -183,14 +183,20 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
     fd = FindingDAO(ctx.conn)
     dd = DynResultDAO(ctx.conn)
     deadline = time.time() + max_seconds
-    execs = crashes = 0
+    execs = crashes = crashes_reproducible = 0
     seen_sigs: dict = {}
     seen_behaviour, kept = set(), 0
+    # Has the coverage channel EVER answered? A runner that returns block data -- even an empty
+    # set -- proves coverage is live and block-novelty is trustworthy. If blocks were armed but
+    # nothing ever came back (ptrace refused in this namespace, a runner that cannot report),
+    # block-only novelty would freeze the corpus forever, so we fall back to behaviour novelty.
+    cover_reported = False
 
     # Batching pays the sandbox namespace once per BATCH instead of once per input, which is
     # 3.18 ms of every 3.55 ms execution. Only for the plain runner: a stage that supplies its
     # own delivery (boundary harnessing) is not a series of independent executions.
     batchable = run_fn is run_input
+    runner_takes_blocks = _takes_blocks(run_fn)   # constant for the campaign; not per-exec
     batch_n = 64
     # Real path coverage when the target has been disassembled. An output-shape proxy notices
     # that a parser printed something new; block coverage notices that it took a branch it has
@@ -270,7 +276,7 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
             # SIGNATURE rather than by identity, because the channel runner takes them too --
             # gated on `run_fn is run_input`, a network campaign could not be given coverage at
             # all, and every payload was judged on output shape alone.
-            if all_blocks and _takes_blocks(run_fn):
+            if all_blocks and runner_takes_blocks:
                 kw["blocks"] = tuple(all_blocks - seen_blocks)
             results = [run_fn(exe, mode, workfile, exec_timeout, target.arch, inputs[0],
                               **kw)[1]]
@@ -285,21 +291,32 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
             # ratchet: without it the corpus never grows and a deeper path is reachable only by a
             # single lucky mutation from a seed.
             new_blocks = set()
+            cover_answered = False
             if all_blocks:
                 # `blocks_hit` is the explicit answer; `note` is the old channel, kept for a
                 # runner that has not been taught the field. A runner with something else to
                 # say in `note` -- the channel harness names its endpoint there -- silently
                 # reported no coverage for as long as the two shared one string.
                 if res.blocks_hit is not None:
+                    cover_answered = True
                     new_blocks = set(res.blocks_hit) - seen_blocks
                 elif res.note:
                     try:
-                        new_blocks = {int(x) for x in res.note.split(",") if x} - seen_blocks
+                        reported = {int(x) for x in res.note.split(",") if x}
+                        cover_answered = True
+                        new_blocks = reported - seen_blocks
                     except ValueError:
-                        new_blocks = set()
+                        pass
                 seen_blocks |= new_blocks
+                cover_reported = cover_reported or cover_answered
             b = behaviour_of(res, data)
-            novel = bool(new_blocks) if all_blocks else (b not in seen_behaviour)
+            # Trust block novelty only once coverage has actually answered; if it never does,
+            # blocks were armed but are not being reported, and behaviour novelty keeps the
+            # corpus learning instead of freezing it (block-only novelty would be dead here).
+            if all_blocks and cover_reported:
+                novel = bool(new_blocks)
+            else:
+                novel = b not in seen_behaviour
             if b not in seen_behaviour:
                 seen_behaviour.add(b)
             if novel:
@@ -323,6 +340,7 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
                                    target, data, run_argv):
                     flaky += 1
                     continue
+                crashes_reproducible += 1
                 # A bucket is (signal, faulting address): the same signal from a different
                 # instruction is a different defect, and treating them as one hid every bug
                 # after the first behind whichever crashed soonest.
@@ -341,9 +359,15 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
                     seen_sigs[bucket] = 1
                     sig = res.signal_name
 
-                    def _same(d, _sig=sig):
-                        r = run_fn(exe, mode, workfile, exec_timeout, target.arch, d,
-                                  endianness=target.endianness, bits=target.bits)[1]
+                    def _same(d, _sig=sig, _prefix=run_argv):
+                        # Minimize under the SAME invocation the crash was found and confirmed
+                        # with: a crash behind an option (jhead's `-cmd`) does not reproduce
+                        # without it, so a flag-less predicate would be false from the first
+                        # call and either minimize nothing or reduce to a non-crashing input.
+                        kw = {"endianness": target.endianness, "bits": target.bits}
+                        if run_fn is run_input:
+                            kw["base_argv"] = _prefix
+                        r = run_fn(exe, mode, workfile, exec_timeout, target.arch, d, **kw)[1]
                         return r.crashed and r.signal_name == _sig
 
                     budget = min(200, max(20, max_execs - execs))
@@ -392,11 +416,41 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
     # alone, which tells the reader to distrust a result that is sound.
     rate = execs / max(1e-3, max_seconds - max(0.0, deadline - time.time()))
     did_work = crashes > 0 or len(seen_behaviour) > 1
-    stats = {"execs": execs, "crashes": crashes, "flaky": flaky, "unique": len(seen_sigs),
-             "starved": bool(execs < 200 and rate < 20 and not did_work),
+    # Reaching an instrumented block is also proof the program ran: a target whose output shape
+    # never varies (behaviours == 1) but whose branches are being covered has plainly entered.
+    entered = did_work or len(seen_blocks) > 0
+    # Coverage was armed but nothing ever came back OR nothing was reached: either way the
+    # campaign learned nothing from coverage, which for a program that also never varied its
+    # output means it never got past the gate.
+    coverage_armed = bool(all_blocks)
+    coverage_dead = coverage_armed and len(seen_blocks) == 0
+    # `starved` now means "could not run / never entered the program", not merely "slow":
+    #  * it barely ran, slowly (the original signal);
+    #  * it ran plenty of executions but never got past the gate (one behaviour, no coverage);
+    #  * coverage was armed and nothing was ever reached.
+    # A crash, more than one behaviour, or any block reached all clear it -- so a genuinely
+    # slow-but-productive campaign (an emulated target, a network listener) is never flagged.
+    starved = bool(
+        (execs < 200 and rate < 20 and not did_work)
+        or (execs >= 200 and not entered)
+        or (coverage_dead and not did_work))
+    stats = {"execs": execs, "crashes": crashes, "flaky": flaky,
+             "crashes_reproducible": crashes_reproducible, "unique": len(seen_sigs),
+             "starved": starved,
              "behaviours": len(seen_behaviour), "corpus": len(corpus), "kept": kept,
              "execs_per_sec": round(execs / elapsed),
-             "blocks_hit": len(seen_blocks), "blocks_known": len(all_blocks)}
+             "blocks_hit": len(seen_blocks), "blocks_known": len(all_blocks),
+             # distinguish "coverage armed and live", "armed but never reported" (a fixable
+             # environment defect, not a clean campaign) and "no coverage available at all".
+             "coverage": ("unavailable" if (coverage_armed and not cover_reported)
+                          else "live" if coverage_armed else "none")}
+    if coverage_armed and not cover_reported:
+        ctx.emit(f"{event_prefix}.coverage_unavailable", payload={
+            "blocks_known": len(all_blocks),
+            "note": ("blocks were recovered and armed but the runner reported no coverage for "
+                     "any input (ptrace may be unavailable in this sandbox); the campaign fell "
+                     "back to output-shape novelty. This is not a clean 'no crashes' result -- "
+                     "coverage-guided search did not run.")})
     ctx.emit(f"{event_prefix}.done", payload=stats)
     ctx.progress(pct=100, msg=f"{execs} execs, {crashes} crashes, {len(seen_sigs)} unique, "
                              f"{len(seen_behaviour)} behaviours")
@@ -694,11 +748,14 @@ def fuzz_stage(ctx) -> dict:
         note = "found by structure-aware fuzzing"
         ctx.emit("fuzz.format", payload={"model": fmt or "custom", "auto": not (
             p.get("format") or p.get("format_name"))})
-    # Split the budget across them, stopping early on a crash. A bug is usually reachable
-    # through one channel only, and which one is not knowable in advance.
+    # Split the budget across them, stopping early on a REPRODUCIBLE crash. A bug is usually
+    # reachable through one channel only, and which one is not knowable in advance. Stopping on
+    # the raw crash count would let a channel that only produced non-reproducible (flaky)
+    # crashes -- a target that rewrites its own input -- halt the sweep with nothing to show.
     share_execs = max(1, max_execs // len(channels))
     share_secs = max(1.0, max_seconds / len(channels))
-    totals = {"execs": 0, "crashes": 0, "unique": 0, "behaviours": 0}
+    totals = {"execs": 0, "crashes": 0, "crashes_reproducible": 0, "unique": 0,
+              "behaviours": 0}
     for ch in channels:
         st = fuzz_campaign(ctx, target, corpus=list(corpus), dictionary=dictionary, mode=ch,
                            max_execs=share_execs, max_seconds=share_secs,
@@ -707,7 +764,7 @@ def fuzz_stage(ctx) -> dict:
                            cover_blocks=blocks, cover_flags=flags, base_argv=base_argv)
         for k in totals:
             totals[k] += st.get(k, 0)
-        if st.get("crashes"):
+        if st.get("crashes_reproducible"):
             break
     ctx.emit("fuzz.channels", payload={"channels": channels, "flags": len(flags), **totals})
     return {}

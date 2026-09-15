@@ -444,3 +444,23 @@ def test_the_campaign_offers_blocks_to_any_runner_that_takes_them():
     assert _takes_blocks(channel_like)
     assert not _takes_blocks(old_style)
     assert not _takes_blocks(object())          # never raises on something odd
+
+
+def test_a_positive_exit_status_is_not_a_fabricated_crash():
+    """A plain positive exit code is an exit STATUS, never a synthesised signal. Python's
+    Popen reports a signal death as a NEGATIVE returncode; the old `_classify` turned any
+    rc>128 into a signal without the CRASH_SIGNALS filter and, worse, discarded the exit code
+    -- so a target that merely exits 200 (or 139 for its own reasons) was recorded as a crash.
+    Both paths now go through sandbox.classify_rc, so they agree and neither fabricates one."""
+    from lykos.analyze.link import harness
+
+    crashed, sig, signame, exit_code, _pc, _d = harness._classify(False, 200, b"", b"")
+    assert not crashed and sig is None and exit_code == 200      # exit code preserved
+
+    crashed, sig, signame, *_ = harness._classify(False, -11, b"", b"")
+    assert crashed and signame == "SIGSEGV"                      # real signal death (negative)
+
+    # the 128+signum wrapper form (bwrap/qemu) is still a crash -- the shared filter keeps it,
+    # so a genuinely wrapped SIGSEGV is not missed (channel_run has always treated it so)
+    crashed, sig, signame, *_ = harness._classify(False, 139, b"", b"")
+    assert crashed and signame == "SIGSEGV"

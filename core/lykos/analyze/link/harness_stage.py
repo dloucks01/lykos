@@ -194,24 +194,29 @@ def boundary_fuzz_stage(ctx) -> dict:
             "family": family, "settle": float(p.get("settle", 0.15)),
             "note": ("one listener process serves many payloads; a crash is re-checked "
                      "against a fresh process before it is recorded")})
-    stats = fuzz_campaign(
-        ctx, target, corpus=corpus, dictionary=dictionary, mode="channel",
-        # Coverage on the wire. A network campaign judged every payload on output shape alone
-        # -- a listener that answers nothing looks identical whether it parsed the packet or
-        # dropped it at the first byte -- so the corpus never grew and a deeper path was
-        # reachable only by one lucky mutation from a seed. Only an emulated target can answer
-        # (qemu's block log is the instrumentation); a native one falls back to behaviour.
-        cover_blocks=cover_blocks,
-        max_execs=int(p.get("max_execs", 800)), max_seconds=float(p.get("max_seconds", 30)),
-        exec_timeout=float(p.get("exec_timeout", 2)), rng=rng, detector="boundary",
-        event_prefix="harness", note_prefix=f"found by boundary harness ({family} channel {key})",
-        # The listener's own flags go on the crash row. "Which invocation produced this" is the
-        # first thing anyone replaying a network crash needs -- `-g 239.9.9.9 -p 5004` is not
-        # recoverable from the payload -- and the campaign records this, not run_fn's return.
-        run_fn=run_fn, mutator=mutator, base_argv=base_argv)
-    if session["s"] is not None:
-        ctx.emit("harness.restarts", payload={"restarts": session["s"].restarts})
-        session["s"].close()
+    try:
+        stats = fuzz_campaign(
+            ctx, target, corpus=corpus, dictionary=dictionary, mode="channel",
+            # Coverage on the wire. A network campaign judged every payload on output shape alone
+            # -- a listener that answers nothing looks identical whether it parsed the packet or
+            # dropped it at the first byte -- so the corpus never grew and a deeper path was
+            # reachable only by one lucky mutation from a seed. Only an emulated target can answer
+            # (qemu's block log is the instrumentation); a native one falls back to behaviour.
+            cover_blocks=cover_blocks,
+            max_execs=int(p.get("max_execs", 800)), max_seconds=float(p.get("max_seconds", 30)),
+            exec_timeout=float(p.get("exec_timeout", 2)), rng=rng, detector="boundary",
+            event_prefix="harness",
+            note_prefix=f"found by boundary harness ({family} channel {key})",
+            # The listener's own flags go on the crash row. "Which invocation produced this" is the
+            # first thing anyone replaying a network crash needs -- `-g 239.9.9.9 -p 5004` is not
+            # recoverable from the payload -- and the campaign records this, not run_fn's return.
+            run_fn=run_fn, mutator=mutator, base_argv=base_argv)
+    finally:
+        # Always reap the persistent listener and remove its coverage tempdir, even if the
+        # campaign raised -- otherwise the qemu child and the lykos-chtrace-* dir are orphaned.
+        if session["s"] is not None:
+            ctx.emit("harness.restarts", payload={"restarts": session["s"].restarts})
+            session["s"].close()
     return {"metrics": {**stats, "family": family, "key": key,
                         "persistent": bool(persistent)}}
 

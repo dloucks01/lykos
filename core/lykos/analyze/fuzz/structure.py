@@ -115,6 +115,17 @@ class FormatModel:
                 # a real container: a JPEG's EXIF segment is followed by the frame and scan
                 # headers that decide whether the file parses at all.
                 name = f.get("name")
+                # An explicit length field is authoritative and caps the blob even when a
+                # delimiter or size_from is ALSO present: a belt-and-suspenders shape (a length
+                # AND a terminator) must never overrun the declared region, so `until`/
+                # `size_from` may only end the blob EARLIER, never later, than the length says.
+                cap = len(data)
+                if name in covered:
+                    total, start = covered[name]
+                    # `length_of` sizes the blob from its own start; `covers` spans from the
+                    # length field itself, so the blob ends at that field's start plus the span
+                    cap = pos + int(total) if start is None else max(start + int(total), pos)
+                    cap = min(max(cap, pos), len(data))
                 if f.get("until") is not None:
                     # A blob that ends at a DELIMITER rather than at a length. H.264 in
                     # Annex-B framing has no length field at all -- a NAL unit runs until the
@@ -122,8 +133,8 @@ class FormatModel:
                     # the whole stream, so the model described three NAL units and the
                     # mutator could only ever reach the first one's header.
                     delim = _as_bytes(f["until"])
-                    nxt = data.find(delim, pos) if delim else -1
-                    stop = nxt if nxt >= 0 else len(data)
+                    nxt = data.find(delim, pos, cap) if delim else -1
+                    stop = nxt if nxt >= 0 else cap
                 elif f.get("size_from"):
                     # A blob whose length lives in part of ANOTHER field: RTP's CSRC list is
                     # four bytes per unit of CC, and CC is the low nibble of byte 0. `covers`
@@ -134,15 +145,9 @@ class FormatModel:
                     raw = int(seen.get(sf.get("field")) or 0)
                     n = ((raw >> int(sf.get("shift", 0))) & int(sf.get("mask", 0xFFFFFFFF))
                          ) * int(sf.get("scale", 1))
-                    stop = min(pos + max(n, 0), len(data))
-                elif name in covered:
-                    total, start = covered[name]
-                    # `length_of` sizes the blob from its own start; `covers` spans from the
-                    # length field itself, so the blob ends at that field's start plus the span
-                    stop = pos + int(total) if start is None else max(start + int(total), pos)
-                    stop = min(max(stop, pos), len(data))
+                    stop = min(pos + max(n, 0), cap)
                 else:
-                    stop = len(data)
+                    stop = cap
                 fields.append({"f": f, "val": data[pos:stop]})
                 pos = stop
         return fields, pos
@@ -384,17 +389,20 @@ class StructMutator:
             return self.byte.mutate(data, corpus)
         if not fields:
             return self.byte.mutate(data, corpus)
-        drove_cover = False
-        scopes = _scopes(fields)
-        for _ in range(self.rng.randint(1, 3)):
-            drove_cover |= self._mutate_field(self.rng.choice(scopes)) == "cover"
-        if not drove_cover:
-            # Keep "covers: rest" lengths honest unless this round deliberately drove one.
-            # A segment length that no longer spans the segment is not a bug the parser will
-            # chase: it reads a short segment and discards the mutated tail as padding, so
-            # every other mutation in the round is thrown away before it is ever parsed.
-            _fix_covers(self.model, fields)
+        # The whole mutate-and-serialize path degrades to byte havoc on any error, not just a
+        # serialize failure: a field-driver on an analyst-supplied spec can hit an edge the
+        # model did not anticipate, and one bad draw must not take the campaign down with it.
         try:
+            drove_cover = False
+            scopes = _scopes(fields)
+            for _ in range(self.rng.randint(1, 3)):
+                drove_cover |= self._mutate_field(self.rng.choice(scopes)) == "cover"
+            if not drove_cover:
+                # Keep "covers: rest" lengths honest unless this round deliberately drove one.
+                # A segment length that no longer spans the segment is not a bug the parser will
+                # chase: it reads a short segment and discards the mutated tail as padding, so
+                # every other mutation in the round is thrown away before it is ever parsed.
+                _fix_covers(self.model, fields)
             return self.model.serialize(fields)
         except Exception:
             return self.byte.mutate(data, corpus)
@@ -418,8 +426,12 @@ class StructMutator:
         off_fd, siz_fd = (fd, mate) if role == "offset" else (mate, fd)
         width = min(_INT[off_fd["f"]["type"]][0], _INT[siz_fd["f"]["type"]][0]) * 8
         mask = (1 << width) - 1
-        if self.rng.random() < 0.5:
-            off = self.rng.choice([x for x in _FAR if 0xFFFF < x <= mask]) & mask
+        # Candidates for the wrap-the-sum attack: a far offset that still fits the field. For a
+        # narrow field (u8/u16) `mask <= 0xFFFF` and there are none, so `rng.choice([])` would
+        # raise -- take the plain far/edge branch instead of driving an empty choice.
+        far = [x for x in _FAR if 0xFFFF < x <= mask]
+        if far and self.rng.random() < 0.5:
+            off = self.rng.choice(far) & mask
             # the wrapped sum has to survive the check too, so aim it just past zero
             off_fd["val"] = off
             siz_fd["val"] = (mask + 1 - off + self.rng.choice((0, 1, 2, 4, 8, 16))) & mask
@@ -937,10 +949,29 @@ _SIGNATURES = [
 ]
 
 
+def _looks_like_h264(sample: bytes) -> bool:
+    """`00 00 00 01` is only four bytes -- a big-endian 1 at offset 0, which is common in
+    firmware dumps, TLV/record containers and serialized formats -- so a bare start code is
+    not enough to claim H.264. Require Annex-B structure: a NAL header byte whose
+    forbidden_zero_bit is clear and whose nal_unit_type is not the reserved 0, plus a SECOND
+    start code later in the sample (a stream is more than one NAL unit)."""
+    if len(sample) < 6 or not sample.startswith(b"\x00\x00\x00\x01"):
+        return False
+    nal = sample[4]
+    if nal & 0x80 or (nal & 0x1F) == 0:      # forbidden_zero_bit set, or unspecified type
+        return False
+    return sample.find(b"\x00\x00\x01", 4) >= 0
+
+
 def detect_magic(sample: bytes):
     """Return (name, magic_bytes) for the first known signature the sample starts with."""
     for name, sig in _SIGNATURES:
         if sample.startswith(sig):
+            # `00 00 00 01` is too generic to trust on the prefix alone -- verify NAL structure
+            # before claiming H.264, or the real length-field discovery is skipped for a file
+            # that merely opens with a big-endian 1.
+            if name == "H264" and not _looks_like_h264(sample):
+                continue
             return name, sig
     return None, b""
 

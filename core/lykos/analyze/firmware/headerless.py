@@ -125,7 +125,8 @@ def analyze_blob(data: bytes) -> dict:
             "endianness": endian, "base_addr": None, "entry": None, "load_addr": None,
             "confidence": round(min(0.8, density * 40), 2), "method": "prologue-scoring",
             "evidence": (f"prologue scoring: {best} matched {best_n} times "
-                         f"({density:.3%} of words); scores={scores}"),
+                         f"({density:.3%} of {'halfwords' if arch == 'thumb' else 'words'}); "
+                         f"scores={scores}"),
         }
     return {"arch": None, "endianness": None, "base_addr": None, "entry": None,
             "confidence": 0.0, "method": "inconclusive", "evidence": f"scores={scores}"}
