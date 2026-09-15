@@ -1,4 +1,10 @@
 dist/
+# Air-gap toolchain bundle + zipapp are build artifacts, never committed: they are
+# large (GBs) and machine/distro-specific. Built on a connected machine and carried by
+# sneakernet (docs 11, 23). Patterns below also catch a bundle built outside dist/ via --out.
+*.tar.zst
+*.tar.zst.sha256
+lykos-toolchain-*
 .mypy_cache/
 .pytest_cache/
 .cases/
