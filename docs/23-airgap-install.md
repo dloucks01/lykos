@@ -30,6 +30,10 @@ bash packaging/collect-toolchain.sh
 # -> dist/lykos-toolchain-<distro>-<date>-<arch>.tar.zst  (+ its sha256)
 ```
 
+The bundle is written to `dist/`, which is **gitignored** — it is a large, distro-specific build
+artifact and is never committed to the repo. It travels to the air-gapped side by sneakernet, not
+by `git`. Only the ~1 MB stdlib-only repo goes through version control.
+
 The collector takes its package list from `lykos.toolchain` — the same table `lykos doctor`
 reports and this document describes — so a tool cannot be added in one place and forgotten in
 the others.
