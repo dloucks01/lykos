@@ -96,8 +96,13 @@ export function dedupeFindings(findings) {
   const kept = list.filter((f) => {
     const p = crashKeyParts(f);
     if (!p) return true;
-    // a memory-corruption manifestation of a hijack overflow: keep only the representative
+    // a memory-corruption manifestation of a hijack overflow: fold the UNANALYSED ones into a
+    // single representative, but NEVER drop a poc-backed finding -- it owns a distinct reproducer,
+    // and two independent overflows that share a signal (each poc-backed) must both survive.
+    // Hiding a real second defect is worse than showing a possibly-redundant card. The server
+    // report does no folding, so dropping one here also disagreed with the report/API.
     if (hijackSignals.has(p.signal) && MEMCORRUPT.has(f.cwe)) {
+      if (f.state === "poc-backed") return true;
       return bestByCorruptSig.get(p.signal) === f;
     }
     // a bare crash with no analysis of its own, on a hijack signal: drop it

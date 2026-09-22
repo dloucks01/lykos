@@ -23,7 +23,7 @@ from ...hashing import canonical_json
 from ...jobs.registry import register_stage
 from ..dynamic import sandbox
 from ..dynamic.minimize import minimize
-from ..dynamic.stage import crash_finding_candidate
+from ..dynamic.stage import asan_defect_key, crash_finding_candidate
 from ..poc.capture import modes_for
 from . import structure, textconf, xmlgrammar
 from .mutator import Mutator
@@ -359,6 +359,8 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
                 if bucket not in seen_sigs:
                     seen_sigs[bucket] = 1
                     sig = res.signal_name
+                    # sanitizer SIGABRT -> discriminate distinct defects that both abort
+                    defect_key = asan_defect_key(res.stderr) if sig == "SIGABRT" else None
 
                     def _same(d, _sig=sig, _prefix=run_argv):
                         # Minimize under the SAME invocation the crash was found and confirmed
@@ -382,11 +384,11 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
                               input_mode=mode, argv=margv, signal=res.signal, signal_name=sig,
                               crashed=True, isolation=res.isolation,
                               duration_ms=res.duration_ms, note=note,
-                              fault_pc=res.fault_pc)
+                              fault_pc=res.fault_pc, defect_key=defect_key)
                     extra = "(" + note_prefix + ("; " + note if note else "") + ")"
                     fd.upsert(target.id, target.case_id, crash_finding_candidate(
                         sig, input_sha, res.isolation, detector, extra,
-                        fault_pc=res.fault_pc))
+                        fault_pc=res.fault_pc, discriminator=defect_key))
                 elif seen_sigs[bucket] < _MAX_CRASH_ROWS:
                     # A campaign that finds a REPRODUCIBLE crash finds it thousands of times:
                     # 8,128 of 20,000 executions on jhead. Storing every one buries the case in
@@ -398,7 +400,9 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
                               input_mode=mode, argv=argv, signal=res.signal,
                               signal_name=res.signal_name, crashed=True,
                               isolation=res.isolation, duration_ms=res.duration_ms,
-                              fault_pc=res.fault_pc)
+                              fault_pc=res.fault_pc,
+                              defect_key=(asan_defect_key(res.stderr)
+                                          if res.signal_name == "SIGABRT" else None))
         if execs % 250 == 0:
             ctx.emit(f"{event_prefix}.progress", payload={"execs": execs, "crashes": crashes,
                                                           "unique": len(seen_sigs),

@@ -146,8 +146,11 @@ def _distinct_crashes(store, target_id):
         if not (d.crashed and d.input_sha):
             continue
         # A SIGABRT is bucketed by signal alone (its PC is in the abort/check machinery, not the
-        # defect), so one double-free is proved once, not 47 times. See crash_dedup_key.
-        key = (d.signal_name, None if d.signal_name == "SIGABRT" else d.fault_pc)
+        # defect), so one double-free is proved once, not 47 times -- EXCEPT a sanitizer abort,
+        # which carries a defect_key (ASan class+source) separating two distinct defects that both
+        # abort, so both reach the prove loop instead of collapsing. See crash_dedup_key.
+        key = ((d.signal_name, d.defect_key) if d.signal_name == "SIGABRT"
+               else (d.signal_name, d.fault_pc))
         if key not in seen:
             seen.add(key)
             out.append(d)
