@@ -120,14 +120,19 @@ def _sanitizer_report(exe, mode, base_argv, data, scratch, timeout, target) -> s
     if mode == "stdin" or mode == "none":
         stdin = data
     elif mode == "arg":
-        argv = [str(exe)] + place(list(base_argv), data.decode("latin-1", "ignore"))
+        # An argv element is NUL-terminated by execve, so the program only ever sees up to the
+        # first NUL -- truncate there (matching how the crash was actually delivered). Passing the
+        # NUL through would make subprocess.run raise ValueError('embedded null byte') and lose the
+        # sanitizer report for a real crash whose input happened to contain a NUL.
+        arg = data.split(b"\x00", 1)[0].decode("latin-1", "ignore")
+        argv = [str(exe)] + place(list(base_argv), arg)
     elif mode == "file":
         f = scratch / "asan-in.bin"
         f.write_bytes(data)
         argv = [str(exe)] + place(list(base_argv), str(f))
     try:
         r = _sp.run(argv, input=stdin, capture_output=True, timeout=max(4.0, float(timeout)), env=env)
-    except (OSError, _sp.SubprocessError):
+    except (OSError, ValueError, _sp.SubprocessError):
         return ""
     return (r.stderr or b"").decode("latin-1", "ignore")
 
