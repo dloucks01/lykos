@@ -32,9 +32,11 @@ _log = logging.getLogger("lykos.jobs.worker")
 class _Heartbeat(threading.Thread):
     """Periodically extends a running job's lease from its OWN connection."""
 
-    def __init__(self, db_path: Path, run_id: str, worker_id: str, cfg: JobConfig):
+    def __init__(self, db_path: Path, run_id: str, worker_id: str, cfg: JobConfig,
+                 deadline: Optional[float] = None):
         super().__init__(daemon=True)
         self._db, self._run, self._wid, self._cfg = db_path, run_id, worker_id, cfg
+        self._deadline = deadline
         self._stop = threading.Event()
 
     def run(self) -> None:
@@ -42,13 +44,27 @@ class _Heartbeat(threading.Thread):
         q = JobQueue(conn)
         try:
             while not self._stop.wait(self._cfg.heartbeat_interval):
-                # A transient failure (e.g. "database is locked") must not kill the heartbeat
-                # thread: if it dies the lease expires, the reaper requeues a job that is in
-                # fact still running, and the running worker's result is then discarded. Log
-                # and retry on the next tick instead.
+                # Stop RENEWING the lease once the job is past its deadline or a cancel was
+                # requested. A non-cooperative stage (stuck in a native angr/unicorn/pypcode call
+                # that never reaches a check) would otherwise have its lease extended forever, so
+                # the reaper could never reclaim the row: the job sits 'running' indefinitely,
+                # holding a worker and blocking the pipeline, and a UI cancel does nothing. Letting
+                # the lease lapse lets reap() mark it failed/requeue so the case moves on; when the
+                # stuck stage finally returns, complete() sees the lease lost and discards.
+                if self._deadline is not None and time.time() > self._deadline:
+                    _log.warning("run %s is past its deadline and unresponsive; letting its lease "
+                                 "lapse so the reaper can reclaim it", self._run)
+                    return
                 try:
+                    if q.is_cancel_requested(self._run):
+                        _log.info("run %s cancel-requested but unresponsive; letting its lease "
+                                  "lapse for the reaper", self._run)
+                        return
                     q.heartbeat(self._run, self._wid, self._cfg.lease_seconds)
                 except Exception:
+                    # A transient failure (e.g. "database is locked") must not kill the heartbeat
+                    # thread: if it dies the lease expires and a still-running job is requeued. Log
+                    # and retry on the next tick instead.
                     _log.warning("heartbeat failed for run %s (worker %s); will retry",
                                  self._run, self._wid, exc_info=True)
         finally:
@@ -167,7 +183,7 @@ class WorkerPool:
         timeout = sd.timeout if sd.timeout is not None else self.cfg.default_timeout
         deadline = (time.time() + timeout) if timeout else None
         ctx = JobContext(q.conn, self.content, run, deadline=deadline, on_event=self.on_event)
-        hb = _Heartbeat(self.db_path, run_id, wid, self.cfg)
+        hb = _Heartbeat(self.db_path, run_id, wid, self.cfg, deadline=deadline)
         hb.start()
         try:
             result = sd.fn(ctx)
