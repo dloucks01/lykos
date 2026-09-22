@@ -6,6 +6,7 @@ via qemu-user's gdbstub."""
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sys
 
@@ -103,6 +104,32 @@ def _root_cause_jvm(ctx, target, input_sha, base_argv, mode, timeout) -> dict:
         "exploitability": "denial-of-service", "report": report_sha})
     ctx.progress(pct=100, msg=summary[:80])
     return {"output_shas": [report_sha], "output_kind": "root-cause"}
+
+
+def _sanitizer_report(exe, mode, base_argv, data, scratch, timeout, target) -> str:
+    """Re-run a known-crashing input once with sanitizer symbolization on, and return its stderr
+    (the AddressSanitizer/UBSan report). Native-arch only; delivered the way the crash was."""
+    import subprocess as _sp
+    if target.arch and target.arch != sandbox.host_arch():
+        return ""                                     # can't natively run a cross-arch build
+    env = dict(os.environ)
+    env["ASAN_OPTIONS"] = "symbolize=1:abort_on_error=1:halt_on_error=1:detect_leaks=0"
+    env["UBSAN_OPTIONS"] = "symbolize=1:print_stacktrace=1:halt_on_error=1"
+    argv = [str(exe)] + list(base_argv)
+    stdin = b""
+    if mode == "stdin" or mode == "none":
+        stdin = data
+    elif mode == "arg":
+        argv = [str(exe)] + place(list(base_argv), data.decode("latin-1", "ignore"))
+    elif mode == "file":
+        f = scratch / "asan-in.bin"
+        f.write_bytes(data)
+        argv = [str(exe)] + place(list(base_argv), str(f))
+    try:
+        r = _sp.run(argv, input=stdin, capture_output=True, timeout=max(4.0, float(timeout)), env=env)
+    except (OSError, _sp.SubprocessError):
+        return ""
+    return (r.stderr or b"").decode("latin-1", "ignore")
 
 
 def root_cause_stage(ctx) -> dict:
@@ -203,6 +230,33 @@ def root_cause_stage(ctx) -> dict:
                                    str(exe), target.arch or host, sites_by_finding, elf_entry)
         report["backend"] = backend
 
+        # Sanitizer build (the source-code path): a bare SIGABRT is uninformative, but the
+        # sanitizer's own report names the exact defect and (symbolized) the source line. Re-run
+        # the crashing input once with symbolization on, parse it, and let it OVERRIDE the
+        # generic classification -- turning "detected-corruption-abort" into e.g.
+        # "heap-buffer-overflow at heap_ovf.c:8". Safe: the input is known to abort immediately.
+        from ..fuzz.aflpp import is_sanitizer_build
+        if is_sanitizer_build(target_bytes):
+            try:
+                asan_text = _sanitizer_report(exe, mode, base_argv, input_bytes,
+                                              ctx.scratch(), timeout, target)
+                parsed = rootcause.parse_asan_report(asan_text)
+            except Exception:
+                parsed = None
+            if parsed:
+                report["classification"] = parsed
+                report["sanitizer_report"] = asan_text[-1200:]
+                report["summary"] = parsed["detail"]
+                # exploitability is re-rated against the specific class where it helps.
+                report["exploitability"]["reasons"] = (
+                    [f"sanitizer-confirmed {parsed['class'].replace('-', ' ')}"
+                     + (f" at {parsed['source']}" if parsed.get("source") else "")]
+                    + list(report["exploitability"].get("reasons", [])))
+                # ...and the end-effect list is re-derived from the specific ASan class, so a
+                # sanitizer-confirmed use-after-free reads as RCE-capable, not just "a crash".
+                from . import exploitability as _expl
+                report["exploitability"]["effects"] = _expl.effects(parsed, cap)
+
         report_sha = ctx.put_artifact("root-cause", data=json.dumps(report, indent=2,
                                       sort_keys=True, default=str).encode(),
                                       meta={"cwe": report["classification"]["cwe"]})
@@ -211,13 +265,26 @@ def root_cause_stage(ctx) -> dict:
         ex = report["exploitability"]
         ex_line = (f"exploitability: {ex['rating']} ({ex['score']}/100) -- "
                    + "; ".join(ex["reasons"]))
+        # Headline the finding with the END EFFECT the defect can reach, not just "a crash":
+        # the most severe achievable effect and whether the PoC has demonstrated it yet.
+        from . import exploitability as _expl
+        effs = ex.get("effects") or _expl.effects(v, cap)
+        # The denial of service IS demonstrated -- its proof is the crashing input itself.
+        for e in effs:
+            if e["kind"] == "dos":
+                e["proof"] = {"type": "input", "sha": input_sha,
+                              "note": "the crashing input reliably terminates the process"}
+        prim_eff = _expl.primary_effect(effs)
+        eff_title = (f"{prim_eff['title']}"
+                     + (" (demonstrated)" if prim_eff["status"] == "demonstrated"
+                        else " (potential)")) if prim_eff else f"Root cause: {v['class']}"
         crash_fn = (report["slice"].get("crash_function") or {})
         fdao = FindingDAO(ctx.conn)
         # from the run that FOUND the input, not from this capture, so every stage that files
         # a crash finding derives the same key and they merge instead of multiplying
         _fault_pc = DynResultDAO(ctx.conn).fault_pc_for(target.id, input_sha)
         fdao.upsert(target.id, target.case_id, {
-            "cwe": v["cwe"], "title": f"Root cause: {v['class']} [{ex['rating']}]",
+            "cwe": v["cwe"], "title": f"{eff_title}: {v['class']}",
             "severity": v["severity"],
             "state": "confirmed", "confidence": 0.9, "detector": "root_cause",
             # The crash is now locatable, and the key carries WHERE it faulted so two
@@ -226,8 +293,13 @@ def root_cause_stage(ctx) -> dict:
             "site_addr": _hex(crash_fn.get("static_addr")),
             "function_addr": crash_fn.get("func_addr"),
             "dedup_key": crash_dedup_key(cap["signal_name"], _fault_pc),
+            # root_cause is the authoritative classifier: its specific class (from the debugger,
+            # and on a sanitizer build from ASan's own report) replaces the generic signal-derived
+            # class the fuzz/dynamic stage first filed the crash under.
+            "authoritative": True,
             "evidence": [{"channel": "root-cause", "detail": report["summary"]},
-                         {"channel": "exploitability", "detail": ex_line}]})
+                         {"channel": "exploitability", "detail": ex_line},
+                         {"channel": "effects", "detail": json.dumps(effs)}]})
 
         # Attribute the crash to the static findings it actually demonstrates. Without this a
         # verified PoC sits beside the static inventory instead of ranking it: on jhead, one

@@ -18,6 +18,9 @@ import pytest
 
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
 _PAGE = _ROOT / "core/lykos/api/static/index.html"
+# The classic single-file UI, still shipped and linked from the new workbench. The inline
+# assertions below check ITS script; the new modular UI is covered by tests/js/gui_*.js.
+_CLASSIC = _ROOT / "core/lykos/api/static/classic.html"
 _HARNESSES = sorted((_ROOT / "tests/js").glob("*.js"))
 
 
@@ -45,7 +48,7 @@ def test_resolving_links_goes_through_the_job_queue():
     "could not launch" was reachable all along, and doing it that way cost the run row, the
     progress, the cancel, the cached result and the event: nothing recorded that linking had
     happened."""
-    h = _PAGE.read_text()
+    h = _CLASSIC.read_text()
     assert "doResolveLinks" in h
     assert '"link_case"' in h, "the button has to enqueue the stage"
     assert 'if(v==="sysmap") loadSystemMap(false)' in h

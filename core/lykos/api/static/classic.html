@@ -1,0 +1,2545 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lykos Console</title>
+<style>
+:root{
+  --bg:#0c1113;--surface:#121a1d;--surface-2:#172227;--surface-3:#1d2a30;
+  --border:#25353b;--border-strong:#33474e;--text:#e7eef0;--dim:#9db0b7;--faint:#66787f;
+  --accent:#e8ab4e;--teal:#46cabb;--ok:#57c88c;--warn:#e0b54f;--danger:#e4605f;--info:#5ea3e6;
+  --mono:ui-monospace,"Cascadia Code","JetBrains Mono",Menlo,Consolas,monospace;
+  --sans:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+}
+:root[data-theme="light"]{
+  --bg:#eef1f1;--surface:#fff;--surface-2:#f5f7f7;--surface-3:#eaeeef;
+  --border:#d3dadb;--border-strong:#bcc6c7;--text:#12191c;--dim:#4d5c61;--faint:#79888d;
+  --accent:#b5771a;--teal:#0f7d74;--ok:#2f8f5f;--warn:#c08a1f;--danger:#c23434;--info:#2f74c0;
+}
+*{box-sizing:border-box}
+[hidden]{display:none!important}   /* beats .grid/.tiles display so tab-switching hides panels */
+body{margin:0;height:100vh;overflow:hidden;background:var(--bg);color:var(--text);
+  font-family:var(--sans);font-size:13.5px;display:grid;grid-template-rows:auto 1fr}
+.mono{font-family:var(--mono);font-variant-numeric:tabular-nums}
+.eyebrow{font-family:var(--sans);text-transform:uppercase;letter-spacing:.09em;font-size:10.5px;
+  font-weight:700;color:var(--faint)}
+button{font-family:var(--sans);cursor:pointer}
+.btn{font-size:12px;font-weight:600;border-radius:6px;padding:6px 12px;border:1px solid var(--border-strong);
+  background:var(--surface-2);color:var(--text)}
+.btn:hover{border-color:var(--accent)}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:#1a1205}
+.btn.sm{padding:4px 9px;font-size:11px}
+
+/* top bar */
+.top{display:flex;align-items:center;gap:16px;height:50px;padding:0 16px;background:var(--surface);
+  border-bottom:1px solid var(--border);box-shadow:inset 0 2px 0 var(--accent)}
+.logo{font-weight:800;letter-spacing:.03em;font-size:17px}
+.logo b{color:var(--accent)}
+.chip{display:inline-flex;align-items:center;gap:6px;font-family:var(--mono);font-size:10.5px;
+  background:var(--surface-2);border:1px solid var(--border);border-radius:20px;padding:3px 9px;color:var(--dim)}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--ok)}
+.spacer{flex:1}
+
+/* body */
+.body{display:grid;grid-template-columns:230px 1fr;min-height:0}
+.rail{background:var(--surface);border-right:1px solid var(--border);padding:12px 10px;overflow-y:auto;
+  display:flex;flex-direction:column;gap:6px}
+.railhead{display:flex;align-items:center;justify-content:space-between;padding:4px 6px 8px}
+.caseitem{padding:9px 10px;border-radius:6px;cursor:pointer;border:1px solid transparent;color:var(--dim)}
+.caseitem:hover{background:var(--surface-2);color:var(--text)}
+.caseitem.active{background:var(--surface-2);color:var(--text);border-color:var(--border);
+  box-shadow:inset 2px 0 0 var(--accent)}
+.caseitem .cn{font-weight:600;font-size:13px}
+.caseitem .cid{font-family:var(--mono);font-size:9.5px;color:var(--faint)}
+
+.main{overflow-y:auto;padding:18px 22px 40px;min-height:0}
+.mainhead{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;margin-bottom:16px}
+.mainhead h1{margin:0;font-size:19px}
+.mainhead .sub{color:var(--dim);font-size:12px;margin-top:2px}
+.uploader{display:flex;gap:8px;align-items:center}
+.grid{display:grid;grid-template-columns:1.6fr 1fr;gap:14px;align-items:start}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:14px 15px;margin-bottom:14px}
+.cardhead{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}
+
+table{width:100%;border-collapse:collapse;font-size:12px}
+th{text-align:left;text-transform:uppercase;letter-spacing:.05em;font-size:10px;color:var(--faint);
+  font-weight:700;padding:6px 8px;border-bottom:1px solid var(--border)}
+td{padding:7px 8px;border-bottom:1px solid var(--border)}
+tr:last-child td{border-bottom:none}
+tbody tr{cursor:pointer}
+tbody tr:hover{background:var(--surface-2)}
+.arch{font-family:var(--mono);font-size:10px;color:var(--teal);border:1px solid color-mix(in srgb,var(--teal) 40%,var(--border));border-radius:4px;padding:1px 6px}
+.mit{font-family:var(--mono);font-size:9.5px;border-radius:4px;padding:1px 5px;margin-right:3px;border:1px solid}
+.mit.on{color:var(--ok);border-color:color-mix(in srgb,var(--ok) 45%,transparent)}
+.mit.off{color:var(--danger);border-color:color-mix(in srgb,var(--danger) 45%,transparent)}
+.mit.partial{color:var(--warn);border-color:color-mix(in srgb,var(--warn) 45%,transparent)}
+.mit.unknown{color:var(--faint);border-color:var(--border)}
+.pill{font-family:var(--sans);text-transform:uppercase;letter-spacing:.05em;font-size:10px;font-weight:700;
+  border-radius:20px;padding:2px 9px;border:1px solid}
+.pill.queued{color:var(--info);border-color:color-mix(in srgb,var(--info) 45%,transparent)}
+.pill.running{color:var(--accent);border-color:color-mix(in srgb,var(--accent) 45%,transparent)}
+.pill.done{color:var(--ok);border-color:color-mix(in srgb,var(--ok) 45%,transparent)}
+.pill.error{color:var(--danger);border-color:color-mix(in srgb,var(--danger) 45%,transparent)}
+.pill.cancelled{color:var(--faint);border-color:var(--border)}
+
+.log{font-family:var(--mono);font-size:11px;height:min(56vh,560px);min-height:320px;overflow-y:auto;display:flex;flex-direction:column;gap:3px}
+.logline{color:var(--dim);white-space:pre-wrap;word-break:break-word;padding:2px 4px;border-radius:4px;border-left:2px solid transparent;line-height:1.45}
+.logline:hover{background:color-mix(in srgb,var(--accent) 6%,transparent)}
+.logline .lt{color:var(--faint)}
+.logline .t{color:var(--teal);font-weight:600}
+.logline .rid{color:var(--faint)}
+.logline.lv-ok{border-left-color:var(--ok)} .logline.lv-warn{border-left-color:var(--warn)} .logline.lv-err{border-left-color:var(--danger)} .logline.lv-hit{border-left-color:var(--accent)}
+.logline .kvp{color:var(--dim)} .logline .kvp b{color:var(--text);font-weight:600}
+.log .logsep{color:var(--faint);text-align:center;font-size:9.5px;letter-spacing:.08em;text-transform:uppercase;margin:3px 0 1px;opacity:.7;border:0;border-top:1px dashed var(--line);line-height:0;overflow:visible}
+.log .logsep span{background:var(--panel);padding:0 8px}
+.kv{display:flex;justify-content:space-between;padding:4px 0;border-bottom:1px dotted var(--border);font-size:12px}
+.kv span{color:var(--dim)} .kv b{font-family:var(--mono)}
+.empty{color:var(--faint);font-size:13px;padding:40px;text-align:center}
+.sec{font-family:var(--mono);font-size:10.5px}
+
+/* view tabs */
+.tabs{display:flex;gap:4px}
+.tab{font-size:12px;font-weight:600;padding:6px 13px;border-radius:6px 6px 0 0;border:1px solid transparent;
+  color:var(--dim);background:transparent}
+.tab:hover{color:var(--text)}
+.tab.active{color:var(--text);background:var(--surface);border-color:var(--border);border-bottom-color:var(--surface)}
+
+/* findings board */
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px;margin-bottom:14px}
+.tile{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:12px 14px;cursor:pointer}
+.tile:hover{border-color:var(--border-strong)}
+.tile.active{box-shadow:inset 0 0 0 1px var(--accent);border-color:var(--accent)}
+.tile .n{font-size:24px;font-weight:800;font-variant-numeric:tabular-nums;line-height:1}
+.tile .l{font-size:10px;text-transform:uppercase;letter-spacing:.07em;color:var(--faint);
+  font-weight:700;margin-top:5px}
+.tile.crit .n{color:var(--danger)} .tile.high .n{color:#e07a4e}
+.tile.pocb .n{color:var(--ok)} .tile.conf .n{color:var(--accent)}
+.tile.med .n{color:var(--warn)} .tile.corr .n{color:var(--info)}
+.filters{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:12px}
+.filters input,.filters select{background:var(--surface-2);color:var(--text);border:1px solid var(--border);
+  border-radius:6px;padding:6px 9px;font-size:12px;font-family:var(--sans)}
+.filters input{flex:1;min-width:150px;font-family:var(--mono);font-size:11px}
+.sev{font-family:var(--sans);text-transform:uppercase;letter-spacing:.04em;font-size:9.5px;font-weight:800;
+  border-radius:4px;padding:2px 7px;border:1px solid;white-space:nowrap}
+.sev.critical{color:#fff;background:var(--danger);border-color:var(--danger)}
+.sev.high{color:#e07a4e;border-color:color-mix(in srgb,#e07a4e 50%,transparent)}
+.sev.medium{color:var(--warn);border-color:color-mix(in srgb,var(--warn) 50%,transparent)}
+.sev.low{color:var(--info);border-color:color-mix(in srgb,var(--info) 50%,transparent)}
+.sev.info{color:var(--faint);border-color:var(--border)}
+.st{font-family:var(--sans);text-transform:uppercase;letter-spacing:.04em;font-size:9.5px;font-weight:700;
+  border-radius:20px;padding:2px 8px;border:1px solid;white-space:nowrap}
+.st.candidate{color:var(--faint);border-color:var(--border)}
+.st.corroborated{color:var(--teal);border-color:color-mix(in srgb,var(--teal) 45%,transparent)}
+.st.confirmed{color:var(--accent);border-color:color-mix(in srgb,var(--accent) 45%,transparent)}
+.st\.poc-backed,.st.pocbacked{color:var(--ok);background:color-mix(in srgb,var(--ok) 16%,transparent);
+  border-color:color-mix(in srgb,var(--ok) 55%,transparent)}
+.cbar{position:relative;height:6px;width:70px;background:var(--surface-3);border-radius:4px;overflow:hidden}
+.cbar i{position:absolute;left:0;top:0;bottom:0;background:linear-gradient(90deg,var(--teal),var(--accent))}
+.lvl{font-family:var(--mono);font-size:9.5px;font-weight:700;color:var(--ok);border:1px solid
+  color-mix(in srgb,var(--ok) 45%,transparent);border-radius:4px;padding:1px 5px}
+.frow td{vertical-align:middle}
+.frow .ttl{font-weight:600}
+.frow .ev{color:var(--faint);font-size:10.5px;font-family:var(--mono)}
+
+/* report builder */
+.fld{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--dim)}
+.statechks{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
+.chk{display:inline-flex;align-items:center;gap:5px;font-size:11px;cursor:pointer;color:var(--dim)}
+.chk input{accent-color:var(--accent);cursor:pointer}
+.rptbtns{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.rptbtns a.btn{text-decoration:none;display:inline-flex;align-items:center}
+
+/* system map */
+.smwrap{width:100%;overflow-x:auto}
+.smsvg{width:100%;height:auto;display:block}
+.smedge{stroke:var(--border-strong);stroke-width:1.6}
+.smarrow{fill:var(--border-strong)}
+.smcount{fill:var(--faint);font-size:9px;font-family:var(--mono);text-anchor:middle}
+.smtaint{stroke:var(--danger);stroke-width:2;stroke-dasharray:5 3}
+.smarrowT{fill:var(--danger)}
+.smtaintlbl{fill:var(--danger);font-size:9.5px;font-family:var(--mono);font-weight:700;text-anchor:middle}
+.smipc{stroke:var(--info);stroke-width:1.8;stroke-dasharray:2 3}
+.smarrowI{fill:var(--info)}
+.smipclbl{fill:var(--info);font-size:9.5px;font-family:var(--mono);font-weight:700;text-anchor:middle}
+.smnode{cursor:pointer}
+.smnode rect{fill:var(--surface-2);stroke:var(--border-strong);stroke-width:1.2}
+.smnode:hover rect{stroke:var(--accent)}
+.smname{fill:var(--text);font-size:11px;font-weight:700;text-anchor:middle;font-family:var(--mono)}
+.smmeta{fill:var(--faint);font-size:9px;text-anchor:middle;font-family:var(--mono)}
+
+/* command palette */
+.kbd{font-family:var(--mono);font-size:10px;border:1px solid var(--border-strong);border-radius:4px;
+  padding:1px 5px;color:var(--dim);background:var(--surface-2)}
+.palette{position:fixed;inset:0;background:color-mix(in srgb,var(--bg) 70%,transparent);
+  backdrop-filter:blur(2px);display:flex;align-items:flex-start;justify-content:center;z-index:50}
+.palette[hidden]{display:none}
+.palbox{margin-top:12vh;width:min(560px,92vw);background:var(--surface);border:1px solid var(--border-strong);
+  border-radius:12px;box-shadow:0 24px 60px rgba(0,0,0,.5);overflow:hidden}
+.palbox input{width:100%;border:0;border-bottom:1px solid var(--border);background:transparent;color:var(--text);
+  font-size:15px;padding:14px 16px;font-family:var(--sans);outline:none}
+/* custom format builder modal */
+.sbbox{margin-top:6vh;width:min(920px,95vw);max-height:86vh;display:flex;flex-direction:column;
+  background:var(--surface);border:1px solid var(--border-strong);border-radius:12px;
+  box-shadow:0 24px 60px rgba(0,0,0,.5);overflow:hidden}
+.sbhead{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;padding:13px 16px;border-bottom:1px solid var(--border)}
+.sbtop{padding:10px 16px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:10px}
+.sbgrid{display:grid;grid-template-columns:1fr 1fr;gap:0;flex:1;min-height:0}
+.sbfields{padding:12px 16px;border-right:1px solid var(--line);overflow:auto}
+.sbpreview{padding:12px 16px;overflow:auto;background:color-mix(in srgb,var(--faint) 5%,transparent)}
+.sbfoot{display:flex;align-items:center;gap:8px;padding:11px 16px;border-top:1px solid var(--border)}
+.sbrow{display:flex;flex-wrap:wrap;gap:6px;align-items:center;padding:7px;border:1px solid var(--line);border-radius:8px;margin-bottom:6px}
+.sbrow .sbt{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;color:var(--accent);min-width:38px}
+.sbrow .sel,.sbrow .inp{font-size:11.5px;padding:3px 6px}
+.sbrow .grow{flex:1;min-width:70px}
+.sbrow .rmf{margin-left:auto;color:var(--faint);cursor:pointer;border:0;background:none;font-size:14px}
+.sbadd{display:flex;gap:5px;align-items:center;flex-wrap:wrap;margin-top:8px}
+.pvfield{display:flex;gap:8px;align-items:baseline;font-family:var(--mono);font-size:11px;padding:4px 6px;border-radius:5px;margin-bottom:2px;background:color-mix(in srgb,var(--faint) 8%,transparent)}
+.pvfield .off{color:var(--faint);min-width:58px}
+.pvfield .ty{color:var(--accent);min-width:44px;font-weight:600}
+.pvfield .nm{color:var(--dim);min-width:52px}
+.pvfield .vl{color:var(--text);word-break:break-all;flex:1}
+.pvbadge{font-size:9.5px;padding:1px 6px;border-radius:10px;font-weight:700}
+.pvbadge.ok{color:var(--ok);border:1px solid color-mix(in srgb,var(--ok) 45%,transparent)}
+.pvbadge.no{color:var(--danger);border:1px solid color-mix(in srgb,var(--danger) 45%,transparent)}
+.pvsummary{margin-top:9px;font-size:11.5px;display:flex;gap:12px;flex-wrap:wrap;color:var(--dim)}
+.pallist{max-height:340px;overflow-y:auto;padding:6px}
+.palitem{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:9px 12px;border-radius:7px;
+  cursor:pointer;color:var(--dim);font-size:13px}
+.palitem .hint{font-size:10px;color:var(--faint);font-family:var(--mono)}
+.palitem.sel,.palitem:hover{background:var(--surface-2);color:var(--text)}
+.palitem.sel{box-shadow:inset 2px 0 0 var(--accent)}
+/* ---- workbench detail: analysis pipeline ---- */
+.wbhead{display:flex;align-items:center;justify-content:space-between;gap:10px;
+  padding-bottom:10px;margin-bottom:12px;border-bottom:1px solid var(--border)}
+.wbtitle{font-size:12.5px;color:var(--text);font-weight:600}
+.wbmits{display:flex;gap:4px;flex-wrap:wrap}
+.pipe{display:flex;flex-direction:column;gap:10px}
+.stage{border:1px solid var(--border);border-radius:9px;background:var(--surface-2);overflow:hidden}
+.stagehdr{display:flex;align-items:center;gap:9px;padding:9px 12px;background:var(--surface-3);
+  border-bottom:1px solid var(--border)}
+.stagehdr b{font-size:12.5px;font-weight:600}
+.snum{display:inline-flex;align-items:center;justify-content:center;width:19px;height:19px;
+  border-radius:50%;background:var(--surface);border:1px solid var(--border-strong);
+  color:var(--dim);font-size:11px;font-weight:700}
+.schip{margin-left:auto;font-size:11px;color:var(--faint)}
+.schip.done{color:var(--ok)}.schip.run{color:var(--accent)}.schip.warn{color:var(--danger)}
+.sbody{padding:11px 12px}
+.kvgrid{display:grid;grid-template-columns:1fr 1fr;gap:2px 18px}
+.kvgrid .kv{border:0;padding:2px 0}
+.actions{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:8px}
+.actions .inp{flex:1;min-width:110px;background:var(--surface);color:var(--text);
+  border:1px solid var(--border);border-radius:6px;padding:5px 8px;font-family:var(--mono);font-size:11px}
+.actions .sel{background:var(--surface);color:var(--text);border:1px solid var(--border-strong);
+  border-radius:6px;padding:5px 8px;font-size:11.5px;font-weight:600}
+.vsep{width:1px;align-self:stretch;background:var(--border);margin:2px 3px}
+.disc{margin-top:8px}.disc summary{cursor:pointer;font-size:11px;color:var(--dim);
+  text-transform:uppercase;letter-spacing:.08em;font-weight:600}
+.disc summary::marker{color:var(--faint)}
+/* guided fuzzing */
+.fgroup{margin:2px 0 10px}
+.fglabel{font-size:11px;font-weight:600;color:var(--dim);margin:0 0 5px}
+.fghint{font-size:10.5px;color:var(--faint);font-weight:400}
+.guide{margin:0 0 12px;padding:9px 11px;border-radius:8px;border:1px solid color-mix(in srgb,var(--accent) 40%,transparent);
+  background:color-mix(in srgb,var(--accent) 8%,transparent);font-size:12px;line-height:1.5}
+.guide .ghd{font-weight:700;color:var(--accent);display:flex;align-items:center;gap:6px;margin-bottom:4px}
+.guide .grec{color:var(--text)} .guide .grec b{color:var(--text)}
+.guide ul.gcheck{list-style:none;margin:7px 0 0;padding:0;display:flex;flex-direction:column;gap:2px}
+.guide ul.gcheck li{font-size:11.5px;display:flex;gap:6px;align-items:baseline}
+.guide .ck{width:13px;text-align:center} .guide .ck.ok{color:var(--ok)} .guide .ck.no{color:var(--warn)}
+.guide .gapply{margin-top:8px}
+.fmetrics{margin:10px 0 4px;padding:9px 11px;border-radius:8px;border:1px solid var(--line);background:color-mix(in srgb,var(--faint) 7%,transparent)}
+.smexplain{margin:2px 0 10px;padding:9px 12px;border-radius:8px;border:1px solid var(--line);
+  background:color-mix(in srgb,var(--info) 7%,transparent);font-size:12px;line-height:1.55;color:var(--dim)}
+.smexplain b{color:var(--text)} .smexplain a{color:var(--teal)}
+/* progress bars */
+.pbar{position:relative;height:6px;border-radius:4px;background:color-mix(in srgb,var(--faint) 22%,transparent);overflow:hidden;margin-top:5px}
+.pbar>i{position:absolute;left:0;top:0;bottom:0;width:0;background:var(--accent);border-radius:4px;transition:width .3s ease}
+.pbar.ind>i{width:35% !important;animation:pind 1.1s ease-in-out infinite}
+.pbar.ok>i{background:var(--ok)} .pbar.err>i{background:var(--danger)} .pbar.hit>i{background:var(--accent)}
+@keyframes pind{0%{left:-35%}100%{left:100%}}
+.pbwrap{display:flex;flex-direction:column;gap:2px;margin-top:6px}
+.pbmeta{display:flex;justify-content:space-between;font-size:10px;color:var(--faint);font-family:var(--mono)}
+.pbmeta b{color:var(--text)}
+.metrics{display:flex;gap:14px;flex-wrap:wrap;margin:2px 0 6px}
+.metric{display:flex;flex-direction:column;gap:1px}
+.metric .mv{font-size:17px;font-weight:700;font-family:var(--mono);line-height:1.1}
+.metric .ml{font-size:9.5px;text-transform:uppercase;letter-spacing:.05em;color:var(--faint)}
+.metric.hit .mv{color:var(--danger)}
+.menu{position:relative}.menu>summary{list-style:none;display:inline-flex}
+.menu>summary::-webkit-details-marker{display:none}
+.menu .menubody{position:absolute;z-index:5;top:110%;left:0;display:flex;flex-direction:column;
+  gap:5px;padding:7px;background:var(--surface);border:1px solid var(--border-strong);
+  border-radius:8px;min-width:170px;box-shadow:0 8px 24px rgba(0,0,0,.4)}
+.hint{color:var(--faint);font-size:11px;margin-bottom:6px}
+.notewarn{margin-top:8px;color:var(--warn)}
+.code{white-space:pre-wrap;max-height:200px;overflow:auto;margin-top:6px}
+.lt{color:var(--faint);font-variant-numeric:tabular-nums;margin-right:2px}
+.runrow{align-items:center}.runmeta{display:flex;gap:8px;align-items:center}
+.runtime{color:var(--faint);font-size:10.5px}
+.fsearch{width:100%;box-sizing:border-box;background:var(--surface);color:var(--text);
+  border:1px solid var(--border);border-radius:6px;padding:5px 8px;font-family:var(--mono);
+  font-size:11px;margin:6px 0}
+.frow.clk{cursor:pointer;padding:3px 4px;border-radius:5px}
+.frow.clk:hover{background:var(--surface-3)}
+.fcount{color:var(--faint);font-size:10px;margin-left:4px}
+/* ---- findings board: inline detail ---- */
+tr.frow.sel>td{background:var(--surface-3)}
+tr.fdetail>td{background:var(--surface-2);border-bottom:1px solid var(--border-strong);padding:0}
+.fdbody{padding:12px 14px}
+.fdhead{font-size:12.5px;margin-bottom:8px}
+.fdmeta{display:block;color:var(--faint);font-size:11px;margin-top:3px}
+.fdkv{display:flex;gap:10px;font-size:11.5px;padding:1px 0}
+.fdkv>span{color:var(--faint);min-width:66px}
+.evlist{display:flex;flex-direction:column;gap:4px}
+.evrow{font-size:11px;color:var(--dim);font-family:var(--mono);line-height:1.4}
+.evch{display:inline-block;min-width:96px;color:var(--teal)}
+/* ---- reverse-engineering code viewer ---- */
+#funcs .frow.on{background:var(--surface-3);box-shadow:inset 2px 0 0 var(--accent)}
+.cv{margin:8px 0 4px;border:1px solid var(--border-strong);border-radius:8px;
+  background:var(--bg);overflow:hidden}
+.cvhead{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;
+  padding:8px 10px;background:var(--surface-3);border-bottom:1px solid var(--border)}
+.cvname{font-size:12px}
+.cvbody{display:grid;grid-template-columns:1fr 1fr}
+.cvpane{min-width:0}
+.cvpane+.cvpane{border-left:1px solid var(--border)}
+.cvplabel{font-size:9.5px;text-transform:uppercase;letter-spacing:.08em;color:var(--faint);
+  padding:6px 12px 2px}
+.cvcode{margin:0;padding:4px 12px 10px;white-space:pre-wrap;overflow:auto;max-height:320px;
+  font-family:var(--mono);font-size:11px;line-height:1.5;color:var(--text);word-break:break-word}
+.cvcalls{padding:8px 12px;border-top:1px solid var(--border);display:flex;gap:6px;
+  flex-wrap:wrap;align-items:center}
+.cvcalls span:not(.cvplabel):not(.hint){font-family:var(--mono);font-size:11px;padding:2px 7px;
+  border-radius:5px;background:var(--surface-2);border:1px solid var(--border)}
+.cvcalls span.ext{color:var(--warn);border-color:var(--warn)}
+@media(max-width:920px){.cvbody{grid-template-columns:1fr}
+  .cvpane+.cvpane{border-left:0;border-top:1px solid var(--border)}}
+/* function list: address + recovered signature */
+#funcs .frow .faddr{color:var(--faint);font-family:var(--mono);font-size:10.5px}
+#funcs .frow .fsig{font-family:var(--mono);font-size:11px;color:var(--dim)}
+#funcs .frow .fnm{font-family:var(--mono);font-size:11px;color:var(--text)}
+#funcs .frow.on .fsig,#funcs .frow.on .fnm{color:var(--text)}
+/* signature line + xrefs + stack frame in the code viewer */
+.cvsig{width:100%;font-family:var(--mono);font-size:11px;color:var(--teal);
+  padding:2px 2px 0;word-break:break-word}
+.cvxrefs{border-top:1px solid var(--border);padding:6px 12px;display:flex;flex-direction:column;gap:4px}
+.cvxr{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.callchip{font-family:var(--mono);font-size:11px;padding:2px 7px;border-radius:5px;cursor:pointer;
+  background:var(--surface-2);border:1px solid var(--border)}
+.callchip:hover{border-color:var(--accent)}
+.callchip.ext{color:var(--warn);border-color:color-mix(in srgb,var(--warn) 45%,transparent)}
+.cvframe{border-top:1px solid var(--border);padding:6px 12px}
+.cvframe>summary{cursor:pointer;font-size:9.5px;text-transform:uppercase;letter-spacing:.08em;color:var(--faint)}
+.frametbl{width:100%;border-collapse:collapse;margin-top:6px;font-size:11px}
+.frametbl th{text-align:left;color:var(--faint);font-weight:600;font-size:9.5px;text-transform:uppercase;padding:2px 8px 2px 0}
+.frametbl td{padding:2px 8px 2px 0;color:var(--dim)}
+.frametbl tr.bufrow td{color:var(--text)}
+.frametbl tr.bufrow{background:color-mix(in srgb,var(--warn) 9%,transparent)}
+/* interactive console */
+.conout{flex:1;min-height:300px;max-height:52vh;overflow:auto;margin:0;padding:10px 12px;
+  background:#0b0f14;color:#d6e2ef;font-family:var(--mono);font-size:12px;line-height:1.4;
+  white-space:pre-wrap;word-break:break-word}
+.conrow{display:flex;gap:8px;align-items:center;padding:8px 12px;border-top:1px solid var(--border)}
+.conrow .inp{flex:1}
+/* ---- CFG graph ---- */
+.cvcfg{overflow:auto;max-height:320px;padding:6px}
+.cfgsvg{display:block;font-family:var(--mono)}
+.cfgnode rect{fill:var(--surface-2);stroke:var(--border-strong);stroke-width:1}
+.cfgnode:hover rect{stroke:var(--accent)}
+.cfghdr{fill:var(--accent);font-size:9px;font-weight:700}
+.cfgins{fill:var(--dim);font-size:8.5px}
+.cfgins.dim{fill:var(--faint)}
+.cfgedge{fill:none;stroke:var(--border-strong);stroke-width:1.4}
+.cfgedge.back{stroke:var(--info);stroke-dasharray:4 3}
+.cfgarh{fill:var(--border-strong)}
+/* ---- system map: toolbar + legend ---- */
+.smtools{display:flex;gap:6px;flex-wrap:wrap}
+.smlegend{display:flex;align-items:center;gap:16px;flex-wrap:wrap;font-size:11px;color:var(--dim);
+  padding:7px 2px 9px;border-bottom:1px solid var(--border);margin-bottom:8px}
+.smlegend span{display:inline-flex;align-items:center;gap:6px}
+.lg{width:16px;height:0;border-top:2px solid var(--faint);display:inline-block}
+.lgdyn{border-top-color:var(--border-strong)}
+.lgtaint{border-top:2px dashed var(--danger)}
+.lgipc{border-top:2px dotted var(--info)}
+/* ---- report: export format grid ---- */
+.fmtgrid{display:grid;grid-template-columns:1fr;gap:8px}
+.fmt{display:flex;align-items:center;gap:12px}
+.fmt>.btn,.fmt>a.btn{min-width:120px;justify-content:center;text-align:center}
+.fmt>span{font-size:11.5px;color:var(--dim)}
+@media(min-width:720px){.fmtgrid{grid-template-columns:1fr 1fr}}
+/* A stage that cannot run on this substrate: visibly out, but still legible and still
+   carrying its reason in the tooltip. Hiding it entirely would make a capability the tester
+   knows exists look missing, with no way to discover why. */
+.btn.unavail, .btn:disabled{opacity:.42;cursor:not-allowed;filter:grayscale(.7)}
+.btn.unavail:hover{opacity:.6}
+/* The recommended next step, so it is findable without reading twenty labels. */
+.btn.planned{box-shadow:inset 0 0 0 1px var(--teal,#3aa);border-color:var(--teal,#3aa)}
+#substrate{opacity:.85}
+#laddernote b{color:var(--teal,#3aa)}
+/* Evidence tiers on the board. The boundary between "we demonstrated this" and "a pattern
+   matched" is the single most important thing the list has to communicate, and 24 rows in one
+   table communicate none of it. */
+tr.tierhd td{background:var(--panel2,#1b1f24);cursor:pointer;padding:5px 8px;
+  border-top:1px solid var(--line,#2a3038);user-select:none}
+tr.tierhd b{font-size:11.5px;letter-spacing:.04em;text-transform:uppercase}
+.tchev{display:inline-block;width:12px;color:var(--faint)}
+.tcount{display:inline-block;min-width:18px;padding:0 5px;margin-left:6px;border-radius:8px;
+  background:var(--line,#2a3038);font-size:10.5px}
+.thint{margin-left:10px;color:var(--faint);font-size:10.5px;font-weight:400;text-transform:none}
+/* Runs grouped by the binary they ran against. A flat list of 28 across four targets says
+   nothing about which belongs to which, and truncating it silently swallowed the only
+   failure. */
+.rungrp{margin-bottom:8px}
+.rungrphd{display:flex;justify-content:space-between;align-items:center;padding:3px 6px;
+  border-bottom:1px solid var(--line,#2a3038);margin-bottom:4px;font-size:11px}
+.rungrphd .dim{color:var(--faint);font-size:10.5px}
+.runmore{text-align:center;padding:5px;color:var(--faint);font-size:11px;cursor:pointer;
+  border:1px dashed var(--line,#2a3038);border-radius:5px;margin-top:4px}
+.runmore:hover{color:var(--fg);border-color:var(--teal,#3aa)}
+.runerr{margin:3px 0 0 6px;padding:4px 6px;border-left:2px solid #c4564f;
+  background:rgba(196,86,79,.09);color:#e0a9a5;font-size:10.5px;white-space:pre-wrap}
+</style>
+</head>
+<body>
+<div class="top">
+  <span class="logo"><b>LYKOS</b></span>
+  <span class="chip"><span class="dot"></span>air-gapped</span>
+  <span class="spacer"></span>
+  <button class="btn sm" id="cmdk" title="Command palette">⌘K</button>
+  <button class="btn sm" id="theme">theme</button>
+</div>
+<div class="body">
+  <aside class="rail">
+    <div class="railhead"><span class="eyebrow">Cases</span>
+      <span style="display:flex;gap:4px">
+        <button class="btn sm" id="impcase" title="Import a case archive (.tar.gz)">Import</button>
+        <button class="btn sm" id="newcase">+ New</button>
+      </span></div>
+    <input type="file" id="impfilerail" accept=".gz,.tgz,.tar" style="display:none">
+    <div id="cases"></div>
+  </aside>
+  <main class="main" id="main">
+    <div class="empty">Select or create a case to begin. Press <span class="kbd">⌘K</span> for commands.</div>
+  </main>
+</div>
+
+<div class="palette" id="palette" hidden>
+  <div class="palbox" role="dialog" aria-label="Command palette">
+    <input id="palq" placeholder="Type a command…" autocomplete="off">
+    <div class="pallist" id="pallist"></div>
+  </div>
+</div>
+
+<div class="palette" id="specbuilder" hidden>
+  <div class="sbbox" role="dialog" aria-label="Custom format builder">
+    <div class="sbhead">
+      <div><b>Custom format builder</b><div class="fghint">Describe the input's layout; the preview carves a real sample so you can see if it fits.</div></div>
+      <button class="btn sm" onclick="closeSpecBuilder()">✕</button>
+    </div>
+    <div class="sbtop">
+      <button class="btn sm primary" id="sbauto" onclick="builderAutodetect()" title="Look at the first attached seed: detect the magic and auto-find the length field">✨ Auto-detect from seed</button>
+      <span class="fghint" id="sbautohint"></span>
+    </div>
+    <div class="sbgrid">
+      <div class="sbfields">
+        <div class="eyebrow">Fields <span class="fghint">(top = start of file)</span></div>
+        <div id="sbfieldlist"></div>
+        <div class="sbadd">
+          <span class="fghint">add:</span>
+          <button class="btn sm" onclick="addField('magic')">magic</button>
+          <button class="btn sm" onclick="addField('u8')">u8</button>
+          <button class="btn sm" onclick="addField('u16')">u16</button>
+          <button class="btn sm" onclick="addField('u32')">u32</button>
+          <button class="btn sm" onclick="addField('u64')">u64</button>
+          <button class="btn sm" onclick="addField('blob')">blob</button>
+        </div>
+      </div>
+      <div class="sbpreview">
+        <div class="eyebrow">Live preview <span class="fghint" id="sbsamplelbl"></span></div>
+        <div id="sbpreviewbody"><div class="hint">Attach a seed (+ seeds) and press Auto-detect, or add fields.</div></div>
+      </div>
+    </div>
+    <div class="sbfoot">
+      <span class="fghint" id="sbstatus"></span>
+      <span style="flex:1"></span>
+      <button class="btn sm" onclick="closeSpecBuilder()">Cancel</button>
+      <button class="btn sm primary" id="sbuse" onclick="useBuilderSpec()">Use this spec</button>
+    </div>
+  </div>
+</div>
+
+<div class="palette" id="console" hidden>
+  <div class="sbbox" role="dialog" aria-label="Interactive detonation console">
+    <div class="sbhead">
+      <div><b>Interactive console</b> <span class="fghint" id="constatus">disconnected</span>
+        <div class="fghint">Drive the target live in the sandbox to reach menus/protocols; save what you send as a seed.</div></div>
+      <button class="btn sm" onclick="closeConsole()">✕</button>
+    </div>
+    <div class="sbtop">
+      <input id="conargv" class="inp" placeholder="argv (comma-separated, optional)" style="max-width:260px">
+      <button class="btn sm primary" id="conconnect" onclick="consoleConnect()">▶ Run</button>
+      <button class="btn sm" onclick="consoleSignal('INT')" title="Send Ctrl-C (SIGINT)">Ctrl-C</button>
+      <button class="btn sm" onclick="consoleEof()" title="Send EOF">EOF</button>
+      <button class="btn sm" onclick="consoleSave()" title="Save the bytes you've sent as a reusable seed">Save as seed</button>
+      <span class="fghint" id="consaved"></span>
+    </div>
+    <div class="sbgrid" style="grid-template-columns:1fr">
+      <div style="padding:0;display:flex;flex-direction:column;min-height:0">
+        <pre id="conout" class="conout"></pre>
+        <div class="conrow">
+          <input id="conin" class="inp" placeholder="type input, Enter to send…" autocomplete="off"
+                 onkeydown="if(event.key==='Enter'){consoleSend();event.preventDefault();}">
+          <label class="fghint" style="display:flex;gap:4px;align-items:center"><input type="checkbox" id="connl" checked>+newline</label>
+          <button class="btn sm" onclick="consoleSend()">Send</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const api = async (path, opts={}) => {
+  const r = await fetch(path, opts);
+  const ct = r.headers.get("content-type")||"";
+  return ct.includes("json") ? r.json() : r.text();
+};
+let CUR = null;      // current case id
+let WS = null;
+let RUNS = [];       // latest runs for the case
+let POLL = null;
+let DETAIL_TID = null;  // target open in the detail panel
+let TRIAGE = null;      // triage record for the open target (drives fuzz guidance)
+let FUZZ_LIVE = {};     // run_id -> {execs,crashes,max} for live fuzz progress bars
+let PROG = {};          // run_id -> {pct,msg} latest job.progress, for run progress bars
+
+// ---- theme ----
+try{const t=localStorage.getItem("theme"); if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}
+document.getElementById("theme").onclick = ()=>{
+  const cur=document.documentElement.getAttribute("data-theme");
+  const next = cur==="light" ? "dark" : "light";
+  document.documentElement.setAttribute("data-theme",next);
+  try{localStorage.setItem("theme",next);}catch(e){}
+};
+
+// ---- cases ----
+async function loadCases(){
+  const cases = await api("/cases");
+  const el = document.getElementById("cases");
+  el.innerHTML = "";
+  cases.forEach(c=>{
+    const d=document.createElement("div");
+    d.className="caseitem"+(c.id===CUR?" active":"");
+    d.innerHTML=`<div class="cn">${esc(c.name)}</div><div class="cid">${c.id.slice(0,12)}</div>`;
+    d.onclick=()=>selectCase(c.id, c.name);
+    el.appendChild(d);
+  });
+}
+document.getElementById("newcase").onclick = async ()=>{
+  const name = prompt("Case name:", "engagement-"+new Date().toISOString().slice(0,10));
+  if(!name) return;
+  const c = await api("/cases",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name})});
+  await loadCases(); selectCase(c.id, c.name);
+};
+
+// ---- case view ----
+async function selectCase(id, name){
+  CUR=id; await loadCases();
+  document.getElementById("main").innerHTML = view(name||id);
+  document.getElementById("file").onchange = onUpload;
+  openWS(id);
+  await refresh();
+  if(POLL) clearInterval(POLL);
+  POLL = setInterval(refresh, 2000);
+}
+function view(name){ return `
+  <div class="mainhead">
+    <div>
+      <h1>${esc(name)}</h1><div class="sub mono" id="casesub"></div>
+      <div class="tabs" style="margin-top:10px">
+        <button class="tab active" id="tab-wb" onclick="switchView('wb')">Workbench</button>
+        <button class="tab" id="tab-board" onclick="switchView('board')">Findings Board</button>
+        <button class="tab" id="tab-sysmap" onclick="switchView('sysmap')">System Map</button>
+        <button class="tab" id="tab-report" onclick="switchView('report')">Report</button>
+      </div>
+    </div>
+    <div class="uploader">
+      <input type="file" id="file" style="display:none">
+      <button class="btn" onclick="document.getElementById('file').click()">Choose binary</button>
+      <span id="fname" class="mono" style="color:var(--faint);font-size:11px"></span>
+      <button class="btn primary" id="analyze" disabled>Analyze</button>
+    </div>
+  </div>
+  <div id="workbench" class="grid">
+    <div>
+      <div class="card"><div class="cardhead"><span class="eyebrow">Targets</span><span class="mono" id="tcount" style="color:var(--faint)"></span></div>
+        <div id="targets"></div></div>
+      <div class="card" id="detailcard" hidden><div class="cardhead"><span class="eyebrow">Triage detail</span></div><div id="detail"></div></div>
+    </div>
+    <div>
+      <div class="card"><div class="cardhead"><span class="eyebrow">Runs</span></div><div id="runs"></div></div>
+      <div class="card"><div class="cardhead"><span class="eyebrow">Live events</span></div><div class="log" id="log"></div></div>
+    </div>
+  </div>
+  <div id="board" hidden></div>
+  <div id="sysmap" hidden></div>
+  <div id="report" hidden></div>`;
+}
+
+let BOARD_VIEW="wb", BOARD_FILTER={sev:"",state:"",q:""};
+function switchView(v){
+  BOARD_VIEW=v;
+  const wb=document.getElementById("workbench"), bd=document.getElementById("board"),
+        rp=document.getElementById("report"), sm=document.getElementById("sysmap");
+  document.getElementById("tab-wb").classList.toggle("active", v==="wb");
+  document.getElementById("tab-board").classList.toggle("active", v==="board");
+  document.getElementById("tab-sysmap").classList.toggle("active", v==="sysmap");
+  document.getElementById("tab-report").classList.toggle("active", v==="report");
+  if(wb) wb.hidden = v!=="wb";
+  if(bd) bd.hidden = v!=="board";
+  if(sm) sm.hidden = v!=="sysmap";
+  if(rp) rp.hidden = v!=="report";
+  if(v==="board") loadBoard();
+  if(v==="sysmap") loadSystemMap(false);   // show what is known; resolving is a stage
+  if(v==="report") renderReport();
+}
+
+const _SEVRANK={critical:4,high:3,medium:2,low:1,info:0};
+async function loadBoard(){
+  const bd=document.getElementById("board"); if(!bd||!CUR) return;
+  let fs=[];
+  try{ fs=await api(`/cases/${CUR}/findings`); }catch(e){ fs=[]; }
+  BOARD_DATA=fs;
+  renderBoard();
+}
+let BOARD_DATA=[];
+function boardCounts(fs){
+  const c={total:fs.length,critical:0,high:0,medium:0,low:0,info:0,
+    candidate:0,corroborated:0,confirmed:0,"poc-backed":0};
+  fs.forEach(f=>{ c[f.severity]=(c[f.severity]||0)+1; c[f.state]=(c[f.state]||0)+1; });
+  return c;
+}
+function renderBoard(){
+  const bd=document.getElementById("board"); if(!bd) return;
+  const all=BOARD_DATA, c=boardCounts(all);
+  const f=BOARD_FILTER;
+  let rows=all.filter(x=>
+    (!f.sev||x.severity===f.sev) && (!f.state||x.state===f.state) &&
+    (!f.q || ((x.cwe||"")+" "+(x.title||"")+" "+(x.target_name||"")+" "+(x.detector||""))
+      .toLowerCase().includes(f.q.toLowerCase())));
+  // Evidence first, then severity. Sorting on severity alone buried the only PROVEN finding
+  // on jhead -- a reproduced, attributed out-of-bounds read -- fifteenth, under a dozen
+  // unproven pattern matches, because tainted_deref files reads as low severity.
+  const _STRANK={"poc-backed":4,"confirmed":3,"corroborated":2,"candidate":1};
+  rows.sort((a,b)=> ((_STRANK[b.state]||0)-(_STRANK[a.state]||0)) ||
+    (_SEVRANK[b.severity]-_SEVRANK[a.severity]) ||
+    ((b.confidence||0)-(a.confidence||0)));
+  const tile=(cls,n,l,key,val)=>`<div class="tile ${cls} ${
+    (f[key]===val)?'active':''}" onclick="boardTile('${key}','${val}')"><div class="n">${n}</div><div class="l">${l}</div></div>`;
+  const tilesHtml=`<div class="tiles">
+    <div class="tile ${!f.sev&&!f.state?'active':''}" onclick="boardTile('clear','')"><div class="n">${c.total}</div><div class="l">All findings</div></div>
+    ${tile('crit',c.critical,'Critical','sev','critical')}
+    ${tile('high',c.high,'High','sev','high')}
+    ${tile('med',c.medium,'Medium','sev','medium')}
+    ${tile('corr',c.corroborated,'Corroborated','state','corroborated')}
+    ${tile('conf',c.confirmed,'Confirmed','state','confirmed')}
+    ${tile('pocb',c['poc-backed'],'PoC-backed','state','poc-backed')}
+  </div>`;
+  const filters=`<div class="filters">
+    <input id="bq" placeholder="filter by CWE, title, target, detector…" value="${esc(f.q)}"
+      oninput="BOARD_FILTER.q=this.value;renderBoard();document.getElementById('bq').focus()">
+    <select id="bsev" onchange="BOARD_FILTER.sev=this.value;renderBoard()">
+      <option value="">all severities</option>
+      ${['critical','high','medium','low','info'].map(s=>`<option ${f.sev===s?'selected':''} value="${s}">${s}</option>`).join('')}
+    </select>
+    <select id="bstate" onchange="BOARD_FILTER.state=this.value;renderBoard()">
+      <option value="">all states</option>
+      ${['candidate','corroborated','confirmed','poc-backed'].map(s=>`<option ${f.state===s?'selected':''} value="${s}">${s}</option>`).join('')}
+    </select>
+    <span class="mono" style="color:var(--faint);font-size:11px">${rows.length} shown</span>
+  </div>`;
+  // Evidence TIERS, not one undifferentiated list. The sort has been evidence-first for a
+  // while, but 24 rows in a single table give the reader no idea where demonstrated stops and
+  // pattern-matching starts -- and on a real parser the speculative tier is most of the list
+  // (jhead: 1 confirmed, 7 corroborated, 16 candidates). Collapsing it puts the evidence on
+  // screen and the inventory one click away, instead of the other way round.
+  const TIERS=[
+    {key:"proven", label:"Demonstrated", hint:"reproduced, and the reproducer was run",
+     states:["poc-backed","confirmed"], open:true},
+    {key:"corr", label:"Corroborated", hint:"a second channel agrees -- data flow, a taint "
+     +"path, an xref", states:["corroborated"], open:true},
+    {key:"cand", label:"Unproven", hint:"a pattern matched; nothing has demonstrated it",
+     states:["candidate"], open:false},
+  ];
+  const body = rows.length ? `<table><thead><tr>
+      <th>Sev</th><th>CWE</th><th>Finding</th><th>Sites</th><th>Where</th><th>State</th>
+      <th>Conf</th><th>Detector</th><th>PoC</th></tr></thead><tbody>
+    ${TIERS.map(t=>{
+      const mine=rows.filter(x=>t.states.includes(x.state));
+      if(!mine.length) return "";
+      // A hand toggle is an OVERRIDE, not one more thing OR-ed in: written as
+      // `t.open || ... || BOARD_OPEN[k]` the two open-by-default tiers could never be
+      // collapsed, because the first term short-circuits and the chevron does nothing.
+      // An explicit state/text filter means the user asked for exactly this tier, so it opens.
+      const dflt = t.open || !!f.state || !!f.q;
+      const open = (t.key in BOARD_OPEN) ? BOARD_OPEN[t.key] : dflt;
+      const head=`<tr class="tierhd" data-tier="${t.key}" onclick="toggleTier('${t.key}')">
+        <td colspan="9"><span class="tchev">${open?"▾":"▸"}</span>
+          <b>${esc(t.label)}</b> <span class="tcount">${mine.length}</span>
+          <span class="thint">${esc(t.hint)}</span></td></tr>`;
+      return head + (open ? mine.map(x=>_boardRow(x)).join("") : "");
+    }).join("")}
+    </tbody></table>` : `<div class="empty">No findings match. Run detection, fuzzing, or PoC stages on the Workbench.</div>`;
+  bd.innerHTML = tilesHtml + filters + `<div class="card" style="padding:6px 8px">${body}</div>`;
+  const q=document.getElementById('bq'); if(q && document.activeElement!==q){}
+}
+function _boardRow(x){
+  const conf=Math.round((x.confidence||0)*100);
+  const ev=(x.evidence||[]).length;
+  const lvl=x.poc_level?`<span class="lvl">${esc(x.poc_level)}</span>`:'';
+  // A finding is a DEFECT; `site_count` is how many places it occurs. The board used to
+  // print one row per site, so 12 identical "strncpy" rows with no location at all.
+  const n=x.site_count||0;
+  const where = x.function_addr ? (x.function_addr + (n>1?` +${n-1} more`:''))
+                                : (x.target_name||'-');
+  const sel=x.id===SEL_FINDING;
+  const row=`<tr class="frow${sel?' sel':''}" data-fid="${x.id}" onclick="toggleFindingDetail('${x.id}')">
+    <td><span class="sev ${x.severity}">${esc(x.severity)}</span></td>
+    <td class="mono">${esc(x.cwe||'-')}</td>
+    <td><div class="ttl">${esc(x.title||'')}</div><div class="ev">${ev} evidence</div></td>
+    <td class="mono">${n>1?`&times;${n}`:(n===1?'1':'-')}${
+      (x.proven_sites||0) ? `<div class="ev">${x.proven_sites} proven</div>` : ''}</td>
+    <td class="mono" style="font-size:11px">${esc(where)}</td>
+    <td><span class="st ${x.state==='poc-backed'?'pocbacked':x.state}">${esc(x.state)}</span></td>
+    <td><div class="cbar" title="${conf}%"><i style="width:${conf}%"></i></div></td>
+    <td class="mono" style="font-size:11px">${esc(x.detector||'-')}</td>
+    <td>${lvl}</td></tr>`;
+  return row + (sel?findingDetailRow(x):'');
+}
+// Which evidence tiers the reader has opened by hand. Demonstrated and Corroborated start
+// open; the unproven inventory starts closed, because on a real parser it IS the list and
+// putting it first buries the one finding that was actually shown to happen.
+let BOARD_OPEN={};
+function toggleTier(k){
+  const cur=document.querySelector(`tr.tierhd[data-tier="${k}"] .tchev`);
+  BOARD_OPEN[k] = !(cur && cur.textContent.trim()==="▾");
+  renderBoard();
+}
+
+function boardTile(key,val){
+  if(key==='clear'){ BOARD_FILTER.sev=''; BOARD_FILTER.state=''; }
+  else { BOARD_FILTER[key] = (BOARD_FILTER[key]===val)?'':val; }
+  renderBoard();
+}
+let SEL_FINDING=null;
+let SITES={};
+async function toggleFindingDetail(id){
+  SEL_FINDING = (SEL_FINDING===id)?null:id;
+  if(SEL_FINDING && !SITES[id]){
+    const f = await api(`/findings/${id}`);           // the detail endpoint carries the sites
+    if(f && f.sites) SITES[id] = f.sites;
+  }
+  renderBoard();
+  if(SEL_FINDING){ const r=document.querySelector(`tr[data-fid="${SEL_FINDING}"]`);
+    if(r) r.scrollIntoView({block:'nearest',behavior:'smooth'}); }
+}
+function findingDetailRow(x){
+  const conf=Math.round((x.confidence||0)*100);
+  const ev=(x.evidence||[]).map(e=>`<div class="evrow"><span class="evch">${esc(e.channel||'')}</span> ${esc(e.detail||'')}</div>`).join('')
+    || '<div class="hint">No evidence recorded.</div>';
+  const loc = (x.function_addr||x.site_addr)
+    ? `<span class="mono">${esc(x.function_addr||'')}${x.site_addr?(' @ '+esc(x.site_addr)):''}</span>` : '—';
+  return `<tr class="fdetail"><td colspan="8"><div class="fdbody">
+    <div class="fdhead"><b>${esc(x.cwe||'')}</b> — ${esc(x.title||'')}
+      <span class="fdmeta">${esc(x.severity)} · ${conf}% confidence · detector ${esc(x.detector||'-')} · ${esc(x.target_name||'')} <span class="arch">${esc(x.target_arch||'')}</span></span></div>
+    <div class="fdkv"><span>state</span><b><span class="st ${x.state==='poc-backed'?'pocbacked':x.state}">${esc(x.state)}</span></b></div>
+    <div class="fdkv"><span>location</span><b>${loc}</b></div>
+    ${(x.site_count||0) > 1 ? `<div class="fdkv"><span>sites</span><b>${x.site_count} places in this target${
+      (x.proven_sites||0) ? `, ${x.proven_sites} proven` : ''}${SITES[x.id]?'':' — open to list'}</b></div>` : ''}
+    ${SITES[x.id] ? `<div class="eyebrow" style="margin:9px 0 4px">Sites (${SITES[x.id].length})</div>
+      <div class="evlist">${SITES[x.id].map(sv=>`<div class="evrow">${
+        sv.state==='poc-backed'?'<span class="st poc-backed">PROVEN</span> ':''}${
+        sv.verdict?`<span class="lvl">${esc(sv.verdict)}</span> `:''}<span class="mono">${esc(sv.function_addr||'?')}</span>${sv.site_addr?` @ <span class="mono">${esc(sv.site_addr)}</span>`:''}${sv.detail?` — ${esc(sv.detail)}`:''}</div>`).join('')}</div>` : ''}
+    ${x.poc_level?`<div class="fdkv"><span>PoC</span><b><span class="lvl">${esc(x.poc_level)}</span> verified</b></div>`:''}
+    <div class="eyebrow" style="margin:9px 0 4px">Evidence (${(x.evidence||[]).length})</div>
+    <div class="evlist">${ev}</div>
+    <div style="margin-top:10px"><button class="btn sm" data-tid="${esc(x.target_id)}" data-faddr="${esc(x.function_addr||'')}" onclick="event.stopPropagation();openFindingInWorkbench(this.dataset.tid, this.dataset.faddr)">View in Workbench${x.function_addr?' → function':''}</button></div>
+  </div></td></tr>`;
+}
+async function openFindingInWorkbench(tid, faddr){
+  switchView('wb');
+  await showDetail(tid);                         // loads triage + functions (async)
+  const dc=document.getElementById('detailcard'); if(dc) dc.scrollIntoView({behavior:'smooth'});
+  if(!faddr) return;
+  const norm=a=>String(a||'').toLowerCase().replace(/^0x0*/,'0x');
+  for(let i=0;i<25 && !FUNCS.length;i++) await new Promise(r=>setTimeout(r,80));  // await decompile load
+  const fn=FUNCS.find(f=>norm(f.addr)===norm(faddr));
+  if(fn) showFunc(fn.id);                        // jump straight to the vulnerable function's code
+}
+
+// ---- report builder ----
+let REPORT_FILTER={min_severity:"",states:[]};
+function reportURL(fmt,embed){
+  const p=new URLSearchParams({format:fmt, embed: embed?"1":"0"});
+  if(REPORT_FILTER.min_severity) p.set("min_severity",REPORT_FILTER.min_severity);
+  if(REPORT_FILTER.states.length) p.set("states",REPORT_FILTER.states.join(","));
+  return `/cases/${CUR}/report?`+p.toString();
+}
+function renderReport(){
+  const rp=document.getElementById("report"); if(!rp||!CUR) return;
+  const sevs=['','critical','high','medium','low','info'];
+  const states=['candidate','corroborated','confirmed','poc-backed'];
+  rp.innerHTML=`
+   <div class="wbhead">
+     <div class="wbtitle">Report builder</div>
+     <div class="mono" style="color:var(--faint);font-size:11px">shareable · reproducible · air-gapped</div>
+   </div>
+   <div class="pipe">
+     <section class="stage">
+       <div class="stagehdr"><span class="snum">1</span><b>Scope</b><span class="schip mono" id="rcount"></span></div>
+       <div class="sbody">
+         <div class="filters">
+           <label class="fld">min severity
+             <select id="rsev" onchange="REPORT_FILTER.min_severity=this.value;refreshPreview()">
+               ${sevs.map(s=>`<option value="${s}" ${REPORT_FILTER.min_severity===s?'selected':''}>${s||'any'}</option>`).join('')}
+             </select></label>
+           <div class="statechks">${states.map(s=>`<label class="chk"><input type="checkbox" value="${s}"
+              ${REPORT_FILTER.states.includes(s)?'checked':''} onchange="toggleState('${s}',this.checked)">
+              <span class="st ${s==='poc-backed'?'pocbacked':s}">${s}</span></label>`).join('')}</div>
+         </div>
+         <div class="hint">No state selected includes every state; "any" severity includes all.</div>
+       </div>
+     </section>
+
+     <section class="stage">
+       <div class="stagehdr"><span class="snum">2</span><b>Live preview</b>
+         <span class="schip"><button class="btn sm" onclick="refreshPreview()">↻ Refresh</button></span></div>
+       <div class="sbody" style="padding:0">
+         <iframe id="rpreview" title="report preview" style="width:100%;height:520px;border:0;background:#fff;display:block"></iframe>
+       </div>
+     </section>
+
+     <section class="stage">
+       <div class="stagehdr"><span class="snum">3</span><b>Export &amp; share</b></div>
+       <div class="sbody">
+         <div class="fmtgrid">
+           <div class="fmt"><button class="btn primary" onclick="window.open(reportURL('html',true),'_blank')">Open HTML ↗</button>
+             <span>Self-contained &amp; interactive, embeds the PoC bundles — the primary shareable format.</span></div>
+           <div class="fmt"><a class="btn" id="dlpdf" download>PDF</a><span>Paginated, print-ready.</span></div>
+           <div class="fmt"><a class="btn" id="dlsarif" download>SARIF 2.1</a><span>Static-analysis interchange for other tools / CI.</span></div>
+           <div class="fmt"><a class="btn" id="dljson" download>Case JSON</a><span>Machine-readable case dump.</span></div>
+         </div>
+       </div>
+     </section>
+
+     <section class="stage">
+       <div class="stagehdr"><span class="snum">4</span><b>Case portability</b><span class="schip mono">sneakernet</span></div>
+       <div class="sbody">
+         <div class="actions">
+           <a class="btn" href="/cases/${CUR}/export" download>Export case (.tar.gz)</a>
+           <button class="btn" onclick="document.getElementById('impfile').click()">Import archive…</button>
+           <input type="file" id="impfile" accept=".gz,.tgz,.tar" style="display:none" onchange="doImportCase(this.files[0])">
+           <span class="mono" id="impstat" style="color:var(--faint);font-size:11px"></span>
+         </div>
+         <div class="hint">Move a whole engagement between air-gapped stores. Import is an idempotent merge.</div>
+       </div>
+     </section>
+   </div>`;
+  loadReportFindings();
+  refreshPreview();
+}
+
+let REPORT_FINDINGS=[];
+async function loadReportFindings(){
+  try{ REPORT_FINDINGS = await api(`/cases/${CUR}/findings`); }catch(e){ REPORT_FINDINGS=[]; }
+  updateReportCount();
+}
+function updateReportCount(){
+  const el=document.getElementById("rcount"); if(!el) return;
+  const f=REPORT_FILTER, minR=f.min_severity?_SEVRANK[f.min_severity]:-1;
+  const inc=REPORT_FINDINGS.filter(x=>
+    (minR<0||_SEVRANK[x.severity]>=minR) && (!f.states.length||f.states.includes(x.state))).length;
+  el.textContent=`${inc} of ${REPORT_FINDINGS.length} findings`;
+}
+function syncReportLinks(){
+  const set=(id,fmt)=>{const a=document.getElementById(id); if(a) a.href=reportURL(fmt,true);};
+  set('dlpdf','pdf'); set('dlsarif','sarif'); set('dljson','json');
+}
+function toggleState(s,on){
+  const i=REPORT_FILTER.states.indexOf(s);
+  if(on&&i<0) REPORT_FILTER.states.push(s); else if(!on&&i>=0) REPORT_FILTER.states.splice(i,1);
+  refreshPreview();
+}
+function refreshPreview(){
+  syncReportLinks(); updateReportCount();
+  const f=document.getElementById("rpreview"); if(f) f.src=reportURL('html',false);
+}
+async function doImportCase(file){
+  if(!file) return;
+  const st=document.getElementById("impstat"); if(st) st.textContent="importing…";
+  try{
+    const buf=await file.arrayBuffer();
+    const r=await fetch("/import",{method:"POST",headers:{"Content-Type":"application/octet-stream"},body:buf});
+    const j=await r.json();
+    if(st) st.textContent = j.cases?`imported ${j.cases.length} case(s)`:(j.error||"failed");
+    await loadCases();
+  }catch(e){ if(st) st.textContent="import failed: "+e; }
+}
+
+// ---- system map (component graph, doc 17.1) ----
+let SYSMAP={nodes:[],edges:[]};
+// Resolving links is the `link_case` STAGE, not a side effect of fetching the map.
+//
+// `GET /systemmap?resolve=1` calls resolve_case() -- the same function link_case_stage calls
+// -- but synchronously, inside the HTTP request. So the one stage of the twenty-nine that the
+// GUI could not launch was in fact reachable, and doing it that way cost everything the job
+// queue provides: no run row, no progress, no cancel, no cached result, and no event, so
+// nothing in the run list or the report ever recorded that linking had happened. On a case
+// with many components the request simply blocks.
+async function doResolveLinks(){
+  const b=document.getElementById("resolvebtn");
+  if(b){ b.disabled=true; b.textContent="resolving…"; }
+  const d=await postRun(null, "link_case", {});
+  if(!d){ if(b){ b.disabled=false; b.textContent="↻ Resolve links"; } return; }
+  // link.done already refreshes the map (see the event handler); this is the fallback for a
+  // run that finishes before the socket delivers it
+  setTimeout(()=>{ loadSystemMap(false);
+    if(b){ b.disabled=false; b.textContent="↻ Resolve links"; } }, 1200);
+}
+
+async function loadSystemMap(resolve){
+  const el=document.getElementById("sysmap"); if(!el||!CUR) return;
+  el.innerHTML=`<div class="empty">Resolving component links…</div>`;
+  try{ SYSMAP=await api(`/cases/${CUR}/systemmap${resolve?'?resolve=1':''}`); }
+  catch(e){ SYSMAP={nodes:[],edges:[]}; }
+  renderSystemMap();
+}
+function renderSystemMap(){
+  const el=document.getElementById("sysmap"); if(!el) return;
+  const nodes=SYSMAP.nodes||[], edges=SYSMAP.edges||[];
+  const name={}; nodes.forEach(n=>name[n.id]=n.filename);
+  const taintN=edges.filter(e=>e.kind==="taint").length;
+  const ipcN=edges.filter(e=>e.kind==="ipc").length;
+  const badges=[taintN?`<span style="color:var(--danger)">${taintN} cross-taint</span>`:'',
+                ipcN?`<span style="color:var(--info)">${ipcN} IPC</span>`:''].filter(Boolean).join(' · ');
+  const head=`<div class="cardhead" style="margin-bottom:8px">
+      <span class="eyebrow">Component graph — ${nodes.length} components · ${edges.length} links${badges?' · '+badges:''}</span>
+      <div class="smtools">
+        <button class="btn sm" id="resolvebtn" onclick="doResolveLinks()" title="Re-resolve import/export links across all components">↻ Resolve links</button>
+        <button class="btn sm" id="ipcbtn" onclick="doModelIpc()" title="Discover IPC channels (socket/pipe/shm/mq) and pair producers with consumers">Model IPC</button>
+        <button class="btn sm" id="xtaintbtn" onclick="doCrossTaint()" title="Propagate taint across resolved edges: source in A → sink in B">Cross-taint</button>
+        <button class="btn sm" id="detbtn" onclick="doWholeSystem()" title="Whole-system detonation: run the components together over their real IPC and blame a crash in one on the input that entered another">Detonate</button>
+      </div></div>
+    <div class="smlegend">
+      <span><i class="lg lgdyn"></i>dynamic link</span>
+      <span><i class="lg lgtaint"></i>⚡ cross-binary taint</span>
+      <span><i class="lg lgipc"></i>⇄ IPC channel</span>
+      <span class="mono" style="margin-left:auto;color:var(--faint)">click a node to open it in the Workbench</span>
+    </div>`;
+  if(!nodes.length){ el.innerHTML=`<div class="card">${head}
+    <div class="smexplain">
+      <b>The System Map is for multi-binary systems.</b> It resolves symbols exported by one
+      component against those imported by another, then lets you propagate taint and detonate
+      the components together over their real IPC.
+      <div style="margin-top:6px">Add components to this case to light it up: a program <i>and</i> its
+      shared libraries, a client and a server, or the parts a firmware image carves into.</div>
+    </div></div>`; return; }
+  // context banner: explain what the map does and (for single/unlinked cases) what unlocks more
+  const lowStr = nodes.length<=1
+    ? `<div class="smexplain"><b>One component in this case.</b> The System Map correlates
+        <i>multiple</i> binaries — it resolves one component's exports against another's imports,
+        propagates taint across those edges, and detonates them together. Add this program's
+        shared libraries (or a peer client/server) to the case and press <b>↻ Resolve links</b>.
+        For a single binary, do your analysis in the <a href="#" onclick="openComponent('${nodes[0].id}');return false">Workbench →</a></div>`
+    : (edges.length===0
+        ? `<div class="smexplain">${nodes.length} components, but <b>no links resolved yet</b> — press
+           <b>↻ Resolve links</b> to match exported↔imported symbols, then <b>Cross-taint</b> to
+           chase a source in one into a sink in another.</div>`
+        : `<div class="smexplain">Click a node to open it in the Workbench. <b>Cross-taint</b> chases a
+           tainted source in one component into a dangerous sink in another; <b>Detonate</b> runs them
+           together and blames a crash on the input that entered the system.</div>`);
+  // circular layout
+  const W=760,H=Math.max(300,Math.min(520,180+nodes.length*40)),cx=W/2,cy=H/2;
+  const R=nodes.length<=1?0:Math.min(H/2-60,80+nodes.length*10);
+  const pos={};
+  nodes.forEach((n,i)=>{ const a=-Math.PI/2+i*2*Math.PI/nodes.length;
+    pos[n.id]={x:cx+R*Math.cos(a),y:cy+R*Math.sin(a)}; });
+  const line=edges.map(e=>{const s=pos[e.src],d=pos[e.dst]; if(!s||!d)return"";
+    const taint=e.kind==="taint", isipc=e.kind==="ipc";
+    // taint/ipc edges bow to opposite sides so they don't hide the dynamic-link line
+    const off=taint?18:(isipc?-18:0);
+    const mx=(s.x+d.x)/2+off,my=(s.y+d.y)/2; const cnt=(e.symbols||[]).length;
+    let lbl="", cls="smedge", mk="url(#arrow)";
+    if(taint){ lbl=`<text x="${mx}" y="${my-3}" class="smtaintlbl">⚡ ${esc(e.symbol||'taint')}</text>`;
+      cls="smedge smtaint"; mk="url(#arrowT)"; }
+    else if(isipc){ lbl=`<text x="${mx}" y="${my-3}" class="smipclbl">⇄ ${esc(e.symbol||'ipc')}</text>`;
+      cls="smedge smipc"; mk="url(#arrowI)"; }
+    else if(cnt){ lbl=`<text x="${mx}" y="${my-3}" class="smcount">${cnt} sym${cnt>1?'s':''}</text>`; }
+    return `<line x1="${s.x}" y1="${s.y}" x2="${d.x}" y2="${d.y}" class="${cls}" marker-end="${mk}"/>${lbl}`;
+  }).join("");
+  const box=nodes.map(n=>{const p=pos[n.id];const w=150,h=46;
+    return `<g class="smnode" onclick="openComponent('${n.id}')">
+      <rect x="${p.x-w/2}" y="${p.y-h/2}" width="${w}" height="${h}" rx="8"/>
+      <text x="${p.x}" y="${p.y-4}" class="smname">${esc((n.filename||'').slice(0,20))}</text>
+      <text x="${p.x}" y="${p.y+12}" class="smmeta">${esc(n.arch||'?')} · ${n.findings||0} findings</text></g>`;
+  }).join("");
+  const svg=`<svg viewBox="0 0 ${W} ${H}" class="smsvg" preserveAspectRatio="xMidYMid meet">
+    <defs>
+      <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="smarrow"/></marker>
+      <marker id="arrowT" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="smarrowT"/></marker>
+      <marker id="arrowI" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="smarrowI"/></marker>
+    </defs>${line}${box}</svg>`;
+  const kindCell=e=> e.kind==="taint"
+      ? `<span class="sev high" style="font-size:9px">cross-taint</span>`
+      : e.kind==="ipc" ? `<span class="st corroborated" style="font-size:9px">ipc</span>`
+      : `<span class="mono" style="font-size:11px">${esc(e.kind)}</span>`;
+  const symCell=e=> e.kind==="taint"
+      ? esc(e.symbol||'')+`<span class="mono" style="color:var(--danger)"> ⚡ source→sink</span>`
+      : e.kind==="ipc"
+      ? `<span class="mono">${esc(e.detail||e.symbol||'')}</span><span class="mono" style="color:var(--info)"> ⇄ channel</span>`
+      : esc((e.symbols||[]).slice(0,6).join(', '))||'—';
+  const rank=e=> e.kind==="taint"?0 : e.kind==="ipc"?1 : 2;
+  const ord=[...edges].sort((a,b)=>rank(a)-rank(b));
+  const rows = edges.length ? `<table><thead><tr><th>Importer</th><th></th><th>Exporter</th>
+      <th>Kind</th><th>Symbols</th></tr></thead><tbody>
+    ${ord.map(e=>`<tr><td class="mono">${esc(name[e.src]||e.src.slice(0,8))}</td>
+      <td style="color:var(--accent)">→</td>
+      <td class="mono">${esc(name[e.dst]||e.dst.slice(0,8))}</td>
+      <td>${kindCell(e)}</td>
+      <td class="mono" style="font-size:11px;color:var(--dim)">${symCell(e)}</td></tr>`).join('')}
+    </tbody></table>` : `<div class="empty" style="padding:20px">No cross-binary links resolved. Components share no imported/exported symbols in this case.</div>`;
+  el.innerHTML=`<div class="card">${head}${lowStr}<div class="smwrap">${svg}</div></div>
+    <div class="card"><div class="cardhead"><span class="eyebrow">Resolved edges</span></div>${rows}</div>`;
+}
+function openComponent(tid){ switchView('wb'); showDetail(tid);
+  const dc=document.getElementById('detailcard'); if(dc) dc.scrollIntoView({behavior:'smooth'}); }
+async function doCrossTaint(){
+  const b=document.getElementById("xtaintbtn"); if(b){ b.disabled=true; b.textContent="analyzing…"; }
+  try{
+    await fetch("/runs",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({case_id:CUR,stage:"cross_taint"})});
+  }catch(e){}
+}
+async function doModelIpc(){
+  const b=document.getElementById("ipcbtn"); if(b){ b.disabled=true; b.textContent="modelling…"; }
+  try{
+    await fetch("/runs",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({case_id:CUR,stage:"ipc_model"})});
+  }catch(e){}
+}
+async function doWholeSystem(){
+  const b=document.getElementById("detbtn"); if(b){ b.disabled=true; b.textContent="detonating…"; }
+  try{
+    await fetch("/runs",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({case_id:CUR,stage:"whole_system",params:{fuzz:true,max_execs:80,max_seconds:25}})});
+  }catch(e){}
+}
+
+let PENDING=null;
+function onUpload(e){
+  PENDING = e.target.files[0]||null;
+  document.getElementById("fname").textContent = PENDING?PENDING.name:"";
+  const a=document.getElementById("analyze"); a.disabled=!PENDING; a.onclick=doUpload;
+}
+async function doUpload(){
+  if(!PENDING) return;
+  const fd=new FormData(); fd.append("file", PENDING);
+  const name=PENDING.name;
+  logline("ui", "uploading "+name);
+  // The response was never checked: a refused or failed upload cleared the filename,
+  // re-enabled the button and refreshed exactly like a successful one, so the only sign
+  // anything went wrong was a target that never appeared.
+  let r;
+  try{ r=await fetch(`/cases/${CUR}/targets`,{method:"POST",body:fd}); }
+  catch(e){ logline("ui", `upload of ${name} failed: ${e}`); return; }
+  if(!r.ok){
+    let why=`HTTP ${r.status}`;
+    try{ const d=await r.json(); if(d && d.error) why=d.error; }catch(e){}
+    logline("ui", `upload of ${name} refused — ${why}`);
+    const fn=document.getElementById("fname");
+    if(fn){ fn.textContent=why; fn.style.color="var(--bad,#d33)"; }
+    return;                       // keep the selection so the user can see what they picked
+  }
+  PENDING=null;
+  const fn=document.getElementById("fname");
+  if(fn){ fn.textContent=""; fn.style.color=""; }
+  document.getElementById("analyze").disabled=true;
+  await refresh();
+}
+
+async function refresh(){
+  if(!CUR) return;
+  const [targets, runs] = await Promise.all([api(`/cases/${CUR}/targets`), api(`/cases/${CUR}/runs`)]);
+  RUNS = runs;
+  TARGET_NAME={}; for(const t of targets) TARGET_NAME[t.id]=t.filename;
+  renderTargets(targets); renderRuns(runs);
+  document.getElementById("casesub").textContent = `${targets.length} targets · ${runs.length} runs`;
+  document.getElementById("tcount").textContent = targets.length;
+  if(BOARD_VIEW==="board") loadBoard();
+}
+
+function renderTargets(ts){
+  const el=document.getElementById("targets");
+  if(!ts.length){ el.innerHTML=`<div class="empty">No targets. Choose a binary and Analyze.</div>`; return; }
+  el.innerHTML = `<table><thead><tr><th>File</th><th>Arch</th><th>Bits</th><th>Mitigations</th><th>Stripped</th><th></th></tr></thead><tbody>${
+    ts.map(t=>`<tr data-id="${t.id}"><td class="mono">${esc(t.filename)}</td>
+      <td>${t.arch?`<span class="arch">${t.arch}</span>`:"—"}</td>
+      <td class="mono">${t.bits||"—"}${t.endianness?(" "+t.endianness[0].toUpperCase()+"E"):""}</td>
+      <td>${mits(t.mitigations)}</td>
+      <td class="mono">${t.stripped===true?"yes":t.stripped===false?"no":"—"}</td>
+      <td style="text-align:right"><button class="btn sm rm" data-fn="${esc(t.filename)}" title="Remove this target from the case (deletes its findings, runs, PoCs and System Map links)" onclick="removeTarget('${t.id}', this, event)">Remove</button></td></tr>`).join("")}</tbody></table>`;
+  el.querySelectorAll("tr[data-id]").forEach(tr=> tr.onclick=(e)=>{ if(!e.target.closest(".rm")) showDetail(tr.dataset.id); });
+}
+
+async function removeTarget(id, btn, ev){
+  if(ev) ev.stopPropagation();
+  const name=(btn && btn.dataset && btn.dataset.fn) || id;   // read from data-fn, not interpolated into the handler
+  if(!confirm(`Remove "${name}" from this case?\n\nThis permanently deletes its triage, findings, runs, PoCs, and any System Map links. This cannot be undone.`)) return;
+  const res = await api(`/targets/${id}`, {method:"DELETE"});
+  if(res && res.error){ alert("Remove failed: "+res.error); return; }
+  if(DETAIL_TID===id){ DETAIL_TID=null; const c=document.getElementById("detailcard"); if(c) c.hidden=true; }
+  await refresh();
+  if(typeof SYSMAP!=="undefined" && SYSMAP) loadSystemMap(false);  // keep the System Map consistent
+}
+function mits(m){
+  if(!m) return `<span class="mit unknown">?</span>`;
+  return ["nx","pie","relro","canary","fortify"].map(k=>{
+    const v=m[k]||"unknown"; return `<span class="mit ${v}">${k}</span>`;
+  }).join("");
+}
+// filename by target id, so a run row can say WHICH binary it ran against
+let TARGET_NAME={};
+let RUNS_ALL=false;
+function toggleAllRuns(){ RUNS_ALL=!RUNS_ALL; renderRuns(RUNS); }
+
+// One walkthrough left 28 runs across 24 stages in a flat list truncated to 14, with no
+// target name on any row. With four binaries in the case you could not tell which run
+// belonged to which, and the fourteen oldest -- including the one that ERRORED -- were simply
+// not rendered, with nothing on screen saying so.
+function renderRuns(rs){
+  const el=document.getElementById("runs");
+  if(!rs.length){ el.innerHTML=`<div class="empty">No runs yet.</div>`; return; }
+  const live=r=>r.status==="running"||r.status==="queued";
+  const bad=r=>r.status==="error";
+  // Group FIRST, then cap within each group. Capping the flat list first lets one busy target
+  // crowd another out entirely -- with four binaries and ten slots, the last two show no runs
+  // at all, which is the "which run belongs to which binary" problem in a new shape.
+  const groups=new Map();
+  for(const r of rs){
+    const k=r.target_id||"__case__";
+    if(!groups.has(k)) groups.set(k,[]);
+    groups.get(k).push(r);
+  }
+  const PER=5;
+  let hidden=0;
+  const sec=[...groups.entries()].map(([k,all])=>{
+    // Never hide a failure or something still moving, whatever the cap: a truncation that can
+    // swallow the only error is worse than a long list.
+    const list = RUNS_ALL ? all : all.filter((r,i)=>i<PER||live(r)||bad(r));
+    hidden += all.length-list.length;
+    const nm = k==="__case__" ? "case-level" : (TARGET_NAME[k]||k.slice(0,8));
+    const nerr=all.filter(bad).length, nlive=all.filter(live).length;
+    const chips=(nerr?`<span class="pill error">${nerr} error${nerr!==1?"s":""}</span>`:"")
+              +(nlive?`<span class="pill running">${nlive} active</span>`:"");
+    return `<div class="rungrp"><div class="rungrphd"><span class="mono">${esc(nm)}</span>
+      <span class="runmeta"><span class="dim">${all.length} run${all.length!==1?"s":""}</span>${chips}</span></div>`
+      + list.map(_runRowHtml).join("") + `</div>`;
+  }).join("");
+  el.innerHTML = sec + (hidden>0||RUNS_ALL
+    ? `<div class="runmore" onclick="toggleAllRuns()">${RUNS_ALL
+        ? "show fewer" : `show ${hidden} older run${hidden!==1?"s":""}`}</div>`
+    : "");
+}
+
+function _runRowHtml(r){
+    const t=r.ended_at||r.started_at||r.created_at;
+    const dur=(r.started_at&&r.ended_at)?` · ${Math.max(0,r.ended_at-r.started_at)}s`:"";
+    const when=t?`<span class="mono runtime" title="${new Date(t*1000).toLocaleString()}">${fmtAgo(t)}${dur}</span>`:"";
+    const running=(r.status==="running"||r.status==="queued");
+    let bar="";
+    if(running){
+      const pr=PROG[r.id]||{}; const live=FUZZ_LIVE[r.id];
+      let pct=pr.pct, msg=pr.msg||(r.status==="queued"?"queued":"working");
+      if(live && live.max){ pct=Math.min(99,Math.round(100*live.execs/live.max));
+        msg=`${live.execs}/${live.max} execs · ${live.crashes} crash${live.crashes===1?'':'es'}`; }
+      const ind=(pct==null)?" ind":"";
+      bar=`<div class="pbwrap"><div class="pbar${ind}" id="pbar-${r.id}"><i style="width:${pct==null?0:pct}%"></i></div>
+        <div class="pbmeta" id="pbmeta-${r.id}"><span>${esc(msg)}</span><span>${pct==null?"":pct+"%"}</span></div></div>`;
+    }
+    // A running stage had no stop control anywhere in the UI, so a ten-minute campaign
+    // started by mistake had to be waited out or the server killed. The job engine has
+    // supported cancellation all along.
+    const stop = running
+      ? `<button class="btn sm" title="Stop this run" onclick="cancelRun('${r.id}')">Stop</button>`
+      : "";
+    // A failed run said "error" and nothing else; the reason was in the API response and
+    // nowhere on screen, so the only way to see it was to re-run and watch.
+    const err = (r.status==="error" && r.error)
+      ? `<div class="runerr mono">${esc(String(r.error).slice(0,300))}</div>` : "";
+    return `<div class="runrowbox"><div class="kv runrow"><span class="mono">${r.stage} <span style="color:var(--faint)">${r.id.slice(0,8)}</span></span>
+     <span class="runmeta">${when}<span class="pill ${r.status}">${r.status}</span>${stop}</span></div>${bar}${err}</div>`;
+}
+async function cancelRun(id){
+  logline("ui", "stopping run "+id.slice(0,8));
+  let r;
+  try{ r=await fetch(`/runs/${id}/cancel`,{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"}); }
+  catch(e){ logline("ui", `stop failed: ${e}`); return; }
+  let d={}; try{ d=await r.json(); }catch(e){}
+  if(!r.ok){ logline("ui", `stop failed — ${d.error||("HTTP "+r.status)}`); return; }
+  // a stage checks for cancellation between units of work, so it stops shortly rather than
+  // instantly -- say so instead of leaving the row looking stuck
+  logline("ui", d.cancelled ? `run ${id.slice(0,8)} cancelling…` : (d.note||`run already ${d.status}`));
+  await refresh();
+}
+
+// live-update a single run's progress bar without a full re-render
+function updateRunBar(run_id){
+  const bar=document.getElementById("pbar-"+run_id), meta=document.getElementById("pbmeta-"+run_id);
+  if(!bar) return false;
+  const pr=PROG[run_id]||{}, live=FUZZ_LIVE[run_id];
+  let pct=pr.pct, msg=pr.msg||"working";
+  if(live && live.max){ pct=Math.min(99,Math.round(100*live.execs/live.max));
+    msg=`${live.execs}/${live.max} execs · ${live.crashes} crash${live.crashes===1?'':'es'}`;
+    bar.classList.toggle("hit", live.crashes>0); }
+  bar.classList.toggle("ind", pct==null);
+  bar.firstElementChild.style.width=(pct==null?0:pct)+"%";
+  if(meta) meta.innerHTML=`<span>${esc(msg)}</span><span>${pct==null?"":pct+"%"}</span>`;
+  return true;
+}
+
+async function showDetail(targetId){
+  const run = RUNS.find(r=>r.target_id===targetId && r.stage==="ingest_triage" && r.status==="done");
+  const card=document.getElementById("detailcard"), det=document.getElementById("detail");
+  card.hidden=false;
+  if(!run){ det.innerHTML=`<div class="empty">No completed triage for this target yet.</div>`; return; }
+  const full = await api(`/runs/${run.id}`);
+  const out = (full.outputs||[]).find(o=>o.kind==="triage-json");
+  if(!out){ det.innerHTML=`<div class="empty">No triage artifact.</div>`; return; }
+  let rec = await api(`/artifacts/${out.sha256}`);
+  // /artifacts is served as octet-stream, so api() hands back a raw string -- parse it
+  if(typeof rec==="string"){ try{ rec=JSON.parse(rec); }catch(e){ rec={}; } }
+  TRIAGE=rec;                                    // stash for the fuzzing guidance
+  const flag = (rec.analyzable===false && rec.advisory) ? `
+    <div style="margin:0 0 10px;padding:8px 10px;border-radius:8px;border:1px solid var(--warn);
+      background:color-mix(in srgb, var(--warn) 12%, transparent);color:var(--text);font-size:12px">
+      <b style="color:var(--warn)">⚠ Not analyzable</b> — ${esc(rec.advisory)}</div>` : "";
+  det.innerHTML = flag + `
+    <div class="wbhead">
+      <div class="wbtitle mono">${esc(rec.detected||"—")}</div>
+      <div class="wbmits">${mits(rec.mitigations)}</div>
+    </div>
+    <div class="pipe">
+      <section class="stage">
+        <div class="stagehdr"><b>Triage</b><span class="schip done">done</span><span class="schip mono" id="substrate"></span></div>
+        <div class="sbody">
+          <div class="kvgrid">
+            <div class="kv"><span>entry</span><b>${rec.entry_point||"—"}</b></div>
+            <div class="kv"><span>linking</span><b>${rec.linking||"—"}${rec.stripped?" · stripped":""}</b></div>
+            <div class="kv"><span>toolchain</span><b>${rec.toolchain_hint||"—"}</b></div>
+            <div class="kv"><span>entropy</span><b>${rec.entropy?.overall??"—"}${rec.entropy?.packed_hint?" · packed?":""}</b></div>
+            <div class="kv"><span>imports</span><b>${(rec.imports?.libraries||[]).map(esc).join(", ")||"—"} (${rec.imports?.functions_count||0})</b></div>
+          </div>
+          <details class="disc"><summary>Sections (${(rec.sections||[]).length})</summary>
+            <div class="sec" style="max-height:150px;overflow:auto;margin-top:4px">${
+              (rec.sections||[]).slice(0,40).map(s=>`${esc((s.name||"").padEnd(18))} ${String(s.size).padStart(8)}  ${esc(s.perms||"")}  H=${s.entropy??"-"}`).join("<br>")}</div></details>
+          ${rec.parse_errors?.length?`<div class="notewarn mono">parse notes: ${rec.parse_errors.map(esc).join("; ")}</div>`:""}
+        </div>
+      </section>
+
+      <!-- (1) FEED -- how the target is invoked and what it is given. This decides whether
+           anything below can work at all, and it used to be the second of twenty-two controls
+           in a single panel: a service needing "-c @@" that is fuzzed bare prints its usage on
+           every execution and reports a clean campaign against a program never entered. -->
+      <section class="stage">
+        <div class="stagehdr"><span class="snum">1</span><b>Feed</b><span class="schip mono" id="feedstat"></span></div>
+        <div class="sbody">
+          <div id="fuzzguide" class="guide" hidden></div>
+          <div class="fgroup">
+            <div class="fglabel">Invocation <span class="fghint">how the target takes input</span></div>
+            <div class="actions">
+              <select id="dynmode" class="sel" title="Where the target reads its input" onchange="recommendFuzz()">
+                <option value="stdin">stdin</option><option value="arg">argv</option>
+                <option value="file">file (parser)</option><option value="none">no input</option>
+              </select>
+              <input id="dynargv" class="inp" placeholder="argv, e.g. -c @@" style="max-width:190px" title="How the target must be invoked. Space-separated. Use @@ where the input belongs -- a service that needs a config path is &quot;-c @@&quot;. Without this a target that requires a flag prints its usage and exits on every execution, which looks exactly like a campaign that found nothing.">
+              <label class="btn sm seedlbl" title="Attach valid sample files as fuzzing seeds -- essential for file-format parsers (PDF/image/doc): the mutator starts from real structure">+ seeds<input type="file" id="seedfiles" multiple style="display:none" onchange="onSeedFiles(this.files)"></label>
+              <span class="mono" id="seedcount" style="color:var(--faint);font-size:10.5px"></span>
+              <span class="vsep"></span>
+              <input id="dyninput" class="inp" placeholder="one concrete input (optional)" style="max-width:170px">
+              <button class="btn sm" id="dynrun" title="Detonate the target once on this exact input (or none) -- a quick smoke test before a campaign">Run once &#9654;</button>
+            </div>
+          </div>
+          <div class="fgroup">
+            <div class="fglabel">Structure model <span class="fghint">keeps a parser's input valid enough to reach its own logic</span></div>
+            <div class="actions">
+              <select id="fuzzformat" class="sel" title="Keeps the format valid and coordinates length fields with their data -- finds format-parser overflows byte mutation misses" onchange="onFmtChange();recommendFuzz()">
+                <option value="">byte-level (no model)</option>
+                <option value="png">PNG (structure)</option>
+                <option value="lv32">length-prefixed (structure)</option>
+                <option value="custom">custom (built from a sample)</option>
+              </select>
+              <input id="fuzzmagic" class="inp" placeholder="magic e.g. %PDF" style="max-width:120px;display:none">
+              <button class="btn sm" id="specbuild" onclick="openSpecBuilder()" title="Build a format spec visually -- auto-detect it from a real sample and see how it carves">&#9881; Build from sample&#8230;</button>
+              <span class="fghint" id="customchip"></span>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- (2) FIND -- discover a defect, by execution or statically. Both belong together:
+           the platform's order is evidence first, and a static finding is supporting evidence
+           for something run, not a separate activity. -->
+      <section class="stage">
+        <div class="stagehdr"><span class="snum">2</span><b>Find</b><span class="schip mono" id="fuzzstat"></span></div>
+        <div class="sbody">
+          <div class="fgroup">
+            <div class="fglabel">Campaign</div>
+            <div class="actions">
+              <select id="fuzzstrategy" class="sel" title="Fuzzing strategy" onchange="recommendFuzz()">
+                <option value="fuzz">Black-box (no tools needed)</option>
+                <option value="directed">Directed (aim at static findings)</option>
+                <option value="coverage">Coverage-guided (AFL++)</option>
+                <option value="concolic">Concolic (angr)</option>
+                <option value="boundary">Boundary (IPC)</option>
+              </select>
+              <button class="btn sm primary" id="fuzzrun">Fuzz &#9654;</button>
+              <span class="vsep"></span>
+              <button class="btn sm" id="synthrun" title="Deterministic: synthesize the overflow input from the recovered stack frame (buffer size + offset) and detonate once -- no fuzzing. Needs Decompile first.">Synthesize PoC</button>
+              <button class="btn sm" id="injectrun" title="Deterministic: probe command-injection / format-string / path-traversal on the sinks the binary imports, and confirm by effect -- no fuzzing.">Injection PoC</button>
+              <button class="btn sm" id="secretpocrun" title="Package a hard-coded secret (CWE-798/321) into a verified PoC: locate the credential's byte offset in the binary, re-extract it offline to verify, and bundle a self-contained reproducer -- no execution. Needs Decompile first (for strings).">Secret PoC</button>
+              <span class="fghint" id="strathint"></span>
+            </div>
+            <div id="fuzzmetrics" class="fmetrics" hidden></div>
+          </div>
+
+          <div class="fgroup">
+            <div class="fglabel">Static channels <span class="fghint">supporting evidence; ranks below anything demonstrated</span></div>
+            <div class="actions">
+              <button class="btn sm" id="deco">Decompile (Ghidra)</button>
+              <span class="schip mono" id="decostat"></span>
+              <button class="btn sm" id="detect">Detect CWEs</button>
+              <span class="schip mono" id="detectstat"></span>
+              <button class="btn sm" id="cverun" title="Fingerprint embedded library versions (OpenSSL/zlib/libpng/busybox/&#8230;) and match a vendored offline CVE database -- no execution.">CVE scan</button>
+              <span class="schip mono" id="cvestat"></span>
+              <details class="menu"><summary class="btn sm">Firmware &#9662;</summary>
+                <div class="menubody">
+                  <button class="btn sm" id="carve" title="Carve embedded components (ELFs, filesystems, keys); identify a bare-metal blob's arch/base/entry">Carve components</button>
+                  <button class="btn sm" id="rehost" title="Rehost a bare-metal ARM Cortex-M image under Unicorn (Fuzzware-style MMIO) and fuzz peripheral inputs">Rehost &amp; fuzz</button>
+                </div></details>
+            </div>
+          </div>
+
+          <div class="fgroup">
+            <div class="fglabel">Observe a live run</div>
+            <div class="actions">
+              <button class="btn sm" id="monitorrun" title="Breakpoint the dangerous sinks and capture what the program passes them at runtime (command strings, copy lengths) -- finds executed commands and overflows without a crash.">Runtime monitor</button>
+              <input id="monargv" class="inp" placeholder="monitor argv (optional)" style="max-width:130px" title="Arguments passed to the target for the runtime monitor, space-separated (e.g. a PIN that reaches system())">
+              <input id="monsinks" class="inp" placeholder="sink addrs: name=0xADDR,&#8230; (optional)" style="max-width:180px" title="Analyst escape hatch: breakpoint sinks by address when the binary is stripped/statically-linked and has no symbols.">
+              <button class="btn sm" id="heaprun" title="Run under a guard-page heap allocator (LD_PRELOAD) that catches use-after-free, double-free, heap overflow and invalid free at the exact access. Native-arch, dynamically-linked targets.">Heap check</button>
+              <button class="btn sm" id="secretrun" title="Breakpoint the comparison functions and dump both operands -- recovers the constants the program checks input against. Native-arch only.">Extract secrets</button>
+              <button class="btn sm" id="taintrun" title="Confirm at runtime that program INPUT reaches a dangerous sink: feed a unique marker and report a Confirmed flow wherever it turns up in a sink argument.">Dynamic taint</button>
+              <button class="btn sm" id="behaviorrun" title="Trace the security-relevant syscalls the binary makes (exec, network, file writes, anti-debug, W^X) -- a behavioral capability inventory.">Behaviour trace</button>
+              <select id="behavbackend" class="sel" title="Trace backend. auto: GDB for native, qemu -strace for cross-arch.">
+                <option value="auto">trace: auto</option>
+                <option value="gdb">gdb (native; ip:port)</option>
+                <option value="qemu">qemu (follows exec)</option>
+              </select>
+              <button class="btn sm" id="consolerun" title="Interactive detonation: run the target in the sandbox and drive it live (send/receive) to reach menus/protocols; save what you send as a seed.">Console &#9656;</button>
+            </div>
+          </div>
+
+          <div id="funcs"></div>
+          <div id="codeviewer" class="cv" hidden></div>
+          <details class="disc"><summary>Strings</summary><div id="strings"></div></details>
+          <div id="findings"></div>
+        </div>
+      </section>
+
+      <!-- (3) PROVE -- the crash rows live here, not under Find, because this is where you
+           act on one: root-cause it, package it, ask whether it controls the instruction
+           pointer. The ladder's ceiling for this substrate is stated rather than implied. -->
+      <section class="stage">
+        <div class="stagehdr"><span class="snum">3</span><b>Prove</b><span class="schip mono" id="pocstat"></span></div>
+        <div class="sbody">
+          <div class="hint" id="laddernote">Run something under Find first &#8212; every action here starts from a crash.</div>
+          <div id="dynresults"></div>
+          <div id="pocs"></div>
+        </div>
+      </section>
+    </div>`;
+  DETAIL_TID = targetId; SEEDS=[];
+  document.getElementById("deco").onclick = ()=>doDecompile(targetId);
+  document.getElementById("detect").onclick = ()=>doDetect(targetId);
+  document.getElementById("cverun").onclick = ()=>doCveScan(targetId);
+  document.getElementById("carve").onclick = ()=>doFirmware(targetId);
+  document.getElementById("rehost").onclick = ()=>doRehost(targetId);
+  document.getElementById("dynrun").onclick = ()=>doDynamic(targetId);
+  document.getElementById("fuzzrun").onclick = ()=>runFuzz(targetId);
+  document.getElementById("synthrun").onclick = ()=>doSynthesize(targetId);
+  document.getElementById("injectrun").onclick = ()=>doInject(targetId);
+  document.getElementById("monitorrun").onclick = ()=>doMonitor(targetId);
+  document.getElementById("heaprun").onclick = ()=>doHeapCheck(targetId);
+  document.getElementById("secretrun").onclick = ()=>doExtract(targetId);
+  document.getElementById("behaviorrun").onclick = ()=>doBehavior(targetId);
+  document.getElementById("taintrun").onclick = ()=>doTaint(targetId);
+  document.getElementById("secretpocrun").onclick = ()=>doSecretPoc(targetId);
+  document.getElementById("consolerun").onclick = ()=>openConsole(targetId);
+  const fm=document.getElementById("fuzzmetrics"); if(fm){ fm.hidden=true; fm.innerHTML=""; }
+  const sc=document.getElementById("seedcount"); if(sc) sc.textContent="";
+  CUSTOM_SPEC=null; BUILDER=[]; updateCustomChip();   // a built spec is per-target
+  onFmtChangeSilent();
+  applyCapabilities(targetId);                   // what CAN run here, before anything is clicked
+  recommendFuzz();                               // TRIAGE is set; findings/funcs refine it as they load
+  loadFunctions(targetId);
+  loadStrings(targetId);
+  loadFindings(targetId);
+  loadDyn(targetId);
+  loadPocs(targetId);
+}
+
+function runFuzz(tid){
+  const s=(document.getElementById("fuzzstrategy")||{}).value||"fuzz";
+  ({fuzz:doFuzz,coverage:doCoverage,directed:doDirected,concolic:doConcolic,boundary:doBoundary}[s]||doFuzz)(tid);
+}
+let SEEDS=[];                                    // base64 sample files seeding the next campaign
+async function onSeedFiles(files){
+  SEEDS=[];
+  for(const f of files){
+    const buf=new Uint8Array(await f.arrayBuffer());
+    let s=""; for(let i=0;i<buf.length;i++) s+=String.fromCharCode(buf[i]);
+    SEEDS.push(btoa(s));
+  }
+  const el=document.getElementById("seedcount");
+  if(el) el.textContent = SEEDS.length?`${SEEDS.length} seed${SEEDS.length!==1?'s':''} attached`:"";
+  recommendFuzz();
+}
+
+// ---- fuzzing guidance: read triage + findings + what's attached, recommend the right run ----
+const _STRAT_HINT={
+  fuzz:"random mutation — always available, no external tools",
+  directed:"aims the campaign at the addresses of static findings",
+  coverage:"AFL++ coverage feedback — needs afl-fuzz installed",
+  concolic:"angr solves branch conditions — needs angr installed, slow",
+  boundary:"fuzz a consumer through its IPC endpoint (multi-binary cases)",
+};
+function _importsText(){
+  const im=(TRIAGE&&TRIAGE.imports)||{};
+  return ((im.symbols||[]).join(" ")+" "+(im.libraries||[]).join(" ")).toLowerCase();
+}
+async function recommendFuzz(){
+  // The recommendation is computed SERVER-SIDE (/targets/<id>/advice) so the API and CLI get
+  // the same answer. It used to live here, which is why a scripted run could pick black-box
+  // fuzzing on a parser and burn 98,500 execs for nothing while this panel said otherwise.
+  const g=document.getElementById("fuzzguide"); if(!g) return;
+  const sh=document.getElementById("strathint");
+  const strat=(document.getElementById("fuzzstrategy")||{}).value||"fuzz";
+  if(sh) sh.textContent=_STRAT_HINT[strat]||"";
+  if(!TRIAGE || !DETAIL_TID){ g.hidden=true; return; }
+  let a=null;
+  try{ a = await api(`/targets/${DETAIL_TID}/advice`); }catch(e){ }
+  if(!a){ g.hidden=true; return; }
+  ADVICE=a;
+  const checks=(a.checks||[]).map(c=>
+    `<li><span class="ck ${c.ok?'ok':'no'}">${c.ok?'✓':'!'}</span><span>${esc(c.text)}</span></li>`).join("");
+  const plan=(a.plan||[]).map((st,i)=>{
+    const cls = st.done?'ok':(st.ready?'':'no');
+    const mark = st.done?'✓':(st.ready?(i+1):'·');
+    return `<li><span class="ck ${cls}">${mark}</span><span><b>${esc(st.stage)}</b> — ${esc(st.why)}</span></li>`;
+  }).join("");
+  g.innerHTML=`<div class="ghd">◈ Recommended setup</div>
+    <div class="grec">${esc(a.headline)}</div>
+    <ul class="gcheck">${checks}</ul>
+    <div class="ghd" style="margin-top:8px">◈ Plan — evidence first</div>
+    <ul class="gcheck">${plan}</ul>
+    ${invocationBlock(a.invocation)}
+    <button class="btn sm gapply" onclick="applyFuzzRecommendation('${esc(a.input_mode)}','${esc(_stratOpt(a.backend))}',${!!a.file_parser})">Apply this setup</button>`;
+  g.hidden=false;
+}
+let ADVICE=null;
+let CAPS=null;
+
+// stage name -> the control that launches it. The buttons stay static HTML with their
+// handlers; what is data-driven is whether each one can work on THIS target.
+const _STAGE_BTN = {
+  disassemble:"deco", detect_cwe:"detect", cve_scan:"cverun", dynamic_run:"dynrun",
+  synthesize_poc:"synthrun", synthesize_injection:"injectrun", synthesize_secret:"secretpocrun",
+  debug_monitor:"monitorrun", heap_check:"heaprun", extract_secrets:"secretrun",
+  dynamic_taint:"taintrun", behavior_trace:"behaviorrun", firmware_carve:"carve",
+  firmware_rehost:"rehost",
+};
+// the fuzzing strategies are <option>s on one control, not buttons of their own
+const _STAGE_OPT = {fuzz:"fuzz", directed_fuzz:"directed", coverage_fuzz:"coverage",
+                    concolic:"concolic", boundary_fuzz:"boundary"};
+
+// Disable what cannot run here, and say WHY on the control itself.
+//
+// The GUI used to be substrate-blind while the engine was substrate-aware: file_type appeared
+// nowhere in this file, so an ELF, a PE, a jar and a firmware image all rendered the same
+// twenty-two controls. Clicking the wrong one cost a Ghidra run that ended in
+// FileNotFoundError, or an AFL++ campaign that completed having executed nothing. The reasons
+// are the STAGES' OWN gates, served by /capabilities -- not a second copy of the rules here,
+// which would drift.
+async function applyCapabilities(tid){
+  let c=null;
+  try{ c = await api(`/targets/${tid}/capabilities`); }catch(e){ }
+  CAPS=c; if(!c) return;
+  const byStage={};
+  for(const g of Object.keys(c.stages||{})) for(const st of c.stages[g]) byStage[st.stage]=st;
+
+  for(const [stage, id] of Object.entries(_STAGE_BTN)){
+    const el=document.getElementById(id); const st=byStage[stage]; if(!el||!st) continue;
+    el.disabled = !st.available;
+    el.classList.toggle("unavail", !st.available);
+    el.classList.toggle("planned", st.available && st.planned!==null && st.planned!==undefined);
+    // the reason replaces the tooltip: a disabled control whose tooltip still describes what
+    // it would have done tells the reader nothing about why it is grey
+    if(!st.available) el.title = "Not available for this target — "+(st.why||"");
+    else if(el.dataset.tip) el.title = el.dataset.tip;
+    else el.dataset.tip = el.title;
+  }
+  const sel=document.getElementById("fuzzstrategy");
+  if(sel) for(const opt of sel.options){
+    const stage=Object.keys(_STAGE_OPT).find(k=>_STAGE_OPT[k]===opt.value);
+    const st=stage?byStage[stage]:null; if(!st) continue;
+    opt.disabled = !st.available;
+    opt.textContent = opt.textContent.replace(/ — unavailable.*$/,"")
+                      + (st.available?"":" — unavailable here");
+    if(!st.available && sel.value===opt.value) sel.value="fuzz";
+  }
+  renderSubstrate(c);
+  renderLadderNote(c, byStage);
+}
+
+// What this target IS, and what that rules out — on the target header, before anything is
+// clicked. "9 of 22 stages unavailable" is a fact the operator should not have to discover by
+// clicking nine times.
+function renderSubstrate(c){
+  const el=document.getElementById("substrate"); if(!el) return;
+  const n=(c.unavailable||[]).length;
+  const bits=[c.file_type?esc(c.file_type.toUpperCase()):null, c.arch?esc(c.arch):null]
+             .filter(Boolean).join(" · ");
+  el.innerHTML = bits + (n?` <span class="dim" title="${esc((c.unavailable||[]).join(", "))}">`
+                          +`· ${n} stage${n!==1?"s":""} not available here</span>`:"");
+}
+
+// Say where the ladder stops for this substrate, in the panel whose job is the ladder. For a
+// managed runtime L2/L3 are not missing features, they are the runtime: the JVM owns the
+// instruction pointer. Leaving the buttons merely greyed invites the reader to wonder what is
+// broken.
+function renderLadderNote(c, byStage){
+  const el=document.getElementById("laddernote"); if(!el) return;
+  const ip=byStage["poc_primitive"];
+  if(ip && !ip.available){
+    el.innerHTML = `<b>L1 is the ceiling for this target.</b> ${esc(ip.why||"")}`;
+  }else{
+    el.textContent = "Act on a crash below: root-cause it, package a reproducer (L1), "
+                   + "then ask whether it controls the instruction pointer (L2/L3).";
+  }
+}
+
+// ---- how this target has to be INVOKED -------------------------------------------------
+// A service behind "-c <config> -d <display> -j <app.jar>" prints its usage and exits without
+// them, so every execution is identical and the campaign reports a clean run. These flags are
+// read off the binary's own usage line and getopt string; the values are a TEMPLATE, because
+// an instance id or a display is site-specific and no binary can tell us yours.
+function invocationBlock(inv){
+  if(!inv || !(inv.flags||[]).length) return "";
+  const argv=(inv.proposed_argv||[]).join(" ");
+  const flags=inv.flags.map(f=>`<li><span class="ck ${f.takes_value?'':'ok'}">${f.takes_value?'·':'✓'}</span>`
+    +`<span><code>${esc(f.flag)}</code> — ${esc(f.takes_value?(f.kind||"value"):"switch")}`
+    +`${f.default?` <span class="dim">(${esc(f.default)})</span>`:""}</span></li>`).join("");
+  return `<div class="ghd" style="margin-top:8px">◈ Invocation — ${esc(inv.confidence)} confidence
+      <span class="dim">(from ${esc((inv.sources||[]).join(" + ")||"—")})</span></div>
+    ${inv.usage?`<div class="grec mono" style="font-size:11px">${esc(inv.usage)}</div>`:""}
+    <ul class="gcheck">${flags}</ul>
+    ${argv?`<div class="grec mono" style="font-size:11px">${esc(argv)}</div>`:""}
+    <div class="dim" style="font-size:11px;margin:4px 0">Values are placeholders — an id or a
+      display is specific to your deployment. Check it before you trust it.</div>
+    <button class="btn sm" onclick="useInvocation()">Use this argv</button>
+    <button class="btn sm" onclick="checkInvocation()">Check it runs</button>
+    <span id="invverdict" class="dim" style="font-size:11px"></span>`;
+}
+function useInvocation(){
+  const d=document.getElementById("dynargv");
+  if(d) d.value=((ADVICE&&ADVICE.invocation&&ADVICE.invocation.proposed_argv)||[]).join(" ");
+}
+// Run it. A proposal read off the strings is a hypothesis, and applying one unchecked is the
+// failure it exists to prevent -- unzip needs no flags at all, and "-d <dir> -x x" is a worse
+// command line than none. The target's own refusal is quoted back.
+async function checkInvocation(){
+  const v=document.getElementById("invverdict"); if(!v) return;
+  const argv=(document.getElementById("dynargv")?.value||"").trim().split(/\s+/).filter(Boolean);
+  v.textContent=" running…";
+  try{
+    const r=await api(`/targets/${DETAIL_TID}/invocation`, {method:"POST",
+      body:JSON.stringify({argv:argv.length?argv:undefined})});
+    const ver=r.verified||{};
+    v.innerHTML = ver.accepted
+      ? ` <span class="ck ok">✓</span> ${esc(ver.why)}`
+      : ` <span class="ck no">!</span> ${esc(ver.why)}`;
+  }catch(e){ v.textContent=" check failed: "+e; }
+}
+// the server names stages; the strategy <select> uses short option values
+function _stratOpt(stage){
+  return {coverage_fuzz:"coverage", directed_fuzz:"directed", fuzz:"fuzz",
+          concolic:"concolic", boundary_fuzz:"boundary"}[stage] || "fuzz";
+}
+function applyFuzzRecommendation(mode, strat, fileParser){
+  const dm=document.getElementById("dynmode"); if(dm) dm.value=mode;
+  const fs=document.getElementById("fuzzstrategy"); if(fs) fs.value=strat;
+  if(fileParser){
+    const ff=document.getElementById("fuzzformat");
+    if(ff && (!ff.value || ff.value==="")){
+      if(SEEDS.length && !CUSTOM_SPEC){ ff.value="custom"; onFmtChangeSilent(); openSpecBuilder(); }  // build it from the seed
+      else { ff.value=CUSTOM_SPEC?"custom":"lv32"; onFmtChange();
+        const mg=document.getElementById("fuzzmagic"); if(mg && !mg.value) mg.placeholder="set magic e.g. %PDF"; }
+    }
+  }
+  recommendFuzz();
+}
+
+// ---- live fuzz metrics: progress bar + execs/crashes/unique/coverage ----
+function resetFuzzMetrics(stage, max){
+  const el=document.getElementById("fuzzmetrics"); if(!el) return;
+  el.hidden=false;
+  el.innerHTML=`<div class="pbwrap"><div class="pbar ind" id="fmbar"><i></i></div>
+      <div class="pbmeta"><span id="fmmsg">${esc(stage)} starting…</span><span id="fmpct"></span></div></div>
+    <div class="metrics" style="margin-top:8px">
+      <div class="metric"><span class="mv" id="fm-execs">0</span><span class="ml">execs</span></div>
+      <div class="metric hit"><span class="mv" id="fm-crashes">0</span><span class="ml">crashes</span></div>
+      <div class="metric"><span class="mv" id="fm-unique">0</span><span class="ml">unique</span></div>
+      <div class="metric"><span class="mv" id="fm-extra">—</span><span class="ml" id="fm-extral">coverage</span></div>
+    </div>`;
+  el._max=max;
+}
+function setFuzzMetric(id,v){ const e=document.getElementById(id); if(e) e.textContent=v; }
+function updateFuzzMetrics(p, {extra=null,extraLabel=null,done=false,status=null}={}){
+  const el=document.getElementById("fuzzmetrics"); if(!el||el.hidden) return;
+  if(p){
+    if(p.execs!=null) setFuzzMetric("fm-execs", p.execs);
+    if(p.crashes!=null) setFuzzMetric("fm-crashes", p.crashes);
+    if(p.unique!=null) setFuzzMetric("fm-unique", p.unique);
+    const bar=document.getElementById("fmbar");
+    if(bar){
+      const max=el._max;
+      if(max && p.execs!=null){ const pct=Math.min(done?100:99,Math.round(100*p.execs/max));
+        bar.classList.remove("ind"); bar.firstElementChild.style.width=pct+"%";
+        const pe=document.getElementById("fmpct"); if(pe) pe.textContent=pct+"%"; }
+      bar.classList.toggle("hit", (p.crashes||0)>0);
+    }
+  }
+  if(extra!=null){ setFuzzMetric("fm-extra", extra); if(extraLabel){ const l=document.getElementById("fm-extral"); if(l) l.textContent=extraLabel; } }
+  const msg=document.getElementById("fmmsg"); if(msg && status) msg.textContent=status;
+  if(done){ const bar=document.getElementById("fmbar"); if(bar){ bar.classList.remove("ind"); bar.classList.add("ok");
+      if(!el._max){ bar.firstElementChild.style.width="100%"; } } }
+}
+function seedParams(){ return SEEDS.length ? {seeds:SEEDS} : {}; }   // spread into fuzz params
+function onFmtChange(){
+  const v=document.getElementById("fuzzformat").value;
+  const m=document.getElementById("fuzzmagic");                     // magic box only for lv32/png built-ins
+  if(m) m.style.display = (v && v!=="custom") ? "" : "none";
+  const b=document.getElementById("specbuild");
+  if(b) b.style.display = (v==="custom") ? "" : "none";
+  updateCustomChip();
+  if(v==="custom" && !CUSTOM_SPEC) openSpecBuilder();               // nothing built yet -> open the builder
+}
+function updateCustomChip(){
+  const chip=document.getElementById("customchip"); if(!chip) return;
+  const v=(document.getElementById("fuzzformat")||{}).value;
+  chip.textContent = (v==="custom" && CUSTOM_SPEC) ? `${CUSTOM_SPEC.length}-field spec ready` : "";
+}
+function fmtParams(){                                                // structure-aware mutation model
+  const name=(document.getElementById("fuzzformat")||{}).value||"";
+  if(!name) return {};
+  if(name==="custom") return CUSTOM_SPEC ? {format:CUSTOM_SPEC} : {};
+  const p={format_name:name};
+  const mg=((document.getElementById("fuzzmagic")||{}).value||"").trim();
+  if(mg) p.magic=mg;                                                 // override the model's magic gate
+  return p;
+}
+
+// ---- custom format spec builder ----
+let CUSTOM_SPEC=null;    // the accepted backend spec (list of field dicts)
+let BUILDER=[];          // working field list in the modal
+const _INTSET=new Set(["u8","u16","u32","u64"]);
+function openSpecBuilder(){
+  const fmt=document.getElementById("fuzzformat"); if(fmt) fmt.value="custom"; onFmtChangeSilent();
+  if(CUSTOM_SPEC && !BUILDER.length) BUILDER=specToBuilder(CUSTOM_SPEC);
+  document.getElementById("specbuilder").hidden=false;
+  const hint=document.getElementById("sbautohint");
+  if(hint) hint.textContent = SEEDS.length ? `using seed #1 (${_seedBytesLen(SEEDS[0])} B)` : "no seed attached -- attach one under + seeds for the best result";
+  const sb=document.getElementById("sbsamplelbl"); if(sb) sb.textContent = SEEDS.length?"":"(no sample)";
+  if(!BUILDER.length && SEEDS.length) builderAutodetect(); else { renderBuilderFields(); builderPreview(); }
+}
+function onFmtChangeSilent(){ const m=document.getElementById("fuzzmagic"); const v=document.getElementById("fuzzformat").value;
+  if(m) m.style.display=(v&&v!=="custom")?"":"none"; const b=document.getElementById("specbuild"); if(b) b.style.display=(v==="custom")?"":"none"; }
+function closeSpecBuilder(){ document.getElementById("specbuilder").hidden=true; }
+function _seedBytesLen(b64){ try{return atob(b64).length;}catch(e){return 0;} }
+function builderSampleB64(){ return SEEDS.length?SEEDS[0]:""; }
+
+// The field types this editor can represent and round-trip. Anything else -- the nested
+// `group`/`array`/`shadow` a builtin model uses -- would fall through specToBuilder's catch-all
+// and come back as a plain blob, so loading a builtin here and pressing "Use this spec" would
+// hand back a WORSE model than the one the campaign picks on its own: a downgrade wearing the
+// clothes of a customisation.
+const _BUILDER_TYPES = new Set(["magic","blob","u8","u16","u32","u64","i8","i16","i32","i64"]);
+function builderCanEdit(spec){
+  return (spec||[]).every(f => _BUILDER_TYPES.has(f.type));
+}
+function specToBuilder(spec){
+  return spec.map(f=>{
+    if(f.type==="magic"){
+      let mode="ascii", val="";
+      if(f.value && typeof f.value==="object" && f.value.b64){ mode="hex"; val=_b64ToHex(f.value.b64); }
+      else { val=String(f.value==null?"":f.value); }
+      return {type:"magic", name:f.name||"magic", mode, val};
+    }
+    if(_INTSET.has(f.type)) return {type:f.type, name:f.name||f.type, endian:f.endian||"little", length_of:f.length_of||""};
+    return {type:"blob", name:f.name||"data"};
+  });
+}
+function builderSpec(){                             // BUILDER -> backend spec
+  return BUILDER.map(f=>{
+    if(f.type==="magic"){
+      let value;
+      if(f.mode==="hex"){ const b=_hexToBytes(f.val); value={b64:_bytesToB64(b)}; }
+      else value=f.val||"";
+      return {type:"magic", name:f.name||"magic", value};
+    }
+    if(_INTSET.has(f.type)){ const o={type:f.type, endian:f.endian||"little", name:f.name||f.type};
+      if(f.length_of) o.length_of=f.length_of; return o; }
+    return {type:"blob", name:f.name||"data"};
+  });
+}
+function addField(type){
+  if(type==="magic") BUILDER.push({type:"magic",name:"magic",mode:"ascii",val:""});
+  else if(_INTSET.has(type)) BUILDER.push({type,name:type,endian:"little",length_of:""});
+  else BUILDER.push({type:"blob",name:"data"});
+  renderBuilderFields(); builderPreview();
+}
+function removeField(i){ BUILDER.splice(i,1); renderBuilderFields(); builderPreview(); }
+function moveField(i,d){ const j=i+d; if(j<0||j>=BUILDER.length) return;
+  [BUILDER[i],BUILDER[j]]=[BUILDER[j],BUILDER[i]]; renderBuilderFields(); builderPreview(); }
+function setField(i,k,v){ BUILDER[i][k]=v; if(k==="type"){ /* re-init shape */ BUILDER[i]=_reshape(BUILDER[i]); }
+  renderBuilderFields(); builderPreview(); }
+function _reshape(f){ if(f.type==="magic") return {type:"magic",name:f.name,mode:f.mode||"ascii",val:f.val||""};
+  if(_INTSET.has(f.type)) return {type:f.type,name:f.name,endian:f.endian||"little",length_of:f.length_of||""};
+  return {type:"blob",name:f.name||"data"}; }
+function renderBuilderFields(){
+  const el=document.getElementById("sbfieldlist"); if(!el) return;
+  const blobs=BUILDER.filter(f=>f.type==="blob").map(f=>f.name);
+  el.innerHTML = BUILDER.map((f,i)=>{
+    const typesel=`<select class="sel" onchange="setField(${i},'type',this.value)">`+
+      ["magic","u8","u16","u32","u64","blob"].map(t=>`<option ${t===f.type?"selected":""}>${t}</option>`).join("")+`</select>`;
+    const name=`<input class="inp grow" value="${esc(f.name||"")}" placeholder="name" oninput="setField(${i},'name',this.value)">`;
+    let extra="";
+    if(f.type==="magic"){
+      const modesel=`<select class="sel" onchange="setField(${i},'mode',this.value)"><option value="ascii" ${f.mode!=="hex"?"selected":""}>ascii</option><option value="hex" ${f.mode==="hex"?"selected":""}>hex</option></select>`;
+      extra=`${modesel}<input class="inp grow" value="${esc(f.val||"")}" placeholder="${f.mode==="hex"?'89 50 4e 47':'e.g. %PDF'}" oninput="setField(${i},'val',this.value)">`;
+    } else if(_INTSET.has(f.type)){
+      const en=`<select class="sel" onchange="setField(${i},'endian',this.value)"><option value="little" ${f.endian!=="big"?"selected":""}>LE</option><option value="big" ${f.endian==="big"?"selected":""}>BE</option></select>`;
+      const lo=`<select class="sel" title="length-of: this integer sizes that blob (drives the overflow)" onchange="setField(${i},'length_of',this.value)">`+
+        `<option value="">— length of —</option>`+blobs.map(b=>`<option ${b===f.length_of?"selected":""}>${esc(b)}</option>`).join("")+`</select>`;
+      extra=`${en}${lo}`;
+    }
+    return `<div class="sbrow"><span class="sbt">${f.type}</span>${typesel}${name}${extra}`+
+      `<button class="rmf" title="up" onclick="moveField(${i},-1)">↑</button>`+
+      `<button class="rmf" title="down" onclick="moveField(${i},1)">↓</button>`+
+      `<button class="rmf" title="remove" onclick="removeField(${i})">✕</button></div>`;
+  }).join("") || `<div class="hint">No fields yet — add magic / integers / blob, or Auto-detect.</div>`;
+}
+async function builderAutodetect(){
+  const sample=builderSampleB64();
+  const hint=document.getElementById("sbautohint");
+  if(!sample){ if(hint) hint.textContent="attach a seed first (+ seeds)"; return; }
+  try{
+    const r=await api("/format/analyze",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({sample_b64:sample})});
+    const sug=(typeof r==="string"?JSON.parse(r):r).suggestion;
+    if(sug){
+      const note=(sug.detected?`detected ${sug.detected}. `:"")+(sug.notes&&sug.notes[0]||"");
+      if(sug.builtin && !builderCanEdit(sug.spec)){
+        // A model this editor cannot express faithfully: say so and leave the list empty,
+        // rather than loading a lossy copy the operator would then apply over the good one.
+        BUILDER=[];
+        if(hint) hint.textContent = note + " This editor cannot represent that model's "
+          + "nested fields, so it is not loaded -- the campaign already uses it. Build a "
+          + "custom spec here only for a format it does not know.";
+      } else {
+        BUILDER=specToBuilder(sug.spec);
+        if(hint) hint.textContent=note;
+      }
+    }
+  }catch(e){ if(hint) hint.textContent="auto-detect failed"; }
+  renderBuilderFields(); builderPreview();
+}
+let _pvTimer=null;
+function builderPreview(){ clearTimeout(_pvTimer); _pvTimer=setTimeout(_doPreview,150); }
+async function _doPreview(){
+  const body=document.getElementById("sbpreviewbody"); if(!body) return;
+  const sample=builderSampleB64();
+  if(!sample){ body.innerHTML=`<div class="hint">Attach a seed (+ seeds) to preview how this spec carves a real file.</div>`; return; }
+  if(!BUILDER.length){ body.innerHTML=`<div class="hint">Add fields to see the carve.</div>`; return; }
+  let r;
+  try{
+    r=await api("/format/analyze",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({sample_b64:sample, spec:builderSpec()})});
+    r=(typeof r==="string"?JSON.parse(r):r).preview;
+  }catch(e){ body.innerHTML=`<div class="hint" style="color:var(--danger)">preview failed</div>`; return; }
+  if(!r){ body.innerHTML=`<div class="hint">no preview</div>`; return; }
+  if(r.error){ body.innerHTML=`<div class="hint" style="color:var(--danger)">parse error: ${esc(r.error)}</div>`; }
+  const rows=(r.fields||[]).map(f=>{
+    let vl="", badge="";
+    if(f.type==="magic"){ vl=`"${esc((f.value&&f.value.ascii)||"")}" <span style="color:var(--faint)">${esc((f.value&&f.value.hex)||"")}</span>`;
+      badge=f.match?`<span class="pvbadge ok">magic ✓</span>`:`<span class="pvbadge no">magic ✗</span>`; }
+    else if(f.type==="blob"){ vl=`${f.size} bytes <span style="color:var(--faint)">${esc((f.value&&f.value.ascii)||"")}</span>`; }
+    else { vl=`= ${f.int} <span style="color:var(--faint)">(${esc(f.endian||"")})</span>`;
+      if(f.length_of!=null) badge=f.length_match?`<span class="pvbadge ok">length ✓ matches ${esc(f.length_of)}</span>`:`<span class="pvbadge no">length ✗ ≠ ${esc(f.length_of)}</span>`; }
+    return `<div class="pvfield"><span class="off">@${f.offset} +${f.size}</span><span class="ty">${esc(f.type)}</span><span class="nm">${esc(f.name||"")}</span><span class="vl">${vl}</span>${badge}</div>`;
+  }).join("");
+  const rt=r.roundtrip?`<span class="pvbadge ok">roundtrip ✓</span>`:`<span class="pvbadge no">roundtrip ✗</span>`;
+  const cov=r.consumed===r.sample_size?`<span class="pvbadge ok">covers all ${r.sample_size} B</span>`:`<span class="pvbadge no">carved ${r.consumed} / ${r.sample_size} B</span>`;
+  body.innerHTML = rows + `<div class="pvsummary">${rt}${cov}</div>`;
+  const status=document.getElementById("sbstatus");
+  const hasLen=(r.fields||[]).some(f=>f.length_of!=null);
+  if(status) status.textContent = hasLen ? "" : "tip: tag an integer as 'length of' a blob so the fuzzer grows the blob to match — that's the overflow trigger";
+}
+function useBuilderSpec(){
+  if(!BUILDER.length){ closeSpecBuilder(); return; }
+  CUSTOM_SPEC=builderSpec();
+  const fmt=document.getElementById("fuzzformat"); if(fmt) fmt.value="custom";
+  onFmtChangeSilent(); updateCustomChip(); closeSpecBuilder(); recommendFuzz();
+}
+// tiny byte helpers
+function _hexToBytes(s){ const h=(s||"").replace(/0x/gi,"").replace(/[^0-9a-fA-F]/g,""); const b=[];
+  for(let i=0;i+1<h.length;i+=2) b.push(parseInt(h.substr(i,2),16)); return b; }
+function _bytesToB64(arr){ let s=""; for(const c of arr) s+=String.fromCharCode(c&0xff); return btoa(s); }
+function _b64ToHex(b64){ try{const s=atob(b64); let h=""; for(let i=0;i<s.length;i++) h+=(s.charCodeAt(i)&0xff).toString(16).padStart(2,"0")+" "; return h.trim();}catch(e){return "";} }
+async function doPoc(tid, inputSha, mode){
+  await fetch("/runs",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({case_id:CUR,target_id:tid,stage:"build_poc",
+      params:{input_sha:inputSha,input_mode:mode||"stdin"}})});
+}
+async function doPrimitive(tid, inputSha, mode){
+  const st=document.getElementById("fuzzstat"); if(st) st.textContent="assessing L2 primitive…";
+  await fetch("/runs",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({case_id:CUR,target_id:tid,stage:"poc_primitive",
+      params:{input_sha:inputSha,input_mode:mode||"stdin"}})});
+}
+async function doExploit(tid, mode){
+  const st=document.getElementById("fuzzstat"); if(st) st.textContent="synthesizing L3 exploit (ret2win)…";
+  await fetch("/runs",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({case_id:CUR,target_id:tid,stage:"build_exploit",
+      params:{input_mode:mode||"stdin"}})});
+}
+async function doRootCause(tid, inputSha, mode){
+  const st=document.getElementById("fuzzstat"); if(st) st.textContent="root-cause analysis…";
+  await fetch("/runs",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({case_id:CUR,target_id:tid,stage:"root_cause",
+      params:{input_sha:inputSha,input_mode:mode||"stdin"}})});
+}
+async function doFirmware(tid){
+  const st=document.getElementById("decostat"); if(st) st.textContent="carving firmware…";
+  await fetch("/runs",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({case_id:CUR,target_id:tid,stage:"firmware_carve"})});
+}
+async function doRehost(tid){
+  const st=document.getElementById("decostat"); if(st) st.textContent="rehosting under Unicorn…";
+  await fetch("/runs",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({case_id:CUR,target_id:tid,stage:"firmware_rehost"})});
+}
+async function doMultiDebug(tid, inputSha, mode){
+  const st=document.getElementById("fuzzstat"); if(st) st.textContent="multi-process debug (follow-fork)…";
+  await fetch("/runs",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({case_id:CUR,target_id:tid,stage:"multi_debug",
+      params:{input_sha:inputSha,input_mode:mode||"stdin"}})});
+}
+async function loadPocs(tid){
+  const el=document.getElementById("pocs"); if(!el) return;
+  const ps=await api(`/targets/${tid}/pocs`)||[];
+  const pst=document.getElementById("pocstat");
+  if(pst){ const best=ps.filter(p=>p.verified).map(p=>p.level).sort().pop();
+    pst.textContent = ps.length?(best?`${best} verified`:`${ps.length} bundle${ps.length!==1?'s':''}`):""; }
+  if(!ps.length){ el.innerHTML=""; return; }
+  el.innerHTML=`<div class="eyebrow" style="margin:6px 0">PoC bundles (${ps.length})</div>`+
+    `<div class="sec" style="max-height:120px;overflow:auto">`+
+    ps.slice(0,20).map(x=>{
+      const ok = x.verified ? `<span style="color:#57c88c">${esc(x.level)} verified ${esc(x.signal||'')}</span>`
+                 : `<span style="color:var(--faint)">${esc(x.level)} unverified</span>`;
+      const dl = x.bundle_sha ? ` <a href="/artifacts/${x.bundle_sha}" download="poc.tar.gz" style="color:var(--teal)">download</a>` : "";
+      return ok+dl;
+    }).join("<br>")+`</div>`;
+}
+// shared run launcher: POSTs, returns {run_id}, and seeds a live progress bar
+async function postRun(tid, stage, params, {liveMax=null, status=null}={}){
+  // a case-level stage (link_case, ipc_model, cross_taint, whole_system) has no target
+  const st=document.getElementById("fuzzstat"); if(st && status) st.textContent=status;
+  let r;
+  try{ r=await fetch("/runs",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify(tid?{case_id:CUR,target_id:tid,stage,params}
+                            :{case_id:CUR,stage,params})}); }
+  catch(e){ if(st) st.textContent=stage+" failed to start"; return null; }
+  if(!r.ok){ if(st) st.textContent=`${stage} failed to start (HTTP ${r.status})`; return null; }
+  let d={}; try{ d=await r.json(); }catch(e){}
+  if(d.run_id){
+    FUZZ_LIVE[d.run_id]={execs:0,crashes:0,unique:0,max:liveMax,stage};
+    resetFuzzMetrics(stage, liveMax);
+    refresh();                                  // show the queued run + its bar immediately
+  }
+  return d;
+}
+async function doDynamic(tid){
+  const raw = document.getElementById("dyninput").value || "";
+  const mode = document.getElementById("dynmode").value;
+  const b64 = raw ? btoa(unescape(encodeURIComponent(raw))) : "";
+  await postRun(tid, "dynamic_run", {input_b64:b64,input_mode:mode,timeout:10}, {status:"running once…"});
+}
+// How the target must be invoked. "@@" marks where the input goes; a service that takes a
+// config path is "-c @@". Ignoring this ran such a target as `daemon <workfile>`, which
+// prints usage and exits -- 8,000 executions reporting one behaviour and no crashes.
+function argvParams(){
+  const raw=(document.getElementById("dynargv")?.value||"").trim();
+  return raw ? {argv: raw.split(/\s+/)} : {};
+}
+async function doFuzz(tid){
+  const mode = document.getElementById("dynmode").value;
+  const max_execs=5000;
+  await postRun(tid, "fuzz", {input_mode:(mode==="none"?"stdin":mode),max_execs,max_seconds:30,
+    ...argvParams(),...seedParams(),...fmtParams()}, {liveMax:max_execs, status:"black-box fuzzing…"});
+}
+async function doCoverage(tid){
+  const mode = document.getElementById("dynmode").value;
+  await postRun(tid, "coverage_fuzz", {input_mode:(mode==="stdin"?"stdin":"file"),max_seconds:30,
+    ...seedParams(),...fmtParams()}, {status:"AFL++ coverage fuzzing…"});
+}
+async function doDirected(tid){
+  const mode = document.getElementById("dynmode").value;
+  const max_execs=6000;
+  await postRun(tid, "directed_fuzz", {input_mode:(mode==="none"?"stdin":mode),max_execs,max_seconds:30,
+    ...argvParams(),...seedParams(),...fmtParams()}, {liveMax:max_execs, status:"directed fuzzing…"});
+}
+async function doBoundary(tid){
+  await postRun(tid, "boundary_fuzz", {}, {status:"boundary harness…"});
+}
+async function doSynthesize(tid){
+  const mode = document.getElementById("dynmode").value;
+  await postRun(tid, "synthesize_poc",
+    {input_mode:(mode==="none"?undefined:mode), timeout:8, ...argvParams()},
+    {status:"synthesizing overflow from recovered frame (no fuzzing)…"});
+}
+async function doMonitor(tid){
+  const mode = document.getElementById("dynmode").value;
+  const params = {input_mode:(mode==="none"?"stdin":mode), timeout:20};
+  const argvRaw = (document.getElementById("monargv").value||"").trim();
+  if(argvRaw) params.argv = argvRaw.split(/\s+/);
+  const sinksRaw = (document.getElementById("monsinks").value||"").trim();
+  if(sinksRaw){
+    const sa = {};
+    sinksRaw.split(",").forEach(p=>{ const [n,a]=p.split("="); if(n&&a&&a.trim()) sa[n.trim()]=a.trim(); });
+    if(Object.keys(sa).length) params.sink_addrs = sa;
+  }
+  await postRun(tid, "debug_monitor", params, {status:"monitoring dangerous calls…"});
+}
+async function doInject(tid){
+  const mode = document.getElementById("dynmode").value;
+  await postRun(tid, "synthesize_injection", {input_mode:(mode==="none"?undefined:mode), timeout:8},
+    {status:"probing injection (cmdi/format/traversal) — no fuzzing…"});
+}
+async function doHeapCheck(tid){
+  const mode = document.getElementById("dynmode").value;
+  await postRun(tid, "heap_check", {input_mode:(mode==="none"?"stdin":mode), timeout:15},
+    {status:"heap check under guard-page allocator…"});
+}
+async function doExtract(tid){
+  const mode = document.getElementById("dynmode").value;
+  await postRun(tid, "extract_secrets", {input_mode:(mode==="none"?"stdin":mode), timeout:20},
+    {status:"extracting comparison constants under GDB…"});
+}
+async function doTaint(tid){
+  const mode = document.getElementById("dynmode").value;
+  await postRun(tid, "dynamic_taint", {input_mode:(mode==="none"?"stdin":mode), timeout:20},
+    {status:"confirming input\u2192sink flows with a marker\u2026"});
+}
+
+async function doSecretPoc(tid){
+  await postRun(tid, "synthesize_secret", {},
+    {status:"packaging hard-coded secret(s) into a verified PoC…"});
+}
+
+async function doBehavior(tid){
+  const mode = document.getElementById("dynmode").value;
+  const backend = document.getElementById("behavbackend").value;
+  await postRun(tid, "behavior_trace",
+    {input_mode:(mode==="none"?"stdin":mode), timeout:25, backend},
+    {status:"tracing syscalls…"});
+}
+// ---- interactive detonation console ----
+let CONWS=null, CON_TID=null;
+function openConsole(tid){ CON_TID=tid; document.getElementById("console").hidden=false;
+  const o=document.getElementById("conout"); if(o) o.textContent=""; setConStatus("disconnected");
+  document.getElementById("consaved").textContent=""; }
+function closeConsole(){ if(CONWS){ try{CONWS.close();}catch(e){} CONWS=null; } document.getElementById("console").hidden=true; }
+function setConStatus(s){ const el=document.getElementById("constatus"); if(el) el.textContent=s; }
+function conAppend(txt){ const o=document.getElementById("conout"); if(!o) return;
+  o.textContent += txt; if(o.textContent.length>200000) o.textContent=o.textContent.slice(-150000);
+  o.scrollTop=o.scrollHeight; }
+function consoleConnect(){
+  if(CONWS){ try{CONWS.close();}catch(e){} }
+  const argv=(document.getElementById("conargv").value||"").trim();
+  const qs = `target_id=${encodeURIComponent(CON_TID)}` + (argv?`&argv=${encodeURIComponent(argv)}`:"");
+  setConStatus("connecting…");
+  CONWS=new WebSocket(`ws://${location.host}/console?${qs}`);
+  CONWS.onopen=()=>setConStatus("running");
+  CONWS.onclose=()=>setConStatus("disconnected");
+  CONWS.onerror=()=>setConStatus("error");
+  CONWS.onmessage=ev=>{
+    let m; try{m=JSON.parse(ev.data);}catch(_){return;}
+    if(m.t==="out"){ try{ conAppend(new TextDecoder().decode(Uint8Array.from(atob(m.b64),c=>c.charCodeAt(0)))); }catch(e){} }
+    else if(m.t==="info"){ conAppend(`\n[·] ${m.msg}\n`); }
+    else if(m.t==="exit"){ conAppend(`\n[exited${m.code!=null?" code "+m.code:""}${m.signal!=null?" signal "+m.signal:""}]\n`); setConStatus("exited"); }
+    else if(m.t==="saved"){ document.getElementById("consaved").textContent=`seed saved (${m.bytes} B): ${m.sha.slice(0,12)}`; }
+  };
+}
+function conSendMsg(o){ if(CONWS && CONWS.readyState===1) CONWS.send(JSON.stringify(o)); }
+function consoleSend(){ const i=document.getElementById("conin"); if(!i) return;
+  let s=i.value; if(document.getElementById("connl").checked) s+="\n";
+  conSendMsg({t:"in", b64: btoa(unescape(encodeURIComponent(s)))}); i.value=""; i.focus(); }
+function consoleSignal(sig){ conSendMsg({t:"signal", sig}); }
+function consoleEof(){ conSendMsg({t:"eof"}); }
+function consoleSave(){ conSendMsg({t:"save"}); }
+async function doConcolic(tid){
+  const mode = document.getElementById("dynmode").value;
+  await postRun(tid, "concolic", {input_mode:(mode==="none"?"stdin":mode),input_size:64,max_seconds:120,
+    ...seedParams(),...fmtParams()}, {status:"concolic (angr)…"});
+}
+async function loadDyn(tid){
+  const el=document.getElementById("dynresults"); if(!el) return;
+  const rs=await api(`/targets/${tid}/dynresults`)||[];
+  const fst=document.getElementById("fuzzstat");
+  if(fst && !fst.textContent){ const cr=rs.filter(r=>r.crashed).length;
+    fst.textContent = rs.length?`${cr} crash${cr!==1?'es':''} in ${rs.length} runs`:""; }
+  if(!rs.length){ el.innerHTML=""; return; }
+  el.innerHTML=`<div class="sec" style="max-height:120px;overflow:auto">`+
+    rs.slice(0,20).map(r=>{
+      const st = r.crashed ? `<span style="color:#e4605f">CRASH ${esc(r.signal||'')}</span>`
+                 : r.timed_out ? `<span style="color:#e0b54f">timeout</span>`
+                 : `<span style="color:#57c88c">exit ${r.exit_code}</span>`;
+      const poc = (r.crashed && r.input_sha)
+        ? ` <button class="btn sm" onclick="doPoc('${DETAIL_TID}','${r.input_sha}','${r.input_mode||'stdin'}')">Build PoC</button>`
+          + ` <button class="btn sm" title="Assess L2 exploitation primitive (instruction-pointer control)" onclick="doPrimitive('${DETAIL_TID}','${r.input_sha}','${r.input_mode||'stdin'}')">L2</button>`
+          + ` <button class="btn sm" title="L3 assisted exploit: synthesize a ret2win control-flow hijack and confirm it (no-PIE x86-64)" onclick="doExploit('${DETAIL_TID}','${r.input_mode||'stdin'}')">L3</button>`
+          + ` <button class="btn sm" title="Debugger root-cause analysis (fault classification + slice)" onclick="doRootCause('${DETAIL_TID}','${r.input_sha}','${r.input_mode||'stdin'}')">Root Cause</button>`
+          + ` <button class="btn sm" title="Multi-process debug: follow fork/exec into spawned children and blame the crash on this input" onclick="doMultiDebug('${DETAIL_TID}','${r.input_sha}','${r.input_mode||'stdin'}')">Multi-debug</button>` : "";
+      return `${st} <span style="color:var(--faint)">${esc(r.isolation||'')} ${r.duration_ms||0}ms ${esc(r.note||'')}</span>${poc}`;
+    }).join("<br>")+`</div>`;
+}
+async function doDetect(tid){
+  await fetch("/runs",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({case_id:CUR,target_id:tid,stage:"detect_cwe"})});
+}
+async function doCveScan(tid){
+  const st=document.getElementById("cvestat"); if(st) st.textContent="fingerprinting components…";
+  await fetch("/runs",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({case_id:CUR,target_id:tid,stage:"cve_scan"})});
+}
+const SEVCOL={critical:"#e4605f",high:"#e58a4c",medium:"#e0b54f",low:"#46cabb",info:"var(--faint)"};
+const _STATEORD={candidate:0,corroborated:1,confirmed:2,"poc-backed":3};
+function _stCls(s){ return s==="poc-backed"||s==="confirmed"?"on":(s==="corroborated"?"partial":"unknown"); }
+let TFINDINGS=[];        // findings for the open target (drives fuzz guidance)
+async function loadFindings(tid){
+  const el=document.getElementById("findings"); if(!el) return;
+  const fs=await api(`/targets/${tid}/findings`)||[];
+  TFINDINGS=fs; recommendFuzz();
+  const dstat=document.getElementById("detectstat");
+  if(!fs.length){ el.innerHTML=`<div class="hint" style="margin-top:6px">No findings yet — run Detect CWEs or a fuzzer.</div>`;
+    if(dstat) dstat.textContent=""; return; }
+  // dedup for display: group identical (cwe,title); keep the strongest state + all sites
+  const groups={};
+  fs.forEach(f=>{ const k=(f.cwe||'')+"|"+(f.title||'');
+    const g=groups[k]||(groups[k]={cwe:f.cwe,title:f.title,severity:f.severity,state:f.state,n:0,ids:[]});
+    g.n++; g.ids.push(f.id);
+    if((_STATEORD[f.state]||0)>(_STATEORD[g.state]||0)) g.state=f.state; });
+  const arr=Object.values(groups).sort((a,b)=>(_SEVRANK[b.severity]||0)-(_SEVRANK[a.severity]||0));
+  if(dstat) dstat.textContent = `${arr.length} finding${arr.length!==1?'s':''}`+(arr.length!==fs.length?` · ${fs.length} sites`:"");
+  el.innerHTML=`<div class="eyebrow" style="margin:6px 0">Findings (${arr.length}${arr.length!==fs.length?` · ${fs.length} sites`:""})</div>`+
+    `<div class="sec" style="max-height:190px;overflow:auto">`+
+    arr.map(g=>`<div class="frow clk" onclick="openBoardFinding('${g.ids[0]}')" title="Open in the Findings Board">`+
+      `<span style="color:${SEVCOL[g.severity]||'var(--faint)'}">${esc(g.cwe||'')}</span> `+
+      `<span class="mit ${_stCls(g.state)}" style="text-transform:uppercase">${esc(g.state)}</span> `+
+      `${esc(g.title||'')}${g.n>1?`<span class="fcount">×${g.n} sites</span>`:''}</div>`).join("")+
+    `</div>`;
+}
+async function openBoardFinding(fid){
+  SEL_FINDING=fid;
+  switchView('board');                       // loadBoard -> renderBoard reads SEL_FINDING
+}
+let STRINGS=[]; let STRINGS_TOTAL=0;
+async function loadStrings(tid){
+  // The endpoint now pages and reports the true total, so the panel can say when it is
+  // showing a slice rather than stopping silently at the cap.
+  const r = await api(`/targets/${tid}/strings`);
+  if(Array.isArray(r)){ STRINGS = r; STRINGS_TOTAL = r.length; }        // older stores
+  else { STRINGS = (r && r.items) || []; STRINGS_TOTAL = (r && r.total) || STRINGS.length; }
+  renderStrings("");
+}
+function renderStrings(q){
+  const el=document.getElementById("strings"); if(!el) return;
+  if(!STRINGS.length){ el.innerHTML=`<div class="hint">No strings yet — run Decompile.</div>`; return; }
+  q=(q||"").toLowerCase();
+  const list = q ? STRINGS.filter(s=>(s.value||"").toLowerCase().includes(q)) : STRINGS;
+  const cap=2000, shown=list.slice(0,cap);
+  el.innerHTML = `<input class="fsearch" placeholder="filter strings…" value="${esc(q)}" oninput="renderStrings(this.value)">`+
+    `<div class="mono" style="color:var(--faint);font-size:10px;margin-bottom:3px">${
+      list.length===STRINGS.length?STRINGS.length:list.length+" of "+STRINGS.length} strings${
+      (STRINGS_TOTAL>STRINGS.length)?` · showing the first ${STRINGS.length} of ${STRINGS_TOTAL} in this binary`:""}</div>`+
+    `<div class="sec" style="max-height:240px;overflow:auto">`+
+    (shown.length?shown.map(s=>`${esc(s.addr)}  ${esc((s.value||"").slice(0,90))} <span style="color:var(--faint)">[${(s.xrefs||[]).length} xref]</span>`).join("<br>"):`<div class="hint">no match</div>`)+
+    (list.length>cap?`<br><span class="hint">…${list.length-cap} more — refine the filter</span>`:"")+
+    `</div>`;
+  const inp=el.querySelector(".fsearch"); if(q&&inp){ inp.focus(); inp.setSelectionRange(inp.value.length,inp.value.length); }
+}
+async function doDecompile(tid){
+  const st=document.getElementById("decostat"); if(st) st.textContent="queued (Ghidra headless is slow)…";
+  await fetch("/runs",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({case_id:CUR,target_id:tid,stage:"disassemble"})});
+}
+let FUNCS=[];
+async function loadFunctions(tid){
+  FUNCS = await api(`/targets/${tid}/functions`)||[];
+  CVFUNC=null; const cv=document.getElementById("codeviewer"); if(cv){ cv.hidden=true; cv.innerHTML=""; }
+  const ds=document.getElementById("decostat"); if(ds) ds.textContent = FUNCS.length?`${FUNCS.length} functions`:"";
+  renderFuncs(""); recommendFuzz();
+}
+function renderFuncs(q){
+  const el=document.getElementById("funcs"); if(!el) return;
+  if(!FUNCS.length){ el.innerHTML=`<div class="hint" style="margin-top:6px">No functions yet — run Decompile.</div>`; return; }
+  q=(q||"").toLowerCase();
+  const list = q ? FUNCS.filter(f=>((f.name||"")+" "+f.addr).toLowerCase().includes(q)) : FUNCS;
+  const cap=600, shown=list.slice(0,cap);
+  el.innerHTML = `<div class="eyebrow" style="margin:6px 0">Functions (${FUNCS.length})</div>`+
+    `<input class="fsearch" placeholder="filter functions by name or address…" value="${esc(q)}" oninput="renderFuncs(this.value)">`+
+    `<div class="sec" style="max-height:200px;overflow:auto">`+
+    (shown.length?shown.map(f=>{
+      const sig=f.signature && f.signature!==f.name ? `<span class="fsig" title="${esc(f.signature)}">${esc(f.signature)}</span>` : `<span class="fnm">${esc(f.name||"")}</span>`;
+      return `<div class="frow clk" data-id="${f.id}"><span class="faddr">${esc(f.addr)}</span> ${sig} <span style="color:var(--faint)">(${f.size||0})</span></div>`;
+    }).join(""):`<div class="hint">no match</div>`)+
+    (list.length>cap?`<div class="hint">…${list.length-cap} more — refine the filter</div>`:"")+
+    `</div>`;
+  el.querySelectorAll(".frow[data-id]").forEach(d=> d.onclick=()=>showFunc(d.dataset.id));
+  const s=el.querySelector(".fsearch"); if(q&&s){ s.focus(); s.setSelectionRange(s.value.length,s.value.length); }
+}
+let CVFUNC=null;
+async function showFunc(fid){
+  CVFUNC = await api(`/functions/${fid}`);
+  renderCodeViewer();
+  document.querySelectorAll("#funcs .frow").forEach(r=>r.classList.toggle("on", r.dataset.id===fid));
+  const cv=document.getElementById("codeviewer"); if(cv) cv.scrollIntoView({block:"nearest",behavior:"smooth"});
+}
+function renderCodeViewer(){
+  const el=document.getElementById("codeviewer"); if(!el||!CVFUNC) return;
+  const f=CVFUNC; el.hidden=false;
+  const blocks=(f.ir&&f.ir.blocks)?f.ir.blocks:[];
+  const callees=f.callees||[], callers=f.callers||[];
+  const norm=a=>String(a||'').toLowerCase().replace(/^0x0*/,'0x');
+  const nameAt=a=>{ const fn=FUNCS.find(x=>norm(x.addr)===norm(a)); return fn&&fn.name; };
+  const chip=(c,dir)=>{
+    const addr = dir==='out' ? (c.dst_addr||'') : (c.src_addr||'');
+    const label = dir==='out' ? (c.dst_name||nameAt(c.dst_addr)||c.dst_addr||'?')
+                              : (nameAt(c.src_addr)||c.src_addr||'?');
+    return `<span class="callchip ${c.external?'ext':''}" title="${esc(String(label)+' @ '+(c.site_addr||''))}" onclick="jumpFunc('${esc(addr)}')">${esc(label)}</span>`;
+  };
+  const calleeHtml = callees.length ? callees.map(c=>chip(c,'out')).join("") : `<span class="hint">none</span>`;
+  const callerHtml = callers.length ? callers.map(c=>chip(c,'in')).join("") : `<span class="hint">none</span>`;
+  const sig = f.signature ? `<div class="cvsig mono">${esc(f.signature)}</div>` : "";
+  el.innerHTML=`<div class="cvhead">
+      <div class="cvname"><b>${esc(f.name||("sub_"+f.addr))}</b>
+        <span class="mono" style="color:var(--faint)">${esc(f.addr)} · ${f.blocks||blocks.length} blk · ${f.edges||0} edges</span></div>
+      ${sig}</div>
+    <div class="cvbody">
+      <div class="cvpane"><div class="cvplabel">CFG (${blocks.length} blocks · ${f.edges||0} edges)</div>
+        <div class="cvcfg">${renderCFGGraph(blocks)}</div></div>
+      <div class="cvpane"><div class="cvplabel">Pseudocode</div>
+        <pre class="cvcode">${esc(f.decompiled||"(no decompilation — run Decompile)")}</pre></div>
+    </div>
+    ${renderFramePane(f.frame)}
+    <div class="cvxrefs">
+      <div class="cvxr"><span class="cvplabel">Calls out →</span>${calleeHtml}</div>
+      <div class="cvxr"><span class="cvplabel">← Called by</span>${callerHtml}</div>
+    </div>`;
+}
+// jump the code viewer to a function by its entry address (caller/callee navigation)
+function jumpFunc(addr){
+  if(!addr) return;
+  const norm=a=>String(a||'').toLowerCase().replace(/^0x0*/,'0x');
+  const fn=FUNCS.find(x=>norm(x.addr)===norm(addr));
+  if(fn) showFunc(fn.id);
+}
+// stack-frame panel: locals with offset/size/type, buffers highlighted; the overflow surface
+function renderFramePane(frame){
+  if(!frame) return "";
+  const vars=(frame.vars||[]).slice().sort((a,b)=>a.offset-b.offset);
+  const params=frame.params||[];
+  const buffers=vars.filter(v=>v.is_buffer);
+  const geo=[`frame ${frame.frame_size??'?'} B`, params.length?`${params.length} param${params.length>1?'s':''}`:'',
+             buffers.length?`${buffers.length} buffer${buffers.length>1?'s':''}`:'', frame.calling_convention||'',
+             frame.varargs?'varargs':''].filter(Boolean).join(" · ");
+  if(!vars.length && !params.length) return "";
+  const prow=params.map(p=>`<tr><td class="mono">param</td><td class="mono">${esc(p.name)}</td><td class="mono">${esc(p.type||'')}</td><td class="mono">${p.size||''}</td><td></td></tr>`).join("");
+  const vrow=vars.map(v=>`<tr class="${v.is_buffer?'bufrow':''}"><td class="mono">${v.offset}</td><td class="mono">${esc(v.name)}</td><td class="mono">${esc(v.type||'')}</td><td class="mono">${v.size}</td><td>${v.is_buffer?`<span class="pvbadge no">buffer</span>`:''}</td></tr>`).join("");
+  return `<details class="cvframe" open><summary>Stack frame <span class="fghint">${esc(geo)}</span></summary>
+    <table class="frametbl"><thead><tr><th>offset</th><th>name</th><th>type</th><th>size</th><th></th></tr></thead>
+    <tbody>${prow}${vrow}</tbody></table></details>`;
+}
+// Vanilla layered SVG CFG: rank blocks by BFS depth, box per basic block with its
+// disassembly, real arrowed edges, back-edges (loops) drawn dashed. No external libs (air-gap).
+function renderCFGGraph(blocks){
+  if(!blocks || !blocks.length) return `<div class="hint" style="padding:10px 12px">no CFG — run Decompile</div>`;
+  const byAddr={}; blocks.forEach(b=>byAddr[b.addr]=b);
+  const rank={}, q=[blocks[0].addr]; rank[blocks[0].addr]=0;   // BFS ranks from the entry block
+  while(q.length){ const a=q.shift(), b=byAddr[a]; if(!b) continue;
+    (b.succ||[]).forEach(s=>{ if(byAddr[s] && rank[s]===undefined){ rank[s]=rank[a]+1; q.push(s); } }); }
+  let maxr=0; Object.values(rank).forEach(r=>maxr=Math.max(maxr,r));
+  blocks.forEach(b=>{ if(rank[b.addr]===undefined) rank[b.addr]=++maxr; });   // unreachable -> tail
+  const rows={}; blocks.forEach(b=>{ (rows[rank[b.addr]]=rows[rank[b.addr]]||[]).push(b); });
+  const ranks=Object.keys(rows).map(Number).sort((a,b)=>a-b);
+  const boxW=176, lineH=12, headH=15, pad=6, maxLines=7, gapX=28, gapY=32;
+  const nins=b=>(b.instructions||[]).length;
+  const boxH=b=>headH+pad+Math.min(nins(b),maxLines)*lineH+(nins(b)>maxLines?lineH:0)+pad;
+  const pos={}; let y=12, maxW=boxW;
+  ranks.forEach(r=>{ const row=rows[r]; maxW=Math.max(maxW,row.length*(boxW+gapX)-gapX);
+    let hmax=0; row.forEach(b=>hmax=Math.max(hmax,boxH(b)));
+    row.forEach((b,i)=>pos[b.addr]={x:i*(boxW+gapX),y:y,w:boxW,h:boxH(b)}); y+=hmax+gapY; });
+  const W=maxW+24, H=y;
+  ranks.forEach(r=>{ const row=rows[r], rowW=row.length*(boxW+gapX)-gapX, off=(W-24-rowW)/2+12;
+    row.forEach(b=>pos[b.addr].x+=off); });
+  const edges=[]; blocks.forEach(b=>(b.succ||[]).forEach(s=>{ const sp=pos[b.addr], dp=pos[s]; if(!dp) return;
+    const x1=sp.x+sp.w/2, y1=sp.y+sp.h, x2=dp.x+dp.w/2, y2=dp.y, back=rank[s]<=rank[b.addr];
+    if(back){ const mx=Math.max(sp.x+sp.w,dp.x+dp.w)+34;
+      edges.push(`<path d="M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}" class="cfgedge back" marker-end="url(#cfgar)"/>`); }
+    else edges.push(`<path d="M${x1},${y1} C${x1},${(y1+y2)/2} ${x2},${(y1+y2)/2} ${x2},${y2}" class="cfgedge" marker-end="url(#cfgar)"/>`);
+  }));
+  const boxes=blocks.map(b=>{ const p=pos[b.addr];
+    const ins=(b.instructions||[]).slice(0,maxLines).map((i,j)=>
+      `<text x="${p.x+pad}" y="${p.y+headH+lineH*(j+1)}" class="cfgins">${esc((i.text||'').slice(0,28))}</text>`).join('');
+    const more=nins(b)>maxLines?`<text x="${p.x+pad}" y="${p.y+headH+lineH*(maxLines+1)}" class="cfgins dim">…${nins(b)-maxLines} more</text>`:'';
+    return `<g class="cfgnode"><rect x="${p.x}" y="${p.y}" width="${p.w}" height="${p.h}" rx="6"/>`+
+      `<text x="${p.x+pad}" y="${p.y+11}" class="cfghdr">${esc(b.addr)}</text>${ins}${more}</g>`;
+  }).join('');
+  return `<svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" class="cfgsvg">`+
+    `<defs><marker id="cfgar" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" class="cfgarh"/></marker></defs>`+
+    edges.join('')+boxes+`</svg>`;
+}
+function renderCFG(blocks){
+  return blocks.map(b=>{
+    const succ = (b.succ&&b.succ.length) ? "   -> "+b.succ.join(", ") : "";
+    const insns = (b.instructions||[]).map(i=>{
+      const pc = (i.pcode||[]).map(p=>"          "+p).join("\n");
+      return "  "+i.addr+"  "+esc(i.text)+(pc?"\n"+pc:"");
+    }).join("\n");
+    return `[block ${b.addr}]${succ}\n${insns}`;
+  }).join("\n\n");
+}
+
+// ---- events ----
+function openWS(id){
+  if(WS){ try{WS.close();}catch(e){} }
+  document.getElementById("log").innerHTML="";
+  WS = new WebSocket(`ws://${location.host}/events?case_id=${id}`);
+  WS.onmessage = ev=>{
+    let e; try{e=JSON.parse(ev.data);}catch(_){return;}
+    logline(e.type, e.run_id?e.run_id.slice(0,8):"", e.payload, e.ts);
+    // ---- live progress bars (run rows + fuzz metrics) ----
+    if(e.type==="job.progress" && e.run_id){
+      PROG[e.run_id]={pct:(e.payload&&e.payload.pct!=null)?e.payload.pct:null, msg:(e.payload&&e.payload.msg)||"working"};
+      updateRunBar(e.run_id);
+    }
+    if(/\.(progress)$/.test(e.type||"") && e.run_id && e.payload && e.payload.execs!=null){
+      const L=FUZZ_LIVE[e.run_id]||(FUZZ_LIVE[e.run_id]={execs:0,crashes:0,unique:0,max:null});
+      L.execs=e.payload.execs; L.crashes=e.payload.crashes!=null?e.payload.crashes:L.crashes;
+      L.unique=e.payload.unique!=null?e.payload.unique:L.unique;
+      updateRunBar(e.run_id);
+      updateFuzzMetrics(L, {status:`${L.stage||'fuzz'}: running`});
+    }
+    if(e.type==="coverage.start"){ updateFuzzMetrics(null,{status:"AFL++ starting (qemu-mode)…"}); }
+    if(e.type==="coverage.harvest" && e.payload){ updateFuzzMetrics({crashes:e.payload.crash_inputs},{status:"AFL++: harvesting crashes"}); }
+    if(["job.done","job.error"].includes(e.type) && e.run_id){
+      const L=FUZZ_LIVE[e.run_id];
+      if(L) updateFuzzMetrics(L,{done:true,status:(e.type==="job.error"?"error":"done")});
+      delete FUZZ_LIVE[e.run_id]; delete PROG[e.run_id];
+    }
+    if(["job.done","job.error","triage.done","job.cachehit","job.started"].includes(e.type)) refresh();
+    if(e.type==="re.done" && DETAIL_TID){
+      loadFunctions(DETAIL_TID);
+      const ds=document.getElementById("decostat"); if(ds) ds.textContent="done: "+((e.payload&&e.payload.functions)||0)+" functions";
+    }
+    if(e.type==="findings.done" && DETAIL_TID){ loadFindings(DETAIL_TID); }
+    if(e.type==="cve.done" && DETAIL_TID){
+      const st=document.getElementById("cvestat");
+      if(st&&e.payload) st.textContent = (e.payload.components||[]).length
+        ? `${e.payload.components.map(c=>c.library+" "+c.version).join(", ")} → ${e.payload.findings} CVE(s)`
+        : (e.payload.note||"no component banners found");
+      loadFindings(DETAIL_TID);
+    }
+    if(e.type==="dynamic.done" && DETAIL_TID){ loadDyn(DETAIL_TID); loadFindings(DETAIL_TID); }
+    if(e.type==="fuzz.progress"){ const st=document.getElementById("fuzzstat"); if(st&&e.payload) st.textContent=`${e.payload.execs} execs · ${e.payload.crashes} crashes`; }
+    if(e.type==="coverage.harvest"){ const st=document.getElementById("fuzzstat"); if(st&&e.payload) st.textContent=`AFL++: ${e.payload.crash_inputs} crash inputs`; }
+    if(e.type==="directed.start"){ const st=document.getElementById("fuzzstat"); if(st&&e.payload) st.textContent = e.payload.directed ? `directed → ${e.payload.top_target} (${e.payload.dictionary} toks)` : "directed: no static targets"; }
+    if(e.type==="concolic.start"){ const st=document.getElementById("fuzzstat"); if(st&&e.payload) st.textContent=`concolic → ${e.payload.targets.length} target(s), ${e.payload.seeds} seeds`; }
+    if(e.type==="concolic.explored"){ const st=document.getElementById("fuzzstat"); if(st&&e.payload) st.textContent=`concolic reached ${e.payload.reached.length}, ${e.payload.generated} inputs`; }
+    if(e.type==="concolic.done" && DETAIL_TID){
+      const st=document.getElementById("fuzzstat"); if(st&&e.payload) st.textContent=`concolic done: ${e.payload.confirmed} crashes · ${e.payload.corroborated} corroborated · ${e.payload.new_seeds} seeds`;
+      loadDyn(DETAIL_TID); loadFindings(DETAIL_TID);
+    }
+    if(e.type==="directed.done" && DETAIL_TID){
+      const st=document.getElementById("fuzzstat"); if(st&&e.payload) st.textContent=`directed done: ${e.payload.execs} execs · ${e.payload.unique} unique`;
+      if(e.payload) updateFuzzMetrics(e.payload,{done:true,status:"directed done"});
+      loadDyn(DETAIL_TID); loadFindings(DETAIL_TID);
+    }
+    if(e.type==="coverage.done" && DETAIL_TID){
+      const st=document.getElementById("fuzzstat"); if(st&&e.payload) st.textContent=`AFL++ done: ${e.payload.confirmed} confirmed · ${e.payload.unique} unique`;
+      if(e.payload) updateFuzzMetrics({crashes:e.payload.crash_inputs,unique:e.payload.unique},
+        {done:true,extra:e.payload.confirmed,extraLabel:"confirmed",status:"AFL++ done"});
+      loadDyn(DETAIL_TID); loadFindings(DETAIL_TID);
+    }
+    if(e.type==="fuzz.done" && DETAIL_TID){
+      const st=document.getElementById("fuzzstat"); if(st&&e.payload) st.textContent=`done: ${e.payload.execs} execs · ${e.payload.unique} unique`;
+      if(e.payload) updateFuzzMetrics(e.payload,{done:true,status:"black-box done"});
+      loadDyn(DETAIL_TID); loadFindings(DETAIL_TID);
+    }
+    if(e.type==="firmware_rehost.done"){
+      const st=document.getElementById("decostat");
+      if(st&&e.payload) st.textContent = e.payload.supported===false ? ("rehost: "+(e.payload.note||"unsupported"))
+        : `rehosted: ${e.payload.coverage||0} blocks`+(e.payload.crash?` · CRASH ${e.payload.cwe||''}`:` · ${e.payload.iters||0} iters`);
+      if(DETAIL_TID) loadFindings(DETAIL_TID);
+    }
+    if(e.type==="firmware.done"){
+      const st=document.getElementById("decostat");
+      if(st&&e.payload) st.textContent = `carved ${e.payload.components} component(s), ${e.payload.signatures} signature(s)`
+        + (e.payload.arch?` · ${e.payload.arch} @ ${e.payload.base_addr?('0x'+Number(e.payload.base_addr).toString(16)):'?'}`:'')
+        + (e.payload.keys?` · ${e.payload.keys} key(s)`:'');
+      refresh(); if(DETAIL_TID) loadFindings(DETAIL_TID);
+    }
+    if(e.type==="multidebug.done" && DETAIL_TID){
+      const st=document.getElementById("fuzzstat");
+      if(st&&e.payload) st.textContent = e.payload.supported===false ? ("multi-debug: "+(e.payload.note||"unsupported"))
+        : (e.payload.blame ? ("multi-debug: "+e.payload.blame).slice(0,100) : (e.payload.note||"no fault"));
+      loadFindings(DETAIL_TID);
+    }
+    if(e.type==="rootcause.done" && DETAIL_TID){
+      const st=document.getElementById("fuzzstat");
+      if(st&&e.payload){ const ex=e.payload.exploitability?` [${e.payload.exploitability}]`:"";
+        st.textContent = e.payload.summary ? ("root cause"+ex+": "+e.payload.summary).slice(0,100) : (e.payload.note||"no fault reproduced"); }
+      loadFindings(DETAIL_TID);
+    }
+    if(e.type==="exploit.done" && DETAIL_TID){
+      const st=document.getElementById("fuzzstat");
+      if(st&&e.payload){ st.textContent = e.payload.supported===false ? ("L3: "+(e.payload.note||"unsupported"))
+        : (e.payload.confirmed ? `L3 CONFIRMED: ret2win → ${esc(e.payload.win||'')} @ offset ${e.payload.offset}`
+           : `L3: ${esc(e.payload.win||'win')} not reached (${esc(e.payload.note||'')})`.slice(0,110)); }
+      loadPocs(DETAIL_TID); loadFindings(DETAIL_TID);
+    }
+    if(e.type==="primitive.done" && DETAIL_TID){
+      const st=document.getElementById("fuzzstat");
+      if(st&&e.payload){ st.textContent = e.payload.confirmed
+        ? `L2 CONFIRMED: ${e.payload.primitive} @ offset ${e.payload.offset}`
+        : (e.payload.primitive ? `L2: ${e.payload.primitive} (unconfirmed)` : (e.payload.note||"no L2 primitive")); }
+      loadPocs(DETAIL_TID); loadFindings(DETAIL_TID);
+    }
+    if(e.type==="harness.start"){ const st=document.getElementById("fuzzstat"); if(st&&e.payload) st.textContent = e.payload.error?("boundary: "+e.payload.error):`boundary → ${esc(e.payload.family)} ${esc(e.payload.key)}`; }
+    if(e.type==="harness.progress"){ const st=document.getElementById("fuzzstat"); if(st&&e.payload) st.textContent=`boundary: ${e.payload.execs} execs · ${e.payload.crashes} crashes`; }
+    if(e.type==="harness.done" && DETAIL_TID){ const st=document.getElementById("fuzzstat"); if(st&&e.payload) st.textContent = e.payload.error?("boundary: "+e.payload.error):`boundary done: ${e.payload.execs} execs · ${e.payload.unique} unique`; loadDyn(DETAIL_TID); loadFindings(DETAIL_TID); }
+    if(e.type==="poc.done" && DETAIL_TID){ loadPocs(DETAIL_TID); loadFindings(DETAIL_TID); }
+    if(e.type==="monitor.done" && DETAIL_TID){
+      const st=document.getElementById("fuzzstat");
+      if(st&&e.payload) st.textContent = !e.payload.ok ? (e.payload.note||"monitor unavailable")
+        : `monitor: ${e.payload.calls||0} dangerous call(s), ${e.payload.findings||0} finding(s)`;
+      loadFindings(DETAIL_TID);
+    }
+    if(e.type==="heap.done" && DETAIL_TID){
+      const st=document.getElementById("fuzzstat");
+      if(st&&e.payload) st.textContent = !e.payload.ok ? (e.payload.note||"heap check unavailable")
+        : (e.payload.errors ? `heap: ${e.payload.findings} finding(s) — ${(e.payload.kinds||[]).join(', ')}`
+           : (e.payload.note||"no heap errors on this input"));
+      loadFindings(DETAIL_TID);
+    }
+    if(e.type==="secrets.done" && DETAIL_TID){
+      const st=document.getElementById("fuzzstat");
+      if(st&&e.payload) st.textContent = !e.payload.ok ? (e.payload.note||"extraction unavailable")
+        : (e.payload.findings ? `recovered ${e.payload.findings} constant(s): `+(e.payload.recovered||[]).slice(0,3).map(r=>JSON.stringify(r.value)).join(', ')
+           : (e.payload.note||"no comparisons observed"));
+      loadFindings(DETAIL_TID);
+    }
+    if(e.type==="inject.done" && DETAIL_TID){
+      const st=document.getElementById("fuzzstat");
+      if(st&&e.payload) st.textContent = e.payload.confirmed
+        ? `injection CONFIRMED: `+(e.payload.results||[]).map(r=>r.cwe+" via "+r.mode).join(", ")
+        : (e.payload.note||"no injection confirmed");
+      loadFindings(DETAIL_TID); loadPocs(DETAIL_TID);
+    }
+    if(e.type==="behavior.done" && DETAIL_TID){
+      const st=document.getElementById("fuzzstat"); const iv=e.payload&&e.payload.inventory;
+      if(st) st.textContent = !e.payload||!e.payload.ok ? ((e.payload&&e.payload.note)||"behavior trace unavailable")
+        : `behavior: ${e.payload.syscalls} syscalls -- exec ${iv.exec.length}, net ${iv.network.length}${iv.anti_debug?", anti-debug":""}${iv.wx?", W^X":""}`;
+      loadFindings(DETAIL_TID);
+    }
+    if(e.type==="taint.done" && DETAIL_TID){
+      const st=document.getElementById("fuzzstat");
+      if(st) st.textContent = !e.payload||!e.payload.ok ? ((e.payload&&e.payload.note)||"taint unavailable")
+        : (e.payload.findings ? `dynamic taint: ${e.payload.findings} confirmed input→sink flow(s) — `
+             + (e.payload.flows||[]).map(f=>`${esc(f.sink)}(${f.cwe})`).join(", ")
+           : "no input→sink flow confirmed (marker did not reach a monitored sink)");
+      loadFindings(DETAIL_TID);
+    }
+    if(e.type==="secret.done" && DETAIL_TID){
+      const st=document.getElementById("fuzzstat");
+      if(st) st.textContent = !e.payload||!e.payload.ok ? ((e.payload&&e.payload.note)||"secret PoC unavailable")
+        : (e.payload.packaged ? `packaged ${e.payload.packaged} hard-coded secret(s) → verified L0-secret PoC — `
+             + (e.payload.secrets||[]).map(s=>`${esc(s.title||s.cwe)}`).join(", ")
+           : (e.payload.note||"no hard-coded secrets to package"));
+      loadFindings(DETAIL_TID); loadPocs(DETAIL_TID);
+    }
+    if(e.type==="synth.start"){ const st=document.getElementById("fuzzstat"); if(st&&e.payload) st.textContent=`synthesizing from ${e.payload.candidates.length} recovered buffer(s)…`; }
+    if(e.type==="synth.done" && DETAIL_TID){
+      const st=document.getElementById("fuzzstat");
+      if(st&&e.payload) st.textContent = !e.payload.ok ? (e.payload.note||"no frame")
+        : (e.payload.crashed ? `synthesized crash: ${esc(e.payload.buffer||'')} overflow @ offset ${e.payload.offset} (${esc(e.payload.mode||'')}) → ${esc(e.payload.level||'L1')}`
+           : `no crash from ${e.payload.tried} synthesized inputs (buffer not reached directly)`);
+      loadDyn(DETAIL_TID); loadFindings(DETAIL_TID); loadPocs(DETAIL_TID);
+    }
+    if((e.type==="cross_taint.done"||e.type==="link.done"||e.type==="ipc_model.done"||e.type==="system.done") && BOARD_VIEW==="sysmap"){ loadSystemMap(false); }
+    if(e.type==="cross_taint.done" && e.payload){ logline("xtaint","",`${e.payload.cross_findings} cross-component finding(s)`); }
+    if(e.type==="ipc_model.done" && e.payload){ logline("ipc","",`${e.payload.ipc_edges} channel edge(s), ${e.payload.cross_findings} candidate(s)`); }
+    if(e.type==="system.start" && e.payload){ logline("detonate","",e.payload.error?("system: "+e.payload.error):`entry ${esc(e.payload.entry||'')} → ${(e.payload.services||[]).join(', ')}`); }
+    if(e.type==="system.progress" && e.payload){ logline("detonate","",`${e.payload.execs} detonations · ${e.payload.cross_boundary} cross-boundary`); }
+    if(e.type==="system.done" && e.payload){ logline("detonate","",e.payload.error?("system: "+e.payload.error):`done: ${e.payload.cross_boundary||e.payload.crashes||0} cross-boundary crash(es)`); }
+  };
+  WS.onclose = ()=> logline("ws","","disconnected");
+}
+function fmtClock(ts){
+  const d = ts ? new Date(ts*1000) : new Date();
+  return d.toTimeString().slice(0,8);   // HH:MM:SS (local)
+}
+function fmtAgo(ts){
+  if(!ts) return "";
+  const s=Math.max(0,Math.floor(Date.now()/1000-ts));
+  if(s<60) return s+"s ago"; if(s<3600) return Math.floor(s/60)+"m ago";
+  if(s<86400) return Math.floor(s/3600)+"h ago"; return Math.floor(s/86400)+"d ago";
+}
+function logLevel(type,payload){
+  if(/\.error$|error|fail/i.test(type)) return "err";
+  if(type==="job.error") return "err";
+  if(/crash|\.hijack|confirmed/i.test(type)) return "hit";
+  if(payload && (payload.crashed || payload.crashes>0 || payload.confirmed>0)) return "hit";
+  if(/warn|timeout|advisory|cachehit/i.test(type)) return "warn";
+  if(/\.done$|complete/i.test(type)) return "ok";
+  return "";
+}
+function fmtPayload(payload){
+  if(!payload || typeof payload!=="object") return payload?esc(String(payload)):"";
+  const parts=[];
+  for(const [k,v] of Object.entries(payload)){
+    if(v===null||v===undefined||v==="") continue;
+    let val = Array.isArray(v) ? `[${v.length}]` : (typeof v==="object" ? JSON.stringify(v) : String(v));
+    if(val.length>60) val=val.slice(0,57)+"…";
+    parts.push(`<span class="kvp">${esc(k)}=<b>${esc(val)}</b></span>`);
+  }
+  return parts.join(" ");
+}
+let _lastLogStage=null;
+function logSeparator(label){
+  const el=document.getElementById("log"); if(!el) return;
+  const s=document.createElement("div"); s.className="logsep"; s.innerHTML=`<span>${esc(label)}</span>`;
+  el.appendChild(s);
+}
+function logline(type, run="", payload="", ts){
+  const el=document.getElementById("log"); if(!el) return;
+  // group by stage: a "job.queued/…" for a new run drops a light divider
+  const stage=(type||"").split(".")[0];
+  if(type==="job.queued" && stage!==_lastLogStage){ /* new job block */ }
+  const lv=logLevel(type,payload);
+  const d=document.createElement("div"); d.className="logline"+(lv?` lv-${lv}`:"");
+  d.innerHTML = `<span class="lt">${fmtClock(ts)}</span> <span class="t">${esc(type)}</span> `
+    + `${run?`<span class="rid">${run}</span> `:""}${fmtPayload(payload)}`;
+  el.appendChild(d);
+  // keep the log bounded so long campaigns don't grow unboundedly
+  while(el.childElementCount>600) el.removeChild(el.firstChild);
+  el.scrollTop=el.scrollHeight;
+}
+// Escapes for BOTH text nodes and quoted attribute values: & < > and both quote styles
+// (plus backtick). A crafted symbol/string from an analysed binary can carry any of these, so
+// esc() must be safe wherever it is interpolated -- element text or `attr="${esc(x)}"`.
+function esc(s){ return String(s==null?"":s).replace(/[&<>"'`]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;","`":"&#96;"}[c])); }
+
+// ---- case import (rail) ----
+document.getElementById("impcase").onclick=()=>document.getElementById("impfilerail").click();
+document.getElementById("impfilerail").onchange=(e)=>doImportCase(e.target.files[0]);
+
+// ---- command palette + keyboard-first nav ----
+function dl(url){ const a=document.createElement("a"); a.href=url; a.download=""; document.body.appendChild(a); a.click(); a.remove(); }
+function ACTIONS(){ return [
+  {label:"New case", run:()=>document.getElementById("newcase").click()},
+  {label:"Import case archive…", run:()=>document.getElementById("impfilerail").click()},
+  ...(CUR?[
+    {label:"Open Workbench", hint:"1", run:()=>switchView("wb")},
+    {label:"Open Findings Board", hint:"2", run:()=>switchView("board")},
+    {label:"Open System Map", hint:"3", run:()=>switchView("sysmap")},
+    {label:"Open Report builder", hint:"4", run:()=>switchView("report")},
+    {label:"Resolve component links", run:()=>{switchView("sysmap");doResolveLinks();}},
+    {label:"Analyze cross-binary taint", run:()=>{switchView("sysmap");doCrossTaint();}},
+    {label:"Model IPC channels", run:()=>{switchView("sysmap");doModelIpc();}},
+    {label:"Detonate whole system", run:()=>{switchView("sysmap");doWholeSystem();}},
+    {label:"Open HTML report ↗", run:()=>window.open(reportURL("html",true),"_blank")},
+    {label:"Download PDF report", run:()=>dl(reportURL("pdf",true))},
+    {label:"Download SARIF export", run:()=>dl(reportURL("sarif",true))},
+    {label:"Download case JSON", run:()=>dl(reportURL("json",true))},
+    {label:"Export case (.tar.gz)", run:()=>dl(`/cases/${CUR}/export`)},
+    {label:"Refresh case", run:()=>refresh()},
+  ]:[]),
+  {label:"Toggle theme", run:()=>document.getElementById("theme").click()},
+];}
+let PAL_SEL=0, PAL_ITEMS=[];
+function openPalette(){
+  const p=document.getElementById("palette"); p.hidden=false;
+  const q=document.getElementById("palq"); q.value=""; PAL_SEL=0; renderPalette(""); q.focus();
+}
+function closePalette(){ document.getElementById("palette").hidden=true; }
+function renderPalette(term){
+  const all=ACTIONS(); term=(term||"").toLowerCase();
+  PAL_ITEMS=all.filter(a=>a.label.toLowerCase().includes(term));
+  if(PAL_SEL>=PAL_ITEMS.length) PAL_SEL=Math.max(0,PAL_ITEMS.length-1);
+  const list=document.getElementById("pallist");
+  list.innerHTML = PAL_ITEMS.length ? PAL_ITEMS.map((a,i)=>`<div class="palitem ${i===PAL_SEL?'sel':''}" data-i="${i}">
+    <span>${esc(a.label)}</span>${a.hint?`<span class="hint">${esc(a.hint)}</span>`:''}</div>`).join('')
+    : `<div class="palitem">No matching command</div>`;
+  list.querySelectorAll(".palitem[data-i]").forEach(el=>{
+    el.onclick=()=>{ const a=PAL_ITEMS[+el.dataset.i]; closePalette(); if(a) a.run(); };
+  });
+}
+document.getElementById("cmdk").onclick=openPalette;
+document.getElementById("palq").oninput=(e)=>{ PAL_SEL=0; renderPalette(e.target.value); };
+document.getElementById("palette").addEventListener("click",(e)=>{ if(e.target.id==="palette") closePalette(); });
+document.addEventListener("keydown",(e)=>{
+  const pal=document.getElementById("palette");
+  if((e.metaKey||e.ctrlKey) && e.key.toLowerCase()==="k"){ e.preventDefault(); pal.hidden?openPalette():closePalette(); return; }
+  if(!pal.hidden){
+    const q=document.getElementById("palq").value;
+    if(e.key==="Escape") closePalette();
+    else if(e.key==="ArrowDown"){ e.preventDefault(); PAL_SEL=Math.min(PAL_SEL+1,PAL_ITEMS.length-1); renderPalette(q); }
+    else if(e.key==="ArrowUp"){ e.preventDefault(); PAL_SEL=Math.max(PAL_SEL-1,0); renderPalette(q); }
+    else if(e.key==="Enter"){ e.preventDefault(); const a=PAL_ITEMS[PAL_SEL]; closePalette(); if(a) a.run(); }
+    return;
+  }
+  if(/^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName||"")) return;
+  if(CUR){
+    if(e.key==="1") switchView("wb");
+    else if(e.key==="2") switchView("board");
+    else if(e.key==="3") switchView("sysmap");
+    else if(e.key==="4") switchView("report");
+    else if(e.key==="/" && BOARD_VIEW==="board"){ e.preventDefault(); const q=document.getElementById("bq"); if(q) q.focus(); }
+  }
+});
+
+loadCases();
+</script>
+</body>
+</html>

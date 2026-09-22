@@ -96,6 +96,33 @@ def test_analyze_summary_mentions_class_and_cwe():
     assert "CWE-121" in rep["summary"] and rep["classification"]["cwe"] == "CWE-121"
 
 
+def test_parse_asan_report_maps_class_cwe_and_source():
+    """The source-code path aborts via ASan (a bare SIGABRT); the ASan report is what names the
+    real defect and its source line. Parsing must map each bug class to its CWE and recover the
+    file:line, so root_cause reports e.g. heap-buffer-overflow at uaf.c:4, not a generic abort."""
+    heap = ("=================================================================\n"
+            "==123==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x1 at pc 0x2\n"
+            "    #0 0x2 in strcpy (/x/a+0x84)\n"
+            "    #1 0x3 in main /tmp/build/heap_ovf.c:4\n"
+            "SUMMARY: AddressSanitizer: heap-buffer-overflow\n")
+    p = rootcause.parse_asan_report(heap)
+    assert p and p["cwe"] == "CWE-122" and p["class"] == "heap-buffer-overflow"
+    assert p["source"] == "heap_ovf.c:4"
+
+    uaf = ("==9==ERROR: AddressSanitizer: heap-use-after-free on address 0x1 at pc 0x2\n"
+           "    #1 0x3 in main /tmp/build/uaf.c:12\n")
+    pu = rootcause.parse_asan_report(uaf)
+    assert pu and pu["cwe"] == "CWE-416" and pu["source"] == "uaf.c:12"
+
+    stk = "==9==ERROR: AddressSanitizer: stack-buffer-overflow on address 0x1\n"
+    assert rootcause.parse_asan_report(stk)["cwe"] == "CWE-121"
+
+    # An ASan *setup* failure (what a too-small address-space limit produces) is not a bug report
+    # and must not be classified as a finding.
+    assert rootcause.parse_asan_report(
+        "==9==ERROR: AddressSanitizer failed to allocate 0xdfff0001000 bytes\n") is None
+
+
 # ------------------------------------------------------------------- integration
 @pytest.fixture
 def pool(store):
@@ -159,6 +186,44 @@ def test_root_cause_null_deref_end_to_end(store, case, pool, gcc, tmp_path):
     if not rc:
         pytest.skip("no fault captured")
     assert any(f.cwe == "CWE-476" for f in rc)
+
+
+_ASAN_UAF = (
+    "#include <unistd.h>\n#include <stdlib.h>\n#include <string.h>\n"
+    "int main(){char*b=malloc(32);char t[64];int n=read(0,t,63);"
+    "if(n<0)n=0;t[n]=0;free(b);if(n>3&&t[0]=='B')strcpy(b,t);return 0;}\n"
+)
+
+
+@pytest.mark.skipif(sandbox.host_arch() not in ("x86-64", "aarch64"),
+                    reason="root-cause capture is native-arch only")
+def test_root_cause_asan_source_reports_specific_cwe(store, case, pool, gcc, tmp_path):
+    """The source-code path compiles with ASan and aborts (SIGABRT) on a defect. A bare abort is
+    uninformative, so root_cause re-runs the input under the sanitizer and lets its report name
+    the real class and source line. It must land a SPECIFIC CWE (here use-after-free / CWE-416),
+    not the generic detected-corruption-abort. Guards two once-broken links: the missing
+    `import os` that silently swallowed the enrichment, and the RLIMIT_AS cap that stopped an
+    ASan build from even initialising in the sandbox."""
+    from lykos.analyze.ingest import ingest
+    src = tmp_path / "uaf.c"; src.write_text(_ASAN_UAF)
+    try:
+        target = ingest(store, case.id, src, filename="uaf.c")
+    except Exception as e:                                      # no libasan on this host
+        pytest.skip("asan source build unavailable: %r" % e)
+    sha, _, _ = store.content.put_bytes(b"B" + b"C" * 60)       # >3 bytes, 'B' -> reaches the UAF
+    q = JobQueue(store.conn)
+    run = enqueue_root_cause(q, target, params={"input_sha": sha, "input_mode": "stdin",
+                                                "timeout": 8})
+    assert pool.wait_idle(60)
+    rec = q.runs.get(run.id)
+    if rec.status != "done":
+        pytest.skip("ptrace unavailable: " + str(rec.error))
+    rc = [f for f in FindingDAO(store.conn).list_by_target(target.id)
+          if any(e.get("channel") == "root-cause" for e in (f.evidence or []))]
+    if not rc:
+        pytest.skip("input did not fault under the debugger in this environment")
+    assert any(f.cwe == "CWE-416" for f in rc), \
+        "expected sanitizer-enriched use-after-free (CWE-416), got %r" % [f.cwe for f in rc]
 
 
 def test_root_cause_cross_arch_unsupported(store, case, pool, gcc, tmp_path, monkeypatch):

@@ -30,9 +30,21 @@ _SIG_CWE = {
 }
 
 
+# Signals whose faulting PC is NOT a stable defect discriminator, so the crash is bucketed by
+# signal alone. A SIGABRT is raised by a runtime CHECK (glibc malloc/free consistency, a stack
+# canary, _FORTIFY_SOURCE, an assert, ASan/UBSan) -- the PC sits in the check/abort machinery
+# (often libc, outside the image, so it reads back as a randomized image-relative offset under
+# ASLR), never at the defect. Keying an abort by that PC split ONE double-free into 47 findings.
+# The defect is instead identified by root_cause (its class / source line), which relabels the
+# single crash finding authoritatively.
+_SIGNAL_ONLY_BUCKET = frozenset({"SIGABRT"})
+
+
 def crash_dedup_key(signal_name, fault_pc=None) -> str:
     """The bucket a crash belongs to. Every stage that files one must agree, or a verified PoC
     opens a second finding beside the crash it just proved."""
+    if signal_name in _SIGNAL_ONLY_BUCKET:
+        return f"dynamic-crash:{signal_name}"
     return (f"dynamic-crash:{signal_name}:{fault_pc:x}" if fault_pc
             else f"dynamic-crash:{signal_name}")
 

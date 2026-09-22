@@ -121,7 +121,8 @@ def test_for_target_puts_the_recommended_step_first():
 
 
 # ---- the page itself ----------------------------------------------------------------------
-_HTML = pathlib.Path(__file__).resolve().parents[1] / "core/lykos/api/static/index.html"
+# The classic single-file workbench (now classic.html); these assert its inline markup.
+_HTML = pathlib.Path(__file__).resolve().parents[1] / "core/lykos/api/static/classic.html"
 
 
 def test_the_workbench_is_fed_find_prove():

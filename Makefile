@@ -2,10 +2,10 @@
 PY ?= python3
 export PYTHONPATH := core
 
-.PHONY: doctor toolchain-bundle test coverage lint typecheck gui ci bundle verify run eval eval-gate arch-gate real-gate dashboard release clean help
+.PHONY: doctor toolchain-bundle repo-tarball runnable container test coverage lint typecheck gui ci bundle verify run eval eval-gate arch-gate real-gate dashboard release clean help
 
 help:
-	@echo "targets: doctor toolchain-bundle test coverage lint typecheck gui ci bundle verify run eval eval-gate arch-gate dashboard release clean"
+	@echo "targets: doctor toolchain-bundle repo-tarball test coverage lint typecheck gui ci bundle verify run eval eval-gate arch-gate dashboard release clean"
 
 # What this host can and cannot do, and the install line for anything missing. On an
 # air-gapped workstation there is no package manager to ask, and "the stage declined" is a
@@ -16,6 +16,25 @@ doctor:
 # Build the air-gap toolchain bundle (run on a CONNECTED machine). See docs/23.
 toolchain-bundle:
 	bash packaging/collect-toolchain.sh
+
+# Package the repo itself for sneakernet to the air-gapped side: tracked files at HEAD, no
+# .git history, no build artifacts. The companion to toolchain-bundle. See docs/23.
+repo-tarball:
+	git archive --format=tar.gz --prefix=lykos/ -o dist/lykos-repo.tar.gz HEAD
+	cd dist && sha256sum lykos-repo.tar.gz > lykos-repo.tar.gz.sha256
+	@echo "built dist/lykos-repo.tar.gz (+ its sha256)"
+
+# The single unzip-and-run air-gap package: one .zip = repo + a fully-populated vendor/ (every
+# tool extracted, pypcode vendored, relocatable wrappers). Unzip on the laptop and run -- no
+# install, nothing placed in system dirs. Needs `make toolchain-bundle` first. See docs/23.
+runnable:
+	bash packaging/make-runnable.sh
+
+# Build the self-contained CONTAINER image + save it as an air-gap tarball (run on a CONNECTED
+# machine with podman/docker). The most portable distribution: it carries its own libc/Python/
+# tools, so it runs on any laptop distro. See docs/23.
+container:
+	bash packaging/build-container.sh
 
 test:
 	$(PY) -m pytest tests/ -q

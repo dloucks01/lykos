@@ -45,6 +45,24 @@ _SPAN_CAP = 32 << 20            # refuse to slurp a span so wide it is cheaper p
 # the per-input deadline alone does not stop it because each stop is ready immediately and the
 # wait loop that checks the clock never runs. Cap how many we forward, then treat it as a hang.
 _MAX_DELIVER = 4096
+# Resident-memory cap (MB) for a sanitizer target, since it CANNOT take an RLIMIT_AS cap.
+_SAN_RSS_MB = 4096
+
+
+def _is_sanitizer(exe) -> bool:
+    """True if the ELF at `exe` is an ASan/UBSan build. A sanitizer runtime reserves a ~20TB
+    *virtual* shadow region at startup; under an RLIMIT_AS cap that mmap fails and the process
+    aborts BEFORE main() -- so every input reads as a spurious SIGABRT and no block is ever
+    reached. Such a build must run without the AS cap (resident memory is bounded instead). This
+    is the stdlib-only twin of sandbox._is_sanitizer_exe: batch_runner is spawned as a bare
+    `python3 batch_runner.py` subprocess and cannot import the package. Cheap byte-scan for the
+    runtime's marker symbol; matches aflpp.is_sanitizer_build."""
+    try:
+        with open(exe, "rb") as fh:
+            data = fh.read()
+    except OSError:
+        return False
+    return b"__asan_init" in data or b"__asan_report" in data or b"__ubsan_handle" in data
 
 
 def _readn(n):
@@ -187,7 +205,7 @@ def _arm(libc, pid, mem, base, blocks, plan):
     return original
 
 
-def _trace_one(libc, argv, stdin_data, timeout, blocks, exe, plan=None):
+def _trace_one(libc, argv, stdin_data, timeout, blocks, exe, plan=None, sanitizer=False):
     """Run one input under ptrace. Returns (rc, out, err, flags, reached, fault_pc)."""
     r_out, w_out = os.pipe()
     r_err, w_err = os.pipe()
@@ -199,13 +217,25 @@ def _trace_one(libc, argv, stdin_data, timeout, blocks, exe, plan=None):
                 import resource
                 # Bound each input's memory and disk writes. The batch path runs native targets
                 # directly, so per-exec RLIMIT_AS is the only place a memory bomb is capped
-                # (the shared runner cannot set it without capping itself).
-                lim = 4096 << 20
-                resource.setrlimit(resource.RLIMIT_AS, (lim, lim))
+                # (the shared runner cannot set it without capping itself). A SANITIZER build is
+                # the exception: ASan reserves a ~20TB virtual shadow at startup, so an AS cap
+                # makes it abort before main() -- every input a spurious crash, zero coverage.
+                # Bound its RESIDENT memory via ASAN_OPTIONS=hard_rss_limit_mb instead (set below,
+                # pre-execv), which is what actually consumes host RAM.
+                if not sanitizer:
+                    lim = 4096 << 20
+                    resource.setrlimit(resource.RLIMIT_AS, (lim, lim))
                 resource.setrlimit(resource.RLIMIT_FSIZE, (64 << 20, 64 << 20))
                 resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
             except Exception:
                 pass
+            if sanitizer:
+                # No AS cap for this build, so bound resident memory the ASan way. Merge, don't
+                # clobber: the caller sets abort_on_error=1 so the fuzzer catches the crash.
+                opts = os.environ.get("ASAN_OPTIONS", "")
+                if "hard_rss_limit_mb" not in opts:
+                    os.environ["ASAN_OPTIONS"] = (opts + ":" if opts else "") \
+                        + "hard_rss_limit_mb=%d" % _SAN_RSS_MB
             libc.ptrace(PTRACE_TRACEME, 0, 0, 0)
             os.dup2(r_in, 0); os.dup2(w_out, 1); os.dup2(w_err, 2)
             for fd in (r_out, w_out, r_err, w_err, r_in, w_in):
@@ -352,6 +382,7 @@ def main():
     per_timeout = float(sys.argv[2])
     exe = sys.argv[3]
     base_argv = sys.argv[4:]
+    sanitizer = _is_sanitizer(exe)          # decide once; an AS cap would abort it before main()
     wf = "/tmp/lykos-fuzz-input.bin"        # fixed: a per-batch name leaked into diagnostics
     (count, n_blocks) = struct.unpack("<II", _readn(8))
     blocks = list(struct.unpack("<%dQ" % n_blocks, _readn(8 * n_blocks))) if n_blocks else []
@@ -385,7 +416,7 @@ def main():
         reached, fault_pc = [], 0
         if blocks:
             rc, so, se, flags, reached, fault_pc = _trace_one(libc, argv, stdin, per_timeout,
-                                                              blocks, exe, plan)
+                                                              blocks, exe, plan, sanitizer)
         else:
             try:
                 pr = subprocess.run(argv, input=stdin, stdout=subprocess.PIPE,

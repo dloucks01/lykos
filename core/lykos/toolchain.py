@@ -80,6 +80,24 @@ def _probe_ghidra():
     return str(p) if p else None
 
 
+def _probe_rizin():
+    """The native RE backend CLI (rizin, else radare2). This is the default decompiler now."""
+    from .analyze.native_re import locate_native
+    p = locate_native()
+    return str(p) if p else None
+
+
+def _probe_pypcode():
+    """pypcode = Ghidra's SLEIGH lifter as a Python module (no JVM). Emits the P-Code IR the
+    memory-safety detectors parse. Bundled under vendor/pysite and put on sys.path by
+    vendorenv, so `import pypcode` resolves in-place on the air-gapped host."""
+    try:
+        import pypcode
+        return f"pypcode {getattr(pypcode, '__version__', '?')}"
+    except Exception:
+        return None
+
+
 def _bundle_ghidra():
     """Ghidra's install root. `<root>/support/analyzeHeadless` is what the locator returns,
     and the locator already searches /opt/ghidra* and <repo>/vendor/ghidra -- so a copy placed
@@ -265,12 +283,24 @@ TOOLS: tuple = (
          "RUNS, which is the problem -- this is the one degradation you do not want silent "
          "when the binary is hostile",
          "apt-get install bubblewrap", _probe_bwrap, tier="required", apt=("bubblewrap",)),
-    Tool("ghidra", "Ghidra (headless)",
-         "disassemble, and everything downstream: detect_cwe, taint, bounds, directed fuzzing",
-         "the whole static half. Fuzzing still finds crashes; nothing explains one",
-         "apt-get install ghidra (Kali), or unpack a release into /opt and set LYKOS_GHIDRA",
-         _probe_ghidra, tier="required", apt=("ghidra", "default-jdk"),
-         bundle=_bundle_ghidra),
+    Tool("rizin", "rizin + rz-ghidra (native RE)",
+         "the DEFAULT disassemble/decompile backend: CFG, xrefs, decompiled C -- no JVM",
+         "no native RE backend; disassembly falls back to Ghidra only if it is present",
+         "apt-get install rizin rz-ghidra", _probe_rizin, tier="required",
+         apt=("rizin", "rz-ghidra")),
+    Tool("pypcode", "pypcode (Ghidra P-Code, no JVM)",
+         "the Ghidra P-Code IR the taint/bounds/int-overflow detectors consume",
+         "the native backend still decompiles, but P-Code-based memory-safety detection degrades",
+         "vendored: pip install pypcode (bundled under vendor/pysite, added to sys.path)",
+         _probe_pypcode, tier="required"),
+    Tool("ghidra", "Ghidra (headless) -- optional, not bundled",
+         "an alternative RE backend with stronger auto-analysis on some stripped/optimized "
+         "binaries; rizin/rz-ghidra + pypcode is the bundled default and covers the common case",
+         "nothing in the bundle: the native rizin backend is used. Install Ghidra separately "
+         "only if a hard binary analyses poorly, then LYKOS_DECOMPILER=ghidra",
+         "apt-get install ghidra (Kali), or unpack a release into /opt and set LYKOS_GHIDRA; "
+         "then LYKOS_DECOMPILER=ghidra. Not shipped in the air-gap bundle (replaced by rizin)",
+         _probe_ghidra, tier="optional"),
     Tool("qemu", "qemu-user", "executing any non-host-architecture binary",
          "cross-architecture targets cannot run at all -- static analysis only",
          "apt-get install qemu-user qemu-user-binfmt",
@@ -338,7 +368,7 @@ def survey() -> list:
         except Exception as e:                          # noqa: BLE001
             got = None
             t = Tool(t.key, t.title, t.unlocks, f"probe failed: {e!r}", t.install, t.probe,
-                     t.tier, t.apt)
+                     tier=t.tier, apt=t.apt)
         out.append((t, got))
     return out
 
@@ -349,12 +379,8 @@ def missing(tier: Optional[str] = None) -> list:
 
 
 def bundle_paths() -> list:
-    """[(key, [paths])] for every tool that ships as a directory copy rather than a deb.
-
-    Ghidra is the reason this exists: it is a REQUIRED tool and it is not apt-installable
-    outside Kali, so a bundle built from the package list alone would arrive without the
-    single most important engine and nothing would say so until the first disassemble.
-    """
+    """[(key, [paths])] for every tool that ships as a directory copy rather than a deb
+    (currently SymQEMU; Ghidra is no longer bundled -- rizin/rz-ghidra + pypcode replaced it)."""
     out = []
     for t in TOOLS:
         if not t.bundle:
@@ -374,7 +400,9 @@ def bundle_paths() -> list:
 
 
 def apt_packages() -> list:
-    """Every deb the air-gap collector should pull, deduplicated and sorted."""
+    """Every deb the air-gap collector should pull, deduplicated and sorted. ONE build with all
+    capabilities. rizin/rz-ghidra + pypcode replaced Ghidra as the RE backend (Ghidra carries no
+    apt here), so it is the only thing not pulled; everything else the platform uses is."""
     out: set = set()
     for t in TOOLS:
         out.update(t.apt)

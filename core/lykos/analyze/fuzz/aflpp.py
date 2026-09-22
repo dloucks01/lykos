@@ -151,8 +151,19 @@ def stage_qemu_trace(trace: Path, workdir) -> str:
     return str(d)
 
 
+def is_sanitizer_build(data: bytes) -> bool:
+    """Is this ELF built with AddressSanitizer/UBSan? Cheap byte-scan for the runtime's marker
+    symbol. Sanitizer builds need special AFL handling (no memory cap, longer fork-server
+    startup), which must NOT be applied to ordinary targets -- an uncapped ordinary target can
+    allocate without bound and OOM the host."""
+    return b"__asan_init" in data or b"__asan_report" in data or b"__ubsan_handle" in data
+
+
 def run_campaign(afl: Path, exe, seeds_dir, out_dir, *, seconds: int = 30,
                  mode: str = "file", qemu: bool = True, afl_path: Optional[str] = None):
+    # NOTE: AFL keeps its default memory cap here. Sanitizer builds (which need `-m none`) are
+    # deliberately NOT run through this path -- an uncapped run OOM'd the host -- they are fuzzed
+    # by the sandbox `fuzz`/`directed_fuzz` stages under rlimits instead (see coverage_stage).
     target = [str(exe)] + (["@@"] if mode == "file" else [])
     cmd = [str(afl)] + (["-Q"] if qemu else []) + \
         ["-i", str(seeds_dir), "-o", str(out_dir), "-V", str(int(seconds)), "--"] + target
@@ -210,7 +221,11 @@ def campaign_stats(out_dir) -> dict:
                 k, _, v = line.partition(":")
                 k, v = k.strip(), v.strip()
                 if k in ("execs_done", "execs_per_sec", "unique_crashes", "corpus_count",
-                         "unique_hangs", "cycles_done", "paths_total"):
+                         "unique_hangs", "cycles_done", "paths_total",
+                         # edge coverage: AFL's own measure of how much of the target the
+                         # campaign actually exercised. `bitmap_cvg` is a percentage of the
+                         # shared-memory edge map filled; `edges_found` is the absolute count.
+                         "bitmap_cvg", "edges_found"):
                     out[k] = v
         except OSError:
             pass

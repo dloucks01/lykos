@@ -312,6 +312,40 @@ def test_arming_fewer_blocks_reports_fewer(gcc, tmp_path):
     assert set(few[0].blocks_hit or ()) == set(keep)
 
 
+def test_is_sanitizer_distinguishes_builds(gcc, tmp_path):
+    """The batch tracer decides once, from the ELF's bytes, whether a target is a sanitizer
+    build -- it runs as a bare subprocess and cannot import the package, so this is a stdlib
+    byte-scan for the ASan/UBSan runtime marker."""
+    plain = _build(gcc, tmp_path, _ECHO_C, "plain_san")
+    assert not batch_runner._is_sanitizer(str(plain))
+    asan = _build(gcc, tmp_path, _ECHO_C, "asan_san", extra=["-fsanitize=address"])
+    if not asan.exists():
+        pytest.skip("no ASan runtime on this toolchain")
+    assert batch_runner._is_sanitizer(str(asan)), "ASan marker scan missed an ASan build"
+    assert not batch_runner._is_sanitizer(str(tmp_path / "missing"))
+
+
+def test_a_sanitizer_build_is_not_as_capped_and_reaches_its_code(gcc, tmp_path):
+    """Regression: the batch tracer capped every child's RLIMIT_AS to bound a memory bomb, but an
+    ASan build reserves a ~20TB VIRTUAL shadow region at startup -- under an AS cap that mmap
+    fails and the process ABORTS BEFORE main(). Every input then read as a spurious SIGABRT and
+    no block was ever reached (block coverage came back 0/N on every source build, which is the
+    whole ASan-source path). A sanitizer build must run WITHOUT the AS cap -- resident memory is
+    bounded via ASAN_OPTIONS=hard_rss_limit_mb instead -- so it reaches its own code and coverage
+    is real. This is the same exemption the sandbox already makes for the non-batched path."""
+    exe = _build(gcc, tmp_path, _BRANCH_C, "asan_cov", extra=["-no-pie", "-fsanitize=address"])
+    if not batch_runner._is_sanitizer(str(exe)):
+        pytest.skip("no ASan runtime on this toolchain")
+    blocks = _blocks_of(exe)
+    if not blocks:
+        pytest.skip("no function entries recovered")
+    res = sandbox.run_batch(exe, [b"a"], mode="stdin", timeout=15, blocks=blocks)
+    if res is None:
+        pytest.skip("batched execution unavailable here")
+    assert not res[0].crashed, "the ASan build spuriously aborted -- the AS cap starved its shadow"
+    assert res[0].blocks_hit, "the ASan build reached none of its blocks -- it aborted before main()"
+
+
 def test_different_inputs_take_different_paths(gcc, tmp_path):
     """The whole reason to collect this: an input that reaches somewhere new is worth keeping,
     and output shape alone could not tell the difference."""

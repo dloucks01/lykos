@@ -1,0 +1,52 @@
+# Self-contained lykos analysis appliance.
+#
+# The whole point: this image carries its OWN complete userland -- its own glibc, ld-linux,
+# Python, and every analysis tool -- so it runs IDENTICALLY on any air-gapped laptop regardless
+# of that laptop's distro, glibc, or Python version. Build once on a connected machine, `save` to
+# a tarball, carry it in, `load`, `run`. None of the relocatable-tree fragility (Python-ABI lock,
+# venv repointing, LD_LIBRARY_PATH wrappers, glibc skew) applies here.
+#
+# Build + package for air-gap:   packaging/build-container.sh   (or: make container)
+# On the laptop:                 see docs/23-airgap-install.md  (podman load + run)
+#
+# Base is kali-rolling because rizin + rz-ghidra (the no-JVM RE backend) are packaged there.
+FROM docker.io/kalilinux/kali-rolling
+
+# ---- system toolchain (the analysis set; arch-gate cross-compilers are intentionally omitted --
+#      the pipeline cross-EXECUTES foreign binaries under qemu-user, it never cross-compiles) ----
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      python3 python3-venv python3-pip \
+      rizin rz-ghidra \
+      qemu-user qemu-user-binfmt \
+      gdb afl++ \
+      build-essential binutils \
+      bubblewrap \
+      default-jre \
+      wine wine64 \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---- Python engines: pypcode (P-Code IR -- REQUIRED by the memory-safety detectors) on the
+#      import path; angr (concolic) + unicorn (firmware rehost) in their own venvs under the
+#      vendor dir lykos already searches. Built against THIS image's Python, so no ABI mismatch. ----
+RUN pip install --break-system-packages --no-cache-dir pypcode \
+    && python3 -m venv /opt/lykos/vendor/angr-venv \
+    && /opt/lykos/vendor/angr-venv/bin/pip install --no-cache-dir angr \
+    && python3 -m venv /opt/lykos/vendor/unicorn-venv \
+    && /opt/lykos/vendor/unicorn-venv/bin/pip install --no-cache-dir unicorn keystone-engine \
+    && rm -rf /root/.cache
+
+# ---- the app itself (stdlib-only; runs under the image's system python3) ----
+COPY core /opt/lykos/core
+COPY docs /opt/lykos/docs
+COPY README.md QUICKSTART.md /opt/lykos/
+
+ENV PYTHONPATH=/opt/lykos/core \
+    LYKOS_VENDOR=/opt/lykos/vendor \
+    PYTHONUNBUFFERED=1
+
+EXPOSE 8787
+VOLUME /cases
+
+# Bind to all interfaces INSIDE the container's own network namespace; the host maps it back to
+# loopback (`-p 127.0.0.1:8787:8787`). stdin is closed so no tool can block reading it.
+ENTRYPOINT ["python3", "-m", "lykos", "serve", "--http", "0.0.0.0:8787", "--case-store", "/cases"]

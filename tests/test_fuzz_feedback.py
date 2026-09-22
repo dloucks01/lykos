@@ -244,3 +244,30 @@ def test_only_reproducible_crashes_count_and_stop_the_channel_sweep():
     assert '"crashes_reproducible": crashes_reproducible' in camp
     stg = inspect.getsource(fz.fuzz_stage)
     assert 'if st.get("crashes_reproducible"):' in stg, "early break gates on reproducible"
+
+
+def test_prior_corpus_reuses_concolic_and_crasher_inputs(store, case):
+    """directed_fuzz seeds every run from the target's accumulated interesting inputs -- concolic
+    solved-inputs first, then crashers -- so coverage compounds across stages instead of each
+    campaign starting from string-mined tokens. This closes the concolic->fuzz loop."""
+    from types import SimpleNamespace
+    from lykos.analyze.fuzz.directed import _prior_corpus
+    from lykos.db.dao import DynResultDAO, TargetDAO
+    t = TargetDAO(store.conn).upsert(case.id, filename="t", sha256="d" * 64, size=1,
+                                     arch="x86-64", bits=64)
+    conc_sha, _, _ = store.content.put_bytes(b"MAGK-solved-by-concolic")
+    crash_sha, _, _ = store.content.put_bytes(b"A" * 40)
+    plain_sha, _, _ = store.content.put_bytes(b"hello")
+    dd = DynResultDAO(store.conn)
+    dd.insert(t.id, case.id, input_sha=plain_sha, note="fuzz corpus")
+    dd.insert(t.id, case.id, input_sha=crash_sha, crashed=True, note="crash")
+    dd.insert(t.id, case.id, input_sha=conc_sha, note="concolic-generated; reached 0x401180")
+    ctx = SimpleNamespace(conn=store.conn, content=store.content)
+    seeds = _prior_corpus(ctx, t)
+    assert b"MAGK-solved-by-concolic" in seeds and b"A" * 40 in seeds
+    # concolic input is ranked FIRST (solved specifically to reach new paths)
+    assert seeds[0] == b"MAGK-solved-by-concolic"
+    # oversized inputs are skipped; a huge one must not be seeded
+    big_sha, _, _ = store.content.put_bytes(b"Z" * 99999)
+    dd.insert(t.id, case.id, input_sha=big_sha, note="huge")
+    assert b"Z" * 99999 not in _prior_corpus(ctx, t)

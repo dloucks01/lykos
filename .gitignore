@@ -12,7 +12,11 @@ lykos-toolchain-*
 __pycache__/
 *.pyc
 *.pyz
-vendor/
+# The air-gap toolchain vendor tree at the repo ROOT only. Anchored with a leading slash so it
+# never swallows core/lykos/api/static/vendor/ -- the vendored Preact/htm ESM runtime the web
+# UI loads, which IS source and must ship in the package (git archive skips ignored files, so an
+# unanchored `vendor/` shipped a blank UI: the import map resolved to files that were not there).
+/vendor/
 eval-report.json
 eval-history.jsonl
 eval-dashboard.html

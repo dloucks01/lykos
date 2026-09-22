@@ -3,7 +3,14 @@
 // suite would still pass.
 const fs = require("fs");
 const vm = require("vm");
-const page = process.argv[2];
+const _pm = require("path");
+const _given = process.argv[2] || "core/lykos/api/static/index.html";
+// These harnesses validate the CLASSIC single-file UI (now classic.html), whose
+// inline <script> they render headlessly. The new workbench is modular ESM and is
+// covered by gui_modules.js / gui_static.js instead.
+const _classic = /classic\.html$/.test(_given) ? _given
+  : _pm.join(_pm.dirname(_given), "classic.html");
+const page = _classic;
 const m = fs.readFileSync(page, "utf8").match(/<script[^>]*>([\s\S]*?)<\/script>/);
 if (!m) { console.log("FAIL  no inline <script> found in " + page); process.exit(1); }
 try {

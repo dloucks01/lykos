@@ -2,7 +2,14 @@
 // row, so with four binaries in a case you could not tell which run belonged to which -- and
 // the runs past the cap, INCLUDING the only one that errored, were simply not drawn.
 const fs = require("fs");
-const src = fs.readFileSync(process.argv[2], "utf8")
+const _pm = require("path");
+const _given = process.argv[2] || "core/lykos/api/static/index.html";
+// These harnesses validate the CLASSIC single-file UI (now classic.html), whose
+// inline <script> they render headlessly. The new workbench is modular ESM and is
+// covered by gui_modules.js / gui_static.js instead.
+const _classic = /classic\.html$/.test(_given) ? _given
+  : _pm.join(_pm.dirname(_given), "classic.html");
+const src = fs.readFileSync(_classic, "utf8")
   .match(/<script[^>]*>([\s\S]*?)<\/script>/)[1];
 const runs = {innerHTML: ""};
 const stub = () => ({innerHTML: "", textContent: "", value: "", style: {},

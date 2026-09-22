@@ -4,9 +4,10 @@ builds an L2 PoC bundle and promotes the finding. Native targets use the ptrace 
 cross-arch (emulated) targets are captured via qemu-user's gdbstub (pc-based IP control)."""
 from __future__ import annotations
 
+import json
 import shutil
 
-from ...db.dao import FindingDAO, FunctionDAO, PocDAO, TargetDAO
+from ...db.dao import DynResultDAO, FindingDAO, FunctionDAO, PocDAO, TargetDAO
 from ...jobs.registry import register_stage
 from ..debug import qemu_gdb, rootcause
 from ..dynamic import sandbox
@@ -276,11 +277,39 @@ def _finalize(ctx, target, target_bytes, mode, base_argv, cap0, control, prim, c
                                      input_sha=control_sha, bundle_sha=bundle_sha)
     if confirmed:
         fd = FindingDAO(ctx.conn)
-        fd.upsert(target.id, target.case_id, crash_finding_candidate(
+        # A confirmed primitive DEMONSTRATES an end effect -- headline it and relabel the crash
+        # finding authoritatively (RIP control -> RCE, write-what-where -> arbitrary write,
+        # controlled read -> info disclosure), instead of leaving it as "Reproduced crash".
+        _EFF = {"instruction-pointer-control": ("rce", "Remote code execution / control-flow hijack"),
+                "write-what-where": ("memory-corruption", "Memory corruption (arbitrary write)"),
+                "arbitrary-write": ("memory-corruption", "Memory corruption (arbitrary write)"),
+                "arbitrary-read": ("info-disclosure", "Information disclosure (memory leak)"),
+                "controlled-read": ("info-disclosure", "Information disclosure (memory leak)")}
+        _kind_title = _EFF.get(prim.get("type"))
+        # Key on the ORIGINAL crash's faulting address (as root_cause does), NOT this capture's,
+        # so the primitive finding merges into the crash finding instead of forking a duplicate:
+        # on a native target the fault PC is in the dedup key, and omitting it here split one
+        # defect into two poc-backed findings.
+        _orig = (ctx.params or {}).get("input_sha")
+        _fpc = DynResultDAO(ctx.conn).fault_pc_for(target.id, _orig) if _orig else None
+        cand = crash_finding_candidate(
             cap0.get("signal_name"), control_sha, "ptrace", "primitive",
             f"(L2 primitive: {extra})", state="poc-backed", confidence=0.98,
-            bundle_sha=bundle_sha))
-        fid = fd.id_for_dedup(target.id, f"dynamic-crash:{cap0.get('signal_name')}")
+            bundle_sha=bundle_sha, fault_pc=_fpc)
+        if _kind_title:
+            _kind, _title = _kind_title
+            cand["title"] = f"{_title} (demonstrated): L2 primitive"
+            cand["authoritative"] = True
+            cand["title_only"] = True                  # keep root_cause's specific CWE
+            # Promote the matching end effect to DEMONSTRATED and attach the L2 bundle that
+            # proves it -- the confirmed primitive (RIP control / write-what-where / controlled
+            # read), the exact input that achieves it, and how (offset, captured marker).
+            cand.setdefault("evidence", []).append({"channel": "effects", "detail": json.dumps([{
+                "kind": _kind, "title": _title, "status": "demonstrated", "detail": extra,
+                "proof": {"type": "bundle", "sha": bundle_sha, "input_sha": control_sha,
+                          "note": extra}}])})
+        fd.upsert(target.id, target.case_id, cand)
+        fid = fd.id_for_dedup(target.id, cand["dedup_key"])   # the pc-keyed crash finding
         if fid:
             PocDAO(ctx.conn).set_finding(poc_id, fid)
     ctx.emit("primitive.done", payload={

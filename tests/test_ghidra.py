@@ -129,7 +129,9 @@ def test_parse_result(tmp_path):
 
 
 def test_disassemble_without_ghidra_errors(store, case, pool, sample_elf, monkeypatch):
-    # force "Ghidra absent" deterministically regardless of host
+    # force "Ghidra absent" deterministically regardless of host. Pin the ghidra backend so the
+    # native (rizin/r2) fallback does not mask the missing-Ghidra error this test asserts.
+    monkeypatch.setenv("LYKOS_DECOMPILER", "ghidra")
     monkeypatch.setattr("lykos.analyze.ghidra.locate_ghidra", lambda *a, **k: None)
     target = ingest(store, case.id, sample_elf)
     q = JobQueue(store.conn)

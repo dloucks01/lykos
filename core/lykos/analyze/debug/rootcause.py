@@ -13,6 +13,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+from typing import Optional
 
 from ..detect.catalog import SOURCES, normalize
 
@@ -253,6 +254,64 @@ def _is_memory_write(disasm):
         return False
     dest = ops[1].split(",")[0]
     return "[" in dest                            # destination dereferences memory -> a write
+
+
+# AddressSanitizer/UBSan bug class -> (CWE, severity). The sanitizer names the exact defect a
+# bare SIGABRT cannot; for the source-code path this is the difference between "aborted by a
+# runtime check" and "heap-buffer-overflow at parser.c:88".
+_ASAN_CWE = {
+    "heap-buffer-overflow": ("CWE-122", "critical"),
+    "stack-buffer-overflow": ("CWE-121", "critical"),
+    "global-buffer-overflow": ("CWE-787", "high"),
+    "dynamic-stack-buffer-overflow": ("CWE-121", "critical"),
+    "heap-use-after-free": ("CWE-416", "critical"),
+    "stack-use-after-return": ("CWE-562", "high"),
+    "stack-use-after-scope": ("CWE-562", "high"),
+    "use-after-poison": ("CWE-416", "high"),
+    "double-free": ("CWE-415", "high"),
+    "alloc-dealloc-mismatch": ("CWE-762", "medium"),
+    "attempting-free-on-address": ("CWE-590", "high"),
+    "negative-size-param": ("CWE-1284", "medium"),
+    "SEGV": ("CWE-476", "high"),
+}
+
+# Tokens that can follow "AddressSanitizer:" in a non-defect line (setup/runtime failures, not
+# bugs in the target). Belt-and-braces alongside the colon requirement in parse_asan_report.
+_ASAN_NONBUG = frozenset({"failed", "out", "hard", "requested", "cannot", "unable", "shadow",
+                          "nested", "ignoring", "while", "thread", "internal", "atos"})
+
+
+def parse_asan_report(text: str) -> Optional[dict]:
+    """Turn an AddressSanitizer / UBSan report into a classification, with the source location
+    when the build was symbolized. Returns None when the text carries no sanitizer report."""
+    import re
+    t = text or ""
+    # A real bug line is `ERROR: AddressSanitizer: <class>` or `SUMMARY: AddressSanitizer:
+    # <class>` -- the colon after "AddressSanitizer" is what separates a defect report from a
+    # runtime *setup failure* like "AddressSanitizer failed to allocate ..." (no colon), which a
+    # too-small address-space limit produces and which is NOT a finding. Requiring the colon,
+    # plus a denylist for the odd non-bug token, keeps those out of the classification.
+    m = re.search(r"(?:ERROR|SUMMARY):\s*AddressSanitizer:\s*([a-z][a-z0-9-]+)", t)
+    ub = re.search(r"runtime error:\s*(.+)", t)
+    if m and m.group(1) in _ASAN_NONBUG:
+        m = None
+    if not m and not ub:
+        return None
+    if m:
+        bug = m.group(1)
+        cwe, sev = _ASAN_CWE.get(bug, ("CWE-119", "high"))
+        detail = f"AddressSanitizer: {bug.replace('-', ' ')}"
+    else:
+        bug = "undefined-behavior"
+        cwe, sev = ("CWE-758", "medium")
+        detail = f"UndefinedBehaviorSanitizer: {ub.group(1).strip()[:120]}"
+    # The first stack frame that names a real source file (skip the sanitizer interceptors).
+    src = None
+    for fm in re.finditer(r"#\d+ 0x[0-9a-f]+ in \S+ ([^\s:]+\.(?:c|cc|cpp|cxx|h|hpp)):(\d+)", t):
+        src = f"{fm.group(1).split('/')[-1]}:{fm.group(2)}"
+        break
+    return {"class": bug, "cwe": cwe, "severity": sev,
+            "detail": detail + (f" at {src}" if src else ""), "source": src}
 
 
 def classify(cap, disasm):

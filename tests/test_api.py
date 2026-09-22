@@ -45,6 +45,17 @@ def _tcp(port, method, url, body=None, headers=None):
         c.close()
 
 
+def _tcp_ct(port, method, url, body=None, headers=None):
+    """Like _tcp, but also returns the Content-Type header (bytes)."""
+    c = http.client.HTTPConnection("127.0.0.1", port)
+    try:
+        c.request(method, url, body=body, headers=headers or {})
+        r = c.getresponse()
+        return r.status, r.read(), (r.getheader("Content-Type") or "").encode()
+    finally:
+        c.close()
+
+
 def _tcp_json(port, method, url, obj=None):
     body = json.dumps(obj).encode() if obj is not None else None
     st, data = _tcp(port, method, url, body,
@@ -182,7 +193,27 @@ def test_rerun_cache_hit(api, sample_elf):
 def test_ui_served_over_tcp(api_http):
     st, body = _tcp(api_http, "GET", "/")
     assert st == 200
-    assert b"LYKOS" in body and b"<title>" in body
+    # The workbench shell: a title, the mount point, and the ES-module entry point. The app
+    # itself lives in ./app/*.js loaded via the import map, not inline in this page.
+    assert b"<title>" in body and b"lykos" in body.lower()
+    assert b'id="root"' in body and b"app/app.js" in body
+
+
+def test_ui_assets_served_over_tcp(api_http):
+    # The SPA is nothing without its modules and the vendored Preact runtime. These load as
+    # separate requests after index.html, so the server must serve them with a JS media type
+    # (a wrong type makes the browser refuse the module and the page renders blank).
+    for pth in ("/app/app.js", "/app/api.js", "/vendor/preact.module.js"):
+        st, body, ctype = _tcp_ct(api_http, "GET", pth)
+        assert st == 200, (pth, st)
+        assert b"javascript" in ctype.lower(), (pth, ctype)
+        assert body, pth
+    # Path traversal out of the static subtree is refused, not served.
+    st, _, _ = _tcp_ct(api_http, "GET", "/app/../server.py")
+    assert st == 404
+    # The preserved classic UI, linked from the new app, is reachable and is HTML.
+    st, body, ctype = _tcp_ct(api_http, "GET", "/classic.html")
+    assert st == 200 and b"html" in ctype.lower() and body
 
 
 def test_list_targets_and_runs(api_http, sample_elf):

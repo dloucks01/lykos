@@ -16,8 +16,33 @@ make run                                   # the analyst UI on 127.0.0.1:8787
 ```
 
 Nothing to install to get that far: the core is **stdlib-only**, no pip packages. The heavy
-engines (Ghidra, qemu-user, AFL++, GDB, angr…) are optional and separately bundled — see
-**[docs/23-airgap-install.md](docs/23-airgap-install.md)**.
+engines (Ghidra, qemu-user, AFL++, GDB, angr…) are optional and separately bundled — and that
+bundle installs nothing either. It extracts to a relocatable tree under `vendor/` that lykos
+runs in place: no `dpkg`, no root, and the host's own libraries are never overwritten or put on
+any shared search path. See **[docs/23-airgap-install.md](docs/23-airgap-install.md)**.
+
+**New here?** [QUICKSTART.md](QUICKSTART.md) walks you from a fresh install to your first
+finding in five minutes.
+
+## What it produces
+
+The **workbench** (`make run`) is a one-click **Autopilot**: drop a binary — or a C/C++ **source
+file**, compiled instrumented on the way in — and it runs the whole pipeline and drives each
+crash as far up the exploitation ladder as the target allows.
+
+- **Demonstrated end effects, not just "a crash."** Every finding headlines the worst effect it
+  can reach — **DoS, memory disclosure, memory corruption, control-flow hijack / RCE, command
+  injection** — each marked *demonstrated* (a PoC achieves it) or *potential*, and every
+  demonstrated effect ships the **proof artifact**: the crashing input, an **L2 primitive**
+  (confirmed instruction-pointer / write-what-where control), an **L3 working exploit** (ret2win /
+  ROP hijacking control to chosen code), or the **captured leaked bytes** of a format-string
+  disclosure. Nothing is over-claimed — ASan-guarded source stays *potential* for RCE and
+  *demonstrated* for DoS. (docs [08](docs/08-triage-poc.md))
+- **Coverage that compounds.** When fuzzing stalls at a guarded branch, concolic execution solves
+  it and the search **re-fuzzes from the solved inputs**, reaching the code beyond — 44% → 100%
+  block coverage on a magic-gated target, automatically. (docs [07](docs/07-harness-fuzzing.md))
+- **Every finding earned + reviewed.** `candidate → corroborated → confirmed → poc-backed`, with a
+  false-positive **replay verdict** on each demonstrated crash.
 
 ## Design philosophy
 
@@ -51,6 +76,9 @@ make arch-gate         # every architecture still reaches its PoC level
 make real-gate         # full chain on real programs (detect -> PoC -> attribution)
 make release           # ci + verify + all four gates
 make toolchain-bundle  # build the air-gap toolchain tarball (on a CONNECTED machine)
+make repo-tarball      # snapshot the repo for sneakernet (tracked files at HEAD, + sha256)
+make runnable          # ONE unzip-and-run .zip: repo + fully-populated vendor/ (no install)
+make container         # self-contained OCI image + air-gap tarball (most portable; needs podman/docker)
 make dashboard         # detection-quality regression dashboard from eval-history.jsonl
 make clean             # remove build artifacts and caches
 ```
@@ -101,7 +129,8 @@ packaging/         zipapp build, offline verify, air-gap bundle scripts
 | 20 | `docs/20-open-work-backlog.md` | **What is done, what is not, and what was measured** |
 | 21 | `docs/21-crs-harvest-review.md` | CRS harvest-review memo template |
 | 22 | `docs/22-toolchain-setup.md` | What each engine is and how it was provisioned |
-| 23 | `docs/23-airgap-install.md` | **Air-gap install runbook** — bundle, carry, verify |
+| 23 | `docs/23-airgap-install.md` | **Air-gap setup runbook (no install)** — bundle, carry, verify, run in place |
+| 24 | `docs/24-modernization-plan.md` | **2026 SOTA refresh** — source path, lean RE stack (drop the JVM), exploit-path automation, optional LLM |
 
 New here? `docs/20-open-work-backlog.md` is the honest state of the system: what works, what
 was measured, and what is still open. `docs/02-architecture.md` for the shape of it.

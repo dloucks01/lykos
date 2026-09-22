@@ -65,6 +65,63 @@ def test_sandbox_timeout(bins):
     assert res.timed_out and not res.crashed
 
 
+_ASAN_SRC = (
+    "#include <unistd.h>\n#include <stdlib.h>\n#include <string.h>\n"
+    "int main(){char*b=malloc(16);char t[256];int n=read(0,t,255);"
+    "if(n<0)n=0;t[n]=0;strcpy(b,t);return 0;}\n"
+)
+
+
+@pytest.fixture(scope="module")
+def asan_bin(gcc, tmp_path_factory):
+    d = tmp_path_factory.mktemp("asanbin")
+    c = d / "a.c"; c.write_text(_ASAN_SRC)
+    b = d / "a"
+    r = subprocess.run([gcc, "-fsanitize=address", "-g", "-O1", str(c), "-o", str(b)],
+                       capture_output=True)
+    if r.returncode != 0:
+        pytest.skip("no libasan / asan build unavailable")
+    return b
+
+
+def test_sandbox_asan_build_not_spurious_crash(asan_bin):
+    """Regression: run() capped RLIMIT_AS for native builds, but an ASan runtime reserves a
+    ~20TB *virtual* shadow region at startup. Under the cap that mmap failed and the process
+    aborted before main() -- so EVERY input (the entire source-code path is ASan builds) read as
+    a spurious SIGABRT crash. A benign input must now run clean, proving the cap is dropped for
+    sanitizer builds and resident memory is bounded via ASan's hard_rss_limit_mb instead."""
+    res = sandbox.run(asan_bin, stdin=b"hi", timeout=10)
+    assert not res.crashed, ("ASan build spuriously crashed on a benign input -- AS cap is "
+                             "starving the shadow map: "
+                             + res.stderr.decode("latin-1", "ignore")[:200])
+    assert res.exit_code == 0
+
+
+def test_sandbox_asan_real_overflow_still_detected(asan_bin):
+    """The fix must not blind the sandbox: a long input overflows the 16-byte heap buffer, and
+    run() forces abort_on_error so ASan turns that into a catchable SIGABRT."""
+    res = sandbox.run(asan_bin, stdin=b"A" * 200, timeout=10)
+    assert res.crashed and res.signal_name == "SIGABRT"
+
+
+def test_review_replay_verdict_persists_and_survives_reopen(store, case, bins):
+    """The false-positive review replays a crashing input N times and persists the verdict as a
+    `replay-verdict` artifact, so a reopened case (and the report) can badge the finding. Shared
+    by the replay endpoint and the server-side Autopilot -- the background path had no review
+    before this. An unknown input is None, not a crash."""
+    from lykos.analyze.ingest import ingest
+    from lykos.analyze.review import replay_verdict
+    if "crash" not in bins:
+        pytest.skip("build failed")
+    target = ingest(store, case.id, bins["crash"])         # deterministic SIGSEGV on any input
+    sha, _, _ = store.content.put_bytes(b"anything")
+    v = replay_verdict(store, target, sha, times=3)
+    assert v and v["runs"] == 3 and v["crashed"] == 3 and v["deterministic"]
+    assert replay_verdict(store, target, "deadbeef", times=2) is None
+    arts = [a for a in store.artifacts.list_by_case(case.id) if a.kind == "replay-verdict"]
+    assert any((a.meta or {}).get("input_sha") == sha for a in arts)
+
+
 def test_dynamic_stage_crash_confirms_finding(store, case, pool, bins):
     from lykos.analyze.ingest import ingest
     if "crash" not in bins:
