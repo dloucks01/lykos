@@ -67,3 +67,21 @@ def test_registry_dispatch_noop_for_stage_without_hook(store, case):
     target, _ = _target_with_cached_disasm(store, case)
     # a stage that denormalizes nothing (or isn't registered) is a safe no-op
     assert reproject_cache_hit(store, "no_such_stage", target.id, "whatever") is False
+
+
+def test_orchestrate_reprojects_on_disassemble_cache_hit(store, case, monkeypatch):
+    """Regression: the server-side Autopilot (orchestrate) got a cache-HIT disassemble but never
+    re-projected its per-target rows, so the target had ZERO functions and the fuzzer then ran
+    blind with no block coverage. _run_target_stage must reproject on a cache hit, like the HTTP
+    route does."""
+    import threading
+    from lykos.analyze import orchestrate
+    disassemble.register()
+    target, run = _target_with_cached_disasm(store, case)
+    run.status = "done"                               # a cache hit comes back already done
+    assert not disassemble.FunctionDAO(store.conn).list_by_target(target.id)
+    # orchestrate enqueues the stage and gets this done (cache-hit) run back
+    monkeypatch.setattr(orchestrate, "_enqueue_fn", lambda spec: (lambda q, t, **kw: run))
+    orchestrate._run_target_stage(store, target, disassemble.DISASSEMBLE_STAGE, {}, threading.Event())
+    names = {f.name for f in disassemble.FunctionDAO(store.conn).list_by_target(target.id)}
+    assert names == {"handle", "main"}, "cache-hit disassemble left the target with no functions"

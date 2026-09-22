@@ -6,8 +6,9 @@ OUT="$1"; PKGS="$2"; ROOT="$3"
 WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
 say(){ printf '\n== %s\n' "$*"; }
 
-mkdir -p "$WORK"/{debs,venvs,extras,afl-qemu,manifest}
-cp "$ROOT/packaging/install-toolchain.sh" "$WORK/install.sh"; chmod +x "$WORK/install.sh"
+mkdir -p "$WORK"/{toolchain,venvs,extras,afl-qemu,manifest}
+DEBS="$(mktemp -d)"; trap 'rm -rf "$WORK" "$DEBS"' EXIT
+cp "$ROOT/packaging/setup-toolchain.sh" "$WORK/setup.sh"; chmod +x "$WORK/setup.sh"
 
 say "resolving availability"
 HAVE=""; GONE=""
@@ -18,9 +19,23 @@ done
                     echo "$GONE" | tr ' ' '\n' | sed '/^$/d;s/^/    /'; }
 
 say "downloading debs"
-apt-get -o Dir::Cache::archives="$WORK/debs" -o Debug::NoLocking=1 \
-        install --reinstall --download-only -y $HAVE >/dev/null
-find "$WORK/debs" -name '*.deb' | wc -l | xargs printf '  %s debs\n'
+# Retry on a mirror that drifts mid-download (hash-sum mismatch) or a transient fetch drop,
+# refreshing the index between attempts; apt's stderr is left visible on failure.
+mkdir -p "$DEBS/partial"
+tries=0
+until apt-get -o Dir::Cache::archives="$DEBS" -o Debug::NoLocking=1 -o Acquire::Retries=5 \
+        install --reinstall --download-only -y $HAVE >/dev/null; do
+  tries=$((tries + 1))
+  [ "$tries" -ge 4 ] && { echo "  ERROR: deb download still failing after $tries attempts" >&2; exit 1; }
+  echo "  download failed (attempt $tries) -- refreshing the index and retrying" >&2
+  apt-get -qq update 2>/dev/null || true
+  sleep 5
+done
+find "$DEBS" -name '*.deb' | wc -l | xargs printf '  %s debs\n'
+
+say "extracting debs into a relocatable toolchain/ tree (no install)"
+for d in "$DEBS"/*.deb; do dpkg-deb -x "$d" "$WORK/toolchain"; done
+du -sh "$WORK/toolchain" | awk '{print "  toolchain/ is " $1}'
 
 say "non-apt tools"
 PYTHONPATH="$ROOT/core" python3 "$ROOT/packaging/_bundle_extras.py" "$WORK/extras"
@@ -36,6 +51,15 @@ for spec in "angr:angr" "unicorn:unicorn keystone-engine"; do
   fi
 done
 
+say "vendored python site (pypcode = Ghidra P-Code IR, no JVM)"
+mkdir -p "$WORK/pysite"
+if python3 -m pip install --target "$WORK/pysite" pypcode >/dev/null 2>&1; then
+  echo "  pypcode ok"
+else
+  echo "  WARNING: pypcode unavailable -- P-Code-based memory-safety detection will degrade"
+  rm -rf "$WORK/pysite"; mkdir -p "$WORK/pysite"
+fi
+
 say "per-guest afl-qemu-trace"
 for a in arm aarch64 x86-64; do
   src="$(command -v "afl-qemu-trace-$a" || true)"
@@ -50,7 +74,7 @@ say "manifest"
   echo "target-python:  $(python3 -V 2>&1)"
   echo "arch:           $(uname -m)"
   echo "built:          $(date -Is)"
-  echo "NOTE: collected NATIVELY -- installable only on this distribution."
+  echo "NOTE: collected NATIVELY -- runs in place (no install) only on this distribution."
   echo
   echo "packages requested:"; echo "$PKGS" | tr ' ' '\n' | sed '/^$/d;s/^/  /'
 } > "$WORK/manifest/BUNDLE.txt"

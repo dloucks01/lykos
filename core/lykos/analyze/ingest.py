@@ -7,6 +7,10 @@ the stage into the job engine.
 """
 from __future__ import annotations
 
+import os
+import shutil
+import subprocess
+import tempfile
 from pathlib import Path
 from typing import Optional
 
@@ -16,6 +20,69 @@ from ..jobs.registry import cached_output_json, register_stage
 from .triage import TOOL, TOOL_VERSION, build_triage
 
 INGEST_TRIAGE_STAGE = "ingest_triage"
+
+# Source we can build and analyse directly. A source drop is compiled with AddressSanitizer +
+# UndefinedBehaviorSanitizer and debug info, and the instrumented binary flows through the whole
+# binary pipeline -- so fuzzing catches heap overflows, use-after-free and UB that a plain
+# segfault-only search misses, and every crash carries a source file:line.
+_C_EXT = {".c"}
+_CXX_EXT = {".cc", ".cpp", ".cxx", ".c++"}
+_SOURCE_EXT = _C_EXT | _CXX_EXT
+
+
+def is_source(filename: str) -> bool:
+    return Path(filename or "").suffix.lower() in _SOURCE_EXT
+
+
+def compile_source(src: Path, filename: str, out: Path) -> dict:
+    """Compile a single-file C/C++ source into an ASan+UBSan, debug, instrumented binary.
+
+    Returns {"ok": True, "compiler": ..., "flags": ...} on success or raises NotAnalysable with
+    the compiler's own diagnostics. Sanitizer runtimes are linked statically where the toolchain
+    allows it, so the instrumented binary needs no sanitizer .so at run time on the air-gap host.
+    """
+    ext = Path(filename).suffix.lower()
+    is_cxx = ext in _CXX_EXT
+    cc = shutil.which("g++" if is_cxx else "gcc") or shutil.which("clang++" if is_cxx else "clang")
+    if not cc:
+        raise NotAnalysable("no C/C++ compiler found to build the source (need gcc/clang)")
+    # The sandbox fuzzer detects crashes by SIGNAL, but AddressSanitizer/UBSan default to
+    # exit(1) on Linux -- a clean exit the fuzzer would not count as a crash. This TU makes
+    # them abort() (SIGABRT) on the first error, so every sanitizer catch IS a crash the
+    # pipeline confirms, root-causes and turns into a PoC. Leak detection is off (noise + cost).
+    opts_c = out.parent / "_lykos_san_opts.c"
+    opts_c.write_text(
+        'const char *__asan_default_options(void){'
+        'return "abort_on_error=1:halt_on_error=1:detect_leaks=0";}\n'
+        'const char *__ubsan_default_options(void){'
+        'return "abort_on_error=1:halt_on_error=1:print_stacktrace=1";}\n')
+    san = "address,undefined"
+    # Permissive: we are building to ANALYSE, not to ship. Modern gcc makes implicit
+    # declarations and implicit int hard errors; downgrade them so ordinary sloppy C still
+    # builds, and silence warnings so the diagnostics we surface are real failures.
+    base = [cc, "-g", "-O1", "-fno-omit-frame-pointer", f"-fsanitize={san}",
+            "-fno-sanitize-recover=all", "-w",
+            "-Wno-error=implicit-function-declaration", "-Wno-error=implicit-int",
+            "-Wno-error=int-conversion", "-D_GNU_SOURCE",
+            # Let AddressSanitizer report the overflow with a file:line, instead of glibc's
+            # _FORTIFY_SOURCE aborting first with a terse "buffer overflow detected".
+            "-U_FORTIFY_SOURCE", "-D_FORTIFY_SOURCE=0",
+            str(src), str(opts_c), "-o", str(out)]
+    # Prefer static sanitizer runtimes so the binary is self-contained on the air-gap host; fall
+    # back to dynamic linking if the static runtime is not present in this toolchain.
+    attempts = [base + ["-static-libasan", "-static-libubsan"], base]
+    last = ""
+    for argv in attempts:
+        try:
+            r = subprocess.run(argv, capture_output=True, text=True, timeout=120)
+        except (OSError, subprocess.SubprocessError) as e:
+            last = str(e)
+            continue
+        if r.returncode == 0 and out.exists():
+            return {"ok": True, "compiler": Path(cc).name, "sanitizers": san,
+                    "static_runtime": "-static-libasan" in argv}
+        last = (r.stderr or r.stdout or "").strip()
+    raise NotAnalysable(f"could not compile {filename}:\n{last[:2000]}")
 
 
 def _apply_triage_denorm(targets: TargetDAO, target_id: str, rec: dict) -> None:
@@ -57,11 +124,29 @@ def ingest(store, case_id: str, path: str | Path, filename: Optional[str] = None
     is no analysis anywhere in this platform that can say something true about zero bytes.
     """
     path = Path(path)
+    fname = filename or path.name
+    if not path.stat().st_size:
+        raise NotAnalysable(f"{fname} is empty (0 bytes) -- nothing to analyse")
+
+    # Source drop: compile to an ASan+UBSan instrumented binary and analyse THAT. The source is
+    # kept (keyed to the binary's hash) so the code view shows real source, and every crash the
+    # sanitizers catch carries a file:line. Nothing else in the pipeline changes.
+    if is_source(fname):
+        with tempfile.TemporaryDirectory(prefix="lykos-cc-") as td:
+            binout = Path(td) / ((Path(fname).stem or "a") + ".bin")
+            meta = compile_source(path, fname, binout)
+            info = hash_all_file(binout)
+            if not info["size"]:
+                raise NotAnalysable(f"{fname} compiled to an empty binary")
+            store.put_artifact(case_id, "source-code", data=path.read_bytes(),
+                               meta={"binary_sha": info["sha256"], "filename": fname, **meta})
+            store.put_artifact(case_id, "target-blob", src=binout)
+            return store.targets.upsert(case_id, fname, info["sha256"],
+                                        md5=info["md5"], sha1=info["sha1"], size=info["size"])
+
     info = hash_all_file(path)
-    if not info["size"]:
-        raise NotAnalysable(f"{filename or path.name} is empty (0 bytes) -- nothing to analyse")
     store.put_artifact(case_id, "target-blob", src=path)
-    return store.targets.upsert(case_id, filename or path.name, info["sha256"],
+    return store.targets.upsert(case_id, fname, info["sha256"],
                                 md5=info["md5"], sha1=info["sha1"], size=info["size"])
 
 

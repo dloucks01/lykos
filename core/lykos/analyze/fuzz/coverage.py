@@ -13,6 +13,7 @@ import base64
 import os
 
 from ...db.dao import DynResultDAO, FindingDAO, TargetDAO
+from ...hashing import canonical_json
 from ...jobs.registry import register_stage
 from ..dynamic.minimize import minimize
 from ..dynamic.stage import crash_finding_candidate
@@ -151,7 +152,21 @@ def coverage_stage(ctx) -> dict:
             "black-box `fuzz` stage.")
 
     exe = ctx.scratch() / "target.bin"
-    exe.write_bytes(ctx.content.path(target.sha256).read_bytes())
+    _blob = ctx.content.path(target.sha256).read_bytes()
+    # A sanitizer build (the source-code path compiles one) reserves a ~20 TB shadow mapping.
+    # AFL cannot run it under its memory cap, and running it UNCAPPED (-m none) lets the target
+    # allocate without bound and OOM the host -- observed here. So AFL does not fuzz sanitizer
+    # builds at all: the sandbox `fuzz`/`directed_fuzz` stages run them under rlimits (memory
+    # bounded, crashes still caught as the sanitizer's SIGABRT), which is safe and effective.
+    if aflpp.is_sanitizer_build(_blob):
+        note = ("sanitizer build: not fuzzed under AFL (its shadow memory is incompatible with "
+                "AFL's memory model). The sandbox fuzzers cover it under rlimits.")
+        ctx.emit("coverage.done", payload={"supported": False, "backend": "aflpp",
+                                           "crash_inputs": 0, "unique": 0, "confirmed": 0,
+                                           "sanitizer": True, "note": note})
+        ctx.progress(pct=100, msg="sanitizer build — fuzzed by the sandbox path instead")
+        return {}
+    exe.write_bytes(_blob)
     os.chmod(exe, 0o755)
 
     # seed corpus for AFL's input dir
@@ -238,7 +253,22 @@ def coverage_stage(ctx) -> dict:
     ctx.emit("coverage.done", payload={"crash_inputs": len(raw),
                                        "unique": len(seen_crashes), "confirmed": confirmed})
     ctx.progress(pct=100, msg=f"{len(raw)} crash inputs, {len(seen_crashes)} unique crashes")
-    return {}
+    # Persist the campaign's own measure of how much it exercised, so the run's output carries
+    # the coverage it achieved -- not just its crash count. `bitmap_cvg` is AFL's edge-map
+    # fill percentage; a low number on a big binary means the fuzzer barely got past the door.
+    def _num(k):
+        v = stats.get(k)
+        try:
+            return float(str(v).rstrip("%")) if v not in (None, "") else None
+        except ValueError:
+            return None
+    summary = {"backend": "aflpp", "execs": _num("execs_done"), "execs_per_sec": _num("execs_per_sec"),
+               "corpus_count": _num("corpus_count"), "unique_crashes": len(seen_crashes),
+               "coverage": {"kind": "edge", "bitmap_cvg_pct": _num("bitmap_cvg"),
+                            "edges_found": _num("edges_found")}}
+    # Persist as the run's output artifact so /runs/<id>/output carries the coverage achieved.
+    sha = ctx.put_artifact("fuzz-summary", data=canonical_json(summary))
+    return {"output_shas": [sha], "output_kind": "fuzz-summary"}
 
 
 def register() -> None:

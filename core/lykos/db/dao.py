@@ -468,6 +468,27 @@ def _rank(seq: Sequence[str], val: Optional[str], default: int = 0) -> int:
         return default
 
 
+def _merge_effect_evidence(evidence: list) -> list:
+    """Collapse the `effects` evidence channel (a JSON list of end effects, each carrying a
+    demonstrated/potential status and a proof artifact) into ONE merged entry, so a later stage
+    that DEMONSTRATES an effect promotes it -- with the artifact that proves it -- instead of the
+    finding keeping both the earlier "potential" line and the newer "demonstrated" one. Non-effect
+    evidence is untouched."""
+    eff_entries = [e for e in evidence if e.get("channel") == "effects"]
+    if len(eff_entries) < 2:
+        return evidence
+    from ..analyze.debug import exploitability as _expl
+    merged: list = []
+    for e in eff_entries:
+        try:
+            merged = _expl.merge_effects(merged, loads(e.get("detail") or "[]"))
+        except Exception:
+            pass
+    rest = [e for e in evidence if e.get("channel") != "effects"]
+    rest.append({"channel": "effects", "detail": dumps(merged)})
+    return rest
+
+
 class FindingDAO(BaseDAO):
     def upsert(self, target_id: str, case_id: str, c: dict) -> None:
         """Insert a candidate, or MERGE into the existing finding with the same dedup_key.
@@ -492,8 +513,23 @@ class FindingDAO(BaseDAO):
                 for e in ev_new:
                     if (e.get("channel"), e.get("detail")) not in seen:
                         evidence.append(e)
+                evidence = _merge_effect_evidence(evidence)   # promote effects across stages
                 self._record_verdict(row["id"], c, now)
                 state, severity, confidence = self._recompute(row["id"])
+                # A crash finding is first filed by a fuzz/dynamic stage with only a GENERIC
+                # signal-derived class (SIGABRT -> CWE-787). When an authoritative classifier --
+                # root_cause, with the sanitizer's own report -- later merges in on the same key,
+                # its specific class (e.g. heap-use-after-free / CWE-416) must become the
+                # finding's, not stay buried in the evidence. Only an `authoritative` candidate
+                # relabels; ordinary corroboration leaves the existing label alone.
+                # A candidate that demonstrates an EFFECT (poc_primitive) relabels the TITLE but
+                # sets `title_only` to keep root_cause's more specific CWE rather than its own
+                # generic signal-derived one.
+                if c.get("authoritative") and (c.get("cwe") or c.get("title")):
+                    new_cwe = row["cwe"] if c.get("title_only") else (c.get("cwe") or row["cwe"])
+                    self.conn.execute(
+                        "UPDATE finding SET cwe=?, title=? WHERE id=?",
+                        (new_cwe, c.get("title") or row["title"], row["id"]))
                 self.conn.execute(
                     "UPDATE finding SET state=?, severity=?, confidence=?, evidence_json=?, "
                     "detector=?, updated_at=? WHERE id=?",

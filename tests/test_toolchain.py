@@ -37,7 +37,10 @@ def test_the_hard_requirements_are_the_ones_that_really_are():
     """Marking something required that is not makes `doctor --strict` cry wolf; marking
     something optional that is not lets a broken install look fine."""
     required = {t.key for t in tc.TOOLS if t.tier == "required"}
-    assert required == {"python", "bwrap", "ghidra"}, required
+    # The default RE backend is now rizin/rz-ghidra + pypcode (no JVM, doc 24). Ghidra moved to
+    # an optional heavy profile, so the hard requirements are the native stack, not Ghidra.
+    assert required == {"python", "bwrap", "rizin", "pypcode"}, required
+    assert next(t for t in tc.TOOLS if t.key == "ghidra").tier == "optional"
 
 
 def test_bubblewraps_absence_is_described_as_the_silent_degradation_it_is():
@@ -108,9 +111,12 @@ def test_missing_can_be_filtered_by_tier():
 def test_the_apt_list_is_what_the_collector_pulls():
     """The bundle script reads exactly this, so an engine added here without its package is an
     engine the air-gapped host will not get."""
-    pkgs = tc.apt_packages()
+    pkgs = tc.apt_packages()                      # ONE build, every capability
     assert pkgs == sorted(set(pkgs)), "not deduplicated/sorted"
-    assert "bubblewrap" in pkgs and "ghidra" in pkgs
+    # the native RE backend replaces Ghidra; every other capability is still pulled
+    assert "rizin" in pkgs and "rz-ghidra" in pkgs
+    assert "wine" in pkgs and "gcc-aarch64-linux-gnu" in pkgs  # capabilities kept, not stripped
+    assert "ghidra" not in pkgs, "Ghidra is replaced by rizin and must not be bundled"
     for t in tc.TOOLS:
         for p in t.apt:
             assert p in pkgs, f"{t.key} names {p} and the collector would not pull it"
@@ -120,6 +126,11 @@ def test_tools_installed_by_apt_declare_their_packages():
     """Anything whose install line is an apt command must name the packages, or the collector
     silently omits it from the bundle while the doc says to install it."""
     for t in tc.TOOLS:
+        # A tool explicitly not bundled (Ghidra, replaced by rizin) may still document a manual
+        # apt install without carrying bundle packages.
+        if "not shipped in the air-gap bundle" in t.install.lower():
+            assert not t.apt, f"{t.key} says not-bundled but still declares apt packages"
+            continue
         if t.install.startswith("apt-get install"):
             assert t.apt, f"{t.key} installs via apt but declares no packages for the bundle"
 

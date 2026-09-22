@@ -199,3 +199,65 @@ def test_a_finding_filed_directly_at_poc_backed_gets_the_severity_floor(store, c
     f = _f(store, t.id, case.id)
     assert f.state == "poc-backed"
     assert f.severity == "high"          # bumped on the very first upsert, not just on merge
+
+
+def test_authoritative_channel_relabels_cwe_and_title(store, case):
+    """A crash is first filed with only a generic signal-derived class (SIGABRT -> CWE-787).
+    When root_cause merges in on the same key with a specific class -- authoritative, because it
+    read the sanitizer's own report -- that class must become the finding's, not stay buried in
+    the evidence while the generic label shows."""
+    t = _target(store, case)
+    fd = FindingDAO(store.conn)
+    fd.upsert(t.id, case.id, _c(key="crash", cwe="CWE-787", title="Reproduced crash (SIGABRT)",
+                                detector="directed_fuzz", state="confirmed", confidence=0.9))
+    fd.upsert(t.id, case.id, _c(key="crash", cwe="CWE-416",
+                                title="Root cause: heap-use-after-free", detector="root_cause",
+                                state="confirmed", confidence=0.9, authoritative=True))
+    f = _f(store, t.id, case.id)
+    assert f.cwe == "CWE-416" and "use-after-free" in f.title
+
+
+def test_non_authoritative_merge_keeps_the_existing_label(store, case):
+    """Ordinary corroboration must not relabel: a second generic channel agreeing with a crash
+    leaves the finding's class alone (only an `authoritative` classifier may change it)."""
+    t = _target(store, case)
+    fd = FindingDAO(store.conn)
+    fd.upsert(t.id, case.id, _c(key="crash", cwe="CWE-416", title="Root cause: use-after-free",
+                                detector="root_cause", state="confirmed", confidence=0.9,
+                                authoritative=True))
+    fd.upsert(t.id, case.id, _c(key="crash", cwe="CWE-787", title="Reproduced crash",
+                                detector="directed_fuzz", state="confirmed", confidence=0.9))
+    f = _f(store, t.id, case.id)
+    assert f.cwe == "CWE-416" and "use-after-free" in f.title
+
+
+def test_effects_promote_across_stages_and_title_only_keeps_cwe(store, case):
+    """root_cause files the finding with the effect ceiling as potential + the specific CWE; a
+    later poc_primitive candidate that DEMONSTRATES the effect promotes it (carrying its proof),
+    relabels the title, but keeps the specific CWE via title_only -- so the finding ends up
+    'RCE (demonstrated)' at CWE-121 with the proving bundle attached."""
+    import json
+    from lykos.db.dao import FindingDAO
+    t = _target(store, case)
+    fd = FindingDAO(store.conn)
+    # root_cause: authoritative, specific CWE, effects with rce potential + dos demonstrated
+    fd.upsert(t.id, case.id, _c(key="crash", cwe="CWE-121", title="RCE (potential): stack overflow",
+              detector="root_cause", state="confirmed", confidence=0.9, authoritative=True,
+              evidence=[{"channel": "effects", "detail": json.dumps([
+                  {"kind": "dos", "title": "Denial of service", "status": "demonstrated"},
+                  {"kind": "rce", "title": "Remote code execution", "status": "potential"}])}]))
+    # poc_primitive: title_only relabel + effects update demonstrating rce with a bundle proof
+    fd.upsert(t.id, case.id, _c(key="crash", cwe="CWE-119",
+              title="Remote code execution (demonstrated): L2 primitive", detector="primitive",
+              state="poc-backed", confidence=0.98, authoritative=True, title_only=True,
+              evidence=[{"channel": "effects", "detail": json.dumps([
+                  {"kind": "rce", "title": "Remote code execution", "status": "demonstrated",
+                   "proof": {"type": "bundle", "sha": "beef"}}])}]))
+    f = _f(store, t.id, case.id)
+    assert f.cwe == "CWE-121"                                  # title_only kept the specific CWE
+    assert "demonstrated" in f.title
+    effs = json.loads(next(e["detail"] for e in f.evidence if e["channel"] == "effects"))
+    rce = next(e for e in effs if e["kind"] == "rce")
+    assert rce["status"] == "demonstrated" and rce["proof"]["sha"] == "beef"
+    assert any(e["kind"] == "dos" for e in effs)              # only one merged effects entry
+    assert sum(1 for e in f.evidence if e["channel"] == "effects") == 1

@@ -229,9 +229,18 @@ def run_batch(exe, payloads, *, mode="stdin", base_argv=(), timeout: float = 2.0
         blob += struct.pack("<I", len(d)) + d
     budget = timeout * len(payloads) + 15.0
     t0 = time.time()
+    # The batch path never caps AS (set_as=False), so an ASan build initialises fine here -- but
+    # then has no memory guard at all. Bound each target invocation's RESIDENT memory with ASan's
+    # own hard_rss_limit_mb, the same guard run() uses, so a sanitizer build cannot OOM the host.
+    env = None
+    if _is_sanitizer_exe(exe):
+        env = dict(os.environ)
+        _prior = env.get("ASAN_OPTIONS", "")
+        env["ASAN_OPTIONS"] = ((_prior + ":") if _prior else "") + \
+            f"abort_on_error=1:hard_rss_limit_mb={max(256, int(mem_mb))}:detect_leaks=0"
     rc, out, err, timed, _dur = _spawn(cmd, bytes(blob), budget,
                                        _rlimits(mem_mb, int(budget) + 5, set_as=False,
-                                                nproc=_nproc_cap(False)))
+                                                nproc=_nproc_cap(False)), env=env)
     if timed or rc != 0 or (err.startswith(b"bwrap:") and not _bwrap_probe_fresh()):
         return None
     per_ms = int((time.time() - t0) * 1000 / max(1, len(payloads)))
@@ -338,10 +347,34 @@ def _nproc_cap(emu: bool) -> int:
     return min(cap, hard) if hard != resource.RLIM_INFINITY else cap
 
 
+_ADDR_NO_RANDOMIZE = 0x0040000                 # <linux/personality.h>
+
+
+def _disable_aslr():
+    """Turn off address-space randomization for the child (personality ADDR_NO_RANDOMIZE).
+
+    Without this a PIE / ASan target faults at a different runtime address every run, so the
+    faulting PC -- which the crash dedup key is built from -- is never the same twice. One defect
+    then splits into dozens of "distinct" findings, and root_cause (run under gdb, which disables
+    randomization by default) reports a stable address that never matches the fuzzer's randomized
+    one, so its enriched classification lands as yet another finding instead of merging. Disabling
+    randomization makes the fault PC deterministic and consistent across stages -- the standard
+    choice for crash reproduction. Best-effort: a platform without personality() is unaffected."""
+    try:
+        import ctypes
+        libc = ctypes.CDLL(None, use_errno=True)
+        cur = libc.personality(0xffffffff)     # query current persona (-1 on failure)
+        if cur != -1:
+            libc.personality(cur | _ADDR_NO_RANDOMIZE)
+    except Exception:
+        pass
+
+
 def _rlimits(mem_mb: int, cpu_s: int, set_as: bool, nproc: Optional[int] = None):
     if nproc is None:
         nproc = _nproc_cap(False)              # default: baseline-aware native cap
     def _apply():
+        _disable_aslr()
         try:
             resource.setrlimit(resource.RLIMIT_CPU, (cpu_s, cpu_s + 1))
             resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
@@ -353,6 +386,34 @@ def _rlimits(mem_mb: int, cpu_s: int, set_as: bool, nproc: Optional[int] = None)
         except Exception:
             pass
     return _apply
+
+
+_SAN_EXE_CACHE: dict = {}
+
+
+def _is_sanitizer_exe(exe) -> bool:
+    """True if the native ELF at `exe` is an ASan/UBSan build. A sanitizer runtime reserves a
+    ~20TB *virtual* shadow region at startup; under an RLIMIT_AS cap that mmap fails and the
+    process aborts before main() -- turning EVERY input into a spurious SIGABRT "crash". The
+    caller uses this to drop the AS cap (and bound resident memory instead) for such builds.
+
+    Cached by (path, mtime, size): the fuzz loop calls run() thousands of times on one exe."""
+    try:
+        st = os.stat(exe)
+        key = (str(exe), st.st_mtime_ns, st.st_size)
+    except OSError:
+        return False
+    hit = _SAN_EXE_CACHE.get(key)
+    if hit is None:
+        try:
+            from ..fuzz.aflpp import is_sanitizer_build       # lazy: avoids an import cycle
+            hit = bool(is_sanitizer_build(Path(exe).read_bytes()))
+        except Exception:
+            hit = False
+        if len(_SAN_EXE_CACHE) > 256:
+            _SAN_EXE_CACHE.clear()
+        _SAN_EXE_CACHE[key] = hit
+    return hit
 
 
 def _killpg(p):
@@ -664,7 +725,13 @@ def _run_java(exe, *, argv, stdin, timeout, mem_mb, capture, main_class=None) ->
 
 
 def _wine() -> Optional[str]:
-    return shutil.which("wine") or shutil.which("wine64")
+    # Debian ships the binary as `wine-stable` (or `wine-development`) and exposes `wine` only as
+    # an update-alternatives symlink -- which does NOT travel in the relocatable air-gap bundle,
+    # so on the laptop only `wine-stable` exists. Try the versioned names too or PE execution is
+    # silently unavailable there despite Wine being bundled. Running the binary under its own
+    # name is equivalent to `wine`.
+    return (shutil.which("wine") or shutil.which("wine64")
+            or shutil.which("wine-stable") or shutil.which("wine-development"))
 
 
 def _is_pe(exe) -> bool:
@@ -777,9 +844,21 @@ def run(exe, *, argv=(), stdin: bytes = b"", timeout: float = 10.0,
     # emulation is several times slower than native, so give it a longer wall-clock budget or
     # correct runs would be misreported as timeouts.
     eff_timeout = max(timeout * 3, 5.0) if emu else timeout
-    # emulated processes need a larger address space; don't cap AS then
-    preexec = _rlimits(mem_mb, int(eff_timeout) + 2, set_as=(emu is None),
-                       nproc=_nproc_cap(emu is not None))
+    # Emulated processes AND sanitizer builds need a huge virtual address space: qemu maps the
+    # guest, and an ASan/UBSan runtime reserves a ~20TB shadow region. An RLIMIT_AS cap makes
+    # that mmap fail and the process aborts before main() -- so every input reads as a spurious
+    # SIGABRT crash (the source-code path is entirely ASan builds). Drop the AS cap for those
+    # and bound RESIDENT memory instead via ASan's own hard_rss_limit_mb, which caps real RAM
+    # (the shadow is sparse) without touching the virtual reservation.
+    san = emu is None and _is_sanitizer_exe(exe)
+    preexec = _rlimits(mem_mb, int(eff_timeout) + 2, set_as=(emu is None and not san),
+                       nproc=_nproc_cap(emu is not None or san))
+    env = None
+    if san:
+        env = dict(os.environ)
+        _prior = env.get("ASAN_OPTIONS", "")
+        env["ASAN_OPTIONS"] = ((_prior + ":") if _prior else "") + \
+            f"abort_on_error=1:hard_rss_limit_mb={max(256, int(mem_mb))}:detect_leaks=0"
 
     iso = "rlimits-only" + ("+qemu" if emu else "")
     cmd = inner
@@ -802,7 +881,7 @@ def run(exe, *, argv=(), stdin: bytes = b"", timeout: float = 10.0,
         cmd = ["bwrap"] + _BWRAP_ARGS[:-1] + extra + ["--"] + inner
         iso = ("bwrap+netns" + ("+qemu" if emu else ""))
 
-    rc, out, err, timed, dur = _spawn(cmd, stdin, eff_timeout, preexec)
+    rc, out, err, timed, dur = _spawn(cmd, stdin, eff_timeout, preexec, env=env)
 
     # bubblewrap setup failed at runtime (some VMs rate-limit namespace creation) -> fall
     # back to rlimits-only and stop trying bwrap this session.
@@ -813,7 +892,7 @@ def run(exe, *, argv=(), stdin: bytes = b"", timeout: float = 10.0,
         # sandbox). Fall back to rlimits-only for THIS run only; do NOT disable bwrap for the
         # rest of the session on the strength of one run's output.
         cmd, iso = inner, "rlimits-only" + ("+qemu" if emu else "")
-        rc, out, err, timed, dur = _spawn(cmd, stdin, eff_timeout, preexec)
+        rc, out, err, timed, dur = _spawn(cmd, stdin, eff_timeout, preexec, env=env)
 
     # classify_rc() holds the one copy of this: native subprocesses report -signum while
     # wrappers (bwrap/qemu) report 128+signum, and the two had drifted apart here.

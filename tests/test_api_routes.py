@@ -181,7 +181,7 @@ def test_every_target_reader_answers_for_a_real_target(triaged, route):
 
 
 @pytest.mark.parametrize("route", ["functions", "callgraph", "dynresults", "pocs",
-                                   "findings", "strings", "advice", "capabilities",
+                                   "findings", "strings", "advice", "capabilities", "source",
                                    "invocation"])
 def test_every_target_reader_survives_an_unknown_target(api, route):
     """The UI builds these URLs from whatever is selected; a stale id must not 500."""
@@ -199,6 +199,52 @@ def test_a_finding_that_does_not_exist_is_a_404(api):
     st, body = _json(api, "GET", "/findings/nope")
     assert st == 404
     assert body.get("error")
+
+
+def test_background_autopilot_status_is_none_before_any_run(triaged):
+    """The server-side background Autopilot: status for a case with no run reads 'none', and
+    cancelling a non-existent run is a 404 -- neither is a 500."""
+    sock, cid, _tid = triaged
+    st, body = _json(sock, "GET", f"/cases/{cid}/autopilot")
+    assert st == 200 and body.get("state") == "none"
+    st, _b = _req(sock, "POST", f"/cases/{cid}/autopilot/cancel")
+    assert st == 404
+
+
+def test_background_autopilot_needs_targets(api):
+    """Starting on a case with no targets is a clean 400, not a spawned thread doing nothing."""
+    st, c = _json(api, "POST", "/cases", {"name": "empty"})
+    st, body = _json(api, "POST", f"/cases/{c['id']}/autopilot", {})
+    assert st == 400 and body.get("error")
+
+
+def test_source_endpoint_reports_no_source_for_a_binary_target(triaged):
+    """A plain binary target has no source; the endpoint answers {source: null}, not an error."""
+    sock, _cid, tid = triaged
+    st, body = _json(sock, "GET", f"/targets/{tid}/source")
+    assert st == 200
+    assert body.get("source") is None
+
+
+def test_replay_requires_an_input_and_survives_a_bogus_one(triaged):
+    """The false-positive review replays a crashing input; a missing input is a 400, an unknown
+    input a 404, and neither is a 500."""
+    sock, _cid, tid = triaged
+    st, _b = _json(sock, "POST", f"/targets/{tid}/replay", {})
+    assert st == 400
+    st, _b = _json(sock, "POST", f"/targets/{tid}/replay", {"input_sha": "deadbeef", "times": 2})
+    assert st == 404
+
+
+def test_verifications_endpoint_shape_and_unknown_case(triaged):
+    """A reopened case restores its VerifyBadges from GET /cases/{cid}/verifications. With no
+    review run yet it is an empty object (never an error), and an unknown case is a 404 -- so the
+    reopen fetch degrades cleanly instead of blanking the results."""
+    sock, cid, _tid = triaged
+    st, body = _json(sock, "GET", f"/cases/{cid}/verifications")
+    assert st == 200 and isinstance(body, dict) and body == {}
+    st, _b = _json(sock, "GET", "/cases/not-a-case/verifications")
+    assert st == 404
 
 
 # ---- cancellation ------------------------------------------------------------------------
@@ -222,6 +268,26 @@ def test_a_finished_run_cannot_be_cancelled_into_a_lie(triaged):
     assert run["status"] == "done", "a finished run was relabelled by a cancel"
 
 
+def test_run_output_returns_the_stage_result(triaged):
+    """The workbench log shows WHAT each stage found, read from GET /runs/<id>/output. The
+    triage run always produces an output artifact, so its output is a dict here."""
+    sock, cid, _tid = triaged
+    _st, runs = _json(sock, "GET", f"/cases/{cid}/runs")
+    done = [r for r in runs if r["status"] == "done"]
+    if not done:
+        pytest.skip("no finished run")
+    rid = done[0]["id"]
+    st, body = _json(sock, "GET", f"/runs/{rid}/output")
+    assert st == 200
+    assert body["run_id"] == rid and body["stage"] == done[0]["stage"]
+    assert "output" in body  # present (dict for triage/disassemble; may be None for row-only stages)
+
+
+def test_run_output_for_an_unknown_run_is_a_404(api):
+    st, body = _json(api, "GET", "/runs/not-a-run/output")
+    assert st == 404 and body.get("error")
+
+
 def test_a_malformed_query_parameter_is_never_a_server_fault(triaged):
     """`?limit=abc` reached int() inside the handler and came back 500. The UI builds these
     from its own controls, but the URL gets typed by hand too, and a 500 in the network tab
@@ -233,3 +299,15 @@ def test_a_malformed_query_parameter_is_never_a_server_fault(triaged):
                 f"/cases/{cid}/events?after=abc"):
         st, _body = _json(sock, "GET", url)
         assert st != 500, f"{url} -> 500"
+
+
+def test_orchestrate_prove_stages_receive_params():
+    """Regression: the background (server-side) Autopilot listed root_cause/build_poc/
+    poc_primitive as no-param stages, so _run_target_stage dropped the crashing input the prove
+    loop threads in -- every one then failed with 'requires params.input_sha'. Those stages must
+    NOT be in _NO_PARAMS; only the genuinely param-less recover stages are."""
+    from lykos.analyze import orchestrate
+    for stage in ("root_cause", "build_poc", "poc_primitive"):
+        assert stage not in orchestrate._NO_PARAMS, \
+            f"{stage} needs params.input_sha but is marked no-param"
+    assert orchestrate._NO_PARAMS == {"disassemble", "detect_cwe"}

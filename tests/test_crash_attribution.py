@@ -348,6 +348,18 @@ def test_a_legacy_crash_finding_is_still_found():
     assert crash_dedup_key("SIGABRT", 0) == "dynamic-crash:SIGABRT", "0 is not an address"
 
 
+def test_sigabrt_buckets_by_signal_even_with_a_fault_pc():
+    """A SIGABRT is raised by a runtime CHECK (glibc malloc/free, a canary, ASan) -- its PC is in
+    the abort machinery (often a randomized image-relative libc offset), not the defect. Keying it
+    by that PC split ONE double-free into dozens of findings, so an abort is bucketed by signal
+    alone; a SIGSEGV (a real fault at an instruction) still keeps its faulting address."""
+    from lykos.analyze.dynamic.stage import crash_dedup_key
+    assert crash_dedup_key("SIGABRT", 0x730f5eca61ac) == "dynamic-crash:SIGABRT"
+    assert crash_dedup_key("SIGABRT", 0x7c54aaea61ac) == "dynamic-crash:SIGABRT"   # same bucket
+    assert crash_dedup_key("SIGSEGV", 0x40117a) == "dynamic-crash:SIGSEGV:40117a"  # PC kept
+    assert crash_dedup_key("SIGSEGV", 0x409999) != crash_dedup_key("SIGSEGV", 0x40117a)
+
+
 def test_an_emulated_crash_still_gets_a_fault_locus():
     """The ptrace tracer cannot reach inside qemu, so a cross-architecture crash had no
     faulting address and every SIGSEGV in the program bucketed as one finding -- on eleven of

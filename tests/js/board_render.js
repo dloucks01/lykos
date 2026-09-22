@@ -5,8 +5,14 @@
 // one nearly shipped: `t.open || ... || BOARD_OPEN[k]` short-circuits, so the chevron on a
 // default-open tier did nothing. That is invisible to a grep and obvious here.
 const fs = require("fs");
-const path = process.argv[2];
-const src = fs.readFileSync(path, "utf8").match(/<script[^>]*>([\s\S]*?)<\/script>/)[1];
+const _pm = require("path");
+const _given = process.argv[2] || "core/lykos/api/static/index.html";
+// These harnesses validate the CLASSIC single-file UI (now classic.html), whose
+// inline <script> they render headlessly. The new workbench is modular ESM and is
+// covered by gui_modules.js / gui_static.js instead.
+const _classic = /classic\.html$/.test(_given) ? _given
+  : _pm.join(_pm.dirname(_given), "classic.html");
+const src = fs.readFileSync(_classic, "utf8").match(/<script[^>]*>([\s\S]*?)<\/script>/)[1];
 
 const board = {innerHTML: "", focus() {}};
 const stub = () => ({innerHTML: "", textContent: "", value: "", style: {},

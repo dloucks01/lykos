@@ -19,6 +19,7 @@ import re
 import time
 
 from ...db.dao import CallEdgeDAO, DynResultDAO, FindingDAO, FunctionDAO, StringDAO, TargetDAO
+from ...hashing import canonical_json
 from ...jobs.registry import register_stage
 from ..dynamic import sandbox
 from ..dynamic.minimize import minimize
@@ -568,12 +569,18 @@ def _recovered_blocks(ctx, target):
     for f in fns:
         if not f.blocks:
             continue
-        if live is not None and f.addr not in live:
-            continue
+        # The reachable-from-main closure, when we have it, is AUTHORITATIVE: it already names the
+        # program's own functions, so trust it and skip the symbol-range filter. That filter is a
+        # FALLBACK for when the call graph cannot say -- and it mis-attributes global functions on
+        # a statically linked build (globals sit outside the STT_FILE local-symbol grouping, so a
+        # program's own main/a/b get charged to an adjacent libc object and dropped).
+        if live is not None:
+            if f.addr not in live:
+                continue
         # ranges come from the ELF's own symbols, so compare in ELF vaddr space: on a PIE the
         # decompiler's addresses sit at a different image base, and comparing raw dropped every
         # function in the binary
-        if ranges and not _in_program(_addr_of(f) - base, ranges):
+        elif ranges and not _in_program(_addr_of(f) - base, ranges):
             continue
         full = fd.get(f.id)
         for b in ((full.ir or {}).get("blocks") or []):
@@ -582,6 +589,39 @@ def _recovered_blocks(ctx, target):
             except (KeyError, TypeError, ValueError):
                 continue
     return sorted(out)
+
+
+# C-runtime / sanitizer / libc symbols the coverage reachability closure must not descend into on
+# a statically linked build -- they are linked-in, not the program. Prefix match first (covers the
+# whole ASan/UBSan/libstdc++/dynamic-loader families), then a set of the common libc entry points a
+# program calls directly (read, malloc, printf, ...) whose names carry no distinguishing prefix.
+_RUNTIME_PREFIXES = (
+    "__asan", "__ubsan", "__sanitizer", "__lsan", "__tsan", "__interceptor", "___interceptor",
+    "__cxa", "__gnu_cxx", "_ZN", "_ZL", "_ZSt", "__libc", "__GI_", "_IO_", "_dl_", "__pthread",
+    "pthread_", "__gthread", "_int_", "sysmalloc", "__default_", "__run_exit", "register_tm",
+    "deregister_tm", "frame_dummy", "__do_global", "_start", "__libc_csu", "__stack_chk",
+)
+_RUNTIME_NAMES = frozenset({
+    "read", "write", "open", "open64", "close", "lseek", "readv", "writev", "pread", "pwrite",
+    "malloc", "free", "calloc", "realloc", "reallocarray", "aligned_alloc", "posix_memalign",
+    "memcpy", "memmove", "memset", "memcmp", "memchr", "mempcpy", "bcopy", "bzero",
+    "strcpy", "strncpy", "strcat", "strncat", "strlen", "strnlen", "strcmp", "strncmp", "strchr",
+    "strrchr", "strstr", "strdup", "strndup", "strtok", "strtol", "strtoul", "atoi", "atol",
+    "printf", "fprintf", "sprintf", "snprintf", "vprintf", "vsnprintf", "puts", "fputs", "putchar",
+    "fputc", "fwrite", "fread", "fopen", "fclose", "fgets", "getline", "scanf", "sscanf", "fscanf",
+    "gets", "system", "popen", "pclose", "execve", "execl", "execlp", "execvp", "fork", "exit",
+    "_exit", "abort", "raise", "signal", "sigaction", "mmap", "mmap64", "munmap", "mprotect",
+    "brk", "sbrk", "getenv", "setenv", "putenv", "qsort", "bsearch", "rand", "srand", "time",
+    "sleep", "usleep", "nanosleep", "isatty", "getpid", "__errno_location", "__assert_fail",
+})
+
+
+def _is_runtime_fn(name: str) -> bool:
+    """True for a linked-in C-runtime / sanitizer / libc function (not the program's own code)."""
+    if not name:
+        return False
+    n = name.lstrip(".")                       # ppc64le ELFv2 local-entry dot
+    return n.startswith(_RUNTIME_PREFIXES) or n in _RUNTIME_NAMES
 
 
 def _reachable_functions(ctx, target, functions):
@@ -604,9 +644,11 @@ def _reachable_functions(ctx, target, functions):
     if not edges:
         return None
     known = {f.addr for f in functions}
+    name_by = {f.addr: (f.name or "") for f in functions}
     entries = [f.addr for f in functions if (f.name or "") in ("main", "_start", "entry")]
     if not entries:
         return None
+    has_main = any((f.name or "") == "main" for f in functions)
     out_edges: dict = {}
     called = set()
     for e in edges:
@@ -618,11 +660,26 @@ def _reachable_functions(ctx, target, functions):
         cur = stack.pop()
         for dst in out_edges.get(cur, ()):
             if dst in known and dst not in live:
+                # On a statically linked build (a sanitizer source build carries all of libc + the
+                # ASan/UBSan runtime), do NOT descend into the C runtime: it is thousands of
+                # functions `main` reaches transitively but that are not the program, and arming
+                # their blocks both dilutes the coverage number and -- since they are re-armed
+                # every exec until reached -- collapses fuzz throughput. Keeping the closure to
+                # the user's own functions leaves coverage measuring the code that matters.
+                if has_main and _is_runtime_fn(name_by.get(dst, "")):
+                    continue
                 live.add(dst)
                 stack.append(dst)
-    if len(live) < _LIVE_FLOOR * len(known):
-        return None
-    return live if len(live) < len(known) else None
+    # The floor guards STRIPPED binaries: their sparse call graph under-approximates, so a tiny
+    # reachable set is evidence the graph is unreadable, not evidence of dead code. But a binary
+    # with a named `main` is NOT stripped -- its reachable-from-main closure IS the program.
+    # A statically linked ASan/sanitizer build carries thousands of runtime functions main never
+    # calls (the shadow allocator, interceptors, UBSan handlers): reaching only a handful of the
+    # 3,680 is CORRECT, not a broken graph, and the floor must not throw that away or coverage is
+    # measured against the entire ASan runtime and reads a meaningless ~2%.
+    if len(live) >= 2 and (has_main or len(live) >= _LIVE_FLOOR * len(known)):
+        return live if len(live) < len(known) else None
+    return None
 
 
 def _addr_of(f):
@@ -756,6 +813,8 @@ def fuzz_stage(ctx) -> dict:
     share_secs = max(1.0, max_seconds / len(channels))
     totals = {"execs": 0, "crashes": 0, "crashes_reproducible": 0, "unique": 0,
               "behaviours": 0}
+    blocks_hit = 0            # the most blocks any one channel reached (coverage is per-run)
+    blocks_known = 0
     for ch in channels:
         st = fuzz_campaign(ctx, target, corpus=list(corpus), dictionary=dictionary, mode=ch,
                            max_execs=share_execs, max_seconds=share_secs,
@@ -764,10 +823,19 @@ def fuzz_stage(ctx) -> dict:
                            cover_blocks=blocks, cover_flags=flags, base_argv=base_argv)
         for k in totals:
             totals[k] += st.get(k, 0)
+        blocks_hit = max(blocks_hit, st.get("blocks_hit", 0))
+        blocks_known = max(blocks_known, st.get("blocks_known", 0))
         if st.get("crashes_reproducible"):
             break
     ctx.emit("fuzz.channels", payload={"channels": channels, "flags": len(flags), **totals})
-    return {}
+    # Block coverage: how much of the recovered code the campaign actually reached. A parser
+    # that fuzzed for a full budget but hit 3% of blocks never got past its length check.
+    pct = round(100.0 * blocks_hit / blocks_known, 1) if blocks_known else None
+    summary = {"backend": "blind", "execs": totals["execs"], "crashes": totals["crashes"],
+               "coverage": {"kind": "block", "blocks_hit": blocks_hit,
+                            "blocks_known": blocks_known, "pct": pct}}
+    sha = ctx.put_artifact("fuzz-summary", data=canonical_json(summary))
+    return {"output_shas": [sha], "output_kind": "fuzz-summary"}
 
 
 def _structure_mutator(p, rng, dictionary):

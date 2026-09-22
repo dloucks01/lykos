@@ -115,7 +115,9 @@ def _hostname_only(value: str) -> str:
 
 _RUN_ID = re.compile(r"^/runs/([^/]+)$")
 _RUN_CANCEL = re.compile(r"^/runs/([^/]+)/cancel$")
+_RUN_OUTPUT = re.compile(r"^/runs/([^/]+)/output$")
 _TARGET_INVOKE = re.compile(r"^/targets/([^/]+)/invocation$")
+_TARGET_REPLAY = re.compile(r"^/targets/([^/]+)/replay$")
 _TARGET_CAPS = re.compile(r"^/targets/([^/]+)/capabilities$")
 _CASE_ID = re.compile(r"^/cases/([^/]+)$")
 _TARGET_ID = re.compile(r"^/targets/([^/]+)$")
@@ -133,22 +135,72 @@ _FIND_ID = re.compile(r"^/findings/([^/]+)$")
 _TARGET_DYN = re.compile(r"^/targets/([^/]+)/dynresults$")
 _TARGET_POC = re.compile(r"^/targets/([^/]+)/pocs$")
 _TARGET_ADVICE = re.compile(r"^/targets/([^/]+)/advice$")
+_TARGET_SOURCE = re.compile(r"^/targets/([^/]+)/source$")
 _CASE_REPORT = re.compile(r"^/cases/([^/]+)/report$")
 _CASE_EXPORT = re.compile(r"^/cases/([^/]+)/export$")
 _CASE_SYSMAP = re.compile(r"^/cases/([^/]+)/systemmap$")
+_CASE_VERIFS = re.compile(r"^/cases/([^/]+)/verifications$")
+_CASE_AUTOPILOT = re.compile(r"^/cases/([^/]+)/autopilot$")
+_CASE_AUTOPILOT_CANCEL = re.compile(r"^/cases/([^/]+)/autopilot/cancel$")
 
 
 def _read_ui() -> bytes:
     """Load the UI page — works from a filesystem checkout AND from a zipapp (.pyz)."""
+    return _read_static("index.html")
+
+
+# Assets the SPA loads after index.html: the vendored ESM runtime and the app modules.
+# Only these subtrees are served, and only plain web asset types -- nothing else under the
+# package is reachable, and a name with `..` or a leading slash never resolves.
+_STATIC_ASSET = re.compile(
+    r"^/((?:app|vendor)/(?!\.\.?(?:/|$))[A-Za-z0-9._-]+(?:/(?!\.\.?(?:/|$))[A-Za-z0-9._-]+)*)$")
+_ASSET_TYPES = {
+    ".js": "text/javascript; charset=utf-8",
+    ".mjs": "text/javascript; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".json": "application/json; charset=utf-8",
+    ".map": "application/json; charset=utf-8",
+    ".html": "text/html; charset=utf-8",
+    ".svg": "image/svg+xml",
+    ".ico": "image/x-icon",
+    ".woff2": "font/woff2",
+}
+
+
+def _read_static(relpath: str) -> bytes:
+    """Read one file under lykos/api/static — from a checkout AND from a zipapp (.pyz).
+
+    `relpath` is already validated by the route regex: no `..`, no leading slash, no
+    backslash. It is joined component-by-component so a traversal can never form even if the
+    regex is later loosened.
+    """
+    parts = [p for p in relpath.split("/") if p and p != "."]
+    if any(p == ".." for p in parts):
+        raise FileNotFoundError(relpath)
     try:
         from importlib import resources
-        return (resources.files("lykos.api") / "static" / "index.html").read_bytes()
+        node = resources.files("lykos.api") / "static"
+        for p in parts:
+            node = node / p
+        return node.read_bytes()
+    except FileNotFoundError:
+        raise
     except Exception:
-        return (Path(__file__).parent / "static" / "index.html").read_bytes()
+        base = (Path(__file__).parent / "static").resolve()
+        target = base.joinpath(*parts).resolve()
+        if base != target and base not in target.parents:
+            raise FileNotFoundError(relpath)
+        return target.read_bytes()
 
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+
+    # Server-side Autopilot runs, keyed by case. Each is {thread, status, stop}. In-memory (one
+    # server process): a run survives the client tab closing, its results persist in the case DB,
+    # and a reopened case shows them. Class-level so it is shared across request threads.
+    _AUTOPILOTS: dict = {}
+    _AUTOPILOTS_LOCK = threading.Lock()
 
     # silence + AF_UNIX-safe logging
     def log_message(self, *a):  # noqa: D401
@@ -278,6 +330,23 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _static_asset(self, relpath: str) -> None:
+        """Serve one vendored/app asset with the right media type."""
+        try:
+            body = _read_static(relpath)
+        except Exception:
+            return self._json({"error": "not found"}, 404)
+        ext = os.path.splitext(relpath)[1].lower()
+        self.send_response(200)
+        self.send_header("Content-Type", _ASSET_TYPES.get(ext, "application/octet-stream"))
+        self.send_header("Content-Length", str(len(body)))
+        # These are content-hashed by name in practice and change only on redeploy; a short
+        # cache keeps a reload from re-fetching the whole runtime while never going stale
+        # across a version bump the operator would notice.
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        self.wfile.write(body)
+
     # ---- GET ----
     def do_GET(self):
         # Reads leak case data too: findings, artifact blobs, the whole-case export. A
@@ -303,6 +372,11 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if path in ("/", "/index.html"):
                 return self._static()
+            if path == "/classic.html":       # the preserved single-file UI, linked from the app
+                return self._static_asset("classic.html")
+            m = _STATIC_ASSET.match(path)
+            if m:
+                return self._static_asset(m.group(1))
             if path == "/favicon.ico":
                 self.send_response(204)
                 self.end_headers()
@@ -393,6 +467,12 @@ class Handler(BaseHTTPRequestHandler):
             m = _CASE_SYSMAP.match(path)
             if m:
                 return self._get_systemmap(m.group(1))
+            m = _CASE_VERIFS.match(path)
+            if m:
+                return self._get_verifications(m.group(1))
+            m = _CASE_AUTOPILOT.match(path)
+            if m:
+                return self._get_autopilot(m.group(1))
             m = _FIND_ID.match(path)
             if m:
                 s = self._store()
@@ -415,6 +495,9 @@ class Handler(BaseHTTPRequestHandler):
             m = _TARGET_ADVICE.match(path)
             if m:
                 return self._get_advice(m.group(1))
+            m = _TARGET_SOURCE.match(path)
+            if m:
+                return self._get_target_source(m.group(1))
             m = _TARGET_CAPS.match(path)
             if m:
                 return self._get_capabilities(m.group(1))
@@ -445,6 +528,9 @@ class Handler(BaseHTTPRequestHandler):
             m = _TARGET_ID.match(path)
             if m:
                 return self._get_target(m.group(1))
+            m = _RUN_OUTPUT.match(path)
+            if m:
+                return self._get_run_output(m.group(1))
             m = _RUN_ID.match(path)
             if m:
                 return self._get_run(m.group(1))
@@ -480,10 +566,19 @@ class Handler(BaseHTTPRequestHandler):
             m = _TARGET_INVOKE.match(path)
             if m:
                 return self._check_invocation(m.group(1))
+            m = _TARGET_REPLAY.match(path)
+            if m:
+                return self._replay_input(m.group(1))
             if path == "/format/analyze":
                 return self._format_analyze()
             if path == "/import":
                 return self._import_case()
+            m = _CASE_AUTOPILOT_CANCEL.match(path)
+            if m:
+                return self._cancel_autopilot(m.group(1))
+            m = _CASE_AUTOPILOT.match(path)
+            if m:
+                return self._start_autopilot(m.group(1))
             self._json({"error": "not found"}, 404, close=True)
         except _TruncatedBody as e:
             self._json({"error": f"request body truncated: {e}"}, 400, close=True)
@@ -582,6 +677,84 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(found)
         finally:
             s.close()
+
+    def _replay_input(self, tid):
+        """Re-run a crashing input several times to confirm it is a TRUE, deterministic crash.
+
+        A demonstrated finding is only trustworthy if its own reproducer fires every time; a
+        crash that appears once in five runs is flaky evidence, not a proof. This is the
+        false-positive review: it replays the recorded crashing input in the sandbox N times
+        and reports how many crashed and with which signal, so the workbench can badge a finding
+        verified or flag it flaky. Bounded (<=10 runs, short timeout) so it is cheap and safe.
+        """
+        from ..analyze.review import replay_verdict
+        body = self._json_body()
+        if body is None:
+            return
+        input_sha = (body or {}).get("input_sha")
+        times = max(1, min(int((body or {}).get("times", 5)), 10))
+        timeout = float((body or {}).get("timeout", 8))
+        s = self._store()
+        try:
+            t = s.targets.get(tid)
+            if not t:
+                return self._json({"error": "no target"}, 404)
+            if not input_sha:
+                return self._json({"error": "input_sha required"}, 400)
+            # The replay + verdict persistence is shared with the server-side Autopilot's review
+            # pass; run_input() there handles delivery mode, argv placement and NUL-safe argv.
+            verdict = replay_verdict(s, t, input_sha, times=times, timeout=timeout)
+            if verdict is None:
+                return self._json({"error": "unknown input"}, 404)
+            return self._json(verdict)
+        finally:
+            s.close()
+
+    def _start_autopilot(self, cid):
+        """Start (or restart) a server-side Autopilot for a case: a daemon thread that drives the
+        pipeline to a PoC and keeps running after the client disconnects."""
+        from ..analyze import orchestrate
+        body = self._json_body() or {}
+        s = self._store()
+        try:
+            if not s.cases.get(cid):
+                return self._json({"error": "no case"}, 404)
+            target_ids = body.get("target_ids") or [t.id for t in s.targets.list_by_case(cid)]
+        finally:
+            s.close()
+        if not target_ids:
+            return self._json({"error": "no targets to analyse"}, 400)
+        with Handler._AUTOPILOTS_LOCK:
+            cur = Handler._AUTOPILOTS.get(cid)
+            if cur and cur["thread"].is_alive():
+                return self._json({"error": "already running", "status": cur["status"]}, 409)
+            status = {"state": "starting", "stage": None, "target": 0, "targets": len(target_ids)}
+            stop = threading.Event()
+            th = threading.Thread(
+                target=orchestrate.run_case_autopilot,
+                args=(self.server.case_dir, cid, target_ids, status, stop),
+                name=f"autopilot-{cid[:8]}", daemon=True)
+            Handler._AUTOPILOTS[cid] = {"thread": th, "status": status, "stop": stop}
+            th.start()
+        return self._json({"started": True, "targets": len(target_ids)}, 202)
+
+    def _get_autopilot(self, cid):
+        """The status of a case's server-side Autopilot, for polling from the UI."""
+        with Handler._AUTOPILOTS_LOCK:
+            rec = Handler._AUTOPILOTS.get(cid)
+            if not rec:
+                return self._json({"state": "none"})
+            st = dict(rec["status"])
+            st["running"] = rec["thread"].is_alive()
+        return self._json(st)
+
+    def _cancel_autopilot(self, cid):
+        with Handler._AUTOPILOTS_LOCK:
+            rec = Handler._AUTOPILOTS.get(cid)
+            if not rec:
+                return self._json({"error": "no run"}, 404)
+            rec["stop"].set()
+        return self._json({"cancelling": True})
 
     def _cancel_run(self, run_id):
         """Stop a running stage.
@@ -843,6 +1016,34 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             s.close()
 
+    def _get_verifications(self, cid):
+        """The false-positive review verdicts for a case, `{input_sha: verdict}` (the latest for
+        each input). Persisted as `replay-verdict` artifacts by the replay endpoint; without a way
+        to read them back, a REOPENED case lost every VerifyBadge (the live run gets them from the
+        event stream, a reopen has no stream). Mirrors the report model's verdict aggregation."""
+        s = self._store()
+        try:
+            if not s.cases.get(cid):
+                return self._json({"error": "no case"}, 404)
+            verdicts: dict = {}
+            for a in s.artifacts.list_by_case(cid):
+                if a.kind != "replay-verdict":
+                    continue
+                m = a.meta or {}
+                ish = m.get("input_sha")
+                if not ish:
+                    continue
+                at = a.created_at or 0
+                if ish not in verdicts or at > verdicts[ish].get("_at", 0):
+                    verdicts[ish] = {"runs": m.get("runs"), "crashed": m.get("crashed"),
+                                     "signal": m.get("signal"),
+                                     "deterministic": m.get("deterministic"), "_at": at}
+            for v in verdicts.values():
+                v.pop("_at", None)
+            return self._json(verdicts)
+        finally:
+            s.close()
+
     def _import_case(self):
         """Merge an uploaded case archive (per-case or whole-store .tar.gz) into the store."""
         ctype = self.headers.get("Content-Type", "")
@@ -901,6 +1102,55 @@ class Handler(BaseHTTPRequestHandler):
             cachehit = any(e.type == "job.cachehit"
                            for e in s.events.list(run_id=rid, limit=1000))
             return self._json({**_run(r), "outputs": outputs, "from_cache": cachehit})
+        finally:
+            s.close()
+
+    def _get_target_source(self, tid):
+        """The source a target was compiled from, when it came from a source drop.
+
+        A source upload is compiled to an instrumented binary at ingest and analysed as that
+        binary; the original source is kept as an artifact keyed to the binary's hash, so the
+        code view can show real source instead of disassembly. Returns {source: null} for an
+        ordinary binary target.
+        """
+        s = self._store()
+        try:
+            t = s.targets.get(tid)
+            if not t:
+                return self._json({"error": "no target"}, 404)
+            for a in s.artifacts.list_by_case(t.case_id):
+                if a.kind == "source-code" and (a.meta or {}).get("binary_sha") == t.sha256:
+                    try:
+                        text = s.content.get_bytes(a.sha256).decode("utf-8", "replace")
+                    except Exception:
+                        text = None
+                    m = a.meta or {}
+                    return self._json({"source": text, "filename": m.get("filename"),
+                                       "compiler": m.get("compiler"), "sanitizers": m.get("sanitizers")})
+            return self._json({"source": None})
+        finally:
+            s.close()
+
+    def _get_run_output(self, rid):
+        """The parsed JSON a stage produced -- what actually happened, for the run log.
+
+        The run row carries status and error but not the stage's own result (how many execs
+        the fuzzer ran, how many functions were recovered, what the crash signal was). That
+        lives in the run's 'output' artifact; this surfaces it so the UI can say what a stage
+        found instead of only that it finished.
+        """
+        from ..jobs.registry import cached_output_json
+        s = self._store()
+        try:
+            r = s.runs.get(rid)
+            if not r:
+                return self._json({"error": "no run"}, 404)
+            try:
+                out = cached_output_json(s, rid)
+            except Exception:
+                out = None
+            return self._json({"run_id": rid, "stage": r.stage, "status": r.status,
+                               "error": r.error, "output": out})
         finally:
             s.close()
 
@@ -1187,8 +1437,11 @@ def _target(t):
 
 
 def _poc(x):
-    return {"id": x.id, "level": x.level, "verified": x.verified, "signal": x.signal_name,
-            "input_sha": x.input_sha, "bundle_sha": x.bundle_sha, "created_at": x.created_at}
+    # finding_id links the PoC to the defect it proves. Without it the workbench cannot tell
+    # which finding a bundle belongs to and would offer the same download on every card.
+    return {"id": x.id, "finding_id": x.finding_id, "level": x.level, "verified": x.verified,
+            "signal": x.signal_name, "input_sha": x.input_sha, "bundle_sha": x.bundle_sha,
+            "created_at": x.created_at}
 
 
 def _dynresult(d):
@@ -1211,7 +1464,9 @@ def _finding(f, sites=None, site_count=None, proven=0):
     d = {"id": f.id, "target_id": f.target_id, "case_id": f.case_id, "cwe": f.cwe,
          "title": f.title, "severity": f.severity, "state": f.state,
          "confidence": f.confidence, "function_addr": f.function_addr,
-         "site_addr": f.site_addr, "detector": f.detector, "evidence": f.evidence}
+         "site_addr": f.site_addr, "detector": f.detector, "evidence": f.evidence,
+         # the dedup key lets the UI fold an unlocated crash into its located, analysed twin
+         "dedup_key": f.dedup_key}
     if sites is not None:
         d["sites"] = sites
     d["site_count"] = len(sites) if sites is not None else (site_count or 0)

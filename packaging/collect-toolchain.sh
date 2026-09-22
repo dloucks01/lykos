@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 # Build the air-gap TOOLCHAIN bundle. Run on a machine WITH network; carry the result to the
-# air-gapped workstation and run install.sh from the extracted bundle.
+# air-gapped workstation and run setup.sh from the extracted bundle (nothing is installed).
 #
 # The lykos repo itself needs no bundle -- clone it and the stdlib-only core runs. This carries
 # the optional engines (Ghidra, qemu-user, GDB, AFL++, Wine, cross compilers, the angr/Unicorn
 # venvs), which are too large for git and turn a working platform into a complete one.
 #
-# THE BUNDLE IS DISTRIBUTION-SPECIFIC. A .deb, a compiled emulator and a Python venv all bind
-# to the C library and interpreter they were built against, so a bundle collected on one distro
-# is not installable on another -- and the failure is not graceful: dpkg leaves a half-configured
-# system, and a venv raises ImportError at first use rather than at install. So by default this
-# collects INSIDE A CONTAINER MATCHING THE TARGET, not from this host.
+# THE BUNDLE IS DISTRIBUTION-SPECIFIC. An extracted glibc-linked binary, a compiled emulator
+# and a Python venv all bind to the C library and interpreter they were built against, so a
+# bundle collected on one distro does not run on another -- and the failure is not graceful: a
+# binary aborts on a symbol its host libc lacks, and a venv raises ImportError at first use. So
+# by default this collects INSIDE A CONTAINER MATCHING THE TARGET, not from this host.
 #
 #   ./packaging/collect-toolchain.sh                      # Kali rolling (default)
 #   ./packaging/collect-toolchain.sh --image kalilinux/kali-rolling:2025.3
@@ -36,6 +36,8 @@ done
 say(){ printf '\n== %s\n' "$*"; }
 die(){ echo "ERROR: $*" >&2; exit 1; }
 
+# ONE build with every capability. The list comes from lykos.toolchain; rizin/rz-ghidra +
+# pypcode is the RE backend (Ghidra is replaced and carries no apt), everything else is pulled.
 PKGS="$(PYTHONPATH="$ROOT/core" python3 -c \
   'from lykos import toolchain; print(" ".join(toolchain.apt_packages()))')"
 [ -n "$PKGS" ] || die "could not read the package list from lykos.toolchain"
@@ -64,7 +66,7 @@ echo "  target:   $IMAGE"
 echo "  host:     $(. /etc/os-release; echo "$PRETTY_NAME") -- drives the container only"
 echo "  packages: $(echo "$PKGS" | wc -w)"
 
-cp "$ROOT/packaging/install-toolchain.sh" "$WORK/install.sh"
+cp "$ROOT/packaging/setup-toolchain.sh" "$WORK/setup.sh"
 
 # ONE finished archive comes back out. Loose files cannot work across both runtimes: rootless
 # podman maps container-root to the invoking user, so chowning to the real uid INSIDE pushes
@@ -83,8 +85,12 @@ say "collector prerequisites (container only)"
 apt-get -qq install -y --no-install-recommends \
         python3 python3-venv python3-pip ca-certificates zstd >/dev/null 2>&1
 
-mkdir -p /stage/debs /stage/venvs /stage/manifest /stage/extras /stage/afl-qemu
-cp /out/install.sh /stage/install.sh && chmod +x /stage/install.sh
+# The bundle installs NOTHING on the air-gapped side: it ships a relocatable toolchain/ tree
+# the engines run out of in place. So here we DOWNLOAD the debs and then EXTRACT them into that
+# tree (dpkg-deb -x, data only, no maintainer scripts, no dpkg database) rather than shipping
+# the .deb files for a dpkg install.
+mkdir -p /tmp/debs /stage/toolchain /stage/venvs /stage/manifest /stage/extras /stage/afl-qemu
+cp /out/setup.sh /stage/setup.sh && chmod +x /stage/setup.sh
 
 say "resolving availability"
 HAVE=""; GONE=""
@@ -96,21 +102,39 @@ done
 
 say "downloading debs (with dependencies)"
 # --reinstall so packages already in the image are still fetched; without it a fatter base
-# image silently yields a thinner bundle.
-apt-get -o Dir::Cache::archives=/stage/debs install --reinstall --download-only -y $HAVE \
-  >/dev/null 2>&1
-rm -rf /stage/debs/partial /stage/debs/lock
-printf "  %s debs, %s\n" "$(find /stage/debs -name "*.deb" | wc -l)" \
-                         "$(du -sh /stage/debs | cut -f1)"
+# image silently yields a thinner bundle. kali-rolling is a MOVING target: over a long, slow
+# download the mirror can sync mid-flight, so a .deb no longer matches the Packages index that
+# apt update just read -- apt aborts with a hash-sum mismatch (exit 100). Retry, refreshing the
+# index each time so apt re-reads the mirror current state, and let apt own stderr through (the
+# old 2>redirect hid exactly this error). Acquire::Retries also rides out a transient per-URL
+# fetch drop. NOTE: this whole block runs inside a single-quoted -c string -- no apostrophes.
+mkdir -p /tmp/debs/partial
+tries=0
+until apt-get -o Dir::Cache::archives=/tmp/debs -o Acquire::Retries=5 \
+        install --reinstall --download-only -y $HAVE >/dev/null; do
+  tries=$((tries + 1))
+  [ "$tries" -ge 4 ] && { echo "  ERROR: deb download still failing after $tries attempts" >&2; exit 1; }
+  echo "  download failed (attempt $tries) -- refreshing the index and retrying" >&2
+  apt-get -qq update 2>/dev/null || true
+  sleep 5
+done
+rm -rf /tmp/debs/partial /tmp/debs/lock
+printf "  %s debs, %s\n" "$(find /tmp/debs -name "*.deb" | wc -l)" \
+                         "$(du -sh /tmp/debs | cut -f1)"
+
+say "extracting debs into a relocatable toolchain/ tree (no install)"
+for d in /tmp/debs/*.deb; do dpkg-deb -x "$d" /stage/toolchain; done
+rm -rf /tmp/debs
+printf "  toolchain/ is %s\n" "$(du -sh /stage/toolchain | cut -f1)"
 
 # Ghidra is a REQUIRED engine. In the container path extras/ is not populated (the repo is not
 # mounted in), so if this image also does not package Ghidra the bundle ships without it -- warn
-# loudly rather than let the air-gapped install discover it at first disassemble.
-if [ -z "$(find /stage/debs -iname "ghidra*.deb" 2>/dev/null | head -1)" ] && \
-   [ -z "$(ls -A /stage/extras 2>/dev/null)" ]; then
-  echo "  WARNING: Ghidra (REQUIRED) is not an apt package in this image and no extras/ was"
-  echo "           staged -- this bundle will install WITHOUT Ghidra. Collect on an image that"
-  echo "           packages it (Kali), or add Ghidra to the extras/ dir before packing."
+# loudly rather than let the air-gapped setup discover it at first disassemble.
+# The RE backend is rizin/rz-ghidra + pypcode (Ghidra is replaced, no JVM). What must not be
+# missing is the native backend itself -- warn if rizin did not land in the tree.
+if [ -z "$(find /stage/toolchain -iname "rizin" -o -iname "rz-ghidra*" 2>/dev/null | head -1)" ]; then
+  echo "  WARNING: rizin (the RE backend) is not in this bundle -- disassembly will have no"
+  echo "           default engine. Collect on an image that packages rizin + rz-ghidra (Kali)."
 fi
 
 say "python venvs (this distro s interpreter)"
@@ -126,6 +150,16 @@ for spec in "angr:angr" "unicorn:unicorn keystone-engine"; do
   fi
 done
 
+say "vendored python site (pypcode = Ghidra P-Code IR, no JVM)"
+mkdir -p /stage/pysite
+if python3 -m pip install --target /stage/pysite pypcode >/dev/null 2>&1; then
+  echo "  pypcode -> pysite ($(python3 -V 2>&1))"
+else
+  echo "  WARNING: pypcode unavailable -- the native RE backend will decompile but P-Code-based"
+  echo "           memory-safety detection (taint/bounds/int-overflow) will degrade"
+  rm -rf /stage/pysite; mkdir -p /stage/pysite
+fi
+
 say "manifest"
 {
   . /etc/os-release
@@ -135,9 +169,11 @@ say "manifest"
   echo "arch:           $(uname -m)"
   echo "built:          $(date -Is)"
   echo
-  echo "Installable on the distribution above. A .deb, a compiled emulator and a"
-  echo "Python venv each bind to the C library and interpreter they were built"
-  echo "against; installing this elsewhere fails, and not gracefully."
+  echo "Runs IN PLACE on the distribution above -- nothing is installed. The debs are"
+  echo "extracted into toolchain/ and lykos puts that tree on its own PATH. A compiled"
+  echo "emulator, an extracted glibc-linked binary and a Python venv each bind to the C"
+  echo "library and interpreter they were built against; running this on another distro"
+  echo "fails, and not gracefully."
   echo
   echo "NOT included, deliberately:"
   echo "  afl-qemu-trace  compiled emulators, guest fixed at build time --"
@@ -167,11 +203,12 @@ $(cat "$OUT.sha256")
 
 The .sha256 and the bundle's SHA256SUMS are UNSIGNED: they prove the bundle arrived
 un-corrupted and un-added-to, not that it is authentic. Carry it over a trusted channel.
-(Future: sign SHA256SUMS and verify the signature at install time.)
+(Future: sign SHA256SUMS and verify the signature at setup time.)
 
-On the air-gapped host -- carry the repo, this file and its .sha256, and verify on ARRIVAL:
+On the air-gapped host -- carry the repo, this file and its .sha256, and verify on ARRIVAL.
+Nothing is installed: the toolchain is placed under the repo's vendor/ and run in place.
   sha256sum -c $(basename "$OUT").sha256
   mkdir -p /tmp/lt && tar xf $(basename "$OUT") -C /tmp/lt
-  /tmp/lt/install.sh --verify-only            # checksums only, installs nothing
-  cd <lykos checkout> && LYKOS_ROOT=\$PWD /tmp/lt/install.sh
+  /tmp/lt/setup.sh --verify-only              # checksums only, places nothing
+  cd <lykos checkout> && LYKOS_ROOT=\$PWD /tmp/lt/setup.sh
 EOF

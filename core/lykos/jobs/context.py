@@ -113,6 +113,11 @@ class JobContext:
                        **popen_kw: Any) -> subprocess.CompletedProcess:
         """Run a child in its own process group; kill the group on cancel/timeout/deadline."""
         start = time.time()
+        # A tool subprocess must never inherit the server's stdin: a worker's stdin can be an open
+        # pipe (not /dev/null), and tools like rizin then BLOCK reading it as a command stream --
+        # the stage hangs at "running" with no CPU. Default to /dev/null; a caller that genuinely
+        # feeds stdin can still override via popen_kw.
+        popen_kw.setdefault("stdin", subprocess.DEVNULL)
         proc = subprocess.Popen(cmd, start_new_session=True,
                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, **popen_kw)
         while True:

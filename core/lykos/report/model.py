@@ -11,6 +11,32 @@ from typing import Any, Optional
 
 from .. import __version__ as _lykos_version
 from ..analyze.detect import catalog
+from ..jobs.registry import cached_output_json
+
+
+def _best_coverage(store, runs) -> Optional[dict]:
+    """The best fuzzing coverage this target reached, read from its fuzz runs' summaries. Block
+    coverage (percent of recovered code) wins over AFL's edge count. Included in the report so
+    "0 crashes" can be read against how much of the binary was actually exercised."""
+    best = None
+    for r in runs:
+        if r.status != "done" or not (r.stage or "").endswith("fuzz"):
+            continue
+        try:
+            out = cached_output_json(store, r.id)
+        except Exception:
+            out = None
+        cov = (out or {}).get("coverage") if isinstance(out, dict) else None
+        if not cov:
+            continue
+        if cov.get("kind") == "block" and cov.get("blocks_known"):
+            pct = cov.get("pct")
+            if pct is not None and (best is None or best.get("pct") is None or pct > best["pct"]):
+                best = {"kind": "block", "pct": pct, "blocks_hit": cov.get("blocks_hit"),
+                        "blocks_known": cov.get("blocks_known")}
+        elif cov.get("kind") == "edge" and best is None:
+            best = {"kind": "edge", "edges": cov.get("edges_found")}
+    return best
 from ..db.dao import (
     AnalysisRunDAO,
     DynResultDAO,
@@ -122,7 +148,22 @@ def build_report(
     by_severity: dict[str, int] = {}
     poc_levels: dict[str, int] = {}
 
+    all_runs = rdao.list_by_case(case_id)
+    # False-positive review verdicts (replay determinism), keyed by the input they reviewed,
+    # keeping the latest for each -- so the report carries "verified 5/5" / "flaky 2/5".
+    verdicts: dict[str, dict] = {}
+    for a in store.artifacts.list_by_case(case_id):
+        if a.kind != "replay-verdict":
+            continue
+        m = a.meta or {}
+        ish = m.get("input_sha")
+        if ish and (ish not in verdicts or (a.created_at or 0) > verdicts[ish].get("_at", 0)):
+            verdicts[ish] = {"runs": m.get("runs"), "crashed": m.get("crashed"),
+                             "signal": m.get("signal"), "deterministic": m.get("deterministic"),
+                             "_at": a.created_at or 0}
+
     for t in tdao.list_by_case(case_id):
+        _target_runs = [r for r in all_runs if r.target_id == t.id]
         pocs = pdao.list_by_target(t.id)
         pocs_by_finding: dict[str, list] = {}
         for p in pocs:
@@ -181,13 +222,21 @@ def build_report(
                 if d:
                     f_crashes.append(_crash_dict(d))
 
+            # The review verdict for this finding: the replay result of any of its inputs.
+            fv = None
+            for p in f_pocs:
+                if p.get("input_sha") in verdicts:
+                    v = verdicts[p["input_sha"]]
+                    fv = {k: v[k] for k in ("runs", "crashed", "signal", "deterministic")}
+                    break
+
             findings_out.append({
                 "id": f.id, "cwe": f.cwe, "cwe_name": catalog.name(f.cwe) if f.cwe else None,
                 "title": f.title, "severity": f.severity, "state": f.state,
                 "confidence": round(f.confidence or 0.0, 3),
                 "function_addr": f.function_addr, "site_addr": f.site_addr,
                 "detector": f.detector, "evidence": f.evidence or [],
-                "pocs": f_pocs, "crashes": f_crashes,
+                "pocs": f_pocs, "crashes": f_crashes, "verification": fv,
                 "created_at": _iso(f.created_at), "updated_at": _iso(f.updated_at),
             })
             tot_findings += 1
@@ -205,6 +254,7 @@ def build_report(
                 "stripped": t.stripped, "mitigations": t.mitigations or {},
                 "runtime": _runtime(t),
                 "entropy": t.entropy, "ingested_at": _iso(t.ingested_at),
+                "fuzz_coverage": _best_coverage(store, _target_runs),
                 "findings": findings_out,
             })
 

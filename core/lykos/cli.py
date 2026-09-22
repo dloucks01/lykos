@@ -176,10 +176,11 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     ask, and "the stage declined" is a poor way to find out Ghidra was never installed."""
     import json
 
-    from . import toolchain
+    from . import toolchain, vendorenv
     if args.json:
         print(json.dumps(toolchain.as_dict(), indent=2))
     else:
+        print(vendorenv.status_line())
         print(toolchain.report(verbose=args.verbose))
     if args.strict:
         return 1 if toolchain.missing("required") else 0
@@ -258,6 +259,12 @@ def _cmd_eval(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Before any command runs a tool locator, point the environment at the run-in-place
+    # toolchain under vendor/ (a no-op when there is none). This is what lets the air-gap
+    # bundle work with nothing installed: every locator resolves through PATH, and this puts
+    # the vendored bin/lib dirs on it. See vendorenv.activate.
+    from . import vendorenv
+    vendorenv.activate()
     parser = build_parser()
     args = parser.parse_args(argv)
     return args.func(args)

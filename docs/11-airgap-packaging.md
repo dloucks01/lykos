@@ -9,11 +9,11 @@ Air-gap is a hard constraint on *every* component. Nothing may fetch at runtime.
   and distributed as one `.tar.zst` so installation needs no network.
 - Pin **exact versions** of everything; record them so findings are reproducible (doc 12). The
   bundle's `manifest/BUNDLE.txt` records the target distro, glibc, Python and build date.
-- Verify integrity on install. **Current state:** the bundle carries an *unsigned* `SHA256SUMS`
-  manifest; `install.sh` checks every listed file's hash and refuses any file present but not
+- Verify integrity on setup. **Current state:** the bundle carries an *unsigned* `SHA256SUMS`
+  manifest; `setup.sh` checks every listed file's hash and refuses any file present but not
   listed, so the guarantee is corruption-resistance and no-added-files — not authenticity. Carry
   the bundle over a trusted channel. **Planned:** sign `SHA256SUMS` and verify the signature at
-  install time, upgrading the guarantee to authenticity.
+  setup time, upgrading the guarantee to authenticity.
 
 ## 11.2 Bundled data packs (versioned + dated)
 | Pack | Contents | Why dated matters |

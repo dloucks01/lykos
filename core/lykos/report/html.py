@@ -130,6 +130,13 @@ def _target_html(t: dict) -> str:
         # arch/bits/endianness are placeholders triage fills for a substrate that has no
         # processor; printing "jvm/64 big" describes nothing and reads like a CPU.
         rows.append(("Runtime", rt.get("label")))
+    cov = t.get("fuzz_coverage")
+    if cov:
+        cov_txt = (f'{cov.get("pct")}% of blocks ({cov.get("blocks_hit")}/{cov.get("blocks_known")})'
+                   if cov.get("kind") == "block" and cov.get("pct") is not None
+                   else f'{cov.get("edges")} edges' if cov.get("kind") == "edge"
+                   else "—")
+        rows.append(("Fuzz coverage", cov_txt))
     p.append(_kv(rows))
     if rt.get("ceiling_why"):
         p.append(f'<p class="ceiling"><b>Analysis ceiling — {esc(rt.get("ceiling"))}.</b> '
@@ -152,6 +159,11 @@ def _finding_html(f: dict) -> str:
     p.append(f'<span class="ftitle">{esc(f.get("title") or f.get("cwe") or "finding")}</span>')
     p.append(_badge(sev, _SEV_COLOR.get(sev, "#8b8d98")))
     p.append(_badge(state, _STATE_COLOR.get(state, "#8b8d98")))
+    v = f.get("verification")
+    if v and v.get("runs"):
+        ok = v.get("crashed") == v.get("runs")
+        p.append(_badge(f'{"verified" if ok else "flaky"} {v.get("crashed")}/{v.get("runs")}',
+                        "#3fb950" if ok else "#d29922"))
     p.append('</div>')
     cwe = f.get("cwe")
     p.append(_kv([
