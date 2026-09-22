@@ -370,21 +370,39 @@ def _disable_aslr():
         pass
 
 
-def _rlimits(mem_mb: int, cpu_s: int, set_as: bool, nproc: Optional[int] = None):
+# A GENEROUS virtual-address cap for emulated (qemu-user) and Wine targets. A tight RLIMIT_AS
+# breaks qemu's guest reservation, but an uncapped run lets a guest/PE memory bomb map host memory
+# without bound and OOM the platform -- so bound it well above normal need but finite. Empirically
+# qemu-user runs comfortably under a few GB; 8 GB leaves ample headroom while stopping a runaway.
+_EMU_AS_MB = 8192
+
+
+def _rlimits(mem_mb: int, cpu_s: int, set_as: bool, nproc: Optional[int] = None,
+             as_mb: Optional[int] = None):
+    """Per-child resource caps. `set_as` caps RLIMIT_AS at `mem_mb` (the tight native/sanitizer-off
+    bound); `as_mb`, when given, caps it at that value instead (the generous emu/wine bound) so no
+    execution path is left with UNBOUNDED memory. Each limit is set in its own try so a platform
+    that rejects one (e.g. RLIMIT_NPROC EPERM) cannot skip the safety-critical AS cap -- which is
+    applied FIRST for that reason."""
     if nproc is None:
         nproc = _nproc_cap(False)              # default: baseline-aware native cap
+    cap_mb = (mem_mb if set_as else as_mb)
     def _apply():
         _disable_aslr()
-        try:
-            resource.setrlimit(resource.RLIMIT_CPU, (cpu_s, cpu_s + 1))
-            resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-            resource.setrlimit(resource.RLIMIT_FSIZE, (64 << 20, 64 << 20))
-            resource.setrlimit(resource.RLIMIT_NPROC, (nproc, nproc))
-            if set_as:
-                lim = mem_mb << 20
+        if cap_mb:                             # AS first: never skipped behind another limit
+            try:
+                lim = cap_mb << 20
                 resource.setrlimit(resource.RLIMIT_AS, (lim, lim))
-        except Exception:
-            pass
+            except Exception:
+                pass
+        for _res, _val in ((resource.RLIMIT_CPU, (cpu_s, cpu_s + 1)),
+                           (resource.RLIMIT_CORE, (0, 0)),
+                           (resource.RLIMIT_FSIZE, (64 << 20, 64 << 20)),
+                           (resource.RLIMIT_NPROC, (nproc, nproc))):
+            try:
+                resource.setrlimit(_res, _val)
+            except Exception:
+                pass
     return _apply
 
 
@@ -473,7 +491,10 @@ def run_reaped(cmd, *, input=None, timeout=None, capture_output=False, **kw):
         kw["stdout"] = subprocess.PIPE
         kw["stderr"] = subprocess.PIPE
     kw.setdefault("start_new_session", True)
-    stdin = subprocess.PIPE if input is not None else kw.pop("stdin", None)
+    # No input to feed => tie stdin to /dev/null, never inherit the worker's stdin: a hostile
+    # inferior (gdb -batch has no input redirect unless a file is given) would otherwise block
+    # reading the server's stdin, the same hang class fixed in jobs.context.run_subprocess.
+    stdin = subprocess.PIPE if input is not None else kw.pop("stdin", subprocess.DEVNULL)
     proc = subprocess.Popen(cmd, stdin=stdin, **kw)
     try:
         out, err = proc.communicate(input=input, timeout=timeout)
@@ -783,8 +804,10 @@ def _run_windows(exe, *, argv, stdin, timeout, mem_mb, capture, wineprefix) -> R
     env = {**os.environ, "WINEPREFIX": prefix, "WINEDEBUG": "fixme-all", "DISPLAY": ""}
     cmd = [wine, str(exe)] + [str(a) for a in argv]
     eff_timeout = max(timeout, 10.0)                   # wine bootstraps a wineserver -> headroom
-    # wine + wineserver need many fds/threads and a large AS; don't cap AS, widen nproc.
-    preexec = _rlimits(mem_mb, int(eff_timeout) + 5, set_as=False, nproc=_nproc_cap(True))
+    # wine + wineserver need many fds/threads and a large AS; use the GENEROUS emu/wine cap (not
+    # the tight native one) so a PE memory bomb still cannot OOM the host, and widen nproc.
+    preexec = _rlimits(mem_mb, int(eff_timeout) + 5, set_as=False, nproc=_nproc_cap(True),
+                       as_mb=max(mem_mb, _EMU_AS_MB))
     # NB: the wine path runs UNWRAPPED (rlimits only, like the original) -- wine needs a writable
     # prefix under ~/.cache and its own service processes, so the bwrap secret-masking that
     # hardens the ELF/JVM paths is deliberately not applied here.
@@ -851,8 +874,12 @@ def run(exe, *, argv=(), stdin: bytes = b"", timeout: float = 10.0,
     # and bound RESIDENT memory instead via ASan's own hard_rss_limit_mb, which caps real RAM
     # (the shadow is sparse) without touching the virtual reservation.
     san = emu is None and _is_sanitizer_exe(exe)
+    # emu: use the GENEROUS AS cap (a tight one breaks qemu's guest reservation, but no cap lets a
+    # guest memory bomb OOM the host). san: no AS cap (the 20TB shadow needs it), bounded by
+    # hard_rss_limit_mb below. native non-san: the tight mem_mb cap.
     preexec = _rlimits(mem_mb, int(eff_timeout) + 2, set_as=(emu is None and not san),
-                       nproc=_nproc_cap(emu is not None or san))
+                       nproc=_nproc_cap(emu is not None or san),
+                       as_mb=(max(mem_mb, _EMU_AS_MB) if emu else None))
     env = None
     if san:
         env = dict(os.environ)
