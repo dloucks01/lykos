@@ -20,7 +20,7 @@ import time
 from typing import Optional
 
 from ..casestore import CaseStore
-from ..db.dao import DynResultDAO, FindingDAO, PocDAO
+from ..db.dao import DynResultDAO, FindingDAO, FunctionDAO, PocDAO
 from ..jobs.queue import JobQueue
 
 # stage -> (module, enqueue-fn). Target-scoped unless listed in _CASE.
@@ -145,6 +145,41 @@ def _finalize_plan(status) -> None:
     status["updated"] = time.time()
 
 
+def _stage_detail(store, target, stage) -> str:
+    """A short 'what it found' summary for a COMPLETED step, shown inline in the plan so the
+    progress view reads as results (`142 functions`, `58% cov · 2 crashes`, `CWE-122`), not just
+    checkmarks. Best-effort: any query failure just yields no detail."""
+    tid = target.id
+    try:
+        if stage == "disassemble":
+            n = FunctionDAO(store.conn).count_by_target(tid)
+            return f"{n} functions" if n else ""
+        if stage == "detect_cwe":
+            n = FindingDAO(store.conn).count_by_target(tid)
+            return f"{n} finding{'s' if n != 1 else ''}" if n else ""
+        if stage in ("coverage_fuzz", "directed_fuzz", "heap_check"):
+            pct = _best_block_pct(store, tid)
+            ncr = sum(1 for d in DynResultDAO(store.conn).list_by_target(tid) if d.crashed)
+            bits = []
+            if pct is not None:
+                bits.append(f"{pct:.0f}% cov")
+            if ncr:
+                bits.append(f"{ncr} crash{'es' if ncr != 1 else ''}")
+            return " · ".join(bits)
+        if stage == "root_cause":
+            cwes = [f.cwe for f in FindingDAO(store.conn).list_by_target(tid) if f.cwe]
+            return cwes[0] if cwes else ""
+        if stage in ("build_poc", "poc_primitive", "build_exploit"):
+            pocs = PocDAO(store.conn).list_by_target(tid)
+            v = sum(1 for p in pocs if getattr(p, "verified", False))
+            if v:
+                return f"{v} verified PoC{'s' if v != 1 else ''}"
+            return f"{len(pocs)} PoC" if pocs else ""
+    except Exception:
+        return ""
+    return ""
+
+
 def _emit_stage(store, case_id, stage, state, *, target_id=None, detail=None) -> None:
     """A structured per-stage event so the log reads as WHAT each step is doing, not just that a
     stage fired: `Directed fuzzing · running`, `Build PoC · done`, `Concolic · skipped`."""
@@ -185,14 +220,16 @@ def _run_target_stage(store, target, stage, status, stop, params=None) -> Option
             reproject_cache_hit(store, stage, target.id, run.id)
         except Exception:
             pass
-        _plan_set(status, stage, "done", "cached")
-        _emit_stage(store, target.case_id, stage, "done", target_id=target.id, detail="cache hit")
+        d = _stage_detail(store, target, stage) or "cached"
+        _plan_set(status, stage, "done", d)
+        _emit_stage(store, target.case_id, stage, "done", target_id=target.id, detail=d)
         return "done"
     outcome = _wait(store, run.id, stop)
     pstate = ({"done": "done", "cancelled": "cancelled", "timeout": "error",
                "error": "error"}).get(outcome, outcome or "error")
-    _plan_set(status, stage, pstate)
-    _emit_stage(store, target.case_id, stage, pstate, target_id=target.id)
+    d = _stage_detail(store, target, stage) if pstate == "done" else None
+    _plan_set(status, stage, pstate, d)
+    _emit_stage(store, target.case_id, stage, pstate, target_id=target.id, detail=d)
     return outcome
 
 
