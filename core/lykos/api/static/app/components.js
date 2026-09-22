@@ -24,6 +24,34 @@ export function SevDot({ severity }) {
   return html`<span class=${`sev sev-${s}`} title=${severity}>${s ? s[0].toUpperCase() : "?"}</span>`;
 }
 
+// The Autopilot pipeline PLAN: what is done, what is running, and what is still to come -- fed by
+// the server-side background run's status.plan, so a glance shows progress, not just a scrolling
+// log. Each step carries a state (pending/running/done/skipped/error/cancelled) and an optional
+// detail. Conditional steps the run never reached show as "skipped".
+const _PLAN_ICON = { done: "✓", error: "✕", skipped: "–", cancelled: "■" };
+export function PipelinePlan({ plan, targetName, target, targets }) {
+  if (!plan || !plan.length) return null;
+  const done = plan.filter((p) => p.state === "done").length;
+  const total = plan.filter((p) => p.state !== "skipped").length || plan.length;
+  return html`
+    <div class="plan card">
+      <div class="plan-head">
+        <span>Pipeline${target && targets > 1 ? ` · target ${target}/${targets}` : ""}${
+          targetName ? html` · <span class="mono">${targetName}</span>` : null}</span>
+        <span class="plan-count">${done}/${total}</span>
+      </div>
+      <ol class="plan-list">
+        ${plan.map((p) => html`
+          <li class=${`plan-step step-${p.state}`} key=${p.stage}>
+            <span class="plan-ico">${p.state === "running"
+              ? html`<span class="st-run"></span>` : (_PLAN_ICON[p.state] || "")}</span>
+            <span class="plan-lbl">${p.label}</span>
+            ${p.detail ? html`<span class="plan-detail">${p.detail}</span>` : null}
+          </li>`)}
+      </ol>
+    </div>`;
+}
+
 // The upload surface. A drop target AND a click-to-pick, because the whole design goal is the
 // fewest clicks: drag a binary onto the page and Autopilot can start on the next click. Accepts
 // several files at once -- multiple binaries in one case unlock the cross-binary analyses.
