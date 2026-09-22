@@ -346,6 +346,27 @@ def test_a_sanitizer_build_is_not_as_capped_and_reaches_its_code(gcc, tmp_path):
     assert res[0].blocks_hit, "the ASan build reached none of its blocks -- it aborted before main()"
 
 
+def test_a_large_stdin_payload_does_not_deadlock_the_traced_path(gcc, tmp_path):
+    """Regression (H5): the tracee is stopped at execve and not yet reading fd 0, so writing a
+    payload larger than the 64 KiB pipe buffer directly -- before continuing it -- deadlocked, and
+    the per-input deadline (checked only inside the trace loop) never fired; the whole batch stalled
+    to the outer budget and was discarded. stdin is now fed from a thread. A 256 KiB payload must
+    complete promptly, not stall."""
+    import time
+    exe = _build(gcc, tmp_path, _ECHO_C, "bigstdin")
+    blocks = _blocks_of(exe)
+    if not blocks:
+        pytest.skip("no function entries recovered")
+    t = time.time()
+    res = sandbox.run_batch(exe, [b"A" * (256 * 1024)], mode="stdin", timeout=5, blocks=blocks)
+    elapsed = time.time() - t
+    if res is None and elapsed < 3:
+        pytest.skip("batched execution unavailable here")
+    # without the fix this returns None only after the outer budget (~timeout+15 s) kills the batch
+    assert elapsed < 15, f"large-stdin batch stalled ({elapsed:.1f}s) -- the H5 deadlock is back"
+    assert res is not None and len(res) == 1
+
+
 def test_different_inputs_take_different_paths(gcc, tmp_path):
     """The whole reason to collect this: an input that reaches somewhere new is worth keeping,
     and output shape alone could not tell the difference."""

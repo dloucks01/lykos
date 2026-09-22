@@ -29,6 +29,7 @@ import signal
 import struct
 import subprocess
 import sys
+import threading
 import time
 
 PTRACE_TRACEME, PTRACE_PEEKTEXT, PTRACE_POKETEXT = 0, 1, 4
@@ -47,6 +48,27 @@ _SPAN_CAP = 32 << 20            # refuse to slurp a span so wide it is cheaper p
 _MAX_DELIVER = 4096
 # Resident-memory cap (MB) for a sanitizer target, since it CANNOT take an RLIMIT_AS cap.
 _SAN_RSS_MB = 4096
+# Virtual-memory cap (MB) for a non-sanitizer batch child, matching _trace_one's cap.
+_BATCH_AS_MB = 4096
+
+
+def _nontraced_preexec(sanitizer):
+    """RLIMIT caps for the NON-traced batch run (blocks == 0). That path runs the target directly
+    with no ptrace, so this preexec is the only place a memory bomb is bounded there -- previously
+    it had none, and it is the steady state of every campaign once coverage saturates. A sanitizer
+    build cannot take an AS cap (its ~20TB shadow); it is bounded by ASAN_OPTIONS hard_rss_limit_mb
+    in the child env instead (set in main)."""
+    def _apply():
+        try:
+            import resource
+            resource.setrlimit(resource.RLIMIT_FSIZE, (64 << 20, 64 << 20))
+            resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+            if not sanitizer:
+                lim = _BATCH_AS_MB << 20
+                resource.setrlimit(resource.RLIMIT_AS, (lim, lim))
+        except Exception:
+            pass
+    return _apply
 
 
 def _is_sanitizer(exe) -> bool:
@@ -247,11 +269,25 @@ def _trace_one(libc, argv, stdin_data, timeout, blocks, exe, plan=None, sanitize
         except Exception:
             os._exit(127)
     os.close(w_out); os.close(w_err); os.close(r_in)
-    try:
-        os.write(w_in, stdin_data)
-    except OSError:
-        pass
-    os.close(w_in)
+    # Feed stdin from a thread. The tracee is stopped at execve and not yet reading fd 0, so a
+    # direct blocking write of a payload larger than the pipe buffer (64 KiB) would deadlock here
+    # BEFORE the trace loop -- and the per-input deadline (below) is only checked inside that loop,
+    # so it would never fire. The thread does the full (possibly partial/interrupted) write and
+    # closes the write end for EOF; if the tracee never reads it, the thread simply blocks and is
+    # reaped when the tracee is killed at the deadline.
+    def _feed_stdin():
+        data = memoryview(stdin_data)
+        while data:
+            try:
+                n = os.write(w_in, data)
+            except OSError:
+                break
+            data = data[n:]
+        try:
+            os.close(w_in)
+        except OSError:
+            pass
+    threading.Thread(target=_feed_stdin, daemon=True).start()
     os.waitpid(pid, 0)                                  # stop at execve
 
     base = _maps_base(pid, exe) - _elf_min_vaddr(exe)
@@ -383,6 +419,16 @@ def main():
     exe = sys.argv[3]
     base_argv = sys.argv[4:]
     sanitizer = _is_sanitizer(exe)          # decide once; an AS cap would abort it before main()
+    # For the NON-traced path a sanitizer child is bounded by resident memory (it can't take an AS
+    # cap); build its env once with hard_rss_limit_mb merged in (abort_on_error is already set by
+    # the caller). None => inherit the environment unchanged (the non-sanitizer case).
+    child_env = None
+    if sanitizer:
+        child_env = dict(os.environ)
+        _opts = child_env.get("ASAN_OPTIONS", "")
+        if "hard_rss_limit_mb" not in _opts:
+            child_env["ASAN_OPTIONS"] = (_opts + ":" if _opts else "") \
+                + "hard_rss_limit_mb=%d" % _SAN_RSS_MB
     wf = "/tmp/lykos-fuzz-input.bin"        # fixed: a per-batch name leaked into diagnostics
     (count, n_blocks) = struct.unpack("<II", _readn(8))
     blocks = list(struct.unpack("<%dQ" % n_blocks, _readn(8 * n_blocks))) if n_blocks else []
@@ -420,7 +466,8 @@ def main():
         else:
             try:
                 pr = subprocess.run(argv, input=stdin, stdout=subprocess.PIPE,
-                                    stderr=subprocess.PIPE, timeout=per_timeout)
+                                    stderr=subprocess.PIPE, timeout=per_timeout,
+                                    preexec_fn=_nontraced_preexec(sanitizer), env=child_env)
                 rc, so, se, flags = pr.returncode, pr.stdout[:4096], pr.stderr[:4096], 0
             except subprocess.TimeoutExpired:
                 rc, so, se, flags = 0, b"", b"", 1
