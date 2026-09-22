@@ -131,6 +131,7 @@ packaging/         zipapp build, offline verify, air-gap bundle scripts
 | 22 | `docs/22-toolchain-setup.md` | What each engine is and how it was provisioned |
 | 23 | `docs/23-airgap-install.md` | **Air-gap setup runbook (no install)** — bundle, carry, verify, run in place |
 | 24 | `docs/24-modernization-plan.md` | **2026 SOTA refresh** — source path, lean RE stack (drop the JVM), exploit-path automation, optional LLM |
+| 25 | `docs/25-security-audit-2026-09.md` | **Code audit & review** — ranked robustness/correctness findings, remediation status, follow-ups |
 
 New here? `docs/20-open-work-backlog.md` is the honest state of the system: what works, what
 was measured, and what is still open. `docs/02-architecture.md` for the shape of it.

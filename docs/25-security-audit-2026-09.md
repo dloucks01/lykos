@@ -169,8 +169,21 @@ pypcode `.so` tag; `die` on mismatch or when there is nothing to match against b
 ---
 
 ## Remediation status (owner chose to fix the robustness/correctness set; security H1–H3 de-scoped)
-- [ ] **H4, H5, M5** — detonation-path robustness (host OOM + fuzzing deadlock + run_reaped stdin).
-- [ ] **H6, H7, M7** — dedup correctness (regressions of this session's dedup work: over-split → over-merge).
-- [ ] **H8, H9** — job-queue resilience + a killable-stage watchdog.
-- [ ] **H10, M8–M12** — packaging robustness (the new self-contained-Python + trim work).
+- [x] **H4, H5, M5** — detonation-path robustness (host OOM + fuzzing deadlock + run_reaped stdin). `3fa1869`
+- [x] **H6, H7, M7** — dedup correctness (over-split → over-merge regressions). `36edd6c`
+- [x] **H8, H9** — job-queue resilience + heartbeat/reaper reclaim of a hung stage. `45e0243`
+- [x] **H10, M8–M12** — packaging robustness (self-contained-Python ABI check, arch-neutral trim,
+  import smoke-test, patchelf-required, no global LD, real zip dedup guard).
 - Deferred: the MEDIUM DoS/validation set (M1–M4, M13–M15) and LOW/improvements.
+
+## Follow-up feature requests (owner, this session — not audit findings)
+1. **Stop/resume at any point** — a run can be halted and later continued. Partly enabled by H9
+   (a cancel now actually reclaims a stuck job) + the existing cache-key resume (completed stages
+   cache-hit on re-run). Needs: explicit pause/resume controls and a resumable autopilot cursor.
+2. **Progress/status: done vs remaining** — surface, per case, which stages are complete, running,
+   queued, and still to come (the pipeline plan), not just a live log.
+3. **Richer per-job logs** — each run should report, in detail, what it is doing step by step
+   (tool invoked, phase, counts), beyond the current coarse progress events.
+4. **Folder/whole-project source** — build an uploaded source TREE (detect Makefile/CMake, inject
+   sanitizers, sandbox the build) and analyse the produced binaries; minimal-viable first
+   (tarball → Makefile/plain-C → sandboxed sanitized build → existing pipeline). See chat notes.

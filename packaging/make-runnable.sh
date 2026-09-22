@@ -72,12 +72,23 @@ for c in "$V"/*-venv/pyvenv.cfg; do
 done
 [ -n "$venv_py" ] || venv_py="$(ls -d "$V"/*-venv/lib/python3.* 2>/dev/null | sed -n 's#.*/python\(3\.[0-9][0-9]*\)$#\1#p' | head -1)"
 host_py="$(python3 -c 'import sys;print("%d.%d"%sys.version_info[:2])' 2>/dev/null || true)"
-if [ -n "$venv_py" ] && [ "$venv_py" != "$host_py" ]; then
-  die "toolchain venvs are Python $venv_py but this build host runs ${host_py:-unknown}. Run make-runnable on a Python $venv_py host so the vendored interpreter, the venvs and pypcode share one ABI (or rebuild the toolchain bundle here)."
-fi
-PYV="${venv_py:-$host_py}"
-[ -n "$PYV" ] || die "cannot determine a Python version to vendor"
+[ -n "$host_py" ] || die "no python3 on the build host to vendor"
+# The pypcode wheel is ABI-locked TOO (and the venvs routinely fail to build, so venv_py can be
+# empty). Derive the minor pypcode was built for from its extension tag (cpython-3XY) and require
+# every ABI-locked component that IS present to match the host python we are about to vendor --
+# otherwise `import pypcode`/angr/unicorn fails on the laptop, the very bug this feature prevents.
+pysite_py=""
+_pyso="$(ls "$V"/pysite/pypcode/*.so 2>/dev/null | head -1)"
+[ -n "$_pyso" ] && pysite_py="$(printf '%s' "$_pyso" | sed -n 's/.*cpython-3\([0-9][0-9]*\).*/3.\1/p')"
+for pair in "engine venvs:$venv_py" "the pypcode wheel:$pysite_py"; do
+  what="${pair%%:*}"; ver="${pair#*:}"
+  if [ -n "$ver" ] && [ "$ver" != "$host_py" ]; then
+    die "$what are Python $ver but this build host runs $host_py. Run make-runnable on a Python $ver host (or rebuild the toolchain bundle here) so the vendored interpreter, the venvs and the pypcode wheel share one ABI."
+  fi
+done
+PYV="$host_py"
 PYBIN="$(command -v "python$PYV" 2>/dev/null || command -v python3)"; PYBIN="$(readlink -f "$PYBIN")"
+MULTIARCH="$("$PYBIN" -c 'import sysconfig;print(sysconfig.get_config_var("MULTIARCH") or "")')"
 STDLIB="$("$PYBIN" -c 'import sysconfig;print(sysconfig.get_path("stdlib"))')"
 TUB="$V/toolchain/usr/bin"; TUL="$V/toolchain/usr/lib"; mkdir -p "$TUB" "$TUL"
 install -m0755 "$PYBIN" "$TUB/python$PYV"
@@ -95,15 +106,30 @@ for base in {libdir, os.path.join(libdir, mult) if mult else libdir}:
             try: shutil.copy2(f, dst)
             except OSError: pass
 PYEOF
-# Find libpython by a RELATIVE ($ORIGIN) rpath so the interpreter -- and the engine venvs that
-# symlink to it -- load it with NO global LD_LIBRARY_PATH (which would leak onto other tools).
-# Resolved from the real binary's location, so it survives both relocation and the venv symlinks.
-if command -v patchelf >/dev/null 2>&1; then
-  patchelf --set-rpath '$ORIGIN/../lib:$ORIGIN/../lib/x86_64-linux-gnu' "$TUB/python$PYV" 2>/dev/null \
-    || echo "  WARN: patchelf failed; venv pythons will rely on RUN.sh's LD_LIBRARY_PATH"
-else
-  echo "  NOTE: no patchelf; the interpreter finds libpython via RUN.sh's LD_LIBRARY_PATH instead"
-fi
+# patchelf is REQUIRED for this path: it gives the interpreter AND its stdlib C-extensions an
+# $ORIGIN-relative rpath into the bundle's own libs, so the whole vendored Python is self-contained
+# with NO global LD_LIBRARY_PATH (which would leak the bundle's libraries onto every other tool the
+# server spawns). Without it the venv engines and half the stdlib fail off the RUN.sh path -- refuse
+# to ship a bundle that only half-works. Arch-neutral: the multiarch triple is derived, not assumed.
+command -v patchelf >/dev/null 2>&1 || die "patchelf is required to vendor a self-contained Python (apt-get install patchelf)"
+_ma="${MULTIARCH:+:\$ORIGIN/../lib/$MULTIARCH}"
+patchelf --set-rpath "\$ORIGIN/../lib$_ma" "$TUB/python$PYV" || die "patchelf failed on the interpreter"
+# stdlib C-extensions (_ssl, _ctypes, _sqlite3, _lzma, ...) link libssl/libffi/liblzma from the
+# bundle -- point them there relative to their own location so no LD_LIBRARY_PATH is needed.
+_dma="${MULTIARCH:+:\$ORIGIN/../../$MULTIARCH}"
+for so in "$TUL/python$PYV"/lib-dynload/*.so; do
+  [ -f "$so" ] && { patchelf --set-rpath "\$ORIGIN/../..$_dma" "$so" 2>/dev/null || true; }
+done
+# Prove the vendored interpreter works with NO help from the host and NO global LD path -- import
+# the stdlib modules lykos and the engines rely on. Fail the build NOW, not on the air-gapped
+# laptop, if the apt closure is missing a non-glibc dependency (libffi/libssl/liblzma/...).
+env -i HOME=/tmp PATH=/usr/bin:/bin "$TUB/python$PYV" - <<'PYCHK' \
+  || die "vendored Python failed its self-contained import smoke-test -- a non-glibc dependency is missing from the toolchain tree (libffi/libssl/liblzma/...); add it to the toolchain package list and rebuild the bundle"
+import sys
+for m in ("ctypes", "ssl", "sqlite3", "lzma", "bz2", "hashlib", "zlib", "socket", "json", "struct"):
+    __import__(m)
+print("  vendored python self-check OK (no LD_LIBRARY_PATH):", sys.version.split()[0])
+PYCHK
 printf '  vendored Python %s + stdlib (%s); venvs are repointed at RUN time by vendorenv\n' \
   "$PYV" "$(du -sh "$TUL/python$PYV" 2>/dev/null | cut -f1)"
 
@@ -139,7 +165,10 @@ find "$V/toolchain/usr/bin" -maxdepth 1 -name 'dpkg*' -o -name 'apt*' 2>/dev/nul
 #     This is the bulk of the bundle (~6.7GB): keeping it only let the laptop run `make arch-gate`,
 #     a CI self-test, which is not analysis. Verified nothing in the bundle links libLLVM.
 TCU="$V/toolchain/usr"
-#   (a) cross-compiler backends + their support libs (native usr/libexec/gcc/x86_64 stays)
+# THIS build host's native GNU triple (x86_64-linux-gnu, aarch64-linux-gnu, ...). The trim keeps
+# the native compiler and mispoints nothing when the build host is not x86_64.
+NATIVE_TRIPLE="$(gcc -dumpmachine 2>/dev/null || echo x86_64-linux-gnu)"
+#   (a) cross-compiler backends + their support libs (native usr/libexec/gcc/<native> stays)
 rm -rf "$TCU/libexec/gcc-cross" "$TCU/lib/gcc-cross" 2>/dev/null || true
 #   (b) per-arch cross driver + LTO binaries under bin/. x86_64-linux-gnu-* IS the native
 #       compiler and must survive EXCEPT its lto-dump; lto-dump is never invoked (drop it for
@@ -148,7 +177,7 @@ rm -rf "$TCU/libexec/gcc-cross" "$TCU/lib/gcc-cross" 2>/dev/null || true
 find "$TCU/bin" -maxdepth 1 \( -type f -o -type l \) 2>/dev/null | while IFS= read -r f; do
   b="$(basename "$f")"
   case "$b" in *lto-dump*) rm -f "$f"; continue ;; esac    # never invoked, any arch incl native
-  case "$b" in x86_64-linux-gnu-*) continue ;; esac        # native toolchain -- keep the rest
+  case "$b" in "${NATIVE_TRIPLE}"-*) continue ;; esac      # native toolchain -- keep the rest
   case "$b" in
     *-linux-gnu-gcc|*-linux-gnu-gcc-*|*-linux-gnu-g++|*-linux-gnu-cpp|*-linux-gnu-gfortran|\
     *-linux-gnu-gccgo|*-linux-gnueabihf-gcc|*-linux-gnueabihf-gcc-*|*-linux-gnueabihf-g++|\
@@ -158,7 +187,7 @@ done
 #   (c) cross sysroot HEADERS (compile-only); usr/<triple>/lib runtime is kept
 for d in "$TCU"/*-linux-gnu "$TCU"/*-linux-gnueabihf; do
   [ -d "$d" ] || continue
-  case "$(basename "$d")" in x86_64-linux-gnu) : ;; *) rm -rf "$d/include" 2>/dev/null || true ;; esac
+  case "$(basename "$d")" in "$NATIVE_TRIPLE") : ;; *) rm -rf "$d/include" 2>/dev/null || true ;; esac
 done
 #   (d) MinGW Windows cross toolchain -- builds PE fixtures only (Wine still RUNS PE binaries)
 rm -rf "$TCU/lib/gcc/x86_64-w64-mingw32" "$TCU/x86_64-w64-mingw32" "$TCU/share/mingw-w64" 2>/dev/null || true
@@ -169,7 +198,7 @@ rm -rf "$TCU/lib/llvm-21" 2>/dev/null || true
 # gcc needs the C headers to compile uploaded source.
 rm -rf "$TCU/include/llvm-21" "$TCU/include/clang" "$TCU/include/clang-c" \
        "$TCU/include/lld" "$TCU/include/lldb" "$TCU/include/mlir" "$TCU/include/polly" 2>/dev/null || true
-find "$TCU/lib/x86_64-linux-gnu" -maxdepth 1 \( -name 'libLLVM*' -o -name 'libclang*' \) -exec rm -f {} + 2>/dev/null || true
+find "$TCU/lib/$NATIVE_TRIPLE" -maxdepth 1 \( -name 'libLLVM*' -o -name 'libclang*' \) -exec rm -f {} + 2>/dev/null || true
 find "$TCU/bin" -maxdepth 1 \( -name 'clang*' -o -name 'llvm*' -o -name 'llc' -o -name 'opt' \
   -o -name 'lli' -o -name 'ld.lld' -o -name 'lld*' -o -name 'wasm-ld' \) -exec rm -f {} + 2>/dev/null || true
 #   (f) Node.js -- only the `make gui` JS test harness uses it; the web console is served by the
@@ -179,14 +208,13 @@ find "$TCU/lib" -name 'libnode.so*' -exec rm -f {} + 2>/dev/null || true
 #   Guard: the native compiler and the foreign-exec substrate MUST survive the trim, or the
 #   bundle is silently broken. Fail the build loudly if any did not.
 for need in \
-    "$TCU/libexec/gcc/x86_64-linux-gnu" "$TCU/bin/rizin" "$TCU/bin/qemu-aarch64" \
+    "$TCU/libexec/gcc/$NATIVE_TRIPLE" "$TCU/bin/rizin" "$TCU/bin/qemu-aarch64" \
     "$TCU/aarch64-linux-gnu/lib" "$TCU/bin/wine"; do
   ls -d "$need" >/dev/null 2>&1 || ls "$need"* >/dev/null 2>&1 || die "trim removed a REQUIRED path: $need"
 done
-ls "$TCU"/bin/x86_64-linux-gnu-gcc* >/dev/null 2>&1 || die "trim removed the native x86_64 gcc"
-# 3) Belt-and-braces: fail loudly if any duplicate path survived (a dup = an interactive prompt).
-dups="$(cd "$STAGE" && find lykos -printf '%p\n' | sort | uniq -d | head)"
-[ -z "$dups" ] || { echo "WARN: duplicate archive paths remain:"; echo "$dups"; }
+ls "$TCU"/bin/"$NATIVE_TRIPLE"-gcc* >/dev/null 2>&1 || die "trim removed the native ($NATIVE_TRIPLE) gcc"
+# 3) The real duplicate-path check runs AFTER zipping, against the archive itself (a filesystem
+#    tree cannot hold the same path twice, so the old find|uniq here could never fire). See below.
 printf '  vendor/ is now %s\n' "$(du -sh "$V" | cut -f1)"
 
 say "generating relocatable scoped wrappers"
@@ -202,15 +230,12 @@ cat > "$APP/RUN.sh" <<'EOF'
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 cd "$here"
 # Prefer the bundle's OWN Python -- it matches the pypcode wheel and the engine venvs, so the
-# analysis works regardless of what python3 (if any) the laptop has. Fall back to the system
-# python3 only if this bundle was built without a vendored interpreter.
+# analysis works regardless of what python3 (if any) the laptop has. It finds its libraries through
+# an $ORIGIN rpath (set at build time), so NO LD_LIBRARY_PATH is exported here -- the bundle's
+# libraries stay private to the bundle's tools and never leak onto anything else the server spawns.
+# Fall back to the system python3 only if this bundle was built without a vendored interpreter.
 py="$here/vendor/toolchain/usr/bin/python3"
-if [ -x "$py" ]; then
-  ld="$here/vendor/toolchain/usr/lib:$here/vendor/toolchain/usr/lib/x86_64-linux-gnu"
-  export LD_LIBRARY_PATH="$ld${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-else
-  py=python3
-fi
+[ -x "$py" ] || py=python3
 # stdin < /dev/null: no analysis tool can then block reading an inherited pipe/terminal.
 exec env PYTHONPATH="$here/core" "$py" -m lykos serve --http 127.0.0.1:8787 \
      --case-store "$here/.cases" --workers 2 < /dev/null
@@ -234,6 +259,13 @@ STAMP="$(date +%Y%m%d)"; ARCH="$(uname -m)"
 OUT="$DIST/lykos-airgapped-$STAMP-$ARCH.zip"
 rm -f "$OUT"
 ( cd "$STAGE" && zip -q -r -y "$OUT" lykos )   # -y: store symlinks as symlinks (venvs, libs)
+# A DUPLICATE PATH inside the zip makes `unzip` stop and prompt "replace? [y]" -- which reads as a
+# hang on the air-gapped laptop. Check the ARCHIVE (not the staging tree, which cannot hold a dup)
+# and fail the build so a prompting bundle never ships.
+if command -v zipinfo >/dev/null 2>&1; then
+  zdups="$(zipinfo -1 "$OUT" | sort | uniq -d | head)"
+  [ -z "$zdups" ] || { echo "duplicate paths in the archive:"; echo "$zdups"; die "the zip has duplicate paths -- unzip would prompt on the laptop; fix the sanitise step"; }
+fi
 ( cd "$DIST" && sha256sum "$(basename "$OUT")" > "$(basename "$OUT").sha256" )
 
 say "done"
