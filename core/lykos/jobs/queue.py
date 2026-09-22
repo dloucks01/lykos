@@ -58,6 +58,33 @@ class JobQueue:
         self.conn.execute("ROLLBACK")
         del self._pending[mark:]                  # the rows are gone; drop their callbacks
 
+    def _begin_immediate(self, critical: bool = True, retries: int = 6) -> bool:
+        """Open a write transaction, resilient to a transient 'database is locked'/'busy'.
+
+        Each attempt already waits up to `busy_timeout` (connection.py, 5s) when another connection
+        holds the write lock. That covers the common case; a large single-writer transaction
+        (FunctionDAO.replace_for_target inserting thousands of rows) can still exceed it. A CRITICAL
+        writer -- complete/fail/enqueue/reap -- MUST land, or a job whose stage already succeeded is
+        recorded as `error`, so it takes several such attempts and, if still locked, lets the
+        OperationalError propagate on the last one rather than silently corrupting queue state. A
+        non-critical caller (claim) has already paid one busy_timeout wait, so it bails to False and
+        claims on the next poll. A non-lock OperationalError re-raises at once.
+        """
+        for i in range(max(1, retries)):
+            try:
+                self.conn.execute("BEGIN IMMEDIATE")
+                return True
+            except sqlite3.OperationalError as e:
+                msg = str(e).lower()
+                if "lock" not in msg and "busy" not in msg:
+                    raise
+                if not critical:
+                    return False                      # the busy_timeout wait already happened
+                time.sleep(0.05 * (i + 1))            # brief backoff between full-timeout attempts
+        if critical:
+            self.conn.execute("BEGIN IMMEDIATE")      # exhausted attempts: let the error surface
+        return False
+
     # ------------------------------------------------------------ enqueue (JE-02/17/18)
     def enqueue(self, case_id: str, stage: str, *, target_id: Optional[str] = None,
                 params: Optional[dict] = None, tool: Optional[str] = None,
@@ -70,7 +97,7 @@ class JobQueue:
         # Read-then-insert let two workers both miss the same pending run and both enqueue it,
         # which is exactly the duplicate work `dedup` exists to prevent.
         mark = len(self._pending)
-        self.conn.execute("BEGIN IMMEDIATE")
+        self._begin_immediate()
         try:
             if not force:
                 cached = self.runs.find_cached(ck)
@@ -138,9 +165,7 @@ class JobQueue:
         ph = ",".join("?" for _ in classes)
         now = _now()
         mark = len(self._pending)
-        try:
-            self.conn.execute("BEGIN IMMEDIATE")
-        except sqlite3.OperationalError:
+        if not self._begin_immediate(critical=False):
             return None
         try:
             row = self.conn.execute(
@@ -168,6 +193,13 @@ class JobQueue:
             "WHERE id=? AND claimed_by=? AND status='running'",
             (now, now + lease_seconds, run_id, worker_id))
 
+    def is_cancel_requested(self, run_id: str) -> bool:
+        """Has a cancel been requested for this run? A read-only probe the heartbeat uses to stop
+        renewing the lease of a non-cooperative stage, so the reaper can reclaim it."""
+        r = self.conn.execute(
+            "SELECT cancel_requested FROM analysis_run WHERE id=?", (run_id,)).fetchone()
+        return bool(r and r["cancel_requested"])
+
     # --------------------------------------------------------- terminal transitions
     def _lease_lost(self, run: Optional[AnalysisRun],
                     worker_id: Optional[str]) -> Optional[str]:
@@ -190,7 +222,7 @@ class JobQueue:
     def complete(self, run_id: str, outputs: Optional[list[tuple[str, str]]] = None,
                  worker_id: Optional[str] = None) -> bool:
         mark = len(self._pending)
-        self.conn.execute("BEGIN IMMEDIATE")
+        self._begin_immediate()
         try:
             run = self.runs.get(run_id)
             lost = self._lease_lost(run, worker_id)
@@ -217,7 +249,7 @@ class JobQueue:
     def fail(self, run_id: str, error: str, retryable: bool = True,
              worker_id: Optional[str] = None) -> Optional[str]:
         mark = len(self._pending)
-        self.conn.execute("BEGIN IMMEDIATE")
+        self._begin_immediate()
         try:
             run = self.runs.get(run_id)
             lost = self._lease_lost(run, worker_id)
@@ -249,7 +281,7 @@ class JobQueue:
 
     def set_cancelled(self, run_id: str) -> bool:
         mark = len(self._pending)
-        self.conn.execute("BEGIN IMMEDIATE")
+        self._begin_immediate()
         try:
             run = self.runs.get(run_id)
             if not run or run.status != "running":
@@ -265,7 +297,7 @@ class JobQueue:
     # ----------------------------------------------------------------- cancel (JE-19)
     def cancel(self, run_id: str) -> bool:
         mark = len(self._pending)
-        self.conn.execute("BEGIN IMMEDIATE")
+        self._begin_immediate()
         try:
             run = self.runs.get(run_id)
             if not run or run.status in ("done", "error", "cancelled"):
@@ -301,7 +333,7 @@ class JobQueue:
     def reap(self, now: Optional[int] = None) -> int:
         now = now or _now()
         mark = len(self._pending)
-        self.conn.execute("BEGIN IMMEDIATE")
+        self._begin_immediate()
         try:
             rows = self.conn.execute(
                 "SELECT * FROM analysis_run WHERE status='running' "
@@ -316,7 +348,7 @@ class JobQueue:
     def recover_orphans(self) -> int:
         """Startup crash-recovery: all 'running' rows have no live worker (JE-07)."""
         mark = len(self._pending)
-        self.conn.execute("BEGIN IMMEDIATE")
+        self._begin_immediate()
         try:
             rows = self.conn.execute("SELECT * FROM analysis_run WHERE status='running'").fetchall()
             for r in rows:

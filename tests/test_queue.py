@@ -205,3 +205,39 @@ def test_enqueue_dedup_is_atomic_under_concurrency(store, case):
 def _future():
     import time
     return int(time.time()) + 10_000
+
+
+def test_is_cancel_requested_reflects_a_cancel(store, case):
+    """H9: the heartbeat reads this to stop renewing a cancelled-but-unresponsive job's lease so
+    the reaper can reclaim it (a non-cooperative stage never observes the cancel itself)."""
+    q = JobQueue(store.conn)
+    run = q.enqueue(case.id, "s", resource_class="quick")
+    q.claim("w1", ["quick"], 30)
+    assert q.is_cancel_requested(run.id) is False
+    assert q.cancel(run.id) is True
+    assert q.is_cancel_requested(run.id) is True
+
+
+def test_a_critical_writer_survives_a_briefly_held_write_lock(store, case):
+    """H8: a queue writer whose BEGIN IMMEDIATE loses the write lock to a large single-writer
+    transaction must retry and land, not raise -- a succeeded job recorded as `error` is worse
+    than a slow one. Hold the lock from another connection briefly, then a critical writer
+    (enqueue) must still commit."""
+    dbfile = store.conn.execute("PRAGMA database_list").fetchall()[0][2]
+    holding, released = threading.Event(), threading.Event()
+
+    def _hold_lock():
+        o = connect(dbfile)                     # a connection is single-thread: own it here
+        o.execute("BEGIN IMMEDIATE")            # holds the RESERVED write lock
+        holding.set()
+        time.sleep(0.4)
+        o.execute("ROLLBACK")
+        o.close()
+        released.set()
+
+    threading.Thread(target=_hold_lock, daemon=True).start()
+    assert holding.wait(2), "background lock holder never started"
+    q = JobQueue(store.conn)
+    run = q.enqueue(case.id, "s", resource_class="quick")   # waits ~0.4s on the lock, then lands
+    assert released.is_set(), "writer returned before the lock was released -- it did not wait"
+    assert run is not None and q.runs.get(run.id) is not None
