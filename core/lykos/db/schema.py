@@ -331,4 +331,18 @@ ALTER TABLE finding_site ADD COLUMN verdict TEXT;
 -- input, or it files a second finding for a crash that is already recorded.
 ALTER TABLE dyn_result ADD COLUMN fault_pc INTEGER;
 """),
+    Migration(version=15, name="dyn_result_defect_key", sql=r"""
+-- A per-defect discriminator for a SIGABRT crash, when the run that found it was a sanitizer
+-- build: the ASan/UBSan class + source location (e.g. "heap-use-after-free@parser.c:88").
+--
+-- SIGABRT is bucketed by signal alone because its faulting PC sits in the abort/check machinery,
+-- not the defect -- which correctly merges a double free's dozens of identical aborts. But two
+-- DIFFERENT sanitizer defects (an overflow AND a use-after-free) also both abort, and signal-only
+-- bucketing then collapsed them into one finding, dropping the second CWE/source line. Keying such
+-- an abort by its sanitizer report separates distinct defects while still merging repeats of one.
+--
+-- Like fault_pc, it lives on the crash row so every later stage derives the SAME key from the same
+-- input, rather than filing a second finding for a crash already recorded.
+ALTER TABLE dyn_result ADD COLUMN defect_key TEXT;
+"""),
 ]

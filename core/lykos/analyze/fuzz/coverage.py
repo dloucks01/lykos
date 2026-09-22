@@ -15,11 +15,12 @@ import os
 from ...db.dao import DynResultDAO, FindingDAO, TargetDAO
 from ...hashing import canonical_json
 from ...jobs.registry import register_stage
+from ..dynamic import sandbox
 from ..dynamic.minimize import minimize
-from ..dynamic.stage import crash_finding_candidate
+from ..dynamic.stage import asan_defect_key, crash_finding_candidate
 from . import aflpp
 from .runner import invocation, run_input
-from .stage import _DEFAULT_SEEDS
+from .stage import _DEFAULT_SEEDS, _recovered_blocks
 
 COVERAGE_STAGE = "coverage_fuzz"
 TOOL = "aflpp"
@@ -209,14 +210,29 @@ def coverage_stage(ctx) -> dict:
     workfile = ctx.scratch() / "input.bin"
     seen_crashes = set()
     confirmed = 0
+    # Recover blocks once so a crash replay can capture a FAULT LOCUS. Without it every AFL crash
+    # replayed here has fault_pc=None: they all bucket (signal, None) -> only the first is treated
+    # as unique, and the finding is keyed by signal alone, which then differs from fuzz/directed's
+    # located key and double-files one defect. run_batch traces native targets (ptrace fault_pc);
+    # for an emulated target the blocks give qemu's fault log via run_input.
+    cover_blocks = _recovered_blocks(ctx, target)
+
+    def _replay(data):
+        if cover_blocks:
+            b = sandbox.run_batch(exe, [data], mode=mode, timeout=exec_timeout, blocks=cover_blocks)
+            if b:
+                return b[0]
+        return run_input(exe, mode, workfile, exec_timeout, target.arch, data,
+                         blocks=cover_blocks)[1]
 
     for data in raw:
         if ctx.should_cancel():
             break
-        _, res = run_input(exe, mode, workfile, exec_timeout, target.arch, data)
+        res = _replay(data)
         if not res.crashed:
             continue                                  # not reproducible in our sandbox
         sig = res.signal_name
+        defect_key = asan_defect_key(res.stderr) if sig == "SIGABRT" else None
         # Bucket by (signal, fault site), not signal alone: every SIGSEGV in a program is the
         # same signal but not the same bug, and de-duping on the name collapsed distinct
         # defects into one finding. AFL's crashes/ are already coverage-unique.
@@ -228,7 +244,8 @@ def coverage_stage(ctx) -> dict:
                       # is nothing but the carrier, and that is scratch
                       input_mode=mode, argv=[],
                       signal=res.signal, signal_name=sig, crashed=True,
-                      isolation=res.isolation, duration_ms=res.duration_ms)
+                      isolation=res.isolation, duration_ms=res.duration_ms,
+                      fault_pc=res.fault_pc, defect_key=defect_key)
             continue
         seen_crashes.add(key)
 
@@ -243,11 +260,12 @@ def coverage_stage(ctx) -> dict:
         dd.insert(target.id, target.case_id, run_id=ctx.run_id, input_sha=input_sha,
                   input_mode=mode, argv=margv, signal=res.signal, signal_name=sig,
                   crashed=True, isolation=res.isolation, duration_ms=res.duration_ms,
-                  note=note)
+                  note=note, fault_pc=res.fault_pc, defect_key=defect_key)
         fd.upsert(target.id, target.case_id, crash_finding_candidate(
             sig, input_sha, res.isolation, "coverage_fuzz",
             "(found by AFL++ coverage-guided fuzzing"
-            + ("; " + note if note else "") + ")"))
+            + ("; " + note if note else "") + ")",
+            fault_pc=res.fault_pc, discriminator=defect_key))
         confirmed += 1
 
     ctx.emit("coverage.done", payload={"crash_inputs": len(raw),

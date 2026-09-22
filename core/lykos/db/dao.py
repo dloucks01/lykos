@@ -768,16 +768,16 @@ class DynResultDAO(BaseDAO):
                timed_out: bool = False, isolation: Optional[str] = None,
                duration_ms: Optional[int] = None, stdout_sha: Optional[str] = None,
                stderr_sha: Optional[str] = None, note: Optional[str] = None,
-               fault_pc: Optional[int] = None) -> str:
+               fault_pc: Optional[int] = None, defect_key: Optional[str] = None) -> str:
         rid = new_id()
         self.conn.execute(
             "INSERT INTO dyn_result(id,target_id,case_id,run_id,input_sha,input_mode,argv,"
             "exit_code,signal,signal_name,crashed,timed_out,isolation,duration_ms,"
-            "stdout_sha,stderr_sha,note,fault_pc,created_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "stdout_sha,stderr_sha,note,fault_pc,defect_key,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (rid, target_id, case_id, run_id, input_sha, input_mode, dumps(argv),
              exit_code, signal, signal_name, as_int_bool(crashed), as_int_bool(timed_out),
-             isolation, duration_ms, stdout_sha, stderr_sha, note, fault_pc, _now()))
+             isolation, duration_ms, stdout_sha, stderr_sha, note, fault_pc, defect_key, _now()))
         return rid
 
     def fault_pc_for(self, target_id: str, input_sha: str) -> Optional[int]:
@@ -791,6 +791,16 @@ class DynResultDAO(BaseDAO):
             "AND fault_pc IS NOT NULL ORDER BY created_at DESC LIMIT 1",
             (target_id, input_sha)).fetchone()
         return int(r["fault_pc"]) if r and r["fault_pc"] is not None else None
+
+    def defect_key_for(self, target_id: str, input_sha: str) -> Optional[str]:
+        """The sanitizer-defect discriminator for this input's crash (ASan class+source), or None.
+        Read by every stage that files/looks-up a SIGABRT crash finding so they agree on the key
+        that separates two distinct sanitizer defects which both abort. Mirrors fault_pc_for."""
+        r = self.conn.execute(
+            "SELECT defect_key FROM dyn_result WHERE target_id=? AND input_sha=? "
+            "AND defect_key IS NOT NULL ORDER BY created_at DESC LIMIT 1",
+            (target_id, input_sha)).fetchone()
+        return r["defect_key"] if r and r["defect_key"] is not None else None
 
     def list_by_target(self, target_id: str) -> list[DynResult]:
         rows = self.conn.execute(
@@ -813,7 +823,8 @@ class DynResultDAO(BaseDAO):
                          timed_out=as_flag(r["timed_out"]), isolation=r["isolation"],
                          duration_ms=r["duration_ms"], stdout_sha=r["stdout_sha"],
                          stderr_sha=r["stderr_sha"], note=r["note"],
-                         fault_pc=_opt_col(r, "fault_pc"))
+                         fault_pc=_opt_col(r, "fault_pc"),
+                         defect_key=_opt_col(r, "defect_key"))
 
 
 # ------------------------------------------------------------------------ Poc (Phase 6)

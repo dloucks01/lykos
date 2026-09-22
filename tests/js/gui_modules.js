@@ -71,29 +71,34 @@ const ck = (n, cond) => { pass = pass && !!cond; console.log(`${cond ? "PASS" : 
       ]);
       return g.length === 2 && g.some((f) => f.id === "other");
     })());
-  ck("dedupeFindings collapses one overflow's many poc-backed manifestations, keeps a NULL deref",
+  ck("dedupeFindings NEVER drops a poc-backed finding (each owns a distinct reproducer)",
     (() => {
+      // Two poc-backed memory-corruption findings on the same signal may be one overflow's two
+      // manifestation PCs OR two independent overflows -- the client cannot tell, and the server
+      // report folds neither. Hiding a real second defect is worse than a possibly-redundant card,
+      // so every poc-backed finding survives; only UNANALYSED (non-poc) manifestations fold.
       const hijackRce = (id, cwe, title) => ({ id, cwe, state: "poc-backed", detector: "primitive",
         title, dedup_key: `dynamic-crash:SIGSEGV:${id}`, severity: "critical",
         evidence: [{ channel: "effects", detail: '[{"kind":"rce","status":"potential"}]' }] });
       const g = util.dedupeFindings([
         hijackRce("a1", "CWE-121", "Remote code execution / control-flow hijack (potential): L2 primitive"),
         hijackRce("a2", "CWE-787", "Remote code execution / control-flow hijack (potential): L2 primitive"),
-        // same overflow: corrupted RBP -> `leave` faults, misread as an OOB read (CWE-125)
         { id: "a3", cwe: "CWE-125", state: "poc-backed", detector: "primitive", severity: "high",
           title: "Information disclosure (memory leak) (potential): out-of-bounds-read",
           dedup_key: "dynamic-crash:SIGSEGV:401221",
           evidence: [{ channel: "effects", detail: '[{"kind":"info-disclosure","status":"potential"}]' }] },
-        // a GENUINELY separate defect on the same signal: a NULL deref keeps its own finding
         { id: "nd", cwe: "CWE-476", state: "poc-backed", detector: "primitive", severity: "high",
           title: "Denial of service (demonstrated): null-pointer-dereference",
           dedup_key: "dynamic-crash:SIGSEGV:401300",
           evidence: [{ channel: "effects", detail: '[{"kind":"dos","status":"demonstrated"}]' }] },
+        // an UNANALYSED bare crash on the hijack signal DOES still fold away (no reproducer of its own)
+        { id: "bare", cwe: "CWE-787", state: "confirmed", detector: "fuzz",
+          dedup_key: "dynamic-crash:SIGSEGV" },
       ]);
       const ids = g.map((f) => f.id);
-      // the three overflow manifestations collapse to ONE (the critical CWE-121 hijack); NULL deref stays
-      return g.length === 2 && ids.includes("nd")
-        && g.some((f) => f.cwe === "CWE-121") && !ids.includes("a3");
+      // all four poc-backed findings survive; only the bare unanalysed crash is folded out
+      return g.length === 4 && ids.includes("a1") && ids.includes("a2")
+        && ids.includes("a3") && ids.includes("nd") && !ids.includes("bare");
     })());
   ck("isDemonstrated is true only for poc-backed/confirmed",
     util.isDemonstrated({ state: "poc-backed" }) && util.isDemonstrated({ state: "confirmed" })

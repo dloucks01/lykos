@@ -360,6 +360,28 @@ def test_sigabrt_buckets_by_signal_even_with_a_fault_pc():
     assert crash_dedup_key("SIGSEGV", 0x409999) != crash_dedup_key("SIGSEGV", 0x40117a)
 
 
+def test_a_sanitizer_abort_separates_distinct_defects_by_its_report():
+    """A plain glibc abort (double free) has no sanitizer report -> signal-only bucket, so its
+    dozens of identical aborts still merge. But two DIFFERENT sanitizer defects both abort with
+    SIGABRT; keying them by the ASan class+source (defect_key) keeps them as two findings instead
+    of collapsing the second one away."""
+    from lykos.analyze.dynamic.stage import crash_dedup_key, asan_defect_key
+    overflow = (b"=1=ERROR: AddressSanitizer: heap-buffer-overflow on address 0x1 "
+                b"...\n    #0 0x5 in main /src/parser.c:42\nSUMMARY: AddressSanitizer: "
+                b"heap-buffer-overflow /src/parser.c:42 in main\n")
+    uaf = (b"=1=ERROR: AddressSanitizer: heap-use-after-free on address 0x2 "
+           b"...\n    #0 0x9 in main /src/cache.c:88\nSUMMARY: AddressSanitizer: "
+           b"heap-use-after-free /src/cache.c:88 in main\n")
+    ko, ku = asan_defect_key(overflow), asan_defect_key(uaf)
+    assert ko and ku and ko != ku, "two ASan reports must yield two discriminators"
+    # a plain abort (no ASan report) has no discriminator -> the shared signal-only bucket
+    assert asan_defect_key(b"free(): double free detected in tcache 2\n") is None
+    # distinct sanitizer defects land in DIFFERENT buckets; the same one shares a bucket
+    assert crash_dedup_key("SIGABRT", None, ko) != crash_dedup_key("SIGABRT", None, ku)
+    assert crash_dedup_key("SIGABRT", None, ko) == crash_dedup_key("SIGABRT", None, ko)
+    assert crash_dedup_key("SIGABRT", None, None) == "dynamic-crash:SIGABRT"  # abort w/o report
+
+
 def test_an_emulated_crash_still_gets_a_fault_locus():
     """The ptrace tracer cannot reach inside qemu, so a cross-architecture crash had no
     faulting address and every SIGSEGV in the program bucketed as one finding -- on eleven of

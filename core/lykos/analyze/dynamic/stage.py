@@ -40,11 +40,40 @@ _SIG_CWE = {
 _SIGNAL_ONLY_BUCKET = frozenset({"SIGABRT"})
 
 
-def crash_dedup_key(signal_name, fault_pc=None) -> str:
+def asan_defect_key(stderr) -> Optional[str]:
+    """A stable per-defect discriminator for a SANITIZER SIGABRT: the ASan/UBSan class + source
+    basename (e.g. "heap-use-after-free@parser.c:88"). Returns None for a plain glibc abort with no
+    sanitizer report -- which keeps the signal-only bucket, so a double free's dozens of identical
+    aborts still merge. Only meaningful for SIGABRT. Derived from the crash's own stderr so every
+    stage that files/looks-up the finding agrees on the key."""
+    if not stderr:
+        return None
+    try:
+        from ..debug.rootcause import parse_asan_report
+        text = (stderr.decode("utf-8", "replace")
+                if isinstance(stderr, (bytes, bytearray)) else str(stderr))
+        rep = parse_asan_report(text)
+    except Exception:
+        return None
+    if not rep:
+        return None
+    import os as _os
+    cls = (rep.get("class") or "").strip()
+    src = (rep.get("source") or "").strip()
+    src = _os.path.basename(src) if src else ""
+    disc = "@".join(p for p in (cls, src) if p)
+    return (disc.replace(" ", "_")[:120] or None)
+
+
+def crash_dedup_key(signal_name, fault_pc=None, discriminator=None) -> str:
     """The bucket a crash belongs to. Every stage that files one must agree, or a verified PoC
     opens a second finding beside the crash it just proved."""
     if signal_name in _SIGNAL_ONLY_BUCKET:
-        return f"dynamic-crash:{signal_name}"
+        # A plain glibc abort (double free) has no discriminator -> signal-only, merging its
+        # repeats. A SANITIZER abort carries one (ASan class+source) -> two DIFFERENT sanitizer
+        # defects that both abort get distinct buckets instead of collapsing into one.
+        return (f"dynamic-crash:{signal_name}:{discriminator}" if discriminator
+                else f"dynamic-crash:{signal_name}")
     return (f"dynamic-crash:{signal_name}:{fault_pc:x}" if fault_pc
             else f"dynamic-crash:{signal_name}")
 
@@ -58,14 +87,17 @@ def find_crash_finding(conn, target_id, signal_name, input_sha=None):
     """
     from ...db.dao import DynResultDAO, FindingDAO
     fd = FindingDAO(conn)
-    pc = DynResultDAO(conn).fault_pc_for(target_id, input_sha) if input_sha else None
-    return (fd.id_for_dedup(target_id, crash_dedup_key(signal_name, pc)) if pc else None) \
+    dd = DynResultDAO(conn)
+    pc = dd.fault_pc_for(target_id, input_sha) if input_sha else None
+    disc = dd.defect_key_for(target_id, input_sha) if input_sha else None
+    return (fd.id_for_dedup(target_id, crash_dedup_key(signal_name, pc, disc))
+            if (pc or disc) else None) \
         or fd.id_for_dedup(target_id, crash_dedup_key(signal_name))
 
 
 def crash_finding_candidate(signal_name, input_sha, isolation, detector, extra="",
                             state="confirmed", confidence=0.9, bundle_sha=None,
-                            fault_pc=None):
+                            fault_pc=None, discriminator=None):
     """Crash finding shared by the dynamic / fuzz / poc stages.
 
     Keyed by WHERE it faulted when that is known, so two defects that both raise SIGSEGV stay
@@ -96,7 +128,7 @@ def crash_finding_candidate(signal_name, input_sha, isolation, detector, extra="
                   if cwe_for_exception(signal_name) and signal_name not in _SIG_CWE
                   else f"Reproduced crash ({signal_name}) under dynamic execution"),
         "site_addr": (hex(fault_pc) if fault_pc else None), "function_addr": None,
-        "dedup_key": crash_dedup_key(signal_name, fault_pc),
+        "dedup_key": crash_dedup_key(signal_name, fault_pc, discriminator),
         "evidence": evidence,
     }
 
@@ -141,12 +173,16 @@ def dynamic_stage(ctx) -> dict:
 
     stdout_sha = ctx.put_artifact("dyn-stdout", data=res.stdout) if res.stdout else None
     stderr_sha = ctx.put_artifact("dyn-stderr", data=res.stderr) if res.stderr else None
+    # A sanitizer SIGABRT carries a defect discriminator (ASan class+source) so two DISTINCT
+    # sanitizer defects that both abort don't collapse to one signal-only bucket. Stored on the
+    # crash row so every later stage derives the same key.
+    defect_key = asan_defect_key(res.stderr) if res.signal_name == "SIGABRT" else None
     DynResultDAO(ctx.conn).insert(
         target.id, target.case_id, run_id=ctx.run_id, input_sha=input_sha, input_mode=mode,
         argv=prefix, exit_code=res.exit_code, signal=res.signal, signal_name=res.signal_name,
         crashed=res.crashed, timed_out=res.timed_out, isolation=res.isolation,
         duration_ms=res.duration_ms, stdout_sha=stdout_sha, stderr_sha=stderr_sha,
-        note=res.note)
+        note=res.note, fault_pc=res.fault_pc, defect_key=defect_key)
 
     ran = res.isolation not in _DID_NOT_RUN
     ctx.emit("dynamic.done", payload={"crashed": res.crashed, "signal": res.signal_name,
@@ -155,7 +191,8 @@ def dynamic_stage(ctx) -> dict:
 
     if res.crashed:
         FindingDAO(ctx.conn).upsert(target.id, target.case_id, crash_finding_candidate(
-            res.signal_name, input_sha, res.isolation, "dynamic"))
+            res.signal_name, input_sha, res.isolation, "dynamic",
+            fault_pc=res.fault_pc, discriminator=defect_key))
 
     if not ran:
         # never executed: do not label this "clean exit" -- it is "could not run", and the note
