@@ -45,6 +45,27 @@ function eventToLog(ev) {
   }
 }
 
+// A SERVER-side case event ({type, payload, id}) -> an append-only log row for the background run,
+// so its log reads step by step like the interactive one. The plan panel shows the live/current
+// state, so here we log only the transitions that COMPLETE a step (done/skipped/error/cancelled),
+// carrying the "what it found" detail; the noisy per-exec progress stays out of the log.
+function bgEventToLog(ev) {
+  const p = ev.payload || {};
+  if (ev.type === "autopilot.stage") {
+    if (!p.state || p.state === "running") return null;
+    const status = p.state === "error" ? "error" : "done";
+    const suffix = p.state === "skipped" ? " (skipped)" : p.state === "cancelled" ? " (stopped)" : "";
+    return { kind: "stage", stage: p.stage,
+             label: (p.label || p.stage) + suffix,
+             detail: p.detail || null, status };
+  }
+  if (ev.type === "autopilot.done") {
+    return { tone: p.outcome === "poc" ? "ok" : "info",
+             text: `Background run finished — ${p.outcome || "done"}.` };
+  }
+  return null;
+}
+
 function App() {
   const [caseId, setCaseId] = useState(null);
   const [targets, setTargets] = useState([]);
@@ -82,6 +103,7 @@ function App() {
   }, []);
   const ctrlRef = useRef(null);
   const bgPollRef = useRef(0);
+  const bgEventsAfter = useRef(-1);   // last case-event id logged for the background run (-1 = seed)
 
 
   // Follow a call to the function it names -- in the SAME binary, or, when the symbol is an
@@ -219,11 +241,30 @@ function App() {
   const pollBackground = useCallback(async (cid) => {
     if (!cid) return;
     const token = ++bgPollRef.current;
+    // Tail the case event stream so the background run's step-by-step log appears here too, not
+    // just the plan panel. Seed past the current tail on the first tick so we log only NEW events.
+    const tailEvents = async () => {
+      try {
+        const evs = await api.events(cid, Math.max(0, bgEventsAfter.current));
+        for (const ev of evs) {
+          if (ev.id > bgEventsAfter.current) bgEventsAfter.current = ev.id;
+          if (bgEventsAfter.current >= 0 && token === bgPollRef.current) {
+            const row = bgEventToLog(ev);
+            if (row) pushLog(row);
+          }
+        }
+      } catch { /* transient; retry next tick */ }
+    };
+    if (bgEventsAfter.current < 0) {
+      try { const seed = await api.events(cid, 0); bgEventsAfter.current = seed.reduce((m, e) => Math.max(m, e.id), 0); }
+      catch { bgEventsAfter.current = 0; }
+    }
     const tick = async () => {
       if (token !== bgPollRef.current) return;      // superseded by a newer poll
       let st;
       try { st = await api.backgroundStatus(cid); } catch { st = null; }
       setBg(st && st.state && st.state !== "none" ? st : null);
+      await tailEvents();
       if (st && st.running) {
         refreshResults(cid, targets);
         setTimeout(tick, 2500);
@@ -232,7 +273,7 @@ function App() {
       }
     };
     tick();
-  }, [refreshResults, targets]);
+  }, [refreshResults, targets, pushLog]);
 
   // Reopen a previous analysis: its targets, findings and PoCs are all still on the server.
   const reopenCase = useCallback(async (cid) => {
@@ -307,7 +348,7 @@ function App() {
     if (!files.length) return;
     setError(null);
     setUploading(true);
-    if (!append) { setLog([]); setFindings([]); setPocs([]); setAdvice(null); setRan(false); setUnavailable([]); setSysmap(null); setCoverage({}); setVerifications({}); setBg(null); bgPollRef.current++; }
+    if (!append) { setLog([]); setFindings([]); setPocs([]); setAdvice(null); setRan(false); setUnavailable([]); setSysmap(null); setCoverage({}); setVerifications({}); setBg(null); bgPollRef.current++; bgEventsAfter.current = -1; }
     try {
       const cid = await ensureCase();
       const got = append ? [...targets] : [];
@@ -406,7 +447,7 @@ function App() {
     setCaseId(null);   // the next upload starts a fresh case; this one stays on the server
     setTargets([]); setAdvice(null); setFindings([]); setPocs([]);
     setLog([]); setRan(false); setError(null); setUnavailable([]); setSysmap(null); setCoverage({}); setVerifications({});
-    setBg(null); bgPollRef.current++;
+    setBg(null); bgPollRef.current++; bgEventsAfter.current = -1;
     loadRecent();      // the analysis just finished now appears in the recent list
   }, [running, loadRecent]);
 
