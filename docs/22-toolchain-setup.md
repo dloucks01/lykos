@@ -15,7 +15,7 @@ stage declines with the same text if you launch it anyway.
 |---|---|---|
 | **python3** | the platform | — (runtime is stdlib-only; no pip packages) |
 | **bubblewrap** (`bwrap`) | every sandboxed execution | the sandbox drops to rlimits-only: no network namespace, no read-only root. It still runs, which is the problem -- this is the one degradation you do not want silent when the binary is hostile |
-| **Ghidra** | `disassemble`, and so `detect_cwe`, taint, bounds, integer overflow, directed fuzzing | the whole static half. Fuzzing still finds crashes; nothing explains one |
+| **rizin + rz-ghidra + pypcode** | `disassemble`, and so `detect_cwe`, taint, bounds, integer overflow, directed fuzzing (the default RE backend, no JVM; Ghidra headless is an optional alternate via `LYKOS_DECOMPILER=ghidra`) | the whole static half. Fuzzing still finds crashes; nothing explains one |
 | **qemu-user** | executing any non-host binary | cross-architecture targets cannot run at all |
 | **gcc/cc** | building the eval corpus and real-gate fixtures | `make eval-gate` / `real-gate` skip |
 | **gdb** | `root_cause` detail, `multi_debug`, runtime monitor | root_cause falls back to the stdlib ptrace helper; multi_debug declines |
@@ -29,9 +29,14 @@ older 3.x very likely works -- but that is inference, not a tested claim.
 
 ## Installed via apt (Kali)
 
-    sudo apt-get install -y gdb afl++ ghidra default-jdk qemu-user qemu-user-binfmt
+    # the default RE backend + the dynamic toolset
+    sudo apt-get install -y rizin rz-ghidra gdb afl++ qemu-user qemu-user-binfmt wine
+    # pypcode (P-Code IR) via pip; on the air-gap bundle it is vendored under vendor/pysite
+    pip install pypcode
+    # OPTIONAL: only if you want the Ghidra headless alternate (LYKOS_DECOMPILER=ghidra)
+    sudo apt-get install -y ghidra default-jdk
 
-- **Ghidra 12.1.3** — headless at `/usr/share/ghidra/support/analyzeHeadless`; the locator
+- **Ghidra 12.1.3** (optional alternate backend) — headless at `/usr/share/ghidra/support/analyzeHeadless`; the locator
   finds it automatically. Ghidra 11.3+/12 dropped bundled Jython for PyGhidra (whose jpype
   wheels stop at CPython 3.13), so the export post-script is a **Java** GhidraScript
   (`ExportAnalysis.java`), which Ghidra compiles on the fly and which works on every Ghidra

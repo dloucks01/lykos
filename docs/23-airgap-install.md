@@ -7,7 +7,7 @@ Two things move to the air-gapped workstation, and they are deliberately separat
 | | What | Size | How it travels |
 |---|---|---|---|
 | **the repo** | lykos itself — stdlib-only, no pip packages | ~1 MB | one tarball (`git archive`), built on a connected machine |
-| **the toolchain bundle** | Ghidra, qemu-user, GDB, AFL++, Wine, the angr/Unicorn venvs | ~1–3 GB | one tarball, built on a connected machine |
+| **the toolchain bundle** | rizin + rz-ghidra + pypcode (the RE backend), a matching Python interpreter, qemu-user, GDB, AFL++, Wine, the angr/Unicorn venvs | ~1.5 GB | one tarball, built on a connected machine |
 
 They are separate because the repo changes constantly and the toolchain almost never does.
 Re-cutting the ~1 MB repo tarball is cheap; re-carrying 3 GB is not.
@@ -30,7 +30,7 @@ previous (`dpkg`-based) approach dangerous — it is designed out here, not mere
 
 **The repo alone is a working platform.** Extract it and the dynamic half runs: ingest, triage,
 black-box fuzzing, the sandbox, crash triage, PoC synthesis, secret extraction, the whole GUI.
-What the bundle adds is the static half (Ghidra, and everything downstream of it),
+What the bundle adds is the static half (the rizin + rz-ghidra + pypcode RE backend, and everything downstream of it),
 cross-architecture execution (qemu-user), and the coverage-guided and symbolic engines.
 
 ---
@@ -127,9 +127,9 @@ LYKOS_ROOT=$PWD /tmp/lt/setup.sh            # verifies, places under vendor/, th
 hash, **and** the set of files in the bundle must equal the set the manifest names — an
 unlisted file (one an attacker added to ride along when the `toolchain/` tree is copied) is
 refused, not placed. It uses no `sudo` and no package manager; it copies `toolchain/` to
-`vendor/toolchain`, the `angr`/`unicorn` venvs to `vendor/`, and Ghidra to `vendor/ghidra`,
-then finishes by printing the capability report — so the outcome is a list of what you can now
-do, not a claim that it worked.
+`vendor/toolchain`, the `angr`/`unicorn` venvs to `vendor/`, and (only if the collect image
+packaged the optional Ghidra) Ghidra to `vendor/ghidra`, then finishes by printing the capability
+report — so the outcome is a list of what you can now do, not a claim that it worked.
 
 If you extract the bundle directly at `<repo>/vendor` (rename the extracted directory to
 `vendor`), even `setup.sh` is optional: lykos finds `vendor/toolchain` on its own. `setup.sh`
@@ -193,7 +193,9 @@ you nothing about which binaries it executes — only `afl-qemu-trace --version`
 prints e.g. `qemu-aarch64 version 5.2.50`. `lykos doctor` reports the guest, not the file
 type. Build one per architecture with `examples/afl-qemu/build.sh <arch>`.
 
-**Ghidra needs a JDK, not just a JRE**, and it is the single largest item in the bundle.
+**The JVM (for JAR/class targets, and the optional Ghidra backend) needs a JDK, not just a JRE**,
+and it is among the largest items in the bundle. The default RE backend (rizin + rz-ghidra +
+pypcode) needs no JVM at all.
 
 **No telemetry, ever.** Nothing in the platform opens an outbound connection. To prove it
 rather than trust it, run under a network namespace:

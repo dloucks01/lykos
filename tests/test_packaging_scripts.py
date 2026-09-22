@@ -26,7 +26,7 @@ def _sh(name):
 
 
 @pytest.mark.parametrize("script", ["build.sh", "verify.sh", "collect-toolchain.sh",
-                                    "setup-toolchain.sh", "make-burn.sh", "make-runnable.sh",
+                                    "setup-toolchain.sh", "make-runnable.sh", "build-container.sh",
                                     "build-symqemu.sh"])
 def test_every_packaging_script_is_valid_shell_and_executable(script):
     p = _sh(script)
@@ -36,7 +36,7 @@ def test_every_packaging_script_is_valid_shell_and_executable(script):
 
 
 @pytest.mark.parametrize("script", ["build.sh", "verify.sh", "collect-toolchain.sh",
-                                    "setup-toolchain.sh", "make-burn.sh", "make-runnable.sh"])
+                                    "setup-toolchain.sh", "make-runnable.sh", "build-container.sh"])
 def test_every_packaging_script_fails_fast(script):
     """Without `set -e` a failed step scrolls past and the script reports success -- which for
     a bundle means shipping an incomplete one to a machine that cannot fix it."""
