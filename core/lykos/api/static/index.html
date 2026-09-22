@@ -102,6 +102,27 @@
   .cta { text-align: center; padding: 6px 0 2px; }
   .cta-sub { color: var(--muted); font-size: .85rem; margin-top: 8px; }
   .bg-status { margin-bottom: 8px; }
+  /* Autopilot pipeline plan: done / running / remaining at a glance */
+  .plan { padding: 12px 14px; margin-bottom: 12px; text-align: left; }
+  .plan-head { display: flex; justify-content: space-between; align-items: center; font-size: .82rem;
+    color: var(--muted); margin-bottom: 8px; }
+  .plan-head .mono { color: var(--ink); font-family: var(--mono); }
+  .plan-count { font-variant-numeric: tabular-nums; color: var(--accent-2); font-weight: 600; }
+  .plan-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 2px; }
+  .plan-step { display: flex; align-items: center; gap: 8px; padding: 3px 4px; border-radius: 6px;
+    font-size: .9rem; color: var(--faint); }
+  .plan-step .plan-ico { width: 1.1em; text-align: center; flex: none; }
+  .plan-step .plan-lbl { flex: 1; }
+  .plan-step .plan-detail { color: var(--muted); font-size: .8rem; }
+  .plan-step.step-pending { color: var(--faint); }
+  .plan-step.step-running { color: var(--ink); background: color-mix(in srgb, var(--run) 12%, transparent); }
+  .plan-step.step-running .plan-lbl { font-weight: 600; }
+  .plan-step.step-done { color: var(--ink); }
+  .plan-step.step-done .plan-ico { color: var(--ok); }
+  .plan-step.step-skipped { color: var(--faint); }
+  .plan-step.step-error { color: var(--bad); }
+  .plan-step.step-error .plan-ico { color: var(--bad); }
+  .plan-step.step-cancelled { color: var(--warn); }
 
   /* Buttons */
   .btn { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--line);

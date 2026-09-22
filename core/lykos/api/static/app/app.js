@@ -8,7 +8,7 @@ import { api, waitForRun } from "./api.js";
 import { runAutopilotCase, newController, cancel as cancelAutopilot, coverageOf } from "./autopilot.js";
 import { rankFindings, pocsForFinding, fmtTime, progressText, stageLabel, dedupeFindings, buildRunLog } from "./util.js";
 import {
-  html, DropZone, TargetSummary, ProgressLog, FindingCard, EmptyResults, Spinner, UnavailablePanel, SystemMap, CoveragePanel, CodeView,
+  html, DropZone, TargetSummary, ProgressLog, FindingCard, EmptyResults, Spinner, UnavailablePanel, SystemMap, CoveragePanel, CodeView, PipelinePlan,
 } from "./components.js";
 
 const stageLabelSafe = (s) => (s ? stageLabel(s) : "");
@@ -459,11 +459,15 @@ function App() {
             ${!running ? html`
               <${DropZone} onFiles=${(fl) => onFiles(fl, true)} busy=${uploading} compact=${true} />
             ` : null}
+            ${bg && bg.plan ? html`<${PipelinePlan} plan=${bg.plan} targetName=${bg.target_name} target=${bg.target} targets=${bg.targets} />` : null}
             <div class="cta">
               ${bg && bg.running ? html`
                 <div class="bg-status"><${Spinner} label=${`Running in the background — ${bg.stage ? stageLabelSafe(bg.stage) : "starting"}${bg.targets > 1 ? ` (target ${bg.target}/${bg.targets})` : ""}`} /></div>
                 <button class="btn ghost small" onClick=${() => api.cancelBackground(caseId)}>■ Stop background run</button>
                 <div class="cta-sub">This keeps running even if you close the tab. Reopen the case later to see the results.</div>
+              ` : bg && (bg.state === "cancelled" || bg.state === "error") ? html`
+                <button class="btn primary" onClick=${onBackground}>▷ Resume background run</button>
+                <div class="cta-sub">Stopped${bg.stage ? ` at ${stageLabelSafe(bg.stage)}` : ""}. Resuming skips the steps already done (they are cached) and continues from where it left off.</div>
               ` : !running ? html`
                 <button class="btn primary big" onClick=${onAutopilot}>
                   ${ran ? "Run Autopilot again" : (multi ? `▶ Run Autopilot on ${targets.length} targets` : "▶ Run Autopilot")}
