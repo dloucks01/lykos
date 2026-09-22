@@ -92,18 +92,85 @@ def _best_block_pct(store, target_id) -> Optional[float]:
         return None
 
 
+# The pipeline PLAN: the ordered steps a target goes through, so the UI can show what is done,
+# running, and still to come -- not just a live log. Conditional steps (concolic, the exploit
+# ladder) start `pending` and become `skipped` if the run does not reach them. Repeats (directed
+# fuzz runs twice; root_cause/build_poc run per crash) update the same entry.
+_PLAN_STAGES = [
+    ("disassemble", "Disassemble"), ("detect_cwe", "Static detectors"),
+    ("cve_scan", "Known-CVE scan"), ("synthesize_injection", "Injection probes"),
+    ("coverage_fuzz", "Coverage fuzzing"), ("directed_fuzz", "Directed fuzzing"),
+    ("heap_check", "Heap checks"), ("concolic", "Concolic execution"),
+    ("root_cause", "Root-cause"), ("build_poc", "Build PoC"),
+    ("poc_primitive", "PoC primitive"), ("build_exploit", "Build exploit"),
+    ("behavior_trace", "Behaviour trace"), ("dynamic_taint", "Dynamic taint"),
+    ("verify", "False-positive review"),
+]
+_PLAN_LABEL = dict(_PLAN_STAGES)
+# how far along a phase is, so a repeat/cache cannot regress a finished one back to running
+_PLAN_RANK = {"pending": 0, "running": 1, "skipped": 2, "cancelled": 3, "error": 4, "done": 5}
+
+
+def _init_plan(status, target, idx, total) -> None:
+    status["target_id"] = target.id
+    status["target_name"] = getattr(target, "filename", None) or target.id[:12]
+    status["target"] = idx
+    status["targets"] = total
+    status["plan"] = [{"stage": s, "label": lbl, "state": "pending", "detail": ""}
+                      for s, lbl in _PLAN_STAGES]
+    status["updated"] = time.time()
+
+
+def _plan_set(status, stage, state, detail=None) -> None:
+    for p in status.get("plan", []):
+        if p["stage"] != stage:
+            continue
+        # never regress a finished phase (build_poc done -> running on the next crash)
+        if state == "running" and _PLAN_RANK.get(p["state"], 0) >= _PLAN_RANK["running"] \
+                and p["state"] != "running":
+            if detail is not None:
+                p["detail"] = detail
+            return
+        p["state"] = state
+        if detail is not None:
+            p["detail"] = detail
+        status["updated"] = time.time()
+        return
+
+
+def _finalize_plan(status) -> None:
+    for p in status.get("plan", []):
+        if p["state"] == "pending":          # a conditional step the run never reached
+            p["state"] = "skipped"
+    status["updated"] = time.time()
+
+
+def _emit_stage(store, case_id, stage, state, *, target_id=None, detail=None) -> None:
+    """A structured per-stage event so the log reads as WHAT each step is doing, not just that a
+    stage fired: `Directed fuzzing · running`, `Build PoC · done`, `Concolic · skipped`."""
+    payload = {"stage": stage, "label": _PLAN_LABEL.get(stage, stage), "state": state}
+    if target_id:
+        payload["target_id"] = target_id
+    if detail:
+        payload["detail"] = detail
+    lvl = "warn" if state in ("error",) else "info"
+    store.events.append("autopilot.stage", level=lvl, case_id=case_id, payload=payload)
+
+
 def _run_target_stage(store, target, stage, status, stop, params=None) -> Optional[str]:
     if stop.is_set():
         return None
     status["stage"] = stage
     status["updated"] = time.time()
-    store.events.append("autopilot.stage", case_id=target.case_id,
-                        payload={"stage": stage, "target_id": target.id})
+    _plan_set(status, stage, "running")
+    _emit_stage(store, target.case_id, stage, "running", target_id=target.id)
     try:
         fn = _enqueue_fn(_TARGET[stage])
         q = JobQueue(store.conn)
         run = fn(q, target) if stage in _NO_PARAMS else fn(q, target, params=params or {})
     except Exception as e:
+        _plan_set(status, stage, "error", str(e)[:120])
+        _emit_stage(store, target.case_id, stage, "error", target_id=target.id, detail=str(e)[:200])
         store.events.append("autopilot.stage_error", level="warn", case_id=target.case_id,
                             payload={"stage": stage, "error": str(e)})
         return None
@@ -118,8 +185,15 @@ def _run_target_stage(store, target, stage, status, stop, params=None) -> Option
             reproject_cache_hit(store, stage, target.id, run.id)
         except Exception:
             pass
+        _plan_set(status, stage, "done", "cached")
+        _emit_stage(store, target.case_id, stage, "done", target_id=target.id, detail="cache hit")
         return "done"
-    return _wait(store, run.id, stop)
+    outcome = _wait(store, run.id, stop)
+    pstate = ({"done": "done", "cancelled": "cancelled", "timeout": "error",
+               "error": "error"}).get(outcome, outcome or "error")
+    _plan_set(status, stage, pstate)
+    _emit_stage(store, target.case_id, stage, pstate, target_id=target.id)
+    return outcome
 
 
 def _run_case_stage(store, case_id, stage, status, stop) -> None:
@@ -169,6 +243,7 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict, stop: t
             t = store.targets.get(tid)
             if not t:
                 continue
+            _init_plan(status, t, i + 1, len(target_ids))
             mode = None
             # Recover + detect.
             _run_target_stage(store, t, "disassemble", status, stop)
@@ -221,8 +296,9 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict, stop: t
                     + [c.input_sha for c in crashes]))[:12]
                 if shas:
                     status["stage"] = "verify"
-                    store.events.append("autopilot.stage", case_id=t.case_id,
-                                        payload={"stage": "verify", "target_id": t.id})
+                    _plan_set(status, "verify", "running", f"{len(shas)} to replay")
+                    _emit_stage(store, t.case_id, "verify", "running", target_id=t.id,
+                                detail=f"replaying {len(shas)} input(s)")
                     for sha in shas:
                         if stop.is_set():
                             break
@@ -230,6 +306,10 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict, stop: t
                             review.replay_verdict(store, t, sha, times=5)
                         except Exception:
                             pass
+                    _plan_set(status, "verify", "cancelled" if stop.is_set() else "done")
+                    _emit_stage(store, t.case_id, "verify",
+                                "cancelled" if stop.is_set() else "done", target_id=t.id)
+            _finalize_plan(status)          # any step never reached is marked skipped
         # Case-level cross-binary analysis for a multi-binary case.
         if len(target_ids) > 1 and not stop.is_set():
             for stage in ("link_case", "ipc_model", "cross_taint", "whole_system"):
