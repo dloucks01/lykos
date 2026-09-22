@@ -28,6 +28,20 @@ import subprocess
 from pathlib import Path
 from typing import Optional
 
+# Bound the per-function work. A large STRIPPED binary (an 11 MB `chmod`) recovers many thousands
+# of functions; disassembling + decompiling every one turns `disassemble` into a 5-plus-minute run
+# that reads as a timeout. Cap the structural pass, and cap the (advisory, slowest) decompile pass
+# harder still. Overridable for a power user who wants the whole thing.
+_MAX_FUNCS = int(os.environ.get("LYKOS_MAX_FUNCS", "1200") or "1200")
+# Above this many functions the (advisory) per-function decompile pass is SKIPPED entirely -- it is
+# the slowest step and the detectors run on the pypcode P-Code, not the decompiled C. Small
+# binaries still get full decompilation.
+_MAX_DECOMPILE = int(os.environ.get("LYKOS_MAX_DECOMPILE", "400") or "400")
+# Cap the per-string xref pass (axtj per string address) -- a big binary has tens of thousands of
+# strings and computing an xref for each is another slow per-item loop. Strings are still all
+# listed; only the xref sites beyond this cap are skipped.
+_MAX_STRING_XREFS = int(os.environ.get("LYKOS_MAX_STRING_XREFS", "1500") or "1500")
+
 # r2/rizin arch+bits+endian -> pypcode SLEIGH language id. Extend as architectures are added;
 # an unmapped target still analyses (structure + decompile), only its P-Code is empty.
 _SLEIGH = {
@@ -286,6 +300,18 @@ def analyze(binary: Path, *, ctx=None, timeout: int = 900) -> dict:
     izj = _readj(T / "strings", [])
     iij = _readj(T / "imports", [])
     fn_by_addr = {_faddr(f): f for f in aflj if isinstance(f, dict) and _faddr(f) is not None}
+    # Cap the per-function passes so a large stripped binary does not make disassemble read as a
+    # timeout. The detectors run on the pypcode P-Code, and coverage/fuzzing are unaffected; the
+    # decompiled C is advisory. Tell the analyst how many of how many were covered.
+    total_fns = len(fn_by_addr)
+    if total_fns > _MAX_FUNCS:
+        fn_by_addr = dict(list(fn_by_addr.items())[:_MAX_FUNCS])
+        if ctx is not None:
+            try:
+                ctx.progress(msg=f"large binary: {total_fns} functions — "
+                                 f"analysing the first {_MAX_FUNCS}")
+            except Exception:
+                pass
 
     # rizin embeds stack vars + call refs in aflj (per function); radare2 does not, and its
     # `afvj`/`afxj` commands do -- but on rizin `afvj` is unknown and ABORTS the -c chain. So we
@@ -306,15 +332,25 @@ def analyze(binary: Path, *, ctx=None, timeout: int = 900) -> dict:
     # Pass 3 (decompile): a SEPARATE run so an empty/failed decompiler cannot abort the
     # structural pass. Decompiled C is advisory (the detectors use the pypcode P-Code); it is
     # fine for this to come back empty (e.g. rz-ghidra not wired for `pdg`).
-    dec_cmd = "pdg" if _has_pdg(cli, binary, ctx, timeout) else "pdc"
-    dparts = ["aaa"]
-    for a in fn_by_addr:
-        dparts.append(f"s {a}")
-        dparts.append(_redir(dec_cmd, T / f"{a}.d"))
-    try:
-        _run(cli, binary, ";".join(dparts), ctx=ctx, timeout=timeout, scratch=T)
-    except Exception:
-        pass
+    # Decompile is advisory (the detectors use the pypcode P-Code) and the slowest step -- pdc/pdg
+    # per function over thousands of functions is what makes a big stripped binary read as a
+    # timeout. Skip it ENTIRELY once the binary is large; small binaries still get full decompiled C.
+    if total_fns <= _MAX_DECOMPILE:
+        dec_cmd = "pdg" if _has_pdg(cli, binary, ctx, timeout) else "pdc"
+        dparts = ["aaa"]
+        for a in fn_by_addr:
+            dparts.append(f"s {a}")
+            dparts.append(_redir(dec_cmd, T / f"{a}.d"))
+        try:
+            _run(cli, binary, ";".join(dparts), ctx=ctx, timeout=timeout, scratch=T)
+        except Exception:
+            pass
+    elif ctx is not None:
+        try:
+            ctx.progress(msg=f"skipping decompiled C for {total_fns} functions "
+                             f"(advisory; detectors use P-Code)")
+        except Exception:
+            pass
 
     functions = _build_functions(T, fn_by_addr, lifter, embedded)
     strings = _build_strings(cli, binary, izj, T, ctx=ctx, timeout=timeout)
@@ -438,7 +474,7 @@ def _build_strings(cli: Path, binary: Path, izj, T: Path, *, ctx, timeout) -> li
     """Strings + their xref sites (axtj per string address), each redirected to a file."""
     strings = []
     addrs = [s.get("vaddr") for s in (izj if isinstance(izj, list) else [])
-             if isinstance(s, dict) and isinstance(s.get("vaddr"), int)]
+             if isinstance(s, dict) and isinstance(s.get("vaddr"), int)][:_MAX_STRING_XREFS]
     xrefs_by_addr = {}
     if addrs:
         parts = ["aaa"]
