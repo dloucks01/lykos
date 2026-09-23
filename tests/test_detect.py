@@ -186,6 +186,10 @@ def test_normalize_isoc_variants():
     assert normalize("__isoc23_sscanf") == "sscanf"     # C23 variant modern glibc emits
     assert normalize("__isoc99_fscanf") == "fscanf"
     assert normalize("isocket_open") == "isocket_open"  # not an isocNN_ alias
+    # ppc64 PLT thunks carry the version tag with a DOUBLE underscore, not `@@`
+    assert normalize("0000001a.plt_call.strcpy__GLIBC_2.17") == "strcpy"
+    assert normalize("memcpy@@GLIBC_2.17") == "memcpy"
+    assert normalize("sprintf__GLIBC_2.17") == "sprintf"
 
 
 def test_scanf_sscanf_not_gated_by_destination():

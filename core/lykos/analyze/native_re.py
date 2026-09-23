@@ -25,6 +25,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -173,39 +174,82 @@ def _vn(ctx, v) -> str:
     return f"{sp}:{hex(v.offset)}:{v.size}"
 
 
+def _have_pypcode() -> bool:
+    try:
+        import pypcode  # noqa: F401
+        return True
+    except Exception:                                        # noqa: BLE001
+        return False
+
+
+def _pcode_worker_path() -> Path:
+    """Path to the standalone pcode_worker.py. Materialize it from the package when it is not a
+    real file on disk (e.g. running from a zipapp), so it can be handed to a child interpreter."""
+    here = Path(__file__).parent / "pcode_worker.py"
+    if here.exists():
+        return here
+    import tempfile
+    from importlib import resources
+    data = (resources.files("lykos.analyze") / "pcode_worker.py").read_bytes()
+    p = Path(tempfile.mkdtemp(prefix="lykos-pcodew-")) / "pcode_worker.py"
+    p.write_bytes(data)
+    return p
+
+
 class _Lifter:
-    """Per-instruction Ghidra P-Code via pypcode (SLEIGH, no JVM). Falls back to empty pcode
-    when pypcode is absent or the language is unmapped -- structure/decompile still work."""
+    """Ghidra P-Code via pypcode (SLEIGH, no JVM), lifted in a SEPARATE PROCESS.
+
+    pypcode is a C extension that can crash the interpreter (a native double-free / SIGABRT on some
+    instruction encodings -- seen on ppc64 big-endian). Lifting in-process would abort the whole
+    server, so `lift_all` runs pcode_worker.py as a child: a crash there is contained, and the
+    parent keeps every function's structure plus whatever P-Code was flushed. Falls back to empty
+    P-Code when pypcode/the language is unavailable -- structure/decompile still work."""
 
     def __init__(self, langid: Optional[str]):
-        self.ctx = None
-        if not langid:
-            return
-        try:
-            import pypcode
-            self.pypcode = pypcode
-            self.ctx = pypcode.Context(langid)
-        except Exception:
-            self.ctx = None
+        self.langid = langid or None
+        self.available = bool(langid) and _have_pypcode()
 
-    def pcode(self, raw: bytes, addr: int) -> list:
-        if self.ctx is None or not raw:
-            return []
+    def lift_all(self, instrs: list, *, ctx=None, timeout: int = 600) -> dict:
+        """Lift many instructions at once in a child process. `instrs` is [(addr_int, hexbytes)].
+        Returns {addr_hex: [op_strings]}. On a crash/timeout the child dies and we return whatever
+        it flushed (possibly nothing) -- the analysis continues with that much P-Code."""
+        if not self.available or not instrs:
+            return {}
+        import tempfile
+        d = Path(tempfile.mkdtemp(prefix="lykos-pcode-"))
+        inp, outp = d / "in.json", d / "out.jsonl"
         try:
-            tx = self.ctx.translate(raw, base_address=addr, max_instructions=1)
-        except Exception:
-            return []
-        ops = []
-        for op in tx.ops:
-            if op.opcode.name == "IMARK":
-                continue
-            s = op.opcode.name
-            for vin in op.inputs:
-                s += " " + _vn(self.ctx, vin)
-            if op.output is not None:
-                s += " -> " + _vn(self.ctx, op.output)
-            ops.append(s)
-        return ops
+            inp.write_text(json.dumps({"langid": self.langid,
+                                       "instrs": [[a, h] for a, h in instrs]}))
+            worker = _pcode_worker_path()
+            cmd = [sys.executable, str(worker), str(inp), str(outp)]
+            env_path = os.pathsep.join(p for p in sys.path if p)   # pypcode wherever the parent has it
+            popen_env = dict(os.environ, PYTHONPATH=env_path)
+            try:
+                if ctx is not None:
+                    ctx.run_subprocess(cmd, timeout=timeout, env=popen_env)
+                else:
+                    subprocess.run(cmd, timeout=timeout, capture_output=True, check=False,
+                                   stdin=subprocess.DEVNULL, env=popen_env)
+            except Exception:                              # noqa: BLE001 -- crash/timeout: use partial
+                pass
+            out = {}
+            try:
+                with open(outp, errors="replace") as fh:
+                    for line in fh:                        # skip a torn final line from a hard crash
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            row = json.loads(line)
+                        except ValueError:
+                            continue
+                        out[row["a"]] = row.get("p") or []
+            except OSError:
+                pass
+            return out
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
 
 
 def _clean_name(n: Optional[str]) -> Optional[str]:
@@ -453,7 +497,7 @@ def analyze(binary: Path, *, ctx=None, timeout: int = 900) -> dict:
                                f"(opens decompile the function you click; detectors use P-Code)")
 
     _emit(ctx, pct=80, msg=f"lifting P-Code for {target_fns} functions")
-    functions = _build_functions(T, fn_by_addr, lifter, embedded)
+    functions = _build_functions(T, fn_by_addr, lifter, embedded, ctx=ctx, timeout=timeout)
     strings = _build_strings(cli, binary, izj, T, ctx=ctx, timeout=timeout)
     imports = [i.get("name") for i in iij if isinstance(i, dict) and i.get("name")]
 
@@ -528,8 +572,14 @@ def _is_missing_decompiler(txt: str) -> bool:
             or "you need to install" in t or "unknown command" in t or "cannot find" in t)
 
 
-def _build_functions(T: Path, fn_by_addr: dict, lifter: "_Lifter", embedded: bool) -> list:
+def _build_functions(T: Path, fn_by_addr: dict, lifter: "_Lifter", embedded: bool,
+                     ctx=None, timeout: int = 600) -> list:
     functions = []
+    # P-Code is lifted OUT OF PROCESS (pypcode can crash on some encodings), so we first build every
+    # function with empty pcode while collecting the instruction bytes, then lift them all in one
+    # child and fill the results in. `pending` holds (addr, ins_dict) so the fill is a dict lookup.
+    to_lift = {}                                             # addr_int -> hexbytes (deduped)
+    pending = []                                             # (addr_int, ins_dict) to fill
     for faddr, meta in fn_by_addr.items():
         afbj = _readj(T / f"{faddr}.b", [])
         pdfj = _readj(T / f"{faddr}.o", {})
@@ -547,9 +597,12 @@ def _build_functions(T: Path, fn_by_addr: dict, lifter: "_Lifter", embedded: boo
             a = o.get("offset") if o.get("offset") is not None else o.get("addr")  # rizin|r2
             if a is None or o.get("type") == "invalid":
                 continue
-            raw = bytes.fromhex(o.get("bytes", "")) if o.get("bytes") else b""
-            ins_by_addr[a] = {"addr": hex(a), "text": o.get("disasm") or o.get("opcode") or "",
-                              "pcode": lifter.pcode(raw, a)}
+            hexb = o.get("bytes", "") or ""
+            ins = {"addr": hex(a), "text": o.get("disasm") or o.get("opcode") or "", "pcode": []}
+            ins_by_addr[a] = ins
+            if hexb:
+                to_lift[a] = hexb
+                pending.append((a, ins))
 
         blocks, edges = [], 0
         for b in (afbj if isinstance(afbj, list) else []):
@@ -592,6 +645,15 @@ def _build_functions(T: Path, fn_by_addr: dict, lifter: "_Lifter", embedded: boo
             "cfg": {"blocks": blocks, "edges": edges},
             "params": params, "frame": frame, "calls": calls,
         })
+
+    # Lift every instruction's P-Code in ONE isolated child, then fill it into the built functions.
+    if to_lift:
+        _emit(ctx, msg=f"lifting P-Code for {len(to_lift)} instructions (isolated)")
+        pcode_map = lifter.lift_all(sorted(to_lift.items()), ctx=ctx, timeout=timeout)
+        for a, ins in pending:
+            ops = pcode_map.get(hex(a))
+            if ops:
+                ins["pcode"] = ops
     return functions
 
 

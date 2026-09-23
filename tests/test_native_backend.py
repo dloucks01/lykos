@@ -56,6 +56,23 @@ def pool(store):
         p.stop(grace=3.0)
 
 
+def test_pcode_lifting_is_out_of_process_and_graceful():
+    """P-Code is lifted in a child process (pypcode can crash the interpreter on some encodings --
+    ppc64 big-endian -- and that must not take the server down). lift_all degrades to {} when the
+    language/worker is unavailable, and never raises."""
+    from lykos.analyze.native_re import _Lifter, _pcode_worker_path
+    assert _pcode_worker_path().exists()
+    # an unmapped language -> not available -> empty, no raise
+    assert _Lifter(None).lift_all([(0x1000, "90")]) == {}
+    # a real x86-64 lift returns ops keyed by address
+    lifter = _Lifter("x86:LE:64:default")
+    if lifter.available:
+        out = lifter.lift_all([(0x1000, "4889f8")])          # mov rax, rdi
+        assert out.get("0x1000")                             # produced at least one op
+    # a bogus hex byte is skipped, not fatal
+    assert isinstance(_Lifter("x86:LE:64:default").lift_all([(0x1000, "zz")]), dict)
+
+
 def test_native_backend_produces_ghidra_pcode(vuln_bin):
     """Unit-level: the backend emits real Ghidra P-Code in the detector's string format, plus
     a recovered char[] buffer -- the two things bounds/taint/int-overflow actually consume."""
