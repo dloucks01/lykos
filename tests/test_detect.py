@@ -4,9 +4,11 @@ from factories import make_target
 from lykos.analyze import ingest, register  # noqa: F401
 from lykos.analyze.detect.detectors import (
     DetectContext,
+    _copy_dest_class,
     correlate,
     dangerous_api,
     hardcoded_secrets,
+    stack_buffer_overflow,
 )
 from lykos.analyze.detect.stage import enqueue_detect
 from lykos.db.dao import CallEdgeDAO, FindingDAO, FunctionDAO, StringDAO
@@ -58,6 +60,60 @@ def test_dangerous_api_detector():
     cwes = {c["cwe"] for c in cands}
     assert "CWE-120" in cwes                              # strcpy + scanf
     assert len(cands) == 2 and all(c["detector"] == "dangerous_api" for c in cands)
+
+
+def _blk(addr, instrs):
+    return {"addr": addr, "succ": [],
+            "instructions": [{"addr": a, "text": t, "pcode": []} for a, t in instrs]}
+
+
+def _ir(instrs):
+    return {"blocks": [_blk("0x1000", instrs)], "edges": []}
+
+
+def test_copy_dest_class_distinguishes_stack_from_pointer():
+    # 32-bit cdecl: destination is the last value written to [esp] before the call.
+    stack = _ir([("0x1000", "lea eax, [var_10h]"), ("0x1008", "mov dword [esp], eax"),
+                 ("0x100e", "call sym.strcpy")])
+    assert _copy_dest_class(stack, "0x100e", 32) == "stack"
+    # loaded pointer / caller argument -> not the stack frame
+    ptr = _ir([("0x1000", "mov eax, dword [arg_8h]"), ("0x1008", "mov dword [esp], eax"),
+               ("0x100e", "call sym.strcpy")])
+    assert _copy_dest_class(ptr, "0x100e", 32) == "nonstack"
+    arena = _ir([("0x1000", "mov ecx, dword [var_44h]"), ("0x1008", "mov dword [esp], ecx"),
+                 ("0x100e", "call sym.strcpy")])       # the _hostTblSearchByName2 shape
+    assert _copy_dest_class(arena, "0x100e", 32) == "nonstack"
+    glob = _ir([("0x1008", "mov dword [esp], obj.loginHostname"),
+                ("0x100e", "call sym.strcpy")])         # the ftpHookup shape
+    assert _copy_dest_class(glob, "0x100e", 32) == "nonstack"
+    # 64-bit SysV: destination is rdi
+    s64 = _ir([("0x1000", "lea rdi, [rbp - 0x20]"), ("0x100e", "call sym.strcpy")])
+    assert _copy_dest_class(s64, "0x100e", 64) == "stack"
+    # can't resolve -> unknown (kept, never a false negative)
+    assert _copy_dest_class(_ir([("0x100e", "call sym.strcpy")]), "0x100e", 32) == "unknown"
+
+
+def test_stack_overflow_gated_on_destination():
+    """CWE-121 fires for a copy INTO the stack frame, and is suppressed when the copy's destination
+    is provably a caller/heap pointer -- the false-positive class found on the VxWorks kernel."""
+    frame = {"vars": [{"name": "buf", "type": "char", "offset": -0x20, "size": 32,
+                       "is_buffer": True}], "ret_offset": 0}
+    edges = [_edge("0x1000", "0x100e", "0x9000", "strcpy", True)]
+    base = dict(target_id="t", case_id="c", call_edges=edges, strings=[], bits=32,
+                frames={"0x1000": frame})
+    # destination is the stack buffer -> finding
+    stack_ir = {"0x1000": _ir([("0x1000", "lea eax, [var_20h]"),
+                               ("0x1008", "mov dword [esp], eax"), ("0x100e", "call sym.strcpy")])}
+    assert [c for c in stack_buffer_overflow(DetectContext(func_irs=stack_ir, **base))
+            if c["cwe"] == "CWE-121"]
+    # destination is a caller pointer -> suppressed
+    ptr_ir = {"0x1000": _ir([("0x1000", "mov eax, dword [arg_8h]"),
+                             ("0x1008", "mov dword [esp], eax"), ("0x100e", "call sym.strcpy")])}
+    assert not [c for c in stack_buffer_overflow(DetectContext(func_irs=ptr_ir, **base))
+                if c["cwe"] == "CWE-121"]
+    # no IR available -> kept (conservative, no false negative)
+    assert [c for c in stack_buffer_overflow(DetectContext(**base))
+            if c["cwe"] == "CWE-121"]
 
 
 def test_hardcoded_secrets_detector():
