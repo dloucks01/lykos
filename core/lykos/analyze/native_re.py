@@ -387,6 +387,13 @@ def analyze(binary: Path, *, ctx=None, timeout: int = 900) -> dict:
     done = 0
     failed_batches = 0
 
+    def _reraise_if_cancel(e):
+        # A cancel/timeout must PROPAGATE, not be swallowed as a "failed batch": otherwise a user
+        # cancel keeps grinding through every remaining batch and the stage reports a partial
+        # "done". Identified by class name to avoid importing the jobs layer into analysis code.
+        if type(e).__name__ in ("StageCancelled", "StageTimeout", "KeyboardInterrupt"):
+            raise e
+
     def _fn_cmds(a):
         parts = [f"s {a}", _redir("afbj", T / f"{a}.b"), _redir("pdfj", T / f"{a}.o")]
         if not embedded:                                  # radare2: pull vars/calls via commands
@@ -401,12 +408,15 @@ def analyze(binary: Path, *, ctx=None, timeout: int = 900) -> dict:
         try:
             _run(cli, binary, ";".join(parts), ctx=ctx, timeout=timeout, scratch=T)
         except Exception as e:                            # noqa: BLE001
+            _reraise_if_cancel(e)
             failed_batches += 1
             _emit(ctx, msg=f"structural pass did not finish ({type(e).__name__}); "
                            f"building the functions that were written")
         _emit(ctx, pct=75, msg=f"disassembled {target_fns} functions")
     else:
         for i in range(0, len(addrs), _BATCH):
+            if ctx is not None:
+                ctx.check_cancel()                        # honor a cancel/timeout between batches
             chunk = addrs[i:i + _BATCH]
             parts = []
             for a in chunk:
@@ -415,6 +425,7 @@ def analyze(binary: Path, *, ctx=None, timeout: int = 900) -> dict:
             try:
                 _run(cli, binary, ";".join(parts), ctx=ctx, timeout=timeout, scratch=T)
             except Exception as e:                        # noqa: BLE001 -- one batch, not the run
+                _reraise_if_cancel(e)
                 failed_batches += 1
                 _emit(ctx, msg=f"disassembly batch {i // _BATCH + 1} did not finish "
                                f"({type(e).__name__}); keeping the {done} functions already done")

@@ -568,24 +568,43 @@ class FindingDAO(BaseDAO):
             if c.get("function_addr") or c.get("site_addr"):
                 self._record_site(fid, c, now)
 
-    def clear_sites_for_keys(self, target_id: str, keys) -> int:
-        """Delete the recorded sites of the target's findings whose dedup_key is in `keys`.
+    def reset_candidate_sites(self, target_id: str, detectors) -> int:
+        """Clear the CANDIDATE-state (rule-channel) sites of the target's findings authored by the
+        given static detectors, before those detectors re-run.
 
-        Static detection is a pure function of the disassembly: when it re-runs it recomputes the
-        COMPLETE site set for each finding, so the previous run's sites must be cleared first --
-        otherwise a site the new run no longer emits (e.g. one dropped by the CWE-121 destination
-        gate) lingers forever and the finding's site_count only ever grows. Scoped to the given
-        keys so it touches only the findings being recomputed; a dynamic stage re-adds its
-        corroboration sites when it re-runs after detection."""
-        keys = list(keys or [])
-        if not keys:
+        Static detection is a pure function of the disassembly, so on a re-run it must REPLACE its
+        sites, not accumulate them -- otherwise a site the new run no longer emits (one dropped by
+        the CWE-121 destination gate, say) lingers forever. Scoped by DETECTOR (not by this run's
+        keys) so a class that drops to zero sites is cleared too. Sites a dynamic channel elevated
+        (poc-backed, corroborated) are PRESERVED: a re-detect must never erase a crash-proven
+        occurrence, or the finding would keep claiming poc-backed with nothing proven."""
+        dets = list(detectors or [])
+        if not dets:
             return 0
-        qs = ",".join("?" * len(keys))
+        qs = ",".join("?" * len(dets))
         with transaction(self.conn, immediate=True):
             cur = self.conn.execute(
                 f"DELETE FROM finding_site WHERE finding_id IN "
-                f"(SELECT id FROM finding WHERE target_id=? AND dedup_key IN ({qs}))",
-                (target_id, *keys))
+                f"(SELECT id FROM finding WHERE target_id=? AND detector IN ({qs})) "
+                f"AND (state IS NULL OR state='candidate')",
+                (target_id, *dets))
+            return cur.rowcount or 0
+
+    def prune_empty_findings(self, target_id: str, detectors) -> int:
+        """Delete the target's candidate findings authored by `detectors` that have NO sites left
+        -- the orphan rows a re-detect leaves when the gate drops a whole class to zero. Findings
+        the dynamic channel promoted (state past 'candidate') are kept. finding_site/finding_verdict
+        rows cascade on the delete (foreign_keys=ON)."""
+        dets = list(detectors or [])
+        if not dets:
+            return 0
+        qs = ",".join("?" * len(dets))
+        with transaction(self.conn, immediate=True):
+            cur = self.conn.execute(
+                f"DELETE FROM finding WHERE target_id=? AND detector IN ({qs}) "
+                f"AND state='candidate' "
+                f"AND id NOT IN (SELECT DISTINCT finding_id FROM finding_site)",
+                (target_id, *dets))
             return cur.rowcount or 0
 
     def _record_site(self, fid: str, c: dict, now: int) -> None:

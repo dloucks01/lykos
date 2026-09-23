@@ -73,6 +73,10 @@ def dangerous_api(ctx: DetectContext):
 # ------------------------------- stack buffer overflow (decompiler stack-frame + unbounded copy)
 # Copies with no length bound; a fixed stack buffer + one of these is the classic smash.
 _UNBOUNDED_COPY = {"strcpy", "strcat", "gets", "sprintf", "vsprintf", "scanf", "sscanf"}
+# The subset whose DESTINATION buffer is the first argument -- the only ones the destination gate
+# can reason about. scanf/sscanf take the buffer as a later variadic argument (arg0 is the format
+# string), so the gate must not run on them.
+_ARG0_DEST = {"strcpy", "strcat", "gets", "sprintf", "vsprintf"}
 
 # For CWE-121 we require the copy's DESTINATION to actually be the stack frame. Without this a
 # function that owns any stack buffer AND calls strcpy is flagged even when the strcpy writes to a
@@ -93,16 +97,45 @@ def _naddr(a):
         return None
 
 
-# a memory operand naming the ADDRESS OF a stack local: `[ebp-N]` / `[rbp-N]` / `[esp+N]` / `[var_..]`.
-# A positive ebp/rbp offset is an incoming argument (ebp+8, ...), NOT a local buffer.
-_STACK_MEM = re.compile(r"\[\s*(?:var_[0-9a-fh]+|"
-                        r"(?:e|r)bp\s*-\s*0x[0-9a-f]+|"
-                        r"(?:e|r)sp\s*[+\-]\s*0x[0-9a-f]+)", re.I)
+# a memory operand naming the ADDRESS OF a stack local. The stack pointer (esp/rsp/sp) is always
+# the frame; a frame pointer (ebp/rbp/x29) counts only with a NEGATIVE displacement (a positive one
+# is an incoming argument at rbp+8...). An index register is allowed, so `[rbp + rcx - 0x20]`
+# (&buf[i], common at -O2) still reads as stack -- the earlier `rbp\s*-` form missed it.
+_STACK_MEM = re.compile(r"\[[^\]]*(?:"
+                        r"\bvar_[0-9a-fh]+\b"                     # rizin-named local
+                        r"|\b(?:esp|rsp|sp)\b"                    # stack pointer -> always the frame
+                        # frame pointer minus an offset (a local); r2 renders small offsets in
+                        # DECIMAL (`[rbp - 8]`) and larger ones in hex (`[rbp - 0x50]`), so accept
+                        # both -- requiring 0x silently missed every buffer within 15 bytes of rbp.
+                        r"|\b(?:ebp|rbp|x29|w29|fp)\b[^\]]*-\s*(?:#\s*)?(?:0x[0-9a-f]+|\d+)"
+                        r")", re.I)
 _DEST_REG64 = "rdi"                                   # SysV first integer arg
 _X86_REGS = {"eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp",
              "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
              "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"}
 _ARITH = re.compile(r"\s*(add|sub|xor|and|or|imul|mul|shl|shr|sar|neg|inc|dec|lea)\s+", re.I)
+
+
+def _mem_inner(rhs: str):
+    m = re.search(r"\[([^\]]+)\]", rhs)
+    return re.sub(r"\s+", "", m.group(1)).lower() if m else None
+
+
+def _slot_store_class(texts, upto: int, inner: str) -> str:
+    """A pointer was loaded from memory slot `inner` (`mov reg, [slot]`). Classify what was STORED
+    there: ONLY a spilled stack address (`lea r,[buf]; mov [slot], r`) yields 'stack'. Anything else
+    -- an arena/heap/struct pointer (`add`/a load/a call return), or no visible store -- is
+    'nonstack'. Returning 'stack' only on a proven stack address is what keeps this from resurrecting
+    the VxWorks arena false positive (whose slot is stored from pointer arithmetic)."""
+    for j in range(upto, -1, -1):
+        t = texts[j].split(";")[0]
+        m = re.match(r"\s*mov\s+(?:dword |qword )?(\[[^\]]+\])\s*,\s*([a-z0-9]+)\s*$", t, re.I)
+        if m and _mem_inner(m.group(1)) == inner:
+            src = m.group(2).strip().lower()
+            if src in _X86_REGS and _dest_reg_class(texts[:j + 1], src) == "stack":
+                return "stack"
+            return "nonstack"
+    return "nonstack"
 
 
 def _dest_reg_class(texts, reg: str) -> str:
@@ -121,7 +154,10 @@ def _dest_reg_class(texts, reg: str) -> str:
             op, rhs = w.group(1).lower(), w.group(2).strip()
             if op == "lea":
                 return "stack" if _STACK_MEM.search(rhs) else "nonstack"   # else global/other lea
-            if rhs.startswith("[") or "[" in rhs:     # a memory load: a pointer VALUE, not &frame
+            if "[" in rhs:                            # a memory load: a pointer VALUE, not &frame
+                inner = _mem_inner(rhs)               # ...unless a stack address was spilled here
+                if inner:                             # (checked by tracing the store to this slot)
+                    return _slot_store_class(texts, i - 1, inner)
                 return "nonstack"
             nxt = rhs.rstrip(",").lower()
             if nxt in _X86_REGS:                       # reg-to-reg: keep tracing the source
@@ -204,14 +240,44 @@ def _dest_reg_class_arm(texts, reg: str, aarch64: bool) -> str:
                 i -= 1
                 continue
             return "nonstack"                              # immediate
-        # any load into reg -> a pointer VALUE (heap ptr, global via literal pool), not &frame
+        # a load into reg. From a stack slot it may be a spilled buffer address (`add r,sp,#o;
+        # str r,[sp,#s]; ldr reg,[sp,#s]`) -> trace the store; from anything else it is a pointer
+        # value (heap / global via literal pool / struct field) -> nonstack.
+        m = re.match(r"ldr(?:\.w)?\s+" + re.escape(reg) + r"\s*,\s*(\[[^\]]+\])", t, re.I)
+        if m:
+            inner = _mem_inner(m.group(1))
+            if inner:                                  # spilled stack address? trace the store
+                return _arm_slot_store_class(texts, i - 1, inner, aarch64)
+            return "nonstack"
         if re.match(r"ldr(?:\.w)?\s+" + re.escape(reg) + r"\b", t, re.I):
             return "nonstack"
-        # a call return value lands in x0/r0
-        if reg in ret_regs and re.match(r"bl", t, re.I):
+        # a call return value lands in x0/r0 (bl / blx / blr, but NOT conditional ble/blt/bls/blo)
+        if reg in ret_regs and re.match(r"bl(?:x|r)?(?:\.w)?\s", t, re.I):
             return "nonstack"
+        # any OTHER arithmetic/logical op that redefines reg (two-operand `add r3, r2` = &buf+index,
+        # mul, orr, ...) is a def we cannot cleanly classify -> stop here as 'unknown' (kept) rather
+        # than tracing past it to a stale earlier definition. (Stores/compares read reg, not write
+        # it, so they are excluded.)
+        if re.match(r"(?:add|adc|sub|sbc|rsb|mul|mla|mls|orr|orn|eor|and|bic|lsl|lsr|asr|ror|rrx"
+                    r"|mvn|neg|umull|smull|umlal|smlal|uxt[bh]|sxt[bh]|clz|rev\d*)s?(?:\.w)?\s+"
+                    + re.escape(reg) + r"\s*,", t, re.I):
+            return "unknown"
         i -= 1
     return "unknown"
+
+
+def _arm_slot_store_class(texts, upto: int, inner: str, aarch64: bool) -> str:
+    """A pointer was loaded from ARM slot `inner`; 'stack' ONLY if a proven stack address was stored
+    there (`add r,sp,#o; str r,[slot]`), else 'nonstack' (heap/struct/arena, or no visible store)."""
+    for j in range(upto, -1, -1):
+        t = texts[j].split(";")[0]
+        m = re.match(r"\s*str(?:\.w)?\s+([a-z0-9]+)\s*,\s*(\[[^\]]+\])", t, re.I)
+        if m and _mem_inner(m.group(2)) == inner:
+            src = m.group(1).strip().lower()
+            if src in _ARM_REGS and _dest_reg_class_arm(texts[:j + 1], src, aarch64) == "stack":
+                return "stack"
+            return "nonstack"
+    return "nonstack"
 
 
 def _copy_dest_class(ir: dict, site_addr, bits: int, arch: str = "x86") -> str:
@@ -300,7 +366,14 @@ def stack_buffer_overflow(ctx: DetectContext):
             # frame is a stack smash. A destination that is provably a caller/heap pointer
             # ('nonstack') is dropped here; 'stack' and 'unknown' are kept, so we never turn a real
             # bug into a false negative when the disassembly is too complex to resolve.
-            if ir is not None and _copy_dest_class(ir, site, ctx.bits, ctx.arch) == "nonstack":
+            #
+            # The gate ONLY applies to sinks whose buffer is the FIRST argument (strcpy/strcat/
+            # sprintf/vsprintf/gets). For scanf/sscanf the destination buffer is a LATER, variadic
+            # argument -- arg0 is the format string (a .rodata global) -- so classifying arg0 would
+            # wrongly read every `scanf("%s", buf)` as a global destination and suppress a textbook
+            # stack smash. Those are kept unconditionally.
+            if n in _ARG0_DEST and ir is not None \
+                    and _copy_dest_class(ir, site, ctx.bits, ctx.arch) == "nonstack":
                 continue
             sites_by_name[n].append(site)
         for n in sorted(sites_by_name):
