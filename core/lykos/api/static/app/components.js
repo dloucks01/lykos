@@ -30,26 +30,34 @@ export function SevDot({ severity }) {
 // log. Each step carries a state (pending/running/done/skipped/error/cancelled) and an optional
 // detail. Conditional steps the run never reached show as "skipped".
 const _PLAN_ICON = { done: "✓", error: "✕", skipped: "–", cancelled: "■" };
+// A COMPACT progress summary -- deliberately not a stage list (the Run log already is one). It
+// gives what the log does not: overall progress at a glance, the step running right now, and the
+// shape of what is still ahead (the dot strip, each dot a stage; hover for its name + detail).
 export function PipelinePlan({ plan, targetName, target, targets }) {
   if (!plan || !plan.length) return null;
-  const done = plan.filter((p) => p.state === "done").length;
-  const total = plan.filter((p) => p.state !== "skipped").length || plan.length;
+  const active = plan.filter((p) => p.state !== "skipped");
+  const done = active.filter((p) => p.state === "done").length;
+  const total = active.length || plan.length;
+  const running = plan.find((p) => p.state === "running");
+  const errored = plan.find((p) => p.state === "error");
+  const pct = Math.round((100 * done) / Math.max(1, total));
   return html`
-    <div class="plan card">
+    <div class="plan card compact">
       <div class="plan-head">
         <span>Pipeline${target && targets > 1 ? ` · target ${target}/${targets}` : ""}${
           targetName ? html` · <span class="mono">${targetName}</span>` : null}</span>
         <span class="plan-count">${done}/${total}</span>
       </div>
-      <ol class="plan-list">
-        ${plan.map((p) => html`
-          <li class=${`plan-step step-${p.state}`} key=${p.stage}>
-            <span class="plan-ico">${p.state === "running"
-              ? html`<span class="st-run"></span>` : (_PLAN_ICON[p.state] || "")}</span>
-            <span class="plan-lbl">${p.label}</span>
-            ${p.detail ? html`<span class="plan-detail">${p.detail}</span>` : null}
-          </li>`)}
-      </ol>
+      <div class="plan-bar"><div class=${`plan-fill${errored ? " err" : ""}`} style=${`width:${Math.max(3, pct)}%`}></div></div>
+      <div class="plan-now">
+        ${running ? html`<${Spinner} label=${running.label + (running.detail ? ` — ${running.detail}` : "")} />`
+          : errored ? html`<span class="plan-nowerr">✕ ${errored.label}${errored.detail ? ` — ${errored.detail}` : " failed"}</span>`
+          : html`<span class="plan-nowok">✓ all ${total} steps complete</span>`}
+      </div>
+      <div class="plan-dots">
+        ${plan.map((p) => html`<span class=${`plan-dot dot-${p.state}`} key=${p.stage}
+          title=${p.label + (p.detail ? ` — ${p.detail}` : "")}></span>`)}
+      </div>
     </div>`;
 }
 
