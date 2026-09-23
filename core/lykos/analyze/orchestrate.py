@@ -158,11 +158,19 @@ def _stage_detail(store, target, stage) -> str:
             n = FindingDAO(store.conn).count_by_target(tid)
             return f"{n} finding{'s' if n != 1 else ''}" if n else ""
         if stage in ("coverage_fuzz", "directed_fuzz", "heap_check"):
-            pct = _best_block_pct(store, tid)
+            from ..report.model import _best_coverage
+            t = store.targets.get(tid)
+            runs = [r for r in store.runs.list_by_case(t.case_id) if r.target_id == tid]
+            cov = _best_coverage(store, runs)
             ncr = sum(1 for d in DynResultDAO(store.conn).list_by_target(tid) if d.crashed)
             bits = []
-            if pct is not None:
-                bits.append(f"{pct:.0f}% cov")
+            # Block coverage is a % of recovered code; edge coverage (AFL bitmap) has no honest %
+            # -- its EDGE COUNT is the figure, so `coverage_fuzz` reads "19 edges", not an empty
+            # cell that looks like it did nothing.
+            if cov and cov.get("kind") == "block" and cov.get("pct") is not None:
+                bits.append(f"{cov['pct']:.0f}% cov")
+            elif cov and cov.get("kind") == "edge" and cov.get("edges"):
+                bits.append(f"{int(cov['edges'])} edges")
             if ncr:
                 bits.append(f"{ncr} crash{'es' if ncr != 1 else ''}")
             return " · ".join(bits)
