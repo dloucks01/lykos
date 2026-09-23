@@ -9,10 +9,11 @@ from .detectors import DETECTORS, DetectContext, correlate
 
 DETECT_STAGE = "detect_cwe"
 TOOL = "detect"
-# -2: CWE-121 is now gated on the copy destination resolving to the stack frame (dropping
-# arena/heap/global-destination false positives). Bump invalidates the content-addressed cache so
-# a target detected under the old logic is re-analyzed instead of reprojecting stale findings.
-TOOL_VERSION = "detect-2"
+# -2: CWE-121 gated on the copy destination resolving to the stack frame (drop arena/heap/global
+# false positives). -3: re-detection is idempotent -- a re-run replaces its own finding sites
+# instead of accumulating them. Each bump invalidates the content-addressed cache so a target
+# analyzed under older logic is re-analyzed instead of reprojecting stale findings.
+TOOL_VERSION = "detect-3"
 
 
 # Attacker-influenced dereference. Every other detector keys on a CALL, so this whole class
@@ -470,6 +471,11 @@ def detect_stage(ctx) -> dict:
             c["site_detail"] = v["why"]
 
     fd = FindingDAO(ctx.conn)
+    # Idempotent re-detection: drop the sites this run's findings had from a PRIOR detect run so
+    # the new (recomputed) site set fully replaces them. Without this a re-run only ever ADDS sites
+    # -- a site the new run no longer emits (dropped by the CWE-121 destination gate, say) would
+    # persist and the count would keep growing across re-runs.
+    fd.clear_sites_for_keys(target.id, {c["dedup_key"] for c in cands if c.get("dedup_key")})
     for c in cands:
         # Stamp the run: this channel's verdicts from an EARLIER run are replaced rather than
         # max-merged, which is what lets a demotion (a copy proven bounded, say) actually take

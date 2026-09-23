@@ -50,6 +50,27 @@ def test_finding_dao_upsert_merges_and_promotes(store, case):
     assert len(f.evidence) == 2                          # evidence unioned
 
 
+def test_clear_sites_for_keys_makes_redetect_idempotent(store, case):
+    """A re-detection replaces its own finding sites instead of accumulating them."""
+    t = make_target(store, case.id)
+    fd = FindingDAO(store.conn)
+    base = dict(cwe="CWE-121", title="stack smash", severity="high",
+                detector="stack_frame", dedup_key="CWE-121:stack_frame:strcpy")
+    # run 1: two sites
+    for sa in ("0x2004", "0x2008"):
+        fd.upsert(t.id, case.id, {**base, "function_addr": "0x2000", "site_addr": sa,
+                                  "evidence": [{"channel": "pattern", "detail": "x"}]})
+    fid = fd.list_by_target(t.id)[0].id
+    assert len(fd.sites(fid)) == 2
+    # run 2 (after clearing this key's sites): only one site survives the destination gate
+    fd.clear_sites_for_keys(t.id, {"CWE-121:stack_frame:strcpy"})
+    fd.upsert(t.id, case.id, {**base, "function_addr": "0x2000", "site_addr": "0x2004",
+                              "evidence": [{"channel": "pattern", "detail": "x"}]})
+    assert len(fd.sites(fid)) == 1                        # replaced, not accumulated (would be 3)
+    # unrelated keys are untouched
+    assert fd.clear_sites_for_keys(t.id, {"CWE-120:dangerous_api:memcpy"}) == 0
+
+
 def test_dangerous_api_detector():
     ctx = DetectContext("t", "c", call_edges=[
         _edge("0x2000", "0x2004", "0x9100", "strcpy", True),
