@@ -122,9 +122,32 @@ def test_copy_dest_class_distinguishes_stack_from_pointer():
     assert _copy_dest_class(g64, "0x100e", 64, "x86-64") == "nonstack"
     # can't resolve -> unknown (kept, never a false negative)
     assert _copy_dest_class(_ir([("0x100e", "call sym.strcpy")]), "0x100e", 32) == "unknown"
-    # non-x86: the x86 ABI patterns don't apply, so the gate stays out of the way (keeps)
-    assert _copy_dest_class(s64, "0x100e", 64, "aarch64") == "unknown"
-    assert _copy_dest_class(heap, "0x100e", 64, "arm") == "unknown"
+    # ---- aarch64: dst is x0. add x0,sp = stack; adrp/add = global; ldr = pointer; bl = return ----
+    a_stack = _ir([("0x1000", "add x0, sp, 0x20"), ("0x100e", "bl sym.imp.strcpy")])
+    assert _copy_dest_class(a_stack, "0x100e", 64, "aarch64") == "stack"
+    a_stack2 = _ir([("0x1000", "add x3, sp, 8"), ("0x1004", "mov x0, x3"),
+                    ("0x100e", "bl sym.imp.strcpy")])                       # reg-to-reg follow
+    assert _copy_dest_class(a_stack2, "0x100e", 64, "aarch64") == "stack"
+    a_heap = _ir([("0x1000", "ldr x0, [var_68h]"), ("0x100e", "bl sym.imp.strcpy")])
+    assert _copy_dest_class(a_heap, "0x100e", 64, "aarch64") == "nonstack"
+    a_glob = _ir([("0x1000", "adrp x0, loc.data_start"), ("0x1004", "add x0, x0, 0x18"),
+                  ("0x100e", "bl sym.imp.strcpy")])
+    assert _copy_dest_class(a_glob, "0x100e", 64, "aarch64") == "nonstack"
+    a_ret = _ir([("0x1000", "bl sym.imp.malloc"), ("0x1004", "mov x0, x0"),
+                 ("0x100e", "bl sym.imp.strcpy")])
+    assert _copy_dest_class(a_ret, "0x100e", 64, "aarch64") == "nonstack"
+    # ---- arm32 (Thumb): dst is r0. add r,r7 = stack (r7 frame ptr); add r,pc = global; ldr = ptr --
+    r_stack = _ir([("0x1000", "add.w r3, r7, 8"), ("0x1004", "mov r0, r3"),
+                   ("0x100e", "blx sym.imp.strcpy")])
+    assert _copy_dest_class(r_stack, "0x100e", 32, "arm") == "stack"
+    r_heap = _ir([("0x1000", "ldr r0, [r7, 0x4c]"), ("0x100e", "blx sym.imp.strcpy")])
+    assert _copy_dest_class(r_heap, "0x100e", 32, "arm") == "nonstack"
+    r_glob = _ir([("0x1000", "add r3, pc"), ("0x1004", "mov r0, r3"),
+                  ("0x100e", "blx sym.imp.strcpy")])
+    assert _copy_dest_class(r_glob, "0x100e", 32, "arm") == "nonstack"
+    # a genuinely unsupported arch still keeps everything
+    assert _copy_dest_class(a_stack, "0x100e", 64, "mips") == "unknown"
+    assert _copy_dest_class(a_stack, "0x100e", 64, "riscv") == "unknown"
 
 
 def test_stack_overflow_gated_on_destination():

@@ -140,6 +140,80 @@ def _is_x86(arch: str) -> bool:
     return a.startswith("x86") or a in ("i386", "i486", "i586", "i686", "amd64", "x64", "x86_64")
 
 
+def _is_aarch64(arch: str) -> bool:
+    a = (arch or "").lower()
+    return a in ("aarch64", "arm64", "arm64e")
+
+
+def _is_arm32(arch: str) -> bool:
+    a = (arch or "").lower()
+    return a in ("arm", "armv7", "armv6", "armhf", "armel", "thumb", "arm32") or a.startswith("armv")
+
+
+# ARM/aarch64 registers, and the ones that hold a stack/frame base (sp, the aarch64 frame pointer
+# x29, and the AArch32 frame pointers r7 (Thumb) / r11/fp (ARM)).
+_ARM_REGS = ({f"r{i}" for i in range(16)} | {f"x{i}" for i in range(31)} | {f"w{i}" for i in range(31)}
+             | {"sp", "lr", "fp", "ip"})
+_ARM_STACK_BASE = {"sp", "x29", "w29", "r7", "r11", "fp"}
+_ARM_FIRST_ARG = {"aarch64": "x0", "arm": "r0"}
+
+
+def _dest_reg_class_arm(texts, reg: str, aarch64: bool) -> str:
+    """Trace an ARM/aarch64 destination register backward. Stack: `add reg, sp/x29/r7/fp, #imm`
+    or `mov reg, sp`. Nonstack: `adrp` / `add reg, pc` (PC-relative global), any `ldr reg, [..]`
+    (a loaded pointer value), or a `bl`/`blx` return value in x0/r0. Reg-to-reg `mov` is followed.
+    Erring toward 'stack'/'unknown' keeps a finding rather than dropping a real one."""
+    reg = reg.lower()
+    ret_regs = {"x0", "w0"} if aarch64 else {"r0"}
+    i = len(texts) - 2
+    hops = 8
+    while i >= 0 and hops > 0:
+        t = texts[i].split(";")[0].strip()
+        # add/sub reg, <base>, #imm   (three-operand address computation)
+        m = re.match(r"(?:add|sub|adds|subs)(?:\.w)?\s+" + re.escape(reg) + r"\s*,\s*([a-z0-9]+)\s*,", t, re.I)
+        if m:
+            base = m.group(1).lower()
+            if base in _ARM_STACK_BASE:
+                return "stack"
+            if base == "pc":
+                return "nonstack"                          # PC-relative global
+            if base == reg:                                # add reg,reg,#imm -> keep tracing reg
+                i -= 1
+                continue
+            reg = base
+            hops -= 1
+            i -= 1
+            continue
+        # two-operand `add reg, pc` (Thumb PC-relative global) / `add reg, sp`
+        if re.match(r"add(?:\.w)?\s+" + re.escape(reg) + r"\s*,\s*pc\b", t, re.I):
+            return "nonstack"
+        if re.match(r"add(?:\.w)?\s+" + re.escape(reg) + r"\s*,\s*sp\b", t, re.I):
+            return "stack"
+        # aarch64 page-address of a global
+        if re.match(r"adrp?\s+" + re.escape(reg) + r"\b", t, re.I):
+            return "nonstack"
+        # mov reg, sp -> stack ; mov reg, <reg2> -> follow
+        m = re.match(r"mov(?:\.w)?\s+" + re.escape(reg) + r"\s*,\s*([a-z0-9]+)\s*$", t, re.I)
+        if m:
+            src = m.group(1).lower()
+            if src == "sp":
+                return "stack"
+            if src in _ARM_REGS:
+                reg = src
+                hops -= 1
+                i -= 1
+                continue
+            return "nonstack"                              # immediate
+        # any load into reg -> a pointer VALUE (heap ptr, global via literal pool), not &frame
+        if re.match(r"ldr(?:\.w)?\s+" + re.escape(reg) + r"\b", t, re.I):
+            return "nonstack"
+        # a call return value lands in x0/r0
+        if reg in ret_regs and re.match(r"bl", t, re.I):
+            return "nonstack"
+        i -= 1
+    return "unknown"
+
+
 def _copy_dest_class(ir: dict, site_addr, bits: int, arch: str = "x86") -> str:
     """Classify the destination of an unbounded copy at `site_addr` as 'stack', 'nonstack', or
     'unknown', by reading the disassembly leading up to the call.
@@ -148,9 +222,10 @@ def _copy_dest_class(ir: dict, site_addr, bits: int, arch: str = "x86") -> str:
     or `push r`); 64-bit SysV: it is rdi. From there `_dest_reg_class` traces the register. Anything
     unresolved stays 'unknown' (kept, so a real bug is never turned into a false negative).
 
-    The register/ABI patterns are x86-specific; on any other architecture this returns 'unknown'
-    (keep) so the gate never suppresses a finding it cannot actually reason about."""
-    if not _is_x86(arch):
+    The register/ABI patterns are per-architecture (x86/x86-64, arm, aarch64); on any other
+    architecture this returns 'unknown' (keep) so the gate never suppresses a finding it cannot
+    actually reason about."""
+    if not (_is_x86(arch) or _is_aarch64(arch) or _is_arm32(arch)):
         return "unknown"
     site = _naddr(site_addr)
     if not ir or site is None:
@@ -165,6 +240,10 @@ def _copy_dest_class(ir: dict, site_addr, bits: int, arch: str = "x86") -> str:
     if not seq:
         return "unknown"
     texts = [(i.get("text") or "") for i in seq]
+    if _is_aarch64(arch):
+        return _dest_reg_class_arm(texts, _ARM_FIRST_ARG["aarch64"], aarch64=True)
+    if _is_arm32(arch):
+        return _dest_reg_class_arm(texts, _ARM_FIRST_ARG["arm"], aarch64=False)
     if bits == 64:
         return _dest_reg_class(texts, _DEST_REG64)
     # 32-bit: the destination is the last value written to [esp] (or pushed) before the call.
