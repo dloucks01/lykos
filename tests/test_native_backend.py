@@ -76,6 +76,32 @@ def test_native_backend_produces_ghidra_pcode(vuln_bin):
     assert any("reg:" in pc for pc in pcode) and any("const:" in pc for pc in pcode)
 
 
+def test_infer_buffers_from_stack_geometry():
+    """A large stack local with no recovered array type is still marked a buffer, sized from the
+    gap to the next-higher local. This is what lets the stack-smash detector fire on a stripped or
+    undecompiled binary (a whole VxWorks kernel had 6000+ frames and ZERO typed buffers)."""
+    # offsets are negative bp-relative; -0x40 slot spans to -0x10 (48 bytes) -> buffer, -0x10 to
+    # -0x8 (8 bytes) -> not a buffer, -0x8 to 0 (8 bytes) -> not.
+    vars_ = [{"name": "big", "type": "int32_t", "offset": -0x40, "is_buffer": False},
+             {"name": "p1", "type": "void*", "offset": -0x10, "is_buffer": False},
+             {"name": "p2", "type": "int32_t", "offset": -0x8, "is_buffer": False}]
+    out = native_re._infer_buffers(vars_)
+    big = next(v for v in out if v["name"] == "big")
+    assert big["is_buffer"] and big.get("buffer_inferred") and big["size"] == 0x30
+    assert not any(v["is_buffer"] for v in out if v["name"] in ("p1", "p2"))
+    # an already-typed array is left as a (non-inferred) buffer
+    typed = native_re._infer_buffers([{"name": "b", "type": "char [64]", "offset": -0x50,
+                                       "is_buffer": True}])
+    assert typed[0]["is_buffer"] and not typed[0].get("buffer_inferred")
+
+
+def test_analyze_is_exhaustive_and_reports_completeness(vuln_bin):
+    """analyze() carries honest completeness bookkeeping and, by default, caps nothing."""
+    res = native_re.analyze(vuln_bin, timeout=180)
+    assert res["partial"] in (False, 0) and res["failed_batches"] == 0
+    assert res["analyzed_functions"] == res["function_count"] == res["total_functions"]
+
+
 def test_native_disassemble_then_detect_finds_the_overflow(store, case, pool, vuln_bin,
                                                             monkeypatch):
     """End-to-end through the real pipeline with the native backend selected: ingest ->

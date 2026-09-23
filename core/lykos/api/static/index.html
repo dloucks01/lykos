@@ -328,6 +328,50 @@
   .cov-hi { background: var(--ok); } .cov-mid { background: var(--warn); } .cov-lo { background: var(--bad); }
   .cov-val { flex: 0 0 auto; font-size: .82rem; font-weight: 600; min-width: 44px; text-align: right; }
   .cov-detail { color: var(--faint); font-weight: 400; font-size: .74rem; }
+  .cov-row.clk { cursor: pointer; border-radius: 6px; padding: 4px 6px; margin: 4px -6px; transition: background .12s; }
+  .cov-row.clk:hover { background: var(--panel-2); }
+  .cov-row.clk:hover .cov-name { color: var(--accent-2); }
+
+  /* Disassembly drill-in button on a target summary */
+  .disasm-drill { display: flex; align-items: center; gap: 10px; width: 100%; margin-top: 12px;
+    background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px; padding: 9px 12px;
+    color: var(--ink); font: inherit; cursor: pointer; text-align: left; transition: border-color .12s, background .12s; }
+  .disasm-drill:hover { border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+    background: color-mix(in srgb, var(--accent) 8%, transparent); }
+  .disasm-drill .dd-ico { font-family: var(--mono); color: var(--accent-2); font-weight: 700; }
+  .disasm-drill .dd-lbl { font-weight: 600; font-size: .9rem; }
+  .disasm-drill .dd-n { color: var(--muted); font-size: .82rem; }
+  .disasm-drill .dd-go { margin-left: auto; color: var(--accent-2); font-size: .8rem; }
+
+  /* Function browser modal */
+  .modal.funcs { padding: 0; max-width: 720px; width: 92%; max-height: 86vh; display: flex; flex-direction: column; }
+  .fn-head { display: flex; justify-content: space-between; align-items: center; gap: 12px;
+    padding: 14px 18px; border-bottom: 1px solid var(--line); }
+  .fn-title { font-size: 1.02rem; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+  .fn-title .mono { font-family: var(--mono); font-size: .9rem; color: var(--muted); font-weight: 400; }
+  .fn-count { background: var(--panel-2); border: 1px solid var(--line); border-radius: 10px;
+    padding: 1px 9px; font-size: .76rem; color: var(--accent-2); font-weight: 600; }
+  .fn-search { margin: 12px 18px 6px; padding: 8px 11px; background: var(--panel-2); border: 1px solid var(--line);
+    border-radius: 8px; color: var(--ink); font: inherit; font-size: .86rem; }
+  .fn-search:focus { outline: none; border-color: color-mix(in srgb, var(--accent) 50%, transparent); }
+  .fn-loading { padding: 28px 18px; }
+  .fn-list { list-style: none; margin: 0; padding: 4px 8px 10px; overflow: auto; }
+  .fn-row { display: flex; align-items: baseline; gap: 12px; padding: 7px 10px; border-radius: 7px;
+    cursor: pointer; transition: background .1s; }
+  .fn-row:hover { background: var(--panel-2); }
+  .fn-row:hover .fn-name { color: var(--accent-2); }
+  .fn-row.fn-thin { opacity: .55; }
+  .fn-name { flex: 1 1 auto; font-family: var(--mono); font-size: .84rem; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap; }
+  .fn-addr { flex: 0 0 auto; font-size: .78rem; color: var(--faint); }
+  .fn-meta { flex: 0 0 auto; font-size: .74rem; color: var(--muted); min-width: 84px; text-align: right; }
+  .fn-more { padding: 8px 18px 14px; color: var(--faint); font-size: .78rem; }
+
+  /* Live intra-stage progress under the background-run spinner */
+  .bg-activity { display: flex; align-items: center; gap: 8px; margin: 6px 0 2px; font-size: .82rem; color: var(--muted); }
+  .bg-activity .bg-pct { font-variant-numeric: tabular-nums; font-weight: 600; color: var(--accent-2);
+    background: var(--panel-2); border: 1px solid var(--line); border-radius: 10px; padding: 1px 8px; }
+  .bg-activity .bg-act-msg { font-family: var(--mono); font-size: .78rem; }
 
   .spin { display: inline-flex; align-items: center; gap: 8px; }
   .spin .dot { width: 12px; height: 12px; border: 2px solid var(--faint); border-top-color: var(--accent);

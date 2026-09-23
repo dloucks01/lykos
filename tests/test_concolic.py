@@ -149,6 +149,50 @@ def test_concolic_corroborates_reached_sink_with_stub(store, case, pool, gated, 
 
 
 
+def _stub_angr_broken(tmp_path):
+    """A fake interpreter that passes the `import angr` check but then writes NO output file --
+    standing in for a driver killed mid-exploration (a native-code stall the subprocess timeout
+    had to SIGKILL). run_explore then sees no output and raises."""
+    py = tmp_path / "broken-angr-python"
+    py.write_text("#!/bin/sh\n"
+                  'if [ "$1" = "-c" ]; then exit 0; fi\n'    # import angr check
+                  "exit 0\n")                                # ... but never writes $3
+    py.chmod(0o755)
+    return py
+
+
+def test_concolic_stage_survives_exploration_failure(store, case, pool, gated, tmp_path):
+    """'Don't fail and lose everything': when exploration dies (stuck/killed driver, backend
+    error), the stage must finish DONE with a note, not error out and take the case with it."""
+    py = _stub_angr_broken(tmp_path)
+    target = ingest(store, case.id, gated)
+    q = JobQueue(store.conn)
+    run = enqueue_concolic(q, target, params={
+        "input_mode": "stdin", "targets": ["0x2020"], "angr_python": str(py),
+        "max_seconds": 5, "exec_timeout": 1})
+    assert pool.wait_idle(40)
+    rec = q.runs.get(run.id)
+    assert rec.status == "done", f"expected graceful done, got {rec.status}: {rec.error}"
+    # no phantom crash was invented from the failed exploration
+    assert not [f for f in FindingDAO(store.conn).list_by_target(target.id)
+                if f.detector == "concolic" and f.state == "confirmed"]
+
+
+@pytest.mark.skipif(concolic.locate_angr_python() is None, reason="angr not installed")
+def test_concolic_blob_fallback_loads_headerless(tmp_path):
+    """A headerless blob (no ELF/PE header) previously raised CLECompatibilityError and failed the
+    stage. With an arch hint the driver falls back to angr's raw 'blob' loader and runs."""
+    import json
+    from lykos.analyze.symbolic import concolic as _c
+    blob = tmp_path / "raw.bin"
+    blob.write_bytes(b"\x55\x89\xe5\x83\xec\x10\xc7\x45\xfc\x00\x00\x00\x00\xeb\x0a" * 16)
+    py = _c.locate_angr_python()
+    res = _c.run_explore(py, {"binary": str(blob), "input_mode": "stdin", "input_size": 16,
+                              "targets": [], "seeds": [], "max_seconds": 15,
+                              "arch": "x86", "bits": 32}, timeout=15)
+    assert res["ok"] is True and res.get("error") is None
+
+
 @pytest.mark.skipif(concolic.locate_angr_python() is None, reason="angr not installed")
 def test_concolic_real_angr_solves_branch_and_confirms(store, case, pool, gcc, tmp_path):
     """Real angr: solve the 4-byte magic gate so the generated input reaches win() and, when

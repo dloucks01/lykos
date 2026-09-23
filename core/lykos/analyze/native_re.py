@@ -28,14 +28,29 @@ import subprocess
 from pathlib import Path
 from typing import Optional
 
-# Bound the per-function work. A large STRIPPED binary (an 11 MB `chmod`) recovers many thousands
-# of functions; disassembling + decompiling every one turns `disassemble` into a 5-plus-minute run
-# that reads as a timeout. Cap the structural pass, and cap the (advisory, slowest) decompile pass
-# harder still. Overridable for a power user who wants the whole thing.
-_MAX_FUNCS = int(os.environ.get("LYKOS_MAX_FUNCS", "1200") or "1200")
-# Above this many functions the (advisory) per-function decompile pass is SKIPPED entirely -- it is
-# the slowest step and the detectors run on the pypcode P-Code, not the decompiled C. Small
-# binaries still get full decompilation.
+# Exhaustive by default: analyze EVERY function. A large kernel (the vxWorks 6.9 image is ~7200
+# functions) previously had its function set silently TRUNCATED to the first 1200, so the CWE
+# detectors -- which read the persisted function rows -- only ever saw ~17% of the program and the
+# real defects in the rest were invisible. We now analyze all of them; the cost (minutes on a big
+# binary) is paid by batching the per-function pass so it reports progress and survives a partial
+# failure without losing the work already done. 0 = unlimited (the default); set LYKOS_MAX_FUNCS to
+# a positive number only to deliberately cap a run.
+_MAX_FUNCS = int(os.environ.get("LYKOS_MAX_FUNCS", "0") or "0")
+# The per-function structural pass is chunked into batches of this many functions. Each batch is a
+# separate rizin invocation, so a batch that times out or errors costs only that batch -- the
+# functions from prior batches are already on disk and get built and persisted. Smaller batches =
+# finer progress + finer failure granularity; larger = less rizin-startup overhead.
+_BATCH = max(1, int(os.environ.get("LYKOS_FUNC_BATCH", "500") or "500"))
+# At or below this many functions the structural pass runs whole-program `aaa` (one pass): its
+# emulation-based type propagation recovers array types, so buffers are detected precisely and the
+# pass is still quick. Above it, `aaa` per batch would dominate the runtime, so we use the fast
+# per-function path and recover buffers from stack geometry instead.
+_AAA_MAX = int(os.environ.get("LYKOS_AAA_MAX", "2000") or "2000")
+# The (advisory, slowest) decompiled-C pass. Decompiling thousands of functions up front would take
+# many minutes and risk losing everything on a timeout, and the detectors use the pypcode P-Code,
+# not the C. So we decompile up to this many up front (small binaries come back fully decompiled),
+# and EVERY OTHER function is decompiled lazily on demand when the analyst opens it (see the
+# /functions/{id} endpoint). Nothing is permanently skipped. 0 disables the up-front pass entirely.
 _MAX_DECOMPILE = int(os.environ.get("LYKOS_MAX_DECOMPILE", "400") or "400")
 # Cap the per-string xref pass (axtj per string address) -- a big binary has tens of thousands of
 # strings and computing an xref for each is another slow per-item loop. Strings are still all
@@ -110,6 +125,20 @@ def _run(cli: Path, binary: Path, script: str, *, ctx=None, timeout: int,
             os.unlink(spath)
         except OSError:
             pass
+
+
+def _emit(ctx, *, pct=None, msg=None):
+    """Best-effort progress emit. Never raises: progress is a courtesy, not part of the result,
+    and a ctx that lacks progress() (or one that fails) must not take the analysis down."""
+    if ctx is None:
+        return
+    try:
+        if pct is not None:
+            ctx.progress(pct=pct, msg=msg)
+        else:
+            ctx.progress(msg=msg)
+    except Exception:
+        pass
 
 
 def _readj(path: Path, default):
@@ -208,9 +237,36 @@ def _langid(prog: dict) -> Optional[str]:
     return _SLEIGH.get((arch, bits, endian))
 
 
+_BUFFER_SLOT_MIN = int(os.environ.get("LYKOS_BUFFER_SLOT_MIN", "16") or "16")
+
+
+def _infer_buffers(vars_: list) -> list:
+    """Size each stack local from the gap to the next-higher local, and mark the large ones as
+    buffers even when the type was not recovered as an array.
+
+    Without a decompiler that propagates array types (rz-ghidra `pdg`), rizin types a `char[64]`
+    as a plain slot, so `is_buffer` ('[' in the type) is never set and the stack-smash detector
+    stays silent on exactly the stripped/undecompiled binaries that need it most -- e.g. a whole
+    VxWorks kernel where 6000+ functions had stack frames but ZERO recovered buffers. A local
+    occupying >= 16 bytes is the classic smashable region; the detector still only fires when such
+    a slot COINCIDES with an unbounded copy in the same function, so this widens recall without
+    turning every large local into a finding on its own."""
+    locs = [v for v in vars_ if isinstance(v.get("offset"), int) and v["offset"] < 0]
+    locs.sort(key=lambda v: v["offset"])          # most negative (furthest from frame base) first
+    for i, v in enumerate(locs):
+        nxt = locs[i + 1]["offset"] if i + 1 < len(locs) else 0
+        slot = nxt - v["offset"]
+        if slot > 0 and not v.get("size"):
+            v["size"] = slot
+        if slot >= _BUFFER_SLOT_MIN and not v.get("is_buffer"):
+            v["is_buffer"] = True
+            v["buffer_inferred"] = True           # geometry, not a recovered array type
+    return vars_
+
+
 def _frame_and_vars(afvj: dict) -> tuple:
     """Turn rizin/r2 afvj (reg/bp/sp variable lists) into the schema's params + frame.vars +
-    geometry. is_buffer = the recovered type is an array ('[' in the type)."""
+    geometry. is_buffer = the recovered type is an array ('[' in the type) OR a large stack slot."""
     params, vars_, local_size = [], [], 0
     for p in (afvj.get("reg") or []):
         params.append({"name": p.get("name"), "type": p.get("type"), "reg": p.get("ref")})
@@ -223,7 +279,7 @@ def _frame_and_vars(afvj: dict) -> tuple:
         if isinstance(off, int) and off < 0:
             local_size = max(local_size, -off)
     frame = {"frame_size": local_size, "local_size": local_size,
-             "param_size": 0, "ret_offset": 0, "vars": vars_}
+             "param_size": 0, "ret_offset": 0, "vars": _infer_buffers(vars_)}
     return params, frame
 
 
@@ -247,7 +303,7 @@ def _frame_vars_rizin(meta: dict) -> tuple:
         if r.get("arg"):
             params.append({"name": r.get("name"), "type": r.get("type")})
     frame = {"frame_size": local_size, "local_size": local_size,
-             "param_size": 0, "ret_offset": 0, "vars": vars_}
+             "param_size": 0, "ret_offset": 0, "vars": _infer_buffers(vars_)}
     return params, frame
 
 
@@ -300,64 +356,134 @@ def analyze(binary: Path, *, ctx=None, timeout: int = 900) -> dict:
     izj = _readj(T / "strings", [])
     iij = _readj(T / "imports", [])
     fn_by_addr = {_faddr(f): f for f in aflj if isinstance(f, dict) and _faddr(f) is not None}
-    # Cap the per-function passes so a large stripped binary does not make disassemble read as a
-    # timeout. The detectors run on the pypcode P-Code, and coverage/fuzzing are unaffected; the
-    # decompiled C is advisory. Tell the analyst how many of how many were covered.
+    # EXHAUSTIVE by default: every function is analyzed. A positive LYKOS_MAX_FUNCS caps it on
+    # request; 0 (the default) means no cap. The old default silently kept only the first 1200,
+    # which blinded the detectors to the rest of a large program.
     total_fns = len(fn_by_addr)
-    if total_fns > _MAX_FUNCS:
+    if _MAX_FUNCS and total_fns > _MAX_FUNCS:
         fn_by_addr = dict(list(fn_by_addr.items())[:_MAX_FUNCS])
-        if ctx is not None:
-            try:
-                ctx.progress(msg=f"large binary: {total_fns} functions — "
-                                 f"analysing the first {_MAX_FUNCS}")
-            except Exception:
-                pass
+        _emit(ctx, msg=f"{total_fns} functions — capped to {_MAX_FUNCS} (LYKOS_MAX_FUNCS)")
+    target_fns = len(fn_by_addr)
 
     # rizin embeds stack vars + call refs in aflj (per function); radare2 does not, and its
     # `afvj`/`afxj` commands do -- but on rizin `afvj` is unknown and ABORTS the -c chain. So we
     # take vars/calls from aflj on rizin, and only add afvj/afxj to the pass on radare2.
     embedded = any(isinstance(f, dict) and ("stackvars" in f or "callrefs" in f) for f in aflj)
 
-    # Pass 2 (structure): CFG + disasm per function, redirected to per-function files.
-    parts = ["aaa"]
-    for a in fn_by_addr:
-        parts.append(f"s {a}")
-        parts.append(_redir("afbj", T / f"{a}.b"))
-        parts.append(_redir("pdfj", T / f"{a}.o"))
+    # Pass 2 (structure): CFG + disasm + stack vars per function, redirected to per-function files.
+    #
+    # Two strategies, chosen by size:
+    #   * small binary (<= _AAA_MAX functions): ONE analysis pass that runs whole-program `aaa`
+    #     first. `aaa` propagates types (emulation), so a `char[16]` comes back typed as an array
+    #     and is_buffer is set from the type -- the precise signal the bounds detector wants. Cheap
+    #     at this size, and one pass is fine because it finishes quickly.
+    #   * large binary (> _AAA_MAX): BATCHED per-function `af @ addr` with NO whole-program `aaa`.
+    #     Pass 1 already discovered every function, so `af` (analyze just this one) is ~60x cheaper
+    #     than re-running `aaa` per batch -- 500 kernel functions in ~0.5s -- and batching means the
+    #     run reports progress and never loses everything (a batch that times out is skipped, its
+    #     predecessors already written). `aaa`-quality types are lost, so _infer_buffers recovers
+    #     buffers from stack geometry instead.
+    addrs = list(fn_by_addr)
+    done = 0
+    failed_batches = 0
+
+    def _fn_cmds(a):
+        parts = [f"s {a}", _redir("afbj", T / f"{a}.b"), _redir("pdfj", T / f"{a}.o")]
         if not embedded:                                  # radare2: pull vars/calls via commands
             parts.append(_redir("afvj", T / f"{a}.v"))
             parts.append(_redir("afxj", T / f"{a}.x"))
-    _run(cli, binary, ";".join(parts), ctx=ctx, timeout=timeout, scratch=T)
+        return parts
 
-    # Pass 3 (decompile): a SEPARATE run so an empty/failed decompiler cannot abort the
-    # structural pass. Decompiled C is advisory (the detectors use the pypcode P-Code); it is
-    # fine for this to come back empty (e.g. rz-ghidra not wired for `pdg`).
-    # Decompile is advisory (the detectors use the pypcode P-Code) and the slowest step -- pdc/pdg
-    # per function over thousands of functions is what makes a big stripped binary read as a
-    # timeout. Skip it ENTIRELY once the binary is large; small binaries still get full decompiled C.
-    if total_fns <= _MAX_DECOMPILE:
+    if target_fns <= _AAA_MAX:
+        parts = ["aaa"]
+        for a in addrs:
+            parts += _fn_cmds(a)
+        try:
+            _run(cli, binary, ";".join(parts), ctx=ctx, timeout=timeout, scratch=T)
+        except Exception as e:                            # noqa: BLE001
+            failed_batches += 1
+            _emit(ctx, msg=f"structural pass did not finish ({type(e).__name__}); "
+                           f"building the functions that were written")
+        _emit(ctx, pct=75, msg=f"disassembled {target_fns} functions")
+    else:
+        for i in range(0, len(addrs), _BATCH):
+            chunk = addrs[i:i + _BATCH]
+            parts = []
+            for a in chunk:
+                parts.append(f"af @ {a}")
+                parts += _fn_cmds(a)
+            try:
+                _run(cli, binary, ";".join(parts), ctx=ctx, timeout=timeout, scratch=T)
+            except Exception as e:                        # noqa: BLE001 -- one batch, not the run
+                failed_batches += 1
+                _emit(ctx, msg=f"disassembly batch {i // _BATCH + 1} did not finish "
+                               f"({type(e).__name__}); keeping the {done} functions already done")
+            done += len(chunk)
+            pct = 5 + int(70 * done / max(1, target_fns))  # 5..75% is the structural pass
+            _emit(ctx, pct=min(75, pct),
+                  msg=f"disassembled {min(done, target_fns)}/{target_fns} functions")
+
+    # Pass 3 (decompile): advisory C, the slowest step. We decompile only up to _MAX_DECOMPILE up
+    # front (small binaries come back fully decompiled); every other function decompiles lazily on
+    # demand when opened (see the /functions/{id} endpoint), so nothing is permanently skipped and a
+    # big binary is not held up for minutes producing C that the detectors never read.
+    if _MAX_DECOMPILE and target_fns <= _MAX_DECOMPILE:
         dec_cmd = "pdg" if _has_pdg(cli, binary, ctx, timeout) else "pdc"
         dparts = ["aaa"]
-        for a in fn_by_addr:
+        for a in addrs:
             dparts.append(f"s {a}")
             dparts.append(_redir(dec_cmd, T / f"{a}.d"))
         try:
             _run(cli, binary, ";".join(dparts), ctx=ctx, timeout=timeout, scratch=T)
         except Exception:
             pass
-    elif ctx is not None:
-        try:
-            ctx.progress(msg=f"skipping decompiled C for {total_fns} functions "
-                             f"(advisory; detectors use P-Code)")
-        except Exception:
-            pass
+    elif target_fns > _MAX_DECOMPILE:
+        _emit(ctx, pct=78, msg=f"decompiled C is on-demand for {target_fns} functions "
+                               f"(opens decompile the function you click; detectors use P-Code)")
 
+    _emit(ctx, pct=80, msg=f"lifting P-Code for {target_fns} functions")
     functions = _build_functions(T, fn_by_addr, lifter, embedded)
     strings = _build_strings(cli, binary, izj, T, ctx=ctx, timeout=timeout)
     imports = [i.get("name") for i in iij if isinstance(i, dict) and i.get("name")]
 
     return {"program": prog, "function_count": len(functions),
-            "functions": functions, "strings": strings, "imports": imports}
+            "functions": functions, "strings": strings, "imports": imports,
+            # honest bookkeeping: how complete this analysis is, surfaced by the stage.
+            "total_functions": total_fns, "analyzed_functions": len(functions),
+            "partial": bool(failed_batches) or (_MAX_FUNCS and total_fns > _MAX_FUNCS),
+            "failed_batches": failed_batches}
+
+
+def decompile_one(binary: Path, addr, *, ctx=None, timeout: int = 120) -> str:
+    """Decompile a SINGLE function on demand and return its C (or "" if unavailable).
+
+    The disassemble stage decompiles only a bounded number of functions up front (decompiling
+    thousands would take minutes and mostly go unread), so the /functions/{id} endpoint calls this
+    to decompile the one function an analyst actually opened, then caches the result on the row.
+    Uses `af @ addr` -- no whole-program analysis -- so it is fast even on a huge binary."""
+    try:
+        cli = locate_native()
+    except Exception:
+        cli = None
+    if cli is None or addr is None:
+        return ""
+    a = int(addr, 16) if isinstance(addr, str) and addr.lower().startswith("0x") \
+        else int(addr) if isinstance(addr, str) else addr
+    import tempfile
+    d = Path(tempfile.mkdtemp(prefix="lykos-dec1-"))
+    try:
+        dec_cmd = "pdg" if _has_pdg(cli, Path(binary), ctx, timeout) else "pdc"
+        out = d / "d"
+        script = f"af @ {a};s {a};" + _redir(dec_cmd, out)
+        _run(cli, Path(binary), script, ctx=ctx, timeout=timeout, scratch=d)
+        try:
+            return _decompiled(out.read_text(errors="replace"))
+        except OSError:
+            return ""
+    except Exception:
+        return ""
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
 
 
 def _has_pdg(cli: Path, binary: Path, ctx, timeout: int) -> bool:

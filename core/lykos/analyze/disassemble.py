@@ -14,7 +14,11 @@ from . import ghidra, native_re
 
 DISASSEMBLE_STAGE = "disassemble"
 TOOL = "ghidra"
-TOOL_VERSION = "ghidra-headless-1"
+# Bumped to -2 when disassembly became EXHAUSTIVE (all functions, not the first 1200) with
+# geometry-inferred buffers. This is the content-addressed cache key (compute_cache_key includes
+# tool_version), so the bump forces a re-analysis of any binary previously disassembled under the
+# old capped logic instead of reprojecting its stale, truncated function set.
+TOOL_VERSION = "ghidra-headless-2"
 _TIMEOUT = 1800
 
 
@@ -121,12 +125,23 @@ def disassemble_stage(ctx) -> dict:
     # functions + call graph/xrefs (reachability + taint sinks for Phase 3) + strings
     funcs, edges, strings = _persist_analysis(ctx.conn, target.id, result)
 
+    # Honest completeness bookkeeping. `analyze()` is exhaustive by default but returns a partial
+    # result rather than raising when a batch times out or the function set was capped, so we
+    # persist whatever was recovered and tell the operator exactly how complete it is.
+    total = result.get("total_functions", len(funcs))
+    partial = bool(result.get("partial"))
+    failed = int(result.get("failed_batches") or 0)
     sha = ctx.put_artifact("ghidra-analysis", data=canonical_json(result))
     ctx.emit("re.done", payload={"functions": len(funcs), "call_edges": len(edges),
-                                 "strings": len(strings),
+                                 "strings": len(strings), "total_functions": total,
+                                 "partial": partial, "failed_batches": failed,
                                  "language": result.get("program", {}).get("language")})
-    ctx.progress(pct=100, msg="%d functions, %d call edges, %d strings" %
-                 (len(funcs), len(edges), len(strings)))
+    suffix = ""
+    if partial:
+        suffix = (f" — partial: {len(funcs)}/{total} functions recovered"
+                  + (f", {failed} batch(es) did not finish" if failed else ""))
+    ctx.progress(pct=100, msg="%d functions, %d call edges, %d strings%s" %
+                 (len(funcs), len(edges), len(strings), suffix))
     return {"output_shas": [sha], "output_kind": "ghidra-analysis"}
 
 
