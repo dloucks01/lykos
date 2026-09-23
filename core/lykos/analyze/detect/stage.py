@@ -8,12 +8,18 @@ from .catalog import entry_seed_params
 from .detectors import DETECTORS, DetectContext, correlate
 
 DETECT_STAGE = "detect_cwe"
+# The detectors this stage owns -- the ones whose sites it recomputes and must replace (not
+# accumulate) on a re-run. Dynamic/crash channels (concolic, root_cause, fuzz...) are NOT here, so
+# reset_candidate_sites/prune_empty_findings never touch their findings.
+_STATIC_DETECTORS = ("dangerous_api", "stack_frame", "secret", "weak_crypto", "weak_random",
+                     "insecure_tmp", "toctou", "hardening", "tainted_deref", "int_overflow_check")
 TOOL = "detect"
-# -2: CWE-121 gated on the copy destination resolving to the stack frame (drop arena/heap/global
-# false positives). -3: re-detection is idempotent -- a re-run replaces its own finding sites
-# instead of accumulating them. Each bump invalidates the content-addressed cache so a target
-# analyzed under older logic is re-analyzed instead of reprojecting stale findings.
-TOOL_VERSION = "detect-3"
+# -2: CWE-121 gated on the copy destination resolving to the stack frame. -3: re-detection is
+# idempotent. -4: the gate is arg0-only (scanf/sscanf no longer suppressed), works on x86-64/arm/
+# aarch64 with register tracing, and re-detection preserves poc-backed sites + prunes 0-site
+# orphans. Each bump invalidates the content-addressed cache so a target analyzed under older logic
+# is re-analyzed instead of reprojecting stale findings.
+TOOL_VERSION = "detect-4"
 
 
 # Attacker-influenced dereference. Every other detector keys on a CALL, so this whole class
@@ -472,17 +478,20 @@ def detect_stage(ctx) -> dict:
             c["site_detail"] = v["why"]
 
     fd = FindingDAO(ctx.conn)
-    # Idempotent re-detection: drop the sites this run's findings had from a PRIOR detect run so
-    # the new (recomputed) site set fully replaces them. Without this a re-run only ever ADDS sites
-    # -- a site the new run no longer emits (dropped by the CWE-121 destination gate, say) would
-    # persist and the count would keep growing across re-runs.
-    fd.clear_sites_for_keys(target.id, {c["dedup_key"] for c in cands if c.get("dedup_key")})
+    # Idempotent re-detection: static detection recomputes the COMPLETE site set every run, so drop
+    # the prior run's CANDIDATE sites for these detectors first (preserving any dynamic channel's
+    # poc-backed/corroborated sites) -- otherwise a site the new run no longer emits persists and
+    # the count only grows, and a class the gate drops to zero keeps its stale sites forever.
+    fd.reset_candidate_sites(target.id, _STATIC_DETECTORS)
     for c in cands:
         # Stamp the run: this channel's verdicts from an EARLIER run are replaced rather than
         # max-merged, which is what lets a demotion (a copy proven bounded, say) actually take
         # effect. Sites within this run still take the strongest.
         c["run_id"] = ctx.run_id
         fd.upsert(target.id, target.case_id, c)
+    # Remove findings this re-run left with no sites (a whole class dropped by the gate); keeping
+    # them would show a 0-site finding at full severity in the report and API.
+    fd.prune_empty_findings(target.id, _STATIC_DETECTORS)
     counts = fd.counts_by_state(target.id)
     total = sum(counts.values()) if counts else 0
     ctx.emit("findings.done", payload={"findings": total, "sites": len(cands),

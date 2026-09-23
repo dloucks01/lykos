@@ -50,25 +50,41 @@ def test_finding_dao_upsert_merges_and_promotes(store, case):
     assert len(f.evidence) == 2                          # evidence unioned
 
 
-def test_clear_sites_for_keys_makes_redetect_idempotent(store, case):
-    """A re-detection replaces its own finding sites instead of accumulating them."""
+def test_redetect_is_idempotent_and_preserves_proven_sites(store, case):
+    """A re-detection replaces its own CANDIDATE sites (not accumulate), drops a class to zero
+    when the gate suppresses it (pruning the orphan), and PRESERVES a dynamic poc-backed site."""
     t = make_target(store, case.id)
     fd = FindingDAO(store.conn)
+    dets = ("stack_frame", "dangerous_api")
     base = dict(cwe="CWE-121", title="stack smash", severity="high",
                 detector="stack_frame", dedup_key="CWE-121:stack_frame:strcpy")
-    # run 1: two sites
+    # run 1: two candidate sites
     for sa in ("0x2004", "0x2008"):
         fd.upsert(t.id, case.id, {**base, "function_addr": "0x2000", "site_addr": sa,
-                                  "evidence": [{"channel": "pattern", "detail": "x"}]})
+                                  "site_state": "candidate", "evidence": [{"channel": "pattern"}]})
+    # a DYNAMIC stage proves one occurrence (reusing the static key)
+    fd.upsert(t.id, case.id, {**base, "function_addr": "0x2000", "site_addr": "0x2004",
+                              "site_state": "poc-backed", "evidence": [{"channel": "dynamic"}]})
     fid = fd.list_by_target(t.id)[0].id
     assert len(fd.sites(fid)) == 2
-    # run 2 (after clearing this key's sites): only one site survives the destination gate
-    fd.clear_sites_for_keys(t.id, {"CWE-121:stack_frame:strcpy"})
-    fd.upsert(t.id, case.id, {**base, "function_addr": "0x2000", "site_addr": "0x2004",
-                              "evidence": [{"channel": "pattern", "detail": "x"}]})
-    assert len(fd.sites(fid)) == 1                        # replaced, not accumulated (would be 3)
-    # unrelated keys are untouched
-    assert fd.clear_sites_for_keys(t.id, {"CWE-120:dangerous_api:memcpy"}) == 0
+    # re-detect: reset candidate sites (the poc-backed one survives), re-add one candidate
+    fd.reset_candidate_sites(t.id, dets)
+    assert len(fd.sites(fid)) == 1                        # only the poc-backed site remains
+    fd.upsert(t.id, case.id, {**base, "function_addr": "0x2000", "site_addr": "0x2008",
+                              "site_state": "candidate", "evidence": [{"channel": "pattern"}]})
+    fd.prune_empty_findings(t.id, dets)
+    sites = fd.sites(fid)
+    assert len(sites) == 2 and any(s.get("state") == "poc-backed" for s in sites)  # proven kept
+
+    # a class entirely suppressed on re-run is pruned, not left as a 0-site orphan
+    fd.upsert(t.id, case.id, {"cwe": "CWE-121", "title": "gone", "severity": "high",
+                              "detector": "stack_frame", "dedup_key": "CWE-121:stack_frame:sprintf",
+                              "function_addr": "0x3000", "site_addr": "0x3004",
+                              "site_state": "candidate", "evidence": []})
+    fd.reset_candidate_sites(t.id, dets)                  # gate drops every sprintf site this run
+    fd.prune_empty_findings(t.id, dets)
+    assert not [f for f in fd.list_by_target(t.id)
+                if f.dedup_key == "CWE-121:stack_frame:sprintf"]
 
 
 def test_dangerous_api_detector():
@@ -148,6 +164,45 @@ def test_copy_dest_class_distinguishes_stack_from_pointer():
     # a genuinely unsupported arch still keeps everything
     assert _copy_dest_class(a_stack, "0x100e", 64, "mips") == "unknown"
     assert _copy_dest_class(a_stack, "0x100e", 64, "riscv") == "unknown"
+    # DECIMAL frame offsets (rizin renders small ones as `[rbp - 8]`, not `[rbp - 0x8]`)
+    dec = _ir([("0x1000", "lea rax, [rbp - 8]"), ("0x1006", "mov rdi, rax"),
+               ("0x100e", "call sym.strcpy")])
+    assert _copy_dest_class(dec, "0x100e", 64, "x86-64") == "stack"
+    # SPILL-RELOAD: a stack address stored to a local then reloaded is still the stack frame
+    spill = _ir([("0x1000", "lea rax, [rbp - 0x50]"), ("0x1004", "mov qword [rbp - 8], rax"),
+                 ("0x1008", "mov rax, qword [rbp - 8]"), ("0x100a", "mov rdi, rax"),
+                 ("0x100e", "call sym.strcpy")])
+    assert _copy_dest_class(spill, "0x100e", 64, "x86-64") == "stack"
+    # ARENA: the slot is loaded but was stored from POINTER ARITHMETIC (VxWorks) -> still nonstack
+    arena = _ir([("0x1000", "add ecx, eax"), ("0x1002", "mov dword [var_44h], ecx"),
+                 ("0x1006", "mov ecx, dword [var_44h]"), ("0x100a", "mov dword [esp], ecx"),
+                 ("0x100e", "call sym.strcpy")])
+    assert _copy_dest_class(arena, "0x100e", 32, "x86") == "nonstack"
+
+
+def test_normalize_isoc_variants():
+    from lykos.analyze.detect.catalog import normalize
+    assert normalize("__isoc99_scanf") == "scanf"
+    assert normalize("__isoc23_sscanf") == "sscanf"     # C23 variant modern glibc emits
+    assert normalize("__isoc99_fscanf") == "fscanf"
+    assert normalize("isocket_open") == "isocket_open"  # not an isocNN_ alias
+
+
+def test_scanf_sscanf_not_gated_by_destination():
+    """scanf/sscanf take the buffer as a later variadic arg (arg0 is the format string), so the
+    destination gate must NOT run on them -- otherwise `scanf("%s", buf)`, whose arg0 is a global
+    format string, is wrongly suppressed."""
+    frame = {"vars": [{"name": "buf", "type": "char", "offset": -0x40, "size": 64,
+                       "is_buffer": True}], "ret_offset": 0}
+    # arg0 (rdi) is a .rodata format string -> would classify 'nonstack' if the gate ran
+    ir = {"0x1000": _ir([("0x1000", "lea rsi, [rbp - 0x40]"), ("0x1004", "lea rdi, [rip + fmt]"),
+                         ("0x100e", "call sym.imp.__isoc99_scanf")])}
+    base = dict(target_id="t", case_id="c", strings=[], bits=64, arch="x86-64",
+                frames={"0x1000": frame}, func_irs=ir)
+    for sink in ("scanf", "sscanf"):
+        edges = [_edge("0x1000", "0x100e", "0x9000", sink, True)]
+        cands = stack_buffer_overflow(DetectContext(call_edges=edges, **base))
+        assert [c for c in cands if c["cwe"] == "CWE-121"], f"{sink} wrongly suppressed"
 
 
 def test_stack_overflow_gated_on_destination():

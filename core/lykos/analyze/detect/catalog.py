@@ -247,8 +247,16 @@ def normalize(fname):
         n = n.split("@", 1)[0]
     n = n.lstrip(".")                    # PowerPC local entry point: .main -> main
     n = n.lstrip("_")
-    if n.startswith("isoc99_"):          # __isoc99_scanf -> scanf
-        n = n[len("isoc99_"):]
+    if n.startswith("isoc"):             # __isoc99_scanf / __isoc23_sscanf -> scanf / sscanf
+        # glibc routes the checked-input functions through an ISO-C-version alias; the number is
+        # the C standard year (99, then 23, and whatever comes next), so match any digits. Without
+        # this every scanf/sscanf sink is invisible on a modern glibc binary.
+        rest = n[len("isoc"):]
+        j = 0
+        while j < len(rest) and rest[j].isdigit():
+            j += 1
+        if j > 0 and rest[j:j + 1] == "_":
+            n = rest[j + 1:]
     if n.startswith("IO_"):              # glibc stdio alias: _IO_fgets -> fgets
         n = n[len("IO_"):]
     return n
