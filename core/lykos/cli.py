@@ -130,7 +130,51 @@ def build_parser() -> argparse.ArgumentParser:
     db2.add_argument("--fail-on-regression", action="store_true",
                      help="exit non-zero if the latest run regressed in any series")
     db2.set_defaults(func=_cmd_dashboard)
+
+    bd = sub.add_parser("bindiff",
+                        help="patch-diff two binary versions: which functions changed (the fix)")
+    bd.add_argument("old", help="the OLD / vulnerable binary")
+    bd.add_argument("new", help="the NEW / patched binary")
+    bd.add_argument("--json", action="store_true", help="emit the full diff as JSON")
+    bd.add_argument("--timeout", type=int, default=600, help="per-binary analysis budget (s)")
+    bd.set_defaults(func=_cmd_bindiff)
     return p
+
+
+def _cmd_bindiff(args: argparse.Namespace) -> int:
+    import json
+    from pathlib import Path
+
+    from .analyze import native_re, patchdiff
+    old, new = Path(args.old), Path(args.new)
+    for pth in (old, new):
+        if not pth.exists():
+            print(f"no such file: {pth}", file=sys.stderr)
+            return 2
+    fa = native_re.analyze(old, timeout=args.timeout).get("functions") or []
+    fb = native_re.analyze(new, timeout=args.timeout).get("functions") or []
+    d = patchdiff.diff(fa, fb)
+    if args.json:
+        print(json.dumps(d, indent=2, default=list))
+        return 0
+    print(f"old {old.name}: {d['n_old']} functions   new {new.name}: {d['n_new']} functions")
+    if not d["symbols"]:
+        print("(stripped: no symbols to match by name -- structural inventory only)")
+        print(f"  functions added: {d['stripped_added']}   removed: {d['stripped_removed']}")
+        print("  supply symbolized builds to localise the exact changed function.")
+        return 0
+    print(f"unchanged: {d['unchanged']}   added: {len(d['added'])}   removed: {len(d['removed'])}")
+    if d["changed"]:
+        print(f"\nCHANGED functions ({len(d['changed'])}) -- a security fix lives in the top ones:")
+        for c in d["changed"][:25]:
+            extra = ""
+            if c["new_callees"]:
+                extra += f"  +calls {', '.join(c['new_callees'][:4])}"
+            print(f"  {c['name']:<32} blocks {c['blocks'][0]}->{c['blocks'][1]}  "
+                  f"insns {c['insns'][0]}->{c['insns'][1]}  (moved {c['moved']}){extra}")
+    else:
+        print("\nno named function changed -- the two builds are identical where symbols match.")
+    return 0
 
 
 def _cmd_archgate(args: argparse.Namespace) -> int:

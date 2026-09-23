@@ -38,6 +38,19 @@ APP="$STAGE/lykos"
 say "extracting the toolchain bundle"
 tar xf "$TC" -C "$BUN"
 
+# afl-qemu-trace (per-guest coverage emulators) and symqemu are built SEPARATELY from the base
+# toolchain collection (per-arch / heavy source builds), so a bundle may predate them. Let a caller
+# inject already-built ones via LYKOS_AFLQEMU_DIR / LYKOS_SYMQEMU_DIR; they land in the same place
+# the bundle would carry them, so the vendoring below is unchanged.
+if [ -n "${LYKOS_AFLQEMU_DIR:-}" ] && [ -n "$(ls -A "$LYKOS_AFLQEMU_DIR" 2>/dev/null)" ]; then
+  mkdir -p "$BUN/afl-qemu"; cp -a "$LYKOS_AFLQEMU_DIR"/. "$BUN/afl-qemu/"
+  say "injected afl-qemu-trace from $LYKOS_AFLQEMU_DIR"
+fi
+if [ -n "${LYKOS_SYMQEMU_DIR:-}" ] && [ -n "$(ls -A "$LYKOS_SYMQEMU_DIR" 2>/dev/null)" ]; then
+  mkdir -p "$BUN/extras/symqemu"; cp -a "$LYKOS_SYMQEMU_DIR"/. "$BUN/extras/symqemu/"
+  say "injected symqemu from $LYKOS_SYMQEMU_DIR"
+fi
+
 say "populating vendor/ (tools ready to run in place)"
 V="$APP/vendor"; mkdir -p "$V"
 cp -a "$BUN/toolchain" "$V/toolchain"
@@ -217,6 +230,55 @@ ls "$TCU"/bin/"$NATIVE_TRIPLE"-gcc* >/dev/null 2>&1 || die "trim removed the nat
 #    tree cannot hold the same path twice, so the old find|uniq here could never fire). See below.
 printf '  vendor/ is now %s\n' "$(du -sh "$V" | cut -f1)"
 
+# ---- SELF-CONTAINMENT: vendor the full transitive shared-library closure of every bundled ELF ----
+# The trim above (and whatever the toolchain tarball happened to include) can leave the bundle short
+# a library a bundled tool needs -- libexpat.so.1 / libsqlite3.so.0 for Python, libglib/libpixman for
+# afl-qemu-trace, and so on. The build host HAS those system-wide, so the interpreter smoke-test above
+# passes while the bundle is actually INCOMPLETE; the gap only shows on a lean air-gapped laptop as
+# "python3: libexpat.so.1: cannot open shared object file" or a REQUIRED tool reading "-- not found --".
+# This walks every ELF in the bundle, resolves its NEEDED libraries on THIS host (ldd is transitive),
+# and copies any non-glibc one that is not already vendored into the multiarch lib dir -- which both
+# the interpreter's rpath ($ORIGIN/../lib/<ma>) and the tool wrappers' LD_LIBRARY_PATH already point
+# at. glibc itself stays the one documented coupling (build on the oldest target glibc). Idempotent.
+say "vendoring the shared-library closure (self-containment)"
+# The closure pass is best-effort (any lib it cannot copy is simply skipped) and its inner tests --
+# `grep -q ELF`, `find|grep -q`, `cp && echo` -- return non-zero as normal control flow. Under the
+# script's `set -e` the first non-ELF file would abort the WHOLE build (it did: only libtinfo copied,
+# no zip produced). Disable errexit for this block and restore it after.
+set +e
+CLOSDIR="$V/toolchain/usr/lib/${MULTIARCH:-x86_64-linux-gnu}"; mkdir -p "$CLOSDIR"
+# An index of what the bundle ALREADY has, by soname basename -- built once, checked in O(1) with a
+# hash, and updated as we copy. (The old per-lib `find` over a 4 GB tree was O(elfs x libs x tree)
+# and crawled.) Everything runs with errexit OFF so a non-ELF file or an empty grep is normal flow.
+HAVE="$STAGE/.closure_have"
+find "$V" -type f \( -name '*.so' -o -name '*.so.*' \) -printf '%f\n' 2>/dev/null | sort -u > "$HAVE"
+_is_core_lib() { case "$1" in \
+  libc.so*|libm.so*|libdl.so*|libpthread.so*|librt.so*|libresolv.so*|libutil.so*|libnsl.so*|\
+  ld-linux*|linux-vdso*|libgcc_s.so*|libcrypt.so*) return 0 ;; *) return 1 ;; esac ; }
+_vendor_needed_of() {                                  # copy the not-yet-bundled NEEDED libs of $1
+  ldd "$1" 2>/dev/null | awk '/=> \//{print $3}' | while IFS= read -r lib; do
+    [ -f "$lib" ] || continue
+    b="$(basename "$lib")"
+    _is_core_lib "$b" && continue
+    grep -qxF "$b" "$HAVE" 2>/dev/null && continue      # already vendored somewhere
+    if cp -aL "$lib" "$CLOSDIR/" 2>/dev/null; then printf '%s\n' "$b" >> "$HAVE"; echo "  + $b"; fi
+  done
+}
+# pass 1: satisfy the interpreter, every toolchain/vendor .so, and the tool binaries + wrappers
+{ find "$V" -type f \( -name '*.so' -o -name '*.so.*' \) 2>/dev/null
+  find "$V/toolchain/usr/bin" "$V/toolchain/usr/local/bin" "$V/toolchain/.wrappers" \
+       -maxdepth 1 -type f 2>/dev/null ; } | sort -u | while IFS= read -r elf; do
+  if head -c4 "$elf" 2>/dev/null | grep -q ELF; then _vendor_needed_of "$elf"; fi
+done
+# passes 2-3: satisfy the libraries the earlier passes just added (their own transitive deps)
+for _p in 2 3; do
+  find "$CLOSDIR" -maxdepth 1 -type f -name '*.so*' 2>/dev/null | while IFS= read -r so; do
+    _vendor_needed_of "$so"
+  done
+done
+set -e                                                 # closure pass done -- restore errexit
+printf '  closure vendored; vendor/ is now %s\n' "$(du -sh "$V" | cut -f1)"
+
 say "generating relocatable scoped wrappers"
 # reuse setup.sh's generator so there is one implementation of the wrapper contract
 eval "$(sed -n '/^gen_wrappers() {/,/^}/p' "$ROOT/packaging/setup-toolchain.sh")"
@@ -236,16 +298,34 @@ cd "$here"
 # Fall back to the system python3 only if this bundle was built without a vendored interpreter.
 py="$here/vendor/toolchain/usr/bin/python3"
 [ -x "$py" ] || py=python3
+# LYKOS_VENDOR is set EXPLICITLY rather than left to auto-detection: the vendored engines --
+# pypcode above all -- live under vendor/pysite, and if that directory is not put on sys.path the
+# P-Code memory-safety detectors go dark and `doctor` reports pypcode "missing" even though it is
+# right there. Auto-detection from __file__/cwd proved fragile across laptops (symlinked paths,
+# odd mounts), so we name the directory outright. This one variable also gives the tool locators
+# vendor/toolchain, so no separate LYKOS_TOOLCHAIN is needed.
 # stdin < /dev/null: no analysis tool can then block reading an inherited pipe/terminal.
-exec env PYTHONPATH="$here/core" "$py" -m lykos serve --http 127.0.0.1:8787 \
-     --case-store "$here/.cases" --workers 2 < /dev/null
+exec env PYTHONPATH="$here/core" LYKOS_VENDOR="$here/vendor" "$py" -m lykos serve \
+     --http 127.0.0.1:8787 --case-store "$here/.cases" --workers 2 < /dev/null
 EOF
 chmod +x "$APP/RUN.sh"
+# A doctor that uses the SAME interpreter and vendored path RUN.sh does -- running `python3 -m lykos
+# doctor` with the laptop's own python (as the notes used to say) finds none of the vendored engines
+# and always reports pypcode missing. This wrapper is the correct invocation, in one command.
+cat > "$APP/DOCTOR.sh" <<'EOF'
+#!/usr/bin/env sh
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+cd "$here"
+py="$here/vendor/toolchain/usr/bin/python3"
+[ -x "$py" ] || py=python3
+exec env PYTHONPATH="$here/core" LYKOS_VENDOR="$here/vendor" "$py" -m lykos doctor "$@" < /dev/null
+EOF
+chmod +x "$APP/DOCTOR.sh"
 cat > "$APP/RUN-HERE-FIRST.txt" <<'EOF'
 lykos -- air-gapped, unzip-and-run. No installation. Nothing is written outside this folder.
 
   1. You already unzipped this (use `unzip -o` if it prompts). Everything is inside ./vendor.
-  2. Check what this host can do:   PYTHONPATH=core python3 -m lykos doctor
+  2. Check what this host can do:   ./DOCTOR.sh
   3. Run it:                        ./RUN.sh      (or: make run)
      Then open http://127.0.0.1:8787 in a browser on this machine.
 

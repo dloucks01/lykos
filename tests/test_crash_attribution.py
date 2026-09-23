@@ -145,6 +145,32 @@ def test_an_address_in_another_module_is_not_rebased():
     assert got["symbol"] is None and "static_addr" not in got
 
 
+def test_image_base_is_derived_from_the_rizin_entry0_name():
+    """rizin AND radare2 name the ELF entry `entry0`, not `entry`; deriving the decompiler base
+    from it is what makes PIE rebasing -- and therefore ALL crash attribution on a PIE target --
+    work. Missing this made `image_base` return None, `delta` None, and every PIE frame resolve to
+    nothing (the file_attribution/jhead 'attributed=0' bug)."""
+    funcs = [_Fn("0x1120", "entry0"), _Fn("0x1209", "parse"),
+             _Fn("0x11c0", "entry.fini0"), _Fn("0x1200", "entry.init0")]
+    # the decompiler loaded the PIE at its file vaddrs (base 0), so entry0.addr == elf_entry
+    assert rootcause.image_base(funcs, 0x1120) == 0
+    assert rootcause.rebase_delta(_MAPS, "/tmp/target.bin", funcs, 0x1120) == 0x555500000000
+
+
+def test_the_init_fini_thunks_are_not_mistaken_for_the_entry():
+    """`entry.init0` / `entry.fini0` are the libc init/fini thunks rizin also flags; picking one
+    would derive the wrong base. Only the real entry (`entry`, `entry0`, `_start`) counts."""
+    funcs = [_Fn("0x1200", "entry.init0"), _Fn("0x11c0", "entry.fini0")]
+    assert rootcause.image_base(funcs, 0x1120) is None
+
+
+def test_a_ghidra_or_start_entry_name_also_derives_the_base():
+    """Ghidra names it `entry`; a stripped binary shows `_start`. Both must still work, and a
+    non-zero decompiler base (Ghidra rebases ET_DYN to 0x100000) is derived, not assumed."""
+    assert rootcause.image_base([_Fn("0x101120", "entry")], 0x1120) == 0x100000
+    assert rootcause.image_base([_Fn("0x1120", "_start")], 0x1120) == 0
+
+
 # ---------------------------------------------------------------- gdb frame parsing
 # The capture dropped the frame the whole feature depends on. gdb omits the address for the
 # INNERMOST frame, so "#0" never parsed, and slicing the first element off the parsed list

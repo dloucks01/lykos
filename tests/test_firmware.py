@@ -124,3 +124,26 @@ def test_firmware_carve_headerless_cortex_m(store, case, pool, tmp_path):
             art = json.loads(store.content.get_bytes(a.sha256))
     assert art and art["headerless"]["arch"] == "arm"
     assert art["headerless"]["sub"] == "cortex-m"
+
+
+def test_headerless_detects_aarch64_and_riscv_blobs():
+    """Blob detection must cover the modern firmware ISAs, not just Cortex-M / ARM / MIPS / PPC:
+    AArch64 (Cortex-A, servers) and RISC-V (RVC-heavy). Near-exact prologue encodings, so this is
+    dominant-and-dense without tripping on random data."""
+    import struct
+    from lykos.analyze.firmware.headerless import analyze_blob
+
+    # AArch64: stp x29,x30,[sp,#-16]! ; mov x29,sp ; <body> ; ret  -- repeated
+    a64 = b"".join(struct.pack("<I", w) for w in
+                   ([0xA9BF7BFD, 0x910003FD, 0xF9400000, 0xD65F03C0] * 400))
+    r = analyze_blob(a64)
+    assert r["arch"] == "aarch64" and r["bits"] == 64, r
+
+    # RISC-V compressed: c.addi16sp ; <body> ; ret(c.jr ra=0x8082) -- 16-bit
+    rv = b"".join(struct.pack("<H", h) for h in ([0x6101, 0x0001, 0x8082, 0x0001] * 800))
+    r = analyze_blob(rv)
+    assert r["arch"] == "riscv" and r["bits"] == 64, r
+
+    # random data still resolves to nothing (the dominant-and-dense gate holds)
+    import os
+    assert analyze_blob(os.urandom(16384)).get("arch") is None

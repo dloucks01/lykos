@@ -88,6 +88,7 @@ function App() {
   const [codeFn, setCodeFn] = useState(null);       // {fn, finding} for the open code view
   const [evidence, setEvidence] = useState(null);   // {finding, focus} for the evidence inspector
   const [funcBrowse, setFuncBrowse] = useState(null); // {targetId, name, functions} for the function browser
+  const [showCandidates, setShowCandidates] = useState(false); // triage: reveal speculative candidates
   const [bg, setBg] = useState(null);               // server-side background autopilot status
   const [bgActivity, setBgActivity] = useState(null); // {msg, pct} live intra-stage progress
   const [consoleLines, setConsoleLines] = useState([]); // job.exec: tool commands + I/O
@@ -529,6 +530,20 @@ function App() {
   const topDemoId = ranked.find((f) => f.state === "poc-backed")?.id;
   const pocsFor = (f) => pocsForFinding(pocs, f.id, topDemoId);
   const demonstrated = ranked.filter((f) => f.state === "poc-backed" || f.state === "confirmed");
+  // Triage split: what the tool has EVIDENCE for (poc-backed / confirmed / corroborated) vs the
+  // speculative inventory (candidate = one detector flagged a pattern, nothing corroborated it).
+  // The candidates are what made the results feel like "a lot of findings that don't lead anywhere";
+  // they are ranked last already, but here they are tucked behind a labelled, counted toggle so the
+  // demonstrated findings are what you actually see. When nothing is demonstrated, candidates show
+  // by default -- otherwise the list would look empty despite the detectors having flagged things.
+  const notable = ranked.filter((f) => f.state !== "candidate");
+  const candidates = ranked.filter((f) => f.state === "candidate");
+  const candidatesVisible = showCandidates || notable.length === 0;
+  const cardFor = (f) => html`<${FindingCard} key=${f.id}
+    finding=${verByFinding[f.id] ? { ...f, verification: verByFinding[f.id] } : f}
+    pocs=${pocsFor(f)} mitigations=${mitOf(f)}
+    reportUrl=${api.reportUrl} artifactUrl=${api.artifactUrl} onViewCode=${viewCode}
+    onInspect=${(finding, focus) => setEvidence({ finding, focus })} />`;
   const multi = targets.length > 1;
   // finding -> its false-positive review (via the PoC that carries the crashing input's sha)
   const verByFinding = {};
@@ -618,12 +633,18 @@ function App() {
                   <a class="btn small ghost" href=${api.reportUrl(caseId, "json")} target="_blank">JSON</a>
                 </span>` : null}
             </div>
-            ${ranked.length ? ranked.map((f) => html`
-              <${FindingCard} key=${f.id} finding=${verByFinding[f.id] ? { ...f, verification: verByFinding[f.id] } : f}
-                pocs=${pocsFor(f)} mitigations=${mitOf(f)}
-                reportUrl=${api.reportUrl} artifactUrl=${api.artifactUrl} onViewCode=${viewCode}
-                onInspect=${(finding, focus) => setEvidence({ finding, focus })} />
-            `) : html`<${EmptyResults} ran=${ran} />`}
+            ${ranked.length ? html`
+              ${notable.map(cardFor)}
+              ${candidates.length ? html`
+                <div class="triage-bar">
+                  <button class="btn small ghost triage-toggle" onClick=${() => setShowCandidates((v) => !v)}>
+                    ${candidatesVisible ? "▾" : "▸"} ${candidates.length} candidate${candidates.length === 1 ? "" : "s"}
+                  </button>
+                  <span class="triage-note">flagged patterns not yet demonstrated${notable.length === 0 ? " — nothing corroborated yet" : ""}</span>
+                </div>
+                ${candidatesVisible ? candidates.map(cardFor) : null}
+              ` : null}
+            ` : html`<${EmptyResults} ran=${ran} />`}
           </section>
         ` : null}
 

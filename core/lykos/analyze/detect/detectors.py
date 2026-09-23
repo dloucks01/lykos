@@ -70,6 +70,45 @@ def dangerous_api(ctx: DetectContext):
     return out
 
 
+# ---------------------------------------------------------- TOCTOU race (check-then-use on a path)
+# The classic time-of-check-to-time-of-use: the program tests a filesystem path (access/stat) and
+# then, believing the answer still holds, operates on it (open/unlink/exec/chmod...). Between the two
+# calls an attacker can swap the path (a symlink race), so the operation hits a different file than
+# the one that was checked -- a privilege/authorisation bypass (CWE-367). Detected purely from the
+# ORDER of calls within a function: a check followed by a later use. Kept low-confidence (the pair is
+# sometimes benign) and one per function, so it is reviewable inventory, not an assertion.
+_TOCTOU_CHECK = {"access", "faccessat", "faccessat2", "euidaccess", "eaccess",
+                 "stat", "lstat", "stat64", "lstat64", "fstatat", "newfstatat", "__xstat", "__lxstat"}
+_TOCTOU_USE = {"open", "open64", "openat", "fopen", "fopen64", "freopen", "creat", "creat64",
+               "unlink", "unlinkat", "remove", "rename", "renameat", "chmod", "fchmodat", "lchmod",
+               "chown", "lchown", "fchownat", "mkdir", "rmdir", "symlink", "link", "truncate",
+               "execve", "execl", "execlp", "execv", "execvp", "system", "mount"}
+
+
+@register_detector
+def toctou_race(ctx: DetectContext):
+    by_fn = {}
+    for e in ctx.call_edges:
+        by_fn.setdefault(e.src_addr, []).append(e)
+    out = []
+    for fn, edges in by_fn.items():
+        edges = sorted(edges, key=lambda e: _naddr(e.site_addr) or 0)
+        for chk in (e for e in edges if normalize(e.dst_name) in _TOCTOU_CHECK):
+            ca = _naddr(chk.site_addr) or 0
+            use = next((e for e in edges if normalize(e.dst_name) in _TOCTOU_USE
+                        and (_naddr(e.site_addr) or 0) > ca), None)
+            if use:
+                c, u = normalize(chk.dst_name), normalize(use.dst_name)
+                out.append(_cand(
+                    "CWE-367", "TOCTOU race: a path is checked, then used", "medium", "toctou_race",
+                    [{"channel": "pattern", "detail": f"{c}() at {chk.site_addr} then {u}() at "
+                      f"{use.site_addr} -- the file can be swapped (symlink race) in between"}],
+                    function_addr=fn, site_addr=chk.site_addr,
+                    dedup_key=f"CWE-367:toctou:{c}->{u}", confidence=0.35))
+                break                                  # one per function is enough
+    return out
+
+
 # ------------------------------- stack buffer overflow (decompiler stack-frame + unbounded copy)
 # Copies with no length bound; a fixed stack buffer + one of these is the classic smash.
 _UNBOUNDED_COPY = {"strcpy", "strcat", "gets", "sprintf", "vsprintf", "scanf", "sscanf"}
@@ -116,6 +155,22 @@ _X86_REGS = {"eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp",
 _ARITH = re.compile(r"\s*(add|sub|xor|and|or|imul|mul|shl|shr|sar|neg|inc|dec|lea)\s+", re.I)
 
 
+def _lea_target_is_stack(rhs: str) -> bool:
+    """True when `lea reg, <rhs>` takes the address of a stack local. `_STACK_MEM` covers the
+    register-relative (`[rbp - 0x10]`, `[rsp + ..]`) and generic `var_NNNh` forms; this ALSO accepts
+    rizin's *named* locals. rizin labels recovered locals semantically -- `[va_args]`, `[src]`,
+    `[dest]`, `[canary]` -- not only as `var_NNNh`, whereas r2 keeps them register-relative
+    (`[rbp - 0x410]`); missing the named form silently dropped every stack-overflow site on the
+    rizin backend the packages actually ship (r2, used in dev, hid it). A bracketed BARE identifier
+    -- no `obj.`/`sym.`/`str.`/`reloc.`/... namespace (globals always carry one) and not a register
+    (a register deref is a pointer value, not &frame) -- is such a local. Both exclusions err toward
+    NOT adding stack, so this only ever widens recognition; it never turns a global into a finding."""
+    if _STACK_MEM.search(rhs):
+        return True
+    m = re.search(r"\[\s*([A-Za-z_][A-Za-z0-9_]*)\s*\]", rhs)
+    return bool(m and "." not in rhs and m.group(1).lower() not in _X86_REGS)
+
+
 def _mem_inner(rhs: str):
     m = re.search(r"\[([^\]]+)\]", rhs)
     return re.sub(r"\s+", "", m.group(1)).lower() if m else None
@@ -153,7 +208,7 @@ def _dest_reg_class(texts, reg: str) -> str:
         if w:
             op, rhs = w.group(1).lower(), w.group(2).strip()
             if op == "lea":
-                return "stack" if _STACK_MEM.search(rhs) else "nonstack"   # else global/other lea
+                return "stack" if _lea_target_is_stack(rhs) else "nonstack"   # else global/other lea
             if "[" in rhs:                            # a memory load: a pointer VALUE, not &frame
                 inner = _mem_inner(rhs)               # ...unless a stack address was spilled here
                 if inner:                             # (checked by tracing the store to this slot)

@@ -16,6 +16,19 @@ RT="$(command -v podman || command -v docker || true)"
 [ -n "$RT" ] || die "need podman or docker on this build host"
 command -v zstd >/dev/null 2>&1 || die "need zstd (apt-get install zstd)"
 
+# Stage separately-built emulators (afl-qemu-trace per guest, symqemu) into a build-context dir the
+# Containerfile copies. They are Kali-built (same base as this image) so they run natively here.
+# The dir always exists (with a .keep) so the COPY never fails when nothing was injected.
+VEND="$ROOT/packaging/_vendor"
+rm -rf "$VEND"; mkdir -p "$VEND/bin" "$VEND/symqemu"; : > "$VEND/bin/.keep"; : > "$VEND/symqemu/.keep"
+if [ -n "${LYKOS_AFLQEMU_DIR:-}" ] && [ -n "$(ls -A "$LYKOS_AFLQEMU_DIR" 2>/dev/null)" ]; then
+  cp -a "$LYKOS_AFLQEMU_DIR"/. "$VEND/bin/"; say "staging afl-qemu-trace from $LYKOS_AFLQEMU_DIR"
+fi
+if [ -n "${LYKOS_SYMQEMU_DIR:-}" ] && [ -n "$(ls -A "$LYKOS_SYMQEMU_DIR" 2>/dev/null)" ]; then
+  cp -a "$LYKOS_SYMQEMU_DIR"/. "$VEND/symqemu/"; say "staging symqemu from $LYKOS_SYMQEMU_DIR"
+fi
+trap 'rm -rf "$VEND"' EXIT
+
 say "building $IMG with $RT (this pulls the base + installs the toolchain; give it time)"
 "$RT" build -t "$IMG" -f "$ROOT/packaging/Containerfile" "$ROOT"
 
@@ -27,7 +40,7 @@ STAMP="$(date +%Y%m%d)"; ARCH="$(uname -m)"
 OUT="$DIST/lykos-container-$STAMP-$ARCH.tar.zst"
 say "saving image -> $OUT (zstd)"
 # save the OCI image and compress in one stream; -T0 = all cores, -19 = strong ratio
-"$RT" save "$IMG" | zstd -T0 -19 -o "$OUT"
+"$RT" save "$IMG" | zstd -f -T0 -19 -o "$OUT"
 ( cd "$DIST" && sha256sum "$(basename "$OUT")" > "$(basename "$OUT").sha256" )
 
 say "done"

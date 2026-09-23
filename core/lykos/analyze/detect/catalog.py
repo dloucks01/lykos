@@ -26,6 +26,8 @@ CWE = {
     "CWE-377": ("Insecure Temporary File", "medium"),
     "CWE-693": ("Protection Mechanism Failure", "low"),
     "CWE-250": ("Execution with Unnecessary Privileges", "medium"),
+    "CWE-367": ("Time-of-check Time-of-use (TOCTOU) Race Condition", "medium"),
+    "CWE-457": ("Use of Uninitialized Variable", "medium"),
 }
 
 
@@ -35,6 +37,42 @@ def name(cwe):
 
 def default_severity(cwe):
     return CWE.get(cwe, (cwe, "info"))[1]
+
+
+# One plain-language sentence per CWE -- what the weakness IS and why it matters -- for the UI to
+# show on hover/click of a CWE badge, so an analyst does not have to leave the tool to look it up.
+CWE_DESC = {
+    "CWE-119": "Code reads or writes outside the intended bounds of a memory buffer, corrupting adjacent data or crashing.",
+    "CWE-120": "Data is copied into a buffer without checking it fits, so a long input overruns the buffer (classic overflow).",
+    "CWE-121": "A buffer on the call stack is overflowed, which can overwrite the saved return address and hijack control flow.",
+    "CWE-122": "A heap-allocated buffer is overflowed, corrupting heap metadata or neighbouring allocations.",
+    "CWE-125": "Code reads memory before the start or past the end of a buffer, leaking data or crashing.",
+    "CWE-416": "Memory is used after it has been freed, letting an attacker control the freed contents.",
+    "CWE-476": "A NULL pointer is dereferenced, typically crashing the program (denial of service).",
+    "CWE-787": "Code writes past the bounds of a buffer, corrupting memory and often enabling code execution.",
+    "CWE-134": "A format string is built from untrusted input, letting an attacker read or write memory via format specifiers.",
+    "CWE-242": "A function that is unsafe by design (e.g. gets()) is used and cannot be made safe.",
+    "CWE-676": "A function that is easy to misuse (e.g. strcpy, alloca) is used without the required safeguards.",
+    "CWE-78":  "Untrusted input reaches a shell/command, letting an attacker run arbitrary OS commands.",
+    "CWE-190": "An arithmetic operation wraps past the integer's range, producing a wrong (often tiny) size or index.",
+    "CWE-259": "A password is hard-coded in the binary, so anyone who reads it gains access.",
+    "CWE-321": "A cryptographic key is hard-coded in the binary, so the key is not secret.",
+    "CWE-798": "Credentials are embedded in the code, usable by anyone who inspects the binary.",
+    "CWE-327": "A broken or outdated cryptographic algorithm is used, so the protection it provides is weak.",
+    "CWE-328": "A weak hash function is used, so hashes can be forged or reversed.",
+    "CWE-330": "Values that must be unpredictable are generated with insufficient randomness.",
+    "CWE-338": "A cryptographically weak PRNG is used where unpredictability is required.",
+    "CWE-377": "A temporary file is created insecurely, allowing races or predictable-name attacks.",
+    "CWE-693": "A protection mechanism is missing or bypassable, weakening the intended defense.",
+    "CWE-250": "Code runs with more privilege than it needs, widening the impact of any other bug.",
+    "CWE-367": "A path is checked (access/stat) then used (open/exec); an attacker can swap it in between (symlink race).",
+    "CWE-457": "A variable is read before it is initialized, so its value is whatever was left in that memory.",
+}
+
+
+def describe(cwe):
+    """A one-sentence plain-language description of the weakness, or None if unknown."""
+    return CWE_DESC.get(cwe)
 
 
 # dangerous function (normalized name) -> (cwe, severity, description)

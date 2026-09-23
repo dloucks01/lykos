@@ -7,6 +7,7 @@ from lykos.analyze.detect.detectors import (
     _copy_dest_class,
     correlate,
     dangerous_api,
+    toctou_race,
     hardcoded_secrets,
     stack_buffer_overflow,
 )
@@ -178,6 +179,31 @@ def test_copy_dest_class_distinguishes_stack_from_pointer():
                  ("0x1006", "mov ecx, dword [var_44h]"), ("0x100a", "mov dword [esp], ecx"),
                  ("0x100e", "call sym.strcpy")])
     assert _copy_dest_class(arena, "0x100e", 32, "x86") == "nonstack"
+
+
+def test_copy_dest_class_handles_rizin_named_locals():
+    # rizin (the backend the shipped packages actually use) names recovered stack locals
+    # SEMANTICALLY -- `lea rax, qword [va_args]` -- not just as `var_NNNh`, and emits a `qword`/
+    # `dword` size keyword r2 omits. The gate must read those as the stack frame; before this was
+    # handled, every stack-overflow site vanished on rizin while passing on r2 (the dev backend).
+    named = _ir([("0x1000", "lea rax, qword [va_args]"), ("0x1006", "mov rdi, rax"),
+                 ("0x100e", "call sym.imp.strcpy")])
+    assert _copy_dest_class(named, "0x100e", 64, "x86-64") == "stack"
+    # a differently-named local (the spill slot rizin calls `src`), still the frame
+    named2 = _ir([("0x1000", "lea rax, qword [dest]"), ("0x1006", "mov rdi, rax"),
+                  ("0x100e", "call sym.imp.strcpy")])
+    assert _copy_dest_class(named2, "0x100e", 64, "x86-64") == "stack"
+    # rizin's generic name WITH the size keyword must still resolve
+    varh = _ir([("0x1000", "lea rax, qword [var_418h]"), ("0x1006", "mov rdi, rax"),
+                ("0x100e", "call sym.imp.strcpy")])
+    assert _copy_dest_class(varh, "0x100e", 64, "x86-64") == "stack"
+    # a NAMESPACED global (obj./sym./str./reloc.) is NOT a local -> stays nonstack (no false find)
+    glob = _ir([("0x1000", "lea rdx, qword [obj.ofname]"), ("0x1006", "mov rdi, rdx"),
+                ("0x100e", "call sym.imp.strcpy")])
+    assert _copy_dest_class(glob, "0x100e", 64, "x86-64") == "nonstack"
+    # a register DEREF (`[rax]`) is a loaded pointer value, not &frame -> nonstack
+    deref = _ir([("0x1000", "mov rdi, qword [rax]"), ("0x100e", "call sym.imp.strcpy")])
+    assert _copy_dest_class(deref, "0x100e", 64, "x86-64") == "nonstack"
 
 
 def test_normalize_isoc_variants():
@@ -828,3 +854,19 @@ def test_every_data_flow_ceiling_is_reported_to_the_operator():
     src = inspect.getsource(dstage.detect_stage)
     assert "detect.taint_skipped" in src        # whole analysis over the function ceiling
     assert "detect.functions_skipped" in src    # one function over the block ceiling
+
+
+def test_toctou_race_detector():
+    # access() then open() in the same function, ordered by call site -> a TOCTOU candidate
+    ctx = DetectContext("t", "c", call_edges=[
+        _edge("0x4000", "0x4010", "0x9000", "access", True),
+        _edge("0x4000", "0x4030", "0x9100", "fopen", True),
+        # a function that only checks (no use) -> nothing
+        _edge("0x5000", "0x5010", "0x9000", "stat", True),
+        # use BEFORE check -> not the vulnerable order
+        _edge("0x6000", "0x6010", "0x9100", "open", True),
+        _edge("0x6000", "0x6020", "0x9000", "lstat", True),
+    ], strings=[])
+    cands = toctou_race(ctx)
+    assert [c["cwe"] for c in cands] == ["CWE-367"], "only the check->use function fires"
+    assert cands[0]["function_addr"] == "0x4000" and "access() " in cands[0]["evidence"][0]["detail"]

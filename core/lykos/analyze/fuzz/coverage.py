@@ -11,8 +11,9 @@ from __future__ import annotations
 
 import base64
 import os
+import subprocess as _sp
 
-from ...db.dao import DynResultDAO, FindingDAO, TargetDAO
+from ...db.dao import ArtifactDAO, DynResultDAO, FindingDAO, TargetDAO
 from ...hashing import canonical_json
 from ...jobs.registry import register_stage
 from ..dynamic import sandbox
@@ -20,7 +21,7 @@ from ..dynamic.minimize import minimize
 from ..dynamic.stage import asan_defect_key, crash_finding_candidate
 from . import aflpp
 from .runner import invocation, run_input
-from .stage import _DEFAULT_SEEDS, _recovered_blocks
+from .stage import _DEFAULT_SEEDS, _recovered_blocks, format_aware_seeds
 
 COVERAGE_STAGE = "coverage_fuzz"
 TOOL = "aflpp"
@@ -90,6 +91,65 @@ def _unsupported(target):
                 f"which routes through qemu-user for any architecture and takes coverage "
                 f"from qemu's own block log.")
     return None
+
+
+def _msan_scan(ctx, target, out_dir, mode, exec_timeout, raw) -> int:
+    """Detonate the fuzz corpus against the MemorySanitizer build (source targets only, if one was
+    produced at ingest) to surface the class ASan cannot: a read of never-initialized memory
+    (CWE-457). Best-effort and fully guarded -- it must never break the campaign. Findings land as
+    'corroborated' (the sanitizer directly observed the read) with the source line."""
+    from ..debug import rootcause
+    try:
+        arts = ArtifactDAO(ctx.conn).list_by_case(target.case_id)
+        msa = next((a for a in arts if a.kind == "msan-blob"
+                    and (a.meta or {}).get("binary_sha") == target.sha256), None)
+        if not msa:
+            return 0
+        msbin = ctx.scratch() / "target.msan"
+        msbin.write_bytes(ctx.content.path(msa.sha256).read_bytes())
+        os.chmod(msbin, 0o755)
+    except Exception:
+        return 0
+    inputs = list(raw)                                   # the crashes, plus what AFL kept as novel
+    try:
+        q = out_dir / "default" / "queue"
+        inputs += [f.read_bytes() for f in sorted(q.glob("id:*"))[:200]]
+    except Exception:
+        pass
+    fd = FindingDAO(ctx.conn); wf = ctx.scratch() / "msan-in.bin"; found = 0; seen = set()
+    for data in inputs[:300]:
+        argv, stdin = [str(msbin)], b""
+        if mode == "file":
+            wf.write_bytes(data); argv.append(str(wf))
+        elif mode == "arg":
+            argv.append(data[:4096].decode("latin-1", "ignore"))
+        else:
+            stdin = data
+        try:
+            r = _sp.run(argv, input=stdin, capture_output=True, timeout=max(2, int(exec_timeout)))
+        except Exception:
+            continue
+        rep = rootcause.parse_asan_report((r.stderr or b"").decode("latin-1", "ignore"))
+        if not rep or rep.get("cwe") != "CWE-457":
+            continue
+        key = rep.get("source") or "msan"
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            sha = ctx.put_artifact("msan-input", data=data).sha256
+            fd.upsert(target.id, target.case_id, {
+                "cwe": "CWE-457", "title": "Use of uninitialized value", "severity": "medium",
+                "detector": "msan", "state": "corroborated", "confidence": 0.8,
+                "dedup_key": f"CWE-457:msan:{key}", "function_addr": None, "site_addr": None,
+                "site_detail": rep.get("source"),
+                "evidence": [{"channel": "sanitizer", "detail": rep["detail"] + f" (input {sha[:12]})"}]})
+            found += 1
+        except Exception:
+            continue
+    if found:
+        ctx.emit("coverage.msan", payload={"uninitialized_reads": found})
+    return found
 
 
 def coverage_stage(ctx) -> dict:
@@ -170,8 +230,19 @@ def coverage_stage(ctx) -> dict:
     exe.write_bytes(_blob)
     os.chmod(exe, 0o755)
 
-    # seed corpus for AFL's input dir
-    seeds = [base64.b64decode(x) for x in p.get("seeds", [])] or list(_DEFAULT_SEEDS)
+    # seed corpus for AFL's input dir. A coverage-guided campaign is only as good as the seed it
+    # starts from: format-aware seeds (a valid jpeg/gif/config sample built from the binary's own
+    # strings) get AFL INSIDE the parser instead of bouncing off its front door, which is the whole
+    # difference between the 0.7% edge coverage a blind seed reaches and a campaign that climbs.
+    seeds = [base64.b64decode(x) for x in p.get("seeds", [])]
+    seeds += format_aware_seeds(ctx, target)
+    seeds += list(_DEFAULT_SEEDS)
+    seen, uniq = set(), []                       # dedupe, keep order (format seeds first)
+    for s in seeds:
+        if s not in seen:
+            seen.add(s)
+            uniq.append(s)
+    seeds = uniq or list(_DEFAULT_SEEDS)
     seeds_dir = ctx.scratch() / "afl-in"
     seeds_dir.mkdir(parents=True, exist_ok=True)
     for i, s in enumerate(seeds):
@@ -268,6 +339,11 @@ def coverage_stage(ctx) -> dict:
             fault_pc=res.fault_pc, discriminator=defect_key))
         confirmed += 1
 
+    # Uninitialized-read pass (CWE-457): detonate the corpus against the MSan build if one exists.
+    try:
+        _msan_scan(ctx, target, out_dir, mode, exec_timeout, raw)
+    except Exception:
+        pass                                             # advisory; never fail the campaign over it
     ctx.emit("coverage.done", payload={"crash_inputs": len(raw),
                                        "unique": len(seen_crashes), "confirmed": confirmed})
     ctx.progress(pct=100, msg=f"{len(raw)} crash inputs, {len(seen_crashes)} unique crashes")

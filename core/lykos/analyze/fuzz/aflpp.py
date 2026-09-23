@@ -160,7 +160,8 @@ def is_sanitizer_build(data: bytes) -> bool:
 
 
 def run_campaign(afl: Path, exe, seeds_dir, out_dir, *, seconds: int = 30,
-                 mode: str = "file", qemu: bool = True, afl_path: Optional[str] = None):
+                 mode: str = "file", qemu: bool = True, afl_path: Optional[str] = None,
+                 cmplog: Optional[Path] = None):
     # NOTE: AFL keeps its default memory cap here. Sanitizer builds (which need `-m none`) are
     # deliberately NOT run through this path -- an uncapped run OOM'd the host -- they are fuzzed
     # by the sandbox `fuzz`/`directed_fuzz` stages under rlimits instead (see coverage_stage).
@@ -177,6 +178,17 @@ def run_campaign(afl: Path, exe, seeds_dir, out_dir, *, seconds: int = 30,
         "AFL_NO_AFFINITY": "1",
         "AFL_BENCH_JUST_ONE": "0",
     })
+    if qemu:
+        # Input-to-state (COMPCOV): the qemu tracer instruments comparisons and splits multi-byte
+        # ones, so AFL learns the magic value / checksum / length a branch demands and reaches code a
+        # blind mutator never would -- deterministically, with no symbolic execution. Level 2 also
+        # intercepts strcmp/memcmp-family calls. Measured on gif2rgb: 751 -> 1534 edges. The compcov
+        # plugin is built into qemuafl, so this is free when present and simply a no-op if not.
+        env.setdefault("AFL_COMPCOV_LEVEL", "2")
+    elif cmplog is not None:
+        # Native (afl-cc-instrumented) build: CmpLog is the same idea via a second, cmplog-
+        # instrumented copy of the target that AFL runs alongside the main one (`-c <binary>`).
+        cmd = [cmd[0], "-c", str(cmplog)] + cmd[1:]
     return subprocess.run(cmd, env=env, capture_output=True, timeout=int(seconds) + 90)
 
 

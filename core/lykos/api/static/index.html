@@ -181,6 +181,10 @@
   /* Results */
   .results-head { display: flex; align-items: center; gap: 12px; margin-bottom: 4px; }
   .results-head .report-links { margin-left: auto; display: flex; gap: 6px; }
+  /* Triage divider between demonstrated findings and the speculative candidate pile. */
+  .triage-bar { display: flex; align-items: center; gap: 10px; margin: 10px 0 6px; padding-top: 8px; border-top: 1px dashed var(--line); }
+  .triage-toggle { font-variant-numeric: tabular-nums; }
+  .triage-note { font-size: .78rem; color: var(--faint); }
   .pill { font-size: .74rem; padding: 3px 9px; border-radius: 20px; }
   .pill.good { background: color-mix(in srgb, var(--ok) 20%, transparent); color: var(--ok); }
 
@@ -191,6 +195,9 @@
   .find-title { font-weight: 600; }
   .find-meta { display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: .78rem; color: var(--muted); margin-top: 2px; }
   .find-meta .cwe { font-family: var(--mono); color: var(--accent-2); }
+  /* A CWE badge carries a hover description (title=): mark it so people know to hover. */
+  .cwe-info { cursor: help; text-decoration: underline dotted; text-underline-offset: 2px; }
+  .ev-sub .cwe-name { color: var(--fg-dim, #9aa); font-size: 0.85em; }
   .find-gloss { color: var(--muted); font-size: .82rem; margin-top: 8px; }
   .effects { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 12px; }
   .effects-head { font-size: .68rem; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
@@ -266,6 +273,19 @@
   .asm-a { color: var(--faint); display: inline-block; min-width: 84px; }
   .asm-hit { background: color-mix(in srgb, var(--bad) 22%, transparent); }
   .asm-tag { color: var(--bad); font-weight: 700; }
+  /* Ego call graph (CallGraphMini): callers -> this function -> callees, click to re-center. */
+  .callgraph { padding: 12px 18px 4px; border-top: 1px solid var(--line); }
+  .cg-lbl { font-size: .7rem; text-transform: uppercase; letter-spacing: .5px; color: var(--faint); margin-bottom: 6px; }
+  .cg-hint { text-transform: none; letter-spacing: 0; color: var(--faint); margin-left: 8px; font-size: .68rem; }
+  .cg-svg { width: 100%; height: auto; max-height: 240px; display: block; }
+  .cg-edge { stroke: var(--line); stroke-width: 1.4; }
+  .cg-node rect { fill: var(--panel-2); stroke: var(--line); stroke-width: 1; }
+  .cg-node text { font-family: var(--mono); font-size: 11px; fill: var(--accent-2); }
+  .cg-caller, .cg-callee { cursor: pointer; }
+  .cg-caller:hover rect, .cg-callee:hover rect { stroke: var(--accent); fill: var(--panel); }
+  .cg-center rect { fill: var(--accent); stroke: var(--accent); }
+  .cg-center text { fill: #fff; font-weight: 700; }
+  .cg-more { font-family: var(--mono); font-size: 10px; fill: var(--faint); }
   .xrefs { padding: 12px 18px; border-top: 1px solid var(--line); display: flex; flex-direction: column; gap: 8px; }
   .xref { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px; }
   .xref-k { font-size: .7rem; text-transform: uppercase; letter-spacing: .5px; color: var(--faint); flex: 0 0 70px; }

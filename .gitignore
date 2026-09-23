@@ -31,3 +31,4 @@ examples/vuln-targets/src/
 .coverage.*
 .coverage-shim/
 htmlcov/
+packaging/_vendor/
