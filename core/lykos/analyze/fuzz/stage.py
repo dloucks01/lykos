@@ -104,6 +104,40 @@ def _strings_for(ctx, target):
     return invmod.string_rows(invmod.raw_strings(data), where="scan")
 
 
+def format_aware_seeds(ctx, target) -> list:
+    """Seeds that pass the target's INPUT GATE, derived from the binary's own strings: a binary
+    format-model seed (jpeg/gif/elf/... -- carries the magic + a minimal valid structure), a text
+    `key=value` config seed when the binary looks config-driven, and a handful of the most selective
+    mined strings. AFL's entire advantage is coverage feedback from a valid starting point; the
+    generic `_DEFAULT_SEEDS` (``""``, ``"AAAA"``, a path) bounce off a real parser at the front door
+    (measured: jhead ran 98k executions for zero finds blind, vs seconds WITH a valid sample). The
+    `fuzz`/`directed_fuzz` stages already build these, but `coverage_fuzz` used only the generic set
+    -- which is exactly why its edge coverage stayed tiny. Every step is best-effort: seeding is an
+    optimisation, never a blocker, so any failure just yields fewer seeds."""
+    seeds: list = []
+    try:
+        svals = [x.value for x in _strings_for(ctx, target) if getattr(x, "value", None)]
+    except Exception:
+        return seeds
+    try:
+        fmt = structure.detect_format(svals)
+        if fmt:
+            s = structure.seed_for_name(fmt)
+            if s:
+                seeds.append(s)
+    except Exception:
+        pass
+    try:
+        keys = textconf.keys_from(svals)
+        if keys:
+            seeds.append(textconf.seed_for(keys))
+    except Exception:
+        pass
+    # the binary's own selective strings (magic tokens, config keywords, path prefixes)
+    seeds += [s.encode("latin-1", "ignore") for s in svals[:8] if 2 <= len(s) <= 256]
+    return [s for s in seeds if s]
+
+
 def _discover_argv(ctx, target, exec_timeout):
     """Work out the target's required arguments -- and CHECK them before using them.
 

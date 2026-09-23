@@ -85,6 +85,32 @@ def compile_source(src: Path, filename: str, out: Path) -> dict:
     raise NotAnalysable(f"could not compile {filename}:\n{last[:2000]}")
 
 
+def compile_source_msan(src: Path, filename: str, out: Path):
+    """Best-effort MemorySanitizer build, or None. MSan reports the ONE memory-safety class the
+    ASan+UBSan build cannot -- a READ of never-initialized memory (CWE-457) -- so detonating the same
+    inputs against this binary catches uninitialized-value bugs the primary build misses. MSan is
+    clang-only and mutually exclusive with ASan, so this is a SEPARATE binary built only when clang is
+    present; origin tracking is on so the report names where the value came from. Advisory: without an
+    MSan-instrumented libc a value that flows through libc can read as uninitialized, so a hit is a
+    lead the PoC ladder then confirms, not an assertion."""
+    ext = Path(filename).suffix.lower()
+    cc = shutil.which("clang++" if ext in _CXX_EXT else "clang")
+    if not cc:
+        return None
+    opts_c = out.parent / "_lykos_msan_opts.c"
+    opts_c.write_text('const char *__msan_default_options(void){'
+                      'return "abort_on_error=1:halt_on_error=1";}\n')
+    argv = [cc, "-g", "-O1", "-fno-omit-frame-pointer", "-fsanitize=memory",
+            "-fsanitize-memory-track-origins=2", "-fno-sanitize-recover=all", "-w",
+            "-Wno-error=implicit-function-declaration", "-Wno-error=implicit-int",
+            "-Wno-error=int-conversion", "-D_GNU_SOURCE", str(src), str(opts_c), "-o", str(out)]
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out if (r.returncode == 0 and out.exists()) else None
+
+
 def _apply_triage_denorm(targets: TargetDAO, target_id: str, rec: dict) -> None:
     targets.update_triage(
         target_id, file_type=rec["file_type"], arch=rec["arch"], bits=rec["bits"],
@@ -138,6 +164,14 @@ def ingest(store, case_id: str, path: str | Path, filename: Optional[str] = None
             info = hash_all_file(binout)
             if not info["size"]:
                 raise NotAnalysable(f"{fname} compiled to an empty binary")
+            # A SECOND, MemorySanitizer build (clang) alongside the ASan one: it catches the
+            # uninitialized-read class (CWE-457) ASan cannot, and the fuzz stage detonates the corpus
+            # against it. Best-effort -- keyed to the SAME binary sha so the fuzzer can find it.
+            msanout = Path(td) / ((Path(fname).stem or "a") + ".msan")
+            if compile_source_msan(path, fname, msanout) and msanout.exists():
+                store.put_artifact(case_id, "msan-blob", src=msanout,
+                                   meta={"binary_sha": info["sha256"], "filename": fname})
+                meta["msan"] = True
             store.put_artifact(case_id, "source-code", data=path.read_bytes(),
                                meta={"binary_sha": info["sha256"], "filename": fname, **meta})
             store.put_artifact(case_id, "target-blob", src=binout)

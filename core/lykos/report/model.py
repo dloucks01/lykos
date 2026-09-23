@@ -15,10 +15,17 @@ from ..jobs.registry import cached_output_json
 
 
 def _best_coverage(store, runs) -> Optional[dict]:
-    """The best fuzzing coverage this target reached, read from its fuzz runs' summaries. Block
-    coverage (percent of recovered code) wins over AFL's edge count. Included in the report so
-    "0 crashes" can be read against how much of the binary was actually exercised."""
-    best = None
+    """The best fuzzing coverage this target reached, read from its fuzz runs' summaries. Included in
+    the report so "0 crashes" can be read against how much of the binary was actually exercised.
+
+    Block coverage (percent of recovered code) is the richer figure, but ONLY when blocks were
+    actually hit: a directed campaign against a target that cannot be block-traced natively
+    (a kernel, a .so, a cross-architecture binary) records blocks_hit=0 and reports 0%. That 0% used
+    to override a coverage-guided AFL/qemu campaign that DID exercise the target -- so the UI showed
+    "0% cov" next to 12k execs and looked broken. So block wins only with blocks_hit>0; otherwise the
+    edge count (AFL's bitmap) is shown, which is the honest measure of what the campaign reached."""
+    best_block = None
+    best_edge = None
     for r in runs:
         if r.status != "done" or not (r.stage or "").endswith("fuzz"):
             continue
@@ -30,13 +37,15 @@ def _best_coverage(store, runs) -> Optional[dict]:
         if not cov:
             continue
         if cov.get("kind") == "block" and cov.get("blocks_known"):
-            pct = cov.get("pct")
-            if pct is not None and (best is None or best.get("pct") is None or pct > best["pct"]):
-                best = {"kind": "block", "pct": pct, "blocks_hit": cov.get("blocks_hit"),
-                        "blocks_known": cov.get("blocks_known")}
-        elif cov.get("kind") == "edge" and best is None:
-            best = {"kind": "edge", "edges": cov.get("edges_found")}
-    return best
+            pct, hit = cov.get("pct"), cov.get("blocks_hit") or 0
+            if pct is not None and hit > 0 and (best_block is None or pct > best_block["pct"]):
+                best_block = {"kind": "block", "pct": pct, "blocks_hit": hit,
+                              "blocks_known": cov.get("blocks_known")}
+        elif cov.get("kind") == "edge":
+            edges = cov.get("edges_found") or 0
+            if edges and (best_edge is None or edges > (best_edge.get("edges") or 0)):
+                best_edge = {"kind": "edge", "edges": edges}
+    return best_block or best_edge
 from ..db.dao import (
     AnalysisRunDAO,
     DynResultDAO,
@@ -232,6 +241,7 @@ def build_report(
 
             findings_out.append({
                 "id": f.id, "cwe": f.cwe, "cwe_name": catalog.name(f.cwe) if f.cwe else None,
+                "cwe_desc": catalog.describe(f.cwe) if f.cwe else None,
                 "title": f.title, "severity": f.severity, "state": f.state,
                 "confidence": round(f.confidence or 0.0, 3),
                 "function_addr": f.function_addr, "site_addr": f.site_addr,

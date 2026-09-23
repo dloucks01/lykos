@@ -94,6 +94,19 @@ def module_base(maps, target_path):
 _ENTRY_NAMES = ("entry", "_start", "__start")
 
 
+def _is_entry_name(name: str) -> bool:
+    """True for the disassembler's name of the ELF entry point. Ghidra calls it `entry`/`_start`;
+    rizin AND radare2 both call it `entry0` (and would use `entry1`... for extra entries) -- which
+    the old `in ("entry","start")` check missed, so `image_base` returned None and PIE targets
+    rebased NOTHING, silently killing crash attribution on every position-independent binary. The
+    dotted decoys rizin also emits -- `entry.init0`, `entry.fini0` -- are the libc init/fini
+    thunks, NOT the entry, so they are excluded (they contain a `.`)."""
+    nm = (name or "").lstrip("_").lower()
+    if "." in nm:
+        return False
+    return nm == "start" or nm == "entry" or (nm.startswith("entry") and nm[5:].isdigit())
+
+
 def image_base(functions, elf_entry):
     """The address the DECOMPILER placed file offset 0 at, or None if it cannot be derived.
 
@@ -107,7 +120,7 @@ def image_base(functions, elf_entry):
     if elf_entry is None:
         return None
     for f in functions:
-        if (f.name or "").lstrip("_").lower() in ("entry", "start"):
+        if _is_entry_name(f.name or ""):
             a = _to_int(f.addr)
             if a is not None and a >= elf_entry:
                 return a - elf_entry
@@ -292,12 +305,20 @@ def parse_asan_report(text: str) -> Optional[dict]:
     # too-small address-space limit produces and which is NOT a finding. Requiring the colon,
     # plus a denylist for the odd non-bug token, keeps those out of the classification.
     m = re.search(r"(?:ERROR|SUMMARY):\s*AddressSanitizer:\s*([a-z][a-z0-9-]+)", t)
+    # MemorySanitizer reports the one class ASan/UBSan cannot: a READ of memory that was never
+    # initialized (CWE-457). It needs its own -fsanitize=memory build (clang, mutually exclusive
+    # with ASan), so this fires only when such a binary is detonated -- see compile_source_msan.
+    msan = re.search(r"(?:ERROR|SUMMARY):\s*MemorySanitizer:\s*(use-of-uninitialized-value)", t)
     ub = re.search(r"runtime error:\s*(.+)", t)
     if m and m.group(1) in _ASAN_NONBUG:
         m = None
-    if not m and not ub:
+    if not m and not msan and not ub:
         return None
-    if m:
+    if msan:
+        bug = "use-of-uninitialized-value"
+        cwe, sev = ("CWE-457", "medium")
+        detail = "MemorySanitizer: use of uninitialized value"
+    elif m:
         bug = m.group(1)
         cwe, sev = _ASAN_CWE.get(bug, ("CWE-119", "high"))
         detail = f"AddressSanitizer: {bug.replace('-', ' ')}"

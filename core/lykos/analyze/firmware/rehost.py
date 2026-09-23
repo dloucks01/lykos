@@ -17,8 +17,16 @@ _DRIVER = "unicorn_driver.py"
 
 
 def _imports_unicorn(python: Path, timeout: int = 20) -> bool:
+    # Actually CONSTRUCT a Uc engine, not just `import unicorn`. Unicorn loads its native library
+    # (libunicorn.so) lazily, so on a laptop where that .so is missing or ABI/glibc-incompatible the
+    # import can still succeed while every real use fails with "failed to load unicornlib.so". If we
+    # only checked the import, `locate_unicorn_python` would hand back a broken interpreter, the
+    # rehost driver would run, and its loader error would spill into the run console on EVERY
+    # firmware target. Instantiating the engine here makes the failure surface in this captured probe
+    # instead, so the stage reports "Unicorn unavailable" once, quietly, and never runs the driver.
+    probe = "import unicorn; unicorn.Uc(unicorn.UC_ARCH_ARM, unicorn.UC_MODE_ARM)"
     try:
-        r = subprocess.run([str(python), "-c", "import unicorn"],
+        r = subprocess.run([str(python), "-c", probe],
                            capture_output=True, timeout=timeout, check=False)
         return r.returncode == 0
     except (OSError, subprocess.SubprocessError):

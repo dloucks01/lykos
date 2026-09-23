@@ -30,18 +30,41 @@ done
 cd "$SRC"
 [ -x ./afl-showmap ] || make -j"$(nproc)"     # qemu_mode's sanity check needs this
 
-# qemuafl is based on qemu 5.x and its coverage macro does not compile for a 32-bit guest on a
-# modern toolchain: it feeds a target_ulong straight into an x86 addressing mode, so a 32-bit
-# guest yields `(%rdx,%edi,1)` -- base and index must be the same width. 64-bit guests are
-# unaffected, which is why aarch64 builds and arm does not. Widen the index to pointer size.
-COMMON="$SRC/qemu_mode/qemuafl/qemuafl/common.h"
-if [ -f "$COMMON" ] && grep -q '"r"(afl_area_ptr), "r"(loc)' "$COMMON"; then
-  sed -i 's/"r"(afl_area_ptr), "r"(loc)/"r"(afl_area_ptr), "r"((uintptr_t)(loc))/' "$COMMON"
-  echo "[*] patched INC_AFL_AREA for 32-bit guests"
+cd "$SRC/qemu_mode"
+
+# qemuafl (the pinned QEMU fork) must be CHECKED OUT before its coverage macro can be patched.
+# build_qemu_support.sh clones it only on its first run, so the previous ordering -- patch, THEN run
+# the script -- edited a path that did not exist yet and silently no-op'd. That is the real reason
+# 32-bit guests never built: the fix below was correct but never applied. Do the same checkout the
+# script does, patch, then build with NO_CHECKOUT so the build keeps the patched tree.
+if [ ! -f qemuafl/qemuafl/common.h ]; then
+  ( git submodule init && git submodule update ./qemuafl ) >/dev/null 2>&1 \
+    || git clone --depth 1 https://github.com/AFLplusplus/qemuafl
+fi
+QV="$(cat ./QEMUAFL_VERSION 2>/dev/null || true)"
+if [ -n "$QV" ] && [ -d qemuafl/.git ]; then
+  ( cd qemuafl && { git fetch --depth 1 origin "$QV" >/dev/null 2>&1 || true; \
+                    git checkout "$QV" >/dev/null 2>&1 || true; } )
 fi
 
-cd "$SRC/qemu_mode"
-PYTHON=/usr/bin/python3 CPU_TARGET="$CPU" ./build_qemu_support.sh
+# qemuafl is based on qemu 5.x. Its per-edge coverage macro INC_AFL_AREA has an x86-HOST inline-asm
+# fast path (`addb $1,(%0,%1,1)`) selected purely by the *host* arch, so it is compiled for every
+# guest -- and expanded in accel/tcg/translate-all.c. Its index operand is the guest `loc` (a
+# target_ulong): for a 32-bit guest that is a 32-bit register, so the assembler sees `(%rdx,%edi,1)`
+# -- base 64-bit, index 32-bit, illegal -- and arm/i386 fail to assemble. 64-bit guests (aarch64,
+# x86_64) are unaffected, which is why they build and arm does not. Gate the asm fast path on a
+# 64-bit guest (TARGET_LONG_BITS) so a 32-bit guest uses the portable `afl_area_ptr[loc]++` branch;
+# also widen the operand wherever the asm survives. Idempotent; format-tolerant across AFL++ releases.
+COMMON="$SRC/qemu_mode/qemuafl/qemuafl/common.h"
+if [ -f "$COMMON" ] && ! grep -q 'lykos:' "$COMMON"; then
+  # NOTE: sed delimiter is @ -- the pattern contains `||` and the replacement contains `/`, so the
+  # usual | or / delimiters would both break the expression.
+  sed -i 's@#if (defined(__x86_64__) || defined(__i386__))@#if (defined(__x86_64__) || defined(__i386__)) \&\& TARGET_LONG_BITS == 64 /* lykos: 32-bit guest -> portable C path */@' "$COMMON"
+  sed -i 's@"r"(afl_area_ptr), "r"(loc)@"r"(afl_area_ptr), "r"((uintptr_t)(loc))@' "$COMMON"
+  echo "[*] patched INC_AFL_AREA for 32-bit guests (guard + operand width)"
+fi
+
+NO_CHECKOUT=1 PYTHON=/usr/bin/python3 CPU_TARGET="$CPU" ./build_qemu_support.sh
 
 BUILT="$SRC/qemu_mode/qemuafl/build/qemu-$CPU"
 [ -x "$BUILT" ] || { echo "build produced no qemu-$CPU" >&2; exit 1; }

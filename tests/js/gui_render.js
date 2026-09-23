@@ -218,6 +218,19 @@ function renderInfo(vnode) {
   ck("CodeView highlights the fault site in the disassembly",
     info.classes.some((c) => /asm-hit/.test(c)) && /site/.test(info.all));
 
+  info = renderInfo(h(C.CallGraphMini, {
+    fn: { name: "comprexx", callers: [{ src_name: "main" }],
+          callees: [{ dst_name: "strcpy" }, { dst_name: "malloc" }] },
+    onNavigate() {},
+  }));
+  ck("CallGraphMini draws an ego call graph (center + neighbours)",
+    info.threw.length === 0 && /comprexx/.test(info.all) && /strcpy/.test(info.all) && /main/.test(info.all)
+    && info.classes.some((c) => /cg-center/.test(c))
+    && info.classes.some((c) => /cg-caller/.test(c))
+    && info.classes.some((c) => /cg-callee/.test(c)));
+  ck("CallGraphMini renders nothing for a leaf with no edges",
+    renderInfo(h(C.CallGraphMini, { fn: { name: "leaf", callers: [], callees: [] } })).threw.length === 0);
+
   console.log(pass ? "ALL PASS" : "FAILURES ABOVE");
   process.exit(pass ? 0 : 1);
 })().catch((e) => { console.log("FAIL  harness threw: " + (e && e.stack || e)); process.exit(1); });

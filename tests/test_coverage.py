@@ -179,3 +179,86 @@ def test_qemu_mode_requires_the_trace_helper():
     import inspect
     src = inspect.getsource(aflpp.locate_qemu_trace)
     assert "afl-qemu-trace" in src and "which" in src
+
+
+def test_best_coverage_falls_back_to_edges_when_block_trace_is_zero(monkeypatch):
+    """A directed campaign against a target that cannot be block-traced natively (kernel/.so/
+    cross-arch) records blocks_hit=0 -> 0%. That must NOT hide a coverage-guided AFL/qemu run that
+    actually exercised the target: block wins only with real hits, otherwise the edge count shows."""
+    from lykos.report import model
+
+    class _Run:
+        def __init__(self, rid, stage):
+            self.id, self.stage, self.status, self.target_id = rid, stage, "done", 1
+
+    outputs = {
+        "edge": {"coverage": {"kind": "edge", "edges_found": 478}},
+        "block0": {"coverage": {"kind": "block", "pct": 0.0, "blocks_hit": 0, "blocks_known": 900}},
+        "block_hit": {"coverage": {"kind": "block", "pct": 41.0, "blocks_hit": 369, "blocks_known": 900}},
+    }
+    monkeypatch.setattr(model, "cached_output_json", lambda store, rid: outputs[rid])
+
+    # edge campaign + a zero-hit block campaign -> show the edges, not a misleading 0%
+    cov = model._best_coverage(None, [_Run("edge", "coverage_fuzz"), _Run("block0", "directed_fuzz")])
+    assert cov == {"kind": "edge", "edges": 478}
+
+    # a block campaign that DID hit blocks wins over the edge count
+    cov = model._best_coverage(None, [_Run("edge", "coverage_fuzz"), _Run("block_hit", "directed_fuzz")])
+    assert cov["kind"] == "block" and cov["pct"] == 41.0
+
+    # nothing meaningful -> None
+    assert model._best_coverage(None, [_Run("block0", "directed_fuzz")]) is None
+
+
+def test_format_aware_seeds_derive_from_the_binary_strings(monkeypatch):
+    """coverage_fuzz must seed from the target's OWN strings -- a format-model sample and config
+    keys -- not just the generic _DEFAULT_SEEDS, or a real parser rejects every seed at the door and
+    edge coverage never climbs. Regression for the ~0.7% coverage that made fuzzing look broken."""
+    from lykos.analyze.fuzz import stage
+
+    class _S:
+        def __init__(self, v):
+            self.value = v
+    monkeypatch.setattr(stage, "_strings_for",
+                        lambda ctx, t: [_S("GIF89a"), _S("listen="), _S("workers="), _S("name=")])
+    seeds = stage.format_aware_seeds(object(), object())
+    assert seeds, "should derive seeds from the strings"
+    assert all(isinstance(s, (bytes, bytearray)) for s in seeds)
+    # a format-model seed for the detected format (gif), carrying its magic
+    assert any(bytes(s).startswith(b"GIF8") for s in seeds), "a valid format-model seed"
+    # the binary's own config tokens become seed material too
+    assert any(b"listen" in bytes(s) for s in seeds)
+    # best-effort: a broken strings source yields [] rather than raising
+    monkeypatch.setattr(stage, "_strings_for", lambda ctx, t: (_ for _ in ()).throw(RuntimeError("x")))
+    assert stage.format_aware_seeds(object(), object()) == []
+
+
+def test_qemu_campaign_enables_compcov_input_to_state(monkeypatch, tmp_path):
+    """Input-to-state (COMPCOV) is what lets AFL solve magic-value/checksum/length branches a blind
+    mutator never reaches -- deterministically, no symbolic execution. It must be on for the
+    qemu-mode (prebuilt-binary) path, and a native build must instead get a `-c <cmplog>` copy."""
+    import subprocess as _sp
+    from pathlib import Path
+    from lykos.analyze.fuzz import aflpp
+    seen = {}
+
+    class _P:
+        returncode = 0
+        stdout = b""
+        stderr = b""
+
+    def fake_run(cmd, env=None, **kw):
+        seen["cmd"], seen["env"] = cmd, env or {}
+        return _P()
+    monkeypatch.setattr(_sp, "run", fake_run)
+    exe = tmp_path / "t"; exe.write_bytes(b"\x7fELF")
+    sd = tmp_path / "in"; sd.mkdir(); od = tmp_path / "out"
+
+    aflpp.run_campaign(Path("/usr/bin/afl-fuzz"), exe, sd, od, seconds=1, mode="file", qemu=True)
+    assert seen["env"].get("AFL_COMPCOV_LEVEL") == "2", "qemu campaigns must enable COMPCOV"
+    assert "-Q" in seen["cmd"]
+
+    cl = tmp_path / "t.cmplog"; cl.write_bytes(b"\x7fELF")
+    aflpp.run_campaign(Path("/usr/bin/afl-fuzz"), exe, sd, od, seconds=1, mode="file",
+                       qemu=False, cmplog=cl)
+    assert "-c" in seen["cmd"] and str(cl) in seen["cmd"], "native build must run a CmpLog copy"

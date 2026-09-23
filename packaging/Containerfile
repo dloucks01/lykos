@@ -23,7 +23,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       bubblewrap \
       default-jre \
       wine wine64 \
+      libglib2.0-0 libpixman-1-0 \
     && rm -rf /var/lib/apt/lists/*
+
+# ---- separately-built emulators, staged by build-container.sh (afl-qemu-trace per guest for
+#      coverage_fuzz; symqemu for the concolic backend). Kali-built = native here. The staging dirs
+#      always exist (a .keep) so this COPY is unconditional; the .keep files are then removed. ----
+COPY packaging/_vendor/bin/ /usr/local/bin/
+COPY packaging/_vendor/symqemu/ /opt/lykos/vendor/symqemu/
+RUN rm -f /usr/local/bin/.keep /opt/lykos/vendor/symqemu/.keep \
+    && chmod -R a+rx /usr/local/bin /opt/lykos/vendor/symqemu 2>/dev/null || true
 
 # ---- Python engines: pypcode (P-Code IR -- REQUIRED by the memory-safety detectors) on the
 #      import path; angr (concolic) + unicorn (firmware rehost) in their own venvs under the

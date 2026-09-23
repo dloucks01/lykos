@@ -12,6 +12,14 @@ import {
 const html = htm.bind(h);
 export { html };
 
+// Tooltip text for a CWE badge: the id, its name, and the plain-language description the backend
+// now ships (finding.cwe_name / finding.cwe_desc). Rendered through the native `title` attribute so
+// hovering a CWE anywhere in the workbench explains it without leaving the tool or looking it up.
+const cweTip = (f) =>
+  f && f.cwe_name
+    ? `${f.cwe}: ${f.cwe_name}${f.cwe_desc ? "\n\n" + f.cwe_desc : ""}`
+    : (f && f.cwe) || "";
+
 export function Spinner({ label }) {
   return html`<span class="spin" role="status"><span class="dot"></span>${label ? html`<span class="spin-lbl">${label}</span>` : null}</span>`;
 }
@@ -335,7 +343,7 @@ export function FindingCard({ finding, pocs, reportUrl, artifactUrl, onViewCode,
         <div class="find-id">
           <div class="find-title">${finding.title || finding.detector || finding.cwe}</div>
           <div class="find-meta">
-            <span class="cwe">${finding.cwe}</span>
+            <span class="cwe cwe-info" title=${cweTip(finding)}>${finding.cwe}</span>
             ${finding.detector ? html`<span class="det">via ${finding.detector}</span>` : null}
             ${site ? html`<span class="at">at <code>${site}</code></span>` : null}
             ${finding.group_count > 1 ? html`<span class="sites">${finding.group_count} occurrences</span>` : (finding.site_count ? html`<span class="sites">${finding.site_count} site${finding.site_count === 1 ? "" : "s"}${finding.proven_sites ? ` · ${finding.proven_sites} proven` : ""}</span>` : null)}
@@ -439,7 +447,8 @@ export function EvidenceModal({ finding, pocs, artifactUrl, onViewCode, onClose,
         <div class="ev-head">
           <div>
             <div class="ev-title"><${SevDot} severity=${finding.severity} /> ${finding.title || finding.cwe}</div>
-            <div class="ev-sub"><span class="cwe">${finding.cwe}</span>
+            <div class="ev-sub"><span class="cwe cwe-info" title=${cweTip(finding)}>${finding.cwe}</span>
+              ${finding.cwe_name ? html`<span class="cwe-name">${finding.cwe_name}</span>` : null}
               ${finding.detector ? html`<span class="det">via ${finding.detector}</span>` : null}
               ${site ? html`<span class="at">at <code>${site}</code></span>` : null}
               <${Badge} state=${finding.state} /></div>
@@ -548,6 +557,48 @@ function hexEq(a, b) {
 // wired, otherwise the disassembly the detectors ran on -- always something to read. The stack
 // frame flags the buffers, the fault/sink site is highlighted, and the call edges let an analyst
 // walk in and out. This is what turns "CWE-121 at 0x401156" into "here is the code, and here is
+// A focused ("ego") call graph around ONE function: who calls it (top row) and what it calls
+// (bottom row), drawn as an SVG the analyst clicks to re-center on a neighbour. Self-contained --
+// no graph library, which is what makes it work in the air-gapped bundle. The full per-target edge
+// list backs cross-binary navigation elsewhere; here it answers the question asked at a finding:
+// how is this function reached, and what does it reach? Uses the callers/callees the function detail
+// already carries, and the same onNavigate the text cross-refs use.
+export function CallGraphMini({ fn, onNavigate }) {
+  if (!fn) return null;
+  const up = [...new Set((fn.callers || []).map((c) => c.src_name || c.name).filter(Boolean))];
+  const dn = [...new Set((fn.callees || []).map((c) => c.dst_name || c.name).filter(Boolean))];
+  if (!up.length && !dn.length) return null;
+  const CAP = 7;
+  const callers = up.slice(0, CAP), callees = dn.slice(0, CAP);
+  const moreUp = up.length - callers.length, moreDn = dn.length - callees.length;
+  const W = 720, nodeW = 92, nodeH = 26, gap = 10;
+  const H = 200, yUp = 34, yC = H / 2, yDn = H - 34, xC = W / 2;
+  const xAt = (n, i) => {
+    const total = n * nodeW + (n - 1) * gap, start = (W - total) / 2;
+    return start + i * (nodeW + gap) + nodeW / 2;
+  };
+  const trunc = (s) => (s.length > 13 ? s.slice(0, 12) + "…" : s);
+  const node = (name, x, y, kind) => html`
+    <g class=${`cg-node cg-${kind}`} onClick=${() => kind !== "center" && onNavigate && onNavigate(name)}>
+      <rect x=${x - nodeW / 2} y=${y - nodeH / 2} width=${nodeW} height=${nodeH} rx="6"/>
+      <text x=${x} y=${y + 4} text-anchor="middle">${trunc(name)}</text>
+      <title>${name}${kind === "center" ? "" : " — click to open"}</title>
+    </g>`;
+  return html`
+    <div class="callgraph">
+      <div class="cg-lbl">Call graph <span class="cg-hint">${(up.length || dn.length) ? "click a node to follow it" : ""}</span></div>
+      <svg viewBox=${`0 0 ${W} ${H}`} class="cg-svg" preserveAspectRatio="xMidYMid meet" role="img" aria-label="call graph">
+        ${callers.map((n, i) => html`<line class="cg-edge" x1=${xAt(callers.length, i)} y1=${yUp + nodeH / 2} x2=${xC} y2=${yC - nodeH / 2}/>`)}
+        ${callees.map((n, i) => html`<line class="cg-edge" x1=${xC} y1=${yC + nodeH / 2} x2=${xAt(callees.length, i)} y2=${yDn - nodeH / 2}/>`)}
+        ${callers.map((n, i) => node(n, xAt(callers.length, i), yUp, "caller"))}
+        ${node(fn.name || "sub", xC, yC, "center")}
+        ${callees.map((n, i) => node(n, xAt(callees.length, i), yDn, "callee"))}
+        ${moreUp > 0 ? html`<text class="cg-more" x=${W - 6} y=${yUp + 4} text-anchor="end">+${moreUp} more</text>` : null}
+        ${moreDn > 0 ? html`<text class="cg-more" x=${W - 6} y=${yDn + 4} text-anchor="end">+${moreDn} more</text>` : null}
+      </svg>
+    </div>`;
+}
+
 // the overrun."
 export function CodeView({ fn, finding, source, onClose, onNavigate, onFollowCaller, crumbs, xbinCallers }) {
   if (!fn) return null;
@@ -597,6 +648,7 @@ export function CodeView({ fn, finding, source, onClose, onNavigate, onFollowCal
             <div class="xref-hint">This function is reached from another binary — follow the call back across the boundary.</div>
           </div>` : null}
         ${(fn.callees && fn.callees.length) || (fn.callers && fn.callers.length) ? html`
+          <${CallGraphMini} fn=${fn} onNavigate=${nav} />
           <div class="xrefs">
             ${fn.callers && fn.callers.length ? html`<div class="xref"><span class="xref-k">Called by</span>${fn.callers.slice(0, 8).map((c) => {
               const n = c.src_name || c.name || c.src_addr; return n ? html`<button class="xref-n nav" onClick=${() => nav(c.src_name || c.name)}>${n}</button>` : null; })}</div>` : null}
