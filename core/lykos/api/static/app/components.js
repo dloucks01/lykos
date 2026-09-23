@@ -3,6 +3,7 @@
 // 160 KB file where markup, state, and network calls were braided together.
 
 import { h } from "preact";
+import { useState } from "preact/hooks";
 import htm from "htm";
 import {
   STATE_LABEL, STATE_GLOSS, isDemonstrated, fmtBytes, shortHash, runTone, stageLabel,
@@ -241,7 +242,8 @@ function faultClassOf(rootCause) {
 // One finding, results-first. The exploitation section is the payload: the exploitability
 // rating, the mechanism (root cause), how the crash is reached, where it faults, and the
 // downloadable verified reproducer. This is "how the binary can actually be exploited."
-export function FindingCard({ finding, pocs, reportUrl, artifactUrl, onViewCode, mitigations }) {
+export function FindingCard({ finding, pocs, reportUrl, artifactUrl, onViewCode, mitigations, onInspect }) {
+  const inspect = (ch) => onInspect && onInspect(finding, ch);
   const demo = isDemonstrated(finding);
   const evRaw = finding.evidence;
   const evList = Array.isArray(evRaw) ? evRaw : [];
@@ -303,19 +305,20 @@ export function FindingCard({ finding, pocs, reportUrl, artifactUrl, onViewCode,
         </div>` : null}
 
       ${exp ? html`
-        <div class=${`exploit-rating ${RATING_CLASS[exp.rating] || "exp-mid"}`}>
+        <div class=${`exploit-rating ${RATING_CLASS[exp.rating] || "exp-mid"}${onInspect ? " clk" : ""}`}
+          onClick=${() => inspect("exploitability")} title=${onInspect ? "inspect the exploitability evidence" : null}>
           <span class="er-badge">${exp.rating ? exp.rating.replace(/_/g, " ") : "assessed"}${exp.score != null ? ` · ${exp.score}/100` : ""}</span>
           ${exp.why || exp.text ? html`<span class="er-why">${exp.why || exp.text}</span>` : null}
         </div>` : null}
 
       ${(rootCause || howFound.length || other.length || legacySteps) ? html`
         <div class="exploit">
-          <div class="exploit-head">How it can be exploited</div>
-          <ol class="exploit-trail">
-            ${rootCause ? html`<li><span class="et-k">Mechanism</span> ${rootCause}</li>` : null}
-            ${howFound.map((h) => html`<li><span class="et-k">Reached</span> ${h}</li>`)}
-            ${other.map((o) => html`<li><span class="et-k">Evidence</span> ${o}</li>`)}
-            ${legacySteps ? (Array.isArray(legacySteps) ? legacySteps : String(legacySteps).split("\n")).filter(Boolean).map((s) => html`<li>${typeof s === "string" ? s : (s.text || "")}</li>`) : null}
+          <div class="exploit-head">How it can be exploited${onInspect ? html` <span class="ev-hint">— click any line to go deeper</span>` : null}</div>
+          <ol class=${`exploit-trail${onInspect ? " clk" : ""}`}>
+            ${rootCause ? html`<li onClick=${() => inspect("root-cause")}><span class="et-k">Mechanism</span> ${rootCause}</li>` : null}
+            ${howFound.map((h) => html`<li onClick=${() => inspect("dynamic")}><span class="et-k">Reached</span> ${h}</li>`)}
+            ${other.map((o) => html`<li onClick=${() => inspect(null)}><span class="et-k">Evidence</span> ${o}</li>`)}
+            ${legacySteps ? (Array.isArray(legacySteps) ? legacySteps : String(legacySteps).split("\n")).filter(Boolean).map((s) => html`<li onClick=${() => inspect(null)}>${typeof s === "string" ? s : (s.text || "")}</li>`) : null}
           </ol>
         </div>` : null}
 
@@ -335,6 +338,7 @@ export function FindingCard({ finding, pocs, reportUrl, artifactUrl, onViewCode,
           ? html`<a class="btn small ghost" href=${artifactUrl(inputPoc.input_sha)} download title="the exact input that triggers the crash">⬇ Crashing input</a>` : null}
         ${finding.function_addr && onViewCode
           ? html`<button class="btn small ghost" onClick=${() => onViewCode(finding)}>⟨⟩ View code</button>` : null}
+        ${onInspect ? html`<button class="btn small ghost" onClick=${() => inspect(null)}>🔍 Inspect evidence</button>` : null}
         ${finding.verification ? html`<${VerifyBadge} v=${finding.verification} />` : null}
       </div>
     </div>`;
@@ -348,6 +352,69 @@ export function VerifyBadge({ v }) {
   return html`<span class=${`verify ${ok ? "verify-ok" : "verify-flaky"}`}
     title=${`replayed the crashing input ${v.runs}x; crashed ${v.crashed}x${v.signal ? ` (${v.signal})` : ""}`}>
     ${ok ? `✓ verified ${v.crashed}/${v.runs}` : `⚠ flaky ${v.crashed}/${v.runs}`}</span>`;
+}
+
+// Click any piece of evidence -> the full trail, uncut. Every channel's complete detail, the end
+// effects with their proof artifacts, the PoC bundle and crashing input, and a raw-JSON view for
+// the power user -- so "why do you say this?" is always one click from an answer.
+export function EvidenceModal({ finding, pocs, artifactUrl, onViewCode, onClose, focus }) {
+  if (!finding) return null;
+  const [raw, setRaw] = useState(false);
+  const evList = Array.isArray(finding.evidence) ? finding.evidence : [];
+  let effects = [];
+  try { effects = JSON.parse((evList.find((x) => x.channel === "effects") || {}).detail || "[]"); } catch { effects = []; }
+  const bundle = (pocs || []).find((p) => p.verified) || (pocs || [])[0];
+  const inputPoc = (pocs || []).find((p) => p.input_sha);
+  const site = fmtAddr(finding.site_addr) || fmtAddr(finding.function_addr);
+  const chLabel = { "root-cause": "Root cause", dynamic: "Reached / how found", poc: "Proof of concept",
+    exploitability: "Exploitability", effects: "End effects", exploit: "Exploit" };
+  return html`
+    <div class="modal-back" onClick=${onClose}>
+      <div class="modal evidence" onClick=${(e) => e.stopPropagation()}>
+        <div class="ev-head">
+          <div>
+            <div class="ev-title"><${SevDot} severity=${finding.severity} /> ${finding.title || finding.cwe}</div>
+            <div class="ev-sub"><span class="cwe">${finding.cwe}</span>
+              ${finding.detector ? html`<span class="det">via ${finding.detector}</span>` : null}
+              ${site ? html`<span class="at">at <code>${site}</code></span>` : null}
+              <${Badge} state=${finding.state} /></div>
+          </div>
+          <button class="btn ghost small" onClick=${onClose}>✕ Close</button>
+        </div>
+
+        ${effects.length ? html`
+          <div class="ev-sec">
+            <div class="ev-sec-h">End effects</div>
+            <ul class="ev-effects">
+              ${effects.map((e) => html`<li class=${e.status === "demonstrated" ? "eff-demo" : "eff-pot"}>
+                <span class="ev-eff-t">${e.status === "demonstrated" ? "✓ " : "○ "}${e.title}</span>
+                <span class="eff-status">${e.status}</span>
+                ${(e.proof && e.proof.note) || e.detail ? html`<div class="ev-eff-note">${(e.proof && e.proof.note) || e.detail}</div>` : null}
+                ${e.proof && e.proof.sha ? html`<a class="btn xsmall" href=${artifactUrl(e.proof.sha)} download>⬇ ${e.proof.type === "bundle" ? "proof PoC" : e.proof.type === "artifact" ? "captured bytes" : "proof input"}</a>` : null}
+              </li>`)}
+            </ul>
+          </div>` : null}
+
+        <div class="ev-sec">
+          <div class="ev-sec-h">Evidence trail <span class="ev-count">${evList.length}</span></div>
+          <ol class="ev-trail">
+            ${evList.filter((e) => e.channel !== "effects").map((e) => html`
+              <li class=${focus && focus === e.channel ? "ev-focus" : ""}>
+                <span class="ev-ch">${chLabel[e.channel] || e.channel}</span>
+                <span class="ev-detail">${e.detail || "(no detail)"}</span>
+              </li>`)}
+          </ol>
+        </div>
+
+        <div class="ev-sec ev-artifacts">
+          ${bundle && bundle.bundle_sha ? html`<a class="btn small" href=${artifactUrl(bundle.bundle_sha)} download>⬇ PoC bundle${bundle.verified ? " (verified)" : ""}</a>` : null}
+          ${inputPoc && inputPoc.input_sha ? html`<a class="btn small ghost" href=${artifactUrl(inputPoc.input_sha)} download>⬇ Crashing input</a>` : null}
+          ${finding.function_addr && onViewCode ? html`<button class="btn small ghost" onClick=${() => { onClose(); onViewCode(finding); }}>⟨⟩ View code at ${site || "site"}</button>` : null}
+          <button class="btn small ghost" onClick=${() => setRaw((v) => !v)}>${raw ? "Hide" : "Show"} raw JSON</button>
+        </div>
+        ${raw ? html`<pre class="ev-raw">${JSON.stringify(finding, null, 2)}</pre>` : null}
+      </div>
+    </div>`;
 }
 
 export function EmptyResults({ ran }) {
