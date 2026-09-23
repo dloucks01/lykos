@@ -8,8 +8,10 @@ import { api, waitForRun } from "./api.js";
 import { runAutopilotCase, newController, cancel as cancelAutopilot, coverageOf } from "./autopilot.js";
 import { rankFindings, pocsForFinding, fmtTime, progressText, stageLabel, dedupeFindings, buildRunLog } from "./util.js";
 import {
-  html, DropZone, TargetSummary, ProgressLog, FindingCard, EmptyResults, Spinner, UnavailablePanel, SystemMap, CoveragePanel, CodeView, PipelinePlan, EvidenceModal, FunctionsModal,
+  html, DropZone, TargetSummary, ProgressLog, ConsolePanel, FindingCard, EmptyResults, Spinner, UnavailablePanel, SystemMap, CoveragePanel, CodeView, PipelinePlan, EvidenceModal, FunctionsModal,
 } from "./components.js";
+
+let _conSeq = 0;
 
 const stageLabelSafe = (s) => (s ? stageLabel(s) : "");
 
@@ -88,6 +90,8 @@ function App() {
   const [funcBrowse, setFuncBrowse] = useState(null); // {targetId, name, functions} for the function browser
   const [bg, setBg] = useState(null);               // server-side background autopilot status
   const [bgActivity, setBgActivity] = useState(null); // {msg, pct} live intra-stage progress
+  const [consoleLines, setConsoleLines] = useState([]); // job.exec: tool commands + I/O
+  const consoleSeen = useRef(new Set());              // de-dupe exec events by server id
   // The effective theme: an explicit choice (data-theme, set pre-paint from localStorage) wins,
   // else the OS preference. The toggle flips it, applies it to <html>, and persists the choice.
   const [theme, setTheme] = useState(() => {
@@ -239,6 +243,22 @@ function App() {
     setLog((cur) => [...cur, { id: ++_logSeq, ...row }]);
   }, []);
 
+  // A job.exec event -> one console line. Deduped by the server event id (both the foreground
+  // controller and the background tail can deliver the same one), capped so a long fuzzing run
+  // does not grow the DOM without bound.
+  const pushConsole = useCallback((evId, payload) => {
+    if (!payload) return;
+    const key = evId != null ? `e${evId}` : `s${++_conSeq}`;
+    if (evId != null) {
+      if (consoleSeen.current.has(key)) return;
+      consoleSeen.current.add(key);
+    }
+    setConsoleLines((cur) => {
+      const next = [...cur, { id: key, ...payload }];
+      return next.length > 500 ? next.slice(next.length - 500) : next;
+    });
+  }, []);
+
   // A fresh case per analysis session. Reusing whatever case happened to exist first piled
   // every upload into one case; instead each session gets its own, and the old ones stay on the
   // server, reopenable from the recent list -- "New analysis" no longer loses anything.
@@ -288,6 +308,7 @@ function App() {
               if (p.msg) setBgActivity({ msg: p.msg, pct: p.pct != null ? p.pct : null });
               continue;
             }
+            if (ev.type === "job.exec") { pushConsole(ev.id, ev.payload); continue; }
             const row = bgEventToLog(ev);
             if (row) { pushLog(row); setBgActivity(null); }
           }
@@ -313,7 +334,7 @@ function App() {
       }
     };
     tick();
-  }, [refreshResults, targets, pushLog]);
+  }, [refreshResults, targets, pushLog, pushConsole]);
 
   // Reopen a previous analysis: its targets, findings and PoCs are all still on the server.
   const reopenCase = useCallback(async (cid) => {
@@ -338,6 +359,17 @@ function App() {
       // Rebuild the run log from the case's own history, so a reopened analysis shows what
       // already ran (and what failed) instead of an empty log.
       setLog(buildRunLog(runs, ts).map((row) => ({ id: ++_logSeq, ...row })));
+      // Backfill the console with the last run's tool commands, so reopening a case shows the
+      // work that was done rather than an empty panel (live commands still stream on top).
+      consoleSeen.current = new Set();
+      try {
+        const evs = await api.events(cid, 0);
+        const execs = (evs || []).filter((e) => e.type === "job.exec").slice(-250);
+        setConsoleLines(execs.map((e) => {
+          consoleSeen.current.add(`e${e.id}`);
+          return { id: `e${e.id}`, ...(e.payload || {}) };
+        }));
+      } catch { setConsoleLines([]); }
       if (ts && ts.length) {
         const adv = await api.advice(ts[0].id).catch(() => null);
         setAdvice(adv);
@@ -455,6 +487,8 @@ function App() {
           }
           return [...cur, { id: ++_logSeq, kind: "stage", stage: ev.stage, label: ev.label, status, detail, cached: ev.cached }];
         });
+      } else if (ev.kind === "exec") {
+        pushConsole(ev.id, ev.payload);
       } else {
         pushLog(eventToLog(ev));
       }
@@ -565,6 +599,8 @@ function App() {
         `}
 
         <${ProgressLog} entries=${log} running=${running} />
+
+        <${ConsolePanel} lines=${consoleLines} />
 
         <${SystemMap} map=${sysmap} />
 

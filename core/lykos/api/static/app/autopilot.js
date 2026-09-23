@@ -215,6 +215,8 @@ async function streamProgress(ctrl, emit, stage, caseId, runId, stopRef) {
       if (ev.run_id !== runId || !ev.payload) continue;
       if (/\.progress$/.test(ev.type) || ev.type === "job.progress")
         emit({ kind: "stage-progress", stage, runId, type: ev.type, payload: ev.payload });
+      else if (ev.type === "job.exec")
+        emit({ kind: "exec", id: ev.id, payload: ev.payload });
     }
   }
 }

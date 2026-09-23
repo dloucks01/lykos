@@ -3,7 +3,7 @@
 // 160 KB file where markup, state, and network calls were braided together.
 
 import { h } from "preact";
-import { useState } from "preact/hooks";
+import { useState, useRef, useEffect } from "preact/hooks";
 import htm from "htm";
 import {
   STATE_LABEL, STATE_GLOSS, isDemonstrated, fmtBytes, shortHash, runTone, stageLabel,
@@ -190,6 +190,53 @@ export function ProgressLog({ entries, running }) {
       <ol class="log-list">
         ${entries.map((e) => html`<${LogRow} key=${e.id} e=${e} />`)}
       </ol>
+    </div>`;
+}
+
+// A live console: the actual tool commands (rizin, angr, afl, pypcode worker...) and a tail of
+// their I/O, streamed from the server's job.exec events. Separate from the Run log (which is the
+// human "what it found"): this is the "what it is doing right now", proof that work is happening.
+function fmtMs(ms) {
+  if (ms == null) return "";
+  return ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${ms}ms`;
+}
+
+export function ConsolePanel({ lines }) {
+  const [open, setOpen] = useState(true);
+  const bodyRef = useRef(null);
+  const atBottom = useRef(true);
+  const shown = (lines || []).slice(-250);
+  // Auto-scroll to the newest line, but only if the user is already at the bottom (so scrolling
+  // up to read history is not yanked away every time a command completes).
+  useEffect(() => {
+    const el = bodyRef.current;
+    if (el && atBottom.current) el.scrollTop = el.scrollHeight;
+  }, [shown.length, open]);
+  if (!lines || !lines.length) return null;
+  const onScroll = (e) => {
+    const el = e.target;
+    atBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+  };
+  return html`
+    <div class="card console">
+      <button class="console-head" onClick=${() => setOpen(!open)}>
+        <span class="console-title">▚ Console</span>
+        <span class="console-sub">tool commands &amp; I/O</span>
+        <span class="console-count">${lines.length}</span>
+        <span class="console-toggle">${open ? "▾" : "▸"}</span>
+      </button>
+      ${open ? html`
+        <div class="console-body" ref=${bodyRef} onScroll=${onScroll}>
+          ${shown.map((l) => html`
+            <div class=${`con-line con-${l.note ? "kill" : (l.rc === 0 ? "ok" : (l.rc == null ? "kill" : "bad"))}`} key=${l.id}>
+              <div class="con-cmd"><span class="con-prompt">$</span> <span class="con-text">${l.cmd}</span>
+                <span class="con-meta">${l.note ? html`<span class="con-note">${l.note}</span>`
+                  : html`<span class="con-rc">${l.rc === 0 ? "ok" : `rc ${l.rc}`}</span>`}${l.ms != null ? html` <span class="con-ms">${fmtMs(l.ms)}</span>` : null}</span>
+              </div>
+              ${l.out ? html`<pre class="con-out">${l.out}</pre>` : null}
+              ${l.err ? html`<pre class="con-out con-err">${l.err}</pre>` : null}
+            </div>`)}
+        </div>` : null}
     </div>`;
 }
 

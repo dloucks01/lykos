@@ -123,14 +123,41 @@ class JobContext:
         while True:
             try:
                 out, err = proc.communicate(timeout=poll)
+                self._emit_exec(cmd, start, rc=proc.returncode, out=out, err=err)
                 return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
             except subprocess.TimeoutExpired:
                 over_local = timeout is not None and (time.time() - start) > timeout
                 if over_local or self.should_cancel():
                     self._kill_group(proc)
                     reason = "timeout" if (over_local or self.timed_out()) else "cancelled"
+                    self._emit_exec(cmd, start, rc=None, note=reason)
                     raise (StageTimeout if reason == "timeout" else StageCancelled)(
                         f"subprocess {cmd[0]} {reason}")
+
+    def _emit_exec(self, cmd, start, *, rc=None, out=b"", err=b"", note=None) -> None:
+        """Publish one 'job.exec' event: the tool command that just ran and a short tail of its
+        output. Feeds the live console panel so an operator can see the actual commands and I/O go
+        by. Best-effort -- a telemetry emit must never fail the subprocess it describes."""
+        try:
+            import os as _os
+
+            def _short(b, n=400):
+                s = (b or b"")[-n:].decode("utf-8", "replace") if isinstance(b, (bytes, bytearray)) \
+                    else str(b or "")[-n:]
+                return s.strip() or None
+            # A readable command line: the tool's basename, then args with temp/scratch paths
+            # shortened to their basenames so a 40-char /var/tmp/rzscript-... reads as `rzscript-…rz`.
+            argv = [str(a) for a in (cmd or [])]
+            disp = [_os.path.basename(argv[0]) if argv else ""]
+            for a in argv[1:]:
+                disp.append(_os.path.basename(a) if (a.startswith("/") and _os.sep in a[1:]) else a)
+            self.emit("job.exec", "info", {
+                "tool": _os.path.basename(argv[0]) if argv else "",
+                "cmd": " ".join(disp)[:500],
+                "rc": rc, "ms": int((time.time() - start) * 1000),
+                "out": _short(out), "err": _short(err), "note": note})
+        except Exception:                                    # noqa: BLE001
+            pass
 
     @staticmethod
     def _kill_group(proc: subprocess.Popen) -> None:
