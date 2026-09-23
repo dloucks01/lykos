@@ -568,6 +568,26 @@ class FindingDAO(BaseDAO):
             if c.get("function_addr") or c.get("site_addr"):
                 self._record_site(fid, c, now)
 
+    def clear_sites_for_keys(self, target_id: str, keys) -> int:
+        """Delete the recorded sites of the target's findings whose dedup_key is in `keys`.
+
+        Static detection is a pure function of the disassembly: when it re-runs it recomputes the
+        COMPLETE site set for each finding, so the previous run's sites must be cleared first --
+        otherwise a site the new run no longer emits (e.g. one dropped by the CWE-121 destination
+        gate) lingers forever and the finding's site_count only ever grows. Scoped to the given
+        keys so it touches only the findings being recomputed; a dynamic stage re-adds its
+        corroboration sites when it re-runs after detection."""
+        keys = list(keys or [])
+        if not keys:
+            return 0
+        qs = ",".join("?" * len(keys))
+        with transaction(self.conn, immediate=True):
+            cur = self.conn.execute(
+                f"DELETE FROM finding_site WHERE finding_id IN "
+                f"(SELECT id FROM finding WHERE target_id=? AND dedup_key IN ({qs}))",
+                (target_id, *keys))
+            return cur.rowcount or 0
+
     def _record_site(self, fid: str, c: dict, now: int) -> None:
         """Record one occurrence, keeping the STRONGEST verdict any channel has given it.
 
