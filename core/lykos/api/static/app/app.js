@@ -8,7 +8,7 @@ import { api, waitForRun } from "./api.js";
 import { runAutopilotCase, newController, cancel as cancelAutopilot, coverageOf } from "./autopilot.js";
 import { rankFindings, pocsForFinding, fmtTime, progressText, stageLabel, dedupeFindings, buildRunLog } from "./util.js";
 import {
-  html, DropZone, TargetSummary, ProgressLog, FindingCard, EmptyResults, Spinner, UnavailablePanel, SystemMap, CoveragePanel, CodeView, PipelinePlan, EvidenceModal,
+  html, DropZone, TargetSummary, ProgressLog, FindingCard, EmptyResults, Spinner, UnavailablePanel, SystemMap, CoveragePanel, CodeView, PipelinePlan, EvidenceModal, FunctionsModal,
 } from "./components.js";
 
 const stageLabelSafe = (s) => (s ? stageLabel(s) : "");
@@ -85,7 +85,9 @@ function App() {
   const [verifications, setVerifications] = useState({});  // input_sha -> replay review result
   const [codeFn, setCodeFn] = useState(null);       // {fn, finding} for the open code view
   const [evidence, setEvidence] = useState(null);   // {finding, focus} for the evidence inspector
+  const [funcBrowse, setFuncBrowse] = useState(null); // {targetId, name, functions} for the function browser
   const [bg, setBg] = useState(null);               // server-side background autopilot status
+  const [bgActivity, setBgActivity] = useState(null); // {msg, pct} live intra-stage progress
   // The effective theme: an explicit choice (data-theme, set pre-paint from localStorage) wins,
   // else the OS preference. The toggle flips it, applies it to <html>, and persists the choice.
   const [theme, setTheme] = useState(() => {
@@ -193,6 +195,35 @@ function App() {
     }
   }, [targets, xbinCallersOf]);
 
+  // Open the function browser for a target: pop the modal immediately (loading), then fetch the
+  // recovered functions. The modal renders a spinner until `functions` arrives.
+  const browseFunctions = useCallback(async (targetId) => {
+    const tgt = targets.find((t) => t.id === targetId);
+    setFuncBrowse({ targetId, name: (tgt && tgt.filename) || targetId.slice(0, 8), functions: null });
+    try {
+      const fns = await api.functions(targetId);
+      setFuncBrowse((cur) => (cur && cur.targetId === targetId ? { ...cur, functions: fns || [] } : cur));
+    } catch (e) {
+      setFuncBrowse((cur) => (cur && cur.targetId === targetId ? { ...cur, functions: [] } : cur));
+      setError(e.message || String(e));
+    }
+  }, [targets]);
+
+  // Open one function from the browser into the code view (same drill-in as a finding, but with
+  // no finding attached). Reuses the cross-binary caller resolution so xrefs still work.
+  const openFunction = useCallback(async (fn, targetId) => {
+    try {
+      const detail = await api.getFunction(fn.id);
+      const tgt = targets.find((t) => t.id === targetId);
+      const xc = await xbinCallersOf(detail, targetId);
+      setFuncBrowse(null);
+      setCodeFn({ fn: detail, finding: null, source: tgt && tgt.source, targetId,
+        xbinCallers: xc, crumbs: [detail.name || fn.name || "fn"] });
+    } catch (e) {
+      setError(e.message || String(e));
+    }
+  }, [targets, xbinCallersOf]);
+
   const loadRecent = useCallback(async () => {
     const cs = await api.listCases().catch(() => []);
     setRecentCases(cs || []);
@@ -250,8 +281,15 @@ function App() {
         for (const ev of evs) {
           if (ev.id > bgEventsAfter.current) bgEventsAfter.current = ev.id;
           if (bgEventsAfter.current >= 0 && token === bgPollRef.current) {
+            // Live intra-stage progress ("disassembled 3000/7180 functions") coalesces into one
+            // activity line instead of flooding the log with a row per batch.
+            if (ev.type === "job.progress") {
+              const p = ev.payload || {};
+              if (p.msg) setBgActivity({ msg: p.msg, pct: p.pct != null ? p.pct : null });
+              continue;
+            }
             const row = bgEventToLog(ev);
-            if (row) pushLog(row);
+            if (row) { pushLog(row); setBgActivity(null); }
           }
         }
       } catch { /* transient; retry next tick */ }
@@ -270,6 +308,7 @@ function App() {
         refreshResults(cid, targets);
         setTimeout(tick, 2500);
       } else if (st && (st.state === "done" || st.state === "cancelled" || st.state === "error")) {
+        setBgActivity(null);
         refreshResults(cid, targets);
       }
     };
@@ -496,7 +535,7 @@ function App() {
         ` : html`
           <section class="run-panel">
             ${targets.map((t, i) => html`
-              <${TargetSummary} key=${t.id} target=${t} advice=${i === 0 ? advice : null} index=${multi ? i + 1 : null} />
+              <${TargetSummary} key=${t.id} target=${t} advice=${i === 0 ? advice : null} index=${multi ? i + 1 : null} onBrowseFunctions=${browseFunctions} />
             `)}
             ${!running ? html`
               <${DropZone} onFiles=${(fl) => onFiles(fl, true)} busy=${uploading} compact=${true} />
@@ -505,6 +544,7 @@ function App() {
             <div class="cta">
               ${bg && bg.running ? html`
                 <div class="bg-status"><${Spinner} label=${`Running in the background — ${bg.stage ? stageLabelSafe(bg.stage) : "starting"}${bg.targets > 1 ? ` (target ${bg.target}/${bg.targets})` : ""}`} /></div>
+                ${bgActivity ? html`<div class="bg-activity">${bgActivity.pct != null ? html`<span class="bg-pct">${Math.round(bgActivity.pct)}%</span>` : null}<span class="bg-act-msg">${bgActivity.msg}</span></div>` : null}
                 <button class="btn ghost small" onClick=${() => api.cancelBackground(caseId)}>■ Stop background run</button>
                 <div class="cta-sub">This keeps running even if you close the tab. Reopen the case later to see the results.</div>
               ` : bg && (bg.state === "cancelled" || bg.state === "error") ? html`
@@ -528,7 +568,7 @@ function App() {
 
         <${SystemMap} map=${sysmap} />
 
-        <${CoveragePanel} coverage=${coverage} targets=${targets} />
+        <${CoveragePanel} coverage=${coverage} targets=${targets} onDrill=${browseFunctions} />
 
         ${(ran || findings.length) ? html`
           <section class="results">
@@ -563,6 +603,9 @@ function App() {
       ${evidence ? html`<${EvidenceModal} finding=${evidence.finding} focus=${evidence.focus}
         pocs=${pocsFor(evidence.finding)} artifactUrl=${api.artifactUrl}
         onViewCode=${viewCode} onClose=${() => setEvidence(null)} />` : null}
+
+      ${funcBrowse ? html`<${FunctionsModal} name=${funcBrowse.name} functions=${funcBrowse.functions}
+        onOpen=${(fn) => openFunction(fn, funcBrowse.targetId)} onClose=${() => setFuncBrowse(null)} />` : null}
     </div>`;
 }
 

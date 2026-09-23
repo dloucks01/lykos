@@ -72,17 +72,25 @@ def _materialize_driver() -> Path:
 
 
 def run_explore(python: Path, spec: dict, *, ctx=None, timeout: int = 300) -> dict:
-    """Run the angr driver on `spec` and return the parsed result dict."""
+    """Run the angr driver on `spec` and return the parsed result dict.
+
+    The driver enforces its own wall-clock deadline (spec.max_seconds) and dumps partial results,
+    so it should finish on its own. The subprocess timeout here is only a backstop for a driver
+    stuck in native code (a z3 query, VEX lifting) that no in-process signal can interrupt -- angr
+    on a large Rust binary does this. We give a short grace past the driver's deadline, then let
+    the TimeoutExpired propagate: the concolic STAGE catches it and finishes cleanly with whatever
+    was produced, so a stuck exploration never takes the case down."""
     work = _materialize_driver().parent
     spec_path = work / "spec.json"
     out_path = work / "out.json"
     spec_path.write_text(json.dumps(spec))
     cmd = [str(python), str(work / _DRIVER), str(spec_path), str(out_path)]
+    grace = timeout + 25
     try:
         if ctx is not None:
-            proc = ctx.run_subprocess(cmd, timeout=timeout + 60)
+            proc = ctx.run_subprocess(cmd, timeout=grace)
         else:
-            proc = subprocess.run(cmd, timeout=timeout + 60, capture_output=True, check=False)
+            proc = subprocess.run(cmd, timeout=grace, capture_output=True, check=False)
         if not out_path.exists():
             tail = (getattr(proc, "stderr", b"") or b"")[-600:].decode("latin-1", "ignore")
             raise RuntimeError(f"angr driver produced no output (rc="

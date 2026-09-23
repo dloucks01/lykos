@@ -378,6 +378,14 @@ class FunctionDAO(BaseDAO):
                               (target_id,)).fetchone()
         return int(r["c"])
 
+    def set_decompiled(self, func_id: str, decompiled: str) -> None:
+        """Cache a lazily-produced decompilation onto the row so the next open is instant. Used by
+        the on-demand decompile path: the disassemble stage does not decompile every function up
+        front, so the first time an analyst opens one we decompile it here and store it."""
+        with transaction(self.conn, immediate=True):
+            self.conn.execute("UPDATE function SET decompiled=? WHERE id=?",
+                              (decompiled, func_id))
+
 
 # ------------------------------------------------------------------- CallEdge (Phase 1)
 class CallEdgeDAO(BaseDAO):

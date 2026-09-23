@@ -154,6 +154,31 @@ function renderInfo(vnode) {
     info.threw.length === 0 && /prog/.test(info.all) && /62%/.test(info.all) && /124\/200/.test(info.all));
   ck("CoveragePanel renders nothing with no coverage data",
     renderInfo(h(C.CoveragePanel, { coverage: {}, targets: [] })).all.trim() === "");
+  // With onDrill, each coverage row becomes a clickable drill-in to that binary's functions.
+  info = renderInfo(h(C.CoveragePanel, {
+    targets: [{ id: "t1", filename: "prog" }],
+    coverage: { t1: { kind: "block", pct: 62, hit: 124, known: 200 } },
+    onDrill() {},
+  }));
+  ck("CoveragePanel rows are clickable to drill into functions when onDrill is given",
+    info.classes.some((c) => /\bclk\b/.test(c)) && /Click a row to drill/i.test(info.all));
+
+  // ---- TargetSummary disassembly drill-in ----
+  // A recovered function count + onBrowseFunctions renders the "Disassembly · N functions" button.
+  info = renderInfo(h(C.TargetSummary, {
+    target: { id: "t1", filename: "vuln", file_type: "elf", arch: "x86", bits: 64,
+      details: { function_count: 142 } },
+    onBrowseFunctions() {},
+  }));
+  ck("TargetSummary offers a disassembly drill-in with the function count",
+    info.threw.length === 0 && /Disassembly/.test(info.all) && /142 functions/.test(info.all)
+    && info.classes.some((c) => /disasm-drill/.test(c)));
+  // No count and no handler -> no drill-in button (nothing to browse yet).
+  const noDrill = renderInfo(h(C.TargetSummary, {
+    target: { id: "t1", filename: "vuln", file_type: "elf" },
+  }));
+  ck("TargetSummary omits the drill-in before disassembly has run",
+    !noDrill.classes.some((c) => /disasm-drill/.test(c)));
 
   // ---- CodeView: the function behind a finding ----
   // Decompiled available -> show it.

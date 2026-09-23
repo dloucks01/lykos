@@ -512,9 +512,25 @@ class Handler(BaseHTTPRequestHandler):
             if m:
                 s = self._store()
                 try:
-                    fn = FunctionDAO(s.conn).get(m.group(1))
+                    fdao = FunctionDAO(s.conn)
+                    fn = fdao.get(m.group(1))
                     if not fn:
                         return self._json({"error": "no function"}, 404)
+                    # On-demand decompilation: the disassemble stage does not decompile every
+                    # function up front (a big binary has thousands), so if this one has no cached C
+                    # yet, decompile just this function now and store it for next time. Best-effort:
+                    # a decompiler that is absent or fails leaves the disassembly view to fall back.
+                    if not fn.decompiled:
+                        try:
+                            from ..analyze import native_re
+                            t = s.targets.get(fn.target_id)
+                            if t is not None:
+                                code = native_re.decompile_one(s.content.path(t.sha256), fn.addr)
+                                if code:
+                                    fdao.set_decompiled(fn.id, code)
+                                    fn.decompiled = code
+                        except Exception:
+                            pass
                     d = _function(fn, code=True)
                     ce = CallEdgeDAO(s.conn)
                     d["callees"] = [_call_edge(e) for e in ce.callees_of(fn.target_id, fn.addr)]

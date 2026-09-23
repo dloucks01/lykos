@@ -41,6 +41,39 @@ def _write(path, obj):
         json.dump(obj, fh)
 
 
+# lykos arch string -> archinfo/angr arch name for the blob backend.
+_ARCH = {
+    "x86-64": "AMD64", "x86_64": "AMD64", "amd64": "AMD64", "x64": "AMD64",
+    "x86": "X86", "i386": "X86", "i686": "X86",
+    "arm": "ARMEL", "armel": "ARMEL", "armhf": "ARMHF", "thumb": "ARMEL",
+    "aarch64": "AARCH64", "arm64": "AARCH64",
+    "mips": "MIPS32", "mipsel": "MIPS32", "mips64": "MIPS64",
+    "ppc": "PPC32", "powerpc": "PPC32", "ppc64": "PPC64",
+    "riscv": "RISCV64", "riscv64": "RISCV64", "sparc": "SPARC",
+}
+
+
+def _load_project(angr, spec, binary):
+    """Open the binary with angr, falling back to the raw 'blob' loader when CLE has no backend
+    for it (a firmware image or headerless dump). Without this a non-ELF target raised
+    CLECompatibilityError and took the whole concolic stage down; the blob backend loads any bytes
+    at a base address for the given architecture so exploration can still proceed."""
+    try:
+        return angr.Project(binary, auto_load_libs=False)
+    except Exception as first:                               # noqa: BLE001
+        arch = _ARCH.get(str(spec.get("arch", "")).lower())
+        if not arch:
+            raise first
+        base = spec.get("base_addr")
+        main_opts = {"backend": "blob", "arch": arch}
+        if isinstance(base, int):
+            main_opts["base_addr"] = base
+        entry = spec.get("entry")
+        if isinstance(entry, int):
+            main_opts["entry_point"] = entry
+        return angr.Project(binary, auto_load_libs=False, main_opts=main_opts)
+
+
 def main(spec_path, out_path):
     spec = json.load(open(spec_path))
     result = {"ok": False, "generated": [], "reached_targets": [], "stats": {}, "note": None}
@@ -68,7 +101,7 @@ def main(spec_path, out_path):
         max_states = int(spec.get("max_states", 800))
         num_find = int(spec.get("num_find", 6))
 
-        proj = angr.Project(binary, auto_load_libs=False)
+        proj = _load_project(angr, spec, binary)
         symbytes = claripy.BVS("lykos_input", 8 * size)
         extras = {angr.options.LAZY_SOLVES}
 
@@ -108,12 +141,39 @@ def main(spec_path, out_path):
                 lsm.split(from_stash="active", limit=max_states, to_stash="spilled")
             return lsm
 
-        if targets:
-            simgr.explore(find=targets, avoid=avoid or None, num_find=num_find,
-                          step_func=step_func)
-        else:
-            while simgr.active and time.time() < deadline and steps["n"] < 2000:
-                simgr.step(step_func=step_func)
+        # Hard wall-clock guard. step_func honors the deadline BETWEEN steps, but a single step can
+        # get stuck (a huge basic block, a slow solver query) and never return -- then the parent's
+        # subprocess timeout SIGKILLs us and every input found so far is lost. A SIGALRM converts
+        # that into a clean break: we stop exploring and dump whatever states we already have.
+        class _Deadline(Exception):
+            pass
+
+        def _alarm(signum, frame):
+            raise _Deadline()
+
+        result["incomplete"] = False
+        try:
+            import signal
+            signal.signal(signal.SIGALRM, _alarm)
+            # a little past the soft deadline so step_func's graceful stop runs first
+            signal.alarm(max(1, int(max_seconds) + 5))
+        except Exception:                                    # noqa: BLE001 -- no SIGALRM on this OS
+            signal = None
+        try:
+            if targets:
+                simgr.explore(find=targets, avoid=avoid or None, num_find=num_find,
+                              step_func=step_func)
+            else:
+                while simgr.active and time.time() < deadline and steps["n"] < 2000:
+                    simgr.step(step_func=step_func)
+        except _Deadline:
+            result["incomplete"] = True                      # dump partial results below
+        finally:
+            if signal is not None:
+                try:
+                    signal.alarm(0)
+                except Exception:                            # noqa: BLE001
+                    pass
 
         def dump_input(st, from_seed):
             try:

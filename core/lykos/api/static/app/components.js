@@ -96,9 +96,11 @@ function Mitigations({ m }) {
   })}</div>`;
 }
 
-export function TargetSummary({ target, advice, index }) {
+export function TargetSummary({ target, advice, index, onBrowseFunctions }) {
   if (!target) return null;
   const d = target.details || {};
+  const fnCount = d.function_count != null ? d.function_count : (Array.isArray(d.functions) ? d.functions.length : null);
+  const fnLabel = fnCount != null ? `${fnCount} ${fnCount === 1 ? "function" : "functions"}` : null;
   const elf = (d.format_details && d.format_details.elf) || {};
   const imp = d.imports || {};
   const impSyms = imp.symbols || [];
@@ -128,6 +130,14 @@ export function TargetSummary({ target, advice, index }) {
       <div class="facts">
         ${facts.map(([k, v]) => html`<div class="fact"><span class="fk">${k}</span><span class="fv">${v}</span></div>`)}
       </div>
+      ${onBrowseFunctions && fnCount ? html`
+        <button class="disasm-drill" onClick=${() => onBrowseFunctions(target.id)}
+          title="browse the recovered functions and open any one's disassembly / decompilation">
+          <span class="dd-ico">⟨⟩</span>
+          <span class="dd-lbl">Disassembly</span>
+          <span class="dd-n">${fnLabel}</span>
+          <span class="dd-go">browse →</span>
+        </button>` : null}
       ${dangerous.length ? html`
         <div class="dang">
           <span class="dang-lbl">Dangerous imports</span>
@@ -417,6 +427,44 @@ export function EvidenceModal({ finding, pocs, artifactUrl, onViewCode, onClose,
     </div>`;
 }
 
+// Browse the recovered functions and drill into any one -- reached from the disassembly summary
+// and from the coverage panel. Filter by name/address; click a row to open its code. Functions
+// with a real body (blocks > 0) sort first; the rest are thunks/stubs.
+export function FunctionsModal({ name, functions, onOpen, onClose }) {
+  const [q, setQ] = useState("");
+  const loading = functions == null;
+  const fns = functions || [];
+  const ql = q.trim().toLowerCase();
+  const filt = ql ? fns.filter((f) => (f.name || "").toLowerCase().includes(ql)
+    || (f.addr || "").toLowerCase().includes(ql)) : fns;
+  const sorted = [...filt].sort((a, b) => (b.blocks || 0) - (a.blocks || 0) || (b.size || 0) - (a.size || 0));
+  const shown = sorted.slice(0, 600);
+  return html`
+    <div class="modal-back" onClick=${onClose}>
+      <div class="modal funcs" onClick=${(e) => e.stopPropagation()}>
+        <div class="fn-head">
+          <div class="fn-title">Functions · <span class="mono">${name}</span>
+            <span class="fn-count">${loading ? "…" : fns.length}</span></div>
+          <button class="btn ghost small" onClick=${onClose}>✕ Close</button>
+        </div>
+        <input class="fn-search" placeholder="filter by name or address…" value=${q}
+          onInput=${(e) => setQ(e.target.value)} />
+        ${loading ? html`<div class="fn-loading"><${Spinner} label="loading functions" /></div>` : html`
+          <ol class="fn-list">
+            ${shown.map((f) => html`
+              <li class=${`fn-row${f.blocks ? "" : " fn-thin"}`} key=${f.id || f.addr} onClick=${() => onOpen(f)}
+                title=${f.signature || (f.blocks ? "open code" : "stub / no body")}>
+                <span class="fn-name">${f.name || "(unnamed)"}</span>
+                <span class="fn-addr mono">${f.addr}</span>
+                <span class="fn-meta">${f.blocks ? `${f.blocks} blk` : "stub"}${f.size ? ` · ${f.size}B` : ""}</span>
+              </li>`)}
+          </ol>
+          ${sorted.length > shown.length ? html`<div class="fn-more">showing ${shown.length} of ${sorted.length} — filter to narrow</div>` : null}
+          ${!sorted.length ? html`<div class="fn-more">no function matches "${q}"</div>` : null}`}
+      </div>
+    </div>`;
+}
+
 export function EmptyResults({ ran }) {
   return html`
     <div class="card empty">
@@ -536,16 +584,17 @@ export function SystemMap({ map }) {
 // fuzzer barely ran" impossible to miss: a red sliver next to "0 crashes" says the clean result
 // is meaningless, where a full green bar next to "0 crashes" is real evidence of robustness.
 function covTone(pct) { return pct == null ? "mid" : pct >= 60 ? "hi" : pct >= 25 ? "mid" : "lo"; }
-export function CoveragePanel({ coverage, targets }) {
+export function CoveragePanel({ coverage, targets, onDrill }) {
   const rows = Object.entries(coverage || {});
   if (!rows.length) return null;
   const nameOf = (id) => ((targets || []).find((t) => t.id === id) || {}).filename || id.slice(0, 8);
   return html`
     <div class="card cov">
       <div class="cov-head">Fuzzing coverage</div>
-      <div class="cov-sub">How much of each binary's recovered code the search actually exercised.</div>
+      <div class="cov-sub">How much of each binary's recovered code the search actually exercised.${onDrill ? " Click a row to drill into its functions." : ""}</div>
       ${rows.map(([tid, c]) => html`
-        <div class="cov-row" key=${tid}>
+        <div class=${`cov-row${onDrill ? " clk" : ""}`} key=${tid}
+          onClick=${() => onDrill && onDrill(tid)} title=${onDrill ? "browse this binary's functions" : null}>
           <span class="cov-name">${nameOf(tid)}</span>
           <div class="cov-bar"><div class=${`cov-fill cov-${covTone(c.pct)}`} style=${`width:${c.pct != null ? Math.max(2, Math.min(100, c.pct)) : 0}%`}></div></div>
           <span class="cov-val">${c.pct != null ? `${c.pct}%` : "—"} <span class="cov-detail">${c.kind === "edge" ? `${c.edges || "?"} edges` : `${c.hit}/${c.known} blocks`}</span></span>
