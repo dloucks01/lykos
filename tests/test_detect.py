@@ -107,11 +107,24 @@ def test_copy_dest_class_distinguishes_stack_from_pointer():
     glob = _ir([("0x1008", "mov dword [esp], obj.loginHostname"),
                 ("0x100e", "call sym.strcpy")])         # the ftpHookup shape
     assert _copy_dest_class(glob, "0x100e", 32) == "nonstack"
-    # 64-bit SysV: destination is rdi
-    s64 = _ir([("0x1000", "lea rdi, [rbp - 0x20]"), ("0x100e", "call sym.strcpy")])
-    assert _copy_dest_class(s64, "0x100e", 64) == "stack"
+    # 64-bit SysV: destination is rdi, and the tracer follows reg-to-reg moves (x86-64 -O0 sets
+    # up the arg as `lea rax,[buf]; mov rdi,rax`).
+    s64 = _ir([("0x1000", "lea rax, [var_10h]"), ("0x1006", "mov rdi, rax"),
+               ("0x100e", "call sym.strcpy")])
+    assert _copy_dest_class(s64, "0x100e", 64, "x86-64") == "stack"
+    # heap: rdi <- rax <- malloc() return value -> nonstack
+    heap = _ir([("0x1000", "call sym.imp.malloc"), ("0x1006", "mov rdi, rax"),
+                ("0x100e", "call sym.strcpy")])
+    assert _copy_dest_class(heap, "0x100e", 64, "x86-64") == "nonstack"
+    # global: rdi <- rdx <- lea rdx, obj.g -> nonstack
+    g64 = _ir([("0x1000", "lea rdx, obj.g"), ("0x1006", "mov rdi, rdx"),
+               ("0x100e", "call sym.strcpy")])
+    assert _copy_dest_class(g64, "0x100e", 64, "x86-64") == "nonstack"
     # can't resolve -> unknown (kept, never a false negative)
     assert _copy_dest_class(_ir([("0x100e", "call sym.strcpy")]), "0x100e", 32) == "unknown"
+    # non-x86: the x86 ABI patterns don't apply, so the gate stays out of the way (keeps)
+    assert _copy_dest_class(s64, "0x100e", 64, "aarch64") == "unknown"
+    assert _copy_dest_class(heap, "0x100e", 64, "arm") == "unknown"
 
 
 def test_stack_overflow_gated_on_destination():

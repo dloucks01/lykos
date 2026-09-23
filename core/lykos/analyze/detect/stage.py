@@ -323,7 +323,8 @@ def detect_stage(ctx) -> dict:
         strings=StringDAO(ctx.conn).list_by_target(target.id),
         functions=functions,
         mitigations=target.mitigations or {}, frames=frames,
-        func_irs=func_irs, bits=int(getattr(target, "bits", 0) or 0))
+        func_irs=func_irs, bits=int(getattr(target, "bits", 0) or 0),
+        arch=getattr(target, "arch", "") or "")
 
     ctx.progress(msg="running CWE detectors")
     # Two detectors are OPT-IN, and the reason is measured rather than felt. On jhead they are

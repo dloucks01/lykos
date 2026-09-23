@@ -32,6 +32,7 @@ class DetectContext:
     frames: dict = field(default_factory=dict)        # func addr -> stack frame (from decompiler)
     func_irs: dict = field(default_factory=dict)      # func addr -> IR {blocks,edges} (call-site disasm)
     bits: int = 0                                     # target word size (32/64), for arg-passing ABI
+    arch: str = "x86"                                 # target arch; the CWE-121 dest gate is x86-only
 
 
 def _cand(cwe, title, severity, detector, evidence, *, function_addr=None,
@@ -92,75 +93,90 @@ def _naddr(a):
         return None
 
 
-# operand that is the ADDRESS OF a stack local: `lea r, [ebp-N]` / `[rbp-N]` / `[esp+N]` / `[var_..]`.
+# a memory operand naming the ADDRESS OF a stack local: `[ebp-N]` / `[rbp-N]` / `[esp+N]` / `[var_..]`.
 # A positive ebp/rbp offset is an incoming argument (ebp+8, ...), NOT a local buffer.
-_LEA_STACK = re.compile(r"\blea\b[^,]*,\s*(?:dword |qword )?\[\s*"
-                        r"(?:var_[0-9a-fh]+|"
+_STACK_MEM = re.compile(r"\[\s*(?:var_[0-9a-fh]+|"
                         r"(?:e|r)bp\s*-\s*0x[0-9a-f]+|"
                         r"(?:e|r)sp\s*[+\-]\s*0x[0-9a-f]+)", re.I)
-# a memory LOAD into a register: `mov r, [..]` -- the destination is then a *pointer value*, wherever
-# it points, not the address of a stack slot. `[arg_..]` is explicitly a caller argument.
-_MOV_LOAD = re.compile(r"\bmov\b[^,]*,\s*(?:dword |qword )?\[", re.I)
 _DEST_REG64 = "rdi"                                   # SysV first integer arg
 _X86_REGS = {"eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp",
              "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
              "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"}
+_ARITH = re.compile(r"\s*(add|sub|xor|and|or|imul|mul|shl|shr|sar|neg|inc|dec|lea)\s+", re.I)
 
 
-def _copy_dest_class(ir: dict, site_addr, bits: int) -> str:
+def _dest_reg_class(texts, reg: str) -> str:
+    """Trace register `reg` backward through the block's disassembly to classify what it holds
+    when the copy runs: 'stack' (the address of a stack local), 'nonstack' (a loaded pointer, a
+    global/RIP-relative address, an immediate, or a call return value -- i.e. NOT this frame), or
+    'unknown'. Follows reg-to-reg moves so `rdi <- rax <- lea rax,[var]` resolves, which is exactly
+    how x86-64 -O0 sets up the argument."""
+    reg = reg.lower()
+    i = len(texts) - 2                                # skip the call instruction itself
+    hops = 6
+    while i >= 0 and hops > 0:
+        t = texts[i].split(";")[0]                    # drop the disassembler's comment
+        w = re.match(r"\s*(mov|lea|movzx|movsx)\s+" + re.escape(reg) + r"\s*,\s*(.+)$", t, re.I)
+        if w:
+            op, rhs = w.group(1).lower(), w.group(2).strip()
+            if op == "lea":
+                return "stack" if _STACK_MEM.search(rhs) else "nonstack"   # else global/other lea
+            if rhs.startswith("[") or "[" in rhs:     # a memory load: a pointer VALUE, not &frame
+                return "nonstack"
+            nxt = rhs.rstrip(",").lower()
+            if nxt in _X86_REGS:                       # reg-to-reg: keep tracing the source
+                reg = nxt; hops -= 1; i -= 1; continue
+            return "nonstack"                          # immediate / global label
+        if reg in ("rax", "eax") and re.match(r"\s*call\b", t, re.I):
+            return "nonstack"                          # destination is a call return value (heap/…)
+        if _ARITH.match(t) and re.match(r"\s*\w+\s+" + re.escape(reg) + r"\b", t, re.I):
+            return "unknown"                           # computed without clear pointer provenance
+        i -= 1
+    return "unknown"
+
+
+def _is_x86(arch: str) -> bool:
+    a = (arch or "").lower()
+    return a.startswith("x86") or a in ("i386", "i486", "i586", "i686", "amd64", "x64", "x86_64")
+
+
+def _copy_dest_class(ir: dict, site_addr, bits: int, arch: str = "x86") -> str:
     """Classify the destination of an unbounded copy at `site_addr` as 'stack', 'nonstack', or
     'unknown', by reading the disassembly leading up to the call.
 
     32-bit cdecl: the destination is the last value written to [esp] before the call (`mov [esp], r`
-    or `push r`); 64-bit SysV: it is rdi. In both cases we then look at how that register was set:
-    a `lea` from a stack slot -> 'stack'; a memory load (a pointer value, or a `[arg_*]`) -> the
-    destination is not the stack frame -> 'nonstack'; anything we cannot resolve in the block ->
-    'unknown' (kept, so we never turn a real bug into a false negative)."""
+    or `push r`); 64-bit SysV: it is rdi. From there `_dest_reg_class` traces the register. Anything
+    unresolved stays 'unknown' (kept, so a real bug is never turned into a false negative).
+
+    The register/ABI patterns are x86-specific; on any other architecture this returns 'unknown'
+    (keep) so the gate never suppresses a finding it cannot actually reason about."""
+    if not _is_x86(arch):
+        return "unknown"
     site = _naddr(site_addr)
     if not ir or site is None:
         return "unknown"
-    # gather the instructions of the block that contains the call, up to and including it
     seq = None
     for b in ir.get("blocks", []) or []:
         ins = b.get("instructions") or []
         addrs = [_naddr(i.get("addr")) for i in ins]
         if site in addrs:
-            cut = addrs.index(site)
-            seq = ins[:cut + 1]
+            seq = ins[:addrs.index(site) + 1]
             break
     if not seq:
         return "unknown"
     texts = [(i.get("text") or "") for i in seq]
-    # identify the destination register
     if bits == 64:
-        dreg = _DEST_REG64
-    else:
-        # 32-bit: find the last `mov dword [esp], <X>` or `push <X>` before the call. If <X> is a
-        # register, trace it; if it is a global/immediate (obj./str./sym./0x...), the destination is
-        # a static buffer, not the stack frame -> nonstack.
-        dreg = None
-        for t in reversed(texts[:-1]):
-            m = re.search(r"mov\s+(?:dword )?\[esp\],\s*(\S+)", t, re.I) \
-                or re.search(r"^\s*push\s+(\S+)\s*$", t, re.I)
-            if m:
-                rhs = m.group(1).strip()
-                if rhs.lower() in _X86_REGS:
-                    dreg = rhs; break
-                return "nonstack"                    # global / immediate destination
-        if dreg is None:
-            return "unknown"
-    # walk backward for the last instruction that sets dreg
-    for t in reversed(texts[:-1]):
-        # `... <dreg>` as the write target: `mov <dreg>, ...` / `lea <dreg>, ...`
-        m = re.match(r"\s*(mov|lea)\s+" + re.escape(dreg) + r"\s*,", t, re.I)
-        if not m:
-            continue
-        if _LEA_STACK.search(t):
-            return "stack"
-        if _MOV_LOAD.search(t):
-            return "nonstack"                        # loaded a pointer value / an arg pointer
-        # reg-to-reg or lea of a non-stack expression: cannot be sure -> unknown
-        return "unknown"
+        return _dest_reg_class(texts, _DEST_REG64)
+    # 32-bit: the destination is the last value written to [esp] (or pushed) before the call.
+    for j in range(len(texts) - 2, -1, -1):
+        t = texts[j].split(";")[0]
+        m = re.search(r"mov\s+(?:dword )?\[esp\],\s*(\S+)", t, re.I) \
+            or re.search(r"^\s*push\s+(\S+)\s*$", t, re.I)
+        if m:
+            rhs = m.group(1).strip().lower()
+            if rhs in _X86_REGS:
+                return _dest_reg_class(texts[:j + 1], rhs)
+            return "nonstack"                          # global / immediate destination
     return "unknown"
 
 
@@ -205,7 +221,7 @@ def stack_buffer_overflow(ctx: DetectContext):
             # frame is a stack smash. A destination that is provably a caller/heap pointer
             # ('nonstack') is dropped here; 'stack' and 'unknown' are kept, so we never turn a real
             # bug into a false negative when the disassembly is too complex to resolve.
-            if ir is not None and _copy_dest_class(ir, site, ctx.bits) == "nonstack":
+            if ir is not None and _copy_dest_class(ir, site, ctx.bits, ctx.arch) == "nonstack":
                 continue
             sites_by_name[n].append(site)
         for n in sorted(sites_by_name):
