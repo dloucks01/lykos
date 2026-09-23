@@ -9,7 +9,10 @@ from .detectors import DETECTORS, DetectContext, correlate
 
 DETECT_STAGE = "detect_cwe"
 TOOL = "detect"
-TOOL_VERSION = "detect-1"
+# -2: CWE-121 is now gated on the copy destination resolving to the stack frame (dropping
+# arena/heap/global-destination false positives). Bump invalidates the content-addressed cache so
+# a target detected under the old logic is re-analyzed instead of reprojecting stale findings.
+TOOL_VERSION = "detect-2"
 
 
 # Attacker-influenced dereference. Every other detector keys on a CALL, so this whole class
@@ -297,21 +300,29 @@ def detect_stage(ctx) -> dict:
     # can say which code is the program's own, detection listens to it -- the same attribution
     # coverage uses. When it cannot (stripped, no local symbols), nothing is filtered.
     functions, edges, dropped = _program_only(ctx, target, functions)
-    # hydrate decompiler stack frames (heavy; omitted from the list view) for size-aware detection
+    # hydrate decompiler stack frames + per-function IR (heavy; omitted from the list view) for
+    # size-aware detection and call-site destination analysis (the CWE-121 stack-dest gate). Both
+    # come from the same full-function load, so we do it once here and reuse it for the taint pass.
     frames = {}
+    func_irs = {}
     for f in functions:
         if not f.blocks:
             continue
         full = fdao.get(f.id)
-        if full and full.frame and (full.frame.get("vars") or full.frame.get("params")):
+        if not full:
+            continue
+        if full.frame and (full.frame.get("vars") or full.frame.get("params")):
             frames[f.addr] = full.frame
+        if full.ir:
+            func_irs[f.addr] = full.ir
 
     dctx = DetectContext(
         target_id=target.id, case_id=target.case_id,
         call_edges=edges,
         strings=StringDAO(ctx.conn).list_by_target(target.id),
         functions=functions,
-        mitigations=target.mitigations or {}, frames=frames)
+        mitigations=target.mitigations or {}, frames=frames,
+        func_irs=func_irs, bits=int(getattr(target, "bits", 0) or 0))
 
     ctx.progress(msg="running CWE detectors")
     # Two detectors are OPT-IN, and the reason is measured rather than felt. On jhead they are
@@ -340,15 +351,10 @@ def detect_stage(ctx) -> dict:
     cands = correlate(cands, dctx)
 
     # inter-procedural data-flow taint over P-Code: flag sink sites whose argument
-    # registers carry tainted data (across function boundaries), and upgrade findings.
+    # registers carry tainted data (across function boundaries), and upgrade findings. Reuse the
+    # per-function IR already hydrated above instead of loading every function a second time.
     ctx.progress(msg="data-flow taint analysis (inter-procedural)")
-    func_irs = {}
-    for f in dctx.functions:
-        if not f.blocks:
-            continue
-        full = fdao.get(f.id)
-        if full and full.ir:
-            func_irs[f.addr] = full.ir
+    func_irs = dctx.func_irs
     entry_seeds = entry_seed_params(dctx.functions, dctx.frames)   # argv/envp at main
     # A shared library has no `main`, so that returns nothing and the data-flow channel starts
     # from SOURCES alone -- which for a library that is handed its input by a caller means it

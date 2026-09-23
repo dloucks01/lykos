@@ -30,6 +30,8 @@ class DetectContext:
     functions: list = field(default_factory=list)
     mitigations: dict = field(default_factory=dict)   # target's mitigation flags (triage)
     frames: dict = field(default_factory=dict)        # func addr -> stack frame (from decompiler)
+    func_irs: dict = field(default_factory=dict)      # func addr -> IR {blocks,edges} (call-site disasm)
+    bits: int = 0                                     # target word size (32/64), for arg-passing ABI
 
 
 def _cand(cwe, title, severity, detector, evidence, *, function_addr=None,
@@ -71,6 +73,96 @@ def dangerous_api(ctx: DetectContext):
 # Copies with no length bound; a fixed stack buffer + one of these is the classic smash.
 _UNBOUNDED_COPY = {"strcpy", "strcat", "gets", "sprintf", "vsprintf", "scanf", "sscanf"}
 
+# For CWE-121 we require the copy's DESTINATION to actually be the stack frame. Without this a
+# function that owns any stack buffer AND calls strcpy is flagged even when the strcpy writes to a
+# caller-provided/heap pointer -- e.g. VxWorks _hostTblSearchByName2 copies into a 64-byte slot it
+# sub-allocates from a caller buffer, not its stack, yet was reported as a 16-byte stack smash.
+_ADDR_RE = _re_addr = re.compile(r"0x[0-9a-fA-F]+")
+
+
+def _naddr(a):
+    if a is None:
+        return None
+    if isinstance(a, int):
+        return a
+    s = str(a)
+    try:
+        return int(s, 16) if s.lower().startswith("0x") else int(s)
+    except ValueError:
+        return None
+
+
+# operand that is the ADDRESS OF a stack local: `lea r, [ebp-N]` / `[rbp-N]` / `[esp+N]` / `[var_..]`.
+# A positive ebp/rbp offset is an incoming argument (ebp+8, ...), NOT a local buffer.
+_LEA_STACK = re.compile(r"\blea\b[^,]*,\s*(?:dword |qword )?\[\s*"
+                        r"(?:var_[0-9a-fh]+|"
+                        r"(?:e|r)bp\s*-\s*0x[0-9a-f]+|"
+                        r"(?:e|r)sp\s*[+\-]\s*0x[0-9a-f]+)", re.I)
+# a memory LOAD into a register: `mov r, [..]` -- the destination is then a *pointer value*, wherever
+# it points, not the address of a stack slot. `[arg_..]` is explicitly a caller argument.
+_MOV_LOAD = re.compile(r"\bmov\b[^,]*,\s*(?:dword |qword )?\[", re.I)
+_DEST_REG64 = "rdi"                                   # SysV first integer arg
+_X86_REGS = {"eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp",
+             "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
+             "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"}
+
+
+def _copy_dest_class(ir: dict, site_addr, bits: int) -> str:
+    """Classify the destination of an unbounded copy at `site_addr` as 'stack', 'nonstack', or
+    'unknown', by reading the disassembly leading up to the call.
+
+    32-bit cdecl: the destination is the last value written to [esp] before the call (`mov [esp], r`
+    or `push r`); 64-bit SysV: it is rdi. In both cases we then look at how that register was set:
+    a `lea` from a stack slot -> 'stack'; a memory load (a pointer value, or a `[arg_*]`) -> the
+    destination is not the stack frame -> 'nonstack'; anything we cannot resolve in the block ->
+    'unknown' (kept, so we never turn a real bug into a false negative)."""
+    site = _naddr(site_addr)
+    if not ir or site is None:
+        return "unknown"
+    # gather the instructions of the block that contains the call, up to and including it
+    seq = None
+    for b in ir.get("blocks", []) or []:
+        ins = b.get("instructions") or []
+        addrs = [_naddr(i.get("addr")) for i in ins]
+        if site in addrs:
+            cut = addrs.index(site)
+            seq = ins[:cut + 1]
+            break
+    if not seq:
+        return "unknown"
+    texts = [(i.get("text") or "") for i in seq]
+    # identify the destination register
+    if bits == 64:
+        dreg = _DEST_REG64
+    else:
+        # 32-bit: find the last `mov dword [esp], <X>` or `push <X>` before the call. If <X> is a
+        # register, trace it; if it is a global/immediate (obj./str./sym./0x...), the destination is
+        # a static buffer, not the stack frame -> nonstack.
+        dreg = None
+        for t in reversed(texts[:-1]):
+            m = re.search(r"mov\s+(?:dword )?\[esp\],\s*(\S+)", t, re.I) \
+                or re.search(r"^\s*push\s+(\S+)\s*$", t, re.I)
+            if m:
+                rhs = m.group(1).strip()
+                if rhs.lower() in _X86_REGS:
+                    dreg = rhs; break
+                return "nonstack"                    # global / immediate destination
+        if dreg is None:
+            return "unknown"
+    # walk backward for the last instruction that sets dreg
+    for t in reversed(texts[:-1]):
+        # `... <dreg>` as the write target: `mov <dreg>, ...` / `lea <dreg>, ...`
+        m = re.match(r"\s*(mov|lea)\s+" + re.escape(dreg) + r"\s*,", t, re.I)
+        if not m:
+            continue
+        if _LEA_STACK.search(t):
+            return "stack"
+        if _MOV_LOAD.search(t):
+            return "nonstack"                        # loaded a pointer value / an arg pointer
+        # reg-to-reg or lea of a non-stack expression: cannot be sure -> unknown
+        return "unknown"
+    return "unknown"
+
 
 @register_detector
 def stack_buffer_overflow(ctx: DetectContext):
@@ -106,8 +198,15 @@ def stack_buffer_overflow(ctx: DetectContext):
         # silently dropped the rest. Iterate the distinct sink names (sorted, for a stable
         # run), emitting a candidate per call site; the per-name dedup_key still merges
         # occurrences across functions into one finding per unbounded-copy routine.
+        ir = ctx.func_irs.get(addr)
         sites_by_name: dict = defaultdict(list)
         for n, site in sinks:
+            # Gate on the copy DESTINATION: only a copy whose destination resolves to this stack
+            # frame is a stack smash. A destination that is provably a caller/heap pointer
+            # ('nonstack') is dropped here; 'stack' and 'unknown' are kept, so we never turn a real
+            # bug into a false negative when the disassembly is too complex to resolve.
+            if ir is not None and _copy_dest_class(ir, site, ctx.bits) == "nonstack":
+                continue
             sites_by_name[n].append(site)
         for n in sorted(sites_by_name):
             for site in sites_by_name[n]:
