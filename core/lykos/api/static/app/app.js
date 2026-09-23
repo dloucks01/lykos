@@ -8,7 +8,7 @@ import { api, waitForRun } from "./api.js";
 import { runAutopilotCase, newController, cancel as cancelAutopilot, coverageOf } from "./autopilot.js";
 import { rankFindings, pocsForFinding, fmtTime, progressText, stageLabel, dedupeFindings, buildRunLog } from "./util.js";
 import {
-  html, DropZone, TargetSummary, ProgressLog, FindingCard, EmptyResults, Spinner, UnavailablePanel, SystemMap, CoveragePanel, CodeView, PipelinePlan,
+  html, DropZone, TargetSummary, ProgressLog, FindingCard, EmptyResults, Spinner, UnavailablePanel, SystemMap, CoveragePanel, CodeView, PipelinePlan, EvidenceModal,
 } from "./components.js";
 
 const stageLabelSafe = (s) => (s ? stageLabel(s) : "");
@@ -84,6 +84,7 @@ function App() {
   const [coverage, setCoverage] = useState({});
   const [verifications, setVerifications] = useState({});  // input_sha -> replay review result
   const [codeFn, setCodeFn] = useState(null);       // {fn, finding} for the open code view
+  const [evidence, setEvidence] = useState(null);   // {finding, focus} for the evidence inspector
   const [bg, setBg] = useState(null);               // server-side background autopilot status
   // The effective theme: an explicit choice (data-theme, set pre-paint from localStorage) wins,
   // else the OS preference. The toggle flips it, applies it to <html>, and persists the choice.
@@ -544,7 +545,8 @@ function App() {
             ${ranked.length ? ranked.map((f) => html`
               <${FindingCard} key=${f.id} finding=${verByFinding[f.id] ? { ...f, verification: verByFinding[f.id] } : f}
                 pocs=${pocsFor(f)} mitigations=${mitOf(f)}
-                reportUrl=${api.reportUrl} artifactUrl=${api.artifactUrl} onViewCode=${viewCode} />
+                reportUrl=${api.reportUrl} artifactUrl=${api.artifactUrl} onViewCode=${viewCode}
+                onInspect=${(finding, focus) => setEvidence({ finding, focus })} />
             `) : html`<${EmptyResults} ran=${ran} />`}
           </section>
         ` : null}
@@ -557,6 +559,10 @@ function App() {
         onNavigate=${(name) => followCall(name, codeFn.targetId, codeFn.crumbs)}
         onFollowCaller=${(xc) => followCrossCaller(xc, codeFn.crumbs)}
         onClose=${() => setCodeFn(null)} />` : null}
+
+      ${evidence ? html`<${EvidenceModal} finding=${evidence.finding} focus=${evidence.focus}
+        pocs=${pocsFor(evidence.finding)} artifactUrl=${api.artifactUrl}
+        onViewCode=${viewCode} onClose=${() => setEvidence(null)} />` : null}
     </div>`;
 }
 
