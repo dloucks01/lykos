@@ -124,6 +124,23 @@
   .plan-step.step-error .plan-ico { color: var(--bad); }
   .plan-step.step-cancelled { color: var(--warn); }
 
+  /* Compact pipeline summary (progress bar + current step + dot strip; NOT a stage list) */
+  .plan.compact { padding: 12px 16px; }
+  .plan-bar { height: 6px; background: var(--panel-2); border: 1px solid var(--line); border-radius: 5px; overflow: hidden; }
+  .plan-fill { height: 100%; background: var(--accent); border-radius: 5px; transition: width .35s; }
+  .plan-fill.err { background: var(--bad); }
+  .plan-now { margin: 8px 0 6px; font-size: .86rem; min-height: 1.2em; }
+  .plan-nowok { color: var(--ok); } .plan-nowerr { color: var(--bad); }
+  .plan-dots { display: flex; flex-wrap: wrap; gap: 5px; }
+  .plan-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--line); cursor: help;
+    transition: background .2s, transform .2s; }
+  .plan-dot.dot-done { background: var(--ok); }
+  .plan-dot.dot-running { background: var(--run); transform: scale(1.35); box-shadow: 0 0 0 3px color-mix(in srgb, var(--run) 25%, transparent); }
+  .plan-dot.dot-error { background: var(--bad); }
+  .plan-dot.dot-skipped { background: color-mix(in srgb, var(--faint) 40%, transparent); }
+  .plan-dot.dot-cancelled { background: var(--warn); }
+  .plan-dot.dot-pending { background: var(--line); }
+
   /* Buttons */
   .btn { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--line);
     background: var(--panel-2); color: var(--ink); border-radius: 8px; padding: 8px 14px;
