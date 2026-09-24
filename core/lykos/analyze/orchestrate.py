@@ -43,6 +43,7 @@ _TARGET = {
     "build_poc": ("..analyze.poc", "enqueue_build_poc"),
     "poc_primitive": ("..analyze.poc", "enqueue_primitive"),
     "build_exploit": ("..analyze.poc", "enqueue_exploit"),
+    "synthesize_poc": ("..analyze.poc", "enqueue_synthesize"),
     "synthesize_injection": ("..analyze.poc", "enqueue_inject"),
     "behavior_trace": ("..analyze.debug", "enqueue_behavior_trace"),
     "dynamic_taint": ("..analyze.debug", "enqueue_taint"),
@@ -56,7 +57,8 @@ _CASE = {
 # Stages whose enqueue-fn takes NO params. root_cause/build_poc/poc_primitive are NOT here: they
 # require params["input_sha"] (the crashing input), which the prove loop threads in -- listing
 # them dropped that input and every one failed with "requires params.input_sha".
-_NO_PARAMS = {"disassemble", "detect_cwe", "heap_trace", "oob_index", "chain_primitive"}
+_NO_PARAMS = {"disassemble", "detect_cwe", "heap_trace", "oob_index", "chain_primitive",
+              "synthesize_poc"}
 _CASE_NO_PARAMS = {"link_case", "ipc_model", "cross_taint"}
 
 _TERMINAL = {"done", "cancelled", "error"}
@@ -116,7 +118,7 @@ _PLAN_STAGES = [
     ("coverage_fuzz", "Coverage fuzzing"), ("directed_fuzz", "Directed fuzzing"),
     ("heap_check", "Heap checks"), ("heap_trace", "Heap primitives"),
     ("oob_index", "Array-index probes"), ("chain_primitive", "Primitive chaining"),
-    ("concolic", "Concolic execution"),
+    ("concolic", "Concolic execution"), ("synthesize_poc", "Synthesize PoC"),
     ("root_cause", "Root-cause"), ("build_poc", "Build PoC"),
     ("poc_primitive", "PoC primitive"), ("build_exploit", "Build exploit"),
     ("behavior_trace", "Behaviour trace"), ("dynamic_taint", "Dynamic taint"),
@@ -371,6 +373,17 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict, stop: t
                 # reuses concolic's solved inputs as seeds -- so the fuzzer explores AROUND the
                 # guarded branches concolic just unlocked, instead of the run ending at them.
                 _run_target_stage(store, t, "directed_fuzz", status, stop, {**dyn, "seed": 4242})
+                crashes = _distinct_crashes(store, tid)
+            # Static-overflow synthesis: an unbounded stack overflow (gets(), a size-less strcpy,
+            # scanf("%s")) needs a long, NEWLINE-FREE payload that blind mutation almost never
+            # generates -- a stray 0x0a ends gets() before the frame is smashed -- so the fuzzer
+            # reports full block coverage and zero crashes on a binary whose bug is glaringly
+            # static. Derive the overflow straight from the recovered stack frame and detonate once
+            # over the channel the binary reads; on a fault it files a verified L1 crash exactly
+            # like a fuzzer-found one, which the exploit ladder below then builds into L2/L3. The
+            # stage no-ops when no stack buffers were recovered, so it is safe to run generally.
+            if not crashes and not stop.is_set():
+                _run_target_stage(store, t, "synthesize_poc", status, stop)
                 crashes = _distinct_crashes(store, tid)
             # Prove each distinct crash.
             for cr in crashes:

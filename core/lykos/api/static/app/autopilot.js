@@ -44,7 +44,9 @@ const PIPELINE = [
   { stage: "extract_secrets", phase: "enrich" },
   { stage: "synthesize_injection", phase: "enrich" },       // package a command/format injection
   { stage: "synthesize_secret", phase: "enrich" },          // package a recovered credential
-  { stage: "synthesize_poc", onlyIfNoCrash: true, phase: "enrich" },
+  // synthesize_poc runs BEFORE the prove phase (handled explicitly below), not here: a crash it
+  // synthesises has to feed root_cause/build_poc/build_exploit to reach L2/L3, and an enrich-phase
+  // run happens after those have already passed.
 ];
 
 export function newController() {
@@ -354,6 +356,19 @@ export async function runAutopilot(ctrl, emit, { targetId, caseId, silentDone = 
       emit({ kind: "info", message: "Re-fuzzing from concolic's solved inputs to explore the newly-reached paths." });
       await run("directed_fuzz", { ...dynParams, ...DEEP, seed: (Number(dynParams.seed) || 1337) + 2 });
     }
+  }
+
+  // ---- Static-overflow synthesis: when the search produced NO crash, an unbounded stack
+  //       overflow (gets(), scanf("%s"), a size-less strcpy) is the likeliest reason it is invisible
+  //       to fuzzing -- the overflow needs a long, NEWLINE-FREE payload that blind mutation almost
+  //       never generates, so the fuzzer reports full coverage and zero crashes on a binary whose
+  //       bug is glaringly static. Derive the overflow straight from the recovered stack frame and
+  //       sweep EVERY channel (no pinned input_mode: the guess ranks a file parser first, but the
+  //       gets()/scanf() overflow is on stdin). Runs before the prove phase so a resulting L1 crash
+  //       flows into root_cause -> build_poc -> build_exploit and reaches L2/L3. ----
+  if (!(await crashingResults(targetId)).length && canRun("synthesize_poc")) {
+    emit({ kind: "info", message: "No crash from the search — synthesising the overflow from the recovered stack frame (sweeping every input channel)." });
+    await run("synthesize_poc", {});
   }
 
   // ---- Phase 2: prove EVERY distinct crash, not just the first. A confirmed crash with no PoC

@@ -40,11 +40,23 @@ from .serializers import (
 _INMEM_LIMIT = 16 << 20
 
 
-def _maybe_extract_bundle(upload: Path, td: Path):
+# Archive formats that ARE themselves an analysable target, not a bundle to unpack: a .jar/.war/
+# .ear/.aar is JVM bytecode and a .apk is an Android package -- all zips, but ingest() analyses
+# them whole. Unpacking one yields only .class/resource files and no native binary, so a valid
+# upload was refused with "no analysable binary found in the bundle". Match on the name, since the
+# magic is just "a zip".
+_SELF_CONTAINED_ARCHIVES = (".jar", ".war", ".ear", ".aar", ".apk")
+
+
+def _maybe_extract_bundle(upload: Path, td: Path, filename: str = ""):
     """If `upload` is a zip/tar archive (a zipped challenge bundle), extract it SAFELY to a temp
     directory and return that dir for ingest() to treat as a bundle; otherwise return None. Path
-    traversal / absolute members are dropped so an archive can never write outside the temp dir."""
+    traversal / absolute members are dropped so an archive can never write outside the temp dir.
+    A self-contained JVM/Android archive (.jar/.apk/...) is left alone -- it IS the target. The
+    real name comes in via `filename`, since `upload` is a streamed temp path (part.bin)."""
     upload = Path(upload)
+    if Path(filename or upload.name).suffix.lower() in _SELF_CONTAINED_ARCHIVES:
+        return None
     dest = td / "bundle"
     try:
         if zipfile.is_zipfile(upload):
@@ -640,7 +652,7 @@ class EndpointsMixin:
                 # A challenge is often a BUNDLE: binary + its patched loader + libc (+ flag),
                 # zipped up. Extract it and ingest the DIRECTORY so ingest() finds the main binary
                 # and keeps the loader/libc as deps -- otherwise the binary can't run in analysis.
-                bundle = _maybe_extract_bundle(upload, tdp)
+                bundle = _maybe_extract_bundle(upload, tdp, safe_name)
                 try:
                     if bundle is not None:
                         target = ingest(s, cid, bundle)     # dir -> main binary + companion deps

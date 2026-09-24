@@ -20,7 +20,7 @@ import os
 from ...db.dao import CallEdgeDAO, DynResultDAO, FindingDAO, PocDAO, TargetDAO
 from ...jobs.registry import register_stage
 from ..dynamic import sandbox
-from ..dynamic.stage import crash_dedup_key, crash_finding_candidate
+from ..dynamic.stage import asan_defect_key, crash_dedup_key, crash_finding_candidate
 from . import bundle, primitive
 from .capture import modes_for
 from .primitive_stage import _hydrate_frames
@@ -98,6 +98,17 @@ def synthesize_stage(ctx) -> dict:
 
 def _finalize(ctx, target, target_bytes, payload, mode, run_argv, res, cand, off, slack, tried):
     input_sha = ctx.put_artifact("synth-crash-input", data=payload)
+    # Record the fault as a first-class crashing dyn_result, exactly like a fuzzer-found crash. The
+    # autopilot's prove/exploit phase selects crashes from the dyn_result table (distinct_crashes),
+    # so without this row the synthesized L1 crash is invisible to root_cause -> build_poc ->
+    # build_exploit and the ladder stalls at L1 instead of climbing to L2/L3. Written before the
+    # fault_pc lookup below so it resolves against this row.
+    defect_key = asan_defect_key(res.stderr) if res.signal_name == "SIGABRT" else None
+    DynResultDAO(ctx.conn).insert(
+        target.id, target.case_id, run_id=ctx.run_id, input_sha=input_sha, input_mode=mode,
+        argv=list(run_argv), signal=res.signal, signal_name=res.signal_name, crashed=True,
+        isolation=res.isolation, duration_ms=res.duration_ms, fault_pc=res.fault_pc,
+        defect_key=defect_key, note="synthesized from the static stack frame; no fuzzing")
     detail = (f"synthesized from static CWE-121: {cand['size']}-byte buffer {cand['buffer']} at "
               f"offset {off}"
               + (f" (predicted {cand['offset']}{'+' if slack > 0 else ''}{slack if slack else ''})"

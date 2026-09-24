@@ -63,6 +63,13 @@ def test_synthesize_overflow_poc_without_fuzzing(store, case, pool, gcc, tmp_pat
     assert backed
     assert any("synthesized from static" in str(e.get("detail", ""))
                for f in backed for e in (f.evidence or []))
+    # The synthesized crash is recorded as a first-class crashing dyn_result, so the autopilot's
+    # prove/exploit phase (which selects crashes from dyn_results) can build L2/L3 on it instead of
+    # stalling at L1. Regression: synthesis used to file only the Poc + Finding, never the crash row.
+    from lykos.db.dao import DynResultDAO
+    crashes = [d for d in DynResultDAO(store.conn).list_by_target(target.id) if d.crashed]
+    assert crashes and crashes[0].input_sha == pocs[0].input_sha
+    assert crashes[0].input_mode == "stdin"        # read(0, ...) overflow: swept to the stdin channel
 
 
 def test_synthesize_reports_when_no_frame(store, case, pool, gcc, tmp_path):
