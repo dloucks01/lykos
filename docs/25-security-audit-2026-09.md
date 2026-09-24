@@ -21,10 +21,13 @@ evidence-backed (code quoted by the reviewer) but not independently re-run.
 
 ---
 
-> **Security findings H1–H3 (arbitrary local-file read via `#include`, Classic-UI stored XSS,
-> cross-case secret exfil) and the auth/tar-filter items were de-scoped by the owner** — lykos is
-> an authorized, air-gapped, single-analyst tool and that residual risk is accepted. They are
-> intentionally omitted below. The remaining items are robustness/availability/correctness bugs.
+> **Owner scope.** In the first pass, security findings H1–H3 (arbitrary local-file read via
+> `#include`, Classic-UI stored XSS, cross-case secret exfil) and the auth/tar-filter items were
+> de-scoped — lykos is an authorized, air-gapped, single-analyst tool and that residual risk is
+> accepted. The second audit (2026-09-23, below) revisited this: the **Classic-UI XSS** and the
+> **tar `filter="data"`** hardening were fixed on the owner's request; the `#include` compile-time
+> file read (would need a compiler sandbox), the qemu gdbstub bind, and the no-auth / shared-host
+> posture (M4) remain accepted. The H4–H10 / M-set items below are robustness/correctness bugs.
 
 ## HIGH
 
@@ -187,3 +190,86 @@ pypcode `.so` tag; `die` on mismatch or when there is nothing to match against b
 4. **Folder/whole-project source** — build an uploaded source TREE (detect Makefile/CMake, inject
    sanitizers, sandbox the build) and analyse the produced binaries; minimal-viable first
    (tarball → Makefile/plain-C → sandboxed sanitized build → existing pipeline). See chat notes.
+
+---
+
+---
+
+## Second audit + remediation (2026-09-23)
+
+A whole-codebase re-audit (11 parallel module reviews with per-finding source verification) on the
+`process-gates` branch, followed by remediation. It confirmed the first pass's fixes still hold and
+surfaced issues that pass did not — chiefly on the new MSan-detonation code and in the
+over-claim / PoC-soundness layer — plus the architectural work the first pass deferred. Full suite
+after remediation: **1379 passed, 17 skipped**; four regression tests added.
+
+### Correctness & over-claim (the product's core integrity promise)
+- **`poc/primitive.py` `marker_confirmed`** accepted the IP-control sentinel at *any* offset in the
+  captured stack window; since the overflow payload contains the sentinel and lands on the stack, a
+  wrong offset guess could "confirm" a control-flow hijack. Restricted to the return-address slot.
+- **`poc/primitive_stage.py`** filed a confirmed L2 instruction-pointer-control primitive as
+  `kind="rce" status="demonstrated"`. Relabelled: demonstrated **control-flow-hijack** + **RCE
+  potential** (L3 upgrades RCE to demonstrated only on a working exploit).
+- **`poc/leak.py`** searched its success marker over pre-payload output; now post-payload only, with
+  a fresh confirmation deadline.
+- **`link/detonate.py`** cross-boundary blame now requires a *confirmed* baseline
+  (`cross_boundary_confirmed`) before minting a finding; the fast search still uses the provisional
+  signal. Also fixed a PIPE-fill deadlock (undrained child stdout/stderr → DEVNULL).
+
+### Host safety on the source path
+- **`fuzz/stage.py` `msan_detonate`** ran the attacker-compiled MSan binary as a bare host
+  subprocess. Now runs under bubblewrap (`isolate_prefix` + `run_reaped`), with a wall-clock budget,
+  cancel check, and `base_argv`/`@@` handling; a latent `put_artifact(...).sha256` bug it inherited
+  was fixed in passing.
+
+### Detectors & parsing
+- `detect/stage.py`: `_STATIC_DETECTORS` listed `"secret"` but the detector emits
+  `hardcoded_secrets` (findings never reset → orphan accumulation); `toctou_race` added so its sites
+  reset; `_intover_candidates` resets `produced` per basic block (was per instruction → never fired).
+- `elf.py`: SHN_XINDEX handled (was misreporting a binary as stripped).
+- `native_re.py`: backend chosen by resolved CLI (rizin) not data presence — a rizin target that
+  recovered no stackvars no longer injects `afvj` and aborts the whole pass; a per-batch timeout no
+  longer kills the exhaustive run.
+- `firmware/{carve,headerless}.py`: xz/bz2 decompression bounded (was uncapped); the arch-score scan
+  bounded to a 16 MB window.
+
+### Data layer
+- `casestore._safe_extract`: rejects symlink/hardlink members and uses `filter="data"` (tar
+  traversal on import); export normalises live queue state so an imported case has no re-executable
+  phantom jobs.
+- Schema FK: a case that owns a cache-shared artifact could not be deleted (`IntegrityError`);
+  `CaseDAO.delete` now re-homes such artifacts to their surviving referrer first.
+- Removed premature bare `conn.commit()` from `PocDAO.set_finding` and three link stages
+  (autocommit connection — a bare commit would end an enclosing transaction early).
+
+### UI
+- `classic.html`: `entry_point` / `linking` / `toolchain_hint` (the last from the attacker ELF
+  `.comment`) now `esc()`-escaped (stored XSS, previously de-scoped, fixed on request).
+
+### Observability (make failures visible)
+- 22 broad silent `except` handlers across the analysis layer now `_log.debug(..., exc_info=True)`;
+  tight per-op loops and genuine best-effort spots (kill/reap/cleanup/telemetry/probes) left silent.
+- `orchestrate._wait` cancels the run on its poll-deadline (was orphaning a still-running job);
+  `eval/harness` surfaces an ignored `wait_idle` timeout as indeterminate.
+
+### Architecture
+- **DAO → analysis decoupled.** The end-effect merge policy moved to a new leaf module
+  `lykos/effects.py`; `analyze.debug.exploitability` re-exports it and `db.dao` imports from the
+  leaf, so `db/` no longer imports `analyze/`.
+- **`server.py` God-object split** (1588 → ~790 lines): 27 endpoint methods → `EndpointsMixin`
+  (`api/endpoints.py`); serializers + route constants → `api/serializers.py`; route table + static
+  reader → `api/routes.py`; Autopilot registry → `AutopilotMixin` (`api/autopilot.py`). Behaviour
+  unchanged (full API suite).
+- **Request-body streaming (M3).** `_read_body_to_file` + `multipart.extract_file_to` stream large
+  uploads to disk instead of a 1 GiB in-memory buffer; a 60 s socket timeout covers slowloris.
+- **Worker wedge reclaim (the H9 residual).** A stage stuck in an uninterruptible in-process call
+  held its concurrency slot forever. Each execution now gets a release-once slot; a supervisor
+  watchdog reclaims it and spawns a replacement worker past `deadline + wedge_grace`, so the pool
+  self-heals. (Full process-per-stage isolation, JE-09, remains a larger change — warranted only if
+  non-subprocessed in-process stages ever become common; the heavy engines already run under the
+  killable `run_subprocess`.)
+
+### Still accepted / deferred
+- **Owner-de-scoped:** the `#include` compile-at-ingest sandbox, the qemu gdbstub loopback bind, the
+  no-auth / shared-host posture (M4), and the first pass's deferred MEDIUM DoS set (M1–M4, M13–M15).
+- **Larger follow-up:** full process-per-stage isolation (JE-09).
