@@ -8,7 +8,7 @@ import { api, waitForRun } from "./api.js";
 import { runAutopilotCase, newController, cancel as cancelAutopilot, coverageOf } from "./autopilot.js";
 import { rankFindings, pocsForFinding, fmtTime, progressText, stageLabel, dedupeFindings, buildRunLog, buildVerdicts } from "./util.js";
 import {
-  html, DropZone, TargetSummary, ProgressLog, ConsolePanel, FindingCard, EmptyResults, Spinner, UnavailablePanel, SystemMap, CoveragePanel, CodeView, PipelinePlan, EvidenceModal, FunctionsModal, VerdictStrip, VerdictCard, AnalysisDrawer, ShellVerdict, ExploitsPanel, DrawerFacts,
+  html, DropZone, TargetSummary, ProgressLog, ConsolePanel, FindingCard, EmptyResults, Spinner, UnavailablePanel, SystemMap, CoveragePanel, CodeView, PipelinePlan, EvidenceModal, FunctionsModal, VerdictStrip, VerdictCard, AnalysisDrawer, ShellVerdict, ExploitsPanel, DrawerFacts, FunctionsPanel, StringsPanel, DisasmPanel, DiffPanel, CrashesPanel,
 } from "./components.js";
 
 let _conSeq = 0;
@@ -91,6 +91,11 @@ function App() {
   const [showCandidates, setShowCandidates] = useState(false); // triage: reveal speculative candidates
   const [activeTid, setActiveTid] = useState(null);   // the target focused in the workbench shell
   const [tab, setTab] = useState("findings");         // active workbench tab
+  const [funcsByT, setFuncsByT] = useState({});       // lazy per-target caches for the tab views
+  const [stringsByT, setStringsByT] = useState({});
+  const [dynByT, setDynByT] = useState({});
+  const [disasmFn, setDisasmFn] = useState(null);     // getFunction detail for the Disassembly tab
+  const [disasmSel, setDisasmSel] = useState({});     // targetId -> selected function id
   const [bg, setBg] = useState(null);               // server-side background autopilot status
   const [bgActivity, setBgActivity] = useState(null); // {msg, pct} live intra-stage progress
   const [consoleLines, setConsoleLines] = useState([]); // job.exec: tool commands + I/O
@@ -534,6 +539,25 @@ function App() {
     loadRecent();      // the analysis just finished now appears in the recent list
   }, [running, loadRecent]);
 
+  // Select a function to disassemble in the Disassembly tab: remember it per target, load its detail.
+  const selectDisasm = useCallback(async (fn) => {
+    setDisasmSel((c) => ({ ...c, [fn.target_id || (activeTid)]: fn.id }));
+    setDisasmFn(null);
+    try { setDisasmFn(await api.getFunction(fn.id)); }
+    catch (e) { setDisasmFn({ ...fn, decompiled: "(failed to load disassembly)" }); }
+  }, [activeTid]);
+
+  // Lazily fetch a tab's data the first time it is needed for the focused target (and always the
+  // crash rows, which gate the conditional Crashes tab). Cached per target so switching is instant.
+  const _at = activeTid || (targets[0] && targets[0].id);
+  useEffect(() => {
+    if (!_at) return;
+    const needFns = (tab === "functions" || tab === "disasm") && !funcsByT[_at];
+    if (needFns) api.functions(_at).then((fs) => setFuncsByT((c) => ({ ...c, [_at]: fs || [] }))).catch(() => setFuncsByT((c) => ({ ...c, [_at]: [] })));
+    if (tab === "strings" && !stringsByT[_at]) api.strings(_at, { limit: 2000 }).then((ss) => setStringsByT((c) => ({ ...c, [_at]: (ss && ss.items) || (Array.isArray(ss) ? ss : []) }))).catch(() => setStringsByT((c) => ({ ...c, [_at]: [] })));
+    if (!dynByT[_at]) api.dynresults(_at).then((ds) => setDynByT((c) => ({ ...c, [_at]: ds || [] }))).catch(() => setDynByT((c) => ({ ...c, [_at]: [] })));
+  }, [tab, _at, funcsByT, stringsByT, dynByT]);
+
   const ranked = dedupeFindings(rankFindings(findings));
   const topDemoId = ranked.find((f) => f.state === "poc-backed")?.id;
   const pocsFor = (f) => pocsForFinding(pocs, f.id, topDemoId);
@@ -592,11 +616,20 @@ function App() {
     ` : html`
       <button class="btn danger" onClick=${onCancel}>■ Stop</button>
     `}`;
-  // Data-driven tab set: a tab shows a count when it has content; empty analytical tabs are dimmed.
+  // Data-driven tab set: analytical tabs carry a count once their data has loaded; the Crashes tab
+  // appears only when a run reproduced a crash for the focused target.
+  const _atid = activeTarget && activeTarget.id;
+  const activeFuncs = _atid ? funcsByT[_atid] : null;
+  const activeStrings = _atid ? stringsByT[_atid] : null;
+  const activeCrashes = _atid ? (dynByT[_atid] || []).filter((d) => d.crashed) : [];
   const tabDefs = [
     { id: "findings", label: "Findings", n: activeRanked.length },
     { id: "exploits", label: "Exploits", n: activePocs.length },
-    { id: "functions", label: "Functions & call graph", modal: true },
+    { id: "functions", label: "Functions & call graph", n: activeFuncs ? activeFuncs.length : undefined },
+    { id: "disasm", label: "Disassembly" },
+    { id: "strings", label: "Strings", n: activeStrings ? activeStrings.length : undefined },
+    ...(activeCrashes.length ? [{ id: "crashes", label: "Crashes", n: activeCrashes.length }] : []),
+    { id: "diff", label: "Diff" },
     { id: "console", label: "Console", n: consoleLines.length },
   ];
 
@@ -677,8 +710,8 @@ function App() {
             <div class="wb-tabs">
               ${tabDefs.map((td) => html`<button key=${td.id}
                 class=${`wb-tab${tab === td.id ? " active" : ""}`}
-                onClick=${() => (td.modal ? browseFunctions(activeTarget && activeTarget.id) : setTab(td.id))}>
-                ${td.label}${td.n ? html`<span class="tab-n">${td.n}</span>` : null}
+                onClick=${() => setTab(td.id)}>
+                ${td.label}${td.n != null ? html`<span class="tab-n">${td.n}</span>` : null}
               </button>`)}
               ${caseId ? html`<span class="tab-exports">
                 <a class="btn small ghost" href=${api.reportUrl(caseId, "html")} target="_blank">HTML</a>
@@ -706,6 +739,22 @@ function App() {
               <div class="wb-panel">
                 <${ExploitsPanel} verdict=${activeVerdict} pocs=${activePocs} topFinding=${topDemoFinding} artifactUrl=${api.artifactUrl} />
               </div>
+            ` : tab === "functions" ? html`
+              <div class="wb-panel">
+                <${FunctionsPanel} functions=${activeFuncs} onOpen=${(fn) => openFunction(fn, _atid)} />
+              </div>
+            ` : tab === "disasm" ? html`
+              <div class="wb-panel">
+                <${DisasmPanel} functions=${activeFuncs} detail=${disasmFn}
+                  selectedId=${disasmSel[_atid]} loading=${disasmSel[_atid] && !disasmFn}
+                  onSelect=${(fn) => selectDisasm({ ...fn, target_id: _atid })} />
+              </div>
+            ` : tab === "strings" ? html`
+              <div class="wb-panel"><${StringsPanel} strings=${activeStrings} /></div>
+            ` : tab === "crashes" ? html`
+              <div class="wb-panel"><${CrashesPanel} crashes=${_atid ? dynByT[_atid] : null} artifactUrl=${api.artifactUrl} /></div>
+            ` : tab === "diff" ? html`
+              <div class="wb-panel"><${DiffPanel} targets=${targets} findings=${ranked} /></div>
             ` : tab === "console" ? html`
               <div class="wb-panel">
                 ${bg && bg.plan ? html`<${PipelinePlan} plan=${bg.plan} targetName=${bg.target_name} target=${bg.target} targets=${bg.targets} />` : null}
