@@ -259,12 +259,20 @@ tictactoe):
   under-read and desync the sequence. Validated end-to-end on a fully STRIPPED line-based libc
   double-free target → CWE-415 found with no symbols; chain files the L2 tcache recipe.
 
-Known gaps / next: **fixed-width input protocols** — dreamdiary1 reads inputs with fixed-width
-`read(0, buf, 4)` byte reads, not newline-delimited lines, so the line-based menu crawler desyncs on
-it (the PLT allocator tracing itself is correct); inferring per-read widths is the fix. **oob_index
-array-table id** still needs symbols (recover fixed-size global arrays from `.bss` + indexed access
-in the disasm). bad_grades (a stripped counted STACK overflow) reaches L1 via the fuzzer but stalls
-(no win). Also:
+- **Fixed-width input-protocol inference** (`heap_discover._read_width` + a fixed-width mode across
+  `menu.crawl_menu` / `_fill` / `menu_op_sequences`) — a target that reads scalars with
+  `read(0, buf, W)` (not fgets/scanf) consumes exactly W bytes per field regardless of newlines, so
+  a line-based `value\n` driver under-reads and desyncs every later field. `_read_width` recovers W
+  from the constant `mov edx, imm` lengths before `read@plt` calls (when no line reader is present);
+  the crawl and the op-sequences then pad each scalar to W bytes and send a data buffer raw. Proven
+  end-to-end on a fully STRIPPED `read(0,buf,4)` libc double-free target → CWE-415 found. (On the
+  real dreamdiary1 the driver now correctly reaches allocate + free, but that target's Delete NULLs
+  its pointer slot, so it is double-free-safe — the finding is a correct negative, and its actual
+  bug is an edit-path issue outside this detector.)
+
+Known gaps / next: **oob_index array-table id** still needs symbols (recover fixed-size global
+arrays from `.bss` + indexed access in the disasm). bad_grades (a stripped counted STACK overflow)
+reaches L1 via the fuzzer but stalls (no win). Also:
 the full angrop/pwntools finish-the-chain backend, live tcache-poison driving off the heap
 primitives (currently an L2 recipe), leaked-canary/PIE auto-confirmation (unblocks the chainer on
 PIE targets and auth-or-out), and the SROP 2-stage/leak variant for the no-writable case (sick_rop).

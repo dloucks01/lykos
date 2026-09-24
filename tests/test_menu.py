@@ -65,7 +65,9 @@ def test_menu_op_sequences_empty_without_allocator():
 
 
 def test_crawl_menu_learns_field_templates(tmp_path):
-    import subprocess, sys, textwrap
+    import subprocess
+    import sys
+    import textwrap
     prog = tmp_path / "fakemenu.py"
     prog.write_text(textwrap.dedent('''
         import sys
@@ -98,3 +100,57 @@ def test_crawl_menu_learns_field_templates(tmp_path):
     assert model.get("2") == ["idx", "str"]                        # id, new name
     assert model.get("3") == ["idx"]                               # id
     assert "4" not in model                                        # exit reads nothing
+
+
+# --------------------------------------------------- fixed-width read(fd,buf,W) protocols ----
+
+def test_fill_fixed_width_pads_scalars_and_raw_data():
+    # line mode (default): newline-delimited
+    assert menu._fill(["num", "str"], num=b"16", width=None) == b"16\n" + b"A" * 16 + b"\n"
+    # fixed-width W=4: each scalar padded to 4 bytes, data sent raw (its read consumed exactly size)
+    assert menu._fill(["num", "str"], num=b"16", width=4) == b"16  " + b"A" * 16
+    assert menu._fill(["idx"], idx=b"0", width=4) == b"0   "
+
+
+def test_menu_op_sequences_fixed_width_has_no_newlines():
+    model = {"1": ["num", "str"], "2": ["idx"]}          # alloc, delete
+    seqs = menu.menu_op_sequences(model, ["1", "2"], width=4)
+    assert seqs and all(b"\n" not in s for s in seqs)     # fixed-width: newline-free
+    # the allocating option: choice "1" padded, size "16" padded, then 16 data bytes
+    assert any(s.startswith(b"1   16  " + b"A" * 16) for s in seqs)
+    # delete driven twice on the same id (double-free shape), each field 4-wide
+    assert any(b"2   0   2   0   " in s for s in seqs)
+
+
+def test_crawl_menu_learns_fixed_width_protocol(tmp_path):
+    import subprocess
+    import sys
+    import textwrap
+    # a menu that reads every scalar as read(0, buf, 4) and data as read(0, buf, size)
+    prog = tmp_path / "fw.py"
+    prog.write_text(textwrap.dedent('''
+        import os, sys
+        def rd4():
+            b = os.read(0, 4)
+            if not b: sys.exit(0)
+            return int(b.decode("latin1").strip() or "0")
+        while True:
+            sys.stdout.write("1) alloc\\n2) delete\\n> "); sys.stdout.flush()
+            op = rd4()
+            if op == 1:
+                sys.stdout.write("size> "); sys.stdout.flush(); sz = rd4()
+                sys.stdout.write("data> "); sys.stdout.flush(); os.read(0, sz if sz>0 else 8)
+                sys.stdout.write("ok\\n"); sys.stdout.flush()
+            elif op == 2:
+                sys.stdout.write("idx> "); sys.stdout.flush(); rd4()
+                sys.stdout.write("del\\n"); sys.stdout.flush()
+            else:
+                break
+    '''))
+
+    def spawn():
+        return subprocess.Popen([sys.executable, str(prog)], stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    model = menu.crawl_menu(spawn, ["1", "2"], idle=0.3, per_option=8.0, width=4)
+    assert model.get("1") == ["num", "str"]              # size, data
+    assert model.get("2") == ["idx"]                     # index

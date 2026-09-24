@@ -138,6 +138,19 @@ def _looks_like_menu(text: str) -> bool:
 _VALUE = {"idx": b"1", "num": b"16", "str": b"AAAA"}
 
 
+# --- field encoding: line-delimited by default, or FIXED-WIDTH for a read(fd, buf, W) protocol ---
+# A target that reads scalars with `read(0, buf, W)` (not fgets/scanf) consumes exactly W bytes per
+# field regardless of newlines; a value+"\n" then under-reads and desyncs every later field. In
+# fixed-width mode each scalar is padded to W bytes (atoi stops at the padding) and a data buffer is
+# sent raw (its read already consumed exactly its size).
+def _scalar(value: bytes, width) -> bytes:
+    return (value + b" " * (width or 0))[:width] if width else value + _NL
+
+
+def _data(payload: bytes, width) -> bytes:
+    return payload if width else payload + _NL
+
+
 def _drain(proc, sel, *, idle: float, deadline: float) -> tuple[str, bool]:
     """Read stdout until the process stalls waiting for input (returns the new output + alive=True),
     exits (alive=False) or the deadline passes. A stall -- select times out, process alive --
@@ -166,14 +179,15 @@ def _drain(proc, sel, *, idle: float, deadline: float) -> tuple[str, bool]:
 
 
 def crawl_menu(spawn, options, *, max_fields: int = 10, idle: float = 0.2,
-               per_option: float = 3.0) -> dict[str, list[str]]:
+               per_option: float = 3.0, width=None) -> dict[str, list[str]]:
     """Learn each option's ordered field template by DRIVING the live process one prompt at a time.
 
     `spawn()` returns a fresh subprocess.Popen (stdin=PIPE, stdout=PIPE, stderr merged) -- the stage
     wraps the sandbox; a test passes a fake. For each option we start a clean process, drive to the
     menu, select the option, then repeatedly: read to the next prompt, classify it, feed a typed
     value, and record the field -- until the menu re-appears (flow done) or the process exits. Pure
-    best-effort: any failure yields no template for that option (the caller falls back)."""
+    best-effort: any failure yields no template (the caller falls back). `width` selects the
+    fixed-width (read(fd, buf, W)) encoding; None drives the target line-by-line."""
     model: dict[str, list[str]] = {}
     for opt in options:
         proc = None
@@ -184,17 +198,26 @@ def crawl_menu(spawn, options, *, max_fields: int = 10, idle: float = 0.2,
             deadline = time.monotonic() + per_option
             _drain(proc, sel, idle=idle,
                    deadline=min(deadline, time.monotonic() + 1.5))  # first menu
-            proc.stdin.write(opt.encode() + _NL)
+            proc.stdin.write(_scalar(opt.encode(), width))
             proc.stdin.flush()
             fields: list[str] = []
+            last_num = 0
             for _ in range(max_fields):
                 out, alive = _drain(proc, sel, idle=idle, deadline=deadline)
                 if _looks_like_menu(out) or not alive:
                     break
                 ftype = classify_prompt(_tail_prompt(out))
                 fields.append(ftype)
+                if ftype == "num":
+                    last_num = int(_VALUE["num"])
+                    send = _scalar(_VALUE["num"], width)
+                elif ftype == "idx":
+                    send = _scalar(_VALUE["idx"], width)
+                else:                                    # a data buffer sized to a preceding size
+                    payload = b"A" * last_num if (width and last_num) else _VALUE["str"]
+                    send = _data(payload, width)
                 try:
-                    proc.stdin.write(_VALUE[ftype] + _NL)
+                    proc.stdin.write(send)
                     proc.stdin.flush()
                 except (OSError, ValueError):
                     break
@@ -217,29 +240,29 @@ def _kill(proc) -> None:
 
 
 def _fill(fields, *, big_last: bool = False, idx: bytes = b"1", num: bytes = b"16",
-          big: bytes = b"B" * 200) -> bytes:
-    """Input lines for ONE invocation of an option with the given field template. `big_last` makes
-    the last STRING field over-long (the overflow payload); otherwise every field gets a small
-    in-bounds value of the right type. A string that FOLLOWS a size field is padded to that many
-    bytes, so a `read(fd, buf, size)` allocator gets exactly what it asked for -- a short fill would
-    under-read and desync every later option in the sequence."""
+          big: bytes = b"B" * 200, width=None) -> bytes:
+    """Input for ONE invocation of an option with the given field template. `big_last` makes the
+    last STRING field over-long (the overflow payload); otherwise every field gets a small in-bounds
+    value of the right type. A string that FOLLOWS a size field is padded to that many bytes, so a
+    `read(fd, buf, size)` allocator gets exactly what it asked for -- a short fill would under-read
+    and desync every later option. `width` switches scalars to fixed-width (read(fd, buf, W))."""
     last_str = max((i for i, f in enumerate(fields) if f == "str"), default=-1)
     out = bytearray()
     sz = 0
     for i, f in enumerate(fields):
         if f == "idx":
-            out += idx + _NL
+            out += _scalar(idx, width)
         elif f == "num":
-            out += num + _NL
+            out += _scalar(num, width)
             try:
                 sz = int(num)
             except ValueError:
                 sz = 0
         elif big_last and i == last_str:
-            out += big + _NL
+            out += _data(big, width)
         else:
-            out += b"A" * sz if 0 < sz <= 4096 else b"AAAA"     # match the preceding size
-            out += _NL
+            payload = b"A" * sz if 0 < sz <= 4096 else b"AAAA"   # match the preceding size
+            out += _data(payload, width)
     return bytes(out)
 
 
@@ -250,7 +273,7 @@ def _is_alloc(fields) -> bool:
     return ni is not None and any(f == "str" for f in fields[ni + 1:])
 
 
-def menu_op_sequences(model: dict, options, *, max_seqs: int = 40) -> list[bytes]:
+def menu_op_sequences(model: dict, options, *, max_seqs: int = 40, width=None) -> list[bytes]:
     """Correctly-typed heap operation sequences built from a crawled menu model.
 
     Picks an allocating option (a size-then-string flow) to prime an object, then drives every other
@@ -260,20 +283,21 @@ def menu_op_sequences(model: dict, options, *, max_seqs: int = 40) -> list[bytes
     alloc = next((o for o in opts if o in model and _is_alloc(model[o])), None)
     if alloc is None:
         return []
-    one = alloc.encode() + _NL + _fill(model[alloc], big_last=False)
+    def _op(o, **kw):                                    # option choice + its filled fields
+        return _scalar(o.encode(), width) + _fill(model[o], width=width, **kw)
+    one = _op(alloc)
     prime = one + one                                    # two objects: ids 0 and 1 both exist
     seqs: list[bytes] = []
     for o in opts:
         f = model.get(o)
         if not f:
             continue
-        ob = o.encode()
         for iv in (b"0", b"1"):                          # target id 0 and 1 (0- or 1-based tables)
             # overflow: after priming, drive this option with an over-long final string
-            seqs.append(prime + ob + _NL + _fill(f, big_last=True, idx=iv))
+            seqs.append(prime + _op(o, big_last=True, idx=iv))
             # double-free / UAF: an index-only option driven twice on the same object
             if all(x == "idx" for x in f):
-                seqs.append(prime + ob + _NL + _fill(f, idx=iv) + ob + _NL + _fill(f, idx=iv))
+                seqs.append(prime + _op(o, idx=iv) + _op(o, idx=iv))
     out, seen = [], set()
     for s in seqs:
         if s not in seen:
