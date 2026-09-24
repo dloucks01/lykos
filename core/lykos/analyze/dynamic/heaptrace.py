@@ -133,11 +133,19 @@ if __name__ == "__main__":                                            # ---- the
         spec = json.load(open(sys.argv[1]))
         exe = spec["exe"]
         stdin_bytes = bytes.fromhex(spec.get("stdin", ""))
-        free_off = int(spec["free_off"])
+        # alloc/free tracking is optional: with neither, the tracer runs in pure OOB-index mode
+        # (only the static guard watchpoints below are armed).
+        free_off = spec.get("free_off")
+        free_off = int(free_off) if free_off is not None else None
         alloc_ret_offs = [int(x) for x in spec.get("alloc_ret_offs", [])]
-        alloc_base_off = int(spec["alloc_off"])          # alloc function file/vaddr offset
+        alloc_base_off = spec.get("alloc_off")           # alloc function file/vaddr offset
+        alloc_base_off = int(alloc_base_off) if alloc_base_off is not None else None
         report = spec["report"]
         timeout = int(spec.get("timeout", 15))
+        # Static guard watchpoints: [off, note] pairs (vaddr offsets, rebased for PIE) armed from
+        # the start. A read/write to a guard from program code = an out-of-bounds ARRAY access (the
+        # guard sits just before/after a fixed-size global array = an unchecked index (CWE-129).
+        static_watch = [(int(o), str(n)) for o, n in spec.get("static_watch", [])]
         # [start, end) offsets of the allocator FAMILY (alloc/free + helpers). A watchpoint that
         # fires from inside this code is the allocator's own bookkeeping / compaction, not a program
         # use-after-free -- ignore those, count only accesses from outside the allocator.
@@ -232,11 +240,12 @@ if __name__ == "__main__":                                            # ---- the
             poke(addr, (orig & ~0xFF) | 0xCC)
             bps[addr] = (kind, orig & 0xFF)
 
-        free_addr = rebase + free_off
-        setbp(free_addr, "free")
-        setbp(rebase + alloc_base_off, "alloc_enter")    # entry: rdi = requested size
-        for ro in alloc_ret_offs:
-            setbp(rebase + alloc_base_off + ro, "alloc")
+        if free_off is not None:
+            setbp(rebase + free_off, "free")
+        if alloc_base_off is not None:
+            setbp(rebase + alloc_base_off, "alloc_enter")    # entry: rdi = requested size
+            for ro in alloc_ret_offs:
+                setbp(rebase + alloc_base_off + ro, "alloc")
 
         signal.signal(signal.SIGALRM, lambda *_: (_ for _ in ()).throw(TimeoutError()))
         signal.alarm(timeout)
@@ -246,7 +255,7 @@ if __name__ == "__main__":                                            # ---- the
         pending_size = 0                                  # rdi captured at the last alloc entry
         free_slots = [0, 1, 2, 3]                         # DR0-3 available for watchpoints
         watches = {}                                      # slot -> {"addr", "kind", "chunk"}
-        uaf_seen, of_seen = set(), set()
+        uaf_seen, of_seen, oob_seen = set(), set(), set()
         events = []
 
         def in_allocator(rip):
@@ -277,6 +286,13 @@ if __name__ == "__main__":                                            # ---- the
             for slot, w in list(watches.items()):
                 if lo <= w["addr"] < hi:
                     disarm(slot)
+
+        # Arm the static array guards up front (read+write): a hit means program code indexed the
+        # array out of bounds. These hold their slots for the whole run.
+        for off, note in static_watch:
+            slot = arm(rebase + off, "static", None, 0b11)
+            if slot is not None:
+                watches[slot]["note"] = note
 
         try:
             while True:
@@ -312,16 +328,24 @@ if __name__ == "__main__":                                            # ---- the
                                 uaf_seen.add(key)
                                 events.append({"error": "use-after-free", "addr": hex(w["chunk"]),
                                                "pc": hex(rg.rip)})
-                        # A WRITE to the qword just past a LIVE chunk is an overflow by construction;
-                        # the writer is usually libc strcpy/memcpy called by the program, so allow any
-                        # PC except the allocator's own (its next-chunk setup writes there legitimately,
-                        # but clear_covering already drops the watch when that happens).
+                        # A WRITE to the qword just past a LIVE chunk is an overflow by
+                        # construction; the writer is usually a libc strcpy/memcpy called by the
+                        # program, so allow any PC except the allocator's own (its next-chunk setup
+                        # writes there legitimately, but clear_covering drops the watch first).
                         elif w["kind"] == "overflow" and not in_alloc:
                             key = (w["addr"], rg.rip)
                             if key not in of_seen:
                                 of_seen.add(key)
                                 events.append({"error": "heap-overflow", "addr": hex(w["chunk"]),
                                                "end": hex(w["addr"]), "pc": hex(rg.rip)})
+                        # A guard just before/after a fixed-size array was touched by program code:
+                        # an out-of-bounds array index (a missing / off-by-one bound check).
+                        elif w["kind"] == "static" and in_code and not in_alloc:
+                            key = (w["addr"], rg.rip)
+                            if key not in oob_seen:
+                                oob_seen.add(key)
+                                events.append({"error": "oob-index", "addr": hex(w["addr"]),
+                                               "array": w.get("note"), "pc": hex(rg.rip)})
                     poke_dr(6, 0)
                     continue                              # the access already retired; resume
                 bp = rg.rip - 1
@@ -374,7 +398,8 @@ if __name__ == "__main__":                                            # ---- the
         json.dump({"events": events,
                    "double_free": any(e.get("error") == "double-free" for e in events),
                    "use_after_free": any(e.get("error") == "use-after-free" for e in events),
-                   "heap_overflow": any(e.get("error") == "heap-overflow" for e in events)},
+                   "heap_overflow": any(e.get("error") == "heap-overflow" for e in events),
+                   "oob_index": any(e.get("error") == "oob-index" for e in events)},
                   open(report, "w"))
         return 0
 

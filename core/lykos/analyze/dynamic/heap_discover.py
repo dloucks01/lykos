@@ -45,6 +45,20 @@ def _alloc_ret_offsets(exe: Path, alloc_name: str) -> list[int]:
     return [r - base for r in rets]
 
 
+def _crawl_menu_model(workdir: Path, exe: Path, opts: list[str]) -> dict:
+    """Learn each menu option's typed field template by driving the sandboxed target interactively.
+    Best-effort: any failure yields {} and the caller falls back to generic op-sequences."""
+    def spawn():
+        cmd = sandbox.isolate_prefix(str(workdir), net=False, rw_binds=[str(workdir)]) + [str(exe)]
+        return subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, cwd=str(workdir),
+                                preexec_fn=sandbox._rlimits(2048, 20, set_as=False))
+    try:
+        return menu.crawl_menu(spawn, opts, per_option=2.5)
+    except Exception:
+        return {}
+
+
 def _allocator_ranges(functions: dict, edges, alloc: dict) -> list[list[int]]:
     """[start, end) code ranges of the allocator FAMILY: alloc/free, everything they call
     transitively (a compacting allocator's insert_block/compact/memmove), and same-stem functions.
@@ -123,13 +137,16 @@ def heap_trace_stage(ctx) -> dict:
         strings = [x.value for x in StringDAO(ctx.conn).list_by_target(target.id)
                    if getattr(x, "value", None)]
         opts = menu.detect_menu(strings)
-        # menu seeds when a menu is printed; else a generic option-1..4 fallback covering both a
-        # double-free (create; free; free) and a use-after-free (create; free; USE) shape.
-        seqs = heaptrace.heap_op_sequences(opts) or [
+        # Learn each option's typed field template (Name/Surname/Age/size/Note ...) by driving the
+        # live process, so a rich add flow actually ALLOCATES -- the generic (option,size,data)
+        # guess never would. menu_op_sequences builds correctly-typed op-sequences from it;
+        # fall back to the generic shapes when crawling finds no allocator flow.
+        model = _crawl_menu_model(workdir, exe, opts) if opts else {}
+        seqs = menu.menu_op_sequences(model, opts) or heaptrace.heap_op_sequences(opts) or [
             b"1\n64\nA\n2\n0\n2\n0\n", b"1\n2\n2\n",                 # double-free
             b"1\n64\nA\n2\n0\n3\n0\n", b"1\n2\n3\n", b"1\n2\n3\n4\n",  # UAF (alloc, free, use)
             b"1\n2\n4\n", b"1\n64\nA\n2\n0\n4\n0\n",
-            b"1\n16\nA\n2\n0\n" + b"B" * 128 + b"\n",               # heap overflow (small; over-long modify)
+            b"1\n16\nA\n2\n0\n" + b"B" * 128 + b"\n",               # heap overflow (over-long)
             b"1\n16\nA\n3\n0\n" + b"B" * 128 + b"\n"]
         ctx.emit("heaptrace.allocator", payload={
             "alloc": alloc["alloc_name"], "free": alloc["free_name"],
@@ -169,9 +186,9 @@ def heap_trace_stage(ctx) -> dict:
                 "applicable": True, "double_free": False, "use_after_free": False,
                 "heap_overflow": False, "allocator": alloc["alloc_name"],
                 "note": (f"traced the target's own allocator ({alloc['alloc_name']}/"
-                         f"{alloc['free_name']}) over {len(seqs)} operation sequences; no double-free, "
-                         "use-after-free or heap overflow surfaced. The menu semantics may need "
-                         "analyst-supplied op sequences.")})
+                         f"{alloc['free_name']}) over {len(seqs)} operation sequences; no "
+                         "double-free, use-after-free or heap overflow surfaced. Menu semantics "
+                         "may need analyst-supplied op sequences.")})
             ctx.progress(pct=100, msg="no heap primitive surfaced on the custom allocator")
             return {"metrics": {"applicable": True, "double_free": False}}
 
