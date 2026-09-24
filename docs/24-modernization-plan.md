@@ -246,10 +246,25 @@ tictactoe):
   "Control-flow hijack". On auth-or-out the OOB-index primitive files an L2 recipe (no reachable
   win; the real exploit is leak-based).
 
-Known gaps / next: **symbol-free discovery** — `heap_trace` (custom-allocator id) and `oob_index`
-(array-table id) both rely on ELF symbols, so the STRIPPED HTB heap challenges (dreamdiary1, a libc
-tcache UAF; bad_grades, a counted stack overflow) don't reach these detectors (bad_grades still hits
-L1 via the fuzzer); recovering the allocator / array bounds from the disassembly is the fix. Also:
+- **Symbol-free allocator discovery** (`heap_discover._libc_plt_pair` + heaptrace PLT mode) — a
+  STRIPPED menu-driven heap service has no named allocator, but it still calls libc. When
+  `identify_allocator` finds no named pair and a menu is present, `heap_trace` now traces the
+  `malloc`/`free` **PLT stubs** (resolved from the DYNAMIC symbols, which survive stripping): at the
+  stub entry it captures the size (`rdi`) and one-shot-breakpoints the caller's return address
+  (`[rsp]`) to read the returned pointer (`rax`), then applies the same double-free / UAF logic
+  (libc's own metadata writes make the end-of-chunk overflow watch unreliable, so PLT mode reports
+  only double-free + UAF — heap_check's guard pages already cover libc overflow). Also fixed:
+  `detect_menu` now strips a leading table border (`| [1] Allocate |` boxed menus), and `menu._fill`
+  sizes a data string to its preceding size field so a `read(fd, buf, size)` allocator does not
+  under-read and desync the sequence. Validated end-to-end on a fully STRIPPED line-based libc
+  double-free target → CWE-415 found with no symbols; chain files the L2 tcache recipe.
+
+Known gaps / next: **fixed-width input protocols** — dreamdiary1 reads inputs with fixed-width
+`read(0, buf, 4)` byte reads, not newline-delimited lines, so the line-based menu crawler desyncs on
+it (the PLT allocator tracing itself is correct); inferring per-read widths is the fix. **oob_index
+array-table id** still needs symbols (recover fixed-size global arrays from `.bss` + indexed access
+in the disasm). bad_grades (a stripped counted STACK overflow) reaches L1 via the fuzzer but stalls
+(no win). Also:
 the full angrop/pwntools finish-the-chain backend, live tcache-poison driving off the heap
 primitives (currently an L2 recipe), leaked-canary/PIE auto-confirmation (unblocks the chainer on
 PIE targets and auth-or-out), and the SROP 2-stage/leak variant for the no-writable case (sick_rop).

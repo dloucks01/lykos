@@ -35,7 +35,10 @@ def detect_menu(strings) -> list[str]:
         # A whole menu is often ONE printf format string; the string store keeps its newlines as
         # the literal escape "\n" (backslash-n), so unescape before splitting into option lines.
         text = str(s).replace("\\n", "\n").replace("\\r", "\n").replace("\\t", " ")
-        for line in text.splitlines():
+        for raw in text.splitlines():
+            # boxed menus prefix each option with a table border ("| [1] Allocate |"); strip a
+            # leading border / bullet so the option token is at the start for the matcher.
+            line = raw.lstrip("|*>#-=+ \t│┃‖●·")
             m = _OPT.match(line)
             if m:
                 opts.add(m.group(1))
@@ -217,16 +220,26 @@ def _fill(fields, *, big_last: bool = False, idx: bytes = b"1", num: bytes = b"1
           big: bytes = b"B" * 200) -> bytes:
     """Input lines for ONE invocation of an option with the given field template. `big_last` makes
     the last STRING field over-long (the overflow payload); otherwise every field gets a small
-    in-bounds value of the right type."""
+    in-bounds value of the right type. A string that FOLLOWS a size field is padded to that many
+    bytes, so a `read(fd, buf, size)` allocator gets exactly what it asked for -- a short fill would
+    under-read and desync every later option in the sequence."""
     last_str = max((i for i, f in enumerate(fields) if f == "str"), default=-1)
     out = bytearray()
+    sz = 0
     for i, f in enumerate(fields):
         if f == "idx":
             out += idx + _NL
         elif f == "num":
             out += num + _NL
+            try:
+                sz = int(num)
+            except ValueError:
+                sz = 0
+        elif big_last and i == last_str:
+            out += big + _NL
         else:
-            out += (big if (big_last and i == last_str) else b"AAAA") + _NL
+            out += b"A" * sz if 0 < sz <= 4096 else b"AAAA"     # match the preceding size
+            out += _NL
     return bytes(out)
 
 

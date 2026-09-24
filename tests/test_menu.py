@@ -49,8 +49,10 @@ def test_menu_op_sequences_from_model_types_fields_and_overflows():
              "3": ["idx"]}                                # delete
     seqs = menu.menu_op_sequences(model, ["1", "2", "3"])
     assert seqs
-    # the allocating option primes with typed values: Name/Surname strings, Age/size numbers, Note
-    assert any(s.startswith(b"1\nAAAA\nAAAA\n16\n16\nAAAA\n") for s in seqs)
+    # the allocating option primes with typed values: Name/Surname strings, Age/size numbers, and
+    # the Note string sized to match the preceding size field (16 bytes, so a read(size) allocator
+    # gets exactly what it asked for)
+    assert any(s.startswith(b"1\nAAAA\nAAAA\n16\n16\n" + b"A" * 16 + b"\n") for s in seqs)
     # an over-long payload (overflow shape) reaches a non-alloc option
     assert any(b"B" * 200 in s for s in seqs)
     # delete driven twice on the same id (double-free shape)
