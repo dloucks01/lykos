@@ -186,6 +186,26 @@ flag — a single air-gap bundle carries every capability, with exactly one swap
   bundle that re-runs from scratch in the sandbox; on hardened/heap targets, produce the L2 primitive +
   a clearly-labeled analyst-gated next step.
 
+**Delivered 2026-09-23** (validated against an HTB pwn set — vuln/scanner/da/sick_rop/auth-or-out/
+tictactoe):
+- **Multi-channel input auto-retry** — the autopilot ranks the target's input channels (stdin/arg/
+  file, from its imports) and retries across them on no-crash instead of a single stdin guess.
+  Measured: ncompress 0 → 26 crashes + an L2 primitive, fully automatic.
+- **Menu / interactive-protocol seeds** (`fuzz/menu.py`) — synthesise multi-step navigation seeds
+  from the numbered menu a binary prints, so coverage/directed fuzzing starts INSIDE the state
+  machine (add/modify/print loops, auth gates). auth-or-out's 1–5 Author menu → 39 seeds.
+- **SROP synthesis** (`poc/rop.py` + `_plan_srop`) — a byte-exact amd64 sigreturn frame + syscall/
+  pop-rax/writable detection + execve chain for static/no-PIE targets, with precise boundary
+  reporting when a piece is missing (sick_rop's no-writable variant). Unconfirmed stays *potential*.
+- **Flag-printer ret2win** — an `open()`+print() "cat flag" backdoor is a recognised win target now,
+  not only `system`/`execve` callers.
+- **Canary leak-chain** — a canary-preserving overflow builder (`exploit.build_canary_overflow`)
+  plus, when a canary-hardened target is hit with no leak, the exact leak-chain recipe + params.
+
+Still analyst-gated / next: the full angrop/pwntools finish-the-chain backend, heap primitive
+discovery + layout, leaked-canary/PIE auto-confirmation, and the SROP 2-stage/leak variant for the
+no-writable case (the hardest, e.g. sick_rop).
+
 ### Phase 4 — Optional, fenced local-LLM helper  *(only worthwhile with a modest GPU)*
 - Off by default. Three roles only, each **verifier-gated**: (1) fuzz harness/seed/dictionary
   generation (fuzzer is the oracle), (2) decompiler-output renaming via **LLM4Decompile-Ref** on
@@ -275,6 +295,16 @@ target reaches a PoC-backed finding with a verified, downloadable L2 bundle. A U
 target before its async triage finished (showing file type "unknown") was fixed by waiting on the
 triage run. Remaining known gap: decompiled-C source text (rz-ghidra `pdg` wiring); the decompile
 stage recovers functions and the call graph, which the P-Code detectors use, but emits no C text.
+
+**Verdict-first re-layout (2026-09-23).** Running the workbench against a multi-binary HTB set made
+the information architecture problem obvious: the case view was a long linear scroll — target info,
+pipeline log, console, coverage — with the Results (findings) at the very bottom, so the *answer*
+(worst demonstrated effect, and whether it is proven) was buried under the *process*. Re-arranged
+verdict-first: a per-target VerdictStrip + VerdictCard lead the view (headline effect + an L1▸L2▸L3
+ladder meter + proof links, or "no crash reproduced — N findings, M% covered"); target detail and
+ranked findings follow; the pipeline/console/coverage collapse into one "Analysis" drawer that is
+open while running and collapsed once a run finishes. Front-end only; the API already returned
+effects-with-status and PoC levels.
 
 ---
 
