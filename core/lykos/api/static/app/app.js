@@ -8,7 +8,7 @@ import { api, waitForRun } from "./api.js";
 import { runAutopilotCase, newController, cancel as cancelAutopilot, coverageOf } from "./autopilot.js";
 import { rankFindings, pocsForFinding, fmtTime, progressText, stageLabel, dedupeFindings, buildRunLog, buildVerdicts } from "./util.js";
 import {
-  html, DropZone, TargetSummary, ProgressLog, ConsolePanel, FindingCard, EmptyResults, Spinner, UnavailablePanel, SystemMap, CoveragePanel, CodeView, PipelinePlan, EvidenceModal, FunctionsModal, VerdictStrip, VerdictCard, AnalysisDrawer,
+  html, DropZone, TargetSummary, ProgressLog, ConsolePanel, FindingCard, EmptyResults, Spinner, UnavailablePanel, SystemMap, CoveragePanel, CodeView, PipelinePlan, EvidenceModal, FunctionsModal, VerdictStrip, VerdictCard, AnalysisDrawer, ShellVerdict, ExploitsPanel, DrawerFacts,
 } from "./components.js";
 
 let _conSeq = 0;
@@ -89,6 +89,8 @@ function App() {
   const [evidence, setEvidence] = useState(null);   // {finding, focus} for the evidence inspector
   const [funcBrowse, setFuncBrowse] = useState(null); // {targetId, name, functions} for the function browser
   const [showCandidates, setShowCandidates] = useState(false); // triage: reveal speculative candidates
+  const [activeTid, setActiveTid] = useState(null);   // the target focused in the workbench shell
+  const [tab, setTab] = useState("findings");         // active workbench tab
   const [bg, setBg] = useState(null);               // server-side background autopilot status
   const [bgActivity, setBgActivity] = useState(null); // {msg, pct} live intra-stage progress
   const [consoleLines, setConsoleLines] = useState([]); // job.exec: tool commands + I/O
@@ -562,8 +564,44 @@ function App() {
   const busy = running || !!(bg && bg.running);
   const drawerHasContent = !!(log.length || consoleLines.length || Object.keys(coverage).length || (bg && bg.plan && bg.plan.length) || busy);
 
+  // ── Workbench shell: the target focused in the rail, and its findings / pocs / verdict ──────
+  const activeTarget = targets.find((t) => t.id === activeTid) || targets[0] || null;
+  const activeVerdict = activeTarget ? verdicts.find((v) => v.target.id === activeTarget.id) : null;
+  const activeRanked = activeTarget ? ranked.filter((f) => f.target_id === activeTarget.id) : [];
+  const activeNotable = activeRanked.filter((f) => f.state !== "candidate");
+  const activeCandidates = activeRanked.filter((f) => f.state === "candidate");
+  const activePocs = activeTarget ? pocs.filter((p) => p.finding_id && activeRanked.some((f) => f.id === p.finding_id)) : [];
+  // The finding behind the worst DEMONSTRATED effect (what the L3 rung narrates), preferring the
+  // verdict's headline finding over merely the first poc-backed row.
+  const topDemoFinding = (activeVerdict && activeVerdict.headline && activeVerdict.headline.findingId
+    && activeRanked.find((f) => f.id === activeVerdict.headline.findingId))
+    || activeRanked.find((f) => f.state === "poc-backed") || null;
+  // Per-target verdict dot for the rail.
+  const dotClass = (v) => v && v.status === "demonstrated" ? "d-crit" : v && v.status === "potential" ? "d-warn" : v && v.crashed ? "d-warn" : "d-none";
+  const lvlTag = (v) => v && v.level ? `L${v.level}` : v && v.crashed ? "crash" : "—";
+  // The run controls (used in the rail): background running / resume / run / stop.
+  const runControls = html`
+    ${bg && bg.running ? html`
+      <div class="bg-status"><${Spinner} label=${`Background — ${bg.stage ? stageLabelSafe(bg.stage) : "starting"}`} /></div>
+      <button class="btn ghost small" onClick=${() => api.cancelBackground(caseId)}>■ Stop background</button>
+    ` : bg && (bg.state === "cancelled" || bg.state === "error") ? html`
+      <button class="btn primary" onClick=${onBackground}>▷ Resume run</button>
+    ` : !running ? html`
+      <button class="btn primary" onClick=${onAutopilot}>${ran ? "Run Autopilot again" : "▶ Run Autopilot"}</button>
+      <button class="btn ghost small" onClick=${onBackground} title="run on the server; survives closing the tab">▷ In background</button>
+    ` : html`
+      <button class="btn danger" onClick=${onCancel}>■ Stop</button>
+    `}`;
+  // Data-driven tab set: a tab shows a count when it has content; empty analytical tabs are dimmed.
+  const tabDefs = [
+    { id: "findings", label: "Findings", n: activeRanked.length },
+    { id: "exploits", label: "Exploits", n: activePocs.length },
+    { id: "functions", label: "Functions & call graph", modal: true },
+    { id: "console", label: "Console", n: consoleLines.length },
+  ];
+
   return html`
-    <div class="app">
+    <div class=${targets.length ? "app app-wb" : "app"}>
       <header class="topbar">
         <div class="brand"><span class="logo">◆</span> lykos <span class="tag">workbench</span></div>
         <div class="top-right">
@@ -578,8 +616,8 @@ function App() {
 
       ${error ? html`<div class="banner err">${error}</div>` : null}
 
-      <main class="stack">
-        ${!targets.length ? html`
+      ${!targets.length ? html`
+        <main class="stack">
           <section>
             <${DropZone} onFiles=${(fl) => onFiles(fl, false)} busy=${uploading} />
             ${uploading ? html`<div class="center"><${Spinner} label="Uploading and triaging…" /></div>` : null}
@@ -593,80 +631,100 @@ function App() {
                   </button>`)}
               </div>` : null}
           </section>
-        ` : html`
-          ${multi ? html`<${VerdictStrip} verdicts=${verdicts} onSelect=${scrollToVerdict} />` : null}
-          ${verdicts.map((v) => html`<${VerdictCard} key=${v.target.id} verdict=${v} artifactUrl=${api.artifactUrl} />`)}
-
-          <section class="run-panel">
-            ${targets.map((t, i) => html`
-              <${TargetSummary} key=${t.id} target=${t} advice=${i === 0 ? advice : null} index=${multi ? i + 1 : null} onBrowseFunctions=${browseFunctions} />
-            `)}
-            ${!running ? html`
-              <${DropZone} onFiles=${(fl) => onFiles(fl, true)} busy=${uploading} compact=${true} />
-            ` : null}
-            <div class="cta">
-              ${bg && bg.running ? html`
-                <div class="bg-status"><${Spinner} label=${`Running in the background — ${bg.stage ? stageLabelSafe(bg.stage) : "starting"}${bg.targets > 1 ? ` (target ${bg.target}/${bg.targets})` : ""}`} /></div>
-                ${bgActivity ? html`<div class="bg-activity">${bgActivity.pct != null ? html`<span class="bg-pct">${Math.round(bgActivity.pct)}%</span>` : null}<span class="bg-act-msg">${bgActivity.msg}</span></div>` : null}
-                <button class="btn ghost small" onClick=${() => api.cancelBackground(caseId)}>■ Stop background run</button>
-                <div class="cta-sub">This keeps running even if you close the tab. Reopen the case later to see the results.</div>
-              ` : bg && (bg.state === "cancelled" || bg.state === "error") ? html`
-                <button class="btn primary" onClick=${onBackground}>▷ Resume background run</button>
-                <div class="cta-sub">Stopped${bg.stage ? ` at ${stageLabelSafe(bg.stage)}` : ""}. Resuming skips the steps already done (they are cached) and continues from where it left off.</div>
-              ` : !running ? html`
-                <button class="btn primary big" onClick=${onAutopilot}>
-                  ${ran ? "Run Autopilot again" : (multi ? `▶ Run Autopilot on ${targets.length} targets` : "▶ Run Autopilot")}
-                </button>
-                <button class="btn ghost" onClick=${onBackground} title="run on the server; survives closing the tab">▷ Run in background</button>
-                <div class="cta-sub">Runs every applicable capability on ${multi ? "each binary" : "the binary"} — decompile, detectors, CVE scan, fuzzing, concolic, heap, behaviour and runtime monitoring — root-causes any crash and builds a proof-of-concept${multi ? ", then links the case for IPC modelling and cross-binary taint" : ""}. "Background" runs the core path on the server so it survives closing the tab.</div>
-              ` : html`
-                <button class="btn danger big" onClick=${onCancel}>■ Stop</button>
-                <div class="cta-sub"><${Spinner} label="Working — you can stop at any time." /></div>
-              `}
-            </div>
-          </section>
-
-          <${SystemMap} map=${sysmap} />
-
-          ${(ran || findings.length) ? html`
-            <section class="results">
-              <div class="results-head">
-                <h2>Results</h2>
-                ${demonstrated.length ? html`<span class="pill good">${demonstrated.length} demonstrated</span>` : null}
-                ${caseId ? html`
-                  <span class="report-links">
-                    <a class="btn small ghost" href=${api.reportUrl(caseId, "html")} target="_blank">HTML report</a>
-                    <a class="btn small ghost" href=${api.reportUrl(caseId, "sarif")} target="_blank">SARIF</a>
-                    <a class="btn small ghost" href=${api.reportUrl(caseId, "json")} target="_blank">JSON</a>
-                  </span>` : null}
+        </main>
+      ` : html`
+        <div class="wb">
+          <!-- left rail: targets + pipeline + run -->
+          <nav class="wb-rail">
+            <div>
+              <div class="rail-sec-h">Targets ${targets.length > 1 ? `· ${targets.length}` : ""}</div>
+              <div class="rail-targets">
+                ${targets.map((t) => {
+                  const v = verdicts.find((x) => x.target.id === t.id);
+                  const on = activeTarget && t.id === activeTarget.id;
+                  return html`<button class=${`rail-target${on ? " active" : ""}`} key=${t.id}
+                    onClick=${() => { setActiveTid(t.id); setTab("findings"); }}>
+                    <span class=${`rail-dot ${dotClass(v)}`}></span>
+                    <span class="rail-tname">${t.filename}</span>
+                    <span class="rail-tlvl">${lvlTag(v)}</span>
+                  </button>`;
+                })}
               </div>
-              ${ranked.length ? html`
-                ${notable.map(cardFor)}
-                ${candidates.length ? html`
-                  <div class="triage-bar">
-                    <button class="btn small ghost triage-toggle" onClick=${() => setShowCandidates((v) => !v)}>
-                      ${candidatesVisible ? "▾" : "▸"} ${candidates.length} candidate${candidates.length === 1 ? "" : "s"}
-                    </button>
-                    <span class="triage-note">flagged patterns not yet demonstrated${notable.length === 0 ? " — nothing corroborated yet" : ""}</span>
-                  </div>
-                  ${candidatesVisible ? candidates.map(cardFor) : null}
-                ` : null}
-              ` : html`<${EmptyResults} ran=${ran} />`}
-            </section>
-          ` : null}
+              ${!running && !(bg && bg.running) ? html`<div style="margin-top:8px;"><${DropZone} onFiles=${(fl) => onFiles(fl, true)} busy=${uploading} compact=${true} /></div>` : null}
+            </div>
+            ${bg && bg.plan && bg.plan.length ? html`
+              <div>
+                <div class="rail-sec-h">Pipeline</div>
+                <div class="rail-pipe">
+                  ${bg.plan.map((s) => html`<div class=${`rail-step rs-${s.status || "pending"}`} key=${s.stage}>
+                    <span class="rs-ico">${s.status === "done" ? "✓" : s.status === "running" ? "◆" : s.status === "error" ? "✕" : "·"}</span>
+                    <span>${s.label || s.stage}</span>
+                  </div>`)}
+                </div>
+              </div>` : null}
+            <div class="rail-run">
+              ${bgActivity ? html`<div class="bg-activity">${bgActivity.pct != null ? html`<span class="bg-pct">${Math.round(bgActivity.pct)}%</span>` : null}<span class="bg-act-msg">${bgActivity.msg}</span></div>` : null}
+              ${runControls}
+            </div>
+          </nav>
 
-          ${drawerHasContent ? html`
-            <${AnalysisDrawer} running=${busy}>
-              ${bg && bg.plan ? html`<${PipelinePlan} plan=${bg.plan} targetName=${bg.target_name} target=${bg.target} targets=${bg.targets} />` : null}
-              <${ProgressLog} entries=${log} running=${running} />
-              <${ConsolePanel} lines=${consoleLines} />
-              <${CoveragePanel} coverage=${coverage} targets=${targets} onDrill=${browseFunctions} />
-            </${AnalysisDrawer}>
-          ` : null}
+          <!-- main: verdict + tabs + panel -->
+          <main class="wb-main">
+            ${multi ? html`<${VerdictStrip} verdicts=${verdicts} onSelect=${(tid) => { setActiveTid(tid); setTab("findings"); }} />` : null}
+            <${ShellVerdict} verdict=${activeVerdict} artifactUrl=${api.artifactUrl} />
+            <${SystemMap} map=${sysmap} />
 
-          <${UnavailablePanel} items=${unavailable} />
-        `}
-      </main>
+            <div class="wb-tabs">
+              ${tabDefs.map((td) => html`<button key=${td.id}
+                class=${`wb-tab${tab === td.id ? " active" : ""}`}
+                onClick=${() => (td.modal ? browseFunctions(activeTarget && activeTarget.id) : setTab(td.id))}>
+                ${td.label}${td.n ? html`<span class="tab-n">${td.n}</span>` : null}
+              </button>`)}
+              ${caseId ? html`<span class="tab-exports">
+                <a class="btn small ghost" href=${api.reportUrl(caseId, "html")} target="_blank">HTML</a>
+                <a class="btn small ghost" href=${api.reportUrl(caseId, "sarif")} target="_blank">SARIF</a>
+                <a class="btn small ghost" href=${api.reportUrl(caseId, "json")} target="_blank">JSON</a>
+              </span>` : null}
+            </div>
+
+            ${tab === "findings" ? html`
+              <div class="wb-panel">
+                ${activeRanked.length ? html`
+                  ${activeNotable.map(cardFor)}
+                  ${activeCandidates.length ? html`
+                    <div class="triage-bar">
+                      <button class="btn small ghost triage-toggle" onClick=${() => setShowCandidates((s) => !s)}>
+                        ${candidatesVisible ? "▾" : "▸"} ${activeCandidates.length} candidate${activeCandidates.length === 1 ? "" : "s"}
+                      </button>
+                      <span class="triage-note">flagged patterns not yet demonstrated${activeNotable.length === 0 ? " — nothing corroborated yet" : ""}</span>
+                    </div>
+                    ${candidatesVisible ? activeCandidates.map(cardFor) : null}
+                  ` : null}
+                ` : html`<${EmptyResults} ran=${ran} />`}
+              </div>
+            ` : tab === "exploits" ? html`
+              <div class="wb-panel">
+                <${ExploitsPanel} verdict=${activeVerdict} pocs=${activePocs} topFinding=${topDemoFinding} artifactUrl=${api.artifactUrl} />
+              </div>
+            ` : tab === "console" ? html`
+              <div class="wb-panel">
+                ${bg && bg.plan ? html`<${PipelinePlan} plan=${bg.plan} targetName=${bg.target_name} target=${bg.target} targets=${bg.targets} />` : null}
+                <${ProgressLog} entries=${log} running=${running} />
+                <${ConsolePanel} lines=${consoleLines} />
+                <${CoveragePanel} coverage=${coverage} targets=${targets} onDrill=${browseFunctions} />
+              </div>
+            ` : html`<div class="wb-soon">This view is coming to the workbench.</div>`}
+
+            <${UnavailablePanel} items=${unavailable} />
+          </main>
+
+          <!-- right drawer: persistent target facts -->
+          <aside class="wb-drawer">
+            <${DrawerFacts} target=${activeTarget} onBrowseFunctions=${browseFunctions} />
+            ${activeTarget && advice && activeTarget.id === (targets[0] && targets[0].id) ? html`<div class="headline" style="border:none;padding:0;">${typeof advice === "string" ? advice : (advice.message || advice.text || "")}</div>` : null}
+          </aside>
+        </div>
+      `}
 
       ${codeFn ? html`<${CodeView} fn=${codeFn.fn} finding=${codeFn.finding} source=${codeFn.source}
         crumbs=${codeFn.crumbs} xbinCallers=${codeFn.xbinCallers}

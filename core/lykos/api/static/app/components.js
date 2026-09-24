@@ -832,3 +832,143 @@ export function UnavailablePanel({ items }) {
       </ul>
     </div>`;
 }
+
+
+// ── Workbench shell (C²) components ──────────────────────────────────────────────────────
+// A shield icon (checked when a live exploit was demonstrated).
+function shieldSvg(stroke, checked) {
+  return html`<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke=${stroke}
+    stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M12 2 3 7v6c0 5 4 8 9 9 5-1 9-4 9-9V7z"/>${checked ? html`<path d="m9 12 2 2 4-4"/>` : null}</svg>`;
+}
+
+// A compact, horizontal verdict header for the shell: worst effect + mini L1▸L2▸L3 ladder + the
+// bundle download. Mirrors VerdictCard but sized for a persistent header, not a stacked card.
+export function ShellVerdict({ verdict, artifactUrl }) {
+  const v = verdict;
+  if (!v) return null;
+  const demo = v.status === "demonstrated";
+  const head = v.headline;
+  const cls = demo ? "vd-demo" : v.status === "potential" ? "vd-pot" : "vd-none";
+  const accent = demo ? "var(--bad)" : "var(--ok)";
+  return html`
+    <div class=${`card wb-verdict ${cls}`}>
+      <div class="vv-icon">${shieldSvg(accent, demo)}</div>
+      <div class="vv-body">
+        <div class="vv-eff">${demo ? "✓ " : "○ "}${head ? (head.title || head.kind) : "No crash reproduced"}</div>
+        <div class="vv-sub">${demo
+          ? "working proof-of-concept · confirmed under the debugger"
+          : head ? "reachable in principle for this defect class — not yet demonstrated"
+          : `${v.staticCount} static finding${v.staticCount === 1 ? "" : "s"}${v.coverage != null ? `, ${v.coverage}% covered` : ""}`}</div>
+      </div>
+      <div class="vv-right">
+        <div class="vv-mini-ladder" title="how far the exploit chain got">
+          ${[1, 2, 3].map((n) => html`${n > 1 ? html`<span class=${`vd-arrow${v.level >= n ? " filled" : ""}`}>▸</span>` : null}<span class=${`vd-rung${v.level >= n ? " filled" : ""}`} key=${n}>L${n}</span>`)}
+        </div>
+        ${demo && v.bundlePoc && v.bundlePoc.bundle_sha
+          ? html`<a class="btn small" href=${artifactUrl(v.bundlePoc.bundle_sha)} download>⬇ PoC bundle${v.bundlePoc.verified ? " (verified)" : ""}</a>` : null}
+      </div>
+    </div>`;
+}
+
+function pocLvlNum(p) { const m = /(\d)/.exec((p && p.level) || ""); return m ? +m[1] : 0; }
+
+// The demonstrated-effect narrative for a finding (the chain_primitive/root-cause detail), pulled
+// from its effects-channel evidence -- what the L3 rung shows as "how it works".
+function exploitDetail(f) {
+  if (!f || !f.evidence) return null;
+  for (const e of f.evidence) {
+    if (e.channel === "effects") {
+      try { const a = JSON.parse(e.detail); const d = a.find((x) => x.status === "demonstrated") || a[0]; if (d && (d.detail || (d.proof && d.proof.note))) return d.detail || d.proof.note; } catch { /* not json */ }
+    }
+  }
+  const e = (f.evidence || []).find((x) => x.detail);
+  return e && e.detail;
+}
+
+// The Exploits tab: the L1▸L2▸L3 ladder for one target, each rung with its artifacts and verified
+// state, and the L3 rung expanded with how the exploit works + an offline-reproduce block.
+export function ExploitsPanel({ verdict, pocs, topFinding, artifactUrl }) {
+  const v = verdict || {};
+  const lvl = v.level || 0;
+  const byLvl = {};
+  for (const p of pocs || []) { const n = pocLvlNum(p); if (!byLvl[n] || (p.verified && !byLvl[n].verified)) byLvl[n] = p; }
+  const inputSha = (byLvl[1] && byLvl[1].input_sha) || (v.inputPoc && v.inputPoc.input_sha) || (byLvl[2] && byLvl[2].input_sha);
+  const bundleSha = v.bundlePoc && v.bundlePoc.bundle_sha;
+  const detail = exploitDetail(topFinding);
+  if (!lvl && !(pocs || []).length) return html`<div class="wb-soon">No exploit built for this target yet — run Autopilot, and any crash → primitive → working exploit will appear here as the chain progresses.</div>`;
+  return html`
+    <div class="xp-ladder">
+      <div class="xp-rung">
+        <div class=${`xp-lvl ${lvl >= 1 ? "done" : "pend"}`}>L1</div>
+        <div class="xp-body">
+          <div class="xp-t">Crash reproduced ${lvl >= 1 ? html`<span class="xp-ok">✓ verified</span>` : ""}</div>
+          <div class="xp-sub">${v.crashed ? "a fault fired reliably under the sandbox" : "no crash reproduced"}</div>
+        </div>
+        ${inputSha ? html`<a class="btn small ghost" href=${artifactUrl(inputSha)} download>⬇ crashing input</a>` : null}
+      </div>
+      <div class="xp-rung">
+        <div class=${`xp-lvl ${lvl >= 2 ? "done" : "pend"}`}>L2</div>
+        <div class="xp-body">
+          <div class="xp-t">Primitive proven ${lvl >= 2 ? html`<span class="xp-ok">✓ confirmed</span>` : ""}</div>
+          <div class="xp-sub">${lvl >= 2 ? "an instruction pointer / memory location is attacker-controlled" : "no primitive built yet"}</div>
+        </div>
+      </div>
+      ${lvl >= 3 ? html`
+        <div class="xp-rung xp-l3">
+          <div class="xp-l3-head">
+            <div class="xp-lvl crit">L3</div>
+            <div class="xp-body">
+              <div class="xp-t">Working exploit${topFinding ? ` — ${topFinding.title}` : ""}</div>
+              <div class="xp-sub">arrival confirmed under the debugger · negative control passed</div>
+            </div>
+          </div>
+          <div class="xp-grid">
+            <div class="xp-steps"><span class="xp-k">HOW IT WORKS</span>${detail || "control flow was hijacked to attacker-chosen code."}</div>
+            <div class="xp-repro"><span class="xp-k">REPRODUCE — OFFLINE, AIR-GAPPED</span>$ unzip poc-bundle.zip<br/>$ ./RUN.sh<br/><span style="color:var(--ok)">breakpoint reached ✓  control passed ✓</span></div>
+          </div>
+          <div class="xp-actions">
+            ${bundleSha ? html`<a class="btn" href=${artifactUrl(bundleSha)} download>⬇ PoC bundle (verified)</a>` : null}
+            ${inputSha ? html`<a class="btn ghost" href=${artifactUrl(inputSha)} download>⬇ exploit input</a>` : null}
+          </div>
+        </div>` : html`
+        <div class="xp-rung">
+          <div class="xp-lvl pend">L3</div>
+          <div class="xp-body">
+            <div class="xp-t">Working exploit</div>
+            <div class="xp-sub">not reached — no full exploit demonstrated for this target</div>
+          </div>
+        </div>`}
+    </div>`;
+}
+
+// Right-drawer persistent context: the target's raw facts (mitigations, identity, hashes).
+function mitTone(k, val) {
+  const on = val === "on" || val === true || val === "full";
+  const weakOff = ["pie", "nx", "canary"].includes(k);
+  if (on) return "mit-good";
+  return weakOff ? "mit-weak" : "";
+}
+export function DrawerFacts({ target, onBrowseFunctions }) {
+  if (!target) return null;
+  const t = target;
+  const m = t.mitigations || {};
+  return html`
+    <div>
+      <div class="rail-sec-h">Target</div>
+      <div class="dr-target">${t.filename}</div>
+      <div class="vv-sub">${(t.file_type || "").toUpperCase()} · ${t.arch || "?"} · ${fmtBytes(t.size)}</div>
+      ${Object.keys(m).length ? html`<div class="mits" style="justify-content:flex-start;margin-top:12px;">
+        ${Object.entries(m).map(([k, val]) => html`<span class=${`mit ${mitTone(k, val)}`} key=${k}>${k.toUpperCase()} ${val}</span>`)}
+      </div>` : null}
+    </div>
+    <div>
+      <div class="rail-sec-h">Identity</div>
+      <div class="dr-kv"><span class="dr-k">arch</span><span class="dr-v">${t.arch || "?"} ${t.bits || ""}b ${t.endianness || ""}</span></div>
+      <div class="dr-kv"><span class="dr-k">linking</span><span class="dr-v">${t.linking || "?"}</span></div>
+      <div class="dr-kv"><span class="dr-k">stripped</span><span class="dr-v">${t.stripped ? "yes" : "no"}</span></div>
+      ${t.entropy != null ? html`<div class="dr-kv"><span class="dr-k">entropy</span><span class="dr-v">${(+t.entropy).toFixed(3)}</span></div>` : null}
+      <div class="dr-hashes" style="margin-top:10px;">sha256 ${t.sha256}</div>
+    </div>
+    ${onBrowseFunctions ? html`<button class="btn small ghost" onClick=${() => onBrowseFunctions(t.id)}>Browse functions →</button>` : null}`;
+}
