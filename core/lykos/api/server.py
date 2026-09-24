@@ -618,6 +618,7 @@ class Handler(EndpointsMixin, AutopilotMixin, BaseHTTPRequestHandler):
         "synthesize_secret": ("..analyze.poc", "enqueue_secret"),
         "boundary_fuzz": ("..analyze.link", "enqueue_boundary"),
         "heap_check": ("..analyze.dynamic", "enqueue_heap_check"),
+        "heap_trace": ("..analyze.dynamic", "enqueue_heap_trace"),
         "root_cause": ("..analyze.debug", "enqueue_root_cause"),
         "multi_debug": ("..analyze.debug", "enqueue_multi_debug"),
         "debug_monitor": ("..analyze.debug", "enqueue_monitor"),
