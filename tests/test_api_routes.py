@@ -310,4 +310,5 @@ def test_orchestrate_prove_stages_receive_params():
     for stage in ("root_cause", "build_poc", "poc_primitive"):
         assert stage not in orchestrate._NO_PARAMS, \
             f"{stage} needs params.input_sha but is marked no-param"
-    assert orchestrate._NO_PARAMS == {"disassemble", "detect_cwe", "heap_trace", "oob_index"}
+    assert orchestrate._NO_PARAMS == {"disassemble", "detect_cwe", "heap_trace", "oob_index",
+                                      "chain_primitive"}

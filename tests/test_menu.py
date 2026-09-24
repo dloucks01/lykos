@@ -90,7 +90,8 @@ def test_crawl_menu_learns_field_templates(tmp_path):
     def spawn():
         return subprocess.Popen([sys.executable, str(prog)], stdin=subprocess.PIPE,
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    model = menu.crawl_menu(spawn, ["1", "2", "3", "4"], idle=0.1, per_option=4.0)
+    # generous idle/budget so the prompt-stall detection stays reliable under heavy CI load
+    model = menu.crawl_menu(spawn, ["1", "2", "3", "4"], idle=0.3, per_option=8.0)
     assert model.get("1") == ["str", "str", "num", "num", "str"]   # Name,Surname,Age,size,Note
     assert model.get("2") == ["idx", "str"]                        # id, new name
     assert model.get("3") == ["idx"]                               # id

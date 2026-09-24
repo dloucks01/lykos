@@ -37,6 +37,7 @@ _TARGET = {
     "heap_check": ("..analyze.dynamic", "enqueue_heap_check"),
     "heap_trace": ("..analyze.dynamic", "enqueue_heap_trace"),
     "oob_index": ("..analyze.dynamic", "enqueue_oob_index"),
+    "chain_primitive": ("..analyze.poc", "enqueue_chain"),
     "concolic": ("..analyze.symbolic", "enqueue_concolic"),
     "root_cause": ("..analyze.debug", "enqueue_root_cause"),
     "build_poc": ("..analyze.poc", "enqueue_build_poc"),
@@ -55,7 +56,7 @@ _CASE = {
 # Stages whose enqueue-fn takes NO params. root_cause/build_poc/poc_primitive are NOT here: they
 # require params["input_sha"] (the crashing input), which the prove loop threads in -- listing
 # them dropped that input and every one failed with "requires params.input_sha".
-_NO_PARAMS = {"disassemble", "detect_cwe", "heap_trace", "oob_index"}
+_NO_PARAMS = {"disassemble", "detect_cwe", "heap_trace", "oob_index", "chain_primitive"}
 _CASE_NO_PARAMS = {"link_case", "ipc_model", "cross_taint"}
 
 _TERMINAL = {"done", "cancelled", "error"}
@@ -114,7 +115,7 @@ _PLAN_STAGES = [
     ("cve_scan", "Known-CVE scan"), ("synthesize_injection", "Injection probes"),
     ("coverage_fuzz", "Coverage fuzzing"), ("directed_fuzz", "Directed fuzzing"),
     ("heap_check", "Heap checks"), ("heap_trace", "Heap primitives"),
-    ("oob_index", "Array-index probes"),
+    ("oob_index", "Array-index probes"), ("chain_primitive", "Primitive chaining"),
     ("concolic", "Concolic execution"),
     ("root_cause", "Root-cause"), ("build_poc", "Build PoC"),
     ("poc_primitive", "PoC primitive"), ("build_exploit", "Build exploit"),
@@ -341,6 +342,10 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict, stop: t
             # Out-of-bounds array-index discovery (a fixed-size object table selected by a
             # user id whose bound check is missing / off-by-one).
             _run_target_stage(store, t, "oob_index", status, stop)
+            # Chain a discovered heap / OOB primitive into a demonstrated control-flow hijack
+            # (or an L2 recipe) -- consumes the heap_trace / oob_index Findings, which otherwise
+            # reach no exploit builder.
+            _run_target_stage(store, t, "chain_primitive", status, stop)
             crashes = _distinct_crashes(store, tid)
             # Multi-channel retry: the best-guess channel is not always where the bug is (a file
             # parser's overflow can be in the argv filename). If nothing crashed, drive the fast
