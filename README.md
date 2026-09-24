@@ -97,7 +97,7 @@ core/lykos/        the platform (stdlib only)
   jobs/            the job queue and worker pool
   toolchain.py     one inventory of every external tool  <- `lykos doctor` reads this
 tests/             the suite (~1290), incl. js/ harnesses for the UI
-docs/              design docs 00-23; archive/ is historical, not maintained
+docs/              design docs 00-25; archive/ is historical, not maintained
 examples/          runnable demos and fixture builders
 packaging/         zipapp build, offline verify, air-gap bundle scripts
 ```
