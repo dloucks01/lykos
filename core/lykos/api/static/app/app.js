@@ -8,7 +8,7 @@ import { api, waitForRun } from "./api.js";
 import { runAutopilotCase, newController, cancel as cancelAutopilot, coverageOf } from "./autopilot.js";
 import { rankFindings, pocsForFinding, fmtTime, progressText, stageLabel, dedupeFindings, buildRunLog, buildVerdicts } from "./util.js";
 import {
-  html, DropZone, TargetSummary, ProgressLog, ConsolePanel, FindingCard, EmptyResults, Spinner, UnavailablePanel, SystemMap, CoveragePanel, CodeView, PipelinePlan, EvidenceModal, FunctionsModal, VerdictStrip, VerdictCard, AnalysisDrawer, ShellVerdict, ExploitsPanel, DrawerFacts, FunctionsPanel, StringsPanel, DisasmPanel, DiffPanel, CrashesPanel,
+  html, DropZone, TargetSummary, ProgressLog, ConsolePanel, FindingCard, EmptyResults, Spinner, UnavailablePanel, SystemMap, CoveragePanel, CodeView, PipelinePlan, EvidenceModal, FunctionsModal, VerdictStrip, VerdictCard, AnalysisDrawer, ShellVerdict, ExploitsPanel, DrawerFacts, FunctionsPanel, StringsPanel, DisasmPanel, DiffPanel, CrashesPanel, CallGraphCanvas,
 } from "./components.js";
 
 let _conSeq = 0;
@@ -92,6 +92,8 @@ function App() {
   const [activeTid, setActiveTid] = useState(null);   // the target focused in the workbench shell
   const [tab, setTab] = useState("findings");         // active workbench tab
   const [funcsByT, setFuncsByT] = useState({});       // lazy per-target caches for the tab views
+  const [cgByT, setCgByT] = useState({});             // call-graph edges per target
+  const [fnView, setFnView] = useState("graph");      // Functions tab: graph or table
   const [stringsByT, setStringsByT] = useState({});
   const [dynByT, setDynByT] = useState({});
   const [disasmFn, setDisasmFn] = useState(null);     // getFunction detail for the Disassembly tab
@@ -554,9 +556,10 @@ function App() {
     if (!_at) return;
     const needFns = (tab === "functions" || tab === "disasm") && !funcsByT[_at];
     if (needFns) api.functions(_at).then((fs) => setFuncsByT((c) => ({ ...c, [_at]: fs || [] }))).catch(() => setFuncsByT((c) => ({ ...c, [_at]: [] })));
+    if (tab === "functions" && !cgByT[_at]) api.callgraph(_at).then((cg) => setCgByT((c) => ({ ...c, [_at]: cg || [] }))).catch(() => setCgByT((c) => ({ ...c, [_at]: [] })));
     if (tab === "strings" && !stringsByT[_at]) api.strings(_at, { limit: 2000 }).then((ss) => setStringsByT((c) => ({ ...c, [_at]: (ss && ss.items) || (Array.isArray(ss) ? ss : []) }))).catch(() => setStringsByT((c) => ({ ...c, [_at]: [] })));
     if (!dynByT[_at]) api.dynresults(_at).then((ds) => setDynByT((c) => ({ ...c, [_at]: ds || [] }))).catch(() => setDynByT((c) => ({ ...c, [_at]: [] })));
-  }, [tab, _at, funcsByT, stringsByT, dynByT]);
+  }, [tab, _at, funcsByT, cgByT, stringsByT, dynByT]);
 
   const ranked = dedupeFindings(rankFindings(findings));
   const topDemoId = ranked.find((f) => f.state === "poc-backed")?.id;
@@ -741,7 +744,15 @@ function App() {
               </div>
             ` : tab === "functions" ? html`
               <div class="wb-panel">
-                <${FunctionsPanel} functions=${activeFuncs} onOpen=${(fn) => openFunction(fn, _atid)} />
+                <div class="fn-viewtabs">
+                  <button class=${`fn-viewtab${fnView === "graph" ? " active" : ""}`} onClick=${() => setFnView("graph")}>Call graph</button>
+                  <button class=${`fn-viewtab${fnView === "table" ? " active" : ""}`} onClick=${() => setFnView("table")}>Functions</button>
+                </div>
+                ${fnView === "graph"
+                  ? html`<${CallGraphCanvas} functions=${activeFuncs} edges=${_atid ? cgByT[_atid] : null}
+                      onOpen=${(fn) => openFunction(fn, _atid)}
+                      highlightAddr=${topDemoFinding && (topDemoFinding.function_addr || topDemoFinding.site_addr)} />`
+                  : html`<${FunctionsPanel} functions=${activeFuncs} onOpen=${(fn) => openFunction(fn, _atid)} />`}
               </div>
             ` : tab === "disasm" ? html`
               <div class="wb-panel">
