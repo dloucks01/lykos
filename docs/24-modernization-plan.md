@@ -205,7 +205,7 @@ tictactoe):
   the LD_PRELOAD guard (`heap_check`) only sees libc; a target with its OWN allocator
   (`ta_alloc`/`ta_free`, an arena pool, `operator new`) was invisible. `heap_trace` identifies the
   allocator pair from local symbols, drives create-then-double-act menu op-sequences, and traces the
-  pointer lifecycle by ptrace to discover a **double-free (CWE-415)** allocator-agnostically, filing
+  pointer lifecycle by ptrace to discover a **double-free (CWE-415)** and, via hardware watchpoints, a **use-after-free (CWE-416)** allocator-agnostically, filing
   it `corroborated` + an aaheg `Vuln{double_free}` lead. Validated on a synthetic custom-allocator
   binary; identifies auth-or-out's `ta_alloc`/`ta_free` (whose specific primitive still needs UAF
   detection + menu-semantic sequences).
