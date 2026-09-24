@@ -626,6 +626,29 @@
   .dr-tag.t-same { color: var(--muted); }
   .dr-cwe { font-family: var(--mono); font-size: .78rem; color: var(--muted); }
   .dr-state { font-size: .78rem; text-align: center; color: var(--muted); }
+  /* Call-graph canvas: pan/zoom SVG of the internal call graph */
+  .fn-viewtabs { display: inline-flex; gap: 2px; background: var(--panel-2); border: 1px solid var(--line);
+    border-radius: 8px; padding: 2px; margin-bottom: 8px; }
+  .fn-viewtab { font-size: .82rem; padding: 4px 12px; border-radius: 6px; border: none; background: transparent;
+    color: var(--muted); cursor: pointer; font: inherit; }
+  .fn-viewtab.active { background: var(--panel); color: var(--ink); font-weight: 600; }
+  .cgc { position: relative; border: 1px solid var(--line); border-radius: 10px; overflow: hidden;
+    background: var(--panel); user-select: none; }
+  .cgc-tools { display: flex; align-items: center; gap: 10px; padding: 8px 12px; border-bottom: 1px solid var(--line); }
+  .cgc-hint { color: var(--faint); font-size: .74rem; }
+  .cgc-svg { display: block; cursor: grab; touch-action: none; }
+  .cgc-svg:active { cursor: grabbing; }
+  .cg2-edge { fill: none; stroke: color-mix(in srgb, var(--muted) 55%, transparent); stroke-width: 1.4; }
+  .cg2-node { cursor: default; }
+  .cg2-fn { cursor: pointer; }
+  .cg2-node rect { fill: var(--panel-2); stroke: var(--line); stroke-width: 1; }
+  .cg2-fn:hover rect { stroke: var(--accent); fill: var(--panel); }
+  .cg2-node text { font-family: var(--mono); font-size: 12px; fill: var(--ink); pointer-events: none; }
+  .cg2-ext rect { fill: transparent; stroke-dasharray: 3 3; stroke: var(--faint); }
+  .cg2-ext text { fill: var(--muted); }
+  .cg2-hl rect { fill: color-mix(in srgb, var(--bad) 20%, transparent); stroke: var(--bad); stroke-width: 1.6; }
+  .cg2-hl text { fill: color-mix(in srgb, var(--bad) 90%, var(--ink)); font-weight: 700; }
+
   /* Crashes */
   .crash-list { border: 1px solid var(--line); border-radius: 9px; overflow: hidden; }
   .crash-row { display: grid; grid-template-columns: 90px 110px 1fr auto; gap: 12px; align-items: center;

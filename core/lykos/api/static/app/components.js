@@ -1111,3 +1111,74 @@ export function CrashesPanel({ crashes, artifactUrl }) {
       </div>
     </div>`;
 }
+
+
+// A pan/zoom canvas of a target's internal call graph. Nodes = functions (clickable → open) plus
+// leaf nodes for external/PLT calls; edges = calls. Laid out in layers by BFS depth from main/entry.
+// The demonstrated finding's function is highlighted so the exploit's home is visible at a glance.
+const _cgClean = (n) => (n || "").replace(/^(sym\.imp\.|sym\.|imp\.)/, "").replace(/@.*/, "") || "?";
+export function CallGraphCanvas({ functions, edges, onOpen, highlightAddr }) {
+  const [view, setView] = useState({ tx: 0, ty: 0, k: 1 });
+  const drag = useRef(null);
+  const na = (a) => (a == null ? null : (typeof a === "string" ? parseInt(a, 16) : a));
+  if (!functions || !edges) return html`<div class="wb-soon"><${Spinner} label="Loading call graph…" /></div>`;
+  const fnByAddr = new Map((functions || []).map((f) => [na(f.addr), f]));
+  const nodeMap = new Map();
+  const E = [];
+  const addFn = (f) => { const k = "f" + na(f.addr); if (!nodeMap.has(k)) nodeMap.set(k, { key: k, label: _cgClean(f.name) || fmtAddr(f.addr), kind: "fn", fn: f, addr: na(f.addr) }); return k; };
+  const addExt = (nm) => { const k = "x" + nm; if (!nodeMap.has(k)) nodeMap.set(k, { key: k, label: _cgClean(nm), kind: "ext" }); return k; };
+  for (const e of edges) {
+    const sf = fnByAddr.get(na(e.src_addr));
+    if (!sf) continue;
+    const from = addFn(sf);
+    const df = fnByAddr.get(na(e.dst_addr));
+    const to = df ? addFn(df) : (e.dst_name ? addExt(e.dst_name) : null);
+    if (to && to !== from) E.push([from, to]);
+  }
+  const nodes = [...nodeMap.values()];
+  if (!nodes.length) return html`<div class="wb-soon">No call edges were recovered for this target.</div>`;
+  const adj = new Map(nodes.map((n) => [n.key, []]));
+  const indeg = new Map(nodes.map((n) => [n.key, 0]));
+  for (const [a, b] of E) { adj.get(a).push(b); indeg.set(b, indeg.get(b) + 1); }
+  let roots = nodes.filter((n) => n.kind === "fn" && /(^|\.)main$|entry/i.test(n.label)).map((n) => n.key);
+  if (!roots.length) roots = nodes.filter((n) => indeg.get(n.key) === 0).map((n) => n.key);
+  if (!roots.length) roots = [nodes[0].key];
+  const depth = new Map(); const q = [...roots]; roots.forEach((r) => depth.set(r, 0));
+  while (q.length) { const a = q.shift(); for (const b of adj.get(a) || []) if (!depth.has(b)) { depth.set(b, depth.get(a) + 1); q.push(b); } }
+  let maxD = 0; depth.forEach((v) => { maxD = Math.max(maxD, v); });
+  nodes.forEach((n) => { if (!depth.has(n.key)) depth.set(n.key, maxD + 1); });
+  const layers = [];
+  nodes.forEach((n) => { const d = depth.get(n.key); (layers[d] = layers[d] || []).push(n); });
+  const COLW = 168, ROWH = 92, NW = 132, NH = 38, PAD = 30;
+  const maxCols = Math.max(1, ...layers.map((l) => (l ? l.length : 0)));
+  const pos = new Map();
+  layers.forEach((layer, d) => { if (!layer) return; const off = (maxCols - layer.length) / 2; layer.forEach((n, i) => pos.set(n.key, { x: (off + i) * COLW + PAD, y: d * ROWH + PAD })); });
+  const W = maxCols * COLW + PAD * 2, H = layers.length * ROWH + PAD * 2;
+  const onWheel = (ev) => { ev.preventDefault(); const f = ev.deltaY < 0 ? 1.1 : 0.9; setView((v) => ({ ...v, k: Math.min(2.4, Math.max(0.3, v.k * f)) })); };
+  const onDown = (ev) => { drag.current = { x: ev.clientX, y: ev.clientY, tx: view.tx, ty: view.ty }; };
+  const onMove = (ev) => { if (!drag.current) return; setView((v) => ({ ...v, tx: drag.current.tx + (ev.clientX - drag.current.x), ty: drag.current.ty + (ev.clientY - drag.current.y) })); };
+  const onUp = () => { drag.current = null; };
+  return html`
+    <div class="cgc">
+      <div class="cgc-tools">
+        <button class="btn xsmall ghost" onClick=${() => setView({ tx: 0, ty: 0, k: 1 })}>Reset view</button>
+        <span class="cgc-hint">${nodes.length} nodes · drag to pan · scroll to zoom · click a function to open it</span>
+      </div>
+      <svg class="cgc-svg" width="100%" height="520" viewBox=${`0 0 ${W} ${H}`}
+        preserveAspectRatio="xMidYMid meet" onWheel=${onWheel} onPointerDown=${onDown}
+        onPointerMove=${onMove} onPointerUp=${onUp} onPointerLeave=${onUp}>
+        <g transform=${`translate(${view.tx},${view.ty}) scale(${view.k})`}>
+          ${E.map(([a, b], i) => { const p = pos.get(a), r = pos.get(b); if (!p || !r) return null;
+            const x1 = p.x + NW / 2, y1 = p.y + NH, x2 = r.x + NW / 2, y2 = r.y, my = (y1 + y2) / 2;
+            return html`<path key=${"e" + i} class="cg2-edge" d=${`M${x1},${y1} C${x1},${my} ${x2},${my} ${x2},${y2}`} />`; })}
+          ${nodes.map((n) => { const p = pos.get(n.key); if (!p) return null;
+            const hl = n.kind === "fn" && highlightAddr != null && n.addr === na(highlightAddr);
+            return html`<g key=${n.key} class=${`cg2-node ${n.kind === "ext" ? "cg2-ext" : "cg2-fn"}${hl ? " cg2-hl" : ""}`}
+                transform=${`translate(${p.x},${p.y})`} onClick=${() => { if (n.kind === "fn" && onOpen) onOpen(n.fn); }}>
+              <rect width=${NW} height=${NH} rx="8"></rect>
+              <text x=${NW / 2} y=${NH / 2 + 4} text-anchor="middle">${n.label.length > 17 ? n.label.slice(0, 16) + "…" : n.label}</text>
+            </g>`; })}
+        </g>
+      </svg>
+    </div>`;
+}
