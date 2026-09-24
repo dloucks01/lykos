@@ -205,13 +205,22 @@ tictactoe):
   the LD_PRELOAD guard (`heap_check`) only sees libc; a target with its OWN allocator
   (`ta_alloc`/`ta_free`, an arena pool, `operator new`) was invisible. `heap_trace` identifies the
   allocator pair from local symbols, drives create-then-double-act menu op-sequences, and traces the
-  pointer lifecycle by ptrace to discover a **double-free (CWE-415)** and, via hardware watchpoints, a **use-after-free (CWE-416)** allocator-agnostically, filing
-  it `corroborated` + an aaheg `Vuln{double_free}` lead. Validated on a synthetic custom-allocator
-  binary; identifies auth-or-out's `ta_alloc`/`ta_free` (whose specific primitive still needs UAF
-  detection + menu-semantic sequences).
+  pointer lifecycle by ptrace to discover a **double-free (CWE-415)**, a **use-after-free (CWE-416)**
+  and a **heap overflow (CWE-122)** allocator-agnostically, filing
+  it `corroborated` + an aaheg `Vuln{double_free|uaf|heap_overflow}` lead. UAF and double-free use a
+  hardware watchpoint on the freed chunk's data; the overflow detector arms a **write-only** watchpoint
+  on the qword just past each live chunk's end (paired from the alloc-entry `rdi`=size and the
+  alloc-return `rax`=ptr) and reports a write there from any non-allocator code (usually libc
+  `strcpy`/`memcpy` driven by the program). Validated end-to-end on synthetic custom-allocator
+  double-free / UAF / overflow binaries. On auth-or-out it identifies `ta_alloc`/`ta_free` and finds
+  no chunk overflow — correctly, because that target's bug is an **out-of-bounds array-index write**
+  (`modify_author` validates the author id only against `> 10`, not `== 0`, so id 0 indexes
+  `authors[-1]`), a distinct class from a heap-chunk overflow.
 
-Still analyst-gated / next: the full angrop/pwntools finish-the-chain backend, heap UAF/overflow
-discovery + tcache-poison chaining (double-free discovery now lands), leaked-canary/PIE
+Still analyst-gated / next: the full angrop/pwntools finish-the-chain backend, tcache-poison chaining
+off the discovered double-free/UAF/overflow primitives, an **OOB array-index** detector (the
+auth-or-out class), menu-semantic op inference (so richer add flows — Name/Surname/Age/size/Note —
+are driven automatically rather than from the generic template), leaked-canary/PIE
 auto-confirmation, and the SROP 2-stage/leak variant for the
 no-writable case (the hardest, e.g. sick_rop).
 

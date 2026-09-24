@@ -36,6 +36,12 @@ def test_heap_op_sequences_empty_without_menu():
     assert heaptrace.heap_op_sequences(["1"]) == []
 
 
+def test_heap_op_sequences_include_overflow_shape():
+    seqs = heaptrace.heap_op_sequences(["1", "2", "3", "4"])
+    # a SMALL create (size 16) followed by an over-long payload = the heap-overflow shape
+    assert any(s.startswith(b"1\n16\n") and b"B" * 128 in s for s in seqs)
+
+
 def test_heap_op_sequences_include_uaf_cross_option():
     seqs = heaptrace.heap_op_sequences(["1", "2", "3", "4"])
     # a create then a FREE-op then a different USE-op (use-after-free shape) exists

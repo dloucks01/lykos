@@ -96,6 +96,14 @@ def heap_op_sequences(menu_options, *, max_seqs: int = 40) -> list[bytes]:
         a, b2 = opts[1].encode(), opts[2].encode()
         seqs.append(create + create + a + nl + b"0" + nl + a + nl + b"0" + nl)
         seqs.append(create + b2 + nl + b"0" + nl + b2 + nl + b"0" + nl)
+    # heap-OVERFLOW shape: allocate a SMALL object, then drive each option with an over-long
+    # payload (the classic "modify/edit" bug that writes past the requested size). Object id 0/1.
+    small = opts[0].encode() + nl + b"16" + nl + b"A" * 8 + nl
+    big = b"B" * 128
+    for act in opts[1:]:
+        ab = act.encode()
+        seqs.append(small + ab + nl + b"0" + nl + big + nl)     # create small; modify 0 (over-long)
+        seqs.append(small + ab + nl + big + nl)                 # create small; modify (no id)
     out, seen = [], set()
     for s in seqs:
         if s not in seen:
@@ -182,12 +190,12 @@ if __name__ == "__main__":                                            # ---- the
             v = libc.ptrace(PTRACE_PEEKUSER, pid, ctypes.c_void_p(_DR + n * 8), None)
             return 0 if (v == -1 and ctypes.get_errno()) else (v & 0xFFFFFFFFFFFFFFFF)
 
-        def set_watch(slot, addr):
+        def set_watch(slot, addr, rw=0b11):
             poke_dr(slot, addr)                          # DRn = watched address
             dr7 = peek_dr(7)
             dr7 |= (1 << (slot * 2))                     # Ln: local enable
             dr7 &= ~(0b1111 << (16 + slot * 4))
-            dr7 |= (0b11 << (16 + slot * 4))             # R/W = 11 (read+write)
+            dr7 |= (rw << (16 + slot * 4))               # R/W: 0b11 read+write, 0b01 write-only
             dr7 |= (0b10 << (18 + slot * 4))             # LEN = 10 (8 bytes)
             poke_dr(7, dr7)
 
@@ -226,6 +234,7 @@ if __name__ == "__main__":                                            # ---- the
 
         free_addr = rebase + free_off
         setbp(free_addr, "free")
+        setbp(rebase + alloc_base_off, "alloc_enter")    # entry: rdi = requested size
         for ro in alloc_ret_offs:
             setbp(rebase + alloc_base_off + ro, "alloc")
 
@@ -233,14 +242,41 @@ if __name__ == "__main__":                                            # ---- the
         signal.alarm(timeout)
 
         freed = set()                                    # pointers currently free
-        free_slots = [0, 1, 2, 3]                         # DR0-3 available for UAF watchpoints
-        slot_of = {}                                      # freed ptr -> DR slot watching its data
-        uaf_seen = set()
+        live = {}                                        # live ptr -> {"size", "end", "slot"}
+        pending_size = 0                                  # rdi captured at the last alloc entry
+        free_slots = [0, 1, 2, 3]                         # DR0-3 available for watchpoints
+        watches = {}                                      # slot -> {"addr", "kind", "chunk"}
+        uaf_seen, of_seen = set(), set()
         events = []
 
         def in_allocator(rip):
             off = rip - rebase
             return any(a <= off < b for a, b in ignore_ranges)
+
+        def arm(addr, kind, chunk, rw):
+            """Take a debug-register slot and watch `addr` (UAF: read+write on freed data;
+            overflow: write-only just past a live chunk's end). Best-effort: no-op when slots are
+            exhausted."""
+            if not free_slots:
+                return None
+            slot = free_slots.pop()
+            watches[slot] = {"addr": addr, "kind": kind, "chunk": chunk}
+            set_watch(slot, addr, rw)
+            return slot
+
+        def disarm(slot):
+            if slot is None or slot not in watches:
+                return
+            clear_watch(slot)
+            watches.pop(slot, None)
+            free_slots.append(slot)
+
+        def clear_covering(lo, hi):
+            """Drop any watch whose address falls in [lo, hi) -- a chunk being (re)allocated there
+            reclaims the region, so a stale UAF/overflow watch on it would false-positive."""
+            for slot, w in list(watches.items()):
+                if lo <= w["addr"] < hi:
+                    disarm(slot)
 
         try:
             while True:
@@ -260,17 +296,32 @@ if __name__ == "__main__":                                            # ---- the
                 dr6 = peek_dr(6)
                 if dr6 & 0xF:
                     in_code = base <= rg.rip < code_end
+                    in_alloc = in_allocator(rg.rip)
                     for slot in range(4):
                         if not (dr6 & (1 << slot)):
                             continue
-                        watched = next((p for p, s in slot_of.items() if s == slot), None)
-                        if (watched is not None and watched in freed
-                                and in_code and not in_allocator(rg.rip)):
-                            key = (watched, rg.rip)
+                        w = watches.get(slot)
+                        if not w:
+                            continue
+                        # UAF is conservative: only the target's OWN code counts (a libc mem* the
+                        # allocator drives over a freed chunk is bookkeeping, not a program UAF).
+                        if (w["kind"] == "uaf" and w["chunk"] in freed
+                                and in_code and not in_alloc):
+                            key = (w["chunk"], rg.rip)
                             if key not in uaf_seen:
                                 uaf_seen.add(key)
-                                events.append({"error": "use-after-free", "addr": hex(watched),
+                                events.append({"error": "use-after-free", "addr": hex(w["chunk"]),
                                                "pc": hex(rg.rip)})
+                        # A WRITE to the qword just past a LIVE chunk is an overflow by construction;
+                        # the writer is usually libc strcpy/memcpy called by the program, so allow any
+                        # PC except the allocator's own (its next-chunk setup writes there legitimately,
+                        # but clear_covering already drops the watch when that happens).
+                        elif w["kind"] == "overflow" and not in_alloc:
+                            key = (w["addr"], rg.rip)
+                            if key not in of_seen:
+                                of_seen.add(key)
+                                events.append({"error": "heap-overflow", "addr": hex(w["chunk"]),
+                                               "end": hex(w["addr"]), "pc": hex(rg.rip)})
                     poke_dr(6, 0)
                     continue                              # the access already retired; resume
                 bp = rg.rip - 1
@@ -284,16 +335,26 @@ if __name__ == "__main__":                                            # ---- the
                         if ptr in freed:
                             events.append({"error": "double-free", "addr": hex(ptr)})
                         freed.add(ptr)
-                        if ptr not in slot_of and free_slots:   # watch this freed chunk for UAF
-                            slot = free_slots.pop()
-                            slot_of[ptr] = slot
-                            set_watch(slot, ptr)
+                        # the chunk is dead: drop its end-of-chunk overflow watch, then watch its
+                        # data for a use-after-free.
+                        if ptr in live:
+                            disarm(live.pop(ptr).get("slot"))
+                        if not any(w["chunk"] == ptr and w["kind"] == "uaf"
+                                   for w in watches.values()):
+                            arm(ptr, "uaf", ptr, 0b11)   # read+write on freed data = UAF
+                elif kind == "alloc_enter":              # entry: capture the requested size (rdi)
+                    pending_size = rg.rdi
                 else:                                    # alloc return: rax = new pointer
                     ptr = rg.rax
+                    size, pending_size = pending_size, 0
                     freed.discard(ptr)                   # handed back out -> live again
-                    if ptr in slot_of:                   # stop watching a reused chunk
-                        clear_watch(slot_of[ptr])
-                        free_slots.append(slot_of.pop(ptr))
+                    if ptr and 0 < size <= (1 << 20):
+                        end = (ptr + size + 7) & ~7      # first aligned qword past the buffer
+                        clear_covering(ptr, end + 8)     # reclaim stale watches on this region
+                        slot = arm(end, "overflow", ptr, 0b01)   # write past end = overflow
+                        live[ptr] = {"size": size, "end": end, "slot": slot}
+                    elif ptr:
+                        clear_covering(ptr, ptr + 8)
                 # step over the int3: restore, single-step, re-arm
                 poke(bp, (peek(bp) & ~0xFF) | orig)
                 setrip(rg, bp)
@@ -312,7 +373,8 @@ if __name__ == "__main__":                                            # ---- the
 
         json.dump({"events": events,
                    "double_free": any(e.get("error") == "double-free" for e in events),
-                   "use_after_free": any(e.get("error") == "use-after-free" for e in events)},
+                   "use_after_free": any(e.get("error") == "use-after-free" for e in events),
+                   "heap_overflow": any(e.get("error") == "heap-overflow" for e in events)},
                   open(report, "w"))
         return 0
 

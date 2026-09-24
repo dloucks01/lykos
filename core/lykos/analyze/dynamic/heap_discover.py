@@ -128,7 +128,9 @@ def heap_trace_stage(ctx) -> dict:
         seqs = heaptrace.heap_op_sequences(opts) or [
             b"1\n64\nA\n2\n0\n2\n0\n", b"1\n2\n2\n",                 # double-free
             b"1\n64\nA\n2\n0\n3\n0\n", b"1\n2\n3\n", b"1\n2\n3\n4\n",  # UAF (alloc, free, use)
-            b"1\n2\n4\n", b"1\n64\nA\n2\n0\n4\n0\n"]
+            b"1\n2\n4\n", b"1\n64\nA\n2\n0\n4\n0\n",
+            b"1\n16\nA\n2\n0\n" + b"B" * 128 + b"\n",               # heap overflow (small; over-long modify)
+            b"1\n16\nA\n3\n0\n" + b"B" * 128 + b"\n"]
         ctx.emit("heaptrace.allocator", payload={
             "alloc": alloc["alloc_name"], "free": alloc["free_name"],
             "alloc_addr": hex(alloc["alloc"]), "free_addr": hex(alloc["free"]),
@@ -158,19 +160,19 @@ def heap_trace_stage(ctx) -> dict:
                 rep = json.loads(report.read_text())
             except Exception:
                 continue
-            if rep.get("double_free") or rep.get("use_after_free"):
+            if rep.get("double_free") or rep.get("use_after_free") or rep.get("heap_overflow"):
                 found = (seq, rep)
                 break
 
         if not found:
             ctx.emit("heaptrace.done", payload={
                 "applicable": True, "double_free": False, "use_after_free": False,
-                "allocator": alloc["alloc_name"],
+                "heap_overflow": False, "allocator": alloc["alloc_name"],
                 "note": (f"traced the target's own allocator ({alloc['alloc_name']}/"
-                         f"{alloc['free_name']}) over {len(seqs)} operation sequences; no double-free "
-                         "or use-after-free surfaced. A heap OVERFLOW may still exist, and the menu "
-                         "semantics may need analyst-supplied op sequences.")})
-            ctx.progress(pct=100, msg="no double-free / UAF surfaced on the custom allocator")
+                         f"{alloc['free_name']}) over {len(seqs)} operation sequences; no double-free, "
+                         "use-after-free or heap overflow surfaced. The menu semantics may need "
+                         "analyst-supplied op sequences.")})
+            ctx.progress(pct=100, msg="no heap primitive surfaced on the custom allocator")
             return {"metrics": {"applicable": True, "double_free": False}}
 
         seq, rep = found
@@ -178,20 +180,28 @@ def heap_trace_stage(ctx) -> dict:
         if rep.get("double_free"):
             _cwe, _title, _kind, _why = ("CWE-415", "Double free", "double_free",
                                          "freed a chunk that was already free")
-        else:
+        elif rep.get("use_after_free"):
             _cwe, _title, _kind, _why = ("CWE-416", "Use-after-free", "uaf",
                                          "read/wrote a chunk after it was freed")
+        else:
+            _cwe, _title, _kind, _why = ("CWE-122", "Heap-based buffer overflow", "heap_overflow",
+                                         "wrote past the end of an allocated chunk")
+        _seeds = ("Corrupts the adjacent chunk's header -> allocator metadata attack"
+                  if _kind == "heap_overflow" else "Seeds tcache poisoning -> arbitrary write")
         detail = (f"{_title} ({_cwe}) discovered on the target's own allocator "
                   f"{alloc['alloc_name']}/{alloc['free_name']}: the traced sequence {_why}. "
-                  f"Seeds tcache poisoning -> arbitrary write. (op sequence {input_sha[:12]})")
+                  f"{_seeds}. (op sequence {input_sha[:12]})")
         FindingDAO(ctx.conn).upsert(target.id, target.case_id, {
             "cwe": _cwe, "title": _title, "severity": "high" if _kind == "double_free" else "critical",
             "detector": "heap_trace", "state": "corroborated", "confidence": 0.85,
             "dedup_key": f"{_cwe}:heaptrace:{alloc['free_name']}",
-            "function_addr": alloc["free"], "site_addr": None, "site_detail": alloc["free_name"],
+            "function_addr": alloc["alloc"] if _kind == "heap_overflow" else alloc["free"],
+            "site_addr": None,
+            "site_detail": alloc["alloc_name"] if _kind == "heap_overflow" else alloc["free_name"],
             "evidence": [{"channel": "heap-trace", "detail": detail}]})
         ctx.emit("heaptrace.done", payload={
             "applicable": True, "double_free": _kind == "double_free", "use_after_free": _kind == "uaf",
+            "heap_overflow": _kind == "heap_overflow",
             "allocator": alloc["alloc_name"], "input_sha": input_sha,
             # the aaheg chainer consumes this Vuln shape (double_free/uaf -> tcache-poison chain)
             "vuln": {"vclass": _kind, "note": f"{alloc['alloc_name']}/{alloc['free_name']}"}})
