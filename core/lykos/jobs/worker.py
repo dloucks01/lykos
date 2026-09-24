@@ -29,6 +29,39 @@ from .registry import get_stage
 _log = logging.getLogger("lykos.jobs.worker")
 
 
+class _Slot:
+    """A per-execution concurrency-cap token released EXACTLY ONCE -- by the worker when its stage
+    returns, OR by the supervisor when it gives up on a wedged worker. The release-once guard is
+    what makes the supervisor's reclaim safe: if the stuck stage later returns and runs its own
+    `finally`, the second release is a no-op instead of over-releasing the BoundedSemaphore."""
+
+    __slots__ = ("_sem", "_lock", "_released")
+
+    def __init__(self, sem: threading.BoundedSemaphore) -> None:
+        self._sem = sem
+        self._lock = threading.Lock()
+        self._released = False
+
+    def release(self) -> bool:
+        with self._lock:
+            if self._released:
+                return False
+            self._released = True
+        self._sem.release()
+        return True
+
+
+class _Active:
+    """What a worker is currently running: its slot and the HARD deadline past which it is judged
+    wedged (a non-cooperative in-process call the heartbeat/cancel cannot interrupt)."""
+
+    __slots__ = ("slot", "hard_deadline")
+
+    def __init__(self, slot: _Slot, hard_deadline: Optional[float]) -> None:
+        self.slot = slot
+        self.hard_deadline = hard_deadline
+
+
 class _Heartbeat(threading.Thread):
     """Periodically extends a running job's lease from its OWN connection."""
 
@@ -93,6 +126,9 @@ class WorkerPool:
         self._classes = sorted(self.cfg.class_caps, key=lambda c: self.cfg.class_caps[c])
         self._metrics: dict[str, int] = defaultdict(int)
         self._mlock = threading.Lock()
+        # What each worker index is currently executing, for the supervisor's wedge watchdog.
+        self._active: dict[int, _Active] = {}
+        self._alock = threading.Lock()
 
     # ------------------------------------------------------------------ lifecycle
     def start(self) -> None:
@@ -138,17 +174,18 @@ class WorkerPool:
         wid = self._worker_id(idx)
         try:
             while not self._stopping.is_set():
-                if not self._try_one(q, wid):
+                if not self._try_one(q, wid, idx):
                     time.sleep(self.cfg.poll_interval)
         finally:
             conn.close()
 
-    def _try_one(self, q: JobQueue, wid: str) -> bool:
+    def _try_one(self, q: JobQueue, wid: str, idx: int) -> bool:
         """Claim+run one job across allowed classes (honoring caps). True if one ran."""
         for cls in self._classes:
             sem = self._sems[cls]
             if not sem.acquire(blocking=False):
                 continue
+            slot = _Slot(sem)                      # released once, by us OR the wedge watchdog
             try:
                 if not self._admit(cls):
                     continue
@@ -156,10 +193,10 @@ class WorkerPool:
                 if rid is None:
                     continue
                 self._bump("claimed")
-                self._execute(q, wid, rid)
+                self._execute(q, wid, rid, idx, slot)
                 return True
             finally:
-                sem.release()
+                slot.release()
         return False
 
     def _admit(self, cls: str) -> bool:
@@ -169,7 +206,7 @@ class WorkerPool:
         avail = _mem_available_mb()
         return avail is None or avail >= self.cfg.mem_min_mb_for_heavy
 
-    def _execute(self, q: JobQueue, wid: str, run_id: str) -> None:
+    def _execute(self, q: JobQueue, wid: str, run_id: str, idx: int, slot: "_Slot") -> None:
         run = q.runs.get(run_id)
         if run is None:
             return
@@ -182,6 +219,12 @@ class WorkerPool:
 
         timeout = sd.timeout if sd.timeout is not None else self.cfg.default_timeout
         deadline = (time.time() + timeout) if timeout else None
+        # Register this execution so the supervisor can reclaim the slot if the stage wedges. Only
+        # a stage WITH a deadline gets a hard deadline; an intentionally-unbounded stage does not.
+        hard = (deadline + self.cfg.wedge_grace) if deadline else None
+        active = _Active(slot, hard)
+        with self._alock:
+            self._active[idx] = active
         ctx = JobContext(q.conn, self.content, run, deadline=deadline, on_event=self.on_event)
         hb = _Heartbeat(self.db_path, run_id, wid, self.cfg, deadline=deadline)
         hb.start()
@@ -205,6 +248,11 @@ class WorkerPool:
             q.fail(run_id, repr(e), worker_id=wid)
             self._bump("error")
         finally:
+            # Deregister -- but only if the supervisor has not already retired us and handed idx to
+            # a replacement worker (identity check avoids clobbering the replacement's record).
+            with self._alock:
+                if self._active.get(idx) is active:
+                    self._active.pop(idx, None)
             hb.stop()
             ctx.cleanup()
 
@@ -221,16 +269,37 @@ class WorkerPool:
             conn.close()
 
     def _supervise(self) -> None:
-        """JE-10 respawn dead worker threads."""
+        """JE-10 respawn dead worker threads, and reclaim WEDGED ones so the pool cannot deadlock."""
         while not self._stopping.is_set():
             # Hold the lock across the check-and-respawn and re-test _stopping inside it, so a
             # respawn can't race stop()'s clear() and leak an unjoined worker after shutdown.
             with self._tlock:
                 if not self._stopping.is_set():
+                    now = time.time()
                     for i, t in enumerate(self._threads):
                         if not t.is_alive():
                             self._threads[i] = self._spawn_worker(i)
                             self._bump("respawned")
+                            continue
+                        # Wedged: alive, but its stage is long past its hard deadline -- stuck in a
+                        # non-cooperative in-process call the heartbeat/cancel could not interrupt
+                        # (the heartbeat has already lapsed so the reaper reclaimed the DB row). We
+                        # cannot kill a Python thread mid-native-call, so reclaim its concurrency
+                        # slot (release-once, safe if it ever returns) and spawn a replacement; the
+                        # stuck thread is abandoned but no longer blocks the pool.
+                        with self._alock:
+                            act = self._active.get(i)
+                        if act is not None and act.hard_deadline is not None \
+                                and now > act.hard_deadline:
+                            if act.slot.release():
+                                self._bump("wedged_reclaimed")
+                                _log.error("worker-%d wedged past its hard deadline; reclaimed its "
+                                           "concurrency slot and spawned a replacement (the stuck "
+                                           "thread is abandoned)", i)
+                            with self._alock:
+                                if self._active.get(i) is act:
+                                    self._active.pop(i, None)
+                            self._threads[i] = self._spawn_worker(i)
             self._stopping.wait(1.0)
 
     # ------------------------------------------------------------------ metrics + helpers
