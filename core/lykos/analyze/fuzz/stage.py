@@ -135,6 +135,14 @@ def format_aware_seeds(ctx, target) -> list:
         pass
     # the binary's own selective strings (magic tokens, config keywords, path prefixes)
     seeds += [s.encode("latin-1", "ignore") for s in svals[:8] if 2 <= len(s) <= 256]
+    # Menu / interactive-protocol navigation seeds: a numbered-menu service hides its bug behind a
+    # state machine, so a blind campaign never leaves the front-door menu. Read the menu out of the
+    # binary's own option strings and start the fuzzer INSIDE it.
+    try:
+        from . import menu
+        seeds += menu.menu_seeds(svals)
+    except Exception:
+        pass
     return [s for s in seeds if s]
 
 

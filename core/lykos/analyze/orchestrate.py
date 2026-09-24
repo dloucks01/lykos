@@ -271,6 +271,21 @@ def _run_case_stage(store, case_id, stage, status, stop) -> None:
         _wait(store, run.id, stop)
 
 
+def _ranked_channels(store, target_id):
+    """Input channels to try for a target, best-first (from the functions it imports), always
+    ending with all channels attempted. Lets the autopilot fuzz the RIGHT channel and, on no crash,
+    retry the others -- a file parser's overflow can live in the argv filename it was handed
+    (ncompress), which a stdin-only campaign never reaches."""
+    from ..db.dao import CallEdgeDAO
+    from .poc.capture import modes_for
+    try:
+        chans = modes_for(CallEdgeDAO(store.conn).list_by_target(target_id))
+        return chans or ["stdin", "arg", "file"]
+    except Exception:
+        _log.debug("channel inference failed for %s", target_id, exc_info=True)
+        return ["stdin", "arg", "file"]
+
+
 def _distinct_crashes(store, target_id):
     seen, out = set(), []
     for d in DynResultDAO(store.conn).list_by_target(target_id):
@@ -301,7 +316,6 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict, stop: t
             if not t:
                 continue
             _init_plan(status, t, i + 1, len(target_ids))
-            mode = None
             # Recover + detect.
             _run_target_stage(store, t, "disassemble", status, stop)
             _run_target_stage(store, t, "detect_cwe", status, stop)
@@ -309,12 +323,29 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict, stop: t
             # Demonstrate injection / format-string leaks by probing the binary's sinks directly
             # (no crash needed) -- a printf(user) leaks live memory, a system(user) runs a command.
             _run_target_stage(store, t, "synthesize_injection", status, stop)
-            # Search. Coverage fuzz (falls back to blind if unavailable), then directed + heap.
-            dyn = {"input_mode": mode} if mode else {}
+            # Search. Fuzz the channel the binary most likely reads (its imports rank them); coverage
+            # fuzz (AFL, falls back to blind if unavailable), then directed + heap on the same channel.
+            channels = _ranked_channels(store, tid)
+            primary = channels[0] if channels else None
+            dyn = {"input_mode": primary} if primary else {}
             _run_target_stage(store, t, "coverage_fuzz", status, stop, dyn)
             _run_target_stage(store, t, "directed_fuzz", status, stop, dyn)
             _run_target_stage(store, t, "heap_check", status, stop, dyn)
             crashes = _distinct_crashes(store, tid)
+            # Multi-channel retry: the best-guess channel is not always where the bug is (a file
+            # parser's overflow can be in the argv filename). If nothing crashed, drive the fast
+            # directed fuzzer at each of the OTHER channels before spending concolic's budget.
+            if not crashes and not stop.is_set():
+                for j, alt in enumerate([c for c in channels[1:] if c != primary]):
+                    if stop.is_set():
+                        break
+                    _run_target_stage(store, t, "directed_fuzz", status, stop,
+                                      {"input_mode": alt, "seed": 91 + j})
+                    crashes = _distinct_crashes(store, tid)
+                    if crashes:
+                        store.events.append("autopilot.channel_hit", case_id=t.case_id,
+                                            payload={"target_id": tid, "mode": alt})
+                        break
             # Run concolic when the search found nothing OR left the binary under-covered: a low
             # block-coverage number means guarded branches (magic values, length checks) were
             # never reached -- exactly what concolic solves for.

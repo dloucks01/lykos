@@ -186,18 +186,27 @@ def plan_directed_campaign(findings, functions, call_edges, strings):
     seed corpus, and the input sources that reach the targets. Falls back to a string-mined
     dictionary (undirected) when there are no addressed static candidates."""
     targets = select_targets(findings)
+    # Menu-navigation seeds so the campaign starts INSIDE a numbered menu (heap/service targets),
+    # not blindly at the front door. Best-effort; empty when the binary is not menu-driven.
+    try:
+        from . import menu as _menu
+        _svals = [getattr(s, "value", s) for s in (strings or [])]
+        menu_seeds = _menu.menu_seeds([v for v in _svals if isinstance(v, str)])
+    except Exception:
+        menu_seeds = []
     if not targets:
         return {"targets": [], "directed": False,
                 "dictionary": _mine_dictionary(strings),
-                "seeds": list(_DEFAULT_SEEDS), "sources": set(),
+                "seeds": menu_seeds + list(_DEFAULT_SEEDS), "sources": set(),
                 "note": "no addressed static candidates; running undirected"}
 
     distance = callgraph_distance(call_edges, [t["function_addr"] for t in targets])
     tdict = mine_targeted_dictionary(functions, strings, distance)
     if not tdict:                            # graph present but no near-target string consts
         tdict = _mine_dictionary(strings)
-    # seed the corpus with the targeted tokens themselves so comparisons are hit immediately
-    seeds = [t for t in tdict[:64]] + list(_DEFAULT_SEEDS)
+    # seed the corpus with the targeted tokens themselves so comparisons are hit immediately,
+    # plus menu-navigation seeds so a menu-driven target is fuzzed from inside its state machine
+    seeds = menu_seeds + [t for t in tdict[:64]] + list(_DEFAULT_SEEDS)
     sources = _sources_reaching_targets(call_edges, distance)
     return {"targets": targets, "directed": True, "dictionary": tdict, "seeds": seeds,
             "sources": sources, "distance_count": len(distance),
