@@ -145,5 +145,7 @@ def test_headerless_detects_aarch64_and_riscv_blobs():
     assert r["arch"] == "riscv" and r["bits"] == 64, r
 
     # random data still resolves to nothing (the dominant-and-dense gate holds)
-    import os
-    assert analyze_blob(os.urandom(16384)).get("arch") is None
+    import random
+    # deterministic high-entropy blob (was os.urandom -> flaky: a rare draw tripped the scorer)
+    rnd = bytes(random.Random(0x1EE7).getrandbits(8) for _ in range(16384))
+    assert analyze_blob(rnd).get("arch") is None
