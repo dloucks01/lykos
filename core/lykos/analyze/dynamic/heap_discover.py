@@ -45,6 +45,35 @@ def _alloc_ret_offsets(exe: Path, alloc_name: str) -> list[int]:
     return [r - base for r in rets]
 
 
+def _plt_addr(exe: Path, name: str) -> int | None:
+    """Address of the `<name@plt>` stub, resolved from the DYNAMIC symbols -- available even on a
+    fully stripped binary (only .symtab is dropped). Used to trace libc malloc/free directly."""
+    if not shutil.which("objdump"):
+        return None
+    try:
+        out = subprocess.run(["objdump", "-d", "--no-show-raw-insn", str(exe)],
+                             capture_output=True, text=True, timeout=60).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    m = re.search(rf"^0*([0-9a-fA-F]+) <{re.escape(name)}@plt>:", out, re.M)
+    return int(m.group(1), 16) if m else None
+
+
+def _libc_plt_pair(exe: Path) -> dict | None:
+    """A stripped menu-driven heap challenge that uses libc directly: trace the malloc (or calloc)
+    and free PLT stubs. Returns the alloc/free stub addresses, or None when the pair is absent.
+    heap_check's guard pages cover libc OVERFLOW; this adds the double-free / UAF it cannot see."""
+    free = _plt_addr(exe, "free")
+    if free is None:
+        return None
+    for an in ("malloc", "calloc", "reallocarray", "realloc"):
+        a = _plt_addr(exe, an)
+        if a is not None:
+            return {"alloc_name": f"{an}@plt", "alloc": a, "free_name": "free@plt", "free": free,
+                    "plt": True}
+    return None
+
+
 def _crawl_menu_model(workdir: Path, exe: Path, opts: list[str]) -> dict:
     """Learn each menu option's typed field template by driving the sandboxed target interactively.
     Best-effort: any failure yields {} and the caller falls back to generic op-sequences."""
@@ -112,8 +141,13 @@ def heap_trace_stage(ctx) -> dict:
     target_bytes = ctx.content.path(target.sha256).read_bytes()
     functions = exploit.elf_functions(target_bytes)
     edges = CallEdgeDAO(ctx.conn).list_by_target(target.id)
+    strings = [x.value for x in StringDAO(ctx.conn).list_by_target(target.id)
+               if getattr(x, "value", None)]
+    opts = menu.detect_menu(strings)
     alloc = heaptrace.identify_allocator(functions, edges)
-    if not alloc:
+    # A stripped target has no named allocator; if it is a menu-driven heap service we fall back to
+    # tracing libc malloc/free directly (resolved from the PLT below, once the binary is on disk).
+    if not alloc and not opts:
         ctx.emit("heaptrace.done", payload={"applicable": False,
                  "note": "no distinct custom allocator found (libc malloc/free is covered by "
                          "heap_check); nothing to trace"})
@@ -124,19 +158,27 @@ def heap_trace_stage(ctx) -> dict:
     sandbox.protect_dir(getattr(ctx.content, "root", None))
     try:
         exe = workdir / "target.bin"
-        exe.write_bytes(ctx.content.path(target.sha256).read_bytes())
+        exe.write_bytes(target_bytes)
         os.chmod(exe, 0o755)
         helper = workdir / "heaptrace.py"
         helper.write_bytes(_HELPER.read_bytes())
 
+        plt_mode = False
+        if not alloc:                                    # symbol-free: trace the libc PLT stubs
+            alloc = _libc_plt_pair(exe)
+            if not alloc:
+                ctx.emit("heaptrace.done", payload={"applicable": False,
+                         "note": "no named custom allocator and no libc malloc/free to trace"})
+                ctx.progress(pct=100, msg="no allocator to trace")
+                return {}
+            plt_mode = True
+
         pie = (target.mitigations or {}).get("pie") == "on"
-        ret_offs = _alloc_ret_offsets(exe, alloc["alloc_name"])
+        # PLT mode has no local `ret` to read rax from and no local allocator family to exclude.
+        ret_offs = [] if plt_mode else _alloc_ret_offsets(exe, alloc["alloc_name"])
         # Allocator-family code ranges (alloc/free + their callees + same-stem functions), so a UAF
         # watchpoint that fires from the allocator's own bookkeeping/compaction is not mis-reported.
-        ignore_ranges = _allocator_ranges(functions, edges, alloc)
-        strings = [x.value for x in StringDAO(ctx.conn).list_by_target(target.id)
-                   if getattr(x, "value", None)]
-        opts = menu.detect_menu(strings)
+        ignore_ranges = [] if plt_mode else _allocator_ranges(functions, edges, alloc)
         # Learn each option's typed field template (Name/Surname/Age/size/Note ...) by driving the
         # live process, so a rich add flow actually ALLOCATES -- the generic (option,size,data)
         # guess never would. menu_op_sequences builds correctly-typed op-sequences from it;
@@ -165,6 +207,7 @@ def heap_trace_stage(ctx) -> dict:
             spec.write_text(json.dumps({
                 "exe": str(exe), "stdin": seq.hex(), "free_off": alloc["free"],
                 "alloc_off": alloc["alloc"], "alloc_ret_offs": ret_offs, "pie": pie,
+                "alloc_is_plt": plt_mode,
                 "ignore_ranges": ignore_ranges, "report": str(report), "timeout": 8}))
             cmd = (sandbox.isolate_prefix(str(workdir), net=False, rw_binds=[str(workdir)])
                    + ["python3", str(helper), str(spec), str(report)])

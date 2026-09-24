@@ -140,6 +140,12 @@ if __name__ == "__main__":                                            # ---- the
         alloc_ret_offs = [int(x) for x in spec.get("alloc_ret_offs", [])]
         alloc_base_off = spec.get("alloc_off")           # alloc function file/vaddr offset
         alloc_base_off = int(alloc_base_off) if alloc_base_off is not None else None
+        # PLT mode: alloc_off is the libc malloc PLT stub (a stripped target's allocator IS libc).
+        # There is no local `ret` to read rax from, so at the stub entry we breakpoint the caller's
+        # return address ([rsp]) one-shot and read rax there. libc's own metadata writes make the
+        # end-of-chunk OVERFLOW watch unreliable (heap_check's guard pages cover libc overflow), so
+        # PLT mode reports only double-free + use-after-free.
+        alloc_is_plt = bool(spec.get("alloc_is_plt", False))
         report = spec["report"]
         timeout = int(spec.get("timeout", 15))
         # Static guard watchpoints: [off, note] pairs (vaddr offsets, rebased for PIE) armed from
@@ -256,6 +262,7 @@ if __name__ == "__main__":                                            # ---- the
         free_slots = [0, 1, 2, 3]                         # DR0-3 available for watchpoints
         watches = {}                                      # slot -> {"addr", "kind", "chunk"}
         uaf_seen, of_seen, oob_seen = set(), set(), set()
+        oneshot = set()                                   # PLT alloc-return bps: fire once, remove
         events = []
 
         def in_allocator(rip):
@@ -368,23 +375,35 @@ if __name__ == "__main__":                                            # ---- the
                             arm(ptr, "uaf", ptr, 0b11)   # read+write on freed data = UAF
                 elif kind == "alloc_enter":              # entry: capture the requested size (rdi)
                     pending_size = rg.rdi
+                    if alloc_is_plt:                     # libc stub: no local ret -> catch the
+                        ret = peek(rg.rsp)               # caller's return address ([rsp]) once
+                        if ret and ret not in bps:
+                            setbp(ret, "alloc")
+                            oneshot.add(ret)
                 else:                                    # alloc return: rax = new pointer
                     ptr = rg.rax
                     size, pending_size = pending_size, 0
                     freed.discard(ptr)                   # handed back out -> live again
-                    if ptr and 0 < size <= (1 << 20):
+                    if alloc_is_plt:
+                        clear_covering(ptr, ptr + max(size, 8))   # reclaim stale UAF watches
+                    elif ptr and 0 < size <= (1 << 20):
                         end = (ptr + size + 7) & ~7      # first aligned qword past the buffer
                         clear_covering(ptr, end + 8)     # reclaim stale watches on this region
                         slot = arm(end, "overflow", ptr, 0b01)   # write past end = overflow
                         live[ptr] = {"size": size, "end": end, "slot": slot}
                     elif ptr:
                         clear_covering(ptr, ptr + 8)
-                # step over the int3: restore, single-step, re-arm
+                # step over the int3: restore, single-step, then re-arm (unless it was a one-shot
+                # PLT alloc-return breakpoint, which is removed after it fires).
                 poke(bp, (peek(bp) & ~0xFF) | orig)
                 setrip(rg, bp)
                 libc.ptrace(PTRACE_SINGLESTEP, pid, None, None)
                 os.waitpid(pid, 0)
-                poke(bp, (peek(bp) & ~0xFF) | 0xCC)
+                if bp in oneshot:
+                    oneshot.discard(bp)
+                    bps.pop(bp, None)
+                else:
+                    poke(bp, (peek(bp) & ~0xFF) | 0xCC)
         except TimeoutError:
             events.append({"note": "timeout"})
         finally:
