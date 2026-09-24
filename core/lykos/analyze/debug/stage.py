@@ -49,7 +49,7 @@ def _root_cause_jvm(ctx, target, input_sha, base_argv, mode, timeout) -> dict:
     from ..jvm import cwe_for_exception
     input_bytes = ctx.content.get_bytes(input_sha)
     exe = ctx.scratch() / "target.bin"
-    exe.write_bytes(ctx.content.path(target.sha256).read_bytes())
+    ctx.content.stage_target(target, exe.parent, exe.name)
     wf = ctx.scratch() / "input.bin"
     wf.write_bytes(input_bytes)
     tried = []
@@ -163,7 +163,7 @@ def root_cause_stage(ctx) -> dict:
     input_bytes = ctx.content.get_bytes(input_sha)
     target_bytes = ctx.content.path(target.sha256).read_bytes()
     exe = ctx.scratch() / "target.bin"
-    exe.write_bytes(target_bytes)
+    ctx.content.stage_target(target, exe.parent, exe.name)
     exe.chmod(0o755)
 
     # capture the fault: qemu-user gdbstub (cross-arch), else GDB, else the ptrace helper

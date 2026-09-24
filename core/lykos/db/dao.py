@@ -105,11 +105,11 @@ class TargetDAO(BaseDAO):
                    ingested_at=_now(), **fields)
         self.conn.execute(
             "INSERT INTO target(id,case_id,filename,sha256,md5,sha1,size,file_type,"
-            "arch,bits,endianness,linking,stripped,mitigations_json,entropy,ingested_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "arch,bits,endianness,linking,stripped,mitigations_json,entropy,deps_json,"
+            "ingested_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (t.id, t.case_id, t.filename, t.sha256, t.md5, t.sha1, t.size, t.file_type,
              t.arch, t.bits, t.endianness, t.linking, as_int_bool(t.stripped),
-             dumps(t.mitigations), t.entropy, t.ingested_at),
+             dumps(t.mitigations), t.entropy, dumps(t.deps), t.ingested_at),
         )
         return t
 
@@ -117,7 +117,8 @@ class TargetDAO(BaseDAO):
     # bound as parameters), so it is whitelisted: an unknown key is rejected rather than
     # trusted. Excludes identity/provenance columns (id, case_id, sha256, ingested_at).
     _UPDATABLE = frozenset({"filename", "md5", "sha1", "size", "file_type", "arch", "bits",
-                            "endianness", "linking", "stripped", "mitigations", "entropy"})
+                            "endianness", "linking", "stripped", "mitigations", "entropy",
+                            "deps"})
 
     def _update_fields(self, target_id: str, fields: dict[str, Any]) -> None:
         cols, vals = [], []
@@ -128,6 +129,8 @@ class TargetDAO(BaseDAO):
                 v = as_int_bool(v)
             elif k == "mitigations":
                 k, v = "mitigations_json", dumps(v)
+            elif k == "deps":
+                k, v = "deps_json", dumps(v)
             cols.append(f"{k}=?")
             vals.append(v)
         if not cols:
@@ -179,6 +182,7 @@ class TargetDAO(BaseDAO):
             file_type=r["file_type"], arch=r["arch"], bits=r["bits"],
             endianness=r["endianness"], linking=r["linking"], stripped=as_bool(r["stripped"]),
             mitigations=loads(r["mitigations_json"]), entropy=r["entropy"],
+            deps=loads(r["deps_json"]),
         )
 
 

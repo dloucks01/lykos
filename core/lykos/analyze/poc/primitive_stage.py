@@ -103,7 +103,7 @@ def primitive_stage(ctx) -> dict:
     orig = ctx.content.get_bytes(input_sha)
     target_bytes = ctx.content.path(target.sha256).read_bytes()
     exe = ctx.scratch() / "target.bin"
-    exe.write_bytes(target_bytes)
+    ctx.content.stage_target(target, exe.parent, exe.name)
     exe.chmod(0o755)
 
     # Static RE corroboration: recovered stack-buffer sizes predict IP-control offsets.

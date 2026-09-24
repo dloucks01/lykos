@@ -44,6 +44,9 @@ class Target:
     stripped: Optional[bool] = None
     mitigations: Optional[dict[str, Any]] = None
     entropy: Optional[float] = None
+    # {path-relative-to-binary: content-sha256} for companion files the target needs to RUN
+    # (a bundled loader / libc / data file). None for an ordinary standalone binary.
+    deps: Optional[dict[str, str]] = None
 
 
 @dataclass

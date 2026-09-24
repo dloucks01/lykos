@@ -161,7 +161,7 @@ def dynamic_stage(ctx) -> dict:
         argv = place(argv, str(infile))
 
     exe = ctx.scratch() / "target.bin"
-    exe.write_bytes(ctx.content.path(target.sha256).read_bytes())
+    ctx.content.stage_target(target, exe.parent, exe.name)
     os.chmod(exe, 0o755)
 
     # mask the case store (other targets' extracted secrets) inside the sandbox; the target is

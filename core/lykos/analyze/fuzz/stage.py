@@ -319,7 +319,7 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
     `run_fn(exe, mode, workfile, timeout, arch, data) -> (argv, RunResult)` is the input
     delivery; boundary-driven harnessing (doc 17.4) swaps in a channel runner."""
     exe = ctx.scratch() / "target.bin"
-    exe.write_bytes(ctx.content.path(target.sha256).read_bytes())
+    ctx.content.stage_target(target, exe.parent, exe.name)
     os.chmod(exe, 0o755)
     workfile = ctx.scratch() / "input.bin"
 

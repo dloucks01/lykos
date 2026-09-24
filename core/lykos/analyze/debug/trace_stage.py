@@ -60,7 +60,7 @@ def _win_behavior_trace(ctx, target, p) -> dict:
         ctx.progress(pct=100, msg="behavior trace needs wine for PE targets")
         return {}
     exe = ctx.scratch() / "target.bin"
-    exe.write_bytes(ctx.content.path(target.sha256).read_bytes())
+    ctx.content.stage_target(target, exe.parent, exe.name)
     os.chmod(exe, 0o755)
     mode = how_to_feed(ctx.conn, target, p.get("input_sha"), p)[0]
     argv = list(p.get("argv") or [])
@@ -230,7 +230,7 @@ def behavior_trace_stage(ctx) -> dict:
         return {}
 
     exe = ctx.scratch() / "target.bin"
-    exe.write_bytes(ctx.content.path(target.sha256).read_bytes())
+    ctx.content.stage_target(target, exe.parent, exe.name)
     os.chmod(exe, 0o755)
     mode = how_to_feed(ctx.conn, target, p.get("input_sha"), p)[0]
     argv = list(p.get("argv") or [])

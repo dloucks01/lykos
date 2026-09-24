@@ -12,7 +12,6 @@ that faults behind a flag is replayed under that flag. Deterministic; runs via r
 from __future__ import annotations
 
 import json
-import os
 import re
 import shutil
 import sys
@@ -56,12 +55,9 @@ def poc_diff_stage(ctx) -> dict:
     workdir = Path(tempfile.mkdtemp(prefix="lykos-pocdiff-"))
     try:
         b_bytes = ctx.content.path(b.sha256).read_bytes()
-        exe = workdir / "candidate.bin"
-        exe.write_bytes(b_bytes)
-        os.chmod(exe, 0o755)
-        a_exe = workdir / "baseline.bin"                 # A, so a win's success output is knowable
-        a_exe.write_bytes(ctx.content.path(a.sha256).read_bytes())
-        os.chmod(a_exe, 0o755)
+        # each staged in its OWN dir so a bundled A and a bundled B don't clash on loader/libc names
+        exe = ctx.content.stage_target(b, workdir / "cand", "candidate.bin")
+        a_exe = ctx.content.stage_target(a, workdir / "base", "baseline.bin")
 
         replayed: dict = {}                              # (input_sha, kind) -> replay result
         results = []

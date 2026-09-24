@@ -10,7 +10,6 @@ into a Confirmed finding -- the same confirm pipeline the `fuzz` and `dynamic_ru
 from __future__ import annotations
 
 import base64
-import os
 
 from ...db.dao import DynResultDAO, FindingDAO, TargetDAO
 from ...hashing import canonical_json
@@ -181,8 +180,7 @@ def coverage_stage(ctx) -> dict:
                                            "sanitizer": True, "note": note})
         ctx.progress(pct=100, msg="sanitizer build — fuzzed by the sandbox path instead")
         return {}
-    exe.write_bytes(_blob)
-    os.chmod(exe, 0o755)
+    ctx.content.stage_target(target, exe.parent, exe.name)   # + bundled loader/libc, if any
 
     # seed corpus for AFL's input dir. A coverage-guided campaign is only as good as the seed it
     # starts from: format-aware seeds (a valid jpeg/gif/config sample built from the binary's own

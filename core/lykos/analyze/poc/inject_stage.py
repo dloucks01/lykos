@@ -73,7 +73,7 @@ def synthesize_injection_stage(ctx) -> dict:
     timeout = float(p.get("timeout", 8))
     target_bytes = ctx.content.path(target.sha256).read_bytes()
     exe = ctx.scratch() / "target.bin"
-    exe.write_bytes(target_bytes)
+    ctx.content.stage_target(target, exe.parent, exe.name)
     os.chmod(exe, 0o755)
 
     ctx.emit("inject.start", payload={"probes": sorted(applicable), "channels": channels})

@@ -87,7 +87,7 @@ def extract_stage(ctx) -> dict:
     stdin = data if mode == "stdin" else b""
 
     exe = ctx.scratch() / "target.bin"
-    exe.write_bytes(ctx.content.path(target.sha256).read_bytes())
+    ctx.content.stage_target(target, exe.parent, exe.name)
     import os
     os.chmod(exe, 0o755)
 

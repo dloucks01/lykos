@@ -135,7 +135,7 @@ def chain_primitive_stage(ctx) -> dict:
     sandbox.protect_dir(getattr(ctx.content, "root", None))
     try:
         exe = workdir / "target.bin"
-        exe.write_bytes(target_bytes)
+        ctx.content.stage_target(target, exe.parent, exe.name)
         exe.chmod(0o755)
         from ..dynamic.heap_discover import _read_width
         strings = [x.value for x in StringDAO(ctx.conn).list_by_target(target.id)

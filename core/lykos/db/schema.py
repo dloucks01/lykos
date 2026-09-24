@@ -345,4 +345,11 @@ ALTER TABLE dyn_result ADD COLUMN fault_pc INTEGER;
 -- input, rather than filing a second finding for a crash already recorded.
 ALTER TABLE dyn_result ADD COLUMN defect_key TEXT;
 """),
+    Migration(version=16, name="target_deps", sql=r"""
+-- Companion files a target needs to RUN: a challenge-bundled loader (a relative ELF interpreter
+-- like ./ld-2.31.so), its specific libc, and data files (flag.txt). Stored content-addressed;
+-- this maps each file's path RELATIVE to the binary -> its content sha, so a dynamic stage can
+-- stage the whole bundle into the run directory and the binary's relative interpreter resolves.
+ALTER TABLE target ADD COLUMN deps_json TEXT;
+"""),
 ]

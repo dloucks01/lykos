@@ -7,8 +7,9 @@ the stage into the job engine.
 """
 from __future__ import annotations
 
-import os
+import re
 import shutil
+import struct
 import subprocess
 import tempfile
 from pathlib import Path
@@ -141,7 +142,76 @@ class NotAnalysable(ValueError):
     """A file that cannot be a target, with a reason fit to show a user."""
 
 
-def ingest(store, case_id: str, path: str | Path, filename: Optional[str] = None):
+_LIB_RE = re.compile(r"^(ld[-.]|ld-linux|ld\.so|libc[.-]|libc\.so|lib\w+\.so)", re.I)
+
+
+def _elf_interp(path) -> tuple[bool, Optional[str]]:
+    """(is_elf, PT_INTERP-string-or-None) for an ELF, pure stdlib. A RELATIVE interp (./ld-...)
+    is the tell that a binary is part of a challenge bundle and cannot run standalone."""
+    try:
+        d = Path(path).read_bytes()
+    except OSError:
+        return False, None
+    if d[:4] != b"\x7fELF" or len(d) < 64:
+        return False, None
+    is64 = d[4] == 2
+    en = "<" if d[5] == 1 else ">"
+    try:
+        if is64:
+            e_phoff = struct.unpack_from(en + "Q", d, 0x20)[0]
+            e_phentsize, e_phnum = struct.unpack_from(en + "HH", d, 0x36)
+        else:
+            e_phoff = struct.unpack_from(en + "I", d, 0x1C)[0]
+            e_phentsize, e_phnum = struct.unpack_from(en + "HH", d, 0x2A)
+        for i in range(e_phnum):
+            off = e_phoff + i * e_phentsize
+            if struct.unpack_from(en + "I", d, off)[0] != 3:      # PT_INTERP
+                continue
+            if is64:
+                p_offset = struct.unpack_from(en + "Q", d, off + 8)[0]
+                p_filesz = struct.unpack_from(en + "Q", d, off + 32)[0]
+            else:
+                p_offset = struct.unpack_from(en + "I", d, off + 4)[0]
+                p_filesz = struct.unpack_from(en + "I", d, off + 16)[0]
+            s = d[p_offset:p_offset + p_filesz].split(b"\x00", 1)[0]
+            return True, s.decode("latin-1", "ignore")
+    except Exception:                                             # noqa: BLE001 -- best-effort
+        pass
+    return True, None
+
+
+def _looks_like_lib(name: str) -> bool:
+    return bool(_LIB_RE.match(name))
+
+
+def gather_bundle(dirpath) -> tuple[Optional[Path], dict[str, str]]:
+    """A challenge DIRECTORY -> (main binary, {path-relative-to-dir: absolute path}) for its
+    companion files. The main binary is the substantial ELF that is not itself a loader/library;
+    the deps are everything else in the tree (a bundled loader named by a relative PT_INTERP, the
+    challenge's libc, data files like flag.txt), so they can be staged beside it at run time."""
+    dirpath = Path(dirpath)
+    files = [p for p in dirpath.rglob("*") if p.is_file()]
+    scanned = [(p, _elf_interp(p)) for p in files]
+    mains = [p for (p, (is_elf, interp)) in scanned
+             if is_elf and interp and not _looks_like_lib(p.name)]
+    if not mains:                                        # a static exe has no interp
+        mains = [p for (p, (is_elf, _)) in scanned if is_elf and not _looks_like_lib(p.name)]
+    if not mains:
+        return None, {}
+    main = max(mains, key=lambda p: p.stat().st_size)
+    deps: dict[str, str] = {}
+    for p in files:
+        if p == main or p.stat().st_size > 64 * 1024 * 1024:
+            continue
+        try:
+            deps[p.relative_to(dirpath).as_posix()] = str(p)
+        except ValueError:
+            continue
+    return main, deps
+
+
+def ingest(store, case_id: str, path: str | Path, filename: Optional[str] = None,
+           deps: Optional[dict[str, str]] = None):
     """IT-03/05: store the file (content-addressed) + create/dedup the target row.
 
     An empty file is refused here rather than downstream. Accepting one produced a target
@@ -150,6 +220,11 @@ def ingest(store, case_id: str, path: str | Path, filename: Optional[str] = None
     is no analysis anywhere in this platform that can say something true about zero bytes.
     """
     path = Path(path)
+    if path.is_dir():                                     # a challenge BUNDLE (binary + loader/libc)
+        main, dep_files = gather_bundle(path)
+        if main is None:
+            raise NotAnalysable(f"{path.name}: no analysable binary found in the bundle")
+        return ingest(store, case_id, main, filename=filename or main.name, deps=dep_files)
     fname = filename or path.name
     if not path.stat().st_size:
         raise NotAnalysable(f"{fname} is empty (0 bytes) -- nothing to analyse")
@@ -180,8 +255,18 @@ def ingest(store, case_id: str, path: str | Path, filename: Optional[str] = None
 
     info = hash_all_file(path)
     store.put_artifact(case_id, "target-blob", src=path)
+    dep_map: Optional[dict[str, str]] = None
+    if deps:
+        dep_map = {}
+        for rel, src in deps.items():
+            try:
+                sha, _, _ = store.content.put_file(src)
+            except OSError:
+                continue
+            dep_map[rel] = sha
     return store.targets.upsert(case_id, fname, info["sha256"],
-                                md5=info["md5"], sha1=info["sha1"], size=info["size"])
+                                md5=info["md5"], sha1=info["sha1"], size=info["size"],
+                                deps=dep_map or None)
 
 
 def ingest_triage_stage(ctx) -> dict:

@@ -85,7 +85,7 @@ def heap_stage(ctx) -> dict:
             return {}
 
         exe = workdir / "target.bin"
-        exe.write_bytes(ctx.content.path(target.sha256).read_bytes())
+        ctx.content.stage_target(target, exe.parent, exe.name)
         os.chmod(exe, 0o755)
 
         mode = how_to_feed(ctx.conn, target, p.get("input_sha"), p)[0]

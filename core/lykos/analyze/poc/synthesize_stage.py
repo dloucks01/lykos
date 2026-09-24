@@ -67,7 +67,7 @@ def synthesize_stage(ctx) -> dict:
 
     target_bytes = ctx.content.path(target.sha256).read_bytes()
     exe = ctx.scratch() / "target.bin"
-    exe.write_bytes(target_bytes)
+    ctx.content.stage_target(target, exe.parent, exe.name)
     os.chmod(exe, 0o755)
 
     ctx.emit("synth.start", payload={"candidates": candidates[:8], "modes": modes})

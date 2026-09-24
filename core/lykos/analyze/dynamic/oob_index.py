@@ -161,7 +161,7 @@ def oob_index_stage(ctx) -> dict:
     sandbox.protect_dir(getattr(ctx.content, "root", None))
     try:
         exe = workdir / "target.bin"
-        exe.write_bytes(target_bytes)
+        ctx.content.stage_target(target, exe.parent, exe.name)
         os.chmod(exe, 0o755)
         (workdir / "heaptrace.py").write_bytes(_HELPER.read_bytes())
 

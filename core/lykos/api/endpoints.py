@@ -13,6 +13,7 @@ import os
 import shutil
 import tarfile
 import tempfile
+import zipfile
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -20,13 +21,47 @@ from ..casestore import CaseStore  # noqa: F401  (some handlers construct it dir
 from ..db.dao import DynResultDAO, FindingDAO, FunctionDAO, PocDAO, StringDAO
 from ..jobs import JobQueue
 from .multipart import extract_file, extract_file_to
-from .serializers import (_INGEST, _REPORT_FORMATS, _case, _csv, _event, _finding,
-                          _function, _poc, _run, _stringref, _target)  # noqa: F401
-
+from .serializers import (
+    _INGEST,
+    _REPORT_FORMATS,
+    _case,
+    _csv,
+    _event,
+    _finding,
+    _function,  # noqa: F401
+    _poc,
+    _run,
+    _stringref,
+    _target,
+)
 
 # Bodies at or below this size are extracted in memory (the proven, simple path); larger uploads
 # have their file part streamed to disk so a big binary/firmware never sits fully in RAM.
 _INMEM_LIMIT = 16 << 20
+
+
+def _maybe_extract_bundle(upload: Path, td: Path):
+    """If `upload` is a zip/tar archive (a zipped challenge bundle), extract it SAFELY to a temp
+    directory and return that dir for ingest() to treat as a bundle; otherwise return None. Path
+    traversal / absolute members are dropped so an archive can never write outside the temp dir."""
+    upload = Path(upload)
+    dest = td / "bundle"
+    try:
+        if zipfile.is_zipfile(upload):
+            with zipfile.ZipFile(upload) as z:
+                for m in z.namelist():
+                    mp = Path(m)
+                    if m.endswith("/") or mp.is_absolute() or ".." in mp.parts:
+                        continue
+                    z.extract(m, dest)
+            return dest if any(dest.rglob("*")) else None
+        if tarfile.is_tarfile(upload):
+            with tarfile.open(upload) as tf:
+                tf.extractall(dest, filter="data")   # 'data' filter blocks traversal/special files
+            return dest if any(dest.rglob("*")) else None
+    except Exception:                                # noqa: BLE001 -- a bad archive falls back to
+        pass                                         # ingesting the upload as a single file
+    return None
 
 
 def _extract_upload(ctype: str, raw: Path, td: Path, x_filename):
@@ -602,8 +637,15 @@ class EndpointsMixin:
                 # The client-supplied filename must never influence where we write: an absolute
                 # path or `../` would escape the temp dir. Reduce it to a bare basename.
                 safe_name = Path(filename or "upload.bin").name or "upload.bin"
+                # A challenge is often a BUNDLE: binary + its patched loader + libc (+ flag),
+                # zipped up. Extract it and ingest the DIRECTORY so ingest() finds the main binary
+                # and keeps the loader/libc as deps -- otherwise the binary can't run in analysis.
+                bundle = _maybe_extract_bundle(upload, tdp)
                 try:
-                    target = ingest(s, cid, upload, filename=safe_name)
+                    if bundle is not None:
+                        target = ingest(s, cid, bundle)     # dir -> main binary + companion deps
+                    else:
+                        target = ingest(s, cid, upload, filename=safe_name)
                 except NotAnalysable as e:
                     # 400, not 500: the upload was understood and refused, and the reason is
                     # for the person who picked the file

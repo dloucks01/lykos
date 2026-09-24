@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import shutil
 import sqlite3
+import subprocess
 import tarfile
 import tempfile
 import warnings
@@ -27,6 +28,35 @@ from .db.models import Artifact
 from .hashing import hash_all_file, hash_bytes
 
 _ARTIFACTS = "artifacts"
+
+
+def _make_runnable(exe: Path, workdir: Path) -> None:
+    """Make a staged bundled binary run from ANY cwd: repoint a RELATIVE ELF interpreter (a
+    challenge's ./ld-2.31.so) at the staged loader by absolute path, and add the staged dir to the
+    rpath so the bundled libc is found. Best-effort via patchelf; if patchelf is absent the binary
+    is left as-is and still runs when the caller's cwd is the staged dir. Never fatal."""
+    pe = shutil.which("patchelf")
+    if not pe:
+        return
+    try:
+        interp = subprocess.run([pe, "--print-interpreter", str(exe)], capture_output=True,
+                                text=True, timeout=20).stdout.strip()
+    except Exception:                                    # noqa: BLE001 -- static exe / no interp
+        interp = ""
+    args = [pe]
+    if interp and not interp.startswith("/"):            # a relative, bundled loader
+        loader = workdir / Path(interp).name
+        if not loader.exists():
+            cand = workdir / interp.lstrip("./")         # e.g. ./glibc/ld-linux-x86-64.so.2
+            if cand.exists():
+                loader = cand
+        if loader.exists():
+            args += ["--set-interpreter", str(loader)]
+    args += ["--set-rpath", str(workdir), str(exe)]      # bundled libc found regardless of cwd
+    try:
+        subprocess.run(args, capture_output=True, timeout=30)
+    except Exception:                                    # noqa: BLE001 -- best-effort
+        pass
 
 
 class ContentStore:
@@ -70,6 +100,38 @@ class ContentStore:
         if hash_bytes(data) != sha256:  # integrity check on read
             raise IOError(f"artifact {sha256} failed integrity check")
         return data
+
+    def stage_target(self, target, workdir, name: str = "target.bin", *,
+                     mode: int = 0o755) -> Path:
+        """Materialise a target for RUNNING: write its binary to <workdir>/<name> and every
+        companion dep (a bundled loader / libc / data file) to its path RELATIVE to the workdir,
+        so the binary's relative ELF interpreter (e.g. ./ld-2.31.so) resolves when it runs with
+        cwd=workdir. Returns the staged binary Path. A target with no deps just writes the binary,
+        so callers can use this unconditionally in place of a bare content read + write.
+        """
+        workdir = Path(workdir)
+        exe = workdir / name
+        exe.parent.mkdir(parents=True, exist_ok=True)
+        exe.write_bytes(self.path(target.sha256).read_bytes())
+        try:
+            exe.chmod(mode)
+        except OSError:
+            pass
+        deps = getattr(target, "deps", None) or {}
+        for rel, sha in deps.items():
+            rp = Path(rel)
+            if rp.is_absolute() or ".." in rp.parts:     # never let a dep escape the workdir
+                continue
+            dst = workdir / rp
+            try:
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                dst.write_bytes(self.path(sha).read_bytes())
+                dst.chmod(0o755)
+            except OSError:
+                pass
+        if deps:
+            _make_runnable(exe, workdir)                  # cwd-independent interp/libc resolution
+        return exe
 
 
 class CaseStore:

@@ -73,7 +73,7 @@ def multi_debug_stage(ctx) -> dict:
     input_bytes = ctx.content.get_bytes(input_sha) if input_sha \
         else base64.b64decode(p["input"])
     exe = ctx.scratch() / "entry.bin"
-    exe.write_bytes(ctx.content.path(target.sha256).read_bytes())
+    ctx.content.stage_target(target, exe.parent, exe.name)
     exe.chmod(0o755)
 
     def _deliver(m):
