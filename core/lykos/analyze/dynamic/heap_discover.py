@@ -45,6 +45,43 @@ def _alloc_ret_offsets(exe: Path, alloc_name: str) -> list[int]:
     return [r - base for r in rets]
 
 
+def _allocator_ranges(functions: dict, edges, alloc: dict) -> list[list[int]]:
+    """[start, end) code ranges of the allocator FAMILY: alloc/free, everything they call
+    transitively (a compacting allocator's insert_block/compact/memmove), and same-stem functions.
+    A UAF watchpoint firing from inside this code is the allocator's own bookkeeping, not a program
+    use-after-free, so the tracer ignores it."""
+    if not functions:
+        return []
+    addrs = sorted(set(functions.values()))
+
+    def _rng(a):
+        nxt = next((x for x in addrs if x > a), a + 0x400)
+        return [a, nxt]
+
+    stem = re.sub(r"(alloc|free|new|delete|release|dealloc)\w*$", "",
+                  alloc["alloc_name"].lstrip("_")).rstrip("_").lower()
+    family = {alloc["alloc"], alloc["free"]}
+    for name, addr in functions.items():
+        if stem and name.split("@")[0].lstrip("_").lower().startswith(stem):
+            family.add(addr)
+    # transitive callees of alloc/free (compaction/bookkeeping helpers)
+    adj: dict = {}
+    for e in edges or []:
+        try:
+            src = int(str(e.src_addr), 16) if isinstance(e.src_addr, str) else int(e.src_addr)
+        except (TypeError, ValueError):
+            continue
+        if e.dst_name in functions:
+            adj.setdefault(src, set()).add(functions[e.dst_name])
+    seen, queue = set(family), list(family)
+    while queue:
+        for callee in adj.get(queue.pop(), ()):
+            if callee not in seen:
+                seen.add(callee)
+                queue.append(callee)
+    return sorted(_rng(a) for a in seen)
+
+
 def heap_trace_stage(ctx) -> dict:
     from ...db.dao import CallEdgeDAO, FindingDAO, StringDAO, TargetDAO
     target = TargetDAO(ctx.conn).get(ctx.target_id) if ctx.target_id else None
@@ -80,11 +117,18 @@ def heap_trace_stage(ctx) -> dict:
 
         pie = (target.mitigations or {}).get("pie") == "on"
         ret_offs = _alloc_ret_offsets(exe, alloc["alloc_name"])
+        # Allocator-family code ranges (alloc/free + their callees + same-stem functions), so a UAF
+        # watchpoint that fires from the allocator's own bookkeeping/compaction is not mis-reported.
+        ignore_ranges = _allocator_ranges(functions, edges, alloc)
         strings = [x.value for x in StringDAO(ctx.conn).list_by_target(target.id)
                    if getattr(x, "value", None)]
         opts = menu.detect_menu(strings)
+        # menu seeds when a menu is printed; else a generic option-1..4 fallback covering both a
+        # double-free (create; free; free) and a use-after-free (create; free; USE) shape.
         seqs = heaptrace.heap_op_sequences(opts) or [
-            b"1\n64\nA\n2\n0\n2\n0\n", b"1\n2\n2\n"]     # generic create-then-double-free fallback
+            b"1\n64\nA\n2\n0\n2\n0\n", b"1\n2\n2\n",                 # double-free
+            b"1\n64\nA\n2\n0\n3\n0\n", b"1\n2\n3\n", b"1\n2\n3\n4\n",  # UAF (alloc, free, use)
+            b"1\n2\n4\n", b"1\n64\nA\n2\n0\n4\n0\n"]
         ctx.emit("heaptrace.allocator", payload={
             "alloc": alloc["alloc_name"], "free": alloc["free_name"],
             "alloc_addr": hex(alloc["alloc"]), "free_addr": hex(alloc["free"]),
@@ -102,7 +146,7 @@ def heap_trace_stage(ctx) -> dict:
             spec.write_text(json.dumps({
                 "exe": str(exe), "stdin": seq.hex(), "free_off": alloc["free"],
                 "alloc_off": alloc["alloc"], "alloc_ret_offs": ret_offs, "pie": pie,
-                "report": str(report), "timeout": 8}))
+                "ignore_ranges": ignore_ranges, "report": str(report), "timeout": 8}))
             cmd = (sandbox.isolate_prefix(str(workdir), net=False, rw_binds=[str(workdir)])
                    + ["python3", str(helper), str(spec), str(report)])
             try:
@@ -114,39 +158,45 @@ def heap_trace_stage(ctx) -> dict:
                 rep = json.loads(report.read_text())
             except Exception:
                 continue
-            if rep.get("double_free"):
+            if rep.get("double_free") or rep.get("use_after_free"):
                 found = (seq, rep)
                 break
 
         if not found:
             ctx.emit("heaptrace.done", payload={
-                "applicable": True, "double_free": False, "allocator": alloc["alloc_name"],
+                "applicable": True, "double_free": False, "use_after_free": False,
+                "allocator": alloc["alloc_name"],
                 "note": (f"traced the target's own allocator ({alloc['alloc_name']}/"
                          f"{alloc['free_name']}) over {len(seqs)} operation sequences; no double-free "
-                         "surfaced. A UAF/overflow may still exist (this pass proves double-free "
-                         "only) -- and the menu semantics may need analyst-supplied op sequences.")})
-            ctx.progress(pct=100, msg="no double-free surfaced on the custom allocator")
+                         "or use-after-free surfaced. A heap OVERFLOW may still exist, and the menu "
+                         "semantics may need analyst-supplied op sequences.")})
+            ctx.progress(pct=100, msg="no double-free / UAF surfaced on the custom allocator")
             return {"metrics": {"applicable": True, "double_free": False}}
 
         seq, rep = found
         input_sha = ctx.put_artifact("heap-op-sequence", data=seq)
-        detail = (f"double-free (CWE-415) discovered on the target's own allocator "
-                  f"{alloc['alloc_name']}/{alloc['free_name']}: the traced sequence freed a chunk "
-                  f"that was already free. Seeds tcache poisoning -> arbitrary write. "
-                  f"(op sequence {input_sha[:12]})")
+        if rep.get("double_free"):
+            _cwe, _title, _kind, _why = ("CWE-415", "Double free", "double_free",
+                                         "freed a chunk that was already free")
+        else:
+            _cwe, _title, _kind, _why = ("CWE-416", "Use-after-free", "uaf",
+                                         "read/wrote a chunk after it was freed")
+        detail = (f"{_title} ({_cwe}) discovered on the target's own allocator "
+                  f"{alloc['alloc_name']}/{alloc['free_name']}: the traced sequence {_why}. "
+                  f"Seeds tcache poisoning -> arbitrary write. (op sequence {input_sha[:12]})")
         FindingDAO(ctx.conn).upsert(target.id, target.case_id, {
-            "cwe": "CWE-415", "title": "Double free", "severity": "high",
+            "cwe": _cwe, "title": _title, "severity": "high" if _kind == "double_free" else "critical",
             "detector": "heap_trace", "state": "corroborated", "confidence": 0.85,
-            "dedup_key": f"CWE-415:heaptrace:{alloc['free_name']}",
+            "dedup_key": f"{_cwe}:heaptrace:{alloc['free_name']}",
             "function_addr": alloc["free"], "site_addr": None, "site_detail": alloc["free_name"],
             "evidence": [{"channel": "heap-trace", "detail": detail}]})
         ctx.emit("heaptrace.done", payload={
-            "applicable": True, "double_free": True, "allocator": alloc["alloc_name"],
-            "input_sha": input_sha,
-            # the aaheg chainer consumes this Vuln shape (vclass double_free -> tcache-poison chain)
-            "vuln": {"vclass": "double_free", "note": f"{alloc['alloc_name']}/{alloc['free_name']}"}})
-        ctx.progress(pct=100, msg=f"double-free discovered on {alloc['free_name']}")
-        return {"metrics": {"double_free": True}, "output_shas": [input_sha]}
+            "applicable": True, "double_free": _kind == "double_free", "use_after_free": _kind == "uaf",
+            "allocator": alloc["alloc_name"], "input_sha": input_sha,
+            # the aaheg chainer consumes this Vuln shape (double_free/uaf -> tcache-poison chain)
+            "vuln": {"vclass": _kind, "note": f"{alloc['alloc_name']}/{alloc['free_name']}"}})
+        ctx.progress(pct=100, msg=f"{_title.lower()} discovered on {alloc['free_name']}")
+        return {"metrics": {_kind: True}, "output_shas": [input_sha]}
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 

@@ -82,6 +82,15 @@ def heap_op_sequences(menu_options, *, max_seqs: int = 40) -> list[bytes]:
         ab = act.encode()
         seqs.append(create + ab + nl + b"0" + nl + ab + nl + b"0" + nl)   # create; act 0; act 0
         seqs.append(create + ab + nl + ab + nl)                           # create; act; act (no id)
+    # cross-option create; FREE-op; USE-op -- the use-after-free shape (free one option, then a
+    # different option reads/writes the same object). Every ordered pair, since we do not know
+    # which option is free vs print/modify; try object id 0 and 1 (either could be the first).
+    for oid in (b"0", b"1"):
+        for i in opts:
+            for j in opts:
+                if i == j:
+                    continue
+                seqs.append(create + i.encode() + nl + oid + nl + j.encode() + nl + oid + nl)
     # allocate two, cross-free, re-free (tcache double-free / UAF shapes)
     if len(opts) >= 3:
         a, b2 = opts[1].encode(), opts[2].encode()
@@ -100,11 +109,11 @@ if __name__ == "__main__":                                            # ---- the
     import json
     import os
     import signal
-    import struct
     import sys
 
-    PTRACE_TRACEME, PTRACE_PEEKTEXT, PTRACE_POKETEXT = 0, 1, 4
+    PTRACE_TRACEME, PTRACE_PEEKTEXT, PTRACE_PEEKUSER, PTRACE_POKETEXT, PTRACE_POKEUSER = 0, 1, 3, 4, 6
     PTRACE_CONT, PTRACE_SINGLESTEP, PTRACE_GETREGS, PTRACE_SETREGS = 7, 9, 12, 13
+    _DR = 848                                            # offsetof(struct user, u_debugreg) on x86-64
 
     class _Regs(ctypes.Structure):
         _fields_ = [(n, ctypes.c_ulonglong) for n in (
@@ -121,6 +130,10 @@ if __name__ == "__main__":                                            # ---- the
         alloc_base_off = int(spec["alloc_off"])          # alloc function file/vaddr offset
         report = spec["report"]
         timeout = int(spec.get("timeout", 15))
+        # [start, end) offsets of the allocator FAMILY (alloc/free + helpers). A watchpoint that
+        # fires from inside this code is the allocator's own bookkeeping / compaction, not a program
+        # use-after-free -- ignore those, count only accesses from outside the allocator.
+        ignore_ranges = [(int(a), int(b)) for a, b in spec.get("ignore_ranges", [])]
 
         libc = ctypes.CDLL(None, use_errno=True)
         libc.ptrace.restype = ctypes.c_long
@@ -160,17 +173,45 @@ if __name__ == "__main__":                                            # ---- the
         def poke(addr, val):
             libc.ptrace(PTRACE_POKETEXT, pid, ctypes.c_void_p(addr), ctypes.c_void_p(val))
 
-        def load_base():
-            for line in open(f"/proc/{pid}/maps"):
-                if exe.split("/")[-1] in line and "r-xp" in line or (exe in line):
-                    return int(line.split("-")[0], 16)
-            # fall back to the first executable mapping of the exe
-            for line in open(f"/proc/{pid}/maps"):
-                if exe.split("/")[-1] in line:
-                    return int(line.split("-")[0], 16)
-            return 0
+        # --- hardware watchpoints (DR0-3 + DR7) for use-after-free detection ---
+        def poke_dr(n, val):
+            libc.ptrace(PTRACE_POKEUSER, pid, ctypes.c_void_p(_DR + n * 8), ctypes.c_void_p(val))
 
-        base = load_base()
+        def peek_dr(n):
+            ctypes.set_errno(0)
+            v = libc.ptrace(PTRACE_PEEKUSER, pid, ctypes.c_void_p(_DR + n * 8), None)
+            return 0 if (v == -1 and ctypes.get_errno()) else (v & 0xFFFFFFFFFFFFFFFF)
+
+        def set_watch(slot, addr):
+            poke_dr(slot, addr)                          # DRn = watched address
+            dr7 = peek_dr(7)
+            dr7 |= (1 << (slot * 2))                     # Ln: local enable
+            dr7 &= ~(0b1111 << (16 + slot * 4))
+            dr7 |= (0b11 << (16 + slot * 4))             # R/W = 11 (read+write)
+            dr7 |= (0b10 << (18 + slot * 4))             # LEN = 10 (8 bytes)
+            poke_dr(7, dr7)
+
+        def clear_watch(slot):
+            dr7 = peek_dr(7)
+            dr7 &= ~((0b11 << (slot * 2)) | (0b1111 << (16 + slot * 4)))
+            poke_dr(7, dr7)
+
+        def load_base():
+            """(load base, end of the exe's executable mapping). The code end bounds a UAF access to
+            the target's OWN code, so a libc mem* the allocator calls is not read as a program UAF."""
+            base = code_end = 0
+            name = exe.split("/")[-1]
+            for line in open(f"/proc/{pid}/maps"):
+                if name not in line and exe not in line:
+                    continue
+                a, b = line.split()[0].split("-")
+                if base == 0:
+                    base = int(a, 16)
+                if "x" in line.split()[1]:               # executable segment of the exe
+                    code_end = max(code_end, int(b, 16))
+            return base, (code_end or (base + (1 << 24)))
+
+        base, code_end = load_base()
         # For a non-PIE EXEC the vaddr offsets ARE absolute; base-add only relocates a PIE image.
         pie = spec.get("pie", False)
         rebase = base if pie else 0
@@ -192,7 +233,15 @@ if __name__ == "__main__":                                            # ---- the
         signal.alarm(timeout)
 
         freed = set()                                    # pointers currently free
+        free_slots = [0, 1, 2, 3]                         # DR0-3 available for UAF watchpoints
+        slot_of = {}                                      # freed ptr -> DR slot watching its data
+        uaf_seen = set()
         events = []
+
+        def in_allocator(rip):
+            off = rip - rebase
+            return any(a <= off < b for a, b in ignore_ranges)
+
         try:
             while True:
                 libc.ptrace(PTRACE_CONT, pid, None, None)
@@ -205,6 +254,25 @@ if __name__ == "__main__":                                            # ---- the
                                 ctypes.c_void_p(os.WSTOPSIG(status)))
                     continue
                 rg = getregs()
+                # A hardware-watchpoint hit (DR6 B0-B3) = freed memory was ACCESSED. Count it as a
+                # use-after-free only when the access came from the target's OWN code and NOT from
+                # the allocator family (its bookkeeping / compaction writes freed regions itself).
+                dr6 = peek_dr(6)
+                if dr6 & 0xF:
+                    in_code = base <= rg.rip < code_end
+                    for slot in range(4):
+                        if not (dr6 & (1 << slot)):
+                            continue
+                        watched = next((p for p, s in slot_of.items() if s == slot), None)
+                        if (watched is not None and watched in freed
+                                and in_code and not in_allocator(rg.rip)):
+                            key = (watched, rg.rip)
+                            if key not in uaf_seen:
+                                uaf_seen.add(key)
+                                events.append({"error": "use-after-free", "addr": hex(watched),
+                                               "pc": hex(rg.rip)})
+                    poke_dr(6, 0)
+                    continue                              # the access already retired; resume
                 bp = rg.rip - 1
                 info = bps.get(bp)
                 if info is None:
@@ -216,9 +284,16 @@ if __name__ == "__main__":                                            # ---- the
                         if ptr in freed:
                             events.append({"error": "double-free", "addr": hex(ptr)})
                         freed.add(ptr)
+                        if ptr not in slot_of and free_slots:   # watch this freed chunk for UAF
+                            slot = free_slots.pop()
+                            slot_of[ptr] = slot
+                            set_watch(slot, ptr)
                 else:                                    # alloc return: rax = new pointer
                     ptr = rg.rax
                     freed.discard(ptr)                   # handed back out -> live again
+                    if ptr in slot_of:                   # stop watching a reused chunk
+                        clear_watch(slot_of[ptr])
+                        free_slots.append(slot_of.pop(ptr))
                 # step over the int3: restore, single-step, re-arm
                 poke(bp, (peek(bp) & ~0xFF) | orig)
                 setrip(rg, bp)
@@ -236,7 +311,8 @@ if __name__ == "__main__":                                            # ---- the
                 pass
 
         json.dump({"events": events,
-                   "double_free": any(e.get("error") == "double-free" for e in events)},
+                   "double_free": any(e.get("error") == "double-free" for e in events),
+                   "use_after_free": any(e.get("error") == "use-after-free" for e in events)},
                   open(report, "w"))
         return 0
 
