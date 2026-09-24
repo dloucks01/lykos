@@ -627,6 +627,11 @@
   .dr-tag.t-same { color: var(--muted); }
   .dr-cwe { font-family: var(--mono); font-size: .78rem; color: var(--muted); }
   .dr-state { font-size: .78rem; text-align: center; color: var(--muted); }
+  .diff-verify { padding: 12px 16px; border-radius: 9px; font-weight: 600; font-size: .92rem; margin-top: 4px; }
+  .diff-verify.dv-fixed { background: color-mix(in srgb, var(--ok) 14%, transparent); border: 1px solid color-mix(in srgb, var(--ok) 40%, transparent); color: var(--ok); }
+  .diff-verify.dv-vuln { background: color-mix(in srgb, var(--bad) 12%, transparent); border: 1px solid color-mix(in srgb, var(--bad) 40%, transparent); color: color-mix(in srgb, var(--bad) 90%, var(--ink)); }
+  .diff-verify-list { display: flex; flex-direction: column; gap: 4px; margin: 6px 2px 4px; }
+  .dvr { font-family: var(--mono); font-size: .8rem; color: var(--muted); }
   /* Call-graph canvas: pan/zoom SVG of the internal call graph */
   .fn-viewtabs { display: inline-flex; gap: 2px; background: var(--panel-2); border: 1px solid var(--line);
     border-radius: 8px; padding: 2px; margin-bottom: 8px; }
