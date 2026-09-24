@@ -20,7 +20,7 @@ from ..analyze.detect.stage import enqueue_detect
 from ..analyze.disassemble import enqueue_disassemble
 from ..analyze.fuzz.stage import enqueue_fuzz
 from ..analyze.ghidra import locate_ghidra
-from ..analyze.ingest import enqueue_triage, ingest
+from ..analyze.ingest import ingest
 from ..casestore import CaseStore
 from ..db.dao import FindingDAO
 from ..jobs import JobConfig, JobQueue, WorkerPool
@@ -115,24 +115,27 @@ def run_corpus(cases=None, *, workdir=None, gcc="gcc", workers=2, stage_timeout=
                 continue
             label = f"{c.cwe}__{c.name}__{c.verdict}"     # store label only, not embedded
             target = ingest(store, case_row.id, exe, filename=label)
-            enqueue_triage(q, target, force=True)
-            pool.wait_idle(stage_timeout)
+            timed_out = not pool.wait_idle(stage_timeout)
             if ghidra:
                 enqueue_disassemble(q, target, force=True)
-                pool.wait_idle(stage_timeout)
+                timed_out |= not pool.wait_idle(stage_timeout)
             enqueue_detect(q, target, force=True)
-            pool.wait_idle(stage_timeout)
+            timed_out |= not pool.wait_idle(stage_timeout)
             findings = FindingDAO(store.conn).list_by_target(target.id)
             found = {f.cwe for f in findings
                      if _STATE_RANK.get(f.state, 0) >= rank_min}
+            # A False return means a stage never went idle within stage_timeout, so `found` is
+            # read from an UNFINISHED pipeline. Flag the outcome as indeterminate rather than let
+            # a slow-but-correct run score as a clean miss.
+            note = (f"{c.note}; " if c.note else "") + "stage timed out (indeterminate)" \
+                if timed_out else c.note
             outcomes.append(Outcome(c.name, c.cwe, c.verdict, found,
                                     state=_best_state(findings, c.cwe),
-                                    matched=matches(c.cwe, found), note=c.note))
+                                    matched=matches(c.cwe, found), note=note))
     finally:
         pool.stop(grace=3.0)
         store.close()
 
-    meta["elapsed_s"] = None
     return Report(outcomes=outcomes, metrics=score(outcomes), meta=meta)
 
 
@@ -174,17 +177,23 @@ def run_dynamic_corpus(cases=None, *, workdir=None, gcc="gcc", workers=2, max_ex
                                         note="compile failed (skipped)"))
                 continue
             target = ingest(store, case_row.id, exe, filename=f"{c.cwe}__{c.name}__{c.verdict}")
-            enqueue_triage(q, target, force=True)
-            pool.wait_idle(stage_timeout)
+            timed_out = not pool.wait_idle(stage_timeout)
             enqueue_fuzz(q, target, params={"input_mode": "stdin", "max_execs": max_execs,
                                             "max_seconds": max_seconds, "exec_timeout": 1})
-            pool.wait_idle(stage_timeout)
+            timed_out |= not pool.wait_idle(stage_timeout)
             findings = FindingDAO(store.conn).list_by_target(target.id)
             confirmed = [f for f in findings if f.state in _CONFIRMED]
             # confirmed-stage: "reproduced a real bug here" -> credit the ground-truth class
             found = {c.cwe} if confirmed else set()
             state = confirmed[0].state if confirmed else ""
-            note = f"reproduced -> {confirmed[0].cwe} ({state})" if confirmed else c.note
+            if confirmed:
+                note = f"reproduced -> {confirmed[0].cwe} ({state})"
+            elif timed_out:
+                # Fuzzing never went idle within stage_timeout: a non-reproduction here is
+                # unfinished, not a clean negative -- mark it indeterminate.
+                note = (f"{c.note}; " if c.note else "") + "stage timed out (indeterminate)"
+            else:
+                note = c.note
             outcomes.append(Outcome(c.name, c.cwe, c.verdict, found, state=state, note=note))
     finally:
         pool.stop(grace=3.0)

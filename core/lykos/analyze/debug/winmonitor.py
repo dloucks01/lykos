@@ -64,4 +64,7 @@ def monitor(exe, *, argv=(), stdin: bytes = b"", timeout: float = 40.0, winepref
     r = winapi._relay(exe, argv=argv, stdin=stdin, timeout=timeout, wineprefix=wineprefix)
     if not r.get("ok"):
         return r
-    return {"ok": True, "hits": parse(r["text"], r["maps"])}
+    # Same bargain as winapi.trace: a run we cut short yields a partial call list, and an
+    # empty partial list is not the same claim as "this PE calls no dangerous sink".
+    return {"ok": True, "hits": parse(r["text"], r["maps"]),
+            "truncated": bool(r.get("truncated")), "timed_out": bool(r.get("timed_out"))}

@@ -7,8 +7,14 @@ carry {"output_shas": [...], "output_kind": str, "metrics": {...}} which the wor
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
+
+_log = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from ..casestore import CaseStore
 
 # fn(ctx: JobContext) -> Optional[dict]
 StageFn = Callable[[Any], Optional[dict]]
@@ -43,7 +49,7 @@ def register_stage(name: str, fn: StageFn, *, resource_class: str = "quick",
     return sd
 
 
-def cached_output_json(store, run_id: str):
+def cached_output_json(store: "CaseStore", run_id: str) -> Any:
     """The parsed JSON of a run's first 'output' artifact, or None. Shared by cache-hit
     reprojection hooks, which rebuild per-target DB rows from a cloned output artifact."""
     for link in store.run_artifacts.list_by_run(run_id):
@@ -51,11 +57,16 @@ def cached_output_json(store, run_id: str):
             try:
                 return json.loads(store.content.get_bytes(link.artifact_sha256))
             except Exception:
+                # Corrupt/unreadable output artifact: keep scanning, but leave a trace so a
+                # silently-dropped cache output is observable.
+                _log.debug("cached_output_json: skipping output artifact %s for run %s",
+                           link.artifact_sha256, run_id, exc_info=True)
                 continue
     return None
 
 
-def reproject_cache_hit(store, stage: str, target_id: str, run_id: str) -> bool:
+def reproject_cache_hit(store: "CaseStore", stage: str, target_id: str,
+                        run_id: str) -> bool:
     """Re-apply a cached stage's per-target DB denormalization onto a (possibly new) target row.
 
     A content-addressed cache hit clones the prior run's output artifacts to the new run but

@@ -21,7 +21,7 @@ in the shipped product, no GPU dependency. Prefer permissive licenses (air-gappe
 | Role | Primary | Alt | License notes |
 |---|---|---|---|
 | Loader/parser | LIEF | Ghidra loaders | permissive |
-| Disassembly/decompile | **Ghidra** (headless, deterministic decompiler) | rizin/Cutter, angr | Apache-2.0 / LGPL |
+| Disassembly/decompile | **rizin + rz-ghidra + pypcode** (Ghidra P-Code, no JVM) | Ghidra headless (optional alternate, `LYKOS_DECOMPILER=ghidra`), angr | permissive / LGPL |
 | Quick disasm/asm | capstone/keystone | — | BSD |
 | Signature matching | Ghidra FID · FLIRT-style · rizin zignatures | — | permissive |
 | Binary diffing / name transfer | **BinDiff** | Diaphora, Ghidra Version Tracking | free/GPL — separate process |

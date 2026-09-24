@@ -5,15 +5,39 @@ stores the full analysis JSON as an artifact. Fails clearly if Ghidra is not ava
 """
 from __future__ import annotations
 
+import os
+
 from ..db.dao import CallEdgeDAO, FunctionDAO, StringDAO, TargetDAO
 from ..hashing import canonical_json
 from ..jobs.registry import cached_output_json, register_stage
-from . import ghidra
+from . import ghidra, native_re
 
 DISASSEMBLE_STAGE = "disassemble"
 TOOL = "ghidra"
-TOOL_VERSION = "ghidra-headless-1"
+# Bumped to -2 when disassembly became EXHAUSTIVE (all functions, not the first 1200) with
+# geometry-inferred buffers. This is the content-addressed cache key (compute_cache_key includes
+# tool_version), so the bump forces a re-analysis of any binary previously disassembled under the
+# old capped logic instead of reprojecting its stale, truncated function set.
+TOOL_VERSION = "ghidra-headless-2"
 _TIMEOUT = 1800
+
+
+def _select_backend() -> str:
+    """Which RE backend to run: 'native' (rizin/radare2 + pypcode, no JVM) or 'ghidra'
+    (headless + JDK). Controlled by LYKOS_DECOMPILER = native | ghidra | auto (default).
+
+    'auto' prefers the NATIVE backend (doc 24 D-24.1: rizin/rz-ghidra + pypcode is the default
+    decompiler; full Ghidra is the optional heavy profile). It falls back to Ghidra only when no
+    native tool is present -- so a host that ships only Ghidra still works. Pin either with
+    LYKOS_DECOMPILER."""
+    pref = os.environ.get("LYKOS_DECOMPILER", "auto").lower()
+    if pref in ("native", "rizin", "radare2"):
+        return "native"
+    if pref == "ghidra":
+        return "ghidra"
+    if native_re.locate_native():
+        return "native"
+    return "ghidra"
 
 
 def _edges_from_funcs(funcs) -> list:
@@ -59,28 +83,65 @@ def disassemble_stage(ctx) -> dict:
     if target is None:
         raise ValueError("disassemble requires a target_id referencing an ingested blob")
 
-    headless = ghidra.locate_ghidra()
-    if headless is None:
-        raise RuntimeError(
-            "Ghidra not found. Install it and set LYKOS_GHIDRA or GHIDRA_INSTALL_DIR, "
-            "or use the full offline bundle that ships Ghidra.")
+    # A substrate with no machine code has nothing to decompile, and saying so is the whole
+    # job here. Ghidra imported the jar, produced no analysis file, and the stage surfaced
+    # `FileNotFoundError(2, 'No such file or directory')` to the operator -- a raw stdlib
+    # exception, in a pipeline whose other stages say things like "heap check not applicable:
+    # target is statically linked". The constant pool is read by `detect_cwe` instead, which
+    # needs no decompiler at all.
+    ftype = (target.file_type or "").lower()
+    if ftype in ("jar", "class"):
+        note = ("a Java target has no machine code to decompile -- its classes, strings and "
+                "every method it calls are already in the constant pool, which `detect_cwe` "
+                "reads directly. Run detect_cwe instead; disassembly is not a step here.")
+        ctx.emit("re.done", payload={"supported": False, "substrate": ftype, "functions": 0,
+                                     "call_edges": 0, "strings": 0, "note": note})
+        ctx.progress(pct=100, msg="no machine code to decompile (Java target)")
+        return {}
 
+    backend = _select_backend()
     blob = ctx.content.path(target.sha256)
-    ctx.progress(msg="running Ghidra headless (import + auto-analysis + decompile)")
-    out = ctx.scratch() / "analysis.json"
-    ghidra.run_headless(headless, blob, out, ctx=ctx, timeout=_TIMEOUT)
-    ctx.check_cancel()
 
-    result = ghidra.parse_result(out)
+    if backend == "native":
+        cli = native_re.locate_native()
+        if cli is None:
+            raise RuntimeError(
+                "No native RE backend (rizin/radare2) found. Install rizin+rz-ghidra, or set "
+                "LYKOS_DECOMPILER=ghidra to use Ghidra headless.")
+        ctx.progress(msg="running native RE backend (%s + pypcode P-Code, no JVM)" % cli.name)
+        result = native_re.analyze(blob, ctx=ctx, timeout=_TIMEOUT)
+    else:
+        headless = ghidra.locate_ghidra()
+        if headless is None:
+            raise RuntimeError(
+                "Ghidra not found. Install it and set LYKOS_GHIDRA or GHIDRA_INSTALL_DIR, "
+                "use the full offline bundle that ships Ghidra, or set LYKOS_DECOMPILER=native "
+                "to use the rizin/radare2 backend.")
+        ctx.progress(msg="running Ghidra headless (import + auto-analysis + decompile)")
+        out = ctx.scratch() / "analysis.json"
+        ghidra.run_headless(headless, blob, out, ctx=ctx, timeout=_TIMEOUT)
+        ctx.check_cancel()
+        result = ghidra.parse_result(out)
     # functions + call graph/xrefs (reachability + taint sinks for Phase 3) + strings
     funcs, edges, strings = _persist_analysis(ctx.conn, target.id, result)
 
+    # Honest completeness bookkeeping. `analyze()` is exhaustive by default but returns a partial
+    # result rather than raising when a batch times out or the function set was capped, so we
+    # persist whatever was recovered and tell the operator exactly how complete it is.
+    total = result.get("total_functions", len(funcs))
+    partial = bool(result.get("partial"))
+    failed = int(result.get("failed_batches") or 0)
     sha = ctx.put_artifact("ghidra-analysis", data=canonical_json(result))
     ctx.emit("re.done", payload={"functions": len(funcs), "call_edges": len(edges),
-                                 "strings": len(strings),
+                                 "strings": len(strings), "total_functions": total,
+                                 "partial": partial, "failed_batches": failed,
                                  "language": result.get("program", {}).get("language")})
-    ctx.progress(pct=100, msg="%d functions, %d call edges, %d strings" %
-                 (len(funcs), len(edges), len(strings)))
+    suffix = ""
+    if partial:
+        suffix = (f" — partial: {len(funcs)}/{total} functions recovered"
+                  + (f", {failed} batch(es) did not finish" if failed else ""))
+    ctx.progress(pct=100, msg="%d functions, %d call edges, %d strings%s" %
+                 (len(funcs), len(edges), len(strings), suffix))
     return {"output_shas": [sha], "output_kind": "ghidra-analysis"}
 
 

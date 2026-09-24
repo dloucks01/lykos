@@ -7,10 +7,13 @@ ELF payload when the decompressed data is itself an ELF -- the common compressed
 from __future__ import annotations
 
 import bz2
+import logging
 import lzma
 import struct
 import zlib
 from typing import Optional
+
+_log = logging.getLogger(__name__)
 
 # magic bytes -> (type, description). Kept to low-false-positive, meaningful firmware markers.
 SIGNATURES: list[tuple[bytes, str, str]] = [
@@ -37,6 +40,8 @@ SIGNATURES: list[tuple[bytes, str, str]] = [
 ]
 _MAX_HITS = 4000
 _MIN_GAP = 4          # collapse dense duplicate magics (e.g. many jffs2 nodes)
+_MAX_DECOMPRESS = 64 << 20    # hard ceiling on decompressed output (matches the gzip cap):
+                              # a crafted xz/bz2 member must not expand to GB into RAM-backed tmpfs
 
 
 def _elf_extent(data: bytes, o: int) -> Optional[int]:
@@ -71,6 +76,7 @@ def _elf_extent(data: bytes, o: int) -> Optional[int]:
         if 0 < end <= len(data) - o:
             return end
     except Exception:
+        _log.debug("_elf_extent: parsing ELF headers at offset %d failed", o, exc_info=True)
         return None
     return None
 
@@ -100,15 +106,31 @@ def scan_signatures(data: bytes) -> list[dict]:
     return hits
 
 
+def _bounded(dec, blob: bytes, cap: int = _MAX_DECOMPRESS) -> bytes:
+    """Stream `blob` through an incremental decompressor, stopping once output reaches `cap`.
+    Returns at most `cap` bytes (truncated like the gzip path), so a decompression bomb can
+    never expand past the ceiling into RAM. Input is fed on the first call and buffered inside
+    the decompressor; b"" then drains its remaining output up to the cap."""
+    out = bytearray()
+    data_in = blob
+    while len(out) < cap:
+        out += dec.decompress(data_in, cap - len(out))
+        data_in = b""
+        if dec.eof or dec.needs_input:
+            break
+    return bytes(out)
+
+
 def _decompress(typ: str, blob: bytes) -> Optional[bytes]:
     try:
         if typ == "gzip":
-            return zlib.decompressobj(16 + zlib.MAX_WBITS).decompress(blob, 64 << 20)
+            return zlib.decompressobj(16 + zlib.MAX_WBITS).decompress(blob, _MAX_DECOMPRESS)
         if typ == "xz":
-            return lzma.decompress(blob)
+            return _bounded(lzma.LZMADecompressor(), blob)
         if typ == "bzip2":
-            return bz2.decompress(blob)
+            return _bounded(bz2.BZ2Decompressor(), blob)
     except Exception:
+        _log.debug("_decompress: %s stream decompression failed", typ, exc_info=True)
         return None
     return None
 

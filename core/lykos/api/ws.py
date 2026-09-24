@@ -10,6 +10,11 @@ import struct
 
 _GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
+# A client-declared frame length is honoured up to 2**64; without a ceiling a single frame
+# header can make _recvn accumulate an unbounded buffer (memory DoS). No interactive console or
+# seed payload is anywhere near this, so a frame larger than the cap is a hostile client.
+MAX_FRAME = 8 * 1024 * 1024  # 8 MiB
+
 
 def accept_key(sec_websocket_key: str) -> str:
     digest = hashlib.sha1((sec_websocket_key + _GUID).encode()).digest()
@@ -47,31 +52,63 @@ def _recvn(sock, n: int) -> bytes:
     return buf
 
 
-def read_frame(sock):
-    """Read one client->server frame (always masked per RFC 6455). Returns (opcode, payload),
-    or (None, b'') on EOF. Assumes unfragmented frames (what browsers send for small messages)."""
+def _read_one(sock):
+    """Read one raw frame off the wire. Returns (fin, opcode, payload), or (None, None, b'') on
+    EOF / oversize / short read. Applies the client mask if present (RFC 6455 requires masking
+    for client->server frames)."""
     h = _recvn(sock, 2)
     if len(h) < 2:
-        return None, b""
+        return None, None, b""
+    fin = h[0] & 0x80
     opcode = h[0] & 0x0F
     masked = h[1] & 0x80
     ln = h[1] & 0x7F
     if ln == 126:
         ext = _recvn(sock, 2)
         if len(ext) < 2:
-            return None, b""
+            return None, None, b""
         ln = struct.unpack("!H", ext)[0]
     elif ln == 127:
         ext = _recvn(sock, 8)
         if len(ext) < 8:
-            return None, b""
+            return None, None, b""
         ln = struct.unpack("!Q", ext)[0]
+    if ln > MAX_FRAME:
+        return None, None, b""             # oversize frame: refuse rather than buffer it
     mask = _recvn(sock, 4) if masked else b"\x00\x00\x00\x00"
     if masked and len(mask) < 4:
-        return None, b""
+        return None, None, b""
     data = _recvn(sock, ln) if ln else b""
     if ln and len(data) < ln:
-        return None, b""
+        return None, None, b""
     if masked:
         data = bytes(data[i] ^ mask[i & 3] for i in range(len(data)))
-    return opcode, data
+    return fin, opcode, data
+
+
+def read_frame(sock):
+    """Read one logical client->server message. Returns (opcode, payload), or (None, b'') on
+    EOF / protocol error / oversize.
+
+    Reassembles a fragmented data message (an initial text/binary frame with FIN=0 followed by
+    continuation frames, opcode 0x0, until FIN). Control frames (close 0x8, ping 0x9, pong 0xA)
+    are never fragmented per RFC 6455 and are returned immediately so the caller can answer a
+    ping or honour a close even mid-stream; the accumulated total is capped at MAX_FRAME."""
+    payload = b""
+    msg_opcode = None
+    while True:
+        fin, opcode, data = _read_one(sock)
+        if opcode is None:
+            return None, b""
+        if opcode >= 0x8:                  # control frame: complete in itself
+            return opcode, data
+        if opcode == 0x0:                  # continuation
+            if msg_opcode is None:
+                return None, b""           # continuation with nothing to continue
+        else:                              # 0x1 text / 0x2 binary: start of a message
+            msg_opcode = opcode
+        payload += data
+        if len(payload) > MAX_FRAME:
+            return None, b""               # reassembled message too large
+        if fin:
+            return msg_opcode, payload

@@ -24,6 +24,7 @@ from ..dynamic import sandbox
 from ..dynamic.stage import crash_finding_candidate
 from ..fuzz.directed import select_targets
 from ..fuzz.runner import invocation
+from ..poc.capture import how_to_feed
 from . import concolic, symqemu
 
 CONCOLIC_STAGE = "concolic"
@@ -61,7 +62,7 @@ def _corroborate_sink(conn, target, reached_addr):
     return False
 
 
-def _validate(ctx, target, exe, mode, workfile, generated, exec_timeout):
+def _validate(ctx, target, exe, mode, workfile, generated, exec_timeout, base_argv=()):
     """Replay each generated input in the sandbox and record crashes / corroborations /
     seeds. `generated` items are dicts: {input_b64, reached?}. Returns counts."""
     fd = FindingDAO(ctx.conn)
@@ -72,12 +73,12 @@ def _validate(ctx, target, exe, mode, workfile, generated, exec_timeout):
         if ctx.should_cancel():
             break
         data = base64.b64decode(g["input_b64"])
-        argv, stdin = invocation(mode, workfile, data)
+        argv, stdin = invocation(mode, workfile, data, base_argv)   # honour the target's flags / `@@`
         r = sandbox.run(exe, argv=argv, stdin=(stdin if mode == "stdin" else b""),
                         timeout=exec_timeout, arch=target.arch)
         input_sha = ctx.put_artifact("concolic-input", data=data)
         dd.insert(target.id, target.case_id, run_id=ctx.run_id, input_sha=input_sha,
-                  input_mode=mode, argv=argv, exit_code=r.exit_code, signal=r.signal,
+                  input_mode=mode, argv=[], exit_code=r.exit_code, signal=r.signal,
                   signal_name=r.signal_name, crashed=r.crashed, isolation=r.isolation,
                   duration_ms=r.duration_ms,
                   note="concolic-generated" + (f"; reached {g['reached']}"
@@ -133,7 +134,10 @@ def _run_angr(ctx, target, exe, mode, p, py):
     seeds_b64 += list(p.get("seeds", []))
     spec = {"binary": str(exe), "input_mode": mode, "input_size": input_size,
             "targets": targets, "seeds": seeds_b64, "max_seconds": max_seconds,
-            "num_find": int(p.get("num_find", 6)), "max_states": int(p.get("max_states", 800))}
+            "num_find": int(p.get("num_find", 6)), "max_states": int(p.get("max_states", 800)),
+            # arch hints let the driver fall back to angr's raw 'blob' loader when CLE cannot
+            # identify the format (firmware / headerless dumps), instead of failing the stage.
+            "arch": target.arch, "bits": target.bits}
     ctx.emit("concolic.start", payload={"backend": "angr", "targets": targets,
                                         "seeds": len(seeds_b64), "mode": mode})
     ctx.progress(msg=f"angr exploration toward {len(targets)} target(s)")
@@ -169,7 +173,7 @@ def concolic_stage(ctx) -> dict:
     if target is None:
         raise ValueError("concolic requires a target_id")
     p = ctx.params or {}
-    mode = p.get("input_mode", "stdin")
+    mode = how_to_feed(ctx.conn, target, p.get("input_sha"), p)[0]
     base_argv = list(p.get("argv") or [])
     exec_timeout = float(p.get("exec_timeout", 2))
 
@@ -185,18 +189,32 @@ def concolic_stage(ctx) -> dict:
     exe.chmod(0o755)
     workfile = ctx.scratch() / "input.bin"
 
-    if backend == "angr":
-        generated, reached = _run_angr(ctx, target, exe, mode, p, py)
-    else:
-        generated, reached = _run_symqemu(ctx, target, exe, mode, base_argv, p, sq)
+    # Exploration is best-effort: angr can time out (stuck deep in a single step) or a backend can
+    # fail on an odd binary. That must NOT lose the run -- concolic is one corroborating channel,
+    # not the case. On failure we record why, validate whatever inputs were produced (possibly
+    # none), and finish cleanly so the fuzzing/static findings stand and the pipeline moves on.
+    note = None
+    try:
+        if backend == "angr":
+            generated, reached = _run_angr(ctx, target, exe, mode, p, py)
+        else:
+            generated, reached = _run_symqemu(ctx, target, exe, mode, base_argv, p, sq)
+    except Exception as e:                                   # noqa: BLE001
+        generated, reached = [], []
+        note = f"{type(e).__name__}: {e}"[:300]
+        ctx.emit("concolic.explored", payload={"backend": backend, "generated": 0,
+                                               "reached": [], "incomplete": True, "note": note})
+        ctx.progress(msg=f"[{backend}] exploration did not finish ({note}); "
+                         f"keeping any inputs already generated")
 
     confirmed, corroborated, new_seeds = _validate(ctx, target, exe, mode, workfile,
-                                                   generated, exec_timeout)
+                                                   generated, exec_timeout, base_argv)
     ctx.emit("concolic.done", payload={"backend": backend, "confirmed": confirmed,
                                        "corroborated": corroborated, "new_seeds": new_seeds,
-                                       "reached": reached})
-    ctx.progress(pct=100, msg=f"[{backend}] {confirmed} crashes, {corroborated} corroborated, "
-                             f"{new_seeds} new seeds")
+                                       "reached": reached, "incomplete": bool(note),
+                                       "note": note})
+    tail = f"[{backend}] {confirmed} crashes, {corroborated} corroborated, {new_seeds} new seeds"
+    ctx.progress(pct=100, msg=(tail + " (exploration incomplete)") if note else tail)
     return {}
 
 

@@ -17,47 +17,28 @@ from __future__ import annotations
 
 import os
 
-from ...db.dao import CallEdgeDAO, FindingDAO, PocDAO, TargetDAO
+from ...db.dao import CallEdgeDAO, DynResultDAO, FindingDAO, PocDAO, TargetDAO
 from ...jobs.registry import register_stage
-from ..detect.catalog import normalize
 from ..dynamic import sandbox
-from ..dynamic.stage import crash_finding_candidate
+from ..dynamic.stage import crash_dedup_key, crash_finding_candidate
 from . import bundle, primitive
+from .capture import modes_for
 from .primitive_stage import _hydrate_frames
 
 SYNTH_STAGE = "synthesize_poc"
 TOOL = "synth"
 TOOL_VERSION = "synth-1"
 
-# input-reading imports -> the channel that reaches a buffer (heuristic ordering only)
-_STDIN_FUNCS = {"read", "fgets", "gets", "scanf", "__isoc99_scanf", "fread", "getchar",
-                "getline", "fgetc"}
-_FILE_FUNCS = {"fopen", "fopen64", "open", "open64", "freopen"}
-
-
-def _modes_for(call_edges, given):
-    """Order the input channels to try: honour an explicit mode, else rank by the input
-    functions the binary imports, always ending with all three tried."""
-    if given:
-        return [given]
-    names = {normalize(e.dst_name) for e in call_edges if e.dst_name}
-    ordered = []
-    if names & _FILE_FUNCS:
-        ordered.append("file")
-    if names & _STDIN_FUNCS:
-        ordered.append("stdin")
-    ordered.append("arg")
-    for m in ("stdin", "arg", "file"):        # ensure every channel is attempted
-        if m not in ordered:
-            ordered.append(m)
-    return ordered
-
-
 def _deliver(mode, payload, argv_base, ctx):
     if mode == "stdin":
         return list(argv_base), payload
     if mode == "arg":
-        return argv_base + [payload.decode("latin-1")], b""
+        # A synthesized payload always carries a sentinel address, and a sentinel always
+        # contains NUL bytes. Handing that to subprocess raw raises "embedded null byte", so
+        # every argv-reachable overflow reported "no crash from N synthesized inputs" -- on
+        # ncompress, whose overflow is argv-only and already confirmed to L2.
+        # execve truncates at the first NUL anyway, so this delivers what the kernel would.
+        return argv_base + [sandbox.argv_arg(payload, truncate=True)], b""
     wf = ctx.scratch() / "input.bin"          # file
     wf.write_bytes(payload)
     return argv_base + [str(wf)], b""
@@ -71,7 +52,7 @@ def synthesize_stage(ctx) -> dict:
     word = 8 if (target.bits or 64) >= 64 else 4
     endian = "big" if target.endianness == "big" else "little"
 
-    frames = _hydrate_frames(ctx, target.id)
+    frames = _hydrate_frames(ctx, target.id, target)
     candidates = primitive.frame_offset_candidates(frames, word)
     if not candidates:
         ctx.emit("synth.done", payload={"ok": False, "crashed": False,
@@ -80,7 +61,7 @@ def synthesize_stage(ctx) -> dict:
         return {}
 
     call_edges = CallEdgeDAO(ctx.conn).list_by_target(target.id)
-    modes = _modes_for(call_edges, p.get("input_mode"))
+    modes = modes_for(call_edges, p.get("input_mode"))
     argv_base = list(p.get("argv") or [])
     timeout = float(p.get("timeout", 8))
 
@@ -133,10 +114,11 @@ def _finalize(ctx, target, target_bytes, payload, mode, run_argv, res, cand, off
                                      signal_name=res.signal_name, input_sha=input_sha,
                                      bundle_sha=bundle_sha)
     fd = FindingDAO(ctx.conn)
+    fault_pc = DynResultDAO(ctx.conn).fault_pc_for(target.id, input_sha)
     fd.upsert(target.id, target.case_id, crash_finding_candidate(
         res.signal_name, input_sha, res.isolation, "synth_overflow", f"({detail})",
-        state="poc-backed", confidence=0.95, bundle_sha=bundle_sha))
-    fid = fd.id_for_dedup(target.id, f"dynamic-crash:{res.signal_name}")
+        state="poc-backed", confidence=0.95, bundle_sha=bundle_sha, fault_pc=fault_pc))
+    fid = fd.id_for_dedup(target.id, crash_dedup_key(res.signal_name, fault_pc))
     if fid:
         PocDAO(ctx.conn).set_finding(poc_id, fid)
 

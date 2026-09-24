@@ -88,12 +88,40 @@ def build_parser() -> argparse.ArgumentParser:
                     help="release gate: fail if the FP-rate exceeds this (default 0.0)")
     ev.add_argument("--require-backend", action="store_true",
                     help="fail (not skip) when the static backend (Ghidra) is absent")
+    ev.add_argument("--min-negative", type=int, default=0,
+                    help="release gate: fail if fewer than this many 'good' cases were scored "
+                         "(guards against a vacuous fp_rate; default 0 = off)")
     ev.add_argument("--record", action="store_true",
                     help="append this run's metrics to the history (for the dashboard)")
     ev.add_argument("--history", default=None,
                     help="history file for --record (default: eval-history.jsonl)")
     ev.add_argument("--label", default=None, help="optional label for the recorded run")
     ev.set_defaults(func=_cmd_eval)
+
+    ag = sub.add_parser("archgate",
+                        help="architecture coverage gate: every ISA still reaches its PoC level")
+    ag.add_argument("--timeout", type=float, default=30.0, help="per-detonation timeout")
+    ag.add_argument("--only", default=None,
+                    help="comma-separated arch labels to check (default: all)")
+    ag.add_argument("--out", default=None, help="write the JSON report here")
+    ag.set_defaults(func=_cmd_archgate)
+
+    rg = sub.add_parser("realgate",
+                        help="full-chain gate: detect -> PoC -> attribution on a real program")
+    rg.add_argument("--timeout", type=float, default=30.0, help="per-detonation timeout")
+    rg.add_argument("--only", default=None,
+                    help="comma-separated case labels to check (default: all)")
+    rg.add_argument("--out", default=None, help="write the JSON report here")
+    rg.set_defaults(func=_cmd_realgate)
+
+    dr = sub.add_parser("doctor",
+                        help="what this host can and cannot do, and how to fix the gaps")
+    dr.add_argument("--json", action="store_true", help="machine-readable output")
+    dr.add_argument("-v", "--verbose", action="store_true",
+                    help="also say what each present tool unlocks")
+    dr.add_argument("--strict", action="store_true",
+                    help="exit non-zero unless every REQUIRED tool is present")
+    dr.set_defaults(func=_cmd_doctor)
 
     db2 = sub.add_parser("dashboard", help="render the detection-quality regression dashboard")
     db2.add_argument("--history", default=None,
@@ -102,7 +130,105 @@ def build_parser() -> argparse.ArgumentParser:
     db2.add_argument("--fail-on-regression", action="store_true",
                      help="exit non-zero if the latest run regressed in any series")
     db2.set_defaults(func=_cmd_dashboard)
+
+    bd = sub.add_parser("bindiff",
+                        help="patch-diff two binary versions: which functions changed (the fix)")
+    bd.add_argument("old", help="the OLD / vulnerable binary")
+    bd.add_argument("new", help="the NEW / patched binary")
+    bd.add_argument("--json", action="store_true", help="emit the full diff as JSON")
+    bd.add_argument("--timeout", type=int, default=600, help="per-binary analysis budget (s)")
+    bd.set_defaults(func=_cmd_bindiff)
     return p
+
+
+def _cmd_bindiff(args: argparse.Namespace) -> int:
+    import json
+    from pathlib import Path
+
+    from .analyze import native_re, patchdiff
+    old, new = Path(args.old), Path(args.new)
+    for pth in (old, new):
+        if not pth.exists():
+            print(f"no such file: {pth}", file=sys.stderr)
+            return 2
+    fa = native_re.analyze(old, timeout=args.timeout).get("functions") or []
+    fb = native_re.analyze(new, timeout=args.timeout).get("functions") or []
+    d = patchdiff.diff(fa, fb)
+    if args.json:
+        print(json.dumps(d, indent=2, default=list))
+        return 0
+    print(f"old {old.name}: {d['n_old']} functions   new {new.name}: {d['n_new']} functions")
+    if not d["symbols"]:
+        print("(stripped: no symbols to match by name -- structural inventory only)")
+        print(f"  functions added: {d['stripped_added']}   removed: {d['stripped_removed']}")
+        print("  supply symbolized builds to localise the exact changed function.")
+        return 0
+    print(f"unchanged: {d['unchanged']}   added: {len(d['added'])}   removed: {len(d['removed'])}")
+    if d["changed"]:
+        print(f"\nCHANGED functions ({len(d['changed'])}) -- a security fix lives in the top ones:")
+        for c in d["changed"][:25]:
+            extra = ""
+            if c["new_callees"]:
+                extra += f"  +calls {', '.join(c['new_callees'][:4])}"
+            print(f"  {c['name']:<32} blocks {c['blocks'][0]}->{c['blocks'][1]}  "
+                  f"insns {c['insns'][0]}->{c['insns'][1]}  (moved {c['moved']}){extra}")
+    else:
+        print("\nno named function changed -- the two builds are identical where symbols match.")
+    return 0
+
+
+def _cmd_archgate(args: argparse.Namespace) -> int:
+    import json
+
+    from .eval import archgate
+    cases = archgate.MATRIX
+    if args.only:
+        want = {x.strip() for x in args.only.split(",") if x.strip()}
+        cases = [c for c in cases if c.label in want]
+    rep = archgate.run(cases, timeout=args.timeout,
+                       progress=lambda m: print(m, file=sys.stderr, flush=True))
+    print(archgate.table(rep))
+    passed, verdict, reason = archgate.gate(rep)
+    if args.out:
+        Path(args.out).write_text(json.dumps(rep, indent=2))
+        print(f"report written to {args.out}", file=sys.stderr)
+    print(f"\nGATE: {verdict} -- {reason}", file=sys.stderr)
+    return 0 if passed else 1
+
+
+def _cmd_realgate(args: argparse.Namespace) -> int:
+    import json
+
+    from .eval import realgate
+    cases = realgate.MATRIX
+    if args.only:
+        want = {x.strip() for x in args.only.split(",") if x.strip()}
+        cases = [c for c in cases if c.label in want]
+    rep = realgate.run(cases, timeout=args.timeout,
+                       progress=lambda m: print(m, file=sys.stderr, flush=True))
+    print(realgate.table(rep))
+    passed, verdict, reason = realgate.gate(rep)
+    if args.out:
+        Path(args.out).write_text(json.dumps(rep, indent=2))
+        print(f"report written to {args.out}", file=sys.stderr)
+    print(f"\nGATE: {verdict} -- {reason}", file=sys.stderr)
+    return 0 if passed else 1
+
+
+def _cmd_doctor(args: argparse.Namespace) -> int:
+    """What works on THIS host. On an air-gapped workstation there is no package manager to
+    ask, and "the stage declined" is a poor way to find out Ghidra was never installed."""
+    import json
+
+    from . import toolchain, vendorenv
+    if args.json:
+        print(json.dumps(toolchain.as_dict(), indent=2))
+    else:
+        print(vendorenv.status_line())
+        print(toolchain.report(verbose=args.verbose))
+    if args.strict:
+        return 1 if toolchain.missing("required") else 0
+    return 0
 
 
 def _cmd_dashboard(args: argparse.Namespace) -> int:
@@ -170,12 +296,19 @@ def _cmd_eval(args: argparse.Namespace) -> int:
     from .eval.metrics import gate
     passed, verdict, reason = gate(rep.metrics, rep.meta, stage=stage,
                                    min_recall=args.min_recall, max_fp_rate=args.max_fp_rate,
-                                   require_backend=args.require_backend)
+                                   require_backend=args.require_backend,
+                                   min_negative=args.min_negative)
     print(f"\nGATE: {verdict} -- {reason}", file=sys.stderr)
     return 0 if passed else 1
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Before any command runs a tool locator, point the environment at the run-in-place
+    # toolchain under vendor/ (a no-op when there is none). This is what lets the air-gap
+    # bundle work with nothing installed: every locator resolves through PATH, and this puts
+    # the vendored bin/lib dirs on it. See vendorenv.activate.
+    from . import vendorenv
+    vendorenv.activate()
     parser = build_parser()
     args = parser.parse_args(argv)
     return args.func(args)

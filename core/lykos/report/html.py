@@ -117,16 +117,30 @@ def _target_html(t: dict) -> str:
     p.append(f'<h2 class="tname mono">{esc(t.get("filename"))}</h2>')
     mits = t.get("mitigations") or {}
     mit_txt = " ".join(f"{k}={v}" for k, v in mits.items()) if mits else "—"
-    p.append(_kv([
-        ("SHA-256", t.get("sha256")),
-        ("MD5", t.get("md5")),
-        ("Size", t.get("size")),
-        ("Type", t.get("file_type")),
-        ("Arch", f'{t.get("arch") or "?"}/{t.get("bits") or "?"} '
-                 f'{t.get("endianness") or ""}'.strip()),
-        ("Linking", ("stripped " if t.get("stripped") else "") + (t.get("linking") or "")),
-        ("Mitigations", mit_txt),
-    ]))
+    rt = t.get("runtime") or {}
+    rows = [("SHA-256", t.get("sha256")), ("MD5", t.get("md5")), ("Size", t.get("size")),
+            ("Type", t.get("file_type"))]
+    if rt.get("describes_cpu", True):
+        rows += [("Arch", f'{t.get("arch") or "?"}/{t.get("bits") or "?"} '
+                          f'{t.get("endianness") or ""}'.strip()),
+                 ("Linking", ("stripped " if t.get("stripped") else "")
+                             + (t.get("linking") or "")),
+                 ("Mitigations", mit_txt)]
+    else:
+        # arch/bits/endianness are placeholders triage fills for a substrate that has no
+        # processor; printing "jvm/64 big" describes nothing and reads like a CPU.
+        rows.append(("Runtime", rt.get("label")))
+    cov = t.get("fuzz_coverage")
+    if cov:
+        cov_txt = (f'{cov.get("pct")}% of blocks ({cov.get("blocks_hit")}/{cov.get("blocks_known")})'
+                   if cov.get("kind") == "block" and cov.get("pct") is not None
+                   else f'{cov.get("edges")} edges' if cov.get("kind") == "edge"
+                   else "—")
+        rows.append(("Fuzz coverage", cov_txt))
+    p.append(_kv(rows))
+    if rt.get("ceiling_why"):
+        p.append(f'<p class="ceiling"><b>Analysis ceiling — {esc(rt.get("ceiling"))}.</b> '
+                 f'{esc(rt["ceiling_why"])}</p>')
     findings = t.get("findings", [])
     if not findings:
         p.append('<p class="muted">No reportable findings for this target.</p></section>')
@@ -145,6 +159,11 @@ def _finding_html(f: dict) -> str:
     p.append(f'<span class="ftitle">{esc(f.get("title") or f.get("cwe") or "finding")}</span>')
     p.append(_badge(sev, _SEV_COLOR.get(sev, "#8b8d98")))
     p.append(_badge(state, _STATE_COLOR.get(state, "#8b8d98")))
+    v = f.get("verification")
+    if v and v.get("runs"):
+        ok = v.get("crashed") == v.get("runs")
+        p.append(_badge(f'{"verified" if ok else "flaky"} {v.get("crashed")}/{v.get("runs")}',
+                        "#3fb950" if ok else "#d29922"))
     p.append('</div>')
     cwe = f.get("cwe")
     p.append(_kv([
@@ -181,8 +200,19 @@ def _finding_html(f: dict) -> str:
                 fn = f'poc-{(pc.get("bundle_sha") or lvl)[:12]}.tar.gz'
                 dl = (f' <a class="dl" download="{esc(fn)}" '
                       f'href="data:application/gzip;base64,{pc["bundle_b64"]}">download bundle</a>')
+            elif pc.get("bundle_same_as"):
+                # the same PoC backs several findings; the bundle is embedded once above
+                dl = (f' <span class="muted mono">same bundle as above '
+                      f'({esc(pc["bundle_same_as"][:12])}…)</span>')
             elif pc.get("bundle_sha"):
+                # Not embedded (too large, or the report's embed budget is spent). Say where
+                # it is instead of showing a bare hash with nothing to do about it.
+                where = pc.get("bundle_href")
                 dl = f' <span class="muted mono">bundle {esc(pc["bundle_sha"][:16])}…</span>'
+                if where:
+                    dl += (f' <span class="muted">not embedded — fetch from '
+                           f'<span class="mono">{esc(where)}</span> on the analysis server'
+                           f'</span>')
             p.append(f'<div class="poc">{_badge(lvl, "#8e4ec6")} '
                      f'<span class="mono">{esc(pc.get("signal") or "")}</span> '
                      f'<span class="muted">{ok}</span>{dl}</div>')
@@ -211,6 +241,8 @@ body{margin:0;background:var(--bg);color:var(--text);font-family:var(--sans);
 .wrap{max-width:900px;margin:0 auto;padding:32px 24px 64px}
 .mono{font-family:var(--mono);font-size:.85em}
 .muted{color:var(--muted)}
+.ceiling{margin:8px 0 0;padding:8px 10px;border-left:3px solid #7aa2c8;
+  background:rgba(122,162,200,.08);font-size:12.5px;line-height:1.5}
 .eyebrow{text-transform:uppercase;letter-spacing:.08em;font-size:11px;color:var(--faint);
   font-weight:600}
 h1{font-size:26px;margin:6px 0 14px;letter-spacing:-.02em}

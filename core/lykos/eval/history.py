@@ -8,11 +8,14 @@ the previous run in the same series. The dashboard renders these; the CLI can fa
 from __future__ import annotations
 
 import json
+import logging
 import subprocess
 import time
 from pathlib import Path
 
 DEFAULT_PATH = "eval-history.jsonl"
+
+_log = logging.getLogger(__name__)
 
 
 def _git_rev():
@@ -54,6 +57,9 @@ def load(path) -> list:
         try:
             out.append(json.loads(line))
         except json.JSONDecodeError:
+            # Skip a corrupt history line but record it, so a truncated/garbled append is
+            # observable instead of silently vanishing from every dashboard.
+            _log.debug("history load: skipping corrupt line in %s: %r", p, line, exc_info=True)
             continue
     return out
 

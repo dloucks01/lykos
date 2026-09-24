@@ -25,3 +25,7 @@ class JobConfig:
     mem_min_mb_for_heavy: int = 1024    # admission guard for cpu/vm classes
     heavy_classes: tuple[str, ...] = ("cpu", "vm")
     shutdown_grace: float = 10.0        # graceful-stop grace period
+    wedge_grace: float = 60.0           # margin past a stage's deadline before its worker is
+    #                                     considered WEDGED (stuck in an uninterruptible in-process
+    #                                     call): the supervisor then reclaims its concurrency slot
+    #                                     and spawns a replacement so the pool cannot deadlock.

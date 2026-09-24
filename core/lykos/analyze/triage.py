@@ -7,18 +7,24 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from . import elf as elfmod
 from . import filetype
+from . import jvm as jvmmod
+from . import pe as pemod
 
 SCHEMA_VERSION = 1
 TOOL = "elf-stdlib"
 TOOL_VERSION = "triage-4"          # bump to invalidate the cache when parsing changes
 #   triage-4: static-pie linking classification (PT_DYNAMIC no longer implies dynamic)
 MITIGATION_ENUM = {"on", "off", "partial", "unknown"}
-_FILE_TYPES = {filetype.ELF, filetype.PE, filetype.MACHO, filetype.RAW, filetype.OTHER}
+_FILE_TYPES = {filetype.ELF, filetype.PE, filetype.MACHO, filetype.JAR,
+               filetype.CLASS, filetype.FIRMWARE, filetype.RAW, filetype.OTHER}
 _PACK_ENTROPY = 7.2
+# Entropy is a whole-file scan in pure Python; on every ingest that is a DoS on a large upload.
+# A 2 MB prefix is representative for the packer heuristic and matches the ELF/PE section cap.
+_ENTROPY_CAP = 2 * 1024 * 1024
 
 
 def _shannon(data: bytes) -> float:
@@ -83,6 +89,52 @@ def _classify_content(data: bytes) -> str:
     return "unrecognized data (not a known binary format)"
 
 
+# A headerless firmware scan runs on every file that matched no format magic, so bound the
+# bytes it inspects: the pure-Python prologue scoring in `headerless` walks the whole blob,
+# and firmware images that need this path are small (flash/SRAM sized). 16 MiB is far above
+# any bare-metal image and keeps the every-ingest cost bounded.
+_FW_SCAN_CAP = 16 * 1024 * 1024
+
+
+def _firmware_fallback(data: bytes) -> Optional[dict]:
+    """Second opinion for a blob that matched no container magic: is it actually firmware?
+
+    `filetype.detect` only knows the six firmware containers by their offset-0 magic. A
+    bare-metal Cortex-M image, a raw flash dump, or a blob with a gzipped kernel embedded at a
+    non-zero offset has none of those, so it fell through to "not a binary, import an ELF" --
+    the exact confident-wrong-answer this platform has a history of giving about images the
+    carve stage then pulls executables and keys out of. Consult the headerless loader (which
+    can name the CPU) and the carve signature scan (which finds embedded components), and only
+    then decide. Returns None when neither finds anything -- it really is not a binary.
+    """
+    blob = data[:_FW_SCAN_CAP]
+    try:
+        from .firmware.headerless import analyze_blob
+    except Exception:
+        analyze_blob = None
+    if analyze_blob is not None:
+        try:
+            hl = analyze_blob(blob)
+        except Exception:
+            hl = None
+        if hl and hl.get("arch"):
+            return {"mode": "headerless", "headerless": hl}
+    try:
+        from .firmware.carve import scan_signatures
+    except Exception:
+        scan_signatures = None
+    if scan_signatures is not None:
+        try:
+            hits = scan_signatures(blob)
+        except Exception:
+            hits = []
+        # offset 0 would already have been a container magic; we want EMBEDDED content
+        embedded = [h for h in hits if (h.get("offset") or 0) > 0]
+        if embedded:
+            return {"mode": "carve", "hits": embedded}
+    return None
+
+
 def _packer_heuristic(overall: float, sections: list[dict]) -> dict:
     reasons, packer = [], None
     if overall >= _PACK_ENTROPY:
@@ -120,8 +172,14 @@ def build_triage(path: str | Path, hashes: dict[str, Any], filename: str) -> dic
         return rec
 
     rec["file_type"] = filetype.detect(data[:64])
+    if rec["file_type"] == filetype.JAR and not jvmmod.is_jar(data):
+        # `PK\x03\x04` is every zip, not only a Java one: a firmware bundle, a .docx and an
+        # archive of source all start with it. Deciding this here rather than inside the JAR
+        # branch keeps the branch chain honest -- resetting the type mid-branch skipped the
+        # not-a-binary description entirely and left `detected` as None.
+        rec["file_type"] = filetype.OTHER
     rec["_data_head"] = data[:4096]                     # transient: for non-binary classify
-    rec["entropy"] = _packer_heuristic(_shannon(data), [])
+    rec["entropy"] = _packer_heuristic(_shannon(data[:_ENTROPY_CAP]), [])
 
     if rec["file_type"] == filetype.ELF:
         info = elfmod.parse(data)
@@ -140,28 +198,151 @@ def build_triage(path: str | Path, hashes: dict[str, Any], filename: str) -> dic
         rec["detected"] = _describe(rec)
         rec["analyzable"] = True                       # ELF is the fully-supported format
         rec["advisory"] = None
-    elif rec["file_type"] in (filetype.PE, filetype.MACHO):
-        fmt = rec["file_type"].upper()
-        parse_errors.append(f"{rec['file_type']} parsing pending LIEF backend (detected only)")
-        rec["detected"] = f"{fmt} (detected only)"
+    elif rec["file_type"] == filetype.PE:
+        info = pemod.parse(data)
+        parse_errors.extend(info.errors)
+        rec.update({
+            "arch": info.arch, "bits": info.bits, "endianness": info.endianness,
+            "linking": info.linking, "stripped": info.stripped,
+            "entry_point": (f"0x{info.entry:x}" if info.entry is not None else None),
+            "sections": info.sections, "imports": info.imports,
+            "exports_count": info.exports_count,
+            "exports": {"count": info.exports_count, "symbols": info.exported_symbols},
+            "toolchain_hint": info.toolchain_hint, "mitigations": info.mitigations,
+            "format_details": pemod.to_format_details(info),
+        })
+        rec["entropy"] = _packer_heuristic(rec["entropy"]["overall"], info.sections)
+        rec["detected"] = _describe(rec)
+        # The old advisory said disassembly, CWE detection and the dynamic stages were "not
+        # yet available for this format" -- while the platform was disassembling 282 functions
+        # out of this very binary, producing findings from it and running it under Wine. What
+        # is actually missing is narrower, so say that instead.
+        rec["analyzable"] = True
+        rec["advisory"] = (
+            "PE analysed: headers, disassembly, CWE detection and execution under Wine all "
+            "work. Not available for PE: the LD_PRELOAD heap checker and P-Code dynamic "
+            "taint (both Linux/ELF), and fuzzing runs at Wine speed (~1 execution/second) "
+            "with no coverage feedback, so it is not a practical campaign.")
+    elif rec["file_type"] in (filetype.JAR, filetype.CLASS):
+        info = jvmmod.parse(data)
+        parse_errors.extend(info.errors)
+        rec.update({
+            "arch": "jvm", "bits": 64, "endianness": "big", "linking": "dynamic",
+            "stripped": False,
+            "entry_point": info.main_class,
+            "imports": {"libraries": sorted({c.split(".")[0].rsplit("/", 1)[0]
+                                             for c in info.calls if "/" in c})[:64],
+                        "functions_count": len(info.calls),
+                        "symbols": [c.split(".")[-1] for c in info.calls][:512]},
+            "exports_count": len(info.classes),
+            "exports": {"count": len(info.classes), "symbols": info.classes[:512]},
+            "toolchain_hint": f"javac (class file v{info.major})" if info.major
+                              else "javac",
+            "format_details": jvmmod.to_format_details(info),
+        })
+        rec["detected"] = _describe_jvm(info, rec["file_type"])
+        rec["analyzable"] = True
+        # Say exactly where the ladder stops. A managed runtime checks every array access
+        # and owns every pointer, so there is no instruction pointer to take -- claiming
+        # otherwise would be a lie about the runtime, not a missing feature.
+        rec["advisory"] = (
+            "Java analysed: the constant pool gives every string and every method call in "
+            "the clear, which is more than a stripped ELF yields, so invocation discovery, "
+            "the fuzzing dictionary and the string-based detectors all work. Execution is "
+            "under the JVM, where a defect surfaces as an uncaught exception rather than a "
+            "signal; JVM startup dominates each execution (~27 ms measured), so a campaign "
+            "runs at roughly 36 executions/second rather than hundreds. Not available "
+            "for Java: Ghidra "
+            "disassembly and P-Code analysis (there is no machine code), and PoC levels "
+            "L2/L3 -- the JVM owns the instruction pointer, so control-flow hijack is not "
+            "a claim this format can support.")
+    elif rec["file_type"] == filetype.FIRMWARE:
+        kind = filetype.firmware_kind(data[:64]) or "firmware image"
+        rec["detected"] = f"Firmware image — {kind}"
+        # Analysable, but not by the stages that want machine code: the image is a CONTAINER,
+        # and what is in it becomes analysable once carved. Saying "not a recognised
+        # executable, library or firmware image" about a file the carve stage then pulls two
+        # executables and a private key out of is a confident wrong answer.
+        rec["analyzable"] = True
+        rec["advisory"] = (
+            f"{kind} detected. This is a container, not a program: run firmware_carve to "
+            f"extract the components (executables, filesystems, keys) as targets of their "
+            f"own, then analyse those. Disassembly and the dynamic stages apply to the "
+            f"carved components, not to the image.")
+    elif rec["file_type"] == filetype.MACHO:
+        parse_errors.append("mach-o parsing pending (detected only)")
+        rec["detected"] = "MACHO (detected only)"
         rec["analyzable"] = False
-        rec["advisory"] = (f"{fmt} binary detected, but this build fully analyzes ELF only. "
-                           "Format and hashes were recorded; disassembly, CWE detection, and "
-                           "the dynamic/fuzzing stages are not yet available for this format.")
+        rec["advisory"] = ("Mach-O binary detected, but this build parses ELF and PE headers "
+                           "only. Format and hashes were recorded.")
     else:
-        desc = _classify_content(rec["_data_head"])
-        rec["detected"] = f"Not a binary — {desc}"
-        rec["analyzable"] = False
-        rec["advisory"] = (f"This file is not a supported executable binary ({desc}). It was "
-                           "imported and hashed, but there is no machine code to analyze: "
-                           "disassembly, CWE detection, and the dynamic/fuzzing/PoC stages do "
-                           "not apply. Import an ELF executable or shared object to analyze.")
+        # Before calling this "not a binary", ask the headerless loader and the carve scan --
+        # a firmware image without a container magic at offset 0 is still firmware, and saying
+        # otherwise is the confident wrong answer this platform has a history of giving.
+        fw = _firmware_fallback(data)
+        if fw is not None:
+            rec["file_type"] = filetype.FIRMWARE
+            rec["analyzable"] = True
+            if fw["mode"] == "headerless":
+                hl = fw["headerless"]
+                sub = hl.get("sub")
+                kind = ("bare-metal " + (hl.get("arch") or "?")
+                        + (f"/{sub}" if sub else "") + " firmware")
+                rec.update({"arch": hl.get("arch"), "bits": hl.get("bits"),
+                            "endianness": hl.get("endianness"),
+                            "entry_point": (f"0x{hl['entry']:x}"
+                                            if hl.get("entry") is not None else None)})
+                rec["detected"] = (
+                    f"Firmware image — {kind} (headerless: {hl.get('method')}, "
+                    f"confidence {hl.get('confidence')})")
+                rec["advisory"] = (
+                    f"{kind} identified by the headerless loader "
+                    f"({hl.get('evidence') or hl.get('method')}). This is a raw image, not an "
+                    f"ELF/PE: run firmware_carve to extract any embedded components, or "
+                    f"firmware_rehost to run a bare-metal image under emulation. Machine-code "
+                    f"disassembly and the ELF/PE dynamic stages apply to carved components, "
+                    f"not to the raw image.")
+            else:
+                types = sorted({h.get("type") for h in fw["hits"] if h.get("type")})
+                rec["detected"] = ("Firmware image — embedded components ("
+                                   + ", ".join(types) + ")")
+                rec["advisory"] = (
+                    "This image carries embedded components ("
+                    + ", ".join(types) + ") at non-zero offsets. It is a container, not a "
+                    "program: run firmware_carve to extract them (executables, filesystems, "
+                    "keys) as targets of their own, then analyse those. Disassembly and the "
+                    "dynamic stages apply to the carved components, not to the raw image.")
+        else:
+            desc = _classify_content(rec["_data_head"])
+            rec["detected"] = f"Not a binary — {desc}"
+            rec["analyzable"] = False
+            rec["advisory"] = (f"This file is not a supported executable binary ({desc}). It "
+                               "was imported and hashed, but there is no machine code to "
+                               "analyze: disassembly, CWE detection, and the "
+                               "dynamic/fuzzing/PoC stages do not apply. Import an ELF "
+                               "executable or shared object to analyze.")
     rec.pop("_data_head", None)
     return rec
 
 
+def _describe_jvm(info, ftype) -> str:
+    kind = "JAR" if ftype == filetype.JAR else "Java class"
+    parts = [kind]
+    if info.java_version:
+        parts.append(f"Java {info.java_version}")
+    if info.main_class:
+        parts.append(f"main-class {info.main_class}")
+    if info.classes:
+        parts.append(f"{len(info.classes)} class" + ("es" if len(info.classes) != 1 else ""))
+    if info.signed:
+        parts.append("signed")
+    return ", ".join(parts)
+
+
 def _describe(rec: dict) -> str:
-    parts = ["ELF"]
+    # was hardcoded "ELF", which described a Windows PE as an ELF the moment PE triage
+    # started filling these fields in
+    parts = [{"pe": "PE", "macho": "Mach-O"}.get(rec.get("file_type"), "ELF")]
     if rec["bits"]:
         parts.append(f"{rec['bits']}-bit")
     if rec["endianness"]:
@@ -173,6 +354,9 @@ def _describe(rec: dict) -> str:
                       "static": "statically linked"}.get(rec["linking"], "statically linked"))
     if rec["stripped"]:
         parts.append("stripped")
+    sub = (rec.get("format_details") or {}).get("subsystem")
+    if sub:
+        parts.append(sub)
     return ", ".join(parts)
 
 

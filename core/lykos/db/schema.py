@@ -247,4 +247,102 @@ CREATE INDEX ix_component_edge_case ON component_edge(case_id);
 ALTER TABLE function ADD COLUMN signature  TEXT;
 ALTER TABLE function ADD COLUMN frame_json TEXT;
 """),
+    Migration(version=11, name="finding_sites", sql=r"""
+-- A finding is a DEFECT, not a call site. Before this, one dangerous call site was one
+-- finding row, so a binary's finding count tracked compiler inlining rather than risk:
+-- jhead 3.06 built with distro flags produced 27 findings and the SAME PROGRAM at -O0
+-- produced 230, because -O0 does not inline memcpy. Sites are now evidence hanging off the
+-- defect, which is also how the Workbench already presented them ("x12 sites") while the
+-- findings board showed 12 separate rows of identical text.
+CREATE TABLE finding_site(
+  id            TEXT PRIMARY KEY,
+  finding_id    TEXT NOT NULL REFERENCES finding(id) ON DELETE CASCADE,
+  function_addr TEXT,
+  site_addr     TEXT,
+  detail        TEXT,
+  created_at    INTEGER NOT NULL,
+  UNIQUE(finding_id, function_addr, site_addr)
+);
+CREATE INDEX ix_finding_site ON finding_site(finding_id);
+"""),
+    Migration(version=12, name="finding_verdicts", sql=r"""
+-- A finding's state is the STRONGEST thing any channel currently says about it -- not the
+-- strongest thing any channel has EVER said. The old merge took the higher state/severity/
+-- confidence and kept it forever, which is right for promotion (that is how a finding climbs
+-- candidate -> corroborated -> confirmed -> poc-backed when channels agree) and wrong for
+-- everything else: a channel could never revise its own verdict downward.
+--
+-- That silently discarded every demotion. `enqueue_detect` forces by default -- "re-detect
+-- after re-analysis should re-run rather than cache-hit" -- so detect re-running is the
+-- designed path, and the bounds channel's "provably bounded, demote to info" was computed and
+-- thrown away on every one of those runs. gzip 1.3.5's guarded strcpy demotes correctly on a
+-- fresh case and stays high on a re-run of the same one.
+--
+-- Each channel now records its own verdict and the finding is the maximum over them, so a
+-- channel can lower ITS OWN contribution without being able to lower anyone else's. A weak
+-- late channel still cannot undo a crash-proven promotion.
+CREATE TABLE finding_verdict(
+  finding_id  TEXT NOT NULL REFERENCES finding(id) ON DELETE CASCADE,
+  channel     TEXT NOT NULL,
+  run_id      TEXT,
+  state       TEXT NOT NULL,
+  severity    TEXT NOT NULL,
+  confidence  REAL NOT NULL,
+  updated_at  INTEGER NOT NULL,
+  PRIMARY KEY(finding_id, channel)
+);
+CREATE INDEX ix_finding_verdict ON finding_verdict(finding_id);
+
+-- Seed from what already exists, or the first upsert after this migration would recompute a
+-- finding from ONE channel and drop the standing verdicts of every channel that has not
+-- re-run yet.
+INSERT INTO finding_verdict(finding_id, channel, run_id, state, severity, confidence,
+                            updated_at)
+  SELECT id, COALESCE(detector, 'legacy'), NULL, state, severity, confidence, updated_at
+    FROM finding;
+"""),
+    Migration(version=13, name="finding_site_verdicts", sql=r"""
+-- A finding is a defect and its sites are the places it occurs -- but every verdict the
+-- analysis computes is about ONE PLACE. bounds proves a particular copy bounded, a dominating
+-- guard bounds a particular index, crash attribution proves a particular instruction. All of
+-- that was being written as prose into `detail` and then collapsed to a single badge on the
+-- finding.
+--
+-- The cost was overclaiming. jhead's poc-backed CWE-125 has 99 sites and exactly ONE of them
+-- is proven -- the instruction the crash landed on -- yet all 99 carried the identical detail
+-- string, so nothing in the data said which. A 99-site finding with one proven site rendered
+-- exactly like one with 99.
+--
+-- Sites now carry their own state and verdict, so they can be ranked within the finding and
+-- the finding can say "1 of 99 proven" instead of a flat badge.
+ALTER TABLE finding_site ADD COLUMN state TEXT;
+ALTER TABLE finding_site ADD COLUMN confidence REAL;
+ALTER TABLE finding_site ADD COLUMN verdict TEXT;
+"""),
+    Migration(version=14, name="dyn_result_fault_pc", sql=r"""
+-- WHERE a crash faulted, image-relative, when the run that found it was traced.
+--
+-- Crash findings were keyed by signal alone, so every SIGSEGV in a program was one finding:
+-- 8,516 crashes in a jhead campaign reported as a single "unique". Two defects that both
+-- segfault are two defects, and the faulting instruction is what separates them.
+--
+-- It lives on the crash row rather than in the stage that observed it because every later
+-- stage -- build_poc, root_cause, synthesize -- has to derive the SAME key from the same
+-- input, or it files a second finding for a crash that is already recorded.
+ALTER TABLE dyn_result ADD COLUMN fault_pc INTEGER;
+"""),
+    Migration(version=15, name="dyn_result_defect_key", sql=r"""
+-- A per-defect discriminator for a SIGABRT crash, when the run that found it was a sanitizer
+-- build: the ASan/UBSan class + source location (e.g. "heap-use-after-free@parser.c:88").
+--
+-- SIGABRT is bucketed by signal alone because its faulting PC sits in the abort/check machinery,
+-- not the defect -- which correctly merges a double free's dozens of identical aborts. But two
+-- DIFFERENT sanitizer defects (an overflow AND a use-after-free) also both abort, and signal-only
+-- bucketing then collapsed them into one finding, dropping the second CWE/source line. Keying such
+-- an abort by its sanitizer report separates distinct defects while still merging repeats of one.
+--
+-- Like fault_pc, it lives on the crash row so every later stage derives the SAME key from the same
+-- input, rather than filing a second finding for a crash already recorded.
+ALTER TABLE dyn_result ADD COLUMN defect_key TEXT;
+"""),
 ]

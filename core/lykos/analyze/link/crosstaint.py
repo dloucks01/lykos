@@ -119,19 +119,56 @@ def cross_taint_case(conn, content, case_id: str, *, persist: bool = True,
     if persist:
         ce_dao.clear_case(case_id, kind="taint")
     findings = []
+    # Why a run found nothing. "cross_findings: 0" is the same answer whether there were no
+    # components, no resolved links, no tainted data reaching the boundary, or a boundary the
+    # callee simply does not misuse -- and those call for four different next actions. The
+    # only clue used to be `components_analyzed`, which reads as a count rather than a
+    # diagnosis: on a program/library pair with a resolved edge it said 1, because the loop
+    # stopped before ever loading the callee.
+    why: dict = {"no_components": len(targets) < 2, "no_links": not dyn,
+                 "edges_without_tainted_symbol": 0, "edges_with_clean_callee": 0,
+                 "callers_without_ir": 0, "callees_without_ir": 0,
+                 "components_over_cap": 0}
     for e in dyn:
         a, b = targets.get(e.src_target), targets.get(e.dst_target)
         if not a or not b:
             continue
+        # No decompilation on the caller means no IR to trace, which is a different problem
+        # from "the data does not reach the boundary" -- and only one of the two is something
+        # the operator can act on. Carved firmware components arrive with neither.
+        src_ir = comp(e.src_target)[0]
+        if not src_ir:
+            why["callers_without_ir"] += 1
+            continue
+        # Symmetric to the caller guard, and the bug this fixes: a callee with no IR (never
+        # decompiled -- a stripped .so or a component carved from firmware) has no functions to
+        # search for a dangerous sink, so `callee_sink_exports` returns nothing and the loop
+        # below would set `clean=True` and report "the callee does not misuse the data -- a
+        # real negative". That is a false negative stated with confidence about an analysis
+        # that never ran. Count it as a missing analysis and skip, exactly as the caller side.
+        if not comp(e.dst_target)[0]:
+            why["callees_without_ir"] += 1
+            continue
+        # The data-flow engine returns an empty result above its function ceiling, and says
+        # nothing. Without this check the diagnosis below could report "the callee does not
+        # carry it into a dangerous sink -- a real negative" about an analysis that never ran,
+        # which is a false negative stated with confidence. libcrypto is 13,529 functions
+        # against a ceiling of 6,000.
+        if len(src_ir) > taint._MAX_FUNCS or len(comp(e.dst_target)[0]) > taint._MAX_FUNCS:
+            why["components_over_cap"] += 1
+            continue
         syms = set(edge_symbols(e.detail)) & imports(e.src_target)
         if not syms:
+            why["edges_without_tainted_symbol"] += 1
             continue
         b_sinks = sinks(e.dst_target)
         _fi, n2a, _ce = comp(e.dst_target)
+        clean = True
         for sym in sorted(syms):
             hit = b_sinks.get(sym)
             if not hit:
                 continue
+            clean = False
             # pick the highest-severity sink reached, deterministically
             cwe, sink_name = max(sorted(hit),
                                  key=lambda cs: _sev_rank(DANGEROUS.get(cs[1], (0, "info"))[1]))
@@ -142,7 +179,54 @@ def cross_taint_case(conn, content, case_id: str, *, persist: bool = True,
                 fd.upsert(b.id, case_id, cand)
                 ce_dao.upsert(case_id, a.id, b.id, kind="taint", symbol=sym,
                               detail=f"{sink_name} via {sym}")
-    if persist:
-        conn.commit()
+        # per EDGE, at the end of its own iteration -- not after the loop, where `clean`
+        # belongs to whichever edge happened to be last, and does not exist at all if every
+        # edge took a `continue` above
+        why["edges_with_clean_callee"] += int(clean)
+    # (no explicit commit: the connection is autocommit and the upserts above already persisted;
+    # a bare conn.commit() here would prematurely commit any enclosing transaction.)
     return {"edges_examined": len(dyn), "cross_findings": len(findings),
-            "components_analyzed": len(comps)}
+            "components_analyzed": len(comps), "note": _why_nothing(why, len(findings))}
+
+
+def _why_nothing(why: dict, found: int):
+    """One sentence naming what stopped this, or None when something was found."""
+    if found:
+        return None
+    if why["no_components"]:
+        return ("only one component in this case -- cross-component taint needs at least two "
+                "(a program and a library it calls, or a client and a server).")
+    if why["no_links"]:
+        return ("no dynamic-link edges are resolved, so there is no boundary to chase taint "
+                "across. Run link_case first.")
+    n = why["components_over_cap"]
+    if n:
+        return (f"{n} boundar{'ies join' if n != 1 else 'y joins'} a component larger than "
+                f"the data-flow ceiling ({taint._MAX_FUNCS} functions), so the analysis did "
+                f"not run across {'them' if n != 1 else 'it'}. This is not a negative "
+                f"result -- nothing was examined.")
+    if why["callers_without_ir"]:
+        return (f"{why['callers_without_ir']} caller component"
+                f"{'s have' if why['callers_without_ir'] != 1 else ' has'} not been "
+                f"decompiled, so there is no data flow to trace across the boundary. Run "
+                f"disassemble on the components first -- carved firmware components arrive "
+                f"without it.")
+    if why.get("callees_without_ir"):
+        n = why["callees_without_ir"]
+        return (f"{n} callee component{'s have' if n != 1 else ' has'} not been decompiled, "
+                f"so there is no code on the far side of the boundary to search for a "
+                f"dangerous sink. 'No sink reached' here is a missing analysis, not a real "
+                f"negative -- run disassemble on the callee (carved firmware and stripped "
+                f"libraries arrive without it).")
+    if why["edges_without_tainted_symbol"]:
+        return (f"{why['edges_without_tainted_symbol']} linked boundar"
+                f"{'ies' if why['edges_without_tainted_symbol'] != 1 else 'y'} carried no "
+                f"tainted argument: the caller does not reach the imported symbol with data "
+                f"this analysis can trace from an input source.")
+    if why["edges_with_clean_callee"]:
+        return (f"the caller does pass untrusted data across "
+                f"{why['edges_with_clean_callee']} boundar"
+                f"{'ies' if why['edges_with_clean_callee'] != 1 else 'y'}, but the callee "
+                f"does not carry it into a dangerous sink -- which is a real negative, not a "
+                f"missing analysis.")
+    return "nothing to examine."

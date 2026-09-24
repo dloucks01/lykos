@@ -14,6 +14,29 @@ from pathlib import Path
 from typing import Optional
 
 _DRIVER = "angr_driver.py"
+# angr/Z3/CLE keep only ACTIVE states capped; spilled/deferred/unconstrained stashes still grow,
+# and the stage's time budget bounds runaway TIME but not runaway MEMORY within it. Cap the child's
+# virtual address space so a hostile/large target cannot OOM the host mid-exploration; generous
+# enough (12 GiB) that ordinary explorations are unaffected. Tunable via LYKOS_ANGR_MEM_MB.
+_ANGR_MEM_MB = int(os.environ.get("LYKOS_ANGR_MEM_MB", "12288"))
+
+
+def _mem_preexec():
+    """A preexec_fn that caps the angr child's address space (Linux). Returns None where resource
+    limits aren't available, so callers can pass it unconditionally."""
+    try:
+        import resource
+    except Exception:
+        return None
+
+    def _apply():
+        cap = _ANGR_MEM_MB * 1024 * 1024
+        for _res in (resource.RLIMIT_AS, resource.RLIMIT_DATA):
+            try:
+                resource.setrlimit(_res, (cap, cap))
+            except Exception:
+                pass
+    return _apply
 
 
 def _imports_angr(python: Path, timeout: float = 20.0) -> bool:
@@ -72,17 +95,27 @@ def _materialize_driver() -> Path:
 
 
 def run_explore(python: Path, spec: dict, *, ctx=None, timeout: int = 300) -> dict:
-    """Run the angr driver on `spec` and return the parsed result dict."""
+    """Run the angr driver on `spec` and return the parsed result dict.
+
+    The driver enforces its own wall-clock deadline (spec.max_seconds) and dumps partial results,
+    so it should finish on its own. The subprocess timeout here is only a backstop for a driver
+    stuck in native code (a z3 query, VEX lifting) that no in-process signal can interrupt -- angr
+    on a large Rust binary does this. We give a short grace past the driver's deadline, then let
+    the TimeoutExpired propagate: the concolic STAGE catches it and finishes cleanly with whatever
+    was produced, so a stuck exploration never takes the case down."""
     work = _materialize_driver().parent
     spec_path = work / "spec.json"
     out_path = work / "out.json"
     spec_path.write_text(json.dumps(spec))
     cmd = [str(python), str(work / _DRIVER), str(spec_path), str(out_path)]
+    grace = timeout + 25
     try:
+        _pre = _mem_preexec()
         if ctx is not None:
-            proc = ctx.run_subprocess(cmd, timeout=timeout + 60)
+            proc = ctx.run_subprocess(cmd, timeout=grace, preexec_fn=_pre)
         else:
-            proc = subprocess.run(cmd, timeout=timeout + 60, capture_output=True, check=False)
+            proc = subprocess.run(cmd, timeout=grace, capture_output=True, check=False,
+                                  preexec_fn=_pre)
         if not out_path.exists():
             tail = (getattr(proc, "stderr", b"") or b"")[-600:].decode("latin-1", "ignore")
             raise RuntimeError(f"angr driver produced no output (rc="

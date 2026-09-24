@@ -5,6 +5,7 @@ connection via `connect()`; connections are NOT shared across threads/processes.
 """
 from __future__ import annotations
 
+import itertools
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
@@ -13,6 +14,8 @@ from typing import Iterator
 # Pragmas applied to every connection. WAL + synchronous are persistent-ish / per-conn;
 # foreign_keys and busy_timeout MUST be set per connection (they do not persist).
 _BUSY_TIMEOUT_MS = 5000
+
+_SAVEPOINT_SEQ = itertools.count()
 
 
 def connect(db_path: str | Path) -> sqlite3.Connection:
@@ -28,17 +31,37 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
 
 
 @contextmanager
-def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
+def transaction(conn: sqlite3.Connection, *, immediate: bool = False
+                ) -> Iterator[sqlite3.Connection]:
     """Explicit transaction. Commits on success, rolls back on exception.
 
     Used with the autocommit connection above so writes are grouped and atomic.
     Keep write transactions short (single-writer discipline; the queue is the hot writer).
+
+    Nest-safe: called while a transaction is already open (e.g. a DAO bulk write invoked inside
+    a larger `transaction()`), it opens a SAVEPOINT and participates in the outer transaction
+    instead of raising "cannot start a transaction within a transaction". The inner block then
+    rolls back to its savepoint on error and re-raises, leaving the outer transaction to decide
+    the final commit/rollback. `immediate=True` takes the write lock up front (BEGIN IMMEDIATE)
+    at the top level; nested, the outer transaction already holds it.
     """
-    conn.execute("BEGIN")
-    try:
-        yield conn
-    except Exception:
-        conn.execute("ROLLBACK")
-        raise
+    if conn.in_transaction:
+        name = f"lykos_sp_{next(_SAVEPOINT_SEQ)}"
+        conn.execute(f"SAVEPOINT {name}")
+        try:
+            yield conn
+        except Exception:
+            conn.execute(f"ROLLBACK TO {name}")
+            conn.execute(f"RELEASE {name}")
+            raise
+        else:
+            conn.execute(f"RELEASE {name}")
     else:
-        conn.execute("COMMIT")
+        conn.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
+        try:
+            yield conn
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        else:
+            conn.execute("COMMIT")

@@ -118,3 +118,115 @@ def test_export_then_import(srv):
     st2, body2 = _post(port, "/import", archive)
     assert st2 == 201
     assert json.loads(body2)["cases"] == [cid]
+
+
+def test_a_bundle_is_embedded_once_and_within_a_budget(tmp_path):
+    """A PoC bundle carries the target binary so it reproduces standalone, which is the point
+    of it -- 660 KB of a 694 KB jhead report was one bundle. The per-bundle cap says nothing
+    about how many there are, and several findings can share one PoC, so ten PoCs on that
+    target would have produced a 7 MB page with the same binary in it repeatedly."""
+    from lykos.report import model
+
+    class _Store:
+        class content:
+            @staticmethod
+            def exists(_sha):
+                return True
+
+            @staticmethod
+            def get_bytes(_sha):
+                return b"\x00" * (1024 * 1024)       # 1 MiB -> ~1.37 MiB of base64
+    budget = {"left": model._MAX_EMBED_TOTAL}
+    embedded = set()
+    got = []
+    for i in range(6):
+        sha = "%064x" % i
+        b64 = model._embed(_Store(), sha, budget)
+        if b64:
+            embedded.add(sha)
+            budget["left"] -= len(b64)
+        got.append(bool(b64))
+    assert got[0] is True, "the first bundle is always embedded"
+    assert not all(got), "the budget has to stop somewhere"
+    assert budget["left"] >= 0
+    total = model._MAX_EMBED_TOTAL - budget["left"]
+    assert total <= model._MAX_EMBED_TOTAL
+
+    # one bundle larger than the per-bundle cap is refused regardless of budget
+    class _Big(_Store):
+        class content:
+            @staticmethod
+            def exists(_sha):
+                return True
+
+            @staticmethod
+            def get_bytes(_sha):
+                return b"\x00" * (model._MAX_EMBED_BUNDLE + 1)
+    assert model._embed(_Big(), "f" * 64, {"left": 1 << 40}) is None
+
+
+def test_a_bundle_that_is_not_embedded_says_where_to_get_it():
+    """With embedding off, or the budget spent, the report showed a bare hash and nothing to
+    do about it. Air-gapped does not mean unhelpful: the bundle is still on the analysis
+    server, and the report can say where."""
+    from lykos.report.html import to_html
+    base = {"case": {"name": "c", "id": "1"}, "generated_at": "now", "summary": {},
+            "targets": [{"filename": "t", "sha256": "a" * 64, "findings": [
+                {"id": "f1", "cwe": "CWE-125", "title": "oob", "severity": "high",
+                 "state": "poc-backed", "confidence": 0.9, "detector": "d", "evidence": [],
+                 "crashes": [], "pocs": [{"level": "L1", "verified": True, "signal": "SIGSEGV",
+                                          "bundle_sha": "b" * 64,
+                                          "bundle_href": "/artifacts/" + "b" * 64}]}]}]}
+    html = to_html(base)
+    assert "not embedded" in html and "/artifacts/" + "b" * 64 in html
+    # and a bundle shared by a second finding is named, not silently dropped
+    base["targets"][0]["findings"][0]["pocs"][0] = {
+        "level": "L1", "verified": True, "signal": "SIGSEGV",
+        "bundle_sha": "b" * 64, "bundle_same_as": "b" * 64}
+    assert "same bundle as above" in to_html(base)
+
+
+class _T:
+    def __init__(self, **kw):
+        for k in ("id", "case_id", "filename", "sha256", "md5", "sha1", "size", "file_type",
+                  "arch", "bits", "endianness", "linking", "stripped", "mitigations",
+                  "entropy", "ingested_at"):
+            setattr(self, k, kw.get(k))
+
+
+def test_the_report_names_the_runtime_and_its_ceiling():
+    """A 47 KB report over a case holding a jar mentioned "Java" zero times and printed
+    `Arch: jvm/64 big` -- placeholder fields from triage rendered as though they described a
+    processor. A reader could not tell a finding came from a managed runtime, nor why no L2/L3
+    appears for it, so "no exploit was produced" read as a gap rather than as the runtime's own
+    guarantee."""
+    from lykos.report.model import _runtime
+    jar = _runtime(_T(file_type="jar", arch="jvm", bits=64, endianness="big"))
+    assert jar["substrate"] == "jvm"
+    assert jar["describes_cpu"] is False, "a jar has no processor to describe"
+    assert jar["ceiling"] == "L1"
+    assert "instruction pointer" in jar["ceiling_why"]
+    assert "not a gap in the" in jar["ceiling_why"]
+    assert "disassemble" in jar["unavailable"]
+
+    native = _runtime(_T(file_type="elf", arch="x86-64", bits=64, linking="dynamic"))
+    assert native["substrate"] == "native" and native["ceiling"] == "L3"
+    assert native["describes_cpu"] is True
+    assert not native["ceiling_why"], "a native target has no ceiling worth stating"
+
+
+def test_the_html_drops_the_meaningless_cpu_row_for_a_jar():
+    from lykos.report.html import _target_html
+    from lykos.report.model import _runtime
+    t = {"filename": "app.jar", "sha256": "a" * 64, "file_type": "jar", "arch": "jvm",
+         "bits": 64, "endianness": "big", "findings": [],
+         "runtime": _runtime(_T(file_type="jar", arch="jvm", bits=64, endianness="big"))}
+    h = _target_html(t)
+    assert "jvm/64 big" not in h
+    assert "Java (JVM)" in h and "Analysis ceiling" in h
+
+    n = {"filename": "jhead", "sha256": "b" * 64, "file_type": "elf", "arch": "x86-64",
+         "bits": 64, "endianness": "little", "linking": "static", "findings": [],
+         "runtime": _runtime(_T(file_type="elf", arch="x86-64", bits=64, linking="static"))}
+    hn = _target_html(n)
+    assert "x86-64/64" in hn and "Analysis ceiling" not in hn

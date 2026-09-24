@@ -109,3 +109,106 @@ def test_root_cause_on_emulated_target(store, case, pool, tmp_path):
     assert payload["supported"] and payload["backend"] == "qemu-gdbstub"
     assert any(f.detector == "root_cause" and f.state == "confirmed"
                for f in FindingDAO(store.conn).list_by_target(t.id))
+
+
+# ------------------------------------------------- stub-derived register layouts (no table)
+def test_stub_abi_declares_what_the_description_cannot():
+    """A target description lists registers and widths, but not WHICH one is the stack pointer
+    or program counter -- and the names are not guessable: i386 calls them esp/eip, and
+    LoongArch has no register named "sp" at all (its stack pointer is r3). Those stay declared.
+    """
+    from lykos.analyze.debug import qemu_gdb as qg
+    assert qg._sp_name("x86") == "esp" and qg._pc_name("x86") == "eip"
+    assert qg._sp_name("loongarch") == "r3" and qg._pc_name("loongarch") == "pc"
+    assert qg._sp_name("m68k") == "sp" and qg._pc_name("m68k") == "pc"
+    # hand-written layouts keep their existing sp names and the default pc
+    assert qg._sp_name("aarch64") == "sp" and qg._pc_name("aarch64") == "pc"
+    assert qg._sp_name("mips") == "r29"
+
+
+def test_derivable_arches_report_supported_without_a_hardcoded_layout():
+    """These have no _LAYOUTS entry -- support comes from fetching the stub's description."""
+    from lykos.analyze.debug import qemu_gdb as qg
+    for arch in ("loongarch", "m68k", "sparcv9", "x86"):
+        assert arch not in qg._LAYOUTS
+        assert qg.supported(arch), f"{arch} should be supported via the stub description"
+    # SuperH is the counterexample: qemu-sh4 serves no description, so it is the one layout
+    # that has to be hand-written -- and it IS written, so the arch is supported.
+    assert "sh" in qg._LAYOUTS and qg.supported("sh")
+
+
+def test_fetch_layout_parses_a_target_description():
+    """Register order and widths come from the description, including xi:include expansion."""
+    from lykos.analyze.debug import qemu_gdb as qg
+
+    core = ('<target><xi:include href="core.xml"/>'
+            '<reg name="pc" bitsize="32"/></target>')
+    inc = ('<feature><reg name="d0" bitsize="32"/><reg name="a0" bitsize="32"/>'
+           '<reg name="fp80" bitsize="80"/></feature>')
+    replies = {"target.xml": core, "core.xml": inc}
+
+    class FakeSock:
+        def __init__(self):
+            self.n = 0
+
+        def _reply(self, req):
+            # qXfer:features:read:<name>:<off>,<len>
+            name = req.split(":")[3]
+            off = int(req.split(":")[4].split(",")[0], 16)
+            body = replies[name]
+            return "l" + body[off:]
+
+    sock = FakeSock()
+    orig = qg._txn
+    qg._txn = lambda s, data, timeout=5.0: sock._reply(data)
+    try:
+        lay = qg._fetch_layout(sock)
+    finally:
+        qg._txn = orig
+    # target.xml's own regs first, then the include, in document order
+    assert ("pc", 4) in lay and ("d0", 4) in lay and ("a0", 4) in lay
+    assert ("fp80", 10) in lay          # 80 bits rounds up to 10 bytes
+
+
+def test_breakpoints_go_at_the_even_address_on_lsb_masking_isas():
+    """ARM marks a Thumb function by setting bit 0 of its SYMBOL value, but the code lives at
+    the even address. A breakpoint placed at the odd address never fires -- verified against
+    qemu-arm: bp at 0x10355 produced no stop at all, bp at 0x10354 hit immediately -- so a
+    ret2win that genuinely redirected execution was reported as "hijack not reached".
+
+    The payload must still carry the ODD address (bit 0 selects Thumb state), so the two
+    cannot simply be normalised together: place even, report back what the caller asked for.
+    """
+    from lykos.analyze.debug import qemu_gdb as qg
+    assert "arm" in qg.LSB_MASKED_PC and "aarch64" in qg.LSB_MASKED_PC
+    assert "riscv" in qg.LSB_MASKED_PC
+    # x86 code addresses are arbitrary bytes; masking one would move the breakpoint
+    assert "x86" not in qg.LSB_MASKED_PC and "x86-64" not in qg.LSB_MASKED_PC
+    assert "m68k" not in qg.LSB_MASKED_PC and "ppc64" not in qg.LSB_MASKED_PC
+
+
+def test_win_address_packing_follows_the_target_not_the_host():
+    """A 4-byte big-endian return address written as 8 little-endian bytes lands nowhere."""
+    from lykos.analyze.poc import exploit
+    be32 = exploit.ret2win_input(8, 0x80000420, 32, word=4, endian="big")
+    assert be32[8:12] == b"\x80\x00\x04\x20"
+    le64 = exploit.ret2win_input(8, 0x401146, 32, word=8, endian="little")
+    assert le64[8:16] == (0x401146).to_bytes(8, "little")
+    # the default stays x86-64 so existing callers are unaffected
+    assert exploit.ret2win_input(8, 0x401146, 32)[8:16] == le64[8:16]
+
+
+def test_superh_layout_is_hand_written_and_self_consistent():
+    """qemu-sh4 serves no target description, so SuperH is the one layout that cannot be
+    derived. Transcribed from qemu's SH4 gdbstub and verified against a live g-packet: 59
+    32-bit registers (236 bytes), with an all-'A' overflow landing at indices 14, 16 and 17 --
+    r14 (frame pointer), pc and pr (link register).
+    """
+    from lykos.analyze.debug import qemu_gdb as qg
+    lay = qg._LAYOUTS["sh"]
+    assert len(lay) == 59, "SuperH g-packet is 59 registers"
+    assert sum(w for _, w in lay) == 236, "236 bytes total"
+    names = [n for n, _ in lay]
+    assert names[14] == "r14" and names[16] == "pc" and names[17] == "pr"
+    assert qg._sp_name("sh") == "r15"
+    assert qg.supported("sh") and qg.breakpoints_supported("sh")

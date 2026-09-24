@@ -66,6 +66,98 @@ Columns = pipeline stages. Cells = target support level.
 | Unknown / custom ISA | wizard | SLEIGH | SLEIGH | Unicorn-via-SLEIGH | N/A | PART | PART | N/A |
 | JVM / .NET / Dalvik / WASM / eBPF | FULL | N/A(bytecode) | FULL | managed VM | lang-level | PART | PART | N/A |
 
+## MEASURED end-to-end results (September 2026)
+
+The matrix above is the *plan*. This one is ground truth: `examples/re-corpus/src/vuln.c`
+built per architecture (`-O0 -static -fno-stack-protector`) and driven through the real
+pipeline -- triage -> disassemble (Ghidra 12.1.2) -> detect_cwe -> dynamic_run -> build_poc
+-> poc_primitive -- on an x86-64 host, so every non-native arch runs under qemu-user.
+
+| label | arch | funcs | findings | corrob | taint | crash | L1 | L2 |
+|---|---|---|---|---|---|---|---|---|
+| aarch64 | aarch64 | 1015 | 17 | 10 | yes | SIGSEGV | yes | **yes** (off 136) |
+| arm | arm | 959 | 25 | 13 | yes | SIGSEGV | yes | **yes** (off 132) |
+| loongarch | loongarch | 1007 | 15 | 10 | yes | SIGSEGV | yes | **yes** (off 136) |
+| m68k | m68k | 961 | 193 | 72 | yes | SIGSEGV | yes | **yes** (off 132) |
+| ppc | ppc | 1231 | 175 | 93 | yes | SIGSEGV | yes | **yes** (off 156) |
+| ppc64 (BE) | ppc64 | 978 | 229 | 158 | yes | SIGSEGV | yes | not confirmed |
+| ppc64le | ppc64 | 1829 | 220 | 146 | yes | SIGSEGV | yes | **yes** (off 176) |
+| riscv | riscv | 984 | 23 | 10 | yes | SIGSEGV | yes | **yes** (off 136) |
+| s390 | s390 | 0 | 3 | 0 | no | SIGILL | yes | yes (off 176) |
+| sh | sh | 969 | 200 | 120 | yes | SIGSEGV | yes | yes (off 64) |
+| sparcv9 | sparcv9 | 954 | 198 | 75 | yes | SIGBUS | yes | supported, unreachable* |
+| x86 (32) | x86 | 1100 | 90 | 37 | yes | SIGSEGV | yes | **yes** (off 140) |
+| x86-64 | x86-64 | 1166 | 100 | 69 | yes | SIGSEGV | yes | **yes** (off 136) |
+
+**All 13 reach a verified L1** (crash reproducer, `poc-backed` finding), and **twelve of
+thirteen reach a confirmed L3** control-flow hijack -- up from one (native x86-64) before the cross-arch work. L3 uses
+**ret2win**: overwrite the saved return address with a chosen function's address read from the
+target's own symbol table, and prove arrival with a breakpoint. All three steps are ISA-neutral
+over the qemu gdbstub; the other L3 strategies (ROP gadget search, mprotect shellcode, the PIE
+info-leak) are x86-64 machine code and stay native-only.
+
+| arch | L1 | L2 | L3 (ret2win offset) |
+|---|---|---|---|
+| x86-64 | yes | yes | **yes** (72) |
+| x86 (32) | yes | yes | **yes** (76) |
+| aarch64 | yes | yes | **yes** (72) |
+| arm | yes | yes | **yes** (68) |
+| ppc | yes | yes | **yes** (92) |
+| ppc64 (BE) | yes | yes | **yes** (96) |
+| ppc64le | yes | yes | **yes** (112) |
+| riscv | yes | yes | **yes** (72) |
+| loongarch | yes | yes | **yes** (72) |
+| m68k | yes | yes | **yes** (68) |
+| s390 | yes | yes | **yes** (176) |
+| sh | yes | yes | **yes** (64) |
+| sparcv9 | yes | no | no |
+
+Reading the table:
+
+### Two architectures that needed more than a table row
+
+**SuperH is the one layout that cannot be derived.** qemu-sh4 serves no target description at
+all, so it is written by hand -- transcribed from qemu's SH4 gdbstub and then VERIFIED against
+a live g-packet rather than trusted: 59 32-bit registers (236 bytes), with an all-'A' overflow
+landing at indices 14, 16 and 17, i.e. exactly r14 (frame pointer), pc and pr (link register),
+which is what that order predicts. sp is r15, the return address is pr, arguments are r4-r7.
+
+**s390 reaches L3 despite decompiling to nothing** (Ghidra ships no SystemZ processor), which
+is the clearest demonstration that the dynamic ladder does not depend on the decompiler. Two
+things were in the way, both ours: its link register is `r14`, which the shared
+return-address list did not contain -- that list is now per-ISA, because r14 is the link
+register on s390 and ARM but an ordinary callee-saved register on PowerPC and MIPS and so
+cannot be guessed globally; and `exploit_stage` recovered the control offset with
+little-endian 64-bit defaults, which reads a big-endian PC backwards.
+
+**sparcv9 is the one architecture still at L1**, for an architectural reason rather than a
+gap: register windows keep the return address in `%i7` and off the stack entirely, so a
+stack-buffer overflow does not corrupt control flow there at all.
+
+### Resolved: ppc64le yielded zero data-flow findings (callee-name decoration)
+
+Recorded here because the cause is worth knowing. ppc64le produced **0** flagged sinks where
+big-endian ppc64 produced 139, from identical source. It was not the ABI row (shared, and
+working big-endian) and not endianness: it was `catalog.normalize()`.
+
+ELFv2 -- which every little-endian ppc64 system uses -- gives each function a *global* entry
+that sets up the TOC and a *local* entry 8 bytes later holding the actual body. Ghidra models
+that as two functions: `main` (8 bytes, `lis r2` / `addi r2`, no calls) and `.main` (the real
+184-byte, 6-block body). On the corpus binary **845 of 1829 functions and 3659 of 4828 call
+targets carried the leading dot**, so `.strcpy` matched no sink, `._IO_fgets` matched no
+source, and `.main` matched no entry point -- the seed landed on the 8-byte TOC stub, which
+uses no parameters and reaches nothing. Big-endian ppc64 is ELFv1, has no dots, and was
+unaffected, which is exactly why the matrix showed one healthy arch and one dead one.
+
+Fixed by normalising three more decorations: a leading `.` (PowerPC local entry), Ghidra's PLT
+thunk form `<hex>.plt_call.<symbol>`, and glibc's `_IO_` stdio aliases. ppc64le now reports
+146 corroborated findings against big-endian's 158. The PLT-thunk part also recovered sinks on
+big-endian ppc64 (`greet` calls `00000397.plt_call.strcat`, previously unmatched), so an
+architecture that *looked* healthy was quietly losing findings too.
+
+Lesson for adding an architecture: verify that recovered callee names actually match the
+catalog. A silent zero here is indistinguishable from "this binary has no bugs".
+
 ## Cross-cutting per-architecture concerns (must be modeled, not assumed)
 These vary by ISA and silently break analysis/PoC if hardcoded to x86:
 - **Endianness** (BE vs LE; bi-endian MIPS/PPC/ARM) — affects every byte-level detector and input crafting.
@@ -97,6 +189,58 @@ These vary by ISA and silently break analysis/PoC if hardcoded to x86:
 - **Tier 2** breadth lands as a wave right after v1 (mostly wiring, since engines already support it).
 - **Tier 3** rides the firmware track (Phase 8, doc 17.5).
 - **Tier 4 / custom ISA / bytecode** are additive plugin efforts, prioritized by real engagement demand.
+
+## MEASURED bounds + guard reasoning (September 2026)
+
+Ground-truth fixture (`signed/s.c`): ten copy sites whose correct verdict is known from the
+source — four genuinely bounded, three signed-length hazards, one guard that does not protect
+the buffer, one unguarded, one constant. Built at `-O0` for all 13 architectures and scored
+against that truth. `9/9` means every scored site matched.
+
+| arch | score | what is still in the way |
+|---|---|---|
+| x86-64 | **9/9** | — |
+| x86 (32) | **9/9** | stack-passing ABI; PIC puts a call in the guard block |
+| aarch64 | **9/9** | — |
+| arm (Thumb) | **9/9** | — |
+| loongarch | **9/9** | — |
+| m68k | **9/9** | stack-passing ABI |
+| ppc | **9/9** | — |
+| ppc64 (BE) | **9/9** | — |
+| sh | 8/9 | a 4096 immediate comes from a PC-relative constant pool the evaluator cannot read; the site stays `unknown`, which is the correct conservative answer |
+| ppc64le | 2/9 | Ghidra reports the fixture's `char[64]` as four separate 8-byte locals, so the destination SIZE is unreliable. Verdicts are `unknown` rather than wrong — see the frame-headroom rule below |
+| riscv | 0/9 | Ghidra resolved one `memcpy` call edge in the whole binary; the per-site edges never reach the detector, so no site is scored at all |
+| s390 | 0/9 | disassembly recovers **0 functions** (see the end-to-end table above), and there is no `ARCH_ABI` entry |
+| sparcv9 | 2/9 | register windows; the recovered frame reports `frame_size=2223` |
+
+The three failures are all upstream of the bounds pass — call-graph naming, function recovery,
+and frame recovery — not guard reasoning. Where the pass cannot trust its inputs it returns
+`unknown`; no architecture produces a wrong verdict.
+
+**How the condition is read.** Out of P-Code, not off the branch mnemonic. Mnemonic tables are
+an x86 fiction, and the ISAs split three ways:
+
+* **flag registers** (x86, x86-32, aarch64, arm, m68k) — `CF`/`OF`/`SF`/`ZF` are each defined
+  by an explicit comparison, then combined with boolean algebra. x86's `JA` is `!(CF|ZF)` and
+  aarch64's `b.hi` is `CY & !ZR`: the same relation, different algebra, neither readable
+  without evaluating it. `SF != OF` is the signed less-than; `SF` alone is sound only against
+  zero, which is exactly the `n >= 0` idiom.
+* **direct compare** (riscv, loongarch, sh) — no flags. The constant lives in a **register**
+  and the operands are **reversed**: `li a5,0x3f; blt a5,a4` is `63 < n`.
+* **condition bitfield** (ppc, ppc64) — `cmplwi` packs lt/gt/eq into `cr0` with shifts and
+  `bgt` extracts one bit. The unrelated `xer_so` bit is OR'd in from a value the evaluator
+  cannot see, so it tracks which bit POSITIONS are unknown instead of discarding the field.
+
+**Frame coordinates are derived, not tabulated.** `ghidra_offset = base_offset + displacement`,
+where the base's offset from the entry stack pointer is read out of the prologue. One rule,
+three conventions: x86-64 `PUSH RBP; MOV RBP,RSP` gives RBP = -8; aarch64 `stp x29,x30,[sp,#-0x60]!`
+gives SP = -96; loongarch `addi.d fp,sp,0x60` gives FP = 0. A per-ISA delta table got the first
+two right and loongarch wrong, because its frame pointer addresses the top of the frame.
+
+**An overflow claim must clear the whole frame.** ppc64le fragments buffers, so a copy that
+exceeds the recovered variable but still fits the frame below it cannot be told apart from a
+buffer the decompiler split up. Those stay `unknown`. This also removed both remaining false
+positives on jhead 3.04 (`ProcessFile`, the `Comment[16001]`/`st` slot-reuse artifact).
 
 ## Honest limits
 - Sanitization quality degrades off Tier 1 (no MMU/ASan for MCUs → fault-based detection only).

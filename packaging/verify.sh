@@ -8,7 +8,10 @@ PYZ="$ROOT/dist/lykos.pyz"
 T="$(mktemp -d)"; SOCK="$T/s.sock"
 SAMPLE="${1:-/bin/ls}"
 
-fail(){ echo "VERIFY FAIL: $1"; [ -f "$T/log" ] && cat "$T/log"; kill "${SRV:-0}" 2>/dev/null || true; rm -rf "$T"; exit 1; }
+# `${SRV:-0}` would expand to `0` before SRV is assigned (an early `db init` failure), and
+# `kill 0` signals the whole process group -- including make and the parent shell. Only kill a
+# server we actually started.
+fail(){ echo "VERIFY FAIL: $1"; [ -f "$T/log" ] && cat "$T/log"; [ -n "${SRV:-}" ] && kill "$SRV" 2>/dev/null; rm -rf "$T"; exit 1; }
 
 python3 "$PYZ" db init --case-store "$T/cs" >/dev/null || fail "db init"
 python3 "$PYZ" serve --socket "$SOCK" --case-store "$T/cs" --workers 2 >"$T/log" 2>&1 &

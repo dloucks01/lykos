@@ -43,6 +43,27 @@ proves impact; L3 is a scoped, analyst-in-the-loop research track, never adverti
 - **Verification:** every PoC is re-executed from its bundle in a clean sandbox before it's marked valid —
   no PoC is trusted until it reproduces from scratch.
 
+## 8.6 End-effect model — what the defect can *achieve*, and whether we proved it
+A crash is the entry point, not the conclusion. Every crash finding carries a structured list of
+the **end effects** an attacker can drive it toward, each with a truthful status and, when
+demonstrated, the **artifact that proves it**:
+
+| Effect | Kind | Demonstrated by | Proof |
+|---|---|---|---|
+| **Denial of service** | `dos` | any reproducible crash | the crashing input |
+| **RCE / control-flow hijack** | `rce` | poc_primitive confirms instruction-pointer control (L2), or build_exploit lands a working exploit (L3) | the L2 primitive bundle / L3 exploit bundle |
+| **Memory corruption (arbitrary write)** | `memory-corruption` | poc_primitive confirms write-what-where | the L2 bundle |
+| **Information disclosure (memory leak)** | `info-disclosure` | a format-string probe leaks live memory (its bytes, incl. secrets, captured) | the leaked-bytes artifact |
+| **Command / code injection** | `injection` | synthesize_injection runs an injected command | the PoC bundle |
+
+Status is **`demonstrated`** (a PoC achieves it, with a downloadable proof) or **`potential`**
+(the defect class can reach it, but it was not demonstrated — e.g. ASan aborts a source build
+before control can be seized, so RCE stays potential and DoS is demonstrated). Effects only ever
+**promote** across the pipeline (root_cause files the ceiling → poc_primitive/build_exploit mark
+what they achieve), and the finding **headlines the most severe achievable effect** rather than
+"reproduced crash". Derived deterministically from the root-cause class + confirmed primitives
+(`analyze/debug/exploitability.py`); never over-claimed.
+
 ## 8.5 Reporting & export
 - **Analyst report:** per-finding — CWE mapping, severity/CVSS vector, root cause, evidence trail (which
   channels fired, coverage, solved constraints), remediation, and the PoC bundle + recording. HTML + PDF,

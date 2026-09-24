@@ -3,68 +3,518 @@ from __future__ import annotations
 
 from ...db.dao import CallEdgeDAO, FindingDAO, FunctionDAO, StringDAO, TargetDAO
 from ...jobs.registry import register_stage
-from . import taint
+from . import bounds, taint
+from .catalog import entry_seed_params
 from .detectors import DETECTORS, DetectContext, correlate
 
 DETECT_STAGE = "detect_cwe"
+# The detectors this stage owns -- the ones whose sites it recomputes and must replace (not
+# accumulate) on a re-run. Dynamic/crash channels (concolic, root_cause, fuzz...) are NOT here, so
+# reset_candidate_sites/prune_empty_findings never touch their findings.
+_STATIC_DETECTORS = ("dangerous_api", "stack_frame", "hardcoded_secrets", "weak_crypto", "weak_random",
+                     "insecure_tmp", "toctou", "toctou_race", "hardening", "tainted_deref",
+                     "int_overflow_check")
 TOOL = "detect"
-TOOL_VERSION = "detect-1"
+# -2: CWE-121 gated on the copy destination resolving to the stack frame. -3: re-detection is
+# idempotent. -4: the gate is arg0-only (scanf/sscanf no longer suppressed), works on x86-64/arm/
+# aarch64 with register tracing, and re-detection preserves poc-backed sites + prunes 0-site
+# orphans. Each bump invalidates the content-addressed cache so a target analyzed under older logic
+# is re-analyzed instead of reprojecting stale findings.
+TOOL_VERSION = "detect-4"
+
+
+# Attacker-influenced dereference. Every other detector keys on a CALL, so this whole class
+# was invisible: jhead's only demonstrated bug is an out-of-bounds READ at
+# `movzx eax,BYTE PTR [rax]`, which is not a call to anything and which nothing could see.
+_DEREF = {
+    "load": ("CWE-125", "low",
+             "Out-of-bounds read candidate: dereferences a pointer computed from "
+             "attacker-controlled input"),
+    "store": ("CWE-787", "medium",
+              "Out-of-bounds write candidate: writes through a pointer computed from "
+              "attacker-controlled input"),
+}
+
+
+def _deref_candidates(derefs, functions, guards=None):
+    """One finding per KIND, carrying every site -- the grain the rest of the channel uses.
+
+    Deliberately filed as low-confidence inventory, not an assertion. Whether any particular
+    dereference is actually unchecked needs a bound on the INDEX, which this does not have;
+    what it does have is the exact set of places attacker data reaches a pointer, which is
+    where the out-of-bounds reads and writes live. A reproduced crash landing on one of these
+    sites promotes it (see rootcause.attribute) -- that is what turns the inventory into a
+    finding.
+    """
+    names = {f.addr: f.name for f in functions}
+    out = []
+    for kind in ("load", "store"):
+        hits = [d for d in derefs if d["kind"] == kind]
+        if not hits:
+            continue
+        cwe, sev, title = _DEREF[kind]
+        where = sorted({names.get(d["function_addr"]) or str(d["function_addr"])
+                        for d in hits})
+        # One candidate per site sharing a dedup_key: upsert merges them into a single
+        # finding and records each as a site, which is how the call-sink detectors already
+        # report a defect that occurs in many places.
+        summary = {"channel": "taint-dataflow",
+                   "detail": (f"{len(hits)} attacker-influenced {kind}"
+                              f"{'s' if len(hits) != 1 else ''} across {len(where)} "
+                              f"functions: " + ", ".join(where[:8])
+                              + (" ..." if len(where) > 8 else ""))}
+        for d in hits:
+            fn = names.get(d["function_addr"]) or str(d["function_addr"])
+            # WHICH of these is unchecked? A dominating comparison on the value the address is
+            # built from is the difference between inventory and a finding.
+            g = (guards or {}).get(d["site_addr"]) or {}
+            detail = f"attacker-influenced {kind} through a computed pointer in {fn}"
+            if g.get("why"):
+                detail += f"; {g['why']}"
+            out.append({
+                "cwe": cwe, "title": title, "severity": sev, "state": "candidate",
+                # an unguarded site outranks a guarded one -- that ranking is the whole point
+                "confidence": 0.3 if g.get("verdict") == bounds.GUARDED else 0.4,
+                "detector": "tainted_deref",
+                "function_addr": d["function_addr"], "site_addr": d["site_addr"],
+                "dedup_key": f"{cwe}:tainted_deref:{kind}",
+                "site_detail": detail,
+                "site_verdict": g.get("verdict"),
+                "evidence": [summary],
+            })
+    return out
+
+
+# A bounds check that can WRAP is not a bounds check. jhead's out-of-bounds read is exactly
+# this: `if (OffsetVal + ByteCount > ExifLength)` computed in 32 bits, where 0x00ffffff +
+# 0xff000002 is 1 -- the sum looks tiny, the check passes, and the offset still points far
+# outside the buffer. The platform FOUND that bug dynamically and could not see it statically,
+# which is the gap this closes.
+_CMP_OPS = {"INT_LESS", "INT_LESSEQUAL", "INT_SLESS", "INT_SLESSEQUAL", "INT_EQUAL",
+            "INT_NOTEQUAL"}
+_ADD_OPS = {"INT_ADD", "INT_MULT", "INT_LEFT"}
+
+
+def _intover_candidates(func_irs, functions, only=None, width=4, ptr_bytes=8):
+    """Sums narrower than a pointer that are then COMPARED: a check the sum can wrap past.
+
+    `only` restricts this to the functions attacker data actually reaches. Without it the
+    pattern is everywhere -- eighteen of jhead's functions do 32-bit arithmetic in a
+    comparison, most of it loop and buffer bookkeeping that no input can steer -- and a report
+    that doubles in size to say so is the inventory-as-findings mistake again.
+
+    `ptr_bytes` is the target's pointer width. The hazard is a sum computed NARROWER than a
+    pointer that then feeds a pointer-width comparison/index: the sum wraps, the check passes.
+    A `width`-byte add is only that hazard when `width < ptr_bytes`; on a 32-bit target a
+    32-bit add is pointer-width and cannot wrap past a pointer, so flagging it as CWE-190 was
+    a false positive. When the sum is not narrower than a pointer, this channel emits nothing.
+    """
+    names = {f.addr: f.name for f in functions}
+    out = []
+    if width >= ptr_bytes:
+        return out                           # not narrower than a pointer: cannot wrap past it
+    for faddr, ir in (func_irs or {}).items():
+        if only is not None and faddr not in only:
+            continue
+        for b in ((ir or {}).get("blocks") or []):
+            # produced lives for the whole basic block: an INT_ADD and the comparison that
+            # consumes its result are separate machine instructions, so clearing it per
+            # instruction erased the sum before the compare was ever seen. Reset per block.
+            produced: dict = {}
+            for i in b.get("instructions", []) or []:
+                for pc in i.get("pcode", []) or []:
+                    mnem, args, outk = _pcode(pc)
+                    if mnem in _ADD_OPS and outk and _tok_width(outk) == width:
+                        # BOTH addends must be values. `i + 1 < n` is a loop, not a hazard,
+                        # and allowing a constant addend flagged sixteen extra functions in
+                        # jhead -- a pointer bump or a loop counter in nearly every one. The
+                        # shape that wraps is two attacker-sized quantities added together:
+                        # an offset plus a count, which is jhead's bug exactly.
+                        if all(not t.startswith("const:") for t in args):
+                            produced[outk] = mnem
+                    elif mnem in _CMP_OPS:
+                        hit = next((k for k in args if k in produced), None)
+                        if hit is None:
+                            continue
+                        fn = names.get(faddr) or str(faddr)
+                        out.append({
+                            "cwe": "CWE-190", "severity": "low", "state": "candidate",
+                            # inventory grade on purpose: this is the SHAPE of a check that
+                            # can wrap, not evidence that this one does. What makes it worth
+                            # reporting is that the platform found jhead's wrapping check
+                            # dynamically and could not see it statically at all.
+                            "confidence": 0.3, "detector": "int_overflow_check",
+                            "title": ("Bounds check on a sum that can wrap "
+                                      f"({width * 8}-bit arithmetic)"),
+                            "function_addr": faddr, "site_addr": i.get("addr"),
+                            # ONE finding with many sites, the grain every other channel
+                            # uses. Keyed per function it filed fourteen findings on jhead and
+                            # took the report from 19 to 37 -- the same inventory read as a
+                            # list of defects.
+                            "dedup_key": "CWE-190:int_overflow_check",
+                            "site_detail": (f"{produced[hit]} at {width * 8} bits feeds a "
+                                            f"comparison in {fn}: if the sum wraps, the check "
+                                            f"passes on a value that is far too large"),
+                            "evidence": [{"channel": "pcode",
+                                          "detail": (f"{produced[hit]} -> {mnem} at "
+                                                     f"{i.get('addr')} in {fn}")}],
+                        })
+                        break
+    return out
+
+
+def _pcode(pc):
+    """(mnemonic, operand tokens, output token) -- output is None for a branch or store."""
+    left, _, out = pc.partition(" -> ")
+    parts = left.split()
+    return (parts[0] if parts else ""), parts[1:], (out.strip() or None)
+
+
+def _tok_width(tok):
+    try:
+        return int(tok.rsplit(":", 1)[1])
+    except (IndexError, ValueError):
+        return 0
+
+
+def _program_only(ctx, target, functions):
+    """(functions, call_edges, dropped) restricted to the program's own code where possible."""
+    from ..elf import program_ranges
+    edges = CallEdgeDAO(ctx.conn).list_by_target(target.id)
+    try:
+        blob = ctx.content.path(target.sha256).read_bytes()
+        ranges = program_ranges(blob)
+    except Exception:
+        ranges = []
+    if not ranges:
+        return functions, edges, 0
+    from ..debug import rootcause
+    from ..elf import parse as parse_elf
+    try:
+        entry = parse_elf(blob).entry
+    except Exception:
+        entry = None
+    base = rootcause.image_base(functions, entry) or 0
+    los = [lo for lo, _ in ranges]
+
+    def own(addr) -> bool:
+        import bisect
+        try:
+            a = (int(addr, 16) if isinstance(addr, str) else int(addr or 0)) - base
+        except (TypeError, ValueError):
+            return True                      # unparseable: keep it rather than hide it
+        i = bisect.bisect_right(los, a) - 1
+        return i >= 0 and a < ranges[i][1]
+
+    keep_fn = [f for f in functions if own(f.addr)]
+    keep_ed = [e for e in edges if own(e.src_addr)]
+    dropped = (len(functions) - len(keep_fn)) + (len(edges) - len(keep_ed))
+    if not keep_fn or not keep_ed:
+        return functions, edges, 0           # attribution said nothing useful; do not blind it
+    return keep_fn, keep_ed, dropped
+
+
+# Enough to reach a sink through a few frames, without seeding thousands of exports on a
+# library like libcrypto and spending the budget proving that a crypto primitive copies bytes.
+_MAX_EXPORT_SEEDS = 96
+
+
+def _export_seeds(ctx, target, functions, func_irs):
+    """({addr: tainted param indices}, count) for a library's exported functions.
+
+    Ordered by name so a re-run seeds the same set: an analysis whose findings depend on dict
+    iteration order is not one anybody can act on twice.
+    """
+    from ..detect import taint as taintmod
+    try:
+        from ..poc.exploit import _elf_symbols
+        blob = ctx.content.path(target.sha256).read_bytes()
+        exported = set(_elf_symbols(blob, 2))              # STT_FUNC
+    except Exception:
+        return {}, 0
+    if not exported:
+        return {}, 0
+    ak = taintmod._arch_key(target.arch)
+    nargs = len(taintmod.ARCH_ABI[ak]["args"]) if ak else 6
+    by_name = {f.name: f.addr for f in functions if f.name}
+    seeds = {}
+    for name in sorted(exported):
+        addr = by_name.get(name)
+        if addr is None or addr not in func_irs:
+            continue
+        seeds[addr] = set(range(nargs or 6))
+        if len(seeds) >= _MAX_EXPORT_SEEDS:
+            break
+    return seeds, len(seeds)
+
+
+def _detect_jvm(ctx, target) -> dict:
+    """Detection for a Java target, which has no machine code for the P-Code channels.
+
+    Every channel this stage normally runs -- taint, bounds, integer overflow, the deref
+    classifier -- needs decompiled functions, and a jar has none, so `detect_cwe` on a Java
+    target did all its work and filed nothing. The constant pool answers a different but
+    overlapping question directly: which dangerous APIs this code calls, and with what
+    arguments, stated outright rather than recovered.
+    """
+    from .. import invocation as invmod
+    from .. import jvm as jvmmod
+    from . import jvmdetect
+    data = ctx.content.path(target.sha256).read_bytes()
+    info = jvmmod.parse(data)
+    cands = jvmdetect.analyze(info)
+    # The string-based detectors are substrate-independent -- hardcoded credentials are
+    # hardcoded credentials -- and the constant pool feeds them exactly as a .rodata scan
+    # feeds them for an ELF.
+    # Attribute each constant to the class holding it, so a credential finding names the
+    # class rather than an offset that does not exist in a jar.
+    rows = []
+    seen: set = set()
+    for cls, d in (info.by_class or {}).items():
+        rows += invmod.string_rows([v for v in d.get("strings", []) if v not in seen],
+                                   where=cls.replace("/", "."))
+        seen.update(d.get("strings", []))
+    rows += invmod.string_rows([v for v in info.strings if v not in seen], where="const-pool")
+    dctx = DetectContext(target_id=target.id, case_id=target.case_id, call_edges=[],
+                         strings=rows, functions=[], mitigations={}, frames={})
+    for det in DETECTORS:
+        if getattr(det, "jvm_safe", False):
+            cands += det(dctx)
+    fdao = FindingDAO(ctx.conn)
+    for c in cands:
+        fdao.upsert(target.id, target.case_id, c)
+    ctx.emit("detect.done", payload={
+        "findings": len(cands), "substrate": "jvm-constant-pool",
+        "classes": len(info.classes), "calls": len(info.calls),
+        "note": ("Java target: findings come from the constant pool, which names every call "
+                 "and string in the clear. There is no machine code, so the taint, bounds and "
+                 "integer-overflow channels do not run -- these are capability findings and "
+                 "rank below anything execution demonstrates.")})
+    ctx.progress(pct=100, msg=f"{len(cands)} findings from {len(info.classes)} classes")
+    return {}
 
 
 def detect_stage(ctx) -> dict:
     target = TargetDAO(ctx.conn).get(ctx.target_id) if ctx.target_id else None
     if target is None:
         raise ValueError("detect_cwe requires a target_id")
+    p_det = ctx.params or {}
+
+    if (target.file_type or "").lower() in ("jar", "class"):
+        return _detect_jvm(ctx, target)
 
     fdao = FunctionDAO(ctx.conn)
     functions = fdao.list_by_target(target.id)
-    # hydrate decompiler stack frames (heavy; omitted from the list view) for size-aware detection
+    # A statically linked binary carries its libc, and the decompiler recovers all of it, so
+    # the report fills with the LIBRARY's own calls: jhead's memcpy finding carried 95 sites,
+    # nearly all of them inside glibc, which says nothing about jhead. Where the symbol table
+    # can say which code is the program's own, detection listens to it -- the same attribution
+    # coverage uses. When it cannot (stripped, no local symbols), nothing is filtered.
+    functions, edges, dropped = _program_only(ctx, target, functions)
+    # hydrate decompiler stack frames + per-function IR (heavy; omitted from the list view) for
+    # size-aware detection and call-site destination analysis (the CWE-121 stack-dest gate). Both
+    # come from the same full-function load, so we do it once here and reuse it for the taint pass.
     frames = {}
+    func_irs = {}
     for f in functions:
         if not f.blocks:
             continue
         full = fdao.get(f.id)
-        if full and full.frame and (full.frame.get("vars") or full.frame.get("params")):
+        if not full:
+            continue
+        if full.frame and (full.frame.get("vars") or full.frame.get("params")):
             frames[f.addr] = full.frame
+        if full.ir:
+            func_irs[f.addr] = full.ir
 
     dctx = DetectContext(
         target_id=target.id, case_id=target.case_id,
-        call_edges=CallEdgeDAO(ctx.conn).list_by_target(target.id),
+        call_edges=edges,
         strings=StringDAO(ctx.conn).list_by_target(target.id),
         functions=functions,
-        mitigations=target.mitigations or {}, frames=frames)
+        mitigations=target.mitigations or {}, frames=frames,
+        func_irs=func_irs, bits=int(getattr(target, "bits", 0) or 0),
+        arch=getattr(target, "arch", "") or "")
 
     ctx.progress(msg="running CWE detectors")
+    # Two detectors are OPT-IN, and the reason is measured rather than felt. On jhead they are
+    # 7 of 23 findings and on unzip 3 of 9 -- about 30% of the board -- and neither earns it:
+    #
+    #   hardening  restates `ctx.mitigations`, which comes straight from triage. "No PIE" is
+    #              already on the target card and in the report's mitigations row; filing it
+    #              again as CWE-693 is the same fact twice, and it outranks nothing.
+    #   toctou     is ordering and reachability, not proof the two calls name the same path.
+    #              Real TOCTOU needs a privilege boundary; in a CLI image tool an access()
+    #              before an fopen() on a user-named file is how the program is supposed to
+    #              work.
+    #
+    # Off by default, available per run, and the skip is REPORTED -- a detector that quietly
+    # did not run is the failure mode this codebase keeps finding, so it is named in the event
+    # rather than left to be inferred from a smaller number.
+    optional = {"hardening": bool(p_det.get("include_hardening")),
+                "toctou": bool(p_det.get("include_toctou"))}
+    skipped = [n for n, on in optional.items() if not on]
     cands = []
     for det in DETECTORS:
+        name = getattr(det, "__name__", "")
+        if name in optional and not optional[name]:
+            continue
         cands += det(dctx)
     cands = correlate(cands, dctx)
 
     # inter-procedural data-flow taint over P-Code: flag sink sites whose argument
-    # registers carry tainted data (across function boundaries), and upgrade findings.
+    # registers carry tainted data (across function boundaries), and upgrade findings. Reuse the
+    # per-function IR already hydrated above instead of loading every function a second time.
     ctx.progress(msg="data-flow taint analysis (inter-procedural)")
-    func_irs = {}
-    for f in dctx.functions:
-        if not f.blocks:
-            continue
-        full = fdao.get(f.id)
-        if full and full.ir:
-            func_irs[f.addr] = full.ir
-    tainted_sites = taint.analyze_program(func_irs, dctx.call_edges, target.arch)
+    func_irs = dctx.func_irs
+    entry_seeds = entry_seed_params(dctx.functions, dctx.frames)   # argv/envp at main
+    # A shared library has no `main`, so that returns nothing and the data-flow channel starts
+    # from SOURCES alone -- which for a library that is handed its input by a caller means it
+    # starts from nothing at all. Measured on libcrypto (13,715 functions): 0 derefs, 0
+    # guarded derefs, and the whole corroboration channel silently idle on a first-class
+    # target type.
+    #
+    # The untrusted input to a library IS its exported parameters, which is exactly how
+    # cross-component taint already treats a callee. Same treatment here when there is no
+    # entry point to seed from.
+    lib_seeded = 0
+    if not entry_seeds:
+        entry_seeds, lib_seeded = _export_seeds(ctx, target, dctx.functions, func_irs)
+    derefs: list = []
+    # The data-flow channel has a hard ceiling and used to hit it in silence: over
+    # `_MAX_FUNCS` functions `analyze_program` returns an empty set immediately, so a large
+    # binary got no corroboration, no dereference candidates and nothing promoted above
+    # `candidate` -- and the run looked identical to one where the analysis ran and found
+    # nothing. Measured on libcrypto: 13,529 functions against a ceiling of 6,000, reported as
+    # `derefs: 0`.
+    #
+    # The ceiling stays (it is there for runtime), but it is now reported, and raisable for a
+    # deliberate deep run.
+    taint_cap = int(p_det.get("max_taint_functions") or taint._MAX_FUNCS)
+    taint_skipped = None
+    if not taint._arch_key(target.arch):
+        # No ABI model for this arch (e.g. mips64/s390x/sparc64 that ingest still accepts):
+        # analyze_program would return an empty set with no notice, indistinguishable from
+        # "ran and found nothing". Say the channel could not run.
+        taint_skipped = {
+            "arch": target.arch,
+            "note": (f"taint has no ABI model for arch {target.arch!r}, so the data-flow "
+                     f"channel, the dereference channel and bounds corroboration did not run. "
+                     f"Findings below are rule-channel only and cannot be promoted past "
+                     f"candidate.")}
+        ctx.emit("detect.taint_skipped", payload=taint_skipped)
+        tainted_sites = set()
+    elif len(func_irs) > taint_cap:
+        taint_skipped = {
+            "functions": len(func_irs), "cap": taint_cap,
+            "note": (f"{len(func_irs)} functions exceeds the data-flow ceiling of {taint_cap}, "
+                     f"so taint, the dereference channel and bounds corroboration did not "
+                     f"run. Findings below are rule-channel only and cannot be promoted past "
+                     f"candidate. Raise it with params.max_taint_functions for a deep run, or "
+                     f"analyse a component rather than the whole image.")}
+        ctx.emit("detect.taint_skipped", payload=taint_skipped)
+        tainted_sites = set()
+    else:
+        oversized: list = []
+        tainted_sites = taint.analyze_program(func_irs, dctx.call_edges, target.arch,
+                                              entry_seeds=entry_seeds, mem_out=derefs,
+                                              max_funcs=taint_cap, skipped_out=oversized)
+        if oversized:
+            # One level down from the whole-analysis ceiling: a single function past the block
+            # limit is skipped entire, and "no tainted flow here" was indistinguishable from
+            # "this function was never looked at". Generated and obfuscated code hits it.
+            ctx.emit("detect.functions_skipped", payload={
+                "count": len(oversized), "block_cap": taint._MAX_BLOCKS,
+                "largest": max(oversized),
+                "note": (f"{len(oversized)} function(s) exceed the {taint._MAX_BLOCKS}-block "
+                         f"per-function ceiling (largest {max(oversized)}) and were not "
+                         f"analysed for data flow. Findings inside them, if any, are "
+                         f"rule-channel only.")})
+    guards = bounds.classify_derefs(func_irs, derefs, target.arch)
+    n_guarded = sum(1 for v in guards.values() if v.get("verdict") == bounds.GUARDED)
+    cands += _deref_candidates(derefs, dctx.functions, guards)
+    # only where attacker data demonstrably lands: a function that dereferences input, or one
+    # whose call to a dangerous sink taint reaches
+    touched = {d["function_addr"] for d in derefs}
+    touched |= {c["function_addr"] for c in cands
+                if c.get("site_addr") in tainted_sites and c.get("function_addr")}
+    cands += _intover_candidates(func_irs, dctx.functions, only=touched,
+                                 ptr_bytes=(target.bits or 64) // 8)
     for c in cands:
         if c["detector"] == "dangerous_api" and c.get("site_addr") in tainted_sites:
             c["state"] = "corroborated"
             c["confidence"] = max(c["confidence"], 0.8)
+            c["site_state"] = "corroborated"      # THIS site is the one taint reaches
+            c["site_confidence"] = 0.8
             c["evidence"].append({"channel": "taint-dataflow",
                                   "detail": "tainted value reaches a sink argument "
                                             "(intra-procedural P-Code taint)"})
 
-    fd = FindingDAO(ctx.conn)
+    # Bounds channel: can this copy actually exceed its destination? The rule channel flags
+    # every memcpy/strncpy and the taint channel confirms "attacker data reaches it", which on
+    # a parser is true of nearly everything -- on jhead that was 20 LOW findings amounting to
+    # "this program calls memcpy". A copy whose length is a compile-time constant that FITS
+    # the recovered destination is not a defect, and saying so turns that noise into inventory.
+    ctx.progress(msg="bounds analysis on copy sinks")
+    verdicts = bounds.classify_program(func_irs, dctx.call_edges, frames, target.arch,
+                                       bits=target.bits or 64)
     for c in cands:
+        v = verdicts.get(c.get("site_addr"))
+        # stack_buffer_overflow reports the same strcpy sites at CWE-121/high, so a bounds
+        # verdict has to reach it too -- otherwise a copy proven safe still shows up as a
+        # high-severity stack smash. Both of gzip 1.3.5's CWE-121 candidates were that.
+        if not v or c.get("detector") not in ("dangerous_api", "stack_frame"):
+            continue
+        c["site_verdict"] = v["verdict"]          # the ruling is about THIS place
+        if v["verdict"] == bounds.SAFE:
+            # provably bounded: demote out of the headline, keep as inventory with the reason
+            c["severity"] = "info"
+            c["state"] = "candidate"
+            c["confidence"] = min(c.get("confidence", 0.4), 0.15)
+            c["evidence"].append({"channel": "bounds", "detail": v["why"]})
+            c["site_detail"] = v["why"]
+        elif v["verdict"] in (bounds.SUSPECT, bounds.SIGNED):
+            # Surfaced for review -- NOT promoted, because a recovered frame can name the
+            # wrong variable for a reused stack slot (see bounds.py). Critically also NOT
+            # demoted: a SIGNED verdict means a bounds check exists and does not bound, so
+            # treating it as "bounded" would bury the defect under its own guard.
+            c["evidence"].append({"channel": "bounds", "detail": v["why"]})
+            c["site_detail"] = v["why"]
+
+    fd = FindingDAO(ctx.conn)
+    # Idempotent re-detection: static detection recomputes the COMPLETE site set every run, so drop
+    # the prior run's CANDIDATE sites for these detectors first (preserving any dynamic channel's
+    # poc-backed/corroborated sites) -- otherwise a site the new run no longer emits persists and
+    # the count only grows, and a class the gate drops to zero keeps its stale sites forever.
+    fd.reset_candidate_sites(target.id, _STATIC_DETECTORS)
+    for c in cands:
+        # Stamp the run: this channel's verdicts from an EARLIER run are replaced rather than
+        # max-merged, which is what lets a demotion (a copy proven bounded, say) actually take
+        # effect. Sites within this run still take the strongest.
+        c["run_id"] = ctx.run_id
         fd.upsert(target.id, target.case_id, c)
+    # Remove findings this re-run left with no sites (a whole class dropped by the gate); keeping
+    # them would show a 0-site finding at full severity in the report and API.
+    fd.prune_empty_findings(target.id, _STATIC_DETECTORS)
     counts = fd.counts_by_state(target.id)
-    ctx.emit("findings.done", payload={"candidates": len(cands), "states": counts})
-    ctx.progress(pct=100, msg="%d candidate findings" % len(cands))
+    total = sum(counts.values()) if counts else 0
+    ctx.emit("findings.done", payload={"findings": total, "sites": len(cands),
+                                       "states": counts,
+                                       "detectors_skipped": skipped,
+                                       "library_exports_seeded": lib_seeded,
+                                       "taint_skipped": taint_skipped,
+                                       "skipped_why": ("opt-in: hardening restates triage's "
+                                                       "mitigations, toctou is ordering not "
+                                                       "proof. Pass include_hardening / "
+                                                       "include_toctou to run them."),
+                                       "library_sites_skipped": dropped,
+                                       "derefs": len(guards), "guarded_derefs": n_guarded})
+    # The number the OPERATOR will see on the board, not the pre-dedup candidate list.
+    # `cands` is one entry per SITE and upsert merges them by dedup_key, so jhead reported
+    # "404 candidate findings" for a board holding 24 -- a 17x mismatch between the progress
+    # line and the screen, which costs trust in both numbers rather than just the wrong one.
+    ctx.progress(pct=100, msg="%d finding%s from %d site%s" % (
+        total, "" if total == 1 else "s", len(cands), "" if len(cands) == 1 else "s"))
     return {}
 
 

@@ -87,6 +87,21 @@ def test_control_input_and_marker_confirmed():
     assert not P.marker_confirmed({"pc": 0x1234, "sp": 0, "stack_base": 0, "stack": ""})
 
 
+def test_marker_confirmed_ignores_sentinel_deep_in_the_stack():
+    """The overflow payload CONTAINS the sentinel and lands on the stack; a WRONG offset guess
+    leaves it somewhere in the copied buffer, NOT at the return-address slot. Confirming on that
+    would be a false instruction-pointer-control claim -- so only the slot SP indexes counts."""
+    sp = 0x7000
+    deep = bytearray(128)
+    deep[64:72] = struct.pack("<Q", P.MARKER)          # sentinel deep in the window, not the RA slot
+    assert not P.marker_confirmed(
+        {"pc": 0xdead, "regs": {}, "sp": sp, "stack_base": sp, "stack": bytes(deep).hex()})
+    at_slot = bytearray(128)
+    at_slot[0:8] = struct.pack("<Q", P.MARKER)         # sentinel at the slot SP indexes -> confirms
+    assert P.marker_confirmed(
+        {"pc": 0xdead, "regs": {}, "sp": sp, "stack_base": sp, "stack": bytes(at_slot).hex()})
+
+
 # ------------------------------------------------------------------- integration
 @pytest.fixture
 def pool(store):
@@ -362,3 +377,38 @@ def test_ip_control_via_link_register_and_masked_pc():
                                "sp": 0}, word=4, endian="big")
     assert P.marker_confirmed({"pc": P.MARKER32 & ~0b11, "regs": {}, "stack": "",
                                "stack_base": 0, "sp": 0}, word=4, endian="big")
+
+
+def test_lsb_masked_pc_covers_riscv_as_well_as_arm():
+    """ISAs whose indirect branch clears bit 0 of the loaded PC need their cyclic window
+    searched at `(pc | 1)`, or a fault with FULL instruction-pointer control reads as
+    unconfirmed.
+
+    ARM/AArch64 mask it to select Thumb vs ARM state; RISC-V's JALR is specified to clear the
+    low bit of the computed target. The list originally covered only the ARM family, so RISC-V
+    captured pc=0x4141414141414140 from an all-'A' overflow -- unmistakable IP control -- and
+    still reported L1 instead of L2.
+    """
+    from lykos.analyze.poc.primitive_stage import _LSB_MASKED_PC
+    assert {"arm", "aarch64", "riscv", "riscv64"} <= set(_LSB_MASKED_PC)
+    # ISAs that do NOT mask must stay out, or a genuine off-by-one alias gets accepted
+    assert not ({"x86-64", "x86", "ppc64", "s390", "m68k"} & set(_LSB_MASKED_PC))
+
+
+def test_return_address_registers_are_per_isa_not_a_shared_guess():
+    """r14 is the LINK register on s390 and ARM but an ordinary callee-saved register on
+    PowerPC and MIPS. A single shared list either misses s390 (which is what happened: it
+    recovered a nonsense offset and never reached L2) or attributes instruction-pointer
+    control to a PowerPC register that merely happens to hold cyclic bytes.
+    """
+    from lykos.analyze.poc import primitive
+    assert primitive.ra_regs({"arch": "s390"}) == ("r14",)
+    assert "r14" not in primitive.ra_regs({"arch": "ppc"})
+    assert "r14" not in primitive.ra_regs({"arch": "mips"})
+    assert primitive.ra_regs({"arch": "ppc"}) == ("lr",)
+    assert primitive.ra_regs({"arch": "aarch64"}) == ("x30",)
+    assert primitive.ra_regs({"arch": "sh"}) == ("pr",)
+    assert primitive.ra_regs({"arch": "riscv"}) == ("x1", "ra")   # the layout names ra as x1
+    assert primitive.ra_regs({"arch": "m68k"}) == ()              # return address on the stack
+    # an unknown / absent arch falls back to the generic list rather than losing all of them
+    assert primitive.ra_regs({}) == primitive._RA_REGS

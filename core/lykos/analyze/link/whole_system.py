@@ -90,10 +90,12 @@ def whole_system_stage(ctx) -> dict:
     if not entry or not services:
         entry, services, channel = _scenario_from_ipc(ctx, tdao)
     if not entry or not services:
-        ctx.emit("system.done", payload={"error": "no scenario", "crashes": 0})
-        ctx.progress(pct=100, msg="no whole-system scenario (need an entry + service or an "
-                                  "IPC edge)")
-        return {"metrics": {"error": "no scenario"}}
+        # Not applicable, not an error: one binary is not a whole system.
+        ctx.emit("system.done", payload={"applicable": False, "crashes": 0,
+                 "note": "no whole-system scenario on this case (needs an entry plus a "
+                         "service, or an IPC edge between linked components)"})
+        ctx.progress(pct=100, msg="not applicable: no whole-system scenario")
+        return {"metrics": {"applicable": False}}
 
     comps = _components(ctx, entry, services)
     timeout = float(p.get("exec_timeout", 6))
@@ -102,12 +104,15 @@ def whole_system_stage(ctx) -> dict:
         "entry": entry.filename, "services": [s.filename for s in services],
         "channel": channel})
 
-    def _detonate(data):
-        return detonate(comps, channel=channel, entry_input=data, timeout=timeout, arch=arch)
+    def _detonate(data, *, baseline=False):
+        return detonate(comps, channel=channel, entry_input=data, timeout=timeout, arch=arch,
+                        baseline=baseline)
 
     if not p.get("fuzz"):
         data = base64.b64decode(p["input"]) if p.get("input") else _SEEDS[0]
-        res = _detonate(data)
+        # a single, reported detonation is worth the benign-baseline control so a service that
+        # crashes regardless of input is not mis-blamed cross-boundary.
+        res = _detonate(data, baseline=True)
         crashes = _finish_single(ctx, res, entry, data)
         return {"metrics": {"execs": 1, "crashes": crashes,
                             "cross_boundary": bool(res.cross_boundary)}}
@@ -137,8 +142,12 @@ def whole_system_stage(ctx) -> dict:
             budget = min(60, max(10, max_execs - execs))
             mdata, mexecs = minimize(_same, data, cap=budget)
             execs += mexecs
-            self_res = _detonate(mdata)
-            if self_res.cross_boundary:
+            # The recording gate re-detonates WITH the benign baseline control: a service that
+            # also crashes on benign input was not crashed by this input, so cross_boundary is
+            # False there and nothing is recorded -- the search above runs baseline-free for
+            # speed, but a finding is only minted once the controlled re-run confirms it.
+            self_res = _detonate(mdata, baseline=True)
+            if self_res.cross_boundary_confirmed:      # a real baseline ran and cleared the victim
                 _record_crash(ctx, self_res, entry, mdata, arch)
         if execs % 20 == 0:
             ctx.emit("system.progress", payload={"execs": execs, "cross_boundary": crossb})
@@ -154,7 +163,7 @@ def _finish_single(ctx, res, entry, data) -> int:
         ctx.progress(pct=100, msg=res.note)
         return 0
     n = 0
-    if res.cross_boundary:
+    if res.cross_boundary_confirmed:
         _record_crash(ctx, res, entry, data, entry.arch)
         n = 1
     ctx.emit("system.done", payload={

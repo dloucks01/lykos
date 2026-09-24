@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import os
 
-from ...db.dao import FindingDAO, PocDAO, TargetDAO
+from ...db.dao import DynResultDAO, FindingDAO, PocDAO, TargetDAO
 from ...jobs.registry import register_stage
 from ..dynamic import sandbox
-from ..dynamic.stage import crash_finding_candidate
+from ..dynamic.stage import crash_dedup_key, crash_finding_candidate
+from ..fuzz.runner import place
 from . import bundle
+from .capture import MODES, how_to_feed
 
 BUILD_POC_STAGE = "build_poc"
 TOOL = "poc"
@@ -23,9 +25,8 @@ def build_poc_stage(ctx) -> dict:
     input_sha = p.get("input_sha")
     if not input_sha:
         raise ValueError("build_poc requires params.input_sha (a crashing input)")
-    mode = p.get("input_mode", "stdin")
-    argv = list(p.get("argv") or [])
     timeout = float(p.get("timeout", 10))
+    mode, argv, mode_why = how_to_feed(ctx.conn, target, input_sha, p)
 
     input_bytes = ctx.content.get_bytes(input_sha)
     target_bytes = ctx.content.path(target.sha256).read_bytes()
@@ -33,26 +34,87 @@ def build_poc_stage(ctx) -> dict:
     exe.write_bytes(target_bytes)
     os.chmod(exe, 0o755)
 
-    run_argv, stdin = [], b""
-    if mode == "stdin":
-        stdin = input_bytes
-    elif mode == "arg":
-        run_argv = [input_bytes.decode("latin-1")]
-    elif mode == "file":
+    def _delivery(m):
+        """(argv, stdin) for one delivery channel."""
+        if m == "stdin":
+            return place(argv, "/dev/stdin") if "@@" in [
+                str(a) for a in argv] else list(argv), input_bytes
+        if m == "arg":
+            # truncate: execve cuts the argument at the first NUL anyway, so this is what the
+            # program would actually receive -- refusing outright discarded payloads whose
+            # control slot sits safely before it (see sandbox.argv_arg).
+            return place(argv, sandbox.argv_arg(input_bytes, truncate=True)), b""
         wf = ctx.scratch() / "input.bin"
         wf.write_bytes(input_bytes)
-        run_argv = [str(wf)]
+        return place(argv, str(wf)), b""
 
     ctx.progress(msg="verifying PoC in a clean sandbox")
-    res = sandbox.run(exe, argv=run_argv, stdin=stdin, timeout=timeout, arch=target.arch)
+    # endianness/bits are load-bearing, not decoration: _qemu_for routes ppc64->ppc64le,
+    # mips->mipsel and riscv->riscv32/64 on them. Omitting them hands a little-endian target
+    # to the big-endian emulator, which cannot run it -- so the PoC "fails to reproduce" and
+    # is filed as an unverified L0 rather than a verified L1.
+    # Try the mode we believe in, then the others. A crashing input fed the wrong way does
+    # not crash, and filing that as an unverified L0 turns a wrong setup into what reads as
+    # "the input does not reproduce".
+    # The options the crash was found under come first, because a crash found under an option
+    # may need it -- but then WITHOUT them, for two reasons: a simpler reproducer is a better
+    # PoC, and a mined flag that consumes the next argument (`-cmd`, `-o`) swallows the file
+    # path, so replaying faithfully is the one thing that cannot work.
+    prefixes = [list(argv)] + ([[]] if argv else [])
+    tried, res = [], None
+    for pre in prefixes:
+        argv = pre
+        for m in [mode] + [x for x in MODES if x != mode]:
+            run_argv, stdin = _delivery(m)
+            res = sandbox.run(exe, argv=run_argv, stdin=stdin, timeout=timeout,
+                              arch=target.arch, endianness=target.endianness, bits=target.bits)
+            tried.append(m if not pre else f"{m}+{' '.join(pre)}")
+            if res.crashed:
+                if m != mode:
+                    mode_why = f"{mode_why}, but it only crashed via {m}"
+                mode = m
+                break
+        if res is not None and res.crashed:
+            if not pre and prefixes[0]:
+                mode_why = f"{mode_why}; reproduces without {' '.join(prefixes[0])}"
+            break
+    run_argv, stdin = _delivery(mode)
     verified = res.crashed
     level = "L1" if verified else "L0"
 
+    # Did we reproduce the crash we were ASKED to package, or a different one?
+    # This is not pedantry: a broken replay argv made the target throw NoSuchFileException
+    # instead of the ArrayIndexOutOfBoundsException the campaign found, and the stage filed a
+    # verified L1 whose expected_signal was the wrong fault entirely. A PoC that reproduces
+    # something else is still evidence, but it is not evidence of THIS finding, and the bundle
+    # has to say which it is.
+    wanted = next((r.signal_name for r in DynResultDAO(ctx.conn).list_by_target(target.id)
+                   if r.input_sha == input_sha and r.crashed and r.signal_name), None)
+    mismatch = bool(verified and wanted and res.signal_name and res.signal_name != wanted)
+    if mismatch:
+        mode_why = (f"{mode_why}; NOTE the replay produced {res.signal_name} where the "
+                    f"campaign recorded {wanted}")
+
     meta = {"target_sha256": target.sha256, "arch": target.arch, "input_mode": mode,
             "argv": argv, "expected_signal": res.signal_name, "isolation": res.isolation,
-            "verified": verified, "tool_version": TOOL_VERSION}
-    data = bundle.build(target_bytes, input_bytes, meta, res.stderr, mode, run_argv,
-                        res.signal_name or "unknown")
+            "verified": verified, "tool_version": TOOL_VERSION,
+            "recorded_signal": wanted, "signal_matches_finding": not mismatch}
+    runtime = {"jar": "jar", "class": "class"}.get((target.file_type or "").lower(), "native")
+    main_class = None
+    if runtime == "class":
+        # The class name comes from the file, not the target row: the JVM resolves a class by
+        # its declared name and the bundle stores the bytes as `target.bin`.
+        from .. import jvm as jvmmod
+        info = jvmmod.parse(target_bytes)
+        main_class = (info.classes or [None])[0]
+    # The PREFIX, with `@@` intact -- not the argv we just ran. `run_argv` has the placeholder
+    # already replaced by a scratch path that will not exist on the machine replaying this, so
+    # baking it in produced `-c /tmp/lykos-<gone>/input.bin ... ./input.bin`: the reproducer
+    # opens a missing file, throws NoSuchFileException, and demonstrates nothing. The bundle
+    # places `./input.bin` itself.
+    data = bundle.build(target_bytes, input_bytes, meta, res.stderr, mode, argv,
+                        res.signal_name or "unknown", runtime=runtime,
+                        main_class=main_class)
     bundle_sha = ctx.put_artifact("poc-bundle", data=data,
                                   meta={"verified": verified, "level": level})
 
@@ -62,15 +124,22 @@ def build_poc_stage(ctx) -> dict:
 
     if verified:
         fd = FindingDAO(ctx.conn)
+        # the SAME key the run that found this input filed it under, or a verified PoC opens a
+        # second finding beside the crash it just proved instead of promoting it
+        fault_pc = DynResultDAO(ctx.conn).fault_pc_for(target.id, input_sha)
         fd.upsert(target.id, target.case_id, crash_finding_candidate(
             res.signal_name, input_sha, res.isolation, "poc", "(PoC verified)",
-            state="poc-backed", confidence=0.95, bundle_sha=bundle_sha))
-        fid = fd.id_for_dedup(target.id, f"dynamic-crash:{res.signal_name}")
+            state="poc-backed", confidence=0.95, bundle_sha=bundle_sha, fault_pc=fault_pc))
+        fid = fd.id_for_dedup(target.id, crash_dedup_key(res.signal_name, fault_pc))
         if fid:
             PocDAO(ctx.conn).set_finding(poc_id, fid)
 
     ctx.emit("poc.done", payload={"verified": verified, "level": level,
-                                  "signal": res.signal_name, "bundle": bundle_sha})
+                                  "signal": res.signal_name, "bundle": bundle_sha,
+                                  "recorded_signal": wanted,
+                                  "signal_matches_finding": not mismatch,
+                                  "input_mode": mode, "input_mode_why": mode_why,
+                                  "input_modes_tried": tried})
     ctx.progress(pct=100, msg=("PoC verified (%s)" % level) if verified
                  else "PoC not reproduced (input did not crash)")
     return {"output_shas": [bundle_sha], "output_kind": "poc-bundle"}

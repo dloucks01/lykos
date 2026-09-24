@@ -26,16 +26,64 @@ class JobQueue:
         self.runs = AnalysisRunDAO(conn)
         self.events = EventDAO(conn)
         self.on_event = on_event
+        self._pending: list[dict] = []
 
     # ------------------------------------------------------------------ events
     def _emit(self, type: str, *, run_id: Optional[str] = None,
               case_id: Optional[str] = None, level: str = "info",
               payload: Optional[dict] = None) -> None:
+        """Record an event row now; deliver it to `on_event` only once the row is COMMITTED.
+
+        Firing the callback inside the transaction let a live consumer -- the UI event stream
+        tails this table -- observe a `job.done` that a rollback then erased.
+        """
         ev = self.events.append(type, level, case_id=case_id, run_id=run_id, payload=payload)
+        self._pending.append({"id": ev.id, "type": ev.type, "level": ev.level,
+                              "case_id": ev.case_id, "run_id": ev.run_id, "ts": ev.ts,
+                              "payload": ev.payload})
+        if not self.conn.in_transaction:          # emitted outside a txn: already durable
+            self._flush()
+
+    def _flush(self) -> None:
+        pending, self._pending = self._pending, []
         if self.on_event:
-            self.on_event({"id": ev.id, "type": ev.type, "level": ev.level,
-                           "case_id": ev.case_id, "run_id": ev.run_id, "ts": ev.ts,
-                           "payload": ev.payload})
+            for ev in pending:
+                self.on_event(ev)
+
+    def _commit(self) -> None:
+        self.conn.execute("COMMIT")
+        self._flush()
+
+    def _rollback(self, mark: int) -> None:
+        self.conn.execute("ROLLBACK")
+        del self._pending[mark:]                  # the rows are gone; drop their callbacks
+
+    def _begin_immediate(self, critical: bool = True, retries: int = 6) -> bool:
+        """Open a write transaction, resilient to a transient 'database is locked'/'busy'.
+
+        Each attempt already waits up to `busy_timeout` (connection.py, 5s) when another connection
+        holds the write lock. That covers the common case; a large single-writer transaction
+        (FunctionDAO.replace_for_target inserting thousands of rows) can still exceed it. A CRITICAL
+        writer -- complete/fail/enqueue/reap -- MUST land, or a job whose stage already succeeded is
+        recorded as `error`, so it takes several such attempts and, if still locked, lets the
+        OperationalError propagate on the last one rather than silently corrupting queue state. A
+        non-critical caller (claim) has already paid one busy_timeout wait, so it bails to False and
+        claims on the next poll. A non-lock OperationalError re-raises at once.
+        """
+        for i in range(max(1, retries)):
+            try:
+                self.conn.execute("BEGIN IMMEDIATE")
+                return True
+            except sqlite3.OperationalError as e:
+                msg = str(e).lower()
+                if "lock" not in msg and "busy" not in msg:
+                    raise
+                if not critical:
+                    return False                      # the busy_timeout wait already happened
+                time.sleep(0.05 * (i + 1))            # brief backoff between full-timeout attempts
+        if critical:
+            self.conn.execute("BEGIN IMMEDIATE")      # exhausted attempts: let the error surface
+        return False
 
     # ------------------------------------------------------------ enqueue (JE-02/17/18)
     def enqueue(self, case_id: str, stage: str, *, target_id: Optional[str] = None,
@@ -45,51 +93,69 @@ class JobQueue:
                 input_hashes: Optional[Iterable[str]] = None, force: bool = False,
                 dedup: bool = True) -> AnalysisRun:
         ck = compute_cache_key(stage, list(input_hashes or []), params, tool_version)
-        if not force:
-            cached = self.runs.find_cached(ck)
-            if cached:
-                return self._materialize_cache_hit(
-                    case_id, stage, target_id, params, tool, tool_version, ck, cached,
-                    priority, resource_class, max_attempts)
-            if dedup:
-                pending = self._find_pending(ck)
-                if pending:
-                    return pending
-        run = self.runs.create(case_id, stage, target_id=target_id, params=params,
-                               tool=tool, tool_version=tool_version, cache_key=ck,
-                               priority=priority, resource_class=resource_class,
-                               max_attempts=max_attempts)
-        self._emit("job.queued", run_id=run.id, case_id=case_id)
-        return run
-
-    def _find_pending(self, cache_key: str) -> Optional[AnalysisRun]:
-        r = self.conn.execute(
-            "SELECT * FROM analysis_run WHERE cache_key=? AND status IN ('queued','running') "
-            "ORDER BY created_at ASC LIMIT 1", (cache_key,)).fetchone()
-        return AnalysisRunDAO._row(r) if r else None
-
-    def _materialize_cache_hit(self, case_id, stage, target_id, params, tool, tool_version,
-                               ck, cached, priority, resource_class, max_attempts) -> AnalysisRun:
-        self.conn.execute("BEGIN IMMEDIATE")
+        # The cache/dedup lookup and the insert that depends on it run under ONE write lock.
+        # Read-then-insert let two workers both miss the same pending run and both enqueue it,
+        # which is exactly the duplicate work `dedup` exists to prevent.
+        mark = len(self._pending)
+        self._begin_immediate()
         try:
+            if not force:
+                cached = self.runs.find_cached(ck)
+                if cached:
+                    run = self._materialize_cache_hit(
+                        case_id, stage, target_id, params, tool, tool_version, ck, cached,
+                        priority, resource_class, max_attempts)
+                    self._commit()
+                    return self.runs.get(run.id)  # type: ignore[return-value]
+                if dedup:
+                    pending = self._find_pending(ck, case_id)
+                    if pending:
+                        self._rollback(mark)
+                        return pending
             run = self.runs.create(case_id, stage, target_id=target_id, params=params,
                                    tool=tool, tool_version=tool_version, cache_key=ck,
                                    priority=priority, resource_class=resource_class,
                                    max_attempts=max_attempts)
-            now = _now()
-            self.conn.execute(
-                "UPDATE analysis_run SET status='done', started_at=?, ended_at=? WHERE id=?",
-                (now, now, run.id))
-            ra = RunArtifactDAO(self.conn)
-            for link in ra.list_by_run(cached.id):
-                ra.link(run.id, link.artifact_sha256, link.role)
-            self._emit("job.cachehit", run_id=run.id, case_id=case_id,
-                       payload={"source_run": cached.id})
-            self._emit("job.done", run_id=run.id, case_id=case_id, payload={"cached": True})
-            self.conn.execute("COMMIT")
+            self._emit("job.queued", run_id=run.id, case_id=case_id)
+            self._commit()
         except Exception:
-            self.conn.execute("ROLLBACK"); raise
-        return self.runs.get(run.id)  # type: ignore[return-value]
+            self._rollback(mark); raise
+        return run
+
+    def _find_pending(self, cache_key: str, case_id: str) -> Optional[AnalysisRun]:
+        # Scoped to the case: cache_key is deliberately case-independent (hashing.py), so a
+        # cross-case match here would hand case B a run that belongs to case A -- B would then
+        # get no run of its own, and none of its per-case rows/events/reprojection. A second
+        # case with the same input instead gets its own queued run and cache-hits off the
+        # first once it completes (find_cached, above, is the cross-case sharing path).
+        r = self.conn.execute(
+            "SELECT * FROM analysis_run WHERE cache_key=? AND case_id=? "
+            "AND status IN ('queued','running') "
+            "ORDER BY created_at ASC LIMIT 1", (cache_key, case_id)).fetchone()
+        return AnalysisRunDAO._row(r) if r else None
+
+    def _materialize_cache_hit(self, case_id: str, stage: str, target_id: Optional[str],
+                               params: Optional[dict], tool: Optional[str],
+                               tool_version: Optional[str], ck: str, cached: AnalysisRun,
+                               priority: int, resource_class: str,
+                               max_attempts: int) -> AnalysisRun:
+        """Materialise a cache hit. The CALLER holds the write transaction (see enqueue), so
+        the lookup that decided this was a hit and the rows written for it are atomic."""
+        run = self.runs.create(case_id, stage, target_id=target_id, params=params,
+                               tool=tool, tool_version=tool_version, cache_key=ck,
+                               priority=priority, resource_class=resource_class,
+                               max_attempts=max_attempts)
+        now = _now()
+        self.conn.execute(
+            "UPDATE analysis_run SET status='done', started_at=?, ended_at=? WHERE id=?",
+            (now, now, run.id))
+        ra = RunArtifactDAO(self.conn)
+        for link in ra.list_by_run(cached.id):
+            ra.link(run.id, link.artifact_sha256, link.role)
+        self._emit("job.cachehit", run_id=run.id, case_id=case_id,
+                   payload={"source_run": cached.id})
+        self._emit("job.done", run_id=run.id, case_id=case_id, payload={"cached": True})
+        return run
 
     # ------------------------------------------------------------- claim (JE-03/08)
     def claim(self, worker_id: str, classes: Iterable[str], lease_seconds: int) -> Optional[str]:
@@ -98,26 +164,25 @@ class JobQueue:
             return None
         ph = ",".join("?" for _ in classes)
         now = _now()
-        try:
-            self.conn.execute("BEGIN IMMEDIATE")
-        except sqlite3.OperationalError:
+        mark = len(self._pending)
+        if not self._begin_immediate(critical=False):
             return None
         try:
             row = self.conn.execute(
                 f"SELECT id FROM analysis_run WHERE status='queued' AND resource_class IN ({ph}) "
                 "ORDER BY priority ASC, created_at ASC, id ASC LIMIT 1", classes).fetchone()
             if not row:
-                self.conn.execute("ROLLBACK"); return None
+                self._rollback(mark); return None
             rid = row["id"]
             cur = self.conn.execute(
                 "UPDATE analysis_run SET status='running', claimed_by=?, attempts=attempts+1, "
                 "started_at=COALESCE(started_at,?), heartbeat_at=?, lease_expires_at=? "
                 "WHERE id=? AND status='queued'", (worker_id, now, now, now + lease_seconds, rid))
             if cur.rowcount != 1:
-                self.conn.execute("ROLLBACK"); return None
-            self.conn.execute("COMMIT")
+                self._rollback(mark); return None
+            self._commit()
         except Exception:
-            self.conn.execute("ROLLBACK"); raise
+            self._rollback(mark); raise
         self._emit("job.started", run_id=rid)
         return rid
 
@@ -128,13 +193,47 @@ class JobQueue:
             "WHERE id=? AND claimed_by=? AND status='running'",
             (now, now + lease_seconds, run_id, worker_id))
 
+    def is_cancel_requested(self, run_id: str) -> bool:
+        """Has a cancel been requested for this run? A read-only probe the heartbeat uses to stop
+        renewing the lease of a non-cooperative stage, so the reaper can reclaim it."""
+        r = self.conn.execute(
+            "SELECT cancel_requested FROM analysis_run WHERE id=?", (run_id,)).fetchone()
+        return bool(r and r["cancel_requested"])
+
     # --------------------------------------------------------- terminal transitions
-    def complete(self, run_id: str, outputs: Optional[list[tuple[str, str]]] = None) -> bool:
-        self.conn.execute("BEGIN IMMEDIATE")
+    def _lease_lost(self, run: Optional[AnalysisRun],
+                    worker_id: Optional[str]) -> Optional[str]:
+        """Why this worker may no longer report a result for `run`, or None if it may.
+
+        The reaper requeues a 'running' job whose lease expired. If the worker was in fact
+        still alive, it then finishes and tries to record its result against a row that has
+        moved on -- and the result used to be dropped on the floor with no trace, while a
+        second worker re-ran the same job. The drop is unavoidable (another worker may already
+        own the row); the SILENCE is not.
+        """
+        if run is None:
+            return "run no longer exists"
+        if run.status != "running":
+            return f"status moved to {run.status!r} (lease reaped or cancelled)"
+        if worker_id is not None and run.claimed_by not in (None, worker_id):
+            return f"claimed by {run.claimed_by!r} (re-claimed after a lease expiry)"
+        return None
+
+    def complete(self, run_id: str, outputs: Optional[list[tuple[str, str]]] = None,
+                 worker_id: Optional[str] = None) -> bool:
+        mark = len(self._pending)
+        self._begin_immediate()
         try:
             run = self.runs.get(run_id)
-            if not run or run.status != "running":
-                self.conn.execute("ROLLBACK"); return False
+            lost = self._lease_lost(run, worker_id)
+            if lost:
+                self._emit("job.result_discarded", run_id=run_id,
+                           case_id=run.case_id if run else None, level="warn",
+                           payload={"reason": lost, "worker": worker_id,
+                                    "outputs": len(outputs or [])})
+                self._commit()                    # the warning itself must survive
+                return False
+            assert run is not None                # _lease_lost returns a reason when it is
             self.conn.execute("UPDATE analysis_run SET status='done', ended_at=? WHERE id=?",
                               (_now(), run_id))
             if outputs:
@@ -142,18 +241,25 @@ class JobQueue:
                 for sha, role in outputs:
                     ra.link(run_id, sha, role)
             self._emit("job.done", run_id=run_id, case_id=run.case_id)
-            self.conn.execute("COMMIT")
+            self._commit()
         except Exception:
-            self.conn.execute("ROLLBACK"); raise
+            self._rollback(mark); raise
         return True
 
-    def fail(self, run_id: str, error: str, retryable: bool = True) -> Optional[str]:
-        self.conn.execute("BEGIN IMMEDIATE")
+    def fail(self, run_id: str, error: str, retryable: bool = True,
+             worker_id: Optional[str] = None) -> Optional[str]:
+        mark = len(self._pending)
+        self._begin_immediate()
         try:
             run = self.runs.get(run_id)
-            if not run or run.status != "running":
-                self.conn.execute("ROLLBACK")
+            lost = self._lease_lost(run, worker_id)
+            if lost:
+                self._emit("job.result_discarded", run_id=run_id,
+                           case_id=run.case_id if run else None, level="warn",
+                           payload={"reason": lost, "worker": worker_id, "error": error})
+                self._commit()
                 return run.status if run else None
+            assert run is not None                # _lease_lost returns a reason when it is
             if retryable and run.attempts < run.max_attempts:
                 self.conn.execute(
                     "UPDATE analysis_run SET status='queued', claimed_by=NULL, "
@@ -168,32 +274,34 @@ class JobQueue:
                 self._emit("job.error", run_id=run_id, case_id=run.case_id, level="error",
                            payload={"error": error})
                 result = "error"
-            self.conn.execute("COMMIT")
+            self._commit()
         except Exception:
-            self.conn.execute("ROLLBACK"); raise
+            self._rollback(mark); raise
         return result
 
     def set_cancelled(self, run_id: str) -> bool:
-        self.conn.execute("BEGIN IMMEDIATE")
+        mark = len(self._pending)
+        self._begin_immediate()
         try:
             run = self.runs.get(run_id)
             if not run or run.status != "running":
-                self.conn.execute("ROLLBACK"); return False
+                self._rollback(mark); return False
             self.conn.execute("UPDATE analysis_run SET status='cancelled', ended_at=? WHERE id=?",
                               (_now(), run_id))
             self._emit("job.cancelled", run_id=run_id, case_id=run.case_id)
-            self.conn.execute("COMMIT")
+            self._commit()
         except Exception:
-            self.conn.execute("ROLLBACK"); raise
+            self._rollback(mark); raise
         return True
 
     # ----------------------------------------------------------------- cancel (JE-19)
     def cancel(self, run_id: str) -> bool:
-        self.conn.execute("BEGIN IMMEDIATE")
+        mark = len(self._pending)
+        self._begin_immediate()
         try:
             run = self.runs.get(run_id)
             if not run or run.status in ("done", "error", "cancelled"):
-                self.conn.execute("ROLLBACK"); return False
+                self._rollback(mark); return False
             self.conn.execute("UPDATE analysis_run SET cancel_requested=1 WHERE id=?", (run_id,))
             if run.status == "queued":
                 self.conn.execute(
@@ -202,13 +310,13 @@ class JobQueue:
                 self._emit("job.cancelled", run_id=run_id, case_id=run.case_id)
             else:
                 self._emit("job.cancel_requested", run_id=run_id, case_id=run.case_id)
-            self.conn.execute("COMMIT")
+            self._commit()
         except Exception:
-            self.conn.execute("ROLLBACK"); raise
+            self._rollback(mark); raise
         return True
 
     # ------------------------------------------------------- reaper / recovery (JE-04/07)
-    def _requeue_or_error(self, r, error: str) -> None:
+    def _requeue_or_error(self, r: sqlite3.Row, error: str) -> None:
         rid, cid = r["id"], r["case_id"]
         if r["attempts"] < r["max_attempts"]:
             self.conn.execute(
@@ -224,28 +332,30 @@ class JobQueue:
 
     def reap(self, now: Optional[int] = None) -> int:
         now = now or _now()
-        self.conn.execute("BEGIN IMMEDIATE")
+        mark = len(self._pending)
+        self._begin_immediate()
         try:
             rows = self.conn.execute(
                 "SELECT * FROM analysis_run WHERE status='running' "
                 "AND lease_expires_at IS NOT NULL AND lease_expires_at < ?", (now,)).fetchall()
             for r in rows:
                 self._requeue_or_error(r, "lease expired")
-            self.conn.execute("COMMIT")
+            self._commit()
         except Exception:
-            self.conn.execute("ROLLBACK"); raise
+            self._rollback(mark); raise
         return len(rows)
 
     def recover_orphans(self) -> int:
         """Startup crash-recovery: all 'running' rows have no live worker (JE-07)."""
-        self.conn.execute("BEGIN IMMEDIATE")
+        mark = len(self._pending)
+        self._begin_immediate()
         try:
             rows = self.conn.execute("SELECT * FROM analysis_run WHERE status='running'").fetchall()
             for r in rows:
                 self._requeue_or_error(r, "orphaned (service restart)")
-            self.conn.execute("COMMIT")
+            self._commit()
         except Exception:
-            self.conn.execute("ROLLBACK"); raise
+            self._rollback(mark); raise
         return len(rows)
 
     # ------------------------------------------------------------------ counts (JE-28)

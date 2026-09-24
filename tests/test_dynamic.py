@@ -65,6 +65,63 @@ def test_sandbox_timeout(bins):
     assert res.timed_out and not res.crashed
 
 
+_ASAN_SRC = (
+    "#include <unistd.h>\n#include <stdlib.h>\n#include <string.h>\n"
+    "int main(){char*b=malloc(16);char t[256];int n=read(0,t,255);"
+    "if(n<0)n=0;t[n]=0;strcpy(b,t);return 0;}\n"
+)
+
+
+@pytest.fixture(scope="module")
+def asan_bin(gcc, tmp_path_factory):
+    d = tmp_path_factory.mktemp("asanbin")
+    c = d / "a.c"; c.write_text(_ASAN_SRC)
+    b = d / "a"
+    r = subprocess.run([gcc, "-fsanitize=address", "-g", "-O1", str(c), "-o", str(b)],
+                       capture_output=True)
+    if r.returncode != 0:
+        pytest.skip("no libasan / asan build unavailable")
+    return b
+
+
+def test_sandbox_asan_build_not_spurious_crash(asan_bin):
+    """Regression: run() capped RLIMIT_AS for native builds, but an ASan runtime reserves a
+    ~20TB *virtual* shadow region at startup. Under the cap that mmap failed and the process
+    aborted before main() -- so EVERY input (the entire source-code path is ASan builds) read as
+    a spurious SIGABRT crash. A benign input must now run clean, proving the cap is dropped for
+    sanitizer builds and resident memory is bounded via ASan's hard_rss_limit_mb instead."""
+    res = sandbox.run(asan_bin, stdin=b"hi", timeout=10)
+    assert not res.crashed, ("ASan build spuriously crashed on a benign input -- AS cap is "
+                             "starving the shadow map: "
+                             + res.stderr.decode("latin-1", "ignore")[:200])
+    assert res.exit_code == 0
+
+
+def test_sandbox_asan_real_overflow_still_detected(asan_bin):
+    """The fix must not blind the sandbox: a long input overflows the 16-byte heap buffer, and
+    run() forces abort_on_error so ASan turns that into a catchable SIGABRT."""
+    res = sandbox.run(asan_bin, stdin=b"A" * 200, timeout=10)
+    assert res.crashed and res.signal_name == "SIGABRT"
+
+
+def test_review_replay_verdict_persists_and_survives_reopen(store, case, bins):
+    """The false-positive review replays a crashing input N times and persists the verdict as a
+    `replay-verdict` artifact, so a reopened case (and the report) can badge the finding. Shared
+    by the replay endpoint and the server-side Autopilot -- the background path had no review
+    before this. An unknown input is None, not a crash."""
+    from lykos.analyze.ingest import ingest
+    from lykos.analyze.review import replay_verdict
+    if "crash" not in bins:
+        pytest.skip("build failed")
+    target = ingest(store, case.id, bins["crash"])         # deterministic SIGSEGV on any input
+    sha, _, _ = store.content.put_bytes(b"anything")
+    v = replay_verdict(store, target, sha, times=3)
+    assert v and v["runs"] == 3 and v["crashed"] == 3 and v["deterministic"]
+    assert replay_verdict(store, target, "deadbeef", times=2) is None
+    arts = [a for a in store.artifacts.list_by_case(case.id) if a.kind == "replay-verdict"]
+    assert any((a.meta or {}).get("input_sha") == sha for a in arts)
+
+
 def test_dynamic_stage_crash_confirms_finding(store, case, pool, bins):
     from lykos.analyze.ingest import ingest
     if "crash" not in bins:
@@ -216,3 +273,101 @@ def test_wine_absent_is_reported_not_crashed(monkeypatch):
     r = sandbox._run_windows("/nonexistent.exe", argv=[], stdin=b"", timeout=5,
                              mem_mb=512, capture=4096, wineprefix=None)
     assert r.isolation == "unsupported-windows" and not r.crashed and "wine" in r.note
+
+
+def test_qemu_selection_covers_every_supported_arch():
+    """Every arch the ELF parser can name must resolve to a qemu-user binary name, or the
+    dynamic stage reports "unsupported-arch" and the whole PoC ladder is unreachable for it.
+    sparcv9 was missing this mapping even though qemu-sparc64 exists.
+    """
+    from lykos.analyze.dynamic import sandbox
+    # (arch, endianness, bits) -> expected qemu suffix
+    cases = [("sparcv9", "big", 64, "sparc64"), ("sparc", "big", 32, "sparc"),
+             ("sparc", "big", 64, "sparc64"), ("riscv", "little", 64, "riscv64"),
+             ("riscv", "little", 32, "riscv32"), ("s390", "big", 64, "s390x"),
+             ("loongarch", "little", 64, "loongarch64"), ("m68k", "big", 32, "m68k"),
+             ("sh", "little", 32, "sh4"), ("ppc64", "little", 64, "ppc64le"),
+             ("ppc64", "big", 64, "ppc64"), ("mips", "little", 32, "mipsel")]
+    for arch, endian, bits, want in cases:
+        suf = sandbox._QEMU.get(arch)
+        if arch in ("mips", "mips64") and endian == "little":
+            suf = "mipsel"
+        elif arch == "ppc64" and endian == "little":
+            suf = "ppc64le"
+        elif arch == "riscv":
+            suf = "riscv32" if bits == 32 else "riscv64"
+        elif arch == "sparc" and bits == 64:
+            suf = "sparc64"
+        assert suf == want, f"{arch}/{endian}/{bits}: got qemu-{suf}, want qemu-{want}"
+
+
+def test_secret_mask_args_covers_root_dotfiles_and_registered_dirs(tmp_path):
+    """The read-only root exposes the whole host fs; host SECRETS (ssh keys, the case store)
+    must be masked with an empty tmpfs so hostile code cannot read and exfil them via stdout."""
+    import os
+    store = tmp_path / "casestore"; store.mkdir()
+    sandbox.protect_dir(str(store))
+    masks = sandbox._secret_mask_args()
+    # a registered dir (the case store) is masked
+    assert "--tmpfs" in masks and str(store) in masks
+    # /root is masked when it exists on the host
+    if os.path.isdir("/root"):
+        assert "/root" in masks
+    # and the mask is actually injected into the bwrap prefix the debug/PoC paths build
+    if sandbox._bwrap_usable():
+        pre = sandbox.isolate_prefix(str(tmp_path), net=False)
+        assert str(store) in pre
+
+
+def test_hostile_target_cannot_read_a_masked_secret(gcc, tmp_path, monkeypatch):
+    """End to end: a target run in the sandbox cannot open a file inside a protected dir even
+    though the read-only root would otherwise expose it (isolation is real, not advisory)."""
+    if not sandbox._bwrap_usable():
+        pytest.skip("bwrap unavailable")
+    secret = tmp_path / "secretstore"; secret.mkdir()
+    (secret / "creds").write_text("TOPSECRET")
+    sandbox.protect_dir(str(secret))
+    exedir = tmp_path / "bin"; exedir.mkdir()
+    src = tmp_path / "r.c"; src.write_text(
+        '#include <stdio.h>\n#include <stdlib.h>\n'
+        'int main(){FILE*f=fopen(getenv("S"),"rb");printf("R%d\\n",f?1:0);'
+        'if(f)fclose(f);return 0;}\n')
+    exe = exedir / "r"
+    if subprocess.run([gcc, "-O0", str(src), "-o", str(exe)], capture_output=True).returncode:
+        pytest.skip("build failed")
+    monkeypatch.setenv("S", str(secret / "creds"))
+    res = sandbox.run(str(exe), timeout=10)
+    assert res.isolation.startswith("bwrap")     # actually contained, not the rlimits fallback
+    assert b"R0" in res.stdout                    # the masked secret could NOT be opened
+
+
+def test_dynamic_stage_marks_never_run_distinct_from_clean(monkeypatch, tmp_path):
+    """A target that never executed (no qemu for its arch) must be reported as 'did not run',
+    not 'clean exit' -- absence of evidence is not evidence of absence."""
+    monkeypatch.setattr(sandbox.shutil, "which", lambda name: None)   # no qemu at all
+    exe = _mini_elf(tmp_path / "x", 0xB7)
+    res = sandbox.run(str(exe), arch="aarch64", host="x86-64")
+    assert res.isolation == "unsupported-arch"
+    # the stage's classifier: this isolation is in the "did not run" set, so ran is False
+    from lykos.analyze.dynamic import stage
+    assert res.isolation in stage._DID_NOT_RUN
+    assert "bwrap+netns" not in stage._DID_NOT_RUN     # a real run is not in the set
+
+
+def test_argv_arg_refuses_a_nul_payload_with_a_usable_reason():
+    """execve() argument strings are NUL-terminated, so an argv element cannot carry a NUL.
+
+    Any L2/L3 confirmation payload that embeds an address contains one, so delivering it via
+    input_mode="arg" is impossible in principle -- not a bug to work around. It previously
+    surfaced as a bare ValueError("embedded null byte") raised from inside subprocess, which
+    failed the whole stage and read like a crash in the tool rather than a property of the
+    delivery channel.
+    """
+    from lykos.analyze.dynamic import sandbox
+    payload = b"A" * 72 + (0x400544).to_bytes(8, "little")
+    assert b"\x00" in payload
+    with pytest.raises(sandbox.ArgvNulError) as ei:
+        sandbox.argv_arg(payload)
+    msg = str(ei.value)
+    assert "NUL" in msg and "stdin" in msg          # says what is wrong AND what to do
+    assert sandbox.argv_arg(b"AAAA") == "AAAA"      # ordinary payloads are unaffected

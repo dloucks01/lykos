@@ -72,11 +72,16 @@ for _n, _li in FUNCS.items():
     except Exception: pass
 gdb.execute("set pagination off")
 gdb.execute("set height 0")
+RAN, ERR = False, ""
 try:
     # args inline: `set args X` then `run < file` resets args to empty (gdb quirk) -> argv lost
     gdb.execute("run " + RUN_ARGS + ((" < " + INPUT_FILE) if INPUT_FILE else ""))
-except gdb.error:
-    pass
+    RAN = True            # the inferior actually executed (run returned no gdb.error)
+except gdb.error as _e:
+    ERR = str(_e)         # never ran (exec-format / cannot-execute / ptrace-denied)
+# LYKOS_STATUS separates "ran and matched no comparison" from "never ran": an empty result from
+# a target that could not be executed must not read as "no secrets to recover".
+print("LYKOS_STATUS " + json.dumps({"ran": RAN, "error": ERR}))
 print("LYKOS_CMP " + json.dumps(HITS))
 '''
 
@@ -105,16 +110,33 @@ def run_extract(exe, funcs, arch, *, argv=(), stdin=b"", timeout=20):
                             "infile": infile,
                             "runargs": " ".join(shlex.quote(a) for a in argv)}
         (d / "sec.py").write_text(script)
-        proc = subprocess.run([gdb_bin, "-batch", "-nx", "-x", str(d / "sec.py"), str(exe)],
-                              capture_output=True, timeout=timeout + 15)
+        from ..dynamic import sandbox
+        # Contain the (hostile) target: bwrap read-only root (net unshared -- ptrace needs no
+        # loopback) + rlimits. The script/input dir is re-bound read-only for gdb to read.
+        exe_abs = str(Path(exe).resolve())            # absolute: bwrap chdirs to /tmp
+        exedir = str(Path(exe_abs).parent)
+        inner = [gdb_bin, "-batch", "-nx", "-x", str(d / "sec.py"), exe_abs]
+        cmd = sandbox.isolate_prefix(exedir, net=False, ro_binds=[str(d)]) + inner
+        proc = sandbox.run_reaped(cmd, capture_output=True, timeout=timeout + 15,
+                                  preexec_fn=sandbox._rlimits(2048, int(timeout) + 15,
+                                                              set_as=False))
         out = proc.stdout.decode("latin-1", "ignore")
-        hits = []
+        hits = status = None
         for line in out.splitlines():
             if line.startswith("LYKOS_CMP "):
                 hits = json.loads(line[len("LYKOS_CMP "):])
+            elif line.startswith("LYKOS_STATUS "):
+                status = json.loads(line[len("LYKOS_STATUS "):])
+        if hits is None or status is None:
+            return {"ok": False, "hits": [], "note": "gdb did not run to completion (no result "
+                    "marker) -- the target could not be run; no comparisons were observed"}
+        if not status.get("ran"):
+            return {"ok": False, "hits": [], "note": "the target never executed under gdb (%s) "
+                    "-- no comparisons observed, which is not the same as none present"
+                    % (status.get("error") or "unknown reason")}
         return {"ok": True, "hits": hits}
     except subprocess.TimeoutExpired:
-        return {"ok": True, "hits": [], "note": "extraction run timed out"}
+        return {"ok": False, "hits": [], "note": "extraction run timed out before completing"}
     finally:
         import shutil
         shutil.rmtree(d, ignore_errors=True)

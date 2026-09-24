@@ -19,6 +19,8 @@ from pathlib import Path
 
 from ...db.dao import FindingDAO, TargetDAO
 from ...jobs.registry import register_stage
+from ..fuzz.runner import place
+from ..poc.capture import how_to_feed
 from . import sandbox
 
 HEAP_STAGE = "heap_check"
@@ -71,6 +73,8 @@ def heap_stage(ctx) -> dict:
         ctx.progress(pct=100, msg="heap check not supported for this cross-arch target")
         return {}
 
+    # mask the case store inside the sandbox; the target is copied out to workdir before it runs.
+    sandbox.protect_dir(getattr(ctx.content, "root", None))
     workdir = Path(tempfile.mkdtemp(prefix="lykos-heap-"))
     try:
         so = _build_shim(workdir)
@@ -84,7 +88,7 @@ def heap_stage(ctx) -> dict:
         exe.write_bytes(ctx.content.path(target.sha256).read_bytes())
         os.chmod(exe, 0o755)
 
-        mode = p.get("input_mode", "stdin")
+        mode = how_to_feed(ctx.conn, target, p.get("input_sha"), p)[0]
         argv = list(p.get("argv") or [])
         timeout = float(p.get("timeout", 15))
         data = ctx.content.get_bytes(p["input_sha"]) if p.get("input_sha") else b"A" * 128
@@ -92,35 +96,74 @@ def heap_stage(ctx) -> dict:
         stdin = data if mode == "stdin" else b""
         if mode == "file":
             (workdir / "input.bin").write_bytes(data)
-            run_argv = argv + [str(workdir / "input.bin")]
+            run_argv = place(argv, str(workdir / "input.bin"))
 
         report = workdir / "heap.json"
-        env = dict(os.environ)
-        env["LD_PRELOAD"] = str(so)
-        env["LYKOS_HEAP_REPORT"] = str(report)
+        # Minimal env for hostile code: the shim needs LD_PRELOAD + its report path; the host
+        # environment is NOT forwarded (it can carry credentials/tokens). Keep only locale so
+        # locale-sensitive parsing behaves as it would natively.
+        env = {"LD_PRELOAD": str(so), "LYKOS_HEAP_REPORT": str(report),
+               "PATH": "/usr/bin:/bin", "HOME": "/tmp"}
+        for k in ("LANG", "LC_ALL", "LC_CTYPE", "TZ"):
+            if k in os.environ:
+                env[k] = os.environ[k]
         if p.get("leaks"):
             env["LYKOS_HEAP_LEAKS"] = "1"
 
         ctx.progress(msg="running under the guard-page heap allocator")
+        # Detonate the (hostile) target with real containment: bwrap read-only root with
+        # /home,/root masked (net unshared -- the shim needs no network) + rlimits so a fork
+        # bomb / disk fill / runaway CPU cannot take the host down. The workdir holds the target,
+        # the shim .so, the input and the shim's JSON report, so it is bound WRITABLE. On timeout
+        # run_reaped kills the whole process group / namespace, so no forked child is orphaned.
+        # AS is deliberately NOT capped: the guard-page allocator maps a guard region per
+        # allocation, and an address-space ceiling would make its mmaps fail and mask real bugs.
+        inner = [str(exe), *run_argv]
+        cmd = sandbox.isolate_prefix(str(workdir), net=False, rw_binds=[str(workdir)]) + inner
+        timed_out = False
         try:
-            subprocess.run([str(exe), *run_argv], input=stdin, capture_output=True,
-                           timeout=timeout, env=env, cwd=str(workdir))
+            sandbox.run_reaped(cmd, input=stdin, capture_output=True, timeout=timeout,
+                               env=env, cwd=str(workdir),
+                               preexec_fn=sandbox._rlimits(2048, int(timeout) + 5, set_as=False))
         except subprocess.TimeoutExpired:
-            pass
+            timed_out = True
         except OSError as e:
-            ctx.emit("heap.done", payload={"ok": False, "note": f"could not run target: {e}"})
+            # Reachable only on the unwrapped fallback (bwrap unusable): a non-ELF target hits
+            # execve's "Exec format error". Give the honest, actionable answer, not the errno.
+            note = f"could not run target: {e}"
+            if e.errno == 8:
+                note = (f"this target is {(target.file_type or 'not an ELF').upper()}, and the "
+                        f"guard-page heap checker is a Linux/ELF LD_PRELOAD shim -- it cannot "
+                        f"load into it. Nothing was checked.")
+            ctx.emit("heap.done", payload={"ok": False, "applicable": False, "note": note})
             return {}
 
+        # The shim's constructor opens (O_CREAT) the report the instant it loads, so the report's
+        # ABSENCE proves the shim never loaded -- the target did not execute under instrumentation
+        # (statically linked, or it failed to exec inside the sandbox). That is NOT a clean bill
+        # of health: nothing was checked, which is not the same as nothing found.
+        if not report.exists():
+            static = (target.linking or "").lower() == "static"
+            note = ("this target is statically linked, so the LD_PRELOAD guard-page allocator "
+                    "never loaded -- nothing was checked, which is not the same as nothing "
+                    "found. Use a dynamically-linked build.") if static else (
+                    "the guard-page allocator never loaded (the target did not execute under it"
+                    + (" before the timeout" if timed_out else "") + ") -- nothing was checked, "
+                    "which is not the same as nothing found.")
+            ctx.emit("heap.done", payload={"ok": False, "applicable": False, "errors": 0,
+                     "findings": 0, "kinds": [], "note": note})
+            ctx.progress(pct=100, msg="heap check did not run: instrumentation never loaded")
+            return {"metrics": {"applicable": False}}
+
         errors = []
-        if report.exists():
-            for line in report.read_text("latin-1").splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    errors.append(json.loads(line))
-                except ValueError:
-                    pass
+        for line in report.read_text("latin-1").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                errors.append(json.loads(line))
+            except ValueError:
+                pass
 
         fd = FindingDAO(ctx.conn)
         seen, findings = set(), 0
@@ -143,10 +186,17 @@ def heap_stage(ctx) -> dict:
                 "dedup_key": key, "state": "corroborated", "confidence": 0.9})
             findings += 1
 
+        # The report exists, so the shim loaded and the target DID run under instrumentation.
+        # (The "statically linked / never loaded" case is handled above by report absence.)
+        note = None
+        if timed_out:
+            note = ("the target was still running when the timeout expired; the heap inventory "
+                    "may be incomplete")
+        elif not errors:
+            note = "no heap errors observed on this input (try other inputs)"
         ctx.emit("heap.done", payload={"ok": True, "errors": len(errors), "findings": findings,
                  "kinds": sorted({e.get("error") for e in errors if e.get("error") in _MAP}),
-                 "note": None if errors else "no heap errors observed on this input "
-                         "(LD_PRELOAD needs a dynamically-linked target; try other inputs)"})
+                 "timed_out": timed_out, "note": note})
         ctx.progress(pct=100, msg=f"{len(errors)} heap error(s), {findings} finding(s)")
         return {}
     finally:

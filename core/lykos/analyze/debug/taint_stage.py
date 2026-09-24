@@ -23,6 +23,8 @@ from ...db.dao import CallEdgeDAO, FindingDAO, TargetDAO
 from ...jobs.registry import register_stage
 from ..detect.catalog import normalize
 from ..dynamic import sandbox
+from ..fuzz.runner import place
+from ..poc.capture import how_to_feed
 from . import elfsyms, monitor, qemu_gdb
 
 TAINT_STAGE = "dynamic_taint"
@@ -102,7 +104,7 @@ def taint_stage(ctx) -> dict:
     os.chmod(exe, 0o755)
 
     marker = _marker()
-    mode = p.get("input_mode", "stdin")
+    mode = how_to_feed(ctx.conn, target, p.get("input_sha"), p)[0]
     argv = list(p.get("argv") or [])
     timeout = float(p.get("timeout", 20))
     stdin = marker.encode() if mode == "stdin" else b""
@@ -112,7 +114,7 @@ def taint_stage(ctx) -> dict:
     elif mode == "file":
         infile = ctx.scratch() / "taint-input.bin"
         infile.write_text(marker)
-        run_argv = argv + [str(infile)]
+        run_argv = place(argv, str(infile))
 
     if emulated:
         info = elfsyms.read(exe)

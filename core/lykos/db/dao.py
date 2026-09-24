@@ -5,8 +5,10 @@ columns are (de)serialized via repository helpers.
 """
 from __future__ import annotations
 
+import sqlite3
 import time
-from typing import Optional
+from collections.abc import Sequence
+from typing import Any, Optional
 
 from ..hashing import new_id
 from .connection import transaction
@@ -29,7 +31,7 @@ from .models import (
     StringRef,
     Target,
 )
-from .repository import BaseDAO, as_bool, as_int_bool, dumps, loads
+from .repository import BaseDAO, as_bool, as_flag, as_int_bool, dumps, loads
 
 _TABLE_CASE = '"case"'  # reserved word — must be quoted everywhere
 
@@ -60,17 +62,35 @@ class CaseDAO(BaseDAO):
         return [self._row(r) for r in rows]
 
     def delete(self, case_id: str) -> None:
-        self.conn.execute(f'DELETE FROM {_TABLE_CASE} WHERE id=?', (case_id,))
+        # An artifact row is global (sha256 is its PK) and owned by the case that first registered
+        # it; a cache hit links ANOTHER case's run to that same row without re-homing it. Deleting
+        # the owning case cascades to delete its artifact rows (ON DELETE CASCADE), but the other
+        # case's run_artifact still references them (no ON DELETE there) -> RESTRICT -> the whole
+        # delete raises IntegrityError, and such a case could never be deleted. So first hand any
+        # artifact this case owns BUT another case's run still references over to that other case;
+        # the cascade then leaves it alone and the delete succeeds without orphaning a live link.
+        with transaction(self.conn, immediate=True):
+            shared = self.conn.execute(
+                "SELECT a.sha256 AS sha, MIN(r.case_id) AS other "
+                "FROM artifact a "
+                "JOIN run_artifact ra ON ra.artifact_sha256 = a.sha256 "
+                "JOIN analysis_run r ON r.id = ra.run_id "
+                "WHERE a.case_id = ? AND r.case_id <> ? "
+                "GROUP BY a.sha256", (case_id, case_id)).fetchall()
+            for row in shared:
+                self.conn.execute("UPDATE artifact SET case_id=? WHERE sha256=?",
+                                  (row["other"], row["sha"]))
+            self.conn.execute(f'DELETE FROM {_TABLE_CASE} WHERE id=?', (case_id,))
 
     @staticmethod
-    def _row(r) -> Case:
+    def _row(r: sqlite3.Row) -> Case:
         return Case(id=r["id"], name=r["name"], created_at=r["created_at"],
                     notes=r["notes"], engagement_ref=r["engagement_ref"])
 
 
 # ------------------------------------------------------------------------- Target (DM-12)
 class TargetDAO(BaseDAO):
-    def upsert(self, case_id: str, filename: str, sha256: str, **fields) -> Target:
+    def upsert(self, case_id: str, filename: str, sha256: str, **fields: Any) -> Target:
         """Insert, or return the existing target for (case_id, sha256), updating fields.
 
         Implements per-case dedup by content hash (IT-05).
@@ -93,9 +113,17 @@ class TargetDAO(BaseDAO):
         )
         return t
 
-    def _update_fields(self, target_id: str, fields: dict) -> None:
+    # Columns update_triage/upsert may set. Interpolated into SQL below (identifiers cannot be
+    # bound as parameters), so it is whitelisted: an unknown key is rejected rather than
+    # trusted. Excludes identity/provenance columns (id, case_id, sha256, ingested_at).
+    _UPDATABLE = frozenset({"filename", "md5", "sha1", "size", "file_type", "arch", "bits",
+                            "endianness", "linking", "stripped", "mitigations", "entropy"})
+
+    def _update_fields(self, target_id: str, fields: dict[str, Any]) -> None:
         cols, vals = [], []
         for k, v in fields.items():
+            if k not in self._UPDATABLE:
+                raise ValueError(f"cannot update unknown/forbidden target column {k!r}")
             if k == "stripped":
                 v = as_int_bool(v)
             elif k == "mitigations":
@@ -107,7 +135,7 @@ class TargetDAO(BaseDAO):
         vals.append(target_id)
         self.conn.execute(f"UPDATE target SET {','.join(cols)} WHERE id=?", vals)
 
-    def update_triage(self, target_id: str, **fields) -> None:
+    def update_triage(self, target_id: str, **fields: Any) -> None:
         self._update_fields(target_id, fields)
 
     def delete(self, target_id: str) -> bool:
@@ -144,7 +172,7 @@ class TargetDAO(BaseDAO):
         return [self._row(r) for r in rows]
 
     @staticmethod
-    def _row(r) -> Target:
+    def _row(r: sqlite3.Row) -> Target:
         return Target(
             id=r["id"], case_id=r["case_id"], filename=r["filename"], sha256=r["sha256"],
             ingested_at=r["ingested_at"], md5=r["md5"], sha1=r["sha1"], size=r["size"],
@@ -177,7 +205,7 @@ class ArtifactDAO(BaseDAO):
         return [self._row(r) for r in rows]
 
     @staticmethod
-    def _row(r) -> Artifact:
+    def _row(r: sqlite3.Row) -> Artifact:
         return Artifact(sha256=r["sha256"], case_id=r["case_id"], kind=r["kind"],
                         rel_path=r["rel_path"], created_at=r["created_at"], size=r["size"],
                         meta=loads(r["meta_json"]))
@@ -255,7 +283,7 @@ class AnalysisRunDAO(BaseDAO):
         return self._row(r) if r else None
 
     @staticmethod
-    def _row(r) -> AnalysisRun:
+    def _row(r: sqlite3.Row) -> AnalysisRun:
         return AnalysisRun(
             id=r["id"], case_id=r["case_id"], stage=r["stage"], status=r["status"],
             created_at=r["created_at"], target_id=r["target_id"],
@@ -280,13 +308,16 @@ class EventDAO(BaseDAO):
             "INSERT INTO event(case_id,run_id,ts,level,type,payload_json) VALUES(?,?,?,?,?,?)",
             (ev.case_id, ev.run_id, ev.ts, ev.level, ev.type, dumps(ev.payload)),
         )
+        if cur.lastrowid is None:                  # AUTOINCREMENT always assigns one
+            raise RuntimeError("event insert produced no rowid")
         ev.id = int(cur.lastrowid)
         return ev
 
     def list(self, *, case_id: Optional[str] = None, run_id: Optional[str] = None,
              after_id: int = 0, limit: int = 100) -> list[Event]:
         """Cursor pagination by monotonic id (feeds the UI log panel + WS backfill)."""
-        clauses, params = ["id > ?"], [after_id]
+        clauses: list[str] = ["id > ?"]
+        params: list[Any] = [after_id]
         if case_id is not None:
             clauses.append("case_id = ?"); params.append(case_id)
         if run_id is not None:
@@ -299,13 +330,13 @@ class EventDAO(BaseDAO):
         return [self._row(r) for r in rows]
 
     @staticmethod
-    def _row(r) -> Event:
+    def _row(r: sqlite3.Row) -> Event:
         return Event(id=r["id"], case_id=r["case_id"], run_id=r["run_id"], ts=r["ts"],
                      level=r["level"], type=r["type"], payload=loads(r["payload_json"]))
 
 
 # --------------------------------------------------------------------- Function (Phase 1)
-def _frame_blob(f: dict):
+def _frame_blob(f: dict[str, Any]) -> Optional[dict[str, Any]]:
     """Fold the decompiler-recovered prototype details + stack frame into one blob:
     frame geometry + vars, plus params / calling_convention / thunk / varargs."""
     if not f.get("frame") and not f.get("params"):
@@ -327,8 +358,7 @@ class FunctionDAO(BaseDAO):
         stack-frame layout (params + calling_convention + thunk/varargs + frame geometry
         + `frame`.vars), collected into frame_json.
         """
-        self.conn.execute("BEGIN IMMEDIATE")
-        try:
+        with transaction(self.conn, immediate=True):
             self.conn.execute("DELETE FROM function WHERE target_id=?", (target_id,))
             now = _now()
             for f in funcs:
@@ -339,9 +369,6 @@ class FunctionDAO(BaseDAO):
                     (new_id(), target_id, f.get("addr", ""), f.get("name"), f.get("size"),
                      f.get("decompiled"), f.get("blocks"), f.get("edges"),
                      dumps(f.get("cfg")), f.get("signature"), dumps(_frame_blob(f)), now))
-            self.conn.execute("COMMIT")
-        except Exception:
-            self.conn.execute("ROLLBACK"); raise
         return len(funcs)
 
     def list_by_target(self, target_id: str) -> list[Function]:
@@ -369,12 +396,19 @@ class FunctionDAO(BaseDAO):
                               (target_id,)).fetchone()
         return int(r["c"])
 
+    def set_decompiled(self, func_id: str, decompiled: str) -> None:
+        """Cache a lazily-produced decompilation onto the row so the next open is instant. Used by
+        the on-demand decompile path: the disassemble stage does not decompile every function up
+        front, so the first time an analyst opens one we decompile it here and store it."""
+        with transaction(self.conn, immediate=True):
+            self.conn.execute("UPDATE function SET decompiled=? WHERE id=?",
+                              (decompiled, func_id))
+
 
 # ------------------------------------------------------------------- CallEdge (Phase 1)
 class CallEdgeDAO(BaseDAO):
     def replace_for_target(self, target_id: str, edges: list[dict]) -> int:
-        self.conn.execute("BEGIN IMMEDIATE")
-        try:
+        with transaction(self.conn, immediate=True):
             self.conn.execute("DELETE FROM call_edge WHERE target_id=?", (target_id,))
             now = _now()
             for e in edges:
@@ -383,9 +417,6 @@ class CallEdgeDAO(BaseDAO):
                     "dst_name,external,created_at) VALUES(?,?,?,?,?,?,?,?)",
                     (new_id(), target_id, e.get("src_addr"), e.get("site_addr"),
                      e.get("dst_addr"), e.get("dst_name"), as_int_bool(e.get("external")), now))
-            self.conn.execute("COMMIT")
-        except Exception:
-            self.conn.execute("ROLLBACK"); raise
         return len(edges)
 
     def list_by_target(self, target_id: str) -> list[CallEdge]:
@@ -419,7 +450,7 @@ class CallEdgeDAO(BaseDAO):
         return int(r["c"])
 
     @staticmethod
-    def _row(r) -> CallEdge:
+    def _row(r: sqlite3.Row) -> CallEdge:
         return CallEdge(id=r["id"], target_id=r["target_id"], created_at=r["created_at"],
                         src_addr=r["src_addr"], site_addr=r["site_addr"],
                         dst_addr=r["dst_addr"], dst_name=r["dst_name"],
@@ -429,8 +460,7 @@ class CallEdgeDAO(BaseDAO):
 # ------------------------------------------------------------------ StringRef (Phase 1)
 class StringDAO(BaseDAO):
     def replace_for_target(self, target_id: str, strings: list[dict]) -> int:
-        self.conn.execute("BEGIN IMMEDIATE")
-        try:
+        with transaction(self.conn, immediate=True):
             self.conn.execute("DELETE FROM string_ref WHERE target_id=?", (target_id,))
             now = _now()
             for s in strings:
@@ -439,15 +469,13 @@ class StringDAO(BaseDAO):
                     "VALUES(?,?,?,?,?,?)",
                     (new_id(), target_id, s.get("addr", ""), s.get("value"),
                      dumps(s.get("xrefs")), now))
-            self.conn.execute("COMMIT")
-        except Exception:
-            self.conn.execute("ROLLBACK"); raise
         return len(strings)
 
-    def list_by_target(self, target_id: str, limit: int = 2000) -> list[StringRef]:
+    def list_by_target(self, target_id: str, limit: int = 2000,
+                       offset: int = 0) -> list[StringRef]:
         rows = self.conn.execute(
-            "SELECT * FROM string_ref WHERE target_id=? ORDER BY addr LIMIT ?",
-            (target_id, limit)).fetchall()
+            "SELECT * FROM string_ref WHERE target_id=? ORDER BY addr LIMIT ? OFFSET ?",
+            (target_id, limit, max(0, int(offset)))).fetchall()
         return [StringRef(id=r["id"], target_id=r["target_id"], addr=r["addr"],
                           created_at=r["created_at"], value=r["value"],
                           xrefs=loads(r["xrefs_json"])) for r in rows]
@@ -459,11 +487,32 @@ class StringDAO(BaseDAO):
 
 
 # -------------------------------------------------------------------- Finding (Phase 3)
-def _rank(seq, val, default=0):
+def _rank(seq: Sequence[str], val: Optional[str], default: int = 0) -> int:
     try:
         return seq.index(val)
     except ValueError:
         return default
+
+
+def _merge_effect_evidence(evidence: list) -> list:
+    """Collapse the `effects` evidence channel (a JSON list of end effects, each carrying a
+    demonstrated/potential status and a proof artifact) into ONE merged entry, so a later stage
+    that DEMONSTRATES an effect promotes it -- with the artifact that proves it -- instead of the
+    finding keeping both the earlier "potential" line and the newer "demonstrated" one. Non-effect
+    evidence is untouched."""
+    eff_entries = [e for e in evidence if e.get("channel") == "effects"]
+    if len(eff_entries) < 2:
+        return evidence
+    from ..effects import merge_effects          # leaf module: no analysis-layer dependency here
+    merged: list = []
+    for e in eff_entries:
+        try:
+            merged = merge_effects(merged, loads(e.get("detail") or "[]"))
+        except Exception:
+            pass
+    rest = [e for e in evidence if e.get("channel") != "effects"]
+    rest.append({"channel": "effects", "detail": dumps(merged)})
+    return rest
 
 
 class FindingDAO(BaseDAO):
@@ -472,9 +521,12 @@ class FindingDAO(BaseDAO):
 
         Merge = union of evidence, and take the *higher* state/severity/confidence. This is
         how the confidence lifecycle advances when multiple channels agree (doc 05).
+
+        A finding is a DEFECT; each occurrence is recorded as a SITE against it (see the
+        finding_site migration). `function_addr`/`site_addr` on the finding row stay as the
+        first site seen, so existing consumers keep working.
         """
-        self.conn.execute("BEGIN IMMEDIATE")
-        try:
+        with transaction(self.conn, immediate=True):
             now = _now()
             key = c["dedup_key"]
             row = self.conn.execute(
@@ -487,11 +539,23 @@ class FindingDAO(BaseDAO):
                 for e in ev_new:
                     if (e.get("channel"), e.get("detail")) not in seen:
                         evidence.append(e)
-                state = FINDING_STATES[max(_rank(FINDING_STATES, row["state"]),
-                                           _rank(FINDING_STATES, c.get("state", "candidate")))]
-                severity = SEVERITIES[max(_rank(SEVERITIES, row["severity"]),
-                                          _rank(SEVERITIES, c.get("severity", "info")))]
-                confidence = max(row["confidence"] or 0.0, c.get("confidence", 0.0))
+                evidence = _merge_effect_evidence(evidence)   # promote effects across stages
+                self._record_verdict(row["id"], c, now)
+                state, severity, confidence = self._recompute(row["id"])
+                # A crash finding is first filed by a fuzz/dynamic stage with only a GENERIC
+                # signal-derived class (SIGABRT -> CWE-787). When an authoritative classifier --
+                # root_cause, with the sanitizer's own report -- later merges in on the same key,
+                # its specific class (e.g. heap-use-after-free / CWE-416) must become the
+                # finding's, not stay buried in the evidence. Only an `authoritative` candidate
+                # relabels; ordinary corroboration leaves the existing label alone.
+                # A candidate that demonstrates an EFFECT (poc_primitive) relabels the TITLE but
+                # sets `title_only` to keep root_cause's more specific CWE rather than its own
+                # generic signal-derived one.
+                if c.get("authoritative") and (c.get("cwe") or c.get("title")):
+                    new_cwe = row["cwe"] if c.get("title_only") else (c.get("cwe") or row["cwe"])
+                    self.conn.execute(
+                        "UPDATE finding SET cwe=?, title=? WHERE id=?",
+                        (new_cwe, c.get("title") or row["title"], row["id"]))
                 self.conn.execute(
                     "UPDATE finding SET state=?, severity=?, confidence=?, evidence_json=?, "
                     "detector=?, updated_at=? WHERE id=?",
@@ -506,9 +570,208 @@ class FindingDAO(BaseDAO):
                      c.get("severity", "info"), c.get("state", "candidate"),
                      c.get("confidence", 0.0), c.get("function_addr"), c.get("site_addr"),
                      c.get("detector"), key, dumps(ev_new), now, now))
-            self.conn.execute("COMMIT")
-        except Exception:
-            self.conn.execute("ROLLBACK"); raise
+            fid = self.conn.execute(
+                "SELECT id FROM finding WHERE target_id=? AND dedup_key=?",
+                (target_id, key)).fetchone()["id"]
+            if not row:
+                # Record this channel's verdict, then recompute the finding from its verdicts
+                # exactly as the merge path does -- so a finding filed DIRECTLY at poc-backed
+                # gets the same poc-backed->high severity floor a promoted one does, instead of
+                # keeping whatever severity the detector first guessed.
+                self._record_verdict(fid, c, now)
+                state, severity, confidence = self._recompute(fid)
+                self.conn.execute(
+                    "UPDATE finding SET state=?, severity=?, confidence=? WHERE id=?",
+                    (state, severity, confidence, fid))
+            if c.get("function_addr") or c.get("site_addr"):
+                self._record_site(fid, c, now)
+
+    def reset_candidate_sites(self, target_id: str, detectors) -> int:
+        """Clear the CANDIDATE-state (rule-channel) sites of the target's findings authored by the
+        given static detectors, before those detectors re-run.
+
+        Static detection is a pure function of the disassembly, so on a re-run it must REPLACE its
+        sites, not accumulate them -- otherwise a site the new run no longer emits (one dropped by
+        the CWE-121 destination gate, say) lingers forever. Scoped by DETECTOR (not by this run's
+        keys) so a class that drops to zero sites is cleared too. Sites a dynamic channel elevated
+        (poc-backed, corroborated) are PRESERVED: a re-detect must never erase a crash-proven
+        occurrence, or the finding would keep claiming poc-backed with nothing proven."""
+        dets = list(detectors or [])
+        if not dets:
+            return 0
+        qs = ",".join("?" * len(dets))
+        with transaction(self.conn, immediate=True):
+            cur = self.conn.execute(
+                f"DELETE FROM finding_site WHERE finding_id IN "
+                f"(SELECT id FROM finding WHERE target_id=? AND detector IN ({qs})) "
+                f"AND (state IS NULL OR state='candidate')",
+                (target_id, *dets))
+            return cur.rowcount or 0
+
+    def prune_empty_findings(self, target_id: str, detectors) -> int:
+        """Delete the target's candidate findings authored by `detectors` that have NO sites left
+        -- the orphan rows a re-detect leaves when the gate drops a whole class to zero. Findings
+        the dynamic channel promoted (state past 'candidate') are kept. finding_site/finding_verdict
+        rows cascade on the delete (foreign_keys=ON)."""
+        dets = list(detectors or [])
+        if not dets:
+            return 0
+        qs = ",".join("?" * len(dets))
+        with transaction(self.conn, immediate=True):
+            cur = self.conn.execute(
+                f"DELETE FROM finding WHERE target_id=? AND detector IN ({qs}) "
+                f"AND state='candidate' "
+                f"AND id NOT IN (SELECT DISTINCT finding_id FROM finding_site)",
+                (target_id, *dets))
+            return cur.rowcount or 0
+
+    def _record_site(self, fid: str, c: dict, now: int) -> None:
+        """Record one occurrence, keeping the STRONGEST verdict any channel has given it.
+
+        Every verdict the analysis computes is about one PLACE -- bounds proves a particular
+        copy bounded, a dominating guard bounds a particular index, crash attribution proves a
+        particular instruction -- and all of it used to collapse into a single badge on the
+        finding. jhead's poc-backed CWE-125 has 99 sites and exactly one is proven.
+
+        A channel may only RAISE a site's state, the same asymmetry the finding row uses, and
+        a channel that says nothing about a field cannot blank what another established.
+        """
+        fa, sa = c.get("function_addr"), c.get("site_addr")
+        prev = self.conn.execute(
+            "SELECT id, state FROM finding_site WHERE finding_id=? AND function_addr IS ? "
+            "AND site_addr IS ?", (fid, fa, sa)).fetchone()
+        want = c.get("site_state")
+        if prev is None:
+            self.conn.execute(
+                "INSERT INTO finding_site(id,finding_id,function_addr,site_addr,detail,"
+                "created_at,state,confidence,verdict) VALUES(?,?,?,?,?,?,?,?,?)",
+                (new_id(), fid, fa, sa, c.get("site_detail"), now, want,
+                 c.get("site_confidence"), c.get("site_verdict")))
+            return
+        keep = (want is not None
+                and _rank(FINDING_STATES, want) >= _rank(FINDING_STATES, prev["state"] or ""))
+        sets, args = [], []
+        for col, val in (("detail", c.get("site_detail")),
+                         ("verdict", c.get("site_verdict")),
+                         ("confidence", c.get("site_confidence"))):
+            if val is not None:
+                sets.append(f"{col}=?")
+                args.append(val)
+        if keep:
+            sets.append("state=?")
+            args.append(want)
+        if not sets:
+            return
+        self.conn.execute(f"UPDATE finding_site SET {', '.join(sets)} WHERE id=?",
+                          (*args, prev["id"]))
+
+    def proven_sites(self, target_id: str) -> dict:
+        """finding_id -> how many of its sites are individually proven.
+
+        The difference between "this defect is PoC-backed" and "one of its 99 occurrences is".
+        """
+        rows = self.conn.execute(
+            "SELECT fs.finding_id AS fid, COUNT(*) AS n FROM finding_site fs "
+            "JOIN finding f ON f.id=fs.finding_id WHERE f.target_id=? AND fs.state=? "
+            "GROUP BY fs.finding_id", (target_id, "poc-backed")).fetchall()
+        return {r["fid"]: r["n"] for r in rows}
+
+    def sites(self, finding_id: str) -> list[dict]:
+        """Every place this defect occurs, WORST FIRST.
+
+        Oldest-first was the only order available when a site was just an address; now that a
+        site carries a verdict, the proven occurrence belongs at the top rather than wherever
+        the decompiler happened to walk it.
+        """
+        rows = self.conn.execute(
+            "SELECT function_addr, site_addr, detail, state, confidence, verdict "
+            "FROM finding_site WHERE finding_id=? ORDER BY "
+            "  CASE state WHEN 'poc-backed' THEN 0 WHEN 'confirmed' THEN 1 "
+            "             WHEN 'corroborated' THEN 2 ELSE 3 END, "
+            "  COALESCE(confidence,0) DESC, created_at, rowid", (finding_id,)).fetchall()
+        return [{"function_addr": r["function_addr"], "site_addr": r["site_addr"],
+                 "detail": r["detail"], "state": r["state"],
+                 "confidence": r["confidence"], "verdict": r["verdict"]} for r in rows]
+
+    def _record_verdict(self, fid: str, c: dict, now: int) -> None:
+        """Store what THIS channel currently says about the finding.
+
+        A channel is identified by `channel`, falling back to `detector`. Within one run the
+        same channel speaks many times -- one candidate per site -- so those max-merge; a
+        LATER run replaces what the channel said before, which is what lets it revise itself
+        downward. Without the run check, nine sites of one sink would leave whichever was
+        written last, rather than the strongest.
+        """
+        chan = c.get("channel") or c.get("detector") or "?"
+        run_id = c.get("run_id")
+        state = c.get("state", "candidate")
+        severity = c.get("severity", "info")
+        confidence = float(c.get("confidence", 0.0) or 0.0)
+        prev = self.conn.execute(
+            "SELECT * FROM finding_verdict WHERE finding_id=? AND channel=?",
+            (fid, chan)).fetchone()
+        if prev is not None and (run_id is None or prev["run_id"] == run_id):
+            state = FINDING_STATES[max(_rank(FINDING_STATES, prev["state"]),
+                                       _rank(FINDING_STATES, state))]
+            severity = SEVERITIES[max(_rank(SEVERITIES, prev["severity"]),
+                                      _rank(SEVERITIES, severity))]
+            confidence = max(prev["confidence"] or 0.0, confidence)
+        self.conn.execute(
+            "INSERT INTO finding_verdict(finding_id,channel,run_id,state,severity,confidence,"
+            "updated_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(finding_id,channel) DO UPDATE SET "
+            "run_id=excluded.run_id, state=excluded.state, severity=excluded.severity, "
+            "confidence=excluded.confidence, updated_at=excluded.updated_at",
+            (fid, chan, run_id, state, severity, confidence, now))
+
+    def _recompute(self, fid: str) -> tuple:
+        """The finding is the STRONGEST thing any channel currently says about it."""
+        rows = self.conn.execute(
+            "SELECT state, severity, confidence FROM finding_verdict WHERE finding_id=?",
+            (fid,)).fetchall()
+        if not rows:
+            return "candidate", "info", 0.0
+        state = FINDING_STATES[max(_rank(FINDING_STATES, r["state"]) for r in rows)]
+        severity = SEVERITIES[max(_rank(SEVERITIES, r["severity"]) for r in rows)]
+        # A finding with a working reproducer is not "low", whatever the rule that first
+        # spotted it guessed. jhead's proven out-of-bounds read carried the severity its
+        # pattern detector assigned -- low -- so the one finding in the report with a verified
+        # PoC was badged below unproven advisories. Severity here means demonstrated impact,
+        # and a PoC is the strongest evidence of it the platform can produce.
+        if state == "poc-backed" and _rank(SEVERITIES, severity) < _rank(SEVERITIES, "high"):
+            severity = "high"
+        return state, severity, max((r["confidence"] or 0.0) for r in rows)
+
+    def verdicts(self, finding_id: str) -> list[dict]:
+        """What each channel currently says -- the audit trail behind the finding's state."""
+        rows = self.conn.execute(
+            "SELECT channel, state, severity, confidence, updated_at FROM finding_verdict "
+            "WHERE finding_id=? ORDER BY channel", (finding_id,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def sites_by_target(self, target_id: str) -> dict:
+        """finding_id -> every (function_addr, site_addr) it occurs at, in one query.
+
+        Findings are deduped at DEFECT grain, so the row's own `site_addr` is just the first
+        occurrence. Anything matching a finding against an address -- crash attribution, for
+        one -- has to look here or it silently sees one site out of dozens.
+        """
+        rows = self.conn.execute(
+            "SELECT fs.finding_id, fs.function_addr, fs.site_addr FROM finding_site fs "
+            "JOIN finding f ON f.id = fs.finding_id WHERE f.target_id=? "
+            "ORDER BY fs.created_at, fs.rowid", (target_id,)).fetchall()
+        out: dict = {}
+        for r in rows:
+            out.setdefault(r["finding_id"], []).append(
+                {"function_addr": r["function_addr"], "site_addr": r["site_addr"]})
+        return out
+
+    def site_counts(self, target_id: str) -> dict:
+        """finding id -> number of recorded sites, for the whole target in one query."""
+        rows = self.conn.execute(
+            "SELECT f.id AS fid, COUNT(s.id) AS n FROM finding f "
+            "LEFT JOIN finding_site s ON s.finding_id = f.id "
+            "WHERE f.target_id=? GROUP BY f.id", (target_id,)).fetchall()
+        return {r["fid"]: int(r["n"]) for r in rows}
 
     def list_by_target(self, target_id: str) -> list[Finding]:
         rows = self.conn.execute(
@@ -543,7 +806,7 @@ class FindingDAO(BaseDAO):
         return int(r["c"])
 
     @staticmethod
-    def _row(r) -> Finding:
+    def _row(r: sqlite3.Row) -> Finding:
         return Finding(id=r["id"], target_id=r["target_id"], case_id=r["case_id"],
                        dedup_key=r["dedup_key"], created_at=r["created_at"],
                        updated_at=r["updated_at"], cwe=r["cwe"], title=r["title"],
@@ -552,22 +815,57 @@ class FindingDAO(BaseDAO):
                        detector=r["detector"], evidence=loads(r["evidence_json"]) or [])
 
 
+def _opt_col(row: sqlite3.Row, name: str) -> Any:
+    """A column that older rows predate. sqlite3.Row raises rather than returning None."""
+    try:
+        return row[name]
+    except (IndexError, KeyError):
+        return None
+
+
 # ------------------------------------------------------------------ DynResult (Phase 4)
 class DynResultDAO(BaseDAO):
-    def insert(self, target_id: str, case_id: str, *, run_id=None, input_sha=None,
-               input_mode=None, argv=None, exit_code=None, signal=None, signal_name=None,
-               crashed=False, timed_out=False, isolation=None, duration_ms=None,
-               stdout_sha=None, stderr_sha=None, note=None) -> str:
+    def insert(self, target_id: str, case_id: str, *, run_id: Optional[str] = None,
+               input_sha: Optional[str] = None,
+               input_mode: Optional[str] = None, argv: Optional[list] = None,
+               exit_code: Optional[int] = None, signal: Optional[int] = None,
+               signal_name: Optional[str] = None, crashed: bool = False,
+               timed_out: bool = False, isolation: Optional[str] = None,
+               duration_ms: Optional[int] = None, stdout_sha: Optional[str] = None,
+               stderr_sha: Optional[str] = None, note: Optional[str] = None,
+               fault_pc: Optional[int] = None, defect_key: Optional[str] = None) -> str:
         rid = new_id()
         self.conn.execute(
             "INSERT INTO dyn_result(id,target_id,case_id,run_id,input_sha,input_mode,argv,"
             "exit_code,signal,signal_name,crashed,timed_out,isolation,duration_ms,"
-            "stdout_sha,stderr_sha,note,created_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "stdout_sha,stderr_sha,note,fault_pc,defect_key,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (rid, target_id, case_id, run_id, input_sha, input_mode, dumps(argv),
              exit_code, signal, signal_name, as_int_bool(crashed), as_int_bool(timed_out),
-             isolation, duration_ms, stdout_sha, stderr_sha, note, _now()))
+             isolation, duration_ms, stdout_sha, stderr_sha, note, fault_pc, defect_key, _now()))
         return rid
+
+    def fault_pc_for(self, target_id: str, input_sha: str) -> Optional[int]:
+        """Where this input faulted, as recorded by the run that found it.
+
+        Every stage that files a crash finding has to derive the SAME dedup key, or a verified
+        PoC files a second finding beside the crash it just proved instead of promoting it.
+        """
+        r = self.conn.execute(
+            "SELECT fault_pc FROM dyn_result WHERE target_id=? AND input_sha=? "
+            "AND fault_pc IS NOT NULL ORDER BY created_at DESC LIMIT 1",
+            (target_id, input_sha)).fetchone()
+        return int(r["fault_pc"]) if r and r["fault_pc"] is not None else None
+
+    def defect_key_for(self, target_id: str, input_sha: str) -> Optional[str]:
+        """The sanitizer-defect discriminator for this input's crash (ASan class+source), or None.
+        Read by every stage that files/looks-up a SIGABRT crash finding so they agree on the key
+        that separates two distinct sanitizer defects which both abort. Mirrors fault_pc_for."""
+        r = self.conn.execute(
+            "SELECT defect_key FROM dyn_result WHERE target_id=? AND input_sha=? "
+            "AND defect_key IS NOT NULL ORDER BY created_at DESC LIMIT 1",
+            (target_id, input_sha)).fetchone()
+        return r["defect_key"] if r and r["defect_key"] is not None else None
 
     def list_by_target(self, target_id: str) -> list[DynResult]:
         rows = self.conn.execute(
@@ -581,21 +879,25 @@ class DynResultDAO(BaseDAO):
         return int(r["c"])
 
     @staticmethod
-    def _row(r) -> DynResult:
+    def _row(r: sqlite3.Row) -> DynResult:
         return DynResult(id=r["id"], target_id=r["target_id"], case_id=r["case_id"],
                          created_at=r["created_at"], run_id=r["run_id"],
                          input_sha=r["input_sha"], input_mode=r["input_mode"],
                          argv=loads(r["argv"]), exit_code=r["exit_code"], signal=r["signal"],
-                         signal_name=r["signal_name"], crashed=as_bool(r["crashed"]),
-                         timed_out=as_bool(r["timed_out"]), isolation=r["isolation"],
+                         signal_name=r["signal_name"], crashed=as_flag(r["crashed"]),
+                         timed_out=as_flag(r["timed_out"]), isolation=r["isolation"],
                          duration_ms=r["duration_ms"], stdout_sha=r["stdout_sha"],
-                         stderr_sha=r["stderr_sha"], note=r["note"])
+                         stderr_sha=r["stderr_sha"], note=r["note"],
+                         fault_pc=_opt_col(r, "fault_pc"),
+                         defect_key=_opt_col(r, "defect_key"))
 
 
 # ------------------------------------------------------------------------ Poc (Phase 6)
 class PocDAO(BaseDAO):
-    def insert(self, target_id, case_id, *, finding_id=None, level=None, verified=False,
-               signal_name=None, input_sha=None, bundle_sha=None) -> str:
+    def insert(self, target_id: str, case_id: str, *, finding_id: Optional[str] = None,
+               level: Optional[str] = None, verified: bool = False,
+               signal_name: Optional[str] = None, input_sha: Optional[str] = None,
+               bundle_sha: Optional[str] = None) -> str:
         rid = new_id()
         self.conn.execute(
             "INSERT INTO poc(id,target_id,case_id,finding_id,level,verified,signal_name,"
@@ -606,24 +908,23 @@ class PocDAO(BaseDAO):
 
     def set_finding(self, poc_id: str, finding_id: str) -> None:
         self.conn.execute("UPDATE poc SET finding_id=? WHERE id=?", (finding_id, poc_id))
-        self.conn.commit()
 
-    def list_by_target(self, target_id) -> list[Poc]:
+    def list_by_target(self, target_id: str) -> list[Poc]:
         rows = self.conn.execute(
             "SELECT * FROM poc WHERE target_id=? ORDER BY created_at DESC", (target_id,)
         ).fetchall()
         return [self._row(r) for r in rows]
 
-    def count_by_target(self, target_id) -> int:
+    def count_by_target(self, target_id: str) -> int:
         r = self.conn.execute("SELECT COUNT(*) AS c FROM poc WHERE target_id=?",
                               (target_id,)).fetchone()
         return int(r["c"])
 
     @staticmethod
-    def _row(r) -> Poc:
+    def _row(r: sqlite3.Row) -> Poc:
         return Poc(id=r["id"], target_id=r["target_id"], case_id=r["case_id"],
                    created_at=r["created_at"], finding_id=r["finding_id"], level=r["level"],
-                   verified=as_bool(r["verified"]), signal_name=r["signal_name"],
+                   verified=as_flag(r["verified"]), signal_name=r["signal_name"],
                    input_sha=r["input_sha"], bundle_sha=r["bundle_sha"])
 
 
@@ -658,7 +959,7 @@ class ComponentEdgeDAO(BaseDAO):
         return int(r["c"])
 
     @staticmethod
-    def _row(r) -> ComponentEdge:
+    def _row(r: sqlite3.Row) -> ComponentEdge:
         return ComponentEdge(id=r["id"], case_id=r["case_id"], src_target=r["src_target"],
                              dst_target=r["dst_target"], created_at=r["created_at"],
                              kind=r["kind"], symbol=r["symbol"], detail=r["detail"])

@@ -14,14 +14,22 @@ the input does not parse.
 """
 from __future__ import annotations
 
+import logging
+import re
 import struct
+import zlib
 
 from .mutator import Mutator
+
+_log = logging.getLogger(__name__)
 
 _INT = {"u8": (1, "B"), "u16": (2, "H"), "u32": (4, "I"), "u64": (8, "Q")}
 # values that break length/count fields: zero, off-by-one, and huge (overflow/overread)
 _EDGE = [0, 1, 63, 64, 65, 127, 128, 255, 256, 1024, 4096, 0x7FFFFFFF, 0xFFFFFFFF]
+# offsets a parser will happily add to a base pointer and then read from
+_FAR = [0, 1, 0x40, 0xFF, 0x100, 0xFFFF, 0x10000, 0x00FFFFFF, 0x7FFFFFFF, 0xFFFFFFF0, 0xFFFFFFFF]
 _MAXBLOB = 8192
+_MAXREC = 4096          # an array's count field is attacker data: parse it, but bound it
 
 
 def _as_bytes(v):
@@ -43,8 +51,19 @@ class FormatModel:
         self.spec = spec
 
     def parse(self, data: bytes):
-        pos, fields = 0, []
-        for f in self.spec:
+        fields, _pos = self._parse_spec(self.spec, data, 0)
+        return fields
+
+    def _parse_spec(self, spec, data: bytes, pos: int, covered=None):
+        """Parse one SCOPE. Groups and arrays recurse, so a format inside a format is fields
+        rather than opaque bytes -- which is what lets a mutation change one of them and leave
+        every other field intact."""
+        fields: list = []
+        # Shared with nested scopes: a PNG chunk's length sits OUTSIDE the group its data is
+        # in, so a scope-local map left the blob unbounded and it swallowed the whole file.
+        covered = {} if covered is None else covered
+        seen: dict = {}                  # name -> value, for an array's count field
+        for f in spec:
             t = f["type"]
             if t == "magic":
                 v = _as_bytes(f["value"])
@@ -55,12 +74,86 @@ class FormatModel:
                 end = "<" if f.get("endian", "little") == "little" else ">"
                 raw = data[pos:pos + sz]
                 val = struct.unpack(end + code, raw.ljust(sz, b"\0"))[0] if raw else 0
+                cov = f.get("covers")
+                if cov and cov != "rest":
+                    covered[cov] = (val, pos)
+                ln = f.get("length_of")
+                if ln and ln not in covered:
+                    # `length_of` sizes the blob exactly, where `covers` spans from the length
+                    # field itself. Both have to bound the blob on the way back IN, or the
+                    # blob eats the remainder and nothing can follow it -- a GIF's sub-block
+                    # is followed by the block terminator and the trailer, which is what
+                    # decides whether the file is a GIF at all.
+                    covered[ln] = (val, None)
+                seen[f.get("name")] = val
                 fields.append({"f": f, "val": val})
                 pos += sz
-            else:                                       # blob: take the remainder
-                fields.append({"f": f, "val": data[pos:]})
-                pos = len(data)
-        return fields
+            elif t == "shadow":
+                # Bytes that exist for DERIVATION and are never written: a ZIP stores the CRC
+                # of the UNCOMPRESSED data, which appears nowhere in the file. Without this a
+                # checksum field can only name bytes the format happens to contain.
+                fields.append({"f": f, "val": _as_bytes(f.get("seed_value", b""))})
+            elif t == "group":
+                sub, pos = self._parse_spec(f["spec"], data, pos, covered)
+                fields.append({"f": f, "val": sub})
+            elif t == "array":
+                # However many the count field claims -- but only as many as the data holds. A
+                # count that outruns its own records is a mutation worth making, not a reason
+                # to give up on the input.
+                want = min(int(seen.get(f.get("count"), 0) or 0), _MAXREC)
+                recs = []
+                for _ in range(want):
+                    if pos >= len(data):
+                        break
+                    sub, nxt = self._parse_spec(f["spec"], data, pos, covered)
+                    if nxt > len(data):
+                        break
+                    recs.append(sub)
+                    pos = nxt
+                fields.append({"f": f, "val": recs})
+            else:
+                # A blob NAMED by a length field ends where that length says, so the fields
+                # after it can be parsed. Without this every blob ate the remainder, so a
+                # model could describe at most one variable region -- which is not enough for
+                # a real container: a JPEG's EXIF segment is followed by the frame and scan
+                # headers that decide whether the file parses at all.
+                name = f.get("name")
+                # An explicit length field is authoritative and caps the blob even when a
+                # delimiter or size_from is ALSO present: a belt-and-suspenders shape (a length
+                # AND a terminator) must never overrun the declared region, so `until`/
+                # `size_from` may only end the blob EARLIER, never later, than the length says.
+                cap = len(data)
+                if name in covered:
+                    total, start = covered[name]
+                    # `length_of` sizes the blob from its own start; `covers` spans from the
+                    # length field itself, so the blob ends at that field's start plus the span
+                    cap = pos + int(total) if start is None else max(start + int(total), pos)
+                    cap = min(max(cap, pos), len(data))
+                if f.get("until") is not None:
+                    # A blob that ends at a DELIMITER rather than at a length. H.264 in
+                    # Annex-B framing has no length field at all -- a NAL unit runs until the
+                    # next 00 00 00 01 start code -- and without this the first NAL body ate
+                    # the whole stream, so the model described three NAL units and the
+                    # mutator could only ever reach the first one's header.
+                    delim = _as_bytes(f["until"])
+                    nxt = data.find(delim, pos, cap) if delim else -1
+                    stop = nxt if nxt >= 0 else cap
+                elif f.get("size_from"):
+                    # A blob whose length lives in part of ANOTHER field: RTP's CSRC list is
+                    # four bytes per unit of CC, and CC is the low nibble of byte 0. `covers`
+                    # and `length_of` both need a whole integer field to point at, so a count
+                    # packed into a bitfield -- which is most of how binary network protocols
+                    # are shaped -- could not be expressed at all.
+                    sf = f["size_from"]
+                    raw = int(seen.get(sf.get("field")) or 0)
+                    n = ((raw >> int(sf.get("shift", 0))) & int(sf.get("mask", 0xFFFFFFFF))
+                         ) * int(sf.get("scale", 1))
+                    stop = min(pos + max(n, 0), cap)
+                else:
+                    stop = cap
+                fields.append({"f": f, "val": data[pos:stop]})
+                pos = stop
+        return fields, pos
 
     def serialize(self, fields) -> bytes:
         out = bytearray()
@@ -72,9 +165,216 @@ class FormatModel:
                 sz, code = _INT[t]
                 end = "<" if f.get("endian", "little") == "little" else ">"
                 out += struct.pack(end + code, int(fd["val"]) & ((1 << (sz * 8)) - 1))
+            elif t == "shadow":
+                continue
+            elif t == "group":
+                out += self.serialize(fd["val"])
+            elif t == "array":
+                for rec in fd["val"]:
+                    out += self.serialize(rec)
             else:
                 out += _as_bytes(fd["val"] or b"")
         return bytes(out)
+
+
+def _serialize_field(model, fd) -> bytes:
+    """The bytes one field contributes, whether it is a leaf, a group or an array."""
+    t = fd["f"]["type"]
+    if t == "shadow":
+        return _as_bytes(fd["val"] or b"")
+    if t == "group":
+        return model.serialize(fd["val"])
+    if t == "array":
+        return b"".join(model.serialize(rec) for rec in fd["val"])
+    return model.serialize([fd])
+
+
+def _layout(model, fields, pos=0, out=None, names=None):
+    """Absolute (offset, length) of every field, including nested ones, plus a name index.
+
+    Derived fields have to be computed over the whole tree, not one scope: a ZIP's central
+    directory entry names a size that lives in the local header, and the end-of-central-
+    directory record names an offset into the file, not into its own group.
+    """
+    out = {} if out is None else out
+    names = {} if names is None else names
+    for fd in fields:
+        t, start = fd["f"]["type"], pos
+        if t == "group":
+            _, _, pos = _layout(model, fd["val"], pos, out, names)
+        elif t == "array":
+            for rec in fd["val"]:
+                _, _, pos = _layout(model, rec, pos, out, names)
+        elif t == "shadow":
+            pass                                       # occupies no bytes in the output
+        else:
+            pos += len(model.serialize([fd]))
+        out[id(fd)] = (start, pos - start)
+        nm = fd["f"].get("name")
+        if nm and nm not in names:
+            names[nm] = fd
+    return out, names, pos
+
+
+def _every_field(fields):
+    for fd in fields:
+        yield fd
+        t = fd["f"]["type"]
+        if t == "group":
+            yield from _every_field(fd["val"])
+        elif t == "array":
+            for rec in fd["val"]:
+                yield from _every_field(rec)
+
+
+def _fix_covers(model, fields, lengths: bool = False) -> None:
+    """Recompute every derived field so the structure stays parseable.
+
+    `covers: "rest"` spans to the end of the input; `covers: <field>` spans from the length
+    field's own start through the end of that field, which is what a JPEG segment length
+    actually means; `offset_of: <field>` is where that field starts, which is how every
+    archive format finds its directory.
+
+    `length_of` is recomputed only when generating a SEED. During mutation a length that no
+    longer matches what it sizes is the whole point -- driving it is how a length-prefixed
+    parser gets tested -- so the fixup must not quietly put it back.
+    """
+    for _ in range(2):            # an offset depends on lengths that may themselves have moved
+        spans, names, total = _layout(model, fields)
+        for fd in _every_field(fields):
+            f = fd["f"]
+            if f["type"] not in _INT:
+                continue
+            # A format that checksums its own chunks cannot be fuzzed blind: a parser rejects
+            # a bad CRC before reading anything else, so every mutation is thrown away at the
+            # door. Derived like a length, and drivable for the same reason -- a deliberately
+            # wrong checksum is its own test.
+            crc = f.get("crc32_of")
+            if crc:
+                mate = names.get(crc)
+                if mate is not None:
+                    fd["val"] = zlib.crc32(_serialize_field(model, mate)) & 0xFFFFFFFF
+                continue
+            target = f.get("offset_of") or (f.get("length_of") if lengths else None)
+            if target:
+                mate = names.get(target)
+                if mate is not None:
+                    off, ln = spans[id(mate)]
+                    fd["val"] = off if f.get("offset_of") else ln
+                continue
+            cov = f.get("covers")
+            if not cov:
+                continue
+            start = spans[id(fd)][0]
+            if cov == "rest":
+                stop = total
+            else:
+                mate = names.get(cov)
+                if mate is None:
+                    continue
+                stop = sum(spans[id(mate)])
+            fd["val"] = max(0, stop - start)
+
+
+def seed_for_name(name: str) -> bytes | None:
+    """A valid seed for a builtin, using that format's own tail when it declares one."""
+    entry = _BUILTINS.get(name)
+    if not entry:
+        return None
+    model = FormatModel([dict(f) for f in entry["spec"]])
+    seed = entry.get("seed")
+    return seed_for(model, seed if seed is not None else b"A" * 64,
+                    tail=entry.get("tail"))
+
+
+def _seed_spec(spec, payload):
+    """A seed for one scope, returning its fields and the blobs in it (outermost first)."""
+    fields: list = []
+    blobs: list = []
+    for f in spec:
+        t = f["type"]
+        if t == "magic":
+            fields.append({"f": f, "val": _as_bytes(f["value"])})
+        elif t in _INT:
+            # A count that must agree with the seed's own payload -- an IFD entry count of 0
+            # alongside one entry is rejected before the parser reaches anything interesting.
+            fields.append({"f": f, "val": f.get("seed_value", 0)})
+        elif t == "shadow":
+            fields.append({"f": f, "val": _as_bytes(f.get("seed_value", b""))})
+        elif t == "group":
+            sub, sub_blobs = _seed_spec(f["spec"], payload)
+            fields.append({"f": f, "val": sub})
+            blobs += sub_blobs
+        elif t == "array":
+            # Records differ from one another -- two IFD entries are two different tags -- so
+            # the model names each one's field values rather than repeating a single template.
+            recs = []
+            for values in f.get("seed_records") or []:
+                sub, sub_blobs = _seed_spec(f["spec"], payload)
+                for fd in sub:
+                    if fd["f"].get("name") in values:
+                        fd["val"] = values[fd["f"]["name"]]
+                recs.append(sub)
+                blobs += sub_blobs
+            fields.append({"f": f, "val": recs})
+        else:
+            # the LAST blob gets the format's tail when it declares one (a JPEG's entropy data
+            # and end-of-image marker); earlier blobs get the payload, unless the model gives
+            # one its own value -- a ZIP's "extra field" and comment have to start EMPTY, or
+            # their length fields describe bytes the format says are not there
+            if "seed_value" in f:
+                val = f["seed_value"]
+            elif f.get("size_from"):
+                # its length is whatever the seeded count field says, which for a baseline is
+                # zero -- handing it the payload would contradict the count and the parser
+                # would reject the seed it was given to start from
+                val = b""
+            else:
+                val = payload
+            fields.append({"f": f, "val": _as_bytes(val)})
+            if "seed_value" not in f and not f.get("size_from"):
+                blobs.append(fields[-1])
+    return fields, blobs
+
+
+def seed_for(model: "FormatModel", payload: bytes = b"A" * 64, tail: bytes = None) -> bytes:
+    """A minimal input the format's own gate accepts.
+
+    The model already declares the magic and which integer sizes which blob, so a valid
+    skeleton falls straight out of `serialize` -- there is no need for an analyst to attach a
+    sample before a campaign can start doing work.
+    """
+    fields, blobs = _seed_spec(model.spec, payload)
+
+    # `covers: "rest"` is the other length shape real formats use: a JPEG segment length spans
+    # the length field itself and everything after it, not one named blob. Getting it wrong is
+    # not cosmetic -- the parser reads a short segment and treats the remainder as padding,
+    # so the seed never reaches the structure the rest of the model describes.
+    if tail is not None and blobs:
+        blobs[-1]["val"] = tail
+    _fix_covers(model, fields, lengths=True)
+    return model.serialize(fields)
+
+
+def _scopes(fields):
+    """Every scope in a parsed input: the top level, and each group and array record.
+
+    A mutation picks a scope and then a field in it, so a leaf buried in a sub-structure is as
+    reachable as a top-level one -- and, crucially, changing it leaves every other field
+    exactly as it was. Byte havoc over the same bytes cannot do that: measured on jhead, it
+    produced the value that triggers the bug 259 times in 20,000 mutations and crashed on none
+    of them, because the same havoc wrecked the surrounding directory and the parser gave up
+    before reaching the code that reads the value.
+    """
+    out = [fields]
+    for fd in fields:
+        t = fd["f"]["type"]
+        if t == "group":
+            out += _scopes(fd["val"])
+        elif t == "array":
+            for rec in fd["val"]:
+                out += _scopes(rec)
+    return out
 
 
 class StructMutator:
@@ -89,15 +389,62 @@ class StructMutator:
         try:
             fields = self.model.parse(data or b"")
         except Exception:
+            _log.debug("struct-mutate: model.parse failed; falling back to byte havoc",
+                       exc_info=True)
             return self.byte.mutate(data, corpus)
         if not fields:
             return self.byte.mutate(data, corpus)
-        for _ in range(self.rng.randint(1, 3)):
-            self._mutate_field(fields)
+        # The whole mutate-and-serialize path degrades to byte havoc on any error, not just a
+        # serialize failure: a field-driver on an analyst-supplied spec can hit an edge the
+        # model did not anticipate, and one bad draw must not take the campaign down with it.
         try:
+            drove_cover = False
+            scopes = _scopes(fields)
+            for _ in range(self.rng.randint(1, 3)):
+                drove_cover |= self._mutate_field(self.rng.choice(scopes)) == "cover"
+            if not drove_cover:
+                # Keep "covers: rest" lengths honest unless this round deliberately drove one.
+                # A segment length that no longer spans the segment is not a bug the parser will
+                # chase: it reads a short segment and discards the mutated tail as padding, so
+                # every other mutation in the round is thrown away before it is ever parsed.
+                _fix_covers(self.model, fields)
             return self.model.serialize(fields)
         except Exception:
+            _log.debug("struct-mutate: field mutate/serialize failed; falling back to byte havoc",
+                       exc_info=True)
             return self.byte.mutate(data, corpus)
+
+    def _drive_pair(self, fields, fd, role):
+        """Drive a record's offset and size TOGETHER.
+
+        A parser that reads `size` bytes from `base + offset` usually checks the pair first,
+        and the check is where the bug is: computing `offset + size` in the field's own width
+        wraps, so a sum that looks tiny passes while the offset still points far outside the
+        buffer. That is jhead's GPS read -- 0x00ffffff + 0xff000002 is 1 in 32 bits -- and
+        neither half does it alone: a huge size is refused, a far offset is refused, and only
+        the pair gets through. Guessing both independently effectively never lands it, so the
+        complementary value is CONSTRUCTED.
+        """
+        mate = next((x for x in fields
+                     if x["f"].get("role") == ("offset" if role == "size" else "size")
+                     and x is not fd), None)
+        if mate is None:
+            return
+        off_fd, siz_fd = (fd, mate) if role == "offset" else (mate, fd)
+        width = min(_INT[off_fd["f"]["type"]][0], _INT[siz_fd["f"]["type"]][0]) * 8
+        mask = (1 << width) - 1
+        # Candidates for the wrap-the-sum attack: a far offset that still fits the field. For a
+        # narrow field (u8/u16) `mask <= 0xFFFF` and there are none, so `rng.choice([])` would
+        # raise -- take the plain far/edge branch instead of driving an empty choice.
+        far = [x for x in _FAR if 0xFFFF < x <= mask]
+        if far and self.rng.random() < 0.5:
+            off = self.rng.choice(far) & mask
+            # the wrapped sum has to survive the check too, so aim it just past zero
+            off_fd["val"] = off
+            siz_fd["val"] = (mask + 1 - off + self.rng.choice((0, 1, 2, 4, 8, 16))) & mask
+        else:
+            off_fd["val"] = self.rng.choice(_FAR) & mask
+            siz_fd["val"] = self.rng.choice(_EDGE) & mask
 
     def _blob_by_name(self, fields, name):
         return next((fd for fd in fields if fd["f"].get("name") == name), None)
@@ -105,15 +452,31 @@ class StructMutator:
     def _mutate_field(self, fields):
         fd = self.rng.choice(fields)
         t = fd["f"]["type"]
+        if t in ("group", "array"):
+            return None                                 # its own fields are a scope of their own
         if t == "magic":
             if self.rng.random() < 0.08:               # usually KEEP so the format gate passes
                 fd["val"] = self.byte.mutate(fd["val"] or b"", ())
         elif t in _INT:
             fd["val"] = self.rng.choice(_EDGE)
+            if (fd["f"].get("covers") == "rest" or fd["f"].get("offset_of")
+                    or fd["f"].get("crc32_of")):
+                return "cover"                          # driving it IS the interesting case
+            # A record that says WHERE data is and HOW MUCH of it there is is the classic
+            # out-of-bounds read, and it needs both halves at once: jhead survives a GPS entry
+            # with a four-billion-byte count, and survives one pointing off the end of the
+            # segment, but reading that many bytes FROM there walks off the mapping. Driving
+            # one field at a time never lands both, so the roles are declared and driven
+            # together -- the same coordination `length_of` already does for a sized blob.
+            role = fd["f"].get("role")
+            if role in ("size", "offset") and self.rng.random() < 0.6:
+                self._drive_pair(fields, fd, role)
             target = fd["f"].get("length_of")
             if target and self.rng.random() < 0.6:      # coordinate: grow the sized blob to match
+                # a length can now name a GROUP as well -- a ZIP's central-directory size --
+                # and a group's value is its fields, not bytes, so there is nothing to grow
                 blob = self._blob_by_name(fields, target)
-                if blob is not None:
+                if blob is not None and blob["f"]["type"] not in ("group", "array"):
                     want = min(int(fd["val"]), _MAXBLOB)
                     base = bytes(blob["val"] or b"A")
                     blob["val"] = (base * (want // max(1, len(base)) + 1))[:want] if want else base
@@ -122,22 +485,443 @@ class StructMutator:
 
 
 # a few ready-made models (analyst can also pass a custom spec)
+# A model is a spec plus the printable tokens that betray a parser for it in a binary's
+# strings. Byte magic (0xFFD8) never survives into a string table; the format's textual
+# markers do, which is what makes auto-detection possible at all.
+def _jpeg_frame():
+    """DQT + SOF0 + DHT + SOS: the smallest tail that makes jhead call the file complete."""
+    def seg(marker, body):
+        return b"\xff" + bytes([marker]) + struct.pack(">H", len(body) + 2) + body
+    dqt = seg(0xDB, b"\x00" + bytes(range(1, 65)))
+    sof0 = seg(0xC0, b"\x08" + struct.pack(">HH", 8, 8) + b"\x01" + b"\x01\x11\x00")
+    dht = seg(0xC4, b"\x00" + bytes(16))
+    sos = seg(0xDA, b"\x01" + b"\x01\x00" + b"\x00\x3f\x00")
+    return dqt + sof0 + dht + sos
+
+
+_JPEG_FRAME = _jpeg_frame()
+
+
+# Offsets inside an EXIF payload are relative to the TIFF header, which the model emits as a
+# magic: an 8-byte header, then IFD0 starts at offset 8 -- exactly where the model's `nent`
+# field sits. Everything after it follows from the entry counts the seed declares.
+_IFD0_OFF = 8
+_GPS_OFF = _IFD0_OFF + 2 + 12 + 4                 # count + one entry (the GPS pointer) + next
+_RAT_OFF = _GPS_OFF + 2 + 12 * 2 + 4              # count + two entries + next
+_RATIONALS = b"".join(struct.pack("<II", n, d) for n, d in ((51, 1), (30, 1), (0, 1)))
+# A ZIP whose only entry is STORED never reaches the decompressor, and unzip is mostly
+# decompressor: the campaign covered 1,162 of 3,705 blocks and found nothing. This is a real
+# raw-deflate stream, so method 8 is exercised, and with the CRC derived `unzip -t` verifies
+# it instead of stopping at "bad CRC".
+_ZIP_PLAIN = b"lykos test payload, compressible compressible compressible\n"
+
+
+def _deflate(data: bytes) -> bytes:
+    c = zlib.compressobj(9, zlib.DEFLATED, -15)        # raw: no zlib header, as ZIP stores it
+    return c.compress(data) + c.flush()
+
+
+_ZIP_DEFLATED = _deflate(_ZIP_PLAIN)
+
+# A one-pixel GIF never runs the LZW decoder, which is most of what a GIF reader IS: the
+# campaign covered 377 of gif2rgb's 1,340 blocks. This is a real 16x16 image -- four-entry
+# colour table, a genuine compressed stream -- so decoding actually happens.
+_GIF_GCT = b"\x00\x00\x00\xff\xff\xff\x00\x00\x00\x00\x00\x00"
+_GIF_LZW_MIN = 8
+_GIF_LZW = (b"\x00\x01\x08\x1cH\xb0\xa0\xc1\x83\x08\x13*\\\xc8\xb0\xa1\xc3\x87\t\x03"
+            b"\x00\x90Hq\xa2\xc5\x8a\x18/j\xcc\xc8q\xa3\xc7\x8e ?\x8a\x0cIr\xe4\xc6\x80")
+
+_PNG_IHDR = struct.pack(">IIBBBBB", 1, 1, 8, 0, 0, 0, 0)
+_PNG_IDAT = zlib.compress(b"\x00\x00")      # one filter byte + one greyscale pixel
+
+_IFD_ENTRY = [{"type": "u16", "endian": "little", "name": "tag"},
+              {"type": "u16", "endian": "little", "name": "fmt"},
+              {"type": "u32", "endian": "little", "name": "count", "role": "size"},
+              {"type": "u32", "endian": "little", "name": "value", "role": "offset"}]
+
+
+
 _BUILTINS = {
     # generic "magic + u32-LE length + payload" container (matches many toy/real headers)
-    "lv32": [{"type": "magic", "value": "\x00"},        # placeholder magic, override via params
-             {"type": "u32", "endian": "little", "name": "len", "length_of": "data"},
-             {"type": "blob", "name": "data"}],
-    # PNG: 8-byte signature, then the mutator drives the first chunk's length/type
-    "png": [{"type": "magic", "value": b"\x89PNG\r\n\x1a\n"},
-            {"type": "u32", "endian": "big", "name": "clen", "length_of": "cdata"},
-            {"type": "magic", "value": "IHDR"},
-            {"type": "blob", "name": "cdata"}],
+    "lv32": {"tokens": (), "spec": [
+        {"type": "magic", "value": "\x00"},          # placeholder magic, override via params
+        {"type": "u32", "endian": "little", "name": "len", "length_of": "data"},
+        {"type": "blob", "name": "data"}]},
+    # PNG: every chunk is length + type + data + CRC32 over type AND data, and a decoder
+    # checks the CRC before it reads anything -- so a model that stops at the signature
+    # generates a file that is rejected at the door. The chunk body is a GROUP precisely so
+    # the checksum can name it.
+    "png": {"tokens": ("IHDR", "IEND", "PNG"), "spec": [
+        {"type": "magic", "value": b"\x89PNG\r\n\x1a\n"},
+        {"type": "group", "name": "ihdr", "spec": [
+            {"type": "u32", "endian": "big", "name": "ihdr_len", "length_of": "ihdr_data"},
+            {"type": "group", "name": "ihdr_body", "spec": [
+                {"type": "magic", "value": b"IHDR"},
+                # 1x1, 8-bit greyscale, no interlace
+                {"type": "blob", "name": "ihdr_data", "seed_value": _PNG_IHDR}]},
+            {"type": "u32", "endian": "big", "name": "ihdr_crc", "crc32_of": "ihdr_body"}]},
+        {"type": "group", "name": "idat", "spec": [
+            {"type": "u32", "endian": "big", "name": "idat_len", "length_of": "idat_data"},
+            {"type": "group", "name": "idat_body", "spec": [
+                {"type": "magic", "value": b"IDAT"},
+                {"type": "blob", "name": "idat_data", "seed_value": _PNG_IDAT}]},
+            {"type": "u32", "endian": "big", "name": "idat_crc", "crc32_of": "idat_body"}]},
+        {"type": "group", "name": "iend", "spec": [
+            {"type": "u32", "endian": "big", "name": "iend_len", "length_of": "iend_data"},
+            {"type": "group", "name": "iend_body", "spec": [
+                {"type": "magic", "value": b"IEND"},
+                {"type": "blob", "name": "iend_data", "seed_value": b""}]},
+            {"type": "u32", "endian": "big", "name": "iend_crc", "crc32_of": "iend_body"}]}]},
+    # JPEG/EXIF: SOI + APP1, a BIG-endian segment length, then the Exif header the EXIF
+    # parsers key on. This is the shape jhead reads, and the length field is exactly the
+    # length-driven relationship the structure mutator exists to drive.
+    "jpeg": {"tokens": ("Exif", "JFIF", "JPEG"),
+             # The TIFF header and the IFD entry count are part of the GATE, not the payload:
+             # an EXIF reader rejects the file before either unless both are well formed, and
+             # the entry count is one of the most productive fields a parser fuzzer can drive.
+             "seed": _RATIONALS, "tail": b"\x00" * 8 + b"\xff\xd9",
+             "spec": [
+                 {"type": "magic", "value": b"\xff\xd8\xff\xe1"},
+                 # the APP1 length spans itself through the end of the EXIF payload, which is
+                 # also what bounds `gpsdata` on the way back in
+                 {"type": "u16", "endian": "big", "name": "seglen", "covers": "gpsdata"},
+                 {"type": "magic", "value": b"Exif\x00\x00"},
+                 {"type": "magic", "value": b"II*\x00\x08\x00\x00\x00"},
+                 # IFD0 and the GPS sub-directory it points at are FIELDS, not payload. As one
+                 # opaque blob the mutator could only flip bytes in them, which produces a
+                 # broken directory and a bad value at the same time -- and jhead rejects the
+                 # directory long before it reads the value. Described, a mutation changes one
+                 # entry's count and leaves every other field exactly as it was, which is the
+                 # single edit that crashes it.
+                 {"type": "u16", "endian": "little", "name": "nent", "seed_value": 1},
+                 {"type": "array", "name": "ifd0", "count": "nent", "spec": _IFD_ENTRY,
+                  "seed_records": [{"tag": 0x8825, "fmt": 4, "count": 1, "value": _GPS_OFF}]},
+                 {"type": "u32", "endian": "little", "name": "next_ifd"},
+                 {"type": "group", "name": "gps", "spec": [
+                     {"type": "u16", "endian": "little", "name": "ngps", "seed_value": 2},
+                     {"type": "array", "name": "gpsent", "count": "ngps", "spec": _IFD_ENTRY,
+                      "seed_records": [
+                          # GPSLatitudeRef: two ASCII bytes, "N", stored inline
+                          {"tag": 0x0001, "fmt": 2, "count": 2, "value": 0x4E},
+                          # GPSLatitude: three rationals, too big to inline, so an offset
+                          {"tag": 0x0002, "fmt": 5, "count": 3, "value": _RAT_OFF}]},
+                     {"type": "u32", "endian": "little", "name": "next_gps"}]},
+                 {"type": "blob", "name": "gpsdata"},
+                 # Everything past EXIF is what makes the file COMPLETE. jhead rejects a file
+                 # with no frame and scan header as "Unexpected end of file" and never reaches
+                 # ShowImageInfo -- 210 blocks, its largest function -- nor anything gated
+                 # behind an option, because those run downstream of a successful parse.
+                 # Measured minimum: SOF0 + SOS. DQT and DHT are not required but reach
+                 # process_DQT and process_DHT, another 69 blocks.
+                 {"type": "magic", "value": _JPEG_FRAME},
+                 {"type": "blob", "name": "scan"}]},
+    # GIF: the real block structure, not just the signature. A stub model (magic, width,
+    # height, payload) generates a seed the target rejects outright -- giflib's gif2rgb
+    # answers "Image of width or height 0" and stops -- so the campaign never reaches the
+    # decoder. This is a complete 35-byte GIF89a: screen descriptor, global colour table, an
+    # image descriptor and one LZW sub-block, which gif2rgb decodes.
+    "gif": {"tokens": ("GIF87a", "GIF89a"), "seed": _GIF_LZW,
+            "spec": [
+                {"type": "magic", "value": b"GIF89a"},
+                # the screen says how big the canvas is; the image descriptor says how big the
+                # image is, and a decoder that trusts one while indexing the other is the
+                # classic GIF bug -- so both are fields
+                {"type": "u16", "endian": "little", "name": "sw", "seed_value": 16},
+                {"type": "u16", "endian": "little", "name": "sh", "seed_value": 16},
+                # bit 7: a global colour table follows; bits 0-2 = 1 -> four entries
+                {"type": "u8", "name": "packed", "seed_value": 0x81},
+                {"type": "u8", "name": "bg"},
+                {"type": "u8", "name": "aspect"},
+                {"type": "magic", "value": _GIF_GCT},
+                {"type": "magic", "value": b"\x2c"},              # image separator
+                {"type": "u16", "endian": "little", "name": "left"},
+                {"type": "u16", "endian": "little", "name": "top"},
+                {"type": "u16", "endian": "little", "name": "iw", "seed_value": 16},
+                {"type": "u16", "endian": "little", "name": "ih", "seed_value": 16},
+                {"type": "u8", "name": "ipacked"},
+                {"type": "u8", "name": "lzwmin", "seed_value": _GIF_LZW_MIN},
+                {"type": "u8", "name": "blen", "length_of": "lzw"},
+                {"type": "blob", "name": "lzw"},
+                {"type": "magic", "value": b"\x00\x3b"}]},        # terminator + trailer
+    # NOT "BM": a two-character token matches as a substring of anything, and it picked BMP
+    # for unzip, which then fuzzed a ZIP tool with bitmaps. A format's token has to be a
+    # string only a parser for that format would carry.
+    # BMP: a file header whose `off` says where the pixels start and a DIB header that says
+    # how many there are. A decoder indexes pixels using width/height/bpp while trusting the
+    # offset, which is exactly the pair that goes wrong -- so both are fields.
+    # MPEG transport stream: the shape a multicast video receiver parses, and one where blind
+    # mutation is worse than useless. A TS packet is 188 bytes beginning with sync byte 0x47,
+    # and a parser drops anything that does not -- so byte mutation destroys the packet before
+    # any parsing code sees it. Measured on a receiver with a planted overflow: 60 executions
+    # over multicast produced 3 distinct behaviours and no crash, because almost every mutant
+    # was rejected at the sync byte.
+    #
+    # The field that matters is the adaptation-field length: it is one byte, it is chosen by
+    # the STREAM, and a receiver that trusts it copies that many bytes out of a 188-byte
+    # packet. Keeping the sync byte fixed and driving that length is the whole game.
+    # NOT "PAT"/"PMT": they are real MPEG-TS terms and useless as evidence, because a
+    # three-character substring matches anything. "PAT" hit "MAX_PATHS reached" and detected
+    # xmllint as a transport-stream parser -- which is worse than detecting nothing, since the
+    # campaign would then generate TS packets for an XML parser.
+    "mpegts": {"tokens": ("mpegts", "MPEG-TS", "adaptation_field", "transport_stream"),
+               "seed": b"\x00" * 164,
+               "spec": [
+                   {"type": "magic", "value": b"\x47"},          # sync byte: never mutate
+                   # transport_error / payload_unit_start / priority, then the 13-bit PID
+                   {"type": "u8", "name": "pid_hi", "seed_value": 0x00},
+                   {"type": "u8", "name": "pid_lo", "seed_value": 0x21},
+                   # scrambling control, adaptation_field_control, continuity counter
+                   {"type": "u8", "name": "afc", "seed_value": 0x20},
+                   {"type": "group", "name": "adaptation", "spec": [
+                       # The field the bug lives behind: one byte, chosen by the STREAM, and a
+                       # receiver that trusts it copies that many bytes out of a 188-byte
+                       # packet. `covers` lets the mutator keep it coherent most rounds and
+                       # deliberately drive it out of range on the others.
+                       {"type": "u8", "name": "af_len", "covers": "rest", "role": "size"},
+                       {"type": "u8", "name": "af_flags", "seed_value": 0x10},
+                       # PCR, when the flags say it is present: 33-bit base + extension,
+                       # carried as six bytes
+                       {"type": "u32", "endian": "big", "name": "pcr_base", "seed_value": 0},
+                       {"type": "u16", "endian": "big", "name": "pcr_ext", "seed_value": 0},
+                       {"type": "blob", "name": "af_stuffing"},
+                   ]},
+                   {"type": "blob", "name": "payload"},
+               ]},
+    # RTP (RFC 3550): the packet a network video receiver actually gets, and the one place
+    # the mpegts model does not reach -- an RTP receiver parses the RTP header BEFORE it ever
+    # sees a TS packet, so a bug in that header is hit first and by every stream.
+    #
+    # Two fields here are the classic shape: chosen by the sender, trusted by the receiver,
+    # and used as a count.
+    #   * CC, the low nibble of byte 0, says how many 4-byte CSRC identifiers follow. A
+    #     receiver that reads CC and then reads CC*4 bytes -- without checking them against
+    #     the datagram it actually received -- walks off the end. Byte 0 is a whole u8 here
+    #     rather than a bitfield because the spec language has no bitfields; mutating the
+    #     byte drives CC through its whole 0..15 range, which is the point.
+    #   * the extension length, which counts 32-bit WORDS of header extension.
+    #
+    # Both are `size_from` rather than `covers`, because both are counts in a unit that is
+    # not bytes -- four bytes per CC, four bytes per extension word -- and `covers` is bytes.
+    # `size_from` bounds the blob on the way back IN without forcing the field to agree on
+    # the way out, which is the whole point: the baseline stays a packet the receiver
+    # accepts, and the mutator is still free to drive the count past what the datagram holds.
+    # Without a bound the blob after each of them swallowed the rest of the packet, so the
+    # payload was unreachable and the extension fields only ever moved when something before
+    # them shifted.
+    #
+    # Seeded X=1 (byte 0 = 0x90) so the extension path is parsed at all, and PT=33/MP2T
+    # (byte 1 = 0x21) with a real TS packet as the payload, which is how video over RTP is
+    # carried in practice -- so a receiver that demuxes reaches its TS parser too.
+    "rtp": {"tokens": ("RTP/AVP", "rtpmap", "rtcp", "ssrc", "rtp"),
+            "seed": b"\x47\x00\x21\x10" + b"\x00" * 184,
+            "spec": [
+                # V=2, P=0, X=1, CC=0
+                {"type": "u8", "name": "v_p_x_cc", "seed_value": 0x90},
+                # M=0, PT=33 (MP2T)
+                {"type": "u8", "name": "m_pt", "seed_value": 0x21},
+                {"type": "u16", "endian": "big", "name": "seq", "seed_value": 1},
+                {"type": "u32", "endian": "big", "name": "timestamp", "seed_value": 0},
+                {"type": "u32", "endian": "big", "name": "ssrc", "seed_value": 0xDEADBEEF},
+                # present only when CC > 0; the mutator grows this as it drives byte 0
+                # four bytes per unit of CC, which is the low nibble of byte 0
+                {"type": "blob", "name": "csrc",
+                 "size_from": {"field": "v_p_x_cc", "mask": 0x0F, "scale": 4}},
+                {"type": "group", "name": "ext", "spec": [
+                    # 0xBEDE: the one-byte-header extension profile of RFC 5285
+                    {"type": "u16", "endian": "big", "name": "ext_profile",
+                     "seed_value": 0xBEDE},
+                    # in 32-bit WORDS, which is why `covers` cannot express it:
+                    # covers is measured in bytes, so it would make the baseline four times
+                    # too large and the receiver would reject every unmutated packet
+                    {"type": "u16", "endian": "big", "name": "ext_len", "seed_value": 1,
+                     "role": "size"},
+                    {"type": "blob", "name": "ext_data",
+                     "size_from": {"field": "ext_len", "scale": 4},
+                     "seed_value": b"\x00" * 4}]},
+                {"type": "blob", "name": "payload"},
+            ]},
+    # H.264 in Annex-B framing: the elementary stream inside an RTP or TS payload, and what a
+    # decoder is handed once the transport is stripped. There is no length field in Annex-B --
+    # a NAL unit runs until the next start code -- so unlike every other model here the value
+    # is not in keeping a length coherent. It is in keeping the START CODES intact: a decoder
+    # scans for 00 00 01 and discards everything before it, so blind byte mutation destroys
+    # the framing and the decoder never parses anything. Exactly the mpegts sync-byte
+    # argument, which is why the start codes are `magic` and the NAL bodies are not.
+    #
+    # The seeded SPS and PPS are real (baseline, 16x16): a decoder that rejects a malformed
+    # parameter set never reaches slice decoding, so the interesting code is only reachable
+    # if the stream is valid up to that point. The IDR slice body is the mutable blob.
+    "h264": {"tokens": ("h264", "H.264", "nal_unit_type", "avcC", "AVC"),
+             "seed": b"\x88\x80\x10\x00",
+             "spec": [
+                 {"type": "magic", "value": b"\x00\x00\x00\x01"},
+                 # nal_ref_idc=3, nal_unit_type=7 (SPS)
+                 {"type": "u8", "name": "sps_hdr", "seed_value": 0x67},
+                 {"type": "blob", "name": "sps", "until": b"\x00\x00\x00\x01",
+                  "seed_value": b"\x42\x00\x0a\xf8\x41\xa2"},
+                 {"type": "magic", "value": b"\x00\x00\x00\x01"},
+                 # nal_ref_idc=3, nal_unit_type=8 (PPS)
+                 {"type": "u8", "name": "pps_hdr", "seed_value": 0x68},
+                 {"type": "blob", "name": "pps", "until": b"\x00\x00\x00\x01",
+                  "seed_value": b"\xce\x3c\x80"},
+                 {"type": "magic", "value": b"\x00\x00\x00\x01"},
+                 # nal_ref_idc=3, nal_unit_type=5 (IDR slice) -- mutating this byte walks the
+                 # decoder's nal_unit_type dispatch, which is where the reserved and
+                 # unhandled types live
+                 {"type": "u8", "name": "idr_hdr", "seed_value": 0x65},
+                 {"type": "blob", "name": "idr_slice", "until": b"\x00\x00\x00\x01",
+                  "seed_value": b"\x88\x80\x10\x00"},
+                 {"type": "magic", "value": b"\x00\x00\x00\x01"},
+                 # nal_ref_idc=2, nal_unit_type=1 (non-IDR slice): a real stream is one IDR
+                 # followed by P-slices, and a decoder only reaches its inter-prediction and
+                 # reference-list code on a non-IDR one -- an IDR-only stream leaves the
+                 # larger half of the slice decoder unvisited
+                 {"type": "u8", "name": "slice_hdr", "seed_value": 0x41},
+                 {"type": "blob", "name": "slice"},
+             ]},
+    "bmp": {"tokens": ("BITMAPINFOHEADER", "BITMAPFILEHEADER", ".bmp"), "seed": b"\x00" * 4,
+            "spec": [
+                {"type": "magic", "value": b"BM"},
+                {"type": "u32", "endian": "little", "name": "filesize", "covers": "rest"},
+                {"type": "magic", "value": b"\x00\x00\x00\x00"},      # reserved
+                {"type": "u32", "endian": "little", "name": "pixoff",
+                 "offset_of": "pixels", "role": "offset"},
+                {"type": "group", "name": "dib", "spec": [
+                    {"type": "u32", "endian": "little", "name": "dibsize", "seed_value": 40},
+                    {"type": "u32", "endian": "little", "name": "width", "seed_value": 1},
+                    {"type": "u32", "endian": "little", "name": "height", "seed_value": 1},
+                    {"type": "u16", "endian": "little", "name": "planes", "seed_value": 1},
+                    {"type": "u16", "endian": "little", "name": "bpp", "seed_value": 24},
+                    {"type": "u32", "endian": "little", "name": "compression"},
+                    {"type": "u32", "endian": "little", "name": "imgsize",
+                     "length_of": "pixels", "role": "size"},
+                    {"type": "u32", "endian": "little", "name": "xppm", "seed_value": 2835},
+                    {"type": "u32", "endian": "little", "name": "yppm", "seed_value": 2835},
+                    {"type": "u32", "endian": "little", "name": "ncolours"},
+                    {"type": "u32", "endian": "little", "name": "nimportant"}]},
+                {"type": "blob", "name": "pixels"}]},
+    # RIFF/WAVE: a container of chunks, each `fourcc + size + data`, inside an outer chunk
+    # whose own size covers everything after it. A decoder walks them by trusting those sizes.
+    "riff": {"tokens": ("RIFF", "WAVE", "fmt "), "seed": b"\x00" * 4,
+             "spec": [
+                 {"type": "magic", "value": b"RIFF"},
+                 {"type": "u32", "endian": "little", "name": "riffsize", "covers": "rest"},
+                 {"type": "magic", "value": b"WAVE"},
+                 {"type": "group", "name": "fmt", "spec": [
+                     {"type": "magic", "value": b"fmt "},
+                     {"type": "u32", "endian": "little", "name": "fmtsize",
+                      "length_of": "fmtdata", "role": "size"},
+                     {"type": "blob", "name": "fmtdata",
+                      # PCM, mono, 8 kHz, 8-bit
+                      "seed_value": struct.pack("<HHIIHH", 1, 1, 8000, 8000, 1, 8)}]},
+                 {"type": "group", "name": "data", "spec": [
+                     {"type": "magic", "value": b"data"},
+                     {"type": "u32", "endian": "little", "name": "datasize",
+                      "length_of": "samples", "role": "size"},
+                     {"type": "blob", "name": "samples"}]}]},
+    # ZIP: a local header is not an archive. Every tool finds the files through the central
+    # directory, located by absolute offset from the end-of-central-directory record, so a
+    # model that stops at the local header generates something unzip refuses before parsing
+    # anything: "End-of-central-directory signature not found". Described in full, the
+    # directory's offsets and lengths are derived -- which is what makes them mutable: a
+    # directory that points at the wrong place is a real archive with one field wrong, not
+    # a file the parser discards.
+    # byte magic never survives into a string table, and unzip writes the phrase hyphenated,
+    # so the old tokens matched nothing at all and the strongest accidental match won instead
+    "zip": {"tokens": ("End-of-central-directory", "central directory", "zipfile"), "seed": b"A",
+            "spec": [
+                {"type": "group", "name": "local", "spec": [
+                    {"type": "magic", "value": b"PK\x03\x04"},
+                    # version, flags, and method 8 -- DEFLATE, so the decompressor runs
+                    {"type": "magic", "value": b"\x14\x00\x00\x00\x08\x00"},
+                    {"type": "magic", "value": b"\x00\x00\x00\x00"},      # mod time, date
+                    {"type": "u32", "endian": "little", "name": "crc", "crc32_of": "plain"},
+                    {"type": "u32", "endian": "little", "name": "csize", "length_of": "data"},
+                    {"type": "u32", "endian": "little", "name": "usize",
+                     "seed_value": len(_ZIP_PLAIN)},
+                    {"type": "u16", "endian": "little", "name": "namelen",
+                     "length_of": "lname"},
+                    {"type": "u16", "endian": "little", "name": "extralen",
+                     "length_of": "lextra"},
+                    {"type": "blob", "name": "lname"},
+                    {"type": "blob", "name": "lextra", "seed_value": b""},
+                    {"type": "blob", "name": "data", "seed_value": _ZIP_DEFLATED},
+                    # never serialised: the uncompressed bytes, so the CRC field can name
+                    # what a decompressor will actually check it against
+                    {"type": "shadow", "name": "plain", "seed_value": _ZIP_PLAIN}]},
+                {"type": "group", "name": "cd", "spec": [
+                    {"type": "magic", "value": b"PK\x01\x02"},
+                    {"type": "magic", "value": b"\x14\x00\x14\x00\x00\x00\x08\x00"},
+                    {"type": "magic", "value": b"\x00\x00\x00\x00"},      # mod time, date
+                    {"type": "u32", "endian": "little", "name": "ccrc", "crc32_of": "plain"},
+                    {"type": "u32", "endian": "little", "name": "ccsize", "length_of": "data"},
+                    {"type": "u32", "endian": "little", "name": "cusize",
+                     "seed_value": len(_ZIP_PLAIN)},
+                    {"type": "u16", "endian": "little", "name": "cnamelen",
+                     "length_of": "cname"},
+                    {"type": "u16", "endian": "little", "name": "cextralen",
+                     "length_of": "cextra"},
+                    {"type": "u16", "endian": "little", "name": "ccommentlen",
+                     "length_of": "ccomment"},
+                    {"type": "magic", "value": b"\x00\x00\x00\x00\x00\x00\x00\x00"},
+                    # where the file's local header is -- derived, and therefore drivable
+                    {"type": "u32", "endian": "little", "name": "localoff",
+                     "offset_of": "local"},
+                    {"type": "blob", "name": "cname"},
+                    {"type": "blob", "name": "cextra", "seed_value": b""},
+                    {"type": "blob", "name": "ccomment", "seed_value": b""}]},
+                {"type": "magic", "value": b"PK\x05\x06"},
+                {"type": "magic", "value": b"\x00\x00\x00\x00\x01\x00\x01\x00"},
+                {"type": "u32", "endian": "little", "name": "cdsize", "length_of": "cd"},
+                {"type": "u32", "endian": "little", "name": "cdoff", "offset_of": "cd"},
+                {"type": "magic", "value": b"\x00\x00"}]},
 }
 
 
 def builtin(name: str):
-    spec = _BUILTINS.get(name)
-    return FormatModel([dict(f) for f in spec]) if spec else None
+    entry = _BUILTINS.get(name)
+    return FormatModel([dict(f) for f in entry["spec"]]) if entry else None
+
+
+def builtin_names() -> list:
+    return sorted(_BUILTINS)
+
+
+def detect_format(strings) -> str | None:
+    """Which builtin format this binary looks like a parser for, by its own strings.
+
+    A blind mutator cannot invent four valid magic bytes, so a parser rejects everything it is
+    given and the campaign does no work: jhead ran 98,500 executions for zero finds against a
+    bug AFL++ reached in 60 seconds WITH a valid seed. The binary itself says which format it
+    reads -- an EXIF reader carries the string "Exif" -- so the model and the seed can both be
+    chosen without an analyst supplying either.
+    """
+    blob = "\n".join(s for s in strings if s)
+    best, score = None, 0
+    for name, entry in _BUILTINS.items():
+        # a longer token is stronger evidence: "GIF89a" in a binary means something, two
+        # characters mean nothing, so weight each hit by the length of what matched
+        hits = sum(len(t) for t in entry["tokens"] if t and _token_hit(t, blob))
+        if hits > score:
+            best, score = name, hits
+    return best
+
+
+# Below this, a substring match is not evidence of anything -- it is a coincidence waiting to
+# happen. Short tokens have to match as WORDS: "PNG" in "PNG image" is a signal, "PAT" inside
+# "MAX_PATHS" is not, and the difference is a word boundary rather than a length.
+_SHORT_TOKEN = 5
+_WORD_CACHE: dict = {}
+
+
+def _token_hit(token: str, blob: str) -> bool:
+    if len(token) >= _SHORT_TOKEN:
+        return token in blob
+    rx = _WORD_CACHE.get(token)
+    if rx is None:
+        rx = _WORD_CACHE[token] = re.compile(r"(?<![A-Za-z0-9_])%s(?![A-Za-z0-9_])"
+                                             % re.escape(token))
+    return rx.search(blob) is not None
 
 
 def from_spec(spec) -> FormatModel:
@@ -167,13 +951,34 @@ _SIGNATURES = [
     ("CLASS", b"\xca\xfe\xba\xbe"), ("OGG", b"OggS"), ("FLAC", b"fLaC"),
     ("7Z", b"7z\xbc\xaf\x27\x1c"), ("XZ", b"\xfd7zXZ\x00"), ("WASM", b"\x00asm"),
     ("CAB", b"MSCF"), ("MACHO", b"\xcf\xfa\xed\xfe"), ("SQLITE", b"SQLite format 3\x00"),
+    ("H264", b"\x00\x00\x00\x01"),
+
 ]
+
+
+def _looks_like_h264(sample: bytes) -> bool:
+    """`00 00 00 01` is only four bytes -- a big-endian 1 at offset 0, which is common in
+    firmware dumps, TLV/record containers and serialized formats -- so a bare start code is
+    not enough to claim H.264. Require Annex-B structure: a NAL header byte whose
+    forbidden_zero_bit is clear and whose nal_unit_type is not the reserved 0, plus a SECOND
+    start code later in the sample (a stream is more than one NAL unit)."""
+    if len(sample) < 6 or not sample.startswith(b"\x00\x00\x00\x01"):
+        return False
+    nal = sample[4]
+    if nal & 0x80 or (nal & 0x1F) == 0:      # forbidden_zero_bit set, or unspecified type
+        return False
+    return sample.find(b"\x00\x00\x01", 4) >= 0
 
 
 def detect_magic(sample: bytes):
     """Return (name, magic_bytes) for the first known signature the sample starts with."""
     for name, sig in _SIGNATURES:
         if sample.startswith(sig):
+            # `00 00 00 01` is too generic to trust on the prefix alone -- verify NAL structure
+            # before claiming H.264, or the real length-field discovery is skipped for a file
+            # that merely opens with a big-endian 1.
+            if name == "H264" and not _looks_like_h264(sample):
+                continue
             return name, sig
     return None, b""
 
@@ -204,11 +1009,65 @@ def find_length_fields(sample: bytes, *, max_off: int = 64):
 _INTNAME = {1: "u8", 2: "u16", 4: "u32", 8: "u64"}
 
 
+def _jsonable_spec(spec):
+    """A builtin's field list, safe to put in a JSON response (magic values are bytes)."""
+    out = []
+    for f in spec:
+        g = dict(f)
+        if "value" in g and isinstance(g["value"], (bytes, bytearray)):
+            g["value"] = _b64safe(bytes(g["value"]))
+        if isinstance(g.get("fields"), list):
+            g["fields"] = _jsonable_spec(g["fields"])
+        out.append(g)
+    return out
+
+
+# Line-oriented text is not a byte grammar, and offering to carve it into magic + blob invites
+# the operator to build a spec that cannot describe it. The campaign already picks the
+# key=value mutator for these on its own.
+def _looks_like_text_config(sample: bytes) -> bool:
+    head = sample[:2048]
+    if not head or b"\x00" in head:
+        return False
+    try:
+        text = head.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    lines = [ln for ln in text.splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
+    if len(lines) < 2:
+        return False
+    return sum(1 for ln in lines if "=" in ln or ":" in ln) >= max(2, len(lines) // 2)
+
+
 def suggest_spec(sample: bytes) -> dict:
-    """Build a starting spec from a real sample: fix the detected header as magic, put a
-    length field where the bytes say one is, and let the rest be the sized blob."""
+    """Build a starting spec from a real sample.
+
+    A builtin model FIRST, when one matches. The generic path below derives magic and hunts a
+    length field from the bytes alone, which for a JPEG produced two fields -- magic and a
+    blob -- while `builtin("jpeg")` describes the segment chain and the nested IFD arrays and
+    is what the campaign would choose anyway. Two places answered "what is this format" and
+    the one the builder called was the weaker.
+    """
     sample = sample or b""
     name, sig = detect_magic(sample)
+    key = (name or "").lower()
+    if key in _BUILTINS:
+        entry = _BUILTINS[key]
+        return {"detected": name, "magic_len": len(sig), "builtin": key,
+                "spec": _jsonable_spec(entry["spec"]),
+                "notes": [f"{name} is a built-in model: this is the full grammar the fuzzer "
+                          f"uses, not a guess from the bytes. Edit it if this file is a "
+                          f"dialect, or leave it and the campaign keeps lengths and offsets "
+                          f"coherent while it mutates."],
+                "sample_size": len(sample)}
+    if _looks_like_text_config(sample):
+        return {"detected": "line-oriented text", "magic_len": 0, "builtin": "keyvalue",
+                "spec": [],
+                "notes": ["this is key=value text, not a byte grammar -- a magic/length/blob "
+                          "spec cannot describe it. The campaign detects this and uses the "
+                          "key=value mutator automatically, mining the keys from the target's "
+                          "own strings; there is nothing to build here."],
+                "sample_size": len(sample)}
     cands = find_length_fields(sample)
     notes = []
     if cands:

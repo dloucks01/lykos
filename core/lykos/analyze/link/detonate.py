@@ -41,10 +41,21 @@ class DetonateResult:
     blame: Optional[dict] = None
     isolation: str = "rlimits-only(system)"
     note: Optional[str] = None
+    baseline_ran: bool = False       # did a benign-input baseline actually execute this detonation?
 
     @property
     def cross_boundary(self) -> bool:
+        """PROVISIONAL: a service crashed and is not a known baseline-crasher. Fine to drive a
+        fast search, but on its own it does not prove the INPUT caused the crash."""
         return bool(self.blame and self.blame.get("cross_boundary"))
+
+    @property
+    def cross_boundary_confirmed(self) -> bool:
+        """CONFIRMED: cross_boundary AND a real benign baseline ran and cleared the victim, so the
+        service crash is attributable to this input. This is the gate a finding must pass -- a
+        detonation whose baseline was skipped (e.g. entry_input == baseline_input) never qualifies,
+        so an input-independent startup crash is not minted as a cross-boundary finding."""
+        return self.cross_boundary and self.baseline_ran
 
 
 def _wait_ready(channel, deadline):
@@ -80,48 +91,24 @@ def _emu_prefix(arch, host):
     return ([], None)
 
 
-def detonate(components: list, *, channel=None, entry_input: bytes = b"",
-             timeout: float = 8.0, arch: Optional[str] = None, host: Optional[str] = None,
-             readiness: float = 1.5, grace: float = 1.5) -> DetonateResult:
-    """Launch services then the entry component together; deliver entry_input to the entry
-    on stdin; detect any crash and blame it on the entry input.
-
-    `components` is an ordered list of dicts: {exe, target_id, filename, role, argv?}.
-    Services (role != "entry") are launched first; exactly one entry is expected last.
-    """
-    host = host or sandbox.host_arch()
-    emu, err = _emu_prefix(arch, host)
-    if err:
-        return DetonateResult(isolation="unsupported-arch", note=err)
-
-    made_fifo = None
-    if channel and channel.get("family") == "fifo" and channel.get("key"):
-        key = channel["key"]
-        try:
-            if not os.path.exists(key):
-                os.mkfifo(key, 0o600)
-                made_fifo = key
-        except OSError as e:
-            return DetonateResult(note=f"mkfifo failed: {e!r}")
-
-    services = [c for c in components if c.get("role") != "entry"]
-    entries = [c for c in components if c.get("role") == "entry"]
-    if not entries:
-        if made_fifo:
-            _rm(made_fifo)
-        return DetonateResult(note="no entry component")
-    entry = entries[0]
-
-    preexec = sandbox._rlimits(2048, int(timeout) + 2, set_as=(not emu))
+def _run_once(*, emu, services, entry, channel, entry_input, timeout, readiness, grace,
+              preexec) -> list:
+    """One launch of the whole component set with `entry_input` fed to the entry on stdin.
+    Returns the CompOutcome list; every process it starts is reaped before it returns."""
     procs = []       # (comp, Popen)
 
     def _launch(comp, stdin_pipe):
         cmd = emu + [str(comp["exe"])] + [str(a) for a in comp.get("argv", [])]
+        # stdout/stderr are DEVNULL, not PIPE: the outcome is read from the exit status only
+        # (classify_rc), the pipes are never drained, and a component that writes >~64 KiB would
+        # otherwise BLOCK on the full pipe -- _wait_proc then times out and SIGKILLs it, so a real
+        # post-output crash is misreported as a timeout and cross-boundary blame silently misses it.
         return subprocess.Popen(
             cmd, stdin=(subprocess.PIPE if stdin_pipe else subprocess.DEVNULL),
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             start_new_session=True, preexec_fn=preexec)
 
+    ep = None
     try:
         for svc in services:
             procs.append((svc, _launch(svc, False)))
@@ -158,8 +145,6 @@ def detonate(components: list, *, channel=None, entry_input: bytes = b"",
                 p.wait(timeout=2)
             except Exception:
                 pass
-        if made_fifo:
-            _rm(made_fifo)
 
     outcomes = []
     for comp, p in procs:
@@ -170,18 +155,94 @@ def detonate(components: list, *, channel=None, entry_input: bytes = b"",
             role=("entry" if comp is entry else "service"),
             crashed=crashed, signal=sig, signal_name=signame, exit_code=exit_code,
             timed_out=(rc is None)))
-
-    blame = _blame(entry, outcomes)
-    return DetonateResult(outcomes=outcomes, blame=blame)
+    return outcomes
 
 
-def _blame(entry, outcomes):
+def detonate(components: list, *, channel=None, entry_input: bytes = b"",
+             timeout: float = 8.0, arch: Optional[str] = None, host: Optional[str] = None,
+             readiness: float = 1.5, grace: float = 1.5, baseline: bool = True,
+             baseline_input: bytes = b"") -> DetonateResult:
+    """Launch services then the entry component together; deliver entry_input to the entry
+    on stdin; detect any crash and blame it on the entry input.
+
+    `components` is an ordered list of dicts: {exe, target_id, filename, role, argv?}.
+    Services (role != "entry") are launched first; exactly one entry is expected last.
+
+    Cross-boundary blame is only earned when a service crash is CAUSED by the test input, not
+    merely coincident with it. So when `baseline` is set (default) the set is first detonated
+    with a benign `baseline_input`; a service that crashes there crashes regardless of the test
+    input and is therefore never attributed to it -- only a service crash present with the test
+    input and ABSENT in the baseline is blamed cross-boundary. Callers that run detonate in a
+    tight search loop can pass baseline=False for speed and re-confirm the final hit with it.
+    """
+    host = host or sandbox.host_arch()
+    emu, err = _emu_prefix(arch, host)
+    if err:
+        return DetonateResult(isolation="unsupported-arch", note=err)
+
+    made_fifo = None
+    if channel and channel.get("family") == "fifo" and channel.get("key"):
+        key = channel["key"]
+        try:
+            if not os.path.exists(key):
+                os.mkfifo(key, 0o600)
+                made_fifo = key
+        except OSError as e:
+            return DetonateResult(note=f"mkfifo failed: {e!r}")
+
+    services = [c for c in components if c.get("role") != "entry"]
+    entries = [c for c in components if c.get("role") == "entry"]
+    if not entries:
+        if made_fifo:
+            _rm(made_fifo)
+        return DetonateResult(note="no entry component")
+    entry = entries[0]
+
+    preexec = sandbox._rlimits(2048, int(timeout) + 2, set_as=(not emu))
+    note = None
+    try:
+        # BASELINE: a service that also crashes on a benign input is not something the test
+        # input caused. Run the set once with baseline_input and remember which services die,
+        # so those crashes cannot be mis-blamed on the test input below.
+        baseline_crashers: set = set()
+        baseline_ran = bool(baseline and services and entry_input != baseline_input)
+        if baseline_ran:
+            base = _run_once(emu=emu, services=services, entry=entry, channel=channel,
+                             entry_input=baseline_input, timeout=timeout,
+                             readiness=readiness, grace=grace, preexec=preexec)
+            baseline_crashers = {o.filename for o in base
+                                 if o.crashed and o.role == "service"}
+            if baseline_crashers:
+                note = ("baseline (benign input) already crashed "
+                        + ", ".join(sorted(baseline_crashers))
+                        + "; those crashes are not attributed to the test input")
+        outcomes = _run_once(emu=emu, services=services, entry=entry, channel=channel,
+                             entry_input=entry_input, timeout=timeout,
+                             readiness=readiness, grace=grace, preexec=preexec)
+    finally:
+        if made_fifo:
+            _rm(made_fifo)
+
+    blame = _blame(entry, outcomes, baseline_crashers)
+    return DetonateResult(outcomes=outcomes, blame=blame, note=note, baseline_ran=baseline_ran)
+
+
+def _blame(entry, outcomes, baseline_crashers=frozenset()):
     crashers = [o for o in outcomes if o.crashed]
     if not crashers:
         return None
-    # prefer a crashing SERVICE (cross-boundary); else the entry crashed directly
-    svc = next((o for o in crashers if o.role == "service"), None)
-    victim = svc or crashers[0]
+    # A cross-boundary blame needs a SERVICE crash the benign baseline did NOT show -- a
+    # service that dies regardless of input was not crashed BY this input. Prefer such an
+    # eligible service (cross-boundary); else the entry crashing directly is attributable
+    # because the entry is what received the input.
+    svc = next((o for o in crashers
+                if o.role == "service" and o.filename not in baseline_crashers), None)
+    entry_crash = next((o for o in crashers if o.role == "entry"), None)
+    victim = svc or entry_crash
+    if victim is None:
+        # the only crashers are services that also crashed on the benign baseline: nothing
+        # here is attributable to the test input.
+        return None
     return {"entry": entry.get("filename"), "entry_target": entry.get("target_id"),
             "crashed": victim.filename, "crashed_target": victim.target_id,
             "signal": victim.signal_name, "cross_boundary": victim.role == "service"}

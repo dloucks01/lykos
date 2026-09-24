@@ -7,6 +7,9 @@ import json
 import tempfile
 from pathlib import Path
 
+from ..dynamic import sandbox
+from ..fuzz.runner import place
+
 _HELPER = "ptrace_capture.py"
 
 
@@ -33,10 +36,13 @@ def make_capture(ctx, helper: Path, exe, mode, base_argv, timeout, python):
             stdin_file = str(work / "stdin.bin")
             (work / "stdin.bin").write_bytes(data)
         elif mode == "arg":
-            argv = argv + [data.decode("latin-1")]
+            try:
+                argv = place(argv, sandbox.argv_arg(data, truncate=True))
+            except sandbox.ArgvNulError as e:
+                return {"ok": False, "reason": str(e)}
         elif mode == "file":
             (work / "input.bin").write_bytes(data)
-            argv = argv + [str(work / "input.bin")]
+            argv = place(argv, str(work / "input.bin"))
         spec = {"exe": str(exe), "argv": argv, "stdin_file": stdin_file, "timeout": timeout}
         if breakpoints:
             spec["breakpoints"] = [int(a) for a in breakpoints]
@@ -65,11 +71,77 @@ def make_qemu_capture(exe, arch, mode, base_argv, timeout, *, endianness=None, b
         if mode == "stdin":
             stdin = data
         elif mode == "arg":
-            argv = argv + [data.decode("latin-1")]
+            try:
+                argv = place(argv, sandbox.argv_arg(data, truncate=True))
+            except sandbox.ArgvNulError as e:
+                return {"ok": False, "reason": str(e)}
         elif mode == "file":
             (work / "input.bin").write_bytes(data)
-            argv = argv + [str(work / "input.bin")]
+            argv = place(argv, str(work / "input.bin"))
         return qemu_gdb.capture(exe, arch, argv=argv, stdin=stdin, timeout=timeout,
-                                endianness=endianness, bits=bits)
+                                endianness=endianness, bits=bits, breakpoints=breakpoints)
 
     return capture
+
+
+# Every way a target can be handed its input. Order matters only as a fallback sweep.
+MODES = ("stdin", "file", "arg")
+
+
+_STDIN_FUNCS = {"read", "fgets", "gets", "scanf", "__isoc99_scanf", "fread", "getchar",
+                "getline", "getc", "fgetc"}
+_FILE_FUNCS = {"fopen", "fopen64", "open", "open64", "freopen"}
+
+
+def modes_for(call_edges, given=None):
+    """The input channels to try, best first, always ending with all three attempted.
+
+    Ranked by the input functions the binary actually imports, because "default to stdin" is
+    a coin flip that loses on most real targets: a file parser reads nothing from stdin, so a
+    campaign or a probe aimed there does no work at all and reports a clean zero.
+    """
+    from ..detect.catalog import normalize
+    if given:
+        return [given]
+    names = {normalize(e.dst_name) for e in call_edges if e.dst_name}
+    ordered = []
+    if names & _FILE_FUNCS:
+        ordered.append("file")
+    if names & _STDIN_FUNCS:
+        ordered.append("stdin")
+    ordered.append("arg")
+    for m in MODES:                          # ensure every channel is attempted
+        if m not in ordered:
+            ordered.append(m)
+    return ordered
+
+
+def how_to_feed(conn, target, input_sha, params):
+    """(mode, argv, why) -- how this input reached the program when it crashed.
+
+    Both the root-cause and the L2 stages used to default to stdin, so a file parser or an
+    argv-driven target reported "did not fault" -- a clean-looking negative that really meant
+    "we fed it the wrong way". The dynamic run that FOUND the input already recorded the mode
+    and argv it used, which is authoritative whenever the crash came from this pipeline;
+    anything else is a starting guess that the caller sweeps past.
+    """
+    from ...db.dao import DynResultDAO
+    if params.get("input_mode"):
+        return params["input_mode"], list(params.get("argv") or []), "given"
+    for r in DynResultDAO(conn).list_by_target(target.id):
+        if r.input_sha == input_sha and r.input_mode:
+            # dyn_result.argv is the FLAG PREFIX, never the thing carrying the input: the
+            # carrier is a scratch path that no longer exists by the time anything replays it,
+            # and the caller appends its own. Recording the whole invocation made the replay
+            # `jhead /tmp/<gone>/input.bin /tmp/new/input.bin`; jhead stops at the missing
+            # first file and never reaches the crashing one, so a real crash was filed as
+            # "did not reproduce".
+            return r.input_mode, list(r.argv or []), "recorded by the run that found it"
+    # Nothing recorded: rank the channels by what the binary imports rather than assuming
+    # stdin. A file parser given its input on stdin looks exactly like a program with no bug.
+    from ...db.dao import CallEdgeDAO
+    try:
+        ranked = modes_for(CallEdgeDAO(conn).list_by_target(target.id))
+    except Exception:
+        ranked = list(MODES)
+    return ranked[0], list(params.get("argv") or []), "inferred from the imported input calls"

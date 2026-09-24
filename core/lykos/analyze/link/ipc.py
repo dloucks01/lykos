@@ -162,7 +162,8 @@ def model_ipc_case(conn, content, case_id: str, *, persist: bool = True) -> dict
                       detail=f"{e['family']}:{e['key']}")
         for cand in findings:
             fd.upsert(cand["_target"], case_id, cand)
-        conn.commit()
+        # autocommit connection: the upserts already persisted; a bare commit here would commit an
+        # enclosing transaction early.
     return {"components": len(profiles), "ipc_edges": len(edges),
             "channels": sorted({e["family"] + ":" + e["key"] for e in edges}),
             "cross_findings": len(findings)}

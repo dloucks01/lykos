@@ -13,6 +13,7 @@ import re
 import select
 import subprocess
 import time
+from pathlib import Path
 
 from ..dynamic import sandbox
 
@@ -39,8 +40,13 @@ def leak_and_exploit(exe, base_argv, *, leak_regex: str, leak_base_offset: int,
     rx = re.compile(leak_regex.encode("latin-1"))
     ok = re.compile(success_regex.encode("latin-1"))
     preexec = sandbox._rlimits(mem_mb, int(timeout) + 2, set_as=True)
+    # The leak harness reads only the target's stdout, so it needs no control channel: contain
+    # it fully (read-only fs, tmpfs, private pid + network namespace) when bwrap is available.
+    exedir = str(Path(exe).resolve().parent)
+    cmd = sandbox.isolate_prefix(exedir, net=False) + \
+        [str(exe)] + [str(a) for a in base_argv]
     try:
-        p = subprocess.Popen([str(exe)] + [str(a) for a in base_argv],
+        p = subprocess.Popen(cmd,
                              stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                              stderr=subprocess.STDOUT, start_new_session=True,
                              preexec_fn=preexec)
@@ -72,6 +78,7 @@ def leak_and_exploit(exe, base_argv, *, leak_regex: str, leak_base_offset: int,
 
         base = leaked - leak_base_offset
         payload = payload_for_base(base)
+        sent_at = len(buf)          # only output AFTER this can confirm the RELOCATED payload worked
         try:
             p.stdin.write(payload)
             p.stdin.flush()
@@ -80,7 +87,10 @@ def leak_and_exploit(exe, base_argv, *, leak_regex: str, leak_base_offset: int,
             pass
 
         out = buf
-        while time.time() < deadline:
+        # A FRESH budget for the confirmation read: the leak may have arrived just before `deadline`,
+        # which would otherwise leave this loop zero iterations and miss a genuine success marker.
+        post_deadline = time.time() + timeout
+        while time.time() < post_deadline:
             r, _, _ = select.select([p.stdout], [], [], 0.2)
             if r:
                 chunk = os.read(p.stdout.fileno(), 4096)
@@ -89,8 +99,11 @@ def leak_and_exploit(exe, base_argv, *, leak_regex: str, leak_base_offset: int,
                 out += chunk
             elif p.poll() is not None:
                 break
+        # Search ONLY the post-payload bytes: a success_regex that merely appears in the target's
+        # normal startup/leak output (pre-payload) must not declare a false "demonstrated".
         return {"ok": True, "leaked": leaked, "base": base,
-                "success": bool(ok.search(out)), "output": out[:800].decode("latin-1", "ignore")}
+                "success": bool(ok.search(out[sent_at:])),
+                "output": out[:800].decode("latin-1", "ignore")}
     finally:
         _kill(p)
         try:

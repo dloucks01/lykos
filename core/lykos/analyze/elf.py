@@ -6,16 +6,21 @@ robust: every sub-parse is guarded; failures are appended to `errors` and never 
 """
 from __future__ import annotations
 
+import bisect
+import logging
 import math
 import struct
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+_log = logging.getLogger(__name__)
+
 # e_machine -> normalized arch name (extend freely)
 _MACHINES = {
     0x02: "sparc", 0x03: "x86", 0x08: "mips", 0x14: "ppc", 0x15: "ppc64",
     0x16: "s390", 0x28: "arm", 0x2A: "sh", 0x04: "m68k", 0x2B: "sparcv9",
-    0x3E: "x86-64", 0xB7: "aarch64", 0xF3: "riscv", 0x101: "loongarch",
+    0x3E: "x86-64", 0xB7: "aarch64", 0xF3: "riscv", 0x102: "loongarch",
+    0x12: "sparc",          # EM_SPARC32PLUS (v8plus) -- same ISA family as EM_SPARC
 }
 _ETYPES = {0: "none", 1: "rel", 2: "exec", 3: "dyn", 4: "core"}
 
@@ -29,6 +34,23 @@ DT_NEEDED, DT_STRTAB, DT_BIND_NOW, DT_FLAGS, DT_FLAGS_1 = 1, 5, 24, 30, 0x6FFFFF
 DF_BIND_NOW, DF_1_NOW, DF_1_PIE = 0x08, 0x00000001, 0x08000000
 SHF_WRITE, SHF_ALLOC, SHF_EXEC = 0x1, 0x2, 0x4
 STT_FUNC = 2
+
+# Per-section entropy is a pure-Python byte loop, and e_shnum is attacker-controlled (u16, up
+# to 65535). A crafted ELF whose sections all point at one 2 MiB high-entropy region would
+# otherwise run that loop tens of thousands of times -- ~137 GB of work from a ~6 MiB file.
+# Cap both the number of sections scanned (mirroring the PE parser's 96) and the cumulative
+# bytes hashed. Real ELFs have a few dozen sections and never approach either bound.
+_MAX_ENTROPY_SECTIONS = 96
+_MAX_ENTROPY_BYTES = 64 << 20
+
+
+def _fits(data: bytes, base: int, entsize: int, claimed: int) -> int:
+    """How many `entsize`-byte records starting at `base` the file can actually hold, capped
+    to what the header claims. Bounds a hostile e_phnum/e_shnum to reality so a struct error
+    mid-loop cannot discard the records that DID parse."""
+    if entsize <= 0 or base < 0 or base >= len(data):
+        return 0
+    return min(claimed, max(0, (len(data) - base) // entsize))
 
 
 @dataclass
@@ -76,6 +98,14 @@ def parse(data: bytes) -> ElfInfo:
         ei_class, ei_data = data[4], data[5]
         info.bits = {1: 32, 2: 64}.get(ei_class)
         info.endianness = {1: "little", 2: "big"}.get(ei_data)
+        # A valid ELF ident says 32/64-bit (EI_CLASS 1/2) and little/big-endian (EI_DATA 1/2).
+        # Anything else means we do not know the layout: defaulting to 32-bit little/big and
+        # reading e_machine anyway hands downstream a guessed arch dressed as fact. Stop, and
+        # let the null bits/endianness plus the error speak for themselves.
+        if ei_class not in (1, 2) or ei_data not in (1, 2):
+            info.errors.append(
+                f"invalid ELF ident: EI_CLASS={ei_class}, EI_DATA={ei_data}")
+            return info
         endc = "<" if ei_data == 1 else ">"
         is64 = ei_class == 2
     except Exception as e:  # pragma: no cover - defensive
@@ -105,8 +135,11 @@ def parse(data: bytes) -> ElfInfo:
     gnu_relro = False
 
     # --- program headers (mitigations: NX/RELRO, interp) ---
+    n_ph = _fits(data, e_phoff, e_phentsize, e_phnum)
+    if n_ph < e_phnum:
+        info.errors.append(f"e_phnum={e_phnum} exceeds file; parsing {n_ph}")
     try:
-        for i in range(e_phnum):
+        for i in range(n_ph):
             off = e_phoff + i * e_phentsize
             if is64:
                 p_type, p_flags, p_offset, _va, _pa, p_filesz = struct.unpack_from(
@@ -131,8 +164,11 @@ def parse(data: bytes) -> ElfInfo:
     # --- section headers (names, symtab/stripped, comment, dynsym, dynamic) ---
     sh = []
     shstr = b""
+    n_sh = _fits(data, e_shoff, e_shentsize, e_shnum)
+    if n_sh < e_shnum:
+        info.errors.append(f"e_shnum={e_shnum} exceeds file; parsing {n_sh}")
     try:
-        for i in range(e_shnum):
+        for i in range(n_sh):
             off = e_shoff + i * e_shentsize
             if is64:
                 (sh_name, sh_type, sh_flags, sh_addr, sh_offset, sh_size, sh_link,
@@ -143,17 +179,28 @@ def parse(data: bytes) -> ElfInfo:
             sh.append(dict(name_off=sh_name, type=sh_type, flags=sh_flags, addr=sh_addr,
                            offset=sh_offset, size=sh_size, link=sh_link, info=sh_info,
                            entsize=sh_entsize))
-        if e_shnum and e_shstrndx < len(sh):
-            s = sh[e_shstrndx]
+        # SHN_XINDEX: when the real string-table index does not fit in 16 bits, e_shstrndx is
+        # 0xFFFF (>= SHN_LORESERVE) and the true index lives in section header 0's sh_link.
+        strndx = e_shstrndx
+        if e_shstrndx >= 0xFF00 and sh:
+            strndx = sh[0].get("link", 0)
+        if e_shnum and 0 <= strndx < len(sh):
+            s = sh[strndx]
             shstr = data[s["offset"]:s["offset"] + s["size"]]
     except Exception as e:
         info.errors.append(f"shdrs: {e!r}")
 
     def _name(off: int) -> str:
+        if not 0 <= off < len(shstr):
+            return ""
         end = shstr.find(b"\x00", off)
-        return shstr[off:end].decode("utf-8", "replace") if off < len(shstr) else ""
+        if end < 0:                              # unterminated: run to the end, don't drop a byte
+            end = len(shstr)
+        return shstr[off:end].decode("utf-8", "replace")
 
     by_name: dict[str, dict] = {}
+    ent_scanned = 0
+    ent_budget = _MAX_ENTROPY_BYTES
     try:
         for s in sh:
             nm = _name(s["name_off"])
@@ -163,9 +210,13 @@ def parse(data: bytes) -> ElfInfo:
                              ("w" if s["flags"] & SHF_WRITE else "-"),
                              ("x" if s["flags"] & SHF_EXEC else "-")])
             ent = None
-            if s["type"] == SHT_PROGBITS and s["size"]:
-                blob = data[s["offset"]:s["offset"] + min(s["size"], 2 << 20)]
+            if (s["type"] == SHT_PROGBITS and s["size"]
+                    and ent_scanned < _MAX_ENTROPY_SECTIONS and ent_budget > 0):
+                take = min(s["size"], 2 << 20, ent_budget)
+                blob = data[s["offset"]:s["offset"] + take]
                 ent = _entropy(blob)
+                ent_scanned += 1
+                ent_budget -= len(blob)
             info.sections.append({"name": nm, "size": s["size"], "perms": perms,
                                   "entropy": ent})
     except Exception as e:
@@ -223,8 +274,10 @@ def parse(data: bytes) -> ElfInfo:
             blob = data[ds["offset"]:ds["offset"] + ds["size"]]
             libs = []
             for no in needed_offs:
-                end = blob.find(b"\x00", no)
                 if 0 <= no < len(blob):
+                    end = blob.find(b"\x00", no)
+                    if end < 0:                  # unterminated: take the whole remaining span
+                        end = len(blob)
                     libs.append(blob[no:end].decode("utf-8", "replace"))
             info.imports["libraries"] = libs
     except Exception as e:
@@ -235,9 +288,18 @@ def parse(data: bytes) -> ElfInfo:
     try:
         dsym = by_name.get(".dynsym")
         dstr = by_name.get(".dynstr")
-        if dsym and dstr and dsym["entsize"]:
+        _symsize = 24 if is64 else 16            # sizeof(Elf64_Sym) / sizeof(Elf32_Sym)
+        if dsym and dstr and dsym["entsize"] >= _symsize:
             strblob = data[dstr["offset"]:dstr["offset"] + dstr["size"]]
             count = dsym["size"] // dsym["entsize"]
+            # A hostile header can claim a huge sh_size with a tiny entsize, turning this into
+            # an O(file) loop that scans the whole string blob each pass. Cap to what the file
+            # can actually hold, so the work is bounded by the real bytes present.
+            fits = max(0, (len(data) - dsym["offset"]) // dsym["entsize"])
+            if count > fits:
+                info.errors.append(
+                    f".dynsym claims {count} symbols; file holds at most {fits}")
+                count = fits
             imported = 0
             imp_names: set[str] = set()
             exp_names: set[str] = set()
@@ -249,9 +311,13 @@ def parse(data: bytes) -> ElfInfo:
                 else:
                     st_name, _val, _sz, st_info, _o, st_shndx = struct.unpack_from(
                         endc + "IIIBBH", data, o)
-                end = strblob.find(b"\x00", st_name)
-                nm = (strblob[st_name:end].decode("utf-8", "replace")
-                      if st_name < len(strblob) else "")
+                if st_name < len(strblob):
+                    end = strblob.find(b"\x00", st_name)
+                    if end < 0:                  # unterminated: take the whole remaining span
+                        end = len(strblob)
+                    nm = strblob[st_name:end].decode("utf-8", "replace")
+                else:
+                    nm = ""
                 sttype = st_info & 0xF
                 st_bind = st_info >> 4
                 if st_shndx == 0 and nm:              # undefined => imported
@@ -294,6 +360,128 @@ def parse(data: bytes) -> ElfInfo:
                         "canary": "on" if canary else "off",
                         "fortify": "on" if fortify else "off"}
     return info
+
+
+STT_OBJECT, STT_FUNC, STT_FILE, STT_GNU_IFUNC = 1, 2, 4, 10
+_LIB_FILE = "crtstuff.c"          # the compiler's own glue, linked into every program
+
+
+def program_ranges(data: bytes) -> list:
+    """Address ranges that belong to the program's OWN source, not to code linked in with it.
+
+    A statically linked binary carries its libc, so the decompiler recovers every block of it:
+    jhead is 1,887 blocks dynamically linked and 38,418 statically, of which 36,000 are library
+    code the fuzzer will never meaningfully explore. Counting those as coverage understates the
+    program by more than an order of magnitude, and worse, an input that wanders into a new
+    printf path scores as "novel" and earns a place in the corpus.
+
+    ELF says who owns what. A symbol table groups local symbols under an STT_FILE symbol naming
+    the object they came from -- `exif.c` for the program, `iofclose.o` for a libc archive
+    member -- so every function is attributed to the nearest preceding local symbol's file.
+    Measured against the dynamically linked build's own symbols, across all twelve
+    architectures jhead is built for: 56 of 56 program functions found, five adjacent crt glue
+    symbols over-claimed, nothing from libc.
+
+    Returns [(start, end)] sorted, or [] when the binary cannot say -- stripped, no local
+    symbols, or a result too degenerate to trust -- in which case the caller must fall back to
+    using everything rather than pretending the program is tiny.
+    """
+    try:
+        if any(sec.get("name") == ".opd" for sec in parse(data).sections):
+            # PowerPC64 ELFv1: a function symbol's value is the address of its OPD descriptor,
+            # not of its code, so every range this derived would be in the wrong address space.
+            return []
+        marks, funcs, end = _symbol_owners(data)
+    except Exception:
+        _log.debug("program_ranges symbol parse failed", exc_info=True)
+        return []
+    if not marks or not funcs:
+        return []
+    addrs = [a for a, _ in marks]
+    owned, total = [], 0
+    for addr, size in funcs:
+        total += 1
+        i = bisect.bisect_right(addrs, addr) - 1
+        if i < 0:
+            continue
+        owner = marks[i][1]
+        if owner.endswith(".c") and owner != _LIB_FILE:
+            owned.append((addr, addr + (size or 1)))
+    # A small program really is a handful of functions -- a single .c file with one static
+    # anchors three -- so there is no ratio to test here. The failure this has to catch is
+    # attributing NOTHING, which would hide the whole program from coverage.
+    if not owned or total < 2:
+        return []
+    owned.sort()
+    merged = [list(owned[0])]
+    for lo, hi in owned[1:]:
+        if lo <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], hi)
+        else:
+            merged.append([lo, hi])
+    return [(lo, min(hi, end) if end else hi) for lo, hi in merged]
+
+
+def _symbol_owners(data: bytes):
+    """(local-symbol -> owning file marks, function (addr, size) list, end of text)."""
+    info = parse(data)
+    is64 = info.bits == 64
+    endc = "<" if info.endianness == "little" else ">"
+    # ARM tags a Thumb function by setting bit 0 of its symbol value; the address the code
+    # actually lives at is even. Left in, every range started one byte late and lost whichever
+    # function sat exactly on its edge.
+    mask = ~1 if (info.arch or "").startswith("arm") else ~0
+    e_shoff, e_shentsize, e_shnum = _section_header_table(data, is64, endc)
+    sections = []
+    for i in range(e_shnum):
+        off = e_shoff + i * e_shentsize
+        fmt = endc + ("IIQQQQIIQQ" if is64 else "IIIIIIIIII")
+        (_nm, typ, _fl, _ad, s_off, s_sz, link, _inf, _al, ent) = struct.unpack_from(fmt, data, off)
+        sections.append((typ, s_off, s_sz, link, ent))
+    sym = next((s for s in sections if s[0] == SHT_SYMTAB), None)
+    if sym is None:
+        return [], [], 0
+    _t, s_off, s_sz, link, ent = sym
+    if link >= len(sections):
+        return [], [], 0
+    str_off, str_sz = sections[link][1], sections[link][2]
+    strtab = data[str_off:str_off + str_sz]
+
+    def name_at(o):
+        e = strtab.find(b"\x00", o)
+        return strtab[o:e].decode("utf-8", "replace") if 0 <= o < len(strtab) else ""
+
+    ent = ent or (24 if is64 else 16)
+    marks, funcs, cur, end = [], [], None, 0
+    for off in range(s_off, min(s_off + s_sz, len(data)) - ent + 1, ent):
+        if is64:
+            nm, info_b, _oth, shndx, val, size = struct.unpack_from(endc + "IBBHQQ", data, off)
+        else:
+            nm, val, size, info_b, _oth, shndx = struct.unpack_from(endc + "IIIBBH", data, off)
+        typ, bind = info_b & 0xF, info_b >> 4
+        if typ == STT_FILE:
+            cur = name_at(nm)
+            continue
+        if not shndx or not val:                       # undefined, or absolute with no address
+            continue
+        val &= mask
+        if typ in (STT_FUNC, STT_GNU_IFUNC):
+            funcs.append((val, size))
+            end = max(end, val + (size or 1))
+        if bind == 0 and cur and typ in (STT_FUNC, STT_GNU_IFUNC, STT_OBJECT):   # STB_LOCAL
+            marks.append((val, cur))
+    marks.sort()
+    return marks, funcs, end
+
+
+def _section_header_table(data: bytes, is64: bool, endc: str):
+    if is64:
+        (e_shoff,) = struct.unpack_from(endc + "Q", data, 0x28)
+        (e_shentsize, e_shnum) = struct.unpack_from(endc + "HH", data, 0x3A)
+    else:
+        (e_shoff,) = struct.unpack_from(endc + "I", data, 0x20)
+        (e_shentsize, e_shnum) = struct.unpack_from(endc + "HH", data, 0x2E)
+    return e_shoff, e_shentsize, e_shnum
 
 
 def to_format_details(info: ElfInfo) -> dict[str, Any]:

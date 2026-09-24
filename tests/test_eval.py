@@ -207,6 +207,25 @@ def test_bundled_corpus_is_labeled_good_bad_pairs():
         assert verds == {"good", "bad"}, f"{cwe} lacks a good/bad pair"
 
 
+def test_corpus_keeps_discrimination_negatives():
+    """The good cases must include some that CALL a dangerous sink safely.
+
+    Without these the corpus has no false-positive surface: every `good` case simply omits
+    the sink, so `fp_rate` is pinned at 0.0 by construction and `--max-fp-rate 0.0` cannot
+    fail under any detector change. This test is the guard on that property -- it fails if
+    the negatives are ever reverted to absence-only.
+    """
+    from lykos.analyze.detect.catalog import DANGEROUS, normalize
+    goods = [c for c in corpus.bundled() if c.verdict == "good"]
+    with_sink = [c for c in goods
+                 if any(normalize(fn) + "(" in c.source for fn in DANGEROUS)]
+    assert len(with_sink) >= 5, (
+        "corpus lost its discrimination negatives; fp_rate is no longer measurable. "
+        f"good cases calling a DANGEROUS sink: {[c.name for c in with_sink]}")
+    # and they must span more than one CWE class, or only one detector is exercised
+    assert len({c.cwe for c in with_sink}) >= 3
+
+
 def test_cwe_family_matching():
     # a sink's generic CWE credits a case labeled with a sibling (Juliet uses specific labels)
     assert same_family("CWE-121", "CWE-120") and same_family("CWE-787", "CWE-119")
@@ -353,3 +372,37 @@ def test_confirmed_stage_reproduces_a_crash_via_fuzzing():
     assert not by["nullderef_safe"].flagged              # safe variant -> no confirmed crash
     assert rep.metrics["per_cwe"]["CWE-476"]["recall"] == 1.0
     assert rep.metrics["per_cwe"]["CWE-476"]["fp_rate"] == 0.0
+
+
+# ---------------------------------------------------------------- gate: exact-metric ratchet
+def test_gate_ratchets_on_exact_recall_not_rounded_display():
+    # 2499/2500 recall = 0.9996, which rounds to 1.000 -- but the ratchet must see the true
+    # value and FAIL a min-recall of 1.0 (a sub-0.05% regression must not slip through).
+    m = {"overall": {"tp": 2499, "fp": 0, "fn": 1, "tn": 10,
+                     "recall": round(2499 / 2500, 3), "fp_rate": 0.0}}
+    ok, verdict, _ = gate(m, {"ghidra": "/x"})
+    assert not ok and verdict == "FAIL"
+
+
+def test_gate_ratchets_on_exact_fp_rate_not_rounded_display():
+    # 1 FP in 3001 negatives = 0.00033, which rounds to 0.0 -- a real false positive must not
+    # pass a 0.0 ceiling.
+    m = {"overall": {"tp": 10, "fp": 1, "fn": 0, "tn": 3000,
+                     "recall": 1.0, "fp_rate": round(1 / 3001, 3)}}
+    assert gate(m, {"ghidra": "/x"})[0] is False
+
+
+def test_gate_min_negative_guards_vacuous_precision():
+    # no good cases -> fp_rate None -> precision axis passes vacuously unless min_negative set
+    m = {"overall": {"tp": 4, "fp": 0, "fn": 0, "tn": 0, "recall": 1.0, "fp_rate": None}}
+    assert gate(m, {"ghidra": "/x"})[0] is True                    # off by default
+    ok, verdict, reason = gate(m, {"ghidra": "/x"}, min_negative=1)
+    assert not ok and verdict == "FAIL" and "negative" in reason
+
+
+def test_gate_dynamic_skips_without_a_compiler():
+    m = {"overall": {"tp": 0, "fp": 0, "fn": 4, "tn": 0, "recall": 0.0, "fp_rate": None}}
+    ok, verdict, _ = gate(m, {"gcc": False}, stage="dynamic")
+    assert ok and verdict == "SKIP"                               # mirrors the static Ghidra SKIP
+    assert gate(m, {"gcc": False}, stage="dynamic", require_backend=True)[1] == "FAIL"
+    assert gate(m, {"gcc": True}, stage="dynamic")[1] == "FAIL"   # compiler present -> real miss

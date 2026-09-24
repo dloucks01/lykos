@@ -9,13 +9,16 @@ inputs into; stronger tiers (microVM) come later.
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import platform
 import re
 import resource
 import shutil
 import signal
+import struct
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -29,16 +32,73 @@ CRASH_SIGNALS = {
 _QEMU = {"x86-64": "x86_64", "x86": "i386", "aarch64": "aarch64", "arm": "arm",
          "mips": "mips", "mipsel": "mipsel", "mips64": "mips64", "ppc": "ppc",
          "ppc64": "ppc64", "riscv": "riscv64", "riscv64": "riscv64", "s390": "s390x",
-         "sparc": "sparc", "sh": "sh4", "m68k": "m68k", "loongarch": "loongarch64"}
+         "sparc": "sparc", "sparcv9": "sparc64", "sh": "sh4", "m68k": "m68k",
+         "loongarch": "loongarch64"}
 _HOST = {"x86_64": "x86-64", "amd64": "x86-64", "aarch64": "aarch64", "arm64": "aarch64",
          "armv7l": "arm", "mips": "mips", "ppc64": "ppc64", "ppc64le": "ppc64",
          "riscv64": "riscv64"}
 _bwrap_cache: Optional[bool] = None
-# Shared flag set for the probe AND the real run (so the probe predicts reality). No PID
-# namespace / procfs: those need privileges some VMs restrict; net isolation + ro-root +
-# tmpfs is the portable T1.
-_BWRAP_ARGS = ["--ro-bind", "/", "/", "--tmpfs", "/tmp", "--dev", "/dev",
+# Shared flag set for the probe AND the real run (so the probe predicts reality).
+#
+# `--proc /proc` overlays a FRESH procfs on the read-only root. Without it /proc arrives
+# through the read-only bind and opening /proc/<pid>/mem O_RDWR fails with EROFS -- which is
+# how the block-coverage tracer plants breakpoints. It fell back silently to two ptrace
+# syscalls per block, 72,000 of them per execution on a statically linked target.
+#
+# `--unshare-pid` is what makes that procfs mean anything. A fresh procfs without a PID
+# namespace still lists every process on the host: a target could read 564 entries of
+# /proc/<pid>/cmdline and, for anything running as the same user, /proc/<pid>/environ. With
+# the namespace it sees four, and the tracer is unaffected because a pid namespace is exactly
+# the scope ptrace and /proc/<pid>/mem already work in.
+#
+# `--ro-bind / /` gives the target the shared libraries and loader it needs -- and, since the
+# platform itself commonly runs from a user's home (a venv interpreter, the lykos package, the
+# batch-runner script, the analyst's target and its input files all live under /home), the root
+# bind stays whole so those keep working. What must NOT leak is host SECRETS: a bare read-only
+# root also hands hostile code READ access to ~/.ssh, ~/.aws, /root and the lykos case store
+# (other targets' extracted secrets), and a target's stdout/stderr is captured and persisted as
+# an artifact, so "read a secret and print it" is a real exfil path even with no network. Those
+# specific locations are masked with an empty tmpfs by `_secret_mask_args()`, injected right
+# after this bind by every command builder below -- not a blanket /home mask, which would hide
+# the platform's own interpreter and code.
+_BWRAP_ARGS = ["--ro-bind", "/", "/", "--unshare-pid", "--proc", "/proc",
+               "--tmpfs", "/tmp", "--dev", "/dev",
                "--unshare-net", "--die-with-parent", "--chdir", "/tmp", "--"]
+
+# Directories registered at runtime (the case store) to mask in every sandbox. The target is
+# copied OUT of the store before it runs, so masking the store never denies it anything it needs.
+_EXTRA_PROTECTED: set = set()
+# Well-known credential/secret directories under the invoking user's home. A denylist, so it can
+# miss an unusual location -- but the alternative (masking all of /home) breaks a platform that
+# runs from there, and general home files are exposed read-only regardless of this.
+_SECRET_DOTFILES = (".ssh", ".aws", ".gnupg", ".config/gcloud", ".config/gh", ".kube",
+                    ".docker", ".azure", ".netrc", ".git-credentials", ".password-store",
+                    ".mozilla", ".thunderbird", ".pki", ".cargo/credentials")
+
+
+def protect_dir(path) -> None:
+    """Register a directory (e.g. the case store) to be masked with an empty tmpfs inside every
+    sandbox, so hostile code cannot read it through the read-only root."""
+    try:
+        if path:
+            _EXTRA_PROTECTED.add(str(Path(path).resolve()))
+    except Exception:
+        pass
+
+
+def _secret_mask_args() -> list:
+    """`--tmpfs` masks for host secrets the read-only root would otherwise expose: /root, the
+    invoking user's credential dotfiles, and every dir registered with protect_dir()."""
+    home = os.path.expanduser("~")
+    dirs = ["/root"] + [os.path.join(home, n) for n in _SECRET_DOTFILES] + sorted(_EXTRA_PROTECTED)
+    out = []
+    for d in dirs:
+        try:
+            if os.path.isdir(d):
+                out += ["--tmpfs", d]
+        except OSError:
+            pass
+    return out
 
 
 @dataclass
@@ -54,6 +114,161 @@ class RunResult:
     duration_ms: int = 0
     cmd: list = field(default_factory=list)
     note: Optional[str] = None
+    # Image-relative address of the faulting instruction, when the target was traced. Two
+    # crashes at different addresses are different defects, however alike their signals look.
+    fault_pc: Optional[int] = None
+    # Which of the requested coverage blocks this run reached, or None when coverage was not
+    # asked for. This used to travel in `note`, parsed back out of a comma-joined string --
+    # which worked only because nothing else ever put anything in `note`. The channel runner
+    # has something to say there (which endpoint, which session, why the process died), so the
+    # two uses collided: one of them had to lose, and coverage losing is silent.
+    blocks_hit: Optional[tuple] = None
+
+
+class ArgvNulError(ValueError):
+    """A payload that cannot be delivered as a command-line argument."""
+
+
+def argv_arg(data: bytes, *, truncate: bool = False) -> str:
+    """Render a payload as ONE argv element, or refuse with a clear reason.
+
+    execve() argument strings are NUL-terminated, so an argument cannot contain a NUL byte --
+    the kernel truncates there. This is not a Python limitation to work around: any payload
+    that embeds an address (an L2/L3 confirmation payload almost always does) is undeliverable
+    via argv on most ABIs and must go over stdin or a file. Raising a NAMED error lets callers
+    report that honestly instead of surfacing a bare ValueError("embedded null byte") from
+    inside subprocess, which reads like a crash in the tool rather than a property of the
+    delivery channel.
+
+    `truncate` delivers what the kernel WOULD deliver -- everything up to the first NUL --
+    instead of refusing. Refusing outright was too strong for the case that matters: an
+    argv-reachable `strcpy` overflow copies until the NUL anyway, so a payload whose control
+    slot sits BEFORE the first NUL is delivered perfectly intact. That is not a hypothetical
+    -- it is CVE-2001-1413 in ncompress, where the return address lands at offset 1048 and
+    the marker's own high zero bytes are the first NUL at 1054. Nothing is assumed by
+    truncating: if the control slot does not survive, the marker check simply fails and no
+    primitive is claimed.
+    """
+    if b"\x00" in data:
+        if truncate:
+            return data.split(b"\x00", 1)[0].decode("latin-1")
+        raise ArgvNulError(
+            "payload contains a NUL byte at offset %d and cannot be delivered as a command-"
+            "line argument (execve truncates at NUL); use input_mode 'stdin' or 'file'"
+            % data.index(b"\x00"))
+    return data.decode("latin-1")
+
+
+def argv_bytes(a):
+    """One argv element as BYTES, without re-encoding a binary payload.
+
+    `argv_arg` renders a payload as latin-1 text because that is the lossless round-trip for
+    arbitrary bytes through JSON. Handing that str to subprocess/execv undoes it: they encode
+    with the filesystem encoding, so every byte >= 0x80 becomes two UTF-8 bytes and any
+    payload carrying an address is silently corrupted. That is most L2/L3 payloads, and it is
+    why argv-delivered instruction-pointer control never confirmed.
+
+    A latin-1-decoded payload only ever holds code points <= U+00FF, so encoding it back with
+    latin-1 is exact. A genuine non-ASCII path (real text, code points above that) cannot be
+    a payload and is encoded the way the filesystem expects.
+    """
+    if isinstance(a, bytes):
+        return a
+    if not isinstance(a, str):
+        a = str(a)
+    try:
+        return a.encode("latin-1")
+    except UnicodeEncodeError:
+        return a.encode("utf-8", "surrogateescape")
+
+
+# One namespace, many executions. Spawning bubblewrap costs 3.18 ms of a 3.55 ms execution --
+# a 9.5x tax paid on EVERY input -- which is why a campaign managed 256 exec/s against AFL++'s
+# 6,100. The runner lives in a real module rather than an embedded string, because it now also
+# carries a ptrace tracer and that does not belong in a quoted blob.
+def _batch_runner_path() -> str:
+    from ..fuzz import batch_runner
+    return str(Path(batch_runner.__file__).resolve())
+
+
+def run_batch(exe, payloads, *, mode="stdin", base_argv=(), timeout: float = 2.0,
+              arch=None, endianness=None, bits=None, host=None, mem_mb: int = 2048,
+              blocks=()):
+    """Execute many inputs inside ONE sandbox. Returns a list of RunResult, or None.
+
+    `blocks` are image-relative basic-block addresses to watch; each result then carries the
+    ones this input REACHED, in `RunResult.note` as a comma-separated list. Breakpoints are
+    one-shot per execution and the caller passes only blocks it has not seen, so the cost
+    decays as coverage saturates.
+
+    None means "not available here" -- no bubblewrap, no python3, an emulated or PE target, a
+    malformed reply -- and the caller falls back to `run()` per input. Speed is never a reason
+    to run a hostile binary with less containment than usual, so this buys throughput by
+    amortising the namespace, not by giving one up.
+    """
+    host = host or host_arch()
+    if _is_pe(exe) or _is_jvm(exe) or (arch and host and arch != host):
+        # Wine, the JVM and qemu stay per-exec. The batch runner execs the target directly and
+        # traces it with ptrace; a jar is not executable and the JVM is not the target, so
+        # batching it would run the wrong program under breakpoints meant for another.
+        return None
+    py = shutil.which("python3")
+    if not py or not _bwrap_usable() or not payloads:
+        return None
+    exedir = str(Path(exe).resolve().parent)
+    runner = _batch_runner_path()
+    inner = [py, runner, mode, str(timeout), str(exe),
+             *[argv_bytes(a).decode("latin-1") for a in base_argv]]
+    cmd = (["bwrap"] + _BWRAP_ARGS[:-1] + _secret_mask_args()
+           + ["--ro-bind", exedir, exedir, "--"] + inner)
+    blocks = list(blocks)
+    blob = bytearray(struct.pack("<II", len(payloads), len(blocks)))
+    if blocks:
+        blob += struct.pack("<%dQ" % len(blocks), *blocks)
+    for d in payloads:
+        blob += struct.pack("<I", len(d)) + d
+    budget = timeout * len(payloads) + 15.0
+    t0 = time.time()
+    # The batch path never caps AS (set_as=False), so an ASan build initialises fine here -- but
+    # then has no memory guard at all. Bound each target invocation's RESIDENT memory with ASan's
+    # own hard_rss_limit_mb, the same guard run() uses, so a sanitizer build cannot OOM the host.
+    env = None
+    if _is_sanitizer_exe(exe):
+        env = dict(os.environ)
+        _prior = env.get("ASAN_OPTIONS", "")
+        env["ASAN_OPTIONS"] = ((_prior + ":") if _prior else "") + \
+            f"abort_on_error=1:hard_rss_limit_mb={max(256, int(mem_mb))}:detect_leaks=0"
+    rc, out, err, timed, _dur = _spawn(cmd, bytes(blob), budget,
+                                       _rlimits(mem_mb, int(budget) + 5, set_as=False,
+                                                nproc=_nproc_cap(False)), env=env)
+    if timed or rc != 0 or (err.startswith(b"bwrap:") and not _bwrap_probe_fresh()):
+        return None
+    per_ms = int((time.time() - t0) * 1000 / max(1, len(payloads)))
+    results, off = [], 0
+    for _ in payloads:
+        if off + 25 > len(out):
+            return None                               # truncated reply: fall back rather than
+        code, nso, nse, flags, nnew, fault_pc = struct.unpack(   # invent one
+            "<iIIBIQ", out[off:off + 25])
+        off += 25
+        so, se = out[off:off + nso], out[off + nso:off + nso + nse]
+        off += nso + nse
+        reached = ()
+        if nnew:
+            if off + 8 * nnew > len(out):
+                return None
+            reached = struct.unpack("<%dQ" % nnew, out[off:off + 8 * nnew])
+            off += 8 * nnew
+        crashed, sig, signame, exit_code = classify_rc(code)
+        results.append(RunResult(isolation="bwrap+netns+batch", crashed=bool(crashed),
+                                 timed_out=bool(flags & 1), exit_code=exit_code, signal=sig,
+                                 signal_name=signame, stdout=so, stderr=se,
+                                 duration_ms=per_ms, fault_pc=(fault_pc or None),
+                                 # both channels, like run(): `blocks_hit` is the explicit
+                                 # one, `note` stays for a reader that has not been moved over
+                                 blocks_hit=tuple(reached) if blocks else None,
+                                 note=(",".join(str(x) for x in reached) or None)))
+    return results
 
 
 def host_arch() -> str:
@@ -91,6 +306,8 @@ def _qemu_for(arch, endianness=None, bits=None) -> Optional[str]:
         suf = "ppc64le"
     elif arch == "riscv":
         suf = "riscv32" if bits == 32 else "riscv64"
+    elif arch == "sparc" and bits == 64:      # EM_SPARC with a 64-bit class -> v9
+        suf = "sparc64"
     return shutil.which("qemu-" + suf) if suf else None
 
 
@@ -130,21 +347,91 @@ def _nproc_cap(emu: bool) -> int:
     return min(cap, hard) if hard != resource.RLIM_INFINITY else cap
 
 
-def _rlimits(mem_mb: int, cpu_s: int, set_as: bool, nproc: Optional[int] = None):
+_ADDR_NO_RANDOMIZE = 0x0040000                 # <linux/personality.h>
+
+
+def _disable_aslr():
+    """Turn off address-space randomization for the child (personality ADDR_NO_RANDOMIZE).
+
+    Without this a PIE / ASan target faults at a different runtime address every run, so the
+    faulting PC -- which the crash dedup key is built from -- is never the same twice. One defect
+    then splits into dozens of "distinct" findings, and root_cause (run under gdb, which disables
+    randomization by default) reports a stable address that never matches the fuzzer's randomized
+    one, so its enriched classification lands as yet another finding instead of merging. Disabling
+    randomization makes the fault PC deterministic and consistent across stages -- the standard
+    choice for crash reproduction. Best-effort: a platform without personality() is unaffected."""
+    try:
+        import ctypes
+        libc = ctypes.CDLL(None, use_errno=True)
+        cur = libc.personality(0xffffffff)     # query current persona (-1 on failure)
+        if cur != -1:
+            libc.personality(cur | _ADDR_NO_RANDOMIZE)
+    except Exception:
+        pass
+
+
+# A GENEROUS virtual-address cap for emulated (qemu-user) and Wine targets. A tight RLIMIT_AS
+# breaks qemu's guest reservation, but an uncapped run lets a guest/PE memory bomb map host memory
+# without bound and OOM the platform -- so bound it well above normal need but finite. Empirically
+# qemu-user runs comfortably under a few GB; 8 GB leaves ample headroom while stopping a runaway.
+_EMU_AS_MB = 8192
+
+
+def _rlimits(mem_mb: int, cpu_s: int, set_as: bool, nproc: Optional[int] = None,
+             as_mb: Optional[int] = None):
+    """Per-child resource caps. `set_as` caps RLIMIT_AS at `mem_mb` (the tight native/sanitizer-off
+    bound); `as_mb`, when given, caps it at that value instead (the generous emu/wine bound) so no
+    execution path is left with UNBOUNDED memory. Each limit is set in its own try so a platform
+    that rejects one (e.g. RLIMIT_NPROC EPERM) cannot skip the safety-critical AS cap -- which is
+    applied FIRST for that reason."""
     if nproc is None:
         nproc = _nproc_cap(False)              # default: baseline-aware native cap
+    cap_mb = (mem_mb if set_as else as_mb)
     def _apply():
-        try:
-            resource.setrlimit(resource.RLIMIT_CPU, (cpu_s, cpu_s + 1))
-            resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-            resource.setrlimit(resource.RLIMIT_FSIZE, (64 << 20, 64 << 20))
-            resource.setrlimit(resource.RLIMIT_NPROC, (nproc, nproc))
-            if set_as:
-                lim = mem_mb << 20
+        _disable_aslr()
+        if cap_mb:                             # AS first: never skipped behind another limit
+            try:
+                lim = cap_mb << 20
                 resource.setrlimit(resource.RLIMIT_AS, (lim, lim))
-        except Exception:
-            pass
+            except Exception:
+                pass
+        for _res, _val in ((resource.RLIMIT_CPU, (cpu_s, cpu_s + 1)),
+                           (resource.RLIMIT_CORE, (0, 0)),
+                           (resource.RLIMIT_FSIZE, (64 << 20, 64 << 20)),
+                           (resource.RLIMIT_NPROC, (nproc, nproc))):
+            try:
+                resource.setrlimit(_res, _val)
+            except Exception:
+                pass
     return _apply
+
+
+_SAN_EXE_CACHE: dict = {}
+
+
+def _is_sanitizer_exe(exe) -> bool:
+    """True if the native ELF at `exe` is an ASan/UBSan build. A sanitizer runtime reserves a
+    ~20TB *virtual* shadow region at startup; under an RLIMIT_AS cap that mmap fails and the
+    process aborts before main() -- turning EVERY input into a spurious SIGABRT "crash". The
+    caller uses this to drop the AS cap (and bound resident memory instead) for such builds.
+
+    Cached by (path, mtime, size): the fuzz loop calls run() thousands of times on one exe."""
+    try:
+        st = os.stat(exe)
+        key = (str(exe), st.st_mtime_ns, st.st_size)
+    except OSError:
+        return False
+    hit = _SAN_EXE_CACHE.get(key)
+    if hit is None:
+        try:
+            from ..fuzz.aflpp import is_sanitizer_build       # lazy: avoids an import cycle
+            hit = bool(is_sanitizer_build(Path(exe).read_bytes()))
+        except Exception:
+            hit = False
+        if len(_SAN_EXE_CACHE) > 256:
+            _SAN_EXE_CACHE.clear()
+        _SAN_EXE_CACHE[key] = hit
+    return hit
 
 
 def _killpg(p):
@@ -155,6 +442,70 @@ def _killpg(p):
             p.kill()
         except Exception:
             pass
+
+
+def _bwrap_probe_fresh() -> bool:
+    """Run a trusted /bin/true under the real bwrap args, ignoring the cache. Lets a genuine
+    namespace-setup failure be told apart from a target that merely printed 'bwrap:' on its own
+    stderr to trick us into stripping its sandbox."""
+    try:
+        r = subprocess.run(["bwrap"] + _BWRAP_ARGS + ["/bin/true"],
+                           capture_output=True, timeout=5)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def isolate_prefix(exedir: str, *, net: bool, ro_binds=(), rw_binds=()) -> list:
+    """bwrap argv prefix that contains a target for the debug/PoC paths that spawn it directly
+    (the gdb stub, the native gdb tools, the leak harness). Read-only root (with /home and /root
+    masked), tmpfs /tmp, pid namespace and die-with-parent, plus the target's own directory
+    bound read-only so a target staged under the tmpfs'd /tmp stays visible. `net=True` KEEPS
+    the network namespace so a loopback gdb control channel still connects; `net=False` unshares
+    it (strictly more isolation, and exactly the config `_bwrap_usable` probes -- use it for any
+    path that does not need loopback).
+
+    `ro_binds` / `rw_binds` are extra directories to re-expose over the tmpfs masks -- a native
+    gdb tool binds the read-only dir holding its script and input file; a tracer that writes a
+    log binds that dir writable. They come AFTER the exedir bind, so a later rw bind wins over an
+    earlier ro bind of the same path (bwrap is last-wins).
+
+    Returns [] when bwrap is unusable, so the caller runs unwrapped (rlimits still apply)."""
+    if not _bwrap_usable():
+        return []
+    args = [a for a in _BWRAP_ARGS[:-1] if not (net and a == "--unshare-net")]
+    cmd = ["bwrap"] + args + _secret_mask_args() + ["--ro-bind", exedir, exedir]
+    for d in ro_binds:
+        cmd += ["--ro-bind", str(d), str(d)]
+    for d in rw_binds:
+        cmd += ["--bind", str(d), str(d)]
+    return cmd + ["--"]
+
+
+def run_reaped(cmd, *, input=None, timeout=None, capture_output=False, **kw):
+    """subprocess.run, but the child gets its own session and, on timeout, the WHOLE process
+    group is killed before TimeoutExpired propagates -- so a launcher's children (wineserver, a
+    qemu worker, a gdb inferior) cannot outlive the trace and keep running on the host. Callers
+    catch TimeoutExpired exactly as with subprocess.run."""
+    if capture_output:
+        kw["stdout"] = subprocess.PIPE
+        kw["stderr"] = subprocess.PIPE
+    kw.setdefault("start_new_session", True)
+    # No input to feed => tie stdin to /dev/null, never inherit the worker's stdin: a hostile
+    # inferior (gdb -batch has no input redirect unless a file is given) would otherwise block
+    # reading the server's stdin, the same hang class fixed in jobs.context.run_subprocess.
+    stdin = subprocess.PIPE if input is not None else kw.pop("stdin", subprocess.DEVNULL)
+    proc = subprocess.Popen(cmd, stdin=stdin, **kw)
+    try:
+        out, err = proc.communicate(input=input, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _killpg(proc)
+        try:
+            proc.communicate(timeout=5)
+        except Exception:
+            pass
+        raise
+    return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
 
 
 def _spawn(cmd, stdin, timeout, preexec, env=None):
@@ -191,10 +542,217 @@ _WINE_EXC = {
     "80000003": "BREAKPOINT",
 }
 _WINE_EXC_RE = re.compile(rb"Unhandled exception code ([0-9a-fA-F]{8})")
+# Wine has a SECOND format for the commonest crash there is, and matching only the first meant
+# every PE access violation read as a clean exit -- so no PE crash was ever recorded and the
+# whole PoC ladder was unreachable for Windows targets:
+#   wine: Unhandled page fault on read access to 00007FFFFF8A0C77 at address 000000014000547D
+# A page fault IS c0000005; the access word (read/write/execute) is kept for the note.
+_WINE_FAULT_RE = re.compile(
+    rb"Unhandled page fault on (read|write|execute)(?:-inclusive)? access"
+    rb"(?: to ([0-9a-fA-F]+))?(?: at address ([0-9a-fA-F]+))?")
+
+
+def wine_exception(stderr: bytes):
+    """(nt status, human name, detail) for a Wine guest crash, or (None, None, None).
+
+    Two formats, one meaning. Anything that says "Unhandled" and names a fault is a crash:
+    reporting it as a clean run is the worst possible answer, because the input that caused
+    it then looks uninteresting.
+    """
+    m = _WINE_EXC_RE.search(stderr or b"")
+    if m:
+        code = m.group(1).decode().lower()
+        return code, "EXCEPTION_" + _WINE_EXC.get(code, code.upper()), None
+    m = _WINE_FAULT_RE.search(stderr or b"")
+    if m:
+        how = m.group(1).decode()
+        at = (m.group(3) or m.group(2) or b"").decode()
+        detail = f"page fault on {how} access" + (f" at 0x{at}" if at else "")
+        return "c0000005", "EXCEPTION_ACCESS_VIOLATION", detail
+    return None, None, None
+
+
+# ---- JVM: a defect surfaces as an uncaught exception, not a signal -----------------------
+#
+# Exception in thread "main" java.lang.ArrayIndexOutOfBoundsException: Index 99 out of ...
+# 	at Svc.setOpt(Svc.java:14)
+#
+# The "Exception in thread" prefix is the load-bearing part. A program that catches its own
+# exception and calls printStackTrace() writes a nearly identical block to stderr and then
+# carries on and exits 0 -- reporting that as a crash would turn correct error handling into
+# a finding, which is the same defect as counting a usage message as a crash.
+_JVM_EXC_RE = re.compile(
+    r'Exception in thread "([^"]*)"\s+([A-Za-z_$][\w.$]*(?:Exception|Error|Throwable))'
+    r'(?::\s*(.*))?')
+_JVM_FRAME_RE = re.compile(r"^\s+at\s+([\w.$/<>]+)\(([^)]*)\)", re.M)
+# The JVM itself dying -- a JNI bug, or a VM defect. This IS memory corruption, and it is a
+# far stronger result than any Java-level exception.
+_JVM_FATAL_RE = re.compile(
+    r"A fatal error has been detected by the Java Runtime Environment", re.I)
+_JVM_FATAL_SIG = re.compile(r"(SIG[A-Z]+)\s*\(", re.I)
+# -XX:+ExitOnOutOfMemoryError makes the VM die immediately instead of unwinding, which is what
+# we want (an unbounded allocation must fail fast rather than let the host absorb it) -- but it
+# prints THIS instead of a stack trace, so matching only "Exception in thread" made
+# uncontrolled memory allocation, one of the most common real Java defects, invisible.
+_JVM_TERM_RE = re.compile(r"^Terminating due to (java\.lang\.\w*(?:Error|Exception))"
+                          r"(?::\s*(.*))?", re.M)
+# Frames inside the JDK are where an exception is CONSTRUCTED, not where the defect is. Every
+# NumberFormatException in every program is thrown from
+# java.base/java.lang.NumberFormatException.forInputString, so blaming the top frame blames
+# the JDK and dedups every such bug in the target into one finding.
+_JDK_FRAME = re.compile(r"^(?:java\.base/|java\.\w+/|jdk\.|sun\.|com\.sun\.|javax\.)")
+
+
+def jvm_exception(stderr: bytes, exit_code: Optional[int] = None, stdout: bytes = b""):
+    """(kind, detail, frames) for an uncaught JVM fault, else (None, None, []).
+
+    `kind` is the exception class name, which is this runtime's equivalent of a signal name:
+    ArrayIndexOutOfBoundsException says far more about the defect than SIGSEGV does.
+
+    Which STREAM each thing is read from is load-bearing, and the two are not interchangeable.
+    An uncaught exception always goes to stderr -- that is what the JVM's default handler
+    does. But -XX:+ExitOnOutOfMemoryError prints "Terminating due to ..." to STDOUT, so
+    reading stderr alone made unbounded allocation invisible.
+
+    The obvious fix -- scan both streams for everything -- opens a hole a fuzzer finds on its
+    own: a target that echoes its input would report a crash the moment a mutation contains
+    the text `Exception in thread`, and a mutator that is rewarded for crashes will produce
+    that string deliberately. So the exception trace is read from stderr only, where a target
+    cannot put it by echoing, and the VM's termination line is corroborated by a non-zero exit
+    -- a program echoing text exits 0.
+    """
+    text = (stderr or b"").decode("utf-8", "replace")
+    vm_text = text + "\n" + (stdout or b"").decode("utf-8", "replace")
+    if _JVM_FATAL_RE.search(vm_text) and exit_code not in (0, None):
+        sig = _JVM_FATAL_SIG.search(vm_text)
+        return ("JVM-FATAL-" + (sig.group(1).upper() if sig else "ABORT"),
+                "the JVM itself crashed -- native memory corruption, not a Java exception",
+                _JVM_FRAME_RE.findall(vm_text))
+    m = _JVM_EXC_RE.search(text)
+    if not m:
+        t = _JVM_TERM_RE.search(vm_text)
+        if t and exit_code not in (0, None):
+            short = t.group(1).rsplit(".", 1)[-1]
+            return short, (f"the VM terminated on {short}"
+                           + (f": {t.group(2).strip()}" if t.group(2) else "")
+                           + " -- an allocation the input controls"), []
+        return None, None, []
+    thread, cls, msg = m.group(1), m.group(2), (m.group(3) or "").strip()
+    frames = _JVM_FRAME_RE.findall(text)
+    short = cls.rsplit(".", 1)[-1]
+    blame = app_frame(frames)
+    where = f" at {blame[0]}({blame[1]})" if blame else ""
+    detail = f"uncaught {short} in thread \"{thread}\"" + (f": {msg}" if msg else "") + where
+    return short, detail, frames
+
+
+def app_frame(frames):
+    """The first frame that is the TARGET's code rather than the JDK's.
+
+    `Integer.parseInt("abc")` throws from three JDK frames deep. The defect is not in
+    java.base -- it is the line that passed unvalidated input to it, which is the first frame
+    below them.
+    """
+    for fr in frames or ():
+        if not _JDK_FRAME.match(fr[0]):
+            return fr
+    return frames[0] if frames else None
+
+
+def jvm_site(frames) -> Optional[int]:
+    """A stable id for WHERE the exception was thrown, used where a native crash uses the
+    faulting PC. Two ArrayIndexOutOfBoundsExceptions thrown from different methods are two
+    defects, and without this they dedup into one -- so this keys on the application frame,
+    not the JDK frame that constructed the exception."""
+    fr = app_frame(frames)
+    if not fr:
+        return None
+    return int(hashlib.sha256(f"{fr[0]}({fr[1]})".encode()).hexdigest()[:8], 16)
+
+
+# Startup dominates a Java execution, so these are not cosmetic: measured on a trivial jar,
+# 37 ms plain against 27 ms with them, and a fuzzing campaign pays it on every input.
+# -Xmx/-Xss are bounds, not tuning: an unbounded allocation is one of the defects being
+# hunted, and without a heap cap the host absorbs it instead of the target failing fast.
+_JVM_FLAGS = ("-XX:TieredStopAtLevel=1", "-XX:+UseSerialGC", "-XX:-UsePerfData",
+              "-Xshare:auto", "-Xmx256m", "-Xss512k", "-Djava.awt.headless=true",
+              "-XX:+ExitOnOutOfMemoryError")
+
+
+def _java() -> Optional[str]:
+    return shutil.which("java")
+
+
+def _is_jvm(path) -> bool:
+    try:
+        head = Path(path).open("rb").read(8)
+    except Exception:
+        return False
+    from ..jvm import is_class
+    if is_class(head + b"\x00" * 8):
+        return True
+    return head[:4] == b"PK\x03\x04" and _looks_like_jar(path)
+
+
+def _looks_like_jar(path) -> bool:
+    import zipfile
+    try:
+        with zipfile.ZipFile(path) as z:
+            names = z.namelist()
+        return any(n.endswith(".class") for n in names) or "META-INF/MANIFEST.MF" in names
+    except Exception:
+        return False
+
+
+def _run_java(exe, *, argv, stdin, timeout, mem_mb, capture, main_class=None) -> RunResult:
+    java = _java()
+    if not java:
+        return RunResult(isolation="jvm-missing",
+                         note="no JVM found; install a JDK/JRE to run a Java target "
+                              "(or analyse it statically -- the constant pool needs no JVM)")
+    exe = Path(exe)
+    if _looks_like_jar(exe):
+        launch = ["-jar", str(exe)]
+    else:
+        # a bare .class: the class name is its own, and the classpath is its directory
+        cls = main_class or exe.stem
+        launch = ["-cp", str(exe.parent), cls]
+    cmd = [java, *_JVM_FLAGS, *launch] + [argv_bytes(a) for a in argv]
+    eff_timeout = max(timeout, 10.0)                 # JVM startup is tens of milliseconds
+    preexec = _rlimits(max(mem_mb, 2048), int(eff_timeout) + 2, set_as=False,
+                       nproc=_nproc_cap(True))       # the JVM is threaded; don't cap AS
+    iso = "rlimits-only+jvm"
+    run = cmd
+    if _bwrap_usable():
+        exedir = str(exe.resolve().parent)
+        run = (["bwrap"] + _BWRAP_ARGS[:-1] + _secret_mask_args()
+               + ["--ro-bind", exedir, exedir] + ["--"] + cmd)
+        iso = "bwrap+netns+jvm"
+    rc, out, err, timed, dur = _spawn(run, stdin, eff_timeout, preexec)
+    if (iso.startswith("bwrap") and not timed and err.startswith(b"bwrap:")
+            and not _bwrap_probe_fresh()):
+        # A fresh /bin/true probe confirms bwrap genuinely cannot set up a namespace here (not
+        # the target spoofing "bwrap:" on stderr). Degrade to rlimits-only for THIS run only.
+        rc, out, err, timed, dur = _spawn(cmd, stdin, eff_timeout, preexec)
+        iso = "rlimits-only+jvm"
+    kind, detail, frames = jvm_exception(err, rc, out)
+    crashed = kind is not None
+    return RunResult(
+        isolation=iso, crashed=crashed, timed_out=timed,
+        exit_code=(None if crashed else rc), signal=None, signal_name=kind,
+        stdout=out[:capture], stderr=err[:capture], duration_ms=dur, cmd=run,
+        fault_pc=jvm_site(frames) if crashed else None,
+        note=(detail if crashed else (None if not timed else "timed out")))
 
 
 def _wine() -> Optional[str]:
-    return shutil.which("wine") or shutil.which("wine64")
+    # Debian ships the binary as `wine-stable` (or `wine-development`) and exposes `wine` only as
+    # an update-alternatives symlink -- which does NOT travel in the relocatable air-gap bundle,
+    # so on the laptop only `wine-stable` exists. Try the versioned names too or PE execution is
+    # silently unavailable there despite Wine being bundled. Running the binary under its own
+    # name is equivalent to `wine`.
+    return (shutil.which("wine") or shutil.which("wine64")
+            or shutil.which("wine-stable") or shutil.which("wine-development"))
 
 
 def _is_pe(exe) -> bool:
@@ -246,13 +804,16 @@ def _run_windows(exe, *, argv, stdin, timeout, mem_mb, capture, wineprefix) -> R
     env = {**os.environ, "WINEPREFIX": prefix, "WINEDEBUG": "fixme-all", "DISPLAY": ""}
     cmd = [wine, str(exe)] + [str(a) for a in argv]
     eff_timeout = max(timeout, 10.0)                   # wine bootstraps a wineserver -> headroom
-    # wine + wineserver need many fds/threads and a large AS; don't cap AS, widen nproc.
-    preexec = _rlimits(mem_mb, int(eff_timeout) + 5, set_as=False, nproc=_nproc_cap(True))
+    # wine + wineserver need many fds/threads and a large AS; use the GENEROUS emu/wine cap (not
+    # the tight native one) so a PE memory bomb still cannot OOM the host, and widen nproc.
+    preexec = _rlimits(mem_mb, int(eff_timeout) + 5, set_as=False, nproc=_nproc_cap(True),
+                       as_mb=max(mem_mb, _EMU_AS_MB))
+    # NB: the wine path runs UNWRAPPED (rlimits only, like the original) -- wine needs a writable
+    # prefix under ~/.cache and its own service processes, so the bwrap secret-masking that
+    # hardens the ELF/JVM paths is deliberately not applied here.
     rc, out, err, timed, dur = _spawn(cmd, stdin, eff_timeout, preexec, env=env)
-    m = _WINE_EXC_RE.search(err or b"")
-    code = m.group(1).decode().lower() if m else None
+    code, name, detail = wine_exception(err or b"")
     crashed = code is not None
-    name = ("EXCEPTION_" + _WINE_EXC.get(code, code.upper())) if code else None
     # a launch failure (esp. a 32-bit PE with no i386 WoW64 runtime) must not read as a clean run.
     # key only on the loader's "failed to load" message (a bare c0000135 is a benign DLL-probe miss)
     low = (err or b"").lower()
@@ -268,17 +829,25 @@ def _run_windows(exe, *, argv, stdin, timeout, mem_mb, capture, wineprefix) -> R
         exit_code=(None if crashed else rc), signal=None, signal_name=name,
         stdout=(out or b"")[:capture], stderr=(err or b"")[:capture],
         duration_ms=dur, cmd=cmd,
-        note=None if crashed or not timed else "timed out")
+        note=(detail if crashed and detail else
+              (None if crashed or not timed else "timed out")))
 
 
 def run(exe, *, argv=(), stdin: bytes = b"", timeout: float = 10.0,
         arch: Optional[str] = None, endianness: Optional[str] = None,
         bits: Optional[int] = None, host: Optional[str] = None, mem_mb: int = 2048,
-        capture: int = 65536, wineprefix: Optional[str] = None) -> RunResult:
+        capture: int = 65536, wineprefix: Optional[str] = None, blocks=()) -> RunResult:
+    """`blocks` asks for coverage. On an EMULATED target that is the only way to get it: the
+    ptrace tracer the batch runner uses cannot reach inside qemu, so every non-native campaign
+    was running blind on output shape alone -- eleven of the twelve architectures the platform
+    builds real targets for. qemu logs the guest PC of each translated block itself."""
     host = host or host_arch()
     if _is_pe(exe):                                     # Windows PE -> Wine substrate
         return _run_windows(exe, argv=argv, stdin=stdin, timeout=timeout, mem_mb=mem_mb,
                             capture=capture, wineprefix=wineprefix)
+    if _is_jvm(exe):                                    # jar / .class -> the JVM
+        return _run_java(exe, argv=argv, stdin=stdin, timeout=timeout, mem_mb=mem_mb,
+                         capture=capture)
     emu = None
     if arch and host and arch != host:
         emu = _qemu_for(arch, endianness, bits)
@@ -287,52 +856,117 @@ def run(exe, *, argv=(), stdin: bytes = b"", timeout: float = 10.0,
                              note=f"no qemu-user for {arch} ({endianness or '?'}-endian) "
                                   f"on {host}")
 
-    base = [str(exe)] + [str(a) for a in argv]
-    inner = [emu] + base if emu else base
+    base = [str(exe)] + [argv_bytes(a) for a in argv]
+    trace_log = None
+    if emu and blocks:
+        tdir = tempfile.mkdtemp(prefix="lykos-qtrace-")
+        trace_log = str(Path(tdir) / "exec.log")
+        inner = [emu, "-d", "exec", "-D", trace_log] + base
+    else:
+        inner = [emu] + base if emu else base
     # emulation is several times slower than native, so give it a longer wall-clock budget or
     # correct runs would be misreported as timeouts.
     eff_timeout = max(timeout * 3, 5.0) if emu else timeout
-    # emulated processes need a larger address space; don't cap AS then
-    preexec = _rlimits(mem_mb, int(eff_timeout) + 2, set_as=(emu is None),
-                       nproc=_nproc_cap(emu is not None))
+    # Emulated processes AND sanitizer builds need a huge virtual address space: qemu maps the
+    # guest, and an ASan/UBSan runtime reserves a ~20TB shadow region. An RLIMIT_AS cap makes
+    # that mmap fail and the process aborts before main() -- so every input reads as a spurious
+    # SIGABRT crash (the source-code path is entirely ASan builds). Drop the AS cap for those
+    # and bound RESIDENT memory instead via ASan's own hard_rss_limit_mb, which caps real RAM
+    # (the shadow is sparse) without touching the virtual reservation.
+    san = emu is None and _is_sanitizer_exe(exe)
+    # emu: use the GENEROUS AS cap (a tight one breaks qemu's guest reservation, but no cap lets a
+    # guest memory bomb OOM the host). san: no AS cap (the 20TB shadow needs it), bounded by
+    # hard_rss_limit_mb below. native non-san: the tight mem_mb cap.
+    preexec = _rlimits(mem_mb, int(eff_timeout) + 2, set_as=(emu is None and not san),
+                       nproc=_nproc_cap(emu is not None or san),
+                       as_mb=(max(mem_mb, _EMU_AS_MB) if emu else None))
+    env = None
+    if san:
+        env = dict(os.environ)
+        _prior = env.get("ASAN_OPTIONS", "")
+        env["ASAN_OPTIONS"] = ((_prior + ":") if _prior else "") + \
+            f"abort_on_error=1:hard_rss_limit_mb={max(256, int(mem_mb))}:detect_leaks=0"
 
     iso = "rlimits-only" + ("+qemu" if emu else "")
     cmd = inner
     if _bwrap_usable():
-        # The exe is staged under /tmp, which _BWRAP_ARGS masks with a tmpfs. A native target
-        # then triggers a "bwrap:" exec error and we fall back below; but an EMULATED target
-        # runs qemu (visible) which just can't open the masked guest -> a silent no-crash. So
-        # bind the exe's scratch dir back in read-only when emulating.
-        extra = []
-        if emu:
-            exedir = str(Path(exe).resolve().parent)
-            extra = ["--ro-bind", exedir, exedir]
+        # The exe is staged under /tmp (ctx.scratch()), which _BWRAP_ARGS masks with a tmpfs,
+        # so the guest binary vanishes inside the sandbox. Bind its directory back in
+        # read-only -- for NATIVE targets as well as emulated ones. Doing this only for the
+        # emulated case meant a native target hit a "bwrap:" exec error and silently fell back
+        # to the rlimits-only tier: no network namespace and no read-only root, precisely
+        # where it matters most (running hostile code on the host CPU).
+        exedir = str(Path(exe).resolve().parent)
+        extra = _secret_mask_args() + ["--ro-bind", exedir, exedir]
+        if trace_log:
+            # qemu writes its block log to a FILE, and /tmp inside the sandbox is a private
+            # tmpfs -- the log is created there and gone the moment the sandbox exits, which
+            # is why every traced emulated run reported zero blocks. Bind the log's own
+            # directory writable; it holds nothing else.
+            tdir = str(Path(trace_log).parent)
+            extra += ["--bind", tdir, tdir]
         cmd = ["bwrap"] + _BWRAP_ARGS[:-1] + extra + ["--"] + inner
         iso = ("bwrap+netns" + ("+qemu" if emu else ""))
 
-    rc, out, err, timed, dur = _spawn(cmd, stdin, eff_timeout, preexec)
+    rc, out, err, timed, dur = _spawn(cmd, stdin, eff_timeout, preexec, env=env)
 
     # bubblewrap setup failed at runtime (some VMs rate-limit namespace creation) -> fall
     # back to rlimits-only and stop trying bwrap this session.
-    if iso.startswith("bwrap") and not timed and err.startswith(b"bwrap:"):
-        global _bwrap_cache
-        _bwrap_cache = False
+    if (iso.startswith("bwrap") and not timed and err.startswith(b"bwrap:")
+            and not _bwrap_probe_fresh()):
+        # bwrap genuinely cannot create a namespace here (confirmed by re-probing with a trusted
+        # /bin/true -- so this is not the target spoofing "bwrap:" on its own stderr to strip its
+        # sandbox). Fall back to rlimits-only for THIS run only; do NOT disable bwrap for the
+        # rest of the session on the strength of one run's output.
         cmd, iso = inner, "rlimits-only" + ("+qemu" if emu else "")
-        rc, out, err, timed, dur = _spawn(cmd, stdin, eff_timeout, preexec)
+        rc, out, err, timed, dur = _spawn(cmd, stdin, eff_timeout, preexec, env=env)
 
-    # crash signal: native subprocess reports -signum; wrappers (bwrap) report 128+signum
-    sig = None
-    exit_code = None
-    if rc is not None:
-        if rc < 0:
-            sig = -rc
-        elif rc > 128 and (rc - 128) in CRASH_SIGNALS:
-            sig = rc - 128
-        else:
-            exit_code = rc
+    # classify_rc() holds the one copy of this: native subprocesses report -signum while
+    # wrappers (bwrap/qemu) report 128+signum, and the two had drifted apart here.
+    crashed, sig, sig_name, exit_code = classify_rc(rc)
+    note, fault_pc, blocks_hit = None, None, None
+    if trace_log:
+        reached, last = _qemu_reached(trace_log, blocks, want_last=True)
+        note = ",".join(str(x) for x in reached) or None
+        blocks_hit = tuple(reached)
+        # Where it died, for an EMULATED target. The ptrace tracer cannot reach inside qemu,
+        # so a cross-architecture crash had no faulting address and every SIGSEGV in the
+        # program bucketed as one finding. qemu's log stops at the fault, so the last block it
+        # translated is the closest thing to a fault locus available here -- a block address,
+        # not the exact instruction, which is enough to tell two defects apart.
+        if crashed:
+            fault_pc = last
+        shutil.rmtree(Path(trace_log).parent, ignore_errors=True)
     return RunResult(
-        isolation=iso, crashed=(sig in CRASH_SIGNALS if sig else False), timed_out=timed,
-        exit_code=exit_code, signal=sig,
-        signal_name=CRASH_SIGNALS.get(sig) if sig else None,
+        isolation=iso, crashed=crashed, timed_out=timed,
+        exit_code=exit_code, signal=sig, signal_name=sig_name,
         stdout=(out or b"")[:capture], stderr=(err or b"")[:capture],
-        duration_ms=dur, cmd=cmd)
+        duration_ms=dur, cmd=cmd, note=note, fault_pc=fault_pc, blocks_hit=blocks_hit)
+
+
+_TRACE_PC = re.compile(rb"^Trace \d+: 0x[0-9a-f]+ \[[^/]*/([0-9a-f]+)/", re.M)
+
+
+def _qemu_reached(path, blocks, want_last: bool = False):
+    """Which of `blocks` qemu executed, from its own -d exec log.
+
+    The log line is `Trace 0: <host addr> [<flags>/<GUEST PC>/...] <symbol>`, so the guest PC
+    is the second bracketed field -- the host translation address in front of it is not an
+    address in the target at all.
+    """
+    want = set(blocks)
+    empty: tuple = ((), None) if want_last else ()
+    if not want:
+        return empty
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read()
+    except OSError:
+        return empty
+    seen, last = set(), None
+    for m in _TRACE_PC.finditer(data):
+        pc = int(m.group(1), 16)
+        seen.add(pc)
+        last = pc
+    hit = sorted(seen & want)
+    return (hit, last) if want_last else hit

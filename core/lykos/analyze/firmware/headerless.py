@@ -59,38 +59,68 @@ def detect_cortex_m(data: bytes) -> Optional[dict]:
 
 # aligned 32-bit prologue patterns (value, mask) per arch, matched on aligned words.
 # ARM: push {..,lr}; mov ip,sp.  MIPS: addiu sp,sp,-x; sw ra.  PPC: stwu r1,-x(r1); mflr r0.
+# AArch64: stp x29,x30,[sp,#-N]!; mov x29,sp; ret.  RISC-V: addi sp,sp,-N; ret (jalr x0,ra,0).
+# The AArch64 and RISC-V patterns are near-exact (32-bit fixed encodings), so their false-positive
+# rate in random data is ~2^-32 -- they never trip the "dominant, dense" gate by chance.
 _PATTERNS = {
     ("arm", "little"): [(0xE92D4000, 0xFFFFC000), (0xE1A0C00D, 0xFFFFFFFF)],
     ("arm", "big"):    [(0xE92D4000, 0xFFFFC000)],
     ("mips", "little"): [(0x27BD0000, 0xFFFF0000), (0xAFBF0000, 0xFFFF0000)],
     ("mips", "big"):    [(0x27BD0000, 0xFFFF0000), (0xAFBF0000, 0xFFFF0000)],
     ("ppc", "big"):     [(0x9421FF00, 0xFFFFFF00), (0x7C0802A6, 0xFFFFFFFF)],
+    ("ppc", "little"):  [(0x00FF2194, 0x00FFFFFF), (0xA602087C, 0xFFFFFFFF)],   # ppc64le byte-swapped
+    ("aarch64", "little"): [(0xA9BF7BFD, 0xFFFFFFFF),                            # stp x29,x30,[sp,#-16]!
+                            (0xA9800000, 0xFFE003FF),                            # stp ..,[sp,#-N]! family
+                            (0x910003FD, 0xFFFFFFFF),                            # mov x29, sp
+                            (0xD65F03C0, 0xFFFFFFFF)],                           # ret
+    ("riscv", "little"): [(0x00010113, 0x000FFFFF),                             # addi sp, sp, imm
+                          (0x00008067, 0xFFFFFFFF),                             # ret (jalr x0, ra, 0)
+                          (0x00113023, 0x01FFFFFF)],                            # sd ra, N(sp) family
 }
+_BITS = {"aarch64": 64, "riscv": 64}                    # the rest default to 32
 # Thumb: 16-bit `push {..,lr}` = 0xB5xx
 _THUMB_PUSH = (0xB500, 0xFF00)
+# RISC-V compressed (RVC, 16-bit) prologue/epilogue -- modern RISC-V firmware is RVC-heavy, so the
+# 32-bit patterns above rarely fire. c.addi16sp (adjust sp) and `ret` (= c.jr ra, 0x8082).
+_RVC = [(0x6101, 0xEF83), (0x8082, 0xFFFF)]
+# arches scanned as 16-bit half-words (density is measured per half-word, not per word)
+_HALFWORD = ("thumb", "riscv")
+# Cap the prologue scan to a leading sample. score_arch runs a pure-Python per-word unpack over
+# the WHOLE image, so a large firmware image (tens of MB) is tens of millions of iterations and
+# can blow the stage timeout. Real code that fingerprints an arch is dense from its start, so a
+# leading window is a faithful sample; images at or below this size are still scanned in full, so
+# detection for small/normal firmware is unchanged. analyze_blob's density denominator uses the
+# same bound so density stays a true fraction of what was actually scanned.
+_MAX_SCAN = 16 << 20
 
 
 def score_arch(data: bytes) -> dict:
     """Instruction-prologue scores per (arch, endianness); higher = more likely."""
-    n = len(data)
+    n = min(len(data), _MAX_SCAN)               # bound worst-case work on huge images (sampled)
     scores: dict = {}
     for (arch, endian), pats in _PATTERNS.items():
         endc = "<" if endian == "little" else ">"
         cnt = 0
-        for off in range(0, n - 4, 4):
+        for off in range(0, n - 3, 4):          # `n - 4` never scanned the final word
             w = struct.unpack_from(endc + "I", data, off)[0]
             for val, mask in pats:
                 if (w & mask) == val:
                     cnt += 1
                     break
         scores[f"{arch}/{endian}"] = cnt
-    # Thumb (16-bit), little-endian
-    tcnt = 0
-    for off in range(0, n - 2, 2):
+    # 16-bit little-endian scans: Thumb push, and RISC-V compressed (RVC) prologues.
+    tcnt = rvc = 0
+    for off in range(0, n - 1, 2):              # likewise the final halfword
         h = struct.unpack_from("<H", data, off)[0]
         if (h & _THUMB_PUSH[1]) == _THUMB_PUSH[0]:
             tcnt += 1
+        for val, mask in _RVC:
+            if (h & mask) == val:
+                rvc += 1
+                break
     scores["thumb/little"] = tcnt
+    # RISC-V wins from its RVC signal when that dominates the sparse 32-bit hits
+    scores["riscv/little"] = max(scores.get("riscv/little", 0), rvc)
     return scores
 
 
@@ -104,19 +134,29 @@ def analyze_blob(data: bytes) -> dict:
     best = max(scores, key=scores.get) if scores else None
     best_n = scores.get(best, 0) if best else 0
     second = sorted(scores.values(), reverse=True)[1] if len(scores) > 1 else 0
-    total_words = max(1, len(data) // 4)
-    density = best_n / total_words
+    # Density has to be measured against the population the score was COLLECTED from. The
+    # 32-bit patterns are counted once per word; the Thumb pattern is 16-bit and counted once
+    # per halfword, so there are twice as many chances to hit it. Dividing both by the word
+    # count doubled Thumb's apparent density and let pure noise through the "dominant, dense"
+    # gate this function exists to enforce: 16 KB of random bytes scored 33 Thumb hits where
+    # chance predicts 32.0, measured as 0.806% against words (over the 0.6% floor) where the
+    # honest figure is 0.403% (under it). The blob came back as ARM/Thumb at 0.32 confidence
+    # -- and a headerless verdict is load-bearing, because everything after it is addresses
+    # computed from a base this guess invented.
+    positions = max(1, min(len(data), _MAX_SCAN) // (2 if best and best.split("/")[0] in _HALFWORD else 4))
+    density = best_n / positions
     # require a dominant, dense prologue signal -- real code has one; random data is uniform
     # noise (16-bit Thumb patterns especially are frequent by chance)
     if best and best_n >= 16 and best_n >= 2 * second + 4 and density >= 0.006:
         arch, endian = best.split("/")
         norm = "arm" if arch == "thumb" else arch
         return {
-            "arch": norm, "sub": ("thumb" if arch == "thumb" else None), "bits": 32,
+            "arch": norm, "sub": ("thumb" if arch == "thumb" else None), "bits": _BITS.get(norm, 32),
             "endianness": endian, "base_addr": None, "entry": None, "load_addr": None,
             "confidence": round(min(0.8, density * 40), 2), "method": "prologue-scoring",
             "evidence": (f"prologue scoring: {best} matched {best_n} times "
-                         f"({density:.3%} of words); scores={scores}"),
+                         f"({density:.3%} of {'halfwords' if arch == 'thumb' else 'words'}); "
+                         f"scores={scores}"),
         }
     return {"arch": None, "endianness": None, "base_addr": None, "entry": None,
             "confidence": 0.0, "method": "inconclusive", "evidence": f"scores={scores}"}

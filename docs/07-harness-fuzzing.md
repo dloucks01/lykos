@@ -57,3 +57,22 @@ Find where untrusted data enters, using static taint (doc 05) + a light dynamic 
   stability, last-new-path time. Campaigns **checkpoint** and **resume** with the case.
 - Auto-stop heuristics (coverage saturation, time budget) + analyst manual control.
 - Every unique crash flows to triage (doc 08).
+
+## 7.7 Closing the coverage loop (hybrid fuzzing)
+Low block coverage means the search stalled at a **guarded branch** — a magic value, a length
+check — that a blind mutator cannot pass. The Autopilot closes the loop automatically:
+1. **Corpus compounds across stages.** `directed_fuzz` seeds every run from the target's
+   accumulated *interesting* inputs — concolic-solved inputs first, then prior crashers
+   (`_prior_corpus`) — instead of restarting from string-mined tokens. Coverage carries forward.
+2. **Coverage-gated concolic.** When a campaign leaves the binary under-covered (block
+   coverage `< 60%`) or found nothing, concolic execution (angr / SymQEMU) **solves the branch
+   constraint** for an input that takes it.
+3. **Re-fuzz from the solved inputs.** A follow-up `directed_fuzz` automatically reuses concolic's
+   generated inputs as seeds, so the mutator explores *around* the branch concolic just unlocked —
+   reaching the code beyond it.
+
+Measured on a magic-gated target: blind fuzzing reached **8/18 blocks, 0 crashes**; after
+concolic solved the gate and the re-fuzz reseeded from it, **18/18 blocks (100%), 156 crashes**.
+Both the interactive (`app/autopilot.js`) and background (`analyze/orchestrate.py`) Autopilots
+run this loop; a content-addressed cache hit re-projects the recovered functions/blocks first,
+so a re-analysed binary is never fuzzed blind.
