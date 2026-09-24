@@ -27,7 +27,7 @@ from ..dynamic.stage import asan_defect_key, crash_finding_candidate
 from ..poc.capture import modes_for
 from . import structure, textconf, xmlgrammar
 from .mutator import Mutator
-from .runner import run_input
+from .runner import invocation, run_input
 
 FUZZ_STAGE = "fuzz"
 TOOL = "fuzz"
@@ -136,6 +136,108 @@ def format_aware_seeds(ctx, target) -> list:
     # the binary's own selective strings (magic tokens, config keywords, path prefixes)
     seeds += [s.encode("latin-1", "ignore") for s in svals[:8] if 2 <= len(s) <= 256]
     return [s for s in seeds if s]
+
+
+def msan_detonate(ctx, target, inputs, mode, exec_timeout, base_argv=()) -> int:
+    """Detonate a set of inputs against the target's MemorySanitizer build (built at ingest for
+    source targets) to surface uninitialized-value reads (CWE-457) -- the class ASan cannot see. Such
+    reads do NOT crash the primary ASan build, so they must be driven with the fuzz CORPUS, not just
+    the crashes. Findings land 'corroborated' (the sanitizer directly observed the read) with the
+    source line. Fully guarded: it must never break a campaign.
+
+    The MSan binary is native code compiled from attacker-controlled source, so it runs under the
+    SAME bubblewrap containment as every other target (ro-root, netns, pid namespace, secret masks)
+    via `isolate_prefix` + `run_reaped` -- never a bare host subprocess. It cannot take an RLIMIT_AS
+    cap (MSan reserves a ~20TB shadow like ASan), so bwrap provides the isolation and a wall-clock
+    budget bounds the cost; the pass fires at the end of every campaign, so it must stay cheap."""
+    import os as _os
+
+    from ...db.dao import ArtifactDAO
+    try:
+        arts = ArtifactDAO(ctx.conn).list_by_case(target.case_id)
+        msa = next((a for a in arts if a.kind == "msan-blob"
+                    and (a.meta or {}).get("binary_sha") == target.sha256), None)
+        if not msa:
+            return 0
+        msbin = ctx.scratch() / "target.msan"
+        msbin.write_bytes(ctx.content.path(msa.sha256).read_bytes())
+        _os.chmod(msbin, 0o755)
+    except Exception:
+        return 0
+    # MSan's default abort path spawns llvm-symbolizer, which DEADLOCKS when stderr is a captured
+    # pipe (not a TTY) -- every detonation then times out and the pass silently finds nothing. Run
+    # with symbolize=0 (report addresses, no symbolizer, exits cleanly) and recover the source line
+    # ourselves with addr2line on the offset. exitcode keeps a report distinguishable from a crash.
+    env = dict(_os.environ)
+    env["MSAN_OPTIONS"] = "symbolize=0:abort_on_error=0:halt_on_error=1:exitcode=86"
+    exedir = str(msbin.parent)
+    prefix = sandbox.isolate_prefix(exedir, net=False)   # [] if bwrap unavailable -> unwrapped run
+    per_timeout = max(2, int(exec_timeout))
+    # Bound the whole pass: cap total wall-clock and honour a cancel, so a large corpus can't add
+    # minutes to a short campaign (msan_detonate fires once at the tail of each campaign).
+    deadline = time.monotonic() + max(15.0, min(90.0, per_timeout * 30))
+    _cancel = getattr(ctx, "should_cancel", None)        # defensive: never break a campaign
+    fd = FindingDAO(ctx.conn)
+    wf = ctx.scratch() / "msan-in.bin"
+    found, seen = 0, set()
+    for data in list(inputs)[:400]:
+        if time.monotonic() > deadline or (_cancel is not None and _cancel()):
+            break
+        data = data or b""
+        tail, stdin = invocation(mode, wf, data, base_argv)   # honour the target's flags / `@@`
+        argv = [str(msbin)] + tail
+        try:
+            r = sandbox.run_reaped(prefix + argv, input=stdin, timeout=per_timeout,
+                                   capture_output=True, env=env)
+        except Exception:
+            continue
+        txt = (r.stderr or b"").decode("latin-1", "ignore")
+        if "MemorySanitizer: use-of-uninitialized-value" not in txt:
+            continue
+        src = _msan_source_line(msbin, txt)
+        # dedup by source line; when addr2line yields nothing, key on the raw (binary+0xOFFSET)
+        # frame so DISTINCT unlocated reads don't all collapse into one "uninit" finding.
+        _raw = re.search(r"\(\S+\+0x[0-9a-fA-F]+\)", txt)
+        key = src or (_raw.group(0) if _raw else
+                      hashlib.sha1(txt[:256].encode("latin-1", "ignore")).hexdigest()[:12])
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            sha = ctx.put_artifact("msan-input", data=data)
+            fd.upsert(target.id, target.case_id, {
+                "cwe": "CWE-457", "title": "Use of uninitialized value", "severity": "medium",
+                "detector": "msan", "state": "corroborated", "confidence": 0.8,
+                "dedup_key": f"CWE-457:msan:{key}", "function_addr": None, "site_addr": None,
+                "site_detail": src,
+                "evidence": [{"channel": "sanitizer",
+                              "detail": "MemorySanitizer: use of uninitialized value"
+                              + (f" at {src}" if src else "") + f" (input {sha[:12]})"}]})
+            found += 1
+        except Exception:
+            continue
+    if found:
+        ctx.emit("msan.done", payload={"uninitialized_reads": found})
+    return found
+
+def _msan_source_line(binpath, text):
+    """file:line for an MSan report produced with symbolize=0: the report carries a raw
+    `(<binary>+0xOFFSET)`, and addr2line turns that offset into a source location."""
+    import re
+    import subprocess as _sp
+    m = re.search(r"\(\S+\+0x([0-9a-fA-F]+)\)", text)
+    if not m:
+        return None
+    try:
+        r = _sp.run(["addr2line", "-e", str(binpath), "0x" + m.group(1)],
+                    capture_output=True, timeout=5)
+        loc = (r.stdout or b"").decode("latin-1", "ignore").strip().splitlines()
+        if loc and ":" in loc[0] and not loc[0].startswith("?"):
+            f, _, line = loc[0].rpartition(":")
+            return f"{f.split('/')[-1]}:{line}" if f else None
+    except Exception:
+        return None
+    return None
 
 
 def _discover_argv(ctx, target, exec_timeout):
@@ -490,6 +592,13 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
                      "any input (ptrace may be unavailable in this sandbox); the campaign fell "
                      "back to output-shape novelty. This is not a clean 'no crashes' result -- "
                      "coverage-guided search did not run.")})
+    # Uninitialized-read pass (CWE-457): detonate the corpus we just built against the MSan binary.
+    # This is the RIGHT place for source targets -- they compile to an ASan build that coverage_fuzz
+    # skips, so they are fuzzed here, and the corpus is the only place uninitialized reads surface.
+    try:
+        msan_detonate(ctx, target, corpus, mode, exec_timeout, base_argv=base_argv)
+    except Exception:
+        pass
     ctx.emit(f"{event_prefix}.done", payload=stats)
     ctx.progress(pct=100, msg=f"{execs} execs, {crashes} crashes, {len(seen_sigs)} unique, "
                              f"{len(seen_behaviour)} behaviours")

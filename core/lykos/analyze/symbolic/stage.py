@@ -62,7 +62,7 @@ def _corroborate_sink(conn, target, reached_addr):
     return False
 
 
-def _validate(ctx, target, exe, mode, workfile, generated, exec_timeout):
+def _validate(ctx, target, exe, mode, workfile, generated, exec_timeout, base_argv=()):
     """Replay each generated input in the sandbox and record crashes / corroborations /
     seeds. `generated` items are dicts: {input_b64, reached?}. Returns counts."""
     fd = FindingDAO(ctx.conn)
@@ -73,7 +73,7 @@ def _validate(ctx, target, exe, mode, workfile, generated, exec_timeout):
         if ctx.should_cancel():
             break
         data = base64.b64decode(g["input_b64"])
-        argv, stdin = invocation(mode, workfile, data)
+        argv, stdin = invocation(mode, workfile, data, base_argv)   # honour the target's flags / `@@`
         r = sandbox.run(exe, argv=argv, stdin=(stdin if mode == "stdin" else b""),
                         timeout=exec_timeout, arch=target.arch)
         input_sha = ctx.put_artifact("concolic-input", data=data)
@@ -208,7 +208,7 @@ def concolic_stage(ctx) -> dict:
                          f"keeping any inputs already generated")
 
     confirmed, corroborated, new_seeds = _validate(ctx, target, exe, mode, workfile,
-                                                   generated, exec_timeout)
+                                                   generated, exec_timeout, base_argv)
     ctx.emit("concolic.done", payload={"backend": backend, "confirmed": confirmed,
                                        "corroborated": corroborated, "new_seeds": new_seeds,
                                        "reached": reached, "incomplete": bool(note),

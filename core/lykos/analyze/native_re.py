@@ -22,12 +22,15 @@ present, else the built-in pseudo-decompiler (``pdc``) as a readable stand-in.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 from typing import Optional
+
+_log = logging.getLogger(__name__)
 
 # Exhaustive by default: analyze EVERY function. A large kernel (the vxWorks 6.9 image is ~7200
 # functions) previously had its function set silently TRUNCATED to the first 1200, so the CWE
@@ -151,6 +154,7 @@ def _readj(path: Path, default):
     try:
         return json.loads(text)
     except Exception:
+        _log.debug("rizin JSON parse failed for %s", path, exc_info=True)
         return default
 
 
@@ -232,6 +236,7 @@ class _Lifter:
                     subprocess.run(cmd, timeout=timeout, capture_output=True, check=False,
                                    stdin=subprocess.DEVNULL, env=popen_env)
             except Exception:                              # noqa: BLE001 -- crash/timeout: use partial
+                _log.debug("pcode worker crashed or timed out; using partial output", exc_info=True)
                 pass
             out = {}
             try:
@@ -412,7 +417,15 @@ def analyze(binary: Path, *, ctx=None, timeout: int = 900) -> dict:
     # rizin embeds stack vars + call refs in aflj (per function); radare2 does not, and its
     # `afvj`/`afxj` commands do -- but on rizin `afvj` is unknown and ABORTS the -c chain. So we
     # take vars/calls from aflj on rizin, and only add afvj/afxj to the pass on radare2.
-    embedded = any(isinstance(f, dict) and ("stackvars" in f or "callrefs" in f) for f in aflj)
+    #
+    # Key this off the resolved BACKEND, not merely whether pass-1 happened to return stackvars:
+    # a small/leaf/stripped rizin target can recover none, and keying on data presence then set
+    # embedded=False, injected `afvj`, and ABORTED the whole per-function chain -- yielding a
+    # near-empty structural pass reported as success. rizin is always `embedded`; the data check
+    # remains as a secondary signal (e.g. a radare2 build that does embed skips the extra commands).
+    is_rizin = Path(cli).name == "rizin"
+    embedded = is_rizin or any(
+        isinstance(f, dict) and ("stackvars" in f or "callrefs" in f) for f in aflj)
 
     # Pass 2 (structure): CFG + disasm + stack vars per function, redirected to per-function files.
     #
@@ -432,11 +445,21 @@ def analyze(binary: Path, *, ctx=None, timeout: int = 900) -> dict:
     failed_batches = 0
 
     def _reraise_if_cancel(e):
-        # A cancel/timeout must PROPAGATE, not be swallowed as a "failed batch": otherwise a user
-        # cancel keeps grinding through every remaining batch and the stage reports a partial
-        # "done". Identified by class name to avoid importing the jobs layer into analysis code.
-        if type(e).__name__ in ("StageCancelled", "StageTimeout", "KeyboardInterrupt"):
+        # A genuine stage cancel/deadline must PROPAGATE, not be swallowed as a "failed batch":
+        # otherwise a user cancel keeps grinding through every remaining batch and the stage reports
+        # a partial "done". Identified by class name to avoid importing the jobs layer here.
+        #
+        # BUT a per-BATCH subprocess that merely exceeded its own `timeout` ALSO surfaces as
+        # StageTimeout (context.run_subprocess raises it for its local per-call cap, not only the
+        # stage deadline). Propagating THAT killed the whole exhaustive pass and discarded every
+        # batch already written -- the opposite of the batching design. So only propagate when the
+        # STAGE is genuinely stopping (should_cancel() covers user-cancel and the stage deadline);
+        # a bare per-batch timeout falls through and is counted as one failed batch.
+        if type(e).__name__ == "KeyboardInterrupt":
             raise e
+        if type(e).__name__ in ("StageCancelled", "StageTimeout"):
+            if ctx is None or ctx.should_cancel():
+                raise e
 
     def _fn_cmds(a):
         parts = [f"s {a}", _redir("afbj", T / f"{a}.b"), _redir("pdfj", T / f"{a}.o")]
@@ -491,6 +514,7 @@ def analyze(binary: Path, *, ctx=None, timeout: int = 900) -> dict:
         try:
             _run(cli, binary, ";".join(dparts), ctx=ctx, timeout=timeout, scratch=T)
         except Exception:
+            _log.debug("up-front decompile pass failed", exc_info=True)
             pass
     elif target_fns > _MAX_DECOMPILE:
         _emit(ctx, pct=78, msg=f"decompiled C is on-demand for {target_fns} functions "
@@ -536,6 +560,7 @@ def decompile_one(binary: Path, addr, *, ctx=None, timeout: int = 120) -> str:
         except OSError:
             return ""
     except Exception:
+        _log.debug("on-demand decompile failed for %s", addr, exc_info=True)
         return ""
     finally:
         shutil.rmtree(d, ignore_errors=True)

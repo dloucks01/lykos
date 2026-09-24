@@ -62,7 +62,25 @@ class CaseDAO(BaseDAO):
         return [self._row(r) for r in rows]
 
     def delete(self, case_id: str) -> None:
-        self.conn.execute(f'DELETE FROM {_TABLE_CASE} WHERE id=?', (case_id,))
+        # An artifact row is global (sha256 is its PK) and owned by the case that first registered
+        # it; a cache hit links ANOTHER case's run to that same row without re-homing it. Deleting
+        # the owning case cascades to delete its artifact rows (ON DELETE CASCADE), but the other
+        # case's run_artifact still references them (no ON DELETE there) -> RESTRICT -> the whole
+        # delete raises IntegrityError, and such a case could never be deleted. So first hand any
+        # artifact this case owns BUT another case's run still references over to that other case;
+        # the cascade then leaves it alone and the delete succeeds without orphaning a live link.
+        with transaction(self.conn, immediate=True):
+            shared = self.conn.execute(
+                "SELECT a.sha256 AS sha, MIN(r.case_id) AS other "
+                "FROM artifact a "
+                "JOIN run_artifact ra ON ra.artifact_sha256 = a.sha256 "
+                "JOIN analysis_run r ON r.id = ra.run_id "
+                "WHERE a.case_id = ? AND r.case_id <> ? "
+                "GROUP BY a.sha256", (case_id, case_id)).fetchall()
+            for row in shared:
+                self.conn.execute("UPDATE artifact SET case_id=? WHERE sha256=?",
+                                  (row["other"], row["sha"]))
+            self.conn.execute(f'DELETE FROM {_TABLE_CASE} WHERE id=?', (case_id,))
 
     @staticmethod
     def _row(r: sqlite3.Row) -> Case:
@@ -485,11 +503,11 @@ def _merge_effect_evidence(evidence: list) -> list:
     eff_entries = [e for e in evidence if e.get("channel") == "effects"]
     if len(eff_entries) < 2:
         return evidence
-    from ..analyze.debug import exploitability as _expl
+    from ..effects import merge_effects          # leaf module: no analysis-layer dependency here
     merged: list = []
     for e in eff_entries:
         try:
-            merged = _expl.merge_effects(merged, loads(e.get("detail") or "[]"))
+            merged = merge_effects(merged, loads(e.get("detail") or "[]"))
         except Exception:
             pass
     rest = [e for e in evidence if e.get("channel") != "effects"]
@@ -890,7 +908,6 @@ class PocDAO(BaseDAO):
 
     def set_finding(self, poc_id: str, finding_id: str) -> None:
         self.conn.execute("UPDATE poc SET finding_id=? WHERE id=?", (finding_id, poc_id))
-        self.conn.commit()
 
     def list_by_target(self, target_id: str) -> list[Poc]:
         rows = self.conn.execute(

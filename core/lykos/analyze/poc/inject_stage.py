@@ -91,7 +91,7 @@ def synthesize_injection_stage(ctx) -> dict:
                 out = (res.stdout or b"") + b"\n" + (res.stderr or b"")
                 if spec["confirm"](out, payload, marker):
                     hit = {"payload": payload, "mode": mode, "signal": res.signal_name,
-                           "out": out, "marker": marker}
+                           "out": out, "marker": marker, "argv_base": list(argv_base)}
                     break
             if hit:
                 break
@@ -133,7 +133,6 @@ def _disclosure_effect(ctx, spec, hit, input_sha, bundle_sha):
     """The end effect an injection PoC demonstrates, with the captured output as proof. Returns
     (eff_line, headline_title, effects_evidence_entry). For a format string, the proof is the
     leaked memory itself (persisted), including any secret bytes it exposed."""
-    from ..debug import exploitability as _expl
     cwe = spec.get("cwe", "")
     out = hit.get("out") or b""
     if cwe == "CWE-134":
@@ -170,7 +169,10 @@ def _finalize(ctx, target, target_bytes, spec, hit):
     pb = payload if isinstance(payload, bytes) else payload.encode()
     mode = hit["mode"]
     input_sha = ctx.put_artifact("inject-input", data=pb)
-    run_argv = [pb.decode("latin-1")] if mode == "arg" else []
+    # Record the ACTUAL base argv that delivered the payload (the discovered flags / `@@`), not a
+    # bare re-derivation: dropping it produced a bundle that a replayer could not reproduce for any
+    # target that takes its input behind a flag. The mode + argv_base let the replay place the input.
+    run_argv = list(hit.get("argv_base") or [])
     shown = pb.decode("latin-1")[:80]
     detail = (f"{spec['title']} confirmed at runtime via {mode}: payload {shown!r} produced the "
               f"expected effect (no fuzzing)")

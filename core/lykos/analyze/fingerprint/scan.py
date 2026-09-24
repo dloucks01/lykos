@@ -7,10 +7,13 @@ shape (merged per library: patterns concatenated, CVEs appended).
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 
 from . import db
+
+_log = logging.getLogger(__name__)
 
 _MAX = 64 * 1024 * 1024        # cap the scan for huge firmware blobs
 
@@ -29,6 +32,7 @@ def _components():
                 tgt["patterns"] += list(v.get("patterns", []))
                 tgt["cves"] += list(v.get("cves", []))
         except Exception:
+            _log.debug("failed to load/merge $LYKOS_CVEDB override %s", path, exc_info=True)
             pass                # a malformed override never breaks the scan
     return comps
 
@@ -74,6 +78,8 @@ def match(detected, comps=None):
                                 "summary": cve.get("summary", ""),
                                 "evidence": d["evidence"]})
             except Exception:
+                _log.debug("CVE range match failed for %s / %s", d.get("library"),
+                           cve.get("id"), exc_info=True)
                 continue        # a bad range entry skips, never crashes the scan
     return out
 

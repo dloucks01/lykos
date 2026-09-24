@@ -11,6 +11,14 @@ from typing import Any, Optional
 
 from .. import __version__ as _lykos_version
 from ..analyze.detect import catalog
+from ..db.dao import (
+    AnalysisRunDAO,
+    DynResultDAO,
+    FindingDAO,
+    PocDAO,
+    TargetDAO,
+)
+from ..db.models import FINDING_STATES, SEVERITIES
 from ..jobs.registry import cached_output_json
 
 
@@ -46,14 +54,7 @@ def _best_coverage(store, runs) -> Optional[dict]:
             if edges and (best_edge is None or edges > (best_edge.get("edges") or 0)):
                 best_edge = {"kind": "edge", "edges": edges}
     return best_block or best_edge
-from ..db.dao import (
-    AnalysisRunDAO,
-    DynResultDAO,
-    FindingDAO,
-    PocDAO,
-    TargetDAO,
-)
-from ..db.models import FINDING_STATES, SEVERITIES
+
 
 # Findings at or above this state are included by default (the "reportable" set:
 # everything that cleared pure candidate). Callers can widen or narrow it.

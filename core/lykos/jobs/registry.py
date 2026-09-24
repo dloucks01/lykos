@@ -7,8 +7,11 @@ carry {"output_shas": [...], "output_kind": str, "metrics": {...}} which the wor
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Optional
+
+_log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from ..casestore import CaseStore
@@ -54,6 +57,10 @@ def cached_output_json(store: "CaseStore", run_id: str) -> Any:
             try:
                 return json.loads(store.content.get_bytes(link.artifact_sha256))
             except Exception:
+                # Corrupt/unreadable output artifact: keep scanning, but leave a trace so a
+                # silently-dropped cache output is observable.
+                _log.debug("cached_output_json: skipping output artifact %s for run %s",
+                           link.artifact_sha256, run_id, exc_info=True)
                 continue
     return None
 

@@ -85,11 +85,18 @@ _THUMB_PUSH = (0xB500, 0xFF00)
 _RVC = [(0x6101, 0xEF83), (0x8082, 0xFFFF)]
 # arches scanned as 16-bit half-words (density is measured per half-word, not per word)
 _HALFWORD = ("thumb", "riscv")
+# Cap the prologue scan to a leading sample. score_arch runs a pure-Python per-word unpack over
+# the WHOLE image, so a large firmware image (tens of MB) is tens of millions of iterations and
+# can blow the stage timeout. Real code that fingerprints an arch is dense from its start, so a
+# leading window is a faithful sample; images at or below this size are still scanned in full, so
+# detection for small/normal firmware is unchanged. analyze_blob's density denominator uses the
+# same bound so density stays a true fraction of what was actually scanned.
+_MAX_SCAN = 16 << 20
 
 
 def score_arch(data: bytes) -> dict:
     """Instruction-prologue scores per (arch, endianness); higher = more likely."""
-    n = len(data)
+    n = min(len(data), _MAX_SCAN)               # bound worst-case work on huge images (sampled)
     scores: dict = {}
     for (arch, endian), pats in _PATTERNS.items():
         endc = "<" if endian == "little" else ">"
@@ -136,7 +143,7 @@ def analyze_blob(data: bytes) -> dict:
     # honest figure is 0.403% (under it). The blob came back as ARM/Thumb at 0.32 confidence
     # -- and a headerless verdict is load-bearing, because everything after it is addresses
     # computed from a base this guess invented.
-    positions = max(1, len(data) // (2 if best and best.split("/")[0] in _HALFWORD else 4))
+    positions = max(1, min(len(data), _MAX_SCAN) // (2 if best and best.split("/")[0] in _HALFWORD else 4))
     density = best_n / positions
     # require a dominant, dense prologue signal -- real code has one; random data is uniform
     # noise (16-bit Thumb patterns especially are frequent by chance)

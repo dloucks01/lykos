@@ -11,9 +11,8 @@ from __future__ import annotations
 
 import base64
 import os
-import subprocess as _sp
 
-from ...db.dao import ArtifactDAO, DynResultDAO, FindingDAO, TargetDAO
+from ...db.dao import DynResultDAO, FindingDAO, TargetDAO
 from ...hashing import canonical_json
 from ...jobs.registry import register_stage
 from ..dynamic import sandbox
@@ -21,7 +20,7 @@ from ..dynamic.minimize import minimize
 from ..dynamic.stage import asan_defect_key, crash_finding_candidate
 from . import aflpp
 from .runner import invocation, run_input
-from .stage import _DEFAULT_SEEDS, _recovered_blocks, format_aware_seeds
+from .stage import _DEFAULT_SEEDS, _recovered_blocks, format_aware_seeds, msan_detonate
 
 COVERAGE_STAGE = "coverage_fuzz"
 TOOL = "aflpp"
@@ -94,62 +93,17 @@ def _unsupported(target):
 
 
 def _msan_scan(ctx, target, out_dir, mode, exec_timeout, raw) -> int:
-    """Detonate the fuzz corpus against the MemorySanitizer build (source targets only, if one was
-    produced at ingest) to surface the class ASan cannot: a read of never-initialized memory
-    (CWE-457). Best-effort and fully guarded -- it must never break the campaign. Findings land as
-    'corroborated' (the sanitizer directly observed the read) with the source line."""
-    from ..debug import rootcause
-    try:
-        arts = ArtifactDAO(ctx.conn).list_by_case(target.case_id)
-        msa = next((a for a in arts if a.kind == "msan-blob"
-                    and (a.meta or {}).get("binary_sha") == target.sha256), None)
-        if not msa:
-            return 0
-        msbin = ctx.scratch() / "target.msan"
-        msbin.write_bytes(ctx.content.path(msa.sha256).read_bytes())
-        os.chmod(msbin, 0o755)
-    except Exception:
-        return 0
-    inputs = list(raw)                                   # the crashes, plus what AFL kept as novel
+    """Detonate the AFL corpus (crashes + the queue AFL kept) against the MemorySanitizer build, for
+    the rare source target that reaches this native-instrumented path. Shares one implementation with
+    the sandbox fuzz stage -- which is where most source targets actually surface CWE-457, since their
+    ASan build makes coverage_fuzz decline."""
+    inputs = list(raw)
     try:
         q = out_dir / "default" / "queue"
         inputs += [f.read_bytes() for f in sorted(q.glob("id:*"))[:200]]
     except Exception:
         pass
-    fd = FindingDAO(ctx.conn); wf = ctx.scratch() / "msan-in.bin"; found = 0; seen = set()
-    for data in inputs[:300]:
-        argv, stdin = [str(msbin)], b""
-        if mode == "file":
-            wf.write_bytes(data); argv.append(str(wf))
-        elif mode == "arg":
-            argv.append(data[:4096].decode("latin-1", "ignore"))
-        else:
-            stdin = data
-        try:
-            r = _sp.run(argv, input=stdin, capture_output=True, timeout=max(2, int(exec_timeout)))
-        except Exception:
-            continue
-        rep = rootcause.parse_asan_report((r.stderr or b"").decode("latin-1", "ignore"))
-        if not rep or rep.get("cwe") != "CWE-457":
-            continue
-        key = rep.get("source") or "msan"
-        if key in seen:
-            continue
-        seen.add(key)
-        try:
-            sha = ctx.put_artifact("msan-input", data=data).sha256
-            fd.upsert(target.id, target.case_id, {
-                "cwe": "CWE-457", "title": "Use of uninitialized value", "severity": "medium",
-                "detector": "msan", "state": "corroborated", "confidence": 0.8,
-                "dedup_key": f"CWE-457:msan:{key}", "function_addr": None, "site_addr": None,
-                "site_detail": rep.get("source"),
-                "evidence": [{"channel": "sanitizer", "detail": rep["detail"] + f" (input {sha[:12]})"}]})
-            found += 1
-        except Exception:
-            continue
-    if found:
-        ctx.emit("coverage.msan", payload={"uninitialized_reads": found})
-    return found
+    return msan_detonate(ctx, target, inputs, mode, exec_timeout)
 
 
 def coverage_stage(ctx) -> dict:

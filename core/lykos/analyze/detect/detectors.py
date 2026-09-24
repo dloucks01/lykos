@@ -121,7 +121,6 @@ _ARG0_DEST = {"strcpy", "strcat", "gets", "sprintf", "vsprintf"}
 # function that owns any stack buffer AND calls strcpy is flagged even when the strcpy writes to a
 # caller-provided/heap pointer -- e.g. VxWorks _hostTblSearchByName2 copies into a 64-byte slot it
 # sub-allocates from a caller buffer, not its stack, yet was reported as a 16-byte stack smash.
-_ADDR_RE = _re_addr = re.compile(r"0x[0-9a-fA-F]+")
 
 
 def _naddr(a):

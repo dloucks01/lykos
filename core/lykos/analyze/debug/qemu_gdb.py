@@ -243,9 +243,13 @@ def capture(exe, arch, *, argv=(), stdin: bytes = b"", timeout: float = 8.0,
     # without RLIMIT_AS, which qemu-user needs generously.
     cmd = sandbox.isolate_prefix(exedir, net=True) + \
         [qemu, "-g", str(port), str(exe), *[_argv_bytes(a) for a in argv]]
+    # stdout/stderr are DEVNULL: the capture is driven entirely over the gdbstub SOCKET and the
+    # guest's output is never read, so leaving them as PIPEs let a guest that writes >~64 KiB block
+    # on the full pipe -- it then never reaches the fault, the socket read times out, and the
+    # capture is lost ("guest did not stop"). A chatty target silently defeated root-cause.
     proc = subprocess.Popen(
         cmd,
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         start_new_session=True,
         preexec_fn=sandbox._rlimits(4096, int(timeout) + 30, set_as=False,
                                     nproc=sandbox._nproc_cap(True)))
@@ -368,9 +372,11 @@ def monitor_calls(exe, arch, *, symbols, entry, pie, sink_names, endianness=None
     exedir = str(Path(exe).resolve().parent)
     cmd = sandbox.isolate_prefix(exedir, net=True) + \
         [qemu, "-g", str(port), str(exe), *[_argv_bytes(a) for a in argv]]
+    # DEVNULL, not PIPE: the guest's output is never read (the monitor runs over the gdbstub
+    # socket), so a PIPE would fill and deadlock a chatty guest before it reaches a sink.
     proc = subprocess.Popen(cmd,
-                            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, start_new_session=True,
+                            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL, start_new_session=True,
                             preexec_fn=sandbox._rlimits(4096, int(timeout) + 30, set_as=False,
                                                         nproc=sandbox._nproc_cap(True)))
     try:
@@ -449,3 +455,9 @@ def _kill(proc):
             proc.kill()
         except Exception:
             pass
+    # Reap it: without a wait() the killed qemu lingers as a zombie and its stdin/stdout/stderr
+    # fds leak, accumulating across a root-cause / monitor loop.
+    try:
+        proc.wait(timeout=5)
+    except Exception:
+        pass

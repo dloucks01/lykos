@@ -189,12 +189,24 @@ def _safe_extract(tar: tarfile.TarFile, dest: Path) -> None:
     """Guard against path traversal in archives (defensive; we control creation)."""
     dest = dest.resolve()
     for m in tar.getmembers():
+        # Reject link/device members outright: a symlink or hardlink member can point outside
+        # the case dir so a following member writes THROUGH it (the name-path check below only
+        # covers where the entry itself lands, not where a link redirects a later write). We
+        # only ever emit plain files and dirs, so anything else is hostile.
+        if m.issym() or m.islnk() or m.isdev():
+            raise IOError(f"unsafe member in archive: {m.name}")
         target = (dest / m.name).resolve()
         # Containment by path components, not string prefix: a startswith check lets a member
         # resolving to a SIBLING (dest="/tmp/abc", target="/tmp/abc-evil/x") pass.
         if target != dest and dest not in target.parents:
             raise IOError(f"unsafe path in archive: {m.name}")
-    tar.extractall(dest)
+    # `filter="data"` (Python 3.12+) is the hardened extractor realgate.py already uses; fall
+    # back on older Pythons that lack the kwarg. The explicit link/dev rejection above keeps the
+    # protection on every version regardless of whether the filter is available.
+    try:
+        tar.extractall(dest, filter="data")
+    except TypeError:
+        tar.extractall(dest)
 
 
 # --------------------------------------------------------------- per-case portability
@@ -263,6 +275,13 @@ _MUTABLE_PK: dict[str, tuple[str, ...]] = {
     "analysis_run": ("id",),
 }
 
+# analysis_run rows in a NON-terminal status carry live queue state (a claim, a lease, a
+# heartbeat) that means nothing in the destination store -- importing them verbatim leaves the
+# destination pool with phantom `running`/`queued` jobs it would claim and re-execute. On copy
+# we neutralize that state: strip the claim/lease/heartbeat and settle a non-terminal status to
+# `error` so the imported run is an inert record of what happened, not a job to run.
+_TERMINAL_RUN_STATUSES = frozenset({"done", "error", "cancelled"})
+
 
 def _copy_rows(sc: sqlite3.Connection, dc: sqlite3.Connection, table: str, where: str,
                params: tuple[Any, ...], *, drop_cols: tuple[str, ...] = (),
@@ -275,7 +294,13 @@ def _copy_rows(sc: sqlite3.Connection, dc: sqlite3.Connection, table: str, where
     collist = ",".join(f'"{c}"' for c in cols)
     ph = ",".join("?" * len(cols))
     ov = override or {}
-    vals = [tuple(ov[c] if c in ov else r[c] for c in cols) for r in rows]
+    # An override value may be a callable, computed per source row (used to settle a run's
+    # non-terminal status against the row's own current status); a plain value applies as-is.
+    def _val(c: str, r: sqlite3.Row) -> Any:
+        if c not in ov:
+            return r[c]
+        return ov[c](r) if callable(ov[c]) else ov[c]
+    vals = [tuple(_val(c, r) for c in cols) for r in rows]
 
     pk = _MUTABLE_PK.get(table)
     if pk and conflicts is not None:
@@ -316,7 +341,18 @@ def copy_case(src: "CaseStore", dst: "CaseStore", case_id: str) -> list[dict[str
             # An artifact may be owned by another case (a cache hit shares one content-addressed
             # blob); re-home it to THIS case so the export is self-contained and artifact.case_id
             # still references a case that travels with it. ON CONFLICT keeps an existing owner.
-            override = {"case_id": case_id} if table == "artifact" else None
+            override: Optional[dict[str, Any]] = None
+            if table == "artifact":
+                override = {"case_id": case_id}
+            elif table == "analysis_run":
+                # Neutralize live queue state so an imported run is inert (see _TERMINAL_RUN_STATUSES).
+                override = {
+                    "status": lambda r: (r["status"] if r["status"] in _TERMINAL_RUN_STATUSES
+                                         else "error"),
+                    "claimed_by": None,
+                    "lease_expires_at": None,
+                    "heartbeat_at": None,
+                }
             _copy_rows(src.conn, dst.conn, table, where, params,
                        drop_cols=drop, override=override, conflicts=conflicts)
     for sha in shas:

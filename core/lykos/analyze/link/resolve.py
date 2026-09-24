@@ -131,7 +131,8 @@ def resolve_case(conn, content, case_id: str, *, persist: bool = True) -> dict[s
         for e in edges:
             ce.upsert(case_id, e["src"], e["dst"], kind="dynamic-link",
                       symbol="", detail=e["detail"])
-        conn.commit()
+        # autocommit connection: the upserts already persisted; a bare commit here would commit an
+        # enclosing transaction early.
 
     return {"components": len(res["targets"]), "edges": len(edges),
             "resolved_symbols": sum(e["sym_count"] for e in edges),

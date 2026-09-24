@@ -183,8 +183,8 @@ def cross_taint_case(conn, content, case_id: str, *, persist: bool = True,
         # belongs to whichever edge happened to be last, and does not exist at all if every
         # edge took a `continue` above
         why["edges_with_clean_callee"] += int(clean)
-    if persist:
-        conn.commit()
+    # (no explicit commit: the connection is autocommit and the upserts above already persisted;
+    # a bare conn.commit() here would prematurely commit any enclosing transaction.)
     return {"edges_examined": len(dyn), "cross_findings": len(findings),
             "components_analyzed": len(comps), "note": _why_nothing(why, len(findings))}
 

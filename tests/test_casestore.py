@@ -38,3 +38,23 @@ def test_export_import_roundtrip(store, tmp_path):
         assert reopened.content.get_bytes(art.sha256) == b"{\"k\":1}"
     finally:
         reopened.close()
+
+
+def test_delete_case_that_shares_a_cached_artifact(store):
+    """A cross-case cache hit links case B's run to case A's artifact ROW (sha256 is global).
+    Deleting A must not raise IntegrityError (the artifact is re-homed to B, its live referrer),
+    and B's link must survive."""
+    a = store.cases.create("owner")
+    b = store.cases.create("consumer")
+    art = store.put_artifact(a.id, "triage-json", data=b"shared-cache-bytes")
+    conn = store.conn
+    conn.execute("INSERT INTO analysis_run(id,case_id,stage,status,created_at) VALUES(?,?,?,?,?)",
+                 ("runB", b.id, "detect_cwe", "done", 0))
+    conn.execute("INSERT INTO run_artifact(run_id,artifact_sha256,role) VALUES(?,?,?)",
+                 ("runB", art.sha256, "output"))
+
+    store.cases.delete(a.id)                      # previously raised IntegrityError
+
+    assert store.cases.get(a.id) is None
+    row = conn.execute("SELECT case_id FROM artifact WHERE sha256=?", (art.sha256,)).fetchone()
+    assert row is not None and row["case_id"] == b.id     # re-homed to B, link intact

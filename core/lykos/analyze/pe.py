@@ -13,9 +13,12 @@ in `errors` rather than raised.
 """
 from __future__ import annotations
 
+import logging
 import struct
 from dataclasses import dataclass, field
 from typing import Any, Optional
+
+_log = logging.getLogger(__name__)
 
 # IMAGE_FILE_MACHINE_*
 _MACHINE = {
@@ -230,6 +233,7 @@ def _section_raw_offsets(data: bytes, info: PeInfo) -> list:
             o = sh + i * 40
             offs.append(struct.unpack_from("<I", data, o + 20)[0] if o + 40 <= len(data) else 0)
     except Exception:
+        _log.debug("PE section raw offsets parse failed", exc_info=True)
         pass
     return offs or [0] * len(info.sections)
 

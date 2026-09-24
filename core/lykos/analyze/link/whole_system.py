@@ -147,7 +147,7 @@ def whole_system_stage(ctx) -> dict:
             # False there and nothing is recorded -- the search above runs baseline-free for
             # speed, but a finding is only minted once the controlled re-run confirms it.
             self_res = _detonate(mdata, baseline=True)
-            if self_res.cross_boundary:
+            if self_res.cross_boundary_confirmed:      # a real baseline ran and cleared the victim
                 _record_crash(ctx, self_res, entry, mdata, arch)
         if execs % 20 == 0:
             ctx.emit("system.progress", payload={"execs": execs, "cross_boundary": crossb})
@@ -163,7 +163,7 @@ def _finish_single(ctx, res, entry, data) -> int:
         ctx.progress(pct=100, msg=res.note)
         return 0
     n = 0
-    if res.cross_boundary:
+    if res.cross_boundary_confirmed:
         _record_crash(ctx, res, entry, data, entry.arch)
         n = 1
     ctx.emit("system.done", payload={

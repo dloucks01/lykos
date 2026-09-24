@@ -280,7 +280,12 @@ def _finalize(ctx, target, target_bytes, mode, base_argv, cap0, control, prim, c
         # A confirmed primitive DEMONSTRATES an end effect -- headline it and relabel the crash
         # finding authoritatively (RIP control -> RCE, write-what-where -> arbitrary write,
         # controlled read -> info disclosure), instead of leaving it as "Reproduced crash".
-        _EFF = {"instruction-pointer-control": ("rce", "Remote code execution / control-flow hijack"),
+        # An L2 instruction-pointer-control primitive DEMONSTRATES a control-flow hijack -- not
+        # code execution. Under NX/ASLR no attacker code has run at this level; that is precisely
+        # what the L3 exploit stage proves (and then upgrades RCE to demonstrated). Reporting L2 as
+        # "RCE demonstrated" is an over-claim, so IP-control headlines a demonstrated hijack and
+        # carries RCE only as POTENTIAL. Write/read primitives ARE their effect, so stay demonstrated.
+        _EFF = {"instruction-pointer-control": ("control-flow-hijack", "Control-flow hijack"),
                 "write-what-where": ("memory-corruption", "Memory corruption (arbitrary write)"),
                 "arbitrary-write": ("memory-corruption", "Memory corruption (arbitrary write)"),
                 "arbitrary-read": ("info-disclosure", "Information disclosure (memory leak)"),
@@ -304,10 +309,18 @@ def _finalize(ctx, target, target_bytes, mode, base_argv, cap0, control, prim, c
             # Promote the matching end effect to DEMONSTRATED and attach the L2 bundle that
             # proves it -- the confirmed primitive (RIP control / write-what-where / controlled
             # read), the exact input that achieves it, and how (offset, captured marker).
-            cand.setdefault("evidence", []).append({"channel": "effects", "detail": json.dumps([{
+            _effects = [{
                 "kind": _kind, "title": _title, "status": "demonstrated", "detail": extra,
                 "proof": {"type": "bundle", "sha": bundle_sha, "input_sha": control_sha,
-                          "note": extra}}])})
+                          "note": extra}}]
+            if prim.get("type") == "instruction-pointer-control":
+                # RCE is POTENTIAL at L2 (hijack achieved, code execution not shown); L3 upgrades it.
+                _effects.append({"kind": "rce", "title": "Remote code execution",
+                                 "status": "potential",
+                                 "detail": "control-flow hijack achieved at L2; code execution not "
+                                           "demonstrated at this level (see L3 exploit)"})
+            cand.setdefault("evidence", []).append(
+                {"channel": "effects", "detail": json.dumps(_effects)})
         fd.upsert(target.id, target.case_id, cand)
         fid = fd.id_for_dedup(target.id, cand["dedup_key"])   # the pc-keyed crash finding
         if fid:
