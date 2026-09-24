@@ -285,11 +285,24 @@ tictactoe):
   recovery reads a PIE base from objdump's computed `lea reg,[rip+..] # <vaddr>` comment (validated
   end-to-end on a STRIPPED PIE global-table target → CWE-129, guard rebased at runtime).
 
+- **Live tcache-poisoning chain** (`chain_primitive._tcache_chain`) — a discovered double-free / UAF
+  now drives a full tcache poison LIVE instead of only emitting the L2 recipe: allocate, free, use
+  the UAF to overwrite the freed chunk's `fd` with a mangled pointer to a code-pointer target,
+  allocate twice to obtain a chunk AT the target, write the win address there, and trigger. lykos
+  runs ASLR-off, so the freed chunk's address is deterministic — the tracer reports it
+  (`alloc_addrs`) and the stage computes the glibc-2.32+ **safe-linking** mangle `(chunk>>12) ^
+  target` with no leak needed. Targets are 16-aligned writable globals (glibc rejects an unaligned
+  tcache chunk). Confirmed under the debugger with the negative-control proof, then filed as an
+  **L3 `verified`** poc. The trace runs the target the same way `capture()` does (direct ptrace, not
+  bwrap) so the heap layout matches. `_is_alloc` now also recognises a size-only `malloc(size)`
+  option. Validated end-to-end on a synthetic double-free target → L3 (chunk over a global fn-ptr →
+  win). Where the pieces aren't recoverable it still files the L2 recipe.
+
 Known gaps / next: bad_grades (a stripped counted STACK overflow) reaches L1 via the fuzzer but
-stalls (no win); its bug is a stack array, not a global table. Also: the full angrop/pwntools
-finish-the-chain backend, live tcache-poison driving off the heap primitives (currently an L2
-recipe), leaked-canary/PIE auto-confirmation (unblocks the chainer on PIE targets and auth-or-out),
-and the SROP 2-stage/leak variant for the no-writable case (sick_rop).
+stalls (no win); its bug is a stack array, not a global table. leaked-canary/PIE auto-confirmation
+(unblocks the chainer on PIE heap targets, which still need a runtime heap leak for the mangle), the
+full angrop/pwntools finish-the-chain backend, and the SROP 2-stage/leak variant for the no-writable
+case (sick_rop).
 
 ### Phase 4 — Optional, fenced local-LLM helper  *(only worthwhile with a modest GPU)*
 - Off by default. Three roles only, each **verifier-gated**: (1) fuzz harness/seed/dictionary
