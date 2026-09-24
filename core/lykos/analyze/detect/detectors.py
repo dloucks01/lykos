@@ -113,7 +113,7 @@ def toctou_race(ctx: DetectContext):
 # Copies with no length bound; a fixed stack buffer + one of these is the classic smash.
 _UNBOUNDED_COPY = {"strcpy", "strcat", "gets", "sprintf", "vsprintf", "scanf", "sscanf"}
 # A scanf string conversion (%s / %[...]); _SCANF_UNBOUNDED is the WIDTHLESS (dangerous) subset --
-# `%s`/`%ls`/`%[` with no width, but not `%16s`. Used to drop the width-bounded-scanf false positive.
+# `%s`/`%ls`/`%[` with no width, but not `%16s`. Drops the width-bounded-scanf false positive.
 _SCANF_CONV = re.compile(r"%\*?\d*[hlLjztq]*[s\[]")
 _SCANF_UNBOUNDED = re.compile(r"%\*?(?![\d])[hlLjztq]*[s\[]")
 # The subset whose DESTINATION buffer is the first argument -- the only ones the destination gate
@@ -404,7 +404,7 @@ def stack_buffer_overflow(ctx: DetectContext):
         n = normalize(e.dst_name)
         if n in _UNBOUNDED_COPY:
             if n in ("scanf", "sscanf") and not scanf_maybe_unbounded:
-                continue                                 # only width-bounded %Ns present -> not a bug
+                continue                          # only width-bounded %Ns present -> not a bug
             sinks_by_func[e.src_addr].append((n, e.site_addr))
     out = []
     for addr, frame in ctx.frames.items():
