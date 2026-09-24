@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
+import subprocess
 import tempfile
 from pathlib import Path
 
@@ -23,7 +25,7 @@ from ...jobs.registry import register_stage
 from ..dynamic import sandbox
 from ..fuzz import menu
 from ..poc import exploit
-from .heap_discover import _crawl_menu_model
+from .heap_discover import _crawl_menu_model, _read_width
 
 OOB_INDEX_STAGE = "oob_index"
 _HELPER = Path(__file__).with_name("heaptrace.py")
@@ -37,9 +39,80 @@ def _array_candidates(objects: dict) -> list[dict]:
     for name, (addr, size) in (objects or {}).items():
         if "@" in name or size % _WORD or not (2 * _WORD <= size <= (1 << 20)):
             continue
-        out.append({"name": name, "addr": addr, "size": size, "cap": size // _WORD})
+        out.append({"name": name, "addr": addr, "size": size, "cap": size // _WORD,
+                    "stride": _WORD})
     out.sort(key=lambda a: -a["size"])
     return out[:8]
+
+
+def _data_ranges(exe: Path) -> list[tuple[int, int]]:
+    """[start, end) virtual ranges of the writable global sections (.data/.bss), so an indexed
+    displacement can be recognised as a global-array base."""
+    if not shutil.which("objdump"):
+        return []
+    try:
+        out = subprocess.run(["objdump", "-h", str(exe)], capture_output=True, text=True,
+                             timeout=30).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    ranges = []
+    for ln in out.splitlines():
+        p = ln.split()
+        if len(p) >= 5 and p[1] in (".data", ".bss"):
+            try:
+                size, vma = int(p[2], 16), int(p[3], 16)
+            except ValueError:
+                continue
+            if size:
+                ranges.append((vma, vma + size))
+    return ranges
+
+
+# an indexed global access: `[... reg*scale + 0xDISP]` (mov rax,[rax*8+0x6020c0]) -- the DISP is the
+# array base, scale the element stride. Intel syntax (objdump -M intel).
+_IDX_ACCESS = re.compile(r"\*([1248])\+0x([0-9a-fA-F]+)\]")
+
+
+def _array_candidates_symfree(exe: Path) -> list[dict]:
+    """Fixed-size global arrays recovered from the DISASSEMBLY when the binary is stripped: a data
+    displacement indexed by a scaled register (`[reg*scale + base]`). The exact element count is not
+    in the binary, so the capacity is estimated from the gap to the next global base (bounded by a
+    default); the before-guard (base - stride) catches the dominant underflow regardless. Native
+    non-PIE only (a PIE base is RIP-relative, not an absolute displacement)."""
+    if not shutil.which("objdump"):
+        return []
+    try:
+        out = subprocess.run(["objdump", "-d", "--no-show-raw-insn", "-M", "intel", str(exe)],
+                             capture_output=True, text=True, timeout=60).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return _candidates_from_disasm(out, _data_ranges(exe))
+
+
+def _candidates_from_disasm(disasm: str, ranges: list) -> list[dict]:
+    """Pure: indexed data accesses in `disasm` -> array candidates, given writable-section ranges.
+    The capacity is estimated from the gap to the next global base (underflow guard is exact)."""
+    if not ranges:
+        return []
+
+    def in_data(a):
+        return any(s <= a < e for s, e in ranges)
+
+    strides: dict = {}                                    # base -> stride (scale)
+    for ln in disasm.splitlines():
+        for m in _IDX_ACCESS.finditer(ln):
+            base = int(m.group(2), 16)
+            if in_data(base):
+                strides.setdefault(base, int(m.group(1)))
+    bases = sorted(strides)
+    cands = []
+    for i, base in enumerate(bases):
+        stride = strides[base]
+        gap = (bases[i + 1] - base) if i + 1 < len(bases) else stride * 64
+        cap = max(2, min(64, gap // stride))             # estimate; underflow guard is exact anyway
+        cands.append({"name": f"data_{base:x}", "addr": base, "stride": stride,
+                      "size": cap * stride, "cap": cap})
+    return cands[:8]
 
 
 def _idx_options(model: dict, opts: list[str]) -> list[str]:
@@ -50,14 +123,14 @@ def _idx_options(model: dict, opts: list[str]) -> list[str]:
     return named or list(opts)
 
 
-def _drive(opt: str, model: dict, boundary: int) -> bytes:
+def _drive(opt: str, model: dict, boundary: int, *, width=None) -> bytes:
     """Input that selects `opt` and supplies `boundary` for its index field (other fields filled
-    with in-bounds typed values)."""
+    with in-bounds typed values). `width` encodes a fixed-width read(fd, buf, W) protocol."""
     fields = model.get(opt)
     if fields:
-        return opt.encode() + b"\n" + menu._fill(fields, big_last=False,
-                                                  idx=str(boundary).encode())
-    return opt.encode() + b"\n" + str(boundary).encode() + b"\n"
+        return menu._scalar(opt.encode(), width) + menu._fill(
+            fields, idx=str(boundary).encode(), width=width)
+    return menu._scalar(opt.encode(), width) + menu._scalar(str(boundary).encode(), width)
 
 
 def oob_index_stage(ctx) -> dict:
@@ -72,12 +145,8 @@ def oob_index_stage(ctx) -> dict:
         return {}
 
     target_bytes = ctx.content.path(target.sha256).read_bytes()
-    arrays = _array_candidates(exploit.elf_objects_sized(target_bytes))
-    if not arrays:
-        ctx.emit("oob_index.done", payload={"applicable": False,
-                 "note": "no fixed-size global array (a selectable object table) found to probe"})
-        ctx.progress(pct=100, msg="no indexable array table found")
-        return {}
+    sym_arrays = _array_candidates(exploit.elf_objects_sized(target_bytes))
+    pie = (target.mitigations or {}).get("pie") == "on"
 
     workdir = Path(tempfile.mkdtemp(prefix="lykos-oob-"))
     sandbox.protect_dir(getattr(ctx.content, "root", None))
@@ -87,15 +156,25 @@ def oob_index_stage(ctx) -> dict:
         os.chmod(exe, 0o755)
         (workdir / "heaptrace.py").write_bytes(_HELPER.read_bytes())
 
-        pie = (target.mitigations or {}).get("pie") == "on"
+        # Symbol table gives array sizes directly; a STRIPPED binary needs the arrays recovered from
+        # the disassembly (indexed data accesses). The symbol-free recovery is non-PIE only.
+        arrays = sym_arrays or ([] if pie else _array_candidates_symfree(exe))
+        if not arrays:
+            ctx.emit("oob_index.done", payload={"applicable": False,
+                     "note": "no fixed-size global array (selectable object table) to probe"})
+            ctx.progress(pct=100, msg="no indexable array table found")
+            return {}
+
         strings = [x.value for x in StringDAO(ctx.conn).list_by_target(target.id)
                    if getattr(x, "value", None)]
         opts = menu.detect_menu(strings)
-        model = _crawl_menu_model(workdir, exe, opts) if opts else {}
+        width = _read_width(exe)
+        model = _crawl_menu_model(workdir, exe, opts, width=width) if opts else {}
         idx_opts = _idx_options(model, opts) or ["1", "2", "3", "4"]
         # prime one valid object so the select path is reachable, if an allocating option exists
         alloc = next((o for o in opts if o in model and menu._is_alloc(model[o])), None)
-        prime = (alloc.encode() + b"\n" + menu._fill(model[alloc])) if alloc else b""
+        prime = (menu._scalar(alloc.encode(), width)
+                 + menu._fill(model[alloc], width=width)) if alloc else b""
 
         ctx.emit("oob_index.arrays", payload={
             "arrays": [{"name": a["name"], "cap": a["cap"]} for a in arrays],
@@ -106,13 +185,14 @@ def oob_index_stage(ctx) -> dict:
         for arr in arrays:
             if found or ctx.should_cancel():
                 break
-            guards = [[arr["addr"] - _WORD, f"{arr['name']}[-1]"],
+            stride = arr.get("stride", _WORD)
+            guards = [[arr["addr"] - stride, f"{arr['name']}[-1]"],
                       [arr["addr"] + arr["size"], f"{arr['name']}[{arr['cap']}]"]]
             for opt in idx_opts:
                 if found or ctx.should_cancel():
                     break
-                for boundary in (0, arr["cap"], arr["cap"] + 1):
-                    seq = prime + _drive(opt, model, boundary)
+                for boundary in (0, -1, arr["cap"], arr["cap"] + 1):
+                    seq = prime + _drive(opt, model, boundary, width=width)
                     report = workdir / "report.json"
                     report.unlink(missing_ok=True)
                     (workdir / "spec.json").write_text(json.dumps({

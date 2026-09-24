@@ -269,13 +269,24 @@ tictactoe):
   real dreamdiary1 the driver now correctly reaches allocate + free, but that target's Delete NULLs
   its pointer slot, so it is double-free-safe — the finding is a correct negative, and its actual
   bug is an edit-path issue outside this detector.)
+- **Symbol-free OOB array-table discovery** (`oob_index._array_candidates_symfree` /
+  `_candidates_from_disasm`) — a STRIPPED binary has no OBJECT symbols, so the fixed-size global
+  arrays are recovered from the DISASSEMBLY: an indexed data access `[reg*scale + 0xDISP]` whose
+  DISP falls in `.data`/`.bss` is an array base with `scale` as its element stride. The element
+  count is not in the binary, so the capacity is estimated from the gap to the next global base —
+  but the **before-guard** (`base - stride`) is exact and catches the dominant underflow case
+  (auth-or-out class) regardless. The boundary set now also drives index `-1` (a direct negative
+  index, not only the `id-1` shape). Native non-PIE (a PIE base is RIP-relative). Validated
+  end-to-end on a STRIPPED global-pointer-table target → CWE-129 found with no symbols
+  (`data_<addr>[-1]` reached from program code). `oob_index` also now infers the fixed-width input
+  width and threads it through the crawl + probes, like `heap_trace`.
 
-Known gaps / next: **oob_index array-table id** still needs symbols (recover fixed-size global
-arrays from `.bss` + indexed access in the disasm). bad_grades (a stripped counted STACK overflow)
-reaches L1 via the fuzzer but stalls (no win). Also:
-the full angrop/pwntools finish-the-chain backend, live tcache-poison driving off the heap
-primitives (currently an L2 recipe), leaked-canary/PIE auto-confirmation (unblocks the chainer on
-PIE targets and auth-or-out), and the SROP 2-stage/leak variant for the no-writable case (sick_rop).
+Known gaps / next: bad_grades (a stripped counted STACK overflow) reaches L1 via the fuzzer but
+stalls (no win); its bug is a stack array, not a global table. **PIE symbol-free** array/allocator
+recovery (RIP-relative bases). Also: the full angrop/pwntools finish-the-chain backend, live
+tcache-poison driving off the heap primitives (currently an L2 recipe), leaked-canary/PIE
+auto-confirmation (unblocks the chainer on PIE targets and auth-or-out), and the SROP 2-stage/leak
+variant for the no-writable case (sick_rop).
 
 ### Phase 4 — Optional, fenced local-LLM helper  *(only worthwhile with a modest GPU)*
 - Off by default. Three roles only, each **verifier-gated**: (1) fuzz harness/seed/dictionary
