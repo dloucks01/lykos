@@ -89,6 +89,13 @@ class TcpHTTPServer(ThreadingHTTPServer):
 # Loopback hosts the browser UI legitimately reaches us on. A request whose Host or Origin is
 # anything else is a cross-site or DNS-rebinding attempt against 127.0.0.1:8787.
 _LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
+# Extra hostnames/IPs allowed through the Host/Origin guard, for reaching the UI over a PRIVATE
+# overlay (e.g. a Tailscale tailnet address or MagicDNS name). Comma-separated, opt-in via env --
+# the default stays loopback-only. Pair it with binding `--http <that-ip>:PORT` so the socket is
+# only reachable on that private interface, never the public internet (there is still no auth).
+_ALLOWED_HOSTS = _LOCAL_HOSTS | {
+    h.strip().lower() for h in os.environ.get("LYKOS_ALLOW_HOSTS", "").split(",") if h.strip()
+}
 # Ceiling on a single request body (uploads, case-archive imports). Bounds memory; firmware
 # images fit comfortably under this.
 _MAX_BODY = 1 * 1024 * 1024 * 1024  # 1 GiB
@@ -194,14 +201,14 @@ class Handler(EndpointsMixin, AutopilotMixin, BaseHTTPRequestHandler):
         Origin and is allowed. A request whose Host or Origin is not loopback is refused, which
         also defeats a rebinding page that points a hostname at 127.0.0.1. Returns True if the
         request may proceed; otherwise it has already sent a 403."""
-        host = _hostname_only(self.headers.get("Host", ""))
-        if host and host not in _LOCAL_HOSTS:
+        host = _hostname_only(self.headers.get("Host", "")).lower()
+        if host and host not in _ALLOWED_HOSTS:
             self._json({"error": "host not allowed"}, 403, close=True)
             return False
         origin = self.headers.get("Origin")
         if origin:
             o = urlparse(origin)
-            if (o.hostname or "") not in _LOCAL_HOSTS:
+            if (o.hostname or "").lower() not in _ALLOWED_HOSTS:
                 self._json({"error": "cross-origin request refused"}, 403, close=True)
                 return False
         return True
