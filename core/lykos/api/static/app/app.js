@@ -625,6 +625,13 @@ function App() {
   const activeFuncs = _atid ? funcsByT[_atid] : null;
   const activeStrings = _atid ? stringsByT[_atid] : null;
   const activeCrashes = _atid ? (dynByT[_atid] || []).filter((d) => d.crashed) : [];
+  // Category subsets for the conditional tabs (each appears only when it has content).
+  const _heapDet = new Set(["heap_trace", "heap_check"]);
+  const _taintDet = new Set(["tainted_deref", "cross_taint", "dynamic_taint"]);
+  const heapFindings = activeRanked.filter((f) => _heapDet.has(f.detector) || /CWE-(122|415|416)\b/.test(f.cwe || ""));
+  const taintFindings = activeRanked.filter((f) => _taintDet.has(f.detector));
+  const cveFindings = activeRanked.filter((f) => f.detector === "cve_scan" || /^CVE-/i.test(f.cwe || ""));
+  const hasCoverage = !!(activeTarget && coverage[activeTarget.id]);
   const tabDefs = [
     { id: "findings", label: "Findings", n: activeRanked.length },
     { id: "exploits", label: "Exploits", n: activePocs.length },
@@ -632,6 +639,10 @@ function App() {
     { id: "disasm", label: "Disassembly" },
     { id: "strings", label: "Strings", n: activeStrings ? activeStrings.length : undefined },
     ...(activeCrashes.length ? [{ id: "crashes", label: "Crashes", n: activeCrashes.length }] : []),
+    ...(hasCoverage ? [{ id: "coverage", label: "Coverage" }] : []),
+    ...(heapFindings.length ? [{ id: "heap", label: "Heap", n: heapFindings.length }] : []),
+    ...(taintFindings.length ? [{ id: "taint", label: "Taint", n: taintFindings.length }] : []),
+    ...(cveFindings.length ? [{ id: "cves", label: "CVEs", n: cveFindings.length }] : []),
     { id: "diff", label: "Diff" },
     { id: "console", label: "Console", n: consoleLines.length },
   ];
@@ -764,6 +775,23 @@ function App() {
               <div class="wb-panel"><${StringsPanel} strings=${activeStrings} /></div>
             ` : tab === "crashes" ? html`
               <div class="wb-panel"><${CrashesPanel} crashes=${_atid ? dynByT[_atid] : null} artifactUrl=${api.artifactUrl} /></div>
+            ` : tab === "coverage" ? html`
+              <div class="wb-panel"><${CoveragePanel} coverage=${coverage} targets=${activeTarget ? [activeTarget] : targets} onDrill=${browseFunctions} /></div>
+            ` : tab === "heap" ? html`
+              <div class="wb-panel">
+                <div class="cat-intro">Heap primitives discovered by tracing the target's allocator — the seeds for tcache poisoning and arbitrary write.</div>
+                ${heapFindings.map(cardFor)}
+              </div>
+            ` : tab === "taint" ? html`
+              <div class="wb-panel">
+                <div class="cat-intro">Attacker-controlled data flows: values from untrusted input that reach a dangerous sink or a computed pointer.</div>
+                ${taintFindings.map(cardFor)}
+              </div>
+            ` : tab === "cves" ? html`
+              <div class="wb-panel">
+                <div class="cat-intro">Known-CVE matches from fingerprinting this binary's components against the offline vulnerability database.</div>
+                ${cveFindings.map(cardFor)}
+              </div>
             ` : tab === "diff" ? html`
               <div class="wb-panel"><${DiffPanel} targets=${targets} findings=${ranked} /></div>
             ` : tab === "console" ? html`
