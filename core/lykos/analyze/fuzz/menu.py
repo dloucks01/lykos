@@ -267,10 +267,13 @@ def _fill(fields, *, big_last: bool = False, idx: bytes = b"1", num: bytes = b"1
 
 
 def _is_alloc(fields) -> bool:
-    """An allocating option (add/create) reads a size (num) with a string to fill AFTER it -- the
-    "how many bytes?" then the buffer. Leading name/label strings before the size are fine."""
+    """An allocating option (add/create) reads a size (num), usually with a string to fill AFTER it
+    -- the "how many bytes?" then the buffer. A size-only option (just num(s), the classic
+    `malloc(size)` menu) also allocates. Leading name/label strings before the size are fine."""
     ni = next((i for i, f in enumerate(fields) if f == "num"), None)
-    return ni is not None and any(f == "str" for f in fields[ni + 1:])
+    if ni is None:
+        return False
+    return any(f == "str" for f in fields[ni + 1:]) or all(f == "num" for f in fields)
 
 
 def menu_op_sequences(model: dict, options, *, max_seqs: int = 40, width=None) -> list[bytes]:

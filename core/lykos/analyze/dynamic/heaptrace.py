@@ -263,6 +263,7 @@ if __name__ == "__main__":                                            # ---- the
         watches = {}                                      # slot -> {"addr", "kind", "chunk"}
         uaf_seen, of_seen, oob_seen = set(), set(), set()
         oneshot = set()                                   # PLT alloc-return bps: fire once, remove
+        alloc_addrs = []                                  # chunk addresses in allocation order
         events = []
 
         def in_allocator(rip):
@@ -384,6 +385,8 @@ if __name__ == "__main__":                                            # ---- the
                     ptr = rg.rax
                     size, pending_size = pending_size, 0
                     freed.discard(ptr)                   # handed back out -> live again
+                    if len(alloc_addrs) < 16:
+                        alloc_addrs.append(ptr)          # deterministic (ASLR-off) chunk addresses
                     if alloc_is_plt:
                         clear_covering(ptr, ptr + max(size, 8))   # reclaim stale UAF watches
                     elif ptr and 0 < size <= (1 << 20):
@@ -418,7 +421,8 @@ if __name__ == "__main__":                                            # ---- the
                    "double_free": any(e.get("error") == "double-free" for e in events),
                    "use_after_free": any(e.get("error") == "use-after-free" for e in events),
                    "heap_overflow": any(e.get("error") == "heap-overflow" for e in events),
-                   "oob_index": any(e.get("error") == "oob-index" for e in events)},
+                   "oob_index": any(e.get("error") == "oob-index" for e in events),
+                   "alloc_addrs": [hex(a) for a in alloc_addrs]},
                   open(report, "w"))
         return 0
 

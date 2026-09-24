@@ -41,6 +41,8 @@ def test_is_alloc_needs_size_then_string():
     assert not menu._is_alloc(["idx"])                 # delete: index only
     assert not menu._is_alloc(["idx", "str"])          # modify by id: no size field
     assert not menu._is_alloc(["str", "str"])          # no size at all
+    assert menu._is_alloc(["num"])                     # size-only malloc(size) menu
+    assert menu._is_alloc(["num", "num"])              # size-only (two numbers)
 
 
 def test_menu_op_sequences_from_model_types_fields_and_overflows():
