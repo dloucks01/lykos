@@ -98,6 +98,7 @@ function App() {
   const [dynByT, setDynByT] = useState({});
   const [disasmFn, setDisasmFn] = useState(null);     // getFunction detail for the Disassembly tab
   const [disasmSel, setDisasmSel] = useState({});     // targetId -> selected function id
+  const [diffVerify, setDiffVerify] = useState(null); // poc_diff run result for the Diff tab
   const [bg, setBg] = useState(null);               // server-side background autopilot status
   const [bgActivity, setBgActivity] = useState(null); // {msg, pct} live intra-stage progress
   const [consoleLines, setConsoleLines] = useState([]); // job.exec: tool commands + I/O
@@ -549,6 +550,20 @@ function App() {
     catch (e) { setDisasmFn({ ...fn, decompiled: "(failed to load disassembly)" }); }
   }, [activeTid]);
 
+  // Verified regression diff: re-run baseline A's PoC inputs against candidate B (the poc_diff
+  // stage) and show whether the fault still reproduces.
+  const runPocDiff = useCallback(async (aId, bId) => {
+    const key = aId + ">" + bId;
+    if (!aId || !bId || aId === bId) { setDiffVerify({ key, error: "pick two different targets" }); return; }
+    setDiffVerify({ key, running: true });
+    try {
+      const run = await api.createRun("poc_diff", { targetId: bId, params: { baseline_target_id: aId } });
+      await waitForRun(run.run_id);
+      const out = await api.runOutput(run.run_id);
+      setDiffVerify({ key, data: (out && out.output) || { applicable: false, note: "no result" } });
+    } catch (e) { setDiffVerify({ key, error: e.message || String(e) }); }
+  }, []);
+
   // Lazily fetch a tab's data the first time it is needed for the focused target (and always the
   // crash rows, which gate the conditional Crashes tab). Cached per target so switching is instant.
   const _at = activeTid || (targets[0] && targets[0].id);
@@ -793,7 +808,7 @@ function App() {
                 ${cveFindings.map(cardFor)}
               </div>
             ` : tab === "diff" ? html`
-              <div class="wb-panel"><${DiffPanel} targets=${targets} findings=${ranked} /></div>
+              <div class="wb-panel"><${DiffPanel} targets=${targets} findings=${ranked} onVerify=${runPocDiff} verify=${diffVerify} /></div>
             ` : tab === "console" ? html`
               <div class="wb-panel">
                 ${bg && bg.plan ? html`<${PipelinePlan} plan=${bg.plan} targetName=${bg.target_name} target=${bg.target} targets=${bg.targets} />` : null}
