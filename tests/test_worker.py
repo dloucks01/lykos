@@ -125,3 +125,40 @@ def test_metrics_and_multiple_jobs(store, case, pool):
     assert pool.wait_idle(8)
     m = pool.metrics()
     assert m.get("done", 0) >= 10
+
+
+def _wedged_uninterruptible(ctx):
+    # Never checks cancel and blocks in a bare sleep: simulates a stage stuck in an in-process
+    # native call the heartbeat/cancel cannot interrupt -- the worker THREAD cannot be killed.
+    import threading as _t
+    _WEDGE_ENTERED.set()
+    _t.Event().wait(30)
+
+
+_WEDGE_ENTERED = None  # set per-test
+
+
+def test_wedged_stage_does_not_starve_the_pool(store, case):
+    """A stage wedged in an uninterruptible call must not permanently hold its concurrency slot:
+    the supervisor reclaims the slot (release-once) and spawns a replacement worker, so other work
+    of the same class still runs even at a cap of 1."""
+    global _WEDGE_ENTERED
+    import threading
+    _WEDGE_ENTERED = threading.Event()
+    register_stage("wedge", _wedged_uninterruptible, resource_class="quick", timeout=0.3)
+    register_stage("fast", _fast, resource_class="quick", timeout=0.3)
+    p = WorkerPool(store.db_path, store.content,
+                   JobConfig(workers=1, class_caps={"quick": 1}, lease_seconds=2,
+                             poll_interval=0.02, heartbeat_interval=0.3,
+                             default_timeout=0.3, wedge_grace=0.4))
+    p.start()
+    try:
+        q = JobQueue(store.conn)
+        q.enqueue(case.id, "wedge", input_hashes=["1"])
+        assert _WEDGE_ENTERED.wait(4), "wedge stage never started"
+        # cap=1, one worker: without reclaim this second job could never run.
+        rf = q.enqueue(case.id, "fast", input_hashes=["2"])
+        assert _wait_status(q, rf.id, "done", timeout=8), "pool starved by the wedged stage"
+        assert p.metrics().get("wedged_reclaimed", 0) >= 1
+    finally:
+        p.stop(grace=1.0)
