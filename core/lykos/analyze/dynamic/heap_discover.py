@@ -59,6 +59,34 @@ def _plt_addr(exe: Path, name: str) -> int | None:
     return int(m.group(1), 16) if m else None
 
 
+def _read_width(exe: Path) -> int | None:
+    """Fixed-width input width W, or None for a line-based target. A target that reads scalars with
+    `read(0, buf, W)` (not fgets/gets/scanf) consumes exactly W bytes per field regardless of
+    newlines, so the driver must pad each field to W. Detected from constant `mov edx, imm` lengths
+    immediately before `read@plt` calls, when no line reader (fgets/gets/scanf) is present."""
+    if not shutil.which("objdump"):
+        return None
+    try:                                                 # -M intel: match `mov edx,0xN` operands
+        out = subprocess.run(["objdump", "-d", "--no-show-raw-insn", "-M", "intel", str(exe)],
+                             capture_output=True, text=True, timeout=60).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if re.search(r"<(fgets|gets|__isoc99_scanf|scanf|fscanf|getline)@plt>", out):
+        return None                                      # a line reader -> line-based
+    from collections import Counter
+    widths: Counter = Counter()
+    prev_edx = None
+    for ln in out.splitlines():
+        m = re.search(r"mov\s+edx,0x([0-9a-fA-F]+)", ln)
+        if m:
+            prev_edx = int(m.group(1), 16)
+        elif "<read@plt>" in ln and "call" in ln and prev_edx in (1, 2, 3, 4, 8, 16):
+            widths[prev_edx] += 1
+        elif "call" in ln:
+            prev_edx = None                              # a different call clobbers edx
+    return widths.most_common(1)[0][0] if widths else None
+
+
 def _libc_plt_pair(exe: Path) -> dict | None:
     """A stripped menu-driven heap challenge that uses libc directly: trace the malloc (or calloc)
     and free PLT stubs. Returns the alloc/free stub addresses, or None when the pair is absent.
@@ -74,16 +102,17 @@ def _libc_plt_pair(exe: Path) -> dict | None:
     return None
 
 
-def _crawl_menu_model(workdir: Path, exe: Path, opts: list[str]) -> dict:
+def _crawl_menu_model(workdir: Path, exe: Path, opts: list[str], *, width=None) -> dict:
     """Learn each menu option's typed field template by driving the sandboxed target interactively.
-    Best-effort: any failure yields {} and the caller falls back to generic op-sequences."""
+    `width` (from `_read_width`) selects the fixed-width read(fd, buf, W) input encoding when the
+    target is not line-based. Best-effort: any failure yields {} and the caller falls back."""
     def spawn():
         cmd = sandbox.isolate_prefix(str(workdir), net=False, rw_binds=[str(workdir)]) + [str(exe)]
         return subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, cwd=str(workdir),
                                 preexec_fn=sandbox._rlimits(2048, 20, set_as=False))
     try:
-        return menu.crawl_menu(spawn, opts, per_option=2.5)
+        return menu.crawl_menu(spawn, opts, per_option=2.5, width=width)
     except Exception:
         return {}
 
@@ -183,8 +212,12 @@ def heap_trace_stage(ctx) -> dict:
         # live process, so a rich add flow actually ALLOCATES -- the generic (option,size,data)
         # guess never would. menu_op_sequences builds correctly-typed op-sequences from it;
         # fall back to the generic shapes when crawling finds no allocator flow.
-        model = _crawl_menu_model(workdir, exe, opts) if opts else {}
-        seqs = menu.menu_op_sequences(model, opts) or heaptrace.heap_op_sequences(opts) or [
+        # Fixed-width read(fd, buf, W) targets consume exactly W bytes per field (dreamdiary-style);
+        # the crawl and the op-sequences must pad each field to W instead of newline-delimiting.
+        width = _read_width(exe)
+        model = _crawl_menu_model(workdir, exe, opts, width=width) if opts else {}
+        seqs = menu.menu_op_sequences(model, opts, width=width) \
+            or heaptrace.heap_op_sequences(opts) or [
             b"1\n64\nA\n2\n0\n2\n0\n", b"1\n2\n2\n",                 # double-free
             b"1\n64\nA\n2\n0\n3\n0\n", b"1\n2\n3\n", b"1\n2\n3\n4\n",  # UAF (alloc, free, use)
             b"1\n2\n4\n", b"1\n64\nA\n2\n0\n4\n0\n",
