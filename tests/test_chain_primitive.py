@@ -47,3 +47,93 @@ def test_recipe_control_flow_when_win_reachable():
 def test_recipe_arbitrary_write_without_win():
     r = chain._recipe("uaf", None, b"")
     assert r.get("technique") or r.get("advisory_alternatives") or r.get("reason")
+
+
+# --- PIE leak-then-chain: recover the base in-process, relocate the win, confirm by flag ---------
+import shutil  # noqa: E402
+import subprocess  # noqa: E402
+import tempfile  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+import pytest  # noqa: E402
+from lykos.analyze.dynamic import sandbox  # noqa: E402
+from lykos.analyze.poc.exploit import elf_functions  # noqa: E402
+
+_PIE_HEAPWIN = r"""
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+long banner = 0xdead;
+void win(void){ puts("FLAG{pie-heap-chain}"); fflush(stdout); _exit(42); }
+void hello(void){ puts("hello"); }
+struct obj { char buf[32]; void (*fn)(void); };
+static struct obj *o;
+static int rd(char *p,int n){ int k=read(0,p,n); if(k<0)k=0; p[k]=0; return k; }
+static long num(void){ char b[32]; rd(b,31); return strtol(b,0,0); }
+int main(void){
+  setvbuf(stdout,0,_IONBF,0);
+  o=malloc(sizeof *o); o->fn=hello;
+  for(;;){ puts("1)new 2)edit 3)leak 4)run 5)quit");
+    switch(num()){
+      case 1: o=malloc(sizeof *o); o->fn=hello; break;
+      case 2: { char b[64]; int k=rd(b,64); memcpy(o->buf,b,k); } break;
+      case 3: printf("leak main=%p cfg=%p\n",(void*)main,(void*)&banner); break;
+      case 4: o->fn(); break;
+      case 5: return 0;
+    }
+  }
+}
+"""
+
+
+class _FakeCtx:
+    def should_cancel(self): return False
+    def progress(self, **k): pass
+
+
+@pytest.fixture
+def pie_heapwin_bin(tmp_path_factory):
+    if sandbox.host_arch() != "x86-64":
+        pytest.skip("PIE leak-chain is x86-64 native only")
+    gcc = shutil.which("gcc") or shutil.which("cc")
+    if not gcc:
+        pytest.skip("no C compiler")
+    d = tmp_path_factory.mktemp("pieheap"); c = d / "m.c"; c.write_text(_PIE_HEAPWIN)
+    out = d / "target.bin"
+    if subprocess.run([gcc, "-O0", "-fno-stack-protector", "-pie", "-fPIE", str(c),
+                       "-o", str(out)], capture_output=True).returncode != 0:
+        pytest.skip("cannot build PIE heap target")
+    return out
+
+
+def test_pie_leak_chain_recovers_base_and_hijacks(pie_heapwin_bin):
+    """The interactive PIE chainer finds the leak option, recovers the base in-process, drives the
+    overflow to overwrite the adjacent fn pointer, and confirms the win RAN (flag output) under a
+    negative control -- no analyst input, ASLR on (relative to the binary)."""
+    wd = Path(tempfile.mkdtemp(prefix="pchain-"))
+    try:
+        tb = pie_heapwin_bin.read_bytes()
+        win_vaddr = elf_functions(tb)["win"]
+        hit = chain._pie_leak_chain(_FakeCtx(), tb, str(pie_heapwin_bin), ("win", win_vaddr),
+                                    opts=["1", "2", "3", "4", "5"], model={"2": ["str"]},
+                                    width=None, workdir=wd)
+        assert hit is not None, "PIE leak-chain not confirmed"
+        leak_opt, writer, off, trig, base = hit
+        assert leak_opt == "3" and writer == "2" and off == 32   # leak, edit-overflow, buf[32]
+        assert base and base % 0x1000 == 0
+    finally:
+        shutil.rmtree(wd, ignore_errors=True)
+
+
+def test_pie_repro_script_reproduces_standalone(pie_heapwin_bin):
+    """The bundled reproducer is a real, runnable ASLR defeat: it recovers the base from the
+    target's own symbols and re-drives the hijack to print the flag."""
+    tb = pie_heapwin_bin.read_bytes()
+    script = chain._pie_repro_script("win", elf_functions(tb)["win"], "3", "2", 32, "4")
+    import sys as _sys
+    d = pie_heapwin_bin.parent
+    (d / "exploit.py").write_bytes(script)
+    r = subprocess.run(["setarch", "-R", _sys.executable, str(d / "exploit.py"),
+                        str(pie_heapwin_bin)], capture_output=True, timeout=30)
+    assert b"FLAG{pie-heap-chain}" in r.stdout, r.stdout + r.stderr

