@@ -212,16 +212,28 @@ tictactoe):
   on the qword just past each live chunk's end (paired from the alloc-entry `rdi`=size and the
   alloc-return `rax`=ptr) and reports a write there from any non-allocator code (usually libc
   `strcpy`/`memcpy` driven by the program). Validated end-to-end on synthetic custom-allocator
-  double-free / UAF / overflow binaries. On auth-or-out it identifies `ta_alloc`/`ta_free` and finds
-  no chunk overflow — correctly, because that target's bug is an **out-of-bounds array-index write**
-  (`modify_author` validates the author id only against `> 10`, not `== 0`, so id 0 indexes
-  `authors[-1]`), a distinct class from a heap-chunk overflow.
+  double-free / UAF / overflow binaries.
+- **Menu-semantic sequence inference** (`fuzz/menu.py`) — the generic `(option, size, data)` op-
+  sequence never allocates against a rich add flow (auth-or-out's add reads Name, Surname, Age,
+  Note-size, Note), so `heap_trace` saw nothing. `crawl_menu` now DRIVES the live sandboxed process
+  one prompt at a time, classifying each prompt as an index / number / string (`classify_prompt`)
+  and learning every option's ordered field template; `menu_op_sequences` composes correctly-typed
+  double-free / UAF / overflow sequences from it (falling back to the generic shapes when no
+  allocator flow is found). Validated: it learns auth-or-out's add as `[str,str,num,num,str]` and
+  each id-taking option as `[idx]`.
+- **Out-of-bounds array-index discovery** (`dynamic/oob_index.py` + the `oob_index` stage) — the
+  auth-or-out class: a fixed-size global object table (`authors[10]`) selected by a user id whose
+  bound check is missing / off-by-one. It arms read/write **guard** watchpoints on the words just
+  before and after each fixed-size global array (from the ELF symbol size), then drives every
+  index-taking menu option with boundary indices (0, capacity, capacity+1). A guard access from
+  program code proves the index escaped the array, filing **CWE-129** (Improper validation of array
+  index) `corroborated`. Reuses the heaptrace ptrace helper in a new static-watch mode. Validated
+  end-to-end: cracks auth-or-out in ~12 s — option 2 (Modify) with index 0 reaches `authors[-1]`
+  (id validated only against `> 10`, never `== 0`), a downstream arbitrary read/write.
 
 Still analyst-gated / next: the full angrop/pwntools finish-the-chain backend, tcache-poison chaining
-off the discovered double-free/UAF/overflow primitives, an **OOB array-index** detector (the
-auth-or-out class), menu-semantic op inference (so richer add flows — Name/Surname/Age/size/Note —
-are driven automatically rather than from the generic template), leaked-canary/PIE
-auto-confirmation, and the SROP 2-stage/leak variant for the
+off the discovered double-free/UAF/overflow primitives, chaining the OOB-index / heap primitives into
+a demonstrated write, leaked-canary/PIE auto-confirmation, and the SROP 2-stage/leak variant for the
 no-writable case (the hardest, e.g. sick_rop).
 
 ### Phase 4 — Optional, fenced local-LLM helper  *(only worthwhile with a modest GPU)*

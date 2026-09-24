@@ -36,6 +36,7 @@ _TARGET = {
     "directed_fuzz": ("..analyze.fuzz", "enqueue_directed_fuzz"),
     "heap_check": ("..analyze.dynamic", "enqueue_heap_check"),
     "heap_trace": ("..analyze.dynamic", "enqueue_heap_trace"),
+    "oob_index": ("..analyze.dynamic", "enqueue_oob_index"),
     "concolic": ("..analyze.symbolic", "enqueue_concolic"),
     "root_cause": ("..analyze.debug", "enqueue_root_cause"),
     "build_poc": ("..analyze.poc", "enqueue_build_poc"),
@@ -54,7 +55,7 @@ _CASE = {
 # Stages whose enqueue-fn takes NO params. root_cause/build_poc/poc_primitive are NOT here: they
 # require params["input_sha"] (the crashing input), which the prove loop threads in -- listing
 # them dropped that input and every one failed with "requires params.input_sha".
-_NO_PARAMS = {"disassemble", "detect_cwe", "heap_trace"}
+_NO_PARAMS = {"disassemble", "detect_cwe", "heap_trace", "oob_index"}
 _CASE_NO_PARAMS = {"link_case", "ipc_model", "cross_taint"}
 
 _TERMINAL = {"done", "cancelled", "error"}
@@ -113,6 +114,7 @@ _PLAN_STAGES = [
     ("cve_scan", "Known-CVE scan"), ("synthesize_injection", "Injection probes"),
     ("coverage_fuzz", "Coverage fuzzing"), ("directed_fuzz", "Directed fuzzing"),
     ("heap_check", "Heap checks"), ("heap_trace", "Heap primitives"),
+    ("oob_index", "Array-index probes"),
     ("concolic", "Concolic execution"),
     ("root_cause", "Root-cause"), ("build_poc", "Build PoC"),
     ("poc_primitive", "PoC primitive"), ("build_exploit", "Build exploit"),
@@ -333,9 +335,12 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict, stop: t
             _run_target_stage(store, t, "coverage_fuzz", status, stop, dyn)
             _run_target_stage(store, t, "directed_fuzz", status, stop, dyn)
             _run_target_stage(store, t, "heap_check", status, stop, dyn)
-            # Custom-allocator heap-primitive discovery (double-free) for a target
+            # Custom-allocator heap-primitive discovery (double-free / UAF / overflow) for a target
             # with its OWN allocator, which the libc guard-page check cannot see.
             _run_target_stage(store, t, "heap_trace", status, stop)
+            # Out-of-bounds array-index discovery (a fixed-size object table selected by a
+            # user id whose bound check is missing / off-by-one).
+            _run_target_stage(store, t, "oob_index", status, stop)
             crashes = _distinct_crashes(store, tid)
             # Multi-channel retry: the best-guess channel is not always where the bug is (a file
             # parser's overflow can be in the argv filename). If nothing crashed, drive the fast
