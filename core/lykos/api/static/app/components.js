@@ -1051,6 +1051,17 @@ export function DisasmPanel({ functions, detail, selectedId, onSelect, loading }
 // shows what a candidate build FIXED (in A, gone in B), what is NEW (in B, not A), and what is the
 // same. When there is only one target it prompts to add a second binary.
 function diffKey(f) { return `${f.cwe || "?"}::${(f.title || "").replace(/\s*\(.*$/, "").replace(/[:—-].*$/, "").trim().toLowerCase()}`; }
+// One replay row's verdict. A crash PoC reproduces by SIGNAL; a no-crash "win" exploit (method set)
+// reproduces by reaching the win function (breakpoint) or re-printing its success output (marker).
+function diffRowVerdict(r) {
+  if (r.error) return "skipped (" + r.error + ")";
+  if (r.method) {                                     // no-crash win exploit
+    const how = r.method === "breakpoint"
+      ? `${r.win || "win"} reached` : `win output "${r.marker || "marker"}"`;
+    return r.reproduced ? `win reproduces — ${how}` : `fixed — win no longer reproduces`;
+  }
+  return r.reproduced ? "still faults (" + (r.signal || "crash") + ")" : "no fault";
+}
 export function DiffPanel({ targets, findings, onVerify, verify }) {
   const ts = targets || [];
   const [a, setA] = useState(ts[0] && ts[0].id);
@@ -1084,11 +1095,11 @@ export function DiffPanel({ targets, findings, onVerify, verify }) {
         : verify.data && verify.data.applicable !== false ? html`
           <div class=${`diff-verify ${verify.data.fixed ? "dv-fixed" : "dv-vuln"}`}>
             ${verify.data.fixed
-              ? `✓ Fixed — none of ${name(a)}'s ${verify.data.checked} PoC input(s) fault ${name(b)}`
-              : `✗ Still vulnerable — ${verify.data.reproduced}/${verify.data.checked} PoC input(s) still fault ${name(b)}`}
+              ? `✓ Fixed — none of ${name(a)}'s ${verify.data.checked} PoC input(s) reproduce against ${name(b)}`
+              : `✗ Still vulnerable — ${verify.data.reproduced}/${verify.data.checked} PoC input(s) still reproduce against ${name(b)}`}
           </div>
           <div class="diff-verify-list">
-            ${(verify.data.results || []).map((r, i) => html`<div class="dvr" key=${i}>${r.level} · ${(r.cwe || "input")} — ${r.error ? "skipped (" + r.error + ")" : r.reproduced ? "still faults (" + (r.signal || "crash") + ")" : "no fault"}</div>`)}
+            ${(verify.data.results || []).map((r, i) => html`<div class="dvr" key=${i}>${r.level} · ${(r.cwe || "input")} — ${diffRowVerdict(r)}</div>`)}
           </div>`
         : verify.data ? html`<div class="cat-intro">${verify.data.note || "Nothing to verify."}</div>` : null) : null}
       <div class="diff-sum">
