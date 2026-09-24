@@ -13,6 +13,7 @@ the same review (the background run had none, and its findings shipped unreviewe
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import tempfile
@@ -21,6 +22,8 @@ from typing import Optional
 
 from ..db.dao import DynResultDAO
 from .fuzz.runner import run_input
+
+_log = logging.getLogger(__name__)
 
 
 def replay_verdict(store, target, input_sha: str, *, times: int = 5,
@@ -36,6 +39,7 @@ def replay_verdict(store, target, input_sha: str, *, times: int = 5,
     try:
         data = store.content.get_bytes(input_sha)
     except Exception:
+        _log.debug("replay input load failed for %s", input_sha, exc_info=True)
         return None
     dr = next((d for d in DynResultDAO(store.conn).list_by_target(target.id)
                if d.input_sha == input_sha), None)
@@ -58,6 +62,7 @@ def replay_verdict(store, target, input_sha: str, *, times: int = 5,
                                    endianness=target.endianness, bits=target.bits,
                                    base_argv=base_argv)
             except Exception:
+                _log.debug("replay run_input failed for %s", input_sha, exc_info=True)
                 continue                          # a delivery that cannot be built is not a crash
             if res.crashed:
                 crashed += 1

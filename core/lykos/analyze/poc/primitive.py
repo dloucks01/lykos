@@ -271,8 +271,16 @@ def marker_confirmed(cap: dict, word: int = 8, endian: str = "little") -> bool:
         if regs.get(rn) == m:
             return True
     want = _marker_bytes(m, word, endian)
-    for _rel, w in _stack_words(cap):
-        if w[:len(want)] == want:
+    # ONLY the return-address slot the stack pointer indexes (and the word a `ret` just popped),
+    # never the whole captured window. The overflow payload we sent CONTAINS the sentinel and
+    # itself lands on the stack, so scanning every slot would "confirm" a WRONG offset guess whose
+    # sentinel merely sits somewhere in the copied buffer -- a false instruction-pointer-control
+    # claim, which the product must never make. The sentinel is only meaningful at the slot the
+    # epilogue actually loaded into the program counter.
+    words = dict(_stack_words(cap))
+    for rel in (0, -word):
+        w = words.get(rel)
+        if w and w[:len(want)] == want:
             return True
     return False
 

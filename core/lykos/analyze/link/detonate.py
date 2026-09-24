@@ -41,10 +41,21 @@ class DetonateResult:
     blame: Optional[dict] = None
     isolation: str = "rlimits-only(system)"
     note: Optional[str] = None
+    baseline_ran: bool = False       # did a benign-input baseline actually execute this detonation?
 
     @property
     def cross_boundary(self) -> bool:
+        """PROVISIONAL: a service crashed and is not a known baseline-crasher. Fine to drive a
+        fast search, but on its own it does not prove the INPUT caused the crash."""
         return bool(self.blame and self.blame.get("cross_boundary"))
+
+    @property
+    def cross_boundary_confirmed(self) -> bool:
+        """CONFIRMED: cross_boundary AND a real benign baseline ran and cleared the victim, so the
+        service crash is attributable to this input. This is the gate a finding must pass -- a
+        detonation whose baseline was skipped (e.g. entry_input == baseline_input) never qualifies,
+        so an input-independent startup crash is not minted as a cross-boundary finding."""
+        return self.cross_boundary and self.baseline_ran
 
 
 def _wait_ready(channel, deadline):
@@ -88,9 +99,13 @@ def _run_once(*, emu, services, entry, channel, entry_input, timeout, readiness,
 
     def _launch(comp, stdin_pipe):
         cmd = emu + [str(comp["exe"])] + [str(a) for a in comp.get("argv", [])]
+        # stdout/stderr are DEVNULL, not PIPE: the outcome is read from the exit status only
+        # (classify_rc), the pipes are never drained, and a component that writes >~64 KiB would
+        # otherwise BLOCK on the full pipe -- _wait_proc then times out and SIGKILLs it, so a real
+        # post-output crash is misreported as a timeout and cross-boundary blame silently misses it.
         return subprocess.Popen(
             cmd, stdin=(subprocess.PIPE if stdin_pipe else subprocess.DEVNULL),
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             start_new_session=True, preexec_fn=preexec)
 
     ep = None
@@ -190,7 +205,8 @@ def detonate(components: list, *, channel=None, entry_input: bytes = b"",
         # input caused. Run the set once with baseline_input and remember which services die,
         # so those crashes cannot be mis-blamed on the test input below.
         baseline_crashers: set = set()
-        if baseline and services and entry_input != baseline_input:
+        baseline_ran = bool(baseline and services and entry_input != baseline_input)
+        if baseline_ran:
             base = _run_once(emu=emu, services=services, entry=entry, channel=channel,
                              entry_input=baseline_input, timeout=timeout,
                              readiness=readiness, grace=grace, preexec=preexec)
@@ -208,7 +224,7 @@ def detonate(components: list, *, channel=None, entry_input: bytes = b"",
             _rm(made_fifo)
 
     blame = _blame(entry, outcomes, baseline_crashers)
-    return DetonateResult(outcomes=outcomes, blame=blame, note=note)
+    return DetonateResult(outcomes=outcomes, blame=blame, note=note, baseline_ran=baseline_ran)
 
 
 def _blame(entry, outcomes, baseline_crashers=frozenset()):

@@ -87,6 +87,21 @@ def test_control_input_and_marker_confirmed():
     assert not P.marker_confirmed({"pc": 0x1234, "sp": 0, "stack_base": 0, "stack": ""})
 
 
+def test_marker_confirmed_ignores_sentinel_deep_in_the_stack():
+    """The overflow payload CONTAINS the sentinel and lands on the stack; a WRONG offset guess
+    leaves it somewhere in the copied buffer, NOT at the return-address slot. Confirming on that
+    would be a false instruction-pointer-control claim -- so only the slot SP indexes counts."""
+    sp = 0x7000
+    deep = bytearray(128)
+    deep[64:72] = struct.pack("<Q", P.MARKER)          # sentinel deep in the window, not the RA slot
+    assert not P.marker_confirmed(
+        {"pc": 0xdead, "regs": {}, "sp": sp, "stack_base": sp, "stack": bytes(deep).hex()})
+    at_slot = bytearray(128)
+    at_slot[0:8] = struct.pack("<Q", P.MARKER)         # sentinel at the slot SP indexes -> confirms
+    assert P.marker_confirmed(
+        {"pc": 0xdead, "regs": {}, "sp": sp, "stack_base": sp, "stack": bytes(at_slot).hex()})
+
+
 # ------------------------------------------------------------------- integration
 @pytest.fixture
 def pool(store):

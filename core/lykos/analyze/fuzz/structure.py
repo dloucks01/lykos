@@ -14,11 +14,14 @@ the input does not parse.
 """
 from __future__ import annotations
 
+import logging
 import re
 import struct
 import zlib
 
 from .mutator import Mutator
+
+_log = logging.getLogger(__name__)
 
 _INT = {"u8": (1, "B"), "u16": (2, "H"), "u32": (4, "I"), "u64": (8, "Q")}
 # values that break length/count fields: zero, off-by-one, and huge (overflow/overread)
@@ -386,6 +389,8 @@ class StructMutator:
         try:
             fields = self.model.parse(data or b"")
         except Exception:
+            _log.debug("struct-mutate: model.parse failed; falling back to byte havoc",
+                       exc_info=True)
             return self.byte.mutate(data, corpus)
         if not fields:
             return self.byte.mutate(data, corpus)
@@ -405,6 +410,8 @@ class StructMutator:
                 _fix_covers(self.model, fields)
             return self.model.serialize(fields)
         except Exception:
+            _log.debug("struct-mutate: field mutate/serialize failed; falling back to byte havoc",
+                       exc_info=True)
             return self.byte.mutate(data, corpus)
 
     def _drive_pair(self, fields, fd, role):

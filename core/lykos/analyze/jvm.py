@@ -21,11 +21,14 @@ L2 and L3 are not, and a badge claiming otherwise would be a lie about the runti
 from __future__ import annotations
 
 import io
+import logging
 import re
 import struct
 import zipfile
 from dataclasses import dataclass, field
 from typing import Optional
+
+_log = logging.getLogger(__name__)
 
 CLASS_MAGIC = b"\xca\xfe\xba\xbe"
 JAR_MAGIC = b"PK\x03\x04"
@@ -79,6 +82,7 @@ def is_jar(data: bytes) -> bool:
         with zipfile.ZipFile(io.BytesIO(data)) as z:
             names = z.namelist()
     except Exception:
+        _log.debug("is_jar zip probe failed", exc_info=True)
         return False
     return any(n.endswith(".class") for n in names) or "META-INF/MANIFEST.MF" in names
 
@@ -220,6 +224,7 @@ def _safe_read(z: "zipfile.ZipFile", name: str) -> Optional[bytes]:
         with z.open(name) as fh:
             buf = fh.read(_MAX_ENTRY_BYTES + 1)
     except Exception:
+        _log.debug("zip member read failed for %s", name, exc_info=True)
         return None
     return None if len(buf) > _MAX_ENTRY_BYTES else buf
 
@@ -244,6 +249,7 @@ def parse(data: bytes, *, max_classes: int = 4000) -> JvmInfo:
             try:
                 info.manifest = parse_manifest(mf.decode("utf-8", "replace"))
             except Exception:
+                _log.debug("manifest parse failed", exc_info=True)
                 pass
         info.main_class = (info.manifest.get("Main-Class")
                            or info.manifest.get("Start-Class"))

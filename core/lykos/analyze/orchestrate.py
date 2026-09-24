@@ -15,9 +15,12 @@ makes it cancellable.
 from __future__ import annotations
 
 import importlib
+import logging
 import threading
 import time
 from typing import Optional
+
+_log = logging.getLogger(__name__)
 
 from ..casestore import CaseStore
 from ..db.dao import DynResultDAO, FindingDAO, FunctionDAO, PocDAO
@@ -75,6 +78,13 @@ def _wait(store, run_id: str, stop: threading.Event, timeout: float = 900.0) -> 
         if r and r.status in _TERMINAL:
             return r.status
         time.sleep(0.6)
+    # Deadline hit: CANCEL the run before giving up on it, exactly as the stop branch does. Without
+    # this the run keeps executing in a worker (CPU/RAM) after the plan has already moved on and
+    # marked the stage "error", and it later writes results into a target the plan called failed.
+    try:
+        JobQueue(store.conn).cancel(run_id)
+    except Exception:
+        pass
     return "timeout"
 
 
@@ -89,6 +99,7 @@ def _best_block_pct(store, target_id) -> Optional[float]:
         cov = _best_coverage(store, runs)
         return cov.get("pct") if cov and cov.get("kind") == "block" else None
     except Exception:
+        _log.debug("best block-coverage lookup failed for target %s", target_id, exc_info=True)
         return None
 
 
@@ -227,6 +238,7 @@ def _run_target_stage(store, target, stage, status, stop, params=None) -> Option
             from ..jobs.registry import reproject_cache_hit
             reproject_cache_hit(store, stage, target.id, run.id)
         except Exception:
+            _log.debug("cache-hit reprojection failed for stage %s target %s", stage, target.id, exc_info=True)
             pass
         d = _stage_detail(store, target, stage) or "cached"
         _plan_set(status, stage, "done", d)
@@ -350,6 +362,7 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict, stop: t
                         try:
                             review.replay_verdict(store, t, sha, times=5)
                         except Exception:
+                            _log.debug("replay verdict failed for %s", sha, exc_info=True)
                             pass
                     _plan_set(status, "verify", "cancelled" if stop.is_set() else "done")
                     _emit_stage(store, t.case_id, "verify",
@@ -360,7 +373,7 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict, stop: t
             for stage in ("link_case", "ipc_model", "cross_taint", "whole_system"):
                 _run_case_stage(store, case_id, stage, status, stop)
         # Outcome.
-        pd, fd = PocDAO(store.conn), FindingDAO(store.conn)
+        pd = PocDAO(store.conn)
         verified = any(p.verified for tid in target_ids for p in pd.list_by_target(tid))
         crashed = any(d.crashed for tid in target_ids for d in DynResultDAO(store.conn).list_by_target(tid))
         outcome = "poc" if verified else ("crash" if crashed else "static")

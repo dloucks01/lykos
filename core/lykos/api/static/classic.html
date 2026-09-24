@@ -1233,9 +1233,9 @@ async function showDetail(targetId){
         <div class="stagehdr"><b>Triage</b><span class="schip done">done</span><span class="schip mono" id="substrate"></span></div>
         <div class="sbody">
           <div class="kvgrid">
-            <div class="kv"><span>entry</span><b>${rec.entry_point||"—"}</b></div>
-            <div class="kv"><span>linking</span><b>${rec.linking||"—"}${rec.stripped?" · stripped":""}</b></div>
-            <div class="kv"><span>toolchain</span><b>${rec.toolchain_hint||"—"}</b></div>
+            <div class="kv"><span>entry</span><b>${esc(rec.entry_point||"—")}</b></div>
+            <div class="kv"><span>linking</span><b>${esc(rec.linking||"—")}${rec.stripped?" · stripped":""}</b></div>
+            <div class="kv"><span>toolchain</span><b>${esc(rec.toolchain_hint||"—")}</b></div>
             <div class="kv"><span>entropy</span><b>${rec.entropy?.overall??"—"}${rec.entropy?.packed_hint?" · packed?":""}</b></div>
             <div class="kv"><span>imports</span><b>${(rec.imports?.libraries||[]).map(esc).join(", ")||"—"} (${rec.imports?.functions_count||0})</b></div>
           </div>

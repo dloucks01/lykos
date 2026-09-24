@@ -11,8 +11,9 @@ DETECT_STAGE = "detect_cwe"
 # The detectors this stage owns -- the ones whose sites it recomputes and must replace (not
 # accumulate) on a re-run. Dynamic/crash channels (concolic, root_cause, fuzz...) are NOT here, so
 # reset_candidate_sites/prune_empty_findings never touch their findings.
-_STATIC_DETECTORS = ("dangerous_api", "stack_frame", "secret", "weak_crypto", "weak_random",
-                     "insecure_tmp", "toctou", "hardening", "tainted_deref", "int_overflow_check")
+_STATIC_DETECTORS = ("dangerous_api", "stack_frame", "hardcoded_secrets", "weak_crypto", "weak_random",
+                     "insecure_tmp", "toctou", "toctou_race", "hardening", "tainted_deref",
+                     "int_overflow_check")
 TOOL = "detect"
 # -2: CWE-121 gated on the copy destination resolving to the stack frame. -3: re-detection is
 # idempotent. -4: the gate is arg0-only (scanf/sscanf no longer suppressed), works on x86-64/arm/
@@ -116,8 +117,11 @@ def _intover_candidates(func_irs, functions, only=None, width=4, ptr_bytes=8):
         if only is not None and faddr not in only:
             continue
         for b in ((ir or {}).get("blocks") or []):
+            # produced lives for the whole basic block: an INT_ADD and the comparison that
+            # consumes its result are separate machine instructions, so clearing it per
+            # instruction erased the sum before the compare was ever seen. Reset per block.
+            produced: dict = {}
             for i in b.get("instructions", []) or []:
-                produced: dict = {}
                 for pc in i.get("pcode", []) or []:
                     mnem, args, outk = _pcode(pc)
                     if mnem in _ADD_OPS and outk and _tok_width(outk) == width:

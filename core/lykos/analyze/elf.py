@@ -7,10 +7,13 @@ robust: every sub-parse is guarded; failures are appended to `errors` and never 
 from __future__ import annotations
 
 import bisect
+import logging
 import math
 import struct
 from dataclasses import dataclass, field
 from typing import Any, Optional
+
+_log = logging.getLogger(__name__)
 
 # e_machine -> normalized arch name (extend freely)
 _MACHINES = {
@@ -176,8 +179,13 @@ def parse(data: bytes) -> ElfInfo:
             sh.append(dict(name_off=sh_name, type=sh_type, flags=sh_flags, addr=sh_addr,
                            offset=sh_offset, size=sh_size, link=sh_link, info=sh_info,
                            entsize=sh_entsize))
-        if e_shnum and e_shstrndx < len(sh):
-            s = sh[e_shstrndx]
+        # SHN_XINDEX: when the real string-table index does not fit in 16 bits, e_shstrndx is
+        # 0xFFFF (>= SHN_LORESERVE) and the true index lives in section header 0's sh_link.
+        strndx = e_shstrndx
+        if e_shstrndx >= 0xFF00 and sh:
+            strndx = sh[0].get("link", 0)
+        if e_shnum and 0 <= strndx < len(sh):
+            s = sh[strndx]
             shstr = data[s["offset"]:s["offset"] + s["size"]]
     except Exception as e:
         info.errors.append(f"shdrs: {e!r}")
@@ -385,6 +393,7 @@ def program_ranges(data: bytes) -> list:
             return []
         marks, funcs, end = _symbol_owners(data)
     except Exception:
+        _log.debug("program_ranges symbol parse failed", exc_info=True)
         return []
     if not marks or not funcs:
         return []

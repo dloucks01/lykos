@@ -24,6 +24,7 @@ stdout: per input: i32 rc, u32 stdout_len, u32 stderr_len, u8 flags, u32 n_new,
         n_new * u64 newly reached block addresses
 """
 import ctypes
+import logging
 import os
 import signal
 import struct
@@ -31,6 +32,8 @@ import subprocess
 import sys
 import threading
 import time
+
+_log = logging.getLogger(__name__)
 
 PTRACE_TRACEME, PTRACE_PEEKTEXT, PTRACE_POKETEXT = 0, 1, 4
 PTRACE_CONT, PTRACE_KILL, PTRACE_GETREGS = 7, 8, 12
@@ -128,6 +131,7 @@ def _elf_min_vaddr(exe):
             lo = vaddr if lo is None else min(lo, vaddr)
         return lo or 0
     except Exception:
+        _log.debug("_elf_min_vaddr: parsing ELF program headers failed", exc_info=True)
         return 0
 
 
