@@ -213,6 +213,80 @@ export function buildRunLog(runs, targets) {
     }));
 }
 
+// ── Verdict derivation ────────────────────────────────────────────────────────────────────
+// The verdict-first UI answers, per binary: what is the worst effect an attacker can DRIVE this
+// binary to, is it proven, and how far did the exploit chain get? The helpers below derive that
+// straight from the findings + PoCs + coverage app.js already holds -- no new API surface.
+
+// Effect-kind severity: a worse end effect ranks higher, so "worst" is a max over this. The
+// `effects` evidence channel carries a `kind` (rce/write/leak/dos/...); unknown kinds sit mid-pack.
+const EFFECT_SEV = {
+  rce: 6, "remote-code-execution": 6, "code-execution": 6, "arbitrary-code-execution": 6,
+  "control-flow-hijack": 5, hijack: 5, "control-flow": 5,
+  write: 4, "arbitrary-write": 4, "mem-write": 4, "memory-corruption": 4, "mem-corruption": 4,
+  leak: 3, "info-leak": 3, "information-disclosure": 3, "oob-read": 3, disclosure: 3, read: 3,
+  dos: 2, crash: 2, "denial-of-service": 2, hang: 2,
+};
+export function effectRank(kind) {
+  const k = String(kind || "").toLowerCase();
+  return EFFECT_SEV[k] != null ? EFFECT_SEV[k] : 1;
+}
+
+// The end-effects a finding carries: the `effects` evidence channel is a JSON list of
+// {kind,title,status:'demonstrated'|'potential',proof}. Returns [] when absent or malformed.
+export function effectsOf(finding) {
+  const ev = Array.isArray(finding && finding.evidence) ? finding.evidence : [];
+  const raw = (ev.find((e) => e && e.channel === "effects") || {}).detail;
+  if (!raw) return [];
+  try { const v = JSON.parse(raw); return Array.isArray(v) ? v : []; } catch { return []; }
+}
+
+// A PoC's exploitation level as a plain integer (L1/L2/L3 -> 1/2/3). 0 when unlevelled.
+export function pocLevel(p) {
+  if (!p || p.level == null) return 0;
+  const n = parseInt(String(p.level).replace(/[^0-9]/g, ""), 10);
+  return isNaN(n) ? 0 : n;
+}
+
+// The verdict for ONE target: its worst DEMONSTRATED effect (falling back to the worst POTENTIAL
+// one, muted), the exploitation level the chain reached, whether a crash actually reproduced, and
+// the proof artifacts to link when demonstrated. Derived from the case-wide findings/pocs/coverage.
+export function verdictForTarget(target, findings, pocs, coverage) {
+  const tid = target.id;
+  const tFindings = (findings || []).filter((f) => f.target_id === tid);
+  const findingIds = new Set(tFindings.map((f) => f.id));
+  const demo = [], pot = [];
+  for (const f of tFindings) {
+    for (const e of effectsOf(f)) {
+      const rec = { ...e, findingId: f.id };
+      if (e.status === "demonstrated") demo.push(rec); else pot.push(rec);
+    }
+  }
+  const worstOf = (list) => list.slice().sort((a, b) => effectRank(b.kind) - effectRank(a.kind))[0] || null;
+  const worstDemo = worstOf(demo);
+  const worstPot = worstOf(pot);
+  const headline = worstDemo || worstPot || null;
+  const status = worstDemo ? "demonstrated" : worstPot ? "potential" : "none";
+  // A PoC belongs to a target through the finding it proves.
+  const tPocs = (pocs || []).filter((p) => p.finding_id && findingIds.has(p.finding_id));
+  const level = tPocs.reduce((m, p) => Math.max(m, pocLevel(p)), 0);
+  const bundlePoc = tPocs.find((p) => p.verified && p.bundle_sha) || tPocs.find((p) => p.bundle_sha) || null;
+  const inputPoc = tPocs.find((p) => p.input_sha) || null;
+  const crashed = tFindings.some((f) => f.state === "poc-backed") || !!worstDemo || !!inputPoc;
+  const staticCount = tFindings.filter((f) => f.state !== "poc-backed").length;
+  const cov = coverage && coverage[tid] && coverage[tid].pct != null ? coverage[tid].pct : null;
+  return { target, headline, status, level, crashed, staticCount, coverage: cov,
+    bundlePoc, inputPoc };
+}
+
+// One verdict per target, in upload order. `index` is set (1-based) only for a multi-binary case,
+// mirroring TargetSummary's numbering.
+export function buildVerdicts(targets, findings, pocs, coverage) {
+  const multi = (targets || []).length > 1;
+  return (targets || []).map((t, i) => ({
+    ...verdictForTarget(t, findings, pocs, coverage), index: multi ? i + 1 : null }));
+}
+
 // A live progress event's payload -> a short line under the running stage. Fuzzers report
 // executions and crashes as they go; other stages report a percent and a message.
 export function progressText(type, p) {

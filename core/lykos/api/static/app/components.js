@@ -709,6 +709,111 @@ export function CoveragePanel({ coverage, targets, onDrill }) {
     </div>`;
 }
 
+// ── Verdict layer ───────────────────────────────────────────────────────────────────────────
+// The answer, up top. Everything below (target facts, findings, the analysis drawer) is the
+// working; these components are the verdict: per binary, the worst effect an attacker can drive it
+// to, whether that is proven, and how far the exploit chain got. Fed by util.js's buildVerdicts.
+
+// The short "what happened" for a verdict: the worst effect's title when there is one, otherwise a
+// plain crash / no-crash statement.
+function verdictEffectLabel(v) {
+  if (v.headline) return v.headline.title || v.headline.kind || "effect";
+  return v.crashed ? "crash reproduced" : "no crash";
+}
+// The exploitation-reached tag: the level the chain got to, or why there is no level.
+function verdictLevelTag(v) {
+  if (v.level) return `L${v.level}`;
+  if (v.crashed) return "crash";
+  return v.staticCount ? "static-only" : "no crash";
+}
+const VERDICT_CLASS = { demonstrated: "vc-demo", potential: "vc-pot", none: "vc-none" };
+
+// A horizontal row of per-target verdict chips for a multi-binary case. Each chip is the target
+// plus its worst effect and the level reached; clicking it jumps to that target's VerdictCard.
+export function VerdictStrip({ verdicts, onSelect }) {
+  if (!verdicts || verdicts.length < 2) return null;
+  return html`
+    <div class="verdict-strip" role="list">
+      ${verdicts.map((v) => html`
+        <button class=${`verdict-chip ${VERDICT_CLASS[v.status] || "vc-none"}`} role="listitem"
+          key=${v.target.id} onClick=${() => onSelect && onSelect(v.target.id)}
+          title=${`${v.target.filename} — ${verdictEffectLabel(v)}${v.status === "demonstrated" ? " (demonstrated)" : v.status === "potential" ? " (potential)" : ""}`}>
+          <span class="vchip-name">${v.target.filename}</span>
+          <span class="vchip-eff">${verdictEffectLabel(v)}</span>
+          <span class="vchip-lvl">${verdictLevelTag(v)}</span>
+        </button>`)}
+    </div>`;
+}
+
+// The verdict for one target, at the top of the case view. Headline = the worst DEMONSTRATED
+// effect (or the worst potential one, muted, when nothing is demonstrated); an L1▸L2▸L3 ladder
+// showing how far the exploit chain got; and, when demonstrated, direct links to the proof
+// artifacts. When no crash reproduced it says so plainly with the static-findings/coverage count.
+export function VerdictCard({ verdict, artifactUrl }) {
+  const v = verdict;
+  if (!v) return null;
+  const demo = v.status === "demonstrated";
+  const cls = demo ? "vd-demo" : v.status === "potential" ? "vd-pot" : "vd-none";
+  const head = v.headline;
+  const proof = head && head.proof;
+  return html`
+    <div class=${`card verdict-card ${cls}`} id=${`verdict-${v.target.id}`} tabindex="-1">
+      <div class="vd-head">
+        <span class="vd-target">${v.index != null ? html`<span class="sum-ix">${v.index}</span>` : null}${v.target.filename}</span>
+        <span class=${`vd-status-pill vs-${v.status}`}>${demo ? "demonstrated" : v.status === "potential" ? "potential" : v.crashed ? "crash" : "no crash"}</span>
+      </div>
+      <div class="vd-headline">
+        ${head ? html`
+          <span class="vd-eff">${demo ? "✓ " : "○ "}${head.title || head.kind}</span>
+          <span class="vd-eff-sub">${demo
+            ? "demonstrated by a working proof-of-concept"
+            : "reachable in principle for this defect class — not yet demonstrated"}</span>
+        ` : html`
+          <span class="vd-eff neutral">No crash reproduced</span>
+          <span class="vd-eff-sub">${v.staticCount} static finding${v.staticCount === 1 ? "" : "s"}${v.coverage != null ? `, ${v.coverage}% covered` : ""}</span>
+        `}
+      </div>
+      <div class="vd-ladder" title="how far the exploit chain got">
+        <span class="vd-ladder-lbl">Chain</span>
+        ${[1, 2, 3].map((n) => html`
+          ${n > 1 ? html`<span class=${`vd-arrow${v.level >= n ? " filled" : ""}`}>▸</span>` : null}
+          <span class=${`vd-rung${v.level >= n ? " filled" : ""}`} key=${n}>L${n}</span>
+        `)}
+        <span class="vd-ladder-cap">${v.level ? `reached L${v.level}` : v.crashed ? "crash, no primitive built" : "static only"}</span>
+      </div>
+      ${demo ? html`
+        <div class="vd-proofs">
+          ${v.bundlePoc && v.bundlePoc.bundle_sha ? html`<a class="btn small" href=${artifactUrl(v.bundlePoc.bundle_sha)} download>⬇ PoC bundle${v.bundlePoc.verified ? " (verified)" : ""}</a>` : null}
+          ${v.inputPoc && v.inputPoc.input_sha ? html`<a class="btn small ghost" href=${artifactUrl(v.inputPoc.input_sha)} download>⬇ Crashing input</a>` : null}
+          ${proof && proof.sha ? html`<a class="btn small ghost" href=${artifactUrl(proof.sha)} download>⬇ ${proof.type === "bundle" ? "proof PoC" : proof.type === "artifact" ? "leaked bytes" : "proof input"}</a>` : null}
+        </div>` : null}
+    </div>`;
+}
+
+// A single collapsible drawer that holds the PROCESS -- the pipeline plan, the run log, the tool
+// console and the coverage panel. Expanded while a run is in flight (so you can watch it work),
+// collapsed once it has finished (so the verdict + findings above are what you land on). The
+// children self-hide when empty, so an idle drawer is just its header.
+export function AnalysisDrawer({ running, children }) {
+  const [open, setOpen] = useState(!!running);
+  const wasRunning = useRef(!!running);
+  useEffect(() => {
+    if (running && !wasRunning.current) setOpen(true);        // a run started -> reveal the work
+    else if (!running && wasRunning.current) setOpen(false);  // it finished -> tuck it away
+    wasRunning.current = running;
+  }, [running]);
+  return html`
+    <div class="card drawer">
+      <button class="drawer-head" onClick=${() => setOpen((o) => !o)} aria-expanded=${open}>
+        <span class="drawer-title">⚙ Analysis</span>
+        <span class="drawer-sub">pipeline, run log, console &amp; coverage</span>
+        ${running ? html`<${Spinner} />` : null}
+        <span class="drawer-toggle">${open ? "▾" : "▸"}</span>
+      </button>
+      ${open ? html`<div class="drawer-body">${children}</div>` : null}
+    </div>`;
+}
+
 // The capabilities Autopilot did NOT run on this target, and why. "Deep" is only honest if it
 // says what it left out -- a firmware carve on an executable, a boundary fuzz with no IPC. Each
 // row names the capability and the server's reason it cannot apply here.
