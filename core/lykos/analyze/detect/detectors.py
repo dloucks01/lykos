@@ -112,6 +112,10 @@ def toctou_race(ctx: DetectContext):
 # ------------------------------- stack buffer overflow (decompiler stack-frame + unbounded copy)
 # Copies with no length bound; a fixed stack buffer + one of these is the classic smash.
 _UNBOUNDED_COPY = {"strcpy", "strcat", "gets", "sprintf", "vsprintf", "scanf", "sscanf"}
+# A scanf string conversion (%s / %[...]); _SCANF_UNBOUNDED is the WIDTHLESS (dangerous) subset --
+# `%s`/`%ls`/`%[` with no width, but not `%16s`. Used to drop the width-bounded-scanf false positive.
+_SCANF_CONV = re.compile(r"%\*?\d*[hlLjztq]*[s\[]")
+_SCANF_UNBOUNDED = re.compile(r"%\*?(?![\d])[hlLjztq]*[s\[]")
 # The subset whose DESTINATION buffer is the first argument -- the only ones the destination gate
 # can reason about. scanf/sscanf take the buffer as a later variadic argument (arg0 is the format
 # string), so the gate must not run on them.
@@ -387,10 +391,20 @@ def stack_buffer_overflow(ctx: DetectContext):
     address -- the offset an exploit would need."""
     if not ctx.frames:
         return []
+    # A scanf/sscanf is only a stack smash when its format has an UNBOUNDED string conversion
+    # (%s / %[...]); a width-limited one (%16s) is bounded and NOT a bug. We cannot resolve arg0
+    # per call site, so gate on the target having ANY unbounded scanf format at all -- with none,
+    # every scanf sink is a false positive (the %16s that flagged scanner). Conservative: if no
+    # scanf format is recovered we cannot tell, so we do NOT suppress (keep the textbook finding).
+    scanf_fmts = [getattr(x, "value", "") or "" for x in (ctx.strings or [])
+                  if _SCANF_CONV.search(getattr(x, "value", "") or "")]
+    scanf_maybe_unbounded = (not scanf_fmts) or any(_SCANF_UNBOUNDED.search(f) for f in scanf_fmts)
     sinks_by_func = defaultdict(list)
     for e in ctx.call_edges:
         n = normalize(e.dst_name)
         if n in _UNBOUNDED_COPY:
+            if n in ("scanf", "sscanf") and not scanf_maybe_unbounded:
+                continue                                 # only width-bounded %Ns present -> not a bug
             sinks_by_func[e.src_addr].append((n, e.site_addr))
     out = []
     for addr, frame in ctx.frames.items():
