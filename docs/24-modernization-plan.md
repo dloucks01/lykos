@@ -281,12 +281,15 @@ tictactoe):
   (`data_<addr>[-1]` reached from program code). `oob_index` also now infers the fixed-width input
   width and threads it through the crawl + probes, like `heap_trace`.
 
+  Works on PIE too: the libc-PLT allocator tracing already rebases via /proc/maps, and the array
+  recovery reads a PIE base from objdump's computed `lea reg,[rip+..] # <vaddr>` comment (validated
+  end-to-end on a STRIPPED PIE global-table target → CWE-129, guard rebased at runtime).
+
 Known gaps / next: bad_grades (a stripped counted STACK overflow) reaches L1 via the fuzzer but
-stalls (no win); its bug is a stack array, not a global table. **PIE symbol-free** array/allocator
-recovery (RIP-relative bases). Also: the full angrop/pwntools finish-the-chain backend, live
-tcache-poison driving off the heap primitives (currently an L2 recipe), leaked-canary/PIE
-auto-confirmation (unblocks the chainer on PIE targets and auth-or-out), and the SROP 2-stage/leak
-variant for the no-writable case (sick_rop).
+stalls (no win); its bug is a stack array, not a global table. Also: the full angrop/pwntools
+finish-the-chain backend, live tcache-poison driving off the heap primitives (currently an L2
+recipe), leaked-canary/PIE auto-confirmation (unblocks the chainer on PIE targets and auth-or-out),
+and the SROP 2-stage/leak variant for the no-writable case (sick_rop).
 
 ### Phase 4 — Optional, fenced local-LLM helper  *(only worthwhile with a modest GPU)*
 - Off by default. Three roles only, each **verifier-gated**: (1) fuzz harness/seed/dictionary
