@@ -201,9 +201,18 @@ tictactoe):
   not only `system`/`execve` callers.
 - **Canary leak-chain** — a canary-preserving overflow builder (`exploit.build_canary_overflow`)
   plus, when a canary-hardened target is hit with no leak, the exact leak-chain recipe + params.
+- **Custom-allocator heap-primitive discovery** (`dynamic/heaptrace.py` + the `heap_trace` stage) —
+  the LD_PRELOAD guard (`heap_check`) only sees libc; a target with its OWN allocator
+  (`ta_alloc`/`ta_free`, an arena pool, `operator new`) was invisible. `heap_trace` identifies the
+  allocator pair from local symbols, drives create-then-double-act menu op-sequences, and traces the
+  pointer lifecycle by ptrace to discover a **double-free (CWE-415)** allocator-agnostically, filing
+  it `corroborated` + an aaheg `Vuln{double_free}` lead. Validated on a synthetic custom-allocator
+  binary; identifies auth-or-out's `ta_alloc`/`ta_free` (whose specific primitive still needs UAF
+  detection + menu-semantic sequences).
 
-Still analyst-gated / next: the full angrop/pwntools finish-the-chain backend, heap primitive
-discovery + layout, leaked-canary/PIE auto-confirmation, and the SROP 2-stage/leak variant for the
+Still analyst-gated / next: the full angrop/pwntools finish-the-chain backend, heap UAF/overflow
+discovery + tcache-poison chaining (double-free discovery now lands), leaked-canary/PIE
+auto-confirmation, and the SROP 2-stage/leak variant for the
 no-writable case (the hardest, e.g. sick_rop).
 
 ### Phase 4 — Optional, fenced local-LLM helper  *(only worthwhile with a modest GPU)*
