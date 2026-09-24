@@ -8,7 +8,7 @@ import { api, waitForRun } from "./api.js";
 import { runAutopilotCase, newController, cancel as cancelAutopilot, coverageOf } from "./autopilot.js";
 import { rankFindings, pocsForFinding, fmtTime, progressText, stageLabel, dedupeFindings, buildRunLog, buildVerdicts } from "./util.js";
 import {
-  html, DropZone, TargetSummary, ProgressLog, ConsolePanel, FindingCard, EmptyResults, Spinner, UnavailablePanel, SystemMap, CoveragePanel, CodeView, PipelinePlan, EvidenceModal, FunctionsModal, VerdictStrip, VerdictCard, AnalysisDrawer, ShellVerdict, ExploitsPanel, DrawerFacts, FunctionsPanel, StringsPanel, DisasmPanel, DiffPanel, CrashesPanel, CallGraphCanvas,
+  html, DropZone, TargetSummary, ProgressLog, ConsolePanel, FindingCard, EmptyResults, Spinner, UnavailablePanel, SystemMap, CoveragePanel, CodeView, PipelinePlan, EvidenceModal, FunctionsModal, VerdictStrip, VerdictCard, AnalysisDrawer, ShellVerdict, ExploitsPanel, DrawerFacts, TargetBar, FunctionsPanel, StringsPanel, DisasmPanel, DiffPanel, CrashesPanel, CallGraphCanvas,
 } from "./components.js";
 
 let _conSeq = 0;
@@ -750,6 +750,7 @@ function App() {
 
           <!-- main: verdict + tabs + panel -->
           <main class="wb-main">
+            <${TargetBar} target=${activeTarget} onBrowseFunctions=${browseFunctions} />
             ${multi ? (() => {
               const dem = verdicts.filter((v) => v.status === "demonstrated").length;
               const pot = verdicts.filter((v) => v.status === "potential").length;
@@ -856,12 +857,6 @@ function App() {
 
             <${UnavailablePanel} items=${unavailable} />
           </main>
-
-          <!-- right drawer: persistent target facts -->
-          <aside class="wb-drawer">
-            <${DrawerFacts} target=${activeTarget} onBrowseFunctions=${browseFunctions} />
-            ${activeTarget && advice && activeTarget.id === (targets[0] && targets[0].id) ? html`<div class="headline" style="border:none;padding:0;">${typeof advice === "string" ? advice : (advice.message || advice.text || "")}</div>` : null}
-          </aside>
         </div>
       `}
 

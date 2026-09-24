@@ -974,6 +974,36 @@ export function DrawerFacts({ target, onBrowseFunctions }) {
 }
 
 
+// Compact horizontal target strip — replaces the right drawer so the workbench is TWO panes and
+// the main content gets the full width. Name + type + the exploitation-relevant mitigations sit on
+// one line; the rest (linking, stripped, entropy, sha256, browse) hides behind a details toggle.
+export function TargetBar({ target, onBrowseFunctions }) {
+  const [open, setOpen] = useState(false);
+  if (!target) return null;
+  const t = target;
+  const m = t.mitigations || {};
+  return html`
+    <div class="wb-metabar">
+      <div class="mb-main">
+        <span class="mb-name">${t.filename}</span>
+        <span class="mb-sub">${(t.file_type || "").toUpperCase()} · ${t.arch || "?"} · ${fmtBytes(t.size)}</span>
+        ${Object.keys(m).length ? html`<span class="mb-mits">
+          ${Object.entries(m).map(([k, val]) => html`<span class=${`mit ${mitTone(k, val)}`} key=${k}>${k.toUpperCase()} ${val}</span>`)}
+        </span>` : null}
+        <button class="mb-details" onClick=${() => setOpen((o) => !o)}>${open ? "▾ details" : "▸ details"}</button>
+      </div>
+      ${open ? html`<div class="mb-more">
+        <span><b>arch</b> ${t.arch || "?"} ${t.bits || ""}b ${t.endianness || ""}</span>
+        <span><b>linking</b> ${t.linking || "?"}</span>
+        <span><b>stripped</b> ${t.stripped ? "yes" : "no"}</span>
+        ${t.entropy != null ? html`<span><b>entropy</b> ${(+t.entropy).toFixed(3)}</span>` : null}
+        <span class="mb-hash"><b>sha256</b> ${t.sha256}</span>
+        ${onBrowseFunctions ? html`<button class="btn small ghost" onClick=${() => onBrowseFunctions(t.id)}>Browse functions →</button>` : null}
+      </div>` : null}
+    </div>`;
+}
+
+
 // ── More workbench tabs: Functions / Strings / Disassembly / Diff / Crashes ──────────────
 export function FunctionsPanel({ functions, onOpen }) {
   const [q, setQ] = useState("");

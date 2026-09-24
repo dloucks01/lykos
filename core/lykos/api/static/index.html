@@ -568,6 +568,20 @@
   .wb-rollup .rollup-bad { color: var(--bad); font-weight: 600; }
   .wb-rollup .rollup-warn { color: var(--warn); }
   .wb-rollup .rollup-muted { color: var(--faint); }
+  /* compact target strip (2-pane: replaces the right drawer) */
+  .wb-metabar { border: 1px solid var(--line); border-radius: 10px; background: var(--panel);
+    padding: 8px 12px; margin-bottom: 12px; }
+  .mb-main { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  .mb-name { font-family: var(--mono); font-weight: 600; color: var(--ink); }
+  .mb-sub { font-size: .82rem; color: var(--muted); }
+  .mb-mits { display: flex; gap: 6px; flex-wrap: wrap; }
+  .mb-details { margin-left: auto; font-size: .8rem; color: var(--muted); background: transparent;
+    border: none; cursor: pointer; font: inherit; }
+  .mb-details:hover { color: var(--ink); }
+  .mb-more { display: flex; gap: 18px; flex-wrap: wrap; margin-top: 8px; padding-top: 8px;
+    border-top: 1px solid var(--line); font-size: .8rem; color: var(--muted); align-items: center; }
+  .mb-more b { color: var(--faint); font-weight: 500; margin-right: 4px; }
+  .mb-hash { font-family: var(--mono); word-break: break-all; }
   .wb-panel { display: flex; flex-direction: column; gap: 14px; }
   .wb-soon { color: var(--muted); font-size: .9rem; padding: 30px 10px; text-align: center; }
   .cat-intro { color: var(--muted); font-size: .84rem; margin: 0 2px 6px; padding-bottom: 8px; border-bottom: 1px solid var(--line); }
