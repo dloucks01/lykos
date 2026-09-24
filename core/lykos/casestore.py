@@ -52,7 +52,14 @@ def _make_runnable(exe: Path, workdir: Path) -> None:
                 loader = cand
         if loader.exists():
             args += ["--set-interpreter", str(loader)]
-    args += ["--set-rpath", str(workdir), str(exe)]      # bundled libc found regardless of cwd
+    # rpath = the workdir plus every directory under it that holds a shared object, so the bundled
+    # libc is found wherever the bundle put it -- flat next to the binary, or under ./glibc/.
+    rpaths = [str(workdir)]
+    for so in workdir.rglob("*.so*"):
+        d = str(so.parent)
+        if d not in rpaths:
+            rpaths.append(d)
+    args += ["--set-rpath", ":".join(rpaths), str(exe)]
     try:
         subprocess.run(args, capture_output=True, timeout=30)
     except Exception:                                    # noqa: BLE001 -- best-effort
