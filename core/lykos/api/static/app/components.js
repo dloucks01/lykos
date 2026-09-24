@@ -972,3 +972,142 @@ export function DrawerFacts({ target, onBrowseFunctions }) {
     </div>
     ${onBrowseFunctions ? html`<button class="btn small ghost" onClick=${() => onBrowseFunctions(t.id)}>Browse functions →</button>` : null}`;
 }
+
+
+// ── More workbench tabs: Functions / Strings / Disassembly / Diff / Crashes ──────────────
+export function FunctionsPanel({ functions, onOpen }) {
+  const [q, setQ] = useState("");
+  if (!functions) return html`<div class="wb-soon"><${Spinner} label="Loading functions…" /></div>`;
+  const ql = q.trim().toLowerCase();
+  const rows = (functions || []).filter((f) => !ql || (f.name || "").toLowerCase().includes(ql) || fmtAddr(f.addr).includes(ql));
+  return html`
+    <div class="fnp">
+      <input class="fn-search" style="margin:0 0 4px" placeholder="Filter functions…" value=${q} onInput=${(e) => setQ(e.target.value)} />
+      <div class="fnp-hint">${rows.length} function${rows.length === 1 ? "" : "s"} · click one for its decompilation and ego call graph</div>
+      <div class="fnp-list">
+        ${rows.slice(0, 400).map((f) => html`
+          <button class=${`fn-row${f.blocks ? "" : " fn-thin"}`} key=${f.id || f.addr} onClick=${() => onOpen(f)}>
+            <span class="fn-name">${f.name || "(unnamed)"}</span>
+            <span class="fn-addr">${fmtAddr(f.addr)}</span>
+            <span class="fn-meta">${f.size ? f.size + " B" : ""}${f.blocks ? ` · ${f.blocks} blk` : ""}</span>
+          </button>`)}
+      </div>
+      ${rows.length > 400 ? html`<div class="fn-more">Showing the first 400 — filter to narrow.</div>` : null}
+    </div>`;
+}
+
+export function StringsPanel({ strings }) {
+  const [q, setQ] = useState("");
+  if (!strings) return html`<div class="wb-soon"><${Spinner} label="Loading strings…" /></div>`;
+  const ql = q.trim().toLowerCase();
+  const rows = (strings || []).filter((s) => !ql || (s.value || "").toLowerCase().includes(ql));
+  return html`
+    <div class="fnp">
+      <input class="fn-search" style="margin:0 0 4px" placeholder="Filter strings…" value=${q} onInput=${(e) => setQ(e.target.value)} />
+      <div class="fnp-hint">${rows.length} string${rows.length === 1 ? "" : "s"}</div>
+      <div class="str-list">
+        ${rows.slice(0, 600).map((s, i) => html`
+          <div class="str-row" key=${i}>
+            <span class="str-addr">${fmtAddr(s.addr)}</span>
+            <span class="str-val" title=${s.value}>${s.value}</span>
+            ${(() => { const n = Array.isArray(s.xrefs) ? s.xrefs.length : (s.xrefs || 0); return n ? html`<span class="str-x">${n} xref${n === 1 ? "" : "s"}</span>` : html`<span></span>`; })()}
+          </div>`)}
+      </div>
+      ${rows.length > 600 ? html`<div class="fn-more">Showing the first 600 — filter to narrow.</div>` : null}
+    </div>`;
+}
+
+function disasmText(d) {
+  if (d && d.decompiled && usableDecompile(d.decompiled)) return d.decompiled;
+  const ir = d && d.ir;
+  if (ir && ir.blocks) return ir.blocks.map((b) => (b.instructions || []).map((i) => `${fmtAddr(i.addr)}  ${i.text}`).join("\n")).join("\n\n");
+  return (d && d.decompiled) || "(no disassembly recovered for this function)";
+}
+export function DisasmPanel({ functions, detail, selectedId, onSelect, loading }) {
+  const [q, setQ] = useState("");
+  if (!functions) return html`<div class="wb-soon"><${Spinner} label="Loading functions…" /></div>`;
+  const ql = q.trim().toLowerCase();
+  const rows = (functions || []).filter((f) => f.blocks && (!ql || (f.name || "").toLowerCase().includes(ql) || fmtAddr(f.addr).includes(ql)));
+  return html`
+    <div class="dis">
+      <div class="dis-list">
+        <input class="fn-search" style="margin:0 0 8px;width:100%" placeholder="Filter…" value=${q} onInput=${(e) => setQ(e.target.value)} />
+        ${rows.slice(0, 300).map((f) => html`
+          <button class=${`fn-row${selectedId === f.id ? " active" : ""}`} key=${f.id} onClick=${() => onSelect(f)}>
+            <span class="fn-name">${f.name || fmtAddr(f.addr)}</span>
+            <span class="fn-addr">${fmtAddr(f.addr)}</span>
+          </button>`)}
+      </div>
+      <div class="dis-body">
+        ${loading ? html`<${Spinner} label="Disassembling…" />`
+          : !detail ? html`<div class="wb-soon">Select a function to disassemble.</div>`
+          : html`<div class="dis-h"><span class="code-name">${detail.name || fmtAddr(detail.addr)}</span> <span class="code-addr">${fmtAddr(detail.addr)}</span>${detail.signature ? html`<span class="code-sig">${detail.signature}</span>` : null}</div>
+            <pre class=${`code-pre ${detail.decompiled && usableDecompile(detail.decompiled) ? "src" : "asm"}`}>${disasmText(detail)}</pre>`}
+      </div>
+    </div>`;
+}
+
+// Compare two targets' findings. Rough finding identity = CWE + the title's stable prefix; the diff
+// shows what a candidate build FIXED (in A, gone in B), what is NEW (in B, not A), and what is the
+// same. When there is only one target it prompts to add a second binary.
+function diffKey(f) { return `${f.cwe || "?"}::${(f.title || "").replace(/\s*\(.*$/, "").replace(/[:—-].*$/, "").trim().toLowerCase()}`; }
+export function DiffPanel({ targets, findings }) {
+  const ts = targets || [];
+  const [a, setA] = useState(ts[0] && ts[0].id);
+  const [b, setB] = useState(ts[1] && ts[1].id);
+  if (ts.length < 2) return html`<div class="wb-soon">Add a second binary to this case to compare — lykos diffs the findings and, when a version has a working PoC, re-runs it against the other to confirm a fix.</div>`;
+  const name = (id) => { const t = ts.find((x) => x.id === id); return t ? t.filename : id; };
+  const fa = (findings || []).filter((f) => f.target_id === a);
+  const fb = (findings || []).filter((f) => f.target_id === b);
+  const ka = new Map(fa.map((f) => [diffKey(f), f])), kb = new Map(fb.map((f) => [diffKey(f), f]));
+  const rows = [];
+  for (const [k, f] of ka) rows.push(kb.has(k) ? { d: "same", f, a: f.state, b: kb.get(k).state } : { d: "fixed", f, a: f.state, b: null });
+  for (const [k, f] of kb) if (!ka.has(k)) rows.push({ d: "new", f, a: null, b: f.state });
+  const order = { fixed: 0, new: 1, same: 2 };
+  rows.sort((x, y) => order[x.d] - order[y.d]);
+  const nFixed = rows.filter((r) => r.d === "fixed").length, nNew = rows.filter((r) => r.d === "new").length;
+  return html`
+    <div class="fnp">
+      <div class="diff-bar">
+        <span style="color:var(--muted);font-size:.8rem">A</span>
+        <select class="diff-sel" value=${a} onChange=${(e) => setA(e.target.value)}>${ts.map((t) => html`<option value=${t.id} key=${t.id}>${t.filename}</option>`)}</select>
+        <span style="color:var(--faint)">→</span>
+        <span style="color:var(--muted);font-size:.8rem">B</span>
+        <select class="diff-sel" value=${b} onChange=${(e) => setB(e.target.value)}>${ts.map((t) => html`<option value=${t.id} key=${t.id}>${t.filename}</option>`)}</select>
+      </div>
+      <div class="diff-sum">
+        <span class="ds-fixed">${nFixed} fixed</span><span class="ds-new">${nNew} new</span>
+        <span style="color:var(--muted)">${rows.length - nFixed - nNew} unchanged</span>
+      </div>
+      <div class="diff-table">
+        <div class="diff-row dr-head"><span>Δ</span><span>CWE</span><span>Finding</span><span style="text-align:center">${name(a)}</span><span style="text-align:center">${name(b)}</span></div>
+        ${rows.map((r, i) => html`
+          <div class=${`diff-row dr-${r.d}`} key=${i}>
+            <span class=${`dr-tag t-${r.d}`}>${r.d === "fixed" ? "FIXED" : r.d === "new" ? "NEW" : "same"}</span>
+            <span class="dr-cwe">${(r.f.cwe || "").replace(/^CWE-/, "")}</span>
+            <span>${(r.f.title || "").replace(/\s*\(.*$/, "")}</span>
+            <span class="dr-state">${r.a || "—"}</span>
+            <span class="dr-state">${r.b || "—"}</span>
+          </div>`)}
+      </div>
+    </div>`;
+}
+
+export function CrashesPanel({ crashes, artifactUrl }) {
+  if (!crashes) return html`<div class="wb-soon"><${Spinner} label="Loading crashes…" /></div>`;
+  const c = (crashes || []).filter((x) => x.crashed);
+  if (!c.length) return html`<div class="wb-soon">No reproduced crashes for this target.</div>`;
+  return html`
+    <div class="fnp">
+      <div class="fnp-hint">${c.length} reproduced crash${c.length === 1 ? "" : "es"}</div>
+      <div class="crash-list">
+        ${c.map((x, i) => html`
+          <div class="crash-row" key=${i}>
+            <span class="crash-sig">${x.signal || "crash"}</span>
+            <span class="crash-pc">${x.fault_pc || ""}</span>
+            <span class="crash-mode">${x.input_mode || "stdin"}${x.argv && x.argv.length ? " · " + x.argv.join(" ") : ""}${x.isolation ? " · " + x.isolation : ""}</span>
+            ${x.input_sha ? html`<a class="btn small ghost" href=${artifactUrl(x.input_sha)} download>⬇ input</a>` : html`<span></span>`}
+          </div>`)}
+      </div>
+    </div>`;
+}

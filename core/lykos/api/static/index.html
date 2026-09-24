@@ -588,6 +588,53 @@
   .dr-kv .dr-k { color: var(--faint); } .dr-kv .dr-v { font-family: var(--mono); color: var(--ink); }
   .dr-hashes { font-family: var(--mono); font-size: .72rem; color: var(--muted); word-break: break-all; line-height: 1.6; }
 
+  /* In-tab panels: Functions / Strings / Disassembly / Diff / Crashes */
+  .fnp { display: flex; flex-direction: column; gap: 4px; }
+  .fnp-hint { color: var(--muted); font-size: .8rem; margin: 2px 0 6px; }
+  .fnp-list, .str-list, .crash-list { display: flex; flex-direction: column; }
+  .fn-row.active { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+  .fn-row { border: none; background: transparent; color: var(--ink); font: inherit; }
+  .str-list { border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  .str-row { display: grid; grid-template-columns: 96px 1fr auto; gap: 12px; align-items: baseline;
+    padding: 7px 12px; border-bottom: 1px solid var(--line); font-size: .82rem; }
+  .str-row:last-child { border-bottom: none; }
+  .str-addr { font-family: var(--mono); font-size: .76rem; color: var(--faint); }
+  .str-val { font-family: var(--mono); color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .str-x { font-size: .72rem; color: var(--accent-2); white-space: nowrap; }
+  /* Disassembler: function list + asm pane */
+  .dis { display: flex; gap: 14px; align-items: stretch; min-height: 360px; }
+  .dis-list { flex: 0 0 240px; max-height: 62vh; overflow-y: auto; border: 1px solid var(--line);
+    border-radius: 9px; padding: 8px; }
+  .dis-body { flex: 1 1 0; min-width: 0; border: 1px solid var(--line); border-radius: 9px; padding: 12px 14px; }
+  .dis-h { margin-bottom: 8px; }
+  /* Diff */
+  .diff-bar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .diff-sel { background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px; color: var(--ink);
+    font: inherit; font-size: .86rem; padding: 6px 10px; }
+  .diff-sum { display: flex; gap: 16px; font-size: .84rem; margin: 4px 0 8px; }
+  .diff-sum .ds-fixed { color: var(--ok); font-weight: 600; } .diff-sum .ds-new { color: var(--bad); font-weight: 600; }
+  .diff-table { border: 1px solid var(--line); border-radius: 9px; overflow: hidden; }
+  .diff-row { display: grid; grid-template-columns: 64px 74px 1fr 120px 120px; gap: 12px; align-items: center;
+    padding: 11px 14px; border-bottom: 1px solid var(--line); font-size: .85rem; }
+  .diff-row:last-child { border-bottom: none; }
+  .diff-row.dr-head { color: var(--faint); font-size: .68rem; text-transform: uppercase; letter-spacing: .06em; }
+  .diff-row.dr-fixed { background: color-mix(in srgb, var(--ok) 8%, transparent); }
+  .diff-row.dr-new { background: color-mix(in srgb, var(--bad) 8%, transparent); }
+  .dr-tag { font-size: .68rem; font-weight: 700; border-radius: 5px; padding: 3px 7px; text-align: center; }
+  .dr-tag.t-fixed { color: var(--ok); background: color-mix(in srgb, var(--ok) 18%, transparent); }
+  .dr-tag.t-new { color: var(--bad); background: color-mix(in srgb, var(--bad) 18%, transparent); }
+  .dr-tag.t-same { color: var(--muted); }
+  .dr-cwe { font-family: var(--mono); font-size: .78rem; color: var(--muted); }
+  .dr-state { font-size: .78rem; text-align: center; color: var(--muted); }
+  /* Crashes */
+  .crash-list { border: 1px solid var(--line); border-radius: 9px; overflow: hidden; }
+  .crash-row { display: grid; grid-template-columns: 90px 110px 1fr auto; gap: 12px; align-items: center;
+    padding: 10px 14px; border-bottom: 1px solid var(--line); font-size: .84rem; }
+  .crash-row:last-child { border-bottom: none; }
+  .crash-sig { font-family: var(--mono); font-size: .78rem; color: var(--bad); font-weight: 600; }
+  .crash-pc { font-family: var(--mono); font-size: .78rem; color: var(--muted); }
+  .crash-mode { font-family: var(--mono); font-size: .76rem; color: var(--faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
   @media (max-width: 1080px) {
     .wb { flex-wrap: wrap; }
     .wb-drawer { width: 100%; flex-basis: 100%; border-left: none; border-top: 1px solid var(--line); }
