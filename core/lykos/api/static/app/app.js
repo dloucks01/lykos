@@ -6,9 +6,9 @@ import { h, render } from "preact";
 import { useState, useEffect, useRef, useCallback } from "preact/hooks";
 import { api, waitForRun } from "./api.js";
 import { runAutopilotCase, newController, cancel as cancelAutopilot, coverageOf } from "./autopilot.js";
-import { rankFindings, pocsForFinding, fmtTime, progressText, stageLabel, dedupeFindings, buildRunLog } from "./util.js";
+import { rankFindings, pocsForFinding, fmtTime, progressText, stageLabel, dedupeFindings, buildRunLog, buildVerdicts } from "./util.js";
 import {
-  html, DropZone, TargetSummary, ProgressLog, ConsolePanel, FindingCard, EmptyResults, Spinner, UnavailablePanel, SystemMap, CoveragePanel, CodeView, PipelinePlan, EvidenceModal, FunctionsModal,
+  html, DropZone, TargetSummary, ProgressLog, ConsolePanel, FindingCard, EmptyResults, Spinner, UnavailablePanel, SystemMap, CoveragePanel, CodeView, PipelinePlan, EvidenceModal, FunctionsModal, VerdictStrip, VerdictCard, AnalysisDrawer,
 } from "./components.js";
 
 let _conSeq = 0;
@@ -31,7 +31,7 @@ let _logSeq = 0;
 // separately so a stage is ONE row that transitions, not a start line plus a done line.
 function eventToLog(ev) {
   switch (ev.kind) {
-    case "advice": return ev.advice && ev.advice.headline ? { tone: "info", text: ev.advice.headline } : null;
+    case "advice": return null;   // shown once, on the target summary (setAdvice); not echoed here
     case "info": return { tone: "info", text: ev.message };
     case "cancelled": return { tone: "warn", text: "Cancelled." };
     case "done": {
@@ -517,6 +517,12 @@ function App() {
     if (ctrlRef.current) cancelAutopilot(ctrlRef.current);
   }, []);
 
+  // Click a verdict chip -> scroll to (and focus) that target's verdict card.
+  const scrollToVerdict = useCallback((tid) => {
+    const el = document.getElementById(`verdict-${tid}`);
+    if (el) { el.scrollIntoView({ behavior: "smooth", block: "start" }); try { el.focus({ preventScroll: true }); } catch { el.focus(); } }
+  }, []);
+
   const onReset = useCallback(() => {
     if (running) return;
     setCaseId(null);   // the next upload starts a fresh case; this one stays on the server
@@ -550,6 +556,12 @@ function App() {
   for (const p of pocs) if (p.finding_id && p.input_sha && verifications[p.input_sha]) verByFinding[p.finding_id] = verifications[p.input_sha];
   const mitOf = (f) => (targets.find((t) => t.id === f.target_id) || {}).mitigations;
 
+  // Verdict layer: one per target, worst-effect-first. `busy` folds the server-side background run
+  // in with the foreground one so the Analysis drawer stays open through either kind of run.
+  const verdicts = targets.length ? buildVerdicts(targets, findings, pocs, coverage) : [];
+  const busy = running || !!(bg && bg.running);
+  const drawerHasContent = !!(log.length || consoleLines.length || Object.keys(coverage).length || (bg && bg.plan && bg.plan.length) || busy);
+
   return html`
     <div class="app">
       <header class="topbar">
@@ -582,6 +594,9 @@ function App() {
               </div>` : null}
           </section>
         ` : html`
+          ${multi ? html`<${VerdictStrip} verdicts=${verdicts} onSelect=${scrollToVerdict} />` : null}
+          ${verdicts.map((v) => html`<${VerdictCard} key=${v.target.id} verdict=${v} artifactUrl=${api.artifactUrl} />`)}
+
           <section class="run-panel">
             ${targets.map((t, i) => html`
               <${TargetSummary} key=${t.id} target=${t} advice=${i === 0 ? advice : null} index=${multi ? i + 1 : null} onBrowseFunctions=${browseFunctions} />
@@ -589,7 +604,6 @@ function App() {
             ${!running ? html`
               <${DropZone} onFiles=${(fl) => onFiles(fl, true)} busy=${uploading} compact=${true} />
             ` : null}
-            ${bg && bg.plan ? html`<${PipelinePlan} plan=${bg.plan} targetName=${bg.target_name} target=${bg.target} targets=${bg.targets} />` : null}
             <div class="cta">
               ${bg && bg.running ? html`
                 <div class="bg-status"><${Spinner} label=${`Running in the background — ${bg.stage ? stageLabelSafe(bg.stage) : "starting"}${bg.targets > 1 ? ` (target ${bg.target}/${bg.targets})` : ""}`} /></div>
@@ -611,44 +625,47 @@ function App() {
               `}
             </div>
           </section>
+
+          <${SystemMap} map=${sysmap} />
+
+          ${(ran || findings.length) ? html`
+            <section class="results">
+              <div class="results-head">
+                <h2>Results</h2>
+                ${demonstrated.length ? html`<span class="pill good">${demonstrated.length} demonstrated</span>` : null}
+                ${caseId ? html`
+                  <span class="report-links">
+                    <a class="btn small ghost" href=${api.reportUrl(caseId, "html")} target="_blank">HTML report</a>
+                    <a class="btn small ghost" href=${api.reportUrl(caseId, "sarif")} target="_blank">SARIF</a>
+                    <a class="btn small ghost" href=${api.reportUrl(caseId, "json")} target="_blank">JSON</a>
+                  </span>` : null}
+              </div>
+              ${ranked.length ? html`
+                ${notable.map(cardFor)}
+                ${candidates.length ? html`
+                  <div class="triage-bar">
+                    <button class="btn small ghost triage-toggle" onClick=${() => setShowCandidates((v) => !v)}>
+                      ${candidatesVisible ? "▾" : "▸"} ${candidates.length} candidate${candidates.length === 1 ? "" : "s"}
+                    </button>
+                    <span class="triage-note">flagged patterns not yet demonstrated${notable.length === 0 ? " — nothing corroborated yet" : ""}</span>
+                  </div>
+                  ${candidatesVisible ? candidates.map(cardFor) : null}
+                ` : null}
+              ` : html`<${EmptyResults} ran=${ran} />`}
+            </section>
+          ` : null}
+
+          ${drawerHasContent ? html`
+            <${AnalysisDrawer} running=${busy}>
+              ${bg && bg.plan ? html`<${PipelinePlan} plan=${bg.plan} targetName=${bg.target_name} target=${bg.target} targets=${bg.targets} />` : null}
+              <${ProgressLog} entries=${log} running=${running} />
+              <${ConsolePanel} lines=${consoleLines} />
+              <${CoveragePanel} coverage=${coverage} targets=${targets} onDrill=${browseFunctions} />
+            </${AnalysisDrawer}>
+          ` : null}
+
+          <${UnavailablePanel} items=${unavailable} />
         `}
-
-        <${ProgressLog} entries=${log} running=${running} />
-
-        <${ConsolePanel} lines=${consoleLines} />
-
-        <${SystemMap} map=${sysmap} />
-
-        <${CoveragePanel} coverage=${coverage} targets=${targets} onDrill=${browseFunctions} />
-
-        ${(ran || findings.length) ? html`
-          <section class="results">
-            <div class="results-head">
-              <h2>Results</h2>
-              ${demonstrated.length ? html`<span class="pill good">${demonstrated.length} demonstrated</span>` : null}
-              ${caseId ? html`
-                <span class="report-links">
-                  <a class="btn small ghost" href=${api.reportUrl(caseId, "html")} target="_blank">HTML report</a>
-                  <a class="btn small ghost" href=${api.reportUrl(caseId, "sarif")} target="_blank">SARIF</a>
-                  <a class="btn small ghost" href=${api.reportUrl(caseId, "json")} target="_blank">JSON</a>
-                </span>` : null}
-            </div>
-            ${ranked.length ? html`
-              ${notable.map(cardFor)}
-              ${candidates.length ? html`
-                <div class="triage-bar">
-                  <button class="btn small ghost triage-toggle" onClick=${() => setShowCandidates((v) => !v)}>
-                    ${candidatesVisible ? "▾" : "▸"} ${candidates.length} candidate${candidates.length === 1 ? "" : "s"}
-                  </button>
-                  <span class="triage-note">flagged patterns not yet demonstrated${notable.length === 0 ? " — nothing corroborated yet" : ""}</span>
-                </div>
-                ${candidatesVisible ? candidates.map(cardFor) : null}
-              ` : null}
-            ` : html`<${EmptyResults} ran=${ran} />`}
-          </section>
-        ` : null}
-
-        <${UnavailablePanel} items=${unavailable} />
       </main>
 
       ${codeFn ? html`<${CodeView} fn=${codeFn.fn} finding=${codeFn.finding} source=${codeFn.source}
