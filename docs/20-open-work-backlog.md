@@ -891,6 +891,25 @@ candidate recall 1.00 / fp_rate 0.571; corroborated recall 0.833 / fp_rate 0.214
   placed at odd Thumb symbol addresses where they never fire. L3 now reads the offset L2
   already confirmed rather than re-deriving it (the local recovery lands word-1 bytes early on
   big-endian targets).
+- **[DONE] Automatic PIE base recovery — push-button leak-then-chain.** PIE L3 used to be
+  analyst-gated (the analyst named `leak_of`, the symbol whose leaked address gives the base) and
+  `chain_primitive` bailed on any PIE image to an L2 recipe. Both are now automatic and remain an
+  HONEST ASLR defeat (the harness's fixed ASLR-off base is never used). `exploit.recover_pie_base`
+  derives the base from leaked runtime pointers using only the target's own symbols — a leaked
+  pointer's low 12 bits are page-invariant, so it matches them to FUNCTION/OBJECT symbol vaddrs and
+  accepts a base only when >=2 distinct leaked slots corroborate it (code+data outranks a lone
+  segment), so a chance collision cannot forge one. Three deliveries: (1) `exploit_stage` PIE
+  ret2win/mprotect no longer needs `leak_of`; (2) it **provokes** a format-string leak itself (an
+  unprompted read first, then a `%p` dump at a couple of depths) and retries triggers until the
+  exploit is CONFIRMED; (3) `chain_primitive` drives the menu INTERACTIVELY to leak, recovers the
+  base in the SAME process, overwrites the adjacent code pointer with base+win_vaddr, and confirms
+  the win RAN (flag/shell output) under a negative control — the L3 bundle ships a stdlib-only
+  reproducer that re-recovers the base from the binary's symbols. Live-verified on PIE fixtures
+  (unprompted leak, provoked format-string leak, and a menu/heap leak-then-overflow). Open limits:
+  a two-read staged target still needs an explicit `params.offset` (auto offset-recovery through a
+  staging read needs read-width inference); confirmation is flag/shell-output-marker based, so a
+  silent shell-spawn win with no distinctive stdout is not auto-confirmed; ROP/mprotect payloads
+  stay x86-64.
 - **[DONE] L2 register layouts derived from the gdbstub** rather than hand-written — qemu
   serves a target description (`qXfer:features:read:target.xml`) listing registers in regnum
   order with widths. loongarch, m68k, sparcv9 and 32-bit x86 now need no table; L2 went from 6
