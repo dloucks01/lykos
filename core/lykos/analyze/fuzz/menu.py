@@ -32,7 +32,10 @@ def detect_menu(strings) -> list[str]:
     opts: set[str] = set()
     prompt = False
     for s in strings or []:
-        for line in str(s).splitlines():
+        # A whole menu is often ONE printf format string; the string store keeps its newlines as
+        # the literal escape "\n" (backslash-n), so unescape before splitting into option lines.
+        text = str(s).replace("\\n", "\n").replace("\\r", "\n").replace("\\t", " ")
+        for line in text.splitlines():
             m = _OPT.match(line)
             if m:
                 opts.add(m.group(1))

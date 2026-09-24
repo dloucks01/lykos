@@ -230,11 +230,29 @@ tictactoe):
   index) `corroborated`. Reuses the heaptrace ptrace helper in a new static-watch mode. Validated
   end-to-end: cracks auth-or-out in ~12 s — option 2 (Modify) with index 0 reaches `authors[-1]`
   (id validated only against `> 10`, never `== 0`), a downstream arbitrary read/write.
+- **Primitive chaining → demonstrated control-flow hijack** (`poc/chain_primitive.py` + the
+  `chain_primitive` stage) — the `heap_trace` (double-free/UAF/overflow) and `oob_index` (CWE-129)
+  Findings previously reached no exploit builder (dead-end leads). This stage consumes them: when
+  the target has a reachable win function (`exploit.find_win`), it drives the primitive's menu
+  option to overwrite an adjacent CODE pointer with the win address, triggers the use, and CONFIRMS
+  control reached the win under the ptrace debugger with the same **negative-control** causation
+  proof `build_exploit` uses (a hijack that also fires without the overwrite is rejected). On
+  success it files an **L3 `verified`** poc ("Control-flow hijack (demonstrated)"); otherwise it
+  emits the concrete `aaheg` technique + target **recipe** as L2 guidance. The live-confirm path is
+  non-PIE (a PIE win address needs a runtime leak, which stays analyst-gated). Reuses `make_capture`
+  / `exploit.reached`. Validated end-to-end through BOTH the harness and the web UI: heap overflow
+  (CWE-122) on a custom allocator → option 2 overwrites the neighbour chunk's callback at +24 with
+  `win` → option 3 calls it → L3 confirmed; the verdict-first UI escalates its headline from DoS to
+  "Control-flow hijack". On auth-or-out the OOB-index primitive files an L2 recipe (no reachable
+  win; the real exploit is leak-based).
 
-Still analyst-gated / next: the full angrop/pwntools finish-the-chain backend, tcache-poison chaining
-off the discovered double-free/UAF/overflow primitives, chaining the OOB-index / heap primitives into
-a demonstrated write, leaked-canary/PIE auto-confirmation, and the SROP 2-stage/leak variant for the
-no-writable case (the hardest, e.g. sick_rop).
+Known gaps / next: **symbol-free discovery** — `heap_trace` (custom-allocator id) and `oob_index`
+(array-table id) both rely on ELF symbols, so the STRIPPED HTB heap challenges (dreamdiary1, a libc
+tcache UAF; bad_grades, a counted stack overflow) don't reach these detectors (bad_grades still hits
+L1 via the fuzzer); recovering the allocator / array bounds from the disassembly is the fix. Also:
+the full angrop/pwntools finish-the-chain backend, live tcache-poison driving off the heap
+primitives (currently an L2 recipe), leaked-canary/PIE auto-confirmation (unblocks the chainer on
+PIE targets and auth-or-out), and the SROP 2-stage/leak variant for the no-writable case (sick_rop).
 
 ### Phase 4 — Optional, fenced local-LLM helper  *(only worthwhile with a modest GPU)*
 - Off by default. Three roles only, each **verifier-gated**: (1) fuzz harness/seed/dictionary

@@ -620,6 +620,7 @@ class Handler(EndpointsMixin, AutopilotMixin, BaseHTTPRequestHandler):
         "heap_check": ("..analyze.dynamic", "enqueue_heap_check"),
         "heap_trace": ("..analyze.dynamic", "enqueue_heap_trace"),
         "oob_index": ("..analyze.dynamic", "enqueue_oob_index"),
+        "chain_primitive": ("..analyze.poc", "enqueue_chain"),
         "root_cause": ("..analyze.debug", "enqueue_root_cause"),
         "multi_debug": ("..analyze.debug", "enqueue_multi_debug"),
         "debug_monitor": ("..analyze.debug", "enqueue_monitor"),
