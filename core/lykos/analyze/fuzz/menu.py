@@ -239,27 +239,45 @@ def _kill(proc) -> None:
         pass
 
 
+_OVERFLOW = 512   # bytes past a typical stack/heap buffer -- reaches the saved return address
+
+
 def _fill(fields, *, big_last: bool = False, idx: bytes = b"1", num: bytes = b"16",
           big: bytes = b"B" * 200, width=None) -> bytes:
     """Input for ONE invocation of an option with the given field template. `big_last` makes the
     last STRING field over-long (the overflow payload); otherwise every field gets a small in-bounds
     value of the right type. A string that FOLLOWS a size field is padded to that many bytes, so a
     `read(fd, buf, size)` allocator gets exactly what it asked for -- a short fill would under-read
-    and desync every later option. `width` switches scalars to fixed-width (read(fd, buf, W))."""
+    and desync every later option. `width` switches scalars to fixed-width (read(fd, buf, W)).
+
+    The overflow payload alone is not enough when a `read(fd, buf, size)` gates the copy on a
+    caller-supplied length: the buffer read stops at `size` bytes no matter how long the string is
+    (this is exactly the `Author Note size:` then `Note:` flow). So when overflowing, the size field
+    that governs the buffer -- the last `num` before the target string -- is driven LARGE too, and
+    the string is filled to match, so the copy actually runs off the end."""
     last_str = max((i for i, f in enumerate(fields) if f == "str"), default=-1)
+    # The size field that governs the overflowable buffer: the last num BEFORE the target string
+    # (a leading `Age:` num is not a buffer size). Only relevant when we are trying to overflow.
+    size_idx = (max((i for i, f in enumerate(fields) if f == "num" and i < last_str), default=-1)
+                if big_last and last_str >= 0 else -1)
     out = bytearray()
     sz = 0
     for i, f in enumerate(fields):
         if f == "idx":
             out += _scalar(idx, width)
         elif f == "num":
-            out += _scalar(num, width)
-            try:
-                sz = int(num)
-            except ValueError:
-                sz = 0
+            if i == size_idx:
+                out += _scalar(str(_OVERFLOW).encode(), width)   # ask for far more than the buffer
+                sz = _OVERFLOW
+            else:
+                out += _scalar(num, width)
+                try:
+                    sz = int(num)
+                except ValueError:
+                    sz = 0
         elif big_last and i == last_str:
-            out += _data(big, width)
+            n = _OVERFLOW if size_idx >= 0 else len(big)
+            out += _data(b"B" * n, width)                        # fill the over-large read
         else:
             payload = b"A" * sz if 0 < sz <= 4096 else b"AAAA"   # match the preceding size
             out += _data(payload, width)
@@ -280,8 +298,13 @@ def menu_op_sequences(model: dict, options, *, max_seqs: int = 40, width=None) -
     """Correctly-typed heap operation sequences built from a crawled menu model.
 
     Picks an allocating option (a size-then-string flow) to prime an object, then drives every other
-    option once with an over-long last string (heap-overflow shape) and, for index-only options,
-    twice on the same id (double-free / UAF shape). Empty when the model has no allocator."""
+    option once with an over-long last string (heap-overflow shape); for index-taking options it also
+    drives twice on the same id (double-free / UAF shape) and once with an OUT-OF-RANGE index. That
+    last shape matters: a menu that bounds an index only on the high side (`cmp idx, N`; no lower
+    bound) takes a NEGATIVE index straight into an OOB read/write of the object table (CWE-129, the
+    "auth-or-out" class). Generic seeds never reach the indexed handler at all -- they can't get past
+    the front-door menu -- so only a correctly-typed op-sequence can put a bad index there at all.
+    Empty when the model has no allocator."""
     opts = [str(o) for o in (options or [])]
     alloc = next((o for o in opts if o in model and _is_alloc(model[o])), None)
     if alloc is None:
@@ -290,17 +313,27 @@ def menu_op_sequences(model: dict, options, *, max_seqs: int = 40, width=None) -
         return _scalar(o.encode(), width) + _fill(model[o], width=width, **kw)
     one = _op(alloc)
     prime = one + one                                    # two objects: ids 0 and 1 both exist
+    # Out-of-range indices for the unchecked-index shape: negative (below a high-only bound) and far
+    # above any plausible table size. The mutator widens these further, but the campaign must be
+    # handed a valid navigation that ALREADY lands a bad index in the handler to build from.
+    oob = (b"-1", b"-2", b"9999")
     seqs: list[bytes] = []
     for o in opts:
         f = model.get(o)
         if not f:
             continue
+        idx_opt = any(x == "idx" for x in f)
         for iv in (b"0", b"1"):                          # target id 0 and 1 (0- or 1-based tables)
             # overflow: after priming, drive this option with an over-long final string
             seqs.append(prime + _op(o, big_last=True, idx=iv))
             # double-free / UAF: an index-only option driven twice on the same object
             if all(x == "idx" for x in f):
                 seqs.append(prime + _op(o, idx=iv) + _op(o, idx=iv))
+        if idx_opt:
+            # unchecked-index (CWE-129): reach the indexed handler with a negative / oversized id
+            for iv in oob:
+                seqs.append(prime + _op(o, idx=iv))
+                seqs.append(prime + _op(o, big_last=True, idx=iv))
     out, seen = [], set()
     for s in seqs:
         if s not in seen:

@@ -66,6 +66,32 @@ def test_menu_op_sequences_empty_without_allocator():
     assert menu.menu_op_sequences({"1": ["idx"], "2": ["idx"]}, ["1", "2"]) == []
 
 
+def test_fill_big_last_drives_the_governing_size_field_large():
+    # A read(fd, buf, size) buffer is bounded by its size field, so an over-long string alone never
+    # overflows: the size `num` immediately before the buffer must go large too, and the string is
+    # filled to match. Leading non-size numbers (Age) stay small.
+    out = menu._fill(["str", "str", "num", "num", "str"], big_last=True)
+    parts = out.split(b"\n")
+    # Name, Surname, Age(small), size(large=_OVERFLOW), Note(_OVERFLOW bytes)
+    assert parts[2] == b"16"                              # Age: not a buffer size, stays small
+    assert parts[3] == str(menu._OVERFLOW).encode()      # size: driven large
+    assert parts[4] == b"B" * menu._OVERFLOW             # buffer filled to the announced size
+    # with no size field before the last string, big_last keeps the fixed fallback payload
+    assert b"B" * 200 in menu._fill(["idx", "str"], big_last=True)
+
+
+def test_menu_op_sequences_emit_out_of_range_indices():
+    # An index option bounded only on the high side takes a NEGATIVE index into an OOB table access
+    # (CWE-129). The op-sequences must reach the indexed handler with such an index; generic seeds
+    # never leave the front-door menu, so this navigation is the only way one lands there.
+    model = {"1": ["str", "str", "num", "num", "str"],   # add (allocator, for priming)
+             "2": ["idx"]}                                # index-taking handler
+    seqs = menu.menu_op_sequences(model, ["1", "2"])
+    body = b"".join(seqs)
+    assert b"2\n-1\n" in body and b"2\n-2\n" in body      # negative indices reach the handler
+    assert b"2\n9999\n" in body                           # oversized index too
+
+
 def test_crawl_menu_learns_field_templates(tmp_path):
     import subprocess
     import sys

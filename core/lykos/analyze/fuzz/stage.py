@@ -146,6 +146,32 @@ def format_aware_seeds(ctx, target) -> list:
     return [s for s in seeds if s]
 
 
+def menu_op_seeds(ctx, target, exe, workdir) -> list:
+    """Correctly-typed menu operation sequences, learned by DRIVING the staged binary. The static
+    `menu_seeds` above guesses a generic numbered-menu navigation from the option strings; it never
+    learns that "Author Note size:" wants a number and "Note:" wants the bytes, so a size-then-buffer
+    flow (the overflow) is fed garbage and the campaign stays parked at the front-door menu. Crawling
+    the live target learns each option's typed field template (`crawl_menu`) and emits alloc-primed,
+    over-long-last-field sequences (`menu_op_sequences`) that actually reach the guarded sink.
+
+    Only pays the crawl when the strings advertise a menu, and is fully best-effort: any failure
+    (no menu, no allocator flow, crawl error) yields [] and the campaign keeps its static seeds."""
+    try:
+        from . import menu
+        svals = [x.value for x in _strings_for(ctx, target) if getattr(x, "value", None)]
+        opts = menu.detect_menu(svals)
+        if not opts:
+            return []
+        from ..dynamic.heap_discover import _crawl_menu_model, _read_width
+        width = _read_width(exe)
+        model = _crawl_menu_model(workdir, exe, opts, width=width)
+        if not model:
+            return []
+        return [s for s in menu.menu_op_sequences(model, opts, width=width) if s]
+    except Exception:
+        return []
+
+
 def msan_detonate(ctx, target, inputs, mode, exec_timeout, base_argv=()) -> int:
     """Detonate a set of inputs against the target's MemorySanitizer build (built at ingest for
     source targets) to surface uninitialized-value reads (CWE-457) -- the class ASan cannot see. Such
@@ -324,6 +350,16 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
     workfile = ctx.scratch() / "input.bin"
 
     corpus = list(corpus) or list(_DEFAULT_SEEDS)
+    # Enrich the corpus with typed menu-operation sequences learned by driving the live target: a
+    # numbered-menu service hides its bug behind a size-then-buffer flow the static seeds can't type,
+    # so without these the mutator never leaves the front-door menu. Best-effort and menu-gated.
+    try:
+        op_seeds = menu_op_seeds(ctx, target, exe, exe.parent)
+        if op_seeds:
+            corpus = list(corpus) + op_seeds
+            ctx.progress(msg=f"{event_prefix} learned {len(op_seeds)} menu-op seeds")
+    except Exception:
+        pass
     mut = mutator or Mutator(rng, dictionary)          # structure-aware mutator when supplied
     fd = FindingDAO(ctx.conn)
     dd = DynResultDAO(ctx.conn)
