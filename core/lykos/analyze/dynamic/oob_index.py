@@ -69,16 +69,20 @@ def _data_ranges(exe: Path) -> list[tuple[int, int]]:
 
 
 # an indexed global access: `[... reg*scale + 0xDISP]` (mov rax,[rax*8+0x6020c0]) -- the DISP is the
-# array base, scale the element stride. Intel syntax (objdump -M intel).
+# array base, scale the element stride. Intel syntax (objdump -M intel). Non-PIE (absolute base).
 _IDX_ACCESS = re.compile(r"\*([1248])\+0x([0-9a-fA-F]+)\]")
+# a PIE global base: `lea reg,[rip+0x..]  # <vaddr>` -- objdump computes the target vaddr in the
+# comment even when stripped. A table's stride is not on this line, so assume a pointer table.
+_LEA_RIP = re.compile(r"\blea\s+\w+,\[rip[+-]0x[0-9a-fA-F]+\]\s*#\s*([0-9a-fA-F]+)")
 
 
 def _array_candidates_symfree(exe: Path) -> list[dict]:
     """Fixed-size global arrays recovered from the DISASSEMBLY when the binary is stripped: a data
     displacement indexed by a scaled register (`[reg*scale + base]`). The exact element count is not
     in the binary, so the capacity is estimated from the gap to the next global base (bounded by a
-    default); the before-guard (base - stride) catches the dominant underflow regardless. Native
-    non-PIE only (a PIE base is RIP-relative, not an absolute displacement)."""
+    default); the before-guard (base - stride) catches the dominant underflow regardless. A non-PIE
+    base is an absolute displacement; a PIE base comes from objdump's computed `lea rip` comment
+    (the tracer rebases the guard via /proc/maps)."""
     if not shutil.which("objdump"):
         return []
     try:
@@ -100,10 +104,15 @@ def _candidates_from_disasm(disasm: str, ranges: list) -> list[dict]:
 
     strides: dict = {}                                    # base -> stride (scale)
     for ln in disasm.splitlines():
-        for m in _IDX_ACCESS.finditer(ln):
+        for m in _IDX_ACCESS.finditer(ln):               # non-PIE: absolute [reg*scale+0xDISP]
             base = int(m.group(2), 16)
             if in_data(base):
                 strides.setdefault(base, int(m.group(1)))
+        m = _LEA_RIP.search(ln)                           # PIE: lea reg,[rip+..] # <vaddr>
+        if m:
+            base = int(m.group(1), 16)
+            if in_data(base):
+                strides.setdefault(base, 8)               # a table's stride is off-line; assume ptr
     bases = sorted(strides)
     cands = []
     for i, base in enumerate(bases):
@@ -157,8 +166,9 @@ def oob_index_stage(ctx) -> dict:
         (workdir / "heaptrace.py").write_bytes(_HELPER.read_bytes())
 
         # Symbol table gives array sizes directly; a STRIPPED binary needs the arrays recovered from
-        # the disassembly (indexed data accesses). The symbol-free recovery is non-PIE only.
-        arrays = sym_arrays or ([] if pie else _array_candidates_symfree(exe))
+        # the disassembly -- absolute `[reg*scale+base]` (non-PIE) or `lea reg,[rip+..] # <vaddr>`
+        # (PIE, from objdump's computed comment). The tracer rebases a PIE guard via /proc/maps.
+        arrays = sym_arrays or _array_candidates_symfree(exe)
         if not arrays:
             ctx.emit("oob_index.done", payload={"applicable": False,
                      "note": "no fixed-size global array (selectable object table) to probe"})

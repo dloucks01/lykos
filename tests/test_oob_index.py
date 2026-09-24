@@ -63,3 +63,16 @@ def test_candidates_from_disasm_empty_without_data_ranges_or_hits():
 def test_array_candidates_carry_stride():
     cands = oob_index._array_candidates({"authors": (0x2030c0, 80)})
     assert cands[0]["stride"] == 8 and cands[0]["cap"] == 10
+
+
+def test_candidates_from_disasm_recovers_pie_lea_rip_tables():
+    ranges = [(0x4020, 0x4088)]                           # .bss of a PIE image
+    disasm = (
+        "  132a:\tlea    rdx,[rax*8+0x0]\n"               # index scaling (stride off-line)
+        "  1332:\tlea    rax,[rip+0x2d07]        # 4040 <stdin+0x10>\n"   # PIE array base -> 0x4040
+        "  1178:\tlea    rdi,[rip+0x12e]        # 12ad <exit>\n"    # .text lea -> ignored
+    )
+    cands = oob_index._candidates_from_disasm(disasm, ranges)
+    by_addr = {c["addr"]: c for c in cands}
+    assert 0x4040 in by_addr and by_addr[0x4040]["stride"] == 8   # ptr-table default stride
+    assert 0x12ad not in by_addr                          # a .text lea-rip is not a data array
