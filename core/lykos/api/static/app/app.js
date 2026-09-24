@@ -647,20 +647,38 @@ function App() {
   const taintFindings = activeRanked.filter((f) => _taintDet.has(f.detector));
   const cveFindings = activeRanked.filter((f) => f.detector === "cve_scan" || /^CVE-/i.test(f.cwe || ""));
   const hasCoverage = !!(activeTarget && coverage[activeTarget.id]);
-  const tabDefs = [
-    { id: "findings", label: "Findings", n: activeRanked.length },
-    { id: "exploits", label: "Exploits", n: activePocs.length },
-    { id: "functions", label: "Functions & call graph", n: activeFuncs ? activeFuncs.length : undefined },
-    { id: "disasm", label: "Disassembly" },
-    { id: "strings", label: "Strings", n: activeStrings ? activeStrings.length : undefined },
-    ...(activeCrashes.length ? [{ id: "crashes", label: "Crashes", n: activeCrashes.length }] : []),
-    ...(hasCoverage ? [{ id: "coverage", label: "Coverage" }] : []),
-    ...(heapFindings.length ? [{ id: "heap", label: "Heap", n: heapFindings.length }] : []),
-    ...(taintFindings.length ? [{ id: "taint", label: "Taint", n: taintFindings.length }] : []),
-    ...(cveFindings.length ? [{ id: "cves", label: "CVEs", n: cveFindings.length }] : []),
-    { id: "diff", label: "Diff" },
-    { id: "console", label: "Console", n: consoleLines.length },
-  ];
+  // Tab metadata (label + optional count), and the GROUPING that keeps the top bar to one row:
+  // the code views (functions/disasm/strings) and the dynamic views (crashes/coverage/heap/taint/
+  // cves) each collapse under one group with a contextual sub-tab row, instead of 11 flat tabs.
+  const tabMeta = {
+    findings: { label: "Findings", n: activeRanked.length },
+    exploits: { label: "Exploits", n: activePocs.length },
+    functions: { label: "Functions & call graph", n: activeFuncs ? activeFuncs.length : undefined },
+    disasm: { label: "Disassembly" },
+    strings: { label: "Strings", n: activeStrings ? activeStrings.length : undefined },
+    crashes: { label: "Crashes", n: activeCrashes.length },
+    coverage: { label: "Coverage" },
+    heap: { label: "Heap", n: heapFindings.length },
+    taint: { label: "Taint", n: taintFindings.length },
+    cves: { label: "CVEs", n: cveFindings.length },
+    diff: { label: "Diff" },
+    console: { label: "Console", n: consoleLines.length },
+  };
+  const groupDefs = [
+    { id: "overview", label: "Overview", tabs: ["findings"], n: activeRanked.length },
+    { id: "exploits", label: "Exploits", tabs: ["exploits"], n: activePocs.length },
+    { id: "code", label: "Code", tabs: ["functions", "disasm", "strings"] },
+    { id: "dynamic", label: "Dynamic", tabs: [
+      ...(activeCrashes.length ? ["crashes"] : []),
+      ...(hasCoverage ? ["coverage"] : []),
+      ...(heapFindings.length ? ["heap"] : []),
+      ...(taintFindings.length ? ["taint"] : []),
+      ...(cveFindings.length ? ["cves"] : []),
+    ] },
+    { id: "diff", label: "Diff", tabs: ["diff"] },
+    { id: "console", label: "Console", tabs: ["console"], n: consoleLines.length },
+  ].filter((g) => g.tabs.length);
+  const activeGroup = groupDefs.find((g) => g.tabs.includes(tab)) || groupDefs[0];
 
   return html`
     <div class=${targets.length ? "app app-wb" : "app"}>
@@ -732,15 +750,25 @@ function App() {
 
           <!-- main: verdict + tabs + panel -->
           <main class="wb-main">
-            ${multi ? html`<${VerdictStrip} verdicts=${verdicts} onSelect=${(tid) => { setActiveTid(tid); setTab("findings"); }} />` : null}
+            ${multi ? (() => {
+              const dem = verdicts.filter((v) => v.status === "demonstrated").length;
+              const pot = verdicts.filter((v) => v.status === "potential").length;
+              const clean = verdicts.length - dem - pot;
+              return html`<div class="wb-rollup">
+                <span>${verdicts.length} targets</span>
+                ${dem ? html`<span class="rollup-bad">${dem} exploited</span>` : null}
+                ${pot ? html`<span class="rollup-warn">${pot} potential</span>` : null}
+                ${clean ? html`<span class="rollup-muted">${clean} no crash</span>` : null}
+              </div>`;
+            })() : null}
             <${ShellVerdict} verdict=${activeVerdict} artifactUrl=${api.artifactUrl} />
             <${SystemMap} map=${sysmap} />
 
             <div class="wb-tabs">
-              ${tabDefs.map((td) => html`<button key=${td.id}
-                class=${`wb-tab${tab === td.id ? " active" : ""}`}
-                onClick=${() => setTab(td.id)}>
-                ${td.label}${td.n != null ? html`<span class="tab-n">${td.n}</span>` : null}
+              ${groupDefs.map((g) => html`<button key=${g.id}
+                class=${`wb-tab${g.tabs.includes(tab) ? " active" : ""}`}
+                onClick=${() => setTab(g.tabs.includes(tab) ? tab : g.tabs[0])}>
+                ${g.label}${g.n ? html`<span class="tab-n">${g.n}</span>` : null}
               </button>`)}
               ${caseId ? html`<span class="tab-exports">
                 <a class="btn small ghost" href=${api.reportUrl(caseId, "html")} target="_blank">HTML</a>
@@ -748,6 +776,14 @@ function App() {
                 <a class="btn small ghost" href=${api.reportUrl(caseId, "json")} target="_blank">JSON</a>
               </span>` : null}
             </div>
+            ${activeGroup && activeGroup.tabs.length > 1 ? html`
+              <div class="wb-subtabs">
+                ${activeGroup.tabs.map((t) => html`<button key=${t}
+                  class=${`wb-subtab${tab === t ? " active" : ""}`}
+                  onClick=${() => setTab(t)}>
+                  ${tabMeta[t].label}${tabMeta[t].n ? html`<span class="tab-n">${tabMeta[t].n}</span>` : null}
+                </button>`)}
+              </div>` : null}
 
             ${tab === "findings" ? html`
               <div class="wb-panel">

@@ -556,6 +556,18 @@
   .wb-tab .tab-n { font-family: var(--mono); font-size: .72rem; color: var(--faint); margin-left: 5px; font-weight: 400; }
   .wb-tab:disabled { color: var(--faint); cursor: default; }
   .wb-tabs .tab-exports { margin-left: auto; display: flex; gap: 6px; align-items: center; font-size: .8rem; }
+  /* contextual second-level tabs (Code / Dynamic groups) — a quiet pill row, not another tab bar */
+  .wb-subtabs { display: flex; flex-wrap: wrap; gap: 2px; margin: 10px 0 2px; }
+  .wb-subtab { font-size: .82rem; color: var(--muted); padding: 4px 12px; border-radius: 6px;
+    background: transparent; border: 1px solid transparent; cursor: pointer; font: inherit; }
+  .wb-subtab:hover { color: var(--ink); background: var(--panel-2); }
+  .wb-subtab.active { color: var(--ink); background: var(--panel-2); border-color: var(--line); font-weight: 600; }
+  .wb-subtab .tab-n { font-family: var(--mono); font-size: .72rem; color: var(--faint); margin-left: 5px; font-weight: 400; }
+  /* multi-target rollup — one quiet line replacing the old chip band */
+  .wb-rollup { display: flex; flex-wrap: wrap; gap: 14px; font-size: .82rem; color: var(--muted); margin-bottom: 10px; }
+  .wb-rollup .rollup-bad { color: var(--bad); font-weight: 600; }
+  .wb-rollup .rollup-warn { color: var(--warn); }
+  .wb-rollup .rollup-muted { color: var(--faint); }
   .wb-panel { display: flex; flex-direction: column; gap: 14px; }
   .wb-soon { color: var(--muted); font-size: .9rem; padding: 30px 10px; text-align: center; }
   .cat-intro { color: var(--muted); font-size: .84rem; margin: 0 2px 6px; padding-bottom: 8px; border-bottom: 1px solid var(--line); }
