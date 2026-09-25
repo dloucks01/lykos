@@ -35,6 +35,12 @@ from .repository import BaseDAO, as_bool, as_flag, as_int_bool, dumps, loads
 
 _TABLE_CASE = '"case"'  # reserved word — must be quoted everywhere
 
+# `severity` is stored as text (info|low|medium|high|critical), so `ORDER BY severity` sorts
+# ALPHABETICALLY (critical < high < info < low < medium) -- meaningless for a findings board.
+# This CASE maps it to a real rank (critical worst) for use in ORDER BY. Constant SQL, no input.
+_SEV_RANK_SQL = ("CASE severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 "
+                 "WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END")
+
 
 def _now() -> int:
     return int(time.time())
@@ -106,10 +112,10 @@ class TargetDAO(BaseDAO):
         self.conn.execute(
             "INSERT INTO target(id,case_id,filename,sha256,md5,sha1,size,file_type,"
             "arch,bits,endianness,linking,stripped,mitigations_json,entropy,deps_json,"
-            "ingested_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "toolchain_hint,ingested_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (t.id, t.case_id, t.filename, t.sha256, t.md5, t.sha1, t.size, t.file_type,
              t.arch, t.bits, t.endianness, t.linking, as_int_bool(t.stripped),
-             dumps(t.mitigations), t.entropy, dumps(t.deps), t.ingested_at),
+             dumps(t.mitigations), t.entropy, dumps(t.deps), t.toolchain_hint, t.ingested_at),
         )
         return t
 
@@ -780,13 +786,14 @@ class FindingDAO(BaseDAO):
 
     def list_by_target(self, target_id: str) -> list[Finding]:
         rows = self.conn.execute(
-            "SELECT * FROM finding WHERE target_id=? ORDER BY confidence DESC, severity DESC",
+            f"SELECT * FROM finding WHERE target_id=? ORDER BY confidence DESC, {_SEV_RANK_SQL}",
             (target_id,)).fetchall()
         return [self._row(r) for r in rows]
 
     def list_by_case(self, case_id: str) -> list[Finding]:
         rows = self.conn.execute(
-            "SELECT * FROM finding WHERE case_id=? ORDER BY confidence DESC", (case_id,)
+            f"SELECT * FROM finding WHERE case_id=? ORDER BY confidence DESC, {_SEV_RANK_SQL}",
+            (case_id,)
         ).fetchall()
         return [self._row(r) for r in rows]
 
@@ -937,13 +944,18 @@ class PocDAO(BaseDAO):
 class ComponentEdgeDAO(BaseDAO):
     def upsert(self, case_id: str, src_target: str, dst_target: str, *, kind: str,
                symbol: Optional[str] = None, detail: Optional[str] = None) -> None:
-        """Insert an edge, or update its detail if the (case,src,dst,kind,symbol) exists."""
+        """Insert an edge, or update its detail if the (case,src,dst,kind,symbol) exists.
+
+        `symbol` is coalesced to '' because SQLite treats NULLs as DISTINCT in a UNIQUE index,
+        so `ON CONFLICT(...symbol)` never fires on a NULL symbol and repeat calls would insert
+        duplicate edges instead of updating -- corrupting the component graph.
+        """
         self.conn.execute(
             "INSERT INTO component_edge(id,case_id,src_target,dst_target,kind,symbol,"
             "detail,created_at) VALUES(?,?,?,?,?,?,?,?) "
             "ON CONFLICT(case_id,src_target,dst_target,kind,symbol) "
             "DO UPDATE SET detail=excluded.detail",
-            (new_id(), case_id, src_target, dst_target, kind, symbol, detail, _now()))
+            (new_id(), case_id, src_target, dst_target, kind, symbol or "", detail, _now()))
 
     def list_by_case(self, case_id: str) -> list[ComponentEdge]:
         rows = self.conn.execute(

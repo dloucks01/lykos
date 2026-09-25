@@ -360,4 +360,10 @@ ALTER TABLE target ADD COLUMN deps_json TEXT;
 -- what does not apply (the memory-safety detectors mean little on a bounds-checked Go/Rust binary).
 ALTER TABLE target ADD COLUMN toolchain_hint TEXT;
 """),
+    Migration(version=18, name="run_artifact_sha_index", sql=r"""
+-- run_artifact.artifact_sha256 REFERENCES artifact(sha256), but it is not the leftmost column of
+-- the PK (run_id, artifact_sha256, role), so with foreign_keys=ON every artifact delete (e.g. a
+-- case-delete cascade) full-scans run_artifact to check for referencing rows. Index it.
+CREATE INDEX IF NOT EXISTS ix_run_artifact_sha ON run_artifact(artifact_sha256);
+"""),
 ]

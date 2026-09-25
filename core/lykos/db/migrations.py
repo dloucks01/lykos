@@ -34,25 +34,49 @@ class Migration:
 def _split_sql(sql: str) -> list[str]:
     """Split a controlled DDL script into individual statements.
 
-    Strips `--` line comments and splits on `;`. Adequate for our own migration DDL
-    (no `;` inside string literals, no trigger BEGIN/END bodies). We do NOT use
-    sqlite3.executescript() because it implicitly commits, which conflicts with the
-    explicit per-migration transaction in apply_migrations().
+    Strips `--` line comments and splits on `;`, but is STRING-LITERAL AWARE: a `;` or `--`
+    inside a `'...'` SQL string literal (doubled `''` is an escaped quote) does not split or
+    truncate. This keeps a future migration that embeds `;`/`--` in a literal from being
+    silently mis-split. (Trigger BEGIN/END bodies are still unsupported.) We do NOT use
+    sqlite3.executescript(), which implicitly commits and would break the transaction wrapping
+    apply_migrations().
     """
-    buf = []
-    for line in sql.splitlines():
-        idx = line.find("--")
-        if idx >= 0:
-            line = line[:idx]
-        buf.append(line)
-    joined = "\n".join(buf)
-    return [s.strip() for s in joined.split(";") if s.strip()]
+    stmts: list[str] = []
+    buf: list[str] = []
+    i, n, in_str = 0, len(sql), False
+    while i < n:
+        c = sql[i]
+        if in_str:
+            buf.append(c)
+            if c == "'":
+                if i + 1 < n and sql[i + 1] == "'":   # doubled '' -> escaped quote, stay in
+                    buf.append("'"); i += 2; continue
+                in_str = False
+            i += 1
+        elif c == "'":
+            in_str = True; buf.append(c); i += 1
+        elif c == "-" and i + 1 < n and sql[i + 1] == "-":   # line comment -> skip to newline
+            j = sql.find("\n", i)
+            if j < 0:
+                break
+            i = j
+        elif c == ";":
+            s = "".join(buf).strip()
+            if s:
+                stmts.append(s)
+            buf = []; i += 1
+        else:
+            buf.append(c); i += 1
+    s = "".join(buf).strip()
+    if s:
+        stmts.append(s)
+    return stmts
 
 
 def _ensure_version_table(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE TABLE IF NOT EXISTS schema_version("
-        "version INTEGER NOT NULL, name TEXT NOT NULL, applied_at INTEGER NOT NULL)"
+        "version INTEGER NOT NULL UNIQUE, name TEXT NOT NULL, applied_at INTEGER NOT NULL)"
     )
 
 
@@ -63,13 +87,25 @@ def current_version(conn: sqlite3.Connection) -> int:
 
 
 def apply_migrations(conn: sqlite3.Connection, migrations: Sequence[Migration]) -> int:
-    """Apply all migrations with version > current, in order. Returns new version."""
+    """Apply all migrations with version > current, in order. Returns new version.
+
+    Concurrency-safe: every worker that opens a case DB migrates it (CaseStore.open ->
+    init_db), so two workers opening a fresh/just-created DB could both read have=0 and both
+    run migration 1 -> `table "case" already exists` (or duplicate schema_version rows). The
+    whole run is therefore serialized behind the write lock (BEGIN IMMEDIATE) and the version is
+    RE-READ inside it; the loser then sees head and does nothing. A quick unlocked pre-check
+    keeps the common already-at-head open lock-free.
+    """
     _ensure_version_table(conn)
-    have = current_version(conn)
-    for m in sorted(migrations, key=lambda x: x.version):
-        if m.version <= have:
-            continue
-        with transaction(conn):
+    pending = sorted(migrations, key=lambda x: x.version)
+    head = pending[-1].version if pending else 0
+    if current_version(conn) >= head:
+        return current_version(conn)
+    with transaction(conn, immediate=True):
+        have = current_version(conn)          # re-read under the write lock
+        for m in pending:
+            if m.version <= have:
+                continue
             m.apply(conn)
             conn.execute(
                 "INSERT INTO schema_version(version, name, applied_at) VALUES (?,?,?)",
