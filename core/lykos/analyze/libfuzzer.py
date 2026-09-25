@@ -44,6 +44,31 @@ def find_harness(root) -> Path | None:
     return None
 
 
+_FN_DEF = re.compile(
+    r"^[ \t]*(?!static\b)(?:[A-Za-z_][\w ]*?[ \t*]+)([A-Za-z_]\w*)[ \t]*\("
+    r"[ \t]*(?:const[ \t]+)?(?:unsigned[ \t]+)?(?:char|void|uint8_t)[ \t]*\*[ \t]*\w*[ \t]*"
+    r"(?:,[ \t]*(?:const[ \t]+)?(?:unsigned[ \t]+)?(?:size_t|int|long|unsigned)[ \t]*\w*[ \t]*)?\)",
+    re.M)
+
+
+def pick_harness_fn(root) -> str | None:
+    """Auto-select an entry function to fuzz in a LIBRARY with no in-tree harness: a non-static,
+    non-main function whose first parameter is a `char*`/`const char*`/`uint8_t*` (a string or
+    buffer consumer -- the parsers where memory-safety bugs live). None if nothing suitable."""
+    for p in sorted(Path(root).rglob("*")):
+        if not (p.is_file() and p.suffix in _SRC_EXT):
+            continue
+        try:
+            txt = p.read_text(errors="ignore")
+        except OSError:
+            continue
+        for m in _FN_DEF.finditer(txt):
+            name = m.group(1)
+            if name not in ("main", "if", "for", "while", "switch", "return", "sizeof"):
+                return name
+    return None
+
+
 def synth_harness(fn: str, *, kind: str = "cstring") -> str:
     """A libFuzzer harness calling `fn` with the fuzz bytes. `cstring`: fn(char*) on a
     NUL-terminated copy; `buflen`: fn(const uint8_t*, size_t)."""
@@ -84,6 +109,8 @@ def build_libfuzzer(root, out: Path, *, harness_fn: str | None = None,
     if present, else synthesizes one for `harness_fn`. Returns {ok, binary, harness, log}."""
     root = Path(root).resolve()
     existing = find_harness(root)
+    if not existing and not harness_fn:
+        harness_fn = pick_harness_fn(root)               # auto-harness a library's parser entry
     cxx = any(p.suffix in _CXX_EXT for p in _sources(root, exclude_main=False))
     cc = _clang(cxx)
     if not cc:

@@ -89,3 +89,39 @@ def test_libfuzzer_stage_confirms_finding_with_source_line(store, case, pool):
     assert lf and lf[0].state == "confirmed"
     assert lf[0].cwe in ("CWE-121", "CWE-122", "CWE-787")
     assert any("parse.c:" in e.get("detail", "") for e in lf[0].evidence)   # precise source line
+
+
+def test_pick_harness_fn():
+    import tempfile
+    from pathlib import Path
+    from lykos.analyze.libfuzzer import pick_harness_fn
+    d = Path(tempfile.mkdtemp())
+    (d / "a.c").write_text("static void helper(char*x){(void)x;}\n"
+                           "int parse(const char* s){ return s[0]; }\n")
+    assert pick_harness_fn(d) == "parse"                  # non-static, char* first arg
+    (d / "b.c").write_text("int add(int a,int b){return a+b;}\n")
+    from pathlib import Path as P
+    e = P(tempfile.mkdtemp()); (e / "b.c").write_text("int add(int a,int b){return a+b;}\n")
+    assert pick_harness_fn(e) is None                     # no buffer-consuming function
+
+
+def test_libfuzzer_on_pure_library_auto_harness(store, case, pool):
+    _clang_or_skip()
+    import shutil as _sh
+    if not _sh.which("gcc"):
+        pytest.skip("no gcc to build the library at ingest")
+    import tempfile
+    from pathlib import Path
+    from lykos.analyze.ingest import ingest
+    from lykos.analyze.libfuzzer_stage import enqueue_libfuzzer
+    from lykos.db.dao import FindingDAO
+    from lykos.jobs import JobQueue
+    lib = Path(tempfile.mkdtemp())
+    (lib / "parse.c").write_text("#include <string.h>\n"
+                                 "#include <stdio.h>\nvoid parse_record(char*s){ char t[16]; strcpy(t,s);"
+                                 " if(t[0]==0x7f)printf(\" \"); }\n")
+    t = ingest(store, case.id, lib, filename="mylib")     # pure library -> ingests as .so
+    run = enqueue_libfuzzer(JobQueue(store.conn), t, params={"seconds": 15})   # auto-harness
+    assert pool.wait_idle(90) and store.runs.get(run.id).status == "done"
+    lf = [f for f in FindingDAO(store.conn).list_by_target(t.id) if f.detector == "libfuzzer"]
+    assert lf and lf[0].state == "confirmed" and lf[0].cwe in ("CWE-121", "CWE-122", "CWE-787")

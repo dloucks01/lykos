@@ -86,6 +86,31 @@ def _elf_executables(root: Path, since: float):
     return sorted(out, key=lambda p: p.stat().st_size, reverse=True)
 
 
+def _elf_libraries(root: Path, since: float):
+    """Newly-produced ELF shared objects (ET_DYN .so) -- the artifact a library-only source project
+    (no main) links to. The sanitizer runtimes are excluded by name."""
+    out = []
+    for p in root.rglob("*"):
+        if not p.is_file():
+            continue
+        n = p.name
+        if not (n.endswith(".so") or ".so." in n):
+            continue
+        if any(x in n for x in ("libasan", "libubsan", "liblsan", "libclang_rt")):
+            continue
+        try:
+            if p.stat().st_mtime < since - 1:
+                continue
+            with open(p, "rb") as f:
+                head = f.read(18)
+        except OSError:
+            continue
+        if head[:4] == b"\x7fELF" and len(head) >= 18 and \
+                int.from_bytes(head[16:18], "little" if head[5] == 1 else "big") == 3:
+            out.append(p)
+    return sorted(out, key=lambda p: p.stat().st_size, reverse=True)
+
+
 def build_source_project(root, *, timeout: int = 300) -> dict:
     """Build the project rooted at `root` with sanitizers forced in. Returns
     {ok, system, binaries:[Path], primary:Path|None, compiler, log}. `binaries` is largest-first;
@@ -149,8 +174,20 @@ def build_source_project(root, *, timeout: int = 300) -> dict:
                 else str(wrapdir / "cc")
             out = root / "a.lykos.bin"
             rc, log = _run([driver] + srcs + ["-o", str(out)])
+            if rc != 0 or not out.exists():
+                # No main() (a LIBRARY) -> link a shared object instead, so a pure library still
+                # ingests. Static detectors run on it and the libFuzzer stage builds a harness for
+                # its exported functions from the retained source.
+                so = root / "a.lykos.so"
+                rc, log2 = _run([driver, "-shared", "-fPIC"] + srcs + ["-o", str(so)])
+                log = log + "\n" + log2
+                system = "loose-shared"
         bins = _elf_executables(root, start)
-        return {"ok": bool(bins), "system": system, "binaries": bins,
+        kind = "executable"
+        if not bins:                                     # a library build (shared object)
+            bins = _elf_libraries(root, start)
+            kind = "library"
+        return {"ok": bool(bins), "system": system, "kind": kind, "binaries": bins,
                 "primary": bins[0] if bins else None, "compiler": Path(cc).name, "log": log[-4000:]}
     finally:
         shutil.rmtree(wrapdir, ignore_errors=True)

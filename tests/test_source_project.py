@@ -103,3 +103,11 @@ def test_static_detect_runs_on_instrumented_source_binary(store, case, gcc_or_sk
         assert any(cwe == "CWE-22" and state == "corroborated" for cwe, state in rows), rows
     finally:
         pool.stop(grace=3.0)
+
+
+def test_library_source_builds_shared_object(tmp_path, gcc_or_skip):
+    # a pure library (no main) links to a shared object instead of failing, so it still ingests
+    (tmp_path / "lib.c").write_text("#include <string.h>\n"
+                                    "void parse_record(char*s){ char t[16]; strcpy(t,s); }\n")
+    r = build_source_project(tmp_path)
+    assert r["ok"] and r["kind"] == "library" and r["primary"].name.endswith(".so"), r["log"][-300:]
