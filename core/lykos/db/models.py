@@ -47,6 +47,8 @@ class Target:
     # {path-relative-to-binary: content-sha256} for companion files the target needs to RUN
     # (a bundled loader / libc / data file). None for an ordinary standalone binary.
     deps: Optional[dict[str, str]] = None
+    # producing toolchain / source language (go, rust, c++, gcc, clang, ...), from triage.
+    toolchain_hint: Optional[str] = None
 
 
 @dataclass

@@ -226,20 +226,24 @@ def parse(data: bytes) -> ElfInfo:
     if sh:
         info.stripped = ".symtab" not in by_name
 
-    # toolchain hint
+    # toolchain / source language. Sections are the strongest signal (Go embeds .gopclntab); Rust
+    # and C++ are LLVM/GCC underneath so .comment says clang/gcc -- identify them by their runtime
+    # symbols/strings instead. A real deployment runs on all of these, and the language decides what
+    # analysis applies (memory-safety detectors mean little on a bounds-checked Go/Rust binary).
     try:
-        if ".gopclntab" in by_name or ".note.go.buildid" in by_name:
+        if ".gopclntab" in by_name or ".note.go.buildid" in by_name or b"\xfb\xff\xff\xff\x00\x00" in data[:1 << 20]:
             info.toolchain_hint = "go"
+        elif b"/rustc/" in data or b"rust_begin_unwind" in data or b"__rust_alloc" in data \
+                or b"rust_eh_personality" in data:
+            info.toolchain_hint = "rust"
+        elif b"libstdc++" in data or b"libc++.so" in data or b"__cxa_throw" in data \
+                or b"_ZSt" in data or b"_ZNSt" in data:
+            info.toolchain_hint = "c++"
         elif ".comment" in by_name:
-            c = data[by_name[".comment"]["offset"]:
-                     by_name[".comment"]["offset"] + by_name[".comment"]["size"]]
-            low = c.lower()
-            if b"clang" in low:
-                info.toolchain_hint = "clang"
-            elif b"gcc" in low:
-                info.toolchain_hint = "gcc"
-            elif b"rust" in low:
-                info.toolchain_hint = "rust"
+            low = data[by_name[".comment"]["offset"]:
+                       by_name[".comment"]["offset"] + by_name[".comment"]["size"]].lower()
+            info.toolchain_hint = ("clang" if b"clang" in low else
+                                   "gcc" if b"gcc" in low else "unknown")
     except Exception as e:
         info.errors.append(f"toolchain: {e!r}")
 

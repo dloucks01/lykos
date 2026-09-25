@@ -118,7 +118,7 @@ class TargetDAO(BaseDAO):
     # trusted. Excludes identity/provenance columns (id, case_id, sha256, ingested_at).
     _UPDATABLE = frozenset({"filename", "md5", "sha1", "size", "file_type", "arch", "bits",
                             "endianness", "linking", "stripped", "mitigations", "entropy",
-                            "deps"})
+                            "deps", "toolchain_hint"})
 
     def _update_fields(self, target_id: str, fields: dict[str, Any]) -> None:
         cols, vals = [], []
@@ -183,6 +183,7 @@ class TargetDAO(BaseDAO):
             endianness=r["endianness"], linking=r["linking"], stripped=as_bool(r["stripped"]),
             mitigations=loads(r["mitigations_json"]), entropy=r["entropy"],
             deps=loads(r["deps_json"]),
+            toolchain_hint=(r["toolchain_hint"] if "toolchain_hint" in r.keys() else None),
         )
 
 

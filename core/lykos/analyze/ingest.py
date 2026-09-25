@@ -116,7 +116,8 @@ def _apply_triage_denorm(targets: TargetDAO, target_id: str, rec: dict) -> None:
     targets.update_triage(
         target_id, file_type=rec["file_type"], arch=rec["arch"], bits=rec["bits"],
         endianness=rec["endianness"], linking=rec["linking"], stripped=rec["stripped"],
-        mitigations=rec["mitigations"], entropy=rec["entropy"]["overall"])
+        mitigations=rec["mitigations"], entropy=rec["entropy"]["overall"],
+        toolchain_hint=rec.get("toolchain_hint"))
 
 
 def backfill_triage_denorm(store, target_id: str, run_id: str) -> bool:

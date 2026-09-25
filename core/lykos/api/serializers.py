@@ -32,7 +32,7 @@ def _target(t):
             "md5": t.md5, "sha1": t.sha1, "size": t.size, "file_type": t.file_type,
             "arch": t.arch, "bits": t.bits, "endianness": t.endianness,
             "linking": t.linking, "stripped": t.stripped, "mitigations": t.mitigations,
-            "entropy": t.entropy}
+            "entropy": t.entropy, "toolchain_hint": t.toolchain_hint}
 
 
 def _poc(x):

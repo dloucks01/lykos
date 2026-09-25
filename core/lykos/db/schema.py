@@ -352,4 +352,12 @@ ALTER TABLE dyn_result ADD COLUMN defect_key TEXT;
 -- stage the whole bundle into the run directory and the binary's relative interpreter resolves.
 ALTER TABLE target ADD COLUMN deps_json TEXT;
 """),
+    Migration(version=17, name="target_toolchain", sql=r"""
+-- The producing toolchain / source LANGUAGE of the target (go, rust, c++, c, clang, gcc, ...).
+-- triage already computes it from the ELF (.gopclntab -> go, .comment -> gcc/clang, Rust mangling)
+-- but never persisted it, so it was recomputed-and-dropped and never surfaced. A real deployment
+-- runs on many languages; storing this lets the UI/report label the target and lets analysis skip
+-- what does not apply (the memory-safety detectors mean little on a bounds-checked Go/Rust binary).
+ALTER TABLE target ADD COLUMN toolchain_hint TEXT;
+"""),
 ]
