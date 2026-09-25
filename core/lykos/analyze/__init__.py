@@ -16,6 +16,7 @@ from .firmware import register as _register_firmware
 from .fuzz import register as _register_fuzz
 from .ingest import INGEST_TRIAGE_STAGE, ingest  # noqa: F401
 from .ingest import register as _register_ingest
+from .libfuzzer_stage import register as _register_libfuzzer
 from .link import register as _register_link
 from .poc import register as _register_poc
 from .symbolic import register as _register_symbolic
@@ -27,6 +28,7 @@ def register() -> None:
     _register_detect()
     _register_dynamic()
     _register_fuzz()
+    _register_libfuzzer()
     _register_poc()
     _register_symbolic()
     _register_debug()
