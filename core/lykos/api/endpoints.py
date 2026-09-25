@@ -8,6 +8,7 @@ the ~900 lines of endpoint bodies out of the 1600-line server module.
 from __future__ import annotations
 
 import base64
+import binascii
 import json
 import os
 import shutil
@@ -20,7 +21,7 @@ from urllib.parse import parse_qs, urlparse
 from ..casestore import CaseStore  # noqa: F401  (some handlers construct it directly)
 from ..db.dao import DynResultDAO, FindingDAO, FunctionDAO, PocDAO, StringDAO
 from ..jobs import JobQueue
-from .multipart import extract_file, extract_file_to
+from .multipart import extract_file, extract_file_to, parse_boundary
 from .serializers import (
     _INGEST,
     _REPORT_FORMATS,
@@ -77,20 +78,31 @@ def _maybe_extract_bundle(upload: Path, td: Path, filename: str = ""):
 
 
 def _extract_upload(ctype: str, raw: Path, td: Path, x_filename):
-    """(filename, path) of the file to ingest from a body already streamed to `raw`. Small bodies
-    use the in-memory multipart parse; large ones stream the file part to disk; a non-multipart
-    body is treated as a raw octet-stream upload (the body file itself)."""
-    if raw.stat().st_size <= _INMEM_LIMIT:
+    """(filename, path) of the file to ingest from a body already streamed to `raw`.
+
+    A NON-multipart body is a raw octet-stream upload (the body file itself). A MULTIPART body is
+    parsed: small ones in memory, large ones streamed to disk. When the streamed extractor cannot
+    cheaply locate the file part in a large multipart body, we fall back to the correct in-memory
+    parse -- and if even that fails, raise -- rather than ingesting the FRAMED body (boundaries +
+    part headers) as if it were the binary, which silently feeds the analysis the wrong bytes.
+    """
+    if parse_boundary(ctype) is None:           # not multipart -> raw octet-stream upload
+        return (x_filename or "upload.bin"), raw
+
+    def _inmem():
         filename, data = extract_file(ctype, raw.read_bytes())
-        if data is None:                        # raw octet-stream fallback
-            return (x_filename or "upload.bin"), raw
+        if data is None:
+            raise ValueError("multipart body: could not locate the uploaded file part")
         part = td / "part.bin"
         part.write_bytes(data)
         return filename, part
+
+    if raw.stat().st_size <= _INMEM_LIMIT:
+        return _inmem()
     fn = extract_file_to(ctype, raw, td / "part.bin")
-    if fn is None:                              # not the single-file shape -> octet-stream fallback
-        return (x_filename or "upload.bin"), raw
-    return fn, (td / "part.bin")
+    if fn is not None:
+        return fn, (td / "part.bin")
+    return _inmem()                             # streamed locate failed: parse correctly, don't ingest raw
 
 
 def _hexdump(data: bytes, limit: int = 1024) -> str:
@@ -169,6 +181,12 @@ class EndpointsMixin:
         body = self._json_body()
         if body is None:
             return
+        try:                                             # a bad value is a 400, not a 500
+            _tmo = float(body.get("timeout", 15))
+            _sample = (base64.b64decode(body["sample_b64"])
+                       if body.get("sample_b64") else b"name=lykos\n")
+        except (ValueError, TypeError, binascii.Error):
+            return self._json({"error": "invalid timeout or sample_b64"}, 400)
         s = self._store()
         try:
             t = s.targets.get(tid)
@@ -188,12 +206,11 @@ class EndpointsMixin:
                 exe.write_bytes(s.content.path(t.sha256).read_bytes())
                 os.chmod(exe, 0o755)
                 sample = d / "sample.bin"
-                sample.write_bytes(base64.b64decode(body["sample_b64"])
-                                   if body.get("sample_b64") else b"name=lykos\n")
+                sample.write_bytes(_sample)
 
                 def _run(a):
-                    return sandbox.run(exe, argv=a, stdin=b"", timeout=float(body.get(
-                        "timeout", 15)), arch=t.arch, endianness=t.endianness, bits=t.bits)
+                    return sandbox.run(exe, argv=a, stdin=b"", timeout=_tmo,
+                                       arch=t.arch, endianness=t.endianness, bits=t.bits)
                 found["verified"] = invmod.verify(_run, exe, argv, str(sample))
             finally:
                 shutil.rmtree(d, ignore_errors=True)
@@ -215,8 +232,11 @@ class EndpointsMixin:
         if body is None:
             return
         input_sha = (body or {}).get("input_sha")
-        times = max(1, min(int((body or {}).get("times", 5)), 10))
-        timeout = float((body or {}).get("timeout", 8))
+        try:
+            times = max(1, min(int((body or {}).get("times", 5)), 10))
+            timeout = float((body or {}).get("timeout", 8))
+        except (ValueError, TypeError):
+            return self._json({"error": "invalid times or timeout"}, 400)
         s = self._store()
         try:
             t = s.targets.get(tid)
@@ -710,8 +730,11 @@ class EndpointsMixin:
                 if not self._read_body_to_file(raw):   # streamed to disk, never held in memory
                     return self._json({"error": "request body too large or malformed"},
                                       413, close=True)
-                filename, upload = _extract_upload(ctype, raw, tdp,
-                                                   self.headers.get("X-Filename"))
+                try:
+                    filename, upload = _extract_upload(ctype, raw, tdp,
+                                                       self.headers.get("X-Filename"))
+                except ValueError as e:
+                    return self._json({"error": str(e)}, 400, close=True)
                 # The client-supplied filename must never influence where we write: an absolute
                 # path or `../` would escape the temp dir. Reduce it to a bare basename.
                 safe_name = Path(filename or "upload.bin").name or "upload.bin"
@@ -744,7 +767,10 @@ class EndpointsMixin:
         body = self._json_body()
         if body is None:
             return
-        sample = base64.b64decode(body["sample_b64"]) if body.get("sample_b64") else b""
+        try:
+            sample = base64.b64decode(body["sample_b64"]) if body.get("sample_b64") else b""
+        except (binascii.Error, ValueError, TypeError):
+            return self._json({"error": "invalid sample_b64"}, 400)
         sample = sample[:65536]                          # cap: previews stay fast
         spec = body.get("spec")
         if spec is not None:
@@ -770,8 +796,12 @@ class EndpointsMixin:
             params = body.get("params")
 
             if stage in self._CASE_STAGES:            # case-scoped: no target needed
-                cid = body.get("case_id") or (
-                    s.targets.get(target_id).case_id if target_id else None)
+                cid = body.get("case_id")
+                if not cid and target_id:             # derive the case from the target
+                    _t = s.targets.get(target_id)
+                    if _t is None:                    # a bad target_id is a 404, not a 500
+                        return self._json({"error": "no target"}, 404)
+                    cid = _t.case_id
                 fn = self._enqueue_fn(self._CASE_STAGES[stage])
                 run = fn(q, cid) if stage in ("link_case", "ipc_model", "cross_taint") \
                     else fn(q, cid, params=params)

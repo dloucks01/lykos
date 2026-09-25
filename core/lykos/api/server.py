@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import parse_qs, urlparse
 
-from ..casestore import CaseStore
+from ..casestore import CaseStore, ContentStore
 from ..db.connection import connect
 from ..db.dao import CallEdgeDAO, DynResultDAO, EventDAO, FindingDAO, FunctionDAO, PocDAO, StringDAO
 from ..jobs import JobConfig, WorkerPool
@@ -55,7 +55,8 @@ class UnixHTTPServer(ThreadingHTTPServer):
 
     def __init__(self, socket_path: str, handler, *, case_dir: Path):
         self.case_dir = Path(case_dir)
-        self.content = CaseStore.open(case_dir).content  # ensures schema + content dir
+        CaseStore.open(case_dir).close()                 # ensure schema + content dir, no leaked conn
+        self.content = ContentStore(self.case_dir)       # stateless (no DB connection)
         self._socket_path = socket_path
         if os.path.exists(socket_path):
             os.unlink(socket_path)
@@ -81,7 +82,8 @@ class TcpHTTPServer(ThreadingHTTPServer):
 
     def __init__(self, address, handler, *, case_dir: Path):
         self.case_dir = Path(case_dir)
-        self.content = CaseStore.open(case_dir).content
+        CaseStore.open(case_dir).close()                 # ensure schema + content dir, no leaked conn
+        self.content = ContentStore(self.case_dir)       # stateless (no DB connection)
         super().__init__(address, handler)
 
 
@@ -188,12 +190,17 @@ class Handler(EndpointsMixin, AutopilotMixin, BaseHTTPRequestHandler):
             safe = filename.replace("\r", "").replace("\n", "").replace('"', "")
             self.send_header("Content-Disposition", f'attachment; filename="{safe}"')
         self.end_headers()
-        with open(path, "rb") as f:
-            while True:
-                chunk = f.read(_CHUNK)
-                if not chunk:
-                    break
-                self.wfile.write(chunk)
+        try:
+            with open(path, "rb") as f:
+                while True:
+                    chunk = f.read(_CHUNK)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            # The client hung up mid-download. The 200 + partial body already went out, so there
+            # is nothing to report; returning quietly avoids the generic handler's doomed 500.
+            pass
 
     def _guard_local(self) -> bool:
         """Refuse cross-site browser requests (CSRF) and DNS-rebinding for state-changing calls.
@@ -220,6 +227,8 @@ class Handler(EndpointsMixin, AutopilotMixin, BaseHTTPRequestHandler):
 
         Raises _TruncatedBody when the client sent FEWER bytes than it declared: a partial read
         must surface as an error, never as a shorter-but-plausible body (invariant 4)."""
+        if self.headers.get("Transfer-Encoding"):
+            return None            # chunked/other TE is unsupported -- don't silently read empty
         try:
             n = int(self.headers.get("Content-Length", 0))
         except ValueError:
@@ -242,6 +251,8 @@ class Handler(EndpointsMixin, AutopilotMixin, BaseHTTPRequestHandler):
         archives), so the whole body never sits in memory at once (the concurrent-upload OOM the
         1 GiB in-memory `_read_body` risked). Returns False (caller sends 413) on a malformed or
         over-ceiling Content-Length; raises _TruncatedBody on a short read, like `_read_body`."""
+        if self.headers.get("Transfer-Encoding"):
+            return False           # chunked/other TE is unsupported -- don't silently read empty
         try:
             n = int(self.headers.get("Content-Length", 0))
         except ValueError:
