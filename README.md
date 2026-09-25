@@ -27,8 +27,9 @@ finding in five minutes.
 ## What it produces
 
 The **workbench** (`make run`) is a one-click **Autopilot**: drop a binary — or a C/C++ **source
-file**, compiled instrumented on the way in — and it runs the whole pipeline and drives each
-crash as far up the exploitation ladder as the target allows.
+tree** (a single file, or a multi-file **project** with a Makefile / CMake / autotools, or a
+**library** with no `main`), compiled instrumented on the way in — and it runs the whole pipeline
+and drives each crash as far up the exploitation ladder as the target allows.
 
 - **Demonstrated end effects, not just "a crash."** Every finding headlines the worst effect it
   can reach — **DoS, memory disclosure, memory corruption, control-flow hijack / RCE, command
@@ -43,6 +44,22 @@ crash as far up the exploitation ladder as the target allows.
   block coverage on a magic-gated target, automatically. (docs [07](docs/07-harness-fuzzing.md))
 - **Every finding earned + reviewed.** `candidate → corroborated → confirmed → poc-backed`, with a
   false-positive **replay verdict** on each demonstrated crash.
+- **Source-first when source is available.** A source project builds ASan+UBSan-instrumented (a
+  compiler wrapper forces the flags through the project's own build), so a fuzzing crash is a
+  *confirmed* finding with the exact **source file:line** and CWE from the sanitizer — no CTF
+  oracle needed. **libFuzzer** drives coverage-guided fuzzing with an **auto-synthesized harness**
+  (an in-tree `LLVMFuzzerTestOneInput`, or one generated for a library's entry function, C or C++).
+  (docs [07](docs/07-harness-fuzzing.md))
+- **Language-aware.** Triage identifies the source language — **C, C++, Go, Rust** — and analysis
+  follows: the memory-safety engine for C/C++, and for the memory-safe languages a call-graph
+  **injection / traversal / SSRF** channel (Go `os/exec`/`os.Open`/`database/sql`/`net/http`, Rust
+  `std::process`/`std::fs`), corroborated when untrusted input reaches the sink. (docs
+  [05](docs/05-cwe-detection.md))
+- **A broad L3 ladder.** ret2win, ret2system/ROP, SROP, execve-syscall, ret2libc (puts-leak, PIE
+  pure-libc, one-gadget fallback), stack-canary leak→ret2libc, **magic-value overwrite**,
+  **format-string `%n` write**, **glibc-heap → shell** (tcache poison + House of Apple 2), mprotect
+  shellcode, and **shellcode injection** with a **bad-char XOR encoder** for filtered input — every
+  L3 confirmed by a live shell / marker / breakpoint, never asserted. (docs [08](docs/08-triage-poc.md))
 
 ## Design philosophy
 

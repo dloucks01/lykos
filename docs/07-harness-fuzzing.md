@@ -4,6 +4,17 @@ Auto-harnessing is the hardest engineering piece (Gap E). Split it into discover
 seeds → instrumentation → campaign. Whole-program vectors are tractable and are the MVP; library-function
 harnessing is assisted + human-in-the-loop.
 
+**Implemented (2026-09):** in addition to the blind + breakpoint-coverage engine, a **`libfuzzer`
+stage** builds an `LLVMFuzzerTestOneInput` harness with `-fsanitize=fuzzer,address,undefined` and runs
+coverage-guided libFuzzer over a source target — using an **in-tree** harness when the project ships one,
+or a **synthesized** one for an entry function (analyst-named, or auto-picked: a non-static function whose
+first parameter is a `char*`/`uint8_t*` — a parser). It fuzzes **libraries with no `main`** (the blind
+engine cannot) and handles **C++** by declaring the target with its real signature so name mangling
+resolves. Each crash is a `confirmed` finding classified from the sanitizer report (CWE + source
+file:line). Source **projects** (multi-file / Makefile / CMake / autotools) build via a compiler wrapper
+that forces the sanitizer flags through the project's own build; a library with no `main` links to a
+shared object so it still ingests.
+
 ## 7.1 Input-vector discovery
 Find where untrusted data enters, using static taint (doc 05) + a light dynamic probe:
 - **argv, stdin, env**, **files** (path from argv/config), **network sockets**, **IPC/shared mem**, ioctl.

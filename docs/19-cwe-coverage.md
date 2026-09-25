@@ -16,6 +16,27 @@ claims coverage honestly and never reports what it cannot actually see.
   requires analyst reverse-engineering to judge (no AI — decision doc 15).
 - Detectors run on the architecture-neutral IR (doc 18), so a family's detection logic is written once.
 
+## Implemented native detectors (as of 2026-09)
+The families below are the *planned* corpus; these are the detectors that concretely **ship today**
+for native/ELF + source, each promoted to `corroborated` only when the taint or reachability channel
+agrees the attacker controls the relevant argument (a bare call stays low-confidence inventory):
+- **CWE-120/121/787** unbounded/stack copies (`dangerous_api` + bounds + stack-frame gate) and the
+  **width-bounded scanf off-by-one** (`%16s` into a 16-byte buffer → the +1 NUL, `scanf_bounded_overflow`).
+- **CWE-134** format string · **CWE-78** command execution (system/popen/exec, + Go/Rust below).
+- **CWE-22** path traversal (fopen/open/openat/unlink/… with a tainted path).
+- **CWE-789** uncontrolled/overflowing allocation size (malloc/calloc/realloc with a tainted size).
+- **CWE-89** SQL injection (sqlite3_exec/mysql_query/PQexec/… with a tainted query).
+- **CWE-822** indirect call through a function pointer in a heap object (`heap_fptr_call`).
+- **CWE-327/328/330/321/798/259/377/367/693** crypto/random/temp/TOCTOU/hardening.
+- **Go / Rust language-aware** (`lang_sinks`, gated on the detected source language): **CWE-78**
+  (`os/exec.Command`, `std::process::Command`), **CWE-22** (`os.Open*`/`std::fs`), **CWE-89**
+  (`database/sql`), **CWE-918** SSRF (`net/http`) — corroborated by call-graph reachability from an
+  untrusted-input source, since the C data-flow taint does not model the Go/Rust ABI.
+
+The taint channel propagates through x86/x86-64 **sub-registers**, so a value assembled from a
+tainted buffer's bytes (a length field read as `buf[0]`, or bytes combined with shifts/ORs) stays
+tainted to the sink — not only whole-word direct flows.
+
 ---
 
 ## A. Memory buffer errors (the core of binary offense)

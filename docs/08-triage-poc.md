@@ -1,5 +1,22 @@
 # 08 — Crash Triage, Root Cause, PoC Synthesis & Reporting
 
+**Implemented L3 strategies (`build_exploit`, 2026-09).** Each is confirmed by a live shell echoing a
+marker, a breakpoint reached with a negative control, or the win path's observable output — never
+asserted:
+- `ret2win` (ISA-neutral, incl. 32-bit stack args) · `rop`/`ret2system` · `execve`-syscall ROP ·
+  `srop` (one-shot + 2-stage `/bin/sh` plant) · `ret2csu`.
+- `ret2libc` — no-PIE puts-leak, PIE pure-libc, and a **one-gadget** fallback (`rop.find_one_gadgets`,
+  no external tool) · `canary` (leak the canary → ret2libc), with a self-contained live re-driver.
+- `magic` — overwrite a magic-checked local to reach a gated flag path (no leak/gadgets, PIE-safe).
+- `format` — a positional `%hhn` write-what-where over a post-sink GOT slot.
+- `heap` — automated glibc heap → shell (unsorted-bin leak → tcache poison of `_IO_2_1_stdout_` →
+  House of Apple 2), driven by menu op templates, with a standalone re-driver in the bundle.
+- `mprotect` shellcode · `shellcode` — inject `execve("/bin/sh")` into an executable input buffer the
+  target jumps to, with a **bad-char XOR encoder** (`shellcode.encode_avoiding`) for filtered input.
+
+The PoC bundle is inspectable in the workbench (Reproduce / Payload hexdump / Technique / Files),
+served by `GET /artifacts/{sha}/bundle`.
+
 ## 8.1 Crash triage
 - **De-duplication:** cluster crashes by normalized stack hash / faulting-IP + call context. Thousands of
   fuzzer crashes → a handful of unique bugs. Use **CASR** (crash analysis + dedup) as the engine.
