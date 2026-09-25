@@ -460,6 +460,147 @@ def stack_buffer_overflow(ctx: DetectContext):
     return out
 
 
+# ------------------------------- width-bounded scanf that STILL overflows (the off-by-one class)
+# `scanf("%16s", buf)` with `char buf[16]` is NOT safe: the conversion writes up to 16 chars PLUS a
+# terminating NUL = 17 bytes into a 16-byte buffer. The width bound fools the coarse detector above
+# (which suppresses any `%Ns`), so this reads the SPECIFIC width against the SPECIFIC destination
+# buffer's size and reports when `width + 1 > size`. `==` is the classic single-NUL off-by-one (a
+# poison-null-byte over the adjacent slot / saved frame pointer -- HTB scanner's real bug); `>` is a
+# plain overflow with an under-sized width. x86-64 SysV only (the arg registers are ABI-specific).
+_SCANF_VARIANTS = {"scanf": ("rdi", "rsi"), "sscanf": ("rsi", "rdx"), "fscanf": ("rsi", "rdx")}
+_SCANF_STR_WIDTH = re.compile(r"%\*?(\d+)[hlLjztq]*[s\[]")     # %16s / %20[..] -> the width int
+_R2_STR_SYM = re.compile(r"\bstr\.(\S+)")
+_SYM_WIDTH = re.compile(r"(\d+)(?:s|\[)")                      # a width in an r2 str. flag name
+
+
+def _norm_call(text: str):
+    """The callee name from a `call ...` instruction, normalised (`sym.imp.__isoc99_scanf` ->
+    `scanf`)."""
+    m = re.search(r"\bcall\s+(\S+)", text or "")
+    if not m:
+        return None
+    tgt = m.group(1)
+    tgt = re.sub(r"^(sym\.imp\.|sym\.|imp\.|\.)", "", tgt)
+    return normalize(tgt)
+
+
+def _str_flag_for_reg(texts, reg: str):
+    """The r2 `str.<flag>` name whose ADDRESS `reg` holds at the end of `texts`, following one
+    reg-to-reg move hop (`lea rdx,str.x; mov rdi,rdx` -- the -O0 arg set-up). None otherwise."""
+    cur = reg
+    for _ in range(2):
+        for t in reversed(texts):
+            body = t.split(";")[0]
+            m = re.match(r"\s*lea\s+" + re.escape(cur) + r"\s*,\s*(.+)$", body, re.I)
+            if m:
+                sym = _R2_STR_SYM.search(m.group(1))
+                return sym.group(1) if sym else None
+            mv = re.match(r"\s*mov\s+" + re.escape(cur) + r"\s*,\s*([a-z0-9]+)\s*$", body, re.I)
+            if mv and mv.group(1).lower() in _X86_REGS:
+                cur = mv.group(1).lower()
+                break
+            if re.match(r"\s*(mov|lea|add|sub|xor|pop)\s+" + re.escape(cur) + r"\b", body, re.I):
+                return None
+        else:
+            return None
+    return None
+
+
+def _stack_slot_for_reg(texts, reg: str):
+    """The rbp-relative slot (`-K`, an int) that `reg` holds the ADDRESS of at the end of `texts`,
+    following one level of reg-to-reg move (`lea rax,[rbp-0x10]; mov rsi,rax`). None if `reg` is not
+    a &frame-local at the call. Matches the -O0 argument set-up r2 emits."""
+    cur = reg
+    for _ in range(2):                                    # at most one mov hop then the lea
+        for t in reversed(texts):
+            body = t.split(";")[0]
+            m = re.match(r"\s*lea\s+" + re.escape(cur) + r"\s*,\s*\[\s*rbp\s*-\s*(0x[0-9a-f]+|\d+)\s*\]",
+                         body, re.I)
+            if m:
+                return -int(m.group(1), 0)
+            mv = re.match(r"\s*mov\s+" + re.escape(cur) + r"\s*,\s*([a-z0-9]+)\s*$", body, re.I)
+            if mv and mv.group(1).lower() in _X86_REGS:
+                cur = mv.group(1).lower()
+                break                                     # re-scan for the new source register
+            if re.match(r"\s*(mov|lea|add|sub|xor|pop)\s+" + re.escape(cur) + r"\b", body, re.I):
+                return None                               # reg was defined by something else
+        else:
+            return None
+    return None
+
+
+def _memset_size_for_slot(texts, slot: int):
+    """Size of a `memset(&local, 0, IMM)` on `slot` earlier in the function (r2: `lea rax,[rbp-K];
+    mov rdi,rax; mov edx,IMM; ...; call memset`). Gives the buffer size when the decompiler frame
+    did not size the local. None if not found."""
+    edx = None
+    for t in texts:
+        body = t.split(";")[0]
+        m = re.match(r"\s*mov\s+(?:edx|rdx)\s*,\s*(0x[0-9a-f]+|\d+)\s*$", body, re.I)
+        if m:
+            edx = int(m.group(1), 0)
+        if _norm_call(body) == "memset" and edx is not None:
+            if _stack_slot_for_reg(texts[:texts.index(t)], "rdi") == slot:
+                return edx
+    return None
+
+
+@register_detector
+def scanf_bounded_overflow(ctx: DetectContext):
+    if not (_is_x86(ctx.arch) and ctx.bits == 64) or not ctx.func_irs:
+        return []
+    # widths that a REAL scanf format string in the binary uses (corroborates the width parsed from
+    # an r2 str. flag, so a coincidental "16s" substring in some other symbol cannot fire this).
+    real_widths = set()
+    for s in (ctx.strings or []):
+        for m in _SCANF_STR_WIDTH.finditer(getattr(s, "value", "") or ""):
+            real_widths.add(int(m.group(1)))
+    if not real_widths:
+        return []
+    out = []
+    for faddr, ir in ctx.func_irs.items():
+        frame = ctx.frames.get(faddr) or {}
+        vsize = {int(v.get("offset", 1)): int(v.get("size", 0))
+                 for v in (frame.get("vars") or []) if v.get("offset") is not None}
+        flat = [(i.get("addr"), (i.get("text") or ""))
+                for b in ir.get("blocks", []) or [] for i in (b.get("instructions") or [])]
+        texts = [t for _, t in flat]
+        for idx, (addr, text) in enumerate(flat):
+            variant = _norm_call(text)
+            if variant not in _SCANF_VARIANTS:
+                continue
+            fmt_reg, buf_reg = _SCANF_VARIANTS[variant]
+            pre = texts[:idx]
+            # the format string flag feeding the format register -> its declared widths
+            sym = _str_flag_for_reg(pre, fmt_reg)
+            widths = {int(w) for w in _SYM_WIDTH.findall(sym)} & real_widths if sym else set()
+            if not widths:
+                continue
+            slot = _stack_slot_for_reg(pre, buf_reg)
+            if slot is None:
+                continue
+            size = vsize.get(slot) or _memset_size_for_slot(pre, slot)
+            if not size:
+                continue
+            n = max(widths)
+            if n + 1 <= size:                             # width + NUL fits -> genuinely safe
+                continue
+            off = "off-by-one NUL" if n + 1 == size + 1 and n == size else f"{n + 1 - size}-byte"
+            kind = "single-NUL off-by-one" if n == size else "overflow"
+            out.append(_cand(
+                "CWE-787",
+                f"Width-bounded {variant}() overflows its stack buffer ({kind})",
+                "high", "scanf_bounded_overflow",
+                [{"channel": "pattern",
+                  "detail": (f"{variant}(\"%{n}s\", &buf) at {addr} writes {n}+1 bytes into a "
+                             f"{size}-byte stack buffer at rbp{slot} ({off} past the end)")}],
+                function_addr=faddr, site_addr=addr,
+                site_detail=(f"{variant} %{n}s into a {size}-byte buffer (rbp{slot}); "
+                             f"writes {n + 1} bytes"),
+                dedup_key=f"CWE-787:scanf_bounded_overflow:{variant}", confidence=0.6))
+    return out
+
+
 # ------------------------------------------------------------- hard-coded secrets (string)
 _AWS = re.compile(r"AKIA[0-9A-Z]{16}")
 _PLACEHOLDERS = {"password", "secret", "changeme", "yourpassword", "xxxxxxxx",
