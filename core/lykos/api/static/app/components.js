@@ -74,12 +74,18 @@ export function PipelinePlan({ plan, targetName, target, targets }) {
 // several files at once -- multiple binaries in one case unlock the cross-binary analyses.
 export function DropZone({ onFiles, busy, compact }) {
   const take = (fl) => { if (fl && fl.length) onFiles(fl); };
-  const onDrop = (e) => { e.preventDefault(); if (!busy) take(e.dataTransfer && e.dataTransfer.files); };
+  // Toggle the "drag" affordance straight on the element (no re-render): onDragOver fires
+  // continuously so it re-asserts the class while the pointer hovers a child, and onDragLeave /
+  // onDrop clear it on the true exit.
+  const setDrag = (el, on) => { if (el && el.classList) el.classList.toggle("drag", !!on && !busy); };
+  const onDrop = (e) => { e.preventDefault(); setDrag(e.currentTarget, false); if (!busy) take(e.dataTransfer && e.dataTransfer.files); };
   const onPick = (e) => { take(e.target.files); e.target.value = ""; };
   return html`
     <label class=${`dropzone${busy ? " busy" : ""}${compact ? " compact" : ""}`}
-           onDragOver=${(e) => e.preventDefault()} onDrop=${onDrop}>
-      <input type="file" multiple hidden onChange=${onPick} disabled=${busy} />
+           onDragOver=${(e) => { e.preventDefault(); setDrag(e.currentTarget, true); }}
+           onDragLeave=${(e) => setDrag(e.currentTarget, false)} onDrop=${onDrop}>
+      <input type="file" multiple class="visually-hidden" onChange=${onPick} disabled=${busy}
+        aria-label=${compact ? "Add binaries or firmware to this case" : "Choose binaries or firmware images to analyse"} />
       <div class="dz-inner">
         <div class="dz-icon">⇪</div>
         <div class="dz-title">${compact ? "Add more binaries to this case" : "Drop one or more binaries or firmware images here"}</div>
@@ -443,7 +449,8 @@ export function EvidenceModal({ finding, pocs, artifactUrl, onViewCode, onClose,
     exploitability: "Exploitability", effects: "End effects", exploit: "Exploit" };
   return html`
     <div class="modal-back" onClick=${onClose}>
-      <div class="modal evidence" onClick=${(e) => e.stopPropagation()}>
+      <div class="modal evidence" role="dialog" aria-modal="true" tabindex="-1"
+        aria-label=${`Evidence for ${finding.title || finding.cwe || "finding"}`} onClick=${(e) => e.stopPropagation()}>
         <div class="ev-head">
           <div>
             <div class="ev-title"><${SevDot} severity=${finding.severity} /> ${finding.title || finding.cwe}</div>
@@ -505,7 +512,8 @@ export function FunctionsModal({ name, functions, onOpen, onClose }) {
   const shown = sorted.slice(0, 600);
   return html`
     <div class="modal-back" onClick=${onClose}>
-      <div class="modal funcs" onClick=${(e) => e.stopPropagation()}>
+      <div class="modal funcs" role="dialog" aria-modal="true" tabindex="-1"
+        aria-label=${`Functions in ${name}`} onClick=${(e) => e.stopPropagation()}>
         <div class="fn-head">
           <div class="fn-title">Functions · <span class="mono">${name}</span>
             <span class="fn-count">${loading ? "…" : fns.length}</span></div>
@@ -613,7 +621,8 @@ export function CodeView({ fn, finding, source, onClose, onNavigate, onFollowCal
   for (const b of blocks) for (const ins of (b.instructions || [])) insns.push(ins);
   return html`
     <div class="modal-back" onClick=${onClose}>
-      <div class="modal code" onClick=${(e) => e.stopPropagation()}>
+      <div class="modal code" role="dialog" aria-modal="true" tabindex="-1"
+        aria-label=${`Code for ${fn.name || "function"}`} onClick=${(e) => e.stopPropagation()}>
         <div class="code-head">
           <div>
             <div class="code-name">${fn.name || "sub"} <span class="code-addr">@ ${fn.addr}</span></div>

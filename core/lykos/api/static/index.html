@@ -717,6 +717,30 @@
   .crash-pc { font-family: var(--mono); font-size: .78rem; color: var(--muted); }
   .crash-mode { font-family: var(--mono); font-size: .76rem; color: var(--faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
+  /* ── Accessibility & interaction polish ─────────────────────────────────────────────────── */
+  /* A visible keyboard-focus ring on every interactive element, from the same accent token —
+     :focus-visible so a mouse click never draws it, only keyboard navigation does. */
+  a:focus-visible, button:focus-visible, select:focus-visible, input:focus-visible,
+  [tabindex]:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 6px; }
+  /* Screen-reader-only: kept in the tab order and operable by keyboard, but out of sight. The
+     upload <input> uses this (instead of `hidden`) so a keyboard user can reach the file picker;
+     the drop zone shows the ring via :focus-within below. */
+  .visually-hidden { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0;
+    border: 0; clip: rect(0 0 0 0); clip-path: inset(50%); overflow: hidden; white-space: nowrap; }
+  .dropzone:focus-within { border-color: var(--accent); background: var(--panel-2); }
+  /* A file being dragged over the zone (toggled in JS): the same affordance as :hover, louder. */
+  .dropzone.drag { border-color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 12%, var(--panel-2)); }
+  /* Dialogs are focusable containers; keep the programmatic focus-on-open ring quiet. */
+  .modal:focus { outline: none; }
+  /* Honour a reduced-motion preference: no spinners whirring, no eased transitions. */
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation-duration: .001ms !important; animation-iteration-count: 1 !important;
+      transition-duration: .001ms !important; scroll-behavior: auto !important;
+    }
+  }
+
   @media (max-width: 1080px) {
     .wb { flex-wrap: wrap; }
     .wb-drawer { width: 100%; flex-basis: 100%; border-left: none; border-top: 1px solid var(--line); }

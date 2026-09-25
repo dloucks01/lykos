@@ -120,6 +120,7 @@ function App() {
     });
   }, []);
   const ctrlRef = useRef(null);
+  const lastFocus = useRef(null);   // the element to restore focus to when a modal closes
   const bgPollRef = useRef(0);
   const bgEventsAfter = useRef(-1);   // last case-event id logged for the background run (-1 = seed)
 
@@ -248,6 +249,35 @@ function App() {
     api.health().then((h) => setHealth(h && h.status)).catch(() => setHealth("down"));
     loadRecent();
   }, [loadRecent]);
+
+  // Keyboard-first modal behaviour, for the three overlays app.js owns (code view, evidence
+  // inspector, function browser). Escape closes the top-most open one; when a modal opens focus
+  // moves into it, and when the last one closes focus returns to whatever opened it. The three
+  // components stay presentational -- this cross-cutting behaviour lives with the state.
+  const anyModal = !!(codeFn || evidence || funcBrowse);
+  useEffect(() => {
+    if (!anyModal) return;
+    const onKey = (e) => {
+      if (e.key !== "Escape") return;
+      if (codeFn) setCodeFn(null);
+      else if (evidence) setEvidence(null);
+      else if (funcBrowse) setFuncBrowse(null);
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [anyModal, codeFn, evidence, funcBrowse]);
+  useEffect(() => {
+    if (anyModal) {
+      lastFocus.current = document.activeElement;
+      requestAnimationFrame(() => {
+        const el = document.querySelector(".modal-back .modal");
+        if (el) { try { el.focus({ preventScroll: true }); } catch { el.focus(); } }
+      });
+    } else if (lastFocus.current) {
+      try { lastFocus.current.focus({ preventScroll: true }); } catch {}
+      lastFocus.current = null;
+    }
+  }, [anyModal]);
 
   const pushLog = useCallback((row) => {
     if (!row) return;
