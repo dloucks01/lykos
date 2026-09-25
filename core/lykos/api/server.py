@@ -617,6 +617,7 @@ class Handler(EndpointsMixin, AutopilotMixin, BaseHTTPRequestHandler):
         "detect_cwe": ("..analyze.detect", "enqueue_detect"),
         "dynamic_run": ("..analyze.dynamic", "enqueue_dynamic"),
         "fuzz": ("..analyze.fuzz", "enqueue_fuzz"),
+        "libfuzzer": ("..analyze.libfuzzer_stage", "enqueue_libfuzzer"),
         "coverage_fuzz": ("..analyze.fuzz", "enqueue_coverage_fuzz"),
         "directed_fuzz": ("..analyze.fuzz", "enqueue_directed_fuzz"),
         "concolic": ("..analyze.symbolic", "enqueue_concolic"),
