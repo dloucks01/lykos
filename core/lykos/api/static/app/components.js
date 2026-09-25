@@ -911,8 +911,7 @@ export function ExploitInspector({ sha, loadBundle, artifactUrl }) {
   const primitive = byBase("PRIMITIVE.txt");
   const readme = byBase("README.txt");
   const meta = data.meta || {};
-  const runLine = (data.run_cmd && data.run_cmd.trim().split("\n").filter((l) => l && !l.startsWith("#")).slice(-1)[0])
-    || (script ? "python3 ./exploit.py ./target.bin" : "sh ./runner.sh");
+  const runLine = script ? "python3 ./exploit.py ./target.bin" : "sh ./runner.sh";
   const TABS = [["repro", "Reproduce"], ["payload", "Payload"], ["technique", "Technique"], ["files", "Files"]];
   return html`
     <div class="insp">
@@ -923,8 +922,7 @@ export function ExploitInspector({ sha, loadBundle, artifactUrl }) {
       ${tab === "repro" ? html`
         <div class="insp-body">
           <div class="insp-note">Offline, air-gapped — unpack the bundle and run:</div>
-          <pre class="insp-cmd">$ tar -xzf poc-bundle.tar.gz &amp;&amp; cd poc
-$ ${runLine}</pre>
+          <pre class="insp-cmd">${`$ tar -xzf poc-bundle.tar.gz && cd poc\n$ ${runLine}`}</pre>
           ${script ? html`<div class="insp-cap">exploit.py <span class="insp-dim">(self-contained re-driver)</span></div>
             <pre class="insp-code">${script.text}</pre>`
             : runner ? html`<div class="insp-cap">runner.sh</div><pre class="insp-code">${runner.text}</pre>` : null}
