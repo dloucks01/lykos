@@ -6,6 +6,7 @@ a status-guarded UPDATE so no two workers claim the same job.
 """
 from __future__ import annotations
 
+import logging
 import sqlite3
 import time
 from typing import Callable, Iterable, Optional
@@ -13,6 +14,8 @@ from typing import Callable, Iterable, Optional
 from ..db.dao import AnalysisRunDAO, EventDAO, RunArtifactDAO
 from ..db.models import AnalysisRun
 from ..hashing import compute_cache_key
+
+_log = logging.getLogger(__name__)
 
 
 def _now() -> int:
@@ -48,7 +51,13 @@ class JobQueue:
         pending, self._pending = self._pending, []
         if self.on_event:
             for ev in pending:
-                self.on_event(ev)
+                # Isolate each callback: _flush runs AFTER the COMMIT (from _commit), so a raising
+                # callback here must not propagate back into complete()/fail() -- that would drive
+                # a spurious ROLLBACK with no open transaction and fail a job already committed done.
+                try:
+                    self.on_event(ev)
+                except Exception:                     # noqa: BLE001 -- telemetry must not break the queue
+                    _log.exception("on_event callback raised for event %s", ev.get("type"))
 
     def _commit(self) -> None:
         self.conn.execute("COMMIT")

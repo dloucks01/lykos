@@ -6,11 +6,13 @@ group on cancel or timeout (readies native tools in later phases).
 """
 from __future__ import annotations
 
+import atexit
 import os
 import shutil
 import signal
 import subprocess
 import tempfile
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -19,6 +21,31 @@ from typing import Any, Callable, Optional
 from ..casestore import ContentStore
 from ..db.dao import ArtifactDAO, EventDAO
 from ..db.models import AnalysisRun
+
+# Cap on per-stream captured child output. `communicate()` buffered the child's ENTIRE
+# stdout/stderr, so a verbose or runaway tool could grow the worker's memory without bound
+# (only the last 400 bytes are ever shown). Beyond this the reader keeps draining but discards,
+# so the child never blocks on a full pipe.
+_MAX_CAPTURE = 16 << 20  # 16 MiB per stream
+
+# Live child process-group ids, killed on interpreter exit so a bare exit / KeyboardInterrupt
+# does not orphan still-running tool groups (each child is its own session via
+# start_new_session=True). A SIGKILL of lykos itself cannot run this -- nothing can.
+_LIVE_PGIDS: set[int] = set()
+_LIVE_LOCK = threading.Lock()
+
+
+def _atexit_kill_children() -> None:
+    with _LIVE_LOCK:
+        pgids = list(_LIVE_PGIDS)
+    for pgid in pgids:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except OSError:
+            pass
+
+
+atexit.register(_atexit_kill_children)
 
 
 class StageCancelled(Exception):
@@ -120,19 +147,65 @@ class JobContext:
         popen_kw.setdefault("stdin", subprocess.DEVNULL)
         proc = subprocess.Popen(cmd, start_new_session=True,
                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, **popen_kw)
-        while True:
+        try:
+            pgid = os.getpgid(proc.pid)
+        except OSError:
+            pgid = None
+        if pgid is not None:
+            with _LIVE_LOCK:
+                _LIVE_PGIDS.add(pgid)
+        # Drain both pipes concurrently into bounded buffers: reading the whole of stdout/stderr
+        # into memory (as communicate did) lets a flooding child OOM the worker, and reading them
+        # serially would deadlock on a full pipe.
+        out_buf, err_buf = bytearray(), bytearray()
+        t_out = threading.Thread(target=self._drain, args=(proc.stdout, out_buf), daemon=True)
+        t_err = threading.Thread(target=self._drain, args=(proc.stderr, err_buf), daemon=True)
+        t_out.start()
+        t_err.start()
+        try:
+            while True:
+                try:
+                    proc.wait(timeout=poll)
+                except subprocess.TimeoutExpired:
+                    over_local = timeout is not None and (time.time() - start) > timeout
+                    if over_local or self.should_cancel():
+                        self._kill_group(proc)
+                        reason = "timeout" if (over_local or self.timed_out()) else "cancelled"
+                        self._emit_exec(cmd, start, rc=None, note=reason)
+                        raise (StageTimeout if reason == "timeout" else StageCancelled)(
+                            f"subprocess {cmd[0]} {reason}")
+                    continue
+                break  # child exited on its own
+            t_out.join(timeout=5)
+            t_err.join(timeout=5)
+            out, err = bytes(out_buf), bytes(err_buf)
+            self._emit_exec(cmd, start, rc=proc.returncode, out=out, err=err)
+            return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+        finally:
+            if pgid is not None:
+                with _LIVE_LOCK:
+                    _LIVE_PGIDS.discard(pgid)
+
+    @staticmethod
+    def _drain(stream: Any, sink: bytearray) -> None:
+        """Read a child pipe to EOF, keeping at most _MAX_CAPTURE bytes and discarding the rest
+        (still draining so the child never blocks on a full pipe)."""
+        if stream is None:
+            return
+        try:
+            while True:
+                chunk = stream.read(65536)
+                if not chunk:
+                    break
+                if len(sink) < _MAX_CAPTURE:
+                    sink.extend(chunk[: _MAX_CAPTURE - len(sink)])
+        except (OSError, ValueError):
+            pass
+        finally:
             try:
-                out, err = proc.communicate(timeout=poll)
-                self._emit_exec(cmd, start, rc=proc.returncode, out=out, err=err)
-                return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
-            except subprocess.TimeoutExpired:
-                over_local = timeout is not None and (time.time() - start) > timeout
-                if over_local or self.should_cancel():
-                    self._kill_group(proc)
-                    reason = "timeout" if (over_local or self.timed_out()) else "cancelled"
-                    self._emit_exec(cmd, start, rc=None, note=reason)
-                    raise (StageTimeout if reason == "timeout" else StageCancelled)(
-                        f"subprocess {cmd[0]} {reason}")
+                stream.close()
+            except OSError:
+                pass
 
     def _emit_exec(self, cmd, start, *, rc=None, out=b"", err=b"", note=None) -> None:
         """Publish one 'job.exec' event: the tool command that just ran and a short tail of its
@@ -168,3 +241,8 @@ class JobContext:
                 os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
         except ProcessLookupError:
             pass
+        finally:
+            try:
+                proc.wait(timeout=2)   # reap the child so it does not linger as a zombie
+            except (subprocess.TimeoutExpired, OSError):
+                pass

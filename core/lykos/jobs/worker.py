@@ -11,6 +11,7 @@ helper (context.run_subprocess) already isolates + kills child process groups.
 """
 from __future__ import annotations
 
+import itertools
 import logging
 import os
 import threading
@@ -117,6 +118,7 @@ class WorkerPool:
         self.on_event = on_event
         self._stopping = threading.Event()
         self._threads: list[threading.Thread] = []
+        self._spawn_gen = itertools.count()  # unique generation per spawned thread (worker-id)
         self._tlock = threading.Lock()   # guards _threads against the supervisor respawn race
         self._supervisor: Optional[threading.Thread] = None
         self._reaper: Optional[threading.Thread] = None
@@ -160,18 +162,23 @@ class WorkerPool:
 
     # ------------------------------------------------------------------ workers
     def _spawn_worker(self, idx: int) -> threading.Thread:
-        t = threading.Thread(target=self._worker_loop, args=(idx,), daemon=True,
+        # A unique generation per spawn: a WEDGED worker is abandoned (still alive) and replaced at
+        # the SAME idx, so an idx-only worker-id would be shared by both -- and the queue's
+        # lease-lost guard (`claimed_by not in (None, worker_id)`) then can't tell a stale result
+        # from the abandoned attempt apart from the fresh one's, letting stale outputs overwrite it.
+        gen = next(self._spawn_gen)
+        t = threading.Thread(target=self._worker_loop, args=(idx, gen), daemon=True,
                              name=f"worker-{idx}")
         t.start()
         return t
 
-    def _worker_id(self, idx: int) -> str:
-        return f"{os.getpid()}-w{idx}"
+    def _worker_id(self, idx: int, gen: int) -> str:
+        return f"{os.getpid()}-w{idx}-g{gen}"
 
-    def _worker_loop(self, idx: int) -> None:
+    def _worker_loop(self, idx: int, gen: int) -> None:
         conn = connect(self.db_path)
         q = JobQueue(conn, self.on_event)
-        wid = self._worker_id(idx)
+        wid = self._worker_id(idx, gen)
         try:
             while not self._stopping.is_set():
                 if not self._try_one(q, wid, idx):

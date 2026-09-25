@@ -20,7 +20,12 @@ class JobConfig:
     poll_interval: float = 0.1          # queue poll when idle (seconds)
     lease_seconds: int = 30             # job lease TTL
     heartbeat_interval: float = 10.0    # worker heartbeat cadence
-    default_timeout: float | None = None  # per-stage wall-clock (None = unbounded)
+    # Per-stage wall-clock fallback for a stage that registers no `timeout=` of its own. A
+    # non-None default is a hang ceiling: without it such a stage has no deadline, so a tool that
+    # wedges in a non-cooperative in-process call (angr/unicorn/rizin) renews its lease forever
+    # and pins the worker + its concurrency slot unreclaimably. 3600s matches the longest EXPLICIT
+    # stage timeout, so no stage designed to run long (which sets its own) is truncated.
+    default_timeout: float | None = 3600.0
     class_caps: dict[str, int] = field(default_factory=_default_caps)
     mem_min_mb_for_heavy: int = 1024    # admission guard for cpu/vm classes
     heavy_classes: tuple[str, ...] = ("cpu", "vm")
