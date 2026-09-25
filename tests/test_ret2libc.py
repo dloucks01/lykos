@@ -285,3 +285,34 @@ def test_exploit_stage_files_l3_canary_ret2libc(store, case, pool, canary_bin):
     pocs = PocDAO(store.conn).list_by_target(t.id)
     assert any(pc.level == "L3" and pc.verified for pc in pocs), \
         f"no confirmed L3 canary ret2libc (pocs={[(p.level, p.verified) for p in pocs]})"
+
+
+def test_classify_leak_auto_recovers_libc_and_canary():
+    """classify_leak auto-recovers the libc base (from >=2 leaked libc symbol pointers) and the
+    canary from one burst, without an analyst naming any slot."""
+    if not _SYS_LIBC:
+        pytest.skip("no system libc")
+    from lykos.analyze.poc import leak
+    ld = open(_SYS_LIBC, "rb").read()
+    syms = rop.libc_symbols(ld, ("puts", "system"))
+    base = 0x7F5500000000
+    canary = 0x8722C75DC372EC00
+    # a realistic burst: a stack ptr, the canary, two libc symbol pointers
+    vals = [0x7FFDFF9A29B0, canary, base + syms["puts"], base + syms["system"]]
+    cls = leak.classify_leak(vals, b"\x7fELF" + b"\x00" * 60, ld)
+    assert cls["libc_base"] == base
+    assert cls["canary"] == canary
+    # no libc data -> libc_base stays None (still finds the canary)
+    assert leak.classify_leak(vals, b"", b"")["libc_base"] is None
+    assert leak.classify_leak(vals, b"", b"")["canary"] == canary
+
+
+def test_analyst_ret2libc_auto_mode_recovers_base(pie_leak_bin):
+    """With no leak_sym/leak_offset, analyst_ret2libc falls back to recover_libc_base on the dump --
+    but this fixture leaks a single symbol, so auto correctly cannot corroborate a base and reports
+    it rather than firing a bogus chain (the analyst-named path still works, tested above)."""
+    ld = open(_SYS_LIBC, "rb").read()
+    res = leak.analyst_ret2libc(pie_leak_bin, pie_leak_bin.parent, offset=72, libc_data=ld,
+                                timeout=6.0)   # no leak_sym: auto
+    # single-symbol leak -> auto cannot corroborate -> honest failure (not a false success)
+    assert res["ok"] is False
