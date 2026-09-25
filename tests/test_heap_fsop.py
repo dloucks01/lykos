@@ -68,3 +68,28 @@ def test_heap_fsop_exploit_spawns_shell(notes_bin):
         timeout=10.0)
     assert res["ok"], f"auto heap->shell failed: {res.get('reason')} (base={res.get('libc_base')})"
     assert res["libc_base"] % 0x1000 == 0
+
+
+def test_heap_strategy_stage_confirms_l3(store, case, notes_bin):
+    """The `heap` strategy wires the automated chain into build_exploit: a menu target with a UAF,
+    run through the full stage, files a verified L3 (default op templates match the notes menu)."""
+    from lykos.analyze import register
+    from lykos.analyze.ingest import ingest, enqueue_triage
+    from lykos.analyze.poc import enqueue_exploit
+    from lykos.db.dao import PocDAO
+    from lykos.jobs import JobConfig, JobQueue, WorkerPool
+    if heap.unsorted_bin_offset() is None:
+        pytest.skip("no compiler/setarch to derive the arena offset")
+    register()
+    pool = WorkerPool(store.db_path, store.content, JobConfig(workers=2, poll_interval=0.02))
+    pool.start()
+    try:
+        t = ingest(store, case.id, notes_bin, filename="notes")
+        q = JobQueue(store.conn)
+        enqueue_triage(q, t, force=True); assert pool.wait_idle(40)
+        run = enqueue_exploit(q, t, params={"input_mode": "stdin", "strategy": "heap"})
+        assert pool.wait_idle(150) and q.runs.get(run.id).status == "done"
+        assert any(pc.level == "L3" and pc.verified
+                   for pc in PocDAO(store.conn).list_by_target(t.id))
+    finally:
+        pool.stop(grace=3.0)
