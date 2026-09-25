@@ -69,20 +69,65 @@ def pick_harness_fn(root) -> str | None:
     return None
 
 
-def synth_harness(fn: str, *, kind: str = "cstring") -> str:
+def fn_first_arg_type(root, fn: str):
+    """The spelling of `fn`'s FIRST parameter type in the source (e.g. "const char *", "char *"),
+    or "" when it takes no args, or None if not found. Needed to forward-declare `fn` in the harness
+    so C++ name mangling matches -- `extern void fn()` mangles differently than `fn(const char*)` and
+    fails to link. C is lenient, but the exact declaration is correct for both."""
+    pat = re.compile(r"\b" + re.escape(fn) + r"\s*\(([^)]*)\)\s*(?:const\s*)?\{", re.M)
+    for p in sorted(Path(root).rglob("*")):
+        if not (p.is_file() and p.suffix in _SRC_EXT):
+            continue
+        try:
+            m = pat.search(p.read_text(errors="ignore"))
+        except OSError:
+            continue
+        if not m:
+            continue
+        params = m.group(1).strip()
+        if not params or params == "void":
+            return ""
+        first = params.split(",")[0].strip()
+        first = re.sub(r"\b[A-Za-z_]\w*\s*$", "", first).strip() or first   # drop the param NAME
+        return first
+    return None
+
+
+def fn_def_file(root, fn) -> Path | None:
+    """The source file that DEFINES `fn` (for its language: .c -> a C symbol, .cc/.cpp -> a mangled
+    C++ symbol -- which decides whether the harness declares it `extern "C"`)."""
+    pat = re.compile(r"\b" + re.escape(fn) + r"\s*\([^)]*\)\s*(?:const\s*)?\{", re.M)
+    for p in sorted(Path(root).rglob("*")):
+        if p.is_file() and p.suffix in _SRC_EXT:
+            try:
+                if pat.search(p.read_text(errors="ignore")):
+                    return p
+            except OSError:
+                pass
+    return None
+
+
+def synth_harness(fn: str, *, kind: str = "cstring", arg_type: str | None = None,
+                  cxx: bool = False, c_linkage: bool = False) -> str:
     """A libFuzzer harness calling `fn` with the fuzz bytes. `cstring`: fn(char*) on a
-    NUL-terminated copy; `buflen`: fn(const uint8_t*, size_t)."""
+    NUL-terminated copy; `buflen`: fn(const uint8_t*, size_t). `arg_type` is `fn`'s real first
+    parameter spelling from the source so the forward declaration links (C++ mangles the signature).
+    `cxx` emits a C++ harness (the fuzzer entry then needs `extern "C"`); `c_linkage` declares `fn`
+    itself `extern "C"` when it is a C symbol reached from a C++ harness."""
+    fuzz_qual = 'extern "C" ' if cxx else ""
+    fn_qual = 'extern "C" ' if (cxx and c_linkage) else "extern "
     if kind == "buflen":
-        call = f"    {fn}(data, size);\n"
-        pre = ""
+        decl = arg_type or "const unsigned char *, unsigned long"
+        pre, call = "", f"    {fn}(data, size);\n"
     else:
-        pre = ("    char *s = (char*)malloc(size + 1);\n"
-               "    if (!s) return 0;\n"
+        at = arg_type if arg_type not in (None, "") else "char *"
+        decl = at
+        pre = ("    char *s = (char*)malloc(size + 1);\n    if (!s) return 0;\n"
                "    memcpy(s, data, size); s[size] = 0;\n")
-        call = f"    {fn}(s);\n    free(s);\n"
+        call = f"    {fn}(({at})s);\n    free(s);\n"
     return ("#include <stdint.h>\n#include <stddef.h>\n#include <stdlib.h>\n#include <string.h>\n"
-            f"extern void {fn}();\n"
-            "int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {\n"
+            f"{fn_qual}void {fn}({decl});\n"
+            f"{fuzz_qual}int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {{\n"
             f"{pre}{call}    return 0;\n}}\n")
 
 
@@ -122,7 +167,13 @@ def build_libfuzzer(root, out: Path, *, harness_fn: str | None = None,
         harness_desc = f"in-tree {existing.relative_to(root)}"
     elif harness_fn:
         h = tmp / ("harness.cc" if cxx else "harness.c")
-        h.write_text(synth_harness(harness_fn, kind=harness_kind))
+        # match the target function's real signature and linkage so a C++ symbol (mangled) or a C
+        # symbol reached from a C++ harness both resolve at link time.
+        def_file = fn_def_file(root, harness_fn)
+        c_linkage = bool(def_file and def_file.suffix in _C_EXT)
+        h.write_text(synth_harness(harness_fn, kind=harness_kind,
+                                   arg_type=fn_first_arg_type(root, harness_fn),
+                                   cxx=cxx, c_linkage=c_linkage))
         srcs = srcs + [h]
         harness_desc = f"synthesized for {harness_fn}()"
     else:

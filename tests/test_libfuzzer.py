@@ -25,8 +25,11 @@ def test_find_and_synth_harness(tmp_path):
                                   "{return 0;}\n")
     assert LF.find_harness(tmp_path).name == "h.c"
     s = LF.synth_harness("parse", kind="cstring")
-    assert "LLVMFuzzerTestOneInput" in s and "parse(s)" in s
+    assert "LLVMFuzzerTestOneInput" in s and "parse((char *)s)" in s
     assert "parse(data, size)" in LF.synth_harness("parse", kind="buflen")
+    # C++ symbol: declared with its real signature + extern "C" for a C symbol from a C++ harness
+    cpp = LF.synth_harness("load", kind="cstring", arg_type="const char *", cxx=True, c_linkage=False)
+    assert "void load(const char *)" in cpp and 'extern "C" int LLVMFuzzerTestOneInput' in cpp
 
 
 def test_build_and_run_intree_harness(tmp_path):
@@ -122,6 +125,34 @@ def test_libfuzzer_on_pure_library_auto_harness(store, case, pool):
                                  " if(t[0]==0x7f)printf(\" \"); }\n")
     t = ingest(store, case.id, lib, filename="mylib")     # pure library -> ingests as .so
     run = enqueue_libfuzzer(JobQueue(store.conn), t, params={"seconds": 15})   # auto-harness
+    assert pool.wait_idle(90) and store.runs.get(run.id).status == "done"
+    lf = [f for f in FindingDAO(store.conn).list_by_target(t.id) if f.detector == "libfuzzer"]
+    assert lf and lf[0].state == "confirmed" and lf[0].cwe in ("CWE-121", "CWE-122", "CWE-787")
+
+
+def test_libfuzzer_cpp_project_name_mangling(store, case, pool):
+    """A C++ source project: the synthesized harness must forward-declare the target with its real
+    signature (const char*) so C++ name mangling matches at link time -- `extern void load()` would
+    mangle differently and silently fail. Verifies C++ (not just C) source is fuzzable end-to-end."""
+    _clang_or_skip()
+    import shutil as _sh
+    if not _sh.which("g++"):
+        pytest.skip("no g++ to build the C++ project at ingest")
+    import tempfile
+    from pathlib import Path
+    from lykos.analyze.ingest import ingest
+    from lykos.analyze.libfuzzer_stage import enqueue_libfuzzer
+    from lykos.db.dao import FindingDAO
+    from lykos.jobs import JobQueue
+    d = Path(tempfile.mkdtemp())
+    (d / "parser.cpp").write_text("#include <cstring>\n#include <cstdio>\n"
+                                  "void load(const char* in){ char n[16]; std::strcpy(n,in);"
+                                  " if(n[0]) std::printf(\" \"); }\n")
+    (d / "main.cpp").write_text("#include <cstdio>\nvoid load(const char*);\n"
+                                "int main(){ char b[256]; if(std::fgets(b,256,stdin)) load(b); return 0; }\n")
+    (d / "Makefile").write_text("app: main.cpp parser.cpp\n\t$(CXX) $(CXXFLAGS) main.cpp parser.cpp -o app $(LDFLAGS)\n")
+    t = ingest(store, case.id, d, filename="cpproj")
+    run = enqueue_libfuzzer(JobQueue(store.conn), t, params={"harness_fn": "load", "seconds": 15})
     assert pool.wait_idle(90) and store.runs.get(run.id).status == "done"
     lf = [f for f in FindingDAO(store.conn).list_by_target(t.id) if f.detector == "libfuzzer"]
     assert lf and lf[0].state == "confirmed" and lf[0].cwe in ("CWE-121", "CWE-122", "CWE-787")
