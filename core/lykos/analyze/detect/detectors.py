@@ -601,6 +601,97 @@ def scanf_bounded_overflow(ctx: DetectContext):
     return out
 
 
+# ---------------------------- indirect call through a function pointer stored in an object field
+# `call *[obj+off]` (or `mov r,[obj+off]; call r`) invokes a function pointer read from writable
+# memory. When `obj` is a heap allocation whose contents an attacker can corrupt -- a UAF, a heap
+# overflow, the bespoke-allocator bug in HTB auth-or-out (print_author calls author->fptr) -- that
+# corruption redirects control flow directly, no ROP needed. This flags the SURFACE: an indirect
+# call whose target is loaded from `[base+disp]` where `base` is itself a pointer read from memory
+# (an object field), not a stack address (`rbp/rsp`) and not RIP-relative (that is the ordinary
+# PLT/GOT indirect call). Reviewable inventory (one per function), lifted when the function also
+# allocates (heap provenance is then likely). x86-64 only.
+_GPREG = re.compile(r"^[re][a-z]{2}$|^r(8|9|1[0-5])[db]?$", re.I)
+_ALLOCATORS = {"malloc", "calloc", "realloc", "reallocarray", "aligned_alloc", "memalign",
+               "posix_memalign", "valloc", "strdup", "strndup", "xmalloc", "xcalloc", "g_malloc"}
+
+
+def _reg_defined_by_mem_load(texts, reg):
+    """The `[base(+disp)]` memory operand that last defined `reg`, as (base, disp_text, def_index),
+    or None if `reg`'s most recent definition is not a plain memory load (a lea of a stack address,
+    an immediate, a reg-to-reg move, or a call result). `def_index` is the position of the defining
+    load in `texts`, so a caller can trace `base`'s own provenance from BEFORE that load."""
+    for j in range(len(texts) - 1, -1, -1):
+        body = texts[j].split(";")[0]
+        if not re.match(r"\s*\S+\s+" + re.escape(reg) + r"\b", body, re.I):
+            continue
+        m = re.match(r"\s*mov\s+" + re.escape(reg) + r"\s*,\s*(?:qword\s+)?\[\s*([a-z0-9]+)\s*"
+                     r"((?:[-+]\s*(?:0x[0-9a-f]+|\d+))?)\s*\]", body, re.I)
+        return (m.group(1).lower(), (m.group(2) or "").replace(" ", ""), j) if m else None
+    return None
+
+
+@register_detector
+def heap_fptr_call(ctx: DetectContext):
+    if not (_is_x86(ctx.arch) and ctx.bits == 64) or not ctx.func_irs:
+        return []
+    # The called object is often allocated in a DIFFERENT function than the one that calls through
+    # it (auth-or-out: add_author allocates, print_author calls author->fptr), so heap provenance is
+    # a binary-wide signal: does the program use a heap allocator at all? Count the libc allocators,
+    # any `*alloc*` routine (custom allocators like auth-or-out's ta_alloc/alloc_block), and the
+    # mmap/brk backing calls -- so a bespoke allocator still reads as heap.
+    def _is_alloc(name):
+        n = normalize(name)
+        return n in _ALLOCATORS or "alloc" in n or n in ("mmap", "mmap64", "sbrk", "brk")
+    heap = any(_is_alloc(e.dst_name) for e in ctx.call_edges)
+    out = []
+    for faddr, ir in ctx.func_irs.items():
+        flat = [(i.get("addr"), (i.get("text") or ""))
+                for b in ir.get("blocks", []) or [] for i in (b.get("instructions") or [])]
+        texts = [t for _, t in flat]
+        seen_here = False
+        for idx, (addr, text) in enumerate(flat):
+            if seen_here:
+                break                                     # one finding per function
+            body = text.split(";")[0].strip()
+            base = disp = None
+            base_scope = idx                              # trace base's provenance from before here
+            # call qword [base + disp]  -- indirect through memory
+            m = re.match(r"call\s+(?:qword\s+)?\[\s*([a-z0-9]+)\s*"
+                         r"((?:[-+]\s*(?:0x[0-9a-f]+|\d+))?)\s*\]$", body, re.I)
+            if m:
+                base, disp = m.group(1).lower(), (m.group(2) or "").replace(" ", "")
+            else:
+                # call reg  -- where reg was loaded from an object field [base+disp]
+                mr = re.match(r"call\s+([a-z0-9]+)$", body, re.I)
+                if mr and _GPREG.match(mr.group(1)):
+                    ld = _reg_defined_by_mem_load(texts[:idx], mr.group(1).lower())
+                    if ld:
+                        base, disp, base_scope = ld[0], ld[1], ld[2]   # trace base before the load
+            if base is None or base in ("rip", "rsp", "esp", "rbp", "ebp"):
+                continue                                  # stack-local fptr or PLT/GOT: not this
+            # the base must itself be a pointer read from memory (an object), not a stack address or
+            # an incoming register -- otherwise it is a local function-pointer variable or an opaque
+            # call, a different (lower-value) shape. Trace from BEFORE the fptr load, so a self
+            # load (`mov rax,[rax+off]`) resolves the object pointer, not itself.
+            if _reg_defined_by_mem_load(texts[:base_scope], base) is None:
+                continue
+            out.append(_cand(
+                "CWE-822",
+                "Indirect call through a function pointer in an object field "
+                "(control-flow hijack surface)",
+                "medium" if heap else "low", "heap_fptr_call",
+                [{"channel": "pattern",
+                  "detail": (f"call through [{base}{disp}] at {addr}: a function pointer read from "
+                             f"an object field is invoked; if that object is corruptible "
+                             f"({'the program uses a heap allocator' if heap else 'e.g. a UAF/overflow'})"
+                             f" the call is a direct control-flow hijack")}],
+                function_addr=faddr, site_addr=addr,
+                site_detail=f"call [{base}{disp}] (object function pointer)",
+                dedup_key="CWE-822:heap_fptr_call", confidence=0.45 if heap else 0.3))
+            seen_here = True
+    return out
+
+
 # ------------------------------------------------------------- hard-coded secrets (string)
 _AWS = re.compile(r"AKIA[0-9A-Z]{16}")
 _PLACEHOLDERS = {"password", "secret", "changeme", "yourpassword", "xxxxxxxx",

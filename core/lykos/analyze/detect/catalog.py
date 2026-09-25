@@ -28,6 +28,7 @@ CWE = {
     "CWE-250": ("Execution with Unnecessary Privileges", "medium"),
     "CWE-367": ("Time-of-check Time-of-use (TOCTOU) Race Condition", "medium"),
     "CWE-457": ("Use of Uninitialized Variable", "medium"),
+    "CWE-822": ("Untrusted Pointer Dereference", "medium"),
 }
 
 
@@ -67,6 +68,7 @@ CWE_DESC = {
     "CWE-250": "Code runs with more privilege than it needs, widening the impact of any other bug.",
     "CWE-367": "A path is checked (access/stat) then used (open/exec); an attacker can swap it in between (symlink race).",
     "CWE-457": "A variable is read before it is initialized, so its value is whatever was left in that memory.",
+    "CWE-822": "Code calls or dereferences a pointer read from writable memory (e.g. a function pointer in a heap object); if that memory can be corrupted, the pointer redirects control flow.",
 }
 
 
