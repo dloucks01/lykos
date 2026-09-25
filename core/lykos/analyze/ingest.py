@@ -210,6 +210,42 @@ def gather_bundle(dirpath) -> tuple[Optional[Path], dict[str, str]]:
     return main, deps
 
 
+def _ingest_built_project(store, case_id, root, built, filename):
+    """Ingest the binary produced by building a source PROJECT: store the primary instrumented
+    executable as the target, keep the source TREE (tar.gz) keyed to its hash so the code view can
+    show real source with the sanitizer's file:line attributions, and record the build provenance."""
+    import io
+    import tarfile
+
+    root = Path(root)
+    primary = Path(built["primary"])
+    info = hash_all_file(primary)
+    if not info["size"]:
+        raise NotAnalysable(f"{filename}: project built an empty binary")
+    # archive the source tree (skip build outputs and VCS/build dirs) for the code view + provenance
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        for p in sorted(root.rglob("*")):
+            if not p.is_file():
+                continue
+            rel = p.relative_to(root).as_posix()
+            if any(seg in (".git", "_lykos_build", "node_modules") for seg in p.relative_to(root).parts):
+                continue
+            if p.suffix in {".o", ".a", ".so", ".lo", ".la"} or p == primary or p.stat().st_size > 8 << 20:
+                continue
+            try:
+                tf.add(str(p), arcname=rel)
+            except OSError:
+                pass
+    store.put_artifact(case_id, "source-project", data=buf.getvalue(),
+                       meta={"binary_sha": info["sha256"], "filename": filename,
+                             "build_system": built.get("system"), "compiler": built.get("compiler"),
+                             "other_binaries": [b.name for b in built.get("binaries", [])[1:8]]})
+    store.put_artifact(case_id, "target-blob", src=primary)
+    return store.targets.upsert(case_id, filename, info["sha256"],
+                                md5=info["md5"], sha1=info["sha1"], size=info["size"])
+
+
 def ingest(store, case_id: str, path: str | Path, filename: Optional[str] = None,
            deps: Optional[dict[str, str]] = None):
     """IT-03/05: store the file (content-addressed) + create/dedup the target row.
@@ -220,7 +256,17 @@ def ingest(store, case_id: str, path: str | Path, filename: Optional[str] = None
     is no analysis anywhere in this platform that can say something true about zero bytes.
     """
     path = Path(path)
-    if path.is_dir():                                     # a challenge BUNDLE (binary + loader/libc)
+    if path.is_dir():
+        # A SOURCE PROJECT (multiple files / Makefile / CMake / autotools) -> build it with
+        # sanitizers and analyse the produced binary. Falls through to the prebuilt-binary bundle
+        # path if the directory is not source, or the build produces nothing runnable.
+        from . import source_project
+        if source_project.is_source_project(path):
+            built = source_project.build_source_project(path)
+            if built["ok"] and built["primary"]:
+                return _ingest_built_project(store, case_id, path, built,
+                                             filename or path.name)
+        # a challenge BUNDLE (prebuilt binary + loader/libc), or a source project that did not build
         main, dep_files = gather_bundle(path)
         if main is None:
             raise NotAnalysable(f"{path.name}: no analysable binary found in the bundle")
