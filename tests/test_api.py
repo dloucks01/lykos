@@ -727,3 +727,43 @@ def test_read_frame_returns_control_frames_inline():
     assert op == 0x9 and payload == b"ping!"
     op, _ = ws.read_frame(_FakeSock(_client_frame(0x8, b"")))             # close
     assert op == 0x8
+
+
+def test_artifact_bundle_endpoint(api_http, tmp_path):
+    """GET /artifacts/{sha}/bundle opens a PoC bundle and returns its inner files -- meta, the
+    reproduce script (text), and a hexdump of the payload -- so the UI can inspect the exploit
+    instead of only downloading the tarball."""
+    from lykos.analyze.poc import bundle
+    from lykos.casestore import CaseStore
+    data = bundle.build(
+        b"\x7fELF" + b"\x00" * 200, bytes(range(64)),
+        {"level": "L3", "exploit": "magic-overwrite", "arch": "x86-64", "target_sha256": "z"},
+        b"", "stdin", [], None,
+        primitive={"type": "magic-overwrite", "confirmed": True},
+        extra_files={"exploit.py": b"#!/usr/bin/env python3\nprint('repro')\n"},
+        run_cmd="python3 ./exploit.py ./target.bin")
+    store = CaseStore.open(tmp_path / "cs")
+    try:
+        sha, _rel, _sz = store.content.put_bytes(data)
+    finally:
+        store.close()
+    st, body = _tcp(api_http, "GET", f"/artifacts/{sha}/bundle")
+    assert st == 200, (st, body[:200])
+    d = json.loads(body)
+    assert d["level"] == "L3" and d["exploit"] == "magic-overwrite"
+    names = {f["name"].split("/")[-1]: f for f in d["files"]}
+    assert "exploit.py" in names and names["exploit.py"]["kind"] == "text"
+    assert "repro" in names["exploit.py"]["text"]
+    assert names["input.bin"]["kind"] == "payload" and "00000000" in names["input.bin"]["hexdump"]
+    assert names["target.bin"]["kind"] == "binary"          # never inlines the raw binary
+
+
+def test_artifact_bundle_endpoint_rejects_non_bundle(api_http, tmp_path):
+    from lykos.casestore import CaseStore
+    store = CaseStore.open(tmp_path / "cs")
+    try:
+        sha, _r, _s = store.content.put_bytes(b"not a tar.gz at all")
+    finally:
+        store.close()
+    st, _body = _tcp(api_http, "GET", f"/artifacts/{sha}/bundle")
+    assert st == 415

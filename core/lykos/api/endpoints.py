@@ -93,6 +93,20 @@ def _extract_upload(ctype: str, raw: Path, td: Path, x_filename):
     return fn, (td / "part.bin")
 
 
+def _hexdump(data: bytes, limit: int = 1024) -> str:
+    """A classic `offset  hex bytes  |ascii|` hexdump of up to `limit` bytes -- for showing an
+    exploit payload inline in the inspector rather than only offering it as a download."""
+    data = data[:limit]
+    lines = []
+    for off in range(0, len(data), 16):
+        chunk = data[off:off + 16]
+        hexpart = " ".join(f"{b:02x}" for b in chunk)
+        hexpart = f"{hexpart[:23]:<23} {hexpart[24:]:<23}" if len(chunk) > 8 else f"{hexpart:<23}"
+        ascii_ = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
+        lines.append(f"{off:08x}  {hexpart}  |{ascii_}|")
+    return "\n".join(lines)
+
+
 class EndpointsMixin:
     def _get_capabilities(self, tid):
         """What this target can and cannot have done to it, and why not.
@@ -606,6 +620,58 @@ class EndpointsMixin:
         # Stream from disk in chunks -- an artifact may be a firmware image near the 1 GiB
         # ceiling, and get_bytes() would load the whole blob into memory per concurrent request.
         return self._stream_file(path, "application/octet-stream")
+
+    def _get_bundle(self, sha):
+        """Open a PoC bundle (.tar.gz) and return its INNER contents for the exploit inspector: the
+        meta/primitive, small text files (README, meta.json, PRIMITIVE.txt, runner.sh, exploit.py)
+        inlined, and a hexdump preview of the payload (input.bin) -- so the UI can show the exploit,
+        not just offer a download. Binary members give size + a note, never their raw bytes here."""
+        import io
+        import json
+        import tarfile
+
+        path = self.server.content.path(sha)
+        if not path.exists():
+            return self._json({"error": "no artifact"}, 404)
+        raw = path.read_bytes()
+        try:
+            tf = tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz")
+        except Exception:                                    # noqa: BLE001 -- not a tar.gz bundle
+            return self._json({"error": "not a poc bundle"}, 415)
+        TEXT = {"README.txt", "meta.json", "PRIMITIVE.txt", "runner.sh", "exploit.py", "recipe.json",
+                "stderr.txt"}
+        files, meta, primitive, run_cmd = [], {}, {}, None
+        try:
+            for m in tf.getmembers():
+                if not m.isfile():
+                    continue
+                base = m.name.split("/")[-1]
+                entry = {"name": m.name, "size": m.size}
+                blob = tf.extractfile(m)
+                data = blob.read(1 << 20) if blob else b""   # cap any single member at 1 MiB
+                if base in TEXT and base.endswith((".txt", ".sh", ".py", ".json")):
+                    entry["kind"] = "text"
+                    entry["text"] = data.decode("utf-8", "replace")
+                    if base == "meta.json":
+                        try:
+                            meta = json.loads(entry["text"])
+                        except Exception:                    # noqa: BLE001
+                            pass
+                    if base == "runner.sh":
+                        run_cmd = entry["text"]
+                elif base == "input.bin":
+                    entry["kind"] = "payload"
+                    entry["hexdump"] = _hexdump(data, limit=1024)
+                    entry["preview_len"] = min(len(data), 1024)
+                else:                                        # target.bin and other binaries
+                    entry["kind"] = "binary"
+                files.append(entry)
+        finally:
+            tf.close()
+        return self._json({"level": meta.get("level") if isinstance(meta, dict) else None,
+                           "exploit": meta.get("exploit") if isinstance(meta, dict) else None,
+                           "meta": meta, "run_cmd": run_cmd,
+                           "files": files, "download": f"/artifacts/{sha}"})
 
     def _get_events(self, cid, after):
         s = self._store()

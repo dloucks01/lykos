@@ -803,7 +803,7 @@ function App() {
               </div>
             ` : tab === "exploits" ? html`
               <div class="wb-panel">
-                <${ExploitsPanel} verdict=${activeVerdict} pocs=${activePocs} topFinding=${topDemoFinding} artifactUrl=${api.artifactUrl} />
+                <${ExploitsPanel} verdict=${activeVerdict} pocs=${activePocs} topFinding=${topDemoFinding} artifactUrl=${api.artifactUrl} loadBundle=${api.bundle} />
               </div>
             ` : tab === "functions" ? html`
               <div class="wb-panel">

@@ -115,6 +115,10 @@ export const api = {
   events: (caseId, after = 0) => _req("GET", `/cases/${caseId}/events?after=${after}`),
   reportUrl: (caseId, fmt = "html") => `/cases/${caseId}/report?format=${fmt}`,
   artifactUrl: (sha) => `/artifacts/${sha}`,
+  // Inner contents of a PoC bundle (.tar.gz): { level, exploit, meta, run_cmd, files:[{name,
+  // size, kind, text?|hexdump?}], download }. Lets the UI show the exploit -- repro script,
+  // payload hexdump, technique notes -- inline instead of only offering the tarball.
+  bundle: (sha) => _req("GET", `/artifacts/${sha}/bundle`),
 };
 
 // Poll a run until it reaches a terminal status. Resolves with the final run record.

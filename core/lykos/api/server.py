@@ -119,7 +119,7 @@ def _hostname_only(value: str) -> str:
 
 
 from .routes import (  # route table + traversal-safe static reader (extracted from this module)
-    _ARTIFACT, _ASSET_TYPES, _CASE_AUTOPILOT, _CASE_AUTOPILOT_CANCEL, _CASE_EVENTS, _CASE_EXPORT,
+    _ARTIFACT, _ARTIFACT_BUNDLE, _ASSET_TYPES, _CASE_AUTOPILOT, _CASE_AUTOPILOT_CANCEL, _CASE_EVENTS, _CASE_EXPORT,
     _CASE_FIND, _CASE_ID, _CASE_REPORT, _CASE_RUNS, _CASE_SYSMAP, _CASE_TARGETS, _CASE_VERIFS,
     _FIND_ID, _FUNC_ID, _RUN_CANCEL, _RUN_ID, _RUN_OUTPUT, _STATIC_ASSET, _TARGET_ADVICE,
     _TARGET_CAPS, _TARGET_CG, _TARGET_DYN, _TARGET_FIND, _TARGET_FUNCS, _TARGET_ID, _TARGET_INVOKE,
@@ -505,6 +505,9 @@ class Handler(EndpointsMixin, AutopilotMixin, BaseHTTPRequestHandler):
             m = _RUN_ID.match(path)
             if m:
                 return self._get_run(m.group(1))
+            m = _ARTIFACT_BUNDLE.match(path)
+            if m:
+                return self._get_bundle(m.group(1))
             m = _ARTIFACT.match(path)
             if m:
                 return self._get_artifact(m.group(1))

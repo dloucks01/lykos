@@ -886,9 +886,76 @@ function exploitDetail(f) {
   return e && e.detail;
 }
 
+// Live inspector for a confirmed L3 PoC bundle: fetches the bundle's INNER files (loadBundle(sha))
+// and shows the exploit itself -- the real reproduce command + script, a hexdump of the payload,
+// the primitive/technique notes, and the file manifest -- instead of a hardcoded placeholder. Tabs
+// keep it compact; every view is derived from the actual bundle, never faked.
+export function ExploitInspector({ sha, loadBundle, artifactUrl }) {
+  const [data, setData] = useState(null);
+  const [err, setErr] = useState(null);
+  const [tab, setTab] = useState("repro");
+  useEffect(() => {
+    let live = true;
+    if (!sha || !loadBundle) return;
+    setData(null); setErr(null);
+    loadBundle(sha).then((d) => { if (live) setData(d); }).catch((e) => { if (live) setErr(e.message || String(e)); });
+    return () => { live = false; };
+  }, [sha]);
+  if (err) return html`<div class="insp insp-err">bundle unavailable: ${err}</div>`;
+  if (!data) return html`<div class="insp insp-load">reading bundle…</div>`;
+  const files = data.files || [];
+  const byBase = (b) => files.find((f) => f.name.split("/").pop() === b);
+  const script = byBase("exploit.py");
+  const runner = byBase("runner.sh");
+  const payload = files.find((f) => f.kind === "payload");
+  const primitive = byBase("PRIMITIVE.txt");
+  const readme = byBase("README.txt");
+  const meta = data.meta || {};
+  const runLine = (data.run_cmd && data.run_cmd.trim().split("\n").filter((l) => l && !l.startsWith("#")).slice(-1)[0])
+    || (script ? "python3 ./exploit.py ./target.bin" : "sh ./runner.sh");
+  const TABS = [["repro", "Reproduce"], ["payload", "Payload"], ["technique", "Technique"], ["files", "Files"]];
+  return html`
+    <div class="insp">
+      <div class="insp-tabs">
+        ${TABS.map(([k, label]) => (k === "payload" && !payload) ? null : html`
+          <button key=${k} class=${`insp-tab${tab === k ? " on" : ""}`} onClick=${() => setTab(k)}>${label}</button>`)}
+      </div>
+      ${tab === "repro" ? html`
+        <div class="insp-body">
+          <div class="insp-note">Offline, air-gapped — unpack the bundle and run:</div>
+          <pre class="insp-cmd">$ tar -xzf poc-bundle.tar.gz &amp;&amp; cd poc
+$ ${runLine}</pre>
+          ${script ? html`<div class="insp-cap">exploit.py <span class="insp-dim">(self-contained re-driver)</span></div>
+            <pre class="insp-code">${script.text}</pre>`
+            : runner ? html`<div class="insp-cap">runner.sh</div><pre class="insp-code">${runner.text}</pre>` : null}
+        </div>` : null}
+      ${tab === "payload" && payload ? html`
+        <div class="insp-body">
+          <div class="insp-cap">${payload.name.split("/").pop()} <span class="insp-dim">(${fmtBytes(payload.size)}${payload.preview_len < payload.size ? `, first ${payload.preview_len} shown` : ""})</span></div>
+          <pre class="insp-hex">${payload.hexdump}</pre>
+        </div>` : null}
+      ${tab === "technique" ? html`
+        <div class="insp-body">
+          <table class="insp-meta">
+            ${["exploit", "arch", "offset", "libc_base", "target"].map((k) => meta[k] != null ? html`
+              <tr key=${k}><td>${k}</td><td>${String(meta[k])}</td></tr>` : null)}
+          </table>
+          ${primitive ? html`<pre class="insp-code">${primitive.text}</pre>` : null}
+          ${readme ? html`<details class="insp-more"><summary>README</summary><pre class="insp-code">${readme.text}</pre></details>` : null}
+        </div>` : null}
+      ${tab === "files" ? html`
+        <div class="insp-body">
+          <table class="insp-files">
+            ${files.map((f) => html`<tr key=${f.name}><td class="insp-fn">${f.name}</td><td class="insp-dim">${f.kind}</td><td>${fmtBytes(f.size)}</td></tr>`)}
+          </table>
+          <a class="btn small ghost" href=${artifactUrl(data.download.split("/").pop())} download>⬇ full bundle (.tar.gz)</a>
+        </div>` : null}
+    </div>`;
+}
+
 // The Exploits tab: the L1▸L2▸L3 ladder for one target, each rung with its artifacts and verified
-// state, and the L3 rung expanded with how the exploit works + an offline-reproduce block.
-export function ExploitsPanel({ verdict, pocs, topFinding, artifactUrl }) {
+// state, and the L3 rung expanded with how the exploit works + a live bundle inspector.
+export function ExploitsPanel({ verdict, pocs, topFinding, artifactUrl, loadBundle }) {
   const v = verdict || {};
   const lvl = v.level || 0;
   const byLvl = {};
@@ -923,10 +990,8 @@ export function ExploitsPanel({ verdict, pocs, topFinding, artifactUrl }) {
               <div class="xp-sub">arrival confirmed under the debugger · negative control passed</div>
             </div>
           </div>
-          <div class="xp-grid">
-            <div class="xp-steps"><span class="xp-k">HOW IT WORKS</span>${detail || "control flow was hijacked to attacker-chosen code."}</div>
-            <div class="xp-repro"><span class="xp-k">REPRODUCE — OFFLINE, AIR-GAPPED</span>$ unzip poc-bundle.zip<br/>$ ./RUN.sh<br/><span style="color:var(--ok)">breakpoint reached ✓  control passed ✓</span></div>
-          </div>
+          <div class="xp-steps"><span class="xp-k">HOW IT WORKS</span>${detail || "control flow was hijacked to attacker-chosen code."}</div>
+          ${bundleSha ? html`<${ExploitInspector} sha=${bundleSha} loadBundle=${loadBundle} artifactUrl=${artifactUrl} />` : null}
           <div class="xp-actions">
             ${bundleSha ? html`<a class="btn" href=${artifactUrl(bundleSha)} download>⬇ PoC bundle (verified)</a>` : null}
             ${inputSha ? html`<a class="btn ghost" href=${artifactUrl(inputSha)} download>⬇ exploit input</a>` : null}
