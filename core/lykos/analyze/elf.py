@@ -391,11 +391,13 @@ def program_ranges(data: bytes) -> list:
     using everything rather than pretending the program is tiny.
     """
     try:
-        if any(sec.get("name") == ".opd" for sec in parse(data).sections):
+        info = parse(data)   # parse ONCE and reuse -- parse() does full-file scans + section
+        #                      entropy, so re-parsing in _symbol_owners doubled that cost per call.
+        if any(sec.get("name") == ".opd" for sec in info.sections):
             # PowerPC64 ELFv1: a function symbol's value is the address of its OPD descriptor,
             # not of its code, so every range this derived would be in the wrong address space.
             return []
-        marks, funcs, end = _symbol_owners(data)
+        marks, funcs, end = _symbol_owners(data, info)
     except Exception:
         _log.debug("program_ranges symbol parse failed", exc_info=True)
         return []
@@ -426,9 +428,9 @@ def program_ranges(data: bytes) -> list:
     return [(lo, min(hi, end) if end else hi) for lo, hi in merged]
 
 
-def _symbol_owners(data: bytes):
+def _symbol_owners(data: bytes, info=None):
     """(local-symbol -> owning file marks, function (addr, size) list, end of text)."""
-    info = parse(data)
+    info = info if info is not None else parse(data)
     is64 = info.bits == 64
     endc = "<" if info.endianness == "little" else ">"
     # ARM tags a Thumb function by setting bit 0 of its symbol value; the address the code

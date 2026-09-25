@@ -104,6 +104,13 @@ def parse(data: bytes) -> PeInfo:
         else:
             (info.image_base,) = struct.unpack_from("<I", data, opt + 28)
             sub_off, dll_off, dir_off = opt + 68, opt + 70, opt + 96 + 8
+        # NumberOfRvaAndSizes: how many data directories the optional header actually holds. The
+        # IMPORT directory is entry [1], so with < 2 entries dir_off points past the directories
+        # into the section table -- reading it yields garbage imports and a wrong `linking`. Skip.
+        n_dirs_off = (opt + 108) if is64 else (opt + 92)
+        (n_dirs,) = struct.unpack_from("<I", data, n_dirs_off)
+        if n_dirs < 2:
+            dir_off = None
         (subsystem,) = struct.unpack_from("<H", data, sub_off)
         info.subsystem = _SUBSYSTEM.get(subsystem, f"0x{subsystem:x}")
         (dllchar,) = struct.unpack_from("<H", data, dll_off)
