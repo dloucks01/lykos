@@ -72,3 +72,34 @@ def test_ingest_source_project(store, case, gcc_or_skip):
     arts = [a for a in ArtifactDAO(store.conn).list_by_case(case.id) if a.kind == "source-project"]
     assert arts, "the source tree should be archived for the code view + provenance"
     assert arts[0].meta.get("build_system") == "make"
+
+
+def test_static_detect_runs_on_instrumented_source_binary(store, case, gcc_or_skip):
+    """A source file compiles to an ASan+UBSan (PIE) binary whose huge runtime used to make
+    _program_only mis-attribute the base and drop the program's own code -- blinding every static
+    detector (zero findings). The entry-point consistency guard now keeps analysis running, so a
+    source target gets static SAST (here a corroborated CWE-22) in ADDITION to dynamic sanitizer
+    findings."""
+    import tempfile
+    from pathlib import Path
+    from lykos.analyze.ingest import ingest, enqueue_triage
+    from lykos.analyze.disassemble import enqueue_disassemble
+    from lykos.analyze.detect import enqueue_detect
+    from lykos.jobs import JobConfig, JobQueue, WorkerPool
+    register()
+    src = Path(tempfile.mkdtemp()) / "t.c"
+    src.write_text("#include <stdio.h>\nint main(int c,char**v){ if(c<2)return 0;"
+                   " FILE*f=fopen(v[1],\"r\"); if(f)fclose(f); return 0; }\n")
+    pool = WorkerPool(store.db_path, store.content, JobConfig(workers=2, poll_interval=0.02))
+    pool.start()
+    try:
+        t = ingest(store, case.id, src, filename="t.c")   # source -> ASan-instrumented binary
+        q = JobQueue(store.conn)
+        enqueue_triage(q, t, force=True); assert pool.wait_idle(40)
+        enqueue_disassemble(q, t, force=True); assert pool.wait_idle(120)
+        enqueue_detect(q, t, force=True); assert pool.wait_idle(90)
+        rows = store.conn.execute("SELECT cwe,state FROM finding WHERE target_id=?", (t.id,)).fetchall()
+        assert rows, "instrumented source binary produced zero static findings (regression)"
+        assert any(cwe == "CWE-22" and state == "corroborated" for cwe, state in rows), rows
+    finally:
+        pool.stop(grace=3.0)

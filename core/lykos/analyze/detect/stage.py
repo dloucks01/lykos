@@ -206,6 +206,13 @@ def _program_only(ctx, target, functions):
         i = bisect.bisect_right(los, a) - 1
         return i >= 0 and a < ranges[i][1]
 
+    # Consistency check: the ELF entry point MUST be the program's own code. If it does not map
+    # into any recovered program range under the computed base, the base/range attribution is wrong
+    # -- which happens on PIE and sanitizer-instrumented binaries (the huge ASan runtime skews the
+    # ranges) -- and restricting to it would silently blind every detector on the real program (a
+    # source target then gets zero static findings). Distrust it and keep everything.
+    if entry is not None and not own(entry):
+        return functions, edges, 0
     keep_fn = [f for f in functions if own(f.addr)]
     keep_ed = [e for e in edges if own(e.src_addr)]
     dropped = (len(functions) - len(keep_fn)) + (len(edges) - len(keep_ed))
