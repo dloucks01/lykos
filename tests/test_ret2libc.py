@@ -146,3 +146,65 @@ def test_recover_libc_base_needs_two_symbol_pointers():
     # real symbol pointers survive being mixed with stack junk
     assert rop.recover_libc_base(
         [0x7FFF12340000, base + syms["puts"], 0x40, base + syms["printf"]], ld) == base
+
+
+@pytest.fixture
+def pie_leak_bin(tmp_path_factory):
+    """A PIE binary that leaks a libc symbol pointer (stdout = &_IO_2_1_stdout_) then has a stack
+    overflow -- the analyst-assisted PIE ret2libc scenario."""
+    from lykos.analyze.dynamic import sandbox
+    if sandbox.host_arch() != "x86-64":
+        pytest.skip("x86-64 native only")
+    if not _SYS_LIBC:
+        pytest.skip("no system libc")
+    gcc = shutil.which("gcc") or shutil.which("cc")
+    if not gcc:
+        pytest.skip("no C compiler")
+    d = tmp_path_factory.mktemp("pier2l")
+    (d / "v.c").write_text(
+        '#include <stdio.h>\n#include <unistd.h>\n'
+        'void leaker(){ printf("leak:%p\\n", stdout); fflush(stdout); }\n'
+        'void pwn(){ char b[64]; read(0,b,400); }\n'
+        'int main(){ setvbuf(stdout,0,2,0); while(1){ leaker(); pwn(); } }\n')
+    exe = d / "v"
+    if subprocess.run([gcc, "-fpie", "-pie", "-fno-stack-protector", "-w",
+                       str(d / "v.c"), "-o", str(exe)], capture_output=True).returncode:
+        pytest.skip("cannot build PIE fixture")
+    return exe
+
+
+def test_analyst_ret2libc_pie_spawns_shell(pie_leak_bin):
+    """A PIE binary under ASLR is exploited to a real shell with NO pie_base: the analyst names the
+    leaked libc symbol, the harness resolves libc_base, and a pure-libc ROP calls system("/bin/sh")."""
+    ld = open(_SYS_LIBC, "rb").read()
+    res = leak.analyst_ret2libc(pie_leak_bin, pie_leak_bin.parent, offset=72, libc_data=ld,
+                                leak_sym="_IO_2_1_stdout_", timeout=8.0)
+    assert res["ok"], f"pure-libc ret2libc did not spawn a shell: {res.get('reason')}"
+    assert res["base"] % 0x1000 == 0
+    # leak_offset works the same as naming the symbol
+    off = rop.libc_symbols(ld, ("_IO_2_1_stdout_",))["_IO_2_1_stdout_"]
+    res2 = leak.analyst_ret2libc(pie_leak_bin, pie_leak_bin.parent, offset=72, libc_data=ld,
+                                 leak_offset=off, timeout=8.0)
+    assert res2["ok"]
+
+
+def test_exploit_stage_files_l3_pie_ret2libc(store, case, pool, pie_leak_bin):
+    """End-to-end through the ladder with strategy=ret2libc: a PIE binary under ASLR, given the
+    analyst's leak symbol, is driven to a CONFIRMED L3 PIE ret2libc (shell spawned, marker echoed)."""
+    from lykos.analyze.ingest import enqueue_triage, ingest
+    from lykos.analyze.poc import enqueue_exploit
+    from lykos.db.dao import PocDAO, TargetDAO
+    from lykos.jobs import JobQueue
+    t = ingest(store, case.id, pie_leak_bin, filename="v")
+    q = JobQueue(store.conn)
+    enqueue_triage(q, t, force=True)
+    assert pool.wait_idle(30)
+    TargetDAO(store.conn).update_triage(t.id, arch="x86-64", bits=64, endianness="little",
+                                        linking="dynamic", stripped=False,
+                                        mitigations={"pie": "on"}, file_type="elf")
+    run = enqueue_exploit(q, t, params={"strategy": "ret2libc", "offset": 72,
+                                        "leak_sym": "_IO_2_1_stdout_"})
+    assert pool.wait_idle(90) and q.runs.get(run.id).status == "done"
+    pocs = PocDAO(store.conn).list_by_target(t.id)
+    assert any(pc.level == "L3" and pc.verified for pc in pocs), \
+        f"no confirmed L3 PIE ret2libc (pocs={[(p.level, p.verified) for p in pocs]})"
