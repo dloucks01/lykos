@@ -225,6 +225,15 @@ def _libc_symbol_values(data: bytes) -> set:
     return vals
 
 
+# Distinctive libc symbols a real leak commonly discloses (FILE structs, environ, key functions);
+# a curated anchor set so a stack/PIE value can't coincidentally corroborate a bogus base.
+_LEAK_ANCHOR_SYMS = (
+    "_IO_2_1_stdout_", "_IO_2_1_stderr_", "_IO_2_1_stdin_", "stdout", "stderr", "stdin",
+    "environ", "__environ", "_environ", "_IO_file_jumps", "_IO_wfile_jumps",
+    "__libc_start_main", "__free_hook", "__malloc_hook", "system", "puts", "printf",
+    "read", "write", "malloc", "free", "setvbuf", "__stack_chk_fail", "exit")
+
+
 def recover_libc_base(leaked, libc_data: bytes):
     """Recover a libc's load base from leaked runtime pointers, the same page-offset method as
     exploit.recover_pie_base but anchored on the LIBC's own exported symbols. A leaked pointer to a
@@ -233,9 +242,15 @@ def recover_libc_base(leaked, libc_data: bytes):
     is cheap coincidence, so a base is accepted only when >=2 DISTINCT leaked slots corroborate it.
     Returns the page-aligned base or None. NOTE: a bare return-address-into-libc (e.g. the
     __libc_start_call_main return commonly on the stack) is NOT a symbol start and will not match --
-    that case needs a version-specific offset the caller must supply."""
+    that case needs a version-specific offset the caller must supply.
+
+    Anchored on a CURATED set of distinctive, commonly-leaked symbols (the _IO_ FILE structs,
+    environ, a few well-known functions) rather than all of libc's thousands: with thousands of
+    anchors a stack/PIE value coincidentally matches some symbol's page offset ~every time, so two
+    of them corroborate a bogus base (a leaked stack address masqueraded as libc). The curated set
+    keeps the real leaks (stdout/stderr/environ/puts...) while making a false 2-way match unlikely."""
     anchors: dict = {}
-    for va in _libc_symbol_values(libc_data):
+    for va in libc_symbols(libc_data, _LEAK_ANCHOR_SYMS).values():
         anchors.setdefault(va & 0xFFF, []).append(va)
     if not anchors:
         return None

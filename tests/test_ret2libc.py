@@ -316,3 +316,63 @@ def test_analyst_ret2libc_auto_mode_recovers_base(pie_leak_bin):
                                 timeout=6.0)   # no leak_sym: auto
     # single-symbol leak -> auto cannot corroborate -> honest failure (not a false success)
     assert res["ok"] is False
+
+
+def test_recover_libc_base_ignores_stack_junk():
+    """Curated anchors: >=2 real libc symbol pointers recover the base, but stack/PIE junk (which
+    with thousands of anchors used to coincidentally corroborate a bogus base) yields None."""
+    if not _SYS_LIBC:
+        pytest.skip("no system libc")
+    import random
+    ld = open(_SYS_LIBC, "rb").read()
+    syms = rop.libc_symbols(ld, ("_IO_2_1_stdout_", "_IO_2_1_stderr_"))
+    base = 0x7F4400000000
+    assert rop.recover_libc_base([base + syms["_IO_2_1_stdout_"],
+                                  base + syms["_IO_2_1_stderr_"]], ld) == base
+    random.seed(1)
+    junk = [random.randint(0x7FFC00000000, 0x7FFFFFFFFFFF) & ~0xF for _ in range(24)]
+    assert rop.recover_libc_base(junk, ld) is None
+
+
+@pytest.fixture
+def pie_fmtleak_bin(tmp_path_factory):
+    """PIE binary that leaks two libc symbols via a format string, then overflows -- the shape
+    strategy=auto should solve with NO analyst config (auto leak classification)."""
+    from lykos.analyze.dynamic import sandbox
+    if sandbox.host_arch() != "x86-64" or not _SYS_LIBC:
+        pytest.skip("x86-64 + system libc required")
+    gcc = shutil.which("gcc") or shutil.which("cc")
+    if not gcc:
+        pytest.skip("no C compiler")
+    d = tmp_path_factory.mktemp("pieauto")
+    (d / "v.c").write_text(
+        '#include <stdio.h>\n#include <unistd.h>\n'
+        'void lk(){ char b[64]; read(0,b,64); printf(b, stdout, stderr); puts(""); }\n'
+        'void pw(){ char b[64]; read(0,b,400); }\n'
+        'int main(){ setvbuf(stdout,0,2,0); while(1){ lk(); pw(); } }\n')
+    exe = d / "v"
+    if subprocess.run([gcc, "-fpie", "-pie", "-fno-stack-protector", "-w", str(d / "v.c"),
+                       "-o", str(exe)], capture_output=True).returncode:
+        pytest.skip("build failed")
+    return exe
+
+
+def test_strategy_auto_pie_ret2libc(store, case, pool, pie_fmtleak_bin):
+    """End-to-end: strategy=auto on a PIE target with a reachable format-string libc leak reaches a
+    CONFIRMED L3 with NO analyst leak config -- auto_provoke_leak + recover_libc_base do it."""
+    from lykos.analyze.ingest import enqueue_triage, ingest
+    from lykos.analyze.poc import enqueue_exploit
+    from lykos.db.dao import PocDAO, TargetDAO
+    from lykos.jobs import JobQueue
+    t = ingest(store, case.id, pie_fmtleak_bin, filename="v")
+    q = JobQueue(store.conn)
+    enqueue_triage(q, t, force=True)
+    assert pool.wait_idle(30)
+    TargetDAO(store.conn).update_triage(t.id, arch="x86-64", bits=64, endianness="little",
+                                        linking="dynamic", stripped=False,
+                                        mitigations={"pie": "on"}, file_type="elf")
+    run = enqueue_exploit(q, t, params={"strategy": "auto", "offset": 72})   # NO leak config
+    assert pool.wait_idle(120) and q.runs.get(run.id).status == "done"
+    pocs = PocDAO(store.conn).list_by_target(t.id)
+    assert any(pc.level == "L3" and pc.verified for pc in pocs), \
+        f"strategy=auto did not auto-solve PIE ret2libc (pocs={[(p.level, p.verified) for p in pocs]})"
