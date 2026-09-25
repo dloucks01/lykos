@@ -94,6 +94,63 @@ def build_ret2csu(offset, pop, call, ptr, edi, rsi, rdx, length, rbx=0, rbp=0):
     return bytes(body)
 
 
+def find_one_gadgets(data: bytes):
+    """One-gadget candidates in a libc image: addresses that reach `execve("/bin/sh", ...)` in a
+    single jump. Found without the external `one_gadget` tool (air-gap) by the byte pattern
+    `lea rdi,[rip -> "/bin/sh"]` (48 8d 3d <disp32>) followed within a short window by a call to
+    execve or an execve syscall (rax=0x3b; 0f 05). Jumping to the lea sets rdi="/bin/sh"; the site
+    fires execve iff rsi and rdx are NULL at that moment -- so the constraint is recorded (whether
+    the window zeroes them inline, in which case there is no precondition). Returns
+    [{offset, constraint, execve}] sorted by offset (offset = VA of the lea = the one-gadget)."""
+    segs = _loads(data)
+    if not segs:
+        return []
+    binsh = find_string(data, b"/bin/sh")
+    if binsh is None:
+        return []
+    syms = libc_symbols(data, ["execve"])
+    execve_va = syms.get("execve")
+    out, seen = [], set()
+    for off, sz, va, fl in segs:
+        if not (fl & 1):
+            continue
+        seg = data[off:off + sz]
+        i = 0
+        while True:
+            j = seg.find(b"\x48\x8d\x3d", i)             # lea rdi, [rip + disp32]
+            if j < 0 or j + 7 > len(seg):
+                break
+            i = j + 1
+            disp = int.from_bytes(seg[j + 3:j + 7], "little", signed=True)
+            site = va + j
+            if site + 7 + disp != binsh:                 # rdi must resolve to "/bin/sh"
+                continue
+            win = seg[j + 7:j + 7 + 80]                  # look ahead for the execve call/syscall
+            fires = False
+            for k in range(0, len(win) - 4):
+                if execve_va is not None and win[k] == 0xE8:   # call rel32 -> execve
+                    tgt = (va + j + 7 + k) + 5 + int.from_bytes(win[k + 1:k + 5], "little", signed=True)
+                    if tgt == execve_va:
+                        fires = True
+                        break
+                if win[k] == 0xB8 and win[k + 1:k + 5] == b"\x3b\x00\x00\x00":   # mov eax,0x3b
+                    fires = True
+                    break
+                if win[k:k + 7] == b"\x48\xc7\xc0\x3b\x00\x00\x00":              # mov rax,0x3b
+                    fires = True
+                    break
+            if not fires:
+                continue
+            zsi = any(p in win for p in (b"\x31\xf6", b"\x45\x31\xf6", b"\x48\x31\xf6"))  # xor esi,esi
+            zdx = any(p in win for p in (b"\x31\xd2", b"\x45\x31\xd2", b"\x48\x31\xd2"))  # xor edx,edx
+            constraint = "none (rsi/rdx zeroed inline)" if (zsi and zdx) else \
+                ("rdx==NULL" if zsi else ("rsi==NULL" if zdx else "rsi==NULL && rdx==NULL"))
+            if site not in seen:
+                seen.add(site)
+                out.append({"offset": site, "constraint": constraint, "execve": execve_va})
+    return sorted(out, key=lambda g: g["offset"])
+
+
 def find_string(data: bytes, s: bytes):
     """VA of byte string `s` (NUL-terminated form preferred) in a loaded segment, or None."""
     segs = _loads(data)
