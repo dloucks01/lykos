@@ -93,3 +93,40 @@ def test_ret2libc_leak_spawns_a_shell(r2l_bin):
                              timeout=8.0)
     assert res["ok"], f"ret2libc did not confirm a shell: {res.get('reason')} (leaked={res.get('leaked')})"
     assert res["base"] % 0x1000 == 0                     # a real, page-aligned libc base was recovered
+
+
+# --- integration: the exploit stage picks ret2libc-leak and files a confirmed L3 -----------------
+@pytest.fixture
+def pool(store):
+    from lykos.analyze import register
+    from lykos.jobs import JobConfig, WorkerPool
+    register()
+    p = WorkerPool(store.db_path, store.content, JobConfig(workers=2, poll_interval=0.02))
+    p.start()
+    try:
+        yield p
+    finally:
+        p.stop(grace=3.0)
+
+
+def test_exploit_stage_files_l3_ret2libc(store, case, pool, r2l_bin):
+    """End-to-end through the ladder: a no-PIE binary importing puts (not system) under ASLR is
+    driven by the exploit stage to a CONFIRMED L3 ret2libc PoC (a shell spawns and echoes a marker),
+    with no /bin/sh string or system@plt in the image."""
+    from lykos.analyze.ingest import enqueue_triage, ingest
+    from lykos.analyze.poc import enqueue_exploit
+    from lykos.db.dao import PocDAO, TargetDAO
+    from lykos.jobs import JobQueue
+    t = ingest(store, case.id, r2l_bin, filename="v")
+    q = JobQueue(store.conn)
+    enqueue_triage(q, t, force=True)
+    assert pool.wait_idle(30)
+    # pin the denorm fields the plan gates on (a tiny asm-light binary can trip tool-based triage)
+    TargetDAO(store.conn).update_triage(t.id, arch="x86-64", bits=64, endianness="little",
+                                        linking="dynamic", stripped=False,
+                                        mitigations={"pie": "off"}, file_type="elf")
+    run = enqueue_exploit(q, t, params={"offset": 40})
+    assert pool.wait_idle(90) and q.runs.get(run.id).status == "done"
+    pocs = PocDAO(store.conn).list_by_target(t.id)
+    assert any(pc.level == "L3" and pc.verified for pc in pocs), \
+        f"no confirmed L3 ret2libc PoC (pocs={[(p.level, p.verified) for p in pocs]})"
