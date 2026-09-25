@@ -17,6 +17,7 @@ CWE = {
     "CWE-78":  ("OS Command Injection", "high"),
     "CWE-190": ("Integer Overflow or Wraparound", "medium"),
     "CWE-22":  ("Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')", "high"),
+    "CWE-789": ("Memory Allocation with Excessive Size Value", "medium"),
     "CWE-259": ("Use of Hard-coded Password", "high"),
     "CWE-321": ("Use of Hard-coded Cryptographic Key", "high"),
     "CWE-798": ("Use of Hard-coded Credentials", "high"),
@@ -58,6 +59,7 @@ CWE_DESC = {
     "CWE-78":  "Untrusted input reaches a shell/command, letting an attacker run arbitrary OS commands.",
     "CWE-190": "An arithmetic operation wraps past the integer's range, producing a wrong (often tiny) size or index.",
     "CWE-22":  "A filesystem path is built from untrusted input without restriction, so \"../\" or an absolute path lets an attacker read or write files outside the intended directory.",
+    "CWE-789": "An allocation size is taken from untrusted input, so an attacker can force a huge allocation (denial of service) or, if the size arithmetic wraps, a too-small buffer that is then overflowed.",
     "CWE-259": "A password is hard-coded in the binary, so anyone who reads it gains access.",
     "CWE-321": "A cryptographic key is hard-coded in the binary, so the key is not secret.",
     "CWE-798": "Credentials are embedded in the code, usable by anyone who inspects the binary.",
@@ -115,6 +117,12 @@ DANGEROUS = {
     "unlinkat": ("CWE-22",  "low",    "unlinkat -- check the path is not attacker-controlled"),
     "remove":   ("CWE-22",  "low",    "remove -- check the path is not attacker-controlled"),
     "rename":   ("CWE-22",  "low",    "rename -- check the paths are not attacker-controlled"),
+    # CWE-789 allocation size: a defect only when the SIZE is attacker-controlled (huge alloc / a
+    # wrapped size arithmetic that under-allocates). Advisory on its own; corroborated by taint.
+    "malloc":   ("CWE-789", "low",    "malloc -- check the size is not attacker-controlled"),
+    "calloc":   ("CWE-789", "low",    "calloc -- check the count/size are not attacker-controlled"),
+    "realloc":  ("CWE-789", "low",    "realloc -- check the size is not attacker-controlled"),
+    "reallocarray": ("CWE-789", "low", "reallocarray -- check the count/size are not attacker-controlled"),
 }
 
 # APIs whose presence is worth REPORTING but is not by itself a defect claim. `memcpy` is a
@@ -128,7 +136,9 @@ ADVISORY = {"strncpy", "memcpy", "memmove", "printf", "fprintf", "snprintf", "sy
             # a file op is a path-traversal defect only when its PATH is tainted -- corroborated by
             # the taint channel, not asserted from the call's mere presence.
             "fopen", "freopen", "open", "open64", "openat", "creat", "opendir",
-            "unlink", "unlinkat", "remove", "rename"}
+            "unlink", "unlinkat", "remove", "rename",
+            # an allocation is a CWE-789 defect only when its SIZE is tainted, not on its presence.
+            "malloc", "calloc", "realloc", "reallocarray"}
 
 # untrusted-input source functions (normalized) for reachability correlation
 SOURCES = {
@@ -207,6 +217,11 @@ SINK_TAINT_ARGS = {
     "unlinkat": frozenset({1}),                   # unlinkat(dirfd, path, flags)
     "remove":   frozenset({0}),                   # remove(path)
     "rename":   frozenset({0, 1}),                # rename(oldpath, newpath)
+    # CWE-789 allocation size: the SIZE argument (and the count for the calloc family).
+    "malloc":   frozenset({0}),                   # malloc(size)
+    "calloc":   frozenset({0, 1}),                # calloc(count, size)
+    "realloc":  frozenset({1}),                   # realloc(ptr, size)
+    "reallocarray": frozenset({0, 1}),            # reallocarray(ptr, count, size)
 }
 
 
