@@ -13,7 +13,7 @@ DETECT_STAGE = "detect_cwe"
 # reset_candidate_sites/prune_empty_findings never touch their findings.
 _STATIC_DETECTORS = ("dangerous_api", "stack_frame", "hardcoded_secrets", "weak_crypto", "weak_random",
                      "insecure_tmp", "toctou", "toctou_race", "hardening", "tainted_deref",
-                     "int_overflow_check")
+                     "int_overflow_check", "scanf_bounded_overflow", "heap_fptr_call", "lang_sinks")
 TOOL = "detect"
 # -2: CWE-121 gated on the copy destination resolving to the stack frame. -3: re-detection is
 # idempotent. -4: the gate is arg0-only (scanf/sscanf no longer suppressed), works on x86-64/arm/
@@ -341,7 +341,8 @@ def detect_stage(ctx) -> dict:
         functions=functions,
         mitigations=target.mitigations or {}, frames=frames,
         func_irs=func_irs, bits=int(getattr(target, "bits", 0) or 0),
-        arch=getattr(target, "arch", "") or "")
+        arch=getattr(target, "arch", "") or "",
+        toolchain=getattr(target, "toolchain_hint", "") or "")
 
     ctx.progress(msg="running CWE detectors")
     # Two detectors are OPT-IN, and the reason is measured rather than felt. On jhead they are

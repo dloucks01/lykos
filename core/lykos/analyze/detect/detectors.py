@@ -33,6 +33,7 @@ class DetectContext:
     func_irs: dict = field(default_factory=dict)      # func addr -> IR {blocks,edges} (call-site disasm)
     bits: int = 0                                     # target word size (32/64), for arg-passing ABI
     arch: str = "x86"                                 # target arch; the CWE-121 dest gate is x86-only
+    toolchain: str = ""                               # source language / toolchain (go, rust, c++, ...)
 
 
 def _cand(cwe, title, severity, detector, evidence, *, function_addr=None,
@@ -66,6 +67,89 @@ def dangerous_api(ctx: DetectContext):
             dedup_key=f"{cwe}:dangerous_api:{n}",
             confidence=0.4)
         cand["api"] = n
+        out.append(cand)
+    return out
+
+
+# -------------------------------------------------- Go / Rust language-aware sinks (call-graph)
+# Go and Rust are memory-safe, so their bugs are not overflows but INJECTION / TRAVERSAL / SSRF
+# through the standard library: a runtime command, path, SQL query or URL built from untrusted
+# input. The C data-flow taint does not apply (different ABI/runtime), but the call graph does --
+# retained package.function symbols name the sink and the source. Flag the sink, and corroborate
+# when an untrusted-input source reaches it over the call graph. Substring-matched against the
+# recovered names (rizin renders `os/exec.Command` as `os_exec.Command`, etc.).
+_GO_SINKS = (
+    ("exec.Command", "CWE-78", "high", "OS command execution (os/exec.Command) with a runtime argument"),
+    ("exec.CommandContext", "CWE-78", "high", "OS command execution (os/exec.CommandContext)"),
+    ("os.StartProcess", "CWE-78", "high", "process execution with a runtime path"),
+    ("syscall.Exec", "CWE-78", "high", "syscall.Exec with a runtime path"),
+    ("os.OpenFile", "CWE-22", "medium", "file open with a runtime path"),
+    ("os.Open", "CWE-22", "medium", "file open with a runtime path"),
+    ("os.ReadFile", "CWE-22", "medium", "file read with a runtime path"),
+    ("os.Create", "CWE-22", "medium", "file create with a runtime path"),
+    ("os.Remove", "CWE-22", "medium", "file remove with a runtime path"),
+    ("ioutil.ReadFile", "CWE-22", "medium", "file read with a runtime path"),
+    ("sql._DB_.Query", "CWE-89", "high", "SQL query built at runtime"),
+    ("sql._DB_.Exec", "CWE-89", "high", "SQL statement built at runtime"),
+    ("sql._DB_.QueryRow", "CWE-89", "high", "SQL query built at runtime"),
+    ("http.Get", "CWE-918", "medium", "outbound HTTP request to a runtime URL (SSRF)"),
+    ("http.Post", "CWE-918", "medium", "outbound HTTP request to a runtime URL (SSRF)"),
+    ("template.HTML", "CWE-79", "medium", "unescaped HTML from a runtime value (XSS)"),
+)
+_RUST_SINKS = (
+    ("process..Command", "CWE-78", "high", "OS command execution (std::process::Command)"),
+    ("Command..new", "CWE-78", "high", "OS command execution (std::process::Command::new)"),
+    ("fs..read", "CWE-22", "medium", "file read with a runtime path (std::fs)"),
+    ("File..open", "CWE-22", "medium", "file open with a runtime path (std::fs::File)"),
+    ("File..create", "CWE-22", "medium", "file create with a runtime path"),
+)
+# Untrusted-input sources (call-graph reachability). Go: argv/env/flags, stdin readers, HTTP req.
+_GO_SOURCES = ("os.Args", "os.Getenv", "flag._FlagSet_", "bufio._Reader_.Read", "bufio._Scanner_.",
+               "http._Request_", "ioutil.ReadAll", "io.ReadAll", "os.Stdin")
+_RUST_SOURCES = ("env..args", "env..var", "io..stdin", "read_line", "read_to_string")
+
+
+@register_detector
+def lang_sinks(ctx: DetectContext):
+    tc = (ctx.toolchain or "").lower()
+    # detect language from the toolchain hint, or fall back to the call graph (Go has runtime.*).
+    is_go = tc == "go" or any("runtime." in (e.dst_name or "") for e in ctx.call_edges)
+    is_rust = tc == "rust"
+    if not (is_go or is_rust):
+        return []
+    sinks = _GO_SINKS if is_go else _RUST_SINKS
+    sources = _GO_SOURCES if is_go else _RUST_SOURCES
+
+    def _hit(name, needles):
+        n = name or ""
+        return any(k in n for k in needles)
+    src_fns = {e.src_addr for e in ctx.call_edges if _hit(e.dst_name, sources)}
+    callers = defaultdict(set)
+    for e in ctx.call_edges:
+        if e.dst_addr:
+            callers[e.dst_addr].add(e.src_addr)
+    lang = "go" if is_go else "rust"
+    out, seen = [], set()
+    for e in ctx.call_edges:
+        hit = next(((cwe, sev, desc) for pat, cwe, sev, desc in sinks
+                    if e.dst_name and pat in e.dst_name), None)
+        if not hit:
+            continue
+        cwe, sev, desc = hit
+        reachable = e.src_addr is not None and reaches_within(e.src_addr, src_fns, callers)
+        key = (cwe, e.dst_name, e.src_addr)
+        if key in seen:
+            continue
+        seen.add(key)
+        cand = _cand(
+            cwe, f"{desc} ({lang})", sev, "lang_sinks",
+            [{"channel": "pattern", "detail": f"{lang} sink {e.dst_name}() at {e.site_addr}"}]
+            + ([{"channel": "taint-reachability",
+                 "detail": "untrusted input reaches this sink (call graph)"}] if reachable else []),
+            function_addr=e.src_addr, site_addr=e.site_addr,
+            dedup_key=f"{cwe}:lang_sinks:{e.dst_name}",
+            state="corroborated" if reachable else "candidate",
+            confidence=0.7 if reachable else 0.4)
         out.append(cand)
     return out
 
