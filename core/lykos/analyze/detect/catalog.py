@@ -16,6 +16,7 @@ CWE = {
     "CWE-676": ("Use of Potentially Dangerous Function", "medium"),
     "CWE-78":  ("OS Command Injection", "high"),
     "CWE-190": ("Integer Overflow or Wraparound", "medium"),
+    "CWE-22":  ("Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')", "high"),
     "CWE-259": ("Use of Hard-coded Password", "high"),
     "CWE-321": ("Use of Hard-coded Cryptographic Key", "high"),
     "CWE-798": ("Use of Hard-coded Credentials", "high"),
@@ -56,6 +57,7 @@ CWE_DESC = {
     "CWE-676": "A function that is easy to misuse (e.g. strcpy, alloca) is used without the required safeguards.",
     "CWE-78":  "Untrusted input reaches a shell/command, letting an attacker run arbitrary OS commands.",
     "CWE-190": "An arithmetic operation wraps past the integer's range, producing a wrong (often tiny) size or index.",
+    "CWE-22":  "A filesystem path is built from untrusted input without restriction, so \"../\" or an absolute path lets an attacker read or write files outside the intended directory.",
     "CWE-259": "A password is hard-coded in the binary, so anyone who reads it gains access.",
     "CWE-321": "A cryptographic key is hard-coded in the binary, so the key is not secret.",
     "CWE-798": "Credentials are embedded in the code, usable by anyone who inspects the binary.",
@@ -100,6 +102,19 @@ DANGEROUS = {
     "fprintf":  ("CWE-134", "low",    "fprintf -- check the format string is not tainted"),
     "snprintf": ("CWE-134", "low",    "snprintf -- check the format string is not tainted"),
     "syslog":   ("CWE-134", "low",    "syslog -- check the format string is not tainted"),
+    # CWE-22 path traversal: a file operation whose PATH is built at runtime. Advisory on its own
+    # (every program opens files); a defect only when taint shows the path is attacker-controlled.
+    "fopen":    ("CWE-22",  "low",    "fopen -- check the path is not attacker-controlled"),
+    "freopen":  ("CWE-22",  "low",    "freopen -- check the path is not attacker-controlled"),
+    "open":     ("CWE-22",  "low",    "open -- check the path is not attacker-controlled"),
+    "open64":   ("CWE-22",  "low",    "open -- check the path is not attacker-controlled"),
+    "openat":   ("CWE-22",  "low",    "openat -- check the path is not attacker-controlled"),
+    "creat":    ("CWE-22",  "low",    "creat -- check the path is not attacker-controlled"),
+    "opendir":  ("CWE-22",  "low",    "opendir -- check the path is not attacker-controlled"),
+    "unlink":   ("CWE-22",  "low",    "unlink -- check the path is not attacker-controlled"),
+    "unlinkat": ("CWE-22",  "low",    "unlinkat -- check the path is not attacker-controlled"),
+    "remove":   ("CWE-22",  "low",    "remove -- check the path is not attacker-controlled"),
+    "rename":   ("CWE-22",  "low",    "rename -- check the paths are not attacker-controlled"),
 }
 
 # APIs whose presence is worth REPORTING but is not by itself a defect claim. `memcpy` is a
@@ -109,7 +124,11 @@ DANGEROUS = {
 # on it made two thirds of jhead's report read "corroborated", which should mean a second
 # channel agreed a defect exists. The channels that CAN answer them are bounds (a proven
 # length) and taint (which argument the bytes reach).
-ADVISORY = {"strncpy", "memcpy", "memmove", "printf", "fprintf", "snprintf", "syslog"}
+ADVISORY = {"strncpy", "memcpy", "memmove", "printf", "fprintf", "snprintf", "syslog",
+            # a file op is a path-traversal defect only when its PATH is tainted -- corroborated by
+            # the taint channel, not asserted from the call's mere presence.
+            "fopen", "freopen", "open", "open64", "openat", "creat", "opendir",
+            "unlink", "unlinkat", "remove", "rename"}
 
 # untrusted-input source functions (normalized) for reachability correlation
 SOURCES = {
@@ -176,6 +195,18 @@ SINK_TAINT_ARGS = {
     # `gets` is intentionally absent: its only argument is the destination, so no argument
     # position makes it "more" of a bug -- it is unconditionally unsafe and the rule channel
     # already reports it.
+    # CWE-22 path traversal: the PATH argument is what an attacker controls to escape the directory.
+    "fopen":    frozenset({0}),                   # fopen(path, mode)
+    "freopen":  frozenset({0}),                   # freopen(path, mode, stream)
+    "open":     frozenset({0}),                   # open(path, flags, ...)
+    "open64":   frozenset({0}),
+    "openat":   frozenset({1}),                   # openat(dirfd, path, flags, ...)
+    "creat":    frozenset({0}),                   # creat(path, mode)
+    "opendir":  frozenset({0}),                   # opendir(path)
+    "unlink":   frozenset({0}),                   # unlink(path)
+    "unlinkat": frozenset({1}),                   # unlinkat(dirfd, path, flags)
+    "remove":   frozenset({0}),                   # remove(path)
+    "rename":   frozenset({0, 1}),                # rename(oldpath, newpath)
 }
 
 
