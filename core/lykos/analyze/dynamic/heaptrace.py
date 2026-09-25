@@ -118,6 +118,7 @@ if __name__ == "__main__":                                            # ---- the
     import os
     import signal
     import sys
+    import threading
 
     PTRACE_TRACEME, PTRACE_PEEKTEXT, PTRACE_PEEKUSER, PTRACE_POKETEXT, PTRACE_POKEUSER = 0, 1, 3, 4, 6
     PTRACE_CONT, PTRACE_SINGLESTEP, PTRACE_GETREGS, PTRACE_SETREGS = 7, 9, 12, 13
@@ -173,8 +174,21 @@ if __name__ == "__main__":                                            # ---- the
             except OSError:
                 os._exit(127)
         os.close(r)
-        os.write(w, stdin_bytes)
-        os.close(w)                                      # EOF ends the target's read loop
+        # Feed stdin from a thread: the target is stopped at its execv trap and has not started
+        # reading, so a stdin_bytes larger than the ~64 KB pipe buffer would block this write with
+        # no timeout yet armed (the SIGALRM is set up further down). A daemon thread writes and
+        # closes w (EOF ends the target's read loop) without ever blocking the tracer.
+        def _feed_stdin():
+            try:
+                os.write(w, stdin_bytes)
+            except OSError:
+                pass
+            finally:
+                try:
+                    os.close(w)
+                except OSError:
+                    pass
+        threading.Thread(target=_feed_stdin, daemon=True).start()
 
         os.waitpid(pid, 0)                               # initial stop at execv
 

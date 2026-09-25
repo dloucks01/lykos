@@ -534,10 +534,15 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
                     flaky += 1
                     continue
                 crashes_reproducible += 1
-                # A bucket is (signal, faulting address): the same signal from a different
-                # instruction is a different defect, and treating them as one hid every bug
-                # after the first behind whichever crashed soonest.
-                bucket = (res.signal_name, res.fault_pc)
+                # A bucket is (signal, faulting address, sanitizer defect): the same signal from a
+                # different instruction is a different defect, and -- because every ASan abort
+                # faults at the SAME PC (the abort machinery) -- distinct sanitizer defects must be
+                # separated by their defect_key too, or every bug after the first is hidden behind
+                # whichever crashed soonest. defect_key MUST be part of the bucket (not computed
+                # later), since the bucket is what gates whether a finding is filed at all.
+                sig = res.signal_name
+                defect_key = asan_defect_key(res.stderr) if sig == "SIGABRT" else None
+                bucket = (sig, res.fault_pc, defect_key)
                 # Explore near crashers -- while they are still telling us something. Kept
                 # unconditionally, one reproducible crash takes the corpus over: jhead crashed
                 # on 8,516 of 20,000 executions, all the same defect, and block coverage fell
@@ -550,9 +555,6 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
                         corpus[rng.randrange(len(corpus))] = data
                 if bucket not in seen_sigs:
                     seen_sigs[bucket] = 1
-                    sig = res.signal_name
-                    # sanitizer SIGABRT -> discriminate distinct defects that both abort
-                    defect_key = asan_defect_key(res.stderr) if sig == "SIGABRT" else None
 
                     def _same(d, _sig=sig, _prefix=run_argv):
                         # Minimize under the SAME invocation the crash was found and confirmed

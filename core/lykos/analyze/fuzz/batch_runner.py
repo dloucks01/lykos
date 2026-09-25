@@ -448,7 +448,12 @@ def main():
         data = _readn(ln)
         # "@@" marks where the target wants its input; without it the carrier is appended.
         if mode == "arg":
-            carrier = data.split(b"\x00", 1)[0].decode("latin-1")
+            # RAW bytes, never latin-1-decoded: a str carrier is fs-encoded (UTF-8 + surrogate-
+            # escape) by os.execv/subprocess, so an input byte >= 0x80 becomes a 2-byte UTF-8
+            # sequence and the target sees DIFFERENT argv bytes under batching than under the
+            # per-exec runner (which delivers argv as bytes) -- crashes then reproduce flakily and
+            # get dropped. Build a bytes argv so the bytes pass through verbatim.
+            carrier = data.split(b"\x00", 1)[0]
         elif mode == "file":
             with open(wf, "wb") as fh:
                 fh.write(data)
@@ -457,6 +462,13 @@ def main():
             carrier = None
         if carrier is None:
             argv, stdin = [exe] + base_argv, data
+        elif isinstance(carrier, bytes):
+            eb, bargs = os.fsencode(exe), [os.fsencode(a) for a in base_argv]
+            if b"@@" in bargs:
+                argv = [eb] + [carrier if a == b"@@" else a for a in bargs]
+            else:
+                argv = [eb] + bargs + [carrier]
+            stdin = b""
         elif "@@" in base_argv:
             argv = [exe] + [carrier if a == "@@" else a for a in base_argv]
             stdin = b""

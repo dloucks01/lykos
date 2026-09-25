@@ -19,10 +19,78 @@ import signal
 import struct
 import subprocess
 import tempfile
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
+
+# Cap on captured child output. communicate() buffered the child's ENTIRE stdout/stderr, so a
+# flooding target could OOM the worker; beyond this the reader keeps draining but discards.
+_MAX_OUTPUT_CAPTURE = 16 << 20  # 16 MiB per stream
+
+
+def _drain_capped(stream, sink: bytearray) -> None:
+    try:
+        while True:
+            chunk = stream.read(65536)
+            if not chunk:
+                break
+            if len(sink) < _MAX_OUTPUT_CAPTURE:
+                sink.extend(chunk[: _MAX_OUTPUT_CAPTURE - len(sink)])
+    except (OSError, ValueError):
+        pass
+    finally:
+        try:
+            stream.close()
+        except OSError:
+            pass
+
+
+def _feed_stdin(stream, data: bytes) -> None:
+    try:
+        if data:
+            stream.write(data)
+    except (OSError, ValueError):
+        pass
+    finally:
+        try:
+            stream.close()
+        except OSError:
+            pass
+
+
+def _communicate_capped(proc, input_bytes, timeout):
+    """communicate(), but stdout/stderr drain into BOUNDED buffers (a flooding child cannot OOM
+    the worker) and stdin is fed from a thread (so a large input cannot deadlock against a full
+    output pipe). Returns (out, err, timed_out); on timeout the whole process group is killed.
+    out/err are None for a stream that was not piped, matching subprocess.communicate."""
+    out = bytearray() if proc.stdout is not None else None
+    err = bytearray() if proc.stderr is not None else None
+    threads = []
+    if proc.stdin is not None:
+        threads.append(threading.Thread(target=_feed_stdin,
+                                        args=(proc.stdin, input_bytes or b""), daemon=True))
+    if out is not None:
+        threads.append(threading.Thread(target=_drain_capped, args=(proc.stdout, out), daemon=True))
+    if err is not None:
+        threads.append(threading.Thread(target=_drain_capped, args=(proc.stderr, err), daemon=True))
+    for t in threads:
+        t.start()
+    timed = False
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed = True
+        _killpg(proc)
+        try:
+            proc.wait(timeout=5)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+    for t in threads:
+        t.join(timeout=5)
+    return (bytes(out) if out is not None else None,
+            bytes(err) if err is not None else None, timed)
 
 CRASH_SIGNALS = {
     int(signal.SIGSEGV): "SIGSEGV", int(signal.SIGABRT): "SIGABRT",
@@ -496,15 +564,9 @@ def run_reaped(cmd, *, input=None, timeout=None, capture_output=False, **kw):
     # reading the server's stdin, the same hang class fixed in jobs.context.run_subprocess.
     stdin = subprocess.PIPE if input is not None else kw.pop("stdin", subprocess.DEVNULL)
     proc = subprocess.Popen(cmd, stdin=stdin, **kw)
-    try:
-        out, err = proc.communicate(input=input, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        _killpg(proc)
-        try:
-            proc.communicate(timeout=5)
-        except Exception:
-            pass
-        raise
+    out, err, timed = _communicate_capped(proc, input, timeout)
+    if timed:
+        raise subprocess.TimeoutExpired(cmd, timeout, output=out, stderr=err)
     return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
 
 
@@ -516,17 +578,8 @@ def _spawn(cmd, stdin, timeout, preexec, env=None):
                              preexec_fn=preexec, env=env)
     except Exception as e:
         return None, b"", ("spawn failed: %r" % e).encode(), False, 0
-    timed = False
-    try:
-        out, err = p.communicate(input=stdin, timeout=timeout)
-        rc = p.returncode
-    except subprocess.TimeoutExpired:
-        _killpg(p)
-        try:
-            out, err = p.communicate(timeout=5)
-        except Exception:
-            out, err = b"", b""
-        rc, timed = None, True
+    out, err, timed = _communicate_capped(p, stdin, timeout)
+    rc = None if timed else p.returncode
     dur = int((time.monotonic() - start) * 1000)
     return rc, out or b"", err or b"", timed, dur
 

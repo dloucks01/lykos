@@ -75,7 +75,8 @@ def _validate(ctx, target, exe, mode, workfile, generated, exec_timeout, base_ar
         data = base64.b64decode(g["input_b64"])
         argv, stdin = invocation(mode, workfile, data, base_argv)   # honour the target's flags / `@@`
         r = sandbox.run(exe, argv=argv, stdin=(stdin if mode == "stdin" else b""),
-                        timeout=exec_timeout, arch=target.arch)
+                        timeout=exec_timeout, arch=target.arch,
+                        endianness=target.endianness, bits=target.bits)
         input_sha = ctx.put_artifact("concolic-input", data=data)
         dd.insert(target.id, target.case_id, run_id=ctx.run_id, input_sha=input_sha,
                   input_mode=mode, argv=[], exit_code=r.exit_code, signal=r.signal,

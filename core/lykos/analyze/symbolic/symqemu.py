@@ -63,12 +63,18 @@ def run_once(symqemu: Path, target: Path, seed: bytes, out_dir: Path, *, mode: s
         stdin = seed
     cmd = [str(symqemu), str(target)] + argv
     import subprocess
+
+    from ..dynamic import sandbox
+    # Bound memory + CPU so a legitimately runaway target under SymQEMU cannot exhaust the host.
+    # (Full bwrap containment is out of scope for this trusted-operator deployment.)
+    rlimit = sandbox._rlimits(2048, int(timeout) + 2, set_as=True)
     if ctx is not None:
         proc = ctx.run_subprocess(cmd, timeout=timeout, env=env,
-                                  stdin=subprocess.PIPE if stdin else None)
+                                  stdin=subprocess.PIPE if stdin else None,
+                                  preexec_fn=rlimit)
         return proc.returncode
     proc = subprocess.run(cmd, input=stdin or None, env=env, capture_output=True,
-                          timeout=timeout, check=False)
+                          timeout=timeout, check=False, preexec_fn=rlimit)
     return proc.returncode
 
 

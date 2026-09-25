@@ -242,11 +242,16 @@ def coverage_stage(ctx) -> dict:
 
     def _replay(data):
         if cover_blocks:
-            b = sandbox.run_batch(exe, [data], mode=mode, timeout=exec_timeout, blocks=cover_blocks)
+            # arch/endianness/bits MUST be passed: without them run_batch's cross-arch guard sees
+            # arch=None and execs a foreign-arch binary natively (rc 127, "not crashed") instead of
+            # routing through qemu -- so it returns a truthy non-crash and every AFL crash on an
+            # emulated target is silently dropped.
+            b = sandbox.run_batch(exe, [data], mode=mode, timeout=exec_timeout, blocks=cover_blocks,
+                                  arch=target.arch, endianness=target.endianness, bits=target.bits)
             if b:
                 return b[0]
         return run_input(exe, mode, workfile, exec_timeout, target.arch, data,
-                         blocks=cover_blocks)[1]
+                         blocks=cover_blocks, endianness=target.endianness, bits=target.bits)[1]
 
     for data in raw:
         if ctx.should_cancel():
@@ -256,10 +261,11 @@ def coverage_stage(ctx) -> dict:
             continue                                  # not reproducible in our sandbox
         sig = res.signal_name
         defect_key = asan_defect_key(res.stderr) if sig == "SIGABRT" else None
-        # Bucket by (signal, fault site), not signal alone: every SIGSEGV in a program is the
-        # same signal but not the same bug, and de-duping on the name collapsed distinct
-        # defects into one finding. AFL's crashes/ are already coverage-unique.
-        key = (sig, res.fault_pc)
+        # Bucket by (signal, fault site, sanitizer defect), not signal alone: every SIGSEGV in a
+        # program is the same signal but not the same bug, and every ASan abort faults at the SAME
+        # PC (the abort machinery), so distinct sanitizer defects must be separated by their
+        # defect_key or only the first is filed as a finding (the rest record a dyn_result only).
+        key = (sig, res.fault_pc, defect_key)
         if key in seen_crashes:
             input_sha = ctx.put_artifact("afl-crash-input", data=data)
             dd.insert(target.id, target.case_id, run_id=ctx.run_id, input_sha=input_sha,
@@ -273,7 +279,8 @@ def coverage_stage(ctx) -> dict:
         seen_crashes.add(key)
 
         def _same(d, _sig=sig):
-            r = run_input(exe, mode, workfile, exec_timeout, target.arch, d)[1]
+            r = run_input(exe, mode, workfile, exec_timeout, target.arch, d,
+                          endianness=target.endianness, bits=target.bits)[1]
             return r.crashed and r.signal_name == _sig
 
         mdata, _ = minimize(_same, data, cap=200)
