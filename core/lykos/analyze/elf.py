@@ -9,6 +9,7 @@ from __future__ import annotations
 import bisect
 import logging
 import math
+import re
 import struct
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -231,7 +232,15 @@ def parse(data: bytes) -> ElfInfo:
     # symbols/strings instead. A real deployment runs on all of these, and the language decides what
     # analysis applies (memory-safety detectors mean little on a bounds-checked Go/Rust binary).
     try:
-        if ".gopclntab" in by_name or ".note.go.buildid" in by_name or b"\xfb\xff\xff\xff\x00\x00" in data[:1 << 20]:
+        # Go: a .gopclntab / .note.go.buildid section, or the build-info blob every Go >=1.13
+        # binary embeds (survives `-s -w`). The bare pclntab magic (\xfb\xff\xff\xff\x00\x00) is
+        # NOT sufficient on its own -- it occurs by chance in the first 1 MB of some static C
+        # binaries (glibc data), and mislabelling a C binary as Go makes the pipeline skip the
+        # memory-safety detectors. Require corroboration: the magic plus a `go1.<n>` version string.
+        go_buildinfo = b"\xff Go buildinf:" in data[:1 << 21]
+        go_pclntab = (b"\xfb\xff\xff\xff\x00\x00" in data[:1 << 20]
+                      and re.search(rb"go1\.\d", data[:1 << 21]) is not None)
+        if ".gopclntab" in by_name or ".note.go.buildid" in by_name or go_buildinfo or go_pclntab:
             info.toolchain_hint = "go"
         elif b"/rustc/" in data or b"rust_begin_unwind" in data or b"__rust_alloc" in data \
                 or b"rust_eh_personality" in data:
