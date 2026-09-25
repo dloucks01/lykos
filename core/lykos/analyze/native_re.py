@@ -227,7 +227,7 @@ class _Lifter:
                                        "instrs": [[a, h] for a, h in instrs]}))
             worker = _pcode_worker_path()
             cmd = [sys.executable, str(worker), str(inp), str(outp)]
-            env_path = os.pathsep.join(p for p in sys.path if p)   # pypcode wherever the parent has it
+            env_path = os.pathsep.join(p for p in sys.path if p)   # from the parent's sys.path
             popen_env = dict(os.environ, PYTHONPATH=env_path)
             try:
                 if ctx is not None:
@@ -241,7 +241,7 @@ class _Lifter:
             out = {}
             try:
                 with open(outp, errors="replace") as fh:
-                    for line in fh:                        # skip a torn final line from a hard crash
+                    for line in fh:                        # a torn final line from a hard crash
                         line = line.strip()
                         if not line:
                             continue
@@ -383,8 +383,21 @@ def analyze(binary: Path, *, ctx=None, timeout: int = 900) -> dict:
     T = Path(scratch) / "nre"
     T.mkdir(parents=True, exist_ok=True)
 
+    # Recover `main` on an aarch64 binary where the disassembler would miss it: main is passed to
+    # __libc_start_main only as a data pointer (never called), so a static/stripped aarch64 target
+    # gets no function/name there. Decode _start (doc 04) and seed rizin with it so main is
+    # analyzed + named for the function list, decompilation, xrefs and detectors alike.
+    main_seed = ""
+    try:
+        from . import elf as _elf
+        _mva = _elf.main_from_start(binary.read_bytes())
+        if _mva is not None:
+            main_seed = f"af @ {hex(_mva)}; afn main @ {hex(_mva)}; "
+    except Exception:
+        pass
+
     # Pass 1: program metadata + function list + strings + imports, each redirected to a file.
-    _run(cli, binary, "aaa;" + ";".join([
+    _run(cli, binary, "aaa;" + main_seed + ";".join([
         _redir("ij", T / "ij"), _redir("aflj", T / "funcs"),
         _redir("izj", T / "strings"), _redir("iij", T / "imports")]),
         ctx=ctx, timeout=timeout, scratch=T)
@@ -683,6 +696,7 @@ def _build_functions(T: Path, fn_by_addr: dict, lifter: "_Lifter", embedded: boo
 
 
 import re as _re
+
 _ANSI = _re.compile(r"\x1b\[[0-9;]*m")
 
 

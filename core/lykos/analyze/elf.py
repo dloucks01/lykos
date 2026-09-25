@@ -503,3 +503,135 @@ def to_format_details(info: ElfInfo) -> dict[str, Any]:
     return {"elf": {"type": info.elf_type, "entry": info.entry,
                     "interpreter": info.interpreter, "linking": info.linking,
                     "sections": len(info.sections)}}
+
+
+def main_from_start(data: bytes) -> Optional[int]:
+    """Recover the virtual address of `main` on a (possibly stripped) aarch64 glibc binary.
+
+    `main` is passed to __libc_start_main only as the first argument in x0 -- it is never the
+    target of a call -- so a disassembler's call-graph analysis often neither creates nor names a
+    function there on a static/stripped aarch64 target. The C runtime's `_start` loads it with the
+    fixed idiom `adrp x0, PAGE ; add x0, x0, #off`, which we decode here (independently of any
+    external tool). Returns main's VA, or None when it cannot be recovered (not aarch64/ELF64-LE,
+    no PT_LOAD covering the entry, or the idiom is absent). See doc 04 (stripped-binary recovery).
+    """
+    try:
+        if len(data) < 64 or data[:4] != b"\x7fELF":
+            return None
+        if data[4] != 2 or data[5] != 1:                       # ELF64, little-endian only
+            return None
+        (e_machine,) = struct.unpack_from("<H", data, 18)
+        if e_machine != 0xB7:                                  # EM_AARCH64
+            return None
+        (e_entry,) = struct.unpack_from("<Q", data, 24)
+        (e_phoff,) = struct.unpack_from("<Q", data, 32)
+        (e_phentsize,) = struct.unpack_from("<H", data, 54)
+        (e_phnum,) = struct.unpack_from("<H", data, 56)
+
+        def va_to_off(va: int) -> Optional[int]:
+            for i in range(min(e_phnum, 256)):
+                base = e_phoff + i * e_phentsize
+                if base + 56 > len(data):
+                    break
+                (p_type,) = struct.unpack_from("<I", data, base)
+                if p_type != 1:                                # PT_LOAD
+                    continue
+                p_offset, p_vaddr = struct.unpack_from("<QQ", data, base + 8)
+                (p_filesz,) = struct.unpack_from("<Q", data, base + 32)
+                if p_vaddr <= va < p_vaddr + p_filesz:
+                    return p_offset + (va - p_vaddr)
+            return None
+
+        def relative_addend(slot_va: int) -> Optional[int]:
+            # A PIE loads main from the GOT; the slot carries an R_AARCH64_RELATIVE (1027) reloc
+            # whose addend IS main's link-time VA. Read DT_RELA/RELASZ from PT_DYNAMIC and match.
+            dyn_off = dyn_sz = None
+            for i in range(min(e_phnum, 256)):
+                base = e_phoff + i * e_phentsize
+                if base + 56 > len(data):
+                    break
+                (p_type,) = struct.unpack_from("<I", data, base)
+                if p_type == 2:                                # PT_DYNAMIC
+                    p_offset, = struct.unpack_from("<Q", data, base + 8)
+                    p_filesz, = struct.unpack_from("<Q", data, base + 32)
+                    dyn_off, dyn_sz = p_offset, p_filesz
+                    break
+            if dyn_off is None:
+                return None
+            rela_va = rela_size = None
+            for j in range(0, dyn_sz, 16):
+                if dyn_off + j + 16 > len(data):
+                    break
+                d_tag, d_val = struct.unpack_from("<qQ", data, dyn_off + j)
+                if d_tag == 0:                                 # DT_NULL
+                    break
+                if d_tag == 7:                                 # DT_RELA
+                    rela_va = d_val
+                elif d_tag == 8:                               # DT_RELASZ
+                    rela_size = d_val
+            if rela_va is None or not rela_size:
+                return None
+            rela_off = va_to_off(rela_va)
+            if rela_off is None:
+                return None
+            for k in range(0, rela_size, 24):
+                if rela_off + k + 24 > len(data):
+                    break
+                r_offset, r_info, r_addend = struct.unpack_from("<QQq", data, rela_off + k)
+                if r_offset == slot_va and (r_info & 0xFFFFFFFF) == 1027:  # R_AARCH64_RELATIVE
+                    return r_addend
+            return None
+
+        def follow_trampoline(va: int, hops: int = 2) -> int:
+            # Newer glibc / -static-pie pass a `__wrap_main` trampoline (a landing-pad `bti` then
+            # `b main`) to __libc_start_main, not main itself. Follow such a tail-branch to the
+            # real main. A normal main prologue is not an unconditional `b`, so nothing is followed.
+            for _ in range(hops):
+                o = va_to_off(va)
+                if o is None or o + 4 > len(data):
+                    break
+                w0 = int.from_bytes(data[o:o + 4], "little")
+                step = 0
+                if (w0 & 0xFFFFF01F) == 0xD503201F and o + 8 <= len(data):  # a hint (bti/pac/nop)
+                    step, w0 = 4, int.from_bytes(data[o + 4:o + 8], "little")
+                if (w0 >> 26) & 0x3F != 0x05:                  # not an unconditional B -> real main
+                    break
+                imm = w0 & 0x3FFFFFF
+                if imm & (1 << 25):
+                    imm -= (1 << 26)                           # sign-extend 26-bit
+                va = va + step + (imm << 2)
+            return va
+
+        off = va_to_off(e_entry)
+        if off is None:
+            return None
+        code = data[off:off + 128]                             # ~32 aarch64 instructions of _start
+        x0_page: Optional[int] = None
+        main: Optional[int] = None
+        for i in range(0, len(code) - 3, 4):
+            w = int.from_bytes(code[i:i + 4], "little")
+            if (w >> 26) & 0x3F == 0x25:                       # BL -> the __libc_start_main call
+                break
+            if (w & 0x9F000000) == 0x90000000 and (w & 0x1F) == 0:   # adrp x0, PAGE
+                imm = (((w >> 5) & 0x7FFFF) << 2) | ((w >> 29) & 3)   # immhi:immlo (21 bits)
+                if imm & (1 << 20):
+                    imm -= (1 << 21)                           # sign-extend
+                x0_page = ((e_entry + i) & ~0xFFF) + (imm << 12)
+            elif x0_page is not None and ((w >> 23) & 0x1FF) == 0x122 \
+                    and (w & 0x1F) == 0 and ((w >> 5) & 0x1F) == 0:
+                # static: `add x0, x0, #imm12` -- x0 now holds main directly
+                imm12 = (w >> 10) & 0xFFF
+                main = x0_page + (imm12 << (12 if (w >> 22) & 1 else 0))
+            elif x0_page is not None and (w & 0xFFC00000) == 0xF9400000 \
+                    and (w & 0x1F) == 0 and ((w >> 5) & 0x1F) == 0:
+                # PIE: `ldr x0, [x0, #off]` -- x0 = *GOT[slot]; resolve the RELATIVE reloc's addend
+                slot = x0_page + (((w >> 10) & 0xFFF) << 3)    # 64-bit LDR imm is byte-scaled by 8
+                main = relative_addend(slot)
+        if main is None:
+            return None
+        main = follow_trampoline(main)                         # __wrap_main -> real main
+        if va_to_off(main) is None:                            # must land in a mapped segment
+            return None
+        return main
+    except Exception:
+        return None
