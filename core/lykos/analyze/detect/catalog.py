@@ -18,6 +18,7 @@ CWE = {
     "CWE-190": ("Integer Overflow or Wraparound", "medium"),
     "CWE-22":  ("Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')", "high"),
     "CWE-789": ("Memory Allocation with Excessive Size Value", "medium"),
+    "CWE-89":  ("Improper Neutralization of Special Elements used in an SQL Command ('SQL Injection')", "high"),
     "CWE-259": ("Use of Hard-coded Password", "high"),
     "CWE-321": ("Use of Hard-coded Cryptographic Key", "high"),
     "CWE-798": ("Use of Hard-coded Credentials", "high"),
@@ -60,6 +61,7 @@ CWE_DESC = {
     "CWE-190": "An arithmetic operation wraps past the integer's range, producing a wrong (often tiny) size or index.",
     "CWE-22":  "A filesystem path is built from untrusted input without restriction, so \"../\" or an absolute path lets an attacker read or write files outside the intended directory.",
     "CWE-789": "An allocation size is taken from untrusted input, so an attacker can force a huge allocation (denial of service) or, if the size arithmetic wraps, a too-small buffer that is then overflowed.",
+    "CWE-89":  "An SQL query is built from untrusted input without parameterization, so an attacker can alter the query -- read or modify data, or bypass authentication.",
     "CWE-259": "A password is hard-coded in the binary, so anyone who reads it gains access.",
     "CWE-321": "A cryptographic key is hard-coded in the binary, so the key is not secret.",
     "CWE-798": "Credentials are embedded in the code, usable by anyone who inspects the binary.",
@@ -123,6 +125,14 @@ DANGEROUS = {
     "calloc":   ("CWE-789", "low",    "calloc -- check the count/size are not attacker-controlled"),
     "realloc":  ("CWE-789", "low",    "realloc -- check the size is not attacker-controlled"),
     "reallocarray": ("CWE-789", "low", "reallocarray -- check the count/size are not attacker-controlled"),
+    # CWE-89 SQL injection: a query built at runtime. Advisory; a defect when the query is tainted.
+    "sqlite3_exec":     ("CWE-89", "medium", "sqlite3_exec -- check the SQL is parameterized"),
+    "sqlite3_prepare":  ("CWE-89", "medium", "sqlite3_prepare -- check the SQL is parameterized"),
+    "sqlite3_prepare_v2": ("CWE-89", "medium", "sqlite3_prepare_v2 -- check the SQL is parameterized"),
+    "mysql_query":      ("CWE-89", "medium", "mysql_query -- check the SQL is parameterized"),
+    "mysql_real_query": ("CWE-89", "medium", "mysql_real_query -- check the SQL is parameterized"),
+    "PQexec":           ("CWE-89", "medium", "PQexec -- check the SQL is parameterized"),
+    "PQexecParams":     ("CWE-89", "low",    "PQexecParams -- parameterized, verify the template"),
 }
 
 # APIs whose presence is worth REPORTING but is not by itself a defect claim. `memcpy` is a
@@ -138,7 +148,10 @@ ADVISORY = {"strncpy", "memcpy", "memmove", "printf", "fprintf", "snprintf", "sy
             "fopen", "freopen", "open", "open64", "openat", "creat", "opendir",
             "unlink", "unlinkat", "remove", "rename",
             # an allocation is a CWE-789 defect only when its SIZE is tainted, not on its presence.
-            "malloc", "calloc", "realloc", "reallocarray"}
+            "malloc", "calloc", "realloc", "reallocarray",
+            # a query call is a CWE-89 defect only when the query STRING is tainted.
+            "sqlite3_exec", "sqlite3_prepare", "sqlite3_prepare_v2", "mysql_query",
+            "mysql_real_query", "PQexec", "PQexecParams"}
 
 # untrusted-input source functions (normalized) for reachability correlation
 SOURCES = {
@@ -222,6 +235,14 @@ SINK_TAINT_ARGS = {
     "calloc":   frozenset({0, 1}),                # calloc(count, size)
     "realloc":  frozenset({1}),                   # realloc(ptr, size)
     "reallocarray": frozenset({0, 1}),            # reallocarray(ptr, count, size)
+    # CWE-89 SQL injection: the query STRING argument.
+    "sqlite3_exec":       frozenset({1}),         # sqlite3_exec(db, SQL, cb, arg, err)
+    "sqlite3_prepare":    frozenset({1}),         # sqlite3_prepare(db, SQL, n, stmt, tail)
+    "sqlite3_prepare_v2": frozenset({1}),
+    "mysql_query":        frozenset({1}),         # mysql_query(conn, SQL)
+    "mysql_real_query":   frozenset({1}),
+    "PQexec":             frozenset({1}),         # PQexec(conn, SQL)
+    "PQexecParams":       frozenset({1}),
 }
 
 
