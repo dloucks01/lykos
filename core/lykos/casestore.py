@@ -9,6 +9,7 @@ Export/import archive the whole directory so a case moves intact between air-gap
 """
 from __future__ import annotations
 
+import os
 import shutil
 import sqlite3
 import subprocess
@@ -66,6 +67,35 @@ def _make_runnable(exe: Path, workdir: Path) -> None:
         pass
 
 
+def _atomic_place(dst: Path, *, data: Optional[bytes] = None,
+                  src: Optional[str | Path] = None) -> None:
+    """Write `data`/copy `src` to `dst` ATOMICALLY: to a temp file in the same directory,
+    then os.replace() onto the final path. A direct write leaves a truncated blob at the final
+    path if the process/host dies mid-write, and because the store is content-addressed
+    (`exists()` -> True forever) that partial blob is never repaired and every future read fails
+    its integrity check permanently. The temp file shares dst's directory so os.replace is a
+    same-filesystem atomic rename.
+    """
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(dst.parent), prefix=".tmp-")
+    try:
+        if data is not None:
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+        else:
+            os.close(fd)
+            shutil.copyfile(src, tmp)  # type: ignore[arg-type]
+        os.replace(tmp, dst)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 class ContentStore:
     """Content-addressed blob store under <case_dir>/artifacts."""
 
@@ -91,15 +121,13 @@ class ContentStore:
         sha = info["sha256"]
         dst = self.path(sha)
         if not dst.exists():
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(src, dst)
+            _atomic_place(dst, src=src)
         return sha, self._rel(sha), info["size"]
 
     def _place(self, sha256: str, data: bytes) -> str:
         dst = self.path(sha256)
         if not dst.exists():
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            dst.write_bytes(data)
+            _atomic_place(dst, data=data)
         return sha256
 
     def get_bytes(self, sha256: str) -> bytes:
@@ -182,11 +210,27 @@ class CaseStore:
 
     # ------------------------------------------------------------- export / import
     def export(self, archive_path: str | Path) -> Path:
-        """Archive the whole case directory (rows + artifacts) to a .tar.gz."""
-        self.checkpoint()
+        """Archive the whole case directory (rows + artifacts) to a .tar.gz.
+
+        The DB is archived as a CONSISTENT snapshot (VACUUM INTO a temp file) rather than the
+        live WAL database: `tar.add`-ing case.db + its -wal while workers are still writing can
+        capture a torn, inconsistent DB. Artifacts are immutable content-addressed blobs (only
+        ever added, atomically via _atomic_place), so the live artifacts dir is safe to archive
+        directly.
+        """
         archive_path = Path(archive_path)
-        with tarfile.open(archive_path, "w:gz") as tar:
-            tar.add(self.dir, arcname=self.dir.name)
+        base = self.dir.name
+        snap_dir = Path(tempfile.mkdtemp())
+        snap_db = snap_dir / "case.db"
+        try:
+            self.conn.execute("VACUUM INTO ?", (str(snap_db),))
+            with tarfile.open(archive_path, "w:gz") as tar:
+                tar.add(snap_db, arcname=f"{base}/case.db")
+                adir = self.dir / _ARTIFACTS
+                if adir.exists():
+                    tar.add(adir, arcname=f"{base}/{_ARTIFACTS}")
+        finally:
+            shutil.rmtree(snap_dir, ignore_errors=True)
         return archive_path
 
     def export_case(self, case_id: str, archive_path: str | Path) -> Path:
