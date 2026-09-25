@@ -84,3 +84,22 @@ def test_constant_alloc_size_not_corroborated(store, case, pool, gcc_or_skip):
                    "#include <stdlib.h>\nint main(void){ char*p=malloc(64);"
                    " if(p){p[0]=1;free(p);} return 0; }\n", "alc")
     assert not any(state == "corroborated" for (state,) in rows), rows
+
+
+def test_reg_family_relates_subregisters():
+    # tainting a register must cover its 32/16/8-bit sub-registers, so `movzx eax, al` (read the
+    # low byte of a tainted register) keeps the taint instead of clearing the chain.
+    from lykos.analyze.detect.taint import _REG_FAMILY
+    assert "AL" in _REG_FAMILY["RAX"] and "AX" in _REG_FAMILY["RAX"] and "EAX" in _REG_FAMILY["RAX"]
+    assert "RAX" in _REG_FAMILY["AL"]                     # and the relation is symmetric
+    assert "R8B" in _REG_FAMILY["R8"] and "DIL" in _REG_FAMILY["RDI"]
+
+
+def test_byte_load_tainted_size_corroborated(store, case, pool, gcc_or_skip):
+    # a size taken from a BYTE of a tainted buffer (buf[0], or bytes assembled with shifts) must
+    # corroborate -- the taint now survives the sub-register byte ops on the way to the sink.
+    rows = _detect(store, case, pool,
+                   "#include <stdlib.h>\n#include <unistd.h>\n"
+                   "int main(void){ unsigned char b[8]; if(read(0,b,8)<8)return 0;"
+                   " char*p=malloc(b[0]); if(p){p[0]=1;free(p);} return 0; }\n", "alb")
+    assert any(state == "corroborated" for (state,) in rows), rows

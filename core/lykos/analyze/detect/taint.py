@@ -104,6 +104,24 @@ for _abi in ARCH_ABI.values():
         for _r in _grp:
             _REG_FAMILY.setdefault(_r, set()).update(_grp)
 
+# x86/x86-64 SUB-REGISTER aliases. The ABI groups above only relate the 64- and 32-bit forms
+# (RAX<->EAX), so tainting RAX did NOT taint AL/AX -- and `movzx eax, al` (read the low byte of a
+# tainted register) then read a "clean" AL and CLEARED the whole chain, so a value assembled from a
+# tainted buffer's bytes (a length field, `buf[0]`) lost its taint before reaching the sink. Relate
+# every register to its 32/16/8-bit sub-registers so a byte read of a tainted register stays tainted.
+# Over-approximate (whole family), the safe direction for a bug-finding taint that a second channel
+# still has to corroborate.
+_X86_SUBREGS = [
+    ("RAX", "EAX", "AX", "AL", "AH"), ("RBX", "EBX", "BX", "BL", "BH"),
+    ("RCX", "ECX", "CX", "CL", "CH"), ("RDX", "EDX", "DX", "DL", "DH"),
+    ("RSI", "ESI", "SI", "SIL"), ("RDI", "EDI", "DI", "DIL"),
+    ("RBP", "EBP", "BP", "BPL"), ("RSP", "ESP", "SP", "SPL"),
+    *[(f"R{_n}", f"R{_n}D", f"R{_n}W", f"R{_n}B") for _n in range(8, 16)],
+]
+for _grp in _X86_SUBREGS:
+    for _r in _grp:
+        _REG_FAMILY.setdefault(_r, set()).update(_grp)
+
 _MAX_BLOCKS = 3000
 _MAX_FUNCS = 6000
 
