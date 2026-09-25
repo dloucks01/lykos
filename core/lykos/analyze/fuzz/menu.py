@@ -198,8 +198,11 @@ def crawl_menu(spawn, options, *, max_fields: int = 10, idle: float = 0.2,
             deadline = time.monotonic() + per_option
             _drain(proc, sel, idle=idle,
                    deadline=min(deadline, time.monotonic() + 1.5))  # first menu
-            proc.stdin.write(_scalar(opt.encode(), width))
-            proc.stdin.flush()
+            try:
+                proc.stdin.write(_scalar(opt.encode(), width))
+                proc.stdin.flush()
+            except (OSError, ValueError):                     # process quit before we could select
+                continue
             fields: list[str] = []
             last_num = 0
             for _ in range(max_fields):
@@ -232,6 +235,17 @@ def crawl_menu(spawn, options, *, max_fields: int = 10, idle: float = 0.2,
 
 
 def _kill(proc) -> None:
+    # Close the pipes FIRST, suppressing the BrokenPipe from flushing buffered bytes to a process
+    # that has already exited -- a menu's "Exit" option makes this the common case. Left to garbage
+    # collection, that unflushed BufferedWriter raises an *unraisable* BrokenPipeError the caller
+    # cannot catch (and which pytest turns into a failure), so the crawl looked flaky on any target
+    # that can quit mid-probe.
+    for stream in (getattr(proc, "stdin", None), getattr(proc, "stdout", None)):
+        try:
+            if stream is not None:
+                stream.close()
+        except Exception:                                    # noqa: BLE001
+            pass
     try:
         proc.kill()
         proc.wait(timeout=1)
@@ -340,3 +354,99 @@ def menu_op_sequences(model: dict, options, *, max_seqs: int = 40, width=None) -
             seen.add(s)
             out.append(s)
     return out[:max_seqs]
+
+
+# Numeric values worth trying for a size/count/index field: boundaries, a negative (unchecked
+# index / signed-vs-unsigned), and sizes that overflow a typical stack or heap buffer.
+_MENU_NUMS = (0, 1, 2, 8, 16, 32, 64, 100, 127, 128, 255, 256, 512, 1024, 4096,
+              -1, -2, 9999, 65535, 0x7FFFFFFF)
+_STR_ALPHABET = bytes(c for c in range(1, 256) if c != 0x0A)   # any byte but newline (ends a line)
+
+
+class MenuMutator:
+    """Structure-aware mutator for a numbered-menu / interactive-protocol target.
+
+    A blind byte mutator flips the option digits and desyncs the state machine on the very first
+    mutation, so the handlers BEHIND the menu -- where the bug lives -- are never reached: a menu
+    service fuzzed blind runs thousands of executions parked at the front door. This mutator keeps
+    every navigation VALID -- real option tokens, correctly-typed fields, a size-prefixed read
+    matched to its size so the stream never desyncs -- and mutates only the field PAYLOADS: a
+    string grown into an overflow, a size/index driven to a boundary or a negative, a dictionary
+    token injected. It GENERATES a fresh valid walk each call from the crawled menu model rather
+    than editing the raw seed, so a corrupted corpus entry can never derail the navigation.
+
+    Line-based targets (gets/fgets/scanf) get newline-delimited fields with newline-free string
+    payloads; a fixed-width read(fd,buf,W) protocol gets `width`-padded scalars and raw data."""
+
+    def __init__(self, rng, model: dict, options, *, width=None, dictionary=None):
+        self.rng = rng
+        self.width = width
+        self.dict = [d for d in (dictionary or []) if d and _NL not in d]
+        # Keep only options the crawl learned a field template for; those are the ones we can drive.
+        self.model = {}
+        for o in (options or []):
+            f = model.get(str(o)) or model.get(o)
+            if f:
+                self.model[str(o)] = list(f)
+        self.options = list(self.model) or [str(o) for o in (options or []) if str(o)]
+        self.alloc = next((o for o in self.options if _is_alloc(self.model.get(o, []))), None)
+
+    def mutate(self, data: bytes = b"", corpus=()) -> bytes:
+        """A fresh, valid multi-operation navigation with mutated fields. `data`/`corpus` are
+        ignored on purpose: regenerating from the model is what keeps the walk in-protocol."""
+        if not self.options:
+            return data or b"1\n"
+        rng = self.rng
+        out = bytearray()
+        # Prime with allocations so index / free / print / modify operations act on live objects
+        # (a use-after-free or an unchecked index only misbehaves once something exists to touch).
+        if self.alloc and rng.random() < 0.8:
+            for _ in range(rng.randint(1, 2)):
+                out += self._op(self.alloc, overflow=False)
+        for _ in range(rng.randint(1, 6)):
+            out += self._op(rng.choice(self.options), overflow=rng.random() < 0.4)
+        return bytes(out) or b"1\n"
+
+    def _op(self, o: str, *, overflow: bool) -> bytes:
+        fields = self.model.get(o, [])
+        out = bytearray(_scalar(o.encode(), self.width))       # the option choice, always valid
+        rng = self.rng
+        last_str = max((i for i, f in enumerate(fields) if f == "str"), default=-1)
+        # the size field that governs the overflowable buffer: the last num BEFORE the last string
+        size_i = (max((i for i, f in enumerate(fields) if f == "num" and i < last_str), default=-1)
+                  if overflow and last_str >= 0 else -1)
+        sz = 0
+        for i, f in enumerate(fields):
+            if f == "idx":
+                out += _scalar(self._index(), self.width)
+            elif f == "num":
+                if i == size_i:
+                    n = rng.choice((256, 512, 1024, 4096))     # ask for far more than the buffer
+                    sz = n
+                    out += _scalar(str(n).encode(), self.width)
+                else:
+                    n = rng.choice(_MENU_NUMS)
+                    sz = n if 0 < n <= 4096 else 0
+                    out += _scalar(str(n).encode(), self.width)
+            else:                                              # str
+                if overflow and i == last_str:
+                    ln = sz or rng.choice((128, 256, 512, 1024))
+                    out += _data(bytes((rng.choice(b"ABCD"),)) * ln, self.width)
+                else:
+                    out += _data(self._str(sz), self.width)
+        return bytes(out)
+
+    def _index(self) -> bytes:
+        r = self.rng.random()
+        if r < 0.6:                                            # a plausible in-range id
+            return str(self.rng.randint(0, 4)).encode()
+        return str(self.rng.choice((-1, -2, 9999, 100000, 0x7FFFFFFF))).encode()
+
+    def _str(self, sz: int) -> bytes:
+        rng = self.rng
+        if self.dict and rng.random() < 0.3:
+            return rng.choice(self.dict)
+        if 0 < sz <= 4096:                                     # match a preceding size: no desync
+            return bytes((rng.choice(b"ABCD"),)) * sz
+        ln = rng.randint(1, 48)
+        return bytes(rng.choice(_STR_ALPHABET) for _ in range(ln))

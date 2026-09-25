@@ -146,30 +146,31 @@ def format_aware_seeds(ctx, target) -> list:
     return [s for s in seeds if s]
 
 
-def menu_op_seeds(ctx, target, exe, workdir) -> list:
-    """Correctly-typed menu operation sequences, learned by DRIVING the staged binary. The static
-    `menu_seeds` above guesses a generic numbered-menu navigation from the option strings; it never
-    learns that "Author Note size:" wants a number and "Note:" wants the bytes, so a size-then-buffer
-    flow (the overflow) is fed garbage and the campaign stays parked at the front-door menu. Crawling
-    the live target learns each option's typed field template (`crawl_menu`) and emits alloc-primed,
-    over-long-last-field sequences (`menu_op_sequences`) that actually reach the guarded sink.
+def menu_model_for(ctx, target, exe, workdir):
+    """Learn the target's menu by DRIVING the staged binary: `(model, options, width)` or None.
+
+    The static `menu_seeds` guesses a generic numbered-menu navigation from the option strings; it
+    never learns that "Author Note size:" wants a number and "Note:" wants the bytes, so a
+    size-then-buffer flow (the overflow) is fed garbage and the campaign stays parked at the
+    front-door menu. Crawling the live target learns each option's typed field template
+    (`crawl_menu`), which drives BOTH the alloc-primed op-sequence seeds and the menu-aware mutator.
 
     Only pays the crawl when the strings advertise a menu, and is fully best-effort: any failure
-    (no menu, no allocator flow, crawl error) yields [] and the campaign keeps its static seeds."""
+    (no menu, crawl error) yields None and the campaign keeps its static seeds + blind mutator."""
     try:
         from . import menu
         svals = [x.value for x in _strings_for(ctx, target) if getattr(x, "value", None)]
         opts = menu.detect_menu(svals)
         if not opts:
-            return []
+            return None
         from ..dynamic.heap_discover import _crawl_menu_model, _read_width
         width = _read_width(exe)
         model = _crawl_menu_model(workdir, exe, opts, width=width)
         if not model:
-            return []
-        return [s for s in menu.menu_op_sequences(model, opts, width=width) if s]
+            return None
+        return model, opts, width
     except Exception:
-        return []
+        return None
 
 
 def msan_detonate(ctx, target, inputs, mode, exec_timeout, base_argv=()) -> int:
@@ -350,17 +351,28 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
     workfile = ctx.scratch() / "input.bin"
 
     corpus = list(corpus) or list(_DEFAULT_SEEDS)
-    # Enrich the corpus with typed menu-operation sequences learned by driving the live target: a
-    # numbered-menu service hides its bug behind a size-then-buffer flow the static seeds can't type,
-    # so without these the mutator never leaves the front-door menu. Best-effort and menu-gated.
+    # A numbered-menu service hides its bug behind a state machine: junk input never selects a valid
+    # option, so a blind campaign runs its whole budget parked at the front-door menu. Learn the menu
+    # by driving the live target ONCE, then use that model two ways -- seed the corpus with typed
+    # operation sequences, AND drive a menu-aware mutator that keeps every navigation valid while
+    # mutating the field payloads (so the fuzzer explores the handlers, not the menu parser). Both
+    # are best-effort and menu-gated; a non-menu target keeps its static seeds + blind mutator.
     try:
-        op_seeds = menu_op_seeds(ctx, target, exe, exe.parent)
-        if op_seeds:
-            corpus = list(corpus) + op_seeds
-            ctx.progress(msg=f"{event_prefix} learned {len(op_seeds)} menu-op seeds")
+        from . import menu as _menu
+        mm = menu_model_for(ctx, target, exe, exe.parent)
+        if mm:
+            model, opts, mwidth = mm
+            op_seeds = [s for s in _menu.menu_op_sequences(model, opts, width=mwidth) if s]
+            if op_seeds:
+                corpus = list(corpus) + op_seeds
+                ctx.progress(msg=f"{event_prefix} learned {len(op_seeds)} menu-op seeds")
+            if mutator is None:                        # don't override an explicit format mutator
+                mutator = _menu.MenuMutator(rng, model, opts, width=mwidth, dictionary=dictionary)
+                ctx.emit("fuzz.format", payload={"model": "menu", "auto": True,
+                         "options": opts, "why": "the target drives a numbered menu; navigating it"})
     except Exception:
         pass
-    mut = mutator or Mutator(rng, dictionary)          # structure-aware mutator when supplied
+    mut = mutator or Mutator(rng, dictionary)          # menu / structure-aware mutator when supplied
     fd = FindingDAO(ctx.conn)
     dd = DynResultDAO(ctx.conn)
     deadline = time.time() + max_seconds

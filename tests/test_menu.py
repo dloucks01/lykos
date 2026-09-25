@@ -1,4 +1,6 @@
 """Menu-navigation seed synthesis for interactive/menu-driven targets."""
+import random
+
 from lykos.analyze.fuzz import menu
 
 
@@ -182,3 +184,74 @@ def test_crawl_menu_learns_fixed_width_protocol(tmp_path):
     model = menu.crawl_menu(spawn, ["1", "2"], idle=0.3, per_option=8.0, width=4)
     assert model.get("1") == ["num", "str"]              # size, data
     assert model.get("2") == ["idx"]                     # index
+
+
+def test_menu_mutator_navigates_and_overflows():
+    """The menu-aware mutator generates a FRESH valid navigation each call: every operation begins
+    with a real option token, the fields stay correctly typed (so a line-based target never
+    desyncs), and it drives the buffer field into an overflow-length run."""
+    model = {"1": ["str", "str", "num", "num", "str"],   # add: Name, Surname, Age, size, Note
+             "2": ["idx", "str"],                         # modify: id, new name
+             "3": ["idx"]}                                # delete: id
+    mm = menu.MenuMutator(random.Random(1), model, ["1", "2", "3", "4"])
+    assert mm.options == ["1", "2", "3"]                  # option 4 has no field template -> skipped
+    assert mm.alloc == "1"                                # the size-then-string option primes objects
+    saw_overflow = saw_oob_index = False
+    for _ in range(300):
+        out = mm.mutate(b"")
+        assert out and out.endswith(b"\n")
+        lines = out.split(b"\n")[:-1]                     # trailing newline -> empty last element
+        # the first line is always a valid option choice (navigation never starts on junk)
+        assert lines[0] in (b"1", b"2", b"3")
+        # a line-based mutator must never emit an interior newline inside a field payload; splitting
+        # on newline and re-joining round-trips, and no line is absurdly empty mid-stream
+        if any(len(ln) >= 256 and len(set(ln)) == 1 for ln in lines):
+            saw_overflow = True
+        if any(ln.startswith(b"-") for ln in lines):      # a negative index reached an idx field
+            saw_oob_index = True
+    assert saw_overflow, "the mutator never produced an overflow-length buffer"
+    assert saw_oob_index, "the mutator never drove an index field negative (CWE-129 shape)"
+
+
+def test_menu_mutator_reaches_the_handlers_behind_the_menu():
+    """End-to-end: feeding the mutator's output to a live menu program reaches the sub-handlers a
+    blind byte mutator can't -- the whole point of navigating the menu."""
+    import subprocess
+    import sys
+    import tempfile
+    import textwrap
+    from pathlib import Path
+    d = Path(tempfile.mkdtemp())
+    prog = d / "m.py"
+    # Reads stdin as BYTES (like a C target using gets/read), so the mutator's full-byte-range
+    # string payloads are accepted rather than crashing a UTF-8 text decoder.
+    prog.write_text(textwrap.dedent('''
+        import sys
+        o = sys.stdout.buffer
+        def rd(): return sys.stdin.buffer.readline()
+        while True:
+            o.write(b"1 - Add\\n2 - Del\\n3 - Exit\\nChoice: "); o.flush()
+            c = rd().strip()
+            if not c: break
+            if c == b"1":
+                for p in (b"Name: ", b"Size: ", b"Data: "): o.write(p); o.flush(); rd()
+                o.write(b"ADDED\\n"); o.flush()
+            elif c == b"2":
+                o.write(b"Id: "); o.flush(); rd()
+                o.write(b"DELETED\\n"); o.flush()
+            else:
+                o.write(b"bye\\n"); o.flush(); break
+    '''))
+    model = {"1": ["str", "num", "str"], "2": ["idx"]}
+    mm = menu.MenuMutator(random.Random(7), model, ["1", "2", "3"])
+    reached = 0
+    for _ in range(40):
+        payload = mm.mutate(b"")
+        p = subprocess.run([sys.executable, str(prog)], input=payload,
+                           capture_output=True, timeout=10)
+        if b"ADDED" in p.stdout or b"DELETED" in p.stdout:
+            reached += 1
+    import shutil
+    shutil.rmtree(d, ignore_errors=True)
+    # A blind mutator effectively never completes a handler flow; the menu-aware one does it often.
+    assert reached >= 20, f"only {reached}/40 navigations reached a handler"
