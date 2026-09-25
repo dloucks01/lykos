@@ -7,7 +7,7 @@ import os
 from ...db.dao import DynResultDAO, FindingDAO, PocDAO, TargetDAO
 from ...jobs.registry import register_stage
 from ..dynamic import sandbox
-from ..dynamic.stage import crash_dedup_key, crash_finding_candidate
+from ..dynamic.stage import crash_dedup_key, crash_finding_candidate, crash_hijack
 from ..fuzz.runner import place
 from . import bundle
 from .capture import MODES, how_to_feed
@@ -127,10 +127,13 @@ def build_poc_stage(ctx) -> dict:
         # the SAME key the run that found this input filed it under, or a verified PoC opens a
         # second finding beside the crash it just proved instead of promoting it
         fault_pc = DynResultDAO(ctx.conn).fault_pc_for(target.id, input_sha)
+        hj = crash_hijack(ctx.conn, target.id, fault_pc)
         fd.upsert(target.id, target.case_id, crash_finding_candidate(
             res.signal_name, input_sha, res.isolation, "poc", "(PoC verified)",
-            state="poc-backed", confidence=0.95, bundle_sha=bundle_sha, fault_pc=fault_pc))
-        fid = fd.id_for_dedup(target.id, crash_dedup_key(res.signal_name, fault_pc))
+            state="poc-backed", confidence=0.95, bundle_sha=bundle_sha,
+            fault_pc=fault_pc, hijack=hj))
+        fid = fd.id_for_dedup(
+            target.id, crash_dedup_key(res.signal_name, fault_pc, hijack=hj))
         if fid:
             PocDAO(ctx.conn).set_finding(poc_id, fid)
 

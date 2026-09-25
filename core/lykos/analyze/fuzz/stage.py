@@ -23,7 +23,12 @@ from ...hashing import canonical_json
 from ...jobs.registry import register_stage
 from ..dynamic import sandbox
 from ..dynamic.minimize import minimize
-from ..dynamic.stage import asan_defect_key, crash_finding_candidate
+from ..dynamic.stage import (
+    asan_defect_key,
+    crash_finding_candidate,
+    is_hijack_pc,
+    recovered_code_span,
+)
 from ..poc.capture import modes_for
 from . import structure, textconf, xmlgrammar
 from .mutator import Mutator
@@ -378,6 +383,7 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
     deadline = time.time() + max_seconds
     execs = crashes = crashes_reproducible = 0
     seen_sigs: dict = {}
+    code_span = recovered_code_span(ctx.conn, target.id)   # classify an out-of-code (hijack) PC
     seen_behaviour, kept = set(), 0
     # Has the coverage channel EVER answered? A runner that returns block data -- even an empty
     # set -- proves coverage is live and block-novelty is trustworthy. If blocks were armed but
@@ -542,7 +548,10 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
                 # later), since the bucket is what gates whether a finding is filed at all.
                 sig = res.signal_name
                 defect_key = asan_defect_key(res.stderr) if sig == "SIGABRT" else None
-                bucket = (sig, res.fault_pc, defect_key)
+                # A hijack PC is attacker-controlled (out of the program's code) and differs per
+                # input, so it is bucketed as one "cfh" defect rather than one-per-garbage-PC.
+                hj = is_hijack_pc(res.fault_pc, code_span)
+                bucket = (sig, "cfh" if hj else res.fault_pc, defect_key)
                 # Explore near crashers -- while they are still telling us something. Kept
                 # unconditionally, one reproducible crash takes the corpus over: jhead crashed
                 # on 8,516 of 20,000 executions, all the same defect, and block coverage fell
@@ -582,7 +591,7 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
                     extra = "(" + note_prefix + ("; " + note if note else "") + ")"
                     fd.upsert(target.id, target.case_id, crash_finding_candidate(
                         sig, input_sha, res.isolation, detector, extra,
-                        fault_pc=res.fault_pc, discriminator=defect_key))
+                        fault_pc=res.fault_pc, discriminator=defect_key, hijack=hj))
                 elif seen_sigs[bucket] < _MAX_CRASH_ROWS:
                     # A campaign that finds a REPRODUCIBLE crash finds it thousands of times:
                     # 8,128 of 20,000 executions on jhead. Storing every one buries the case in

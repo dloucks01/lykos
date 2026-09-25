@@ -16,7 +16,12 @@ from ...hashing import canonical_json
 from ...jobs.registry import register_stage
 from ..dynamic import sandbox
 from ..dynamic.minimize import minimize
-from ..dynamic.stage import asan_defect_key, crash_finding_candidate
+from ..dynamic.stage import (
+    asan_defect_key,
+    crash_finding_candidate,
+    is_hijack_pc,
+    recovered_code_span,
+)
 from . import aflpp
 from .runner import invocation, run_input
 from .stage import _DEFAULT_SEEDS, _recovered_blocks, format_aware_seeds, msan_detonate
@@ -239,6 +244,7 @@ def coverage_stage(ctx) -> dict:
     # located key and double-files one defect. run_batch traces native targets (ptrace fault_pc);
     # for an emulated target the blocks give qemu's fault log via run_input.
     cover_blocks = _recovered_blocks(ctx, target)
+    code_span = recovered_code_span(ctx.conn, target.id)   # to classify a hijacked (out-of-code) PC
 
     def _replay(data):
         if cover_blocks:
@@ -261,11 +267,14 @@ def coverage_stage(ctx) -> dict:
             continue                                  # not reproducible in our sandbox
         sig = res.signal_name
         defect_key = asan_defect_key(res.stderr) if sig == "SIGABRT" else None
+        hj = is_hijack_pc(res.fault_pc, code_span)
         # Bucket by (signal, fault site, sanitizer defect), not signal alone: every SIGSEGV in a
         # program is the same signal but not the same bug, and every ASan abort faults at the SAME
         # PC (the abort machinery), so distinct sanitizer defects must be separated by their
         # defect_key or only the first is filed as a finding (the rest record a dyn_result only).
-        key = (sig, res.fault_pc, defect_key)
+        # A HIJACK PC is attacker-controlled and differs per input, so it is bucketed as one "cfh"
+        # defect (otherwise a single stack overflow fans out into a finding per garbage PC).
+        key = (sig, "cfh" if hj else res.fault_pc, defect_key)
         if key in seen_crashes:
             input_sha = ctx.put_artifact("afl-crash-input", data=data)
             dd.insert(target.id, target.case_id, run_id=ctx.run_id, input_sha=input_sha,
@@ -295,7 +304,7 @@ def coverage_stage(ctx) -> dict:
             sig, input_sha, res.isolation, "coverage_fuzz",
             "(found by AFL++ coverage-guided fuzzing"
             + ("; " + note if note else "") + ")",
-            fault_pc=res.fault_pc, discriminator=defect_key))
+            fault_pc=res.fault_pc, discriminator=defect_key, hijack=hj))
         confirmed += 1
 
     # Uninitialized-read pass (CWE-457): detonate the corpus against the MSan build if one exists.

@@ -11,7 +11,7 @@ from ...db.dao import DynResultDAO, FindingDAO, FunctionDAO, PocDAO, TargetDAO
 from ...jobs.registry import register_stage
 from ..debug import qemu_gdb, rootcause
 from ..dynamic import sandbox
-from ..dynamic.stage import crash_finding_candidate
+from ..dynamic.stage import crash_finding_candidate, crash_hijack
 from . import bundle, primitive
 from .capture import MODES, how_to_feed, make_capture, make_qemu_capture, materialize_helper
 
@@ -297,10 +297,11 @@ def _finalize(ctx, target, target_bytes, mode, base_argv, cap0, control, prim, c
         # defect into two poc-backed findings.
         _orig = (ctx.params or {}).get("input_sha")
         _fpc = DynResultDAO(ctx.conn).fault_pc_for(target.id, _orig) if _orig else None
+        _hj = crash_hijack(ctx.conn, target.id, _fpc)
         cand = crash_finding_candidate(
             cap0.get("signal_name"), control_sha, "ptrace", "primitive",
             f"(L2 primitive: {extra})", state="poc-backed", confidence=0.98,
-            bundle_sha=bundle_sha, fault_pc=_fpc)
+            bundle_sha=bundle_sha, fault_pc=_fpc, hijack=_hj)
         if _kind_title:
             _kind, _title = _kind_title
             cand["title"] = f"{_title} (demonstrated): L2 primitive"

@@ -391,7 +391,7 @@ def test_a_sanitizer_abort_separates_distinct_defects_by_its_report():
     dozens of identical aborts still merge. But two DIFFERENT sanitizer defects both abort with
     SIGABRT; keying them by the ASan class+source (defect_key) keeps them as two findings instead
     of collapsing the second one away."""
-    from lykos.analyze.dynamic.stage import crash_dedup_key, asan_defect_key
+    from lykos.analyze.dynamic.stage import asan_defect_key, crash_dedup_key
     overflow = (b"=1=ERROR: AddressSanitizer: heap-buffer-overflow on address 0x1 "
                 b"...\n    #0 0x5 in main /src/parser.c:42\nSUMMARY: AddressSanitizer: "
                 b"heap-buffer-overflow /src/parser.c:42 in main\n")
@@ -436,3 +436,29 @@ def test_an_emulated_crash_still_gets_a_fault_locus():
     ok = pathlib.Path("examples/vuln-targets/inputs/jhead-ok.jpg").resolve()
     clean = sandbox.run(exe, argv=[str(ok)], arch="aarch64", timeout=30, blocks=blocks)
     assert not clean.crashed and clean.fault_pc is None
+
+
+def test_hijack_pc_collapses_to_one_bucket():
+    """A control-flow hijack faults at an attacker-controlled PC that differs per input; keying on
+    it split one overflow into a finding-per-garbage-PC (22 on aarch64/qemu). An out-of-code PC is
+    bucketed as one 'cfh' defect, while a genuine in-code fault keeps its distinct PC."""
+    from lykos.analyze.dynamic.stage import crash_dedup_key, crash_finding_candidate, is_hijack_pc
+    # out-of-code (hijack): different garbage PCs collapse to ONE key
+    k1 = crash_dedup_key("SIGSEGV", 0x7357f464f462, hijack=True)
+    k2 = crash_dedup_key("SIGSEGV", 0x75bb3e84f462, hijack=True)
+    assert k1 == k2 == "dynamic-crash:SIGSEGV:cfh"
+    # in-code faults stay distinct (two different null-derefs are two bugs)
+    assert crash_dedup_key("SIGSEGV", 0x401180) != crash_dedup_key("SIGSEGV", 0x401200)
+    assert crash_dedup_key("SIGSEGV", 0x401180) != k1
+    # is_hijack_pc: outside the code span is a hijack; inside / unknown is not
+    span = (0x400268, 0x47439c)
+    assert is_hijack_pc(0x7357f464f462, span) is True
+    assert is_hijack_pc(0x401180, span) is False
+    assert is_hijack_pc(0x401180, None) is False        # no code recovered -> cannot classify
+    assert is_hijack_pc(None, span) is False
+    # the finding self-describes as a hijack and uses the collapsing key
+    cand = crash_finding_candidate("SIGSEGV", "a" * 64, "bwrap", "fuzz",
+                                   fault_pc=0x7357f464f462, hijack=True)
+    assert cand["dedup_key"] == "dynamic-crash:SIGSEGV:cfh"
+    assert "control-flow hijack" in cand["title"].lower()
+    assert cand["site_addr"] is None                    # an attacker-controlled PC is not a site
