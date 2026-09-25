@@ -202,6 +202,58 @@ def libc_symbols(data: bytes, names) -> dict:
     return out
 
 
+def _libc_symbol_values(data: bytes) -> set:
+    """Every DEFINED function/object symbol VALUE (unrelocated vaddr) in .dynsym -- the anchors a
+    leaked libc pointer's page offset can be matched against, to recover the libc base."""
+    secs = _sections(data)
+    ds, st = secs.get(".dynsym"), secs.get(".dynstr")
+    if not ds:
+        return set()
+    is64, endc = _elf_class_endian(data)
+    entsize = ds[2] or (24 if is64 else 16)
+    vals = set()
+    for o in range(ds[0], ds[0] + ds[1], entsize):
+        try:
+            if is64:
+                _n, info, _oth, shndx, value, _sz = struct.unpack_from(endc + "IBBHQQ", data, o)
+            else:
+                _n, value, _sz, info, _oth, shndx = struct.unpack_from(endc + "IIIBBH", data, o)
+        except struct.error:
+            break
+        if shndx != 0 and value and (info & 0xF) in (1, 2):   # STT_OBJECT / STT_FUNC, defined
+            vals.add(value)
+    return vals
+
+
+def recover_libc_base(leaked, libc_data: bytes):
+    """Recover a libc's load base from leaked runtime pointers, the same page-offset method as
+    exploit.recover_pie_base but anchored on the LIBC's own exported symbols. A leaked pointer to a
+    libc symbol (a FILE like _IO_2_1_stdout_, a function address in the GOT) has `& 0xfff` equal to
+    that symbol's page offset; base = leaked - symbol. libc has thousands of symbols so a lone match
+    is cheap coincidence, so a base is accepted only when >=2 DISTINCT leaked slots corroborate it.
+    Returns the page-aligned base or None. NOTE: a bare return-address-into-libc (e.g. the
+    __libc_start_call_main return commonly on the stack) is NOT a symbol start and will not match --
+    that case needs a version-specific offset the caller must supply."""
+    anchors: dict = {}
+    for va in _libc_symbol_values(libc_data):
+        anchors.setdefault(va & 0xFFF, []).append(va)
+    if not anchors:
+        return None
+    support: dict = {}
+    for v in leaked:
+        v = int(v)
+        if not (0x1000 <= v <= 0x7FFFFFFFFFFF):
+            continue
+        for va in anchors.get(v & 0xFFF, ()):
+            base = v - va
+            if base > 0 and (base & 0xFFF) == 0:
+                support.setdefault(base, set()).add(v)
+    best = max(support, key=lambda b: len(support[b]), default=None)
+    if best is None or len(support[best]) < 2:
+        return None
+    return best
+
+
 def got_entry(data: bytes, name: str):
     """The GOT slot the PLT stub for `name` dereferences, read from .rela.plt/.rel.plt. For a
     no-PIE binary this is the absolute address whose contents (the resolved libc function) a

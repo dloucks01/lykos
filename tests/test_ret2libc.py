@@ -130,3 +130,19 @@ def test_exploit_stage_files_l3_ret2libc(store, case, pool, r2l_bin):
     pocs = PocDAO(store.conn).list_by_target(t.id)
     assert any(pc.level == "L3" and pc.verified for pc in pocs), \
         f"no confirmed L3 ret2libc PoC (pocs={[(p.level, p.verified) for p in pocs]})"
+
+
+def test_recover_libc_base_needs_two_symbol_pointers():
+    """recover_libc_base recovers a libc load base from >=2 leaked SYMBOL pointers (page-offset
+    match), and honestly refuses a lone match or a bare return-address-into-libc."""
+    if not _SYS_LIBC:
+        pytest.skip("no system libc")
+    ld = open(_SYS_LIBC, "rb").read()
+    syms = rop.libc_symbols(ld, ("puts", "system", "printf"))
+    base = 0x7F4400000000
+    assert rop.recover_libc_base([base + syms["puts"], base + syms["system"]], ld) == base
+    assert rop.recover_libc_base([base + syms["puts"]], ld) is None          # one match: unsure
+    assert rop.recover_libc_base([base + 0xA03E6], ld) is None               # a return addr, no sym
+    # real symbol pointers survive being mixed with stack junk
+    assert rop.recover_libc_base(
+        [0x7FFF12340000, base + syms["puts"], 0x40, base + syms["printf"]], ld) == base
