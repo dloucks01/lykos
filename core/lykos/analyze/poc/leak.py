@@ -42,6 +42,9 @@ def leak_and_exploit(exe, base_argv, *, leak_regex: str, leak_base_offset=None,
     `payload_for_base(base)->bytes` builds the relocated payload. Success = `success_regex`
     appears in the post-payload output.
     """
+    if leak_base_offset is None and base_from_leaks is None:
+        raise ValueError("leak_and_exploit needs exactly one of leak_base_offset= "
+                         "or base_from_leaks= (got neither)")
     rx = re.compile(leak_regex.encode("latin-1"))
     ok = re.compile(success_regex.encode("latin-1"))
     preexec = sandbox._rlimits(mem_mb, int(timeout) + 2, set_as=True)

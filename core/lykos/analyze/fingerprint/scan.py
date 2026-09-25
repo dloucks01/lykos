@@ -45,7 +45,15 @@ def scan(blob: bytes, comps=None):
     found, seen = [], set()
     for lib, spec in comps.items():
         for pat in spec["patterns"]:
-            for m in re.finditer(pat, text):
+            try:
+                matches = list(re.finditer(pat, text))
+            except re.error:
+                # An operator-supplied $LYKOS_CVEDB pattern can be malformed; a raw re.error here
+                # aborts the whole cve scan for the target. Skip the bad pattern instead -- the
+                # module's documented guarantee is that a malformed override never breaks the scan.
+                _log.debug("skipping malformed CVE pattern %r for %s", pat, lib)
+                continue
+            for m in matches:
                 if not m.groups():
                     continue
                 ver = m.group(1)

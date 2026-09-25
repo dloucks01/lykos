@@ -49,7 +49,7 @@ def _runner(mode: str, argv, signal_name: str, run_cmd=None, runtime: str = "nat
         # to be put back under the name the class declares.
         cls = (main_class or "Main").replace("/", ".")
         exe = f"java -cp . {shlex.quote(cls)}"
-        setup = f"cp ./target.bin ./{cls.rsplit('.', 1)[-1]}.class\n"
+        setup = f"cp ./target.bin ./{shlex.quote(cls.rsplit('.', 1)[-1] + '.class')}\n"
     pre = _argv_text(argv, carrier="./input.bin")
     if run_cmd:                                          # script-based reproducer (e.g. PIE)
         invoke = run_cmd

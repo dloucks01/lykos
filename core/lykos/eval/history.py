@@ -91,7 +91,7 @@ def regressions(history, *, recall_drop=0.0, fp_rise=0.0) -> list:
     for key, runs in series(history).items():
         if len(runs) < 2:
             continue
-        prev, cur = runs[-2]["overall"], runs[-1]["overall"]
+        prev, cur = runs[-2].get("overall", {}) or {}, runs[-1].get("overall", {}) or {}
         dr = _num(cur.get("recall")) - _num(prev.get("recall"))
         df = _num(cur.get("fp_rate")) - _num(prev.get("fp_rate"))
         reasons = []

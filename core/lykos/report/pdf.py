@@ -68,16 +68,17 @@ def _wrap(text: str, font: str, size: float, width: float, indent: float) -> lis
 
 
 class _Line:
-    __slots__ = ("text", "font", "size", "indent", "gap", "color")
+    __slots__ = ("text", "font", "size", "indent", "gap", "color", "rule")
 
     def __init__(self, text, font="H", size=10.0, indent=0.0, gap=0.0,
-                 color: Optional[tuple] = None):
+                 color: Optional[tuple] = None, rule: bool = False):
         self.text = text
         self.font = font
         self.size = size
         self.indent = indent
         self.gap = gap
         self.color = color
+        self.rule = rule   # a horizontal rule, not text -- see _content_stream
 
 
 def _flow(text, font, size, indent, gap, color=None) -> list[_Line]:
@@ -104,7 +105,7 @@ def _report_lines(report: dict[str, Any]) -> list[_Line]:
 
     # summary
     L.append(_Line("Summary", "HB", 13, 0, 16))
-    L.append(_Line("__RULE__", "H", 1, 0, 3))
+    L.append(_Line("", "H", 1, 0, 3, rule=True))
     L += _flow(
         f'{summ.get("findings", 0)} findings across {summ.get("targets", 0)} targets  ·  '
         f'{summ.get("confirmed", 0)} confirmed  ·  {summ.get("poc_backed", 0)} PoC-backed',
@@ -122,7 +123,7 @@ def _report_lines(report: dict[str, Any]) -> list[_Line]:
 
     # reproducibility
     L.append(_Line("Reproducibility", "HB", 13, 0, 16))
-    L.append(_Line("__RULE__", "H", 1, 0, 3))
+    L.append(_Line("", "H", 1, 0, 3, rule=True))
     eng = report.get("engines", [])
     if eng:
         for e in eng:
@@ -138,7 +139,7 @@ def _report_lines(report: dict[str, Any]) -> list[_Line]:
     for t in report.get("targets", []):
         L.append(_Line("Target", "HB", 8, 0, 20, (0.6, 0.6, 0.65)))
         L += _flow(t.get("filename") or "(target)", "HB", 13, 0, 2)
-        L.append(_Line("__RULE__", "H", 1, 0, 3))
+        L.append(_Line("", "H", 1, 0, 3, rule=True))
         mits = t.get("mitigations") or {}
         mit_txt = " ".join(f"{k}={v}" for k, v in mits.items()) if mits else "-"
         for k, v in (("SHA-256", t.get("sha256")),
@@ -231,7 +232,7 @@ def _content_stream(page: list[tuple], page_no: int, total: int, report: dict) -
     ops: list[str] = []
     for ln, y in page:
         x = MARGIN + ln.indent
-        if ln.text == "__RULE__":
+        if ln.rule:
             ops.append("0.85 0.85 0.87 RG 0.7 w")
             ops.append(f"{MARGIN:.1f} {y + 4:.1f} m {PAGE_W - MARGIN:.1f} {y + 4:.1f} l S")
             continue

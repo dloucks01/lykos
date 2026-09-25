@@ -61,6 +61,12 @@ def _norm_soname(name: str) -> str:
                 n = head
         if n == base:
             break
+    # Also drop a trailing -<version> stem so a dash-versioned filename reduces to the same stem
+    # as a dotted soname: libcfg-1.0.so -> "libcfg-1" above -> "libcfg", matching libcfg.so.1.2.
+    if "-" in n:
+        head, _, tail = n.rpartition("-")
+        if head and tail and all(c.isdigit() or c == "." for c in tail):
+            n = head
     return n
 
 

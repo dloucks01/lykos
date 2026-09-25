@@ -172,6 +172,11 @@ def build_report(
                              "signal": m.get("signal"), "deterministic": m.get("deterministic"),
                              "_at": a.created_at or 0}
 
+    # one embed per distinct bundle, and a byte budget for the WHOLE report -- both must span
+    # every target, or an N-target case can emit up to N x the cap and re-embed a bundle shared
+    # across targets (the browser-choking blowup the cap exists to prevent).
+    embedded: set = set()
+    budget = {"left": _MAX_EMBED_TOTAL}
     for t in tdao.list_by_case(case_id):
         _target_runs = [r for r in all_runs if r.target_id == t.id]
         pocs = pdao.list_by_target(t.id)
@@ -186,11 +191,6 @@ def build_report(
 
         findings_out: list[dict] = []
 
-        # one embed per distinct bundle, and a budget for the whole report
-
-        embedded: set = set()
-
-        budget = {"left": _MAX_EMBED_TOTAL}
         for f in fdao.list_by_target(t.id):
             if sel_ids is not None and f.id not in sel_ids:
                 continue
