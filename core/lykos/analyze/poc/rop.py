@@ -307,6 +307,79 @@ def got_entry(data: bytes, name: str):
     return None
 
 
+def _jcc_at(seg, p):
+    """True if seg[p:] begins an equality conditional jump: short jz/jnz (74/75) or the near
+    two-byte forms (0f 84 / 0f 85). Compilers pick either depending on the branch distance."""
+    if p < len(seg) and seg[p] in (0x74, 0x75):
+        return True
+    return p + 1 < len(seg) and seg[p] == 0x0F and seg[p + 1] in (0x84, 0x85)
+
+
+def _s8(b):
+    return b - 256 if b >= 128 else b
+
+
+def find_magic_gates(data: bytes):
+    """Find a stack LOCAL checked against a magic constant that gates a branch (jeeves'
+    `if (local==0x1337bab3)` -> read+print the flag). A stack overflow that writes IMM32 into the
+    local satisfies the check without touching the return address. Two code shapes are recognised,
+    each followed by an equality jump (short or near):
+
+      * direct compare  -- `cmp dword [rbp-X], IMM32`  (81 7d <disp8> <imm32>) / `[rsp+X]`
+      * load-then-compare -- `mov eax, [rbp-X]; cmp eax, IMM32`  (8b 45 <disp8> ... 3d <imm32>)
+
+    the second is what gcc/clang emit for a `volatile` local or at higher optimisation. Returns
+    [{va, magic, disp}] where `disp` is the local's signed rbp displacement (negative == a local
+    below rbp, the overflowable case)."""
+    out = []
+    seen = set()
+    for off, sz, va, fl in _loads(data):
+        if not (fl & 1):                                 # executable segments only
+            continue
+        seg = data[off:off + sz]
+        # (a) direct memory compare against an immediate.
+        i = 0
+        while True:
+            j = seg.find(b"\x81\x7d", i)                 # cmp dword [rbp+disp8], imm32
+            k = seg.find(b"\x81\x7c\x24", i)             # cmp dword [rsp+disp8], imm32
+            hit = min(x for x in (j, k) if x >= 0) if (j >= 0 or k >= 0) else -1
+            if hit < 0:
+                break
+            i = hit + 1
+            rbp = seg[hit:hit + 2] == b"\x81\x7d"
+            base = hit + (3 if rbp else 4)
+            if base + 4 > len(seg):
+                continue
+            disp = _s8(seg[base - 1])
+            magic = int.from_bytes(seg[base:base + 4], "little")
+            if magic > 0x1000 and disp < 0 and _jcc_at(seg, base + 4):
+                key = (va + hit, magic)
+                if key not in seen:
+                    seen.add(key)
+                    out.append({"va": va + hit, "magic": magic, "disp": disp})
+        # (b) load a local into eax, then compare eax to an immediate: mov eax,[rbp+disp8] (8b 45
+        #     <disp8>) followed within a few bytes by cmp eax,imm32 (3d <imm32>) then a jcc.
+        i = 0
+        while True:
+            m = seg.find(b"\x8b\x45", i)                 # mov eax, dword [rbp+disp8]
+            if m < 0 or m + 3 > len(seg):
+                break
+            i = m + 1
+            disp = _s8(seg[m + 2])
+            if disp >= 0:
+                continue
+            c = seg.find(b"\x3d", m + 3, m + 12)         # cmp eax, imm32, near the load
+            if c < 0 or c + 5 > len(seg):
+                continue
+            magic = int.from_bytes(seg[c + 1:c + 5], "little")
+            if magic > 0x1000 and _jcc_at(seg, c + 5):
+                key = (va + m, magic)
+                if key not in seen:
+                    seen.add(key)
+                    out.append({"va": va + m, "magic": magic, "disp": disp})
+    return out
+
+
 def find_canary(vals):
     """A leaked stack canary from a set of leaked values (a %p dump / an over-read). glibc's canary
     is a full-width random word with its LOW BYTE forced to 0x00 (so a string read stops before it
