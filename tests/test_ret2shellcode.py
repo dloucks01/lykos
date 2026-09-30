@@ -97,11 +97,11 @@ def test_declines_the_patched_target(store, _stage, sc_safe_bin):
     assert not _drive(store, _stage, sc_safe_bin), "patched target wrongly credited an L3"
 
 
-def test_find_reg_control_gadgets_recognises_jmp_and_call():
-    """find_reg_control_gadgets picks out every `jmp <reg>` / `call <reg>` encoding, rsp first."""
+def test_find_reg_control_gadgets_recognises_jmp_call_and_push_ret():
+    """find_reg_control_gadgets picks out jmp/call <reg> and push <reg>;ret, rsp first."""
     from lykos.analyze.poc import rop
-    # a fake exec segment: jmp rsp (ff e4), jmp rax (ff e0), call rdi (ff d7)
-    seg = b"\x90\xff\xe4\x90\xff\xe0\x90\xff\xd7\x90"
+    # jmp rax (ff e0), call rdi (ff d7), push rsp;ret (54 c3), push rbx;ret (53 c3)
+    seg = b"\x90\xff\xe0\x90\xff\xd7\x90\x54\xc3\x90\x53\xc3\x90"
     orig = rop._loads
     rop._loads = lambda data: [(0, len(seg), 0x400000, 1)]
     try:
@@ -109,7 +109,8 @@ def test_find_reg_control_gadgets_recognises_jmp_and_call():
     finally:
         rop._loads = orig
     found = {(g["insn"], g["reg"]) for g in gs}
-    assert ("jmp", "rsp") in found and ("jmp", "rax") in found and ("call", "rdi") in found
+    assert ("jmp", "rax") in found and ("call", "rdi") in found
+    assert ("push+ret", "rsp") in found and ("push+ret", "rbx") in found
     assert gs[0]["reg"] == "rsp"                          # rsp is ordered first
 
 

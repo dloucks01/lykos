@@ -93,15 +93,19 @@ _REGS8 = ("rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi")
 
 
 def find_reg_control_gadgets(data: bytes):
-    """Every `jmp <reg>` / `call <reg>` gadget present, as [{insn, reg, va}] (insn in jmp/call, reg
-    an x86-64 GPR). These redirect the instruction pointer to an address already in a register --
-    the basis of a ret2shellcode that needs no info leak when a register points at the input buffer.
-    Ordered rsp first (the after-return layout is the most common), then by register."""
+    """Every gadget that redirects the instruction pointer to an address already in a register, as
+    [{insn, reg, va}]: `jmp <reg>` (FF /4), `call <reg>` (FF /2), and `push <reg>; ret` (50+reg C3)
+    -- the last is at least as common as `jmp rsp` and, via `push rsp; ret`, lands in the exact same
+    place, so it doubles the reach of a ret2shellcode that needs no info leak. reg is the register
+    whose value the PC takes: rsp means the shellcode sits after the return address, any other
+    register means it points at the buffer start. Ordered rsp first (the most common layout)."""
     out = []
     order = {"rsp": 0}
-    for insn, base in (("jmp", 0xE0), ("call", 0xD0)):
+    for insn, pat in [("jmp", lambda i: bytes((0xFF, 0xE0 + i))),
+                      ("call", lambda i: bytes((0xFF, 0xD0 + i))),
+                      ("push+ret", lambda i: bytes((0x50 + i, 0xC3)))]:
         for i, reg in enumerate(_REGS8):
-            va = _find_exec(data, bytes((0xFF, base + i)))
+            va = _find_exec(data, pat(i))
             if va is not None:
                 out.append({"insn": insn, "reg": reg, "va": va})
     out.sort(key=lambda g: (order.get(g["reg"], 1), g["reg"], g["insn"]))
