@@ -110,7 +110,8 @@ class CommandMutator:
 
     def __init__(self, rng, verbs, dictionary=None):
         self.rng = rng
-        self.verbs = [v.encode() if isinstance(v, str) else bytes(v) for v in verbs if v] or [b"help"]
+        vb = [v.encode() if isinstance(v, str) else bytes(v) for v in verbs if v]
+        self.verbs = vb or [b"help"]
         self.dictionary = [d if isinstance(d, bytes) else str(d).encode()
                            for d in (dictionary or [])]
 
