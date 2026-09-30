@@ -3,8 +3,12 @@
 The live control-flow demonstration (drive the primitive to overwrite a code pointer and confirm
 the win under ptrace) is exercised end-to-end by the stage on a real target; here we cover the
 deterministic building blocks."""
+import shutil
 import struct
+import subprocess
 
+import pytest
+from lykos.analyze.dynamic import sandbox
 from lykos.analyze.poc import chain_primitive as chain
 
 
@@ -50,13 +54,9 @@ def test_recipe_arbitrary_write_without_win():
 
 
 # --- PIE leak-then-chain: recover the base in-process, relocate the win, confirm by flag ---------
-import shutil  # noqa: E402
-import subprocess  # noqa: E402
 import tempfile  # noqa: E402
 from pathlib import Path  # noqa: E402
 
-import pytest  # noqa: E402
-from lykos.analyze.dynamic import sandbox  # noqa: E402
 from lykos.analyze.poc.exploit import elf_functions  # noqa: E402
 
 _PIE_HEAPWIN = r"""
@@ -137,3 +137,37 @@ def test_pie_repro_script_reproduces_standalone(pie_heapwin_bin):
     r = subprocess.run(["setarch", "-R", _sys.executable, str(d / "exploit.py"),
                         str(pie_heapwin_bin)], capture_output=True, timeout=30)
     assert b"FLAG{pie-heap-chain}" in r.stdout, r.stdout + r.stderr
+
+
+# ------------------------------------------------- attribution proof (Phase 1b integration)
+class _ShimCtx:
+    """Minimal ctx for `_attribution_proof`: it only needs a run_subprocess that returns an
+    object with `.stdout` bytes. Runs the attribution helper directly (no worker/sandbox)."""
+    def run_subprocess(self, cmd, timeout=None):
+        return subprocess.run(cmd, capture_output=True, timeout=timeout)
+
+
+_WINSRC = ("#include <stdio.h>\n#include <string.h>\nint main(){char b[64];"
+           "if(fgets(b,sizeof b,stdin)){if(!strncmp(b,\"WIN\",3))puts(\"flag{chain}\");"
+           "else puts(\"no\");}return 0;}\n")
+
+
+@pytest.mark.skipif(sandbox.host_arch() != "x86-64" or not shutil.which("gcc"),
+                    reason="attribution proof is native x86-64 only")
+def test_attribution_proof_credits_only_an_attributed_differential_win(tmp_path):
+    c = tmp_path / "w.c"; c.write_text(_WINSRC)
+    exe = tmp_path / "w"
+    if subprocess.run(["gcc", "-O0", str(c), "-o", str(exe)],
+                      capture_output=True, check=False).returncode:
+        pytest.skip("build failed")
+    ctx = _ShimCtx()
+    # the "win" input yields the banner from the target's OWN subtree, absent under the control
+    good = chain._attribution_proof(ctx, exe, b"WIN\n")
+    assert good and good["level"] == "win_attributed", good
+    # a benign input produces no win banner -> not credited as a hijack
+    benign = chain._attribution_proof(ctx, exe, b"zz\n")
+    assert benign and benign["level"] == "output_attributed", benign
+
+
+def test_attribution_proof_is_best_effort_without_exe():
+    assert chain._attribution_proof(_ShimCtx(), None, b"x") is None

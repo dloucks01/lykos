@@ -172,7 +172,7 @@ def chain_primitive_stage(ctx) -> dict:
                     seq, tgt, trig = tc
                     return _file_l3(ctx, target, lead, vclass, win_name, win_addr, seq,
                                     blame=f"tcache-poison chunk over {hex(tgt)}", writer=trig,
-                                    off=None, trig=trig)
+                                    off=None, trig=trig, exe=exe)
             else:
                 # heap overflow / oob write -> overwrite an adjacent code pointer directly
                 alloc = next((o for o in opts if o in model and menu._is_alloc(model[o])), None)
@@ -185,7 +185,7 @@ def chain_primitive_stage(ctx) -> dict:
                     seq, writer, off, trig = found
                     return _file_l3(ctx, target, lead, vclass, win_name, win_addr, seq,
                                     blame=f"option {writer} overwrites a code pointer at +{off}",
-                                    writer=writer, off=off, trig=trig)
+                                    writer=writer, off=off, trig=trig, exe=exe)
         finally:
             shutil.rmtree(helper.parent, ignore_errors=True)
 
@@ -478,13 +478,51 @@ def _tcache_chain(ctx, target, target_bytes, exe, functions, edges, win, opts, m
     return None
 
 
-def _file_l3(ctx, target, lead, vclass, win_name, win_addr, seq, *, blame, writer, off, trig):
+def _attribution_proof(ctx, exe, seq, *, control=b"\n"):
+    """Independently re-confirm a breakpoint-verified hijack by ATTRIBUTION: run the confirmed
+    input under the write-attribution oracle and grade the win's output as coming from the
+    target's OWN process subtree, present under the exploit and ABSENT under a benign control --
+    a proof the old stdout-regex confirmation could not give (it credited any reflected string,
+    or a helper that printed the banner itself). Best-effort: returns a proof dict or None, and
+    never blocks the already breakpoint-confirmed L3."""
+    try:
+        from . import attribution as attr
+        if exe is None or not attr.supported():
+            return None
+        helper = attr.materialize_helper()
+        try:
+            cap = attr.make_attributed_capture(ctx, helper, str(exe), "stdin", [], 8,
+                                               sys.executable)
+            res = cap(seq)
+            if not isinstance(res, dict) or not res.get("ok"):
+                return None
+            ctrl = cap(control)
+            ctrl = ctrl if isinstance(ctrl, dict) and ctrl.get("ok") else None
+            lb = attr.lineage_bytes(res)
+            cb = attr.lineage_bytes(ctrl) if ctrl else b""
+            # a win banner / shell prompt (by shape) in an attributed write, absent under the
+            # benign control -> the hijack ran, not a run-to-run artifact or a reflected string.
+            win_lines = [ln for ln in lb.splitlines()
+                         if _WIN_OUT.search(ln) and ln not in cb.splitlines()]
+            g = attr.grade(res, win_tokens=win_lines, control=ctrl)
+            return {"level": g["level"], "rank": g["rank"], "evidence": g["evidence"],
+                    "attributed_bytes": g["attributed_bytes"]}
+        finally:
+            shutil.rmtree(helper.parent, ignore_errors=True)
+    except Exception:
+        return None
+
+
+def _file_l3(ctx, target, lead, vclass, win_name, win_addr, seq, *, blame, writer, off, trig,
+             exe=None):
     from ...db.dao import FindingDAO, PocDAO
     from . import bundle
+    proof = _attribution_proof(ctx, exe, seq)
     input_sha = ctx.put_artifact("chain-exploit-input", data=seq)
     meta = {"target_sha256": target.sha256, "arch": target.arch, "level": "L3",
             "exploit": f"{vclass}->control-flow", "offset": off, "target": win_name,
-            "tool_version": TOOL_VERSION}
+            "tool_version": TOOL_VERSION,
+            "proof_level": (proof or {}).get("level", "breakpoint_only")}
     data = bundle.build(ctx.content.path(target.sha256).read_bytes(),
                         seq, meta, b"", "stdin", [], None,
                         primitive={"type": vclass, "target": win_name, "offset": off,
@@ -496,6 +534,10 @@ def _file_l3(ctx, target, lead, vclass, win_name, win_addr, seq, *, blame, write
     eff = (f"working exploit ({vclass} -> control-flow hijack): {blame} to {win_name} "
            f"(0x{win_addr:x}); {trg} then calls it, arrival confirmed under the debugger with a "
            f"passing negative control.")
+    if proof and proof["level"] in ("win_attributed", "code_exec_proven", "shell_proven"):
+        eff += (f" Independently re-confirmed by attribution ({proof['level']}): the win output "
+                "was emitted by the target's own process subtree, absent under a benign control.")
+    attr_proof = {"attribution": proof} if proof else {}
     fd = FindingDAO(ctx.conn)
     cand = {
         "cwe": lead.cwe, "title": "Control-flow hijack (demonstrated): L3 working exploit",
@@ -506,14 +548,14 @@ def _file_l3(ctx, target, lead, vclass, win_name, win_addr, seq, *, blame, write
         "evidence": [{"channel": "effects", "detail": __import__("json").dumps([{
             "kind": "rce", "title": "Control-flow hijack", "status": "demonstrated", "detail": eff,
             "proof": {"type": "bundle", "sha": bundle_sha, "input_sha": input_sha,
-                      "note": eff}}])}]}
+                      "note": eff, **attr_proof}}])}]}
     fd.upsert(target.id, target.case_id, cand)
     fid = fd.id_for_dedup(target.id, cand["dedup_key"])
     if fid:
         PocDAO(ctx.conn).set_finding(poc_id, fid)
     ctx.emit("chain.done", payload={"applicable": True, "confirmed": True, "vclass": vclass,
              "win": win_name, "offset": off, "writer": writer, "trigger": trig,
-             "bundle": bundle_sha})
+             "bundle": bundle_sha, "proof_level": (proof or {}).get("level", "breakpoint_only")})
     ctx.progress(pct=100, msg=f"L3 CONFIRMED: {vclass} -> {win_name} (option {writer} +{off})")
     return {"output_shas": [bundle_sha], "output_kind": "poc-bundle",
             "metrics": {"chained": True, "level": "L3", "vclass": vclass, "offset": off}}
