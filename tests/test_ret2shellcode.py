@@ -95,3 +95,35 @@ def test_declines_the_patched_target(store, _stage, sc_safe_bin):
     confirmed L3 -- byte-identical but for the read length, so the decline is the missing overflow
     alone (the jmp-rsp gadget and the executable stack are unchanged)."""
     assert not _drive(store, _stage, sc_safe_bin), "patched target wrongly credited an L3"
+
+
+def test_find_reg_control_gadgets_recognises_jmp_and_call():
+    """find_reg_control_gadgets picks out every `jmp <reg>` / `call <reg>` encoding, rsp first."""
+    from lykos.analyze.poc import rop
+    # a fake exec segment: jmp rsp (ff e4), jmp rax (ff e0), call rdi (ff d7)
+    seg = b"\x90\xff\xe4\x90\xff\xe0\x90\xff\xd7\x90"
+    orig = rop._loads
+    rop._loads = lambda data: [(0, len(seg), 0x400000, 1)]
+    try:
+        gs = rop.find_reg_control_gadgets(seg)
+    finally:
+        rop._loads = orig
+    found = {(g["insn"], g["reg"]) for g in gs}
+    assert ("jmp", "rsp") in found and ("jmp", "rax") in found and ("call", "rdi") in found
+    assert gs[0]["reg"] == "rsp"                          # rsp is ordered first
+
+
+def test_sc_payload_layouts():
+    """The two ret2shellcode layouts, and the gadget always at [offset:offset+8]."""
+    from lykos.analyze.poc.exploit_stage import _sc_payload
+    sc = b"\xcc" * 20
+    g = 0x401146
+    gb = g.to_bytes(8, "little")
+    # rsp: shellcode AFTER the return address
+    rsp = _sc_payload("rsp", 72, g, sc)
+    assert rsp[:72] == b"A" * 72 and rsp[72:80] == gb and rsp[80:] == sc
+    # a general register pointing at the buffer: shellcode FIRST, gadget at the return slot
+    rax = _sc_payload("rax", 72, g, sc)
+    assert rax[:20] == sc and rax[20:72] == b"\x90" * 52 and rax[72:80] == gb
+    # shellcode too big to fit before the return address -> no layout
+    assert _sc_payload("rax", 8, g, sc) is None

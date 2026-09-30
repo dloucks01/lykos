@@ -84,6 +84,30 @@ def find_csu(data: bytes):
     return {"pop": pop, "call": call} if pop and call else None
 
 
+# jmp/call <reg>: `FF /4` (jmp) and `FF /2` (call), modrm E0+reg / D0+reg. The register order is the
+# x86 encoding order (rax,rcx,rdx,rbx,rsp,rbp,rsi,rdi). A ret2shellcode redirect needs whichever
+# register happens to point at the input buffer at the fault: rsp (shellcode sits after the return
+# address), or a general register the callee left pointing at the buffer start (`jmp rax`, common
+# when a read wrapper returns the buffer, is the canonical no-gadget-needed case after jmp rsp).
+_REGS8 = ("rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi")
+
+
+def find_reg_control_gadgets(data: bytes):
+    """Every `jmp <reg>` / `call <reg>` gadget present, as [{insn, reg, va}] (insn in jmp/call, reg
+    an x86-64 GPR). These redirect the instruction pointer to an address already in a register --
+    the basis of a ret2shellcode that needs no info leak when a register points at the input buffer.
+    Ordered rsp first (the after-return layout is the most common), then by register."""
+    out = []
+    order = {"rsp": 0}
+    for insn, base in (("jmp", 0xE0), ("call", 0xD0)):
+        for i, reg in enumerate(_REGS8):
+            va = _find_exec(data, bytes((0xFF, base + i)))
+            if va is not None:
+                out.append({"insn": insn, "reg": reg, "va": va})
+    out.sort(key=lambda g: (order.get(g["reg"], 1), g["reg"], g["insn"]))
+    return out
+
+
 def build_ret2csu(offset, pop, call, ptr, edi, rsi, rdx, length, rbx=0, rbp=0, align_ret=None):
     """ret2csu chain: pop-gadget loads rbx/rbp/r12=ptr/r13=edi/r14=rsi/r15=rdx, then the
     call-gadget does the 3-arg call *[ptr+rbx*8]. `align_ret` (a `ret` VA) prepends one return to
