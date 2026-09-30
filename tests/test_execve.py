@@ -4,7 +4,6 @@ import struct
 import subprocess
 
 import pytest
-
 from lykos.analyze.poc import rop
 
 
@@ -32,17 +31,10 @@ def pool(store):
         p.stop(grace=3.0)
 
 
-@pytest.fixture
-def execve_bin(tmp_path_factory):
-    from lykos.analyze.dynamic import sandbox
-    import shutil
-    if sandbox.host_arch() != "x86-64":
-        pytest.skip("x86-64 native only")
-    gcc = shutil.which("gcc") or shutil.which("cc")
-    if not gcc:
-        pytest.skip("no C compiler")
-    d = tmp_path_factory.mktemp("execve")
-    (d / "v.c").write_text(
+def _execve_src(read_call: str) -> str:
+    """The execve-ROP target, parameterised ONLY by the read that owns the overflow, so the positive
+    and its negative control are byte-identical but for that call (supwngo _90_neg discipline)."""
+    return (
         '#include <unistd.h>\n'
         'char binsh[] = "/bin/sh";\n'
         '__asm__(".text\\n"\n'
@@ -51,13 +43,38 @@ def execve_bin(tmp_path_factory):
         '  ".global grdx\\n grdx: pop %rdx\\n ret\\n"\n'
         '  ".global grax\\n grax: pop %rax\\n ret\\n"\n'
         '  ".global gsys\\n gsys: syscall\\n ret\\n");\n'
-        'void vuln(){ char b[32]; read(0,b,400); }\n'
+        'void vuln(){ char b[32]; ' + read_call + '; }\n'
         'int main(){ vuln(); return 0; }\n')
+
+
+def _build_execve(tmp_path_factory, name, read_call):
+    import shutil
+
+    from lykos.analyze.dynamic import sandbox
+    if sandbox.host_arch() != "x86-64":
+        pytest.skip("x86-64 native only")
+    gcc = shutil.which("gcc") or shutil.which("cc")
+    if not gcc:
+        pytest.skip("no C compiler")
+    d = tmp_path_factory.mktemp(name)
+    (d / "v.c").write_text(_execve_src(read_call))
     exe = d / "v"
     if subprocess.run([gcc, "-no-pie", "-fno-stack-protector", "-static", "-w",
                        str(d / "v.c"), "-o", str(exe)], capture_output=True).returncode:
         pytest.skip("cannot build execve fixture")
     return exe
+
+
+@pytest.fixture
+def execve_bin(tmp_path_factory):
+    return _build_execve(tmp_path_factory, "execve", "read(0,b,400)")        # overflow: the bug
+
+
+@pytest.fixture
+def execve_safe_bin(tmp_path_factory):
+    # the negative control: the read is bounded to the buffer, so there is no overflow and no
+    # return-address control -- the gadgets, the "/bin/sh" string and the syscall stay identical.
+    return _build_execve(tmp_path_factory, "execve_safe", "read(0,b,sizeof b)")  # bounds-fixed
 
 
 def test_exploit_stage_files_l3_execve_rop(store, case, pool, execve_bin):
@@ -79,3 +96,27 @@ def test_exploit_stage_files_l3_execve_rop(store, case, pool, execve_bin):
     pocs = PocDAO(store.conn).list_by_target(t.id)
     assert any(pc.level == "L3" and pc.verified for pc in pocs), \
         f"no confirmed L3 execve ROP (pocs={[(p.level, p.verified) for p in pocs]})"
+
+
+def test_execve_rop_declines_the_patched_target(store, case, pool, execve_safe_bin):
+    """Negative control (supwngo _90_neg): the SAME binary with the overflow removed must NOT yield
+    a confirmed L3. Driven through the SAME stage with the SAME offset=40, so a decline is the
+    missing overflow alone -- the gadgets, "/bin/sh" and the syscall are all still present. A
+    confirmed L3 here would mean a "solve" credited to something other than the bug: exactly what
+    the real, forgery-proof execve("/bin/sh") detonation exists to prevent (offset != shell)."""
+    from lykos.analyze.ingest import enqueue_triage, ingest
+    from lykos.analyze.poc import enqueue_exploit
+    from lykos.db.dao import PocDAO, TargetDAO
+    from lykos.jobs import JobQueue
+    t = ingest(store, case.id, execve_safe_bin, filename="v")
+    q = JobQueue(store.conn)
+    enqueue_triage(q, t, force=True)
+    assert pool.wait_idle(30)
+    TargetDAO(store.conn).update_triage(t.id, arch="x86-64", bits=64, endianness="little",
+                                        linking="static", stripped=False,
+                                        mitigations={"pie": "off"}, file_type="elf")
+    run = enqueue_exploit(q, t, params={"strategy": "execve", "offset": 40})
+    assert pool.wait_idle(60) and q.runs.get(run.id).status == "done"
+    pocs = PocDAO(store.conn).list_by_target(t.id)
+    assert not any(pc.level == "L3" and pc.verified for pc in pocs), \
+        f"patched target wrongly credited a confirmed L3: {[(p.level, p.verified) for p in pocs]}"
