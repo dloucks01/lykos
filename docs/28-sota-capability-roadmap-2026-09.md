@@ -46,6 +46,7 @@ Tier entries **[DONE]**.
 | Binary memory-safety oracle | `analyze/dynamic/memoracle.py` | `test_memoracle.py` | Valgrind memcheck → CWE classification for stripped-binary crashes + a guard-page (`libdislocator`) oracle wired into the fuzz loop |
 | Sink-directed block distance | `analyze/fuzz/blockdist.py` | `test_blockdist.py` | AFLGo-style block distance to lykos's own sinks, steering the fuzzer to keep inputs that get closer (no recompile) |
 | Binary N-day variant hunting | `analyze/variant.py` + `lykos variant-scan` | `test_variant.py` | Fuzzy function matching + corpus-wide hunt for an unpatched vulnerable function |
+| Corpus distillation (minset) | `analyze/fuzz/distill.py` | `test_distill.py` | afl-cmin-style coverage-preserving corpus minimization via the block tracer, before every campaign |
 
 ### 1. Static input-to-state dictionary (`analyze/fuzz/cmpdict.py`)
 
@@ -137,7 +138,7 @@ copy matches at 1.0 while a `strncpy`-patched build reads clean. Tests in `tests
    Unlike upstream AFLGo/Beacon this needs **no source** — it suits our stripped/cross-arch targets.
    Build cost: **medium**, all static/offline. Refs: AFLGo (CCS'17); Beacon (S&P'22); ParmeSan
    (USENIX'20, sanitizer-check blocks as targets).
-4. **Corpus distillation before every campaign: `afl-cmin` → OptiMin.** ISSTA'21 shows *minset
+4. **[DONE — `distill.py`] Corpus distillation before every campaign (greedy minset; OptiMin optional).** ISSTA'21 shows *minset
    quality dominates fuzzer choice*. Start with `afl-cmin` (already in AFL++), then OptiMin
    (MaxSAT-optimal, ships in AFL++ tree, bundle a MaxSAT solver). Also distill angr-produced inputs.
    Build cost: **low**. Refs: "Seed Selection for Successful Fuzzing" (ISSTA'21).
@@ -231,16 +232,15 @@ copy matches at 1.0 while a `strncpy`-patched build reads clean. Tests in `tests
 The four highest-ROI items (`cmpdict`, `memoracle`, `blockdist`, `variant`) are now **shipped**
 (see "Shipped in this pass"). The next tier, in priority order:
 
-1. **Corpus distillation** (Tier 1 #4): wire `afl-cmin` (then OptiMin) before every campaign and on
-   angr-produced inputs — ISSTA'21 shows minset quality dominates fuzzer choice; nearly free.
-2. **Grammar / structure-aware mutation from the inferred format spec** (Tier 2 #9): emit lykos's
+1. **Grammar / structure-aware mutation from the inferred format spec** (Tier 2 #9): emit lykos's
    already-inferred format spec as a Gramatron/Grammar-Mutator grammar through the AFL++
    custom-mutator API — uniquely leverages an asset most fuzzers lack.
-3. **weggli source variant analysis** (Tier 2 #8): vendor the single weggli binary + a curated
+2. **weggli source variant analysis** (Tier 2 #8): vendor the single weggli binary + a curated
    query pack and a "generalize-from-a-patch" workflow — the source-side complement to the binary
    `variant-scan` just shipped.
-4. **Differential testing (NEZHA-style)** (Tier 2 #11): a non-crashing oracle for logic/parsing
+3. **Differential testing (NEZHA-style)** (Tier 2 #11): a non-crashing oracle for logic/parsing
    bugs sanitizers never see — highest *new bug class* yield.
+4. **OptiMin** (MaxSAT-optimal minset) on top of `distill.py` when a bundled solver is acceptable.
 
 Beacon-style path pruning on top of `blockdist`, and `libqasan` (built from AFL++ qemu_mode) to add
 shadow-memory depth to the `memoracle` lanes, are natural follow-ons to the shipped work.

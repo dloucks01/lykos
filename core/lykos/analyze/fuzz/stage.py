@@ -56,6 +56,10 @@ def _mine_dictionary(strings):
 # How many inputs the corpus may retain, and how big one may be. A blind campaign that keeps
 # everything spends its budget re-running near-duplicates of one enormous input.
 _MAX_CORPUS = 256
+# Corpus distillation (afl-cmin-style): only bother minsetting a seed set bigger than this, and
+# trace at most this many seeds for the up-front coverage measurement.
+_DISTILL_MIN = 12
+_DISTILL_CAP = 256
 # Below this share of the binary, a call-graph closure is not telling us about dead code --
 # it is telling us the call graph could not be read (stripped, or indirect-heavy).
 _LIVE_FLOOR = 0.25
@@ -402,6 +406,25 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
     # never taken -- which is the difference between a few thousand distinct behaviours and
     # tens of thousands of distinct paths.
     all_blocks = set(cover_blocks or ())
+    # Corpus distillation: before spending the budget, drop seeds whose block coverage another seed
+    # already covers, so the campaign starts from a small high-coverage minset instead of re-running
+    # near-duplicate accumulated inputs (ISSTA'21: minset quality dominates fuzzer choice). Crashers
+    # are always kept. Gated on a corpus worth minimising, block coverage to measure with, and the
+    # batched runner (the only one that reports per-input blocks). Never fatal -- it is an optimiser.
+    if all_blocks and len(corpus) > _DISTILL_MIN and runner_takes_blocks:
+        try:
+            from . import distill as _distill
+            _d = _distill.distill_corpus(exe, corpus, all_blocks, mode=mode, base_argv=base_argv,
+                                         timeout=exec_timeout, arch=target.arch,
+                                         endianness=getattr(target, "endianness", None),
+                                         bits=getattr(target, "bits", None), cap=_DISTILL_CAP)
+            if _d["dropped"] > 0:
+                corpus = _d["kept"]
+                ctx.emit(f"{event_prefix}.distill", payload=_d["stats"])
+                ctx.progress(msg=f"{event_prefix} distilled corpus "
+                                 f"{_d['stats']['in']} -> {_d['stats']['out']} seeds")
+        except Exception:
+            pass
     seen_blocks: set = set()
     # Sink-directed steering (AFLGo-style): `block_dist` maps a block address to its distance to a
     # target sink. We keep the lowest distance any input has reached, and RETAIN an input that gets
