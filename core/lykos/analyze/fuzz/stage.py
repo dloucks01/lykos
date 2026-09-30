@@ -390,6 +390,24 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
                          "options": opts, "why": "the target drives a numbered menu; navigating it"})
     except Exception:
         pass
+    # A WORD-command service -- `strncmp(cmd, "free", 4)` -- is a state machine like a numbered menu
+    # but keyed on verbs the menu path cannot see. When no menu (and no explicit format model) fired,
+    # mine the verbs (comparison literals, often too short for the string table) and seed ordered
+    # command sequences: a use-after-free is `free` then `use`, a double-free is `free` twice --
+    # neither reachable by a mutator that has to invent BOTH words and order them across lines.
+    if mutator is None:
+        try:
+            from . import command as _cmd
+            verbs = _cmd.mine_verbs(ctx.content.path(target.sha256).read_bytes())
+            cseeds = [s for s in _cmd.command_seeds(verbs) if s]
+            if cseeds:
+                corpus = list(corpus) + cseeds
+                mutator = _cmd.CommandMutator(rng, verbs, dictionary)
+                ctx.progress(msg=f"{event_prefix} learned {len(cseeds)} command seeds")
+                ctx.emit("fuzz.format", payload={"model": "command", "auto": True,
+                         "verbs": verbs[:16], "why": "the target dispatches on text commands"})
+        except Exception:
+            pass
     mut = mutator or Mutator(rng, dictionary)          # menu / structure-aware mutator when supplied
     fd = FindingDAO(ctx.conn)
     dd = DynResultDAO(ctx.conn)
