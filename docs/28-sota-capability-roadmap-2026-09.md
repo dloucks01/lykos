@@ -49,6 +49,7 @@ Tier entries **[DONE]**.
 | Corpus distillation (minset) | `analyze/fuzz/distill.py` | `test_distill.py` | afl-cmin-style coverage-preserving corpus minimization via the block tracer, before every campaign |
 | Grammar-aware mutation | `analyze/fuzz/grammar.py` | `test_grammar.py` | Recursive/structure-valid input generation (Gramatron/Nautilus-style) reaching code behind nested parsers a flat model never builds |
 | Source variant analysis | `analyze/weggli.py` + `lykos weggli-scan` | `test_weggli.py` | weggli AST vuln-pattern pack over C/C++ + generalize-from-a-patch variant hunting (source-side complement to variant-scan) |
+| Differential testing | `analyze/fuzz/differential.py` + `lykos diff-test` | `test_differential.py` | NEZHA-style discrepancy oracle: fuzz 2+ implementations, flag disagreement (a non-crashing bug class) |
 
 ### 1. Static input-to-state dictionary (`analyze/fuzz/cmpdict.py`)
 
@@ -184,7 +185,7 @@ copy matches at 1.0 while a `strncpy`-patched build reads clean. Tests in `tests
     scheduling (invoke on coverage-stall, optimistic solving, block pruning). Cuts expensive
     symbolic runs sharply. Build cost: **medium**, all on vendored engines. Refs: GreyOne
     (USENIX'20); Eclipser (ICSE'19); QSYM (USENIX'18); Driller (NDSS'16).
-11. **Differential testing (NEZHA-style discrepancy oracle).** Run one input through ≥2 local
+11. **[DONE — `differential.py` + `lykos diff-test`] Differential testing (NEZHA-style oracle).** Run one input through ≥2 local
     implementations of a spec (parsers, TLS/crypto, decompressors) and flag divergence — a
     **non-crashing** oracle for logic/validation bugs (auth bypass, request smuggling, cert-check
     gaps) sanitizers never see; historically very high CVE yield. Build cost: **medium** (reusable

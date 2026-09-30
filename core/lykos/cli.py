@@ -158,7 +158,60 @@ def build_parser() -> argparse.ArgumentParser:
     wg.add_argument("--json", action="store_true", help="emit findings as JSON")
     wg.add_argument("--timeout", type=int, default=120, help="per-query budget (s)")
     wg.set_defaults(func=_cmd_weggli_scan)
+
+    dt = sub.add_parser("diff-test",
+                        help="differential testing: fuzz 2+ implementations, report disagreements")
+    dt.add_argument("programs", nargs="+", help="2+ program binaries implementing the same spec")
+    dt.add_argument("--mode", choices=("stdin", "arg", "file"), default="stdin",
+                    help="how each program takes the input (default stdin)")
+    dt.add_argument("--seed", action="append", default=[], help="a seed input FILE (repeatable)")
+    dt.add_argument("--iterations", type=int, default=2000, help="mutation iterations")
+    dt.add_argument("--compare", choices=("status", "output"), default="status",
+                    help="status = accept/reject/crash; output = also compare produced bytes")
+    dt.add_argument("--timeout", type=float, default=5.0, help="per-run budget (s)")
+    dt.add_argument("--json", action="store_true", help="emit discrepancies as JSON")
+    dt.set_defaults(func=_cmd_diff_test)
     return p
+
+
+def _cmd_diff_test(args: argparse.Namespace) -> int:
+    import json
+    import random
+    from pathlib import Path
+
+    from .analyze.fuzz import differential as D
+    if len(args.programs) < 2:
+        print("diff-test needs at least two programs", file=sys.stderr)
+        return 2
+    for pth in args.programs:
+        if not Path(pth).exists():
+            print(f"no such file: {pth}", file=sys.stderr)
+            return 2
+    progs = [D.Program(Path(p).name, p, mode=args.mode) for p in args.programs]
+    seeds = []
+    for s in args.seed:
+        try:
+            seeds.append(Path(s).read_bytes())
+        except OSError as e:
+            print(f"skip seed {s}: {e}", file=sys.stderr)
+    st = D.differential_campaign(progs, seeds, rng=random.Random(0), iterations=args.iterations,
+                                 timeout=args.timeout, compare=args.compare)
+    if args.json:
+        print(json.dumps({"execs": st.execs, "delta_diversity": st.delta_diversity,
+                          "discrepancies": st.discrepancies}, indent=2, default=list))
+        return 0
+    print(f"diff-test: {st.execs} execs, {st.delta_diversity} distinct behaviour-combinations, "
+          f"{len(st.discrepancies)} disagreement(s):\n")
+    for d in st.discrepancies[:40]:
+        parts = "  ".join(f"[{o}] {','.join(names)}" for o, names in d["partitions"].items())
+        print(f"  {d['kind']:<13} on {d['input'][:48]}...")
+        print(f"                {parts}")
+    if st.discrepancies:
+        print("\nEach disagreement is a candidate bug -- one implementation accepts/handles input "
+              "another does not. Confirm which behaviour violates the spec.")
+    else:
+        print("no disagreements found (the implementations behaved identically on every input).")
+    return 0
 
 
 def _cmd_weggli_scan(args: argparse.Namespace) -> int:
