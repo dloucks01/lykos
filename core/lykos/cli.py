@@ -150,7 +150,46 @@ def build_parser() -> argparse.ArgumentParser:
     vs.add_argument("--timeout", type=int, default=600, help="per-binary analysis budget (s)")
     vs.add_argument("--json", action="store_true", help="emit results as JSON")
     vs.set_defaults(func=_cmd_variant_scan)
+
+    wg = sub.add_parser("weggli-scan",
+                        help="source variant analysis: run the weggli vuln-pattern pack over C/C++")
+    wg.add_argument("path", help="source directory (or file) to scan")
+    wg.add_argument("--cpp", action="store_true", help="C++ mode")
+    wg.add_argument("--json", action="store_true", help="emit findings as JSON")
+    wg.add_argument("--timeout", type=int, default=120, help="per-query budget (s)")
+    wg.set_defaults(func=_cmd_weggli_scan)
     return p
+
+
+def _cmd_weggli_scan(args: argparse.Namespace) -> int:
+    import json
+    from pathlib import Path
+
+    from .analyze import weggli
+    if not Path(args.path).exists():
+        print(f"no such path: {args.path}", file=sys.stderr)
+        return 2
+    r = weggli.scan(args.path, cpp=args.cpp, timeout=args.timeout)
+    if args.json:
+        print(json.dumps(r, indent=2, default=list))
+        return 0
+    if not r["supported"]:
+        print(r["note"], file=sys.stderr)
+        return 3
+    if not r["findings"]:
+        print(f"no vulnerable patterns matched ({r['queries_run']} queries, clean).")
+        return 0
+    print(f"weggli found {len(r['findings'])} vulnerable pattern(s) "
+          f"({r['queries_run']} queries):\n")
+    for f in r["findings"]:
+        from pathlib import Path as _P
+        files = ", ".join(_P(x).name for x in f["files"][:6])
+        more = f" (+{len(f['files']) - 6} more)" if len(f["files"]) > 6 else ""
+        print(f"  [{f['severity']:<8}] {f['cwe']:<8} {f['name']}  x{f['count']}: {files}{more}")
+        print(f"             {f['why']}")
+    print("\nEach is a candidate -- confirm the source reaching the sink is untrusted, then "
+          "generalize from a confirmed bug with weggli.variant_query to hunt more variants.")
+    return 0
 
 
 def _cmd_variant_scan(args: argparse.Namespace) -> int:

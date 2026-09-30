@@ -48,6 +48,7 @@ Tier entries **[DONE]**.
 | Binary N-day variant hunting | `analyze/variant.py` + `lykos variant-scan` | `test_variant.py` | Fuzzy function matching + corpus-wide hunt for an unpatched vulnerable function |
 | Corpus distillation (minset) | `analyze/fuzz/distill.py` | `test_distill.py` | afl-cmin-style coverage-preserving corpus minimization via the block tracer, before every campaign |
 | Grammar-aware mutation | `analyze/fuzz/grammar.py` | `test_grammar.py` | Recursive/structure-valid input generation (Gramatron/Nautilus-style) reaching code behind nested parsers a flat model never builds |
+| Source variant analysis | `analyze/weggli.py` + `lykos weggli-scan` | `test_weggli.py` | weggli AST vuln-pattern pack over C/C++ + generalize-from-a-patch variant hunting (source-side complement to variant-scan) |
 
 ### 1. Static input-to-state dictionary (`analyze/fuzz/cmpdict.py`)
 
@@ -163,7 +164,7 @@ copy matches at 1.0 while a `strncpy`-patched build reads clean. Tests in `tests
    bugs — this is the biggest *new-bug-source* gap after the memory oracle. Build cost:
    **low–medium** (both self-contained JVM/native). Refs: https://github.com/clearbluejar/ghidriff ;
    Ghidra BSim tutorial.
-8. **Source variant analysis: vendor weggli (+ optional Joern).** Turn a root-caused bug into a
+8. **[DONE — `weggli.py` integration + query pack + `lykos weggli-scan`; binary install-on-demand] Source variant analysis (weggli).** Turn a root-caused bug into a
    query and sweep the codebase for siblings. **weggli** is a single static Rust binary (easiest to
    vendor) with a "generalize-from-a-patch" workflow; Joern (CPG + data-flow) as the heavier
    cross-language backend. **CodeQL is deliberately excluded as a default** — free only for
@@ -241,9 +242,10 @@ The four highest-ROI items (`cmpdict`, `memoracle`, `blockdist`, `variant`) are 
    `variant-scan` just shipped.
 2. **Differential testing (NEZHA-style)** (Tier 2 #11): a non-crashing oracle for logic/parsing
    bugs sanitizers never see — highest *new bug class* yield.
-3. **OptiMin** (MaxSAT-optimal minset) on top of `distill.py` when a bundled solver is acceptable.
-4. **Auto-derive a grammar from the inferred format spec / mined tokens** so the new grammar engine
+2. **OptiMin** (MaxSAT-optimal minset) on top of `distill.py` when a bundled solver is acceptable.
+3. **Auto-derive a grammar from the inferred format spec / mined tokens** so the new grammar engine
    fires without an analyst-supplied grammar (a from_spec bridge already exists; extend it).
+4. **Joern** as a heavier cross-language / data-flow variant-analysis backend beside weggli.
 
 Beacon-style path pruning on top of `blockdist`, and `libqasan` (built from AFL++ qemu_mode) to add
 shadow-memory depth to the `memoracle` lanes, are natural follow-ons to the shipped work.

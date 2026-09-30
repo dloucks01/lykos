@@ -292,6 +292,11 @@ def _probe_qasan():
     return str(p) if p else None
 
 
+def _probe_weggli():
+    from .analyze.weggli import weggli_bin
+    return weggli_bin() or None
+
+
 TOOLS: tuple = (
     Tool("python", "Python 3", "the platform itself", "nothing runs",
          "already present (the runtime is stdlib-only; no pip packages)",
@@ -356,6 +361,12 @@ TOOLS: tuple = (
          "the dislocator + valgrind lanes cover the common case; qasan adds shadow-memory depth",
          "build AFL++ qemu_mode with libqasan, then LYKOS_QASAN=/path/libqasan.so",
          _probe_qasan, tier="optional"),
+    Tool("weggli", "weggli (source variant analysis)",
+         "AST pattern matching over C/C++ source: run the vuln-pattern pack and hunt variants of a "
+         "known bug (lykos weggli-scan)",
+         "the source variant-analysis pack is unavailable (binary variant-scan still applies)",
+         "cargo install weggli  (or a release binary), then it is on PATH / set LYKOS_WEGGLI",
+         _probe_weggli, tier="optional"),
     Tool("jdk", "JDK (javac + jar)", "building the JVM gate fixtures",
          "the real-gate JVM case skips",
          "apt-get install default-jdk", _probe_jdk, tier="optional", apt=("default-jdk",)),
