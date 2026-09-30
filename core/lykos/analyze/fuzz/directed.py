@@ -26,6 +26,7 @@ import random
 from collections import defaultdict
 
 from ...db.dao import (
+    ArtifactDAO,
     CallEdgeDAO,
     DynResultDAO,
     FindingDAO,
@@ -288,6 +289,51 @@ def _target_label(targets):
     return f"{t.get('cwe') or t.get('detector')} @ {where}"
 
 
+def _auto_weggli_targets(ctx, target, functions, *, timeout: float = 90.0):
+    """Auto-run weggli on the target's RETAINED source (archived at ingest) and map the hits to
+    directed-fuzz targets -- so a source-built project's weggli findings steer the campaign with no
+    operator step. Best-effort: empty on any miss (weggli absent, no source artifact, extract/scan
+    failure). Only source-built targets have a symbolized name->addr map for weggli.to_targets."""
+    import io
+    import shutil
+    import tarfile
+    import tempfile
+    from pathlib import Path
+
+    from .. import weggli
+    if weggli.weggli_bin() is None:
+        return []
+    art = None
+    for a in ArtifactDAO(ctx.conn).list_by_case(target.case_id):
+        if a.kind in ("source-project", "source-code") \
+                and (a.meta or {}).get("binary_sha") == target.sha256:
+            art = a
+            break
+    if art is None:
+        return []
+    d = Path(tempfile.mkdtemp(prefix="lykos-weggli-"))
+    try:
+        raw = ctx.content.get_bytes(art.sha256)
+        if art.kind == "source-project":
+            with tarfile.open(fileobj=io.BytesIO(raw)) as tf:
+                tf.extractall(d, filter="data")        # our own archive; filter blocks traversal
+        else:
+            fname = Path((art.meta or {}).get("filename") or "src.c").name
+            (d / fname).write_bytes(raw)
+        exts = {p.suffix.lower() for p in d.rglob("*") if p.is_file()}
+        cpp = bool(exts & {".cc", ".cpp", ".cxx", ".hpp", ".hh", ".c++"})
+        sc = weggli.scan(d, cpp=cpp, timeout=timeout)
+        tgts = weggli.to_targets(sc, functions)
+        if tgts:
+            ctx.emit("directed.weggli", payload={"targets": len(tgts), "source": art.kind,
+                     "hits": [{"title": t["title"], "cwe": t["cwe"]} for t in tgts[:8]]})
+        return tgts
+    except Exception:
+        return []
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def directed_stage(ctx) -> dict:
     target = TargetDAO(ctx.conn).get(ctx.target_id) if ctx.target_id else None
     if target is None:
@@ -312,9 +358,12 @@ def directed_stage(ctx) -> dict:
     strings = StringDAO(ctx.conn).list_by_target(target.id)
 
     # Targets from OTHER static engines, closing the static->dynamic loop: weggli source hits mapped
-    # to binary functions (params.weggli_targets, produced by weggli.to_targets) steer the campaign
-    # toward source-flagged code. diff-test disagreement inputs come in as seeds via params.seeds.
-    extra_targets = p.get("weggli_targets") or []
+    # to binary functions steer the campaign toward source-flagged code. weggli runs auto on
+    # the target's retained source (unless params.weggli is false); an operator may also pass
+    # pre-mapped targets via params.weggli_targets. diff-test disagreements come in as params.seeds.
+    extra_targets = list(p.get("weggli_targets") or [])
+    if p.get("weggli", True):
+        extra_targets += _auto_weggli_targets(ctx, target, hydrated)
     plan = plan_directed_campaign(findings, hydrated, call_edges, strings,
                                   extra_targets=extra_targets)
 
