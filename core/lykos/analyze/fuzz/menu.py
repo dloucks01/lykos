@@ -205,9 +205,13 @@ def crawl_menu(spawn, options, *, max_fields: int = 10, idle: float = 0.2,
                 continue
             fields: list[str] = []
             last_num = 0
+            returned = False       # did the menu come back? (option completed, process alive)
             for _ in range(max_fields):
                 out, alive = _drain(proc, sel, idle=idle, deadline=deadline)
-                if _looks_like_menu(out) or not alive:
+                if _looks_like_menu(out):
+                    returned = True
+                    break
+                if not alive:
                     break
                 ftype = classify_prompt(_tail_prompt(out))
                 fields.append(ftype)
@@ -224,7 +228,14 @@ def crawl_menu(spawn, options, *, max_fields: int = 10, idle: float = 0.2,
                     proc.stdin.flush()
                 except (OSError, ValueError):
                     break
-            if fields:
+            # Record an option that COMPLETED and returned to the menu, even when it read no
+            # fields: a no-argument action -- a fixed-size `malloc`, a bare `free`/`use`/`print`
+            # -- is a real menu operation, and the heap op-sequences (double-free, use-after-free)
+            # are built out of exactly these. The menu reprinting is the completion signal: an
+            # option that EXITED the process ("quit") never returns to it (and any "bye" line it
+            # prints must not be mistaken for a field), so it stays unrecorded and no sequence
+            # selects it and cuts itself short.
+            if returned:
                 model[opt] = fields
         except Exception:                                    # noqa: BLE001 -- best-effort probe
             pass
@@ -320,34 +331,57 @@ def menu_op_sequences(model: dict, options, *, max_seqs: int = 40, width=None) -
     the front-door menu -- so only a correctly-typed op-sequence can put a bad index there at all.
     Empty when the model has no allocator."""
     opts = [str(o) for o in (options or [])]
-    alloc = next((o for o in opts if o in model and _is_alloc(model[o])), None)
-    if alloc is None:
+    present = [o for o in opts if o in model]
+    alloc = next((o for o in present if _is_alloc(model[o])), None)
+    # A no-ARGUMENT option (empty field template) is a candidate allocator or trigger the size-flow
+    # heuristic cannot name: a fixed-size `malloc` reads nothing, and so do the bare `free`/`use`/
+    # `print` operations whose SEQUENCE is the double-free / use-after-free. With neither a size-flow
+    # allocator nor any no-arg option there is nothing that can build heap state, so still empty --
+    # which keeps a menu of index-only operations (delete/modify by id, no create) from emitting
+    # sequences that act on objects it can never allocate.
+    noarg = [o for o in present if not model[o]]
+    if alloc is None and not noarg:
         return []
     def _op(o, **kw):                                    # option choice + its filled fields
         return _scalar(o.encode(), width) + _fill(model[o], width=width, **kw)
-    one = _op(alloc)
-    prime = one + one                                    # two objects: ids 0 and 1 both exist
     # Out-of-range indices for the unchecked-index shape: negative (below a high-only bound) and far
     # above any plausible table size. The mutator widens these further, but the campaign must be
     # handed a valid navigation that ALREADY lands a bad index in the handler to build from.
     oob = (b"-1", b"-2", b"9999")
     seqs: list[bytes] = []
-    for o in opts:
-        f = model.get(o)
-        if not f:
-            continue
-        idx_opt = any(x == "idx" for x in f)
-        for iv in (b"0", b"1"):                          # target id 0 and 1 (0- or 1-based tables)
-            # overflow: after priming, drive this option with an over-long final string
-            seqs.append(prime + _op(o, big_last=True, idx=iv))
-            # double-free / UAF: an index-only option driven twice on the same object
-            if all(x == "idx" for x in f):
-                seqs.append(prime + _op(o, idx=iv) + _op(o, idx=iv))
-        if idx_opt:
-            # unchecked-index (CWE-129): reach the indexed handler with a negative / oversized id
-            for iv in oob:
-                seqs.append(prime + _op(o, idx=iv))
+    # --- precise path: a size-flow allocator (add/create reading a size) was identified. Prime two
+    #     objects, then drive each option with an over-long last string / doubled id / bad index. ---
+    if alloc is not None:
+        one = _op(alloc)
+        prime = one + one                                # two objects: ids 0 and 1 both exist
+        for o in present:
+            f = model[o]
+            if not f:
+                continue
+            idx_opt = any(x == "idx" for x in f)
+            for iv in (b"0", b"1"):                      # target id 0 and 1 (0- or 1-based tables)
                 seqs.append(prime + _op(o, big_last=True, idx=iv))
+                if all(x == "idx" for x in f):           # double-free / UAF: index-only op, twice
+                    seqs.append(prime + _op(o, idx=iv) + _op(o, idx=iv))
+            if idx_opt:
+                for iv in oob:                           # unchecked-index (CWE-129)
+                    seqs.append(prime + _op(o, idx=iv))
+                    seqs.append(prime + _op(o, big_last=True, idx=iv))
+    # --- generic path: reach use-after-free / double-free / double-use even when the allocator and
+    #     the trigger take NO argument, which the size-flow heuristic above cannot name. An
+    #     alloc->free->use flow is literally "select every option in order", and no single-option
+    #     seed reaches it; a no-arg double-free is the SAME option twice once an object is live. ---
+    gprime = b"".join(_op(o) for o in noarg) or (_op(alloc) if alloc else b"")
+    seqs.append(b"".join(_op(o) for o in present))       # walk every option in menu order
+    seqs.append(b"".join(_op(o) for o in reversed(present)))   # and in reverse
+    for o in present:
+        f = model[o]
+        ivs = (b"0", b"1") if any(x == "idx" for x in f) else (None,)
+        for iv in ivs:
+            kw = {"idx": iv} if iv is not None else {}
+            # prime a live object with the no-arg options, then drive THIS op twice: a bare
+            # free/use repeated (CWE-416/CWE-415), or free(id) on the same id twice.
+            seqs.append(gprime + _op(o, **kw) + _op(o, **kw))
     out, seen = [], set()
     for s in seqs:
         if s not in seen:
