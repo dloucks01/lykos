@@ -126,6 +126,13 @@ class CodeMarkers:
         # what a target that merely echoes the command back would emit.
         return f'{self.nonce}A""B_$(({self.a}*{self.b}))'.encode()
 
+    def proves(self, output) -> bool:
+        """True iff `output` shows the challenge was EVALUATED (solved form present) and not
+        merely reflected (raw form absent) -- a real shell ran it, not an echo. Use in place of
+        a bare `marker in output` check to close the input-reflection false positive."""
+        ob = output if isinstance(output, (bytes, bytearray)) else output.encode("latin-1", "ignore")
+        return self.solved in ob and self.raw not in ob
+
 
 def make_code_markers() -> CodeMarkers:
     a = 100 + secrets.randbelow(900)

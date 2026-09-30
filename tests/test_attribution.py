@@ -91,3 +91,14 @@ def test_a_win_printed_every_time_is_not_a_hijack(tmp_path):
     ctrl = _run(exe, b"xx\n", tmp_path)
     g = A.grade(hit, win_tokens=[b"flag{"], control=ctrl)
     assert g["level"] == "output_attributed"       # attributed, but not a differential win
+
+
+def test_code_markers_reject_reflection():
+    """The core anti-reflection property: a shell that evaluates the challenge is proven; a target
+    that merely echoes the command (its raw form) is not -- closing the input-reflection cheat that
+    a bare `marker in output` check falls for."""
+    m = A.make_code_markers()
+    assert m.proves(b"noise " + m.solved + b" more")        # a real shell evaluated it
+    assert not m.proves(b"you sent: " + m.command)          # an echo reflects the raw command
+    assert not m.proves(m.raw)                               # the unevaluated challenge alone
+    assert not m.proves(b"")
