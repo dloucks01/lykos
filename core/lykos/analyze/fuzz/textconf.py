@@ -112,6 +112,29 @@ def seed_for(keys, *, sep: str = "=") -> bytes:
     return b"\n".join(lines) + b"\n"
 
 
+# Edge values for a field parsed as a NUMBER. A config key fed to atoi / Integer.parseInt / an
+# array index hides its bug behind a specific value -- 0, -1, INT_MAX, overflow -- that random
+# mutation of a text placeholder lands only by luck inside a short (JVM-slow) exec budget.
+_BOUNDARY_VALUES = (b"0", b"-1", b"2147483647", b"2147483648", b"4294967295")
+
+
+def boundary_seeds(keys, *, sep: str = "=", limit: int = 5) -> list:
+    """One accepted config per boundary value, with that value on EVERY discovered key at once.
+
+    A numeric-field bug (unchecked array index, off-by-one bound, signed overflow) becomes
+    reachable on the first execution instead of by chance -- the same reason a byte fuzzer ships
+    a dictionary. General, not target-specific: a robust parser simply accepts these and the
+    campaign moves on; only a real bug turns one into a crash."""
+    if not keys:
+        return []
+    ks = [(k.encode("ascii", "replace") if isinstance(k, str) else k) for k in keys[:8]]
+    sep = sep.encode() if isinstance(sep, str) else sep
+    out = []
+    for v in _BOUNDARY_VALUES[:limit]:
+        out.append(b"\n".join(k + sep + v for k in ks) + b"\n")
+    return out
+
+
 class KeyValueMutator:
     """Line-aware mutator with the byte Mutator's interface.
 

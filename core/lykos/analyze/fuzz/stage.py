@@ -140,6 +140,10 @@ def format_aware_seeds(ctx, target) -> list:
         keys = textconf.keys_from(svals)
         if keys:
             seeds.append(textconf.seed_for(keys))
+            # ...plus a boundary-value config per numeric edge (0, -1, INT_MAX, overflow): a
+            # config field parsed as a number hides an unchecked-index / off-by-one bug behind a
+            # specific value that mutating a text placeholder rarely lands inside a short budget.
+            seeds += textconf.boundary_seeds(keys)
     except Exception:
         pass
     # the binary's own selective strings (magic tokens, config keywords, path prefixes)
