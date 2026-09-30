@@ -19,6 +19,11 @@ import time
 # The digit is delimited by a closing bracket OR a separator, and a LETTER must follow (so version
 # strings like "1.5 GB" or "2.3.4" do not read as menu options).
 _OPT = re.compile(r"^\s*[\[\(<]?\s*(\d{1,2})\s*(?:[\]\)>]|[-.):|])\s*[A-Za-z]")
+# the same item found ANYWHERE in a line, not only at its start: a compact menu prints every
+# option on ONE line ("1)alloc 2)free 3)use 0)quit"), so anchoring to the line start sees only the
+# first. A separator must precede the digit (start / space / a table border) so a version string
+# mid-line ("build 2.3.4") is not read as options.
+_OPT_SCAN = re.compile(r"(?:^|[\s|>#])\s*[\[\(<]?\s*(\d{1,2})\s*(?:[\]\)>]|[-.):|])\s*[A-Za-z]")
 # a choice prompt the loop reads after printing the menu
 _PROMPT = re.compile(r"(choice|option|select|menu|enter|cmd|command|action|your)\b", re.I)
 
@@ -39,8 +44,9 @@ def detect_menu(strings) -> list[str]:
             # boxed menus prefix each option with a table border ("| [1] Allocate |"); strip a
             # leading border / bullet so the option token is at the start for the matcher.
             line = raw.lstrip("|*>#-=+ \t│┃‖●·")
-            m = _OPT.match(line)
-            if m:
+            # Every option on the line, not just the first: one-per-line menus match at the start
+            # and compact single-line menus match the rest after each separator.
+            for m in _OPT_SCAN.finditer(line):
                 opts.add(m.group(1))
             if _PROMPT.search(line):
                 prompt = True
