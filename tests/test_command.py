@@ -59,6 +59,6 @@ def test_mutator_emits_only_valid_command_lines():
         for line in out.split(b"\n"):
             if line in verbset:
                 saw_verb = True
-            elif line and set(line) != {ord("A")}:      # the only other shape is a data/overflow line
+            elif line and set(line) != {ord("A")}:      # else only a data/overflow line
                 raise AssertionError(f"unexpected line {line!r}")
     assert saw_verb
