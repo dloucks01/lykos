@@ -2,7 +2,7 @@
 
 > **Authorized use only.** An offensive-security tool, for binaries and systems you are
 > authorized to test. Authorization is an operator-process matter and is deliberately not
-> modelled in the software (see `docs/15-risks-open-questions.md`).
+> modelled in the software (see `docs/overview.md`).
 
 lykos ingests a binary — stripped, cross-architecture, firmware, JAR, or PE — recovers its
 structure, detects CWE-class defects through static, dynamic and symbolic analysis, builds a
@@ -19,7 +19,7 @@ Nothing to install to get that far: the core is **stdlib-only**, no pip packages
 engines (Ghidra, qemu-user, AFL++, GDB, angr…) are optional and separately bundled — and that
 bundle installs nothing either. It extracts to a relocatable tree under `vendor/` that lykos
 runs in place: no `dpkg`, no root, and the host's own libraries are never overwritten or put on
-any shared search path. See **[docs/23-airgap-install.md](docs/23-airgap-install.md)**.
+any shared search path. See **[docs/air-gap.md](docs/air-gap.md)**.
 
 **New here?** [QUICKSTART.md](QUICKSTART.md) walks you from a fresh install to your first
 finding in five minutes.
@@ -38,10 +38,10 @@ and drives each crash as far up the exploitation ladder as the target allows.
   (confirmed instruction-pointer / write-what-where control), an **L3 working exploit** (ret2win /
   ROP hijacking control to chosen code), or the **captured leaked bytes** of a format-string
   disclosure. Nothing is over-claimed — ASan-guarded source stays *potential* for RCE and
-  *demonstrated* for DoS. (docs [08](docs/08-triage-poc.md))
+  *demonstrated* for DoS. (docs [08](docs/pipeline.md))
 - **Coverage that compounds.** When fuzzing stalls at a guarded branch, concolic execution solves
   it and the search **re-fuzzes from the solved inputs**, reaching the code beyond — 44% → 100%
-  block coverage on a magic-gated target, automatically. (docs [07](docs/07-harness-fuzzing.md))
+  block coverage on a magic-gated target, automatically. (docs [07](docs/pipeline.md))
 - **Every finding earned + reviewed.** `candidate → corroborated → confirmed → poc-backed`, with a
   false-positive **replay verdict** on each demonstrated crash.
 - **Source-first when source is available.** A source project builds ASan+UBSan-instrumented (a
@@ -49,17 +49,17 @@ and drives each crash as far up the exploitation ladder as the target allows.
   *confirmed* finding with the exact **source file:line** and CWE from the sanitizer — no CTF
   oracle needed. **libFuzzer** drives coverage-guided fuzzing with an **auto-synthesized harness**
   (an in-tree `LLVMFuzzerTestOneInput`, or one generated for a library's entry function, C or C++).
-  (docs [07](docs/07-harness-fuzzing.md))
+  (docs [07](docs/pipeline.md))
 - **Language-aware.** Triage identifies the source language — **C, C++, Go, Rust** — and analysis
   follows: the memory-safety engine for C/C++, and for the memory-safe languages a call-graph
   **injection / traversal / SSRF** channel (Go `os/exec`/`os.Open`/`database/sql`/`net/http`, Rust
   `std::process`/`std::fs`), corroborated when untrusted input reaches the sink. (docs
-  [05](docs/05-cwe-detection.md))
+  [05](docs/pipeline.md))
 - **A broad L3 ladder.** ret2win, ret2system/ROP, SROP, execve-syscall, ret2libc (puts-leak, PIE
   pure-libc, one-gadget fallback), stack-canary leak→ret2libc, **magic-value overwrite**,
   **format-string `%n` write**, **glibc-heap → shell** (tcache poison + House of Apple 2), mprotect
   shellcode, and **shellcode injection** with a **bad-char XOR encoder** for filtered input — every
-  L3 confirmed by a live shell / marker / breakpoint, never asserted. (docs [08](docs/08-triage-poc.md))
+  L3 confirmed by a live shell / marker / breakpoint, never asserted. (docs [08](docs/pipeline.md))
 
 ## Design philosophy
 
@@ -120,33 +120,18 @@ packaging/         zipapp build, offline verify, air-gap bundle scripts
 
 ## Documents
 
-| # | Doc | What it covers |
-|---|-----|----------------|
-| 00 | `docs/00-overview-goals.md` | Vision, users, non-goals, capability tiers |
-| 01 | `docs/01-gap-analysis.md` | Gaps in the original plan and what had to be added |
-| 02 | `docs/02-architecture.md` | Layers, pipeline/job engine, module boundaries |
-| 03 | `docs/03-static-analysis.md` | Loading, disasm, decompile, CFG/callgraph, types |
-| 04 | `docs/04-stripped-binary-recovery.md` | Function ID, signatures, custom ISAs |
-| 05 | `docs/05-cwe-detection.md` | CWE taxonomy engine, per-class strategies |
-| 06 | `docs/06-dynamic-analysis-sandbox.md` | Isolation, emulation, tracing, coverage, debugging |
-| 07 | `docs/07-harness-fuzzing.md` | Input-vector discovery, harness synthesis, fuzzing |
-| 08 | `docs/08-triage-poc.md` | Crash dedup, exploitability, root cause, PoC synthesis |
-| 09 | `docs/09-gui-design.md` | GUI architecture, views, design system |
-| 10 | `docs/10-tech-stack.md` | Technology choices, rationale, licensing |
-| 11 | `docs/11-airgap-packaging.md` | Air-gap *design position* (procedure is doc 23) |
-| 12 | `docs/12-data-model.md` | Case model, DB schema, artifact store |
-| 14 | `docs/14-validation-benchmarks.md` | How detection quality is measured |
-| 15 | `docs/15-risks-open-questions.md` | Risks, legal/ethical gating, open decisions |
-| 16 | `docs/16-sota-references.md` | State-of-the-art survey incl. DARPA AIxCC |
-| 17 | `docs/17-multibinary-firmware.md` | Multi-binary analysis + firmware rehosting |
-| 18 | `docs/18-architecture-coverage.md` | All-architecture coverage matrix and tiers |
-| 19 | `docs/19-cwe-coverage.md` | All-CWE coverage matrix by family and channel |
-| 22 | `docs/22-toolchain-setup.md` | What each engine is and how it was provisioned |
-| 23 | `docs/23-airgap-install.md` | **Air-gap setup runbook (no install)** — bundle, carry, verify, run in place |
+| Doc | What it covers |
+|-----|----------------|
+| [`docs/overview.md`](docs/overview.md) | Vision, users, non-goals, capability tiers; risks, constraints, open decisions |
+| [`docs/architecture.md`](docs/architecture.md) | Layers, pipeline/job engine, module boundaries; tech stack & licensing; data model & reproducibility |
+| [`docs/pipeline.md`](docs/pipeline.md) | The analysis engine end to end: static/RE → stripped recovery → CWE detection → dynamic & sandbox → fuzzing → triage & PoC → multi-binary/firmware |
+| [`docs/coverage.md`](docs/coverage.md) | Architecture coverage matrix, CWE coverage matrix, and how detection quality is measured |
+| [`docs/air-gap.md`](docs/air-gap.md) | Packaging design, per-host toolchain setup, and the no-install air-gap runbook |
+| [`docs/gui.md`](docs/gui.md) | The workbench UI: architecture, views, design system |
 
 New here? [QUICKSTART.md](QUICKSTART.md) is the five-minute path to your first finding;
-`docs/02-architecture.md` is the shape of the system. (Working notes, audits and the backlog
-live under `docs/internal/`.)
+[`docs/architecture.md`](docs/architecture.md) is the shape of the system. (Working notes,
+audits and the backlog live under `docs/internal/`.)
 
 ## What the detection gate measures
 

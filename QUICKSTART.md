@@ -2,7 +2,7 @@
 
 New to lykos? This is the five-minute path from a fresh install to your first finding.
 It assumes lykos is already on this machine — if you are setting up an air-gapped
-workstation from a disk, do [docs/23-airgap-install.md](docs/23-airgap-install.md) first,
+workstation from a disk, do [docs/air-gap.md](docs/air-gap.md) first,
 then come back here.
 
 ## What lykos is

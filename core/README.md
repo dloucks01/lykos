@@ -30,4 +30,4 @@ lykos/
 The tests live at the repository root (`../tests`), not here, because they exercise the
 platform end to end rather than this package in isolation.
 
-See the root `README.md` for commands and `docs/02-architecture.md` for how the pieces fit.
+See the root `README.md` for commands and `docs/architecture.md` for how the pieces fit.

@@ -58,7 +58,7 @@ if [ -n "$missing" ] || [ -n "$loaderr" ]; then
   [ -n "$missing" ] && echo "$missing"
   [ -n "$loaderr" ] && echo "$loaderr"
   echo "(folder: usually a shared library the bundle did not vendor -- the closure pass in"
-  echo " make-runnable.sh should copy it. See docs/23-airgap-install.md.)"
+  echo " make-runnable.sh should copy it. See docs/air-gap.md.)"
   exit 1
 fi
 say "AIR-GAP TEST PASSED -- every required tool resolves from the package alone."

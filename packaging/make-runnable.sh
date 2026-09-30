@@ -313,7 +313,7 @@ lykos -- air-gapped, unzip-and-run. No installation. Nothing is written outside 
 
 The analysis tools (rizin, gdb, qemu, wine, afl++, the cross-compilers, the JVM, ...) live
 under vendor/toolchain and run through relocatable wrappers, so they use ONLY the bundle's own
-libraries -- your laptop's libraries are never replaced or relinked. See docs/23-airgap-install.md.
+libraries -- your laptop's libraries are never replaced or relinked. See docs/air-gap.md.
 EOF
 
 say "zipping the single runnable package"
