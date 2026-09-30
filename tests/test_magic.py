@@ -135,3 +135,48 @@ def test_explicit_magic_strategy(store, case, pool, magic_bin):
     run = enqueue_exploit(q, t, params={"input_mode": "stdin", "strategy": "magic"})
     assert pool.wait_idle(120) and q.runs.get(run.id).status == "done"
     assert any(pc.level == "L3" and pc.verified for pc in PocDAO(store.conn).list_by_target(t.id))
+
+
+# ---- 64-bit magic gate: `unsigned long key == 0x...` -> `movabs rax, imm64; cmp rdx, rax` -----
+# The dword shapes above never match a 64-bit compare, so this whole class of gate was invisible
+# and the overwrite masked the value to 32 bits (writing half of it). Same jeeves flag-print shape.
+_MAGIC64 = r"""
+#include <stdio.h>
+#include <unistd.h>
+int main(void){
+    volatile unsigned long key = 0;
+    char name[64];
+    (void)read(0, name, 256);
+    if (key == 0xc0ffee1234567890UL) {
+        char fb[160]; FILE *f = fopen("flag.txt", "r");
+        if (f) { size_t k = fread(fb, 1, 159, f); fb[k] = 0; printf("gift: %s\n", fb); fclose(f); }
+    }
+    return 0;
+}
+"""
+
+
+@pytest.fixture
+def magic64_bin(gcc, tmp_path_factory, x86_64_only):
+    return _build(gcc, tmp_path_factory.mktemp("magic64"), _MAGIC64, "magic64")
+
+
+def test_find_magic_gates_64bit(magic64_bin):
+    gates = find_magic_gates(magic64_bin.read_bytes())
+    assert any(g["magic"] == 0xC0FFEE1234567890 and g["width"] == 8 and g["disp"] < 0
+               for g in gates), gates
+
+
+def test_build_exploit_confirms_magic64_overwrite(store, case, pool, magic64_bin):
+    """A 64-bit magic gate is detected AND its full 8 bytes are planted -- reaching L3 where the
+    32-bit-masked payload never satisfied the compare."""
+    t = ingest(store, case.id, magic64_bin, filename="magic64")
+    q = JobQueue(store.conn)
+    enqueue_triage(q, t, force=True)
+    assert pool.wait_idle(30)
+    run = enqueue_exploit(q, t, params={"input_mode": "stdin", "strategy": "auto"})
+    assert pool.wait_idle(120) and q.runs.get(run.id).status == "done"
+    pocs = PocDAO(store.conn).list_by_target(t.id)
+    assert any(pc.level == "L3" and pc.verified for pc in pocs), "no L3 for the 64-bit magic gate"
+    l3 = next(pc for pc in pocs if pc.level == "L3" and pc.verified)
+    assert l3.finding_id

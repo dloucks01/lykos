@@ -483,6 +483,32 @@ def _s8(b):
     return b - 256 if b >= 128 else b
 
 
+def _find_movabs(seg, start):
+    """Index of the next `movabs r64, imm64` (REX.W prefix 0x48/0x49, opcode 0xB8..0xBF) at or
+    after `start`, or -1. This is the only x86-64 instruction carrying a full 64-bit immediate."""
+    x = max(0, start)
+    n = len(seg)
+    while x + 1 < n:
+        if seg[x] in (0x48, 0x49) and 0xB8 <= seg[x + 1] <= 0xBF:
+            return x
+        x += 1
+    return -1
+
+
+def _local_load_disp(seg, lo, hi):
+    """Signed rbp/rsp disp8 of a `mov r64, [rbp/rsp+disp8]` load in seg[lo:hi], or None. Used to
+    recover the checked local's frame displacement for the 64-bit magic-gate shape."""
+    for x in range(max(0, lo), min(hi, len(seg) - 3)):
+        if seg[x] != 0x48 or seg[x + 1] != 0x8B:         # REX.W mov r64, r/m64
+            continue
+        modrm = seg[x + 2]
+        if (modrm & 0xC7) == 0x45:                       # mod=01, rm=101 -> [rbp+disp8]
+            return _s8(seg[x + 3])
+        if (modrm & 0xC7) == 0x44 and x + 4 < len(seg) and seg[x + 3] == 0x24:  # [rsp+disp8]
+            return _s8(seg[x + 4])
+    return None
+
+
 def find_magic_gates(data: bytes):
     """Find a stack LOCAL checked against a magic constant that gates a branch (jeeves'
     `if (local==0x1337bab3)` -> read+print the flag). A stack overflow that writes IMM32 into the
@@ -520,7 +546,7 @@ def find_magic_gates(data: bytes):
                 key = (va + hit, magic)
                 if key not in seen:
                     seen.add(key)
-                    out.append({"va": va + hit, "magic": magic, "disp": disp})
+                    out.append({"va": va + hit, "magic": magic, "disp": disp, "width": 4})
         # (b) load a local into eax, then compare eax to an immediate: mov eax,[rbp+disp8] (8b 45
         #     <disp8>) followed within a few bytes by cmp eax,imm32 (3d <imm32>) then a jcc.
         i = 0
@@ -540,7 +566,29 @@ def find_magic_gates(data: bytes):
                 key = (va + m, magic)
                 if key not in seen:
                     seen.add(key)
-                    out.append({"va": va + m, "magic": magic, "disp": disp})
+                    out.append({"va": va + m, "magic": magic, "disp": disp, "width": 4})
+        # (c) 64-bit magic: `mov r64,[rbp/rsp-X]; movabs rreg, imm64; cmp r64,r64; jcc`. gcc emits
+        #     this for a 64-bit local (`unsigned long key == 0x...`); the dword shapes above never
+        #     match it, so a whole class of magic gate was invisible and reached no L3 overwrite.
+        i = 0
+        while True:
+            mv = _find_movabs(seg, i)                     # REX.W B8+r : movabs r64, imm64
+            if mv < 0 or mv + 10 > len(seg):
+                break
+            i = mv + 1
+            imm = int.from_bytes(seg[mv + 2:mv + 10], "little")
+            if imm <= 0xFFFFFFFF:                         # a 32-bit value uses the dword shapes
+                continue
+            disp = _local_load_disp(seg, mv - 12, mv)     # the local loaded just before the movabs
+            if disp is None or disp >= 0:
+                continue
+            c = seg.find(b"\x48\x39", mv + 10, mv + 16)   # cmp r64, r64 (REX.W 39 /r) just after
+            if c < 0 or not _jcc_at(seg, c + 3):
+                continue
+            key = (va + mv, imm)
+            if key not in seen:
+                seen.add(key)
+                out.append({"va": va + mv, "magic": imm, "disp": disp, "width": 8})
     return out
 
 
