@@ -7,7 +7,6 @@
 # has every system library, so it always passes while the bundle may be incomplete.
 #
 #   packaging/test-airgap.sh folder [dist/lykos-airgapped-*.zip]   # test the unzip-and-run folder
-#   packaging/test-airgap.sh container [dist/lykos-container-*.tar.zst]  # test the container image
 #
 # Env: BASE=<image> overrides the simulated-laptop base (default: a recent glibc so the folder's
 # vendored binaries load; the folder is glibc-coupled -- see docs/23). RT=podman|docker.
@@ -59,7 +58,7 @@ if [ -n "$missing" ] || [ -n "$loaderr" ]; then
   [ -n "$missing" ] && echo "$missing"
   [ -n "$loaderr" ] && echo "$loaderr"
   echo "(folder: usually a shared library the bundle did not vendor -- the closure pass in"
-  echo " make-runnable.sh should copy it; container: rebuild. See docs/23-airgap-install.md.)"
+  echo " make-runnable.sh should copy it. See docs/23-airgap-install.md.)"
   exit 1
 fi
 say "AIR-GAP TEST PASSED -- every required tool resolves from the package alone."
