@@ -59,7 +59,13 @@ from pathlib import Path  # noqa: E402
 
 from lykos.analyze.poc.exploit import elf_functions  # noqa: E402
 
-_PIE_HEAPWIN = r"""
+
+def _pie_heapwin_src(copy_len: str) -> str:
+    """The menu-driven PIE heap target, parameterised ONLY by the edit's memcpy length, so the
+    positive (an overflow past buf into the adjacent fn pointer) and its negative control (the copy
+    bounded to the buffer) are byte-identical but for that expression (supwngo _90_neg).
+    """
+    return (r"""
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -77,14 +83,18 @@ int main(void){
   for(;;){ puts("1)new 2)edit 3)leak 4)run 5)quit");
     switch(num()){
       case 1: o=malloc(sizeof *o); o->fn=hello; break;
-      case 2: { char b[64]; int k=rd(b,64); memcpy(o->buf,b,k); } break;
+      case 2: { char b[64]; int k=rd(b,64); memcpy(o->buf,b,""" + copy_len + r"""); } break;
       case 3: printf("leak main=%p cfg=%p\n",(void*)main,(void*)&banner); break;
       case 4: o->fn(); break;
       case 5: return 0;
     }
   }
 }
-"""
+""")
+
+
+_PIE_HEAPWIN = _pie_heapwin_src("k")                              # overflow past buf: the bug
+_PIE_HEAPSAFE = _pie_heapwin_src("k>(int)sizeof o->buf?(int)sizeof o->buf:k")  # bounded
 
 
 class _FakeCtx:
@@ -92,19 +102,28 @@ class _FakeCtx:
     def progress(self, **k): pass
 
 
-@pytest.fixture
-def pie_heapwin_bin(tmp_path_factory):
+def _build_pie_heap(tmp_path_factory, name, src):
     if sandbox.host_arch() != "x86-64":
         pytest.skip("PIE leak-chain is x86-64 native only")
     gcc = shutil.which("gcc") or shutil.which("cc")
     if not gcc:
         pytest.skip("no C compiler")
-    d = tmp_path_factory.mktemp("pieheap"); c = d / "m.c"; c.write_text(_PIE_HEAPWIN)
+    d = tmp_path_factory.mktemp(name); c = d / "m.c"; c.write_text(src)
     out = d / "target.bin"
     if subprocess.run([gcc, "-O0", "-fno-stack-protector", "-pie", "-fPIE", str(c),
                        "-o", str(out)], capture_output=True).returncode != 0:
         pytest.skip("cannot build PIE heap target")
     return out
+
+
+@pytest.fixture
+def pie_heapwin_bin(tmp_path_factory):
+    return _build_pie_heap(tmp_path_factory, "pieheap", _PIE_HEAPWIN)
+
+
+@pytest.fixture
+def pie_heapsafe_bin(tmp_path_factory):
+    return _build_pie_heap(tmp_path_factory, "pieheapsafe", _PIE_HEAPSAFE)
 
 
 def test_pie_leak_chain_recovers_base_and_hijacks(pie_heapwin_bin):
@@ -122,6 +141,24 @@ def test_pie_leak_chain_recovers_base_and_hijacks(pie_heapwin_bin):
         leak_opt, writer, off, trig, base = hit
         assert leak_opt == "3" and writer == "2" and off == 32   # leak, edit-overflow, buf[32]
         assert base and base % 0x1000 == 0
+    finally:
+        shutil.rmtree(wd, ignore_errors=True)
+
+
+def test_pie_leak_chain_declines_the_patched_target(pie_heapsafe_bin):
+    """Negative control (supwngo _90_neg): the SAME target with the edit's memcpy bounded to the
+    buffer cannot reach the adjacent fn pointer, so the chainer must NOT confirm a hijack. The leak
+    option, the win function, and every menu path are still present and reachable, so a `None` here
+    is attributable to the missing overflow alone -- a non-None result would be a hijack claimed
+    without a bug, which the win-ran-under-a-negative-control confirmation exists to prevent."""
+    wd = Path(tempfile.mkdtemp(prefix="pchainsafe-"))
+    try:
+        tb = pie_heapsafe_bin.read_bytes()
+        win_vaddr = elf_functions(tb)["win"]
+        hit = chain._pie_leak_chain(_FakeCtx(), tb, str(pie_heapsafe_bin), ("win", win_vaddr),
+                                    opts=["1", "2", "3", "4", "5"], model={"2": ["str"]},
+                                    width=None, workdir=wd)
+        assert hit is None, f"patched target wrongly confirmed a hijack: {hit}"
     finally:
         shutil.rmtree(wd, ignore_errors=True)
 

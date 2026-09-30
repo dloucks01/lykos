@@ -45,8 +45,19 @@ def test_build_leak_puts_structure():
     assert q(40) == 0x401176 and q(48) == 0x404000 and q(56) == 0x401060 and q(64) == 0x4011ac
 
 
-@pytest.fixture
-def r2l_bin(tmp_path_factory):
+def _r2l_src(read_call: str) -> str:
+    """The ret2libc target, parameterised ONLY by the read that owns the overflow, so the positive
+    and its negative control are byte-identical but for that call (supwngo _90_neg).
+    """
+    return (
+        '#include <stdio.h>\n#include <unistd.h>\n'
+        # a pop rdi;ret gadget the tiny binary would otherwise lack (a solvable target provides it)
+        '__asm__(".text\\n.global g\\n g: pop %rdi\\n ret\\n");\n'
+        'void vuln(void){ char b[32]; puts("go"); ' + read_call + '; }\n'
+        'int main(void){ setvbuf(stdout,0,2,0); while(1) vuln(); return 0; }\n')
+
+
+def _build_r2l(tmp_path_factory, name, read_call):
     from lykos.analyze.dynamic import sandbox
     if sandbox.host_arch() != "x86-64":
         pytest.skip("ret2libc fixture is x86-64 native only")
@@ -55,18 +66,25 @@ def r2l_bin(tmp_path_factory):
     gcc = shutil.which("gcc") or shutil.which("cc")
     if not gcc:
         pytest.skip("no C compiler")
-    d = tmp_path_factory.mktemp("r2l")
-    (d / "v.c").write_text(
-        '#include <stdio.h>\n#include <unistd.h>\n'
-        # a pop rdi;ret gadget the tiny binary would otherwise lack (a solvable target provides it)
-        '__asm__(".text\\n.global g\\n g: pop %rdi\\n ret\\n");\n'
-        'void vuln(void){ char b[32]; puts("go"); read(0,b,400); }\n'
-        'int main(void){ setvbuf(stdout,0,2,0); while(1) vuln(); return 0; }\n')
+    d = tmp_path_factory.mktemp(name)
+    (d / "v.c").write_text(_r2l_src(read_call))
     exe = d / "v"
     if subprocess.run([gcc, "-no-pie", "-fno-stack-protector", "-w",
                        str(d / "v.c"), "-o", str(exe)], capture_output=True).returncode:
         pytest.skip("cannot build ret2libc fixture")
     return exe
+
+
+@pytest.fixture
+def r2l_bin(tmp_path_factory):
+    return _build_r2l(tmp_path_factory, "r2l", "read(0,b,400)")           # overflow: the bug
+
+
+@pytest.fixture
+def r2l_safe_bin(tmp_path_factory):
+    # the negative control: the read is bounded to the buffer, so there is no overflow and no
+    # return-address control -- everything else (the win gadget, puts, the loop) is identical.
+    return _build_r2l(tmp_path_factory, "r2l_safe", "read(0,b,sizeof b)")  # bounds-fixed: no bug
 
 
 def test_ret2libc_leak_spawns_a_shell(r2l_bin):
@@ -130,6 +148,30 @@ def test_exploit_stage_files_l3_ret2libc(store, case, pool, r2l_bin):
     pocs = PocDAO(store.conn).list_by_target(t.id)
     assert any(pc.level == "L3" and pc.verified for pc in pocs), \
         f"no confirmed L3 ret2libc PoC (pocs={[(p.level, p.verified) for p in pocs]})"
+
+
+def test_exploit_stage_declines_the_patched_ret2libc(store, case, pool, r2l_safe_bin):
+    """Negative control (supwngo _90_neg): the SAME target with the overflow removed must NOT yield
+    a confirmed L3. Driven through the SAME stage with the SAME offset=40 as the positive, so a
+    decline is attributable to the missing overflow alone -- not a missing gadget, string, or path.
+    A confirmed L3 here would mean the stage credited a "solve" NOT caused by a bug: the exact false
+    positive the real, forgery-proof detonation exists to prevent (offset given != shell proven)."""
+    from lykos.analyze.ingest import enqueue_triage, ingest
+    from lykos.analyze.poc import enqueue_exploit
+    from lykos.db.dao import PocDAO, TargetDAO
+    from lykos.jobs import JobQueue
+    t = ingest(store, case.id, r2l_safe_bin, filename="v")
+    q = JobQueue(store.conn)
+    enqueue_triage(q, t, force=True)
+    assert pool.wait_idle(30)
+    TargetDAO(store.conn).update_triage(t.id, arch="x86-64", bits=64, endianness="little",
+                                        linking="dynamic", stripped=False,
+                                        mitigations={"pie": "off"}, file_type="elf")
+    run = enqueue_exploit(q, t, params={"offset": 40})
+    assert pool.wait_idle(90) and q.runs.get(run.id).status == "done"
+    pocs = PocDAO(store.conn).list_by_target(t.id)
+    assert not any(pc.level == "L3" and pc.verified for pc in pocs), \
+        f"patched target wrongly credited a confirmed L3: {[(p.level, p.verified) for p in pocs]}"
 
 
 def test_recover_libc_base_needs_two_symbol_pointers():
