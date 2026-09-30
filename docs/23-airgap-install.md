@@ -13,7 +13,7 @@ They are separate because the repo changes constantly and the toolchain almost n
 Re-cutting the ~1 MB repo tarball is cheap; re-carrying 3 GB is not.
 
 **Neither package is installed on the air-gapped side. Both run in place.** The repo runs
-straight from its extracted directory (`PYTHONPATH=core python3 -m lykos ...`). The toolchain
+straight from its extracted directory (`./start`, or `./lykos ...`). The toolchain
 bundle is a relocatable tree: the debs are extracted into `toolchain/` on the connected
 machine, and on arrival that tree is placed under the repo's `vendor/` directory — no package
 manager, no `dpkg`, no root, nothing written to a system path.
@@ -92,7 +92,7 @@ arrival, not just on departure — the point of the checksum is the journey):
 ```sh
 tar xzf lykos-repo.tar.gz                   # creates ./lykos/
 cd lykos
-PYTHONPATH=core python3 -m lykos doctor     # what works right now, before the toolchain is placed
+./lykos doctor     # what works right now, before the toolchain is placed
 ```
 
 Then the toolchain. Nothing is installed: `setup.sh` places the extracted tree under the
@@ -126,7 +126,7 @@ the manifest to match, so carry the bundle over a trusted channel. (Future step:
 ## 3. Confirm
 
 ```sh
-PYTHONPATH=core python3 -m lykos doctor --strict   # exit 1 if a REQUIRED tool is missing
+./lykos doctor --strict   # exit 1 if a REQUIRED tool is missing
 make test                                          # stages whose tool is absent skip, and say so
 make release                                       # the full quality gate, ~25 min
 ```
@@ -183,7 +183,7 @@ rather than trust it, run under a network namespace:
 
 ```sh
 bwrap --ro-bind / / --unshare-net --dev /dev --proc /proc --chdir "$PWD" \
-      -- env PYTHONPATH=core python3 -m lykos doctor
+      -- ./lykos doctor
 ```
 
 **Data packs rot silently.** The bundled CVE fingerprint database is a point-in-time snapshot

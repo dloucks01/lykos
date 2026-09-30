@@ -208,7 +208,7 @@ elif [ -d "$HERE/../core/lykos" ]; then
   PYTHONPATH="$(cd "$HERE/.." && pwd)/core" LYKOS_VENDOR="$DEST" python3 -m lykos doctor || true
 else
   echo "  run this from your lykos checkout to see it:"
-  echo "    LYKOS_VENDOR=$DEST PYTHONPATH=core python3 -m lykos doctor"
+  echo "    ./lykos doctor"
 fi
 
 cat <<EOF

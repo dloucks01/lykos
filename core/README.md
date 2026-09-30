@@ -2,9 +2,9 @@
 
 The platform package. **Stdlib only** — no pip packages, no network, at runtime.
 
-This directory is a `PYTHONPATH` root, not an installable distribution: run it as
-`PYTHONPATH=core python3 -m lykos ...`, or build the single-file zipapp with
-`make bundle` (`dist/lykos.pyz`, which runs the same way).
+This directory is a `PYTHONPATH` root, not an installable distribution. Run lykos from the repo
+root with `./start` (UI) or `./lykos ...` (CLI) -- they set this directory on `PYTHONPATH` for
+you -- or build the single-file zipapp with `make bundle` (`dist/lykos.pyz`, which runs the same way).
 
 ```
 lykos/
