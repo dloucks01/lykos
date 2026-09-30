@@ -537,6 +537,21 @@ def _local_load_disp(seg, lo, hi):
     return None
 
 
+def find_br_gadgets_aarch64(data: bytes):
+    """AArch64 `br <Xn>` / `blr <Xn>` gadgets, as [{insn, reg, va}] (reg 'x0'..'x30'). These branch
+    the PC to a register's value -- the aarch64 equivalent of x86 `jmp <reg>`, and the only no-leak
+    way to reach injected shellcode on the (ASLR'd) stack when a register points at the input
+    buffer. Encodings: br Xn = 0xD61F0000 | (n<<5); blr Xn = 0xD63F0000 | (n<<5)."""
+    out = []
+    for insn, base in (("br", 0xD61F0000), ("blr", 0xD63F0000)):
+        for n in range(31):                              # x0..x30 (x31 is xzr/sp, not a br target)
+            va = _find_exec(data, struct.pack("<I", base | (n << 5)))
+            if va is not None:
+                out.append({"insn": insn, "reg": f"x{n}", "va": va})
+    out.sort(key=lambda g: (int(g["reg"][1:]), g["insn"]))
+    return out
+
+
 def find_magic_gates(data: bytes):
     """Find a stack LOCAL checked against a magic constant that gates a branch (jeeves'
     `if (local==0x1337bab3)` -> read+print the flag). A stack overflow that writes IMM32 into the

@@ -89,3 +89,22 @@ def write_marker(marker: bytes, code_addr: int) -> bytes:
     )
     assert len(code) == _CODE_LEN, len(code)
     return code + marker
+
+
+def write_marker_aarch64(marker: bytes) -> bytes:
+    """AArch64 write(1, marker, len); exit(93). Position-independent: `adr x1, marker` addresses the
+    marker bytes appended after the fixed 7-instruction (28-byte) code, PC-relative, so the stub
+    runs anywhere it is jumped to. Confirming a cross-arch ret2shellcode by a WRITTEN marker (not a
+    spawned shell) is what makes it verifiable under qemu-user, where execve('/bin/sh') is
+    unreliable. Encodings assembled and checked against `aarch64-linux-gnu-as` + qemu."""
+    n = len(marker) & 0xFFFF
+    return struct.pack(
+        "<7I",
+        0xD2800020,                      # mov x0, #1            ; fd = stdout
+        0x100000C1,                      # adr x1, marker        ; +24 bytes -> the appended marker
+        0xD2800002 | (n << 5),           # movz x2, #len
+        0xD2800808,                      # mov x8, #64           ; __NR_write
+        0xD4000001,                      # svc #0
+        0xD2800BA8,                      # mov x8, #93           ; __NR_exit
+        0xD4000001,                      # svc #0
+    ) + marker
