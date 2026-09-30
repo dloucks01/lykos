@@ -274,6 +274,24 @@ def _probe_node():
     return _v("node", "--version") if shutil.which("node") else None
 
 
+def _probe_valgrind():
+    from .analyze.dynamic.memoracle import valgrind_bin
+    vg = valgrind_bin()
+    return _v(vg, "--version") if vg else None
+
+
+def _probe_dislocator():
+    from .analyze.dynamic.memoracle import dislocator_lib
+    p = dislocator_lib()
+    return str(p) if p else None
+
+
+def _probe_qasan():
+    from .analyze.dynamic.memoracle import libqasan_lib
+    p = libqasan_lib()
+    return str(p) if p else None
+
+
 TOOLS: tuple = (
     Tool("python", "Python 3", "the platform itself", "nothing runs",
          "already present (the runtime is stdlib-only; no pip packages)",
@@ -321,6 +339,23 @@ TOOLS: tuple = (
          "coverage_fuzz declines for those guests and prints the build command",
          "examples/afl-qemu/build.sh <arch>  (one per guest architecture)",
          _probe_afl_qemu, tier="optional"),
+    Tool("dislocator", "libdislocator (guard-page heap oracle)",
+         "a binary-only heap oracle: LD_PRELOADed, a heap OOB / use-after-free in a target with no "
+         "source ASan faults immediately instead of corrupting silently",
+         "stripped binaries lose the guard-page heap oracle (valgrind triage still applies)",
+         "apt-get install afl++  (ships libdislocator.so under /usr/lib/afl)",
+         _probe_dislocator, tier="optional", apt=("afl++",)),
+    Tool("valgrind", "Valgrind memcheck (memory-error triage)",
+         "classifies a crash into an exact memory-error CWE (heap OOB read/write, "
+         "use-after-free, double-free, uninitialised read) on a binary with no source ASan",
+         "dynamic crashes on stripped binaries are not classified by defect class",
+         "apt-get install valgrind",
+         _probe_valgrind, tier="optional", apt=("valgrind",)),
+    Tool("qasan", "libqasan (QEMU-mode ASan) -- optional, built from AFL++",
+         "deeper heap shadowing than libdislocator for an ELF fuzzed under qemu",
+         "the dislocator + valgrind lanes cover the common case; qasan adds shadow-memory depth",
+         "build AFL++ qemu_mode with libqasan, then LYKOS_QASAN=/path/libqasan.so",
+         _probe_qasan, tier="optional"),
     Tool("jdk", "JDK (javac + jar)", "building the JVM gate fixtures",
          "the real-gate JVM case skips",
          "apt-get install default-jdk", _probe_jdk, tier="optional", apt=("default-jdk",)),
@@ -339,7 +374,7 @@ TOOLS: tuple = (
          _probe_cross_cc, tier="optional", apt=_cross_apt()),
     Tool("angr", "angr (vendored venv)", "the concolic stage's default backend",
          "concolic declines unless symqemu is present",
-         "python3 -m venv vendor/angr-venv && vendor/angr-venv/bin/pip install angr",
+         "python3 -m venv vendor/angr-venv && vendor/angr-venv/bin/pip install 'angr==9.3.4'",
          _probe_angr, tier="optional"),
     Tool("unicorn", "Unicorn (vendored venv)", "firmware_rehost (bare-metal Cortex-M)",
          "firmware_rehost declines; carving and headerless identification still work",

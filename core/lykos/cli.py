@@ -138,7 +138,67 @@ def build_parser() -> argparse.ArgumentParser:
     bd.add_argument("--json", action="store_true", help="emit the full diff as JSON")
     bd.add_argument("--timeout", type=int, default=600, help="per-binary analysis budget (s)")
     bd.set_defaults(func=_cmd_bindiff)
+
+    vs = sub.add_parser("variant-scan",
+                        help="hunt a known-vulnerable function across a corpus of binaries (N-day)")
+    vs.add_argument("--ref", required=True,
+                    help="reference binary containing the vulnerable function")
+    vs.add_argument("--function", "--func", dest="target_func", required=True,
+                    help="name of the vulnerable function in --ref")
+    vs.add_argument("corpus", nargs="+", help="binaries to scan for an unpatched variant")
+    vs.add_argument("--threshold", type=float, default=0.9, help="min similarity to report (0..1)")
+    vs.add_argument("--timeout", type=int, default=600, help="per-binary analysis budget (s)")
+    vs.add_argument("--json", action="store_true", help="emit results as JSON")
+    vs.set_defaults(func=_cmd_variant_scan)
     return p
+
+
+def _cmd_variant_scan(args: argparse.Namespace) -> int:
+    import json
+    from pathlib import Path
+
+    from .analyze import native_re, variant
+    ref = Path(args.ref)
+    if not ref.exists():
+        print(f"no such file: {ref}", file=sys.stderr)
+        return 2
+    ref_funcs = native_re.analyze(ref, timeout=args.timeout).get("functions") or []
+    sigf = next((f for f in ref_funcs if (f.get("name") or "").split(".")[-1] == args.target_func
+                 or f.get("name") == args.target_func), None)
+    if sigf is None:
+        print(f"function {args.target_func!r} not found in {ref.name} "
+              f"(has {len(ref_funcs)} functions)", file=sys.stderr)
+        return 2
+    sig = variant.function_features(sigf)
+    results = []
+    for path in args.corpus:
+        p = Path(path)
+        if not p.exists():
+            print(f"skip (no such file): {p}", file=sys.stderr)
+            continue
+        funcs = native_re.analyze(p, timeout=args.timeout).get("functions") or []
+        hits = variant.variant_scan(sig, funcs, threshold=args.threshold)
+        results.append({"binary": str(p), "hits": hits})
+    if args.json:
+        print(json.dumps({"function": args.target_func, "reference": str(ref), "results": results},
+                         indent=2, default=list))
+        return 0
+    print(f"hunting {args.target_func!r} (from {ref.name}) across {len(results)} binaries, "
+          f"threshold {args.threshold}:")
+    any_hit = False
+    for r in results:
+        name = Path(r["binary"]).name
+        if r["hits"]:
+            any_hit = True
+            top = r["hits"][0]
+            print(f"  MATCH  {name:<28} {top['name'] or '(unnamed)'} @ {top['addr']}  "
+                  f"similarity {top['similarity']}")
+        else:
+            print(f"  clean  {name}")
+    if any_hit:
+        print("\nA MATCH is a candidate unpatched variant -- confirm the defect is there, not just "
+              "the shape (recompiled-but-fixed code can still look similar).")
+    return 0
 
 
 def _cmd_bindiff(args: argparse.Namespace) -> int:

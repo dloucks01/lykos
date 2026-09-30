@@ -262,6 +262,16 @@ def _trace_one(libc, argv, stdin_data, timeout, blocks, exe, plan=None, sanitize
                 if "hard_rss_limit_mb" not in opts:
                     os.environ["ASAN_OPTIONS"] = (opts + ":" if opts else "") \
                         + "hard_rss_limit_mb=%d" % _SAN_RSS_MB
+            else:
+                # Binary-only memory-safety oracle: a guard-page allocator (libdislocator) named in
+                # LYKOS_PRELOAD is LD_PRELOADed into the TARGET child only (never this python
+                # tracer, never a sanitizer build that already instruments memory), so a heap
+                # out-of-bounds / use-after-free faults immediately here instead of running on
+                # silently. Set in the forked child right before execv, so it scopes to the target.
+                pre = os.environ.get("LYKOS_PRELOAD")
+                if pre:
+                    prior = os.environ.get("LD_PRELOAD", "")
+                    os.environ["LD_PRELOAD"] = pre + (":" + prior if prior else "")
             libc.ptrace(PTRACE_TRACEME, 0, 0, 0)
             os.dup2(r_in, 0); os.dup2(w_out, 1); os.dup2(w_err, 2)
             for fd in (r_out, w_out, r_err, w_err, r_in, w_in):
@@ -433,6 +443,15 @@ def main():
         if "hard_rss_limit_mb" not in _opts:
             child_env["ASAN_OPTIONS"] = (_opts + ":" if _opts else "") \
                 + "hard_rss_limit_mb=%d" % _SAN_RSS_MB
+    else:
+        # Binary-only memory-safety oracle for the non-traced path: translate LYKOS_PRELOAD into
+        # LD_PRELOAD for the TARGET only (a guard-page allocator makes a heap OOB/UAF fault here).
+        # Never on a sanitizer build (already instrumented) and never leaked onto this runner.
+        _pre = os.environ.get("LYKOS_PRELOAD")
+        if _pre:
+            child_env = dict(os.environ)
+            _prior = child_env.get("LD_PRELOAD", "")
+            child_env["LD_PRELOAD"] = _pre + (":" + _prior if _prior else "")
     wf = "/tmp/lykos-fuzz-input.bin"        # fixed: a per-batch name leaked into diagnostics
     (count, n_blocks) = struct.unpack("<II", _readn(8))
     blocks = list(struct.unpack("<%dQ" % n_blocks, _readn(8 * n_blocks))) if n_blocks else []

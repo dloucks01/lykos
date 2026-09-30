@@ -343,7 +343,7 @@ def _takes_blocks(run_fn) -> bool:
 
 def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_seconds,
                   exec_timeout, rng, detector, event_prefix, note_prefix, run_fn=run_input,
-                  mutator=None, cover_blocks=(), cover_flags=(), base_argv=()):
+                  mutator=None, cover_blocks=(), cover_flags=(), base_argv=(), block_dist=None):
     """Shared mutational campaign: mutate -> sandbox -> dedup-by-signal -> minimize ->
     dyn_result + Confirmed finding. Used by both the black-box `fuzz` stage and the directed
     stage (which supplies a corpus/dictionary aimed at specific sinks). Returns stats.
@@ -403,6 +403,12 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
     # tens of thousands of distinct paths.
     all_blocks = set(cover_blocks or ())
     seen_blocks: set = set()
+    # Sink-directed steering (AFLGo-style): `block_dist` maps a block address to its distance to a
+    # target sink. We keep the lowest distance any input has reached, and RETAIN an input that gets
+    # strictly closer even when it adds no new coverage -- the "exploitation" half of directed
+    # greybox fuzzing, driving the search down toward the flagged sink. None => undirected.
+    best_dist = None
+    directed_kept = 0
     # Flag fuzzing runs ONLY under the batched sandbox. An option like jhead's `-cmd` executes
     # a command built from our input; that is the point (it is where CVE-2020-6624 lives) and
     # it is only acceptable inside the unshared-net, read-only-root namespace. On the
@@ -508,6 +514,14 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
                         pass
                 seen_blocks |= new_blocks
                 cover_reported = cover_reported or cover_answered
+            # Directedness: did this input reach a block closer to a sink than anything before?
+            closer = False
+            if block_dist and res.blocks_hit is not None:
+                from . import blockdist as _bd
+                d = _bd.min_distance(res.blocks_hit, block_dist)
+                if d is not None and (best_dist is None or d < best_dist):
+                    best_dist = d
+                    closer = True
             b = behaviour_of(res, data)
             # Trust block novelty only once coverage has actually answered; if it never does,
             # blocks were armed but are not being reported, and behaviour novelty keeps the
@@ -518,7 +532,7 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
                 novel = b not in seen_behaviour
             if b not in seen_behaviour:
                 seen_behaviour.add(b)
-            if novel:
+            if novel or closer:
                 if not res.crashed and len(data) <= _MAX_KEEP:  # noqa: SIM102
                     if len(corpus) < _MAX_CORPUS:
                         corpus.append(data)
@@ -528,6 +542,8 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
                         # which is most of them -- the interesting paths are discovered late.
                         corpus[rng.randrange(len(corpus))] = data
                     kept += 1
+                    if closer and not novel:
+                        directed_kept += 1
             if res.crashed:
                 crashes += 1
                 # A crash that does not happen again is not a finding. Some targets REWRITE
@@ -644,7 +660,8 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
         or (coverage_dead and not did_work))
     stats = {"execs": execs, "crashes": crashes, "flaky": flaky,
              "crashes_reproducible": crashes_reproducible, "unique": len(seen_sigs),
-             "starved": starved,
+             "starved": starved, "directed_kept": directed_kept,
+             "nearest_sink_dist": (round(best_dist, 2) if best_dist is not None else None),
              "behaviours": len(seen_behaviour), "corpus": len(corpus), "kept": kept,
              "execs_per_sec": round(execs / elapsed),
              "blocks_hit": len(seen_blocks), "blocks_known": len(all_blocks),

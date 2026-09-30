@@ -261,6 +261,34 @@ def root_cause_stage(ctx) -> dict:
                 # sanitizer-confirmed use-after-free reads as RCE-capable, not just "a crash".
                 from . import exploitability as _expl
                 report["exploitability"]["effects"] = _expl.effects(parsed, cap)
+        elif not emulated:
+            # Stripped / non-sanitizer NATIVE binary: the generic classification is signal-based
+            # ("a SIGSEGV somewhere"). Valgrind memcheck names the exact heap defect -- OOB
+            # read/write, use-after-free, double-free -- on a binary with no source ASan, so re-run
+            # the crashing input once under memcheck and let a concrete verdict SHARPEN the
+            # classification the same way the sanitizer report does for the source path. Declines
+            # silently (leaves the generic verdict) when valgrind is absent or finds nothing.
+            _VG_ASAN = {"heap-oob-write": "heap-buffer-overflow",
+                        "heap-oob-read": "heap-buffer-overflow",
+                        "use-after-free": "heap-use-after-free", "double-free": "double-free"}
+            try:
+                from ..dynamic import memoracle
+                vg = memoracle.valgrind_triage(exe, input_bytes, mode=mode, base_argv=base_argv,
+                                               timeout=min(120.0, max(30.0, timeout * 12)))
+            except Exception:
+                vg = None
+            if vg:
+                klass = _VG_ASAN.get(vg["kind"], vg["kind"])
+                report["classification"] = {"cwe": vg["cwe"], "class": klass,
+                                            "severity": vg["severity"],
+                                            "detail": f"valgrind memcheck: {vg['detail']}"}
+                report["memcheck"] = vg
+                report["summary"] = f"valgrind-confirmed {vg['kind'].replace('-', ' ')}"
+                report["exploitability"]["reasons"] = (
+                    [f"valgrind-confirmed {vg['kind'].replace('-', ' ')}"]
+                    + list(report["exploitability"].get("reasons", [])))
+                from . import exploitability as _expl
+                report["exploitability"]["effects"] = _expl.effects(report["classification"], cap)
 
         report_sha = ctx.put_artifact("root-cause", data=json.dumps(report, indent=2,
                                       sort_keys=True, default=str).encode(),

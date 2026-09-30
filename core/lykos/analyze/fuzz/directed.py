@@ -36,6 +36,7 @@ from ...db.dao import (
 from ...hashing import canonical_json
 from ...jobs.registry import register_stage
 from ..detect.catalog import SOURCES, normalize
+from . import cmpdict
 from .stage import (
     _DEFAULT_SEEDS,
     _mine_dictionary,
@@ -43,6 +44,27 @@ from .stage import (
     _structure_mutator,
     fuzz_campaign,
 )
+
+
+def _cmp_tokens_for(functions, keep=None):
+    """Static input-to-state tokens (see cmpdict) from the hydrated IR of `functions`, optionally
+    restricted to the addresses in `keep` (the near-target set). Empty when no IR / no P-Code."""
+    irs = {}
+    for f in functions or ():
+        fa = _addr(f.addr)
+        ir = getattr(f, "ir", None)
+        if fa is not None and ir and (keep is None or fa in keep):
+            irs[fa] = ir
+    return cmpdict.mine_cmp_dictionary(irs)
+
+
+def _merge_dict(cmptoks, base, limit=400):
+    """cmp-immediate tokens first (a 4-byte magic is the most discriminating thing to splice),
+    then the string-mined tokens, de-duplicated."""
+    if not cmptoks:
+        return base
+    seen = set(cmptoks)
+    return (list(cmptoks) + [t for t in base if t not in seen])[:limit]
 
 DIRECTED_STAGE = "directed_fuzz"
 TOOL = "directed"
@@ -195,15 +217,26 @@ def plan_directed_campaign(findings, functions, call_edges, strings):
     except Exception:
         menu_seeds = []
     if not targets:
+        # Undirected: still plant input-to-state tokens mined from every function's comparison
+        # constants, so magic-gated code is reached even without a specific target to steer toward.
+        undirected = _merge_dict(_cmp_tokens_for(functions), _mine_dictionary(strings))
         return {"targets": [], "directed": False,
-                "dictionary": _mine_dictionary(strings),
-                "seeds": menu_seeds + list(_DEFAULT_SEEDS), "sources": set(),
+                "dictionary": undirected,
+                "seeds": menu_seeds + [t for t in undirected[:64]] + list(_DEFAULT_SEEDS),
+                "sources": set(),
                 "note": "no addressed static candidates; running undirected"}
 
     distance = callgraph_distance(call_edges, [t["function_addr"] for t in targets])
     tdict = mine_targeted_dictionary(functions, strings, distance)
     if not tdict:                            # graph present but no near-target string consts
         tdict = _mine_dictionary(strings)
+    # Input-to-state (RedQueen/CmpLog-style) tokens mined STATICALLY from the P-Code comparison
+    # constants of the functions on a path to a target -- the magic bytes, tags and length gates
+    # the near-target code tests the input against. A byte-level mutator never guesses a 4-byte
+    # magic; planting it from the dictionary reaches the gated branch immediately, and this works
+    # even black-box under qemu where CmpLog cannot run. Merged FIRST (most discriminating).
+    near = {fa for fa, d in distance.items() if d <= 4}
+    tdict = _merge_dict(_cmp_tokens_for(functions, keep=near), tdict)
     # seed the corpus with the targeted tokens themselves so comparisons are hit immediately,
     # plus menu-navigation seeds so a menu-driven target is fuzzed from inside its state machine
     seeds = menu_seeds + [t for t in tdict[:64]] + list(_DEFAULT_SEEDS)
@@ -300,10 +333,22 @@ def directed_stage(ctx) -> dict:
     # Arm block coverage so the directed campaign reports how much of the recovered code it
     # actually reached -- the honest "% of the binary covered", not AFL's edge-map density.
     blocks = _recovered_blocks(ctx, target)
+    # Sink-directed steering: distance from every recovered block to the nearest target sink, so the
+    # campaign RETAINS inputs that get closer to the flagged CWE site (AFLGo, no recompile). Only
+    # meaningful when we have real targets; the undirected fallback passes an empty map (no steer).
+    from . import blockdist
+    _sites = {a for a in (blockdist._addr(t.get("site_addr")) for t in plan["targets"])
+              if a is not None}
+    bdist = blockdist.block_distance(hydrated, call_edges, _sites) if _sites else {}
+    if bdist:
+        ctx.emit("directed.blockdist", payload={"targets": len(_sites),
+                 "blocks_with_distance": len(bdist),
+                 "nearest": round(min(bdist.values()), 2)})
     st = fuzz_campaign(ctx, target, corpus=corpus, dictionary=plan["dictionary"], mode=mode,
                        max_execs=max_execs, max_seconds=max_seconds, exec_timeout=exec_timeout,
                        rng=rng, detector="directed_fuzz", event_prefix="directed",
-                       note_prefix=note_prefix, mutator=mutator, cover_blocks=blocks)
+                       note_prefix=note_prefix, mutator=mutator, cover_blocks=blocks,
+                       block_dist=bdist)
     hit, known = st.get("blocks_hit", 0), st.get("blocks_known", 0)
     summary = {"backend": "directed", "execs": st.get("execs", 0), "crashes": st.get("crashes", 0),
                "directed": bool(plan["directed"]), "top_target": _target_label(plan["targets"]) if plan["directed"] else None,
