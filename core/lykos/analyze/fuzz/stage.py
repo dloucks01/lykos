@@ -1093,8 +1093,19 @@ def fuzz_stage(ctx) -> dict:
 
 
 def _structure_mutator(p, rng, dictionary):
-    """Build a structure-aware mutator from params.format (a field spec) or params.format_name
-    (a built-in model). params.magic overrides a built-in's placeholder magic. None otherwise."""
+    """Build a format-aware mutator. A GRAMMAR (params.grammar spec, or params.grammar_name for a
+    built-in: kv/tlv/json/sexpr) is preferred -- it generates recursive, structurally-valid inputs
+    that reach code behind nested parsers a flat field model never builds. Otherwise a flat
+    StructMutator from params.format / params.format_name. None when neither is specified."""
+    if p.get("grammar") or p.get("grammar_name"):
+        try:
+            from . import grammar as _grammar
+            g = (_grammar.compile_grammar(p["grammar"]) if p.get("grammar")
+                 else _grammar.builtin(p["grammar_name"]))
+            if g is not None:
+                return _grammar.GrammarMutator(rng, g, dictionary)
+        except Exception:
+            pass                                       # bad grammar: fall through to flat structure
     from . import structure
     model = None
     if p.get("format"):

@@ -47,6 +47,7 @@ Tier entries **[DONE]**.
 | Sink-directed block distance | `analyze/fuzz/blockdist.py` | `test_blockdist.py` | AFLGo-style block distance to lykos's own sinks, steering the fuzzer to keep inputs that get closer (no recompile) |
 | Binary N-day variant hunting | `analyze/variant.py` + `lykos variant-scan` | `test_variant.py` | Fuzzy function matching + corpus-wide hunt for an unpatched vulnerable function |
 | Corpus distillation (minset) | `analyze/fuzz/distill.py` | `test_distill.py` | afl-cmin-style coverage-preserving corpus minimization via the block tracer, before every campaign |
+| Grammar-aware mutation | `analyze/fuzz/grammar.py` | `test_grammar.py` | Recursive/structure-valid input generation (Gramatron/Nautilus-style) reaching code behind nested parsers a flat model never builds |
 
 ### 1. Static input-to-state dictionary (`analyze/fuzz/cmpdict.py`)
 
@@ -170,7 +171,7 @@ copy matches at 1.0 while a `strncpy`-patched build reads clean. Tests in `tests
    blocks air-gapped commercial/red-team use). Ship weggli + a curated lykos query pack. Build cost:
    **low** (weggli) / medium (Joern). Refs: https://github.com/weggli-rs/weggli ;
    https://github.com/joernio/joern .
-9. **Grammar / structure-aware mutation from our inferred spec.** We already *infer* a format spec —
+9. **[DONE — `grammar.py`] Grammar / structure-aware mutation.** We already *infer* a format spec —
    almost no fuzzer has that. Emit it as a **Gramatron** automaton / Grammar-Mutator grammar / LPM
    schema and load via the AFL++ custom-mutator API, so fuzzing stays structurally valid and reaches
    deep parser states. Build cost: **medium** (the converter is the novel glue; engines are
@@ -238,9 +239,11 @@ The four highest-ROI items (`cmpdict`, `memoracle`, `blockdist`, `variant`) are 
 2. **weggli source variant analysis** (Tier 2 #8): vendor the single weggli binary + a curated
    query pack and a "generalize-from-a-patch" workflow — the source-side complement to the binary
    `variant-scan` just shipped.
-3. **Differential testing (NEZHA-style)** (Tier 2 #11): a non-crashing oracle for logic/parsing
+2. **Differential testing (NEZHA-style)** (Tier 2 #11): a non-crashing oracle for logic/parsing
    bugs sanitizers never see — highest *new bug class* yield.
-4. **OptiMin** (MaxSAT-optimal minset) on top of `distill.py` when a bundled solver is acceptable.
+3. **OptiMin** (MaxSAT-optimal minset) on top of `distill.py` when a bundled solver is acceptable.
+4. **Auto-derive a grammar from the inferred format spec / mined tokens** so the new grammar engine
+   fires without an analyst-supplied grammar (a from_spec bridge already exists; extend it).
 
 Beacon-style path pruning on top of `blockdist`, and `libqasan` (built from AFL++ qemu_mode) to add
 shadow-memory depth to the `memoracle` lanes, are natural follow-ons to the shipped work.
