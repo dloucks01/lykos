@@ -78,6 +78,11 @@ def _runner(mode: str, argv, signal_name: str, run_cmd=None, runtime: str = "nat
         # failed when it worked.
         hint = (f'echo "exit status: $rc -- {signal_name} appears on stderr above as an '
                 'uncaught exception; the JVM exits 1 (or 3 on OutOfMemoryError)"')
+    elif run_cmd:
+        # A script reproducer (a shell-spawning exploit / a live leak) reports its OWN outcome;
+        # "a crash shows as 128+signum" is wrong for it and made an L3 bundle read as a crash.
+        hint = ('echo "exit status: $rc -- the reproducer above prints whether it succeeded '
+                '(a spawned shell / hijacked control), not a crash code"')
     else:
         hint = (f'echo "exit status: $rc (a crash by {signal_name} shows as 128+signum, '
                 'e.g. 139=SIGSEGV)"')
@@ -92,22 +97,44 @@ def _runner(mode: str, argv, signal_name: str, run_cmd=None, runtime: str = "nat
 
 
 def _primitive_txt(prim: dict) -> bytes:
+    # An L2 IP-control primitive carries a sentinel address and the observed faulting PC; an L3
+    # WORKING-EXPLOIT primitive (ret2win, ret2csu, execve, srop, a partial overwrite) carries
+    # neither. Forcing the L2 template onto an L3 printed "Sentinel: 0x0 / Observed PC: 0x0" for a
+    # confirmed exploit -- meaningless and misleading -- so each is described as what it is.
+    if "marker" in prim or "observed_pc" in prim:
+        lines = [
+            "L2 exploitation primitive",
+            "=========================",
+            f"Primitive: {prim.get('type')}",
+            f"Control offset: {prim.get('offset')} bytes",
+            f"Sentinel: 0x{prim.get('marker', 0):x}",
+            f"Observed program counter at fault: 0x{prim.get('observed_pc', 0):x}",
+            f"Confirmed: {prim.get('confirmed')}",
+            "",
+            "input.bin places the sentinel address at the control offset. Under native execution",
+            "the program counter is loaded with the sentinel, demonstrating full instruction-",
+            "pointer control (not merely a crash). Register control (if any):",
+        ]
+        for reg, off in (prim.get("registers") or {}).items():
+            lines.append(f"  {reg}: input offset {off}")
+        lines.append("")
+        return ("\n".join(lines)).encode()
     lines = [
-        "L2 exploitation primitive",
-        "=========================",
-        f"Primitive: {prim.get('type')}",
+        "L3 working-exploit primitive",
+        "============================",
+        f"Technique: {prim.get('type')}",
         f"Control offset: {prim.get('offset')} bytes",
-        f"Sentinel: 0x{prim.get('marker', 0):x}",
-        f"Observed program counter at fault: 0x{prim.get('observed_pc', 0):x}",
         f"Confirmed: {prim.get('confirmed')}",
         "",
-        "input.bin places the sentinel address at the control offset. Under native execution",
-        "the program counter is loaded with the sentinel, demonstrating full instruction-",
-        "pointer control (not merely a crash). Register control (if any):",
     ]
-    for reg, off in (prim.get("registers") or {}).items():
-        lines.append(f"  {reg}: input offset {off}")
-    lines.append("")
+    if prim.get("note"):
+        lines += [str(prim["note"]), ""]
+    lines += [
+        "input.bin drives control flow to attacker-chosen code -- this is a working exploit, not",
+        "merely a crash. meta.json records the technique and offset; runner.sh reproduces it and",
+        "prints the outcome (a spawned shell / the hijack's marker output).",
+        "",
+    ]
     return ("\n".join(lines)).encode()
 
 
