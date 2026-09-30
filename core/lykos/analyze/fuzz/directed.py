@@ -203,11 +203,16 @@ def _sources_reaching_targets(call_edges, distance):
     return got
 
 
-def plan_directed_campaign(findings, functions, call_edges, strings):
+def plan_directed_campaign(findings, functions, call_edges, strings, extra_targets=()):
     """Build a directed plan: ranked targets, callgraph distances, a targeted dictionary and
     seed corpus, and the input sources that reach the targets. Falls back to a string-mined
-    dictionary (undirected) when there are no addressed static candidates."""
-    targets = select_targets(findings)
+    dictionary (undirected) when there are no addressed static candidates.
+
+    ``extra_targets`` are target dicts from OTHER static engines -- e.g. weggli source hits mapped
+    to binary functions (``weggli.to_targets``) -- merged with the detector-derived targets so the
+    campaign steers toward them too. This closes the loop from a source pattern match to a
+    coverage-guided campaign aimed at the flagged function."""
+    targets = select_targets(findings) + list(extra_targets or ())
     # Menu-navigation seeds so the campaign starts INSIDE a numbered menu (heap/service targets),
     # not blindly at the front door. Best-effort; empty when the binary is not menu-driven.
     try:
@@ -306,7 +311,12 @@ def directed_stage(ctx) -> dict:
     call_edges = CallEdgeDAO(ctx.conn).list_by_target(target.id)
     strings = StringDAO(ctx.conn).list_by_target(target.id)
 
-    plan = plan_directed_campaign(findings, hydrated, call_edges, strings)
+    # Targets from OTHER static engines, closing the static->dynamic loop: weggli source hits mapped
+    # to binary functions (params.weggli_targets, produced by weggli.to_targets) steer the campaign
+    # toward source-flagged code. diff-test disagreement inputs come in as seeds via params.seeds.
+    extra_targets = p.get("weggli_targets") or []
+    plan = plan_directed_campaign(findings, hydrated, call_edges, strings,
+                                  extra_targets=extra_targets)
 
     # allow explicit seeds from params to augment the mined corpus, and ALWAYS reuse the target's
     # accumulated interesting inputs (concolic-solved inputs + prior crashers) so coverage

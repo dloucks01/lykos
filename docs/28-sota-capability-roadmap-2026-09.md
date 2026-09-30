@@ -50,6 +50,7 @@ Tier entries **[DONE]**.
 | Grammar-aware mutation | `analyze/fuzz/grammar.py` | `test_grammar.py` | Recursive/structure-valid input generation (Gramatron/Nautilus-style) reaching code behind nested parsers a flat model never builds |
 | Source variant analysis | `analyze/weggli.py` + `lykos weggli-scan` | `test_weggli.py` | weggli AST vuln-pattern pack over C/C++ + generalize-from-a-patch variant hunting (source-side complement to variant-scan) |
 | Differential testing | `analyze/fuzz/differential.py` + `lykos diff-test` | `test_differential.py` | NEZHA-style discrepancy oracle: fuzz 2+ implementations, flag disagreement (a non-crashing bug class) |
+| Static->dynamic loop wiring | `weggli.to_targets`, `differential.disagreement_seeds`, `directed.plan_directed_campaign(extra_targets=)` | in the above test files | weggli source hits become directed-fuzz TARGETS (steered by blockdist); diff-test disagreements become fuzz SEEDS |
 
 ### 1. Static input-to-state dictionary (`analyze/fuzz/cmpdict.py`)
 

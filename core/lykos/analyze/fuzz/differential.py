@@ -180,3 +180,16 @@ def differential_campaign(programs, seeds, *, rng, iterations: int = 2000, timeo
     stats.delta_diversity = len(seen_delta)
     stats.corpus = len(corpus)
     return stats
+
+
+def disagreement_seeds(stats) -> list:
+    """Inputs on which the implementations disagreed, as raw bytes -- high-value seeds: each sits
+    on a behavioural boundary, so mutating around it explores where a parser's logic diverges. Feed
+    them into a directed/blind fuzz campaign's corpus (via directed-fuzz params.seeds)."""
+    out = []
+    for d in getattr(stats, "discrepancies", None) or []:
+        try:
+            out.append(bytes.fromhex(d["input"]))
+        except (ValueError, KeyError, TypeError):
+            pass
+    return out

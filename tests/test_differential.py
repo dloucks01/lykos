@@ -48,6 +48,15 @@ def test_campaign_needs_two_programs():
                                 iterations=1)
 
 
+def test_disagreement_seeds_decodes_inputs():
+    st = D.DiffStats()
+    st.discrepancies = [{"input": b"12abc\n".hex(), "kind": "accept-reject", "partitions": {}},
+                        {"input": "not-hex", "kind": "output", "partitions": {}}]
+    seeds = D.disagreement_seeds(st)
+    assert b"12abc\n" in seeds                            # valid hex decoded
+    assert len(seeds) == 1                                # the bad one is skipped, not fatal
+
+
 @pytest.mark.skipif(not (shutil.which("gcc") or shutil.which("cc")), reason="no C compiler")
 def test_end_to_end_finds_a_parse_discrepancy(tmp_path):
     """Two 'validators' that disagree: strict accepts only a pure integer (strtol consumes all),

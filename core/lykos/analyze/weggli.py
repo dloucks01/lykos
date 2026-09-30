@@ -121,13 +121,58 @@ def _matched_files(output: str, root: Path) -> list:
     return seen
 
 
+# a C/C++ function DEFINITION: an identifier, a parenthesised param list with no ; { } inside, then
+# an opening brace. Distinguishes `parse_header(char*s){` (a def) from `strcpy(b,s);` (a call).
+_FUNC_DEF = re.compile(r"\b([A-Za-z_]\w*)\s*\([^;{}]*\)\s*\{")
+_HEADER = re.compile(r"^(?P<path>.+):(?P<line>\d+)$")
+
+
+def _parse_matches(output: str, root: Path) -> list:
+    """[{file, line, function, snippet}] per weggli match. weggli prints a ``path:line`` header then
+    the enclosing function; we recover the file (by existence), the line, and -- best-effort -- the
+    name of the enclosing function (the first function DEFINITION in the snippet), which lets a hit
+    be mapped onto a recovered binary function and become a directed-fuzz target."""
+    plain = re.sub(r"\x1b\[[0-9;]*m", "", output)
+    lines = plain.splitlines()
+    matches = []
+    cur = None
+
+    def _flush():
+        if cur and cur["file"]:
+            snip = "\n".join(cur["snippet"])
+            m = _FUNC_DEF.search(snip)
+            cur["function"] = m.group(1) if m else None
+            cur["snippet"] = snip[:400]
+            matches.append({k: cur[k] for k in ("file", "line", "function", "snippet")})
+
+    for ln in lines:
+        h = _HEADER.match(ln.strip())
+        f = None
+        if h:
+            p = h.group("path")
+            for cand in (Path(p), root / p):
+                try:
+                    if cand.is_file():
+                        f = str(cand.resolve()); break
+                except OSError:
+                    pass
+        if f:
+            _flush()
+            cur = {"file": f, "line": int(h.group("line")), "snippet": []}
+        elif cur is not None:
+            if ln.strip():
+                cur["snippet"].append(ln)
+    _flush()
+    return matches
+
+
 def run_query(query: str, path, *, cpp: bool = False, timeout: float = 120.0,
               context: int = 0, unique: bool = True) -> dict:
-    """Run one weggli query over ``path``. Returns ``{ok, files, count, raw, error}``.
+    """Run one weggli query over ``path``. Returns ``{ok, files, matches, count, raw, error}``.
 
     ``ok`` is False (with ``error``) when weggli is absent or the run failed. ``files`` is the list
-    of source files that matched; ``count`` is the number of matched files; ``raw`` is a bounded
-    prefix of weggli's output (for the analyst / snippet context).
+    of source files that matched; ``matches`` is per-hit ``{file, line, function, snippet}``;
+    ``count`` is the number of matched files; ``raw`` is a bounded prefix of weggli's output.
     """
     wb = weggli_bin()
     if wb is None:
@@ -143,10 +188,12 @@ def run_query(query: str, path, *, cpp: bool = False, timeout: float = 120.0,
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
                            env={**os.environ, "NO_COLOR": "1"})
     except (OSError, subprocess.SubprocessError) as e:
-        return {"ok": False, "files": [], "count": 0, "raw": "", "error": str(e)}
+        return {"ok": False, "files": [], "matches": [], "count": 0, "raw": "", "error": str(e)}
     out = r.stdout or ""
     files = _matched_files(out, root)
-    return {"ok": True, "files": files, "count": len(files), "raw": out[:4000], "error": None}
+    matches = _parse_matches(out, root)
+    return {"ok": True, "files": files, "matches": matches, "count": len(files),
+            "raw": out[:4000], "error": None}
 
 
 def scan(path, *, queries=None, cpp: bool = False, timeout: float = 120.0) -> dict:
@@ -167,7 +214,8 @@ def scan(path, *, queries=None, cpp: bool = False, timeout: float = 120.0) -> di
         if res["ok"] and res["count"] > 0:
             findings.append({"name": q["name"], "cwe": q["cwe"], "severity": q["severity"],
                              "query": q["query"], "why": q["why"],
-                             "files": res["files"], "count": res["count"]})
+                             "files": res["files"], "matches": res.get("matches", []),
+                             "count": res["count"]})
     # rank: severity then breadth
     _sev = {"critical": 0, "high": 1, "medium": 2, "low": 3}
     findings.sort(key=lambda f: (_sev.get(f["severity"], 9), -f["count"]))
@@ -214,3 +262,46 @@ def variant_query(snippet: str, *, level: int = 1) -> str:
     if level >= 2:
         q = re.sub(r"\b\d+\b", "_", q)
     return "{ " + q + "; }"
+
+
+# ---------------------------------------------------------------- static -> dynamic bridge
+
+def _norm_fn(name) -> str:
+    n = (name or "").strip()
+    for pre in ("sym.imp.", "sym.", "imp."):
+        if n.startswith(pre):
+            n = n[len(pre):]
+    return n
+
+
+def to_targets(scan_result: dict, functions) -> list:
+    """Map weggli source hits to DIRECTED-FUZZ targets by matching the enclosing function name to a
+    recovered binary function. Returns target dicts shaped like ``directed.select_targets`` output
+    (``function_addr``/``site_addr``/``cwe``/``detector``/``title``/``has_taint``/``score``) so the
+    directed-fuzz plan can steer toward the flagged function -- closing the loop from a source
+    pattern match to a coverage-guided campaign aimed at it. Requires a symbolized (source-built)
+    binary so the C function name maps to an address; unmapped hits are skipped.
+    """
+    by_name = {}
+    for f in functions or ():
+        name = _norm_fn(f.get("name") if isinstance(f, dict) else getattr(f, "name", None))
+        addr = f.get("addr") if isinstance(f, dict) else getattr(f, "addr", None)
+        if name and addr is not None:
+            by_name.setdefault(name, addr)
+    _sev = {"critical": 40, "high": 30, "medium": 20, "low": 10}
+    targets, seen = [], set()
+    for finding in (scan_result or {}).get("findings", []):
+        for m in finding.get("matches", []):
+            fn = _norm_fn(m.get("function"))
+            addr = by_name.get(fn) if fn else None
+            if addr is None or (addr, finding["cwe"]) in seen:
+                continue
+            seen.add((addr, finding["cwe"]))
+            targets.append({
+                "function_addr": addr, "site_addr": addr, "cwe": finding["cwe"],
+                "detector": "weggli", "title": f"weggli: {finding['name']} in {fn}()",
+                "has_taint": False,
+                "score": _sev.get(finding["severity"], 10) + 100,   # a source-confirmed pattern
+                "source_file": m.get("file"), "source_line": m.get("line")})
+    targets.sort(key=lambda t: t["score"], reverse=True)
+    return targets

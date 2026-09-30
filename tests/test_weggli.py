@@ -63,6 +63,35 @@ def test_run_query_declines_without_weggli(monkeypatch):
     assert r["ok"] is False and r["error"]
 
 
+def test_parse_matches_extracts_the_enclosing_function():
+    d = Path(tempfile.mkdtemp())
+    (d / "h.c").write_text("void parse_header(char*s){char b[16]; strcpy(b,s);}\n")
+    out = f"{d/'h.c'}:1\nvoid parse_header(char*s){{char b[16]; strcpy(b,s);}}\n"
+    matches = weggli._parse_matches(out, d)
+    assert len(matches) == 1
+    assert matches[0]["function"] == "parse_header" and matches[0]["line"] == 1
+
+
+def test_to_targets_maps_source_hits_to_binary_functions():
+    # a scan result whose hit is in function parse_header, and recovered binary functions
+    scan = {"supported": True, "findings": [
+        {"name": "unbounded_strcpy", "cwe": "CWE-120", "severity": "high",
+         "matches": [{"function": "parse_header", "file": "h.c", "line": 3}]}]}
+    functions = [{"name": "parse_header", "addr": "0x1139"},
+                 {"name": "sym.helper", "addr": "0x1180"}]
+    targets = weggli.to_targets(scan, functions)
+    assert len(targets) == 1
+    t = targets[0]
+    assert t["function_addr"] == "0x1139" and t["cwe"] == "CWE-120"
+    assert t["detector"] == "weggli" and "parse_header" in t["title"]
+
+
+def test_to_targets_skips_unmapped_functions():
+    scan = {"findings": [{"name": "x", "cwe": "CWE-120", "severity": "high",
+                          "matches": [{"function": "not_in_binary"}]}]}
+    assert weggli.to_targets(scan, [{"name": "other", "addr": "0x1"}]) == []
+
+
 @pytest.mark.skipif(weggli.weggli_bin() is None, reason="weggli binary not installed")
 def test_end_to_end_finds_strcpy(tmp_path):
     src = tmp_path / "v.c"
