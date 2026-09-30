@@ -20,6 +20,8 @@ GADGETS = {
     "pop_rdx": b"\x5a\xc3",           # pop rdx ; ret
     "ret": b"\xc3",                   # ret (stack alignment)
     "pop_rsi_r15": b"\x5e\x41\x5f\xc3",  # pop rsi ; pop r15 ; ret (libc_csu)
+    "jmp_rsp": b"\xff\xe4",           # jmp rsp  -- redirect PC to the stack (ret2shellcode, no leak)
+    "call_rsp": b"\xff\xd4",          # call rsp -- same, pushing a return first
 }
 
 
