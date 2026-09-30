@@ -160,14 +160,22 @@ def parse_memcheck(stderr: bytes) -> Optional[dict]:
     for i, ln in enumerate(lines):
         low = ln.lower()
         ctx = " ".join(lines[i + 1:i + 4]).lower()   # the Address/context lines that follow
+        # memcheck names a real heap region only for a genuine heap error: "... a block of
+        # size N alloc'd/free'd". A wild or NULL pointer instead reads "not stack'd, malloc'd
+        # or (recently) free'd" -- note that NEGATION also contains the substring "free'd", so
+        # keying on "free'd" alone misreads a NULL deref as a use-after-free. Gate on the
+        # affirmative block marker, and treat an invalid read/write with no heap block as NOT a
+        # heap defect (a wild/NULL/stack pointer) -- left to the signal-based classifier.
+        heap = "block of size" in ctx
+        freed = heap and "free'd" in ctx
         kind = None
         if low.startswith("invalid write"):
-            kind = "use-after-free" if "free'd" in ctx else "heap-oob-write"
+            kind = "use-after-free" if freed else ("heap-oob-write" if heap else None)
         elif low.startswith("invalid read"):
-            kind = "use-after-free" if "free'd" in ctx else "heap-oob-read"
+            kind = "use-after-free" if freed else ("heap-oob-read" if heap else None)
         elif "invalid free" in low or "invalid delete" in low:
             # a free of an already-freed block is a double free; otherwise a free of a bad pointer.
-            kind = "double-free" if "free'd" in ctx else "invalid-free"
+            kind = "double-free" if freed else "invalid-free"
         elif low.startswith("use of uninitialised") or "uninitialised value" in low:
             kind = "uninitialised"
         elif "conditional jump or move depends on uninitialised" in low:
