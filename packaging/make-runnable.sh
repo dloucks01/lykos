@@ -5,7 +5,7 @@
 #
 #     unzip lykos-airgapped-*.zip
 #     cd lykos
-#     ./RUN.sh            # or: make run
+#     ./start             # (or ./RUN.sh)
 #
 # No install, no setup step, nothing placed in system directories, and the laptop's own
 # libraries are never touched (each tool runs through a relocatable scoped wrapper). Run this on
@@ -285,48 +285,30 @@ eval "$(sed -n '/^gen_wrappers() {/,/^}/p' "$ROOT/packaging/setup-toolchain.sh")
 gen_wrappers "$V/toolchain"
 
 say "launcher + quickstart"
+# The package ships the repo's own ./start and ./lykos launchers. They are already air-gap aware:
+# when a vendor/ tree is present (it is, here) they use the bundle's OWN Python -- ABI-matched to
+# the pypcode wheel and the engine venvs -- and set LYKOS_VENDOR so the P-Code detectors and the
+# tool locators find vendor/toolchain and vendor/pysite. So the laptop needs no python3 of its own.
+# RUN.sh / DOCTOR.sh remain as thin, familiar aliases; `< /dev/null` keeps any spawned analysis
+# tool from blocking on an inherited terminal.
 cat > "$APP/RUN.sh" <<'EOF'
 #!/usr/bin/env sh
-# Unzip-and-run launcher. Serves the lykos console on http://127.0.0.1:8787 (loopback only).
-# Everything runs in place from ./vendor -- no install, nothing touched on this machine.
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-cd "$here"
-# Prefer the bundle's OWN Python -- it matches the pypcode wheel and the engine venvs, so the
-# analysis works regardless of what python3 (if any) the laptop has. It finds its libraries through
-# an $ORIGIN rpath (set at build time), so NO LD_LIBRARY_PATH is exported here -- the bundle's
-# libraries stay private to the bundle's tools and never leak onto anything else the server spawns.
-# Fall back to the system python3 only if this bundle was built without a vendored interpreter.
-py="$here/vendor/toolchain/usr/bin/python3"
-[ -x "$py" ] || py=python3
-# LYKOS_VENDOR is set EXPLICITLY rather than left to auto-detection: the vendored engines --
-# pypcode above all -- live under vendor/pysite, and if that directory is not put on sys.path the
-# P-Code memory-safety detectors go dark and `doctor` reports pypcode "missing" even though it is
-# right there. Auto-detection from __file__/cwd proved fragile across laptops (symlinked paths,
-# odd mounts), so we name the directory outright. This one variable also gives the tool locators
-# vendor/toolchain, so no separate LYKOS_TOOLCHAIN is needed.
-# stdin < /dev/null: no analysis tool can then block reading an inherited pipe/terminal.
-exec env PYTHONPATH="$here/core" LYKOS_VENDOR="$here/vendor" "$py" -m lykos serve \
-     --http 127.0.0.1:8787 --case-store "$here/.cases" --workers 2 < /dev/null
+exec "$here/start" < /dev/null
 EOF
 chmod +x "$APP/RUN.sh"
-# A doctor that uses the SAME interpreter and vendored path RUN.sh does -- running `python3 -m lykos
-# doctor` with the laptop's own python (as the notes used to say) finds none of the vendored engines
-# and always reports pypcode missing. This wrapper is the correct invocation, in one command.
 cat > "$APP/DOCTOR.sh" <<'EOF'
 #!/usr/bin/env sh
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-cd "$here"
-py="$here/vendor/toolchain/usr/bin/python3"
-[ -x "$py" ] || py=python3
-exec env PYTHONPATH="$here/core" LYKOS_VENDOR="$here/vendor" "$py" -m lykos doctor "$@" < /dev/null
+exec "$here/lykos" doctor "$@" < /dev/null
 EOF
 chmod +x "$APP/DOCTOR.sh"
 cat > "$APP/RUN-HERE-FIRST.txt" <<'EOF'
 lykos -- air-gapped, unzip-and-run. No installation. Nothing is written outside this folder.
 
   1. You already unzipped this (use `unzip -o` if it prompts). Everything is inside ./vendor.
-  2. Check what this host can do:   ./DOCTOR.sh
-  3. Run it:                        ./RUN.sh      (or: make run)
+  2. Check what this host can do:   ./lykos doctor       (or ./DOCTOR.sh)
+  3. Run it:                        ./start              (or ./RUN.sh)
      Then open http://127.0.0.1:8787 in a browser on this machine.
 
 The analysis tools (rizin, gdb, qemu, wine, afl++, the cross-compilers, the JVM, ...) live

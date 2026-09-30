@@ -26,7 +26,7 @@ REQ='Python 3|rizin|pypcode|qemu-user|GDB|C compiler|AFL\+\+|afl-qemu-trace'
 
 if [ "$KIND" = folder ]; then
   ART="${ART:-$(ls -1t "$ROOT"/dist/lykos-airgapped-*.zip 2>/dev/null | head -1)}"
-  [ -n "$ART" ] && [ -f "$ART" ] || die "no folder zip (build with 'make runnable')"
+  [ -n "$ART" ] && [ -f "$ART" ] || die "no folder zip (build with ./package)"
   say "cold-laptop test of $(basename "$ART")  base=$BASE  (offline, non-root, no tools)"
   # Extract HERE (the build host has unzip) and mount the tree read-only -- the minimal laptop base
   # deliberately has no tools, unzip included, so extracting inside it would give a false NO_UNZIP.
@@ -39,14 +39,8 @@ if [ "$KIND" = folder ]; then
   out="$("$RT" run --rm --network none --user 1000:1000 \
         -v "$ROOTDIR":/lykos:ro -e HOME=/tmp \
         "$BASE" sh -c 'cd /tmp && sh /lykos/DOCTOR.sh 2>&1' 2>&1 || true)"
-elif [ "$KIND" = container ]; then
-  ART="${ART:-$(ls -1t "$ROOT"/dist/lykos-container-*.tar.zst 2>/dev/null | head -1)}"
-  [ -n "$ART" ] && [ -f "$ART" ] || die "no container tarball (build with 'make container')"
-  say "loading + doctor of $(basename "$ART")  (the image carries its own libc -- distro-independent)"
-  zstd -dc "$ART" | "$RT" load >/dev/null 2>&1 || die "load failed"
-  out="$("$RT" run --rm --network none --entrypoint python3 localhost/lykos:latest -m lykos doctor 2>&1 || true)"
 else
-  die "usage: test-airgap.sh folder|container [artifact]"
+  die "usage: test-airgap.sh folder [artifact]"
 fi
 
 echo "$out" | grep -iE '\[ok|\[MISS|present|REQUIRED missing|cannot open|not found|NO_DOCTOR|NO_UNZIP' || true

@@ -3,11 +3,25 @@
 #   ./lykos doctor     what this host can do (and the install line for anything missing)
 #   ./lykos serve ...  run the workbench UI + API (see also ./start)
 #   ./lykos --help     every command
-# Override the interpreter with LYKOS_PYTHON=/path/to/python3 if needed.
+# In an air-gap package (a vendor/ tree is present) it uses the bundle's OWN Python and engines;
+# in a plain clone it uses the system python3. Override with LYKOS_PYTHON=/path/to/python3.
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-PY=${LYKOS_PYTHON:-python3}
-if ! command -v "$PY" >/dev/null 2>&1; then
+
+PY=${LYKOS_PYTHON:-}
+if [ -z "$PY" ]; then
+    if [ -x "$here/vendor/toolchain/usr/bin/python3" ]; then
+        PY="$here/vendor/toolchain/usr/bin/python3"      # air-gap bundle's own interpreter (ABI-matched)
+    else
+        PY=python3
+    fi
+fi
+if [ ! -x "$PY" ] && ! command -v "$PY" >/dev/null 2>&1; then
     echo "lykos needs python3 (>= 3.10). Install it, or set LYKOS_PYTHON=/path/to/python3." >&2
     exit 1
+fi
+
+if [ -d "$here/vendor" ]; then                           # air-gap engines (P-Code, qemu, ...) present
+    exec env PYTHONPATH="$here/core${PYTHONPATH:+:$PYTHONPATH}" LYKOS_VENDOR="$here/vendor" \
+        "$PY" -m lykos "$@"
 fi
 exec env PYTHONPATH="$here/core${PYTHONPATH:+:$PYTHONPATH}" "$PY" -m lykos "$@"

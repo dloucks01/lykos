@@ -219,5 +219,5 @@ Anything still marked MISS names its own fallback line.
 Next:
   cd <your lykos checkout>
   make test        # the suite; stages whose tool is absent skip, and say so
-  make run         # serve the UI on 127.0.0.1:8787
+  ./start          # serve the UI on 127.0.0.1:8787
 EOF

@@ -94,8 +94,7 @@ make real-gate         # full chain on real programs (detect -> PoC -> attributi
 make release           # ci + verify + all four gates
 make toolchain-bundle  # build the air-gap toolchain tarball (on a CONNECTED machine)
 make repo-tarball      # snapshot the repo for sneakernet (tracked files at HEAD, + sha256)
-make runnable          # ONE unzip-and-run .zip: repo + fully-populated vendor/ (no install)
-make container         # self-contained OCI image + air-gap tarball (most portable; needs podman/docker)
+./package              # ONE unzip-and-run .zip: repo + fully-populated vendor/ (no install)
 make dashboard         # detection-quality regression dashboard from eval-history.jsonl
 make clean             # remove build artifacts and caches
 ```

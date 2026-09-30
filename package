@@ -1,0 +1,7 @@
+#!/bin/sh
+# package -- build the ONE unzip-and-run air-gap folder (a single .zip: the repo + a fully
+# populated vendor/ of engines, no install). Run this on a CONNECTED build machine; carry the
+# resulting dist/lykos-airgapped-*.zip to the air-gapped laptop, unzip, and ./start.
+# Prerequisite: an air-gap toolchain bundle in dist/ (build it with: make toolchain-bundle).
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec bash "$here/packaging/make-runnable.sh" "$@"
