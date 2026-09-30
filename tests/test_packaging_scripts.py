@@ -165,7 +165,7 @@ def test_the_installer_repoints_a_venv_at_this_hosts_python():
 
 
 def test_the_airgap_runbook_exists_and_covers_both_sides():
-    doc = (DOCS / "23-airgap-install.md").read_text()
+    doc = (DOCS / "air-gap.md").read_text()
     assert "collect-toolchain.sh" in doc
     # the bundle stages the setup script as setup.sh, so the runbook names that
     assert "setup.sh" in doc
@@ -175,7 +175,7 @@ def test_the_airgap_runbook_exists_and_covers_both_sides():
 
 def test_the_runbook_documents_every_required_tool():
     from lykos import toolchain
-    doc = (DOCS / "23-airgap-install.md").read_text().lower()
+    doc = (DOCS / "air-gap.md").read_text().lower()
     for t in toolchain.TOOLS:
         if t.tier == "required":
             assert t.title.split()[0].lower() in doc, f"{t.title} is not in the runbook"
@@ -185,7 +185,7 @@ def test_the_runbook_states_the_afl_qemu_trap():
     """`file` reports the HOST architecture of an emulator whose guest is fixed at build time.
     Anyone provisioning coverage fuzzing air-gapped will hit this, and the symptom is a
     campaign that aborts at the fork-server handshake."""
-    doc = (DOCS / "23-airgap-install.md").read_text()
+    doc = (DOCS / "air-gap.md").read_text()
     assert "afl-qemu-trace" in doc and "--version" in doc
 
 
