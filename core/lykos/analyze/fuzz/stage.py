@@ -60,6 +60,11 @@ _MAX_CORPUS = 256
 # trace at most this many seeds for the up-front coverage measurement.
 _DISTILL_MIN = 12
 _DISTILL_CAP = 256
+# Seed calibration: run at most this many starting seeds verbatim before mutation begins. Every
+# seed a curated corpus supplies (format models, boundary-value configs, menu op-sequences) is
+# worth one clean execution up front; the cap stops a large accumulated corpus from spending a
+# whole starved budget on replay alone.
+_CALIBRATE_CAP = 64
 # Below this share of the binary, a call-graph closure is not telling us about dead code --
 # it is telling us the call graph could not be read (stripped, or indirect-heavy).
 _LIVE_FLOOR = 0.25
@@ -457,11 +462,22 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
     retired: set = set()
     suspect: list = []
     cheap_ms = [1.0]
+    # Seed calibration: run every starting seed ONCE, verbatim, before any mutation. A seed that
+    # already crashes then surfaces in the first handful of executions instead of waiting on a
+    # mutation to rediscover it -- and a mutation usually destroys the very value that crashes.
+    # This is what makes a seeded bug deterministic under a starved budget: a JVM/PE campaign
+    # under CPU contention completes a few dozen executions, not thousands, and an unchecked
+    # array index behind `slot=0` (CWE-129) has to be HIT, not stumbled upon. AFL calibrates
+    # every seed for the same reason. Verbatim, so the seed's own bytes reach the parser; the
+    # boundary-value configs the JVM path puts first in the corpus are exactly the payloads this
+    # detonates first. Bounded so a large distilled corpus cannot eat the whole budget on replay.
+    replay: list = list(corpus)[:_CALIBRATE_CAP]
     ctx.progress(msg=f"{event_prefix} campaign")
     while execs < max_execs and time.time() < deadline and not ctx.should_cancel():
+        calibrating = bool(replay)
         prefix: list = []
         base_ms = sorted(cheap_ms)[len(cheap_ms) // 2]
-        if batchable and flags:
+        if batchable and flags and not calibrating:
             live = [f for f in flags if f not in retired
                     and not _dear(flag_cost.get(f), base_ms)]
             if suspect:
@@ -479,7 +495,14 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
         risky = any(f not in flag_cost or _dear(flag_cost.get(f), base_ms) for f in prefix)
         run_argv = prefix + base_argv          # exploration first, the contract last
         want = min((_PROBE_N if risky else batch_n) if batchable else 1, max_execs - execs)
-        inputs = [mut.mutate(rng.choice(corpus), corpus) for _ in range(max(1, want))]
+        if calibrating:
+            # Verbatim seeds first, in corpus order (boundary-value configs lead), up to the
+            # batch size -- never mutated, so a seed that crashes is caught as itself.
+            take = min(len(replay), max(1, want))
+            inputs = replay[:take]
+            del replay[:take]
+        else:
+            inputs = [mut.mutate(rng.choice(corpus), corpus) for _ in range(max(1, want))]
         results = None
         if batchable:
             # Only ever arm blocks we have not reached: the breakpoints are one-shot, so
@@ -1035,7 +1058,12 @@ def fuzz_stage(ctx) -> dict:
         # executions against one produced 826 distinct behaviours and no crashes.
         keys = textconf.keys_from([x.value for x in strings])
         mutator, fmt = textconf.KeyValueMutator(rng, keys, dictionary), "keyvalue"
-        corpus = [textconf.seed_for(keys)] + list(corpus)
+        # Boundary-value configs FIRST in the corpus, then the valid placeholder seed. A field
+        # parsed as a number (atoi / Integer.parseInt / an array index) hides its bug behind a
+        # specific value -- 0, -1, INT_MAX, overflow -- that the mutator lands only by luck, and
+        # never inside a short, JVM-slow budget under load. Seeding them makes such a bug crash on
+        # the first executions instead of stochastically; a robust parser just accepts them.
+        corpus = textconf.boundary_seeds(keys) + [textconf.seed_for(keys)] + list(corpus)
         ctx.emit("fuzz.format", payload={"model": "keyvalue", "auto": True,
                                          "keys": keys[:16],
                                          "why": "the binary requires a config path"})

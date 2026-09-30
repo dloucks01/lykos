@@ -306,9 +306,14 @@ def test_a_jar_is_analysed_run_and_cracked_from_the_file_alone(tmp_path):
         pool.wait_idle(180)
         target = store.targets.get(target.id)
         assert target.file_type == "jar"
-        enqueue_fuzz(q, target, params={"max_execs": 4000, "max_seconds": 120,
+        # A small budget on purpose: the campaign calibrates every seed VERBATIM before it
+        # mutates, and the config path seeds boundary-value configs (slot=0, ...) first, so the
+        # unchecked array index is hit in the first batch -- not stumbled on after thousands of
+        # JVM-slow executions. That is the property under test: the find is deterministic even
+        # when the box is loaded and this campaign completes a few dozen executions, not 4000.
+        enqueue_fuzz(q, target, params={"max_execs": 40, "max_seconds": 40,
                                         "exec_timeout": 5}, force=True)
-        pool.wait_idle(600)
+        pool.wait_idle(300)
     finally:
         pool.stop()
 
