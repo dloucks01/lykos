@@ -45,16 +45,32 @@ def _mem(reg, n):
         return bytes(b).decode("latin-1")
     except Exception: return None
 
+def _in_loader(frame):
+    # The dynamic linker calls strcmp/strncmp heavily while resolving symbols at startup; those
+    # comparisons are noise and, unfiltered, can exhaust MAX before the target's own call runs.
+    # Resolve the caller's objfile BY ADDRESS (ld.so carries symbols but no line info, so its
+    # frames have no symtab -- keying on symtab would never match).
+    try:
+        of = gdb.current_progspace().objfile_for_address(frame.pc())
+        name = of.filename if of else ""
+    except Exception:
+        name = ""
+    return bool(name) and ("ld-linux" in name or "/ld-2." in name or name.endswith("/ld.so"))
+
 class Cmp(gdb.Breakpoint):
-    def __init__(self, name, lenidx):
-        super().__init__(name, gdb.BP_BREAKPOINT, internal=True)
-        self.fname, self.lenidx = name, lenidx
+    def __init__(self, location, fname, lenidx):
+        # `location` is what gdb breaks on (e.g. "strcmp@plt"); `fname` is the reported name.
+        super().__init__(location, gdb.BP_BREAKPOINT, internal=True)
+        self.fname, self.lenidx = fname, lenidx
     def stop(self):
         rec = {"func": self.fname}
+        f = None
         try:
             f = gdb.selected_frame().older()
             rec["caller"] = f.name() if f else None
         except Exception: rec["caller"] = None
+        if f is not None and _in_loader(f):
+            return False                       # skip ld.so's own symbol-name comparisons
         try:
             n = _u(ARGREGS[self.lenidx]) if self.lenidx is not None else None
             rec["n"] = n
@@ -68,8 +84,15 @@ class Cmp(gdb.Breakpoint):
 
 gdb.execute("set breakpoint pending on")   # comparison funcs live in libc (not yet loaded)
 for _n, _li in FUNCS.items():
-    try: Cmp(_n, _li)
-    except Exception: pass
+    # On modern glibc, strcmp/strncmp/memcmp/... are GNU IFUNCs: a call in the target dispatches
+    # to a CPU-specific SIMD impl (__strcmp_avx2, ...), NOT the generic libc symbol -- so breaking
+    # on the bare name MISSES the target's own comparisons (it only catches ld.so's internal use).
+    # The target's PLT stub is hit regardless of which impl the GOT resolves to, so break there
+    # first; keep the bare name too for statically linked / no-PLT builds. A location that does not
+    # exist (e.g. no PLT) just stays an unresolved pending breakpoint -- harmless.
+    for _loc in (_n + "@plt", _n):
+        try: Cmp(_loc, _n, _li)
+        except Exception: pass
 gdb.execute("set pagination off")
 gdb.execute("set height 0")
 RAN, ERR = False, ""
