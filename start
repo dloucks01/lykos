@@ -1,0 +1,10 @@
+#!/bin/sh
+# start the lykos workbench: the point-and-click analyst UI. Nothing to install.
+# Open the printed http://... address in a browser, then drop in a binary or a source tree.
+#   LYKOS_HTTP=127.0.0.1:9000 ./start   to change the bind address
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+echo "lykos workbench starting -- open the address below in a browser; Ctrl-C to stop."
+exec "$here/lykos" serve \
+    --http "${LYKOS_HTTP:-127.0.0.1:8787}" \
+    --case-store "$here/.cases" \
+    --workers "${LYKOS_WORKERS:-2}"

@@ -19,7 +19,7 @@ state that says how far it has been proven, and **you** decide when to trust it.
 
 ```sh
 cd lykos
-PYTHONPATH=core python3 -m lykos doctor
+./lykos doctor
 ```
 
 `doctor` prints every analysis engine, whether it is installed, and the exact install line for
@@ -30,7 +30,7 @@ heavy engines (Ghidra, AFL++, QEMU, GDB, angr) are optional and only unlock extr
 ## 2. Start the console
 
 ```sh
-make run
+./start
 ```
 
 This starts the local server and prints a URL. Open it in a browser on this machine:

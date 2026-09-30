@@ -10,9 +10,9 @@ fuzzing harness around it, and produces a **reproducible proof-of-concept** for 
 confirms. It runs entirely offline and has no network code paths at all.
 
 ```sh
-git clone <lykos> && cd lykos
-PYTHONPATH=core python3 -m lykos doctor    # what this host can do, and how to fix the gaps
-make run                                   # the analyst UI on 127.0.0.1:8787
+git clone https://github.com/dloucks01/lykos && cd lykos
+./start                                    # the analyst UI on http://127.0.0.1:8787
+./lykos doctor                             # what this host can do, and how to fix the gaps
 ```
 
 Nothing to install to get that far: the core is **stdlib-only**, no pip packages. The heavy
@@ -26,7 +26,7 @@ finding in five minutes.
 
 ## What it produces
 
-The **workbench** (`make run`) is a one-click **Autopilot**: drop a binary — or a C/C++ **source
+The **workbench** (`./start`) is a one-click **Autopilot**: drop a binary — or a C/C++ **source
 tree** (a single file, or a multi-file **project** with a Makefile / CMake / autotools, or a
 **library** with no `main`), compiled instrumented on the way in — and it runs the whole pipeline
 and drives each crash as far up the exploitation ladder as the target allows.
@@ -85,7 +85,7 @@ make lint typecheck    # ruff; mypy (strict over the infra core — see mypy.ini
 make gui               # headless GUI harnesses (needs node)
 make ci                # lint + typecheck + gui + test
 make coverage          # line/branch coverage INCLUDING the subprocess-only engines
-make run               # serve the API + UI on 127.0.0.1:8787 (case store in .cases/)
+./start                # serve the API + UI on 127.0.0.1:8787 (case store in .cases/)
 make bundle            # build the standalone dist/lykos.pyz zipapp
 make verify            # build it, then prove it serves the UI and triages offline
 make eval-gate         # detection-quality gate over the bundled corpus
@@ -187,7 +187,7 @@ measurement.
 ## Driving it over HTTP
 
 ```sh
-PYTHONPATH=core python3 -m lykos serve --http 127.0.0.1:8787 --case-store .cases --workers 2
+./lykos serve --http 127.0.0.1:8787 --case-store .cases --workers 2
 curl -s -X POST http://127.0.0.1:8787/cases -d '{"name":"demo"}'            # -> {"id": ...}
 curl -s -X POST http://127.0.0.1:8787/cases/<CASE_ID>/targets \
      -H 'X-Filename: ls' --data-binary @/bin/ls                            # ingest + triage

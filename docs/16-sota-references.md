@@ -135,9 +135,9 @@ orchestration posture in doc 02. Don't build an "LLM that finds bugs"; build a C
   prioritize symbolic paths for vuln discovery. *NOT adopted (LLM); substitute: static-analysis-guided path prioritization (doc 05/08).*
 
 ## Threat-landscape context (why this is timely, not why to over-claim)
-Reporting through H1–H2 2026 shows agents chaining discovery→validation→weaponization; Anthropic's
-**Claude Mythos Preview** (April 2026) demonstrated autonomous 0-day identification/exploitation across
-major OSes/browsers. Capability context only — our tool stays human-in-the-loop and engagement-scoped.
+Reporting through H1–H2 2026 shows autonomous agents chaining discovery→validation→weaponization,
+including public demonstrations of end-to-end 0-day identification and exploitation across major
+OSes/browsers. Capability context only — our tool stays human-in-the-loop and engagement-scoped.
 
 ## Net architectural implications for BinAnalysis (zero-AI reading)
 1. Build a **lean custom orchestration core** we own (doc 02/10) with a deterministic-engine layer only —
