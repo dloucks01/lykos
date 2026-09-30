@@ -462,7 +462,18 @@ def run_case(case: RealCase, exe: Path, *, timeout: float = 30.0) -> dict:
                     res["missing"] = [k for k, v in _asserts(case).items()
                                       if got.get(k) != v]
                     return res
-                sha = crashes[0].input_sha
+                # When the case asserts a SPECIFIC fault, prove the bundle for THAT crash, not
+                # for whatever landed last. A target can throw several distinct faults -- the JVM
+                # config parser reaches an ArrayIndexOutOfBoundsException (CWE-129) on slot=0 AND a
+                # NumberFormatException on an out-of-int-range boundary value -- and the crash list
+                # is ordered most-recent-first, so "the first crash" is not a stable choice. The
+                # real autopilot proves EVERY distinct crash for this reason; the gate drives one,
+                # so it picks the one it makes an assertion about. Falls back to the first crash
+                # when the case names no fault.
+                want_fault = case.expect.get("fault")
+                picked = next((c for c in crashes if want_fault and c.signal_name == want_fault),
+                              crashes[0])
+                sha = picked.input_sha
                 if "cwe129" in case.expect or "not_memory_corruption" in case.expect:
                     # Recomputed AFTER the crash: the fault's CWE comes from the exception,
                     # and the native table falls through to CWE-119 "critical" for anything it
@@ -472,7 +483,7 @@ def run_case(case: RealCase, exe: Path, *, timeout: float = 30.0) -> dict:
                     after = {f.cwe for f in fd.list_by_target(target.id)}
                     got["cwe129"] = "CWE-129" in after
                     got["not_memory_corruption"] = "CWE-119" not in after
-                    res["detail"]["fault"] = crashes[0].signal_name
+                    res["detail"]["fault"] = picked.signal_name
 
             # NOTE: input_sha and nothing else. The stage must work out the channel itself --
             # every case here is reachable through exactly one, so the sweep is load-bearing.
