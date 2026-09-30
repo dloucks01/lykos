@@ -135,26 +135,18 @@ packaging/         zipapp build, offline verify, air-gap bundle scripts
 | 10 | `docs/10-tech-stack.md` | Technology choices, rationale, licensing |
 | 11 | `docs/11-airgap-packaging.md` | Air-gap *design position* (procedure is doc 23) |
 | 12 | `docs/12-data-model.md` | Case model, DB schema, artifact store |
-| 13 | `docs/13-roadmap-milestones.md` | Phased delivery with exit criteria |
 | 14 | `docs/14-validation-benchmarks.md` | How detection quality is measured |
 | 15 | `docs/15-risks-open-questions.md` | Risks, legal/ethical gating, open decisions |
 | 16 | `docs/16-sota-references.md` | State-of-the-art survey incl. DARPA AIxCC |
 | 17 | `docs/17-multibinary-firmware.md` | Multi-binary analysis + firmware rehosting |
 | 18 | `docs/18-architecture-coverage.md` | All-architecture coverage matrix and tiers |
 | 19 | `docs/19-cwe-coverage.md` | All-CWE coverage matrix by family and channel |
-| 20 | `docs/20-open-work-backlog.md` | **What is done, what is not, and what was measured** |
-| 21 | `docs/21-crs-harvest-review.md` | CRS harvest-review memo template |
 | 22 | `docs/22-toolchain-setup.md` | What each engine is and how it was provisioned |
 | 23 | `docs/23-airgap-install.md` | **Air-gap setup runbook (no install)** — bundle, carry, verify, run in place |
-| 24 | `docs/24-modernization-plan.md` | **2026 SOTA refresh** — source path, lean RE stack (drop the JVM), exploit-path automation, optional LLM |
-| 25 | `docs/25-security-audit-2026-09.md` | **Code audit & review** — ranked robustness/correctness findings, remediation status, follow-ups |
-| 26 | `docs/26-code-audit-2026-09-25.md` | **Code audit & correctness pass** — six parallel reviews, de-duplicated and ranked, fixes validated |
-| 27 | `docs/27-full-sweep-audit-2026-09-29.md` | **Full-sweep audit** — code correctness, capability (claims vs code), test/gate integrity, packaging |
-| 28 | `docs/28-sota-capability-roadmap-2026-09.md` | **SOTA capability audit & roadmap** — non-AI/air-gapped 0-day techniques vs lykos, prioritized additions |
-| 29 | `docs/29-next-steps-2026-09-30.md` | **Next steps (handoff)** — validate-first checklist, remaining builds (OptiMin/grammar-auto/Joern), environment + quick reference |
 
-New here? `docs/20-open-work-backlog.md` is the honest state of the system: what works, what
-was measured, and what is still open. `docs/02-architecture.md` for the shape of it.
+New here? [QUICKSTART.md](QUICKSTART.md) is the five-minute path to your first finding;
+`docs/02-architecture.md` is the shape of the system. (Working notes, audits and the backlog
+live under `docs/internal/`.)
 
 ## What the detection gate measures
 

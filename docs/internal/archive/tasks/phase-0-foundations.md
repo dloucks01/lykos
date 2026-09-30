@@ -155,7 +155,7 @@ Reuse the console prototype’s tokens/components.
 | ID | Task | Deliverable | Accept | Dep |
 |----|------|-------------|--------|-----|
 | P0.8.1 | Study Buttercup + 1–2 AIxCC OSS CRSs | reading notes | orchestration patterns understood | — |
-| P0.8.2 | Vendor-vs-reimplement memo | `docs/21-crs-harvest-review.md`: what to reuse vs build, license notes | decisions feed P0.3 design | P0.8.1 |
+| P0.8.2 | Vendor-vs-reimplement memo | `docs/internal/21-crs-harvest-review.md`: what to reuse vs build, license notes | decisions feed P0.3 design | P0.8.1 |
 > Gate: **finish P0.8.2 before finalizing the P0.3 job-engine design** (scaffolding P0.3.1 may start earlier).
 
 ### P0.9 — Plugin API skeleton  (S–M)

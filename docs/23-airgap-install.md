@@ -35,39 +35,20 @@ cross-architecture execution (qemu-user), and the coverage-guided and symbolic e
 
 ---
 
-## Two ways to deliver it — pick by what the laptop can run
+## How it is delivered — one unzip-and-run folder
 
-| | Build | Carry | Run on laptop | Portability |
-|---|---|---|---|---|
-| **Container image** (recommended) | `make container` (needs podman/docker + network) | one `dist/lykos-container-*.tar.zst` | `podman load` + `podman run` | **Runs on any distro.** Carries its own libc/`ld-linux`/Python/tools; only the kernel is shared |
-| **Unzip-and-run folder** | `make runnable` (needs the toolchain bundle) | one `dist/lykos-airgapped-*.zip` | `unzip -o` + `./RUN.sh` | Coupled to the laptop's **glibc** — build on a base whose glibc is **≤** the laptop's, or the binaries won't load |
+Build a single self-contained folder on a connected machine, carry the `.zip`, unzip it on the
+air-gapped laptop, and run it in place. No install, nothing written outside the folder.
 
-Both are fully self-contained for **Python**: the folder now vendors its own interpreter (matching
-the pypcode wheel and the engine venvs, which are ABI-locked to one Python minor), so it no longer
-needs the laptop to have any particular `python3`; the container obviously carries its own. The
-**only** thing the folder cannot escape is glibc skew — the vendored native binaries are linked
-against the build host's glibc. The container escapes that too, which is why it is the default
-recommendation. If the laptop has no container runtime, use the folder and build it on the oldest
-glibc you must support.
+| Build (connected machine) | Carry | Run on the laptop |
+|---|---|---|
+| `./package` (needs the toolchain bundle) | one `dist/lykos-airgapped-*.zip` | `unzip -o` + `./start` |
 
-### Container: build, carry, run
-
-```sh
-# on a CONNECTED machine
-make container                                  # -> dist/lykos-container-YYYYMMDD-<arch>.tar.zst (+ .sha256)
-
-# on the AIR-GAPPED laptop (podman shown; docker is identical)
-sha256sum -c lykos-container-*.tar.zst.sha256
-zstd -dc lykos-container-*.tar.zst | podman load
-mkdir -p cases
-podman run --rm -p 127.0.0.1:8787:8787 -v "$PWD/cases:/cases" lykos:latest
-# then open http://127.0.0.1:8787
-```
-
-Rootless podman needs no daemon and no root — ideal for a locked-down box. The container is a
-strong isolation boundary in its own right; lykos's internal `bwrap` detonation sandbox may
-degrade to rlimits-only inside it (nested user namespaces), which is an acceptable trade for the
-portability. `-v "$PWD/cases:/cases"` persists analyses on the host between runs.
+The folder is fully self-contained for **Python**: it vendors its own interpreter (ABI-matched to
+the pypcode wheel and the engine venvs), so the laptop needs no particular `python3` of its own.
+The one thing it cannot escape is **glibc skew** — the vendored native binaries are linked against
+the build host's glibc — so build it on a base whose glibc is **≤** the laptop's (the oldest you
+must support), or the binaries won't load.
 
 ---
 
@@ -174,7 +155,7 @@ The table below is the same data, for planning before you build the bundle.
 | optional | afl-qemu-trace (per guest) | `coverage_fuzz` on a non-host architecture | declines for those guests, and prints the build command |
 | optional | JDK / Java | building and running JAR targets | Java targets analyse statically but cannot execute |
 | optional | Wine | PE execution, behaviour trace, Win32 monitor | PE analyses statically; `synthesize_poc` still derives an overflow from the frame |
-| optional | cross compilers | the architecture gate's fixtures | `make arch-gate` covers fewer architectures. **Not shipped in the `make runnable` bundle** — the pipeline compiles source only natively and *executes* foreign-arch binaries under qemu-user (which stays, with each arch's runtime libs), so it never cross-compiles; only the arch-gate self-test needs them |
+| optional | cross compilers | the architecture gate's fixtures | `make arch-gate` covers fewer architectures. **Not shipped in the `./package` bundle** — the pipeline compiles source only natively and *executes* foreign-arch binaries under qemu-user (which stays, with each arch's runtime libs), so it never cross-compiles; only the arch-gate self-test needs them |
 | optional | angr / SymQEMU | `concolic` | the stage declines |
 | optional | Unicorn | `firmware_rehost` | declines; carving and headerless ID still work |
 | optional | Node.js | `make gui` harnesses | that target fails; the UI is unaffected |

@@ -274,7 +274,7 @@ The real exposure is at the **gate** level and in a cluster of **host-dependent 
   the likely common cause is that block-breakpoint injection / the interactive chainer is flaky
   under this host's kernel (7.1.5+kali), while the plain dynamic path (real fuzzing, recall 1.0)
   works. A genuine robustness finding to reproduce on a stock kernel.
-- **C-M2 — `test_the_readme_indexes_every_doc` fails: `docs/26-code-audit-2026-09-25.md` is not in
+- **C-M2 — `test_the_readme_indexes_every_doc` fails: `docs/internal/26-code-audit-2026-09-25.md` is not in
   the README index** (deterministic, host-independent). doc 25 is indexed, 26 was added without
   updating the table. *This report adds rows for 26 and 27 to keep the gate green.*
 
