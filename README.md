@@ -152,6 +152,7 @@ packaging/         zipapp build, offline verify, air-gap bundle scripts
 | 26 | `docs/26-code-audit-2026-09-25.md` | **Code audit & correctness pass** — six parallel reviews, de-duplicated and ranked, fixes validated |
 | 27 | `docs/27-full-sweep-audit-2026-09-29.md` | **Full-sweep audit** — code correctness, capability (claims vs code), test/gate integrity, packaging |
 | 28 | `docs/28-sota-capability-roadmap-2026-09.md` | **SOTA capability audit & roadmap** — non-AI/air-gapped 0-day techniques vs lykos, prioritized additions |
+| 29 | `docs/29-next-steps-2026-09-30.md` | **Next steps (handoff)** — validate-first checklist, remaining builds (OptiMin/grammar-auto/Joern), environment + quick reference |
 
 New here? `docs/20-open-work-backlog.md` is the honest state of the system: what works, what
 was measured, and what is still open. `docs/02-architecture.md` for the shape of it.
