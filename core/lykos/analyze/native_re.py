@@ -418,6 +418,18 @@ def analyze(binary: Path, *, ctx=None, timeout: int = 900) -> dict:
     izj = _readj(T / "strings", [])
     iij = _readj(T / "imports", [])
     fn_by_addr = {_faddr(f): f for f in aflj if isinstance(f, dict) and _faddr(f) is not None}
+    # Skip the compiler/sanitizer/coverage runtime entirely (see _is_runtime_name). A static
+    # ASan+UBSan build links in ~3,800 such functions for a one-line program, and analyzing them
+    # (per-function structure + P-Code lift) is ~100s and hundreds of MB of pure waste: nothing
+    # consumes their analysis -- the memory-safety detectors drop them by the same name test, and a
+    # call into one keeps its name on the call EDGE regardless. Dropping them here keeps the static
+    # binary self-contained for execution while making its analysis proportional to the user's code.
+    runtime_n = sum(1 for f in fn_by_addr.values()
+                    if _is_runtime_name(_clean_name(f.get("name"))))
+    if runtime_n:
+        fn_by_addr = {a: f for a, f in fn_by_addr.items()
+                      if not _is_runtime_name(_clean_name(f.get("name")))}
+        _emit(ctx, msg=f"skipping {runtime_n} sanitizer/compiler-runtime functions")
     # EXHAUSTIVE by default: every function is analyzed. A positive LYKOS_MAX_FUNCS caps it on
     # request; 0 (the default) means no cap. The old default silently kept only the first 1200,
     # which blinded the detectors to the rest of a large program.
@@ -608,6 +620,19 @@ def _is_missing_decompiler(txt: str) -> bool:
     t = (txt or "").lower()
     return ("r2pm" in t or "rz-pm" in t or "install the plugin" in t
             or "you need to install" in t or "unknown command" in t or "cannot find" in t)
+
+
+# Compiler/sanitizer/coverage runtime that an ASan+UBSan build statically links in. Its P-Code is
+# never consumed (the memory-safety detectors drop these functions by the same name test), but on a
+# sanitizer build it is the bulk of the functions -- ~3,800 for a one-line program -- and lifting
+# all of it costs ~100s. Keep the functions (call graph, names) but skip the SLEIGH lift for them;
+# any consumer that ever needs one re-decompiles it on demand.
+_RUNTIME_PREFIXES = ("__asan", "__ubsan", "__lsan", "__tsan", "__msan", "__hwasan",
+                     "__sanitizer", "__sancov", "asan.", "sancov.", "__sanitize")
+
+
+def _is_runtime_name(name) -> bool:
+    return bool(name) and str(name).startswith(_RUNTIME_PREFIXES)
 
 
 def _build_functions(T: Path, fn_by_addr: dict, lifter: "_Lifter", embedded: bool,

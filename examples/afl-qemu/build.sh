@@ -21,8 +21,14 @@ SRC="${AFL_SRC:-/tmp/aflsrc}"
 VER="${AFL_VERSION:-v4.33c}"          # match the installed afl-fuzz (afl-fuzz --version)
 
 # prerequisites beyond a normal build host: qemu needs these and they are easy to miss
-for t in ninja meson bison flex; do
+for t in ninja meson bison flex pkg-config; do
   command -v "$t" >/dev/null || { echo "missing build tool: $t" >&2; exit 1; }
+done
+# qemu's configure also needs the glib + pixman dev headers (found via pkg-config); without them
+# build_qemu_support.sh fails deep in configure with a bare "pkg-config not found"-style error.
+for pc in glib-2.0 pixman-1; do
+  pkg-config --exists "$pc" 2>/dev/null || {
+    echo "missing dev headers: $pc (apt-get install libglib2.0-dev libpixman-1-dev)" >&2; exit 1; }
 done
 
 [ -d "$SRC" ] || git clone --depth 1 --branch "$VER" \

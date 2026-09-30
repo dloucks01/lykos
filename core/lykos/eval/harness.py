@@ -19,6 +19,7 @@ from ..analyze import register as register_stages
 from ..analyze.detect.stage import enqueue_detect
 from ..analyze.disassemble import enqueue_disassemble
 from ..analyze.fuzz.stage import enqueue_fuzz
+from ..analyze.ingest import enqueue_triage
 from ..analyze.ghidra import locate_ghidra
 from ..analyze.ingest import ingest
 from ..casestore import CaseStore
@@ -115,6 +116,11 @@ def run_corpus(cases=None, *, workdir=None, gcc="gcc", workers=2, stage_timeout=
                 continue
             label = f"{c.cwe}__{c.name}__{c.verdict}"     # store label only, not embedded
             target = ingest(store, case_row.id, exe, filename=label)
+            # ingest() only stores the blob + creates the target row; triage is a separate stage
+            # and nothing else enqueues it. Without it the target's arch/bits/language stay null,
+            # so the taint/bounds corroboration channel is dark and every bad case tops out at
+            # `candidate` -- the corroborated-stage gate then reads recall 0.0. Run it explicitly.
+            enqueue_triage(q, target, force=True)
             timed_out = not pool.wait_idle(stage_timeout)
             if ghidra:
                 enqueue_disassemble(q, target, force=True)

@@ -57,10 +57,13 @@ a venv the locator checks automatically (`vendor/angr-venv/bin/python`), or set
 `LYKOS_ANGR_PYTHON`:
 
     python3 -m venv vendor/angr-venv
-    vendor/angr-venv/bin/pip install angr
+    vendor/angr-venv/bin/pip install 'angr==9.3.4'
 
-`vendor/` is gitignored (machine-specific). angr 9.3.4 works on CPython 3.14 (the unicorn
-engine is disabled, which our directed exploration does not require).
+`vendor/` is gitignored (machine-specific). Pin **angr 9.3.4**: it works on CPython 3.14 (the
+unicorn engine is disabled, which our directed exploration does not require), whereas the current
+unpinned release (angr 10.x) changes the exploration API and the concolic driver no longer solves —
+the stage runs but confirms nothing. The venv interpreter must match the core interpreter's ABI
+(3.14) so the vendored cp314 `pypcode` on `PYTHONPATH` loads inside the driver.
 
 ## Unicorn + Keystone (vendored venv) — firmware rehosting
 

@@ -145,15 +145,33 @@ STATIC_FP_BUDGET ?= 0.60
 CORROB_MIN_RECALL ?= 1.0
 CORROB_FP_BUDGET  ?= 0.25
 
+# Release-gate honesty. The two static halves need Ghidra; without it they SKIP, and a SKIP is
+# exit 0, so `make release` used to go green while static detection quality was never measured.
+# By default the static gate now FAILS (not skips) when the backend is absent, and requires at
+# least one 'good' case to be scored so the FP ratchet can never pass on a vacuous fp_rate.
+# A host that deliberately runs without Ghidra can opt back into skip-on-missing-backend with
+#   make eval-gate REQUIRE_BACKEND=
+REQUIRE_BACKEND     ?= --require-backend
+STATIC_MIN_NEGATIVE ?= 1
+# The static gate must actually USE the backend it requires. `auto` prefers the native rizin
+# decompiler whenever it is present, and rizin does not populate the string data-xrefs that
+# CWE-798 corroboration needs -- so the corroborated ratchet caps at recall 0.833 (one hard-coded
+# secret case) under `auto` and only reaches 1.0 with Ghidra's xref analysis. Pin the static gate
+# to Ghidra so `require-backend` and the ratchet agree. Override for a rizin-only host with
+#   make eval-gate STATIC_BACKEND=native   (then lower CORROB_MIN_RECALL to the measured value)
+STATIC_BACKEND      ?= ghidra
+
 eval-gate:
 	@echo "== release gate: confirmed-stage recall (dynamic; gcc only) =="
 	$(PY) -m lykos eval --stage dynamic --record
 	@echo "== release gate: candidate-stage detection + FP ratchet (static; needs Ghidra) =="
-	$(PY) -m lykos eval --stage static --min-state candidate --record \
-	      --min-recall 1.0 --max-fp-rate $(STATIC_FP_BUDGET)
+	LYKOS_DECOMPILER=$(STATIC_BACKEND) $(PY) -m lykos eval --stage static --min-state candidate --record \
+	      --min-recall 1.0 --max-fp-rate $(STATIC_FP_BUDGET) \
+	      $(REQUIRE_BACKEND) --min-negative $(STATIC_MIN_NEGATIVE)
 	@echo "== release gate: corroborated-stage discrimination (static; needs Ghidra) =="
-	$(PY) -m lykos eval --stage static --min-state corroborated --record \
-	      --min-recall $(CORROB_MIN_RECALL) --max-fp-rate $(CORROB_FP_BUDGET)
+	LYKOS_DECOMPILER=$(STATIC_BACKEND) $(PY) -m lykos eval --stage static --min-state corroborated --record \
+	      --min-recall $(CORROB_MIN_RECALL) --max-fp-rate $(CORROB_FP_BUDGET) \
+	      $(REQUIRE_BACKEND) --min-negative $(STATIC_MIN_NEGATIVE)
 
 # Architecture coverage gate: every supported ISA still reaches its expected PoC level.
 # Builds a vulnerable program per architecture with the cross toolchain, detonates it through

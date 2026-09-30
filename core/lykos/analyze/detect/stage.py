@@ -177,10 +177,29 @@ def _tok_width(tok):
         return 0
 
 
+# Compiler/sanitizer/coverage runtime that an ASan+UBSan build links in. It is never the analysis
+# target, and a STATIC sanitizer link maps it into the program's own address ranges -- so the range
+# filter below cannot exclude it, and a one-line source program balloons to ~3,800 functions that
+# put the inter-procedural taint pass minutes deep in libasan. The user's own functions never carry
+# these names, so dropping them by name is safe and leaves detection unchanged on real code.
+_RUNTIME_PREFIXES = ("__asan", "__ubsan", "__lsan", "__tsan", "__msan", "__hwasan",
+                     "__sanitizer", "__sancov", "asan.", "sancov.", "__sanitize")
+
+
+def _is_runtime_fn(name) -> bool:
+    return bool(name) and str(name).startswith(_RUNTIME_PREFIXES)
+
+
 def _program_only(ctx, target, functions):
     """(functions, call_edges, dropped) restricted to the program's own code where possible."""
     from ..elf import program_ranges
     edges = CallEdgeDAO(ctx.conn).list_by_target(target.id)
+    # Drop the statically-linked sanitizer/coverage runtime by name first (see note above): the
+    # range-based filter cannot, because a static build maps it into the program's own ranges.
+    runtime = {f.addr for f in functions if _is_runtime_fn(f.name)}
+    if runtime:
+        functions = [f for f in functions if f.addr not in runtime]
+        edges = [e for e in edges if e.src_addr not in runtime]
     try:
         blob = ctx.content.path(target.sha256).read_bytes()
         ranges = program_ranges(blob)
@@ -359,8 +378,12 @@ def detect_stage(ctx) -> dict:
     # Off by default, available per run, and the skip is REPORTED -- a detector that quietly
     # did not run is the failure mode this codebase keeps finding, so it is named in the event
     # rather than left to be inferred from a smaller number.
+    # `toctou_race` is registered under its own name, so it must be gated explicitly too --
+    # otherwise it runs on every detect_cwe while the event reports `skipped:[toctou]`, i.e. it
+    # claims TOCTOU did not run when it did. Both TOCTOU detectors share the include_toctou flag.
     optional = {"hardening": bool(p_det.get("include_hardening")),
-                "toctou": bool(p_det.get("include_toctou"))}
+                "toctou": bool(p_det.get("include_toctou")),
+                "toctou_race": bool(p_det.get("include_toctou"))}
     skipped = [n for n, on in optional.items() if not on]
     cands = []
     for det in DETECTORS:

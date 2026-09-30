@@ -39,8 +39,10 @@ def compile_source(src: Path, filename: str, out: Path) -> dict:
     """Compile a single-file C/C++ source into an ASan+UBSan, debug, instrumented binary.
 
     Returns {"ok": True, "compiler": ..., "flags": ...} on success or raises NotAnalysable with
-    the compiler's own diagnostics. Sanitizer runtimes are linked statically where the toolchain
-    allows it, so the instrumented binary needs no sanitizer .so at run time on the air-gap host.
+    the compiler's own diagnostics. The sanitizer runtimes are linked DYNAMICALLY (see the attempt
+    list below): the binary is built and analysed on the same host, whose libasan.so the run
+    sandbox already exposes, and a static link would bloat the image with the whole runtime for the
+    RE backend to chew through. Static linking is kept only as a fallback.
     """
     ext = Path(filename).suffix.lower()
     is_cxx = ext in _CXX_EXT
@@ -69,9 +71,13 @@ def compile_source(src: Path, filename: str, out: Path) -> dict:
             # _FORTIFY_SOURCE aborting first with a terse "buffer overflow detected".
             "-U_FORTIFY_SOURCE", "-D_FORTIFY_SOURCE=0",
             str(src), str(opts_c), "-o", str(out)]
-    # Prefer static sanitizer runtimes so the binary is self-contained on the air-gap host; fall
-    # back to dynamic linking if the static runtime is not present in this toolchain.
-    attempts = [base + ["-static-libasan", "-static-libubsan"], base]
+    # Prefer DYNAMIC sanitizer runtimes. Static linking pulls the ENTIRE libasan/libubsan
+    # implementation into the image -- ~3,800 functions for a one-line program -- which the RE
+    # backend then spends ~100s and hundreds of MB analysing (nothing needs it), and on a loaded
+    # host that analysis is OOM-killed. The instrumented binary is BUILT and RUN on the same host
+    # under a sandbox that `--ro-bind`s `/`, so libasan.so is always on hand; static
+    # self-containment buys nothing here. Fall back to static only if dynamic linking fails.
+    attempts = [base, base + ["-static-libasan", "-static-libubsan"]]
     last = ""
     for argv in attempts:
         try:

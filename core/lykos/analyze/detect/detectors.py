@@ -865,9 +865,11 @@ def hardcoded_secrets(ctx: DetectContext):
 # Checking a path and then acting on it are two operations on a NAME, not on a file, and
 # anything can change what the name refers to in between. The check-then-use pair in one
 # function is the shape; the window is whatever runs between them.
-_TOCTOU_CHECK = {"access", "stat", "lstat", "faccessat", "statx", "euidaccess", "eaccess"}
-_TOCTOU_USE = {"open", "open64", "fopen", "fopen64", "freopen", "creat", "unlink", "remove",
-               "rename", "chmod", "chown", "truncate", "symlink", "link", "mkdir", "rmdir"}
+# Distinct name from `_TOCTOU_CHECK`/`_TOCTOU_USE` above: same module globals would otherwise
+# shadow the comprehensive sets `toctou_race` relies on, silently narrowing BOTH detectors.
+_TOCTOU_CHECK_LEGACY = {"access", "stat", "lstat", "faccessat", "statx", "euidaccess", "eaccess"}
+_TOCTOU_USE_LEGACY = {"open", "open64", "fopen", "fopen64", "freopen", "creat", "unlink", "remove",
+                      "rename", "chmod", "chown", "truncate", "symlink", "link", "mkdir", "rmdir"}
 
 
 
@@ -891,16 +893,16 @@ def toctou(ctx: DetectContext):
     by_func: dict = defaultdict(list)
     for e in ctx.call_edges:
         n = normalize(e.dst_name)
-        if n in _TOCTOU_CHECK or n in _TOCTOU_USE:
+        if n in _TOCTOU_CHECK_LEGACY or n in _TOCTOU_USE_LEGACY:
             by_func[e.src_addr].append((e.site_addr, n))
     out = []
     for faddr, calls in by_func.items():
         ordered = sorted(calls, key=lambda c: _addr_int(c[0]))
-        checks = [c for c in ordered if c[1] in _TOCTOU_CHECK]
+        checks = [c for c in ordered if c[1] in _TOCTOU_CHECK_LEGACY]
         if not checks:
             continue
         first = _addr_int(checks[0][0])
-        uses = [c for c in ordered if c[1] in _TOCTOU_USE and _addr_int(c[0]) > first]
+        uses = [c for c in ordered if c[1] in _TOCTOU_USE_LEGACY and _addr_int(c[0]) > first]
         if not uses:
             continue
         chk, use = checks[0], uses[0]

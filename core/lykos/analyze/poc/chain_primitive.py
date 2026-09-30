@@ -206,8 +206,14 @@ def _pie_spawn(workdir, exe):
 
     from ..dynamic import sandbox
 
+    # isolate_prefix's first argument is the exe DIRECTORY it ro-binds so bwrap can exec the
+    # target. Pass the exe's own directory, not workdir: production happens to place the exe inside
+    # workdir, but a caller with the two apart (e.g. a prebuilt fixture) would otherwise leave the
+    # binary unbound and bwrap fails with `execvp ...: No such file or directory`. workdir stays a
+    # rw bind for the target's own writes / cwd.
+    exedir = str(Path(exe).resolve().parent)
     def spawn():
-        cmd = sandbox.isolate_prefix(str(workdir), net=False, rw_binds=[str(workdir)]) + [str(exe)]
+        cmd = sandbox.isolate_prefix(exedir, net=False, rw_binds=[str(workdir)]) + [str(exe)]
         return subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, cwd=str(workdir),
                                 preexec_fn=sandbox._rlimits(2048, 20, set_as=False))

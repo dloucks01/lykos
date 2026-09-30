@@ -81,8 +81,21 @@ def test_coverage_is_recorded_only_when_blocks_are_asked_for(tmp_path, gcc):
 
     entry = batch_runner._elf_min_vaddr(str(exe))
     assert isinstance(entry, int), "the address contract must resolve for a real binary"
-    traced = sandbox.run_batch(exe, [b"hi\n"], mode="stdin", timeout=5.0,
-                               blocks=[0x1000, 0x1040, 0x1080])
+    # Arm REAL block boundaries recovered from the binary, not synthetic every-Nth addresses:
+    # an INT3 planted mid-instruction (e.g. on the last byte of _start's call to
+    # __libc_start_main) rewrites that instruction and faults the process before main -- which
+    # is a property of the arbitrary address, not of the tracer. A decompiler block address is
+    # always an instruction start, which is what the runner is actually fed in production.
+    from lykos.analyze import native_re
+    recovered = []
+    for f in native_re.analyze(str(exe)).get("functions", []):
+        for b in f.get("cfg", {}).get("blocks", []):
+            a = b.get("addr")
+            a = int(a, 16) if isinstance(a, str) else a
+            if isinstance(a, int):
+                recovered.append(a)
+    blocks = sorted(set(recovered))[:8] if recovered else [entry]
+    traced = sandbox.run_batch(exe, [b"hi\n"], mode="stdin", timeout=5.0, blocks=blocks)
     assert traced is not None and traced[0].exit_code == 0, "tracing must not break the run"
 
 

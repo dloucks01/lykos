@@ -149,6 +149,9 @@ packaging/         zipapp build, offline verify, air-gap bundle scripts
 | 23 | `docs/23-airgap-install.md` | **Air-gap setup runbook (no install)** — bundle, carry, verify, run in place |
 | 24 | `docs/24-modernization-plan.md` | **2026 SOTA refresh** — source path, lean RE stack (drop the JVM), exploit-path automation, optional LLM |
 | 25 | `docs/25-security-audit-2026-09.md` | **Code audit & review** — ranked robustness/correctness findings, remediation status, follow-ups |
+| 26 | `docs/26-code-audit-2026-09-25.md` | **Code audit & correctness pass** — six parallel reviews, de-duplicated and ranked, fixes validated |
+| 27 | `docs/27-full-sweep-audit-2026-09-29.md` | **Full-sweep audit** — code correctness, capability (claims vs code), test/gate integrity, packaging |
+| 28 | `docs/28-sota-capability-roadmap-2026-09.md` | **SOTA capability audit & roadmap** — non-AI/air-gapped 0-day techniques vs lykos, prioritized additions |
 
 New here? `docs/20-open-work-backlog.md` is the honest state of the system: what works, what
 was measured, and what is still open. `docs/02-architecture.md` for the shape of it.
