@@ -54,6 +54,7 @@ _TARGET = {
     "behavior_trace": ("..analyze.debug", "enqueue_behavior_trace"),
     "dynamic_taint": ("..analyze.debug", "enqueue_taint"),
     "firmware_carve": ("..analyze.firmware", "enqueue_firmware"),
+    "firmware_rehost": ("..analyze.firmware", "enqueue_rehost"),
 }
 _CASE = {
     "link_case": ("..analyze.link", "enqueue_link"),
@@ -386,6 +387,10 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict, stop: t
                 # and no standalone ELF to extract. The byte-scan finds it either way.
                 _run_target_stage(store, t, "cve_scan", status, stop)
                 _run_target_stage(store, t, "firmware_carve", status, stop)
+                # A bare-metal image (no filesystem, no embedded ELF) is a Cortex-M blob: rehost
+                # it under Unicorn and fuzz its modelled MMIO inputs. The stage self-gates to a
+                # detected Cortex-M reset-vector table, so it is a cheap no-op otherwise.
+                _run_target_stage(store, t, "firmware_rehost", status, stop)
                 for sub in store.targets.list_by_case(case_id):
                     if sub.id not in done_tids and sub.id not in worklist:
                         worklist.append(sub.id)
