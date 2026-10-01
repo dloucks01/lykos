@@ -65,6 +65,31 @@ def test_class_triggers_cover_the_main_weaponizable_cwes():
     assert max(len(t.data) for t in ov) >= 16384
 
 
+def test_library_triggers_map_zlib_and_xml_to_dos_payloads():
+    zt = cve_triggers.library_triggers("zlib")
+    assert zt and zt[0].cwe == "CWE-409"                 # decompression bomb
+    import zlib
+    # decompress up to 512 MiB; the bomb expands ~1000:1, so it fills the cap from a few MB in.
+    expanded = zlib.decompressobj(15 + 16).decompress(zt[0].data, 512 << 20)
+    assert len(expanded) > 32 * len(zt[0].data)          # expands far beyond its own size
+    xt = cve_triggers.library_triggers("expat")
+    assert xt and xt[0].cwe == "CWE-776"                 # billion laughs
+    assert xt[0].data.count(b"<!ENTITY") >= 5            # nested entities present
+    assert cve_triggers.library_triggers("not-a-lib") == []
+
+
+def test_dos_trigger_counts_a_timeout_as_a_fault():
+    from lykos.analyze.poc import cve_poc_stage
+
+    class _R:
+        crashed = False
+        timed_out = True
+    bomb = cve_triggers.library_triggers("zlib")[0]
+    overflow = cve_triggers.class_triggers("CWE-787")[0]
+    assert cve_poc_stage._fault(bomb, _R()) is True       # DoS: timeout is the fault
+    assert cve_poc_stage._fault(overflow, _R()) is False  # non-DoS: a timeout is not a crash
+
+
 @pytest.mark.skipif(not _HAS_CC, reason="no C compiler")
 def test_generic_overflow_class_trigger_faults_a_vulnerable_target(tmp_path):
     cc = shutil.which("gcc") or shutil.which("cc")

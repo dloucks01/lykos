@@ -36,11 +36,29 @@ def _matched_cves(fd, target) -> list:
     return out
 
 
+# A resource-exhaustion DoS (decompression bomb, XML entity expansion) is "demonstrated" by the
+# target being KILLED or hanging under a tight budget -- not by a crash signal. For those CWEs a
+# timeout/OOM-kill counts as a fault; a tighter memory + time budget makes the bomb trip it.
+_DOS_CWES = {"CWE-409", "CWE-776", "CWE-400", "CWE-770", "CWE-789"}
+
+
+def _fault(trig, r) -> bool:
+    if r is None:
+        return False
+    if r.crashed:
+        return True
+    return trig.cwe in _DOS_CWES and getattr(r, "timed_out", False)
+
+
 def _detonate(exe: str, trig, arch) -> "sandbox.RunResult | None":
-    """Feed the trigger to the target on its channel; return the crashing RunResult or None."""
+    """Feed the trigger to the target on its channel; return the faulting RunResult or None. For a
+    DoS trigger a timeout/OOM-kill under a tight budget counts as the fault."""
+    dos = trig.cwe in _DOS_CWES
+    timeout = 6.0 if dos else 10.0
+    mem_mb = 512 if dos else 2048                  # tight cap so a bomb OOM-kills, not just grows
     if trig.channel in ("stdin", "stdin-slow"):
-        r = sandbox.run(exe, stdin=trig.data, timeout=10, arch=arch)
-        return r if r.crashed else None
+        r = sandbox.run(exe, stdin=trig.data, timeout=timeout, arch=arch, mem_mb=mem_mb)
+        return r if _fault(trig, r) else None
     if trig.channel == "file":
         import tempfile
         d = tempfile.mkdtemp(prefix="lykos-cvepoc-")
@@ -48,14 +66,14 @@ def _detonate(exe: str, trig, arch) -> "sandbox.RunResult | None":
         with open(fp, "wb") as fh:
             fh.write(trig.data)
         try:
-            r = sandbox.run(exe, argv=[fp], timeout=10, arch=arch)
-            return r if r.crashed else None
+            r = sandbox.run(exe, argv=[fp], timeout=timeout, arch=arch, mem_mb=mem_mb)
+            return r if _fault(trig, r) else None
         finally:
             import shutil
             shutil.rmtree(d, ignore_errors=True)
     if trig.channel == "arg":
-        r = sandbox.run(exe, argv=[trig.data], timeout=10, arch=arch)
-        return r if r.crashed else None
+        r = sandbox.run(exe, argv=[trig.data], timeout=timeout, arch=arch, mem_mb=mem_mb)
+        return r if _fault(trig, r) else None
     return None
 
 
@@ -106,10 +124,31 @@ def cve_poc_stage(ctx) -> dict:
             _record(cve, trig, res, 0.95)
             reproduced.append(cve)
 
-    # 2) generic CWE-class weaponization for any matched CVE without a bespoke trigger: try the
-    #    class payloads once per distinct CWE (bounded), stopping at the first fault per class.
     DETONATION_CAP = 60
     budget = DETONATION_CAP
+
+    # 2) library-level format triggers (e.g. zlib decompression bomb, XML billion-laughs): apply
+    #    once per distinct matched library, stopping at the first fault.
+    seen_lib = set()
+    for cve, finding in candidates:
+        if budget <= 0:
+            break
+        lib = (finding.dedup_key or "").split(":")[1] if (finding.dedup_key or "").count(":") >= 2 else ""
+        if not lib or lib in seen_lib:
+            continue
+        seen_lib.add(lib)
+        for trig in cve_triggers.library_triggers(lib):
+            if budget <= 0:
+                break
+            budget -= 1
+            res = _detonate(str(exe), trig, target.arch)
+            if res is not None:
+                _record(f"{cve} ({lib} {trig.cwe})", trig, res, 0.85)
+                reproduced.append(f"{cve}:{lib}")
+                break
+
+    # 3) generic CWE-class weaponization for any matched CVE without a bespoke trigger: try the
+    #    class payloads once per distinct CWE (bounded), stopping at the first fault per class.
     seen_cwe = set()
     for cve, finding in candidates:
         if cve_triggers.for_cve(cve) is not None or budget <= 0:
