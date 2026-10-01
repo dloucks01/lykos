@@ -76,6 +76,24 @@ def _xml_deep_nesting(depth: int = 60000) -> Trigger:
                         f"parser without a depth limit")
 
 
+def _png_oversized_dims() -> Trigger:
+    """libpng (CWE-190): a structurally-valid PNG whose IHDR declares 0x7FFFFFFF x 0x7FFFFFFF at
+    16-bit RGBA. A consumer that computes rowbytes = width*channels*bitdepth/8 and allocates
+    height rows integer-overflows the size on a 32-bit size_t (undersized alloc -> heap overflow)
+    or attempts a vast allocation. A random blob would fail PNG validation immediately; a valid
+    header reaches the size arithmetic. Recorded only on a real fault, so a decoder that bounds
+    image dimensions is never flagged."""
+    sig = b"\x89PNG\r\n\x1a\n"
+    ihdr = struct.pack(">IIBBBBB", 0x7FFFFFFF, 0x7FFFFFFF, 16, 6, 0, 0, 0)   # 16-bit RGBA
+    chunk = b"IHDR" + ihdr
+    png = sig + struct.pack(">I", len(ihdr)) + chunk + struct.pack(">I", zlib.crc32(chunk) & 0xFFFFFFFF)
+    png += struct.pack(">I", 0) + b"IEND" + struct.pack(">I", zlib.crc32(b"IEND") & 0xFFFFFFFF)
+    return Trigger(cve="class:CWE-190", data=png, channel="file", cwe="CWE-190",
+                   libraries=("libpng", "png"),
+                   note="PNG IHDR with 0x7FFFFFFF dimensions -- integer-overflow / huge-alloc in a "
+                        "libpng consumer that does not bound image size")
+
+
 def _billion_laughs() -> Trigger:
     """XML entity-expansion DoS (CWE-776 'billion laughs'): nested entities expand to billions of
     characters, exhausting memory in a parser without an amplification limit. Modern expat/libxml2
@@ -106,6 +124,8 @@ _LIBRARY_TRIGGERS = {
     "libexpat": [_billion_laughs, _xml_deep_nesting],
     "expat2": [_billion_laughs, _xml_deep_nesting],
     "libxml2": [_billion_laughs, _xml_deep_nesting],
+    "libpng": [_png_oversized_dims],
+    "png": [_png_oversized_dims],
 }
 
 

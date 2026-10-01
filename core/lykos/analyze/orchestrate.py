@@ -407,8 +407,9 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict, stop: t
             _run_target_stage(store, t, "embedded_audit", status, stop)
             # Unguarded size arithmetic feeding an allocator (integer-overflow allocation).
             _run_target_stage(store, t, "int_overflow_scan", status, stop)
-            # Weaponize a version-matched CVE that has an authored trigger: feed the trigger and
-            # record a verified reproduction only if the target actually faults.
+            # Weaponize every version-matched CVE -- a bespoke per-CVE trigger where one is
+            # authored, else the library's format attack (zlib bomb, XML billion-laughs) and its
+            # CWE-class probes -- recording a verified reproduction only if the target faults.
             _run_target_stage(store, t, "cve_poc", status, stop)
             # Demonstrate injection / format-string leaks by probing the binary's sinks directly
             # (no crash needed) -- a printf(user) leaks live memory, a system(user) runs a command.

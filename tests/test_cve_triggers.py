@@ -142,6 +142,20 @@ def test_weaponization_plan_empty_without_matches():
     assert cve_triggers.weaponization_plan([("CVE-9999-1", "sqlite", "CWE-611")]) == []
 
 
+def test_libpng_trigger_is_a_valid_png_with_oversized_dimensions():
+    import zlib
+    pt = cve_triggers.library_triggers("libpng")
+    assert pt and pt[0].cwe == "CWE-190" and pt[0].channel == "file"
+    data = pt[0].data
+    assert data[:8] == b"\x89PNG\r\n\x1a\n"                       # PNG signature
+    ln = struct.unpack_from(">I", data, 8)[0]
+    chunk = data[12:12 + 4 + ln]
+    assert chunk[:4] == b"IHDR"
+    assert struct.unpack_from(">I", data, 12 + 4 + ln)[0] == zlib.crc32(chunk) & 0xFFFFFFFF
+    w, h = struct.unpack_from(">II", data, 16)                   # IHDR width/height
+    assert w >= 0x7FFFFFFF and h >= 0x7FFFFFFF                   # overflows a 32-bit row-size calc
+
+
 def test_recursion_class_and_deep_nesting_triggers_exist():
     rec = cve_triggers.class_triggers("CWE-674")
     assert rec and all(t.cwe == "CWE-674" for t in rec)
