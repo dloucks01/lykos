@@ -172,6 +172,31 @@ def _killtree(proc) -> None:
         pass
 
 
+def _default_corpus() -> list:
+    """Protocol-shaped seeds for a network parser. Beyond raw overflows, these target the bug
+    classes that dominate embedded network stacks (FreeRTOS+TCP, lwIP): a length/size field that
+    lies about the body (header says huge, body is short -> over-read), oversized option/TLV and
+    extension fields, and format specifiers reaching a logging printf."""
+    import struct
+    out = [
+        b"GET / HTTP/1.0\r\n\r\n",                     # a benign request to pass a protocol gate
+        b"A" * 64, b"A" * 1024, b"A" * 8192,           # escalating overflow
+        b"\x00" * 16,
+        b"%s%s%s%s%n", b"%p" * 32,                     # format string into a log line
+    ]
+    # length-prefixed: a 2- and 4-byte length header that claims far more than follows.
+    for lam in (struct.pack(">H", 0xFFFF), struct.pack("<H", 0xFFFF),
+                struct.pack(">I", 0x7FFFFFFF), struct.pack("<I", 0x0FFFFFFF)):
+        out.append(lam + b"A" * 8)                     # header lies: says huge, body tiny
+        out.append(lam + b"A" * 2048)
+    # TLV / option storms: many type-length-value records, and one with an oversized length.
+    out.append(b"".join(bytes([1, 4]) + b"opt" + b"\x00" for _ in range(64)))
+    out.append(bytes([3, 0xFF]) + b"B" * 16)           # TLV length 255, 16 bytes present
+    # an IPv6-RA-ish prefix/option length field (the CVE-2026-7426 class): oversized length byte.
+    out.append(b"\x86\x00" + b"\x00" * 6 + bytes([0x03, 0xFF]) + b"C" * 8)
+    return out
+
+
 class NetFuzzResult:
     def __init__(self, crashed, payload=None, signal_name=None, signal_num=None,
                  execs=0, port=None, note=None):
@@ -192,8 +217,7 @@ def fuzz_server(exe: str, proto: str, *, argv=(), seeds=(), port: "int | None" =
     reporting it (kills one-off flakes). Returns a NetFuzzResult."""
     rng = random.Random(seed)
     mut = Mutator(rng)
-    corpus = [s for s in seeds if s] or [b"GET / HTTP/1.0\r\n\r\n", b"A" * 64, b"\x00" * 16,
-                                         b"%s%s%s%n", b"A" * 1024]
+    corpus = [s for s in seeds if s] or _default_corpus()
     found = {"port": port}
 
     def _run_campaign(confirm_payload=None):
