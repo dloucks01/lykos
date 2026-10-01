@@ -101,6 +101,26 @@ COMPONENTS = {
              "summary": "recv_msg_userauth_request username enumeration"},
         ],
     },
+    # Embedded / RTOS C stacks. BANNER patterns here let the binary scan recover the version from
+    # a compiled image; their CVE ranges come from NVD CPE (data/clib_cvedb.json, built by
+    # tools/build_cvedb.py --clibs) and from a source project's vendored header
+    # (fingerprint/source_scan.py). Empty `cves` -- the loader merges the NVD set in.
+    "freertos": {
+        "patterns": [r"FreeRTOS(?: Kernel)? V(\d+\.\d+\.\d+)"],
+        "cves": [],
+    },
+    "mbedtls": {
+        "patterns": [r"[Mm]bed ?TLS (\d+\.\d+\.\d+)"],
+        "cves": [],
+    },
+    "wolfssl": {
+        "patterns": [r"wolfSSL(?:/| )(\d+\.\d+\.\d+)"],
+        "cves": [],
+    },
+    "lwip": {
+        "patterns": [r"lwIP (\d+\.\d+\.\d+)"],
+        "cves": [],
+    },
 }
 
 

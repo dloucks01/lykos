@@ -31,13 +31,19 @@ TOOL_VERSION = "cve-source-1"
 _MAX_FILES = 4000
 _MAX_FILE = 4 << 20
 
-# Vendored C/C++ library headers: a #define carrying the library's own version string.
-_HEADER_VERSION = {
-    "zlib.h": ("zlib", re.compile(r'#\s*define\s+ZLIB_VERSION\s+"([0-9]+\.[0-9]+\.[0-9]+)')),
-    "zlib.h.in": ("zlib", re.compile(r'#\s*define\s+ZLIB_VERSION\s+"([0-9]+\.[0-9]+\.[0-9]+)')),
-    "opensslv.h": ("openssl",
-                   re.compile(r'OPENSSL_VERSION_TEXT\s+"OpenSSL\s+([0-9]+\.[0-9]+\.[0-9]+[a-z]*)')),
-}
+# Vendored C/C++ library headers carry the library's own version in a distinctive #define. We
+# scan the CONTENT of header files (not filenames) for these macros, so a generic name like
+# version.h disambiguates by which macro it holds (mbedtls vs wolfssl both ship a version.h).
+# The library key matches the DB (bare name -> curated/NVD C-lib ranges).
+_HEADER_MACROS = [
+    ("zlib", re.compile(r'#\s*define\s+ZLIB_VERSION\s+"(\d+\.\d+\.\d+)')),
+    ("openssl", re.compile(r'OPENSSL_VERSION_TEXT\s+"OpenSSL\s+(\d+\.\d+\.\d+[a-z]*)')),
+    ("freertos", re.compile(r'#\s*define\s+tskKERNEL_VERSION_NUMBER\s+"V?(\d+\.\d+\.\d+)')),
+    ("mbedtls", re.compile(r'#\s*define\s+MBEDTLS_VERSION_STRING\s+"(\d+\.\d+\.\d+)')),
+    ("wolfssl", re.compile(r'#\s*define\s+LIBWOLFSSL_VERSION_STRING\s+"(\d+\.\d+\.\d+)')),
+    ("lwip", re.compile(r'#\s*define\s+LWIP_VERSION_STRING\s+"(\d+\.\d+\.\d+)')),
+]
+_HEADER_SUFFIXES = (".h", ".hpp", ".hh", ".hxx", ".in")
 # requirements.txt line: name[extras] ==|=== exact-version  (only exact pins give a version)
 _REQ = re.compile(r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)\s*(?:\[[^\]]*\])?\s*===?\s*"
                   r"([0-9][0-9A-Za-z.\-]*)", re.M)
@@ -139,11 +145,6 @@ def parse_source_tree(root: Path) -> list:
         seen_files += 1
         base = p.name
         parser = _MANIFEST_PARSERS.get(base)
-        rel = p.name
-        try:
-            rel = str(p)
-        except Exception:
-            pass
         hits = []
         if parser:
             try:
@@ -152,14 +153,16 @@ def parse_source_tree(root: Path) -> list:
             except Exception:
                 _log.debug("manifest parse failed for %s", p, exc_info=True)
                 hits = []
-        elif base in _HEADER_VERSION:
-            lib, rx = _HEADER_VERSION[base]
+        elif p.suffix.lower() in _HEADER_SUFFIXES:
+            # scan the header's CONTENT for any known library version macro (filename-agnostic)
             try:
-                m = rx.search(p.read_text("utf-8", "replace"))
+                text = p.read_text("utf-8", "replace")
             except Exception:
-                m = None
-            if m:
-                hits = [(lib, lib, m.group(1), f"{base}: {lib} {m.group(1)}")]
+                text = ""
+            for lib, rx in _HEADER_MACROS:
+                m = rx.search(text)
+                if m:
+                    hits.append((lib, lib, m.group(1), f"{base}: {lib} {m.group(1)}"))
         for lk, nm, ver, ev in hits:
             found.setdefault((lk, ver), {"library": lk, "name": nm, "version": ver,
                                          "evidence": ev})

@@ -95,6 +95,24 @@ def test_vendored_openssl_header_version(tmp_path):
     assert _by_lib(source_scan.parse_source_tree(root)).get("openssl") == "1.0.1"
 
 
+def test_vendored_freertos_kernel_version(tmp_path):
+    """FreeRTOS keyed off the kernel version #define; the trailing '+' (dev build) is stripped."""
+    root = _tree(tmp_path, {"kernel/include/task.h":
+                            '#define tskKERNEL_VERSION_NUMBER   "V11.1.0+"\n'})
+    assert _by_lib(source_scan.parse_source_tree(root)).get("freertos") == "11.1.0"
+
+
+def test_header_macros_disambiguate_a_generic_version_h(tmp_path):
+    """mbedTLS and wolfSSL both ship a file called version.h; detection keys off the MACRO it
+    contains, not the filename, so each resolves to the right library."""
+    root = _tree(tmp_path, {
+        "a/mbedtls/version.h": '#define MBEDTLS_VERSION_STRING "2.16.0"\n',
+        "b/wolfssl/version.h": '#define LIBWOLFSSL_VERSION_STRING "4.0.0"\n'})
+    got = _by_lib(source_scan.parse_source_tree(root))
+    assert got.get("mbedtls") == "2.16.0"
+    assert got.get("wolfssl") == "4.0.0"
+
+
 def test_a_malformed_manifest_is_skipped_not_fatal(tmp_path):
     root = _tree(tmp_path, {"package-lock.json": "{not valid json",
                             "requirements.txt": "Jinja2==2.10\n"})

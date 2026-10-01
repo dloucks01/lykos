@@ -172,11 +172,29 @@ def test_the_sqlite_sourceid_banner_detects_and_matches():
     assert {m["cve"] for m in matches} >= {"CVE-2019-5018"}
 
 
-def test_a_patched_sqlite_sourceid_is_detected_and_not_matched():
-    blob = b"3.45.0 " + b"f" * 40
-    detected, matches = scan.scan_and_match(blob)
-    assert any(d["library"] == "sqlite" for d in detected)
-    assert not matches, f"a patched SQLite was reported vulnerable: {matches}"
+def test_the_matcher_respects_a_cve_upper_bound():
+    """Range precision: a version at/above a CVE's fixed version must NOT match THAT CVE.
+    (We assert per-CVE rather than "no matches at all": with the full NVD C-library feed a
+    mid-range SQLite legitimately matches newer CVEs, so a blanket no-match assertion would be
+    testing stale coverage, not the range logic.)"""
+    # CVE-2019-5018 is fixed in 3.28.0.
+    before = [m["cve"] for m in scan.match([{"library": "sqlite", "version": "3.27.2",
+                                             "evidence": "3.27.2"}])]
+    after = [m["cve"] for m in scan.match([{"library": "sqlite", "version": "3.28.0",
+                                            "evidence": "3.28.0"}])]
+    assert "CVE-2019-5018" in before
+    assert "CVE-2019-5018" not in after, "a version at the fix still matched the CVE"
+
+
+def test_no_open_ended_upward_range_is_shipped():
+    """An open-ended-UPWARD range ({ge}/{gt} with no upper bound and no eq) matches every future
+    version forever -- a false-positive factory. The NVD-CPE ingest drops these; none may ship."""
+    comps = scan._components()
+    for lib, spec in comps.items():
+        for cve in spec["cves"]:
+            for r in cve["ranges"]:
+                assert {"le", "lt", "eq"} & set(r), \
+                    f"{lib} {cve['id']} has an open-ended-upward range {r}"
 
 
 def test_a_modern_sqlite_library_is_a_KNOWN_detection_gap():

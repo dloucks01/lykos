@@ -18,10 +18,13 @@ _log = logging.getLogger(__name__)
 
 _MAX = 64 * 1024 * 1024        # cap the scan for huge firmware blobs
 
-# The vendored OSV snapshot shipped with the tool (built offline by tools/build_cvedb.py). It
-# carries the language-ecosystem packages (pypi:/npm:/go:/crates:) matched from a source
-# project's dependency manifests; the hand-curated C-library banner ranges live in db.COMPONENTS.
-_BUNDLED_DB = Path(__file__).with_name("data") / "osv_cvedb.json"
+# Vendored snapshots shipped with the tool (built offline by tools/build_cvedb.py):
+#   osv_cvedb.json  -- language-ecosystem packages (pypi:/npm:/go:/crates:) for source manifests
+#   clib_cvedb.json -- C/embedded-library CVEs from NVD CPE (keyed by bare name: freertos, zlib,
+#                      mbedtls, ...), matched off a binary banner or a vendored header
+# Banner/header detection patterns live in db.COMPONENTS / source_scan; these files add the CVEs.
+_DATA = Path(__file__).with_name("data")
+_BUNDLED_DBS = [_DATA / "osv_cvedb.json", _DATA / "clib_cvedb.json"]
 
 
 def _merge(comps: dict, ext: dict) -> None:
@@ -33,11 +36,13 @@ def _merge(comps: dict, ext: dict) -> None:
 
 
 def _components():
-    """The seed C-library DB, merged with the vendored OSV snapshot and any operator-supplied
-    $LYKOS_CVEDB JSON. A malformed or missing file never breaks the scan."""
+    """The seed C-library DB (banner patterns + curated CVEs), merged with the vendored OSV +
+    NVD-CPE snapshots and any operator-supplied $LYKOS_CVEDB JSON. A malformed or missing file
+    never breaks the scan. CVEs are deduped per library by id (first source wins: the curated
+    db.COMPONENTS entry takes precedence over a snapshot's copy of the same CVE)."""
     comps = {k: {"patterns": list(v["patterns"]), "cves": list(v["cves"])}
              for k, v in db.COMPONENTS.items()}
-    sources = [_BUNDLED_DB]
+    sources = list(_BUNDLED_DBS)
     override = os.environ.get("LYKOS_CVEDB")
     if override:
         sources.append(Path(override))
@@ -49,6 +54,22 @@ def _components():
         except Exception:
             _log.debug("failed to load/merge CVE DB %s", src, exc_info=True)
             continue            # a malformed source never breaks the scan
+    for spec in comps.values():
+        seen, uniq = set(), []
+        for cve in spec["cves"]:
+            cid = cve.get("id")
+            if not cid or cid in seen:
+                continue
+            # Drop open-ended-UPWARD ranges ({ge}/{gt} with no le/lt/eq): they match every
+            # future version forever (a version-matcher false-positive factory, e.g. an NVD CPE
+            # that lists only a start bound for an already-fixed bug). A CVE left with no usable
+            # range is dropped -- it could only ever match everything or nothing.
+            ranges = [r for r in cve.get("ranges", []) if {"le", "lt", "eq"} & set(r)]
+            if not ranges:
+                continue
+            seen.add(cid)
+            uniq.append({**cve, "ranges": ranges})
+        spec["cves"] = uniq
     return comps
 
 
