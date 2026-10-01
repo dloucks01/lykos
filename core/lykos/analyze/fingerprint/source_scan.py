@@ -42,6 +42,9 @@ _HEADER_MACROS = [
     ("mbedtls", re.compile(r'#\s*define\s+MBEDTLS_VERSION_STRING\s+"(\d+\.\d+\.\d+)')),
     ("wolfssl", re.compile(r'#\s*define\s+LIBWOLFSSL_VERSION_STRING\s+"(\d+\.\d+\.\d+)')),
     ("lwip", re.compile(r'#\s*define\s+LWIP_VERSION_STRING\s+"(\d+\.\d+\.\d+)')),
+    ("libxml2", re.compile(r'#\s*define\s+LIBXML_DOTTED_VERSION\s+"(\d+\.\d+\.\d+)')),
+    ("mongoose", re.compile(r'#\s*define\s+MG_VERSION\s+"(\d+\.\d+)')),
+    ("libjpeg-turbo", re.compile(r'#\s*define\s+LIBJPEG_TURBO_VERSION\s+"?(\d+\.\d+\.\d+)')),
 ]
 # Some libraries spell the version as SEPARATE numeric #defines rather than one string. lwIP's
 # lwip/init.h is the common case: MAJOR/MINOR/REVISION. Combine them into X.Y.Z.
@@ -49,6 +52,14 @@ _COMBINED_MACROS = [
     ("lwip", (re.compile(r'#\s*define\s+LWIP_VERSION_MAJOR\s+\(?(\d+)'),
               re.compile(r'#\s*define\s+LWIP_VERSION_MINOR\s+\(?(\d+)'),
               re.compile(r'#\s*define\s+LWIP_VERSION_REVISION\s+\(?(\d+)'))),
+    # FreeType's freetype.h: FREETYPE_MAJOR/MINOR/PATCH.
+    ("freetype", (re.compile(r'#\s*define\s+FREETYPE_MAJOR\s+(\d+)'),
+                  re.compile(r'#\s*define\s+FREETYPE_MINOR\s+(\d+)'),
+                  re.compile(r'#\s*define\s+FREETYPE_PATCH\s+(\d+)'))),
+    # PCRE2's pcre2.h: PCRE2_MAJOR/MINOR (two-part version, PATCH synthesised as 0).
+    ("pcre2", (re.compile(r'#\s*define\s+PCRE2_MAJOR\s+(\d+)'),
+               re.compile(r'#\s*define\s+PCRE2_MINOR\s+(\d+)'),
+               re.compile(r'(?:\A|\Z)()'))),  # no patch component -> 0
 ]
 _HEADER_SUFFIXES = (".h", ".hpp", ".hh", ".hxx", ".in")
 # requirements.txt line: name[extras] ==|=== exact-version  (only exact pins give a version)
@@ -173,7 +184,7 @@ def parse_source_tree(root: Path) -> list:
             for lib, (rmaj, rmin, rrev) in _COMBINED_MACROS:
                 a, b, c = rmaj.search(text), rmin.search(text), rrev.search(text)
                 if a and b and c:
-                    ver = f"{a.group(1)}.{b.group(1)}.{c.group(1)}"
+                    ver = f"{a.group(1)}.{b.group(1)}.{c.group(1) or '0'}"
                     hits.append((lib, lib, ver, f"{base}: {lib} {ver} (MAJOR/MINOR/REVISION)"))
         for lk, nm, ver, ev in hits:
             found.setdefault((lk, ver), {"library": lk, "name": nm, "version": ver,

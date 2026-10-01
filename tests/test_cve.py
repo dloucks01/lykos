@@ -38,10 +38,14 @@ def test_scan_detects_banners_and_matches_cves():
     assert "CVE-2018-25032" in cves                # zlib 1.2.8 < 1.2.12
 
 
-def test_scan_clean_version_no_cve():
-    detected = scan.scan(b"OpenSSL 3.0.7 stuff")   # patched punycode version
+def test_scan_version_range_filtering():
+    # Version-range filtering must exclude vulns that only affect OLDER releases: a current
+    # OpenSSL 3.x is not Heartbleed (CVE-2014-0160, a 1.0.1 bug) however complete the DB is.
+    detected = scan.scan(b"OpenSSL 3.0.7 stuff")
     assert ("openssl", "3.0.7") in {(d["library"], d["version"]) for d in detected}
-    assert scan.match(detected) == []
+    cves = {m["cve"] for m in scan.match(detected)}
+    assert "CVE-2014-0160" not in cves             # Heartbleed only affects 1.0.1
+    assert "CVE-2014-0224" not in cves             # CCS injection, <=1.0.1g
 
 
 @pytest.fixture

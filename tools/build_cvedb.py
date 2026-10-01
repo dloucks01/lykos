@@ -54,10 +54,15 @@ NVD_API = "https://services.nvd.nist.gov/rest/json/cves/2.0"
 # The keyword must be a term NVD's text matches (a CPE token like "mbed_tls" matches nothing);
 # the cpe tokens filter the results to the right product.
 CLIB_PRODUCTS = {
+    # RTOS / embedded stacks
     "freertos": {"kw": "freertos", "cpe": ["freertos"]},
     "mbedtls": {"kw": "mbedtls", "cpe": ["mbed_tls", "mbedtls"]},
     "wolfssl": {"kw": "wolfssl", "cpe": ["wolfssl"]},
     "lwip": {"kw": "lwip", "cpe": ["lwip"]},
+    "mongoose": {"kw": "mongoose cesanta", "cpe": ["mongoose"]},
+    "mosquitto": {"kw": "mosquitto", "cpe": ["mosquitto"]},
+    "u-boot": {"kw": "u-boot", "cpe": ["u-boot"]},
+    # common C libraries shipped in firmware / stripped binaries
     "zlib": {"kw": "zlib", "cpe": ["zlib"]},
     "openssl": {"kw": "openssl", "cpe": ["openssl"]},
     "libpng": {"kw": "libpng", "cpe": ["libpng"]},
@@ -65,6 +70,22 @@ CLIB_PRODUCTS = {
     "sqlite": {"kw": "sqlite", "cpe": ["sqlite"]},
     "busybox": {"kw": "busybox", "cpe": ["busybox"]},
     "dropbear": {"kw": "dropbear", "cpe": ["dropbear_ssh", "dropbear"]},
+    "curl": {"kw": "curl", "cpe": ["curl", "libcurl"]},
+    "libxml2": {"kw": "libxml2", "cpe": ["libxml2"]},
+    "libtiff": {"kw": "libtiff", "cpe": ["libtiff"]},
+    "libjpeg-turbo": {"kw": "libjpeg-turbo", "cpe": ["libjpeg-turbo"]},
+    "freetype": {"kw": "freetype", "cpe": ["freetype", "freetype2"]},
+    # NB: libwebp intentionally omitted -- it exposes only an ABI version (WEBP_*_ABI_VERSION),
+    # no release-version macro in any header and no reliable binary banner, so its CVEs could
+    # never be version-matched. An operator who can fingerprint it adds it via $LYKOS_CVEDB.
+    "ncurses": {"kw": "ncurses", "cpe": ["ncurses"]},
+    "pcre2": {"kw": "pcre2", "cpe": ["pcre2"]},
+    "libssh": {"kw": "libssh", "cpe": ["libssh"]},
+    "openssh": {"kw": "openssh", "cpe": ["openssh"]},
+    "nghttp2": {"kw": "nghttp2", "cpe": ["nghttp2"]},
+    "c-ares": {"kw": "c-ares", "cpe": ["c-ares"]},
+    "lua": {"kw": "lua interpreter", "cpe": ["lua"]},
+    "nginx": {"kw": "nginx", "cpe": ["nginx"]},
 }
 
 # The default is the LANGUAGE ecosystems a source project's dependency manifests point at --
@@ -76,6 +97,9 @@ CLIB_PRODUCTS = {
 # binary's version banner. `--all` pulls every ecosystem for anyone who wants the full mirror.
 DEFAULT_ECOSYSTEMS = [
     "PyPI", "npm", "Go", "crates.io", "Maven", "RubyGems", "Packagist", "NuGet", "Hex", "Pub",
+    # remaining matchable LANGUAGE/app ecosystems (small; distro/OS feeds still excluded)
+    "CRAN", "Hackage", "Julia", "GHC", "SwiftURL", "Bitnami", "GitHub Actions", "Android",
+    "OSS-Fuzz",
 ]
 
 # The small committed JSON subset (used when cvedb.sqlite is absent).

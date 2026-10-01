@@ -83,15 +83,20 @@ def test_a_cve_with_no_ranges_affects_nothing():
 
 def test_every_shipped_cve_is_well_formed():
     """A malformed entry is inert and invisible: it simply never matches, and nothing says so."""
+    from core.lykos.analyze.fingerprint import source_scan
+    # Libraries detected from a vendored SOURCE header (version #defines) rather than a binary
+    # banner -- an empty binary-pattern list is correct for these.
+    src_detected = {lib for lib, _ in source_scan._HEADER_MACROS}
+    src_detected |= {lib for lib, _ in source_scan._COMBINED_MACROS}
     comps = scan._components()
     assert comps, "no components shipped at all"
     for lib, spec in comps.items():
-        # A bare key is a C library detected by a BINARY version banner, so it needs a pattern.
-        # An "ecosystem:name" key is matched from a source manifest by name, not by any banner,
-        # so an empty patterns list is correct for it.
+        # A bare key is a C library detected by a BINARY version banner, so it needs a pattern --
+        # UNLESS it is detected from a source header instead (src_detected). An "ecosystem:name"
+        # key is matched from a source manifest by name, so an empty patterns list is fine for it.
         manifest_keyed = ":" in lib
-        if not manifest_keyed:
-            assert spec.get("patterns"), f"{lib} has no detection pattern"
+        if not manifest_keyed and lib not in src_detected:
+            assert spec.get("patterns"), f"{lib} has no detection pattern (banner or source header)"
         for cve in spec.get("cves", []):
             # A vuln id is usually CVE-*, but OSV also carries GHSA-*/RUSTSEC-*/PYSEC-* advisory
             # ids where no CVE was assigned; any non-empty id is a valid reference.

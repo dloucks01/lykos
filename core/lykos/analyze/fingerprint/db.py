@@ -121,6 +121,22 @@ COMPONENTS = {
         "patterns": [r"lwIP (\d+\.\d+\.\d+)"],
         "cves": [],
     },
+    # Common C libraries shipped in firmware / stripped binaries. BANNER patterns (low-FP,
+    # anchored on the library's own version-string text); CVEs merged from clib_cvedb.json.
+    "openssh": {"patterns": [r"OpenSSH_(\d+\.\d+)"], "cves": []},
+    "nginx": {"patterns": [r"nginx/(\d+\.\d+\.\d+)"], "cves": []},
+    "libssh": {"patterns": [r"libssh[-_ /](\d+\.\d+\.\d+)"], "cves": []},
+    "lua": {"patterns": [r"Lua (\d+\.\d+\.\d+)"], "cves": []},
+    "mosquitto": {"patterns": [r"mosquitto version (\d+\.\d+\.\d+)"], "cves": []},
+    "nghttp2": {"patterns": [r"nghttp2/(\d+\.\d+\.\d+)"], "cves": []},
+    "libtiff": {"patterns": [r"LIBTIFF, Version (\d+\.\d+\.\d+)"], "cves": []},
+    "c-ares": {"patterns": [r"c-ares(?:/| version )(\d+\.\d+\.\d+)"], "cves": []},
+    "u-boot": {"patterns": [r"U-Boot (\d+\.\d+)"], "cves": []},
+    "ncurses": {"patterns": [r"ncurses (\d+\.\d+\.\d+)"], "cves": []},
+    "pcre2": {"patterns": [r"PCRE2 (\d+\.\d+)"], "cves": []},
+    "libxml2": {"patterns": [], "cves": []},          # detected from a vendored header (no banner)
+    "freetype": {"patterns": [], "cves": []},
+    "mongoose": {"patterns": [r"Mongoose/(\d+\.\d+)"], "cves": []},
 }
 
 
