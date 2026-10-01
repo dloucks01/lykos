@@ -38,6 +38,36 @@ def test_a_constant_that_fits_is_provably_bounded():
     assert v["buffer"] == "buf" and v["capacity"] == 64 and v["length"] == 64
 
 
+# Some decompiler builds number locals from the FRAME POINTER directly (var offset == the RBP
+# displacement), not from the return slot -- and ret_offset does not disambiguate the two. The
+# destination then resolved one word off the recovered buffer, _capacity saw "no variable", and
+# the safe idiom (memcpy/strncpy bounded to sizeof) read as corroborated. This is 2 of the 3
+# CWE-120 corroborated false positives in the micro-corpus.
+_FRAME_FP = {"ret_offset": 0, "vars": [{"name": "buf", "size": 64, "offset": -64,
+                                        "is_buffer": True, "type": "char[64]"}]}
+_FP_DISP = "0xffffffffffffffc0"        # RBP-64 == the buffer's frame offset (no ret-slot adjust)
+
+
+def test_frame_pointer_numbered_buffer_is_resolved_by_calibration():
+    """A buffer Ghidra numbers at its RBP displacement (identity convention) must still be found
+    as the copy's destination, so a bounded copy into it is proven SAFE rather than left
+    corroborated. Regression for the capacity calibration fallback."""
+    v = bounds.classify_site(_copy_block(_FP_DISP, 63), "0x100c", "memcpy", _FRAME_FP, "x86-64")
+    assert v["verdict"] == bounds.SAFE, v
+    assert v["buffer"] == "buf" and v["capacity"] == 64 and v["length"] == 63
+
+
+def test_calibration_never_attributes_a_copy_to_a_non_buffer():
+    """The calibration fallback matches ONLY a variable recovered as a buffer, at its exact
+    start -- it must not resurrect the interior/wrong-variable attribution the exact-match rule
+    prevents. A non-buffer local at the displacement stays unknown, never a fabricated size."""
+    frame = {"ret_offset": 0, "vars": [{"name": "st", "size": 144, "offset": -64,
+                                        "is_buffer": False, "type": "struct stat"}]}
+    v = bounds.classify_site(_copy_block(_FP_DISP, 16000), "0x100c", "memcpy", frame, "x86-64")
+    assert v["verdict"] == bounds.UNKNOWN, v
+    assert v.get("buffer") != "st"
+
+
 def test_a_constant_that_does_not_fit_is_surfaced_but_never_asserted():
     """C locals in disjoint scopes SHARE stack slots, so a recovered frame can name the wrong
     variable and the wrong size for an address. jhead's ProcessFile is the worked example: the

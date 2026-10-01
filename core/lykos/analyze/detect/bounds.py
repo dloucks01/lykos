@@ -337,6 +337,25 @@ def _capacity(frame: dict, base: str, offset: int):
     return None
 
 
+def _capacity_buffer(frame: dict, offset: int):
+    """A calibration fallback for _capacity: a variable recovered as a BUFFER whose start is
+    exactly `offset`. Decompiler builds differ in whether they number locals from the return
+    slot (frame_delta == word) or from the frame pointer directly (frame_delta == 0), and
+    ret_offset does not disambiguate the two -- so the primary translation can miss the real
+    destination by one word. When it does, snapping to a buffer at the UN-translated
+    displacement recovers it. Restricted to is_buffer + exact start: this never attributes a
+    copy to a non-buffer or to an interior address, which is the fabrication the exact-match
+    rule in _capacity exists to prevent (jhead's struct `st` was not a buffer)."""
+    for v in (frame or {}).get("vars", []) or []:
+        try:
+            vo, vs = int(v.get("offset")), int(v.get("size") or 0)
+        except (TypeError, ValueError):
+            continue
+        if vs > 0 and vo == offset and v.get("is_buffer"):
+            return v.get("name") or "?", vs
+    return None
+
+
 def classify_site(instrs, site_addr, sink, frame, arch, bits=64,
                   blocks=None, site_block=None, dom=None, base_offs=None):
     """Verdict for one copy call site.
@@ -378,6 +397,10 @@ def classify_site(instrs, site_addr, sink, frame, arch, bits=64,
     else:
         goff = _ghidra_offset(frame, dst[1], dst[2], word, ak)
     cap = _capacity(frame, dst[1], goff)
+    if cap is None:
+        cap = _capacity_buffer(frame, dst[2])     # calibrate: buffer at the un-translated disp
+        if cap is not None:
+            goff = dst[2]
     if cap is None:
         return {"verdict": UNKNOWN,
                 "why": (f"no variable recovered at exactly {dst[1]}{dst[2]:+d}; the frame "
@@ -557,6 +580,8 @@ def classify_nul_site(instrs, site_addr, sink, frame, arch, bits, blocks, site_b
     goff = (base_offs[dst[1]] + dst[2]) if (base_offs and dst[1] in base_offs) \
         else _ghidra_offset(frame, dst[1], dst[2], word, ak)
     cap = _capacity(frame, dst[1], goff)
+    if cap is None:
+        cap = _capacity_buffer(frame, dst[2])     # calibrate: buffer at the un-translated disp
     if cap is None:
         return None
     name, room = cap

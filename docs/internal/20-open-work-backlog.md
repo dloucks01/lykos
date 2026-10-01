@@ -932,12 +932,20 @@ candidate recall 1.00 / fp_rate 0.571; corroborated recall 0.833 / fp_rate 0.214
 - **[PLANNED] Cross-arch cases in the bundled corpus.** The verification above was manual
   (`riscv64-unknown-elf-gcc` freestanding, `aarch64/arm-linux-gnueabihf-gcc -static`); nothing
   in `eval-gate` measures any arch but x86-64, so an arch regression would not trip a gate.
-- **[PLANNED] CWE-120 path-insensitivity — the 3 remaining corroborated false positives.**
-  `strcpy` behind `strlen() < sizeof`, `strncpy` bounded to `sizeof-1`, `memcpy` with a clamped
-  length: attacker bytes genuinely reach the sink, so the taint channel is right to see a flow;
-  what makes them safe is a value-range fact it does not carry. Needs bounds/value-range
-  reasoning over the same P-Code (relate the copy length to the destination's recovered frame
-  size). Biggest single precision win available, and the biggest piece of work here.
+- **[WIP] CWE-120 path-insensitivity — corroborated false positives: 3 → 1.** `strncpy`
+  bounded to `sizeof-1` and `memcpy` with a clamped length are now demoted to SAFE. Root cause
+  was NOT missing value-range reasoning (the guard/constant/strlen machinery already existed):
+  the destination buffer was resolving one word off the recovered variable because some Ghidra
+  builds number locals from the frame pointer directly (var offset == RBP displacement) rather
+  than from the return slot, and `ret_offset` does not disambiguate the two. `bounds._capacity`
+  now calibrates with a buffer-only exact-start fallback at the un-translated displacement
+  (`_capacity_buffer`), which cannot reintroduce the interior/wrong-variable attribution the
+  exact-match rule prevents. Corpus: CWE-120 corroborated FPs 3 → 1, no new FNs.
+  - **[PLANNED] `strcpy` behind `strlen() < sizeof` is the 1 remaining FP.** `classify_nul_site`
+    now resolves the destination, but the strcpy SOURCE is `argv[1]` (a double indirection the
+    intra-block slice does not track), so `strlen_bound` cannot correlate the checked length
+    with the copied string. Needs the source resolved through argv/pointer indirection — the
+    same gap as "Memory model beyond constant-offset frame slots" below.
 - **[PLANNED] CWE-798 cannot be corroborated at all** — caps corroborated recall at 0.833 (5/6).
   `hardcoded_secrets` is a string detector with no call site, so neither the reachability nor the
   data-flow channel applies. Secrets are promoted by `synthesize_secret` (straight to poc-backed)
