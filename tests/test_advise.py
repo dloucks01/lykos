@@ -167,3 +167,18 @@ def test_coverage_fuzz_is_not_recommended_where_afl_cannot_run():
                  afl_usable=True, executable=True, coverage_blocked=blocked)
     assert out["backend"] == "fuzz"
     assert out["plan"][0]["stage"] == "fuzz"
+
+
+def test_macho_is_static_only_on_a_non_macos_host():
+    """A Mach-O has no loader on Linux: advise must say analysis is static-only and NOT
+    recommend a dynamic backend that cannot run."""
+    from lykos.analyze.advise import advise
+    a = advise(imports=[], functions=12, findings=3, seeds=0, has_format=False,
+               afl_usable=True, file_format="macho")
+    assert a["backend"] == "synthesize_poc"              # not a fuzzing backend
+    assert "static only" in a["headline"].lower()
+    assert any("execution" in c["text"] and not c["ok"] for c in a["checks"])
+    # the plan must be the static chain, with no fuzz/dynamic stage
+    stages = {s["stage"] for s in a["plan"]}
+    assert "coverage_fuzz" not in stages and "directed_fuzz" not in stages
+    assert {"disassemble", "detect_cwe", "cve_scan"} <= stages

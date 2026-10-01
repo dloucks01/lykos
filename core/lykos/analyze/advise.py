@@ -127,6 +127,37 @@ def advise(*, imports: list, functions: int, findings: int, seeds: int,
                                                             "carve the components out of it",
                           "params": {}, "ready": True, "done": False}],
                 "file_parser": False, "afl_usable": afl_usable, "analysable": False}
+    if file_format == "macho":
+        # A Mach-O binary has no loader on a non-macOS host: it cannot be executed, fuzzed or
+        # sandboxed here, so analysis is STATIC ONLY. Say so plainly rather than recommend a
+        # dynamic backend that cannot run (the same honest-limit rule as the PE / unrecognised
+        # cases). Static detection + CVE fingerprint still apply; synthesize_poc derives an
+        # overflow from the recovered frame without executing.
+        return {"input_mode": None, "shape": "a Mach-O binary", "backend": "synthesize_poc",
+                "backend_why": ("a Mach-O binary cannot be executed on a non-macOS host, so "
+                                "fuzzing, sandboxing and dynamic confirmation are unavailable; "
+                                "synthesize_poc derives an overflow from the recovered stack "
+                                "frame without executing"),
+                "analysable": True, "file_parser": False, "afl_usable": afl_usable,
+                "headline": ("This is a Mach-O binary. With no macOS loader on this host it "
+                             "cannot be run, fuzzed or sandboxed, so analysis is STATIC ONLY "
+                             "(disassembly, CWE detection, CVE fingerprint, and a frame-derived "
+                             "PoC). For a demonstrated dynamic PoC, run lykos on macOS or "
+                             "provide the source."),
+                "checks": [{"ok": False, "text": ("execution — none: Mach-O has no loader here, "
+                                                  "so dynamic confirmation is unavailable")},
+                           {"ok": functions > 0, "text": (f"decompiled — {functions} functions"
+                                                          if functions else "decompiled — not yet")},
+                           {"ok": findings > 0, "text": (f"static findings — {findings}"
+                                                         if findings else "static findings — none yet")}],
+                "plan": [{"stage": "disassemble", "why": "recover functions/strings for static "
+                          "analysis", "params": {}, "ready": True, "done": functions > 0},
+                         {"stage": "detect_cwe", "why": "static CWE detectors over the recovered "
+                          "code", "params": {}, "ready": True, "done": findings > 0},
+                         {"stage": "cve_scan", "why": "fingerprint known-vulnerable components",
+                          "params": {}, "ready": True, "done": False},
+                         {"stage": "synthesize_poc", "why": "derive an overflow from the stack "
+                          "frame (no execution)", "params": {}, "ready": functions > 0}]}
     mode, shape = _input_mode(imports)
     blocked = coverage_blocked
     # A binary that documents a REQUIRED `-c <config>` has told us what its input is, and it
