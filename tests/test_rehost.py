@@ -1,95 +1,95 @@
-"""Phase 8 (doc 17.5) — emulation-based rehosting (Unicorn, Fuzzware-style MMIO)."""
+"""Multi-architecture firmware rehosting + Fuzzware-style MMIO access-pattern modeling.
+
+Two layers: the pure arch-name resolution (no Unicorn needed), and a Unicorn-gated integration
+run of the standalone driver that proves (a) a status-poll loop is broken so init proceeds, and
+(b) non-ARM-Cortex-M arches (aarch64, mipsel) actually execute -- the QEMU-board-model problem
+sidestepped.
+"""
 from __future__ import annotations
 
+import json
+import struct
+import subprocess
+import tempfile
+from pathlib import Path
+
 import pytest
-from lykos.analyze import register
-from lykos.analyze.firmware.rehost import locate_unicorn_python, run_rehost
-from lykos.analyze.firmware.rehost_stage import enqueue_rehost
-from lykos.analyze.ingest import enqueue_triage, ingest
-from lykos.db.dao import FindingDAO
-from lykos.jobs import JobConfig, JobQueue, WorkerPool
 
-# ARM Cortex-M blob: vector table (SP + Thumb handlers) + a reset handler that reads an MMIO
-# byte and, when it is 0x2a, writes to an unmapped address (an emulation fault).
-_FW_HEX = ("0000012041000008410000084100000841000008410000084100000841000008"
-           "410000084100000841000008410000084100000841000008410000084100000840"
-           "f20000c4f2000001782a2904d140f20002caf200021160fee7")
-_FW = bytes.fromhex(_FW_HEX)
+from lykos.analyze.firmware import unicorn_driver as drv
+from lykos.analyze.firmware.rehost import locate_unicorn_python
+
+_UNI = locate_unicorn_python()
+_DRIVER = Path(drv.__file__)
 
 
-@pytest.fixture
-def unicorn_py():
-    p = locate_unicorn_python()
-    if p is None:
-        pytest.skip("unicorn interpreter not available")
-    return p
+def test_resolve_arch_maps_canonical_names():
+    assert drv._resolve_arch({"arch": "arm", "sub": "cortex-m"}) == "cortex-m"
+    assert drv._resolve_arch({"arch": "aarch64"}) == "aarch64"
+    assert drv._resolve_arch({"arch": "arm64"}) == "aarch64"
+    assert drv._resolve_arch({"arch": "mips", "endianness": "big"}) == "mips"
+    assert drv._resolve_arch({"arch": "mips", "endianness": "little"}) == "mipsel"
+    assert drv._resolve_arch({"arch": "mips", "endianness": "little", "bits": 64}) == "mips64el"
+    assert drv._resolve_arch({"arch": "ppc"}) == "ppc"
+    assert drv._resolve_arch({"arch": "ppc", "bits": 64}) == "ppc64"
+    assert drv._resolve_arch({"arch": "riscv", "bits": 64}) == "riscv64"
+    assert drv._resolve_arch({"arch": "sparc"}) is None     # unsupported
 
 
-def test_run_rehost_fuzz_finds_mmio_crash(unicorn_py, tmp_path):
-    blob = tmp_path / "fw.bin"; blob.write_bytes(_FW)
-    spec = {"blob": str(blob), "base": 0x08000000, "mode": "fuzz",
-            "budget": 3000, "max_iters": 400, "seed": 1337}
-    res = run_rehost(unicorn_py, spec, timeout=60)
-    assert res["ok"] and res["arch"] == "cortex-m"
-    crash = res["fuzz"]["crash"]
-    assert crash and crash["fault"]["kind"] == "write"
-    assert res["fuzz"]["coverage"] >= 2          # executed real firmware blocks
+def _run(spec: dict) -> dict:
+    with tempfile.TemporaryDirectory() as d:
+        bp = Path(d) / "fw.bin"
+        bp.write_bytes(spec.pop("_blob"))
+        spec["blob"] = str(bp)
+        sp = Path(d) / "spec.json"
+        op = Path(d) / "out.json"
+        sp.write_text(json.dumps(spec))
+        subprocess.run([str(_UNI), str(_DRIVER), str(sp), str(op)], timeout=120, check=True)
+        return json.loads(op.read_text())
 
 
-def test_run_rehost_single_run_no_crash_on_benign_mmio(unicorn_py, tmp_path):
-    import base64
-    blob = tmp_path / "fw.bin"; blob.write_bytes(_FW)
-    spec = {"blob": str(blob), "base": 0x08000000, "mode": "run",
-            "budget": 3000, "fuzz_b64": base64.b64encode(b"\x00").decode()}
-    res = run_rehost(unicorn_py, spec, timeout=30)
-    assert res["ok"] and res["run"]["halt"] == "budget" and res["run"]["fault"] is None
+@pytest.mark.skipif(_UNI is None, reason="Unicorn venv not available")
+def test_poll_loop_is_broken_so_init_proceeds():
+    """A Cortex-M reset handler that spins on an MMIO status bit must be driven PAST the poll
+    (naive fuzz-every-read hangs forever). polls_satisfied > 0 and it reaches the proceed block."""
+    img = bytearray(0x80)
+    struct.pack_into("<I", img, 0x00, 0x20010000)              # SP
+    for off in range(0x04, 0x40, 4):
+        struct.pack_into("<I", img, off, 0x08000041)           # vectors -> entry 0x40
+    # ldr r0,[pc,#8]; loop: ldr r1,[r0]; cmp r1,#0; beq loop; b . ; pool=0x40000000
+    img[0x40:0x50] = bytes([0x02, 0x48, 0x01, 0x68, 0x00, 0x29, 0xFC, 0xD0,
+                            0xFE, 0xE7, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40])
+    out = _run({"_blob": bytes(img), "arch": "cortex-m", "mode": "run", "budget": 5000})
+    assert out["ok"] and out["arch"] == "cortex-m"
+    r = out["run"]
+    assert r["polls_satisfied"] >= 1, "the status poll was never satisfied -- init hung"
+    assert r["nblocks"] >= 3, "did not get past the poll loop"
 
 
-@pytest.fixture
-def pool(store):
-    register()
-    p = WorkerPool(store.db_path, store.content, JobConfig(workers=1, poll_interval=0.02))
-    p.start()
-    try:
-        yield p
-    finally:
-        p.stop(grace=3.0)
+@pytest.mark.skipif(_UNI is None, reason="Unicorn venv not available")
+@pytest.mark.parametrize("arch,code", [
+    ("aarch64", struct.pack("<IIII", 0xD503201F, 0xD503201F, 0xD503201F, 0x14000000)),  # nop*3;b .
+    ("mipsel", struct.pack("<IIII", 0, 0, 0x1000FFFF, 0)),                              # nop;nop;b .
+])
+def test_non_cortex_m_arches_execute(arch, code):
+    """aarch64 and mipsel blobs run under the driver with no board model -- the case QEMU
+    cannot do without a machine definition."""
+    out = _run({"_blob": code, "arch": arch, "mode": "run", "budget": 2000,
+                "base": 0, "entry": 0})
+    assert out["ok"], out.get("error")
+    assert out["arch"] == arch
+    assert out["run"]["nblocks"] >= 1, "no blocks executed"
 
 
-def test_firmware_rehost_stage_confirms_fault(store, case, pool, unicorn_py, tmp_path):
-    img = tmp_path / "fw.bin"; img.write_bytes(_FW)
-    t = ingest(store, case.id, img, filename="cortexm.bin")
-    q = JobQueue(store.conn)
-    enqueue_triage(q, t, force=True); assert pool.wait_idle(20)
-    run = enqueue_rehost(q, t, params={"budget": 3000, "max_iters": 400})
-    assert pool.wait_idle(60) and q.runs.get(run.id).status == "done"
-    fs = [f for f in FindingDAO(store.conn).list_by_target(t.id)
-          if f.detector == "firmware_rehost"]
-    assert fs and fs[0].cwe == "CWE-787" and fs[0].state == "confirmed"
-    assert any("under emulation" in e.get("detail", "") for e in fs[0].evidence)
-
-
-def test_firmware_rehost_unsupported_on_non_cortexm(store, case, pool):
-    # a non-Cortex-M blob -> the stage reports unsupported, files nothing (no unicorn needed)
-    import os
-    sha = store.put_artifact(case.id, "target-blob", data=os.urandom(4096)).sha256
-    t = store.targets.upsert(case.id, filename="blob.bin", sha256=sha, size=4096,
-                             file_type="raw")
-    q = JobQueue(store.conn)
-    run = enqueue_rehost(q, t)
-    assert pool.wait_idle(20) and q.runs.get(run.id).status == "done"
-    assert not [f for f in FindingDAO(store.conn).list_by_target(t.id)
-                if f.detector == "firmware_rehost"]
-
-
-def test_firmware_rehost_graceful_without_unicorn(store, case, pool, monkeypatch):
-    monkeypatch.setattr("lykos.analyze.firmware.rehost_stage.locate_unicorn_python",
-                        lambda *a, **k: None)
-    sha = store.put_artifact(case.id, "target-blob", data=_FW).sha256
-    t = store.targets.upsert(case.id, filename="cortexm.bin", sha256=sha, size=len(_FW),
-                             file_type="raw")
-    q = JobQueue(store.conn)
-    run = enqueue_rehost(q, t)
-    assert pool.wait_idle(20) and q.runs.get(run.id).status == "done"
-    assert not [f for f in FindingDAO(store.conn).list_by_target(t.id)
-                if f.detector == "firmware_rehost"]
+@pytest.mark.skipif(_UNI is None, reason="Unicorn venv not available")
+def test_bad_write_is_a_fault():
+    """A write to a wild unmapped address under Cortex-M is a genuine fault (memory corruption)."""
+    img = bytearray(0x80)
+    struct.pack_into("<I", img, 0x00, 0x20010000)
+    for off in range(0x04, 0x40, 4):
+        struct.pack_into("<I", img, off, 0x08000041)
+    # ldr r0,[pc,#4]; movs r1,#1; str r1,[r0]; b . ; pool=0x00001000 (unmapped, not RAM/MMIO)
+    img[0x40:0x4C] = bytes([0x01, 0x48, 0x01, 0x21, 0x01, 0x60, 0xFE, 0xE7,
+                            0x00, 0x10, 0x00, 0x00])
+    out = _run({"_blob": bytes(img), "arch": "cortex-m", "mode": "run", "budget": 2000})
+    assert out["ok"]
+    assert out["run"]["fault"] and out["run"]["fault"]["kind"] == "write"

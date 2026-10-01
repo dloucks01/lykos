@@ -35,11 +35,19 @@ def firmware_rehost_stage(ctx) -> dict:
     data = ctx.content.path(target.sha256).read_bytes()
 
     hl = analyze_blob(data)
-    if not (hl.get("arch") == "arm" and hl.get("sub") == "cortex-m"):
+    # Rehostable arches (the Unicorn driver's supported set). Cortex-M is the strongest case (a
+    # reset-vector table gives base/sp/entry); the others run from an assumed base/entry, which
+    # an operator can override via params. A target the headerless loader could not classify at
+    # all is skipped.
+    _REHOST_ARCHES = {"arm", "aarch64", "mips", "mips64", "ppc", "ppc64", "riscv", "riscv64"}
+    arch = (hl.get("arch") or "").lower()
+    is_cm = arch == "arm" and hl.get("sub") == "cortex-m"
+    if not (is_cm or arch in _REHOST_ARCHES):
         ctx.emit("firmware_rehost.done", payload={
-            "supported": False, "note": "rehosting supports ARM Cortex-M images "
-            "(no reset vector table detected)", "arch": hl.get("arch")})
-        ctx.progress(pct=100, msg="not a Cortex-M image; rehosting unsupported")
+            "supported": False, "note": "no rehostable architecture identified in this blob "
+            "(no Cortex-M reset vector table and no confident headerless arch)",
+            "arch": hl.get("arch")})
+        ctx.progress(pct=100, msg="no rehostable arch identified; rehosting unsupported")
         return {"metrics": {"supported": False}}
 
     python = locate_unicorn_python(p.get("unicorn_python"))
@@ -54,7 +62,11 @@ def firmware_rehost_stage(ctx) -> dict:
     blob_path.write_bytes(data)
     spec = {
         "blob": str(blob_path),
-        "base": p.get("base", hl.get("base_addr") or 0x08000000),
+        "arch": "cortex-m" if is_cm else arch,
+        "sub": hl.get("sub"),
+        "endianness": hl.get("endianness") or "little",
+        "bits": hl.get("bits") or 32,
+        "base": p.get("base", hl.get("base_addr") or (0x08000000 if is_cm else 0)),
         "sp": p.get("sp"), "entry": p.get("entry", hl.get("entry")),
         "mode": p.get("mode", "fuzz"),
         "budget": int(p.get("budget", 20000)),
@@ -94,7 +106,7 @@ def firmware_rehost_stage(ctx) -> dict:
                           f"({crash.get('consumed', 0)} bytes consumed)"}]})
         finding = 1
 
-    report = {"arch": "cortex-m", "entry": res.get("entry"), "sp": res.get("sp"),
+    report = {"arch": res.get("arch", spec["arch"]), "entry": res.get("entry"), "sp": res.get("sp"),
               "unicorn_version": res.get("unicorn_version"), "coverage_blocks": coverage,
               "fuzz": fz, "run": run}
     report_sha = ctx.put_artifact("firmware-rehost",
