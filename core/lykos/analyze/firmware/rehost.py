@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Optional
 
 _DRIVER = "unicorn_driver.py"
+_ANGR_DRIVER = "angr_mmio.py"
 
 
 def _imports_unicorn(python: Path, timeout: int = 20) -> bool:
@@ -61,16 +62,45 @@ def locate_unicorn_python(config: Optional[str] = None) -> Optional[Path]:
     return None
 
 
-def _materialize_driver() -> Path:
+def _materialize(name: str) -> Path:
     d = Path(tempfile.mkdtemp(prefix="lykos-unicorn-"))
     try:
         from importlib import resources
-        data = (resources.files("lykos.analyze.firmware") / _DRIVER).read_bytes()
+        data = (resources.files("lykos.analyze.firmware") / name).read_bytes()
     except Exception:
-        data = (Path(__file__).parent / _DRIVER).read_bytes()
-    p = d / _DRIVER
+        data = (Path(__file__).parent / name).read_bytes()
+    p = d / name
     p.write_bytes(data)
     return p
+
+
+def _materialize_driver() -> Path:
+    return _materialize(_DRIVER)
+
+
+def run_angr_mmio(python: Path, spec: dict, *, ctx=None, timeout: int = 180) -> list:
+    """Run the angr MMIO-value oracle; return its seed list (base64 MMIO byte-streams that reach
+    deep code). This is an OPTIONAL accelerant for the deterministic Unicorn loop -- any failure
+    (angr absent, unsupported arch, timeout, state explosion) returns [] and never breaks rehosting."""
+    try:
+        work = _materialize(_ANGR_DRIVER).parent
+        spec_path = work / "aspec.json"
+        out_path = work / "aout.json"
+        spec_path.write_text(json.dumps(spec))
+        cmd = [str(python), str(work / _ANGR_DRIVER), str(spec_path), str(out_path)]
+        try:
+            if ctx is not None:
+                ctx.run_subprocess(cmd, timeout=timeout + 30)
+            else:
+                subprocess.run(cmd, timeout=timeout + 30, capture_output=True, check=False)
+            if out_path.exists():
+                data = json.loads(out_path.read_text())
+                return list(data.get("seeds", []))[:8]
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+    except Exception:
+        pass
+    return []
 
 
 def run_rehost(python: Path, spec: dict, *, ctx=None, timeout: int = 180) -> dict:

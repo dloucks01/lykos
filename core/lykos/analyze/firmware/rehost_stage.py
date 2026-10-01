@@ -14,7 +14,7 @@ import json
 from ...db.dao import FindingDAO, TargetDAO
 from ...jobs.registry import register_stage
 from .headerless import analyze_blob
-from .rehost import locate_unicorn_python, run_rehost
+from .rehost import locate_unicorn_python, run_angr_mmio, run_rehost
 
 REHOST_STAGE = "firmware_rehost"
 TOOL = "lykos-rehost"
@@ -78,9 +78,27 @@ def firmware_rehost_stage(ctx) -> dict:
         # an operator or a signature matcher: handled on the host instead of emulated.
         "handlers": p.get("handlers", {}),
     }
+    # Symbolic MMIO oracle (optional, deterministic): angr solves peripheral-read values that
+    # reach deep code -- including arbitrary gate constants the Unicorn value-set search cannot
+    # guess -- and we feed those as Unicorn fuzz seeds. Any failure degrades to no extra seeds.
+    if spec["mode"] == "fuzz" and p.get("symbolic_mmio", True):
+        try:
+            from ..symbolic.concolic import locate_angr_python
+            angr_py = locate_angr_python(p.get("angr_python"))
+        except Exception:
+            angr_py = None
+        if angr_py is not None:
+            aspec = {"blob": spec["blob"], "arch": spec["arch"], "base": spec["base"],
+                     "entry": spec["entry"], "sp": spec["sp"], "endianness": spec["endianness"],
+                     "steps": int(p.get("angr_steps", 160))}
+            extra = run_angr_mmio(angr_py, aspec, ctx=ctx, timeout=int(p.get("angr_timeout", 120)))
+            if extra:
+                spec["seeds"] = list(dict.fromkeys(list(spec["seeds"]) + extra))
+                ctx.emit("firmware_rehost.symbolic", payload={"angr_seeds": len(extra)})
+
     ctx.emit("firmware_rehost.start", payload={"entry": hex(spec["base"]),
              "python": python.name})
-    ctx.progress(msg="rehosting Cortex-M image under Unicorn (Fuzzware-style MMIO)")
+    ctx.progress(msg="rehosting image under Unicorn (Fuzzware-style MMIO + symbolic seeds)")
     res = run_rehost(python, spec, ctx=ctx, timeout=int(p.get("timeout", 120)))
 
     fz = res.get("fuzz") or {}

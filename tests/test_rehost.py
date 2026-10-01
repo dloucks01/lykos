@@ -7,6 +7,7 @@ sidestepped.
 """
 from __future__ import annotations
 
+import base64
 import json
 import struct
 import subprocess
@@ -15,11 +16,17 @@ from pathlib import Path
 
 import pytest
 
+from lykos.analyze.firmware import angr_mmio as amod
 from lykos.analyze.firmware import unicorn_driver as drv
-from lykos.analyze.firmware.rehost import locate_unicorn_python
+from lykos.analyze.firmware.rehost import locate_unicorn_python, run_angr_mmio
 
 _UNI = locate_unicorn_python()
 _DRIVER = Path(drv.__file__)
+try:
+    from lykos.analyze.symbolic.concolic import locate_angr_python
+    _ANGR = locate_angr_python()
+except Exception:
+    _ANGR = None
 
 
 def test_resolve_arch_maps_canonical_names():
@@ -152,3 +159,33 @@ def test_bad_write_is_a_fault():
     out = _run({"_blob": bytes(img), "arch": "cortex-m", "mode": "run", "budget": 2000})
     assert out["ok"]
     assert out["run"]["fault"] and out["run"]["fault"]["kind"] == "write"
+
+
+@pytest.mark.skipif(_ANGR is None, reason="angr venv not available")
+def test_angr_oracle_solves_an_arbitrary_mmio_gate(tmp_path):
+    """The symbolic tier: a poll that waits for an ARBITRARY 32-bit MMIO value (0xCAFEBABE),
+    which the deterministic value-set search cannot guess, is solved by angr -- it returns a
+    seed whose MMIO byte-stream contains that value, so Unicorn can replay past the gate."""
+    img = bytearray(0x80)
+    struct.pack_into("<I", img, 0x00, 0x20010000)
+    for off in range(0x04, 0x40, 4):
+        struct.pack_into("<I", img, off, 0x08000041)
+    # ldr r0,[pc,#0xC]; loop: ldr r1,[r0]; ldr r2,[pc,#0xC]; cmp r1,r2; bne loop; b .
+    img[0x40:0x4C] = bytes([0x03, 0x48, 0x01, 0x68, 0x03, 0x4A, 0x91, 0x42, 0xFC, 0xD1, 0xFE, 0xE7])
+    struct.pack_into("<I", img, 0x50, 0x40000000)             # MMIO address
+    struct.pack_into("<I", img, 0x54, 0xCAFEBABE)             # the awaited magic
+    bp = tmp_path / "fw.bin"
+    bp.write_bytes(bytes(img))
+    spec = {"blob": str(bp), "arch": "cortex-m", "base": 0x08000000,
+            "entry": 0x08000040, "steps": 150}
+    seeds = run_angr_mmio(_ANGR, spec)
+    assert seeds, "angr produced no MMIO seeds"
+    streams = [base64.b64decode(s) for s in seeds]
+    assert any(b"\xbe\xba\xfe\xca" in s for s in streams), \
+        "no seed carried the solved magic value 0xCAFEBABE"
+
+
+def test_angr_oracle_arch_mapping_is_pure():
+    """Arch gating in the oracle must not need angr imported."""
+    assert "cortex-m" in amod._ARCH and "aarch64" in amod._ARCH
+    assert "sparc" not in amod._ARCH
