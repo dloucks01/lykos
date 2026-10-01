@@ -33,6 +33,7 @@ _TARGET = {
     "cve_scan": ("..analyze.fingerprint", "enqueue_cve_scan"),
     "source_cve_scan": ("..analyze.fingerprint", "enqueue_source_cve_scan"),
     "embedded_audit": ("..analyze.fingerprint", "enqueue_embedded_audit"),
+    "int_overflow_scan": ("..analyze.fingerprint", "enqueue_int_overflow_scan"),
     "coverage_fuzz": ("..analyze.fuzz", "enqueue_coverage_fuzz"),
     "fuzz": ("..analyze.fuzz", "enqueue_fuzz"),
     "directed_fuzz": ("..analyze.fuzz", "enqueue_directed_fuzz"),
@@ -61,7 +62,8 @@ _CASE = {
 # require params["input_sha"] (the crashing input), which the prove loop threads in -- listing
 # them dropped that input and every one failed with "requires params.input_sha".
 _NO_PARAMS = {"disassemble", "detect_cwe", "heap_trace", "oob_index", "chain_primitive",
-              "synthesize_poc", "firmware_carve", "source_cve_scan", "embedded_audit"}
+              "synthesize_poc", "firmware_carve", "source_cve_scan", "embedded_audit",
+              "int_overflow_scan"}
 _CASE_NO_PARAMS = {"link_case", "ipc_model", "cross_taint"}
 
 _TERMINAL = {"done", "cancelled", "error"}
@@ -118,7 +120,8 @@ def _best_block_pct(store, target_id) -> Optional[float]:
 _PLAN_STAGES = [
     ("disassemble", "Disassemble"), ("detect_cwe", "Static detectors"),
     ("cve_scan", "Known-CVE scan"), ("source_cve_scan", "Dependency-CVE scan"),
-    ("embedded_audit", "RTOS config audit"), ("synthesize_injection", "Injection probes"),
+    ("embedded_audit", "RTOS config audit"), ("int_overflow_scan", "Int-overflow allocs"),
+    ("synthesize_injection", "Injection probes"),
     ("coverage_fuzz", "Coverage fuzzing"), ("directed_fuzz", "Directed fuzzing"),
     ("heap_check", "Heap checks"), ("heap_trace", "Heap primitives"),
     ("oob_index", "Array-index probes"), ("chain_primitive", "Primitive chaining"),
@@ -362,6 +365,8 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict, stop: t
             _run_target_stage(store, t, "source_cve_scan", status, stop)
             # Audit an embedded RTOS config header (FreeRTOSConfig.h) for disabled safety nets.
             _run_target_stage(store, t, "embedded_audit", status, stop)
+            # Unguarded size arithmetic feeding an allocator (integer-overflow allocation).
+            _run_target_stage(store, t, "int_overflow_scan", status, stop)
             # Demonstrate injection / format-string leaks by probing the binary's sinks directly
             # (no crash needed) -- a printf(user) leaks live memory, a system(user) runs a command.
             _run_target_stage(store, t, "synthesize_injection", status, stop)
