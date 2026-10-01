@@ -35,6 +35,7 @@ _TARGET = {
     "embedded_audit": ("..analyze.fingerprint", "enqueue_embedded_audit"),
     "int_overflow_scan": ("..analyze.fingerprint", "enqueue_int_overflow_scan"),
     "net_fuzz": ("..analyze.fuzz", "enqueue_net_fuzz"),
+    "cve_corroborate": ("..analyze.fingerprint", "enqueue_cve_corroborate"),
     "coverage_fuzz": ("..analyze.fuzz", "enqueue_coverage_fuzz"),
     "fuzz": ("..analyze.fuzz", "enqueue_fuzz"),
     "directed_fuzz": ("..analyze.fuzz", "enqueue_directed_fuzz"),
@@ -64,7 +65,7 @@ _CASE = {
 # them dropped that input and every one failed with "requires params.input_sha".
 _NO_PARAMS = {"disassemble", "detect_cwe", "heap_trace", "oob_index", "chain_primitive",
               "synthesize_poc", "firmware_carve", "source_cve_scan", "embedded_audit",
-              "int_overflow_scan", "net_fuzz"}
+              "int_overflow_scan", "net_fuzz", "cve_corroborate"}
 _CASE_NO_PARAMS = {"link_case", "ipc_model", "cross_taint"}
 
 _TERMINAL = {"done", "cancelled", "error"}
@@ -122,7 +123,8 @@ _PLAN_STAGES = [
     ("disassemble", "Disassemble"), ("detect_cwe", "Static detectors"),
     ("cve_scan", "Known-CVE scan"), ("source_cve_scan", "Dependency-CVE scan"),
     ("embedded_audit", "RTOS config audit"), ("int_overflow_scan", "Int-overflow allocs"),
-    ("net_fuzz", "Network fuzzing"), ("synthesize_injection", "Injection probes"),
+    ("net_fuzz", "Network fuzzing"), ("cve_corroborate", "CVE corroboration"),
+    ("synthesize_injection", "Injection probes"),
     ("coverage_fuzz", "Coverage fuzzing"), ("directed_fuzz", "Directed fuzzing"),
     ("heap_check", "Heap checks"), ("heap_trace", "Heap primitives"),
     ("oob_index", "Array-index probes"), ("chain_primitive", "Primitive chaining"),
@@ -470,6 +472,10 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict, stop: t
                     _plan_set(status, "verify", "cancelled" if stop.is_set() else "done")
                     _emit_stage(store, t.case_id, "verify",
                                 "cancelled" if stop.is_set() else "done", target_id=t.id)
+            # Link a matched CVE to a demonstrated crash of a matching class (soft corroboration),
+            # now that crashes/PoCs for this target exist.
+            if not stop.is_set():
+                _run_target_stage(store, t, "cve_corroborate", status, stop)
             _finalize_plan(status)          # any step never reached is marked skipped
         # Case-level cross-binary analysis for a multi-binary case (a carved firmware's extracted
         # components are exactly such a set).
