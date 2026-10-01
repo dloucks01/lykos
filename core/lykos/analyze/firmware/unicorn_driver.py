@@ -34,7 +34,7 @@ try:
     from unicorn import (
         UC_ARCH_ARM, UC_ARCH_ARM64, UC_ARCH_MIPS, UC_ARCH_PPC, UC_ARCH_RISCV,
         UC_HOOK_BLOCK, UC_HOOK_MEM_READ_UNMAPPED, UC_HOOK_MEM_READ, UC_HOOK_MEM_WRITE,
-        UC_HOOK_MEM_WRITE_UNMAPPED, UC_HOOK_MEM_FETCH_UNMAPPED,
+        UC_HOOK_MEM_WRITE_UNMAPPED, UC_HOOK_MEM_FETCH_UNMAPPED, UC_HOOK_INTR,
         UC_MEM_FETCH_PROT, UC_MEM_FETCH_UNMAPPED, UC_MEM_READ_PROT, UC_MEM_READ_UNMAPPED,
         UC_MEM_WRITE_PROT, UC_MEM_WRITE_UNMAPPED,
         UC_MODE_ARM, UC_MODE_THUMB, UC_MODE_MIPS32, UC_MODE_MIPS64,
@@ -42,7 +42,8 @@ try:
         UC_MODE_BIG_ENDIAN, UC_MODE_LITTLE_ENDIAN,
         Uc, UcError,
     )
-    from unicorn.arm_const import UC_ARM_REG_PC, UC_ARM_REG_SP, UC_ARM_REG_LR, UC_ARM_REG_R0
+    from unicorn.arm_const import (UC_ARM_REG_PC, UC_ARM_REG_SP, UC_ARM_REG_LR, UC_ARM_REG_R0,
+                                   UC_CPU_ARM_CORTEX_M3)
     from unicorn.arm64_const import (UC_ARM64_REG_PC, UC_ARM64_REG_SP, UC_ARM64_REG_X0,
                                      UC_ARM64_REG_X30)
     from unicorn.mips_const import (UC_MIPS_REG_PC, UC_MIPS_REG_SP, UC_MIPS_REG_V0,
@@ -191,6 +192,14 @@ def run_once(cfg, blob, base, sp, entry, fuzz, budget, handlers=None):
     be = bool(cfg["mode"] & UC_MODE_BIG_ENDIAN)
     endc = ">" if be else "<"
     uc = Uc(cfg["uc"], cfg["mode"])
+    if cfg["cortex_m"]:
+        # Select an ARMv7-M CPU, or the M-profile system instructions the firmware (and every RTOS
+        # port) uses -- msr/mrs BASEPRI/PSP/MSP/CONTROL, cpsie/cpsid -- decode as INVALID on the
+        # default ARM core and the image dies in its first critical section.
+        try:
+            uc.ctl_set_cpu_model(UC_CPU_ARM_CORTEX_M3)
+        except Exception:
+            pass
     flash_size = max(0x10000, (len(blob) + 0xFFF) & ~0xFFF)
     uc.mem_map(base, flash_size)
     uc.mem_write(base, blob)
@@ -215,6 +224,16 @@ def run_once(cfg, blob, base, sp, entry, fuzz, budget, handlers=None):
     if mmio:
         for s, sz in mmio:
             uc.mem_map(s, sz)
+    # Cortex-M System Control Space (SCS: SysTick, NVIC, SCB) is system control, NOT a fuzzable
+    # peripheral. In particular SCB->VTOR (0xE000ED08) is the vector-table base the startup/RTOS
+    # code dereferences; fuzzing it turns [VTOR+0x2C] (an exception vector slot) into a wild
+    # pointer and fabricates a crash. Pin VTOR to the image base and leave the rest of the SCS
+    # reading 0 (see hmr_defined, which does not model the SCS window).
+    if cfg["cortex_m"]:
+        try:
+            uc.mem_write(0xE000ED08, struct.pack("<I", base & 0xFFFFFFFF))
+        except UcError:
+            pass
 
     # Interrupt dispatch (Cortex-M): when the firmware is deeply stuck in a wait-for-interrupt
     # spin (nothing the MMIO poll-breaker can help), fire a vector-table handler as a subroutine
@@ -251,7 +270,7 @@ def run_once(cfg, blob, base, sp, entry, fuzz, budget, handlers=None):
 
     blocks = set()
     st = {"i": 0, "fault": None, "since_new": 0, "stuck": False, "trial": 0,
-          "pending": None, "cache": {}, "polls": 0, "wr": 0, "wr_seen": 0,
+          "pending": None, "cache": {}, "polls": 0, "wr": 0, "wr_seen": 0, "svc_boundary": False,
           "irq_i": 0, "in_isr": False, "saved": None, "fires": 0, "resume": None, "handled": 0}
     _IRQ_STUCK = _STUCK * 3
     _MAX_FIRES = 16
@@ -343,6 +362,10 @@ def run_once(cfg, blob, base, sp, entry, fuzz, budget, handlers=None):
             uc.emu_stop()
 
     def hmr_defined(uc, access, addr, size, value, ud):   # read inside a defined MMIO window
+        # The SCS (0xE000E000-0xE000F000: SysTick/NVIC/SCB) is system control, not attacker input.
+        # Leave its mapped value (0, VTOR=base) rather than fuzzing it into nonsense pointers.
+        if 0xE000E000 <= addr < 0xE000F000:
+            return
         _read_model(uc, addr, size, uc.reg_read(cfg["pc"]))
 
     def hmr_lazy(uc, access, addr, size, value, ud):      # generic: model any unmapped READ
@@ -355,6 +378,19 @@ def run_once(cfg, blob, base, sp, entry, fuzz, budget, handlers=None):
         return True                                       # retry the access now that it's mapped
 
     def hbad(uc, access, addr, size, value, ud):          # bad write / fetch = genuine fault
+        # An RTOS scheduler starts its first task with an `svc`; Unicorn's M-profile model enters
+        # the exception by FETCHING the handler from the vector table at VTOR + 4*excnum, and VTOR
+        # is 0 here, so it reads a low vector-slot address (e.g. 0x2C = SVCall) that is unmapped.
+        # That is an emulation artifact of the unmodelled context switch, NOT a firmware fault --
+        # recognise the exception-vector read and stop cleanly at the scheduler boundary.
+        if cfg["cortex_m"] and _kind(access) == "read" and 0x08 <= addr < 0x40:
+            st["svc_boundary"] = True
+            try:                                          # satisfy the retry so emu_stop is clean
+                uc.mem_map(addr & ~(_PAGE - 1), _PAGE)
+            except UcError:
+                pass
+            uc.emu_stop()
+            return True
         st["fault"] = {"addr": addr, "access": int(access),
                        "pc": uc.reg_read(cfg["pc"]), "kind": _kind(access)}
         return False
@@ -362,8 +398,19 @@ def run_once(cfg, blob, base, sp, entry, fuzz, budget, handlers=None):
     def hw(uc, access, addr, size, value, ud):        # count mapped writes = the firmware is progressing
         st["wr"] += 1
 
+    def hintr(uc, intno, ud):
+        # A software interrupt (svc) here is, in practice, an RTOS scheduler starting its first
+        # task (e.g. FreeRTOS vPortSVCHandler). Faithful M-profile exception entry/return -- the
+        # context switch INTO the task -- is beyond this lightweight rehoster, and letting Unicorn
+        # vector the svc natively faults on the vector fetch (VTOR is 0) as a spurious read. Stop
+        # cleanly at this scheduler boundary instead of reporting an emulation artifact as a fault.
+        st["svc_boundary"] = True
+        uc.emu_stop()
+
     uc.hook_add(UC_HOOK_BLOCK, hb)
     uc.hook_add(UC_HOOK_MEM_WRITE, hw)
+    if cfg["cortex_m"]:
+        uc.hook_add(UC_HOOK_INTR, hintr)
     uc.hook_add(UC_HOOK_MEM_WRITE_UNMAPPED, hbad)
     uc.hook_add(UC_HOOK_MEM_FETCH_UNMAPPED, hbad)
     if mmio:
@@ -399,13 +446,16 @@ def run_once(cfg, blob, base, sp, entry, fuzz, budget, handlers=None):
         if st["resume"] is not None:
             pc = st["resume"]
             continue
+        if st["svc_boundary"]:                     # reached an RTOS scheduler-start svc: clean stop
+            halt = "svc-boundary"
+            break
         break                                     # natural end (count exhausted / until hit)
     if st["fault"]:
         halt = "fault"
     return {"nblocks": len(blocks), "blocks": sorted(hex(b) for b in blocks)[:200],
             "halt": halt, "fault": st["fault"], "consumed": st["i"],
             "polls_satisfied": len(st["cache"]), "irq_fires": st["fires"],
-            "handled_calls": st["handled"]}
+            "handled_calls": st["handled"], "svc_boundary": st["svc_boundary"]}
 
 
 def _mutate(data, rng):

@@ -84,6 +84,38 @@ def test_poll_loop_is_broken_so_init_proceeds():
 
 
 @pytest.mark.skipif(_UNI is None, reason="Unicorn venv not available")
+def test_cortex_m_profile_system_instructions_decode():
+    """A Cortex-M image using an ARMv7-M system instruction (msr BASEPRI) must execute, not die
+    with an invalid-instruction fault. The driver had no CPU model set, so the default ARM core
+    decoded msr/mrs BASEPRI/PSP/MSP, cpsie/cpsid as INVALID and every RTOS image died in its first
+    critical section. Regression for selecting UC_CPU_ARM_CORTEX_M3."""
+    img = bytearray(0x80)
+    struct.pack_into("<I", img, 0x00, 0x20010000)              # SP
+    struct.pack_into("<I", img, 0x04, 0x08000041)              # Reset -> 0x40
+    img[0x40:0x46] = bytes.fromhex("80f31188") + bytes.fromhex("fee7")  # msr BASEPRI, r0 ; b .
+    out = _run({"_blob": bytes(img), "arch": "cortex-m", "mode": "run", "budget": 2000})
+    assert out["ok"]
+    f = out["run"]["fault"]
+    assert not f, f"an M-profile system instruction did not decode: {f}"
+
+
+@pytest.mark.skipif(_UNI is None, reason="Unicorn venv not available")
+def test_cortex_m_svc_is_a_clean_scheduler_boundary_not_a_fault():
+    """An `svc` is how an RTOS starts its first task. Faithful M-profile exception entry/return
+    (the context switch into the task) is beyond this board-model-free rehoster, and letting the
+    svc vector natively faults on the vector fetch. The driver must recognise the svc as a clean
+    scheduler boundary and stop there -- NOT fabricate a crash from the emulation gap."""
+    img = bytearray(0x80)
+    struct.pack_into("<I", img, 0x00, 0x20010000)              # SP
+    struct.pack_into("<I", img, 0x04, 0x08000041)              # Reset -> 0x40
+    img[0x40:0x44] = bytes.fromhex("00df") + bytes.fromhex("fee7")  # svc 0 ; b .
+    out = _run({"_blob": bytes(img), "arch": "cortex-m", "mode": "run", "budget": 2000})
+    assert out["ok"]
+    assert out["run"].get("svc_boundary") is True
+    assert not out["run"]["fault"], "the scheduler-start svc was mis-reported as a fault"
+
+
+@pytest.mark.skipif(_UNI is None, reason="Unicorn venv not available")
 def test_cortex_m_ram_is_tight_to_the_stack_top_so_overflows_fault():
     """Cortex-M RAM is mapped only up to the initial SP (vector[0] = _estack = top of RAM by the
     standard startup convention), so a write PAST the stack top -- a stack buffer overflowing off
