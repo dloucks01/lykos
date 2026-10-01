@@ -339,6 +339,11 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict, stop: t
             # as a sub-target) and analyse THOSE. Running native recovery on the raw blob finds nothing
             # and misses every component + secret.
             if (t.file_type or "").lower() == "firmware":
+                # CVE-fingerprint the image's OWN bytes first: a monolithic RTOS image (VxWorks,
+                # bare-metal) statically links its libraries, so a vulnerable zlib/openssl/etc.
+                # lives as a version banner in the container itself with no filesystem to carve
+                # and no standalone ELF to extract. The byte-scan finds it either way.
+                _run_target_stage(store, t, "cve_scan", status, stop)
                 _run_target_stage(store, t, "firmware_carve", status, stop)
                 for sub in store.targets.list_by_case(case_id):
                     if sub.id not in done_tids and sub.id not in worklist:
