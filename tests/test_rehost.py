@@ -101,6 +101,24 @@ def test_interrupt_handler_is_dispatched_when_main_waits():
 
 
 @pytest.mark.skipif(_UNI is None, reason="Unicorn venv not available")
+def test_value_search_satisfies_a_specific_magic_gate():
+    """A poll that waits for a SPECIFIC value (r1 == 0x55), where all-ones/zero do not satisfy
+    it, must still be broken -- the deterministic value-set search reaches 0x55."""
+    img = bytearray(0x80)
+    struct.pack_into("<I", img, 0x00, 0x20010000)
+    for off in range(0x04, 0x40, 4):
+        struct.pack_into("<I", img, off, 0x08000041)
+    # ldr r0,[pc,#8]; loop: ldr r1,[r0]; cmp r1,#0x55; bne loop; b . ; pool=0x40000000
+    img[0x40:0x50] = bytes([0x02, 0x48, 0x01, 0x68, 0x55, 0x29, 0xFC, 0xD1,
+                            0xFE, 0xE7, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40])
+    out = _run({"_blob": bytes(img), "arch": "cortex-m", "mode": "run", "budget": 20000})
+    assert out["ok"]
+    r = out["run"]
+    assert r["polls_satisfied"] >= 1, "the magic-value poll was never satisfied"
+    assert r["nblocks"] >= 3, "did not get past the magic-value poll"
+
+
+@pytest.mark.skipif(_UNI is None, reason="Unicorn venv not available")
 def test_bad_write_is_a_fault():
     """A write to a wild unmapped address under Cortex-M is a genuine fault (memory corruption)."""
     img = bytearray(0x80)

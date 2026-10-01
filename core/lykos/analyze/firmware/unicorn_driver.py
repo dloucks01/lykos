@@ -134,7 +134,28 @@ def _resolve_arch(spec):
 
 _PAGE = 0x1000
 _STUCK = 48          # blocks without progress before we treat an MMIO read as a status poll
-_SATISFY = [0xFFFFFFFFFFFFFFFF, 0x0, 0x1, 0x2, 0x3]   # try: all-set, clear, small counters
+
+
+def _satisfy_values():
+    """Deterministic value-set search for a stuck status-poll MMIO read. The poll-breaker tries
+    these in order and keeps whichever advances the firmware (a new block appears), caching it
+    per read site. Covers the common gate shapes without a datasheet or symbolic solver:
+    all-bits-set / clear (ready/busy flags), each single bit (wait-for-bit-N), small counters,
+    and common magic/status bytes (0x55/0xAA/0xFF ping-pong, 0x80 MSB). Full SMT solving of an
+    arbitrary compare constant is the deeper symbolic tier."""
+    vals = [0xFFFFFFFFFFFFFFFF, 0x0]
+    vals += [1 << n for n in range(32)]                  # single-bit: wait-for-bit-N
+    vals += [0x55, 0xAA, 0xFF, 0x80, 0x55AA, 0xAA55, 0x5555, 0xA5A5]  # common magic/status
+    vals += [1, 2, 3, 0x10, 0x100, 0x7FFFFFFF]           # small counters / sign edge
+    seen, out = set(), []
+    for v in vals:
+        if v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out
+
+
+_SATISFY = _satisfy_values()
 
 
 def _kind(access):
