@@ -51,14 +51,20 @@ def _fault(trig, r) -> bool:
     return trig.cwe in _DOS_CWES and getattr(r, "timed_out", False)
 
 
-def _detonate(exe: str, trig, arch) -> "sandbox.RunResult | None":
+def _detonate(exe: str, trig, arch, endianness=None, bits=None) -> "sandbox.RunResult | None":
     """Feed the trigger to the target on its channel; return the faulting RunResult or None. For a
-    DoS trigger a timeout/OOM-kill under a tight budget counts as the fault."""
+    DoS trigger a timeout/OOM-kill under a tight budget counts as the fault.
+
+    endianness and bits MUST be forwarded to the sandbox: the ELF arch name is endianness- and
+    word-blind (ppc64le and ppc64 are both "ppc64", mipsel is "mips", riscv is 32/64), so without
+    them the sandbox routes a little-endian or 32/64-bit target to the WRONG qemu-user emulator,
+    the target never runs, and a real reproduction is silently filed as "did not fault"."""
     dos = trig.cwe in _DOS_CWES
     timeout = 6.0 if dos else 10.0
     mem_mb = 512 if dos else 2048                  # tight cap so a bomb OOM-kills, not just grows
+    kw = {"timeout": timeout, "arch": arch, "endianness": endianness, "bits": bits, "mem_mb": mem_mb}
     if trig.channel in ("stdin", "stdin-slow"):
-        r = sandbox.run(exe, stdin=trig.data, timeout=timeout, arch=arch, mem_mb=mem_mb)
+        r = sandbox.run(exe, stdin=trig.data, **kw)
         return r if _fault(trig, r) else None
     if trig.channel == "file":
         import tempfile
@@ -67,13 +73,13 @@ def _detonate(exe: str, trig, arch) -> "sandbox.RunResult | None":
         with open(fp, "wb") as fh:
             fh.write(trig.data)
         try:
-            r = sandbox.run(exe, argv=[fp], timeout=timeout, arch=arch, mem_mb=mem_mb)
+            r = sandbox.run(exe, argv=[fp], **kw)
             return r if _fault(trig, r) else None
         finally:
             import shutil
             shutil.rmtree(d, ignore_errors=True)
     if trig.channel == "arg":
-        r = sandbox.run(exe, argv=[trig.data], timeout=timeout, arch=arch, mem_mb=mem_mb)
+        r = sandbox.run(exe, argv=[trig.data], **kw)
         return r if _fault(trig, r) else None
     return None
 
@@ -138,7 +144,9 @@ def cve_poc_stage(ctx) -> dict:
             continue
         ctx.progress(msg=f"detonating {item.label}")
         fired += 1
-        res = _detonate(str(exe), item.trigger, target.arch)
+        res = _detonate(str(exe), item.trigger, target.arch,
+                        endianness=getattr(target, "endianness", None),
+                        bits=getattr(target, "bits", None))
         if res is not None:
             _record(item.label, item.trigger, res, item.confidence)
             reproduced.append(item.label)

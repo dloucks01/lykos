@@ -110,6 +110,32 @@ def test_generic_overflow_class_trigger_faults_a_vulnerable_target(tmp_path):
 
 # ---- the weaponization plan: bespoke + library + CWE-class, all reachable --------------------
 
+def test_detonate_forwards_endianness_and_bits_to_the_sandbox(monkeypatch):
+    """Regression: the ELF arch name is endianness- and word-blind (ppc64le and ppc64 are both
+    'ppc64', mipsel is 'mips', riscv is 32/64), so _detonate MUST forward endianness and bits or
+    the sandbox routes a little-endian/32-64-bit target to the WRONG qemu-user, the target never
+    runs, and a real reproduction is silently filed as 'did not fault'. (Observed: ppc64le CVE
+    weaponization reproduced nothing while big-endian ppc64 produced 5 PoCs.)"""
+    seen = {}
+
+    class _R:
+        crashed = True
+        signal = 11
+        signal_name = "SIGSEGV"
+        isolation = "qemu"
+
+    def _fake_run(exe, **kw):
+        seen.update(kw)
+        return _R()
+
+    monkeypatch.setattr(cve_poc_stage.sandbox, "run", _fake_run)
+    trig = cve_triggers.class_triggers("CWE-787")[0]       # a stdin cyclic probe
+    cve_poc_stage._detonate("/bin/true", trig, "ppc64", endianness="little", bits=64)
+    assert seen.get("arch") == "ppc64"
+    assert seen.get("endianness") == "little"              # the bug: this was dropped
+    assert seen.get("bits") == 64
+
+
 def test_weaponization_plan_weaponizes_a_match_with_no_bespoke_trigger():
     """Regression: a version-matched CVE that has NO hand-authored trigger must still be
     weaponized by its library format attack AND its CWE class. (The stage previously filtered
