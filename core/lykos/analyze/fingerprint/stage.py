@@ -32,15 +32,15 @@ def cve_stage(ctx) -> dict:
         if m.get("name"):
             label += f" ({m['name']})"
         cvss = f", CVSS {m['cvss']}" if m.get("cvss") else ""
+        evidence = [
+            {"channel": "fingerprint",
+             "detail": f"detected {m['library']} {m['version']} via banner \"{m['evidence']}\""},
+            {"channel": "cve", "detail": f"{m['cve']}{cvss}: {m['summary']}"}]
+        evidence += scan.exploit_evidence(m["cwe"])
         fd.upsert(target.id, target.case_id, {
             "cwe": m["cwe"], "severity": m["severity"], "detector": "cve_fingerprint",
             "title": f"Vulnerable component: {label}",
-            "evidence": [
-                {"channel": "fingerprint",
-                 "detail": f"detected {m['library']} {m['version']} via banner "
-                           f"\"{m['evidence']}\""},
-                {"channel": "cve",
-                 "detail": f"{m['cve']}{cvss}: {m['summary']}"}],
+            "evidence": evidence,
             "function_addr": None, "site_addr": None,
             "dedup_key": f"{m['cve']}:{m['library']}:{m['version']}",
             "state": "corroborated", "confidence": 0.85})

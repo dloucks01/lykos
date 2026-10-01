@@ -31,6 +31,7 @@ _TARGET = {
     "disassemble": ("..analyze.disassemble", "enqueue_disassemble"),
     "detect_cwe": ("..analyze.detect", "enqueue_detect"),
     "cve_scan": ("..analyze.fingerprint", "enqueue_cve_scan"),
+    "source_cve_scan": ("..analyze.fingerprint", "enqueue_source_cve_scan"),
     "coverage_fuzz": ("..analyze.fuzz", "enqueue_coverage_fuzz"),
     "fuzz": ("..analyze.fuzz", "enqueue_fuzz"),
     "directed_fuzz": ("..analyze.fuzz", "enqueue_directed_fuzz"),
@@ -59,7 +60,7 @@ _CASE = {
 # require params["input_sha"] (the crashing input), which the prove loop threads in -- listing
 # them dropped that input and every one failed with "requires params.input_sha".
 _NO_PARAMS = {"disassemble", "detect_cwe", "heap_trace", "oob_index", "chain_primitive",
-              "synthesize_poc", "firmware_carve"}
+              "synthesize_poc", "firmware_carve", "source_cve_scan"}
 _CASE_NO_PARAMS = {"link_case", "ipc_model", "cross_taint"}
 
 _TERMINAL = {"done", "cancelled", "error"}
@@ -115,7 +116,8 @@ def _best_block_pct(store, target_id) -> Optional[float]:
 # fuzz runs twice; root_cause/build_poc run per crash) update the same entry.
 _PLAN_STAGES = [
     ("disassemble", "Disassemble"), ("detect_cwe", "Static detectors"),
-    ("cve_scan", "Known-CVE scan"), ("synthesize_injection", "Injection probes"),
+    ("cve_scan", "Known-CVE scan"), ("source_cve_scan", "Dependency-CVE scan"),
+    ("synthesize_injection", "Injection probes"),
     ("coverage_fuzz", "Coverage fuzzing"), ("directed_fuzz", "Directed fuzzing"),
     ("heap_check", "Heap checks"), ("heap_trace", "Heap primitives"),
     ("oob_index", "Array-index probes"), ("chain_primitive", "Primitive chaining"),
@@ -354,6 +356,9 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict, stop: t
             _run_target_stage(store, t, "disassemble", status, stop)
             _run_target_stage(store, t, "detect_cwe", status, stop)
             _run_target_stage(store, t, "cve_scan", status, stop)
+            # Known-CVE scan of a built-from-source project's declared dependencies + vendored
+            # headers -- versions that never survive into the compiled binary's banners.
+            _run_target_stage(store, t, "source_cve_scan", status, stop)
             # Demonstrate injection / format-string leaks by probing the binary's sinks directly
             # (no crash needed) -- a printf(user) leaks live memory, a system(user) runs a command.
             _run_target_stage(store, t, "synthesize_injection", status, stop)

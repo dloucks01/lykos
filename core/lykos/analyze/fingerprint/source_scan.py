@@ -1,0 +1,233 @@
+"""Source-side CVE detection: find vulnerable dependency versions in an uploaded SOURCE project.
+
+The binary-side scan (`scan.scan`) reads version BANNERS out of a compiled artifact. A source
+project states its dependency versions directly -- in a package manifest (requirements.txt,
+package-lock.json, go.mod, Cargo.lock) or a vendored library header (zlib.h's ZLIB_VERSION,
+openssl's opensslv.h). Those versions never survive into a stripped/optimised binary, so this is
+the only channel that sees them. Each parsed (library, version) is fed to the SAME matcher
+(`scan.match`) and the SAME offline DB the binary path uses, so the ecosystem CVE index and the
+reference pack apply identically.
+
+Pure parsing, no execution, stdlib only. A malformed manifest is skipped, never fatal.
+"""
+from __future__ import annotations
+
+import io
+import logging
+import re
+import tarfile
+from pathlib import Path
+
+from ...db.dao import ArtifactDAO, FindingDAO, TargetDAO
+from ...jobs.registry import register_stage
+from . import scan
+
+_log = logging.getLogger(__name__)
+
+SOURCE_CVE_STAGE = "source_cve_scan"
+TOOL = "cve-source"
+TOOL_VERSION = "cve-source-1"
+
+_MAX_FILES = 4000
+_MAX_FILE = 4 << 20
+
+# Vendored C/C++ library headers: a #define carrying the library's own version string.
+_HEADER_VERSION = {
+    "zlib.h": ("zlib", re.compile(r'#\s*define\s+ZLIB_VERSION\s+"([0-9]+\.[0-9]+\.[0-9]+)')),
+    "zlib.h.in": ("zlib", re.compile(r'#\s*define\s+ZLIB_VERSION\s+"([0-9]+\.[0-9]+\.[0-9]+)')),
+    "opensslv.h": ("openssl",
+                   re.compile(r'OPENSSL_VERSION_TEXT\s+"OpenSSL\s+([0-9]+\.[0-9]+\.[0-9]+[a-z]*)')),
+}
+# requirements.txt line: name[extras] ==|=== exact-version  (only exact pins give a version)
+_REQ = re.compile(r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)\s*(?:\[[^\]]*\])?\s*===?\s*"
+                  r"([0-9][0-9A-Za-z.\-]*)", re.M)
+# go.mod require line: module vX.Y.Z   (single line or inside a require(...) block)
+_GOMOD = re.compile(r"^\s*(?:require\s+)?([a-zA-Z0-9./_-]+\.[a-zA-Z0-9./_-]+)\s+v"
+                    r"([0-9]+\.[0-9]+\.[0-9]+[0-9A-Za-z.\-+]*)", re.M)
+
+
+def _norm_pypi(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def _parse_requirements(text: str) -> list:
+    out = []
+    for m in _REQ.finditer(text):
+        out.append(("pypi:" + _norm_pypi(m.group(1)), m.group(1), m.group(2)))
+    return out
+
+
+def _parse_package_lock(text: str) -> list:
+    import json
+    out = []
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return out
+    # v2/v3: {"packages": {"node_modules/<name>": {"version": ...}}}
+    for path, meta in (data.get("packages") or {}).items():
+        if not path or not isinstance(meta, dict) or "version" not in meta:
+            continue
+        name = path.split("node_modules/")[-1]
+        if name:
+            out.append(("npm:" + name.lower(), name, str(meta["version"])))
+    # v1: {"dependencies": {"<name>": {"version": ...}}}
+    for name, meta in (data.get("dependencies") or {}).items():
+        if isinstance(meta, dict) and "version" in meta:
+            out.append(("npm:" + name.lower(), name, str(meta["version"])))
+    return out
+
+
+def _parse_package_json(text: str) -> list:
+    import json
+    out = []
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return out
+    for section in ("dependencies", "devDependencies", "optionalDependencies"):
+        for name, spec in (data.get(section) or {}).items():
+            # strip a leading range operator to a concrete-ish version (best effort; a lockfile,
+            # parsed above, is preferred and will dedupe-win on the same package).
+            m = re.search(r"([0-9]+\.[0-9]+\.[0-9]+[0-9A-Za-z.\-]*)", str(spec))
+            if m:
+                out.append(("npm:" + name.lower(), name, m.group(1)))
+    return out
+
+
+def _parse_go_mod(text: str) -> list:
+    return [("go:" + mod.lower(), mod, ver) for mod, ver in _GOMOD.findall(text)]
+
+
+def _parse_cargo_lock(text: str) -> list:
+    out = []
+    try:
+        import tomllib
+        data = tomllib.loads(text)
+    except Exception:
+        return out
+    for pkg in data.get("package", []):
+        if isinstance(pkg, dict) and pkg.get("name") and pkg.get("version"):
+            out.append(("crates:" + str(pkg["name"]).lower(), pkg["name"], str(pkg["version"])))
+    return out
+
+
+_MANIFEST_PARSERS = {
+    "requirements.txt": _parse_requirements,
+    "package-lock.json": _parse_package_lock,
+    "package.json": _parse_package_json,
+    "go.mod": _parse_go_mod,
+    "Cargo.lock": _parse_cargo_lock,
+}
+
+
+def parse_source_tree(root: Path) -> list:
+    """Every (library-key, display-name, version) found across the source tree's dependency
+    manifests and vendored library headers. Deduped; a lockfile/header wins over a loose spec."""
+    found: dict = {}        # (libkey, version) -> {library, name, version, evidence}
+    seen_files = 0
+    for p in sorted(root.rglob("*")):
+        if seen_files >= _MAX_FILES:
+            break
+        if not p.is_file():
+            continue
+        try:
+            if p.stat().st_size > _MAX_FILE:
+                continue
+        except OSError:
+            continue
+        seen_files += 1
+        base = p.name
+        parser = _MANIFEST_PARSERS.get(base)
+        rel = p.name
+        try:
+            rel = str(p)
+        except Exception:
+            pass
+        hits = []
+        if parser:
+            try:
+                hits = [(lk, nm, ver, f"{base}: {nm} {ver}")
+                        for lk, nm, ver in parser(p.read_text("utf-8", "replace"))]
+            except Exception:
+                _log.debug("manifest parse failed for %s", p, exc_info=True)
+                hits = []
+        elif base in _HEADER_VERSION:
+            lib, rx = _HEADER_VERSION[base]
+            try:
+                m = rx.search(p.read_text("utf-8", "replace"))
+            except Exception:
+                m = None
+            if m:
+                hits = [(lib, lib, m.group(1), f"{base}: {lib} {m.group(1)}")]
+        for lk, nm, ver, ev in hits:
+            found.setdefault((lk, ver), {"library": lk, "name": nm, "version": ver,
+                                         "evidence": ev})
+    return list(found.values())
+
+
+def source_cve_stage(ctx) -> dict:
+    target = TargetDAO(ctx.conn).get(ctx.target_id) if ctx.target_id else None
+    if target is None:
+        raise ValueError("source_cve_scan requires a target_id")
+    # Recover the archived source tree for this target (built-from-source projects only).
+    arts = ArtifactDAO(ctx.conn).list_by_case(target.case_id)
+    proj = next((a for a in arts if a.kind == "source-project"
+                 and (a.meta or {}).get("binary_sha") == target.sha256), None)
+    if proj is None:
+        ctx.emit("source_cve.done", payload={"applicable": False,
+                 "note": "no archived source tree (target was not built from a source project)"})
+        return {}
+    root = ctx.scratch() / "srccve"
+    root.mkdir(parents=True, exist_ok=True)
+    try:
+        with tarfile.open(fileobj=io.BytesIO(ctx.content.path(proj.sha256).read_bytes()),
+                          mode="r:gz") as tf:
+            for m in tf.getmembers():
+                if m.isfile() and not m.name.startswith("/") and ".." not in m.name:
+                    tf.extract(m, root)
+    except Exception:
+        ctx.emit("source_cve.done", payload={"applicable": False,
+                 "note": "could not unpack the archived source tree"})
+        return {}
+
+    ctx.progress(msg="parsing dependency manifests and vendored headers")
+    detected = parse_source_tree(root)
+    matches = scan.match(detected)
+
+    fd = FindingDAO(ctx.conn)
+    for m in matches:
+        disp = m["library"].split(":", 1)[-1]
+        label = f"{disp} {m['version']} — {m['cve']}"
+        cvss = f", CVSS {m['cvss']}" if m.get("cvss") else ""
+        fd.upsert(target.id, target.case_id, {
+            "cwe": m["cwe"], "severity": m["severity"], "detector": "cve_source",
+            "title": f"Vulnerable dependency: {label}",
+            "evidence": [
+                {"channel": "manifest", "detail": f"declared in source: {m['evidence']}"},
+                {"channel": "cve", "detail": f"{m['cve']}{cvss}: {m['summary']}"}]
+                + scan.exploit_evidence(m["cwe"]),
+            "function_addr": None, "site_addr": None,
+            "dedup_key": f"{m['cve']}:{m['library']}:{m['version']}",
+            "state": "corroborated", "confidence": 0.85})
+
+    ctx.emit("source_cve.done", payload={
+        "applicable": True,
+        "components": [{"library": d["library"], "version": d["version"]} for d in detected],
+        "cves": [{"cve": m["cve"], "library": m["library"], "version": m["version"],
+                  "severity": m["severity"]} for m in matches],
+        "findings": len(matches),
+        "note": None if detected else "no dependency manifests or vendored headers found"})
+    ctx.progress(pct=100, msg=f"{len(detected)} declared component(s), {len(matches)} CVE finding(s)")
+    return {}
+
+
+def register() -> None:
+    register_stage(SOURCE_CVE_STAGE, source_cve_stage, resource_class="quick",
+                   tool=TOOL, tool_version=TOOL_VERSION, timeout=120)
+
+
+def enqueue_source_cve_scan(queue, target, *, params=None, force: bool = True):
+    return queue.enqueue(target.case_id, SOURCE_CVE_STAGE, target_id=target.id,
+                         params=params or {}, input_hashes=[target.sha256], tool=TOOL,
+                         tool_version=TOOL_VERSION, resource_class="quick", force=force)

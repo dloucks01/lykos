@@ -311,4 +311,5 @@ def test_orchestrate_prove_stages_receive_params():
         assert stage not in orchestrate._NO_PARAMS, \
             f"{stage} needs params.input_sha but is marked no-param"
     assert orchestrate._NO_PARAMS == {"disassemble", "detect_cwe", "heap_trace", "oob_index",
-                                      "chain_primitive", "synthesize_poc", "firmware_carve"}
+                                      "chain_primitive", "synthesize_poc", "firmware_carve",
+                                      "source_cve_scan"}

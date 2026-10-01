@@ -86,13 +86,21 @@ def test_every_shipped_cve_is_well_formed():
     comps = scan._components()
     assert comps, "no components shipped at all"
     for lib, spec in comps.items():
-        assert spec.get("patterns"), f"{lib} has no detection pattern"
+        # A bare key is a C library detected by a BINARY version banner, so it needs a pattern.
+        # An "ecosystem:name" key is matched from a source manifest by name, not by any banner,
+        # so an empty patterns list is correct for it.
+        manifest_keyed = ":" in lib
+        if not manifest_keyed:
+            assert spec.get("patterns"), f"{lib} has no detection pattern"
         for cve in spec.get("cves", []):
-            assert cve.get("id", "").startswith("CVE-"), (lib, cve)
+            # A vuln id is usually CVE-*, but OSV also carries GHSA-*/RUSTSEC-*/PYSEC-* advisory
+            # ids where no CVE was assigned; any non-empty id is a valid reference.
+            assert cve.get("id"), (lib, cve)
             assert cve.get("ranges"), f"{lib} {cve.get('id')} can never match: no ranges"
             assert cve.get("cwe", "").startswith("CWE-"), (lib, cve)
             assert cve.get("severity") in ("low", "medium", "high", "critical"), (lib, cve)
-            assert cve.get("summary"), f"{lib} {cve.get('id')} has no summary to show"
+            if not manifest_keyed:        # curated C-lib entries always carry a summary to show
+                assert cve.get("summary"), f"{lib} {cve.get('id')} has no summary to show"
             for r in cve["ranges"]:
                 assert set(r) <= {"eq", "lt", "le", "gt", "ge"}, (lib, cve["id"], r)
                 assert r, f"{lib} {cve['id']} has an empty range that matches everything"

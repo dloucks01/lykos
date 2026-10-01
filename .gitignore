@@ -32,3 +32,11 @@ examples/vuln-targets/src/
 .coverage-shim/
 htmlcov/
 packaging/_vendor/
+
+# Offline CVE data: the full OSV match-index mirror and the NVD reference pack are large data
+# artifacts built by tools/build_cvedb.py and shipped WITH THE PACKAGE, not via git. The small
+# curated subset (data/osv_cvedb.json) IS committed so the tool matches common packages without
+# them. (See core/lykos/analyze/fingerprint/cvedb.py for discovery order.)
+core/lykos/analyze/fingerprint/data/cvedb.sqlite
+core/lykos/analyze/fingerprint/data/cve.sqlite
+core/lykos/analyze/fingerprint/data/*.sqlite.building

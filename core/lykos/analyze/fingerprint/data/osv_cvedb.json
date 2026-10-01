@@ -1,0 +1,5696 @@
+{
+ "crates:openssl": {
+  "cves": [
+   {
+    "cwe": "CWE-295",
+    "id": "CVE-2016-10931",
+    "ranges": [
+     {
+      "lt": "0.9.0"
+     }
+    ],
+    "severity": "high",
+    "summary": "Improper Certificate Validation in openssl"
+   },
+   {
+    "cwe": "CWE-1395",
+    "id": "GHSA-3gxf-9r58-2ghg",
+    "ranges": [
+     {
+      "ge": "0.9.7",
+      "lt": "0.10.48"
+     }
+    ],
+    "severity": "medium",
+    "summary": "`openssl` `X509NameBuilder::build` returned object is not thread safe"
+   },
+   {
+    "cwe": "CWE-416",
+    "id": "GHSA-4fcv-w3qc-ppgg",
+    "ranges": [
+     {
+      "ge": "0.10.39",
+      "lt": "0.10.72"
+     }
+    ],
+    "severity": "medium",
+    "summary": "rust-openssl Use-After-Free in `Md::fetch` and `Cipher::fetch`"
+   },
+   {
+    "cwe": "CWE-476",
+    "id": "GHSA-6hcf-g6gr-hhcr",
+    "ranges": [
+     {
+      "ge": "0.9.7",
+      "lt": "0.10.48"
+     }
+    ],
+    "severity": "high",
+    "summary": "`openssl` `X509Extension::new` and `X509Extension::new_nid` null pointer dereference"
+   },
+   {
+    "cwe": "CWE-787",
+    "id": "CVE-2026-41678",
+    "ranges": [
+     {
+      "ge": "0.10.24",
+      "lt": "0.10.78"
+     }
+    ],
+    "severity": "high",
+    "summary": "rust-openssl has incorrect bounds assertion in aes key wrap"
+   },
+   {
+    "cwe": "CWE-1395",
+    "id": "GHSA-9qwg-crg9-m2vc",
+    "ranges": [
+     {
+      "ge": "0.9.7",
+      "lt": "0.10.48"
+     }
+    ],
+    "severity": "high",
+    "summary": "`openssl` `SubjectAlternativeName` and `ExtendedKeyUsage::other` allow arbitrary file read"
+   },
+   {
+    "cwe": "CWE-121",
+    "id": "CVE-2026-41681",
+    "ranges": [
+     {
+      "ge": "0.10.39",
+      "lt": "0.10.78"
+     }
+    ],
+    "severity": "high",
+    "summary": "rust-openssl: rustMdCtxRef::digest_final() writes past caller buffer with no length check"
+   },
+   {
+    "cwe": "CWE-126",
+    "id": "CVE-2026-41898",
+    "ranges": [
+     {
+      "ge": "0.9.24",
+      "lt": "0.10.78"
+     }
+    ],
+    "severity": "high",
+    "summary": "rust-openssl: Unchecked callback length in PSK/cookie trampolines leaks adjacent memory to peer"
+   },
+   {
+    "cwe": "CWE-131",
+    "id": "CVE-2026-45784",
+    "ranges": [
+     {
+      "ge": "0.10.50",
+      "lt": "0.10.80"
+     }
+    ],
+    "severity": "medium",
+    "summary": "rust-openssl: Potential out-of-bounds write in `CipherCtxRef::cipher_update_inplace` for AES-KW-PAD ciphers"
+   },
+   {
+    "cwe": "CWE-131",
+    "id": "CVE-2026-41676",
+    "ranges": [
+     {
+      "ge": "0.9.27",
+      "lt": "0.10.78"
+     }
+    ],
+    "severity": "high",
+    "summary": "rust-openssl: Deriver::derive and PkeyCtxRef::derive can overflow short buffers on OpenSSL 1.1.1"
+   },
+   {
+    "cwe": "CWE-476",
+    "id": "GHSA-q445-7m23-qrmw",
+    "ranges": [
+     {
+      "lt": "0.10.66"
+     }
+    ],
+    "severity": "medium",
+    "summary": "openssl's `MemBio::get_buf` has undefined behavior with empty buffers"
+   },
+   {
+    "cwe": "CWE-416",
+    "id": "CVE-2025-24898",
+    "ranges": [
+     {
+      "ge": "0.10.0",
+      "lt": "0.10.70"
+     }
+    ],
+    "severity": "medium",
+    "summary": "rust-openssl ssl::select_next_proto use after free"
+   },
+   {
+    "cwe": "CWE-126",
+    "id": "CVE-2023-53159",
+    "ranges": [
+     {
+      "ge": "0.10.0",
+      "lt": "0.10.55"
+     }
+    ],
+    "severity": "medium",
+    "summary": "`openssl` `X509VerifyParamRef::set_host` buffer over-read"
+   },
+   {
+    "cwe": "CWE-416",
+    "id": "CVE-2018-20997",
+    "ranges": [
+     {
+      "ge": "0.10.8",
+      "lt": "0.10.9"
+     }
+    ],
+    "severity": "critical",
+    "summary": "Use after free in openssl"
+   },
+   {
+    "cwe": "CWE-125",
+    "id": "CVE-2026-41677",
+    "ranges": [
+     {
+      "ge": "0.9.0",
+      "lt": "0.10.78"
+     }
+    ],
+    "severity": "low",
+    "summary": "rust-opennssl has an Out-of-bounds read in PEM password callback when returning an oversized length"
+   },
+   {
+    "cwe": "CWE-20",
+    "id": "CVE-2026-42327",
+    "ranges": [
+     {
+      "ge": "0.9.7",
+      "lt": "0.10.79"
+     }
+    ],
+    "severity": "high",
+    "summary": "rust-openssl has undefined behavior in X509Ref::ocsp_responders for certificates with non-UTF-8 OCSP URLs"
+   },
+   {
+    "cwe": "CWE-1395",
+    "id": "GHSA-xphf-cx8h-7q9g",
+    "ranges": [
+     {
+      "ge": "0.10.29",
+      "lt": "0.10.60"
+     }
+    ],
+    "severity": "medium",
+    "summary": "`openssl` `X509StoreRef::objects` is unsound"
+   },
+   {
+    "cwe": "CWE-122",
+    "id": "CVE-2026-44662",
+    "ranges": [
+     {
+      "ge": "0.10.0",
+      "lt": "0.10.79"
+     }
+    ],
+    "severity": "medium",
+    "summary": "rust-openssl vulnerable to heap buffer overflow when encrypting with AES key-wrap-with-padding"
+   },
+   {
+    "cwe": "CWE-1395",
+    "id": "RUSTSEC-2023-0022",
+    "ranges": [
+     {
+      "ge": "0.0.0-0",
+      "lt": "0.10.48"
+     }
+    ],
+    "severity": "medium",
+    "summary": "`openssl` `X509NameBuilder::build` returned object is not thread safe"
+   },
+   {
+    "cwe": "CWE-1395",
+    "id": "RUSTSEC-2023-0023",
+    "ranges": [
+     {
+      "ge": "0.0.0-0",
+      "lt": "0.10.48"
+     }
+    ],
+    "severity": "medium",
+    "summary": "`openssl` `SubjectAlternativeName` and `ExtendedKeyUsage::other` allow arbitrary file read"
+   },
+   {
+    "cwe": "CWE-1395",
+    "id": "RUSTSEC-2023-0024",
+    "ranges": [
+     {
+      "ge": "0.0.0-0",
+      "lt": "0.10.48"
+     }
+    ],
+    "severity": "medium",
+    "summary": "`openssl` `X509Extension::new` and `X509Extension::new_nid` null pointer dereference"
+   },
+   {
+    "cwe": "CWE-1395",
+    "id": "RUSTSEC-2023-0072",
+    "ranges": [
+     {
+      "ge": "0.0.0-0",
+      "lt": "0.10.60"
+     }
+    ],
+    "severity": "medium",
+    "summary": "`openssl` `X509StoreRef::objects` is unsound"
+   },
+   {
+    "cwe": "CWE-1395",
+    "id": "RUSTSEC-2024-0357",
+    "ranges": [
+     {
+      "ge": "0.0.0-0",
+      "lt": "0.10.66"
+     }
+    ],
+    "severity": "medium",
+    "summary": "`MemBio::get_buf` has undefined behavior with empty buffers"
+   },
+   {
+    "cwe": "CWE-1395",
+    "id": "RUSTSEC-2025-0022",
+    "ranges": [
+     {
+      "ge": "0.10.39",
+      "lt": "0.10.72"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Use-After-Free in `Md::fetch` and `Cipher::fetch`"
+   }
+  ],
+  "patterns": []
+ },
+ "crates:time": {
+  "cves": [
+   {
+    "cwe": "CWE-121",
+    "id": "CVE-2026-25727",
+    "ranges": [
+     {
+      "ge": "0.3.6",
+      "lt": "0.3.47"
+     }
+    ],
+    "severity": "medium",
+    "summary": "time vulnerable to stack exhaustion Denial of Service attack"
+   },
+   {
+    "cwe": "CWE-476",
+    "id": "CVE-2020-26235",
+    "ranges": [
+     {
+      "ge": "0.1.0",
+      "lt": "0.2.23"
+     },
+     {
+      "ge": "0.2.7",
+      "lt": "0.2.23"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Segmentation fault in time"
+   }
+  ],
+  "patterns": []
+ },
+ "go:golang.org/x/net": {
+  "cves": [
+   {
+    "cwe": "CWE-476",
+    "id": "CVE-2018-17142",
+    "ranges": [
+     {
+      "lt": "0.0.0-20180925071336-cf3bd585ca2a"
+     }
+    ],
+    "severity": "high",
+    "summary": "golang.org/x/net/html NULL Pointer Dereference vulnerability"
+   },
+   {
+    "cwe": "CWE-79",
+    "id": "CVE-2023-3978",
+    "ranges": [
+     {
+      "lt": "0.13.0"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Improper rendering of text nodes in golang.org/x/net/html"
+   },
+   {
+    "cwe": "CWE-400",
+    "id": "CVE-2019-9512",
+    "ranges": [
+     {
+      "lt": "0.0.0-20190813141303-74dc4d7220e7"
+     }
+    ],
+    "severity": "high",
+    "summary": "golang.org/x/net/http vulnerable to a reset flood"
+   },
+   {
+    "cwe": "CWE-400",
+    "id": "CVE-2023-39325",
+    "ranges": [
+     {
+      "lt": "0.17.0"
+     }
+    ],
+    "severity": "high",
+    "summary": "HTTP/2 rapid reset can cause excessive work in net/http"
+   },
+   {
+    "cwe": "CWE-119",
+    "id": "CVE-2018-17847",
+    "ranges": [
+     {
+      "lt": "0.0.0-20190125002852-4b62a64f59f7"
+     }
+    ],
+    "severity": "high",
+    "summary": "golang.org/x/net/html has Improper Restriction of Operations within the Bounds of a Memory Buffer"
+   },
+   {
+    "cwe": "CWE-400",
+    "id": "CVE-2023-45288",
+    "ranges": [
+     {
+      "lt": "0.23.0"
+     }
+    ],
+    "severity": "medium",
+    "summary": "net/http, x/net/http2: close connections when receiving too many headers"
+   },
+   {
+    "cwe": "CWE-400",
+    "id": "CVE-2026-25680",
+    "ranges": [
+     {
+      "lt": "0.55.0"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Go Net HTML parser is vulnerable to denial of service"
+   },
+   {
+    "cwe": "CWE-476",
+    "id": "CVE-2018-17075",
+    "ranges": [
+     {
+      "lt": "0.0.0-20180816102801-aaf60122140d"
+     }
+    ],
+    "severity": "high",
+    "summary": "golang.org/x/net/html NULL Pointer Dereference vulnerability"
+   },
+   {
+    "cwe": "CWE-1395",
+    "id": "CVE-2022-27664",
+    "ranges": [
+     {
+      "lt": "0.0.0-20220906165146-f3363e06e74c"
+     }
+    ],
+    "severity": "high",
+    "summary": "golang.org/x/net/http2 Denial of Service vulnerability"
+   },
+   {
+    "cwe": "CWE-835",
+    "id": "CVE-2021-33194",
+    "ranges": [
+     {
+      "lt": "0.0.0-20210520170846-37e1c6afe023"
+     }
+    ],
+    "severity": "high",
+    "summary": "golang.org/x/net/html Infinite Loop vulnerability"
+   },
+   {
+    "cwe": "CWE-119",
+    "id": "CVE-2018-17143",
+    "ranges": [
+     {
+      "lt": "0.0.0-20180921000356-2f5d2388922f"
+     }
+    ],
+    "severity": "high",
+    "summary": "golang.org/x/net/html has Improper Restriction of Operations within the Bounds of a Memory Buffer"
+   },
+   {
+    "cwe": "CWE-444",
+    "id": "CVE-2022-41721",
+    "ranges": [
+     {
+      "ge": "0.0.0-20220524220425-1d687d428aca",
+      "lt": "0.1.1-0.20221104162952-702349b0e862"
+     }
+    ],
+    "severity": "high",
+    "summary": "golang.org/x/net/http2/h2c vulnerable to request smuggling attack"
+   },
+   {
+    "cwe": "CWE-674",
+    "id": "CVE-2021-31525",
+    "ranges": [
+     {
+      "lt": "0.0.0-20210428140749-89ef3d95e781"
+     }
+    ],
+    "severity": "medium",
+    "summary": "golang.org/x/net/http/httpguts vulnerable to Uncontrolled Recursion"
+   },
+   {
+    "cwe": "CWE-400",
+    "id": "CVE-2023-44487",
+    "ranges": [
+     {
+      "lt": "0.17.0"
+     }
+    ],
+    "severity": "medium",
+    "summary": "HTTP/2 Stream Cancellation Attack"
+   },
+   {
+    "cwe": "CWE-115",
+    "id": "CVE-2025-22870",
+    "ranges": [
+     {
+      "lt": "0.36.0"
+     }
+    ],
+    "severity": "medium",
+    "summary": "HTTP Proxy bypass using IPv6 Zone IDs in golang.org/x/net"
+   },
+   {
+    "cwe": "CWE-835",
+    "id": "CVE-2018-17846",
+    "ranges": [
+     {
+      "lt": "0.0.0-20190125091013-d26f9f9a57f3"
+     }
+    ],
+    "severity": "high",
+    "summary": "x/net/html Vulnerable to DoS During HTML Parsing"
+   },
+   {
+    "cwe": "CWE-79",
+    "id": "CVE-2025-22872",
+    "ranges": [
+     {
+      "lt": "0.38.0"
+     }
+    ],
+    "severity": "medium",
+    "summary": "golang.org/x/net vulnerable to Cross-site Scripting"
+   },
+   {
+    "cwe": "CWE-400",
+    "id": "CVE-2022-41723",
+    "ranges": [
+     {
+      "lt": "0.7.0"
+     }
+    ],
+    "severity": "high",
+    "summary": "golang.org/x/net vulnerable to Uncontrolled Resource Consumption"
+   },
+   {
+    "cwe": "CWE-770",
+    "id": "CVE-2022-41717",
+    "ranges": [
+     {
+      "lt": "0.4.0"
+     }
+    ],
+    "severity": "medium",
+    "summary": "golang.org/x/net/http2 vulnerable to possible excessive memory growth"
+   },
+   {
+    "cwe": "CWE-1395",
+    "id": "CVE-2021-44716",
+    "ranges": [
+     {
+      "lt": "0.0.0-20211209124913-491a49abca63"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Unbounded memory growth in net/http and golang.org/x/net/http2"
+   },
+   {
+    "cwe": "CWE-1395",
+    "id": "CVE-2024-45338",
+    "ranges": [
+     {
+      "lt": "0.33.0"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Non-linear parsing of case-insensitive content in golang.org/x/net/html"
+   },
+   {
+    "cwe": "CWE-1395",
+    "id": "CVE-2025-47911",
+    "ranges": [
+     {
+      "lt": "0.45.0"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Quadratic parsing complexity in golang.org/x/net/html"
+   },
+   {
+    "cwe": "CWE-1395",
+    "id": "CVE-2025-58190",
+    "ranges": [
+     {
+      "lt": "0.45.0"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Infinite parsing loop in golang.org/x/net"
+   },
+   {
+    "cwe": "CWE-1395",
+    "id": "CVE-2026-27141",
+    "ranges": [
+     {
+      "ge": "0.50.0",
+      "lt": "0.51.0"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Sending certain HTTP/2 frames can cause a server to panic in golang.org/x/net"
+   },
+   {
+    "cwe": "CWE-1395",
+    "id": "CVE-2026-33814",
+    "ranges": [
+     {
+      "lt": "0.53.0"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Infinite loop in HTTP/2 transport when given bad SETTINGS_MAX_FRAME_SIZE in net/http/internal/http2 in golang.org/x/net"
+   },
+   {
+    "cwe": "CWE-1395",
+    "id": "CVE-2026-42506",
+    "ranges": [
+     {
+      "lt": "0.55.0"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Invoking incorrect handling of namespaced elements in foreign content in golang.org/x/net/html"
+   },
+   {
+    "cwe": "CWE-1395",
+    "id": "CVE-2026-39821",
+    "ranges": [
+     {
+      "lt": "0.55.0"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Invoking failure to reject ASCII-only Punycode-encoded labels in golang.org/x/net/idna"
+   },
+   {
+    "cwe": "CWE-1395",
+    "id": "CVE-2026-42502",
+    "ranges": [
+     {
+      "lt": "0.55.0"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Invoking incorrect handling of HTML elements in foreign content in golang.org/x/net/html"
+   },
+   {
+    "cwe": "CWE-1395",
+    "id": "CVE-2026-25681",
+    "ranges": [
+     {
+      "lt": "0.55.0"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Invoking incorrect handling of character references in DOCTYPE nodes in golang.org/x/net/html"
+   },
+   {
+    "cwe": "CWE-1395",
+    "id": "CVE-2026-27136",
+    "ranges": [
+     {
+      "lt": "0.55.0"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Invoking duplicate attributes can cause XSS in golang.org/x/net/html"
+   },
+   {
+    "cwe": "CWE-1395",
+    "id": "CVE-2026-46600",
+    "ranges": [
+     {
+      "lt": "0.56.0"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Parsing an invalid SVCB or HTTPS RR can panic in golang.org/x/net/dns/dnsmessage"
+   }
+  ],
+  "patterns": []
+ },
+ "go:golang.org/x/text": {
+  "cves": [
+   {
+    "cwe": "CWE-400",
+    "id": "CVE-2020-14040",
+    "ranges": [
+     {
+      "lt": "0.3.3"
+     }
+    ],
+    "severity": "medium",
+    "summary": "golang.org/x/text Infinite loop"
+   },
+   {
+    "cwe": "CWE-772",
+    "id": "CVE-2022-32149",
+    "ranges": [
+     {
+      "lt": "0.3.8"
+     }
+    ],
+    "severity": "high",
+    "summary": "golang.org/x/text/language Denial of service via crafted Accept-Language header"
+   },
+   {
+    "cwe": "CWE-125",
+    "id": "CVE-2021-38561",
+    "ranges": [
+     {
+      "lt": "0.3.7"
+     }
+    ],
+    "severity": "high",
+    "summary": "golang.org/x/text/language Out-of-bounds Read vulnerability"
+   },
+   {
+    "cwe": "CWE-1395",
+    "id": "CVE-2026-56852",
+    "ranges": [
+     {
+      "lt": "0.39.0"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Infinite loop on invalid input in golang.org/x/text"
+   }
+  ],
+  "patterns": []
+ },
+ "npm:axios": {
+  "cves": [
+   {
+    "cwe": "CWE-1321",
+    "id": "CVE-2026-44494",
+    "ranges": [
+     {
+      "ge": "1.0.0",
+      "lt": "1.16.0"
+     }
+    ],
+    "severity": "high",
+    "summary": "axios Vulnerable to Full Man-in-the-Middle via Prototype Pollution Gadget in `config.proxy`"
+   },
+   {
+    "cwe": "CWE-1321",
+    "id": "CVE-2026-44495",
+    "ranges": [
+     {
+      "ge": "1.0.0",
+      "lt": "1.15.2"
+     },
+     {
+      "ge": "0.19.0",
+      "lt": "0.31.1"
+     }
+    ],
+    "severity": "high",
+    "summary": "axios Vulnerable to Credential Theft and Response Hijacking via Prototype Pollution Gadget in Config Merge"
+   },
+   {
+    "cwe": "CWE-441",
+    "id": "CVE-2025-62718",
+    "ranges": [
+     {
+      "ge": "1.0.0",
+      "lt": "1.15.0"
+     },
+     {
+      "lt": "0.31.0"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Axios has a NO_PROXY Hostname Normalization Bypass that Leads to SSRF"
+   },
+   {
+    "cwe": "CWE-918",
+    "id": "CVE-2026-101898",
+    "ranges": [
+     {
+      "ge": "1.13.0",
+      "lt": "1.20.0"
+     }
+    ],
+    "severity": "high",
+    "summary": "Axios: HTTP/2 adapter bypasses configured DNS lookup and proxy controls"
+   },
+   {
+    "cwe": "CWE-1321",
+    "id": "CVE-2026-42044",
+    "ranges": [
+     {
+      "ge": "1.0.0",
+      "lt": "1.15.2"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Axios: Invisible JSON Response Tampering via Prototype Pollution Gadget in `parseReviver`"
+   },
+   {
+    "cwe": "CWE-400",
+    "id": "CVE-2026-67313",
+    "ranges": [
+     {
+      "ge": "0.28.0",
+      "lt": "0.33.0"
+     },
+     {
+      "ge": "1.0.0",
+      "lt": "1.18.0"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Axios: Excessive recursion in formDataToJSON can cause denial of service"
+   },
+   {
+    "cwe": "CWE-20",
+    "id": "CVE-2019-10742",
+    "ranges": [
+     {
+      "lt": "0.18.1"
+     }
+    ],
+    "severity": "high",
+    "summary": "Denial of Service in axios"
+   },
+   {
+    "cwe": "CWE-1321",
+    "id": "CVE-2026-25639",
+    "ranges": [
+     {
+      "ge": "1.0.0",
+      "lt": "1.13.5"
+     },
+     {
+      "lt": "0.30.3"
+     }
+    ],
+    "severity": "high",
+    "summary": "Axios is Vulnerable to Denial of Service via __proto__ Key in mergeConfig"
+   },
+   {
+    "cwe": "CWE-93",
+    "id": "CVE-2026-42037",
+    "ranges": [
+     {
+      "ge": "1.0.0",
+      "lt": "1.15.1"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Axios: CRLF Injection in multipart/form-data body via unsanitized blob.type in formDataToStream"
+   },
+   {
+    "cwe": "CWE-693",
+    "id": "CVE-2026-101899",
+    "ranges": [
+     {
+      "ge": "1.15.0",
+      "lt": "1.20.0"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Axios: CIDR-form NO_PROXY entries are ignored, causing proxy exclusion bypass for internal IP ranges"
+   },
+   {
+    "cwe": "CWE-770",
+    "id": "CVE-2025-58754",
+    "ranges": [
+     {
+      "ge": "1.0.0",
+      "lt": "1.12.0"
+     },
+     {
+      "ge": "0.28.0",
+      "lt": "0.30.2"
+     }
+    ],
+    "severity": "high",
+    "summary": "Axios is vulnerable to DoS attack through lack of data size check"
+   },
+   {
+    "cwe": "CWE-1321",
+    "id": "CVE-2026-101900",
+    "ranges": [
+     {
+      "ge": "1.12.0",
+      "lt": "1.20.0"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Axios: Fetch Adapter Header Injection via Inherited FormData getHeaders"
+   },
+   {
+    "cwe": "CWE-918",
+    "id": "CVE-2020-28168",
+    "ranges": [
+     {
+      "lt": "0.21.1"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Axios vulnerable to Server-Side Request Forgery"
+   },
+   {
+    "cwe": "CWE-400",
+    "id": "CVE-2026-101901",
+    "ranges": [
+     {
+      "ge": "1.13.0",
+      "lt": "1.20.0"
+     }
+    ],
+    "severity": "high",
+    "summary": "Axios: Denial of Service via Unhandled 'error' Event in HTTP/2 ClientHttp2Session Initialization"
+   },
+   {
+    "cwe": "CWE-770",
+    "id": "CVE-2026-42034",
+    "ranges": [
+     {
+      "ge": "1.0.0",
+      "lt": "1.15.1"
+     },
+     {
+      "lt": "0.31.1"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Axios' HTTP adapter-streamed uploads bypass maxBodyLength when maxRedirects: 0"
+   },
+   {
+    "cwe": "CWE-674",
+    "id": "CVE-2026-42039",
+    "ranges": [
+     {
+      "ge": "1.0.0",
+      "lt": "1.15.1"
+     },
+     {
+      "lt": "0.31.1"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Axios: unbounded recursion in toFormData causes DoS via deeply nested request data"
+   },
+   {
+    "cwe": "CWE-113",
+    "id": "CVE-2026-44489",
+    "ranges": [
+     {
+      "ge": "1.15.2",
+      "lt": "1.16.0"
+     }
+    ],
+    "severity": "low",
+    "summary": "Axios has a Patch Bypass: Proxy-Authorization Header Injection via Prototype Pollution \u2014 Incomplete Null-Prototype Fix"
+   },
+   {
+    "cwe": "CWE-113",
+    "id": "CVE-2026-42035",
+    "ranges": [
+     {
+      "ge": "1.0.0",
+      "lt": "1.15.1"
+     },
+     {
+      "lt": "0.31.1"
+     }
+    ],
+    "severity": "high",
+    "summary": "Axios: Header Injection via Prototype Pollution"
+   },
+   {
+    "cwe": "CWE-770",
+    "id": "CVE-2026-44488",
+    "ranges": [
+     {
+      "ge": "1.7.0",
+      "lt": "1.16.0"
+     }
+    ],
+    "severity": "high",
+    "summary": "Allocation of Resources Without Limits or Throttling in Axios"
+   },
+   {
+    "cwe": "CWE-1321",
+    "id": "CVE-2026-67319",
+    "ranges": [
+     {
+      "ge": "0.8.0",
+      "lt": "0.33.0"
+     },
+     {
+      "ge": "1.0.0",
+      "lt": "1.18.0"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Axios: Nested axios option objects can consume polluted prototype values"
+   },
+   {
+    "cwe": "CWE-1321",
+    "id": "CVE-2026-44490",
+    "ranges": [
+     {
+      "ge": "1.0.0",
+      "lt": "1.16.0"
+     },
+     {
+      "lt": "0.32.0"
+     }
+    ],
+    "severity": "medium",
+    "summary": "axios has DoS & Header Injection via Prototype Pollution Read-Side Gadgets in axios merge functions"
+   },
+   {
+    "cwe": "CWE-918",
+    "id": "CVE-2024-39338",
+    "ranges": [
+     {
+      "ge": "1.3.2",
+      "lt": "1.7.4"
+     }
+    ],
+    "severity": "high",
+    "summary": "Server-Side Request Forgery in axios"
+   },
+   {
+    "cwe": "CWE-1321",
+    "id": "CVE-2026-101902",
+    "ranges": [
+     {
+      "ge": "0.27.2",
+      "lt": "0.34.0"
+     },
+     {
+      "ge": "1.0.0",
+      "lt": "1.20.0"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Axios: Prototype-Pollution Gadget in the Default Instance Allows Inherited Object.prototype.method to Override HTTP Method"
+   },
+   {
+    "cwe": "CWE-1333",
+    "id": "CVE-2026-101903",
+    "ranges": [
+     {
+      "ge": "1.16.1",
+      "lt": "1.20.0"
+     }
+    ],
+    "severity": "high",
+    "summary": "Axios: ReDoS in fromDataURI data: URL parser freezes the Node event loop (DoS)"
+   },
+   {
+    "cwe": "CWE-1333",
+    "id": "CVE-2021-3749",
+    "ranges": [
+     {
+      "lt": "0.21.2"
+     }
+    ],
+    "severity": "high",
+    "summary": "axios Inefficient Regular Expression Complexity vulnerability"
+   },
+   {
+    "cwe": "CWE-183",
+    "id": "CVE-2026-67315",
+    "ranges": [
+     {
+      "ge": "1.15.0",
+      "lt": "1.18.0"
+     },
+     {
+      "ge": "0.31.0",
+      "lt": "0.33.0"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Axios: NO_PROXY bypass for 0.0.0.0 local addresses in axios"
+   },
+   {
+    "cwe": "CWE-113",
+    "id": "CVE-2026-40175",
+    "ranges": [
+     {
+      "ge": "1.0.0",
+      "lt": "1.15.0"
+     },
+     {
+      "lt": "0.31.0"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Axios has Unrestricted Cloud Metadata Exfiltration via Header Injection Chain"
+   },
+   {
+    "cwe": "CWE-1321",
+    "id": "CVE-2026-67320",
+    "ranges": [
+     {
+      "ge": "0.31.1",
+      "lt": "0.33.0"
+     },
+     {
+      "ge": "1.15.2",
+      "lt": "1.18.0"
+     }
+    ],
+    "severity": "high",
+    "summary": "Axios Node HTTP adapter can use an inherited proxy after interceptor config cloning"
+   },
+   {
+    "cwe": "CWE-674",
+    "id": "CVE-2026-67321",
+    "ranges": [
+     {
+      "ge": "0.31.1",
+      "lt": "0.33.0"
+     },
+     {
+      "ge": "1.15.1",
+      "lt": "1.18.0"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Axios form serializer maxDepth bypass via {} metatoken"
+   },
+   {
+    "cwe": "CWE-1333",
+    "id": "CVE-2026-44496",
+    "ranges": [
+     {
+      "ge": "1.0.0",
+      "lt": "1.16.0"
+     },
+     {
+      "lt": "0.32.0"
+     }
+    ],
+    "severity": "high",
+    "summary": "Axios: Regular Expression Denial of Service (ReDoS) via Cookie Name Injection"
+   },
+   {
+    "cwe": "CWE-200",
+    "id": "CVE-2026-44486",
+    "ranges": [
+     {
+      "ge": "1.0.0",
+      "lt": "1.16.0"
+     },
+     {
+      "lt": "0.32.0"
+     }
+    ],
+    "severity": "high",
+    "summary": "Axios: Proxy-Authorization header leaks to redirect target when proxy is re-evaluated to direct connection"
+   },
+   {
+    "cwe": "CWE-1321",
+    "id": "CVE-2026-101904",
+    "ranges": [
+     {
+      "ge": "1.0.0",
+      "lt": "1.20.0"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Axios: Header Injection via Inherited headers After Minimal Interceptor"
+   },
+   {
+    "cwe": "CWE-770",
+    "id": "CVE-2026-67317",
+    "ranges": [
+     {
+      "ge": "1.7.0",
+      "lt": "1.18.0"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Axios: Fetch adapter `ReadableStream` uploads bypass `maxBodyLength`"
+   },
+   {
+    "cwe": "CWE-918",
+    "id": "CVE-2025-27152",
+    "ranges": [
+     {
+      "ge": "1.0.0",
+      "lt": "1.8.2"
+     },
+     {
+      "lt": "0.30.0"
+     }
+    ],
+    "severity": "high",
+    "summary": "axios Requests Vulnerable To Possible SSRF and Credential Leakage via Absolute URL"
+   },
+   {
+    "cwe": "CWE-918",
+    "id": "CVE-2026-42038",
+    "ranges": [
+     {
+      "ge": "1.0.0",
+      "lt": "1.15.1"
+     },
+     {
+      "lt": "0.31.1"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Axios: no_proxy bypass via IP alias allows SSRF"
+   },
+   {
+    "cwe": "CWE-1321",
+    "id": "CVE-2026-101905",
+    "ranges": [
+     {
+      "ge": "1.15.2",
+      "lt": "1.20.0"
+     }
+    ],
+    "severity": "high",
+    "summary": "Axios: Node HTTP adapter prototype-pollution gadget allows request socket hijack via inherited createConnection"
+   },
+   {
+    "cwe": "CWE-1333",
+    "id": "CVE-2026-101906",
+    "ranges": [
+     {
+      "ge": "1.15.0",
+      "lt": "1.20.0"
+     }
+    ],
+    "severity": "high",
+    "summary": "Axios: ReDoS (O(N\u00b2)) in shouldBypassProxy host normalization, reachable via untrusted redirect Location"
+   },
+   {
+    "cwe": "CWE-1321",
+    "id": "CVE-2026-67316",
+    "ranges": [
+     {
+      "ge": "1.0.0",
+      "lt": "1.18.0"
+     },
+     {
+      "lt": "0.33.0"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Axios: Prototype pollution gadgets can alter axios request construction"
+   },
+   {
+    "cwe": "CWE-400",
+    "id": "CVE-2026-67318",
+    "ranges": [
+     {
+      "ge": "1.13.0",
+      "lt": "1.18.0"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Axios: HTTP/2 streamed uploads bypass `maxBodyLength`"
+   },
+   {
+    "cwe": "CWE-201",
+    "id": "CVE-2026-44487",
+    "ranges": [
+     {
+      "ge": "1.0.0",
+      "lt": "1.16.0"
+     },
+     {
+      "lt": "0.32.0"
+     }
+    ],
+    "severity": "high",
+    "summary": "Axios: Proxy-Authorization Credential Leak to Origin Server Across HTTP-to-HTTPS Redirect in Axios Node.js HTTP Adapter"
+   },
+   {
+    "cwe": "CWE-1321",
+    "id": "CVE-2026-42033",
+    "ranges": [
+     {
+      "ge": "1.0.0",
+      "lt": "1.15.1"
+     },
+     {
+      "lt": "0.31.1"
+     }
+    ],
+    "severity": "high",
+    "summary": "Axios: Prototype Pollution Gadgets - Response Tampering, Data Exfiltration, and Request Hijacking"
+   },
+   {
+    "cwe": "CWE-289",
+    "id": "CVE-2026-44492",
+    "ranges": [
+     {
+      "ge": "1.15.0",
+      "lt": "1.16.0"
+     },
+     {
+      "lt": "0.32.0"
+     }
+    ],
+    "severity": "high",
+    "summary": "axios's shouldBypassProxy does not recognize IPv4-mapped IPv6 addresses, allowing NO_PROXY bypass (incomplete fix for CVE-2025-62718)"
+   },
+   {
+    "cwe": "CWE-400",
+    "id": "CVE-2026-67312",
+    "ranges": [
+     {
+      "ge": "0.28.0",
+      "lt": "0.33.0"
+     },
+     {
+      "ge": "1.0.0",
+      "lt": "1.18.0"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Axios: Deep formToJSON Key Recursion Can Cause Denial of Service"
+   },
+   {
+    "cwe": "CWE-183",
+    "id": "CVE-2026-42043",
+    "ranges": [
+     {
+      "ge": "1.0.0",
+      "lt": "1.15.1"
+     },
+     {
+      "lt": "0.31.1"
+     }
+    ],
+    "severity": "high",
+    "summary": "Axios: Incomplete Fix for CVE-2025-62718 \u2014 NO_PROXY Protection Bypassed via RFC 1122 Loopback Subnet (127.0.0.0/8) in Axios 1.15.0"
+   },
+   {
+    "cwe": "CWE-1321",
+    "id": "CVE-2026-42264",
+    "ranges": [
+     {
+      "ge": "1.0.0",
+      "lt": "1.15.2"
+     }
+    ],
+    "severity": "high",
+    "summary": "Axios has prototype pollution read-side gadgets in HTTP adapter that allow credential injection and request hijacking"
+   },
+   {
+    "cwe": "CWE-400",
+    "id": "CVE-2026-39865",
+    "ranges": [
+     {
+      "ge": "1.13.0",
+      "lt": "1.13.2"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Axios HTTP/2 Session Cleanup State Corruption Vulnerability"
+   },
+   {
+    "cwe": "CWE-441",
+    "id": "CVE-2026-101907",
+    "ranges": [
+     {
+      "ge": "1.17.0",
+      "lt": "1.20.0"
+     }
+    ],
+    "severity": "high",
+    "summary": "Axios: maxRedirects: 0 is not enforced by the fetch adapter, allowing redirect-based SSRF"
+   },
+   {
+    "cwe": "CWE-770",
+    "id": "CVE-2026-42036",
+    "ranges": [
+     {
+      "ge": "1.0.0",
+      "lt": "1.15.1"
+     },
+     {
+      "lt": "0.31.1"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Axios: HTTP adapter streamed responses bypass maxContentLength"
+   },
+   {
+    "cwe": "CWE-1321",
+    "id": "CVE-2026-101908",
+    "ranges": [
+     {
+      "ge": "1.7.0",
+      "lt": "1.20.0"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Axios: Prototype pollution gadget in fetch adapter can alter outbound requests"
+   },
+   {
+    "cwe": "CWE-1321",
+    "id": "CVE-2026-42041",
+    "ranges": [
+     {
+      "ge": "1.0.0",
+      "lt": "1.15.1"
+     },
+     {
+      "lt": "0.31.1"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Axios: Authentication Bypass via Prototype Pollution Gadget in `validateStatus` Merge Strategy"
+   },
+   {
+    "cwe": "CWE-352",
+    "id": "CVE-2023-45857",
+    "ranges": [
+     {
+      "ge": "1.0.0",
+      "lt": "1.6.0"
+     },
+     {
+      "ge": "0.8.1",
+      "lt": "0.28.0"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Axios Cross-Site Request Forgery Vulnerability"
+   },
+   {
+    "cwe": "CWE-1321",
+    "id": "CVE-2026-101909",
+    "ranges": [
+     {
+      "ge": "0.28.0",
+      "lt": "0.34.0"
+     },
+     {
+      "ge": "1.15.1",
+      "lt": "1.20.0"
+     }
+    ],
+    "severity": "high",
+    "summary": "Axios: Prototype Pollution Gadget in axios toFormData Options"
+   },
+   {
+    "cwe": "CWE-116",
+    "id": "CVE-2026-42040",
+    "ranges": [
+     {
+      "ge": "1.0.0",
+      "lt": "1.15.1"
+     },
+     {
+      "lt": "0.31.1"
+     }
+    ],
+    "severity": "low",
+    "summary": "Axios: Null Byte Injection via Reverse-Encoding in AxiosURLSearchParams"
+   },
+   {
+    "cwe": "CWE-1321",
+    "id": "CVE-2026-67314",
+    "ranges": [
+     {
+      "ge": "1.15.2",
+      "lt": "1.18.0"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Axios: Prototype pollution auth subfields can inject Basic auth"
+   },
+   {
+    "cwe": "CWE-183",
+    "id": "CVE-2026-42042",
+    "ranges": [
+     {
+      "ge": "1.0.0",
+      "lt": "1.15.1"
+     },
+     {
+      "lt": "0.31.1"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Axios: XSRF Token Cross-Origin Leakage via Prototype Pollution Gadget in `withXSRFToken` Boolean Coercion"
+   }
+  ],
+  "patterns": []
+ },
+ "npm:express": {
+  "cves": [
+   {
+    "cwe": "CWE-74",
+    "id": "CVE-2024-10491",
+    "ranges": [
+     {
+      "lt": "4.0.0-rc1"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Express ressource injection"
+   },
+   {
+    "cwe": "CWE-79",
+    "id": "CVE-2014-6393",
+    "ranges": [
+     {
+      "lt": "3.11.0"
+     },
+     {
+      "ge": "4.0.0",
+      "lt": "4.5.0"
+     }
+    ],
+    "severity": "medium",
+    "summary": "No Charset in Content-Type Header in express"
+   },
+   {
+    "cwe": "CWE-601",
+    "id": "CVE-2024-9266",
+    "ranges": [
+     {
+      "ge": "3.4.5",
+      "lt": "4.0.0-rc1"
+     }
+    ],
+    "severity": "low",
+    "summary": "Express Open Redirect vulnerability"
+   },
+   {
+    "cwe": "CWE-79",
+    "id": "CVE-2024-43796",
+    "ranges": [
+     {
+      "lt": "4.20.0"
+     },
+     {
+      "ge": "5.0.0-alpha.1",
+      "lt": "5.0.0"
+     }
+    ],
+    "severity": "low",
+    "summary": "express vulnerable to XSS via response.redirect()"
+   },
+   {
+    "cwe": "CWE-1286",
+    "id": "CVE-2024-29041",
+    "ranges": [
+     {
+      "lt": "4.19.2"
+     },
+     {
+      "ge": "5.0.0-alpha.1",
+      "lt": "5.0.0-beta.3"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Express.js Open Redirect in malformed URLs"
+   }
+  ],
+  "patterns": []
+ },
+ "npm:lodash": {
+  "cves": [
+   {
+    "cwe": "CWE-1333",
+    "id": "CVE-2020-28500",
+    "ranges": [
+     {
+      "ge": "4.0.0",
+      "lt": "4.17.21"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Regular Expression Denial of Service (ReDoS) in lodash"
+   },
+   {
+    "cwe": "CWE-77",
+    "id": "CVE-2021-23337",
+    "ranges": [
+     {
+      "lt": "4.17.21"
+     }
+    ],
+    "severity": "high",
+    "summary": "Command Injection in lodash"
+   },
+   {
+    "cwe": "CWE-400",
+    "id": "CVE-2018-16487",
+    "ranges": [
+     {
+      "lt": "4.17.11"
+     }
+    ],
+    "severity": "high",
+    "summary": "Prototype Pollution in lodash"
+   },
+   {
+    "cwe": "CWE-1321",
+    "id": "CVE-2025-13465",
+    "ranges": [
+     {
+      "lt": "4.18.0"
+     }
+    ],
+    "severity": "medium",
+    "summary": "lodash vulnerable to Prototype Pollution via array path bypass in `_.unset` and `_.omit`"
+   },
+   {
+    "cwe": "CWE-1321",
+    "id": "CVE-2018-3721",
+    "ranges": [
+     {
+      "lt": "4.17.5"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Prototype Pollution in lodash"
+   },
+   {
+    "cwe": "CWE-1321",
+    "id": "CVE-2019-10744",
+    "ranges": [
+     {
+      "lt": "4.17.12"
+     }
+    ],
+    "severity": "critical",
+    "summary": "Prototype Pollution in lodash"
+   },
+   {
+    "cwe": "CWE-1321",
+    "id": "CVE-2020-8203",
+    "ranges": [
+     {
+      "ge": "3.7.0",
+      "lt": "4.17.19"
+     }
+    ],
+    "severity": "high",
+    "summary": "Prototype Pollution in lodash"
+   },
+   {
+    "cwe": "CWE-400",
+    "id": "CVE-2019-1010266",
+    "ranges": [
+     {
+      "ge": "4.7.0",
+      "lt": "4.17.11"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Regular Expression Denial of Service (ReDoS) in lodash"
+   }
+  ],
+  "patterns": []
+ },
+ "npm:minimist": {
+  "cves": [
+   {
+    "cwe": "CWE-1321",
+    "id": "CVE-2020-7598",
+    "ranges": [
+     {
+      "lt": "0.2.1"
+     },
+     {
+      "ge": "1.0.0",
+      "lt": "1.2.3"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Prototype Pollution in minimist"
+   },
+   {
+    "cwe": "CWE-1321",
+    "id": "CVE-2021-44906",
+    "ranges": [
+     {
+      "ge": "1.0.0",
+      "lt": "1.2.6"
+     },
+     {
+      "lt": "0.2.4"
+     }
+    ],
+    "severity": "critical",
+    "summary": "Prototype Pollution in minimist"
+   }
+  ],
+  "patterns": []
+ },
+ "pypi:cryptography": {
+  "cves": [
+   {
+    "cwe": "CWE-1395",
+    "id": "GHSA-39hc-v87j-747x",
+    "ranges": [
+     {
+      "ge": "37.0.0",
+      "lt": "38.0.3"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Vulnerable OpenSSL included in cryptography wheels"
+   },
+   {
+    "cwe": "CWE-203",
+    "id": "CVE-2023-50782",
+    "ranges": [
+     {
+      "lt": "42.0.0"
+     }
+    ],
+    "severity": "high",
+    "summary": "Python Cryptography package vulnerable to Bleichenbacher timing oracle attack"
+   },
+   {
+    "cwe": "CWE-125",
+    "id": "GHSA-537c-gmf6-5ccf",
+    "ranges": [
+     {
+      "ge": "0.5.0",
+      "lt": "48.0.1"
+     }
+    ],
+    "severity": "high",
+    "summary": "Vulnerable OpenSSL included in cryptography wheels"
+   },
+   {
+    "cwe": "CWE-1395",
+    "id": "GHSA-5cpq-8wj7-hf2v",
+    "ranges": [
+     {
+      "ge": "0.5",
+      "lt": "41.0.0"
+     }
+    ],
+    "severity": "low",
+    "summary": "Vulnerable OpenSSL included in cryptography wheels"
+   },
+   {
+    "cwe": "CWE-476",
+    "id": "CVE-2024-26130",
+    "ranges": [
+     {
+      "ge": "38.0.0",
+      "lt": "42.0.4"
+     }
+    ],
+    "severity": "high",
+    "summary": "cryptography NULL pointer dereference with pkcs12.serialize_key_and_certificates when called with a non-matching certificate and private key and an hmac_hash override"
+   },
+   {
+    "cwe": "CWE-1395",
+    "id": "CVE-2024-12797",
+    "ranges": [
+     {
+      "ge": "42.0.0",
+      "lt": "44.0.1"
+     }
+    ],
+    "severity": "low",
+    "summary": "Vulnerable OpenSSL included in cryptography wheels"
+   },
+   {
+    "cwe": "CWE-476",
+    "id": "CVE-2024-0727",
+    "ranges": [
+     {
+      "lt": "42.0.2"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Null pointer dereference in PKCS12 parsing"
+   },
+   {
+    "cwe": "CWE-295",
+    "id": "CVE-2023-38325",
+    "ranges": [
+     {
+      "ge": "40.0.0",
+      "lt": "41.0.2"
+     }
+    ],
+    "severity": "high",
+    "summary": "cryptography mishandles SSH certificates"
+   },
+   {
+    "cwe": "CWE-20",
+    "id": "CVE-2018-10903",
+    "ranges": [
+     {
+      "ge": "1.9.0",
+      "lt": "2.3"
+     }
+    ],
+    "severity": "high",
+    "summary": "PyCA Cryptography vulnerable to GCM tag forgery"
+   },
+   {
+    "cwe": "CWE-208",
+    "id": "CVE-2026-69247",
+    "ranges": [
+     {
+      "ge": "44.0.0",
+      "lt": "50.0.0"
+     }
+    ],
+    "severity": "high",
+    "summary": "cryptography: PKCS#7 EnvelopedData decryption exposes a Bleichenbacher oracle through distinguishable errors and timing"
+   },
+   {
+    "cwe": "CWE-1395",
+    "id": "GHSA-h4gh-qq45-vh27",
+    "ranges": [
+     {
+      "ge": "37.0.0",
+      "lt": "43.0.1"
+     }
+    ],
+    "severity": "medium",
+    "summary": "pyca/cryptography has a vulnerable OpenSSL included in cryptography wheels"
+   },
+   {
+    "cwe": "CWE-385",
+    "id": "CVE-2020-25659",
+    "ranges": [
+     {
+      "lt": "3.2"
+     }
+    ],
+    "severity": "high",
+    "summary": "RSA decryption vulnerable to Bleichenbacher timing vulnerability"
+   },
+   {
+    "cwe": "CWE-476",
+    "id": "CVE-2023-49083",
+    "ranges": [
+     {
+      "ge": "3.1",
+      "lt": "41.0.6"
+     }
+    ],
+    "severity": "medium",
+    "summary": "cryptography vulnerable to NULL-dereference when loading PKCS7 certificates"
+   },
+   {
+    "cwe": "CWE-1395",
+    "id": "GHSA-jm77-qphf-c4w8",
+    "ranges": [
+     {
+      "ge": "0.8",
+      "lt": "41.0.3"
+     }
+    ],
+    "severity": "low",
+    "summary": "pyca/cryptography's wheels include vulnerable OpenSSL"
+   },
+   {
+    "cwe": "CWE-400",
+    "id": "CVE-2026-69249",
+    "ranges": [
+     {
+      "ge": "42.0.0",
+      "lt": "49.0.0"
+     }
+    ],
+    "severity": "high",
+    "summary": "python-cryptography: Duplicate self-signed intermediates can cause exponential path-building"
+   },
+   {
+    "cwe": "CWE-295",
+    "id": "CVE-2026-69248",
+    "ranges": [
+     {
+      "ge": "45.0.0",
+      "lt": "49.0.0"
+     }
+    ],
+    "severity": "medium",
+    "summary": "python-cryptography verifier accepts wildcard DNS names allowing escape from permittedSubtrees"
+   },
+   {
+    "cwe": "CWE-295",
+    "id": "CVE-2026-34073",
+    "ranges": [
+     {
+      "lt": "46.0.6"
+     }
+    ],
+    "severity": "low",
+    "summary": "cryptography has incomplete DNS name constraint enforcement on peer names"
+   },
+   {
+    "cwe": "CWE-119",
+    "id": "CVE-2026-39892",
+    "ranges": [
+     {
+      "ge": "45.0.0",
+      "lt": "46.0.7"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Cryptography vulnerable to buffer overflow if non-contiguous buffers were passed to APIs"
+   },
+   {
+    "cwe": "CWE-20",
+    "id": "CVE-2016-9243",
+    "ranges": [
+     {
+      "lt": "1.5.3"
+     }
+    ],
+    "severity": "high",
+    "summary": "Improper input validation in cryptography"
+   },
+   {
+    "cwe": "CWE-345",
+    "id": "CVE-2026-26007",
+    "ranges": [
+     {
+      "lt": "46.0.5"
+     }
+    ],
+    "severity": "high",
+    "summary": "cryptography Vulnerable to a Subgroup Attack Due to Missing Subgroup Validation for SECT Curves"
+   },
+   {
+    "cwe": "CWE-190",
+    "id": "CVE-2020-36242",
+    "ranges": [
+     {
+      "ge": "3.1",
+      "lt": "3.3.2"
+     }
+    ],
+    "severity": "high",
+    "summary": "PyCA Cryptography symmetrically encrypting large values can lead to integer overflow"
+   },
+   {
+    "cwe": "CWE-1395",
+    "id": "GHSA-v8gr-m533-ghj9",
+    "ranges": [
+     {
+      "ge": "2.5",
+      "lt": "41.0.4"
+     }
+    ],
+    "severity": "low",
+    "summary": "Vulnerable OpenSSL included in cryptography wheels"
+   },
+   {
+    "cwe": "CWE-754",
+    "id": "CVE-2023-23931",
+    "ranges": [
+     {
+      "ge": "1.8",
+      "lt": "39.0.1"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Cipher.update_into can corrupt memory if passed an immutable python object as the outbuf"
+   },
+   {
+    "cwe": "CWE-843",
+    "id": "CVE-2023-0286",
+    "ranges": [
+     {
+      "ge": "0.8.1",
+      "lt": "39.0.1"
+     }
+    ],
+    "severity": "high",
+    "summary": "Vulnerable OpenSSL included in cryptography wheels"
+   }
+  ],
+  "patterns": []
+ },
+ "pypi:django": {
+  "cves": [
+   {
+    "cwe": "CWE-20",
+    "id": "CVE-2012-4520",
+    "ranges": [
+     {
+      "ge": "1.3",
+      "lt": "1.3.4"
+     },
+     {
+      "ge": "1.4",
+      "lt": "1.4.2"
+     }
+    ],
+    "severity": "high",
+    "summary": "Django Allows Arbitrary URL Generation"
+   },
+   {
+    "cwe": "CWE-400",
+    "id": "CVE-2014-0481",
+    "ranges": [
+     {
+      "lt": "1.4.14"
+     },
+     {
+      "ge": "1.5",
+      "lt": "1.5.9"
+     },
+     {
+      "ge": "1.6",
+      "lt": "1.6.6"
+     }
+    ],
+    "severity": "high",
+    "summary": "Django denial of service via file upload naming"
+   },
+   {
+    "cwe": "CWE-185",
+    "id": "CVE-2018-7537",
+    "ranges": [
+     {
+      "ge": "2.0",
+      "lt": "2.0.3"
+     },
+     {
+      "ge": "1.11",
+      "lt": "1.11.11"
+     },
+     {
+      "ge": "1.8",
+      "lt": "1.8.19"
+     }
+    ],
+    "severity": "low",
+    "summary": "Django Denial-of-service possibility in truncatechars_html and truncatewords_html template filters"
+   },
+   {
+    "cwe": "CWE-89",
+    "id": "CVE-2022-28346",
+    "ranges": [
+     {
+      "ge": "2.2",
+      "lt": "2.2.28"
+     },
+     {
+      "ge": "3.2",
+      "lt": "3.2.13"
+     },
+     {
+      "ge": "4.0",
+      "lt": "4.0.4"
+     }
+    ],
+    "severity": "critical",
+    "summary": "SQL Injection in Django"
+   },
+   {
+    "cwe": "CWE-400",
+    "id": "CVE-2023-24580",
+    "ranges": [
+     {
+      "ge": "3.2a1",
+      "lt": "3.2.18"
+     },
+     {
+      "ge": "4.1a1",
+      "lt": "4.1.7"
+     },
+     {
+      "ge": "4.0a1",
+      "lt": "4.0.10"
+     }
+    ],
+    "severity": "high",
+    "summary": "Resource exhaustion in Django"
+   },
+   {
+    "cwe": "CWE-79",
+    "id": "CVE-2020-13596",
+    "ranges": [
+     {
+      "ge": "2.2a1",
+      "lt": "2.2.13"
+     },
+     {
+      "ge": "3.0a1",
+      "lt": "3.0.7"
+     }
+    ],
+    "severity": "medium",
+    "summary": "XSS in Django"
+   },
+   {
+    "cwe": "CWE-208",
+    "id": "CVE-2025-13473",
+    "ranges": [
+     {
+      "ge": "6.0a1",
+      "lt": "6.0.2"
+     },
+     {
+      "ge": "5.2a1",
+      "lt": "5.2.11"
+     },
+     {
+      "ge": "4.2a1",
+      "lt": "4.2.28"
+     }
+    ],
+    "severity": "low",
+    "summary": "Django has Observable Timing Discrepancy"
+   },
+   {
+    "cwe": "CWE-20",
+    "id": "CVE-2019-3498",
+    "ranges": [
+     {
+      "ge": "1.11a1",
+      "lt": "1.11.18"
+     },
+     {
+      "ge": "2.0a1",
+      "lt": "2.0.10"
+     },
+     {
+      "ge": "2.1a1",
+      "lt": "2.1.5"
+     }
+    ],
+    "severity": "high",
+    "summary": "Improper Input Validation in Django"
+   },
+   {
+    "cwe": "CWE-407",
+    "id": "CVE-2025-14550",
+    "ranges": [
+     {
+      "ge": "6.0a1",
+      "lt": "6.0.2"
+     },
+     {
+      "ge": "5.2a1",
+      "lt": "5.2.11"
+     },
+     {
+      "ge": "4.2a1",
+      "lt": "4.2.28"
+     }
+    ],
+    "severity": "low",
+    "summary": "Django has Inefficient Algorithmic Complexity"
+   },
+   {
+    "cwe": "CWE-601",
+    "id": "CVE-2017-7233",
+    "ranges": [
+     {
+      "ge": "1.10a1",
+      "lt": "1.10.7"
+     },
+     {
+      "ge": "1.9a1",
+      "lt": "1.9.13"
+     },
+     {
+      "ge": "1.8a1",
+      "lt": "1.8.18"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Django open redirect and possible XSS attack via user-supplied numeric redirect URLs"
+   },
+   {
+    "cwe": "CWE-1395",
+    "id": "CVE-2016-9014",
+    "ranges": [
+     {
+      "ge": "1.8a1",
+      "lt": "1.8.16"
+     },
+     {
+      "ge": "1.9a1",
+      "lt": "1.9.11"
+     },
+     {
+      "ge": "1.10a1",
+      "lt": "1.10.3"
+     }
+    ],
+    "severity": "critical",
+    "summary": "Django DNS Rebinding Vulnerability"
+   },
+   {
+    "cwe": "CWE-89",
+    "id": "CVE-2020-9402",
+    "ranges": [
+     {
+      "ge": "1.11",
+      "lt": "1.11.29"
+     },
+     {
+      "ge": "2.2",
+      "lt": "2.2.11"
+     },
+     {
+      "ge": "3.0",
+      "lt": "3.0.4"
+     }
+    ],
+    "severity": "high",
+    "summary": "SQL injection in Django"
+   },
+   {
+    "cwe": "CWE-524",
+    "id": "CVE-2026-48588",
+    "ranges": [
+     {
+      "lt": "5.2.16"
+     },
+     {
+      "ge": "6.0.0",
+      "lt": "6.0.7"
+     }
+    ],
+    "severity": "low",
+    "summary": "Django: cache middleware may expose private responses when unrelated request cookies are present"
+   },
+   {
+    "cwe": "CWE-1088",
+    "id": "CVE-2011-4137",
+    "ranges": [
+     {
+      "lt": "1.2.7"
+     },
+     {
+      "ge": "1.3",
+      "lt": "1.3.1"
+     }
+    ],
+    "severity": "high",
+    "summary": "Denial of service in django"
+   },
+   {
+    "cwe": "CWE-284",
+    "id": "CVE-2016-2048",
+    "ranges": [
+     {
+      "ge": "1.9",
+      "lt": "1.9.2"
+     }
+    ],
+    "severity": "high",
+    "summary": "Django Access Restrictions Bypass "
+   },
+   {
+    "cwe": "CWE-79",
+    "id": "CVE-2013-4249",
+    "ranges": [
+     {
+      "ge": "1.5",
+      "lt": "1.5.2"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Django cross-site scripting (XSS) vulnerability in the AdminURLFieldWidget widget"
+   },
+   {
+    "cwe": "CWE-400",
+    "id": "CVE-2013-1443",
+    "ranges": [
+     {
+      "ge": "1.4",
+      "lt": "1.4.8"
+     },
+     {
+      "ge": "1.5",
+      "lt": "1.5.4"
+     }
+    ],
+    "severity": "high",
+    "summary": "Django Denial of Service Vulnerability in the authentication framework "
+   },
+   {
+    "cwe": "CWE-407",
+    "id": "CVE-2026-1285",
+    "ranges": [
+     {
+      "ge": "6.0a1",
+      "lt": "6.0.2"
+     },
+     {
+      "ge": "5.2a1",
+      "lt": "5.2.11"
+     },
+     {
+      "ge": "4.2a1",
+      "lt": "4.2.28"
+     }
+    ],
+    "severity": "low",
+    "summary": "Django has Inefficient Algorithmic Complexity"
+   },
+   {
+    "cwe": "CWE-400",
+    "id": "CVE-2021-45115",
+    "ranges": [
+     {
+      "ge": "2.2a1",
+      "lt": "2.2.26"
+     },
+     {
+      "ge": "3.2a1",
+      "lt": "3.2.11"
+     },
+     {
+      "ge": "4.0a1",
+      "lt": "4.0.1"
+     }
+    ],
+    "severity": "high",
+    "summary": "Denial-of-service in Django"
+   },
+   {
+    "cwe": "CWE-79",
+    "id": "CVE-2008-2302",
+    "ranges": [
+     {
+      "ge": "0.91",
+      "lt": "0.91.2"
+     },
+     {
+      "ge": "0.95",
+      "lt": "0.95.3"
+     },
+     {
+      "ge": "0.96",
+      "lt": "0.96.2"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Django Cross-site scripting (XSS) vulnerability"
+   },
+   {
+    "cwe": "CWE-20",
+    "id": "CVE-2012-3443",
+    "ranges": [
+     {
+      "lt": "1.3.2"
+     },
+     {
+      "ge": "1.4",
+      "lt": "1.4.1"
+     }
+    ],
+    "severity": "high",
+    "summary": "Django Image Field Vulnerable to Image Decompression Bombs"
+   },
+   {
+    "cwe": "CWE-119",
+    "id": "CVE-2012-3444",
+    "ranges": [
+     {
+      "lt": "1.3.2"
+     },
+     {
+      "ge": "1.4",
+      "lt": "1.4.1"
+     }
+    ],
+    "severity": "high",
+    "summary": "Django vulnerable to Improper Restriction of Operations within the Bounds of a Memory Buffer"
+   },
+   {
+    "cwe": "CWE-601",
+    "id": "CVE-2018-14574",
+    "ranges": [
+     {
+      "ge": "2.0",
+      "lt": "2.0.8"
+     },
+     {
+      "ge": "1.11",
+      "lt": "1.11.15"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Django open redirect"
+   },
+   {
+    "cwe": "CWE-120",
+    "id": "CVE-2024-45230",
+    "ranges": [
+     {
+      "ge": "5.1",
+      "lt": "5.1.1"
+     },
+     {
+      "ge": "5.0",
+      "lt": "5.0.9"
+     },
+     {
+      "ge": "4.2",
+      "lt": "4.2.16"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Django vulnerable to denial-of-service attack via the urlize() and urlizetrunc() template filters"
+   },
+   {
+    "cwe": "CWE-524",
+    "id": "CVE-2026-6907",
+    "ranges": [
+     {
+      "ge": "6.0",
+      "lt": "6.0.5"
+     },
+     {
+      "ge": "5.2",
+      "lt": "5.2.14"
+     }
+    ],
+    "severity": "low",
+    "summary": "Django Uses Cache Containing Sensitive Information"
+   },
+   {
+    "cwe": "CWE-352",
+    "id": "CVE-2011-0696",
+    "ranges": [
+     {
+      "ge": "1.1",
+      "lt": "1.1.4"
+     },
+     {
+      "ge": "1.2",
+      "lt": "1.2.5"
+     }
+    ],
+    "severity": "high",
+    "summary": "Cross-site request forgery in Django"
+   },
+   {
+    "cwe": "CWE-407",
+    "id": "CVE-2026-33033",
+    "ranges": [
+     {
+      "ge": "6.0",
+      "lt": "6.0.4"
+     },
+     {
+      "ge": "5.2",
+      "lt": "5.2.13"
+     },
+     {
+      "ge": "4.2",
+      "lt": "4.2.30"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Django has potential DoS via MultiPartParser through crafted multipart uploads"
+   },
+   {
+    "cwe": "CWE-287",
+    "id": "CVE-2014-0482",
+    "ranges": [
+     {
+      "lt": "1.4.14"
+     },
+     {
+      "ge": "1.5",
+      "lt": "1.5.9"
+     },
+     {
+      "ge": "1.6",
+      "lt": "1.6.6"
+     },
+     {
+      "ge": "1.7a1",
+      "lt": "1.7c3"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Django Middleware Enables Session Hijacking"
+   },
+   {
+    "cwe": "CWE-89",
+    "id": "CVE-2026-1312",
+    "ranges": [
+     {
+      "ge": "6.0a1",
+      "lt": "6.0.2"
+     },
+     {
+      "ge": "5.2a1",
+      "lt": "5.2.11"
+     },
+     {
+      "ge": "4.2a1",
+      "lt": "4.2.28"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Django has an SQL Injection issue"
+   },
+   {
+    "cwe": "CWE-79",
+    "id": "CVE-2015-2241",
+    "ranges": [
+     {
+      "lt": "1.7.6"
+     },
+     {
+      "ge": "1.8a1",
+      "lt": "1.8b2"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Django Cross-site Scripting Vulnerability"
+   },
+   {
+    "cwe": "CWE-22",
+    "id": "CVE-2021-33203",
+    "ranges": [
+     {
+      "lt": "2.2.24"
+     },
+     {
+      "ge": "3.0",
+      "lt": "3.1.12"
+     },
+     {
+      "ge": "3.2",
+      "lt": "3.2.4"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Path Traversal in Django"
+   },
+   {
+    "cwe": "CWE-1321",
+    "id": "CVE-2019-11358",
+    "ranges": [
+     {
+      "ge": "2.0a1",
+      "lt": "2.1.9"
+     },
+     {
+      "ge": "2.2a1",
+      "lt": "2.2.2"
+     }
+    ],
+    "severity": "medium",
+    "summary": "XSS in jQuery as used in Drupal, Backdrop CMS, and other products"
+   },
+   {
+    "cwe": "CWE-319",
+    "id": "CVE-2019-12781",
+    "ranges": [
+     {
+      "ge": "2.1",
+      "lt": "2.1.10"
+     },
+     {
+      "ge": "2.2",
+      "lt": "2.2.3"
+     },
+     {
+      "ge": "1.11",
+      "lt": "1.11.22"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Django Incorrect HTTP detection with reverse-proxy connecting via HTTPS"
+   },
+   {
+    "cwe": "CWE-835",
+    "id": "CVE-2022-23833",
+    "ranges": [
+     {
+      "ge": "2.2",
+      "lt": "2.2.27"
+     },
+     {
+      "ge": "3.2",
+      "lt": "3.2.12"
+     },
+     {
+      "ge": "4.0",
+      "lt": "4.0.2"
+     }
+    ],
+    "severity": "high",
+    "summary": "Infinite Loop in Django"
+   },
+   {
+    "cwe": "CWE-770",
+    "id": "CVE-2015-0222",
+    "ranges": [
+     {
+      "ge": "1.6",
+      "lt": "1.6.10"
+     },
+     {
+      "ge": "1.7",
+      "lt": "1.7.3"
+     }
+    ],
+    "severity": "high",
+    "summary": "Django database denial-of-service with ModelMultipleChoiceField"
+   },
+   {
+    "cwe": "CWE-522",
+    "id": "CVE-2018-16984",
+    "ranges": [
+     {
+      "ge": "2.1",
+      "lt": "2.1.2"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Django allows unprivileged users to read the password hashes of arbitrary accounts"
+   },
+   {
+    "cwe": "CWE-89",
+    "id": "CVE-2019-14234",
+    "ranges": [
+     {
+      "ge": "1.11a1",
+      "lt": "1.11.23"
+     },
+     {
+      "ge": "2.1a1",
+      "lt": "2.1.11"
+     },
+     {
+      "ge": "2.2a1",
+      "lt": "2.2.4"
+     }
+    ],
+    "severity": "critical",
+    "summary": "SQL Injection in Django"
+   },
+   {
+    "cwe": "CWE-89",
+    "id": "CVE-2025-57833",
+    "ranges": [
+     {
+      "lt": "4.2.24"
+     },
+     {
+      "ge": "5.0a1",
+      "lt": "5.1.12"
+     },
+     {
+      "ge": "5.2a1",
+      "lt": "5.2.6"
+     }
+    ],
+    "severity": "high",
+    "summary": "Django is subject to SQL injection through its column aliases"
+   },
+   {
+    "cwe": "CWE-200",
+    "id": "CVE-2015-8213",
+    "ranges": [
+     {
+      "ge": "1.7",
+      "lt": "1.7.11"
+     },
+     {
+      "ge": "1.8a1",
+      "lt": "1.8.7"
+     },
+     {
+      "ge": "1.9a1",
+      "lt": "1.9rc2"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Django settings leak in date template filter"
+   },
+   {
+    "cwe": "CWE-384",
+    "id": "CVE-2015-3982",
+    "ranges": [
+     {
+      "ge": "1.8a1",
+      "lt": "1.8.2"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Django allows user sessions hijacking via an empty string in the session key"
+   },
+   {
+    "cwe": "CWE-79",
+    "id": "CVE-2012-3442",
+    "ranges": [
+     {
+      "lt": "1.3.2"
+     },
+     {
+      "ge": "1.4",
+      "lt": "1.4.1"
+     }
+    ],
+    "severity": "critical",
+    "summary": "Django Allows Redirect via Data URL"
+   },
+   {
+    "cwe": "CWE-130",
+    "id": "CVE-2024-41990",
+    "ranges": [
+     {
+      "ge": "5.0",
+      "lt": "5.0.8"
+     },
+     {
+      "ge": "4.2",
+      "lt": "4.2.15"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Django vulnerable to a denial-of-service attack"
+   },
+   {
+    "cwe": "CWE-79",
+    "id": "CVE-2015-2317",
+    "ranges": [
+     {
+      "lt": "1.4.20"
+     },
+     {
+      "ge": "1.5",
+      "lt": "1.6.11"
+     },
+     {
+      "ge": "1.7",
+      "lt": "1.7.7"
+     },
+     {
+      "ge": "1.8a1",
+      "lt": "1.8c1"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Django cross-site scripting (XSS) attack via user-supplied redirect URLs"
+   },
+   {
+    "cwe": "CWE-22",
+    "id": "CVE-2011-0698",
+    "ranges": [
+     {
+      "ge": "1.1",
+      "lt": "1.1.4"
+     },
+     {
+      "ge": "1.2",
+      "lt": "1.2.5"
+     }
+    ],
+    "severity": "critical",
+    "summary": "Directory traversal in Django"
+   },
+   {
+    "cwe": "CWE-539",
+    "id": "CVE-2026-35192",
+    "ranges": [
+     {
+      "ge": "6.0",
+      "lt": "6.0.5"
+     },
+     {
+      "ge": "5.2",
+      "lt": "5.2.14"
+     }
+    ],
+    "severity": "low",
+    "summary": "Django Uses Persistent Cookies Containing Sensitive Information "
+   },
+   {
+    "cwe": "CWE-1284",
+    "id": "CVE-2023-41164",
+    "ranges": [
+     {
+      "ge": "3.2",
+      "lt": "3.2.21"
+     },
+     {
+      "ge": "4.1",
+      "lt": "4.1.11"
+     },
+     {
+      "ge": "4.2",
+      "lt": "4.2.5"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Django Denial of service vulnerability in django.utils.encoding.uri_to_iri"
+   },
+   {
+    "cwe": "CWE-290",
+    "id": "CVE-2015-0219",
+    "ranges": [
+     {
+      "lt": "1.4.18"
+     },
+     {
+      "ge": "1.6",
+      "lt": "1.6.10"
+     },
+     {
+      "ge": "1.7",
+      "lt": "1.7.3"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Django WSGI Header Spoofing Vulnerability"
+   },
+   {
+    "cwe": "CWE-79",
+    "id": "CVE-2019-12308",
+    "ranges": [
+     {
+      "ge": "1.11a1",
+      "lt": "1.11.21"
+     },
+     {
+      "ge": "2.1a1",
+      "lt": "2.1.9"
+     },
+     {
+      "ge": "2.2a1",
+      "lt": "2.2.2"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Django Cross-site Scripting in AdminURLFieldWidget"
+   },
+   {
+    "cwe": "CWE-20",
+    "id": "CVE-2010-4535",
+    "ranges": [
+     {
+      "lt": "1.1.3"
+     },
+     {
+      "ge": "1.2",
+      "lt": "1.2.4"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Improper date handling in Django"
+   },
+   {
+    "cwe": "CWE-117",
+    "id": "CVE-2025-48432",
+    "ranges": [
+     {
+      "ge": "5.2",
+      "lt": "5.2.2"
+     },
+     {
+      "ge": "5.0a1",
+      "lt": "5.1.10"
+     },
+     {
+      "lt": "4.2.22"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Django Improper Output Neutralization for Logs vulnerability"
+   },
+   {
+    "cwe": "CWE-770",
+    "id": "CVE-2024-53907",
+    "ranges": [
+     {
+      "ge": "5.1.0",
+      "lt": "5.1.4"
+     },
+     {
+      "ge": "4.2.0",
+      "lt": "4.2.17"
+     },
+     {
+      "ge": "5.0.0",
+      "lt": "5.0.10"
+     },
+     {
+      "ge": "5.1",
+      "lt": "5.1.4"
+     },
+     {
+      "ge": "5.0",
+      "lt": "5.0.10"
+     },
+     {
+      "ge": "4.2",
+      "lt": "4.2.17"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Django denial-of-service in django.utils.html.strip_tags()"
+   },
+   {
+    "cwe": "CWE-200",
+    "id": "CVE-2014-0473",
+    "ranges": [
+     {
+      "lt": "1.4.11"
+     },
+     {
+      "ge": "1.5",
+      "lt": "1.5.6"
+     },
+     {
+      "ge": "1.6",
+      "lt": "1.6.3"
+     }
+    ],
+    "severity": "high",
+    "summary": "Django Reuses Cached CSRF Token"
+   },
+   {
+    "cwe": "CWE-20",
+    "id": "CVE-2021-45116",
+    "ranges": [
+     {
+      "ge": "2.2",
+      "lt": "2.2.26"
+     },
+     {
+      "ge": "3.2",
+      "lt": "3.2.11"
+     },
+     {
+      "ge": "4.0",
+      "lt": "4.0.1"
+     }
+    ],
+    "severity": "high",
+    "summary": "Information disclosure in Django"
+   },
+   {
+    "cwe": "CWE-178",
+    "id": "CVE-2026-8404",
+    "ranges": [
+     {
+      "lt": "5.2.15"
+     },
+     {
+      "ge": "6.0.0",
+      "lt": "6.0.6"
+     }
+    ],
+    "severity": "low",
+    "summary": "Django: UpdateCacheMiddleware may disclose cached responses due to case-sensitive Cache-Control handling"
+   },
+   {
+    "cwe": "CWE-770",
+    "id": "CVE-2025-32873",
+    "ranges": [
+     {
+      "ge": "4.2",
+      "lt": "4.2.21"
+     },
+     {
+      "ge": "5.1",
+      "lt": "5.1.9"
+     },
+     {
+      "ge": "5.2",
+      "lt": "5.2.1"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Django has a denial-of-service possibility in strip_tags()"
+   },
+   {
+    "cwe": "CWE-79",
+    "id": "CVE-2011-0697",
+    "ranges": [
+     {
+      "ge": "1.1",
+      "lt": "1.1.4"
+     },
+     {
+      "ge": "1.2",
+      "lt": "1.2.5"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Cross-site scripting in django"
+   },
+   {
+    "cwe": "CWE-400",
+    "id": "CVE-2026-25673",
+    "ranges": [
+     {
+      "ge": "6.0",
+      "lt": "6.0.3"
+     },
+     {
+      "ge": "5.2",
+      "lt": "5.2.12"
+     },
+     {
+      "ge": "4.2",
+      "lt": "4.2.29"
+     }
+    ],
+    "severity": "high",
+    "summary": "Django vulnerable to Uncontrolled Resource Consumption"
+   },
+   {
+    "cwe": "CWE-144",
+    "id": "CVE-2026-53878",
+    "ranges": [
+     {
+      "lt": "5.2.16"
+     },
+     {
+      "ge": "6.0.0",
+      "lt": "6.0.7"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Django: DomainNameValidator permits newline characters that may enable HTTP header injection"
+   },
+   {
+    "cwe": "CWE-494",
+    "id": "CVE-2022-36359",
+    "ranges": [
+     {
+      "lt": "3.2.15"
+     },
+     {
+      "ge": "4.0",
+      "lt": "4.0.7"
+     }
+    ],
+    "severity": "high",
+    "summary": "Django vulnerable to Reflected File Download attack"
+   },
+   {
+    "cwe": "CWE-1023",
+    "id": "CVE-2026-48587",
+    "ranges": [
+     {
+      "lt": "5.2.15"
+     },
+     {
+      "ge": "6.0.0",
+      "lt": "6.0.6"
+     }
+    ],
+    "severity": "low",
+    "summary": "Django: has_vary_header may expose cached responses when Vary values contain whitespace"
+   },
+   {
+    "cwe": "CWE-770",
+    "id": "CVE-2026-33034",
+    "ranges": [
+     {
+      "ge": "6.0",
+      "lt": "6.0.4"
+     },
+     {
+      "ge": "5.2",
+      "lt": "5.2.13"
+     },
+     {
+      "ge": "4.2",
+      "lt": "4.2.30"
+     }
+    ],
+    "severity": "high",
+    "summary": "Django: SGI requests with a missing or understated `Content-Length` header could bypass the `DATA_UPLOAD_MAX_MEMORY_SIZE` limit"
+   },
+   {
+    "cwe": "CWE-79",
+    "id": "CVE-2022-22818",
+    "ranges": [
+     {
+      "ge": "2.2",
+      "lt": "2.2.27"
+     },
+     {
+      "ge": "3.2",
+      "lt": "3.2.12"
+     },
+     {
+      "ge": "4.0",
+      "lt": "4.0.2"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Cross-site Scripting in Django"
+   },
+   {
+    "cwe": "CWE-79",
+    "id": "CVE-2013-6044",
+    "ranges": [
+     {
+      "ge": "1.4",
+      "lt": "1.4.6"
+     },
+     {
+      "ge": "1.5",
+      "lt": "1.5.2"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Django cross-site scripting (XSS) vulnerability via is_safe_url function "
+   },
+   {
+    "cwe": "CWE-22",
+    "id": "CVE-2024-39330",
+    "ranges": [
+     {
+      "ge": "5.0",
+      "lt": "5.0.7"
+     },
+     {
+      "ge": "4.2",
+      "lt": "4.2.14"
+     }
+    ],
+    "severity": "high",
+    "summary": "Django Path Traversal vulnerability"
+   },
+   {
+    "cwe": "CWE-79",
+    "id": "CVE-2017-12794",
+    "ranges": [
+     {
+      "ge": "1.10a1",
+      "lt": "1.10.8"
+     },
+     {
+      "ge": "1.11a1",
+      "lt": "1.11.5"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Django vulnerable to XSS on 500 pages"
+   },
+   {
+    "cwe": "CWE-400",
+    "id": "CVE-2007-5712",
+    "ranges": [
+     {
+      "ge": "0.96.0",
+      "lt": "0.96.1"
+     },
+     {
+      "ge": "0.95",
+      "lt": "0.95.2"
+     },
+     {
+      "ge": "0.91.0",
+      "lt": "0.91.1"
+     }
+    ],
+    "severity": "high",
+    "summary": "Django vulnerable to Denial of Service via i18n middleware component"
+   },
+   {
+    "cwe": "CWE-22",
+    "id": "CVE-2009-2659",
+    "ranges": [
+     {
+      "ge": "0.96.0",
+      "lt": "0.96.4"
+     },
+     {
+      "ge": "1.0",
+      "lt": "1.0.3"
+     }
+    ],
+    "severity": "high",
+    "summary": "Django Admin Media Handler Vulnerable to Directory Traversal"
+   },
+   {
+    "cwe": "CWE-400",
+    "id": "CVE-2019-14232",
+    "ranges": [
+     {
+      "ge": "1.11a1",
+      "lt": "1.11.23"
+     },
+     {
+      "ge": "2.1a1",
+      "lt": "2.1.11"
+     },
+     {
+      "ge": "2.2a1",
+      "lt": "2.2.4"
+     }
+    ],
+    "severity": "high",
+    "summary": "Django Denial-of-service in django.utils.text.Truncator"
+   },
+   {
+    "cwe": "CWE-79",
+    "id": "CVE-2016-6186",
+    "ranges": [
+     {
+      "lt": "1.8.14"
+     },
+     {
+      "ge": "1.9",
+      "lt": "1.9.8"
+     },
+     {
+      "ge": "1.10a1",
+      "lt": "1.10rc1"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Django Cross-site scripting Vulnerability"
+   },
+   {
+    "cwe": "CWE-1333",
+    "id": "CVE-2015-5145",
+    "ranges": [
+     {
+      "ge": "1.8a1",
+      "lt": "1.8.3"
+     }
+    ],
+    "severity": "high",
+    "summary": "Django ReDoS in validators.URLValidator"
+   },
+   {
+    "cwe": "CWE-805",
+    "id": "CVE-2026-53877",
+    "ranges": [
+     {
+      "lt": "5.2.16"
+     },
+     {
+      "ge": "6.0.0",
+      "lt": "6.0.7"
+     }
+    ],
+    "severity": "medium",
+    "summary": " Django: GDALRaster may over-read heap memory when constructed from bytes"
+   },
+   {
+    "cwe": "CWE-1395",
+    "id": "CVE-2016-7401",
+    "ranges": [
+     {
+      "lt": "1.8.15"
+     },
+     {
+      "ge": "1.9",
+      "lt": "1.9.10"
+     }
+    ],
+    "severity": "high",
+    "summary": "Django CSRF Protection Bypass"
+   },
+   {
+    "cwe": "CWE-130",
+    "id": "CVE-2024-39614",
+    "ranges": [
+     {
+      "ge": "5.0",
+      "lt": "5.0.7"
+     },
+     {
+      "ge": "4.2",
+      "lt": "4.2.14"
+     }
+    ],
+    "severity": "high",
+    "summary": "Django vulnerable to Denial of Service"
+   },
+   {
+    "cwe": "CWE-20",
+    "id": "CVE-2014-0480",
+    "ranges": [
+     {
+      "lt": "1.4.14"
+     },
+     {
+      "ge": "1.5",
+      "lt": "1.5.9"
+     },
+     {
+      "ge": "1.6",
+      "lt": "1.6.6"
+     }
+    ],
+    "severity": "high",
+    "summary": "Django Incorrectly Validates URLs"
+   },
+   {
+    "cwe": "CWE-200",
+    "id": "CVE-2016-2513",
+    "ranges": [
+     {
+      "lt": "1.8.10"
+     },
+     {
+      "ge": "1.9",
+      "lt": "1.9.3"
+     }
+    ],
+    "severity": "low",
+    "summary": "Django User Enumeration Vulnerability"
+   },
+   {
+    "cwe": "CWE-276",
+    "id": "CVE-2020-24584",
+    "ranges": [
+     {
+      "ge": "2.2",
+      "lt": "2.2.16"
+     },
+     {
+      "ge": "3.0",
+      "lt": "3.0.10"
+     },
+     {
+      "ge": "3.1",
+      "lt": "3.1.1"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Django Incorrect Default Permissions"
+   },
+   {
+    "cwe": "CWE-89",
+    "id": "CVE-2025-64459",
+    "ranges": [
+     {
+      "ge": "5.2a1",
+      "lt": "5.2.8"
+     },
+     {
+      "ge": "5.0a1",
+      "lt": "5.1.14"
+     },
+     {
+      "lt": "4.2.26"
+     }
+    ],
+    "severity": "critical",
+    "summary": "Django vulnerable to SQL injection via _connector keyword argument in QuerySet and Q objects."
+   },
+   {
+    "cwe": "CWE-22",
+    "id": "CVE-2021-3281",
+    "ranges": [
+     {
+      "ge": "2.2",
+      "lt": "2.2.18"
+     },
+     {
+      "ge": "3.1",
+      "lt": "3.1.6"
+     },
+     {
+      "ge": "3.0",
+      "lt": "3.0.12"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Django Directory Traversal via archive.extract"
+   },
+   {
+    "cwe": "CWE-20",
+    "id": "CVE-2010-4534",
+    "ranges": [
+     {
+      "lt": "1.1.3"
+     },
+     {
+      "ge": "1.2",
+      "lt": "1.2.4"
+     }
+    ],
+    "severity": "high",
+    "summary": "Improper query string handling in Django"
+   },
+   {
+    "cwe": "CWE-79",
+    "id": "CVE-2010-3082",
+    "ranges": [
+     {
+      "ge": "1.2",
+      "lt": "1.2.2"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Cross-site scripting in django"
+   },
+   {
+    "cwe": "CWE-400",
+    "id": "CVE-2013-0306",
+    "ranges": [
+     {
+      "ge": "1.3",
+      "lt": "1.3.6"
+     },
+     {
+      "ge": "1.4",
+      "lt": "1.4.4"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Django is vulnerable to Denial of Service attack in formset "
+   },
+   {
+    "cwe": "CWE-79",
+    "id": "CVE-2015-0220",
+    "ranges": [
+     {
+      "lt": "1.4.18"
+     },
+     {
+      "ge": "1.6",
+      "lt": "1.6.10"
+     },
+     {
+      "ge": "1.7",
+      "lt": "1.7.3"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Django Cross-site Scripting Vulnerability"
+   },
+   {
+    "cwe": "CWE-89",
+    "id": "CVE-2026-1287",
+    "ranges": [
+     {
+      "ge": "6.0a1",
+      "lt": "6.0.2"
+     },
+     {
+      "ge": "5.2a1",
+      "lt": "5.2.11"
+     },
+     {
+      "ge": "4.2a1",
+      "lt": "4.2.28"
+     }
+    ],
+    "severity": "high",
+    "summary": "Django has an SQL Injection issue"
+   },
+   {
+    "cwe": "CWE-601",
+    "id": "CVE-2017-7234",
+    "ranges": [
+     {
+      "ge": "1.10",
+      "lt": "1.10.7"
+     },
+     {
+      "ge": "1.9",
+      "lt": "1.9.13"
+     },
+     {
+      "ge": "1.8",
+      "lt": "1.8.18"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Django open redirect"
+   },
+   {
+    "cwe": "CWE-770",
+    "id": "CVE-2015-5143",
+    "ranges": [
+     {
+      "lt": "1.4.21"
+     },
+     {
+      "ge": "1.5",
+      "lt": "1.7.9"
+     },
+     {
+      "ge": "1.8",
+      "lt": "1.8.3"
+     }
+    ],
+    "severity": "high",
+    "summary": "Django Denial-of-service by filling session store"
+   },
+   {
+    "cwe": "CWE-400",
+    "id": "CVE-2019-14233",
+    "ranges": [
+     {
+      "ge": "1.11a1",
+      "lt": "1.11.23"
+     },
+     {
+      "ge": "2.1a1",
+      "lt": "2.1.11"
+     },
+     {
+      "ge": "2.2a1",
+      "lt": "2.2.4"
+     }
+    ],
+    "severity": "high",
+    "summary": "Django Denial-of-service in strip_tags()"
+   },
+   {
+    "cwe": "CWE-347",
+    "id": "CVE-2026-6873",
+    "ranges": [
+     {
+      "lt": "5.2.15"
+     },
+     {
+      "ge": "6.0.0",
+      "lt": "6.0.6"
+     }
+    ],
+    "severity": "low",
+    "summary": "Django: signed cookies are vulnerable to salt namespace collisions"
+   },
+   {
+    "cwe": "CWE-1284",
+    "id": "CVE-2023-43665",
+    "ranges": [
+     {
+      "ge": "3.2a1",
+      "lt": "3.2.22"
+     },
+     {
+      "ge": "4.1a1",
+      "lt": "4.1.12"
+     },
+     {
+      "ge": "4.2a1",
+      "lt": "4.2.6"
+     }
+    ],
+    "severity": "high",
+    "summary": "Django Denial-of-service in django.utils.text.Truncator"
+   },
+   {
+    "cwe": "CWE-352",
+    "id": "CVE-2011-4140",
+    "ranges": [
+     {
+      "le": "1.2.7"
+     },
+     {
+      "ge": "1.3",
+      "le": "1.3.1"
+     }
+    ],
+    "severity": "high",
+    "summary": "Django Cross-Site Request Forgery vulnerability"
+   },
+   {
+    "cwe": "CWE-89",
+    "id": "CVE-2020-7471",
+    "ranges": [
+     {
+      "lt": "1.11.28"
+     },
+     {
+      "ge": "2.0",
+      "lt": "2.2.10"
+     },
+     {
+      "ge": "3.0",
+      "lt": "3.0.3"
+     }
+    ],
+    "severity": "critical",
+    "summary": "SQL injection in Django"
+   },
+   {
+    "cwe": "CWE-89",
+    "id": "CVE-2025-59681",
+    "ranges": [
+     {
+      "ge": "4.2",
+      "lt": "4.2.25"
+     },
+     {
+      "ge": "5.1",
+      "lt": "5.1.13"
+     },
+     {
+      "ge": "5.2",
+      "lt": "5.2.7"
+     }
+    ],
+    "severity": "high",
+    "summary": "Django vulnerable to SQL injection in column aliases"
+   },
+   {
+    "cwe": "CWE-276",
+    "id": "CVE-2019-19118",
+    "ranges": [
+     {
+      "ge": "2.1",
+      "lt": "2.1.15"
+     },
+     {
+      "ge": "2.2",
+      "lt": "2.2.8"
+     }
+    ],
+    "severity": "high",
+    "summary": "Django allows unintended model editing"
+   },
+   {
+    "cwe": "CWE-770",
+    "id": "CVE-2015-2316",
+    "ranges": [
+     {
+      "ge": "1.6",
+      "lt": "1.6.11"
+     },
+     {
+      "ge": "1.7",
+      "lt": "1.7.7"
+     },
+     {
+      "ge": "1.8a1",
+      "lt": "1.8c1"
+     }
+    ],
+    "severity": "high",
+    "summary": "Django Denial-of-service possibility with strip_tags"
+   },
+   {
+    "cwe": "CWE-1333",
+    "id": "CVE-2023-36053",
+    "ranges": [
+     {
+      "ge": "3.2a1",
+      "lt": "3.2.20"
+     },
+     {
+      "ge": "4.0a1",
+      "lt": "4.1.10"
+     },
+     {
+      "ge": "4.2a1",
+      "lt": "4.2.3"
+     }
+    ],
+    "severity": "high",
+    "summary": "Django has regular expression denial of service vulnerability in EmailValidator/URLValidator"
+   },
+   {
+    "cwe": "CWE-400",
+    "id": "CVE-2024-41989",
+    "ranges": [
+     {
+      "ge": "5.0",
+      "lt": "5.0.8"
+     },
+     {
+      "ge": "4.2",
+      "lt": "4.2.15"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Django memory consumption vulnerability"
+   },
+   {
+    "cwe": "CWE-400",
+    "id": "CVE-2015-0221",
+    "ranges": [
+     {
+      "lt": "1.4.18"
+     },
+     {
+      "ge": "1.6",
+      "lt": "1.6.10"
+     },
+     {
+      "ge": "1.7",
+      "lt": "1.7.3"
+     }
+    ],
+    "severity": "high",
+    "summary": "Django DoS in django.views.static.serve"
+   },
+   {
+    "cwe": "CWE-22",
+    "id": "CVE-2021-45452",
+    "ranges": [
+     {
+      "ge": "2.2",
+      "lt": "2.2.26"
+     },
+     {
+      "ge": "3.2",
+      "lt": "3.2.11"
+     },
+     {
+      "ge": "4.0",
+      "lt": "4.0.1"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Directory-traversal in Django"
+   },
+   {
+    "cwe": "CWE-276",
+    "id": "CVE-2020-24583",
+    "ranges": [
+     {
+      "ge": "2.2a1",
+      "lt": "2.2.16"
+     },
+     {
+      "ge": "3.0a1",
+      "lt": "3.0.10"
+     },
+     {
+      "ge": "3.1a1",
+      "lt": "3.1.1"
+     }
+    ],
+    "severity": "high",
+    "summary": "Django Incorrect Default Permissions"
+   },
+   {
+    "cwe": "CWE-89",
+    "id": "CVE-2024-53908",
+    "ranges": [
+     {
+      "ge": "5.0.0",
+      "lt": "5.0.10"
+     },
+     {
+      "ge": "5.1.0",
+      "lt": "5.1.4"
+     },
+     {
+      "ge": "4.2.0",
+      "lt": "4.2.17"
+     },
+     {
+      "ge": "5.1",
+      "lt": "5.1.4"
+     },
+     {
+      "ge": "5.0",
+      "lt": "5.0.10"
+     },
+     {
+      "ge": "4.2",
+      "lt": "4.2.17"
+     }
+    ],
+    "severity": "high",
+    "summary": "Django SQL injection in HasKey(lhs, rhs) on Oracle"
+   },
+   {
+    "cwe": "CWE-362",
+    "id": "CVE-2026-25674",
+    "ranges": [
+     {
+      "ge": "6.0",
+      "lt": "6.0.3"
+     },
+     {
+      "ge": "5.2",
+      "lt": "5.2.12"
+     },
+     {
+      "ge": "4.2",
+      "lt": "4.2.29"
+     }
+    ],
+    "severity": "low",
+    "summary": "Django has a Race Condition vulnerability"
+   },
+   {
+    "cwe": "CWE-319",
+    "id": "CVE-2026-7666",
+    "ranges": [
+     {
+      "ge": "5.2",
+      "lt": "5.2.15"
+     },
+     {
+      "ge": "6.0",
+      "lt": "6.0.6"
+     }
+    ],
+    "severity": "low",
+    "summary": "Django fails to prevent reuse of a partially-initialized connection after a failed `STARTTLS` handshake"
+   },
+   {
+    "cwe": "CWE-862",
+    "id": "CVE-2026-4292",
+    "ranges": [
+     {
+      "ge": "6.0",
+      "lt": "6.0.4"
+     },
+     {
+      "ge": "5.2",
+      "lt": "5.2.13"
+     },
+     {
+      "ge": "4.2",
+      "lt": "4.2.30"
+     }
+    ],
+    "severity": "low",
+    "summary": "Django vulnerable to privilege abuse in ModelAdmin.list_editable"
+   },
+   {
+    "cwe": "CWE-798",
+    "id": "CVE-2016-9013",
+    "ranges": [
+     {
+      "ge": "1.10a1",
+      "lt": "1.10.3"
+     },
+     {
+      "ge": "1.9a1",
+      "lt": "1.9.11"
+     },
+     {
+      "ge": "1.8a1",
+      "lt": "1.8.16"
+     }
+    ],
+    "severity": "critical",
+    "summary": "Django user with hardcoded password created when running tests on Oracle"
+   },
+   {
+    "cwe": "CWE-290",
+    "id": "CVE-2026-3902",
+    "ranges": [
+     {
+      "ge": "6.0",
+      "lt": "6.0.4"
+     },
+     {
+      "ge": "5.2",
+      "lt": "5.2.13"
+     },
+     {
+      "ge": "4.2",
+      "lt": "4.2.30"
+     }
+    ],
+    "severity": "high",
+    "summary": "Django vulnerable to ASGI header spoofing via underscore/hyphen conflation"
+   },
+   {
+    "cwe": "CWE-89",
+    "id": "CVE-2026-1207",
+    "ranges": [
+     {
+      "ge": "6.0a1",
+      "lt": "6.0.2"
+     },
+     {
+      "ge": "5.2a1",
+      "lt": "5.2.11"
+     },
+     {
+      "ge": "4.2a1",
+      "lt": "4.2.28"
+     }
+    ],
+    "severity": "high",
+    "summary": "Django has an SQL Injection issue"
+   },
+   {
+    "cwe": "CWE-1395",
+    "id": "CVE-2007-0405",
+    "ranges": [
+     {
+      "ge": "0.95",
+      "lt": "1.0"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Django Improper Access Control"
+   },
+   {
+    "cwe": "CWE-770",
+    "id": "CVE-2025-26699",
+    "ranges": [
+     {
+      "ge": "4.2",
+      "lt": "4.2.20"
+     },
+     {
+      "ge": "5.0",
+      "lt": "5.0.13"
+     },
+     {
+      "ge": "5.1",
+      "lt": "5.1.7"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Django vulnerable to Allocation of Resources Without Limits or Throttling"
+   },
+   {
+    "cwe": "CWE-89",
+    "id": "CVE-2022-34265",
+    "ranges": [
+     {
+      "ge": "3.2a1",
+      "lt": "3.2.14"
+     },
+     {
+      "ge": "4.0a1",
+      "lt": "4.0.6"
+     }
+    ],
+    "severity": "critical",
+    "summary": "Django `Trunc()` and `Extract()` database functions vulnerable to SQL Injection"
+   },
+   {
+    "cwe": "CWE-1333",
+    "id": "CVE-2009-3695",
+    "ranges": [
+     {
+      "ge": "1.0",
+      "lt": "1.0.4"
+     },
+     {
+      "ge": "1.1",
+      "lt": "1.1.1"
+     }
+    ],
+    "severity": "high",
+    "summary": "Django Regex Algorithmic Complexity Causes Denial of Service"
+   },
+   {
+    "cwe": "CWE-918",
+    "id": "CVE-2021-33571",
+    "ranges": [
+     {
+      "ge": "2.2a1",
+      "lt": "2.2.24"
+     },
+     {
+      "ge": "3.0a1",
+      "lt": "3.1.12"
+     },
+     {
+      "ge": "3.2a1",
+      "lt": "3.2.4"
+     }
+    ],
+    "severity": "high",
+    "summary": "Django Access Control Bypass possibly leading to SSRF, RFI, and LFI attacks "
+   },
+   {
+    "cwe": "CWE-770",
+    "id": "CVE-2015-5963",
+    "ranges": [
+     {
+      "ge": "1.8",
+      "lt": "1.8.4"
+     },
+     {
+      "ge": "1.7",
+      "lt": "1.7.10"
+     },
+     {
+      "ge": "1.4",
+      "lt": "1.4.22"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Django denial of service via empty session record creation"
+   },
+   {
+    "cwe": "CWE-89",
+    "id": "CVE-2024-42005",
+    "ranges": [
+     {
+      "ge": "5.0",
+      "lt": "5.0.8"
+     },
+     {
+      "ge": "4.2",
+      "lt": "4.2.15"
+     }
+    ],
+    "severity": "critical",
+    "summary": "Django SQL injection vulnerability"
+   },
+   {
+    "cwe": "CWE-79",
+    "id": "CVE-2016-2512",
+    "ranges": [
+     {
+      "lt": "1.8.10"
+     },
+     {
+      "ge": "1.9a1",
+      "lt": "1.9.3"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Django XSS Vulnerability"
+   },
+   {
+    "cwe": "CWE-862",
+    "id": "CVE-2026-4277",
+    "ranges": [
+     {
+      "ge": "6.0",
+      "lt": "6.0.4"
+     },
+     {
+      "ge": "5.2",
+      "lt": "5.2.13"
+     },
+     {
+      "ge": "4.2",
+      "lt": "4.2.30"
+     }
+    ],
+    "severity": "low",
+    "summary": "Django vulnerable to privilege abuse in GenericInlineModelAdmin"
+   },
+   {
+    "cwe": "CWE-674",
+    "id": "CVE-2026-15830",
+    "ranges": [
+     {
+      "lt": "5.2.17"
+     },
+     {
+      "ge": "6.0a1",
+      "lt": "6.0.8"
+     },
+     {
+      "ge": "6.1a1",
+      "lt": "6.1.1"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Django GeoDjango vulnerable to denial of service through deeply nested geometry collections"
+   },
+   {
+    "cwe": "CWE-400",
+    "id": "CVE-2023-23969",
+    "ranges": [
+     {
+      "ge": "3.2a1",
+      "lt": "3.2.17"
+     },
+     {
+      "ge": "4.0a1",
+      "lt": "4.0.9"
+     },
+     {
+      "ge": "4.1a1",
+      "lt": "4.1.6"
+     }
+    ],
+    "severity": "high",
+    "summary": "Django contains Uncontrolled Resource Consumption via cached header"
+   },
+   {
+    "cwe": "CWE-20",
+    "id": "CVE-2015-5144",
+    "ranges": [
+     {
+      "lt": "1.4.21"
+     },
+     {
+      "ge": "1.5",
+      "lt": "1.7.9"
+     },
+     {
+      "ge": "1.8a1",
+      "lt": "1.8.3"
+     }
+    ],
+    "severity": "high",
+    "summary": "Django Vulnerable to HTTP Response Splitting Attack"
+   },
+   {
+    "cwe": "CWE-349",
+    "id": "CVE-2014-1418",
+    "ranges": [
+     {
+      "ge": "1.4",
+      "lt": "1.4.13"
+     },
+     {
+      "ge": "1.5",
+      "lt": "1.5.8"
+     },
+     {
+      "ge": "1.6",
+      "lt": "1.6.5"
+     },
+     {
+      "ge": "1.7a1",
+      "lt": "1.7b4"
+     }
+    ],
+    "severity": "critical",
+    "summary": "Django Vulnerable to Cache Poisoning"
+   },
+   {
+    "cwe": "CWE-23",
+    "id": "CVE-2025-59682",
+    "ranges": [
+     {
+      "ge": "4.2",
+      "lt": "4.2.25"
+     },
+     {
+      "ge": "5.1",
+      "lt": "5.1.13"
+     },
+     {
+      "ge": "5.2",
+      "lt": "5.2.7"
+     }
+    ],
+    "severity": "low",
+    "summary": "Django vulnerable to partial directory traversal via archives"
+   },
+   {
+    "cwe": "CWE-1395",
+    "id": "CVE-2007-0404",
+    "ranges": [
+     {
+      "ge": "0.95",
+      "lt": "1.0"
+     }
+    ],
+    "severity": "high",
+    "summary": "Django Arbitrary Code Execution"
+   },
+   {
+    "cwe": "CWE-770",
+    "id": "CVE-2024-56374",
+    "ranges": [
+     {
+      "ge": "5.1",
+      "lt": "5.1.5"
+     },
+     {
+      "ge": "5.0",
+      "lt": "5.0.11"
+     },
+     {
+      "ge": "4.2",
+      "lt": "4.2.18"
+     },
+     {
+      "ge": "5.1",
+      "lt": "5.1.5"
+     },
+     {
+      "ge": "5.0",
+      "lt": "5.0.11"
+     },
+     {
+      "ge": "4.2",
+      "lt": "4.2.18"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Django has a potential denial-of-service vulnerability in IPv6 validation"
+   },
+   {
+    "cwe": "CWE-130",
+    "id": "CVE-2024-38875",
+    "ranges": [
+     {
+      "ge": "4.2",
+      "lt": "4.2.14"
+     },
+     {
+      "ge": "5.0",
+      "lt": "5.0.7"
+     }
+    ],
+    "severity": "high",
+    "summary": "Django vulnerable to Denial of Service"
+   },
+   {
+    "cwe": "CWE-79",
+    "id": "CVE-2021-32052",
+    "ranges": [
+     {
+      "ge": "2.2",
+      "lt": "2.2.22"
+     },
+     {
+      "ge": "3.1",
+      "lt": "3.1.10"
+     },
+     {
+      "ge": "3.2",
+      "lt": "3.2.2"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Header injection possible in Django"
+   },
+   {
+    "cwe": "CWE-400",
+    "id": "CVE-2023-46695",
+    "ranges": [
+     {
+      "ge": "3.2a1",
+      "lt": "3.2.23"
+     },
+     {
+      "ge": "4.1a1",
+      "lt": "4.1.13"
+     },
+     {
+      "ge": "4.2a1",
+      "lt": "4.2.7"
+     }
+    ],
+    "severity": "high",
+    "summary": "Django potential denial of service vulnerability in UsernameField on Windows"
+   },
+   {
+    "cwe": "CWE-524",
+    "id": "CVE-2026-35193",
+    "ranges": [
+     {
+      "ge": "5.2.0",
+      "lt": "5.2.15"
+     },
+     {
+      "ge": "6.0.0",
+      "lt": "6.0.6"
+     }
+    ],
+    "severity": "low",
+    "summary": "Django: UpdateCacheMiddleware may disclose private cached responses by omitting Authorization from Vary"
+   },
+   {
+    "cwe": "CWE-611",
+    "id": "CVE-2013-1664",
+    "ranges": [
+     {
+      "ge": "1.3.0",
+      "lt": "1.3.6"
+     },
+     {
+      "ge": "1.4.0",
+      "lt": "1.4.4"
+     }
+    ],
+    "severity": "medium",
+    "summary": "XML Entity Expansion (XEE) in Django"
+   },
+   {
+    "cwe": "CWE-1333",
+    "id": "CVE-2022-41323",
+    "ranges": [
+     {
+      "ge": "3.2",
+      "lt": "3.2.16"
+     },
+     {
+      "ge": "4.0",
+      "lt": "4.0.8"
+     },
+     {
+      "ge": "4.1",
+      "lt": "4.1.2"
+     }
+    ],
+    "severity": "high",
+    "summary": "Django denial-of-service vulnerability in internationalized URLs"
+   },
+   {
+    "cwe": "CWE-407",
+    "id": "CVE-2025-64458",
+    "ranges": [
+     {
+      "ge": "5.2a1",
+      "lt": "5.2.8"
+     },
+     {
+      "ge": "5.0a1",
+      "lt": "5.1.14"
+     },
+     {
+      "lt": "4.2.26"
+     }
+    ],
+    "severity": "high",
+    "summary": "Django has a denial-of-service vulnerability in HttpResponseRedirect and HttpResponsePermanentRedirect on Windows"
+   },
+   {
+    "cwe": "CWE-185",
+    "id": "CVE-2018-7536",
+    "ranges": [
+     {
+      "ge": "2.0a1",
+      "lt": "2.0.3"
+     },
+     {
+      "ge": "1.11a1",
+      "lt": "1.11.11"
+     },
+     {
+      "ge": "1.8a1",
+      "lt": "1.8.19"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Django denial-of-service possibility in urlize and urlizetrunc template filters"
+   },
+   {
+    "cwe": "CWE-20",
+    "id": "CVE-2023-31047",
+    "ranges": [
+     {
+      "ge": "3.2a1",
+      "lt": "3.2.19"
+     },
+     {
+      "ge": "4.0a1",
+      "lt": "4.1.9"
+     },
+     {
+      "ge": "4.2a1",
+      "lt": "4.2.1"
+     }
+    ],
+    "severity": "critical",
+    "summary": "Django bypasses validation when using one form field to upload multiple files"
+   },
+   {
+    "cwe": "CWE-352",
+    "id": "CVE-2008-3909",
+    "ranges": [
+     {
+      "ge": "0.91.0",
+      "lt": "0.91.3"
+     },
+     {
+      "ge": "0.95.0",
+      "lt": "0.95.4"
+     },
+     {
+      "ge": "0.96.0",
+      "lt": "0.96.3"
+     }
+    ],
+    "severity": "high",
+    "summary": "Django cross-site request forgery (CSRF) vulnerability"
+   },
+   {
+    "cwe": "CWE-200",
+    "id": "CVE-2013-0305",
+    "ranges": [
+     {
+      "ge": "1.3",
+      "lt": "1.3.6"
+     },
+     {
+      "ge": "1.4",
+      "lt": "1.4.4"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Django Data leakage via admin history log"
+   },
+   {
+    "cwe": "CWE-1284",
+    "id": "CVE-2024-41991",
+    "ranges": [
+     {
+      "ge": "5.0",
+      "lt": "5.0.8"
+     },
+     {
+      "ge": "4.2",
+      "lt": "4.2.15"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Django vulnerable to denial-of-service attack"
+   },
+   {
+    "cwe": "CWE-200",
+    "id": "CVE-2018-6188",
+    "ranges": [
+     {
+      "ge": "2.0a1",
+      "lt": "2.0.2"
+     },
+     {
+      "ge": "1.11.8",
+      "lt": "1.11.10"
+     }
+    ],
+    "severity": "high",
+    "summary": "Django vulnerable to information leakage in AuthenticationForm"
+   },
+   {
+    "cwe": "CWE-20",
+    "id": "CVE-2011-4139",
+    "ranges": [
+     {
+      "lt": "1.2.7"
+     },
+     {
+      "ge": "1.3",
+      "lt": "1.3.1"
+     }
+    ],
+    "severity": "high",
+    "summary": "Django Vulnerable to Cache Poisoning"
+   },
+   {
+    "cwe": "CWE-89",
+    "id": "CVE-2025-13372",
+    "ranges": [
+     {
+      "ge": "5.2a1",
+      "lt": "5.2.9"
+     },
+     {
+      "ge": "5.1a1",
+      "lt": "5.1.15"
+     },
+     {
+      "ge": "4.2a1",
+      "lt": "4.2.27"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Django is vulnerable to SQL injection in column aliases"
+   },
+   {
+    "cwe": "CWE-203",
+    "id": "CVE-2024-45231",
+    "ranges": [
+     {
+      "ge": "5.1",
+      "lt": "5.1.1"
+     },
+     {
+      "ge": "5.0",
+      "lt": "5.0.9"
+     },
+     {
+      "lt": "4.2.16"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Django allows enumeration of user e-mail addresses"
+   },
+   {
+    "cwe": "CWE-94",
+    "id": "CVE-2014-0472",
+    "ranges": [
+     {
+      "lt": "1.4.11"
+     },
+     {
+      "ge": "1.5",
+      "lt": "1.5.6"
+     },
+     {
+      "ge": "1.6",
+      "lt": "1.6.3"
+     }
+    ],
+    "severity": "critical",
+    "summary": "Code Injection in Django"
+   },
+   {
+    "cwe": "CWE-200",
+    "id": "CVE-2014-0483",
+    "ranges": [
+     {
+      "lt": "1.4.14"
+     },
+     {
+      "ge": "1.5",
+      "lt": "1.5.9"
+     },
+     {
+      "ge": "1.6",
+      "lt": "1.6.6"
+     },
+     {
+      "ge": "1.7a1",
+      "lt": "1.7c3"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Django data leakage via querystring manipulation in admin"
+   },
+   {
+    "cwe": "CWE-22",
+    "id": "CVE-2021-31542",
+    "ranges": [
+     {
+      "ge": "2.2",
+      "lt": "2.2.21"
+     },
+     {
+      "ge": "3.0",
+      "lt": "3.1.9"
+     },
+     {
+      "ge": "3.2",
+      "lt": "3.2.1"
+     }
+    ],
+    "severity": "high",
+    "summary": "Path Traversal in Django"
+   },
+   {
+    "cwe": "CWE-287",
+    "id": "CVE-2021-44420",
+    "ranges": [
+     {
+      "ge": "2.2a1",
+      "lt": "2.2.25"
+     },
+     {
+      "ge": "3.0a1",
+      "lt": "3.1.14"
+     },
+     {
+      "ge": "3.2a1",
+      "lt": "3.2.10"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Potential bypass of an upstream access control based on URL paths in Django"
+   },
+   {
+    "cwe": "CWE-674",
+    "id": "CVE-2019-14235",
+    "ranges": [
+     {
+      "ge": "1.11a1",
+      "lt": "1.11.23"
+     },
+     {
+      "ge": "2.1a1",
+      "lt": "2.1.11"
+     },
+     {
+      "ge": "2.2a1",
+      "lt": "2.2.4"
+     }
+    ],
+    "severity": "high",
+    "summary": "Uncontrolled Recursion in Django"
+   },
+   {
+    "cwe": "CWE-640",
+    "id": "CVE-2019-19844",
+    "ranges": [
+     {
+      "lt": "1.11.27"
+     },
+     {
+      "ge": "2.0",
+      "lt": "2.2.9"
+     },
+     {
+      "ge": "3.0",
+      "lt": "3.0.1"
+     }
+    ],
+    "severity": "critical",
+    "summary": "Django Potential account hijack via password reset form"
+   },
+   {
+    "cwe": "CWE-22",
+    "id": "CVE-2013-4315",
+    "ranges": [
+     {
+      "ge": "1.4",
+      "lt": "1.4.7"
+     },
+     {
+      "ge": "1.5",
+      "lt": "1.5.3"
+     }
+    ],
+    "severity": "high",
+    "summary": "Django Directory Traversal via ssi template tag"
+   },
+   {
+    "cwe": "CWE-1333",
+    "id": "CVE-2024-27351",
+    "ranges": [
+     {
+      "ge": "3.2",
+      "lt": "3.2.25"
+     },
+     {
+      "ge": "4.2",
+      "lt": "4.2.11"
+     },
+     {
+      "ge": "5.0",
+      "lt": "5.0.3"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Regular expression denial-of-service in Django"
+   },
+   {
+    "cwe": "CWE-20",
+    "id": "CVE-2014-3730",
+    "ranges": [
+     {
+      "ge": "1.4",
+      "lt": "1.4.13"
+     },
+     {
+      "ge": "1.5",
+      "lt": "1.5.8"
+     },
+     {
+      "ge": "1.6",
+      "lt": "1.6.5"
+     },
+     {
+      "ge": "1.7a1",
+      "lt": "1.7b4"
+     }
+    ],
+    "severity": "high",
+    "summary": "Django Allows Open Redirects"
+   },
+   {
+    "cwe": "CWE-407",
+    "id": "CVE-2025-64460",
+    "ranges": [
+     {
+      "ge": "5.2a1",
+      "lt": "5.2.9"
+     },
+     {
+      "ge": "5.1a1",
+      "lt": "5.1.15"
+     },
+     {
+      "ge": "4.2a1",
+      "lt": "4.2.27"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Django is vulnerable to DoS via XML serializer text extraction"
+   },
+   {
+    "cwe": "CWE-89",
+    "id": "CVE-2022-28347",
+    "ranges": [
+     {
+      "ge": "2.2",
+      "lt": "2.2.28"
+     },
+     {
+      "ge": "3.2",
+      "lt": "3.2.13"
+     },
+     {
+      "ge": "4.0",
+      "lt": "4.0.4"
+     }
+    ],
+    "severity": "critical",
+    "summary": "SQL Injection in Django"
+   },
+   {
+    "cwe": "CWE-130",
+    "id": "CVE-2026-5766",
+    "ranges": [
+     {
+      "ge": "6.0",
+      "lt": "6.0.5"
+     },
+     {
+      "ge": "5.2",
+      "lt": "5.2.14"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Django has an Improper Handling of Length Parameter Inconsistency"
+   },
+   {
+    "cwe": "CWE-770",
+    "id": "CVE-2019-6975",
+    "ranges": [
+     {
+      "ge": "1.11",
+      "lt": "1.11.19"
+     },
+     {
+      "ge": "2.0",
+      "lt": "2.0.11"
+     },
+     {
+      "ge": "2.1",
+      "lt": "2.1.6"
+     }
+    ],
+    "severity": "high",
+    "summary": "Uncontrolled Memory Consumption in Django"
+   },
+   {
+    "cwe": "CWE-295",
+    "id": "CVE-2020-13254",
+    "ranges": [
+     {
+      "ge": "2.2",
+      "lt": "2.2.13"
+     },
+     {
+      "ge": "3.0",
+      "lt": "3.0.7"
+     }
+    ],
+    "severity": "high",
+    "summary": "Data leakage via cache key collision in Django"
+   },
+   {
+    "cwe": "CWE-770",
+    "id": "CVE-2025-27556",
+    "ranges": [
+     {
+      "ge": "5.0",
+      "lt": "5.0.14"
+     },
+     {
+      "ge": "5.1",
+      "lt": "5.1.8"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Django Potential Denial of Service (DoS) on Windows "
+   },
+   {
+    "cwe": "CWE-89",
+    "id": "CVE-2014-0474",
+    "ranges": [
+     {
+      "lt": "1.4.11"
+     },
+     {
+      "ge": "1.5",
+      "lt": "1.5.6"
+     },
+     {
+      "ge": "1.6",
+      "lt": "1.6.3"
+     }
+    ],
+    "severity": "high",
+    "summary": "Django Vulnerable to MySQL Injection"
+   },
+   {
+    "cwe": "CWE-73",
+    "id": "CVE-2026-15307",
+    "ranges": [
+     {
+      "lt": "5.2.17"
+     },
+     {
+      "ge": "6.0a1",
+      "lt": "6.0.8"
+     }
+    ],
+    "severity": "high",
+    "summary": "Django GeoDjango spatial lookups allow file writes and outbound requests through GDAL raster parsing"
+   },
+   {
+    "cwe": "CWE-20",
+    "id": "CVE-2011-4138",
+    "ranges": [
+     {
+      "lt": "1.2.7"
+     },
+     {
+      "ge": "1.3",
+      "lt": "1.3.1"
+     }
+    ],
+    "severity": "high",
+    "summary": "Django Might Allow CSRF Requests via URL Verification"
+   },
+   {
+    "cwe": "CWE-1395",
+    "id": "CVE-2015-5964",
+    "ranges": [
+     {
+      "ge": "1.7",
+      "lt": "1.7.10"
+     },
+     {
+      "ge": "1.4",
+      "lt": "1.4.22"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Denial-of-service possibility in logout() view by filling session store"
+   },
+   {
+    "cwe": "CWE-200",
+    "id": "CVE-2013-1665",
+    "ranges": [
+     {
+      "ge": "1.3.0",
+      "lt": "1.3.6"
+     },
+     {
+      "ge": "1.4.0",
+      "lt": "1.4.4"
+     }
+    ],
+    "severity": "medium",
+    "summary": "XML External Entity (XXE) in Django"
+   },
+   {
+    "cwe": "CWE-208",
+    "id": "CVE-2024-39329",
+    "ranges": [
+     {
+      "ge": "5.0",
+      "lt": "5.0.7"
+     },
+     {
+      "ge": "4.2",
+      "lt": "4.2.14"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Django vulnerable to user enumeration attack"
+   },
+   {
+    "cwe": "CWE-20",
+    "id": "CVE-2011-4136",
+    "ranges": [
+     {
+      "lt": "1.2.7"
+     },
+     {
+      "ge": "1.3",
+      "lt": "1.3.1"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Session manipulation in Django"
+   },
+   {
+    "cwe": "CWE-22",
+    "id": "CVE-2021-28658",
+    "ranges": [
+     {
+      "ge": "2.2a1",
+      "lt": "2.2.20"
+     },
+     {
+      "ge": "3.0a1",
+      "lt": "3.0.14"
+     },
+     {
+      "ge": "3.1a1",
+      "lt": "3.1.8"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Directory Traversal in Django"
+   },
+   {
+    "cwe": "CWE-89",
+    "id": "CVE-2021-35042",
+    "ranges": [
+     {
+      "ge": "3.2a1",
+      "lt": "3.2.5"
+     },
+     {
+      "ge": "3.0a1",
+      "lt": "3.1.13"
+     }
+    ],
+    "severity": "critical",
+    "summary": "SQL Injection in Django"
+   },
+   {
+    "cwe": "CWE-770",
+    "id": "CVE-2024-24680",
+    "ranges": [
+     {
+      "ge": "3.2",
+      "lt": "3.2.24"
+     },
+     {
+      "ge": "4.2",
+      "lt": "4.2.10"
+     },
+     {
+      "ge": "5.0",
+      "lt": "5.0.2"
+     }
+    ],
+    "severity": "high",
+    "summary": "Django denial-of-service attack in the intcomma template filter"
+   }
+  ],
+  "patterns": []
+ },
+ "pypi:flask": {
+  "cves": [
+   {
+    "cwe": "CWE-683",
+    "id": "CVE-2025-47278",
+    "ranges": [
+     {
+      "ge": "3.1.0",
+      "lt": "3.1.1"
+     }
+    ],
+    "severity": "low",
+    "summary": "Flask uses fallback key instead of current signing key"
+   },
+   {
+    "cwe": "CWE-20",
+    "id": "CVE-2018-1000656",
+    "ranges": [
+     {
+      "lt": "0.12.3"
+     }
+    ],
+    "severity": "high",
+    "summary": "Flask is vulnerable to Denial of Service via incorrect encoding of JSON data"
+   },
+   {
+    "cwe": "CWE-400",
+    "id": "CVE-2019-1010083",
+    "ranges": [
+     {
+      "lt": "1.0"
+     }
+    ],
+    "severity": "high",
+    "summary": "Pallets Project Flask is vulnerable to Denial of Service via Unexpected memory usage"
+   },
+   {
+    "cwe": "CWE-524",
+    "id": "CVE-2026-27205",
+    "ranges": [
+     {
+      "lt": "3.1.3"
+     }
+    ],
+    "severity": "low",
+    "summary": "Flask session does not add `Vary: Cookie` header when accessed in some ways"
+   },
+   {
+    "cwe": "CWE-539",
+    "id": "CVE-2023-30861",
+    "ranges": [
+     {
+      "ge": "2.3.0",
+      "lt": "2.3.2"
+     },
+     {
+      "lt": "2.2.5"
+     }
+    ],
+    "severity": "high",
+    "summary": "Flask vulnerable to possible disclosure of permanent session cookie due to missing Vary: Cookie header"
+   }
+  ],
+  "patterns": []
+ },
+ "pypi:jinja2": {
+  "cves": [
+   {
+    "cwe": "CWE-693",
+    "id": "CVE-2019-10906",
+    "ranges": [
+     {
+      "lt": "2.10.1"
+     }
+    ],
+    "severity": "high",
+    "summary": "Jinja2 sandbox escape via string formatting"
+   },
+   {
+    "cwe": "CWE-266",
+    "id": "CVE-2014-1402",
+    "ranges": [
+     {
+      "lt": "2.7.2"
+     }
+    ],
+    "severity": "high",
+    "summary": "Incorrect Privilege Assignment in Jinja2"
+   },
+   {
+    "cwe": "CWE-1336",
+    "id": "CVE-2025-27516",
+    "ranges": [
+     {
+      "lt": "3.1.6"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Jinja2 vulnerable to sandbox breakout through attr filter selecting format method"
+   },
+   {
+    "cwe": "CWE-377",
+    "id": "CVE-2014-0012",
+    "ranges": [
+     {
+      "lt": "2.7.2"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Insecure Temporary File in Jinja2"
+   },
+   {
+    "cwe": "CWE-400",
+    "id": "CVE-2020-28493",
+    "ranges": [
+     {
+      "lt": "2.11.3"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Regular Expression Denial of Service (ReDoS) in Jinja2"
+   },
+   {
+    "cwe": "CWE-150",
+    "id": "CVE-2024-56201",
+    "ranges": [
+     {
+      "ge": "3.0.0",
+      "lt": "3.1.5"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Jinja has a sandbox breakout through malicious filenames"
+   },
+   {
+    "cwe": "CWE-79",
+    "id": "CVE-2024-22195",
+    "ranges": [
+     {
+      "lt": "3.1.3"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Jinja vulnerable to HTML attribute injection when passing user input as keys to xmlattr filter"
+   },
+   {
+    "cwe": "CWE-79",
+    "id": "CVE-2024-34064",
+    "ranges": [
+     {
+      "lt": "3.1.4"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Jinja vulnerable to HTML attribute injection when passing user input as keys to xmlattr filter"
+   },
+   {
+    "cwe": "CWE-134",
+    "id": "CVE-2016-10745",
+    "ranges": [
+     {
+      "lt": "2.8.1"
+     }
+    ],
+    "severity": "high",
+    "summary": "Jinja2 sandbox escape vulnerability"
+   },
+   {
+    "cwe": "CWE-693",
+    "id": "CVE-2024-56326",
+    "ranges": [
+     {
+      "lt": "3.1.5"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Jinja has a sandbox breakout through indirect reference to format method"
+   }
+  ],
+  "patterns": []
+ },
+ "pypi:pyyaml": {
+  "cves": [
+   {
+    "cwe": "CWE-502",
+    "id": "CVE-2019-20477",
+    "ranges": [
+     {
+      "ge": "5.1",
+      "lt": "5.2"
+     }
+    ],
+    "severity": "critical",
+    "summary": "Deserialization of Untrusted Data in PyYAML"
+   },
+   {
+    "cwe": "CWE-20",
+    "id": "CVE-2020-1747",
+    "ranges": [
+     {
+      "ge": "5.1b7",
+      "lt": "5.3.1"
+     }
+    ],
+    "severity": "critical",
+    "summary": "Improper Input Validation in PyYAML"
+   },
+   {
+    "cwe": "CWE-20",
+    "id": "CVE-2020-14343",
+    "ranges": [
+     {
+      "lt": "5.4"
+     }
+    ],
+    "severity": "critical",
+    "summary": "Improper Input Validation in PyYAML"
+   },
+   {
+    "cwe": "CWE-502",
+    "id": "CVE-2017-18342",
+    "ranges": [
+     {
+      "lt": "5.1"
+     }
+    ],
+    "severity": "critical",
+    "summary": "PyYAML insecurely deserializes YAML strings leading to arbitrary code execution"
+   }
+  ],
+  "patterns": []
+ },
+ "pypi:requests": {
+  "cves": [
+   {
+    "cwe": "CWE-200",
+    "id": "CVE-2014-1830",
+    "ranges": [
+     {
+      "lt": "2.3.0"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Exposure of Sensitive Information to an Unauthorized Actor in Requests"
+   },
+   {
+    "cwe": "CWE-522",
+    "id": "CVE-2024-47081",
+    "ranges": [
+     {
+      "lt": "2.32.4"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Requests vulnerable to .netrc credentials leak via malicious URLs"
+   },
+   {
+    "cwe": "CWE-670",
+    "id": "CVE-2024-35195",
+    "ranges": [
+     {
+      "lt": "2.32.0"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Requests `Session` object does not verify requests after making first request with verify=False"
+   },
+   {
+    "cwe": "CWE-200",
+    "id": "CVE-2014-1829",
+    "ranges": [
+     {
+      "lt": "2.3.0"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Exposure of Sensitive Information to an Unauthorized Actor in Requests"
+   },
+   {
+    "cwe": "CWE-377",
+    "id": "CVE-2026-25645",
+    "ranges": [
+     {
+      "lt": "2.33.0"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Requests has Insecure Temp File Reuse in its extract_zipped_paths() utility function"
+   },
+   {
+    "cwe": "CWE-200",
+    "id": "CVE-2023-32681",
+    "ranges": [
+     {
+      "ge": "2.3.0",
+      "lt": "2.31.0"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Unintended leak of Proxy-Authorization header in requests"
+   },
+   {
+    "cwe": "CWE-1395",
+    "id": "CVE-2015-2296",
+    "ranges": [
+     {
+      "ge": "2.1.0",
+      "lt": "2.6.0"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Python Requests Session Fixation"
+   },
+   {
+    "cwe": "CWE-522",
+    "id": "CVE-2018-18074",
+    "ranges": [
+     {
+      "lt": "2.20.0"
+     }
+    ],
+    "severity": "high",
+    "summary": "Insufficiently Protected Credentials in Requests"
+   }
+  ],
+  "patterns": []
+ },
+ "pypi:urllib3": {
+  "cves": [
+   {
+    "cwe": "CWE-409",
+    "id": "CVE-2025-66471",
+    "ranges": [
+     {
+      "ge": "1.0",
+      "lt": "2.6.0"
+     }
+    ],
+    "severity": "high",
+    "summary": "urllib3 streaming API improperly handles highly compressed data"
+   },
+   {
+    "cwe": "CWE-669",
+    "id": "CVE-2024-37891",
+    "ranges": [
+     {
+      "lt": "1.26.19"
+     },
+     {
+      "ge": "2.0.0",
+      "lt": "2.2.2"
+     }
+    ],
+    "severity": "medium",
+    "summary": "urllib3's Proxy-Authorization request header isn't stripped during cross-origin redirects"
+   },
+   {
+    "cwe": "CWE-409",
+    "id": "CVE-2026-21441",
+    "ranges": [
+     {
+      "ge": "1.22",
+      "lt": "2.6.3"
+     }
+    ],
+    "severity": "high",
+    "summary": "Decompression-bomb safeguards bypassed when following HTTP redirects (streaming API)"
+   },
+   {
+    "cwe": "CWE-601",
+    "id": "CVE-2025-50182",
+    "ranges": [
+     {
+      "ge": "2.2.0",
+      "lt": "2.5.0"
+     }
+    ],
+    "severity": "medium",
+    "summary": "urllib3 does not control redirects in browsers and Node.js"
+   },
+   {
+    "cwe": "CWE-295",
+    "id": "CVE-2021-28363",
+    "ranges": [
+     {
+      "ge": "1.26.0",
+      "lt": "1.26.4"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Using default SSLContext for HTTPS requests in an HTTPS proxy doesn't verify certificate hostname for proxy connection"
+   },
+   {
+    "cwe": "CWE-295",
+    "id": "CVE-2026-97687",
+    "ranges": [
+     {
+      "ge": "1.26.0",
+      "lt": "2.8.0"
+     }
+    ],
+    "severity": "high",
+    "summary": "urllib3: HTTPS proxy TLS configuration may be ignored or overridden"
+   },
+   {
+    "cwe": "CWE-200",
+    "id": "CVE-2023-45803",
+    "ranges": [
+     {
+      "ge": "2.0.0",
+      "lt": "2.0.7"
+     },
+     {
+      "lt": "1.26.18"
+     }
+    ],
+    "severity": "medium",
+    "summary": "urllib3's request body not stripped after redirect from 303 status changes request method to GET"
+   },
+   {
+    "cwe": "CWE-835",
+    "id": "CVE-2026-97688",
+    "ranges": [
+     {
+      "ge": "2.6.2",
+      "lt": "2.8.0"
+     }
+    ],
+    "severity": "medium",
+    "summary": "urllib3: Chunked Deflate streaming can enter an infinite loop"
+   },
+   {
+    "cwe": "CWE-770",
+    "id": "CVE-2025-66418",
+    "ranges": [
+     {
+      "ge": "1.24",
+      "lt": "2.6.0"
+     }
+    ],
+    "severity": "high",
+    "summary": "urllib3 allows an unbounded number of links in the decompression chain"
+   },
+   {
+    "cwe": "CWE-200",
+    "id": "CVE-2018-25091",
+    "ranges": [
+     {
+      "lt": "1.24.2"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Authorization Header forwarded on redirect"
+   },
+   {
+    "cwe": "CWE-400",
+    "id": "CVE-2020-7212",
+    "ranges": [
+     {
+      "ge": "1.25.2",
+      "lt": "1.25.8"
+     }
+    ],
+    "severity": "high",
+    "summary": "Uncontrolled Resource Consumption in urllib3"
+   },
+   {
+    "cwe": "CWE-409",
+    "id": "CVE-2026-44432",
+    "ranges": [
+     {
+      "ge": "2.6.0",
+      "lt": "2.7.0"
+     }
+    ],
+    "severity": "high",
+    "summary": "urllib3: Decompression-bomb safeguards bypassed in parts of the streaming API"
+   },
+   {
+    "cwe": "CWE-295",
+    "id": "CVE-2019-11324",
+    "ranges": [
+     {
+      "lt": "1.24.2"
+     }
+    ],
+    "severity": "high",
+    "summary": "Improper Certificate Validation in urllib3"
+   },
+   {
+    "cwe": "CWE-601",
+    "id": "CVE-2025-50181",
+    "ranges": [
+     {
+      "lt": "2.5.0"
+     }
+    ],
+    "severity": "medium",
+    "summary": "urllib3 redirects are not disabled when retries are disabled on PoolManager instantiation"
+   },
+   {
+    "cwe": "CWE-400",
+    "id": "CVE-2021-33503",
+    "ranges": [
+     {
+      "ge": "1.25.4",
+      "lt": "1.26.5"
+     }
+    ],
+    "severity": "high",
+    "summary": "Catastrophic backtracking in URL authority parser when passed URL containing many @ characters"
+   },
+   {
+    "cwe": "CWE-200",
+    "id": "CVE-2026-44431",
+    "ranges": [
+     {
+      "ge": "1.23",
+      "lt": "2.7.0"
+     }
+    ],
+    "severity": "high",
+    "summary": "urllib3: Sensitive headers forwarded across origins in proxied low-level redirects"
+   },
+   {
+    "cwe": "CWE-93",
+    "id": "CVE-2019-11236",
+    "ranges": [
+     {
+      "lt": "1.24.3"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Improper Neutralization of CRLF Sequences in urllib3 library for Python"
+   },
+   {
+    "cwe": "CWE-295",
+    "id": "CVE-2016-9015",
+    "ranges": [
+     {
+      "ge": "1.17",
+      "lt": "1.18.1"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Urllib3 Incorrect Certificate Validation"
+   },
+   {
+    "cwe": "CWE-200",
+    "id": "CVE-2023-43804",
+    "ranges": [
+     {
+      "ge": "2.0.0",
+      "lt": "2.0.6"
+     },
+     {
+      "lt": "1.26.17"
+     }
+    ],
+    "severity": "high",
+    "summary": "`Cookie` HTTP header isn't stripped on cross-origin redirects"
+   },
+   {
+    "cwe": "CWE-770",
+    "id": "CVE-2026-97689",
+    "ranges": [
+     {
+      "ge": "1.10.3",
+      "lt": "2.8.0"
+     }
+    ],
+    "severity": "high",
+    "summary": "urllib3: HTTPResponse.stream()/read_chunked() buffers an unbounded chunk-size line into memory"
+   },
+   {
+    "cwe": "CWE-74",
+    "id": "CVE-2020-26137",
+    "ranges": [
+     {
+      "lt": "1.25.9"
+     }
+    ],
+    "severity": "medium",
+    "summary": "CRLF injection in urllib3"
+   },
+   {
+    "cwe": "CWE-200",
+    "id": "CVE-2018-20060",
+    "ranges": [
+     {
+      "lt": "1.23"
+     }
+    ],
+    "severity": "critical",
+    "summary": "Exposure of Sensitive Information to an Unauthorized Actor in urllib3"
+   }
+  ],
+  "patterns": []
+ },
+ "pypi:werkzeug": {
+  "cves": [
+   {
+    "cwe": "CWE-67",
+    "id": "CVE-2026-27199",
+    "ranges": [
+     {
+      "lt": "3.1.6"
+     }
+    ],
+    "severity": "medium",
+    "summary": " Werkzeug safe_join() allows Windows special device names"
+   },
+   {
+    "cwe": "CWE-352",
+    "id": "CVE-2024-34069",
+    "ranges": [
+     {
+      "lt": "3.0.3"
+     }
+    ],
+    "severity": "high",
+    "summary": "Werkzeug debugger vulnerable to remote execution when interacting with attacker controlled domain"
+   },
+   {
+    "cwe": "CWE-601",
+    "id": "CVE-2020-28724",
+    "ranges": [
+     {
+      "lt": "0.11.6"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Open Redirect in werkzeug"
+   },
+   {
+    "cwe": "CWE-67",
+    "id": "CVE-2026-21860",
+    "ranges": [
+     {
+      "lt": "3.1.5"
+     }
+    ],
+    "severity": "medium",
+    "summary": " Werkzeug safe_join() allows Windows special device names with compound extensions"
+   },
+   {
+    "cwe": "CWE-22",
+    "id": "CVE-2024-49766",
+    "ranges": [
+     {
+      "lt": "3.0.6"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Werkzeug safe_join not safe on Windows"
+   },
+   {
+    "cwe": "CWE-331",
+    "id": "CVE-2019-14806",
+    "ranges": [
+     {
+      "lt": "0.15.3"
+     }
+    ],
+    "severity": "high",
+    "summary": "Pallets Werkzeug Insufficient Entropy"
+   },
+   {
+    "cwe": "CWE-79",
+    "id": "CVE-2016-10516",
+    "ranges": [
+     {
+      "lt": "0.11.11"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Pallets Werkzeug cross-site scripting vulnerability"
+   },
+   {
+    "cwe": "CWE-67",
+    "id": "CVE-2025-66221",
+    "ranges": [
+     {
+      "lt": "3.1.4"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Werkzeug safe_join() allows Windows special device names"
+   },
+   {
+    "cwe": "CWE-400",
+    "id": "CVE-2023-46136",
+    "ranges": [
+     {
+      "ge": "3.0.0",
+      "lt": "3.0.1"
+     },
+     {
+      "ge": "2.0.0rc1",
+      "lt": "2.3.8"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Werkzeug DoS: High resource usage when parsing multipart/form-data containing a large part with CR/LF character at the beginning"
+   },
+   {
+    "cwe": "CWE-22",
+    "id": "CVE-2019-14322",
+    "ranges": [
+     {
+      "lt": "0.15.5"
+     }
+    ],
+    "severity": "high",
+    "summary": "Pallets Werkzeug vulnerable to Path Traversal"
+   },
+   {
+    "cwe": "CWE-20",
+    "id": "CVE-2023-23934",
+    "ranges": [
+     {
+      "lt": "2.2.3"
+     }
+    ],
+    "severity": "low",
+    "summary": "Incorrect parsing of nameless cookies leads to __Host- cookies bypass"
+   },
+   {
+    "cwe": "CWE-400",
+    "id": "CVE-2024-49767",
+    "ranges": [
+     {
+      "ge": "2.0.0rc1",
+      "lt": "3.0.6"
+     }
+    ],
+    "severity": "medium",
+    "summary": "Werkzeug possible resource exhaustion when parsing file data in forms"
+   },
+   {
+    "cwe": "CWE-400",
+    "id": "CVE-2023-25577",
+    "ranges": [
+     {
+      "lt": "2.2.3"
+     }
+    ],
+    "severity": "high",
+    "summary": "High resource usage when parsing multipart form data with many fields"
+   },
+   {
+    "cwe": "CWE-1395",
+    "id": "CVE-2022-29361",
+    "ranges": [
+     {
+      "lt": "2.1.1"
+     }
+    ],
+    "severity": "medium",
+    "summary": "** DISPUTED ** Improper parsing of HTTP requests in Pallets Werkzeug v2.1.0 and below allows attackers to perform HTTP Request Smuggling using a crafted HTTP request with multiple requests included in"
+   }
+  ],
+  "patterns": []
+ }
+}

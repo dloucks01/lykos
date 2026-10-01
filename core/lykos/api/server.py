@@ -651,6 +651,7 @@ class Handler(EndpointsMixin, AutopilotMixin, BaseHTTPRequestHandler):
         "behavior_trace": ("..analyze.debug", "enqueue_behavior_trace"),
         "dynamic_taint": ("..analyze.debug", "enqueue_taint"),
         "cve_scan": ("..analyze.fingerprint", "enqueue_cve_scan"),
+        "source_cve_scan": ("..analyze.fingerprint", "enqueue_source_cve_scan"),
         "firmware_carve": ("..analyze.firmware", "enqueue_firmware"),
         "firmware_rehost": ("..analyze.firmware", "enqueue_rehost"),
     }

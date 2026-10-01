@@ -104,6 +104,40 @@ COMPONENTS = {
 }
 
 
+# --------------------------------------------------------------- exploit-class hinting
+# A matched CVE names a KNOWN bug but carries no reproducer for the specific target, so this is
+# a HINT -- the exploit family its CWE implies -- not a claim that a weaponised PoC exists. It
+# tells an analyst (and can seed an exploit strategy) what class of attack the flaw is, with the
+# honest caveat that a trigger/reproducer in this target is still required. `strategy` lines up
+# with exploit_stage's strategy names when one applies, else None (web/logic/DoS classes).
+_EXPLOIT_CLASS = {
+    "CWE-121": ("stack buffer overflow — overwrite the saved return address (ret2* family)", "rop"),
+    "CWE-787": ("out-of-bounds write — corrupt control data (ret2* / overwrite)", "rop"),
+    "CWE-120": ("classic buffer overflow — overwrite adjacent control data (ret2* family)", "rop"),
+    "CWE-122": ("heap buffer overflow — corrupt heap metadata / adjacent object", "heap"),
+    "CWE-416": ("use-after-free — reclaim the freed object (tcache/fastbin)", "heap"),
+    "CWE-415": ("double free — tcache/fastbin poisoning to an arbitrary write", "heap"),
+    "CWE-134": ("format string — %n write / memory leak via a tainted format", "format"),
+    "CWE-190": ("integer overflow — a miscomputed size usually yields a heap/stack overflow", "rop"),
+    "CWE-476": ("null-pointer dereference — denial of service (crash)", None),
+    "CWE-78":  ("OS command injection — inject shell metacharacters into a command", None),
+    "CWE-77":  ("command injection — inject into a constructed command", None),
+    "CWE-89":  ("SQL injection — break out of the query", None),
+    "CWE-22":  ("path traversal — escape the intended directory", None),
+    "CWE-79":  ("cross-site scripting — inject script into rendered output", None),
+    "CWE-400": ("uncontrolled resource consumption — denial of service", None),
+    "CWE-770": ("allocation without limits — denial of service", None),
+    "CWE-125": ("out-of-bounds read — information disclosure / crash", None),
+    "CWE-200": ("information exposure — leak sensitive data", None),
+}
+
+
+def exploit_hint(cwe: str) -> "tuple[str, str | None] | None":
+    """(human exploit-class description, exploit_stage strategy or None) for a CWE, or None when
+    the CWE is not a class we map. The strategy is a SUGGESTION, gated on a real reproducer."""
+    return _EXPLOIT_CLASS.get((cwe or "").strip().upper())
+
+
 # ------------------------------------------------------------------ version comparison
 def vkey(v: str):
     """Sortable key for versions like 1.2.11 / 1.0.2k / 2018.76: each dotted part -> (int, str)
