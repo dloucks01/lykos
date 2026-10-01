@@ -1,10 +1,10 @@
-# Air-Gap: Packaging & Install
+# Offline Packaging & Install
 
 ---
 
-## Air-Gap Packaging, Bundled Data & Offline Updates
+## Offline Packaging, Bundled Data & Offline Updates
 
-Air-gap is a hard constraint on *every* component. Nothing may fetch at runtime.
+Running offline is a hard constraint on *every* component. Nothing may fetch at runtime.
 
 ### 11.1 The installer bundle (single, verifiable, offline)
 - Ships the optional engines (Ghidra, QEMU-user, AFL++, GDB, Wine, cross compilers, the
@@ -33,17 +33,26 @@ Air-gap is a hard constraint on *every* component. Nothing may fetch at runtime.
 | Benchmarks | Juliet, LAVA-M, Magma, CGC | self-validation (`coverage.md`) |
 | Exploit assets | gadget DBs, PoC/exploit templates | PoC synthesis |
 
+**CVE data packs (built connected, carried offline).** The offline CVE database is built on a
+connected machine by `python tools/build_cvedb.py --sqlite --json --clibs`. It produces three
+tiers: a small **committed JSON subset** (the curated high-profile seed, travels in the repo), a
+large **OSV match index** (`cvedb.sqlite`) for component→CVE matching, and an **NVD reference
+pack** (`cve.sqlite`) for CPE/version lookups. The two SQLite packs are large and **git-ignored**,
+so they travel with the package alongside the toolchain bundle rather than in the repo. Runtime
+discovery of all three lives in `core/lykos/analyze/fingerprint/cvedb.py` (`LYKOS_CVEDB` overrides
+the location); the packs are a point-in-time snapshot and age like every other data pack.
+
 ### 11.3 Offline update channel (sneakernet)
 - Updates ship as **signed, incremental data-pack / tool bundles** carried in on removable media.
 - The app verifies signature + version lineage, applies atomically, and records the new versions per case.
 - **Staleness is a first-class UI concept:** the app always shows how old the CVE/signature/rule packs are,
-  because in an air-gapped deployment they silently rot. Never imply "up to date."
+  because in an offline deployment they silently rot. Never imply "up to date."
 - No telemetry, no phone-home, ever. A hard architectural rule enforced by having zero network bindings and,
   ideally, running the whole stack in a network-isolated namespace.
 
 ### 11.4 Hardware & footprint
 - Document minimum vs recommended: cores (fuzzing parallelism), RAM (Ghidra + VMs + fuzzers), disk (bundles
-  + signature DBs + diff corpus + corpora can be tens of GB). **No GPU required** (zero-AI, `overview.md`).
+  + signature DBs + diff corpus + corpora can be tens of GB). **No GPU required** — the engines are CPU-only (`overview.md`).
 - Target: Kali VM ~32 GB RAM, 4+ cores, nested virt (`architecture.md`, `overview.md`). Provide a "lite" install (no diff
   corpus/benchmarks) and a "full" install.
 
@@ -82,7 +91,7 @@ older 3.x very likely works -- but that is inference, not a tested claim.
 
     # the default RE backend + the dynamic toolset
     sudo apt-get install -y rizin rz-ghidra gdb afl++ qemu-user qemu-user-binfmt wine
-    # pypcode (P-Code IR) via pip; on the air-gap bundle it is vendored under vendor/pysite
+    # pypcode (P-Code IR) via pip; on the offline bundle it is vendored under vendor/pysite
     pip install pypcode
     # OPTIONAL: only if you want the Ghidra headless alternate (LYKOS_DECOMPILER=ghidra)
     sudo apt-get install -y ghidra default-jdk
@@ -207,11 +216,11 @@ cannot.
 
 ---
 
-## Air-gap setup runbook (no install)
+## Offline setup runbook (no install)
 
-Doc 11 is the design position on air-gap. This is the procedure.
+Doc 11 is the design position on running offline. This is the procedure.
 
-Two things move to the air-gapped workstation, and they are deliberately separate:
+Two things move to the offline workstation, and they are deliberately separate:
 
 | | What | Size | How it travels |
 |---|---|---|---|
@@ -221,7 +230,7 @@ Two things move to the air-gapped workstation, and they are deliberately separat
 They are separate because the repo changes constantly and the toolchain almost never does.
 Re-cutting the ~1 MB repo tarball is cheap; re-carrying 3 GB is not.
 
-**Neither package is installed on the air-gapped side. Both run in place.** The repo runs
+**Neither package is installed on the offline side. Both run in place.** The repo runs
 straight from its extracted directory (`./start`, or `./lykos ...`). The toolchain
 bundle is a relocatable tree: the debs are extracted into `toolchain/` on the connected
 machine, and on arrival that tree is placed under the repo's `vendor/` directory — no package
@@ -247,7 +256,7 @@ cross-architecture execution (qemu-user), and the coverage-guided and symbolic e
 ### How it is delivered — one unzip-and-run folder
 
 Build a single self-contained folder on a connected machine, carry the `.zip`, unzip it on the
-air-gapped laptop, and run it in place. No install, nothing written outside the folder.
+offline laptop, and run it in place. No install, nothing written outside the folder.
 
 | Build (connected machine) | Carry | Run on the laptop |
 |---|---|---|
@@ -281,7 +290,7 @@ toolchain collector prints the bundle's sha256 for you; the `git archive` line d
 `repo-tarball` target cuts the repo tarball's checksum for you as shown.
 
 Both tarballs are written to `dist/`, which is **gitignored** — they are build artifacts, never
-committed to the repo. They travel to the air-gapped side by sneakernet, not by `git`. The repo
+committed to the repo. They travel to the offline side by sneakernet, not by `git`. The repo
 tarball is a point-in-time snapshot with no history: it runs in place but cannot `git log`, diff,
 or pull updates. Carry a `git bundle` instead (`git bundle create dist/lykos.bundle --all`) only
 if you need version control on the far side.
@@ -290,13 +299,13 @@ The collector takes its package list from `lykos.toolchain` — the same table `
 reports and this document describes — so a tool cannot be added in one place and forgotten in
 the others.
 
-Carry both tarballs to the air-gapped side, **each with the sha256 you printed** (verify them on
+Carry both tarballs to the offline side, **each with the sha256 you printed** (verify them on
 arrival, not just on departure — the point of the checksum is the journey):
 
 * `lykos-toolchain-<distro>-<date>-<arch>.tar.zst`
 * `lykos-repo.tar.gz`
 
-### 2. On the air-gapped workstation
+### 2. On the offline workstation
 
 ```sh
 tar xzf lykos-repo.tar.gz                   # creates ./lykos/
@@ -396,6 +405,6 @@ bwrap --ro-bind / / --unshare-net --dev /dev --proc /proc --chdir "$PWD" \
 ```
 
 **Data packs rot silently.** The bundled CVE fingerprint database is a point-in-time snapshot
-(`LYKOS_CVEDB` overrides it). An air-gapped deployment has no way to notice it has aged, so
+(`LYKOS_CVEDB` overrides it). An offline deployment has no way to notice it has aged, so
 treat the bundle's `manifest/BUNDLE.txt` date as the age of your CVE data and re-cut the
 bundle on a schedule you decide.

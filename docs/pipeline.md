@@ -50,10 +50,10 @@ This IR is what the plugin API exposes. Rules should never touch raw x86 vs ARM 
 
 ---
 
-## Stripped-Binary Recovery & Custom Architectures (Zero-AI)
+## Stripped-Binary Recovery & Custom Architectures
 
-Stripped binaries have no symbols. Recovery is a layered pipeline of **deterministic** techniques — no ML,
-no LLM, no GPU (decision `overview.md`). Each layer annotates the Program IR and raises analyst
+Stripped binaries have no symbols. Recovery is a layered pipeline of **deterministic** techniques
+(decision `overview.md`). Each layer annotates the Program IR and raises analyst
 confidence; the analyst accepts/rejects any suggestion. The honest boundary: these techniques name the
 **plumbing** (libraries, runtime, known code) and expose dangerous calls; a binary's own **custom logic**
 stays `sub_xxxx` until a human reverses it — exactly as Ghidra/IDA behave without plugins.
@@ -76,7 +76,7 @@ lot with zero inference:
 ### 4.3 Signature & known-code identification (the core naming engine)
 - **Byte-signature matching:** Ghidra **Function ID (FID)**, IDA-style **FLIRT**, rizin **zignatures**. Ship
   a large bundled signature DB built by compiling common libraries (libc, OpenSSL, zlib, musl, …) across a
-  matrix of compilers × versions × optimization levels × architectures (`air-gap.md`). Names statically-linked
+  matrix of compilers × versions × optimization levels × architectures (`offline-packaging.md`). Names statically-linked
   library code and, crucially, **surfaces dangerous library calls** (`strcpy`, `system`, `memcpy`) even when
   stripped/static.
 - **Prototype & type archives:** once a function is identified, apply its argument/return/struct types
@@ -84,14 +84,14 @@ lot with zero inference:
   *and* taint.
 - **libc fingerprinting:** identify the exact libc build (offset DB) — matters for exploitation.
 - **Crypto-primitive ID (deterministic):** constant-based detection of S-boxes, IVs, primes, magic values →
-  names AES/DES/RC4/SHA/RSA routines. No LLM; pure constant/structure matching.
+  names AES/DES/RC4/SHA/RSA routines — pure constant/structure matching.
 
 ### 4.4 Diff-against-symbolized corpus (highest-ROI for known software)
 Bundle a curated corpus of **open-source builds compiled *with* symbols**. Use **BinDiff** (open source),
 **Diaphora**, or **Ghidra Version Tracking** to match a stripped target's functions against a symbolized
 reference build and **transfer names/types** across. Deterministic: BinDiff derives a per-function signature
 from the normalized CFG (blocks/edges/calls) and uses **Weisfeiler-Lehman graph hashing** to build a unique
-per-function ID; callgraph-context features (Springer'24) further disambiguate library functions. No ML. For known software (a stripped build of a known OSS version), this recovers large swaths of
+per-function ID; callgraph-context features (Springer'24) further disambiguate library functions — all deterministic. For known software (a stripped build of a known OSS version), this recovers large swaths of
 names, and it doubles as **known-vulnerability search**: match against the *vulnerable version* of a function
 to flag "this resembles CVE-XXXX's buggy `foo`."
 
@@ -117,14 +117,13 @@ Two distinct cases:
 ### 4.7 Deobfuscation & anti-analysis handling (deterministic)
 - Detect + unpack common packers (UPX; generic entropy-triggered runtime-unpack via emulation + dump).
 - Control-flow flattening / opaque predicates: **symbolic simplification** passes (Triton/miasm-style) —
-  deterministic, no ML.
+  deterministic.
 - Flag anti-debug/anti-VM/timing tricks for the sandbox to neutralize; log every modification.
 
-### 4.8 Optional AI hook (unshipped)
-Per decision `overview.md`, the shipped package contains **no AI**. A plugin interface is left open so an operator
-who later stands up a **local Ollama** instance could add naming/summary *suggestions* — but nothing in the
-pipeline depends on it, it is never bundled, and the tool is fully functional without it. A low-quality small
-model would hurt more than help, so the default and recommended posture is zero-AI.
+### 4.8 Optional model hook (unshipped)
+The naming stack is deterministic (decision `overview.md`). A plugin interface is left open so an operator
+who later stands up a **local model** could add naming/summary *suggestions* — but nothing in the
+pipeline depends on it, it is not bundled, and the tool is fully functional without it.
 
 ### Net expectation
 Runtime metadata + signatures + corpus-diffing name most library/runtime/known code and demangle C++/Go;
@@ -143,7 +142,7 @@ Candidate  → Corroborated → Confirmed → PoC-backed
              + confidence score at each step; analyst can accept/reject/annotate
 ```
 This is the antidote to static-analysis false positives (`internal/01-gap-analysis.md`-B): a hypothesis→validation pipeline, but
-with **deterministic** validators only — no AI in the loop (decision `overview.md`).
+with **deterministic** validators only (decision `overview.md`).
 
 ### The four detection channels (findings are correlated across all four in the core)
 1. **Pattern / rule detectors (static, fast, noisy).** Dangerous API sinks (`strcpy`, `sprintf`, `system`,
@@ -151,7 +150,7 @@ with **deterministic** validators only — no AI in the loop (decision `overview
    fixed-size stack buffers near copies. Rules run over the normalized IR so they're arch-independent.
 2. **Static taint / data-flow (static, medium cost).** Propagate from input **sources** (argv/env/read/
    recv/fread/mmap) to dangerous **sinks**; a source→sink path is a candidate. Sources/sinks/propagation come
-   from a **curated rule set** (dangerous-API catalog + syscall model), extensible via the plugin API — no LLM.
+   from a **curated rule set** (dangerous-API catalog + syscall model), extensible via the plugin API.
 3. **Symbolic / concolic (medium-high cost, corroborates + generates inputs).** angr / SymCC / SymQEMU
    explore paths to a candidate sink and try to satisfy the "bad" condition (e.g., index > bound). Adopt
    **static-analysis-guided path prioritization** (reachability + candidate-distance heuristics) so we don't
@@ -160,7 +159,7 @@ with **deterministic** validators only — no AI in the loop (decision `overview
 4. **Dynamic (high cost, confirms).** Run under sanitizer/emulation with the fuzzer; a
    crash/UB observation at a candidate site **confirms** it. Fuzzing can be *directed* at a candidate using
    **classical distance-based directed greybox fuzzing** (AFLGo-style: CFG/callgraph distance to the target
-   site) to reach it faster — deterministic, no ML.
+   site) to reach it faster — deterministic.
 
 ### Correlation & promotion (done in the core, `architecture.md`)
 - Findings are keyed by (function, site, CWE-class, tainted-source). When a static candidate's site matches
@@ -200,8 +199,27 @@ hardcoded-credential strings — accepted as **low precision** because decompile
 **known-vulnerable-function similarity** (BinDiff against a corpus of known-buggy functions, the stripped-recovery section.4) — not
 for matching source snippets against bytes, which does not survive compilation.
 
-### Optional AI hook (unshipped)
-No AI ships (decision `overview.md`). The plugin API leaves a hook so an operator with a local Ollama instance could
+### CVE fingerprint & weaponization
+A distinct channel matches a target against **known CVEs** and then tries to *prove* the match, all offline:
+- **Fingerprint.** Binary targets are scanned for embedded **library version banners** (OpenSSL/zlib/libpng/
+  busybox/…); source projects are scanned for **dependency manifests** (`requirements.txt`,
+  `package-lock.json`, `go.mod`, `Cargo.lock`) and **vendored headers** (zlib/openssl/mbedTLS/wolfSSL/
+  FreeRTOS). Each identified component + version is matched against the **bundled offline CVE database**
+  (OSV match index + NVD-CPE reference, `offline-packaging.md`), yielding findings that carry the component,
+  version, CVE(s) and an **exploit-class hint** from the CWE of the matched CVE.
+- **Corroborate (`cve_corroborate`).** A matched CVE is linked to a **demonstrated crash** when the pipeline
+  has one whose class/site is consistent — turning a version match into corroborated evidence.
+- **Weaponize (`cve_poc`).** For a matched CVE, a **per-CVE or CWE-class trigger** is detonated against the
+  target; a **verified repro is recorded only when a real fault fires**, never on the version match alone. The
+  first authored trigger is **CVE-2022-37434** (zlib `inflate` heap OOB via an oversized gzip `FEXTRA` field),
+  which reproducibly aborts real **zlib 1.2.11 under ASan**.
+
+New attack-surface coverage feeds the same findings lifecycle: **embedded config audit** (`embedded_audit`,
+e.g. `FreeRTOSConfig.h`), the **integer-overflow-into-allocation** detector (`int_overflow_scan`, CWE-190,
+guard-aware, source-level), and **TCP/UDP network fuzzing** of socket servers (`net_fuzz`).
+
+### Optional model hook (unshipped)
+Detection is deterministic (decision `overview.md`). The plugin API leaves a hook so an operator with a local model could
 add vuln *hypotheses* as extra Candidates — but they would still require deterministic validation before
 reaching Confirmed, and nothing depends on the hook.
 
@@ -298,7 +316,7 @@ Find where untrusted data enters, using static taint + a light dynamic probe:
   preconditions and calls the target function, using **deterministic templates** driven by the recovered
   prototype/types. The tool proposes a skeleton harness (allocate buffers for pointer args, wire the
   fuzz input to the tainted parameter); the **analyst reviews and hand-tunes** it. We compile/emulate and
-  validate it doesn't trivially crash on setup. No LLM — this is the honest limit: auto-harnessing library
+  validate it doesn't trivially crash on setup. This is the honest limit: auto-harnessing library
   functions is assisted, not automatic.
 - **Emulation harness (no runnable program):** drive a single function under Unicorn/Qiling with a
   synthesized state (the dynamic-analysis section T0) — lets us fuzz code that can't be launched as a process.
@@ -393,7 +411,7 @@ served by `GET /artifacts/{sha}/bundle`.
 - **Symbolic replay:** re-run the crashing input under angr/Triton to recover the exact constraint that
   makes it fail and to identify controllable bytes (the basis for the PoC ladder below).
 - **Analyst explanation (templated):** the tool renders the slice + decompiled context + evidence into a
-  structured root-cause + remediation writeup from templates; the analyst edits. No LLM narration.
+  structured root-cause + remediation writeup from templates (not generated prose); the analyst edits.
 
 ### 8.3 PoC ladder (define what "PoC" means — Gap H)
 Each level is a **demonstrable bundle**; the tool claims only the level it actually achieved.
@@ -479,7 +497,7 @@ components (arch/format/mitigations), edges are relationships, and findings can 
   B's parameter → B's sink) and *across* IPC by modeling each channel as a paired **taint sink (send) →
   taint source (recv)** with a "channel contract" (what serializes across). This is how a source in A and a
   sink in B become one **cross-component finding**.
-- **This is a solved deterministic problem (`internal/16-sota-references.md`), no AI:** our component graph is essentially **Karonte's
+- **This is a solved deterministic problem (`internal/16-sota-references.md`):** our component graph is essentially **Karonte's
   Binary Dependency Graph** (S&P'20 -- 46 zero-days across 53 firmware images with pure static taint). Adopt
   its patterns plus **SaTC** (shared-keyword front-end/binary taint), **BPDA** (faster + more precise), and
   **Mango** (scalable taint-style discovery). Study these before building the taint engine.
@@ -516,7 +534,7 @@ hardware it doesn't have. Rehosting = emulate it faithfully enough to execute/fu
   components, and feed them into the component graph (17.1). Bare-metal blobs use the headerless loader
   wizard (the stripped-recovery section.6) with the target arch (ARM/PPC/MIPS, `overview.md`).
 - **Fidelity ladder:** partial (single task under Unicorn+models) → full-system (whole image under QEMU) →
-  hardware-in-the-loop is **out of scope** (air-gapped, no device farm).
+  hardware-in-the-loop is **out of scope** (offline, no device farm).
 
 ### 17.6 What it produces
 A merged component graph, cross-component findings with source/sink in different binaries, whole-system

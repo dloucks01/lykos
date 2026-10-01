@@ -40,7 +40,13 @@
 - A **DAG of stages** per case: `load → disasm → decompile → recover(strip) → static-cwe → dynamic-triage
   → harness → fuzz → crash-triage → symbolic-confirm → poc → report`. Stages are individually
   runnable/re-runnable; the UI shows the graph and lets the analyst run/skip/re-run any node.
-- **Job queue** backed by SQLite (air-gap friendly, no broker). Each job: inputs (content-hashed),
+- The stage set has grown to **~40** stages. Recent additions: `source_cve_scan` (CVE matching over a
+  source project's dependency manifests + vendored headers), `embedded_audit` (RTOS config review, e.g.
+  `FreeRTOSConfig.h`), `int_overflow_scan` (CWE-190 integer-overflow-into-allocation, guard-aware),
+  `net_fuzz` (TCP/UDP socket fuzzing of network servers), `cve_corroborate` (link a matched CVE to a
+  demonstrated crash), and `cve_poc` (weaponize a matched CVE with a trigger that confirms a repro only on
+  a real fault).
+- **Job queue** backed by SQLite (offline-friendly, no broker). Each job: inputs (content-hashed),
   tool version, params, status, artifacts out. Idempotent + **result-cached by (stage, input-hash,
   params, tool-version)** so re-opening a case is instant and re-runs are cheap.
 - **Scheduler + resource governor:** concurrency caps per resource class (CPU-heavy decompile vs
@@ -82,7 +88,7 @@ This correlation is what lets a noisy candidate get promoted to Confirmed.
 
 ### Case-centric model
 Everything lives under a **Case** (one engagement/target set). A case is self-contained and portable
-(export/import as a directory or archive) so it can move between air-gapped hosts.
+(export/import as a directory or archive) so it can move between offline hosts.
 
 ```
 Case
@@ -120,7 +126,7 @@ Case
 ### Reproducibility (not "chain of custody" — engineering reproducibility)
 - Hash every input and artifact; pin every tool/model/pack **version** into each run and report.
 - A finding records exactly *how* it was produced so re-running yields the same result — critical when
-  bundles are stale (`air-gap.md`) and when a colleague on another air-gapped host must reproduce a PoC.
+  bundles are stale (`offline-packaging.md`) and when a colleague on another offline host must reproduce a PoC.
 - Deterministic seeds where engines allow; record RNG seeds for fuzz/symbolic runs.
 
 ### Logging & audit
@@ -129,17 +135,17 @@ Case
 
 ---
 
-## Technology Stack & Licensing (Zero-AI)
+## Technology Stack & Licensing
 
-Bias: **orchestrate proven, deterministic OSS** behind a lean custom core we own (decision `overview.md`). No ML/LLM
-in the shipped product, no GPU dependency. Prefer permissive licenses (air-gapped redistribution). "Primary"
+Bias: **orchestrate proven, deterministic OSS** behind a lean custom core we own (decision `overview.md`).
+The engines are CPU-only, with no GPU dependency. Prefer permissive licenses (offline redistribution). "Primary"
 = default; "alt" = swappable behind the module interface.
 
 ### Deployment target (decision `overview.md`)
 - **Kali VM**, ~32 GB RAM, 4+ cores, **nested virtualization available** (KVM inside the VM works, verify per
   host). So KVM-backed microVMs and accelerated system emulation are viable, not just TCG.
 - **No GPU.** Modest core count → a few parallel fuzz instances, not a farm; size the resource governor accordingly.
-- **Fully self-contained package:** everything needed to run ships in the installer (`air-gap.md`).
+- **Fully self-contained package:** everything needed to run ships in the installer (`offline-packaging.md`).
 
 ### Languages
 - **Backend/orchestration:** Python 3.12 (richest deterministic RE/exploit ecosystem: angr, pwntools,
@@ -169,33 +175,31 @@ in the shipped product, no GPU dependency. Prefer permissive licenses (air-gappe
 | Crash triage | CASR | custom gdb | Apache-2.0 |
 | Gadgets/exploit | ROPgadget/ropper + pwntools | — | permissive |
 | Rule pattern-match (secondary) | Semgrep / Weggli over decompiled C | Ghidra P-Code scripts | permissive |
-| Vector/similarity | structural/graph + function hashing | — | (deterministic, no ML) |
+| Vector/similarity | structural/graph + function hashing | — | (deterministic) |
 | Data store | SQLite (+ DuckDB for trace analytics) | — | public-domain/MIT |
 
 > **Licensing action item:** GPL tools (QEMU, Unicorn, Qiling, GDB, BinDiff) are fine as **separate bundled
 > processes**; avoid static linking that would impose copyleft on our code. Dropping ML model weights removes
 > the thorniest redistribution risk from the earlier plan.
 
-### No-AI posture (decision `overview.md`)
-- **Zero AI in the shipped package.** No model weights, no GPU runtime, no agentic loop, no neural
-  decompiler/naming. All naming is deterministic (`pipeline.md`); all detection is rules + taint + symbolic +
-  dynamic (`pipeline.md`).
-- **Optional, unshipped plugin hook for a local Ollama** instance is left in the plugin API for operators who
-  want naming/summary *suggestions* later. Nothing depends on it; it is never bundled. A low-quality small
-  model would hurt more than help — so the default is off and unshipped.
+### Deterministic core (decision `overview.md`)
+- The shipped package is **deterministic and CPU-only**: all naming is deterministic (`pipeline.md`); all
+  detection is rules + taint + symbolic + dynamic (`pipeline.md`), so every result is reproducible from its
+  recorded inputs. A plugin hook is left in the API for an operator who later wants to wire in a local model
+  for naming/summary *suggestions*; nothing depends on it and it is not bundled.
 
 ### Data & platform
 - **DB:** SQLite (cases, findings, jobs, provenance) + DuckDB for analytics over large trace tables.
 - **Artifact store:** content-addressed files on disk (hash-named), referenced from SQLite.
-- **Packaging:** offline OCI/Podman images or a Nix/`apt` offline repo for reproducible installs (`air-gap.md`).
+- **Packaging:** offline OCI/Podman images or a Nix/`apt` offline repo for reproducible installs (`offline-packaging.md`).
 - **Target OS:** pinned Kali/Debian-family matching the VM; document the exact base.
 
 ### Harvest the engines, own the glue (decision `overview.md`)
 Build a **lean custom orchestration core** (job queue, stage DAG, data model, GUI) that one person can
 understand and maintain over a long horizon. **Harvest aggressively at the tool/library level** (Ghidra,
 angr, AFL++/LibAFL, QEMU, CASR, BinDiff, ROPgadget, signature DBs). **Study** open Cyber Reasoning Systems
-(e.g., Trail of Bits' Buttercup) for orchestration *ideas only* — do not fork them; they are online,
-AI-integrated, and source/patch-shaped, the opposite of our offline, binary-only, zero-AI posture.
+(e.g., Trail of Bits' Buttercup) for orchestration *ideas only* — do not fork them; they are online
+and source/patch-shaped, the opposite of our offline, binary-only, deterministic posture.
 
 ### Why not build our own decompiler/fuzzer/emulator
 Each represents many person-years. The moat is the orchestration, correlation, the confidence pipeline,

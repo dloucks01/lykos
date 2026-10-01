@@ -1,13 +1,14 @@
-# lykos — air-gapped binary vulnerability analysis platform
+# lykos — binary & source vulnerability analysis platform
 
 > **Authorized use only.** An offensive-security tool, for binaries and systems you are
 > authorized to test. Authorization is an operator-process matter and is deliberately not
 > modelled in the software (see `docs/overview.md`).
 
-lykos ingests a binary — stripped, cross-architecture, firmware, JAR, or PE — recovers its
-structure, detects CWE-class defects through static, dynamic and symbolic analysis, builds a
-fuzzing harness around it, and produces a **reproducible proof-of-concept** for what it
-confirms. It runs entirely offline and has no network code paths at all.
+lykos ingests a binary — stripped, cross-architecture, firmware, JAR, or PE — or a C/C++ source
+tree, recovers its structure, detects CWE-class defects through static, dynamic and symbolic
+analysis, fingerprints known **CVEs** in bundled and third-party components, builds a fuzzing
+harness around it, and produces a **reproducible proof-of-concept** for what it confirms. It is
+self-contained and needs no network at run time.
 
 ```sh
 git clone https://github.com/dloucks01/lykos && cd lykos
@@ -19,7 +20,7 @@ Nothing to install to get that far: the core is **stdlib-only**, no pip packages
 engines (Ghidra, qemu-user, AFL++, GDB, angr…) are optional and separately bundled — and that
 bundle installs nothing either. It extracts to a relocatable tree under `vendor/` that lykos
 runs in place: no `dpkg`, no root, and the host's own libraries are never overwritten or put on
-any shared search path. See **[docs/air-gap.md](docs/air-gap.md)**.
+any shared search path. See **[docs/offline-packaging.md](docs/offline-packaging.md)**.
 
 **New here?** [QUICKSTART.md](QUICKSTART.md) walks you from a fresh install to your first
 finding in five minutes.
@@ -39,6 +40,23 @@ and drives each crash as far up the exploitation ladder as the target allows.
   ROP hijacking control to chosen code), or the **captured leaked bytes** of a format-string
   disclosure. Nothing is over-claimed — ASan-guarded source stays *potential* for RCE and
   *demonstrated* for DoS. (docs [08](docs/pipeline.md))
+- **Known-CVE detection + weaponization.** Fingerprints vulnerable component versions on **both**
+  channels — a compiled binary's version banners *and* a source project's dependency manifests
+  (`requirements.txt`, `package-lock.json`, `go.mod`, `Cargo.lock`) and vendored headers
+  (`zlib.h`, `openssl`, `mbedTLS`, `wolfSSL`, **FreeRTOS** `tskKERNEL_VERSION_NUMBER`) — against a
+  bundled offline database (OSV language-ecosystem index + an NVD-CPE set for C/embedded
+  libraries). Each match names its exploit class, is corroborated by any demonstrated crash of a
+  matching class on the target, and — where an authored trigger exists — is **weaponized**: the
+  trigger is fired at the target and recorded as a verified reproduction only if it actually
+  faults. (docs [08](docs/pipeline.md))
+- **Embedded / RTOS aware.** A FreeRTOS config audit flags disabled safety nets
+  (`configCHECK_FOR_STACK_OVERFLOW` off, no MPU, `configASSERT` undefined), an
+  integer-overflow-into-allocation detector catches the `a*b`-into-`malloc` class (guard-aware, so
+  a fixed, bounds-checked site is not flagged), and firmware images are carved into their embedded
+  binaries, filesystems and secrets, each analysed as a target of its own.
+- **Network attack surface.** A socket server is fuzzed the way it is actually reached — spawned,
+  its listening port discovered, and driven over a real TCP/UDP connection — and a confirmed crash
+  flows into the same exploitation ladder as any other.
 - **Coverage that compounds.** When fuzzing stalls at a guarded branch, concolic execution solves
   it and the search **re-fuzzes from the solved inputs**, reaching the code beyond — 44% → 100%
   block coverage on a magic-gated target, automatically. (docs [07](docs/pipeline.md))
@@ -74,7 +92,6 @@ and drives each crash as far up the exploitation ladder as the target allows.
 4. **Absence of evidence is not evidence of absence.** A stage that could not run says so, in
    its own words, and never as a clean result. This is the single most load-bearing rule in
    the codebase and most of its hard-won bug fixes are instances of it.
-5. **Air-gap is a constraint, not a feature.** No component may assume network access.
 
 ## Commands
 
@@ -92,8 +109,8 @@ make eval-gate         # detection-quality gate over the bundled corpus
 make arch-gate         # every architecture still reaches its PoC level
 make real-gate         # full chain on real programs (detect -> PoC -> attribution)
 make release           # ci + verify + all four gates
-make toolchain-bundle  # build the air-gap toolchain tarball (on a CONNECTED machine)
-make repo-tarball      # snapshot the repo for sneakernet (tracked files at HEAD, + sha256)
+make toolchain-bundle  # build the offline toolchain tarball (on a CONNECTED machine)
+make repo-tarball      # snapshot the repo for transfer (tracked files at HEAD, + sha256)
 ./package              # ONE unzip-and-run .zip: repo + fully-populated vendor/ (no install)
 make dashboard         # detection-quality regression dashboard from eval-history.jsonl
 make clean             # remove build artifacts and caches
@@ -102,20 +119,25 @@ make clean             # remove build artifacts and caches
 `make lint` and `make typecheck` **fail** when their tool is missing rather than skipping, so
 `make ci` cannot go green without having actually run them.
 
+To (re)build the offline CVE database: `python tools/build_cvedb.py --sqlite --json --clibs`
+(on a connected machine). The small curated subset is committed; the full OSV match index and
+the NVD reference pack travel with the package. See `core/lykos/analyze/fingerprint/cvedb.py`.
+
 ## Where things are
 
 ```
 core/lykos/        the platform (stdlib only)
-  analyze/         the 29 analysis stages, grouped by what they do
+  analyze/         the 40 analysis stages, grouped by what they do
   api/             HTTP + WebSocket server and the single-page UI
   db/              schema, migrations, DAOs
   eval/            benchmark corpora and the quality gates
   jobs/            the job queue and worker pool
   toolchain.py     one inventory of every external tool  <- `lykos doctor` reads this
-tests/             the suite (~1290), incl. js/ harnesses for the UI
-docs/              design docs 00-25; archive/ is historical, not maintained
+tests/             the suite, incl. js/ harnesses for the UI
+tools/             dev-time builders (e.g. the offline CVE database)
+docs/              design docs; internal/ archive/ are historical, not maintained
 examples/          runnable demos and fixture builders
-packaging/         zipapp build, offline verify, air-gap bundle scripts
+packaging/         zipapp build, offline verify, and bundle scripts
 ```
 
 ## Documents
@@ -124,9 +146,9 @@ packaging/         zipapp build, offline verify, air-gap bundle scripts
 |-----|----------------|
 | [`docs/overview.md`](docs/overview.md) | Vision, users, non-goals, capability tiers; risks, constraints, open decisions |
 | [`docs/architecture.md`](docs/architecture.md) | Layers, pipeline/job engine, module boundaries; tech stack & licensing; data model & reproducibility |
-| [`docs/pipeline.md`](docs/pipeline.md) | The analysis engine end to end: static/RE → stripped recovery → CWE detection → dynamic & sandbox → fuzzing → triage & PoC → multi-binary/firmware |
+| [`docs/pipeline.md`](docs/pipeline.md) | The analysis engine end to end: static/RE → stripped recovery → CWE detection → CVE fingerprint & weaponization → dynamic & sandbox → fuzzing → triage & PoC → multi-binary/firmware |
 | [`docs/coverage.md`](docs/coverage.md) | Architecture coverage matrix, CWE coverage matrix, and how detection quality is measured |
-| [`docs/air-gap.md`](docs/air-gap.md) | Packaging design, per-host toolchain setup, and the no-install air-gap runbook |
+| [`docs/offline-packaging.md`](docs/offline-packaging.md) | Packaging design, per-host toolchain setup, bundled data packs, and the no-install offline runbook |
 | [`docs/gui.md`](docs/gui.md) | The workbench UI: architecture, views, design system |
 
 New here? [QUICKSTART.md](QUICKSTART.md) is the five-minute path to your first finding;

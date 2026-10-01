@@ -36,7 +36,7 @@ candidate→confirmed→PoC promotion (the ~32% ceiling means the analyst is in 
 7. **Report builder** — assemble findings into a report, preview, export HTML/PDF/SARIF. (`pipeline.md`)
 8. **Recovery view** — the deterministic naming stack (`pipeline.md`): signature/FID matches, corpus-diff name
    transfers (BinDiff), runtime-metadata recovery (Go pclntab / C++ RTTI), and behavioral tags, each with
-   provenance and confidence, batch accept/reject. (No AI agent — decision `overview.md`.)
+   provenance and confidence, batch accept/reject. (Deterministic naming — decision `overview.md`.)
 
 ### 9.3 Visual & interaction design system ("highly stylized, organized, neat")
 - **Aesthetic:** dark-first, high-contrast "operator console" — think a refined SOC/RE cockpit. Restrained
@@ -55,7 +55,7 @@ candidate→confirmed→PoC promotion (the ~32% ceiling means the analyst is in 
 ### 9.4 As built — the "workbench" (shipped UI)
 The shipped interface is a **dependency-free Preact + htm** single page served by the API
 (`core/lykos/api/static/`, no build step, ESM vendored under `static/vendor/`) — chosen over the
-Tauri/React target for zero-install air-gap delivery. The classic view remains at `/classic.html`.
+Tauri/React target for zero-install offline delivery. The classic view remains at `/classic.html`.
 
 Centered on **one-click Autopilot**: drop a binary or C/C++ **source** file → Autopilot runs the
 full pipeline (recover → detect → fuzz → **coverage loop** → prove → enrich → review) and drives

@@ -5,7 +5,7 @@
 ## Overview, Goals, and Honest Feasibility
 
 ### Vision
-A single air-gapped Linux workstation app that takes an arbitrary binary and drives it through the full
+A single offline Linux workstation app that takes an arbitrary binary and drives it through the full
 offensive-analysis lifecycle — load → reverse engineer → detect weaknesses → confirm dynamically →
 demonstrate with a PoC — inside one coherent, styled analyst workflow.
 
@@ -26,6 +26,8 @@ vs *frontier research*, so the roadmap does not over-promise.
 | CFG/callgraph/xref, string/const analysis | Solved | Orchestrate + present |
 | Stripped-binary function recovery via signatures | Mostly solved (FLIRT/FCG/sig DBs) | Bundle DBs + ML assist |
 | Static CWE pattern + taint detection | Solved but **noisy** | Orchestrate + confidence scoring |
+| Known-CVE detection (binary version banners **+** source dependency manifests + vendored headers) | Solved for known components | Fingerprint → bundled offline CVE DB (OSV + NVD-CPE) match |
+| CVE **weaponization** (per-CVE + CWE-class triggers) | Hard, scoped | Trigger fires; repro recorded **only** on a real fault |
 | Sandboxed execution / tracing / coverage | Solved (QEMU/Qiling/DynamoRIO) | Orchestrate + isolate |
 | Coverage-guided fuzzing of binaries | Solved (AFL++ qemu/frida mode) | Orchestrate + auto-harness |
 | **Automatic harness synthesis** | **Hard, partially solved** | Assisted, human-in-loop |
@@ -45,7 +47,7 @@ generation is explicitly a stretch goal, not an MVP promise.
 - Not a source-code SAST tool (we assume binary-only, though we ingest debug info if present).
 - Not multi-user collaboration server. Single workstation.
 - Not a general disassembler replacement — we embed one.
-- Not cloud/online CVE correlation (air-gapped); CVE/version data is bundled and clearly dated.
+- Not cloud/online CVE correlation (offline); CVE/version data is bundled and clearly dated.
 
 ### Success criteria (v1)
 1. Ingest a stripped x86-64 ELF and produce a navigable RE view with recovered functions.
@@ -75,19 +77,18 @@ generation is explicitly a stretch goal, not an MVP promise.
    Both are made possible by architecture-neutral IR (detectors written once) + a live in-app capability
    matrix so coverage is always shown honestly. Breadth is delivered in waves (Tier 1 → 2 → 3 → 4), not
    all at v1 — but the design accommodates all of it from day one.
-5. **AI ambition. [DECIDED — ZERO AI in the product.]** No ML, no LLM, no GPU. Every capability is
-   deterministic (naming: `pipeline.md`; detection: `pipeline.md`; PoC: `pipeline.md`). Rationale: the target is a Kali VM with no
-   GPU, and a low-quality small model would hurt more than help. An **optional, unshipped plugin hook for a
-   local Ollama** instance is left in the plugin API for an operator who later wants naming/summary
-   *suggestions* — but it is never bundled and nothing depends on it. The deterministic bug-finding stack
-   (signatures + rules + taint + symbolic + fuzzing + sanitizers) is the industry standard; AI was the
-   newcomer on top, not the foundation, so the impact of dropping it is contained to custom-code naming and
-   summaries (an inherently human RE task).
+5. **Analysis approach. [DECIDED — deterministic orchestration.]** Every capability is a **deterministic**
+   pipeline that orchestrates proven OSS (Ghidra/rizin, angr, AFL++, QEMU, GDB) behind a custom core we own
+   (naming: `pipeline.md`; detection: `pipeline.md`; PoC: `pipeline.md`). The deterministic bug-finding stack
+   (signatures + rules + taint + symbolic + fuzzing + sanitizers) is the industry standard and is what every
+   finding and PoC is reproducible from. A plugin hook is left in the API for an operator who later wants to
+   wire in a local model for naming/summary *suggestions*, but nothing in the pipeline depends on it and it is
+   not bundled.
 6. **Hardware envelope. [DECIDED — Kali VM, no GPU.]** Design for ~**32 GB RAM, 4+ cores, nested
    virtualization available** (KVM inside the VM). Consequences: KVM-backed microVMs (T2) and accelerated
    system emulation (T3) are viable, not just software TCG (`pipeline.md`). Modest core count → a **few** parallel
-   fuzz instances, not a farm; the resource governor (`architecture.md`) is sized for this. No GPU means no real-time AI
-   even if a model were added — reinforcing decision 5.
+   fuzz instances, not a farm; the resource governor (`architecture.md`) is sized for this. The engines are
+   CPU-only, consistent with the deterministic approach in decision 5.
 7. **PoC ceiling. [DECIDED — a finding is "confirmed" only when a demonstrable effect is reproduced.]** This is
    the definition of vulnerable, and it drives the confidence lifecycle (`pipeline.md`): **Confirmed** is tied to a
    reproducible artifact that produces an observable effect (a crash + sanitizer report, PC control, a leak, an
@@ -99,9 +100,9 @@ generation is explicitly a stretch goal, not an MVP promise.
    spine (job queue, stage DAG, data model, GUI) so one person can understand and maintain it over a long
    horizon. **Harvest aggressively at the tool/library level** (Ghidra, angr, AFL++/LibAFL, QEMU, CASR,
    BinDiff, ROPgadget, signature DBs). **Study** open Cyber Reasoning Systems (Trail of Bits' Buttercup et al.)
-   for orchestration *ideas only* — do not fork them; they are online, AI-integrated, source/patch-shaped, the
-   opposite of our offline, binary-only, zero-AI posture. Rationale: solo + long horizon makes comprehension
-   and ownership beat a head-start, and without AI orchestration the spine is a manageable amount of code.
+   for orchestration *ideas only* — do not fork them; they are online and source/patch-shaped, the
+   opposite of our offline, binary-only, deterministic posture. Rationale: solo + long horizon makes
+   comprehension and ownership beat a head-start, and the orchestration spine is a manageable amount of code.
 
 ### Technical risks
 - **False positives** overwhelm the analyst → mitigated by the confidence pipeline (`pipeline.md`); this is the make-
@@ -113,7 +114,7 @@ generation is explicitly a stretch goal, not an MVP promise.
   snapshot rollback (`pipeline.md`). Treat isolation bugs as security-critical.
 - **Resource thrash** (Ghidra + VMs + fuzzers + LLM on one box) → the resource governor (`architecture.md`) is essential,
   not optional.
-- **Bundle staleness** on an air-gapped host → surface data-pack ages everywhere; never imply currency (`air-gap.md`).
+- **Bundle staleness** on an offline host → surface data-pack ages everywhere; never imply currency (`offline-packaging.md`).
 - **Benchmark contamination** inflating perceived quality → use 2026 contamination-free sets (`coverage.md`).
 
 ### Licensing / distribution risk
@@ -128,4 +129,4 @@ or chain-of-custody module is planned; that's an operator-process matter, out of
 ### Non-technical
 - **Effort realism:** full scope is multi-person, multi-year. Phases 0–7 (`internal/13-roadmap-milestones.md`) are the credible v1;
   8–9 are research. Right-size the team or the scope, not both optimistically.
-- **Maintenance:** signatures/CVE/models rot; plan the sneakernet update cadence (`air-gap.md`) before shipping.
+- **Maintenance:** signatures/CVE/data packs rot; plan the sneakernet update cadence (`offline-packaging.md`) before shipping.

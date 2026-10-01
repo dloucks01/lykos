@@ -264,13 +264,13 @@ families** (with detection strategy + channel + feasibility) and an **out-of-sco
 claims coverage honestly and never reports what it cannot actually see.
 
 ### How we organize coverage
-- We import the MITRE CWE catalog offline (`air-gap.md`) and attach to each in-scope CWE: primary **channel(s)**
+- We import the MITRE CWE catalog offline (`offline-packaging.md`) and attach to each in-scope CWE: primary **channel(s)**
   (`pipeline.md`: `pattern` / `taint` / `symbolic` / `dynamic`), a **feasibility** rating, and remediation text.
 - We anchor priority on the **CWE Top 25** and the **hardware view (CWE-1194)** for firmware, but coverage
   is family-based, not a fixed list — a new detector maps to whichever CWEs its evidence pattern implies.
 - **Feasibility ratings:** `HIGH` reliably detectable + confirmable · `MED` detectable with some FP/FN ·
   `LOW` heuristic/assistive only · `DYN` needs execution to confirm · `MANUAL` rule/heuristic hint that
-  requires analyst reverse-engineering to judge (no AI — decision `overview.md`).
+  requires analyst reverse-engineering to judge (deterministic assists only — decision `overview.md`).
 - Detectors run on the architecture-neutral IR, so a family's detection logic is written once.
 
 ### Implemented native detectors (as of 2026-09)
@@ -453,7 +453,7 @@ These are real CWEs but generally invisible in a compiled binary or belong to ot
 - **Design / process / governance:** 1053, 1059, most "pillar/class" abstract entries, CWE-CATEGORY nodes,
   supply-chain-process, documentation, and configuration-of-external-systems weaknesses.
 - **Source-only constructs** lost at compile time: many style/maintainability weaknesses.
-- **Physical/side-channel** (power/EM/timing hardware) — needs instrumentation we don't have air-gapped.
+- **Physical/side-channel** (power/EM/timing hardware) — needs physical instrumentation we don't have offline.
 We record these as "known-not-covered" in the taxonomy engine so the UI shows *gaps*, not false silence.
 
 ### Coverage methodology & honesty
