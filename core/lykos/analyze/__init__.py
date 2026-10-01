@@ -1,4 +1,4 @@
-"""Deterministic analysis stages (zero-AI).
+"""Deterministic analysis stages.
 
 Phase 0: ingest/triage (pure-stdlib ELF parsing; LIEF deferred for PE/Mach-O).
 Phase 1: `disassemble` via Ghidra headless (bundled in the full offline package; the

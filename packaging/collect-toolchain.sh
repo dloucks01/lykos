@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Build the air-gap TOOLCHAIN bundle. Run on a machine WITH network; carry the result to the
-# air-gapped workstation and run setup.sh from the extracted bundle (nothing is installed).
+# Build the offline TOOLCHAIN bundle. Run on a machine WITH network; carry the result to the
+# offline workstation and run setup.sh from the extracted bundle (nothing is installed).
 #
 # The lykos repo itself needs no bundle -- clone it and the stdlib-only core runs. This carries
 # the optional engines (Ghidra, qemu-user, GDB, AFL++, Wine, cross compilers, the angr/Unicorn
@@ -85,7 +85,7 @@ say "collector prerequisites (container only)"
 apt-get -qq install -y --no-install-recommends \
         python3 python3-venv python3-pip ca-certificates zstd >/dev/null 2>&1
 
-# The bundle installs NOTHING on the air-gapped side: it ships a relocatable toolchain/ tree
+# The bundle installs NOTHING on the offline side: it ships a relocatable toolchain/ tree
 # the engines run out of in place. So here we DOWNLOAD the debs and then EXTRACT them into that
 # tree (dpkg-deb -x, data only, no maintainer scripts, no dpkg database) rather than shipping
 # the .deb files for a dpkg install.
@@ -129,7 +129,7 @@ printf "  toolchain/ is %s\n" "$(du -sh /stage/toolchain | cut -f1)"
 
 # Ghidra is a REQUIRED engine. In the container path extras/ is not populated (the repo is not
 # mounted in), so if this image also does not package Ghidra the bundle ships without it -- warn
-# loudly rather than let the air-gapped setup discover it at first disassemble.
+# loudly rather than let the offline setup discover it at first disassemble.
 # The RE backend is rizin/rz-ghidra + pypcode (Ghidra is replaced, no JVM). What must not be
 # missing is the native backend itself -- warn if rizin did not land in the tree.
 if [ -z "$(find /stage/toolchain -iname "rizin" -o -iname "rz-ghidra*" 2>/dev/null | head -1)" ]; then
@@ -205,7 +205,7 @@ The .sha256 and the bundle's SHA256SUMS are UNSIGNED: they prove the bundle arri
 un-corrupted and un-added-to, not that it is authentic. Carry it over a trusted channel.
 (Future: sign SHA256SUMS and verify the signature at setup time.)
 
-On the air-gapped host -- carry the repo, this file and its .sha256, and verify on ARRIVAL.
+On the offline host -- carry the repo, this file and its .sha256, and verify on ARRIVAL.
 Nothing is installed: the toolchain is placed under the repo's vendor/ and run in place.
   sha256sum -c $(basename "$OUT").sha256
   mkdir -p /tmp/lt && tar xf $(basename "$OUT") -C /tmp/lt

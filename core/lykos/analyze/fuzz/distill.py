@@ -5,7 +5,7 @@ dominates the choice of fuzzer -- a smaller corpus that preserves total coverage
 campaign spend its budget on new behaviour instead of re-running near-duplicate inputs. afl-cmin is
 the classic tool; lykos does the same thing self-contained, using the **block-coverage tracer it
 already has** (so it works on a stripped, cross-architecture binary with no instrumented build), and
-adds no dependency: pure greedy set-cover over per-input block sets, non-AI and deterministic.
+adds no dependency: pure greedy set-cover over per-input block sets and deterministic.
 
 Two pieces:
   * ``greedy_minset`` -- the pure algorithm: given each input's set of reached blocks, greedily keep

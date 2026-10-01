@@ -8,7 +8,7 @@ outer parser forever. Nautilus (NDSS'19) and Gramatron (ISSTA'21) solve this by 
 context-free grammar so every input is structurally valid and the fuzzer explores the *handlers*.
 
 This is a self-contained grammar engine in lykos's own campaign -- no external Gramatron/Nautilus,
-no AFL++ custom-mutator glue, no dependency, non-AI and deterministic given the RNG. It provides:
+no AFL++ custom-mutator glue, no dependency and deterministic given the RNG. It provides:
 
   * a compact grammar representation (rules of alternative productions of literal / reference
     elements) with a ``%ref%`` string DSL and a JSON-list form for `params.grammar`;

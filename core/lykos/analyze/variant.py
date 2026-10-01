@@ -28,7 +28,7 @@ already recovered -- no external BinDiff/BSim, self-contained and offline -- and
 It will not match aggressively-different optimization levels the way a heavyweight semantic matcher
 does -- for that, the roadmap (doc 28) points at Ghidra BSim -- but for the common N-day case (same
 source, same/similar toolchain, version N vs N+1, one library linked into many products) it is fast,
-deterministic, non-AI and offline.
+deterministic and offline.
 """
 from __future__ import annotations
 

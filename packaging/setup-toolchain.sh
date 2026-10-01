@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Place the air-gap toolchain bundle so lykos runs it IN PLACE. Run this ON the air-gapped
+# Place the offline toolchain bundle so lykos runs it IN PLACE. Run this ON the offline
 # workstation, from the directory the bundle was extracted into. Needs no network, no root,
 # and installs NOTHING into the system: it moves the extracted tree under the repo's vendor/
 # directory, where lykos finds every engine on its own PATH and vendor search.

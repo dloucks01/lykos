@@ -1,6 +1,6 @@
 """Self-contained, print-optimized HTML report (doc 08 §8.5, doc 09 §7).
 
-Single file, inlined CSS, no external assets (air-gap clean). Severity/state colors
+Single file, inlined CSS, no external assets (offline clean). Severity/state colors
 come from the same design tokens the app UI uses (doc 09 §design-system) so the report
 reads as one system. PoC bundles, when embedded, are offered as `data:` download links
 so the report is a portable, reproducible deliverable. `@media print` yields a clean

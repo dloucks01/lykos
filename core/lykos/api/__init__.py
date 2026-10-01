@@ -1,4 +1,4 @@
-"""Local HTTP API + event WebSocket (P0.2 / P0.6), stdlib-only, Unix-socket bound.
+"""Local HTTP API + event WebSocket (P0.2 / P0.6), stdlib-based, Unix-socket bound.
 
 No FastAPI/uvicorn dependency: a ThreadingHTTPServer over AF_UNIX with a hand-rolled
 RFC-6455 WebSocket for /events. The event stream tails the persisted `event` table

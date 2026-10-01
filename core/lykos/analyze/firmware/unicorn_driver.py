@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Standalone Unicorn firmware-rehosting driver (Phase 8, doc 17.5).
 
-Run by a Unicorn-capable interpreter (NOT imported by the stdlib-only Lykos core):
+Run by a Unicorn-capable interpreter (NOT imported by the stdlib-based Lykos core):
 
     <unicorn_python> unicorn_driver.py <spec.json> <out.json>
 

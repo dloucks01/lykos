@@ -2,7 +2,7 @@
 
 Groups runs into series (stage / min_state), shows the metric trend per series with the
 delta versus the previous run, and highlights regressions. The HTML is fully self-contained
-(inline CSS + inline SVG sparklines) so it works air-gapped.
+(inline CSS + inline SVG sparklines) so it works offline.
 """
 from __future__ import annotations
 

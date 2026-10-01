@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Standalone angr concolic/symbolic-execution driver (Phase 6).
 
-Run by an angr-capable interpreter (NOT imported by the stdlib-only Lykos core):
+Run by an angr-capable interpreter (NOT imported by the stdlib-based Lykos core):
 
     <angr_python> angr_driver.py <spec.json> <out.json>
 

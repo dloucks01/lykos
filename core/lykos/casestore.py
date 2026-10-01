@@ -4,7 +4,7 @@ A case is a self-contained directory:
     <case_dir>/case.db                 SQLite (WAL)
     <case_dir>/artifacts/<aa>/<bb>/<sha256>   content-addressed blobs
 
-Export/import archive the whole directory so a case moves intact between air-gapped hosts
+Export/import archive the whole directory so a case moves intact between offline hosts
 (doc 12). This ships a MINIMAL content store; the artifact-store epic (P0.4) formalizes it.
 """
 from __future__ import annotations

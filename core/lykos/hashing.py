@@ -1,7 +1,7 @@
 """DM-16 / DM-17 — Content hashing + canonical serialization.
 
 Shared primitives imported by the artifact store (P0.4) and the result cache (JE-15/16),
-and used by the triage worker (IT-20) to keep output deterministic. Stdlib only.
+and used by the triage worker (IT-20) to keep output deterministic. Stdlib-based.
 """
 from __future__ import annotations
 

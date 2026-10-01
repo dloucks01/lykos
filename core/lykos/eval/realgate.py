@@ -26,7 +26,7 @@ So this gate asserts the things those bugs broke:
   * detect, root_cause and the PoC ladder run together, because crash attribution is the join
     between them and no other gate runs either half.
 
-The fixtures are built here rather than downloaded: this is an air-gapped platform, and a
+The fixtures are built here rather than downloaded: this is an offline platform, and a
 release gate that needs the network is not one. They are small but not toy -- several
 functions, a real call graph, argv and file input paths -- and they reproduce the shapes that
 were validated by hand against ncompress 4.2.4 (CVE-2001-1413) and jhead 3.04.

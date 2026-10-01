@@ -11,7 +11,7 @@ offline re-extractor that any analyst can run to independently recover the crede
 binary alone. That extractability *is* the vulnerability, so the demonstrating artifact is the
 secret itself — the deterministic analog of a crash reproducer.
 
-Deterministic, zero-AI, air-gap clean, and safe (it only reads the file — it never runs the
+Deterministic, offline clean, and safe (it only reads the file — it never runs the
 target). Honest limit: it proves the credential is embedded and recoverable; whether that
 credential is still live on a real service is out of scope (rotate it regardless).
 """

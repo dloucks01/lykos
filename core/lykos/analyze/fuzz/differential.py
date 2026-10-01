@@ -9,7 +9,7 @@ they diverge. It is a NON-CRASHING oracle: a discrepancy is a finding with no cr
 class historically has very high CVE yield (NEZHA, IEEE S&P'17, found 778 discrepancies including
 among OpenSSL/LibreSSL/BoringSSL).
 
-This module is lykos's self-contained differential engine (non-AI, offline, reusing the sandbox and
+This module is lykos's self-contained differential engine (deterministic, offline, reusing the sandbox and
 the byte mutator):
 
   * ``outcome`` -- normalize one run into a comparable verdict: ``accept`` (exited 0), ``reject``

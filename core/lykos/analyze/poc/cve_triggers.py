@@ -7,7 +7,7 @@ trigger to a matched target and records a VERIFIED PoC only if the target actual
 fixed/unaffected target is never falsely flagged.
 
 Each trigger returns a Trigger: the input bytes, how to feed them (stdin/arg/file/stdin-slow),
-the CWE, and a human note. stdlib only.
+the CWE, and a human note. stdlib based.
 """
 from __future__ import annotations
 

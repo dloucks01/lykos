@@ -1,4 +1,4 @@
-"""Cross-architecture fault capture via qemu-user's gdbstub (pure stdlib, air-gap safe).
+"""Cross-architecture fault capture via qemu-user's gdbstub (pure stdlib, offline safe).
 
 Native L2/root-cause use ptrace/gdb, which only work on the host ISA. For an emulated target
 we instead launch `qemu-<arch> -g <port>` (the guest starts paused, speaking the GDB Remote
@@ -7,7 +7,7 @@ the guest's fatal signal read the guest register file -- so we recover the exact
 (including a hijacked/controlled value) and the general registers, on any ISA qemu supports.
 
 No gdb / gdb-multiarch needed: the RSP client is ~a page of socket code, matching the project's
-stdlib-only stance (cf. ptrace_capture.py). The register file layout is per-ISA (the g-packet
+stdlib-based stance (cf. ptrace_capture.py). The register file layout is per-ISA (the g-packet
 concatenates registers target-endian); layouts below are verified for aarch64/riscv64 and
 best-effort elsewhere. Returns a capture dict compatible with rootcause.classify and
 primitive.recover_ip_offset: {pc, sp, regs, signal, signal_name, arch, isolation}.
@@ -238,7 +238,7 @@ def capture(exe, arch, *, argv=(), stdin: bytes = b"", timeout: float = 8.0,
     port = port or _free_port()
     exedir = str(Path(exe).resolve().parent)
     # Detonating a hostile guest: contain the filesystem and cap resources. The network
-    # namespace is KEPT (net=True) so the loopback gdb stub is still reachable; on an air-gapped
+    # namespace is KEPT (net=True) so the loopback gdb stub is still reachable; on an offline
     # host loopback is not egress. rlimits bound memory-adjacent abuse (forks, file size, CPU)
     # without RLIMIT_AS, which qemu-user needs generously.
     cmd = sandbox.isolate_prefix(exedir, net=True) + \

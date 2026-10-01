@@ -10,7 +10,7 @@ variable) ONLY when no overflow guard appears nearby -- so patched code (FreeRTO
 added the guard) is NOT flagged, while the pre-fix shape is. A source heuristic, so findings are
 `candidate`: it cannot prove the operands are attacker-controlled, only that the guard is absent.
 
-Pure parsing, stdlib only; a file it cannot read is skipped, never fatal.
+Pure parsing, stdlib based; a file it cannot read is skipped, never fatal.
 """
 from __future__ import annotations
 

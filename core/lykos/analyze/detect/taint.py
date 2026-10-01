@@ -1,4 +1,4 @@
-"""Data-flow taint over Ghidra low-P-Code (deterministic, zero-AI).
+"""Data-flow taint over Ghidra low-P-Code (deterministic).
 
 Intra-procedural: flow-sensitive CFG fixpoint, def-use with kill-on-redefine, per-arch ABI
 registers. Inter-procedural: a summary-based fixpoint over the call graph that (a) pushes

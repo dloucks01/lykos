@@ -1,4 +1,4 @@
-"""CWE catalog subset + dangerous-API / input-source tables (deterministic, zero-AI)."""
+"""CWE catalog subset + dangerous-API / input-source tables (deterministic)."""
 from __future__ import annotations
 
 # CWE id -> (name, default severity)

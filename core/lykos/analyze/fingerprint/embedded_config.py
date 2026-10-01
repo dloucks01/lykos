@@ -6,7 +6,7 @@ off, every task shares one flat address space; if configASSERT is undefined, the
 sanity checks compile to nothing. These never show up as a code bug a disassembler can see --
 they are the absence of a defence, declared in config -- so they are their own detector.
 
-Pure parsing of the archived source tree, stdlib only. A missing/garbled config is simply no
+Pure parsing of the archived source tree, stdlib based. A missing/garbled config is simply no
 findings, never fatal.
 """
 from __future__ import annotations

@@ -2,7 +2,7 @@
 
 Resolves each component's imports against every other component's exports to build ONE
 merged system graph spanning the case's binaries (Karonte's Binary Dependency Graph
-pattern, deterministic, zero-AI). Importing registers the `link_case` stage.
+pattern, deterministic). Importing registers the `link_case` stage.
 """
 from .crosstaint import cross_taint_case  # noqa: F401
 from .detonate import detonate  # noqa: F401

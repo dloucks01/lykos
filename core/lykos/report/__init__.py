@@ -2,7 +2,7 @@
 
 Turns a case's findings/evidence/PoCs into shareable, reproducible deliverables:
 a self-contained **HTML** report (print-optimized), a genuine **PDF** (pure-stdlib
-writer, no external deps -- air-gap clean), a **SARIF 2.1.0** export for tool interop,
+writer, no external deps -- offline clean), a **SARIF 2.1.0** export for tool interop,
 and a machine-readable **case JSON** for archival/transfer. All generators consume one
 `build_report(...)` model so the four formats never drift.
 """

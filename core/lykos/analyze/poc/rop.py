@@ -140,7 +140,7 @@ def build_ret2csu(offset, pop, call, ptr, edi, rsi, rdx, length, rbx=0, rbp=0, a
 
 def find_one_gadgets(data: bytes):
     """One-gadget candidates in a libc image: addresses that reach `execve("/bin/sh", ...)` in a
-    single jump. Found without the external `one_gadget` tool (air-gap) by the byte pattern
+    single jump. Found without the external `one_gadget` tool (offline) by the byte pattern
     `lea rdi,[rip -> "/bin/sh"]` (48 8d 3d <disp32>) followed within a short window by a call to
     execve or an execve syscall (rax=0x3b; 0f 05). Jumping to the lea sets rdi="/bin/sh"; the site
     fires execve iff rsi and rdx are NULL at that moment -- so the constraint is recorded (whether
@@ -469,7 +469,7 @@ def build_ret2dlresolve(offset, *, read_plt, plt0, pop_rdi, pop_rsi, pop_rdx, re
     Elf64_Sym + the symbol string so that _dl_runtime_resolve resolves `symbol` (e.g. "system")
     and immediately calls it with rdi = &arg -- no libc leak, no `system` PLT entry needed. Works
     on ANY loader that still binds this target lazily (older glibc included; that is the common
-    air-gap case), because everything forged comes from the TARGET binary's own tables.
+    offline case), because everything forged comes from the TARGET binary's own tables.
 
     Returns (chain, data): the stage-1 ROP `chain` reads `data` into `scratch` via
     read(0, scratch, n), sets rdi = &arg, then drops into PLT0 with the forged reloc index.

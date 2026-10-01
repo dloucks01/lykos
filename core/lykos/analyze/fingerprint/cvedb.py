@@ -1,7 +1,7 @@
 """Offline CVE data access — the runtime side of the OSV snapshot + the optional reference pack.
 
-Two independent, read-only, stdlib-only data sources, each used when present and skipped cleanly
-when absent (so the tool runs identically air-gapped with or without them):
+Two independent, read-only, stdlib-based data sources, each used when present and skipped cleanly
+when absent (so the tool runs identically offline with or without them):
 
   * MATCH INDEX -- `cvedb.sqlite`, built by tools/build_cvedb.py from OSV. One row per
     (ecosystem, package, CVE): severity, CWE, and affected version ranges. This is what answers

@@ -8,7 +8,7 @@ For each resolved `dynamic-link` edge A -> B over an imported symbol S:
 If both hold, the boundary call is the bridge: emit a corroborated cross-component finding
 on B (where it manifests), with an evidence trail naming the source component and sink.
 
-Deterministic, zero-AI, register-granularity (same honest limits as intra-binary taint).
+Deterministic, register-granularity (same honest limits as intra-binary taint).
 Requires both components to have been disassembled (Ghidra); degrades to nothing otherwise.
 """
 from __future__ import annotations

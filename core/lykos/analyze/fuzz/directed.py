@@ -1,4 +1,4 @@
-"""Directed fuzzing at static candidates (Phase 5, zero-AI).
+"""Directed fuzzing at static candidates (Phase 5).
 
 Classical distance-based directed greybox fuzzing (AFLGo-style) says: don't explore blindly,
 steer toward the code sites that static analysis already flagged as dangerous. We can't

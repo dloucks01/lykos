@@ -1,4 +1,4 @@
-"""Deterministic CWE detectors + call-graph reachability correlation (zero-AI).
+"""Deterministic CWE detectors + call-graph reachability correlation.
 
 A detector is `fn(DetectContext) -> list[candidate dict]`. `correlate()` is a post-pass that
 promotes candidates when a second channel agrees (the confidence lifecycle, doc 05). This

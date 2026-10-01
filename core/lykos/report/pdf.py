@@ -1,4 +1,4 @@
-"""Pure-stdlib PDF writer + report layout (no external deps -- air-gap clean).
+"""Pure-stdlib PDF writer + report layout (no external deps -- offline clean).
 
 PDF is a text container format; this emits a genuine multi-page US-Letter PDF using
 the base-14 Helvetica fonts (no font embedding needed), with headings, wrapped body

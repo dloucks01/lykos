@@ -1,6 +1,6 @@
 """Emulation-based rehosting integration (doc 17.5): locate a Unicorn-capable interpreter,
 run the standalone rehosting driver in it, and parse the result -- keeping the Lykos core
-stdlib-only. Clear, graceful failure when Unicorn is absent (like the angr/SymQEMU backends).
+stdlib-based. Clear, graceful failure when Unicorn is absent (like the angr/SymQEMU backends).
 """
 from __future__ import annotations
 

@@ -1,6 +1,6 @@
 """Phase 8 (doc 17.5) — firmware / embedded image decomposition.
 
-Deterministic and air-gapped: carve a firmware image into its embedded components (signature
+Deterministic and offline: carve a firmware image into its embedded components (signature
 scan, binwalk-style), extract embedded ELFs (and gzip/xz/bzip2-wrapped ELFs) as new case
 targets so the whole multi-binary pipeline (component graph, cross-binary taint, IPC) applies,
 unpack an embedded root filesystem (SquashFS/cpio, via the system extractor when installed --

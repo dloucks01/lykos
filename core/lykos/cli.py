@@ -368,7 +368,7 @@ def _cmd_realgate(args: argparse.Namespace) -> int:
 
 
 def _cmd_doctor(args: argparse.Namespace) -> int:
-    """What works on THIS host. On an air-gapped workstation there is no package manager to
+    """What works on THIS host. On an offline workstation there is no package manager to
     ask, and "the stage declined" is a poor way to find out Ghidra was never installed."""
     import json
 
@@ -456,7 +456,7 @@ def _cmd_eval(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     # Before any command runs a tool locator, point the environment at the run-in-place
-    # toolchain under vendor/ (a no-op when there is none). This is what lets the air-gap
+    # toolchain under vendor/ (a no-op when there is none). This is what lets the offline
     # bundle work with nothing installed: every locator resolves through PATH, and this puts
     # the vendored bin/lib dirs on it. See vendorenv.activate.
     from . import vendorenv

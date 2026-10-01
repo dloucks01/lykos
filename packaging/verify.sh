@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # P0.10 — offline smoke: run the packaged .pyz end-to-end with no dependencies.
-# The app makes no network calls; for a strict air-gap check run this under: unshare -rn packaging/verify.sh
+# The app makes no network calls; for a strict offline check run this under: unshare -rn packaging/verify.sh
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PYZ="$ROOT/dist/lykos.pyz"

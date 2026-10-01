@@ -1,4 +1,4 @@
-"""Root-cause analysis of a confirmed crash (Phase 6, zero-AI).
+"""Root-cause analysis of a confirmed crash (Phase 6).
 
 Turns a fault capture (registers, fault address, faulting-instruction bytes, backtrace, memory
 maps -- from the ptrace helper or GDB) into a structured explanation: what kind of memory-

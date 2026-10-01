@@ -4,7 +4,7 @@ lykos gets precise memory-safety detection on a SOURCE build (ASan/UBSan/MSan na
 defect with a file:line). A stripped, third-party or cross-arch binary has none of that -- a heap
 out-of-bounds or use-after-free there merely *sometimes* faults, and often runs on silently. This
 module adds the two classic non-instrumentation oracles that turn that silent corruption into a
-signal, on any binary, offline and with no AI:
+signal, on any binary, offline and with : 
 
   * **libdislocator** (AFL++'s guard-page allocator, `LD_PRELOAD`ed): every allocation is placed at
     the END of its own page with an unmapped page just past it, so a one-byte heap overflow faults

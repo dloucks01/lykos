@@ -1,6 +1,6 @@
 """Activate a run-in-place toolchain: no install, no root, and the laptop's libraries untouched.
 
-The air-gap toolchain bundle does not install anything. It extracts to a relocatable prefix
+The offline toolchain bundle does not install anything. It extracts to a relocatable prefix
 under the repo's ``vendor/`` directory (``vendor/toolchain``), and the engines run straight
 out of that tree. This module is what makes that work, and it does so through ``PATH`` **only**:
 once, before any stage's locator runs, it prepends the prefix's binary directory to ``PATH``.
@@ -270,7 +270,7 @@ def activate(force: bool = False) -> dict:
     # sys.path so `import pypcode` resolves in-place -- it is a compiled wheel built against the
     # bundle's Python, so it is imported by the main interpreter, not run from a venv. Also add
     # it to PYTHONPATH so child processes inherit it. Absent => a no-op; the core stays
-    # stdlib-only unless a bundle placed one here.
+    # stdlib-based unless a bundle placed one here.
     site = pysite_dir(vendor)
     if site:
         s = str(site)

@@ -1,6 +1,6 @@
 """Comparison / secret extraction: breakpoint the comparison functions and dump BOTH operands,
 so the constant the program checks our input against falls out -- passwords, magic bytes,
-license keys, expected tokens. Classic offensive RE, deterministic, no AI.
+license keys, expected tokens. Classic offensive RE, deterministic.
 
 We run the target under GDB with a distinctive probe input; at each strcmp/memcmp/... the operand
 that is NOT our probe is the *expected* value the program wanted. `run_extract()` returns the

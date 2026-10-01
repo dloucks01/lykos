@@ -4,7 +4,7 @@
 curated list of well-known CVEs with affected version ranges. This is a *seed* set (high-profile
 CVEs, ranges best-effort) meant to be extended -- an operator can drop a JSON file at
 $LYKOS_CVEDB (same shape) and it is merged in at scan time, so a fuller offline NVD-derived
-feed can be vendored without code changes. Everything here is air-gapped and rule-based.
+feed can be vendored without code changes. Everything here is offline and rule-based.
 """
 from __future__ import annotations
 

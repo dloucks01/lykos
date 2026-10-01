@@ -800,7 +800,7 @@ def _run_java(exe, *, argv, stdin, timeout, mem_mb, capture, main_class=None) ->
 
 def _wine() -> Optional[str]:
     # Debian ships the binary as `wine-stable` (or `wine-development`) and exposes `wine` only as
-    # an update-alternatives symlink -- which does NOT travel in the relocatable air-gap bundle,
+    # an update-alternatives symlink -- which does NOT travel in the relocatable offline bundle,
     # so on the laptop only `wine-stable` exists. Try the versioned names too or PE execution is
     # silently unavailable there despite Wine being bundled. Running the binary under its own
     # name is equivalent to `wine`.

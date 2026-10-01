@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Build the ONE-ZIP, unzip-and-run air-gap package: a single .zip that already contains the
+# Build the ONE-ZIP, unzip-and-run offline package: a single .zip that already contains the
 # repo AND a fully-populated vendor/ (every tool extracted, pypcode vendored, relocatable
-# wrappers generated). On the air-gapped laptop you just:
+# wrappers generated). On the offline laptop you just:
 #
-#     unzip lykos-airgapped-*.zip
+#     unzip lykos-offline-*.zip
 #     cd lykos
 #     ./start             # (or ./RUN.sh)
 #
@@ -134,7 +134,7 @@ for so in "$TUL/python$PYV"/lib-dynload/*.so; do
   [ -f "$so" ] && { patchelf --set-rpath "\$ORIGIN/../..$_dma" "$so" 2>/dev/null || true; }
 done
 # Prove the vendored interpreter works with NO help from the host and NO global LD path -- import
-# the stdlib modules lykos and the engines rely on. Fail the build NOW, not on the air-gapped
+# the stdlib modules lykos and the engines rely on. Fail the build NOW, not on the offline
 # laptop, if the apt closure is missing a non-glibc dependency (libffi/libssl/liblzma/...).
 env -i HOME=/tmp PATH=/usr/bin:/bin "$TUB/python$PYV" - <<'PYCHK' \
   || die "vendored Python failed its self-contained import smoke-test -- a non-glibc dependency is missing from the toolchain tree (libffi/libssl/liblzma/...); add it to the toolchain package list and rebuild the bundle"
@@ -234,7 +234,7 @@ printf '  vendor/ is now %s\n' "$(du -sh "$V" | cut -f1)"
 # The trim above (and whatever the toolchain tarball happened to include) can leave the bundle short
 # a library a bundled tool needs -- libexpat.so.1 / libsqlite3.so.0 for Python, libglib/libpixman for
 # afl-qemu-trace, and so on. The build host HAS those system-wide, so the interpreter smoke-test above
-# passes while the bundle is actually INCOMPLETE; the gap only shows on a lean air-gapped laptop as
+# passes while the bundle is actually INCOMPLETE; the gap only shows on a lean offline laptop as
 # "python3: libexpat.so.1: cannot open shared object file" or a REQUIRED tool reading "-- not found --".
 # This walks every ELF in the bundle, resolves its NEEDED libraries on THIS host (ldd is transitive),
 # and copies any non-glibc one that is not already vendored into the multiarch lib dir -- which both
@@ -285,7 +285,7 @@ eval "$(sed -n '/^gen_wrappers() {/,/^}/p' "$ROOT/packaging/setup-toolchain.sh")
 gen_wrappers "$V/toolchain"
 
 say "launcher + quickstart"
-# The package ships the repo's own ./start and ./lykos launchers. They are already air-gap aware:
+# The package ships the repo's own ./start and ./lykos launchers. They are already offline aware:
 # when a vendor/ tree is present (it is, here) they use the bundle's OWN Python -- ABI-matched to
 # the pypcode wheel and the engine venvs -- and set LYKOS_VENDOR so the P-Code detectors and the
 # tool locators find vendor/toolchain and vendor/pysite. So the laptop needs no python3 of its own.
@@ -304,7 +304,7 @@ exec "$here/lykos" doctor "$@" < /dev/null
 EOF
 chmod +x "$APP/DOCTOR.sh"
 cat > "$APP/RUN-HERE-FIRST.txt" <<'EOF'
-lykos -- air-gapped, unzip-and-run. No installation. Nothing is written outside this folder.
+lykos -- offline, unzip-and-run. No installation. Nothing is written outside this folder.
 
   1. You already unzipped this (use `unzip -o` if it prompts). Everything is inside ./vendor.
   2. Check what this host can do:   ./lykos doctor       (or ./DOCTOR.sh)
@@ -313,16 +313,16 @@ lykos -- air-gapped, unzip-and-run. No installation. Nothing is written outside 
 
 The analysis tools (rizin, gdb, qemu, wine, afl++, the cross-compilers, the JVM, ...) live
 under vendor/toolchain and run through relocatable wrappers, so they use ONLY the bundle's own
-libraries -- your laptop's libraries are never replaced or relinked. See docs/air-gap.md.
+libraries -- your laptop's libraries are never replaced or relinked. See docs/offline-packaging.md.
 EOF
 
 say "zipping the single runnable package"
 STAMP="$(date +%Y%m%d)"; ARCH="$(uname -m)"
-OUT="$DIST/lykos-airgapped-$STAMP-$ARCH.zip"
+OUT="$DIST/lykos-offline-$STAMP-$ARCH.zip"
 rm -f "$OUT"
 ( cd "$STAGE" && zip -q -r -y "$OUT" lykos )   # -y: store symlinks as symlinks (venvs, libs)
 # A DUPLICATE PATH inside the zip makes `unzip` stop and prompt "replace? [y]" -- which reads as a
-# hang on the air-gapped laptop. Check the ARCHIVE (not the staging tree, which cannot hold a dup)
+# hang on the offline laptop. Check the ARCHIVE (not the staging tree, which cannot hold a dup)
 # and fail the build so a prompting bundle never ships.
 if command -v zipinfo >/dev/null 2>&1; then
   zdups="$(zipinfo -1 "$OUT" | sort | uniq -d | head)"
@@ -335,7 +335,7 @@ printf '  %s (%s)\n' "$OUT" "$(du -h "$OUT" | cut -f1)"
 cat "$OUT.sha256" | sed 's/^/  /'
 cat <<EOF
 
-On the air-gapped laptop (verify, then unzip and run -- nothing is installed):
+On the offline laptop (verify, then unzip and run -- nothing is installed):
   sha256sum -c $(basename "$OUT").sha256
   unzip -o $(basename "$OUT")     # -o = never prompt; extracts non-interactively
   cd lykos && ./RUN.sh

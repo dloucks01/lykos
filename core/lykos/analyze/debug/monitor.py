@@ -1,5 +1,5 @@
 """Instrumented dangerous-call monitor: run a target under GDB with breakpoints on dangerous
-sink functions and capture their concrete arguments at runtime (pure tooling, no AI).
+sink functions and capture their concrete arguments at runtime (pure tooling).
 
 Where the static detectors say "there is a call to strcpy" and the fuzzer waits for a crash,
 this watches the program actually make the call and records what it passed -- the copy length,

@@ -10,7 +10,7 @@ pattern, then generalize until every variant surfaces (Project Zero's workflow; 
 This is the SOURCE-side complement to lykos's binary ``variant-scan``: run a curated pack of
 vulnerable-pattern queries over an ingested source tree, map each hit to a CWE, and support the
 "generalize-from-a-patch" workflow (build a query from a known-bad snippet, then loosen it). Once
-single static weggli binary is vendored it is fully offline and non-AI; lykos degrades gracefully
+single static weggli binary is vendored it is fully offline and deterministic; lykos degrades gracefully
 (declines with an install hint) when weggli is absent, exactly like the other optional engines.
 
 weggli emits no machine-readable format and prints each match as the file path followed by the

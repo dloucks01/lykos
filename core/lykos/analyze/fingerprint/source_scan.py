@@ -8,7 +8,7 @@ the only channel that sees them. Each parsed (library, version) is fed to the SA
 (`scan.match`) and the SAME offline DB the binary path uses, so the ecosystem CVE index and the
 reference pack apply identically.
 
-Pure parsing, no execution, stdlib only. A malformed manifest is skipped, never fatal.
+Pure parsing, no execution, stdlib based. A malformed manifest is skipped, never fatal.
 """
 from __future__ import annotations
 

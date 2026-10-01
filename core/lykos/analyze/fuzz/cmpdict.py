@@ -16,7 +16,7 @@ Why this is worth a stage even though lykos ships CmpLog:
   * Even where CmpLog runs, seeding the dictionary with the constants up front reaches the first
     comparison sooner and gives CmpLog/the havoc splicer material immediately.
   * It costs nothing at fuzz time (pure static pass over IR lykos has already paid for) and adds
-    no dependency: no AI model, no network, deterministic.
+    no dependency: no model, no network, deterministic.
 
 This complements -- does not replace -- CmpLog and the concolic solver: a checksum whose expected
 value is *computed* from the input (not a constant) still needs those. Constants are the cheap 80%.

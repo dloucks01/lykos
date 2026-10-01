@@ -154,7 +154,7 @@ def leak_and_exploit(exe, base_argv, *, leak_regex: str, leak_base_offset=None,
 
 
 def render_ret2win_script(leak_regex, leak_base_offset, off_win, offset) -> bytes:
-    """A self-contained, stdlib-only reproducer: leak -> compute base -> ret2win. This is the
+    """A self-contained, stdlib-based reproducer: leak -> compute base -> ret2win. This is the
     portable PoC for a PIE target (the raw payload is base-specific and cannot be static)."""
     return (
         "#!/usr/bin/env python3\n"
@@ -189,7 +189,7 @@ def render_ret2win_script(leak_regex, leak_base_offset, off_win, offset) -> byte
 def render_canary_script(*, canary_offset, ret_offset, canary_trigger, pop_rdi, puts_plt, puts_got,
                           ret_to, puts_off, system_off, binsh_off, ret_gadget=None, loop_feed=None,
                           canary_regex=r"0x[0-9a-fA-F]+", canary_index=None) -> bytes:
-    """A self-contained, stdlib-only reproducer for a ret2libc PAST A STACK CANARY (no-PIE). The
+    """A self-contained, stdlib-based reproducer for a ret2libc PAST A STACK CANARY (no-PIE). The
     canary is per-process random, so a static input cannot exist -- the script LEAKS it at runtime,
     writes it back, does a two-stage puts leak to defeat ASLR, then system("/bin/sh"). All binary
     offsets are static (no-PIE); the libc base is recovered live, so the script is portable."""
@@ -395,7 +395,7 @@ def ret2dlresolve(exe, workdir, *, offset, read_plt, plt0, pop_rdi, pop_rsi, pop
     the "system" string in the target's own .bss, read them in with one read(0, scratch, n), then
     drop into PLT0 with the forged reloc index so the loader resolves `symbol` and calls it with
     rdi = &arg. No libc leak, no `system` PLT entry -- it works against whatever loader the target
-    runs under (older air-gap glibc included), because everything forged is the target's own data.
+    runs under (older offline glibc included), because everything forged is the target's own data.
 
     system()/do_system needs a 16-byte-aligned rsp and the re-entered frame's parity is
     environment-dependent, so BOTH parities are detonated on a fresh process each. Success = the
@@ -772,7 +772,7 @@ def auto_provoke_leak(exe, workdir, target_bytes, libc_data=b"", *, base_argv=()
 
 def render_heap_script(*, menu_ops, unsorted_off, stdout_off, wfile_jumps_off, system_off,
                        poison_size=0x300, guard_size=0x430) -> bytes:
-    """A self-contained, stdlib-only reproducer for the automated glibc-heap -> shell chain
+    """A self-contained, stdlib-based reproducer for the automated glibc-heap -> shell chain
     (unsorted-bin libc leak -> tcache-fd heap leak -> tcache poison of _IO_2_1_stdout_ -> House of
     Apple 2 -> system("/bin/sh")). ASLR-dependent, so no static input can exist -- the libc base and
     heap page are recovered live; only the libc OFFSETS (measured at build time) are embedded. The

@@ -216,7 +216,7 @@ def build(target_bytes: bytes, input_bytes: bytes, meta: dict, stderr: bytes,
 # The offline re-extractor shipped in the bundle: it re-derives each secret from the binary
 # alone (seek the recorded file offset, read the C-string; fall back to a printable-run scan),
 # proving the credential is really embedded -- deterministically, with NO execution of the
-# target. Pure stdlib so it runs on any air-gapped box.
+# target. Pure stdlib so it runs on any offline box.
 _EXTRACT_PY = r'''#!/usr/bin/env python3
 """Re-extract the hard-coded secret(s) from the target binary -- offline, no execution."""
 import json, os, sys, re

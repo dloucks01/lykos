@@ -1,4 +1,4 @@
-"""L2 exploitation-primitive analysis (Phase 6, zero-AI).
+"""L2 exploitation-primitive analysis (Phase 6).
 
 L1 proves a crash reproduces. L2 proves the crash yields a *controllable* primitive -- most
 importantly instruction-pointer control: attacker input lands in the program counter at a

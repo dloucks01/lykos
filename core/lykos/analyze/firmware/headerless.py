@@ -8,7 +8,7 @@ Two signals:
   2. **Instruction-pattern scoring**: count common function-prologue encodings for ARM / Thumb
      / MIPS / PPC across the blob and take the best-scoring architecture.
 
-No emulator, no ML. Reports a confidence and the evidence behind each call.
+No emulator. Reports a confidence and the evidence behind each call.
 """
 from __future__ import annotations
 

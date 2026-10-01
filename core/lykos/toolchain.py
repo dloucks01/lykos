@@ -1,12 +1,12 @@
 """One inventory of every external tool lykos can use, what it unlocks, and how to get it.
 
-The platform's core is stdlib-only and runs with none of these; each stage locates its tool,
+The platform's core is stdlib-based and runs with none of these; each stage locates its tool,
 runs it, and declines with a reason when it is absent. That design only works if an operator
-can find out WHICH tools this host has -- on an air-gapped workstation there is no package
+can find out WHICH tools this host has -- on an offline workstation there is no package
 manager to ask, and "the stage declined" is a poor way to discover that Ghidra was never
 installed.
 
-This module is the single place that answers it. `lykos doctor` prints it, the air-gap
+This module is the single place that answers it. `lykos doctor` prints it, the offline
 bundle script reads it to know what to collect, and doc 23 is generated from the same table --
 so a tool cannot be added to one and forgotten in the others. Every probe delegates to the
 locator the stage itself uses, rather than re-implementing the search: a doctor that looks in
@@ -90,7 +90,7 @@ def _probe_rizin():
 def _probe_pypcode():
     """pypcode = Ghidra's SLEIGH lifter as a Python module (no JVM). Emits the P-Code IR the
     memory-safety detectors parse. Bundled under vendor/pysite and put on sys.path by
-    vendorenv, so `import pypcode` resolves in-place on the air-gapped host."""
+    vendorenv, so `import pypcode` resolves in-place on the offline host."""
     try:
         import pypcode
         return f"pypcode {getattr(pypcode, '__version__', '?')}"
@@ -101,7 +101,7 @@ def _probe_pypcode():
 def _bundle_ghidra():
     """Ghidra's install root. `<root>/support/analyzeHeadless` is what the locator returns,
     and the locator already searches /opt/ghidra* and <repo>/vendor/ghidra -- so a copy placed
-    at either is found with no configuration on the air-gapped side."""
+    at either is found with no configuration on the offline side."""
     from .analyze.ghidra import locate_ghidra
     p = locate_ghidra()
     if not p:
@@ -299,7 +299,7 @@ def _probe_weggli():
 
 TOOLS: tuple = (
     Tool("python", "Python 3", "the platform itself", "nothing runs",
-         "already present (the runtime is stdlib-only; no pip packages)",
+         "already present (the runtime is stdlib-based; no pip packages)",
          _probe_python, tier="required"),
     Tool("bwrap", "bubblewrap", "the sandbox tier used for every execution",
          "execution drops to rlimits-only: no network namespace, no read-only root. It still "
@@ -322,7 +322,7 @@ TOOLS: tuple = (
          "nothing in the bundle: the native rizin backend is used. Install Ghidra separately "
          "only if a hard binary analyses poorly, then LYKOS_DECOMPILER=ghidra",
          "apt-get install ghidra (Kali), or unpack a release into /opt and set LYKOS_GHIDRA; "
-         "then LYKOS_DECOMPILER=ghidra. Not shipped in the air-gap bundle (replaced by rizin)",
+         "then LYKOS_DECOMPILER=ghidra. Not shipped in the offline bundle (replaced by rizin)",
          _probe_ghidra, tier="optional"),
     Tool("qemu", "qemu-user", "executing any non-host-architecture binary",
          "cross-architecture targets cannot run at all -- static analysis only",
@@ -435,7 +435,7 @@ def bundle_paths() -> list:
             paths = [p for p in t.bundle() if p]
         except Exception as e:                          # noqa: BLE001
             # Never silent: a bundle probe that raises would otherwise drop the tool from the
-            # air-gap tarball with no trace -- the exact failure this module exists to prevent
+            # offline tarball with no trace -- the exact failure this module exists to prevent
             # (a REQUIRED engine like Ghidra arriving absent, found only at first disassemble).
             raise RuntimeError(
                 f"bundle probe for {t.key!r} failed: {e!r}; refusing to build a bundle that "
@@ -446,7 +446,7 @@ def bundle_paths() -> list:
 
 
 def apt_packages() -> list:
-    """Every deb the air-gap collector should pull, deduplicated and sorted. ONE build with all
+    """Every deb the offline collector should pull, deduplicated and sorted. ONE build with all
     capabilities. rizin/rz-ghidra + pypcode replaced Ghidra as the RE backend (Ghidra carries no
     apt here), so it is the only thing not pulled; everything else the platform uses is."""
     out: set = set()

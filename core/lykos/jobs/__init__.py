@@ -1,6 +1,6 @@
 """Job engine (Phase 0 P0.3): queue, state machine, stage registry, context, worker pool.
 
-Deterministic, air-gapped, single Kali VM. SQLite-backed queue (no external broker).
+Deterministic, offline, single Kali VM. SQLite-backed queue (no external broker).
 See tasks/phase-0-P0.3-job-engine-tickets.md (JE-00..JE-30).
 """
 from .config import JobConfig

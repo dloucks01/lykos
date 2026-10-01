@@ -79,7 +79,7 @@ def _is_sanitizer(exe) -> bool:
     *virtual* shadow region at startup; under an RLIMIT_AS cap that mmap fails and the process
     aborts BEFORE main() -- so every input reads as a spurious SIGABRT and no block is ever
     reached. Such a build must run without the AS cap (resident memory is bounded instead). This
-    is the stdlib-only twin of sandbox._is_sanitizer_exe: batch_runner is spawned as a bare
+    is the stdlib-based twin of sandbox._is_sanitizer_exe: batch_runner is spawned as a bare
     `python3 batch_runner.py` subprocess and cannot import the package. Cheap byte-scan for the
     runtime's marker symbol; matches aflpp.is_sanitizer_build."""
     try:
