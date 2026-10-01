@@ -34,6 +34,7 @@ _TARGET = {
     "source_cve_scan": ("..analyze.fingerprint", "enqueue_source_cve_scan"),
     "embedded_audit": ("..analyze.fingerprint", "enqueue_embedded_audit"),
     "int_overflow_scan": ("..analyze.fingerprint", "enqueue_int_overflow_scan"),
+    "net_fuzz": ("..analyze.fuzz", "enqueue_net_fuzz"),
     "coverage_fuzz": ("..analyze.fuzz", "enqueue_coverage_fuzz"),
     "fuzz": ("..analyze.fuzz", "enqueue_fuzz"),
     "directed_fuzz": ("..analyze.fuzz", "enqueue_directed_fuzz"),
@@ -63,7 +64,7 @@ _CASE = {
 # them dropped that input and every one failed with "requires params.input_sha".
 _NO_PARAMS = {"disassemble", "detect_cwe", "heap_trace", "oob_index", "chain_primitive",
               "synthesize_poc", "firmware_carve", "source_cve_scan", "embedded_audit",
-              "int_overflow_scan"}
+              "int_overflow_scan", "net_fuzz"}
 _CASE_NO_PARAMS = {"link_case", "ipc_model", "cross_taint"}
 
 _TERMINAL = {"done", "cancelled", "error"}
@@ -121,7 +122,7 @@ _PLAN_STAGES = [
     ("disassemble", "Disassemble"), ("detect_cwe", "Static detectors"),
     ("cve_scan", "Known-CVE scan"), ("source_cve_scan", "Dependency-CVE scan"),
     ("embedded_audit", "RTOS config audit"), ("int_overflow_scan", "Int-overflow allocs"),
-    ("synthesize_injection", "Injection probes"),
+    ("net_fuzz", "Network fuzzing"), ("synthesize_injection", "Injection probes"),
     ("coverage_fuzz", "Coverage fuzzing"), ("directed_fuzz", "Directed fuzzing"),
     ("heap_check", "Heap checks"), ("heap_trace", "Heap primitives"),
     ("oob_index", "Array-index probes"), ("chain_primitive", "Primitive chaining"),
@@ -377,6 +378,9 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict, stop: t
             dyn = {"input_mode": primary} if primary else {}
             _run_target_stage(store, t, "coverage_fuzz", status, stop, dyn)
             _run_target_stage(store, t, "directed_fuzz", status, stop, dyn)
+            # A socket server is reached by spawning it and sending over the network, not via
+            # stdin/argv/file; the stage self-gates to targets that import bind/listen/recvfrom.
+            _run_target_stage(store, t, "net_fuzz", status, stop)
             _run_target_stage(store, t, "heap_check", status, stop, dyn)
             # Custom-allocator heap-primitive discovery (double-free / UAF / overflow) for a target
             # with its OWN allocator, which the libc guard-page check cannot see.
