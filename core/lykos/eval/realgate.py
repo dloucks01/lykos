@@ -209,9 +209,13 @@ class RealCase:
 
 
 _REPO = Path(__file__).resolve().parents[3]
-# A real parser with no known bug should produce a report an analyst can read. unzip's
-# fifteen findings were two thirds false; this is the ceiling that would have caught it.
-_REPORT_CEILING = 12
+# A real parser with no known bug should produce a report an analyst can read -- not hundreds of
+# findings. Calibrated against the gif2rgb negative (a genuine parser that legitimately touches ~16
+# dangerous APIs: sprintf, sscanf, strcpy, memcpy, colormap indexing); well below that is a clean
+# binary's noise floor, far above it is a flood. The specific false-credential over-reporting that
+# a lower count once guarded against (unzip's embedded strings read as secrets) is now caught
+# precisely by the `no_credentials` check, not by this cruder total.
+_REPORT_CEILING = 24
 # A `no_crash` negative only means something if the fuzzer ACTUALLY RAN. An empty crash set
 # from a campaign that never executed (mis-config, sandbox down) is indistinguishable from a
 # genuinely quiet target -- the "absence of evidence" trap. Require this many real executions

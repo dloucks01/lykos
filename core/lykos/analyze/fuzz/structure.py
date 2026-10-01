@@ -287,6 +287,50 @@ def seed_for_name(name: str) -> bytes | None:
                     tail=entry.get("tail"))
 
 
+def boundary_seeds(name: str) -> list:
+    """The valid seed PLUS crash-shaped variants for a builtin format: each record carrying an
+    offset/size ROLE pair is set to the wrap-the-sum values that pass a 32-bit bounds check while
+    the offset still points out of bounds (jhead's GPS read -- 0x00ffffff + 0xff000002 is 1 in 32
+    bits -- and the shape of many offset+length OOB reads). Seeding these puts the bug in the
+    corpus, so the campaign's calibration pass detonates it on the FIRST executions instead of
+    waiting on a byte/field mutator to construct both halves by luck -- exactly what
+    textconf.boundary_seeds does for a config. Base seed first, then one variant per pair; just the
+    base when the format declares no offset/size pair. Best-effort -- any failure yields fewer."""
+    base = seed_for_name(name)
+    if base is None:
+        return []
+    out = [base]
+    entry = _BUILTINS.get(name)
+    try:
+        model = FormatModel([dict(f) for f in entry["spec"]])
+        fields = model.parse(base)
+        for scope in _scopes(fields):
+            o = next((x for x in scope if x["f"].get("role") == "offset"), None)
+            s = next((x for x in scope if x["f"].get("role") == "size"), None)
+            if o is None or s is None:
+                continue
+            w = min(_INT[o["f"]["type"]][0], _INT[s["f"]["type"]][0]) * 8
+            mask = (1 << w) - 1
+            if mask < 0xFFFF:                            # too narrow to point far AND wrap the sum
+                continue
+            save = (o["val"], s["val"])
+            o["val"] = 0x00FFFFFF & mask                 # a far offset that still fits the field
+            s["val"] = ((1 << w) + 1 - o["val"]) & mask  # complement: offset + size wraps to 1
+            try:
+                out.append(model.serialize(fields))
+            except Exception:                            # noqa: BLE001
+                pass
+            o["val"], s["val"] = save                    # restore: each variant wraps ONE pair
+    except Exception:                                    # noqa: BLE001
+        pass
+    seen, uniq = set(), []
+    for b in out:
+        if b not in seen:
+            seen.add(b)
+            uniq.append(b)
+    return uniq
+
+
 def _seed_spec(spec, payload):
     """A seed for one scope, returning its fields and the blobs in it (outermost first)."""
     fields: list = []

@@ -1095,9 +1095,14 @@ def fuzz_stage(ctx) -> dict:
         if fmt:
             model = structure.builtin(fmt)
             mutator = structure.StructMutator(rng, model, dictionary)
-            seed = structure.seed_for_name(fmt)
-            if seed:
-                corpus = [seed] + list(corpus)
+            # Boundary seeds FIRST: the valid skeleton AND one crash-shaped variant per offset/size
+            # record (an offset+length that wraps a 32-bit bounds check while pointing out of
+            # bounds -- jhead's GPS read, and the shape of many parser OOB bugs). Calibration
+            # detonates these before mutation, so a structural bug that a byte/field mutator lands
+            # only by luck (jhead: 259 near-misses in 20k, zero crashes) is found on the first execs.
+            bseeds = structure.boundary_seeds(fmt)
+            if bseeds:
+                corpus = bseeds + list(corpus)
     # Always, not only when a format model was chosen: a wrong invocation is the failure that
     # looks most like a clean campaign, so it has to be visible in the run's own events.
     ctx.emit("fuzz.invocation", payload={
