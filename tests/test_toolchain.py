@@ -128,7 +128,7 @@ def test_tools_installed_by_apt_declare_their_packages():
     for t in tc.TOOLS:
         # A tool explicitly not bundled (Ghidra, replaced by rizin) may still document a manual
         # apt install without carrying bundle packages.
-        if "not shipped in the air-gap bundle" in t.install.lower():
+        if "not shipped in the offline bundle" in t.install.lower():
             assert not t.apt, f"{t.key} says not-bundled but still declares apt packages"
             continue
         if t.install.startswith("apt-get install"):

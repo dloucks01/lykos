@@ -164,8 +164,8 @@ def test_the_installer_repoints_a_venv_at_this_hosts_python():
     assert "WARNING" in src, "a venv that does not run here is not reported"
 
 
-def test_the_airgap_runbook_exists_and_covers_both_sides():
-    doc = (DOCS / "air-gap.md").read_text()
+def test_the_offline_runbook_exists_and_covers_both_sides():
+    doc = (DOCS / "offline-packaging.md").read_text()
     assert "collect-toolchain.sh" in doc
     # the bundle stages the setup script as setup.sh, so the runbook names that
     assert "setup.sh" in doc
@@ -175,7 +175,7 @@ def test_the_airgap_runbook_exists_and_covers_both_sides():
 
 def test_the_runbook_documents_every_required_tool():
     from lykos import toolchain
-    doc = (DOCS / "air-gap.md").read_text().lower()
+    doc = (DOCS / "offline-packaging.md").read_text().lower()
     for t in toolchain.TOOLS:
         if t.tier == "required":
             assert t.title.split()[0].lower() in doc, f"{t.title} is not in the runbook"
@@ -183,9 +183,9 @@ def test_the_runbook_documents_every_required_tool():
 
 def test_the_runbook_states_the_afl_qemu_trap():
     """`file` reports the HOST architecture of an emulator whose guest is fixed at build time.
-    Anyone provisioning coverage fuzzing air-gapped will hit this, and the symptom is a
+    Anyone provisioning coverage fuzzing offline will hit this, and the symptom is a
     campaign that aborts at the fork-server handshake."""
-    doc = (DOCS / "air-gap.md").read_text()
+    doc = (DOCS / "offline-packaging.md").read_text()
     assert "afl-qemu-trace" in doc and "--version" in doc
 
 
