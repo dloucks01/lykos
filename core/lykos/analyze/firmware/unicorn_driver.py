@@ -42,7 +42,12 @@ try:
         UC_MODE_BIG_ENDIAN, UC_MODE_LITTLE_ENDIAN,
         Uc, UcError,
     )
-    from unicorn.arm_const import UC_ARM_REG_PC, UC_ARM_REG_SP
+    from unicorn.arm_const import (
+        UC_ARM_REG_PC, UC_ARM_REG_SP, UC_ARM_REG_LR,
+        UC_ARM_REG_R0, UC_ARM_REG_R1, UC_ARM_REG_R2, UC_ARM_REG_R3, UC_ARM_REG_R4,
+        UC_ARM_REG_R5, UC_ARM_REG_R6, UC_ARM_REG_R7, UC_ARM_REG_R8, UC_ARM_REG_R9,
+        UC_ARM_REG_R10, UC_ARM_REG_R11, UC_ARM_REG_R12,
+    )
     from unicorn.arm64_const import UC_ARM64_REG_PC, UC_ARM64_REG_SP
     from unicorn.mips_const import UC_MIPS_REG_PC, UC_MIPS_REG_SP
     from unicorn.ppc_const import UC_PPC_REG_PC, UC_PPC_REG_1
@@ -164,9 +169,36 @@ def run_once(cfg, blob, base, sp, entry, fuzz, budget):
         for s, sz in mmio:
             uc.mem_map(s, sz)
 
+    # Interrupt dispatch (Cortex-M): when the firmware is deeply stuck in a wait-for-interrupt
+    # spin (nothing the MMIO poll-breaker can help), fire a vector-table handler as a subroutine
+    # -- save thread PC/LR, set LR to a mapped SENTINEL, jump to the handler; when it returns to
+    # SENTINEL, restore the thread. This reaches interrupt-driven code (a very common blocker)
+    # without faithful exception semantics.
+    SENTINEL = 0x04000000
+    irq_handlers = []
+    if cfg["cortex_m"]:
+        try:
+            uc.mem_map(SENTINEL, _PAGE)
+            uc.mem_write(SENTINEL, b"\xFE\xE7")        # b . safety net
+        except UcError:
+            pass
+        # vector[0]=SP, vector[1]=Reset (the entry, not an interrupt); IRQ/exception handlers are
+        # vector[2..]. Collect the distinct Thumb handlers in flash, excluding the entry itself.
+        seen_h = set()
+        entry_h = (entry & ~1)
+        for i in range(2, min(len(blob) // 4, 128)):
+            v = struct.unpack_from("<I", blob, 4 * i)[0]
+            h = v & ~1
+            if v & 1 and base <= h < base + flash_size and h != entry_h and h not in seen_h:
+                seen_h.add(h)
+                irq_handlers.append(h)
+
     blocks = set()
     st = {"i": 0, "fault": None, "since_new": 0, "stuck": False, "trial": 0,
-          "pending": None, "cache": {}, "polls": 0}
+          "pending": None, "cache": {}, "polls": 0,
+          "irq_i": 0, "in_isr": False, "saved": None, "fires": 0, "resume": None}
+    _IRQ_STUCK = _STUCK * 3
+    _MAX_FIRES = 16
 
     def _read_model(uc, addr, size, pc):
         # cached satisfying value for a known status-poll site
@@ -193,6 +225,19 @@ def run_once(cfg, blob, base, sp, entry, fuzz, budget):
             pass
 
     def hb(uc, addr, size, ud):
+        # returned from a fired interrupt -> restore the thread context and resume there.
+        # (PC changes from a block hook do not reliably redirect Unicorn, so we stop and the
+        # outer loop restarts at st["resume"].)
+        if st["in_isr"] and (addr & ~1) == SENTINEL:
+            s = st["saved"] or {}
+            for reg, val in s.items():
+                uc.reg_write(reg, val)
+            st["in_isr"] = False
+            st["saved"] = None
+            st["since_new"] = 0
+            st["resume"] = s.get(UC_ARM_REG_PC)
+            uc.emu_stop()
+            return
         if addr not in blocks:
             blocks.add(addr)
             st["since_new"] = 0
@@ -201,10 +246,23 @@ def run_once(cfg, blob, base, sp, entry, fuzz, budget):
             st["stuck"] = False
             st["pending"] = None
             st["trial"] = 0
-        else:
-            st["since_new"] += 1
-            if st["since_new"] > _STUCK:
-                st["stuck"] = True
+            return
+        st["since_new"] += 1
+        if st["since_new"] > _STUCK:
+            st["stuck"] = True
+        # deeply stuck and nothing is progressing: fire the next interrupt handler
+        if (irq_handlers and not st["in_isr"] and st["fires"] < _MAX_FIRES
+                and st["since_new"] > _IRQ_STUCK):
+            h = irq_handlers[st["irq_i"] % len(irq_handlers)]
+            st["irq_i"] += 1
+            st["fires"] += 1
+            st["saved"] = {UC_ARM_REG_PC: uc.reg_read(UC_ARM_REG_PC),
+                           UC_ARM_REG_LR: uc.reg_read(UC_ARM_REG_LR)}
+            st["in_isr"] = True
+            st["since_new"] = 0
+            uc.reg_write(UC_ARM_REG_LR, SENTINEL | 1)
+            st["resume"] = h | 1                      # restart at the handler (see note above)
+            uc.emu_stop()
 
     def hmr_defined(uc, access, addr, size, value, ud):   # read inside a defined MMIO window
         _read_model(uc, addr, size, uc.reg_read(cfg["pc"]))
@@ -234,26 +292,37 @@ def run_once(cfg, blob, base, sp, entry, fuzz, budget):
         uc.hook_add(UC_HOOK_MEM_READ_UNMAPPED, hmr_lazy)  # model all unmapped reads
 
     uc.reg_write(cfg["sp"], sp)
-    start = (entry | 1) if cfg["thumb"] else entry
     # `until` must be an address the firmware never executes -- NOT 0, which equals a generic
     # arch's entry (base 0) and makes emu_start stop before the first instruction. count bounds it.
     until = 0xFFFFFFFFFFFFFFFC if cfg["bits"] == 64 else 0xFFFFFFFC
     halt = "budget"
-    try:
-        uc.emu_start(start, until, count=budget)
-    except UcError as e:
-        halt = "fault"
-        if st["fault"] is None:                   # a UcError our mem hooks did not classify
-            try:
-                pc = uc.reg_read(cfg["pc"])
-            except Exception:
-                pc = 0
-            st["fault"] = {"addr": pc, "pc": pc, "kind": "invalid", "error": str(e)}
+    pc = (entry | 1) if cfg["thumb"] else entry
+    # Emulate in segments: a hook that fires/returns an interrupt sets st["resume"] and stops;
+    # we restart there. Restarts are bounded by the interrupt-fire cap, so this terminates.
+    for _segment in range(_MAX_FIRES * 2 + 2):
+        st["resume"] = None
+        try:
+            uc.emu_start(pc, until, count=budget)
+        except UcError as e:
+            halt = "fault"
+            if st["fault"] is None:               # a UcError our mem hooks did not classify
+                try:
+                    fpc = uc.reg_read(cfg["pc"])
+                except Exception:
+                    fpc = 0
+                st["fault"] = {"addr": fpc, "pc": fpc, "kind": "invalid", "error": str(e)}
+            break
+        if st["fault"]:
+            break
+        if st["resume"] is not None:
+            pc = st["resume"]
+            continue
+        break                                     # natural end (count exhausted / until hit)
     if st["fault"]:
         halt = "fault"
     return {"nblocks": len(blocks), "blocks": sorted(hex(b) for b in blocks)[:200],
             "halt": halt, "fault": st["fault"], "consumed": st["i"],
-            "polls_satisfied": len(st["cache"])}
+            "polls_satisfied": len(st["cache"]), "irq_fires": st["fires"]}
 
 
 def _mutate(data, rng):

@@ -81,6 +81,26 @@ def test_non_cortex_m_arches_execute(arch, code):
 
 
 @pytest.mark.skipif(_UNI is None, reason="Unicorn venv not available")
+def test_interrupt_handler_is_dispatched_when_main_waits():
+    """Interrupt-driven firmware whose main() just spins waiting for an IRQ must still have its
+    ISR reached: when deeply stuck, the driver fires a vector-table handler as a subroutine."""
+    img = bytearray(0x100)
+    struct.pack_into("<I", img, 0x00, 0x20010000)              # SP
+    struct.pack_into("<I", img, 0x04, 0x08000081)              # Reset -> main 0x80
+    struct.pack_into("<I", img, 0x40, 0x08000091)              # IRQ vector -> ISR 0x90
+    img[0x80:0x82] = bytes([0xFE, 0xE7])                       # main: b . (wait for interrupt)
+    # ISR: ldr r0,[pc,#4]; movs r1,#1; str r1,[r0]; bx lr ; pool=0x1000 (unmapped -> fault)
+    img[0x90:0x9C] = bytes([0x01, 0x48, 0x01, 0x21, 0x01, 0x60, 0x70, 0x47,
+                            0x00, 0x10, 0x00, 0x00])
+    out = _run({"_blob": bytes(img), "arch": "cortex-m", "mode": "run", "budget": 20000})
+    assert out["ok"]
+    r = out["run"]
+    assert r["irq_fires"] >= 1, "no interrupt was ever fired -- main spin never escaped"
+    assert r["nblocks"] >= 2, "the ISR code was never reached"
+    assert r["fault"] and r["fault"]["kind"] == "write"        # the ISR's bad write
+
+
+@pytest.mark.skipif(_UNI is None, reason="Unicorn venv not available")
 def test_bad_write_is_a_fault():
     """A write to a wild unmapped address under Cortex-M is a genuine fault (memory corruption)."""
     img = bytearray(0x80)
