@@ -23,7 +23,7 @@ curl -sf --unix-socket "$SOCK" http://localhost/health >/dev/null || fail "healt
 # capture-then-grep (not `curl | grep -q`): grep -q exits on first match and SIGPIPEs curl
 # mid-body, which under `set -o pipefail` would fail the pipeline on a large page.
 UI="$(curl -s --unix-socket "$SOCK" http://localhost/)"
-case "$UI" in *"<title>Lykos"*) ;; *) fail "UI not served from pyz";; esac
+case "$UI" in *"<title>lykos"*) ;; *) fail "UI not served from pyz";; esac
 CID=$(curl -s --unix-socket "$SOCK" -H 'Content-Type: application/json' -d '{"name":"verify"}' \
       http://localhost/cases | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
 RUN=$(curl -s --unix-socket "$SOCK" -F "file=@$SAMPLE" http://localhost/cases/$CID/targets \
