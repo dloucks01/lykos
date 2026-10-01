@@ -189,3 +189,20 @@ def test_angr_oracle_arch_mapping_is_pure():
     """Arch gating in the oracle must not need angr imported."""
     assert "cortex-m" in amod._ARCH and "aarch64" in amod._ARCH
     assert "sparc" not in amod._ARCH
+
+
+def test_hal_signatures_detect_weak_default_handlers():
+    """Deterministic HAL signatures: a vector target that is an infinite `b .` (a weak
+    Default_Handler) is mapped to skip, while a real handler is left alone -- no disassembler or
+    SDK data needed."""
+    import struct as _s
+    from lykos.analyze.firmware import hal_signatures as hs
+    img = bytearray(0x80)
+    _s.pack_into("<I", img, 0x00, 0x20010000)
+    _s.pack_into("<I", img, 0x04, 0x08000041)          # Reset -> 0x40 (real)
+    _s.pack_into("<I", img, 0x08, 0x08000061)          # NMI  -> 0x60 (weak: b .)
+    img[0x40:0x44] = bytes([0x00, 0x20, 0x70, 0x47])   # real: movs r0,#0; bx lr
+    img[0x60:0x62] = bytes([0xFE, 0xE7])               # weak default handler: b .
+    h = hs.scan(bytes(img), "cortex-m", 0x08000000, "little")
+    assert h.get("0x8000060") == "skip"
+    assert "0x8000040" not in h

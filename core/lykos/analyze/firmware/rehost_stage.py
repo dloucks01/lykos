@@ -74,10 +74,20 @@ def firmware_rehost_stage(ctx) -> dict:
         "seed": int(p.get("seed", 1337)),
         "seeds": p.get("seeds", []),
         "fuzz_b64": p.get("fuzz_b64"),
-        # {entry_addr: "skip"|"ret0"|"ret1"} for recognised HAL/libc/delay functions, supplied by
-        # an operator or a signature matcher: handled on the host instead of emulated.
-        "handlers": p.get("handlers", {}),
+        # {entry_addr: "skip"|"ret0"|"ret1"} for recognised HAL/libc/delay functions, handled on
+        # the host instead of emulated. Auto-populated from deterministic signatures (weak default
+        # handlers, known stubs) and merged with any operator-supplied ones.
+        "handlers": dict(p.get("handlers", {})),
     }
+    try:
+        from .hal_signatures import scan as _hal_scan
+        auto = _hal_scan(data, spec["arch"], int(spec["base"]), spec["endianness"])
+        for a, act in auto.items():
+            spec["handlers"].setdefault(a, act)
+        if auto:
+            ctx.emit("firmware_rehost.handlers", payload={"auto_handlers": len(auto)})
+    except Exception:
+        pass
     # Symbolic MMIO oracle (optional, deterministic): angr solves peripheral-read values that
     # reach deep code -- including arbitrary gate constants the Unicorn value-set search cannot
     # guess -- and we feed those as Unicorn fuzz seeds. Any failure degrades to no extra seeds.
