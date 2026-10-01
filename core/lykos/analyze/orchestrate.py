@@ -47,6 +47,7 @@ _TARGET = {
     "synthesize_injection": ("..analyze.poc", "enqueue_inject"),
     "behavior_trace": ("..analyze.debug", "enqueue_behavior_trace"),
     "dynamic_taint": ("..analyze.debug", "enqueue_taint"),
+    "firmware_carve": ("..analyze.firmware", "enqueue_firmware"),
 }
 _CASE = {
     "link_case": ("..analyze.link", "enqueue_link"),
@@ -58,7 +59,7 @@ _CASE = {
 # require params["input_sha"] (the crashing input), which the prove loop threads in -- listing
 # them dropped that input and every one failed with "requires params.input_sha".
 _NO_PARAMS = {"disassemble", "detect_cwe", "heap_trace", "oob_index", "chain_primitive",
-              "synthesize_poc"}
+              "synthesize_poc", "firmware_carve"}
 _CASE_NO_PARAMS = {"link_case", "ipc_model", "cross_taint"}
 
 _TERMINAL = {"done", "cancelled", "error"}
@@ -315,14 +316,35 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict, stop: t
     store = CaseStore(case_dir)
     try:
         status.update({"state": "running", "targets": len(target_ids), "started": time.time()})
-        for i, tid in enumerate(target_ids):
+        # Worklist, not a fixed loop: a firmware image is a CONTAINER whose embedded binaries are
+        # discovered mid-run (firmware_carve registers them as sub-targets). Those get appended and
+        # analysed in the same pass.
+        worklist = list(target_ids)
+        done_tids: set = set()
+        wi = 0
+        while wi < len(worklist):
+            tid = worklist[wi]
+            wi += 1
             if stop.is_set():
                 break
-            status["target"] = i + 1
+            if tid in done_tids:
+                continue
+            done_tids.add(tid)
+            status["target"] = len(done_tids)
             t = store.targets.get(tid)
             if not t:
                 continue
-            _init_plan(status, t, i + 1, len(target_ids))
+            _init_plan(status, t, len(done_tids), len(worklist))
+            # A firmware image is not a program: carve it into its embedded binaries (each registered
+            # as a sub-target) and analyse THOSE. Running native recovery on the raw blob finds nothing
+            # and misses every component + secret.
+            if (t.file_type or "").lower() == "firmware":
+                _run_target_stage(store, t, "firmware_carve", status, stop)
+                for sub in store.targets.list_by_case(case_id):
+                    if sub.id not in done_tids and sub.id not in worklist:
+                        worklist.append(sub.id)
+                _finalize_plan(status)
+                continue
             # Recover + detect.
             _run_target_stage(store, t, "disassemble", status, stop)
             _run_target_stage(store, t, "detect_cwe", status, stop)
@@ -427,14 +449,15 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict, stop: t
                     _emit_stage(store, t.case_id, "verify",
                                 "cancelled" if stop.is_set() else "done", target_id=t.id)
             _finalize_plan(status)          # any step never reached is marked skipped
-        # Case-level cross-binary analysis for a multi-binary case.
-        if len(target_ids) > 1 and not stop.is_set():
+        # Case-level cross-binary analysis for a multi-binary case (a carved firmware's extracted
+        # components are exactly such a set).
+        if len(worklist) > 1 and not stop.is_set():
             for stage in ("link_case", "ipc_model", "cross_taint", "whole_system"):
                 _run_case_stage(store, case_id, stage, status, stop)
         # Outcome.
         pd = PocDAO(store.conn)
-        verified = any(p.verified for tid in target_ids for p in pd.list_by_target(tid))
-        crashed = any(d.crashed for tid in target_ids for d in DynResultDAO(store.conn).list_by_target(tid))
+        verified = any(p.verified for tid in worklist for p in pd.list_by_target(tid))
+        crashed = any(d.crashed for tid in worklist for d in DynResultDAO(store.conn).list_by_target(tid))
         outcome = "poc" if verified else ("crash" if crashed else "static")
         status.update({"state": "cancelled" if stop.is_set() else "done",
                        "outcome": outcome, "stage": None, "updated": time.time()})

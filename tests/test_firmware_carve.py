@@ -199,3 +199,93 @@ def test_every_component_carries_what_registration_needs():
 def test_an_image_with_nothing_in_it_extracts_nothing():
     assert carve.extract_components(b"\x00" * 8192) == []
     assert carve.extract_components(b"") == []
+
+
+# ---- embedded filesystem unpack ----------------------------------------------------------
+# Real firmware keeps its binaries inside a COMPRESSED root filesystem, so they are invisible to
+# the raw ELF/gzip scan above. extract_filesystems() shells out to the system extractor to reach
+# them; these tests cover the superblock sizing, the graceful degradation when no extractor is
+# installed, and a real cpio round-trip when `cpio` is on PATH.
+
+def _squashfs_superblock(bytes_used: int, endian="<") -> bytes:
+    """A v4.0 SquashFS superblock prefix with the magic and bytes_used (+40) we read."""
+    magic = b"hsqs" if endian == "<" else b"sqsh"
+    sb = bytearray(96)
+    sb[0:4] = magic
+    struct.pack_into(endian + "Q", sb, 40, bytes_used)
+    return bytes(sb)
+
+
+def test_squashfs_size_is_read_from_the_superblock():
+    sb = _squashfs_superblock(96) + b"\x00" * 64         # bytes_used covers the whole region
+    assert carve._squashfs_size(sb, 0) == 96
+
+
+def test_squashfs_size_handles_big_endian_sqsh():
+    sb = _squashfs_superblock(100, endian=">") + b"\x00" * 64
+    assert carve._squashfs_size(sb, 0) == 100
+
+
+def test_squashfs_size_refuses_a_bytes_used_past_the_image():
+    sb = _squashfs_superblock(1 << 40) + b"\x00" * 64
+    assert carve._squashfs_size(sb, 0) is None           # claims more than the buffer holds
+
+
+def test_squashfs_size_rejects_non_squashfs():
+    assert carve._squashfs_size(b"not a superblock" + b"\x00" * 80, 0) is None
+
+
+def test_extract_filesystems_is_empty_without_a_filesystem():
+    assert carve.extract_filesystems(b"\x00" * 8192) == []
+    assert carve.extract_filesystems(b"") == []
+
+
+def test_extract_filesystems_degrades_when_no_extractor_is_installed(monkeypatch):
+    """No unsquashfs on PATH must mean an empty result, never a crash -- the optional tool is a
+    capability, not a dependency."""
+    monkeypatch.setattr(carve.shutil, "which", lambda _name: None)
+    img = _squashfs_superblock(96) + b"\x00" * 64
+    assert carve.extract_filesystems(img) == []
+
+
+def _newc_cpio(entries: list[tuple[str, bytes]]) -> bytes:
+    """A newc-format cpio archive of (name, data) pairs, built by hand so the test needs no tool
+    to CREATE the archive -- only `cpio` to extract it."""
+    def field(v):
+        return b"%08x" % v
+
+    def entry(name: str, data: bytes) -> bytes:
+        name_b = name.encode() + b"\x00"
+        hdr = (b"070701" + field(0) + field(0o100644) + field(0) + field(0) + field(1)
+               + field(0) + field(len(data)) + field(0) + field(0) + field(0) + field(0)
+               + field(len(name_b)) + field(0))
+        buf = bytearray(hdr + name_b)
+        while len(buf) % 4:
+            buf += b"\x00"
+        buf += data
+        while len(buf) % 4:
+            buf += b"\x00"
+        return bytes(buf)
+
+    out = b"".join(entry(n, d) for n, d in entries)
+    trailer = (b"070701" + field(0) * 7 + field(1) + field(0) * 3 + field(len(b"TRAILER!!!\x00"))
+               + field(0) + b"TRAILER!!!\x00")
+    out += trailer
+    buf = bytearray(out)
+    while len(buf) % 512:
+        buf += b"\x00"
+    return bytes(buf)
+
+
+@pytest.mark.skipif(not __import__("shutil").which("cpio"), reason="cpio not installed")
+def test_a_cpio_rootfs_is_unpacked_and_its_elf_is_an_elf_component():
+    """The end the fix exists for: a filesystem container whose binaries are only reachable by
+    actually unpacking it. The ELF file must come back tagged kind='elf' so the stage registers
+    it as a sub-target; a config file comes back as kind='file' for secret scanning."""
+    elf = _elf64(0x40)
+    archive = _newc_cpio([("bin/app", elf), ("etc/app.conf", b"api_key=AKIAIOSFODNN7EXAMPLE1\n")])
+    files = carve.extract_filesystems(archive)
+    by_path = {f["path"]: f for f in files}
+    assert "bin/app" in by_path and by_path["bin/app"]["kind"] == "elf"
+    assert by_path["bin/app"]["bytes"] == elf, "the unpacked ELF is not byte-identical"
+    assert "etc/app.conf" in by_path and by_path["etc/app.conf"]["kind"] == "file"

@@ -9,7 +9,11 @@ from __future__ import annotations
 import bz2
 import logging
 import lzma
+import os
+import shutil
 import struct
+import subprocess
+import tempfile
 import zlib
 from typing import Optional
 
@@ -166,4 +170,131 @@ def extract_components(data: bytes, *, max_components: int = 64) -> list[dict]:
                             "filename": f"carved_0x{o:x}_{typ}.elf",
                             "bytes": dec[:esz],
                             "note": f"{typ}-compressed ELF ({esz} bytes decompressed)"})
+    return out
+
+
+# ---------------------------------------------------------------- embedded filesystem unpack
+# Real firmware keeps its binaries inside a root FILESYSTEM (SquashFS almost always, sometimes
+# cpio/CramFS), which is compressed block-by-block -- so the embedded ELFs are NOT visible as
+# contiguous ELF or gzip magic in the raw image and extract_components() finds nothing. Unpacking
+# the filesystem is the only way to reach them. We shell out to the standard extractor when it is
+# on PATH (unsquashfs / cpio): optional tools, degrading to [] when absent -- never a hard dep.
+_MAX_FS_FILES = 1024
+_MAX_FS_FILE = 32 << 20        # skip any single extracted file larger than this
+_MAX_FS_TOTAL = 256 << 20      # stop walking once this many bytes have been read out
+
+
+def _squashfs_size(data: bytes, o: int) -> Optional[int]:
+    """Total on-disk size of the SquashFS at offset o, read from its v4 superblock (bytes_used
+    at +40). 'hsqs' is little-endian, 'sqsh' big-endian."""
+    magic = data[o:o + 4]
+    endc = "<" if magic == b"hsqs" else (">" if magic == b"sqsh" else None)
+    if endc is None or len(data) - o < 48:
+        return None
+    try:
+        bytes_used = struct.unpack_from(endc + "Q", data, o + 40)[0]
+    except struct.error:
+        return None
+    if 96 <= bytes_used <= len(data) - o:
+        return bytes_used
+    return None
+
+
+def _walk_tree(root: str) -> list[dict]:
+    """Every regular file under `root`: [{path, bytes, kind}] (path relative to root). kind is
+    'elf' when the file begins with the ELF magic, else 'file'. Symlinks are skipped."""
+    files: list[dict] = []
+    total = 0
+    for dirpath, _dirs, names in os.walk(root):
+        for name in names:
+            if len(files) >= _MAX_FS_FILES or total >= _MAX_FS_TOTAL:
+                return files
+            full = os.path.join(dirpath, name)
+            if os.path.islink(full) or not os.path.isfile(full):
+                continue
+            try:
+                if os.path.getsize(full) > _MAX_FS_FILE:
+                    continue
+                blob = open(full, "rb").read()
+            except OSError:
+                continue
+            total += len(blob)
+            rel = os.path.relpath(full, root)
+            kind = "elf" if blob[:4] == b"\x7fELF" else "file"
+            files.append({"path": rel, "bytes": blob, "kind": kind})
+    return files
+
+
+def _unpack_squashfs(fs: bytes) -> list[dict]:
+    exe = shutil.which("unsquashfs")
+    if not exe:
+        _log.debug("unsquashfs not on PATH; cannot unpack SquashFS root filesystem")
+        return []
+    with tempfile.TemporaryDirectory(prefix="lykos-fw-") as td:
+        img = os.path.join(td, "fs.sqsh")
+        dest = os.path.join(td, "root")        # must NOT pre-exist: unsquashfs creates it
+        with open(img, "wb") as fh:
+            fh.write(fs)
+        try:
+            subprocess.run([exe, "-no-progress", "-force", "-dest", dest, img],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=180, check=False)
+        except (OSError, subprocess.TimeoutExpired):
+            _log.debug("unsquashfs failed on carved SquashFS region", exc_info=True)
+            return []
+        if not os.path.isdir(dest):
+            return []
+        return _walk_tree(dest)
+
+
+def _unpack_cpio(fs: bytes) -> list[dict]:
+    exe = shutil.which("cpio")
+    if not exe:
+        return []
+    with tempfile.TemporaryDirectory(prefix="lykos-fw-") as td:
+        dest = os.path.join(td, "root")
+        os.makedirs(dest, exist_ok=True)
+        try:
+            subprocess.run([exe, "-idm", "--no-absolute-filenames", "--quiet"],
+                           input=fs, cwd=dest, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=120, check=False)
+        except (OSError, subprocess.TimeoutExpired):
+            _log.debug("cpio extraction failed", exc_info=True)
+            return []
+        return _walk_tree(dest)
+
+
+def extract_filesystems(data: bytes, *, max_filesystems: int = 8) -> list[dict]:
+    """Unpack embedded root filesystems (SquashFS, cpio) with the matching system extractor and
+    return every regular file inside them: [{offset, fs, path, bytes, kind}] where `offset` is
+    where the filesystem starts in the image, `fs` its type, `path` the file's path within it,
+    and `kind` 'elf' for an ELF file else 'file'. Returns [] when no filesystem is present or no
+    extractor is installed -- the raw-ELF carve (extract_components) is unaffected either way."""
+    out: list[dict] = []
+    seen: set[int] = set()
+    hits = scan_signatures(data)
+    n_fs = 0
+    for h in hits:
+        if n_fs >= max_filesystems:
+            break
+        o, typ = h["offset"], h["type"]
+        if typ == "squashfs":
+            sz = _squashfs_size(data, o)
+            if sz is None or o in seen:
+                continue
+            seen.add(o)
+            files = _unpack_squashfs(data[o:o + sz])
+        elif typ == "cpio":
+            if o in seen:
+                continue
+            seen.add(o)
+            files = _unpack_cpio(data[o:])
+        else:
+            continue
+        if not files:
+            continue
+        n_fs += 1
+        for f in files:
+            out.append({"offset": o, "fs": typ, "path": f["path"],
+                        "bytes": f["bytes"], "kind": f["kind"]})
     return out
