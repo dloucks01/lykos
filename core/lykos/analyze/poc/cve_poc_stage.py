@@ -77,19 +77,13 @@ def cve_poc_stage(ctx) -> dict:
 
     dd, pd = DynResultDAO(ctx.conn), PocDAO(ctx.conn)
     reproduced = []
-    for cve, _finding in candidates:
-        trig = cve_triggers.for_cve(cve)
-        if trig is None:
-            continue
-        ctx.progress(msg=f"detonating {cve} trigger")
-        res = _detonate(str(exe), trig, target.arch)
-        if res is None:
-            continue
+
+    def _record(label, trig, res, confidence):
         input_sha = ctx.put_artifact("cve-trigger-input", data=trig.data)
         iso = res.isolation or "cve-trigger"
         dd.insert(target.id, target.case_id, run_id=ctx.run_id, input_sha=input_sha,
                   input_mode=trig.channel, signal=res.signal, signal_name=res.signal_name,
-                  crashed=True, isolation=iso, note=f"{cve} trigger")
+                  crashed=True, isolation=iso, note=f"{label} trigger")
         try:
             pd.insert(target.id, target.case_id, level="L1", verified=True,
                       signal_name=res.signal_name, input_sha=input_sha)
@@ -97,11 +91,44 @@ def cve_poc_stage(ctx) -> dict:
             _log.debug("recording cve_poc L1 failed", exc_info=True)
         fd.upsert(target.id, target.case_id, crash_finding_candidate(
             res.signal_name, input_sha, iso, "cve_poc",
-            extra=f"({cve} trigger reproduced a fault -- {trig.note})",
-            state="confirmed", confidence=0.95))
-        reproduced.append(cve)
+            extra=f"({label} trigger reproduced a fault -- {trig.note})",
+            state="confirmed", confidence=confidence))
 
-    ctx.emit("cve_poc.done", payload={"applicable": True, "tried": [c for c, _ in candidates],
+    # 1) hand-authored, CVE-specific triggers (highest fidelity).
+    specific = [cve for cve, _ in candidates]
+    for cve in specific:
+        trig = cve_triggers.for_cve(cve)
+        if trig is None:
+            continue
+        ctx.progress(msg=f"detonating {cve} trigger")
+        res = _detonate(str(exe), trig, target.arch)
+        if res is not None:
+            _record(cve, trig, res, 0.95)
+            reproduced.append(cve)
+
+    # 2) generic CWE-class weaponization for any matched CVE without a bespoke trigger: try the
+    #    class payloads once per distinct CWE (bounded), stopping at the first fault per class.
+    DETONATION_CAP = 60
+    budget = DETONATION_CAP
+    seen_cwe = set()
+    for cve, finding in candidates:
+        if cve_triggers.for_cve(cve) is not None or budget <= 0:
+            continue
+        cwe = finding.cwe
+        if not cwe or cwe in seen_cwe:
+            continue
+        seen_cwe.add(cwe)
+        for trig in cve_triggers.class_triggers(cwe):
+            if budget <= 0:
+                break
+            budget -= 1
+            res = _detonate(str(exe), trig, target.arch)
+            if res is not None:
+                _record(f"{cve} ({cwe} class)", trig, res, 0.8)
+                reproduced.append(f"{cve}:class")
+                break
+
+    ctx.emit("cve_poc.done", payload={"applicable": True, "tried": specific,
              "reproduced": reproduced})
     ctx.progress(pct=100, msg=(f"reproduced {', '.join(reproduced)}" if reproduced
                                else "no CVE trigger reproduced a fault on this target"))
