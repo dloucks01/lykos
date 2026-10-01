@@ -321,6 +321,37 @@ def _distinct_crashes(store, target_id):
     return out[:12]
 
 
+# CWE classes where a static finding SHOULD be reproducible but may not fault a non-instrumented
+# binary (the overflow doesn't reach an unmapped page; the target has no canary/sanitizer).
+_MEMCORRUPTION_CWES = {"CWE-119", "CWE-120", "CWE-121", "CWE-122", "CWE-125", "CWE-787", "CWE-416",
+                       "CWE-190", "CWE-131", "CWE-476", "CWE-824"}
+
+
+def _note_static_memcorruption(store, target) -> None:
+    """When a memory-corruption defect was found statically but NO crash was reproduced, record a
+    note explaining why there is no dynamic PoC -- so a static-only outcome does not read as a
+    clean bill of health. A sanitizer build / source would demonstrate it."""
+    try:
+        from ..db.dao import FindingDAO
+        hits = [f for f in FindingDAO(store.conn).list_by_target(target.id)
+                if (f.cwe in _MEMCORRUPTION_CWES
+                    and f.state in ("corroborated", "confirmed", "poc-backed"))]
+        if not hits:
+            return
+        cwes = sorted({f.cwe for f in hits})
+        store.events.append("autopilot.note", case_id=target.case_id, payload={
+            "target_id": target.id, "kind": "static_memcorruption_unreproduced",
+            "cwes": cwes,
+            "note": (f"A memory-corruption defect ({', '.join(cwes)}) was found statically but no "
+                     f"runtime fault was reproduced on this binary. That is expected when the "
+                     f"target has no stack canary or sanitizer and the overflow does not reach an "
+                     f"unmapped page (e.g. the write stays within a large task/thread stack) -- "
+                     f"the bug is real but not self-evidently crashing. Rebuild with "
+                     f"-fsanitize=address, or provide source, to demonstrate it.")})
+    except Exception:
+        _log.debug("static-memcorruption note failed for %s", target.id, exc_info=True)
+
+
 def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict, stop: threading.Event) -> None:
     """The background pipeline. Owns its OWN CaseStore connection (SQLite is per-thread)."""
     store = CaseStore(case_dir)
@@ -480,6 +511,11 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict, stop: t
             # now that crashes/PoCs for this target exist.
             if not stop.is_set():
                 _run_target_stage(store, t, "cve_corroborate", status, stop)
+            # Explain a static-only outcome: a memory-corruption defect was found but no runtime
+            # fault was reproduced -- say WHY (the binary carries no sanitizer), rather than
+            # leaving a bare "static" that reads like "nothing to see".
+            if not crashes and not stop.is_set():
+                _note_static_memcorruption(store, t)
             _finalize_plan(status)          # any step never reached is marked skipped
         # Case-level cross-binary analysis for a multi-binary case (a carved firmware's extracted
         # components are exactly such a set).

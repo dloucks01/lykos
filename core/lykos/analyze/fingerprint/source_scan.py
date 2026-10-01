@@ -43,6 +43,13 @@ _HEADER_MACROS = [
     ("wolfssl", re.compile(r'#\s*define\s+LIBWOLFSSL_VERSION_STRING\s+"(\d+\.\d+\.\d+)')),
     ("lwip", re.compile(r'#\s*define\s+LWIP_VERSION_STRING\s+"(\d+\.\d+\.\d+)')),
 ]
+# Some libraries spell the version as SEPARATE numeric #defines rather than one string. lwIP's
+# lwip/init.h is the common case: MAJOR/MINOR/REVISION. Combine them into X.Y.Z.
+_COMBINED_MACROS = [
+    ("lwip", (re.compile(r'#\s*define\s+LWIP_VERSION_MAJOR\s+\(?(\d+)'),
+              re.compile(r'#\s*define\s+LWIP_VERSION_MINOR\s+\(?(\d+)'),
+              re.compile(r'#\s*define\s+LWIP_VERSION_REVISION\s+\(?(\d+)'))),
+]
 _HEADER_SUFFIXES = (".h", ".hpp", ".hh", ".hxx", ".in")
 # requirements.txt line: name[extras] ==|=== exact-version  (only exact pins give a version)
 _REQ = re.compile(r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)\s*(?:\[[^\]]*\])?\s*===?\s*"
@@ -163,6 +170,11 @@ def parse_source_tree(root: Path) -> list:
                 m = rx.search(text)
                 if m:
                     hits.append((lib, lib, m.group(1), f"{base}: {lib} {m.group(1)}"))
+            for lib, (rmaj, rmin, rrev) in _COMBINED_MACROS:
+                a, b, c = rmaj.search(text), rmin.search(text), rrev.search(text)
+                if a and b and c:
+                    ver = f"{a.group(1)}.{b.group(1)}.{c.group(1)}"
+                    hits.append((lib, lib, ver, f"{base}: {lib} {ver} (MAJOR/MINOR/REVISION)"))
         for lk, nm, ver, ev in hits:
             found.setdefault((lk, ver), {"library": lk, "name": nm, "version": ver,
                                          "evidence": ev})

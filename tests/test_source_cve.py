@@ -102,6 +102,14 @@ def test_vendored_freertos_kernel_version(tmp_path):
     assert _by_lib(source_scan.parse_source_tree(root)).get("freertos") == "11.1.0"
 
 
+def test_lwip_version_from_separate_major_minor_revision_macros(tmp_path):
+    """lwIP spells its version as three numeric #defines in lwip/init.h, not one string."""
+    root = _tree(tmp_path, {"lwip/src/include/lwip/init.h":
+                            "#define LWIP_VERSION_MAJOR 2\n#define LWIP_VERSION_MINOR 1\n"
+                            "#define LWIP_VERSION_REVISION 3\n"})
+    assert _by_lib(source_scan.parse_source_tree(root)).get("lwip") == "2.1.3"
+
+
 def test_header_macros_disambiguate_a_generic_version_h(tmp_path):
     """mbedTLS and wolfSSL both ship a file called version.h; detection keys off the MACRO it
     contains, not the filename, so each resolves to the right library."""
