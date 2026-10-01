@@ -84,6 +84,24 @@ def test_poll_loop_is_broken_so_init_proceeds():
 
 
 @pytest.mark.skipif(_UNI is None, reason="Unicorn venv not available")
+def test_cortex_m_ram_is_tight_to_the_stack_top_so_overflows_fault():
+    """Cortex-M RAM is mapped only up to the initial SP (vector[0] = _estack = top of RAM by the
+    standard startup convention), so a write PAST the stack top -- a stack buffer overflowing off
+    the end -- is caught as a direct unmapped-WRITE fault (CWE-787) at the overflowing store,
+    instead of silently landing inside an over-generously mapped SRAM region. .data/.bss/heap all
+    live below SP, so nothing legitimate is cut off."""
+    img = bytearray(0x80)
+    struct.pack_into("<I", img, 0x00, 0x20010000)              # SP = top of RAM
+    struct.pack_into("<I", img, 0x04, 0x08000041)              # Reset -> 0x40
+    img[0x40:0x46] = bytes.fromhex("69460a60fee7")             # mov r1,sp; str r2,[r1]; b .
+    out = _run({"_blob": bytes(img), "arch": "cortex-m", "mode": "run", "budget": 200})
+    assert out["ok"]
+    f = out["run"]["fault"]
+    assert f and f["kind"] == "write", f"expected an unmapped-write fault, got {f}"
+    assert f["addr"] == 0x20010000, "a write past the stack top was not caught (RAM mapped too wide)"
+
+
+@pytest.mark.skipif(_UNI is None, reason="Unicorn venv not available")
 def test_write_progress_init_loop_is_not_mistaken_for_stuck():
     """A long startup loop that ZEROES/copies RAM (a real RTOS image zeroes KBs of .bss before
     main) re-executes one block hundreds of times with no NEW coverage -- but it is making real

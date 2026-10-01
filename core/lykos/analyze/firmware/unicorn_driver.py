@@ -196,6 +196,17 @@ def run_once(cfg, blob, base, sp, entry, fuzz, budget, handlers=None):
     uc.mem_write(base, blob)
     # a scratch RAM region: the arch default, else a window straddling the image base.
     ram_lo, ram_sz = (cfg["ram"] if cfg["ram"] else (max(0, base - 0x200000) & ~0xFFF, 0x400000))
+    # Tighten Cortex-M RAM to the initial stack top. vector[0] (the SP) is `_estack` -- the top of
+    # RAM -- under the universal CMSIS/GCC startup convention. A stack-buffer overflow writes UP
+    # past the stack top; with the whole SRAM region mapped it stays mapped and silently corrupts,
+    # so the fault only shows up later (if at all) as a wild jump. Mapping RAM only up to SP turns
+    # the overflow itself into a direct unmapped-WRITE fault (CWE-787) at the overflowing store.
+    # .data/.bss/heap all live below SP, so nothing legitimate is cut off. Guarded to a sane SP
+    # inside the default window and a non-tiny resulting size.
+    if cfg["cortex_m"] and sp and ram_lo < sp <= ram_lo + ram_sz:
+        tight = ((sp - ram_lo) + 0xFFF) & ~0xFFF
+        if tight >= 0x800:
+            ram_sz = tight
     try:
         uc.mem_map(ram_lo, ram_sz)
     except UcError:
