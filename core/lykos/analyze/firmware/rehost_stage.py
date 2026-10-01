@@ -74,6 +74,9 @@ def firmware_rehost_stage(ctx) -> dict:
         "seed": int(p.get("seed", 1337)),
         "seeds": p.get("seeds", []),
         "fuzz_b64": p.get("fuzz_b64"),
+        # {entry_addr: "skip"|"ret0"|"ret1"} for recognised HAL/libc/delay functions, supplied by
+        # an operator or a signature matcher: handled on the host instead of emulated.
+        "handlers": p.get("handlers", {}),
     }
     ctx.emit("firmware_rehost.start", payload={"entry": hex(spec["base"]),
              "python": python.name})

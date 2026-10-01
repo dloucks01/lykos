@@ -119,6 +119,27 @@ def test_value_search_satisfies_a_specific_magic_gate():
 
 
 @pytest.mark.skipif(_UNI is None, reason="Unicorn venv not available")
+def test_hal_handler_skips_a_known_function():
+    """A recognised function (e.g. a blocking delay) can be intercepted and returned-from on the
+    host: without the handler the firmware hangs in the delay; with it, execution proceeds."""
+    img = bytearray(0x100)
+    struct.pack_into("<I", img, 0x00, 0x20010000)
+    struct.pack_into("<I", img, 0x04, 0x08000081)             # Reset -> main 0x80
+    # main: bl 0x90 (delay); ldr r0,[pc,#4]; str r1,[r0]; b . ; pool=0x1000 (unmapped -> fault)
+    img[0x80:0x8E] = bytes([0x00, 0xF0, 0x06, 0xF8, 0x01, 0x48, 0x01, 0x60,
+                            0xFE, 0xE7, 0x00, 0x00, 0x00, 0x10])
+    struct.pack_into("<I", img, 0x8C, 0x00001000)
+    img[0x90:0x92] = bytes([0xFE, 0xE7])                       # delay: b . (spin forever)
+    blob = bytes(img)
+    base = {"_blob": blob, "arch": "cortex-m", "mode": "run", "budget": 30000}
+    without = _run(dict(base))
+    assert without["run"]["halt"] == "budget" and without["run"]["fault"] is None  # hung in delay
+    with_h = _run(dict(base, handlers={"0x08000090": "skip"}))
+    assert with_h["run"]["handled_calls"] >= 1
+    assert with_h["run"]["fault"] and with_h["run"]["fault"]["kind"] == "write"    # proceeded
+
+
+@pytest.mark.skipif(_UNI is None, reason="Unicorn venv not available")
 def test_bad_write_is_a_fault():
     """A write to a wild unmapped address under Cortex-M is a genuine fault (memory corruption)."""
     img = bytearray(0x80)

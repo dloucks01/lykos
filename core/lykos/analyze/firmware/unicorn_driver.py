@@ -42,16 +42,14 @@ try:
         UC_MODE_BIG_ENDIAN, UC_MODE_LITTLE_ENDIAN,
         Uc, UcError,
     )
-    from unicorn.arm_const import (
-        UC_ARM_REG_PC, UC_ARM_REG_SP, UC_ARM_REG_LR,
-        UC_ARM_REG_R0, UC_ARM_REG_R1, UC_ARM_REG_R2, UC_ARM_REG_R3, UC_ARM_REG_R4,
-        UC_ARM_REG_R5, UC_ARM_REG_R6, UC_ARM_REG_R7, UC_ARM_REG_R8, UC_ARM_REG_R9,
-        UC_ARM_REG_R10, UC_ARM_REG_R11, UC_ARM_REG_R12,
-    )
-    from unicorn.arm64_const import UC_ARM64_REG_PC, UC_ARM64_REG_SP
-    from unicorn.mips_const import UC_MIPS_REG_PC, UC_MIPS_REG_SP
-    from unicorn.ppc_const import UC_PPC_REG_PC, UC_PPC_REG_1
-    from unicorn.riscv_const import UC_RISCV_REG_PC, UC_RISCV_REG_SP
+    from unicorn.arm_const import UC_ARM_REG_PC, UC_ARM_REG_SP, UC_ARM_REG_LR, UC_ARM_REG_R0
+    from unicorn.arm64_const import (UC_ARM64_REG_PC, UC_ARM64_REG_SP, UC_ARM64_REG_X0,
+                                     UC_ARM64_REG_X30)
+    from unicorn.mips_const import (UC_MIPS_REG_PC, UC_MIPS_REG_SP, UC_MIPS_REG_V0,
+                                    UC_MIPS_REG_RA)
+    from unicorn.ppc_const import UC_PPC_REG_PC, UC_PPC_REG_1, UC_PPC_REG_3, UC_PPC_REG_LR
+    from unicorn.riscv_const import (UC_RISCV_REG_PC, UC_RISCV_REG_SP, UC_RISCV_REG_A0,
+                                     UC_RISCV_REG_RA)
     try:
         from unicorn import UC_MODE_PPC64
     except Exception:
@@ -158,6 +156,23 @@ def _satisfy_values():
 _SATISFY = _satisfy_values()
 
 
+def _ret_ra(cfg):
+    """(return-value register, return-address register) for the arch, or (None, None). Used to
+    intercept a known function (HAL/libc/delay) and return from it on the host."""
+    a = cfg["uc"]
+    if a == UC_ARCH_ARM:
+        return UC_ARM_REG_R0, UC_ARM_REG_LR
+    if a == UC_ARCH_ARM64:
+        return UC_ARM64_REG_X0, UC_ARM64_REG_X30
+    if a == UC_ARCH_MIPS:
+        return UC_MIPS_REG_V0, UC_MIPS_REG_RA
+    if a == UC_ARCH_PPC:
+        return UC_PPC_REG_3, UC_PPC_REG_LR
+    if a == UC_ARCH_RISCV:
+        return UC_RISCV_REG_A0, UC_RISCV_REG_RA
+    return None, None
+
+
 def _kind(access):
     if access in (UC_MEM_WRITE_UNMAPPED, UC_MEM_WRITE_PROT):
         return "write"
@@ -172,7 +187,7 @@ def _in(addr, size, lo, hi):
     return lo <= addr and addr + size <= hi
 
 
-def run_once(cfg, blob, base, sp, entry, fuzz, budget):
+def run_once(cfg, blob, base, sp, entry, fuzz, budget, handlers=None):
     be = bool(cfg["mode"] & UC_MODE_BIG_ENDIAN)
     endc = ">" if be else "<"
     uc = Uc(cfg["uc"], cfg["mode"])
@@ -214,10 +229,19 @@ def run_once(cfg, blob, base, sp, entry, fuzz, budget):
                 seen_h.add(h)
                 irq_handlers.append(h)
 
+    # HAL/known-function handlers: {entry_addr: action}. An operator (or the lykos core's
+    # signature matcher) supplies the addresses of recognised library functions and we run them
+    # on the host instead of emulating -- "skip" (return immediately), "ret0"/"ret1" (set the
+    # return value and return). This is the HALucinator mechanism; the signature DB that finds
+    # the addresses is populated separately.
+    hmap = {(int(a, 0) if isinstance(a, str) else int(a)) & ~1: str(act)
+            for a, act in (handlers or {}).items()}
+    ret_reg, ra_reg = _ret_ra(cfg)
+
     blocks = set()
     st = {"i": 0, "fault": None, "since_new": 0, "stuck": False, "trial": 0,
           "pending": None, "cache": {}, "polls": 0,
-          "irq_i": 0, "in_isr": False, "saved": None, "fires": 0, "resume": None}
+          "irq_i": 0, "in_isr": False, "saved": None, "fires": 0, "resume": None, "handled": 0}
     _IRQ_STUCK = _STUCK * 3
     _MAX_FIRES = 16
 
@@ -246,6 +270,16 @@ def run_once(cfg, blob, base, sp, entry, fuzz, budget):
             pass
 
     def hb(uc, addr, size, ud):
+        # intercept a known function: run it on the host and return to the caller instead of
+        # emulating its body (skip a delay/HAL_Init, return 0/1 from a probe).
+        if hmap and ra_reg is not None and (addr & ~1) in hmap and not st["in_isr"]:
+            act = hmap[addr & ~1]
+            if act in ("ret0", "ret1") and ret_reg is not None:
+                uc.reg_write(ret_reg, 1 if act == "ret1" else 0)
+            st["handled"] += 1
+            st["resume"] = uc.reg_read(ra_reg)       # return to the caller
+            uc.emu_stop()
+            return
         # returned from a fired interrupt -> restore the thread context and resume there.
         # (PC changes from a block hook do not reliably redirect Unicorn, so we stop and the
         # outer loop restarts at st["resume"].)
@@ -343,7 +377,8 @@ def run_once(cfg, blob, base, sp, entry, fuzz, budget):
         halt = "fault"
     return {"nblocks": len(blocks), "blocks": sorted(hex(b) for b in blocks)[:200],
             "halt": halt, "fault": st["fault"], "consumed": st["i"],
-            "polls_satisfied": len(st["cache"]), "irq_fires": st["fires"]}
+            "polls_satisfied": len(st["cache"]), "irq_fires": st["fires"],
+            "handled_calls": st["handled"]}
 
 
 def _mutate(data, rng):
@@ -363,7 +398,7 @@ def _mutate(data, rng):
     return bytes(d[:256])
 
 
-def fuzz(cfg, blob, base, sp, entry, budget, seeds, max_iters, rng_seed):
+def fuzz(cfg, blob, base, sp, entry, budget, seeds, max_iters, rng_seed, handlers=None):
     rng = random.Random(rng_seed)
     corpus = [base64.b64decode(s) for s in seeds] or [b"\x00" * 16]
     corpus.append(bytes(rng.getrandbits(8) for _ in range(16)))
@@ -374,7 +409,7 @@ def fuzz(cfg, blob, base, sp, entry, budget, seeds, max_iters, rng_seed):
     for _ in range(max_iters):
         iters += 1
         data = _mutate(rng.choice(corpus), rng)
-        r = run_once(cfg, blob, base, sp, entry, data, budget)
+        r = run_once(cfg, blob, base, sp, entry, data, budget, handlers=handlers)
         best_polls = max(best_polls, r.get("polls_satisfied", 0))
         new = set(r["blocks"]) - covered
         if new:
@@ -420,13 +455,14 @@ def main():
             out["arch"] = archkey
             out["entry"] = hex(entry)
             out["sp"] = hex(sp)
+            handlers = spec.get("handlers") or {}
             if spec.get("mode") == "fuzz":
                 out["fuzz"] = fuzz(cfg, blob, base, sp, entry, budget,
                                    spec.get("seeds", []), int(spec.get("max_iters", 200)),
-                                   int(spec.get("seed", 1337)))
+                                   int(spec.get("seed", 1337)), handlers=handlers)
             else:
                 fz = base64.b64decode(spec["fuzz_b64"]) if spec.get("fuzz_b64") else b""
-                out["run"] = run_once(cfg, blob, base, sp, entry, fz, budget)
+                out["run"] = run_once(cfg, blob, base, sp, entry, fz, budget, handlers=handlers)
             out["ok"] = True
         except Exception as e:
             out["error"] = repr(e)
