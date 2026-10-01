@@ -36,6 +36,7 @@ _TARGET = {
     "int_overflow_scan": ("..analyze.fingerprint", "enqueue_int_overflow_scan"),
     "net_fuzz": ("..analyze.fuzz", "enqueue_net_fuzz"),
     "cve_corroborate": ("..analyze.fingerprint", "enqueue_cve_corroborate"),
+    "cve_poc": ("..analyze.poc", "enqueue_cve_poc"),
     "coverage_fuzz": ("..analyze.fuzz", "enqueue_coverage_fuzz"),
     "fuzz": ("..analyze.fuzz", "enqueue_fuzz"),
     "directed_fuzz": ("..analyze.fuzz", "enqueue_directed_fuzz"),
@@ -65,7 +66,7 @@ _CASE = {
 # them dropped that input and every one failed with "requires params.input_sha".
 _NO_PARAMS = {"disassemble", "detect_cwe", "heap_trace", "oob_index", "chain_primitive",
               "synthesize_poc", "firmware_carve", "source_cve_scan", "embedded_audit",
-              "int_overflow_scan", "net_fuzz", "cve_corroborate"}
+              "int_overflow_scan", "net_fuzz", "cve_corroborate", "cve_poc"}
 _CASE_NO_PARAMS = {"link_case", "ipc_model", "cross_taint"}
 
 _TERMINAL = {"done", "cancelled", "error"}
@@ -123,8 +124,8 @@ _PLAN_STAGES = [
     ("disassemble", "Disassemble"), ("detect_cwe", "Static detectors"),
     ("cve_scan", "Known-CVE scan"), ("source_cve_scan", "Dependency-CVE scan"),
     ("embedded_audit", "RTOS config audit"), ("int_overflow_scan", "Int-overflow allocs"),
-    ("net_fuzz", "Network fuzzing"), ("cve_corroborate", "CVE corroboration"),
-    ("synthesize_injection", "Injection probes"),
+    ("net_fuzz", "Network fuzzing"), ("cve_poc", "CVE weaponization"),
+    ("cve_corroborate", "CVE corroboration"), ("synthesize_injection", "Injection probes"),
     ("coverage_fuzz", "Coverage fuzzing"), ("directed_fuzz", "Directed fuzzing"),
     ("heap_check", "Heap checks"), ("heap_trace", "Heap primitives"),
     ("oob_index", "Array-index probes"), ("chain_primitive", "Primitive chaining"),
@@ -370,6 +371,9 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict, stop: t
             _run_target_stage(store, t, "embedded_audit", status, stop)
             # Unguarded size arithmetic feeding an allocator (integer-overflow allocation).
             _run_target_stage(store, t, "int_overflow_scan", status, stop)
+            # Weaponize a version-matched CVE that has an authored trigger: feed the trigger and
+            # record a verified reproduction only if the target actually faults.
+            _run_target_stage(store, t, "cve_poc", status, stop)
             # Demonstrate injection / format-string leaks by probing the binary's sinks directly
             # (no crash needed) -- a printf(user) leaks live memory, a system(user) runs a command.
             _run_target_stage(store, t, "synthesize_injection", status, stop)

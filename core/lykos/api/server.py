@@ -656,6 +656,7 @@ class Handler(EndpointsMixin, AutopilotMixin, BaseHTTPRequestHandler):
         "int_overflow_scan": ("..analyze.fingerprint", "enqueue_int_overflow_scan"),
         "net_fuzz": ("..analyze.fuzz", "enqueue_net_fuzz"),
         "cve_corroborate": ("..analyze.fingerprint", "enqueue_cve_corroborate"),
+        "cve_poc": ("..analyze.poc", "enqueue_cve_poc"),
         "firmware_carve": ("..analyze.firmware", "enqueue_firmware"),
         "firmware_rehost": ("..analyze.firmware", "enqueue_rehost"),
     }

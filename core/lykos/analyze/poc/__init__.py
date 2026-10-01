@@ -5,6 +5,8 @@
 """
 from .chain_primitive import CHAIN_STAGE, enqueue_chain  # noqa: F401
 from .chain_primitive import register as _register_chain
+from .cve_poc_stage import CVE_POC_STAGE, enqueue_cve_poc  # noqa: F401
+from .cve_poc_stage import register as _register_cve_poc
 from .poc_diff import POC_DIFF_STAGE, enqueue_poc_diff  # noqa: F401
 from .poc_diff import register as _register_poc_diff
 from .exploit_stage import EXPLOIT_STAGE, enqueue_exploit  # noqa: F401
@@ -30,3 +32,4 @@ def register() -> None:
     _register_synth()
     _register_inject()
     _register_secret()
+    _register_cve_poc()
