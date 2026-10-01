@@ -173,6 +173,25 @@ def _slice_block(instrs, upto_addr, bases, bits, sp=None):
                         off += sp_off             # SP moves within the block on these ISAs
                     slots[outk] = ("frame", base, off)
                     vals[outk] = ("frame", base, off)
+                    continue
+                # A loaded POINTER plus a constant -- `argv + 8` is `load(frame) + 8`. Carry it
+                # as an address expression so a following LOAD through it resolves to a canonical
+                # value, which is what lets a double-indirected source (argv[1]) be correlated
+                # between a strlen guard and the strcpy it protects.
+                ptr = None
+                for vk, dtok in ((a, toks[2]), (b, toks[1])):
+                    known = vals.get(vk) if vk else None
+                    if known and known[0] in ("load", "loadp", "ptradd"):
+                        d = _const_of(dtok)
+                        if d is None and _key(dtok) in consts:
+                            d = consts[_key(dtok)]
+                        if d is not None:
+                            d = _signed(d, bits)
+                            ptr = (("ptradd", known[1], known[2] + d) if known[0] == "ptradd"
+                                   else ("ptradd", known, d))
+                            break
+                if ptr is not None:
+                    vals[outk] = ptr
                 else:
                     vals.pop(outk, None)
                 continue
@@ -190,6 +209,10 @@ def _slice_block(instrs, upto_addr, bases, bits, sp=None):
                 src = slots.get(addr) or vals.get(addr)
                 if src and src[0] == "frame":
                     vals[outk] = ("load", src[1], src[2])
+                elif src and src[0] == "ptradd":
+                    vals[outk] = ("loadp", src[1], src[2])     # *(ptr + off)
+                elif src and src[0] in ("load", "loadp"):
+                    vals[outk] = ("loadp", src, 0)             # *(ptr) with no displacement
                 else:
                     vals.pop(outk, None)
                 continue
@@ -543,11 +566,49 @@ def strlen_bound(blocks, site_block, site_addr, src, strlen_sites, bases, bits, 
         if measured is None or measured != src:
             continue                              # a different string: proves nothing here
         slot = _spill_slot(ins, sl_site, {("reg", r) for r in retregs}, bases, bits)
-        if slot is None:
-            continue
-        g = guard_bound(blocks, site_block, slot, bases=bases, dom=dom)
+        if slot is not None:
+            g = guard_bound(blocks, site_block, slot, bases=bases, dom=dom)
+            if g:
+                return g
+        # No spill: the guard may compare the strlen RESULT REGISTER directly, which is the
+        # common -O0 shape `n = strlen(x); if (n < sizeof b)`. Evaluate the branch in strlen's
+        # own block over the instructions AFTER the call (so the result register is the bounded
+        # value), and accept it when the edge reaching the copy is the bounded one.
+        g = _strlen_reg_guard(blk, sl_site, site_block, retregs, bases, dom)
         if g:
             return g
+    return None
+
+
+def _strlen_reg_guard(blk, sl_site, site_block, retregs, bases, dom):
+    """Bound from a guard that compares a call's RESULT REGISTER directly (no spill): the branch
+    lives in the call's own block, so the result register is the bounded value on the
+    instructions that follow the call. Returns a guard_bound-shaped dict or None."""
+    ins = blk.get("instructions", []) or []
+    idx = next((j for j, i in enumerate(ins) if i.get("addr") == sl_site), None)
+    reaching = (dom or {}).get(site_block, ())
+    if idx is None or not (blk.get("addr") in reaching or blk.get("addr") == site_block):
+        return None                               # the guard block must dominate the copy
+    after = ins[idx + 1:]                         # strictly after the call: the register holds n
+    succ = blk.get("succ", []) or []
+    for rr in retregs:
+        got = branch_predicate(after, ("reg", rr), bases)
+        if not got:
+            continue
+        target, (_t, rel, k, signed) = got
+        here = lambda x: x in reaching or x == site_block
+        other = [x for x in succ if x != target and here(x)]
+        if here(target) and other:
+            continue                              # both edges reach the copy: no constraint
+        holds = rel if here(target) else (_NEGATE[rel] if other else None)
+        fn = _UPPER.get(holds) if holds else None
+        if fn is None or k <= 0:
+            continue
+        cand = fn(k)
+        if cand <= 0:
+            continue
+        return {"bound": cand, "nonneg": (signed is False or holds == "eq"),
+                "why": f"a dominating check permits a source length of at most {cand}"}
     return None
 
 
@@ -913,6 +974,14 @@ def branch_predicate(instrs, slot, bases):
     """
     from .taint import _REG_FAMILY
     v: dict = {}
+    # A register slot -- ("reg", name) -- is the bounded value itself, seeded at the top. Used
+    # for a value compared directly in a register with no spill (a call result like
+    # `n = strlen(x); if (n < K)`); the caller passes only the instructions that FOLLOW the
+    # definition, so nothing earlier clobbers the seed. A memory slot is (base, offset), whose
+    # first element is a frame-base name, never the literal "reg", so the two never collide.
+    if isinstance(slot, tuple) and len(slot) == 2 and slot[0] == "reg":
+        for r in _REG_FAMILY.get(_canon_reg(slot[1]), (_canon_reg(slot[1]),)):
+            v[("reg", r)] = ("n",)
 
     def val(tok):
         c = _const_tok(tok)

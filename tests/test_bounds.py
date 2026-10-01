@@ -501,6 +501,58 @@ def test_an_unmeasured_strcpy_stays_unknown():
                                bounds.dominators(blocks)) is None
 
 
+def _argv1_load(out_reg):
+    """`v[1]` as gcc -O0 emits it: *(*(RBP-0x50) + 8) -- a double indirection (load argv, add 8,
+    deref). The slice must carry it as a canonical value so the same source correlates between a
+    strlen guard and the strcpy it protects."""
+    return [f"INT_ADD reg:RBP:8 const:0xffffffffffffffb0:8 -> unique:0x20:8",   # RBP-0x50
+            "LOAD const:0x1b1:8 unique:0x20:8 -> reg:RAX:8",                     # RAX = argv
+            "INT_ADD reg:RAX:8 const:0x8:8 -> reg:RAX:8",                        # RAX = argv + 8
+            f"LOAD const:0x1b1:8 reg:RAX:8 -> reg:{out_reg}:8"]                  # out = argv[1]
+
+
+_ARGV1 = ("loadp", ("load", "RBP", -0x50), 8)
+
+
+def test_slice_resolves_double_indirection_argv1():
+    """argv[1] -- a load through a loaded pointer -- resolves to a canonical ('loadp', ...) value
+    instead of being dropped, which is what lets the source be correlated across blocks."""
+    vals, _ = bounds._slice_block([_i("0x1000", _argv1_load("RDI"))], "0xffff", ("RBP",), 64)
+    assert vals.get(("reg", "RDI")) == _ARGV1
+
+
+def _x86_cmp_reg(reg, k):
+    """`cmp reg, K` -- the length compared DIRECTLY in a register (no spill), as `if (strlen(x) <
+    K)` emits at -O0 with the result still in the return register."""
+    return [f"COPY reg:{reg}:8 -> unique:0x66100:4",
+            f"INT_LESS unique:0x66100:4 const:{k:#x}:4 -> reg:CF:1",
+            f"INT_SBORROW unique:0x66100:4 const:{k:#x}:4 -> reg:OF:1",
+            f"INT_SUB unique:0x66100:4 const:{k:#x}:4 -> unique:0x66300:4",
+            "INT_SLESS unique:0x66300:4 const:0x0:4 -> reg:SF:1",
+            "INT_EQUAL unique:0x66300:4 const:0x0:4 -> reg:ZF:1"]
+
+
+def test_strlen_guard_on_the_result_register_bounds_a_double_indirected_source():
+    """`if (strlen(v[1]) < sizeof b) strcpy(b, v[1])`: the source is argv[1] (double indirection)
+    and the guard compares the strlen RESULT REGISTER directly, with no spill. Both halves --
+    correlating the source and reading the register guard -- must line up for the copy to be
+    proven bounded. This is the 3rd CWE-120 corroborated false positive."""
+    strlen_blk = {"addr": "0x1000", "succ": ["0x3000", "0x2000"], "instructions": [
+        _i("0x1000", _argv1_load("RDI"), "RDI = v[1]"),
+        _i("0x1004", ["CALL ram:0x9000:8"], "CALL strlen"),
+        _i("0x1008", _x86_cmp_reg("RAX", 0x3f), "CMP RAX,0x3f"),
+        _i("0x100c", _X86_COND["JA"][0] + ["CBRANCH ram:0x3000:8 " + _X86_COND["JA"][1]],
+           "JA 0x3000"),
+    ]}
+    blocks = [strlen_blk,
+              {"addr": "0x2000", "succ": ["0x3000"], "instructions": []},  # the strcpy block
+              {"addr": "0x3000", "succ": [], "instructions": []}]          # the skip block
+    got = bounds.strlen_bound(blocks, "0x2000", "0x200c", _ARGV1, [("0x1004", "0x1000")],
+                              ("RBP", "RSP"), 64, bounds.ARCH_ABI["x86-64"],
+                              bounds.dominators(blocks))
+    assert got is not None and got["bound"] == 0x3f and got["nonneg"] is True
+
+
 def test_a_dereference_with_a_dominating_bound_is_separated_from_one_without():
     """`tainted_deref` reports every place input reaches a pointer -- 122 of them on jhead --
     and said nothing about which was unchecked, so the list was inventory. The dominating-guard
