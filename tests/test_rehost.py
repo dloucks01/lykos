@@ -42,6 +42,17 @@ def test_resolve_arch_maps_canonical_names():
     assert drv._resolve_arch({"arch": "sparc"}) is None     # unsupported
 
 
+def test_every_driver_fault_kind_maps_to_a_cwe():
+    """The rehost stage looks up _FAULT_CWE[kind] for the fault the driver reports. Every kind the
+    driver can emit (_kind()'s returns plus the 'invalid' UcError trap) must be present, or a real
+    firmware fault crashes the stage with a TypeError instead of being filed. Regression: a real
+    FreeRTOS image reached an invalid-instruction fault once the init loop was no longer mis-read
+    as stuck, and 'invalid' was missing from the map."""
+    from lykos.analyze.firmware.rehost_stage import _FAULT_CWE
+    for kind in ("write", "fetch", "read", "unknown", "invalid"):
+        assert kind in _FAULT_CWE, f"driver fault kind {kind!r} has no CWE mapping"
+
+
 def _run(spec: dict) -> dict:
     with tempfile.TemporaryDirectory() as d:
         bp = Path(d) / "fw.bin"
@@ -70,6 +81,29 @@ def test_poll_loop_is_broken_so_init_proceeds():
     r = out["run"]
     assert r["polls_satisfied"] >= 1, "the status poll was never satisfied -- init hung"
     assert r["nblocks"] >= 3, "did not get past the poll loop"
+
+
+@pytest.mark.skipif(_UNI is None, reason="Unicorn venv not available")
+def test_write_progress_init_loop_is_not_mistaken_for_stuck():
+    """A long startup loop that ZEROES/copies RAM (a real RTOS image zeroes KBs of .bss before
+    main) re-executes one block hundreds of times with no NEW coverage -- but it is making real
+    progress, not stuck. The driver must NOT mistake it for a spin and fire an interrupt into it
+    (into a weak `b .` Default_Handler, which then hangs), or init never reaches application code.
+    Regression for a real FreeRTOS Cortex-M image that stopped at 7 blocks in its bss-zero loop."""
+    # movs r0,#200; r1=0x20000000; loop: str r2,[r1]; r1+=4; r0-=1; bne loop; app: r3=[0x40000000]; b .
+    CODE = bytes.fromhex("c82000212021090600220a60043110f1ff30fad140231b061b68fee7")
+    img = bytearray(0x80)
+    struct.pack_into("<I", img, 0x00, 0x20010000)              # SP
+    struct.pack_into("<I", img, 0x04, 0x08000041)              # Reset -> code at 0x40 (thumb)
+    for off in range(0x08, 0x40, 4):
+        struct.pack_into("<I", img, off, 0x08000061)           # IRQ vectors -> weak handler at 0x60
+    img[0x40:0x40 + len(CODE)] = CODE
+    struct.pack_into("<H", img, 0x60, 0xE7FE)                  # weak Default_Handler: `b .`
+    out = _run({"_blob": bytes(img), "arch": "cortex-m", "mode": "run", "budget": 8000})
+    assert out["ok"]
+    # the app block PAST the 200-iteration write loop must be reached; if the loop had been
+    # mistaken for a spin, an interrupt would have fired into the weak handler and hung first.
+    assert "0x8000054" in out["run"]["blocks"], "init write-loop was derailed before reaching app"
 
 
 @pytest.mark.skipif(_UNI is None, reason="Unicorn venv not available")

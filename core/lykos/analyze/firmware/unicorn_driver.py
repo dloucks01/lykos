@@ -33,7 +33,7 @@ try:
     import unicorn
     from unicorn import (
         UC_ARCH_ARM, UC_ARCH_ARM64, UC_ARCH_MIPS, UC_ARCH_PPC, UC_ARCH_RISCV,
-        UC_HOOK_BLOCK, UC_HOOK_MEM_READ_UNMAPPED, UC_HOOK_MEM_READ,
+        UC_HOOK_BLOCK, UC_HOOK_MEM_READ_UNMAPPED, UC_HOOK_MEM_READ, UC_HOOK_MEM_WRITE,
         UC_HOOK_MEM_WRITE_UNMAPPED, UC_HOOK_MEM_FETCH_UNMAPPED,
         UC_MEM_FETCH_PROT, UC_MEM_FETCH_UNMAPPED, UC_MEM_READ_PROT, UC_MEM_READ_UNMAPPED,
         UC_MEM_WRITE_PROT, UC_MEM_WRITE_UNMAPPED,
@@ -240,7 +240,7 @@ def run_once(cfg, blob, base, sp, entry, fuzz, budget, handlers=None):
 
     blocks = set()
     st = {"i": 0, "fault": None, "since_new": 0, "stuck": False, "trial": 0,
-          "pending": None, "cache": {}, "polls": 0,
+          "pending": None, "cache": {}, "polls": 0, "wr": 0, "wr_seen": 0,
           "irq_i": 0, "in_isr": False, "saved": None, "fires": 0, "resume": None, "handled": 0}
     _IRQ_STUCK = _STUCK * 3
     _MAX_FIRES = 16
@@ -296,6 +296,7 @@ def run_once(cfg, blob, base, sp, entry, fuzz, budget, handlers=None):
         if addr not in blocks:
             blocks.add(addr)
             st["since_new"] = 0
+            st["wr_seen"] = st["wr"]
             if st["stuck"] and st["pending"]:        # the poll-satisfying value just made progress
                 st["cache"][st["pending"][0]] = st["pending"][1]
             st["stuck"] = False
@@ -303,9 +304,20 @@ def run_once(cfg, blob, base, sp, entry, fuzz, budget, handlers=None):
             st["trial"] = 0
             return
         st["since_new"] += 1
+        # A loop that is WRITING memory is making real progress even with no NEW coverage: startup
+        # .bss-zeroing/memcpy (a real RTOS image zeroes KBs of RAM before main) or an MMIO
+        # receive-copy. Treat memory-write progress as progress -- reset the stuck window -- so we
+        # neither poll-break nor (worse) fire an interrupt into a mid-init loop and derail it
+        # before it ever reaches application code. A pure read-spin (MMIO poll or idle wait) does
+        # not write, so it still escalates: poll-break for an MMIO read, interrupt for a true idle.
+        if st["wr"] != st["wr_seen"]:
+            st["wr_seen"] = st["wr"]
+            st["since_new"] = 0
+            st["stuck"] = False
+            return
         if st["since_new"] > _STUCK:
             st["stuck"] = True
-        # deeply stuck and nothing is progressing: fire the next interrupt handler
+        # deeply stuck and genuinely idle (no write progress): fire the next interrupt handler.
         if (irq_handlers and not st["in_isr"] and st["fires"] < _MAX_FIRES
                 and st["since_new"] > _IRQ_STUCK):
             h = irq_handlers[st["irq_i"] % len(irq_handlers)]
@@ -336,7 +348,11 @@ def run_once(cfg, blob, base, sp, entry, fuzz, budget, handlers=None):
                        "pc": uc.reg_read(cfg["pc"]), "kind": _kind(access)}
         return False
 
+    def hw(uc, access, addr, size, value, ud):        # count mapped writes = the firmware is progressing
+        st["wr"] += 1
+
     uc.hook_add(UC_HOOK_BLOCK, hb)
+    uc.hook_add(UC_HOOK_MEM_WRITE, hw)
     uc.hook_add(UC_HOOK_MEM_WRITE_UNMAPPED, hbad)
     uc.hook_add(UC_HOOK_MEM_FETCH_UNMAPPED, hbad)
     if mmio:

@@ -20,10 +20,12 @@ REHOST_STAGE = "firmware_rehost"
 TOOL = "lykos-rehost"
 TOOL_VERSION = "rehost-1"
 
-# emulation fault kind -> (cwe, severity)
+# emulation fault kind -> (cwe, severity). "invalid" is an invalid-instruction trap: execution
+# reached bytes that do not decode -- a control-flow hijack (a corrupted return/pointer jumped
+# into data), which is the firmware equivalent of a crash to a wild PC.
 _FAULT_CWE = {
     "write": ("CWE-787", "high"), "read": ("CWE-125", "medium"),
-    "fetch": ("CWE-119", "high"), "unknown": ("CWE-119", "high"),
+    "fetch": ("CWE-119", "high"), "invalid": ("CWE-119", "high"), "unknown": ("CWE-119", "high"),
 }
 
 
@@ -146,7 +148,8 @@ def firmware_rehost_stage(ctx) -> dict:
     ctx.emit("firmware_rehost.done", payload={
         "supported": True, "coverage": coverage, "iters": fz.get("iters"),
         "crash": bool(crash), "cwe": (_FAULT_CWE.get((crash or {}).get("fault", {})
-                                      .get("kind", "unknown"))[0] if crash else None),
+                                      .get("kind", "unknown"), _FAULT_CWE["unknown"])[0]
+                                      if crash else None),
         "report": report_sha})
     ctx.progress(pct=100, msg=(f"rehosted: {coverage} blocks covered"
                                + (", crash found" if crash else ", no crash")))
