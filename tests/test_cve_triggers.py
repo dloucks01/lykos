@@ -106,3 +106,90 @@ def test_generic_overflow_class_trigger_faults_a_vulnerable_target(tmp_path):
     faulted = any(cve_poc_stage._detonate(str(exe), t, "x86-64") is not None
                   for t in cve_triggers.class_triggers("CWE-787") if t.channel == "stdin")
     assert faulted
+
+
+# ---- the weaponization plan: bespoke + library + CWE-class, all reachable --------------------
+
+def test_weaponization_plan_weaponizes_a_match_with_no_bespoke_trigger():
+    """Regression: a version-matched CVE that has NO hand-authored trigger must still be
+    weaponized by its library format attack AND its CWE class. (The stage previously filtered
+    candidates to bespoke-only, so library/class triggers never fired and the class path was
+    dead code -- only zlib was ever weaponized.)"""
+    plan = cve_triggers.weaponization_plan([("CVE-2017-0663", "libxml2", "CWE-787"),
+                                            ("CVE-2022-29824", "libxml2", "CWE-190")])
+    assert plan, "a matched libxml2 CVE with no bespoke trigger produced no weaponization"
+    # the library's billion-laughs + deep-nesting are present...
+    libcwes = {p.trigger.cwe for p in plan if p.group == "lib:libxml2"}
+    assert "CWE-776" in libcwes
+    assert any(b"<!ENTITY" in p.trigger.data for p in plan)      # billion laughs
+    assert any(p.trigger.data.count(b"<a>") > 100 for p in plan)  # deep nesting
+    # ...and the CWE-class probes for BOTH matched CWEs are planned.
+    assert {"cwe:CWE-787", "cwe:CWE-190"} <= {p.group for p in plan}
+
+
+def test_weaponization_plan_orders_bespoke_first_and_groups():
+    plan = cve_triggers.weaponization_plan([("CVE-2022-37434", "zlib", "CWE-787")])
+    assert plan[0].label == "CVE-2022-37434" and plan[0].confidence == 0.95
+    assert plan[0].group == ""                                   # bespoke is always tried
+    # library (zlib bomb) and class groups carry a group tag so the stage records one per group
+    assert any(p.group == "lib:zlib" for p in plan)
+    assert all(0.0 < p.confidence <= 0.95 for p in plan)
+
+
+def test_weaponization_plan_empty_without_matches():
+    assert cve_triggers.weaponization_plan([]) == []
+    # a lib with no known triggers and a CWE with no class probe -> nothing to try
+    assert cve_triggers.weaponization_plan([("CVE-9999-1", "sqlite", "CWE-611")]) == []
+
+
+def test_recursion_class_and_deep_nesting_triggers_exist():
+    rec = cve_triggers.class_triggers("CWE-674")
+    assert rec and all(t.cwe == "CWE-674" for t in rec)
+    assert any(t.data.startswith(b"[") for t in rec) and max(len(t.data) for t in rec) >= 50000
+    xt = cve_triggers.library_triggers("libxml2")
+    assert any(t.data.count(b"<a>") > 1000 for t in xt), "deep-nesting XML trigger missing"
+
+
+@pytest.mark.skipif(not _HAS_CC, reason="no C compiler")
+def test_cve_poc_stage_weaponizes_a_nonbespoke_cve_end_to_end(store, gcc, tmp_path):
+    """End-to-end: seed a CVE finding with NO bespoke trigger on a stack-smashing target and run
+    the cve_poc stage through the worker. The generic CWE-class path must fire and record a
+    confirmed, verified reproduction -- proving the stage no longer drops non-bespoke matches."""
+    from lykos.analyze import register
+    from lykos.analyze.ingest import ingest
+    from lykos.analyze.poc.cve_poc_stage import enqueue_cve_poc
+    from lykos.db.dao import FindingDAO, PocDAO
+    from lykos.jobs import JobConfig, JobQueue, WorkerPool
+
+    src = tmp_path / "v.c"
+    src.write_text("#include <unistd.h>\n#include <string.h>\n"
+                   "static void vuln(char*in){char b[32]; strcpy(b,in);}\n"
+                   "int main(){char line[4096]; int n=read(0,line,sizeof line-1);"
+                   "line[n>0?n-1:0]=0; vuln(line); return 0;}\n")
+    exe = tmp_path / "v"
+    subprocess.run([gcc, "-O0", "-fno-stack-protector", str(src), "-o", str(exe)], check=True)
+
+    case = store.cases.create("cvepoc")
+    target = ingest(store, case.id, exe)
+    FindingDAO(store.conn).upsert(target.id, case.id, {
+        "cwe": "CWE-787", "title": "Vulnerable component: libxml2 2.9.4 — CVE-2017-0663",
+        "severity": "high", "state": "corroborated", "detector": "cve_fingerprint",
+        "dedup_key": "CVE-2017-0663:libxml2:2.9.4", "confidence": 0.85,
+        "evidence": [{"channel": "cve", "detail": "x"}]})
+
+    register()
+    pool = WorkerPool(store.db_path, store.content,
+                      JobConfig(workers=2, lease_seconds=60, poll_interval=0.02,
+                                heartbeat_interval=5.0))
+    pool.start()
+    try:
+        q = JobQueue(store.conn)
+        run = enqueue_cve_poc(q, target)
+        assert pool.wait_idle(60) and q.runs.get(run.id).status == "done"
+    finally:
+        pool.stop(grace=3.0)
+
+    poc_findings = [f for f in FindingDAO(store.conn).list_by_target(target.id)
+                    if f.detector == "cve_poc" and f.state == "confirmed"]
+    assert poc_findings, "non-bespoke CVE match was not weaponized by the CWE-class path"
+    assert PocDAO(store.conn).list_by_target(target.id)   # a verified PoC row was recorded

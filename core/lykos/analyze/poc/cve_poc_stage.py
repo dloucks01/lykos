@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 
 from ...db.dao import DynResultDAO, FindingDAO, PocDAO, TargetDAO
 from ...jobs.registry import register_stage
@@ -77,16 +78,31 @@ def _detonate(exe: str, trig, arch) -> "sandbox.RunResult | None":
     return None
 
 
+def _lib_of(finding) -> str:
+    dk = finding.dedup_key or ""
+    return dk.split(":")[1].lower() if dk.count(":") >= 2 else ""
+
+
+# Bound the detonation phase: each run is up to ~10s, the stage timeout is 180s, so cap both the
+# number of payloads and the wall-clock we spend firing them.
+DETONATION_CAP = 60
+WALLCLOCK_BUDGET = 150.0
+
+
 def cve_poc_stage(ctx) -> dict:
     target = TargetDAO(ctx.conn).get(ctx.target_id) if ctx.target_id else None
     if target is None:
         raise ValueError("cve_poc requires a target_id")
     fd = FindingDAO(ctx.conn)
-    candidates = [(cve, f) for cve, f in _matched_cves(fd, target)
-                  if cve in cve_triggers.available()]
-    if not candidates:
+    matched = _matched_cves(fd, target)
+    # The weaponization plan covers bespoke, library-level AND generic CWE-class triggers -- so a
+    # matched CVE with no bespoke trigger is still weaponized by its library and its CWE class.
+    plan = cve_triggers.weaponization_plan(
+        (cve, _lib_of(f), f.cwe) for cve, f in matched)
+    if not plan:
         ctx.emit("cve_poc.done", payload={"applicable": False,
-                 "note": "no matched CVE on this target has an authored trigger"})
+                 "note": ("no matched CVE on this target is weaponizable (no bespoke trigger, "
+                          "no known-vulnerable library format attack, no CWE-class probe)")})
         return {}
 
     exe = ctx.scratch() / "cve_target.bin"
@@ -112,63 +128,26 @@ def cve_poc_stage(ctx) -> dict:
             extra=f"({label} trigger reproduced a fault -- {trig.note})",
             state="confirmed", confidence=confidence))
 
-    # 1) hand-authored, CVE-specific triggers (highest fidelity).
-    specific = [cve for cve, _ in candidates]
-    for cve in specific:
-        trig = cve_triggers.for_cve(cve)
-        if trig is None:
-            continue
-        ctx.progress(msg=f"detonating {cve} trigger")
-        res = _detonate(str(exe), trig, target.arch)
-        if res is not None:
-            _record(cve, trig, res, 0.95)
-            reproduced.append(cve)
-
-    DETONATION_CAP = 60
-    budget = DETONATION_CAP
-
-    # 2) library-level format triggers (e.g. zlib decompression bomb, XML billion-laughs): apply
-    #    once per distinct matched library, stopping at the first fault.
-    seen_lib = set()
-    for cve, finding in candidates:
-        if budget <= 0:
+    deadline = time.monotonic() + WALLCLOCK_BUDGET
+    fired = 0
+    faulted_groups = set()          # a group ("lib:zlib"/"cwe:CWE-787") records one fault, then skips
+    for item in plan:
+        if fired >= DETONATION_CAP or time.monotonic() >= deadline:
             break
-        lib = (finding.dedup_key or "").split(":")[1] if (finding.dedup_key or "").count(":") >= 2 else ""
-        if not lib or lib in seen_lib:
+        if item.group and item.group in faulted_groups:
             continue
-        seen_lib.add(lib)
-        for trig in cve_triggers.library_triggers(lib):
-            if budget <= 0:
-                break
-            budget -= 1
-            res = _detonate(str(exe), trig, target.arch)
-            if res is not None:
-                _record(f"{cve} ({lib} {trig.cwe})", trig, res, 0.85)
-                reproduced.append(f"{cve}:{lib}")
-                break
+        ctx.progress(msg=f"detonating {item.label}")
+        fired += 1
+        res = _detonate(str(exe), item.trigger, target.arch)
+        if res is not None:
+            _record(item.label, item.trigger, res, item.confidence)
+            reproduced.append(item.label)
+            if item.group:
+                faulted_groups.add(item.group)
 
-    # 3) generic CWE-class weaponization for any matched CVE without a bespoke trigger: try the
-    #    class payloads once per distinct CWE (bounded), stopping at the first fault per class.
-    seen_cwe = set()
-    for cve, finding in candidates:
-        if cve_triggers.for_cve(cve) is not None or budget <= 0:
-            continue
-        cwe = finding.cwe
-        if not cwe or cwe in seen_cwe:
-            continue
-        seen_cwe.add(cwe)
-        for trig in cve_triggers.class_triggers(cwe):
-            if budget <= 0:
-                break
-            budget -= 1
-            res = _detonate(str(exe), trig, target.arch)
-            if res is not None:
-                _record(f"{cve} ({cwe} class)", trig, res, 0.8)
-                reproduced.append(f"{cve}:class")
-                break
-
-    ctx.emit("cve_poc.done", payload={"applicable": True, "tried": specific,
-             "reproduced": reproduced})
+    bespoke_tried = [cve for cve, _f in matched if cve_triggers.for_cve(cve) is not None]
+    ctx.emit("cve_poc.done", payload={"applicable": True, "bespoke_tried": bespoke_tried,
+             "plan_size": len(plan), "fired": fired, "reproduced": reproduced})
     ctx.progress(pct=100, msg=(f"reproduced {', '.join(reproduced)}" if reproduced
                                else "no CVE trigger reproduced a fault on this target"))
     return {}
