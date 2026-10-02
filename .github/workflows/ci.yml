@@ -1,0 +1,70 @@
+name: ci
+
+# Unit tests + the detection-quality release gate, on every push and PR. The gate uses the
+# no-JVM RE backend the product ships with (rizin + pypcode) rather than Ghidra headless: Ghidra
+# takes ~1 min/case (≈48 min for the two corpus passes) which is far too slow for a push gate,
+# while the native backend runs the whole gate in well under two minutes and is what offline
+# users actually run. Validated locally (2026-10): native holds 0 corroborated false positives
+# with full recall, identical to Ghidra on this corpus.
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: System dependencies
+        run: |
+          sudo apt-get update
+          # gcc + cross toolchains + qemu-user drive the cross-arch and 32-bit ARM tests; rizin +
+          # pypcode are the no-JVM RE backend the detect/eval tests exercise. --no-install-recommends
+          # keeps the image lean; anything a test needs and does not find, it SKIPs (never fails).
+          sudo apt-get install -y --no-install-recommends \
+            gcc binutils gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf \
+            qemu-user qemu-user-static rizin
+          python -m pip install --upgrade pip
+          pip install pypcode
+      - name: Unit tests
+        run: PYTHONPATH=core python -m pytest tests/ -q
+
+  eval-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: RE backend + compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc binutils rizin
+          python -m pip install --upgrade pip
+          pip install pypcode
+      # Diagnostic only; the real enforcement is --require-backend on the gate steps, which FAILs
+      # (not skips) when the native RE backend is absent so a backend-less runner cannot go green.
+      - name: Report RE backend availability
+        run: PYTHONPATH=core LYKOS_DECOMPILER=native python -m lykos doctor
+      # Candidate stage = the raw rule/sink channel: every bad case must at least be flagged
+      # (recall 1.0); the FP ceiling is loose on purpose because this channel is noisy and the
+      # corroborated channel below is what filters it.
+      - name: eval-gate — candidate (recall ratchet)
+        run: |
+          PYTHONPATH=core LYKOS_DECOMPILER=native python -m lykos eval --stage static \
+            --min-state candidate --min-recall 1.0 --max-fp-rate 0.65 \
+            --require-backend --min-negative 1
+      # Corroborated stage = the taint-discriminated channel: the precision ratchet. 0 false
+      # positives and full recall (CWE-798/321/259 are corroboration-exempt — they promote via
+      # synthesize_secret, not corroboration). A reintroduced FP or a demoted real bug fails here.
+      - name: eval-gate — corroborated (0 FP + full recall ratchet)
+        run: |
+          PYTHONPATH=core LYKOS_DECOMPILER=native python -m lykos eval --stage static \
+            --min-state corroborated --min-recall 1.0 --max-fp-rate 0.0 \
+            --require-backend --min-negative 1

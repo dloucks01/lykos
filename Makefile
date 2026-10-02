@@ -129,7 +129,10 @@ STATIC_FP_BUDGET ?= 0.60
 # legitimately stops being corroborable, that is a deliberate decision to record here with the
 # reason, not something to absorb into unused headroom.
 CORROB_MIN_RECALL ?= 1.0
-CORROB_FP_BUDGET  ?= 0.25
+# 0.0: the corroborated (taint-discriminated) channel carries ZERO false positives after the
+# precision work of 2026-10 (frame-pointer-numbered buffers, pointer-dereferenced source/length
+# operands, heap destinations). Any corroborated FP is a regression, not slack to absorb.
+CORROB_FP_BUDGET  ?= 0.0
 
 # Release-gate honesty. The two static halves need Ghidra; without it they SKIP, and a SKIP is
 # exit 0, so `make release` used to go green while static detection quality was never measured.

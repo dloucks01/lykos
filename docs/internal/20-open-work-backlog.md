@@ -950,12 +950,15 @@ candidate recall 1.00 / fp_rate 0.571; corroborated recall 0.833 / fp_rate 0.214
        (`_strlen_reg_guard` + register-seeded `branch_predicate`).
   The `('loadp', ...)` chain also closes part of the "constant-offset frame slots only" gap for
   copy SOURCES (not yet for arbitrary length operands / heap / aliasing).
-- **[PLANNED] CWE-798 cannot be corroborated at all** — caps corroborated recall at 0.833 (5/6).
-  `hardcoded_secrets` is a string detector with no call site, so neither the reachability nor the
-  data-flow channel applies. Secrets are promoted by `synthesize_secret` (straight to poc-backed)
-  instead. Either give the string channel its own second-channel notion or exclude it from
-  corroborated-stage scoring; today the benchmark reads as a recall gap that is really a
-  structural mismatch.
+- **[DONE] CWE-798 corroborated-scoring mismatch.** `hardcoded_secrets` is a string detector with
+  no call site, so neither corroboration channel (reachability / data-flow) can apply; it is
+  promoted by `synthesize_secret` straight to poc-backed. The corroborated-stage benchmark read
+  that as a recall gap (capped at ~0.875) that was really a structural mismatch. Fixed by exempting
+  the no-call-site classes (CWE-798/321/259) from the corroborated-stage requirement in the eval
+  harness (`_CORROBORATION_EXEMPT`) — they count as detected at the candidate state they do reach.
+  Corroborated recall is now a true 1.0, so the release gate can ratchet `--min-recall 1.0`
+  honestly. Done as a prerequisite of P0.1 (a meaningful recall ratchet). Giving the string channel
+  its OWN second-channel corroborator (the byte-offset re-extraction) remains optional polish.
 - **[PLANNED] Memory model beyond constant-offset frame slots.** `_apply` now tracks
   `[BASE + const]` spills (which is what made argv usable at -O0), but heap buffers, computed
   indices and aliasing are still invisible, and a `STORE` through a non-slot address drops taint.

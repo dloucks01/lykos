@@ -34,6 +34,14 @@ _LAVA_MARKER = re.compile(rb"Successfully triggered bug (\d+)")
 # finding-state lifecycle order, for reporting the strongest state reached per class
 _STATE_RANK = {"candidate": 0, "corroborated": 1, "confirmed": 2, "poc-backed": 3}
 
+# Classes whose detector has NO call site, so neither corroboration channel (reachability /
+# data-flow) can apply -- a hard-coded credential/key/password is a string in the binary, not a
+# sink reached by input. They are promoted straight to poc-backed by `synthesize_secret` (the
+# secret itself is the reproducer), never through `corroborated`. Counting them as a
+# corroborated-stage miss reads as a recall gap that is really a structural mismatch (doc 20 §G),
+# so at the corroborated+ gate they count as detected at the candidate state they do reach.
+_CORROBORATION_EXEMPT = {"CWE-798", "CWE-321", "CWE-259"}
+
 
 def compile_case(case, outdir: Path, gcc: str = "gcc"):
     """Compile one case to an ELF; return the path, or None if compilation failed.
@@ -129,7 +137,8 @@ def run_corpus(cases=None, *, workdir=None, gcc="gcc", workers=2, stage_timeout=
             timed_out |= not pool.wait_idle(stage_timeout)
             findings = FindingDAO(store.conn).list_by_target(target.id)
             found = {f.cwe for f in findings
-                     if _STATE_RANK.get(f.state, 0) >= rank_min}
+                     if _STATE_RANK.get(f.state, 0) >= rank_min
+                     or f.cwe in _CORROBORATION_EXEMPT}
             # A False return means a stage never went idle within stage_timeout, so `found` is
             # read from an UNFINISHED pipeline. Flag the outcome as indeterminate rather than let
             # a slow-but-correct run score as a clean miss.
