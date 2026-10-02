@@ -406,3 +406,21 @@ def test_gate_dynamic_skips_without_a_compiler():
     assert ok and verdict == "SKIP"                               # mirrors the static Ghidra SKIP
     assert gate(m, {"gcc": False}, stage="dynamic", require_backend=True)[1] == "FAIL"
     assert gate(m, {"gcc": True}, stage="dynamic")[1] == "FAIL"   # compiler present -> real miss
+
+
+def test_benchmark_corpus_is_a_superset_with_more_classes():
+    """benchmark() is the tripwire corpus PLUS the vendored breadth extension: strictly more cases,
+    and it adds CWE classes the 24-case gate does not exercise (377/330/190). Every extra case
+    carries a good/bad label the harness can score."""
+    base = corpus.bundled()
+    bench = corpus.benchmark()
+    assert len(bench) > len(base)
+    base_names = {c.name for c in base}
+    assert base_names.issubset({c.name for c in bench})          # superset
+    base_cwes = {c.cwe for c in base}
+    bench_cwes = {c.cwe for c in bench}
+    assert {"CWE-377", "CWE-330", "CWE-190"}.issubset(bench_cwes - base_cwes)
+    # each extra class has both a bad (detectable) and a discrimination-good (the safe API)
+    for cwe in ("CWE-377", "CWE-330", "CWE-190"):
+        verdicts = {c.verdict for c in bench if c.cwe == cwe}
+        assert verdicts == {"bad", "good"}, cwe

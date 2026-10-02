@@ -44,11 +44,20 @@ and score detection per arch. *Acceptance:* `eval-gate` reports a precision/reca
 drop on any arch fails. *Depends on:* nothing. *Risk:* static cross binaries bloat Ghidra — bound
 the subset.
 
-**0.3 Real scored benchmark, separate from the tripwire.** (L) The 24-case corpus is a regression
-tripwire, not a benchmark. Stand up a scored harness over **Juliet** (subset by CWE), **LAVA-M**,
-and a handful of **real CVEs** (the CVE DB already lists them). Report precision/recall/F1 as a
-tracked number, not a gate. *Acceptance:* `lykos eval --benchmark` prints a stable score; wired into
-doc 20's dashboard. *Risk:* Juliet/LAVA size + licensing → vendor a small, fixed subset.
+**0.3 Real scored benchmark, separate from the tripwire.** (L) ✅ **DONE.** `lykos eval --benchmark`
+scores detection as a TRACKED number, never a gate (always exits 0). It runs a vendored, offline,
+fixed breadth corpus (`corpus.benchmark()` = the 24-case tripwire **plus** `_BENCH_EXTRA` — good/bad
+pairs for CWE-377/330/190, classes the gate does not exercise; 10 classes total) at BOTH channels —
+candidate (detection breadth, incl. the rule/weak-primitive detectors) and corroborated (the
+taint-discriminated precision lever) — plus the **LAVA-M** recall mini, and records each run to the
+dashboard history (`lykos dashboard`). Measured on the native backend: candidate P=0.52 R=1.00
+F1=0.69, corroborated P=1.00 R=0.73 F1=0.84, LAVA 3/8 — the candidate→corroborated recall gap is the
+three rule-channel extras, exactly the breadth-vs-precision distinction a benchmark should show.
+`--juliet`/`--lava` point it at a real NIST drop for a larger score (the loaders already exist). CI
+runs it as a non-gating visibility step so the numbers print on every push. *Acceptance:* `lykos
+eval --benchmark` prints a stable score; wired into doc 20's dashboard. ✅ *Deferred:* bundling real
+CVE **binaries** (size/provenance) — the external-drop path and the realgate's ncompress CVE cover
+real targets today; a vendored CVE mini is a later add.
 
 **0.4 32-bit ARM tests runnable in CI.** (S) ✅ **DONE.** `tests/test_arm.py` skipped unless the
 musl-built `vuln_arm` corpus binary was present (a dev-box artefact). It now builds the binary on

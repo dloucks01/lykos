@@ -294,9 +294,68 @@ int main(void){ char small[16]; int n=read(0,small,sizeof small-1);
 ]
 
 
+# ---------------------------------------------- vendored benchmark extension (P0.3)
+# The 24-case corpus above is a precision TRIPWIRE for the release gate: four CWE families, tuned
+# so the corroborated channel holds 0 FP / full recall. A BENCHMARK answers a different question --
+# how much DETECTION BREADTH the platform has -- so this fixed, offline, reproducible set adds
+# good/bad pairs for CWE classes the binary detectors handle but the tripwire does not exercise.
+# Each pair was verified on the native backend: the `bad` fires its class at the candidate channel,
+# the discrimination-`good` (which uses the SAFE API) does not. These are rule-channel detectors
+# (dangerous-API / weak-primitive), so they score at `candidate`, not `corroborated` -- which is
+# exactly what `eval --benchmark` reports separately from the corroborated precision lever.
+_BENCH_EXTRA: list[Case] = [
+    # ---- CWE-377: insecure temporary file (tmpnam/mktemp vs mkstemp) ----
+    Case("tmpnam_insecure", "CWE-377", "bad", r"""
+#include <stdio.h>
+int main(void){ char*p=tmpnam(0); FILE*f=fopen(p,"w"); if(f){ fputs("x",f); fclose(f);} return 0; }
+""", note="tmpnam() then fopen -- predictable name, TOCTOU race"),
+    Case("tmpnam_mkstemp", "CWE-377", "good", r"""
+#include <stdlib.h>
+#include <unistd.h>
+int main(void){ char t[]="/tmp/eXXXXXX"; int fd=mkstemp(t); if(fd>=0){ write(fd,"x",1); close(fd);} return 0; }
+""", note="mkstemp() creates the file atomically with a random name"),
+
+    # ---- CWE-330: use of insufficiently random values (rand vs getrandom) ----
+    Case("rand_key", "CWE-330", "bad", r"""
+#include <stdlib.h>
+#include <time.h>
+#include <unistd.h>
+int main(void){ srand(time(0)); unsigned k=rand(); write(1,&k,sizeof k); return 0; }
+""", note="srand(time)+rand() to derive a secret -- predictable"),
+    Case("rand_getrandom", "CWE-330", "good", r"""
+#include <sys/random.h>
+#include <unistd.h>
+int main(void){ unsigned k; if(getrandom(&k,sizeof k,0)==(long)sizeof k) write(1,&k,sizeof k); return 0; }
+""", note="getrandom() -- a CSPRNG, not the libc PRNG"),
+
+    # ---- CWE-190: integer overflow feeding an allocation (unchecked vs checked multiply) ----
+    Case("intovf_alloc", "CWE-190", "bad", r"""
+#include <stdlib.h>
+#include <string.h>
+int main(int c, char**v){ if(c>1){ int n=atoi(v[1]); char*b=malloc(n*4); if(b){ memset(b,0,n*4); free(b);} } return 0; }
+""", note="n*4 can wrap to a tiny allocation, then a large memset"),
+    Case("intovf_checked", "CWE-190", "good", r"""
+#include <stdlib.h>
+#include <string.h>
+#include <limits.h>
+int main(int c, char**v){ if(c>1){ long n=atol(v[1]);
+  if(n>0 && n < (long)(INT_MAX/4)){ char*b=malloc((size_t)n*4); if(b){ memset(b,0,(size_t)n*4); free(b);} } } return 0; }
+""", note="multiply guarded against wrap before the allocation"),
+]
+
+
 def bundled() -> list[Case]:
     """The built-in labeled micro-corpus for STATIC (candidate-stage) detection."""
     return list(_CASES)
+
+
+def benchmark() -> list[Case]:
+    """The static detection BENCHMARK corpus: the tripwire micro-corpus plus the vendored breadth
+    extension (`_BENCH_EXTRA`). Broader than `bundled()` -- 10 CWE classes vs the gate's 4 -- and
+    meant to be SCORED (precision/recall/F1 tracked over time), not gated. Fully offline and fixed,
+    so the number is reproducible; point `eval --juliet`/`--lava` at a real NIST drop for a larger
+    one. See `eval --benchmark`."""
+    return list(_CASES) + list(_BENCH_EXTRA)
 
 
 def bundled_dynamic() -> list[Case]:

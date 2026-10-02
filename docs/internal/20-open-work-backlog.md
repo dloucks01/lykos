@@ -1026,16 +1026,23 @@ candidate recall 1.00 / fp_rate 0.571; corroborated recall 0.833 / fp_rate 0.214
 
 ## H. Benchmark & CI enforcement
 
-- **[PLANNED] Ghidra in CI so `eval-gate` is enforced on push.** `.github/workflows/ci.yml` runs
-  lint / typecheck / tests / packaging on 3.11 + 3.13 and installs gcc, gdb, qemu-user-static and
-  bubblewrap — but not Ghidra (~1 GB), so all three detection gates run only locally. Needs a
-  cached install step.
-- **[PLANNED] Real benchmark corpora.** The bundled 20-case corpus is a regression tripwire, not a
-  measurement. The `--juliet` and `--lava` loaders exist and are tested; wire a pinned drop in so
-  recall/precision are quoted against something external.
-- **[PLANNED] 32-bit ARM tests skip everywhere but a dev box** — `tests/test_arm.py` needs
-  `examples/re-corpus/bin/vuln_arm`, which is gitignored and built out of band, so the freshest
-  arch work has no CI coverage at all.
+- **[DONE] `eval-gate` enforced on push** (doc 30 P0.1). `.github/workflows/ci.yml` runs the unit
+  tests plus the detection gate on every push/PR, using the **native** RE backend (rizin + pypcode)
+  rather than Ghidra: Ghidra is ~1 min/case (far too slow for a push gate) while native runs the
+  whole gate in well under two minutes and is what offline users actually run. Candidate recall
+  ratchet + corroborated 0-FP/full-recall ratchet + per-arch ratchet, all `--require-backend` so a
+  backend-less runner fails rather than greens. (Fixing this surfaced that `run_corpus` only ran
+  disassemble under Ghidra, so a native-only runner read recall 0 — now gated on either backend.)
+- **[DONE] Real benchmark, tracked not gated** (doc 30 P0.3). `lykos eval --benchmark` scores
+  precision/recall/F1 over a vendored breadth corpus (`corpus.benchmark()` — the tripwire + CWE-377/
+  330/190 pairs, 10 classes) at both the candidate and corroborated channels, plus LAVA-M recall,
+  and records each run to the dashboard history (`lykos dashboard`). Always exits 0 — a number to
+  track, not a gate. `--juliet`/`--lava` point it at a pinned external NIST drop for a larger score.
+  CI prints it on every push as a non-gating step. Deferred: a vendored real-CVE binary mini.
+- **[DONE] 32-bit ARM tests run in CI** (doc 30 P0.4). `tests/test_arm.py` builds `vuln_arm` on
+  demand from the corpus source with the distro `arm-linux-gnueabihf-gcc` when the gitignored musl
+  build is absent, so the four ARM tests execute in CI instead of skipping off a dev box. (Surfaced
+  and fixed the Thumb cross-arch-monitor bug — see section C.)
 
 ## I. Engine correctness (found in the September 2026 audit, unfixed)
 

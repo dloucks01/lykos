@@ -80,3 +80,9 @@ jobs:
         run: |
           PYTHONPATH=core LYKOS_DECOMPILER=native python -m lykos eval --stage static \
             --arch all --min-state corroborated --require-backend --min-negative 1
+      # Detection BENCHMARK: precision/recall/F1 over the vendored breadth corpus (10 CWE classes)
+      # + LAVA-M recall, at both the candidate and corroborated channels. This is a TRACKED number,
+      # NOT a gate -- it always exits 0; the point is to print the score on every push so a breadth
+      # change is visible even when the 0-FP tripwire above is unmoved.
+      - name: benchmark — detection score (tracked, non-gating)
+        run: PYTHONPATH=core LYKOS_DECOMPILER=native python -m lykos eval --benchmark

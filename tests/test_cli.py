@@ -227,6 +227,40 @@ def test_eval_exit_code_follows_the_gate_not_the_run(capsys, monkeypatch):
     assert "GATE: FAIL" in capsys.readouterr().err
 
 
+def test_eval_benchmark_tracks_prf1_and_never_gates(tmp_path, capsys, monkeypatch):
+    """--benchmark scores both channels + LAVA recall, prints precision/recall/F1, records to
+    history, and ALWAYS exits 0 -- even when recall is poor (it is a tracked number, not a gate)."""
+    from lykos.eval import harness
+
+    class Rep:
+        def __init__(self, recall):
+            self.meta = {"native": "/usr/bin/rizin", "ghidra": None, "warnings": [],
+                         "max_execs": 1, "max_seconds": 1}
+            self.metrics = {"n_cases": 30, "n_cwe_classes": 10, "per_cwe": {},
+                            "overall": {"precision": 0.5, "recall": recall, "f1": 0.5,
+                                        "fp_rate": 0.5, "tp": 7, "fn": 3}}
+
+        def table(self):
+            return "TABLE"
+
+        def to_dict(self):
+            return {}
+
+    seen = {}
+    # a deliberately AWFUL recall (0.1) so a gate WOULD fail -- the benchmark must still exit 0
+    monkeypatch.setattr(harness, "run",
+                        lambda cases, **kw: (seen.setdefault("states", []).append(kw.get("min_state")), Rep(0.1))[1])
+    monkeypatch.setattr(harness, "run_lava_corpus", lambda *a, **k: Rep(0.4))
+    hist = tmp_path / "h.jsonl"
+    rc = cli.main(["eval", "--benchmark", "--min-recall", "1.0", "--history", str(hist)])
+    out = capsys.readouterr().out
+    assert rc == 0                                        # never gates, whatever the numbers
+    assert "BENCHMARK" in out and "F1" in out
+    assert "static/candidate" in out and "static/corroborated" in out and "lava/recall" in out
+    assert seen["states"] == ["candidate", "corroborated"]  # both channels scored
+    assert hist.exists()                                  # recorded for the dashboard
+
+
 # ---- doctor ------------------------------------------------------------------------------
 
 def test_doctor_reports_the_host_and_exits_zero(capsys):

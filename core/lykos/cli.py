@@ -80,6 +80,12 @@ def build_parser() -> argparse.ArgumentParser:
                     default="candidate",
                     help="finding state a static case must reach to count as detected "
                          "(candidate = rule/sink channel; corroborated = taint-discriminated)")
+    ev.add_argument("--benchmark", action="store_true",
+                    help="score the detection BENCHMARK and print precision/recall/F1 as a TRACKED "
+                         "number, not a gate (always exits 0). Runs the vendored breadth corpus "
+                         "(10 CWE classes) at both candidate and corroborated, plus the LAVA-M "
+                         "recall mini, and records each to the dashboard history. Use --juliet/"
+                         "--lava to benchmark a real NIST drop instead of the bundled set.")
     ev.add_argument("--out", default=None, help="write the full JSON report to this path")
     ev.add_argument("--arch", default=None,
                     help="static only: cross-compile the corpus and score detection PER arch "
@@ -408,6 +414,65 @@ def _cmd_dashboard(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_benchmark(args: argparse.Namespace, cases) -> int:
+    """`eval --benchmark`: score detection as a TRACKED number, never a gate (always exits 0).
+
+    Scores the static corpus at BOTH channels -- candidate (detection breadth, including the
+    rule/weak-primitive detectors) and corroborated (the taint-discriminated precision lever) --
+    then the LAVA-M recall mini, and records each to the dashboard history. `cases` is an external
+    drop (--juliet/--lava/--corpus) when given, else the vendored breadth corpus. Unlike the gate,
+    a drop in a number here is information to track over time, not a failure.
+    """
+    import json
+
+    from .eval import corpus as corpusmod
+    from .eval import harness
+    from .eval import history as histmod
+
+    static_cases = cases if cases is not None else corpusmod.benchmark()
+    hist_path = args.history or histmod.DEFAULT_PATH
+    print("BENCHMARK (tracked, non-gating)\n")
+    rows = []
+    for state in ("candidate", "corroborated"):
+        rep = harness.run(static_cases, stage="static", min_state=state, workers=args.workers,
+                          progress=lambda m: print(m, file=sys.stderr, flush=True))
+        o = rep.metrics.get("overall", {})
+        n, g = rep.metrics.get("n_cases", 0), rep.metrics.get("n_cwe_classes", 0)
+        backend = ("ghidra" if rep.meta.get("ghidra")
+                   else "native" if rep.meta.get("native") else "NONE")
+        rows.append((f"static/{state}", o.get("precision"), o.get("recall"), o.get("f1"),
+                     f"{n} cases, {g} classes, backend={backend}"))
+        histmod.record(hist_path, rep, stage="static", min_state=state,
+                       label=args.label or "benchmark")
+        if args.out:
+            Path(args.out).write_text(json.dumps(rep.to_dict(), indent=2))
+
+    # LAVA-M injected-bug recall (the bundled mini, or an external drop via --lava)
+    lava_line = None
+    try:
+        progs = corpusmod.load_lava(args.lava) if args.lava else corpusmod.bundled_lava()
+        lrep = harness.run_lava_corpus(progs, progress=lambda m: print(m, file=sys.stderr, flush=True))
+        lo = lrep.metrics.get("overall", {})
+        found, total = int(lo.get("tp", 0)), int(lo.get("tp", 0)) + int(lo.get("fn", 0))
+        lava_line = (found, total, lo.get("recall"))
+        histmod.record(hist_path, lrep, stage="lava", min_state=None,
+                       label=args.label or "benchmark")
+    except Exception as e:                                # a benchmark never fails the caller
+        print(f"warning: lava benchmark skipped: {e}", file=sys.stderr)
+
+    def _f(x):
+        return f"{x:.3f}" if isinstance(x, (int, float)) else "  -  "
+
+    print(f"  {'channel':22} {'P':>6} {'R':>6} {'F1':>6}   detail")
+    for name, p, r, f1, detail in rows:
+        print(f"  {name:22} {_f(p):>6} {_f(r):>6} {_f(f1):>6}   {detail}")
+    if lava_line:
+        found, total, rec = lava_line
+        print(f"  {'lava/recall':22} {'':>6} {_f(rec):>6} {'':>6}   {found}/{total} injected bugs found")
+    print(f"\nrecorded to {hist_path} (view with `lykos dashboard`)", file=sys.stderr)
+    return 0                                              # tracked, never a gate
+
+
 def _cmd_eval(args: argparse.Namespace) -> int:
     import json
 
@@ -424,6 +489,9 @@ def _cmd_eval(args: argparse.Namespace) -> int:
         cases = corpusmod.load_dir(args.corpus)
     else:
         cases = None
+
+    if args.benchmark:
+        return _run_benchmark(args, cases)
 
     # Per-architecture static scoring: cross-compile the corpus for each requested arch and
     # ratchet detection against eval/arch_baseline.json -- a new false positive or false negative
