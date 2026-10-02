@@ -162,3 +162,22 @@ def test_wedged_stage_does_not_starve_the_pool(store, case):
         assert p.metrics().get("wedged_reclaimed", 0) >= 1
     finally:
         p.stop(grace=1.0)
+
+
+def test_unknown_param_fails_loud_when_a_stage_declares_a_schema(store, case, pool):
+    """P5.4: a stage that declares a param_schema fails a run carrying an undeclared key, loud and
+    in the run record -- so a typo'd param is no longer a silent no-op. A stage with no schema is
+    unaffected (opt-in)."""
+    register_stage("schemad", _fast, param_schema={"mode", "argv"})
+    register_stage("open", _fast)                      # no schema -> not validated
+    q = JobQueue(store.conn)
+    bad = q.enqueue(case.id, "schemad", input_hashes=["1"], params={"moed": "x"})  # typo
+    assert pool.wait_idle(5)
+    r = q.runs.get(bad.id)
+    assert r.status == "error" and "unknown param" in (r.error or "")
+    ok = q.enqueue(case.id, "schemad", input_hashes=["2"], params={"mode": "stdin"})
+    assert pool.wait_idle(5)
+    assert q.runs.get(ok.id).status == "done"
+    free = q.enqueue(case.id, "open", input_hashes=["3"], params={"anything": 1})
+    assert pool.wait_idle(5)
+    assert q.runs.get(free.id).status == "done"        # no schema -> no restriction

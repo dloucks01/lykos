@@ -274,7 +274,10 @@ def dynamic_stage(ctx) -> dict:
 
 def register() -> None:
     register_stage(DYNAMIC_STAGE, dynamic_stage, resource_class="cpu",
-                   tool=TOOL, tool_version=TOOL_VERSION, timeout=300)
+                   tool=TOOL, tool_version=TOOL_VERSION, timeout=300,
+                   # P5.4: the keys dynamic_run understands; a typo now fails the run loud instead
+                   # of silently running with the default (input_b64 vs input, argv vs args, ...).
+                   param_schema={"input_mode", "argv", "input_b64", "env"})
 
 
 def enqueue_dynamic(queue, target, *, params=None, force: bool = True):

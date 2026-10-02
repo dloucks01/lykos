@@ -32,6 +32,10 @@ class StageDef:
     tool_version: Optional[str] = None
     timeout: Optional[float] = None      # per-stage wall-clock override
     on_cache_hit: Optional[CacheHitFn] = None   # re-project per-target DB rows on a cache hit
+    # The param keys this stage understands (doc 30 P5.4). When set, a run carrying a key NOT in
+    # this set (or in default_params) fails LOUD at dispatch -- a typo'd param no longer silently
+    # does nothing. None = opt-out (no validation), so an undeclared stage is not newly restricted.
+    param_schema: Optional[frozenset] = None
 
 
 _STAGES: dict[str, StageDef] = {}
@@ -41,12 +45,35 @@ def register_stage(name: str, fn: StageFn, *, resource_class: str = "quick",
                    default_params: Optional[dict] = None, tool: Optional[str] = None,
                    tool_version: Optional[str] = None,
                    timeout: Optional[float] = None,
-                   on_cache_hit: Optional[CacheHitFn] = None) -> StageDef:
+                   on_cache_hit: Optional[CacheHitFn] = None,
+                   param_schema: Optional[set] = None) -> StageDef:
     sd = StageDef(name=name, fn=fn, resource_class=resource_class,
                   default_params=default_params or {}, tool=tool,
-                  tool_version=tool_version, timeout=timeout, on_cache_hit=on_cache_hit)
+                  tool_version=tool_version, timeout=timeout, on_cache_hit=on_cache_hit,
+                  param_schema=frozenset(param_schema) if param_schema is not None else None)
     _STAGES[name] = sd
     return sd
+
+
+def validate_params(name: str, params: Optional[dict]) -> None:
+    """Raise ValueError if `params` carries a key the stage does not declare (doc 30 P5.4).
+
+    A stage opts in by passing `param_schema` to `register_stage`; `default_params` keys are always
+    allowed. A stage with no schema is not validated, so this is additive -- turning it on for a
+    stage is what makes a typo'd param a loud failure instead of a silent no-op. The common control
+    keys every stage's harness threads through are always permitted."""
+    sd = _STAGES.get(name)
+    if sd is None or sd.param_schema is None:
+        return
+    allowed = set(sd.param_schema) | set(sd.default_params or {}) | _COMMON_PARAMS
+    unknown = sorted(k for k in (params or {}) if k not in allowed)
+    if unknown:
+        raise ValueError(f"stage {name!r}: unknown param(s) {unknown}; allowed: {sorted(allowed)}")
+
+
+# Control keys the queue/harness may thread onto any run; never a stage-specific typo.
+_COMMON_PARAMS = frozenset({"force", "max_seconds", "max_execs", "exec_timeout", "timeout",
+                            "workers", "seed", "seeds"})
 
 
 def cached_output_json(store: "CaseStore", run_id: str) -> Any:

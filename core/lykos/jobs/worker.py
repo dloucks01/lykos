@@ -25,7 +25,7 @@ from ..db.connection import connect
 from .config import JobConfig
 from .context import JobContext, StageCancelled, StageTimeout
 from .queue import JobQueue
-from .registry import get_stage
+from .registry import get_stage, validate_params
 
 _log = logging.getLogger("lykos.jobs.worker")
 
@@ -220,6 +220,12 @@ class WorkerPool:
         try:
             sd = get_stage(run.stage)
         except KeyError as e:
+            q.fail(run_id, f"{e}", retryable=False, worker_id=wid)
+            self._bump("error")
+            return
+        try:
+            validate_params(run.stage, run.params)        # P5.4: a typo'd param fails loud here
+        except ValueError as e:
             q.fail(run_id, f"{e}", retryable=False, worker_id=wid)
             self._bump("error")
             return

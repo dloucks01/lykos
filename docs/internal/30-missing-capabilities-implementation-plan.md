@@ -288,9 +288,15 @@ a libwebp binary with CVE-2023-4863's version matches.
 - **5.3 PE `behavior_trace`/monitor.** (M) ✅ **DONE** (already in place). `trace_stage._win_behavior_trace`
   traces a Windows PE's own Win32 API calls under Wine `+relay` (exec/net/wx/inject/antidebug,
   attributed to the exe's mapped range) and declines cleanly when Wine is absent.
-- **5.4 Stage parameter consistency.** (M) `dynamic_run` and others accept inconsistent params and
-  fail silently. Add a per-stage param schema + validation that fails loud (surfaces in the run
-  record), and a test that every registered stage declares its params.
+- **5.4 Stage parameter consistency.** (M) ✅ **Mechanism DONE; schemas rolling out.** `register_stage`
+  gained an optional `param_schema`, and the worker calls `validate_params` at dispatch: a run
+  carrying a key the stage does not declare FAILS loud with that reason in the run record, so a
+  typo'd param (`inputmode` vs `input_mode`) is no longer a silent no-op. Opt-in per stage
+  (`default_params` keys + a small common-control set are always allowed; a stage with no schema is
+  unvalidated), so it is additive. `dynamic_run` — the named offender — now declares its schema;
+  `tests/test_worker.py` covers reject-unknown / accept-known / unschema'd-stage-unrestricted.
+  *Remaining:* declaring a schema on the other stages is incremental (each is a one-line addition at
+  its `register_stage`), tracked as follow-on rather than a 30-stage sweep in this pass.
 - **5.5 Runs list shows yield.** (S) ✅ **DONE.** The run serializer now carries `crashes` (the
   crashing executions the run recorded, via `DynResultDAO.count_crashed_by_run`), so a `DONE` row
   shows `0 crashes` vs `3 crashes` instead of reading like success regardless. `tests/test_api_routes.py`.
