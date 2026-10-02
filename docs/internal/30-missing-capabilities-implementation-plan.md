@@ -255,11 +255,20 @@ machine, vs (c) Renode. Only then commit to one. *Acceptance of the spike:* a de
 first task's code reached on the real FreeRTOS image. *Risk:* high — this is the "board model" the
 rehoster exists to avoid; time-box the spike and accept "documented out of scope" as a valid outcome.
 
-**4.2 Non-constant allocation sizes + allocator wrappers.** (M) `_heap_capacities` handles
-`malloc(const)` single-writer slots. Extend to (a) a size bounded by a dominating guard (reuse
-`value_guard_bound`), and (b) a project's allocator wrapper (`xmalloc`-style) resolved by its own
-`malloc(arg)` forwarding. *Acceptance:* a guarded-variable-size heap copy demotes; a wrapper'd alloc
-is recognized. *Risk:* keep the single-writer soundness guard.
+**4.2 Non-constant allocation sizes + allocator wrappers.** (M) ✅ **(b) DONE; (a) noted.**
+`_heap_capacities` handled only direct `malloc(const)` single-writer slots. `_allocator_wrappers`
+now resolves a project's own allocator WRAPPER (`xmalloc`/`my_alloc`-style) by its structure — the
+function's ONLY allocation call feeds a base allocator the function's own first parameter as the
+size (`_param0_spill_slot`, tracking the param through its prologue copy), and it RETURNS the
+allocator's result (reusing the P2.2 `_returned_value` at every value-returning exit; a no-return
+abort path is ignored). A `p = wrapper(n)` then sizes `p` exactly as `malloc(n)` would. The
+signature is deliberately strict so the heap-sizing channel never fabricates a size. *Acceptance
+(met):* a copy into a `my_alloc(64)` buffer is SAFE and a `my_alloc(16)` buffer overflowed by 64 is
+flagged (`tests/test_alloc_wrappers.py`); the corroborated eval-gate is unchanged (8/0/0).
+*(a) deferred with finding:* the sound demotion for a *variable* size is the EQUALITY case
+`p = malloc(n); copy(p, src, n)` (copy length == alloc size → exact fit → SAFE), which needs
+size-value ↔ copy-length linkage; a guard `n <= K` only yields an UPPER bound on the allocation, so
+it supports ASSERTING an overflow (copy > K), not proving SAFE. Tracked as a follow-on.
 
 **4.3 `libwebp` and other ABI-only-version libraries.** (S) Dropped from the CVE DB because it
 exposes only `WEBP_*_ABI_VERSION`. *Approach:* map the ABI/decoder version constant → release

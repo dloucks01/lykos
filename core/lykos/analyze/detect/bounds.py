@@ -865,11 +865,15 @@ def _heap_capacities(func_irs, call_edges, bases, bits, ak):
     out: dict = {}
     if not argregs or not retregs:
         return out
+    wrappers = _allocator_wrappers(func_irs, call_edges, bases, bits, ak)   # P4.2
     alloc_by_func: dict = {}
     for e in call_edges:
         n = normalize(e.dst_name)
         if n in _ALLOCATORS and e.site_addr and e.src_addr:
             alloc_by_func.setdefault(e.src_addr, []).append((e.site_addr, n))
+        elif e.dst_addr in wrappers and e.site_addr and e.src_addr:
+            # a call to a size-preserving wrapper sizes its slot exactly as malloc(arg0) would
+            alloc_by_func.setdefault(e.src_addr, []).append((e.site_addr, "malloc"))
     for faddr, sites in alloc_by_func.items():
         ir = (func_irs or {}).get(faddr) or {}
         blocks = ir.get("blocks", []) or []
@@ -893,6 +897,98 @@ def _heap_capacities(func_irs, call_edges, bases, bits, ak):
         if caps:
             out[faddr] = caps
     return out
+
+
+def _param0_spill_slot(blocks, param0_regs, bases, bits):
+    """The frame slot the function's FIRST parameter is spilled to in its prologue, or None. At
+    -O0 the entry does `mov [rbp-k], <arg0 reg>`, which lowers to a STORE of the arg0 register (or
+    of a unique copied straight from it). Scans the entry block and returns the first such spill."""
+    param0 = {("reg", r) for r in param0_regs}
+    for b in (blocks[:1] or []):                       # the entry block's prologue
+        slots: dict = {}
+        from_param0: set = set()                       # uniques/regs holding an unmodified param0
+        for ins in b.get("instructions", []) or []:
+            for pc in ins.get("pcode", []) or []:
+                try:
+                    mnem, _i, outk, toks = _parse(pc)
+                except Exception:
+                    continue
+                if mnem == "INT_ADD" and outk is not None and len(toks) >= 3:
+                    for rk, dtok in ((_key(toks[1]), toks[2]), (_key(toks[2]), toks[1])):
+                        if rk and rk[0] == "reg" and rk[1] in bases:
+                            d = _const_of(dtok)
+                            if d is not None:
+                                slots[outk] = (rk[1], _signed(d, bits))
+                    continue
+                if mnem == "COPY" and outk is not None and len(toks) >= 2 \
+                        and (_key(toks[1]) in param0 or _key(toks[1]) in from_param0):
+                    from_param0.add(outk)                # a pass-through copy of the parameter
+                    continue
+                if mnem == "STORE" and len(toks) >= 4:
+                    dst = slots.get(_key(toks[2]))
+                    if dst is not None and (_key(toks[3]) in param0 or _key(toks[3]) in from_param0):
+                        return dst
+    return None
+
+
+def _allocator_wrappers(func_irs, call_edges, bases, bits, ak):
+    """Function addresses that are size-preserving allocator WRAPPERS (doc 30 P4.2): the function's
+    ONLY allocation call feeds a base allocator the function's own first parameter as the size, and
+    the function RETURNS the allocator's result. A `p = wrapper(n)` then sizes `p` exactly as
+    `malloc(n)` would, so project-local `xmalloc`-style wrappers get the same heap-capacity
+    treatment as a direct malloc. The signature is deliberately strict -- the heap-sizing channel
+    must never fabricate a size, so anything short of "forwards its arg and returns the result" is
+    not trusted as a wrapper."""
+    from .catalog import normalize
+    abi = ARCH_ABI.get(ak) or {}
+    argregs = abi.get("args") or []
+    retregs = abi.get("ret") or set()
+    if not argregs or not retregs:
+        return set()
+    out_calls: dict = {}
+    for e in call_edges:
+        if e.src_addr and e.site_addr and e.dst_name:
+            out_calls.setdefault(e.src_addr, []).append((e.site_addr, normalize(e.dst_name)))
+    retkeys = {("reg", r) for r in retregs}
+    wrappers = set()
+    for faddr, calls in out_calls.items():
+        allocs = [(s, n) for s, n in calls if n in _ALLOCATORS]
+        if len(allocs) != 1:
+            continue                                   # exactly one allocation call
+        site, sink = allocs[0]
+        size_i = 1 if sink in ("realloc", "aligned_alloc") else 0
+        if size_i >= len(argregs):
+            continue
+        blocks = ((func_irs or {}).get(faddr) or {}).get("blocks", []) or []
+        if not blocks:
+            continue
+        ablk = next((b for b in blocks
+                     if any(i.get("addr") == site for i in b.get("instructions", []))), None)
+        if ablk is None:
+            continue
+        ins = ablk.get("instructions", []) or []
+        vals, _ = _slice_block(ins, site, bases, bits)
+        sz = next((vals.get(("reg", r)) for r in argregs[size_i] if vals.get(("reg", r))), None)
+        if not (sz and sz[0] == "load"):
+            continue                                   # size must come from a frame slot
+        store_counts = _slot_store_counts(blocks, bases, bits)
+        size_slot = (sz[1], sz[2])
+        # the size slot must be the first parameter's spill (so the forwarded size IS the arg)
+        if store_counts.get(size_slot, 0) != 1 or \
+                size_slot != _param0_spill_slot(blocks, argregs[0], bases, bits):
+            continue
+        # the function returns the allocator's result: its return reg is spilled to a single-writer
+        # slot and every exit returns that slot (reuse the P2.2 return-value reader).
+        rslot = _spill_slot(ins, site, retkeys, bases, bits)
+        if rslot is None or store_counts.get(rslot, 0) != 1:
+            continue
+        # every exit that returns a VALUE must return the allocator's slot; a no-return exit (an
+        # abort path) returns nothing and is ignored, not counted against the signature.
+        rets = [rv for b in blocks if not b.get("succ")
+                for rv in [_returned_value(b.get("instructions", []), retregs, bases, bits)] if rv]
+        if rets and all(rv == ("slot", rslot) for rv in rets):
+            wrappers.add(faddr)
+    return wrappers
 
 
 def _classify_heap(room, ln, sink, blocks, site_block, dom, bases, bits):
