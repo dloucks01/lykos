@@ -380,7 +380,7 @@ def _capacity_buffer(frame: dict, offset: int):
 
 
 def classify_site(instrs, site_addr, sink, frame, arch, bits=64,
-                  blocks=None, site_block=None, dom=None, base_offs=None):
+                  blocks=None, site_block=None, dom=None, base_offs=None, heap_caps=None):
     """Verdict for one copy call site.
 
     `blocks`/`site_block` enable the dominating-guard pass: without them only a compile-time
@@ -412,6 +412,11 @@ def classify_site(instrs, site_addr, sink, frame, arch, bits=64,
         return None
 
     dst, ln = arg(dst_i), arg(len_i)
+    # A heap destination: the pointer is loaded from a frame slot that holds a tracked, single-
+    # writer malloc(const). The allocation size is an exact capacity, judged like a stack buffer.
+    if dst and dst[0] == "load" and heap_caps and (dst[1], dst[2]) in heap_caps:
+        return _classify_heap(heap_caps[(dst[1], dst[2])], ln, sink, blocks, site_block, dom,
+                              bases, bits)
     if not dst or dst[0] != "frame":
         return {"verdict": UNKNOWN, "why": "destination is not a recovered stack buffer"}
     word = (bits or 64) // 8
@@ -750,6 +755,148 @@ def classify_nul_site(instrs, site_addr, sink, frame, arch, bits, blocks, site_b
                     f"({room} bytes) does not clear")}
 
 
+# ---------------------------------------------------------------- heap destinations
+# A copy destination is often not a stack buffer but a malloc()'d pointer. When the size is a
+# compile-time constant and the pointer lives in a frame slot that is WRITTEN EXACTLY ONCE (the
+# allocation), that slot can never hold anything else on any path, so the allocation size is a
+# sound capacity for the destination -- the same question the stack path answers, for the heap.
+_ALLOCATORS = {"malloc", "valloc", "xmalloc", "calloc", "realloc", "reallocarray", "aligned_alloc"}
+
+
+def _alloc_size(vals, sink, argregs):
+    """The constant byte size an allocator call reserves, or None if not a constant."""
+    def arg(i):
+        if i >= len(argregs):
+            return None
+        for r in argregs[i]:
+            v = vals.get(("reg", r))
+            if v is not None:
+                return v
+        return None
+    a = arg(0)
+    if sink in ("calloc", "reallocarray"):             # count * size
+        b = arg(1)
+        if a and b and a[0] == "const" and b[0] == "const":
+            return a[1] * b[1]
+        return None
+    if sink in ("realloc", "aligned_alloc"):           # size is the SECOND argument
+        b = arg(1)
+        return b[1] if b and b[0] == "const" else None
+    return a[1] if a and a[0] == "const" else None      # malloc/valloc/xmalloc: first argument
+
+
+def _slot_store_counts(blocks, bases, bits):
+    """How many times each frame slot (base, offset) is STORED to across the function. A slot
+    written once can never be reassigned, which is what makes a tracked heap capacity sound. Best
+    effort over -O0 stores (`mov %reg, disp(%rbp)` = INT_ADD base+const then STORE); conservative
+    -- resolving fewer store targets can only KEEP a multi-write slot, never invent a safe one,
+    because a slot is trusted only at a count of exactly one."""
+    counts: dict = {}
+    for b in blocks:
+        regaddr: dict = {}
+        for ins in b.get("instructions", []) or []:
+            for pc in ins.get("pcode", []) or []:
+                try:
+                    mnem, _i, outk, toks = _parse(pc)
+                except Exception:
+                    continue
+                if mnem == "STORE" and len(toks) >= 4:
+                    a = regaddr.get(_key(toks[2]))
+                    if a:
+                        counts[a] = counts.get(a, 0) + 1
+                    continue
+                if outk is None:
+                    continue
+                if mnem == "INT_ADD" and len(toks) >= 3:
+                    hit = None
+                    for rk, dtok in ((_key(toks[1]), toks[2]), (_key(toks[2]), toks[1])):
+                        if rk and rk[0] == "reg" and rk[1] in bases:
+                            d = _const_of(dtok)
+                            if d is not None:
+                                hit = (rk[1], _signed(d, bits))
+                                break
+                    if hit:
+                        regaddr[outk] = hit
+                    else:
+                        regaddr.pop(outk, None)
+                elif mnem == "COPY" and len(toks) >= 2 and _key(toks[1]) in regaddr:
+                    regaddr[outk] = regaddr[_key(toks[1])]
+                else:
+                    regaddr.pop(outk, None)
+    return counts
+
+
+def _heap_capacities(func_irs, call_edges, bases, bits, ak):
+    """{faddr: {(base, offset): capacity}} for frame slots that hold a constant-size allocation
+    and are written exactly once (so the slot provably holds only that allocation everywhere)."""
+    from .catalog import normalize
+    abi = ARCH_ABI.get(ak) or {}
+    argregs = abi.get("args") or []
+    retregs = abi.get("ret") or set()
+    out: dict = {}
+    if not argregs or not retregs:
+        return out
+    alloc_by_func: dict = {}
+    for e in call_edges:
+        n = normalize(e.dst_name)
+        if n in _ALLOCATORS and e.site_addr and e.src_addr:
+            alloc_by_func.setdefault(e.src_addr, []).append((e.site_addr, n))
+    for faddr, sites in alloc_by_func.items():
+        ir = (func_irs or {}).get(faddr) or {}
+        blocks = ir.get("blocks", []) or []
+        if not blocks:
+            continue
+        store_counts = _slot_store_counts(blocks, bases, bits)
+        caps: dict = {}
+        for b in blocks:
+            ins = b.get("instructions", []) or []
+            at = {i.get("addr") for i in ins}
+            for site, sink in sites:
+                if site not in at:
+                    continue
+                vals, _ = _slice_block(ins, site, bases, bits)
+                size = _alloc_size(vals, sink, argregs)
+                if size is None or size <= 0:
+                    continue
+                slot = _spill_slot(ins, site, {("reg", r) for r in retregs}, bases, bits)
+                if slot is not None and store_counts.get(slot, 0) == 1:
+                    caps[slot] = size              # exactly one writer: sound to trust
+        if caps:
+            out[faddr] = caps
+    return out
+
+
+def _classify_heap(room, ln, sink, blocks, site_block, dom, bases, bits):
+    """Verdict for a copy into a heap buffer of known malloc() size. The size is EXACT (not a
+    fragmented frame), so a length that fits is provably safe and one that exceeds it a real
+    overflow -- surfaced as SUSPECT, not asserted, to match the module's caution."""
+    common = {"buffer": "heap buffer", "capacity": room}
+    if ln and ln[0] == "const":
+        n = ln[1]
+        verdict = SAFE if n <= room else SUSPECT
+        return {"verdict": verdict, **common, "length": n,
+                "why": f"copies a constant {n} bytes into a {room}-byte heap allocation"}
+    g = None
+    if blocks and site_block and ln:
+        if ln[0] == "load":
+            g = guard_bound(blocks, site_block, (ln[1], ln[2]), bases=bases, dom=dom)
+        elif ln[0] == "loadp":
+            g = value_guard_bound(blocks, site_block, ln, bases, bits, dom=dom)
+    if g:
+        gmax = g["bound"]
+        common.update({"bound": gmax, "guard": True})
+        if gmax > room:
+            return {"verdict": SUSPECT, **common,
+                    "why": f"{g['why']}, but the heap allocation holds only {room}"}
+        if not g["nonneg"]:
+            return {"verdict": SIGNED, **common, "signed": True,
+                    "why": (f"{g['why']}, but the check is SIGNED and nothing excludes a negative "
+                            f"length, which {sink} takes as an unsigned size into {room} bytes")}
+        return {"verdict": SAFE, **common, "why": f"{g['why']}; the heap allocation holds {room}"}
+    return {"verdict": UNKNOWN, **common,
+            "why": f"length is not a compile-time constant ({room}-byte heap allocation)"}
+
+
 GUARDED = "guarded-index"
 # Not "no guard" -- "no question could be asked here". Keeping the two apart is the difference
 # between a measurement and a silence that looks like one.
@@ -859,6 +1006,7 @@ def classify_program(func_irs: dict, call_edges, frames: dict, arch, bits=64) ->
             strlen_by_func.setdefault(e.src_addr, []).append(e.site_addr)
     ak = _arch_key(arch)
     bases = (ARCH_ABI.get(ak) or {}).get("frame", ()) if ak else ()
+    heap_caps = _heap_capacities(func_irs, call_edges, bases, bits, ak) if ak else {}
     for faddr, ir in (func_irs or {}).items():
         blocks = (ir or {}).get("blocks", []) or []
         dom = None                                    # dominators are per function, not per site
@@ -892,7 +1040,7 @@ def classify_program(func_irs: dict, call_edges, frames: dict, arch, bits=64) ->
                                 if a in set(strlen_by_func.get(faddr, ()))]
                 v = classify_site(bins, i["addr"], hit[1], frames.get(faddr) or {},
                                   arch, bits=bits, blocks=blocks, site_block=b.get("addr"),
-                                  dom=dom, base_offs=base_offs)
+                                  dom=dom, base_offs=base_offs, heap_caps=heap_caps.get(faddr))
                 if v:
                     out[i["addr"]] = {**v, "sink": hit[1], "function_addr": faddr}
     return out

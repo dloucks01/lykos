@@ -966,8 +966,16 @@ candidate recall 1.00 / fp_rate 0.571; corroborated recall 0.833 / fp_rate 0.214
     the frame-slot `guard_bound`). A guard bound that fits the FRAME BELOW the destination now
     proves safety even when the decompiler fragmented the recovered variable. Corpus cases
     `memcpy_ptr_len_guarded` (demoted) / `memcpy_ptr_len_unbounded` (still flagged) gate it.
-    Still not covered: heap buffers, computed/variable indices, aliasing (the taint `_apply`
-    side), and length operands that are neither a frame slot nor a single pointer dereference.
+    Still not covered: computed/variable indices, aliasing (the taint `_apply` side), and length
+    operands that are neither a frame slot nor a single pointer dereference.
+  - **[DONE] Heap-buffer destinations.** A copy into a `malloc(const)` buffer is now bounded by
+    the allocation size (`_heap_capacities` + `_classify_heap`), the heap analog of the recovered
+    stack frame. Sound by construction: the capacity is trusted only for a frame slot written
+    EXACTLY ONCE (the allocation), so it can never be reassigned on any path -- a slot written
+    twice (`b = malloc(256); b = malloc(64)`) is dropped, keeping a real overflow flagged. The
+    size is exact (not a fragmented frame), so a length that fits is SAFE and one that exceeds it
+    SUSPECT. Corpus: `memcpy_heap_guarded` (demoted) / `memcpy_heap_unbounded` (flagged). Not yet
+    covered: non-constant allocation sizes, and allocators behind a wrapper.
 - **[PLANNED] `argc` is not a taint source** (deliberate — a count, not data; see
   `ENTRY_PARAM_SOURCES`). Integer-overflow and bounds classes want it; it belongs in a size/range
   channel rather than the data-flow one, where it would push taint through every `argc` guard.

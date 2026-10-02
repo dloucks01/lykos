@@ -553,6 +553,60 @@ def test_strlen_guard_on_the_result_register_bounds_a_double_indirected_source()
     assert got is not None and got["bound"] == 0x3f and got["nonneg"] is True
 
 
+def _heap_copy_block(slot_disp, length, site="0x100c"):
+    """memcpy(p, src, <const>) where the destination pointer p is LOADED from a frame slot (a
+    heap buffer), not a stack-buffer address."""
+    return [
+        _i("0x1000", [f"INT_ADD reg:RBP:8 const:{slot_disp}:8 -> unique:0x20:8",
+                      "LOAD const:0x1b1:8 unique:0x20:8 -> reg:RDI:8"], "MOV RDI,[RBP+slot]"),
+        _i("0x1004", [f"COPY const:{length:#x}:8 -> reg:RDX:8"], "MOV EDX,len"),
+        _i(site, ["CALL ram:0x9000:8"], "CALL memcpy"),
+    ]
+
+
+def test_heap_destination_capacity_bounds_a_constant_copy():
+    """A copy into a malloc()'d buffer of known size is judged against that size (exact, unlike a
+    fragmented stack frame): a constant that fits is SAFE, one that exceeds it SUSPECT, and
+    without a tracked capacity the destination is simply unknown."""
+    caps = {("RBP", -8): 64}
+    safe = bounds.classify_site(_heap_copy_block("0xfffffffffffffff8", 32), "0x100c", "memcpy",
+                                {}, "x86-64", heap_caps=caps)
+    assert safe["verdict"] == bounds.SAFE and safe["capacity"] == 64 and safe["length"] == 32
+    over = bounds.classify_site(_heap_copy_block("0xfffffffffffffff8", 100), "0x100c", "memcpy",
+                                {}, "x86-64", heap_caps=caps)
+    assert over["verdict"] == bounds.SUSPECT
+    unk = bounds.classify_site(_heap_copy_block("0xfffffffffffffff8", 32), "0x100c", "memcpy",
+                               {}, "x86-64", heap_caps={})
+    assert unk["verdict"] == bounds.UNKNOWN
+
+
+def _alloc_spill(size_hex, slot_disp, call_site, store_addr):
+    return [_i("0x1000", [f"COPY const:{size_hex}:8 -> reg:RDI:8"], "mov edi,size"),
+            _i(call_site, ["CALL ram:0x9000:8"], "call malloc"),
+            _i(store_addr, [f"INT_ADD reg:RBP:8 const:{slot_disp}:8 -> unique:0x30:8",
+                            "STORE const:0x1b1:8 unique:0x30:8 reg:RAX:8"], "mov [RBP+slot],RAX")]
+
+
+def test_heap_capacity_only_for_a_single_writer_slot():
+    """A frame slot that holds a malloc(const) and is written ONCE can never be reassigned, so
+    the size is a sound capacity. A slot written again (b = malloc(256); b = malloc(64)) is
+    ambiguous and must be dropped, or a stale size would demote a real overflow."""
+    from types import SimpleNamespace
+    edge = SimpleNamespace(dst_name="malloc", site_addr="0x1004", src_addr="0x401000")
+    once = [{"addr": "0x1000", "instructions": _alloc_spill("0x40", "0xfffffffffffffff8",
+                                                            "0x1004", "0x1008")}]
+    caps = bounds._heap_capacities({"0x401000": {"blocks": once}}, [edge], ("RBP", "RSP"), 64,
+                                   "x86-64")
+    assert caps.get("0x401000", {}).get(("RBP", -8)) == 64
+    # a second store to the same slot -> ambiguous -> no capacity
+    twice = [{"addr": "0x1000", "instructions": once[0]["instructions"] + [
+        _i("0x100c", ["INT_ADD reg:RBP:8 const:0xfffffffffffffff8:8 -> unique:0x40:8",
+                      "STORE const:0x1b1:8 unique:0x40:8 reg:RCX:8"], "mov [RBP-8],RCX")]}]
+    caps2 = bounds._heap_capacities({"0x401000": {"blocks": twice}}, [edge], ("RBP", "RSP"), 64,
+                                    "x86-64")
+    assert ("RBP", -8) not in caps2.get("0x401000", {})
+
+
 def _loadp_into(out_reg, slot_disp, deref_off):
     """`out = *(*(RBP+slot_disp) + deref_off)` -- a struct field read through a pointer, e.g.
     `p->len` where p is a spilled parameter."""

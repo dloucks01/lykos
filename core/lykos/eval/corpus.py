@@ -183,6 +183,22 @@ int main(void){ char raw[512]; int n=read(0,raw,sizeof raw); (void)n;
   handle((struct pkt*)raw); return 0; }
 """, note="same p->len length with NO bounding check -- must still be flagged, so the "
          "value-guard demotion does not swallow a real overflow"),
+    Case("memcpy_heap_guarded", "CWE-120", "good", r"""
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+int main(void){ char *b = malloc(64); char src[256]; int n = read(0, src, sizeof src);
+  if(n > 0 && (size_t)n <= 64){ memcpy(b, src, n); } write(1, b, 1); return 0; }
+""", note="destination is a malloc(64) heap buffer (not a stack frame) with a guarded length -- "
+         "exercises the single-writer heap-capacity path"),
+    Case("memcpy_heap_unbounded", "CWE-120", "bad", r"""
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+int main(void){ char *b = malloc(64); char src[256]; int n = read(0, src, sizeof src);
+  memcpy(b, src, n); write(1, b, 1); return 0; }
+""", note="same malloc(64) destination with NO bound -- must stay flagged, so the heap-capacity "
+         "demotion does not swallow a real heap overflow"),
 
     # ---- CWE-134: format strings that are literals (the sink is present and correct) ----
     Case("printf_literal_format", "CWE-134", "good", r"""
