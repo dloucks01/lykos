@@ -113,12 +113,22 @@ precision held at **1.000** (0 FP), and the corroborated eval-gate still PASSes 
 benchmark gained a heap-round-trip good/bad pair to track it. *Risk handled:* keyed only on proven
 heap slots (not arbitrary pointers), region-granular, measured against the benchmark precision number.
 
-**1.3 Inter-procedural guard reasoning.** (M, after 1.1) Guard reasoning is intra-procedural: a
-length/index bounded in a caller (or by a callee's return check) is invisible. *Approach:* propagate
-a proven bound across the one-level call edges `dctx.call_edges` already provide — a parameter bound
-at the call site, or a callee that returns a bounded value. *Acceptance:* a `check(n); copy(buf,src,n)`
-split across two functions demotes correctly. *Risk:* unsound if the callee re-derives the value;
-require the bound to dominate the call and the argument to be pass-through.
+**1.3 Inter-procedural guard reasoning.** (M, after 1.1) ✅ **DONE** (callee-return direction).
+Guard reasoning was intra-procedural: a length bounded by a callee's return was invisible, so
+`unsigned n = cap(); memcpy(buf,src,n)` read as an unbounded copy. `bounds._return_bounds` now
+summarises a function's provable constant return UPPER BOUND — every return path yields a
+non-negative constant, or a return slot a dominating guard bounds (reusing the sound `guard_bound`,
+which refuses a slot reassigned on one path, so a cmov/branch clamp is conservatively skipped rather
+than mis-bounded). `classify_program` carries that bound to a caller's copy length when the length
+is a **single-writer** slot holding that callee's return — the slot then always holds the bounded
+value, the same soundness trust `_heap_capacities` uses, so no dominance tracking is needed. Gated
+by `LYKOS_INTERPROC_BOUNDS` (default on). *Acceptance (met):* `cap()` returns ≤ 64 and
+`f(){ char buf[128]; n=cap(); memcpy(buf,src,n); }` is proven **SAFE** with the flag on and UNKNOWN
+without — the guard came from a different function (`tests/test_interproc_bounds.py`); corroborated
+eval-gate still 8/0/0, 0 FP. *Scope:* the callee-RETURN-bound direction (the acceptance's "a callee
+that returns a bounded value"). The caller-parameter-bound direction into a copy WRAPPER (`copy(buf,
+src,n)` whose body is the sink) needs the destination pointer resolved across the call — that is
+inter-procedural points-to (1.2 territory), tracked separately and not attempted here.
 
 **1.4 `argc` as a size/range source.** (S) Deliberately excluded from the data-flow channel (a count,
 not data). Integer-overflow and bounds classes want it. *Approach:* a separate **size/range** source

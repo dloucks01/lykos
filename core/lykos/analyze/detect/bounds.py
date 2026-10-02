@@ -380,7 +380,8 @@ def _capacity_buffer(frame: dict, offset: int):
 
 
 def classify_site(instrs, site_addr, sink, frame, arch, bits=64,
-                  blocks=None, site_block=None, dom=None, base_offs=None, heap_caps=None):
+                  blocks=None, site_block=None, dom=None, base_offs=None, heap_caps=None,
+                  callee_len_bounds=None):
     """Verdict for one copy call site.
 
     `blocks`/`site_block` enable the dominating-guard pass: without them only a compile-time
@@ -461,6 +462,13 @@ def classify_site(instrs, site_addr, sink, frame, arch, bits=64,
                 g = guard_bound(blocks, site_block, (ln[1], ln[2]), bases=bases, dom=dom)
             elif ln[0] == "loadp":
                 g = value_guard_bound(blocks, site_block, ln, bases, bits, dom=dom)
+        # P1.3: no dominating guard HERE, but the length is a single-writer slot that holds the
+        # return of a callee proven bounded (<= K) -- a guard from the other function.
+        if not g and callee_len_bounds and ln and ln[0] == "load" \
+                and (ln[1], ln[2]) in callee_len_bounds:
+            K = callee_len_bounds[(ln[1], ln[2])]
+            g = {"bound": K, "nonneg": True,
+                 "why": f"the length is the return value of a callee bounded to <= {K}"}
         if g:
             gmax, why = g["bound"], g["why"]
             common = {"buffer": name, "capacity": room, "bound": gmax, "guard": True}
@@ -994,8 +1002,115 @@ def _guard_slots(d):
     return out
 
 
+def _returned_value(instrs, retregs, bases, bits):
+    """The value the return register holds at the end of an exit block, as ("const", K) or
+    ("slot", (base, off)), else None. Tracks the -O0 idioms a return bound can be read from: a
+    constant moved into the return register, or a reload of a frame slot (possibly through a
+    zero/sign extension or a register copy)."""
+    consts, slots, regval = {}, {}, {}
+    for ins in instrs:
+        for pc in ins.get("pcode", []) or []:
+            try:
+                mnem, _ins, outk, toks = _parse(pc)
+            except Exception:
+                continue
+            if outk is None:
+                continue
+            if mnem == "COPY" and len(toks) >= 2:
+                k = _key(toks[1]); c = _const_of(toks[1])
+                if c is not None:
+                    consts[outk] = c; regval[outk] = ("const", c)
+                elif k in consts:
+                    consts[outk] = consts[k]; regval[outk] = ("const", consts[k])
+                elif k in slots:
+                    slots[outk] = slots[k]; regval[outk] = ("slot", slots[k])
+                elif k in regval:
+                    regval[outk] = regval[k]
+                else:
+                    regval.pop(outk, None)
+                continue
+            if mnem in ("INT_ZEXT", "INT_SEXT", "SUBPIECE") and len(toks) >= 2:
+                k = _key(toks[1])
+                if k in regval:
+                    regval[outk] = regval[k]
+                else:
+                    regval.pop(outk, None)
+                continue
+            if mnem == "INT_ADD" and len(toks) >= 3:               # frame-slot address
+                for rk, dtok in ((_key(toks[1]), toks[2]), (_key(toks[2]), toks[1])):
+                    if rk and rk[0] == "reg" and rk[1] in bases:
+                        d = _const_of(dtok)
+                        if d is not None:
+                            slots[outk] = (rk[1], _signed(d, bits))
+                continue
+            if mnem == "LOAD" and len(toks) >= 3:
+                s = slots.get(_key(toks[2]))
+                if s is not None:
+                    slots[outk] = s; regval[outk] = ("slot", s)
+                else:
+                    regval.pop(outk, None)
+                continue
+            regval.pop(outk, None)                                 # any other def clears tracking
+    for r in retregs:
+        v = regval.get(("reg", r))
+        if v is not None:
+            return v
+    return None
+
+
+def _return_bounds(func_irs, arch, bits):
+    """{faddr: K} -- a provable constant UPPER BOUND on a function's return value (P1.3).
+
+    A function is summarised only when EVERY return path yields either a non-negative constant or a
+    frame slot a dominating guard bounds (reusing the sound `guard_bound`). If any exit cannot be
+    bounded, the function gets no entry and callers treat its return as unbounded exactly as before
+    -- so this never fabricates a bound (the guard evaluator correctly refuses a slot reassigned on
+    one path, e.g. a cmov/branch clamp, which stays out of scope). Used to carry a bound proven in a
+    callee to a copy length in its caller.
+    """
+    ak = _arch_key(arch)
+    if not ak:
+        return {}
+    abi = ARCH_ABI.get(ak) or {}
+    retregs = abi.get("ret") or set()
+    bases = abi.get("frame", ())
+    if not retregs:
+        return {}
+    out = {}
+    for faddr, ir in (func_irs or {}).items():
+        blocks = (ir or {}).get("blocks", []) or []
+        exits = [b for b in blocks if not b.get("succ")]
+        if not blocks or not exits:
+            continue
+        dom = None
+        bound, ok, seen = 0, True, False
+        for ex in exits:
+            rv = _returned_value(ex.get("instructions", []), retregs, bases, bits)
+            if rv is None:
+                ok = False
+                break
+            if rv[0] == "const":
+                if rv[1] < 0:
+                    ok = False
+                    break
+                bound = max(bound, rv[1]); seen = True
+            else:
+                if dom is None:
+                    dom = dominators(blocks)
+                g = guard_bound(blocks, ex.get("addr"), rv[1], bases=bases, dom=dom)
+                if g and g.get("nonneg"):
+                    bound = max(bound, int(g["bound"])); seen = True
+                else:
+                    ok = False
+                    break
+        if ok and seen:
+            out[faddr] = bound
+    return out
+
+
 def classify_program(func_irs: dict, call_edges, frames: dict, arch, bits=64) -> dict:
     """site_addr -> verdict, for every copy sink whose call site we can read."""
+    import os as _osb
     from .catalog import normalize
     out: dict = {}
     by_site = {}
@@ -1014,6 +1129,34 @@ def classify_program(func_irs: dict, call_edges, frames: dict, arch, bits=64) ->
     ak = _arch_key(arch)
     bases = (ARCH_ABI.get(ak) or {}).get("frame", ()) if ak else ()
     heap_caps = _heap_capacities(func_irs, call_edges, bases, bits, ak) if ak else {}
+    # P1.3 inter-procedural guard reasoning: a copy length that is the return value of a callee
+    # whose return is provably bounded (constant / dominating-guard) is bounded by that value --
+    # a guard proven in one function reaching a sink in another. Sound by construction: the length
+    # slot must be the SINGLE writer's target (so it always holds that return), the same trust the
+    # heap-capacity channel uses. Behind a flag so the precision effect is measurable.
+    callee_len_bounds: dict = {}
+    if ak and _osb.environ.get("LYKOS_INTERPROC_BOUNDS", "1") != "0":
+        retregs = (ARCH_ABI.get(ak) or {}).get("ret") or set()
+        ret_bounds = _return_bounds(func_irs, arch, bits) if retregs else {}
+        if ret_bounds:
+            store_counts: dict = {}
+            for e in call_edges:
+                K = ret_bounds.get(e.dst_addr)
+                if K is None or not (e.src_addr and e.site_addr):
+                    continue
+                ir = (func_irs or {}).get(e.src_addr) or {}
+                blocks = ir.get("blocks", []) or []
+                sc = store_counts.get(e.src_addr)
+                if sc is None:
+                    sc = store_counts[e.src_addr] = _slot_store_counts(blocks, bases, bits)
+                for b in blocks:
+                    ins = b.get("instructions", []) or []
+                    if e.site_addr not in {i.get("addr") for i in ins}:
+                        continue
+                    slot = _spill_slot(ins, e.site_addr, {("reg", r) for r in retregs}, bases, bits)
+                    if slot is not None and sc.get(slot, 0) == 1:   # one writer: always this return
+                        cur = callee_len_bounds.setdefault(e.src_addr, {})
+                        cur[slot] = min(cur.get(slot, K), K)
     for faddr, ir in (func_irs or {}).items():
         blocks = (ir or {}).get("blocks", []) or []
         dom = None                                    # dominators are per function, not per site
@@ -1047,7 +1190,8 @@ def classify_program(func_irs: dict, call_edges, frames: dict, arch, bits=64) ->
                                 if a in set(strlen_by_func.get(faddr, ()))]
                 v = classify_site(bins, i["addr"], hit[1], frames.get(faddr) or {},
                                   arch, bits=bits, blocks=blocks, site_block=b.get("addr"),
-                                  dom=dom, base_offs=base_offs, heap_caps=heap_caps.get(faddr))
+                                  dom=dom, base_offs=base_offs, heap_caps=heap_caps.get(faddr),
+                                  callee_len_bounds=callee_len_bounds.get(faddr))
                 if v:
                     out[i["addr"]] = {**v, "sink": hit[1], "function_addr": faddr}
     return out
