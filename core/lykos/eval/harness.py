@@ -158,7 +158,11 @@ def run_corpus(cases=None, *, workdir=None, gcc="gcc", workers=2, stage_timeout=
             # `candidate` -- the corroborated-stage gate then reads recall 0.0. Run it explicitly.
             enqueue_triage(q, target, force=True)
             timed_out = not pool.wait_idle(stage_timeout)
-            if ghidra:
+            # Disassemble under EITHER backend: the stage picks native (rizin+pypcode) or Ghidra
+            # via LYKOS_DECOMPILER/_select_backend(). Gating this on Ghidra alone left a native-only
+            # host (the shipped default, and the CI eval-gate runner) with no IR -- every call-graph
+            # and bounds detector dark, so recall read 0.0. Run it whenever any backend is present.
+            if decompiler:
                 enqueue_disassemble(q, target, force=True)
                 timed_out |= not pool.wait_idle(stage_timeout)
             enqueue_detect(q, target, force=True)
