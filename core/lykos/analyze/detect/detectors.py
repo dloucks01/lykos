@@ -590,10 +590,16 @@ def _str_flag_for_reg(texts, reg: str):
     return None
 
 
-def _stack_slot_for_reg(texts, reg: str):
+def _stack_slot_for_reg(texts, reg: str, slot_names=None):
     """The rbp-relative slot (`-K`, an int) that `reg` holds the ADDRESS of at the end of `texts`,
     following one level of reg-to-reg move (`lea rax,[rbp-0x10]; mov rsi,rax`). None if `reg` is not
-    a &frame-local at the call. Matches the -O0 argument set-up r2 emits."""
+    a &frame-local at the call. Matches the -O0 argument set-up r2 emits.
+
+    `slot_names` maps the decompiler's NAMED stack operands to their frame offsets (e.g. rizin's
+    `var_18h` -> -24, from the frame table). The disassembly often renders a local as that name --
+    `lea rax, qword [var_18h]` -- rather than a literal `[rbp - 0x18]`, and without the mapping the
+    address of the buffer is simply not recovered (the whole slot comes back None). The offset is
+    taken from the frame table, never parsed out of the name's digits."""
     cur = reg
     for _ in range(2):                                    # at most one mov hop then the lea
         for t in reversed(texts):
@@ -602,6 +608,11 @@ def _stack_slot_for_reg(texts, reg: str):
                          body, re.I)
             if m:
                 return -int(m.group(1), 0)
+            if slot_names:                                # &frame-local via the named operand
+                mn = re.match(r"\s*lea\s+" + re.escape(cur) +
+                              r"\s*,\s*(?:[a-z]+\s+)?\[\s*([A-Za-z_][\w.]*)\s*\]", body, re.I)
+                if mn and mn.group(1) in slot_names:
+                    return int(slot_names[mn.group(1)])
             mv = re.match(r"\s*mov\s+" + re.escape(cur) + r"\s*,\s*([a-z0-9]+)\s*$", body, re.I)
             if mv and mv.group(1).lower() in _X86_REGS:
                 cur = mv.group(1).lower()
@@ -613,10 +624,11 @@ def _stack_slot_for_reg(texts, reg: str):
     return None
 
 
-def _memset_size_for_slot(texts, slot: int):
+def _memset_size_for_slot(texts, slot: int, slot_names=None):
     """Size of a `memset(&local, 0, IMM)` on `slot` earlier in the function (r2: `lea rax,[rbp-K];
-    mov rdi,rax; mov edx,IMM; ...; call memset`). Gives the buffer size when the decompiler frame
-    did not size the local. None if not found."""
+    mov rdi,rax; mov edx,IMM; ...; call memset`). This is the buffer's zeroed extent -- a tighter,
+    more reliable size than a decompiler frame var that merges the local with adjacent slots (rizin
+    reports a padded 24 for a `char[16]` that abuts the saved rbp). None if not found."""
     edx = None
     for t in texts:
         body = t.split(";")[0]
@@ -624,7 +636,7 @@ def _memset_size_for_slot(texts, slot: int):
         if m:
             edx = int(m.group(1), 0)
         if _norm_call(body) == "memset" and edx is not None:
-            if _stack_slot_for_reg(texts[:texts.index(t)], "rdi") == slot:
+            if _stack_slot_for_reg(texts[:texts.index(t)], "rdi", slot_names) == slot:
                 return edx
     return None
 
@@ -646,6 +658,10 @@ def scanf_bounded_overflow(ctx: DetectContext):
         frame = ctx.frames.get(faddr) or {}
         vsize = {int(v.get("offset", 1)): int(v.get("size", 0))
                  for v in (frame.get("vars") or []) if v.get("offset") is not None}
+        # name -> frame offset, so a `lea rax, [var_18h]` operand resolves to its slot (the
+        # disassembly names locals; it rarely spells out `[rbp - 0x18]`).
+        slot_names = {v["name"]: int(v["offset"]) for v in (frame.get("vars") or [])
+                      if v.get("name") and v.get("offset") is not None}
         flat = [(i.get("addr"), (i.get("text") or ""))
                 for b in ir.get("blocks", []) or [] for i in (b.get("instructions") or [])]
         texts = [t for _, t in flat]
@@ -660,10 +676,14 @@ def scanf_bounded_overflow(ctx: DetectContext):
             widths = {int(w) for w in _SYM_WIDTH.findall(sym)} & real_widths if sym else set()
             if not widths:
                 continue
-            slot = _stack_slot_for_reg(pre, buf_reg)
+            slot = _stack_slot_for_reg(pre, buf_reg, slot_names)
             if slot is None:
                 continue
-            size = vsize.get(slot) or _memset_size_for_slot(pre, slot)
+            # Prefer the memset-zeroed extent: it is the exact buffer size, whereas a decompiler
+            # frame var often merges the buffer with the slots above it (rizin pads a char[16] that
+            # abuts the saved rbp to 24, which would hide the off-by-one). Fall back to the frame
+            # size when the buffer is not memset.
+            size = _memset_size_for_slot(pre, slot, slot_names) or vsize.get(slot)
             if not size:
                 continue
             n = max(widths)

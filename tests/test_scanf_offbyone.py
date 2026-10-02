@@ -117,7 +117,11 @@ def pool(store):
                                              ("%32s", 16, True), ("%s", 16, False)])
 def test_detect_scanf_offbyone_e2e(store, case, pool, gcc, tmp_path, x86_64_only, fmt, size, expect):
     c = tmp_path / "s.c"
-    c.write_text(f'#include <stdio.h>\nint main(void){{char b[{size}];scanf("{fmt}",b);'
+    # memset(b, 0, sizeof b) matches the real scanner shape the detector is built around: the
+    # zeroed extent is the exact buffer size, which is what lets the off-by-one be proven on the
+    # native backend (whose frame var merges the buffer with the saved rbp above it).
+    c.write_text(f'#include <stdio.h>\n#include <string.h>\n'
+                 f'int main(void){{char b[{size}];memset(b,0,sizeof b);scanf("{fmt}",b);'
                  f'printf("%s",b);return 0;}}\n')
     out = tmp_path / "sf"
     if subprocess.run([gcc, "-O0", "-fno-stack-protector", "-no-pie", str(c), "-o", str(out)],

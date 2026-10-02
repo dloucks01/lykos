@@ -202,7 +202,9 @@ def test_eval_static_stage_passes_min_state_and_says_which_backend(capsys, monke
     assert rc == 0
     assert seen["min_state"] == "corroborated"
     out = capsys.readouterr().out
-    assert "ghidra=yes, min_state=corroborated" in out
+    # the backend line names which RE backend produced the scores (ghidra | native | NONE), so a
+    # native-backend eval can't masquerade as a ghidra one -- see the --require-backend gate (P0.2).
+    assert "backend=ghidra, min_state=corroborated" in out
 
 
 def test_eval_exit_code_follows_the_gate_not_the_run(capsys, monkeypatch):

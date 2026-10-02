@@ -100,6 +100,12 @@ crashing input; many bug classes have a **derivable** input and need no fuzzing.
   symbols (stripped/PLT-only cross-arch binaries yield no sinks); no backtrace over the stub, so
   the CWE-121 caller-buffer overflow predicate stays native-only. (Syscall/behavior tracing is now
   cross-arch too, via qemu-user `-strace` — see the behavior-tracing item above.)
+  **[DONE] Thumb sinks (armhf/glibc):** `monitor_calls` now masks bit 0 of a Thumb function symbol
+  and arms a 2-byte breakpoint at the even code address (mirroring `capture()`), so a glibc/armhf
+  libc — whose `system`/`strcpy`/… symbols are Thumb (odd) — is monitored instead of silently
+  yielding zero hits. Previously only musl's ARM-mode libc worked. Now live-verified on 32-bit ARM
+  against the distro `arm-linux-gnueabihf` toolchain (`tests/test_arm.py`, which builds its own
+  `vuln_arm` on demand so the suite runs in CI rather than skipping off a dev box).
 - **[DONE] Analyst `sink_addrs` escape hatch**: a stripped, *statically-linked* binary loses sink
   identity entirely (no `.symtab`, and Ghidra recovers the functions only as `FUN_xxxx`), so
   name-based resolution finds nothing on either path. `debug_monitor` now accepts
@@ -286,6 +292,16 @@ actionable.
   been. This also removed the last two false positives on jhead 3.04 — the `ProcessFile`
   `Comment[16001]`/`st` slot-reuse artifact documented above — taking it to 38 unknown / 4
   bounded / 0 suspect.
+- **[DONE] Width-bounded scanf off-by-one on the native backend** (`scanf_bounded_overflow`,
+  CWE-787). The detector (`scanf("%16s", buf)` writes 16 chars + a NUL into a 16-byte buffer) was
+  written against hand-written `[rbp - 0x10]` IR and never fired end-to-end on a compiled binary:
+  rizin (and Ghidra) render the destination as a NAMED local (`lea rax, [var_18h]`), so
+  `_stack_slot_for_reg` recovered no slot, and rizin's frame var merges the `char[16]` with the
+  saved rbp above it and reports size 24, hiding the single-byte overflow. Fixed both: the slot is
+  now resolved through the frame's name→offset table, and the size prefers the `memset(&buf,0,N)`
+  zeroed extent (the exact buffer size, the shape the real HTB scanner bug has) over the merged
+  frame var. The e2e corpus test now runs and passes on the shipped native backend. (Separately: the
+  detector parses rizin-style asm text and does not apply to Ghidra IR — a native-only detector.)
 - **[DONE] L2 on a REAL target.** Until now instruction-pointer control was only ever
   demonstrated on the arch gate's synthetic ret2win fixtures. ncompress 4.2.4 — the
   historically released version, built from upstream git at tag `v4.2.4` using only the

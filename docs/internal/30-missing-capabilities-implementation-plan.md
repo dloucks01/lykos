@@ -50,9 +50,18 @@ and a handful of **real CVEs** (the CVE DB already lists them). Report precision
 tracked number, not a gate. *Acceptance:* `lykos eval --benchmark` prints a stable score; wired into
 doc 20's dashboard. *Risk:* Juliet/LAVA size + licensing → vendor a small, fixed subset.
 
-**0.4 32-bit ARM tests runnable in CI.** (S) `tests/test_arm.py` skips off a dev box. Gate it on
-`arm-linux-gnueabihf-gcc` + `qemu-arm` (both installable in CI) and run it. *Acceptance:* the arm
-tests execute in CI, not skip.
+**0.4 32-bit ARM tests runnable in CI.** (S) ✅ **DONE.** `tests/test_arm.py` skipped unless the
+musl-built `vuln_arm` corpus binary was present (a dev-box artefact). It now builds the binary on
+demand from the corpus source with the distro `arm-linux-gnueabihf-gcc` (`-O0 -fno-stack-protector
+-static`, verified to reproduce the same handle()-frame offset 132 as the musl build) when the musl
+one is absent, and skips only when neither a cross-gcc nor `qemu-arm` is available — both are already
+installed in the `tests` CI job, so the four ARM tests now execute there. Doing so surfaced a real
+monitor bug: `qemu_gdb.monitor_calls` armed fixed 4-byte ARM breakpoints at raw symbol addresses and
+never masked the Thumb bit, so against a **glibc/armhf** libc (Thumb-built — `system`/`strcpy`/… have
+bit0 set) every breakpoint sat at an odd address and never fired → zero hits. Fixed to mask the
+address (`&~1`) and use a 2-byte length hint for Thumb symbols, mirroring what `capture()` already
+did; the cross-arch call monitor now works against Thumb libcs, not just musl's ARM-mode one.
+*Acceptance:* the arm tests execute in CI, not skip. ✅
 
 ---
 

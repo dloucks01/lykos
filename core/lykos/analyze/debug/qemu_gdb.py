@@ -396,9 +396,20 @@ def monitor_calls(exe, arch, *, symbols, entry, pie, sink_names, endianness=None
             if rt_entry is None:
                 return {"ok": False, "note": "could not read the runtime entry point"}
             base = (rt_entry - entry) if pie else 0
-            bp_by_addr = {(v + base): n for n, v in targets.items()}
+            mask = arch in LSB_MASKED_PC
+            # Thumb/interworking (same rule capture() applies, see LSB_MASKED_PC): a sink symbol
+            # with bit0 set lives at the even code address and runs in Thumb state, so the
+            # breakpoint belongs at addr&~1 with a 2-byte length hint. Armed at the odd address --
+            # or as a 4-byte ARM breakpoint -- it simply never fires, which is exactly how a
+            # glibc/armhf libc (Thumb-built: system/strcpy/... are odd) yields zero monitor hits.
+            bp_by_addr, bp_kind = {}, {}
+            for n, v in targets.items():
+                a = v + base
+                placed = a & ~1 if mask else a
+                bp_by_addr[placed] = n
+                bp_kind[placed] = 2 if (mask and (a & 1)) else kind
             for a in bp_by_addr:
-                _txn(sock, f"Z0,{a:x},{kind}")
+                _txn(sock, f"Z0,{a:x},{bp_kind[a]}")
             hits = []
             reply = _txn(sock, "c", timeout=timeout)
             while len(hits) < max_hits and time.time() < deadline:
@@ -414,9 +425,10 @@ def monitor_calls(exe, arch, *, symbols, entry, pie, sink_names, endianness=None
                     hits.append({"func": name, "argints": ints, "argstrs": strs})
                 # step over: remove bp, single-step the original insn, re-arm, continue
                 if pc in bp_by_addr:
-                    _txn(sock, f"z0,{pc:x},{kind}")
+                    k = bp_kind[pc]
+                    _txn(sock, f"z0,{pc:x},{k}")
                     _stop_sig(_txn(sock, "s", timeout=timeout))
-                    _txn(sock, f"Z0,{pc:x},{kind}")
+                    _txn(sock, f"Z0,{pc:x},{k}")
                 reply = _txn(sock, "c", timeout=timeout)
             return {"ok": True, "hits": hits, "base": base}
         except socket.timeout:
