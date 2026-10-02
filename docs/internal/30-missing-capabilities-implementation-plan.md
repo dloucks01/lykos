@@ -304,8 +304,21 @@ a libwebp binary with CVE-2023-4863's version matches.
   query param defaulting to 0, so the WebSocket replays the stored event log on connect (a case
   with history is no longer an empty pane) then streams live; a reconnecting client passes its last
   id to resume. `tests/test_api.py::test_event_websocket_backfills_history_on_connect`.
-- **5.7 Second positive L2 target.** (S) Close out the open L2 validation (doc 20 §F): a second
-  real program driven to a demonstrated primitive, beyond the ncompress/jhead fixtures.
+- **5.7 Second positive L2 target.** (S) ⚠️ **Validation follow-on — the machinery is proven; a
+  second real-UPSTREAM L2 needs a suitable target.** The L2 (instruction-pointer-control) machinery
+  is already validated two ways: `real_ncompress` (CVE-2001-1413, an unchecked `strcpy` of an argv
+  pathname) drives a real upstream program to a confirmed L2 in `realgate`, and the arch gate drives
+  the ret2win shape to L2 across 13 ISAs (automated, tested). The blocker to a *second real upstream*
+  L2 is target availability, not capability: the other real programs in `examples/vuln-targets`
+  reach their correct level and stop there — `real_jhead` is an out-of-bounds READ (CWE-125), which
+  cannot reach L2 at all, and `gif2rgb` is a clean negative. A genuine second upstream L2 therefore
+  requires sourcing a program with a stack-return-overwrite bug (not an OOB-parser bug) and a
+  trigger — a focused validation exercise, tracked as a follow-on rather than fabricated here.
+
+**Phase 5:** 5.1/5.2/5.3 were already in place (loader-filtered monitor, graceful boundary_fuzz, PE
+behaviour trace); 5.5 (run-row crash yield), 5.6 (Live Events history backfill) and 5.4 (per-stage
+param schema + loud validation, mechanism + `dynamic_run`) landed this pass; 5.7 is a validation
+follow-on as above.
 
 ---
 
