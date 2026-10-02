@@ -7,7 +7,8 @@ operator-facing documentation. The reference docs a user needs are in the parent
 What's here:
 
 - **Roadmap & backlog** — `13-roadmap-milestones.md`, `20-open-work-backlog.md`
-- **Reviews & plans** — `21-crs-harvest-review.md`, `24-modernization-plan.md`
+- **Reviews & plans** — `21-crs-harvest-review.md`, `24-modernization-plan.md`,
+  `30-missing-capabilities-implementation-plan.md` (sequenced plan for doc 20's open queue)
 - **Dated audits & handoffs** — `25-`…`29-` (point-in-time code/capability audits and session
   handoffs; they describe the state as of their date, not necessarily the current tree)
 - **`archive/`** — early prototype and phase-0 planning tickets (historical)
