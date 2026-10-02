@@ -976,6 +976,18 @@ candidate recall 1.00 / fp_rate 0.571; corroborated recall 0.833 / fp_rate 0.214
     size is exact (not a fragmented frame), so a length that fits is SAFE and one that exceeds it
     SUSPECT. Corpus: `memcpy_heap_guarded` (demoted) / `memcpy_heap_unbounded` (flagged). Not yet
     covered: non-constant allocation sizes, and allocators behind a wrapper.
+  - **[PLANNED] Computed/variable indices (`buf[i]`) at -O2 need inter-block taint origins.**
+    `classify_derefs` bounds an index that is a FRAME SLOT; at -O2 the index stays in a register
+    and never becomes one, so a guarded `if (i < N) buf[i]=…` reads as UNCHECKABLE (ranking only
+    -- tainted_deref is candidate-state, confidence 0.3 GUARDED vs 0.4). A register-NAME guard
+    search was tried and reverted as UNSOUND: register names are reused across values, so an
+    unrelated dominating compare on the same name (e.g. the `if (read()!=1)` check reusing RAX)
+    fabricated a guard on a genuinely unbounded index. The sound signal is the frame SLOT the
+    index was loaded from and compared (`movzbl [rsp+n],eax; cmp al,K`), which the existing
+    slot-based `guard_bound` handles -- but the taint `via` is PER-BLOCK, so that origin is lost
+    before the deref's block. Needs inter-block taint-origin tracking (persist a value's slot
+    origin across the block boundary); not a bounds-local change, and ranking-only, so low
+    priority against the corroborated-FP work.
 - **[PLANNED] `argc` is not a taint source** (deliberate — a count, not data; see
   `ENTRY_PARAM_SOURCES`). Integer-overflow and bounds classes want it; it belongs in a size/range
   channel rather than the data-flow one, where it would push taint through every `argc` guard.

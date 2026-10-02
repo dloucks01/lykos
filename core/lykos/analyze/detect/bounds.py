@@ -939,6 +939,13 @@ def classify_derefs(func_irs: dict, derefs, arch) -> dict:
                 # fixture with an explicit `if (i >= 0 && i < 256)`: found at -O0, invisible at
                 # -O2. Reporting that as "no dominating check" would be a silent failure that
                 # reads exactly like a real absence of one.
+                #
+                # A register-name match was tried and REJECTED as unsound: register names are
+                # reused across values, so an unrelated dominating compare on the same name
+                # (e.g. the `if (read()!=1)` check reusing RAX) fabricated a guard on a genuinely
+                # unbounded index. The sound signal is the frame SLOT the index was loaded from,
+                # which the taint `via` drops at the block boundary (it is per-block) -- so this
+                # needs inter-block taint-origin tracking, not a bounds-local change.
                 out[d["site_addr"]] = {
                     "verdict": UNCHECKABLE,
                     "why": ("the value this address is built from is not a frame slot here, "
