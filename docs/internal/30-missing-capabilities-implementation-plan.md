@@ -186,12 +186,29 @@ PCs) produce two findings and the same defect found repeatedly stays one — `te
 added because the native SIGSEGV path captures neither (only the JVM/Wine paths carry frames), so the
 faulting PC is the best signature the data offers.
 
-**2.4 Unblock the three arches upstream of the bounds pass.** (M) `riscv` resolves only one constant
-of a split immediate; SuperH materialises constants in a **PC-relative literal pool** the slicer
-cannot read; a third arch mis-tracks spills. *Approach:* (a) riscv `lui`/`addi` immediate pairing in
-`_slice_block`; (b) a PC-relative pool reader (resolve `mov.l @(disp,pc)` against the function's
-rodata) feeding `_const_of`. *Acceptance:* the bounds/guard corpus cases pass on riscv64 and sh in
-Phase-0.2 cross-arch scoring. *Risk:* per-ISA encoding detail — table-driven, unit-tested per shape.
+**2.4 Unblock the three arches upstream of the bounds pass.** (M) ⚠️ **INVESTIGATED — plan premises
+did not survive the evidence; real blockers are backend-level, deferred with findings.** Measured on
+the bundled corpus (native backend, riscv64-/sh4-linux-gnu toolchains, both present):
+- **riscv64** recall is 0.125 at BOTH candidate and corroborated — not a bounds-slicer problem. The
+  native backend (rizin + pypcode) recovers **no call edges** for riscv64 (`dst_name` set empty) and
+  emits a garbage symbol from the ISA string (`_xrv64i2p1_...`), so the rule-channel detectors that
+  key on calls (`dangerous_api`/`lang_sinks`) never fire. The planned `lui`/`addi` immediate pairing
+  is a bounds refinement and cannot help a candidate-channel miss — the blocker is call-graph
+  recovery in the disassembler, not `_slice_block`. Fixing it needs backend work (rizin riscv64
+  analysis) or a lykos-side call-recovery path (`auipc`/`jalr`, PLT/relocations) — a separate effort.
+- **sh4** recovers calls (finds every bad case, fn=0) but has 9 false POSITIVES, and they are exactly
+  the discrimination negatives — `printf("literal")`, `system("const")`, `memcpy_clamped`,
+  `strncpy_bounded`, `strcpy_length_guarded`, … — flagged at corroborated. The cause is the
+  PC-relative literal pool: the format strings, constant commands and clamped lengths are
+  materialised via `mov.l @(disp,pc)`, which the analysis cannot resolve, so it cannot recognise them
+  as compile-time constants and defaults to "attacker-influenced." So 2.4b's direction is right, but
+  the fix is larger than a `_const_of` pool read: it must plumb the binary's rodata (or reuse rizin's
+  string xrefs) into the detect stage and feed resolved constants/literals through the taint, bounds
+  AND injection discriminators — a multi-detector change, not the table-driven slicer tweak scoped.
+
+Not landed: shipping the planned `lui`/`addi` slicer would be dead code (riscv64 reaches no sink to
+bound), and a half-wired pool reader risks the precision bar. Both arches stay on their ratchet
+baselines (unregressed). Recommended follow-ups recorded in doc 20.
 
 ---
 
