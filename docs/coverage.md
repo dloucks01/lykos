@@ -483,6 +483,13 @@ every phase (`internal/13-roadmap-milestones.md`). Measure both **detection powe
 | **DARPA CGC** | vulnerable binaries with reference PoVs | end-to-end find→confirm→PoC |
 | Real-CVE mini-suite | a curated set of CVEs relevant to expected targets | true end-to-end validation |
 
+**Implemented:** `lykos eval --benchmark` scores a vendored, offline breadth corpus (10 CWE
+classes) at both the candidate and corroborated channels and runs the LAVA-M recall mini,
+reporting precision/recall/F1 as a **tracked, non-gating** number recorded to the dashboard
+(`lykos dashboard`). Point it at a real NIST drop with `--juliet` / `--lava`. The separate
+`make eval-gate` remains the 0-FP release tripwire (24-case corpus), with a per-architecture
+ratchet (`--arch all`).
+
 ### Metrics tracked over time (regression dashboard)
 - **Per-CWE:** precision / recall / F1 at each finding state (candidate vs confirmed).
 - **False-positive rate** at candidate stage AND the confirmed-stage FP rate (should approach ~0 — that's the

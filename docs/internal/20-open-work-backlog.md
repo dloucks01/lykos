@@ -5,6 +5,30 @@ tags: **[DONE]** shipped & verified, **[WIP]** in progress this stream, **[PLANN
 direction, not started. Everything here is deterministic / zero-AI (doc 15 §5). Roadmap phase
 notes (doc 13) carry the authoritative "what shipped"; this doc is the forward queue.
 
+> **doc 30 implementation (Phases 0–5) — complete 2026-10.** The sequenced plan in
+> [30-missing-capabilities-implementation-plan.md](30-missing-capabilities-implementation-plan.md)
+> was worked end to end; see it for each item's status. Shipped: CI eval-gate + per-arch scoring +
+> ARM-in-CI + the `eval --benchmark` harness (P0); the taint memory-model backbone — inter-block
+> origins, heap/computed-address region taint, inter-procedural return-bound guards, argc as a
+> size source (P1); CWE-798 corroboration, two-source-corroborated CONFIRMED overflows, fault-PC
+> crash grain (P2); coverage_fuzz native-instrumented path + format-aware seeds (P3); the RTOS
+> task-level spike memo, allocator-wrapper heap sizing, libwebp ABI-version CVEs (P4); run-row
+> crash yield, Live Events backfill, per-stage param-schema validation (P5). The corroborated
+> eval-gate held at **0 FP / full recall** throughout.
+>
+> **Open follow-ons (recorded, not regressions):**
+> - **riscv64 call-graph recovery** — rizin/pypcode recovers no call edges for riscv64, so the
+>   rule channel is dark there (P2.4). Needs backend work or a lykos-side `auipc`/`jalr`+reloc
+>   recovery path.
+> - **SuperH PC-relative literal pool** — unresolved pool constants make the discrimination
+>   channels over-flag on sh4 (P2.4). Needs rodata (or rizin string-xref) plumbing into detect.
+> - **Guarded/variable heap-alloc size** — the sound demote is the `malloc(n)`+`copy(n)` equality
+>   case, needing size↔length value linkage (P4.2a).
+> - **Param-schema rollout** — the mechanism ships; declaring a schema on the remaining stages is
+>   a one-line addition each (P5.4).
+> - **Second real-upstream L2 target** — the machinery is proven (ncompress + 13-ISA matrix); a new
+>   upstream L2 needs a stack-return-overwrite target + trigger (P5.7).
+
 ## A. PoC creation beyond fuzzing (deterministic input synthesis)
 
 Motivation: for a long time every poc-backed finding traced to a *fuzzer/concolic-produced*

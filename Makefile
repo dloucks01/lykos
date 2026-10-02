@@ -2,11 +2,11 @@
 PY ?= python3
 export PYTHONPATH := core
 
-.PHONY: doctor toolchain-bundle repo-tarball test coverage lint typecheck gui ci bundle verify eval eval-gate arch-gate real-gate dashboard release clean help
+.PHONY: doctor toolchain-bundle repo-tarball test coverage lint typecheck gui ci bundle verify eval eval-gate benchmark arch-gate real-gate dashboard release clean help
 
 help:
 	@echo "run the app with ./start (UI) and ./lykos (CLI); build the air-gap package with ./package"
-	@echo "make targets (dev/release): doctor toolchain-bundle repo-tarball test coverage lint typecheck gui ci bundle verify eval eval-gate arch-gate real-gate dashboard release clean"
+	@echo "make targets (dev/release): doctor toolchain-bundle repo-tarball test coverage lint typecheck gui ci bundle verify eval eval-gate benchmark arch-gate real-gate dashboard release clean"
 
 # What this host can and cannot do, and the install line for anything missing. On an
 # air-gapped workstation there is no package manager to ask, and "the stage declined" is a
@@ -161,6 +161,12 @@ eval-gate:
 	LYKOS_DECOMPILER=$(STATIC_BACKEND) $(PY) -m lykos eval --stage static --min-state corroborated --record \
 	      --min-recall $(CORROB_MIN_RECALL) --max-fp-rate $(CORROB_FP_BUDGET) \
 	      $(REQUIRE_BACKEND) --min-negative $(STATIC_MIN_NEGATIVE)
+
+# Tracked detection BENCHMARK (not a gate): precision/recall/F1 over the vendored breadth corpus
+# (10 CWE classes) at both channels + the LAVA-M recall mini, recorded to the dashboard. Always
+# exits 0; use --juliet/--lava for a real NIST drop.
+benchmark:
+	LYKOS_DECOMPILER=$(STATIC_BACKEND) $(PY) -m lykos eval --benchmark
 
 # Architecture coverage gate: every supported ISA still reaches its expected PoC level.
 # Builds a vulnerable program per architecture with the cross toolchain, detonates it through

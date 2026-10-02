@@ -43,7 +43,8 @@ and drives each crash as far up the exploitation ladder as the target allows.
 - **Known-CVE detection + weaponization.** Fingerprints vulnerable component versions on **both**
   channels — a compiled binary's version banners *and* a source project's dependency manifests
   (`requirements.txt`, `package-lock.json`, `go.mod`, `Cargo.lock`) and vendored headers
-  (`zlib.h`, `openssl`, `mbedTLS`, `wolfSSL`, **FreeRTOS** `tskKERNEL_VERSION_NUMBER`) — against a
+  (`zlib.h`, `openssl`, `mbedTLS`, `wolfSSL`, **FreeRTOS** `tskKERNEL_VERSION_NUMBER`, and
+  ABI-only libraries like **libwebp** mapped from `WEBP_DECODER_ABI_VERSION`) — against a
   bundled offline database (OSV language-ecosystem index + an NVD-CPE set for C/embedded
   libraries). Each match names its exploit class, is corroborated by any demonstrated crash of a
   matching class on the target, and — where an authored trigger exists — is **weaponized**: the
@@ -105,7 +106,8 @@ make coverage          # line/branch coverage INCLUDING the subprocess-only engi
 ./start                # serve the API + UI on 127.0.0.1:8787 (case store in .cases/)
 make bundle            # build the standalone dist/lykos.pyz zipapp
 make verify            # build it, then prove it serves the UI and triages offline
-make eval-gate         # detection-quality gate over the bundled corpus
+make eval-gate         # detection-quality gate over the bundled corpus (0-FP tripwire)
+make benchmark         # tracked precision/recall/F1 over the breadth corpus (non-gating)
 make arch-gate         # every architecture still reaches its PoC level
 make real-gate         # full chain on real programs (detect -> PoC -> attribution)
 make release           # ci + verify + all four gates
@@ -165,22 +167,24 @@ negative, and only the second can fail:
   a `strlen() < sizeof` guard, clamped `memcpy`, literal-format `printf`, constant-command
   `system`). These are what make `fp_rate` a measurement rather than a constant.
 
-Measured on x86-64 with Ghidra, 20 cases over 4 CWE classes:
+Measured on the native backend (rizin + pypcode — the shipped default), 24 cases over 4 CWE
+families:
 
 | stage | recall | fp_rate |
 |---|---|---|
-| `--min-state candidate` (rule channel) | 1.00 | 0.571 |
-| `--min-state corroborated` (data-flow channel) | 1.00 | 0.214 |
+| `--min-state candidate` (rule channel) | 1.00 | 0.65 |
+| `--min-state corroborated` (data-flow channel) | 1.00 | **0.00** |
 
 That gap is the confidence lifecycle earning its keep: the rule channel flags every safe use
-too — honest behaviour for a pattern rule — and the taint channel discards most of them. The
-CWE-120 false positives that remain are path-insensitivity: attacker bytes really do reach the
-`strcpy`, and the guard that makes it safe is a value-range fact the taint model does not
-carry. Promotion to *confirmed* still requires dynamic evidence.
+too — honest behaviour for a pattern rule — and the taint channel discards **all** of them. The
+corroborated channel holds **0 false positives with full recall**, and a **per-architecture
+ratchet** (`--arch all`) stops any arch regressing against its baseline. Promotion to *confirmed*
+still requires dynamic evidence.
 
-All gates are ratchets at their measured values and fail in **either** direction. The corpus
-is a regression tripwire, not a benchmark — use `lykos eval --juliet` / `--lava` for real
-measurement.
+The gate is a regression tripwire. For a **tracked breadth score**, `lykos eval --benchmark`
+reports precision/recall/F1 over a wider vendored corpus (10 CWE classes) at both channels plus the
+LAVA-M recall mini — non-gating, recorded to the dashboard — and `--juliet` / `--lava` point it at a
+real NIST drop. All gates are ratchets at their measured values and fail in **either** direction.
 
 ## Driving it over HTTP
 
