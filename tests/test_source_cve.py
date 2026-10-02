@@ -154,3 +154,24 @@ def test_exploit_evidence_carries_the_honest_caveat():
     # it must NEVER claim a PoC exists -- only that a reproducer is still needed
     assert "still required" in ev[0]["detail"]
     assert scan.exploit_evidence("CWE-9999") == []
+
+
+def test_libwebp_abi_version_maps_to_a_release_and_matches_its_cve(tmp_path):
+    """libwebp exposes only WEBP_DECODER_ABI_VERSION, no dotted release -- doc 30 P4.3. The ABI
+    number maps (operator-extensible table) to the earliest release carrying it, so a CVE range
+    check fires across the window the ABI covers. 0x0209 -> ~1.3.0, which CVE-2023-4863 (< 1.3.2)
+    hits; the match is flagged ABI-approximate."""
+    from lykos.analyze.fingerprint import scan
+    root = _tree(tmp_path, {"src/webp/decode.h":
+                            "#ifndef WEBP_DECODE_H\n#define WEBP_DECODER_ABI_VERSION 0x0209\n#endif\n"})
+    hits = {h["library"]: h for h in source_scan.parse_source_tree(root)}
+    assert "libwebp" in hits
+    assert hits["libwebp"]["version"] == "1.3.0"
+    assert "ABI-approximate" in hits["libwebp"]["evidence"]
+    matched = {m.get("cve") or m.get("id") for m in scan.match(
+        [{"library": "libwebp", "name": "libwebp", "version": hits["libwebp"]["version"],
+          "evidence": hits["libwebp"]["evidence"]}])}
+    assert "CVE-2023-4863" in matched
+    # the fixed release (same ABI, so still 1.3.0-approximate) is why the flag says "verify": a
+    # true 1.3.2 is clear, and the curated range excludes it.
+    assert not scan.match([{"library": "libwebp", "name": "libwebp", "version": "1.3.2"}])

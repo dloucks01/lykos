@@ -136,6 +136,7 @@ COMPONENTS = {
     "pcre2": {"patterns": [r"PCRE2 (\d+\.\d+)"], "cves": []},
     "libxml2": {"patterns": [], "cves": []},          # detected from a vendored header (no banner)
     "freetype": {"patterns": [], "cves": []},
+    "libwebp": {"patterns": [], "cves": []},          # detected from WEBP_DECODER_ABI_VERSION (no banner)
     "mongoose": {"patterns": [r"Mongoose/(\d+\.\d+)"], "cves": []},
 }
 

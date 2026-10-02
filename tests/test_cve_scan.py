@@ -88,6 +88,7 @@ def test_every_shipped_cve_is_well_formed():
     # banner -- an empty binary-pattern list is correct for these.
     src_detected = {lib for lib, _ in source_scan._HEADER_MACROS}
     src_detected |= {lib for lib, _ in source_scan._COMBINED_MACROS}
+    src_detected |= {lib for lib, _, _ in source_scan._ABI_MACROS}      # ABI-version headers (libwebp)
     comps = scan._components()
     assert comps, "no components shipped at all"
     for lib, spec in comps.items():

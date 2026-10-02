@@ -61,6 +61,16 @@ _COMBINED_MACROS = [
                re.compile(r'#\s*define\s+PCRE2_MINOR\s+(\d+)'),
                re.compile(r'(?:\A|\Z)()'))),  # no patch component -> 0
 ]
+# Some libraries expose ONLY an ABI/version constant, never a dotted release string -- libwebp's
+# decode.h has `#define WEBP_DECODER_ABI_VERSION 0x0209` and nothing else. The ABI number is stable
+# across patch releases, so it maps to a release RANGE, not a point: this table gives the EARLIEST
+# release carrying each ABI, so a CVE range check (`lt X`) fires conservatively across the window
+# the ABI covers. It is intentionally operator-extensible -- add a library + its {abi: release}
+# column as new ABIs land. A match is flagged approximate (the exact patch needs another signal).
+_ABI_MACROS = [
+    ("libwebp", re.compile(r'#\s*define\s+WEBP_DECODER_ABI_VERSION\s+0x([0-9a-fA-F]+)'),
+     {0x0209: "1.3.0", 0x0208: "1.2.0", 0x0207: "1.1.0", 0x0200: "0.2.0"}),
+]
 _HEADER_SUFFIXES = (".h", ".hpp", ".hh", ".hxx", ".in")
 # requirements.txt line: name[extras] ==|=== exact-version  (only exact pins give a version)
 _REQ = re.compile(r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)\s*(?:\[[^\]]*\])?\s*===?\s*"
@@ -186,6 +196,14 @@ def parse_source_tree(root: Path) -> list:
                 if a and b and c:
                     ver = f"{a.group(1)}.{b.group(1)}.{c.group(1) or '0'}"
                     hits.append((lib, lib, ver, f"{base}: {lib} {ver} (MAJOR/MINOR/REVISION)"))
+            for lib, rx, abimap in _ABI_MACROS:
+                m = rx.search(text)
+                if not m:
+                    continue
+                ver = abimap.get(int(m.group(1), 16))
+                if ver:                                   # ABI maps to the earliest release with it
+                    hits.append((lib, lib, ver, f"{base}: {lib} ABI 0x{m.group(1)} "
+                                                f"-> ~{ver} (ABI-approximate; verify exact patch)"))
         for lk, nm, ver, ev in hits:
             found.setdefault((lk, ver), {"library": lk, "name": nm, "version": ver,
                                          "evidence": ev})
