@@ -553,6 +553,40 @@ def test_strlen_guard_on_the_result_register_bounds_a_double_indirected_source()
     assert got is not None and got["bound"] == 0x3f and got["nonneg"] is True
 
 
+def _loadp_into(out_reg, slot_disp, deref_off):
+    """`out = *(*(RBP+slot_disp) + deref_off)` -- a struct field read through a pointer, e.g.
+    `p->len` where p is a spilled parameter."""
+    seq = [f"INT_ADD reg:RBP:8 const:{slot_disp}:8 -> unique:0x20:8",
+           "LOAD const:0x1b1:8 unique:0x20:8 -> reg:RAX:8"]            # RAX = *(RBP+slot) = p
+    if deref_off:
+        seq.append(f"INT_ADD reg:RAX:8 const:{deref_off:#x}:8 -> reg:RAX:8")
+    seq.append(f"LOAD const:0x1b1:8 reg:RAX:8 -> reg:{out_reg}:8")      # out = *(p + off)
+    return seq
+
+
+def test_value_guard_bounds_a_pointer_dereferenced_length():
+    """A length that is a struct field `p->len` (a loadp, not a frame slot) bounded by a
+    dominating `if (p->len <= K)` is proven bounded -- correlated by the equality of the resolved
+    value token, since there is no frame slot to match. The length-operand analog of the source
+    correlation."""
+    guard = {"addr": "0x1000", "succ": ["0x3000", "0x2000"], "instructions": [
+        _i("0x1000", _loadp_into("EAX", "0xffffffffffffffb8", 0), "EAX = p->len"),   # p at RBP-0x48
+        _i("0x1004", _x86_cmp_reg("EAX", 0x40), "CMP EAX,0x40"),
+        _i("0x1008", _X86_COND["JA"][0] + ["CBRANCH ram:0x3000:8 " + _X86_COND["JA"][1]],
+           "JA 0x3000"),
+    ]}
+    blocks = [guard,
+              {"addr": "0x2000", "succ": ["0x3000"], "instructions": []},   # the memcpy block
+              {"addr": "0x3000", "succ": [], "instructions": []}]
+    value = ("loadp", ("load", "RBP", -0x48), 0)
+    got = bounds.value_guard_bound(blocks, "0x2000", value, ("RBP", "RSP"), 64,
+                                   bounds.dominators(blocks))
+    assert got is not None and got["bound"] == 0x40 and got["nonneg"] is True
+    # a DIFFERENT field (offset 4) is not what the guard measured -> no bound
+    assert bounds.value_guard_bound(blocks, "0x2000", ("loadp", ("load", "RBP", -0x48), 4),
+                                    ("RBP", "RSP"), 64, bounds.dominators(blocks)) is None
+
+
 def test_a_dereference_with_a_dominating_bound_is_separated_from_one_without():
     """`tainted_deref` reports every place input reaches a pointer -- 122 of them on jhead --
     and said nothing about which was unchecked, so the list was inventory. The dominating-guard

@@ -959,6 +959,15 @@ candidate recall 1.00 / fp_rate 0.571; corroborated recall 0.833 / fp_rate 0.214
 - **[PLANNED] Memory model beyond constant-offset frame slots.** `_apply` now tracks
   `[BASE + const]` spills (which is what made argv usable at -O0), but heap buffers, computed
   indices and aliasing are still invisible, and a `STORE` through a non-slot address drops taint.
+  - **[DONE] Pointer-dereference (loadp) resolution in the bounds slice.** `_slice_block` now
+    carries `*(*(BASE+c1)+c2)` as a canonical `('loadp', ptr, off)` token, so a copy SOURCE
+    (argv[1]) correlates across blocks and a copy LENGTH that is a struct field (`p->len`) is
+    bounded by a dominating guard on the same value (`value_guard_bound`, the length analog of
+    the frame-slot `guard_bound`). A guard bound that fits the FRAME BELOW the destination now
+    proves safety even when the decompiler fragmented the recovered variable. Corpus cases
+    `memcpy_ptr_len_guarded` (demoted) / `memcpy_ptr_len_unbounded` (still flagged) gate it.
+    Still not covered: heap buffers, computed/variable indices, aliasing (the taint `_apply`
+    side), and length operands that are neither a frame slot nor a single pointer dereference.
 - **[PLANNED] `argc` is not a taint source** (deliberate — a count, not data; see
   `ENTRY_PARAM_SOURCES`). Integer-overflow and bounds classes want it; it belongs in a size/range
   channel rather than the data-flow one, where it would push taint through every `argc` guard.

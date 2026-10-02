@@ -162,6 +162,27 @@ int main(int c, char**v){ char b[64];
            write(1,b,n); }
   return 0; }
 """, note="memcpy length clamped to the destination size before the copy"),
+    Case("memcpy_ptr_len_guarded", "CWE-120", "good", r"""
+#include <string.h>
+#include <unistd.h>
+#include <stdint.h>
+struct pkt { uint32_t len; char payload[256]; };
+static void handle(struct pkt *p){ char out[64];
+  if(p->len <= sizeof out){ memcpy(out, p->payload, p->len); } write(1,out,1); }
+int main(void){ char raw[512]; int n=read(0,raw,sizeof raw); (void)n;
+  handle((struct pkt*)raw); return 0; }
+""", note="length is a struct field p->len (pointer-dereferenced, not a frame slot) bounded by "
+         "a dominating check -- exercises value_guard_bound"),
+    Case("memcpy_ptr_len_unbounded", "CWE-120", "bad", r"""
+#include <string.h>
+#include <unistd.h>
+#include <stdint.h>
+struct pkt { uint32_t len; char payload[256]; };
+static void handle(struct pkt *p){ char out[64]; memcpy(out, p->payload, p->len); write(1,out,1); }
+int main(void){ char raw[512]; int n=read(0,raw,sizeof raw); (void)n;
+  handle((struct pkt*)raw); return 0; }
+""", note="same p->len length with NO bounding check -- must still be flagged, so the "
+         "value-guard demotion does not swallow a real overflow"),
 
     # ---- CWE-134: format strings that are literals (the sink is present and correct) ----
     Case("printf_literal_format", "CWE-134", "good", r"""

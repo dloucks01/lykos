@@ -447,28 +447,41 @@ def classify_site(instrs, site_addr, sink, frame, arch, bits=64,
                             f"is not a reliable bound here")}
         return None
     if not ln or ln[0] != "const":
-        # Not a constant -- but a dominating `if (n < sizeof buf)` bounds it just as firmly.
-        if ln and ln[0] == "load" and blocks and site_block:
-            g = guard_bound(blocks, site_block, (ln[1], ln[2]), bases=bases, dom=dom)
-            if g:
-                gmax, why = g["bound"], g["why"]
-                common = {"buffer": name, "capacity": room, "bound": gmax, "guard": True}
-                if gmax > room:
-                    soft = _over(gmax, f"a dominating check permits {gmax} bytes into "
-                                       f"{name} ({room} recovered)")
-                    return soft or {"verdict": SUSPECT, **common,
-                                    "why": (f"{why}, but {name} holds only {room} -- the "
-                                            f"check does not protect the buffer")}
-                if not g["nonneg"]:
-                    # The upper bound is real and it is not a bound: the comparison is signed
-                    # and nothing dominating excludes a negative length, which the sink reads
-                    # as a 64-bit unsigned size.
-                    return {"verdict": SIGNED, **common, "signed": True,
-                            "why": (f"{why}, but the check is SIGNED and nothing excludes a "
-                                    f"negative length: n = -1 passes it and {sink} takes the "
-                                    f"length as an unsigned size, so {name} ({room} bytes) "
-                                    f"overflows")}
+        # Not a constant -- but a dominating `if (n < sizeof buf)` bounds it just as firmly. A
+        # frame-slot length is matched by its slot; a pointer-dereferenced one (a struct field
+        # like `p->len`) is matched by the equality of its resolved value token.
+        g = None
+        if blocks and site_block and ln:
+            if ln[0] == "load":
+                g = guard_bound(blocks, site_block, (ln[1], ln[2]), bases=bases, dom=dom)
+            elif ln[0] == "loadp":
+                g = value_guard_bound(blocks, site_block, ln, bases, bits, dom=dom)
+        if g:
+            gmax, why = g["bound"], g["why"]
+            common = {"buffer": name, "capacity": room, "bound": gmax, "guard": True}
+            # A guard that still permits a copy PAST the frame below the destination is a real
+            # concern (surfaced, never asserted -- the recovered size may be a fragment). Within
+            # the frame it is safe: the decompiler splits one buffer into several locals, so a
+            # bound that overruns the recovered variable yet fits the frame below it is the guard
+            # proving containment of a fragmented buffer, not an overflow.
+            if gmax > room and gmax > headroom:
+                return {"verdict": SUSPECT, **common,
+                        "why": (f"{why}, but that exceeds the {headroom}-byte frame below {name} "
+                                f"-- the check does not protect the buffer")}
+            if not g["nonneg"]:
+                # The upper bound is real and it is not a bound: the comparison is signed
+                # and nothing dominating excludes a negative length, which the sink reads
+                # as a 64-bit unsigned size.
+                return {"verdict": SIGNED, **common, "signed": True,
+                        "why": (f"{why}, but the check is SIGNED and nothing excludes a "
+                                f"negative length: n = -1 passes it and {sink} takes the "
+                                f"length as an unsigned size, so {name} ({room} bytes) "
+                                f"overflows")}
+            if gmax <= room:
                 return {"verdict": SAFE, **common, "why": f"{why}; {name} holds {room}"}
+            return {"verdict": SAFE, **common,
+                    "why": f"{why}; fits the {headroom}-byte frame below {name} "
+                           f"(recovered {room}, likely a fragment)"}
         return {"verdict": UNKNOWN, "buffer": name, "capacity": room,
                 "why": f"length is not a compile-time constant ({name}, {room} bytes)"}
     n = ln[1]
@@ -580,6 +593,30 @@ def strlen_bound(blocks, site_block, site_addr, src, strlen_sites, bases, bits, 
     return None
 
 
+def _edge_pred_bound(got, succ, reaching, site_block):
+    """(upper bound, nonneg) a branch predicate proves on the paths that reach the copy, or None.
+
+    `got` is branch_predicate's (taken target, predicate); `reaching` is the copy's dominator
+    set. The single-comparison form used by the register/value guards -- guard_bound keeps the
+    richer cross-block lower-bound accumulation for frame slots.
+    """
+    target, (_tag, rel, k, signed) = got
+
+    def here(x):
+        return x in reaching or x == site_block
+    other = [x for x in succ if x != target and here(x)]
+    if here(target) and other:
+        return None                               # both edges reach the copy: no constraint
+    holds = rel if here(target) else (_NEGATE[rel] if other else None)
+    fn = _UPPER.get(holds) if holds else None
+    if fn is None or k <= 0:
+        return None
+    cand = fn(k)
+    if cand <= 0:
+        return None
+    return cand, (signed is False or holds == "eq")
+
+
 def _strlen_reg_guard(blk, sl_site, site_block, retregs, bases, dom):
     """Bound from a guard that compares a call's RESULT REGISTER directly (no spill): the branch
     lives in the call's own block, so the result register is the bounded value on the
@@ -595,21 +632,74 @@ def _strlen_reg_guard(blk, sl_site, site_block, retregs, bases, dom):
         got = branch_predicate(after, ("reg", rr), bases)
         if not got:
             continue
-        target, (_t, rel, k, signed) = got
-        here = lambda x: x in reaching or x == site_block
-        other = [x for x in succ if x != target and here(x)]
-        if here(target) and other:
-            continue                              # both edges reach the copy: no constraint
-        holds = rel if here(target) else (_NEGATE[rel] if other else None)
-        fn = _UPPER.get(holds) if holds else None
-        if fn is None or k <= 0:
+        r = _edge_pred_bound(got, succ, reaching, site_block)
+        if r is None:
             continue
-        cand = fn(k)
-        if cand <= 0:
-            continue
-        return {"bound": cand, "nonneg": (signed is False or holds == "eq"),
+        cand, nn = r
+        return {"bound": cand, "nonneg": nn,
                 "why": f"a dominating check permits a source length of at most {cand}"}
     return None
+
+
+def _reg_holding(ins, value, bases, bits):
+    """A register that holds `value` at the end of the block, and the index of the last
+    instruction that defines it. Lets a value-based guard seed the comparison: the guard loads
+    the length into a register and tests it in its own block, so the branch is read over the
+    instructions AFTER this definition (the register then IS the bounded value)."""
+    vals, _ = _slice_block(ins, None, bases, bits)       # None addr: never matches, slice it all
+    reg = next((k[1] for k, v in vals.items() if k[0] == "reg" and v == value), None)
+    if reg is None:
+        return None, None
+    from .taint import _REG_FAMILY
+    fam = {_canon_reg(r) for r in _REG_FAMILY.get(_canon_reg(reg), (reg,))}
+    last = None
+    for i, instr in enumerate(ins):
+        for pc in instr.get("pcode", []) or []:
+            if " -> " in pc:
+                out = _key(pc.split(" -> ", 1)[1].strip())
+                if out and out[0] == "reg" and _canon_reg(out[1]) in fam:
+                    last = i
+    return reg, last
+
+
+def value_guard_bound(blocks, site_block, value, bases, bits, dom=None):
+    """Bound a length whose VALUE is `value` -- a loadp/load token such as a struct field
+    `p->len` that is not a frame slot -- by a dominating guard comparing the SAME value.
+
+    guard_bound matches a frame SLOT by the address a comparison loads; a pointer-dereferenced
+    length has no slot, so correlate it by equality of the slice token instead (the principle
+    that correlates a strcpy source with its strlen). The guard loads the value into a register
+    and compares it within its block, so the branch is read over the instructions after that
+    register is defined, with it seeded as the bounded value."""
+    by_addr = {b["addr"]: b for b in blocks}
+    dom = dominators(blocks) if dom is None else dom
+    reaching = dom.get(site_block, ())
+    best = None
+    nonneg = False
+    for d in reaching:
+        if d == site_block:
+            continue
+        blk = by_addr.get(d)
+        if not blk:
+            continue
+        ins = blk.get("instructions", []) or []
+        reg, idx = _reg_holding(ins, value, bases, bits)
+        if reg is None:
+            continue
+        got = branch_predicate(ins[idx + 1:], ("reg", reg), bases)
+        if not got:
+            continue
+        r = _edge_pred_bound(got, blk.get("succ", []) or [], reaching, site_block)
+        if r is None:
+            continue
+        cand, nn = r
+        nonneg = nonneg or nn
+        if best is None or cand < best:
+            best = cand
+    if best is None:
+        return None
+    return {"bound": best, "nonneg": nonneg,
+            "why": f"a dominating check permits a length of at most {best}"}
 
 
 def classify_nul_site(instrs, site_addr, sink, frame, arch, bits, blocks, site_block,
