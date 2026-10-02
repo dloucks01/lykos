@@ -130,11 +130,20 @@ that returns a bounded value"). The caller-parameter-bound direction into a copy
 src,n)` whose body is the sink) needs the destination pointer resolved across the call — that is
 inter-procedural points-to (1.2 territory), tracked separately and not attempted here.
 
-**1.4 `argc` as a size/range source.** (S) Deliberately excluded from the data-flow channel (a count,
-not data). Integer-overflow and bounds classes want it. *Approach:* a separate **size/range** source
-set feeding only `int_overflow` and `bounds`, never the data-flow taint (which would push taint
-through every `argc` guard). *Acceptance:* `malloc(argc*K)` int-overflow fixture flags; no new
-data-flow FPs.
+**1.4 `argc` as a size/range source.** (S) ✅ **DONE.** `argc` stays out of the data-flow taint
+channel (a count, not data; tainting it would push taint through every `argc` guard), but the detect
+stage now treats the entry function that receives it as scanned for the integer-overflow shapes
+(`touched |= entry_seeds`) and `_intover_candidates` gained an allocation-size-wrap detector: a
+narrow (sub-pointer-width) arithmetic feeding an allocator's size argument — `malloc(argc*K)`,
+`calloc`/`realloc` sizes — emits `int_overflow_alloc` (CWE-190). A constant operand is allowed here
+(`n*elemsize` is the canonical overflow, not a loop counter), kept quiet by confining it to
+allocator size args. *Acceptance (met):* `malloc(argc*4096)` flags CWE-190 and a constant-size
+allocation does not (`tests/test_argc_sizesource.py`); it is a candidate-grade channel, so no
+data-flow taint and no change to the corroborated eval-gate (still 8/0/0, 0 FP).
+
+**Phase 1 complete** (1.1–1.4). The taint engine now carries value origins across blocks, taints
+through heap/computed addresses, propagates callee return bounds, and treats `argc` as a size source
+— each behind its own flag, each eval-gate-neutral, with regression tests.
 
 ---
 

@@ -93,9 +93,19 @@ def _deref_candidates(derefs, functions, guards=None):
 _CMP_OPS = {"INT_LESS", "INT_LESSEQUAL", "INT_SLESS", "INT_SLESSEQUAL", "INT_EQUAL",
             "INT_NOTEQUAL"}
 _ADD_OPS = {"INT_ADD", "INT_MULT", "INT_LEFT"}
+# allocators whose size argument a wrapping narrow arithmetic makes too small (P1.4)
+_ALLOC_NAMES = {"malloc", "calloc", "realloc", "reallocarray", "alloca", "valloc",
+                "aligned_alloc", "memalign", "pvalloc"}
 
 
-def _intover_candidates(func_irs, functions, only=None, width=4, ptr_bytes=8):
+def _reg_name(tok):
+    """`reg:EAX:4` -> `EAX`, else None."""
+    parts = (tok or "").split(":")
+    return parts[1] if len(parts) >= 2 and parts[0] == "reg" else None
+
+
+def _intover_candidates(func_irs, functions, only=None, width=4, ptr_bytes=8,
+                        alloc_sites=None, argregs=None):
     """Sums narrower than a pointer that are then COMPARED: a check the sum can wrap past.
 
     `only` restricts this to the functions attacker data actually reaches. Without it the
@@ -108,11 +118,26 @@ def _intover_candidates(func_irs, functions, only=None, width=4, ptr_bytes=8):
     A `width`-byte add is only that hazard when `width < ptr_bytes`; on a 32-bit target a
     32-bit add is pointer-width and cannot wrap past a pointer, so flagging it as CWE-190 was
     a false positive. When the sum is not narrower than a pointer, this channel emits nothing.
+
+    `alloc_sites` {site_addr: allocator_name} + `argregs` (the arch's argument registers) add the
+    allocation-SIZE-wrap shape (P1.4): a narrow arithmetic -- `count * elemsize`, `n + hdr` -- that
+    feeds an allocator's size argument. The wrap produces a tiny allocation the rest of the code
+    then overflows. Unlike the comparison shape a CONSTANT operand is allowed here (`n * 4` is the
+    canonical overflow, not a loop counter), and the allocator restriction keeps it quiet. This is
+    what lets `argc` matter: `argc` is a size/range source, not data-flow taint, so its function is
+    scanned (see `touched`) and `malloc(argc * K)` is flagged without pushing taint through argc.
     """
     names = {f.addr: f.name for f in functions}
     out = []
     if width >= ptr_bytes:
         return out                           # not narrower than a pointer: cannot wrap past it
+    alloc_sites = alloc_sites or {}
+    # the registers an allocator takes its size in: arg0 (malloc/alloca/valloc), and arg1
+    # (realloc) / arg0-1 (calloc). Checking the first two argument registers covers them.
+    size_regs = set()
+    for ri in (0, 1):
+        if argregs and ri < len(argregs):
+            size_regs |= set(argregs[ri])
     for faddr, ir in (func_irs or {}).items():
         if only is not None and faddr not in only:
             continue
@@ -121,17 +146,41 @@ def _intover_candidates(func_irs, functions, only=None, width=4, ptr_bytes=8):
             # consumes its result are separate machine instructions, so clearing it per
             # instruction erased the sum before the compare was ever seen. Reset per block.
             produced: dict = {}
+            # reghold: a register currently carrying a narrow product/sum with >=1 non-const
+            # operand (the allocation-size-wrap candidate), propagated through COPY/extension.
+            reghold: dict = {}
             for i in b.get("instructions", []) or []:
                 for pc in i.get("pcode", []) or []:
                     mnem, args, outk = _pcode(pc)
                     if mnem in _ADD_OPS and outk and _tok_width(outk) == width:
+                        nonconst = [t for t in args if not t.startswith("const:")]
                         # BOTH addends must be values. `i + 1 < n` is a loop, not a hazard,
                         # and allowing a constant addend flagged sixteen extra functions in
                         # jhead -- a pointer bump or a loop counter in nearly every one. The
                         # shape that wraps is two attacker-sized quantities added together:
                         # an offset plus a count, which is jhead's bug exactly.
-                        if all(not t.startswith("const:") for t in args):
+                        if len(nonconst) == len(args):
                             produced[outk] = mnem
+                        # allocation-size shape allows a const multiplier (`n * elemsize`); it
+                        # is confined to allocator size args below, so it does not add noise.
+                        if nonconst:
+                            reghold[outk] = mnem
+                            rn = _reg_name(outk)
+                            if rn:
+                                reghold[rn] = mnem
+                    elif mnem in ("COPY", "INT_ZEXT", "INT_SEXT", "SUBPIECE") and outk and args:
+                        src = args[0]
+                        held = src in reghold or (_reg_name(src) in reghold if _reg_name(src) else False)
+                        if held:
+                            m = reghold.get(src) or reghold.get(_reg_name(src))
+                            reghold[outk] = m
+                            rn = _reg_name(outk)
+                            if rn:
+                                reghold[rn] = m
+                        else:
+                            rn = _reg_name(outk)
+                            if rn:
+                                reghold.pop(rn, None)        # redefined by a non-product -> clear
                     elif mnem in _CMP_OPS:
                         hit = next((k for k in args if k in produced), None)
                         if hit is None:
@@ -160,6 +209,27 @@ def _intover_candidates(func_irs, functions, only=None, width=4, ptr_bytes=8):
                                                      f"{i.get('addr')} in {fn}")}],
                         })
                         break
+                # allocation-size wrap: this instruction is an allocator call whose size argument
+                # is carrying a narrow product/sum (P1.4).
+                sink = alloc_sites.get(i.get("addr"))
+                if sink and size_regs:
+                    m = next((reghold[r] for r in size_regs if r in reghold), None)
+                    if m is not None:
+                        fn = names.get(faddr) or str(faddr)
+                        out.append({
+                            "cwe": "CWE-190", "severity": "medium", "state": "candidate",
+                            "confidence": 0.35, "detector": "int_overflow_alloc",
+                            "title": (f"Allocation size from {width * 8}-bit arithmetic that can "
+                                      f"wrap"),
+                            "function_addr": faddr, "site_addr": i.get("addr"),
+                            "dedup_key": "CWE-190:int_overflow_alloc",
+                            "site_detail": (f"{m} at {width * 8} bits feeds the size of {sink}() in "
+                                            f"{fn}: if it wraps, the allocation is far too small "
+                                            f"and the following writes overflow it"),
+                            "evidence": [{"channel": "pcode",
+                                          "detail": (f"{m} -> {sink} size argument at "
+                                                     f"{i.get('addr')} in {fn}")}],
+                        })
     return out
 
 
@@ -483,8 +553,20 @@ def detect_stage(ctx) -> dict:
     touched = {d["function_addr"] for d in derefs}
     touched |= {c["function_addr"] for c in cands
                 if c.get("site_addr") in tainted_sites and c.get("function_addr")}
+    # P1.4: argc is a size/range source, not data-flow taint -- so scan the entry function (which
+    # receives argc) for the integer-overflow/allocation shapes without pushing taint through every
+    # argc guard. entry_seeds keys are the argv/argc entry points.
+    touched |= set(entry_seeds or ())
+    _alloc_sites = {}
+    for e in dctx.call_edges:
+        from .catalog import normalize as _norm
+        if e.site_addr and _norm(e.dst_name) in _ALLOC_NAMES:
+            _alloc_sites[e.site_addr] = _norm(e.dst_name)
+    _ak = bounds._arch_key(target.arch)
+    _argregs = (bounds.ARCH_ABI.get(_ak) or {}).get("args") if _ak else None
     cands += _intover_candidates(func_irs, dctx.functions, only=touched,
-                                 ptr_bytes=(target.bits or 64) // 8)
+                                 ptr_bytes=(target.bits or 64) // 8,
+                                 alloc_sites=_alloc_sites, argregs=_argregs)
     for c in cands:
         if c["detector"] == "dangerous_api" and c.get("site_addr") in tainted_sites:
             c["state"] = "corroborated"
