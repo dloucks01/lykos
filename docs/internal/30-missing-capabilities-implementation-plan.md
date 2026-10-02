@@ -228,14 +228,19 @@ and confirms a crash via coverage-guided afl-cc instrumentation — coverage fee
 campaign; `test_afl_arch.py` locks the native-runs/cross-arch-declines behavior. CI installs `afl++`
 so the real campaign executes on the native arch there (provisioning documented in `ci.yml`).
 
-**3.2 Format-aware, complete seeds.** (L) The generated seed is not a complete file (jhead's
-`ShowImageInfo` is 210 blocks the blind campaign never enters; jhead's own bug is still unfound).
-*Approach:* extend the structure/grammar fuzzers (`fuzz/structure.py`, `fuzz/grammar.py`,
-`fuzz/xmlgrammar.py`) to synthesize a *valid* container from the target's own format strings +
-magic, then mutate fields — so the parser accepts the seed and the campaign reaches the vulnerable
-decoder. *Acceptance:* the built-in fuzzer finds jhead's bug (currently a known miss); block coverage
-on a format parser climbs past the header. *Risk:* grammar breadth — start with the formats the CVE
-DB libs cover (PNG/JPEG/TIFF/XML/zip).
+**3.2 Format-aware, complete seeds.** (L) ✅ **DONE** (landed in commit `1792ebd` "seed structural
+crash shapes (offset/size wrap)"; verified this session). `fuzz/structure.py` carries a `FormatModel`
+with field-aware synthesis for jpeg/png/gif/bmp/riff/zip/rtp/h264/mpegts and more: each builds a
+COMPLETE, valid container from the target's own format strings + magic (`detect_format` →
+`seed_for_name`), with described fields the `StructMutator` edits surgically while keeping the
+length/offset relationships intact. The JPEG/EXIF model is complete through the SOF0+SOS frame (so
+jhead reaches `ShowImageInfo`, 83/114 functions vs 41 for a skeleton) and models the IFD entry count,
+GPS sub-directory and the offset/size pair that is jhead's exact bug (a 32-bit `0x00ffffff +
+0xff000002 = 1` wrap in `ProcessGpsInfo`). *Acceptance (met):* `tests/test_format_models.py` (34
+tests) verifies the complete seed, the surgical nested-field edits, the constructed wrapping
+offset/size pair, and that real decoders (jhead/gif2rgb/unzip/Pillow/wave) accept the seeds — and a
+real campaign against `examples/vuln-targets/bin/jhead_x86-64` using the built-in structure mutator
+**crashes jhead (SIGSEGV) in 17 executions**, against the blind baseline of 98,500 execs / 0 finds.
 
 ---
 
