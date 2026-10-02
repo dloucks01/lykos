@@ -857,6 +857,14 @@ class DynResultDAO(BaseDAO):
              isolation, duration_ms, stdout_sha, stderr_sha, note, fault_pc, defect_key, _now()))
         return rid
 
+    def count_crashed_by_run(self, run_id: str) -> int:
+        """How many crashing executions a run recorded -- the run's crash YIELD. Lets a run row
+        say `3 crashes` vs `0 crashes` instead of a bare DONE that reads like success whether or
+        not it found anything (doc 30 P5.5)."""
+        r = self.conn.execute(
+            "SELECT COUNT(*) c FROM dyn_result WHERE run_id=? AND crashed=1", (run_id,)).fetchone()
+        return int(r["c"]) if r else 0
+
     def fault_pc_for(self, target_id: str, input_sha: str) -> Optional[int]:
         """Where this input faulted, as recorded by the run that found it.
 

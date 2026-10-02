@@ -329,7 +329,10 @@ class Handler(EndpointsMixin, AutopilotMixin, BaseHTTPRequestHandler):
         if path == "/events" and "websocket" in self.headers.get("Upgrade", "").lower():
             if not self._guard_local():
                 return
-            return self._ws_events(qs.get("case_id", [None])[0])
+            # `after` is the resume cursor: 0 (the default) replays the stored event log on connect
+            # so a case with history is not an empty Live Events pane (doc 30 P5.6); a reconnecting
+            # client passes the last id it saw to stream only what is new.
+            return self._ws_events(qs.get("case_id", [None])[0], _int_param(qs, "after", 0))
         # WebSocket upgrade for the interactive detonation console
         if path == "/console" and "websocket" in self.headers.get("Upgrade", "").lower():
             if not self._guard_local():
@@ -371,7 +374,9 @@ class Handler(EndpointsMixin, AutopilotMixin, BaseHTTPRequestHandler):
             if m:
                 s = self._store()
                 try:
-                    return self._json([_run(r) for r in s.runs.list_by_case(m.group(1))])
+                    _dd = DynResultDAO(s.conn)            # imported at module top
+                    return self._json([_run(r, crashes=_dd.count_crashed_by_run(r.id))
+                                       for r in s.runs.list_by_case(m.group(1))])
                 finally:
                     s.close()
             m = _TARGET_FUNCS.match(path)
@@ -709,7 +714,7 @@ class Handler(EndpointsMixin, AutopilotMixin, BaseHTTPRequestHandler):
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
 
-    def _ws_events(self, case_id: Optional[str]):
+    def _ws_events(self, case_id: Optional[str], after: int = 0):
         key = self.headers.get("Sec-WebSocket-Key")
         if not key:
             return self._json({"error": "missing Sec-WebSocket-Key"}, 400)
@@ -728,11 +733,10 @@ class Handler(EndpointsMixin, AutopilotMixin, BaseHTTPRequestHandler):
         conn = connect(self.db_path)
         try:
             ed = EventDAO(conn)
-            # start after the current tail so the client sees live events
-            row = conn.execute(
-                "SELECT MAX(id) AS m FROM event WHERE case_id IS ? OR ? IS NULL",
-                (case_id, case_id)).fetchone()
-            cursor = int(row["m"]) if row and row["m"] is not None else 0
+            # Start at `after` (0 = replay the whole stored log on connect, so a case with history
+            # is not an empty pane; a resuming client passes its last id). The loop then streams
+            # everything after the cursor and keeps going live.
+            cursor = max(0, int(after))
             while not stop.is_set():
                 evs = ed.list(case_id=case_id, after_id=cursor, limit=200) if case_id \
                     else ed.list(after_id=cursor, limit=200)

@@ -96,11 +96,17 @@ def _function(f, code=False):
     return d
 
 
-def _run(r):
-    return {"id": r.id, "case_id": r.case_id, "target_id": r.target_id, "stage": r.stage,
-            "status": r.status, "error": r.error, "attempts": r.attempts,
-            "cache_key": r.cache_key, "created_at": r.created_at,
-            "started_at": r.started_at, "ended_at": r.ended_at}
+def _run(r, *, crashes=None):
+    d = {"id": r.id, "case_id": r.case_id, "target_id": r.target_id, "stage": r.stage,
+         "status": r.status, "error": r.error, "attempts": r.attempts,
+         "cache_key": r.cache_key, "created_at": r.created_at,
+         "started_at": r.started_at, "ended_at": r.ended_at}
+    if crashes is not None:
+        # the run's YIELD, so a `DONE` row is not read as success whether or not it found anything
+        # (doc 30 P5.5): the number of crashing executions this run recorded (0 for a stage that
+        # does not run the target).
+        d["crashes"] = crashes
+    return d
 
 
 def _event(e):

@@ -254,6 +254,32 @@ def test_event_websocket_stream(api, sample_elf):
         ws.close()
 
 
+def test_event_websocket_backfills_history_on_connect(api, sample_elf):
+    """P5.6: the Live Events stream replays the stored log on connect, so a case that already has
+    history is not an empty pane. Here the upload (and its events) happen BEFORE the WebSocket
+    connects, yet the stream still delivers them."""
+    _, c = _json(api, "POST", "/cases", {"name": "backfill"})
+    _, up = _upload(api, c["id"], "default", sample_elf.read_bytes())   # events created pre-connect
+    time.sleep(1.0)                                                      # let triage emit some
+    ws = _ws_connect(api, c["id"])                                      # connects with no `after`
+    try:
+        seen = set()
+        deadline = time.time() + 6
+        while time.time() < deadline:
+            try:
+                ev = _ws_read(ws, timeout=3.0)
+            except socket.timeout:
+                break
+            if ev in (None, "__close__"):
+                break
+            seen.add(ev["type"])
+            if len(seen) >= 1:
+                break
+        assert seen, "the WS replayed no pre-connect history"
+    finally:
+        ws.close()
+
+
 def test_case_findings_board(tmp_path):
     """Case-level findings board endpoint aggregates findings across targets, enriched with
     target filename/arch and best PoC level."""

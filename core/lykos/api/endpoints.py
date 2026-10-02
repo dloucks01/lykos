@@ -580,7 +580,10 @@ class EndpointsMixin:
                                 "kind": art.kind if art else None})
             cachehit = any(e.type == "job.cachehit"
                            for e in s.events.list(run_id=rid, limit=1000))
-            return self._json({**_run(r), "outputs": outputs, "from_cache": cachehit})
+            from ..db.dao import DynResultDAO
+            crashes = DynResultDAO(s.conn).count_crashed_by_run(rid)
+            return self._json({**_run(r, crashes=crashes), "outputs": outputs,
+                               "from_cache": cachehit})
         finally:
             s.close()
 

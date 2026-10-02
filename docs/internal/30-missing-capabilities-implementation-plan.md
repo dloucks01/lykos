@@ -279,19 +279,25 @@ a libwebp binary with CVE-2023-4863's version matches.
 
 ## Phase 5 — Dynamic & UX polish (small, independent)
 
-- **5.1 `debug_monitor` beyond the loader.** (M) Its 13 recorded calls on a real target were mostly
-  `ld.so`. Filter to the target's own address range and set symbol breakpoints on user code.
-- **5.2 `boundary_fuzz` graceful on inapplicable targets.** (S) Returns `error` for a single-binary
-  target with no boundary; make it a clean `skipped`/no-op (like the self-gating stages).
-- **5.3 PE `behavior_trace`/monitor.** (M) The Wine `+relay` monitor exists; extend the behavior
-  trace + execution/crash path to PE so Windows targets get the same loop as ELF.
+- **5.1 `debug_monitor` beyond the loader.** (M) ✅ **DONE** (already in place). `program_calls`
+  splits the monitor log into the executable's own address range vs `ld.so` and the stage reports
+  `loader_calls_excluded`, so the recorded calls are user-code, not loader startup (monitor_stage.py).
+- **5.2 `boundary_fuzz` graceful on inapplicable targets.** (S) ✅ **DONE** (already in place). The
+  harness stage treats a single binary with no IPC channel as `applicable: False` and returns
+  cleanly — "Not applicable, not an error" — rather than a failed run (harness_stage.py).
+- **5.3 PE `behavior_trace`/monitor.** (M) ✅ **DONE** (already in place). `trace_stage._win_behavior_trace`
+  traces a Windows PE's own Win32 API calls under Wine `+relay` (exec/net/wx/inject/antidebug,
+  attributed to the exe's mapped range) and declines cleanly when Wine is absent.
 - **5.4 Stage parameter consistency.** (M) `dynamic_run` and others accept inconsistent params and
   fail silently. Add a per-stage param schema + validation that fails loud (surfaces in the run
   record), and a test that every registered stage declares its params.
-- **5.5 Runs list shows yield.** (S) `fuzz · 177s · DONE` that found nothing reads like success.
-  Show found/none (and crash count) in the run row.
-- **5.6 Live Events backfill.** (S) The WebSocket starts at connect, so a case with history shows an
-  empty Live Events. Replay the stored event log on connect.
+- **5.5 Runs list shows yield.** (S) ✅ **DONE.** The run serializer now carries `crashes` (the
+  crashing executions the run recorded, via `DynResultDAO.count_crashed_by_run`), so a `DONE` row
+  shows `0 crashes` vs `3 crashes` instead of reading like success regardless. `tests/test_api_routes.py`.
+- **5.6 Live Events backfill.** (S) ✅ **DONE.** `_ws_events` now starts its cursor at an `after`
+  query param defaulting to 0, so the WebSocket replays the stored event log on connect (a case
+  with history is no longer an empty pane) then streams live; a reconnecting client passes its last
+  id to resume. `tests/test_api.py::test_event_websocket_backfills_history_on_connect`.
 - **5.7 Second positive L2 target.** (S) Close out the open L2 validation (doc 20 §F): a second
   real program driven to a demonstrated primitive, beyond the ncompress/jhead fixtures.
 
