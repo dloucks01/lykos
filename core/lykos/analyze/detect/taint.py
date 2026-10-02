@@ -315,6 +315,12 @@ def _apply(taint, ops, bases=(), aliases=None, mem_out=None, via=None):
 
         if outk is not None and mnem in _ADDR_ARITH:
             via[outk] = [k for k in ins if k is not None]
+        elif outk is not None:
+            # A definition we do NOT track as an address computation (a non-slot LOAD, an
+            # arithmetic/logical op outside _ADDR_ARITH) kills any origin this key carried in from
+            # a predecessor block (seeded `via`, P1.1). Within a single block the key starts
+            # unbound, so popping it is a no-op for the intra-block callers.
+            via.pop(outk, None)
         _define(taint, outk, any(k in taint for k in ins))
 
         # The ADDRESS of tainted memory is itself a tainted pointer -- and this has to come
@@ -369,6 +375,43 @@ def _origins(key, via, depth=8):
             break
         frontier = nxt
     return order
+
+
+def _carry_origins(via):
+    """The part of a block's exit `via` that is STABLE across a block boundary (P1.1).
+
+    `via` keys are register, stack-slot or `unique` p-code temporaries. Uniques are block-local
+    (the next block's p-code reuses the numbers for unrelated values), so only register- and
+    stack-keyed values are carried; each is resolved to the frame-slot origin(s) a guard compares,
+    so the successor block sees the origin in one hop.
+    """
+    out = {}
+    for k in list(via):
+        if isinstance(k, tuple) and k and k[0] in ("reg", "stack"):
+            origins = [o for o in _origins(k, via)
+                       if o != k and isinstance(o, tuple) and o[0] == "stack"]
+            if origins:
+                out[k] = origins
+    return out
+
+
+def _merge_origins(maps):
+    """Merge predecessor origin maps at a block entry. A binding is carried only when EVERY
+    predecessor agrees on it (same key, same origin set) -- the intersection. This is what keeps
+    it sound: if the paths into a block disagree about where a value came from, no slot is claimed,
+    so a guard on one path cannot be fabricated onto the merged value."""
+    maps = [m for m in maps if m]
+    if not maps:
+        return {}
+    common = set(maps[0])
+    for m in maps[1:]:
+        common &= set(m)
+    out = {}
+    for k in common:
+        vals = [tuple(m[k]) for m in maps]
+        if all(v == vals[0] for v in vals):
+            out[k] = list(vals[0])
+    return out
 
 
 def _has_abi(abi):
@@ -562,6 +605,31 @@ def _run(ir, abi, callmap, dstmap, func_addrs, entry_params, ret_tainted, *, ove
         if not changed:
             break
 
+    # Inter-block taint-origin tracking (doc 30 P1.1): the per-block `via` chain drops a value's
+    # frame-slot origin at a block boundary, so a guard in one block and the dereference it
+    # protects in another never resolve to the same slot (the computed-index-at-O2 miss in doc 20).
+    # Carry the register/stack origin map across edges, merged at entry like the taint set. Register
+    # and stack keys are block-stable; uniques are not and are dropped (_carry_origins). Guarded by
+    # a flag so the effect on dataflow precision can be measured before/after (default on).
+    import os as _os3
+    interblock = mem_out is not None and _os3.environ.get("LYKOS_INTERBLOCK_ORIGINS", "1") != "0"
+    VIA_OUT = {a: {} for a in order}
+    if interblock:
+        for _ in range(len(blocks) * 4 + 10):
+            vchanged = False
+            for a in order:
+                vvia = dict(_merge_origins([VIA_OUT[p] for p in preds[a]]))
+                valias, tdummy = {}, set()
+                for instr in by_addr[a]["instructions"]:
+                    _apply(tdummy, instr.get("pcode", []), abi.get("frame", ()),
+                           valias, None, vvia)
+                vout = _carry_origins(vvia)
+                if vout != VIA_OUT[a]:
+                    VIA_OUT[a] = vout
+                    vchanged = True
+            if not vchanged:
+                break
+
     flagged, contribs = set(), {}
     for a in order:
         cur = set()
@@ -571,7 +639,8 @@ def _run(ir, abi, callmap, dstmap, func_addrs, entry_params, ret_tainted, *, ove
             cur |= pre
         pushes, aliases = [], {}
         acc = [] if mem_out is not None else None
-        via: dict = {}                  # per block, like aliases: the chain spans instructions
+        # the origin chain, seeded from predecessors (P1.1) so it spans blocks, not just instrs
+        via: dict = dict(_merge_origins([VIA_OUT[p] for p in preds[a]])) if interblock else {}
         for instr in by_addr[a]["instructions"]:
             transfer(cur, instr, flagged, contribs, pushes, aliases, acc, via)
         for x in (acc or ()):

@@ -80,17 +80,22 @@ This is the root enabler: doc 20's "memory model beyond constant-offset frame sl
 indices", and "guard reasoning is intra-procedural" all reduce to the taint engine (`detect/taint.py`)
 losing a value's origin across blocks/calls and dropping taint at non-slot memory.
 
-**1.1 Inter-block taint-origin tracking.** (L) `via` is reset per block (`taint.py` ~L574), so the
-frame slot an index/length was loaded from is lost before the deref's block — which is exactly why
-the computed-index guard reads as UNCHECKABLE at -O2 (doc 20; investigated and the register-name
-shortcut rejected as unsound). Carry a live value's origin (its `("stack", base, off)` key) across
-block boundaries alongside the taint set that already spans blocks. *Approach:* extend the per-block
-`via` into a worklist-carried origin map keyed by live register/slot, merged at block entry like the
-taint set. *Acceptance:* the `-O2` guarded-index fixture (`if (i<N) buf[i]=…`) resolves the index to
-its frame slot, and the existing **sound** slot-based `guard_bound`/`classify_derefs` marks it
-GUARDED — with the unguarded sibling still UNKNOWN (no fabricated guard). Add both as corpus cases.
-*Risk:* touches core dataflow precision broadly → land behind a flag, diff `eval-gate` before/after,
-require no FN change.
+**1.1 Inter-block taint-origin tracking.** (L) ✅ **DONE.** `via` was reset per block (`taint.py`),
+so the frame slot an index/length was loaded from was lost before the deref's block — exactly why
+the computed-index guard read as UNCHECKABLE at -O2 (doc 20; the register-name shortcut had been
+rejected as unsound). Now a register/stack→frame-slot origin map is carried across block edges and
+merged at block entry (`_merge_origins`, intersection — a binding survives a join only if every
+predecessor agrees, so nothing is fabricated), with `_apply` killing a carried origin on any
+redefinition it does not itself track. Uniques (block-local p-code temps) are not carried
+(`_carry_origins`). Gated by `LYKOS_INTERBLOCK_ORIGINS` (default on) so the before/after is testable.
+*Acceptance (met):* the `-O2` `if (i<N) buf[i]=…` fixture — with the guard and the use in separate
+blocks — resolves the index to its slot and the sound `guard_bound`/`classify_derefs` marks it
+GUARDED, while the unguarded sibling stays UNKNOWN (no fabricated guard); flag OFF leaves it
+`index-not-tracked`. `tests/test_interblock_origins.py`. *Risk handled:* the corroborated `eval-gate`
+is byte-identical ON vs OFF (8/0/0, recall 1.00, fp_rate 0.00) — `via` feeds only the computed-index
+`mem_out` channel, never the sink taint set, so no FN/FP change. (The planned "corpus cases" were
+dropped: a computed-index deref is always a candidate-state `tainted_deref` finding regardless of the
+guard, so the harness cannot discriminate the pair — the verdict unit test is the meaningful check.)
 
 **1.2 Taint through computed/heap addresses (stop dropping taint at non-slot STOREs).** (L) A
 `STORE` through a computed address (`buf[i]`, a heap pointer, an alias) drops taint, so downstream
