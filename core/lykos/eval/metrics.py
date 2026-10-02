@@ -75,7 +75,10 @@ def gate(metrics: dict, meta: dict, *, stage: str = "static", min_recall: float 
     # negative), so n_positive > 0 and the recall check below would FAIL a CI host that simply
     # lacks the backend. That is the false regression the SKIP exists to avoid.
     if stage == "static":
-        backend_absent, need = (not meta.get("ghidra")), "Ghidra"
+        # EITHER backend (Ghidra headless, or the no-JVM rizin+pypcode) satisfies the static run;
+        # `decompiler` is truthy when either is present (older reports only carry `ghidra`).
+        backend_absent = not (meta.get("decompiler") or meta.get("ghidra") or meta.get("native"))
+        need = "an RE backend (Ghidra or rizin+pypcode)"
     elif stage in ("dynamic", "lava"):
         backend_absent, need = (not meta.get("gcc")), "a compiler"
     else:

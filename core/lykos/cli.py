@@ -81,6 +81,15 @@ def build_parser() -> argparse.ArgumentParser:
                     help="finding state a static case must reach to count as detected "
                          "(candidate = rule/sink channel; corroborated = taint-discriminated)")
     ev.add_argument("--out", default=None, help="write the full JSON report to this path")
+    ev.add_argument("--arch", default=None,
+                    help="static only: cross-compile the corpus and score detection PER arch "
+                         "(comma-list like aarch64,arm,riscv64, or 'all'); an arch whose "
+                         "cross-compiler is absent is skipped. Ratchets each arch against "
+                         "eval/arch_baseline.json: fails if any arch gains a false positive or a "
+                         "false negative versus its baseline.")
+    ev.add_argument("--arch-update-baseline", action="store_true",
+                    help="with --arch: rewrite eval/arch_baseline.json to the measured counts "
+                         "instead of gating (use after a deliberate detection change).")
     ev.add_argument("--workers", type=int, default=2, help="worker count (default 2)")
     ev.add_argument("--min-recall", type=float, default=1.0,
                     help="release gate: fail if overall recall is below this (default 1.0)")
@@ -415,6 +424,59 @@ def _cmd_eval(args: argparse.Namespace) -> int:
         cases = corpusmod.load_dir(args.corpus)
     else:
         cases = None
+
+    # Per-architecture static scoring: cross-compile the corpus for each requested arch and
+    # ratchet detection against eval/arch_baseline.json -- a new false positive or false negative
+    # on any arch fails. An arch whose cross-compiler is absent is skipped (not failed); an arch
+    # with no baseline entry is reported but not gated. Cross-arch detection is x86-64-tuned and
+    # weak off it (see the baseline's comment), so this is a regression ratchet, not a 0-FP bar.
+    if args.arch and stage == "static":
+        from pathlib import Path as _P
+        base_path = _P(__file__).resolve().parent / "eval" / "arch_baseline.json"
+        baseline = {}
+        if base_path.exists():
+            baseline = json.loads(base_path.read_text()).get("arches", {})
+        want = None if args.arch == "all" else [a.strip() for a in args.arch.split(",")]
+        targets = harness.available_arches(want)
+        if not targets:
+            print("no requested cross-compilers installed; per-arch scoring skipped",
+                  file=sys.stderr)
+            return 0
+        all_pass = True
+        measured = {}
+        for arch, cc in targets:
+            rep = harness.run(cases, stage="static", min_state=args.min_state,
+                              workers=args.workers, gcc=cc,
+                              progress=lambda m: print(f"[{arch}] {m}", file=sys.stderr, flush=True))
+            o = rep.metrics.get("overall", {})
+            fp, fn = int(o.get("fp", 0)), int(o.get("fn", 0))
+            measured[arch] = {"fp": fp, "fn": fn}
+            base = baseline.get(arch)
+            if args.arch_update_baseline:
+                verdict = "RECORDED"
+            elif base is None:
+                verdict = "no-baseline (reported, not gated)"
+            else:
+                regressed = fp > base["fp"] or fn > base["fn"]
+                improved = fp < base["fp"] or fn < base["fn"]
+                verdict = ("REGRESSED" if regressed
+                           else "IMPROVED (lower the baseline)" if improved else "ok")
+                all_pass = all_pass and not regressed
+            btxt = f" [baseline fp={base['fp']} fn={base['fn']}]" if base else ""
+            print(f"[{arch:8}] {verdict}: fp={fp} fn={fn} "
+                  f"recall={o.get('recall')} fp_rate={o.get('fp_rate')}{btxt}")
+        if args.arch_update_baseline:
+            doc = {}
+            if base_path.exists():
+                doc = json.loads(base_path.read_text())
+            doc.setdefault("arches", {}).update(measured)
+            base_path.write_text(json.dumps(doc, indent=2) + "\n")
+            print(f"\nbaseline updated for {len(measured)} arch(es): {base_path}")
+            return 0
+        print(f"\nper-arch static ratchet over {len(targets)} arch(es): "
+              f"{'PASS' if all_pass else 'FAIL'}")
+        return 0 if all_pass else 1
+
     kw = {"stage": stage, "workers": args.workers,
           "progress": lambda m: print(m, file=sys.stderr, flush=True)}
     if stage == "static":
@@ -425,7 +487,8 @@ def _cmd_eval(args: argparse.Namespace) -> int:
     for w in rep.meta.get("warnings", []):
         print(f"warning: {w}", file=sys.stderr)
     print(rep.table())
-    backend = (f"ghidra={'yes' if rep.meta.get('ghidra') else 'NO'}, min_state={args.min_state}"
+    backend = (f"backend={'ghidra' if rep.meta.get('ghidra') else ('native' if rep.meta.get('native') else 'NONE')}"
+               f", min_state={args.min_state}"
                if stage == "static"
                else f"fuzz budget={rep.meta.get('max_execs')} execs/{rep.meta.get('max_seconds')}s")
     ncases, ngroups = rep.metrics.get("n_cases", 0), rep.metrics.get("n_cwe_classes", 0)

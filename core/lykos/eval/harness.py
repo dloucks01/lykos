@@ -43,6 +43,28 @@ _STATE_RANK = {"candidate": 0, "corroborated": 1, "confirmed": 2, "poc-backed": 
 _CORROBORATION_EXEMPT = {"CWE-798", "CWE-321", "CWE-259"}
 
 
+# Cross toolchains for per-architecture static scoring. `eval-gate` measures x86-64 only, so an
+# arch-specific regression in the recovery/bounds/taint passes (which run on the decompiler's
+# P-Code, the same IR on every ISA) never trips it. STATIC detection does not RUN the binary --
+# it disassembles it -- so this needs only a cross-compiler, no qemu. An arch whose compiler is
+# absent SKIPs, the same rule arch-gate uses for the dynamic path.
+CROSS_TOOLCHAINS = {
+    "aarch64": "aarch64-linux-gnu-gcc", "arm": "arm-linux-gnueabihf-gcc",
+    "ppc64": "powerpc64-linux-gnu-gcc", "ppc64le": "powerpc64le-linux-gnu-gcc",
+    "riscv64": "riscv64-linux-gnu-gcc", "mips": "mips-linux-gnu-gcc",
+    "mipsel": "mipsel-linux-gnu-gcc", "m68k": "m68k-linux-gnu-gcc",
+    "s390x": "s390x-linux-gnu-gcc", "sh4": "sh4-linux-gnu-gcc",
+}
+
+
+def available_arches(arches=None):
+    """(arch, cross-gcc) for each requested arch whose compiler is installed. `arches=None` or
+    'all' means every toolchain in CROSS_TOOLCHAINS that is present."""
+    want = list(CROSS_TOOLCHAINS) if (arches is None or arches == ["all"]) else list(arches)
+    return [(a, CROSS_TOOLCHAINS[a]) for a in want
+            if a in CROSS_TOOLCHAINS and shutil.which(CROSS_TOOLCHAINS[a])]
+
+
 def compile_case(case, outdir: Path, gcc: str = "gcc"):
     """Compile one case to an ELF; return the path, or None if compilation failed.
 
@@ -87,6 +109,9 @@ def run_corpus(cases=None, *, workdir=None, gcc="gcc", workers=2, stage_timeout=
     cases = list(cases if cases is not None else bundled())
     gcc_path = shutil.which(gcc)
     ghidra = locate_ghidra()
+    from ..analyze import native_re
+    native = native_re.locate_native()
+    decompiler = ghidra or native          # the detect pass runs with EITHER backend (per LYKOS_DECOMPILER)
     rank_min = _STATE_RANK.get(min_state, 0)
     tmp = Path(workdir) if workdir else Path(tempfile.mkdtemp(prefix="lykos-eval-"))
     tmp.mkdir(parents=True, exist_ok=True)
@@ -94,16 +119,19 @@ def run_corpus(cases=None, *, workdir=None, gcc="gcc", workers=2, stage_timeout=
 
     meta = {
         "n_cases": len(cases), "gcc": bool(gcc_path),
-        "ghidra": str(ghidra) if ghidra else None, "min_state": min_state,
+        # `ghidra` kept for back-compat; `decompiler` is the backend-presence signal the gate
+        # reads, so a native-only host (rizin + pypcode, no JVM) is not treated as backend-absent.
+        "ghidra": str(ghidra) if ghidra else None, "native": str(native) if native else None,
+        "decompiler": str(decompiler) if decompiler else None, "min_state": min_state,
         "warnings": [],
     }
     if not gcc_path:
         meta["warnings"].append("gcc not found: cannot compile the corpus")
         return Report(outcomes=[], metrics=score([]), meta=meta)
-    if not ghidra:
+    if not decompiler:
         meta["warnings"].append(
-            "Ghidra not located: call-graph detectors are inactive, so recall will be ~0. "
-            "Set LYKOS_GHIDRA or install Ghidra for a meaningful run.")
+            "No RE backend located (neither Ghidra nor rizin+pypcode): call-graph detectors are "
+            "inactive, so recall will be ~0. Install rizin+pypcode or set LYKOS_GHIDRA.")
 
     store = CaseStore.open(tmp / "eval-store")
     register_stages()

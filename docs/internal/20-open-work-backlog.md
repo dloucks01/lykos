@@ -929,9 +929,17 @@ candidate recall 1.00 / fp_rate 0.571; corroborated recall 0.833 / fp_rate 0.214
 - **[DONE] Verified argv seeding off x86-64** — confirmed end-to-end on riscv64, aarch64 and
   32-bit ARM. This is what surfaced the materialised-displacement bug above: the seed was
   arch-independent, but the spill tracking it depends on was not.
-- **[PLANNED] Cross-arch cases in the bundled corpus.** The verification above was manual
-  (`riscv64-unknown-elf-gcc` freestanding, `aarch64/arm-linux-gnueabihf-gcc -static`); nothing
-  in `eval-gate` measures any arch but x86-64, so an arch regression would not trip a gate.
+- **[DONE] Per-architecture detection scoring + regression ratchet** (doc 30 P0.2).
+  `lykos eval --stage static --arch all` cross-compiles the corpus for every installed cross
+  toolchain and scores detection per arch (static needs no qemu -- it disassembles, not runs),
+  ratcheting each arch against `eval/arch_baseline.json` (a new FP or FN fails; `--arch-update-baseline`
+  re-records). Wired into CI. **It immediately quantified a real gap: cross-arch detection is
+  x86-64-tuned and degrades badly off it** (native backend, corroborated stage, bundled corpus):
+  aarch64 recall 1.0 / 1 FP; arm 0.625 / 7 FP; ppc64le 0.5 / 6 FP; ppc64 0.25; riscv64/m68k/s390x
+  0.125 (recall collapses -- only 1 of 8 bugs found); sh4 1.0 / 9 FP. The ratchet stops this from
+  worsening; **lifting it toward x86-64 parity is Phase 1 (taint memory model) + Phase 2.4 (the
+  arches blocked upstream of the bounds pass -- the same riscv/SuperH constant-resolution and
+  frame-recovery gaps, now measured across 8 ISAs).**
 - **[DONE] CWE-120 path-insensitivity — corroborated false positives 3 → 0.** All three safe
   idioms (`strcpy` behind `strlen() < sizeof`, `strncpy` to `sizeof-1`, `memcpy` with a clamped
   length) are now demoted to SAFE, taking the whole corroborated-stage corpus to ZERO false

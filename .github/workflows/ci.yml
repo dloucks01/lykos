@@ -42,10 +42,14 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
-      - name: RE backend + compiler
+      - name: RE backend + compilers (host + cross toolchains for per-arch scoring)
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends gcc binutils rizin
+          # Host gcc + the cross toolchains the per-arch ratchet uses; an arch whose compiler is
+          # absent is simply skipped, so a missing package never fails the gate.
+          sudo apt-get install -y --no-install-recommends gcc binutils rizin \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf gcc-riscv64-linux-gnu \
+            gcc-powerpc64le-linux-gnu gcc-powerpc64-linux-gnu gcc-s390x-linux-gnu || true
           python -m pip install --upgrade pip
           pip install pypcode
       # Diagnostic only; the real enforcement is --require-backend on the gate steps, which FAILs
@@ -68,3 +72,11 @@ jobs:
           PYTHONPATH=core LYKOS_DECOMPILER=native python -m lykos eval --stage static \
             --min-state corroborated --min-recall 1.0 --max-fp-rate 0.0 \
             --require-backend --min-negative 1
+      # Per-architecture regression ratchet: cross-compile the corpus for each installed arch and
+      # fail on a new false positive or false negative vs eval/arch_baseline.json. Cross-arch
+      # detection is x86-64-tuned and weak off it, so this prevents further degradation (and
+      # makes an arch regression visible) rather than enforcing parity.
+      - name: eval-gate — per-architecture ratchet
+        run: |
+          PYTHONPATH=core LYKOS_DECOMPILER=native python -m lykos eval --stage static \
+            --arch all --min-state corroborated --require-backend --min-negative 1

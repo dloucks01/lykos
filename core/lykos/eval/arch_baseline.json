@@ -1,0 +1,15 @@
+{
+  "_comment": "Per-architecture corroborated-stage detection baseline on the native RE backend (rizin + pypcode), measured 2026-10 over the bundled micro-corpus. A REGRESSION RATCHET, not an endorsement: cross-arch detection is x86-64-tuned and weak off it (recall collapses on riscv64/m68k/s390x, precision is poor on arm/ppc64le/sh4), which is exactly the gap this file exists to make visible and stop from worsening. `lykos eval --stage static --arch all` fails an arch whose false-POSITIVE or false-NEGATIVE count EXCEEDS the baseline. When an arch improves, lower its numbers here (make eval ... --arch-update-baseline). Lifting these toward x86-64 parity is doc 30 Phase 1 (taint memory model) + Phase 2.4 (arches blocked upstream of the bounds pass).",
+  "backend": "native",
+  "min_state": "corroborated",
+  "arches": {
+    "aarch64": {"fp": 1, "fn": 0},
+    "arm":     {"fp": 7, "fn": 3},
+    "ppc64":   {"fp": 1, "fn": 6},
+    "ppc64le": {"fp": 6, "fn": 4},
+    "riscv64": {"fp": 0, "fn": 7},
+    "m68k":    {"fp": 0, "fn": 7},
+    "s390x":   {"fp": 0, "fn": 7},
+    "sh4":     {"fp": 9, "fn": 0}
+  }
+}
