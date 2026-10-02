@@ -97,14 +97,21 @@ is byte-identical ON vs OFF (8/0/0, recall 1.00, fp_rate 0.00) — `via` feeds o
 dropped: a computed-index deref is always a candidate-state `tainted_deref` finding regardless of the
 guard, so the harness cannot discriminate the pair — the verdict unit test is the meaningful check.)
 
-**1.2 Taint through computed/heap addresses (stop dropping taint at non-slot STOREs).** (L) A
-`STORE` through a computed address (`buf[i]`, a heap pointer, an alias) drops taint, so downstream
-reads of that memory are untainted → missed findings (recall). *Approach:* a coarse points-to: model
-a tainted STORE to an unknown address as tainting a "heap region" token associated with its base
-pointer's origin, and a LOAD from the same base as tainted. Keep it conservative (region-granular,
-not byte-precise) to avoid over-tainting. *Acceptance:* a `heap[i] = input; use(heap[j])` fixture
-flags the downstream use; recall up on the Phase-0 benchmark with precision held. *Risk:*
-over-tainting → FP inflation; gate on the benchmark precision number.
+**1.2 Taint through computed/heap addresses (stop dropping taint at non-slot STOREs).** (L) ✅
+**DONE.** A `STORE` through a computed address (`heap[i]`) dropped taint, so a downstream read of
+that memory was untainted → missed findings. Now a coarse, region-granular points-to: a tainted
+STORE through a pointer whose origin is a known heap slot taints an `("hmem", slot)` token (keyed by
+the frame slot that holds the `malloc`'d pointer — reusing `bounds._heap_capacities`' sound
+single-writer provenance), and a LOAD through the same slot reads it. The tokens live in the taint
+set, so they flow across blocks through the existing fixpoint; P1.1's cross-block origins make the
+pointer slot resolvable (and this fixed a related gap: an in-place `add rdx,rax→rdx` for `base+index`
+lost the base's origin — `_apply` now folds in each input's resolved origins before overwriting).
+Gated by `LYKOS_REGION_TAINT` (default on). *Acceptance (met):* the `heap[i]=input; n=heap[0];
+memcpy(dst,src,n)` fixture flags the sink with the flag on and not off (`tests/test_region_taint.py`);
+on the Phase-0 benchmark corroborated recall rose 0.727 → **0.750** (F1 0.842 → **0.857**) with
+precision held at **1.000** (0 FP), and the corroborated eval-gate still PASSes (8/0/0). The bundled
+benchmark gained a heap-round-trip good/bad pair to track it. *Risk handled:* keyed only on proven
+heap slots (not arbitrary pointers), region-granular, measured against the benchmark precision number.
 
 **1.3 Inter-procedural guard reasoning.** (M, after 1.1) Guard reasoning is intra-procedural: a
 length/index bounded in a caller (or by a callee's return check) is invisible. *Approach:* propagate

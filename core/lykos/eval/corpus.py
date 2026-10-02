@@ -341,6 +341,30 @@ int main(int c, char**v){ if(c>1){ int n=atoi(v[1]); char*b=malloc(n*4); if(b){ 
 int main(int c, char**v){ if(c>1){ long n=atol(v[1]);
   if(n>0 && n < (long)(INT_MAX/4)){ char*b=malloc((size_t)n*4); if(b){ memset(b,0,(size_t)n*4); free(b);} } } return 0; }
 """, note="multiply guarded against wrap before the allocation"),
+
+    # ---- CWE-120 through a heap round-trip (exercises P1.2 region taint): input stored into a
+    # heap allocation through a computed pointer, read back, and used as a copy length. The `bad`
+    # reaches corroborated ONLY because region taint connects the store to the downstream read;
+    # the `good` reads the heap back but copies a constant length, so nothing attacker-sized
+    # reaches the sink.
+    Case("heap_region_tainted_len", "CWE-120", "bad", r"""
+#include <unistd.h>
+#include <string.h>
+#include <stdlib.h>
+static char dst[16], src[256];
+int main(void){ char*h=malloc(256); if(!h) return 1;
+  int i=0; if(read(0,&i,4)!=4) return 1; i&=255; char in=0; if(read(0,&in,1)!=1) return 1;
+  h[i]=in; unsigned n=(unsigned char)h[0]; memcpy(dst,src,n); return dst[0]; }
+""", note="attacker byte stored into heap[i], read back, used as a memcpy length"),
+    Case("heap_region_const_len", "CWE-120", "good", r"""
+#include <unistd.h>
+#include <string.h>
+#include <stdlib.h>
+static char dst[16], src[256];
+int main(void){ char*h=malloc(256); if(!h) return 1;
+  int i=0; if(read(0,&i,4)!=4) return 1; i&=255; char in=0; if(read(0,&in,1)!=1) return 1;
+  h[i]=in; (void)h[0]; memcpy(dst,src,16); return dst[0]; }
+""", note="same heap round-trip but a constant copy length -- nothing attacker-sized at the sink"),
 ]
 
 

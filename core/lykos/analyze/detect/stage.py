@@ -447,9 +447,23 @@ def detect_stage(ctx) -> dict:
         tainted_sites = set()
     else:
         oversized: list = []
+        # P1.2: the frame slots that hold a (single-writer, constant-size) heap allocation --
+        # reuse the bounds channel's sound provenance so a tainted store through such a pointer
+        # taints the allocation's region and a later read of it comes back tainted.
+        heap_regions = {}
+        try:
+            _ak = bounds._arch_key(target.arch)
+            if _ak:
+                _bases = (bounds.ARCH_ABI.get(_ak) or {}).get("frame", ())
+                _caps = bounds._heap_capacities(func_irs, dctx.call_edges, _bases,
+                                                target.bits or 64, _ak)
+                heap_regions = {fa: set(c.keys()) for fa, c in _caps.items()}
+        except Exception:
+            heap_regions = {}
         tainted_sites = taint.analyze_program(func_irs, dctx.call_edges, target.arch,
                                               entry_seeds=entry_seeds, mem_out=derefs,
-                                              max_funcs=taint_cap, skipped_out=oversized)
+                                              max_funcs=taint_cap, skipped_out=oversized,
+                                              heap_regions=heap_regions)
         if oversized:
             # One level down from the whole-analysis ceiling: a single function past the block
             # limit is skipped entire, and "no tainted flow here" was indistinguishable from

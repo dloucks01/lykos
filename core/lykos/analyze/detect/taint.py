@@ -261,7 +261,33 @@ def _define(taint, key, tainted):
         taint.add(k) if tainted else taint.discard(k)
 
 
-def _apply(taint, ops, bases=(), aliases=None, mem_out=None, via=None):
+def _region_slots(addr_tok, via, heap_regions):
+    """The `("hmem", base, off)` region tokens the pointer `addr_tok` may name (P1.2).
+
+    For every stack-slot origin of the address that is a KNOWN heap-pointer slot (a slot that
+    holds a single-writer allocation, from `bounds._heap_capacities`), produce its region token.
+    `_origins` spans blocks (P1.1), so the slot the pointer was loaded from is still visible even
+    when that load and this access are in different basic blocks. Region-granular on purpose: the
+    index is not modelled, so one token covers the whole allocation -- conservative, to recover a
+    downstream read of attacker-written heap memory without over-tainting arbitrary pointers.
+    """
+    if not heap_regions:
+        return ()
+    out = []
+    for org in _origins(_key(addr_tok), via):
+        if isinstance(org, tuple) and len(org) == 3 and org[0] == "stack":
+            base, off = org[1], org[2]
+            soff = off
+            for b in (64, 32):                       # the slot table carries signed displacements
+                if off >= (1 << (b - 1)):
+                    soff = off - (1 << b)
+                    break
+            if (base, soff) in heap_regions or (base, off) in heap_regions:
+                out.append(("hmem", base, off))
+    return out
+
+
+def _apply(taint, ops, bases=(), aliases=None, mem_out=None, via=None, heap_regions=None):
     slots = {}                       # varnode key -> frame-slot key (this instruction only)
     consts = {}                      # varnode key -> literal value  (this instruction only)
     # What each computed value was built FROM. A dominating guard compares the INDEX, not the
@@ -294,8 +320,14 @@ def _apply(taint, ops, bases=(), aliases=None, mem_out=None, via=None):
                 if dst is not None:
                     val = _key(toks[3])
                     _define(taint, dst, val is not None and val in taint)
-                elif mem_out is not None:
-                    _note_access(mem_out, "store", toks[2], taint, slots, via)
+                else:
+                    # P1.2: a tainted store through a pointer loaded from a heap slot taints that
+                    # slot's heap region, so a later read of the same allocation is tainted too.
+                    if heap_regions and _key(toks[3]) in taint:
+                        for tok in _region_slots(toks[2], via, heap_regions):
+                            taint.add(tok)
+                    if mem_out is not None:
+                        _note_access(mem_out, "store", toks[2], taint, slots, via)
             continue
 
         if outk is None:
@@ -310,11 +342,27 @@ def _apply(taint, ops, bases=(), aliases=None, mem_out=None, via=None):
                 via[outk] = [src]        # this value IS that frame slot, as a guard sees it
                 _define(taint, outk, src in taint)
                 continue
+            region = bool(heap_regions) and any(
+                tok in taint for tok in _region_slots(toks[2], via, heap_regions))
             if mem_out is not None:
                 _note_access(mem_out, "load", toks[2], taint, slots, via)
+            if region:
+                # P1.2: reading from a heap region a tainted store reached -> tainted data
+                via.pop(outk, None)
+                _define(taint, outk, True)
+                continue
 
         if outk is not None and mnem in _ADDR_ARITH:
-            via[outk] = [k for k in ins if k is not None]
+            ins_keys = [k for k in ins if k is not None]
+            # Snapshot each input's origins BEFORE overwriting via[outk]. An in-place op --
+            # `add rdx, rax -> rdx`, the normal -O0 shape for `base + index` -- otherwise loses
+            # outk's own pre-op origin (the base pointer), because via[outk] is replaced and the
+            # self-reference dead-ends in _origins. Folding the resolved origins in keeps both the
+            # base-pointer slot and the index slot reachable (P1.1/P1.2).
+            resolved = []
+            for k in ins_keys:
+                resolved.extend(_origins(k, via))
+            via[outk] = list(dict.fromkeys(ins_keys + resolved))
         elif outk is not None:
             # A definition we do NOT track as an address computation (a non-slot LOAD, an
             # arithmetic/logical op outside _ADDR_ARITH) kills any origin this key carried in from
@@ -487,7 +535,7 @@ def build_callmap(call_edges):
 
 
 def _run(ir, abi, callmap, dstmap, func_addrs, entry_params, ret_tainted, *, oversized=None,
-         seed_sources=True, extmap=None, ext_out=None, mem_out=None):
+         seed_sources=True, extmap=None, ext_out=None, mem_out=None, heap_regions=None):
     """Analyze one function. Returns (flagged_sink_sites, return_is_tainted, callee_contribs).
 
     Cross-binary hooks (Phase 8, doc 17.2):
@@ -496,7 +544,13 @@ def _run(ir, abi, callmap, dstmap, func_addrs, entry_params, ret_tainted, *, ove
         parameter reach a sink?).
       * extmap {site: imported_symbol} + ext_out set: record imported symbols called with
         tainted arguments -- used to summarise a caller (which imports does it taint?).
+      * heap_regions {(base, offset)}: this function's heap-pointer slots (P1.2) -- a tainted
+        store through one taints its region; a load from it reads tainted (disabled with the
+        LYKOS_REGION_TAINT flag).
     """
+    import os as _osr
+    if _osr.environ.get("LYKOS_REGION_TAINT", "1") == "0":
+        heap_regions = None
     argregs_list = abi["args"]
     retregs = abi["ret"]
     stack_call = abi.get("stack_call")
@@ -552,7 +606,7 @@ def _run(ir, abi, callmap, dstmap, func_addrs, entry_params, ret_tainted, *, ove
         tainted_params = {i for i, t in enumerate(argt) if t} if internal else set()
         seen = [] if collect is not None else None
         _apply(cur, instr.get("pcode", []), abi.get("frame", ()), aliases, seen,
-               via)
+               via, heap_regions)
         for acc in (seen or ()):
             collect.append({**acc, "site_addr": addr})
         if stack_call is not None:
@@ -587,34 +641,19 @@ def _run(ir, abi, callmap, dstmap, func_addrs, entry_params, ret_tainted, *, ove
             # address, which must not be mistaken for the next call's argument 0)
             del pushes[:]
 
-    OUT = {a: set() for a in order}
-    for _ in range(len(blocks) * 4 + 10):
-        changed = False
-        for a in order:
-            cur = set()
-            for p in preds[a]:
-                cur |= OUT[p]
-            if a == entry:
-                cur |= pre
-            f, c, pushes, aliases = set(), {}, [], {}
-            for instr in by_addr[a]["instructions"]:
-                transfer(cur, instr, f, c, pushes, aliases)
-            if cur != OUT[a]:
-                OUT[a] = cur
-                changed = True
-        if not changed:
-            break
-
     # Inter-block taint-origin tracking (doc 30 P1.1): the per-block `via` chain drops a value's
     # frame-slot origin at a block boundary, so a guard in one block and the dereference it
     # protects in another never resolve to the same slot (the computed-index-at-O2 miss in doc 20).
     # Carry the register/stack origin map across edges, merged at entry like the taint set. Register
     # and stack keys are block-stable; uniques are not and are dropped (_carry_origins). Guarded by
-    # a flag so the effect on dataflow precision can be measured before/after (default on).
+    # a flag. Computed BEFORE the taint fixpoint so that pass can seed `via` and resolve the slot a
+    # heap pointer came from (P1.2 region taint). Needed whenever origins feed a consumer: the
+    # computed-index mem_out, or region taint.
     import os as _os3
-    interblock = mem_out is not None and _os3.environ.get("LYKOS_INTERBLOCK_ORIGINS", "1") != "0"
+    interblock = _os3.environ.get("LYKOS_INTERBLOCK_ORIGINS", "1") != "0"
+    need_via = interblock and (mem_out is not None or heap_regions)
     VIA_OUT = {a: {} for a in order}
-    if interblock:
+    if need_via:
         for _ in range(len(blocks) * 4 + 10):
             vchanged = False
             for a in order:
@@ -630,6 +669,28 @@ def _run(ir, abi, callmap, dstmap, func_addrs, entry_params, ret_tainted, *, ove
             if not vchanged:
                 break
 
+    def _seed_via(a):
+        return dict(_merge_origins([VIA_OUT[p] for p in preds[a]])) if need_via else {}
+
+    OUT = {a: set() for a in order}
+    for _ in range(len(blocks) * 4 + 10):
+        changed = False
+        for a in order:
+            cur = set()
+            for p in preds[a]:
+                cur |= OUT[p]
+            if a == entry:
+                cur |= pre
+            f, c, pushes, aliases = set(), {}, [], {}
+            via = _seed_via(a)              # seed origins so region taint resolves heap pointers
+            for instr in by_addr[a]["instructions"]:
+                transfer(cur, instr, f, c, pushes, aliases, None, via)
+            if cur != OUT[a]:
+                OUT[a] = cur
+                changed = True
+        if not changed:
+            break
+
     flagged, contribs = set(), {}
     for a in order:
         cur = set()
@@ -640,7 +701,7 @@ def _run(ir, abi, callmap, dstmap, func_addrs, entry_params, ret_tainted, *, ove
         pushes, aliases = [], {}
         acc = [] if mem_out is not None else None
         # the origin chain, seeded from predecessors (P1.1) so it spans blocks, not just instrs
-        via: dict = dict(_merge_origins([VIA_OUT[p] for p in preds[a]])) if interblock else {}
+        via = _seed_via(a)
         for instr in by_addr[a]["instructions"]:
             transfer(cur, instr, flagged, contribs, pushes, aliases, acc, via)
         for x in (acc or ()):
@@ -661,7 +722,7 @@ def analyze_function(ir, callmap, arch):
 
 
 def analyze_program(func_irs, call_edges, arch, *, entry_seeds=None, mem_out=None,
-                    max_funcs=None, skipped_out=None):
+                    max_funcs=None, skipped_out=None, heap_regions=None):
     """Inter-procedural: fixpoint over the call graph. Returns all flagged sink sites.
 
     `entry_seeds` maps an entry-point function addr -> the parameter indices that arrive
@@ -674,7 +735,13 @@ def analyze_program(func_irs, call_edges, arch, *, entry_seeds=None, mem_out=Non
     dereference through a pointer the input helped compute. Those are invisible to every
     other detector, which all key on CALLS, and they are where the out-of-bounds reads and
     writes live.
+
+    `heap_regions` maps a function addr -> the set of `(base, offset)` frame slots that hold a
+    heap allocation (P1.2). A tainted store through such a pointer taints its region and a later
+    read of the same allocation comes back tainted -- so attacker data that lands in heap memory
+    is not lost at the store.
     """
+    heap_regions = heap_regions or {}
     ak = _arch_key(arch)
     if not ak or not _has_abi(ARCH_ABI[ak]):
         return set()
@@ -702,7 +769,8 @@ def analyze_program(func_irs, call_edges, arch, *, entry_seeds=None, mem_out=Non
         f = wl.popleft()
         inq.discard(f)
         _, retf, contribs = _run(func_irs[f], abi, callmap, dstmap, func_addrs,
-                                 entry_params[f], ret_tainted)
+                                 entry_params[f], ret_tainted,
+                                 heap_regions=heap_regions.get(f))
         if retf and not ret_tainted[f]:
             ret_tainted[f] = True
             for c in callers.get(f, ()):
@@ -719,7 +787,8 @@ def analyze_program(func_irs, call_edges, arch, *, entry_seeds=None, mem_out=Non
     for f in func_addrs:
         acc = [] if mem_out is not None else None
         ff, _, _ = _run(func_irs[f], abi, callmap, dstmap, func_addrs,
-                        entry_params[f], ret_tainted, mem_out=acc, oversized=big)
+                        entry_params[f], ret_tainted, mem_out=acc, oversized=big,
+                        heap_regions=heap_regions.get(f))
         flagged |= ff
         for x in (acc or ()):
             mem_out.append({**x, "function_addr": f})
