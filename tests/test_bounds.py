@@ -802,3 +802,21 @@ def test_every_architecture_can_find_its_copy_arguments_somehow():
     for arch, abi in bounds.ARCH_ABI.items():
         assert abi.get("args") or (abi.get("stack_call") or {}).get("base"), \
             f"{arch} can locate no call arguments at all"
+
+
+def test_confirmed_overflow_requires_a_second_source_agreeing_on_the_size():
+    """P2.2: a copy past the buffer is ASSERTED (CONFIRMED) only when a second, independent source
+    -- a memset of the same slot -- agrees with the recovered size. On agreement the overflow is
+    confirmed; on disagreement (the fragmented-frame case) it stays conservative, never fabricated."""
+    blk = _copy_block(_DISP, 128)                      # memcpy 128 bytes into the 64-byte buf
+    slot = ("RBP", -0x1018)                            # the raw slice of the destination address
+    v = bounds.classify_site(blk, "0x100c", "memcpy", _FRAME, "x86-64",
+                             confirmed_sizes={slot: 64})
+    assert v["verdict"] == bounds.CONFIRMED and v.get("confirmed"), v
+    # a second source that DISAGREES (a fragment) must NOT assert -- the cardinal sin
+    v2 = bounds.classify_site(blk, "0x100c", "memcpy", _FRAME, "x86-64",
+                              confirmed_sizes={slot: 32})
+    assert v2["verdict"] != bounds.CONFIRMED, v2
+    # no second source at all -> the existing conservative verdict, never confirmed
+    v3 = bounds.classify_site(blk, "0x100c", "memcpy", _FRAME, "x86-64")
+    assert v3["verdict"] != bounds.CONFIRMED, v3

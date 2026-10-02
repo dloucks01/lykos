@@ -149,30 +149,42 @@ through heap/computed addresses, propagates callee return bounds, and treats `ar
 
 ## Phase 2 — Precision completeness (rides on Phase 1 where noted)
 
-**2.1 CWE-798 corroboration.** (S) `hardcoded_secrets` is a string detector with no call site, so
-neither taint channel applies → it can never be corroborated, capping corroborated recall at 0.833
-(5/6). *Approach:* give the string channel its own second-channel notion (the secret's byte offset +
-a re-extraction, which `synthesize_secret` already computes is the natural corroborator), OR exclude
-CWE-798 from corroborated-stage scoring and score it on the poc-backed promotion it already gets.
-*Acceptance:* corroborated recall reflects reality (not a structural 0.833 floor). *Risk:* none —
-scoring/semantics only.
+**2.1 CWE-798 corroboration.** (S) ✅ **DONE** (pulled forward in P0.1). `hardcoded_secrets` is a
+string detector with no call site, so neither taint channel applies → it could never be corroborated,
+capping corroborated recall at a structural 0.833 (5/6). Resolved via approach (b): the eval harness
+carries `_CORROBORATION_EXEMPT = {CWE-798, CWE-321, CWE-259}` and counts those classes as detected on
+their poc-backed promotion (`synthesize_secret`) rather than requiring a taint second channel. The
+CWE-798 bad case now scores found at corroborated and its goods discriminate, so corroborated recall
+reflects reality. *Acceptance met:* the corroborated gate holds recall 1.00 with CWE-798 in the
+corpus.
 
-**2.2 Assertable overflows from trustworthy frame recovery.** (L) Today a constant/guard bound that
-EXCEEDS the recovered buffer is only SUSPECT (surfaced, never asserted), because Ghidra fragments a
-buffer into several locals and the recovered size is unreliable. To CONFIRM an overflow we need a
-reliable destination size. *Approach:* corroborate the frame table against a second source — the
-copy's own access pattern, adjacent-variable gaps, or a lightweight re-derivation of the buffer
-extent from the prologue — and only assert when two sources agree. *Acceptance:* a true stack
-overflow is reported CONFIRMED (not just corroborated) with no fabricated overflow on the fragmented
-fixtures in `test_bounds.py`. *Risk:* the module's cardinal sin (a fabricated overflow) — keep the
-two-source-agreement bar; default to SUSPECT on disagreement.
+**2.2 Assertable overflows from trustworthy frame recovery.** (L) ✅ **DONE.** A constant/guard bound
+exceeding the recovered buffer was only SUSPECT (surfaced, never asserted) because the decompiler
+fragments a buffer into several locals and the recovered size is unreliable. A new `CONFIRMED`
+verdict asserts the overflow, but ONLY when a second, independent source agrees on the destination
+size: `_memset_sizes` records each stack buffer's `memset(&buf, _, CONST)` extent (the program's own
+init, keyed by the same raw `(base, disp)` a copy's destination resolves to), and `classify_site`
+upgrades to CONFIRMED when that extent EQUALS the frame-recovered capacity and the copy exceeds it.
+On disagreement — the fragmented-frame case — it stays SUSPECT, so the module's cardinal sin (a
+fabricated overflow) cannot happen. `stage.py` promotes a CONFIRMED copy to high/corroborated.
+*Acceptance (met):* the two-source-agreement test confirms a true overflow and refuses both the
+disagreeing (fragment) and no-second-source cases (`test_bounds.py`), the existing fragmented
+fixtures are untouched (no `confirmed_sizes` → unchanged), and the corroborated eval-gate still
+PASSes 8/0/0. *Note:* the native backend's coarse frame recovery often disagrees with the memset
+(e.g. recovers a `char[64]` as 72), in which case CONFIRMED correctly abstains — a precise backend
+gets the assertion.
 
-**2.3 Crash finding grain: one row per DISTINCT crash.** (M) Two unrelated SIGSEGVs merge into one
-finding (keyed by signal), so distinct bugs are undercounted and a fixed one masks a live one.
-*Approach:* key crash findings by fault signature (faulting PC + access kind + normalized
-backtrace), not by signal — consistent with the fuzz-calibration multi-fault handling. *Acceptance:*
-two distinct crashers produce two findings; a regression corpus with N planted bugs reports N.
-*Risk:* over-splitting flaky crashes → normalize the backtrace, cap per-function.
+**2.3 Crash finding grain: one row per DISTINCT crash.** (M) ✅ **DONE** (already resolved; the
+plan's "keyed by signal" described the pre-fix state). `crash_dedup_key` keys a crash by its FAULT
+SIGNATURE: `dynamic-crash:{signal}:{fault_pc}` for a real fault, a sanitizer-report discriminator
+(`class@source`) for an ASan/UBSan abort so two different sanitizer defects that both abort stay
+distinct, a signal-only bucket for a plain glibc abort (whose PC is in the abort machinery, not the
+defect), and a `:cfh` collapse for a control-flow hijack (where the PC is attacker-garbage and would
+otherwise fan one stack smash into dozens). *Acceptance met:* two distinct crashers (different fault
+PCs) produce two findings and the same defect found repeatedly stays one — `test_crash_attribution.py`
+(`test_two_defects_that_both_segfault_are_two_findings` and siblings). Access-kind/backtrace are not
+added because the native SIGSEGV path captures neither (only the JVM/Wine paths carry frames), so the
+faulting PC is the best signature the data offers.
 
 **2.4 Unblock the three arches upstream of the bounds pass.** (M) `riscv` resolves only one constant
 of a split immediate; SuperH materialises constants in a **PC-relative literal pool** the slicer

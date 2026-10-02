@@ -600,6 +600,17 @@ def detect_stage(ctx) -> dict:
             c["confidence"] = min(c.get("confidence", 0.4), 0.15)
             c["evidence"].append({"channel": "bounds", "detail": v["why"]})
             c["site_detail"] = v["why"]
+        elif v["verdict"] == bounds.CONFIRMED:
+            # P2.2: the copy exceeds the destination AND a second source agrees on the size -- a
+            # real overflow, asserted. Promote it (two sources is the module's bar for asserting an
+            # overflow; a single recovered frame is not trusted because stack slots are reused).
+            c["severity"] = "high"
+            c["state"] = "corroborated"
+            c["confidence"] = max(c.get("confidence", 0.4), 0.9)
+            c["site_state"] = "corroborated"
+            c["site_confidence"] = 0.9
+            c["evidence"].append({"channel": "bounds", "detail": v["why"]})
+            c["site_detail"] = v["why"]
         elif v["verdict"] in (bounds.SUSPECT, bounds.SIGNED):
             # Surfaced for review -- NOT promoted, because a recovered frame can name the
             # wrong variable for a reused stack slot (see bounds.py). Critically also NOT

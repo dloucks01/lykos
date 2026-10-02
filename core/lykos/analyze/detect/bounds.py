@@ -36,6 +36,10 @@ NUL_COPY_ARGS = {"strcpy": (0, 1), "stpcpy": (0, 1)}
 UNKNOWN = "unknown"
 SAFE = "bounded"
 SUSPECT = "exceeds-recovered-size"
+# An overflow we will ASSERT, not merely surface: the copy exceeds the destination AND a second,
+# independent source agrees on the destination's size (P2.2). Reserved for exactly that -- the
+# module's cardinal sin is a fabricated overflow (see below), so CONFIRMED requires corroboration.
+CONFIRMED = "confirmed-overflow"
 # A signed bounds check with nothing excluding a negative length. `if (n < 64)` on an `int`
 # admits n = -1, which memcpy's size_t parameter reads as 0xFFFFFFFFFFFFFFFF. The check looks
 # careful, the upper bound is real, and the copy is still unbounded.
@@ -381,7 +385,7 @@ def _capacity_buffer(frame: dict, offset: int):
 
 def classify_site(instrs, site_addr, sink, frame, arch, bits=64,
                   blocks=None, site_block=None, dom=None, base_offs=None, heap_caps=None,
-                  callee_len_bounds=None):
+                  callee_len_bounds=None, confirmed_sizes=None):
     """Verdict for one copy call site.
 
     `blocks`/`site_block` enable the dominating-guard pass: without them only a compile-time
@@ -445,6 +449,13 @@ def classify_site(instrs, site_addr, sink, frame, arch, bits=64,
     # inside it may simply be filling a buffer the decompiler fragmented, so it stays unknown.
     headroom = -goff if goff < 0 else int(frame.get("frame_size") or 0)
 
+    # P2.2: a SECOND source agrees on the destination size -> the recovered size is trustworthy, so
+    # a copy past it is a real overflow we ASSERT (CONFIRMED), not merely surface. `confirmed_sizes`
+    # is a `memset(&buf, _, CONST)` extent keyed by the same raw (base, disp) this copy's dst
+    # resolved to; agreement with `room` is the two-source bar. Disagreement (e.g. a fragmented
+    # frame) leaves the copy SUSPECT -- never a fabricated overflow.
+    corrob = bool(confirmed_sizes) and confirmed_sizes.get((dst[1], dst[2])) == room
+
     def _over(n_bytes, detail):
         if headroom and n_bytes <= headroom:
             return {"verdict": UNKNOWN, "buffer": name, "capacity": room,
@@ -472,6 +483,11 @@ def classify_site(instrs, site_addr, sink, frame, arch, bits=64,
         if g:
             gmax, why = g["bound"], g["why"]
             common = {"buffer": name, "capacity": room, "bound": gmax, "guard": True}
+            if corrob and gmax > room and g.get("nonneg"):
+                # two sources agree on the size, so a bound past it is a real overflow -- assert it
+                return {"verdict": CONFIRMED, **common, "confirmed": True,
+                        "why": (f"{why}, exceeding {name} ({room} bytes, confirmed by its memset) "
+                                f"-- overflow")}
             # A guard that still permits a copy PAST the frame below the destination is a real
             # concern (surfaced, never asserted -- the recovered size may be a fragment). Within
             # the frame it is safe: the decompiler splits one buffer into several locals, so a
@@ -499,6 +515,11 @@ def classify_site(instrs, site_addr, sink, frame, arch, bits=64,
                 "why": f"length is not a compile-time constant ({name}, {room} bytes)"}
     n = ln[1]
     if n > room:
+        if corrob:
+            return {"verdict": CONFIRMED, "buffer": name, "capacity": room, "length": n,
+                    "confirmed": True,
+                    "why": (f"copies a constant {n} bytes into {name} ({room} bytes, confirmed by "
+                            f"its memset) -- overflow")}
         soft = _over(n, f"copies a constant {n} bytes into {name} ({room} recovered)")
         if soft:
             return soft
@@ -1108,6 +1129,42 @@ def _return_bounds(func_irs, arch, bits):
     return out
 
 
+def _memset_sizes(func_irs, call_edges, bases, bits, ak):
+    """{faddr: {(base, offset): size}} for stack buffers the program clears with `memset(&buf, _,
+    CONST)` (P2.2). A SECOND, independent witness of a buffer's extent -- the program's own init,
+    not the decompiler's frame table. Used only to CONFIRM an overflow when it AGREES with the
+    recovered size; on disagreement the copy stays SUSPECT, so a fragmented frame never fabricates
+    one. The slot key is the raw `(base, disp)` a backward slice reads, the same shape a copy's
+    destination resolves to, so the memset and the copy that share a buffer share a key."""
+    from .catalog import normalize
+    abi = ARCH_ABI.get(ak) or {}
+    argregs = abi.get("args") or []
+    if len(argregs) < 3:
+        return {}
+    ms_by_func: dict = {}
+    for e in call_edges:
+        if normalize(e.dst_name) == "memset" and e.site_addr and e.src_addr:
+            ms_by_func.setdefault(e.src_addr, []).append(e.site_addr)
+    out: dict = {}
+    for faddr, sites in ms_by_func.items():
+        blocks = ((func_irs or {}).get(faddr) or {}).get("blocks", []) or []
+        sizes: dict = {}
+        for b in blocks:
+            ins = b.get("instructions", []) or []
+            at = {i.get("addr") for i in ins}
+            for site in sites:
+                if site not in at:
+                    continue
+                vals, _ = _slice_block(ins, site, bases, bits)
+                dst = next((vals.get(("reg", r)) for r in argregs[0] if vals.get(("reg", r))), None)
+                szv = next((vals.get(("reg", r)) for r in argregs[2] if vals.get(("reg", r))), None)
+                if dst and dst[0] == "frame" and szv and szv[0] == "const" and szv[1] > 0:
+                    sizes[(dst[1], dst[2])] = szv[1]
+        if sizes:
+            out[faddr] = sizes
+    return out
+
+
 def classify_program(func_irs: dict, call_edges, frames: dict, arch, bits=64) -> dict:
     """site_addr -> verdict, for every copy sink whose call site we can read."""
     import os as _osb
@@ -1129,6 +1186,9 @@ def classify_program(func_irs: dict, call_edges, frames: dict, arch, bits=64) ->
     ak = _arch_key(arch)
     bases = (ARCH_ABI.get(ak) or {}).get("frame", ()) if ak else ()
     heap_caps = _heap_capacities(func_irs, call_edges, bases, bits, ak) if ak else {}
+    # P2.2: a second-source witness of each stack buffer's size (its memset extent), used to CONFIRM
+    # an overflow only where it agrees with the recovered size.
+    memset_sizes = _memset_sizes(func_irs, call_edges, bases, bits, ak) if ak else {}
     # P1.3 inter-procedural guard reasoning: a copy length that is the return value of a callee
     # whose return is provably bounded (constant / dominating-guard) is bounded by that value --
     # a guard proven in one function reaching a sink in another. Sound by construction: the length
@@ -1191,7 +1251,8 @@ def classify_program(func_irs: dict, call_edges, frames: dict, arch, bits=64) ->
                 v = classify_site(bins, i["addr"], hit[1], frames.get(faddr) or {},
                                   arch, bits=bits, blocks=blocks, site_block=b.get("addr"),
                                   dom=dom, base_offs=base_offs, heap_caps=heap_caps.get(faddr),
-                                  callee_len_bounds=callee_len_bounds.get(faddr))
+                                  callee_len_bounds=callee_len_bounds.get(faddr),
+                                  confirmed_sizes=memset_sizes.get(faddr))
                 if v:
                     out[i["addr"]] = {**v, "sink": hit[1], "function_addr": faddr}
     return out
