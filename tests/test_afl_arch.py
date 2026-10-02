@@ -88,11 +88,16 @@ def test_missing_afl_and_missing_trace_are_different_answers(monkeypatch, tmp_pa
 
 
 def test_the_gate_no_longer_asks_the_host_architecture():
-    """The regression guard. `host_arch()` is the wrong question for an emulator, and asking
-    it is what produced a gate that was exactly inverted."""
+    """The regression guard. For QEMU-mode `host_arch()` is the wrong question for an emulator,
+    and asking it is what produced a gate that was exactly inverted -- the GUEST the trace targets
+    decides it. (host_arch() is legitimately consulted only on the afl-instrumented `qemu=false`
+    path, which runs the binary natively and so must match the host -- that branch is excluded.)"""
     src = inspect.getsource(_unsupported)
-    assert "host_arch" not in src, "the guest architecture is what decides this"
     assert "qemu_trace_arch" in src
+    qemu_part, sep, _instrumented = src.partition("if not use_qemu:")
+    assert sep, "the instrumented-path branch should exist"
+    assert "host_arch" not in qemu_part, \
+        "the qemu-mode gate must decide on the guest architecture, not the host"
 
 
 def test_a_machine_can_hold_one_emulator_per_guest(monkeypatch, tmp_path):
@@ -154,3 +159,23 @@ def test_campaign_stats_distinguish_a_quiet_run_from_a_dead_one(tmp_path):
     assert got["execs_done"] == "41562"
     assert got["execs_per_sec"] == "923.17"
     assert aflpp.campaign_stats(tmp_path / "nothing") == {}
+
+
+def test_instrumented_mode_runs_the_native_arch_without_a_qemu_trace(monkeypatch, tmp_path):
+    """P3.1: the afl-instrumented path (qemu=false) executes the target natively under afl-fuzz, so
+    it needs only afl-fuzz -- NOT afl-qemu-trace. coverage_fuzz must therefore RUN on the native
+    arch where the trace is absent, instead of raising `toolchain_missing` ('failing loudly'). A
+    cross-arch target still declines, because instrumented mode runs the binary natively."""
+    from lykos.analyze.dynamic import sandbox
+    from lykos.analyze.fuzz.coverage import _unsupported, toolchain_missing
+    afl = tmp_path / "afl-fuzz"
+    afl.write_text("")
+    monkeypatch.setattr(aflpp, "locate_afl", lambda _c=None: afl)
+    monkeypatch.setattr(aflpp, "locate_qemu_trace", lambda _a: None)      # no trace helper
+    host = sandbox.host_arch()
+    assert _unsupported(_T(arch=host), use_qemu=False) is None            # native runs, no trace
+    assert toolchain_missing(use_qemu=False) is None                     # afl-fuzz alone suffices
+    assert "afl-qemu-trace" in (toolchain_missing(use_qemu=True) or "")  # qemu-mode still needs it
+    other = "aarch64" if host != "aarch64" else "x86-64"
+    why = _unsupported(_T(arch=other), use_qemu=False)
+    assert why and "natively" in why                                     # cross-arch declines

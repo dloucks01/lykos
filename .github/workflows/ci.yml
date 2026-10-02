@@ -25,11 +25,13 @@ jobs:
         run: |
           sudo apt-get update
           # gcc + cross toolchains + qemu-user drive the cross-arch and 32-bit ARM tests; rizin +
-          # pypcode are the no-JVM RE backend the detect/eval tests exercise. --no-install-recommends
-          # keeps the image lean; anything a test needs and does not find, it SKIPs (never fails).
+          # pypcode are the no-JVM RE backend the detect/eval tests exercise; afl++ provides afl-cc
+          # + afl-fuzz so coverage_fuzz runs INSTRUMENTED on the native arch (no afl-qemu-trace
+          # needed -- qemu-mode is cross-arch only, P3.1). --no-install-recommends keeps the image
+          # lean; anything a test needs and does not find, it SKIPs (never fails).
           sudo apt-get install -y --no-install-recommends \
             gcc binutils gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf \
-            qemu-user qemu-user-static rizin
+            qemu-user qemu-user-static rizin afl++
           python -m pip install --upgrade pip
           pip install pypcode
       - name: Unit tests

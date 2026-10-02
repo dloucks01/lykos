@@ -31,19 +31,23 @@ TOOL = "aflpp"
 TOOL_VERSION = "aflpp-1"
 
 
-def toolchain_missing():
+def toolchain_missing(use_qemu=True):
     """Why coverage-guided fuzzing cannot run on this MACHINE, or None if it can.
 
     Separate from `_unsupported`, which answers about the TARGET. The distinction matters:
     "this jar has no machine code" is permanent and belongs in a decline, while "afl-qemu-trace
     is not installed" is an environment defect the operator can fix in ten minutes, and a
     stage that quietly reports zero crashes for it is the failure this codebase keeps hunting.
+
+    `use_qemu=False` is the afl-INSTRUMENTED path (an afl-cc build): it needs only afl-fuzz, NOT
+    afl-qemu-trace. Demanding the trace there made coverage_fuzz raise -- "fail loudly" -- on the
+    native arch even when it could run against an instrumented build (doc 30 P3.1).
     """
     afl = aflpp.locate_afl(None)
     if afl is None:
         return ("AFL++ not found (looked at LYKOS_AFL, AFL_PATH, PATH). Install afl++ with "
                 "afl-qemu, or use the built-in black-box `fuzz` stage instead.")
-    if aflpp.locate_qemu_trace(afl) is None:
+    if use_qemu and aflpp.locate_qemu_trace(afl) is None:
         return (f"AFL++ qemu-mode needs afl-qemu-trace, which is not installed next to {afl} "
                 f"or on PATH. Build it with AFL++'s qemu_mode/build_qemu_support.sh, pass "
                 f"params.qemu=false to fuzz an afl-instrumented build, or use the built-in "
@@ -51,7 +55,7 @@ def toolchain_missing():
     return None
 
 
-def _unsupported(target):
+def _unsupported(target, use_qemu=True):
     """Why AFL++ cannot drive this target, or None if it can.
 
     Returning a REASON rather than silently producing an empty campaign is the whole point:
@@ -67,6 +71,16 @@ def _unsupported(target):
         return ("AFL++ cannot instrument a Windows PE here, and the Wine path runs at about "
                 "one execution a second. Use `synthesize_poc`, which derives the overflow "
                 "from the recovered stack frame without executing at all.")
+    if not use_qemu:
+        # The afl-instrumented path (qemu=false) EXECUTES the target natively under afl-fuzz, so
+        # it needs no emulator -- but for the same reason it can only run a HOST-arch binary. A
+        # cross-arch instrumented build would fault natively; that case belongs in qemu-mode.
+        host = sandbox.host_arch()
+        if target.arch and host and target.arch != host:
+            return (f"afl-instrumented mode (qemu=false) runs the binary natively, but this "
+                    f"target is {target.arch} on a {host} host -- use qemu-mode (needs "
+                    f"afl-qemu-trace) or the black-box `fuzz` stage for a cross-arch target.")
+        return toolchain_missing(use_qemu=False)      # only afl-fuzz is required here
     # Which guest can the installed afl-qemu-trace actually run? Not "the host": it is an
     # EMULATOR, always built for the host and targeting one guest chosen at build time. This
     # check previously assumed host == guest, which blocked coverage-guided fuzzing on the one
@@ -116,15 +130,16 @@ def coverage_stage(ctx) -> dict:
         raise ValueError("coverage_fuzz requires a target_id")
 
     p = ctx.params or {}
-    # Can AFL++ drive this target AT ALL? afl-qemu-trace is built for the HOST architecture
-    # and AFL++ instruments native code, so a cross-architecture ELF, a Windows PE and a jar
-    # are all outside what this backend can execute -- and the failure is the quiet kind:
-    # measured on an aarch64 target, the campaign ran to completion and reported
-    # `crash_inputs: 0, unique: 0, confirmed: 0` with status `done`, which reads exactly like
-    # a thorough campaign that found nothing. The `advise` endpoint recommended it first for
-    # every one of the eleven non-host architectures in the corpus.
-    why = _unsupported(target)
-    if why and why == toolchain_missing():
+    use_qemu = bool(p.get("qemu", True))              # qemu-mode (uninstrumented) vs afl-cc build
+    # Can AFL++ drive this target AT ALL? In qemu-mode afl-qemu-trace is built for ONE guest and
+    # AFL++ instruments native code, so a cross-architecture ELF, a Windows PE and a jar are all
+    # outside what this backend can execute -- and the failure is the quiet kind: measured on an
+    # aarch64 target, the campaign ran to completion and reported `crash_inputs: 0, unique: 0,
+    # confirmed: 0` with status `done`, which reads exactly like a thorough campaign that found
+    # nothing. In the afl-instrumented path (qemu=false) only afl-fuzz is needed and the target
+    # runs natively, so the native arch can run WITHOUT afl-qemu-trace (doc 30 P3.1).
+    why = _unsupported(target, use_qemu)
+    if why and why == toolchain_missing(use_qemu):
         # environment, not target: raise so the run is visibly broken rather than a clean zero
         raise RuntimeError(why)
     if why:
@@ -152,7 +167,6 @@ def coverage_stage(ctx) -> dict:
         mode = "stdin"
     seconds = int(p.get("max_seconds", 30))
     exec_timeout = float(p.get("exec_timeout", 2))
-    use_qemu = bool(p.get("qemu", True))              # qemu-mode: fuzz an uninstrumented bin
     trace = aflpp.locate_qemu_trace_for(afl, target.arch) if target.arch else None
     afl_path = None
     if use_qemu and trace is not None:

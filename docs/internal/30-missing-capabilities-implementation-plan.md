@@ -214,11 +214,19 @@ baselines (unregressed). Recommended follow-ups recorded in doc 20.
 
 ## Phase 3 — Fuzzing yield on real parsers
 
-**3.1 `coverage_fuzz` (AFL) reliability.** (M) AFL-QEMU fails on this host and `file` reports the
-host arch for a fixed-guest emulator (the afl-qemu-trap in doc 20). *Approach:* detect the
-afl-qemu-trace guest/host mismatch at setup and fall back cleanly; document the provisioning;
-fix the fork-server handshake abort. *Acceptance:* `coverage_fuzz` runs (not "fails loudly") on at
-least the native arch in CI; coverage feedback actually reaches the campaign.
+**3.1 `coverage_fuzz` (AFL) reliability.** (M) ✅ **DONE.** The guest/host-mismatch detection and
+clean decline were already in place (`aflpp.qemu_trace_arch` names the guest the trace actually
+emulates; `_unsupported` declines a cross-arch target with a fix-it message; the fork-server abort
+is avoided by checking first). The remaining defect: `coverage_stage` raised `toolchain_missing`
+(which always demanded `afl-qemu-trace`) BEFORE honoring `qemu=false`, so the afl-INSTRUMENTED path
+— which executes the target natively under afl-fuzz and needs no emulator — was unreachable, and
+coverage_fuzz "failed loudly" on the native arch wherever `afl-qemu-trace` was absent (the common
+case; Ubuntu's `afl++` omits it). Fixed: `toolchain_missing`/`_unsupported` take `use_qemu`, so the
+instrumented path requires only afl-fuzz and declines only a cross-arch target (which can't run
+natively). *Acceptance (met):* `test_coverage_fuzz_real_campaign_confirms` now RUNS (was skipping)
+and confirms a crash via coverage-guided afl-cc instrumentation — coverage feedback reaching the
+campaign; `test_afl_arch.py` locks the native-runs/cross-arch-declines behavior. CI installs `afl++`
+so the real campaign executes on the native arch there (provisioning documented in `ci.yml`).
 
 **3.2 Format-aware, complete seeds.** (L) The generated seed is not a complete file (jhead's
 `ShowImageInfo` is 210 blocks the blind campaign never enters; jhead's own bug is still unfound).
