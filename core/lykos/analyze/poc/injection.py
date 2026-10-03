@@ -57,16 +57,35 @@ def sqli_payloads(marker: str):
             cols = ",".join([f"'{m}'"] + ["'x'"] * (n - 1))
             out.append(f"{prefix}UNION SELECT {cols}-- ")        # sqlite / mysql / pg line comment
             out.append(f"{prefix}UNION SELECT {cols}#")          # mysql hash comment
+    # error-based: an unbalanced quote makes the DB raise a PARSE error for targets that surface it
+    # (auth/count apps that never display query rows). The marker is appended so a verbatim echo of
+    # the payload is distinguishable from a genuine engine error (see sqli_confirm).
+    out += [f"'{m}", f'"{m}', f"') {m}", f"';{m}"]
     return out
 
 
+# DB engine parse/structure errors: their presence proves the input reached the SQL parser. Scoped
+# to messages a non-injectable (parameterised) target never emits for a literal string value.
+_SQL_ERRORS = (b"unrecognized token", b"sql logic error", b"no such column", b"incomplete input",
+               b"unterminated", b"syntax error", b"you have an error in your sql",
+               b"unclosed quotation", b"quoted string not properly terminated", b"sqlstate",
+               b"odbc", b"sqlite3::", b"near \"")
+
+
 def sqli_confirm(out: bytes, payload, marker: str) -> bool:
-    # the marker must surface because the UNION SELECT RAN (the DB returned it as a row), NOT because
-    # the program echoed our payload verbatim: if the whole payload (which contains the marker) is
-    # still present in the output it was reflected, not executed -- same test shape as cmdi_confirm.
     mk = marker.encode()
     pb = payload if isinstance(payload, bytes) else payload.encode()
-    return mk in out and pb not in out
+    # (1) UNION: the marker surfaced because the SELECT RAN (the DB returned it as a row), NOT
+    # because the program echoed our payload verbatim -- same shape as cmdi_confirm.
+    if mk in out and pb not in out:
+        return True
+    # (2) error-based: an error payload (an unbalanced quote) made the engine raise a parse error.
+    # Require the marker to NOT appear as the literal payload echo (which would mean reflection, not
+    # execution), and a DB parse-error signature to be present -- a parameterised target raises none.
+    low = out.lower()
+    if b"union select" not in pb.lower() and pb not in out and any(e in low for e in _SQL_ERRORS):
+        return True
+    return False
 
 
 def traversal_payloads():

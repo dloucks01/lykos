@@ -163,6 +163,44 @@ def test_xxe_confirmed(store, pool, gcc, tmp_path):
     assert f is not None and ("xxe" in f.title.lower() or "external entity" in f.title.lower())
 
 
+_SQLI_ERR = ('#include <stdio.h>\n#include <string.h>\n#include <unistd.h>\n'
+             'typedef struct sqlite3 sqlite3; typedef int(*cb)(void*,int,char**,char**);\n'
+             'extern int sqlite3_open(const char*,sqlite3**);\n'
+             'extern int sqlite3_exec(sqlite3*,const char*,cb,void*,char**);\n'
+             'extern int sqlite3_close(sqlite3*);\n'
+             'int main(void){sqlite3*db;sqlite3_open(":memory:",&db);'
+             'sqlite3_exec(db,"CREATE TABLE u(name TEXT);",0,0,0);'
+             'char u[128],q[512],*e=0;int n=read(0,u,sizeof u-1);if(n<=0)return 0;'
+             'if(u[n-1]==\'\\n\')n--;u[n]=0;'
+             'snprintf(q,sizeof q,"SELECT COUNT(*) FROM u WHERE name=\'%s\'",u);'  # VULNERABLE
+             'int rc=sqlite3_exec(db,q,0,0,&e);'
+             'if(rc!=0&&e)printf("DB error: %s\\n",e);else printf("query ok\\n");'  # surfaces error
+             'sqlite3_close(db);return 0;}\n')
+
+
+@pytest.mark.skipif(sandbox.host_arch() != "x86-64", reason="native x86-64")
+def test_sql_injection_error_based_confirmed(store, pool, gcc, tmp_path):
+    """An auth/count-style SQLi target that never displays rows but SURFACES the DB error is still
+    driven to a confirmed CWE-89 PoC via the error-based path (a parse error names our token)."""
+    import glob
+    if not (glob.glob("/usr/lib/x86_64-linux-gnu/libsqlite3.so*") or glob.glob("/usr/lib/libsqlite3.so*")
+            or glob.glob("/lib/x86_64-linux-gnu/libsqlite3.so*")):
+        pytest.skip("no libsqlite3 runtime")
+    c = tmp_path / "sqlie.c"; c.write_text(_SQLI_ERR); b = tmp_path / "sqlie"
+    if subprocess.run([gcc, "-O0", "-w", str(c), "-o", str(b), "-l:libsqlite3.so.0"],
+                      capture_output=True, check=False).returncode:
+        pytest.skip("cannot build sqlite3 fixture")
+    case = store.cases.create("sqlie"); target = ingest(store, case.id, b)
+    CallEdgeDAO(store.conn).replace_for_target(target.id, _edges(["sqlite3_exec", "sqlite3_open"]))
+    run = enqueue_inject(JobQueue(store.conn), target, params={"input_mode": "stdin", "timeout": 8})
+    assert pool.wait_idle(60)
+    if JobQueue(store.conn).runs.get(run.id).status != "done":
+        pytest.skip("sandbox unavailable")
+    f = next((f for f in FindingDAO(store.conn).list_by_target(target.id)
+              if f.detector == "inject_synth" and f.cwe == "CWE-89"), None)
+    assert f is not None and "sql injection" in f.title.lower()
+
+
 @pytest.mark.skipif(sandbox.host_arch() != "x86-64", reason="native x86-64")
 def test_sql_injection_confirmed(store, pool, gcc, tmp_path):
     """A C program that concatenates stdin into a sqlite3 query is driven to a confirmed CWE-89 PoC:

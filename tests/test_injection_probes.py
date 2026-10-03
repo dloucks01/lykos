@@ -149,6 +149,23 @@ def test_sqli_does_not_confirm_without_the_marker():
     assert not injection.sqli_confirm(b"", f"' UNION SELECT '{MARK}'-- ", MARK)
 
 
+def test_sqli_error_based_confirms_on_a_db_parse_error():
+    # an app that never shows rows but surfaces the DB error (auth/count apps): an unbalanced-quote
+    # payload makes the engine raise a parse error -> confirmed, no verbatim echo of the payload.
+    assert injection.sqli_payloads(MARK)[-4:]              # error-provoker payloads exist
+    assert injection.sqli_confirm(b'Error: near "x": syntax error', f"'{MARK}", MARK)
+    assert injection.sqli_confirm(b"unrecognized token at line 1", f"'{MARK}", MARK)
+
+
+def test_sqli_error_based_does_not_false_positive():
+    assert not injection.sqli_confirm(b"no results found\n", f"'{MARK}", MARK)       # benign
+    # a verbatim echo of the error payload is reflection, not execution
+    assert not injection.sqli_confirm((f"you searched: '{MARK} syntax error\n").encode(),
+                                      f"'{MARK}", MARK)
+    # a UNION payload must never confirm via the error branch
+    assert not injection.sqli_confirm(b"syntax error", f"' UNION SELECT '{MARK}'-- ", MARK)
+
+
 # ---- XXE ---------------------------------------------------------------------------------
 
 def test_xxe_payloads_declare_an_external_entity_to_a_local_file():
