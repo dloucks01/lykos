@@ -687,6 +687,21 @@ def find_aarch64_r2libc_gadgets(data: bytes) -> dict:
     return {"callers": callers, "loaders": loaders}
 
 
+def find_arm_r0pc_gadgets(data: bytes):
+    """ARM (32-bit, ARM mode) `pop {r0, ..., pc}` gadgets -- LDMFD sp!, {rlist} with both r0 and pc
+    in the list. LDM loads in register-number order from low memory, so r0 (lowest) comes off [sp]
+    and pc (r15, highest) off the last slot: one gadget sets the first argument AND the return PC,
+    the ARM32 ret2libc primitive (r0=&"/bin/sh", pc=&system). Returns [{va, nregs}] sorted by fewest
+    popped words (cleanest stack layout first). Encoding: pop {rlist} = 0xE8BD0000 | rlist;
+    r0=bit0, pc=bit15. Pure byte decode (the host objdump cannot disassemble ARM)."""
+    out = []
+    for va, w in _a64_words(data):                       # 4-byte little-endian words (reused)
+        if (w & 0xFFFF0000) == 0xE8BD0000 and (w & 0x8001) == 0x8001:
+            out.append({"va": va, "nregs": bin(w & 0xFFFF).count("1")})
+    out.sort(key=lambda g: g["nregs"])
+    return out
+
+
 def find_bx_gadgets_arm(data: bytes):
     """ARM (32-bit, ARM mode) `bx <Rn>` / `blx <Rn>` gadgets, as [{insn, reg, va}] (reg r0..r14).
     The ARM `jmp <reg>` -- branch (with optional link) to a register's value -- the only no-leak way
