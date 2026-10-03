@@ -559,23 +559,42 @@ def run_reaped(cmd, *, input=None, timeout=None, capture_output=False, **kw):
         kw["stdout"] = subprocess.PIPE
         kw["stderr"] = subprocess.PIPE
     kw.setdefault("start_new_session", True)
+    # Contain cwd for an UNWRAPPED detonation. isolate_prefix/_bwrap_prefix return [] when bwrap is
+    # unavailable (notably under memory pressure, where namespace setup fails); the caller then runs
+    # the target with no sandbox, inheriting the SERVER's cwd. A target that writes relative to cwd
+    # (unzip/tar extracting an archive whose entry name a fuzzer mutated, a tool dropping a file)
+    # then litters, and could clobber, the dir lykos was launched from. A bwrap-wrapped command
+    # chdirs inside its own sandbox, so cwd is irrelevant there -- pin one only when unwrapped with
+    # no caller cwd.
+    _tmp_cwd = None
+    _head = cmd[0] if cmd else ""
+    if isinstance(_head, bytes):
+        _head = _head.decode("latin-1", "ignore")
+    _wrapped = os.path.basename(str(_head)) == "bwrap"
+    if "cwd" not in kw and not _wrapped:
+        _tmp_cwd = tempfile.mkdtemp(prefix="lykos-reap-")
+        kw["cwd"] = _tmp_cwd
     # No input to feed => tie stdin to /dev/null, never inherit the worker's stdin: a hostile
     # inferior (gdb -batch has no input redirect unless a file is given) would otherwise block
     # reading the server's stdin, the same hang class fixed in jobs.context.run_subprocess.
     stdin = subprocess.PIPE if input is not None else kw.pop("stdin", subprocess.DEVNULL)
-    proc = subprocess.Popen(cmd, stdin=stdin, **kw)
-    out, err, timed = _communicate_capped(proc, input, timeout)
-    if timed:
-        raise subprocess.TimeoutExpired(cmd, timeout, output=out, stderr=err)
-    return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+    try:
+        proc = subprocess.Popen(cmd, stdin=stdin, **kw)
+        out, err, timed = _communicate_capped(proc, input, timeout)
+        if timed:
+            raise subprocess.TimeoutExpired(cmd, timeout, output=out, stderr=err)
+        return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+    finally:
+        if _tmp_cwd:
+            shutil.rmtree(_tmp_cwd, ignore_errors=True)
 
 
-def _spawn(cmd, stdin, timeout, preexec, env=None):
+def _spawn(cmd, stdin, timeout, preexec, env=None, cwd=None):
     start = time.monotonic()
     try:
         p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                              stderr=subprocess.PIPE, start_new_session=True,
-                             preexec_fn=preexec, env=env)
+                             preexec_fn=preexec, env=env, cwd=cwd)
     except Exception as e:
         return None, b"", ("spawn failed: %r" % e).encode(), False, 0
     out, err, timed = _communicate_capped(p, stdin, timeout)
@@ -961,40 +980,50 @@ def run(exe, *, argv=(), stdin: bytes = b"", timeout: float = 10.0,
         cmd = ["bwrap"] + _BWRAP_ARGS[:-1] + extra + ["--"] + inner
         iso = ("bwrap+netns" + ("+qemu" if emu else ""))
 
-    rc, out, err, timed, dur = _spawn(cmd, stdin, eff_timeout, preexec, env=env)
+    # Run in a throwaway working directory. The bwrap tier chdirs to its own tmpfs /tmp, but the
+    # rlimits-only tier (no bwrap, or the runtime fallback below) otherwise inherits the SERVER's
+    # cwd -- so a target that writes relative to cwd (unzip/tar extracting an archive, a tool that
+    # drops output files) littered, and could clobber, the directory lykos was launched from. A
+    # fuzzer feeding `unzip` a ZIP with a mutated filename field wrote junk files into the repo
+    # root this way. An empty per-run dir contains that; it is removed once the result is captured.
+    rundir = tempfile.mkdtemp(prefix="lykos-run-")
+    try:
+        rc, out, err, timed, dur = _spawn(cmd, stdin, eff_timeout, preexec, env=env, cwd=rundir)
 
-    # bubblewrap setup failed at runtime (some VMs rate-limit namespace creation) -> fall
-    # back to rlimits-only and stop trying bwrap this session.
-    if (iso.startswith("bwrap") and not timed and err.startswith(b"bwrap:")
-            and not _bwrap_probe_fresh()):
-        # bwrap genuinely cannot create a namespace here (confirmed by re-probing with a trusted
-        # /bin/true -- so this is not the target spoofing "bwrap:" on its own stderr to strip its
-        # sandbox). Fall back to rlimits-only for THIS run only; do NOT disable bwrap for the
-        # rest of the session on the strength of one run's output.
-        cmd, iso = inner, "rlimits-only" + ("+qemu" if emu else "")
-        rc, out, err, timed, dur = _spawn(cmd, stdin, eff_timeout, preexec, env=env)
+        # bubblewrap setup failed at runtime (some VMs rate-limit namespace creation) -> fall
+        # back to rlimits-only and stop trying bwrap this session.
+        if (iso.startswith("bwrap") and not timed and err.startswith(b"bwrap:")
+                and not _bwrap_probe_fresh()):
+            # bwrap genuinely cannot create a namespace here (confirmed by re-probing with a
+            # trusted /bin/true -- so this is not the target spoofing "bwrap:" on its own stderr
+            # to strip its sandbox). Fall back to rlimits-only for THIS run only; do NOT disable
+            # bwrap for the rest of the session on the strength of one run's output.
+            cmd, iso = inner, "rlimits-only" + ("+qemu" if emu else "")
+            rc, out, err, timed, dur = _spawn(cmd, stdin, eff_timeout, preexec, env=env, cwd=rundir)
 
-    # classify_rc() holds the one copy of this: native subprocesses report -signum while
-    # wrappers (bwrap/qemu) report 128+signum, and the two had drifted apart here.
-    crashed, sig, sig_name, exit_code = classify_rc(rc)
-    note, fault_pc, blocks_hit = None, None, None
-    if trace_log:
-        reached, last = _qemu_reached(trace_log, blocks, want_last=True)
-        note = ",".join(str(x) for x in reached) or None
-        blocks_hit = tuple(reached)
-        # Where it died, for an EMULATED target. The ptrace tracer cannot reach inside qemu,
-        # so a cross-architecture crash had no faulting address and every SIGSEGV in the
-        # program bucketed as one finding. qemu's log stops at the fault, so the last block it
-        # translated is the closest thing to a fault locus available here -- a block address,
-        # not the exact instruction, which is enough to tell two defects apart.
-        if crashed:
-            fault_pc = last
-        shutil.rmtree(Path(trace_log).parent, ignore_errors=True)
-    return RunResult(
-        isolation=iso, crashed=crashed, timed_out=timed,
-        exit_code=exit_code, signal=sig, signal_name=sig_name,
-        stdout=(out or b"")[:capture], stderr=(err or b"")[:capture],
-        duration_ms=dur, cmd=cmd, note=note, fault_pc=fault_pc, blocks_hit=blocks_hit)
+        # classify_rc() holds the one copy of this: native subprocesses report -signum while
+        # wrappers (bwrap/qemu) report 128+signum, and the two had drifted apart here.
+        crashed, sig, sig_name, exit_code = classify_rc(rc)
+        note, fault_pc, blocks_hit = None, None, None
+        if trace_log:
+            reached, last = _qemu_reached(trace_log, blocks, want_last=True)
+            note = ",".join(str(x) for x in reached) or None
+            blocks_hit = tuple(reached)
+            # Where it died, for an EMULATED target. The ptrace tracer cannot reach inside qemu,
+            # so a cross-architecture crash had no faulting address and every SIGSEGV in the
+            # program bucketed as one finding. qemu's log stops at the fault, so the last block it
+            # translated is the closest thing to a fault locus available here -- a block address,
+            # not the exact instruction, which is enough to tell two defects apart.
+            if crashed:
+                fault_pc = last
+            shutil.rmtree(Path(trace_log).parent, ignore_errors=True)
+        return RunResult(
+            isolation=iso, crashed=crashed, timed_out=timed,
+            exit_code=exit_code, signal=sig, signal_name=sig_name,
+            stdout=(out or b"")[:capture], stderr=(err or b"")[:capture],
+            duration_ms=dur, cmd=cmd, note=note, fault_pc=fault_pc, blocks_hit=blocks_hit)
+    finally:
+        shutil.rmtree(rundir, ignore_errors=True)
 
 
 _TRACE_PC = re.compile(rb"^Trace \d+: 0x[0-9a-f]+ \[[^/]*/([0-9a-f]+)/", re.M)

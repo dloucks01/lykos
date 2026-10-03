@@ -63,6 +63,12 @@ def compile_source(src: Path, filename: str, out: Path) -> dict:
     # Permissive: we are building to ANALYSE, not to ship. Modern gcc makes implicit
     # declarations and implicit int hard errors; downgrade them so ordinary sloppy C still
     # builds, and silence warnings so the diagnostics we surface are real failures.
+    # `-x c`/`-x c++` fixes the INPUT LANGUAGE explicitly. The compiler otherwise infers it from
+    # the file's on-disk extension, and the HTTP upload path hands us the body as `body.bin` (the
+    # real name lives only in `filename`): gcc then treats `.bin` as a linker input -- "file format
+    # not recognized; treating as linker script" -- and never compiles it. `-x none` after the
+    # source restores extension-based detection for the sanitizer-options TU that follows.
+    lang = "c++" if is_cxx else "c"
     base = [cc, "-g", "-O1", "-fno-omit-frame-pointer", f"-fsanitize={san}",
             "-fno-sanitize-recover=all", "-w",
             "-Wno-error=implicit-function-declaration", "-Wno-error=implicit-int",
@@ -70,7 +76,7 @@ def compile_source(src: Path, filename: str, out: Path) -> dict:
             # Let AddressSanitizer report the overflow with a file:line, instead of glibc's
             # _FORTIFY_SOURCE aborting first with a terse "buffer overflow detected".
             "-U_FORTIFY_SOURCE", "-D_FORTIFY_SOURCE=0",
-            str(src), str(opts_c), "-o", str(out)]
+            "-x", lang, str(src), "-x", "none", str(opts_c), "-o", str(out)]
     # Prefer DYNAMIC sanitizer runtimes. Static linking pulls the ENTIRE libasan/libubsan
     # implementation into the image -- ~3,800 functions for a one-line program -- which the RE
     # backend then spends ~100s and hundreds of MB analysing (nothing needs it), and on a loaded
@@ -107,10 +113,14 @@ def compile_source_msan(src: Path, filename: str, out: Path):
     opts_c = out.parent / "_lykos_msan_opts.c"
     opts_c.write_text('const char *__msan_default_options(void){'
                       'return "abort_on_error=1:halt_on_error=1";}\n')
+    # `-x`: see compile_source -- the upload path hands us `body.bin`, so pin the input language
+    # rather than let clang misread the extension.
+    lang = "c++" if ext in _CXX_EXT else "c"
     argv = [cc, "-g", "-O1", "-fno-omit-frame-pointer", "-fsanitize=memory",
             "-fsanitize-memory-track-origins=2", "-fno-sanitize-recover=all", "-w",
             "-Wno-error=implicit-function-declaration", "-Wno-error=implicit-int",
-            "-Wno-error=int-conversion", "-D_GNU_SOURCE", str(src), str(opts_c), "-o", str(out)]
+            "-Wno-error=int-conversion", "-D_GNU_SOURCE",
+            "-x", lang, str(src), "-x", "none", str(opts_c), "-o", str(out)]
     try:
         r = subprocess.run(argv, capture_output=True, text=True, timeout=120)
     except (OSError, subprocess.SubprocessError):
@@ -268,14 +278,22 @@ def ingest(store, case_id: str, path: str | Path, filename: Optional[str] = None
         # sanitizers and analyse the produced binary. Falls through to the prebuilt-binary bundle
         # path if the directory is not source, or the build produces nothing runnable.
         from . import source_project
+        build_log: Optional[str] = None
         if source_project.is_source_project(path):
             built = source_project.build_source_project(path)
             if built["ok"] and built["primary"]:
                 return _ingest_built_project(store, case_id, path, built,
                                              filename or path.name)
+            build_log = built.get("log")       # keep WHY the build failed for the error below
         # a challenge BUNDLE (prebuilt binary + loader/libc), or a source project that did not build
         main, dep_files = gather_bundle(path)
         if main is None:
+            # When this WAS recognised as source, the build failure is the real reason -- surface it
+            # (e.g. "cmake: No such file or directory" -> install the tool / run `make doctor`), not
+            # the generic bundle message, which reads as "lykos could not understand the input".
+            if build_log is not None:
+                raise NotAnalysable(
+                    f"{path.name}: source project did not build:\n{build_log.strip()[-600:]}")
             raise NotAnalysable(f"{path.name}: no analysable binary found in the bundle")
         return ingest(store, case_id, main, filename=filename or main.name, deps=dep_files)
     fname = filename or path.name

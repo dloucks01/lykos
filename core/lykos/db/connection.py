@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import itertools
 import sqlite3
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
@@ -14,6 +15,14 @@ from typing import Iterator
 # Pragmas applied to every connection. WAL + synchronous are persistent-ish / per-conn;
 # foreign_keys and busy_timeout MUST be set per connection (they do not persist).
 _BUSY_TIMEOUT_MS = 5000
+
+# A top-level BEGIN that still sees 'database is locked' after its full busy_timeout wait is
+# retried this many times with brief backoff before the error surfaces. The queue's hot writers
+# have their own retry (queue._begin_immediate); this gives the SAME resilience to every cold
+# writer that goes through transaction() -- the user-facing endpoints (create case, upload) among
+# them. Without it a case-create under heavy concurrent write load (several pipelines at once)
+# returned a bare HTTP 500 'database is locked' instead of waiting the storm out.
+_BEGIN_RETRIES = 5
 
 _SAVEPOINT_SEQ = itertools.count()
 
@@ -57,7 +66,7 @@ def transaction(conn: sqlite3.Connection, *, immediate: bool = False
         else:
             conn.execute(f"RELEASE {name}")
     else:
-        conn.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
+        _begin_resilient(conn, "BEGIN IMMEDIATE" if immediate else "BEGIN")
         try:
             yield conn
         except Exception:
@@ -65,3 +74,22 @@ def transaction(conn: sqlite3.Connection, *, immediate: bool = False
             raise
         else:
             conn.execute("COMMIT")
+
+
+def _begin_resilient(conn: sqlite3.Connection, stmt: str) -> None:
+    """Open a transaction, retrying a transient lock a few times past the busy_timeout wait.
+
+    Each attempt already blocks up to busy_timeout (5s) when another connection holds the write
+    lock; this rides out a longer storm instead of letting the OperationalError become a 500. A
+    non-lock OperationalError re-raises at once, and the final attempt lets the error surface."""
+    for i in range(max(1, _BEGIN_RETRIES)):
+        try:
+            conn.execute(stmt)
+            return
+        except sqlite3.OperationalError as e:
+            msg = str(e).lower()
+            if "lock" not in msg and "busy" not in msg:
+                raise
+            if i == _BEGIN_RETRIES - 1:
+                raise
+            time.sleep(0.05 * (i + 1))

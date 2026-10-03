@@ -41,6 +41,27 @@ def is_source_project(root) -> bool:
     return any(p.suffix in _SOURCE_EXT for p in root.rglob("*") if p.is_file())
 
 
+def _project_root(root: Path) -> Path:
+    """Descend through single wrapper directories before detecting the build system.
+
+    A release tarball unpacks to one top dir (`jhead-3.04/`), so the Makefile/CMakeLists/configure
+    lives one level down. Detecting the build system at the OUTER dir finds none of them and falls
+    to the loose "compile every .c together" path, which fails for any real multi-file project --
+    and ingest then reports "no analysable binary found in the bundle". Follow a chain of lone
+    subdirectories (bounded) to the real root; stop as soon as a level has a build file or more than
+    one meaningful entry."""
+    cur = Path(root)
+    for _ in range(8):                                    # bound against pathological nesting
+        if any((cur / f).exists() for f in _BUILD_FILES):
+            return cur
+        entries = [p for p in cur.iterdir() if not p.name.startswith(".")]
+        if len(entries) == 1 and entries[0].is_dir():
+            cur = entries[0]
+        else:
+            return cur
+    return cur
+
+
 def _which_cc():
     return (shutil.which("gcc") or shutil.which("clang"),
             shutil.which("g++") or shutil.which("clang++"))
@@ -62,12 +83,22 @@ def _write_wrappers(bindir: Path):
     return cc, cxx
 
 
+def _is_build_scaffold(p: Path) -> bool:
+    """CMake writes compiler-probe binaries -- CMakeDetermineCompilerABI_C.bin, CompilerIdC/a.out --
+    under `<build>/CMakeFiles/`, and they are LARGER than a tiny project binary, so picking the
+    largest new executable selected CMake's own scaffolding instead of the target. Final targets
+    never live under CMakeFiles/, so excluding that path component is safe."""
+    return "CMakeFiles" in p.parts
+
+
 def _elf_executables(root: Path, since: float):
     """Newly-produced ELF executables under `root` (ET_EXEC, or ET_DYN with an interpreter -- a PIE
     program, not a plain shared library). Object files, archives and .so libraries are excluded."""
     out = []
     for p in root.rglob("*"):
         if not p.is_file() or p.suffix in {".o", ".a", ".so", ".lo", ".la"} or ".so." in p.name:
+            continue
+        if _is_build_scaffold(p):                         # skip CMake's compiler-probe binaries
             continue
         try:
             if p.stat().st_mtime < since - 1:
@@ -91,7 +122,7 @@ def _elf_libraries(root: Path, since: float):
     (no main) links to. The sanitizer runtimes are excluded by name."""
     out = []
     for p in root.rglob("*"):
-        if not p.is_file():
+        if not p.is_file() or _is_build_scaffold(p):
             continue
         n = p.name
         if not (n.endswith(".so") or ".so." in n):
@@ -116,7 +147,7 @@ def build_source_project(root, *, timeout: int = 300) -> dict:
     {ok, system, binaries:[Path], primary:Path|None, compiler, log}. `binaries` is largest-first;
     `primary` is the biggest produced executable. `ok` is False (with the build log) when nothing
     executable came out."""
-    root = Path(root).resolve()
+    root = _project_root(Path(root).resolve())            # descend a `project-1.2/` wrapper dir
     cc, cxx = _which_cc()
     if not cc:
         return {"ok": False, "system": None, "binaries": [], "primary": None,
@@ -132,7 +163,6 @@ def build_source_project(root, *, timeout: int = 300) -> dict:
     env["CFLAGS"] = (env.get("CFLAGS", "") + " " + flags).strip()
     env["CXXFLAGS"] = (env.get("CXXFLAGS", "") + " " + flags).strip()
     env["LDFLAGS"] = (env.get("LDFLAGS", "") + " -fsanitize=address,undefined").strip()
-    start = time.time()
 
     def _run(argv, cwd=root):
         try:
@@ -142,52 +172,73 @@ def build_source_project(root, *, timeout: int = 300) -> dict:
         except (OSError, subprocess.SubprocessError) as e:
             return 1, f"{argv[0]}: {e}"
 
-    log, system = "", None
+    def _b_cmake():
+        bd = root / "_lykos_build"
+        bd.mkdir(exist_ok=True)
+        _, o1 = _run(["cmake", "-S", str(root), "-B", str(bd),
+                      f"-DCMAKE_C_COMPILER={wrapdir/'cc'}", f"-DCMAKE_CXX_COMPILER={wrapdir/'c++'}",
+                      "-DCMAKE_BUILD_TYPE=Debug"], cwd=root)
+        _, o2 = _run(["cmake", "--build", str(bd), "-j"], cwd=root)
+        return "cmake", o1 + o2
+
+    def _b_autotools():
+        _, o1 = _run(["./configure"], cwd=root)
+        _, o2 = _run(["make", "-j"], cwd=root)
+        return "autotools", o1 + o2
+
+    def _b_make():
+        # Pass the wrapped CC/flags as make VARIABLES too (override the Makefile's own).
+        _, o = _run(["make", "-j", f"CC={wrapdir/'cc'}", f"CXX={wrapdir/'c++'}",
+                     f"CFLAGS={flags}", f"CXXFLAGS={flags}",
+                     "LDFLAGS=-fsanitize=address,undefined"])
+        return "make", o
+
+    def _b_loose():
+        srcs = sorted(str(p) for p in root.rglob("*") if p.suffix in _SOURCE_EXT)
+        if not srcs:
+            return "loose", "no C/C++ sources found"
+        driver = str(wrapdir / "c++") if any(Path(s).suffix in _CXX_EXT for s in srcs) \
+            else str(wrapdir / "cc")
+        out = root / "a.lykos.bin"
+        _, log = _run([driver] + srcs + ["-o", str(out)])
+        if not out.exists():
+            # No main() (a LIBRARY) -> link a shared object instead, so a pure library still
+            # ingests. Static detectors run on it and the libFuzzer stage builds a harness for
+            # its exported functions from the retained source.
+            so = root / "a.lykos.so"
+            _, log2 = _run([driver, "-shared", "-fPIC"] + srcs + ["-o", str(so)])
+            log = log + "\n" + log2
+        return "loose", log
+
+    # Applicable builders in PREFERENCE order, each TRIED until one yields a binary -- a real
+    # project often ships more than one (zlib carries CMakeLists.txt AND a configure/Makefile), and
+    # the preferred one can fail for reasons unrelated to the code: modern CMake 4.x rejects an old
+    # `cmake_minimum_required(VERSION <3.5)`, so committing to cmake alone gave up on a project that
+    # builds fine via ./configure. `loose` (compile the sources directly) is always the last resort.
+    builders = []
+    if (root / "compile_commands.json").exists() or (root / "CMakeLists.txt").exists():
+        builders.append(_b_cmake)
+    if (root / "configure").exists():
+        builders.append(_b_autotools)
+    if any((root / m).exists() for m in ("Makefile", "makefile", "GNUmakefile")):
+        builders.append(_b_make)
+    builders.append(_b_loose)
+
+    full_log, system = "", None
     try:
-        if (root / "compile_commands.json").exists() or (root / "CMakeLists.txt").exists():
-            system = "cmake"
-            bd = root / "_lykos_build"
-            bd.mkdir(exist_ok=True)
-            rc, o1 = _run(["cmake", "-S", str(root), "-B", str(bd),
-                           f"-DCMAKE_C_COMPILER={wrapdir/'cc'}", f"-DCMAKE_CXX_COMPILER={wrapdir/'c++'}",
-                           "-DCMAKE_BUILD_TYPE=Debug"], cwd=root)
-            rc2, o2 = _run(["cmake", "--build", str(bd), "-j"], cwd=root)
-            log = o1 + o2
-        elif (root / "configure").exists():
-            system = "autotools"
-            rc, o1 = _run(["./configure"], cwd=root)
-            rc2, o2 = _run(["make", "-j"], cwd=root)
-            log = o1 + o2
-        elif any((root / m).exists() for m in ("Makefile", "makefile", "GNUmakefile")):
-            system = "make"
-            # Pass the wrapped CC/flags as make VARIABLES too (override the Makefile's own).
-            rc, log = _run(["make", "-j", f"CC={wrapdir/'cc'}", f"CXX={wrapdir/'c++'}",
-                            f"CFLAGS={flags}", f"CXXFLAGS={flags}",
-                            "LDFLAGS=-fsanitize=address,undefined"])
-        else:
-            system = "loose"
-            srcs = sorted(str(p) for p in root.rglob("*") if p.suffix in _SOURCE_EXT)
-            if not srcs:
-                return {"ok": False, "system": "loose", "binaries": [], "primary": None,
-                        "compiler": Path(cc).name, "log": "no C/C++ sources found"}
-            driver = str(wrapdir / "c++") if any(Path(s).suffix in _CXX_EXT for s in srcs) \
-                else str(wrapdir / "cc")
-            out = root / "a.lykos.bin"
-            rc, log = _run([driver] + srcs + ["-o", str(out)])
-            if rc != 0 or not out.exists():
-                # No main() (a LIBRARY) -> link a shared object instead, so a pure library still
-                # ingests. Static detectors run on it and the libFuzzer stage builds a harness for
-                # its exported functions from the retained source.
-                so = root / "a.lykos.so"
-                rc, log2 = _run([driver, "-shared", "-fPIC"] + srcs + ["-o", str(so)])
-                log = log + "\n" + log2
-                system = "loose-shared"
-        bins = _elf_executables(root, start)
-        kind = "executable"
-        if not bins:                                     # a library build (shared object)
-            bins = _elf_libraries(root, start)
-            kind = "library"
-        return {"ok": bool(bins), "system": system, "kind": kind, "binaries": bins,
-                "primary": bins[0] if bins else None, "compiler": Path(cc).name, "log": log[-4000:]}
+        for build in builders:
+            start = time.time()                          # attribute binaries to THIS builder only
+            system, log = build()
+            full_log += f"\n== {system} ==\n{log}"
+            bins = _elf_executables(root, start)
+            kind = "executable"
+            if not bins:                                 # a library build (shared object)
+                bins = _elf_libraries(root, start)
+                kind = "library"
+            if bins:
+                return {"ok": True, "system": system, "kind": kind, "binaries": bins,
+                        "primary": bins[0], "compiler": Path(cc).name, "log": full_log[-4000:]}
+        return {"ok": False, "system": system, "kind": "executable", "binaries": [],
+                "primary": None, "compiler": Path(cc).name, "log": full_log[-4000:]}
     finally:
         shutil.rmtree(wrapdir, ignore_errors=True)

@@ -1,5 +1,9 @@
 """DM-19 — migration runner + schema + pragmas."""
-from lykos.db.connection import connect
+import sqlite3
+
+import pytest
+from lykos.db import connection
+from lykos.db.connection import connect, transaction
 from lykos.db.migrations import apply_migrations, current_version, init_db
 from lykos.db.schema import MIGRATIONS
 
@@ -51,3 +55,49 @@ def test_indexes_present(tmp_path):
            conn.execute("SELECT name FROM sqlite_master WHERE type='index'").fetchall()}
     assert {"ix_run_case", "ix_run_cache", "ix_event_case", "ix_event_run",
             "ix_target_case"}.issubset(idx)
+
+
+class _FlakyConn:
+    """A connection whose BEGIN raises 'database is locked' a fixed number of times, then works.
+    Everything else delegates to a real connection so COMMIT/ROLLBACK behave."""
+    def __init__(self, real, fail_times):
+        self._real, self._fail = real, fail_times
+        self.begins = 0
+        self.in_transaction = False
+
+    def execute(self, sql, *a):
+        if sql.startswith("BEGIN"):
+            self.begins += 1
+            if self._fail > 0:
+                self._fail -= 1
+                raise sqlite3.OperationalError("database is locked")
+        return self._real.execute(sql, *a)
+
+
+def test_transaction_rides_out_transient_lock(tmp_path):
+    # A cold writer (an endpoint, say) must not 500 because the write lock was briefly held: the
+    # top-level BEGIN retries past the busy_timeout wait. Three transient locks, then success.
+    real = connect(tmp_path / "x.db")
+    flaky = _FlakyConn(real, fail_times=3)
+    with transaction(flaky):
+        pass
+    assert flaky.begins == 4                        # 3 locked retries + 1 that stuck
+
+
+def test_transaction_gives_up_after_retries(tmp_path, monkeypatch):
+    monkeypatch.setattr(connection, "_BEGIN_RETRIES", 2)
+    flaky = _FlakyConn(connect(tmp_path / "x.db"), fail_times=99)
+    with pytest.raises(sqlite3.OperationalError):
+        with transaction(flaky):
+            pass
+    assert flaky.begins == 2                         # bounded: it does not spin forever
+
+
+def test_transaction_reraises_non_lock_error_at_once(tmp_path):
+    class _Boom:
+        in_transaction = False
+        def execute(self, sql, *a):
+            raise sqlite3.OperationalError("no such table: nope")
+    with pytest.raises(sqlite3.OperationalError, match="no such table"):
+        with transaction(_Boom()):
+            pass

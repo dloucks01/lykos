@@ -65,6 +65,44 @@ def test_sandbox_timeout(bins):
     assert res.timed_out and not res.crashed
 
 
+def test_run_reaped_unwrapped_does_not_litter_cwd(tmp_path, monkeypatch):
+    """When bwrap is down, isolate_prefix returns [] and detonation paths run the target UNWRAPPED
+    via run_reaped -- which would inherit the server's cwd. A target that writes relative to cwd
+    (unzip extracting a fuzzed archive) then littered the launch dir. run_reaped now pins an
+    unwrapped command to a throwaway cwd. Assert a bare writer does not touch the launch dir."""
+    import os
+    launch = tmp_path / "launch"
+    launch.mkdir()
+    monkeypatch.chdir(launch)
+    # unwrapped command (no bwrap prefix), no cwd kwarg -> run_reaped must contain it
+    r = sandbox.run_reaped(["/bin/sh", "-c", "echo x > litter.out; exit 0"],
+                           timeout=10, capture_output=True)
+    assert r.returncode == 0
+    assert os.listdir(launch) == [], "run_reaped let an unwrapped target litter the launch cwd"
+
+
+def test_sandbox_rlimits_tier_does_not_litter_cwd(gcc, tmp_path, monkeypatch):
+    """A target that writes relative to its cwd must not touch the directory lykos runs in. The
+    bwrap tier chdirs into its own tmpfs; the rlimits-only tier used to inherit the server's cwd,
+    so a file-writing target (a fuzzer's `unzip` extracting a mutated archive) littered the repo
+    root. Force the rlimits-only tier and assert the launch cwd stays clean."""
+    import os
+    c = tmp_path / "w.c"
+    c.write_text('#include <stdio.h>\nint main(){FILE*f=fopen("litter.out","w");'
+                 'if(f){fputs("x",f);fclose(f);}return 0;}\n')
+    exe = tmp_path / "w"
+    if subprocess.run([gcc, "-O0", str(c), "-o", str(exe)], capture_output=True).returncode != 0:
+        pytest.skip("build failed")
+    monkeypatch.setattr(sandbox, "_bwrap_usable", lambda: False)   # force the rlimits-only tier
+    launch = tmp_path / "launchdir"
+    launch.mkdir()
+    monkeypatch.chdir(launch)
+    res = sandbox.run(str(exe), timeout=10)
+    assert res.isolation == "rlimits-only"
+    assert not (launch / "litter.out").exists(), "target wrote into the launch cwd"
+    assert os.listdir(launch) == [], "launch cwd was littered by the detonated target"
+
+
 _ASAN_SRC = (
     "#include <unistd.h>\n#include <stdlib.h>\n#include <string.h>\n"
     "int main(){char*b=malloc(16);char t[256];int n=read(0,t,255);"
