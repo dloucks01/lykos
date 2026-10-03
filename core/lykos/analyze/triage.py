@@ -12,6 +12,7 @@ from typing import Any, Optional
 from . import elf as elfmod
 from . import filetype
 from . import jvm as jvmmod
+from . import macho as machomod
 from . import pe as pemod
 
 SCHEMA_VERSION = 1
@@ -270,11 +271,34 @@ def build_triage(path: str | Path, hashes: dict[str, Any], filename: str) -> dic
             f"own, then analyse those. Disassembly and the dynamic stages apply to the "
             f"carved components, not to the image.")
     elif rec["file_type"] == filetype.MACHO:
-        parse_errors.append("mach-o parsing pending (detected only)")
-        rec["detected"] = "MACHO (detected only)"
-        rec["analyzable"] = False
-        rec["advisory"] = ("Mach-O binary detected, but this build parses ELF and PE headers "
-                           "only. Format and hashes were recorded.")
+        info = machomod.parse(data)
+        parse_errors.extend(info.errors)
+        rec.update({
+            "arch": info.arch, "bits": info.bits, "endianness": info.endianness,
+            "linking": info.linking, "stripped": info.stripped,
+            "entry_point": (f"0x{info.entry:x}" if info.entry is not None else None),
+            "interpreter": info.interpreter, "sections": info.sections, "imports": info.imports,
+            "exports_count": info.exports_count,
+            "exports": {"count": info.exports_count, "symbols": info.exported_symbols},
+            "toolchain_hint": info.toolchain_hint, "mitigations": info.mitigations,
+            "format_details": machomod.to_format_details(info),
+        })
+        rec["detected"] = _describe(rec) + (" (universal)" if info.fat else "")
+        # Header-level analysis is real (arch, linked dylibs, symbols, mitigations, and the
+        # string/symbol/invocation detectors all apply, plus Ghidra disassembles Mach-O). What is
+        # missing is the Linux/ELF dynamic stack: qemu-user/Wine cannot run a macOS binary here, so
+        # the dynamic/fuzzing/PoC stages do not -- say that precisely rather than "detected only".
+        rec["analyzable"] = True
+        enc = " The __TEXT is FairPlay-encrypted, so the code pages read here are ciphertext." \
+            if info.encrypted else ""
+        rec["advisory"] = (
+            "Mach-O analysed: header, architecture, linked dylibs, symbol table and the "
+            "advertised mitigations (PIE, stack execution, code signature, encryption) were "
+            "parsed, so the string, symbol and invocation detectors and Ghidra disassembly apply."
+            + enc +
+            " Not available for Mach-O: the dynamic stages (fuzzing, the heap checker, PoC "
+            "levels L1-L3) -- running a macOS/iOS binary needs a macOS host or emulator this "
+            "Linux build does not provide.")
     else:
         # Before calling this "not a binary", ask the headerless loader and the carve scan --
         # a firmware image without a container magic at offset 0 is still firmware, and saying
