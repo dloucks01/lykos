@@ -6,6 +6,8 @@ PE = "pe"
 MACHO = "macho"
 JAR = "jar"
 CLASS = "class"
+WASM = "wasm"
+PYC = "pyc"
 FIRMWARE = "firmware"
 RAW = "raw"
 OTHER = "other"
@@ -52,6 +54,18 @@ def detect(head: bytes) -> str:
         return MACHO
     if head[:4] in _MACHO_MAGICS:
         return MACHO
+    if head[:4] == b"\x00asm":
+        # WebAssembly: "\0asm" then a 4-byte LE version (1 for the MVP). The magic alone is
+        # distinctive enough; the version is checked in the parser.
+        return WASM
+    if len(head) >= 16 and head[2:4] == b"\r\n":
+        # CPython bytecode: a 2-byte LE version magic that increments every release, always followed
+        # by 0x0d 0x0a. Rather than enumerate every release's magic, accept the ranges CPython has
+        # ever used (3.x is ~3000-4000; 2.x ~20000-65000), with the \r\n and a 16-byte header guard
+        # against a chance collision. The parser maps the exact magic to a Python version or rejects.
+        v = head[0] | (head[1] << 8)
+        if 3000 <= v <= 4000 or 20000 <= v <= 65000:
+            return PYC
     for magic, _desc in FIRMWARE_MAGICS:
         if head[:len(magic)] == magic:
             return FIRMWARE

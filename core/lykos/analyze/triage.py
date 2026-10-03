@@ -14,6 +14,8 @@ from . import filetype
 from . import jvm as jvmmod
 from . import macho as machomod
 from . import pe as pemod
+from . import pyc as pycmod
+from . import wasm as wasmmod
 
 SCHEMA_VERSION = 1
 TOOL = "elf-stdlib"
@@ -21,7 +23,8 @@ TOOL_VERSION = "triage-4"          # bump to invalidate the cache when parsing c
 #   triage-4: static-pie linking classification (PT_DYNAMIC no longer implies dynamic)
 MITIGATION_ENUM = {"on", "off", "partial", "unknown"}
 _FILE_TYPES = {filetype.ELF, filetype.PE, filetype.MACHO, filetype.JAR,
-               filetype.CLASS, filetype.FIRMWARE, filetype.RAW, filetype.OTHER}
+               filetype.CLASS, filetype.WASM, filetype.PYC, filetype.FIRMWARE,
+               filetype.RAW, filetype.OTHER}
 _PACK_ENTROPY = 7.2
 # Entropy is a whole-file scan in pure Python; on every ingest that is a DoS on a large upload.
 # A 2 MB prefix is representative for the packer heuristic and matches the ELF/PE section cap.
@@ -257,6 +260,45 @@ def build_triage(path: str | Path, hashes: dict[str, Any], filename: str) -> dic
             "disassembly and P-Code analysis (there is no machine code), and PoC levels "
             "L2/L3 -- the JVM owns the instruction pointer, so control-flow hijack is not "
             "a claim this format can support.")
+    elif rec["file_type"] == filetype.WASM:
+        info = wasmmod.parse(data)
+        parse_errors.extend(info.errors)
+        rec.update({
+            "arch": info.arch, "bits": info.bits, "endianness": info.endianness,
+            "linking": info.linking, "imports": info.imports,
+            "exports_count": info.exports_count,
+            "exports": {"count": info.exports_count, "symbols": info.exported_symbols},
+            "sections": info.sections, "toolchain_hint": info.toolchain_hint,
+            "mitigations": info.mitigations, "format_details": wasmmod.to_format_details(info),
+        })
+        rec["detected"] = (f"WebAssembly module (v{info.version}, {info.func_count} functions, "
+                           f"{len(info.imported_symbols)} imports, {info.exports_count} exports)")
+        rec["analyzable"] = True
+        rec["advisory"] = (
+            "WebAssembly analysed: the module's imports (its host call surface), exports, "
+            "function/memory counts and all embedded strings were parsed, so the string, import "
+            "and invocation detectors apply. Not available for WASM: native disassembly and the "
+            "x86/ELF dynamic stages -- a .wasm has no machine code or addressable call stack, and "
+            "its linear memory is bounds-checked by the engine, so the stack-smash/NX/PIE/PoC "
+            "ladder does not apply; run it under a wasm engine (wasmtime/node) for dynamic work.")
+    elif rec["file_type"] == filetype.PYC:
+        info = pycmod.parse(data)
+        parse_errors.extend(info.errors)
+        rec.update({
+            "arch": info.arch, "endianness": info.endianness, "imports": info.imports,
+            "stripped": False, "toolchain_hint": info.toolchain_hint,
+            "mitigations": info.mitigations, "format_details": pycmod.to_format_details(info),
+        })
+        rec["detected"] = (f"CPython bytecode (.pyc) — Python {info.python_version}"
+                           + (", hash-based" if info.hash_based else ""))
+        rec["analyzable"] = True
+        rec["advisory"] = (
+            f"CPython {info.python_version} bytecode analysed: the version magic, header and the "
+            "readable identifiers/strings in the marshalled code object were parsed, so the string "
+            "and invocation detectors apply (and the module can be decompiled to source with a "
+            "decompiler such as decompyle3/uncompyle6 for review). Not available for .pyc: native "
+            "disassembly and the x86/ELF dynamic/PoC stages -- the CPython VM owns the instruction "
+            "pointer, so control-flow hijack is not a claim this format supports.")
     elif rec["file_type"] == filetype.FIRMWARE:
         kind = filetype.firmware_kind(data[:64]) or "firmware image"
         rec["detected"] = f"Firmware image — {kind}"
