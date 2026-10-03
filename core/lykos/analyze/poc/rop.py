@@ -618,6 +618,75 @@ def find_br_gadgets_aarch64(data: bytes):
     return out
 
 
+_A64_RET = 0xD65F03C0                                    # ret (x30)
+_A64_NOPS = {0xD503201F, 0xD50323BF, 0xD50323FF,         # nop, autiasp, autibsp
+             0xD503235F, 0xD503239F}                     # autiaz, autibz (auth = nop under qemu)
+
+
+def _a64_words(data: bytes):
+    """(va, word) for every 4-byte instruction in executable segments (little-endian aarch64)."""
+    for off, sz, va, flags in _loads(data):
+        if not (flags & 1):
+            continue
+        for p in range(off, off + (sz & ~3) - 3, 4):
+            yield va + (p - off), int.from_bytes(data[p:p + 4], "little")
+
+
+def _a64_ldp_regs(w: int):
+    """(Rt, Rt2, Rn) if `w` is a 64-bit LDP (post-index / signed-offset / pre-index), else None."""
+    if (w & 0xFFC00000) in (0xA8C00000, 0xA9400000, 0xA9C00000):
+        return w & 0x1F, (w >> 10) & 0x1F, (w >> 5) & 0x1F
+    return None
+
+
+def find_aarch64_r2libc_gadgets(data: bytes) -> dict:
+    """AArch64 two-gadget ret2libc gadgets, decoded straight from the bytes (no objdump -- the host
+    objdump cannot disassemble aarch64, so this is pure-stdlib like `find_br_gadgets_aarch64`):
+
+      caller: `mov x0, xS ; blr xB`  -- set x0 from a callee-saved reg, then call another one.
+      loader: `ldp xR1, xR2, [sp,..] ; ... ; ldp x29, x30, [sp], #M ; (auti*;) ret` -- pop two
+              callee-saved regs AND the return address off the stack, then return.
+
+    Chaining a loader whose {R1,R2} == a caller's {S,B} gives system("/bin/sh"): the loader sets
+    xS=&"/bin/sh", xB=&system and x30=caller; the caller does x0=xS; blr xB. Returns
+    {"callers":[{va,src,br}], "loaders":[{va,r1,r2}]} (reg indices). Pointer-authentication
+    (`autiasp`) is a no-op under qemu-user, so those epilogues are usable gadgets."""
+    words = list(_a64_words(data))
+    callers, loaders = [], []
+    for i in range(len(words) - 1):
+        va, w = words[i]
+        if (w & 0xFFE0FFFF) == 0xAA0003E0:               # mov x0, xS  (orr x0, xzr, xS)
+            s = (w >> 16) & 0x1F
+            w2 = words[i + 1][1]
+            if (w2 & 0xFFFFFC1F) == 0xD63F0000 and s < 29:   # blr xB
+                callers.append({"va": va, "src": s, "br": (w2 >> 5) & 0x1F})
+    for i in range(len(words)):
+        va, w = words[i]
+        regs = _a64_ldp_regs(w)
+        if not regs:
+            continue
+        r1, r2, rn = regs
+        if rn != 31 or r1 in (29, 30, 31) or r2 in (29, 30, 31):
+            continue                                     # must load two GPRs from sp
+        for k in range(i + 1, min(i + 8, len(words))):
+            wk = words[k][1]
+            if wk in _A64_NOPS:
+                continue
+            lr = _a64_ldp_regs(wk)
+            if lr and lr[0] == 29 and lr[1] == 30 and lr[2] == 31:   # ldp x29, x30, [sp], #M
+                for j in range(k + 1, min(k + 4, len(words))):
+                    wj = words[j][1]
+                    if wj in _A64_NOPS:
+                        continue
+                    if wj == _A64_RET:
+                        loaders.append({"va": va, "r1": r1, "r2": r2})
+                    break
+                break
+            if lr and (lr[0] in (r1, r2) or lr[1] in (r1, r2)):
+                break                                    # r1/r2 clobbered before the restore
+    return {"callers": callers, "loaders": loaders}
+
+
 def find_bx_gadgets_arm(data: bytes):
     """ARM (32-bit, ARM mode) `bx <Rn>` / `blx <Rn>` gadgets, as [{insn, reg, va}] (reg r0..r14).
     The ARM `jmp <reg>` -- branch (with optional link) to a register's value -- the only no-leak way

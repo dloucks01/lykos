@@ -38,6 +38,71 @@ def test_find_br_gadgets_aarch64():
     assert ("blr", "x0") in found and ("br", "x1") in found
 
 
+def test_find_aarch64_r2libc_gadgets():
+    """The byte-decode scanner (no objdump) finds the caller (mov x0,xS; blr xB) and loader
+    (ldp xR1,xR2,[sp]; ldp x29,x30,[sp],#M; ret), and a {src,br}=={r1,r2} pair chains them."""
+    def ldp(rt, rt2, rn, imm, base):                      # 64-bit LDP, base picks the index mode
+        return base | ((imm // 8 & 0x7F) << 15) | (rt2 << 10) | (rn << 5) | rt
+    seg = struct.pack("<I", 0xAA0003E0 | (19 << 16))      # mov x0, x19
+    seg += struct.pack("<I", 0xD63F0000 | (20 << 5))      # blr x20   (caller @ +0)
+    loader = struct.pack("<I", ldp(19, 20, 31, 16, 0xA9400000))   # ldp x19,x20,[sp,#16]
+    loader += struct.pack("<I", ldp(29, 30, 31, 32, 0xA8C00000))  # ldp x29,x30,[sp],#32 (post)
+    loader += struct.pack("<I", 0xD65F03C0)               # ret       (loader @ +8)
+    seg += loader
+    orig = rop._loads
+    rop._loads = lambda data: [(0, len(seg), 0x400000, 1)]
+    try:
+        g = rop.find_aarch64_r2libc_gadgets(seg)
+    finally:
+        rop._loads = orig
+    assert any(c["src"] == 19 and c["br"] == 20 for c in g["callers"])
+    assert any(ll["r1"] == 19 and ll["r2"] == 20 for ll in g["loaders"])
+    assert any({c["src"], c["br"]} == {ll["r1"], ll["r2"]}
+               for c in g["callers"] for ll in g["loaders"])
+
+
+@pytest.mark.skipif(not (_A64_GCC and _QEMU),
+                    reason="needs aarch64-linux-gnu-gcc + qemu-aarch64")
+def test_auto_files_l3_aarch64_ret2libc(store, tmp_path):
+    """strategy=auto drives an NX-ON AArch64 stack overflow to a confirmed L3 ret2libc: a two-gadget
+    chain (ldp loader + `mov x0,x19; blr x20` caller) calls system("/bin/sh"), confirmed by reaching
+    `system` with x0=&"/bin/sh" under the qemu debugger + a negative control. No execstack, no leak."""
+    from lykos.analyze import register
+    from lykos.analyze.ingest import enqueue_triage, ingest
+    from lykos.analyze.poc import enqueue_exploit
+    from lykos.db.dao import PocDAO
+    from lykos.jobs import JobConfig, JobQueue, WorkerPool
+    src = tmp_path / "v.c"
+    src.write_text(
+        '#include <stdlib.h>\n#include <unistd.h>\n'
+        'char cmd[16] = "/bin/sh";\n'
+        # the ret2libc caller gadget (the rare piece; a solvable target provides it, as x86-64
+        # fixtures provide "pop rdi; ret"). The ldp x19,x20/ldp x29,x30 loader is ubiquitous.
+        '__asm__(".text\\n.global r2l_gadget\\nr2l_gadget:\\n mov x0, x19\\n blr x20\\n");\n'
+        'void vuln(void){ char b[64]; read(0,b,1024); }\n'
+        'int main(int argc,char**argv){ if(argc>99) system(argv[0]); vuln(); return 0; }\n')
+    exe = tmp_path / "v"
+    if subprocess.run([_A64_GCC, "-O0", "-fno-stack-protector", "-no-pie", "-static",
+                       "-mbranch-protection=none", "-w", str(src), "-o", str(exe)],
+                      capture_output=True).returncode:
+        pytest.skip("cannot build aarch64 ret2libc fixture")
+    register()
+    pool = WorkerPool(store.db_path, store.content, JobConfig(workers=2, poll_interval=0.02))
+    pool.start()
+    try:
+        t = ingest(store, store.cases.create("a64r2l").id, exe, filename="v")
+        q = JobQueue(store.conn)
+        enqueue_triage(q, t, force=True)
+        assert pool.wait_idle(180)
+        assert (store.targets.get(t.id).mitigations or {}).get("nx") != "off"   # NX on
+        run = enqueue_exploit(q, t, params={"strategy": "auto", "timeout": 12})
+        assert pool.wait_idle(400) and q.runs.get(run.id).status == "done"
+    finally:
+        pool.stop(grace=3.0)
+    l3 = [pc for pc in PocDAO(store.conn).list_by_target(t.id) if pc.level == "L3" and pc.verified]
+    assert l3, "no confirmed L3 AArch64 ret2libc"
+
+
 @pytest.mark.skipif(not (_A64_GCC and _QEMU),
                     reason="needs aarch64-linux-gnu-gcc + qemu-aarch64")
 def test_auto_files_l3_aarch64_ret2shellcode(store, tmp_path):
