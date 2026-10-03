@@ -166,6 +166,15 @@ def _disclosure_effect(ctx, spec, hit, input_sha, bundle_sha):
                  "detail": "the query returns attacker-chosen rows",
                  "proof": {"type": "artifact", "sha": proof_sha, "input_sha": input_sha}}]
         title = "SQL injection (demonstrated)"
+    elif cwe == "CWE-611":
+        proof_sha = ctx.put_artifact("disclosure-proof", data=out[:4096])
+        effs = [{"kind": "info-disclosure", "title": "XML external entity (file disclosure)",
+                 "status": "demonstrated",
+                 "detail": "an external XML entity resolved a local file (/etc/passwd) and its "
+                           "content was returned -- the parser substitutes attacker-named SYSTEM "
+                           "entities (can also reach internal network services / exfil)",
+                 "proof": {"type": "artifact", "sha": proof_sha, "input_sha": input_sha}}]
+        title = "Information disclosure (demonstrated): XML external entity (XXE)"
     else:                                              # path traversal etc. -> disclosure
         proof_sha = ctx.put_artifact("disclosure-proof", data=out[:4096])
         effs = [{"kind": "info-disclosure", "title": "Information disclosure",

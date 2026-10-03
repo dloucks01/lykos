@@ -149,6 +149,21 @@ def test_sqli_does_not_confirm_without_the_marker():
     assert not injection.sqli_confirm(b"", f"' UNION SELECT '{MARK}'-- ", MARK)
 
 
+# ---- XXE ---------------------------------------------------------------------------------
+
+def test_xxe_payloads_declare_an_external_entity_to_a_local_file():
+    pays = injection.xxe_payloads(MARK)
+    assert pays and all(b"<!DOCTYPE" in p and b"SYSTEM" in p for p in pays)
+    assert any(b"/etc/passwd" in p for p in pays)
+    assert any(b"file://" in p for p in pays)
+
+
+def test_xxe_confirms_only_on_the_leaked_file_contents():
+    # XXE reuses the traversal oracle: the entity resolved /etc/passwd and its content came back
+    assert injection.traversal_confirm(b"parsed: root:x:0:0:root:/root:/bin/sh\n", b"", "")
+    assert not injection.traversal_confirm(b"parsed: hello\n", b"", "")
+
+
 # ---- the probe table ---------------------------------------------------------------------
 
 def test_every_probe_is_wired_end_to_end():

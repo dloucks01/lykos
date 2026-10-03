@@ -98,6 +98,37 @@ def test_path_traversal_confirmed(store, pool, gcc, tmp_path):
     assert _run(store, pool, gcc, tmp_path, _TRAV, "tv", ["fopen"], "CWE-22")
 
 
+_XXE = ('#include <stdio.h>\n#include <unistd.h>\n'
+        '#include <libxml/parser.h>\n#include <libxml/tree.h>\n'
+        'int main(void){char b[8192];int n=read(0,b,sizeof b-1);if(n<=0)return 0;b[n]=0;'
+        'xmlDocPtr d=xmlReadMemory(b,n,"in.xml",0,XML_PARSE_NOENT|XML_PARSE_DTDLOAD);'
+        'if(!d){printf("parse error\\n");return 1;}xmlNodePtr r=xmlDocGetRootElement(d);'
+        'xmlChar*t=r?xmlNodeGetContent(r):0;if(t){printf("parsed: %s\\n",(char*)t);xmlFree(t);}'
+        'xmlFreeDoc(d);return 0;}\n')
+
+
+@pytest.mark.skipif(sandbox.host_arch() != "x86-64", reason="native x86-64")
+def test_xxe_confirmed(store, pool, gcc, tmp_path):
+    """A C program parsing stdin XML with entity substitution enabled (XML_PARSE_NOENT) is driven to
+    a confirmed CWE-611 PoC: an external SYSTEM entity resolves /etc/passwd and its content returns."""
+    import glob
+    if not glob.glob("/usr/include/libxml2/libxml/parser.h"):
+        pytest.skip("no libxml2 dev headers")
+    c = tmp_path / "xxe.c"; c.write_text(_XXE); b = tmp_path / "xxe"
+    if subprocess.run([gcc, "-O0", "-w", str(c), "-o", str(b), "-I/usr/include/libxml2", "-lxml2"],
+                      capture_output=True, check=False).returncode:
+        pytest.skip("cannot build libxml2 fixture")
+    case = store.cases.create("xxe"); target = ingest(store, case.id, b)
+    CallEdgeDAO(store.conn).replace_for_target(target.id, _edges(["xmlReadMemory"]))
+    run = enqueue_inject(JobQueue(store.conn), target, params={"input_mode": "stdin", "timeout": 8})
+    assert pool.wait_idle(60)
+    if JobQueue(store.conn).runs.get(run.id).status != "done":
+        pytest.skip("sandbox unavailable")
+    f = next((f for f in FindingDAO(store.conn).list_by_target(target.id)
+              if f.detector == "inject_synth" and f.cwe == "CWE-611"), None)
+    assert f is not None and ("xxe" in f.title.lower() or "external entity" in f.title.lower())
+
+
 @pytest.mark.skipif(sandbox.host_arch() != "x86-64", reason="native x86-64")
 def test_sql_injection_confirmed(store, pool, gcc, tmp_path):
     """A C program that concatenates stdin into a sqlite3 query is driven to a confirmed CWE-89 PoC:

