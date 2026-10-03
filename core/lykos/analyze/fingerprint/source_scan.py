@@ -146,12 +146,93 @@ def _parse_cargo_lock(text: str) -> list:
     return out
 
 
+_DEP_RE = re.compile(
+    r"<dependency>(.*?)</dependency>", re.DOTALL | re.IGNORECASE)
+_MVN_G = re.compile(r"<groupId>\s*([^<$][^<]*?)\s*</groupId>", re.IGNORECASE)
+_MVN_A = re.compile(r"<artifactId>\s*([^<$][^<]*?)\s*</artifactId>", re.IGNORECASE)
+_MVN_V = re.compile(r"<version>\s*([0-9][0-9A-Za-z.\-]*)\s*</version>", re.IGNORECASE)
+
+
+def _parse_pom(text: str) -> list:
+    """Maven pom.xml <dependency> blocks -> OSV 'Maven' coordinates 'groupId:artifactId'. Only
+    concrete versions are taken; a `${property}` version has no literal to match and is skipped."""
+    out = []
+    for block in _DEP_RE.findall(text):
+        g, a, v = _MVN_G.search(block), _MVN_A.search(block), _MVN_V.search(block)
+        if g and a and v:
+            coord = f"{g.group(1)}:{a.group(1)}"
+            out.append(("maven:" + coord.lower(), coord, v.group(1)))
+    return out
+
+
+def _parse_composer_lock(text: str) -> list:
+    """Composer composer.lock -> OSV 'Packagist' packages 'vendor/name'. Both the runtime and dev
+    package arrays are read; a leading 'v' on the version (v1.2.3) is normalised off."""
+    import json
+    out = []
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return out
+    for section in ("packages", "packages-dev"):
+        for pkg in (data.get(section) or []):
+            if isinstance(pkg, dict) and pkg.get("name") and pkg.get("version"):
+                ver = re.sub(r"^v", "", str(pkg["version"]))
+                out.append(("packagist:" + str(pkg["name"]).lower(), pkg["name"], ver))
+    return out
+
+
+_GEMSPEC = re.compile(r"^    ([A-Za-z0-9_.\-]+) \(([0-9][0-9A-Za-z.\-]*)\)\s*$")
+
+
+def _parse_gemfile_lock(text: str) -> list:
+    """Gemfile.lock -> OSV 'RubyGems' gems. Only the resolved `specs:` entries (indented four
+    spaces with a parenthesised version) are taken, not the looser nested dependency lines."""
+    out, in_specs = [], False
+    for line in text.splitlines():
+        if re.match(r"^\s{2}specs:\s*$", line):
+            in_specs = True
+            continue
+        if in_specs and line and not line.startswith(" "):
+            in_specs = False
+        if in_specs:
+            m = _GEMSPEC.match(line)
+            if m:
+                out.append(("rubygems:" + m.group(1).lower(), m.group(1), m.group(2)))
+    return out
+
+
+_PUB_PKG = re.compile(r'^  ([A-Za-z0-9_]+):\s*$')
+_PUB_VER = re.compile(r'^    version:\s*"?([0-9][0-9A-Za-z.+\-]*)"?\s*$')
+
+
+def _parse_pubspec_lock(text: str) -> list:
+    """Dart/Flutter pubspec.lock -> OSV 'Pub' packages. Parsed as indentation-scoped key/value
+    (no stdlib YAML): a 2-space package name under `packages:` followed by its 4-space `version:`."""
+    out, cur = [], None
+    for line in text.splitlines():
+        pm = _PUB_PKG.match(line)
+        if pm:
+            cur = pm.group(1)
+            continue
+        if cur:
+            vm = _PUB_VER.match(line)
+            if vm:
+                out.append(("pub:" + cur.lower(), cur, vm.group(1)))
+                cur = None
+    return out
+
+
 _MANIFEST_PARSERS = {
     "requirements.txt": _parse_requirements,
     "package-lock.json": _parse_package_lock,
     "package.json": _parse_package_json,
     "go.mod": _parse_go_mod,
     "Cargo.lock": _parse_cargo_lock,
+    "pom.xml": _parse_pom,
+    "composer.lock": _parse_composer_lock,
+    "Gemfile.lock": _parse_gemfile_lock,
+    "pubspec.lock": _parse_pubspec_lock,
 }
 
 

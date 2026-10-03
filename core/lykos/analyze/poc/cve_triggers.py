@@ -94,6 +94,47 @@ def _png_oversized_dims() -> Trigger:
                         "libpng consumer that does not bound image size")
 
 
+def _tiff_oversized_dims() -> Trigger:
+    """libtiff (CWE-190/-787): a structurally-valid little-endian TIFF whose ImageWidth/ImageLength
+    are 0x7FFFFFFF. A reader that computes a scanline/strip buffer from width*height*bpp overflows
+    the size on 32-bit arithmetic (undersized alloc -> heap overflow) or attempts a vast allocation.
+    A random blob fails TIFF validation immediately; a valid IFD reaches the size math. Recorded
+    only on a real fault, so a reader that bounds image dimensions is never flagged."""
+    def ifd_entry(tag, typ, val):                    # 12-byte IFD entry: tag,type,count=1,value
+        return struct.pack("<HHII", tag, typ, 1, val)
+    entries = [ifd_entry(0x0100, 4, 0x7FFFFFFF),      # ImageWidth  (LONG)
+               ifd_entry(0x0101, 4, 0x7FFFFFFF),      # ImageLength (LONG)
+               ifd_entry(0x0102, 3, 8),               # BitsPerSample
+               ifd_entry(0x0106, 3, 1),               # PhotometricInterpretation
+               ifd_entry(0x0111, 4, 8)]               # StripOffsets
+    ifd_off = 8
+    ifd = struct.pack("<H", len(entries)) + b"".join(entries) + struct.pack("<I", 0)
+    data = b"II" + struct.pack("<HI", 42, ifd_off) + ifd
+    return Trigger(cve="class:CWE-190", data=data, channel="file", cwe="CWE-190",
+                   libraries=("libtiff", "tiff"),
+                   note="TIFF IFD declaring 0x7FFFFFFF x 0x7FFFFFFF -- integer-overflow / huge-alloc "
+                        "in a libtiff reader that does not bound image dimensions")
+
+
+def _webp_oversized_dims() -> Trigger:
+    """libwebp (CWE-787/-190): a RIFF/WEBP container with a lossless VP8L chunk whose 14-bit
+    width/height fields are maxed (16383x16383). A decoder that allocates the ARGB canvas from the
+    declared dimensions without a cap over-allocates or overflows the size math -- the class of flaw
+    behind the libwebp VP8L heap overflow. A random blob fails the RIFF/VP8L validation; a valid
+    header reaches the allocation. Recorded only on a real fault, so a bounded decoder is not
+    flagged."""
+    # VP8L bitstream head (little-endian bits): signature 0x2f, then 14-bit width-1 and height-1.
+    w = h = 0x3FFF                                    # 16383 (= max 14-bit value, i.e. 16384 px)
+    bits = 0x2F | ((w) << 8) | ((h) << 22)            # sig(8) | width-1(14) | height-1(14)
+    vp8l = struct.pack("<I", bits & 0xFFFFFFFF) + b"\x00" * 8
+    chunk = b"VP8L" + struct.pack("<I", len(vp8l)) + vp8l
+    riff = b"RIFF" + struct.pack("<I", 4 + len(chunk)) + b"WEBP" + chunk
+    return Trigger(cve="class:CWE-787", data=riff, channel="file", cwe="CWE-787",
+                   libraries=("libwebp", "webp"),
+                   note="WEBP/VP8L header declaring 16383x16383 -- over-allocation / size overflow "
+                        "in a libwebp decoder without a dimension cap (the VP8L heap-overflow class)")
+
+
 def _billion_laughs() -> Trigger:
     """XML entity-expansion DoS (CWE-776 'billion laughs'): nested entities expand to billions of
     characters, exhausting memory in a parser without an amplification limit. Modern expat/libxml2
@@ -126,6 +167,10 @@ _LIBRARY_TRIGGERS = {
     "libxml2": [_billion_laughs, _xml_deep_nesting],
     "libpng": [_png_oversized_dims],
     "png": [_png_oversized_dims],
+    "libtiff": [_tiff_oversized_dims],
+    "tiff": [_tiff_oversized_dims],
+    "libwebp": [_webp_oversized_dims],
+    "webp": [_webp_oversized_dims],
 }
 
 

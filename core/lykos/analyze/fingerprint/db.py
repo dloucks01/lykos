@@ -138,6 +138,13 @@ COMPONENTS = {
     "freetype": {"patterns": [], "cves": []},
     "libwebp": {"patterns": [], "cves": []},          # detected from WEBP_DECODER_ABI_VERSION (no banner)
     "mongoose": {"patterns": [r"Mongoose/(\d+\.\d+)"], "cves": []},
+    # Banner patterns below are anchored on each library's OWN distinctive version string, verified
+    # against the shipped shared objects; CVE ranges come from the merged NVD feed, not hand-entry.
+    "gnutls": {"patterns": [r"GnuTLS (\d+\.\d+\.\d+)"], "cves": []},          # "...GnuTLS 3.8.13..."
+    "xz": {"patterns": [r"XZ Utils\) (\d+\.\d+\.\d+)"], "cves": []},          # "xz (XZ Utils) 5.6.0"
+    # bzip2's BZ2_bzlibVersion string is "1.0.8, 13-Jul-2019" -- the ", DD-Mon-YYYY" tail is the
+    # low-FP anchor (plain "X.Y.Z" alone would match far too much).
+    "bzip2": {"patterns": [r"(\d+\.\d+\.\d+), \d{1,2}-[A-Z][a-z]{2}-\d{4}"], "cves": []},
 }
 
 
