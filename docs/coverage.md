@@ -99,16 +99,25 @@ thirteen reach a confirmed L3** control-flow hijack -- up from one (native x86-6
 target's own symbol table, and prove arrival with a breakpoint. All three steps are ISA-neutral
 over the qemu gdbstub.
 
-**Cross-arch L3 is no longer ret2win-only (2026-10).** AArch64 and ARM (32-bit) now reach a
-confirmed **ret2libc -> `system("/bin/sh")`** on NX-on, no-PIE targets -- the first non-x86-64 ROP
-chains. AArch64 uses a two-gadget chain (a `ldp xS,xB,[sp]; ...; ldp x29,x30,[sp],#M; ret` loader +
-a `mov x0,xS; blr xB` caller; `autiasp`/PAC is a no-op under qemu-user, so those epilogues are
-usable); ARM32 uses the one-gadget `pop {r0,..,pc}`. Gadgets are decoded straight from the bytes
-(the host objdump cannot disassemble these ISAs), the chain is confirmed by reaching `system` with
-x0/r0 = &"/bin/sh" over the qemu gdbstub plus a negative control, and it is driven push-button by
-the `auto` strategy. The remaining ROP/heap/format strategies (ret2csu, SROP, dlresolve, mprotect
-shellcode, heap/FSOP, the PIE info-leak) are still x86-64 machine code and stay native-only; MIPS
-ret2libc is designed but unverified here (qemu present, no cross-compiler to build a fixture).
+**Cross-arch L3 is no longer ret2win-only (2026-10).** AArch64, ARM (32-bit), **RISC-V 64 and
+PowerPC64 (ELFv2, little-endian)** now reach a confirmed **ret2libc -> `system("/bin/sh")`** on
+NX-on, no-PIE targets -- the first non-x86-64 ROP chains. AArch64 uses a two-gadget chain (a
+`ldp xS,xB,[sp]; ...; ldp x29,x30,[sp],#M; ret` loader + a `mov x0,xS; blr xB` caller;
+`autiasp`/PAC is a no-op under qemu-user, so those epilogues are usable); ARM32 uses the one-gadget
+`pop {r0,..,pc}`. RISC-V 64 mirrors AArch64 -- a contiguous epilogue loader
+(`ld sX,oX(sp); ...; ld ra,oRA(sp); addi sp,sp,N; ret`) restores two callee-saved s-regs + ra, and a
+`mv a0,sS; (jr|jalr) sB` caller calls system (the byte decoder handles compressed RVC insns that
+static libc pulls in regardless of `-march`). PowerPC64 points the saved Link Register at a
+`mtctr rC; mr r3,rT; bctr` caller gadget, loading &system/&"/bin/sh" into controllable callee-saved
+GPRs (r14..r31) that the vulnerable frame's own save/restore exposes -- the controlling buffer
+offsets for the LR and each GPR are found by one tagged detonation; the gadget's `mr r12,rC` doubles
+as the ELFv2 global-entry TOC setup, so system's prologue resolves. Gadgets are decoded straight
+from the bytes (the host objdump cannot disassemble any of these ISAs), each chain is confirmed by
+reaching `system` with the first argument = &"/bin/sh" over the qemu gdbstub plus a negative control,
+and all are driven push-button by the `auto` strategy. The remaining ROP/heap/format strategies
+(ret2csu, SROP, dlresolve, mprotect shellcode, heap/FSOP, the PIE info-leak) are still x86-64 machine
+code and stay native-only; MIPS/PPC-BE ret2libc is designed but unverified here (qemu present, no
+cross-compiler to build a fixture).
 
 | arch | L1 | L2 | L3 (ret2win offset) |
 |---|---|---|---|

@@ -717,6 +717,173 @@ def find_bx_gadgets_arm(data: bytes):
     return out
 
 
+# ---------------------------------------------------------------- RISC-V 64 ret2libc gadgets
+# s-registers (callee-saved): s0=x8, s1=x9, s2..s11 = x18..x27. These are what a function epilogue
+# restores from the stack, so they are the registers a ROP chain can control.
+_RV_SREG = {8, 9} | set(range(18, 28))
+
+
+def _rv_decode(w: int, sz: int):
+    """Decode the handful of RISC-V insns a ret2libc chain cares about, for a 2-byte compressed or
+    4-byte base word. Returns (op, reg, imm): op in {mv, jr, jalr, ret, ldsp, addisp, nop} or None.
+    `reg` is rd for a load / the source for mv-jr; `imm` is the sp-relative byte offset for a load or
+    the sp adjustment for addisp. A static RISC-V binary pulls in compressed (RVC) libc regardless of
+    the main module's -march, so both widths must be handled; host objdump cannot disassemble it."""
+    if sz == 2:
+        if (w & 0xF003) == 0x8002:                       # C.MV / C.JR / C.EBREAK family (funct4=1000)
+            rd, rs2 = (w >> 7) & 0x1F, (w >> 2) & 0x1F
+            if rs2 and rd:
+                return ("mv", rd, rs2)                    # c.mv rd, rs2
+            if rs2 == 0 and rd == 1:
+                return ("ret", 1, 0)                      # c.jr ra == ret
+            if rs2 == 0 and rd:
+                return ("jr", rd, 0)                      # c.jr rd
+        if (w & 0xF003) == 0x9002:                        # C.JALR / C.ADD family (funct4=1001)
+            rd, rs2 = (w >> 7) & 0x1F, (w >> 2) & 0x1F
+            if rs2 == 0 and rd:
+                return ("jalr", rd, 0)                    # c.jalr rd  (rd!=0; rd==0 is c.ebreak)
+        if (w & 0xE003) == 0x6002 and ((w >> 7) & 0x1F):  # c.ldsp rd, uimm(sp)
+            imm = (((w >> 12) & 1) << 5) | (((w >> 5) & 3) << 3) | (((w >> 2) & 7) << 6)
+            return ("ldsp", (w >> 7) & 0x1F, imm)
+        if (w & 0xEF83) == 0x6101:                        # c.addi16sp sp, nzimm
+            u = ((((w >> 12) & 1) << 9) | (((w >> 3) & 3) << 7) | (((w >> 5) & 1) << 6)
+                 | (((w >> 2) & 1) << 5) | (((w >> 6) & 1) << 4))
+            return ("addisp", 2, u - 0x400 if u & 0x200 else u)
+        if w == 0x0001:
+            return ("nop", 0, 0)
+        return None
+    if (w & 0x707F) == 0x3003 and ((w >> 15) & 0x1F) == 2:    # ld rd, off(sp)
+        off = (w >> 20) & 0xFFF
+        return ("ldsp", (w >> 7) & 0x1F, off - 0x1000 if off & 0x800 else off)
+    if (w & 0x707F) == 0x0067:                               # jalr rd, rs1, 0
+        rd, rs1 = (w >> 7) & 0x1F, (w >> 15) & 0x1F
+        if rd == 0 and rs1 == 1 and ((w >> 20) & 0xFFF) == 0:
+            return ("ret", 1, 0)
+        return ("jalr" if rd == 1 else "jr", rs1, 0)
+    if (w & 0x707F) == 0x0013 and ((w >> 7) & 0x1F) == 2 and ((w >> 15) & 0x1F) == 2:   # addi sp,sp,imm
+        off = (w >> 20) & 0xFFF
+        return ("addisp", 2, off - 0x1000 if off & 0x800 else off)
+    return None
+
+
+def _rv_stream(data: bytes):
+    """Linear decode of every executable byte as a RISC-V instruction stream: [(va, op, reg, imm)].
+    Compressed (2-byte, low bits != 11) and base (4-byte) insns are length-decoded in sequence."""
+    out = []
+    for off, sz, va, flags in _loads(data):
+        if not (flags & 1):
+            continue
+        p, end = off, off + sz
+        while p + 2 <= end:
+            w16 = int.from_bytes(data[p:p + 2], "little")
+            if (w16 & 3) != 3:
+                rec = _rv_decode(w16, 2)
+                out.append((va + (p - off), rec)); p += 2
+            else:
+                if p + 4 > end:
+                    break
+                rec = _rv_decode(int.from_bytes(data[p:p + 4], "little"), 4)
+                out.append((va + (p - off), rec)); p += 4
+    return out
+
+
+def find_riscv64_r2libc_gadgets(data: bytes) -> dict:
+    """RISC-V 64 two-gadget ret2libc gadgets (pure byte decode; host objdump cannot disassemble it):
+
+      caller: `mv a0, sS ; (jr|jalr) sB`  -- set the first argument a0 from a callee-saved reg, then
+              jump to another one.
+      loader: a contiguous function epilogue `ld sX,oX(sp); ... ; ld ra,oRA(sp); addi sp,sp,N; ret`
+              that restores two callee-saved regs AND the return address off the attacker stack.
+
+    Chaining a loader that restores {S,B} with a caller whose {src,br}=={S,B} gives system("/bin/sh"):
+    the loader sets sS=&"/bin/sh", sB=&system and ra=caller; the caller does a0=sS; jr sB. Returns
+    {"callers":[{va,src,br}], "loaders":[{va,regs:{reg:off},raoff,spadj}]} (reg = x-number). Only an
+    epilogue of load/addi-sp/mv/nop before the ret is taken, so `regs`/offsets are exact."""
+    s = _rv_stream(data)
+    callers, loaders = [], []
+    for i in range(len(s) - 1):
+        va, rec = s[i]
+        if rec and rec[0] == "mv" and rec[1] == 10 and rec[2] in _RV_SREG:
+            nrec = s[i + 1][1]
+            if nrec and nrec[0] in ("jr", "jalr") and nrec[1] in _RV_SREG:
+                callers.append({"va": va, "src": rec[2], "br": nrec[1]})
+    for i, (va, rec) in enumerate(s):
+        if not (rec and rec[0] == "ret"):
+            continue
+        regs, raoff, spadj, entry, j = {}, None, 0, va, i - 1
+        while j >= 0:                                    # walk back over the contiguous epilogue
+            o = s[j][1]
+            if not o or o[0] not in ("ldsp", "addisp", "mv", "nop"):
+                break
+            if o[0] == "ldsp":
+                if o[1] == 1:
+                    raoff = o[2]
+                elif o[1] in _RV_SREG:
+                    regs[o[1]] = o[2]
+            elif o[0] == "addisp":
+                spadj = o[2]
+            entry = s[j][0]
+            j -= 1
+        if raoff is not None and len(regs) >= 2:
+            loaders.append({"va": entry, "regs": regs, "raoff": raoff, "spadj": spadj})
+    return {"callers": callers, "loaders": loaders}
+
+
+# ---------------------------------------------------------------- PowerPC64 (ELFv2) ret2libc gadgets
+# PPC64 callee-saved GPRs are r14..r31 -- the registers a function epilogue restores from its frame,
+# hence the ones a stack overflow of that frame can control.
+_PPC_CALLEE = set(range(14, 32))
+
+
+def _ppc_words(data: bytes):
+    """(va, word) for every aligned 4-byte PPC instruction in executable segments. PPC is fixed-width;
+    `endianness` is not needed here because only ppc64le (little-endian ELFv2) is targeted."""
+    for off, sz, va, flags in _loads(data):
+        if not (flags & 1):
+            continue
+        for p in range(off, off + (sz & ~3) - 3, 4):
+            yield va + (p - off), int.from_bytes(data[p:p + 4], "little")
+
+
+def _ppc_is_mtctr(w):
+    return (w & 0xFC1FFFFF) == 0x7C0903A6                 # mtctr rS (mtspr 9)
+
+
+def _ppc_is_mr_r3(w):                                    # mr r3, rX  ==  or r3, rX, rX
+    return (((w >> 26) & 0x3F) == 31 and ((w >> 1) & 0x3FF) == 444 and (w & 1) == 0
+            and ((w >> 16) & 0x1F) == 3 and ((w >> 21) & 0x1F) == ((w >> 11) & 0x1F))
+
+
+def find_ppc64_r2libc_gadgets(data: bytes) -> dict:
+    """PowerPC64 (ELFv2) ret2libc caller gadgets: `mtctr rC ; mr r3, rT ; ... ; bctr[l]` with rC and
+    rT both callee-saved (r14..r31). Pure byte decode -- the host objdump cannot disassemble PPC.
+
+    The overflow controls the saved Link Register (the function's return target) and, through the
+    function's own GPR save/restore, the callee-saved registers. Point the saved LR at this gadget
+    with rC=&system and rT=&"/bin/sh": `mtctr` loads CTR=&system, `mr r3` sets the first argument,
+    `bctr` branches to system("/bin/sh"). (The gadget also does `mr r12,rC`, which is exactly the
+    ELFv2 global-entry TOC register, so system's TOC prologue resolves correctly.) Returns
+    {"callers":[{va, ctr, arg}]} with ctr/arg the GPR numbers to load with &system / &"/bin/sh"."""
+    words = list(_ppc_words(data))
+    callers = []
+    for i, (va, w) in enumerate(words):
+        if w not in (0x4E800420, 0x4E800421):            # bctr / bctrl
+            continue
+        ctr = arg = None
+        start = va
+        for k in range(i - 1, max(-1, i - 8), -1):
+            wk = words[k][1]
+            if wk in (0x4E800420, 0x4E800421):
+                break
+            if _ppc_is_mtctr(wk) and ctr is None and ((wk >> 21) & 0x1F) in _PPC_CALLEE:
+                ctr = (wk >> 21) & 0x1F; start = min(start, words[k][0])
+            elif _ppc_is_mr_r3(wk) and arg is None and ((wk >> 21) & 0x1F) in _PPC_CALLEE:
+                arg = (wk >> 21) & 0x1F; start = min(start, words[k][0])
+        if ctr is not None and arg is not None and ctr != arg:
+            callers.append({"va": start, "ctr": ctr, "arg": arg})
+    return {"callers": callers}
+
+
 def find_magic_gates(data: bytes):
     """Find a stack LOCAL checked against a magic constant that gates a branch (jeeves'
     `if (local==0x1337bab3)` -> read+print the flag). A stack overflow that writes IMM32 into the
