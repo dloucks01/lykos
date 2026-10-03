@@ -97,8 +97,18 @@ pipeline -- triage -> disassemble (Ghidra 12.1.2) -> detect_cwe -> dynamic_run -
 thirteen reach a confirmed L3** control-flow hijack -- up from one (native x86-64) before the cross-arch work. L3 uses
 **ret2win**: overwrite the saved return address with a chosen function's address read from the
 target's own symbol table, and prove arrival with a breakpoint. All three steps are ISA-neutral
-over the qemu gdbstub; the other L3 strategies (ROP gadget search, mprotect shellcode, the PIE
-info-leak) are x86-64 machine code and stay native-only.
+over the qemu gdbstub.
+
+**Cross-arch L3 is no longer ret2win-only (2026-10).** AArch64 and ARM (32-bit) now reach a
+confirmed **ret2libc -> `system("/bin/sh")`** on NX-on, no-PIE targets -- the first non-x86-64 ROP
+chains. AArch64 uses a two-gadget chain (a `ldp xS,xB,[sp]; ...; ldp x29,x30,[sp],#M; ret` loader +
+a `mov x0,xS; blr xB` caller; `autiasp`/PAC is a no-op under qemu-user, so those epilogues are
+usable); ARM32 uses the one-gadget `pop {r0,..,pc}`. Gadgets are decoded straight from the bytes
+(the host objdump cannot disassemble these ISAs), the chain is confirmed by reaching `system` with
+x0/r0 = &"/bin/sh" over the qemu gdbstub plus a negative control, and it is driven push-button by
+the `auto` strategy. The remaining ROP/heap/format strategies (ret2csu, SROP, dlresolve, mprotect
+shellcode, heap/FSOP, the PIE info-leak) are still x86-64 machine code and stay native-only; MIPS
+ret2libc is designed but unverified here (qemu present, no cross-compiler to build a fixture).
 
 | arch | L1 | L2 | L3 (ret2win offset) |
 |---|---|---|---|
@@ -294,6 +304,18 @@ The taint channel propagates through x86/x86-64 **sub-registers**, so a value as
 tainted buffer's bytes (a length field read as `buf[0]`, or bytes combined with shifts/ORs) stays
 tainted to the sink — not only whole-word direct flows.
 
+**Injection PoC — confirmed demonstrating input (the `synthesize_injection` stage).** Beyond
+detection, six non-memory-corruption classes are turned into a `poc-backed` finding carrying the
+exact input that triggers them, confirmed by effect (no fuzzing): **CWE-78** command injection
+(shell metachars → an injected `echo <marker>` ran), **CWE-134** format string (`%p` leaked
+pointers instead of echoing), **CWE-22** path traversal (`/etc/passwd` content returned),
+**CWE-89** SQL injection (a UNION-selected marker column came back, or a DB parse error named our
+token — the latter covers auth/count apps that never display rows), **CWE-611** XXE (a SYSTEM
+external entity resolved a local file), and **CWE-918** SSRF (a `file:` URL made the server return
+a local file; the same control reaches internal services live). Each confirmation is forgery-proof
+(the effect can only occur if the input was interpreted, not echoed) and the probe fires only when
+the target imports the matching sink (sqlite/mysql/pg, libcurl, libxml2/expat, system/popen, …).
+
 ---
 
 ### A. Memory buffer errors (the core of binary offense)
@@ -448,8 +470,11 @@ Managed memory removes most memory-safety CWEs but adds others:
 
 ### Explicitly OUT OF SCOPE for binary-only offensive analysis (do not claim)
 These are real CWEs but generally invisible in a compiled binary or belong to other tool classes:
-- **Web/app-layer without a visible parser:** 79 XSS, 89 SQLi, 352 CSRF, 601 open redirect, 918 SSRF,
-  611 XXE — only in scope when the binary itself constructs/parses the relevant string and data is tainted.
+- **Web/app-layer without a visible parser:** 79 XSS, 352 CSRF, 601 open redirect — only in scope when
+  the binary itself constructs/parses the relevant string and data is tainted. (**89 SQLi, 918 SSRF,
+  611 XXE are now IN SCOPE for native C** with a confirmed input PoC — see the Injection PoC note above:
+  a C program linking sqlite/mysql/pg, libcurl, or libxml2 with a tainted query/URL/XML is driven to a
+  demonstrated finding.)
 - **Design / process / governance:** 1053, 1059, most "pillar/class" abstract entries, CWE-CATEGORY nodes,
   supply-chain-process, documentation, and configuration-of-external-systems weaknesses.
 - **Source-only constructs** lost at compile time: many style/maintainability weaknesses.
