@@ -24,7 +24,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
+import struct
 import subprocess
 import sys
 from pathlib import Path
@@ -74,7 +76,16 @@ _SLEIGH = {
     ("ppc", 64, "big"): "PowerPC:BE:64:default",
     ("mips", 32, "big"): "MIPS:BE:32:default",
     ("mips", 32, "little"): "MIPS:LE:32:default",
+    # RISC-V: SLEIGH disassembles it even where the rizin build has no RISC-V plugin (Kali's does
+    # not -- it silently decodes RISC-V bytes as x86). The pypcode recovery path below uses this.
+    ("riscv", 64, "little"): "RISCV:LE:64:default",
+    ("riscv", 32, "little"): "RISCV:LE:32:default",
 }
+# Arches the rizin/radare2 build here CANNOT disassemble (no asm plugin), so its structural pass
+# decodes their bytes as the default (x86) and yields garbage bodies/edges. When SLEIGH can
+# disassemble such a target, the pypcode recovery path owns the function bodies instead. rizin's
+# bin loader still reads the correct arch name and the symbol-table function list, which we keep.
+_RIZIN_BLIND = {"riscv"}
 
 def locate_native(config: Optional[str] = None) -> Optional[Path]:
     """Path to the rizin or radare2 CLI, preferring rizin (the rz-ghidra host). Honours
@@ -219,16 +230,30 @@ class _Lifter:
         it flushed (possibly nothing) -- the analysis continues with that much P-Code."""
         if not self.available or not instrs:
             return {}
+        rows = self._invoke({"langid": self.langid, "instrs": [[a, h] for a, h in instrs]},
+                            ctx=ctx, timeout=timeout)
+        return {row["a"]: (row.get("p") or []) for row in rows if "a" in row}
+
+    def disasm_regions(self, regions: list, *, ctx=None, timeout: int = 600) -> dict:
+        """Linearly disassemble whole function byte-ranges in the isolated worker -- for an arch the
+        structural backend cannot disassemble, SLEIGH recovers the instruction boundaries itself.
+        `regions` is [(addr_int, hexbytes)]; returns {region_addr_hex: [{a,len,text,p}, ...]}."""
+        if not self.available or not regions:
+            return {}
+        rows = self._invoke({"langid": self.langid, "regions": [[a, h] for a, h in regions]},
+                            ctx=ctx, timeout=timeout)
+        return {row["region"]: (row.get("insns") or []) for row in rows if "region" in row}
+
+    def _invoke(self, spec: dict, *, ctx=None, timeout: int = 600) -> list:
+        """Run the isolated pcode worker with `spec` and return the parsed JSONL rows. A crash/timeout
+        kills only the child; whatever it flushed is returned."""
         import tempfile
         d = Path(tempfile.mkdtemp(prefix="lykos-pcode-"))
         inp, outp = d / "in.json", d / "out.jsonl"
         try:
-            inp.write_text(json.dumps({"langid": self.langid,
-                                       "instrs": [[a, h] for a, h in instrs]}))
-            worker = _pcode_worker_path()
-            cmd = [sys.executable, str(worker), str(inp), str(outp)]
-            env_path = os.pathsep.join(p for p in sys.path if p)   # from the parent's sys.path
-            popen_env = dict(os.environ, PYTHONPATH=env_path)
+            inp.write_text(json.dumps(spec))
+            cmd = [sys.executable, str(_pcode_worker_path()), str(inp), str(outp)]
+            popen_env = dict(os.environ, PYTHONPATH=os.pathsep.join(p for p in sys.path if p))
             try:
                 if ctx is not None:
                     ctx.run_subprocess(cmd, timeout=timeout, env=popen_env)
@@ -237,22 +262,19 @@ class _Lifter:
                                    stdin=subprocess.DEVNULL, env=popen_env)
             except Exception:                              # noqa: BLE001 -- crash/timeout: use partial
                 _log.debug("pcode worker crashed or timed out; using partial output", exc_info=True)
-                pass
-            out = {}
+            rows = []
             try:
                 with open(outp, errors="replace") as fh:
                     for line in fh:                        # a torn final line from a hard crash
                         line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            row = json.loads(line)
-                        except ValueError:
-                            continue
-                        out[row["a"]] = row.get("p") or []
+                        if line:
+                            try:
+                                rows.append(json.loads(line))
+                            except ValueError:
+                                continue
             except OSError:
                 pass
-            return out
+            return rows
         finally:
             shutil.rmtree(d, ignore_errors=True)
 
@@ -452,6 +474,15 @@ def analyze(binary: Path, *, ctx=None, timeout: int = 900) -> dict:
     embedded = is_rizin or any(
         isinstance(f, dict) and ("stackvars" in f or "callrefs" in f) for f in aflj)
 
+    # When the structural backend has no disassembler for this arch (e.g. Kali's rizin lacks the
+    # RISC-V plugin and silently decodes it as x86), its per-function structure/CFG/edges are garbage.
+    # If SLEIGH can disassemble it, recover the function bodies with pypcode instead -- skip rizin's
+    # structural/decompile passes entirely and keep only its (correct) symbol-table function list.
+    rizin_blind = (prog["arch"] or "").lower() in _RIZIN_BLIND and lifter.available
+    if rizin_blind:
+        _emit(ctx, msg=f"{prog['arch']}: structural backend cannot disassemble it; "
+                       f"recovering function bodies via SLEIGH ({lifter.langid})")
+
     # Pass 2 (structure): CFG + disasm + stack vars per function, redirected to per-function files.
     #
     # Two strategies, chosen by size:
@@ -465,7 +496,7 @@ def analyze(binary: Path, *, ctx=None, timeout: int = 900) -> dict:
     #     run reports progress and never loses everything (a batch that times out is skipped, its
     #     predecessors already written). `aaa`-quality types are lost, so _infer_buffers recovers
     #     buffers from stack geometry instead.
-    addrs = list(fn_by_addr)
+    addrs = [] if rizin_blind else list(fn_by_addr)   # rizin-blind arch: SLEIGH recovery owns bodies
     done = 0
     failed_batches = 0
 
@@ -530,7 +561,7 @@ def analyze(binary: Path, *, ctx=None, timeout: int = 900) -> dict:
     # front (small binaries come back fully decompiled); every other function decompiles lazily on
     # demand when opened (see the /functions/{id} endpoint), so nothing is permanently skipped and a
     # big binary is not held up for minutes producing C that the detectors never read.
-    if _MAX_DECOMPILE and target_fns <= _MAX_DECOMPILE:
+    if _MAX_DECOMPILE and target_fns <= _MAX_DECOMPILE and not rizin_blind:
         dec_cmd = "pdg" if _has_pdg(cli, binary, ctx, timeout) else "pdc"
         dparts = ["aaa"]
         for a in addrs:
@@ -546,7 +577,9 @@ def analyze(binary: Path, *, ctx=None, timeout: int = 900) -> dict:
                                f"(opens decompile the function you click; detectors use P-Code)")
 
     _emit(ctx, pct=80, msg=f"lifting P-Code for {target_fns} functions")
-    functions = _build_functions(T, fn_by_addr, lifter, embedded, ctx=ctx, timeout=timeout)
+    functions = (_recover_via_pcode(binary, fn_by_addr, lifter, ctx=ctx, timeout=timeout)
+                 if rizin_blind
+                 else _build_functions(T, fn_by_addr, lifter, embedded, ctx=ctx, timeout=timeout))
     strings = _build_strings(cli, binary, izj, T, ctx=ctx, timeout=timeout)
     imports = [i.get("name") for i in iij if isinstance(i, dict) and i.get("name")]
 
@@ -635,6 +668,128 @@ def _is_runtime_name(name) -> bool:
     return bool(name) and str(name).startswith(_RUNTIME_PREFIXES)
 
 
+_CALL_OP_TYPES = {"call", "ucall", "rcall", "ccall", "icall"}
+_SYMTOK = re.compile(r"\b(?:sym|fcn|loc)\.(?:imp\.)?([A-Za-z_][\w.]*)")
+
+
+def _calls_from_ops(ops: list, fn_by_addr: dict) -> list:
+    """Call edges harvested from the per-instruction disassembly (rizin/r2 `ops`), for arches whose
+    xref DB comes back empty. An op is a call when its `type` is a call variant; the target is the
+    numeric `jump` when present, else the `sym.`/`fcn.` name the disassembler already resolved."""
+    calls = []
+    for o in ops:
+        if (o.get("type") or "").lower() not in _CALL_OP_TYPES:
+            continue
+        frm = o.get("offset") if o.get("offset") is not None else o.get("addr")
+        dst = o.get("jump")
+        raw = (fn_by_addr.get(dst) or {}).get("name") if isinstance(dst, int) else None
+        if not raw:                                          # fall back to the resolved name in text
+            m = _SYMTOK.search(o.get("disasm") or o.get("opcode") or "")
+            raw = m.group(0) if m else None
+        calls.append({"site_addr": hex(frm) if isinstance(frm, int) else None,
+                      "dst_addr": hex(dst) if isinstance(dst, int) else None,
+                      "dst_name": _clean_name(raw), "external": _is_import(raw)})
+    return calls
+
+
+def _va_to_off(data: bytes, va: int):
+    """File offset of a virtual address via the ELF program headers (ELF64/ELF32, either endian), or
+    None. Used to feed a function's raw bytes to the SLEIGH recovery for a rizin-blind arch."""
+    try:
+        if data[:4] != b"\x7fELF":
+            return None
+        is64 = data[4] == 2
+        en = "<" if data[5] == 1 else ">"
+        if is64:
+            e_phoff = struct.unpack_from(en + "Q", data, 32)[0]
+            e_phentsize = struct.unpack_from(en + "H", data, 54)[0]
+            e_phnum = struct.unpack_from(en + "H", data, 56)[0]
+        else:
+            e_phoff = struct.unpack_from(en + "I", data, 28)[0]
+            e_phentsize = struct.unpack_from(en + "H", data, 42)[0]
+            e_phnum = struct.unpack_from(en + "H", data, 44)[0]
+        for i in range(e_phnum):
+            b = e_phoff + i * e_phentsize
+            if struct.unpack_from(en + "I", data, b)[0] != 1:        # PT_LOAD
+                continue
+            if is64:
+                p_off, p_va, _p_pa, p_fsz = struct.unpack_from(en + "QQQQ", data, b + 8)[:4]
+            else:
+                p_off, p_va, _p_pa, p_fsz = struct.unpack_from(en + "IIII", data, b + 4)[:4]
+            if p_va <= va < p_va + p_fsz:
+                return p_off + (va - p_va)
+    except (struct.error, IndexError):
+        return None
+    return None
+
+
+def _recover_via_pcode(binary: Path, fn_by_addr: dict, lifter: "_Lifter", *,
+                       ctx=None, timeout: int = 600) -> list:
+    """Build the function list for an arch the structural backend cannot disassemble (rizin decodes
+    its bytes as x86 garbage) by disassembling each symbol-table function's byte range with SLEIGH in
+    the isolated worker. Recovers instructions (+ P-Code) and call edges (from P-Code CALL/CALLIND
+    ops, whose direct targets SLEIGH resolves) -- the function LIST and names still come from rizin's
+    (correct) symbol-table read; only the bodies are recovered here."""
+    data = binary.read_bytes()
+    # The per-function SIZE in the structural backend's list was computed by its wrong (x86) decode,
+    # so it cannot be trusted here. Bound each region by the NEXT function's start (the standard
+    # linear-sweep bound), falling back to the symtab size then a cap -- decoding a little trailing
+    # padding is harmless, decoding into the next function is not.
+    sorted_addrs = sorted(fn_by_addr)
+    next_addr = {a: sorted_addrs[i + 1] for i, a in enumerate(sorted_addrs[:-1])}
+    regions = []
+    for faddr, meta in fn_by_addr.items():
+        off = _va_to_off(data, faddr)
+        if off is None:
+            continue
+        gap = next_addr.get(faddr, faddr + (meta.get("size") or 4096)) - faddr
+        size = max(0, min(gap if gap > 0 else (meta.get("size") or 0), 1 << 16))
+        if size <= 0:
+            continue
+        regions.append((faddr, data[off:off + size].hex()))
+    _emit(ctx, msg=f"SLEIGH recovery: disassembling {len(regions)} functions (rizin-blind arch)")
+    recovered = lifter.disasm_regions(regions, ctx=ctx, timeout=timeout)
+    functions = []
+    for faddr, meta in fn_by_addr.items():
+        insns = recovered.get(hex(faddr)) or []
+        instructions, calls = [], []
+        for ins in insns:
+            instructions.append({"addr": ins["a"], "text": ins.get("text") or "",
+                                 "pcode": ins.get("p") or []})
+            for op in (ins.get("p") or []):
+                if op.startswith(("CALL ", "CALLIND ")):
+                    # "CALL ram:0x16cca:8" -> resolve the ram target to a known function's name
+                    dst = _ram_target(op)
+                    raw = (fn_by_addr.get(dst) or {}).get("name") if dst is not None else None
+                    calls.append({"site_addr": ins["a"],
+                                  "dst_addr": hex(dst) if dst is not None else None,
+                                  "dst_name": _clean_name(raw),
+                                  "external": _is_import(raw)})
+                    break
+        block = {"addr": hex(faddr), "succ": [], "instructions": instructions}
+        functions.append({
+            "addr": hex(faddr), "name": _clean_name(meta.get("name")) or f"fcn.{faddr:x}",
+            "size": meta.get("size") or 0, "signature": meta.get("signature") or "",
+            "calling_convention": meta.get("cc") or meta.get("calltype") or "",
+            "thunk": bool(meta.get("is-pure") or meta.get("is_pure")), "varargs": False,
+            "decompiled": "", "blocks": 1 if instructions else 0, "edges": 0,
+            "cfg": {"blocks": [block] if instructions else [], "edges": 0},
+            "params": [], "frame": {"size": 0, "vars": []}, "calls": calls,
+        })
+    return functions
+
+
+def _ram_target(op: str):
+    """The ram address a 'CALL ram:0x..:sz' P-Code op points at, or None (indirect / non-ram)."""
+    for tok in op.split()[1:]:
+        if tok.startswith("ram:"):
+            try:
+                return int(tok.split(":")[1], 16)
+            except (ValueError, IndexError):
+                return None
+    return None
+
+
 def _build_functions(T: Path, fn_by_addr: dict, lifter: "_Lifter", embedded: bool,
                      ctx=None, timeout: int = 600) -> list:
     functions = []
@@ -697,6 +852,12 @@ def _build_functions(T: Path, fn_by_addr: dict, lifter: "_Lifter", embedded: boo
                           "dst_addr": hex(dst) if isinstance(dst, int) else None,
                           "dst_name": _clean_name(raw),
                           "external": _is_import(raw)})
+        # Fallback: some arches (e.g. s390) disassemble correctly but leave callrefs/afxj EMPTY even
+        # though the instruction stream clearly has calls -- rizin's xref DB just doesn't record them.
+        # Harvest the call edges straight from the per-instruction ops (type == call, target from the
+        # `jump` field or the `sym.`/`fcn.` token in the disasm), so the call graph is not lost.
+        if not calls:
+            calls = _calls_from_ops(ops, fn_by_addr)
 
         functions.append({
             "addr": hex(faddr), "name": _clean_name(meta.get("name")) or f"fcn.{faddr:x}",

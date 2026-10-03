@@ -70,6 +70,18 @@ Columns = pipeline stages. Cells = target support level.
 | Unknown / custom ISA | wizard | SLEIGH | SLEIGH | Unicorn-via-SLEIGH | N/A | PART | PART | N/A |
 | JVM / .NET / Dalvik / WASM / eBPF | FULL | N/A(bytecode) | FULL | managed VM | lang-level | PART | PART | N/A |
 
+**Structural recovery when the installed backend can't disassemble an arch (2026-10).** The native
+RE backend (Kali's rizin) ships no RISC-V plugin and silently decodes RISC-V bytes as x86 -- it had
+been reporting hundreds of "functions" with garbage bodies and ~0 call edges. The pipeline now
+detects a backend-blind arch (its bin-loader arch has no matching asm plugin) and, when SLEIGH can
+disassemble it, recovers the function bodies with pypcode instead: correct instructions, P-Code, and
+call edges (from P-Code `CALL`/`CALLIND` ops, whose direct targets SLEIGH resolves), keeping only the
+backend's correct symbol-table function list. On the RISC-V 64 fixture this took call edges from 2 to
+~3900 and P-Code from 0 to ~16k instructions. Separately, s390x disassembles correctly but rizin
+leaves its xref DB empty; call edges are now harvested straight from the instruction stream (0 -> ~3000).
+s390 P-Code stays empty -- this pypcode build has no z/Architecture SLEIGH language, stated rather
+than faked.
+
 ### MEASURED end-to-end results (September 2026)
 
 The matrix above is the *plan*. This one is ground truth: `examples/re-corpus/src/vuln.c`
