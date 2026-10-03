@@ -20,6 +20,7 @@ from .libfuzzer_stage import register as _register_libfuzzer
 from .link import register as _register_link
 from .poc import register as _register_poc
 from .symbolic import register as _register_symbolic
+from .unpack import register as _register_unpack
 
 
 def register() -> None:
@@ -35,6 +36,7 @@ def register() -> None:
     _register_link()
     _register_firmware()
     _register_fingerprint()
+    _register_unpack()
 
 
 register()

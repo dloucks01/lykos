@@ -53,6 +53,7 @@ _TARGET = {
     "synthesize_injection": ("..analyze.poc", "enqueue_inject"),
     "behavior_trace": ("..analyze.debug", "enqueue_behavior_trace"),
     "dynamic_taint": ("..analyze.debug", "enqueue_taint"),
+    "unpack": ("..analyze.unpack", "enqueue_unpack"),
     "firmware_carve": ("..analyze.firmware", "enqueue_firmware"),
     "firmware_rehost": ("..analyze.firmware", "enqueue_rehost"),
 }
@@ -230,6 +231,18 @@ def _emit_stage(store, case_id, stage, state, *, target_id=None, detail=None) ->
     store.events.append("autopilot.stage", level=lvl, case_id=case_id, payload=payload)
 
 
+def _looks_packed(store, target) -> bool:
+    """True for an ELF/PE target whose bytes carry a runtime-packer (UPX) marker, so the orchestrator
+    unpacks it into a child target before the machine-code stages run on the compressed stub."""
+    if (target.file_type or "").lower() not in ("elf", "pe"):
+        return False
+    try:
+        from .unpack import looks_packed
+        return looks_packed(store, target)
+    except Exception:                                        # noqa: BLE001 -- never block the pipeline
+        return False
+
+
 def _run_target_stage(store, target, stage, status, stop, params=None) -> Optional[str]:
     if stop.is_set():
         return None
@@ -391,6 +404,16 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict, stop: t
                 # it under Unicorn and fuzz its modelled MMIO inputs. The stage self-gates to a
                 # detected Cortex-M reset-vector table, so it is a cheap no-op otherwise.
                 _run_target_stage(store, t, "firmware_rehost", status, stop)
+                for sub in store.targets.list_by_case(case_id):
+                    if sub.id not in done_tids and sub.id not in worklist:
+                        worklist.append(sub.id)
+                _finalize_plan(status)
+                continue
+            # A runtime-packed executable (UPX) is a compressed stub around the real program: the
+            # machine-code stages would analyse the decompressor, not the code. Unpack it into a
+            # child target and analyse THAT, exactly as a firmware image is carved into its binaries.
+            if _looks_packed(store, t):
+                _run_target_stage(store, t, "unpack", status, stop)
                 for sub in store.targets.list_by_case(case_id):
                     if sub.id not in done_tids and sub.id not in worklist:
                         worklist.append(sub.id)
