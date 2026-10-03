@@ -29,9 +29,15 @@ jobs:
           # + afl-fuzz so coverage_fuzz runs INSTRUMENTED on the native arch (no afl-qemu-trace
           # needed -- qemu-mode is cross-arch only, P3.1). --no-install-recommends keeps the image
           # lean; anything a test needs and does not find, it SKIPs (never fails).
+          # Cross toolchains + qemu-user for the cross-arch ret2libc / static-recovery E2E tests
+          # (riscv64/ppc64le/s390x alongside aarch64/arm); upx-ucl for the packer-unpack stage test;
+          # wabt (wat2wasm) for the WebAssembly front-end test. A test whose tool is still missing
+          # SKIPs rather than fails, but installing these means the new capabilities are actually
+          # EXERCISED in CI instead of silently skipped.
           sudo apt-get install -y --no-install-recommends \
             gcc binutils gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf \
-            qemu-user qemu-user-static rizin afl++
+            gcc-riscv64-linux-gnu gcc-powerpc64le-linux-gnu gcc-s390x-linux-gnu \
+            qemu-user qemu-user-static rizin afl++ upx-ucl wabt
           python -m pip install --upgrade pip
           pip install pypcode
       - name: Unit tests
