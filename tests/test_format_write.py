@@ -85,3 +85,40 @@ def test_format_write_confirms_l3(store, case, pool, fmt_bin):
     assert any(pc.level == "L3" and pc.verified for pc in PocDAO(store.conn).list_by_target(t.id))
     pb = [f for f in FindingDAO(store.conn).list_by_target(t.id) if f.state == "poc-backed"]
     assert any("format-string" in e.get("detail", "") for f in pb for e in f.evidence)
+
+
+@pytest.fixture
+def fmt_bin_fullrelro(gcc, tmp_path_factory, x86_64_only):
+    d = tmp_path_factory.mktemp("fmtrelro")
+    (d / "v.c").write_text(
+        "#include <stdio.h>\n#include <unistd.h>\n"
+        "void win(void){ puts(\"WIN-SHELL-LYKOS\"); fflush(stdout); }\n"
+        "int main(void){ char buf[200]; int n;\n"
+        "  while ((n = read(0, buf, sizeof buf - 1)) > 0) { buf[n] = 0; printf(buf); fflush(stdout); }\n"
+        "  return 0; }\n")
+    out = d / "fmtwin_relro"
+    if subprocess.run([gcc, "-O0", "-fno-stack-protector", "-no-pie", "-Wl,-z,relro,-z,now",
+                       str(d / "v.c"), "-o", str(out)], capture_output=True).returncode != 0:
+        pytest.skip("cannot build full-RELRO format-string target")
+    return out
+
+
+def test_format_write_refuses_got_overwrite_under_full_relro(store, case, pool, fmt_bin_fullrelro):
+    """Full RELRO / bind-now remaps the GOT read-only before main, so a %hhn GOT overwrite silently
+    faulted. The stage must now REFUSE with an honest reason (GOT read-only -> use fmt_write_addr),
+    not emit a 'confident' chain that never lands -- the exact failure lykos's gates exist to catch."""
+    t = ingest(store, case.id, fmt_bin_fullrelro, filename="fmtwin_relro")
+    q = JobQueue(store.conn)
+    enqueue_triage(q, t, force=True); assert pool.wait_idle(40)
+    assert (store.targets.get(t.id).mitigations or {}).get("bind_now") == "on"
+    run = enqueue_exploit(q, t, params={"input_mode": "stdin", "strategy": "format",
+                                        "fmt_got": "fflush", "fmt_win": "win",
+                                        "success_regex": "WIN-SHELL-LYKOS"})
+    assert pool.wait_idle(90) and q.runs.get(run.id).status == "done"
+    assert not any(pc.level == "L3" and pc.verified
+                   for pc in PocDAO(store.conn).list_by_target(t.id))
+    # the refusal reason is surfaced (a job.progress msg), naming RELRO / read-only GOT
+    msgs = " ".join((e.payload or {}).get("msg") or ""
+                    for e in store.events.list(run_id=run.id, limit=400)
+                    if e.type == "job.progress")
+    assert "relro" in msgs.lower() or "read-only" in msgs.lower(), msgs[-300:]

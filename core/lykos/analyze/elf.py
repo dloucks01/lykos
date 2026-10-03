@@ -369,9 +369,25 @@ def parse(data: bytes) -> ElfInfo:
            else ("off" if info.elf_type == "exec" else "unknown"))
     bind_now = bool(dt_flags & DF_BIND_NOW) or bool(df1 & DF_1_NOW)
     relro = "on" if (gnu_relro and bind_now) else ("partial" if gnu_relro else "off")
+    # Surface bind_now as its OWN field, not only folded into relro. The two differ in a way that
+    # decides exploit technique: a GOT-WRITE (format %hhn, GOT overwrite) needs a WRITABLE GOT, and
+    # ret2dlresolve needs LAZY binding -- both dead under bind-now -- while a GOT-READ leak (puts@got)
+    # still works. relro=="on" implies bind_now, but bind_now can be set without full GNU_RELRO, so a
+    # technique that only cares about "is the GOT writable / lazily bound" must read this directly.
+    # seccomp hint (static, best-effort): a libseccomp user (seccomp_init/_load/_rule_add) or a raw
+    # prctl(PR_SET_SECCOMP)/seccomp() filter installer. A filter that blocks execve defeats every
+    # shell-spawning finisher, so this steers the exploit stage toward an ORW (open/read/write)
+    # chain. Import-based, so a raw-BPF binary that only calls prctl still trips it; the exploit
+    # stage also detects the block at runtime (a SIGSYS on execve) as the authoritative signal.
+    _imps = set(info.imported_symbols or [])
+    seccomp = bool(_imps & {"seccomp", "seccomp_init", "seccomp_load", "seccomp_rule_add",
+                            "prctl", "syscall"}) and ("prctl" in _imps or any(
+                                s.startswith("seccomp") for s in _imps))
     info.mitigations = {"nx": nx, "pie": pie, "relro": relro,
+                        "bind_now": "on" if bind_now else "off",
                         "canary": "on" if canary else "off",
-                        "fortify": "on" if fortify else "off"}
+                        "fortify": "on" if fortify else "off",
+                        "seccomp": "on" if seccomp else "off"}
     return info
 
 

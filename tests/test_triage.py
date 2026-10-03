@@ -70,6 +70,7 @@ def test_hardened_mitigations(variants):
     m = _triage(variants["hardened"])["mitigations"]
     assert m["pie"] == "on"
     assert m["relro"] == "on"      # full RELRO (relro + now)
+    assert m["bind_now"] == "on"   # -z now: GOT remapped read-only -> GOT-write techniques are dead
     assert m["canary"] == "on"
     assert m["nx"] == "on"
 
@@ -81,6 +82,7 @@ def test_weak_mitigations(variants):
     assert m["pie"] == "off"       # -no-pie => ET_EXEC
     assert m["canary"] == "off"    # -fno-stack-protector
     assert m["relro"] == "off"     # -z norelro
+    assert m["bind_now"] == "off"  # lazy binding: GOT writable, ret2dlresolve/GOT-overwrite viable
 
 
 def test_stripped_flag(variants):

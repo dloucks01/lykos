@@ -70,9 +70,13 @@ def _lead_finding(conn, target):
     return max(leads, key=lambda f: f.confidence, default=None)
 
 
-def _recipe(vclass: str, win, target_bytes: bytes) -> dict:
-    """An aaheg technique + concrete write target when a live hijack is not demonstrable."""
+def _recipe(vclass: str, win, target_bytes: bytes, glibc=None) -> dict:
+    """An aaheg technique + concrete write target when a live hijack is not demonstrable. `glibc`
+    (major, minor) gates the technique selection correctly (hooks removed in 2.34, safe-linking in
+    2.32, double-free key in 2.29, House of Force only <2.29); without it the planner assumed a
+    fixed modern version and mis-offered/omitted techniques for an old-libc target."""
     from . import aaheg
+    env = aaheg.Env(glibc=glibc) if glibc else aaheg.Env()
     goal = (aaheg.Goal(kind="control_flow", value=(win[1] if win else 0),
                        trigger="overwrite a called code pointer with the win address")
             if win else aaheg.Goal(kind="arbitrary_write"))
@@ -81,7 +85,7 @@ def _recipe(vclass: str, win, target_bytes: bytes) -> dict:
         return {"technique": "oob-index-write", "goal": goal.kind,
                 "note": ("write a chosen value through the out-of-bounds array slot; aim it at a "
                          "saved return / GOT entry / function pointer, then trigger its use")}
-    plan = aaheg.plan_exploit(aaheg.Vuln(vclass=vclass), goal)
+    plan = aaheg.plan_exploit(aaheg.Vuln(vclass=vclass), goal, env=env)
     plan["technique"] = plan.get("technique") or (plan.get("advisory_alternatives") or [{}])[0].get(
         "technique", "tcache-poison")
     return plan
@@ -112,6 +116,9 @@ def chain_primitive_stage(ctx) -> dict:
     vclass = _VCLASS[lead.cwe]
 
     target_bytes = ctx.content.path(target.sha256).read_bytes()
+    from . import rop
+    from .exploit_stage import _libc_bytes_for
+    _glibc = rop.libc_version(_libc_bytes_for(ctx, target) or b"")   # gate heap techniques by version
     functions = exploit.elf_functions(target_bytes)
     edges = CallEdgeDAO(ctx.conn).list_by_target(target.id)
     win = exploit.find_win(functions, call_edges=edges)
@@ -122,7 +129,7 @@ def chain_primitive_stage(ctx) -> dict:
     # A PIE image is no longer a hard stop: if the target leaks a pointer, _pie_leak_chain recovers
     # the base in-process and relocates the win address (below).
     if win is None:
-        recipe = _recipe(vclass, win, target_bytes)
+        recipe = _recipe(vclass, win, target_bytes, glibc=_glibc)
         why = "no reachable win function (a leak-based libc/one-gadget chain is analyst-gated)"
         _file_recipe(ctx, target, lead, vclass, win, recipe, why)
         ctx.emit("chain.done", payload={"applicable": True, "confirmed": False, "vclass": vclass,
@@ -153,7 +160,7 @@ def chain_primitive_stage(ctx) -> dict:
                 leak_opt, writer, off, trig, base = hit
                 return _file_pie_l3(ctx, target, lead, vclass, win_name, win_vaddr=win_addr,
                                     leak_opt=leak_opt, writer=writer, off=off, trig=trig)
-            recipe = _recipe(vclass, win, target_bytes)
+            recipe = _recipe(vclass, win, target_bytes, glibc=_glibc)
             _file_recipe(ctx, target, lead, vclass, win, recipe,
                          "PIE: no in-band leak recovered the image base (leak-chain not confirmed)")
             ctx.emit("chain.done", payload={"applicable": True, "confirmed": False,
@@ -189,7 +196,7 @@ def chain_primitive_stage(ctx) -> dict:
         finally:
             shutil.rmtree(helper.parent, ignore_errors=True)
 
-        recipe = _recipe(vclass, win, target_bytes)
+        recipe = _recipe(vclass, win, target_bytes, glibc=_glibc)
         _file_recipe(ctx, target, lead, vclass, win, recipe,
                      f"drove {vclass} but control never reached {win_name}")
         ctx.emit("chain.done", payload={"applicable": True, "confirmed": False,

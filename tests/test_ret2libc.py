@@ -352,6 +352,29 @@ def test_exploit_stage_files_l3_canary_ret2libc(store, case, pool, canary_bin):
         f"no confirmed L3 canary ret2libc (pocs={[(p.level, p.verified) for p in pocs]})"
 
 
+def test_exploit_stage_auto_defeats_canary_no_params(store, case, pool, canary_bin):
+    """P3: strategy=auto with NO canary params. The stage PROVOKES the canary leak itself and
+    DISCOVERS the canary/return offsets via the __stack_chk_fail threshold (discover_canary_offset),
+    then ret2libc's past the canary to a confirmed L3 shell -- the fully-automatic canary defeat."""
+    from lykos.analyze.ingest import enqueue_triage, ingest
+    from lykos.analyze.poc import enqueue_exploit
+    from lykos.db.dao import PocDAO, TargetDAO
+    from lykos.jobs import JobQueue
+    t = ingest(store, case.id, canary_bin, filename="v")
+    q = JobQueue(store.conn)
+    enqueue_triage(q, t, force=True)
+    assert pool.wait_idle(30)
+    TargetDAO(store.conn).update_triage(t.id, arch="x86-64", bits=64, endianness="little",
+                                        linking="dynamic", stripped=False,
+                                        mitigations={"pie": "off", "canary": "on"}, file_type="elf")
+    # no strategy, no canary_trigger, no offsets -> the auto path must find everything itself
+    run = enqueue_exploit(q, t, params={"input_mode": "stdin", "timeout": 20})
+    assert pool.wait_idle(240) and q.runs.get(run.id).status == "done"
+    pocs = PocDAO(store.conn).list_by_target(t.id)
+    assert any(pc.level == "L3" and pc.verified for pc in pocs), \
+        f"auto canary defeat produced no confirmed L3 (pocs={[(p.level, p.verified) for p in pocs]})"
+
+
 def test_classify_leak_auto_recovers_libc_and_canary():
     """classify_leak auto-recovers the libc base (from >=2 leaked libc symbol pointers) and the
     canary from one burst, without an analyst naming any slot."""
@@ -370,6 +393,47 @@ def test_classify_leak_auto_recovers_libc_and_canary():
     # no libc data -> libc_base stays None (still finds the canary)
     assert leak.classify_leak(vals, b"", b"")["libc_base"] is None
     assert leak.classify_leak(vals, b"", b"")["canary"] == canary
+
+
+def test_le_pointer_words_harvests_binary_leak():
+    """A stack over-read (CWE-125) echoes memory as RAW bytes, not hex. _le_pointer_words recovers
+    the x86-64 userspace pointers (0x00007f.. libc/mmap, 0x000055/56.. PIE) from that binary dump so
+    a leak with no format-string sink is still usable -- what the hex-only harvest missed."""
+    from lykos.analyze.poc.leak import _le_pointer_words
+    libc_ptr = 0x7F5533445566
+    pie_ptr = 0x555555554abc
+    noise = b"garbage \x01\x02 text "
+    dump = noise + libc_ptr.to_bytes(8, "little") + b"\xff\xff" + pie_ptr.to_bytes(8, "little")
+    found = _le_pointer_words(dump)
+    assert libc_ptr in found and pie_ptr in found
+    # a small int and a stack-ish 0x7ffd.. value without the 0x0000 top bytes are NOT pointers
+    assert not _le_pointer_words((123).to_bytes(8, "little"))
+
+
+def test_libc_version_parses_glibc_symbols():
+    """glibc version from the max GLIBC_2.NN symbol-version string -- used to gate heap techniques
+    (hooks/safe-linking/double-free-key/House-of-Force) instead of assuming a fixed version."""
+    import glob
+    assert rop.libc_version(b"x GLIBC_2.17\x00 GLIBC_2.31\x00 GLIBC_2.2.5\x00 y") == (2, 31)
+    assert rop.libc_version(b"no glibc version strings here") is None
+    libs = (glob.glob("/usr/lib/x86_64-linux-gnu/libc.so.6")
+            or glob.glob("/lib/x86_64-linux-gnu/libc.so.6"))
+    if libs:
+        v = rop.libc_version(open(libs[0], "rb").read())
+        assert v and v[0] == 2 and v[1] >= 27           # a real, modern glibc
+
+
+def test_build_leak_write_layout():
+    """The robust non-puts leaker: write(1, got, 8) emits exactly 8 raw address bytes. The chain
+    must set rdi=1, rsi=got, rdx=8 then call write@plt and loop back to ret_to."""
+    import struct
+    s1 = rop.build_leak_write(72, pop_rdi=0x4011aa, pop_rsi=0x4011ac, pop_rdx=0x4011ae,
+                              got=0x404038, write_plt=0x401050, ret_to=0x401176)
+    tail = s1[72:]
+    words = [struct.unpack("<Q", tail[i:i + 8])[0] for i in range(0, len(tail) - 7, 8)]
+    # pop rdi;1; pop rsi;got; pop rdx;8; write@plt; ret_to
+    assert words[:7] == [0x4011aa, 1, 0x4011ac, 0x404038, 0x4011ae, 8, 0x401050]
+    assert words[-1] == 0x401176
 
 
 def test_analyst_ret2libc_auto_mode_recovers_base(pie_leak_bin):
