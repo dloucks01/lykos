@@ -229,6 +229,12 @@ def capture(exe, argv, stdin_file, timeout, breakpoints=None):
                 resource.setrlimit(resource.RLIMIT_FSIZE, (64 << 20, 64 << 20))
             except Exception:
                 pass
+            try:                                           # deterministic addresses: ASLR off
+                cur = libc.personality(0xffffffff)         # query, then OR in ADDR_NO_RANDOMIZE
+                if cur != -1:
+                    libc.personality(cur | 0x0040000)
+            except Exception:
+                pass
             libc.ptrace(PTRACE_TRACEME, 0, 0, 0)
             # argv elements arrive through JSON as latin-1 text (the lossless round-trip
             # for arbitrary bytes). They MUST go back to bytes the same way: os.execv

@@ -282,6 +282,102 @@ def test_oob_write_hijack_declines_the_bounds_checked_target(oobwrite_safe_bin):
     assert _drive_oob_write_hijack(oobwrite_safe_bin) is None
 
 
+# --- C++ use-after-free -> vtable hijack (operator new/delete, inline fake vtable) --------------
+def _uafvt_src(clear: str) -> str:
+    """A menu-driven C++ heap-note target, parameterised ONLY by whether `free` clears the dangling
+    pointer. The positive keeps it (use-after-free -> the edit overwrites the freed object's vtable
+    pointer); the negative nulls it (the standard UAF fix), so the guarded edit/show skip and no
+    hijack is possible -- byte-identical but for that clear (supwngo _90_neg)."""
+    return (r"""
+#include <cstdio>
+#include <cstdlib>
+#include <unistd.h>
+struct Note { virtual void show() { write(1, buf, 24); } char buf[24]; };
+__attribute__((used)) void win() { system("/bin/sh"); _exit(0); }
+static Note* notes[16];
+static long num(const char* p) { char b[64]; int k=0; char c; printf("%s", p);
+  while (k<63) { int n=read(0,&c,1); if(n<=0) exit(0); if(c=='\n') break; b[k++]=c; } b[k]=0;
+  return strtol(b,0,0); }
+int main() { setbuf(stdout,0);
+  for(;;){ printf("1. new\n2. free\n3. edit\n4. show\n5. exit\n> ");
+    long c=num("");
+    if(c==1){ long i=num("idx: "); notes[i]=new Note(); }
+    else if(c==2){ long i=num("idx: "); delete notes[i]; """ + clear + r""" }
+    else if(c==3){ long i=num("idx: "); if(notes[i]) read(0,notes[i],sizeof(Note)); }
+    else if(c==4){ long i=num("idx: "); if(notes[i]) notes[i]->show(); }
+    else break;
+  } return 0; }
+""")
+
+
+_UAFVT_BUG = _uafvt_src("")                       # dangling pointer kept: the use-after-free
+_UAFVT_SAFE = _uafvt_src("notes[i]=0;")           # pointer cleared on free: the UAF fix
+
+
+def _build_cpp(tmp_path_factory, name, src):
+    if sandbox.host_arch() != "x86-64":
+        pytest.skip("C++ UAF vtable hijack is x86-64 native only")
+    gpp = shutil.which("g++") or shutil.which("c++")
+    if not gpp:
+        pytest.skip("no C++ compiler")
+    d = tmp_path_factory.mktemp(name); c = d / "m.cpp"; c.write_text(src)
+    out = d / "target.bin"
+    if subprocess.run([gpp, "-O0", "-fno-stack-protector", "-no-pie", "-w", str(c), "-o", str(out)],
+                      capture_output=True).returncode != 0:
+        pytest.skip("cannot build C++ UAF target")
+    return out
+
+
+def _drive_cpp_vtable_uaf(exe):
+    import sys as _sys
+
+    from lykos.analyze.poc.capture import make_capture, materialize_helper
+    tb = exe.read_bytes()
+    win_addr = elf_functions(tb)["_Z3winv"]
+    win_addr = int(str(win_addr), 16) if isinstance(win_addr, str) else win_addr
+    ctx = _CapCtx()
+    helper = materialize_helper()
+    wd = Path(tempfile.mkdtemp(prefix="uafvt-"))
+    try:
+        cap = make_capture(ctx, helper, str(exe), "stdin", [], 8, _sys.executable)
+        # roles are searched (a C++ target's menu crawl is empty), so pass raw options + empty model
+        return chain._cpp_vtable_uaf(ctx, None, tb, exe, {}, [], ("win", win_addr),
+                                     ["1", "2", "3", "4", "5"], {}, None, wd, cap)
+    finally:
+        shutil.rmtree(helper.parent, ignore_errors=True)
+        shutil.rmtree(wd, ignore_errors=True)
+
+
+@pytest.fixture
+def uafvt_bug_bin(tmp_path_factory):
+    return _build_cpp(tmp_path_factory, "uafvtbug", _UAFVT_BUG)
+
+
+@pytest.fixture
+def uafvt_safe_bin(tmp_path_factory):
+    return _build_cpp(tmp_path_factory, "uafvtsafe", _UAFVT_SAFE)
+
+
+def test_cpp_vtable_uaf_hijacks_through_fake_vtable(uafvt_bug_bin):
+    """The chainer identifies the new/free/edit/show roles by search (no menu model), overwrites the
+    freed object's vtable pointer with an inline fake table whose slots are &win, and confirms the
+    dangling virtual call dispatched to win under the ptrace breakpoint -- deterministic because the
+    helpers run the target with ASLR off, so the inline heap pointer (chunk+8) is fixed."""
+    hit = _drive_cpp_vtable_uaf(uafvt_bug_bin)
+    assert hit is not None, "C++ UAF vtable hijack not confirmed"
+    seq, new_o, free_o, edit_o, show_o, chunk, size = hit
+    assert len({new_o, free_o, edit_o, show_o}) == 4     # four distinct roles
+    assert chunk and size >= 16
+    assert struct.pack("<Q", chunk + 8) in seq           # the inline fake-vtable pointer
+
+
+def test_cpp_vtable_uaf_declines_when_dangling_pointer_cleared(uafvt_safe_bin):
+    """Negative control: the SAME target that nulls the pointer on free (the textbook UAF fix) has
+    no dangling object to hijack, so the chainer must NOT confirm. Every menu path and the win
+    function are unchanged, so `None` is attributable to the cleared pointer alone."""
+    assert _drive_cpp_vtable_uaf(uafvt_safe_bin) is None
+
+
 # ------------------------------------------------- attribution proof (Phase 1b integration)
 class _ShimCtx:
     """Minimal ctx for `_attribution_proof`: it only needs a run_subprocess that returns an

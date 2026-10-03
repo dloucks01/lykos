@@ -88,17 +88,29 @@ def _read_width(exe: Path) -> int | None:
 
 
 def _libc_plt_pair(exe: Path) -> dict | None:
-    """A stripped menu-driven heap challenge that uses libc directly: trace the malloc (or calloc)
-    and free PLT stubs. Returns the alloc/free stub addresses, or None when the pair is absent.
-    heap_check's guard pages cover libc OVERFLOW; this adds the double-free / UAF it cannot see."""
-    free = _plt_addr(exe, "free")
+    """A menu-driven heap challenge that uses libc directly: trace the malloc (or calloc) and free
+    PLT stubs. Returns the alloc/free stub addresses, or None when the pair is absent. heap_check's
+    guard pages cover libc OVERFLOW; this adds the double-free / UAF it cannot see.
+
+    A C++ program's PLT allocator is `operator new`/`operator delete` (_Znwm / _ZdlPv[m]), which
+    wrap malloc/free: operator new returns the pointer in rax (like malloc) and operator delete
+    takes it in rdi (like free), so the ptrace alloc/free trace works identically -- without this,
+    every C++ heap target (and its UAF -> vtable hijack) is invisible to the chain."""
+    free, free_name = _plt_addr(exe, "free"), "free"
+    if free is None:                                     # C++ operator delete / delete[]
+        for dn in ("_ZdlPv", "_ZdlPvm", "_ZdaPv", "_ZdaPvm"):
+            free = _plt_addr(exe, dn)
+            if free is not None:
+                free_name = dn
+                break
     if free is None:
         return None
-    for an in ("malloc", "calloc", "reallocarray", "realloc"):
+    # malloc family first (a C program), then C++ operator new / new[]
+    for an in ("malloc", "calloc", "reallocarray", "realloc", "_Znwm", "_Znam"):
         a = _plt_addr(exe, an)
         if a is not None:
-            return {"alloc_name": f"{an}@plt", "alloc": a, "free_name": "free@plt", "free": free,
-                    "plt": True}
+            return {"alloc_name": f"{an}@plt", "alloc": a, "free_name": f"{free_name}@plt",
+                    "free": free, "plt": True}
     return None
 
 

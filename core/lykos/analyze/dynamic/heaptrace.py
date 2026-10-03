@@ -168,6 +168,12 @@ if __name__ == "__main__":                                            # ---- the
             os.close(w)
             os.dup2(r, 0)
             os.close(r)
+            try:                                         # ASLR off: deterministic chunk addresses
+                cur = libc.personality(0xffffffff)       # so the chain's inline heap pointers land
+                if cur != -1:
+                    libc.personality(cur | 0x0040000)    # ADDR_NO_RANDOMIZE
+            except Exception:
+                pass
             libc.ptrace(PTRACE_TRACEME, 0, None, None)
             try:
                 os.execv(exe, [exe])
@@ -278,6 +284,7 @@ if __name__ == "__main__":                                            # ---- the
         uaf_seen, of_seen, oob_seen = set(), set(), set()
         oneshot = set()                                   # PLT alloc-return bps: fire once, remove
         alloc_addrs = []                                  # chunk addresses in allocation order
+        alloc_sizes = []                                  # requested size per allocation (parallel)
         events = []
 
         def in_allocator(rip):
@@ -401,6 +408,7 @@ if __name__ == "__main__":                                            # ---- the
                     freed.discard(ptr)                   # handed back out -> live again
                     if len(alloc_addrs) < 16:
                         alloc_addrs.append(ptr)          # deterministic (ASLR-off) chunk addresses
+                        alloc_sizes.append(size)         # the requested size (operator new / malloc)
                     if alloc_is_plt:
                         clear_covering(ptr, ptr + max(size, 8))   # reclaim stale UAF watches
                     elif ptr and 0 < size <= (1 << 20):
@@ -436,7 +444,8 @@ if __name__ == "__main__":                                            # ---- the
                    "use_after_free": any(e.get("error") == "use-after-free" for e in events),
                    "heap_overflow": any(e.get("error") == "heap-overflow" for e in events),
                    "oob_index": any(e.get("error") == "oob-index" for e in events),
-                   "alloc_addrs": [hex(a) for a in alloc_addrs]},
+                   "alloc_addrs": [hex(a) for a in alloc_addrs],
+                   "alloc_sizes": alloc_sizes},
                   open(report, "w"))
         return 0
 

