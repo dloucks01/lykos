@@ -18,6 +18,22 @@ _FMT = ('#include <stdio.h>\n'
 _TRAV = ('#include <stdio.h>\nint main(int c,char**v){if(c<2)return 1;FILE*f=fopen(v[1],"r");'
          'if(!f)return 1;char b[512];size_t n=fread(b,1,sizeof b,f);fwrite(b,1,n,stdout);'
          'fclose(f);return 0;}\n')
+# CWE-89: stdin concatenated into a sqlite3 query; the matching rows are printed (a UNION-injected
+# marker column surfaces). The sqlite3 API is forward-declared so no dev header is needed.
+_SQLI = ('#include <stdio.h>\n#include <string.h>\n#include <unistd.h>\n'
+         'typedef struct sqlite3 sqlite3; typedef int(*cb)(void*,int,char**,char**);\n'
+         'extern int sqlite3_open(const char*,sqlite3**);\n'
+         'extern int sqlite3_exec(sqlite3*,const char*,cb,void*,char**);\n'
+         'extern int sqlite3_close(sqlite3*);\n'
+         'static int row(void*u,int a,char**v,char**c){printf("found: %s\\n",(a>0&&v[0])?v[0]:"");'
+         'return 0;}\n'
+         'int main(void){sqlite3*db;sqlite3_open(":memory:",&db);'
+         'sqlite3_exec(db,"CREATE TABLE users(name TEXT);",0,0,0);'
+         'sqlite3_exec(db,"INSERT INTO users VALUES(\'admin\'),(\'bob\');",0,0,0);'
+         'char u[128],q[512];int n=read(0,u,sizeof u-1);if(n<=0)return 0;'
+         'if(u[n-1]==\'\\n\')n--;u[n]=0;'
+         'snprintf(q,sizeof q,"SELECT name FROM users WHERE name=\'%s\'",u);'
+         'sqlite3_exec(db,q,row,0,0);sqlite3_close(db);return 0;}\n')
 
 
 @pytest.fixture
@@ -80,6 +96,31 @@ def test_format_string_confirmed(store, pool, gcc, tmp_path):
 @pytest.mark.skipif(sandbox.host_arch() != "x86-64", reason="native x86-64")
 def test_path_traversal_confirmed(store, pool, gcc, tmp_path):
     assert _run(store, pool, gcc, tmp_path, _TRAV, "tv", ["fopen"], "CWE-22")
+
+
+@pytest.mark.skipif(sandbox.host_arch() != "x86-64", reason="native x86-64")
+def test_sql_injection_confirmed(store, pool, gcc, tmp_path):
+    """A C program that concatenates stdin into a sqlite3 query is driven to a confirmed CWE-89 PoC:
+    a UNION-injected marker column comes back from the DB (forgery-proof, no analyst input)."""
+    import glob
+    if not (glob.glob("/usr/lib/x86_64-linux-gnu/libsqlite3.so*") or glob.glob("/usr/lib/libsqlite3.so*")
+            or glob.glob("/lib/x86_64-linux-gnu/libsqlite3.so*")):
+        pytest.skip("no libsqlite3 runtime")
+    c = tmp_path / "sqli.c"; c.write_text(_SQLI)
+    b = tmp_path / "sqli"
+    if subprocess.run([gcc, "-O0", "-w", str(c), "-o", str(b), "-l:libsqlite3.so.0"],
+                      capture_output=True, check=False).returncode:
+        pytest.skip("cannot build sqlite3 fixture (no libsqlite3)")
+    case = store.cases.create("sqli")
+    target = ingest(store, case.id, b)
+    CallEdgeDAO(store.conn).replace_for_target(target.id, _edges(["sqlite3_exec", "sqlite3_open"]))
+    run = enqueue_inject(JobQueue(store.conn), target, params={"input_mode": "stdin", "timeout": 8})
+    assert pool.wait_idle(60)
+    if JobQueue(store.conn).runs.get(run.id).status != "done":
+        pytest.skip("sandbox unavailable")
+    f = next((f for f in FindingDAO(store.conn).list_by_target(target.id)
+              if f.detector == "inject_synth" and f.cwe == "CWE-89"), None)
+    assert f is not None and "sql injection" in f.title.lower() and "demonstrated" in f.title.lower()
 
 
 def test_leaked_words_extracts_and_decodes_secret_bytes():

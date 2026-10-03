@@ -122,6 +122,33 @@ def test_anything_short_of_the_file_contents_does_not_confirm(out):
     assert not injection.traversal_confirm(out, b"", "")
 
 
+# ---- SQL injection -----------------------------------------------------------------------
+
+def test_sqli_payloads_cover_quote_contexts_and_column_counts():
+    pays = injection.sqli_payloads(MARK)
+    assert any(p.startswith("' UNION SELECT") for p in pays), "no single-quote context"
+    assert any(p.startswith('" UNION SELECT') for p in pays), "no double-quote context"
+    assert any(p.startswith("0 UNION SELECT") for p in pays), "no numeric (unquoted) context"
+    assert all(MARK in p for p in pays), "a payload with no marker cannot be judged"
+    assert any("-- " in p for p in pays) and any(p.rstrip().endswith("#") for p in pays)
+
+
+def test_sqli_confirms_when_the_db_returns_the_injected_marker():
+    # the UNION-selected marker came back as a row -- the input was parsed as SQL
+    out = f"search name: found: {MARK}\n".encode()
+    assert injection.sqli_confirm(out, f"' UNION SELECT '{MARK}'-- ", MARK)
+
+
+def test_sqli_does_NOT_confirm_on_a_verbatim_echo_of_the_payload():
+    pl = f"' UNION SELECT '{MARK}'-- "
+    assert not injection.sqli_confirm(("you searched for: " + pl + "\n").encode(), pl, MARK)
+
+
+def test_sqli_does_not_confirm_without_the_marker():
+    assert not injection.sqli_confirm(b"found: bob\n", f"' UNION SELECT '{MARK}'-- ", MARK)
+    assert not injection.sqli_confirm(b"", f"' UNION SELECT '{MARK}'-- ", MARK)
+
+
 # ---- the probe table ---------------------------------------------------------------------
 
 def test_every_probe_is_wired_end_to_end():

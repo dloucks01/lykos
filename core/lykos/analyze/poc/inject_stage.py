@@ -155,6 +155,17 @@ def _disclosure_effect(ctx, spec, hit, input_sha, bundle_sha):
                  "detail": "an injected command ran (its marker appeared in output)",
                  "proof": {"type": "bundle", "sha": bundle_sha, "input_sha": input_sha}}]
         title = "Command / code injection (demonstrated)"
+    elif cwe == "CWE-89":
+        proof_sha = ctx.put_artifact("disclosure-proof", data=out[:4096])
+        effs = [{"kind": "injection", "title": "SQL injection", "status": "demonstrated",
+                 "detail": "a UNION-injected marker column was returned by the database -- the input "
+                           "is concatenated into the query, so an attacker controls its SQL (read "
+                           "or, via stacked/2nd-order queries, modify arbitrary data)",
+                 "proof": {"type": "bundle", "sha": bundle_sha, "input_sha": input_sha}},
+                {"kind": "info-disclosure", "title": "Database disclosure", "status": "demonstrated",
+                 "detail": "the query returns attacker-chosen rows",
+                 "proof": {"type": "artifact", "sha": proof_sha, "input_sha": input_sha}}]
+        title = "SQL injection (demonstrated)"
     else:                                              # path traversal etc. -> disclosure
         proof_sha = ctx.put_artifact("disclosure-proof", data=out[:4096])
         effs = [{"kind": "info-disclosure", "title": "Information disclosure",

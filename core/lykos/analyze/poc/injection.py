@@ -44,6 +44,31 @@ def fmt_confirm(out: bytes, payload: bytes, marker: str) -> bool:
     return len(re.findall(rb"0x[0-9a-fA-F]+", seg)) >= 2 or b"(nil)" in seg or b"(null)" in seg
 
 
+def sqli_payloads(marker: str):
+    """UNION-based SQL injection payloads carrying `marker` as a selected column. If the input is
+    concatenated into a query, the DB itself returns the marker as a row -- a forgery-proof oracle
+    (a non-injectable target treats the payload as a literal string and never emits the marker). The
+    original SELECT's arity is unknown, so a few column counts are tried, across single-quote,
+    double-quote and numeric (unquoted) contexts, each terminated with a SQL comment."""
+    m, out = marker, []
+    # break out of: a single-quoted literal, a double-quoted literal, or an unquoted numeric field.
+    for prefix in ("' ", '" ', "0 "):
+        for n in (1, 2, 3, 4, 5):
+            cols = ",".join([f"'{m}'"] + ["'x'"] * (n - 1))
+            out.append(f"{prefix}UNION SELECT {cols}-- ")        # sqlite / mysql / pg line comment
+            out.append(f"{prefix}UNION SELECT {cols}#")          # mysql hash comment
+    return out
+
+
+def sqli_confirm(out: bytes, payload, marker: str) -> bool:
+    # the marker must surface because the UNION SELECT RAN (the DB returned it as a row), NOT because
+    # the program echoed our payload verbatim: if the whole payload (which contains the marker) is
+    # still present in the output it was reflected, not executed -- same test shape as cmdi_confirm.
+    mk = marker.encode()
+    pb = payload if isinstance(payload, bytes) else payload.encode()
+    return mk in out and pb not in out
+
+
 def traversal_payloads():
     return [b"../../../../../../../../etc/passwd", b"..%2f..%2f..%2f..%2fetc/passwd",
             b"....//....//....//....//etc/passwd", b"/etc/passwd"]
@@ -71,4 +96,12 @@ PROBES = {
         "sinks": {"fopen", "fopen64", "open", "open64", "freopen"},
         "payloads": lambda m: traversal_payloads(), "confirm": traversal_confirm,
         "title": "Path traversal", "binary": True},
+    "sql-injection": {
+        "cwe": "CWE-89", "severity": "critical",
+        # the query-string sinks (sqlite / mysql / postgres). A prepared-statement API that binds
+        # parameters is NOT here -- only the string-concatenation execs an injection can reach.
+        "sinks": {"sqlite3_exec", "sqlite3_get_table", "sqlite3_prepare", "sqlite3_prepare_v2",
+                  "mysql_query", "mysql_real_query", "PQexec", "PQexecParams"},
+        "payloads": lambda m: sqli_payloads(m), "confirm": sqli_confirm,
+        "title": "SQL injection", "binary": True},
 }
