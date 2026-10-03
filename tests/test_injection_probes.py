@@ -164,6 +164,16 @@ def test_xxe_confirms_only_on_the_leaked_file_contents():
     assert not injection.traversal_confirm(b"parsed: hello\n", b"", "")
 
 
+# ---- SSRF --------------------------------------------------------------------------------
+
+def test_ssrf_payloads_use_the_file_scheme_for_offline_confirmation():
+    pays = injection.ssrf_payloads(MARK)
+    assert pays and all(b"etc/passwd" in p for p in pays)
+    assert any(p.lower().startswith(b"file:") for p in pays)
+    # confirmed by the fetched file's contents (shared traversal oracle)
+    assert injection.traversal_confirm(b"root:x:0:0:root:/root:/bin/sh\n", b"", "")
+
+
 # ---- the probe table ---------------------------------------------------------------------
 
 def test_every_probe_is_wired_end_to_end():

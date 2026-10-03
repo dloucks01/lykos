@@ -166,6 +166,14 @@ def _disclosure_effect(ctx, spec, hit, input_sha, bundle_sha):
                  "detail": "the query returns attacker-chosen rows",
                  "proof": {"type": "artifact", "sha": proof_sha, "input_sha": input_sha}}]
         title = "SQL injection (demonstrated)"
+    elif cwe == "CWE-918":
+        proof_sha = ctx.put_artifact("disclosure-proof", data=out[:4096])
+        effs = [{"kind": "ssrf", "title": "Server-side request forgery", "status": "demonstrated",
+                 "detail": "the server fetched an attacker-controlled URL -- demonstrated with a "
+                           "file: URL that returned a local file; the same control reaches internal "
+                           "services (http://169.254.169.254/, localhost) in a live environment",
+                 "proof": {"type": "artifact", "sha": proof_sha, "input_sha": input_sha}}]
+        title = "Server-side request forgery (demonstrated): SSRF"
     elif cwe == "CWE-611":
         proof_sha = ctx.put_artifact("disclosure-proof", data=out[:4096])
         effs = [{"kind": "info-disclosure", "title": "XML external entity (file disclosure)",

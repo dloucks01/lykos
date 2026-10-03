@@ -107,6 +107,40 @@ _XXE = ('#include <stdio.h>\n#include <unistd.h>\n'
         'xmlFreeDoc(d);return 0;}\n')
 
 
+_SSRF = ('#include <stdio.h>\n#include <string.h>\n#include <unistd.h>\n'
+         'typedef void CURL; extern CURL*curl_easy_init(void);\n'
+         'extern int curl_easy_setopt(CURL*,int,...); extern int curl_easy_perform(CURL*);\n'
+         'extern void curl_easy_cleanup(CURL*);\n'
+         'int main(void){char u[512];int n=read(0,u,sizeof u-1);if(n<=0)return 0;'
+         'if(u[n-1]==\'\\n\')n--;u[n]=0;CURL*c=curl_easy_init();if(!c)return 1;'
+         'curl_easy_setopt(c,10002,u);curl_easy_setopt(c,10001,stdout);'
+         'curl_easy_perform(c);curl_easy_cleanup(c);return 0;}\n')
+
+
+@pytest.mark.skipif(sandbox.host_arch() != "x86-64", reason="native x86-64")
+def test_ssrf_confirmed(store, pool, gcc, tmp_path):
+    """A C program fetching a user-controlled URL via libcurl is driven to a confirmed CWE-918 PoC:
+    a file: URL makes the server return a local file (the offline-observable SSRF facet)."""
+    import glob
+    if not (glob.glob("/usr/lib/x86_64-linux-gnu/libcurl.so*") or glob.glob("/usr/lib/libcurl.so*")
+            or glob.glob("/lib/x86_64-linux-gnu/libcurl.so*")):
+        pytest.skip("no libcurl runtime")
+    c = tmp_path / "ssrf.c"; c.write_text(_SSRF); b = tmp_path / "ssrf"
+    if subprocess.run([gcc, "-O0", "-w", str(c), "-o", str(b), "-l:libcurl.so.4"],
+                      capture_output=True, check=False).returncode:
+        pytest.skip("cannot build libcurl fixture")
+    case = store.cases.create("ssrf"); target = ingest(store, case.id, b)
+    CallEdgeDAO(store.conn).replace_for_target(target.id,
+                                               _edges(["curl_easy_setopt", "curl_easy_perform"]))
+    run = enqueue_inject(JobQueue(store.conn), target, params={"input_mode": "stdin", "timeout": 8})
+    assert pool.wait_idle(60)
+    if JobQueue(store.conn).runs.get(run.id).status != "done":
+        pytest.skip("sandbox unavailable")
+    f = next((f for f in FindingDAO(store.conn).list_by_target(target.id)
+              if f.detector == "inject_synth" and f.cwe == "CWE-918"), None)
+    assert f is not None and "ssrf" in f.title.lower()
+
+
 @pytest.mark.skipif(sandbox.host_arch() != "x86-64", reason="native x86-64")
 def test_xxe_confirmed(store, pool, gcc, tmp_path):
     """A C program parsing stdin XML with entity substitution enabled (XML_PARSE_NOENT) is driven to

@@ -78,6 +78,15 @@ def traversal_confirm(out: bytes, payload: bytes, marker: str) -> bool:
     return re.search(rb"root:.?:0:0:", out) is not None or b"root:x:0:" in out
 
 
+def ssrf_payloads(marker=None):
+    """Server-side request forgery: the fetched URL is attacker-controlled. The `file:` scheme
+    demonstrates it OFFLINE (the server fetches a local file of our choosing); confirmed by the
+    file content coming back. An internal-network pivot (http://169.254.169.254/, localhost
+    services) is the same primitive but needs a live environment to observe."""
+    return [b"file:///etc/passwd", b"file://localhost/etc/passwd", b"file:/etc/passwd",
+            b"FILE:///etc/passwd"]
+
+
 def xxe_payloads(marker=None):
     """XML external-entity file-disclosure documents: a SYSTEM entity pointing at /etc/passwd, in a
     few DTD/entity forms. Confirmed by the file's content coming back (same oracle as traversal)."""
@@ -108,6 +117,12 @@ PROBES = {
         "sinks": {"fopen", "fopen64", "open", "open64", "freopen"},
         "payloads": lambda m: traversal_payloads(), "confirm": traversal_confirm,
         "title": "Path traversal", "binary": True},
+    "ssrf": {
+        "cwe": "CWE-918", "severity": "high",
+        # a user-controlled URL handed to an HTTP/URL client. curl is the dominant C one.
+        "sinks": {"curl_easy_setopt", "curl_easy_perform", "curl_easy_init", "curl_url_set"},
+        "payloads": lambda m: ssrf_payloads(m), "confirm": traversal_confirm,
+        "title": "Server-side request forgery (SSRF)", "binary": True},
     "xxe": {
         "cwe": "CWE-611", "severity": "high",
         # libxml2 / libexpat document-parse entry points. Entity substitution must be enabled for
