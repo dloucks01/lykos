@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from ...db.dao import CallEdgeDAO, FindingDAO, FunctionDAO, StringDAO, TargetDAO
 from ...jobs.registry import register_stage
-from . import bounds, taint
+from . import bounds, scriptscan, taint
 from .catalog import entry_seed_params
 from .detectors import DETECTORS, DetectContext, correlate
 
@@ -390,6 +390,33 @@ def _detect_jvm(ctx, target) -> dict:
     return {}
 
 
+def _detect_script(ctx, target, lang, data) -> dict:
+    """Pattern-based vulnerability detection for an interpreted-script source (scriptscan). A
+    dangerous sink is a candidate; it is corroborated when an untrusted input source reaches it."""
+    findings = scriptscan.scan(data, lang)
+    fd = FindingDAO(ctx.conn)
+    fname = target.filename or "script"
+    for f in findings:
+        corro = f["state"] == "corroborated"
+        reach = ("untrusted input reaches the sink" if f["tainted"]
+                 else "sink present; verify input reachability")
+        fd.upsert(target.id, target.case_id, {
+            "cwe": f["cwe"], "title": f["title"],
+            "severity": f["severity"] if corro else "medium",
+            "detector": "scriptscan", "state": f["state"], "confidence": 0.75 if corro else 0.4,
+            "dedup_key": f'{f["cwe"]}:script:{fname}:{f["line"]}',
+            "function_addr": None, "site_addr": None, "site_detail": f'{fname}:{f["line"]}',
+            "evidence": [{"channel": "source",
+                          "detail": f'{lang}: {f["title"]} at {fname}:{f["line"]} ({reach}): '
+                                    f'{f["snippet"]}'}]})
+    ctx.emit("detect.done", payload={
+        "findings": len(findings), "substrate": f"script-{lang}",
+        "note": (f"{lang} source: pattern-based sink/source detection (no machine code). A sink "
+                 "with an untrusted source reaching it is corroborated; a bare sink is a lead.")})
+    ctx.progress(pct=100, msg=f"{len(findings)} findings in {lang} source")
+    return {}
+
+
 def detect_stage(ctx) -> dict:
     target = TargetDAO(ctx.conn).get(ctx.target_id) if ctx.target_id else None
     if target is None:
@@ -398,6 +425,18 @@ def detect_stage(ctx) -> dict:
 
     if (target.file_type or "").lower() in ("jar", "class"):
         return _detect_jvm(ctx, target)
+
+    # Interpreted-script SOURCE (PHP/Python/JS/Ruby): no machine code, so detection is pattern-based
+    # over the text (the Go/Rust lang_sinks shape). Routed before the native path when the target is
+    # a script by extension/shebang and is not itself a compiled binary.
+    if (target.file_type or "").lower() not in ("elf", "pe", "jar", "class", "macho", "firmware"):
+        try:
+            data = ctx.content.path(target.sha256).read_bytes()
+            lang = scriptscan.language_for(target.filename, data)
+        except Exception:
+            lang = None
+        if lang:
+            return _detect_script(ctx, target, lang, data)
 
     fdao = FunctionDAO(ctx.conn)
     functions = fdao.list_by_target(target.id)
