@@ -293,6 +293,79 @@ def _msan_source_line(binpath, text):
     return None
 
 
+def tsan_detonate(ctx, target, inputs, mode, exec_timeout, base_argv=()) -> int:
+    """Detonate a set of inputs against the target's ThreadSanitizer build (built at ingest for
+    source targets) to surface data races (CWE-362) -- the concurrency class no other sanitizer
+    sees. A race only manifests when the input drives the threaded path, and it does not crash the
+    ASan build, so it must be driven with the fuzz CORPUS. Findings land 'corroborated' (TSan
+    directly observed the race) with the source line. Fully guarded -- it must never break a
+    campaign. Shares the containment and cost bounds of msan_detonate."""
+    import os as _os
+
+    from ...db.dao import ArtifactDAO
+    from ..debug.rootcause import parse_asan_report
+    try:
+        arts = ArtifactDAO(ctx.conn).list_by_case(target.case_id)
+        tsa = next((a for a in arts if a.kind == "tsan-blob"
+                    and (a.meta or {}).get("binary_sha") == target.sha256), None)
+        if not tsa:
+            return 0
+        tsbin = ctx.scratch() / "target.tsan"
+        tsbin.write_bytes(ctx.content.path(tsa.sha256).read_bytes())
+        _os.chmod(tsbin, 0o755)
+    except Exception:
+        return 0
+    env = dict(_os.environ)
+    # halt on the first race; no symbolizer (it deadlocks on a captured-pipe stderr, as with MSan)
+    env["TSAN_OPTIONS"] = "halt_on_error=1:abort_on_error=0:exitcode=86:symbolize=0:history_size=4"
+    exedir = str(tsbin.parent)
+    prefix = sandbox.isolate_prefix(exedir, net=False)
+    per_timeout = max(2, int(exec_timeout))
+    deadline = time.monotonic() + max(15.0, min(90.0, per_timeout * 30))
+    _cancel = getattr(ctx, "should_cancel", None)
+    fd = FindingDAO(ctx.conn)
+    wf = ctx.scratch() / "tsan-in.bin"
+    found, seen = 0, set()
+    for data in list(inputs)[:400]:
+        if time.monotonic() > deadline or (_cancel is not None and _cancel()):
+            break
+        data = data or b""
+        tail, stdin = invocation(mode, wf, data, base_argv)
+        try:
+            r = sandbox.run_reaped(prefix + [str(tsbin)] + tail, input=stdin, timeout=per_timeout,
+                                   capture_output=True, env=env)
+        except Exception:
+            continue
+        txt = (r.stderr or b"").decode("latin-1", "ignore")
+        if "ThreadSanitizer: data race" not in txt and "ThreadSanitizer: lock-order" not in txt:
+            continue
+        rep = parse_asan_report(txt) or {}
+        src = _msan_source_line(tsbin, txt) or rep.get("source")
+        _raw = re.search(r"\(\S+\+0x[0-9a-fA-F]+\)", txt)
+        key = src or (_raw.group(0) if _raw else
+                      hashlib.sha1(txt[:256].encode("latin-1", "ignore")).hexdigest()[:12])
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            sha = ctx.put_artifact("tsan-input", data=data)
+            cwe = rep.get("cwe", "CWE-362")
+            fd.upsert(target.id, target.case_id, {
+                "cwe": cwe, "title": "Data race" if cwe == "CWE-362" else "Concurrency defect",
+                "severity": "high", "detector": "tsan", "state": "corroborated", "confidence": 0.8,
+                "dedup_key": f"{cwe}:tsan:{key}", "function_addr": None, "site_addr": None,
+                "site_detail": src,
+                "evidence": [{"channel": "sanitizer",
+                              "detail": (rep.get("detail") or "ThreadSanitizer: data race")
+                              + (f" at {src}" if src else "") + f" (input {sha[:12]})"}]})
+            found += 1
+        except Exception:
+            continue
+    if found:
+        ctx.emit("tsan.done", payload={"data_races": found})
+    return found
+
+
 def _discover_argv(ctx, target, exec_timeout):
     """Work out the target's required arguments -- and CHECK them before using them.
 
@@ -749,6 +822,11 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
     # skips, so they are fuzzed here, and the corpus is the only place uninitialized reads surface.
     try:
         msan_detonate(ctx, target, corpus, mode, exec_timeout, base_argv=base_argv)
+    except Exception:
+        pass
+    # Data-race pass (CWE-362): detonate the same corpus against the ThreadSanitizer binary.
+    try:
+        tsan_detonate(ctx, target, corpus, mode, exec_timeout, base_argv=base_argv)
     except Exception:
         pass
     ctx.emit(f"{event_prefix}.done", payload=stats)

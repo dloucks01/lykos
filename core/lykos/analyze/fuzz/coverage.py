@@ -24,7 +24,8 @@ from ..dynamic.stage import (
 )
 from . import aflpp
 from .runner import invocation, run_input
-from .stage import _DEFAULT_SEEDS, _recovered_blocks, format_aware_seeds, msan_detonate
+from .stage import (_DEFAULT_SEEDS, _recovered_blocks, format_aware_seeds, msan_detonate,
+                    tsan_detonate)
 
 COVERAGE_STAGE = "coverage_fuzz"
 TOOL = "aflpp"
@@ -121,7 +122,12 @@ def _msan_scan(ctx, target, out_dir, mode, exec_timeout, raw) -> int:
         inputs += [f.read_bytes() for f in sorted(q.glob("id:*"))[:200]]
     except Exception:
         pass
-    return msan_detonate(ctx, target, inputs, mode, exec_timeout)
+    n = msan_detonate(ctx, target, inputs, mode, exec_timeout)
+    try:
+        n += tsan_detonate(ctx, target, inputs, mode, exec_timeout)
+    except Exception:
+        pass
+    return n
 
 
 def coverage_stage(ctx) -> dict:

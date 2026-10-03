@@ -309,15 +309,31 @@ def parse_asan_report(text: str) -> Optional[dict]:
     # initialized (CWE-457). It needs its own -fsanitize=memory build (clang, mutually exclusive
     # with ASan), so this fires only when such a binary is detonated -- see compile_source_msan.
     msan = re.search(r"(?:ERROR|SUMMARY):\s*MemorySanitizer:\s*(use-of-uninitialized-value)", t)
+    # ThreadSanitizer reports a data race (CWE-362) -- a concurrency class none of the other
+    # sanitizers see; it needs its own -fsanitize=thread build (see compile_source_tsan).
+    tsan = re.search(r"(?:WARNING|ERROR|SUMMARY):\s*ThreadSanitizer:\s*(data race|"
+                     r"heap-use-after-free|thread leak|lock-order-inversion|"
+                     r"destroy of a locked mutex|signal-unsafe call)", t)
+    # LeakSanitizer (standalone, or inside an ASan build) reports a memory leak (CWE-401).
+    lsan = re.search(r"(?:ERROR|SUMMARY):\s*LeakSanitizer:\s*detected memory leaks", t) or \
+        re.search(r"(?:Direct|Indirect) leak of \d+ byte", t)
     ub = re.search(r"runtime error:\s*(.+)", t)
     if m and m.group(1) in _ASAN_NONBUG:
         m = None
-    if not m and not msan and not ub:
+    if not m and not msan and not tsan and not lsan and not ub:
         return None
     if msan:
         bug = "use-of-uninitialized-value"
         cwe, sev = ("CWE-457", "medium")
         detail = "MemorySanitizer: use of uninitialized value"
+    elif tsan:
+        bug = tsan.group(1).replace(" ", "-")
+        cwe, sev = (("CWE-416", "high") if bug == "heap-use-after-free" else ("CWE-362", "high"))
+        detail = f"ThreadSanitizer: {tsan.group(1)}"
+    elif lsan:
+        bug = "memory-leak"
+        cwe, sev = ("CWE-401", "low")
+        detail = "LeakSanitizer: detected memory leak"
     elif m:
         bug = m.group(1)
         cwe, sev = _ASAN_CWE.get(bug, ("CWE-119", "high"))

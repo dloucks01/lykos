@@ -128,6 +128,33 @@ def compile_source_msan(src: Path, filename: str, out: Path):
     return out if (r.returncode == 0 and out.exists()) else None
 
 
+def compile_source_tsan(src: Path, filename: str, out: Path):
+    """Best-effort ThreadSanitizer build, or None. TSan reports the one class no other sanitizer
+    sees -- a DATA RACE (CWE-362), plus lock-order inversions and a few other concurrency bugs --
+    so detonating a multithreaded target against this binary catches races the ASan/MSan builds
+    cannot. TSan is mutually exclusive with ASan/MSan, so it is a SEPARATE binary built only when a
+    compiler supports it. A race only surfaces when the input drives the threaded path, so, like
+    MSan, it must be driven with the fuzz CORPUS; a hit is directly observed (not a lead)."""
+    ext = Path(filename).suffix.lower()
+    cc = shutil.which("clang++" if ext in _CXX_EXT else "clang") or \
+        shutil.which("g++" if ext in _CXX_EXT else "gcc")
+    if not cc:
+        return None
+    opts_c = out.parent / "_lykos_tsan_opts.c"
+    opts_c.write_text('const char *__tsan_default_options(void){'
+                      'return "abort_on_error=1:halt_on_error=1";}\n')
+    lang = "c++" if ext in _CXX_EXT else "c"
+    argv = [cc, "-g", "-O1", "-fno-omit-frame-pointer", "-fsanitize=thread",
+            "-fno-sanitize-recover=all", "-w", "-Wno-error=implicit-function-declaration",
+            "-Wno-error=implicit-int", "-Wno-error=int-conversion", "-D_GNU_SOURCE", "-pthread",
+            "-x", lang, str(src), "-x", "none", str(opts_c), "-o", str(out)]
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out if (r.returncode == 0 and out.exists()) else None
+
+
 def _apply_triage_denorm(targets: TargetDAO, target_id: str, rec: dict) -> None:
     targets.update_triage(
         target_id, file_type=rec["file_type"], arch=rec["arch"], bits=rec["bits"],
@@ -318,6 +345,13 @@ def ingest(store, case_id: str, path: str | Path, filename: Optional[str] = None
                 store.put_artifact(case_id, "msan-blob", src=msanout,
                                    meta={"binary_sha": info["sha256"], "filename": fname})
                 meta["msan"] = True
+            # A THIRD, ThreadSanitizer build: catches the data-race class (CWE-362) no other
+            # sanitizer sees; the fuzz stage detonates the corpus against it. Best-effort.
+            tsanout = Path(td) / ((Path(fname).stem or "a") + ".tsan")
+            if compile_source_tsan(path, fname, tsanout) and tsanout.exists():
+                store.put_artifact(case_id, "tsan-blob", src=tsanout,
+                                   meta={"binary_sha": info["sha256"], "filename": fname})
+                meta["tsan"] = True
             store.put_artifact(case_id, "source-code", data=path.read_bytes(),
                                meta={"binary_sha": info["sha256"], "filename": fname, **meta})
             store.put_artifact(case_id, "target-blob", src=binout)
