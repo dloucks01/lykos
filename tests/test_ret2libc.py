@@ -386,6 +386,52 @@ def test_exploit_stage_auto_defeats_canary_no_params(store, case, pool, canary_b
         f"auto canary defeat produced no confirmed L3 (pocs={[(p.level, p.verified) for p in pocs]})"
 
 
+@pytest.fixture
+def canary_overread_bin(tmp_path_factory):
+    """A canary target that leaks via a buffer OVER-READ (write past the buffer), NOT a format
+    string -- the commonest real canary leak. Mirrors canary_bin but swaps printf(b) for
+    write(1,b,160)."""
+    from lykos.analyze.dynamic import sandbox
+    if sandbox.host_arch() != "x86-64" or not _SYS_LIBC:
+        pytest.skip("x86-64 + system libc required")
+    gcc = shutil.which("gcc") or shutil.which("cc")
+    if not gcc:
+        pytest.skip("no C compiler")
+    d = tmp_path_factory.mktemp("canary_or")
+    (d / "v.c").write_text(
+        '#include <stdio.h>\n#include <stdlib.h>\n#include <unistd.h>\n'
+        '__asm__(".text\\n.global g\\n g: pop %rdi\\n ret\\n");\n'
+        'void vuln(){ char b[64]; read(0,b,64); write(1,b,160); puts("go"); read(0,b,400); }\n'
+        'int main(){ setvbuf(stdout,0,2,0); while(1) vuln(); return 0; }\n')
+    exe = d / "v"
+    if subprocess.run([gcc, "-no-pie", "-fstack-protector-all", "-w",
+                       str(d / "v.c"), "-o", str(exe)], capture_output=True).returncode:
+        pytest.skip("cannot build over-read canary fixture")
+    return exe
+
+
+def test_exploit_stage_auto_defeats_canary_via_overread(store, case, pool, canary_overread_bin):
+    """strategy=auto defeats a stack canary leaked by a buffer OVER-READ (no format-string sink):
+    the stage fills the buffer, harvests the raw spilled canary word, discovers the offsets, writes
+    the canary back and ret2libc's past it to a confirmed L3 shell -- no analyst params."""
+    from lykos.analyze.ingest import enqueue_triage, ingest
+    from lykos.analyze.poc import enqueue_exploit
+    from lykos.db.dao import PocDAO, TargetDAO
+    from lykos.jobs import JobQueue
+    t = ingest(store, case.id, canary_overread_bin, filename="v")
+    q = JobQueue(store.conn)
+    enqueue_triage(q, t, force=True)
+    assert pool.wait_idle(30)
+    TargetDAO(store.conn).update_triage(t.id, arch="x86-64", bits=64, endianness="little",
+                                        linking="dynamic", stripped=False,
+                                        mitigations={"pie": "off", "canary": "on"}, file_type="elf")
+    run = enqueue_exploit(q, t, params={"input_mode": "stdin", "timeout": 20})
+    assert pool.wait_idle(240) and q.runs.get(run.id).status == "done"
+    pocs = PocDAO(store.conn).list_by_target(t.id)
+    assert any(pc.level == "L3" and pc.verified for pc in pocs), \
+        f"over-read canary defeat produced no confirmed L3 (pocs={[(p.level, p.verified) for p in pocs]})"
+
+
 def test_classify_leak_auto_recovers_libc_and_canary():
     """classify_leak auto-recovers the libc base (from >=2 leaked libc symbol pointers) and the
     canary from one burst, without an analyst naming any slot."""

