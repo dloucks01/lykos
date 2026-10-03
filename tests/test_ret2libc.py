@@ -44,6 +44,17 @@ def test_build_leak_puts_structure():
     assert q(40) == 0x401176 and q(48) == 0x404000 and q(56) == 0x401060 and q(64) == 0x4011ac
 
 
+def test_got_entries_enumerates_every_slot(r2l_bin):
+    """got_entries lists the whole PLT GOT (the arbitrary-write target set for an indexed-write
+    hijack); every slot must agree with the single-symbol got_entry reader."""
+    data = r2l_bin.read_bytes()
+    all_got = rop.got_entries(data)
+    assert "puts" in all_got and "read" in all_got       # both libc imports have slots
+    for name, slot in all_got.items():
+        assert rop.got_entry(data, name) == slot          # agrees with the per-symbol reader
+        assert slot > 0
+
+
 def _r2l_src(read_call: str) -> str:
     """The ret2libc target, parameterised ONLY by the read that owns the overflow, so the positive
     and its negative control are byte-identical but for that call (supwngo _90_neg).

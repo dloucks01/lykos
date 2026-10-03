@@ -105,7 +105,7 @@ def menu_seeds(strings, *, max_seeds: int = 64) -> list[bytes]:
 # The index keywords are index INDICATORS only (id/index/slot/...), never object nouns like
 # "author" -- "Author Note size" is a size, not an index, so NUM must win there.
 _NUM_KW = re.compile(r"(size|length|\blen\b|count|number|\bnum\b|\bage\b|amount|\bqty\b|quantity|"
-                     r"bytes|how many|price|score|year|\bhow much\b)", re.I)
+                     r"bytes|how many|price|score|year|\bhow much\b|\bvalue\b|\bval\b)", re.I)
 _IDX_KW = re.compile(r"(\bid\b|\bidx\b|index|\bslot\b|\bentry\b|position|\bpos\b|\bwhich\b|"
                      r"\bno\.?\b)", re.I)
 

@@ -176,6 +176,112 @@ def test_pie_repro_script_reproduces_standalone(pie_heapwin_bin):
     assert b"FLAG{pie-heap-chain}" in r.stdout, r.stdout + r.stderr
 
 
+# --- CWE-129/787 indexed write-what-where -> control-flow hijack (no-PIE, GOT overwrite) ---------
+def _oobwrite_src(guard: str) -> str:
+    """A menu-driven unchecked array-index WRITE target, parameterised ONLY by the index guard on
+    the `set` option, so the positive (no bound check -> arr[-9] reaches printf@GOT) and its
+    negative control (the write bounded to the array) are byte-identical but for that expression."""
+    return (r"""
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+long arr[8];
+__attribute__((used)) void win(void){ system("/bin/sh"); _exit(0); }
+int main(void){
+  setbuf(stdout,0);
+  long idx,val; int choice;
+  for(;;){
+    printf("1. set\n2. get\n3. exit\n> ");
+    if(scanf("%d",&choice)!=1) break;
+    if(choice==1){
+      printf("index: "); if(scanf("%ld",&idx)!=1) break;
+      printf("value: "); if(scanf("%ld",&val)!=1) break;
+      """ + guard + r"""
+    } else if(choice==2){
+      printf("index: "); if(scanf("%ld",&idx)!=1) break;
+      printf("%ld\n",arr[idx]);
+    } else break;
+  }
+  return 0;
+}
+""")
+
+
+_OOBWRITE_BUG = _oobwrite_src("arr[idx]=val;")                       # unchecked: write-what-where
+_OOBWRITE_SAFE = _oobwrite_src("if(idx>=0&&idx<8) arr[idx]=val;")    # bounded: no escape
+
+
+class _CapCtx:
+    """ctx for the live indexed-write hijack: should_cancel / progress / run_subprocess, enough to
+    drive make_capture's ptrace helper directly (no worker, no sandbox)."""
+    def should_cancel(self): return False
+    def progress(self, **k): pass
+    def run_subprocess(self, cmd, timeout=None):
+        return subprocess.run(cmd, capture_output=True, timeout=timeout)
+
+
+def _build_nopie(tmp_path_factory, name, src):
+    if sandbox.host_arch() != "x86-64":
+        pytest.skip("indexed-write GOT hijack is x86-64 native only")
+    gcc = shutil.which("gcc") or shutil.which("cc")
+    if not gcc:
+        pytest.skip("no C compiler")
+    d = tmp_path_factory.mktemp(name); c = d / "m.c"; c.write_text(src)
+    out = d / "target.bin"
+    if subprocess.run([gcc, "-O0", "-fno-stack-protector", "-no-pie", "-w", str(c), "-o", str(out)],
+                      capture_output=True).returncode != 0:
+        pytest.skip("cannot build no-PIE indexed-write target")
+    return out
+
+
+def _drive_oob_write_hijack(exe):
+    import sys as _sys
+
+    from lykos.analyze.poc.capture import make_capture, materialize_helper
+    tb = exe.read_bytes()
+    win_addr = elf_functions(tb)["win"]
+    ctx = _CapCtx()
+    helper = materialize_helper()
+    try:
+        cap = make_capture(ctx, helper, str(exe), "stdin", [], 8, _sys.executable)
+        return chain._oob_write_hijack(ctx, cap, tb, exe, ["1", "2", "3"],
+                                       {"1": ["idx", "num"], "2": ["idx"]}, win_addr, width=None)
+    finally:
+        shutil.rmtree(helper.parent, ignore_errors=True)
+
+
+@pytest.fixture
+def oobwrite_bug_bin(tmp_path_factory):
+    return _build_nopie(tmp_path_factory, "oobwbug", _OOBWRITE_BUG)
+
+
+@pytest.fixture
+def oobwrite_safe_bin(tmp_path_factory):
+    return _build_nopie(tmp_path_factory, "oobwsafe", _OOBWRITE_SAFE)
+
+
+def test_oob_write_hijack_overwrites_got_and_reaches_win(oobwrite_bug_bin):
+    """CWE-129/787: the unchecked `arr[idx]=val` set option is driven with the index that lands on
+    printf@GOT and val=&win, so the loop's next printf enters win -- confirmed under the ptrace
+    breakpoint with a passing negative control. The INDEX selects the address (a write-what-where),
+    which is why a GOT slot well outside the 8-element array is reachable at all."""
+    hit = _drive_oob_write_hijack(oobwrite_bug_bin)
+    assert hit is not None, "indexed-write GOT hijack not confirmed"
+    seq, writer, idx, tgt_addr, trig, tgt_name = hit
+    assert writer == "1" and idx < 0                      # the `set` option, an underflow index
+    assert tgt_name.endswith("@got")                      # a GOT slot was the write target
+    assert str(idx).encode() in seq and str(elf_functions(oobwrite_bug_bin.read_bytes())["win"]
+                                              ).encode() in seq
+
+
+def test_oob_write_hijack_declines_the_bounds_checked_target(oobwrite_safe_bin):
+    """Negative control: the SAME target with `if(idx>=0&&idx<8)` guarding the write cannot escape
+    the array, so no GOT slot is reachable and the chainer must NOT confirm a hijack. The win
+    function and every menu path are still present, so `None` is attributable to the bound check
+    alone -- a non-None result would be a hijack claimed without a bug."""
+    assert _drive_oob_write_hijack(oobwrite_safe_bin) is None
+
+
 # ------------------------------------------------- attribution proof (Phase 1b integration)
 class _ShimCtx:
     """Minimal ctx for `_attribution_proof`: it only needs a run_subprocess that returns an

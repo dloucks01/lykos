@@ -34,6 +34,11 @@ def test_classify_prompt_index_number_string():
     assert menu.classify_prompt("Author Note size: ") == "num"   # object noun is not an index
     assert menu.classify_prompt("Name: ") == "str"
     assert menu.classify_prompt("Note: ") == "str"
+    # a scalar "value" cell (arr[idx]=value) is numeric, not a data buffer: classifying it str sent
+    # "AAAA" into a scanf("%ld") and desynced the whole set/write flow (CWE-129 crawl).
+    assert menu.classify_prompt("value: ") == "num"
+    assert menu.classify_prompt("Enter val: ") == "num"
+    assert menu.classify_prompt("content: ") == "str"            # a real buffer stays a buffer
 
 
 def test_is_alloc_needs_size_then_string():

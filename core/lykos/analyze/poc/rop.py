@@ -424,6 +424,46 @@ def got_entry(data: bytes, name: str):
     return None
 
 
+def got_entries(data: bytes) -> dict:
+    """Every PLT GOT slot as {symbol_name: r_offset}, read from .rela.plt/.rel.plt. For a no-PIE
+    target each r_offset is the absolute, writable address the PLT stub dereferences -- the set of
+    arbitrary-write targets whose overwrite redirects a later call to that function. Pure stdlib,
+    best-effort: {} when the reloc/symbol tables are absent."""
+    secs = _sections(data)
+    rela = secs.get(".rela.plt") or secs.get(".rel.plt")
+    ds, st = secs.get(".dynsym"), secs.get(".dynstr")
+    if not rela or not ds or not st:
+        return {}
+    is64, endc = _elf_class_endian(data)
+    rel_ent = rela[2] or (24 if is64 else 8)
+    sym_ent = ds[2] or (24 if is64 else 16)
+    stroff = st[0]
+
+    def _symname(idx):
+        try:
+            st_name = struct.unpack_from(endc + "I", data, ds[0] + idx * sym_ent)[0]
+            end = data.find(b"\x00", stroff + st_name)
+            return data[stroff + st_name:end].decode("latin-1", "replace")
+        except struct.error:
+            return ""
+
+    out: dict = {}
+    for o in range(rela[0], rela[0] + rela[1], rel_ent):
+        try:
+            if is64:
+                r_offset, r_info = struct.unpack_from(endc + "QQ", data, o)[:2]
+                sym = r_info >> 32
+            else:
+                r_offset, r_info = struct.unpack_from(endc + "II", data, o)[:2]
+                sym = r_info >> 8
+        except struct.error:
+            break
+        name = _symname(sym)
+        if name:
+            out[name] = r_offset
+    return out
+
+
 def section_addr(data: bytes, name: str):
     """The runtime VADDR (sh_addr) of section `name`, or None. For a no-PIE target this is the
     fixed address of .rela.plt / .dynsym / .dynstr / .plt that a ret2dlresolve forges against."""

