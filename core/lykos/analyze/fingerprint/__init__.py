@@ -13,6 +13,8 @@ from .source_scan import SOURCE_CVE_STAGE, enqueue_source_cve_scan  # noqa: F401
 from .source_scan import register as _register_source
 from .stage import CVE_STAGE, enqueue_cve_scan  # noqa: F401
 from .stage import register as _register_cve
+from .uaf import UAF_STAGE, enqueue_uaf_scan  # noqa: F401
+from .uaf import register as _register_uaf
 
 
 def register() -> None:
@@ -20,4 +22,5 @@ def register() -> None:
     _register_source()
     _register_embedded()
     _register_intovf()
+    _register_uaf()
     _register_corroborate()

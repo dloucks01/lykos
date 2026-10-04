@@ -35,6 +35,7 @@ _TARGET = {
     "source_cve_scan": ("..analyze.fingerprint", "enqueue_source_cve_scan"),
     "embedded_audit": ("..analyze.fingerprint", "enqueue_embedded_audit"),
     "int_overflow_scan": ("..analyze.fingerprint", "enqueue_int_overflow_scan"),
+    "uaf_scan": ("..analyze.fingerprint", "enqueue_uaf_scan"),
     "net_fuzz": ("..analyze.fuzz", "enqueue_net_fuzz"),
     "env_fuzz": ("..analyze.fuzz", "enqueue_env_fuzz"),
     "cve_corroborate": ("..analyze.fingerprint", "enqueue_cve_corroborate"),
@@ -70,7 +71,8 @@ _CASE = {
 # them dropped that input and every one failed with "requires params.input_sha".
 _NO_PARAMS = {"disassemble", "detect_cwe", "heap_trace", "oob_index", "chain_primitive",
               "synthesize_poc", "firmware_carve", "source_cve_scan", "embedded_audit",
-              "int_overflow_scan", "net_fuzz", "env_fuzz", "cve_corroborate", "cve_poc"}
+              "int_overflow_scan", "uaf_scan", "net_fuzz", "env_fuzz", "cve_corroborate",
+              "cve_poc"}
 _CASE_NO_PARAMS = {"link_case", "ipc_model", "cross_taint"}
 
 _TERMINAL = {"done", "cancelled", "error"}
@@ -128,6 +130,7 @@ _PLAN_STAGES = [
     ("disassemble", "Disassemble"), ("detect_cwe", "Static detectors"),
     ("cve_scan", "Known-CVE scan"), ("source_cve_scan", "Dependency-CVE scan"),
     ("embedded_audit", "RTOS config audit"), ("int_overflow_scan", "Int-overflow allocs"),
+    ("uaf_scan", "Use-after-free scan"),
     ("net_fuzz", "Network fuzzing"), ("env_fuzz", "Env-var fuzzing"),
     ("cve_poc", "CVE weaponization"),
     ("cve_corroborate", "CVE corroboration"), ("synthesize_injection", "Injection probes"),
@@ -479,6 +482,8 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict, stop: t
             _run_target_stage(store, t, "embedded_audit", status, stop)
             # Unguarded size arithmetic feeding an allocator (integer-overflow allocation).
             _run_target_stage(store, t, "int_overflow_scan", status, stop)
+            # A freed pointer used or freed again on a path the fuzzer may never reach (UAF/dbl-free).
+            _run_target_stage(store, t, "uaf_scan", status, stop)
             # Weaponize every version-matched CVE -- a bespoke per-CVE trigger where one is
             # authored, else the library's format attack (zlib bomb, XML billion-laughs) and its
             # CWE-class probes -- recording a verified reproduction only if the target faults.
