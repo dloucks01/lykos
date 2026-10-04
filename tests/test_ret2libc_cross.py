@@ -14,6 +14,10 @@ _RV_GCC = shutil.which("riscv64-linux-gnu-gcc")
 _RV_QEMU = shutil.which("qemu-riscv64") or shutil.which("qemu-riscv64-static")
 _PPC_GCC = shutil.which("powerpc64le-linux-gnu-gcc")
 _PPC_QEMU = shutil.which("qemu-ppc64le") or shutil.which("qemu-ppc64le-static")
+_A64_GCC = shutil.which("aarch64-linux-gnu-gcc")
+_A64_QEMU = shutil.which("qemu-aarch64") or shutil.which("qemu-aarch64-static")
+_ARM_GCC = shutil.which("arm-linux-gnueabihf-gcc")
+_ARM_QEMU = shutil.which("qemu-arm") or shutil.which("qemu-arm-static")
 
 
 def _one_seg(seg, va=0x10000):
@@ -70,6 +74,32 @@ def test_find_ppc64_gadgets_requires_callee_saved_regs():
     assert all(c["ctr"] != 8 for c in g["callers"])      # the volatile-reg window is not a gadget
 
 
+def test_find_aarch64_gadgets_records_ldp_offset():
+    """The AArch64 loader scanner records the FIRST ldp's `[sp,#A]` displacement (a_off), so the
+    chain-builder can place &system / &"/bin/sh" at their true stack slots. A real gcc epilogue pops
+    the callee-saved pair far from sp (e.g. `ldp x27,x28,[sp,#80]`), so assuming A==16 left x0 unset
+    and aarch64 filed no PoC at all. Encodings (byte-decoded, no objdump): mov x0,x28 / blr x27, then
+    ldp x27,x28,[sp,#80] ; ldp x29,x30,[sp],#96 ; ret."""
+    def le(w):
+        return struct.pack("<I", w)
+    mov_x0_x28 = 0xAA0003E0 | (28 << 16)                  # mov x0, x28
+    blr_x27 = 0xD63F0000 | (27 << 5)                      # blr x27
+    ldp_2728_80 = 0xA9400000 | (10 << 15) | (28 << 10) | (31 << 5) | 27   # ldp x27,x28,[sp,#80]
+    ldp_2930_96 = 0xA8C00000 | (12 << 15) | (30 << 10) | (31 << 5) | 29   # ldp x29,x30,[sp],#96
+    ret = 0xD65F03C0
+    seg = le(mov_x0_x28) + le(blr_x27) + le(ldp_2728_80) + le(ldp_2930_96) + le(ret)
+    _one_seg(seg)
+    orig = rop._loads
+    rop._loads = lambda data: [(0, len(seg), 0x10000, 1)]
+    try:
+        g = rop.find_aarch64_r2libc_gadgets(seg)
+    finally:
+        rop._loads = orig
+    assert any(c["src"] == 28 and c["br"] == 27 for c in g["callers"])
+    ld = next(l for l in g["loaders"] if {l["r1"], l["r2"]} == {27, 28})
+    assert ld["a_off"] == 80, f"ldp [sp,#80] offset not recovered: {ld}"
+
+
 @pytest.mark.skipif(not (_RV_GCC and _RV_QEMU), reason="needs riscv64-linux-gnu-gcc + qemu-riscv64")
 def test_auto_files_l3_riscv64_ret2libc(store, tmp_path):
     """strategy=auto drives an NX-on RISC-V 64 stack overflow to a confirmed L3 ret2libc: an epilogue
@@ -86,6 +116,26 @@ def test_auto_files_l3_ppc64_ret2libc(store, tmp_path):
     saved LR -> a `mtctr; mr r3; bctr` caller gadget with &system / &"/bin/sh" in controllable
     callee-saved GPRs; confirmed by reaching `system` with r3=&"/bin/sh" + a negative control."""
     _run_cross_e2e(store, tmp_path, _PPC_GCC, "ppc64", "ppc64-ret2libc", opt="-O2")
+
+
+@pytest.mark.skipif(not (_A64_GCC and _A64_QEMU),
+                    reason="needs aarch64-linux-gnu-gcc + qemu-aarch64")
+def test_auto_files_l3_aarch64_ret2libc(store, tmp_path):
+    """strategy=auto drives an NX-on AArch64 overflow to a confirmed L3 ret2libc: the overwritten
+    saved x30 -> a two-gadget chain (signed-offset `ldp xR1,xR2,[sp,#A]` + post-indexed `ldp x29,x30`
+    loader, then a `mov x0,xS; blr xB` caller) calls system("/bin/sh"); confirmed by a spawned shell
+    under qemu-user. Regression guard: a real gcc loader pops the callee-saved pair at [sp,#80], so
+    the chain MUST honour a_off (not assume 16) or x0 stays 0 and no PoC is filed."""
+    _run_cross_e2e(store, tmp_path, _A64_GCC, "aarch64", "aarch64-ret2libc")
+
+
+@pytest.mark.skipif(not (_ARM_GCC and _ARM_QEMU),
+                    reason="needs arm-linux-gnueabihf-gcc + qemu-arm")
+def test_auto_files_l3_arm_ret2libc(store, tmp_path):
+    """strategy=auto drives an NX-on ARM (32-bit) overflow to a confirmed L3 ret2libc: a
+    `pop {r0,..,pc}` gadget sets r0=&"/bin/sh" and pc=&system -> system("/bin/sh"); confirmed by a
+    spawned shell under qemu-user + a negative control."""
+    _run_cross_e2e(store, tmp_path, _ARM_GCC, "arm", "arm-ret2libc")
 
 
 # A vulnerable program whose `vuln` keeps several values live ACROSS the overflowing read(), forcing
