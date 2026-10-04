@@ -13,6 +13,10 @@ from __future__ import annotations
 
 import re
 
+# A physical line longer than this is treated as minified (a whole module collapsed onto one line):
+# line-scoped corroboration cannot hold on it, so it yields candidates only.
+_MINIFIED_LINE = 2000
+
 # interpreted language -> the regex that matches an untrusted-input SOURCE token.
 _SOURCES = {
     "php": re.compile(r"\$_(?:GET|POST|REQUEST|COOKIE|SERVER|FILES|ENV)\b|php://input|"
@@ -56,9 +60,18 @@ _SINKS = {
          "CWE-22", "Path traversal", "high"),
     ],
     "javascript": [
-        (re.compile(r"\bchild_process\.(?:exec|execSync|spawn|spawnSync)\s*\(|"
-                    r"\brequire\s*\(\s*['\"]child_process['\"]\s*\)\.(?:exec|execSync)\s*\(|"
-                    r"\bexec(?:Sync)?\s*\("), "CWE-78", "OS command injection", "critical"),
+        # OS command injection. The receiver matters: `RegExp.prototype.exec` is by far the most
+        # common `.exec(` in JavaScript, so a BARE `.exec(` is NOT taken as a shell call (that flags
+        # every file that uses a regex -- e.g. all of jQuery). Fire on child_process's own calls,
+        # the `require('child_process')` form, and the *Sync / execFile / spawn variants that RegExp
+        # has no equivalent of. (A `cp.exec(x)` aliased off child_process is intentionally missed
+        # rather than flag every regex `.exec` -- recall traded for a FP that destroyed trust.)
+        (re.compile(r"\bchild_process\.(?:exec|execSync|execFile|execFileSync|spawn|spawnSync)\s*\(|"
+                    r"\brequire\s*\(\s*['\"]child_process['\"]\s*\)\s*\.\s*"
+                    r"(?:exec|execSync|execFile|spawn|spawnSync)\s*\(|"
+                    r"\b(?:execSync|execFileSync|spawnSync)\s*\(|"
+                    r"(?<![.\w$])(?:exec|execFile|spawn)\s*\("), "CWE-78", "OS command injection",
+         "critical"),
         (re.compile(r"(?<!\.)\beval\s*\(|\bnew\s+Function\s*\(|\bvm\.runIn\w*\s*\(|"
                     r"\bsetTimeout\s*\(\s*['\"]"), "CWE-95", "Code injection (eval)", "critical"),
         (re.compile(r"\.(?:query|execute)\s*\(\s*(?:`[^`]*\$\{|['\"][^'\"]*\"\s*\+|[^,)]*\+)"),
@@ -144,14 +157,18 @@ def scan(data: bytes, lang: str) -> list[dict]:
         stripped = line.lstrip()
         if stripped.startswith(("#", "//", "*", "/*")):     # skip obvious comments
             continue
+        # A MINIFIED line is a whole file collapsed onto one physical line; line-scoped corroboration
+        # ("source and sink in the same statement") is meaningless there -- every source co-occurs
+        # with every sink -- so such a line yields candidates only, never corroboration.
+        minified = len(line) > _MINIFIED_LINE
         for rx, cwe, title, sev in sinks:
             if not rx.search(line):
                 continue
             # Corroborate ONLY when the untrusted input is in the SINK'S OWN statement -- a source
             # elsewhere in the file must not promote a hardcoded `system("ls")`. Directly: a source
             # token on this line. Via a one-hop tainted variable used on this line.
-            direct_src = bool(src_rx and src_rx.search(line))
-            via_var = bool(taint_rx and taint_rx.search(line))
+            direct_src = bool(src_rx and src_rx.search(line)) and not minified
+            via_var = bool(taint_rx and taint_rx.search(line)) and not minified
             state = "corroborated" if (direct_src or via_var) else "candidate"
             key = (cwe, i)
             if key in seen:

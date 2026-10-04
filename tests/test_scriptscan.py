@@ -11,7 +11,11 @@ _PHP = (b"<?php\n$cmd=$_GET['c'];\nsystem($cmd);\n"
         b"include($_GET['page']);\neval($_REQUEST['x']);\nsystem(\"ls -la\");\n")
 _PY = (b"import os, subprocess, pickle, sys\nu = sys.argv[1]\nos.system('ping '+u)\n"
        b"subprocess.run('echo '+u, shell=True)\npickle.loads(request.data)\nopen('/safe/path')\n")
-_JS = (b"const cp=require('child_process');\nlet u=req.query.cmd;\ncp.exec('ls '+u);\n"
+# NOTE: child_process.exec(...) (explicit), not an aliased `cp.exec(...)`: a bare `.exec(` is
+# RegExp.prototype.exec far more often than a shell call, so scriptscan deliberately requires the
+# child_process receiver (see the CWE-78 pattern) to avoid flagging every regex in the wild.
+_JS = (b"const child_process=require('child_process');\nlet u=req.query.cmd;\n"
+       b"child_process.exec('ls '+u);\n"
        b"eval(req.body.code);\ndb.query(`SELECT * FROM t WHERE id=${req.params.id}`);\n")
 
 
@@ -41,6 +45,25 @@ def test_javascript_sinks_and_taint():
     assert ("CWE-78", "corroborated") in got        # cp.exec('ls '+u)
     assert ("CWE-95", "corroborated") in got        # eval(req.body.code)
     assert ("CWE-89", "corroborated") in got        # db.query(template literal with req.params)
+
+
+def test_js_regex_exec_is_not_command_injection():
+    """A bare `.exec(` is RegExp.prototype.exec, not a shell call -- it must NOT be CWE-78 (this FP
+    flagged all of jQuery as critical command injection). child_process's own calls still fire."""
+    regexy = b"var m = /ab+c/.exec(input); if (rquickExpr.exec(selector)) {} str.exec(x);\n"
+    assert not any(f["cwe"] == "CWE-78" for f in S.scan(regexy, "javascript"))
+    assert any(f["cwe"] == "CWE-78" for f in S.scan(b"child_process.exec(userInput)\n", "javascript"))
+    assert any(f["cwe"] == "CWE-78" for f in S.scan(b"const {execSync}=require('child_process');execSync(c)\n", "javascript"))
+
+
+def test_minified_megaline_yields_candidates_not_corroborated():
+    """A minified module is a whole file on one physical line, so line-scoped corroboration (source
+    and sink in the same statement) is meaningless there -- it must stay candidate, never promote."""
+    mega = (b"!function(){" + b"var x=1;" * 500 + b"var u=req.query.q;child_process.exec(u);"
+            + b"a.innerHTML=u;" * 200 + b"}();\n")   # one line, well over the minified threshold
+    got = {(f["cwe"], f["state"]) for f in S.scan(mega, "javascript")}
+    assert ("CWE-78", "candidate") in got
+    assert not any(st == "corroborated" for _, st in got)   # nothing corroborates on a megaline
 
 
 def test_taint_var_is_whole_token_not_substring():
