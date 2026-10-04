@@ -426,3 +426,37 @@ def test_parameter_driven_structured_crash_spawns_a_shell(store, case, pool, gcc
     assert "L3" in levels, f"did not reach L3: {levels}"
     titles = [f.title or "" for f in FindingDAO(store.conn).list_by_target(target.id)]
     assert any("spawned shell" in t for t in titles), f"no spawned-shell effect: {titles}"
+
+
+# A converter: `conv [options] input output`. argc<3 -> usage; otherwise it reads the INPUT file
+# (binary-safe fread) into a 64-byte buffer (overflow) and writes the OUTPUT. The harness must
+# discover the two-positional shape and supply a writable scratch OUTPUT, or it never runs.
+_CONV = (
+    "#include <stdio.h>\n#include <string.h>\n"
+    "static void usage(const char*p){ fprintf(stderr,\"usage: %s [options] input output\\n\",p); }\n"
+    "int main(int c,char**v){ if(c<3){ usage(v[0]); return 2; }\n"
+    "  FILE*f=fopen(v[1],\"rb\"); if(!f){ perror(\"open\"); return 1; }\n"
+    "  char buf[64]; size_t n=fread(buf,1,4096,f); fclose(f);\n"
+    "  FILE*o=fopen(v[2],\"wb\"); if(o){ fwrite(buf,1,n>64?64:n,o); fclose(o); } return 0; }\n")
+
+
+def test_multipositional_converter_is_driven_to_a_crash(store, case, pool, gcc, tmp_path):
+    """A `tool [opts] INPUT OUTPUT` converter: lykos must discover the two-positional shape, supply
+    a writable scratch output, drive the input through the parser, and find the overflow -- not sit
+    at the usage gate. Asserts a crash is found AND the invocation carried the output positional."""
+    from lykos.analyze.ingest import enqueue_triage
+    src = tmp_path / "conv.c"; src.write_text(_CONV)
+    exe = tmp_path / "conv"
+    if subprocess.run([gcc, "-O0", "-fno-stack-protector", "-no-pie", "-w", str(src),
+                       "-o", str(exe)], capture_output=True).returncode != 0:
+        pytest.skip("build failed")
+    seed = tmp_path / "seed.bin"; seed.write_bytes(b"A" * 300)       # overflows buf[64]
+    target = ingest(store, case.id, exe, filename="conv")
+    q = JobQueue(store.conn)
+    enqueue_triage(q, target, force=True); assert pool.wait_idle(120)
+    run = enqueue_fuzz(q, target, params={"timeout": 60, "seed_files": [str(seed)]})
+    assert pool.wait_idle(120) and q.runs.get(run.id).status == "done"
+    crashes = [d for d in DynResultDAO(store.conn).list_by_target(target.id) if d.crashed]
+    assert crashes, "converter not driven to a crash (stuck at the usage gate?)"
+    argv = crashes[0].argv or []
+    assert any("lykos.out" in str(a) for a in argv), f"output positional not supplied: {argv}"

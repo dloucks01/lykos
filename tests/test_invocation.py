@@ -247,3 +247,27 @@ def test_getopt_only_input_flag_becomes_the_optional_input_slot():
     found2 = invocation.discover(["c:v", "usage: prog -c <config>"])
     argv2 = invocation.propose_argv(found2)
     assert argv2 == ["-c", "@@"], argv2
+
+
+def test_converter_usage_proposes_input_and_output_positionals():
+    """A converter (`tool [opts] input output`) is driven by its two positionals; propose just
+    them -- input at @@, a scratch output at the OUTPUT placeholder -- not its optional flags."""
+    found = invocation.discover(["usage: conv [options] input output", "c:f:v"])
+    assert found["output_positional"] is True
+    assert invocation.propose_argv(found) == [invocation.INPUT_PLACEHOLDER,
+                                              invocation.OUTPUT_PLACEHOLDER]
+    # a non-converter (no output positional) is unchanged
+    assert invocation.discover(["usage: tool -c <config>"])["output_positional"] is False
+
+
+def test_verify_accepts_content_error_but_rejects_file_error():
+    """A converter handed a bad input exits non-zero with a CONTENT error (it got past args); that
+    is accepted. A wrong proposal that names a file it cannot find is rejected."""
+    def run_content(argv):           # bad input -> parser engaged, content error
+        return _R(2, b"tiffcp: Sanity check on directory count failed\n") if argv \
+            else _R(255, b"usage: tiffcp [options] input... output\n")
+    assert invocation.verify(run_content, "c", ["@@", "lykos.out"], "/s")["accepted"]
+    def run_filerr(argv):            # wrong proposal -> file not found
+        return _R(9, b"conv: cannot open nope: No such file\n") if argv \
+            else _R(2, b"usage: conv in out\n")
+    assert not invocation.verify(run_filerr, "c", ["-x", "nope", "@@"], "/s")["accepted"]

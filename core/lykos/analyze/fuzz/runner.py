@@ -2,7 +2,16 @@
 from __future__ import annotations
 
 from ..dynamic import sandbox
-from ..invocation import INPUT_PLACEHOLDER
+from ..invocation import INPUT_PLACEHOLDER, OUTPUT_PLACEHOLDER
+
+
+def _sub_output(argv, workfile):
+    """Replace the converter OUTPUT placeholder with a writable scratch path next to the input, so
+    `tool [opts] INPUT OUTPUT` targets (tiffcp, ffmpeg) run instead of printing usage and exiting."""
+    if OUTPUT_PLACEHOLDER not in argv:
+        return argv
+    outp = "lykos.out"  # relative -> writable cwd
+    return [outp if a == OUTPUT_PLACEHOLDER else a for a in argv]
 
 
 def place(argv, carrier: str) -> list:
@@ -30,7 +39,7 @@ def invocation(mode, workfile, d: bytes, base_argv=()):
     would produce `-c -v <path>` the moment any other flag was present, and `-c` would eat the
     flag instead of the file.
     """
-    argv = [str(a) for a in base_argv or []]
+    argv = _sub_output([str(a) for a in base_argv or []], workfile)
     if mode == "arg":
         carrier = d.decode("latin-1")
     elif mode == "file":

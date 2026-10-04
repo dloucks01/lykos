@@ -41,6 +41,33 @@ from typing import Optional
 # PoC bundle: `@@` marks where the input belongs in an argv that is not simply "the last
 # argument".
 INPUT_PLACEHOLDER = "@@"
+# A converter is `tool [opts] INPUT OUTPUT`: the input goes at `@@`, but it also needs a writable
+# OUTPUT path as a trailing positional or it refuses to run (tiffcp, ffmpeg, convert). This second
+# placeholder marks that slot; the runner/capture layers substitute a real scratch path for it.
+OUTPUT_PLACEHOLDER = "@@out"
+# The concrete output path a converter writes: RELATIVE, so it lands in whatever writable cwd the
+# run happens in -- the sandbox chdirs to a writable tmpfs /tmp, and an unwrapped run uses a temp
+# cwd. An absolute path under the exe dir (read-only bind) or a /tmp subdir (empty tmpfs) is not
+# writable, so the tool fails to create its output and looks like a wrong invocation.
+OUTPUT_SCRATCH = "lykos.out"
+_OUT_WORD = re.compile(r"(?i)^(out|output|outfile|dst|dest|destination|target|result|outputfile)$")
+
+
+def output_positional(usage) -> bool:
+    """Does the usage line end in an OUTPUT positional (a converter's `... input output`)?
+
+    True when, after dropping `[optional]` groups and flags, two or more bare positionals remain
+    and one after the first names an output. Then the invocation must append a scratch output path
+    or the tool prints usage and exits -- which otherwise looks like a wrong invocation forever."""
+    if not usage:
+        return False
+    t = re.sub(r"(?i)^.*?\busage\b\s*:?\s*", "", usage)
+    t = re.sub(r"\[[^\]]*\]", " ", t)                    # drop [options]-style optional groups
+    toks = [w for w in re.split(r"\s+", t) if w and not w.startswith("-")]
+    bare = [re.sub(r"[<>().]", "", w).strip(".") for w in toks]
+    bare = [w for w in bare if w and w != "%s"]
+    return len(bare) >= 2 and any(_OUT_WORD.match(w) for w in bare[1:])
+
 
 _OPTSTRING = re.compile(r"^[+-]?:?(?=[^:]*:)([A-Za-z0-9]:{0,2}){2,24}$")
 # usage: prog -c <config> --jar=FILE
@@ -415,7 +442,10 @@ def discover(strings, *, usage_hint: Optional[str] = None, help_text: Optional[s
     elif len(opt) and len(opt) <= 12:
         flags_in, sources, confidence = dict(opt), ["getopt"], "medium"
     else:
-        return {"flags": [], "usage": usage, "sources": [], "confidence": "none"}
+        # No flags, but a converter's `input output` usage still names a usable invocation (the two
+        # positionals), so carry output_positional out even on the "none" path.
+        return {"flags": [], "usage": usage, "sources": [], "confidence": "none",
+                "output_positional": output_positional(usage)}
 
     placeholders = {}
     for text in ([usage] if usage else []):
@@ -461,7 +491,8 @@ def discover(strings, *, usage_hint: Optional[str] = None, help_text: Optional[s
                 flags.append({"flag": oflag, "takes_value": True, "optional": True,
                               "kind": k, "default": d, "placeholder": None, "name": None,
                               "from_getopt": True})
-    return {"flags": flags, "usage": usage, "sources": sources, "confidence": confidence}
+    return {"flags": flags, "usage": usage, "sources": sources, "confidence": confidence,
+            "output_positional": output_positional(usage)}
 
 
 def propose_argv(found: dict, *, input_kind: str = "config") -> list:
@@ -479,6 +510,12 @@ def propose_argv(found: dict, *, input_kind: str = "config") -> list:
     default and the returned argv contains no `@@`, which the runner handles by APPENDING the
     input positionally. Callers that need to know which happened test `"@@" in argv`.
     """
+    # A CONVERTER (`tool [opts] INPUT OUTPUT`) is driven by its two positionals; its flags sit in
+    # the usage line's `[options]`, i.e. they are OPTIONAL extras, and filling them with placeholder
+    # values (`-c x`) only makes the tool reject the whole invocation. So for a converter, propose
+    # just the positionals: input at @@, a scratch path at OUTPUT_PLACEHOLDER.
+    if found.get("output_positional"):
+        return [INPUT_PLACEHOLDER, OUTPUT_PLACEHOLDER]
     # The fuzzed input is a FILE, delivered behind whichever flag names a file to read. `config`
     # is the canonical kind, but a --help metavar of FILE/PATH gives kind `path` for the very same
     # slot, so both are input slots -- otherwise a help-mined `-c FILE` got a dead default path and
@@ -510,6 +547,12 @@ def propose_argv(found: dict, *, input_kind: str = "config") -> list:
         if cands:
             argv += [cands[0]["flag"], "@@"]
             placed = True
+    # A converter (`tool [opts] INPUT OUTPUT`): the input is a trailing positional AND a writable
+    # OUTPUT path must follow, or it refuses to run. Emit both placeholders explicitly (input before
+    # output); the delivery layers substitute a real scratch output for OUTPUT_PLACEHOLDER.
+    if not placed and found.get("output_positional"):
+        argv += [INPUT_PLACEHOLDER, OUTPUT_PLACEHOLDER]
+        placed = True
     return argv
 
 
@@ -583,6 +626,10 @@ def materialize(found: dict, directory, *, sample=None) -> list:
     kinds = {f["flag"]: f.get("kind") for f in found.get("flags") or []}
     while i < len(argv):
         a = argv[i]
+        if a == OUTPUT_PLACEHOLDER:                       # a converter's scratch output path
+            out.append(OUTPUT_SCRATCH)                    # relative -> the sandbox's writable cwd
+            i += 1
+            continue
         out.append(a)
         kind = kinds.get(a)
         if i + 1 < len(argv) and kind in _FILE_KINDS and argv[i + 1] != INPUT_PLACEHOLDER:
@@ -602,6 +649,15 @@ def materialize(found: dict, directory, *, sample=None) -> list:
 
 _REJECT = re.compile(r"(?i)\b(usage|invalid option|unrecogni[sz]ed|unknown option|"
                      r"must (be|give|specify)|required|missing)\b")
+# The invocation named a FILE the target could not find/open/create -- a wrong proposal (unzip's
+# `-x x` -> "cannot find or open x"), or an output path that is not writable. Distinct from the
+# target ENGAGING our input content and failing on the bytes (a converter's "bad magic" / "Sanity
+# check failed"), which got PAST the argument gate and must count as accepted. So a non-zero exit is
+# "refused" only on one of these file errors, usage text, or output indistinguishable from the bare
+# run -- never on a content error.
+_FILEERR = re.compile(r"(?i)cannot (find|open|access|read|create|stat)|could not open|"
+                      r"no such file|does not exist|unable to open|read-only file|"
+                      r"permission denied|not found")
 
 
 def verify(run, exe, argv, sample_path, *, timeout: float = 10.0) -> dict:
@@ -619,14 +675,29 @@ def verify(run, exe, argv, sample_path, *, timeout: float = 10.0) -> dict:
         r = run(list(a))
         out = ((r.stdout or b"") + (r.stderr or b"")).decode("utf-8", "replace")[:4000]
         return {"rc": r.exit_code, "crashed": bool(r.crashed), "text": out,
-                "rejected": bool(_REJECT.search(out)) or (r.exit_code or 0) not in (0, None)}
+                "nonzero": (r.exit_code or 0) not in (0, None)}
+
+    def _rejected(res, other):
+        t = res["text"]
+        if _REJECT.search(t):                            # usage / invalid option / required / ...
+            return True
+        if _FILEERR.search(t):                           # named a file it can't find/open -> wrong
+            return True
+        if not res["nonzero"]:                           # ran clean (exit 0) -> accepted
+            return False
+        # Non-zero exit: refused ONLY if it never engaged our input -- no output, or output that is
+        # just the same usage/banner as the no-argument run. A different, non-file, non-usage error
+        # (a converter's "bad magic" / "Sanity check failed") means the parser RAN past the args.
+        s = t.strip()
+        return (not s) or s[:160] == other["text"].strip()[:160]
+
     bare = once([])
     ours = once([sample_path if a == "@@" else a for a in argv]) if argv else bare
-    accepted = bool(ours["crashed"]) or not ours["rejected"]
+    accepted = bool(ours["crashed"]) or not _rejected(ours, bare)
     return {
         "accepted": accepted,
         "argv": list(argv),
-        "bare_rejected": bare["rejected"],
+        "bare_rejected": _rejected(bare, {"text": ""}),
         "why": ("the target runs with this invocation" if accepted else
                 "the target still refuses this invocation -- "
                 + (ours["text"].strip().splitlines() or ["no output"])[0][:160]),

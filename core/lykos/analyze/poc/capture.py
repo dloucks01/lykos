@@ -9,6 +9,15 @@ from pathlib import Path
 
 from ..dynamic import sandbox
 from ..fuzz.runner import place
+from ..invocation import OUTPUT_PLACEHOLDER
+
+
+def _sub_out(argv, work):
+    """Replace a converter's OUTPUT placeholder with a writable scratch path, so `tool [opts] IN
+    OUT` targets run under the confirmation harness too (not just the fuzzer)."""
+    if OUTPUT_PLACEHOLDER not in argv:
+        return argv
+    return ["lykos.out" if a == OUTPUT_PLACEHOLDER else a for a in argv]
 
 _HELPER = "ptrace_capture.py"
 
@@ -31,7 +40,7 @@ def make_capture(ctx, helper: Path, exe, mode, base_argv, timeout, python):
 
     def capture(data: bytes, breakpoints=None) -> dict:
         stdin_file = None
-        argv = list(base_argv)
+        argv = _sub_out(list(base_argv), work)
         if mode == "stdin":
             stdin_file = str(work / "stdin.bin")
             (work / "stdin.bin").write_bytes(data)
@@ -67,7 +76,7 @@ def make_qemu_capture(exe, arch, mode, base_argv, timeout, *, endianness=None, b
     work = Path(tempfile.mkdtemp(prefix="lykos-qemucap-"))
 
     def capture(data: bytes, breakpoints=None) -> dict:
-        argv, stdin = list(base_argv), b""
+        argv, stdin = _sub_out(list(base_argv), work), b""
         if mode == "stdin":
             stdin = data
         elif mode == "arg":
