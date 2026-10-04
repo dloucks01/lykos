@@ -370,3 +370,46 @@ def test_recursion_is_depth_bounded():
         payload = gzip.compress(payload)
     # must return without error (possibly empty, since the ELF is deeper than the cap)
     assert isinstance(carve.extract_components(payload), list)
+
+
+# ---- pure-Python cpio (newc) extraction: no external tool needed ---------------------------
+def _make_cpio(tmp_path):
+    """Build an authoritative newc cpio with the system tool (so the test validates the pure-Python
+    parser against a real archive, not against bytes we wrote to match it). Skips if cpio absent."""
+    import shutil as _sh
+    import subprocess as _sp
+    if not _sh.which("cpio"):
+        pytest.skip("cpio tool not available to build an authoritative fixture")
+    root = tmp_path / "r"
+    (root / "bin").mkdir(parents=True)
+    (root / "bin" / "prog").write_bytes(_elf64(0x80))
+    (root / "etc_conf").write_text("secret=hunter2\n")
+    names = b"\0".join(p.relative_to(root).as_posix().encode()
+                       for p in sorted(root.rglob("*")) if p.is_file()) + b"\0"
+    r = _sp.run(["cpio", "--null", "-o", "-H", "newc", "--quiet"], input=names, cwd=str(root),
+                capture_output=True)
+    if r.returncode or not r.stdout:
+        pytest.skip("cpio could not build the fixture")
+    return r.stdout
+
+
+def test_cpio_newc_is_parsed_in_pure_python(tmp_path):
+    from lykos.analyze.firmware import carve
+    files = carve._cpio_newc_files(_make_cpio(tmp_path), 0)
+    by = {f["path"]: f for f in files}
+    assert any(f["kind"] == "elf" for f in files), "embedded ELF not recovered from the cpio"
+    assert "etc_conf" in by and by["etc_conf"]["bytes"] == b"secret=hunter2\n"
+
+
+def test_cpio_filesystem_is_extracted_from_an_image(tmp_path):
+    from lykos.analyze.firmware import carve
+    img = b"HDR0" + b"\x00" * 60 + _make_cpio(tmp_path)   # cpio embedded behind a header + padding
+    got = carve.extract_filesystems(img)
+    kinds = {(g["fs"], g["kind"]) for g in got}
+    assert ("cpio", "elf") in kinds, f"cpio filesystem not extracted from image: {kinds}"
+
+
+def test_garbage_cpio_header_does_not_crash():
+    from lykos.analyze.firmware import carve
+    assert carve._cpio_newc_files(b"070701" + b"Z" * 200, 0) == []   # bad hex fields -> clean []
+    assert carve._cpio_newc_files(b"070701", 0) == []                # truncated -> clean []

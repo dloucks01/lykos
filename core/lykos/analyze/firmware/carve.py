@@ -332,7 +332,54 @@ def _unpack_squashfs(fs: bytes) -> list[dict]:
         return _walk_tree(dest)
 
 
+_CPIO_NEWC = (b"070701", b"070702")        # newc, and newc with a CRC
+_S_IFREG = 0o100000
+
+
+def _cpio_newc_files(data: bytes, start: int = 0) -> list[dict]:
+    """Parse a newc cpio archive in pure Python -- no external tool. Each entry is a 110-byte ASCII
+    header (6-byte magic + 13 eight-hex fields) then the NUL-terminated name and the file body, the
+    header+name and the body each padded to a 4-byte boundary measured from the archive origin.
+    'TRAILER!!!' ends it. Returns regular files only: [{path, bytes, kind}]. Every read is
+    bounds-checked (untrusted firmware) and the file/byte totals are capped."""
+    files: list[dict] = []
+    pos, total = start, 0
+    while pos + 110 <= len(data) and len(files) < _MAX_FS_FILES and total < _MAX_FS_TOTAL:
+        if data[pos:pos + 6] not in _CPIO_NEWC:
+            break
+        try:
+            f = [int(data[pos + 6 + i * 8:pos + 6 + (i + 1) * 8], 16) for i in range(13)]
+        except ValueError:
+            break
+        mode, filesize, namesize = f[1], f[6], f[11]
+        if namesize > 4096 or filesize > (1 << 31):       # absurd -> corrupt/not really newc
+            break
+        name = data[pos + 110:pos + 110 + namesize].split(b"\x00", 1)[0]
+        nm = name.decode("utf-8", "replace").lstrip("./")
+        body_off = pos + 110 + namesize
+        body_off += (start - body_off) % 4                # pad header+name to 4 from the origin
+        if nm == "TRAILER!!!":
+            break
+        body = data[body_off:body_off + filesize] if filesize <= _MAX_FS_FILE else b""
+        nxt = body_off + filesize
+        nxt += (start - nxt) % 4                           # pad body to 4 from the origin
+        if nxt <= pos:                                     # no forward progress -> stop
+            break
+        pos = nxt
+        if (mode & 0o170000) == _S_IFREG and body and nm:
+            total += len(body)
+            files.append({"path": nm, "bytes": body,
+                          "kind": "elf" if body[:4] == b"\x7fELF" else "file"})
+    return files
+
+
 def _unpack_cpio(fs: bytes) -> list[dict]:
+    # Pure-Python newc parse first -- no dependency, and it works where `cpio` is not installed
+    # (the common case for an analysis host). Fall back to the system tool only if that finds
+    # nothing (e.g. an old binary/odc cpio variant the pure parser does not implement).
+    files = _cpio_newc_files(fs, 0)
+    if files:
+        return files
     exe = shutil.which("cpio")
     if not exe:
         return []
