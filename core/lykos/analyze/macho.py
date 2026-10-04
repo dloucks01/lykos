@@ -196,7 +196,7 @@ def _parse_lc(data, off, cmd, cmdsize, e, bits, info, libs):
             _parse_segment(data, off, cmd, e, info)
         elif cmd == LC_SYMTAB:
             _parse_symtab(data, off, e, bits, info)
-        elif cmd == LC_MAIN:
+        elif cmd == LC_MAIN and cmdsize >= 16:                        # entryoff+stacksize = 16 bytes
             (entryoff,) = struct.unpack_from(e + "Q", data, off + 8)   # file offset of entry
             info.entry = entryoff
         elif cmd == LC_UNIXTHREAD and info.entry is None:

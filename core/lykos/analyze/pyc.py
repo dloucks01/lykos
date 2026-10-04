@@ -57,7 +57,11 @@ def parse(data: bytes) -> PycInfo:
     info.hash_based = bool(info.flags & 0x1)
     info.toolchain_hint = f"CPython {info.python_version}"
     body = data[16:]
-    names, strings = _harvest(body)
+    try:
+        names, strings = _harvest(body)          # best-effort; mirror the sibling parsers' contract
+    except Exception as e:                       # noqa: BLE001 -- never raise on a hostile .pyc
+        info.errors.append(f"harvest: {e!r}")
+        names, strings = [], []
     # names that look like dotted/importable identifiers are the module's call surface; the rest are
     # literal strings for the dictionary/string detectors.
     info.imported_symbols = names[:512]

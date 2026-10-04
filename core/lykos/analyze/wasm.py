@@ -123,13 +123,13 @@ def _parse_section(sec_id: int, body: bytes, info: WasmInfo):
             info.exported_symbols.append(f"{nm} [{_EXTERN_KIND.get(kind,'?')}]")
     elif sec_id == 3:                                            # function section (count of funcs)
         count, _ = _uleb(body, 0)
-        info.func_count = count
+        info.func_count = min(count, _MAX_VEC)                   # a LEB count is up to 2^70; clamp
     elif sec_id == 5:                                            # memory section -> initial pages
         count, pos = _uleb(body, 0)
         if count:
             flags, pos = _uleb(body, pos)
             initial, pos = _uleb(body, pos)
-            info.mem_pages = initial
+            info.mem_pages = min(initial, 0x10000)               # wasm32 max is 65536 pages; clamp
     elif sec_id == 8:                                            # start section
         info.has_start = True
 

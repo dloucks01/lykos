@@ -32,8 +32,9 @@ FIRMWARE_MAGICS = (
 _MACHO_MAGICS = {
     b"\xfe\xed\xfa\xce", b"\xce\xfa\xed\xfe",   # 32-bit
     b"\xfe\xed\xfa\xcf", b"\xcf\xfa\xed\xfe",   # 64-bit
-    b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca",   # fat / universal
-}
+    b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca",   # fat / universal (32-bit offsets)
+    b"\xca\xfe\xba\xbf", b"\xbf\xba\xfe\xca",   # fat / universal (64-bit offsets) -- macho.parse
+}                                              # handles these; they are not the Java CAFEBABE
 
 
 def detect(head: bytes) -> str:

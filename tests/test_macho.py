@@ -54,6 +54,16 @@ def test_rejects_non_macho():
     assert macho.parse(b"xx").errors                            # too short
 
 
+def test_filetype_routes_fat64_universal_to_macho():
+    # fat/universal Mach-O with 64-bit offsets (FAT_MAGIC_64 / FAT_CIGAM_64) must route to the
+    # Mach-O parser, not fall through to "other" (macho.parse already handles these slices).
+    from lykos.analyze import filetype
+    assert filetype.detect(b"\xca\xfe\xba\xbf" + b"\x00" * 60) == "macho"   # fat64 big-endian
+    assert filetype.detect(b"\xbf\xba\xfe\xca" + b"\x00" * 60) == "macho"   # fat64 little-endian
+    # the Java class CAFEBABE (identical to fat32 magic) must still resolve to CLASS, not Mach-O
+    assert filetype.detect(b"\xca\xfe\xba\xbe\x00\x00\x00\x34" + b"\x00" * 56) == "class"
+
+
 def test_bits_and_arch_mapping():
     # arm64 sets the 64-bit ABI bit even though we pass bits from the magic
     aname, abits = macho._arch_name(0x0100000C, 64)
