@@ -175,3 +175,31 @@ def test_libwebp_abi_version_maps_to_a_release_and_matches_its_cve(tmp_path):
     # the fixed release (same ABI, so still 1.3.0-approximate) is why the flag says "verify": a
     # true 1.3.2 is clear, and the curated range excludes it.
     assert not scan.match([{"library": "libwebp", "name": "libwebp", "version": "1.3.2"}])
+
+
+def test_go_sum_gives_exact_versions_deduped(tmp_path):
+    """go.sum pins the resolved version (better than go.mod's requires); each module appears twice
+    (once with /go.mod) and must dedupe, with the version stripped of its leading 'v' like go.mod."""
+    root = _tree(tmp_path, {"go.sum":
+                            "github.com/pkg/errors v0.9.1 h1:A=\n"
+                            "github.com/pkg/errors v0.9.1/go.mod h1:B=\n"
+                            "gopkg.in/yaml.v2 v2.4.0 h1:C=\n"})
+    got = _by_lib(source_scan.parse_source_tree(root))
+    assert got.get("go:github.com/pkg/errors") == "0.9.1"
+    assert got.get("go:gopkg.in/yaml.v2") == "2.4.0"
+
+
+def test_nuget_csproj_and_packages_config(tmp_path):
+    """NuGet: a .csproj PackageReference (attribute OR child <Version>), and packages.config. Each
+    PackageReference is parsed on its own so one package's child version is not read onto another."""
+    root = _tree(tmp_path, {
+        "App.csproj": '<Project><ItemGroup>'
+                      '<PackageReference Include="Newtonsoft.Json" Version="12.0.3" />'
+                      '<PackageReference Include="Serilog"><Version>2.10.0</Version></PackageReference>'
+                      '</ItemGroup></Project>',
+        "packages.config": '<packages><package id="jQuery" version="3.6.0" '
+                           'targetFramework="net48" /></packages>'})
+    got = _by_lib(source_scan.parse_source_tree(root))
+    assert got.get("nuget:newtonsoft.json") == "12.0.3"
+    assert got.get("nuget:serilog") == "2.10.0"          # NOT cross-read from Newtonsoft
+    assert got.get("nuget:jquery") == "3.6.0"

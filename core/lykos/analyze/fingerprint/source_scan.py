@@ -134,6 +134,60 @@ def _parse_go_mod(text: str) -> list:
     return [("go:" + mod.lower(), mod, ver) for mod, ver in _GOMOD.findall(text)]
 
 
+# go.sum: `module version hash` and `module version/go.mod hash` -- exact resolved versions, better
+# than go.mod's requires. Each module appears twice (once with /go.mod); dedupe on (module, ver).
+_GOSUM = re.compile(r"(?m)^(\S+)\s+v([0-9][\w.\-+]*?)(?:/go\.mod)?\s+h1:")   # version without the v
+
+
+def _parse_go_sum(text: str) -> list:
+    seen, out = set(), []
+    for mod, ver in _GOSUM.findall(text):
+        key = (mod.lower(), ver)
+        if key not in seen:
+            seen.add(key)
+            out.append(("go:" + mod.lower(), mod, ver))
+    return out
+
+
+# NuGet: each <PackageReference> element on its own (a non-greedy scan across elements would attach
+# one package's child <Version> to another). Version is an attribute or a child element; and
+# packages.config uses <package id="Pkg" version="1.2.3" />.
+_NUGET_ELEM = re.compile(r"(?is)<PackageReference\b(.*?)(?:/>|>(.*?)</PackageReference>)")
+_NUGET_PKGCONF = re.compile(r'(?is)<package\b[^>]*?\bid="([^"]+)"[^>]*?\bversion="([^"]+)"')
+
+
+def _nuget_rows(pairs) -> list:
+    out, seen = [], set()
+    for name, ver in pairs:
+        v = (ver or "").strip()
+        m = re.search(r"[0-9][0-9A-Za-z.\-+]*", v)       # a range like [1.2.3,) -> its lower bound
+        if not (name and m):
+            continue
+        key = (name.lower(), m.group(0))
+        if key not in seen:
+            seen.add(key)
+            out.append(("nuget:" + name.lower(), name, m.group(0)))
+    return out
+
+
+def _parse_nuget_csproj(text: str) -> list:
+    pairs = []
+    for attrs, body in _NUGET_ELEM.findall(text):
+        inc = re.search(r'\bInclude="([^"]+)"', attrs)
+        if not inc:
+            continue
+        ver = re.search(r'\bVersion="([^"]+)"', attrs)                      # attribute form
+        if not ver and body:
+            ver = re.search(r"<Version>\s*([^<\s]+)", body)                 # child element form
+        if ver:
+            pairs.append((inc.group(1), ver.group(1)))
+    return _nuget_rows(pairs)
+
+
+def _parse_packages_config(text: str) -> list:
+    return _nuget_rows(_NUGET_PKGCONF.findall(text))
+
+
 def _parse_cargo_lock(text: str) -> list:
     out = []
     try:
@@ -229,12 +283,16 @@ _MANIFEST_PARSERS = {
     "package-lock.json": _parse_package_lock,
     "package.json": _parse_package_json,
     "go.mod": _parse_go_mod,
+    "go.sum": _parse_go_sum,
     "Cargo.lock": _parse_cargo_lock,
     "pom.xml": _parse_pom,
     "composer.lock": _parse_composer_lock,
     "Gemfile.lock": _parse_gemfile_lock,
     "pubspec.lock": _parse_pubspec_lock,
+    "packages.config": _parse_packages_config,
 }
+# Parsers keyed by file SUFFIX (a wildcard name): NuGet project files are `<anything>.csproj`.
+_SUFFIX_PARSERS = {".csproj": _parse_nuget_csproj}
 
 
 def parse_source_tree(root: Path) -> list:
@@ -257,7 +315,7 @@ def parse_source_tree(root: Path) -> list:
             continue
         seen_files += 1
         base = p.name
-        parser = _MANIFEST_PARSERS.get(base)
+        parser = _MANIFEST_PARSERS.get(base) or _SUFFIX_PARSERS.get(p.suffix.lower())
         hits = []
         if parser:
             try:
