@@ -755,11 +755,13 @@ def _rv_decode(w: int, sz: int):
     if (w & 0x707F) == 0x3003 and ((w >> 15) & 0x1F) == 2:    # ld rd, off(sp)
         off = (w >> 20) & 0xFFF
         return ("ldsp", (w >> 7) & 0x1F, off - 0x1000 if off & 0x800 else off)
-    if (w & 0x707F) == 0x0067:                               # jalr rd, rs1, 0
-        rd, rs1 = (w >> 7) & 0x1F, (w >> 15) & 0x1F
-        if rd == 0 and rs1 == 1 and ((w >> 20) & 0xFFF) == 0:
+    if (w & 0x707F) == 0x0067:                               # jalr rd, rs1, imm
+        rd, rs1, imm = (w >> 7) & 0x1F, (w >> 15) & 0x1F, (w >> 20) & 0xFFF
+        if rd == 0 and rs1 == 1 and imm == 0:
             return ("ret", 1, 0)
-        return ("jalr" if rd == 1 else "jr", rs1, 0)
+        if imm == 0:                                         # only a displacement-free jalr is a
+            return ("jalr" if rd == 1 else "jr", rs1, 0)     # clean register jump; jalr sB,off(sB)
+        return None                                          # lands at sB+off, not sB -- not a gadget
     if (w & 0x707F) == 0x0013 and ((w >> 7) & 0x1F) == 2 and ((w >> 15) & 0x1F) == 2:   # addi sp,sp,imm
         off = (w >> 20) & 0xFFF
         return ("addisp", 2, off - 0x1000 if off & 0x800 else off)
