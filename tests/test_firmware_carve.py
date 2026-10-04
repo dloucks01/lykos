@@ -289,3 +289,54 @@ def test_a_cpio_rootfs_is_unpacked_and_its_elf_is_an_elf_component():
     assert "bin/app" in by_path and by_path["bin/app"]["kind"] == "elf"
     assert by_path["bin/app"]["bytes"] == elf, "the unpacked ELF is not byte-identical"
     assert "etc/app.conf" in by_path and by_path["etc/app.conf"]["kind"] == "file"
+
+
+# ---- new firmware codecs and container signatures (breadth) -------------------------------
+
+def test_an_xz_compressed_elf_is_extracted():
+    elf = _elf64(0x80)
+    blob = b"\x00" * 64 + lzma.compress(elf, format=lzma.FORMAT_XZ) + b"\xff" * 32
+    kinds = [c["note"] for c in carve.extract_components(blob)]
+    assert any("xz-compressed ELF" in n for n in kinds), kinds
+
+
+def test_a_raw_lzma_compressed_elf_is_extracted_without_a_magic():
+    """OpenWRT ships kernels/filesystems as raw .lzma (LZMA_ALONE), which has no reliable magic.
+    The carver finds it by validating candidates via trial-decompression, not by a magic guess."""
+    elf = _elf64(0x80)
+    blob = b"\x00" * 64 + lzma.compress(elf, format=lzma.FORMAT_ALONE) + b"\xff" * 32
+    notes = [c["note"] for c in carve.extract_components(blob)]
+    assert any("raw-LZMA-compressed ELF" in n for n in notes), notes
+
+
+def test_a_zstd_compressed_elf_is_extracted_when_the_codec_is_available():
+    try:
+        from compression import zstd
+    except Exception:
+        try:
+            import zstandard as zstd  # noqa: F401
+        except Exception:
+            pytest.skip("no zstd codec available (stdlib compression.zstd needs Python 3.14+)")
+        import zstandard
+        comp = zstandard.ZstdCompressor().compress(_elf64(0x80))
+    else:
+        comp = zstd.compress(_elf64(0x80))
+    blob = b"\x00" * 64 + comp + b"\xff" * 32
+    notes = [c["note"] for c in carve.extract_components(blob)]
+    assert any("zstd-compressed ELF" in n for n in notes), notes
+
+
+def test_new_container_magics_are_identified():
+    for magic, typ in ((b"HDR0", "trx"), (b"ANDROID!", "androidboot"),
+                       (b"-rom1fs-", "romfs"), (b"\x28\xb5\x2f\xfd", "zstd"),
+                       (b"\x04\x22\x4d\x18", "lz4"), (b"7z\xbc\xaf\x27\x1c", "7zip")):
+        blob = b"\x00" * 32 + magic + b"\x00" * 64
+        types = {h["type"] for h in carve.scan_signatures(blob)}
+        assert typ in types, f"{typ} not identified from its magic"
+
+
+def test_a_bare_0x5d_byte_is_not_a_false_raw_lzma_hit():
+    """0x5d is a common data byte; a raw-LZMA candidate is only kept if it actually decompresses
+    to an ELF, so noise full of 0x5d yields no components (low false positive by construction)."""
+    blob = bytes([0x5d, 0, 0, 0, 0, 0, 0, 0] * 400)     # many 0x5d, none valid LZMA
+    assert carve.extract_components(blob) == []

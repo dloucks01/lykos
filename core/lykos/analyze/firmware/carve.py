@@ -19,6 +19,23 @@ from typing import Optional
 
 _log = logging.getLogger(__name__)
 
+# Zstandard: stdlib `compression.zstd` from Python 3.14, else the third-party `zstandard` if present,
+# else None (zstd streams are then IDENTIFIED but not extracted). Resolved once, at import.
+try:
+    from compression import zstd as _zstd_mod          # Python 3.14+ stdlib
+
+    def _zstd_decompress(blob, cap):
+        d = _zstd_mod.ZstdDecompressor()
+        return _bounded(d, blob, cap)
+except Exception:                                       # noqa: BLE001
+    try:
+        import zstandard as _zstandard
+
+        def _zstd_decompress(blob, cap):
+            return _zstandard.ZstdDecompressor().decompress(blob, max_output_size=cap)
+    except Exception:                                   # noqa: BLE001
+        _zstd_decompress = None
+
 # magic bytes -> (type, description). Kept to low-false-positive, meaningful firmware markers.
 SIGNATURES: list[tuple[bytes, str, str]] = [
     (b"\x7fELF", "elf", "ELF executable/object"),
@@ -28,9 +45,15 @@ SIGNATURES: list[tuple[bytes, str, str]] = [
     (b"hsqs", "squashfs", "SquashFS filesystem (little-endian)"),
     (b"sqsh", "squashfs", "SquashFS filesystem (big-endian)"),
     (b"\x45\x3d\xcd\x28", "cramfs", "CramFS filesystem"),
+    (b"-rom1fs-", "romfs", "ROMFS filesystem"),
     (b"\x27\x05\x19\x56", "uimage", "U-Boot uImage header"),
+    (b"HDR0", "trx", "Broadcom TRX firmware header"),
+    (b"ANDROID!", "androidboot", "Android boot image"),
     (b"\xd0\x0d\xfe\xed", "dtb", "Flattened Device Tree (DTB) blob"),
     (b"UBI#", "ubi", "UBI image"),
+    (b"\x28\xb5\x2f\xfd", "zstd", "Zstandard-compressed data"),
+    (b"\x04\x22\x4d\x18", "lz4", "LZ4-frame-compressed data"),
+    (b"7z\xbc\xaf\x27\x1c", "7zip", "7-zip archive"),
     (b"\x85\x19", "jffs2", "JFFS2 node (little-endian)"),
     (b"\x19\x85", "jffs2", "JFFS2 node (big-endian)"),
     (b"070701", "cpio", "cpio archive (newc)"),
@@ -131,8 +154,12 @@ def _decompress(typ: str, blob: bytes) -> Optional[bytes]:
             return zlib.decompressobj(16 + zlib.MAX_WBITS).decompress(blob, _MAX_DECOMPRESS)
         if typ == "xz":
             return _bounded(lzma.LZMADecompressor(), blob)
+        if typ == "lzma":                               # raw .lzma (LZMA_ALONE), ubiquitous in OpenWRT
+            return _bounded(lzma.LZMADecompressor(format=lzma.FORMAT_ALONE), blob)
         if typ == "bzip2":
             return _bounded(bz2.BZ2Decompressor(), blob)
+        if typ == "zstd" and _zstd_decompress is not None:
+            return _zstd_decompress(blob, _MAX_DECOMPRESS)
     except Exception:
         _log.debug("_decompress: %s stream decompression failed", typ, exc_info=True)
         return None
@@ -162,7 +189,7 @@ def extract_components(data: bytes, *, max_components: int = 64) -> list[dict]:
             seen_ranges.append((o, o + sz))
             out.append({"offset": o, "kind": "elf", "filename": f"carved_0x{o:x}.elf",
                         "bytes": data[o:o + sz], "note": f"embedded ELF ({sz} bytes)"})
-        elif typ in ("gzip", "xz", "bzip2"):
+        elif typ in ("gzip", "xz", "bzip2", "zstd"):
             dec = _decompress(typ, data[o:])
             if dec and dec[:4] == b"\x7fELF":
                 esz = _elf_extent(dec, 0) or len(dec)
@@ -170,7 +197,47 @@ def extract_components(data: bytes, *, max_components: int = 64) -> list[dict]:
                             "filename": f"carved_0x{o:x}_{typ}.elf",
                             "bytes": dec[:esz],
                             "note": f"{typ}-compressed ELF ({esz} bytes decompressed)"})
+    # Raw LZMA (.lzma / LZMA_ALONE) has no reliable magic, so it is NOT a SIGNATURE (a bare 0x5d
+    # byte is far too common to report). Instead scan for its header shape and VALIDATE each
+    # candidate by trial-decompression -- an embedded LZMA-compressed ELF is kept, noise is not.
+    for o, dec in _scan_raw_lzma(data):
+        if len(out) >= max_components or _overlaps(o, 1):
+            continue
+        esz = _elf_extent(dec, 0) or len(dec)
+        out.append({"offset": o, "kind": "elf", "filename": f"carved_0x{o:x}_lzma.elf",
+                    "bytes": dec[:esz],
+                    "note": f"raw-LZMA-compressed ELF ({esz} bytes decompressed)"})
     return out
+
+
+# The .lzma (LZMA_ALONE) header: properties byte (0x5D is the lc3/lp0/pb2 default used by every
+# common packer), a 4-byte LE dictionary size that is a power of two, then an 8-byte LE uncompressed
+# size. 0x5D alone is a common data byte, so a candidate is only trusted once it actually
+# decompresses to an ELF -- validation, not a magic guess.
+_LZMA_DICT_SIZES = {1 << k for k in range(16, 28)}      # 64 KiB .. 128 MiB, the realistic range
+_LZMA_MAX_TRIALS = 256
+
+
+def _scan_raw_lzma(data: bytes):
+    """Yield (offset, decompressed_bytes) for every embedded raw-LZMA stream whose content is an
+    ELF. Bounded: at most _LZMA_MAX_TRIALS validations, each on a capped window."""
+    trials = 0
+    start = 0
+    while trials < _LZMA_MAX_TRIALS:
+        o = data.find(b"\x5d", start)
+        if o < 0 or o + 13 > len(data):
+            break
+        start = o + 1
+        dict_sz = int.from_bytes(data[o + 1:o + 5], "little")
+        if dict_sz not in _LZMA_DICT_SIZES:
+            continue
+        trials += 1
+        try:
+            dec = _bounded(lzma.LZMADecompressor(format=lzma.FORMAT_ALONE), data[o:])
+        except Exception:                               # noqa: BLE001
+            continue
+        if dec and dec[:4] == b"\x7fELF":
+            yield o, dec
 
 
 # ---------------------------------------------------------------- embedded filesystem unpack
