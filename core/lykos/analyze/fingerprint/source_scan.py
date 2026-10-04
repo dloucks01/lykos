@@ -30,6 +30,7 @@ TOOL_VERSION = "cve-source-1"
 
 _MAX_FILES = 4000
 _MAX_FILE = 4 << 20
+_MAX_EXTRACT = 2 << 30            # cap cumulative tar-extraction bytes (tar-bomb defense): 2 GiB
 
 # Vendored C/C++ library headers carry the library's own version in a distinctive #define. We
 # scan the CONTENT of header files (not filenames) for these macros, so a generic name like
@@ -146,8 +147,8 @@ def _parse_cargo_lock(text: str) -> list:
     return out
 
 
-_DEP_RE = re.compile(
-    r"<dependency>(.*?)</dependency>", re.DOTALL | re.IGNORECASE)
+_DEP_RE = re.compile(          # bound the lazy gap: an unterminated <dependency> is else quadratic
+    r"<dependency>(.{0,4000}?)</dependency>", re.DOTALL | re.IGNORECASE)
 _MVN_G = re.compile(r"<groupId>\s*([^<$][^<]*?)\s*</groupId>", re.IGNORECASE)
 _MVN_A = re.compile(r"<artifactId>\s*([^<$][^<]*?)\s*</artifactId>", re.IGNORECASE)
 _MVN_V = re.compile(r"<version>\s*([0-9][0-9A-Za-z.\-]*)\s*</version>", re.IGNORECASE)
@@ -241,7 +242,10 @@ def parse_source_tree(root: Path) -> list:
     manifests and vendored library headers. Deduped; a lockfile/header wins over a loose spec."""
     found: dict = {}        # (libkey, version) -> {library, name, version, evidence}
     seen_files = 0
-    for p in sorted(root.rglob("*")):
+    # Iterate LAZILY -- `sorted(root.rglob("*"))` would materialise and sort every path in an
+    # (untrusted, extracted) source tree before the _MAX_FILES guard could apply, an OOM on a tree
+    # with millions of entries. rglob yields one path at a time; we stop at the cap.
+    for p in root.rglob("*"):
         if seen_files >= _MAX_FILES:
             break
         if not p.is_file():
@@ -306,11 +310,19 @@ def source_cve_stage(ctx) -> dict:
     root = ctx.scratch() / "srccve"
     root.mkdir(parents=True, exist_ok=True)
     try:
+        extracted = extracted_bytes = 0
         with tarfile.open(fileobj=io.BytesIO(ctx.content.path(proj.sha256).read_bytes()),
                           mode="r:gz") as tf:
-            for m in tf.getmembers():
+            for m in tf:                                  # stream members; don't getmembers() upfront
+                # bound a tar bomb (member count + cumulative size); path traversal already rejected
+                if extracted >= _MAX_FILES or extracted_bytes >= _MAX_EXTRACT:
+                    break
                 if m.isfile() and not m.name.startswith("/") and ".." not in m.name:
+                    if m.size > _MAX_FILE:
+                        continue
                     tf.extract(m, root)
+                    extracted += 1
+                    extracted_bytes += m.size
     except Exception:
         ctx.emit("source_cve.done", payload={"applicable": False,
                  "note": "could not unpack the archived source tree"})

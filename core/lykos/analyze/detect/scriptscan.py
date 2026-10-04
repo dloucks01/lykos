@@ -16,6 +16,8 @@ import re
 # A physical line longer than this is treated as minified (a whole module collapsed onto one line):
 # line-scoped corroboration cannot hold on it, so it yields candidates only.
 _MINIFIED_LINE = 2000
+_MAX_SCAN = 4 << 20              # cap script bytes scanned (4 MiB) -- larger isn't a useful script
+_MAX_TAINT_VARS = 512           # cap distinct tainted-var alternatives folded into taint_rx
 
 # interpreted language -> the regex that matches an untrusted-input SOURCE token.
 _SOURCES = {
@@ -134,14 +136,23 @@ def language_for(filename: str, data: bytes) -> str | None:
 
 def _tainted_vars(text: str, lang: str) -> set:
     rx = _ASSIGN.get(lang)
-    return {m.group(1) for m in rx.finditer(text)} if rx else set()
+    if not rx:
+        return set()
+    out = set()
+    for m in rx.finditer(text):               # cap distinct tainted vars: taint_rx is an alternation
+        out.add(m.group(1))                    # of all of them, run per line -> bound its width
+        if len(out) >= _MAX_TAINT_VARS:
+            break
+    return out
 
 
 def scan(data: bytes, lang: str) -> list[dict]:
     """Findings for a script source. Each is {cwe, title, severity, state, line, snippet, evidence}.
     `state` is 'corroborated' when an untrusted source reaches the sink (directly or via a tainted
     variable), else 'candidate'."""
-    text = data.decode("utf-8", "replace")
+    # Cap the input a sink scan sees: a script is source text; anything past a few MiB is not a
+    # script we usefully analyse, and scanning it line-by-line with every sink regex is pure cost.
+    text = data[:_MAX_SCAN].decode("utf-8", "replace")
     sinks = _SINKS.get(lang)
     if not sinks:
         return []

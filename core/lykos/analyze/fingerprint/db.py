@@ -86,7 +86,9 @@ COMPONENTS = {
         ],
     },
     "expat": {
-        "patterns": [r"expat_(\d+\.\d+\.\d+)", r"libexpat.*?(\d+\.\d+\.\d+)"],
+        # Bound the gap after "libexpat": a lazy `.*?` over the 64 MiB untrusted-byte scan is
+        # quadratic (each of ~N/8 "libexpat" hits scans to EOF for a version) -> CVE-scan DoS.
+        "patterns": [r"expat_(\d+\.\d+\.\d+)", r"libexpat.{0,64}?(\d+\.\d+\.\d+)"],
         "cves": [
             {"id": "CVE-2022-25235", "cvss": 9.8, "severity": "critical", "cwe": "CWE-116",
              "ranges": [{"lt": "2.4.5"}],

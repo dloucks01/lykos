@@ -26,6 +26,7 @@ UNPACK_STAGE = "unpack"
 TOOL = "unpack"
 TOOL_VERSION = "unpack-1"
 _SCAN = 1 << 16                                  # bytes to scan at each end for the UPX marker
+_MAX_UNPACKED = 1 << 30                          # refuse an unpacked image larger than 1 GiB (bomb)
 
 
 def is_upx(data: bytes) -> bool:
@@ -74,6 +75,14 @@ def upx_unpack(data: bytes, *, timeout: int = 60) -> tuple[Optional[bytes], str]
         if proc.returncode != 0 or not dst.exists():
             err = (proc.stderr or proc.stdout or b"").decode("utf-8", "replace").strip()[:200]
             return None, f"upx -d failed: {err or 'unknown error'}"
+        # Decompression-bomb guard: refuse to read back an unpacked image beyond a sane ceiling
+        # (the result is stored and re-ingested, so an absurd expansion is a memory/disk DoS).
+        try:
+            outsz = dst.stat().st_size
+        except OSError:
+            return None, "upx -d produced no readable output"
+        if outsz > _MAX_UNPACKED:
+            return None, f"upx -d output too large ({outsz} bytes > {_MAX_UNPACKED} cap)"
         out = dst.read_bytes()
         if not out or out == data:
             return None, "upx -d produced no change"

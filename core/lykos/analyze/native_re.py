@@ -42,6 +42,10 @@ _log = logging.getLogger(__name__)
 # failure without losing the work already done. 0 = unlimited (the default); set LYKOS_MAX_FUNCS to
 # a positive number only to deliberately cap a run.
 _MAX_FUNCS = int(os.environ.get("LYKOS_MAX_FUNCS", "0") or "0")
+# Hard ceiling for the SLEIGH (rizin-blind) recovery path specifically: unlike the rizin pass, it
+# serialises every function's bytes to the worker, so a hostile symbol table declaring millions of
+# functions would OOM. Independent of _MAX_FUNCS (which defaults to unlimited).
+_SLEIGH_RECOVER_MAX = 100000
 # The per-function structural pass is chunked into batches of this many functions. Each batch is a
 # separate rizin invocation, so a batch that times out or errors costs only that batch -- the
 # functions from prior batches are already on disk and get built and persisted. Smaller batches =
@@ -737,8 +741,15 @@ def _recover_via_pcode(binary: Path, fn_by_addr: dict, lifter: "_Lifter", *,
     # padding is harmless, decoding into the next function is not.
     sorted_addrs = sorted(fn_by_addr)
     next_addr = {a: sorted_addrs[i + 1] for i, a in enumerate(sorted_addrs[:-1])}
+    # Bound the NUMBER of regions, not just each region's size: a hostile symbol table could declare
+    # millions of functions, and serialising that many 64 KiB hex blobs to the worker is an OOM/hang.
+    if len(sorted_addrs) > _SLEIGH_RECOVER_MAX:
+        _emit(ctx, msg=f"SLEIGH recovery: {len(sorted_addrs)} functions — capping to "
+                       f"{_SLEIGH_RECOVER_MAX}")
+        sorted_addrs = sorted_addrs[:_SLEIGH_RECOVER_MAX]
     regions = []
-    for faddr, meta in fn_by_addr.items():
+    for faddr in sorted_addrs:
+        meta = fn_by_addr[faddr]
         off = _va_to_off(data, faddr)
         if off is None:
             continue
@@ -750,7 +761,8 @@ def _recover_via_pcode(binary: Path, fn_by_addr: dict, lifter: "_Lifter", *,
     _emit(ctx, msg=f"SLEIGH recovery: disassembling {len(regions)} functions (rizin-blind arch)")
     recovered = lifter.disasm_regions(regions, ctx=ctx, timeout=timeout)
     functions = []
-    for faddr, meta in fn_by_addr.items():
+    for faddr in sorted_addrs:                           # capped set only (don't materialise millions)
+        meta = fn_by_addr[faddr]
         insns = recovered.get(hex(faddr)) or []
         instructions, calls = [], []
         for ins in insns:

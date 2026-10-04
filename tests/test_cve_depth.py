@@ -76,6 +76,18 @@ def test_new_banners_detect_component_and_version():
     assert got.get("bzip2") == "1.0.8"
 
 
+def test_libexpat_banner_is_not_quadratic_on_hostile_bytes():
+    """The libexpat banner pattern must not catastrophically backtrack: a blob dense in 'libexpat'
+    with NO version digits used to make the lazy `.*?` scan to EOF from each hit (O(N^2)). The
+    bounded gap keeps it near-linear -- this must finish well under a second."""
+    import time
+    blob = b"libexpat" * 200000                     # ~1.6 MB, many anchors, zero version strings
+    t0 = time.monotonic()
+    detected, _ = scan.scan_and_match(blob)
+    assert time.monotonic() - t0 < 2.0              # would be many seconds with the unbounded .*?
+    assert not any(d["library"] == "expat" for d in detected)   # no false version match either
+
+
 def test_bzip2_banner_needs_the_date_anchor():
     # a plain "1.2.3" with no ", DD-Mon-YYYY" tail must NOT be read as bzip2 (that anchor is the
     # whole point of the low-FP pattern)

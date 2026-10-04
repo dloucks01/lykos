@@ -73,6 +73,18 @@ def test_taint_var_is_whole_token_not_substring():
     assert ("CWE-89", "candidate") in got and ("CWE-89", "corroborated") not in got
 
 
+def test_scan_caps_input_size():
+    """scan() bounds the bytes it reads (a script past a few MiB is not usefully analysed). A sink
+    placed AFTER the cap must not be reported, proving the tail isn't scanned."""
+    head = b"x = 1\n" * 100
+    pad = b"# filler\n" * (1 << 20)                  # ~9 MiB, well past the 4 MiB cap
+    tail = b"os.system(sys.argv[1])\n"               # a CWE-78 sink beyond the cap
+    findings = S.scan(head + pad + tail, "python")
+    assert not any(f["cwe"] == "CWE-78" for f in findings)   # the post-cap sink is never seen
+    # and a sink BEFORE the cap is still found
+    assert any(f["cwe"] == "CWE-78" for f in S.scan(tail + pad, "python"))
+
+
 def test_language_detection_by_extension_and_shebang():
     assert S.language_for("x.php", b"<?php") == "php"
     assert S.language_for("x.py", b"print(1)") == "python"
