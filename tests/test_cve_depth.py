@@ -3,8 +3,65 @@ more source-manifest ecosystems (Maven/Composer/RubyGems/Pub), and two more form
 weaponization triggers (libtiff/libwebp). The banner regexes and manifest parsers are detection
 logic (no hand-entered CVE version ranges — those come from the OSV feed); the triggers are
 input generators the cve_poc stage records only on a real fault."""
+import glob
+import shutil
+import subprocess
+
+import pytest
 from lykos.analyze.fingerprint import scan, source_scan
 from lykos.analyze.poc import cve_triggers as T
+
+_GCC = shutil.which("gcc") or shutil.which("cc")
+_LIBWEBP = next(iter(glob.glob("/usr/lib/*/libwebp.so.7") + glob.glob("/usr/lib/libwebp.so.7")), None)
+
+
+# A realistic naive WebP consumer: it reads the image dimensions from the REAL libwebp, then renders
+# into a buffer sized for an assumed 1024x1024 maximum WITHOUT re-checking the declared dimensions --
+# the "no dimension cap" bug (CWE-787) the libwebp trigger targets. Linked by soname (no dev header).
+_WEBP_CONSUMER = r'''
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+extern int WebPGetInfo(const unsigned char*, unsigned long, int*, int*);
+#define CAP 1024
+int main(void){
+    static unsigned char in[1<<20];
+    size_t n = fread(in, 1, sizeof in, stdin);
+    int w=0, h=0;
+    if (!WebPGetInfo(in, (unsigned long)n, &w, &h)) return 0;
+    unsigned char *canvas = malloc((size_t)CAP*CAP*4);
+    if (!canvas) return 0;
+    memset(canvas, 0x41, (size_t)w*(size_t)h*4);   /* heap overflow when the declared image > CAP */
+    free(canvas);
+    return 0;
+}
+'''
+
+
+@pytest.mark.skipif(not (_GCC and _LIBWEBP), reason="needs gcc + libwebp.so.7 for the live demo")
+def test_webp_trigger_faults_a_real_libwebp_consumer(tmp_path):
+    """DEMONSTRATED EFFECT: the libwebp trigger, fed to a naive consumer that renders at the REAL
+    libwebp's reported dimensions, causes an actual AddressSanitizer memory error; a benign image
+    does not. Proves the trigger is a real weapon against real library code, not just well-formed
+    bytes. (The cve_poc stage records a fault only on exactly this kind of real crash.)"""
+    src = tmp_path / "c.c"; src.write_text(_WEBP_CONSUMER)
+    exe = tmp_path / "c"
+    build = subprocess.run([_GCC, "-fsanitize=address", "-g", "-O0", str(src), "-o", str(exe),
+                            "-l:libwebp.so.7"], capture_output=True)
+    if build.returncode:
+        pytest.skip("cannot build/link the libwebp consumer: " + build.stderr.decode()[:120])
+    trig = T._webp_oversized_dims().data
+    r = subprocess.run([str(exe)], input=trig, capture_output=True, timeout=30)
+    assert b"AddressSanitizer" in r.stderr and b"overflow" in r.stderr, \
+        "the trigger did not fault the real-libwebp consumer"
+    # negative control: a benign 8x8 lossless WebP must NOT fault
+    import struct
+    dims = (7 | (7 << 14)) & 0xFFFFFFFF
+    vp8l = b"\x2f" + struct.pack("<I", dims) + b"\x00" * 8
+    benign = b"RIFF" + struct.pack("<I", 4 + 8 + len(vp8l)) + b"WEBP" + b"VP8L" + \
+        struct.pack("<I", len(vp8l)) + vp8l
+    rc = subprocess.run([str(exe)], input=benign, capture_output=True, timeout=30)
+    assert b"AddressSanitizer" not in rc.stderr, "benign 8x8 WebP must not fault (negative control)"
 
 
 # ------------------------------------------------------------------- D1: binary banners
@@ -89,7 +146,15 @@ def test_tiff_trigger_is_valid_container_and_in_plan():
 
 
 def test_webp_trigger_is_valid_riff_and_in_plan():
+    import struct
     t = T._webp_oversized_dims()
     assert t.data[:4] == b"RIFF" and t.data[8:12] == b"WEBP" and b"VP8L" in t.data
+    # the VP8L dims must actually decode to the maxed 14-bit values (16384 x 16384) -- a real
+    # libwebp reads width-1/height-1 from here, and an earlier packing bug truncated the height.
+    vp8l = t.data[t.data.index(b"VP8L") + 8:]
+    assert vp8l[0] == 0x2F                                  # VP8L signature byte
+    dims = struct.unpack_from("<I", vp8l, 1)[0]
+    assert (dims & 0x3FFF) + 1 == 16384                     # width
+    assert ((dims >> 14) & 0x3FFF) + 1 == 16384             # height (the previously-truncated field)
     labels = [p.label for p in T.weaponization_plan([("CVE-y", "libwebp", "CWE-787")])]
     assert any("libwebp" in l for l in labels)

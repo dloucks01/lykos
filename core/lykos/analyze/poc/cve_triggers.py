@@ -123,10 +123,11 @@ def _webp_oversized_dims() -> Trigger:
     behind the libwebp VP8L heap overflow. A random blob fails the RIFF/VP8L validation; a valid
     header reaches the allocation. Recorded only on a real fault, so a bounded decoder is not
     flagged."""
-    # VP8L bitstream head (little-endian bits): signature 0x2f, then 14-bit width-1 and height-1.
-    w = h = 0x3FFF                                    # 16383 (= max 14-bit value, i.e. 16384 px)
-    bits = 0x2F | ((w) << 8) | ((h) << 22)            # sig(8) | width-1(14) | height-1(14)
-    vp8l = struct.pack("<I", bits & 0xFFFFFFFF) + b"\x00" * 8
+    # VP8L bitstream head: a 0x2f signature byte, then (LSB-first) width-1 (14 bits), height-1
+    # (14 bits), alpha (1), version (3) -- the 28 dim bits occupy the four bytes AFTER the signature.
+    w = h = 0x3FFF                                    # width-1 = height-1 = 16383  -> 16384 px each
+    dims = (w | (h << 14)) & 0xFFFFFFFF               # width-1 in bits 0..13, height-1 in bits 14..27
+    vp8l = b"\x2f" + struct.pack("<I", dims) + b"\x00" * 8
     chunk = b"VP8L" + struct.pack("<I", len(vp8l)) + vp8l
     riff = b"RIFF" + struct.pack("<I", 4 + len(chunk)) + b"WEBP" + chunk
     return Trigger(cve="class:CWE-787", data=riff, channel="file", cwe="CWE-787",
