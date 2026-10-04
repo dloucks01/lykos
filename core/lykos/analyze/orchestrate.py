@@ -36,6 +36,7 @@ _TARGET = {
     "embedded_audit": ("..analyze.fingerprint", "enqueue_embedded_audit"),
     "int_overflow_scan": ("..analyze.fingerprint", "enqueue_int_overflow_scan"),
     "net_fuzz": ("..analyze.fuzz", "enqueue_net_fuzz"),
+    "env_fuzz": ("..analyze.fuzz", "enqueue_env_fuzz"),
     "cve_corroborate": ("..analyze.fingerprint", "enqueue_cve_corroborate"),
     "cve_poc": ("..analyze.poc", "enqueue_cve_poc"),
     "coverage_fuzz": ("..analyze.fuzz", "enqueue_coverage_fuzz"),
@@ -69,7 +70,7 @@ _CASE = {
 # them dropped that input and every one failed with "requires params.input_sha".
 _NO_PARAMS = {"disassemble", "detect_cwe", "heap_trace", "oob_index", "chain_primitive",
               "synthesize_poc", "firmware_carve", "source_cve_scan", "embedded_audit",
-              "int_overflow_scan", "net_fuzz", "cve_corroborate", "cve_poc"}
+              "int_overflow_scan", "net_fuzz", "env_fuzz", "cve_corroborate", "cve_poc"}
 _CASE_NO_PARAMS = {"link_case", "ipc_model", "cross_taint"}
 
 _TERMINAL = {"done", "cancelled", "error"}
@@ -127,7 +128,8 @@ _PLAN_STAGES = [
     ("disassemble", "Disassemble"), ("detect_cwe", "Static detectors"),
     ("cve_scan", "Known-CVE scan"), ("source_cve_scan", "Dependency-CVE scan"),
     ("embedded_audit", "RTOS config audit"), ("int_overflow_scan", "Int-overflow allocs"),
-    ("net_fuzz", "Network fuzzing"), ("cve_poc", "CVE weaponization"),
+    ("net_fuzz", "Network fuzzing"), ("env_fuzz", "Env-var fuzzing"),
+    ("cve_poc", "CVE weaponization"),
     ("cve_corroborate", "CVE corroboration"), ("synthesize_injection", "Injection probes"),
     ("coverage_fuzz", "Coverage fuzzing"), ("directed_fuzz", "Directed fuzzing"),
     ("heap_check", "Heap checks"), ("heap_trace", "Heap primitives"),
@@ -494,6 +496,9 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict, stop: t
             # A socket server is reached by spawning it and sending over the network, not via
             # stdin/argv/file; the stage self-gates to targets that import bind/listen/recvfrom.
             _run_target_stage(store, t, "net_fuzz", status, stop)
+            # Env-var input: a program that reads getenv("NAME") is reached by SETTING that
+            # variable, not via stdin/argv/file; the stage self-gates to targets importing getenv.
+            _run_target_stage(store, t, "env_fuzz", status, stop)
             _run_target_stage(store, t, "heap_check", status, stop, dyn)
             # Custom-allocator heap-primitive discovery (double-free / UAF / overflow) for a target
             # with its OWN allocator, which the libc guard-page check cannot see.

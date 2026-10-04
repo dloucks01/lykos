@@ -460,3 +460,63 @@ def test_multipositional_converter_is_driven_to_a_crash(store, case, pool, gcc, 
     assert crashes, "converter not driven to a crash (stuck at the usage gate?)"
     argv = crashes[0].argv or []
     assert any("lykos.out" in str(a) for a in argv), f"output positional not supplied: {argv}"
+
+
+# A getenv-driven target: reads APP_CONFIG into a 64-byte buffer (strcpy overflow) and separately
+# reads a benign APP_MODE. The env channel must mine the env-var NAMES from the binary, set a
+# payload into them, crash the target, and ATTRIBUTE the crash to APP_CONFIG (not APP_MODE).
+_ENV_VULN = (
+    "#include <stdio.h>\n#include <string.h>\n#include <stdlib.h>\n"
+    "int main(void){ char buf[64];\n"
+    "  char*m=getenv(\"APP_MODE\"); if(m) printf(\"mode=%s\\n\",m);\n"
+    "  char*v=getenv(\"APP_CONFIG\"); if(v){ strcpy(buf,v); printf(\"cfg=%s\\n\",buf); }\n"
+    "  return 0; }\n")
+
+
+def test_env_var_channel_finds_and_attributes_crash(store, case, pool, gcc, tmp_path):
+    """The environment-variable input channel: a program whose bug is reached only by SETTING an env
+    var (not stdin/argv/file). The stage must detect the getenv import, mine the env NAMES from the
+    binary's strings, fuzz a value in, crash it, and record a DynResult(input_mode='env') attributed
+    to the vulnerable variable -- so the rest of the PoC ladder picks it up like any other crash."""
+    from lykos.analyze.disassemble import enqueue_disassemble
+    from lykos.analyze.fuzz.env_stage import enqueue_env_fuzz
+    from lykos.analyze.ingest import enqueue_triage
+    src = tmp_path / "envvuln.c"; src.write_text(_ENV_VULN)
+    exe = tmp_path / "envvuln"
+    if subprocess.run([gcc, "-O0", "-fno-stack-protector", "-no-pie", "-w", str(src),
+                       "-o", str(exe)], capture_output=True).returncode != 0:
+        pytest.skip("build failed")
+    target = ingest(store, case.id, exe, filename="envvuln")
+    q = JobQueue(store.conn)
+    for fn in (enqueue_triage, enqueue_disassemble):
+        fn(q, target, force=True); assert pool.wait_idle(300)
+    run = enqueue_env_fuzz(q, target, params={"max_execs": 400}, force=True)
+    assert pool.wait_idle(300) and q.runs.get(run.id).status == "done"
+    crashes = [d for d in DynResultDAO(store.conn).list_by_target(target.id)
+               if d.crashed and d.input_mode == "env"]
+    assert crashes, "env-var channel did not record a crash via the environment"
+    argv0 = " ".join(str(a) for a in (crashes[0].argv or []))
+    assert "APP_CONFIG=" in argv0, f"crash not attributed to the vulnerable env var: {argv0}"
+    assert "APP_MODE=" not in argv0, f"benign env var misattributed as the cause: {argv0}"
+
+
+def test_env_channel_self_gates_on_no_getenv(store, case, pool, gcc, tmp_path):
+    """A target that reads no environment variable must leave the env channel inapplicable -- no
+    getenv import means nothing to fuzz, and the stage records no env crash (negative control)."""
+    from lykos.analyze.disassemble import enqueue_disassemble
+    from lykos.analyze.fuzz.env_stage import enqueue_env_fuzz
+    from lykos.analyze.ingest import enqueue_triage
+    src = tmp_path / "noenv.c"; src.write_text(_OK)
+    exe = tmp_path / "noenv"
+    if subprocess.run([gcc, "-O0", "-w", str(src), "-o", str(exe)],
+                      capture_output=True).returncode != 0:
+        pytest.skip("build failed")
+    target = ingest(store, case.id, exe, filename="noenv")
+    q = JobQueue(store.conn)
+    for fn in (enqueue_triage, enqueue_disassemble):
+        fn(q, target, force=True); assert pool.wait_idle(300)
+    run = enqueue_env_fuzz(q, target, params={"max_execs": 100}, force=True)
+    assert pool.wait_idle(300) and q.runs.get(run.id).status == "done"
+    env_crashes = [d for d in DynResultDAO(store.conn).list_by_target(target.id)
+                   if d.crashed and d.input_mode == "env"]
+    assert not env_crashes, "env channel fired on a target that reads no environment variable"
