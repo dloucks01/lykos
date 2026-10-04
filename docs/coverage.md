@@ -124,9 +124,14 @@ static libc pulls in regardless of `-march`). PowerPC64 points the saved Link Re
 GPRs (r14..r31) that the vulnerable frame's own save/restore exposes -- the controlling buffer
 offsets for the LR and each GPR are found by one tagged detonation; the gadget's `mr r12,rC` doubles
 as the ELFv2 global-entry TOC setup, so system's prologue resolves. Gadgets are decoded straight
-from the bytes (the host objdump cannot disassemble any of these ISAs), each chain is confirmed by
-reaching `system` with the first argument = &"/bin/sh" over the qemu gdbstub plus a negative control,
-and all are driven push-button by the `auto` strategy. The remaining ROP/heap/format strategies
+from the bytes (the host objdump cannot disassemble any of these ISAs). Each chain is first confirmed
+by reaching `system` with the first argument = &"/bin/sh" over the qemu gdbstub plus a negative
+control, then **raised to a demonstrated effect**: the same payload is detonated live and the shell
+`system("/bin/sh")` spawns (qemu-user relays the guest execve to the host) is driven with a
+forgery-proof marker -- the finding is recorded as demonstrated RCE only when a real shell EVALUATES
+the challenge (solved form present, raw echo absent), else it keeps the register-state proof as the
+floor (a control-flow-confirmed L3). All four (AArch64/ARM/RISC-V 64/PowerPC64) spawn a real shell
+here. All are driven push-button by the `auto` strategy. The remaining ROP/heap/format strategies
 (ret2csu, SROP, dlresolve, mprotect shellcode, heap/FSOP, the PIE info-leak) are still x86-64 machine
 code and stay native-only; MIPS/PPC-BE ret2libc is designed but unverified here (qemu present, no
 cross-compiler to build a fixture).

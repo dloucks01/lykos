@@ -136,5 +136,12 @@ def _run_cross_e2e(store, tmp_path, gcc, arch_name, exploit_name, opt="-O1", ext
     l3 = [pc for pc in PocDAO(store.conn).list_by_target(t.id) if pc.level == "L3" and pc.verified]
     assert l3, f"no confirmed L3 {arch_name} ret2libc"
     # the confirmed L3 must be THIS arch's ret2libc (not some other L3), identified by its dedup key
-    assert FindingDAO(store.conn).id_for_dedup(t.id, f"exploit:{exploit_name}:{t.id}"), \
-        f"no {exploit_name} finding filed"
+    fdao = FindingDAO(store.conn)
+    fid = fdao.id_for_dedup(t.id, f"exploit:{exploit_name}:{t.id}")
+    assert fid, f"no {exploit_name} finding filed"
+    # DEMONSTRATED EFFECT: the chain must spawn a real shell that evaluates a forgery-proof marker
+    # under qemu-user, not merely reach system with the arg register set. The driver raises the
+    # finding to RCE/demonstrated only when a live shell actually ran.
+    f = fdao.get(fid)
+    assert "Remote code execution (demonstrated)" in f.title, \
+        f"{arch_name} ret2libc did not demonstrate a spawned-shell effect: {f.title!r}"
