@@ -393,6 +393,40 @@ def _detect_jvm(ctx, target) -> dict:
     return {}
 
 
+def _detect_dotnet(ctx, target) -> dict:
+    """Detection for a .NET assembly, which (like a jar) has no machine code for the P-Code
+    channels. The metadata heaps answer the same string-based questions directly: the #US heap is
+    every string literal in the code and #Strings is every type/method name -- fed to the same
+    substrate-independent string detectors (hardcoded credentials, weak crypto) that a .rodata scan
+    feeds for an ELF. The taint/bounds/int-overflow channels need decompiled functions and so do
+    not run; these are capability findings."""
+    from .. import dotnet as dotnetmod
+    from .. import invocation as invmod
+    data = ctx.content.path(target.sha256).read_bytes()
+    info = dotnetmod.parse(data)
+    rows = (invmod.string_rows(info.user_strings, where="#US")
+            + invmod.string_rows(info.names, where="#Strings"))
+    dctx = DetectContext(target_id=target.id, case_id=target.case_id, call_edges=[],
+                         strings=rows, functions=[], mitigations={}, frames={})
+    cands = []
+    for det in DETECTORS:
+        if getattr(det, "jvm_safe", False):             # the substrate-independent string detectors
+            cands += det(dctx)
+    fdao = FindingDAO(ctx.conn)
+    for c in cands:
+        fdao.upsert(target.id, target.case_id, c)
+    ctx.emit("detect.done", payload={
+        "findings": len(cands), "substrate": "dotnet-metadata",
+        "types": info.type_count, "methods": info.method_count,
+        "note": (".NET target: findings come from the metadata heaps (#US string literals + "
+                 "#Strings type/method names), which name every literal and symbol in the clear. "
+                 "There is no machine code, so the taint, bounds and integer-overflow channels do "
+                 "not run -- these are capability findings and rank below anything execution "
+                 "demonstrates.")})
+    ctx.progress(pct=100, msg=f"{len(cands)} findings from {info.type_count} types")
+    return {}
+
+
 def _detect_script(ctx, target, lang, data) -> dict:
     """Pattern-based vulnerability detection for an interpreted-script source (scriptscan). A
     dangerous sink is a candidate; it is corroborated when an untrusted input source reaches it."""
@@ -479,6 +513,10 @@ def detect_stage(ctx) -> dict:
 
     if (target.file_type or "").lower() in ("jar", "class"):
         return _detect_jvm(ctx, target)
+
+    # .NET assembly: no machine code either -- detect from the metadata heaps (names + literals).
+    if (target.file_type or "").lower() == "dotnet":
+        return _detect_dotnet(ctx, target)
 
     # CPython bytecode: no machine code and not source text -- detect from the harvested call surface.
     if (target.file_type or "").lower() == "pyc":

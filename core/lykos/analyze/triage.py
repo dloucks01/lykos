@@ -9,6 +9,7 @@ import math
 from pathlib import Path
 from typing import Any, Optional
 
+from . import dotnet as dotnetmod
 from . import elf as elfmod
 from . import filetype
 from . import jvm as jvmmod
@@ -23,8 +24,8 @@ TOOL_VERSION = "triage-4"          # bump to invalidate the cache when parsing c
 #   triage-4: static-pie linking classification (PT_DYNAMIC no longer implies dynamic)
 MITIGATION_ENUM = {"on", "off", "partial", "unknown"}
 _FILE_TYPES = {filetype.ELF, filetype.PE, filetype.MACHO, filetype.JAR,
-               filetype.CLASS, filetype.WASM, filetype.PYC, filetype.FIRMWARE,
-               filetype.RAW, filetype.OTHER}
+               filetype.CLASS, filetype.WASM, filetype.PYC, filetype.DOTNET,
+               filetype.FIRMWARE, filetype.RAW, filetype.OTHER}
 _PACK_ENTROPY = 7.2
 # Entropy is a whole-file scan in pure Python; on every ingest that is a DoS on a large upload.
 # A 2 MB prefix is representative for the packer heuristic and matches the ELF/PE section cap.
@@ -202,6 +203,35 @@ def build_triage(path: str | Path, hashes: dict[str, Any], filename: str) -> dic
         rec["detected"] = _describe(rec)
         rec["analyzable"] = True                       # ELF is the fully-supported format
         rec["advisory"] = None
+    elif rec["file_type"] == filetype.PE and dotnetmod.is_dotnet(data):
+        # A .NET assembly IS a PE, so magic detection called it `pe` -- but it is CIL bytecode, not
+        # native machine code. Disassembling CIL as x86 is pure garbage (the RISC-V-as-x86 trap), so
+        # route it to the managed path: inventory the metadata the format gives in the clear and
+        # stop the PoC ladder honestly at the managed boundary.
+        rec["file_type"] = filetype.DOTNET
+        info = dotnetmod.parse(data)
+        parse_errors.extend(info.errors)
+        rec.update({
+            "arch": "cil", "bits": info.bits or 32, "endianness": "little", "linking": "dynamic",
+            "stripped": False, "entry_point": None,
+            "imports": {"libraries": [], "functions_count": info.method_count,
+                        "symbols": info.names[:512]},
+            "exports_count": info.type_count,
+            "exports": {"count": info.type_count, "symbols": info.names[:512]},
+            "toolchain_hint": (f".NET CLR {info.clr_version}" if info.clr_version else ".NET"),
+            "format_details": dotnetmod.to_format_details(info),
+        })
+        rec["detected"] = _describe_dotnet(info)
+        rec["analyzable"] = True
+        # Say exactly where the ladder stops, like the JVM path: the CLR checks every array access
+        # and owns every pointer, so there is no native instruction pointer to take.
+        rec["advisory"] = (
+            ".NET assembly analysed: the metadata gives every type and method NAME (#Strings) and "
+            "every string literal (#US) in the clear -- more than a stripped native PE -- so the "
+            "string-based detectors, invocation discovery and the fuzzing dictionary all work. "
+            "Execution is under the CLR, where a defect surfaces as a managed exception, not a "
+            "signal. Not available: native disassembly (the body is CIL, not x86) and the L2/L3 "
+            "exploit ladder -- the managed runtime owns every pointer, so there is no IP to hijack.")
     elif rec["file_type"] == filetype.PE:
         info = pemod.parse(data)
         parse_errors.extend(info.errors)
@@ -404,6 +434,19 @@ def _describe_jvm(info, ftype) -> str:
         parts.append(f"{len(info.classes)} class" + ("es" if len(info.classes) != 1 else ""))
     if info.signed:
         parts.append("signed")
+    return ", ".join(parts)
+
+
+def _describe_dotnet(info) -> str:
+    parts = [".NET assembly"]
+    if info.clr_version:
+        parts.append(f"CLR {info.clr_version}")
+    if info.type_count:
+        parts.append(f"{info.type_count} type" + ("s" if info.type_count != 1 else ""))
+    if info.method_count:
+        parts.append(f"{info.method_count} method" + ("s" if info.method_count != 1 else ""))
+    if info.runtime_flags & 0x1:
+        parts.append("IL-only")
     return ", ".join(parts)
 
 

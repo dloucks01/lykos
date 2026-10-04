@@ -90,13 +90,15 @@ def disassemble_stage(ctx) -> dict:
     # target is statically linked". The constant pool is read by `detect_cwe` instead, which
     # needs no decompiler at all.
     ftype = (target.file_type or "").lower()
-    if ftype in ("jar", "class"):
-        note = ("a Java target has no machine code to decompile -- its classes, strings and "
-                "every method it calls are already in the constant pool, which `detect_cwe` "
-                "reads directly. Run detect_cwe instead; disassembly is not a step here.")
+    if ftype in ("jar", "class", "dotnet"):
+        managed = "a .NET" if ftype == "dotnet" else "a Java"
+        store = "metadata (#Strings / #US heaps)" if ftype == "dotnet" else "constant pool"
+        note = (f"{managed} target has no machine code to decompile -- its types, strings and "
+                f"every method it names are already in the {store}, which `detect_cwe` "
+                f"reads directly. Run detect_cwe instead; disassembly is not a step here.")
         ctx.emit("re.done", payload={"supported": False, "substrate": ftype, "functions": 0,
                                      "call_edges": 0, "strings": 0, "note": note})
-        ctx.progress(pct=100, msg="no machine code to decompile (Java target)")
+        ctx.progress(pct=100, msg=f"no machine code to decompile ({'.NET' if ftype == 'dotnet' else 'Java'} target)")
         return {}
 
     backend = _select_backend()
