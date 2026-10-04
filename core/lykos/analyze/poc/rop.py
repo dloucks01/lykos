@@ -323,7 +323,7 @@ def _libc_symbol_values(data: bytes) -> set:
     """Every DEFINED function/object symbol VALUE (unrelocated vaddr) in .dynsym -- the anchors a
     leaked libc pointer's page offset can be matched against, to recover the libc base."""
     secs = _sections(data)
-    ds, st = secs.get(".dynsym"), secs.get(".dynstr")
+    ds = secs.get(".dynsym")
     if not ds:
         return set()
     is64, endc = _elf_class_endian(data)
