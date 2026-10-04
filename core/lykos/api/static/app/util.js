@@ -303,3 +303,37 @@ export function progressText(type, p) {
   }
   return "";
 }
+
+// --- Case Overview visualization helpers (pure; so the viz interactivity is unit-testable) ---
+
+// Filter findings by a clicked overview segment. `viz` is null (no filter), {severity} or {cwe}.
+// Returns the findings a clicked severity arc / CWE bar should narrow the list to.
+export function filterByViz(findings, viz) {
+  if (!viz) return findings;
+  if (viz.severity) return findings.filter((f) => (f.severity || "").toLowerCase() === viz.severity);
+  if (viz.cwe) return findings.filter((f) => f.cwe === viz.cwe);
+  return findings;
+}
+
+// The weaponization ladder level reached (0..3) from a target's PoCs: L1 crash / L2 primitive /
+// L3 exploit; 0 when only static findings exist. A verified PoC counts; its level is "L1".."L3".
+export function maxPocLevel(pocs) {
+  let lv = 0;
+  for (const p of pocs || []) {
+    if (!p || p.verified === false) continue;
+    const m = /^L([0-3])$/.exec(p.level || "");
+    if (m) lv = Math.max(lv, Number(m[1]));
+  }
+  return lv;
+}
+
+// Count findings into an ordered [{key,count}] histogram by a field (severity/cwe/detector),
+// most-frequent first (ties keep input order). Used for the overview bars/donut.
+export function histogram(findings, field) {
+  const m = new Map();
+  for (const f of findings || []) {
+    const k = f[field] || "unknown";
+    m.set(k, (m.get(k) || 0) + 1);
+  }
+  return [...m.entries()].map(([key, count]) => ({ key, count })).sort((a, b) => b.count - a.count);
+}

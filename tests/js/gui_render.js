@@ -231,6 +231,34 @@ function renderInfo(vnode) {
   ck("CallGraphMini renders nothing for a leaf with no edges",
     renderInfo(h(C.CallGraphMini, { fn: { name: "leaf", callers: [], callees: [] } })).threw.length === 0);
 
+  // ---- CaseOverview: the interactive analytics dashboard (severity donut, CWE bars, ladder) ----
+  const ovFindings = [
+    { id: "a", cwe: "CWE-121", severity: "critical", state: "poc-backed", detector: "build_exploit" },
+    { id: "b", cwe: "CWE-787", severity: "high", state: "corroborated", detector: "cve_fingerprint" },
+    { id: "c", cwe: "CWE-787", severity: "high", state: "corroborated", detector: "cve_fingerprint" },
+    { id: "d", cwe: "CWE-78", severity: "medium", state: "candidate", detector: "scriptscan" },
+  ];
+  const ovPocs = [{ level: "L1", verified: true }, { level: "L3", verified: true }];
+  let clicked = null;
+  info = renderInfo(h(C.CaseOverview, {
+    findings: ovFindings, pocs: ovPocs, filter: null, onFilter: (s) => { clicked = s; },
+  }));
+  ck("CaseOverview renders without throwing", info.threw.length === 0);
+  ck("CaseOverview draws an SVG severity donut", info.tags.includes("svg") && info.tags.includes("path"));
+  ck("CaseOverview shows the total finding count", /\b4\b/.test(info.all));
+  ck("CaseOverview lists the top CWEs", /CWE-787/.test(info.all) && /CWE-121/.test(info.all));
+  ck("CaseOverview draws the L0..L3 weaponization ladder reaching L3",
+    /Detected/.test(info.all) && /Exploit/.test(info.all)
+    // pocs reach L3, so all four rungs (L0..L3) are lit
+    && info.classes.filter((c) => /^ov-step reached/.test(c)).length === 4);
+  ck("CaseOverview shows the detector mix", /cve_fingerprint/.test(info.all) && /scriptscan/.test(info.all));
+  ck("CaseOverview is empty-safe with no findings",
+    renderInfo(h(C.CaseOverview, { findings: [], pocs: [] })).threw.length === 0);
+  // a filtered render exposes the clear affordance
+  ck("CaseOverview offers a clear-filter control when a filter is active",
+    /clear/i.test(renderInfo(h(C.CaseOverview,
+      { findings: ovFindings, pocs: ovPocs, filter: { severity: "critical" }, onFilter() {} })).all));
+
   console.log(pass ? "ALL PASS" : "FAILURES ABOVE");
   process.exit(pass ? 0 : 1);
 })().catch((e) => { console.log("FAIL  harness threw: " + (e && e.stack || e)); process.exit(1); });

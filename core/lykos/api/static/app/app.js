@@ -6,9 +6,9 @@ import { h, render } from "preact";
 import { useState, useEffect, useRef, useCallback } from "preact/hooks";
 import { api, waitForRun } from "./api.js";
 import { runAutopilotCase, newController, cancel as cancelAutopilot, coverageOf } from "./autopilot.js";
-import { rankFindings, pocsForFinding, fmtTime, progressText, stageLabel, dedupeFindings, buildRunLog, buildVerdicts } from "./util.js";
+import { rankFindings, pocsForFinding, fmtTime, progressText, stageLabel, dedupeFindings, buildRunLog, buildVerdicts, filterByViz } from "./util.js";
 import {
-  html, DropZone, TargetSummary, ProgressLog, ConsolePanel, FindingCard, EmptyResults, Spinner, UnavailablePanel, SystemMap, CoveragePanel, CodeView, PipelinePlan, EvidenceModal, FunctionsModal, VerdictStrip, VerdictCard, AnalysisDrawer, ShellVerdict, ExploitsPanel, DrawerFacts, TargetBar, FunctionsPanel, StringsPanel, DisasmPanel, DiffPanel, CrashesPanel, CallGraphCanvas,
+  html, DropZone, TargetSummary, ProgressLog, ConsolePanel, FindingCard, EmptyResults, Spinner, UnavailablePanel, SystemMap, CoveragePanel, CodeView, PipelinePlan, EvidenceModal, FunctionsModal, VerdictStrip, VerdictCard, AnalysisDrawer, ShellVerdict, ExploitsPanel, DrawerFacts, TargetBar, FunctionsPanel, StringsPanel, DisasmPanel, DiffPanel, CrashesPanel, CallGraphCanvas, CaseOverview,
 } from "./components.js";
 
 let _conSeq = 0;
@@ -91,6 +91,7 @@ function App() {
   const [showCandidates, setShowCandidates] = useState(false); // triage: reveal speculative candidates
   const [activeTid, setActiveTid] = useState(null);   // the target focused in the workbench shell
   const [tab, setTab] = useState("findings");         // active workbench tab
+  const [viz, setViz] = useState(null);               // Case Overview click-filter ({severity}/{cwe})
   const [funcsByT, setFuncsByT] = useState({});       // lazy per-target caches for the tab views
   const [cgByT, setCgByT] = useState({});             // call-graph edges per target
   const [fnView, setFnView] = useState("graph");      // Functions tab: graph or table
@@ -640,8 +641,11 @@ function App() {
   const activeTarget = targets.find((t) => t.id === activeTid) || targets[0] || null;
   const activeVerdict = activeTarget ? verdicts.find((v) => v.target.id === activeTarget.id) : null;
   const activeRanked = activeTarget ? ranked.filter((f) => f.target_id === activeTarget.id) : [];
-  const activeNotable = activeRanked.filter((f) => f.state !== "candidate");
-  const activeCandidates = activeRanked.filter((f) => f.state === "candidate");
+  // The findings LIST honours a Case Overview click-filter; the overview itself always sees the
+  // full set (so its donut/bars reflect the whole target, not the filtered subset).
+  const vizRanked = filterByViz(activeRanked, viz);
+  const activeNotable = vizRanked.filter((f) => f.state !== "candidate");
+  const activeCandidates = vizRanked.filter((f) => f.state === "candidate");
   const activePocs = activeTarget ? pocs.filter((p) => p.finding_id && activeRanked.some((f) => f.id === p.finding_id)) : [];
   // The finding behind the worst DEMONSTRATED effect (what the L3 rung narrates), preferring the
   // verdict's headline finding over merely the first poc-backed row.
@@ -753,7 +757,7 @@ function App() {
                   const v = verdicts.find((x) => x.target.id === t.id);
                   const on = activeTarget && t.id === activeTarget.id;
                   return html`<button class=${`rail-target${on ? " active" : ""}`} key=${t.id}
-                    onClick=${() => { setActiveTid(t.id); setTab("findings"); }}>
+                    onClick=${() => { setActiveTid(t.id); setTab("findings"); setViz(null); }}>
                     <span class=${`rail-dot ${dotClass(v)}`}></span>
                     <span class="rail-tname">${t.filename}</span>
                     <span class="rail-tlvl">${lvlTag(v)}</span>
@@ -818,6 +822,8 @@ function App() {
 
             ${tab === "findings" ? html`
               <div class="wb-panel">
+                ${activeRanked.length ? html`<${CaseOverview} findings=${activeRanked}
+                  pocs=${activePocs} filter=${viz} onFilter=${setViz} />` : null}
                 ${activeRanked.length ? html`
                   ${activeNotable.map(cardFor)}
                   ${activeCandidates.length ? html`

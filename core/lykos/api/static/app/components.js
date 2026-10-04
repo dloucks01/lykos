@@ -7,6 +7,7 @@ import { useState, useRef, useEffect } from "preact/hooks";
 import htm from "htm";
 import {
   STATE_LABEL, STATE_GLOSS, isDemonstrated, fmtBytes, shortHash, runTone, stageLabel,
+  SEV_ORDER, maxPocLevel, histogram,
 } from "./util.js";
 
 const html = htm.bind(h);
@@ -1310,4 +1311,83 @@ export function CallGraphCanvas({ functions, edges, onOpen, highlightAddr }) {
         </g>
       </svg>
     </div>`;
+}
+
+// Severity -> CSS color token (matches the --crit..--info / sev-* palette used across the UI).
+const SEVVAR = { critical: "crit", high: "high", medium: "med", low: "low", info: "info" };
+const _sameSeg = (a, b) => a && b && a.severity === b.severity && a.cwe === b.cwe;
+
+// Case Overview: at-a-glance INTERACTIVE analytics for the active target -- a severity donut, a
+// top-CWE bar chart, the L0->L3 weaponization ladder, and a detector mix. Pure inline SVG (the
+// project ships no chart lib), themed via the --crit..--info tokens. Clicking a severity arc or a
+// CWE bar calls onFilter to narrow the findings list (click again to clear); hovering shows a
+// native <title> tooltip. onFilter is optional, so this renders -- and tests -- with or without the
+// interactive wiring.
+export function CaseOverview({ findings, pocs, filter, onFilter }) {
+  const fs = findings || [];
+  if (!fs.length) return null;
+  const total = fs.length;
+  const sev = SEV_ORDER
+    .map((s) => ({ key: s, count: fs.filter((f) => (f.severity || "").toLowerCase() === s).length }))
+    .filter((d) => d.count);
+  const cwes = histogram(fs, "cwe").slice(0, 6);
+  const dets = histogram(fs, "detector");
+  const lvl = maxPocLevel(pocs);
+  const LADDER = ["Detected", "Crash", "Primitive", "Exploit"];       // L0 .. L3
+  const pick = (seg) => onFilter && onFilter(_sameSeg(filter, seg) ? null : seg);
+
+  // Donut: one stroked arc per severity, sized by share of findings.
+  const R = 46, C = 58, SW = 16;
+  let a0 = -Math.PI / 2;
+  const pt = (ang) => [C + R * Math.cos(ang), C + R * Math.sin(ang)];
+  const arcs = sev.map((d) => {
+    const a1 = a0 + (d.count / total) * 2 * Math.PI;
+    const large = a1 - a0 > Math.PI ? 1 : 0;
+    const [x0, y0] = pt(a0);
+    const [x1, y1] = pt(a1 - 1e-4);
+    const on = !!(filter && filter.severity === d.key);
+    const seg = { severity: d.key };
+    const path = `M ${x0.toFixed(2)} ${y0.toFixed(2)} A ${R} ${R} 0 ${large} 1 ${x1.toFixed(2)} ${y1.toFixed(2)}`;
+    a0 = a1;
+    return html`<path key=${d.key} d=${path} fill="none" stroke=${`var(--${SEVVAR[d.key]})`}
+      stroke-width=${on ? SW + 4 : SW} stroke-linecap="butt"
+      class=${`ov-arc${onFilter ? " clk" : ""}`} onClick=${() => pick(seg)}>
+      <title>${d.count} ${d.key}${onFilter ? " — click to filter the list" : ""}</title></path>`;
+  });
+
+  const barMax = Math.max(1, ...cwes.map((c) => c.count));
+  return html`<div class="ov" aria-label="case overview">
+    ${filter ? html`<button class="ov-clear btn small ghost" onClick=${() => onFilter && onFilter(null)}>
+      ✕ clear ${filter.severity || filter.cwe} filter</button>` : null}
+    <div class="ov-grid">
+      <div class="ov-card">
+        <div class="ov-h">Severity</div>
+        <svg viewBox="0 0 116 116" class="ov-donut" role="img" aria-label="severity distribution">
+          <circle cx=${C} cy=${C} r=${R} fill="none" stroke="var(--line)" stroke-width=${SW} opacity="0.25" />
+          ${arcs}
+          <text x=${C} y=${C - 2} text-anchor="middle" class="ov-donut-n">${total}</text>
+          <text x=${C} y=${C + 13} text-anchor="middle" class="ov-donut-l">finding${total === 1 ? "" : "s"}</text>
+        </svg>
+        <div class="ov-legend">${sev.map((d) => html`<span key=${d.key} class=${`ov-leg${filter && filter.severity === d.key ? " on" : ""}`}
+          onClick=${() => pick({ severity: d.key })}><i class=${`sev sev-${d.key}`}></i>${d.key} ${d.count}</span>`)}</div>
+      </div>
+      <div class="ov-card">
+        <div class="ov-h">Top CWEs</div>
+        <div class="ov-bars">${cwes.map((c) => html`<div key=${c.key}
+          class=${`ov-bar${onFilter ? " clk" : ""}${filter && filter.cwe === c.key ? " on" : ""}`}
+          onClick=${() => pick({ cwe: c.key })} title=${`${c.key}: ${c.count}${onFilter ? " — click to filter" : ""}`}>
+          <span class="ov-bar-k">${c.key}</span>
+          <span class="ov-bar-t"><span class="ov-bar-f" style=${`width:${Math.round((c.count / barMax) * 100)}%`}></span></span>
+          <span class="ov-bar-n">${c.count}</span></div>`)}</div>
+      </div>
+      <div class="ov-card">
+        <div class="ov-h">Weaponization</div>
+        <div class="ov-ladder">${LADDER.map((name, i) => html`<div key=${name}
+          class=${`ov-step${lvl >= i ? " reached" : ""}${lvl === i ? " top" : ""}`}
+          title=${`L${i} ${name}${lvl >= i ? " — reached" : ""}`}>
+          <span class="ov-step-n">L${i}</span><span class="ov-step-l">${name}</span></div>`)}</div>
+        <div class="ov-det">${dets.map((d) => html`<span key=${d.key} class="ov-chip" title=${`${d.count} finding(s) via ${d.key}`}>${d.key} ·${d.count}</span>`)}</div>
+      </div>
+    </div>
+  </div>`;
 }

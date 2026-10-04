@@ -310,6 +310,25 @@ const ck = (n, cond) => { pass = pass && !!cond; console.log(`${cond ? "PASS" : 
   ck("the case run ends with a single done event", cev.filter((e) => e.kind === "done").length === 1);
   ck("the case run reports an outcome", typeof cres.outcome === "string");
 
+  // ---------- util.js: Case Overview interactivity logic (pure; the click-filter the UI wires) ----------
+  const ov = [
+    { id: "a", cwe: "CWE-121", severity: "critical" },
+    { id: "b", cwe: "CWE-787", severity: "high" },
+    { id: "c", cwe: "CWE-787", severity: "high" },
+    { id: "d", cwe: "CWE-78", severity: "medium" },
+  ];
+  ck("filterByViz returns all when no filter", util.filterByViz(ov, null).length === 4);
+  ck("filterByViz narrows to a clicked severity",
+    util.filterByViz(ov, { severity: "high" }).map((f) => f.id).join("") === "bc");
+  ck("filterByViz narrows to a clicked CWE",
+    util.filterByViz(ov, { cwe: "CWE-121" }).map((f) => f.id).join("") === "a");
+  ck("histogram counts a field, most-frequent first",
+    JSON.stringify(util.histogram(ov, "cwe")) ===
+      JSON.stringify([{ key: "CWE-787", count: 2 }, { key: "CWE-121", count: 1 }, { key: "CWE-78", count: 1 }]));
+  ck("maxPocLevel takes the highest verified ladder rung",
+    util.maxPocLevel([{ level: "L1", verified: true }, { level: "L3", verified: true }, { level: "L2", verified: false }]) === 3);
+  ck("maxPocLevel is 0 with no verified PoC", util.maxPocLevel([{ level: "L3", verified: false }]) === 0 && util.maxPocLevel([]) === 0);
+
   console.log(pass ? "ALL PASS" : "FAILURES ABOVE");
   process.exit(pass ? 0 : 1);
 })().catch((e) => { console.log("FAIL  harness threw: " + (e && e.stack || e)); process.exit(1); });
