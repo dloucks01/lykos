@@ -196,3 +196,35 @@ def test_b64_magic_roundtrips_through_from_spec():
     assert d["ok"] and d["fields"][0]["match"] is True
     model = structure.from_spec(spec)
     assert model.serialize(model.parse(magic + b"payload")) == magic + b"payload"
+
+
+def test_load_external_seeds_from_files_and_dir(tmp_path):
+    """External seeding: real example input/config files reach the corpus via `seed_files` and
+    `seed_dir` (not only base64 inline). This is what lets a config/parameter-driven parser be
+    fuzzed from the files you already have -- jhead's EXIF OOB read was unreproduced until the
+    crashing sample could be seeded this way. base64 `seeds` still works; bad/oversized entries
+    are skipped, never fatal."""
+    import base64
+    from lykos.analyze.fuzz.stage import _load_external_seeds, _MAX_SEED_BYTES
+
+    f1 = tmp_path / "a.conf"; f1.write_bytes(b"key=value\n")
+    sd = tmp_path / "corpus"; sd.mkdir()
+    (sd / "s1.bin").write_bytes(b"\xff\xd8sample")
+    (sd / "s2.bin").write_bytes(b"other")
+    big = tmp_path / "big.bin"; big.write_bytes(b"A" * (_MAX_SEED_BYTES + 1))
+
+    out = _load_external_seeds({
+        "seeds": [base64.b64encode(b"inline").decode()],
+        "seed_files": [str(f1), str(tmp_path / "missing.bin"), str(big)],
+        "seed_dir": str(sd),
+    })
+    assert b"inline" in out                      # base64 inline still honoured
+    assert b"key=value\n" in out                 # explicit file loaded
+    assert b"\xff\xd8sample" in out and b"other" in out   # whole directory loaded
+    assert not any(len(s) > _MAX_SEED_BYTES for s in out)  # oversized skipped
+    assert all(isinstance(s, bytes) for s in out)          # missing path skipped, no crash
+
+
+def test_load_external_seeds_empty_is_empty():
+    from lykos.analyze.fuzz.stage import _load_external_seeds
+    assert _load_external_seeds({}) == []        # lets the caller fall back to _DEFAULT_SEEDS

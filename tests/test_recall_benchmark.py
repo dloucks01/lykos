@@ -99,3 +99,51 @@ def test_ncompress_cve_reaches_l2(tmp_path):
     assert rb._lvl(res["max_level"]) >= rb._lvl("L2"), f"only reached {res['max_level']}: {res}"
     assert {"CWE-121", "CWE-120"} & set(res["cwes"]), f"stack-overflow CWE not detected: {res['cwes']}"
     assert rb.score(res, spec)["verdict"] == "PASS"
+
+
+_JHEAD = rb.BIN / "jhead_x86-64"
+
+
+_JHEAD_SEED = rb.INPUTS / "jhead-crash.jpg"
+
+
+@pytest.mark.skipif(not (_JHEAD.exists() and _JHEAD_SEED.exists()),
+                    reason="vuln-targets corpus not built (examples/vuln-targets/fetch_build.sh)")
+def test_jhead_file_arg_seeding_reproduces_crash(tmp_path):
+    """jhead CWE-125 reads a file named on argv; the campaign must be seeded from the crashing
+    example via `seed_files` to reproduce it. Locks the file-argument seeding fix with a FAST chain
+    (triage -> fuzz(seed_files) -> build_poc; no disassembly): a verified L1 crash PoC. Regresses if
+    external file seeding breaks again."""
+    from lykos.analyze import register
+    from lykos.analyze.ingest import ingest, enqueue_triage
+    from lykos.analyze.fuzz.stage import enqueue_fuzz
+    from lykos.analyze.poc.stage import enqueue_build_poc
+    from lykos.casestore import CaseStore
+    from lykos.db.dao import DynResultDAO, PocDAO
+    from lykos.jobs import JobConfig, JobQueue, WorkerPool
+
+    register()
+    store = CaseStore.open(tmp_path / "store")
+    t = ingest(store, store.cases.create("jh").id, _JHEAD, filename="jhead_x86-64")
+    pool = WorkerPool(store.db_path, store.content, JobConfig(workers=4, poll_interval=0.02))
+    pool.start()
+    try:
+        q = JobQueue(store.conn)
+        enqueue_triage(q, store.targets.get(t.id), force=True)
+        assert pool.wait_idle(300)
+        enqueue_fuzz(q, store.targets.get(t.id),
+                     params={"timeout": 40, "input_mode": "file", "seed_files": [str(_JHEAD_SEED)]},
+                     force=True)
+        assert pool.wait_idle(300)
+        crashes = [r for r in DynResultDAO(store.conn).list_by_target(t.id)
+                   if r.crashed and r.input_sha]
+        assert crashes, "seed_files did not reproduce the jhead crash (file-arg seeding regressed)"
+        c0 = crashes[0]
+        enqueue_build_poc(q, store.targets.get(t.id),
+                          params={"input_sha": c0.input_sha, "input_mode": c0.input_mode or "file"},
+                          force=True)
+        assert pool.wait_idle(300)
+    finally:
+        pool.stop(grace=3.0)
+    l1 = [p for p in PocDAO(store.conn).list_by_target(t.id) if p.verified and p.level == "L1"]
+    assert l1, "no verified L1 PoC from the reproduced jhead crash"

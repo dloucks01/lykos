@@ -53,11 +53,10 @@ GROUND_TRUTH: dict[str, dict] = {
         "note": "CVE-2001-1413 argv strcpy; NUL in the slot caps it at L2 (IP control)"},
     "jhead_x86-64": {
         "cwe": {"CWE-125"}, "min_level": "L1", "mode": "file", "seed": "jhead-crash.jpg",
-        "negative": False, "known_gap": True,
-        "note": "CWE-125 OOB read in ProcessGpsInfo. KNOWN GAP: the seed SIGSEGVs under a direct "
-                "`jhead <file>` run, but the fuzz harness records 0 crashing execs -- jhead reads its "
-                "input from an argv FILENAME (not stdin), and file-argument delivery isn't reaching "
-                "the parser. Dynamic-recall gap in file-arg harnessing, tracked not hidden."},
+        "negative": False,
+        "note": "CWE-125 OOB read in ProcessGpsInfo. jhead reads a file named on argv, so it needs "
+                "the crashing example seeded via seed_files (fixed: external file/dir seeding). "
+                "Reproduces L1 both natively and cross-arch under qemu."},
     # --- x86-64 negatives: precision controls ---
     "gif2rgb_x86-64": {
         "cwe": set(), "min_level": None, "mode": "file", "negative": True,
@@ -68,8 +67,8 @@ GROUND_TRUTH: dict[str, dict] = {
         "note": "Info-ZIP 6.0 -- no crash reached; precision control"},
     # --- cross-arch positives: same bug, exercises the emulated dynamic path (crash under qemu) ---
     **{f"jhead_{a}": {"cwe": {"CWE-125"}, "min_level": "L1", "mode": "file",
-                      "seed": "jhead-crash.jpg", "negative": False, "cross": True, "known_gap": True,
-                      "note": f"CWE-125 OOB read, {a} under qemu-user (same file-arg harness gap as x86-64)"}
+                      "seed": "jhead-crash.jpg", "negative": False, "cross": True,
+                      "note": f"CWE-125 OOB read, {a} under qemu-user (seeded via seed_files)"}
        for a in ("aarch64", "arm", "ppc64le", "riscv64", "s390x", "ppc64", "ppc",
                  "mips" if False else "sparc64", "m68k", "loongarch64", "sh4")},
 }
@@ -109,7 +108,7 @@ def run_target(binpath: Path, spec: dict, fuzz_timeout: int, log=print) -> dict:
         seeds = [str(p) for p in sorted(VT.glob(spec["seed_glob"]))[:4]]
     fuzz_params = {"timeout": fuzz_timeout, "input_mode": mode}
     if seeds:
-        fuzz_params["seeds"] = seeds
+        fuzz_params["seed_files"] = seeds          # real example inputs (paths), not base64 bytes
 
     pool = WorkerPool(store.db_path, store.content, JobConfig(workers=4, poll_interval=0.02))
     pool.start()

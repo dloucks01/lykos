@@ -17,6 +17,7 @@ import os
 import random
 import re
 import time
+from pathlib import Path
 
 from ...db.dao import CallEdgeDAO, DynResultDAO, FindingDAO, FunctionDAO, StringDAO, TargetDAO
 from ...hashing import canonical_json
@@ -65,6 +66,42 @@ _DISTILL_CAP = 256
 # worth one clean execution up front; the cap stops a large accumulated corpus from spending a
 # whole starved budget on replay alone.
 _CALIBRATE_CAP = 64
+# Largest external seed file to load (configs, sample documents). Big enough for a real config or a
+# media sample, small enough that a stray huge file can't blow up the corpus.
+_MAX_SEED_BYTES = 1 << 20
+
+
+def _load_external_seeds(p) -> list[bytes]:
+    """Caller-supplied seed bytes: base64 inline (`seeds`), explicit files (`seed_files`), or every
+    file in a directory (`seed_dir`).
+
+    Pointing the campaign at REAL example inputs -- a config file, a sample document, a known-
+    crashing reproducer -- is how a structured-input parser gets fuzzed at all. A blind mutator
+    never invents a valid-enough structure (a parseable JPEG/EXIF, a `key=value` config) to reach a
+    bug behind the parser inside a short budget; `jhead`'s EXIF OOB read sat unreproduced for exactly
+    this reason. Before this, the only external-seed channel was base64 inline, so an application
+    that takes a config file or a sample input could not be seeded from the files you already have.
+    Bounded by count (`_MAX_CORPUS`) and per-seed size; an unreadable or oversized entry is skipped,
+    never fatal."""
+    out: list[bytes] = []
+    for b64 in p.get("seeds", []) or []:
+        try:
+            out.append(base64.b64decode(b64))
+        except Exception:                                # noqa: BLE001 -- a bad seed is not fatal
+            continue
+    paths: list[Path] = [Path(fp) for fp in (p.get("seed_files", []) or [])]
+    sd = p.get("seed_dir")
+    if sd and Path(sd).is_dir():
+        paths += sorted(q for q in Path(sd).iterdir() if q.is_file())
+    for q in paths:
+        if len(out) >= _MAX_CORPUS:
+            break
+        try:
+            if q.is_file() and 0 <= q.stat().st_size <= _MAX_SEED_BYTES:
+                out.append(q.read_bytes())
+        except OSError:                                  # unreadable path -> skip
+            continue
+    return out
 # Below this share of the binary, a call-graph closure is not telling us about dead code --
 # it is telling us the call graph could not be read (stripped, or indirect-heavy).
 _LIVE_FLOOR = 0.25
@@ -1133,7 +1170,10 @@ def fuzz_stage(ctx) -> dict:
     strings = _strings_for(ctx, target)
     blocks = _recovered_blocks(ctx, target)
     flags = mine_flags(ctx.content.path(target.sha256).read_bytes())
-    corpus = [base64.b64decode(x) for x in p.get("seeds", [])] or list(_DEFAULT_SEEDS)
+    corpus = _load_external_seeds(p) or list(_DEFAULT_SEEDS)
+    if p.get("seed_files") or p.get("seed_dir"):
+        ctx.emit("fuzz.seeds", payload={"loaded": len(corpus),
+                                        "from": [k for k in ("seed_files", "seed_dir") if p.get(k)]})
     dictionary = _mine_dictionary(strings)
     mutator, note = _structure_mutator(p, rng, dictionary), "found by fuzzing"
     fmt = p.get("format_name") or ("custom" if p.get("format") else None)
