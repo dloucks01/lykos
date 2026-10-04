@@ -447,6 +447,20 @@ def discover(strings, *, usage_hint: Optional[str] = None, help_text: Optional[s
                 f["default"] = shapes[i] if i < len(shapes) else shapes[0]
                 if "strings" not in sources:
                     sources.append("strings")
+    # getopt names flags the usage line / --help left out. We do NOT promote them into the main
+    # invocation (that is the "sixty invented flags" trap), but a value-taking one can be the
+    # OPTIONAL input slot a reader hides its input behind -- `tcpdump -r <pcap>` is in the optstring,
+    # not the terse usage. Add such flags as OPTIONAL, so only the input-slot fallback in
+    # propose_argv can pick one, and the caller VERIFIES the chosen invocation against the real
+    # target (so a wrong guess is empirically dropped).
+    if sources and sources[0] in ("usage", "help"):
+        have = {f["flag"] for f in flags}
+        for oflag, otakes in opt.items():
+            if otakes and oflag not in have:
+                k, d = _hint_for(oflag, None)
+                flags.append({"flag": oflag, "takes_value": True, "optional": True,
+                              "kind": k, "default": d, "placeholder": None, "name": None,
+                              "from_getopt": True})
     return {"flags": flags, "usage": usage, "sources": sources, "confidence": confidence}
 
 
@@ -486,17 +500,34 @@ def propose_argv(found: dict, *, input_kind: str = "config") -> list:
     # so a reader whose only input path is optional still gets fuzzed. Pick a READ flag, never an
     # output one (`-w`/`-o`/`--out`), or we would write to the fuzzed path instead of reading it.
     if not placed:
-        opt_in = next((f for f in (found.get("flags") or [])
-                       if f.get("takes_value") and f.get("optional")
-                       and f.get("kind") in input_kinds and _is_read_flag(f)), None)
-        if opt_in is not None:
-            argv += [opt_in["flag"], "@@"]
+        # A file-kind read flag is the clearest input slot; a bare getopt value-flag with no metavar
+        # (kind "value") is a candidate too, chosen by how read-like its name is -- `-r`/`-i`/`-in`
+        # before `-f`/`-file`. The caller verifies the result, so a wrong pick is dropped.
+        cands = [f for f in (found.get("flags") or [])
+                 if f.get("takes_value") and f.get("optional")
+                 and f.get("kind") in (input_kinds | {"value"}) and _is_read_flag(f)]
+        cands.sort(key=_read_rank)
+        if cands:
+            argv += [cands[0]["flag"], "@@"]
             placed = True
     return argv
 
 
 _READ_FLAG = re.compile(r"(?i)read|input|\bin\b|\bsrc\b|source|load|\bfile\b|\br\b|\bi\b|\bf\b")
 _WRITE_FLAG = re.compile(r"(?i)out|write|save|dest|\bdst\b|export|log|\bo\b|\bw\b")
+# Read-likeness ranking (lower = more clearly an input): an explicit "read"/"input" beats the
+# single letters r/i, which beat the generic "file"/f -- so `tcpdump -r` is chosen over `-f`.
+_READ_RANK = ("read", r"\binput\b", r"\bin\b", "src", "source", "load", r"\br\b", r"\bi\b",
+              "file", r"\bf\b")
+
+
+def _read_rank(f: dict) -> int:
+    hay = (f.get("flag", "").lstrip("-") + " " + (f.get("name") or "")
+           + " " + (f.get("placeholder") or "")).lower()
+    for i, pat in enumerate(_READ_RANK):
+        if re.search(pat, hay):
+            return i
+    return 99
 
 
 def _is_read_flag(f: dict) -> bool:

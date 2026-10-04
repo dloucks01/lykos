@@ -232,3 +232,18 @@ def test_write_only_optional_flag_is_not_fed_the_input():
     found = invocation.discover(["usage: prog [ -o outfile ] [ -v ]"])
     argv = invocation.propose_argv(found)
     assert "@@" not in argv                     # nothing safe to carry the input
+
+
+def test_getopt_only_input_flag_becomes_the_optional_input_slot():
+    """A reader (tcpdump) hides its input behind `-r`, which is in the getopt OPTSTRING but not the
+    terse usage line. The optstring flag is added as an optional candidate, and the input-slot
+    fallback puts @@ on it -- the READ flag `-r`, never a non-input optstring flag. Derived purely
+    from the binary (no man page); the fuzz stage then verifies the invocation against the target."""
+    # usage names only -v; the optstring adds -r (value) and -w (value, a WRITE flag)
+    found = invocation.discover(["vr:w:", "usage: prog [-v]"])
+    argv = invocation.propose_argv(found)
+    assert argv == ["-r", "@@"], argv              # -r chosen; -w (write) never fed the input
+    # a usage that already names the input flag is unchanged (no spurious optstring slot)
+    found2 = invocation.discover(["c:v", "usage: prog -c <config>"])
+    argv2 = invocation.propose_argv(found2)
+    assert argv2 == ["-c", "@@"], argv2
