@@ -1,12 +1,15 @@
 """Phase 3 — the `detect_cwe` stage: run detectors over IR/call-graph/strings -> findings."""
 from __future__ import annotations
 
+import logging
+
 from ...db.dao import CallEdgeDAO, FindingDAO, FunctionDAO, StringDAO, TargetDAO
 from ...jobs.registry import register_stage
 from . import bounds, scriptscan, taint
 from .catalog import entry_seed_params
 from .detectors import DETECTORS, DetectContext, correlate
 
+_log = logging.getLogger(__name__)
 DETECT_STAGE = "detect_cwe"
 # The detectors this stage owns -- the ones whose sites it recomputes and must replace (not
 # accumulate) on a re-run. Dynamic/crash channels (concolic, root_cause, fuzz...) are NOT here, so
@@ -417,6 +420,57 @@ def _detect_script(ctx, target, lang, data) -> dict:
     return {}
 
 
+# CPython bytecode (.pyc) dangerous-call surface, keyed by CWE. These are the co_names a vulnerable
+# .pyc calls; marshalled symbols can't prove the dataflow (that needs a decompile), so a hit is a
+# CANDIDATE -- surfaced, never corroborated. Names distinctive enough to keep false positives low.
+_PYC_SINKS = {
+    "CWE-78": ({"system", "popen", "execl", "execlp", "execv", "execvp", "execle", "execve",
+                "spawnl", "spawnv", "spawnlp", "spawnvp", "check_output", "check_call", "Popen"},
+               "OS command execution"),
+    "CWE-95": ({"eval", "exec", "compile", "__import__"}, "Code evaluation (eval/exec)"),
+    "CWE-502": ({"loads", "load"}, "Insecure deserialization"),   # gated on a risky module below
+}
+_PYC_SOURCES = {"input", "raw_input", "argv", "stdin", "environ", "getenv", "recv", "read"}
+_PYC_DESER_MODS = {"pickle", "cpickle", "marshal", "yaml", "dill", "shelve"}
+
+
+def _detect_pyc(ctx, target, data) -> dict:
+    """Find the dangerous call surface of a CPython .pyc from its harvested symbols (no unmarshal).
+    A hit is a CANDIDATE: the symbols show the program CALLS os.system/eval/pickle.loads etc., but
+    proving an untrusted value reaches it needs a decompile -- so this surfaces the risk without
+    claiming a proven dataflow (an untrusted-source symbol co-occurring raises the note, not state)."""
+    from .. import pyc as pycmod
+    info = pycmod.parse(data)
+    names = set(info.imported_symbols or [])
+    src_present = bool(names & _PYC_SOURCES)
+    fd = FindingDAO(ctx.conn)
+    n = 0
+    for cwe, (sinks, title) in _PYC_SINKS.items():
+        hit = sorted(names & sinks)
+        if not hit:
+            continue
+        if cwe == "CWE-502" and not (names & _PYC_DESER_MODS):
+            continue                                     # loads/load without pickle/marshal/yaml = json, safe
+        n += 1
+        reach = (" an untrusted-input symbol (%s) also appears" % ", ".join(sorted(names & _PYC_SOURCES))
+                 if src_present else " no untrusted-input symbol detected in the symbols")
+        fd.upsert(target.id, target.case_id, {
+            "cwe": cwe, "title": f"{title} in CPython bytecode (candidate)",
+            "severity": "medium", "detector": "pyc_scan", "state": "candidate",
+            "confidence": 0.5 if src_present else 0.35,
+            "dedup_key": f"{cwe}:pyc:{target.id}", "function_addr": None, "site_addr": None,
+            "site_detail": target.filename or "bytecode",
+            "evidence": [{"channel": "bytecode",
+                          "detail": f"CPython {info.python_version}: calls {', '.join(hit)} "
+                                    f"({title});{reach}. Co-occurrence in the marshalled symbols -- "
+                                    f"decompile (decompyle3/uncompyle6) to confirm the dataflow."}]})
+    ctx.emit("detect.done", payload={"findings": n, "substrate": "pyc",
+             "note": "CPython bytecode: dangerous-call-surface detection from harvested symbols "
+                     "(candidate-level; a decompile confirms reachability)"})
+    ctx.progress(pct=100, msg=f"{n} candidate finding(s) in CPython bytecode")
+    return {}
+
+
 def detect_stage(ctx) -> dict:
     target = TargetDAO(ctx.conn).get(ctx.target_id) if ctx.target_id else None
     if target is None:
@@ -425,6 +479,14 @@ def detect_stage(ctx) -> dict:
 
     if (target.file_type or "").lower() in ("jar", "class"):
         return _detect_jvm(ctx, target)
+
+    # CPython bytecode: no machine code and not source text -- detect from the harvested call surface.
+    if (target.file_type or "").lower() == "pyc":
+        try:
+            return _detect_pyc(ctx, target, ctx.content.path(target.sha256).read_bytes())
+        except Exception:
+            _log.debug("pyc detection failed", exc_info=True)
+            return {}
 
     # Interpreted-script SOURCE (PHP/Python/JS/Ruby): no machine code, so detection is pattern-based
     # over the text (the Go/Rust lang_sinks shape). Routed before the native path when the target is

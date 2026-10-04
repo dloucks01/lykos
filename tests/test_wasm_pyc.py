@@ -2,7 +2,6 @@
 that yields the imports/exports/strings the detectors consume, and the triage route that turns each
 from unrecognized into an analyzable, precisely-described target. Neither has native machine code, so
 both advisories say the exploit ladder does not apply."""
-import struct
 import subprocess
 import sys
 from pathlib import Path
@@ -101,3 +100,46 @@ def test_pyc_triage_route(tmp_path):
     assert rec["file_type"] == "pyc" and rec["analyzable"] is True
     assert rec["arch"] == "cpython-bytecode"
     assert "bytecode analysed" in (rec.get("advisory") or "")
+
+
+def test_pyc_detect_flags_dangerous_call_surface(store, tmp_path):
+    """detect_cwe must FEED OFF the .pyc parse: the harvested call surface (os.system, pickle.loads)
+    is flagged as pyc_scan candidates, and a benign .pyc yields none. This is the wiring that turns
+    the .pyc front-end from parse-only into a finding producer."""
+    import py_compile
+
+    from lykos.analyze import register
+    from lykos.analyze.ingest import enqueue_triage, ingest
+    from lykos.db.dao import FindingDAO
+    from lykos.jobs import JobConfig, JobQueue, WorkerPool
+    reg_dir = tmp_path
+    vuln_src = reg_dir / "vuln.py"
+    vuln_src.write_text("import os, pickle\nos.system(input())\npickle.loads(open('x','rb').read())\n")
+    safe_src = reg_dir / "safe.py"
+    safe_src.write_text("import json\nprint(json.loads('{}'))\n")
+    vuln_pyc, safe_pyc = reg_dir / "vuln.pyc", reg_dir / "safe.pyc"
+    py_compile.compile(str(vuln_src), cfile=str(vuln_pyc), doraise=True)
+    py_compile.compile(str(safe_src), cfile=str(safe_pyc), doraise=True)
+    register()
+    pool = WorkerPool(store.db_path, store.content, JobConfig(workers=2, poll_interval=0.02))
+    pool.start()
+    try:
+        case = store.cases.create("pycdetect")
+        tv = ingest(store, case.id, vuln_pyc, filename="vuln.pyc")
+        ts = ingest(store, case.id, safe_pyc, filename="safe.pyc")
+        q = JobQueue(store.conn)
+        for t in (tv, ts):
+            enqueue_triage(q, t, force=True)
+        assert pool.wait_idle(60)
+        for t in (tv, ts):
+            assert pool.wait_idle(5)
+            q.enqueue(case.id, "detect_cwe", target_id=t.id, force=True)
+        assert pool.wait_idle(60)
+    finally:
+        pool.stop(grace=3.0)
+    fd = FindingDAO(store.conn)
+    vuln_cwes = {f.cwe for f in fd.list_by_target(tv.id) if f.detector == "pyc_scan"}
+    assert {"CWE-78", "CWE-502"} <= vuln_cwes, f"pyc detector missed the sinks: {vuln_cwes}"
+    # json.loads is not pickle/marshal -> CWE-502 must NOT fire on the benign pyc
+    safe = [f for f in fd.list_by_target(ts.id) if f.detector == "pyc_scan"]
+    assert not safe, f"benign pyc (json.loads) wrongly flagged: {[f.cwe for f in safe]}"
