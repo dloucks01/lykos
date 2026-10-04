@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import importlib
 import logging
+import re
 import threading
 import time
 from typing import Optional
@@ -318,6 +319,52 @@ def _ranked_channels(store, target_id):
         return ["stdin", "arg", "file"]
 
 
+_CVE_ID_RE = re.compile(r"CVE-\d{4}-\d{4,}")
+
+
+def _cve_crash_origins(store, target_id) -> dict:
+    """input_sha -> CVE id for crashes the `cve_poc` stage reproduced (its DynResult note is
+    '<label> trigger', the label carrying the matched CVE). Lets the autopilot attribute a crash the
+    exploit ladder then weaponizes back to the known CVE it came from -- the CVE->exploit chain."""
+    out = {}
+    for d in DynResultDAO(store.conn).list_by_target(target_id):
+        if d.crashed and d.input_sha and (d.note or "").endswith("trigger"):
+            m = _CVE_ID_RE.search(d.note or "")
+            if m:
+                out.setdefault(d.input_sha, m.group(0))
+    return out
+
+
+def _max_verified_poc_level(store, target_id) -> int:
+    """Highest verified PoC level (L1->1, L2->2, L3->3) on the target, or 0 when none."""
+    lv = 0
+    for p in PocDAO(store.conn).list_by_target(target_id):
+        if p.verified and (p.level or "").startswith("L") and p.level[1:].isdigit():
+            lv = max(lv, int(p.level[1:]))
+    return lv
+
+
+def _record_cve_weaponized(store, target, cve: str, level: int) -> None:
+    """Record that a version-matched CVE was reproduced AND its crash escalated by the exploit ladder
+    to L{level} -- the explicit CVE->exploit link (otherwise the escalation reads as a generic
+    control-flow finding disconnected from the CVE)."""
+    note = (f"{cve} was version-matched on this target, its trigger reproduced a real fault, and the "
+            f"exploit ladder weaponized that crash to L{level} -- a demonstrated CVE-to-exploit "
+            f"chain (not just a version match).")
+    store.events.append("cve.weaponized", case_id=target.case_id,
+                        payload={"target_id": target.id, "cve": cve, "level": f"L{level}",
+                                 "note": note})
+    try:
+        FindingDAO(store.conn).upsert(target.id, target.case_id, {
+            "cwe": "CWE-1395", "title": f"{cve} weaponized to L{level} (CVE -> exploit chain)",
+            "severity": "critical" if level >= 3 else "high", "detector": "cve_chain",
+            "state": "poc-backed", "confidence": 0.95, "site_detail": cve,
+            "dedup_key": f"cve-chain:{cve}:{target.id}",
+            "evidence": [{"channel": "cve", "detail": note}]})
+    except Exception:
+        _log.debug("recording cve_chain finding failed", exc_info=True)
+
+
 def _distinct_crashes(store, target_id):
     seen, out = set(), []
     for d in DynResultDAO(store.conn).list_by_target(target_id):
@@ -495,19 +542,38 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict, stop: t
             if not crashes and not stop.is_set():
                 _run_target_stage(store, t, "synthesize_poc", status, stop)
                 crashes = _distinct_crashes(store, tid)
+            # CVE -> exploit chain: which of these crashes were REPRODUCED by a matched-CVE trigger,
+            # so if the ladder escalates one we can attribute the exploit back to the CVE. Accumulate
+            # the BEST level reached per CVE and record once at the end (so an L3 is not masked by an
+            # earlier L2 record that shares the finding's dedup key).
+            cve_origin = _cve_crash_origins(store, tid)
+            cve_best: dict = {}
+
+            def _note_escalation(cve, before):
+                after = _max_verified_poc_level(store, tid)
+                if cve and after > before and after >= 2:    # the ladder raised THIS CVE crash to L2/L3
+                    cve_best[cve] = max(cve_best.get(cve, 0), after)
             # Prove each distinct crash.
             for cr in crashes:
                 if stop.is_set():
                     break
                 p = {"input_sha": cr.input_sha}
+                cve = cve_origin.get(cr.input_sha)
+                lvl0 = _max_verified_poc_level(store, tid) if cve else 0
                 _run_target_stage(store, t, "root_cause", status, stop, p)
                 _run_target_stage(store, t, "build_poc", status, stop, p)
                 _run_target_stage(store, t, "poc_primitive", status, stop, p)
+                _note_escalation(cve, lvl0)              # these three ran on THIS CVE crash's input
             if crashes and not stop.is_set():
                 rep = {"input_sha": crashes[0].input_sha}
+                cve0 = cve_origin.get(crashes[0].input_sha)
+                lvlb = _max_verified_poc_level(store, tid) if cve0 else 0
                 _run_target_stage(store, t, "build_exploit", status, stop, rep)
+                _note_escalation(cve0, lvlb)             # build_exploit ran on this CVE crash's input
                 _run_target_stage(store, t, "behavior_trace", status, stop, rep)
                 _run_target_stage(store, t, "dynamic_taint", status, stop, rep)
+            for cve, lvl in cve_best.items():            # one CVE->exploit link per CVE, at its best
+                _record_cve_weaponized(store, t, cve, lvl)
             # Review each demonstrated finding: replay its input several times so a flaky crash is
             # flagged rather than trusted, and a reopened case carries the verdict. Verified-PoC
             # inputs come first (never dropped), then any distinct crash; capped so a target with
