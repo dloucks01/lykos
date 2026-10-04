@@ -379,6 +379,26 @@ def test_dispatch_covers_every_registered_stage():
         f"dispatch names no engine stage: {sorted(reachable - registered)}"
 
 
+def test_target_stage_enqueue_fns_accept_params():
+    """_create_run (and the autopilot's _run_target_stage) call every target-stage enqueue fn as
+    fn(q, target, params=...) except the three no-param stages. An enqueue fn missing the `params`
+    kwarg TypeErrors at dispatch -- a silently unrunnable stage (this bit the `unpack` stage)."""
+    import importlib
+    import inspect
+
+    from lykos.api.server import Handler
+    no_params = {"ingest_triage", "disassemble", "detect_cwe"}
+    broken = []
+    for stage, (mod, fn_name) in Handler._TARGET_STAGES.items():
+        if stage in no_params:
+            continue
+        module = importlib.import_module(mod, "lykos.api")   # same resolution as _enqueue_fn
+        sig = inspect.signature(getattr(module, fn_name))
+        if "params" not in sig.parameters:
+            broken.append(f"{stage} ({fn_name})")
+    assert not broken, f"target-stage enqueue fns missing a `params` kwarg: {broken}"
+
+
 def test_unknown_stage_is_rejected_at_the_edge(api):
     """The old final `else` enqueued ANY name, creating a run no worker could execute -- it
     sat queued forever instead of reporting the typo."""

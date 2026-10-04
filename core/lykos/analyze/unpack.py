@@ -159,5 +159,7 @@ def register() -> None:
                    tool=TOOL, tool_version=TOOL_VERSION, timeout=120)
 
 
-def enqueue_unpack(queue, target, *, force: bool = True):
+def enqueue_unpack(queue, target, *, params=None, force: bool = True):
+    # `params` is accepted for call-convention parity with every other target-stage enqueue fn (the
+    # API's _create_run and the autopilot's _run_target_stage both pass it); unpack takes none.
     return queue.enqueue(target.case_id, UNPACK_STAGE, target_id=target.id, force=force)
