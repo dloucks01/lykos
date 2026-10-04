@@ -166,9 +166,13 @@ def _decompress(typ: str, blob: bytes) -> Optional[bytes]:
     return None
 
 
-def extract_components(data: bytes, *, max_components: int = 64) -> list[dict]:
+def extract_components(data: bytes, *, max_components: int = 64, _depth: int = 0) -> list[dict]:
     """Embeddable components to register as sub-targets: embedded ELFs and ELF payloads of
-    gzip/xz/bzip2 streams. Each: {offset, kind, filename, bytes, note}."""
+    gzip/xz/bzip2/zstd/raw-LZMA streams. Each: {offset, kind, filename, bytes, note}.
+
+    Recursive (bounded to _MAX_CARVE_DEPTH): a compressed stream whose content is NOT a bare ELF
+    is itself re-scanned, so the common firmware shapes -- gzip of a padded ELF, xz/gzip of a
+    cpio/initramfs full of ELFs, or nested compression -- are reached, not dropped at the first layer."""
     hits = scan_signatures(data)
     out: list[dict] = []
     seen_ranges: list[tuple[int, int]] = []
@@ -191,12 +195,25 @@ def extract_components(data: bytes, *, max_components: int = 64) -> list[dict]:
                         "bytes": data[o:o + sz], "note": f"embedded ELF ({sz} bytes)"})
         elif typ in ("gzip", "xz", "bzip2", "zstd"):
             dec = _decompress(typ, data[o:])
-            if dec and dec[:4] == b"\x7fELF":
+            if not dec:
+                continue
+            if dec[:4] == b"\x7fELF":
                 esz = _elf_extent(dec, 0) or len(dec)
                 out.append({"offset": o, "kind": "elf",
                             "filename": f"carved_0x{o:x}_{typ}.elf",
                             "bytes": dec[:esz],
                             "note": f"{typ}-compressed ELF ({esz} bytes decompressed)"})
+            elif _depth < _MAX_CARVE_DEPTH:
+                # Not a bare ELF: the decompressed stream may be a padded ELF, a cpio/initramfs or
+                # tar of ELFs, or another compression layer. Re-scan it -- the embedded ELFs are not
+                # visible as contiguous magic in the ORIGINAL (compressed) image.
+                for sub in extract_components(dec, max_components=max_components - len(out),
+                                              _depth=_depth + 1):
+                    sub["note"] = f"{typ} stream @ 0x{o:x} -> " + sub["note"]
+                    sub["filename"] = f"carved_0x{o:x}_{typ}_" + sub["filename"]
+                    out.append(sub)
+                    if len(out) >= max_components:
+                        break
     # Raw LZMA (.lzma / LZMA_ALONE) has no reliable magic, so it is NOT a SIGNATURE (a bare 0x5d
     # byte is far too common to report). Instead scan for its header shape and VALIDATE each
     # candidate by trial-decompression -- an embedded LZMA-compressed ELF is kept, noise is not.
@@ -246,6 +263,7 @@ def _scan_raw_lzma(data: bytes):
 # contiguous ELF or gzip magic in the raw image and extract_components() finds nothing. Unpacking
 # the filesystem is the only way to reach them. We shell out to the standard extractor when it is
 # on PATH (unsquashfs / cpio): optional tools, degrading to [] when absent -- never a hard dep.
+_MAX_CARVE_DEPTH = 2           # how deep extract_components recurses into nested compression layers
 _MAX_FS_FILES = 1024
 _MAX_FS_FILE = 32 << 20        # skip any single extracted file larger than this
 _MAX_FS_TOTAL = 256 << 20      # stop walking once this many bytes have been read out

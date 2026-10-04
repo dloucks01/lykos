@@ -340,3 +340,33 @@ def test_a_bare_0x5d_byte_is_not_a_false_raw_lzma_hit():
     to an ELF, so noise full of 0x5d yields no components (low false positive by construction)."""
     blob = bytes([0x5d, 0, 0, 0, 0, 0, 0, 0] * 400)     # many 0x5d, none valid LZMA
     assert carve.extract_components(blob) == []
+
+
+# ---- recursive carving: ELFs hidden under a compression/container layer -------------------
+
+def test_a_gzip_of_a_PADDED_elf_is_carved_recursively():
+    """A gzip stream whose content is not a BARE ELF (padding before it, as in a real packed
+    image) was dropped by the single-layer carver; recursion re-scans the decompressed bytes."""
+    elf = _elf64(0x80)
+    blob = b"\x00" * 32 + gzip.compress(b"\x11" * 100 + elf + b"\x22" * 40)
+    notes = [c["note"] for c in carve.extract_components(blob)]
+    assert any("embedded ELF" in n for n in notes), notes
+
+
+def test_nested_compression_is_carved_to_the_elf():
+    """xz(gzip(ELF)) -- a nested layer, common when a kernel/initramfs is double-compressed."""
+    elf = _elf64(0x60)
+    blob = b"\x00" * 16 + lzma.compress(gzip.compress(elf), format=lzma.FORMAT_XZ)
+    notes = [c["note"] for c in carve.extract_components(blob)]
+    assert any("ELF" in n for n in notes), notes
+
+
+def test_recursion_is_depth_bounded():
+    """Deeply nested compression must terminate (no unbounded recursion); past the depth cap the
+    inner layers are simply not descended, never an error."""
+    elf = _elf64(0x40)
+    payload = gzip.compress(elf)
+    for _ in range(6):                                  # 6 layers, past _MAX_CARVE_DEPTH
+        payload = gzip.compress(payload)
+    # must return without error (possibly empty, since the ELF is deeper than the cap)
+    assert isinstance(carve.extract_components(payload), list)
