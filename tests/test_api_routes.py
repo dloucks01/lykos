@@ -313,5 +313,5 @@ def test_orchestrate_prove_stages_receive_params():
     assert orchestrate._NO_PARAMS == {"disassemble", "detect_cwe", "heap_trace", "oob_index",
                                       "chain_primitive", "synthesize_poc", "firmware_carve",
                                       "source_cve_scan", "embedded_audit",
-                                      "int_overflow_scan", "net_fuzz", "cve_corroborate",
-                                      "cve_poc"}
+                                      "int_overflow_scan", "uaf_scan", "net_fuzz", "env_fuzz",
+                                      "cve_corroborate", "cve_poc"}
