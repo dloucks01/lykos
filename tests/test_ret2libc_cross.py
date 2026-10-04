@@ -46,7 +46,7 @@ def test_find_riscv64_gadgets_decodes_compressed_and_base():
     finally:
         rop._loads = orig
     assert any(c["va"] == 0x10000 and c["src"] == 9 and c["br"] == 18 for c in g["callers"])
-    ld = next(l for l in g["loaders"] if 9 in l["regs"] and 18 in l["regs"])
+    ld = next(ll for ll in g["loaders"] if 9 in ll["regs"] and 18 in ll["regs"])
     assert ld["regs"][9] == 8 and ld["regs"][18] == 0 and ld["raoff"] == 24 and ld["spadj"] == 32
 
 

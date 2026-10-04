@@ -142,7 +142,7 @@ def test_tiff_trigger_is_valid_container_and_in_plan():
     t = T._tiff_oversized_dims()
     assert t.data[:2] in (b"II", b"MM") and t.channel == "file" and t.cwe == "CWE-190"
     labels = [p.label for p in T.weaponization_plan([("CVE-x", "libtiff", "CWE-190")])]
-    assert any("libtiff" in l for l in labels)
+    assert any("libtiff" in lbl for lbl in labels)
 
 
 def test_webp_trigger_is_valid_riff_and_in_plan():
@@ -157,4 +157,4 @@ def test_webp_trigger_is_valid_riff_and_in_plan():
     assert (dims & 0x3FFF) + 1 == 16384                     # width
     assert ((dims >> 14) & 0x3FFF) + 1 == 16384             # height (the previously-truncated field)
     labels = [p.label for p in T.weaponization_plan([("CVE-y", "libwebp", "CWE-787")])]
-    assert any("libwebp" in l for l in labels)
+    assert any("libwebp" in lbl for lbl in labels)
