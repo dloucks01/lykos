@@ -315,3 +315,114 @@ def test_parameter_driven_structured_crash_weaponizes_to_l2(store, case, pool, g
     enqueue_primitive(q, target, params=dict(p), force=True); assert pool.wait_idle(300)
     levels = {pc.level for pc in PocDAO(store.conn).list_by_target(target.id) if pc.verified}
     assert "L2" in levels, f"structured parameter-driven crash did not weaponize to L2: {levels}"
+
+
+# svc + a win() reachable only via the overflow return: the whole parameter-driven -> L3 path.
+_PARAM_SVC_WIN = _PARAM_SVC.replace(
+    "#include <ctype.h>", "#include <ctype.h>\n#include <stdlib.h>").replace(
+    "static void set_name",
+    'static void win(void){ system("/bin/sh"); }\nstatic void set_name')
+
+
+def test_parameter_driven_structured_crash_weaponizes_to_l3(store, case, pool, gcc, tmp_path):
+    """The full parameter-driven -> L3 path: a service gated behind `-t/-s/-c` (one a shaped id),
+    a config overflow (`name=<...>`), and a win(). Discovery synthesizes the required params, the
+    crash is delivered through the structured config, and the exploit stage -- preserving the
+    `name=` structure -- reaches L3: control flow is hijacked to win(), confirmed under the debugger
+    with a negative control. Locks structured-input exploitation (not just the L2 primitive)."""
+    from lykos.analyze import invocation
+    from lykos.analyze.disassemble import enqueue_disassemble
+    from lykos.analyze.ingest import enqueue_triage
+    from lykos.analyze.poc.exploit_stage import enqueue_exploit
+    from lykos.analyze.poc.primitive_stage import enqueue_primitive
+    from lykos.analyze.poc.stage import enqueue_build_poc
+    from lykos.db.dao import DynResultDAO, PocDAO
+    src = tmp_path / "svcw.c"; src.write_text(_PARAM_SVC_WIN)
+    exe = tmp_path / "svcw"
+    if subprocess.run([gcc, "-O0", "-fno-stack-protector", "-no-pie", "-w", str(src),
+                       "-o", str(exe)], capture_output=True).returncode != 0:
+        pytest.skip("build failed")
+    target = ingest(store, case.id, exe, filename="svcw")
+    q = JobQueue(store.conn)
+    for fn in (enqueue_triage, enqueue_disassemble):
+        fn(q, target, force=True); assert pool.wait_idle(300)
+    found = invocation.discover(["usage: %s -t <seconds> -s <NNN-NNN-NNN-NNN> -c <config>"])
+    argv = invocation.propose_argv(found)                 # -c @@ -s 111-111-111-111 -t 0
+    crash = b"name=" + b"A" * 300 + b"\n"
+    sha = store.content.put_bytes(crash)[0]
+    run = store.runs.create(case.id, "fuzz", status="done")
+    DynResultDAO(store.conn).insert(target.id, case.id, run_id=run.id, input_sha=sha,
+                                    input_mode="file", argv=argv, signal_name="SIGSEGV", crashed=True)
+    p = {"input_sha": sha, "input_mode": "file", "argv": argv}
+    for fn in (enqueue_build_poc, enqueue_primitive):
+        fn(q, target, params=dict(p), force=True); assert pool.wait_idle(300)
+    enqueue_exploit(q, target, params={**p, "strategy": "auto", "timeout": 25}, force=True)
+    assert pool.wait_idle(400)
+    levels = {pc.level for pc in PocDAO(store.conn).list_by_target(target.id) if pc.verified}
+    assert "L3" in levels, f"structured parameter-driven crash did not reach L3: {levels}"
+
+
+# A parameter-driven service whose config overflow is BINARY-SAFE (fread + memcpy, not strcpy), so a
+# full ROP chain -- whose x86-64 addresses contain NULs -- can be delivered through the structured
+# `name=` config. No win(); ret2system is reached via a provided `pop rdi;ret` gadget + system@plt +
+# "/bin/sh". The whole parameter-driven -> spawned-shell path.
+_PARAM_SVC_SHELL = (
+    "#include <ctype.h>\n#include <stdlib.h>\n#include <stdio.h>\n#include <string.h>\n"
+    "#include <unistd.h>\n"
+    '__asm__(".text\\n.global g_pop\\n g_pop: pop %rdi\\n ret\\n");\n'
+    'volatile char *g_sh = "/bin/sh";\n'
+    'static void usage(const char*p){fprintf(stderr,'
+    '"usage: %s -t <seconds> -s <NNN-NNN-NNN-NNN> -c <config>\\n",p);}\n'
+    "static int valid_sid(const char*s){ if(!s||strlen(s)!=15) return 0;\n"
+    "  for(int i=0;i<15;i++){ if((i+1)%4==0){ if(s[i]!='-') return 0; }\n"
+    "    else if(!isdigit((unsigned char)s[i])) return 0; } return 1; }\n"
+    "static void set_name(const char*v,size_t n){ char name[64]; memcpy(name,v,n);"
+    ' printf("ok %zu\\n",n); }\n'
+    "int main(int c,char**v){ const char*sid=0,*cfg=0; int ht=0,o;\n"
+    "  if(c>9999) system((char*)g_sh);\n"
+    "  while((o=getopt(c,v,\"t:s:c:\"))!=-1){ if(o=='t')ht=1; else if(o=='s')sid=optarg;\n"
+    "    else if(o=='c')cfg=optarg; else {usage(v[0]);return 2;} }\n"
+    "  if(!ht||!sid||!cfg){usage(v[0]);return 2;}\n"
+    "  if(!valid_sid(sid)){fprintf(stderr,\"bad session id\\n\");return 3;}\n"
+    "  FILE*f=fopen(cfg,\"r\"); if(!f) return 1; char buf[4096];\n"
+    "  size_t n=fread(buf,1,sizeof buf,f); fclose(f);\n"
+    '  if(n>=5 && !memcmp(buf,"name=",5)) set_name(buf+5,n-5); return 0; }\n')
+
+
+def test_parameter_driven_structured_crash_spawns_a_shell(store, case, pool, gcc, tmp_path):
+    """The demonstrated EFFECT through structured params: a binary that needs `-t/-s/-c` (one a
+    shaped id) and overflows a binary-safe `memcpy` of a `name=` config value is driven to a
+    SPAWNED SHELL -- ret2system via a pop-rdi gadget, the chain delivered inside the structured
+    config, confirmed by a real /bin/sh evaluating a forgery-proof marker."""
+    from lykos.analyze import invocation
+    from lykos.analyze.disassemble import enqueue_disassemble
+    from lykos.analyze.ingest import enqueue_triage
+    from lykos.analyze.poc.exploit_stage import enqueue_exploit
+    from lykos.analyze.poc.primitive_stage import enqueue_primitive
+    from lykos.analyze.poc.stage import enqueue_build_poc
+    from lykos.db.dao import DynResultDAO, FindingDAO, PocDAO
+    src = tmp_path / "svcx.c"; src.write_text(_PARAM_SVC_SHELL)
+    exe = tmp_path / "svcx"
+    if subprocess.run([gcc, "-O0", "-fno-stack-protector", "-no-pie", "-w", str(src),
+                       "-o", str(exe)], capture_output=True).returncode != 0:
+        pytest.skip("build failed")
+    target = ingest(store, case.id, exe, filename="svcx")
+    q = JobQueue(store.conn)
+    for fn in (enqueue_triage, enqueue_disassemble):
+        fn(q, target, force=True); assert pool.wait_idle(300)
+    argv = invocation.propose_argv(invocation.discover(
+        ["usage: %s -t <seconds> -s <NNN-NNN-NNN-NNN> -c <config>"]))
+    crash = b"name=" + b"A" * 300            # binary-safe; whole file is read
+    sha = store.content.put_bytes(crash)[0]
+    run = store.runs.create(case.id, "fuzz", status="done")
+    DynResultDAO(store.conn).insert(target.id, case.id, run_id=run.id, input_sha=sha,
+                                    input_mode="file", argv=argv, signal_name="SIGSEGV", crashed=True)
+    p = {"input_sha": sha, "input_mode": "file", "argv": argv}
+    for fn in (enqueue_build_poc, enqueue_primitive):
+        fn(q, target, params=dict(p), force=True); assert pool.wait_idle(300)
+    enqueue_exploit(q, target, params={**p, "strategy": "auto", "timeout": 25}, force=True)
+    assert pool.wait_idle(400)
+    levels = {pc.level for pc in PocDAO(store.conn).list_by_target(target.id) if pc.verified}
+    assert "L3" in levels, f"did not reach L3: {levels}"
+    titles = [f.title or "" for f in FindingDAO(store.conn).list_by_target(target.id)]
+    assert any("spawned shell" in t for t in titles), f"no spawned-shell effect: {titles}"
