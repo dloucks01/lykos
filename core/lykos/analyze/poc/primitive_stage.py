@@ -26,6 +26,33 @@ TOOL = "primitive"
 TOOL_VERSION = "primitive-1"
 
 
+_MIN_FILLER_RUN = 16
+
+
+def _overflow_frame(orig: bytes):
+    """(prefix, suffix) around the longest single-byte run in the crashing input -- the filler that
+    smashes the frame.
+
+    A structured input only faults when the structure around the overflow is intact: a config
+    `name=<AAAA...>` crashes, but a whole-buffer cyclic (`aaaabaaac...`) is not a `name=` line, so
+    the target never reaches the sink and L2 reports a false "no fault". Putting the cyclic exactly
+    where the filler was keeps the `name=` prefix (and any trailing bytes) and reproduces the crash.
+    Returns (b"", b"") when there is no significant run -- an unstructured input the pattern can
+    replace whole, exactly as before."""
+    if not orig:
+        return b"", b""
+    best_s = best_len = run_s = 0
+    for i in range(1, len(orig) + 1):
+        if i < len(orig) and orig[i] == orig[run_s]:
+            continue
+        if i - run_s > best_len:
+            best_s, best_len = run_s, i - run_s
+        run_s = i
+    if best_len < _MIN_FILLER_RUN:
+        return b"", b""
+    return orig[:best_s], orig[best_s + best_len:]
+
+
 def _slack_txt(slack):
     """Describe how the confirmed offset sits relative to the recovered buffer's frame base."""
     if slack > 0:
@@ -101,6 +128,15 @@ def primitive_stage(ctx) -> dict:
         return {}
 
     orig = ctx.content.get_bytes(input_sha)
+    # Structure-preserving framing: a structured input (a config `name=<AAAA...>`, an argv-delivered
+    # path, a packet) only faults when the bytes AROUND the overflow are kept -- the smash is the
+    # long filler run, not the whole input. Put the cyclic (and later the control marker) exactly
+    # where that filler was, so the target still reaches the vulnerable sink. (b"",b"") => the input
+    # is unstructured and the pattern is fed whole, exactly as before.)
+    _pre, _post = _overflow_frame(orig)
+
+    def frame(payload):
+        return _pre + payload + _post
     target_bytes = ctx.content.path(target.sha256).read_bytes()
     exe = ctx.scratch() / "target.bin"
     ctx.content.stage_target(target, exe.parent, exe.name)
@@ -131,15 +167,25 @@ def primitive_stage(ctx) -> dict:
         # what reads as a real negative result.
         pattern = primitive.cyclic(length)
         tried = []
-        for m in [mode] + [x for x in MODES if x != mode]:
-            capture = _capture_for(m)
-            cap0 = capture(pattern)
-            tried.append(m)
+        # Prefer the structure-preserving framing (keeps a `name=` prefix etc.); fall back to the
+        # raw pattern so an input whose longest run is NOT the overflow still works exactly as
+        # before. `active_frame` is whichever reproduced the fault, reused for the confirm step.
+        identity = (lambda b: b)
+        framings = ([frame, identity] if (_pre or _post) else [identity])
+        active_frame = identity
+        cap0 = {}
+        for fr in framings:
+            for m in [mode] + [x for x in MODES if x != mode]:
+                capture = _capture_for(m)
+                cap0 = capture(fr(pattern))
+                if m not in tried:
+                    tried.append(m)
+                if cap0.get("ok") and cap0.get("signal_name"):
+                    active_frame, mode = fr, m
+                    break
             if cap0.get("ok") and cap0.get("signal_name"):
-                if m != mode:
-                    mode_why = f"{mode_why}, but it only faulted via {m}"
-                mode = m
                 break
+        frame = active_frame                       # confirm uses the framing that actually faulted
         capture = _capture_for(mode)
         if not cap0.get("ok") or not cap0.get("signal_name"):
             ctx.emit("primitive.done", payload={
@@ -191,13 +237,16 @@ def primitive_stage(ctx) -> dict:
                 continue
             seen_off.add(off)
             ctx.progress(msg=f"confirming IP-control at offset {off} ({source})")
-            control = primitive.control_input(off, length, word, endian)
+            control = frame(primitive.control_input(off, length, word, endian))
             if not primitive.marker_confirmed(capture(control), word, endian):
                 continue
             prim = {"type": "instruction-pointer-control", "offset": off, "source": source,
                     "marker": primitive._ip_marker(word), "observed_pc": cap0.get("pc", 0),
                     "confirmed": True, "registers": regs,
                     "static_offset": static_match, "static_candidates": offset_candidates}
+            if _pre or _post:                          # structured input: record the framing
+                prim["prefix"] = _pre.hex()
+                prim["suffix"] = _post.hex()
             extra = f"instruction-pointer control at offset {off} ({source})"
             if static_match:
                 extra += (f"; corroborated by static stack frame -- {static_match['size']}-byte"
@@ -212,7 +261,7 @@ def primitive_stage(ctx) -> dict:
             offset, source = rec
             static_match, fp_slack = primitive.match_frame_candidate(offset, offset_candidates,
                                                                      word)
-            control = primitive.control_input(offset, length, word, endian)
+            control = frame(primitive.control_input(offset, length, word, endian))
             prim = {"type": "instruction-pointer-control", "offset": offset, "source": source,
                     "marker": primitive._ip_marker(word), "observed_pc": cap0.get("pc", 0),
                     "confirmed": False, "registers": regs,
@@ -230,8 +279,8 @@ def primitive_stage(ctx) -> dict:
                                                   word=word)
         if memp is not None:
             ctx.progress(msg=f"{memp['type']} at addr offset {memp['addr_offset']}; confirming")
-            control = primitive.two_marker_input(memp["addr_offset"], memp.get("value_offset"),
-                                                 length, word=word, endian=endian)
+            control = frame(primitive.two_marker_input(memp["addr_offset"], memp.get("value_offset"),
+                                                       length, word=word, endian=endian))
             addr_ok, value_ok = primitive.memory_primitive_confirmed(capture(control), memp,
                                                                      word=word, endian=endian)
             confirmed = addr_ok and (value_ok or memp["type"] != "write-what-where")

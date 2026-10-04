@@ -65,7 +65,7 @@ _HINTS = (
     # file-path value instead of a count and breaking the invocation of any timeout-driven service.
     (re.compile(r"(?i)path|dir|file|\bout\b|log"), "path", "@@"),
     (re.compile(r"(?i)num|count|size|len|threads|workers|sec|timeout|interval|"
-                r"delay|ttl|level|\bms\b|\bn\b|\bt\b"), "number", "0"),
+                r"delay|ttl|level|float|double|real|\bms\b|\bn\b|\bt\b"), "number", "0"),
 )
 
 
@@ -164,14 +164,43 @@ def raw_strings(data: bytes, *, minlen: int = 4, limit: int = 200000) -> list:
     return out
 
 
-def _hint_for(flag: str, placeholder: Optional[str]) -> tuple:
+# A structured value written out in a string -- a usage/error/format message like "want
+# NNN-NNN-NNN-NNN" or "e.g. 111-222-333-444": groups of digits/template-class chars joined by a
+# single separator, three or more groups (so a date 2024-01-02 or a version 1.2.3 qualifies too,
+# which is fine -- they are valid values for a flag that wants that shape).
+_SHAPE_IN_TEXT = re.compile(r"(?<![\w-])([0-9A-Za-z#]{1,8}(?:[-:._/][0-9A-Za-z#]{1,8}){2,})(?![\w-])")
+
+
+def mine_shape_values(strings) -> list:
+    """Concrete values of any STRUCTURED shape the binary writes in its own strings.
+
+    A target with no --help and only a terse usage line still often documents a required value's
+    shape in an error or format message ("bad session id (want NNN-NNN-NNN-NNN)", "format:
+    111-222-333-444"). Without this a structured flag with no usage/help placeholder falls back to
+    "x", the validator rejects it, and nothing runs. Templates (NNN-NNN-...) are rendered to a
+    concrete value; literal examples (111-222-...) are used as-is. Longest first (more specific)."""
+    seen, out = set(), []
+    for s in strings or []:
+        for m in _SHAPE_IN_TEXT.finditer(s or ""):
+            tok = m.group(1)
+            val = _shape_value(tok) or (tok if any(c.isdigit() for c in tok) else None)
+            if val and val not in seen and 5 <= len(val) <= 64:
+                seen.add(val)
+                out.append(val)
+    out.sort(key=len, reverse=True)
+    return out
+
+
+def _hint_for(flag: str, placeholder: Optional[str], name: Optional[str] = None) -> tuple:
     # A literal format template in the placeholder is the most specific signal -- honour it before
     # the keyword hints, so `-s <NNN-NNN-NNN-NNN>` gets a shape-matching value, not a keyword guess.
     shaped = _shape_value(placeholder)
     if shaped is not None:
         return "value", shaped
+    # `name` is a descriptive long alias (e.g. "config" from `--config`): the short `-c` means
+    # nothing, but the alias names the value's kind.
     for rx, kind, default in _HINTS:
-        if rx.search(placeholder or "") or rx.search(flag):
+        if rx.search(placeholder or "") or rx.search(flag) or rx.search(name or ""):
             return kind, default
     return "value", "x"
 
@@ -206,6 +235,69 @@ def from_optstring(strings) -> dict:
                 out["-" + ch] = n >= 1
             i += 1 + n
     return out
+
+
+_HELP_METAVAR = re.compile(r"(?i)^(<.+>|\[.+\]|[A-Z][A-Z0-9_.=-]*|[a-z][a-z0-9_-]*|\d[\w.-]*)$")
+
+
+def from_help(lines) -> tuple:
+    """Flags + value shapes mined from `--help` / `-h` option-table output.
+
+    Modern GNU tools print a terse `Usage: ... [options]` in .rodata and keep the real option
+    list in --help (objdump, xmllint, exiv2, tiffcp -- the CVE-rich CLI-fuzz targets). Each option
+    row names the flag(s) and, when it takes a value, the metavar that gives the VALUE SHAPE:
+
+        -c, --config FILE        -> -c/--config take a FILE
+        --start-time <float>     -> a float value
+        -s <NNN-NNN-NNN-NNN>     -> a shaped session id
+        -v, --verbose            -> a switch
+
+    Returns ({flag: takes_value}, {flag: placeholder}). The description is separated from the
+    option column by a run of 2+ spaces, so it is cut away before parsing; a row whose remaining
+    tokens are not a single metavar-shaped word is treated as a switch (so a single-space
+    'description' cannot masquerade as a value)."""
+    takes: dict = {}
+    placeholders: dict = {}
+    names: dict = {}
+    for raw in lines or []:
+        line = (raw or "").rstrip()
+        if not line.lstrip().startswith("-"):
+            continue
+        col = re.split(r"\s{2,}", line.strip(), maxsplit=1)[0]
+        flags, rest = [], []
+        for tok in re.split(r"[,\s]+", col):
+            if not tok:
+                continue
+            if tok.startswith("-") and "=" in tok:              # --config=FILE
+                f, _, mv = tok.partition("=")
+                if re.fullmatch(r"--?[A-Za-z][\w-]*", f):
+                    flags.append(f)
+                    if mv:
+                        rest.append(mv)
+            elif re.fullmatch(r"--?[A-Za-z][\w-]*", tok):       # -c / --config
+                flags.append(tok)
+            else:
+                rest.append(tok)
+        if not flags:
+            continue
+        # a value exists only when exactly one trailing token remains and it is metavar-shaped;
+        # several tokens means we captured a single-spaced description, not a value.
+        mv = rest[0] if len(rest) == 1 and _HELP_METAVAR.match(rest[0]) else None
+        ph = (mv or "").strip("<>[]") or None
+        # `-c, --config FILE` is ONE option: collapse the aliases to a single canonical flag
+        # (prefer the short form -- getopt confirms it and it keeps the argv short) so the proposal
+        # does not emit `-c @@ --config <other>`, where the synonym overrides @@ with a dead path.
+        canon = next((f for f in flags if re.fullmatch(r"-[A-Za-z0-9]", f)), flags[0])
+        takes[canon] = takes.get(canon, False) or (ph is not None)
+        if ph and canon not in placeholders:
+            placeholders[canon] = ph
+        # keep the descriptive long alias (`--config` -> "config") as a KIND hint: the short
+        # canonical flag `-c` carries no meaning, but "config" tells us the value is a config file
+        # (so the campaign uses the key=value mutator), and a bare `FILE` metavar would not.
+        longest = max((f for f in flags), key=len)
+        if longest.startswith("--") and canon not in names:
+            names[canon] = longest.lstrip("-")
+    return takes, placeholders, names
 
 
 def from_usage(strings) -> tuple:
@@ -269,7 +361,7 @@ def optional_flags(usage: str) -> set:
     return out
 
 
-def discover(strings, *, usage_hint: Optional[str] = None) -> dict:
+def discover(strings, *, usage_hint: Optional[str] = None, help_text: Optional[str] = None) -> dict:
     """Everything we can say about how to invoke this target.
 
     The USAGE LINE is the authority on which flags exist, and the others only refine it. That
@@ -290,11 +382,11 @@ def discover(strings, *, usage_hint: Optional[str] = None) -> dict:
     use, usage = from_usage(strings)
     opt = from_optstring(strings)
     cmp_ = from_argv_compares(strings)
+    help_flags, help_ph, help_names = (from_help((help_text or "").splitlines())
+                                       if help_text else ({}, {}, {}))
 
-    if use:
-        flags_in = dict(use)
-        sources = ["usage"]
-        # the option string is trustworthy about VALUES for flags usage already named
+    def _refine(flags_in, sources):
+        # the option string is trustworthy about VALUES for flags we already named
         for flag in list(flags_in):
             if len(flag) == 2 and flag in opt:
                 flags_in[flag] = flags_in[flag] or opt[flag]
@@ -303,7 +395,21 @@ def discover(strings, *, usage_hint: Optional[str] = None) -> dict:
         for flag in cmp_:
             if flag in flags_in and "argv-compare" not in sources:
                 sources.append("argv-compare")
+
+    if use:
+        flags_in = dict(use)
+        sources = ["usage"]
         confidence = "high"
+        _refine(flags_in, sources)
+        # --help enumerates options the terse usage line omits, and names their value shapes.
+        for flag, takes in help_flags.items():
+            flags_in[flag] = flags_in.get(flag, False) or takes
+        if help_flags:
+            sources.append("help")
+    elif help_flags:
+        # no usage line, but --help gave us a real, verifiable option table: trust it.
+        flags_in, sources, confidence = dict(help_flags), ["help"], "high"
+        _refine(flags_in, sources)
     elif len(opt) and len(opt) <= 12:
         flags_in, sources, confidence = dict(opt), ["getopt"], "medium"
     else:
@@ -314,16 +420,30 @@ def discover(strings, *, usage_hint: Optional[str] = None) -> dict:
         for m in _USAGE_FLAG.finditer(text):
             if m.group(2):
                 placeholders[m.group(1)] = m.group(2)
+    for flag, ph in help_ph.items():                 # help names shapes usage often omits
+        placeholders.setdefault(flag, ph)
 
     optional = optional_flags(usage or "")
     flags = []
     for flag in sorted(flags_in):
         takes = flags_in[flag]
-        kind, default = _hint_for(flag, placeholders.get(flag))
+        kind, default = _hint_for(flag, placeholders.get(flag), name=help_names.get(flag))
         flags.append({"flag": flag, "takes_value": takes,
                       "optional": flag in optional,
                       "kind": kind if takes else "switch",
                       "default": default if takes else None})
+    # Last resort for a value flag whose shape neither usage nor --help gave us (default is the
+    # generic "x"): a structured value the binary documents in an error/format string. Not every
+    # parameter-driven target has a --help, but a strict validator almost always PRINTS the shape
+    # it wants, so mine it. Each generic flag takes a distinct mined shape when several exist.
+    generic = [f for f in flags if f["takes_value"] and f["default"] == "x"]
+    if generic:
+        shapes = mine_shape_values(strings)
+        for i, f in enumerate(generic):
+            if shapes:
+                f["default"] = shapes[i] if i < len(shapes) else shapes[0]
+                if "strings" not in sources:
+                    sources.append("strings")
     return {"flags": flags, "usage": usage, "sources": sources, "confidence": confidence}
 
 
@@ -342,13 +462,18 @@ def propose_argv(found: dict, *, input_kind: str = "config") -> list:
     default and the returned argv contains no `@@`, which the runner handles by APPENDING the
     input positionally. Callers that need to know which happened test `"@@" in argv`.
     """
+    # The fuzzed input is a FILE, delivered behind whichever flag names a file to read. `config`
+    # is the canonical kind, but a --help metavar of FILE/PATH gives kind `path` for the very same
+    # slot, so both are input slots -- otherwise a help-mined `-c FILE` got a dead default path and
+    # the input went nowhere. A `jar` is a module to load, not the fuzz input, so it is excluded.
+    input_kinds = {input_kind, "path"}
     argv: list = []
     placed = False
     for f in found.get("flags") or []:
         if not f.get("takes_value") or f.get("optional"):
             continue
         argv.append(f["flag"])
-        if not placed and f.get("kind") == input_kind:
+        if not placed and f.get("kind") in input_kinds:
             argv.append("@@")
             placed = True
         else:

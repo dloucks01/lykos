@@ -412,3 +412,21 @@ def test_return_address_registers_are_per_isa_not_a_shared_guess():
     assert primitive.ra_regs({"arch": "m68k"}) == ()              # return address on the stack
     # an unknown / absent arch falls back to the generic list rather than losing all of them
     assert primitive.ra_regs({}) == primitive._RA_REGS
+
+
+def test_overflow_frame_isolates_the_filler_run():
+    """The L2 probe must put its cyclic where the overflow FILLER was and keep the structure
+    around it (a config `name=<AAAA...>` only crashes as a `name=` line). An input with no long
+    run is unstructured and framed as a whole (b"", b"")."""
+    from lykos.analyze.poc.primitive_stage import _overflow_frame
+    pre, post = _overflow_frame(b"name=" + b"A" * 300 + b"\n")
+    assert pre == b"name=" and post == b"\n"        # prefix/suffix kept, filler isolated
+    pre, post = _overflow_frame(b"A" * 300)          # whole input is the run -> identity framing
+    assert pre == b"" and post == b""
+    pre, post = _overflow_frame(b"abcdefghij")       # no significant run -> unstructured
+    assert pre == b"" and post == b""
+    # framing + a cyclic reproduces the structured shape
+    from lykos.analyze.poc import primitive
+    pre, post = _overflow_frame(b"key=" + b"B" * 200)
+    framed = pre + primitive.cyclic(64) + post
+    assert framed.startswith(b"key=") and b"aaaa" in framed

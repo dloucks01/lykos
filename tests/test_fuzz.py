@@ -279,3 +279,39 @@ def test_parameter_driven_target_is_discovered_and_crashed(store, case, pool, gc
     sid = argv[argv.index("-s") + 1]
     assert re.fullmatch(r"\d{3}-\d{3}-\d{3}-\d{3}", sid), f"-s value not shape-synthesized: {sid!r}"
     assert "@@" in joined or any("conf" in str(a) or "/" in str(a) for a in argv)  # config delivered
+
+
+def test_parameter_driven_structured_crash_weaponizes_to_l2(store, case, pool, gcc, tmp_path):
+    """The whole parameter-driven weaponization: a service gated behind `-t/-s/-c` (one a shaped
+    id) whose config overflow is structured (`name=<...>`). The discovered invocation delivers the
+    crashing config, and the L2 primitive -- preserving the `name=` structure around the overflow --
+    confirms instruction-pointer control. Locks discovery + structured-input L2 together."""
+    from lykos.analyze import invocation
+    from lykos.analyze.disassemble import enqueue_disassemble
+    from lykos.analyze.ingest import enqueue_triage
+    from lykos.analyze.poc.primitive_stage import enqueue_primitive
+    from lykos.analyze.poc.stage import enqueue_build_poc
+    from lykos.db.dao import DynResultDAO, PocDAO
+    src = tmp_path / "svc.c"; src.write_text(_PARAM_SVC)
+    exe = tmp_path / "svc"
+    if subprocess.run([gcc, "-O0", "-fno-stack-protector", "-no-pie", "-w", str(src),
+                       "-o", str(exe)], capture_output=True).returncode != 0:
+        pytest.skip("build failed")
+    target = ingest(store, case.id, exe, filename="svc")
+    q = JobQueue(store.conn)
+    for fn in (enqueue_triage, enqueue_disassemble):
+        fn(q, target, force=True); assert pool.wait_idle(300)
+    # discovery synthesizes the required params (incl. the shaped -s) that let the app run at all
+    found = invocation.discover(["usage: %s -t <seconds> -s <NNN-NNN-NNN-NNN> -c <config>"])
+    argv = invocation.propose_argv(found)
+    assert "-s" in argv and "@@" in argv
+    crash = b"name=" + b"A" * 300 + b"\n"                 # the structured, minimized crash shape
+    sha = store.content.put_bytes(crash)[0]
+    run = store.runs.create(case.id, "fuzz", status="done")
+    DynResultDAO(store.conn).insert(target.id, case.id, run_id=run.id, input_sha=sha,
+                                    input_mode="file", argv=argv, signal_name="SIGSEGV", crashed=True)
+    p = {"input_sha": sha, "input_mode": "file", "argv": argv}
+    enqueue_build_poc(q, target, params=dict(p), force=True); assert pool.wait_idle(300)
+    enqueue_primitive(q, target, params=dict(p), force=True); assert pool.wait_idle(300)
+    levels = {pc.level for pc in PocDAO(store.conn).list_by_target(target.id) if pc.verified}
+    assert "L2" in levels, f"structured parameter-driven crash did not weaponize to L2: {levels}"

@@ -165,3 +165,46 @@ def test_structured_id_flag_gets_a_shape_matching_value():
 def test_numeric_placeholders_get_a_number_default():
     assert invocation._hint_for("-t", "seconds") == ("number", "0")
     assert invocation._hint_for("-n", "timeout") == ("number", "0")
+
+
+def test_from_help_mines_flags_and_value_shapes():
+    """--help option tables name flags the terse .rodata usage omits, and their value shapes.
+    Synonyms on one row collapse to one canonical flag; a single-spaced description is not a
+    value."""
+    help_txt = (
+        "Options:\n"
+        "  -t, --timeout N          seconds\n"
+        "  -s <NNN-NNN-NNN-NNN>     session id\n"
+        "  -c, --config FILE        config file\n"
+        "  -v, --verbose            be loud and wordy here\n")
+    takes, ph, names = invocation.from_help(help_txt.splitlines())
+    assert takes["-t"] and takes["-s"] and takes["-c"]       # value flags
+    assert takes.get("-v") is False                          # switch, not a value
+    assert "--timeout" not in takes and "--config" not in takes   # synonyms collapsed to short
+    assert ph["-s"] == "NNN-NNN-NNN-NNN" and ph["-c"] == "FILE" and ph["-t"] == "N"
+    assert names["-c"] == "config" and names["-t"] == "timeout"   # alias kept as a kind hint
+
+
+def test_discover_from_help_when_the_binary_usage_is_terse():
+    """The modern-GNU-tool case: usage says only '[options]', the flags live in --help."""
+    import re
+    found = invocation.discover(["Usage: svc [options]"], help_text=(
+        "Options:\n  -s <NNN-NNN-NNN-NNN>  id\n  -c, --config FILE  cfg\n  -t N  secs\n"))
+    assert found["confidence"] == "high" and "help" in found["sources"]
+    bf = {f["flag"]: f for f in found["flags"]}
+    assert re.fullmatch(r"\d{3}-\d{3}-\d{3}-\d{3}", bf["-s"]["default"])
+    assert bf["-c"]["default"] == "@@" and bf["-t"]["kind"] == "number"
+
+
+def test_mine_shape_values_recovers_a_structured_value_from_strings():
+    """No --help and no usage shape, but the binary PRINTS the format it wants in an error
+    string: recover a usable value from it so a strict validator is satisfied."""
+    vals = invocation.mine_shape_values(
+        ["bad session id (want NNN-NNN-NNN-NNN)", "e.g. 111-222-333-444", "/lib/x.so"])
+    assert "111-111-111-111" in vals          # template rendered
+    assert "111-222-333-444" in vals          # literal example kept
+    # end to end: optstring gives the flags, the error string gives -s its shape
+    found = invocation.discover(["t:s:c:", "bad session id (want NNN-NNN-NNN-NNN)"])
+    sflag = next(f for f in found["flags"] if f["flag"] == "-s")
+    assert sflag["default"] != "x" and "-" in sflag["default"]
+    assert "strings" in found["sources"]

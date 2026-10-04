@@ -403,6 +403,28 @@ def tsan_detonate(ctx, target, inputs, mode, exec_timeout, base_argv=()) -> int:
     return found
 
 
+def _help_text(exe, target, exec_timeout):
+    """Run the target's own help to mine its option table. Modern GNU tools print a terse
+    `Usage: ... [options]` in .rodata and keep the real flags in --help, so string-scraping finds
+    nothing; `objdump`, `xmllint`, `exiv2`, `tiffcp` all return zero flags without this. Tries the
+    usual help triggers, under the sandbox + a tight timeout, and returns the richest output that
+    actually looks like an option table (>=2 lines beginning with a dash), else None."""
+    from ..dynamic import sandbox
+    best, best_rows = None, 1
+    for flag in ("--help", "-h", "help", "-help", "--usage"):
+        try:
+            r = sandbox.run(exe, argv=[flag], stdin=b"", timeout=max(3.0, exec_timeout * 2),
+                            arch=target.arch, endianness=target.endianness, bits=target.bits)
+        except Exception:                          # noqa: BLE001 -- help mining is best-effort
+            continue
+        blob = (getattr(r, "stdout", b"") or b"") + b"\n" + (getattr(r, "stderr", b"") or b"")
+        txt = blob.decode("utf-8", "replace")
+        rows = sum(1 for ln in txt.splitlines() if ln.lstrip()[:1] == "-")
+        if rows > best_rows:
+            best, best_rows = txt, rows
+    return best
+
+
 def _discover_argv(ctx, target, exec_timeout):
     """Work out the target's required arguments -- and CHECK them before using them.
 
@@ -422,17 +444,21 @@ def _discover_argv(ctx, target, exec_timeout):
     from .. import invocation as invmod
     try:
         data = ctx.content.path(target.sha256).read_bytes()
-        found = invmod.discover([x.value for x in _strings_for(ctx, target)])
         d = ctx.scratch() / "argvprobe"
+        d.mkdir(parents=True, exist_ok=True)
+        exe = d / "target.bin"
+        exe.write_bytes(data)
+        exe.chmod(0o755)
+        # Mine the option table from the target's OWN --help, so a tool that hides its flags there
+        # (objdump/xmllint/exiv2/...) still gets a discovered, verifiable invocation.
+        help_text = _help_text(exe, target, exec_timeout)
+        found = invmod.discover([x.value for x in _strings_for(ctx, target)], help_text=help_text)
         # Real files behind every value that names one, or the proposal cannot be tested: a
         # service required to be given `-j <app.jar>` refuses the literal string "app.jar",
         # and the run then throws away an invocation that was right apart from a missing file.
         argv = invmod.materialize(found, d)
         if not argv:
             return [], None, False
-        exe = d / "target.bin"
-        exe.write_bytes(data)
-        exe.chmod(0o755)
         sample = d / "sample"
         sample.write_bytes(b"# lykos\n")
 
