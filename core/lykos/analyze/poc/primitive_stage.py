@@ -11,6 +11,7 @@ from ...db.dao import DynResultDAO, FindingDAO, FunctionDAO, PocDAO, TargetDAO
 from ...jobs.registry import register_stage
 from ..debug import qemu_gdb, rootcause
 from ..dynamic import sandbox
+from ..dynamic.minimize import minimize
 from ..dynamic.stage import crash_finding_candidate, crash_hijack
 from . import bundle, primitive
 from .capture import MODES, how_to_feed, make_capture, make_qemu_capture, materialize_helper
@@ -128,15 +129,6 @@ def primitive_stage(ctx) -> dict:
         return {}
 
     orig = ctx.content.get_bytes(input_sha)
-    # Structure-preserving framing: a structured input (a config `name=<AAAA...>`, an argv-delivered
-    # path, a packet) only faults when the bytes AROUND the overflow are kept -- the smash is the
-    # long filler run, not the whole input. Put the cyclic (and later the control marker) exactly
-    # where that filler was, so the target still reaches the vulnerable sink. (b"",b"") => the input
-    # is unstructured and the pattern is fed whole, exactly as before.)
-    _pre, _post = _overflow_frame(orig)
-
-    def frame(payload):
-        return _pre + payload + _post
     target_bytes = ctx.content.path(target.sha256).read_bytes()
     exe = ctx.scratch() / "target.bin"
     ctx.content.stage_target(target, exe.parent, exe.name)
@@ -159,6 +151,32 @@ def primitive_stage(ctx) -> dict:
                 return make_qemu_capture(exe, target.arch, m, base_argv, timeout,
                                          endianness=target.endianness, bits=target.bits)
             return make_capture(ctx, helper, exe, m, base_argv, timeout, sys.executable)
+
+        # Structure-preserving framing: a structured input (a config `name=<AAAA...>`, a packet)
+        # only faults when the bytes AROUND the overflow stay intact -- the smash is the long filler
+        # run, not the whole input. The FUZZER's crashing input is often messy (dictionary tokens +
+        # a trailing run), so first MINIMIZE it to its essential crashing shape; then the longest
+        # run is the real filler and the prefix/suffix are the true structure. The cyclic (and the
+        # control marker) then go exactly where the filler was. Unstructured inputs minimize to a
+        # single run and frame as a whole (b"", b""), i.e. exactly the old behaviour.
+        min_cap = _capture_for(mode)
+
+        def _still_faults(b):
+            c = min_cap(b)
+            return bool(c.get("ok") and c.get("signal_name"))
+        # Native only: minimization is up to `cap` detonations, cheap under ptrace but far too slow
+        # over a qemu gdbstub (each exec is a full emulated run), where it would blow the stage's
+        # budget. Cross-arch keeps the raw crash input, exactly as before.
+        if len(orig) > 64 and not emulated:
+            ctx.progress(msg=f"minimizing the {len(orig)}-byte crash to its essential shape")
+            mini, _mx = minimize(_still_faults, orig, cap=120)
+            if len(mini) < len(orig) and _still_faults(mini):
+                ctx.emit("primitive.minimized", payload={"from": len(orig), "to": len(mini)})
+                orig = mini
+        _pre, _post = _overflow_frame(orig)
+
+        def frame(payload):
+            return _pre + payload + _post
 
         ctx.progress(msg=f"detonating {length}-byte cyclic pattern under "
                          + (f"qemu-{target.arch} gdbstub" if emulated else "ptrace"))

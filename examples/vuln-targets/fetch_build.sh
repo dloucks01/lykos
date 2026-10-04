@@ -101,6 +101,26 @@ if fetch ncompress.tar.gz http://archive.ubuntu.com/ubuntu/pool/universe/n/ncomp
   fi
 fi
 
+# ---------------------------------------------------------------- libtiff 4.0.3 tiffcp (TIFF)
+# A canonical CLI-fuzzing target (CarpetFuzz, ProphetFuzz): a PARAMETER-DRIVEN image converter --
+# `tiffcp [options] input... output` -- with a long CVE history in 4.0.3. It is here to exercise
+# the parameter-discovery path on real third-party code: tiffcp keeps its option table in its own
+# usage/-h output, which lykos mines to build the invocation. Built x86-64-native (the whole suite
+# needs port/ + libtiff/ before tools/, so `make` is run top-level); extra codecs are disabled so
+# no system -dev packages are required. -O0 keeps the frames recoverable, matching the rest.
+TC_SHA=ea1aebe282319537fb2d4d7805f478dd4e0e05c33d0928baba76a7c963684872
+if command -v gcc >/dev/null && \
+   fetch tiff.tar.gz http://archive.ubuntu.com/ubuntu/pool/main/t/tiff/tiff_4.0.3.orig.tar.gz $TC_SHA; then
+  rm -rf src/tiff-4.0.3; tar xzf src/tiff.tar.gz -C src
+  echo "== libtiff 4.0.3 tiffcp (x86-64) =="
+  if ( cd src/tiff-4.0.3 && \
+       ./configure --disable-shared --disable-lzma --disable-jpeg --disable-zlib \
+                   --disable-webp --disable-zstd CFLAGS="-O0 -g -w" >/dev/null 2>&1 && \
+       make >/dev/null 2>&1 ) && [ -x src/tiff-4.0.3/tools/tiffcp ]; then
+    cp src/tiff-4.0.3/tools/tiffcp "$W/bin/tiffcp_x86-64"; echo "  + tiffcp_x86-64"
+  else echo "  x tiffcp_x86-64 (configure/make failed)"; fi
+fi
+
 echo
 echo "== self-check: the crasher must fault, the seed must parse =="
 for f in bin/jhead_*; do

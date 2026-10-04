@@ -165,25 +165,27 @@ def raw_strings(data: bytes, *, minlen: int = 4, limit: int = 200000) -> list:
 
 
 # A structured value written out in a string -- a usage/error/format message like "want
-# NNN-NNN-NNN-NNN" or "e.g. 111-222-333-444": groups of digits/template-class chars joined by a
-# single separator, three or more groups (so a date 2024-01-02 or a version 1.2.3 qualifies too,
-# which is fine -- they are valid values for a flag that wants that shape).
-_SHAPE_IN_TEXT = re.compile(r"(?<![\w-])([0-9A-Za-z#]{1,8}(?:[-:._/][0-9A-Za-z#]{1,8}){2,})(?![\w-])")
+# NNN-NNN-NNN-NNN" or "e.g. 111-222-333-444": groups of DIGITS (or N/#/X template chars) joined by
+# a `-`, `:`, `.` or `_`, three or more groups. Digit-ish groups only, and NOT `/`-separated, so a
+# file path (usr/lib/gcc/...), a soname (ld-linux-x86-64.so) or a dotted library name is NOT
+# mistaken for a value -- that false match injected a path as a flag's value. A date (2024-01-02)
+# or a dotted version (1.2.3) still qualifies, which is fine: they are valid shaped values.
+_SHAPE_IN_TEXT = re.compile(r"(?<![\w./:-])([0-9NX#]{1,8}(?:[-:._][0-9NX#]{1,8}){2,})(?![\w./:-])")
 
 
 def mine_shape_values(strings) -> list:
     """Concrete values of any STRUCTURED shape the binary writes in its own strings.
 
     A target with no --help and only a terse usage line still often documents a required value's
-    shape in an error or format message ("bad session id (want NNN-NNN-NNN-NNN)", "format:
-    111-222-333-444"). Without this a structured flag with no usage/help placeholder falls back to
-    "x", the validator rejects it, and nothing runs. Templates (NNN-NNN-...) are rendered to a
-    concrete value; literal examples (111-222-...) are used as-is. Longest first (more specific)."""
+    shape in an error message as a TEMPLATE ("bad session id (want NNN-NNN-NNN-NNN)"). Only
+    templates -- tokens carrying explicit N/#/X shape chars -- are mined, and rendered to a concrete
+    value. A bare literal like a version `4.0.3` or `16.2.0-1` is NOT mined: those appear all over a
+    real binary and are not shapes anyone asked for, so mining them injected a version string as a
+    flag's value. Longest first (more specific)."""
     seen, out = set(), []
     for s in strings or []:
         for m in _SHAPE_IN_TEXT.finditer(s or ""):
-            tok = m.group(1)
-            val = _shape_value(tok) or (tok if any(c.isdigit() for c in tok) else None)
+            val = _shape_value(m.group(1))             # templates only (must have N/#/X chars)
             if val and val not in seen and 5 <= len(val) <= 64:
                 seen.add(val)
                 out.append(val)
@@ -431,7 +433,8 @@ def discover(strings, *, usage_hint: Optional[str] = None, help_text: Optional[s
         flags.append({"flag": flag, "takes_value": takes,
                       "optional": flag in optional,
                       "kind": kind if takes else "switch",
-                      "default": default if takes else None})
+                      "default": default if takes else None,
+                      "placeholder": placeholders.get(flag), "name": help_names.get(flag)})
     # Last resort for a value flag whose shape neither usage nor --help gave us (default is the
     # generic "x"): a structured value the binary documents in an error/format string. Not every
     # parameter-driven target has a --help, but a strict validator almost always PRINTS the shape
@@ -478,7 +481,33 @@ def propose_argv(found: dict, *, input_kind: str = "config") -> list:
             placed = True
         else:
             argv.append(_concrete(f))
+    # No REQUIRED flag carries the input, but the target may read its input behind an OPTIONAL file
+    # flag -- `tcpdump -r <pcap>`, `openssl ... -in <file>`. Append that one, with the input at it,
+    # so a reader whose only input path is optional still gets fuzzed. Pick a READ flag, never an
+    # output one (`-w`/`-o`/`--out`), or we would write to the fuzzed path instead of reading it.
+    if not placed:
+        opt_in = next((f for f in (found.get("flags") or [])
+                       if f.get("takes_value") and f.get("optional")
+                       and f.get("kind") in input_kinds and _is_read_flag(f)), None)
+        if opt_in is not None:
+            argv += [opt_in["flag"], "@@"]
+            placed = True
     return argv
+
+
+_READ_FLAG = re.compile(r"(?i)read|input|\bin\b|\bsrc\b|source|load|\bfile\b|\br\b|\bi\b|\bf\b")
+_WRITE_FLAG = re.compile(r"(?i)out|write|save|dest|\bdst\b|export|log|\bo\b|\bw\b")
+
+
+def _is_read_flag(f: dict) -> bool:
+    """A flag that names an INPUT to read, not an output to write. Checks the flag letter, its
+    long alias and its metavar; an output signal vetoes it so the campaign never feeds the target a
+    path it will overwrite."""
+    hay = " ".join(x for x in (f.get("flag", "").lstrip("-"), f.get("name") or "",
+                               f.get("placeholder") or "") if x)
+    if _WRITE_FLAG.search(hay):
+        return False
+    return bool(_READ_FLAG.search(hay))
 
 
 def _concrete(f: dict) -> str:

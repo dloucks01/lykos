@@ -14,3 +14,4 @@ jhead_x86-64	x86-64	jhead 3.04	JPEG/EXIF	CWE-125 OOB read in ProcessGpsInfo (off
 ncompress_x86-64_cve	x86-64	ncompress 4.2.4.4 (CVE fix reverted)	argv	CWE-121 stack overflow, CVE-2001-1413 -- reaches L2 (IP control at offset 1048)
 gif2rgb_x86-64	x86-64	giflib 5.1.4	GIF	none known -- negative case, already carries the screen-confinement check
 unzip_x86-64	x86-64	Info-ZIP 6.0	ZIP	none reached yet -- 3705 blocks, 1162 covered
+tiffcp_x86-64	x86-64	libtiff 4.0.3	TIFF	parameter-driven (`tiffcp [options] in... out`); CarpetFuzz/ProphetFuzz CLI-fuzz target, CVE history in 4.0.3 -- exercises --help/usage option mining

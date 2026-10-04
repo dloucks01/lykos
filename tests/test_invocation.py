@@ -200,11 +200,35 @@ def test_mine_shape_values_recovers_a_structured_value_from_strings():
     """No --help and no usage shape, but the binary PRINTS the format it wants in an error
     string: recover a usable value from it so a strict validator is satisfied."""
     vals = invocation.mine_shape_values(
-        ["bad session id (want NNN-NNN-NNN-NNN)", "e.g. 111-222-333-444", "/lib/x.so"])
-    assert "111-111-111-111" in vals          # template rendered
-    assert "111-222-333-444" in vals          # literal example kept
-    # end to end: optstring gives the flags, the error string gives -s its shape
+        ["bad session id (want NNN-NNN-NNN-NNN)", "e.g. 111-222-333-444",
+         "/lib/x.so", "version 4.0.3", "gcc 16.2.0-1", "ld-linux-x86-64.so.2"])
+    assert "111-111-111-111" in vals          # the TEMPLATE is rendered to a concrete value
+    # literal digit-strings (a version, an soname, a path) are NOT shapes anyone asked for and
+    # must never be mined as a flag value -- that injected garbage into real binaries' flags
+    assert all("4.0.3" not in v and ".so" not in v and "16.2.0" not in v for v in vals)
+    assert "111-222-333-444" not in vals      # a bare literal example is not mined (templates only)
+    # end to end: optstring gives the flags, the error string's TEMPLATE gives -s its shape
     found = invocation.discover(["t:s:c:", "bad session id (want NNN-NNN-NNN-NNN)"])
     sflag = next(f for f in found["flags"] if f["flag"] == "-s")
     assert sflag["default"] != "x" and "-" in sflag["default"]
     assert "strings" in found["sources"]
+
+
+def test_input_behind_an_optional_read_flag_is_used():
+    """A reader whose only input path is an OPTIONAL flag (`tcpdump -r <pcap>`, `openssl -in
+    <file>`) still gets fuzzed: when no REQUIRED flag carries the input, the input goes on an
+    optional READ flag -- never an output one, or we would overwrite the fuzzed path."""
+    found = invocation.discover(["usage: prog [ -r file ] [ -w file ] [ -v ]"])
+    argv = invocation.propose_argv(found)
+    assert argv == ["-r", "@@"], argv          # read flag chosen, write flag avoided
+    # a required file flag still wins over an optional one
+    found2 = invocation.discover(["usage: prog -c <config> [ -r file ]"])
+    argv2 = invocation.propose_argv(found2)
+    assert argv2[argv2.index("-c") + 1] == "@@" and "@@" not in argv2[argv2.index("-c") + 2:]
+
+
+def test_write_only_optional_flag_is_not_fed_the_input():
+    """No read flag at all -> we do NOT put @@ on a write/output flag (that would clobber it)."""
+    found = invocation.discover(["usage: prog [ -o outfile ] [ -v ]"])
+    argv = invocation.propose_argv(found)
+    assert "@@" not in argv                     # nothing safe to carry the input
