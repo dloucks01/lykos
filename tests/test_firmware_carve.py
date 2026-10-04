@@ -413,3 +413,29 @@ def test_garbage_cpio_header_does_not_crash():
     from lykos.analyze.firmware import carve
     assert carve._cpio_newc_files(b"070701" + b"Z" * 200, 0) == []   # bad hex fields -> clean []
     assert carve._cpio_newc_files(b"070701", 0) == []                # truncated -> clean []
+
+
+# ---- compressed cpio = the standard Linux initramfs root filesystem -----------------------
+def test_gzip_compressed_cpio_initramfs_tree_is_recovered(tmp_path):
+    """gzip(cpio) is the usual initramfs. extract_filesystems must recover the whole TREE (paths +
+    non-ELF files), not just the contiguous ELFs the raw carve pulls out."""
+    import shutil as _sh
+    import subprocess as _sp
+    if not _sh.which("cpio"):
+        pytest.skip("cpio tool needed to build an authoritative initramfs")
+    root = tmp_path / "r"
+    (root / "sbin").mkdir(parents=True)
+    (root / "sbin" / "init").write_bytes(_elf64(0x80))
+    (root / "etc_passwd").write_text("root::0:0:/root:/bin/sh\n")
+    names = b"\0".join(p.relative_to(root).as_posix().encode()
+                       for p in sorted(root.rglob("*")) if p.is_file()) + b"\0"
+    r = _sp.run(["cpio", "--null", "-o", "-H", "newc", "--quiet"], input=names, cwd=str(root),
+                capture_output=True)
+    if r.returncode or not r.stdout:
+        pytest.skip("cpio could not build the fixture")
+    img = b"\x00" * 48 + gzip.compress(r.stdout)
+    got = carve.extract_filesystems(img)
+    by = {g["path"]: g for g in got}
+    assert any(g["kind"] == "elf" for g in got), "initramfs ELF (sbin/init) not recovered"
+    assert "etc_passwd" in by, f"non-ELF initramfs file lost: {sorted(by)}"
+    assert all(g["fs"] == "gzip+cpio" for g in got)

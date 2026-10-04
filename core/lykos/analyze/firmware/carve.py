@@ -421,6 +421,18 @@ def extract_filesystems(data: bytes, *, max_filesystems: int = 8) -> list[dict]:
                 continue
             seen.add(o)
             files = _unpack_cpio(data[o:])
+        elif typ in ("gzip", "xz", "bzip2", "zstd"):
+            # A compressed cpio is the standard Linux initramfs root filesystem. Decompress and, if
+            # the result is a cpio, recover its whole file tree -- the raw-ELF carve only pulls the
+            # contiguous ELFs out and loses every path and non-ELF file (configs, keys).
+            if o in seen:
+                continue
+            seen.add(o)
+            dec = _decompress(typ, data[o:])
+            if not (dec and dec[:6] in _CPIO_NEWC):
+                continue
+            typ = f"{typ}+cpio"
+            files = _cpio_newc_files(dec, 0)
         else:
             continue
         if not files:
