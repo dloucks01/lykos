@@ -61,9 +61,42 @@ _HINTS = (
     # sent to the real one.
     (re.compile(r"(?i)host|addr|ip\b|group|grp|mcast|multicast"), "host", "127.0.0.1"),
     (re.compile(r"(?i)user|login"), "user", "lykos"),
-    (re.compile(r"(?i)path|dir|file|out|log"), "path", "@@"),
-    (re.compile(r"(?i)num|count|size|len|threads|workers"), "number", "1"),
+    # `out` only as a whole word: it was matching "timeout" (a NUMBER), handing `-t <timeout>` a
+    # file-path value instead of a count and breaking the invocation of any timeout-driven service.
+    (re.compile(r"(?i)path|dir|file|\bout\b|log"), "path", "@@"),
+    (re.compile(r"(?i)num|count|size|len|threads|workers|sec|timeout|interval|"
+                r"delay|ttl|level|\bms\b|\bn\b|\bt\b"), "number", "0"),
 )
+
+
+# Format-template placeholders: a value whose SHAPE is written out literally, like a session id
+# `NNN-NNN-NNN-NNN`, a time `HH:MM`, a MAC `XX:XX:XX:XX:XX:XX`. A service that validates the shape
+# (`-s <NNN-NNN-NNN-NNN>`, `-csid 111-111-222-222`) rejects a generic "x" and never reaches its
+# real work, so nothing downstream -- fuzzing, the crash, the PoC -- can happen. These class chars
+# are the common conventions; a run of them (with literal separators) IS a template.
+_SHAPE_CLASS = {"N": "1", "#": "1", "9": "1", "D": "1",      # a digit slot
+                "X": "a", "A": "a", "x": "a", "H": "a"}      # an alnum / hex slot
+_SHAPE_SEP = set("-_.:/ @")
+
+
+def _shape_value(placeholder):
+    """Concrete value matching a literal format-template placeholder, else None.
+
+    `NNN-NNN-NNN-NNN` -> `111-111-111-111`; `HH:HH:HH` -> `aa:aa:aa`. Returns None for an ordinary
+    descriptive word (`config`, `seconds`) so the keyword hints still handle those. A template is a
+    string made only of class chars + separators, with at least three class chars so a short word
+    like `IP` is not mistaken for one."""
+    if not placeholder:
+        return None
+    p = placeholder.strip().strip("<>[]").strip()
+    if not p or len(p) > 128:
+        return None
+    nclass = sum(1 for c in p if c in _SHAPE_CLASS)
+    if nclass < 3:
+        return None
+    if any(c not in _SHAPE_CLASS and c not in _SHAPE_SEP and not c.isdigit() for c in p):
+        return None                                  # a real word crept in -> not a pure template
+    return "".join(_SHAPE_CLASS.get(c, c) for c in p)
 
 
 _PRINTABLE = bytes(range(0x20, 0x7F)) + b"\t"
@@ -132,6 +165,11 @@ def raw_strings(data: bytes, *, minlen: int = 4, limit: int = 200000) -> list:
 
 
 def _hint_for(flag: str, placeholder: Optional[str]) -> tuple:
+    # A literal format template in the placeholder is the most specific signal -- honour it before
+    # the keyword hints, so `-s <NNN-NNN-NNN-NNN>` gets a shape-matching value, not a keyword guess.
+    shaped = _shape_value(placeholder)
+    if shaped is not None:
+        return "value", shaped
     for rx, kind, default in _HINTS:
         if rx.search(placeholder or "") or rx.search(flag):
             return kind, default

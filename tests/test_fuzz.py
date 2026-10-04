@@ -228,3 +228,54 @@ def test_load_external_seeds_from_files_and_dir(tmp_path):
 def test_load_external_seeds_empty_is_empty():
     from lykos.analyze.fuzz.stage import _load_external_seeds
     assert _load_external_seeds({}) == []        # lets the caller fall back to _DEFAULT_SEEDS
+
+
+# A parameter-driven service: it REQUIRES three well-formed flags before it runs -- a number
+# (-t), a strict-shape session id (-s NNN-NNN-NNN-NNN), and a config file (-c). Fuzzed bare it
+# just prints usage; the harness must DISCOVER the flags and SYNTHESIZE a valid value for each
+# (especially the structured -s) to reach the strcpy overflow behind the config parser.
+_PARAM_SVC = (
+    "#include <ctype.h>\n#include <stdio.h>\n#include <string.h>\n#include <unistd.h>\n"
+    "static void usage(const char*p){fprintf(stderr,"
+    "\"usage: %s -t <seconds> -s <NNN-NNN-NNN-NNN> -c <config>\\n\",p);}\n"
+    "static int valid_sid(const char*s){ if(!s||strlen(s)!=15) return 0;\n"
+    "  for(int i=0;i<15;i++){ if((i+1)%4==0){ if(s[i]!='-') return 0; }\n"
+    "    else if(!isdigit((unsigned char)s[i])) return 0; } return 1; }\n"
+    "static void set_name(const char*v){ char name[64]; strcpy(name,v); printf(\"name=%s\\n\",name); }\n"
+    "int main(int c,char**v){ const char*sid=0,*cfg=0; int ht=0,o;\n"
+    "  while((o=getopt(c,v,\"t:s:c:\"))!=-1){ if(o=='t')ht=1; else if(o=='s')sid=optarg;\n"
+    "    else if(o=='c')cfg=optarg; else {usage(v[0]);return 2;} }\n"
+    "  if(!ht||!sid||!cfg){usage(v[0]);return 2;}\n"
+    "  if(!valid_sid(sid)){fprintf(stderr,\"bad session id\\n\");return 3;}\n"
+    "  FILE*f=fopen(cfg,\"r\"); if(!f) return 1; char line[512];\n"
+    "  while(fgets(line,sizeof line,f)){ size_t n=strlen(line);\n"
+    "    if(n&&line[n-1]=='\\n')line[n-1]=0; if(!strncmp(line,\"name=\",5)) set_name(line+5); }\n"
+    "  fclose(f); return 0; }\n")
+
+
+def test_parameter_driven_target_is_discovered_and_crashed(store, case, pool, gcc, tmp_path):
+    """The parameter-driven case: a service gated behind required flags, one of them a strict-shape
+    id (-s NNN-NNN-NNN-NNN). The campaign must discover `-c @@ -s <valid-shape> -t <n>` -- synthesize
+    a value the validator accepts -- deliver the fuzzed config at @@, and reach the overflow. Locks
+    structured required-value synthesis + file-arg delivery together."""
+    import re
+    src = tmp_path / "svc.c"; src.write_text(_PARAM_SVC)
+    exe = tmp_path / "svc"
+    if subprocess.run([gcc, "-O0", "-fno-stack-protector", "-no-pie", "-w", str(src),
+                       "-o", str(exe)], capture_output=True).returncode != 0:
+        pytest.skip("build failed")
+    seed = tmp_path / "seed.conf"; seed.write_bytes(b"name=hello\nhost=127.0.0.1\n")
+    target = ingest(store, case.id, exe, filename="svc")
+    q = JobQueue(store.conn)
+    # do NOT pin input_mode: the stage must discover the argv and force file delivery via @@
+    run = enqueue_fuzz(q, target, params={"max_execs": 800, "max_seconds": 45, "exec_timeout": 1,
+                                          "seed_files": [str(seed)]})
+    assert pool.wait_idle(90) and q.runs.get(run.id).status == "done"
+    crashes = [d for d in DynResultDAO(store.conn).list_by_target(target.id) if d.crashed]
+    assert crashes, "no crash: the parameter-driven target was never driven past its arg gate"
+    argv = crashes[0].argv or []
+    joined = " ".join(str(a) for a in argv)
+    assert "-s" in argv, f"the required -s flag was not in the crashing invocation: {argv}"
+    sid = argv[argv.index("-s") + 1]
+    assert re.fullmatch(r"\d{3}-\d{3}-\d{3}-\d{3}", sid), f"-s value not shape-synthesized: {sid!r}"
+    assert "@@" in joined or any("conf" in str(a) or "/" in str(a) for a in argv)  # config delivered

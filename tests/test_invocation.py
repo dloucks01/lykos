@@ -134,3 +134,34 @@ def test_a_flag_that_names_a_file_gets_a_real_file(tmp_path):
     assert argv[argv.index("-c") + 1] == "@@"
     # a display id or an instance id names nothing on disk and stays a literal
     assert argv[argv.index("-d") + 1] == ":0"
+
+
+def test_shape_template_value_matches_the_placeholder_format():
+    """A placeholder written as a literal format -- a session id NNN-NNN-NNN-NNN, a time HH:MM --
+    is rendered to a concrete value of that exact shape, so a service that VALIDATES the shape
+    (`-s <NNN-NNN-NNN-NNN>`, `-csid 111-111-222-222`) accepts it and runs. An ordinary descriptive
+    word is left to the keyword hints."""
+    assert invocation._shape_value("NNN-NNN-NNN-NNN") == "111-111-111-111"
+    assert invocation._shape_value("<NNN-NNN-NNN-NNN>") == "111-111-111-111"
+    assert invocation._shape_value("HH:HH:HH") == "aa:aa:aa"
+    assert invocation._shape_value("config") is None          # a real word, not a template
+    assert invocation._shape_value("IP") is None              # too short to be a template
+    assert invocation._shape_value("session-id") is None      # letters -> not a pure shape
+
+
+def test_structured_id_flag_gets_a_shape_matching_value():
+    """The gap that hid a parameter-driven bug: `-s <NNN-NNN-NNN-NNN>` used to get the generic
+    "x", which a strict validator rejects, so the app never ran. It must now get a value of the
+    documented shape."""
+    import re
+    found = invocation.discover(
+        ["t:s:c:", "usage: %s -t <seconds> -s <NNN-NNN-NNN-NNN> -c <config>"])
+    byflag = {f["flag"]: f for f in found["flags"]}
+    assert re.fullmatch(r"\d{3}-\d{3}-\d{3}-\d{3}", byflag["-s"]["default"]), byflag["-s"]
+    assert byflag["-t"]["kind"] == "number"                   # <seconds> is numeric
+    assert byflag["-c"]["default"] == "@@"                    # the config is the fuzzed input
+
+
+def test_numeric_placeholders_get_a_number_default():
+    assert invocation._hint_for("-t", "seconds") == ("number", "0")
+    assert invocation._hint_for("-n", "timeout") == ("number", "0")
