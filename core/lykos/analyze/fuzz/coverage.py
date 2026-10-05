@@ -226,11 +226,24 @@ def coverage_stage(ctx) -> dict:
         (seeds_dir / f"seed{i:04d}").write_bytes(s or b"\n")
     out_dir = ctx.scratch() / "afl-out"
 
+    # Discover the real invocation so AFL drives the PARSER, not the usage banner: a dispatch or
+    # parameter-driven tool (`mutool draw @@`, a service behind `-c @@`) parses nothing run as
+    # `tool @@`. Reuses the black-box stage's discovery + live verification.
+    argv_template = None
+    try:
+        from .stage import _discover_argv
+        disc, _dnote, _wc = _discover_argv(ctx, target, exec_timeout)
+        if disc and "@@" in disc:
+            argv_template, mode = disc, "file"
+            ctx.emit("coverage.invocation", payload={"argv": disc, "why": _dnote})
+    except Exception:                                # noqa: BLE001 -- discovery is an optimisation
+        pass
+
     ctx.progress(msg=f"AFL++ qemu-mode, {seconds}s budget")
     ctx.emit("coverage.start", payload={"backend": "aflpp", "seconds": seconds,
                                         "afl": str(afl)})
     proc = aflpp.run_campaign(afl, exe, seeds_dir, out_dir, seconds=seconds, afl_path=afl_path,
-                              mode=mode, qemu=use_qemu)
+                              mode=mode, qemu=use_qemu, argv_template=argv_template)
     if proc.returncode != 0 and not (out_dir / "default").exists() \
             and not (out_dir / "crashes").exists():
         tail = (proc.stderr or b"")[-800:].decode("latin-1", "ignore")
@@ -266,18 +279,25 @@ def coverage_stage(ctx) -> dict:
     cover_blocks = _recovered_blocks(ctx, target)
     code_span = recovered_code_span(ctx.conn, target.id)   # to classify a hijacked (out-of-code) PC
 
+    # Replay with the SAME invocation the campaign fuzzed under (`mutool draw @@`): without the
+    # discovered prefix the crash replays as `mutool @@`, prints usage, "does not reproduce", and
+    # every real crash is silently dropped.
+    replay_argv = argv_template or ()
+
     def _replay(data):
         if cover_blocks:
             # arch/endianness/bits MUST be passed: without them run_batch's cross-arch guard sees
             # arch=None and execs a foreign-arch binary natively (rc 127, "not crashed") instead of
             # routing through qemu -- so it returns a truthy non-crash and every AFL crash on an
             # emulated target is silently dropped.
-            b = sandbox.run_batch(exe, [data], mode=mode, timeout=exec_timeout, blocks=cover_blocks,
+            b = sandbox.run_batch(exe, [data], mode=mode, base_argv=replay_argv,
+                                  timeout=exec_timeout, blocks=cover_blocks,
                                   arch=target.arch, endianness=target.endianness, bits=target.bits)
             if b:
                 return b[0]
         return run_input(exe, mode, workfile, exec_timeout, target.arch, data,
-                         blocks=cover_blocks, endianness=target.endianness, bits=target.bits)[1]
+                         base_argv=replay_argv, blocks=cover_blocks,
+                         endianness=target.endianness, bits=target.bits)[1]
 
     for data in raw:
         if ctx.should_cancel():
@@ -309,12 +329,15 @@ def coverage_stage(ctx) -> dict:
 
         def _same(d, _sig=sig):
             r = run_input(exe, mode, workfile, exec_timeout, target.arch, d,
-                          endianness=target.endianness, bits=target.bits)[1]
+                          base_argv=replay_argv, endianness=target.endianness, bits=target.bits)[1]
             return r.crashed and r.signal_name == _sig
 
         mdata, _ = minimize(_same, data, cap=200)
         note = (f"minimized {len(data)}->{len(mdata)}B" if len(mdata) < len(data) else None)
-        margv = invocation(mode, workfile, mdata)[0]
+        # Record the discovered invocation template (`['draw','@@']`), not a concrete scratch path:
+        # the prove loop (root_cause/build_poc) reads this to replay `mutool draw <crash>` and would
+        # otherwise run `mutool <crash>`, hit the usage banner, and file the crash as unreproduced.
+        margv = list(replay_argv) if replay_argv else invocation(mode, workfile, mdata)[0]
         input_sha = ctx.put_artifact("afl-crash-input", data=mdata)
         dd.insert(target.id, target.case_id, run_id=ctx.run_id, input_sha=input_sha,
                   input_mode=mode, argv=margv, signal=res.signal, signal_name=sig,

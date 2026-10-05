@@ -161,11 +161,18 @@ def is_sanitizer_build(data: bytes) -> bool:
 
 def run_campaign(afl: Path, exe, seeds_dir, out_dir, *, seconds: int = 30,
                  mode: str = "file", qemu: bool = True, afl_path: Optional[str] = None,
-                 cmplog: Optional[Path] = None):
+                 cmplog: Optional[Path] = None, argv_template=None):
     # NOTE: AFL keeps its default memory cap here. Sanitizer builds (which need `-m none`) are
     # deliberately NOT run through this path -- an uncapped run OOM'd the host -- they are fuzzed
     # by the sandbox `fuzz`/`directed_fuzz` stages under rlimits instead (see coverage_stage).
-    target = [str(exe)] + (["@@"] if mode == "file" else [])
+    # `argv_template` is the discovered invocation (e.g. ['draw', '@@'] for `mutool draw @@`): a
+    # dispatch/parameter-driven tool parses nothing without it, so AFL would fuzz only the usage
+    # banner. AFL recognises the literal '@@' as the input-file slot; for stdin mode there is none.
+    if argv_template:
+        tail = [str(a) for a in argv_template if not (mode != "file" and a == "@@")]
+        target = [str(exe)] + tail
+    else:
+        target = [str(exe)] + (["@@"] if mode == "file" else [])
     cmd = [str(afl)] + (["-Q"] if qemu else []) + \
         ["-i", str(seeds_dir), "-o", str(out_dir), "-V", str(int(seconds)), "--"] + target
     env = dict(os.environ)
