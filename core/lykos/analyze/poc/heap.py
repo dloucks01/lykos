@@ -250,15 +250,27 @@ def unsorted_bin_offset(libc_path=None):
                     'int main(){ void*a=malloc(0x430); malloc(0x430); free(a);\n'
                     '  write(1, a, 8); char c; read(0,&c,1); return 0; }\n')  # pause: keep maps live
         exe = os.path.join(d, "a")
+        # Compile with a CLEAN env. A bundled libc is a different glibc version than the host, so
+        # putting its dir on LD_LIBRARY_PATH makes the HOST gcc/setarch themselves try to load it
+        # ("version GLIBC_2.XX not found") and fail. The target's libc is selected at RUN time by
+        # the bundled ld's --library-path instead, which touches only the probe, not host tools.
         env = dict(os.environ)
-        cmd = [gcc, src, "-o", exe]
-        if libc_path:                                          # link/run against a specific libc
+        env.pop("LD_LIBRARY_PATH", None)
+        run_cmd = [setarch, "-R", exe]
+        if libc_path:                                          # run against a SPECIFIC libc
             libdir = os.path.dirname(os.path.realpath(libc_path))
-            env["LD_LIBRARY_PATH"] = libdir + ":" + env.get("LD_LIBRARY_PATH", "")
-        if subprocess.run(cmd, capture_output=True, env=env).returncode:
+            # Run the probe under the BUNDLED ld-linux (shipped beside the libc) with --library-path:
+            # the standard way to execute a binary against a foreign glibc, so main_arena's offset
+            # is measured for THAT libc. LD_LIBRARY_PATH alone fails (host ld cannot load it).
+            import glob as _glob
+            lds = _glob.glob(os.path.join(libdir, "ld-linux*.so*")) + \
+                _glob.glob(os.path.join(libdir, "ld-*.so*"))
+            if lds:
+                run_cmd = [setarch, "-R", lds[0], "--library-path", libdir, exe]
+        if subprocess.run([gcc, src, "-o", exe], capture_output=True, env=env).returncode:
             cache[key] = None
             return None
-        proc = subprocess.Popen([setarch, "-R", exe], stdin=subprocess.PIPE,
+        proc = subprocess.Popen(run_cmd, stdin=subprocess.PIPE,
                                 stdout=subprocess.PIPE, env=env)
         out = proc.stdout.read(8)                               # blocks until the leak is written
         try:

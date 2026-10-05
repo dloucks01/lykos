@@ -105,9 +105,10 @@ def menu_seeds(strings, *, max_seeds: int = 64) -> list[bytes]:
 # The index keywords are index INDICATORS only (id/index/slot/...), never object nouns like
 # "author" -- "Author Note size" is a size, not an index, so NUM must win there.
 _NUM_KW = re.compile(r"(size|length|\blen\b|count|number|\bnum\b|\bage\b|amount|\bqty\b|quantity|"
-                     r"bytes|how many|price|score|year|\bhow much\b|\bvalue\b|\bval\b)", re.I)
+                     r"bytes|how many|price|score|year|\bhow much\b|\bvalue\b|\bval\b|"
+                     r"\bbig\b|\bhow long\b|capacity|\bbuf(fer)? ?size\b)", re.I)
 _IDX_KW = re.compile(r"(\bid\b|\bidx\b|index|\bslot\b|\bentry\b|position|\bpos\b|\bwhich\b|"
-                     r"\bno\.?\b)", re.I)
+                     r"\bno\.?\b|\bpage\b)", re.I)
 
 
 def classify_prompt(text: str) -> str:
@@ -130,10 +131,16 @@ def _tail_prompt(chunk: str) -> str:
     if not chunk:
         return ""
     after = chunk.rsplit("\n", 1)[-1]
-    if after.strip():
+    # A trailing INPUT GLYPH with no letters -- "💀 ", "> ", "$ ", "# " -- is decoration, not the
+    # question; the real prompt ("How big is your request?", "Name of victim:") is on the line(s)
+    # before it. Classifying the glyph makes every field look like a bare string (an ornate menu's crawl
+    # returned an empty model for exactly this). Prefer the last non-empty line that has letters.
+    if after.strip() and re.search(r"[A-Za-z]", after):
         return after
-    lines = [ln for ln in chunk.splitlines() if ln.strip()]
-    return lines[-1] if lines else ""
+    lines = [ln for ln in chunk.splitlines() if ln.strip() and re.search(r"[A-Za-z]", ln)]
+    if lines:
+        return lines[-1]
+    return after if after.strip() else ""
 
 
 def _looks_like_menu(text: str) -> bool:
