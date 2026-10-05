@@ -408,18 +408,27 @@ def _help_text(exe, target, exec_timeout):
     `Usage: ... [options]` in .rodata and keep the real flags in --help, so string-scraping finds
     nothing; `objdump`, `xmllint`, `exiv2`, `tiffcp` all return zero flags without this. Tries the
     usual help triggers, under the sandbox + a tight timeout, and returns the richest output that
-    actually looks like an option table (>=2 lines beginning with a dash), else None."""
+    actually looks like an option table (>=2 dash-option lines) OR a subcommand table (>=2 command
+    rows), else None.
+
+    The BARE run (no args) is tried too: a dispatch-style tool (mutool, git, busybox) prints its
+    command list with no arguments and exits, and that list is what names the subcommand the fuzzer
+    must prepend -- without it the campaign runs `tool <input>`, gets usage, and never parses."""
     from ..dynamic import sandbox
+    # a command-table row: indented word + a '--'/2-space-gap description (mirrors invocation._SUBCMD_ROW)
+    _row = re.compile(r"^[ \t]+[a-z][a-z0-9][a-z0-9_-]{0,18}(?:[ \t]*--|[ \t]{2,}|\t)\s*\S")
     best, best_rows = None, 1
-    for flag in ("--help", "-h", "help", "-help", "--usage"):
+    for argv in ([], ["--help"], ["-h"], ["help"], ["-help"], ["--usage"]):
         try:
-            r = sandbox.run(exe, argv=[flag], stdin=b"", timeout=max(3.0, exec_timeout * 2),
+            r = sandbox.run(exe, argv=argv, stdin=b"", timeout=max(3.0, exec_timeout * 2),
                             arch=target.arch, endianness=target.endianness, bits=target.bits)
         except Exception:                          # noqa: BLE001 -- help mining is best-effort
             continue
         blob = (getattr(r, "stdout", b"") or b"") + b"\n" + (getattr(r, "stderr", b"") or b"")
         txt = blob.decode("utf-8", "replace")
-        rows = sum(1 for ln in txt.splitlines() if ln.lstrip()[:1] == "-")
+        lines = txt.splitlines()
+        rows = max(sum(1 for ln in lines if ln.lstrip()[:1] == "-"),
+                   sum(1 for ln in lines if _row.match(ln.rstrip())))
         if rows > best_rows:
             best, best_rows = txt, rows
     return best

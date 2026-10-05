@@ -390,6 +390,68 @@ def optional_flags(usage: str) -> set:
     return out
 
 
+# A subcommand-dispatched tool (`tool <command> [opts] INPUT`) parses NOTHING when run as
+# `tool INPUT` -- it prints its command list and exits, so the fuzzer never reaches the parser and
+# the campaign stalls at L0. mutool, git, openssl, busybox, ImageMagick and many others work this
+# way. We detect the command table and pick the subcommand that READS a single input document, so
+# the fuzzed input actually flows into the parser.
+_DISPATCH_HINT = re.compile(
+    r"(?im)^\s*usage:.*<(?:command|subcommand|verb|tool)>"       # usage: tool [opts] <command> ...
+    r"|^\s*(?:available\s+)?(?:sub)?commands:\s*$")              # a 'Commands:' section header
+# a command-list row: leading indent, a lowercase command word, then a description (often after
+# `--` or 2+ spaces). Deliberately narrow so an ordinary wrapped help line is not mistaken for one.
+_SUBCMD_ROW = re.compile(r"^[ \t]+([a-z][a-z0-9][a-z0-9_-]{0,18})(?:[ \t]*--|[ \t]{2,}|\t)\s*(.+?)\s*$")
+# commands whose job is to READ/parse one input document -- the ones worth fuzzing. Ranked: a
+# renderer/convertor exercises the deepest parser, then structural dumps, then light info.
+_READ_CMD_PRIORITY = ["draw", "convert", "render", "rasterize", "rip", "dump", "show", "info",
+                      "trace", "extract", "clean", "cat", "parse", "read", "check", "test", "view",
+                      "inspect", "list", "ls", "print", "display", "decode", "disasm", "run"]
+# verbs in a description that mean "this consumes an input document".
+_READ_VERBS = ("convert", "render", "show", "display", "information", "info", "rewrite", "parse",
+               "read", "dump", "extract", "trace", "inspect", "decode", "print", "draw", "view",
+               "list", "check", "analyse", "analyze", "rasteri")
+# commands that do NOT read a single input doc (create from scratch, need many inputs, side effects).
+_NONREAD_CMD = {"create", "new", "make", "init", "merge", "combine", "sign", "gen", "generate",
+                "help", "version", "config", "add", "commit", "push", "pull", "clone", "serve",
+                "server", "daemon", "install", "update", "upgrade", "remove", "delete", "set"}
+
+
+def from_subcommands(help_text: str) -> "tuple[Optional[str], list]":
+    """(best_input_reading_subcommand, all_subcommands) for a dispatch-style tool, else (None, []).
+
+    Requires BOTH a dispatch usage hint (`usage: tool <command>`) and a parsed command list, so a
+    program that merely lists examples is not mistaken for one. The chosen command is the
+    highest-ranked one that reads a single input document (a renderer/convertor first, as it drives
+    the deepest parser), avoiding create/merge/sign/help and friends."""
+    text = help_text or ""
+    if not _DISPATCH_HINT.search(text):
+        return None, []
+    cmds: dict = {}
+    for raw in text.splitlines():
+        m = _SUBCMD_ROW.match(raw.rstrip())
+        if not m:
+            continue
+        name, desc = m.group(1), m.group(2).strip()
+        if name in cmds or name in ("usage", "options", "commands"):
+            continue
+        cmds[name] = desc.lower()
+    if len(cmds) < 2:                                    # a single match is almost certainly noise
+        return None, []
+    names = list(cmds)
+
+    def _rank(name):
+        if name in _NONREAD_CMD:
+            return (3, 99, name)                         # last resort only
+        reads = any(v in cmds[name] for v in _READ_VERBS)
+        pri = _READ_CMD_PRIORITY.index(name) if name in _READ_CMD_PRIORITY else 50
+        return (0 if reads or name in _READ_CMD_PRIORITY else 1, pri, name)
+
+    best = min(names, key=_rank)
+    if best in _NONREAD_CMD:                             # nothing looked like a reader -> don't guess
+        return None, names
+    return best, names
+
+
 def discover(strings, *, usage_hint: Optional[str] = None, help_text: Optional[str] = None) -> dict:
     """Everything we can say about how to invoke this target.
 
@@ -413,6 +475,9 @@ def discover(strings, *, usage_hint: Optional[str] = None, help_text: Optional[s
     cmp_ = from_argv_compares(strings)
     help_flags, help_ph, help_names = (from_help((help_text or "").splitlines())
                                        if help_text else ({}, {}, {}))
+    # A dispatch-style tool (`tool <command> INPUT`) parses nothing without its subcommand. Look
+    # for the command table in --help AND in the strings (many print it on a bare/`-h` run).
+    subcmd, _all = from_subcommands("\n".join(list(strings) + ([help_text] if help_text else [])))
 
     def _refine(flags_in, sources):
         # the option string is trustworthy about VALUES for flags we already named
@@ -444,8 +509,9 @@ def discover(strings, *, usage_hint: Optional[str] = None, help_text: Optional[s
     else:
         # No flags, but a converter's `input output` usage still names a usable invocation (the two
         # positionals), so carry output_positional out even on the "none" path.
-        return {"flags": [], "usage": usage, "sources": [], "confidence": "none",
-                "output_positional": output_positional(usage)}
+        return {"flags": [], "usage": usage, "sources": (["subcommand"] if subcmd else []),
+                "confidence": "medium" if subcmd else "none",
+                "output_positional": output_positional(usage), "subcommand": subcmd}
 
     placeholders = {}
     for text in ([usage] if usage else []):
@@ -491,8 +557,10 @@ def discover(strings, *, usage_hint: Optional[str] = None, help_text: Optional[s
                 flags.append({"flag": oflag, "takes_value": True, "optional": True,
                               "kind": k, "default": d, "placeholder": None, "name": None,
                               "from_getopt": True})
+    if subcmd and "subcommand" not in sources:
+        sources.append("subcommand")
     return {"flags": flags, "usage": usage, "sources": sources, "confidence": confidence,
-            "output_positional": output_positional(usage)}
+            "output_positional": output_positional(usage), "subcommand": subcmd}
 
 
 def propose_argv(found: dict, *, input_kind: str = "config") -> list:
@@ -514,14 +582,17 @@ def propose_argv(found: dict, *, input_kind: str = "config") -> list:
     # the usage line's `[options]`, i.e. they are OPTIONAL extras, and filling them with placeholder
     # values (`-c x`) only makes the tool reject the whole invocation. So for a converter, propose
     # just the positionals: input at @@, a scratch path at OUTPUT_PLACEHOLDER.
+    # A dispatch-style tool needs its subcommand FIRST (`mutool draw @@`), or it prints its command
+    # list and never parses the input. Everything else is placed after it.
+    sub = found.get("subcommand")
     if found.get("output_positional"):
-        return [INPUT_PLACEHOLDER, OUTPUT_PLACEHOLDER]
+        return ([sub] if sub else []) + [INPUT_PLACEHOLDER, OUTPUT_PLACEHOLDER]
     # The fuzzed input is a FILE, delivered behind whichever flag names a file to read. `config`
     # is the canonical kind, but a --help metavar of FILE/PATH gives kind `path` for the very same
     # slot, so both are input slots -- otherwise a help-mined `-c FILE` got a dead default path and
     # the input went nowhere. A `jar` is a module to load, not the fuzz input, so it is excluded.
     input_kinds = {input_kind, "path"}
-    argv: list = []
+    argv: list = [sub] if sub else []
     placed = False
     for f in found.get("flags") or []:
         if not f.get("takes_value") or f.get("optional"):
@@ -552,6 +623,11 @@ def propose_argv(found: dict, *, input_kind: str = "config") -> list:
     # output); the delivery layers substitute a real scratch output for OUTPUT_PLACEHOLDER.
     if not placed and found.get("output_positional"):
         argv += [INPUT_PLACEHOLDER, OUTPUT_PLACEHOLDER]
+        placed = True
+    # A dispatch subcommand takes its input as the positional after it (`mutool draw @@`): if no
+    # flag claimed the input, place it there rather than leaving the runner to guess.
+    if not placed and sub:
+        argv.append(INPUT_PLACEHOLDER)
         placed = True
     return argv
 
@@ -658,6 +734,16 @@ _REJECT = re.compile(r"(?i)\b(usage|invalid option|unrecogni[sz]ed|unknown optio
 _FILEERR = re.compile(r"(?i)cannot (find|open|access|read|create|stat)|could not open|"
                       r"no such file|does not exist|unable to open|read-only file|"
                       r"permission denied|not found")
+# The target ENGAGED our input and failed on its CONTENT/FORMAT, not on opening a file -- it got
+# past argument parsing, which is exactly what a correct invocation looks like before fuzzing
+# supplies real bytes. `mutool draw X` on a non-document prints "cannot find document handler for
+# file" (the FILE opened fine; its FORMAT was not recognised), which must NOT be read as a file
+# error. Checked before _FILEERR / _REJECT so a content error overrides their broader phrasing.
+_CONTENT_OK = re.compile(
+    r"(?i)document handler|cannot recognize|unsupported (file|document|format|image|type|filter)|"
+    r"unknown (format|filter|type|encoding|codec)|not a (valid )?\w+ (file|document|image)|"
+    r"bad (magic|header)|sanity check|parse error|syntax error|corrupt|malformed|"
+    r"premature end|decode|invalid \w+ (header|structure|format|stream)")
 
 
 def verify(run, exe, argv, sample_path, *, timeout: float = 10.0) -> dict:
@@ -679,6 +765,8 @@ def verify(run, exe, argv, sample_path, *, timeout: float = 10.0) -> dict:
 
     def _rejected(res, other):
         t = res["text"]
+        if _CONTENT_OK.search(t):                        # engaged our content (format error) -> in
+            return False
         if _REJECT.search(t):                            # usage / invalid option / required / ...
             return True
         if _FILEERR.search(t):                           # named a file it can't find/open -> wrong

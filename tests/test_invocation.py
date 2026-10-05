@@ -271,3 +271,47 @@ def test_verify_accepts_content_error_but_rejects_file_error():
         return _R(9, b"conv: cannot open nope: No such file\n") if argv \
             else _R(2, b"usage: conv in out\n")
     assert not invocation.verify(run_filerr, "c", ["-x", "nope", "@@"], "/s")["accepted"]
+
+
+# ---- subcommand-dispatched tools (tool <command> INPUT): mutool, git, busybox ----------------
+def test_subcommand_dispatch_picks_an_input_reading_command():
+    from lykos.analyze import invocation as inv
+    mutool = ("usage: mutool <command> [options]\n\tclean\t-- rewrite pdf file\n"
+              "\tdraw\t-- convert document\n\tinfo\t-- show information\n\tcreate\t-- create pdf")
+    best, allc = inv.from_subcommands(mutool)
+    assert best == "draw" and "create" in allc            # a reader, not the create command
+    found = inv.discover([], help_text=mutool)
+    assert found["subcommand"] == "draw"
+    assert inv.propose_argv(found) == ["draw", "@@"]       # subcommand first, input after it
+
+
+def test_subcommand_dispatch_handles_git_and_busybox_styles():
+    from lykos.analyze import invocation as inv
+    git = ("usage: git [--version] <command> [<args>]\n   clone     Clone a repository\n"
+           "   log       Show commit logs\n   show      Show objects")
+    assert inv.from_subcommands(git)[0] in ("show", "log")   # a read-only inspector, not clone
+    bb = ("Usage: busybox [function]\nCommands:\n   cat   concatenate files\n"
+          "   ls    list directory\n   tar   archive")
+    assert inv.from_subcommands(bb)[0] == "cat"
+
+
+def test_a_non_dispatch_tool_is_not_given_a_subcommand():
+    from lykos.analyze import invocation as inv
+    # a viewer that takes a file directly (mupdf) must NOT be handed a spurious subcommand
+    assert inv.from_subcommands("usage: mupdf [options] file.pdf [page]")[0] is None
+    assert inv.discover([], help_text="usage: tool [-v] [-o OUT] file").get("subcommand") is None
+
+
+def test_verify_accepts_a_content_format_error_as_engaged():
+    """A parser that opened the input and rejected its FORMAT (mutool's 'cannot find document
+    handler') engaged past the argument gate -- it must not be read as a file-open refusal."""
+    from lykos.analyze import invocation as inv
+
+    class _R:
+        def __init__(s, out, rc): s.stdout, s.stderr, s.exit_code, s.crashed = out, b"", rc, False
+    def run(a):
+        if not a:
+            return _R(b"usage: mutool <command> [options]", 1)      # bare -> usage (rejected)
+        return _R(b"error: cannot find document handler for file: /x/sample", 1)  # engaged
+    v = inv.verify(run, "mutool", ["draw", "@@"], "/x/sample")
+    assert v["accepted"] and v["bare_rejected"]
