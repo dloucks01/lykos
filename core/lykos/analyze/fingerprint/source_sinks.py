@@ -92,6 +92,16 @@ def _split_args(arglist: str) -> list:
     return out
 
 
+_COMMENT = re.compile(r"//[^\n]*|/\*.*?\*/", re.S)
+
+
+def _strip_comments(text: str) -> str:
+    """Blank out C/C++ comments while preserving line structure (so reported line numbers stay
+    correct). A sink mentioned in PROSE -- `builds on top of the system (like for instance ...)` --
+    is not a call; scanning the comment-stripped text removes that whole false-positive class."""
+    return _COMMENT.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), text)
+
+
 def _is_literal(arg: str) -> bool:
     """True if the argument is (or wraps, via i18n) a string literal -- the safe case."""
     a = arg.strip()
@@ -118,6 +128,7 @@ def scan_source(root: Path) -> list:
         except OSError:
             continue
         n += 1
+        text = _strip_comments(text)                       # a sink named in a comment is not a call
         lines = text.splitlines()
         lit_vars = set(_LIT_ASSIGN.findall(text))          # locals assigned a string literal
         for i, ln in enumerate(lines):

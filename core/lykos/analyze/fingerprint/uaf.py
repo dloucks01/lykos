@@ -64,6 +64,15 @@ def _uses(line: str, var: str) -> "str | None":
     return None
 
 
+_COMMENT = re.compile(r"//[^\n]*|/\*.*?\*/", re.S)
+
+
+def _strip_comments(text: str) -> str:
+    """Blank out C/C++ comments, preserving line structure (so line numbers stay correct) -- a
+    `free(p)` written in a comment is not a deallocation."""
+    return _COMMENT.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), text)
+
+
 def _scan_text(name: str, lines: list) -> list:
     findings: list = []
     freed: dict = {}          # var -> (line_index, dealloc_name)
@@ -102,7 +111,17 @@ def _scan_text(name: str, lines: list) -> list:
         if depth <= 0:
             depth = 0
             freed = {}
+        # 4) an UNCONDITIONAL control-flow exit ends the branch the free was on: `if(err){ free(p);
+        # return; } use(p);` is NOT a use-after-free (the free's path returned). Clear the dangling
+        # set on a bare return/goto/break/continue (statement at line start). A CONDITIONAL exit
+        # (`if(x) return;`) is NOT treated this way -- the free may still reach the fall-through, so
+        # a real `free(a); if(x) return; use(a);` is kept. A `return p;` was scored as a use above.
+        elif _EXIT.match(ln.lstrip()):
+            freed = {}
     return findings
+
+
+_EXIT = re.compile(r"(return|goto|break|continue)\b")
 
 
 def _mk(name, free_line, use_line, var, dealloc, cwe, label, detail_tail) -> dict:
@@ -129,7 +148,7 @@ def scan_source(root: Path) -> list:
         try:
             if p.stat().st_size > _MAX_FILE:
                 continue
-            lines = p.read_text("utf-8", "replace").splitlines()
+            lines = _strip_comments(p.read_text("utf-8", "replace")).splitlines()
         except OSError:
             continue
         n += 1
