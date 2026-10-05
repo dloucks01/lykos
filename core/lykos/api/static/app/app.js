@@ -5,6 +5,7 @@
 import { h, render } from "preact";
 import { useState, useEffect, useRef, useCallback } from "preact/hooks";
 import { api, waitForRun } from "./api.js";
+import { isFolderPick, folderArchive } from "./archive.js";
 import { runAutopilotCase, newController, cancel as cancelAutopilot, coverageOf } from "./autopilot.js";
 import { rankFindings, pocsForFinding, fmtTime, progressText, stageLabel, dedupeFindings, buildRunLog, buildVerdicts, filterByViz } from "./util.js";
 import {
@@ -458,10 +459,23 @@ function App() {
 
   // Upload one or more files. `append` adds to the current case; otherwise it starts fresh.
   const onFiles = useCallback(async (fileList, append = false) => {
-    const files = Array.from(fileList || []);
+    let files = Array.from(fileList || []);
     if (!files.length) return;
     setError(null);
     setUploading(true);
+    // A FOLDER pick (a source tree) comes back as many files with relative paths. Pack the whole
+    // tree into one archive client-side and upload THAT -- the server ingests it as a source
+    // project (dependency-CVE + the source bug scanners), which is the point of a folder upload.
+    try {
+      if (isFolderPick(fileList)) {
+        pushLog({ tone: "ok", text: `Packing ${files.length} files into a source archive…` });
+        files = [await folderArchive(fileList)];
+      }
+    } catch (e) {
+      setUploading(false);
+      setError(`could not pack the folder: ${e.message || e}`);
+      return;
+    }
     if (!append) { setLog([]); setFindings([]); setPocs([]); setAdvice(null); setRan(false); setUnavailable([]); setSysmap(null); setCoverage({}); setVerifications({}); setBg(null); bgPollRef.current++; bgEventsAfter.current = -1; }
     try {
       const cid = await ensureCase();

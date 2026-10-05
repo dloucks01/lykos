@@ -81,16 +81,27 @@ export function DropZone({ onFiles, busy, compact }) {
   const setDrag = (el, on) => { if (el && el.classList) el.classList.toggle("drag", !!on && !busy); };
   const onDrop = (e) => { e.preventDefault(); setDrag(e.currentTarget, false); if (!busy) take(e.dataTransfer && e.dataTransfer.files); };
   const onPick = (e) => { take(e.target.files); e.target.value = ""; };
+  // A folder pick is a SOURCE TREE: the whole directory is packed and uploaded as a source
+  // project (dependency-CVE + the source bug scanners). Browsers expose it via `webkitdirectory`.
+  const folderRef = { current: null };
+  const onPickFolder = (e) => { take(e.target.files); e.target.value = ""; };
   return html`
     <label class=${`dropzone${busy ? " busy" : ""}${compact ? " compact" : ""}`}
            onDragOver=${(e) => { e.preventDefault(); setDrag(e.currentTarget, true); }}
            onDragLeave=${(e) => setDrag(e.currentTarget, false)} onDrop=${onDrop}>
       <input type="file" multiple class="visually-hidden" onChange=${onPick} disabled=${busy}
         aria-label=${compact ? "Add binaries or firmware to this case" : "Choose binaries or firmware images to analyse"} />
+      <input type="file" webkitdirectory directory multiple class="visually-hidden" disabled=${busy}
+        ref=${(el) => (folderRef.current = el)} onChange=${onPickFolder}
+        aria-label="Choose a source-code folder to analyse" />
       <div class="dz-inner">
         <div class="dz-icon">⇪</div>
         <div class="dz-title">${compact ? "Add more binaries to this case" : "Drop one or more binaries or firmware images here"}</div>
         <div class="dz-sub">${compact ? "several binaries unlock IPC modelling and cross-binary taint" : "or click to choose files — analysis starts on the next click"}</div>
+        <button type="button" class="dz-folder" disabled=${busy}
+          onClick=${(e) => { e.preventDefault(); e.stopPropagation(); if (folderRef.current) folderRef.current.click(); }}>
+          ${compact ? "+ source folder" : "📁 or choose a source-code folder (analyse the whole tree)"}
+        </button>
       </div>
     </label>`;
 }

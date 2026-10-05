@@ -68,6 +68,10 @@
   .dz-icon { font-size: 2.4rem; color: var(--accent); }
   .dz-title { font-size: 1.15rem; font-weight: 600; margin-top: 8px; }
   .dz-sub { color: var(--muted); font-size: .9rem; margin-top: 4px; }
+  .dz-folder { margin-top: 12px; background: var(--panel-2); color: var(--fg); border: 1px solid var(--line);
+    border-radius: 8px; padding: 7px 14px; font-size: .88rem; cursor: pointer; }
+  .dz-folder:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+  .dz-folder:disabled { opacity: .5; cursor: default; }
 
   /* Target summary + CTA */
   .run-panel { display: flex; flex-direction: column; gap: 16px; }
