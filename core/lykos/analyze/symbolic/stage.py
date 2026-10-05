@@ -117,8 +117,35 @@ def _choose_backend(p, target):
     return None, None, None
 
 
+def _frame_sized_input(ctx, target, fallback=64, cap=4096):
+    """How many symbolic input bytes concolic needs to EXPRESS a stack overflow on this target.
+
+    A fixed 64-byte symbolic input can satisfy an input gate (a magic token) but can never
+    generate a return-address-smashing input for a buffer larger than 64 bytes -- so concolic
+    solved a `strstr(input,"TOKEN")` input gate yet stopped short of the overflow, because the
+    vulnerable buffer sat 136 bytes from the saved return address and the symbolic input was 64.
+    Size it from the largest recovered frame offset (buffer + saved regs + return slot) so the
+    solved input can reach unconstrained-IP in one shot, bounded by `cap` to keep angr tractable.
+    Best-effort: any failure (no frames recovered, not disassembled) falls back to the default."""
+    try:
+        from ..poc import primitive
+        from ..poc.primitive_stage import _hydrate_frames
+        word = 8 if (target.bits or 64) >= 64 else 4
+        frames = _hydrate_frames(ctx, target.id, target)
+        cands = primitive.frame_offset_candidates(frames, word)
+        offs = [int(c["offset"]) for c in cands if isinstance(c, dict) and c.get("offset")]
+        if not offs:
+            return fallback
+        # the offset is to the return slot; cover it plus the saved return address, with a little
+        # slack so the smash lands past it rather than exactly on its first byte.
+        need = max(offs) + 2 * word + 16
+        return max(fallback, min(need, cap))
+    except Exception:                                        # noqa: BLE001 -- sizing is an optimisation
+        return fallback
+
+
 def _run_angr(ctx, target, exe, mode, p, py):
-    input_size = int(p.get("input_size", 64))
+    input_size = int(p["input_size"]) if p.get("input_size") else _frame_sized_input(ctx, target)
     max_seconds = int(p.get("max_seconds", 120))
     if p.get("targets"):
         targets = list(p["targets"])
@@ -185,9 +212,12 @@ def concolic_stage(ctx) -> dict:
             "and symqemu (LYKOS_SYMQEMU / vendored / PATH) were both not found. Install one, "
             "or use the fuzzing stages instead.")
 
-    exe = ctx.scratch() / "target.bin"
-    exe.write_bytes(ctx.content.path(target.sha256).read_bytes())
-    exe.chmod(0o755)
+    # Stage the binary WITH its bundled deps (a bundled ./glibc/ loader + libc), not a bare
+    # write: a concolic-solved input that reaches unconstrained-IP still records "no crash" if the
+    # detonation cannot load the binary, because a relative ELF interpreter needs its loader staged
+    # beside it. stage_target lays the deps out at their relative paths (and patchelf's the interp
+    # where available); the sandbox chdirs into this dir so ./glibc/ld-... resolves.
+    exe = ctx.content.stage_target(target, ctx.scratch(), "target.bin")
     workfile = ctx.scratch() / "input.bin"
 
     # Exploration is best-effort: angr can time out (stuck deep in a single step) or a backend can

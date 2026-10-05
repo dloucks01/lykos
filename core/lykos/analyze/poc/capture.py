@@ -100,6 +100,18 @@ MODES = ("stdin", "file", "arg")
 _STDIN_FUNCS = {"read", "fgets", "gets", "scanf", "__isoc99_scanf", "fread", "getchar",
                 "getline", "getc", "fgetc"}
 _FILE_FUNCS = {"fopen", "fopen64", "open", "open64", "freopen"}
+# Interactive-stdin primitives: raw read(2), gets, the scanf family, getchar, getline. Their
+# presence means the program takes its ATTACKER input from stdin, so stdin outranks a file
+# channel even when the binary ALSO opens a file -- which, for this class of target, is usually
+# an internal resource opened by a constant name (a program `open`s a fixed file like "flag.txt"; a service
+# reads stdin yet opens a log/config). Deliberately EXCLUDES fgets/fread/getc/fgetc: a file
+# parser reads its own FILE* with exactly those, so they must not pull ranking toward stdin
+# (jhead is fopen+fread; the real-gate arm_config fixture is fopen+fgets). Without this split a
+# binary that merely reads its flag file was classed as file-input and every stdin payload --
+# the real channel -- was delivered where the program never reads it (a stdin reader that also opens a fixed file: concolic
+# solved the gate to unconstrained-IP, then the input was dumped as an unread file of zeros).
+_STDIN_INTERACTIVE = {"read", "gets", "scanf", "__isoc99_scanf", "getchar", "getchar_unlocked",
+                      "getline"}
 
 
 def modes_for(call_edges, given=None):
@@ -107,16 +119,24 @@ def modes_for(call_edges, given=None):
 
     Ranked by the input functions the binary actually imports, because "default to stdin" is
     a coin flip that loses on most real targets: a file parser reads nothing from stdin, so a
-    campaign or a probe aimed there does no work at all and reports a clean zero.
+    campaign or a probe aimed there does no work at all and reports a clean zero. When a binary
+    exposes BOTH channels (it opens a file and reads stdin), an interactive-stdin primitive
+    breaks the tie toward stdin -- the file is then almost always an internal resource, not the
+    input -- while a pure stdio file-reader (fread/fgets on a FILE*) keeps file first.
     """
     from ..detect.catalog import normalize
     if given:
         return [given]
     names = {normalize(e.dst_name) for e in call_edges if e.dst_name}
-    ordered = []
-    if names & _FILE_FUNCS:
+    has_file = bool(names & _FILE_FUNCS)
+    has_stdin = bool(names & _STDIN_FUNCS)
+    interactive = bool(names & _STDIN_INTERACTIVE)
+    ordered: list = []
+    if has_file and has_stdin:
+        ordered += ["stdin", "file"] if interactive else ["file", "stdin"]
+    elif has_file:
         ordered.append("file")
-    if names & _STDIN_FUNCS:
+    elif has_stdin:
         ordered.append("stdin")
     ordered.append("arg")
     for m in MODES:                          # ensure every channel is attempted

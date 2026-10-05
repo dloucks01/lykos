@@ -502,6 +502,61 @@ def _is_sanitizer_exe(exe) -> bool:
     return hit
 
 
+_INTERP_CACHE: dict = {}
+
+
+def _relative_interp(exe) -> bool:
+    """True if the ELF at `exe` names a RELATIVE program interpreter (e.g. ./glibc/ld-linux.so).
+
+    A relocated bundle (and much firmware) ships its own loader + libc and patchelf's the binary to
+    a relative interpreter path, which the kernel resolves against the process CWD. The sandbox
+    otherwise chdirs to its own tmpfs /tmp, where that path does not exist, so the loader is never
+    found and the program exits before main() -- turning every input into a silent no-op. The
+    caller uses this to chdir the sandbox into the staged bundle directory instead.
+
+    Cached by (path, mtime, size): run() is called thousands of times on one exe."""
+    try:
+        st = os.stat(exe)
+        key = (str(exe), st.st_mtime_ns, st.st_size)
+    except OSError:
+        return False
+    hit = _INTERP_CACHE.get(key)
+    if hit is None:
+        hit = False
+        try:
+            with open(exe, "rb") as fh:
+                head = fh.read(64)
+                if head[:4] == b"\x7fELF":
+                    is64 = head[4] == 2
+                    en = "<" if head[5] == 1 else ">"      # EI_DATA: 1=LE, 2=BE
+                    if is64:
+                        phoff = struct.unpack_from(en + "Q", head, 0x20)[0]
+                        phentsize, phnum = struct.unpack_from(en + "HH", head, 0x36)
+                        toff, tsz = 8, 32                  # p_offset, p_filesz within a 64-bit phdr
+                    else:
+                        phoff = struct.unpack_from(en + "I", head, 0x1C)[0]
+                        phentsize, phnum = struct.unpack_from(en + "HH", head, 0x2A)
+                        toff, tsz = 4, 16                  # p_offset, p_filesz within a 32-bit phdr
+                    for i in range(min(phnum, 64)):
+                        fh.seek(phoff + i * phentsize)
+                        ph = fh.read(phentsize)
+                        if len(ph) < phentsize or struct.unpack_from(en + "I", ph, 0)[0] != 3:
+                            continue                       # not PT_INTERP
+                        fmt = en + ("Q" if is64 else "I")
+                        p_off = struct.unpack_from(fmt, ph, toff)[0]
+                        p_fsz = struct.unpack_from(fmt, ph, tsz)[0]
+                        fh.seek(p_off)
+                        interp = fh.read(min(p_fsz, 4096)).split(b"\x00", 1)[0]
+                        hit = bool(interp) and not interp.startswith(b"/")
+                        break
+        except Exception:                                  # noqa: BLE001 -- unreadable/odd ELF
+            hit = False
+        if len(_INTERP_CACHE) > 256:
+            _INTERP_CACHE.clear()
+        _INTERP_CACHE[key] = hit
+    return hit
+
+
 def _killpg(p):
     try:
         os.killpg(os.getpgid(p.pid), signal.SIGKILL)
@@ -524,7 +579,7 @@ def _bwrap_probe_fresh() -> bool:
         return False
 
 
-def isolate_prefix(exedir: str, *, net: bool, ro_binds=(), rw_binds=()) -> list:
+def isolate_prefix(exedir: str, *, net: bool, ro_binds=(), rw_binds=(), chdir: str = "") -> list:
     """bwrap argv prefix that contains a target for the debug/PoC paths that spawn it directly
     (the gdb stub, the native gdb tools, the leak harness). Read-only root (with /home and /root
     masked), tmpfs /tmp, pid namespace and die-with-parent, plus the target's own directory
@@ -547,6 +602,12 @@ def isolate_prefix(exedir: str, *, net: bool, ro_binds=(), rw_binds=()) -> list:
         cmd += ["--ro-bind", str(d), str(d)]
     for d in rw_binds:
         cmd += ["--bind", str(d), str(d)]
+    # A staged bundle with a RELATIVE ELF interpreter (./glibc/ld-...) only loads when the sandbox
+    # CWD is the dir holding it; the base args chdir to the tmpfs /tmp where ./glibc does not exist,
+    # so the target dies before main. `chdir` (last --chdir wins) points the sandbox INTO the staged
+    # dir -- pass it (usually == exedir, which rw_binds also makes writable) for such a target.
+    if chdir:
+        cmd += ["--chdir", str(chdir)]
     return cmd + ["--"]
 
 
@@ -969,7 +1030,18 @@ def run(exe, *, argv=(), stdin: bytes = b"", timeout: float = 10.0,
         # to the rlimits-only tier: no network namespace and no read-only root, precisely
         # where it matters most (running hostile code on the host CPU).
         exedir = str(Path(exe).resolve().parent)
-        extra = _secret_mask_args() + ["--ro-bind", exedir, exedir]
+        # A binary with a RELATIVE ELF interpreter (./glibc/ld-...: the patchelf'd layout of a
+        # relocated bundle, and of much firmware) resolves its loader against the CWD, but the
+        # sandbox chdirs to its own tmpfs /tmp where that path does not exist -- so the loader is
+        # never found and the program exits before main(), making every input a silent no-op.
+        # The caller stages the binary WITH its bundled deps beside it (stage_target), so bind that
+        # directory WRITABLE and chdir the sandbox into it: now ./glibc/ld-... resolves and a target
+        # that writes relative to cwd (into the throwaway staged dir) still works. Without this, no
+        # glibc-bundled target can be executed at all.
+        rel_interp = _relative_interp(exe)
+        extra = _secret_mask_args() + (
+            ["--bind", exedir, exedir, "--chdir", exedir]   # last --chdir wins over base --chdir /tmp
+            if rel_interp else ["--ro-bind", exedir, exedir])
         if trace_log:
             # qemu writes its block log to a FILE, and /tmp inside the sandbox is a private
             # tmpfs -- the log is created there and gone the moment the sandbox exits, which
