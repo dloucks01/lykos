@@ -179,3 +179,19 @@ def test_instrumented_mode_runs_the_native_arch_without_a_qemu_trace(monkeypatch
     other = "aarch64" if host != "aarch64" else "x86-64"
     why = _unsupported(_T(arch=other), use_qemu=False)
     assert why and "natively" in why                                     # cross-arch declines
+
+
+def test_input_suffix_votes_the_format_extension_from_seeds():
+    """A parser that selects its handler by file EXTENSION (mutool, ImageMagick, ...) rejects AFL's
+    extensionless .cur_input as an unknown format -- so the campaign must give the input file the
+    extension the seeds imply, voted by magic. The commonest format wins; unknown bytes abstain."""
+    from lykos.analyze.fuzz import aflpp
+    assert aflpp.input_suffix([b"%PDF-1.7\n...", b"%PDF-1.4\n..."]) == ".pdf"
+    assert aflpp.input_suffix([b"\x89PNG\r\n\x1a\n\x00\x00"]) == ".png"
+    assert aflpp.input_suffix([b"GIF89a....", b"GIF87a...."]) == ".gif"
+    assert aflpp.input_suffix([b"RIFF\x00\x00\x00\x00WEBPVP8 "]) == ".webp"
+    # majority vote: two PDFs beat one PNG
+    assert aflpp.input_suffix([b"%PDF a", b"%PDF b", b"\x89PNG\r\n\x1a\n"]) == ".pdf"
+    # no recognisable magic -> abstain (keep the extensionless default)
+    assert aflpp.input_suffix([b"just some random text", b"\x01\x02\x03\x04"]) == ""
+    assert aflpp.input_suffix([]) == ""

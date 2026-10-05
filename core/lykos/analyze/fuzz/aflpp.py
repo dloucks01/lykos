@@ -159,21 +159,55 @@ def is_sanitizer_build(data: bytes) -> bool:
     return b"__asan_init" in data or b"__asan_report" in data or b"__ubsan_handle" in data
 
 
+# Leading-bytes -> the file EXTENSION a format sniffer expects. Many parsers (mutool/ImageMagick/
+# ffmpeg/...) pick their handler from the input's EXTENSION, and AFL's `.cur_input` has none -- so
+# every mutation is rejected as an unknown format and the campaign never enters the parser. Giving
+# AFL's input file the right suffix fixes it. Low-FP magics only.
+_MAGIC_SUFFIX = [
+    (b"%PDF", ".pdf"), (b"\x89PNG\r\n\x1a\n", ".png"), (b"\xff\xd8\xff", ".jpg"),
+    (b"GIF87a", ".gif"), (b"GIF89a", ".gif"), (b"II*\x00", ".tif"), (b"MM\x00*", ".tif"),
+    (b"BM", ".bmp"), (b"RIFF", ".webp"), (b"\x00\x00\x01\x00", ".ico"), (b"PK\x03\x04", ".zip"),
+    (b"\x1f\x8b", ".gz"), (b"\xfd7zXZ\x00", ".xz"), (b"OggS", ".ogg"), (b"fLaC", ".flac"),
+    (b"\x00\x00\x00\x18ftyp", ".mp4"), (b"<?xml", ".xml"), (b"<svg", ".svg"), (b"{", ".json"),
+]
+
+
+def input_suffix(seeds) -> str:
+    """The input-file extension a format sniffer expects, voted from the seed corpus (most common
+    magic wins). Empty when no seed matches a known magic -- then the current extension-less
+    behaviour is kept."""
+    from collections import Counter
+    votes: Counter = Counter()
+    for s in seeds or []:
+        for magic, suf in _MAGIC_SUFFIX:
+            if s[:len(magic)] == magic or (magic == b"RIFF" and s[:4] == b"RIFF" and s[8:12] == b"WEBP"):
+                votes[suf] += 1
+                break
+    return votes.most_common(1)[0][0] if votes else ""
+
+
 def run_campaign(afl: Path, exe, seeds_dir, out_dir, *, seconds: int = 30,
                  mode: str = "file", qemu: bool = True, afl_path: Optional[str] = None,
-                 cmplog: Optional[Path] = None, argv_template=None):
+                 cmplog: Optional[Path] = None, argv_template=None, input_file=None):
     # NOTE: AFL keeps its default memory cap here. Sanitizer builds (which need `-m none`) are
     # deliberately NOT run through this path -- an uncapped run OOM'd the host -- they are fuzzed
     # by the sandbox `fuzz`/`directed_fuzz` stages under rlimits instead (see coverage_stage).
     # `argv_template` is the discovered invocation (e.g. ['draw', '@@'] for `mutool draw @@`): a
     # dispatch/parameter-driven tool parses nothing without it, so AFL would fuzz only the usage
     # banner. AFL recognises the literal '@@' as the input-file slot; for stdin mode there is none.
+    # AFL writes each test case to `.cur_input` (no extension) unless `-f FILE` is given. An
+    # extension-sniffing parser (mutool, ImageMagick, ...) rejects an extensionless file as an
+    # unknown format, so the whole campaign bounces off the front door; `input_file` (e.g.
+    # `.../afl_input.pdf`) makes AFL write to a path WITH the right suffix, which @@ then points at.
+    slot = str(input_file) if input_file else "@@"
     if argv_template:
-        tail = [str(a) for a in argv_template if not (mode != "file" and a == "@@")]
+        tail = [(slot if a == "@@" else str(a)) for a in argv_template
+                if not (mode != "file" and a == "@@")]
         target = [str(exe)] + tail
     else:
-        target = [str(exe)] + (["@@"] if mode == "file" else [])
-    cmd = [str(afl)] + (["-Q"] if qemu else []) + \
+        target = [str(exe)] + ([slot] if mode == "file" else [])
+    ffile = ["-f", str(input_file)] if input_file else []
+    cmd = [str(afl)] + (["-Q"] if qemu else []) + ffile + \
         ["-i", str(seeds_dir), "-o", str(out_dir), "-V", str(int(seconds)), "--"] + target
     env = dict(os.environ)
     if afl_path:

@@ -225,6 +225,13 @@ def coverage_stage(ctx) -> dict:
     for i, s in enumerate(seeds):
         (seeds_dir / f"seed{i:04d}").write_bytes(s or b"\n")
     out_dir = ctx.scratch() / "afl-out"
+    # Give AFL's input file the EXTENSION the format expects (voted from the seeds). A parser that
+    # picks its handler by extension (mutool, ImageMagick, ...) rejects AFL's extensionless
+    # `.cur_input` as an unknown format -- the whole campaign then bounces off the front door and
+    # climbs no coverage. The replay workfile below gets the SAME suffix, or a found crash would not
+    # reproduce (and would be dropped).
+    suffix = aflpp.input_suffix(seeds) if mode == "file" else ""
+    input_file = (ctx.scratch() / f"afl_input{suffix}") if suffix else None
 
     # Discover the real invocation so AFL drives the PARSER, not the usage banner: a dispatch or
     # parameter-driven tool (`mutool draw @@`, a service behind `-c @@`) parses nothing run as
@@ -243,7 +250,8 @@ def coverage_stage(ctx) -> dict:
     ctx.emit("coverage.start", payload={"backend": "aflpp", "seconds": seconds,
                                         "afl": str(afl)})
     proc = aflpp.run_campaign(afl, exe, seeds_dir, out_dir, seconds=seconds, afl_path=afl_path,
-                              mode=mode, qemu=use_qemu, argv_template=argv_template)
+                              mode=mode, qemu=use_qemu, argv_template=argv_template,
+                              input_file=input_file)
     if proc.returncode != 0 and not (out_dir / "default").exists() \
             and not (out_dir / "crashes").exists():
         tail = (proc.stderr or b"")[-800:].decode("latin-1", "ignore")
@@ -268,7 +276,7 @@ def coverage_stage(ctx) -> dict:
 
     fd = FindingDAO(ctx.conn)
     dd = DynResultDAO(ctx.conn)
-    workfile = ctx.scratch() / "input.bin"
+    workfile = ctx.scratch() / f"input{suffix or '.bin'}"   # same extension the parser sniffs on
     seen_crashes = set()
     confirmed = 0
     # Recover blocks once so a crash replay can capture a FAULT LOCUS. Without it every AFL crash

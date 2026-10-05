@@ -511,9 +511,15 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
     exe = ctx.scratch() / "target.bin"
     ctx.content.stage_target(target, exe.parent, exe.name)
     os.chmod(exe, 0o755)
-    workfile = ctx.scratch() / "input.bin"
 
     corpus = list(corpus) or list(_DEFAULT_SEEDS)
+    # Give the delivered input file the EXTENSION its format implies (voted from the corpus): a
+    # parser that selects its handler by extension (mutool, ImageMagick, ...) rejects an
+    # extensionless file outright, so every mutation would bounce off the front door and the
+    # campaign would never enter the parser.
+    from . import aflpp
+    _suffix = aflpp.input_suffix(corpus) if mode == "file" else ""
+    workfile = ctx.scratch() / f"input{_suffix or '.bin'}"
     # A numbered-menu service hides its bug behind a state machine: junk input never selects a valid
     # option, so a blind campaign runs its whole budget parked at the front-door menu. Learn the menu
     # by driving the live target ONCE, then use that model two ways -- seed the corpus with typed
