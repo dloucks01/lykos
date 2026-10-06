@@ -622,6 +622,16 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict, stop: t
                 if heap_menu:
                     _run_target_stage(store, t, "build_exploit", status, stop,
                                       {"strategy": "heap"})
+            # Leak-centric weaponization WITHOUT a crash. A modern-hardened target (PIE / stack
+            # canary / full RELRO) rarely yields a blind-mutation crash -- the fuzzer reports clean --
+            # yet strategy="auto" PROVOKES its own leak (a %p/%s over-read behind the input prompts,
+            # a format sink) and drives the canary-bypass ret2win/ret2libc, the format-%n saved-return
+            # overwrite, or files the demonstrated ASLR info-leak (L2) when no shell is reachable.
+            # build_exploit's auto path otherwise runs only for a crash (above), so a hardened target
+            # with no fuzzer crash topped out with nothing. The stage self-gates per arch/mitigation
+            # and reports honest ceilings, so this is a bounded attempt, not a false positive.
+            if not stop.is_set() and _max_verified_poc_level(store, tid) < 3:
+                _run_target_stage(store, t, "build_exploit", status, stop, {"strategy": "auto"})
             # Review each demonstrated finding: replay its input several times so a flaky crash is
             # flagged rather than trusted, and a reopened case carries the verdict. Verified-PoC
             # inputs come first (never dropped), then any distinct crash; capped so a target with
