@@ -111,12 +111,22 @@ _IDX_KW = re.compile(r"(\bid\b|\bidx\b|index|\bslot\b|\bentry\b|position|\bpos\b
                      r"\bno\.?\b|\bpage\b)", re.I)
 
 
-def classify_prompt(text: str) -> str:
-    """Field type a prompt asks for: 'idx' (array index / id), 'num' (a size/count) or 'str'.
+_YN_KW = re.compile(r"\by\s*/\s*n\b|\byes\s*/\s*no\b|\(\s*y\s*/\s*n\s*\)|\[\s*y\s*/\s*n\s*\]"
+                    r"|would you like|\bconfirm\b|\(y\)es|proceed\?", re.I)
 
-    A size keyword (num) wins over a bare index word so "Note size" is a size; an explicit index
-    word (id/index/slot) with no size keyword is an index; everything else is a string."""
+
+def classify_prompt(text: str) -> str:
+    """Field type a prompt asks for: 'yn' (a yes/no confirmation), 'idx' (array index / id), 'num'
+    (a size/count) or 'str'.
+
+    A yes/no confirmation is checked FIRST: a `would you like ... ? (y/n)` prompt answered with a
+    typed string or a number gets rejected ("only y/n permitted") and the option never completes, so
+    the crawl never models it -- exactly why a create flow with a save/continue confirmation stayed
+    invisible. A size keyword (num) then wins over a bare index word so "Note size" is a size; an
+    explicit index word (id/index/slot) with no size keyword is an index; everything else is a string."""
     t = str(text or "")
+    if _YN_KW.search(t):
+        return "yn"
     has_num, has_idx = _NUM_KW.search(t), _IDX_KW.search(t)
     if has_num:
         return "num"
@@ -148,7 +158,19 @@ def _looks_like_menu(text: str) -> bool:
     return len(detect_menu([text])) >= 2
 
 
-_VALUE = {"idx": b"1", "num": b"16", "str": b"AAAA"}
+_VALUE = {"idx": b"1", "num": b"16", "str": b"AAAA", "yn": b"y"}
+
+# A y/n that asks whether to CONTINUE / repeat / keep processing is answered NO -- answering yes loops
+# the option back on itself (it never returns to the menu, so the crawl can't model it). Everything
+# else (save?/confirm?/sure?) is answered YES to let the operation complete.
+_YN_NO = re.compile(r"\b(continue|again|more|another|keep going|retry|repeat|re-?process|processing)\b",
+                    re.I)
+
+
+def yn_answer(text) -> bytes:
+    """The y/n answer that lets an option COMPLETE: 'n' to a continue/repeat prompt (yes would loop),
+    'y' otherwise."""
+    return b"n" if _YN_NO.search(str(text or "")) else b"y"
 
 
 # --- field encoding: line-delimited by default, or FIXED-WIDTH for a read(fd, buf, W) protocol ---
@@ -200,11 +222,14 @@ def drive_to_menu(proc, sel, *, idle: float, deadline: float, width=None, tries:
     for _ in range(tries):
         if _looks_like_menu(out) or not alive:
             break
-        ftype = classify_prompt(_tail_prompt(out))
+        prompt = _tail_prompt(out)
+        ftype = classify_prompt(prompt)
         if ftype == "num":
             send = _scalar(_VALUE["num"], width)
         elif ftype == "idx":
             send = _scalar(_VALUE["idx"], width)
+        elif ftype == "yn":
+            send = _scalar(yn_answer(prompt), width)
         else:
             send = _data(_VALUE["str"], width)
         try:
@@ -233,8 +258,10 @@ def crawl_menu(spawn, options, *, max_fields: int = 10, idle: float = 0.2,
             proc = spawn()
             sel = selectors.DefaultSelector()
             sel.register(proc.stdout, selectors.EVENT_READ)
+            # Pass any pre-menu gate FIRST, then start the per-option budget -- the name-gate
+            # navigation must not eat into the time to crawl the option's own fields.
+            drive_to_menu(proc, sel, idle=idle, deadline=time.monotonic() + per_option, width=width)
             deadline = time.monotonic() + per_option
-            drive_to_menu(proc, sel, idle=idle, deadline=deadline, width=width)  # pass any name gate
             try:
                 proc.stdin.write(_scalar(opt.encode(), width))
                 proc.stdin.flush()
@@ -250,16 +277,23 @@ def crawl_menu(spawn, options, *, max_fields: int = 10, idle: float = 0.2,
                     break
                 if not alive:
                     break
-                ftype = classify_prompt(_tail_prompt(out))
-                fields.append(ftype)
+                prompt = _tail_prompt(out)
+                ftype = classify_prompt(prompt)
                 if ftype == "num":
                     last_num = int(_VALUE["num"])
                     send = _scalar(_VALUE["num"], width)
+                    fields.append(ftype)
                 elif ftype == "idx":
                     send = _scalar(_VALUE["idx"], width)
+                    fields.append(ftype)
+                elif ftype == "yn":                      # context-sensitive: 'n' to a continue/repeat
+                    ans = yn_answer(prompt)              # prompt (else it loops), 'y' to save/confirm
+                    send = _scalar(ans, width)
+                    fields.append("yn=" + ans.decode())  # record the answer so replay matches
                 else:                                    # a data buffer sized to a preceding size
                     payload = b"A" * last_num if (width and last_num) else _VALUE["str"]
                     send = _data(payload, width)
+                    fields.append(ftype)
                 try:
                     proc.stdin.write(send)
                     proc.stdin.flush()

