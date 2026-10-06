@@ -1592,6 +1592,50 @@ def _le_pointer_words(data: bytes, cap: int = 256) -> list:
     return out
 
 
+def _case_fold_pointer_candidates(data: bytes, *, cap: int = 4096) -> list:
+    """Candidate pointer VALUES recovered from a leak the viewer CASE-FOLDED on output (a `funkify`
+    / toupper / tolower echo). A byte in [A-Za-z] loses its case, so a leaked pointer's letter bytes
+    are ambiguous -- and crucially the image top byte 0x55 ('U') / 0x56 ('V') can arrive LOWERCASED
+    as 0x75 ('u') / 0x76 ('v'), which `_le_pointer_words` (looking for 0x55/0x56/0x7f) would miss.
+
+    For every 6-byte little-endian run whose top byte is 0x55/0x56/0x7f OR the case-folded 0x75/0x76,
+    un-fold the top byte and enumerate the case variants of the lower-5 alpha bytes (the ambiguity),
+    yielding each candidate address. A real pointer's page offset still matches a unique image anchor,
+    so recover_pie_base(allow_single) / classify_leak pick the true one; the bogus case-variants fail
+    corroboration. Bounded (<= 2**5 variants per run) so the brute stays tiny. Transform-agnostic: it
+    does not need to know the exact fold rule, only that case was lost."""
+    import itertools
+    tops = {0x7F: 0x7F, 0x55: 0x55, 0x56: 0x56, 0x75: 0x55, 0x76: 0x56}
+    out, seen = [], set()
+    for i in range(0, max(0, len(data) - 5)):
+        top = tops.get(data[i + 5])
+        if top is None:
+            continue
+        low = data[i:i + 5]
+        # per-byte case variants of the low 5 bytes (letters -> {upper, lower}); non-letters fixed
+        choices = []
+        for b in low:
+            if 0x41 <= b <= 0x5A:
+                choices.append((b, b + 0x20))
+            elif 0x61 <= b <= 0x7A:
+                choices.append((b, b - 0x20))
+            else:
+                choices.append((b,))
+        nvar = 1
+        for c in choices:
+            nvar *= len(c)
+        if nvar > 64:                                    # too ambiguous -> keep only the raw reading
+            choices = [(c[0],) for c in choices]
+        for combo in itertools.product(*choices):
+            v = int.from_bytes(bytes(combo) + bytes([top]), "little")
+            if v not in seen:
+                seen.add(v)
+                out.append(v)
+            if len(out) >= cap:
+                return out
+    return out
+
+
 # --- automatic leak classification + provocation (gap #2) ---------------------------------------
 def _le_canary_words(data: bytes, cap: int = 64) -> list:
     """8-byte words in `data` shaped like a glibc stack canary -- low byte 0x00, the rest non-zero,

