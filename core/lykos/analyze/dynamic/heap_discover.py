@@ -178,7 +178,8 @@ def _drive(workdir: Path, exe: Path, writes: list, *, timeout: float = 10.0, idl
         sel = selectors.DefaultSelector()
         sel.register(p.stdout, selectors.EVENT_READ)
         end = _t.monotonic() + timeout
-        menu._drain(p, sel, idle=idle, deadline=min(end, _t.monotonic() + 1.5))   # banner
+        # banner + pass any pre-menu prompt (a name/username gate) so writes land on the menu
+        menu.drive_to_menu(p, sel, idle=idle, deadline=min(end, _t.monotonic() + 2.0))
         for w in writes:
             if _t.monotonic() >= end:
                 break
@@ -210,20 +211,30 @@ def identify_heap_ops(workdir: Path, exe: Path, model: dict, opts: list, width) 
 
     Returns {"add","free","view"} or None when any role is missing."""
     add = next((o for o in opts if o in model and menu._is_alloc(model[o])), None)
-    frees = [o for o in opts if o in model and model[o] == ["idx"]]
-    free = frees[0] if frees else None
-    if not (add and free):
+    idx_only = [o for o in opts if o in model and model[o] == ["idx"]]
+    if not (add and idx_only):
         return None
-    marker = b"MK_" + os.urandom(5).hex().encode() + b"_UAF"
-    # candidates that take an index and could print: idx-leading options other than the free op
-    cands = [o for o in opts if o in model and model[o][:1] == ["idx"] and o != free]
+    # VIEW is the idx-op that ECHOES a stored chunk; FREE is an idx-op that does not. They often have
+    # the IDENTICAL template (["idx"]), so the roles can only be told apart by PROBING -- don't assume
+    # free is the first one (that mislabels view as free when view happens to come first in the menu).
+    # An all-DIGIT marker survives a case transform (a target that toupper/tolower/"funkify"s stored
+    # text mangles letters; digits are invariant), and we compare case-insensitively as a backstop.
+    marker = str(int.from_bytes(os.urandom(8), "big")).encode()[:16]
+    cands = [o for o in opts if o in model and model[o][:1] == ["idx"]]
+    view = None
     for cand in cands:
         writes = _op_writes(add, model[add], width, idx=0, size=0x80, data=marker) \
             + _op_writes(cand, model[cand], width, idx=0)
         out = _drive(workdir, exe, writes, timeout=8.0)
-        if marker in out:
-            return {"add": add, "free": free, "view": cand}
-    return None
+        if marker in out or marker.lower() in out.lower():
+            view = cand
+            break
+    if view is None:
+        return None
+    free = next((o for o in idx_only if o != view), None)
+    if free is None:
+        return None
+    return {"add": add, "free": free, "view": view}
 
 
 def heap_uaf_leak(workdir: Path, exe: Path, ops: dict, model: dict, width, *, target_bytes: bytes,

@@ -191,6 +191,31 @@ def _drain(proc, sel, *, idle: float, deadline: float) -> tuple[str, bool]:
     return buf.decode("latin1"), proc.poll() is None
 
 
+def drive_to_menu(proc, sel, *, idle: float, deadline: float, width=None, tries: int = 3):
+    """Drain to the first menu, benignly ANSWERING any pre-menu prompt (a `what is your name?` /
+    `username:` gate that many challenges put before the menu) so the crawl/driver lands ON the menu
+    instead of feeding a menu option to that prompt and desyncing. Each pre-menu prompt is classified
+    and answered like a field (a number, an index, or a short string). Returns (last_text, alive)."""
+    out, alive = _drain(proc, sel, idle=idle, deadline=min(deadline, time.monotonic() + 1.5))
+    for _ in range(tries):
+        if _looks_like_menu(out) or not alive:
+            break
+        ftype = classify_prompt(_tail_prompt(out))
+        if ftype == "num":
+            send = _scalar(_VALUE["num"], width)
+        elif ftype == "idx":
+            send = _scalar(_VALUE["idx"], width)
+        else:
+            send = _data(_VALUE["str"], width)
+        try:
+            proc.stdin.write(send)
+            proc.stdin.flush()
+        except (OSError, ValueError):
+            break
+        out, alive = _drain(proc, sel, idle=idle, deadline=min(deadline, time.monotonic() + 1.5))
+    return out, alive
+
+
 def crawl_menu(spawn, options, *, max_fields: int = 10, idle: float = 0.2,
                per_option: float = 3.0, width=None) -> dict[str, list[str]]:
     """Learn each option's ordered field template by DRIVING the live process one prompt at a time.
@@ -209,8 +234,7 @@ def crawl_menu(spawn, options, *, max_fields: int = 10, idle: float = 0.2,
             sel = selectors.DefaultSelector()
             sel.register(proc.stdout, selectors.EVENT_READ)
             deadline = time.monotonic() + per_option
-            _drain(proc, sel, idle=idle,
-                   deadline=min(deadline, time.monotonic() + 1.5))  # first menu
+            drive_to_menu(proc, sel, idle=idle, deadline=deadline, width=width)  # pass any name gate
             try:
                 proc.stdin.write(_scalar(opt.encode(), width))
                 proc.stdin.flush()
