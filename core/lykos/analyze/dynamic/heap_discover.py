@@ -61,34 +61,15 @@ def _plt_addr(exe: Path, name: str) -> int | None:
 
 
 def _read_width(exe: Path) -> int | None:
-    """Fixed-width input width W, or None for a line-based target. A target that reads scalars with
-    `read(0, buf, W)` (not fgets/gets/scanf) consumes exactly W bytes per field regardless of
-    newlines, so the driver must pad each field to W. Detected from constant `mov edx, imm` lengths
-    immediately before `read@plt` calls, when no line reader (fgets/gets/scanf) is present."""
-    if not shutil.which("objdump"):
+    """Fixed-width input width W (read(fd,buf,W) with W>=8), or None for a line-based target. A view
+    over the shared interaction.read_shape -- the single read-shape analyzer every stage uses, so a
+    read(fd,&c,1) char loop is not misread as a width-1 protocol (which padded every field to one
+    byte and desynced the crawl)."""
+    from .. import interaction
+    try:
+        return interaction.read_shape(Path(exe).read_bytes()).width
+    except Exception:                                    # noqa: BLE001
         return None
-    try:                                                 # -M intel: match `mov edx,0xN` operands
-        out = subprocess.run(["objdump", "-d", "--no-show-raw-insn", "-M", "intel", str(exe)],
-                             capture_output=True, text=True, timeout=60).stdout
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if re.search(r"<(fgets|gets|__isoc99_scanf|scanf|fscanf|getline)@plt>", out):
-        return None                                      # a line reader -> line-based
-    from collections import Counter
-    widths: Counter = Counter()
-    prev_edx = None
-    for ln in out.splitlines():
-        m = re.search(r"mov\s+edx,0x([0-9a-fA-F]+)", ln)
-        if m:
-            prev_edx = int(m.group(1), 16)
-        elif "<read@plt>" in ln and "call" in ln and prev_edx in (8, 16, 24, 32, 48, 64):
-            # a fixed-WIDTH field protocol pads each field to W; W in {1,2,3,4} is a char/scalar
-            # read loop (read(fd,&c,1) until newline), NOT a per-field width -- treating it as one
-            # pads every input to 1 byte and desyncs the whole crawl, so only accept W >= 8.
-            widths[prev_edx] += 1
-        elif "call" in ln:
-            prev_edx = None                              # a different call clobbers edx
-    return widths.most_common(1)[0][0] if widths else None
 
 
 def _libc_plt_pair(exe: Path) -> dict | None:

@@ -17,6 +17,7 @@ import selectors
 import struct
 import subprocess
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 from .dynamic import sandbox
@@ -24,75 +25,59 @@ from .fuzz import menu
 from .poc import leak as _leak
 
 
-def read_sizes(target_bytes: bytes) -> list:
-    """Best-effort sequence of read(fd, buf, N) size immediates in the x86-64 image (the `mov
-    $imm,%edx` that precedes a `call read@plt`). Lets the driver send exactly N bytes for a fixed
-    read so it does not desync, and spot the oversized read whose buffer is the over-readable one.
-    Code order, not execution order -- a hint, not ground truth. Empty on failure."""
-    import shutil
-    try:
-        objdump = shutil.which("objdump")
-        if not objdump:
-            return []
-        import tempfile
-        with tempfile.NamedTemporaryFile(suffix=".bin") as f:
-            f.write(target_bytes)
-            f.flush()
-            out = subprocess.run([objdump, "-d", f.name], capture_output=True, text=True,
-                                 timeout=30).stdout
-    except Exception:
-        return []
-    sizes, pend = [], None
-    for ln in out.splitlines():
-        m = re.search(r"mov\s+\$0x([0-9a-f]+),%edx", ln)
-        if m:
-            pend = int(m.group(1), 16)
-        elif "call" in ln and "read@plt" in ln and pend is not None:
-            sizes.append(pend)
-            pend = None
-    return sizes
+@dataclass
+class ReadShape:
+    """How the target consumes input scalars, recovered ONCE from the disassembly and shared by every
+    stage that drives it (the leak reacher, the heap crawler, the fuzzer's channel sizing). Replaces
+    three separate objdump passes (read_sizes / read_loop_caps / heap's _read_width) that drifted."""
+    sizes: list            # read(fd, buf, N) size immediates, code order (the oversized one over-reads)
+    loop_caps: list        # capacities of char-at-a-time read(fd,&c,1) loop fields, code order
+    width: int | None      # fixed-WIDTH field protocol (read(fd,buf,W), W>=8), or None if line-based
 
 
-def read_loop_caps(target_bytes: bytes) -> list:
-    """Best-effort sequence of CAPACITIES of char-at-a-time input fields: a `read(fd,&c,1)` inside a
-    loop bounded by `cmp $CAP,%reg ; jbe/jb` (the classic `for(i=0;i<=CAP;i++){read(0,&c,1); if
-    (c=='\\n')break; buf[i]=c;}`). Such a field is read one byte per call, so read_sizes sees only a
-    size of 1 and cannot tell the field's real width; the loop bound does. The width lets the driver
-    FILL a field exactly (send CAP+1 bytes with no newline so the loop stops at the cap and leaves no
-    residue) and -- by filling several adjacent fields -- BRIDGE a printf(\"%s\") over-read past the
-    buffer to a saved pointer. Returns caps (loop bound + 1 = bytes the field accepts) in code order;
-    empty on failure. A hint, not ground truth."""
+_READ_SHAPE_CACHE: dict = {}
+_LINE_READER = re.compile(r"<(fgets|gets|__isoc99_scanf|scanf|fscanf|getline)@plt>")
+
+
+def read_shape(target_bytes: bytes) -> ReadShape:
+    """The single source of truth for the target's input read shape (cached per image). ONE objdump
+    disassembly feeds all three views below. A hint from code order, not execution order."""
+    import hashlib
+    key = hashlib.sha1(target_bytes).hexdigest()
+    cached = _READ_SHAPE_CACHE.get(key)
+    if cached is not None:
+        return cached
     import shutil
+    import tempfile
+    out = ""
     try:
         objdump = shutil.which("objdump")
-        if not objdump:
-            return []
-        import tempfile
-        with tempfile.NamedTemporaryFile(suffix=".bin") as f:
-            f.write(target_bytes)
-            f.flush()
-            out = subprocess.run([objdump, "-d", f.name], capture_output=True, text=True,
-                                 timeout=30).stdout
-    except Exception:
-        return []
+        if objdump:
+            with tempfile.NamedTemporaryFile(suffix=".bin") as f:
+                f.write(target_bytes); f.flush()
+                out = subprocess.run([objdump, "-d", f.name], capture_output=True, text=True,
+                                     timeout=30).stdout
+    except Exception:                                    # noqa: BLE001
+        out = ""
     lines = out.splitlines()
-    read1_at = []                                        # indices of `call read@plt` with size==1
+    sizes: list = []
+    read1_at: list = []                                  # line indices of a size-1 read@plt (char loop)
     pend = None
     for i, ln in enumerate(lines):
         m = re.search(r"mov\s+\$0x([0-9a-f]+),%edx", ln)
         if m:
             pend = int(m.group(1), 16)
         elif "call" in ln and "read@plt" in ln:
-            if pend == 1:
-                read1_at.append(i)
+            if pend is not None:
+                sizes.append(pend)
+                if pend == 1:
+                    read1_at.append(i)
             pend = None
-    caps = []
+    # loop caps: the bound `cmp $CAP,<counter>` feeding the loop back-branch a few insns after a
+    # read(,,1). counter may be a register or a memory slot; branch signed (jle/jl) or unsigned
+    # (jbe/jb); EXCLUDE je/jne (the `c=='\n'` terminator). "or-equal" -> i=0..CAP -> CAP+1 bytes.
+    caps: list = []
     for idx in read1_at:
-        # the loop's upper bound is a `cmp $CAP, <counter>` feeding the loop back-branch a few insns
-        # after the read. The counter may be a register OR a memory slot (-0x4(%rbp)), and the branch
-        # may be signed (jle/jl) or unsigned (jbe/jb) depending on the counter's type. EXCLUDE je/jne
-        # -- that is the `if (c=='\n')` terminator compare, not the bound. An "or-equal" branch
-        # (jle/jbe) means i runs 0..CAP inclusive -> CAP+1 bytes; a strict one (jl/jb) -> CAP bytes.
         cap = None
         for j in range(idx, min(idx + 28, len(lines))):
             cm = re.search(r"\bcmp[lqwb]?\s+\$0x([0-9a-f]+),", lines[j])
@@ -104,7 +89,28 @@ def read_loop_caps(target_bytes: bytes) -> list:
                 cap = n + 1 if bm.group(1) in ("jbe", "jle", "jae", "jge") else n
                 break
         caps.append(cap if cap is not None else 1)
-    return caps
+    # fixed-width protocol: a read(fd,buf,W) target pads each field to W. W<8 is a char/scalar loop,
+    # not a field width (reading it as 1 pads everything to one byte and desyncs the crawl). None when
+    # a line reader (fgets/scanf/getline) is present -- that target is line-delimited, not fixed-width.
+    width = None
+    if not _LINE_READER.search(out):
+        from collections import Counter
+        wc = Counter(s for s in sizes if s in (8, 16, 24, 32, 48, 64))
+        width = wc.most_common(1)[0][0] if wc else None
+    rs = ReadShape(sizes, caps, width)
+    _READ_SHAPE_CACHE[key] = rs
+    return rs
+
+
+def read_sizes(target_bytes: bytes) -> list:
+    """read(fd, buf, N) size immediates in code order (a view over read_shape). A hint, not truth."""
+    return read_shape(target_bytes).sizes
+
+
+def read_loop_caps(target_bytes: bytes) -> list:
+    """Capacities of char-at-a-time read(fd,&c,1) loop fields (a view over read_shape). Lets a driver
+    FILL such a field exactly and BRIDGE a printf(\"%s\") over-read past the buffer to a saved pointer."""
+    return read_shape(target_bytes).loop_caps
 
 
 def _spawn(exe: Path, workdir: Path):
