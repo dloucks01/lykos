@@ -243,6 +243,30 @@ int main(void){ setvbuf(stdout,0,2,0); setvbuf(stdin,0,2,0);
          ["-fPIE", "-pie", "-O0", "-w"],
          want_level=3, want_cwe=("CWE-416",), budget=420.0,
          note="edit RE-ASKS the write length -> length-declaring FSOP poison write -> shell (L3)"),
+
+    Case("heap_fsop_slots17",
+         r'''#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+/* SMALL slot table (17) AND a size cap: the libc leak needs a tcache-fill spill, which needs
+   capacity+1 distinct chunks -- 17 on this glibc -- so the fill must size itself to the table
+   exactly. Allocating past it is refused, and the refusal desyncs the menu and exits the target. */
+char *ptr[17]; long sz[17];
+static long rl(void){ char b[32]; int i=0,c; while(i<31){ c=getchar(); if(c<0||c=='\n')break; b[i++]=c; } b[i]=0; return strtol(b,0,10); }
+int main(void){ setvbuf(stdout,0,2,0); setvbuf(stdin,0,2,0);
+  while(1){ printf("1.add 2.free 3.view 4.edit 5.exit\n> ");
+    long o=rl();
+    if(o==1){ printf("idx: "); long i=rl(); printf("size: "); long s=rl();
+              if(i>=0&&i<17&&s>0&&s<=0x400){ ptr[i]=malloc(s); sz[i]=s; printf("data: "); read(0,ptr[i],s); }
+              else printf("bad size\n"); }
+    else if(o==2){ printf("idx: "); long i=rl(); if(i>=0&&i<17&&ptr[i]) free(ptr[i]); }
+    else if(o==3){ printf("idx: "); long i=rl(); if(i>=0&&i<17&&ptr[i]) write(1,ptr[i],sz[i]); }
+    else if(o==4){ printf("idx: "); long i=rl(); printf("data: "); if(i>=0&&i<17&&ptr[i]) read(0,ptr[i],sz[i]); }
+    else return 0; } }''',
+         ["-fPIE", "-pie", "-O0", "-w"],
+         want_level=3, want_cwe=("CWE-416",), budget=480.0,
+         note="17-slot table + size cap -> fill sized to the table -> FSOP shell (L3)"),
 ]
 
 
@@ -254,6 +278,23 @@ class Result:
     findings: list = field(default_factory=list)
     elapsed: int = 0
     reason: str = ""
+
+
+def _verdict(s, target, case):
+    """(max verified poc level, demonstrated findings matching want_cwe, all demonstrated findings).
+
+    The SINGLE definition of "this case succeeded", used both to poll for early completion and to
+    score the run, so the two can never disagree. A demonstrated finding is one from a non-static
+    detector carrying an expected CWE (an info-leak files as a finding, not always a leveled poc)."""
+    from lykos.db.dao import FindingDAO, PocDAO
+    pocs = PocDAO(s.conn).list_by_target(target.id)
+    maxlvl = max((int(pc.level[1]) for pc in pocs
+                  if getattr(pc, "verified", False) and pc.level and pc.level[0] == "L"), default=0)
+    fs = [f for f in FindingDAO(s.conn).list_by_target(target.id)
+          if f.state in ("poc-backed", "corroborated")]
+    demod = [(f.detector, f.cwe, (f.title or "")[:40]) for f in fs
+             if f.detector not in _STATIC_DETECTORS and any(w in (f.cwe or "") for w in case.want_cwe)]
+    return maxlvl, demod, fs
 
 
 def _run_case(case: Case, gcc: str) -> Result:
@@ -283,23 +324,28 @@ def _run_case(case: Case, gcc: str) -> Result:
         th = threading.Thread(target=run_case_autopilot, args=(d / "case", c.id, [t.id], status, stop),
                               daemon=True)
         th.start()
+        # Stop as soon as the case's OWN criterion is met instead of burning the whole budget. The
+        # effect these cases assert lands early (an FSOP shell is filed long before fuzz/concolic
+        # spend their time), so the tail was pure waiting -- it proved nothing the criterion does not
+        # already state. Same verdict function decides here and below, so stopping early cannot
+        # change a PASS into a FAIL or vice versa.
+        early = False
         while th.is_alive() and time.time() - t0 < case.budget:
             time.sleep(1.0)
+            try:
+                ml, dm, _ = _verdict(s, t, case)
+            except Exception:                            # noqa: BLE001 -- a transient DB lock; retry
+                continue
+            if ml >= case.want_level or dm:
+                early = True
+                break
         if th.is_alive():
             stop.set(); th.join(timeout=60)
-        from lykos.db.dao import PocDAO
-        pocs = PocDAO(s.conn).list_by_target(t.id)
-        maxlvl = max((int(pc.level[1]) for pc in pocs
-                      if getattr(pc, "verified", False) and pc.level and pc.level[0] == "L"), default=0)
-        fs = [f for f in FindingDAO(s.conn).list_by_target(t.id)
-              if f.state in ("poc-backed", "corroborated")]
-        # a DEMONSTRATED finding carrying an expected CWE from a non-static detector (an info-leak
-        # files as a finding, not always a leveled poc)
-        demod = [(f.detector, f.cwe, (f.title or "")[:40]) for f in fs
-                 if f.detector not in _STATIC_DETECTORS and any(w in (f.cwe or "") for w in case.want_cwe)]
+        maxlvl, demod, fs = _verdict(s, t, case)
         ok = (maxlvl >= case.want_level) or bool(demod)
         shown = demod or [(f.detector, f.cwe, (f.title or "")[:30]) for f in fs]
-        return Result(case.name, ok, "%s L%d" % (prof, maxlvl), shown, int(time.time() - t0),
+        return Result(case.name, ok, "%s L%d%s" % (prof, maxlvl, "*" if early else ""), shown,
+                      int(time.time() - t0),
                       "" if ok else "want L%d / %s demonstrated; got L%d" % (case.want_level, case.want_cwe, maxlvl))
     finally:
         pool.stop(grace=5.0); s.close()
@@ -366,8 +412,9 @@ def run_all(names=None) -> list[Result]:
         print("%-24s | %-4s | %-26s | %s [%ds]" % (r.name, "PASS" if r.ok else "FAIL", r.profile, f, r.elapsed))
     print("-" * 110)
     npass = sum(1 for r in results if r.ok)
-    print("CONFORMANCE: %d/%d bug-classes demonstrated end-to-end through the real autopilot"
-          % (npass, len(results)))
+    print("CONFORMANCE: %d/%d bug-classes demonstrated end-to-end through the real autopilot "
+          "(%ds total; * = stopped as soon as the case's criterion was met)"
+          % (npass, len(results), sum(r.elapsed for r in results)))
     # Infrastructure check (not a bug class): the cross-stage op-model artifact actually composes two
     # stages. Only when the full run exercised the shared crawl, i.e. not a name-filtered subset.
     if not names:
