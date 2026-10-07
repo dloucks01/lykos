@@ -113,6 +113,54 @@ def read_loop_caps(target_bytes: bytes) -> list:
     return read_shape(target_bytes).loop_caps
 
 
+@dataclass
+class InteractionModel:
+    """How a target is DRIVEN, recovered ONCE and shared by every stage that talks to it (the leak
+    reacher, the heap crawler, the fuzzer, the weaponizers). Before this, each stage re-derived the
+    channel / read sizes / menu options / input gates independently and the fixes drifted apart.
+
+      read           -- ReadShape (fixed read sizes, char-loop caps, fixed-width protocol).
+      menu_opts      -- numbered menu options (detect_menu), [] when the target has no menu.
+      gate_preambles -- byte preambles that pass an input gate (a strstr(input,"TOKEN") / banner reply)
+                        so a sink behind the gate is reachable; empty when no gate is detected.
+      channel        -- primary input mode (stdin / argv / file / ...); best-effort, caller may refine.
+    """
+    read: ReadShape
+    menu_opts: list
+    gate_preambles: list
+    channel: str = "stdin"
+
+
+_MODEL_CACHE: dict = {}
+
+
+def build_model(target_bytes: bytes, *, strings=(), known_inputs=(), channel: str = "stdin"
+                ) -> InteractionModel:
+    """Build (and cache) the shared InteractionModel for a target from its bytes alone -- the single
+    source of truth a stage asks for instead of re-deriving read sizes / menu / gates itself. Each
+    component is best-effort; a failure yields an empty piece, never an exception."""
+    import hashlib
+    key = (hashlib.sha1(target_bytes).hexdigest(), channel)
+    cached = _MODEL_CACHE.get(key)
+    if cached is not None:
+        return cached
+    read = read_shape(target_bytes)
+    opts: list = []
+    try:
+        from . import invocation
+        opts = menu.detect_menu(invocation.raw_strings(target_bytes))
+    except Exception:                                    # noqa: BLE001
+        opts = []
+    gates: list = []
+    try:
+        gates = _leak._gate_preambles(target_bytes, strings=strings, known_inputs=known_inputs)
+    except Exception:                                    # noqa: BLE001
+        gates = []
+    m = InteractionModel(read, opts, gates, channel)
+    _MODEL_CACHE[key] = m
+    return m
+
+
 def _spawn(exe: Path, workdir: Path):
     rel = sandbox._relative_interp(str(exe)) if hasattr(sandbox, "_relative_interp") else False
     cmd = sandbox.isolate_prefix(str(workdir), net=False, rw_binds=[str(workdir)],

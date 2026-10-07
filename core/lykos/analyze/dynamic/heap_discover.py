@@ -446,9 +446,11 @@ def heap_trace_stage(ctx) -> dict:
     edges = CallEdgeDAO(ctx.conn).list_by_target(target.id)
     strings = [x.value for x in StringDAO(ctx.conn).list_by_target(target.id)
                if getattr(x, "value", None)]
-    # StringDAO is filled by the DISASSEMBLE stage; fall back to a direct byte scan so menu detection
-    # does not depend on stage ordering (the same reason _looks_like_heap_menu uses raw_strings).
-    opts = menu.detect_menu(strings) or menu.detect_menu(invocation.raw_strings(target_bytes))
+    # StringDAO is filled by the DISASSEMBLE stage; fall back to the shared interaction model's menu
+    # (a direct byte scan) so detection does not depend on stage ordering AND matches the menu list
+    # _looks_like_heap_menu gates on -- the crawler and the gate never disagree.
+    from .. import interaction
+    opts = menu.detect_menu(strings) or interaction.build_model(target_bytes).menu_opts
     alloc = heaptrace.identify_allocator(functions, edges)
     # A stripped target has no named allocator; if it is a menu-driven heap service we fall back to
     # tracing libc malloc/free directly (resolved from the PLT below, once the binary is on disk).
