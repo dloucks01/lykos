@@ -324,19 +324,24 @@ def _run_case(case: Case, gcc: str) -> Result:
         th = threading.Thread(target=run_case_autopilot, args=(d / "case", c.id, [t.id], status, stop),
                               daemon=True)
         th.start()
-        # Stop as soon as the case's OWN criterion is met instead of burning the whole budget. The
-        # effect these cases assert lands early (an FSOP shell is filed long before fuzz/concolic
-        # spend their time), so the tail was pure waiting -- it proved nothing the criterion does not
-        # already state. Same verdict function decides here and below, so stopping early cannot
-        # change a PASS into a FAIL or vice versa.
+        # Stop once the case has demonstrated its STATED LEVEL, instead of burning the whole budget:
+        # an FSOP shell is filed long before fuzz and concolic finish spending their time, so the
+        # tail was pure waiting.
+        #
+        # The bar here is deliberately want_level and NOT the full pass criterion. Passing also
+        # admits a demonstrated want_cwe finding, which often appears much earlier and from a weaker
+        # stage -- stopping on that let format_fullrelro_ret2win "pass" at L1 off an inject_synth
+        # finding without ever proving the L3 format-%n chain the case exists for. A case that can
+        # only ever pass on that weaker evidence simply runs to budget, because nothing tells us
+        # sooner that it is done.
         early = False
         while th.is_alive() and time.time() - t0 < case.budget:
             time.sleep(1.0)
             try:
-                ml, dm, _ = _verdict(s, t, case)
+                ml, _, _ = _verdict(s, t, case)
             except Exception:                            # noqa: BLE001 -- a transient DB lock; retry
                 continue
-            if ml >= case.want_level or dm:
+            if case.want_level and ml >= case.want_level:
                 early = True
                 break
         if th.is_alive():
