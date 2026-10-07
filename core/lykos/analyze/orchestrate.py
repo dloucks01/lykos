@@ -507,11 +507,23 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict, stop: t
             # reached once fuzz/concolic had spent the budget.)
             if not stop.is_set() and _max_verified_poc_level(store, tid) < 3:
                 _run_target_stage(store, t, "build_exploit", status, stop, {"strategy": "auto"})
-            # Search. Fuzz the channel the binary most likely reads (its imports rank them); coverage
-            # fuzz (AFL, falls back to blind if unavailable), then directed + heap on the same channel.
+            # Channel ranking (from the imports) feeds both the heap check and the fuzzer below.
             channels = _ranked_channels(store, tid)
             primary = channels[0] if channels else None
             dyn = {"input_mode": primary} if primary else {}
+            # DISCOVERY that needs NO fuzzer crash -- run it BEFORE the budget-draining fuzz/concolic,
+            # for the same reason as the crashless weaponization above: a menu-driven heap / OOB target
+            # rarely yields a blind-mutation crash, so with the old ordering heap_trace + oob_index +
+            # chain_primitive were starved (the conformance harness caught a UAF-read heap failing here
+            # for exactly this reason). heap_check (libc guard pages) + the custom-allocator UAF/
+            # double-free trace + OOB-index discovery, then chain their primitives into a demonstrated
+            # hijack / L2 recipe (chain_primitive consumes those Findings).
+            _run_target_stage(store, t, "heap_check", status, stop, dyn)
+            _run_target_stage(store, t, "heap_trace", status, stop)
+            _run_target_stage(store, t, "oob_index", status, stop)
+            _run_target_stage(store, t, "chain_primitive", status, stop)
+            # Search. Fuzz the channel the binary most likely reads; coverage fuzz (AFL, falls back to
+            # blind if unavailable), then directed on the same channel.
             _run_target_stage(store, t, "coverage_fuzz", status, stop, dyn)
             _run_target_stage(store, t, "directed_fuzz", status, stop, dyn)
             # A socket server is reached by spawning it and sending over the network, not via
@@ -520,17 +532,6 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict, stop: t
             # Env-var input: a program that reads getenv("NAME") is reached by SETTING that
             # variable, not via stdin/argv/file; the stage self-gates to targets importing getenv.
             _run_target_stage(store, t, "env_fuzz", status, stop)
-            _run_target_stage(store, t, "heap_check", status, stop, dyn)
-            # Custom-allocator heap-primitive discovery (double-free / UAF / overflow) for a target
-            # with its OWN allocator, which the libc guard-page check cannot see.
-            _run_target_stage(store, t, "heap_trace", status, stop)
-            # Out-of-bounds array-index discovery (a fixed-size object table selected by a
-            # user id whose bound check is missing / off-by-one).
-            _run_target_stage(store, t, "oob_index", status, stop)
-            # Chain a discovered heap / OOB primitive into a demonstrated control-flow hijack
-            # (or an L2 recipe) -- consumes the heap_trace / oob_index Findings, which otherwise
-            # reach no exploit builder.
-            _run_target_stage(store, t, "chain_primitive", status, stop)
             crashes = _distinct_crashes(store, tid)
             # Multi-channel retry: the best-guess channel is not always where the bug is (a file
             # parser's overflow can be in the argv filename). If nothing crashed, drive the fast
