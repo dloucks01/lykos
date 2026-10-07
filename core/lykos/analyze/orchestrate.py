@@ -292,6 +292,84 @@ def _run_target_stage(store, target, stage, status, stop, params=None) -> Option
     return outcome
 
 
+def _run_target_stages(store, target, specs, status, stop) -> dict:
+    """Enqueue several INDEPENDENT target stages at once and wait for all of them, letting the worker
+    pool run them concurrently under its per-class concurrency caps -- the single sandbox governor
+    (quick/io/cpu/vm) that already bounds how many sandbox runs execute at once. An independent
+    discovery group is thus no longer serialized one-at-a-time, with NO new concurrency primitive and
+    no risk of oversubscribing the sandbox: the pool's caps decide the real parallelism (a 1-worker
+    pool still runs them correctly, just serially).
+
+    `specs` is a list of (stage, params). The caller GUARANTEES the stages do not consume each other's
+    Findings/artifacts; a stage that reads another's output must stay a serial _run_target_stage after
+    this batch. Per-stage plan/event/cache-hit handling mirrors _run_target_stage exactly. Returns
+    {stage: outcome}."""
+    from ..jobs.registry import reproject_cache_hit
+    pending: dict = {}                                    # run_id -> stage
+    outcomes: dict = {}
+    for stage, params in specs:
+        if stop.is_set():
+            break
+        status["stage"] = stage
+        status["updated"] = time.time()
+        _plan_set(status, stage, "running")
+        _emit_stage(store, target.case_id, stage, "running", target_id=target.id)
+        try:
+            fn = _enqueue_fn(_TARGET[stage])
+            q = JobQueue(store.conn)
+            run = fn(q, target) if stage in _NO_PARAMS else fn(q, target, params=params or {})
+        except Exception as e:
+            _plan_set(status, stage, "error", str(e)[:120])
+            _emit_stage(store, target.case_id, stage, "error", target_id=target.id, detail=str(e)[:200])
+            store.events.append("autopilot.stage_error", level="warn", case_id=target.case_id,
+                                payload={"stage": stage, "error": str(e)})
+            outcomes[stage] = None
+            continue
+        if run.status == "done":                          # content-addressed cache hit (see _run_target_stage)
+            try:
+                reproject_cache_hit(store, stage, target.id, run.id)
+            except Exception:
+                _log.debug("cache-hit reprojection failed for stage %s target %s", stage, target.id,
+                           exc_info=True)
+            d = _stage_detail(store, target, stage) or "cached"
+            _plan_set(status, stage, "done", d)
+            _emit_stage(store, target.case_id, stage, "done", target_id=target.id, detail=d)
+            outcomes[stage] = "done"
+        else:
+            pending[run.id] = stage
+    # Poll every queued run to a terminal state; the pool's workers execute them in parallel, bounded
+    # by the per-class caps. Finalize each stage the instant it finishes, exactly as the serial path.
+    deadline = time.time() + 900.0
+    while pending and time.time() < deadline:
+        if stop.is_set():
+            break
+        for rid in list(pending):
+            r = store.runs.get(rid)
+            if r and r.status in _TERMINAL:
+                stage = pending.pop(rid)
+                pstate = ({"done": "done", "cancelled": "cancelled", "timeout": "error",
+                           "error": "error"}).get(r.status, r.status or "error")
+                d = _stage_detail(store, target, stage) if pstate == "done" else None
+                _plan_set(status, stage, pstate, d)
+                _emit_stage(store, target.case_id, stage, pstate, target_id=target.id, detail=d)
+                outcomes[stage] = r.status
+        if pending:
+            time.sleep(0.6)
+    # Anything still pending (cancelled or past the batch deadline) is cancelled so it cannot keep a
+    # worker busy writing into a target the plan has moved past -- the same cleanup _wait does.
+    for rid, stage in list(pending.items()):
+        try:
+            JobQueue(store.conn).cancel(rid)
+        except Exception:
+            pass
+        timed_out = not stop.is_set()
+        _plan_set(status, stage, "error" if timed_out else "cancelled")
+        _emit_stage(store, target.case_id, stage, "error" if timed_out else "cancelled",
+                    target_id=target.id)
+        outcomes[stage] = "timeout" if timed_out else "cancelled"
+    return outcomes
+
+
 def _run_case_stage(store, case_id, stage, status, stop) -> None:
     if stop.is_set():
         return
@@ -518,9 +596,15 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict, stop: t
             # for exactly this reason). heap_check (libc guard pages) + the custom-allocator UAF/
             # double-free trace + OOB-index discovery, then chain their primitives into a demonstrated
             # hijack / L2 recipe (chain_primitive consumes those Findings).
-            _run_target_stage(store, t, "heap_check", status, stop, dyn)
-            _run_target_stage(store, t, "heap_trace", status, stop)
-            _run_target_stage(store, t, "oob_index", status, stop)
+            # heap_check (libc guard pages), heap_trace (custom-allocator UAF/double-free) and
+            # oob_index (OOB-index discovery) are three INDEPENDENT discovery passes -- none reads a
+            # Finding or artifact another writes (heap_check -> detector "heap_monitor"; heap_trace ->
+            # "heap_trace"; oob_index -> "oob_index"), so they run concurrently under the pool's
+            # per-class caps (the single sandbox governor), halving this phase on a multi-core box
+            # without oversubscribing the sandbox. chain_primitive then runs SERIALLY after them --
+            # its _lead_finding consumes the heap_trace / oob_index Findings, so it must see them done.
+            _run_target_stages(store, t, [("heap_check", dyn), ("heap_trace", None),
+                                          ("oob_index", None)], status, stop)
             _run_target_stage(store, t, "chain_primitive", status, stop)
             # Search. Fuzz the channel the binary most likely reads; coverage fuzz (AFL, falls back to
             # blind if unavailable), then directed on the same channel.
