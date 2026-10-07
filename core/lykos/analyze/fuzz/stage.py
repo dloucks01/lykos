@@ -218,9 +218,8 @@ def menu_model_for(ctx, target, exe, workdir):
         opts = menu.detect_menu(svals)
         if not opts:
             return None
-        from ..dynamic.heap_discover import _crawl_menu_model, _read_width
-        width = _read_width(exe)
-        model = _crawl_menu_model(workdir, exe, opts, width=width)
+        from ..dynamic.heap_discover import crawl_op_model
+        width, model = crawl_op_model(workdir, exe, opts)
         if not model:
             return None
         return model, opts, width

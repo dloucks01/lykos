@@ -115,6 +115,18 @@ def _crawl_menu_model(workdir: Path, exe: Path, opts: list[str], *, width=None) 
         return {}
 
 
+def crawl_op_model(workdir: Path, exe: Path, opts: list) -> tuple:
+    """Shared menu op-model derivation: read the fixed-width input width, then crawl each option's
+    typed field template at that width. The heap, out-of-bounds-index, primitive-chaining and fuzz
+    stages all drive the SAME two steps, which MUST stay in sync (the width selects the crawl's field
+    encoding); folding them here keeps a crawl fix from drifting across four call sites. Each stage
+    still derives `opts` itself, since the strings source differs. Returns (width, model); model is
+    {} when there is no menu (`opts` empty) or the crawl fails."""
+    width = _read_width(exe)
+    model = _crawl_menu_model(workdir, exe, opts, width=width) if opts else {}
+    return width, model
+
+
 def _spawn_menu(workdir: Path, exe: Path):
     """A fresh sandboxed interactive process for the target (stdin/stdout piped), the same isolation
     the crawl uses."""
@@ -492,8 +504,7 @@ def heap_trace_stage(ctx) -> dict:
         # fall back to the generic shapes when crawling finds no allocator flow.
         # Fixed-width read(fd, buf, W) targets consume exactly W bytes per field (dreamdiary-style);
         # the crawl and the op-sequences must pad each field to W instead of newline-delimiting.
-        width = _read_width(exe)
-        model = _crawl_menu_model(workdir, exe, opts, width=width) if opts else {}
+        width, model = crawl_op_model(workdir, exe, opts)
         seqs = menu.menu_op_sequences(model, opts, width=width) \
             or heaptrace.heap_op_sequences(opts) or [
             b"1\n64\nA\n2\n0\n2\n0\n", b"1\n2\n2\n",                 # double-free
