@@ -134,6 +134,26 @@ int main(void){ setvbuf(stdout,0,2,0); setvbuf(stdin,0,2,0);
          ["-fPIE", "-pie", "-O0", "-w"],
          want_level=2, want_cwe=("CWE-416","CWE-200"),
          note="name-gate + y/n + char-loop + uninit-reuse -> libc leak (L2)"),
+
+    Case("heap_fsop_shell",
+         r'''#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+char *ptr[32]; long sz[32];
+static long rl(void){ char b[32]; int i=0,c; while(i<31){ c=getchar(); if(c<0||c=='\n')break; b[i++]=c; } b[i]=0; return strtol(b,0,10); }
+int main(void){ setvbuf(stdout,0,2,0); setvbuf(stdin,0,2,0);
+  while(1){ printf("1.add 2.free 3.view 4.edit 5.exit\n> ");
+    long o=rl();
+    if(o==1){ printf("idx: "); long i=rl(); printf("size: "); long s=rl();
+              if(i>=0&&i<32&&s>0&&s<0x1000){ ptr[i]=malloc(s); sz[i]=s; printf("data: "); read(0,ptr[i],s); } }
+    else if(o==2){ printf("idx: "); long i=rl(); if(i>=0&&i<32&&ptr[i]) free(ptr[i]); }          /* no NULL -> UAF */
+    else if(o==3){ printf("idx: "); long i=rl(); if(i>=0&&i<32&&ptr[i]) write(1,ptr[i],sz[i]); }  /* UAF read */
+    else if(o==4){ printf("idx: "); long i=rl(); printf("data: "); if(i>=0&&i<32&&ptr[i]) read(0,ptr[i],sz[i]); } /* UAF write */
+    else return 0; } }''',
+         ["-fPIE", "-pie", "-O0", "-w"],
+         want_level=3, want_cwe=("CWE-416",), budget=420.0,
+         note="menu notebook, UAF edit -> tcache poison _IO_2_1_stdout_ + House of Apple 2 -> shell (L3)"),
 ]
 
 
