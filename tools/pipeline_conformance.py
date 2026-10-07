@@ -197,6 +197,29 @@ int main(void){ setvbuf(stdout,0,2,0);
          ["-fPIE", "-pie", "-O0", "-w"],
          want_level=3, want_cwe=("CWE-416",), budget=420.0,
          note="FIXED-WIDTH read(fd,buf,8) menu -> width-encoded FSOP chain -> shell (L3)"),
+
+    Case("heap_fsop_capped",
+         r'''#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+char *ptr[32]; long sz[32];
+static long rl(void){ char b[32]; int i=0,c; while(i<31){ c=getchar(); if(c<0||c=='\n')break; b[i++]=c; } b[i]=0; return strtol(b,0,10); }
+int main(void){ setvbuf(stdout,0,2,0); setvbuf(stdin,0,2,0);
+  while(1){ printf("1.add 2.free 3.view 4.edit 5.exit\n> ");
+    long o=rl();
+    if(o==1){ printf("idx: "); long i=rl(); printf("size: "); long s=rl();
+              /* SIZE CAP: refuses an above-tcache chunk, so one free never reaches a bin head and
+                 the libc leak needs a tcache-FILL spill instead. */
+              if(i>=0&&i<32&&s>0&&s<=0x400){ ptr[i]=malloc(s); sz[i]=s; printf("data: "); read(0,ptr[i],s); }
+              else printf("bad size\n"); }
+    else if(o==2){ printf("idx: "); long i=rl(); if(i>=0&&i<32&&ptr[i]) free(ptr[i]); }
+    else if(o==3){ printf("idx: "); long i=rl(); if(i>=0&&i<32&&ptr[i]) write(1,ptr[i],sz[i]); }
+    else if(o==4){ printf("idx: "); long i=rl(); printf("data: "); if(i>=0&&i<32&&ptr[i]) read(0,ptr[i],sz[i]); }
+    else return 0; } }''',
+         ["-fPIE", "-pie", "-O0", "-w"],
+         want_level=3, want_cwe=("CWE-416",), budget=420.0,
+         note="SIZE-CAPPED notebook -> tcache-fill spill for the libc leak -> FSOP shell (L3)"),
 ]
 
 
