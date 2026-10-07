@@ -267,6 +267,54 @@ int main(void){ setvbuf(stdout,0,2,0); setvbuf(stdin,0,2,0);
          ["-fPIE", "-pie", "-O0", "-w"],
          want_level=3, want_cwe=("CWE-416",), budget=480.0,
          note="17-slot table + size cap -> fill sized to the table -> FSOP shell (L3)"),
+
+    Case("heap_fsop_slots8",
+         r'''#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+/* TINY slot table (8) AND a size cap: too few slots to hold capacity+1 distinct chunks, so the
+   libc leak can only come from re-entering ONE chunk into the tcache bin (clearing its key
+   through the edit) until the bin overflows. */
+char *ptr[8]; long sz[8];
+static long rl(void){ char b[32]; int i=0,c; while(i<31){ c=getchar(); if(c<0||c=='\n')break; b[i++]=c; } b[i]=0; return strtol(b,0,10); }
+int main(void){ setvbuf(stdout,0,2,0); setvbuf(stdin,0,2,0);
+  while(1){ printf("1.add 2.free 3.view 4.edit 5.exit\n> ");
+    long o=rl();
+    if(o==1){ printf("idx: "); long i=rl(); printf("size: "); long s=rl();
+              if(i>=0&&i<8&&s>0&&s<=0x400){ ptr[i]=malloc(s); sz[i]=s; printf("data: "); read(0,ptr[i],s); }
+              else printf("bad size\n"); }
+    else if(o==2){ printf("idx: "); long i=rl(); if(i>=0&&i<8&&ptr[i]) free(ptr[i]); }
+    else if(o==3){ printf("idx: "); long i=rl(); if(i>=0&&i<8&&ptr[i]) write(1,ptr[i],sz[i]); }
+    else if(o==4){ printf("idx: "); long i=rl(); printf("data: "); if(i>=0&&i<8&&ptr[i]) read(0,ptr[i],sz[i]); }
+    else return 0; } }''',
+         ["-fPIE", "-pie", "-O0", "-w"],
+         want_level=3, want_cwe=("CWE-416",), budget=480.0,
+         note="8-slot table + size cap -> tcache-dup (re-enter one chunk) -> FSOP shell (L3)"),
+
+    Case("heap_fsop_tightcap",
+         r'''#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+/* TIGHT size cap (0x100): too small for the one-piece fake _IO_FILE, which needs 0x2A8 bytes. The
+   fake _IO_wide_data and its jump table have to be parked in a chunk of the exploit's own, reached
+   by a second tcache poison, so no single write exceeds the cap. */
+char *ptr[16]; long sz[16];
+static long rl(void){ char b[32]; int i=0,c; while(i<31){ c=getchar(); if(c<0||c=='\n')break; b[i++]=c; } b[i]=0; return strtol(b,0,10); }
+int main(void){ setvbuf(stdout,0,2,0); setvbuf(stdin,0,2,0);
+  while(1){ printf("1.add 2.free 3.view 4.edit 5.exit\n> ");
+    long o=rl();
+    if(o==1){ printf("idx: "); long i=rl(); printf("size: "); long s=rl();
+              if(i>=0&&i<16&&s>0&&s<=0x100){ ptr[i]=malloc(s); sz[i]=s; printf("data: "); read(0,ptr[i],s); }
+              else printf("bad size\n"); }
+    else if(o==2){ printf("idx: "); long i=rl(); if(i>=0&&i<16&&ptr[i]) free(ptr[i]); }
+    else if(o==3){ printf("idx: "); long i=rl(); if(i>=0&&i<16&&ptr[i]) write(1,ptr[i],sz[i]); }
+    else if(o==4){ printf("idx: "); long i=rl(); printf("data: "); if(i>=0&&i<16&&ptr[i]) read(0,ptr[i],sz[i]); }
+    else return 0; } }''',
+         ["-fPIE", "-pie", "-O0", "-w"],
+         want_level=3, want_cwe=("CWE-416",), budget=600.0,
+         note="0x100 size cap -> split fake FILE (wide data in our own chunk) -> FSOP shell (L3)"),
 ]
 
 

