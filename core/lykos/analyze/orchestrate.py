@@ -494,6 +494,19 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict, stop: t
             # Demonstrate injection / format-string leaks by probing the binary's sinks directly
             # (no crash needed) -- a printf(user) leaks live memory, a system(user) runs a command.
             _run_target_stage(store, t, "synthesize_injection", status, stop)
+            # Leak-centric weaponization that needs NO crash -- run it BEFORE the budget-draining
+            # fuzz/concolic below, so a modern-hardened target (PIE / stack canary / full RELRO) that
+            # blind mutation can't crash still reaches its demonstrable effect within a time budget.
+            # strategy="auto" provokes its own leak (a %p/%s over-read behind the input prompts, a
+            # format sink, a heap UAF/menu) and drives the canary-bypass ret2win/ret2libc, the
+            # format-%n saved-return overwrite, the heap FSOP chain, or files the demonstrated ASLR
+            # info-leak (L2) when no shell is reachable. The overflow-based auto paths that DO need a
+            # crash offset just no-op here and are covered by the crash-driven build_exploit later.
+            # Self-gates per arch/mitigation and reports honest ceilings -- a bounded attempt, not a
+            # false positive. (Placed early precisely because the old end-of-pass slot was never
+            # reached once fuzz/concolic had spent the budget.)
+            if not stop.is_set() and _max_verified_poc_level(store, tid) < 3:
+                _run_target_stage(store, t, "build_exploit", status, stop, {"strategy": "auto"})
             # Search. Fuzz the channel the binary most likely reads (its imports rank them); coverage
             # fuzz (AFL, falls back to blind if unavailable), then directed + heap on the same channel.
             channels = _ranked_channels(store, tid)
@@ -622,16 +635,8 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict, stop: t
                 if heap_menu:
                     _run_target_stage(store, t, "build_exploit", status, stop,
                                       {"strategy": "heap"})
-            # Leak-centric weaponization WITHOUT a crash. A modern-hardened target (PIE / stack
-            # canary / full RELRO) rarely yields a blind-mutation crash -- the fuzzer reports clean --
-            # yet strategy="auto" PROVOKES its own leak (a %p/%s over-read behind the input prompts,
-            # a format sink) and drives the canary-bypass ret2win/ret2libc, the format-%n saved-return
-            # overwrite, or files the demonstrated ASLR info-leak (L2) when no shell is reachable.
-            # build_exploit's auto path otherwise runs only for a crash (above), so a hardened target
-            # with no fuzzer crash topped out with nothing. The stage self-gates per arch/mitigation
-            # and reports honest ceilings, so this is a bounded attempt, not a false positive.
-            if not stop.is_set() and _max_verified_poc_level(store, tid) < 3:
-                _run_target_stage(store, t, "build_exploit", status, stop, {"strategy": "auto"})
+            # (The crashless leak-centric build_exploit(strategy="auto") now runs EARLY, before
+            # fuzz/concolic, so a time-boxed pass reaches it; see above. It is not repeated here.)
             # Review each demonstrated finding: replay its input several times so a flaky crash is
             # flagged rather than trusted, and a reopened case carries the verdict. Verified-PoC
             # inputs come first (never dropped), then any distinct crash; capped so a target with
