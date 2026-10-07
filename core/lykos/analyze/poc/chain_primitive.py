@@ -99,7 +99,7 @@ def _recipe(vclass: str, win, target_bytes: bytes, glibc=None) -> dict:
 def chain_primitive_stage(ctx) -> dict:
     from ...db.dao import CallEdgeDAO, StringDAO, TargetDAO
     from ..dynamic import sandbox
-    from ..dynamic.heap_discover import crawl_op_model
+    from ..dynamic.heap_discover import shared_op_model
     from ..fuzz import menu
     from . import exploit
     from .capture import make_capture, materialize_helper
@@ -152,7 +152,7 @@ def chain_primitive_stage(ctx) -> dict:
         strings = [x.value for x in StringDAO(ctx.conn).list_by_target(target.id)
                    if getattr(x, "value", None)]
         opts = menu.detect_menu(strings)
-        width, model = crawl_op_model(workdir, exe, opts)   # fixed-width read(fd,buf,W) + crawl
+        width, model = shared_op_model(ctx, target, workdir, exe, opts)   # fixed-width + crawl, shared
 
         if pie:
             # PIE: the win address is only known at runtime. Recover the base from an in-band leak

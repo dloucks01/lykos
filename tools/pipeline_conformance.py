@@ -197,6 +197,52 @@ def _run_case(case: Case, gcc: str) -> Result:
         shutil.rmtree(d, ignore_errors=True)
 
 
+def verify_op_model_sharing(gcc: str) -> bool:
+    """Prove the cross-stage op-model artifact composes two stages: heap_trace crawls the live menu
+    once and PERSISTS the op-model; a later, separate stage (oob_index) LOADS it instead of re-driving
+    the binary. Run serially (workers=1) so heap_trace finishes before oob_index starts and the proof
+    is deterministic. Reuses the heap_uaf_read menu target (a global array table so oob_index applies).
+    PASS requires both: the artifact was persisted, and oob_index emitted the 'reused' signal."""
+    from lykos.analyze import register
+    from lykos.analyze.disassemble import enqueue_disassemble
+    from lykos.analyze.dynamic import enqueue_heap_trace, enqueue_oob_index
+    from lykos.analyze.dynamic.heap_discover import _OP_MODEL_KIND
+    from lykos.analyze.ingest import enqueue_triage, ingest
+    from lykos.casestore import CaseStore
+    from lykos.db.dao import ArtifactDAO, EventDAO
+    from lykos.jobs import JobConfig, JobQueue, WorkerPool
+
+    src = next(c.src for c in _CASES if c.name == "heap_uaf_read")
+    d = Path(tempfile.mkdtemp(prefix="conf-share-"))
+    (d / "t.c").write_text(src)
+    exe = d / "share_menu"
+    if subprocess.run([gcc, "-fPIE", "-pie", "-O0", "-w", str(d / "t.c"), "-o", str(exe)],
+                      capture_output=True).returncode:
+        print("%-24s | %-4s | build failed (skip)" % ("op_model_sharing", "SKIP"))
+        return True
+    register()
+    s = CaseStore.open(d / "case"); c = s.cases.create("share")
+    pool = WorkerPool(s.db_path, s.content, JobConfig(workers=1, poll_interval=0.02)); pool.start()
+    try:
+        t = ingest(s, c.id, exe, filename="share_menu")
+        q = JobQueue(s.conn)
+        enqueue_triage(q, t, force=True); pool.wait_idle(60)
+        enqueue_disassemble(q, t, force=True); pool.wait_idle(60)          # populates StringDAO -> opts
+        enqueue_heap_trace(q, t); pool.wait_idle(180)                      # crawls + persists the op-model
+        persisted = any(a.kind == _OP_MODEL_KIND and (a.meta or {}).get("target") == t.sha256
+                        for a in ArtifactDAO(s.conn).list_by_case(c.id))
+        run = enqueue_oob_index(q, t); pool.wait_idle(180)                 # should LOAD, not re-crawl
+        rid = getattr(run, "id", None)
+        evs = EventDAO(s.conn).list(run_id=rid, limit=2000) if rid else []
+        reused = any("reused shared crawl" in ((e.payload or {}).get("msg") or "") for e in evs)
+        ok = persisted and reused
+        print("%-24s | %-4s | persisted=%s reused-by-oob_index=%s" %
+              ("op_model_sharing", "PASS" if ok else "FAIL", persisted, reused))
+        return ok
+    finally:
+        pool.stop(grace=5.0); s.close(); shutil.rmtree(d, ignore_errors=True)
+
+
 def run_all(names=None) -> list[Result]:
     gcc = shutil.which("gcc") or shutil.which("cc")
     if not gcc:
@@ -213,6 +259,11 @@ def run_all(names=None) -> list[Result]:
     npass = sum(1 for r in results if r.ok)
     print("CONFORMANCE: %d/%d bug-classes demonstrated end-to-end through the real autopilot"
           % (npass, len(results)))
+    # Infrastructure check (not a bug class): the cross-stage op-model artifact actually composes two
+    # stages. Only when the full run exercised the shared crawl, i.e. not a name-filtered subset.
+    if not names:
+        print("-" * 110)
+        verify_op_model_sharing(gcc)
     return results
 
 

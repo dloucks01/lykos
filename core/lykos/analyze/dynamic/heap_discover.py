@@ -127,6 +127,59 @@ def crawl_op_model(workdir: Path, exe: Path, opts: list) -> tuple:
     return width, model
 
 
+# Cross-stage menu op-model sharing. Crawling the live menu spawns the target many times; the heap,
+# oob-index, primitive-chaining and fuzz stages each run as a SEPARATE worker process, so an
+# in-process cache cannot share the crawl between them. Persist it as a per-target artifact instead:
+# the first stage to reach it crawls and stores, the rest load it. The payload embeds the target sha
+# so two targets never collide on the content-addressed artifact row, and reuse is gated on the
+# caller's `opts` matching the stored opts, so a load is only ever a true drop-in for that caller's
+# own crawl (behaviour-identical to crawl_op_model, just without the re-drive).
+_OP_MODEL_KIND = "interaction-op-model"
+
+
+def _load_op_model(ctx, target, opts: list):
+    """A persisted (width, model) for this target whose crawl used the SAME opts, or None."""
+    import json
+
+    from ...db.dao import ArtifactDAO
+    try:
+        for a in ArtifactDAO(ctx.conn).list_by_case(ctx.case_id):
+            if a.kind != _OP_MODEL_KIND or (a.meta or {}).get("target") != target.sha256:
+                continue
+            doc = json.loads(ctx.content.get_bytes(a.sha256))
+            if doc.get("opts") == list(opts):
+                return doc.get("width"), doc.get("model") or {}
+    except Exception:                                    # noqa: BLE001
+        _log.debug("op-model load failed for %s", getattr(target, "id", "?"), exc_info=True)
+    return None
+
+
+def _store_op_model(ctx, target, opts: list, width, model: dict) -> None:
+    import json
+    try:
+        doc = {"target": target.sha256, "opts": list(opts), "width": width, "model": model}
+        ctx.put_artifact(_OP_MODEL_KIND, data=json.dumps(doc, sort_keys=True).encode(),
+                         meta={"target": target.sha256, "options": len(opts)})
+    except Exception:                                    # noqa: BLE001
+        _log.debug("op-model store failed for %s", getattr(target, "id", "?"), exc_info=True)
+
+
+def shared_op_model(ctx, target, workdir: Path, exe: Path, opts: list) -> tuple:
+    """crawl_op_model, shared across stages via the artifact store. Reuse a persisted crawl for this
+    target+opts when one exists; otherwise crawl and persist it for the later stages. Removes the 3
+    redundant live re-crawls a menu heap target otherwise pays (heap_trace, then oob_index,
+    chain_primitive and the fuzz campaign each re-driving the same binary)."""
+    if opts:
+        hit = _load_op_model(ctx, target, opts)
+        if hit is not None:
+            ctx.progress(msg="op-model: reused shared crawl (no re-drive)")
+            return hit
+    width, model = crawl_op_model(workdir, exe, opts)
+    if opts and model:                                   # only share a crawl that actually learned a flow
+        _store_op_model(ctx, target, opts, width, model)
+    return width, model
+
+
 def _spawn_menu(workdir: Path, exe: Path):
     """A fresh sandboxed interactive process for the target (stdin/stdout piped), the same isolation
     the crawl uses."""
@@ -504,7 +557,7 @@ def heap_trace_stage(ctx) -> dict:
         # fall back to the generic shapes when crawling finds no allocator flow.
         # Fixed-width read(fd, buf, W) targets consume exactly W bytes per field (dreamdiary-style);
         # the crawl and the op-sequences must pad each field to W instead of newline-delimiting.
-        width, model = crawl_op_model(workdir, exe, opts)
+        width, model = shared_op_model(ctx, target, workdir, exe, opts)
         seqs = menu.menu_op_sequences(model, opts, width=width) \
             or heaptrace.heap_op_sequences(opts) or [
             b"1\n64\nA\n2\n0\n2\n0\n", b"1\n2\n2\n",                 # double-free

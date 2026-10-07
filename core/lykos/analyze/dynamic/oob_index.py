@@ -25,7 +25,7 @@ from ...jobs.registry import register_stage
 from ..dynamic import sandbox
 from ..fuzz import menu
 from ..poc import exploit
-from .heap_discover import crawl_op_model
+from .heap_discover import shared_op_model
 
 OOB_INDEX_STAGE = "oob_index"
 _HELPER = Path(__file__).with_name("heaptrace.py")
@@ -178,7 +178,7 @@ def oob_index_stage(ctx) -> dict:
         strings = [x.value for x in StringDAO(ctx.conn).list_by_target(target.id)
                    if getattr(x, "value", None)]
         opts = menu.detect_menu(strings)
-        width, model = crawl_op_model(workdir, exe, opts)
+        width, model = shared_op_model(ctx, target, workdir, exe, opts)
         idx_opts = _idx_options(model, opts) or ["1", "2", "3", "4"]
         # prime one valid object so the select path is reachable, if an allocating option exists
         alloc = next((o for o in opts if o in model and menu._is_alloc(model[o])), None)
