@@ -764,6 +764,46 @@ int main(void){ setvbuf(stdout,0,2,0);
          note="TTP attacker bytes copied into a page the program makes executable (mprotect / "
               "shellcode), plus a stack overflow to reach it"),
 
+    # ---- C++ . Every case so far is C: mangled symbols, vtables and operator new/delete are a
+    # different recovery problem, and the platform has a C++ UAF -> vtable-hijack path.
+    Case("cpp_uaf_vtable", "",
+         [], want_level=0, want_cwe=("CWE-416", "CWE-843", "CWE-824"), budget=420.0,
+         build=(["sh", "-c",
+                 "cat > t.cpp <<'EOF'\n"
+                 "#include <cstdio>\n#include <cstring>\n#include <cstdlib>\n#include <unistd.h>\n"
+                 "struct Base { virtual void speak(){ puts(\"base\"); } virtual ~Base(){} char buf[32]; };\n"
+                 "struct Derived : Base { void speak() override { puts(\"derived\"); } };\n"
+                 "int main(){ setvbuf(stdout,0,2,0);\n"
+                 "  Base *o = new Derived();\n"
+                 "  for(;;){ printf(\"1.use 2.del 3.write 4.exit\\n> \");\n"
+                 "    int c; if(scanf(\"%d\",&c)!=1) return 0; getchar();\n"
+                 "    if(c==1) o->speak();                 /* virtual call, usable after delete */\n"
+                 "    else if(c==2) delete o;              /* pointer not nulled: UAF */\n"
+                 "    else if(c==3){ printf(\"data: \"); read(0, o, 48); }  /* overwrite the vtable ptr */\n"
+                 "    else return 0; } }\nEOF\n"
+                 "g++ -fno-stack-protector -O0 -w t.cpp -o cpp_uaf"], "cpp_uaf"),
+         note="C++ use-after-free into a virtual call (CWE-416/843): delete leaves the pointer live, "
+              "then the vtable pointer is overwritten and the next virtual call dispatches through it"),
+
+    # ---- PARAMETER-DRIVEN. A tool that refuses to run without its flags is a channel of its own:
+    # nothing happens on any input until the required option is supplied.
+    Case("required_flag_overflow",
+         r"""#include <stdio.h>
+#include <string.h>
+int main(int argc, char **argv){ setvbuf(stdout,0,2,0);
+  const char *mode = NULL;
+  for(int i=1;i<argc;i++) if(!strcmp(argv[i],"-m") && i+1<argc) mode = argv[++i];
+  if(!mode){ printf("usage: %s -m parse < input\n", argv[0]); return 2; }  /* refuses without -m */
+  if(strcmp(mode,"parse")){ printf("unknown mode %s\n", mode); return 2; }
+  char b[64]; printf("data: ");
+  if(scanf("%s", b) != 1) return 0;
+  printf("parsed %s\n", b); return 0; }""",
+         ["-no-pie", "-fno-stack-protector", "-O0", "-w"],
+         want_level=1, want_cwe=("CWE-121", "CWE-787", "CWE-119"), budget=420.0,
+         note="PARAMETER-DRIVEN: the bug is unreachable until `-m parse` is supplied. The usage "
+              "string names both the flag AND its valid value, so discovery is possible -- demanding "
+              "a magic value that appears nowhere would test nothing but luck"),
+
     # ---- MULTIPLE DEFECTS. Every case above asserts ONE effect on one target; the mission claim is
     # "find EVERY crash", so this binary carries two unrelated bugs behind a menu and both must be
     # demonstrated.
@@ -867,8 +907,11 @@ def _run_case(case: Case, gcc: str) -> Result:
         argv, out = case.build
         if not shutil.which(argv[0]):
             return Result(case.name, True, profile="SKIP", reason="no %s" % argv[0])
-        if subprocess.run(list(argv), capture_output=True, cwd=str(d)).returncode:
-            return Result(case.name, False, reason="BUILD FAILED (%s)" % argv[0])
+        made = subprocess.run(list(argv), capture_output=True, cwd=str(d))
+        if made.returncode:
+            err = (made.stderr or made.stdout or b"").decode("utf-8", "replace").strip()
+            return Result(case.name, False, reason="BUILD FAILED (%s): %s" % (
+                argv[0], (err.splitlines() or [""])[-1][:90]))
         produced = sorted(d.rglob(out))
         if not produced:
             return Result(case.name, False, reason="BUILD produced no %s" % out)

@@ -17,7 +17,8 @@ from __future__ import annotations
 
 import os
 
-from ...db.dao import CallEdgeDAO, DynResultDAO, FindingDAO, PocDAO, TargetDAO
+from ...db.dao import (CallEdgeDAO, DynResultDAO, FindingDAO, PocDAO, StringDAO,
+                       TargetDAO)
 from ...jobs.registry import register_stage
 from ..dynamic import sandbox
 from ..dynamic.stage import asan_defect_key, crash_dedup_key, crash_finding_candidate
@@ -69,6 +70,33 @@ def synthesize_stage(ctx) -> dict:
     exe = ctx.scratch() / "target.bin"
     ctx.content.stage_target(target, exe.parent, exe.name)
     os.chmod(exe, 0o755)
+    if not argv_base:
+        # A PARAMETER-DRIVEN target refuses to run until its required option is supplied, and this
+        # stage is enqueued without params, so argv was always empty: the synthesized overflow was
+        # delivered to a program that printed its usage and exited, and the one stage that can prove
+        # this bug class reported "no crash". The fuzz stage already mines the invocation for itself;
+        # do the same here rather than leave the proof unreachable. Best-effort: an undiscoverable
+        # invocation just leaves argv empty, exactly as before.
+        try:
+            from .. import invocation as _inv
+            _strings = [x.value for x in StringDAO(ctx.conn).list_by_target(target.id)
+                        if getattr(x, "value", None)]
+            _found = _inv.discover(_strings)
+            _cand = _inv.materialize(_found, ctx.scratch())
+            if _cand:
+                _smp = ctx.scratch() / "inv-sample"
+                _smp.write_bytes(b"# lykos\n")
+
+                def _probe(a):
+                    return sandbox.run(exe, argv=a, stdin=b"", timeout=max(4.0, timeout),
+                                       arch=target.arch, endianness=target.endianness,
+                                       bits=target.bits)
+                _v = _inv.verify(_probe, exe, _cand, str(_smp))
+                if _v.get("accepted") and _v.get("bare_rejected"):
+                    argv_base = [str(a) for a in _cand]
+                    ctx.progress(msg="required invocation discovered: " + " ".join(argv_base))
+        except Exception:                                # noqa: BLE001 -- never block the synthesis
+            pass                                 # discovery is an optimisation, not a gate
 
     ctx.emit("synth.start", payload={"candidates": candidates[:8], "modes": modes})
     tried, cap = 0, 48

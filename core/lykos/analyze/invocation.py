@@ -231,6 +231,16 @@ def _hint_for(flag: str, placeholder: Optional[str], name: Optional[str] = None)
     for rx, kind, default in _HINTS:
         if rx.search(placeholder or "") or rx.search(flag) or rx.search(name or ""):
             return kind, default
+    # Neither a template nor a known keyword: a plain lowercase placeholder is usually an
+    # ENUMERATED VALID VALUE rather than a metavariable -- `usage: prog -m parse` is documenting
+    # that -m takes "parse". Handing such a flag the generic "x" makes the program reject the
+    # invocation ("unknown mode x"), so nothing the flag unlocks is ever reached and the run looks
+    # like a target with no reachable input at all. A metavariable is conventionally UPPERCASE or
+    # bracketed, both of which are excluded here, so only a concrete-looking token is taken at its
+    # word; anything else still falls back to "x".
+    lit = (placeholder or "").strip().strip("<>[]").strip()
+    if lit and lit == lit.lower() and re.fullmatch(r"[a-z][a-z0-9._-]{1,31}", lit):
+        return "value", lit
     return "value", "x"
 
 
