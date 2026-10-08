@@ -564,7 +564,7 @@ int main(void){ setvbuf(stdout,0,2,0);
          ["-no-pie", "-fno-stack-protector", "-O0", "-w"],
          want_level=0, want_cwe=("CWE-190", "CWE-131", "CWE-122", "CWE-787", "CWE-119"),
          budget=300.0,
-         note="BUG CLASS integer overflow feeding an allocation (CWE-190/131)"),
+         note="BUG CLASS integer overflow feeding an allocation (CWE-190/131). KNOWN GAP -- only static dangerous_api findings (and not even for this defect); the wrap needs a decimal input above 2**28, which blind mutation does not reach, and int_overflow_scan files nothing demonstrated."),
 
     Case("off_by_one",
          r"""#include <stdio.h>
@@ -576,7 +576,7 @@ int main(void){ char b[64]; int i;
   printf("hi %s\n", b); return 0; }""",
          ["-no-pie", "-fno-stack-protector", "-O0", "-w"],
          want_level=0, want_cwe=("CWE-787", "CWE-121", "CWE-119", "CWE-193"), budget=300.0,
-         note="BUG CLASS off-by-one / single-byte overflow (CWE-193/787)"),
+         note="BUG CLASS off-by-one / single-byte overflow (CWE-193/787). KNOWN GAP -- two bytes past a 64-byte buffer lands in padding or the saved frame pointer and does not fault, so there is no crash to find, and no static detector files CWE-193."),
 
     Case("oob_index_write",
          r"""#include <stdio.h>
@@ -614,7 +614,7 @@ static void leak(void){ char b[64]; printf("%.64s\n", b); }   /* never initialis
 int main(void){ setvbuf(stdout,0,2,0); fill(); leak(); return 0; }""",
          ["-no-pie", "-fno-stack-protector", "-O0", "-w"],
          want_level=0, want_cwe=("CWE-457", "CWE-200", "CWE-908"), budget=240.0,
-         note="BUG CLASS use of uninitialised stack memory (CWE-457/908) -> disclosure"),
+         note="BUG CLASS use of uninitialised stack memory (CWE-457/908) -> disclosure. KNOWN GAP -- reading an uninitialised buffer never faults, and nothing compares output against stale frame contents, so the disclosure is not demonstrated."),
 
     # ---- MULTIPLE DEFECTS. Every case above asserts ONE effect on one target; the mission claim is
     # "find EVERY crash", so this binary carries two unrelated bugs behind a menu and both must be
@@ -689,8 +689,15 @@ def _scored(maxlvl, demod, case, file_type=None):
             return any(a in g for a in alts for g in got)
         hit = all(_met(r) for r in case.want_all_cwe)
         return hit, hit
-    ok = (maxlvl >= case.want_level) or bool(demod)
-    return ok, bool(case.want_level and maxlvl >= case.want_level)
+    # A want_level of 0 means "no level is claimed; judge this case by its want_cwe" -- it must NOT
+    # satisfy the level test, or `maxlvl >= 0` makes every such case pass unconditionally (which
+    # silently turned three bug-class cases green while they produced nothing but STATIC findings).
+    lvl_ok = bool(case.want_level) and maxlvl >= case.want_level
+    ok = lvl_ok or bool(demod)
+    # Stop early only on the LEVEL when one is claimed: a demonstrated want_cwe finding often turns
+    # up earlier and from a weaker stage, and stopping on it would cut the case short of its own
+    # claim. With no level claimed, the want_cwe finding IS the claim, so stop on it.
+    return ok, lvl_ok if case.want_level else bool(demod)
 
 
 def _run_case(case: Case, gcc: str) -> Result:
