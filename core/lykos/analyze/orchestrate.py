@@ -816,8 +816,15 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict, stop: t
             # no channel ranking either.
             if _nonnative_image(t):
                 _run_target_stage(store, t, "fuzz", status, stop, dyn)
-            else:
-                _run_target_stage(store, t, "coverage_fuzz", status, stop, dyn)
+            elif _run_target_stage(store, t, "coverage_fuzz", status, stop, dyn) != "done":
+                # AFL can abort for reasons that say nothing about the target: its dry run is
+                # FATAL on a single seed that times out ("results in a timeout",
+                # perform_dry_run()), a missing qemu tracer ends it, a forkserver handshake can
+                # fail. Without a fallback the one campaign a native target gets simply does not
+                # happen, and the run then reports only static findings -- "nothing was run"
+                # wearing the face of "nothing was found", at campaign scale. The blind stage
+                # carries none of those preconditions, so it runs the same corpus regardless.
+                _run_target_stage(store, t, "fuzz", status, stop, dyn)
             _run_target_stage(store, t, "directed_fuzz", status, stop, dyn)
             crashes = _distinct_crashes(store, tid)
             # Multi-channel retry: the best-guess channel is not always where the bug is (a file

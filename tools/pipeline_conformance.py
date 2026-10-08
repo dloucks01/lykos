@@ -456,10 +456,10 @@ int main(void){ char b[64];
   printf("cfg %s\n", b); return 0; }''',
          ["-no-pie", "-fno-stack-protector", "-O0", "-w"],
          want_level=1, want_cwe=("CWE-121", "CWE-787", "CWE-119"), budget=300.0,
-         note="CHANNEL env: the overflow is only reachable by setting APP_CONFIG. KNOWN GAP -- "
-              "env_fuzz finds the SIGSEGV and files a confirmed finding, but capture.MODES is "
-              "(stdin, file, arg) with no env delivery, so the prove loop cannot replay an "
-              "env-delivered input and no verified PoC is ever built. net_fuzz has the same hole."),
+         note="CHANNEL env: the overflow is only reachable by setting APP_CONFIG. Was a known gap "
+              "while capture.MODES was (stdin, file, arg) with no env delivery, so the prove loop "
+              "could not replay an env-delivered input and no verified PoC was ever built; "
+              "sandbox.run takes env_overrides now and this reaches a verified L1."),
 
     Case("socket_overflow",
          r'''#include <stdio.h>
@@ -803,7 +803,14 @@ int main(void){ setvbuf(stdout,0,2,0);
          ["-no-pie", "-fno-stack-protector", "-O0", "-w"],
          want_level=0, want_cwe=("CWE-190", "CWE-131", "CWE-122", "CWE-787", "CWE-119"),
          budget=300.0,
-         note="BUG CLASS integer overflow feeding an allocation (CWE-190/131). KNOWN GAP -- only static dangerous_api findings (and not even for this defect); the wrap needs a decimal input above 2**28, which blind mutation does not reach, and int_overflow_scan files nothing demonstrated."),
+         note="BUG CLASS integer overflow feeding an allocation (CWE-190/131). Was a known gap: "
+              "the wrap needs a DECIMAL input above 2**28 and a byte mutator emits bytes, so it "
+              "was unreachable by budget rather than expensive. textconf.numeric_boundary_seeds "
+              "seeds the wrap thresholds 2**bits//elem_size (+1) verbatim -- note the type "
+              "boundary a fuzzer would try does NOT work here, since 4294967295*16 wraps to a "
+              "size malloc refuses and the program exits cleanly. Gated on a scanf/strtol-family "
+              "import. It also needed the coverage_fuzz->fuzz fallback: afl-fuzz aborts its dry "
+              "run on one timing-out seed, and a native target then got no fuzzing at all."),
 
     Case("off_by_one",
          r"""#include <stdio.h>
@@ -1111,10 +1118,10 @@ int main(void){ setvbuf(stdout,0,2,0); setvbuf(stdin,0,2,0);
          ["-no-pie", "-fno-stack-protector", "-O0", "-w"],
          want_level=0, want_cwe=(),
          want_all_cwe=(("CWE-121", "CWE-787", "CWE-119"), ("CWE-134",)), budget=420.0,
-         note="MULTI: a stack overflow AND a format string, each behind its own menu branch. KNOWN "
-              "GAP -- the overflow is demonstrated (L2) and the run stops there; the format sink on "
-              "the OTHER branch is never demonstrated, so 'find every crash' holds for one defect "
-              "per target but not for several in one binary."),
+         note="MULTI: a stack overflow AND a format string, each behind its own menu branch. Was a "
+              "known gap while the run stopped at the first defect; synthesize_injection reaches "
+              "the format sink on the OTHER branch, so both are reported (CWE-134 and CWE-119) and "
+              "'find every crash' holds for several defects in one binary."),
 ]
 
 

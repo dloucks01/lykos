@@ -25,8 +25,13 @@ from ..dynamic.stage import (
 )
 from . import aflpp
 from .runner import invocation, run_input
-from .stage import (_DEFAULT_SEEDS, _recovered_blocks, format_aware_seeds, msan_detonate,
-                    tsan_detonate)
+from .stage import (
+    _DEFAULT_SEEDS,
+    _recovered_blocks,
+    format_aware_seeds,
+    msan_detonate,
+    tsan_detonate,
+)
 
 COVERAGE_STAGE = "coverage_fuzz"
 TOOL = "aflpp"
@@ -55,6 +60,34 @@ def toolchain_missing(use_qemu=True):
                 f"params.qemu=false to fuzz an afl-instrumented build, or use the built-in "
                 f"black-box `fuzz` stage.")
     return None
+
+
+# A seed slower than this is one afl-fuzz would abort on. Generous relative to
+# AFL's 1000 ms auto-scaled default, so only a pathological seed is dropped.
+_SEED_SCREEN_TIMEOUT = 3.0
+
+
+def _drop_timeout_seeds(ctx, target, exe, seeds, mode) -> set:
+    """Indices of seeds that time out, so they never reach afl-fuzz's dry run.
+
+    STDIN only: a file/argv seed has to be staged per execution and the invocation it needs is
+    not settled at this point, whereas a stdin seed costs one native exec. Returns an empty set
+    on any failure, because screening is an optimisation and must never be the reason a campaign
+    does not start.
+    """
+    if mode != "stdin":
+        return set()
+    bad: set = set()
+    try:
+        from ..dynamic import sandbox
+        for i, data in enumerate(seeds):
+            r = sandbox.run(exe, stdin=data, timeout=_SEED_SCREEN_TIMEOUT, arch=target.arch,
+                            endianness=target.endianness, bits=target.bits)
+            if r.timed_out:
+                bad.add(i)
+    except Exception:                                    # noqa: BLE001 -- advisory screening
+        return set()
+    return bad
 
 
 def _unsupported(target, use_qemu=True):
@@ -220,6 +253,22 @@ def coverage_stage(ctx) -> dict:
             seen.add(s)
             uniq.append(s)
     seeds = uniq or list(_DEFAULT_SEEDS)
+    # Drop any seed that TIMES OUT before AFL ever sees it. afl-fuzz's dry run is fatal on one
+    # ("Test case 'id:000018,...' results in a timeout", perform_dry_run()), so a single slow
+    # seed aborts the WHOLE campaign and the target gets no coverage fuzzing at all -- measured
+    # on a plain native ELF whose input is a count fed to an allocation: the seed that drives it
+    # into a long loop is the very seed that reaches the bug. Screening here is version- and
+    # flag-independent (`-t msec+` only changes AFL's auto-calculation, not this abort), costs
+    # one fast native exec per seed, and is reported rather than silent -- the blind `fuzz`
+    # stage has no such restriction and still runs them.
+    slow = _drop_timeout_seeds(ctx, target, exe, seeds, mode)
+    if slow:
+        seeds = [s for i, s in enumerate(seeds) if i not in slow]
+        ctx.emit("coverage.seeds", payload={
+            "dropped_timeouts": len(slow), "kept": len(seeds),
+            "why": "afl-fuzz aborts its dry run on a seed that times out, which would end the "
+                   "campaign before a single execution; these are still fuzzed blind"})
+    seeds = seeds or list(_DEFAULT_SEEDS)
     seeds_dir = ctx.scratch() / "afl-in"
     seeds_dir.mkdir(parents=True, exist_ok=True)
     for i, s in enumerate(seeds):

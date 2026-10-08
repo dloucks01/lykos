@@ -115,7 +115,59 @@ def seed_for(keys, *, sep: str = "=") -> bytes:
 # Edge values for a field parsed as a NUMBER. A config key fed to atoi / Integer.parseInt / an
 # array index hides its bug behind a specific value -- 0, -1, INT_MAX, overflow -- that random
 # mutation of a text placeholder lands only by luck inside a short (JVM-slow) exec budget.
-_BOUNDARY_VALUES = (b"0", b"-1", b"2147483647", b"2147483648", b"4294967295")
+# A multiplication wraps once the COUNT reaches 2**bits // elem_size, and the product then
+# lands on a SMALL number -- so `malloc(n * elem)` succeeds with a tiny buffer and the loop that
+# follows writes far past it. That is the whole integer-overflow-to-heap-overflow shape
+# (CWE-190 -> CWE-122/787), and the type boundaries below never reach it: 4294967295 * 16 wraps
+# to 4294967280, which is still an enormous allocation that simply FAILS, so the program takes
+# its `if (!p) return` path and exits cleanly on the one value a fuzzer would think to try.
+#
+# The thresholds are derived, not guessed at per target: elem_size is almost always a small
+# power of two (int/long/pointer) or a small struct, so 2**bits//k over small k covers the class.
+# `base + 1` matters as much as `base` -- it wraps to exactly k, the smallest allocation that
+# still enters the loop.
+def _wrap_thresholds(bits, factors):
+    out = []
+    for k in factors:
+        base = (1 << bits) // k
+        out += [base, base + 1]
+    return out
+
+
+# The type boundaries every numeric parser is tested against. These LEAD for a config field,
+# where the bug behind a number is usually an index or a bound: `-1` and `0` are what reach an
+# unchecked array index, and they are the values the JVM/heap cases depend on arriving first.
+_TYPE_BOUNDARIES = [0, -1, 2147483647, 2147483648, 4294967295]
+
+# Ordering matters because seed CALIBRATION detonates the corpus in order and a short budget may
+# never reach the tail -- so each consumer leads with the values its own bug class needs, over
+# one shared pool. A config field wants the type boundaries first (above); a bare count fed to
+# an allocation wants the WRAP thresholds first, since that is the only way its product lands on
+# a size malloc will accept.
+_WRAP_FIRST = tuple(dict.fromkeys(
+    _wrap_thresholds(32, (16, 8, 4, 2))
+    + _TYPE_BOUNDARIES + [1, 4294967296, 65535, 65536]
+    + _wrap_thresholds(32, (32, 64, 24, 256, 12, 3))
+    + _wrap_thresholds(64, (16, 8, 2))
+    + [18446744073709551615]))
+
+#: As text, for a field inside a `key=value` config. Type boundaries first; the wrap thresholds
+#: follow, so an existing caller's `limit=5` gets exactly the five values it always did.
+_BOUNDARY_VALUES = tuple(str(v).encode()
+                         for v in dict.fromkeys(_TYPE_BOUNDARIES + list(_WRAP_FIRST)))
+
+
+def numeric_boundary_seeds(limit: int = 16) -> list:
+    """Bare decimal seeds for a target that reads a NUMBER rather than a structured document.
+
+    `boundary_seeds` covers a numeric field inside a config; this covers the other shape, where
+    the program's entire input is a count or an index read by `scanf("%u")` / `strtoul` / `atoi`.
+    Blind byte mutation effectively never emits the DECIMAL TEXT of a 9-10 digit number, so a
+    wrap-driven allocation bug is unreachable by mutation alone however long the campaign runs --
+    it is not a matter of budget. A newline terminates the value for a reader that scans a line
+    as well as for one that stops at whitespace.
+    """
+    return [str(v).encode() + b"\n" for v in _WRAP_FIRST[:max(0, limit)]]
 
 
 def boundary_seeds(keys, *, sep: str = "=", limit: int = 5) -> list:

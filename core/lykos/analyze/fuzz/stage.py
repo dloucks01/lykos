@@ -156,6 +156,32 @@ def _strings_for(ctx, target):
     return invmod.string_rows(invmod.raw_strings(data), where="scan")
 
 
+# Functions that turn INPUT TEXT into a number. Their presence is what justifies spending
+# calibration execs on decimal boundary seeds: the program's input is (or contains) a count, an
+# index or a size, and those have values that matter rather than lengths that matter.
+_NUMERIC_READERS = frozenset({
+    "scanf", "__isoc99_scanf", "sscanf", "__isoc99_sscanf", "fscanf", "__isoc99_fscanf",
+    "vscanf", "vsscanf", "strtol", "strtoul", "strtoll", "strtoull", "strtoimax",
+    "strtoumax", "atoi", "atol", "atoll", "strtod", "strtof",
+})
+
+
+def _reads_a_number(ctx, target) -> bool:
+    """Does this target parse a number out of its input?
+
+    Asked of the imports rather than guessed, for the same reason the channel ranking is: a
+    `%u` in .rodata proves nothing on its own, since `printf("ok %u", n)` has one too.
+    """
+    try:
+        from ...db.dao import CallEdgeDAO
+        from ..detect.catalog import normalize
+        names = {normalize(e.dst_name) for e in CallEdgeDAO(ctx.conn).list_by_target(target.id)
+                 if e.dst_name}
+        return bool(names & _NUMERIC_READERS)
+    except Exception:                                    # noqa: BLE001 -- seeding is advisory
+        return False
+
+
 def format_aware_seeds(ctx, target) -> list:
     """Seeds that pass the target's INPUT GATE, derived from the binary's own strings: a binary
     format-model seed (jpeg/gif/elf/... -- carries the magic + a minimal valid structure), a text
@@ -187,6 +213,14 @@ def format_aware_seeds(ctx, target) -> list:
             # config field parsed as a number hides an unchecked-index / off-by-one bug behind a
             # specific value that mutating a text placeholder rarely lands inside a short budget.
             seeds += textconf.boundary_seeds(keys)
+    except Exception:
+        pass
+    # A target that parses a NUMBER out of its input has values that matter, not lengths: a
+    # count multiplied into an allocation wraps at 2**32/elem_size, and no amount of byte
+    # mutation emits the decimal text of such a number.
+    try:
+        if _reads_a_number(ctx, target):
+            seeds += textconf.numeric_boundary_seeds(8)
     except Exception:
         pass
     # the binary's own selective strings (magic tokens, config keywords, path prefixes)
@@ -1306,6 +1340,19 @@ def fuzz_stage(ctx) -> dict:
             bseeds = structure.boundary_seeds(fmt)
             if bseeds:
                 corpus = bseeds + list(corpus)
+    if not fmt and _reads_a_number(ctx, target):
+        # No document format to model, and the target converts input text to a number: its bug
+        # is behind a VALUE, not a length. `n * 16` wraps at 2**28, and the wrapped product is
+        # small enough that the allocation succeeds and the following loop runs off it -- while
+        # the type boundary a fuzzer would reach for, 4294967295, wraps to a size malloc simply
+        # refuses, so the program exits cleanly. Blind mutation does not emit nine-digit decimal
+        # text at all, so this class was unreachable by budget, not merely expensive.
+        _nseeds = textconf.numeric_boundary_seeds()
+        corpus = _nseeds + list(corpus)
+        ctx.emit("fuzz.seeds", payload={
+            "numeric_boundaries": len(_nseeds),
+            "why": "the target converts input text to a number (scanf/strtol family), so "
+                   "allocation- and index-wrap thresholds are seeded verbatim"})
     # Always, not only when a format model was chosen: a wrong invocation is the failure that
     # looks most like a clean campaign, so it has to be visible in the run's own events.
     ctx.emit("fuzz.invocation", payload={
