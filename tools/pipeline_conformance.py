@@ -528,6 +528,31 @@ int main(void){ setvbuf(stdout,0,2,0);
                  "javac Boom.java"], "Boom.class"),
          note="FRONT-END JVM: a .class is identified as JVM bytecode, not a native image"),
 
+    # As with pe_overflow: drive JVM bytecode through the real autopilot and demand a DEMONSTRATED
+    # defect. On this runtime an uncaught ArrayIndexOutOfBoundsException is the equivalent of a
+    # signal (jvm.py maps it to CWE-129). The index is the input's LENGTH, so the defect is
+    # reachable by a broad class of inputs.
+    #
+    # It deliberately is NOT `Integer.parseInt(line)` out of range. parseInt needs the WHOLE
+    # trimmed string to be a valid integer, so a blind mutator essentially never produces one:
+    # measured, that version found nothing in a full campaign. Normally directed/concolic search
+    # solves such a predicate, but there is no bytecode-level instrumentation or concolic here
+    # (disassembly recovers 0 functions from a .class), so a JVM defect behind a narrow parse
+    # guard is an honest open gap -- and asserting it would test the mutator's luck, not this
+    # pipeline. What IS tested: a JVM uncaught exception becoming a demonstrated finding.
+    Case("jvm_oob_index", "",
+         [], want_level=0, want_cwe=("CWE-129", "CWE-125", "CWE-20"),
+         requires=("javac", "java"), budget=420.0,
+         build=(["sh", "-c",
+                 "printf 'import java.io.*;\\npublic class Idx{public static void main(String[] a)"
+                 "throws Exception{BufferedReader r=new BufferedReader(new InputStreamReader"
+                 "(System.in));String s=r.readLine();if(s==null)s=\"\";int[] t=new int[4];"
+                 "int i=s.length();"
+                 "System.out.println(\"slot \"+i+\" = \"+t[i]);}}' > Idx.java && javac Idx.java"],
+                "Idx.class"),
+         note="JVM DYNAMIC: an array indexed by the unvalidated input length, demonstrated as an "
+              "uncaught ArrayIndexOutOfBoundsException rather than merely identified as bytecode"),
+
     Case("fmt_pyc", "",
          [], want_level=0, want_cwe=(), want_file_type="pyc", budget=120.0,
          build=(["sh", "-c",

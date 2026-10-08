@@ -856,6 +856,47 @@ def _looks_like_jar(path) -> bool:
         return False
 
 
+def _jvm_class_entry(exe: Path, main_class=None):
+    """(classpath dir, dotted class name) for a bare .class, laid out so the JVM can load it.
+
+    The class name used to come from the FILE STEM, which is wrong twice over for an analysis
+    pipeline. Every stage stages the target under a generic name (`target.bin`), and the JVM then
+    reports `Could not find or load main class target` -- so the program never ran AT ALL, on every
+    execution, while the campaign recorded each one as a non-crash and reported a clean zero. A
+    fuzz campaign measured 274 executions and 0 crashes against a target that faults on almost any
+    input, purely because of this.
+
+    The authoritative name is in the bytecode (`this_class` in the constant pool), so read it from
+    there. The JVM also resolves a class only from a file named `<ClassName>.class` on the
+    classpath, so when the staged file is named anything else -- or the class sits in a package and
+    needs `pkg/Sub/Name.class` beneath the classpath root -- lay out that path and hand back the
+    root. The copy goes UNDER the executable's own directory because that is the only thing bound
+    into the sandbox, and it is created before bwrap binds the directory read-only.
+    """
+    try:
+        from ..jvm import parse_class
+        raw = (parse_class(exe.read_bytes()).classes or [None])[0]
+    except Exception:                                    # noqa: BLE001 -- fall back to the stem
+        raw = None
+    if main_class:
+        raw = main_class.replace(".", "/")
+    if not raw:
+        return str(exe.parent), exe.stem
+    rel = Path(raw + ".class")                           # e.g. Idx.class, com/example/Idx.class
+    dotted = raw.replace("/", ".")
+    if len(rel.parts) == 1 and exe.name == rel.name:
+        return str(exe.parent), dotted                   # already loadable where it sits
+    root = exe.parent / "_lykos_cp"
+    dst = root / rel
+    try:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if not dst.exists():
+            shutil.copy2(exe, dst)
+        return str(root), dotted
+    except OSError:
+        return str(exe.parent), exe.stem
+
+
 def _run_java(exe, *, argv, stdin, timeout, mem_mb, capture, main_class=None) -> RunResult:
     java = _java()
     if not java:
@@ -866,9 +907,8 @@ def _run_java(exe, *, argv, stdin, timeout, mem_mb, capture, main_class=None) ->
     if _looks_like_jar(exe):
         launch = ["-jar", str(exe)]
     else:
-        # a bare .class: the class name is its own, and the classpath is its directory
-        cls = main_class or exe.stem
-        launch = ["-cp", str(exe.parent), cls]
+        cpdir, cls = _jvm_class_entry(exe, main_class)
+        launch = ["-cp", cpdir, cls]
     cmd = [java, *_JVM_FLAGS, *launch] + [argv_bytes(a) for a in argv]
     eff_timeout = max(timeout, 10.0)                 # JVM startup is tens of milliseconds
     preexec = _rlimits(max(mem_mb, 2048), int(eff_timeout) + 2, set_as=False,

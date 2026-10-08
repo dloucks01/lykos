@@ -433,6 +433,17 @@ _OVERFLOW_CWES = frozenset({"CWE-119", "CWE-120", "CWE-121", "CWE-122", "CWE-125
 _FOREIGN_SUBSTRATE_TYPES = frozenset({"pe", "class", "jar", "jvm"})
 
 
+def _nonnative_image(target) -> bool:
+    """Is this target something AFL fundamentally cannot instrument?
+
+    AFL rewrites/traces MACHINE CODE. Bytecode (.class/.jar) is not machine code, and a PE runs
+    under wine rather than as a host process, so coverage_fuzz cannot apply to either -- it has to
+    be the blind campaign instead. Distinct from _expensive_substrate, which includes a foreign
+    ARCH: AFL++ qemu-mode genuinely does handle those, given afl-qemu-trace.
+    """
+    return (getattr(target, "file_type", "") or "").lower() in _FOREIGN_SUBSTRATE_TYPES
+
+
 def _expensive_substrate(target) -> bool:
     """Is one execution of this target orders of magnitude dearer than a native exec?
 
@@ -688,8 +699,24 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict, stop: t
             # strictly more. The stage no-ops without recovered stack buffers.
             if _expensive_substrate(t):
                 _run_target_stage(store, t, "synthesize_poc", status, stop)
-            # coverage fuzz (AFL, falls back to blind if unavailable), then directed on the same channel.
-            _run_target_stage(store, t, "coverage_fuzz", status, stop, dyn)
+            # coverage fuzz (AFL, falls back to blind if unavailable), then directed on the same
+            # channel -- EXCEPT on a non-native image, where AFL cannot apply at all. AFL
+            # instruments machine code: a .class/.jar is bytecode and a PE runs under wine, so
+            # coverage_fuzz got as far as AFL++ qemu-mode and then ERRORED ("needs afl-qemu-trace"),
+            # which is not the documented "falls back to blind". directed_fuzz then had no recovered
+            # functions to direct at and synthesize_poc has no stack frame to work from, so a JVM
+            # target reached the end of the ladder having executed the program ZERO times.
+            #
+            # The blind campaign is the right stage for these and already knows them -- it carries
+            # the measured per-execution costs for wine (~1/s) and the JVM (~36/s) and reads a
+            # defect as an uncaught exception rather than a signal -- but the autopilot never ran
+            # it: "fuzz" appeared only in the stage registry. It splits its budget across every
+            # channel, which is what this needs, since a bytecode target has no call edges and so
+            # no channel ranking either.
+            if _nonnative_image(t):
+                _run_target_stage(store, t, "fuzz", status, stop, dyn)
+            else:
+                _run_target_stage(store, t, "coverage_fuzz", status, stop, dyn)
             _run_target_stage(store, t, "directed_fuzz", status, stop, dyn)
             crashes = _distinct_crashes(store, tid)
             # Multi-channel retry: the best-guess channel is not always where the bug is (a file
