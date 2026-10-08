@@ -16,6 +16,53 @@ ARTIFACT_ROLES = frozenset({"input", "output"})
 FINDING_STATES = ["candidate", "corroborated", "confirmed", "poc-backed"]
 SEVERITIES = ["info", "low", "medium", "high", "critical"]
 
+#: CWE classes where a working reproducer PROVES exploitable impact, so a severity the first
+#: pattern detector guessed must not hold the finding down. This is the floor's real condition:
+#: jhead's proven out-of-bounds read carried the `low` its pattern detector assigned, and the
+#: one finding in the report with a verified PoC was badged below unproven advisories.
+#:
+#: Conditioning on STATE alone was too wide. A managed runtime's exception tables
+#: (jvm/pyc/dotnet.EXCEPTION_CWE) deliberately rank an uncaught `FileNotFoundException` or
+#: `IllegalStateException` at info/low -- a program that validates its input by throwing is
+#: doing the right thing, and 42 of those 91 mappings say so in as many words -- yet every one
+#: of them reproduces easily and so was promoted to `high`, burying the findings that matter.
+#: That is the exact outcome those tables were written to avoid.
+MEMORY_CORRUPTION_CWES = frozenset({
+    "CWE-119", "CWE-120", "CWE-121", "CWE-122", "CWE-124", "CWE-125", "CWE-126", "CWE-127",
+    "CWE-129", "CWE-131", "CWE-134", "CWE-190", "CWE-191", "CWE-193", "CWE-415", "CWE-416",
+    "CWE-476", "CWE-590", "CWE-680", "CWE-761", "CWE-787", "CWE-788", "CWE-822", "CWE-823",
+    "CWE-824", "CWE-825",
+})
+
+#: Detectors that merely SPOT something in the image -- no execution, nothing demonstrated.
+#: Everything that decides "has this been proven?" filters on this, so it is kept here beside
+#: the states and severities rather than copied into each consumer.
+#:
+#: It used to be `{dangerous_api, detect_cwe, cwe_scan, source_sink_scan}` in two places, where
+#: three of the four are STAGE names and can never match a finding's `detector` column -- so
+#: the filter whose whole job is "detected is not demonstrated" enforced it for one detector
+#: out of fourteen. Names below are the ones the detectors actually file under.
+#:
+#: Deliberately NOT listed, and each for a reason: `secret_poc` demonstrates by re-extracting
+#: the credential (the extractability IS the defect, which is why it needs no crash);
+#: `firmware_carve` and `unpack` report a structural fact about a container rather than a
+#: candidate site; `cross_binary_taint` and `ipc_taint` were left out because this audit did
+#: not establish whether they execute, and counting a demonstration as static would HIDE real
+#: evidence -- the costlier mistake of the two.
+STATIC_DETECTORS = frozenset({
+    # detect/ -- pattern, frame and taint analysis over recovered code
+    "dangerous_api", "stack_frame", "hardcoded_secrets", "weak_crypto", "weak_random",
+    "insecure_tmp", "toctou", "toctou_race", "hardening", "tainted_deref",
+    "int_overflow_check", "int_overflow_alloc", "scanf_bounded_overflow", "heap_fptr_call",
+    "lang_sinks", "scriptscan", "pyc_scan",
+    # detect/jvmdetect -- the constant pool, read directly
+    "jvm_sink", "jvm_crypto", "jvm_tls",
+    # fingerprint/ -- version matching and source/config scanning
+    "cve_fingerprint", "cve_source", "embedded_config", "int_overflow", "uaf", "source_sink",
+    # source pattern matching
+    "weggli",
+})
+
 
 @dataclass
 class Case:

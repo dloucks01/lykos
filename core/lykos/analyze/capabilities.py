@@ -48,8 +48,8 @@ STAGES: dict = {
     "heap_check":           (FIND,  "Heap check", "guard-page allocator under LD_PRELOAD"),
     "behavior_trace":       (FIND,  "Behaviour trace", "syscalls, exec, network, anti-debug"),
     "debug_monitor":        (FIND,  "Runtime monitor", "break on dangerous calls, live"),
-    "synthesize_poc":       (FIND,  "Synthesize PoC", "derive the overflow from the frame; "
-                                                      "no execution"),
+    "synthesize_poc":       (FIND,  "Synthesize PoC", "derive the overflow from the frame, "
+                                                      "then detonate once -- no fuzzing"),
     "synthesize_injection": (FIND,  "Injection PoC", "confirm a command/format injection"),
     "synthesize_secret":    (FIND,  "Secret PoC", "package a recovered credential"),
     "root_cause":           (PROVE, "Root cause", "name the faulting function and the CWE"),

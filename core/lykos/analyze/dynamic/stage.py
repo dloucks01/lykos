@@ -27,6 +27,23 @@ _SIG_CWE = {
     "SIGSEGV": ("CWE-119", "critical"), "SIGBUS": ("CWE-119", "critical"),
     "SIGABRT": ("CWE-787", "high"), "SIGFPE": ("CWE-369", "high"),
     "SIGILL": ("CWE-119", "high"),
+    # A Windows PE faults with a NAMED exception, and the name says more than the signal it
+    # corresponds to -- `STACK_BUFFER_OVERRUN` is the /GS cookie check firing, which is the
+    # clearest evidence of a stack overflow this platform can get from any substrate. All nine
+    # of them used to miss this table and take the generic ("CWE-119", "high") fallback, so a
+    # PE divide-by-zero was filed as memory corruption while the SAME defect on a native target
+    # went to CWE-369: the substrate, not the bug, decided the weakness class.
+    "EXCEPTION_ACCESS_VIOLATION": ("CWE-119", "critical"),       # c0000005, the PE SIGSEGV
+    "EXCEPTION_STACK_BUFFER_OVERRUN": ("CWE-121", "critical"),   # c0000409, /GS cookie tripped
+    "EXCEPTION_HEAP_CORRUPTION": ("CWE-122", "critical"),        # c0000374, heap guard tripped
+    "EXCEPTION_STACK_OVERFLOW": ("CWE-674", "high"),             # c00000fd, recursion
+    "EXCEPTION_INT_DIVIDE_BY_ZERO": ("CWE-369", "high"),         # c0000094, as SIGFPE
+    "EXCEPTION_ILLEGAL_INSTRUCTION": ("CWE-119", "high"),        # c000001d, as SIGILL
+    # A runtime CHECK deliberately terminating the process: corruption was DETECTED, not
+    # silently exploited. That is a reachable assertion, not a hijack.
+    "EXCEPTION_FAIL_FAST_EXCEPTION": ("CWE-617", "high"),        # c0000602, __fastfail
+    "EXCEPTION_NONCONTINUABLE_EXCEPTION": ("CWE-617", "medium"),  # c0000025
+    "EXCEPTION_BREAKPOINT": ("CWE-617", "medium"),               # 80000003, an int3
 }
 
 

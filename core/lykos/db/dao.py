@@ -15,6 +15,7 @@ from .connection import transaction
 from .models import (
     ARTIFACT_ROLES,
     FINDING_STATES,
+    MEMORY_CORRUPTION_CWES,
     RUN_STATUSES,
     SEVERITIES,
     AnalysisRun,
@@ -734,6 +735,11 @@ class FindingDAO(BaseDAO):
             "confidence=excluded.confidence, updated_at=excluded.updated_at",
             (fid, chan, run_id, state, severity, confidence, now))
 
+    def _cwe_of(self, fid: str) -> str:
+        """The finding's weakness class, for rules that must not apply to every class."""
+        r = self.conn.execute("SELECT cwe FROM finding WHERE id=?", (fid,)).fetchone()
+        return (r["cwe"] if r and r["cwe"] else "") or ""
+
     def _recompute(self, fid: str) -> tuple:
         """The finding is the STRONGEST thing any channel currently says about it."""
         rows = self.conn.execute(
@@ -748,7 +754,14 @@ class FindingDAO(BaseDAO):
         # pattern detector assigned -- low -- so the one finding in the report with a verified
         # PoC was badged below unproven advisories. Severity here means demonstrated impact,
         # and a PoC is the strongest evidence of it the platform can produce.
-        if state == "poc-backed" and _rank(SEVERITIES, severity) < _rank(SEVERITIES, "high"):
+        #
+        # Gated on the CWE, because conditioning on the state alone was too wide: a managed
+        # runtime's exception table deliberately ranks an uncaught FileNotFoundException at
+        # `info` -- a missing catch, not memory corruption -- and such a fault reproduces on
+        # the first input, so EVERY one of them was promoted to `high`. Where the weakness
+        # class itself says the impact is limited, the reproducer does not change that.
+        if (state == "poc-backed" and _rank(SEVERITIES, severity) < _rank(SEVERITIES, "high")
+                and self._cwe_of(fid) in MEMORY_CORRUPTION_CWES):
             severity = "high"
         return state, severity, max((r["confidence"] or 0.0) for r in rows)
 

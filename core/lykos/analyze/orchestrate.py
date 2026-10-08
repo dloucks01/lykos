@@ -25,6 +25,7 @@ _log = logging.getLogger(__name__)
 
 from ..casestore import CaseStore
 from ..db.dao import DynResultDAO, FindingDAO, FunctionDAO, PocDAO
+from ..db.models import STATIC_DETECTORS
 from ..jobs.queue import JobQueue
 from . import substrate
 
@@ -453,7 +454,11 @@ def _cve_crash_origins(store, target_id) -> dict:
 # Detectors that report a defect from the CODE rather than from an observed effect. A finding from
 # one of these is "detected", not "demonstrated", so it must never satisfy a check for whether a
 # bug class has actually been proven -- `dangerous_api` files a strcpy() sighting as corroborated.
-_STATIC_DETECTORS = frozenset({"dangerous_api", "detect_cwe", "cwe_scan", "source_sink_scan"})
+# Imported, not re-stated: three of the four names this used to hold ("detect_cwe",
+# "cwe_scan", "source_sink_scan") are STAGE names and could never match a finding's
+# detector column, so the "detected is not demonstrated" rule covered one detector of
+# fourteen. See db.models.STATIC_DETECTORS.
+_STATIC_DETECTORS = STATIC_DETECTORS
 # The unbounded stack/buffer-copy family that synthesize_poc exists to demonstrate.
 _OVERFLOW_CWES = frozenset({"CWE-119", "CWE-120", "CWE-121", "CWE-122", "CWE-125", "CWE-193",
                             "CWE-242", "CWE-787"})

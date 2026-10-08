@@ -162,13 +162,21 @@ def multi_debug_stage(ctx) -> dict:
     crash_fn = (rc["slice"].get("crash_function") or {})
     _fault_pc = (DynResultDAO(ctx.conn).fault_pc_for(victim.id, input_sha)
                  if input_sha else None)
+    # Keyed by the CRASH's dedup key, so this merges into the finding the fuzzer/PoC stages
+    # already filed -- and `upsert` rewrites the detector on merge. Writing "multi_debug" there
+    # re-credited a defect that `poc`/`primitive`/`root_cause` had proven to this stage, which
+    # loses which capability actually found it (the per-channel verdict trail still holds every
+    # contributor; it is the finding's headline detector that was wrong). `rootcause`'s
+    # attribution_upsert guards the same hazard the same way.
+    _key = crash_dedup_key(cap["signal_name"], _fault_pc)
+    _prior = next((f for f in fdao.list_by_target(victim.id) if f.dedup_key == _key), None)
     fdao.upsert(victim.id, victim.case_id, {
         "cwe": v["cwe"], "title": f"Root cause ({relation}): {v['class']}",
         "severity": v["severity"], "state": "confirmed", "confidence": 0.9,
-        "detector": "multi_debug",
+        "detector": (_prior.detector if _prior else "multi_debug"),
         "site_addr": _hex(crash_fn.get("static_addr")),
         "function_addr": crash_fn.get("func_addr"),
-        "dedup_key": crash_dedup_key(cap["signal_name"], _fault_pc),
+        "dedup_key": _key,
         "evidence": [{"channel": "multi-process-debug", "detail": detail}]})
 
     # A crash found through a forked child demonstrates the child's findings just as much.

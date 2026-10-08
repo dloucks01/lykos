@@ -19,10 +19,8 @@ _PRIM_CWE = {"instruction-pointer-control": "CWE-787",
              "arbitrary-read": "CWE-125",
              "controlled-read": "CWE-125"}
 # root_cause classes that are already a memory-corruption defect and so are kept as-is.
-_MEM_CORRUPTION = frozenset({"CWE-119", "CWE-120", "CWE-121", "CWE-122", "CWE-124", "CWE-125",
-                             "CWE-126", "CWE-127", "CWE-787", "CWE-788", "CWE-193", "CWE-415",
-                             "CWE-416", "CWE-590", "CWE-761", "CWE-822", "CWE-823", "CWE-824",
-                             "CWE-825"})
+# The one definition lives beside the finding vocabulary; a second copy here would drift.
+from ...db.models import MEMORY_CORRUPTION_CWES as _MEM_CORRUPTION
 from ...jobs.registry import register_stage
 from ..debug import qemu_gdb, rootcause
 from ..dynamic import sandbox

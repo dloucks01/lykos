@@ -25,8 +25,6 @@ if str(CORE) not in sys.path:
     sys.path.insert(0, str(CORE))
 
 
-# static pattern detectors -- a finding from one of these is DETECTED, not demonstrated.
-_STATIC_DETECTORS = {"dangerous_api", "detect_cwe", "cwe_scan", "source_sink_scan"}
 
 
 # A plain unbounded-%s stack overflow. Shared by the build-realism and ARCHITECTURE cases so those
@@ -1144,7 +1142,12 @@ def _verdict(s, target, case):
     unpack notice while its child had been driven to a demonstrated overflow. Each case here ingests
     exactly one artifact, so "the case" and "that artifact plus what was carved out of it" are the
     same set."""
+    # STATIC_DETECTORS is imported, not restated. Restating it here is how the gate came to
+    # hold three STAGE names that match no finding's detector, so "detected is not
+    # demonstrated" was enforced for one detector out of fourteen and static evidence could
+    # score a case green.
     from lykos.db.dao import FindingDAO, PocDAO, TargetDAO
+    from lykos.db.models import STATIC_DETECTORS as _STATIC_DETECTORS
     tids = [t.id for t in TargetDAO(s.conn).list_by_case(target.case_id)] or [target.id]
     pocs = [pc for tid in tids for pc in PocDAO(s.conn).list_by_target(tid)]
     maxlvl = max((int(pc.level[1]) for pc in pocs

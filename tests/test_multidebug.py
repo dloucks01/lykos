@@ -79,6 +79,42 @@ def test_multi_debug_stage_blames_fork_child(store, case, pool, gdbpath, forkcra
     assert "fork" in ev and "forkcrash" in ev
 
 
+def test_multi_debug_does_not_steal_credit_for_a_finding_others_proved(
+        store, case, pool, gdbpath, forkcrash):
+    """It keys on the CRASH's dedup key, so it MERGES into whatever the fuzzer and the PoC
+    stages already filed -- and `upsert` rewrites the detector on merge.
+
+    Writing its own name there re-credited a defect that `poc`/`primitive`/`root_cause` had
+    proven to this stage. Nothing is lost from the per-channel verdict trail, but the finding's
+    headline detector -- which is what a report shows and what detector-keyed filters read --
+    named the wrong capability. Latent until the autopilot began scheduling this stage, and the
+    conformance gate usually early-stops at L1 before it runs, so only a full run shows it.
+    """
+    fd = FindingDAO(store.conn)
+    t = ingest(store, case.id, forkcrash, filename="forkcrash")
+    q = JobQueue(store.conn)
+    params = {"input": base64.b64encode(b"A" * 512).decode(), "input_mode": "stdin"}
+    assert q.runs.get(enqueue_multi_debug(q, t, params=params).id) is not None
+    assert pool.wait_idle(40)
+    made = [f for f in fd.list_by_target(t.id) if f.detector == "multi_debug"]
+    assert made, "expected a multi_debug finding on the first run"
+    key = made[0].dedup_key
+
+    # Now stand in for the stage that actually proved it, on the same dedup key.
+    fd.upsert(t.id, case.id, {"cwe": made[0].cwe, "title": "Reproduced crash", "severity": "high",
+                              "state": "poc-backed", "confidence": 0.95, "detector": "poc",
+                              "dedup_key": key})
+    assert next(f for f in fd.list_by_target(t.id) if f.dedup_key == key).detector == "poc"
+
+    run = enqueue_multi_debug(q, t, params=params)
+    assert pool.wait_idle(40) and q.runs.get(run.id).status == "done"
+    merged = next(f for f in fd.list_by_target(t.id) if f.dedup_key == key)
+    assert merged.detector == "poc", \
+        f"multi_debug re-credited a finding proven by {merged.detector!r} to itself"
+    # ...and its own evidence is still attached, so nothing was lost by not renaming it.
+    assert any("multi-process debug" in (e.get("detail") or "") for e in merged.evidence)
+
+
 def test_multi_debug_reports_unsupported_without_gdb(store, case, pool, monkeypatch):
     # no gdb -> the stage degrades cleanly (does not raise, files no finding)
     monkeypatch.setattr("lykos.analyze.debug.gdb.locate_gdb", lambda *a, **k: None)
