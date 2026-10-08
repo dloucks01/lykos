@@ -38,6 +38,18 @@ class Case:
     want_cwe: tuple[str, ...]            # or: a non-static poc-backed finding carrying one of these
     note: str = ""
     budget: float = 300.0
+    # A PRECISION case: this target has no bug, so the run must demonstrate NOTHING. Static pattern
+    # detectors may still fire (that is "detected", not "demonstrated") and are ignored, exactly as
+    # they are when scoring a positive case.
+    clean: bool = False
+    # Every ENTRY here must be demonstrated, not just one of them -- for a binary carrying SEVERAL
+    # distinct bugs, which is what "find every crash" actually claims. An entry may be a tuple of
+    # acceptable alternatives, because one defect maps to several CWEs depending on which stage
+    # files it (a stack overflow lands as CWE-121, -787 or -119).
+    want_all_cwe: tuple = ()
+    # Toolchain prefix for a cross-architecture case ("aarch64-linux-gnu-"); the case SKIPS when the
+    # cross compiler is absent rather than failing the gate on a machine that cannot build it.
+    cross: str = ""
 
 
 _CASES: list[Case] = [
@@ -315,6 +327,113 @@ int main(void){ setvbuf(stdout,0,2,0); setvbuf(stdin,0,2,0);
          ["-fPIE", "-pie", "-O0", "-w"],
          want_level=3, want_cwe=("CWE-416",), budget=600.0,
          note="0x100 size cap -> split fake FILE (wide data in our own chunk) -> FSOP shell (L3)"),
+
+    # ---- PRECISION. Every other case asks "is the effect found?"; this one asks "does the tool stay
+    # quiet when there is nothing to find?" Without it a precision regression is invisible.
+    Case("clean_no_bug",
+         r'''#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+int main(void){ setvbuf(stdout,0,2,0);
+  char name[64], out[160];
+  printf("name: "); if(!fgets(name,sizeof name,stdin)) return 0;
+  name[strcspn(name,"\n")]=0;
+  printf("count: "); long n; if(scanf("%ld",&n)!=1) return 0;
+  if(n<0||n>16){ puts("out of range"); return 1; }
+  snprintf(out,sizeof out,"hello %.32s x%ld",name,n);   /* bounded, no user-controlled format */
+  puts(out);
+  char *p=calloc((size_t)n+1,8); if(!p) return 1;
+  memset(p,'A',(size_t)n*8); p[(size_t)n*8]=0; puts(p);
+  free(p); p=NULL;                                      /* nulled: no use-after-free */
+  return 0; }''',
+         ["-fPIE", "-pie", "-fstack-protector-all", "-Wl,-z,relro,-z,now", "-O1", "-w"],
+         want_level=0, want_cwe=(), clean=True, budget=240.0,
+         note="PRECISION: bounded reads, no user format, no heap misuse -> nothing may be demonstrated"),
+
+    # ---- INPUT CHANNELS. The pipeline has to find the bug through the channel the program actually
+    # reads; every case above is stdin, so argv/file/env regressions cannot be seen.
+    Case("argv_overflow",
+         r'''#include <stdio.h>
+#include <string.h>
+int main(int argc, char **argv){ char b[64];
+  if(argc<2){ puts("usage: prog ARG"); return 1; }
+  strcpy(b, argv[1]);                                   /* unbounded copy from argv */
+  printf("got %s\n", b); return 0; }''',
+         ["-no-pie", "-fno-stack-protector", "-O0", "-w"],
+         want_level=1, want_cwe=("CWE-121", "CWE-787", "CWE-119"), budget=300.0,
+         note="CHANNEL argv: the overflow is only reachable through argv[1]"),
+
+    Case("file_overflow",
+         r'''#include <stdio.h>
+#include <string.h>
+int main(int argc, char **argv){ char b[64];
+  if(argc<2){ puts("usage: prog FILE"); return 1; }
+  FILE *f = fopen(argv[1], "rb"); if(!f) return 1;
+  size_t n = fread(b, 1, 512, f);                       /* 512 into a 64-byte buffer */
+  fclose(f); printf("read %zu\n", n); puts(b); return 0; }''',
+         ["-no-pie", "-fno-stack-protector", "-O0", "-w"],
+         want_level=1, want_cwe=("CWE-121", "CWE-787", "CWE-119"), budget=300.0,
+         note="CHANNEL file: the overflow is only reachable by the contents of a named file"),
+
+    Case("env_overflow",
+         r'''#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+int main(void){ char b[64];
+  char *e = getenv("APP_CONFIG"); if(!e){ puts("APP_CONFIG unset"); return 1; }
+  strcpy(b, e);                                         /* unbounded copy from the environment */
+  printf("cfg %s\n", b); return 0; }''',
+         ["-no-pie", "-fno-stack-protector", "-O0", "-w"],
+         want_level=1, want_cwe=("CWE-121", "CWE-787", "CWE-119"), budget=300.0,
+         note="CHANNEL env: the overflow is only reachable by setting APP_CONFIG. KNOWN GAP -- "
+              "env_fuzz finds the SIGSEGV and files a confirmed finding, but capture.MODES is "
+              "(stdin, file, arg) with no env delivery, so the prove loop cannot replay an "
+              "env-delivered input and no verified PoC is ever built. net_fuzz has the same hole."),
+
+    # ---- BUILD REALISM. Real binaries are optimised and stripped; -O0 with symbols hides any
+    # reliance on symbol names or on an unoptimised frame layout.
+    Case("stripped_opt_overflow",
+         r'''#include <stdio.h>
+int main(void){ char b[64]; printf("in: ");
+  if(scanf("%s", b) != 1) return 0;                      /* unbounded %s into a 64-byte buffer */
+  printf("hi %s\n", b); return 0; }''',
+         ["-no-pie", "-fno-stack-protector", "-O2", "-s", "-w"],
+         want_level=1, want_cwe=("CWE-121", "CWE-787", "CWE-119"), budget=300.0,
+         note="BUILD: -O2 and STRIPPED -- no symbols to lean on, optimised frame"),
+
+    # ---- ARCHITECTURE. Everything else is x86-64, so an aarch64 regression is invisible. Skips
+    # cleanly when the cross toolchain is absent.
+    Case("arm64_overflow",
+         r'''#include <stdio.h>
+int main(void){ char b[64]; printf("in: ");
+  if(scanf("%s", b) != 1) return 0;
+  printf("hi %s\n", b); return 0; }''',
+         ["-static", "-fno-stack-protector", "-O0", "-w"],
+         want_level=1, want_cwe=("CWE-121", "CWE-787", "CWE-119"),
+         cross="aarch64-linux-gnu-", budget=360.0,
+         note="ARCH aarch64 (static, under qemu): the crash must still be found off x86-64"),
+
+    # ---- MULTIPLE DEFECTS. Every case above asserts ONE effect on one target; the mission claim is
+    # "find EVERY crash", so this binary carries two unrelated bugs behind a menu and both must be
+    # demonstrated.
+    Case("multi_bug",
+         r'''#include <stdio.h>
+#include <string.h>
+int main(void){ setvbuf(stdout,0,2,0); setvbuf(stdin,0,2,0);
+  char b[64], fmt[64];
+  printf("1.echo 2.report\n> ");
+  int o; if(scanf("%d",&o)!=1) return 0; getchar();
+  if(o==1){ printf("data: "); if(scanf("%s",b)!=1) return 0; printf("%s\n",b); }  /* overflow */
+  else if(o==2){ printf("label: "); if(!fgets(fmt,sizeof fmt,stdin)) return 0;
+                 printf(fmt); }                          /* user-controlled format string */
+  return 0; }''',
+         ["-no-pie", "-fno-stack-protector", "-O0", "-w"],
+         want_level=0, want_cwe=(),
+         want_all_cwe=(("CWE-121", "CWE-787", "CWE-119"), ("CWE-134",)), budget=420.0,
+         note="MULTI: a stack overflow AND a format string, each behind its own menu branch. KNOWN "
+              "GAP -- the overflow is demonstrated (L2) and the run stops there; the format sink on "
+              "the OTHER branch is never demonstrated, so 'find every crash' holds for one defect "
+              "per target but not for several in one binary."),
 ]
 
 
@@ -340,9 +459,29 @@ def _verdict(s, target, case):
                   if getattr(pc, "verified", False) and pc.level and pc.level[0] == "L"), default=0)
     fs = [f for f in FindingDAO(s.conn).list_by_target(target.id)
           if f.state in ("poc-backed", "corroborated")]
+    wanted = list(case.want_cwe)
+    for req in case.want_all_cwe:                        # an entry may be a group of alternatives
+        wanted += list(req) if isinstance(req, (tuple, list)) else [req]
     demod = [(f.detector, f.cwe, (f.title or "")[:40]) for f in fs
-             if f.detector not in _STATIC_DETECTORS and any(w in (f.cwe or "") for w in case.want_cwe)]
+             if f.detector not in _STATIC_DETECTORS and any(w in (f.cwe or "") for w in wanted)]
     return maxlvl, demod, fs
+
+
+def _scored(maxlvl, demod, case):
+    """Did this case pass, and is it finished? `done` gates the early stop, so it must never be true
+    before the case has shown everything it asserts -- otherwise the run is cut short of its own
+    claim (which is how an earlier version let a format case 'pass' at L1)."""
+    if case.clean:                                       # precision: nothing may be demonstrated
+        return (maxlvl == 0 and not demod), False        # never stop early -- absence needs the time
+    if case.want_all_cwe:                                # every listed defect must be demonstrated
+        got = {c for _, c, _ in demod}
+        def _met(req):
+            alts = req if isinstance(req, (tuple, list)) else (req,)
+            return any(a in g for a in alts for g in got)
+        hit = all(_met(r) for r in case.want_all_cwe)
+        return hit, hit
+    ok = (maxlvl >= case.want_level) or bool(demod)
+    return ok, bool(case.want_level and maxlvl >= case.want_level)
 
 
 def _run_case(case: Case, gcc: str) -> Result:
@@ -355,7 +494,12 @@ def _run_case(case: Case, gcc: str) -> Result:
     d = Path(tempfile.mkdtemp(prefix="conf-"))
     (d / "t.c").write_text(case.src)
     exe = d / case.name
-    if subprocess.run([gcc, *case.cflags, str(d / "t.c"), "-o", str(exe)],
+    cc = gcc
+    if case.cross:                                       # cross-arch case: needs its own toolchain
+        cc = shutil.which(case.cross + "gcc") or ""
+        if not cc:
+            return Result(case.name, True, profile="SKIP", reason="no %sgcc" % case.cross)
+    if subprocess.run([cc, *case.cflags, str(d / "t.c"), "-o", str(exe)],
                       capture_output=True).returncode:
         return Result(case.name, False, reason="BUILD FAILED (skip)")
     register()
@@ -386,20 +530,28 @@ def _run_case(case: Case, gcc: str) -> Result:
         while th.is_alive() and time.time() - t0 < case.budget:
             time.sleep(1.0)
             try:
-                ml, _, _ = _verdict(s, t, case)
+                ml, dm, _ = _verdict(s, t, case)
             except Exception:                            # noqa: BLE001 -- a transient DB lock; retry
                 continue
-            if case.want_level and ml >= case.want_level:
+            if _scored(ml, dm, case)[1]:
                 early = True
                 break
         if th.is_alive():
             stop.set(); th.join(timeout=60)
         maxlvl, demod, fs = _verdict(s, t, case)
-        ok = (maxlvl >= case.want_level) or bool(demod)
+        ok, _ = _scored(maxlvl, demod, case)
         shown = demod or [(f.detector, f.cwe, (f.title or "")[:30]) for f in fs]
+        if ok:
+            why = ""
+        elif case.clean:
+            why = "CLEAN target but %d demonstrated finding(s) / L%d" % (len(demod), maxlvl)
+        elif case.want_all_cwe:
+            why = "want ALL of %s demonstrated; got %s" % (case.want_all_cwe,
+                                                           sorted({c for _, c, _ in demod}))
+        else:
+            why = "want L%d / %s demonstrated; got L%d" % (case.want_level, case.want_cwe, maxlvl)
         return Result(case.name, ok, "%s L%d%s" % (prof, maxlvl, "*" if early else ""), shown,
-                      int(time.time() - t0),
-                      "" if ok else "want L%d / %s demonstrated; got L%d" % (case.want_level, case.want_cwe, maxlvl))
+                      int(time.time() - t0), why)
     finally:
         pool.stop(grace=5.0); s.close()
         shutil.rmtree(d, ignore_errors=True)
