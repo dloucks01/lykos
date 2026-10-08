@@ -29,6 +29,14 @@ if str(CORE) not in sys.path:
 _STATIC_DETECTORS = {"dangerous_api", "detect_cwe", "cwe_scan", "source_sink_scan"}
 
 
+# A plain unbounded-%s stack overflow. Shared by the build-realism and ARCHITECTURE cases so those
+# differ ONLY in how they are compiled -- the point of those cases is the toolchain/ISA, not the bug.
+_OVERFLOW_SRC = r"""#include <stdio.h>
+int main(void){ char b[64]; printf("in: ");
+  if(scanf("%s", b) != 1) return 0;
+  printf("hi %s\n", b); return 0; }"""
+
+
 @dataclass
 class Case:
     name: str
@@ -427,26 +435,48 @@ int main(void){ setvbuf(stdout,0,2,0);
 
     # ---- BUILD REALISM. Real binaries are optimised and stripped; -O0 with symbols hides any
     # reliance on symbol names or on an unoptimised frame layout.
-    Case("stripped_opt_overflow",
-         r'''#include <stdio.h>
-int main(void){ char b[64]; printf("in: ");
-  if(scanf("%s", b) != 1) return 0;                      /* unbounded %s into a 64-byte buffer */
-  printf("hi %s\n", b); return 0; }''',
+    Case("stripped_opt_overflow", _OVERFLOW_SRC,
          ["-no-pie", "-fno-stack-protector", "-O2", "-s", "-w"],
          want_level=1, want_cwe=("CWE-121", "CWE-787", "CWE-119"), budget=300.0,
          note="BUILD: -O2 and STRIPPED -- no symbols to lean on, optimised frame"),
 
     # ---- ARCHITECTURE. Everything else is x86-64, so an aarch64 regression is invisible. Skips
     # cleanly when the cross toolchain is absent.
-    Case("arm64_overflow",
-         r'''#include <stdio.h>
-int main(void){ char b[64]; printf("in: ");
-  if(scanf("%s", b) != 1) return 0;
-  printf("hi %s\n", b); return 0; }''',
+    Case("arm64_overflow", _OVERFLOW_SRC,
          ["-static", "-fno-stack-protector", "-O0", "-w"],
          want_level=1, want_cwe=("CWE-121", "CWE-787", "CWE-119"),
          cross="aarch64-linux-gnu-", budget=360.0,
          note="ARCH aarch64 (static, under qemu): the crash must still be found off x86-64"),
+
+    # ---- MORE ARCHITECTURES. Same bug, same assertion, different ISA: these differ from the
+    # x86-64 cases ONLY in the toolchain, so each one protects a whole instruction set's recovery
+    # and crash detection. s390x is BIG-ENDIAN, which is the one most likely to catch a byte-order
+    # assumption. Static links so no guest libraries are needed under qemu; each SKIPS cleanly when
+    # its cross compiler is absent.
+    Case("arm32_overflow", _OVERFLOW_SRC,
+         ["-static", "-fno-stack-protector", "-O0", "-w"],
+         want_level=1, want_cwe=("CWE-121", "CWE-787", "CWE-119"),
+         cross="arm-linux-gnueabihf-", budget=420.0,
+         note="ARCH arm32 (static, qemu-arm)"),
+
+    Case("riscv64_overflow", _OVERFLOW_SRC,
+         ["-static", "-fno-stack-protector", "-O0", "-w"],
+         want_level=1, want_cwe=("CWE-121", "CWE-787", "CWE-119"),
+         cross="riscv64-linux-gnu-", budget=420.0,
+         note="ARCH riscv64 (static, qemu-riscv64) -- the backend mis-decodes RISC-V as x86 without "
+              "the SLEIGH path, so this guards body recovery too"),
+
+    Case("s390x_overflow", _OVERFLOW_SRC,
+         ["-static", "-fno-stack-protector", "-O0", "-w"],
+         want_level=1, want_cwe=("CWE-121", "CWE-787", "CWE-119"),
+         cross="s390x-linux-gnu-", budget=420.0,
+         note="ARCH s390x -- BIG-ENDIAN, the case that catches a byte-order assumption"),
+
+    Case("ppc64le_overflow", _OVERFLOW_SRC,
+         ["-static", "-fno-stack-protector", "-O0", "-w"],
+         want_level=1, want_cwe=("CWE-121", "CWE-787", "CWE-119"),
+         cross="powerpc64le-linux-gnu-", budget=420.0,
+         note="ARCH ppc64le (static, qemu-ppc64le)"),
 
     # ---- MULTIPLE DEFECTS. Every case above asserts ONE effect on one target; the mission claim is
     # "find EVERY crash", so this binary carries two unrelated bugs behind a menu and both must be
