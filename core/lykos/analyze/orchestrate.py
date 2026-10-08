@@ -428,6 +428,29 @@ _OVERFLOW_CWES = frozenset({"CWE-119", "CWE-120", "CWE-121", "CWE-122", "CWE-125
                             "CWE-242", "CWE-787"})
 
 
+# File types whose execution needs a foreign substrate: a Windows PE runs under wine, a class/jar
+# under the JVM. Neither can be batched, so each execution pays a fresh start-up.
+_FOREIGN_SUBSTRATE_TYPES = frozenset({"pe", "class", "jar", "jvm"})
+
+
+def _expensive_substrate(target) -> bool:
+    """Is one execution of this target orders of magnitude dearer than a native exec?
+
+    True for wine / the JVM / qemu -- the substrates sandbox.run_batch refuses, so the fuzzers
+    fall back to one process per input and pay the start-up every time. Stage ORDER has to differ
+    there: a cheap, certain, single-detonation stage must not sit behind a campaign that will
+    consume the entire budget.
+    """
+    try:
+        if (target.file_type or "").lower() in _FOREIGN_SUBSTRATE_TYPES:
+            return True
+        from .dynamic import sandbox
+        return bool(target.arch) and target.arch != sandbox.host_arch()
+    except Exception:                                    # noqa: BLE001 -- ordering hint only
+        _log.debug("substrate-cost check failed", exc_info=True)
+        return False
+
+
 def _has_demonstrated(store, target_id, cwes) -> bool:
     """Has any bug in `cwes` been DEMONSTRATED (not merely flagged statically) on this target?"""
     try:
@@ -653,6 +676,18 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict, stop: t
             # reached -- while net_fuzz crashes the same server in about three execs. The generic
             # coverage/directed sweeps then follow for whatever the binary reads conventionally.
             _run_target_stage(store, t, "env_fuzz", status, stop)
+            # On an EXPENSIVE SUBSTRATE, synthesize the static overflow BEFORE the campaigns for
+            # exactly the reason net_fuzz moved ahead of them. Wine, the JVM and qemu cannot be
+            # batched (sandbox.run_batch returns None for them), so every execution pays a fresh
+            # interpreter/emulator start-up -- seconds, not milliseconds. A coverage campaign then
+            # eats the whole time budget and the run never reaches synthesize_poc at the end, even
+            # though that stage demonstrates this bug class in ONE detonation from the recovered
+            # stack frame. Measured on a mingw PE whose scanf("%s") overflow synthesize_poc proves
+            # instantly: the full autopilot spent its entire budget fuzzing under wine and finished
+            # at L0. Native targets keep the original order -- there, fuzzing is cheap and finds
+            # strictly more. The stage no-ops without recovered stack buffers.
+            if _expensive_substrate(t):
+                _run_target_stage(store, t, "synthesize_poc", status, stop)
             # coverage fuzz (AFL, falls back to blind if unavailable), then directed on the same channel.
             _run_target_stage(store, t, "coverage_fuzz", status, stop, dyn)
             _run_target_stage(store, t, "directed_fuzz", status, stop, dyn)

@@ -508,6 +508,18 @@ int main(void){ setvbuf(stdout,0,2,0);
          cross="x86_64-w64-mingw32-", budget=120.0,
          note="FRONT-END PE (mingw): identified as a Windows PE, x86-64"),
 
+    # Front-end identification is not analysis. This drives the SAME PE through the real autopilot
+    # and demands a DEMONSTRATED memory-safety defect, which is what "works on Windows binaries"
+    # has to mean. Wine is the substrate; a smashed stack there never prints "Unhandled exception
+    # code" (the SEH chain is overwritten, so the exception cannot be dispatched at all) and used
+    # to read as a clean run -- see sandbox._WINE_SEH_RE.
+    Case("pe_overflow", _OVERFLOW_SRC,
+         ["-fno-stack-protector", "-O0", "-w"],
+         want_level=0, want_cwe=("CWE-121", "CWE-787", "CWE-119", "CWE-120", "CWE-125"),
+         cross="x86_64-w64-mingw32-", requires=("wine",), budget=600.0,
+         note="PE DYNAMIC: the Windows PE's stack overflow demonstrated through wine, not just "
+              "identified as a PE"),
+
     Case("fmt_jvm_class", "",
          [], want_level=0, want_cwe=(), want_file_type="class", budget=120.0,
          build=(["sh", "-c",
