@@ -662,6 +662,39 @@ int main(void){ setvbuf(stdout,0,2,0);
          note="FIRMWARE DYNAMIC: the vulnerable service lives inside a SquashFS root filesystem, "
               "so it is demonstrable only if the carve registers it as a child target"),
 
+    # The OTHER firmware shape, and the one with no operating system at all: a bare-metal
+    # Cortex-M image. There is no filesystem to carve, no ELF to extract and no process to run
+    # -- the image IS the program, it boots from a reset vector, and its only input is a
+    # peripheral register. So this exercises the path nothing else does: the headerless loader
+    # identifies it from its vector table, and firmware_rehost runs it under Unicorn with a
+    # modelled MMIO input until a device value drives it off the end of RAM.
+    #
+    # Built in pure Python from pre-assembled Thumb, deliberately -- the same style as the
+    # rehost unit fixtures. The image is 166 bytes and needs no cross-toolchain, so the case
+    # runs anywhere Unicorn does rather than skipping on most machines.
+    #
+    # Three details are load-bearing. The reset handler ZEROES .bss first, so the case also
+    # covers the write-progress init loop a real RTOS image starts with (a long loop with no
+    # new coverage that must not be mistaken for a stuck spin). Every IRQ vector points at a
+    # weak `b .` handler, as a real startup file's does. And RAM is mapped only up to the
+    # initial SP, which is why an index past the top of RAM faults instead of landing silently
+    # inside an over-generously mapped SRAM region.
+    Case("firmware_rehost_oob", "",
+         [], want_level=0, want_cwe=("CWE-787", "CWE-119", "CWE-125", "CWE-129"),
+         requires=("python3",), budget=600.0,
+         build=(["python3", "-c",
+                 "import struct;"
+                 "code=bytes.fromhex('fee740204ff0005100220a6004310138fad1"
+                 "4ff08040016889004ff00052521841231360fee7');"
+                 "img=bytearray(0x80);"
+                 "struct.pack_into('<I',img,0,0x20010000);"            # initial SP = top of RAM
+                 "struct.pack_into('<I',img,4,0x08000083);"            # Reset -> code+2, Thumb
+                 "[struct.pack_into('<I',img,o,0x08000081) for o in range(8,0x80,4)];"
+                 "open('fw.bin','wb').write(bytes(img)+code)"], "fw.bin"),
+         note="FIRMWARE REHOST: a bare-metal Cortex-M image indexes RAM with a value read "
+              "straight off a peripheral register -- demonstrable only by rehosting it under "
+              "Unicorn with a modelled MMIO input, since there is no process to run"),
+
     # ---- BUG CLASSES with no case of their own. Each is a distinct defect the platform claims to
     # find; without these only overflow/format/UAF were ever asserted.
     Case("double_free",
