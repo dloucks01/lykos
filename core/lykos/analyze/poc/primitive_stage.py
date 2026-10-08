@@ -8,6 +8,21 @@ import json
 import shutil
 
 from ...db.dao import DynResultDAO, FindingDAO, FunctionDAO, PocDAO, TargetDAO
+
+# What a CONFIRMED primitive proves about the defect, used only where root_cause's class does
+# not already name a memory-corruption weakness (see the comment at the override below).
+# Reaching a saved return address or an arbitrary address IS an out-of-bounds write, and a
+# controlled read of memory the program did not intend to expose IS an out-of-bounds read.
+_PRIM_CWE = {"instruction-pointer-control": "CWE-787",
+             "write-what-where": "CWE-787",
+             "arbitrary-write": "CWE-787",
+             "arbitrary-read": "CWE-125",
+             "controlled-read": "CWE-125"}
+# root_cause classes that are already a memory-corruption defect and so are kept as-is.
+_MEM_CORRUPTION = frozenset({"CWE-119", "CWE-120", "CWE-121", "CWE-122", "CWE-124", "CWE-125",
+                             "CWE-126", "CWE-127", "CWE-787", "CWE-788", "CWE-193", "CWE-415",
+                             "CWE-416", "CWE-590", "CWE-761", "CWE-822", "CWE-823", "CWE-824",
+                             "CWE-825"})
 from ...jobs.registry import register_stage
 from ..debug import qemu_gdb, rootcause
 from ..dynamic import sandbox
@@ -373,7 +388,26 @@ def _finalize(ctx, target, target_bytes, mode, base_argv, cap0, control, prim, c
             _kind, _title = _kind_title
             cand["title"] = f"{_title} (demonstrated): L2 primitive"
             cand["authoritative"] = True
-            cand["title_only"] = True                  # keep root_cause's specific CWE
+            # Keep root_cause's CWE only where it already names a MEMORY-CORRUPTION defect --
+            # there it genuinely is more specific than a signal-derived class. Where it does not,
+            # keeping it makes the finding contradict its own headline. Measured on a service
+            # carved out of a SquashFS firmware image: the stack smash left a near-null return
+            # address, root_cause classified the fault as CWE-476 (null-pointer dereference), and
+            # the finding went out as "Control-flow hijack (demonstrated): L2 primitive" carrying
+            # a DoS-grade weakness id -- so anyone filtering for memory corruption would never
+            # see a CONFIRMED instruction-pointer hijack at a known stack offset. A confirmed
+            # primitive is direct evidence of what the write did, which outranks a guess made
+            # from where the process happened to land.
+            _prim_cwe = _PRIM_CWE.get(prim.get("type"))
+            _prior = next((f for f in fd.list_by_target(target.id)
+                           if f.dedup_key == cand["dedup_key"]), None)
+            if _prim_cwe and (_prior.cwe if _prior else None) not in _MEM_CORRUPTION:
+                cand["cwe"] = _prim_cwe
+                cand["title_only"] = False
+                if prim.get("type") == "instruction-pointer-control":
+                    cand["severity"] = "critical"       # RIP control, confirmed under ptrace
+            else:
+                cand["title_only"] = True              # keep root_cause's specific CWE
             # Promote the matching end effect to DEMONSTRATED and attach the L2 bundle that
             # proves it -- the confirmed primitive (RIP control / write-what-where / controlled
             # read), the exact input that achieves it, and how (offset, captured marker).

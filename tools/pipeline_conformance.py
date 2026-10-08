@@ -639,6 +639,29 @@ int main(void){ setvbuf(stdout,0,2,0);
          note="UPX DYNAMIC: the overflow lives inside the compressed image, so it is demonstrable "
               "only if the unpack stage carves out a child target the ELF pipeline then drives"),
 
+    # A FIRMWARE image is the other CONTAINER shape, and the one the platform is most pointed
+    # at: an embedded device ships a filesystem, not a program. Nothing static can find the
+    # defect -- the vulnerable binary is a region inside a compressed SquashFS, so disassembling
+    # the image recovers nothing and the detectors see one high-entropy blob. The case therefore
+    # asserts the whole container path: triage routes the image to firmware_carve, the carve
+    # registers the embedded ELF as a child target, and the ELF pipeline then drives it.
+    #
+    # This case was impossible to pass before _verdict became case-scoped, for exactly the
+    # reason upx_overflow was: a container's findings land on the CHILD target's id.
+    Case("firmware_carve_overflow", "",
+         [], want_level=0, want_cwe=("CWE-121", "CWE-787", "CWE-119", "CWE-120", "CWE-125"),
+         requires=("mksquashfs", "unsquashfs", "gcc"), budget=600.0,
+         build=(["sh", "-c",
+                 "printf '#include <stdio.h>\nint main(){char b[64];printf(\"in: \");"
+                 "if(scanf(\"%%s\",b)!=1) return 0;printf(\"hi %%s\\\\n\",b);return 0;}\n'"
+                 " > f.c && "
+                 "gcc -no-pie -fno-stack-protector -O0 -w f.c -o httpd && "
+                 "mkdir -p root/usr/sbin root/etc && cp httpd root/usr/sbin/ && "
+                 "printf 'admin:x:0:0:root:/:/bin/sh\n' > root/etc/passwd && "
+                 "mksquashfs root fw.squashfs -noappend -quiet -no-progress"], "fw.squashfs"),
+         note="FIRMWARE DYNAMIC: the vulnerable service lives inside a SquashFS root filesystem, "
+              "so it is demonstrable only if the carve registers it as a child target"),
+
     # ---- BUG CLASSES with no case of their own. Each is a distinct defect the platform claims to
     # find; without these only overflow/format/UAF were ever asserted.
     Case("double_free",
@@ -1016,8 +1039,20 @@ def _verdict(s, target, case):
     pocs = [pc for tid in tids for pc in PocDAO(s.conn).list_by_target(tid)]
     maxlvl = max((int(pc.level[1]) for pc in pocs
                   if getattr(pc, "verified", False) and pc.level and pc.level[0] == "L"), default=0)
+    # The state ladder is poc-backed > confirmed > corroborated > candidate (the ordering
+    # FindingDAO.sites sorts by). `confirmed` was MISSING here while the weaker `corroborated`
+    # was accepted, so a crash the pipeline reproduced dynamically -- the project's own
+    # definition of demonstrated, `corroborate._DEMO_STATES = {confirmed, poc-backed}` -- did
+    # not count. That is what made firmware_carve_overflow read FAIL while its carved child had
+    # a `directed_fuzz` CWE-119 finding in exactly that state.
+    #
+    # `corroborated` is deliberately still admitted even though it is NOT in `_DEMO_STATES`, so
+    # this filter is looser than the project's own definition of demonstrated. Tightening it is
+    # a separate change: it could only ever turn cases red, and a case that passes on
+    # corroboration alone is worth seeing as a case to strengthen rather than hiding by
+    # narrowing the filter in the same commit that fixes the omission.
     fs = [f for f in FindingDAO(s.conn).list_by_case(target.case_id)
-          if f.state in ("poc-backed", "corroborated")]
+          if f.state in ("poc-backed", "confirmed", "corroborated")]
     wanted = list(case.want_cwe)
     for req in case.want_all_cwe:                        # an entry may be a group of alternatives
         wanted += list(req) if isinstance(req, (tuple, list)) else [req]
@@ -1218,6 +1253,50 @@ def verify_op_model_sharing(gcc: str) -> bool:
         pool.stop(grace=5.0); s.close(); shutil.rmtree(d, ignore_errors=True)
 
 
+def verify_determinism(gcc: str, case_name: str = "argv_overflow", runs: int = 3) -> bool:
+    """Run ONE case repeatedly and require the verdict to be the same every time.
+
+    Every other case here runs once, which cannot distinguish "this capability works" from
+    "this capability worked that time". The pipeline is full of races by construction -- a live
+    worker pool, per-class concurrency caps, wall-clock budgets, and an early stop that fires
+    the moment a criterion is met -- so a capability can pass on a quiet machine and fail on a
+    busy one, and a single green run hides it completely.
+
+    FAILS only on a verdict that disagrees across runs. The LEVEL is reported but not asserted:
+    a case whose criterion is a demonstrated CWE stops as soon as it sees one, so how much
+    further the ladder happened to get before the stop is genuinely timing-dependent -- measured
+    on upx_overflow, L1 on one run and L2 on the next, both correct. Asserting the level would
+    turn that into a false alarm; printing it says plainly which part is and is not stable.
+    """
+    case = next((c for c in _CASES if c.name == case_name), None)
+    if case is None:
+        print("%-24s | %-4s | no such case %r" % ("determinism", "SKIP", case_name))
+        return True
+    verdicts, levels, elapsed = [], [], []
+    for _i in range(runs):
+        r = _run_case(case, gcc)
+        if r.profile == "SKIP":
+            print("%-24s | %-4s | %s skipped (%s)" % ("determinism", "SKIP", case_name, r.reason))
+            return True
+        verdicts.append(r.ok)
+        levels.append(r.profile.rsplit(" ", 1)[-1].rstrip("*"))
+        elapsed.append(r.elapsed)
+    # Agreement AND agreement on PASS. A case that fails every single time is perfectly
+    # consistent, and reporting "determinism PASS" beside its own FAIL row would be a true
+    # statement that reads as reassurance.
+    ok = len(set(verdicts)) == 1 and verdicts[0]
+    note = "%s x%d: %s" % (case_name, runs,
+                           " ".join("PASS" if v else "FAIL" for v in verdicts))
+    if len(set(verdicts)) == 1 and not verdicts[0]:
+        note += " -- consistent, but consistently failing"
+    if len(set(levels)) > 1:
+        note += " (levels %s -- the early stop is timing-dependent, which is expected)" % (
+            "/".join(levels))
+    print("%-24s | %-4s | %s [%ds]" % ("determinism", "PASS" if ok else "FAIL", note,
+                                       sum(elapsed)))
+    return ok
+
+
 def run_all(names=None) -> list[Result]:
     gcc = shutil.which("gcc") or shutil.which("cc")
     if not gcc:
@@ -1240,6 +1319,9 @@ def run_all(names=None) -> list[Result]:
     if not names:
         print("-" * 110)
         verify_op_model_sharing(gcc)
+        # Repeat ONE case: a single green run cannot tell "this works" from "this worked that
+        # time", and every stage here races a live worker pool against a wall-clock budget.
+        verify_determinism(gcc)
     return results
 
 
