@@ -19,8 +19,12 @@ _MARGIN = 30
 # Isolation labels sandbox.run() returns when the target NEVER EXECUTED (no qemu for the arch,
 # no wine/JVM, a PE that could not be launched). A non-crash from one of these is "could not
 # run", not "ran and exited cleanly" -- absence of evidence is not evidence of absence.
-_DID_NOT_RUN = frozenset({"unsupported-arch", "unsupported-windows", "wine-launch-failed",
-                          "jvm-missing"})
+# "Did it run?" is answered by `sandbox.did_not_run`, beside the isolation strings it describes.
+# The frozenset that used to live here listed four of the eight exact sentinels and could not
+# match the `/not-runnable` suffix at all, so a .pyc with no python3, a .wasm with no node, a
+# .NET with no dotnet and every managed non-run were reported as clean exits. It is GONE rather
+# than aliased: a name that silently changes from a container to a callable breaks `in` at the
+# call site, which is exactly what it did to a test.
 
 # fatal signal -> (cwe, severity) for the confirmed crash finding
 _SIG_CWE = {
@@ -277,7 +281,7 @@ def dynamic_stage(ctx) -> dict:
         duration_ms=res.duration_ms, stdout_sha=stdout_sha, stderr_sha=stderr_sha,
         note=res.note, fault_pc=res.fault_pc, defect_key=defect_key)
 
-    ran = res.isolation not in _DID_NOT_RUN
+    ran = not sandbox.did_not_run(res.isolation)
     ctx.emit("dynamic.done", payload={"crashed": res.crashed, "signal": res.signal_name,
                                       "timed_out": res.timed_out, "isolation": res.isolation,
                                       "ran": ran, "note": res.note})

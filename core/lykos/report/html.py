@@ -82,8 +82,13 @@ def to_html(report: dict[str, Any]) -> str:
     eng = report.get("engines", [])
     parts.append('<section class="card"><h2>Reproducibility</h2>')
     if eng:
+        # An engine that ABORTED is not an engine that ran: afl-fuzz failing its dry run
+        # executed nothing, and a bare `tool version` badge said the same thing as a clean
+        # campaign that found no crash.
         parts.append('<div class="chips">' + "".join(
-            _badge(f'{e["tool"]} {e.get("version") or ""}'.strip(), "#5b9dd9") for e in eng)
+            _badge(f'{e["tool"]} {e.get("version") or ""}'.strip()
+                   + ("" if e.get("ran", True) else " — did not complete"),
+                   "#5b9dd9" if e.get("ran", True) else "#b06a4a") for e in eng)
             + '</div>')
     else:
         parts.append('<p class="muted">No external analysis engines recorded for this case.</p>')
@@ -138,12 +143,32 @@ def _target_html(t: dict) -> str:
                    else "—")
         rows.append(("Fuzz coverage", cov_txt))
     p.append(_kv(rows))
+    ex = t.get("execution") or {}
+    if ex.get("did_not_run_count") or ex.get("failed_stages"):
+        # The distinction this whole platform is built on, in the artefact a human opens: an
+        # empty crash list because nothing FOUND a defect, versus an empty crash list because
+        # nothing RAN. Without this they render identically.
+        p.append('<p class="ceiling"><b>Execution gaps.</b> ')
+        if ex.get("did_not_run_count"):
+            reasons = "; ".join(
+                esc((d.get("reason") or d.get("isolation") or "").strip())
+                for d in ex.get("did_not_run", [])[:3] if d)
+            p.append(f'{ex["did_not_run_count"]} execution(s) never ran: {reasons}. ')
+        if ex.get("failed_stages"):
+            p.append('Stages that failed: ' + esc(", ".join(ex["failed_stages"])) + '. ')
+        p.append('An absent result from these is not evidence of absence.</p>')
     if rt.get("ceiling_why"):
         p.append(f'<p class="ceiling"><b>Analysis ceiling — {esc(rt.get("ceiling"))}.</b> '
                  f'{esc(rt["ceiling_why"])}</p>')
     findings = t.get("findings", [])
     if not findings:
-        p.append('<p class="muted">No reportable findings for this target.</p></section>')
+        # "No reportable findings" is the sentence a reader takes as CLEAN, so it must not stand
+        # alone when part of the analysis never executed.
+        if ex.get("did_not_run_count") or ex.get("failed_stages"):
+            p.append('<p class="muted">No reportable findings for this target — but see the '
+                     'execution gaps above: this is not a clean result.</p></section>')
+        else:
+            p.append('<p class="muted">No reportable findings for this target.</p></section>')
         return "".join(p)
     for f in findings:
         p.append(_finding_html(f))

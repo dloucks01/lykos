@@ -58,7 +58,11 @@ def test_model_shape_and_summary(store, case):
     assert r["summary"]["poc_backed"] == 1
     assert r["summary"]["confirmed"] == 1
     assert r["summary"]["by_severity"].get("high") == 1
-    assert {"tool": "angr", "version": "9.3.4"} in r["engines"]
+    # The engine entry gained status counts (an engine that ABORTED is not one that ran), so
+    # check the reproducibility fields by subset rather than by exact dict identity.
+    angr = next(e for e in r["engines"] if e["tool"] == "angr")
+    assert angr["version"] == "9.3.4"
+    assert angr["ran"] is True and angr["completed"] >= 1
     f = r["targets"][0]["findings"][0]
     assert f["cwe_name"].startswith("Stack-based")
     assert f["pocs"][0]["level"] == "L2"

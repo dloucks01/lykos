@@ -63,6 +63,14 @@ def to_sarif(report: dict[str, Any]) -> dict[str, Any]:
                     rules[cwe].pop("helpUri")
 
             level, sec = _level(f.get("severity"))
+            # "detected" is not "demonstrated", and SARIF is read by machines: a `candidate` is
+            # an unproven pattern match, so emitting it at a severity-derived `error` made an
+            # advisory indistinguishable from a reproduced crash in CI, where `error` fails a
+            # build. Cap an unproven finding at `warning` and leave everything a channel has
+            # actually corroborated, confirmed or proven at its own level. The `state` property
+            # below still carries the full truth for a consumer that wants it.
+            if f.get("state") == "candidate" and level == "error":
+                level = "warning"
             msg = f.get("title") or f.get("cwe_name") or cwe
             ev = "; ".join(e.get("detail", "") for e in f.get("evidence", []) if e.get("detail"))
             if ev:
@@ -87,6 +95,9 @@ def to_sarif(report: dict[str, Any]) -> dict[str, Any]:
                 "partialFingerprints": {"lykos/dedup": f.get("id", "")},
                 "properties": {
                     "state": f.get("state"),
+                    # Structured, not stringified into the message a reader sees: this blob
+                    # used to land verbatim in a GitHub code-scanning alert.
+                    "effects": f.get("effects") or [],
                     "confidence": f.get("confidence"),
                     "detector": f.get("detector"),
                     "security-severity": sec,

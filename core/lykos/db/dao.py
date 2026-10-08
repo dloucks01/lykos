@@ -568,11 +568,20 @@ class FindingDAO(BaseDAO):
                     self.conn.execute(
                         "UPDATE finding SET cwe=?, title=? WHERE id=?",
                         (new_cwe, c.get("title") or row["title"], row["id"]))
+                # `detector` names WHO found this, so it is NOT last-writer-wins. It used to be,
+                # and five modules merge on the shared crash dedup_key: a defect proven by
+                # `poc`/`primitive` ended up credited to whichever stage touched it last, and
+                # STATIC_DETECTORS filtering keys on this very field. Two callers had grown local
+                # workarounds for that (rootcause.attribution_upsert, multidebug). The rule
+                # instead: the DISCOVERER keeps the credit, and only an `authoritative`
+                # classifier -- root_cause with the debugger's own report, the exploit ladder
+                # with a demonstrated effect -- may take it.
+                detector = (c.get("detector") if (c.get("authoritative") or not row["detector"])
+                            else row["detector"])
                 self.conn.execute(
                     "UPDATE finding SET state=?, severity=?, confidence=?, evidence_json=?, "
                     "detector=?, updated_at=? WHERE id=?",
-                    (state, severity, confidence, dumps(evidence), c.get("detector"),
-                     now, row["id"]))
+                    (state, severity, confidence, dumps(evidence), detector, now, row["id"]))
             else:
                 self.conn.execute(
                     "INSERT INTO finding(id,target_id,case_id,cwe,title,severity,state,"

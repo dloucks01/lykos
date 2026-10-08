@@ -386,10 +386,12 @@ def test_dynamic_stage_marks_never_run_distinct_from_clean(monkeypatch, tmp_path
     exe = _mini_elf(tmp_path / "x", 0xB7)
     res = sandbox.run(str(exe), arch="aarch64", host="x86-64")
     assert res.isolation == "unsupported-arch"
-    # the stage's classifier: this isolation is in the "did not run" set, so ran is False
-    from lykos.analyze.dynamic import stage
-    assert res.isolation in stage._DID_NOT_RUN
-    assert "bwrap+netns" not in stage._DID_NOT_RUN     # a real run is not in the set
+    # the classifier: this isolation means the target never executed, so `ran` is False. It is
+    # a predicate rather than a set because the managed and native paths append a
+    # `/not-runnable` SUFFIX to a real isolation, which no membership test can match.
+    assert sandbox.did_not_run(res.isolation)
+    assert not sandbox.did_not_run("bwrap+netns")               # a real run
+    assert sandbox.did_not_run("bwrap+netns+clr/not-runnable")  # the suffixed form
 
 
 def test_argv_arg_refuses_a_nul_payload_with_a_usable_reason():

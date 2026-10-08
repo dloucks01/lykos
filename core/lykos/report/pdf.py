@@ -127,7 +127,10 @@ def _report_lines(report: dict[str, Any]) -> list[_Line]:
     eng = report.get("engines", [])
     if eng:
         for e in eng:
-            L += _flow(f'- {e["tool"]} {e.get("version") or ""}'.strip(), "H", 9, 8, 1)
+            # An engine that aborted executed nothing; a bare tool/version line read the same
+            # as a campaign that ran and found no crash.
+            _note = "" if e.get("ran", True) else "  (did not complete)"
+            L += _flow(f'- {e["tool"]} {e.get("version") or ""}'.strip() + _note, "H", 9, 8, 1)
     else:
         L += _flow("No external analysis engines recorded for this case.", "HO", 9, 0, 2,
                    (0.4, 0.4, 0.45))
@@ -142,19 +145,47 @@ def _report_lines(report: dict[str, Any]) -> list[_Line]:
         L.append(_Line("", "H", 1, 0, 3, rule=True))
         mits = t.get("mitigations") or {}
         mit_txt = " ".join(f"{k}={v}" for k, v in mits.items()) if mits else "-"
-        for k, v in (("SHA-256", t.get("sha256")),
-                     ("Type", t.get("file_type")),
-                     ("Arch", f'{t.get("arch") or "?"}/{t.get("bits") or "?"} '
-                              f'{t.get("endianness") or ""}'.strip()),
-                     ("Linking", ("stripped " if t.get("stripped") else "")
-                                 + (t.get("linking") or "")),
-                     ("Mitigations", mit_txt)):
+        rt = t.get("runtime") or {}
+        rows = [("SHA-256", t.get("sha256")), ("Type", t.get("file_type"))]
+        # Only a machine-code image has an `arch` naming a PROCESSOR. For a managed target
+        # triage puts the RUNTIME there, so this row printed `Arch: jvm/64 big` -- the exact
+        # meaningless line the HTML renderer learned to drop and this one never did. Name the
+        # runtime instead.
+        if rt.get("describes_cpu", True):
+            rows.append(("Arch", f'{t.get("arch") or "?"}/{t.get("bits") or "?"} '
+                                 f'{t.get("endianness") or ""}'.strip()))
+        elif rt.get("label"):
+            rows.append(("Runs on", rt["label"]))
+        rows += [("Linking", ("stripped " if t.get("stripped") else "")
+                             + (t.get("linking") or "")),
+                 ("Mitigations", mit_txt)]
+        for k, v in rows:
             if v not in (None, "", "-") or k == "Mitigations":
                 L += _flow(f"{k}: {v}", "H", 8.5, 0, 1, (0.4, 0.4, 0.45))
+        if rt.get("ceiling_why"):
+            L += _flow(f'Analysis ceiling - {rt.get("ceiling")}. {rt["ceiling_why"]}',
+                       "HO", 8.5, 0, 2, (0.35, 0.35, 0.4))
+        ex = t.get("execution") or {}
+        if ex.get("did_not_run_count") or ex.get("failed_stages"):
+            bits = []
+            if ex.get("did_not_run_count"):
+                why = "; ".join((d.get("reason") or d.get("isolation") or "").strip()
+                                for d in ex.get("did_not_run", [])[:2] if d)
+                bits.append(f'{ex["did_not_run_count"]} execution(s) never ran: {why}')
+            if ex.get("failed_stages"):
+                bits.append("stages that failed: " + ", ".join(ex["failed_stages"]))
+            L += _flow("Execution gaps - " + ". ".join(bits)
+                       + ". An absent result from these is not evidence of absence.",
+                       "HO", 8.5, 0, 3, (0.5, 0.35, 0.3))
 
         findings = t.get("findings", [])
         if not findings:
-            L += _flow("No reportable findings for this target.", "HO", 9, 0, 6,
+            # "No reportable findings" is the sentence a reader takes as CLEAN, so it must not
+            # be printed bare when part of the analysis never executed.
+            _bare = not (ex.get("did_not_run_count") or ex.get("failed_stages"))
+            L += _flow("No reportable findings for this target." if _bare else
+                       "No reportable findings for this target -- but see the execution gaps "
+                       "above: this is not a clean result.", "HO", 9, 0, 6,
                        (0.4, 0.4, 0.45))
             continue
         for f in findings:

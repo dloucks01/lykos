@@ -79,40 +79,42 @@ def test_multi_debug_stage_blames_fork_child(store, case, pool, gdbpath, forkcra
     assert "fork" in ev and "forkcrash" in ev
 
 
-def test_multi_debug_does_not_steal_credit_for_a_finding_others_proved(
+def test_multi_debug_merges_its_evidence_without_re_crediting_the_defect(
         store, case, pool, gdbpath, forkcrash):
-    """It keys on the CRASH's dedup key, so it MERGES into whatever the fuzzer and the PoC
-    stages already filed -- and `upsert` rewrites the detector on merge.
+    """It keys on the CRASH's dedup key, so it MERGES into whatever already filed that crash.
 
-    Writing its own name there re-credited a defect that `poc`/`primitive`/`root_cause` had
-    proven to this stage. Nothing is lost from the per-channel verdict trail, but the finding's
-    headline detector -- which is what a report shows and what detector-keyed filters read --
-    named the wrong capability. Latent until the autopilot began scheduling this stage, and the
-    conformance gate usually early-stops at L1 before it runs, so only a full run shows it.
+    `detector` names who FOUND the defect, and it used to be last-writer-wins: five modules merge
+    on that shared key, so a defect proven by `poc`/`primitive` ended up credited to whichever
+    stage touched it last -- and STATIC_DETECTORS filtering reads that very field. The rule now
+    lives in `FindingDAO.upsert`: the discoverer keeps the credit unless the newcomer is an
+    `authoritative` classifier. This stage is not one, so it contributes evidence and no more.
     """
     fd = FindingDAO(store.conn)
     t = ingest(store, case.id, forkcrash, filename="forkcrash")
     q = JobQueue(store.conn)
     params = {"input": base64.b64encode(b"A" * 512).decode(), "input_mode": "stdin"}
-    assert q.runs.get(enqueue_multi_debug(q, t, params=params).id) is not None
-    assert pool.wait_idle(40)
+    run = enqueue_multi_debug(q, t, params=params)
+    assert pool.wait_idle(40) and q.runs.get(run.id).status == "done"
     made = [f for f in fd.list_by_target(t.id) if f.detector == "multi_debug"]
-    assert made, "expected a multi_debug finding on the first run"
-    key = made[0].dedup_key
+    assert made, "expected a multi_debug finding"
+    key, before = made[0].dedup_key, made[0].detector
 
-    # Now stand in for the stage that actually proved it, on the same dedup key.
+    # A later, NON-authoritative channel on the same key: the credit must not move.
     fd.upsert(t.id, case.id, {"cwe": made[0].cwe, "title": "Reproduced crash", "severity": "high",
                               "state": "poc-backed", "confidence": 0.95, "detector": "poc",
                               "dedup_key": key})
-    assert next(f for f in fd.list_by_target(t.id) if f.dedup_key == key).detector == "poc"
-
-    run = enqueue_multi_debug(q, t, params=params)
-    assert pool.wait_idle(40) and q.runs.get(run.id).status == "done"
     merged = next(f for f in fd.list_by_target(t.id) if f.dedup_key == key)
-    assert merged.detector == "poc", \
-        f"multi_debug re-credited a finding proven by {merged.detector!r} to itself"
-    # ...and its own evidence is still attached, so nothing was lost by not renaming it.
+    assert merged.detector == before, "a corroborating channel took the credit"
+    assert merged.state == "poc-backed", "the state must still advance on the stronger evidence"
+    # ...and this stage's own evidence is still attached, which is what it is for.
     assert any("multi-process debug" in (e.get("detail") or "") for e in merged.evidence)
+
+    # An AUTHORITATIVE classifier may take it -- that is how root_cause relabels a generic crash.
+    fd.upsert(t.id, case.id, {"cwe": made[0].cwe, "title": "Root cause: heap-use-after-free",
+                              "severity": "high", "state": "confirmed", "confidence": 0.95,
+                              "detector": "root_cause", "authoritative": True, "dedup_key": key})
+    assert next(f for f in fd.list_by_target(t.id)
+                if f.dedup_key == key).detector == "root_cause"
 
 
 def test_multi_debug_reports_unsupported_without_gdb(store, case, pool, monkeypatch):

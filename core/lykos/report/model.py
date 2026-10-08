@@ -6,6 +6,7 @@ model is JSON-serializable and self-contained: it embeds the reproducibility met
 """
 from __future__ import annotations
 
+import json
 import time
 from typing import Any, Optional
 
@@ -81,6 +82,55 @@ def _iso(ts: Optional[int]) -> Optional[str]:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
 
 
+#: Evidence channels whose `detail` is STRUCTURED (a JSON blob), not prose. Every surface that
+#: renders evidence prints `detail` verbatim, so one of these reached a reader as raw JSON --
+#: measured in a SARIF message, where it lands in a GitHub code-scanning alert, and the same in
+#: the HTML and PDF. The data is kept, parsed, under its own key; only the prose stays in the
+#: line a reader sees.
+_STRUCTURED_EVIDENCE = frozenset({"effects"})
+
+
+def _split_evidence(ev: list) -> tuple:
+    """(prose evidence, parsed structured evidence by channel)."""
+    prose, structured = [], {}
+    for e in ev or []:
+        ch = e.get("channel")
+        if ch in _STRUCTURED_EVIDENCE:
+            try:
+                structured[ch] = json.loads(e.get("detail") or "null")
+            except (ValueError, TypeError):
+                structured[ch] = None
+            continue
+        prose.append(e)
+    return prose, structured
+
+
+def _sentence(text: Optional[str]) -> str:
+    """A reason phrase as a sentence -- these are composed for inline use elsewhere."""
+    t = (text or "").strip()
+    return (t[0].upper() + t[1:]) if t else ""
+
+
+def _ceiling_why(submod, ftype: str, sub) -> str:
+    """Why the ladder stops where it does, phrased for a REPORT reader.
+
+    `substrate.no_ip_control_reason` states the mechanism, which is what a tooltip in the
+    workbench needs. A report has a different reader: someone deciding whether the missing L2/L3
+    is a limit of the target or a hole in the analysis. So the mechanism is kept and the
+    consequence spelled out, which is the whole reason this field exists.
+    """
+    why = _sentence(submod.no_ip_control_reason(ftype))
+    if not why:
+        return ""
+    if sub.runtime:
+        return why + (" The absence of an L2 or L3 result is the runtime's guarantee, not a gap "
+                      "in the analysis.")
+    if sub.backend is None:
+        return why + (" Nothing was executed, so no level is claimed at all -- that is a limit "
+                      "of this host, not a statement about the target.")
+    return why
+
+
 def _runtime(t) -> dict:
     """What this target RUNS ON, and what that means for the evidence in the report.
 
@@ -89,31 +139,42 @@ def _runtime(t) -> dict:
     processor. A reader could not tell that a finding came from a managed runtime, nor why no
     L2/L3 appears for it, and "no exploit was produced" reads as a gap rather than as the
     runtime's own guarantee.
+
+    Derived from `analyze.substrate` rather than a jar/class/pe list kept here, because that
+    list reproduced the very bug above for every format added after it: .pyc, .wasm and a .NET
+    assembly all fell through to "Native machine code" with `describes_cpu` true and an L3
+    ceiling, so the report rendered `Arch: cpython` / `Arch: cil` as a processor and implied an
+    exploit had been possible but was not produced. A Mach-O and a raw blob claimed L3 on an
+    image nothing here can execute.
     """
     from ..analyze import capabilities as capmod
+    from ..analyze import substrate as submod
     ftype = (t.file_type or "").lower()
-    if ftype in ("jar", "class"):
-        return {
-            "substrate": "jvm",
-            "label": "Java (JVM)" + (" — JAR" if ftype == "jar" else " — class file"),
-            "describes_cpu": False,
-            "ceiling": "L1",
-            "ceiling_why": (
-                "The JVM checks every array access and owns the instruction pointer, so a "
-                "defect surfaces as an uncaught exception that terminates the process -- "
-                "denial of service -- and cannot be escalated to control-flow hijack. L1 (a "
-                "verified, reproducible fault) is the ceiling this runtime supports; the "
-                "absence of an L2 or L3 result is the runtime's guarantee, not a gap in the "
-                "analysis."),
-            "unavailable": capmod.unavailable_summary(t),
-        }
-    if ftype == "pe":
-        return {"substrate": "windows", "label": "Windows PE", "describes_cpu": True,
-                "ceiling": "L3", "ceiling_why": "",
-                "unavailable": capmod.unavailable_summary(t)}
-    return {"substrate": "native", "label": "Native machine code", "describes_cpu": True,
-            "ceiling": "L3", "ceiling_why": "",
-            "unavailable": capmod.unavailable_summary(t)}
+    sub = submod.of(ftype)
+    out = {"substrate": sub.backend or "none",
+           "label": _SUBSTRATE_LABELS.get(ftype, "Native machine code"),
+           # Only a machine-code image has an `arch` that names a PROCESSOR. For a managed
+           # target triage puts the runtime there ("jvm", "cpython", "cil"), which must not be
+           # presented as hardware.
+           "describes_cpu": bool(sub.machine_code),
+           "ceiling": "L3" if sub.ip_control else "L1",
+           "ceiling_why": _ceiling_why(submod, ftype, sub),
+           "unavailable": capmod.unavailable_summary(t)}
+    if sub.backend is None:
+        # Nothing here executes it, so even L1 -- a verified, reproducible fault -- is out of
+        # reach, and saying "L1" would promise a reproducer the platform cannot build.
+        out["ceiling"] = "L0"
+    return out
+
+
+#: Reader-facing names. Absent means "Native machine code", which is right for an ELF.
+_SUBSTRATE_LABELS = {
+    "jar": "Java (JVM) — JAR", "class": "Java (JVM) — class file",
+    "pe": "Windows PE", "dotnet": ".NET assembly (CIL)",
+    "pyc": "CPython bytecode", "wasm": "WebAssembly module",
+    "macho": "Mach-O (macOS/iOS)", "firmware": "Bare-metal firmware image",
+    "raw": "Raw blob", "other": "Not an executable image",
+}
 
 
 def build_report(
@@ -184,6 +245,25 @@ def build_report(
         for p in pocs:
             pocs_by_finding.setdefault(p.finding_id or "", []).append(p)
         crashes = ddao.list_by_target(t.id)
+        # R2: an execution that NEVER HAPPENED is evidence, and the report had no way to say so.
+        # Every substrate returns a sentinel isolation for it (jvm-missing, python-missing,
+        # dotnet-missing, unsupported-arch, wine-launch-failed, .../not-runnable), and all of it
+        # died at this boundary: a target nothing could run produced an empty crash list, which
+        # is byte-identical in the report to a target that ran cleanly and had no defect. That is
+        # the one confusion this whole platform is built to avoid, surviving into the deliverable.
+        from ..analyze.dynamic import sandbox as _sb
+        _notrun = [d for d in crashes if _sb.did_not_run(d.isolation)]
+        execution = {
+            "executions_recorded": len(crashes),
+            "did_not_run": [{"isolation": d.isolation, "mode": d.input_mode,
+                             "reason": d.note or ""} for d in _notrun[:8]],
+            "did_not_run_count": len(_notrun),
+        }
+        # R3: a stage that ERRORED is not a stage that found nothing. `_engines` lists the tools
+        # used for reproducibility and discarded run status entirely, so afl-fuzz aborting with
+        # zero executions still read as "AFL++ was used".
+        execution["failed_stages"] = sorted({
+            r.stage for r in _target_runs if r.status in ("error", "timeout") and r.stage})
         crash_by_input: dict[str, Any] = {}
         for d in crashes:
             if d.input_sha and d.input_sha not in crash_by_input:
@@ -240,13 +320,17 @@ def build_report(
                     fv = {k: v[k] for k in ("runs", "crashed", "signal", "deterministic")}
                     break
 
+            _ev_prose, _ev_struct = _split_evidence(f.evidence or [])
             findings_out.append({
                 "id": f.id, "cwe": f.cwe, "cwe_name": catalog.name(f.cwe) if f.cwe else None,
                 "cwe_desc": catalog.describe(f.cwe) if f.cwe else None,
                 "title": f.title, "severity": f.severity, "state": f.state,
                 "confidence": round(f.confidence or 0.0, 3),
                 "function_addr": f.function_addr, "site_addr": f.site_addr,
-                "detector": f.detector, "evidence": f.evidence or [],
+                "detector": f.detector, "evidence": _ev_prose,
+                # Parsed, under its own key, so a renderer can present the effect LIST instead
+                # of the blob and nothing has to re-parse a string.
+                "effects": _ev_struct.get("effects") or [],
                 "pocs": f_pocs, "crashes": f_crashes, "verification": fv,
                 "created_at": _iso(f.created_at), "updated_at": _iso(f.updated_at),
             })
@@ -266,6 +350,7 @@ def build_report(
                 "runtime": _runtime(t),
                 "entropy": t.entropy, "ingested_at": _iso(t.ingested_at),
                 "fuzz_coverage": _best_coverage(store, _target_runs),
+                "execution": execution,
                 "findings": findings_out,
             })
 
@@ -309,13 +394,28 @@ def _crash_dict(d) -> dict:
 
 
 def _engines(rdao, case_id: str) -> list[dict]:
-    """Distinct (tool, version) pairs actually used in this case -- reproducibility."""
+    """Distinct (tool, version) pairs used in this case, and whether they COMPLETED.
+
+    Run status was discarded here, and used in exactly one other place in the whole report, so
+    an engine that aborted having executed nothing still appeared under "engines actually used"
+    -- afl-fuzz failing its dry run was indistinguishable from afl-fuzz finding no crash. The
+    counts are what let a reader tell a tool that ran from a tool that was merely invoked.
+    """
     seen: dict[tuple, dict] = {}
     for r in rdao.list_by_case(case_id):
-        if r.tool:
-            seen.setdefault((r.tool, r.tool_version), {
-                "tool": r.tool, "version": r.tool_version,
-            })
+        if not r.tool:
+            continue
+        e = seen.setdefault((r.tool, r.tool_version), {
+            "tool": r.tool, "version": r.tool_version, "runs": 0, "completed": 0, "failed": 0,
+        })
+        e["runs"] += 1
+        if r.status == "done":
+            e["completed"] += 1
+        elif r.status in ("error", "timeout"):
+            e["failed"] += 1
+    for e in seen.values():
+        # The distinction that matters to a reader: did this engine ever finish a run here?
+        e["ran"] = e["completed"] > 0
     return sorted(seen.values(), key=lambda e: (e["tool"], e["version"] or ""))
 
 

@@ -1612,6 +1612,38 @@ def _exec_failed(rc: int, err: bytes) -> bool:
     return any(m in low for m in _EXEC_FAIL_MARKERS)
 
 
+# ---- "did this image execute at all?" -----------------------------------------------------
+#
+# Every substrate here returns a sentinel isolation when nothing ran, and the whole
+# "nothing was run is not nothing was found" discipline depends on consumers RECOGNISING one.
+# A hand-kept set of exact strings could not: it listed four values while the sandbox returned
+# eight, and it could never match the `/not-runnable` SUFFIX the managed and native paths append
+# to a real isolation (`bwrap+netns+clr/not-runnable`), so seven of the ten values that mean
+# "did not execute" were read as a clean exit.
+#
+# So the rule is STRUCTURAL and lives here, beside the strings it describes: a new runtime that
+# follows the naming (`<runtime>-missing`, `unsupported-<thing>`, a `/not-runnable` suffix) is
+# recognised with no second table to update.
+_NOT_RUN_SUFFIX = "/not-runnable"
+
+
+def did_not_run(isolation: Optional[str]) -> bool:
+    """Does this isolation mean the target never executed?
+
+    True for a missing runtime (`jvm-missing`, `python-missing`, `node-missing`,
+    `dotnet-missing`), an unsupported substrate (`unsupported-arch`, `unsupported-windows`), a
+    launch failure (`wine-launch-failed`), a bare `not-runnable`, and any isolation carrying the
+    `/not-runnable` suffix. An EMPTY isolation counts too: with no record of a run we cannot
+    claim one happened, and that is the safe direction for this question.
+    """
+    iso = (isolation or "").strip()
+    if not iso:
+        return True
+    return (iso == "not-runnable" or iso.endswith(_NOT_RUN_SUFFIX)
+            or iso.endswith("-missing") or iso.startswith("unsupported-")
+            or iso == "wine-launch-failed")
+
+
 def _wine() -> Optional[str]:
     # Debian ships the binary as `wine-stable` (or `wine-development`) and exposes `wine` only as
     # an update-alternatives symlink -- which does NOT travel in the relocatable offline bundle,
