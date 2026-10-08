@@ -65,6 +65,10 @@ class Case:
     # How the artifact is produced, when a C compiler cannot: (argv-list, output-name). Runs in the
     # case directory; SKIPS when the first command is unavailable.
     build: tuple = ()
+    # Headers (absolute paths) or executables (bare names) this case needs. Missing any of them
+    # SKIPS the case rather than failing it: a sink that cannot be built here is untested, which is
+    # not the same as a capability that does not work, and conflating the two invents fake gaps.
+    requires: tuple = ()
 
 
 _CASES: list[Case] = [
@@ -616,6 +620,103 @@ int main(void){ setvbuf(stdout,0,2,0); fill(); leak(); return 0; }""",
          want_level=0, want_cwe=("CWE-457", "CWE-200", "CWE-908"), budget=240.0,
          note="BUG CLASS use of uninitialised stack memory (CWE-457/908) -> disclosure. KNOWN GAP -- reading an uninitialised buffer never faults, and nothing compares output against stale frame contents, so the disclosure is not demonstrated."),
 
+    # ---- INJECTION. A whole bug family the platform has probes for (command, path, SQL, XXE,
+    # SSRF) and which nothing asserted: these need no memory corruption at all, so none of the
+    # crash machinery above would ever surface them.
+    Case("cmd_injection",
+         r"""#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+int main(void){ setvbuf(stdout,0,2,0);
+  char host[128], cmd[256];
+  printf("host: "); if(!fgets(host,sizeof host,stdin)) return 0;
+  host[strcspn(host,"\n")]=0;
+  snprintf(cmd,sizeof cmd,"ping -c1 %s", host);   /* user text spliced into a shell command */
+  return system(cmd); }""",
+         ["-no-pie", "-O0", "-w"],
+         want_level=0, want_cwe=("CWE-78", "CWE-77", "CWE-88"), budget=300.0,
+         note="INJECTION command (CWE-78): user input spliced into system()"),
+
+    Case("path_traversal",
+         r"""#include <stdio.h>
+#include <string.h>
+#include <sys/stat.h>
+int main(void){ setvbuf(stdout,0,2,0);
+  char name[128], path[256]; char buf[256];
+  /* The base directory must EXIST, or no ../ can resolve THROUGH it and the traversal is
+     undemonstrable no matter how good the prober is (open() needs every component to exist). */
+  mkdir("/tmp/lykos_pt_data", 0755);
+  printf("file: "); if(!fgets(name,sizeof name,stdin)) return 0;
+  name[strcspn(name,"\n")]=0;
+  snprintf(path,sizeof path,"/tmp/lykos_pt_data/%s", name);   /* no ../ rejection */
+  FILE *f=fopen(path,"rb"); if(!f){ printf("no such file\n"); return 1; }
+  size_t n=fread(buf,1,sizeof buf-1,f); buf[n]=0; fclose(f);
+  printf("%s", buf); return 0; }""",
+         ["-no-pie", "-O0", "-w"],
+         want_level=0, want_cwe=("CWE-22", "CWE-23", "CWE-36"), budget=300.0,
+         note="INJECTION path traversal (CWE-22): user name concatenated into a path under a base "
+              "directory that EXISTS, so ../ actually resolves and the read can be demonstrated"),
+
+    Case("sql_injection",
+         r"""#include <stdio.h>
+#include <string.h>
+#include <sqlite3.h>
+int main(void){ setvbuf(stdout,0,2,0);
+  sqlite3 *db; if(sqlite3_open(":memory:", &db)) return 1;
+  sqlite3_exec(db, "CREATE TABLE users(name TEXT, pw TEXT);"
+                   "INSERT INTO users VALUES('admin','s3cret');", 0, 0, 0);
+  char user[128], q[384];
+  printf("user: "); if(!fgets(user,sizeof user,stdin)) return 0;
+  user[strcspn(user,"\n")]=0;
+  snprintf(q,sizeof q,"SELECT pw FROM users WHERE name='%s'", user);   /* unescaped */
+  char *err=0; sqlite3_exec(db, q, 0, 0, &err);                        /* recognised SQL sink */
+  printf("done%s%s\n", err?": ":"", err?err:""); sqlite3_close(db); return 0; }""",
+         ["-no-pie", "-O0", "-w", "-lsqlite3"],
+         want_level=0, want_cwe=("CWE-89", "CWE-943"), budget=300.0,
+         requires=("/usr/include/sqlite3.h",),
+         note="INJECTION SQL (CWE-89) through sqlite3_exec, a sink the prober recognises. SKIPS "
+              "where sqlite3 headers are absent -- an untested sink is not a broken one"),
+
+    Case("xxe_injection",
+         r"""#include <stdio.h>
+#include <string.h>
+#include <libxml/parser.h>
+#include <libxml/tree.h>
+int main(void){ setvbuf(stdout,0,2,0);
+  static char doc[8192];
+  size_t n = fread(doc, 1, sizeof doc - 1, stdin); doc[n] = 0;
+  /* NOENT|DTDLOAD enables external entity expansion: an entity pointing at a local file is read
+     and echoed back, which is the XXE disclosure. */
+  xmlDocPtr d = xmlReadMemory(doc, (int)n, "in.xml", NULL,
+                              XML_PARSE_NOENT | XML_PARSE_DTDLOAD | XML_PARSE_NONET);
+  if(!d){ printf("parse failed\n"); return 1; }
+  xmlNodePtr r = xmlDocGetRootElement(d);
+  xmlChar *txt = r ? xmlNodeGetContent(r) : NULL;
+  printf("content: %s\n", txt ? (char*)txt : "(none)");
+  if(txt) xmlFree(txt);
+  xmlFreeDoc(d); xmlCleanupParser(); return 0; }""",
+         ["-no-pie", "-O0", "-w", "-I/usr/include/libxml2", "-lxml2"],
+         want_level=0, want_cwe=("CWE-611", "CWE-827", "CWE-200"), budget=300.0,
+         requires=("/usr/include/libxml2/libxml/parser.h",),
+         note="INJECTION XXE (CWE-611) through xmlReadMemory with entity expansion enabled"),
+
+    Case("ssrf_injection",
+         r"""#include <stdio.h>
+#include <string.h>
+#include <curl/curl.h>
+int main(void){ setvbuf(stdout,0,2,0);
+  char url[256];
+  printf("url: "); if(!fgets(url,sizeof url,stdin)) return 0;
+  url[strcspn(url,"\n")]=0;
+  CURL *c = curl_easy_init(); if(!c) return 1;
+  curl_easy_setopt(c, CURLOPT_URL, url);        /* user-controlled destination: SSRF */
+  curl_easy_perform(c); curl_easy_cleanup(c); return 0; }""",
+         ["-no-pie", "-O0", "-w", "-lcurl"],
+         want_level=0, want_cwe=("CWE-918",), budget=300.0,
+         requires=("/usr/include/curl/curl.h",),
+         note="INJECTION SSRF (CWE-918): a user-controlled URL handed to curl. SKIPS without curl "
+              "headers"),
+
     # ---- MULTIPLE DEFECTS. Every case above asserts ONE effect on one target; the mission claim is
     # "find EVERY crash", so this binary carries two unrelated bugs behind a menu and both must be
     # demonstrated.
@@ -710,6 +811,10 @@ def _run_case(case: Case, gcc: str) -> Result:
     d = Path(tempfile.mkdtemp(prefix="conf-"))
     (d / "t.c").write_text(case.src)
     exe = d / case.name
+    for need in case.requires:
+        ok_need = Path(need).exists() if need.startswith("/") else bool(shutil.which(need))
+        if not ok_need:
+            return Result(case.name, True, profile="SKIP", reason="missing %s" % need)
     cc = gcc
     if case.build:                                       # produced by something other than a C compiler
         argv, out = case.build
@@ -726,9 +831,16 @@ def _run_case(case: Case, gcc: str) -> Result:
             cc = shutil.which(case.cross + "gcc") or ""
             if not cc:
                 return Result(case.name, True, profile="SKIP", reason="no %sgcc" % case.cross)
-        if subprocess.run([cc, *case.cflags, str(d / "t.c"), "-o", str(exe)],
-                          capture_output=True).returncode:
-            return Result(case.name, False, reason="BUILD FAILED (skip)")
+        # Libraries must follow the objects: `gcc -lxml2 t.c` leaves xmlInitParser undefined,
+        # while `gcc t.c -lxml2` links. Splitting them here keeps a case's cflags order-agnostic.
+        libs = [f for f in case.cflags if f.startswith("-l")]
+        flags = [f for f in case.cflags if not f.startswith("-l")]
+        built = subprocess.run([cc, *flags, str(d / "t.c"), "-o", str(exe), *libs],
+                               capture_output=True)
+        if built.returncode:
+            return Result(case.name, False,
+                          reason="BUILD FAILED: " + (built.stderr or b"").decode(
+                              "utf-8", "replace").strip().splitlines()[-1][:90])
         if not exe.exists() and exe.with_suffix(".exe").exists():
             exe = exe.with_suffix(".exe")                # mingw appends .exe to a bare -o name
     register()
