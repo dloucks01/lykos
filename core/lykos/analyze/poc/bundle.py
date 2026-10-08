@@ -70,6 +70,23 @@ def _runner(mode: str, argv, signal_name: str, run_cmd=None, runtime: str = "nat
                 for a in argv))
         else:
             invoke = f'{exe}{" " + pre if pre else ""} "$(cat ./input.bin)"'
+    elif mode == "socket":
+        # A socket PoC cannot be a one-liner: the input only exists after the server is listening,
+        # so the reproducer has to spawn the target, find its port and connect. Without this an
+        # env/socket bundle ran the target with no input and demonstrated nothing.
+        invoke = f'python3 ./replay_socket.py {exe}' + (" " + pre if pre else "")
+    elif mode == "env":
+        # The input is an ENVIRONMENT VARIABLE's value, and the variable's name rides along as a
+        # "NAME=@@" argv prefix element (how env_fuzz records it). Export it from the file and drop
+        # the placeholder from the command line -- without this an env-mode bundle ran the target
+        # with no input at all and demonstrated nothing.
+        from .capture import env_var_from_argv
+        var, rest = env_var_from_argv(argv)
+        pre = _argv_text(rest, carrier="./input.bin")
+        if var:
+            invoke = (f'{var}="$(cat ./input.bin)" {exe}' + (" " + pre if pre else ""))
+        else:
+            invoke = f'{exe}{" " + pre if pre else ""}'
     else:
         invoke = f'{exe}{" " + pre if pre else ""}'
     if runtime in ("jar", "class"):
@@ -148,11 +165,74 @@ _LEVEL_MEANING = {
 }
 
 
+_SOCKET_REPLAY = br'''#!/usr/bin/env python3
+"""Replay a SOCKET-delivered crash: spawn the server, find the port it opens, send ./input.bin.
+
+A socket input has no exec-time carrier -- it exists only once the server is listening -- so this
+cannot be a shell one-liner the way a stdin/argv/file/env PoC can. The port is discovered by
+diffing the listening set around the spawn, so no port has to be hard-coded. Authorized-use only.
+"""
+import socket, subprocess, sys, time
+
+EXE = sys.argv[1] if len(sys.argv) > 1 else "./target.bin"
+ARGS = sys.argv[2:]
+PAYLOAD = open("./input.bin", "rb").read()
+
+
+def listening():
+    out = set()
+    for proto, path in (("tcp", "/proc/net/tcp"), ("tcp", "/proc/net/tcp6"),
+                        ("udp", "/proc/net/udp"), ("udp", "/proc/net/udp6")):
+        try:
+            for line in open(path).read().splitlines()[1:]:
+                f = line.split()
+                if len(f) > 3 and (proto == "udp" or f[3] == "0A"):   # 0A == TCP LISTEN
+                    out.add((proto, int(f[1].split(":")[1], 16)))
+        except OSError:
+            pass
+    return out
+
+
+before = listening()
+proc = subprocess.Popen([EXE] + ARGS, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+found = None
+for _ in range(50):
+    time.sleep(0.1)
+    new = listening() - before
+    if new:
+        found = sorted(new)[0]
+        break
+if not found:
+    proc.kill(); sys.stderr.write("server never listened\n"); sys.exit(2)
+proto, port = found
+print("server listening: %s port %d" % (proto.upper(), port))
+try:
+    if proto == "tcp":
+        s = socket.create_connection(("127.0.0.1", port), timeout=2)
+        s.sendall(PAYLOAD); s.close()
+    else:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.sendto(PAYLOAD, ("127.0.0.1", port)); s.close()
+except OSError as e:
+    print("send failed (%s) -- the server may already be gone" % e)
+time.sleep(0.6)
+rc = proc.poll()
+if rc is None:
+    proc.kill(); sys.stderr.write("server survived: crash did not reproduce\n"); sys.exit(1)
+if rc < 0:
+    print("CRASHED: killed by signal %d" % -rc); sys.exit(0)
+sys.stderr.write("server exited %d without a fatal signal\n" % rc); sys.exit(1)
+'''
+
+
 def build(target_bytes: bytes, input_bytes: bytes, meta: dict, stderr: bytes,
           mode: str, argv, signal_name: str, primitive: dict | None = None,
           extra_files: dict | None = None, run_cmd: str | None = None,
           runtime: str = "native", main_class: str | None = None) -> bytes:
     level = meta.get("level", "L1")
+    if mode == "socket":                                 # the runner invokes this; ship it
+        extra_files = dict(extra_files or {})
+        extra_files.setdefault("replay_socket.py", _SOCKET_REPLAY)
     script = extra_files and "exploit.py" in extra_files
     prim_line = ""
     if primitive:

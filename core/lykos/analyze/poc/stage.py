@@ -10,11 +10,29 @@ from ..dynamic import sandbox
 from ..dynamic.stage import crash_dedup_key, crash_finding_candidate, crash_hijack
 from ..fuzz.runner import place
 from . import bundle
-from .capture import MODES, how_to_feed
+from .capture import MODES, env_var_from_argv, how_to_feed
 
 BUILD_POC_STAGE = "build_poc"
 TOOL = "poc"
 TOOL_VERSION = "poc-1"
+
+
+
+class _SocketReplay:
+    """sandbox.RunResult-shaped verdict for a socket replay (only these fields are read downstream)."""
+
+    def __init__(self, crashed, signal_name, isolation):
+        self.crashed, self.signal_name, self.isolation = bool(crashed), signal_name, isolation
+        self.stderr = b""
+
+
+def _dyn_isolation(conn, target, input_sha):
+    """The isolation tag the run that found this input recorded ("net-tcp"/"net-udp"), or None."""
+    from ...db.dao import DynResultDAO
+    for r in DynResultDAO(conn).list_by_target(target.id):
+        if r.input_sha == input_sha and r.isolation:
+            return r.isolation
+    return None
 
 
 def build_poc_stage(ctx) -> dict:
@@ -35,18 +53,29 @@ def build_poc_stage(ctx) -> dict:
     os.chmod(exe, 0o755)
 
     def _delivery(m):
-        """(argv, stdin) for one delivery channel."""
+        """(argv, stdin, env_overrides) for one delivery channel."""
         if m == "stdin":
-            return place(argv, "/dev/stdin") if "@@" in [
-                str(a) for a in argv] else list(argv), input_bytes
+            return (place(argv, "/dev/stdin") if "@@" in [
+                str(a) for a in argv] else list(argv)), input_bytes, None
         if m == "arg":
             # truncate: execve cuts the argument at the first NUL anyway, so this is what the
             # program would actually receive -- refusing outright discarded payloads whose
             # control slot sits safely before it (see sandbox.argv_arg).
-            return place(argv, sandbox.argv_arg(input_bytes, truncate=True)), b""
+            return place(argv, sandbox.argv_arg(input_bytes, truncate=True)), b"", None
+        if m == "env":
+            # The input is a variable's VALUE; its NAME rides along as a "NAME=@@" argv prefix
+            # element, which env_fuzz recorded on the crash. Without this an env-delivered crash
+            # fell through to the file channel, never reproduced, and was filed as an unverified
+            # L0 -- a crash the pipeline had genuinely found but could not prove.
+            var, rest = env_var_from_argv(argv)
+            if not var:
+                return list(argv), b"", None
+            return rest, b"", {var: input_bytes.decode("latin-1")}
+        if m == "socket":
+            return list(argv), b"", None                 # delivered over a socket, not at exec
         wf = ctx.scratch() / "input.bin"
         wf.write_bytes(input_bytes)
-        return place(argv, str(wf)), b""
+        return place(argv, str(wf)), b"", None
 
     ctx.progress(msg="verifying PoC in a clean sandbox")
     # endianness/bits are load-bearing, not decoration: _qemu_for routes ppc64->ppc64le,
@@ -62,12 +91,26 @@ def build_poc_stage(ctx) -> dict:
     # path, so replaying faithfully is the one thing that cannot work.
     prefixes = [list(argv)] + ([[]] if argv else [])
     tried, res = [], None
-    for pre in prefixes:
+    if mode == "socket":
+        # A socket crash has NO exec-time carrier: the input only exists once the server is up and
+        # listening, so none of the exec-time channels can deliver it and sweeping them is pointless.
+        # Spawn the server and send it instead -- the same sequence net_fuzz used to find the crash.
+        from ..fuzz import netfuzz
+        proto = "udp" if "udp" in ((_dyn_isolation(ctx.conn, target, input_sha) or "")) else "tcp"
+        crashed, sig_name, _signum, port = netfuzz.replay_once(
+            str(exe), proto, input_bytes, argv=list(argv),
+            listen_timeout=float(p.get("listen_timeout", 5.0)))
+        res = _SocketReplay(crashed, sig_name, f"net-{proto}")
+        tried = [f"socket/{proto}"]
+        mode_why = (f"{mode_why}; replayed over a {proto.upper()} socket"
+                    + (f" on port {port}" if port else ""))
+    for pre in (prefixes if mode != "socket" else []):
         argv = pre
         for m in [mode] + [x for x in MODES if x != mode]:
-            run_argv, stdin = _delivery(m)
+            run_argv, stdin, run_env = _delivery(m)
             res = sandbox.run(exe, argv=run_argv, stdin=stdin, timeout=timeout,
-                              arch=target.arch, endianness=target.endianness, bits=target.bits)
+                              arch=target.arch, endianness=target.endianness, bits=target.bits,
+                              env_overrides=run_env)
             tried.append(m if not pre else f"{m}+{' '.join(pre)}")
             if res.crashed:
                 if m != mode:
@@ -78,7 +121,7 @@ def build_poc_stage(ctx) -> dict:
             if not pre and prefixes[0]:
                 mode_why = f"{mode_why}; reproduces without {' '.join(prefixes[0])}"
             break
-    run_argv, stdin = _delivery(mode)
+    run_argv, stdin, _env = _delivery(mode)
     verified = res.crashed
     level = "L1" if verified else "L0"
 

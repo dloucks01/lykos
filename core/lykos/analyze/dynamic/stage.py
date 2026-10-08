@@ -221,6 +221,15 @@ def dynamic_stage(ctx) -> dict:
         infile = ctx.scratch() / "input.bin"
         infile.write_bytes(input_bytes)
         argv = place(argv, str(infile))
+    env_overrides = None
+    if mode == "env" and input_bytes:
+        # The ENVIRONMENT channel: the input is a variable's value and its name rides along as a
+        # "NAME=@@" argv prefix (how env_fuzz records it). Without this a replay of an env crash
+        # delivered nothing, so the review pass would call a real, reproducible crash flaky.
+        from ..poc.capture import env_var_from_argv
+        var, argv = env_var_from_argv(argv)
+        if var:
+            env_overrides = {var: input_bytes.decode("latin-1")}
 
     exe = ctx.scratch() / "target.bin"
     ctx.content.stage_target(target, exe.parent, exe.name)
@@ -231,7 +240,8 @@ def dynamic_stage(ctx) -> dict:
     sandbox.protect_dir(getattr(ctx.content, "root", None))
     ctx.progress(msg="detonating in sandbox")
     res = sandbox.run(exe, argv=argv, stdin=stdin, timeout=timeout, arch=target.arch,
-                      endianness=target.endianness, bits=target.bits)
+                      endianness=target.endianness, bits=target.bits,
+                      env_overrides=env_overrides)
 
     stdout_sha = ctx.put_artifact("dyn-stdout", data=res.stdout) if res.stdout else None
     stderr_sha = ctx.put_artifact("dyn-stderr", data=res.stderr) if res.stderr else None

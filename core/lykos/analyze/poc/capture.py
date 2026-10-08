@@ -40,6 +40,7 @@ def make_capture(ctx, helper: Path, exe, mode, base_argv, timeout, python):
 
     def capture(data: bytes, breakpoints=None) -> dict:
         stdin_file = None
+        env = None
         argv = _sub_out(list(base_argv), work)
         if mode == "stdin":
             stdin_file = str(work / "stdin.bin")
@@ -52,7 +53,14 @@ def make_capture(ctx, helper: Path, exe, mode, base_argv, timeout, python):
         elif mode == "file":
             (work / "input.bin").write_bytes(data)
             argv = place(argv, str(work / "input.bin"))
+        elif mode == "env":
+            var, argv = env_var_from_argv(argv)
+            if not var:
+                return {"ok": False, "reason": "env mode but no NAME=@@ prefix recorded"}
+            env = {var: data.decode("latin-1")}          # latin-1: lossless byte round-trip via JSON
         spec = {"exe": str(exe), "argv": argv, "stdin_file": stdin_file, "timeout": timeout}
+        if env:
+            spec["env"] = env
         if breakpoints:
             spec["breakpoints"] = [int(a) for a in breakpoints]
         spec_path = work / "spec.json"
@@ -93,8 +101,24 @@ def make_qemu_capture(exe, arch, mode, base_argv, timeout, *, endianness=None, b
     return capture
 
 
-# Every way a target can be handed its input. Order matters only as a fallback sweep.
+# Every way a target can be handed its input in the generic fallback sweep. "env" is deliberately
+# NOT here: env_fuzz already discovers that channel from the getenv() names in the binary, so adding
+# it would make every unrelated target pay for an extra sweep. It is still a first-class DELIVERY
+# mode -- how_to_feed returns it for a crash env_fuzz recorded, and the capture/bundle paths below
+# honour it -- which is what lets such a crash be replayed into a verified PoC.
 MODES = ("stdin", "file", "arg")
+
+# env_fuzz records its delivery as an argv prefix element "NAME=@@" (@@ being the input placeholder),
+# so the variable's name survives on the DynResult and the replay can set the right one.
+_ENV_PLACEHOLDER = "=@@"
+
+
+def env_var_from_argv(argv):
+    """(var_name, remaining_argv) for an env-delivered crash, or (None, argv) when there is none."""
+    for i, a in enumerate(list(argv or [])):
+        if isinstance(a, str) and a.endswith(_ENV_PLACEHOLDER):
+            return a[:-len(_ENV_PLACEHOLDER)], [x for j, x in enumerate(argv) if j != i]
+    return None, list(argv or [])
 
 
 _STDIN_FUNCS = {"read", "fgets", "gets", "scanf", "__isoc99_scanf", "fread", "getchar",

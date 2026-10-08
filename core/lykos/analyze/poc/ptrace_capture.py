@@ -198,7 +198,7 @@ def _argv_bytes(a):
         return a.encode("utf-8", "surrogateescape")
 
 
-def capture(exe, argv, stdin_file, timeout, breakpoints=None):
+def capture(exe, argv, stdin_file, timeout, breakpoints=None, env=None):
     """Run `exe` under ptrace and capture the fault. When `breakpoints` (x86-64 VAs) are given,
     set software breakpoints and, if execution reaches one, report `breakpoint_hit` instead of
     (or before) a fault -- used to confirm a control-flow hijack reached a chosen function."""
@@ -241,6 +241,16 @@ def capture(exe, argv, stdin_file, timeout, breakpoints=None):
             # encodes str with the filesystem encoding, so UTF-8 turns every byte >= 0x80
             # into two, silently corrupting any payload carrying an address. That is most of
             # them -- it broke argv-delivered IP control outright.
+            if env:
+                # An ENV-delivered input (the channel env_fuzz crashes a getenv() reader on) has to
+                # be handed over at exec. Same latin-1 -> bytes round-trip as argv: the value is an
+                # arbitrary payload, so re-encoding it as UTF-8 would corrupt every byte >= 0x80.
+                e = {k.encode("latin-1", "ignore") if isinstance(k, str) else k: _argv_bytes(v)
+                     for k, v in env.items()}
+                full = {k.encode() if isinstance(k, str) else k: v.encode() if isinstance(v, str)
+                        else v for k, v in os.environb.items()} if hasattr(os, "environb") else {}
+                full.update(e)
+                os.execve(exe, [exe] + [_argv_bytes(a) for a in argv], full)
             os.execv(exe, [exe] + [_argv_bytes(a) for a in argv])
         except Exception:
             pass
@@ -318,7 +328,8 @@ def main(spec_path):
     spec = json.load(open(spec_path))
     try:
         res = capture(spec["exe"], spec.get("argv", []), spec.get("stdin_file"),
-                      float(spec.get("timeout", 10)), breakpoints=spec.get("breakpoints"))
+                      float(spec.get("timeout", 10)), breakpoints=spec.get("breakpoints"),
+                      env=spec.get("env"))
     except Exception as e:                             # noqa: BLE001
         res = {"ok": False, "reason": f"{type(e).__name__}: {e}"}
     sys.stdout.write(json.dumps(res))

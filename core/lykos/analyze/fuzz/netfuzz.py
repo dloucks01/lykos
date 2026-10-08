@@ -94,8 +94,27 @@ def _listening_ports(pid: int, proto: str) -> list:
     return ports
 
 
+_PR_SET_PDEATHSIG = 1
+
+
 def _spawn_server(exe: str, argv: list, mem_mb: int = 1024) -> "subprocess.Popen | None":
-    preexec = sandbox._rlimits(mem_mb, 60, set_as=True, nproc=64)
+    rlimits = sandbox._rlimits(mem_mb, 60, set_as=True, nproc=64)
+
+    def preexec():
+        rlimits()
+        # Tie the server's life to ours in the KERNEL. _killtree is the normal cleanup, but it only
+        # runs if this process unwinds: a campaign cancelled at its budget (or an interpreter exit
+        # with the worker thread still mid-fuzz) never reaches that `finally`, and because
+        # start_new_session puts the server in its own process group, nothing else reaps it. A
+        # leaked instance keeps its listening port, so every later spawn of the same server fails to
+        # bind and the whole campaign reports "no-listen" -- a live bug that reads as "no crash".
+        try:
+            import ctypes
+            ctypes.CDLL("libc.so.6", use_errno=True).prctl(_PR_SET_PDEATHSIG, signal.SIGKILL,
+                                                           0, 0, 0)
+        except Exception:                                # noqa: BLE001 -- best effort; _killtree remains
+            pass
+
     try:
         return subprocess.Popen([exe] + [str(a) for a in argv],
                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
@@ -207,6 +226,37 @@ class NetFuzzResult:
         self.execs = execs
         self.port = port
         self.note = note
+
+
+def replay_once(exe: str, proto: str, payload: bytes, *, argv=(), port: "int | None" = None,
+                listen_timeout: float = 5.0, settle: float = 0.6) -> "tuple":
+    """Deliver ONE payload to a freshly spawned server and report whether it died:
+    (crashed, signal_name, signal_num, port).
+
+    A socket is not an exec-time channel like stdin/argv/a file/an env var -- the input only exists
+    after the server is up and listening -- so a crash found this way could not be replayed by the
+    PoC path at all, and was filed as an unverified L0. This is the same spawn -> wait-for-port ->
+    send -> poll sequence fuzz_server already uses for its confirm pass, exposed so the PoC and
+    bundle paths can reproduce a socket crash instead of guessing a channel that cannot carry it."""
+    proc = _spawn_server(exe, list(argv))
+    if proc is None:
+        return False, "spawn-failed", None, None
+    try:
+        p = _wait_for_port(proc, proto, port, listen_timeout)
+        if p is None:
+            return False, "no-listen", None, None
+        try:
+            _send_once(proto, p, payload)
+        except OSError:
+            pass                                         # refused/reset: it may have just died
+        rc = _poll_death(proc, timeout=settle)
+        if rc is None:
+            return False, "survived", None, p
+        crashed, _sig, sig_name, _ = sandbox.classify_rc(rc)
+        return bool(crashed), (sig_name if crashed else f"exit{rc}"), \
+            (-rc if rc < 0 else None), p
+    finally:
+        _killtree(proc)
 
 
 def fuzz_server(exe: str, proto: str, *, argv=(), seeds=(), port: "int | None" = None,

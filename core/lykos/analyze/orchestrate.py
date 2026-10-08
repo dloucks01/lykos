@@ -565,6 +565,23 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict, stop: t
             _run_target_stage(store, t, "uaf_scan", status, stop)
             # A dangerous sink (system/popen, printf-family) called with a non-literal arg (CWE-78/134).
             _run_target_stage(store, t, "source_sink_scan", status, stop)
+            # A SOCKET SERVER has to be fuzzed before anything else touches it. Such a target
+            # blocks in accept() and never reads stdin, so every stage that drives it that way --
+            # the injection prober, the crashless exploit ladder, the OOB-index driver, the generic
+            # fuzzers -- waits out its full timeout and finds nothing, draining the budget before
+            # the one channel that works is ever tried. net_fuzz crashes such a server in about
+            # three execs. It self-gates on bind/listen/recvfrom imports, so a non-server pays
+            # nothing for being asked first.
+            try:
+                from ..db.dao import CallEdgeDAO as _CE   # imported here: the module-level name
+                from .fuzz import netfuzz as _nf          # lives in _ranked_channels, not this scope
+                _is_server = _nf.detect_server(_CE(store.conn).list_by_target(tid))[1]
+            except Exception:
+                _log.debug("server detection failed for %s", tid, exc_info=True)
+                _is_server = False
+            if _is_server:
+                _run_target_stage(store, t, "net_fuzz", status, stop)
+
             # Weaponize every version-matched CVE -- a bespoke per-CVE trigger where one is
             # authored, else the library's format attack (zlib bomb, XML billion-laughs) and its
             # CWE-class probes -- recording a verified reproduction only if the target faults.
@@ -606,16 +623,17 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict, stop: t
             _run_target_stages(store, t, [("heap_check", dyn), ("heap_trace", None),
                                           ("oob_index", None)], status, stop)
             _run_target_stage(store, t, "chain_primitive", status, stop)
-            # Search. Fuzz the channel the binary most likely reads; coverage fuzz (AFL, falls back to
-            # blind if unavailable), then directed on the same channel.
+            # Search. The CHANNEL-SPECIFIC fuzzers go first, because each one knows the channel its
+            # target actually reads and both self-gate to the imports that prove it (bind/listen/
+            # recvfrom; getenv), so a target they do not apply to pays nothing. Running them after
+            # the generic sweeps starved them: a socket server BLOCKS in accept(), so every
+            # stdin/argv/file exec runs to its timeout and drains the budget before net_fuzz is ever
+            # reached -- while net_fuzz crashes the same server in about three execs. The generic
+            # coverage/directed sweeps then follow for whatever the binary reads conventionally.
+            _run_target_stage(store, t, "env_fuzz", status, stop)
+            # coverage fuzz (AFL, falls back to blind if unavailable), then directed on the same channel.
             _run_target_stage(store, t, "coverage_fuzz", status, stop, dyn)
             _run_target_stage(store, t, "directed_fuzz", status, stop, dyn)
-            # A socket server is reached by spawning it and sending over the network, not via
-            # stdin/argv/file; the stage self-gates to targets that import bind/listen/recvfrom.
-            _run_target_stage(store, t, "net_fuzz", status, stop)
-            # Env-var input: a program that reads getenv("NAME") is reached by SETTING that
-            # variable, not via stdin/argv/file; the stage self-gates to targets importing getenv.
-            _run_target_stage(store, t, "env_fuzz", status, stop)
             crashes = _distinct_crashes(store, tid)
             # Multi-channel retry: the best-guess channel is not always where the bug is (a file
             # parser's overflow can be in the argv filename). If nothing crashed, drive the fast

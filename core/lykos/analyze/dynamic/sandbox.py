@@ -969,7 +969,8 @@ def _run_windows(exe, *, argv, stdin, timeout, mem_mb, capture, wineprefix) -> R
 def run(exe, *, argv=(), stdin: bytes = b"", timeout: float = 10.0,
         arch: Optional[str] = None, endianness: Optional[str] = None,
         bits: Optional[int] = None, host: Optional[str] = None, mem_mb: int = 2048,
-        capture: int = 65536, wineprefix: Optional[str] = None, blocks=()) -> RunResult:
+        capture: int = 65536, wineprefix: Optional[str] = None, blocks=(),
+        env_overrides: Optional[dict] = None) -> RunResult:
     """`blocks` asks for coverage. On an EMULATED target that is the only way to get it: the
     ptrace tracer the batch runner uses cannot reach inside qemu, so every non-native campaign
     was running blind on output shape alone -- eleven of the twelve architectures the platform
@@ -1019,6 +1020,12 @@ def run(exe, *, argv=(), stdin: bytes = b"", timeout: float = 10.0,
         _prior = env.get("ASAN_OPTIONS", "")
         env["ASAN_OPTIONS"] = ((_prior + ":") if _prior else "") + \
             f"abort_on_error=1:hard_rss_limit_mb={max(256, int(mem_mb))}:detect_leaks=0"
+    if env_overrides:
+        # The ENVIRONMENT as an input channel: a getenv() reader is crashed by the VALUE of a
+        # variable, so replaying such a crash means handing that variable over at exec. Without
+        # this the input had nowhere to go and the crash "did not reproduce".
+        env = dict(env if env is not None else os.environ)
+        env.update({str(k): v for k, v in env_overrides.items()})
 
     iso = "rlimits-only" + ("+qemu" if emu else "")
     cmd = inner

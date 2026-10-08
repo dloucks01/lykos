@@ -390,6 +390,41 @@ int main(void){ char b[64];
               "(stdin, file, arg) with no env delivery, so the prove loop cannot replay an "
               "env-delivered input and no verified PoC is ever built. net_fuzz has the same hole."),
 
+    Case("socket_overflow",
+         r'''#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+/* The receive buffer is GLOBAL and the handler RETURNS: the overflow therefore runs over the
+   handler's saved return address (a fault on return) instead of over its own source buffer inside
+   a main() that loops forever and never returns -- which would smash the frame observably but
+   never actually fault. */
+static char rxbuf[4096];
+static void handle(int c){
+  char small[64];
+  ssize_t n = recv(c, rxbuf, sizeof rxbuf, 0);
+  if(n > 0){ rxbuf[n < 4095 ? n : 4095] = 0; strcpy(small, rxbuf); printf("got %s\n", small); }
+}
+int main(void){ setvbuf(stdout,0,2,0);
+  int s = socket(AF_INET, SOCK_STREAM, 0); if(s<0) return 1;
+  int one=1; setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+  struct sockaddr_in a; memset(&a,0,sizeof a);
+  a.sin_family=AF_INET; a.sin_addr.s_addr=htonl(INADDR_LOOPBACK); a.sin_port=0;  /* ephemeral */
+  if(bind(s,(struct sockaddr*)&a,sizeof a)<0) return 1;
+  if(listen(s,4)<0) return 1;
+  /* An EPHEMERAL port, not a fixed one: the fuzzer respawns this server hundreds of times, so one
+     leaked instance holding a fixed port would make every later bind fail and the campaign report
+     "no-listen". netfuzz discovers the port from /proc, so it need not be known in advance. */
+  puts("listening");
+  for(;;){ int c = accept(s,0,0); if(c<0) continue; handle(c); close(c); } }''',
+         ["-no-pie", "-fno-stack-protector", "-O0", "-w"],
+         want_level=1, want_cwe=("CWE-121", "CWE-787", "CWE-119"), budget=900.0,
+         note="CHANNEL socket: a TCP server that strcpy's its global recv buffer into a 64-byte "
+              "stack buffer in a handler that RETURNS -- reachable only over a connection, and "
+              "replayable only by spawning the server and sending (no exec-time carrier exists)"),
+
     # ---- BUILD REALISM. Real binaries are optimised and stripped; -O0 with symbols hides any
     # reliance on symbol names or on an unoptimised frame layout.
     Case("stripped_opt_overflow",
