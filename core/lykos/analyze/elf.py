@@ -22,6 +22,13 @@ _MACHINES = {
     0x16: "s390", 0x28: "arm", 0x2A: "sh", 0x04: "m68k", 0x2B: "sparcv9",
     0x3E: "x86-64", 0xB7: "aarch64", 0xF3: "riscv", 0x102: "loongarch",
     0x12: "sparc",          # EM_SPARC32PLUS (v8plus) -- same ISA family as EM_SPARC
+    # qemu-user for each of these is installed on a stock Debian/Kali, and the only thing that
+    # kept them unsupported end-to-end was their absence from this table and from _QEMU.
+    # XTENSA is the ESP32, which the firmware carve/rehost path meets in the wild.
+    0x5E: "xtensa",         # EM_XTENSA (94)
+    0xBD: "microblaze",     # EM_MICROBLAZE (189)
+    0x0F: "hppa",           # EM_PARISC (15)
+    0x9026: "alpha",        # EM_ALPHA -- Linux's unofficial value; there is no assigned one
 }
 _ETYPES = {0: "none", 1: "rel", 2: "exec", 3: "dyn", 4: "core"}
 

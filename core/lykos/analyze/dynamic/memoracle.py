@@ -117,6 +117,112 @@ def dislocator_preload(base_env: Optional[dict], *, host_arch: str, target_arch:
     return env
 
 
+# ---------------------------------------------------------------- runtime comparison tokens
+
+# libtokencap hooks the string/memory comparison functions and appends every constant a target
+# compares its input AGAINST to AFL_TOKEN_FILE, in AFL dictionary form: one `"token"` per line.
+_TOKEN_LINE = re.compile(rb'^\s*(?:[\w.]+\s*=\s*)?"((?:[^"\\]|\\.)*)"\s*$')
+#: A token longer than this is almost certainly a whole buffer rather than a magic value, and a
+#: dictionary entry that large only slows the mutator down.
+_TOKEN_MAX = 64
+
+
+def _unescape(tok: bytes) -> bytes:
+    """AFL dictionary escaping: \\xNN byte escapes plus \\\\ and \\"."""
+    out, i = bytearray(), 0
+    while i < len(tok):
+        c = tok[i]
+        if c != 0x5C or i + 1 >= len(tok):           # not a backslash
+            out.append(c)
+            i += 1
+            continue
+        nxt = tok[i + 1]
+        if nxt == 0x78 and i + 3 < len(tok):         # \xNN
+            try:
+                out.append(int(tok[i + 2:i + 4], 16))
+                i += 4
+                continue
+            except ValueError:
+                pass
+        out.append(nxt)
+        i += 2
+    return bytes(out)
+
+
+def parse_token_file(data: bytes) -> list:
+    """The distinct tokens in an AFL-format dictionary, longest-first, unescaped."""
+    toks, seen = [], set()
+    for raw in (data or b"").splitlines():
+        m = _TOKEN_LINE.match(raw.strip())
+        if not m:
+            continue
+        tok = _unescape(m.group(1))
+        if 2 <= len(tok) <= _TOKEN_MAX and tok not in seen:
+            seen.add(tok)
+            toks.append(tok)
+    # Longest first: a mutator that inserts the whole magic value gets past the gate in one step,
+    # where a prefix only gets past the first byte of the comparison.
+    toks.sort(key=len, reverse=True)
+    return toks
+
+
+def runtime_tokens(exe, data: bytes, *, mode: str = "stdin", base_argv=(), timeout: float = 20.0,
+                   host_arch: str = "", target_arch: Optional[str] = None) -> list:
+    """Tokens the target actually COMPARED its input against, observed at runtime. [] if n/a.
+
+    The static extractor (`fuzz.cmpdict`) reads comparisons out of the recovered IR, so it sees
+    only the ones whose operand is a constant IN THE CODE. A magic value that is COMPUTED -- a
+    decoded header, a checksum, a token read from a config or the environment -- exists only at
+    runtime, and that is exactly the kind of gate a blind campaign never gets past. libtokencap
+    hooks the comparison functions and reports those, which is why it was built; it was never
+    called, so this half of the input-to-state dictionary did not exist.
+
+    Same preload constraints as `dislocator_preload`: host-architecture ELF only, and a target
+    that is dynamically linked (a static binary resolves no symbols through the loader).
+    """
+    lib = tokencap_lib()
+    if lib is None:
+        return []
+    if target_arch and host_arch and target_arch != host_arch:
+        return []
+    import tempfile
+    d = tempfile.mkdtemp(prefix="lykos-tokcap-")
+    out = Path(d) / "tokens.dict"
+    env = dict(os.environ)
+    prior = env.get("LD_PRELOAD", "")
+    env["LD_PRELOAD"] = str(lib) + (":" + prior if prior else "")
+    env["AFL_TOKEN_FILE"] = str(out)
+    argv = [str(exe), *[str(a) for a in base_argv]]
+    tmp = None
+    try:
+        stdin_data = b""
+        if mode == "stdin":
+            stdin_data = data
+        elif mode == "arg":
+            argv = [str(exe), data.split(b"\x00", 1)[0].decode("latin-1"),
+                    *[str(a) for a in base_argv]]
+        elif mode == "file":
+            fd, tmp = tempfile.mkstemp(prefix="lykos-tokcap-in-")
+            os.write(fd, data)
+            os.close(fd)
+            argv = [(tmp if a == "@@" else a) for a in argv] if "@@" in argv else argv + [tmp]
+        try:
+            subprocess.run(argv, input=stdin_data, capture_output=True, timeout=timeout, env=env)
+        except (OSError, subprocess.SubprocessError):
+            return []
+        try:
+            return parse_token_file(out.read_bytes())
+        except OSError:
+            return []
+    finally:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+        shutil.rmtree(d, ignore_errors=True)
+
+
 # ---------------------------------------------------------------- valgrind triage
 
 # memcheck error class -> (CWE, severity). Aligned with rootcause._ASAN_CWE so a valgrind-classified

@@ -541,6 +541,21 @@ int main(void){ setvbuf(stdout,0,2,0);
          cross="powerpc64le-linux-gnu-", budget=420.0,
          note="ARCH ppc64le (static, qemu-ppc64le)"),
 
+    # The five cross-arch cases above are aarch64, arm32 HF (little-endian), ppc64le, riscv64 and
+    # s390x -- every one of which either needs no emulator discriminator or hits a branch that was
+    # already implemented. So nothing asserted MIPS, and for MIPS the ELF e_machine is BOTH
+    # endianness- and word-size-blind: EM_MIPS covers MIPS32 and MIPS64 and elf._MACHINES emits
+    # "mips" for both, which makes `bits` the only way to reach qemu-mips64el. The router ignored
+    # it, so every MIPS64 target ran under a 32-bit emulator and the two 64-bit MIPS emulators were
+    # unreachable by any code path. SKIPs without the toolchain, which is the point: it closes the
+    # coverage hole for anyone who has it.
+    Case("mips64el_overflow", _OVERFLOW_SRC,
+         ["-static", "-fno-stack-protector", "-O0", "-w"],
+         want_level=1, want_cwe=("CWE-121", "CWE-787", "CWE-119"),
+         cross="mips64el-linux-gnuabi64-", budget=420.0,
+         note="ARCH mips64el: 64-bit little-endian MIPS, sharing its e_machine with MIPS32 -- the "
+              "case that would have caught qemu-mips64el being unreachable"),
+
     # ---- FILE FORMATS / FRONT-ENDS. The platform parses PE, JVM, CPython bytecode, WASM and
     # UPX-packed ELF, but every case above is a plain ELF, so a front-end could stop recognising its
     # container entirely without the gate noticing. These assert the one property the probe shows

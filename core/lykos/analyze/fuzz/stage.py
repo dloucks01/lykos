@@ -1294,6 +1294,35 @@ def fuzz_stage(ctx) -> dict:
         ctx.emit("fuzz.seeds", payload={"loaded": len(corpus),
                                         "from": [k for k in ("seed_files", "seed_dir") if p.get(k)]})
     dictionary = _mine_dictionary(strings)
+    # The target's own strings give the tokens visible in the IMAGE. The ones that matter most for
+    # getting past a gate are often not there: a magic value that is COMPUTED (a decoded header, a
+    # checksum, a token read from a config or the environment) exists only at runtime. libtokencap
+    # hooks the comparison functions and reports exactly those, and it was already discovered by
+    # `memoracle.tokencap_lib` and never called -- the static half of this dictionary
+    # (`fuzz.cmpdict`, in directed_fuzz) was wired and the runtime half was not. One extra
+    # execution, host-arch ELF only, and the tokens go to the FRONT: a comparison the program
+    # actually performed beats a string that merely sits in .rodata.
+    _rt_tokens = []
+    try:
+        if not substrate.is_managed(target.file_type):
+            from ..dynamic import memoracle
+            # Staged with its deps, as every stage that executes the target does: the
+            # content-addressed blob is not an executable file.
+            _tc_exe = ctx.scratch() / "target.bin"
+            ctx.content.stage_target(target, _tc_exe.parent, _tc_exe.name)
+            _rt_tokens = memoracle.runtime_tokens(
+                _tc_exe, (corpus[0] if corpus else b""),
+                mode=channels[0] if channels else "stdin",
+                base_argv=base_argv, host_arch=sandbox.host_arch(), target_arch=target.arch)
+    except Exception:                                    # noqa: BLE001 -- the dictionary is advisory
+        _rt_tokens = []
+    if _rt_tokens:
+        dictionary = _rt_tokens + [t for t in dictionary if t not in set(_rt_tokens)]
+        ctx.emit("fuzz.dictionary", payload={
+            "runtime_tokens": len(_rt_tokens), "total": len(dictionary),
+            "sample": [t.decode("latin-1", "replace")[:32] for t in _rt_tokens[:8]],
+            "why": "values the target COMPARED its input against at runtime, which a static "
+                   "string scan cannot see when the value is computed"})
     mutator, note = _structure_mutator(p, rng, dictionary), "found by fuzzing"
     fmt = p.get("format_name") or ("custom" if p.get("format") else None)
     if mutator is None and not p.get("format") and any(

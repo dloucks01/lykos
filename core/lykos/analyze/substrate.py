@@ -56,6 +56,9 @@ class Substrate:
     #: to the interpreter, and instrumenting it measures coverage of CPython, not of the target.
     machine_code: bool = False
     #: Can `sandbox.run_batch` drive many inputs through one ptrace-supervised process group?
+    #: Documentation only, and deliberately so: `run_batch` is handed a PATH, not a target, so it
+    #: answers the same question by magic-sniffing the image. An accessor here had no callers and
+    #: was removed rather than left to imply this field is what enforces the rule.
     batchable: bool = False
     #: Is a control-flow hijack (L2/L3) a claim this substrate can support at all?
     ip_control: bool = False
@@ -146,10 +149,6 @@ def is_managed(file_type: Optional[str]) -> bool:
 def instrumentable(file_type: Optional[str]) -> bool:
     """Does this image contain machine code AFL could instrument or trace?"""
     return of(file_type).machine_code
-
-
-def batchable(file_type: Optional[str]) -> bool:
-    return of(file_type).batchable
 
 
 def supports_ip_control(file_type: Optional[str]) -> bool:

@@ -102,7 +102,11 @@ _QEMU = {"x86-64": "x86_64", "x86": "i386", "aarch64": "aarch64", "arm": "arm",
          "mips": "mips", "mipsel": "mipsel", "mips64": "mips64", "ppc": "ppc",
          "ppc64": "ppc64", "riscv": "riscv64", "riscv64": "riscv64", "s390": "s390x",
          "sparc": "sparc", "sparcv9": "sparc64", "sh": "sh4", "m68k": "m68k",
-         "loongarch": "loongarch64"}
+         "loongarch": "loongarch64",
+         # Installed as qemu-user on a stock host and previously absent from both this table and
+         # elf._MACHINES, so these were unsupported end-to-end with the emulator sitting right
+         # there. xtensa is the ESP32; a firmware image for one is squarely in scope.
+         "xtensa": "xtensa", "microblaze": "microblaze", "hppa": "hppa", "alpha": "alpha"}
 _HOST = {"x86_64": "x86-64", "amd64": "x86-64", "aarch64": "aarch64", "arm64": "aarch64",
          "armv7l": "arm", "mips": "mips", "ppc64": "ppc64", "ppc64le": "ppc64",
          "riscv64": "riscv64"}
@@ -363,22 +367,59 @@ def classify_rc(rc: Optional[int]):
     return False, None, None, rc
 
 
+# An ELF's e_machine names a FAMILY, not an emulator: it is endianness-blind (a little-endian
+# MIPS is still EM_MIPS) and word-size-blind (EM_MIPS covers MIPS32 and MIPS64, EM_RISCV covers
+# RV32 and RV64). The ELF CLASS and DATA bytes carry the rest, so the emulator has to be chosen
+# from all three. A table, because the chain of special cases this replaced applied endianness to
+# mips/ppc64 and bits to riscv/sparc, and the arches needing the OTHER axis were simply missed:
+# every MIPS64 target was handed a 32-bit emulator (qemu-mips64el and qemu-mips64 were therefore
+# unreachable by any code path), and a big-endian ARM or SH target was handed the little-endian
+# one. The gate never caught it because its five cross-arch cases -- aarch64, arm32 hf, ppc64le,
+# riscv64, s390x -- are exactly the ones that need no discriminator or hit the two branches that
+# were implemented. There is still no MIPS case; see mips64el_overflow.
+#
+# Key: arch -> {(endianness, bits): qemu suffix}. `None` in a key position means "don't care";
+# the most specific match wins, so a family needing only one axis lists only that one.
+_QEMU_VARIANTS: dict = {
+    # The ("...", None) rows matter: a caller that does not know the word size must still get
+    # the right ENDIANNESS, and 32-bit is the safe default for an unknown width (MIPS32 is far
+    # more common, and it is what this routed to before). A KNOWN 64 selects the 64-bit emulator.
+    "mips":   {("little", 32): "mipsel",   ("big", 32): "mips",
+               ("little", 64): "mips64el", ("big", 64): "mips64",
+               ("little", None): "mipsel", ("big", None): "mips",
+               # endianness unknown but the width known: honour what we DO have. The ELF parser
+               # always reports endianness, so this is for a manually-set target.arch.
+               (None, 32): "mips", (None, 64): "mips64"},
+    "mips64": {("little", None): "mips64el", ("big", None): "mips64"},
+    "ppc64":  {("little", None): "ppc64le", ("big", None): "ppc64"},
+    "riscv":  {(None, 32): "riscv32", (None, 64): "riscv64"},
+    "sparc":  {(None, 64): "sparc64", (None, 32): "sparc"},
+    # ARM and SH both ship big-endian variants (qemu-armeb, qemu-sh4eb) and both were routed to
+    # the little-endian emulator regardless -- the firmware this tool carves and rehosts is
+    # exactly where big-endian ARM and SH turn up.
+    "arm":    {("big", None): "armeb", ("little", None): "arm"},
+    "sh":     {("big", None): "sh4eb", ("little", None): "sh4"},
+}
+
+
+def _qemu_suffix(arch, endianness, bits) -> Optional[str]:
+    """The qemu-user suffix for a target, from its family AND its endianness AND its word size."""
+    variants = _QEMU_VARIANTS.get(arch)
+    if variants:
+        for key in ((endianness, bits), (endianness, None), (None, bits)):
+            if key in variants:
+                return variants[key]
+    return _QEMU.get(arch)
+
+
 def _qemu_for(arch, endianness=None, bits=None) -> Optional[str]:
     """Pick the qemu-user binary for a target, honouring endianness and word size.
 
-    The ELF arch name is endianness-blind (a little-endian MIPS is still "mips") and
-    bit-blind ("riscv" for both RV32/RV64), so route those to the right qemu here -- otherwise
-    a LE-MIPS target would be handed the big-endian emulator and fail to run.
+    Returns None when no emulator for that exact variant is installed -- which the caller turns
+    into `unsupported-arch` WITH the reason, rather than running the wrong one and reporting the
+    silence as a clean run.
     """
-    suf = _QEMU.get(arch)
-    if arch in ("mips", "mips64") and endianness == "little":
-        suf = "mipsel" if arch == "mips" else "mips64el"
-    elif arch == "ppc64" and endianness == "little":
-        suf = "ppc64le"
-    elif arch == "riscv":
-        suf = "riscv32" if bits == 32 else "riscv64"
-    elif arch == "sparc" and bits == 64:      # EM_SPARC with a 64-bit class -> v9
-        suf = "sparc64"
+    suf = _qemu_suffix(arch, endianness, bits)
     return shutil.which("qemu-" + suf) if suf else None
 
 
