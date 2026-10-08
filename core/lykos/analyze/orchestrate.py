@@ -440,8 +440,9 @@ def _nonnative_image(target) -> bool:
     machine code -- the only machine code in the process belongs to the interpreter or the
     engine, so instrumenting it measures coverage of the JVM, of CPython or of V8 and tells you
     nothing about the target -- and a PE runs under wine rather than as a host process.
-    coverage_fuzz cannot apply to any of them; it has to be the blind campaign instead. Distinct from _expensive_substrate, which includes a foreign ARCH:
-    AFL++ qemu-mode genuinely does handle those, given afl-qemu-trace.
+    coverage_fuzz cannot apply to any of them; it has to be the blind campaign instead.
+    Distinct from _expensive_substrate, which includes a foreign ARCH: AFL++ qemu-mode
+    genuinely does handle those, given afl-qemu-trace.
     """
     return (getattr(target, "file_type", "") or "").lower() in _FOREIGN_SUBSTRATE_TYPES
 
