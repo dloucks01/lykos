@@ -128,8 +128,20 @@ _VALGRIND_CWE = {
     "double-free": ("CWE-415", "critical"),
     "invalid-free": ("CWE-590", "high"),
     "uninitialised": ("CWE-457", "medium"),
+    # Uninitialised bytes handed to a WRITE syscall have LEFT THE PROCESS. memcheck reports that
+    # distinctly ("Syscall param write(buf) points to uninitialised byte(s)"), and the difference
+    # matters: a conditional jump on an uninitialised value is an internal error with no effect a
+    # report can demonstrate, while this one IS the effect -- stack or heap residue disclosed to
+    # whoever reads the output. Ranked above plain `uninitialised` for that reason.
+    "uninit-disclosure": ("CWE-200", "high"),
     "leak": ("CWE-401", "low"),
 }
+
+# "Syscall param write(buf) points to uninitialised byte(s)" -- also sendto/send/pwrite/writev.
+_VG_DISCLOSE = re.compile(
+    r"^syscall param (write|pwrite\d*|writev|send|sendto|sendmsg)\b.*points to uninitialised")
+# "Uninitialised value was created by a stack allocation" / "by a heap allocation"
+_VG_ORIGIN = re.compile(r"uninitialised value was created by an? (\w+) allocation")
 
 _VG_LINE = re.compile(rb"^==\d+==\s?(.*)$")
 
@@ -176,14 +188,28 @@ def parse_memcheck(stderr: bytes) -> Optional[dict]:
         elif "invalid free" in low or "invalid delete" in low:
             # a free of an already-freed block is a double free; otherwise a free of a bad pointer.
             kind = "double-free" if freed else "invalid-free"
+        elif _VG_DISCLOSE.match(low):
+            kind = "uninit-disclosure"
         elif low.startswith("use of uninitialised") or "uninitialised value" in low:
             kind = "uninitialised"
         elif "conditional jump or move depends on uninitialised" in low:
             kind = "uninitialised"
         if kind:
             cwe, sev = _VALGRIND_CWE[kind]
-            findings.append({"kind": kind, "cwe": cwe, "severity": sev,
-                             "size": _size(ln), "detail": ln})
+            f = {"kind": kind, "cwe": cwe, "severity": sev, "size": _size(ln), "detail": ln}
+            if kind.startswith("uninit"):
+                # memcheck with --track-origins names WHERE the uninitialised value came from
+                # ("created by a stack allocation"), which is the difference between "something
+                # was uninitialised" and a root cause a reader can act on.
+                # The origin sits AFTER the error's whole stack trace, which can be a dozen
+                # frames deep, so a short window misses it. Prefer the nearest, then fall back
+                # to the run as a whole -- with several uninit errors the origins are all of the
+                # same shape, and this is evidence rather than the verdict.
+                om = (_VG_ORIGIN.search(" ".join(lines[i + 1:i + 40]).lower())
+                      or _VG_ORIGIN.search(text.lower()))
+                if om:
+                    f["origin"] = om.group(1)          # "stack" | "heap" | "client"
+            findings.append(f)
 
     if not findings:
         # A leak-only run: "definitely lost: N bytes in M blocks".
@@ -195,7 +221,7 @@ def parse_memcheck(stderr: bytes) -> Optional[dict]:
         return None
 
     order = ["double-free", "use-after-free", "heap-oob-write", "invalid-free",
-             "heap-oob-read", "uninitialised", "leak"]
+             "heap-oob-read", "uninit-disclosure", "uninitialised", "leak"]
     findings.sort(key=lambda f: order.index(f["kind"]))
     return findings[0]
 
@@ -233,9 +259,13 @@ def valgrind_triage(exe, data: bytes, *, mode: str = "stdin", base_argv=(),
                 argv = [input_path if a == "@@" else a for a in argv]
             else:
                 argv = argv + [input_path]
+        # --track-origins names WHERE an undefined value came from ("created by a stack
+        # allocation"), which is the difference between "something was uninitialised" and a root
+        # cause a reader can act on. It costs extra shadow state, which this triage lane can
+        # afford; the fuzz loop never comes here.
         cmd = [vg, "--error-exitcode=0", "--exit-on-first-error=no",
                "--leak-check=summary", "--errors-for-leak-kinds=definite",
-               "-q", *argv]
+               "--track-origins=yes", "-q", *argv]
         try:
             r = subprocess.run(cmd, input=stdin_data, capture_output=True, timeout=timeout)
         except (OSError, subprocess.SubprocessError):

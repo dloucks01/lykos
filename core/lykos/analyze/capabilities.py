@@ -46,6 +46,9 @@ STAGES: dict = {
     "extract_secrets":      (FIND,  "Extract secrets", "recover compared-against values"),
     "dynamic_taint":        (FIND,  "Dynamic taint", "watch input reach a sink at runtime"),
     "heap_check":           (FIND,  "Heap check", "guard-page allocator under LD_PRELOAD"),
+    "mem_oracle":           (FIND,  "Uninitialised memory", "shadow memory: reads of undefined "
+                                                           "bytes, and the disclosure when they "
+                                                           "reach the output"),
     "behavior_trace":       (FIND,  "Behaviour trace", "syscalls, exec, network, anti-debug"),
     "debug_monitor":        (FIND,  "Runtime monitor", "break on dangerous calls, live"),
     "synthesize_poc":       (FIND,  "Synthesize PoC", "derive the overflow from the frame, "
@@ -109,6 +112,20 @@ def _why_unavailable(stage: str, target) -> Optional[str]:
             return ("this target is statically linked, so the LD_PRELOAD guard-page allocator "
                     "never loads -- nothing would be checked, which is not the same as "
                     "nothing found.")
+
+    if stage == "mem_oracle":
+        from .dynamic import memoracle
+        from .dynamic import sandbox as _sb
+        sub = substrate.of(ftype)
+        if sub.backend != substrate.NATIVE:
+            return (f"memcheck is a host-architecture dynamic translator and cannot run a "
+                    f"{(ftype or 'non-native').upper()} target.")
+        host = _sb.host_arch()
+        if arch and host and arch != host:
+            return (f"memcheck runs the target natively (target {arch}, host {host}); a "
+                    f"cross-arch shadow-memory oracle is not available here.")
+        if memoracle.valgrind_bin() is None:
+            return "uninitialised-memory detection needs valgrind, which is not installed."
 
     if stage == "multi_debug":
         from .debug import gdb

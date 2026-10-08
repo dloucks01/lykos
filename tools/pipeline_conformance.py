@@ -860,7 +860,7 @@ static void leak(void){ char b[64]; printf("%.64s\n", b); }   /* never initialis
 int main(void){ setvbuf(stdout,0,2,0); fill(); leak(); return 0; }""",
          ["-no-pie", "-fno-stack-protector", "-O0", "-w"],
          want_level=0, want_cwe=("CWE-457", "CWE-200", "CWE-908"), budget=240.0,
-         note="BUG CLASS use of uninitialised stack memory (CWE-457/908) -> disclosure. KNOWN GAP -- reading an uninitialised buffer never faults, and nothing compares output against stale frame contents, so the disclosure is not demonstrated."),
+         note="BUG CLASS use of uninitialised stack memory (CWE-457/908) -> disclosure. Was a known gap: the read never faults, so every crash-centric stage is blind to it, and a DIFFERENTIAL oracle cannot see it either -- fill() overwrites any pre-seeded pattern microseconds before leak() reads it, and the program takes no input, so there is no knob. The `mem_oracle` stage runs valgrind memcheck, whose shadow memory sees the read itself and distinguishes undefined bytes reaching a WRITE syscall (CWE-200, the disclosure, an effect that actually happened) from a merely internal uninitialised read (CWE-457)."),
 
     # ---- INJECTION. A whole bug family the platform has probes for (command, path, SQL, XXE,
     # SSRF) and which nothing asserted: these need no memory corruption at all, so none of the

@@ -1,5 +1,5 @@
 """Sandboxed dynamic analysis (Phase 4). Importing registers the `dynamic_run`, `heap_check`,
-`heap_trace` and `oob_index` stages."""
+`heap_trace`, `oob_index` and `mem_oracle` stages."""
 from .heap_discover import HEAP_TRACE_STAGE, enqueue_heap_trace  # noqa: F401
 from .heap_discover import register as _register_heaptrace
 from .heap_stage import HEAP_STAGE, enqueue_heap_check  # noqa: F401
@@ -9,6 +9,8 @@ from .oob_index import register as _register_oob
 from .sandbox import RunResult, run  # noqa: F401
 from .stage import DYNAMIC_STAGE, enqueue_dynamic  # noqa: F401
 from .stage import register as _register
+from .uninit_stage import MEM_ORACLE_STAGE, enqueue_mem_oracle  # noqa: F401
+from .uninit_stage import register as _register_memoracle
 
 
 def register() -> None:
@@ -16,3 +18,4 @@ def register() -> None:
     _register_heap()
     _register_heaptrace()
     _register_oob()
+    _register_memoracle()

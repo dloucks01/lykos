@@ -49,6 +49,7 @@ _TARGET = {
     "heap_check": ("..analyze.dynamic", "enqueue_heap_check"),
     "heap_trace": ("..analyze.dynamic", "enqueue_heap_trace"),
     "oob_index": ("..analyze.dynamic", "enqueue_oob_index"),
+    "mem_oracle": ("..analyze.dynamic", "enqueue_mem_oracle"),
     "chain_primitive": ("..analyze.poc", "enqueue_chain"),
     "concolic": ("..analyze.symbolic", "enqueue_concolic"),
     "root_cause": ("..analyze.debug", "enqueue_root_cause"),
@@ -92,7 +93,10 @@ _NO_PARAMS = {"disassemble", "detect_cwe", "heap_trace", "oob_index", "chain_pri
               # reads static findings and never executes; libfuzzer builds its own harness from
               # source; boundary_fuzz discovers its own IPC channel. Each declines for itself
               # when it does not apply, which is why none of them needs a gate here.
-              "extract_secrets", "synthesize_secret", "libfuzzer", "boundary_fuzz"}
+              "extract_secrets", "synthesize_secret", "libfuzzer", "boundary_fuzz",
+              # mem_oracle picks its own probe inputs (a recorded crash if there is one, else an
+              # empty probe -- a default-path uninitialised read needs no input at all).
+              "mem_oracle"}
 _CASE_NO_PARAMS = {"link_case", "ipc_model", "cross_taint"}
 
 _TERMINAL = {"done", "cancelled", "error"}
@@ -158,7 +162,8 @@ _PLAN_STAGES = [
     ("cve_corroborate", "CVE corroboration"), ("synthesize_injection", "Injection probes"),
     ("coverage_fuzz", "Coverage fuzzing"), ("directed_fuzz", "Directed fuzzing"),
     ("heap_check", "Heap checks"), ("heap_trace", "Heap primitives"),
-    ("oob_index", "Array-index probes"), ("chain_primitive", "Primitive chaining"),
+    ("oob_index", "Array-index probes"), ("mem_oracle", "Uninitialised-memory oracle"),
+    ("chain_primitive", "Primitive chaining"),
     ("concolic", "Concolic execution"), ("synthesize_poc", "Synthesize PoC"),
     ("root_cause", "Root-cause"), ("build_poc", "Build PoC"),
     ("poc_primitive", "PoC primitive"), ("build_exploit", "Build exploit"),
@@ -779,6 +784,12 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict, stop: t
             # its _lead_finding consumes the heap_trace / oob_index Findings, so it must see them done.
             _run_target_stages(store, t, [("heap_check", dyn), ("heap_trace", None),
                                           ("oob_index", None)], status, stop)
+            # A defect that never crashes is invisible to every stage above and below this one.
+            # Shadow memory sees an uninitialised read as it happens, and tells a disclosure --
+            # undefined bytes reaching a write syscall, which IS the effect -- from a merely
+            # internal one. Native-ELF only and ~10-30x a bare run, so it is a bounded pass over
+            # a few inputs here rather than anything inside a campaign.
+            _run_target_stage(store, t, "mem_oracle", status, stop)
             _run_target_stage(store, t, "chain_primitive", status, stop)
             # Search. The CHANNEL-SPECIFIC fuzzers go first, because each one knows the channel its
             # target actually reads and both self-gate to the imports that prove it (bind/listen/
