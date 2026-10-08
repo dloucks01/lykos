@@ -69,6 +69,12 @@ class Case:
     # SKIPS the case rather than failing it: a sink that cannot be built here is untested, which is
     # not the same as a capability that does not work, and conflating the two invents fake gaps.
     requires: tuple = ()
+    # Ingest the SOURCE rather than a binary we compiled. The platform builds such a target itself
+    # with ASan+UBSan, which is the only way several defects are observable at all -- an off-by-one
+    # or an uninitialised read does not fault in a plain build, so a binary-only case can never
+    # demonstrate one however good the pipeline is. The mission is "binaries AND source", and
+    # nothing covered the source half.
+    as_source: bool = False
 
 
 _CASES: list[Case] = [
@@ -804,6 +810,61 @@ int main(int argc, char **argv){ setvbuf(stdout,0,2,0);
               "string names both the flag AND its valid value, so discovery is possible -- demanding "
               "a magic value that appears nowhere would test nothing but luck"),
 
+    # ---- SOURCE INPUT. The mission is "binaries AND source" and nothing covered the source half.
+    # It also matters for capability, not just coverage: the platform builds a source target with
+    # ASan+UBSan, and these three defects are exactly the ones that do NOT fault in a plain build,
+    # so the binary-only versions of them above cannot be demonstrated however good the pipeline is.
+    # Same sources, handed over as source instead of compiled by the harness.
+    Case("src_off_by_one",
+         r"""#include <stdio.h>
+int main(void){ char b[64]; int i;
+  printf("in: ");
+  for(i=0; i<=64; i++){ int c=getchar(); if(c<0||c=='\n') break; b[i]=(char)c; }
+  b[i]=0;                                   /* one past the end; ASan sees it, a plain build does not */
+  printf("hi %s\n", b); return 0; }""",
+         [], want_level=0,
+         want_cwe=("CWE-787", "CWE-121", "CWE-119", "CWE-193", "CWE-125"),
+         as_source=True, budget=420.0,
+         note="SOURCE off-by-one: built with ASan by the platform, so the single-byte overflow is "
+              "observable where the plain-binary case cannot fault"),
+
+    Case("src_uninit_read",
+         r"""#include <stdio.h>
+static void fill(void){ volatile char pad[64]; for(int i=0;i<64;i++) pad[i]='S'; }
+static int leak(void){ int b[16]; return b[7]; }      /* never initialised */
+int main(void){ setvbuf(stdout,0,2,0);
+  char name[32]; printf("name: ");
+  if(scanf("%31s", name)!=1) return 0;
+  fill();
+  int v = leak();                                     /* uninitialised read */
+  if(v == 0x53535353) printf("hi %s: match\n", name);
+  else printf("hi %s: %d\n", name, v);
+  return 0; }""",
+         [], want_level=0, want_cwe=("CWE-457", "CWE-908", "CWE-200", "CWE-824"),
+         as_source=True, budget=420.0,
+         note="SOURCE uninitialised read: nothing faults in a plain build, so only the MSan build "
+              "can demonstrate it. The uninitialised value is BRANCHED ON, which is the shape MSan "
+              "reports; a measured open gap is the pure-disclosure shape (printf(\"%.64s\", uninit)) "
+              "-- MSan stays silent on it at every -O level even though it visibly prints the "
+              "previous frame's bytes, so catching that needs a differential oracle, not MSan"),
+
+    Case("src_int_overflow",
+         r"""#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+int main(void){ setvbuf(stdout,0,2,0);
+  unsigned n; printf("count: ");
+  if(scanf("%u",&n)!=1) return 0;
+  char *p = malloc(n * 16);                 /* n*16 wraps: UBSan flags the overflow itself */
+  if(!p) return 1;
+  for(unsigned i=0;i<n;i++) memset(p + i*16, 'A', 16);
+  printf("ok %u\n", n); free(p); return 0; }""",
+         [], want_level=0,
+         want_cwe=("CWE-190", "CWE-131", "CWE-122", "CWE-787", "CWE-119"),
+         as_source=True, budget=420.0,
+         note="SOURCE integer overflow into an allocation: UBSan reports the wrap directly rather "
+              "than waiting for a fault that may never come"),
+
     # ---- MULTIPLE DEFECTS. Every case above asserts ONE effect on one target; the mission claim is
     # "find EVERY crash", so this binary carries two unrelated bugs behind a menu and both must be
     # demonstrated.
@@ -902,8 +963,14 @@ def _run_case(case: Case, gcc: str) -> Result:
         ok_need = Path(need).exists() if need.startswith("/") else bool(shutil.which(need))
         if not ok_need:
             return Result(case.name, True, profile="SKIP", reason="missing %s" % need)
+    if case.as_source:                                   # hand over the SOURCE; the platform builds it
+        src = d / (case.name + ".c")
+        src.write_text(case.src)
+        exe = src
     cc = gcc
-    if case.build:                                       # produced by something other than a C compiler
+    if case.as_source:
+        pass                                             # nothing to compile here
+    elif case.build:                                       # produced by something other than a C compiler
         argv, out = case.build
         if not shutil.which(argv[0]):
             return Result(case.name, True, profile="SKIP", reason="no %s" % argv[0])
@@ -938,7 +1005,10 @@ def _run_case(case: Case, gcc: str) -> Result:
     pool = WorkerPool(s.db_path, s.content, JobConfig(workers=3, poll_interval=0.02)); pool.start()
     t0 = time.time()
     try:
-        t = ingest(s, c.id, exe, filename=case.name)
+        # ingest dispatches source-vs-binary on the FILENAME SUFFIX (ingest.is_source), so a
+        # source case has to arrive named ".c" or the platform treats it as an unknown blob.
+        t = ingest(s, c.id, exe,
+                   filename=case.name + ".c" if case.as_source else case.name)
         q = JobQueue(s.conn); enqueue_triage(q, t, force=True); pool.wait_idle(60)
         tg = TargetDAO(s.conn).get(t.id); mit = tg.mitigations or {}
         prof = "%s pie=%s can=%s relro=%s" % ((tg.arch or "?")[:7], mit.get("pie", "?"),

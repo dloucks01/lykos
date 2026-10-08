@@ -116,7 +116,13 @@ def compile_source_msan(src: Path, filename: str, out: Path):
     # `-x`: see compile_source -- the upload path hands us `body.bin`, so pin the input language
     # rather than let clang misread the extension.
     lang = "c++" if ext in _CXX_EXT else "c"
-    argv = [cc, "-g", "-O1", "-fno-omit-frame-pointer", "-fsanitize=memory",
+    # -O0, NOT -O1. Reading an uninitialized value is undefined behaviour, so at -O1 and above
+    # clang is entitled to assume the read never happens: it folds the dependent branch (or the
+    # whole path, as `unreachable`) away BEFORE the MSan pass instruments it, and the binary runs
+    # clean. Measured on a canonical case -- branch on an uninitialized int -- MSan reports it at
+    # -O0 and says nothing whatsoever at -O1/-O2, which left this entire build dead for the one
+    # class it exists to catch. Optimisation buys nothing here; the binary is only detonated.
+    argv = [cc, "-g", "-O0", "-fno-omit-frame-pointer", "-fsanitize=memory",
             "-fsanitize-memory-track-origins=2", "-fno-sanitize-recover=all", "-w",
             "-Wno-error=implicit-function-declaration", "-Wno-error=implicit-int",
             "-Wno-error=int-conversion", "-D_GNU_SOURCE",

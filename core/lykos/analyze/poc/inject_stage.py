@@ -42,16 +42,53 @@ def _channels(call_edges, given):
     return order
 
 
-def _deliver(mode, payload, argv_base, ctx):
+def _deliver(mode, payload, argv_base, ctx, nav=b""):
     if isinstance(payload, str):
         payload = payload.encode()
     if mode == "stdin":
-        return list(argv_base), payload
+        return list(argv_base), nav + payload
     if mode == "arg":
-        return argv_base + [payload.decode("latin-1")], b""
+        return argv_base + [payload.decode("latin-1")], nav
     wf = ctx.scratch() / "input.bin"
     wf.write_bytes(payload)
-    return argv_base + [str(wf)], b""
+    return argv_base + [str(wf)], nav
+
+
+def _nav_preambles(ctx, target, target_bytes):
+    """Stdin byte prefixes that NAVIGATE to a sink the entry channel cannot reach.
+
+    A sink behind a menu branch (`printf(user)` under option 2) or an input gate never sees the
+    probe: the first read consumes the payload as the menu choice, it fails to parse, and the
+    program exits -- which this stage used to report as "no injection confirmed on the entry
+    channel". Prepending a menu selection / gate-passing preamble puts the program AT the sink
+    before the payload is read. Returns only the non-empty prefixes, in cheapest-first order; the
+    bare attempt is made separately so an already-reachable sink costs exactly what it did before.
+    """
+    from ...db.dao import StringDAO                   # local: a sibling-scope import here bites
+    from .. import interaction
+    try:                                              # detect_menu needs DISASSEMBLER strings --
+        strings = [s.value for s in StringDAO(ctx.conn).list_by_target(target.id)]
+    except Exception:                                 # noqa: BLE001 -- ElfInfo has no .strings
+        strings = []
+    try:
+        model = interaction.build_model(target_bytes, strings=strings)
+    except Exception:                                 # noqa: BLE001
+        return []
+    out = []
+    for opt in (model.menu_opts or [])[:8]:           # select each advertised menu branch FIRST:
+        out.append(str(opt).encode() + b"\n")         # highest-signal, and exactly one is the sink
+    # Gates are tried after because _gate_preambles is deliberately over-broad -- on a target with
+    # no real gate it returns imported symbol names and the interpreter path, so leading with them
+    # just buys sandbox runs. Harmless, but they go last.
+    for g in (model.gate_preambles or [])[:4]:        # pass an input gate (strstr/banner reply)
+        g = g if isinstance(g, bytes) else str(g).encode()
+        out.append(g if g.endswith(b"\n") else g + b"\n")
+    seen, uniq = set(), []
+    for p in out:
+        if p not in seen:
+            seen.add(p)
+            uniq.append(p)
+    return uniq[:10]
 
 
 def synthesize_injection_stage(ctx) -> dict:
@@ -78,31 +115,50 @@ def synthesize_injection_stage(ctx) -> dict:
 
     ctx.emit("inject.start", payload={"probes": sorted(applicable), "channels": channels})
     confirmed = []
+    navs = None                                      # built lazily: only a failing probe needs it
     for name, spec in applicable.items():
         marker = _marker()
         payloads = spec["payloads"](marker)
+
+        def _attempt(payload, mode, nav=b""):
+            run_argv, stdin = _deliver(mode, payload, argv_base, ctx, nav)
+            res = sandbox.run(exe, argv=run_argv, stdin=stdin, timeout=timeout,
+                              arch=target.arch, endianness=target.endianness, bits=target.bits)
+            out = (res.stdout or b"") + b"\n" + (res.stderr or b"")
+            if not spec["confirm"](out, payload, marker):
+                return None
+            return {"payload": payload, "mode": mode, "signal": res.signal_name, "out": out,
+                    "marker": marker, "argv_base": list(argv_base), "nav": nav, "stdin": stdin}
+
         hit = None
-        for payload in payloads:
+        for payload in payloads:                     # 1. the entry channel, exactly as before
             for mode in channels:
-                run_argv, stdin = _deliver(mode, payload, argv_base, ctx)
                 ctx.progress(msg=f"probing {name} ({mode})")
-                res = sandbox.run(exe, argv=run_argv, stdin=stdin, timeout=timeout,
-                                  arch=target.arch, endianness=target.endianness, bits=target.bits)
-                out = (res.stdout or b"") + b"\n" + (res.stderr or b"")
-                if spec["confirm"](out, payload, marker):
-                    hit = {"payload": payload, "mode": mode, "signal": res.signal_name,
-                           "out": out, "marker": marker, "argv_base": list(argv_base)}
+                hit = _attempt(payload, mode)
+                if hit:
                     break
             if hit:
                 break
+        if hit is None:                              # 2. NAVIGATE to a sink behind a menu / gate
+            if navs is None:
+                navs = _nav_preambles(ctx, target, target_bytes)
+            for nav in navs:
+                for payload in payloads:
+                    ctx.progress(msg=f"probing {name} (stdin after {nav[:8]!r})")
+                    hit = _attempt(payload, "stdin", nav)
+                    if hit:
+                        break
+                if hit:
+                    break
         if hit:
             confirmed.append({"probe": name, **_finalize(ctx, target, target_bytes, spec, hit)})
 
     ctx.emit("inject.done", payload={"ok": True, "confirmed": len(confirmed),
              "results": [{"probe": c["probe"], "cwe": c["cwe"], "mode": c["mode"]}
                          for c in confirmed],
-             "note": None if confirmed else "no injection confirmed on the entry channel "
-                     "(sink may need navigation to reach; try the interactive console)"})
+             "note": None if confirmed else
+                     "no injection confirmed on the entry channel or behind any of the %d "
+                     "navigation preamble(s) tried (menu branches / input gates)" % len(navs or [])})
     ctx.progress(pct=100, msg=f"{len(confirmed)} injection PoC(s) confirmed")
     return {}
 
@@ -196,7 +252,12 @@ def _finalize(ctx, target, target_bytes, spec, hit):
     payload = hit["payload"]
     pb = payload if isinstance(payload, bytes) else payload.encode()
     mode = hit["mode"]
-    input_sha = ctx.put_artifact("inject-input", data=pb)
+    # The DEMONSTRATING input is whatever actually went down the channel. When the sink sat behind
+    # a menu branch that is navigation + payload, and shipping the bare payload would hand the user
+    # a bundle that replays to a clean exit.
+    nav = hit.get("nav") or b""
+    delivered = hit.get("stdin") if mode == "stdin" and hit.get("stdin") else pb
+    input_sha = ctx.put_artifact("inject-input", data=delivered)
     # Record the ACTUAL base argv that delivered the payload (the discovered flags / `@@`), not a
     # bare re-derivation: dropping it produced a bundle that a replayer could not reproduce for any
     # target that takes its input behind a flag. The mode + argv_base let the replay place the input.
@@ -204,10 +265,15 @@ def _finalize(ctx, target, target_bytes, spec, hit):
     shown = pb.decode("latin-1")[:80]
     detail = (f"{spec['title']} confirmed at runtime via {mode}: payload {shown!r} produced the "
               f"expected effect (no fuzzing)")
+    if nav:
+        detail += (f" -- reached by navigating first with {nav.decode('latin-1')!r} "
+                   "(the sink is behind a menu branch / input gate)")
     meta = {"target_sha256": target.sha256, "arch": target.arch, "input_mode": mode,
             "argv": run_argv, "level": "L1", "cwe": spec["cwe"], "injection": spec["title"],
             "tool_version": TOOL_VERSION}
-    data = bundle.build(target_bytes, pb, meta, b"", mode, run_argv, "none")
+    if nav:
+        meta["navigation"] = nav.decode("latin-1")
+    data = bundle.build(target_bytes, delivered, meta, b"", mode, run_argv, "none")
     bundle_sha = ctx.put_artifact("poc-bundle", data=data, meta={"verified": True, "level": "L1"})
     poc_id = PocDAO(ctx.conn).insert(target.id, target.case_id, level="L1", verified=True,
                                      signal_name=None, input_sha=input_sha, bundle_sha=bundle_sha)

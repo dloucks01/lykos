@@ -288,6 +288,40 @@ _ASAN_CWE = {
     "SEGV": ("CWE-476", "high"),
 }
 
+# UndefinedBehaviorSanitizer names the exact check that fired in its "runtime error:" line, so the
+# report carries the bug class already -- classifying every one of them as CWE-758 ("reliance on
+# undefined behaviour") threw that away and reported an out-of-bounds array write as a vague
+# medium. Matched in order, first hit wins; anything unrecognised still falls back to CWE-758.
+_UBSAN_CWE = (
+    # An out-of-bounds array access. UBSan does not say whether it was a read or a write, so this
+    # stays at the bounds PARENT class rather than claiming CWE-125/CWE-787 it cannot distinguish.
+    (r"\bindex\b.*\bout of bounds\b", "array-index-out-of-bounds", "CWE-119", "high"),
+    (r"\bvariable length array bound\b", "vla-bound-not-positive", "CWE-129", "medium"),
+    (r"\b(?:signed|unsigned) integer overflow\b", "integer-overflow", "CWE-190", "high"),
+    (r"\bnegation of .* cannot be represented\b", "integer-overflow", "CWE-190", "medium"),
+    (r"\bimplicit conversion from type\b", "integer-truncation", "CWE-197", "medium"),
+    (r"\bdivision by zero\b", "divide-by-zero", "CWE-369", "medium"),
+    (r"\b(?:member access within|member call on|load of|store to|applying .* to|"
+     r"binding reference to|applying zero offset to)\s*(?:misaligned address|null pointer)",
+     "null-pointer-dereference", "CWE-476", "high"),
+    (r"\bshift exponent\b", "bad-shift", "CWE-1335", "medium"),
+    (r"\bpointer index expression .* overflowed\b", "pointer-overflow", "CWE-823", "medium"),
+    (r"\bnot a valid value for type\b", "invalid-value-load", "CWE-704", "medium"),
+    (r"\bthrough pointer to incorrect function type\b", "function-type-mismatch",
+     "CWE-686", "medium"),
+    (r"\bexecution reached the end of a value-returning function\b", "missing-return",
+     "CWE-758", "low"),
+)
+
+
+def _classify_ubsan(msg: str):
+    """(class, cwe, severity) for a UBSan 'runtime error: ...' message."""
+    import re
+    for pat, bug, cwe, sev in _UBSAN_CWE:
+        if re.search(pat, msg, re.I):
+            return bug, cwe, sev
+    return "undefined-behavior", "CWE-758", "medium"
+
 # Tokens that can follow "AddressSanitizer:" in a non-defect line (setup/runtime failures, not
 # bugs in the target). Belt-and-braces alongside the colon requirement in parse_asan_report.
 _ASAN_NONBUG = frozenset({"failed", "out", "hard", "requested", "cannot", "unable", "shadow",
@@ -339,9 +373,9 @@ def parse_asan_report(text: str) -> Optional[dict]:
         cwe, sev = _ASAN_CWE.get(bug, ("CWE-119", "high"))
         detail = f"AddressSanitizer: {bug.replace('-', ' ')}"
     else:
-        bug = "undefined-behavior"
-        cwe, sev = ("CWE-758", "medium")
-        detail = f"UndefinedBehaviorSanitizer: {ub.group(1).strip()[:120]}"
+        msg = ub.group(1).strip()
+        bug, cwe, sev = _classify_ubsan(msg)
+        detail = f"UndefinedBehaviorSanitizer: {msg[:120]}"
     # The first stack frame that names a real source file (skip the sanitizer interceptors).
     src = None
     for fm in re.finditer(r"#\d+ 0x[0-9a-f]+ in \S+ ([^\s:]+\.(?:c|cc|cpp|cxx|h|hpp)):(\d+)", t):

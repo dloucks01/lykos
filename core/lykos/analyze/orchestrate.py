@@ -419,6 +419,28 @@ def _cve_crash_origins(store, target_id) -> dict:
     return out
 
 
+# Detectors that report a defect from the CODE rather than from an observed effect. A finding from
+# one of these is "detected", not "demonstrated", so it must never satisfy a check for whether a
+# bug class has actually been proven -- `dangerous_api` files a strcpy() sighting as corroborated.
+_STATIC_DETECTORS = frozenset({"dangerous_api", "detect_cwe", "cwe_scan", "source_sink_scan"})
+# The unbounded stack/buffer-copy family that synthesize_poc exists to demonstrate.
+_OVERFLOW_CWES = frozenset({"CWE-119", "CWE-120", "CWE-121", "CWE-122", "CWE-125", "CWE-193",
+                            "CWE-242", "CWE-787"})
+
+
+def _has_demonstrated(store, target_id, cwes) -> bool:
+    """Has any bug in `cwes` been DEMONSTRATED (not merely flagged statically) on this target?"""
+    try:
+        for f in FindingDAO(store.conn).list_by_target(target_id):
+            if (f.detector not in _STATIC_DETECTORS
+                    and f.state in ("poc-backed", "corroborated", "confirmed")
+                    and (f.cwe or "") in cwes):
+                return True
+    except Exception:                                    # noqa: BLE001 -- advisory check only
+        _log.debug("demonstrated-CWE check failed for %s", target_id, exc_info=True)
+    return False
+
+
 def _max_verified_poc_level(store, target_id) -> int:
     """Highest verified PoC level (L1->1, L2->2, L3->3) on the target, or 0 when none."""
     lv = 0
@@ -668,7 +690,13 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict, stop: t
             # over the channel the binary reads; on a fault it files a verified L1 crash exactly
             # like a fuzzer-found one, which the exploit ladder below then builds into L2/L3. The
             # stage no-ops when no stack buffers were recovered, so it is safe to run generally.
-            if not crashes and not stop.is_set():
+            # Run it when the fuzzer found NOTHING, and also when it found crashes that do not
+            # include an overflow: a binary with two defects (say a format sink on one menu branch
+            # and a scanf("%s") overflow on another) gives the fuzzer the easy one, and gating on
+            # `not crashes` then skipped the synthesis the hard one needs -- so "find every crash"
+            # held for one defect per target but not for several in one binary. The stage no-ops
+            # when no stack buffers were recovered, so the added cost is one detonation.
+            if not stop.is_set() and (not crashes or not _has_demonstrated(store, tid, _OVERFLOW_CWES)):
                 _run_target_stage(store, t, "synthesize_poc", status, stop)
                 crashes = _distinct_crashes(store, tid)
             # CVE -> exploit chain: which of these crashes were REPRODUCED by a matched-CVE trigger,
