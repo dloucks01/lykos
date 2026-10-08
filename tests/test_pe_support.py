@@ -46,6 +46,35 @@ def test_a_wine_page_fault_is_a_crash():
     assert sandbox.wine_exception(b"") == (None, None, None)
 
 
+def test_a_smashed_seh_chain_is_a_crash():
+    """A THIRD format, and the one a stack overflow actually produces. Once the overflow has
+    overwritten the SEH chain the exception cannot be dispatched at all, so wine never prints
+    "Unhandled exception code" -- it prints the dispatcher giving up. Matching only the first two
+    formats read the most interesting PE crash there is, a fully controlled stack overwrite, as a
+    clean run.
+
+    These are the exact lines wine emitted for a mingw scanf("%s") overflow fed 400 bytes."""
+    real = (b"0024:err:seh:call_seh_handlers invalid frame 4141414141414141 "
+            b"(00007FFFFE102000-00007FFFFE300000)\n"
+            b"0024:err:seh:NtRaiseException Exception frame is not in stack limits "
+            b"=> unable to dispatch exception.\n")
+    code, name, detail = sandbox.wine_exception(real)
+    assert code == "c0000005" and name == "EXCEPTION_ACCESS_VIOLATION"
+    # the frame value is the attacker's own bytes -- keep it, it is the evidence of control
+    assert "0x4141414141414141" in detail and "SEH frame corrupted" in detail
+
+
+def test_wineboot_noise_is_not_a_crash():
+    """A fresh WINEPREFIX emits a wall of err: lines while bootstrapping. None of them is a guest
+    crash, and counting one would make every first PE run a false finding."""
+    noise = (b"004c:err:winediag:nodrv_CreateWindow Application tried to create a window\n"
+             b"004c:err:ole:StdMarshalImpl_MarshalInterface Failed to create ifstub, hr 0x80070578\n"
+             b"004c:err:ole:start_rpcss Failed to open RpcSs service\n"
+             b"wine: failed to open L\"C:\\\\windows\\\\syswow64\\\\rundll32.exe\": c0000135\n"
+             b"002c:err:setupapi:do_file_copyW Unsupported style(s) 0x10\n")
+    assert sandbox.wine_exception(noise) == (None, None, None)
+
+
 def test_pe_headers_are_parsed(tmp_path):
     """Triage recorded `file_type: pe` and then null for arch, bits, linking, stripped and
     mitigations -- the panel that shows them was blank on every Windows binary."""

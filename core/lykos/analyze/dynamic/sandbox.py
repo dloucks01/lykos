@@ -683,14 +683,24 @@ _WINE_EXC_RE = re.compile(rb"Unhandled exception code ([0-9a-fA-F]{8})")
 _WINE_FAULT_RE = re.compile(
     rb"Unhandled page fault on (read|write|execute)(?:-inclusive)? access"
     rb"(?: to ([0-9a-fA-F]+))?(?: at address ([0-9a-fA-F]+))?")
+# A THIRD format, and the one a stack smash actually produces. When the overflow has overwritten
+# the SEH chain, the exception cannot be dispatched at all, so Wine never prints "Unhandled
+# exception code" -- it prints the dispatcher giving up:
+#   err:seh:call_seh_handlers invalid frame 4141414141414141 (00007FFFFE102000-00007FFFFE300000)
+#   err:seh:NtRaiseException Exception frame is not in stack limits => unable to dispatch exception.
+# Matching only the first two formats read THE most interesting PE crash -- a fully controlled
+# stack overwrite, the frame pointer being the attacker's own bytes -- as a clean run.
+_WINE_SEH_RE = re.compile(
+    rb"call_seh_handlers invalid frame ([0-9a-fA-F]+)"
+    rb"|Exception frame is not in stack limits")
 
 
 def wine_exception(stderr: bytes):
     """(nt status, human name, detail) for a Wine guest crash, or (None, None, None).
 
-    Two formats, one meaning. Anything that says "Unhandled" and names a fault is a crash:
-    reporting it as a clean run is the worst possible answer, because the input that caused
-    it then looks uninteresting.
+    Three formats, one meaning. Anything that says "Unhandled" and names a fault is a crash, as
+    is the SEH dispatcher reporting it cannot dispatch one: reporting any of them as a clean run
+    is the worst possible answer, because the input that caused it then looks uninteresting.
     """
     m = _WINE_EXC_RE.search(stderr or b"")
     if m:
@@ -701,6 +711,15 @@ def wine_exception(stderr: bytes):
         how = m.group(1).decode()
         at = (m.group(3) or m.group(2) or b"").decode()
         detail = f"page fault on {how} access" + (f" at 0x{at}" if at else "")
+        return "c0000005", "EXCEPTION_ACCESS_VIOLATION", detail
+    m = _WINE_SEH_RE.search(stderr or b"")
+    if m:
+        frame = (m.group(1) or b"").decode()
+        # Reported as an access violation (an exception WAS raised; the dispatcher then walked a
+        # corrupt chain), with the corruption itself in the detail. The frame value is the
+        # overwritten SEH pointer -- on a controlled overflow it is the attacker's own bytes.
+        detail = "SEH frame corrupted, exception could not be dispatched" + (
+            f" (frame 0x{frame})" if frame else "")
         return "c0000005", "EXCEPTION_ACCESS_VIOLATION", detail
     return None, None, None
 
