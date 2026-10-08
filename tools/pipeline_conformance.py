@@ -560,6 +560,22 @@ int main(void){ setvbuf(stdout,0,2,0);
                  "python3 -m py_compile m.py"], "m.*.pyc"),
          note="FRONT-END CPython bytecode: a .pyc is identified as pyc / cpython-bytecode"),
 
+    # And the same demand as pe_overflow / jvm_oob_index: drive the bytecode through the real
+    # autopilot and require a DEMONSTRATED defect. CPython is a managed runtime, so the ceiling
+    # here is denial of service -- the interpreter bounds-checks every index and owns every
+    # reference, which is a property of the runtime, not a gap in this pipeline. The index is the
+    # input's LENGTH so a broad class of inputs reaches it, for the reason spelled out on
+    # jvm_oob_index: a `int(line)` guard would test the mutator's luck instead of the pipeline.
+    Case("pyc_oob_index", "",
+         [], want_level=0, want_cwe=("CWE-129", "CWE-125", "CWE-20"),
+         requires=("python3",), budget=420.0,
+         build=(["sh", "-c",
+                 "printf 'import sys\ns = sys.stdin.readline()\nt = [1, 2, 3, 4]\n"
+                 "print(\"slot\", len(s), \"=\", t[len(s)])\n' > oob.py && "
+                 "python3 -m py_compile oob.py"], "oob.*.pyc"),
+         note="PYC DYNAMIC: a list indexed by the unvalidated input length, demonstrated as an "
+              "uncaught IndexError rather than merely identified as CPython bytecode"),
+
     Case("fmt_wasm", "",
          [], want_level=0, want_cwe=(), want_file_type="wasm", budget=120.0,
          build=(["sh", "-c",
@@ -567,6 +583,33 @@ int main(void){ setvbuf(stdout,0,2,0);
                  "void copy(const char *s,int n){for(int i=0;i<n;i++) buf[i]=s[i];}\n' > w.c && "
                  "clang --target=wasm32 -nostdlib -Wl,--no-entry -O0 -o w.wasm w.c"], "w.wasm"),
          note="FRONT-END WASM: a wasm32 module is identified as wasm (an unbounded copy inside)"),
+
+    # And the dynamic demand, as for pe_overflow / jvm_oob_index / pyc_oob_index. A wasm module
+    # is not an executable: no process, no argv, and (unless it is a WASI command) no entry
+    # point at all, so "running" one means choosing how to hand it the input. This module is a
+    # REACTOR -- built with --no-entry, exporting one function -- which the driver feeds by
+    # staging the input in the module's own linear memory and calling the export as (ptr, len).
+    #
+    # The defect is an offset taken straight from the input bytes, NOT an unbounded copy. That
+    # is deliberate: wasm linear memory is one flat array holding the module's globals, stack
+    # and heap, so a copy that overruns a 64-byte buffer corrupts the neighbours and traps on
+    # nothing. Only an access past the END of linear memory traps, which is this platform's
+    # honest ceiling on this substrate and is recorded on wasm.TRAP_CWE.
+    Case("wasm_oob_store", "",
+         [], want_level=0, want_cwe=("CWE-119", "CWE-787", "CWE-125", "CWE-129"),
+         requires=("node", "clang"), budget=420.0,
+         build=(["sh", "-c",
+                 "printf 'static char buf[64];\n"
+                 "__attribute__((export_name(\"parse\")))\n"
+                 "int parse(const unsigned char *s, int n){\n"
+                 "  if (n < 4) return -1;\n"
+                 "  int off = (int)(s[0] | (s[1]<<8) | (s[2]<<16) | (s[3]<<24));\n"
+                 "  buf[off] = (char)s[3];\n"
+                 "  return off; }\n' > w2.c && "
+                 "clang --target=wasm32 -nostdlib -Wl,--no-entry -O0 -o w2.wasm w2.c"],
+                "w2.wasm"),
+         note="WASM DYNAMIC: a store at an offset taken from the input, demonstrated as an "
+              "out-of-bounds trap rather than merely identified as a wasm module"),
 
     Case("fmt_upx_packed", "",
          [], want_level=0, want_cwe=(), want_file_type="elf", budget=120.0,
@@ -577,6 +620,24 @@ int main(void){ setvbuf(stdout,0,2,0);
                  "upx -q -o u_packed u_native >/dev/null"], "u_packed"),
          note="FRONT-END UPX: a runtime-packed ELF is still identified as an ELF (the unpack stage "
               "then carves the real program out of the decompressor stub)"),
+
+    # As with pe_overflow / jvm_oob_index: identification is not analysis. The same packed image,
+    # driven through the real autopilot, must DEMONSTRATE the defect that is hidden inside the
+    # compressed stream. Nothing static can: disassembling the stub recovers a decompressor, the
+    # detectors see one high-entropy blob, and the vulnerable `scanf` is not even present as bytes
+    # until the loader has run. So this asserts the unpack stage actually produces a child target
+    # and that the child is then analysed like any other ELF -- the whole point of having the stage.
+    Case("upx_overflow", "",
+         [], want_level=0, want_cwe=("CWE-121", "CWE-787", "CWE-119", "CWE-120", "CWE-125"),
+         requires=("upx", "gcc"), budget=420.0,
+         build=(["sh", "-c",
+                 "printf '#include <stdio.h>\nint main(){char b[64];printf(\"in: \");"
+                 "if(scanf(\"%%s\",b)!=1) return 0;printf(\"hi %%s\\\\n\",b);return 0;}\n'"
+                 " > u.c && "
+                 "gcc -no-pie -fno-stack-protector -O0 -w u.c -o u_native && "
+                 "upx -q -o u_packed u_native >/dev/null"], "u_packed"),
+         note="UPX DYNAMIC: the overflow lives inside the compressed image, so it is demonstrable "
+              "only if the unpack stage carves out a child target the ELF pipeline then drives"),
 
     # ---- BUG CLASSES with no case of their own. Each is a distinct defect the platform claims to
     # find; without these only overflow/format/UAF were ever asserted.
@@ -941,12 +1002,21 @@ def _verdict(s, target, case):
 
     The SINGLE definition of "this case succeeded", used both to poll for early completion and to
     score the run, so the two can never disagree. A demonstrated finding is one from a non-static
-    detector carrying an expected CWE (an info-leak files as a finding, not always a leveled poc)."""
-    from lykos.db.dao import FindingDAO, PocDAO
-    pocs = PocDAO(s.conn).list_by_target(target.id)
+    detector carrying an expected CWE (an info-leak files as a finding, not always a leveled poc).
+
+    Scored over every target in the CASE, not just the ingested one. A CONTAINER -- a UPX-packed
+    executable, a firmware image -- is analysed by registering what it holds as a CHILD target, and
+    the real program's findings land there, on a different target id. Scoring only the ingested
+    target made every such case unpassable by construction: the UPX case reported nothing but the
+    unpack notice while its child had been driven to a demonstrated overflow. Each case here ingests
+    exactly one artifact, so "the case" and "that artifact plus what was carved out of it" are the
+    same set."""
+    from lykos.db.dao import FindingDAO, PocDAO, TargetDAO
+    tids = [t.id for t in TargetDAO(s.conn).list_by_case(target.case_id)] or [target.id]
+    pocs = [pc for tid in tids for pc in PocDAO(s.conn).list_by_target(tid)]
     maxlvl = max((int(pc.level[1]) for pc in pocs
                   if getattr(pc, "verified", False) and pc.level and pc.level[0] == "L"), default=0)
-    fs = [f for f in FindingDAO(s.conn).list_by_target(target.id)
+    fs = [f for f in FindingDAO(s.conn).list_by_case(target.case_id)
           if f.state in ("poc-backed", "corroborated")]
     wanted = list(case.want_cwe)
     for req in case.want_all_cwe:                        # an entry may be a group of alternatives

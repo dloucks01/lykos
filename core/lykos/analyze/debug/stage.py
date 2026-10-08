@@ -29,16 +29,60 @@ def _hex(v):
     return None if v is None else (v if isinstance(v, str) else hex(v))
 
 
-def _root_cause_jvm(ctx, target, input_sha, base_argv, mode, timeout) -> dict:
-    """Root cause for a Java target -- where the JVM hands it to you.
+# ---- managed runtimes: the backtrace arrives with the fault ------------------------------
+#
+# One code path for every runtime that reports a fault as an uncaught exception, because the
+# shape of the work is identical and only the vocabulary differs. Each entry says how to parse
+# that runtime's trace, how to render a frame, and what the ceiling is -- a runtime that owns
+# the instruction pointer cannot be escalated to control-flow hijack, and claiming otherwise
+# would be a fabricated level.
+_MANAGED_FILE_TYPES = {"jar": "jvm", "class": "jvm", "jvm": "jvm", "pyc": "cpython",
+                       "wasm": "wasm"}
 
-    The native path attaches a debugger to recover a backtrace from a fault address. A JVM
+
+def _managed_runtime(kind: str):
+    if kind == "jvm":
+        return {
+            "name": "the JVM", "backend": "jvm",
+            "parse": lambda r: sandbox.jvm_exception(r.stderr, r.exit_code, r.stdout),
+            "blame": sandbox.app_frame,
+            "frame": lambda fr: f"{fr[0]}({fr[1]})",
+            "checks": "the JVM checks every array access and owns every pointer",
+            "lang": "Java",
+        }
+    if kind == "wasm":
+        # A trap carries no call stack out of the engine -- only the message and the export it
+        # trapped in, both of which the sandbox has already classified. There is nothing to
+        # re-parse, so this descriptor reads the result instead of the stderr.
+        return {
+            "name": "the WebAssembly engine", "backend": "wasm",
+            "parse": lambda r: (r.signal_name, r.note, []),
+            "blame": lambda frames: None,
+            "frame": lambda fr: str(fr),
+            "checks": "the engine bounds-checks every memory access and owns every pointer",
+            "lang": "WebAssembly",
+        }
+    return {
+        "name": "CPython", "backend": "cpython",
+        "parse": lambda r: sandbox.python_exception(r.stderr, r.exit_code, r.stdout),
+        "blame": sandbox.app_frame_py,
+        "frame": lambda fr: f"{fr[0]}:{fr[1]}" + (f" in {fr[2]}" if len(fr) > 2 and fr[2] else ""),
+        "checks": "CPython bounds-checks every index and owns every reference",
+        "lang": "Python",
+    }
+
+
+def _root_cause_managed(ctx, target, input_sha, base_argv, mode, timeout, runtime) -> dict:
+    """Root cause on a managed runtime -- where the runtime hands it to you.
+
+    The native path attaches a debugger to recover a backtrace from a fault address. A managed
     fault arrives with the backtrace already attached, symbolised, with line numbers, and
-    naming the exception class: `Svc.setOpt(Svc.java:14)` is strictly more than the native
-    channel can produce even when it works. What it does NOT have is an address, so the
-    finding is keyed on the application frame instead -- and on the application frame rather
-    than the top one, because `Integer.parseInt("abc")` throws three JDK frames deep and
-    blaming java.base would merge every such defect in the program into one.
+    naming the exception class: `Svc.setOpt(Svc.java:14)` or `svc.py:14 in parse` is strictly
+    more than the native channel can produce even when it works. What it does NOT have is an
+    address, so the finding is keyed on the APPLICATION frame instead -- and on the application
+    frame rather than the top one, because `Integer.parseInt("abc")` throws three JDK frames
+    deep (and `int("abc")` from inside no Python frame at all), so blaming the top frame blames
+    the runtime and merges every such defect in the program into one finding.
 
     Without this the stage declined with "no qemu gdbstub layout for jvm", which is true of
     qemu and irrelevant here: nothing needed emulating.
@@ -46,7 +90,8 @@ def _root_cause_jvm(ctx, target, input_sha, base_argv, mode, timeout) -> dict:
     import json as _json
 
     from ..fuzz.runner import place
-    from ..jvm import cwe_for_exception
+    from ..runtime_fault import managed_fault
+    rt = _managed_runtime(runtime)
     input_bytes = ctx.content.get_bytes(input_sha)
     exe = ctx.scratch() / "target.bin"
     ctx.content.stage_target(target, exe.parent, exe.name)
@@ -57,50 +102,61 @@ def _root_cause_jvm(ctx, target, input_sha, base_argv, mode, timeout) -> dict:
     for m in [mode] + [x for x in MODES if x != mode]:
         argv, stdin = (place(base_argv, str(wf)), b"") if m != "stdin" else (
             list(base_argv), input_bytes)
-        ctx.progress(msg=f"reproducing under the JVM ({m})")
+        ctx.progress(msg=f"reproducing under {rt['name']} ({m})")
         res = sandbox.run(exe, argv=argv, stdin=stdin, timeout=timeout)
         tried.append(m)
         if res.crashed:
             mode = m
             break
     if res is None or not res.crashed:
+        # Distinguish "ran and did not fault" from "never ran". A managed runtime refusing the
+        # program -- bytecode built for another interpreter version, a missing import -- fails
+        # identically on every input, and reporting that as "no fault" hides a capability gap
+        # behind a result that looks like a clean program.
+        why = (res.note if res is not None and "not-runnable" in (res.isolation or "")
+               else None)
+        note = (f"{rt['name']} could not run this program, so nothing was tested: {why}" if why
+                else f"the input did not fault under {rt['name']} via any of " + ", ".join(tried))
         ctx.emit("rootcause.done", payload={
-            "supported": True, "backend": "jvm", "input_modes_tried": tried,
-            "note": "the input did not fault under the JVM via any of " + ", ".join(tried)})
-        ctx.progress(pct=100, msg="no fault reproduced (tried %s)" % ", ".join(tried))
+            "supported": True, "backend": rt["backend"], "input_modes_tried": tried,
+            "ran": not why, "note": note})
+        ctx.progress(pct=100, msg=note[:80])
         return {}
 
-    kind, detail, frames = sandbox.jvm_exception(res.stderr, res.exit_code, res.stdout)
-    blame = sandbox.app_frame(frames)
-    cwe, sev = cwe_for_exception(kind) or ("CWE-248", "medium")
+    kind, detail, frames = rt["parse"](res)
+    blame = rt["blame"](frames)
+    hit = managed_fault(kind)
+    cwe, sev = (hit[0], hit[1]) if hit else ("CWE-248", "medium")
     summary = detail or f"uncaught {kind}"
+    stack = [rt["frame"](fr) for fr in frames]
+    blame_frame = rt["frame"](blame) if blame else None
     report = {
-        "backend": "jvm", "signal": kind, "summary": summary,
+        "backend": rt["backend"], "signal": kind, "summary": summary,
         "classification": {"cwe": cwe, "class": kind, "severity": sev},
-        "stack": [f"{a}({b})" for a, b in frames],
-        "blame_frame": f"{blame[0]}({blame[1]})" if blame else None,
+        "stack": stack,
+        "blame_frame": blame_frame,
         "input_mode": mode, "stderr": (res.stderr or b"")[:4000].decode("utf-8", "replace"),
-        # Say what this level of evidence is and is not. The JVM owns the instruction
+        # Say what this level of evidence is and is not. The runtime owns the instruction
         # pointer, so no amount of work here produces L2/L3 -- that is the runtime, not a gap.
         "exploitability": {
             "rating": "denial-of-service", "score": 35,
             "reasons": ["an uncaught exception terminates the process, which for a service is "
                         "denial of service",
-                        "the JVM checks every array access and owns every pointer, so this "
-                        "cannot be escalated to control-flow hijack (no L2/L3 for Java)"]},
+                        f"{rt['checks']}, so this cannot be escalated to control-flow hijack "
+                        f"(no L2/L3 for {rt['lang']})"]},
     }
     report_sha = ctx.put_artifact("root-cause", data=_json.dumps(
         report, indent=2, sort_keys=True).encode(), meta={"cwe": cwe})
     FindingDAO(ctx.conn).upsert(target.id, target.case_id, {
         "cwe": cwe, "title": f"Root cause: uncaught {kind}", "severity": sev,
         "state": "confirmed", "confidence": 0.9, "detector": "root_cause",
-        "site_addr": report["blame_frame"], "function_addr": None,
+        "site_addr": blame_frame, "function_addr": None,
         "dedup_key": crash_dedup_key(kind, res.fault_pc),
         "evidence": [{"channel": "root-cause", "detail": summary},
-                     {"channel": "stack", "detail": " <- ".join(report["stack"][:6])}]})
+                     {"channel": "stack", "detail": " <- ".join(stack[:6])}]})
     ctx.emit("rootcause.done", payload={
-        "supported": True, "backend": "jvm", "cwe": cwe, "classification": kind,
-        "summary": summary, "input_mode": mode, "blame_frame": report["blame_frame"],
+        "supported": True, "backend": rt["backend"], "cwe": cwe, "classification": kind,
+        "summary": summary, "input_mode": mode, "blame_frame": blame_frame,
         "exploitability": "denial-of-service", "report": report_sha})
     ctx.progress(pct=100, msg=summary[:80])
     return {"output_shas": [report_sha], "output_kind": "root-cause"}
@@ -148,8 +204,9 @@ def root_cause_stage(ctx) -> dict:
     timeout = float(p.get("timeout", 10))
     mode, base_argv, mode_why = how_to_feed(ctx.conn, target, input_sha, p)
 
-    if (target.file_type or "").lower() in ("jar", "class"):
-        return _root_cause_jvm(ctx, target, input_sha, base_argv, mode, timeout)
+    managed = _MANAGED_FILE_TYPES.get((target.file_type or "").lower())
+    if managed:
+        return _root_cause_managed(ctx, target, input_sha, base_argv, mode, timeout, managed)
 
     host = sandbox.host_arch()
     emulated = bool(target.arch and target.arch != host)

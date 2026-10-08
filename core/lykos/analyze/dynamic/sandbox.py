@@ -10,6 +10,7 @@ inputs into; stronger tiers (microVM) come later.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import platform
 import re
@@ -275,10 +276,12 @@ def run_batch(exe, payloads, *, mode="stdin", base_argv=(), timeout: float = 2.0
     amortising the namespace, not by giving one up.
     """
     host = host or host_arch()
-    if _is_pe(exe) or _is_jvm(exe) or (arch and host and arch != host):
-        # Wine, the JVM and qemu stay per-exec. The batch runner execs the target directly and
-        # traces it with ptrace; a jar is not executable and the JVM is not the target, so
-        # batching it would run the wrong program under breakpoints meant for another.
+    if (_is_pe(exe) or _is_jvm(exe) or _is_pyc(exe) or _is_wasm(exe)
+            or (arch and host and arch != host)):
+        # Wine, the JVM, CPython and qemu stay per-exec. The batch runner execs the target
+        # directly and traces it with ptrace; a jar or a .pyc is not executable and the
+        # interpreter is not the target, so batching it would run the wrong program under
+        # breakpoints meant for another.
         return None
     py = shutil.which("python3")
     if not py or not _bwrap_usable() or not payloads:
@@ -937,6 +940,302 @@ def _run_java(exe, *, argv, stdin, timeout, mem_mb, capture, main_class=None) ->
         note=(detail if crashed else (None if not timed else "timed out")))
 
 
+# ---- CPython: a defect surfaces as an uncaught exception, as on the JVM ------------------
+#
+# Traceback (most recent call last):
+#   File "svc.py", line 14, in parse
+#     return table[int(field)]
+# IndexError: list index out of range
+#
+# Read from stderr ONLY, for the same reason as the JVM trace: a target that echoes its input
+# would otherwise report a crash the moment a mutation contains the word "Traceback", and a
+# mutator rewarded for crashes will produce that string deliberately. CPython's default
+# handler always writes to stderr.
+_PY_TRACE_RE = re.compile(r"^Traceback \(most recent call last\):", re.M)
+# The exception line ends the traceback: unindented, a dotted class name, optional message.
+# `findall` and then take the LAST -- a chained traceback ("During handling of the above
+# exception, another exception occurred") prints several, and the last one is what killed the
+# process.
+_PY_EXC_RE = re.compile(r"^([A-Za-z_][\w.]*(?:Error|Exception|Exit|Interrupt|Iteration|"
+                        r"Warning|error))(?::[ \t]*(.*))?$", re.M)
+_PY_FRAME_RE = re.compile(r'^\s+File "([^"]*)", line (\d+)(?:, in (\S+))?', re.M)
+# The interpreter itself dying. faulthandler/CPython print this for a genuine native fault --
+# a C extension or a CPython bug reached through pure Python. THAT is memory corruption, and a
+# far stronger result than any Python-level exception.
+_PY_FATAL_RE = re.compile(r"^Fatal Python error: (.+)$", re.M)
+_PY_FATAL_SIG = re.compile(r"(Segmentation fault|Bus error|Illegal instruction|Aborted)", re.I)
+# ---- the interpreter REFUSING to run the program, which is not a defect in it ------------
+#
+# Each of these fails identically on every input, so classifying one as a crash does not
+# produce a false positive -- it produces a false positive on EVERY execution, and a campaign
+# that "finds" thousands of them. This is the JVM launch-failure lesson pointed the other way:
+# there a failed launch looked like a clean run, here it looks like a universal crash.
+_PY_NOT_RUNNABLE = (
+    "Bad magic number in .pyc file",       # compiled for a different CPython than the one here
+    "bad magic number",
+    "bad marshal data",                    # truncated or corrupt code object
+    "EOF read where object expected",
+    "No module named",                     # a third-party import this environment lacks
+    "unsupported pickle protocol",
+    "cannot import name",
+    "can't open file",                     # the program is not where the launcher looked
+)
+_PY_NOT_A_DEFECT = ("SyntaxError", "IndentationError", "TabError", "ModuleNotFoundError",
+                    "ImportError", "SystemExit", "KeyboardInterrupt", "GeneratorExit")
+
+
+def python_exception(stderr: bytes, exit_code: Optional[int] = None, stdout: bytes = b""):
+    """(kind, detail, frames) for an uncaught Python fault, else (None, None, []).
+
+    `kind` is the exception class name -- this runtime's equivalent of a signal name, and far
+    more informative than one: `IndexError` names the defect, SIGSEGV does not.
+
+    Returns ("", reason, []) -- a FALSY kind with a reason -- when the interpreter could not
+    run the program at all, so the caller can report a capability gap instead of a crash.
+    """
+    text = (stderr or b"").decode("utf-8", "replace")
+    fatal = _PY_FATAL_RE.search(text)
+    if fatal and exit_code not in (0, None):
+        sig = _PY_FATAL_SIG.search(fatal.group(1))
+        return ("PY-FATAL-" + (sig.group(1).split()[0].upper() if sig else "ABORT"),
+                "the interpreter itself crashed (" + fatal.group(1).strip()[:80]
+                + ") -- native memory corruption in an extension or in CPython, not a Python "
+                  "exception", _PY_FRAME_RE.findall(text))
+    for bad in _PY_NOT_RUNNABLE:
+        if bad in text:
+            return "", f"the interpreter could not load this program: {bad}", []
+    if not _PY_TRACE_RE.search(text):
+        return None, None, []
+    if exit_code in (0, None):
+        # A program that CATCHES its own exception and calls traceback.print_exc() writes a
+        # byte-identical block to stderr and then carries on. Unlike the JVM -- where an
+        # uncaught exception is prefixed "Exception in thread" and printStackTrace is not --
+        # CPython gives the two no textual difference whatsoever, so the exit code is the only
+        # thing that separates them. An uncaught exception always leaves a non-zero status;
+        # correct error handling exits 0, and reporting that as a crash would make a logged,
+        # handled error a finding.
+        return None, None, []
+    hits = _PY_EXC_RE.findall(text)
+    if not hits:
+        return None, None, []
+    cls, msg = hits[-1][0], (hits[-1][1] or "").strip()
+    short = cls.rsplit(".", 1)[-1]
+    if short in _PY_NOT_A_DEFECT:
+        # A bad import or a syntax error is this environment, not the program's input handling;
+        # SystemExit/KeyboardInterrupt are a deliberate exit. None of them is a finding.
+        return "", f"not an input-driven fault: {short}" + (f": {msg}" if msg else ""), []
+    frames = _PY_FRAME_RE.findall(text)
+    blame = app_frame_py(frames)
+    where = f" at {blame[0]}:{blame[1]}" + (f" in {blame[2]}" if blame[2] else "") if blame else ""
+    detail = f"uncaught {short}" + (f": {msg}" if msg else "") + where
+    return short, detail, frames
+
+
+# Frames inside the standard library are where an exception is RAISED, not where the defect
+# is: `int("abc")` raises from deep inside no Python frame at all, and `json.loads` raises
+# three stdlib frames down. The defect is the line of the TARGET's code that passed
+# unvalidated input in -- the deepest frame that is not stdlib.
+_PY_STDLIB_FRAME = re.compile(r"(^|/)(?:lib/python3|python3\.\d+/(?!site-packages))|"
+                              r"^<frozen importlib")
+
+
+def app_frame_py(frames):
+    """The deepest frame that is the TARGET's code rather than the standard library's."""
+    for fr in reversed(list(frames or ())):
+        if not _PY_STDLIB_FRAME.search(fr[0]):
+            return fr
+    return frames[-1] if frames else None
+
+
+def python_site(frames) -> Optional[int]:
+    """A stable id for WHERE the exception was raised, standing in for a native fault PC. Two
+    IndexErrors raised from different lines are two defects; without this they dedup into
+    one."""
+    fr = app_frame_py(frames)
+    if not fr:
+        return None
+    return int(hashlib.sha256(f"{fr[0]}:{fr[1]}".encode()).hexdigest()[:8], 16)
+
+
+def _is_pyc(path) -> bool:
+    """CPython bytecode: a 2-byte version magic from the known table, then \\r\\n.
+
+    The \\r\\n alone is far too weak (any file with 0x0d0a at offset 2), so the magic must be a
+    version CPython actually shipped -- which is also what decides whether THIS interpreter can
+    run it."""
+    try:
+        head = Path(path).open("rb").read(16)
+    except Exception:                                    # noqa: BLE001
+        return False
+    if len(head) < 16 or head[2:4] != b"\r\n":
+        return False
+    from ..pyc import _MAGIC_VERSION
+    return (head[0] | (head[1] << 8)) in _MAGIC_VERSION
+
+
+# -E: ignore PYTHON* env vars, so the harness's own environment is not the target's.
+# -s: no per-user site dir. -X faulthandler: a native fault in a C extension prints a
+# traceback instead of dying silently, which is the only way that class of bug is visible.
+_PY_FLAGS = ("-E", "-s", "-X", "faulthandler")
+
+
+def _run_python(exe, *, argv, stdin, timeout, mem_mb, capture) -> RunResult:
+    """Run CPython bytecode under the interpreter.
+
+    Unlike a bare .class, a .pyc is loadable under ANY filename -- `python3 target.bin` works --
+    so there is no entry-point recovery to do here.
+    """
+    py = shutil.which("python3") or shutil.which("python")
+    if not py:
+        return RunResult(isolation="python-missing",
+                         note="no python3 found to run CPython bytecode (the header and its "
+                              "strings still parse without one)")
+    # Resolve: bwrap chdirs into the sandbox, so a relative path would not exist there and the
+    # interpreter would report "can't open file" on every input -- a universal non-run.
+    exe = Path(exe).resolve()
+    cmd = [py, *_PY_FLAGS, str(exe)] + [argv_bytes(a) for a in argv]
+    eff_timeout = max(timeout, 5.0)                      # interpreter start-up is ~20 ms
+    preexec = _rlimits(max(mem_mb, 1024), int(eff_timeout) + 2, set_as=False,
+                       nproc=_nproc_cap(True))
+    iso = "rlimits-only+cpython"
+    run = cmd
+    if _bwrap_usable():
+        exedir = str(exe.resolve().parent)
+        run = (["bwrap"] + _BWRAP_ARGS[:-1] + _secret_mask_args()
+               + ["--ro-bind", exedir, exedir] + ["--"] + cmd)
+        iso = "bwrap+netns+cpython"
+    rc, out, err, timed, dur = _spawn(run, stdin, eff_timeout, preexec)
+    if (iso.startswith("bwrap") and not timed and err.startswith(b"bwrap:")
+            and not _bwrap_probe_fresh()):
+        rc, out, err, timed, dur = _spawn(cmd, stdin, eff_timeout, preexec)
+        iso = "rlimits-only+cpython"
+    kind, detail, frames = python_exception(err, rc, out)
+    crashed = bool(kind)
+    if kind == "":
+        # The interpreter refused the program (wrong bytecode version, missing import). That is
+        # not a crash and it is not a clean run either -- it is "this did not execute", and
+        # saying so is the difference between an honest gap and a campaign full of phantoms.
+        iso += "/not-runnable"
+    return RunResult(
+        isolation=iso, crashed=crashed, timed_out=timed,
+        exit_code=(None if crashed else rc), signal=None, signal_name=(kind or None),
+        stdout=out[:capture], stderr=err[:capture], duration_ms=dur, cmd=run,
+        fault_pc=python_site(frames) if crashed else None,
+        note=(detail if (crashed or kind == "") else (None if not timed else "timed out")))
+
+
+# ---- WebAssembly: a defect surfaces as a TRAP -------------------------------------------
+#
+# A wasm trap is the closest thing this runtime has to a signal, and like a JVM exception it
+# names the defect: "memory access out of bounds" is more than SIGSEGV says. The engine
+# catches it, so nothing is corrupted and there is no instruction pointer to hijack -- the
+# ceiling here is denial of service, as on any managed runtime.
+#
+# THE HONEST LIMIT, worth stating because it decides what this substrate can ever find: wasm
+# linear memory is one flat array, and a module's globals, stack and heap all live inside it.
+# An overflow that stays WITHIN linear memory -- the ordinary stack-buffer overflow, the one
+# this platform demonstrates on every native target -- silently corrupts the module's
+# neighbouring data and never traps. Only an access past the END of linear memory does. So
+# wasm turns memory corruption into something quieter than on native, and a differential
+# oracle (not a trap) is what would be needed to see the rest.
+def classify_wasm_trap(msg: str):
+    """(bug, cwe, severity) for a wasm trap message -- see wasm.classify_trap."""
+    from ..wasm import classify_trap
+    return classify_trap(msg)
+
+
+def _wasm_signal(bug: str) -> str:
+    from ..wasm import trap_signal
+    return trap_signal(bug)
+
+
+def _is_wasm(path) -> bool:
+    """A WebAssembly module: the `\0asm` magic followed by a version word."""
+    try:
+        head = Path(path).open("rb").read(8)
+    except Exception:                                    # noqa: BLE001
+        return False
+    return len(head) >= 8 and head[:4] == b"\x00asm"
+
+
+def _node() -> Optional[str]:
+    return shutil.which("node") or shutil.which("nodejs")
+
+
+def _wasm_driver_path() -> str:
+    return str((Path(__file__).resolve().parent / "wasm_driver.js"))
+
+
+def _run_wasm(exe, *, argv, stdin, timeout, mem_mb, capture) -> RunResult:
+    """Run a WebAssembly module under node, via the driver that decides how to feed it.
+
+    The verdict comes back in a FILE, not on stderr: a WASI module writes to fd 2 itself, so a
+    marker on stderr would be forgeable by the target -- and a mutator rewarded for crashes
+    learns to print one. The module is given no filesystem preopens, so it cannot reach the
+    report.
+    """
+    node = _node()
+    if not node:
+        return RunResult(isolation="node-missing",
+                         note="no node found to execute a WebAssembly module (the module's "
+                              "types, imports and exports still parse without one)")
+    exe = Path(exe).resolve()
+    rdir = Path(tempfile.mkdtemp(prefix="lykos-wasm-"))
+    rep = rdir / "report.json"
+    # --no-warnings: node prints an ExperimentalWarning for WASI on every single execution,
+    # which would otherwise be tens of kilobytes of stderr noise per campaign.
+    cmd = [node, "--no-warnings", _wasm_driver_path(), str(exe), str(rep)] + [
+        argv_bytes(a) for a in argv]
+    eff_timeout = max(timeout, 5.0)                      # node start-up is ~40 ms
+    preexec = _rlimits(max(mem_mb, 2048), int(eff_timeout) + 2, set_as=False,
+                       nproc=_nproc_cap(True))           # V8 is threaded; don't cap AS
+    iso = "rlimits-only+wasm"
+    run = cmd
+    if _bwrap_usable():
+        exedir = str(exe.parent)
+        run = (["bwrap"] + _BWRAP_ARGS[:-1] + _secret_mask_args()
+               + ["--ro-bind", exedir, exedir, "--bind", str(rdir), str(rdir),
+                  "--ro-bind", _wasm_driver_path(), _wasm_driver_path()] + ["--"] + cmd)
+        iso = "bwrap+netns+wasm"
+    try:
+        rc, out, err, timed, dur = _spawn(run, stdin, eff_timeout, preexec)
+        if (iso.startswith("bwrap") and not timed and err.startswith(b"bwrap:")
+                and not _bwrap_probe_fresh()):
+            rc, out, err, timed, dur = _spawn(cmd, stdin, eff_timeout, preexec)
+            iso = "rlimits-only+wasm"
+        try:
+            verdict = json.loads(rep.read_text() or "{}")
+        except Exception:                                # noqa: BLE001
+            verdict = {}
+    finally:
+        shutil.rmtree(rdir, ignore_errors=True)
+    status = verdict.get("status")
+    if status == "trap":
+        msg = str(verdict.get("message") or "trap")
+        entry = verdict.get("entry")
+        bug, cwe, _sev = classify_wasm_trap(msg)
+        where = f" in export {entry}" if entry else ""
+        return RunResult(
+            isolation=iso, crashed=True, timed_out=timed, exit_code=None, signal=None,
+            signal_name=_wasm_signal(bug),
+            stdout=out[:capture], stderr=err[:capture], duration_ms=dur, cmd=run,
+            # No instruction pointer exists, so key the defect on WHERE it trapped -- the
+            # export plus the message -- or two unrelated traps dedup into one finding.
+            fault_pc=int(hashlib.sha256(f"{entry}:{bug}".encode()).hexdigest()[:8], 16),
+            note=f"wasm trap: {msg}{where} ({cwe})")
+    if status == "notdrivable" or (status is None and not timed):
+        why = str(verdict.get("message") or "the driver produced no verdict")
+        # Not a crash and not a clean run: this module never executed. Saying so is the
+        # difference between an honest capability gap and a campaign of phantom results.
+        return RunResult(isolation=iso + "/not-runnable", crashed=False, timed_out=timed,
+                         exit_code=rc, stdout=out[:capture], stderr=err[:capture],
+                         duration_ms=dur, cmd=run, note=why)
+    return RunResult(isolation=iso, crashed=False, timed_out=timed,
+                     exit_code=int(verdict.get("exit") or 0), stdout=out[:capture],
+                     stderr=err[:capture], duration_ms=dur, cmd=run,
+                     note=(None if not timed else "timed out"))
+
+
 def _wine() -> Optional[str]:
     # Debian ships the binary as `wine-stable` (or `wine-development`) and exposes `wine` only as
     # an update-alternatives symlink -- which does NOT travel in the relocatable offline bundle,
@@ -1040,6 +1339,12 @@ def run(exe, *, argv=(), stdin: bytes = b"", timeout: float = 10.0,
                             capture=capture, wineprefix=wineprefix)
     if _is_jvm(exe):                                    # jar / .class -> the JVM
         return _run_java(exe, argv=argv, stdin=stdin, timeout=timeout, mem_mb=mem_mb,
+                         capture=capture)
+    if _is_pyc(exe):                                    # .pyc -> the CPython interpreter
+        return _run_python(exe, argv=argv, stdin=stdin, timeout=timeout, mem_mb=mem_mb,
+                           capture=capture)
+    if _is_wasm(exe):                                   # .wasm -> a WebAssembly engine (node)
+        return _run_wasm(exe, argv=argv, stdin=stdin, timeout=timeout, mem_mb=mem_mb,
                          capture=capture)
     emu = None
     if arch and host and arch != host:

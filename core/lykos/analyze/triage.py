@@ -307,11 +307,17 @@ def build_triage(path: str | Path, hashes: dict[str, Any], filename: str) -> dic
         rec["advisory"] = (
             "WebAssembly analysed: the module's imports (its host call surface), exports, "
             "function/memory counts and embedded strings are inventoried -- they feed the invocation "
-            "map and the fuzzing dictionary, and the string detectors run over them. Not yet "
-            "available for WASM: a wasm-specific vulnerability detector, native disassembly, and the "
-            "x86/ELF dynamic stages -- a .wasm has no machine code or addressable call stack, and "
-            "its linear memory is bounds-checked by the engine, so the stack-smash/NX/PIE/PoC "
-            "ladder does not apply; run it under a wasm engine (wasmtime/node) for dynamic work.")
+            "map and the fuzzing dictionary, and the string detectors run over them. It is also "
+            "EXECUTED: the module runs under node, either as a WASI command through its _start "
+            "entry point or, for a reactor/library module, by staging the input in its own linear "
+            "memory and calling each two-argument export as (pointer, length) -- and a defect "
+            "surfaces as a TRAP, which names the bug class ('memory access out of bounds') more "
+            "precisely than a signal does. Two honest limits: only an access past the END of "
+            "linear memory traps, so an overflow that stays inside it corrupts the module's own "
+            "neighbouring data silently and is invisible here; and there is no L2/L3 ladder, "
+            "because the engine bounds-checks every access and owns every pointer, so there is no "
+            "IP to hijack. Not available: native disassembly (the body is wasm, not x86) and a "
+            "wasm-specific static vulnerability detector.")
     elif rec["file_type"] == filetype.PYC:
         info = pycmod.parse(data)
         parse_errors.extend(info.errors)
@@ -327,10 +333,15 @@ def build_triage(path: str | Path, hashes: dict[str, Any], filename: str) -> dic
             f"CPython {info.python_version} bytecode analysed: the version magic, header and the "
             "readable identifiers/strings in the marshalled code object were parsed, and detect_cwe "
             "flags the dangerous call surface (os.system/eval/exec/pickle.loads) as candidates from "
-            "those symbols -- decompile (decompyle3/uncompyle6) to confirm the dataflow. Not "
-            "available for .pyc: native disassembly and the x86/ELF dynamic/PoC stages -- the CPython "
-            "VM owns the instruction pointer, so control-flow hijack is not a claim this format "
-            "supports.")
+            "those symbols -- decompile (decompyle3/uncompyle6) to confirm the dataflow. It is "
+            "also EXECUTED: the bytecode runs under this host's CPython, where a defect surfaces "
+            "as an uncaught exception rather than a signal -- IndexError, RecursionError, "
+            "MemoryError -- each of which names the bug class more precisely than SIGSEGV would, "
+            "and an uncaught one terminating the process is denial of service for a service. "
+            "Bytecode built for a DIFFERENT CPython cannot run here and is reported as that, not "
+            "as a result. Not available: native disassembly, and the L2/L3 exploit ladder -- the "
+            "CPython VM owns the instruction pointer, so control-flow hijack is not a claim this "
+            "format supports.")
     elif rec["file_type"] == filetype.FIRMWARE:
         kind = filetype.firmware_kind(data[:64]) or "firmware image"
         rec["detected"] = f"Firmware image — {kind}"

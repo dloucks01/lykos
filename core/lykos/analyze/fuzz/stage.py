@@ -1207,6 +1207,28 @@ def fuzz_stage(ctx) -> dict:
                 "coverage feedback. A defect surfaces as an uncaught exception rather than a "
                 "signal. Budget thousands of executions, not millions, and lean on the "
                 "constant pool -- it names every string and call in the clear.")})
+    if (target.file_type or "").lower() == "pyc":
+        # Measured through the sandbox: 53 ms per execution (~19/s) against ~580/s native --
+        # interpreter start-up plus the bwrap namespace, and no coverage feedback, because the
+        # only machine code in the process is CPython's own.
+        ctx.emit("fuzz.slow", payload={
+            "format": "pyc", "note": (
+                "this is CPython bytecode: every execution pays interpreter start-up (~53 ms "
+                "measured, so roughly 19 executions/second against ~580/s native) and there is "
+                "no coverage feedback. A defect surfaces as an uncaught exception rather than a "
+                "signal. Budget hundreds of executions, not millions, and lean on the "
+                "marshalled code object -- it names every identifier and literal in the clear.")})
+    if (target.file_type or "").lower() == "wasm":
+        # Measured through the sandbox: 90 ms per execution (~11/s) -- node start-up plus
+        # module compilation on every input, the dearest substrate here after Wine.
+        ctx.emit("fuzz.slow", payload={
+            "format": "wasm", "note": (
+                "this is a WebAssembly module: every execution pays node start-up and a fresh "
+                "module compile (~90 ms measured, roughly 11 executions/second against ~580/s "
+                "native), with no coverage feedback. A defect surfaces as a TRAP, and only an "
+                "access past the END of linear memory traps -- an overflow that stays inside it "
+                "corrupts the module's own data silently, so this substrate cannot see the "
+                "ordinary in-bounds buffer overflow at all.")})
     strings = _strings_for(ctx, target)
     blocks = _recovered_blocks(ctx, target)
     flags = mine_flags(ctx.content.path(target.sha256).read_bytes())

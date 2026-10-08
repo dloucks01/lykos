@@ -173,3 +173,67 @@ def to_format_details(info: WasmInfo) -> dict[str, Any]:
                      "memory_pages": info.mem_pages, "has_start": info.has_start,
                      "sections": [s["name"] for s in info.sections],
                      "imports": len(info.imported_symbols), "exports": info.exports_count}}
+
+
+# ---- what a wasm TRAP actually means ----------------------------------------------------
+#
+# A trap is the closest thing this runtime has to a signal, and like a JVM exception it names
+# the defect: "memory access out of bounds" says more than SIGSEGV does. The engine catches
+# it, so nothing is corrupted and there is no instruction pointer to hijack -- the ceiling
+# here is denial of service, as on any managed runtime.
+#
+# THE HONEST LIMIT, worth stating because it decides what this substrate can ever find: wasm
+# linear memory is one flat array, and a module's globals, stack and heap all live inside it.
+# An overflow that stays WITHIN linear memory -- the ordinary stack-buffer overflow this
+# platform demonstrates on every native target -- silently corrupts the module's neighbouring
+# data and never traps. Only an access past the END of linear memory does. So wasm makes
+# memory corruption quieter than native, and seeing the rest would need a differential oracle
+# rather than a trap.
+TRAP_CWE = (
+    ("memory access out of bounds", ("out-of-bounds access", "CWE-119", "high")),
+    ("out of bounds memory access", ("out-of-bounds access", "CWE-119", "high")),
+    ("table index is out of bounds", ("out-of-bounds table index", "CWE-129", "high")),
+    ("integer divide by zero", ("divide by zero", "CWE-369", "medium")),
+    ("integer overflow", ("integer overflow", "CWE-190", "medium")),
+    ("float unrepresentable in integer range", ("bad float conversion", "CWE-681", "medium")),
+    ("call stack exhausted", ("uncontrolled recursion", "CWE-674", "high")),
+    ("maximum call stack size exceeded", ("uncontrolled recursion", "CWE-674", "high")),
+    ("null function or function signature mismatch",
+     ("indirect call type confusion", "CWE-843", "high")),
+    ("indirect call type mismatch", ("indirect call type confusion", "CWE-843", "high")),
+    ("unreachable", ("reachable trap instruction", "CWE-617", "medium")),
+    ("out of memory", ("memory exhaustion", "CWE-789", "medium")),
+)
+# How a trap is carried where a native crash carries a signal name.
+SIGNAL_PREFIX = "WASM-TRAP-"
+
+
+def classify_trap(msg: str):
+    """(bug, cwe, severity) for a wasm trap message.
+
+    `unreachable` is deliberately LAST: clang compiles undefined behaviour and failed
+    assertions alike to `unreachable`, and the word also turns up inside other engines'
+    messages, so a more specific match has to win.
+    """
+    low = (msg or "").lower()
+    for needle, hit in TRAP_CWE:
+        if needle in low:
+            return hit
+    return ("wasm trap", "CWE-248", "medium")
+
+
+def trap_signal(bug: str) -> str:
+    """The signal-shaped name a RunResult carries for a trap. Spaces become hyphens and
+    nothing else does, so the bug name round-trips -- "out-of-bounds access" already contains
+    hyphens, and translating those too made the name unmatchable on the way back."""
+    return SIGNAL_PREFIX + (bug or "trap").replace(" ", "-")
+
+
+def cwe_for_trap(signal_name: str):
+    """(cwe, severity) for the slugged name a RunResult carries, else None."""
+    if not signal_name or not signal_name.startswith(SIGNAL_PREFIX):
+        return None
+    for _needle, (name, cwe, sev) in TRAP_CWE:
+        if trap_signal(name) == signal_name:
+            return (cwe, sev)
+    return ("CWE-248", "medium")

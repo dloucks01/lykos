@@ -163,8 +163,9 @@ def crash_finding_candidate(signal_name, input_sha, isolation, detector, extra="
     than duplicate, so the faulting address is taken from the crash itself, not from whichever
     stage happened to observe it.
     """
-    from ..jvm import cwe_for_exception
-    cwe, sev = _SIG_CWE.get(signal_name) or cwe_for_exception(signal_name) \
+    from ..runtime_fault import managed_fault
+    managed = managed_fault(signal_name)
+    cwe, sev = _SIG_CWE.get(signal_name) or (managed[:2] if managed else None) \
         or ("CWE-119", "high")
     short = input_sha[:12] if input_sha else "(none)"
     detail = f"{signal_name} with input {short} [{isolation}]"
@@ -180,8 +181,8 @@ def crash_finding_candidate(signal_name, input_sha, isolation, detector, extra="
                          "detail": f"verified PoC bundle {bundle_sha[:12]}"})
     if hijack:
         title = f"Control-flow hijack ({signal_name}): attacker-controlled instruction pointer"
-    elif cwe_for_exception(signal_name) and signal_name not in _SIG_CWE:
-        title = f"Reproduced fault ({signal_name}) under the JVM"
+    elif managed and signal_name not in _SIG_CWE:
+        title = f"Reproduced fault ({signal_name}) under {managed[2]}"
     else:
         title = f"Reproduced crash ({signal_name}) under dynamic execution"
     return {

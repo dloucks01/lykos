@@ -430,16 +430,18 @@ _OVERFLOW_CWES = frozenset({"CWE-119", "CWE-120", "CWE-121", "CWE-122", "CWE-125
 
 # File types whose execution needs a foreign substrate: a Windows PE runs under wine, a class/jar
 # under the JVM. Neither can be batched, so each execution pays a fresh start-up.
-_FOREIGN_SUBSTRATE_TYPES = frozenset({"pe", "class", "jar", "jvm"})
+_FOREIGN_SUBSTRATE_TYPES = frozenset({"pe", "class", "jar", "jvm", "pyc", "wasm"})
 
 
 def _nonnative_image(target) -> bool:
     """Is this target something AFL fundamentally cannot instrument?
 
-    AFL rewrites/traces MACHINE CODE. Bytecode (.class/.jar) is not machine code, and a PE runs
-    under wine rather than as a host process, so coverage_fuzz cannot apply to either -- it has to
-    be the blind campaign instead. Distinct from _expensive_substrate, which includes a foreign
-    ARCH: AFL++ qemu-mode genuinely does handle those, given afl-qemu-trace.
+    AFL rewrites/traces MACHINE CODE. Bytecode (.class/.jar/.pyc) and a wasm module are not
+    machine code -- the only machine code in the process belongs to the interpreter or the
+    engine, so instrumenting it measures coverage of the JVM, of CPython or of V8 and tells you
+    nothing about the target -- and a PE runs under wine rather than as a host process.
+    coverage_fuzz cannot apply to any of them; it has to be the blind campaign instead. Distinct from _expensive_substrate, which includes a foreign ARCH:
+    AFL++ qemu-mode genuinely does handle those, given afl-qemu-trace.
     """
     return (getattr(target, "file_type", "") or "").lower() in _FOREIGN_SUBSTRATE_TYPES
 

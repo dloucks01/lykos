@@ -112,3 +112,85 @@ def to_format_details(info: PycInfo) -> dict[str, Any]:
     return {"pyc": {"magic": info.magic, "python_version": info.python_version,
                     "hash_based": info.hash_based, "flags": info.flags,
                     "names": len(info.imported_symbols), "strings": len(info.strings)}}
+
+
+# ---- what an uncaught Python exception actually means ------------------------------------
+#
+# Same reasoning as jvm.EXCEPTION_CWE, and for the same reason: the native crash table falls
+# through to CWE-119 "critical memory corruption", which on a managed runtime is a lie. An
+# IndexError is CPython CATCHING the out-of-bounds access -- the unvalidated index is a real
+# defect, and uncaught it terminates the process (denial of service for a service), but
+# nothing was corrupted.
+#
+# The severities are deliberately not uniform. A program that rejects bad input by raising is
+# doing the RIGHT thing; ranking that with a memory-safety defect buries the findings that
+# matter, so the "this is how input validation looks" exceptions sit at low/info.
+EXCEPTION_CWE = {
+    # unvalidated index / key / size reaching a container
+    "IndexError": ("CWE-129", "high"),
+    "KeyError": ("CWE-20", "medium"),
+    "SliceError": ("CWE-129", "medium"),
+    # resource exhaustion the input controls
+    "MemoryError": ("CWE-789", "high"),
+    "RecursionError": ("CWE-674", "high"),
+    # unvalidated input reaching a conversion, a cast or arithmetic
+    "ZeroDivisionError": ("CWE-369", "medium"),
+    "OverflowError": ("CWE-190", "medium"),
+    "FloatingPointError": ("CWE-369", "low"),
+    "ValueError": ("CWE-20", "medium"),
+    "TypeError": ("CWE-704", "medium"),
+    "AttributeError": ("CWE-476", "medium"),       # the closest analogue of a null dereference
+    "UnicodeDecodeError": ("CWE-172", "medium"),
+    "UnicodeEncodeError": ("CWE-172", "low"),
+    "UnicodeError": ("CWE-172", "low"),
+    "error": ("CWE-130", "medium"),                # struct.error: a length field mishandled
+    "AssertionError": ("CWE-617", "medium"),       # a reachable assertion
+    # deserialisation reaching code or state it should not. Unpickling attacker bytes is
+    # arbitrary code execution by design, so a crash INSIDE it is the tame outcome.
+    "UnpicklingError": ("CWE-502", "high"),
+    "BadPickleGet": ("CWE-502", "high"),
+    "ConstructorError": ("CWE-502", "high"),       # PyYAML's unsafe-load failure
+    # CPython's own invariant broken -- not the program's bug, and worth seeing.
+    "SystemError": ("CWE-248", "medium"),
+    # a missing catch, not a memory-safety defect
+    "EOFError": ("CWE-248", "low"),
+    "StopIteration": ("CWE-248", "low"),
+    "NotImplementedError": ("CWE-248", "low"),
+    "RuntimeError": ("CWE-248", "low"),
+    "LookupError": ("CWE-248", "low"),
+    "ArithmeticError": ("CWE-369", "low"),
+    "OSError": ("CWE-248", "low"),
+    "IOError": ("CWE-248", "low"),
+    "FileNotFoundError": ("CWE-248", "info"),
+    "IsADirectoryError": ("CWE-248", "info"),
+    "NotADirectoryError": ("CWE-248", "info"),
+    "PermissionError": ("CWE-248", "info"),
+    "TimeoutError": ("CWE-248", "info"),
+    "ConnectionResetError": ("CWE-248", "info"),
+    "BrokenPipeError": ("CWE-248", "info"),
+}
+# The interpreter itself dying is the one Python result that IS memory corruption: a C
+# extension or a CPython bug, reached through the pure-Python surface.
+_FATAL_PREFIX = "PY-FATAL-"
+# Neither of these is a defect in the program. SystemExit is a deliberate exit (it is what
+# sys.exit raises) and KeyboardInterrupt is the harness or the user; filing either as a crash
+# would make every well-behaved `sys.exit(2)` on bad input a finding.
+NOT_A_FAULT = frozenset({"SystemExit", "KeyboardInterrupt", "GeneratorExit"})
+
+
+def cwe_for_exception(name: str):
+    """(cwe, severity) for an uncaught Python fault, or None if this is not one."""
+    if not name or name in NOT_A_FAULT:
+        return None
+    if name.startswith(_FATAL_PREFIX):
+        return ("CWE-119", "critical")
+    hit = EXCEPTION_CWE.get(name)
+    if hit:
+        return hit
+    if name.endswith(("Error", "Exception")):
+        # Unknown, but unmistakably a Python exception -- every builtin and essentially every
+        # library exception ends this way. CWE-248 at a middling severity is the honest
+        # answer; inheriting the native default would call it critical memory corruption on a
+        # runtime that has none.
+        return ("CWE-248", "medium")
+    return None
