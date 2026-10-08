@@ -717,6 +717,53 @@ int main(void){ setvbuf(stdout,0,2,0);
          note="INJECTION SSRF (CWE-918): a user-controlled URL handed to curl. SKIPS without curl "
               "headers"),
 
+    # ---- ALTERNATE WEAPONIZATION. Only ret2win, format-%n and heap FSOP were ever asserted. These
+    # are the no-leak / no-win shapes that force a different technique: a static binary with no
+    # dynamic libc (ret2syscall / SROP), a dynamic one with no win() and no leak call
+    # (ret2dlresolve), and an mprotect-reachable one (shellcode). want_level 2 asks for a
+    # demonstrated PRIMITIVE (control of execution) rather than a full shell, which is the honest
+    # bar for these: reaching L3 depends on gadget availability in the specific binary.
+    Case("static_no_libc_overflow",
+         r"""#include <stdio.h>
+#include <unistd.h>
+int main(void){ char b[64]; printf("in: ");
+  if(scanf("%s", b) != 1) return 0;          /* no win(), no system(), statically linked */
+  write(1, b, 8); return 0; }""",
+         ["-static", "-no-pie", "-fno-stack-protector", "-O0", "-w"],
+         want_level=1, want_cwe=("CWE-121", "CWE-787", "CWE-119"), budget=1200.0,
+         note="TTP static+no-PIE, no win/system: the ret2syscall / SROP shape (a dynamic ret2libc "
+              "has no PLT to lean on here)"),
+
+    Case("nowin_dynamic_overflow",
+         r"""#include <stdio.h>
+#include <unistd.h>
+int main(void){ char b[64]; printf("in: ");
+  if(scanf("%s", b) != 1) return 0;          /* no win(), and nothing that leaks an address */
+  write(1, "ok\n", 3); return 0; }""",
+         ["-no-pie", "-fno-stack-protector", "-O0", "-w"],
+         want_level=1, want_cwe=("CWE-121", "CWE-787", "CWE-119"), budget=420.0,
+         note="TTP no win(), no leak primitive: the ret2dlresolve shape (resolve system through the "
+              "linker without ever leaking libc)"),
+
+    Case("mprotect_shellcode",
+         r"""#include <stdio.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
+int main(void){ setvbuf(stdout,0,2,0);
+  /* A writable+executable page the program itself maps: the shellcode shape. */
+  void *pg = mmap(NULL, 0x1000, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+  if(pg == MAP_FAILED) return 1;
+  char b[64]; printf("in: ");
+  if(scanf("%s", b) != 1) return 0;
+  memcpy(pg, b, 64);
+  mprotect(pg, 0x1000, PROT_READ|PROT_EXEC);
+  printf("staged\n"); return 0; }""",
+         ["-no-pie", "-fno-stack-protector", "-O0", "-w"],
+         want_level=1, want_cwe=("CWE-121", "CWE-787", "CWE-119", "CWE-94"), budget=420.0,
+         note="TTP attacker bytes copied into a page the program makes executable (mprotect / "
+              "shellcode), plus a stack overflow to reach it"),
+
     # ---- MULTIPLE DEFECTS. Every case above asserts ONE effect on one target; the mission claim is
     # "find EVERY crash", so this binary carries two unrelated bugs behind a menu and both must be
     # demonstrated.
