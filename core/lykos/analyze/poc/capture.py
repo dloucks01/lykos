@@ -138,7 +138,56 @@ _STDIN_INTERACTIVE = {"read", "gets", "scanf", "__isoc99_scanf", "getchar", "get
                       "getline"}
 
 
-def modes_for(call_edges, given=None):
+# ---- the SAME question on a managed runtime ----------------------------------------------
+#
+# A managed target has no machine code, so `disassemble` recovers no functions and writes no
+# call edges -- which left the sets above matching nothing and put `arg` FIRST for every jar,
+# .pyc and .NET assembly. The cost is not a wrong answer (the autopilot retries the other
+# channels) but a wasted one: a .NET assembly runs at 8 exec/s, so a campaign spent ~364
+# executions, about 45 seconds of its budget, fuzzing a channel the program never reads before
+# trying the one it does.
+#
+# The names ARE available: triage reads them out of the metadata heaps / constant pool / code
+# object and records them (`ingest.triage_symbols`). They are not libc symbols, so they need
+# their own vocabulary, and the vocabulary has to be careful -- `ReadLine` is `Console.ReadLine`
+# on stdin AND `StreamReader.ReadLine` on a file, so a read method alone decides nothing. Where
+# the TYPE disambiguates, require it.
+_MANAGED_CONSOLE_TYPES = {"System.Console", "Console"}
+_MANAGED_CONSOLE_READS = {"ReadLine", "Read", "ReadKey", "ReadToEnd", "ReadBlock",
+                          "OpenStandardInput", "get_In"}
+# Unambiguous stdin markers: the name itself names the stream, whatever is called on it.
+_MANAGED_STDIN_MARKERS = {
+    "stdin",                      # Python: sys.stdin
+    "input", "raw_input",         # Python: input() reads a line from stdin
+    "System.in", "in",            # Java: System.in -- a constant-pool field ref
+    "nextLine", "nextInt",        # Java: a Scanner, which is only ever built over a stream
+}
+# File readers. A TYPE name here is enough: `System.IO.File` / `FileStream` / `open` exist to
+# touch the filesystem. Deliberately EXCLUDES the bare `System.IO` namespace and
+# `MemoryStream`/`TextReader`, which a console-only program also names.
+_MANAGED_FILE_NAMES = {
+    "File", "FileStream", "FileInfo", "OpenRead", "OpenText", "OpenWrite",
+    "ReadAllBytes", "ReadAllText", "ReadAllLines", "Directory", "DirectoryInfo",
+    "FileInputStream", "FileReader", "RandomAccessFile", "Files",      # Java
+    "open", "fileno",                                                  # Python
+}
+
+
+def _managed_channels(symbols):
+    """(has_stdin, has_file, interactive) from a managed target's recorded symbol names."""
+    names = {s for s in (symbols or ()) if s}
+    short = {n.rsplit(".", 1)[-1] for n in names}
+    console = bool(names & _MANAGED_CONSOLE_TYPES) and bool(short & _MANAGED_CONSOLE_READS)
+    marked = bool(short & _MANAGED_STDIN_MARKERS) or bool(names & _MANAGED_STDIN_MARKERS)
+    has_file = bool(short & _MANAGED_FILE_NAMES)
+    has_stdin = console or marked
+    # A direct console/stdin read is this runtime's interactive primitive, exactly as raw
+    # read(2) and the scanf family are on a native target: it means the program takes its
+    # ATTACKER input from stdin, so stdin outranks a file channel the program also touches.
+    return has_stdin, has_file, has_stdin
+
+
+def modes_for(call_edges, given=None, symbols=()):
     """The input channels to try, best first, always ending with all three attempted.
 
     Ranked by the input functions the binary actually imports, because "default to stdin" is
@@ -147,6 +196,11 @@ def modes_for(call_edges, given=None):
     exposes BOTH channels (it opens a file and reads stdin), an interactive-stdin primitive
     breaks the tie toward stdin -- the file is then almost always an internal resource, not the
     input -- while a pure stdio file-reader (fread/fgets on a FILE*) keeps file first.
+
+    `symbols` is the managed equivalent of `call_edges`: the names triage recovered from a
+    constant pool, a metadata heap or a code object, for a target that owns no machine code and
+    therefore has no call edges at all. Unioned with the native signals, never substituted for
+    them. See `_managed_channels`.
     """
     from ..detect.catalog import normalize
     if given:
@@ -155,6 +209,13 @@ def modes_for(call_edges, given=None):
     has_file = bool(names & _FILE_FUNCS)
     has_stdin = bool(names & _STDIN_FUNCS)
     interactive = bool(names & _STDIN_INTERACTIVE)
+    # `symbols` carries a MANAGED target's recorded names, which is the only inventory such a
+    # target has -- it owns no machine code, so `call_edges` is empty for it. Unioned, never
+    # substituted: a native target with both sources keeps every native signal it had.
+    m_stdin, m_file, m_interactive = _managed_channels(symbols)
+    has_file = has_file or m_file
+    has_stdin = has_stdin or m_stdin
+    interactive = interactive or m_interactive
     ordered: list = []
     if has_file and has_stdin:
         ordered += ["stdin", "file"] if interactive else ["file", "stdin"]

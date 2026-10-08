@@ -174,7 +174,7 @@ def build_poc_stage(ctx) -> dict:
         fd.upsert(target.id, target.case_id, crash_finding_candidate(
             res.signal_name, input_sha, res.isolation, "poc", "(PoC verified)",
             state="poc-backed", confidence=0.95, bundle_sha=bundle_sha,
-            fault_pc=fault_pc, hijack=hj))
+            fault_pc=fault_pc, hijack=hj, file_type=target.file_type))
         fid = fd.id_for_dedup(
             target.id, crash_dedup_key(res.signal_name, fault_pc, hijack=hj))
         if fid:

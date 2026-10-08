@@ -150,7 +150,8 @@ def find_crash_finding(conn, target_id, signal_name, input_sha=None):
 
 def crash_finding_candidate(signal_name, input_sha, isolation, detector, extra="",
                             state="confirmed", confidence=0.9, bundle_sha=None,
-                            fault_pc=None, discriminator=None, *, hijack=False):
+                            fault_pc=None, discriminator=None, *, hijack=False,
+                            file_type=None):
     """Crash finding shared by the dynamic / fuzz / poc stages.
 
     Keyed by WHERE it faulted when that is known, so two defects that both raise SIGSEGV stay
@@ -164,7 +165,9 @@ def crash_finding_candidate(signal_name, input_sha, isolation, detector, extra="
     stage happened to observe it.
     """
     from ..runtime_fault import managed_fault
-    managed = managed_fault(signal_name)
+    # file_type disambiguates a name the JVM and the CLR share (IOException, ArithmeticException)
+    # so the title attributes the fault to the runtime that actually observed it.
+    managed = managed_fault(signal_name, file_type)
     cwe, sev = _SIG_CWE.get(signal_name) or (managed[:2] if managed else None) \
         or ("CWE-119", "high")
     short = input_sha[:12] if input_sha else "(none)"
@@ -266,7 +269,8 @@ def dynamic_stage(ctx) -> dict:
         _hj = is_hijack_pc(res.fault_pc, recovered_code_span(ctx.conn, target.id))
         FindingDAO(ctx.conn).upsert(target.id, target.case_id, crash_finding_candidate(
             res.signal_name, input_sha, res.isolation, "dynamic",
-            fault_pc=res.fault_pc, discriminator=defect_key, hijack=_hj))
+            fault_pc=res.fault_pc, discriminator=defect_key, hijack=_hj,
+            file_type=target.file_type))
 
     if not ran:
         # never executed: do not label this "clean exit" -- it is "could not run", and the note

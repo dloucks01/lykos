@@ -17,6 +17,8 @@ from __future__ import annotations
 
 from typing import Optional
 
+from . import substrate  # the ONE table of what each file_type can be run on
+
 # The three questions the workbench asks, in the order the evidence-first pipeline answers
 # them. `feed` is not a group of stages but of INPUTS -- how the target is invoked and what it
 # is given -- which is the step that decides whether any of the rest can work at all, and
@@ -58,7 +60,6 @@ STAGES: dict = {
     "multi_debug":          (PROVE, "Multi-process", "follow fork/exec and blame the child"),
 }
 
-_JVM = ("jar", "class")
 
 
 def _why_unavailable(stage: str, target) -> Optional[str]:
@@ -71,23 +72,29 @@ def _why_unavailable(stage: str, target) -> Optional[str]:
         from .fuzz.coverage import _unsupported  # the stage's gate, imported
         return _unsupported(target)
 
-    if stage == "disassemble" and ftype in _JVM:
-        return ("a Java target has no machine code to decompile -- its classes, strings and "
-                "every method it calls are already in the constant pool, which detect_cwe "
-                "reads directly.")
+    if stage == "disassemble":
+        # Asked of the one substrate table, not of a jar/class list: .pyc, .wasm and a .NET
+        # assembly have no machine code either, and the operator was being offered Decompile
+        # on all three with no reason given.
+        why = substrate.no_machine_code_reason(ftype)
+        if why:
+            return why
 
-    if stage in ("poc_primitive", "build_exploit") and ftype in _JVM:
-        return ("the JVM checks every array access and owns the instruction pointer, so "
-                "control-flow hijack is not a claim this runtime can support. L1 (a verified, "
-                "reproducible fault) is the ceiling for Java, and that is the runtime, not a "
-                "gap to be closed.")
+    if stage in ("poc_primitive", "build_exploit"):
+        # The honest-ceiling message used to be told for jar/class ONLY, so .pyc, .wasm and
+        # .NET targets were offered IP control and Exploit with no explanation at all -- the
+        # exact "learn by waiting for a decline" failure this module exists to prevent.
+        why = substrate.no_ip_control_reason(ftype)
+        if why:
+            return why
 
     if stage == "heap_check":
         from .dynamic import sandbox
         host = sandbox.host_arch()
-        if ftype in _JVM:
-            return "the JVM manages its own heap; the LD_PRELOAD guard-page allocator does " \
-                   "not apply."
+        managed = substrate.managed_runtime(ftype)
+        if managed:
+            return (f"{managed} manages its own heap; the LD_PRELOAD guard-page allocator "
+                    f"does not apply.")
         if ftype and ftype != "elf":
             # The stage says this itself at runtime; the map did not know, so the workbench
             # offered Heap check on a Windows PE and the operator learned by waiting for a
@@ -112,10 +119,12 @@ def _why_unavailable(stage: str, target) -> Optional[str]:
         if gdb.locate_gdb(None) is None:
             return "follow-fork multi-process debugging requires gdb, which is not installed."
 
-    if stage in ("dynamic_taint", "debug_monitor", "concolic") and ftype in _JVM:
-        return ("this channel works on machine code (P-Code / ptrace / angr); a Java target "
-                "has none. The constant pool gives detect_cwe the same call inventory "
-                "directly.")
+    if stage in ("dynamic_taint", "debug_monitor", "concolic"):
+        managed = substrate.managed_runtime(ftype)
+        if managed:
+            return (f"this channel works on machine code (P-Code / ptrace / angr) and a target "
+                    f"that runs on {managed} has none. Its metadata gives detect_cwe the same "
+                    f"call inventory directly.")
 
     if stage == "dynamic_taint" and ftype and ftype != "elf":
         return f"dynamic taint runs Linux ELF only (this target is {ftype.upper()})."

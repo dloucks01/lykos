@@ -12,7 +12,7 @@ import sys
 
 from ...db.dao import CallEdgeDAO, DynResultDAO, FindingDAO, FunctionDAO, TargetDAO
 from ...jobs.registry import register_stage
-from .. import elf
+from .. import elf, substrate
 from ..dynamic import sandbox
 from ..dynamic.stage import crash_dedup_key
 from ..fuzz.runner import place
@@ -36,15 +36,44 @@ def _hex(v):
 # that runtime's trace, how to render a frame, and what the ceiling is -- a runtime that owns
 # the instruction pointer cannot be escalated to control-flow hijack, and claiming otherwise
 # would be a fabricated level.
-_MANAGED_FILE_TYPES = {"jar": "jvm", "class": "jvm", "jvm": "jvm", "pyc": "cpython",
-                       "wasm": "wasm"}
+def _reparse_rc(res):
+    """A truthful exit code for RE-PARSING a stored RunResult.
+
+    `RunResult.exit_code` is deliberately None when the run CRASHED -- every substrate here
+    does that. But the managed parsers use the exit code as their ONE discriminator between a
+    program that printed an exception trace and handled it correctly and one the runtime
+    killed: `traceback.print_exc()` and `Console.Error.Write(ex)` are byte-identical to an
+    uncaught exception, so a target that echoes its input would otherwise "crash" on any
+    mutation containing the words.
+
+    Re-parsing with None therefore made the fault VANISH. root_cause took a reproduced
+    IndexOutOfRangeException, re-read the same stderr, got nothing, and filed `uncaught None`
+    / CWE-248 at state `confirmed` -- a confident wrong weakness that outranked the crash
+    finding which had it right. The sandbox has already judged this result crashed; say so.
+    """
+    if res.exit_code is not None:
+        return res.exit_code
+    return 1 if res.crashed else 0
+
+
+def _managed_kind(file_type):
+    """The managed-runtime descriptor key for a file_type, or None if it is not managed.
+
+    Derived from the ONE substrate table rather than a second hand-written dict here, which is
+    what stopped the old failure: .pyc and .wasm became executable and the dict still knew only
+    the JVM, so a managed fault on those formats never reached this path at all.
+    """
+    ft = (file_type or "").lower().strip()
+    if ft == "jvm":                       # defensive alias; triage emits jar/class
+        return "jvm"
+    return substrate.managed_kind(ft)
 
 
 def _managed_runtime(kind: str):
     if kind == "jvm":
         return {
             "name": "the JVM", "backend": "jvm",
-            "parse": lambda r: sandbox.jvm_exception(r.stderr, r.exit_code, r.stdout),
+            "parse": lambda r: sandbox.jvm_exception(r.stderr, _reparse_rc(r), r.stdout),
             "blame": sandbox.app_frame,
             "frame": lambda fr: f"{fr[0]}({fr[1]})",
             "checks": "the JVM checks every array access and owns every pointer",
@@ -62,9 +91,21 @@ def _managed_runtime(kind: str):
             "checks": "the engine bounds-checks every memory access and owns every pointer",
             "lang": "WebAssembly",
         }
+    if kind == "clr":
+        # The CLR trace is the richest of the four: a method signature always, and file:line
+        # too for any assembly shipped with a PDB.
+        return {
+            "name": "the CLR", "backend": "clr",
+            "parse": lambda r: sandbox.dotnet_exception(r.stderr, _reparse_rc(r), r.stdout),
+            "blame": sandbox.app_frame_clr,
+            "frame": lambda fr: (f"{fr[0]} ({fr[1]}:{fr[2]})" if len(fr) > 2 and fr[1]
+                                 else str(fr[0])),
+            "checks": "the CLR bounds-checks every array access and owns every pointer",
+            "lang": "C#/.NET",
+        }
     return {
         "name": "CPython", "backend": "cpython",
-        "parse": lambda r: sandbox.python_exception(r.stderr, r.exit_code, r.stdout),
+        "parse": lambda r: sandbox.python_exception(r.stderr, _reparse_rc(r), r.stdout),
         "blame": sandbox.app_frame_py,
         "frame": lambda fr: f"{fr[0]}:{fr[1]}" + (f" in {fr[2]}" if len(fr) > 2 and fr[2] else ""),
         "checks": "CPython bounds-checks every index and owns every reference",
@@ -124,8 +165,26 @@ def _root_cause_managed(ctx, target, input_sha, base_argv, mode, timeout, runtim
         return {}
 
     kind, detail, frames = rt["parse"](res)
+    # The sandbox already classified this fault when it ran it, and its verdict is
+    # authoritative: prefer it, and only fall back to what re-parsing the trace recovered.
+    kind = kind or res.signal_name
+    if not kind:
+        # The runtime faulted -- the sandbox says so -- but nothing here can name the defect.
+        # Report the gap and file NOTHING. The alternative is what this used to do: invent
+        # CWE-248 "uncaught None" at state `confirmed`, which ranks as demonstrated evidence
+        # and buries the crash finding that named the defect correctly.
+        ctx.emit("rootcause.done", payload={
+            "supported": True, "backend": rt["backend"], "input_mode": mode, "ran": True,
+            "classification": None,
+            "note": (f"the input faulted under {rt['name']} but the trace could not be "
+                     f"classified, so no weakness is claimed here -- the crash finding from "
+                     f"the stage that found it carries the defect")})
+        ctx.progress(pct=100, msg=f"faulted under {rt['name']}; trace not classifiable")
+        return {}
     blame = rt["blame"](frames)
-    hit = managed_fault(kind)
+    # Pass the file_type: it decides which runtime's table is authoritative for a name the JVM
+    # and the CLR share, so the finding is attributed to the runtime that actually observed it.
+    hit = managed_fault(kind, target.file_type)
     cwe, sev = (hit[0], hit[1]) if hit else ("CWE-248", "medium")
     summary = detail or f"uncaught {kind}"
     stack = [rt["frame"](fr) for fr in frames]
@@ -204,7 +263,7 @@ def root_cause_stage(ctx) -> dict:
     timeout = float(p.get("timeout", 10))
     mode, base_argv, mode_why = how_to_feed(ctx.conn, target, input_sha, p)
 
-    managed = _MANAGED_FILE_TYPES.get((target.file_type or "").lower())
+    managed = _managed_kind(target.file_type)
     if managed:
         return _root_cause_managed(ctx, target, input_sha, base_argv, mode, timeout, managed)
 

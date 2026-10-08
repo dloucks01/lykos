@@ -229,9 +229,17 @@ def build_triage(path: str | Path, hashes: dict[str, Any], filename: str) -> dic
             ".NET assembly analysed: the metadata gives every type and method NAME (#Strings) and "
             "every string literal (#US) in the clear -- more than a stripped native PE -- so the "
             "string-based detectors, invocation discovery and the fuzzing dictionary all work. "
-            "Execution is under the CLR, where a defect surfaces as a managed exception, not a "
-            "signal. Not available: native disassembly (the body is CIL, not x86) and the L2/L3 "
-            "exploit ladder -- the managed runtime owns every pointer, so there is no IP to hijack.")
+            "It is also EXECUTED, under the CLR (`dotnet`, ~8 exec/s measured): a defect surfaces "
+            "as an unhandled managed exception, not a signal, and the trace names the exception "
+            "class plus a method signature -- with file:line too when the assembly shipped a PDB, "
+            "which is richer than a native backtrace. An ingested single assembly is run by "
+            "linking a `.dll` name beside it and synthesizing the `runtimeconfig.json` the host "
+            "needs, so no build output is required. Not available: native disassembly (the body "
+            "is CIL, not x86) and the L2/L3 exploit ladder -- the CLR bounds-checks every array "
+            "access and owns every pointer, so there is no instruction pointer to hijack and L1 "
+            "(a verified, reproducible fault) is the honest ceiling. Note it is NOT run under "
+            "wine: wine needs Mono for managed code, and without it nothing executed at all "
+            "while the run still reported success.")
     elif rec["file_type"] == filetype.PE:
         info = pemod.parse(data)
         parse_errors.extend(info.errors)

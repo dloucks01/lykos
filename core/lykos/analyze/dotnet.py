@@ -230,3 +230,90 @@ def to_format_details(info: DotNetInfo) -> dict:
         "names_sample": info.names[:32],
         "user_strings_sample": info.user_strings[:32],
     }
+
+
+# ---- the CLR's exceptions, as a defect taxonomy -------------------------------------------
+#
+# A .NET defect surfaces as an UNHANDLED MANAGED EXCEPTION, exactly as on the JVM and in
+# CPython: the CLR bounds-checks every array access and owns every pointer, so the process dies
+# with a named exception and a stack trace rather than a signal. The exception name is strictly
+# more informative than SIGSEGV would be -- `IndexOutOfRangeException` says which defect class
+# it is -- and on this runtime the trace carries file:line for any assembly built with a PDB,
+# which is more than the JVM path recovers.
+#
+# Names are stored WITHOUT the `System.` prefix and matched on the last dotted component, so a
+# user-defined `Acme.IndexOutOfRangeException` and `System.IndexOutOfRangeException` both land.
+EXCEPTION_CWE = {
+    # unvalidated index / size reaching an array or a span
+    "IndexOutOfRangeException": ("CWE-129", "high"),
+    "ArgumentOutOfRangeException": ("CWE-129", "high"),
+    "RankException": ("CWE-129", "medium"),
+    # resource exhaustion the input controls
+    "OutOfMemoryException": ("CWE-789", "high"),
+    "StackOverflowException": ("CWE-674", "high"),
+    "InsufficientExecutionStackException": ("CWE-674", "medium"),
+    # unvalidated input reaching a conversion, a cast or arithmetic
+    "FormatException": ("CWE-20", "medium"),
+    "InvalidCastException": ("CWE-704", "medium"),
+    "ArrayTypeMismatchException": ("CWE-704", "medium"),
+    "OverflowException": ("CWE-190", "medium"),
+    "DivideByZeroException": ("CWE-369", "medium"),
+    "NullReferenceException": ("CWE-476", "medium"),
+    "ArithmeticException": ("CWE-369", "medium"),
+    "NotFiniteNumberException": ("CWE-681", "low"),
+    # memory safety that DOES reach past the managed boundary: an `unsafe` block, a fixed
+    # buffer, a P/Invoke or a Marshal call steps outside the CLR's checks, and the CLR reports
+    # the fault it was handed rather than one it prevented.
+    "AccessViolationException": ("CWE-119", "critical"),
+    "DataMisalignedException": ("CWE-119", "high"),
+    "SEHException": ("CWE-119", "critical"),
+    # deserialization reaching code it should not
+    "SerializationException": ("CWE-502", "high"),
+    # A program that validates its input by throwing is doing the RIGHT thing. Uncaught at the
+    # entry point it still kills the process, so it is not nothing -- but it is a missing catch,
+    # not a memory-safety defect, and ranking it with one would bury the findings that matter.
+    "ArgumentException": ("CWE-248", "low"),
+    "ArgumentNullException": ("CWE-248", "low"),
+    "InvalidOperationException": ("CWE-248", "low"),
+    "NotSupportedException": ("CWE-248", "low"),
+    "NotImplementedException": ("CWE-248", "low"),
+    "KeyNotFoundException": ("CWE-248", "low"),
+    "ObjectDisposedException": ("CWE-248", "low"),
+    "TimeoutException": ("CWE-248", "low"),
+    "IOException": ("CWE-248", "low"),
+    "FileNotFoundException": ("CWE-248", "info"),
+    "DirectoryNotFoundException": ("CWE-248", "info"),
+    "UnauthorizedAccessException": ("CWE-248", "low"),
+    "SecurityException": ("CWE-248", "low"),
+    "PlatformNotSupportedException": ("CWE-248", "info"),
+}
+
+# The CLR aborting the process outright is the one managed result that IS memory corruption.
+_FATAL_PREFIX = "CLR-FATAL-"
+
+# Not input-driven faults: a deliberate exit, an operator interrupt, or the runtime refusing to
+# load the assembly at all (which is a capability gap, reported separately as a non-run).
+NOT_A_FAULT = frozenset({
+    "OperationCanceledException", "TaskCanceledException", "ThreadAbortException",
+    "ThreadInterruptedException", "AppDomainUnloadedException",
+})
+
+
+def cwe_for_exception(name: str):
+    """(cwe, severity) for an unhandled CLR fault, or None if this is not one."""
+    if not name:
+        return None
+    if name.startswith(_FATAL_PREFIX):
+        return ("CWE-119", "critical")
+    short = name.rsplit(".", 1)[-1]                      # System.IndexOutOfRangeException
+    if short in NOT_A_FAULT:
+        return None
+    hit = EXCEPTION_CWE.get(short)
+    if hit:
+        return hit
+    if short.endswith("Exception"):
+        # Unknown, but unmistakably a managed fault. CWE-248 with a middling severity is the
+        # honest answer; inheriting the native default would call it critical memory
+        # corruption on a runtime that has none.
+        return ("CWE-248", "medium")
+    return None

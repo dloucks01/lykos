@@ -14,6 +14,7 @@ import base64
 from ...db.dao import DynResultDAO, FindingDAO, TargetDAO
 from ...hashing import canonical_json
 from ...jobs.registry import register_stage
+from .. import substrate
 from ..dynamic import sandbox
 from ..dynamic.minimize import minimize
 from ..dynamic.stage import (
@@ -63,15 +64,14 @@ def _unsupported(target, use_qemu=True):
     the operator needs to know the difference between "nothing was found" and "nothing was
     run", and those two are otherwise identical on screen.
     """
-    ftype = (target.file_type or "").lower()
-    if ftype in ("jar", "class"):
-        return ("AFL++ instruments native code and cannot drive a JVM target. Use the "
-                "black-box `fuzz` stage, which runs the JVM directly (~36 exec/s measured) "
-                "and reads uncaught exceptions as faults.")
-    if ftype == "pe":
-        return ("AFL++ cannot instrument a Windows PE here, and the Wine path runs at about "
-                "one execution a second. Use `synthesize_poc`, which derives the overflow "
-                "from the recovered stack frame without executing at all.")
+    # The FORMAT question is answered by the one substrate table, not by a list kept here:
+    # this gate knew only jar/class/pe, so when .pyc, .wasm, a .NET assembly and a Mach-O
+    # became things the pipeline handled, AFL was offered on all four -- and for dotnet and
+    # macho the autopilot actually started a campaign against bytecode and against an image
+    # the host cannot execute.
+    reason = substrate.afl_reason(target.file_type)
+    if reason:
+        return reason
     if not use_qemu:
         # The afl-instrumented path (qemu=false) EXECUTES the target natively under afl-fuzz, so
         # it needs no emulator -- but for the same reason it can only run a HOST-arch binary. A

@@ -77,6 +77,54 @@ class Case:
     as_source: bool = False
 
 
+# ---- .NET assemblies for the two dotnet cases ---------------------------------------------
+#
+# Compiled with the SDK's Roslyn (csc) directly rather than `dotnet build`. MSBuild drags in a
+# NuGet restore and spawns worker nodes: it took five seconds idle and TEN MINUTES under load.
+# csc alone takes under a second and needs no network. The artifact is leaner too -- no
+# runtimeconfig.json and no deps.json -- which is what an INGESTED assembly actually looks
+# like, so the case exercises more of the path rather than less.
+_CSC_PRELUDE = """set -e
+ROOT=$(dirname "$(readlink -f "$(command -v dotnet)")")
+CSC=$(ls "$ROOT"/sdk/*/Roslyn/bincore/csc.dll | tail -1)
+FW=$(ls -d "$ROOT"/shared/Microsoft.NETCore.App/* | tail -1)
+cat > Program.cs <<'XEOF'
+%s
+XEOF
+dotnet "$CSC" -nologo -nostdlib -target:exe -out:%s \
+  -r:"$FW/System.Runtime.dll" -r:"$FW/System.Console.dll" \
+  -r:"$FW/System.Private.CoreLib.dll" -r:"$FW/System.Runtime.Extensions.dll" Program.cs
+"""
+
+# An array indexed by argv's COUNT: no input needed, so this one only has to be identified.
+_CS_FMT = """using System;
+public static class Program {
+    static readonly string[] Names = {"alpha", "beta"};
+    public static int Main(string[] a) {
+        Console.WriteLine(Names[a.Length]);
+        return 0;
+    }
+}"""
+
+# An array indexed by the input's LENGTH. The index is the length, not a parsed number, for the
+# reason spelled out on jvm_oob_index: an int.Parse() guard would test the mutator's luck
+# instead of the pipeline. Any line of four characters or more reaches it.
+_CS_OOB = """using System;
+public static class Program {
+    public static int Main(string[] a) {
+        string s = Console.In.ReadLine() ?? "";
+        int[] t = {1, 2, 3, 4};
+        Console.WriteLine("slot {0} = {1}", s.Length, t[s.Length]);
+        return 0;
+    }
+}"""
+
+
+def _csc_build(source: str, out: str):
+    """A (argv, output-glob) build pair that compiles one C# file with the SDK's csc."""
+    return (["sh", "-c", _CSC_PRELUDE % (source, out)], out)
+
+
 _CASES: list[Case] = [
     Case("no_pie_ret2win",
          r'''#include <stdio.h>
@@ -610,6 +658,35 @@ int main(void){ setvbuf(stdout,0,2,0);
                 "w2.wasm"),
          note="WASM DYNAMIC: a store at an offset taken from the input, demonstrated as an "
               "out-of-bounds trap rather than merely identified as a wasm module"),
+
+    # A .NET assembly IS a PE, so for as long as the dispatch asked only "is it a PE" this went
+    # to WINE -- which cannot execute managed code without Wine Mono. Nothing ran, and the run
+    # was reported crashed=False with no note: a CLEAN verdict on a target that never executed,
+    # on a host carrying a full .NET SDK. This case pins the routing itself.
+    Case("fmt_dotnet", "",
+         [], want_level=0, want_cwe=(), want_file_type="dotnet", budget=180.0,
+         requires=("dotnet",),
+         build=_csc_build(_CS_FMT, 'fmtnet.dll'),
+         note="FRONT-END .NET: a managed PE is identified as dotnet (CIL), NOT as a native PE"),
+
+    # And the same demand as pe_overflow / jvm_oob_index / pyc_oob_index / wasm_oob_store: drive
+    # the assembly through the real autopilot and require a DEMONSTRATED defect. The CLR is a
+    # managed runtime, so the ceiling here is denial of service -- it bounds-checks every array
+    # access and owns every pointer, which is a property of the runtime and not a gap in this
+    # pipeline. The index is the input's LENGTH so a broad class of inputs reaches it, for the
+    # reason spelled out on jvm_oob_index: an int.Parse() guard would test the mutator's luck
+    # instead of the pipeline.
+    #
+    # Note what this case also proves incidentally: an ingested assembly arrives as a single
+    # file under a generated name, with no runtimeconfig.json and no .dll extension, and the
+    # `dotnet` muxer refuses both. If either were unhandled every execution would be a non-run.
+    Case("dotnet_oob_index", "",
+         [], want_level=0, want_cwe=("CWE-129", "CWE-125", "CWE-20"),
+         requires=("dotnet",), budget=480.0,
+         build=_csc_build(_CS_OOB, 'oobnet.dll'),
+         note="DOTNET DYNAMIC: an array indexed by the unvalidated input length, demonstrated "
+              "as an unhandled IndexOutOfRangeException under the CLR rather than merely "
+              "identified as a .NET assembly"),
 
     Case("fmt_upx_packed", "",
          [], want_level=0, want_cwe=(), want_file_type="elf", budget=120.0,

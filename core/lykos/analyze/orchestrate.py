@@ -26,6 +26,7 @@ _log = logging.getLogger(__name__)
 from ..casestore import CaseStore
 from ..db.dao import DynResultDAO, FindingDAO, FunctionDAO, PocDAO
 from ..jobs.queue import JobQueue
+from . import substrate
 
 # stage -> (module, enqueue-fn). Target-scoped unless listed in _CASE.
 _TARGET = {
@@ -60,6 +61,18 @@ _TARGET = {
     "unpack": ("..analyze.unpack", "enqueue_unpack"),
     "firmware_carve": ("..analyze.firmware", "enqueue_firmware"),
     "firmware_rehost": ("..analyze.firmware", "enqueue_rehost"),
+    # These seven were REGISTERED and reachable only by a human clicking in the web UI --
+    # nothing in the autopilot named them and no other stage chained to them, so for an
+    # unattended run the capability did not exist. `multi_debug` in particular was the only
+    # follow-fork/exec capture in the engine, which means a crash in a forked child or an
+    # exec'd helper was never attributed to the input that caused it.
+    "extract_secrets": ("..analyze.debug", "enqueue_extract"),
+    "synthesize_secret": ("..analyze.poc", "enqueue_secret"),
+    "debug_monitor": ("..analyze.debug", "enqueue_monitor"),
+    "multi_debug": ("..analyze.debug", "enqueue_multi_debug"),
+    "libfuzzer": ("..analyze.libfuzzer_stage", "enqueue_libfuzzer"),
+    "boundary_fuzz": ("..analyze.link", "enqueue_boundary"),
+    "poc_diff": ("..analyze.poc", "enqueue_poc_diff"),
 }
 _CASE = {
     "link_case": ("..analyze.link", "enqueue_link"),
@@ -73,7 +86,12 @@ _CASE = {
 _NO_PARAMS = {"disassemble", "detect_cwe", "heap_trace", "oob_index", "chain_primitive",
               "synthesize_poc", "firmware_carve", "source_cve_scan", "embedded_audit",
               "int_overflow_scan", "uaf_scan", "source_sink_scan", "net_fuzz", "env_fuzz",
-              "cve_corroborate", "cve_poc"}
+              "cve_corroborate", "cve_poc",
+              # extract_secrets feeds itself a probe input when given none; synthesize_secret
+              # reads static findings and never executes; libfuzzer builds its own harness from
+              # source; boundary_fuzz discovers its own IPC channel. Each declines for itself
+              # when it does not apply, which is why none of them needs a gate here.
+              "extract_secrets", "synthesize_secret", "libfuzzer", "boundary_fuzz"}
 _CASE_NO_PARAMS = {"link_case", "ipc_model", "cross_taint"}
 
 _TERMINAL = {"done", "cancelled", "error"}
@@ -132,7 +150,9 @@ _PLAN_STAGES = [
     ("cve_scan", "Known-CVE scan"), ("source_cve_scan", "Dependency-CVE scan"),
     ("embedded_audit", "RTOS config audit"), ("int_overflow_scan", "Int-overflow allocs"),
     ("uaf_scan", "Use-after-free scan"), ("source_sink_scan", "Tainted-sink scan"),
-    ("net_fuzz", "Network fuzzing"), ("env_fuzz", "Env-var fuzzing"),
+    ("extract_secrets", "Recover gate values"), ("synthesize_secret", "Secret PoC"),
+    ("net_fuzz", "Network fuzzing"), ("boundary_fuzz", "IPC boundary fuzzing"),
+    ("libfuzzer", "libFuzzer harness"), ("env_fuzz", "Env-var fuzzing"),
     ("cve_poc", "CVE weaponization"),
     ("cve_corroborate", "CVE corroboration"), ("synthesize_injection", "Injection probes"),
     ("coverage_fuzz", "Coverage fuzzing"), ("directed_fuzz", "Directed fuzzing"),
@@ -142,6 +162,8 @@ _PLAN_STAGES = [
     ("root_cause", "Root-cause"), ("build_poc", "Build PoC"),
     ("poc_primitive", "PoC primitive"), ("build_exploit", "Build exploit"),
     ("behavior_trace", "Behaviour trace"), ("dynamic_taint", "Dynamic taint"),
+    ("multi_debug", "Follow fork/exec"), ("debug_monitor", "Runtime monitor"),
+    ("poc_diff", "Regression diff"),
     ("verify", "False-positive review"),
 ]
 _PLAN_LABEL = dict(_PLAN_STAGES)
@@ -393,10 +415,19 @@ def _ranked_channels(store, target_id):
     ending with all channels attempted. Lets the autopilot fuzz the RIGHT channel and, on no crash,
     retry the others -- a file parser's overflow can live in the argv filename it was handed
     (ncompress), which a stdin-only campaign never reaches."""
-    from ..db.dao import CallEdgeDAO
+    from ..db.dao import CallEdgeDAO, TargetDAO
+    from .ingest import triage_symbols
     from .poc.capture import modes_for
     try:
-        chans = modes_for(CallEdgeDAO(store.conn).list_by_target(target_id))
+        # A MANAGED target owns no machine code, so it has no call edges and the ranking had
+        # nothing to go on: `arg` came first for every jar, .pyc and .NET assembly. Triage
+        # already recorded the names from its constant pool / metadata, which say which stream
+        # the program reads -- so hand those over too.
+        syms = ()
+        tgt = TargetDAO(store.conn).get(target_id)
+        if tgt is not None and substrate.is_managed(tgt.file_type):
+            syms = triage_symbols(store.conn, store.content, tgt)
+        chans = modes_for(CallEdgeDAO(store.conn).list_by_target(target_id), symbols=syms)
         return chans or ["stdin", "arg", "file"]
     except Exception:
         _log.debug("channel inference failed for %s", target_id, exc_info=True)
@@ -428,23 +459,65 @@ _OVERFLOW_CWES = frozenset({"CWE-119", "CWE-120", "CWE-121", "CWE-122", "CWE-125
                             "CWE-242", "CWE-787"})
 
 
-# File types whose execution needs a foreign substrate: a Windows PE runs under wine, a class/jar
-# under the JVM. Neither can be batched, so each execution pays a fresh start-up.
-_FOREIGN_SUBSTRATE_TYPES = frozenset({"pe", "class", "jar", "jvm", "pyc", "wasm"})
+def _run_poc_diff(store, worklist, status, stop) -> None:
+    """Replay a PoC-bearing target's crashing inputs against a REBUILD of the same program.
+
+    This is the one stage that needs a PAIR, which is why nothing scheduled it: a single-target
+    case has no baseline. When a case does hold two builds of one program -- ingest the patched
+    binary beside the vulnerable one -- replaying the verified PoC across them turns "the static
+    findings differ" into "the exploit no longer reproduces", which is the only claim worth
+    making about a fix.
+
+    Gated on the SAME FILENAME with a different content hash, because that is what a rebuild
+    looks like. Without that gate a carved firmware's unrelated components would be compared to
+    each other and poc_diff would report the bug "fixed" in a program that never had it.
+    """
+    pd = PocDAO(store.conn)
+    builds: dict = {}
+    for tid in worklist:
+        t = store.targets.get(tid)
+        if t is None or not t.filename:
+            continue
+        builds.setdefault(t.filename, []).append(t)
+    for _name, group in builds.items():
+        if len(group) < 2:
+            continue
+        proven = [t for t in group
+                  if any(getattr(pc, "verified", False) for pc in pd.list_by_target(t.id))]
+        if not proven:
+            continue
+        baseline = proven[0]
+        for cand in group:
+            if stop.is_set():
+                return
+            if cand.id == baseline.id or cand.sha256 == baseline.sha256:
+                continue
+            _run_target_stage(store, cand, "poc_diff", status, stop,
+                              {"baseline_target_id": baseline.id})
 
 
 def _nonnative_image(target) -> bool:
     """Is this target something AFL fundamentally cannot instrument?
 
-    AFL rewrites/traces MACHINE CODE. Bytecode (.class/.jar/.pyc) and a wasm module are not
-    machine code -- the only machine code in the process belongs to the interpreter or the
-    engine, so instrumenting it measures coverage of the JVM, of CPython or of V8 and tells you
-    nothing about the target -- and a PE runs under wine rather than as a host process.
-    coverage_fuzz cannot apply to any of them; it has to be the blind campaign instead.
+    AFL rewrites/traces MACHINE CODE. Bytecode (.class/.jar/.pyc), a wasm module and a .NET
+    assembly are not machine code -- the only machine code in the process belongs to the
+    interpreter or the engine, so instrumenting it measures coverage of the JVM, of CPython, of
+    V8 or of the CLR and tells you nothing about the target. A PE is machine code but runs under
+    wine rather than as a host process, and a Mach-O or a bare-metal image does not run on this
+    host at all. coverage_fuzz cannot apply to any of them; it has to be the blind campaign.
+
+    Answered by the one substrate table because the hand-kept set this replaced missed `dotnet`
+    and `macho`, so the autopilot started an AFL campaign against CIL bytecode and against an
+    image the kernel refuses to exec.
+
     Distinct from _expensive_substrate, which includes a foreign ARCH: AFL++ qemu-mode
     genuinely does handle those, given afl-qemu-trace.
     """
-    return (getattr(target, "file_type", "") or "").lower() in _FOREIGN_SUBSTRATE_TYPES
+    ft = getattr(target, "file_type", "") or ""
+    if not substrate.known(ft):
+        return False                     # not yet triaged: do not block AFL on no evidence
+    sub = substrate.of(ft)
+    return not (sub.machine_code and sub.backend in (substrate.NATIVE, substrate.QEMU))
 
 
 def _expensive_substrate(target) -> bool:
@@ -456,7 +529,7 @@ def _expensive_substrate(target) -> bool:
     consume the entire budget.
     """
     try:
-        if (target.file_type or "").lower() in _FOREIGN_SUBSTRATE_TYPES:
+        if substrate.expensive(target.file_type):
             return True
         from .dynamic import sandbox
         return bool(target.arch) and target.arch != sandbox.host_arch()
@@ -624,6 +697,17 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict, stop: t
             _run_target_stage(store, t, "uaf_scan", status, stop)
             # A dangerous sink (system/popen, printf-family) called with a non-literal arg (CWE-78/134).
             _run_target_stage(store, t, "source_sink_scan", status, stop)
+            # Recover the CONSTANTS the program checks input against -- a password, magic bytes,
+            # an expected token, a menu command -- by breaking on its comparison functions. Those
+            # are the values every later stage needs in order to get PAST a gate, so this belongs
+            # before the campaigns, not after them. Native-arch + gdb only; self-gates.
+            _run_target_stage(store, t, "extract_secrets", status, stop)
+            # Package any hard-coded credential detect_cwe found (CWE-798/321) into a verified,
+            # self-contained PoC. It is the one demonstrated-effect class that needs NO crash --
+            # deterministic, offline, and it never executes the target, so it costs nothing and
+            # can never be starved by the fuzzing budget. It must follow detect_cwe, whose
+            # findings it promotes rather than duplicates.
+            _run_target_stage(store, t, "synthesize_secret", status, stop)
             # A SOCKET SERVER has to be fuzzed before anything else touches it. Such a target
             # blocks in accept() and never reads stdin, so every stage that drives it that way --
             # the injection prober, the crashless exploit ladder, the OOB-index driver, the generic
@@ -632,14 +716,23 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict, stop: t
             # three execs. It self-gates on bind/listen/recvfrom imports, so a non-server pays
             # nothing for being asked first.
             try:
-                from ..db.dao import CallEdgeDAO as _CE   # imported here: the module-level name
-                from .fuzz import netfuzz as _nf          # lives in _ranked_channels, not this scope
+                from ..db.dao import CallEdgeDAO as _CE  # imported here: the module-level name
+                from .fuzz import netfuzz as _nf  # lives in _ranked_channels, not this scope
                 _is_server = _nf.detect_server(_CE(store.conn).list_by_target(tid))[1]
             except Exception:
                 _log.debug("server detection failed for %s", tid, exc_info=True)
                 _is_server = False
             if _is_server:
                 _run_target_stage(store, t, "net_fuzz", status, stop)
+            # An IPC/protocol boundary (a unix socket, a pipe, a datagram listener) is a channel
+            # the generic fuzzers cannot reach at all: they drive stdin/argv/files. It discovers
+            # its own channel and declines when there is none, so a plain binary pays nothing.
+            _run_target_stage(store, t, "boundary_fuzz", status, stop)
+            # On a SOURCE target, an in-process libFuzzer harness under ASan+UBSan is the
+            # strongest crash finder available -- thousands of executions a second with a
+            # sanitizer oracle, against a few hundred for out-of-process mutation. It builds its
+            # own harness and reports unsupported for a binary-only target.
+            _run_target_stage(store, t, "libfuzzer", status, stop)
 
             # Weaponize every version-matched CVE -- a bespoke per-CVE trigger where one is
             # authored, else the library's format attack (zlib bomb, XML billion-laughs) and its
@@ -794,6 +887,14 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict, stop: t
                 _note_escalation(cve0, lvlb)             # build_exploit ran on this CVE crash's input
                 _run_target_stage(store, t, "behavior_trace", status, stop, rep)
                 _run_target_stage(store, t, "dynamic_taint", status, stop, rep)
+                # Follow fork/exec and blame the CHILD. A forking server or a target that
+                # execve()s a helper faults in a process the ordinary single-process capture
+                # never sees, so without this the crash is attributed to the parent or missed
+                # entirely. gdb-only and native-only; self-gates and says so.
+                _run_target_stage(store, t, "multi_debug", status, stop, rep)
+                # Break on the dangerous calls live and record the arguments they were actually
+                # reached with -- the runtime counterpart to the static sink findings.
+                _run_target_stage(store, t, "debug_monitor", status, stop, rep)
             for cve, lvl in cve_best.items():            # one CVE->exploit link per CVE, at its best
                 _record_cve_weaponized(store, t, cve, lvl)
             # Format-string -> shell WITHOUT a crash. A reachable printf(user) sink is an L3
@@ -876,6 +977,9 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict, stop: t
         if len(worklist) > 1 and not stop.is_set():
             for stage in ("link_case", "ipc_model", "cross_taint", "whole_system"):
                 _run_case_stage(store, case_id, stage, status, stop)
+            # Two builds of the same program in one case: re-run the proven exploit against the
+            # other one and say whether it still reproduces.
+            _run_poc_diff(store, worklist, status, stop)
         # Outcome.
         pd = PocDAO(store.conn)
         verified = any(p.verified for tid in worklist for p in pd.list_by_target(tid))

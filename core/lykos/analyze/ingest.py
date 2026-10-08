@@ -7,6 +7,7 @@ the stage into the job engine.
 """
 from __future__ import annotations
 
+import json
 import re
 import shutil
 import struct
@@ -186,6 +187,44 @@ def backfill_triage_denorm(store, target_id: str, run_id: str) -> bool:
         _apply_triage_denorm(store.targets, target_id, rec)
         return True
     return False
+
+
+def triage_record(conn, content, target) -> dict:
+    """The parsed `ingest_triage` JSON for one target, or {}.
+
+    Needed because a MANAGED target has no machine code: `disassemble` recovers no functions
+    and writes no call edges, so everything that infers something from the names a program
+    calls -- channel ranking above all -- had nothing to work with and fell back to a default.
+    The names are not lost, though. Triage reads them straight out of the constant pool /
+    metadata heaps / code object and records them here, where they name the APIs the program
+    calls in the clear.
+
+    `link.resolve` reads the same artifact for a whole case; this is the single-target query.
+    """
+    from ..db.dao import AnalysisRunDAO, ArtifactDAO, RunArtifactDAO
+    runs = [r for r in AnalysisRunDAO(conn).list_by_case(target.case_id)
+            if r.stage == INGEST_TRIAGE_STAGE and r.status == "done"
+            and r.target_id == target.id]
+    if not runs:
+        return {}
+    runs.sort(key=lambda r: (r.ended_at or 0), reverse=True)
+    ra, art = RunArtifactDAO(conn), ArtifactDAO(conn)
+    for link in ra.list_by_run(runs[0].id):
+        a = art.get(link.artifact_sha256)
+        if a and a.kind == "triage-json":
+            try:
+                rec = json.loads(content.get_bytes(a.sha256))
+            except Exception:                            # noqa: BLE001 -- absent is the answer
+                return {}
+            return rec if isinstance(rec, dict) else {}
+    return {}
+
+
+def triage_symbols(conn, content, target) -> list:
+    """The symbol names triage recorded for a target (its imports/metadata inventory)."""
+    rec = triage_record(conn, content, target)
+    syms = ((rec.get("imports") or {}).get("symbols")) or []
+    return [str(x) for x in syms if x]
 
 
 class NotAnalysable(ValueError):

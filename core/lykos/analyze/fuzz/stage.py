@@ -22,6 +22,7 @@ from pathlib import Path
 from ...db.dao import CallEdgeDAO, DynResultDAO, FindingDAO, FunctionDAO, StringDAO, TargetDAO
 from ...hashing import canonical_json
 from ...jobs.registry import register_stage
+from .. import substrate
 from ..dynamic import sandbox
 from ..dynamic.minimize import minimize
 from ..dynamic.stage import (
@@ -825,7 +826,8 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
                     extra = "(" + note_prefix + ("; " + note if note else "") + ")"
                     fd.upsert(target.id, target.case_id, crash_finding_candidate(
                         sig, input_sha, res.isolation, detector, extra,
-                        fault_pc=res.fault_pc, discriminator=defect_key, hijack=hj))
+                        fault_pc=res.fault_pc, discriminator=defect_key, hijack=hj,
+                        file_type=target.file_type))
                 elif seen_sigs[bucket] < _MAX_CRASH_ROWS:
                     # A campaign that finds a REPRODUCIBLE crash finds it thousands of times:
                     # 8,128 of 20,000 executions on jhead. Storing every one buries the case in
@@ -1159,8 +1161,16 @@ def fuzz_stage(ctx) -> dict:
     # about what the program READS: ncompress genuinely parses files, and its overflow is in
     # the filename it was handed on the command line. A campaign aimed at the wrong channel
     # does no work and reports a clean zero.
+    # On a managed target the call-edge inventory is empty (no machine code), so pass the
+    # names triage recovered from its metadata as well -- otherwise this ranks `arg` first for
+    # every jar, .pyc and .NET assembly and spends the budget on a channel it never reads.
+    _syms = ()
+    if substrate.is_managed(target.file_type):
+        from ..ingest import triage_symbols
+        _syms = triage_symbols(ctx.conn, ctx.content, target)
     channels = ([p["input_mode"]] if p.get("input_mode")
-                else modes_for(CallEdgeDAO(ctx.conn).list_by_target(target.id)))
+                else modes_for(CallEdgeDAO(ctx.conn).list_by_target(target.id),
+                               symbols=_syms))
     max_execs = int(p.get("max_execs", 3000))
     max_seconds = float(p.get("max_seconds", 30))
     exec_timeout = float(p.get("exec_timeout", 2))
@@ -1229,6 +1239,19 @@ def fuzz_stage(ctx) -> dict:
                 "access past the END of linear memory traps -- an overflow that stays inside it "
                 "corrupts the module's own data silently, so this substrate cannot see the "
                 "ordinary in-bounds buffer overflow at all.")})
+    if (target.file_type or "").lower() == "dotnet":
+        # Measured through the sandbox: 122 ms per execution (~8/s) -- the CLR bootstraps and
+        # JITs on every input. The dearest managed substrate here, though still eight times
+        # the PE/Wine path.
+        ctx.emit("fuzz.slow", payload={
+            "format": "dotnet", "note": (
+                "this is a .NET assembly: every execution pays CLR start-up and a fresh JIT "
+                "(~122 ms measured, roughly 8 executions/second against ~580/s native), with "
+                "no coverage feedback. A defect surfaces as an unhandled managed exception "
+                "rather than a signal, and the trace names the exception class and the method "
+                "-- with file:line when a PDB shipped. Budget hundreds of executions, not "
+                "millions, and lean on the metadata: #Strings names every type and method and "
+                "#US holds every string literal in the clear.")})
     strings = _strings_for(ctx, target)
     blocks = _recovered_blocks(ctx, target)
     flags = mine_flags(ctx.content.path(target.sha256).read_bytes())

@@ -276,12 +276,12 @@ def run_batch(exe, payloads, *, mode="stdin", base_argv=(), timeout: float = 2.0
     amortising the namespace, not by giving one up.
     """
     host = host or host_arch()
-    if (_is_pe(exe) or _is_jvm(exe) or _is_pyc(exe) or _is_wasm(exe)
+    if (_is_pe(exe) or _is_jvm(exe) or _is_pyc(exe) or _is_wasm(exe) or _is_dotnet(exe)
             or (arch and host and arch != host)):
-        # Wine, the JVM, CPython and qemu stay per-exec. The batch runner execs the target
-        # directly and traces it with ptrace; a jar or a .pyc is not executable and the
-        # interpreter is not the target, so batching it would run the wrong program under
-        # breakpoints meant for another.
+        # Wine, the JVM, CPython, the CLR and qemu stay per-exec. The batch runner execs the
+        # target directly and traces it with ptrace; a jar, a .pyc or a managed assembly is not
+        # executable and the runtime is not the target, so batching it would run the wrong
+        # program under breakpoints meant for another.
         return None
     py = shutil.which("python3")
     if not py or not _bwrap_usable() or not payloads:
@@ -1236,6 +1236,382 @@ def _run_wasm(exe, *, argv, stdin, timeout, mem_mb, capture) -> RunResult:
                      note=(None if not timed else "timed out"))
 
 
+# ---- .NET / CIL: a defect surfaces as an unhandled managed exception ----------------------
+#
+# Unhandled exception. System.IndexOutOfRangeException: Index was outside the bounds of the array.
+#    at Program.Lookup(Byte[] input) in /src/Program.cs:line 10
+#    at Program.Main(String[] args) in /src/Program.cs:line 22
+#
+# The same shape as the JVM and CPython paths, and read from stderr for the same reason: a
+# target that echoes its input would otherwise report a crash the moment a mutation contains
+# the word "Unhandled exception", and a mutator rewarded for crashes will produce that string
+# deliberately. The CLR's default handler always writes to stderr.
+#
+# A .NET assembly carried a worse failure than any of those before this path existed: it is a
+# PE, so `_is_pe` won the dispatch and it went to WINE, which cannot execute managed code
+# without Wine Mono. Nothing ran, and the run was reported `crashed=False` with no note -- a
+# clean verdict on a target that was never executed.
+_CLR_HDR_RE = re.compile(r"^Unhandled [Ee]xception[.:]\s*(.*)$", re.M)
+# The exception type, optionally namespaced, optionally with a message after a colon.
+_CLR_TYPE_RE = re.compile(r"([A-Za-z_][\w.]*?Exception)(?::\s*(.*))?$")
+# "   at Ns.Type.Method(ArgTypes) in /path/File.cs:line 42"  (the `in ...` part needs a PDB)
+_CLR_FRAME_RE = re.compile(r"^\s+at\s+(.+?)(?:\s+in\s+(.+?):line\s+(\d+))?\s*$", re.M)
+_CLR_FATAL_RE = re.compile(r"^Fatal error\.\s*(.*)$", re.M)
+# A managed exception type at the START of a line. Distinct from _CLR_TYPE_RE, which is
+# `$`-anchored for matching a single extracted string and so never matches mid-text.
+_CLR_BARE_EXC_RE = re.compile(r"^([A-Za-z_][\w.]*Exception)(?::|\s*$)", re.M)
+# The CLR cannot THROW for a blown stack -- it aborts the process. Report it as the exception
+# it corresponds to so the CWE table gives CWE-674 (uncontrolled recursion) rather than the
+# generic fatal-abort CWE-119, which would overstate it as memory corruption.
+_CLR_STACK_OVERFLOW = re.compile(r"^Stack overflow\.?$", re.M)
+
+# The host refusing to START the assembly. Every one of these is a NON-RUN, not a clean run:
+# the distinction is the whole point of this path existing.
+_CLR_NOT_RUNNABLE = (
+    "you must install or update .net",
+    "it was not possible to find any compatible framework version",
+    "the framework 'microsoft.netcore.app'",
+    "required to execute the application was not found",
+    "failed to run as a self-contained app",
+    "the application to execute does not exist",
+    "a fatal error was encountered",
+    "cannot use file stream for",
+    "badimageformatexception",                  # not a managed assembly after all
+    "could not load file or assembly",
+    "an assembly specified in the application dependencies manifest",
+    "no executable found matching command",
+    "could not execute because the specified command or file was not found",
+)
+
+
+def dotnet_exception(stderr: bytes, exit_code=None, stdout: bytes = b""):
+    """(kind, detail, frames) for an unhandled CLR fault.
+
+    Returns ("", reason, []) -- a FALSY kind WITH a reason -- when the host could not start the
+    assembly at all, so the caller can report a capability gap rather than a crash or, worse,
+    a clean run.
+    """
+    text = (stderr or b"").decode("utf-8", "replace")
+    low = text.lower()
+    for bad in _CLR_NOT_RUNNABLE:
+        if bad in low:
+            first = next((ln.strip() for ln in text.splitlines() if ln.strip()), bad)
+            return "", f"the .NET host could not start this assembly: {first[:200]}", []
+    frames = [(sig.strip(), f or "", int(n) if n else 0)
+              for sig, f, n in _CLR_FRAME_RE.findall(text)]
+    fatal = _CLR_FATAL_RE.search(text)
+    if fatal and exit_code not in (0, None):
+        # "Fatal error. Internal CLR error." / "Fatal error. System.AccessViolationException"
+        rest = (fatal.group(1) or "").strip()
+        inner = _CLR_TYPE_RE.search(rest)
+        if inner:
+            return inner.group(1).rsplit(".", 1)[-1], rest[:300], frames
+        from ..dotnet import _FATAL_PREFIX
+        word = re.sub(r"[^A-Za-z]+", "-", rest).strip("-").upper() or "ABORT"
+        return _FATAL_PREFIX + word[:40], f"the CLR aborted: {rest[:200]}", frames
+    if _CLR_STACK_OVERFLOW.search(text) and exit_code not in (0, None):
+        return "StackOverflowException", "the CLR aborted on a blown stack", frames
+    hdr = _CLR_HDR_RE.search(text)
+    if not hdr:
+        # A managed stack trace with NO "Unhandled exception." header did not come from the
+        # program -- it came from the `dotnet` CLI or the host failing before the entry point
+        # (a read-only HOME, a missing dependency, a corrupt assembly). The header is what the
+        # CLR's own unhandled-exception handler prints, so its absence is the discriminator.
+        # Without this rule such a failure returned "no fault" and the run read as clean.
+        if frames and exit_code not in (0, None) and _CLR_BARE_EXC_RE.search(text):
+            first = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
+            return "", (f"the .NET host failed before the program's entry point: "
+                        f"{first[:200]}"), []
+        return None, None, []
+    if exit_code in (0, None):
+        # Console.Error.Write of a formatted exception is byte-identical to the real thing, so
+        # as on the CPython path the exit code is the only discriminator. A program that
+        # handles its errors correctly exits 0.
+        return None, None, []
+    # An inner-exception chain prints "---> System.Inner: msg" lines after the outer one. The
+    # OUTERMOST is what reached the entry point and killed the process, so key on it and keep
+    # the whole header text as the detail.
+    hit = _CLR_TYPE_RE.search(hdr.group(1).strip())
+    if not hit:
+        return None, None, []
+    cls, msg = hit.group(1), (hit.group(2) or "").strip()
+    short = cls.rsplit(".", 1)[-1]
+    from ..dotnet import NOT_A_FAULT
+    if short in NOT_A_FAULT:
+        return "", f"not an input-driven fault: {short} is a cancellation, not a defect", []
+    return short, (f"{cls}: {msg}" if msg else cls)[:300], frames
+
+
+# A frame inside the framework itself is where the exception was THROWN; the deepest frame in
+# the assembly under test is where the defect lives. Blame that one.
+# `Interop+Sys.Foo()` is a nested type, hence the `+` as well as the `.`.
+_CLR_FRAMEWORK_FRAME = re.compile(r"^(?:System|Microsoft|Internal|Interop)[.+]")
+
+
+def app_frame_clr(frames):
+    """The deepest frame that is not framework code -- the site to blame."""
+    for sig, _f, _n in frames or ():
+        if not _CLR_FRAMEWORK_FRAME.match(sig):
+            return (sig, _f, _n)
+    return (frames[0] if frames else None)
+
+
+def clr_site(frames):
+    """A stable id for the fault site, standing in for a native fault PC.
+
+    Prefers file:line when a PDB was shipped, and falls back to the method signature, which is
+    always present. Without this two different defects in one assembly would share a fault_pc
+    and dedup into one finding.
+    """
+    fr = app_frame_clr(frames)
+    if not fr:
+        return None
+    key = f"{fr[1]}:{fr[2]}" if fr[1] else fr[0]
+    return int(hashlib.sha256(key.encode()).hexdigest()[:8], 16)
+
+
+def _dotnet() -> Optional[str]:
+    return shutil.which("dotnet")
+
+
+def _is_dotnet(path) -> bool:
+    """A managed .NET assembly: a PE whose optional-header data directory 14 (the CLI header)
+    is populated. MUST be tested BEFORE `_is_pe`, which every .NET assembly also satisfies."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(0x400)
+        if head[:2] != b"MZ":
+            return False
+        from ..dotnet import is_dotnet
+        return bool(is_dotnet(head))
+    except Exception:                                    # noqa: BLE001
+        return False
+
+
+_CLR_FRAMEWORK_VER: Optional[str] = None
+
+
+def _clr_framework_version() -> Optional[str]:
+    """The newest installed Microsoft.NETCore.App version, cached for the process."""
+    global _CLR_FRAMEWORK_VER
+    if _CLR_FRAMEWORK_VER is not None:
+        return _CLR_FRAMEWORK_VER or None
+    exe, best = _dotnet(), ""
+    if exe:
+        try:
+            out = subprocess.run([exe, "--list-runtimes"], capture_output=True,
+                                 timeout=60).stdout.decode("utf-8", "replace")
+            vers = [ln.split()[1] for ln in out.splitlines()
+                    if ln.startswith("Microsoft.NETCore.App ") and len(ln.split()) > 1]
+            best = max(vers, key=lambda v: [int(p) for p in re.findall(r"\d+", v)] or [0],
+                       default="")
+        except Exception:                                # noqa: BLE001
+            # An empty answer is handled by the caller, which reports a non-run with the
+            # reason. This module has no logger of its own, by the convention every other
+            # probe here follows.
+            best = ""
+    _CLR_FRAMEWORK_VER = best
+    return best or None
+
+
+def _clr_assembly(exe: Path):
+    """(path to hand `dotnet`, reason it is impossible).
+
+    The muxer dispatches on the `.dll` EXTENSION: given anything else it looks for a global
+    tool called `dotnet-<name>` and fails with "Could not execute because the specified
+    command or file was not found". An ingested target is staged under a generated name like
+    `target.bin`, so without this every single execution was a non-run. Link a `.dll` beside
+    it and run that; the assembly content is identical, so the fault still blames the real
+    method.
+    """
+    if exe.suffix.lower() == ".dll":
+        return exe, None
+    dll = exe.with_suffix(".dll")
+    try:
+        if not dll.exists():
+            try:
+                os.link(exe, dll)                        # same filesystem: no copy
+            except OSError:
+                shutil.copy2(exe, dll)
+        return dll, None
+    except OSError as e:
+        return exe, f"could not stage a .dll name for the assembly: {e}"
+
+
+def _ensure_runtimeconfig(exe: Path) -> Optional[str]:
+    """A framework-dependent assembly needs `<stem>.runtimeconfig.json` BESIDE it to start.
+
+    An ingested single .dll never has one, so every execution would fail with "Failed to run as
+    a self-contained app" -- a universal non-run that this path would correctly but uselessly
+    report on every input. The host tells us exactly what is missing, so synthesize the minimal
+    file against the installed framework. Returns a reason string when that is not possible.
+    """
+    cfg = exe.with_suffix(".runtimeconfig.json")
+    if cfg.exists():
+        return None
+    ver = _clr_framework_version()
+    if not ver:
+        return "no Microsoft.NETCore.App runtime is installed to run a .NET assembly"
+    tfm = ".".join(ver.split(".")[:2])
+    try:
+        cfg.write_text(json.dumps({"runtimeOptions": {
+            "tfm": f"net{tfm}",
+            "framework": {"name": "Microsoft.NETCore.App", "version": ver}}}))
+    except OSError as e:
+        return f"could not write {cfg.name} beside the assembly: {e}"
+    return None
+
+
+# DOTNET_* flags that keep the runtime quiet, offline and deterministic enough to fuzz:
+# no telemetry callouts, no first-run package extraction, no diagnostic IPC socket in the
+# sandbox, and an invariant culture so no ICU data is needed.
+_CLR_ENV = {
+    "DOTNET_CLI_TELEMETRY_OPTOUT": "1",
+    "DOTNET_NOLOGO": "1",
+    "DOTNET_SKIP_FIRST_TIME_EXPERIENCE": "1",
+    "DOTNET_EnableDiagnostics": "0",
+    "DOTNET_SYSTEM_GLOBALIZATION_INVARIANT": "1",
+    "DOTNET_gcServer": "0",
+}
+
+_CLR_HOME: Optional[str] = None
+
+
+def _clr_home() -> str:
+    """A writable HOME for the `dotnet` muxer, created once per process.
+
+    The CLI insists on creating `$HOME/.dotnet` for its first-run sentinel. Pointing HOME at
+    the assembly's own directory -- which the sandbox binds READ-ONLY -- made every execution
+    die with `System.IO.IOException: Read-only file system` before reaching the program, and
+    because that trace carries no "Unhandled exception." header it read as a clean run.
+    """
+    global _CLR_HOME
+    if _CLR_HOME is None:
+        _CLR_HOME = tempfile.mkdtemp(prefix="lykos-clrhome-")
+    return _CLR_HOME
+
+
+def _run_dotnet(exe, *, argv, stdin, timeout, mem_mb, capture) -> RunResult:
+    """Run a .NET assembly under the CLR.
+
+    There is no entry-point recovery to do (the assembly names its own), but unlike a .pyc an
+    ingested assembly needs TWO things staged beside it or every execution is a non-run: a
+    `.dll` filename, because the `dotnet` muxer dispatches on that extension and otherwise
+    hunts for a global tool called `dotnet-<name>`, and a `<stem>.runtimeconfig.json`, because
+    a framework-dependent assembly will not start without one. An ingested target has neither
+    -- it arrives as a single file under a generated name. The host names both in its own
+    error message, so both are derived rather than guessed.
+    """
+    net = _dotnet()
+    if not net:
+        return RunResult(isolation="dotnet-missing",
+                         note="no `dotnet` found to run a .NET assembly (the CLI header, the "
+                              "metadata names and the #US strings still parse without one)")
+    # Resolve: bwrap chdirs into the sandbox, so a relative path would not exist there and the
+    # host would report "The application to execute does not exist" on every input.
+    exe = Path(exe).resolve()
+    exe, why = _clr_assembly(exe)
+    if not why:
+        why = _ensure_runtimeconfig(exe)
+    if why:
+        return RunResult(isolation="dotnet-missing", note=why)
+    cmd = [net, str(exe)] + [argv_bytes(a) for a in argv]
+    eff_timeout = max(timeout, 10.0)                     # the CLR bootstraps in ~70 ms
+    preexec = _rlimits(max(mem_mb, 2048), int(eff_timeout) + 2, set_as=False,
+                       nproc=_nproc_cap(True))           # the CLR is threaded; don't cap AS
+    home = _clr_home()
+    env = {**os.environ, **_CLR_ENV, "HOME": home, "DOTNET_CLI_HOME": home}
+    iso = "rlimits-only+clr"
+    run = cmd
+    if _bwrap_usable():
+        exedir = str(exe.parent)
+        # The runtime tree must be readable too, or the host cannot find libhostpolicy.so.
+        shared = [p for p in (os.path.dirname(os.path.realpath(net)), "/usr/share/dotnet",
+                              "/usr/lib/dotnet") if os.path.isdir(p)]
+        binds = []
+        for d in dict.fromkeys(shared):
+            binds += ["--ro-bind", d, d]
+        run = (["bwrap"] + _BWRAP_ARGS[:-1] + _secret_mask_args()
+               + ["--ro-bind", exedir, exedir] + binds
+               + ["--bind", home, home] + ["--"] + cmd)
+        iso = "bwrap+netns+clr"
+    rc, out, err, timed, dur = _spawn(run, stdin, eff_timeout, preexec, env=env)
+    if (iso.startswith("bwrap") and not timed and err.startswith(b"bwrap:")
+            and not _bwrap_probe_fresh()):
+        rc, out, err, timed, dur = _spawn(cmd, stdin, eff_timeout, preexec, env=env)
+        iso = "rlimits-only+clr"
+    kind, detail, frames = dotnet_exception(err, rc, out)
+    crashed = bool(kind)
+    if kind == "":
+        # The host refused the assembly. Not a crash, and NOT a clean run either.
+        iso += "/not-runnable"
+    return RunResult(
+        isolation=iso, crashed=crashed, timed_out=timed,
+        exit_code=(None if crashed else rc), signal=None, signal_name=(kind or None),
+        stdout=out[:capture], stderr=err[:capture], duration_ms=dur, cmd=run,
+        fault_pc=clr_site(frames) if crashed else None,
+        note=(detail if (crashed or kind == "") else (None if not timed else "timed out")))
+
+
+# ---- "did it run at all?" on the NATIVE path ---------------------------------------------
+#
+# Every other substrate here reports a non-run explicitly: `jvm-missing`, `python-missing`,
+# `node-missing`, `dotnet-missing`, `unsupported-arch`, `unsupported-windows`,
+# `wine-launch-failed`, and the `/not-runnable` suffix on the managed paths. The native path
+# had NO such signal, and it is the fall-through for every file_type without a backend of its
+# own -- a Mach-O (which triage marks `analyzable`), a raw blob, a bare-metal image, a
+# truncated or corrupt ELF.
+#
+# What happened instead: glibc's execvp() falls back to /bin/sh when execve returns ENOEXEC,
+# so an unrunnable image produced `rc=127`, stderr `"<path>: 1: <magic bytes>: not found"`,
+# and a RunResult of `crashed=False, note=None` -- indistinguishable on screen from a program
+# that ran correctly and found nothing. A whole campaign could complete against a Mach-O and
+# report it clean.
+_SHEBANG = b"#!"
+_ELF = b"\x7fELF"
+# execvp's /bin/sh fallback, and the direct-exec errors, for the post-hoc check.
+_EXEC_FAIL_MARKERS = (
+    b"exec format error", b"cannot execute binary file", b"cannot execute:",
+    b": not found", b"no such file or directory", b"permission denied",
+    b"accel is not enabled",
+)
+
+
+def _host_loadable(exe) -> Optional[str]:
+    """None if the host loader can start this image, else WHY it cannot.
+
+    Only two things the kernel will exec: an ELF (for any architecture -- a foreign one is
+    handled by qemu above) and a script with a `#!` interpreter line. Anything else is not a
+    program on this host, and saying so beats letting execvp's shell fallback turn it into a
+    silent `rc=127` clean run.
+    """
+    try:
+        with open(exe, "rb") as f:
+            head = f.read(4)
+    except OSError as e:
+        return f"cannot read the image: {e}"
+    if not head:
+        return "the image is empty -- there is nothing to execute"
+    if head.startswith(_SHEBANG) or head == _ELF:
+        return None
+    return ("this is not an executable image on this host: the kernel can exec an ELF or a "
+            f"`#!` script, and this file begins {head[:4]!r}. Header analysis and the static "
+            "detectors still apply; execution does not")
+
+
+def _exec_failed(rc: int, err: bytes) -> bool:
+    """Post-hoc: did the process never actually start?
+
+    `rc == 127` is the shell's "command not found", which is what execvp's ENOEXEC fallback
+    produces, and 126 is "found but not executable". Require a marker as well so a target that
+    legitimately exits 127 is not mistaken for a non-run.
+    """
+    if rc not in (126, 127):
+        return False
+    low = (err or b"").lower()
+    return any(m in low for m in _EXEC_FAIL_MARKERS)
+
+
 def _wine() -> Optional[str]:
     # Debian ships the binary as `wine-stable` (or `wine-development`) and exposes `wine` only as
     # an update-alternatives symlink -- which does NOT travel in the relocatable offline bundle,
@@ -1308,9 +1684,15 @@ def _run_windows(exe, *, argv, stdin, timeout, mem_mb, capture, wineprefix) -> R
     # a launch failure (esp. a 32-bit PE with no i386 WoW64 runtime) must not read as a clean run.
     # key only on the loader's "failed to load" message (a bare c0000135 is a benign DLL-probe miss)
     low = (err or b"").lower()
-    if not crashed and b"wine: failed to load" in low:
+    # `mscoree`/Wine Mono: a MANAGED assembly reached the wine path. _run_dotnet now claims
+    # those first, so this is the belt-and-braces case (a managed image whose CLI header we
+    # failed to recognise). Without it the run reported crashed=False with no note at all.
+    mono = b"wine mono is not installed" in low or b"mscoree" in low
+    if not crashed and (b"wine: failed to load" in low or mono):
         wow = b"syswow64" in low or b"wine32" in low
         note = "wine could not launch this PE" + (
+            " -- it is a .NET/managed assembly and this wine has no Mono; run it under the "
+            "CLR (`dotnet`) instead" if mono else
             " -- it is 32-bit; install the i386 WoW64 runtime (wine32:i386)" if wow else "")
         return RunResult(isolation="wine-launch-failed", crashed=False, timed_out=timed,
                          exit_code=rc, stdout=(out or b"")[:capture],
@@ -1334,6 +1716,12 @@ def run(exe, *, argv=(), stdin: bytes = b"", timeout: float = 10.0,
     was running blind on output shape alone -- eleven of the twelve architectures the platform
     builds real targets for. qemu logs the guest PC of each translated block itself."""
     host = host or host_arch()
+    # ORDER MATTERS: a .NET assembly satisfies _is_pe too, and wine cannot execute managed code
+    # without Wine Mono -- which reported `crashed=False` with no note, a clean verdict on a
+    # target that never ran. The managed test has to come first.
+    if _is_dotnet(exe):                                 # .NET assembly -> the CLR
+        return _run_dotnet(exe, argv=argv, stdin=stdin, timeout=timeout, mem_mb=mem_mb,
+                           capture=capture)
     if _is_pe(exe):                                     # Windows PE -> Wine substrate
         return _run_windows(exe, argv=argv, stdin=stdin, timeout=timeout, mem_mb=mem_mb,
                             capture=capture, wineprefix=wineprefix)
@@ -1353,6 +1741,12 @@ def run(exe, *, argv=(), stdin: bytes = b"", timeout: float = 10.0,
             return RunResult(isolation="unsupported-arch",
                              note=f"no qemu-user for {arch} ({endianness or '?'}-endian) "
                                   f"on {host}")
+
+    # Before spawning: can the host loader start this image AT ALL? Asking first is what makes
+    # "nothing was run" distinguishable from "nothing was found" on this path.
+    unloadable = _host_loadable(exe)
+    if unloadable:
+        return RunResult(isolation="not-runnable", crashed=False, note=unloadable)
 
     base = [str(exe)] + [argv_bytes(a) for a in argv]
     trace_log = None
@@ -1448,6 +1842,15 @@ def run(exe, *, argv=(), stdin: bytes = b"", timeout: float = 10.0,
         # wrappers (bwrap/qemu) report 128+signum, and the two had drifted apart here.
         crashed, sig, sig_name, exit_code = classify_rc(rc)
         note, fault_pc, blocks_hit = None, None, None
+        if not crashed and not timed and _exec_failed(rc, err):
+            # It passed the header check but still never started -- a missing ELF interpreter,
+            # a corrupt program header, a qemu that declined the image. Same rule as above:
+            # a non-run is reported as one, never as a clean run.
+            return RunResult(isolation=iso + "/not-runnable", crashed=False, exit_code=rc,
+                             stdout=out[:capture], stderr=err[:capture], duration_ms=dur,
+                             cmd=cmd,
+                             note="the image never executed (the loader refused it); "
+                                  "nothing was run, which is not the same as nothing found")
         if trace_log:
             reached, last = _qemu_reached(trace_log, blocks, want_last=True)
             note = ",".join(str(x) for x in reached) or None
