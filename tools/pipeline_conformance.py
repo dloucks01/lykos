@@ -58,6 +58,13 @@ class Case:
     # Toolchain prefix for a cross-architecture case ("aarch64-linux-gnu-"); the case SKIPS when the
     # cross compiler is absent rather than failing the gate on a machine that cannot build it.
     cross: str = ""
+    # FRONT-END check: triage must identify the container as this file_type. With want_level 0 and no
+    # want_cwe it is the WHOLE assertion, and the case then needs only ingest+triage -- no autopilot --
+    # which is both the honest claim (these formats demonstrate no effect yet) and nearly free to run.
+    want_file_type: str = ""
+    # How the artifact is produced, when a C compiler cannot: (argv-list, output-name). Runs in the
+    # case directory; SKIPS when the first command is unavailable.
+    build: tuple = ()
 
 
 _CASES: list[Case] = [
@@ -478,6 +485,137 @@ int main(void){ setvbuf(stdout,0,2,0);
          cross="powerpc64le-linux-gnu-", budget=420.0,
          note="ARCH ppc64le (static, qemu-ppc64le)"),
 
+    # ---- FILE FORMATS / FRONT-ENDS. The platform parses PE, JVM, CPython bytecode, WASM and
+    # UPX-packed ELF, but every case above is a plain ELF, so a front-end could stop recognising its
+    # container entirely without the gate noticing. These assert the one property the probe shows
+    # actually holds today: the container is identified and routed to the right triage. They
+    # deliberately do NOT claim a demonstrated effect -- triage/disassemble/detect produce no
+    # findings on these artifacts yet, so asserting one would just be a standing red mark. Each
+    # needs only ingest+triage, so it costs seconds rather than a budget.
+    Case("fmt_pe", _OVERFLOW_SRC,
+         ["-fno-stack-protector", "-O0", "-w"],
+         want_level=0, want_cwe=(), want_file_type="pe",
+         cross="x86_64-w64-mingw32-", budget=120.0,
+         note="FRONT-END PE (mingw): identified as a Windows PE, x86-64"),
+
+    Case("fmt_jvm_class", "",
+         [], want_level=0, want_cwe=(), want_file_type="class", budget=120.0,
+         build=(["sh", "-c",
+                 "printf 'public class Boom{public static void main(String[] a){int[] x=new int[4];"
+                 "System.out.println(x[Integer.parseInt(a.length>0?a[0]:\"9\")]);}}' > Boom.java && "
+                 "javac Boom.java"], "Boom.class"),
+         note="FRONT-END JVM: a .class is identified as JVM bytecode, not a native image"),
+
+    Case("fmt_pyc", "",
+         [], want_level=0, want_cwe=(), want_file_type="pyc", budget=120.0,
+         build=(["sh", "-c",
+                 "printf 'import sys\nd={}\nprint(d[sys.argv[1]])\n' > m.py && "
+                 "python3 -m py_compile m.py"], "m.*.pyc"),
+         note="FRONT-END CPython bytecode: a .pyc is identified as pyc / cpython-bytecode"),
+
+    Case("fmt_wasm", "",
+         [], want_level=0, want_cwe=(), want_file_type="wasm", budget=120.0,
+         build=(["sh", "-c",
+                 "printf 'static char buf[64];\n__attribute__((export_name(\"copy\"))) "
+                 "void copy(const char *s,int n){for(int i=0;i<n;i++) buf[i]=s[i];}\n' > w.c && "
+                 "clang --target=wasm32 -nostdlib -Wl,--no-entry -O0 -o w.wasm w.c"], "w.wasm"),
+         note="FRONT-END WASM: a wasm32 module is identified as wasm (an unbounded copy inside)"),
+
+    Case("fmt_upx_packed", "",
+         [], want_level=0, want_cwe=(), want_file_type="elf", budget=120.0,
+         build=(["sh", "-c",
+                 "printf '#include <stdio.h>\nint main(){char b[64];scanf(\"%%s\",b);"
+                 "printf(\"%%s\",b);return 0;}\n' > u.c && "
+                 "gcc -no-pie -fno-stack-protector -O0 -w u.c -o u_native && "
+                 "upx -q -o u_packed u_native >/dev/null"], "u_packed"),
+         note="FRONT-END UPX: a runtime-packed ELF is still identified as an ELF (the unpack stage "
+              "then carves the real program out of the decompressor stub)"),
+
+    # ---- BUG CLASSES with no case of their own. Each is a distinct defect the platform claims to
+    # find; without these only overflow/format/UAF were ever asserted.
+    Case("double_free",
+         r"""#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+int main(void){ setvbuf(stdout,0,2,0);
+  char *p[8]; int n=0;
+  for(;;){ printf("1.alloc 2.free 3.exit\n> ");
+    int o; if(scanf("%d",&o)!=1) return 0; getchar();
+    if(o==1){ if(n<8){ p[n]=malloc(0x80); memset(p[n],'A',8); n++; } }
+    else if(o==2){ int i; printf("idx: "); if(scanf("%d",&i)!=1) return 0; getchar();
+                   if(i>=0&&i<n) free(p[i]); }      /* not nulled: freeing twice is a double free */
+    else return 0; } }""",
+         ["-fPIE", "-pie", "-O0", "-w"],
+         want_level=0, want_cwe=("CWE-415", "CWE-416"), budget=300.0,
+         note="BUG CLASS double free (CWE-415): the slot is never nulled, so two frees of one index"),
+
+    Case("int_overflow_alloc",
+         r"""#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+int main(void){ setvbuf(stdout,0,2,0);
+  unsigned n; printf("count: ");
+  if(scanf("%u",&n)!=1) return 0;
+  /* n*16 wraps for a large n, so a huge count allocates a tiny buffer and the loop runs off it */
+  char *p = malloc(n * 16);
+  if(!p) return 1;
+  for(unsigned i=0;i<n;i++) memset(p + i*16, 'A', 16);
+  printf("ok %u\n", n); free(p); return 0; }""",
+         ["-no-pie", "-fno-stack-protector", "-O0", "-w"],
+         want_level=0, want_cwe=("CWE-190", "CWE-131", "CWE-122", "CWE-787", "CWE-119"),
+         budget=300.0,
+         note="BUG CLASS integer overflow feeding an allocation (CWE-190/131)"),
+
+    Case("off_by_one",
+         r"""#include <stdio.h>
+#include <string.h>
+int main(void){ char b[64]; int i;
+  printf("in: ");
+  for(i=0; i<=64; i++){ int c=getchar(); if(c<0||c=='\n') break; b[i]=(char)c; }
+  b[i]=0;                                   /* <=64 writes one past the end, then NUL past that */
+  printf("hi %s\n", b); return 0; }""",
+         ["-no-pie", "-fno-stack-protector", "-O0", "-w"],
+         want_level=0, want_cwe=("CWE-787", "CWE-121", "CWE-119", "CWE-193"), budget=300.0,
+         note="BUG CLASS off-by-one / single-byte overflow (CWE-193/787)"),
+
+    Case("oob_index_write",
+         r"""#include <stdio.h>
+long table[16];
+int main(void){ setvbuf(stdout,0,2,0);
+  for(;;){ printf("1.set 2.get 3.exit\n> ");
+    int o; if(scanf("%d",&o)!=1) return 0;
+    if(o==1){ long i,v; printf("idx: "); if(scanf("%ld",&i)!=1) return 0;
+              printf("val: "); if(scanf("%ld",&v)!=1) return 0;
+              table[i]=v; }                 /* index never bounded: an arbitrary relative write */
+    else if(o==2){ long i; printf("idx: "); if(scanf("%ld",&i)!=1) return 0;
+                   printf("%ld\n", table[i]); }
+    else return 0; } }""",
+         ["-no-pie", "-fno-stack-protector", "-O0", "-w"],
+         want_level=0, want_cwe=("CWE-129", "CWE-787", "CWE-125", "CWE-119"), budget=300.0,
+         note="BUG CLASS out-of-bounds INDEX write (CWE-129): unbounded index into a global table"),
+
+    Case("format_read_leak",
+         r"""#include <stdio.h>
+int main(void){ setvbuf(stdout,0,2,0);
+  char f[128]; char secret[32] = "SECRET-ON-THE-STACK";
+  printf("say: ");
+  if(!fgets(f,sizeof f,stdin)) return 0;
+  printf(f);                                 /* user-controlled format: %p/%s READ, not a write */
+  printf("\n"); return 0; }""",
+         ["-no-pie", "-fno-stack-protector", "-O0", "-w"],
+         want_level=0, want_cwe=("CWE-134", "CWE-200"), budget=300.0,
+         note="BUG CLASS format-string READ/disclosure (CWE-134/200) -- the gate only had the %n WRITE"),
+
+    Case("uninit_stack_read",
+         r"""#include <stdio.h>
+#include <string.h>
+static void fill(void){ char pad[64]; memset(pad,'S',sizeof pad); }
+static void leak(void){ char b[64]; printf("%.64s\n", b); }   /* never initialised */
+int main(void){ setvbuf(stdout,0,2,0); fill(); leak(); return 0; }""",
+         ["-no-pie", "-fno-stack-protector", "-O0", "-w"],
+         want_level=0, want_cwe=("CWE-457", "CWE-200", "CWE-908"), budget=240.0,
+         note="BUG CLASS use of uninitialised stack memory (CWE-457/908) -> disclosure"),
+
     # ---- MULTIPLE DEFECTS. Every case above asserts ONE effect on one target; the mission claim is
     # "find EVERY crash", so this binary carries two unrelated bugs behind a menu and both must be
     # demonstrated.
@@ -532,10 +670,16 @@ def _verdict(s, target, case):
     return maxlvl, demod, fs
 
 
-def _scored(maxlvl, demod, case):
+def _scored(maxlvl, demod, case, file_type=None):
     """Did this case pass, and is it finished? `done` gates the early stop, so it must never be true
     before the case has shown everything it asserts -- otherwise the run is cut short of its own
     claim (which is how an earlier version let a format case 'pass' at L1)."""
+    if case.want_file_type:                              # front-end: did triage route it correctly?
+        ft_ok = (file_type or "").lower() == case.want_file_type.lower()
+        if not (case.want_level or case.want_cwe):
+            return ft_ok, ft_ok                          # identification IS the whole assertion
+        if not ft_ok:
+            return False, False
     if case.clean:                                       # precision: nothing may be demonstrated
         return (maxlvl == 0 and not demod), False        # never stop early -- absence needs the time
     if case.want_all_cwe:                                # every listed defect must be demonstrated
@@ -560,13 +704,26 @@ def _run_case(case: Case, gcc: str) -> Result:
     (d / "t.c").write_text(case.src)
     exe = d / case.name
     cc = gcc
-    if case.cross:                                       # cross-arch case: needs its own toolchain
-        cc = shutil.which(case.cross + "gcc") or ""
-        if not cc:
-            return Result(case.name, True, profile="SKIP", reason="no %sgcc" % case.cross)
-    if subprocess.run([cc, *case.cflags, str(d / "t.c"), "-o", str(exe)],
-                      capture_output=True).returncode:
-        return Result(case.name, False, reason="BUILD FAILED (skip)")
+    if case.build:                                       # produced by something other than a C compiler
+        argv, out = case.build
+        if not shutil.which(argv[0]):
+            return Result(case.name, True, profile="SKIP", reason="no %s" % argv[0])
+        if subprocess.run(list(argv), capture_output=True, cwd=str(d)).returncode:
+            return Result(case.name, False, reason="BUILD FAILED (%s)" % argv[0])
+        produced = sorted(d.rglob(out))
+        if not produced:
+            return Result(case.name, False, reason="BUILD produced no %s" % out)
+        exe = produced[0]
+    else:
+        if case.cross:                                   # cross-arch case: needs its own toolchain
+            cc = shutil.which(case.cross + "gcc") or ""
+            if not cc:
+                return Result(case.name, True, profile="SKIP", reason="no %sgcc" % case.cross)
+        if subprocess.run([cc, *case.cflags, str(d / "t.c"), "-o", str(exe)],
+                          capture_output=True).returncode:
+            return Result(case.name, False, reason="BUILD FAILED (skip)")
+        if not exe.exists() and exe.with_suffix(".exe").exists():
+            exe = exe.with_suffix(".exe")                # mingw appends .exe to a bare -o name
     register()
     s = CaseStore.open(d / "case"); c = s.cases.create(case.name)
     pool = WorkerPool(s.db_path, s.content, JobConfig(workers=3, poll_interval=0.02)); pool.start()
@@ -577,6 +734,13 @@ def _run_case(case: Case, gcc: str) -> Result:
         tg = TargetDAO(s.conn).get(t.id); mit = tg.mitigations or {}
         prof = "%s pie=%s can=%s relro=%s" % ((tg.arch or "?")[:7], mit.get("pie", "?"),
                                               mit.get("canary", "?"), (mit.get("relro", "?") or "?")[:4])
+        if case.want_file_type and not (case.want_level or case.want_cwe):
+            ok, _ = _scored(0, [], case, file_type=tg.file_type)
+            return Result(case.name, ok, "%s %s" % (prof, tg.file_type),
+                          [("triage", tg.file_type or "?", tg.arch or "?")],
+                          int(time.time() - t0),
+                          "" if ok else "want file_type %r; triaged as %r" % (
+                              case.want_file_type, tg.file_type))
         status = {}; stop = threading.Event()
         th = threading.Thread(target=run_case_autopilot, args=(d / "case", c.id, [t.id], status, stop),
                               daemon=True)
@@ -598,13 +762,13 @@ def _run_case(case: Case, gcc: str) -> Result:
                 ml, dm, _ = _verdict(s, t, case)
             except Exception:                            # noqa: BLE001 -- a transient DB lock; retry
                 continue
-            if _scored(ml, dm, case)[1]:
+            if _scored(ml, dm, case, file_type=tg.file_type)[1]:
                 early = True
                 break
         if th.is_alive():
             stop.set(); th.join(timeout=60)
         maxlvl, demod, fs = _verdict(s, t, case)
-        ok, _ = _scored(maxlvl, demod, case)
+        ok, _ = _scored(maxlvl, demod, case, file_type=tg.file_type)
         shown = demod or [(f.detector, f.cwe, (f.title or "")[:30]) for f in fs]
         if ok:
             why = ""
