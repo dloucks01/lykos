@@ -5,6 +5,11 @@ tags: **[DONE]** shipped & verified, **[WIP]** in progress this stream, **[PLANN
 direction, not started. Everything here is deterministic / zero-AI (doc 15 §5). Roadmap phase
 notes (doc 13) carry the authoritative "what shipped"; this doc is the forward queue.
 
+> **Newer queue:** the 2026-10 audit stream (budget/baseline/scorecard/CLI, delivery channels,
+> emulator routing, the uninit-memory oracle) is tracked in
+> [32-next-steps-2026-10-09.md](32-next-steps-2026-10-09.md), which supersedes this doc for
+> anything about behaviour on *arbitrary* binaries. The items below remain open as recorded.
+
 > **doc 30 implementation (Phases 0–5) — complete 2026-10.** The sequenced plan in
 > [30-missing-capabilities-implementation-plan.md](30-missing-capabilities-implementation-plan.md)
 > was worked end to end; see it for each item's status. Shipped: CI eval-gate + per-arch scoring +
