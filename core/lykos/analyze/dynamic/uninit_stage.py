@@ -101,7 +101,7 @@ def mem_oracle_stage(ctx) -> dict:
                              f"a {(target.file_type or 'non-native').upper()} target "
                              f"({sub.no_exec or 'it does not execute as a host process'})")
     host = sandbox.host_arch()
-    if target.arch and host and target.arch != host:
+    if substrate.foreign_cpu(target.arch, target.file_type, host):
         return _decline(ctx, f"memcheck runs the target natively (target {target.arch}, host "
                              f"{host}); a cross-arch shadow-memory oracle is not available here")
     if memoracle.valgrind_bin() is None:

@@ -21,6 +21,7 @@ import secrets
 
 from ...db.dao import CallEdgeDAO, FindingDAO, TargetDAO
 from ...jobs.registry import register_stage
+from .. import substrate
 from ..detect.catalog import normalize
 from ..dynamic import sandbox
 from ..fuzz.runner import place
@@ -88,7 +89,7 @@ def taint_stage(ctx) -> dict:
                  "note": f"dynamic taint runs Linux ELF only (this target is {fmt.upper()})"})
         ctx.progress(pct=100, msg="taint not supported for this format")
         return {}
-    emulated = bool(target.arch and target.arch != host)
+    emulated = substrate.foreign_cpu(target.arch, target.file_type, host)
     if emulated and not qemu_gdb.breakpoints_supported(target.arch):
         ctx.emit("taint.done", payload={"ok": False, "supported": False,
                  "note": f"no cross-arch monitor for {target.arch}"})

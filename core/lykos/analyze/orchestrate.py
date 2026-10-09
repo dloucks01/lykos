@@ -433,7 +433,8 @@ def _ranked_channels(store, target_id):
         tgt = TargetDAO(store.conn).get(target_id)
         if tgt is not None and substrate.is_managed(tgt.file_type):
             syms = triage_symbols(store.conn, store.content, tgt)
-        chans = modes_for(CallEdgeDAO(store.conn).list_by_target(target_id), symbols=syms)
+        chans = modes_for(CallEdgeDAO(store.conn).list_by_target(target_id), symbols=syms,
+                          file_type=getattr(tgt, "file_type", None))
         return chans or ["stdin", "arg", "file"]
     except Exception:
         _log.debug("channel inference failed for %s", target_id, exc_info=True)
@@ -542,7 +543,7 @@ def _expensive_substrate(target) -> bool:
         if substrate.expensive(target.file_type):
             return True
         from .dynamic import sandbox
-        return bool(target.arch) and target.arch != sandbox.host_arch()
+        return substrate.foreign_cpu(target.arch, target.file_type, sandbox.host_arch())
     except Exception:                                    # noqa: BLE001 -- ordering hint only
         _log.debug("substrate-cost check failed", exc_info=True)
         return False

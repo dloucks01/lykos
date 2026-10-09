@@ -941,7 +941,33 @@ def _jvm_class_entry(exe: Path, main_class=None):
         return str(exe.parent), exe.stem
 
 
-def _run_java(exe, *, argv, stdin, timeout, mem_mb, capture, main_class=None) -> RunResult:
+def _env_for_runtime(env_overrides, extra=None, pinned=None):
+    """The child environment for a NON-NATIVE runner, with the environment CHANNEL applied.
+
+    `run()` dispatches to a managed runtime at the very top and built its environment much
+    further down, in the native path -- so `env_overrides`, the environment as an input channel,
+    was silently dropped for every jar, .class, .pyc, .NET assembly and wasm module. The channel
+    is real on all of them: each runs as an ordinary host process, and the program reads
+    `System.getenv` / `os.environ` / `Environment.GetEnvironmentVariable` / WASI `environ_get`
+    exactly as a native target reads `getenv`. A crash delivered that way could therefore not
+    even be REPLAYED on a managed target, which reports as "did not reproduce" -- a real finding
+    retracted by a plumbing gap.
+
+    `pinned` wins over the overrides, and only ever holds the few variables that decide whether
+    the runtime STARTS (the CLR's writable HOME). Letting a mutated value take those turns a
+    delivered input into a universal non-run, which is the failure that looks like a clean pass.
+    """
+    if not env_overrides and not extra and not pinned:
+        return None                                      # inherit, exactly as before
+    env = dict(os.environ)
+    env.update(extra or {})
+    env.update({str(k): v for k, v in (env_overrides or {}).items()})
+    env.update(pinned or {})
+    return env
+
+
+def _run_java(exe, *, argv, stdin, timeout, mem_mb, capture, main_class=None,
+              env_overrides=None) -> RunResult:
     java = _java()
     if not java:
         return RunResult(isolation="jvm-missing",
@@ -964,12 +990,13 @@ def _run_java(exe, *, argv, stdin, timeout, mem_mb, capture, main_class=None) ->
         run = (["bwrap"] + _BWRAP_ARGS[:-1] + _secret_mask_args()
                + ["--ro-bind", exedir, exedir] + ["--"] + cmd)
         iso = "bwrap+netns+jvm"
-    rc, out, err, timed, dur = _spawn(run, stdin, eff_timeout, preexec)
+    env = _env_for_runtime(env_overrides)
+    rc, out, err, timed, dur = _spawn(run, stdin, eff_timeout, preexec, env=env)
     if (iso.startswith("bwrap") and not timed and err.startswith(b"bwrap:")
             and not _bwrap_probe_fresh()):
         # A fresh /bin/true probe confirms bwrap genuinely cannot set up a namespace here (not
         # the target spoofing "bwrap:" on stderr). Degrade to rlimits-only for THIS run only.
-        rc, out, err, timed, dur = _spawn(cmd, stdin, eff_timeout, preexec)
+        rc, out, err, timed, dur = _spawn(cmd, stdin, eff_timeout, preexec, env=env)
         iso = "rlimits-only+jvm"
     kind, detail, frames = jvm_exception(err, rc, out)
     crashed = kind is not None
@@ -1120,7 +1147,8 @@ def _is_pyc(path) -> bool:
 _PY_FLAGS = ("-E", "-s", "-X", "faulthandler")
 
 
-def _run_python(exe, *, argv, stdin, timeout, mem_mb, capture) -> RunResult:
+def _run_python(exe, *, argv, stdin, timeout, mem_mb, capture,
+                env_overrides=None) -> RunResult:
     """Run CPython bytecode under the interpreter.
 
     Unlike a bare .class, a .pyc is loadable under ANY filename -- `python3 target.bin` works --
@@ -1145,10 +1173,11 @@ def _run_python(exe, *, argv, stdin, timeout, mem_mb, capture) -> RunResult:
         run = (["bwrap"] + _BWRAP_ARGS[:-1] + _secret_mask_args()
                + ["--ro-bind", exedir, exedir] + ["--"] + cmd)
         iso = "bwrap+netns+cpython"
-    rc, out, err, timed, dur = _spawn(run, stdin, eff_timeout, preexec)
+    env = _env_for_runtime(env_overrides)
+    rc, out, err, timed, dur = _spawn(run, stdin, eff_timeout, preexec, env=env)
     if (iso.startswith("bwrap") and not timed and err.startswith(b"bwrap:")
             and not _bwrap_probe_fresh()):
-        rc, out, err, timed, dur = _spawn(cmd, stdin, eff_timeout, preexec)
+        rc, out, err, timed, dur = _spawn(cmd, stdin, eff_timeout, preexec, env=env)
         iso = "rlimits-only+cpython"
     kind, detail, frames = python_exception(err, rc, out)
     crashed = bool(kind)
@@ -1207,13 +1236,45 @@ def _wasm_driver_path() -> str:
     return str((Path(__file__).resolve().parent / "wasm_driver.js"))
 
 
-def _run_wasm(exe, *, argv, stdin, timeout, mem_mb, capture) -> RunResult:
+def _argv_path_dirs(argv, exclude=()) -> list:
+    """Directories named by EXISTING paths in `argv`, for a runner that must bind them in.
+
+    `file` delivery puts the input's path in argv, and a sandbox that does not bind that
+    directory hands the target a name it cannot open -- which reads as a clean run on every
+    input, not as a delivery failure. Only paths that exist are considered, so an ordinary
+    option string is never mistaken for one.
+    """
+    # realpath on BOTH sides: a later --ro-bind of a directory already bound writable would win,
+    # and re-binding the report's directory read-only would make every run a non-run.
+    skip = {os.path.realpath(str(x)) for x in exclude}
+    out: list = []
+    for a in argv or ():
+        try:
+            t = a.decode() if isinstance(a, bytes) else str(a)
+            if not t.startswith("/") or not os.path.exists(t):
+                continue
+            d = os.path.realpath(t if os.path.isdir(t) else os.path.dirname(t))
+        except Exception:                                # noqa: BLE001 -- advisory bind only
+            continue
+        if d and d not in skip and d not in out:
+            out.append(d)
+    return out
+
+
+def _run_wasm(exe, *, argv, stdin, timeout, mem_mb, capture,
+              env_overrides=None) -> RunResult:
     """Run a WebAssembly module under node, via the driver that decides how to feed it.
 
     The verdict comes back in a FILE, not on stderr: a WASI module writes to fd 2 itself, so a
     marker on stderr would be forgeable by the target -- and a mutator rewarded for crashes
-    learns to print one. The module is given no filesystem preopens, so it cannot reach the
-    report.
+    learns to print one. The report's own directory is never preopened for the module, so it
+    cannot reach it.
+
+    `argv` is passed through to the driver, which hands it to a WASI command as its argv and
+    preopens the directories those arguments name -- so `arg` and `file` delivery are real here
+    for a command module (they cannot exist for a reactor, which has no process at all; see
+    `substrate.channels`). Under bwrap those directories must be bound in, or the module would
+    be granted a path that does not exist inside the sandbox.
     """
     node = _node()
     if not node:
@@ -1234,15 +1295,18 @@ def _run_wasm(exe, *, argv, stdin, timeout, mem_mb, capture) -> RunResult:
     run = cmd
     if _bwrap_usable():
         exedir = str(exe.parent)
-        run = (["bwrap"] + _BWRAP_ARGS[:-1] + _secret_mask_args()
-               + ["--ro-bind", exedir, exedir, "--bind", str(rdir), str(rdir),
-                  "--ro-bind", _wasm_driver_path(), _wasm_driver_path()] + ["--"] + cmd)
+        binds = ["--ro-bind", exedir, exedir, "--bind", str(rdir), str(rdir),
+                 "--ro-bind", _wasm_driver_path(), _wasm_driver_path()]
+        for d in _argv_path_dirs(argv, exclude=(exedir, str(rdir))):
+            binds += ["--ro-bind", d, d]
+        run = (["bwrap"] + _BWRAP_ARGS[:-1] + _secret_mask_args() + binds + ["--"] + cmd)
         iso = "bwrap+netns+wasm"
+    env = _env_for_runtime(env_overrides)
     try:
-        rc, out, err, timed, dur = _spawn(run, stdin, eff_timeout, preexec)
+        rc, out, err, timed, dur = _spawn(run, stdin, eff_timeout, preexec, env=env)
         if (iso.startswith("bwrap") and not timed and err.startswith(b"bwrap:")
                 and not _bwrap_probe_fresh()):
-            rc, out, err, timed, dur = _spawn(cmd, stdin, eff_timeout, preexec)
+            rc, out, err, timed, dur = _spawn(cmd, stdin, eff_timeout, preexec, env=env)
             iso = "rlimits-only+wasm"
         try:
             verdict = json.loads(rep.read_text() or "{}")
@@ -1532,7 +1596,8 @@ def _clr_home() -> str:
     return _CLR_HOME
 
 
-def _run_dotnet(exe, *, argv, stdin, timeout, mem_mb, capture) -> RunResult:
+def _run_dotnet(exe, *, argv, stdin, timeout, mem_mb, capture,
+                env_overrides=None) -> RunResult:
     """Run a .NET assembly under the CLR.
 
     There is no entry-point recovery to do (the assembly names its own), but unlike a .pyc an
@@ -1561,7 +1626,10 @@ def _run_dotnet(exe, *, argv, stdin, timeout, mem_mb, capture) -> RunResult:
     preexec = _rlimits(max(mem_mb, 2048), int(eff_timeout) + 2, set_as=False,
                        nproc=_nproc_cap(True))           # the CLR is threaded; don't cap AS
     home = _clr_home()
-    env = {**os.environ, **_CLR_ENV, "HOME": home, "DOTNET_CLI_HOME": home}
+    # HOME/DOTNET_CLI_HOME are PINNED past the env channel: the muxer must have a writable home
+    # or nothing executes at all, and a mutated HOME made that a clean-looking non-run.
+    env = _env_for_runtime(env_overrides, extra=_CLR_ENV,
+                           pinned={"HOME": home, "DOTNET_CLI_HOME": home})
     iso = "rlimits-only+clr"
     run = cmd
     if _bwrap_usable():
@@ -1731,7 +1799,8 @@ def _ensure_wineprefix(wine: str, prefix: str) -> None:
         pass
 
 
-def _run_windows(exe, *, argv, stdin, timeout, mem_mb, capture, wineprefix) -> RunResult:
+def _run_windows(exe, *, argv, stdin, timeout, mem_mb, capture, wineprefix,
+                 env_overrides=None) -> RunResult:
     wine = _wine()
     if not wine:
         return RunResult(isolation="unsupported-windows",
@@ -1741,7 +1810,10 @@ def _run_windows(exe, *, argv, stdin, timeout, mem_mb, capture, wineprefix) -> R
     _ensure_wineprefix(wine, prefix)
     # WINEDEBUG=fixme-all drops the noisy fixme channel but keeps err:/warn: (the unhandled-
     # exception marker we classify on). DISPLAY="" avoids GUI popups on headless hosts.
-    env = {**os.environ, "WINEPREFIX": prefix, "WINEDEBUG": "fixme-all", "DISPLAY": ""}
+    # WINEPREFIX/WINEDEBUG/DISPLAY are PINNED past the env channel: they decide whether wine
+    # launches and whether the unhandled-exception marker we classify on survives.
+    env = _env_for_runtime(env_overrides, pinned={"WINEPREFIX": prefix,
+                                                  "WINEDEBUG": "fixme-all", "DISPLAY": ""})
     cmd = [wine, str(exe)] + [str(a) for a in argv]
     eff_timeout = max(timeout, 10.0)                   # wine bootstraps a wineserver -> headroom
     # wine + wineserver need many fds/threads and a large AS; use the GENEROUS emu/wine cap (not
@@ -1794,19 +1866,20 @@ def run(exe, *, argv=(), stdin: bytes = b"", timeout: float = 10.0,
     # target that never ran. The managed test has to come first.
     if _is_dotnet(exe):                                 # .NET assembly -> the CLR
         return _run_dotnet(exe, argv=argv, stdin=stdin, timeout=timeout, mem_mb=mem_mb,
-                           capture=capture)
+                           capture=capture, env_overrides=env_overrides)
     if _is_pe(exe):                                     # Windows PE -> Wine substrate
         return _run_windows(exe, argv=argv, stdin=stdin, timeout=timeout, mem_mb=mem_mb,
-                            capture=capture, wineprefix=wineprefix)
+                            capture=capture, wineprefix=wineprefix,
+                            env_overrides=env_overrides)
     if _is_jvm(exe):                                    # jar / .class -> the JVM
         return _run_java(exe, argv=argv, stdin=stdin, timeout=timeout, mem_mb=mem_mb,
-                         capture=capture)
+                         capture=capture, env_overrides=env_overrides)
     if _is_pyc(exe):                                    # .pyc -> the CPython interpreter
         return _run_python(exe, argv=argv, stdin=stdin, timeout=timeout, mem_mb=mem_mb,
-                           capture=capture)
+                           capture=capture, env_overrides=env_overrides)
     if _is_wasm(exe):                                   # .wasm -> a WebAssembly engine (node)
         return _run_wasm(exe, argv=argv, stdin=stdin, timeout=timeout, mem_mb=mem_mb,
-                         capture=capture)
+                         capture=capture, env_overrides=env_overrides)
     emu = None
     if arch and host and arch != host:
         emu = _qemu_for(arch, endianness, bits)

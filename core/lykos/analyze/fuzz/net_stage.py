@@ -12,6 +12,7 @@ import os
 
 from ...db.dao import CallEdgeDAO, DynResultDAO, FindingDAO, TargetDAO
 from ...jobs.registry import register_stage
+from .. import substrate
 from ..dynamic import sandbox
 from ..dynamic.stage import crash_finding_candidate
 from . import netfuzz
@@ -31,8 +32,12 @@ def net_fuzz_stage(ctx) -> dict:
 
     # Host-native only: we spawn and connect over localhost; an emulated guest's sockets are not
     # reachable from the host without a networked emulator.
+    why = substrate.native_only_reason(target.file_type, "the localhost network campaign")
+    if why:
+        ctx.emit("net_fuzz.done", payload={"applicable": False, "note": why})
+        return {}
     host = sandbox.host_arch()
-    if target.arch and host and target.arch != host:
+    if substrate.foreign_cpu(target.arch, target.file_type, host):
         ctx.emit("net_fuzz.done", payload={"applicable": False,
                  "note": f"cross-arch target ({target.arch}); network fuzzing needs a native host"})
         return {}

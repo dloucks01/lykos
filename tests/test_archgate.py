@@ -20,6 +20,24 @@ def test_matrix_is_coherent():
             assert c.note, f"{c.label} expects only {c.expect} but records no reason"
 
 
+#: An arch needs a gate ROW only if this host can BUILD for it -- the gate compiles its own
+#: fixture, so with no cross-gcc there is nothing to measure and a row would state a bar nobody
+#: ever checked. Each exemption names the toolchain that would be needed, and the test below
+#: fails if one of them ever turns up installed, so this list cannot quietly hide a regression.
+#:
+#: qemu-user IS installed for all of these (xtensa, microblaze, hppa and alpha were added to the
+#: emulator routing table), so the thing that CAN be checked without a toolchain -- that an
+#: e_machine the parser names routes to the right emulator -- is checked in test_arch_routing.py.
+_NO_TOOLCHAIN = {
+    "mips": ("mips-linux-gnu-gcc", "mipsel-linux-gnu-gcc", "mips64el-linux-gnuabi64-gcc"),
+    "sparc": ("sparc-linux-gnu-gcc",),           # sparcv9 IS gated; the 32-bit name is not
+    "xtensa": ("xtensa-linux-gnu-gcc", "xtensa-lx106-elf-gcc"),
+    "microblaze": ("microblaze-linux-gnu-gcc",),
+    "hppa": ("hppa-linux-gnu-gcc", "hppa64-linux-gnu-gcc"),
+    "alpha": ("alpha-linux-gnu-gcc",),
+}
+
+
 def test_matrix_covers_every_arch_the_parser_can_name():
     """A new arch in the ELF machine table without a gate row would go unmeasured."""
     from lykos.analyze import elf
@@ -29,9 +47,18 @@ def test_matrix_covers_every_arch_the_parser_can_name():
     gated = set()
     for c in archgate.MATRIX:
         gated.add("ppc64" if c.label == "ppc64le" else c.label)
-    # mips has no cross toolchain in current Ubuntu and no corpus binary; the rest must be gated
-    missing = named - gated - {"mips", "sparc"}
+    missing = named - gated - set(_NO_TOOLCHAIN)
     assert not missing, f"architectures with no arch-gate row: {sorted(missing)}"
+
+
+def test_an_exempt_arch_really_cannot_be_built_here():
+    """The exemption list is only honest while it is true. If a cross toolchain appears, the
+    arch becomes measurable and owes the gate a row -- this is what makes the list above a
+    statement about the host rather than a place to put architectures that fail."""
+    import shutil
+    for arch, candidates in sorted(_NO_TOOLCHAIN.items()):
+        found = [c for c in candidates if shutil.which(c)]
+        assert not found, f"{arch} can be built here now ({found}); it needs an arch-gate row"
 
 
 def _r(label, expect, reached, ok=None):

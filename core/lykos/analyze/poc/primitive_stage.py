@@ -20,8 +20,9 @@ _PRIM_CWE = {"instruction-pointer-control": "CWE-787",
              "controlled-read": "CWE-125"}
 # root_cause classes that are already a memory-corruption defect and so are kept as-is.
 # The one definition lives beside the finding vocabulary; a second copy here would drift.
-from ...db.models import MEMORY_CORRUPTION_CWES as _MEM_CORRUPTION
+from ...db.models import OUTRANKS_PRIMITIVE_CWES as _MEM_CORRUPTION
 from ...jobs.registry import register_stage
+from .. import substrate
 from ..debug import qemu_gdb, rootcause
 from ..dynamic import sandbox
 from ..dynamic.minimize import minimize
@@ -132,8 +133,20 @@ def primitive_stage(ctx) -> dict:
     timeout = float(p.get("timeout", 8))
     mode, base_argv, mode_why = how_to_feed(ctx.conn, target, input_sha, p)
 
+    # A substrate that owns the instruction pointer cannot be asked for L2, and the reason
+    # matters: `target.arch` holds the RUNTIME's name for a managed target ("cil", "jvm",
+    # "cpython", "wasm"), so the cross-arch test below fired for every one of them and the
+    # decline read "no qemu gdbstub register layout (host x86-64)" -- naming a missing TOOL for
+    # something no tool can do. `known()` first, because an empty file_type means triage has not
+    # run yet, not that nothing can run this.
+    if substrate.known(target.file_type) and not substrate.supports_ip_control(target.file_type):
+        note = substrate.no_ip_control_reason(target.file_type)
+        ctx.emit("primitive.done", payload={"primitive": None, "supported": False, "note": note})
+        ctx.progress(pct=100, msg="L2 is not a claim this substrate can support")
+        return {}
+
     host = sandbox.host_arch()
-    emulated = bool(target.arch and target.arch != host)
+    emulated = substrate.foreign_cpu(target.arch, target.file_type, host)
     if emulated and not qemu_gdb.supported(target.arch):
         ctx.emit("primitive.done", payload={"primitive": None, "supported": False,
                  "note": f"L2 for cross-arch {target.arch}: no qemu gdbstub register layout "

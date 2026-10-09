@@ -221,10 +221,29 @@ def triage_record(conn, content, target) -> dict:
 
 
 def triage_symbols(conn, content, target) -> list:
-    """The symbol names triage recorded for a target (its imports/metadata inventory)."""
+    """Every symbol name triage recorded for a target: its IMPORTS and its EXPORTS.
+
+    Reading only `imports.symbols` was right for the formats it was written against (a .NET
+    assembly's memberrefs, a constant pool's method calls, a .pyc's names) and silently empty for
+    the one where the inventory lives on the other side: a WebAssembly module's imports are its
+    HOST CALL SURFACE, so a `--no-entry` reactor module has none at all -- measured 0 imports
+    against 2 exports -- and the names a caller needs are in `exports.symbols`. A consumer asking
+    "what does this target read?" could therefore never see a wasm module's names, whatever
+    vocabulary it was given.
+
+    Both halves answer that question, on either side of the boundary: a wasm module's imports name
+    the WASI calls it makes (`fd_read`, `path_open`, `environ_get`) and its exports name its entry
+    point (`_start`) and its functions. Imports first, de-duplicated, order preserved.
+    """
     rec = triage_record(conn, content, target)
-    syms = ((rec.get("imports") or {}).get("symbols")) or []
-    return [str(x) for x in syms if x]
+    out, seen = [], set()
+    for half in ("imports", "exports"):
+        for x in ((rec.get(half) or {}).get("symbols")) or []:
+            s = str(x)
+            if s and s not in seen:
+                seen.add(s)
+                out.append(s)
+    return out
 
 
 class NotAnalysable(ValueError):

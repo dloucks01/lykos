@@ -20,6 +20,7 @@ import tempfile
 from pathlib import Path
 
 from ...jobs.registry import register_stage
+from .. import substrate
 
 # NOTE: cross-subpackage imports (..dynamic, ..fuzz, sibling poc modules) are done LAZILY inside the
 # functions below -- importing at module load creates a poc <-> dynamic import cycle (poc.__init__
@@ -107,7 +108,8 @@ def chain_primitive_stage(ctx) -> dict:
     if target is None:
         raise ValueError("chain_primitive requires a target_id")
     host = sandbox.host_arch()
-    if (target.arch and target.arch != host) or (target.file_type or "").lower() not in ("elf", ""):
+    if (substrate.foreign_cpu(target.arch, target.file_type, host)
+            or (target.file_type or "").lower() not in ("elf", "")):
         ctx.emit("chain.done", payload={"applicable": False,
                  "note": "primitive chaining is native x86-64 / ELF only"})
         return {}

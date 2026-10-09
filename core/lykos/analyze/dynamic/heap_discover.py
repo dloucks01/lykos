@@ -16,7 +16,7 @@ import tempfile
 from pathlib import Path
 
 from ...jobs.registry import register_stage
-from .. import invocation
+from .. import invocation, substrate
 from ..dynamic import sandbox
 from ..fuzz import menu
 from ..poc import exploit
@@ -599,7 +599,8 @@ def heap_trace_stage(ctx) -> dict:
     if target is None:
         raise ValueError("heap_trace requires a target_id")
     host = sandbox.host_arch()
-    if (target.arch and target.arch != host) or (target.file_type or "").lower() not in ("elf", ""):
+    if (substrate.foreign_cpu(target.arch, target.file_type, host)
+            or (target.file_type or "").lower() not in ("elf", "")):
         ctx.emit("heaptrace.done", payload={"applicable": False,
                  "note": "custom-allocator tracing is native x86-64 / ELF only"})
         return {}

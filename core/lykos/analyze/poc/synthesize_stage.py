@@ -62,7 +62,7 @@ def synthesize_stage(ctx) -> dict:
         return {}
 
     call_edges = CallEdgeDAO(ctx.conn).list_by_target(target.id)
-    modes = modes_for(call_edges, p.get("input_mode"))
+    modes = modes_for(call_edges, p.get("input_mode"), file_type=target.file_type)
     argv_base = list(p.get("argv") or [])
     timeout = float(p.get("timeout", 8))
 

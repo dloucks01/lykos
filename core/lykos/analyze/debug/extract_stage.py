@@ -12,6 +12,7 @@ import re
 
 from ...db.dao import CallEdgeDAO, FindingDAO, TargetDAO
 from ...jobs.registry import register_stage
+from .. import substrate
 from ..detect.catalog import normalize
 from ..dynamic import sandbox
 from ..poc.capture import how_to_feed
@@ -57,7 +58,8 @@ def extract_stage(ctx) -> dict:
         raise ValueError("extract_secrets requires a target_id")
     p = ctx.params or {}
     host = sandbox.host_arch()
-    if (target.arch and target.arch != host) or not secrets.supported(target.arch or host):
+    if (substrate.foreign_cpu(target.arch, target.file_type, host)
+            or not secrets.supported(target.arch or host)):
         ctx.emit("secrets.done", payload={"ok": False, "supported": False,
                  "note": f"secret extraction is native-arch only (target {target.arch}, "
                          f"host {host}); cross-arch via qemu-gdbstub is future work"})

@@ -170,16 +170,25 @@ _MANAGED_FILE_NAMES = {
     "ReadAllBytes", "ReadAllText", "ReadAllLines", "Directory", "DirectoryInfo",
     "FileInputStream", "FileReader", "RandomAccessFile", "Files",      # Java
     "open", "fileno",                                                  # Python
+    "path_open", "fd_pread", "fd_prestat_get", "path_filestat_get",    # WASI
 }
+# WASI is the sharpest evidence any of these formats offers, because a wasm module can only reach
+# the outside world through an IMPORT it declares: `fd_read` means it reads a descriptor, and
+# without `path_open` it can never open a file at all -- so the descriptor is fd 0.
+_MANAGED_STDIN_MARKERS = _MANAGED_STDIN_MARKERS | {"fd_read"}
 
 
 def _managed_channels(symbols):
-    """(has_stdin, has_file, interactive) from a managed target's recorded symbol names."""
-    names = {s for s in (symbols or ()) if s}
-    short = {n.rsplit(".", 1)[-1] for n in names}
-    console = bool(names & _MANAGED_CONSOLE_TYPES) and bool(short & _MANAGED_CONSOLE_READS)
-    marked = bool(short & _MANAGED_STDIN_MARKERS) or bool(names & _MANAGED_STDIN_MARKERS)
-    has_file = bool(short & _MANAGED_FILE_NAMES)
+    """(has_stdin, has_file, interactive) from a managed target's recorded symbol names.
+
+    `symbol_names` supplies both the qualified and the short form of every name, so a type-
+    qualified marker (`System.Console`) and a bare one (`fd_read`) are matched from one set.
+    """
+    from .. import substrate
+    names = substrate.symbol_names(symbols)
+    console = bool(names & _MANAGED_CONSOLE_TYPES) and bool(names & _MANAGED_CONSOLE_READS)
+    marked = bool(names & _MANAGED_STDIN_MARKERS)
+    has_file = bool(names & _MANAGED_FILE_NAMES)
     has_stdin = console or marked
     # A direct console/stdin read is this runtime's interactive primitive, exactly as raw
     # read(2) and the scanf family are on a native target: it means the program takes its
@@ -187,8 +196,8 @@ def _managed_channels(symbols):
     return has_stdin, has_file, has_stdin
 
 
-def modes_for(call_edges, given=None, symbols=()):
-    """The input channels to try, best first, always ending with all three attempted.
+def modes_for(call_edges, given=None, symbols=(), file_type=None):
+    """The input channels to try, best first, always ending with every DELIVERABLE one attempted.
 
     Ranked by the input functions the binary actually imports, because "default to stdin" is
     a coin flip that loses on most real targets: a file parser reads nothing from stdin, so a
@@ -201,7 +210,15 @@ def modes_for(call_edges, given=None, symbols=()):
     constant pool, a metadata heap or a code object, for a target that owns no machine code and
     therefore has no call edges at all. Unioned with the native signals, never substituted for
     them. See `_managed_channels`.
+
+    `file_type` decides which channels EXIST here, which is a different question from which is
+    most likely. The ranking is universal and the fallback sweep attempts all three, which is
+    the right shape wherever all three can carry input -- and wrong where one cannot: for a wasm
+    reactor module `arg` and `file` reach nothing (no process, no argv, no preopened directory),
+    and `arg` was nevertheless offered FIRST, on the slowest substrate measured here. Omitting
+    it is not a narrowing of the search; those executions found nothing by construction.
     """
+    from .. import substrate
     from ..detect.catalog import normalize
     if given:
         return [given]
@@ -227,7 +244,11 @@ def modes_for(call_edges, given=None, symbols=()):
     for m in MODES:                          # ensure every channel is attempted
         if m not in ordered:
             ordered.append(m)
-    return ordered
+    deliverable = substrate.channels(file_type, symbols)
+    kept = [m for m in ordered if m in deliverable]
+    # Never return nothing: a substrate with no capture-mode channel at all is fed by a stage of
+    # its own (a bare-metal image through modelled MMIO), and the caller's own gate reports that.
+    return kept or ordered
 
 
 def how_to_feed(conn, target, input_sha, params):
@@ -255,7 +276,9 @@ def how_to_feed(conn, target, input_sha, params):
     # stdin. A file parser given its input on stdin looks exactly like a program with no bug.
     from ...db.dao import CallEdgeDAO
     try:
-        ranked = modes_for(CallEdgeDAO(conn).list_by_target(target.id))
+        ranked = modes_for(CallEdgeDAO(conn).list_by_target(target.id),
+                           file_type=getattr(target, "file_type", None))
     except Exception:
         ranked = list(MODES)
-    return ranked[0], list(params.get("argv") or []), "inferred from the imported input calls"
+    return (ranked or list(MODES))[0], list(params.get("argv") or []), \
+        "inferred from the imported input calls"

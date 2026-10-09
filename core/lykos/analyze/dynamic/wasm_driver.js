@@ -1,6 +1,6 @@
 // Drive a WebAssembly module with one input and report what happened.
 //
-//   node wasm_driver.js <module.wasm> <report.json>      input on stdin
+//   node wasm_driver.js <module.wasm> <report.json> [args...]   input on stdin (and in args)
 //
 // A wasm module is not an executable: it has no process, no argv and (unless it is a WASI
 // command) no entry point. So "running" one means choosing how to hand it the input, and that
@@ -19,15 +19,27 @@
 // and if it faults anyway the trap is the convention rather than a defect this input reached --
 // reported as not-drivable, not as a crash.
 //
+// A WASI COMMAND also gets the two channels a reactor cannot have, because the caller passes
+// them and the host grants them:
+//
+//   * ARGV -- `args` was hardcoded to ['prog'], so every argument the sandbox passed on this
+//     driver's own command line was dropped on the floor. A wasm-compiled utility that takes
+//     its input filename or its option on the command line read nothing, on every input.
+//   * the FILESYSTEM -- WASI is capability-based: with no `preopens` a module cannot open a
+//     path even when it knows the name, so `file` delivery was impossible by construction.
+//     Only the directories holding the arguments we actually passed are preopened, never the
+//     report's own directory: the verdict must stay unforgeable by the target (see below).
+//
 // The verdict is written to the report FILE, never to stderr. A WASI module can write whatever
 // it likes to fd 2, so a marker on stderr would be forgeable by the target -- and a fuzzer
-// rewarded for crashes will learn to print one. The report path is not preopened for the
-// module, so it cannot reach it.
+// rewarded for crashes will learn to print one.
 'use strict';
 const fs = require('fs');
+const path = require('path');
 
 const modPath = process.argv[2];
 const reportPath = process.argv[3];
+const extraArgs = process.argv.slice(4);
 
 function report(obj) {
   try { fs.writeFileSync(reportPath, JSON.stringify(obj)); } catch (e) { /* nothing left to do */ }
@@ -59,13 +71,35 @@ function isWasi(mod) {
   return WebAssembly.Module.imports(mod).some((d) => d.module.startsWith('wasi_'));
 }
 
+// Directories to grant the module, derived from the arguments it was actually given. WASI has
+// no ambient filesystem access, so without this a module cannot open a path it was handed.
+// The report's own directory is NEVER granted: the module must not be able to write its own
+// verdict, and a fuzzer rewarded for crashes would find that if it existed.
+function preopensFor(args) {
+  const deny = path.resolve(path.dirname(reportPath));
+  const out = {};
+  for (const a of args) {
+    let dir;
+    try {
+      if (!fs.existsSync(a)) continue;
+      dir = path.resolve(fs.statSync(a).isDirectory() ? a : path.dirname(a));
+    } catch (e) { continue; }
+    if (dir === deny || deny.startsWith(dir + path.sep) || dir.startsWith(deny + path.sep)) continue;
+    out[dir] = dir;                       // same path inside, so the argument resolves as passed
+  }
+  return out;
+}
+
 function runWasi(bytes) {
   let WASI;
   try { ({ WASI } = require('node:wasi')); }
   catch (e) { return { notdrivable: 'this node has no WASI support for a wasm command module' }; }
   // stdin/stdout/stderr are passed EXPLICITLY: the input arrives on fd 0 and a WASI
   // command that never gets it reads zero bytes and looks like a clean run on every input.
-  const wasi = new WASI({ version: 'preview1', args: ['prog'], env: {},
+  // argv[0] is a name, as in any process; the rest are the caller's, which is what makes `arg`
+  // and `file` real channels here rather than ranked-and-dropped ones.
+  const wasi = new WASI({ version: 'preview1', args: ['prog'].concat(extraArgs),
+                          env: process.env, preopens: preopensFor(extraArgs),
                           stdin: 0, stdout: 1, stderr: 2, returnOnExit: true });
   const mod = new WebAssembly.Module(bytes);
   const inst = new WebAssembly.Instance(mod, wasi.getImportObject());

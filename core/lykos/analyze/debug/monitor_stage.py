@@ -22,6 +22,7 @@ import os
 
 from ...db.dao import CallEdgeDAO, FindingDAO, FunctionDAO, TargetDAO
 from ...jobs.registry import register_stage
+from .. import substrate
 from ..detect.catalog import normalize
 from ..dynamic import sandbox
 from ..poc.capture import how_to_feed
@@ -192,7 +193,7 @@ def monitor_stage(ctx) -> dict:
                          f"(Wine); this target is {fmt.upper()} (macOS needs a full-system VM)."})
         ctx.progress(pct=100, msg=f"monitor does not support {fmt.upper()} targets")
         return {}
-    emulated = bool(target.arch and target.arch != host)
+    emulated = substrate.foreign_cpu(target.arch, target.file_type, host)
     if emulated and not qemu_gdb.breakpoints_supported(target.arch):
         ctx.emit("monitor.done", payload={"ok": False, "supported": False,
                  "note": f"no cross-arch breakpoint support for {target.arch} (host {host})"})

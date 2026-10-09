@@ -14,7 +14,7 @@ import os
 
 from ...db.dao import CallEdgeDAO, DynResultDAO, FindingDAO, FunctionDAO, TargetDAO
 from ...jobs.registry import register_stage
-from .. import elf
+from .. import elf, substrate
 from ..dynamic import sandbox
 from ..dynamic.stage import crash_dedup_key
 from ..fuzz.runner import place
@@ -56,8 +56,13 @@ def multi_debug_stage(ctx) -> dict:
     base_argv = list(p.get("argv") or [])
     timeout = float(p.get("timeout", 12))
 
+    why = substrate.native_only_reason(target.file_type, "follow-fork multi-process debugging")
+    if why:
+        ctx.emit("multidebug.done", payload={"supported": False, "note": why})
+        ctx.progress(pct=100, msg=why[:90])
+        return {}
     host = sandbox.host_arch()
-    if target.arch and target.arch != host:
+    if substrate.foreign_cpu(target.arch, target.file_type, host):
         ctx.emit("multidebug.done", payload={"supported": False,
                  "note": f"needs native execution; target {target.arch} != {host}"})
         ctx.progress(pct=100, msg="multi-process debug not supported for cross-arch target")

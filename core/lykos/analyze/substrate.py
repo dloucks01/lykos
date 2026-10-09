@@ -66,6 +66,10 @@ class Substrate:
     execs_per_sec: float = 0.0
     #: Why nothing here can execute it, when `backend is None`.
     no_exec: str = ""
+    #: Which of `capture.MODES` (+ "env") can PHYSICALLY carry input to this substrate. The
+    #: channel ranking is otherwise universal -- stdin/file/arg are offered for every target --
+    #: and that is wrong for a substrate where a channel does not exist: see `channels()`.
+    channels: tuple = ("stdin", "file", "arg", "env")
 
 
 #: file_type -> Substrate. Keyed by `triage`'s file_type, which is the only name the rest of
@@ -86,8 +90,14 @@ SUBSTRATES: dict[str, Substrate] = {
     "jar": Substrate(JVM, runtime="the JVM", runtime_key="jvm", execs_per_sec=36.0),
     "class": Substrate(JVM, runtime="the JVM", runtime_key="jvm", execs_per_sec=36.0),
     "pyc": Substrate(CPYTHON, runtime="CPython", runtime_key="cpython", execs_per_sec=19.0),
+    # A wasm REACTOR module has exactly one channel: the bytes staged into its linear memory and
+    # handed to an export as (ptr, len), which the driver feeds from stdin. It has no process, so
+    # there is no argv and no environment, and WASI capabilities are granted by the host -- with
+    # no preopened directory a module cannot open a file even by name. A WASI COMMAND module is
+    # the opposite: it has `_start`, argv, an environment and whatever directories the host
+    # preopens, so `channels()` widens for it on the evidence of that export.
     "wasm": Substrate(WASM, runtime="the WebAssembly engine", runtime_key="wasm",
-                      execs_per_sec=11.0),
+                      execs_per_sec=11.0, channels=("stdin",)),
     "dotnet": Substrate(CLR, runtime="the CLR", runtime_key="clr", execs_per_sec=8.0),
     # A bare-metal image has no host process: there is no loader, no syscalls and no libc. The
     # firmware rehoster emulates the core and models the peripherals instead, which is a stage
@@ -180,6 +190,124 @@ def no_ip_control_reason(file_type: Optional[str]) -> Optional[str]:
         return f"nothing here executes this image -- {s.no_exec}."
     return ("this substrate is emulated rather than executed, so there is no host instruction "
             "pointer to take.")
+
+
+#: The export that makes a wasm module a WASI COMMAND rather than a reactor/library: it has an
+#: entry point, so the host gives it argv, an environment and its preopened directories.
+WASI_COMMAND_EXPORT = "_start"
+
+_ALL_CHANNELS = ("stdin", "file", "arg", "env")
+
+
+def symbol_names(symbols) -> set:
+    """A matchable set from a recorded symbol inventory, both qualified and short.
+
+    Each format decorates its names differently and a matcher that ignores that sees nothing:
+    the wasm parser records an import as `wasi_snapshot_preview1.fd_read [func]` and an export as
+    `_start [func]`, so a plain `"_start" in symbols` is False on every module that has one.
+    Strips the kind annotation and offers the last dotted component as well, since
+    `System.Console` and `Console` are the same evidence.
+    """
+    out: set = set()
+    for s in symbols or ():
+        t = str(s).split(" [", 1)[0].strip()
+        if t:
+            out.add(t)
+            out.add(t.rsplit(".", 1)[-1])
+    return out
+
+
+def channels(file_type: Optional[str], symbols=()) -> tuple:
+    """Which delivery channels can physically reach this substrate, as a filter on the ranking.
+
+    The ranking in `capture.modes_for` is universal by design -- it ends with every channel
+    attempted, so a wrong guess costs a retry rather than a miss. That is right wherever all
+    three channels EXIST, and wrong where one does not: for a wasm reactor module `arg` and
+    `file` cannot carry anything at all (no process, no argv, no preopened directory), yet it
+    ranked FIRST on the slowest substrate here (11 exec/s measured), so a campaign spent its
+    budget delivering input nowhere before the retry reached the one channel that works.
+
+    `symbols` is the target's recorded inventory (`ingest.triage_symbols`), used only where the
+    channel set depends on the image rather than the format -- today just the WASI-command
+    export. Without evidence the answer is the narrow one, because offering a channel that
+    cannot carry input is what produced the empty campaign.
+    """
+    if not known(file_type):
+        return _ALL_CHANNELS                             # not triaged yet: do not narrow anything
+    s = of(file_type)
+    if s.backend == WASM and WASI_COMMAND_EXPORT in symbol_names(symbols):
+        return _ALL_CHANNELS
+    return s.channels
+
+
+# ---- `target.arch` is a CPU for a native image and a RUNTIME NAME for a managed one ------
+#
+# triage writes "cil" / "jvm" / "cpython" / "wasm" into `target.arch`, because those targets have
+# no CPU to name. That makes `target.arch != host_arch()` TRUE for every managed target, and that
+# comparison is the pipeline's test for "a foreign architecture, reachable only under an
+# emulator" -- asked at 28 call sites. The conclusion usually coincides with the right answer,
+# so the bug shows up as the REASON given to the operator:
+#
+#   * `poc_primitive` declines a .NET assembly with "L2 for cross-arch cil: no qemu gdbstub
+#     register layout (host x86-64)" -- naming a missing TOOL, when the truth is that the CLR
+#     owns the instruction pointer and no tool would change that (`no_ip_control_reason`);
+#   * `env_fuzz` declines with "cross-arch target (cil); env fuzzing needs a native host", which
+#     is the wrong reason AND the wrong conclusion -- the CLR runs as an ordinary host process
+#     and reads the environment like any other;
+#   * five stages set `emulated=True` and take a qemu path for something that is not emulated.
+#
+#: The tokens triage writes into `arch` for a managed format. Checked by NAME as well as by
+#: file_type, so an arch string that outlived its target row is still not read as a CPU.
+RUNTIME_ARCHS = frozenset({"cil", "clr", "jvm", "cpython", "wasm", "dotnet"})
+
+
+def names_a_cpu(arch: Optional[str], file_type: Optional[str] = None) -> bool:
+    """Does `target.arch` name a CPU here, or the runtime that owns the instruction pointer?"""
+    a = (arch or "").lower().strip()
+    if not a or a in RUNTIME_ARCHS:
+        return False
+    return not is_managed(file_type)
+
+
+def foreign_cpu(arch: Optional[str], file_type: Optional[str] = None,
+                host: Optional[str] = None) -> bool:
+    """Is this target machine code for ANOTHER CPU -- i.e. does it need an emulator?
+
+    False for every managed target, however `arch` compares to the host: there is no CPU named
+    there to be foreign. Use this instead of `target.arch != host_arch()`; where the answer is
+    False and the target still cannot be driven, `no_ip_control_reason` / `no_machine_code_reason`
+    give the reason that is actually true.
+    """
+    if not names_a_cpu(arch, file_type):
+        return False
+    h = (host or "").lower().strip()
+    return bool(h) and (arch or "").lower().strip() != h
+
+
+def native_only_reason(file_type: Optional[str], what: str) -> Optional[str]:
+    """Why a HOST-NATIVE-ONLY technique cannot apply to this target, or None if it can.
+
+    An LD_PRELOAD shim, a GDB follow-fork session, a localhost socket campaign: each needs a
+    host process with the host ABI. Several of these stages tested only `target.arch != host`,
+    which is TRUE for a managed target by accident of `arch` holding a runtime name -- so they
+    declined with the right conclusion and the wrong reason, and would have proceeded to
+    execve() a .NET assembly the moment that comparison was corrected.
+
+    `what` names the technique, so the sentence reads as the stage's own.
+    """
+    if not known(file_type):
+        return None                                 # not triaged: the stage's own gates decide
+    s = of(file_type)
+    if s.backend == NATIVE:
+        return None
+    if s.runtime:
+        return (f"{what} drives a host process through the native ABI; this target runs on "
+                f"{s.runtime}, which owns the process -- nothing would be instrumented, which "
+                f"is not the same as nothing found.")
+    if s.backend is None:
+        return f"{what} needs a running process, and {s.no_exec}."
+    return (f"{what} drives a host-native process; this target runs under {s.backend}, which "
+            f"it cannot reach into.")
 
 
 def no_machine_code_reason(file_type: Optional[str]) -> Optional[str]:

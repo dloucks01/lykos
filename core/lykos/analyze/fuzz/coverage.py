@@ -110,7 +110,7 @@ def _unsupported(target, use_qemu=True):
         # it needs no emulator -- but for the same reason it can only run a HOST-arch binary. A
         # cross-arch instrumented build would fault natively; that case belongs in qemu-mode.
         host = sandbox.host_arch()
-        if target.arch and host and target.arch != host:
+        if substrate.foreign_cpu(target.arch, target.file_type, host):
             return (f"afl-instrumented mode (qemu=false) runs the binary natively, but this "
                     f"target is {target.arch} on a {host} host -- use qemu-mode (needs "
                     f"afl-qemu-trace) or the black-box `fuzz` stage for a cross-arch target.")

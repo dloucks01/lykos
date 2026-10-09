@@ -29,8 +29,24 @@ _NOT_ENV = {"GCC", "GNU", "GLIBC", "ELF", "NULL", "TRUE", "FALSE", "NAN", "ERROR
             "UTF", "JSON", "XML", "HTTP", "HTTPS", "TCP", "UDP", "GET", "POST", "OK"}
 
 
-def uses_getenv(call_edges) -> bool:
-    return any(normalize(e.dst_name) in _GETENV for e in call_edges if e.dst_name)
+# The same channel on a MANAGED runtime. A jar, a .pyc and a .NET assembly own no machine code,
+# so `call_edges` is empty for them and this answered False for every one -- while each reads the
+# environment through a named member that triage already recorded. WASI is the sharpest case: a
+# wasm module can only reach the environment through an `environ_get` import it declares.
+_MANAGED_GETENV = {
+    "GetEnvironmentVariable", "GetEnvironmentVariables", "ExpandEnvironmentVariables",  # .NET
+    "getenv",                                                                           # Java/py
+    "environ", "environb",                                                              # Python
+    "environ_get", "environ_sizes_get",                                                 # WASI
+}
+
+
+def uses_getenv(call_edges, symbols=()) -> bool:
+    """Does this target read the environment? From its imports, or from a managed inventory."""
+    if any(normalize(e.dst_name) in _GETENV for e in call_edges if e.dst_name):
+        return True
+    from .. import substrate
+    return bool(substrate.symbol_names(symbols) & _MANAGED_GETENV)
 
 
 def env_var_candidates(strings, limit: int = 24) -> list:
@@ -84,12 +100,19 @@ def _crashes(exe, argv, overrides, timeout):
 
 
 def fuzz_env(exe: str, env_names, *, argv=(), seeds=(), max_execs: int = 1500, seed: int = 1337,
-             timeout: float = 5.0) -> EnvFuzzResult:
+             timeout: float = 5.0, run=None) -> EnvFuzzResult:
     """Fuzz a value into the candidate env vars until one crashes `exe`, then ATTRIBUTE the crash to
     the single variable that reproduces it. Shotgun (all names set to the same payload) finds the
-    bug fast; the per-variable re-run names the culprit and confirms it, killing one-off flakes."""
+    bug fast; the per-variable re-run names the culprit and confirms it, killing one-off flakes.
+
+    `run(overrides) -> (crashed, signal, signal_name)` replaces the native execute-and-read-the-
+    signal path. A managed target cannot be exec'd and does not fault with a signal -- its defect
+    is an uncaught exception -- so the only way this channel reaches a jar, a .pyc or a .NET
+    assembly is for the caller to supply the runner that knows how to start it.
+    """
     if not env_names:
         return EnvFuzzResult(False, note="no candidate env vars")
+    fire = run if run is not None else (lambda ov: _crashes(exe, argv, ov, timeout))
     rng = random.Random(seed)
     mut = Mutator(rng)
     corpus = [s for s in seeds if s] or [b"A" * 8, b"A" * 128, b"%n%n%n%n", b"../../etc/passwd",
@@ -101,12 +124,11 @@ def fuzz_env(exe: str, env_names, *, argv=(), seeds=(), max_execs: int = 1500, s
         for data in payloads:
             n += 1
             val = data.replace(b"\x00", b"")             # execve env truncates at NUL
-            crashed, _, _ = _crashes(exe, argv, {name: val.decode("latin-1") for name in env_names},
-                                     timeout)
+            crashed, _, _ = fire({name: val.decode("latin-1") for name in env_names})
             if crashed:
                 # attribute: which single variable reproduces it?
                 for name in env_names:
-                    c2, sig, signame = _crashes(exe, argv, {name: val.decode("latin-1")}, timeout)
+                    c2, sig, signame = fire({name: val.decode("latin-1")})
                     if c2:
                         return EnvFuzzResult(True, payload=val, var=name, signal_name=signame,
                                              signal_num=sig, execs=n, note=f"env {name}")

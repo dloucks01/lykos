@@ -105,7 +105,7 @@ def _why_unavailable(stage: str, target) -> Optional[str]:
             return (f"the guard-page heap checker is a Linux/ELF LD_PRELOAD shim and cannot "
                     f"load into a {ftype.upper()} image -- nothing would be checked, which is "
                     f"not the same as nothing found.")
-        if arch and host and arch != host:
+        if substrate.foreign_cpu(arch, ftype, host):
             return (f"heap check is native-arch only (target {arch}, host {host}); a per-arch "
                     f"shim under qemu is future work.")
         if linking == "static":
@@ -121,7 +121,7 @@ def _why_unavailable(stage: str, target) -> Optional[str]:
             return (f"memcheck is a host-architecture dynamic translator and cannot run a "
                     f"{(ftype or 'non-native').upper()} target.")
         host = _sb.host_arch()
-        if arch and host and arch != host:
+        if substrate.foreign_cpu(arch, ftype, host):
             return (f"memcheck runs the target natively (target {arch}, host {host}); a "
                     f"cross-arch shadow-memory oracle is not available here.")
         if memoracle.valgrind_bin() is None:
@@ -131,7 +131,13 @@ def _why_unavailable(stage: str, target) -> Optional[str]:
         from .debug import gdb
         from .dynamic import sandbox
         host = sandbox.host_arch()
-        if arch and host and arch != host:
+        # The substrate reason comes FIRST: a managed target's `arch` is its runtime's name, so
+        # the comparison below told the operator "needs native execution (target cil)" -- true
+        # by accident, and it named the wrong obstacle.
+        why = substrate.native_only_reason(ftype, "follow-fork multi-process debugging")
+        if why:
+            return why
+        if substrate.foreign_cpu(arch, ftype, host):
             return f"follow-fork debugging needs native execution (target {arch}, host {host})."
         if gdb.locate_gdb(None) is None:
             return "follow-fork multi-process debugging requires gdb, which is not installed."

@@ -1,9 +1,11 @@
 # Quick start
 
 New to lykos? This is the five-minute path from a fresh install to your first finding.
-It assumes lykos is already on this machine — if you are setting up an air-gapped
-workstation from a disk, do [docs/air-gap.md](docs/air-gap.md) first,
-then come back here.
+It assumes lykos is already on this machine. Moving it to another machine is
+`git clone` plus `./lykos doctor` — the core is Python-stdlib-only, so the repo
+runs on its own and doctor names anything else worth installing. For a machine with
+no network, build the toolchain bundle first:
+[docs/offline-packaging.md](docs/offline-packaging.md).
 
 ## What lykos is
 

@@ -305,13 +305,29 @@ def test_orchestrate_prove_stages_receive_params():
     """Regression: the background (server-side) Autopilot listed root_cause/build_poc/
     poc_primitive as no-param stages, so _run_target_stage dropped the crashing input the prove
     loop threads in -- every one then failed with 'requires params.input_sha'. Those stages must
-    NOT be in _NO_PARAMS; only the genuinely param-less recover stages are."""
-    from lykos.analyze import orchestrate
-    for stage in ("root_cause", "build_poc", "poc_primitive"):
-        assert stage not in orchestrate._NO_PARAMS, \
-            f"{stage} needs params.input_sha but is marked no-param"
-    assert orchestrate._NO_PARAMS == {"disassemble", "detect_cwe", "heap_trace", "oob_index",
-                                      "chain_primitive", "synthesize_poc", "firmware_carve",
-                                      "source_cve_scan", "embedded_audit",
-                                      "int_overflow_scan", "uaf_scan", "source_sink_scan",
-                                      "net_fuzz", "env_fuzz", "cve_corroborate", "cve_poc"}
+    NOT be in _NO_PARAMS; only the genuinely param-less recover stages are.
+
+    Checked by DERIVING the set that must be excluded rather than pinning a copy of _NO_PARAMS.
+    The copy went stale five times over (extract_secrets, synthesize_secret, libfuzzer,
+    boundary_fuzz, mem_oracle were each added for a reason the stage itself documents), and a
+    snapshot that fails on every legitimate addition stops being read as a signal -- while the
+    thing it was guarding is a property every stage states in its own first lines.
+    """
+    import inspect
+
+    from lykos.analyze import orchestrate, register
+    from lykos.jobs import registry
+    register()
+    needs_input = set()
+    for name in registry.list_stages():
+        try:
+            src = inspect.getsource(registry.get_stage(name).fn)
+        except (OSError, TypeError):                     # a C/builtin stage has no source
+            continue
+        if "requires params.input_sha" in src:
+            needs_input.add(name)
+    assert {"root_cause", "build_poc", "poc_primitive"} <= needs_input, \
+        "the prove-loop stages no longer announce their required input; update this check"
+    assert not (needs_input & orchestrate._NO_PARAMS), \
+        ("stages that raise on a missing params.input_sha but are marked no-param, so the "
+         f"autopilot will drop it: {sorted(needs_input & orchestrate._NO_PARAMS)}")

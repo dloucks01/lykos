@@ -1204,7 +1204,7 @@ def fuzz_stage(ctx) -> dict:
         _syms = triage_symbols(ctx.conn, ctx.content, target)
     channels = ([p["input_mode"]] if p.get("input_mode")
                 else modes_for(CallEdgeDAO(ctx.conn).list_by_target(target.id),
-                               symbols=_syms))
+                               symbols=_syms, file_type=target.file_type))
     max_execs = int(p.get("max_execs", 3000))
     max_seconds = float(p.get("max_seconds", 30))
     exec_timeout = float(p.get("exec_timeout", 2))

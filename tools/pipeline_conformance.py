@@ -672,6 +672,33 @@ int main(void){ setvbuf(stdout,0,2,0);
          note="WASM DYNAMIC: a store at an offset taken from the input, demonstrated as an "
               "out-of-bounds trap rather than merely identified as a wasm module"),
 
+    # CHANNEL x FORMAT, the cell no case covered. Every non-stdin case above is a native ELF and
+    # every managed case is stdin-only, so nothing asked whether a channel the ranking OFFERS can
+    # actually carry input on the substrate it offers it for. For wasm it could not: the driver
+    # hardcoded `args: ['prog']`, so an argument never reached the module, and it granted no
+    # filesystem preopens, so `file` was impossible by construction -- yet `arg` ranked FIRST for
+    # every wasm target, on the slowest substrate measured here (11 exec/s).
+    #
+    # This module is a WASI COMMAND: it exports `_start`, so it has a process and therefore an
+    # argv. Its defect is reachable ONLY through that argv (it reads no input at all otherwise),
+    # so a clean verdict here means the channel delivered nothing -- which is precisely what the
+    # ranking was spending its budget on before.
+    Case("wasm_argv_trap", "",
+         [], want_level=0, want_cwe=("CWE-119", "CWE-787", "CWE-125"),
+         requires=("node", "clang"), budget=300.0,
+         build=(["sh", "-c",
+                 "printf '__attribute__((import_module(\"wasi_snapshot_preview1\"), "
+                 "import_name(\"args_sizes_get\")))\n"
+                 "int args_sizes_get(int *argc, int *bufsize);\n"
+                 "__attribute__((export_name(\"_start\")))\n"
+                 "void _start(void){ int c = 0, s = 0; args_sizes_get(&c, &s);\n"
+                 "  if (c >= 2) { volatile char *p = (volatile char *)0x7fff0000; "
+                 "*p = (char)c; } }\n' > w3.c && "
+                 "clang --target=wasm32 -nostdlib -Wl,--no-entry -O0 -o w3.wasm w3.c"],
+                "w3.wasm"),
+         note="WASM ARGV: a WASI command whose only input channel is argv, demonstrated as an "
+              "out-of-bounds trap -- a clean verdict here means the channel delivered nothing"),
+
     # A .NET assembly IS a PE, so for as long as the dispatch asked only "is it a PE" this went
     # to WINE -- which cannot execute managed code without Wine Mono. Nothing ran, and the run
     # was reported crashed=False with no note: a CLEAN verdict on a target that never executed,

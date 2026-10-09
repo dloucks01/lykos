@@ -18,6 +18,7 @@ import os
 
 from ...db.dao import FindingDAO, TargetDAO
 from ...jobs.registry import register_stage
+from .. import substrate
 from ..dynamic import sandbox
 from ..poc.capture import how_to_feed
 from . import syscalls, winapi
@@ -206,7 +207,7 @@ def behavior_trace_stage(ctx) -> dict:
                          f"is {fmt.upper()} (macOS needs a full-system VM)."})
         ctx.progress(pct=100, msg=f"behavior trace does not support {fmt.upper()} targets")
         return {}
-    emulated = bool(target.arch and target.arch != host)
+    emulated = substrate.foreign_cpu(target.arch, target.file_type, host)
     # backend: auto (native->gdb, cross->qemu), or forced. The gdb backend decodes the connect()
     # sockaddr (ip:port) but can't follow a forked child's exec (system/popen via clone3); the
     # qemu backend follows children (captures that exec) but leaves the connect dest undecoded.

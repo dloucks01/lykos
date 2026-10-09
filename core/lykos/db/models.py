@@ -34,6 +34,33 @@ MEMORY_CORRUPTION_CWES = frozenset({
     "CWE-824", "CWE-825",
 })
 
+#: A NARROWER question, and the reason it is a second set: which of root_cause's classes are
+#: specific enough to KEEP over a confirmed primitive's own label.
+#:
+#: `primitive_stage` relabels a reproduced crash once it has confirmed what the input can do
+#: (instruction-pointer control, an arbitrary write, a controlled read) but defers to
+#: root_cause's CWE where that is already a memory-corruption class, because root_cause read
+#: the sanitizer/debugger report and is usually more precise. Reusing the severity-floor set
+#: above for that silently widened the keep-list by seven classes, and two of them are the
+#: exact mislabelling the deferral exists to prevent:
+#:
+#:   * CWE-476 (null-pointer dereference) -- measured on a service carved out of a SquashFS
+#:     image: a stack smash left a NEAR-NULL return address, root_cause read the fault as a null
+#:     deref, and a confirmed IP hijack at a known stack offset went out carrying a DoS-grade
+#:     weakness id. A null deref CONTRADICTS a confirmed hijack; it must be replaced, not kept.
+#:   * CWE-129 (improper index validation) names the input flaw, not the access, so it loses the
+#:     one thing the primitive established.
+#:   * CWE-131/134/190/191/680 are likewise CAUSES (a bad size calculation, a format string, an
+#:     integer wrap) rather than the corruption the primitive has just demonstrated.
+#:
+#: They stay in the severity floor above, where the question is only "does a reproducer prove
+#: impact for this family" -- and a reproduced null deref or integer wrap does.
+OUTRANKS_PRIMITIVE_CWES = frozenset({
+    "CWE-119", "CWE-120", "CWE-121", "CWE-122", "CWE-124", "CWE-125", "CWE-126", "CWE-127",
+    "CWE-193", "CWE-415", "CWE-416", "CWE-590", "CWE-761", "CWE-787", "CWE-788", "CWE-822",
+    "CWE-823", "CWE-824", "CWE-825",
+})
+
 #: Detectors that merely SPOT something in the image -- no execution, nothing demonstrated.
 #: Everything that decides "has this been proven?" filters on this, so it is kept here beside
 #: the states and severities rather than copied into each consumer.

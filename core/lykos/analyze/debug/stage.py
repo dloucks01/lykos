@@ -225,7 +225,7 @@ def _sanitizer_report(exe, mode, base_argv, data, scratch, timeout, target) -> s
     """Re-run a known-crashing input once with sanitizer symbolization on, and return its stderr
     (the AddressSanitizer/UBSan report). Native-arch only; delivered the way the crash was."""
     import subprocess as _sp
-    if target.arch and target.arch != sandbox.host_arch():
+    if substrate.foreign_cpu(target.arch, target.file_type, sandbox.host_arch()):
         return ""                                     # can't natively run a cross-arch build
     env = dict(os.environ)
     env["ASAN_OPTIONS"] = "symbolize=1:abort_on_error=1:halt_on_error=1:detect_leaks=0"
@@ -268,7 +268,7 @@ def root_cause_stage(ctx) -> dict:
         return _root_cause_managed(ctx, target, input_sha, base_argv, mode, timeout, managed)
 
     host = sandbox.host_arch()
-    emulated = bool(target.arch and target.arch != host)
+    emulated = substrate.foreign_cpu(target.arch, target.file_type, host)
     if emulated and not qemu_gdb.supported(target.arch):
         ctx.emit("rootcause.done", payload={"supported": False,
                  "note": f"root-cause for cross-arch {target.arch}: no qemu gdbstub layout "

@@ -19,6 +19,7 @@ from pathlib import Path
 
 from ...db.dao import FindingDAO, TargetDAO
 from ...jobs.registry import register_stage
+from .. import substrate
 from ..fuzz.runner import place
 from ..poc.capture import how_to_feed
 from . import sandbox
@@ -65,8 +66,13 @@ def heap_stage(ctx) -> dict:
     if target is None:
         raise ValueError("heap_check requires a target_id")
     p = ctx.params or {}
+    why = substrate.native_only_reason(target.file_type, "the guard-page heap checker")
+    if why:
+        ctx.emit("heap.done", payload={"ok": False, "supported": False, "note": why})
+        ctx.progress(pct=100, msg=why[:90])
+        return {}
     host = sandbox.host_arch()
-    if target.arch and target.arch != host:
+    if substrate.foreign_cpu(target.arch, target.file_type, host):
         ctx.emit("heap.done", payload={"ok": False, "supported": False,
                  "note": f"heap check is native-arch only (target {target.arch}, host {host}); "
                          f"a per-arch shim under qemu is future work"})

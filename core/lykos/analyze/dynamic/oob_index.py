@@ -22,6 +22,7 @@ import tempfile
 from pathlib import Path
 
 from ...jobs.registry import register_stage
+from .. import substrate
 from ..dynamic import sandbox
 from ..fuzz import menu
 from ..poc import exploit
@@ -148,7 +149,8 @@ def oob_index_stage(ctx) -> dict:
     if target is None:
         raise ValueError("oob_index requires a target_id")
     host = sandbox.host_arch()
-    if (target.arch and target.arch != host) or (target.file_type or "").lower() not in ("elf", ""):
+    if (substrate.foreign_cpu(target.arch, target.file_type, host)
+            or (target.file_type or "").lower() not in ("elf", "")):
         ctx.emit("oob_index.done", payload={"applicable": False,
                  "note": "out-of-bounds array-index probing is native x86-64 / ELF only"})
         return {}

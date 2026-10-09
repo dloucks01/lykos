@@ -55,3 +55,23 @@ def test_the_replacement_is_itself_a_memory_corruption_class():
     """The override must not take the finding OUT of the family it is moving it into, or a
     second pass over the same finding would flip it back."""
     assert set(PS._PRIM_CWE.values()) <= PS._MEM_CORRUPTION
+
+
+def test_the_keep_list_is_not_the_severity_floor_list():
+    """These are two different questions and they were briefly answered by one set.
+
+    The severity floor asks "does a working reproducer prove impact for this family?", and for a
+    reproduced null deref or integer wrap the answer is yes. The keep-list asks "is this class
+    specific enough to outrank what the primitive just demonstrated?", and for exactly those
+    classes the answer is no -- a null deref CONTRADICTS a confirmed hijack. Reusing the wider
+    set widened the keep-list by seven classes and reintroduced the mislabelling this file
+    exists to prevent.
+    """
+    from lykos.db.models import MEMORY_CORRUPTION_CWES, OUTRANKS_PRIMITIVE_CWES
+    assert OUTRANKS_PRIMITIVE_CWES < MEMORY_CORRUPTION_CWES, \
+        "the keep-list must stay a strict subset of the severity-floor family"
+    # The classes that name a CAUSE rather than the corruption, which the primitive supersedes.
+    causes = {"CWE-476", "CWE-129", "CWE-131", "CWE-134", "CWE-190", "CWE-191", "CWE-680"}
+    assert MEMORY_CORRUPTION_CWES - OUTRANKS_PRIMITIVE_CWES == causes
+    assert PS._MEM_CORRUPTION is OUTRANKS_PRIMITIVE_CWES, \
+        "the stage must read the narrow set, not a copy and not the floor's set"
