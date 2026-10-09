@@ -108,6 +108,44 @@ class _Heartbeat(threading.Thread):
         self._stop.set()
 
 
+def _run_timeout(run, sd, cfg):
+    """This run's deadline: the budget its CALLER gave it, else the stage's own default.
+
+    A stage's registered timeout is a safety net sized for the worst case it might legitimately
+    need -- `directed_fuzz` and `concolic` are both 3600s, and the queue default is 3600 too.
+    That is the right ceiling for a stage launched on its own and the wrong one for a stage
+    inside a case that has 420 seconds in total: measured, a single stage could claim eight
+    times the whole run, and whatever was ordered after it never executed.
+
+    So a caller that divides a budget (`analyze.budget.CaseBudget`) passes its slice as
+    `max_seconds`, which `registry._COMMON_PARAMS` permits on every stage. The MINIMUM of the
+    two wins: a per-run budget may tighten the ceiling, never raise it past what the stage
+    author thought safe.
+    """
+    base = sd.timeout if sd.timeout is not None else cfg.default_timeout
+    try:
+        want = (run.params or {}).get("max_seconds")
+        want = float(want) if want is not None else None
+    except (TypeError, ValueError):
+        want = None
+    if want is None or want <= 0:
+        return base
+    # The caller's budget is the stage's CAMPAIGN LENGTH; the kill deadline has to sit just
+    # beyond it, or the stage is killed at the exact moment it would have returned. Measured:
+    # `directed_fuzz` ended in `timeout` on every one of four channels, having done the work --
+    # the run was marked `error`, its summary never written, and the scorecard counted a stage
+    # that had in fact succeeded as a failure.
+    hard = want * _BUDGET_MARGIN + _BUDGET_GRACE_S
+    return hard if base is None else min(float(base), hard)
+
+
+#: How far the worker's kill deadline sits beyond the budget the caller gave the stage. Enough
+#: for a campaign to finish its last batch and write its summary; not enough to matter to the
+#: phase after it.
+_BUDGET_MARGIN = 1.2
+_BUDGET_GRACE_S = 10.0
+
+
 class WorkerPool:
     def __init__(self, db_path: str | Path, content: ContentStore,
                  config: Optional[JobConfig] = None,
@@ -230,7 +268,7 @@ class WorkerPool:
             self._bump("error")
             return
 
-        timeout = sd.timeout if sd.timeout is not None else self.cfg.default_timeout
+        timeout = _run_timeout(run, sd, self.cfg)
         deadline = (time.time() + timeout) if timeout else None
         # Register this execution so the supervisor can reclaim the slot if the stage wedges. Only
         # a stage WITH a deadline gets a hard deadline; an intentionally-unbounded stage does not.

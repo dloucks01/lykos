@@ -1,0 +1,311 @@
+"""The case has a wall clock, and the stages have to share it.
+
+Measured on four stock /usr/bin binaries before any of this existed, 420s of budget each:
+
+    /usr/bin/cat        1,511 executions   27 of ~40 stages   ended inside directed_fuzz
+    /usr/bin/xxd        2,756 executions   30 stages (done)   --
+    /usr/bin/readelf    1,473 executions   26 stages          ended inside concolic
+    /usr/bin/jpegtran           0          15 stages          ended inside build_exploit
+
+Three defects in that table, none of them about analysis quality:
+
+  * the campaign was never budgeted, so every target got the stage default of `max_seconds=30`
+    and `max_execs=3000` -- a smoke test, at a fraction of the 174 exec/s measured achievable
+    on /usr/bin/cat;
+  * a single stage could outlast the whole run (`directed_fuzz` and `concolic` are registered at
+    3600s, the queue default is 3600, the case had 420), so which stages you got depended on
+    where the clock stopped;
+  * and jpegtran, the one real file-format parser in the sample, was executed ZERO times because
+    `build_exploit` spent its full registered 300s on a target with no crash yet.
+
+Both of the binaries that produced no findings also produced a report that looked identical --
+one after 2,756 executions, one after none. That is what the scorecard is for.
+"""
+import re
+from pathlib import Path
+
+import pytest
+from lykos.analyze import budget as B
+from lykos.analyze import orchestrate as O
+
+_SRC = Path(O.__file__).read_text()
+
+
+# ---- the clock, divided --------------------------------------------------------------------
+
+def test_a_phase_cannot_spend_what_a_later_phase_is_owed():
+    """The core rule. `recover` keeps 70% back, so everything before the campaigns -- including
+    the crashless weaponization that deliberately runs early -- is bounded by the remaining 30%."""
+    b = B.CaseBudget(900)
+    assert b.available() == pytest.approx(270.0)          # 30% of 900
+    b.phase("search")
+    assert b.available() == pytest.approx(675.0)          # 900 - 25% reserved for proving
+    b.phase("prove")
+    assert b.available() == pytest.approx(900.0)          # last phase keeps nothing back
+
+
+def test_no_single_stage_takes_its_whole_phase():
+    """Without this the first expensive stage in a phase takes the lot, which is exactly how one
+    `build_exploit` consumed a whole case."""
+    b = B.CaseBudget(900)
+    assert b.slice("build_exploit") == pytest.approx(135.0)   # half of the recover allowance
+    b.phase("search")
+    assert b.slice("fuzz") == pytest.approx(337.5)            # half of the search allowance
+
+
+def test_a_caller_may_ask_for_less_but_never_for_more():
+    b = B.CaseBudget(900)
+    b.phase("search")
+    assert b.slice("env_fuzz", want=45.0) == pytest.approx(45.0)
+    assert b.slice("fuzz", want=10_000.0) == pytest.approx(337.5)
+
+
+def test_a_slice_too_small_to_measure_anything_is_refused_outright():
+    """"Ran out of time before this stage" is a result; a two-second campaign pretending to be
+    one is not. 0.0 is the signal the orchestrator turns into a `skipped` plan entry."""
+    b = B.CaseBudget(20)
+    assert b.slice("fuzz") == 0.0
+    assert B.CaseBudget(900, clock=lambda: 0).slice("fuzz") > 0
+
+
+def test_an_exhausted_clock_refuses_every_slice():
+    ticks = iter([0.0] + [10_000.0] * 20)
+    b = B.CaseBudget(900, clock=lambda: next(ticks))
+    assert b.expired()
+    assert b.slice("fuzz") == 0.0
+
+
+def test_the_budget_records_where_the_time_went():
+    b = B.CaseBudget(900)
+    b.record("fuzz", 120.0)
+    b.record("fuzz", 30.0)
+    b.record("disassemble", 2.0)
+    b.skipped("concolic", "no budget left in the search phase")
+    sp = b.spent()
+    assert sp["by_stage"] == {"fuzz": 150.0, "disassemble": 2.0}   # dearest first
+    assert list(sp["by_stage"]) == ["fuzz", "disassemble"]
+    assert sp["skipped_for_budget"] == [{"stage": "concolic",
+                                         "why": "no budget left in the search phase"}]
+
+
+def test_an_unknown_phase_is_a_programming_error_not_a_default():
+    with pytest.raises(ValueError):
+        B.CaseBudget(900).phase("exploit")
+
+
+def test_the_spent_record_is_json_serializable():
+    """It goes into the autopilot's status dict, which the API serializes wholesale to the UI."""
+    import json
+    json.dumps(B.CaseBudget(900).spent())
+
+
+# ---- the worker honours a per-run budget ---------------------------------------------------
+
+class _SD:
+    def __init__(self, timeout):
+        self.timeout = timeout
+
+
+class _Run:
+    def __init__(self, params):
+        self.params = params
+
+
+class _Cfg:
+    default_timeout = 3600.0
+
+
+def _t(params, stage_timeout=3600.0):
+    from lykos.jobs.worker import _run_timeout
+    return _run_timeout(_Run(params), _SD(stage_timeout), _Cfg())
+
+
+def test_a_per_run_budget_tightens_the_stages_own_ceiling():
+    """The measured failure: `directed_fuzz` is registered at 3600s and the case had 420."""
+    assert _t({"max_seconds": 120.0}) < 3600.0
+    assert _t({"max_seconds": 120.0}) < _t({"max_seconds": 600.0})
+
+
+def test_the_kill_deadline_sits_just_BEYOND_the_campaign_length():
+    """The budget is the stage's own campaign length as well as the worker's kill deadline, and
+    making them the same number kills every campaign at the instant it would have returned.
+
+    Measured after the first version of this: `directed_fuzz` ended in `timeout` on all four
+    channels it was driven over -- the work was done, the run was marked `error`, its summary
+    was never written, and the scorecard counted a success as a failure.
+    """
+    for want in (30.0, 120.0, 600.0):
+        hard = _t({"max_seconds": want})
+        assert hard > want, "a stage killed at its own deadline never finishes cleanly"
+        assert hard < want * 2, "the margin is a handover, not a second budget"
+
+
+def test_a_per_run_budget_can_never_raise_the_ceiling():
+    """A stage author's timeout is a safety limit. A caller may ask for less, never for more."""
+    assert _t({"max_seconds": 9999.0}, stage_timeout=300.0) == 300.0
+
+
+@pytest.mark.parametrize("params", [{}, {"max_seconds": None}, {"max_seconds": "soon"},
+                                    {"max_seconds": 0}, {"max_seconds": -5}, None])
+def test_without_a_usable_budget_the_stage_default_still_applies(params):
+    """Nothing here may make a stage launched on its own from the API lose its timeout."""
+    assert _t(params) == 3600.0
+
+
+def test_an_intentionally_unbounded_stage_stays_unbounded_without_a_budget():
+    assert _t({}, stage_timeout=None) == 3600.0           # falls back to the queue default
+    assert 60.0 < _t({"max_seconds": 60.0}, stage_timeout=None) < 120.0
+
+
+# ---- the operator's facts reach the stages -------------------------------------------------
+
+def test_argv_reaches_every_stage_and_seeds_only_the_fuzzers():
+    """`dynamic_run` is the one stage that VALIDATES its params, and it declares argv but not
+    seed_files -- handing it the latter would fail the run outright."""
+    over = {"argv": ["-r", "@@"], "seed_files": ["/tmp/a.jpg"]}
+    assert O._apply_overrides("dynamic_run", None, over) == {"argv": ["-r", "@@"]}
+    assert O._apply_overrides("fuzz", None, over) == over
+    assert O._apply_overrides("disassemble", None, over) == {"argv": ["-r", "@@"]}
+
+
+def test_what_the_operator_knows_beats_what_the_pipeline_inferred():
+    """The channel ranking is a guess from the imported symbols; an explicit mode is knowledge.
+    A program handed its input on the wrong channel looks exactly like one with no bugs."""
+    got = O._apply_overrides("fuzz", {"input_mode": "stdin"}, {"input_mode": "file"})
+    assert got["input_mode"] == "file"
+
+
+def test_empty_overrides_change_nothing():
+    base = {"input_mode": "stdin"}
+    assert O._apply_overrides("fuzz", base, None) == base
+    assert O._apply_overrides("fuzz", base, {"argv": [], "seed_files": None}) == base
+
+
+def test_the_seed_scope_lists_only_stages_that_read_seeds():
+    for stage in O._OVERRIDE_SCOPE["seed_files"]:
+        assert stage in O._TARGET, stage
+
+
+# ---- the ordering invariant ---------------------------------------------------------------
+
+def _pos(needle):
+    i = _SRC.index("def run_case_autopilot(")
+    return _SRC.index(needle, i)
+
+
+def test_the_baseline_execution_comes_before_any_analysis():
+    """`dynamic_run`'s own capability description is "Run once, to see the target work". It was
+    registered, wired to the API and offered in the UI, and the autopilot never called it -- so
+    the pipeline's first execution of an arbitrary target happened inside a fuzzer twenty stages
+    later, and a run whose budget went elsewhere never ran the program at all."""
+    assert _pos('"dynamic_run"') < _pos('"disassemble"')
+    assert "dynamic_run" in O._TARGET
+    assert O._PLAN_STAGES[0][0] == "dynamic_run"
+
+
+def test_every_autopilot_stage_call_carries_the_budget():
+    """A stage added to the pipeline without a budget would silently get its registered
+    timeout -- up to an hour -- and could consume the run. The autopilot's calls are spelled
+    `_staged` precisely so that this check can be made mechanically."""
+    body = _SRC[_SRC.index("def run_case_autopilot("):]
+    direct = re.findall(r"_run_target_stage\(store, t,", body)
+    assert not direct, f"{len(direct)} autopilot call(s) bypass the budget; use _staged"
+    assert len(re.findall(r"_staged\(bud, store, t,", body)) > 30
+
+
+def test_the_phases_are_entered_in_order():
+    assert _pos('bud.phase("recover")') < _pos('bud.phase("search")') < _pos('bud.phase("prove")')
+
+
+def test_the_campaigns_are_inside_the_search_phase():
+    """If a campaign were left in `recover` it would be capped by the 30% allowance, and if it
+    were in `prove` it would spend the reserve that exists to prove what it finds."""
+    s, p = _pos('bud.phase("search")'), _pos('bud.phase("prove")')
+    for stage in ('"coverage_fuzz"', '"fuzz"', '"directed_fuzz"'):
+        assert s < _pos(stage) < p, stage
+
+
+def test_a_campaign_is_bounded_by_time_and_not_by_an_arbitrary_count():
+    """The stage default of 3,000 executions turned a 200-second slice into a 17-second
+    campaign on a fast target. Time is the bound the operator actually has."""
+    assert "fuzz" in O._EXEC_BOUNDED and "coverage_fuzz" in O._EXEC_BOUNDED
+    assert B.EXEC_CEILING > 100_000
+
+
+# ---- the scorecard ------------------------------------------------------------------------
+
+def test_the_scorecard_event_is_what_the_report_reads():
+    """One derivation of "how much work was done", not two: the report reads the autopilot's own
+    record rather than re-deriving it, so the deliverable cannot disagree with what the operator
+    watched happen."""
+    from lykos.report import model
+    assert O.SCORECARD_EVENT == "autopilot.scorecard"
+    assert "SCORECARD_EVENT" in Path(model.__file__).read_text()
+
+
+def test_the_report_states_the_work_behind_a_null_result():
+    """The two stock binaries that found nothing -- one after 2,756 executions and one after
+    none -- rendered identically. These are the fields that separate them."""
+    html = Path(__import__("lykos.report.html", fromlist=["x"]).__file__).read_text()
+    for field in ("baseline", "executions_attempted", "stages_skipped_for_budget"):
+        assert field in html, field
+    assert "DID NOT RUN" in html
+
+
+def test_a_stage_skipped_for_budget_is_an_execution_gap_in_the_report():
+    """"We ran out of time before this stage" must reach the same prominence as "this stage
+    found nothing", or a short run reads as a clean one."""
+    html = Path(__import__("lykos.report.html", fromlist=["x"]).__file__).read_text()
+    i = html.index("Execution gaps")
+    assert "Ran out of time before" in html[i:i + 2500]
+
+
+# ---- the front door ------------------------------------------------------------------------
+
+def test_the_cli_can_analyse_a_binary():
+    """There was no CLI path to the pipeline at all: `serve`, `eval`, `archgate`, `realgate`,
+    `doctor` -- nothing that takes a file. So the only ways in were the browser console and
+    importing the orchestrator, which is why nobody had ever watched it run on an arbitrary
+    binary."""
+    from lykos.cli import build_parser
+    args = build_parser().parse_args(["analyze", "/bin/ls", "--budget", "120",
+                                      "--argv", "-l @@", "--input-mode", "file"])
+    assert args.binary == "/bin/ls" and args.budget == 120.0
+    assert args.input_mode == "file"
+    # One shell-quoted string, not a list: argparse reads a leading-dash list element as an
+    # unknown option, so `--argv -c @@` -- the shape every real invocation has -- cannot parse.
+    import shlex
+    assert shlex.split(args.argv) == ["-l", "@@"]
+
+
+def test_the_cli_passes_the_budget_and_the_overrides_to_the_autopilot():
+    import inspect
+
+    from lykos.cli import _cmd_analyze
+    src = inspect.getsource(_cmd_analyze)
+    assert "args.budget" in src and "over" in src
+    sig = inspect.signature(O.run_case_autopilot)
+    assert list(sig.parameters)[-2:] == ["budget_seconds", "overrides"]
+
+
+def test_nothing_that_consumes_a_crash_runs_before_the_stages_that_produce_one():
+    """The ordering invariant. `root_cause`, `build_poc` and `poc_primitive` all require
+    `params.input_sha` -- a crash -- so running them before the campaigns would be asking for
+    evidence that cannot exist yet.
+
+    `build_exploit` is the deliberate exception and stays early: its `auto` strategy provokes
+    its OWN leak and needs no crash, and placing it early was itself an earlier fix for a
+    budget it could never reach at the end of the pass. What was wrong was not its position but
+    that it could spend the search phase's share -- which the phase reserve now prevents.
+    """
+    first_campaign = min(_pos('"coverage_fuzz"'), _pos('"fuzz"'))
+    for stage in ('"root_cause"', '"build_poc"', '"poc_primitive"'):
+        assert _pos(stage) > first_campaign, f"{stage} needs a crash that does not exist yet"
+
+
+def test_the_crashless_weaponizer_is_bounded_where_it_sits():
+    """Measured: unbounded in that slot it took its full registered 300s on a jpegtran with no
+    crash, and the run ended before any fuzzer started."""
+    body = _SRC[_SRC.index("def run_case_autopilot("):]
+    m = re.search(r'_staged\(bud, store, t, "build_exploit", status, stop,[^)]*?\)', body, re.S)
+    assert m and "want=" in m.group(0), "build_exploit must declare what it is worth"

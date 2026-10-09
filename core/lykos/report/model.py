@@ -264,6 +264,11 @@ def build_report(
         # zero executions still read as "AFL++ was used".
         execution["failed_stages"] = sorted({
             r.stage for r in _target_runs if r.status in ("error", "timeout") and r.stage})
+        # R7: the SCORECARD -- what the run actually did to this target, which is the only thing
+        # that makes "no findings" readable. Measured: one stock binary completed the pipeline
+        # with 2,756 executions and no crash (a real clean result) while another executed ZERO
+        # times because a stage upstream spent the budget, and the two reports were identical.
+        execution.update(_scorecard(store, case_id, t.id))
         crash_by_input: dict[str, Any] = {}
         for d in crashes:
             if d.input_sha and d.input_sha not in crash_by_input:
@@ -381,6 +386,38 @@ def build_report(
             "poc_levels": poc_levels,
         },
         "targets": targets_out,
+    }
+
+
+def _scorecard(store, case_id: str, target_id: str) -> dict:
+    """The autopilot's own record of the work done on this target, or {} if it never ran.
+
+    Read from the event the autopilot writes (`orchestrate.SCORECARD_EVENT`) rather than
+    re-derived here: two derivations of "how many executions" would drift, and this one has to
+    agree with what the operator watched happen.
+    """
+    try:
+        from ..analyze.orchestrate import SCORECARD_EVENT
+        best = None
+        for e in store.events.list(case_id=case_id, limit=8000):
+            if e.type != SCORECARD_EVENT:
+                continue
+            pl = e.payload if isinstance(e.payload, dict) else {}
+            if pl.get("target_id") == target_id:
+                best = pl
+        if not best:
+            return {}
+    except Exception:                                    # noqa: BLE001 -- the report must render
+        return {}
+    ex = best.get("executions") or {}
+    return {
+        "baseline": best.get("baseline"),
+        "executions_attempted": ex.get("total"),
+        "executions_per_second": ex.get("per_second"),
+        "executions_by_engine": ex.get("by_engine") or {},
+        "stage_counts": best.get("stages") or {},
+        "stages_skipped_for_budget": best.get("stages_skipped_for_budget") or [],
+        "budget": best.get("budget") or {},
     }
 
 

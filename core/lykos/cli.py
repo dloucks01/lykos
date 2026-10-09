@@ -44,6 +44,147 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_analyze(args) -> int:
+    """Point the pipeline at a binary and print what it did and what it found.
+
+    This did not exist. The platform's entry points were `serve` (the browser console) and the
+    gates, so the only way to analyse a file was through the UI or by importing the orchestrator
+    in Python -- which also meant the pipeline was never exercised the way an operator would
+    exercise it, on a binary nobody had prepared. The first run of this command over four stock
+    /usr/bin binaries is what produced the budget findings recorded in `analyze/budget.py`.
+    """
+    import tempfile
+    import threading
+    import time
+
+    from .analyze import register
+    from .analyze.ingest import enqueue_triage, ingest
+    from .analyze.orchestrate import run_case_autopilot
+    from .casestore import CaseStore
+    from .db.dao import FindingDAO, TargetDAO
+    from .jobs import JobConfig, JobQueue, WorkerPool
+
+    path = Path(args.binary)
+    if not path.is_file():
+        print(f"not a file: {path}", file=sys.stderr)
+        return 2
+    case_dir = Path(args.case_store) if args.case_store else Path(
+        tempfile.mkdtemp(prefix="lykos-case-"))
+    register()
+    store = CaseStore.open(case_dir)
+    case = store.cases.create(args.name or path.name)
+    pool = WorkerPool(store.db_path, store.content,
+                      JobConfig(workers=args.workers, poll_interval=0.02))
+    pool.start()
+    rc = 0
+    try:
+        # The operator's facts, threaded to every stage that can use them. Without this channel
+        # the autopilot could only ever GUESS how the target takes its input -- and a program
+        # given its input on the wrong channel looks exactly like a program with no bugs.
+        over = {}
+        if args.argv:
+            import shlex
+            over["argv"] = shlex.split(args.argv)
+        if args.seed:
+            over["seed_files"] = [str(Path(x).resolve()) for x in args.seed]
+        if args.input_mode:
+            over["input_mode"] = args.input_mode
+        t = ingest(store, case.id, path, filename=path.name)
+        enqueue_triage(JobQueue(store.conn), t, force=True)
+        pool.wait_idle(180)
+        tg = TargetDAO(store.conn).get(t.id)
+        print(f"target   {path.name}  {tg.file_type or '?'} {tg.arch or '?'} "
+              f"{'stripped' if tg.stripped else 'with symbols'} "
+              f"{(tg.mitigations or {}).get('pie', '?')}/pie")
+        print(f"budget   {args.budget:g}s   case {case_dir}")
+        status: dict = {"state": "starting"}
+        stop = threading.Event()
+        th = threading.Thread(target=run_case_autopilot,
+                              args=(case_dir, case.id, [t.id], status, stop, args.budget,
+                                    over),
+                              daemon=True)
+        th.start()
+        # `--budget N` has to mean something to the person who typed it, so this is a hard
+        # wall-clock wait, not a poll-until-done. The budget bounds what each STAGE may be
+        # allowed; a stage that never polls its own deadline cannot be interrupted, so the
+        # tail allowance below is what keeps the command from hanging on one wedged stage.
+        deadline = time.monotonic() + args.budget * 1.5 + 120.0
+        last = None
+        while th.is_alive() and time.monotonic() < deadline:
+            th.join(timeout=2.0)
+            cur = status.get("stage")
+            if cur and cur != last and not args.quiet:
+                print(f"  .. {cur}", flush=True)
+                last = cur
+        if th.is_alive():
+            stop.set()
+            th.join(timeout=90)
+            print("\n(stopped: the run outlasted its budget and the tail allowance; the "
+                  "scorecard below covers what finished)")
+        card = status.get("scorecard") or {}
+        _print_scorecard(card)
+        findings = [f for f in FindingDAO(store.conn).list_by_target(t.id)]
+        _print_findings(findings)
+        if args.report:
+            from .report.html import to_html
+            from .report.model import build_report
+            Path(args.report).write_text(to_html(build_report(store, case.id)))
+            print(f"\nreport   {args.report}")
+        # Exit code says whether anything was DEMONSTRATED, not whether anything was printed.
+        rc = 0 if any(f.state in ("confirmed", "poc-backed") for f in findings) else 1
+    finally:
+        pool.stop()
+        store.close()
+    return rc
+
+
+def _print_scorecard(card: dict) -> None:
+    """What the run DID. Printed before the findings, because it is what makes them readable."""
+    if not card:
+        print("\nscorecard unavailable (the run did not complete a target)")
+        return
+    base = card.get("baseline") or {}
+    ex = card.get("executions") or {}
+    bud = card.get("budget") or {}
+    print("\n-- what this run did " + "-" * 56)
+    if base:
+        print("  baseline     " + ("ran, exited normally" if base.get("ran")
+                                   and not base.get("crashed")
+                                   else "ran, FAULTED" if base.get("ran")
+                                   else "DID NOT RUN: " + str(base.get("note") or
+                                                              base.get("isolation"))))
+    else:
+        print("  baseline     not attempted")
+    rate = ex.get("per_second")
+    print(f"  executions   {ex.get('total', 0):,}" + (f"  ({rate:g}/s)" if rate else ""))
+    by = ex.get("by_engine") or {}
+    for k, v in sorted(by.items(), key=lambda kv: -kv[1]):
+        print(f"               {k:<14} {v:,}")
+    st = card.get("stages") or {}
+    print("  stages       " + ", ".join(f"{k} {v}" for k, v in sorted(st.items())))
+    if card.get("stages_skipped_for_budget"):
+        print("  out of time  " + ", ".join(card["stages_skipped_for_budget"][:8]))
+    if bud.get("total"):
+        print(f"  budget       {bud.get('elapsed', 0):g}s of {bud['total']:g}s")
+        dear = list((bud.get("by_stage") or {}).items())[:4]
+        if dear:
+            print("  dearest      " + ", ".join(f"{k} {v:g}s" for k, v in dear))
+
+
+def _print_findings(findings) -> None:
+    print("\n-- findings " + "-" * 64)
+    if not findings:
+        print("  none. Read that against the scorecard above: no findings after a campaign that "
+              "ran\n  is a result; no findings after one that did not is not.")
+        return
+    order = {"poc-backed": 0, "confirmed": 1, "corroborated": 2, "candidate": 3}
+    for f in sorted(findings, key=lambda f: (order.get(f.state, 9), f.cwe or "")):
+        print(f"  [{f.state:<12}] {f.severity:<8} {f.cwe or '-':<10} "
+              f"{(f.title or '')[:52]:<52} {f.detector or ''}")
+    demod = [f for f in findings if f.state in ("confirmed", "poc-backed")]
+    print(f"\n  {len(demod)} demonstrated, {len(findings) - len(demod)} detected only.")
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="lykos", description="lykos core CLI")
     p.add_argument("--version", action="version", version=f"lykos {__version__}")
@@ -128,6 +269,28 @@ def build_parser() -> argparse.ArgumentParser:
                     help="comma-separated case labels to check (default: all)")
     rg.add_argument("--out", default=None, help="write the JSON report here")
     rg.set_defaults(func=_cmd_realgate)
+
+    an = sub.add_parser("analyze",
+                        help="run the full pipeline on one binary and report what it did")
+    an.add_argument("binary", help="the file to analyse")
+    an.add_argument("--budget", type=float, default=900.0,
+                    help="wall-clock seconds for this target (default 900); divided among the "
+                         "recover/search/prove phases")
+    an.add_argument("--argv", default=None,
+                    help="how the program is invoked, as one shell-quoted string with @@ where "
+                         "the input file goes, e.g. --argv '-c @@'. A list form cannot work "
+                         "here: argparse reads a leading-dash element as an unknown option.")
+    an.add_argument("--seed", action="append", default=None,
+                    help="a valid sample input to seed the fuzzer (repeatable)")
+    an.add_argument("--input-mode", choices=["stdin", "file", "arg", "env"], default=None,
+                    help="how the input reaches the program (default: inferred from its imports)")
+    an.add_argument("--case-store", default=None,
+                    help="case directory to keep (default: a temporary one)")
+    an.add_argument("--name", default=None, help="case name")
+    an.add_argument("--report", default=None, help="write an HTML report here")
+    an.add_argument("--workers", type=int, default=3, help="worker threads (default 3)")
+    an.add_argument("-q", "--quiet", action="store_true", help="no per-stage progress")
+    an.set_defaults(func=_cmd_analyze)
 
     dr = sub.add_parser("doctor",
                         help="what this host can and cannot do, and how to fix the gaps")

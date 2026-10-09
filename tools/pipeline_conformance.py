@@ -1325,7 +1325,12 @@ def _run_case(case: Case, gcc: str) -> Result:
                           "" if ok else "want file_type %r; triaged as %r" % (
                               case.want_file_type, tg.file_type))
         status = {}; stop = threading.Event()
-        th = threading.Thread(target=run_case_autopilot, args=(d / "case", c.id, [t.id], status, stop),
+        # The case's budget is the autopilot's budget. Passing it is what makes the phase
+        # reserves mean anything here: with the default the orchestrator would divide a 900s
+        # clock while this harness stops the run at `case.budget`, so a single stage could still
+        # eat a short case -- the very pathology the budget exists to prevent.
+        th = threading.Thread(target=run_case_autopilot,
+                              args=(d / "case", c.id, [t.id], status, stop, case.budget),
                               daemon=True)
         th.start()
         # Stop once the case has demonstrated its STATED LEVEL, instead of burning the whole budget:

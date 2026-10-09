@@ -27,10 +27,13 @@ from ..casestore import CaseStore
 from ..db.dao import DynResultDAO, FindingDAO, FunctionDAO, PocDAO
 from ..db.models import STATIC_DETECTORS
 from ..jobs.queue import JobQueue
+from . import budget as budget_mod
 from . import substrate
 
 # stage -> (module, enqueue-fn). Target-scoped unless listed in _CASE.
 _TARGET = {
+    # The FLOOR: one execution, before any analysis. See the call site for why it was missing.
+    "dynamic_run": ("..analyze.dynamic", "enqueue_dynamic"),
     "disassemble": ("..analyze.disassemble", "enqueue_disassemble"),
     "detect_cwe": ("..analyze.detect", "enqueue_detect"),
     "cve_scan": ("..analyze.fingerprint", "enqueue_cve_scan"),
@@ -151,6 +154,7 @@ def _best_block_pct(store, target_id) -> Optional[float]:
 # ladder) start `pending` and become `skipped` if the run does not reach them. Repeats (directed
 # fuzz runs twice; root_cause/build_poc run per crash) update the same entry.
 _PLAN_STAGES = [
+    ("dynamic_run", "Baseline execution"),
     ("disassemble", "Disassemble"), ("detect_cwe", "Static detectors"),
     ("cve_scan", "Known-CVE scan"), ("source_cve_scan", "Dependency-CVE scan"),
     ("embedded_audit", "RTOS config audit"), ("int_overflow_scan", "Int-overflow allocs"),
@@ -278,9 +282,78 @@ def _looks_packed(store, target) -> bool:
         return False
 
 
-def _run_target_stage(store, target, stage, status, stop, params=None) -> Optional[str]:
+#: Operator-supplied invocation facts, and which stages may be handed each one.
+#:
+#: There was no channel for these at all: `run_case_autopilot` took no params, so a caller who
+#: KNEW how the target is invoked -- the one thing that decides whether a campaign does any work
+#: -- could not tell it. The UI's invocation box reaches the fuzz stage only when that stage is
+#: launched by hand. `argv` and `input_mode` are safe everywhere (`dynamic_run` is the only stage
+#: that validates its params, and it declares both); `seed_files`/`seed_dir` are read by the
+#: fuzzers alone and `dynamic_run` would reject them.
+_OVERRIDE_SCOPE: dict = {
+    "argv": None,                                        # None = every stage
+    "input_mode": None,
+    "seed_files": frozenset({"fuzz", "coverage_fuzz", "directed_fuzz"}),
+    "seed_dir": frozenset({"fuzz", "coverage_fuzz", "directed_fuzz"}),
+}
+
+
+def _apply_overrides(stage: str, params: Optional[dict], overrides: Optional[dict]) -> dict:
+    """Operator facts win over the autopilot's inferences: they are knowledge, not a guess."""
+    out = dict(params or {})
+    for key, value in (overrides or {}).items():
+        if value in (None, [], ""):
+            continue
+        scope = _OVERRIDE_SCOPE.get(key, frozenset())
+        if scope is None or stage in scope:
+            out[key] = value
+    return out
+
+
+#: Mirrors jobs.worker._BUDGET_MARGIN: the orchestrator must outlast the worker's kill deadline,
+#: or it stops waiting on a stage that was about to finish cleanly.
+_WORKER_MARGIN = 1.25
+
+
+#: Stages whose own default caps EXECUTIONS as well as time. The count is a runaway guard, not
+#: a campaign size -- see budget.EXEC_CEILING.
+_EXEC_BOUNDED = frozenset({"fuzz", "coverage_fuzz", "directed_fuzz", "net_fuzz", "env_fuzz"})
+
+
+def _run_target_stage(store, target, stage, status, stop, params=None, *,
+                      budget=None, want=None) -> Optional[str]:
+    """Run one stage and wait for it, within the slice its phase can afford.
+
+    `budget` is the case's divided wall clock (`analyze.budget.CaseBudget`). The slice is handed
+    to the stage as `max_seconds`, which does three jobs at once: it caps the wait below, it
+    becomes the worker's per-run deadline so a wedged stage stops blocking the pipeline, and for
+    the four stages that read `max_seconds` themselves it IS the campaign length -- which is how
+    a campaign stops being a 30-second smoke test on every target.
+
+    With no budget the behaviour is exactly as before, so a stage launched on its own from the
+    API still gets its registered timeout.
+    """
     if stop.is_set():
         return None
+    secs = None
+    if budget is not None:
+        secs = budget.slice(stage, want)
+        if secs <= 0.0:
+            # Saying this is the point: "we ran out of time before this stage" and "this stage
+            # found nothing" are different outcomes that used to look identical in a report.
+            why = f"no budget left in the {budget.current_phase} phase"
+            budget.skipped(stage, why)
+            _plan_set(status, stage, "skipped", why)
+            _emit_stage(store, target.case_id, stage, "skipped", target_id=target.id, detail=why)
+            return "skipped"
+        params = dict(params or {})
+        # MIN, never MAX: an explicit caller budget may tighten the slice but not exceed it.
+        prior = params.get("max_seconds")
+        params["max_seconds"] = min(float(prior), secs) if prior else secs
+        if stage in _EXEC_BOUNDED and "max_execs" not in params:
+            # Time is the bound that matters; the count is only a runaway guard. The stage
+            # default of 3,000 turned a 200-second slice into a 17-second campaign.
+            params["max_execs"] = budget_mod.EXEC_CEILING
     status["stage"] = stage
     status["updated"] = time.time()
     _plan_set(status, stage, "running")
@@ -311,13 +384,40 @@ def _run_target_stage(store, target, stage, status, stop, params=None) -> Option
         _plan_set(status, stage, "done", d)
         _emit_stage(store, target.case_id, stage, "done", target_id=target.id, detail=d)
         return "done"
-    outcome = _wait(store, run.id, stop)
+    t_begin = time.time()
+    # The grace is PROPORTIONAL, and small. The worker's deadline fires at the slice and marks
+    # the run, but a stage that never polls `should_cancel()` cannot be interrupted -- all the
+    # orchestrator can do is stop waiting and move on, leaving the stage to finish on its own
+    # worker thread. A flat +30s grace made that generosity the dominant term: measured on a
+    # 90-second budget, `build_exploit` was allowed 13.5s and held the pipeline for 42.1s, so
+    # the search phase it was supposed to protect got nothing at all.
+    # Beyond the worker's own kill deadline (jobs.worker._run_timeout), which already sits a
+    # little past the stage's campaign length, plus a small proportional grace for the handover.
+    grace = min(15.0, max(3.0, secs * 0.25)) if secs else None
+    wait_for = (secs * _WORKER_MARGIN + grace) if secs else None
+    outcome = _wait(store, run.id, stop, **({"timeout": wait_for} if wait_for else {}))
+    if budget is not None:
+        budget.record(stage, time.time() - t_begin)
     pstate = ({"done": "done", "cancelled": "cancelled", "timeout": "error",
                "error": "error"}).get(outcome, outcome or "error")
     d = _stage_detail(store, target, stage) if pstate == "done" else None
     _plan_set(status, stage, pstate, d)
     _emit_stage(store, target.case_id, stage, pstate, target_id=target.id, detail=d)
     return outcome
+
+
+def _staged(budget, store, target, stage, status, stop, params=None, *, want=None,
+            overrides=None):
+    """`_run_target_stage` with the case budget in front, for the autopilot's own call sites.
+
+    Spelled as its own name so that a stage added to the pipeline without a budget is visible in
+    review: `_run_target_stage` still exists for the API's single-stage launches, where the
+    stage's registered timeout is the right ceiling.
+    """
+    over = overrides if overrides is not None else getattr(budget, "overrides", None)
+    return _run_target_stage(store, target, stage, status, stop,
+                             _apply_overrides(stage, params, over),
+                             budget=budget, want=want)
 
 
 def _run_target_stages(store, target, specs, status, stop) -> dict:
@@ -640,8 +740,75 @@ def _note_static_memcorruption(store, target) -> None:
         _log.debug("static-memcorruption note failed for %s", target.id, exc_info=True)
 
 
-def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict, stop: threading.Event) -> None:
-    """The background pipeline. Owns its OWN CaseStore connection (SQLite is per-thread)."""
+SCORECARD_EVENT = "autopilot.scorecard"
+
+
+def _scorecard(store, target, bud, status) -> dict:
+    """What this run actually DID to the target, recorded whether or not it found anything.
+
+    The gap this closes, measured on four stock /usr/bin binaries: one of them
+    (`/usr/bin/xxd`) completed the whole pipeline with 2,756 executions and no crash -- a
+    legitimately clean result -- and another (`/usr/bin/jpegtran`) executed the program ZERO
+    times because a stage upstream consumed the budget. Both produced a report with
+    `corroborated` findings and no crashes, and nothing in either report distinguished them.
+
+    A null result is only worth something next to the work behind it, so this records the work:
+    did the program run at all, how many times, how fast, which stages were reached, and which
+    were skipped for want of time. The report prints it beside the findings.
+    """
+    card: dict = {"target_id": target.id, "filename": target.filename}
+
+    # One pass over the case's events: the baseline verdict and every campaign's own execution
+    # count. `dynamic.done` already reports `ran`, which is the floor this whole card is about.
+    by_stage: dict = {}
+    try:
+        events = store.events.list(case_id=target.case_id, limit=8000)
+    except Exception:                                    # noqa: BLE001 -- advisory
+        _log.debug("scorecard: event read failed", exc_info=True)
+        events = []
+    for e in events:
+        pl = e.payload if isinstance(e.payload, dict) else {}
+        if e.type == "dynamic.done" and "baseline" not in card:
+            card["baseline"] = {"ran": bool(pl.get("ran")), "crashed": bool(pl.get("crashed")),
+                                "isolation": pl.get("isolation"),
+                                "note": str(pl.get("note") or "")[:200]}
+        n = pl.get("execs")
+        if isinstance(n, int) and n > 0 and "." in (e.type or ""):
+            key = (e.type or "").split(".")[0]
+            if n > by_stage.get(key, 0):
+                by_stage[key] = n                        # a stage's last count, not a sum of ticks
+    execs = sum(by_stage.values())
+    card["executions"] = {"total": execs, "by_engine": by_stage}
+
+    spent = bud.spent()
+    search = max(1e-3, sum(v for k, v in spent["by_stage"].items() if k in _EXEC_BOUNDED))
+    card["executions"]["per_second"] = round(execs / search, 1) if execs else 0.0
+    card["budget"] = spent
+
+    plan = status.get("plan") or []
+    counts: dict = {}
+    for step in plan:
+        st = (step.get("state") or "pending") if isinstance(step, dict) else "pending"
+        counts[st] = counts.get(st, 0) + 1
+    card["stages"] = counts
+    card["stages_skipped_for_budget"] = list(
+        dict.fromkeys(x["stage"] for x in spent["skipped_for_budget"]))
+    store.events.append(SCORECARD_EVENT, case_id=target.case_id, payload=card)
+    return card
+
+
+def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
+                       stop: threading.Event, budget_seconds: Optional[float] = None,
+                       overrides: Optional[dict] = None) -> None:
+    """The background pipeline. Owns its OWN CaseStore connection (SQLite is per-thread).
+
+    `budget_seconds` is the wall clock EACH TARGET gets, divided among the phases by
+    `budget.CaseBudget` (default `budget.DEFAULT_TARGET_BUDGET`). Before this the pipeline had no
+    budget of its own: stage timeouts were absolute and generous (3600s for two of them), so a
+    single stage could outlast the whole run and everything after it never executed. Measured on
+    stock /usr/bin binaries, three runs out of four ended inside one stage with a third of the
+    pipeline unreached -- see the table in `budget.py`.
+    """
     store = CaseStore(case_dir)
     try:
         status.update({"state": "running", "targets": len(target_ids), "started": time.time()})
@@ -664,6 +831,8 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict, stop: t
             if not t:
                 continue
             _init_plan(status, t, len(done_tids), len(worklist))
+            bud = budget_mod.CaseBudget(budget_seconds, overrides=overrides)
+            status["budget"] = bud.spent()                # serializable; refreshed as we go
             # A firmware image is not a program: carve it into its embedded binaries (each registered
             # as a sub-target) and analyse THOSE. Running native recovery on the raw blob finds nothing
             # and misses every component + secret.
@@ -672,12 +841,12 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict, stop: t
                 # bare-metal) statically links its libraries, so a vulnerable zlib/openssl/etc.
                 # lives as a version banner in the container itself with no filesystem to carve
                 # and no standalone ELF to extract. The byte-scan finds it either way.
-                _run_target_stage(store, t, "cve_scan", status, stop)
-                _run_target_stage(store, t, "firmware_carve", status, stop)
+                _staged(bud, store, t, "cve_scan", status, stop)
+                _staged(bud, store, t, "firmware_carve", status, stop)
                 # A bare-metal image (no filesystem, no embedded ELF) is a Cortex-M blob: rehost
                 # it under Unicorn and fuzz its modelled MMIO inputs. The stage self-gates to a
                 # detected Cortex-M reset-vector table, so it is a cheap no-op otherwise.
-                _run_target_stage(store, t, "firmware_rehost", status, stop)
+                _staged(bud, store, t, "firmware_rehost", status, stop)
                 for sub in store.targets.list_by_case(case_id):
                     if sub.id not in done_tids and sub.id not in worklist:
                         worklist.append(sub.id)
@@ -687,38 +856,51 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict, stop: t
             # machine-code stages would analyse the decompressor, not the code. Unpack it into a
             # child target and analyse THAT, exactly as a firmware image is carved into its binaries.
             if _looks_packed(store, t):
-                _run_target_stage(store, t, "unpack", status, stop)
+                _staged(bud, store, t, "unpack", status, stop)
                 for sub in store.targets.list_by_case(case_id):
                     if sub.id not in done_tids and sub.id not in worklist:
                         worklist.append(sub.id)
                 _finalize_plan(status)
                 continue
+            # THE FLOOR, before any analysis: can this image be executed here at all, and what
+            # does it do with one input? Measured on stock /usr/bin binaries, this stage --
+            # whose own capability description is "Run once, to see the target work" -- was
+            # registered, wired to the API and offered in the UI, and the autopilot never called
+            # it. So the pipeline's first execution of an arbitrary target happened inside a
+            # fuzzer twenty stages later, and if anything upstream consumed the budget the
+            # program was never run at all while the report still showed corroborated findings.
+            #
+            # It is also the cheapest honest signal there is: a target that cannot start (wrong
+            # loader, missing runtime, needs an argument) is a different situation from one that
+            # runs and survives, and every later stage's result is read in that light.
+            bud.phase("recover")
+            _staged(bud, store, t, "dynamic_run", status, stop, want=30.0)
             # Recover + detect.
-            _run_target_stage(store, t, "disassemble", status, stop)
-            _run_target_stage(store, t, "detect_cwe", status, stop)
-            _run_target_stage(store, t, "cve_scan", status, stop)
+            _staged(bud, store, t, "disassemble", status, stop)
+            _staged(bud, store, t, "detect_cwe", status, stop)
+            _staged(bud, store, t, "cve_scan", status, stop)
             # Known-CVE scan of a built-from-source project's declared dependencies + vendored
             # headers -- versions that never survive into the compiled binary's banners.
-            _run_target_stage(store, t, "source_cve_scan", status, stop)
+            _staged(bud, store, t, "source_cve_scan", status, stop)
             # Audit an embedded RTOS config header (FreeRTOSConfig.h) for disabled safety nets.
-            _run_target_stage(store, t, "embedded_audit", status, stop)
+            _staged(bud, store, t, "embedded_audit", status, stop)
             # Unguarded size arithmetic feeding an allocator (integer-overflow allocation).
-            _run_target_stage(store, t, "int_overflow_scan", status, stop)
+            _staged(bud, store, t, "int_overflow_scan", status, stop)
             # A freed pointer used or freed again on a path the fuzzer may never reach (UAF/dbl-free).
-            _run_target_stage(store, t, "uaf_scan", status, stop)
+            _staged(bud, store, t, "uaf_scan", status, stop)
             # A dangerous sink (system/popen, printf-family) called with a non-literal arg (CWE-78/134).
-            _run_target_stage(store, t, "source_sink_scan", status, stop)
+            _staged(bud, store, t, "source_sink_scan", status, stop)
             # Recover the CONSTANTS the program checks input against -- a password, magic bytes,
             # an expected token, a menu command -- by breaking on its comparison functions. Those
             # are the values every later stage needs in order to get PAST a gate, so this belongs
             # before the campaigns, not after them. Native-arch + gdb only; self-gates.
-            _run_target_stage(store, t, "extract_secrets", status, stop)
+            _staged(bud, store, t, "extract_secrets", status, stop, want=30.0)
             # Package any hard-coded credential detect_cwe found (CWE-798/321) into a verified,
             # self-contained PoC. It is the one demonstrated-effect class that needs NO crash --
             # deterministic, offline, and it never executes the target, so it costs nothing and
             # can never be starved by the fuzzing budget. It must follow detect_cwe, whose
             # findings it promotes rather than duplicates.
-            _run_target_stage(store, t, "synthesize_secret", status, stop)
+            _staged(bud, store, t, "synthesize_secret", status, stop, want=20.0)
             # A SOCKET SERVER has to be fuzzed before anything else touches it. Such a target
             # blocks in accept() and never reads stdin, so every stage that drives it that way --
             # the injection prober, the crashless exploit ladder, the OOB-index driver, the generic
@@ -734,24 +916,24 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict, stop: t
                 _log.debug("server detection failed for %s", tid, exc_info=True)
                 _is_server = False
             if _is_server:
-                _run_target_stage(store, t, "net_fuzz", status, stop)
+                _staged(bud, store, t, "net_fuzz", status, stop, want=45.0)
             # An IPC/protocol boundary (a unix socket, a pipe, a datagram listener) is a channel
             # the generic fuzzers cannot reach at all: they drive stdin/argv/files. It discovers
             # its own channel and declines when there is none, so a plain binary pays nothing.
-            _run_target_stage(store, t, "boundary_fuzz", status, stop)
+            _staged(bud, store, t, "boundary_fuzz", status, stop, want=45.0)
             # On a SOURCE target, an in-process libFuzzer harness under ASan+UBSan is the
             # strongest crash finder available -- thousands of executions a second with a
             # sanitizer oracle, against a few hundred for out-of-process mutation. It builds its
             # own harness and reports unsupported for a binary-only target.
-            _run_target_stage(store, t, "libfuzzer", status, stop)
+            _staged(bud, store, t, "libfuzzer", status, stop, want=60.0)
 
             # Weaponize every version-matched CVE -- a bespoke per-CVE trigger where one is
             # authored, else the library's format attack (zlib bomb, XML billion-laughs) and its
             # CWE-class probes -- recording a verified reproduction only if the target faults.
-            _run_target_stage(store, t, "cve_poc", status, stop)
+            _staged(bud, store, t, "cve_poc", status, stop, want=45.0)
             # Demonstrate injection / format-string leaks by probing the binary's sinks directly
             # (no crash needed) -- a printf(user) leaks live memory, a system(user) runs a command.
-            _run_target_stage(store, t, "synthesize_injection", status, stop)
+            _staged(bud, store, t, "synthesize_injection", status, stop, want=30.0)
             # Leak-centric weaponization that needs NO crash -- run it BEFORE the budget-draining
             # fuzz/concolic below, so a modern-hardened target (PIE / stack canary / full RELRO) that
             # blind mutation can't crash still reaches its demonstrable effect within a time budget.
@@ -763,8 +945,17 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict, stop: t
             # Self-gates per arch/mitigation and reports honest ceilings -- a bounded attempt, not a
             # false positive. (Placed early precisely because the old end-of-pass slot was never
             # reached once fuzz/concolic had spent the budget.)
+            # Bounded by the PRE-SEARCH allowance on purpose. Running it early is itself an
+            # earlier fix (the end-of-pass slot was never reached once fuzz had spent the
+            # budget), and moving it back would undo that -- but unbounded it took its full
+            # registered 300s on a jpegtran that had no crash yet and the run ended before any
+            # fuzzer started. It keeps its early slot and can no longer spend the search's share.
             if not stop.is_set() and _max_verified_poc_level(store, tid) < 3:
-                _run_target_stage(store, t, "build_exploit", status, stop, {"strategy": "auto"})
+                _staged(bud, store, t, "build_exploit", status, stop,
+                        {"strategy": "auto"}, want=60.0)
+            # SEARCH: everything from here actually executes the target with attacker input, so
+            # it gets the largest share and the phase reserve stops an earlier stage spending it.
+            bud.phase("search")
             # Channel ranking (from the imports) feeds both the heap check and the fuzzer below.
             channels = _ranked_channels(store, tid)
             primary = channels[0] if channels else None
@@ -790,8 +981,8 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict, stop: t
             # undefined bytes reaching a write syscall, which IS the effect -- from a merely
             # internal one. Native-ELF only and ~10-30x a bare run, so it is a bounded pass over
             # a few inputs here rather than anything inside a campaign.
-            _run_target_stage(store, t, "mem_oracle", status, stop)
-            _run_target_stage(store, t, "chain_primitive", status, stop)
+            _staged(bud, store, t, "mem_oracle", status, stop, want=60.0)
+            _staged(bud, store, t, "chain_primitive", status, stop, want=45.0)
             # Search. The CHANNEL-SPECIFIC fuzzers go first, because each one knows the channel its
             # target actually reads and both self-gate to the imports that prove it (bind/listen/
             # recvfrom; getenv), so a target they do not apply to pays nothing. Running them after
@@ -799,7 +990,7 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict, stop: t
             # stdin/argv/file exec runs to its timeout and drains the budget before net_fuzz is ever
             # reached -- while net_fuzz crashes the same server in about three execs. The generic
             # coverage/directed sweeps then follow for whatever the binary reads conventionally.
-            _run_target_stage(store, t, "env_fuzz", status, stop)
+            _staged(bud, store, t, "env_fuzz", status, stop, want=45.0)
             # On an EXPENSIVE SUBSTRATE, synthesize the static overflow BEFORE the campaigns for
             # exactly the reason net_fuzz moved ahead of them. Wine, the JVM and qemu cannot be
             # batched (sandbox.run_batch returns None for them), so every execution pays a fresh
@@ -811,7 +1002,7 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict, stop: t
             # at L0. Native targets keep the original order -- there, fuzzing is cheap and finds
             # strictly more. The stage no-ops without recovered stack buffers.
             if _expensive_substrate(t):
-                _run_target_stage(store, t, "synthesize_poc", status, stop)
+                _staged(bud, store, t, "synthesize_poc", status, stop, want=45.0)
             # coverage fuzz (AFL, falls back to blind if unavailable), then directed on the same
             # channel -- EXCEPT on a non-native image, where AFL cannot apply at all. AFL
             # instruments machine code: a .class/.jar is bytecode and a PE runs under wine, so
@@ -827,17 +1018,26 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict, stop: t
             # channel, which is what this needs, since a bytecode target has no call edges and so
             # no channel ranking either.
             if _nonnative_image(t):
-                _run_target_stage(store, t, "fuzz", status, stop, dyn)
-            elif _run_target_stage(store, t, "coverage_fuzz", status, stop, dyn) != "done":
-                # AFL can abort for reasons that say nothing about the target: its dry run is
+                _staged(bud, store, t, "fuzz", status, stop, dyn)
+            elif _staged(bud, store, t, "coverage_fuzz", status, stop, dyn) != "done" or \
+                    bud.slice("fuzz") > 0:
+                # The blind campaign is a SECOND campaign, not only a fallback. Measured on
+                # /usr/bin/xxd with a 400s budget: coverage_fuzz returned "done" after 22s of a
+                # 97s allowance -- AFL finishing early is not AFL having searched -- and because
+                # `fuzz` was reached only when coverage_fuzz failed, the remaining 75 seconds of
+                # the search phase went unspent. The two look for different things (one is
+                # coverage-guided and single-channel, the other splits its budget across every
+                # channel the target reads), so with budget left both are worth running.
+                #
+                # AFL can also abort for reasons that say nothing about the target: its dry run is
                 # FATAL on a single seed that times out ("results in a timeout",
                 # perform_dry_run()), a missing qemu tracer ends it, a forkserver handshake can
                 # fail. Without a fallback the one campaign a native target gets simply does not
                 # happen, and the run then reports only static findings -- "nothing was run"
                 # wearing the face of "nothing was found", at campaign scale. The blind stage
                 # carries none of those preconditions, so it runs the same corpus regardless.
-                _run_target_stage(store, t, "fuzz", status, stop, dyn)
-            _run_target_stage(store, t, "directed_fuzz", status, stop, dyn)
+                _staged(bud, store, t, "fuzz", status, stop, dyn)
+            _staged(bud, store, t, "directed_fuzz", status, stop, dyn, want=120.0)
             crashes = _distinct_crashes(store, tid)
             # Multi-channel retry: the best-guess channel is not always where the bug is (a file
             # parser's overflow can be in the argv filename). If nothing crashed, drive the fast
@@ -846,7 +1046,7 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict, stop: t
                 for j, alt in enumerate([c for c in channels[1:] if c != primary]):
                     if stop.is_set():
                         break
-                    _run_target_stage(store, t, "directed_fuzz", status, stop,
+                    _staged(bud, store, t, "directed_fuzz", status, stop,
                                       {"input_mode": alt, "seed": 91 + j})
                     crashes = _distinct_crashes(store, tid)
                     if crashes:
@@ -858,11 +1058,12 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict, stop: t
             # never reached -- exactly what concolic solves for.
             cov_pct = _best_block_pct(store, tid)
             if not crashes or (cov_pct is not None and cov_pct < 60):
-                _run_target_stage(store, t, "concolic", status, stop, dyn)
+                _staged(bud, store, t, "concolic", status, stop, dyn, want=120.0)
                 # Close the coverage loop: re-fuzz once more, now that directed_fuzz automatically
                 # reuses concolic's solved inputs as seeds -- so the fuzzer explores AROUND the
                 # guarded branches concolic just unlocked, instead of the run ending at them.
-                _run_target_stage(store, t, "directed_fuzz", status, stop, {**dyn, "seed": 4242})
+                _staged(bud, store, t, "directed_fuzz", status, stop,
+                        {**dyn, "seed": 4242}, want=120.0)
                 crashes = _distinct_crashes(store, tid)
             # Static-overflow synthesis: an unbounded stack overflow (gets(), a size-less strcpy,
             # scanf("%s")) needs a long, NEWLINE-FREE payload that blind mutation almost never
@@ -879,7 +1080,7 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict, stop: t
             # held for one defect per target but not for several in one binary. The stage no-ops
             # when no stack buffers were recovered, so the added cost is one detonation.
             if not stop.is_set() and (not crashes or not _has_demonstrated(store, tid, _OVERFLOW_CWES)):
-                _run_target_stage(store, t, "synthesize_poc", status, stop)
+                _staged(bud, store, t, "synthesize_poc", status, stop, want=45.0)
                 crashes = _distinct_crashes(store, tid)
             # CVE -> exploit chain: which of these crashes were REPRODUCED by a matched-CVE trigger,
             # so if the ladder escalates one we can attribute the exploit back to the CVE. Accumulate
@@ -892,6 +1093,11 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict, stop: t
                 after = _max_verified_poc_level(store, tid)
                 if cve and after > before and after >= 2:    # the ladder raised THIS CVE crash to L2/L3
                     cve_best[cve] = max(cve_best.get(cve, 0), after)
+            # PROVE what the search found. This phase keeps no reserve -- it is last, and every
+            # crash it is given is already evidence that something is there. The reserve the
+            # search phase held back exists for exactly this: a campaign that finds a crash in
+            # its final seconds must still have time to root-cause and prove it.
+            bud.phase("prove")
             # Prove each distinct crash.
             for cr in crashes:
                 if stop.is_set():
@@ -899,26 +1105,26 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict, stop: t
                 p = {"input_sha": cr.input_sha}
                 cve = cve_origin.get(cr.input_sha)
                 lvl0 = _max_verified_poc_level(store, tid) if cve else 0
-                _run_target_stage(store, t, "root_cause", status, stop, p)
-                _run_target_stage(store, t, "build_poc", status, stop, p)
-                _run_target_stage(store, t, "poc_primitive", status, stop, p)
+                _staged(bud, store, t, "root_cause", status, stop, p, want=60.0)
+                _staged(bud, store, t, "build_poc", status, stop, p, want=60.0)
+                _staged(bud, store, t, "poc_primitive", status, stop, p, want=90.0)
                 _note_escalation(cve, lvl0)              # these three ran on THIS CVE crash's input
             if crashes and not stop.is_set():
                 rep = {"input_sha": crashes[0].input_sha}
                 cve0 = cve_origin.get(crashes[0].input_sha)
                 lvlb = _max_verified_poc_level(store, tid) if cve0 else 0
-                _run_target_stage(store, t, "build_exploit", status, stop, rep)
+                _staged(bud, store, t, "build_exploit", status, stop, rep, want=60.0)
                 _note_escalation(cve0, lvlb)             # build_exploit ran on this CVE crash's input
-                _run_target_stage(store, t, "behavior_trace", status, stop, rep)
-                _run_target_stage(store, t, "dynamic_taint", status, stop, rep)
+                _staged(bud, store, t, "behavior_trace", status, stop, rep, want=45.0)
+                _staged(bud, store, t, "dynamic_taint", status, stop, rep, want=60.0)
                 # Follow fork/exec and blame the CHILD. A forking server or a target that
                 # execve()s a helper faults in a process the ordinary single-process capture
                 # never sees, so without this the crash is attributed to the parent or missed
                 # entirely. gdb-only and native-only; self-gates and says so.
-                _run_target_stage(store, t, "multi_debug", status, stop, rep)
+                _staged(bud, store, t, "multi_debug", status, stop, rep, want=45.0)
                 # Break on the dangerous calls live and record the arguments they were actually
                 # reached with -- the runtime counterpart to the static sink findings.
-                _run_target_stage(store, t, "debug_monitor", status, stop, rep)
+                _staged(bud, store, t, "debug_monitor", status, stop, rep, want=45.0)
             for cve, lvl in cve_best.items():            # one CVE->exploit link per CVE, at its best
                 _record_cve_weaponized(store, t, cve, lvl)
             # Format-string -> shell WITHOUT a crash. A reachable printf(user) sink is an L3
@@ -934,7 +1140,7 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict, stop: t
                     f.cwe == "CWE-134" and f.state in ("corroborated", "confirmed", "poc-backed")
                     for f in FindingDAO(store.conn).list_by_target(tid))
                 if fmt_hit:
-                    _run_target_stage(store, t, "build_exploit", status, stop,
+                    _staged(bud, store, t, "build_exploit", status, stop,
                                       {"strategy": "format"})
             # Menu-driven glibc-heap -> shell WITHOUT a crash. A notebook/heap-menu target
             # (malloc/free pair + a numbered add/free/view/edit menu) is an L3 candidate via the
@@ -954,7 +1160,7 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict, stop: t
                     _log.debug("heap-menu gate check failed for %s", tid, exc_info=True)
                     heap_menu = False
                 if heap_menu:
-                    _run_target_stage(store, t, "build_exploit", status, stop,
+                    _staged(bud, store, t, "build_exploit", status, stop,
                                       {"strategy": "heap"})
             # (The crashless leak-centric build_exploit(strategy="auto") now runs EARLY, before
             # fuzz/concolic, so a time-boxed pass reaches it; see above. It is not repeated here.)
@@ -989,13 +1195,18 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict, stop: t
             # Link a matched CVE to a demonstrated crash of a matching class (soft corroboration),
             # now that crashes/PoCs for this target exist.
             if not stop.is_set():
-                _run_target_stage(store, t, "cve_corroborate", status, stop)
+                _staged(bud, store, t, "cve_corroborate", status, stop, want=30.0)
             # Explain a static-only outcome: a memory-corruption defect was found but no runtime
             # fault was reproduced -- say WHY (the binary carries no sanitizer), rather than
             # leaving a bare "static" that reads like "nothing to see".
             if not crashes and not stop.is_set():
                 _note_static_memcorruption(store, t)
             _finalize_plan(status)          # any step never reached is marked skipped
+            # Record what this run DID, not only what it found. See _scorecard.
+            try:
+                status["scorecard"] = _scorecard(store, t, bud, status)
+            except Exception:                            # noqa: BLE001 -- never fail a run on this
+                _log.debug("scorecard failed for %s", tid, exc_info=True)
         # Case-level cross-binary analysis for a multi-binary case (a carved firmware's extracted
         # components are exactly such a set).
         if len(worklist) > 1 and not stop.is_set():

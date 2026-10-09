@@ -142,13 +142,45 @@ def _target_html(t: dict) -> str:
                    else f'{cov.get("edges")} edges' if cov.get("kind") == "edge"
                    else "—")
         rows.append(("Fuzz coverage", cov_txt))
-    p.append(_kv(rows))
     ex = t.get("execution") or {}
-    if ex.get("did_not_run_count") or ex.get("failed_stages"):
+    # THE SCORECARD. A null result is only worth what the work behind it was worth, so the work
+    # is stated next to it: whether the program ever started, how many times it was executed and
+    # how fast, and which stages ran out of time. Measured before this existed: one stock binary
+    # finished the pipeline with 2,756 executions and no crash while another was executed ZERO
+    # times, and the two reports read identically.
+    base = ex.get("baseline")
+    if base is not None:
+        why = esc(str(base.get("note") or base.get("isolation") or "no reason given"))
+        rows.append(("Baseline execution",
+                     "ran, exited normally" if base.get("ran") and not base.get("crashed")
+                     else "ran, FAULTED" if base.get("ran")
+                     else "DID NOT RUN — " + why))
+    if ex.get("executions_attempted") is not None:
+        rate = ex.get("executions_per_second")
+        rows.append(("Executions", f'{ex["executions_attempted"]:,}'
+                     + (f' ({rate:g}/s)' if rate else "")))
+        by = ex.get("executions_by_engine") or {}
+        if by:
+            rows.append(("By engine", esc(", ".join(f"{k} {v:,}" for k, v in
+                                                    sorted(by.items(), key=lambda kv: -kv[1])))))
+    bg = ex.get("budget") or {}
+    if bg.get("total"):
+        rows.append(("Time budget", f'{bg.get("elapsed", 0):g}s of {bg["total"]:g}s used'))
+    p.append(_kv(rows))
+    skipped = ex.get("stages_skipped_for_budget") or []
+    never_ran = (base is not None and not base.get("ran"))
+    if ex.get("did_not_run_count") or ex.get("failed_stages") or skipped or never_ran:
         # The distinction this whole platform is built on, in the artefact a human opens: an
         # empty crash list because nothing FOUND a defect, versus an empty crash list because
         # nothing RAN. Without this they render identically.
         p.append('<p class="ceiling"><b>Execution gaps.</b> ')
+        if never_ran:
+            p.append('The baseline execution never started this target, so every dynamic '
+                     'result below is absent for that reason and not for want of a defect. ')
+        if skipped:
+            p.append('Ran out of time before: ' + esc(", ".join(skipped[:8]))
+                     + ('' if len(skipped) <= 8 else f' (+{len(skipped) - 8} more)')
+                     + '. Give the run a larger budget to reach them. ')
         if ex.get("did_not_run_count"):
             reasons = "; ".join(
                 esc((d.get("reason") or d.get("isolation") or "").strip())
@@ -164,7 +196,7 @@ def _target_html(t: dict) -> str:
     if not findings:
         # "No reportable findings" is the sentence a reader takes as CLEAN, so it must not stand
         # alone when part of the analysis never executed.
-        if ex.get("did_not_run_count") or ex.get("failed_stages"):
+        if ex.get("did_not_run_count") or ex.get("failed_stages") or skipped or never_ran:
             p.append('<p class="muted">No reportable findings for this target — but see the '
                      'execution gaps above: this is not a clean result.</p></section>')
         else:

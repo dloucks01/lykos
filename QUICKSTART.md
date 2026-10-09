@@ -29,7 +29,45 @@ anything missing. Nothing here needs installing to start: the core is Python-std
 heavy engines (Ghidra, AFL++, QEMU, GDB, angr) are optional and only unlock extra capabilities.
 `doctor` is how you tell "the tool declined because an engine is absent" from a real problem.
 
-## 2. Start the console
+## 2. Analyse something, from the shell
+
+```sh
+./lykos analyze /path/to/binary --budget 600
+```
+
+That runs the whole pipeline on one file and prints two things: **what the run did** and **what
+it found**, in that order. The first half is the part worth reading even when the second is
+empty — whether the program ever started, how many times it was executed and how fast, where
+the time went, and which stages ran out of budget:
+
+```
+-- what this run did -----------------------------------------------
+  baseline     ran, exited normally
+  executions   10,792  (51.6/s)
+               directed       9,281
+               env_fuzz       1,511
+  stages       done 24, error 2, skipped 11
+  out of time  synthesize_poc
+  budget       297.7s of 400s
+  dearest      directed_fuzz 164.7s, build_exploit 69.1s, env_fuzz 22.3s
+```
+
+No findings after a campaign that ran is a result. No findings after one that did not is not,
+and this is how you tell them apart. `--budget` is a wall clock, divided among the recovery,
+search and proving phases; raise it and the campaigns get proportionally more.
+
+If the program needs arguments or a sample input, say so — this is the one thing worth getting
+right, because a program handed its input on the wrong channel looks exactly like a program
+with no bugs:
+
+```sh
+./lykos analyze ./parser --argv '-c @@' --seed good1.conf --seed good2.conf --report out.html
+```
+
+`@@` is where the input file goes. `--seed` is a valid sample input (repeatable); for any
+format parser, give it a couple of real ones so the fuzzer starts from real structure.
+
+## 3. Or start the console
 
 ```sh
 ./start
@@ -45,7 +83,7 @@ It binds to loopback only, so nothing outside this machine can reach it. You wil
 **Lykos Console**. The interface highlights the recommended next step at each stage, so you can
 follow it without hunting through menus.
 
-## 3. Analyze your first binary
+## 4. Analyze your first binary
 
 In the console:
 
@@ -65,7 +103,7 @@ In the console:
 4. **Start the run.** lykos works through its pipeline: recover structure, flag candidate
    defects, then fuzz and execute the program to try to confirm them. Progress streams live.
 
-## 4. Read the findings board
+## 5. Read the findings board
 
 The board is the heart of the tool. Each finding is a card, and cards move across lanes as the
 evidence gets stronger:
@@ -84,7 +122,7 @@ to cut a long list down.
 Static analysis over-reports on purpose, so **Unproven** cards are leads, not verdicts. The ones
 that reached **Demonstrated** or **PoC-backed** are the ones lykos stands behind.
 
-## 5. Export
+## 6. Export
 
 When you are done, export the case as a report (HTML, PDF, or SARIF) or as a self-contained
 `.tar.gz` archive you can carry to another machine or hand to a colleague.

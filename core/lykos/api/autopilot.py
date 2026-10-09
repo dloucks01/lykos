@@ -40,9 +40,18 @@ class AutopilotMixin:
                 return self._json({"error": "already running", "status": cur["status"]}, 409)
             status = {"state": "starting", "stage": None, "target": 0, "targets": len(target_ids)}
             stop = threading.Event()
+            # Per-target wall clock, divided among the phases by analyze.budget. Without one
+            # a single stage registered at 3600s could outlast the whole run and everything
+            # after it never executed -- measured on stock binaries, three runs in four.
+            try:
+                secs = float(body.get("budget_seconds")) if body.get("budget_seconds") else None
+            except (TypeError, ValueError):
+                secs = None
+            over = body.get("overrides") if isinstance(body.get("overrides"), dict) else None
+            status["budget_seconds"] = secs
             th = threading.Thread(
                 target=orchestrate.run_case_autopilot,
-                args=(self.server.case_dir, cid, target_ids, status, stop),
+                args=(self.server.case_dir, cid, target_ids, status, stop, secs, over),
                 name=f"autopilot-{cid[:8]}", daemon=True)
             AutopilotMixin._AUTOPILOTS[cid] = {"thread": th, "status": status, "stop": stop}
             th.start()
