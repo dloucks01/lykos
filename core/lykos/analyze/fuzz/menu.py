@@ -555,3 +555,139 @@ class MenuMutator:
             return bytes((rng.choice(b"ABCD"),)) * sz
         ln = rng.randint(1, 48)
         return bytes(rng.choice(_STR_ALPHABET) for _ in range(ln))
+
+
+#: A benign value per field type, used to walk a linear protocol to its end while LEARNING it.
+#: Deliberately small and valid: the crawl is discovering the shape, not attacking it.
+_PROBE = {"idx": b"1", "num": b"16", "str": b"probe", "yn": b"y"}
+
+#: Line lengths to try, each just under a plausible `read(0, buf, N)` buffer (64/128/256/512).
+#: N is not knowable from outside and BOTH directions are wrong: a line longer than N spills its
+#: tail into the next field and desyncs every field after it, while a line far shorter than N
+#: cannot reach a defect that needs the buffer nearly full. Measured both failures on `replaceme`
+#: -- a 160-byte filler ahead of its 0x80 reader swallowed field two's expression, and a 48-byte
+#: one left the result 165 bytes against a 192-byte buffer, just short of the overflow. So the
+#: size is swept, and the campaign's own feedback keeps whichever engaged the parser.
+_LINE_SIZES = (48, 112, 240, 496)
+
+#: Runs inside an example that look like a FIELD rather than a delimiter.
+_FIELDISH = re.compile(rb"[A-Za-z0-9_.-]{2,}")
+
+#: Past this a "protocol" is a loop, not a field list -- a REPL re-prompting forever looks like
+#: an endless sequence of fields, and the model only has to describe one pass.
+_MAX_LINEAR = 8
+
+
+def crawl_linear(spawn, *, max_fields: int = _MAX_LINEAR, idle: float = 0.15,
+                 timeout: float = 5.0, width=None) -> list:
+    """The ordered field types of a LINEAR prompt protocol: `['str', 'str']`, or [] if the target
+    does not prompt.
+
+    A linear protocol is a numbered menu minus the dispatch: the program prints a prompt, reads a
+    field, prints the next prompt, reads the next field, and then acts on all of them. `crawl_menu`
+    cannot model it (there are no options to select) and `detect_menu` does not fire, so such a
+    target got the blind path -- and a blind campaign delivers ONE blob to stdin, where a program
+    that reads its fields with separate `read(0, buf, N)` calls takes the whole blob as field one
+    and reaches EOF on field two.
+
+    Measured on the HTB target `replaceme`: 63,234 executions produced nothing, and every single
+    one was rejected at the first gate with "Missing 's/' at the beginning", because the sed
+    expression it needs in field TWO arrived inside field one. Driven one field per prompt, the
+    same bytes reach the parser.
+
+    `spawn()` returns a fresh interactive process (the stage wraps the sandbox; a test passes a
+    fake). Best-effort: any failure yields [], and the campaign keeps the blind path.
+    """
+    proc = None
+    try:
+        proc = spawn()
+        sel = selectors.DefaultSelector()
+        sel.register(proc.stdout, selectors.EVENT_READ)
+        deadline = time.monotonic() + timeout
+        fields: list = []
+        out, alive = _drain(proc, sel, idle=idle, deadline=min(deadline,
+                                                               time.monotonic() + 1.5))
+        while alive and len(fields) < max_fields and time.monotonic() < deadline:
+            prompt = _tail_prompt(out)
+            if not prompt:
+                break
+            ftype = classify_prompt(prompt)
+            fields.append(ftype)
+            send = (_scalar(yn_answer(prompt), width) if ftype == "yn"
+                    else _scalar(_PROBE[ftype], width) if ftype in ("idx", "num")
+                    else _data(_PROBE["str"], width))
+            try:
+                proc.stdin.write(send)
+                proc.stdin.flush()
+            except (OSError, ValueError):
+                break
+            out, alive = _drain(proc, sel, idle=idle,
+                                deadline=min(deadline, time.monotonic() + 1.5))
+        return fields
+    except Exception:                                    # discovery is never a blocker
+        return []
+    finally:
+        if proc is not None:
+            _kill(proc)
+
+
+def _grow_to(ex: bytes, size: int) -> bytes:
+    """The example with its LAST field expanded so the whole line is `size` bytes.
+
+    Clipping the example to the slot instead would break the grammar at the far end: a
+    `s/old/new/` cut at 128 bytes loses its closing delimiter, and the target answers "Missing
+    '/' after the replacement" -- measured. Growing a field keeps every delimiter the parser
+    checks and still fills the buffer the defect needs full.
+    """
+    runs = list(_FIELDISH.finditer(ex))
+    if not runs:
+        return b""
+    last = runs[-1]
+    room = size - (len(ex) - (last.end() - last.start()))
+    if room < 1:
+        return b""
+    return ex[:last.start()] + b"A" * room + ex[last.end():]
+
+
+def linear_seeds(fields: list, examples=(), *, max_seeds: int = 24) -> list:
+    """Seeds shaped like the protocol: one LINE per field, with a documented example -- as given
+    and grown to fill the field -- tried in each position and at each plausible line size.
+
+    A linear protocol's defect is behind a particular field: `replaceme`'s overflow is in the
+    SECOND one and only reachable once the first holds enough text for the replacement to work
+    on, so a seed has to fill every field, and which field carries the interesting value is
+    exactly what the campaign has to try. Filler for the other fields comes from the example's
+    own tokens, because a search-and-replace or lookup grammar refers to content the other field
+    must contain.
+    """
+    if not fields:
+        return []
+    out: list = []
+    exs = [e for e in (examples or ()) if e]
+    for size in _LINE_SIZES:
+        for ex in exs or [b"A" * size]:
+            toks = _FIELDISH.findall(ex) or [b"A"]
+            filler = (toks[0] * (1 + size // max(1, len(toks[0]))))[:size]
+            for variant in (ex, _grow_to(ex, size)):
+                if not variant or len(variant) > size:
+                    continue
+                for pos in range(len(fields)):
+                    lines = []
+                    for i, f in enumerate(fields):
+                        if i == pos:
+                            lines.append(variant)
+                        elif f == "num":
+                            lines.append(_PROBE["num"])
+                        elif f == "idx":
+                            lines.append(_PROBE["idx"])
+                        elif f == "yn":
+                            lines.append(b"y")
+                        else:
+                            lines.append(filler)
+                    out.append(_NL.join(lines) + _NL)
+    seen, uniq = set(), []
+    for b in out:
+        if b not in seen:
+            seen.add(b)
+            uniq.append(b)
+    return uniq[:max_seeds]

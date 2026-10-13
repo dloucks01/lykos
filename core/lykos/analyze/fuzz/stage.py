@@ -330,6 +330,33 @@ def menu_model_for(ctx, target, exe, workdir):
         return None
 
 
+def linear_protocol_for(ctx, target, exe, workdir):
+    """The field template of a LINEAR prompt protocol -- `['str','str']` -- or None.
+
+    A linear protocol is a numbered menu minus the dispatch: prompt, read a field, prompt, read
+    the next, then act. `detect_menu` does not fire on it and `crawl_menu` has no options to
+    select, so such a target fell to the blind path -- which delivers ONE blob to stdin, where a
+    program reading its fields with separate `read(0, buf, N)` calls takes the whole blob as
+    field one and hits EOF on field two. Measured on `replaceme`: 63,234 executions, every one
+    rejected at the first gate because the sed expression meant for field two arrived inside
+    field one.
+
+    Only crawled when there is no menu (the menu path is strictly better when it applies) and
+    only accepted at TWO or more fields, because a single-prompt target is what bulk delivery
+    already handles and the prompted path costs a drain per field.
+    """
+    try:
+        from . import menu
+        from ..dynamic.heap_discover import _spawn_menu
+        svals = [x.value for x in _strings_for(ctx, target) if getattr(x, "value", None)]
+        if menu.detect_menu(svals):
+            return None
+        fields = menu.crawl_linear(lambda: _spawn_menu(workdir, exe))
+        return fields if len(fields) >= 2 else None
+    except Exception:
+        return None
+
+
 def msan_detonate(ctx, target, inputs, mode, exec_timeout, base_argv=()) -> int:
     """Detonate a set of inputs against the target's MemorySanitizer build (built at ingest for
     source targets) to surface uninitialized-value reads (CWE-457) -- the class ASan cannot see. Such
@@ -1503,6 +1530,40 @@ def fuzz_stage(ctx) -> dict:
     # reachable through one channel only, and which one is not knowable in advance. Stopping on
     # the raw crash count would let a channel that only produced non-reproducible (flaky)
     # crashes -- a target that rewrites its own input -- halt the sweep with nothing to show.
+    # A PROMPT-DRIVEN target is fed one field per prompt, not one blob. The blob arrives whole,
+    # and a program that reads its fields with separate `read(0, buf, N)` calls takes all of it
+    # as field one -- so every input is rejected at the first gate whatever it contains. The
+    # delivery that fixes it is the one the menu path already uses, applied to a linear protocol.
+    _lin_fields, _lin_run = None, None
+    # Keyed on the CHANNEL, not on how the channel was chosen. Gating this on
+    # `not p.get("input_mode")` meant it never fired under the autopilot, which always passes
+    # `input_mode` -- that parameter carries the orchestrator's channel decision, not an
+    # operator override -- so the path worked when the stage was driven directly and silently
+    # did nothing in the pipeline that needs it.
+    if "stdin" in channels:
+        _exe_probe = ctx.scratch() / "target.bin"
+        try:
+            ctx.content.stage_target(target, _exe_probe.parent, _exe_probe.name)
+            os.chmod(_exe_probe, 0o755)
+            _lin_fields = linear_protocol_for(ctx, target, _exe_probe, _exe_probe.parent)
+        except Exception:
+            _lin_fields = None
+    if _lin_fields:
+        from . import menu as _menu2
+        from .runner import prompted_runner
+        _ex = textconf.example_seeds([x.value for x in strings
+                                      if getattr(x, "value", None)])
+        _lseeds = [x for x in _menu2.linear_seeds(_lin_fields, _ex) if x]
+        if _lseeds:
+            corpus = _lseeds + list(corpus)
+        _lin_run = prompted_runner(_lin_fields)
+        channels = ["stdin"]                 # the other channels cannot carry a prompt protocol
+        ctx.emit("fuzz.format", payload={
+            "model": "linear-prompt", "auto": True, "fields": _lin_fields,
+            "seeds": len(_lseeds),
+            "why": "the target prompts for each field in turn, so the input is delivered one "
+                   "field per prompt instead of as one blob that field one would swallow"})
+
     share_execs = max(1, max_execs // len(channels))
     share_secs = max(1.0, max_seconds / len(channels))
     totals = {"execs": 0, "crashes": 0, "crashes_reproducible": 0, "unique": 0,
@@ -1510,11 +1571,12 @@ def fuzz_stage(ctx) -> dict:
     blocks_hit = 0            # the most blocks any one channel reached (coverage is per-run)
     blocks_known = 0
     for ch in channels:
+        _kw = {"run_fn": _lin_run} if _lin_run is not None else {}
         st = fuzz_campaign(ctx, target, corpus=list(corpus), dictionary=dictionary, mode=ch,
                            max_execs=share_execs, max_seconds=share_secs,
                            exec_timeout=exec_timeout, rng=rng, detector="fuzz",
                            event_prefix="fuzz", note_prefix=note, mutator=mutator,
-                           cover_blocks=blocks, cover_flags=flags, base_argv=base_argv)
+                           cover_blocks=blocks, cover_flags=flags, base_argv=base_argv, **_kw)
         for k in totals:
             totals[k] += st.get(k, 0)
         blocks_hit = max(blocks_hit, st.get("blocks_hit", 0))

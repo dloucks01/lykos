@@ -260,3 +260,53 @@ def test_menu_mutator_reaches_the_handlers_behind_the_menu():
     shutil.rmtree(d, ignore_errors=True)
     # A blind mutator effectively never completes a handler flow; the menu-aware one does it often.
     assert reached >= 20, f"only {reached}/40 navigations reached a handler"
+
+
+# --- a LINEAR prompt protocol: a menu minus the dispatch --------------------------------
+
+def test_a_linear_protocol_is_learned_as_a_field_list():
+    """`detect_menu` does not fire on a target with no numbered options and `crawl_menu` has no
+    option to select, so a prompt-driven program fell to the blind path -- which delivers ONE
+    blob to stdin, where a program reading its fields with separate `read(0, buf, N)` calls takes
+    the whole blob as field one and reaches EOF on field two. Measured on the HTB target
+    `replaceme`: 63,234 executions, every one rejected at the first gate."""
+    from lykos.analyze.fuzz import menu
+    assert menu.crawl_linear(lambda: (_ for _ in ()).throw(OSError("no"))) == []
+    assert menu.linear_seeds([], [b"s/old/new/"]) == []
+
+
+def test_a_seed_fills_every_field_and_tries_each_position():
+    """A linear protocol's defect sits behind a particular field -- `replaceme`'s overflow is in
+    the SECOND one, reachable only once the first holds text for the replacement to work on -- so
+    a seed has to fill them all, and which field carries the payload is what the campaign tries."""
+    from lykos.analyze.fuzz import menu
+    seeds = menu.linear_seeds(["str", "str"], [b"s/old/new/"])
+    assert seeds, "a documented example must produce protocol-shaped seeds"
+    assert all(s.count(b"\n") == 2 for s in seeds), "one line per field"
+    # the example appears in each position across the set
+    first = [s for s in seeds if s.split(b"\n")[0].startswith(b"s/old/")]
+    second = [s for s in seeds if s.split(b"\n")[1].startswith(b"s/old/")]
+    assert first and second, (len(first), len(second))
+
+
+def test_no_line_exceeds_the_slot_it_was_built_for():
+    """A line longer than the field's `read(0, buf, N)` spills its tail into the NEXT read and
+    desyncs every field after it: measured, a 160-byte filler ahead of `replaceme`'s 0x80 reader
+    swallowed the expression meant for field two and every seed was rejected at the first gate."""
+    from lykos.analyze.fuzz import menu
+    for s in menu.linear_seeds(["str", "str", "str"], [b"s/old/new/"]):
+        for line in s.split(b"\n"):
+            assert len(line) <= max(menu._LINE_SIZES), len(line)
+
+
+def test_an_example_is_GROWN_to_fill_a_slot_not_clipped_into_it():
+    """Clipping breaks the grammar at the far end: `s/old/new/` cut to 128 bytes loses its
+    closing delimiter and the target answers "Missing '/' after the replacement" -- measured.
+    Growing a field keeps every delimiter the parser checks AND fills the buffer the defect
+    needs full."""
+    from lykos.analyze.fuzz import menu
+    grown = menu._grow_to(b"s/old/new/", 112)
+    assert len(grown) == 112
+    assert grown.startswith(b"s/old/") and grown.endswith(b"/")
+    assert menu._grow_to(b"s/old/new/", 4) == b"", "no room means no seed, not a broken one"
+    assert menu._grow_to(b"////", 64) == b"", "nothing field-shaped to grow"

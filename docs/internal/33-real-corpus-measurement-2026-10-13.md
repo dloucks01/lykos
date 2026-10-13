@@ -279,12 +279,53 @@ reverted (see above).
        the TEXT and the expression never reaches field two. The crash needs 128 bytes of text
        (containing the needle) and THEN the expression.
 
-    So the remaining gap is record-layout-aware delivery: one field per prompt, each padded to
-    the size that `read` asks for. The pipeline already does exactly this for numbered-menu
-    targets (`heap_discover._drive` sends incrementally and `_render_op` pads a sized
-    `read(fd,buf,sz)` field to `sz`); what it lacks is the same for a LINEAR prompt protocol,
-    which is a menu minus the dispatch. That is a feature, not a tweak, and padding the example
-    to a guessed 128 would be a target-specific hack rather than a capability.
+    **FIXED -- linear prompt protocol delivery.** A linear protocol is a numbered menu minus
+    the dispatch, and the delivery the menu path already uses is the one it needed:
+
+    * `menu.crawl_linear` learns the field template by driving the live target one prompt at a
+      time (reusing `_drain`, which detects "stalled waiting on input" = a prompt). Gated: only
+      when `detect_menu` finds nothing, and only at two or more fields.
+    * `runner.run_input_prompted` / `prompted_runner` deliver the blob's LINES one per prompt
+      with a drain between, and drop into `fuzz_campaign` as its `run_fn` (which already
+      disables batching for any runner that is not `run_input` -- correct, these cannot batch).
+    * `menu.linear_seeds` + `_grow_to` emit protocol-shaped seeds: one line per field, the
+      documented example tried in each position at each of four plausible line sizes.
+
+    Three constraints that were measured rather than reasoned, all of which cost a wrong answer
+    first:
+
+    1. a line LONGER than the field's `read(0, buf, N)` spills its tail into the next read and
+       desyncs every field after it -- a 160-byte filler ahead of this target's 0x80 reader
+       swallowed field two's expression and all 16 seeds were rejected at the first gate;
+    2. a line far SHORTER than N cannot reach a defect that needs the buffer nearly full -- a
+       48-byte filler left the result at 165 bytes against a 192-byte buffer, just short;
+    3. clipping an example into a slot breaks its grammar at the far end -- `s/old/new/` cut at
+       128 bytes loses its closing delimiter and the target answers "Missing '/' after the
+       replacement" -- so `_grow_to` expands the example's LAST field instead.
+
+    Measured, same target, same 600 s budget:
+
+    | | before | after |
+    |---|---|---|
+    | crashes | 0 in 63,234 executions | **1 reproducible in 1,015** |
+    | findings | 3 corroborated + 1 candidate, no crash | **confirmed CWE-119** (SIGSEGV) + **corroborated CWE-121** from `monitor` ("Stack overflow observed: read() copied 128 bytes into ask_input") |
+    | rate | 105/s bulk | 6-30/s prompted (a drain per field) |
+
+    A guard bug in the first version is worth remembering, because it is this document's own
+    theme: the path was gated on `not p.get("input_mode")`, and the autopilot ALWAYS passes
+    `input_mode` -- that parameter carries the orchestrator's channel decision, not an operator
+    override. So the feature worked when the stage was driven directly and did nothing at all in
+    the pipeline that needs it. Key such a gate on the CHANNEL, never on how the channel was
+    chosen.
+
+    **STILL OPEN, one layer up: the PoC ladder cannot verify a prompt-protocol crash.** The PoC
+    row is L0 `verified: false` even though the crash is confirmed and reproducible, because
+    `poc/stage.py` replays by sweeping `[mode] + MODES` through `sandbox.run` -- bulk delivery
+    only. The recorded isolation tag is `bwrap+netns/prompted`, which is the signal a fix keys
+    on. Do NOT fix only the replay: the bundled reproducer SCRIPT also delivers in bulk, and
+    this input (two 112-byte lines) desyncs that way, so a replay-only patch would file a
+    "verified L1" whose bundle does not reproduce for the operator -- the exact failure this
+    stage already warns about for a mismatched signal.
   * `no_gadgets` -- L0, and NOT a budget failure: `concolic` returns after **5 steps in 0.01 s**
     with nothing active or deadended, i.e. angr never explored the binary (it ships a bundled
     `ld-2.35.so`). The recorded L1 for this challenge came from its ASan SOURCE build
