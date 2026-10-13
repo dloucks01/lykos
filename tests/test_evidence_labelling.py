@@ -163,3 +163,28 @@ def test_execution_backed_detectors_are_never_treated_as_static(detector):
                                       "pyc_scan", "uaf", "int_overflow"])
 def test_the_scanners_that_never_execute_are_treated_as_static(detector):
     assert detector in STATIC_DETECTORS
+
+
+def test_the_gate_still_executes_the_bundles_it_ships():
+    """The gate scored every case by reading our OWN database back, and three defects lived in
+    that gap -- including `runner.sh` ending on `echo "exit status: $rc"`, which made every
+    bundle ever shipped exit 0 whether the reproducer crashed or ran clean. The only check that
+    can see that class of bug unpacks the bundle somewhere else and reads the script's EXIT
+    STATUS, so this asserts the gate still does it, on cases spanning the delivery channels.
+
+    This is a source-level invariant for the same reason as the test above it: the gate takes
+    minutes per case, so nothing else notices if the assertion quietly stops being made."""
+    gate = pathlib.Path(__file__).resolve().parents[1] / "tools" / "pipeline_conformance.py"
+    src = gate.read_text()
+    assert "def _bundle_reproduces(" in src, "the gate no longer executes a shipped bundle"
+    assert "runner.sh" in src and ">= 128" in src, \
+        "the bundle check must run runner.sh and judge it by its exit status"
+    # Every channel whose carrier the bundle has to get RIGHT -- argv quoting, a file path that
+    # must not be a vanished scratch dir, an exported variable, a spawned server, one field per
+    # prompt. Each of those has broken a bundle before.
+    for case in ("argv_overflow", "file_overflow", "env_overflow", "socket_overflow",
+                 "prompt_protocol_overflow"):
+        i = src.index('Case("%s"' % case)
+        j = src.index('Case("', i + 10) if src.count('Case("', i + 10) else len(src)
+        assert "want_bundle=True" in src[i:j], \
+            "%s no longer executes its bundle" % case

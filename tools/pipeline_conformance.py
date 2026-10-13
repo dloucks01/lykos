@@ -11,8 +11,10 @@ No external targets -- every binary is compiled here from a C string with gcc; s
 """
 from __future__ import annotations
 
+import io
 import shutil
 import subprocess
+import tarfile
 import tempfile
 import threading
 import time
@@ -73,6 +75,12 @@ class Case:
     # demonstrate one however good the pipeline is. The mission is "binaries AND source", and
     # nothing covered the source half.
     as_source: bool = False
+    # EXECUTE the bundle this case ships: unpack it in a fresh directory and run its own
+    # `runner.sh`, requiring it to report the crash through its EXIT STATUS. Nothing in this gate
+    # did that, and three defects lived in the gap -- see `_bundle_reproduces`. Set it on a case
+    # whose PoC is a CRASH (the 128+signum convention); a JVM bundle exits 1 and an L3
+    # shell-spawning reproducer reports its own outcome, so neither is scored this way.
+    want_bundle: bool = False
 
 
 # ---- .NET assemblies for the two dotnet cases ---------------------------------------------
@@ -432,6 +440,7 @@ int main(int argc, char **argv){ char b[64];
   printf("got %s\n", b); return 0; }''',
          ["-no-pie", "-fno-stack-protector", "-O0", "-w"],
          want_level=1, want_cwe=("CWE-121", "CWE-787", "CWE-119"), budget=300.0,
+         want_bundle=True,
          note="CHANNEL argv: the overflow is only reachable through argv[1]"),
 
     Case("file_overflow",
@@ -444,6 +453,7 @@ int main(int argc, char **argv){ char b[64];
   fclose(f); printf("read %zu\n", n); puts(b); return 0; }''',
          ["-no-pie", "-fno-stack-protector", "-O0", "-w"],
          want_level=1, want_cwe=("CWE-121", "CWE-787", "CWE-119"), budget=300.0,
+         want_bundle=True,
          note="CHANNEL file: the overflow is only reachable by the contents of a named file"),
 
     Case("env_overflow",
@@ -456,6 +466,7 @@ int main(void){ char b[64];
   printf("cfg %s\n", b); return 0; }''',
          ["-no-pie", "-fno-stack-protector", "-O0", "-w"],
          want_level=1, want_cwe=("CWE-121", "CWE-787", "CWE-119"), budget=300.0,
+         want_bundle=True,
          note="CHANNEL env: the overflow is only reachable by setting APP_CONFIG. Was a known gap "
               "while capture.MODES was (stdin, file, arg) with no env delivery, so the prove loop "
               "could not replay an env-delivered input and no verified PoC was ever built; "
@@ -492,9 +503,51 @@ int main(void){ setvbuf(stdout,0,2,0);
   for(;;){ int c = accept(s,0,0); if(c<0) continue; handle(c); close(c); } }''',
          ["-no-pie", "-fno-stack-protector", "-O0", "-w"],
          want_level=1, want_cwe=("CWE-121", "CWE-787", "CWE-119"), budget=900.0,
+         want_bundle=True,
          note="CHANNEL socket: a TCP server that strcpy's its global recv buffer into a 64-byte "
               "stack buffer in a handler that RETURNS -- reachable only over a connection, and "
               "replayable only by spawning the server and sending (no exec-time carrier exists)"),
+
+    Case("prompt_protocol_overflow",
+         r"""#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+/* A LINEAR PROMPT PROTOCOL: prompt, read a field, prompt, read a field, act. There is no menu,
+   so `detect_menu` does not fire and `crawl_menu` has no option to select. The property that
+   makes it a regression case is the one-line check: a BULK feed (one write of both lines, which
+   is what every exec-time channel does) leaves the first read holding both lines, so the newline
+   is not the last byte, the program rejects the input, and the second field never arrives at all.
+   Only delivery paced one field per prompt reaches the overflow. Measured on the HTB target
+   `replaceme`: 63,234 bulk executions found nothing; 1,015 prompted executions found the crash. */
+/* The copy lives in a function that RETURNS, for the reason the socket case states: with the
+   64-byte buffer among main's other locals the overflow runs upward into those locals and never
+   reaches a saved return address -- measured here, clean at 500 bytes -- so the smash is real and
+   nothing faults. This is doc 32 item 5(b) (frame layout decides reachability) biting on x86-64,
+   not only on AArch64. */
+static void use(const char *src){ char small[64]; strcpy(small, src); printf("ok %s\n", small); }
+int main(void){ setvbuf(stdout,0,2,0);
+  char first[128], second[512];
+  printf("mode: ");
+  ssize_t n = read(0, first, sizeof first - 1); if(n <= 0) return 0; first[n] = 0;
+  if(memchr(first, '\n', n) != first + n - 1){ puts("one field per line, please"); return 1; }
+  /* Field one is deliberately NOT content-checked. `replaceme` also demanded a magic prefix
+     ("s/"), and an earlier version of this case copied that -- which made it unreachable for a
+     second reason: the crawler cannot discover prompt TWO until something gets past prompt one,
+     so the case silently asserted token mining as well, and failed at L0 with the prompted path
+     never engaging. A gate case isolates ONE capability; token discovery has its own cases. */
+  printf("data: ");
+  n = read(0, second, sizeof second - 1); if(n <= 0) return 0; second[n] = 0;
+  use(second);                                          /* unbounded copy into 64 bytes */
+  return 0; }""",
+         ["-no-pie", "-fno-stack-protector", "-O0", "-w"],
+         want_level=1, want_cwe=("CWE-121", "CWE-787", "CWE-119"), budget=300.0,
+         want_bundle=True,
+         note="CHANNEL prompt: a linear prompt protocol, reachable ONLY one field per prompt. "
+              "Both halves are asserted here -- the pipeline must find it (which needs prompted "
+              "delivery in the campaign) and the shipped bundle must reproduce it (which needs a "
+              "reproducer that paces the same way, not `< input.bin`). A bulk feed desyncs and "
+              "the program says so, which is why a half-fix reads as a verified L1 whose bundle "
+              "does nothing."),
 
     # ---- BUILD REALISM. Real binaries are optimised and stripped; -O0 with symbols hides any
     # reliance on symbol names or on an unoptimised frame layout.
@@ -1223,6 +1276,59 @@ def _verdict(s, target, case):
     return maxlvl, demod, fs
 
 
+def _bundle_reproduces(s, target, case, timeout: float = 120.0):
+    """Unpack the bundle this case shipped into a FRESH directory and run its own `runner.sh`.
+
+    Returns (ok, why). The assertion is the operator's: a PoC bundle is a deliverable, and the
+    only thing that makes it one is that it reproduces on a machine that is not ours, from the
+    files it carries, driven by the script inside it. Everything else this gate checks is read
+    back out of our own database -- which is precisely how three defects survived it:
+
+      * `poc/stage.py` replayed a prompt-protocol crash in BULK, so the database said L0 for a
+        crash that was confirmed and reproducible;
+      * the bundle's `runner.sh` fed that input in bulk too, so a replay-only fix would have
+        filed a verified L1 whose bundle did nothing for the operator;
+      * `runner.sh` ended on `echo "exit status: $rc"`, so EVERY bundle ever shipped exited 0,
+        crash or clean -- the one machine-readable thing a bundle carries, reporting the opposite
+        of the truth.
+
+    The third is the reason this reads the STATUS and not the output. The script PRINTS
+    "exit status: 139" in both the working and the broken case; only `$?` tells them apart.
+
+    A crash reproducer exits 128+signum (the shell's convention for a signal-killed child), so
+    >=128 is the bar. A clean exit is the failure this exists to catch.
+    """
+    from lykos.db.dao import PocDAO, TargetDAO
+    tids = [t.id for t in TargetDAO(s.conn).list_by_case(target.case_id)] or [target.id]
+    pocs = [pc for tid in tids for pc in PocDAO(s.conn).list_by_target(tid)
+            if getattr(pc, "verified", False) and pc.bundle_sha]
+    if not pocs:
+        return False, "no verified PoC bundle to execute"
+    blob = s.content.get_bytes(pocs[-1].bundle_sha)
+    out = Path(tempfile.mkdtemp(prefix="conf-bundle-"))
+    try:
+        tf = tarfile.open(fileobj=io.BytesIO(blob))
+        try:
+            tf.extractall(out, filter="data")            # py>=3.12; the bundle is our own tar
+        except TypeError:                                # noqa: PERF203 -- older tarfile
+            tf.extractall(out)
+        roots = [d for d in out.iterdir() if (d / "runner.sh").exists()]
+        if not roots:
+            return False, "bundle ships no runner.sh (%s)" % sorted(x.name for x in out.iterdir())
+        try:
+            r = subprocess.run(["sh", "./runner.sh"], cwd=str(roots[0]),
+                               capture_output=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return False, "bundle runner.sh did not finish in %gs" % timeout
+        if r.returncode >= 128:
+            return True, ""
+        tail = (r.stdout + r.stderr).decode("utf-8", "replace").strip().splitlines()
+        return False, "bundle ran but exited %d (want >=128, a signal): %s" % (
+            r.returncode, (tail or [""])[-1][:70])
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
+
+
 def _scored(maxlvl, demod, case, file_type=None):
     """Did this case pass, and is it finished? `done` gates the early stop, so it must never be true
     before the case has shown everything it asserts -- otherwise the run is cut short of its own
@@ -1358,8 +1464,19 @@ def _run_case(case: Case, gcc: str) -> Result:
         maxlvl, demod, fs = _verdict(s, t, case)
         ok, _ = _scored(maxlvl, demod, case, file_type=tg.file_type)
         shown = demod or [(f.detector, f.cwe, (f.title or "")[:30]) for f in fs]
+        # The bundle check runs LAST and can only turn a case red, never green: a case has to
+        # earn its level first, and then its deliverable has to work. It is deliberately able to
+        # fail a case the database called a verified L1 -- that divergence IS the finding, and it
+        # is the one this gate could not see before (see `_bundle_reproduces`).
+        bundle_why = ""
+        if ok and case.want_bundle:
+            b_ok, bundle_why = _bundle_reproduces(s, t, case)
+            if not b_ok:
+                ok = False
         if ok:
             why = ""
+        elif bundle_why:
+            why = "L%d verified but the BUNDLE does not reproduce: %s" % (maxlvl, bundle_why)
         elif case.clean:
             why = "CLEAN target but %d demonstrated finding(s) / L%d" % (len(demod), maxlvl)
         elif case.want_all_cwe:
@@ -1475,6 +1592,11 @@ def run_all(names=None) -> list[Result]:
     for case in cases:
         r = _run_case(case, gcc); results.append(r)
         f = "; ".join("%s/%s" % (d, cw) for d, cw, _ in r.findings) if r.findings else r.reason
+        # A FAILING case must print WHY, even when it has findings to show. The bundle check made
+        # this visible: a case can now fail with its level earned and six healthy-looking findings
+        # listed, and the old line dropped the one sentence that said the deliverable is broken.
+        if not r.ok and r.reason:
+            f = r.reason if not r.findings else "%s -- found %s" % (r.reason, f)
         print("%-24s | %-4s | %-26s | %s [%ds]" % (r.name, "PASS" if r.ok else "FAIL", r.profile, f, r.elapsed))
     print("-" * 110)
     npass = sum(1 for r in results if r.ok)
