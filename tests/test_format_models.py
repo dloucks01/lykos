@@ -648,3 +648,62 @@ def test_an_annex_b_sample_suggests_the_h264_model_to_the_builder():
     spec = S.suggest_spec(S.seed_for_name("h264"))
     assert spec["builtin"] == "h264"
     assert any("h264" in n.lower() or "H264" in n for n in [spec["detected"]])
+
+
+def _tiff_tag(buf, tag):
+    """The `value` of one IFD entry in a baseline TIFF seed, or None."""
+    import struct
+    n = struct.unpack_from("<H", buf, 8)[0]
+    for i in range(n):
+        off = 10 + 12 * i
+        if off + 12 > len(buf):
+            break
+        t, _fmt, _cnt, val = struct.unpack_from("<HHII", buf, off)
+        if t == tag:
+            return val
+    return None
+
+
+def test_every_codec_the_format_selects_gets_its_own_seed():
+    """A format whose behaviour is SELECTED by one field needs a seed per value of it.
+
+    Measured: the TIFF baseline sets Compression=1 (none), so 27,458 executions of a libtiff
+    tool never entered a single codec decoder -- while that is where libtiff 4.0.3's CVEs are
+    (OJPEG, LZW, PixarLog, NeXT, ThunderScan, CCITT). Mutation does not fix this by itself:
+    the tag is one u32 among many and a random walk that happens to set it to 32909 almost
+    never also leaves the rest of the directory coherent enough to reach the decoder."""
+    seeds = S.boundary_seeds("tiff")
+    comps = {_tiff_tag(b, 259) for b in seeds} - {None}
+    for codec in (5, 6, 7, 8, 32766, 32773, 32909):
+        assert codec in comps, f"no seed selects codec {codec}; got {sorted(comps)}"
+    assert len(comps) >= 10, f"only {len(comps)} codecs seeded: {sorted(comps)}"
+
+
+def test_a_codec_seed_sets_the_companion_tags_its_codec_demands():
+    """A codec its companion tags contradict is refused in SETUP, which reaches the decoder's
+    door and no further -- measured against a real ASan libtiff: "Fax3SetupState: Bits/sample
+    must be 1", "ThunderSetupDecode: Wrong bitspersample value (8)". The variant therefore sets
+    BitsPerSample with Compression, and the seed gets past setup into the decode loop."""
+    seeds = S.boundary_seeds("tiff")
+    by_codec = {_tiff_tag(b, 259): b for b in seeds}
+    assert _tiff_tag(by_codec[4], 258) == 1, "CCITT G4 seed must declare 1 bit/sample"
+    assert _tiff_tag(by_codec[32809], 258) == 4, "ThunderScan seed must declare 4 bits/sample"
+    # and the plain variants leave the baseline alone
+    assert _tiff_tag(by_codec[32773], 258) == 8, "PackBits needs no companion override"
+
+
+def test_a_format_that_declares_no_variants_gets_none():
+    """The variants are DECLARED. Inventing them for any format with an array would corrupt
+    seeds for formats where no single field selects a code path."""
+    assert S._record_variant_seeds({"spec": []}, b"") == []
+    assert S._record_variant_seeds(S._BUILTINS["gzip"], S.seed_for_name("gzip")) == []
+
+
+def test_a_variant_whose_selector_is_absent_yields_nothing():
+    """A declared selector that does not appear in the parsed seed must not silently produce
+    the baseline again N times -- that would pad the corpus with duplicates and read as codec
+    coverage that does not exist."""
+    entry = dict(S._BUILTINS["tiff"])
+    entry["record_variants"] = {"key": "tag", "match": 65000,       # no such tag in the seed
+                                "field": "value", "values": (1, 2, 3)}
+    assert S._record_variant_seeds(entry, S.seed_for_name("tiff")) == []

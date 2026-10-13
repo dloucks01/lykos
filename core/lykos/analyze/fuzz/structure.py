@@ -331,12 +331,69 @@ def boundary_seeds(name: str) -> list:
             o["val"], s["val"] = save                    # restore: each variant wraps ONE pair
     except Exception:                                    # noqa: BLE001
         pass
+    out += _record_variant_seeds(entry, base)
     seen, uniq = set(), []
     for b in out:
         if b not in seen:
             seen.add(b)
             uniq.append(b)
     return uniq
+
+
+def _array_records(fields):
+    """Every RECORD (one array element's parsed fields) at any nesting depth."""
+    for x in fields:
+        val, kind = x.get("val"), x["f"].get("type")
+        if kind == "group" and isinstance(val, list):
+            yield from _array_records(val)
+        elif kind == "array" and isinstance(val, list):
+            for rec in val:
+                if isinstance(rec, list):
+                    yield rec
+                    yield from _array_records(rec)
+
+
+def _record_variant_seeds(entry, base: bytes) -> list:
+    """One extra seed per declared `record_variants` value.
+
+    A format whose behaviour is SELECTED by one field in one record needs a seed per value of
+    that field, or the campaign only ever exercises the default. TIFF is the measured case: the
+    baseline sets Compression=1 (none), so 27,458 executions of a libtiff tool never entered a
+    single codec decoder -- which is where 4.0.3's CVEs are. See `_TIFF_CODECS`.
+
+    Declared, not hardcoded: `{"key": ..., "match": ..., "field": ..., "values": (...)}` means
+    "in the record whose `key` field equals `match`, set `field` to each of `values`".
+    Best-effort -- a format that declares none, or a serialize that fails, yields nothing.
+    """
+    rv = (entry or {}).get("record_variants")
+    if not rv:
+        return []
+    out = []
+    for variant in rv.get("values", ()):
+        # An int is shorthand for "set the declared field on the declared record"; a sequence of
+        # (key, value) pairs sets several records, for a selector its companions must agree with.
+        pairs = ((rv["match"], variant),) if isinstance(variant, int) else tuple(variant)
+        try:
+            model = FormatModel([dict(f) for f in entry["spec"]])
+            fields = model.parse(base)                   # re-parse per variant: one change each
+            recs = list(_array_records(fields))
+            applied = 0
+            for key_val, set_val in pairs:
+                for rec in recs:
+                    k = next((y for y in rec if y["f"].get("name") == rv["key"]), None)
+                    if k is None or k.get("val") != key_val:
+                        continue
+                    tgt = next((y for y in rec if y["f"].get("name") == rv["field"]), None)
+                    if tgt is not None:
+                        tgt["val"] = set_val
+                        applied += 1
+                    break
+            if not applied:
+                return out                               # the key is absent: no variant applies
+            out.append(model.serialize(fields))
+        except Exception:                                # noqa: BLE001 -- best effort per variant
+            continue
+    return out
 
 
 def _seed_spec(spec, payload):
@@ -615,6 +672,32 @@ _TIFF_ENTRIES = [
     {"tag": 278, "fmt": 3, "count": 1, "value": 1},        # RowsPerStrip
     {"tag": 279, "fmt": 4, "count": 1, "value": 1},        # StripByteCounts
 ]
+
+# One seed per CODEC, and this is the difference between fuzzing a TIFF reader and fuzzing its
+# directory parser. The baseline sets Compression=1 (none), so every mutant decodes with the
+# null codec and NONE of libtiff 4.0.3's codec decoders is ever entered -- while that is exactly
+# where its CVEs live (OJPEG, LZW, PixarLog, NeXT, ThunderScan, CCITT fax). Changing the tag is
+# enough to get there: libtiff dispatches on Compression when it sets up the decoder, so the
+# strip bytes reach that codec's own setup/predictor path, which is where the inconsistent-tag
+# defects are. The streams are NOT valid for the codec, deliberately -- a decoder handed
+# incoherent input is the condition under test, and the mutator starts from inside it.
+# A codec that its COMPANION TAGS contradict is refused in setup, which reaches the decoder's
+# door and no further -- measured: "Fax3SetupState: Bits/sample must be 1", "ThunderSetupDecode:
+# Wrong bitspersample value (8)", "LogLuvSetupDecode: Inappropriate photometric interpretation
+# 1". A variant may therefore set several tags, so the configuration is coherent enough to get
+# past setup and into the decode loop that the campaign is there to mutate.
+_TIFF_CODECS = (
+    5,                                   # LZW
+    6,                                   # OJPEG (old-style JPEG): densest CVE cluster in 4.0.3
+    7,                                   # JPEG
+    8,                                   # Adobe Deflate
+    ((259, 4), (258, 1)),                # CCITT G4 -- 1 bit/sample
+    32766,                               # NeXT RLE
+    32773,                               # PackBits
+    ((259, 32809), (258, 4)),            # ThunderScan -- 4 bits/sample only
+    32909,                               # PixarLog
+    ((259, 34676), (262, 32845), (258, 16)),   # SGILog -- photometric LOGLUV, 16 bits
+)
 
 # --- PDF --------------------------------------------------------------------------------
 # PDF's cross-reference offsets are ASCII DECIMAL, which the spec language cannot express
@@ -1070,7 +1153,11 @@ _BUILTINS = {
                      {"type": "array", "name": "ifd0", "count": "nent", "spec": _IFD_ENTRY,
                       "seed_records": _TIFF_ENTRIES},
                      {"type": "u32", "endian": "little", "name": "next_ifd"}]},
-                 {"type": "blob", "name": "strip"}]},
+                 {"type": "blob", "name": "strip"}],
+     # one extra seed per codec: find the IFD record whose `tag` is 259 (Compression) and set
+     # its `value` to each codec in turn. See `_TIFF_CODECS`.
+     "record_variants": {"key": "tag", "match": 259, "field": "value",
+                         "values": _TIFF_CODECS}},
     # PDF: mupdf's mutool was detected as "zip" (it reads epub/xps, so it carries ZIP's
     # strings) and never got a PDF seed at all. The body is a blob for the reason given at
     # `_pdf_body`: the xref offsets are ASCII decimal and the spec language has no such field.
