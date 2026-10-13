@@ -318,6 +318,12 @@ def gather_bundle(dirpath) -> tuple[Optional[Path], dict[str, str]]:
     return main, deps
 
 
+#: How many of a source project's executables one case will carry. Each is a full target with
+#: its own budget, so this is a cost ceiling, not a judgement about which ones matter: the
+#: builder returns them largest-first and the scorecard reports how many were left out.
+MAX_ENTRY_POINTS = 6
+
+
 def _ingest_built_project(store, case_id, root, built, filename):
     """Ingest the binary produced by building a source PROJECT: store the primary instrumented
     executable as the target, keep the source TREE (tar.gz) keyed to its hash so the code view can
@@ -350,8 +356,28 @@ def _ingest_built_project(store, case_id, root, built, filename):
                              "build_system": built.get("system"), "compiler": built.get("compiler"),
                              "other_binaries": [b.name for b in built.get("binaries", [])[1:8]]})
     store.put_artifact(case_id, "target-blob", src=primary)
-    return store.targets.upsert(case_id, filename, info["sha256"],
+    main = store.targets.upsert(case_id, filename, info["sha256"],
                                 md5=info["md5"], sha1=info["sha1"], size=info["size"])
+    # EVERY ENTRY POINT THE BUILD PRODUCED, not just the biggest one. A library project builds a
+    # tool per operation -- libtiff builds ~20 -- and each is a different parser front end with a
+    # different attack surface, while only `primary` (the largest executable) was ever registered.
+    # The rest are registered as targets of the same case so the pass can reach them and the
+    # report can say how many entry points exist; `MAX_ENTRY_POINTS` bounds how many a single
+    # case will carry, because each one costs a full per-target budget.
+    for extra in (built.get("binaries") or [])[1:MAX_ENTRY_POINTS]:
+        try:
+            ex = Path(extra)
+            if ex == primary or not ex.is_file():
+                continue
+            xi = hash_all_file(ex)
+            if not xi["size"]:
+                continue
+            store.put_artifact(case_id, "target-blob", src=ex)
+            store.targets.upsert(case_id, ex.name, xi["sha256"],
+                                 md5=xi["md5"], sha1=xi["sha1"], size=xi["size"])
+        except OSError:
+            continue
+    return main
 
 
 def ingest(store, case_id: str, path: str | Path, filename: Optional[str] = None,

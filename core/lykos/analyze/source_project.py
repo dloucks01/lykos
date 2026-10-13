@@ -172,17 +172,33 @@ def build_source_project(root, *, timeout: int = 300) -> dict:
         except (OSError, subprocess.SubprocessError) as e:
             return 1, f"{argv[0]}: {e}"
 
+    # STATIC libraries, for both builders. A shared build of a library project produces tools that
+    # are unrunnable here for two independent reasons, measured on libtiff 4.0.3 and expat 2.1.0:
+    #   * libtool puts the real ELF in `tools/.libs/` and leaves a SHELL WRAPPER at `tools/tiffcrop`
+    #     that sets LD_LIBRARY_PATH. The pipeline analysed the wrapper (expat: 13,701 executions of
+    #     a shell script, file_type "other", 0 findings);
+    #   * the real ELF in `.libs/` has NO RPATH -- it NEEDS `libtiff.so.5` and nothing stages it, so
+    #     the loader refuses it. The scorecard said `ran: false` and the orchestrator still spent
+    #     34,059 executions on an image that never started.
+    # Linking the tools statically against the project's own libs makes each tool one self-contained
+    # instrumented ELF needing only host libraries (libasan/libz/libm), which is what the sanitizer
+    # build is for. Verified on libtiff 4.0.3: `tools/tiffcrop` becomes a 7 MB ASan ELF that runs,
+    # and so do tiffinfo/tiffcp/tiff2pdf/tiffdump/tiffmedian.
     def _b_cmake():
         bd = root / "_lykos_build"
         bd.mkdir(exist_ok=True)
         _, o1 = _run(["cmake", "-S", str(root), "-B", str(bd),
                       f"-DCMAKE_C_COMPILER={wrapdir/'cc'}", f"-DCMAKE_CXX_COMPILER={wrapdir/'c++'}",
+                      "-DBUILD_SHARED_LIBS=OFF",
                       "-DCMAKE_BUILD_TYPE=Debug"], cwd=root)
         _, o2 = _run(["cmake", "--build", str(bd), "-j"], cwd=root)
         return "cmake", o1 + o2
 
     def _b_autotools():
-        _, o1 = _run(["./configure"], cwd=root)
+        # `--disable-shared` is not a preference here, it is what makes the build RUNNABLE (above).
+        _, o1 = _run(["./configure", "--disable-shared"], cwd=root)
+        if "command not found" in o1 or "No such file" in o1:
+            _, o1 = _run(["./configure"], cwd=root)      # a non-autoconf `configure` may reject it
         _, o2 = _run(["make", "-j"], cwd=root)
         return "autotools", o1 + o2
 
