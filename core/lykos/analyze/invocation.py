@@ -176,18 +176,26 @@ def raw_strings(data: bytes, *, minlen: int = 4, limit: int = 200000) -> list:
         # dictionary, the format detector, the credential detector -- quietly concluded there
         # was nothing there. The constant pool holds them all in the clear.
         return jvm.strings_of(data)[:limit]
-    out, cur = [], bytearray()
-    for b in data[:limit * 8]:
-        if b in _PRINTABLE:
-            cur.append(b)
-            continue
-        if len(cur) >= minlen:
-            out.append(cur.decode("ascii", "replace"))
-            if len(out) >= limit:
-                return out
-        cur.clear()
-    if len(cur) >= minlen:
-        out.append(cur.decode("ascii", "replace"))
+    # The WHOLE file, and with a C-speed scan rather than a Python byte loop.
+    #
+    # This used to stop at `data[:limit * 8]` -- the first 1.6 MB -- which conflated "at most
+    # 200,000 strings" with "at most 1.6 MB of bytes". Measured consequence: libtiff's plain
+    # `tiffinfo` is 1.24 MB and yielded 5,815 strings including every TIFF marker, while the
+    # same project's ASan-instrumented `tiffcrop` is 5.47 MB, so its .rodata sat PAST the cap
+    # and the scan returned 784 strings of mostly code -- no usage line, no format tokens, no
+    # dictionary. Every consumer went blind at once: invocation discovery proposed a flag
+    # soup the target refused, the format detector found nothing and the campaign fell through
+    # to mutating text commands mined from three-letter fragments, against a TIFF reader.
+    #
+    # A byte prefix is the wrong bound for "how much work is this": a large binary is exactly
+    # the case where the strings matter most. `limit` still bounds the OUTPUT, which is the
+    # bound that was wanted.
+    rx = re.compile(b"[" + re.escape(_PRINTABLE) + b"]{" + str(int(minlen)).encode() + b",}")
+    out = []
+    for m in rx.finditer(data):
+        out.append(m.group().decode("ascii", "replace"))
+        if len(out) >= limit:
+            break
     return out
 
 
@@ -617,6 +625,15 @@ def propose_argv(found: dict, *, input_kind: str = "config") -> list:
     # flag -- `tcpdump -r <pcap>`, `openssl ... -in <file>`. Append that one, with the input at it,
     # so a reader whose only input path is optional still gets fuzzed. Pick a READ flag, never an
     # output one (`-w`/`-o`/`--out`), or we would write to the fuzzed path instead of reading it.
+    # A DISPATCH tool takes its input as the positional after the subcommand (`mutool draw @@`),
+    # so an OPTIONAL read-ish flag must not claim the slot: `-r` on `mutool draw` is a
+    # RESOLUTION, and `mutool draw -r input.pdf` feeds the document to that flag and then has no
+    # input left -- the tool prints usage and the campaign looks clean forever. The
+    # optional-read-flag branch below exists for a flag-only reader (`tcpdump -r <pcap>`), which
+    # is the case with no subcommand to anchor a positional.
+    if not placed and sub:
+        argv.append(INPUT_PLACEHOLDER)
+        placed = True
     if not placed:
         # A file-kind read flag is the clearest input slot; a bare getopt value-flag with no metavar
         # (kind "value") is a candidate too, chosen by how read-like its name is -- `-r`/`-i`/`-in`

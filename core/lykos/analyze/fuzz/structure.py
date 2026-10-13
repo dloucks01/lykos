@@ -129,6 +129,14 @@ class FormatModel:
                     # length field itself, so the blob ends at that field's start plus the span
                     cap = pos + int(total) if start is None else max(start + int(total), pos)
                     cap = min(max(cap, pos), len(data))
+                if f.get("reserve"):
+                    # A blob with no length field at all, followed by a FIXED-SIZE TRAILER:
+                    # gzip's deflate stream runs to eight bytes before the end of the member,
+                    # where its CRC32 and uncompressed size sit. Without this the trailing
+                    # blob ate the trailer (every blob consumes the rest by default), so the
+                    # model did not round-trip its own seed: parse swallowed the CRC, serialize
+                    # wrote zeros back, and the decoder then rejected the baseline as corrupt.
+                    cap = min(cap, max(pos, len(data) - int(f["reserve"])))
                 if f.get("until") is not None:
                     # A blob that ends at a DELIMITER rather than at a length. H.264 in
                     # Annex-B framing has no length field at all -- a NAL unit runs until the
@@ -583,6 +591,128 @@ _IFD_ENTRY = [{"type": "u16", "endian": "little", "name": "tag"},
               {"type": "u32", "endian": "little", "name": "count", "role": "size"},
               {"type": "u32", "endian": "little", "name": "value", "role": "offset"}]
 
+# --- TIFF -------------------------------------------------------------------------------
+# A TIFF is a header pointing at a directory of 12-byte entries, and the entries point at the
+# pixel data by ABSOLUTE file offset. That is the whole reason this format produces so many
+# OOB reads: StripOffsets says where the data is and StripByteCounts says how much of it there
+# is, both chosen by the file, and a decoder that trusts either walks off the end.
+#
+# The baseline is a real 1x1 8-bit greyscale image (verified accepted by tiffinfo), so the
+# campaign starts INSIDE the decoder rather than at the magic check; the two fields above are
+# the ones `boundary_seeds` then drives to the wrap-the-sum values.
+_TIFF_IFD_OFF = 8                                  # header is II*\0 + the 4-byte IFD offset
+_TIFF_NENT = 8
+# where the strip data lands in the baseline: header + count + entries + next-IFD pointer
+_TIFF_STRIP_OFF = _TIFF_IFD_OFF + 2 + 12 * _TIFF_NENT + 4
+_TIFF_ENTRIES = [
+    {"tag": 256, "fmt": 3, "count": 1, "value": 1},        # ImageWidth
+    {"tag": 257, "fmt": 3, "count": 1, "value": 1},        # ImageLength
+    {"tag": 258, "fmt": 3, "count": 1, "value": 8},        # BitsPerSample
+    {"tag": 259, "fmt": 3, "count": 1, "value": 1},        # Compression: none
+    {"tag": 262, "fmt": 3, "count": 1, "value": 1},        # Photometric: min-is-black
+    # StripOffsets: an absolute file offset, which is what makes it the format's sharp edge
+    {"tag": 273, "fmt": 4, "count": 1, "value": _TIFF_STRIP_OFF},
+    {"tag": 278, "fmt": 3, "count": 1, "value": 1},        # RowsPerStrip
+    {"tag": 279, "fmt": 4, "count": 1, "value": 1},        # StripByteCounts
+]
+
+# --- PDF --------------------------------------------------------------------------------
+# PDF's cross-reference offsets are ASCII DECIMAL, which the spec language cannot express
+# (`offset_of` writes a binary integer), so the body is one blob seeded with a complete,
+# verified-parsable document rather than a field-by-field model. That is still the difference
+# between a campaign that reaches the object parser and one that is rejected at byte 0: the
+# header stays `magic`, so every mutant is still a PDF, and the havoc lands on objects,
+# stream lengths and the xref table instead of on "%PDF".
+def _pdf_body() -> bytes:
+    objs = [b"1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj",
+            b"2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj",
+            b"3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 99 99]/Contents 4 0 R>>endobj",
+            b"4 0 obj<</Length 44>>stream\nBT /F1 12 Tf 10 50 Td (lykos) Tj ET\nendstream endobj"]
+    out, offs = b"", []
+    for o in objs:
+        offs.append(len(_PDF_HEADER) + len(out))
+        out += o + b"\n"
+    xref = len(_PDF_HEADER) + len(out)
+    out += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objs) + 1)
+    for o in offs:
+        out += b"%010d 00000 n \n" % o
+    out += b"trailer<</Size %d/Root 1 0 R>>\nstartxref\n%d\n%%%%EOF\n" % (len(objs) + 1, xref)
+    return out
+
+
+_PDF_HEADER = b"%PDF-1.4\n"
+_PDF_BODY = _pdf_body()
+
+# --- XML --------------------------------------------------------------------------------
+# Text format, so there are no lengths to keep coherent; what matters is that the seed
+# declares the constructs the bugs live in -- a DOCTYPE, an internal entity, an attribute --
+# because an XML parser's interesting code is entity expansion and encoding handling, and a
+# document with none of it exercises the element loop only.
+_XML_DOC = (b'<!DOCTYPE r [<!ENTITY e "lykos"><!ENTITY f "&e;&e;">]>\n'
+            b'<r a="1" xmlns:n="urn:x"><n:c>&f;</n:c><![CDATA[<raw>]]></r>\n')
+
+# --- gzip -------------------------------------------------------------------------------
+# A 10-byte header, a raw DEFLATE stream, then a CRC32 of the UNCOMPRESSED bytes and their
+# length. The CRC is why a blind mutator gets nowhere past the inflate call: a decoder checks
+# it and reports corruption. `crc32_of` a `shadow` lets the model carry the plain bytes it is
+# a checksum OF without serialising them, exactly as the ZIP model does.
+_GZ_PLAIN = b"lykos test payload, compressible compressible compressible\n"
+
+
+def _raw_deflate(data: bytes) -> bytes:
+    c = zlib.compressobj(9, zlib.DEFLATED, -15)
+    return c.compress(data) + c.flush()
+
+
+_GZ_DEFLATED = _raw_deflate(_GZ_PLAIN)
+
+# --- bzip2 ------------------------------------------------------------------------------
+# bzip2's block is Huffman-coded and bit-packed: nothing in the spec language can emit a valid
+# one, so the baseline is a real compressed block kept as the seed value and the magic/level
+# stay fields. The level byte ("1".."9") is a field because it sets the block size a decoder
+# allocates from, and the randomised/blocksize bits are where its historical overflows are.
+def _bz2_block():
+    """A real compressed block, split at the two fields that are byte-aligned in it.
+
+    Everything in a bzip2 block after its header is Huffman-coded and BIT-packed, so no
+    byte-field model can emit one -- but the FIRST block's 48-bit magic and its 32-bit CRC sit
+    immediately after the 4-byte stream header, which is byte-aligned, so those two are real
+    fields rather than part of the opaque payload. The CRC is NOT derived: bzip2 uses the
+    non-reflected CRC-32/BZIP2 polynomial, and `crc32_of` computes zlib's reflected one, so
+    deriving it would quietly produce a stream every decoder rejects.
+    """
+    import bz2
+    raw = bz2.compress(b"lykos test payload\n" * 4, 9)[4:]        # strip "BZh9"
+    return raw[:6], int.from_bytes(raw[6:10], "big"), raw[10:]
+
+
+_BZ2_MAGIC, _BZ2_CRC, _BZ2_BODY = _bz2_block()
+
+# --- ELF --------------------------------------------------------------------------------
+# The format every binary-analysis tool parses, and the one whose header is nothing but
+# counts and offsets a reader has to trust: e_shoff/e_shnum/e_shentsize say where the section
+# table is and how big, and a tool that multiplies them and reads gets an OOB read out of a
+# 64-byte file. readelf/objdump/nm/strip are all reachable this way, which is why the seed is
+# a real loadable ELF rather than a stub: a tool that rejects the header never reaches the
+# section walker.
+_ELF_SHSTR = b"\x00.shstrtab\x00"
+_ELF_EHSIZE = 64
+_ELF_SHENT = 64
+_ELF_NSHDR = 3                                     # NULL, .shstrtab, one PROGBITS
+_ELF_SHOFF = _ELF_EHSIZE + len(_ELF_SHSTR)
+
+
+def _elf_shdrs() -> bytes:
+    def sh(name, typ, off, size, link=0, entsize=0, flags=0):
+        return struct.pack("<IIQQQQIIQQ", name, typ, flags, 0, off, size, link, 0, 1, entsize)
+    return (sh(0, 0, 0, 0)                                      # SHT_NULL
+            + sh(1, 3, _ELF_EHSIZE, len(_ELF_SHSTR))            # .shstrtab (SHT_STRTAB)
+            + sh(1, 1, _ELF_EHSIZE, 0))                         # SHT_PROGBITS
+
+
+_ELF_SHDRS = _elf_shdrs()
+
+
 
 
 _BUILTINS = {
@@ -919,7 +1049,152 @@ _BUILTINS = {
                 {"type": "u32", "endian": "little", "name": "cdsize", "length_of": "cd"},
                 {"type": "u32", "endian": "little", "name": "cdoff", "offset_of": "cd"},
                 {"type": "magic", "value": b"\x00\x00"}]},
+    # TIFF: measured on this corpus, libtiff's tools were detected as "jpeg" (they link
+    # libjpeg, so they carry its strings) and handed a JPEG seed their TIFF reader rejects at
+    # the magic. The format's own markers are its tag NAMES and its error strings, which only
+    # a TIFF implementation carries -- and `TIFFOpen` is in the import table of anything that
+    # reads one through the shared library, where there are no strings to mine at all.
+    "tiff": {"tokens": ("TIFFReadDirectory", "StripByteCounts", "SamplesPerPixel",
+                        "TIFF Directory", "PlanarConfiguration", "TIFFOpen"),
+             "imports": ("TIFFOpen", "TIFFClientOpen", "TIFFRead*", "TIFFGetField"),
+             "seed": b"\x80",
+             "spec": [
+                 {"type": "magic", "value": b"II*\x00"},
+                 {"type": "u32", "endian": "little", "name": "ifd_off",
+                  "offset_of": "ifd", "role": "offset"},
+                 {"type": "group", "name": "ifd", "spec": [
+                     # the entry count: a reader allocates and walks `nent` 12-byte entries,
+                     # and this is the field that makes it walk past the end of the file
+                     {"type": "u16", "endian": "little", "name": "nent",
+                      "seed_value": _TIFF_NENT, "role": "size"},
+                     {"type": "array", "name": "ifd0", "count": "nent", "spec": _IFD_ENTRY,
+                      "seed_records": _TIFF_ENTRIES},
+                     {"type": "u32", "endian": "little", "name": "next_ifd"}]},
+                 {"type": "blob", "name": "strip"}]},
+    # PDF: mupdf's mutool was detected as "zip" (it reads epub/xps, so it carries ZIP's
+    # strings) and never got a PDF seed at all. The body is a blob for the reason given at
+    # `_pdf_body`: the xref offsets are ASCII decimal and the spec language has no such field.
+    "pdf": {"tokens": ("%PDF-", "startxref", "/MediaBox", "endobj", "/Pages",
+                       "xref", "/Catalog"),
+            "imports": ("pdf_open_document", "FPDF_LoadDocument", "poppler_document_new"),
+            "spec": [
+                {"type": "magic", "value": _PDF_HEADER},
+                {"type": "blob", "name": "body", "seed_value": _PDF_BODY}]},
+    # XML: the thin-CLI case in its purest form -- xmlwf carries NO xml strings of its own,
+    # because every one of them lives in the libexpat it links against. Its IMPORT table says
+    # `XML_ParserCreate` in plain text, which is why detection reads imports as well as
+    # strings; with strings alone this target was undetectable in principle, not by accident.
+    "xml": {"tokens": ("<?xml", "not well-formed", "XML_ParserCreate", "xmlns",
+                       "DOCTYPE", "encoding specified"),
+            # expat exports `XML_*`; libxml2 exports several hundred `xml*` functions, so
+            # the prefix is the marker rather than a list that would always be incomplete
+            "imports": ("XML_Parse*", "XML_SetElementHandler", "xmlParse*", "xmlRead*",
+                        "xmlCtxt*", "xmlNewParserCtxt", "xmlCreatePushParserCtxt"),
+            "spec": [
+                {"type": "magic", "value": b'<?xml version="1.0" encoding="UTF-8"?>\n'},
+                {"type": "blob", "name": "doc", "seed_value": _XML_DOC}]},
+    # gzip: deliberately NOT keyed on "inflate" or "incorrect header check". Every PNG reader
+    # links zlib and carries both, so those tokens detect a PNG decoder as a gzip reader and
+    # the campaign then generates gzip members for a PNG parser. `gz*` is the gzip-FILE API,
+    # which only a program that reads .gz files calls.
+    "gzip": {"tokens": ("gzopen", "gzread", "gzdopen", "gzip", ".gz"),
+             "imports": ("gzopen", "gzread", "gzdopen", "gzgets", "gzbuffer"),
+             "spec": [
+                 {"type": "magic", "value": b"\x1f\x8b"},
+                 {"type": "u8", "name": "cm", "seed_value": 8},        # deflate
+                 # FEXTRA | FNAME. Seeded with both OPTIONAL members present on purpose: an
+                 # extra field is a length a decoder trusts, and a stored filename is a
+                 # NUL-terminated string it copies -- the two places gzip readers have
+                 # historically gone wrong -- and neither exists to be parsed unless the flag
+                 # byte says so. A seed with FLG=0 leaves that code unreachable for the whole
+                 # campaign; mutating the flag byte then walks the decoder's member dispatch.
+                 {"type": "u8", "name": "flg", "seed_value": 0x0C},
+                 {"type": "u32", "endian": "little", "name": "mtime"},
+                 {"type": "u8", "name": "xfl"},
+                 {"type": "u8", "name": "os", "seed_value": 3},
+                 {"type": "u16", "endian": "little", "name": "xlen",
+                  "length_of": "extra", "role": "size"},
+                 # one well-formed subfield: SI1 SI2 then its own 16-bit length
+                 {"type": "blob", "name": "extra", "seed_value": b"lk\x04\x00seed"},
+                 {"type": "blob", "name": "fname", "until": b"\x00",
+                  "seed_value": b"lykos.bin"},
+                 {"type": "magic", "value": b"\x00"},                 # the NAME terminator
+                 # stops eight bytes short of the end: the CRC and size trailer live there,
+                 # and the format gives the stream no length field to stop it earlier
+                 {"type": "blob", "name": "data", "seed_value": _GZ_DEFLATED, "reserve": 8},
+                 {"type": "u32", "endian": "little", "name": "crc", "crc32_of": "plain"},
+                 # the decompressed SIZE, which an extractor may believe before it has the
+                 # bytes to back it up -- the allocation-from-the-file shape
+                 {"type": "u32", "endian": "little", "name": "isize",
+                  "seed_value": len(_GZ_PLAIN), "role": "size"},
+                 {"type": "shadow", "name": "plain", "seed_value": _GZ_PLAIN}]},
+    # bzip2: "BZh" + a level digit that sets the block size the decoder allocates from.
+    "bzip2": {"tokens": ("bzip2", "bzlib", "BZ2_bzDecompress", "libbzip2", ".bz2"),
+              "imports": ("BZ2_bzDecompress", "BZ2_bzRead", "BZ2_bzReadOpen",
+                          "BZ2_bzDecompressInit", "BZ2_bzopen"),
+              "spec": [
+                  {"type": "magic", "value": b"BZh"},
+                  # "1".."9": the 100k-block multiplier, and the number a decoder sizes its
+                  # buffers from before it has seen any of the data they will hold
+                  {"type": "u8", "name": "level", "seed_value": 0x39, "role": "size"},
+                  {"type": "magic", "value": _BZ2_MAGIC},            # 48-bit block magic
+                  # the block CRC a decoder checks before it trusts the block it just
+                  # decompressed: described so the mutator can drive the corruption path
+                  {"type": "u32", "endian": "big", "name": "blk_crc",
+                   "seed_value": _BZ2_CRC},
+                  {"type": "blob", "name": "block", "seed_value": _BZ2_BODY}]},
+    # ELF: readelf was detected as "h264" -- a coincidence of three-letter tokens -- and fuzzed
+    # with 37 bytes of video. Binary-analysis tools are a real attack surface and their input
+    # is nothing but counts and offsets: e_shoff + e_shnum * e_shentsize is a multiplication
+    # the reader performs on attacker numbers, which is this model's whole point.
+    "elf": {"tokens": ("Section Headers:", "Program Headers:", "ELF Header:", "PT_LOAD",
+                       "section headers", "SHT_PROGBITS", "Elf64_Shdr"),
+            "imports": ("elf_begin", "elf_getshdrnum", "gelf_getshdr", "elf64_getshdr",
+                        "bfd_openr", "bfd_get_section_contents"),
+            "spec": [
+                {"type": "magic", "value": b"\x7fELF\x02\x01\x01\x00"},
+                {"type": "magic", "value": b"\x00" * 8},            # e_ident padding
+                {"type": "u16", "endian": "little", "name": "e_type", "seed_value": 1},
+                {"type": "u16", "endian": "little", "name": "e_machine", "seed_value": 62},
+                {"type": "u32", "endian": "little", "name": "e_version", "seed_value": 1},
+                {"type": "u64", "endian": "little", "name": "e_entry"},
+                {"type": "u64", "endian": "little", "name": "e_phoff", "role": "offset"},
+                # where the section table is: derived here, so a mutation that moves it is a
+                # real ELF with one wrong offset rather than a file the reader discards
+                {"type": "u64", "endian": "little", "name": "e_shoff",
+                 "offset_of": "shdrs", "role": "offset"},
+                {"type": "u32", "endian": "little", "name": "e_flags"},
+                {"type": "u16", "endian": "little", "name": "e_ehsize",
+                 "seed_value": _ELF_EHSIZE},
+                {"type": "u16", "endian": "little", "name": "e_phentsize", "seed_value": 56},
+                {"type": "u16", "endian": "little", "name": "e_phnum"},
+                # entsize * num is the multiplication; both halves are fields on purpose
+                {"type": "u16", "endian": "little", "name": "e_shentsize",
+                 "seed_value": _ELF_SHENT, "role": "size"},
+                {"type": "u16", "endian": "little", "name": "e_shnum",
+                 "seed_value": _ELF_NSHDR, "role": "size"},
+                {"type": "u16", "endian": "little", "name": "e_shstrndx", "seed_value": 1},
+                {"type": "blob", "name": "shstr", "seed_value": _ELF_SHSTR},
+                {"type": "blob", "name": "shdrs", "seed_value": _ELF_SHDRS}]},
 }
+
+
+#: Formats whose LAYOUT the spec language cannot express. The entry exists to DETECT the
+#: format and emit a VALID specimen, not to drive field-aware mutation:
+#:
+#:   * ``pdf``   -- its cross-reference offsets are ASCII DECIMAL; `offset_of` writes a binary
+#:                  integer, so the xref table cannot be a derived field.
+#:   * ``xml``   -- a grammar rather than a byte layout. `xmlgrammar.XmlMutator` mutates it;
+#:                  this entry's job is to put a well-formed document in the corpus, which is
+#:                  what makes that mutator reachable on a target nobody seeded.
+#:   * ``bzip2`` -- everything after the block header is Huffman-coded and bit-packed.
+#:
+#: These are exempt from the ">= 10 described fields" invariant (`test_format_models`), and
+#: that is a narrow exemption rather than a loophole: the invariant exists because a STUB
+#: model emits a file the target rejects, and each of these is tested against a real parser
+#: for its format instead. A new entry belongs here only when the spec language genuinely
+#: cannot describe the format -- not when describing it is merely work.
+SEED_ONLY = frozenset({"pdf", "xml", "bzip2"})
 
 
 def builtin(name: str):
@@ -931,24 +1206,62 @@ def builtin_names() -> list:
     return sorted(_BUILTINS)
 
 
-def detect_format(strings) -> str | None:
-    """Which builtin format this binary looks like a parser for, by its own strings.
+#: An imported symbol is a LINKAGE FACT, not a coincidence: a binary that calls
+#: `XML_ParserCreate` reads XML, where a binary that merely contains the string "xml" may be
+#: printing a usage line. Measured need for it: `xmlwf` has no XML strings at all.
+#:
+#: A FLAT weight, and capped. Weighting an import by the length of its name (the first version
+#: here) says `BZ2_bzDecompressInit` is four times the evidence of `gzread`, which is not a
+#: claim about anything -- and it ranked `unzip` as a bzip2 reader, because unzip imports four
+#: long bzlib symbols to decompress members INSIDE a zip. A linkage fact is strong but it is
+#: one fact, and a library's symbol count is an implementation detail of that library.
+_IMPORT_HIT = 10
+_IMPORT_CAP = 3
+
+#: A parser's strings are SATURATED with its format's vocabulary -- unzip says "zipfile"
+#: dozens of times -- while a codec it merely supports is named once or twice. Bounded at
+#: three so a help text cannot swamp the ranking.
+_TOKEN_CAP = 3
+
+
+def detect_formats(strings, imports=()) -> list:
+    """Every builtin this binary looks like a parser for, strongest first.
 
     A blind mutator cannot invent four valid magic bytes, so a parser rejects everything it is
     given and the campaign does no work: jhead ran 98,500 executions for zero finds against a
     bug AFL++ reached in 60 seconds WITH a valid seed. The binary itself says which format it
-    reads -- an EXIF reader carries the string "Exif" -- so the model and the seed can both be
-    chosen without an analyst supplying either.
+    reads, so the model and the seed can both be chosen without an analyst supplying either.
+
+    Two things this corpus forced, both measured rather than anticipated:
+
+    * **A list, not a winner.** Real readers read several formats -- mupdf's mutool takes PDF,
+      XPS, EPUB (zip), PNG, GIF and JPEG -- and picking one makes the other seeds unreachable.
+      Scoring them all and seeding the top few removes the ranking problem instead of trying
+      to win it: mutool was ranked "zip", which is not even wrong, and got no PDF seed.
+    * **Imports, not only strings.** `xmlwf` carries no XML strings at all; they live in the
+      libexpat it links against. String evidence cannot see through a shared library in
+      principle, and its import table says `XML_ParserCreate` in plain text.
     """
     blob = "\n".join(s for s in strings if s)
-    best, score = None, 0
+    imps = {str(s) for s in (imports or ()) if s}
+    scored = []
     for name, entry in _BUILTINS.items():
         # a longer token is stronger evidence: "GIF89a" in a binary means something, two
-        # characters mean nothing, so weight each hit by the length of what matched
-        hits = sum(len(t) for t in entry["tokens"] if t and _token_hit(t, blob))
-        if hits > score:
-            best, score = name, hits
-    return best
+        # characters mean nothing, so weight each hit by the length of what matched -- times
+        # how often it occurs, bounded, because a parser repeats its format's vocabulary
+        score = sum(len(t) * min(_TOKEN_CAP, _token_count(t, blob))
+                    for t in entry["tokens"] if t)
+        score += _IMPORT_HIT * min(_IMPORT_CAP, _import_hits(entry.get("imports", ()), imps))
+        if score:
+            scored.append((score, name))
+    scored.sort(key=lambda x: (-x[0], x[1]))
+    return [n for _s, n in scored]
+
+
+def detect_format(strings, imports=()) -> str | None:
+    """The single strongest candidate -- `detect_formats`'s first row."""
+    ranked = detect_formats(strings, imports)
+    return ranked[0] if ranked else None
 
 
 # Below this, a substring match is not evidence of anything -- it is a coincidence waiting to
@@ -956,6 +1269,34 @@ def detect_format(strings) -> str | None:
 # "MAX_PATHS" is not, and the difference is a word boundary rather than a length.
 _SHORT_TOKEN = 5
 _WORD_CACHE: dict = {}
+
+
+def _import_hits(tokens, imps) -> int:
+    """How many of a format's import markers this binary links. A token ending in `*` is a
+    PREFIX, which is how a library is recognised without enumerating its API: libxml2 exports
+    several hundred `xml*` entry points and a binary that calls any of them reads XML."""
+    n = 0
+    for t in tokens or ():
+        if not t:
+            continue
+        if t.endswith("*"):
+            pre = t[:-1]
+            if any(s.startswith(pre) for s in imps):
+                n += 1
+        elif t in imps:
+            n += 1
+    return n
+
+
+def _token_count(token: str, blob: str) -> int:
+    """How many times a token occurs, under the same word-boundary rule as `_token_hit`."""
+    if len(token) >= _SHORT_TOKEN:
+        return blob.count(token)
+    rx = _WORD_CACHE.get(token)
+    if rx is None:
+        rx = _WORD_CACHE[token] = re.compile(r"(?<![A-Za-z0-9_])%s(?![A-Za-z0-9_])"
+                                             % re.escape(token))
+    return len(rx.findall(blob))
 
 
 def _token_hit(token: str, blob: str) -> bool:

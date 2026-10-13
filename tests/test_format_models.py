@@ -19,6 +19,59 @@ def test_a_parser_is_recognised_from_its_own_strings():
     assert S.detect_format(["GIF89a"]) == "gif"
 
 
+def test_a_format_is_detected_through_a_shared_library_it_links():
+    """`xmlwf` carries not one XML string: they all live in the libexpat it links against, so
+    a strings-only detector is blind to it by construction rather than by accident. Its import
+    table says `XML_ParserCreate` in plain text."""
+    assert S.detect_format(["usage: xmlwf [-s] file"]) is None
+    assert S.detect_format(["usage: xmlwf [-s] file"],
+                           ["XML_ParserCreate", "XML_Parse", "fopen"]) == "xml"
+
+
+def test_an_import_is_one_strong_fact_not_a_vote_per_symbol():
+    """Weighting an import by the length of its symbol name (the first version of this) says
+    `BZ2_bzDecompressInit` is four times the evidence of `gzread`, which is a claim about
+    nothing -- and it ranked `unzip` as a bzip2 reader, because unzip imports four long bzlib
+    symbols to decompress members INSIDE a zip archive."""
+    unzip_strings = ["central directory"] * 4 + ["zipfile"] * 30 + ["BZ2_bzDecompress"]
+    bz_imports = ["BZ2_bzDecompress", "BZ2_bzDecompressEnd", "BZ2_bzDecompressInit",
+                  "BZ2_bzlibVersion"]
+    assert S.detect_formats(unzip_strings, bz_imports)[0] == "zip"
+    # the codec it supports is still offered -- it is evidence, just not the winner
+    assert "bzip2" in S.detect_formats(unzip_strings, bz_imports)
+
+
+def test_a_parser_repeats_its_own_format_vocabulary():
+    """A parser's strings are saturated with its format's words; a codec it merely supports is
+    named once. Bounded, so a help text cannot swamp the ranking."""
+    once = ["zipfile", "GIF89a", "GIF89a", "GIF89a", "GIF89a"]
+    assert S.detect_formats(once)[0] == "gif"
+    many = ["zipfile"] * 30 + ["GIF89a"]
+    assert S.detect_formats(many)[0] == "zip"
+
+
+def test_every_format_a_multi_format_reader_reads_gets_a_seed():
+    """mupdf's mutool takes PDF, XPS and EPUB (zip), PNG, GIF and JPEG. Ranked one-at-a-time
+    it was "zip" -- which is not even wrong -- and so never got a PDF seed at all, leaving its
+    PDF parser behind a magic check for the whole campaign."""
+    mutool = ["%PDF-", "startxref", "endobj", "/MediaBox", "/Pages", "central directory",
+              "zipfile", "IHDR", "GIF89a"]
+    ranked = S.detect_formats(mutool)
+    assert ranked[0] == "pdf", ranked
+    assert {"zip", "png", "gif"} & set(ranked[1:]), ranked
+    assert all(S.seed_for_name(n) for n in ranked[:3])
+
+
+def test_a_tiff_reader_that_links_libjpeg_is_still_a_tiff_reader():
+    """The measured failure that started this: libtiff's tools carry libjpeg's strings, were
+    detected as "jpeg", and were handed a 215-byte JPEG their TIFF reader rejects at the
+    magic -- 1 of 8 real library tools got a seed for the format it reads."""
+    tiffinfo = ["TIFFReadDirectory", "StripByteCounts", "SamplesPerPixel", "TIFF Directory",
+                "PlanarConfiguration", "Exif", "JFIF"]
+    assert S.detect_formats(tiffinfo)[0] == "tiff"
+    assert S.detect_formats(tiffinfo, ["TIFFOpen", "TIFFGetField"])[0] == "tiff"
+
+
 def test_a_non_parser_is_not_forced_into_a_format():
     """Guessing a model for a program that reads no format would seed every campaign with
     inputs its target rejects."""
@@ -342,8 +395,112 @@ def test_every_builtin_describes_more_than_its_magic():
     for name in S.builtin_names():
         if name == "lv32":
             continue            # deliberately generic: a magic + length + payload container
+        if name in S.SEED_ONLY:
+            continue            # the spec language cannot describe it -- see SEED_ONLY, and
+            # test_a_seed_only_format_still_emits_a_specimen_a_real_parser_accepts
         n = described(S.builtin(name).spec)
         assert n >= 10, f"{name} is still a stub: {n} fields"
+
+
+def test_a_seed_only_format_still_emits_a_specimen_a_real_parser_accepts():
+    """The exemption above is narrow, and this is what keeps it narrow.
+
+    The ">= 10 fields" invariant exists because a stub model emits something the target
+    rejects at the door. For a format the spec language cannot describe -- PDF's ASCII-decimal
+    xref offsets, XML's grammar, bzip2's bit-packed block -- the entry's job is to put a VALID
+    specimen in the corpus instead, so the test is the same claim measured differently: the
+    seed must be a real document of that format, not a magic with filler behind it.
+    """
+    for name in sorted(S.SEED_ONLY):
+        seed = S.seed_for_name(name)
+        assert seed and len(seed) >= 48, f"{name}: {len(seed or b'')} bytes is filler"
+        model = S.builtin(name)
+        assert model.serialize(model.parse(seed)) == seed, f"{name} must round-trip"
+    # and each one is a specimen of the format it claims, not of some other
+    assert S.seed_for_name("pdf").startswith(b"%PDF-")
+    assert b"<!DOCTYPE" in S.seed_for_name("xml") and b"<!ENTITY" in S.seed_for_name("xml")
+    assert S.seed_for_name("bzip2").startswith(b"BZh9")
+
+
+def test_the_formats_this_corpus_added_are_the_ones_real_tools_read():
+    """Added because the measurement that motivated them was not a near miss: libtiff's tools
+    were detected as "jpeg" (they link libjpeg, so they carry its strings) and got a JPEG seed
+    their TIFF reader rejects at the magic; mupdf's mutool was detected as "zip"; and readelf
+    was detected as "h264" from a coincidence of three-letter tokens and fuzzed with 37 bytes
+    of video. One of eight targets got a seed for the format it actually reads."""
+    for name in ("tiff", "pdf", "xml", "gzip", "bzip2", "elf"):
+        assert name in S.builtin_names(), name
+        assert S.seed_for_name(name), name
+
+
+def test_a_tiff_seed_is_a_directory_a_reader_can_walk():
+    """StripOffsets is an ABSOLUTE file offset, which is what makes this format produce so
+    many OOB reads -- and what makes a seed that gets it wrong useless, because a reader
+    rejects the directory before reaching any of the code the campaign is aiming at."""
+    seed = S.seed_for_name("tiff")
+    assert seed[:4] == b"II*\x00"
+    ifd_off = int.from_bytes(seed[4:8], "little")
+    nent = int.from_bytes(seed[ifd_off:ifd_off + 2], "little")
+    assert nent == 8, nent
+    tags = {}
+    for i in range(nent):
+        e = ifd_off + 2 + 12 * i
+        tags[int.from_bytes(seed[e:e + 2], "little")] = \
+            int.from_bytes(seed[e + 8:e + 12], "little")
+    assert tags[256] == 1 and tags[257] == 1          # a 1x1 image
+    assert tags[273] == ifd_off + 2 + 12 * nent + 4   # StripOffsets points AT the strip
+    assert seed[tags[273]:tags[273] + tags[279]]      # and there are bytes there to read
+
+
+def test_an_elf_seed_section_table_is_where_its_header_says():
+    """e_shoff + e_shnum * e_shentsize is a multiplication a reader performs on numbers the
+    file chose, which is the whole reason binary-analysis tools are worth fuzzing. A seed whose
+    header does not agree with itself never reaches that code."""
+    seed = S.seed_for_name("elf")
+    assert seed[:4] == b"\x7fELF"
+    shoff = int.from_bytes(seed[0x28:0x30], "little")
+    shentsize = int.from_bytes(seed[0x3A:0x3C], "little")
+    shnum = int.from_bytes(seed[0x3C:0x3E], "little")
+    assert shentsize == 64 and shnum == 3
+    assert shoff + shnum * shentsize == len(seed), "the table must END at the end of the file"
+
+
+def test_a_gzip_seed_carries_a_crc_of_bytes_that_are_not_in_it():
+    """A decoder checks the CRC32 of the DECOMPRESSED bytes, which the file does not contain:
+    without `shadow` carrying them for the checksum to name, the baseline is reported as
+    corrupt and the campaign never gets past the inflate call."""
+    import gzip
+    import zlib
+    seed = S.seed_for_name("gzip")
+    assert seed[:3] == b"\x1f\x8b\x08"
+    # FEXTRA | FNAME are both seeded present, so the deflate stream does not start at a fixed
+    # offset: walk the header the way a decoder does.
+    flg = seed[3]
+    assert flg & 0x04 and flg & 0x08, "the optional members are the point of the seed"
+    pos = 10
+    xlen = int.from_bytes(seed[pos:pos + 2], "little")
+    pos += 2 + xlen
+    pos = seed.index(b"\x00", pos) + 1                 # the NUL-terminated stored filename
+    plain = zlib.decompress(seed[pos:-8], -15)
+    assert int.from_bytes(seed[-8:-4], "little") == zlib.crc32(plain)
+    assert int.from_bytes(seed[-4:], "little") == len(plain)
+    # ...and the whole thing is what a real decoder calls a gzip member
+    assert gzip.decompress(seed) == plain
+
+
+def test_a_trailing_blob_can_stop_short_of_a_fixed_size_trailer():
+    """`reserve`: gzip's deflate stream has no length field and runs to eight bytes before the
+    end of the member, where the CRC and size sit. Without it the trailing blob ate the
+    trailer -- every blob consumes the rest by default -- so the model did not round-trip its
+    own seed: parse swallowed the CRC and serialize wrote zeros back."""
+    m = S.FormatModel([{"type": "magic", "value": b"MZ"},
+                       {"type": "blob", "name": "data", "reserve": 4},
+                       {"type": "u32", "endian": "little", "name": "trailer"}])
+    data = b"MZ" + b"payload" + (0xAABBCCDD).to_bytes(4, "little")
+    fields = m.parse(data)
+    assert fields[1]["val"] == b"payload"
+    assert fields[2]["val"] == 0xAABBCCDD
+    assert m.serialize(fields) == data
 
 
 # --- delimited and derived-size blobs, and the two video models built on them ----------

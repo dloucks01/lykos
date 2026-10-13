@@ -182,9 +182,44 @@ def _reads_a_number(ctx, target) -> bool:
         return False
 
 
+#: How many detected formats get a seed. A real reader reads several (mutool: PDF, XPS/EPUB,
+#: PNG, GIF, JPEG); past the third the evidence is no longer evidence, and every extra seed
+#: costs calibration time against a target that may not read that format at all.
+_MAX_FORMATS = 3
+
+
+def _imports_for(ctx, target) -> list:
+    """The target's imported function names -- the evidence string mining cannot reach.
+
+    A thin CLI over a shared library carries none of that library's strings: `xmlwf` has not
+    one XML string in it, because they all live in the libexpat it links against. A
+    strings-only format detector is blind to such a target by construction, not by accident,
+    and its import table says `XML_ParserCreate` in plain text.
+
+    Call edges carry the names once `disassemble` has run; before that -- and leading with
+    execution means fuzzing usually runs first -- the ELF import table does, for the cost of
+    parsing bytes already on disk. Best-effort: no imports just means less evidence.
+    """
+    names: list = []
+    try:
+        names = [e.dst_name for e in CallEdgeDAO(ctx.conn).list_by_target(target.id)
+                 if e.dst_name]
+    except Exception:
+        names = []
+    if not names:
+        try:
+            from .. import elf as elfmod
+            data = ctx.content.path(target.sha256).read_bytes()
+            names = list((elfmod.parse(data).imports or {}).get("symbols") or [])
+        except Exception:
+            names = []
+    return [str(n).split("@")[0] for n in names if n]
+
+
 def format_aware_seeds(ctx, target) -> list:
-    """Seeds that pass the target's INPUT GATE, derived from the binary's own strings: a binary
-    format-model seed (jpeg/gif/elf/... -- carries the magic + a minimal valid structure), a text
+    """Seeds that pass the target's INPUT GATE, derived from the binary's own strings AND its
+    import table: a format-model seed for each format it looks like a reader for (tiff/pdf/
+    elf/... -- carrying the magic and a minimal valid structure), a text
     `key=value` config seed when the binary looks config-driven, and a handful of the most selective
     mined strings. AFL's entire advantage is coverage feedback from a valid starting point; the
     generic `_DEFAULT_SEEDS` (``""``, ``"AAAA"``, a path) bounce off a real parser at the front door
@@ -198,11 +233,26 @@ def format_aware_seeds(ctx, target) -> list:
     except Exception:
         return seeds
     try:
-        fmt = structure.detect_format(svals)
-        if fmt:
-            s = structure.seed_for_name(fmt)
-            if s:
-                seeds.append(s)
+        imps = _imports_for(ctx, target)
+    except Exception:
+        imps = []
+    try:
+        # EVERY format this binary looks like a reader for, strongest first -- not just the
+        # winner. Measured on this corpus: mutool was ranked "zip" (it reads EPUB/XPS, so the
+        # ranking is not even wrong) and therefore never got a PDF seed, and libtiff's tools
+        # were ranked "jpeg" because they link libjpeg and carry its strings. One guess means
+        # the other parsers stay behind their magic check for the whole campaign.
+        detected = structure.detect_formats(svals, imps)
+        for i, fmt in enumerate(detected[:_MAX_FORMATS]):
+            if i == 0:
+                # the strongest candidate also gets the crash-shaped variants: one per
+                # offset/size pair, wrapping a 32-bit bounds check while still pointing out
+                # of bounds, so calibration detonates the structural bug on the first execs
+                seeds += structure.boundary_seeds(fmt) or []
+            else:
+                s = structure.seed_for_name(fmt)
+                if s:
+                    seeds.append(s)
     except Exception:
         pass
     try:
@@ -1357,8 +1407,24 @@ def fuzz_stage(ctx) -> dict:
         # AFL++ reached the same bug in 60 seconds WITH a valid sample -- and the target's own
         # strings say which format it reads. The model then yields a seed that passes the gate,
         # so the campaign starts inside the parser instead of at its front door.
-        fmt = structure.detect_format([x.value for x in strings])
-        if fmt:
+        _detected = structure.detect_formats([x.value for x in strings],
+                                             _imports_for(ctx, target))
+        fmt = _detected[0] if _detected else None
+        if fmt == "xml":
+            # XML is a grammar, and the grammar mutator already exists -- but it could only be
+            # chosen when the CORPUS already looked like XML (`looks_like_xml` above), which on
+            # a target nobody seeded it never does. So the one capability that works on XML was
+            # unreachable on exactly the targets that need it: measured on xmlwf, whose own
+            # strings contain no XML at all because they live in the libexpat it links.
+            mutator = xmlgrammar.XmlMutator(rng, dictionary)
+            _xs = structure.seed_for_name("xml")
+            if _xs:
+                corpus = [_xs] + list(corpus)
+            ctx.emit("fuzz.format", payload={
+                "model": "xml", "auto": True,
+                "why": "the binary's strings or imports say it parses XML; seeded with a "
+                       "well-formed document so the grammar mutator has something to mutate"})
+        elif fmt:
             model = structure.builtin(fmt)
             mutator = structure.StructMutator(rng, model, dictionary)
             # Boundary seeds FIRST: the valid skeleton AND one crash-shaped variant per offset/size
@@ -1367,6 +1433,14 @@ def fuzz_stage(ctx) -> dict:
             # detonates these before mutation, so a structural bug that a byte/field mutator lands
             # only by luck (jhead: 259 near-misses in 20k, zero crashes) is found on the first execs.
             bseeds = structure.boundary_seeds(fmt)
+            # The runner-up formats cannot drive the mutator -- a StructMutator models one
+            # format -- but their seeds still belong in the corpus: a multi-format reader is
+            # several parsers behind several magic checks, and the only one this campaign
+            # could otherwise reach is the one that won the ranking.
+            for _other in _detected[1:_MAX_FORMATS]:
+                _s = structure.seed_for_name(_other)
+                if _s:
+                    bseeds = (bseeds or []) + [_s]
             if bseeds:
                 corpus = bseeds + list(corpus)
     if not fmt and _reads_a_number(ctx, target):

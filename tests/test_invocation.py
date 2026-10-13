@@ -315,3 +315,40 @@ def test_verify_accepts_a_content_format_error_as_engaged():
         return _R(b"error: cannot find document handler for file: /x/sample", 1)  # engaged
     v = inv.verify(run, "mutool", ["draw", "@@"], "/x/sample")
     assert v["accepted"] and v["bare_rejected"]
+
+
+def test_strings_are_scanned_past_the_first_megabytes():
+    """The scan used to stop at `limit * 8` bytes -- the first 1.6 MB -- which conflated "at most
+    200,000 strings" with "at most 1.6 MB of bytes".
+
+    Measured consequence on a real pair: libtiff's plain `tiffinfo` is 1.24 MB and yielded 5,815
+    strings including every TIFF marker, while the same project's ASan-instrumented `tiffcrop` is
+    5.47 MB, so its .rodata sat PAST the cap and the scan returned 784 strings of mostly code.
+    Invocation discovery, the fuzzing dictionary, the format detector and the credential detector
+    all read this function, so all four went blind at once -- on precisely the big binaries where
+    strings matter most.
+    """
+    far = b"\x00" * (4 << 20) + b"usage: bigtool -c <config>\x00"
+    out = invocation.raw_strings(far)
+    assert any("usage: bigtool" in s for s in out), "a string past 1.6 MB must still be found"
+    # the OUTPUT bound is the one that was wanted, and it still holds
+    many = (b"A" * 8 + b"\x00") * 50
+    assert len(invocation.raw_strings(many, limit=10)) == 10
+
+
+def test_a_dispatch_tool_takes_its_input_positionally_not_behind_a_read_flag():
+    """`mutool draw -r input.pdf` feeds the document to `-r`, which is a RESOLUTION, and the tool
+    then has no input left: it prints usage and the campaign looks clean forever. With a
+    subcommand to anchor it, the positional wins."""
+    found = {"subcommand": "draw", "output_positional": False,
+             "flags": [{"flag": "-r", "takes_value": True, "optional": True, "kind": "value"}]}
+    assert invocation.propose_argv(found) == ["draw", invocation.INPUT_PLACEHOLDER]
+
+
+def test_a_flag_only_reader_still_gets_its_read_flag():
+    """The optional-read-flag branch exists for `tcpdump -r <pcap>` -- a reader whose only input
+    path is an optional flag and which has no subcommand to anchor a positional. Fixing the
+    dispatch case must not take that away."""
+    found = {"subcommand": None, "output_positional": False,
+             "flags": [{"flag": "-r", "takes_value": True, "optional": True, "kind": "path"}]}
+    assert invocation.propose_argv(found) == ["-r", invocation.INPUT_PLACEHOLDER]
