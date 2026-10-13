@@ -318,14 +318,34 @@ reverted (see above).
     the pipeline that needs it. Key such a gate on the CHANNEL, never on how the channel was
     chosen.
 
-    **STILL OPEN, one layer up: the PoC ladder cannot verify a prompt-protocol crash.** The PoC
-    row is L0 `verified: false` even though the crash is confirmed and reproducible, because
-    `poc/stage.py` replays by sweeping `[mode] + MODES` through `sandbox.run` -- bulk delivery
-    only. The recorded isolation tag is `bwrap+netns/prompted`, which is the signal a fix keys
-    on. Do NOT fix only the replay: the bundled reproducer SCRIPT also delivers in bulk, and
-    this input (two 112-byte lines) desyncs that way, so a replay-only patch would file a
-    "verified L1" whose bundle does not reproduce for the operator -- the exact failure this
-    stage already warns about for a mismatched signal.
+    **CLOSED 2026-10-13 (both layers plus a third nobody was looking for).** The PoC ladder
+    could not verify a prompt-protocol crash: `poc/stage.py` replayed by sweeping
+    `[mode] + MODES` through `sandbox.run`, bulk delivery only, so a confirmed reproducible
+    SIGSEGV was filed L0 `verified: false`. The fix keys on the recorded isolation tag
+    (`bwrap+netns/prompted`), replays with `run_input_prompted`, and -- because a prompted crash
+    has no exec-time carrier -- skips the bulk sweep entirely for `mode == "prompt"`, the same
+    shape the socket channel already used. `poc/bundle.py` ships a `replay_prompt.py` that paces
+    the same way, and `runner.sh` invokes it instead of redirecting the blob at stdin.
+
+    Measured end to end, which for a bundle means the ONLY test that counts -- unpack it in a
+    fresh directory and run its own `runner.sh`:
+
+    | | before | after |
+    |---|---|---|
+    | `poc.done` | `verified: false, level: L0` | **`verified: true, level: L1`** |
+    | `input_mode` / tried | `file`, swept all of `MODES` | `prompt`, `['stdin/prompted']` |
+    | unpacked `runner.sh` | ran clean (bulk feed desynced) | **`exit status: 139`, exit code 139** |
+
+    The third defect is the one to remember, because neither the suite nor a reading of the diff
+    could see it: `runner.sh` ended on `echo "exit status: $rc"`, so **every bundle this tool has
+    ever produced exited 0** whether the reproducer crashed or ran clean. The first end-to-end
+    run printed `exit status: 139` and `runner.sh exit=0`, and the check correctly called it
+    DID NOT REPRODUCE. The one machine-readable signal a bundle carries said "clean" for a
+    reproducer that had just segfaulted, and anything gating on it -- an operator's CI, a triage
+    script, our own harness -- read the wrong answer. It now ends `exit $rc`, with a `printf
+    "\n"` first because the target's last write has no newline and ran the verdict onto the end
+    of the program's own output (`...\xa6h\xe0 Uexit status: 139`). **A reproducer is tested by
+    executing it and reading its STATUS, never by reading what it prints.**
   * `no_gadgets` -- L0, and NOT a budget failure: `concolic` returns after **5 steps in 0.01 s**
     with nothing active or deadended, i.e. angr never explored the binary (it ships a bundled
     `ld-2.35.so`). The recorded L1 for this challenge came from its ASan SOURCE build

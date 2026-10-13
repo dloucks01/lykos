@@ -70,6 +70,11 @@ def _runner(mode: str, argv, signal_name: str, run_cmd=None, runtime: str = "nat
                 for a in argv))
         else:
             invoke = f'{exe}{" " + pre if pre else ""} "$(cat ./input.bin)"'
+    elif mode == "prompt":
+        # One field per prompt, paced by the shipped script. `< input.bin` is wrong here for the
+        # reason in `_PROMPT_REPLAY`: `read` takes whatever is available, so a bulk feed puts
+        # field two's bytes inside field one and the target rejects them at its first gate.
+        invoke = f'python3 ./replay_prompt.py {exe}' + (" " + pre if pre else "")
     elif mode == "socket":
         # A socket PoC cannot be a one-liner: the input only exists after the server is listening,
         # so the reproducer has to spawn the target, find its port and connect. Without this an
@@ -110,7 +115,16 @@ def _runner(mode: str, argv, signal_name: str, run_cmd=None, runtime: str = "nat
             f"{setup}"
             f"{invoke}\n"
             'rc=$?\n'
-            + hint + "\n").encode()
+            # A target's last write often has no trailing newline, which ran the verdict onto the
+            # end of the program's own output ("...\xa6h\xe0 Uexit status: 139").
+            'printf "\\n"\n'
+            + hint + "\n"
+            # Propagate the reproducer's status. Ending on `echo` made runner.sh exit 0 ALWAYS, so
+            # the one machine-readable thing a bundle has said "clean" for a reproducer that had
+            # just segfaulted: measured on `replaceme`, where the script printed "exit status: 139"
+            # and `sh ./runner.sh; echo $?` printed 0. Anything gating on the reproducer -- an
+            # operator's CI, a triage script, our own end-to-end check -- read the wrong answer.
+            'exit $rc\n').encode()
 
 
 def _primitive_txt(prim: dict) -> bytes:
@@ -163,6 +177,54 @@ _LEVEL_MEANING = {
           "memory read/write (not merely a crash); see PRIMITIVE.txt",
     "L3": "a working EXPLOIT -- control flow is hijacked to attacker-chosen code",
 }
+
+
+_PROMPT_REPLAY = br'''#!/usr/bin/env python3
+"""Replay a crash against a PROMPT-DRIVEN target: one field per prompt.
+
+The target reads each field with its own `read(0, buf, N)`. `read` returns whatever is
+AVAILABLE, so `./target.bin < input.bin` hands the whole file to field one and field two gets
+EOF -- the program then rejects the input at its first gate and the crash does not reproduce.
+input.bin holds one LINE per field; this writes them one at a time and waits for the target to
+consume each, which is how the campaign delivered it.
+
+    python3 replay_prompt.py ./target.bin [args...]
+"""
+import subprocess
+import sys
+import time
+
+exe = sys.argv[1] if len(sys.argv) > 1 else "./target.bin"
+args = sys.argv[2:]
+data = open("input.bin", "rb").read()
+lines = data.split(b"\n")
+if lines and lines[-1] == b"":
+    lines.pop()
+
+p = subprocess.Popen([exe] + args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                     stderr=subprocess.STDOUT)
+try:
+    for line in lines:
+        time.sleep(0.25)                 # let the target print its prompt and block on read()
+        try:
+            p.stdin.write(line + b"\n")
+            p.stdin.flush()
+        except (BrokenPipeError, OSError):
+            break                        # the target is gone: that is the result we wanted
+    try:
+        p.stdin.close()
+    except OSError:
+        pass
+    out, _ = p.communicate(timeout=30)
+except subprocess.TimeoutExpired:
+    p.kill()
+    out, _ = p.communicate()
+sys.stdout.write((out or b"").decode("latin-1", "replace"))
+rc = p.returncode if p.returncode is not None else 0
+# Exit the way a SHELL reports it, so runner.sh's "a crash shows as 128+signum" is true of this
+# reproducer too -- a script with its own exit convention would make that advice wrong.
+sys.exit(128 + (-rc) if rc < 0 else rc)
+'''
 
 
 _SOCKET_REPLAY = br'''#!/usr/bin/env python3
@@ -233,6 +295,12 @@ def build(target_bytes: bytes, input_bytes: bytes, meta: dict, stderr: bytes,
     if mode == "socket":                                 # the runner invokes this; ship it
         extra_files = dict(extra_files or {})
         extra_files.setdefault("replay_socket.py", _SOCKET_REPLAY)
+    if mode == "prompt":
+        # A prompt-protocol crash cannot be a `< input.bin` one-liner: delivered in bulk the
+        # whole file lands in field one and field two reaches EOF, so the reproducer the operator
+        # runs would NOT reproduce -- a verified PoC whose bundle proves nothing.
+        extra_files = dict(extra_files or {})
+        extra_files.setdefault("replay_prompt.py", _PROMPT_REPLAY)
     script = extra_files and "exploit.py" in extra_files
     prim_line = ""
     if primitive:
@@ -248,7 +316,11 @@ def build(target_bytes: bytes, input_bytes: bytes, meta: dict, stderr: bytes,
                   "delivers the exploit live (the payload is base-specific so it cannot be "
                   "a static file)"]
     else:
-        files += ["input.bin   - the crafted input that triggers it"]
+        files += ["input.bin   - the crafted input that triggers it"
+                  + (" (one LINE per prompted field)" if mode == "prompt" else "")]
+    if mode == "prompt":
+        files += ["replay_prompt.py - delivers input.bin one field per prompt, which is how the "
+                  "crash was found: fed in bulk, field one swallows the whole file"]
     files += ["runner.sh   - runs the reproducer for you",
               "meta.json   - machine-readable details (target hash, arch, offset, tool)",
               "PRIMITIVE.txt / stderr.txt - the primitive description and captured diagnostics"]

@@ -73,6 +73,10 @@ def build_poc_stage(ctx) -> dict:
             return rest, b"", {var: input_bytes.decode("latin-1")}
         if m == "socket":
             return list(argv), b"", None                 # delivered over a socket, not at exec
+        if m == "prompt":
+            # Delivered one FIELD PER PROMPT, not at exec: the bytes are the same, the pacing is
+            # what makes them land in the right field.
+            return list(argv), input_bytes, None
         wf = ctx.scratch() / "input.bin"
         wf.write_bytes(input_bytes)
         return place(argv, str(wf)), b"", None
@@ -91,6 +95,20 @@ def build_poc_stage(ctx) -> dict:
     # path, so replaying faithfully is the one thing that cannot work.
     prefixes = [list(argv)] + ([[]] if argv else [])
     tried, res = [], None
+    # A crash found by PROMPTED delivery cannot be replayed in bulk, and sweeping the bulk
+    # channels for it produces exactly the wrong answer: the input does not reproduce, so a
+    # genuinely confirmed crash is filed as an unverified L0. `read` returns whatever is
+    # available, so the whole blob lands in field one and field two reaches EOF -- measured on
+    # the HTB target `replaceme`, whose SIGSEGV the campaign confirms and whose PoC stayed L0.
+    # The run that found it recorded how (`bwrap+netns/prompted`), so this is reading the
+    # record rather than guessing.
+    if "prompted" in (_dyn_isolation(ctx.conn, target, input_sha) or ""):
+        from ..fuzz.runner import run_input_prompted
+        _, pres = run_input_prompted(exe, input_bytes, timeout=timeout)
+        tried.append("stdin/prompted")
+        if pres.crashed:
+            res, mode = pres, "prompt"
+            mode_why = f"{mode_why}; replayed one field per prompt, as the campaign delivered it"
     if mode == "socket":
         # A socket crash has NO exec-time carrier: the input only exists once the server is up and
         # listening, so none of the exec-time channels can deliver it and sweeping them is pointless.
@@ -104,7 +122,8 @@ def build_poc_stage(ctx) -> dict:
         tried = [f"socket/{proto}"]
         mode_why = (f"{mode_why}; replayed over a {proto.upper()} socket"
                     + (f" on port {port}" if port else ""))
-    for pre in (prefixes if mode != "socket" else []):
+    for pre in (prefixes if (mode not in ("socket", "prompt")
+                            and not (res is not None and res.crashed)) else []):
         argv = pre
         for m in [mode] + [x for x in MODES if x != mode]:
             run_argv, stdin, run_env = _delivery(m)
