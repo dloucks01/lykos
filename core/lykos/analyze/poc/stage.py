@@ -18,6 +18,21 @@ TOOL_VERSION = "poc-1"
 
 
 
+class _SanitizerReplay:
+    """A verdict for a fault the SANITIZER reported rather than the kernel.
+
+    `signal_name` carries the sanitizer class, not a signal name, because that is what happened:
+    writing "SIGSEGV" for a `heap-buffer-overflow` ASan caught and reported cleanly would be a
+    plausible-looking lie in the one field a reader trusts. Downstream only reads these fields.
+    """
+
+    def __init__(self, cls: dict, isolation, stderr):
+        self.crashed = True
+        self.signal_name = str(cls.get("class") or "sanitizer-error")
+        self.isolation = isolation
+        self.stderr = stderr or b""
+
+
 class _SocketReplay:
     """sandbox.RunResult-shaped verdict for a socket replay (only these fields are read downstream)."""
 
@@ -33,6 +48,17 @@ def _dyn_isolation(conn, target, input_sha):
         if r.input_sha == input_sha and r.isolation:
             return r.isolation
     return None
+
+
+def _harness_sha(ctx, target, prefix: str):
+    """The stored libFuzzer harness whose sha starts with `prefix` (or any, for this target)."""
+    from ...db.dao import ArtifactDAO
+    arts = [a for a in ArtifactDAO(ctx.conn).list_by_case(target.case_id)
+            if a.kind == "libfuzzer-harness"]
+    for a in arts:
+        if prefix and a.sha256.startswith(prefix):
+            return a.sha256
+    return arts[-1].sha256 if arts and not prefix else None
 
 
 def build_poc_stage(ctx) -> dict:
@@ -51,6 +77,25 @@ def build_poc_stage(ctx) -> dict:
     exe = ctx.scratch() / "target.bin"
     ctx.content.stage_target(target, exe.parent, exe.name)
     os.chmod(exe, 0o755)
+
+    # A libFuzzer crash is a crash of the HARNESS, which is a different binary from the one that
+    # was ingested. Replaying the input against the ingested binary is not a weaker test, it is
+    # the wrong one: a heap overflow reached through `TIFFReadRGBAImage` does not reproduce under
+    # a tool that never calls it, so a genuine memory-corruption finding would be filed as an
+    # unverified L0 -- the same mistake prompted delivery made, in a new place. The run that found
+    # it recorded the harness in its isolation tag, so this reads the record.
+    _iso = _dyn_isolation(ctx.conn, target, input_sha) or ""
+    if _iso.startswith("libfuzzer"):
+        h_sha = _iso.split("/", 1)[1] if "/" in _iso else ""
+        h_full = _harness_sha(ctx, target, h_sha)
+        if h_full:
+            exe = ctx.scratch() / "harness.bin"
+            exe.write_bytes(ctx.content.get_bytes(h_full))
+            os.chmod(exe, 0o755)
+            target_bytes = exe.read_bytes()              # the bundle must ship the HARNESS
+            mode, argv = "file", ["@@"]
+            mode_why = ("replayed against the libFuzzer harness the crash was found in "
+                        "(the ingested binary need not call the vulnerable path)")
 
     def _delivery(m):
         """(argv, stdin, env_overrides) for one delivery channel."""
@@ -141,6 +186,22 @@ def build_poc_stage(ctx) -> dict:
                 mode_why = f"{mode_why}; reproduces without {' '.join(prefixes[0])}"
             break
     run_argv, stdin, _env = _delivery(mode)
+
+    # A SANITIZER-DETECTED fault is not a signal. ASan/UBSan report the defect and the process
+    # exits with a CODE (libFuzzer's harness exits 77), so `crashed` -- which asks "was it killed
+    # by a signal" -- is False for a genuine heap-buffer-overflow. Measured on libtiff 4.0.3: the
+    # replay printed `ERROR: AddressSanitizer: heap-buffer-overflow` and the PoC was filed as an
+    # unverified L0 because nothing read it. This is the same shape the bundle README already
+    # states for a JVM fault ("an uncaught exception and exit 1, not a signal"), applied to the
+    # verification itself. `parse_asan_report` is used rather than a substring test because it
+    # already separates a real report from a sanitizer SETUP failure, which is not a finding.
+    if res is not None and not res.crashed and (res.stderr or b""):
+        from ..debug.rootcause import parse_asan_report
+        _san = parse_asan_report((res.stderr or b"").decode("utf-8", "replace"))
+        if _san:
+            res = _SanitizerReplay(_san, res.isolation, res.stderr)
+            mode_why = (f"{mode_why}; the fault is a {_san.get('sanitizer', 'sanitizer')} report"
+                        f" ({_san.get('class')}), not a signal")
     verified = res.crashed
     level = "L1" if verified else "L0"
 
