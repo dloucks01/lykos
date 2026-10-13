@@ -52,7 +52,6 @@ def multi_debug_stage(ctx) -> dict:
     input_sha = p.get("input_sha")
     if not input_sha and not p.get("input"):
         raise ValueError("multi_debug requires params.input_sha or params.input")
-    mode = how_to_feed(ctx.conn, target, p.get("input_sha"), p, content=ctx.content)[0]
     base_argv = list(p.get("argv") or [])
     timeout = float(p.get("timeout", 12))
 
@@ -73,6 +72,12 @@ def multi_debug_stage(ctx) -> dict:
                  "note": "follow-fork multi-process debugging requires gdb (not installed)"})
         ctx.progress(pct=100, msg="gdb not installed; multi-process debug unavailable")
         return {}
+
+    # AFTER the guards above, not before: discovery reads the content store and the
+    # target's import table, which is wasted work on a target this stage is about to
+    # refuse outright -- and it made the stage touch `ctx.content` before it had decided
+    # anything, so a managed target could not even be declined without one.
+    mode = how_to_feed(ctx.conn, target, p.get("input_sha"), p, content=ctx.content)[0]
 
     import base64
     input_bytes = ctx.content.get_bytes(input_sha) if input_sha \

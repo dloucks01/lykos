@@ -131,7 +131,6 @@ def primitive_stage(ctx) -> dict:
     if not input_sha:
         raise ValueError("poc_primitive requires params.input_sha (a crashing input)")
     timeout = float(p.get("timeout", 8))
-    mode, base_argv, mode_why = how_to_feed(ctx.conn, target, input_sha, p, content=ctx.content)
 
     # A substrate that owns the instruction pointer cannot be asked for L2, and the reason
     # matters: `target.arch` holds the RUNTIME's name for a managed target ("cil", "jvm",
@@ -153,6 +152,13 @@ def primitive_stage(ctx) -> dict:
                          f"(host {host})"})
         ctx.progress(pct=100, msg="L2 not supported for this cross-arch target")
         return {}
+
+    # AFTER the guards above, not before: discovery reads the content store and the
+    # target's import table, which is wasted work on a target this stage is about to
+    # refuse outright -- and it made the stage touch `ctx.content` before it had decided
+    # anything, so a managed target could not even be declined without one.
+    mode, base_argv, mode_why = how_to_feed(ctx.conn, target, input_sha, p,
+                                            content=ctx.content)
 
     orig = ctx.content.get_bytes(input_sha)
     target_bytes = ctx.content.path(target.sha256).read_bytes()
