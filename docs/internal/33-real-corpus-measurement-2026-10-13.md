@@ -145,7 +145,50 @@ And one limit of the new seeds themselves: a minimal TIFF sets `Compression=1` (
 codec path is exercised — while most of libtiff 4.0.3's CVEs live in OJPEG/LZW/PixarLog/NeXT/
 thunder. The models should emit one seed per codec, which is cheap now that the model exists.
 
-## 5. Where the capability actually stands
+## 5. FIXED — the channel ranking had no evidence unless `disassemble` had run
+
+The HTB half of the corpus found a second chain of the same shape, and this one had regressed a
+capability an earlier session had demonstrated. `quack_quack` -- whose verified L1 (SIGABRT,
+CWE-787) is on record -- came back **L0 at 240 s and again at 600 s with 90,872 executions**.
+
+It is a two-link chain, and neither link is the fuzzer:
+
+1. **`modes_for` read only call edges.** Those come from `disassemble`, which returned in 0.6 s
+   under the per-target budget, so the edge set was empty, *no channel had any evidence*, and
+   the no-evidence fallback was taken -- `arg`, which is correct for a binary that genuinely
+   reads nothing and wrong here. The concolic stage therefore solved against **argv** for a
+   program whose input is `read(0, ...)`. Triage had parsed that import table at ingest.
+   Fixed: a native target's recorded symbol names are unioned into the same C vocabulary the
+   call edges use, so `read` is evidence whether it arrives as an edge or an import. Scoped to
+   native targets by file type -- Python's `open`/`read` are a file object's METHODS, and
+   feeding them to the C vocabulary turned a Python file reader into an interactive stdin
+   target. Two false starts worth remembering: making `arg` non-leading broke the designed and
+   tested "imports no input function at all" case, and gating on "the managed vocabulary found
+   nothing" suppressed the C reading for quack_quack itself, which imports `open` for its own
+   `flag.txt`.
+
+2. **`concolic` sizes its symbolic input from the frames `disassemble` recovered.** Run as
+   `disassemble` then `concolic` with the channel fix in place, it reaches the defect in 19.8 s
+   and files `confirmed: 2` with `signal=SIGABRT mode=stdin` -- the known L1 crash, reproduced.
+   Without the frames it deadends in 2.07 s of a 180 s slice and reports nothing about why, so
+   the stage degrades silently to a no-op. It should say "symbolic input sized blindly, no
+   frames recovered" instead.
+
+The channel fix is confirmed at the stage level: across the three attempts the chosen mode went
+`arg` -> `file` -> `stdin`, and on `stdin` the SIGABRT returns.
+
+**But the full autopilot is still L0 on this target, and the reason is NOT yet identified.**
+91,896 executions at 600 s, `concolic` 19.2 s -- within a second of the 19.76 s the isolated run
+needed -- and no crash. So "disassemble was starved" is NOT a sufficient explanation: that stage
+costs well under a second on this 20 KB binary in the isolated run too. The most likely remaining
+link, unverified, is `how_to_feed`'s first branch: it returns the mode recorded by whichever
+`DynResult` matches `input_sha`, and the blind campaign runs before `concolic` and records plenty
+of them -- which would override the ranking this round just fixed. **Whoever picks this up: run
+the autopilot with the fuzz stages disabled and see whether concolic reaches SIGABRT; that
+isolates it in one run.** Do not assume the channel fix is sufficient end to end, because it
+measurably is not.
+
+## 6. Where the capability actually stands
 
 * **Identify, black-box, real software:** yes — N-day fingerprinting (108 CVEs on libtiff
   4.0.3, 54 on expat 2.1.0), static sink/API/frame detectors, symbolic `tainted_deref`/
@@ -153,9 +196,14 @@ thunder. The models should emit one seed per codec, which is cheap now that the 
 * **Demonstrate (crash/PoC) on real library software:** not yet, on this corpus. Every
   obstacle found so far was mechanical — detection, string truncation, invocation, loadability,
   budget — rather than a limit of the fuzzer, and four of six are now closed.
-* **Weaponize:** unchanged by this round; the HTB ceiling (L1 on canaried stack overflow, L2
-  demonstrated libc leak on `deathnote`, L3 on the no-PIE / leak-bearing-PIE / win()-bearing
-  classes) is documented in doc 32 §7 and the memory notes.
+* **Weaponize:** the recorded ceiling (L1 on a canaried stack overflow, L2 demonstrated libc
+  leak on `deathnote`, L3 on the no-PIE / leak-bearing-PIE / win()-bearing classes, doc 32 §7)
+  did NOT reproduce through the autopilot this round: five HTB targets at 240 s and
+  `quack_quack` twice at 600 s all returned **L0**, while the same crash is reachable in 19.8 s
+  from the concolic stage driven directly. `tictactoe` managed **zero executions** in 240 s --
+  `mem_oracle` 76.9 s and `disassemble` 46.9 s ate the clock, `coverage_fuzz` aborted
+  ("Fork server handshake failed"), and every search stage was then skipped for want of budget.
+  The exploitation machinery is intact; what is broken is what the autopilot hands it.
 
 ## Process note
 

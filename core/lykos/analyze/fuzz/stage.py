@@ -188,6 +188,16 @@ def _reads_a_number(ctx, target) -> bool:
 _MAX_FORMATS = 3
 
 
+def _triage_symbols_for(ctx, target) -> list:
+    """The names triage recorded (imports + exports) -- the channel-ranking evidence that does
+    not need `disassemble` to have run. Best-effort: fewer signals, never a failure."""
+    try:
+        from ..ingest import triage_symbols
+        return triage_symbols(ctx.conn, ctx.content, target)
+    except Exception:
+        return []
+
+
 def _imports_for(ctx, target) -> list:
     """The target's imported function names -- the evidence string mining cannot reach.
 
@@ -1245,16 +1255,17 @@ def fuzz_stage(ctx) -> dict:
     # about what the program READS: ncompress genuinely parses files, and its overflow is in
     # the filename it was handed on the command line. A campaign aimed at the wrong channel
     # does no work and reports a clean zero.
-    # On a managed target the call-edge inventory is empty (no machine code), so pass the
-    # names triage recovered from its metadata as well -- otherwise this ranks `arg` first for
-    # every jar, .pyc and .NET assembly and spends the budget on a channel it never reads.
-    _syms = ()
-    if substrate.is_managed(target.file_type):
-        from ..ingest import triage_symbols
-        _syms = triage_symbols(ctx.conn, ctx.content, target)
+    # The call-edge inventory is empty on a managed target (no machine code) AND often empty on
+    # a native one, because leading with execution means fuzzing runs before `disassemble`. In
+    # both cases the names triage recorded at ingest -- a jar's constant pool, a .NET metadata
+    # heap, an ELF's IMPORT TABLE -- answer the same question, so they are passed always rather
+    # than only for the managed case. Without them this ranked `arg` first for every target
+    # whose edges were missing, and a campaign aimed at a channel the program never reads does
+    # no work and reports a clean zero.
     channels = ([p["input_mode"]] if p.get("input_mode")
                 else modes_for(CallEdgeDAO(ctx.conn).list_by_target(target.id),
-                               symbols=_syms, file_type=target.file_type))
+                               symbols=_triage_symbols_for(ctx, target),
+                               file_type=target.file_type))
     max_execs = int(p.get("max_execs", 3000))
     max_seconds = float(p.get("max_seconds", 30))
     exec_timeout = float(p.get("exec_timeout", 2))

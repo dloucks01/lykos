@@ -105,7 +105,7 @@ def taint_stage(ctx) -> dict:
     os.chmod(exe, 0o755)
 
     marker = _marker()
-    mode = how_to_feed(ctx.conn, target, p.get("input_sha"), p)[0]
+    mode = how_to_feed(ctx.conn, target, p.get("input_sha"), p, content=ctx.content)[0]
     argv = list(p.get("argv") or [])
     timeout = float(p.get("timeout", 20))
     stdin = marker.encode() if mode == "stdin" else b""

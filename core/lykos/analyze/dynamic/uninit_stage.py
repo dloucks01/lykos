@@ -128,7 +128,7 @@ def mem_oracle_stage(ctx) -> dict:
                 data = ctx.content.get_bytes(sha)
             except Exception:                            # noqa: BLE001
                 continue
-        mode, argv, _why = how_to_feed(ctx.conn, target, sha, p)
+        mode, argv, _why = how_to_feed(ctx.conn, target, sha, p, content=ctx.content)
         tried.append({"input_sha": sha, "mode": mode})
         ctx.progress(msg=f"memcheck under {mode} ({len(tried)}/{_MAX_RUNS})")
         verdict = memoracle.valgrind_triage(exe, data, mode=mode, base_argv=argv,

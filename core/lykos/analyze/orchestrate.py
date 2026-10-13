@@ -529,10 +529,18 @@ def _ranked_channels(store, target_id):
         # nothing to go on: `arg` came first for every jar, .pyc and .NET assembly. Triage
         # already recorded the names from its constant pool / metadata, which say which stream
         # the program reads -- so hand those over too.
+        # Not only for a managed target. A native ELF's IMPORT TABLE names what it reads
+        # (`read`, `fgets`, `fopen`) and triage recorded it at ingest, while `disassemble` may
+        # not have run yet or may have returned nothing useful -- measured on quack_quack,
+        # where an empty edge set left every channel without evidence and the concolic stage
+        # ran against `arg` on a program whose input is `read(0, ...)`.
         syms = ()
         tgt = TargetDAO(store.conn).get(target_id)
-        if tgt is not None and substrate.is_managed(tgt.file_type):
-            syms = triage_symbols(store.conn, store.content, tgt)
+        if tgt is not None:
+            try:
+                syms = triage_symbols(store.conn, store.content, tgt)
+            except Exception:                            # best-effort: fewer signals, not none
+                syms = ()
         chans = modes_for(CallEdgeDAO(store.conn).list_by_target(target_id), symbols=syms,
                           file_type=getattr(tgt, "file_type", None))
         return chans or ["stdin", "arg", "file"]

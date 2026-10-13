@@ -201,7 +201,7 @@ def concolic_stage(ctx) -> dict:
     if target is None:
         raise ValueError("concolic requires a target_id")
     p = ctx.params or {}
-    mode = how_to_feed(ctx.conn, target, p.get("input_sha"), p)[0]
+    mode = how_to_feed(ctx.conn, target, p.get("input_sha"), p, content=ctx.content)[0]
     base_argv = list(p.get("argv") or [])
     exec_timeout = float(p.get("exec_timeout", 2))
 

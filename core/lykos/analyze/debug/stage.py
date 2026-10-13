@@ -261,7 +261,7 @@ def root_cause_stage(ctx) -> dict:
     if not input_sha:
         raise ValueError("root_cause requires params.input_sha (a crashing input)")
     timeout = float(p.get("timeout", 10))
-    mode, base_argv, mode_why = how_to_feed(ctx.conn, target, input_sha, p)
+    mode, base_argv, mode_why = how_to_feed(ctx.conn, target, input_sha, p, content=ctx.content)
 
     managed = _managed_kind(target.file_type)
     if managed:

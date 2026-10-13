@@ -52,7 +52,7 @@ def multi_debug_stage(ctx) -> dict:
     input_sha = p.get("input_sha")
     if not input_sha and not p.get("input"):
         raise ValueError("multi_debug requires params.input_sha or params.input")
-    mode = how_to_feed(ctx.conn, target, p.get("input_sha"), p)[0]
+    mode = how_to_feed(ctx.conn, target, p.get("input_sha"), p, content=ctx.content)[0]
     base_argv = list(p.get("argv") or [])
     timeout = float(p.get("timeout", 12))
 

@@ -102,3 +102,27 @@ def test_a_native_target_is_completely_unaffected():
 
 def test_an_explicit_mode_still_overrides_everything():
     assert modes_for([], given="file", symbols=_DOTNET_CONSOLE) == ["file"]
+
+
+def test_a_native_targets_import_table_ranks_its_channels_without_disassembly():
+    """Reading only call edges made the ranking depend on `disassemble` having produced them.
+
+    Measured on the HTB target quack_quack, whose `disassemble` returned in 0.6 s under the
+    per-target budget: the edge set was empty, so no channel had any evidence, the no-evidence
+    fallback (`arg`) was taken -- correct for a binary that genuinely reads nothing, wrong here
+    -- and the concolic stage solved against argv for a program whose input is `read(0, ...)`.
+    90,872 executions and a 300 s solver slice could not reach a defect that is one stdin write
+    away. Triage parsed that import table at ingest, long before any disassembly.
+    """
+    assert modes_for([], symbols=["read", "printf", "alarm"], file_type="elf")[0] == "stdin"
+    assert modes_for([], symbols=["fopen", "fread", "malloc"], file_type="elf")[0] == "file"
+    # a binary that imports no input function at all still falls through to argv
+    assert modes_for([], symbols=["printf", "malloc"], file_type="elf")[0] == "arg"
+
+
+def test_a_managed_inventory_is_not_read_with_the_C_vocabulary():
+    """The same spellings mean different things on a runtime: Python's `open`/`read` are a file
+    object's methods, not `open(2)` and `read(2)` on fd 0. Unioning them into the native
+    vocabulary turned a Python file reader into an interactive stdin target."""
+    assert modes_for([], symbols=["open", "read", "close"])[0] == "file"
+    assert modes_for([], symbols=["FileInputStream", "read"])[0] == "file"

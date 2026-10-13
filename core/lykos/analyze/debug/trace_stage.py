@@ -63,7 +63,7 @@ def _win_behavior_trace(ctx, target, p) -> dict:
     exe = ctx.scratch() / "target.bin"
     ctx.content.stage_target(target, exe.parent, exe.name)
     os.chmod(exe, 0o755)
-    mode = how_to_feed(ctx.conn, target, p.get("input_sha"), p)[0]
+    mode = how_to_feed(ctx.conn, target, p.get("input_sha"), p, content=ctx.content)[0]
     argv = list(p.get("argv") or [])
     timeout = float(p.get("timeout", 45))
     data = ctx.content.get_bytes(p["input_sha"]) if p.get("input_sha") else b""
@@ -233,7 +233,7 @@ def behavior_trace_stage(ctx) -> dict:
     exe = ctx.scratch() / "target.bin"
     ctx.content.stage_target(target, exe.parent, exe.name)
     os.chmod(exe, 0o755)
-    mode = how_to_feed(ctx.conn, target, p.get("input_sha"), p)[0]
+    mode = how_to_feed(ctx.conn, target, p.get("input_sha"), p, content=ctx.content)[0]
     argv = list(p.get("argv") or [])
     timeout = float(p.get("timeout", 25))
     data = ctx.content.get_bytes(p["input_sha"]) if p.get("input_sha") else b"A" * 64

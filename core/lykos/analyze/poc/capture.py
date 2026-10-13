@@ -230,6 +230,32 @@ def modes_for(call_edges, given=None, symbols=(), file_type=None):
     # target has -- it owns no machine code, so `call_edges` is empty for it. Unioned, never
     # substituted: a native target with both sources keeps every native signal it had.
     m_stdin, m_file, m_interactive = _managed_channels(symbols)
+    # A NATIVE target's recorded symbol names are the same vocabulary as its call edges -- an
+    # import of `read` says exactly what a call edge to `read` says -- and they cost nothing,
+    # because triage parsed the import table long before any disassembly. Reading only the
+    # edges made this ranking depend on `disassemble` having produced them: measured on
+    # quack_quack, whose `disassemble` returned in 0.6 s under the budget, the edge set was
+    # empty, so NO channel had evidence, the no-evidence fallback (`arg`, correct for a binary
+    # that genuinely reads nothing) was taken, and the concolic stage solved against argv for a
+    # program whose input is `read(0, ...)`. 90,872 executions and a 300 s solver slice could
+    # not reach a defect that is one stdin write away.
+    #
+    # Applied only when the MANAGED vocabulary recognised nothing in the set, because the same
+    # spellings mean different things on a runtime: Python's `open`/`read` are a file object's
+    # methods, not `open(2)` and `read(2)` on fd 0, and feeding those to the C vocabulary turned
+    # a Python file reader into an interactive stdin target. The file type cannot make this
+    # call on its own -- callers that know only the names pass no `file_type` at all.
+    # A KNOWN native file type decides this outright; the marker heuristic is only for callers
+    # that pass names and no type at all (the managed tests do). Getting this backwards
+    # suppressed the C vocabulary for quack_quack -- a native ELF that imports `open` for its
+    # own flag.txt, which the managed vocabulary also recognises -- so the managed reading won
+    # and the channel came out `file` for a program whose input is `read(0, ...)`.
+    _native = file_type is not None and not substrate.is_managed(file_type)
+    if _native or not (m_stdin or m_file):
+        names |= {normalize(n) for n in (symbols or ()) if isinstance(n, str) and n}
+        has_file = has_file or bool(names & _FILE_FUNCS)
+        has_stdin = has_stdin or bool(names & _STDIN_FUNCS)
+        interactive = interactive or bool(names & _STDIN_INTERACTIVE)
     has_file = has_file or m_file
     has_stdin = has_stdin or m_stdin
     interactive = interactive or m_interactive
@@ -240,6 +266,11 @@ def modes_for(call_edges, given=None, symbols=(), file_type=None):
         ordered.append("file")
     elif has_stdin:
         ordered.append("stdin")
+    # `arg` ranks straight after whatever the evidence chose -- and FIRST when there was none,
+    # which is deliberate and tested: a binary that imports no input function at all reads
+    # neither a file nor stdin, so argv is what is left. That is only sound while the evidence
+    # is actually consulted, which is why the symbol names above matter: without them a target
+    # whose edges were merely MISSING looked identical to one that reads nothing.
     ordered.append("arg")
     for m in MODES:                          # ensure every channel is attempted
         if m not in ordered:
@@ -251,7 +282,7 @@ def modes_for(call_edges, given=None, symbols=(), file_type=None):
     return kept or ordered
 
 
-def how_to_feed(conn, target, input_sha, params):
+def how_to_feed(conn, target, input_sha, params, *, content=None):
     """(mode, argv, why) -- how this input reached the program when it crashed.
 
     Both the root-cause and the L2 stages used to default to stdin, so a file parser or an
@@ -276,7 +307,18 @@ def how_to_feed(conn, target, input_sha, params):
     # stdin. A file parser given its input on stdin looks exactly like a program with no bug.
     from ...db.dao import CallEdgeDAO
     try:
-        ranked = modes_for(CallEdgeDAO(conn).list_by_target(target.id),
+        # The import table says what the program reads even when `disassemble` has written no
+        # call edges -- which is the common case, because leading with execution means the
+        # dynamic stages run first. Without it the ranking had no evidence at all and the
+        # fallback's first element decided the channel.
+        syms = ()
+        if content is not None:
+            try:
+                from ..ingest import triage_symbols
+                syms = triage_symbols(conn, content, target)
+            except Exception:                            # best-effort: fewer signals, not none
+                syms = ()
+        ranked = modes_for(CallEdgeDAO(conn).list_by_target(target.id), symbols=syms,
                            file_type=getattr(target, "file_type", None))
     except Exception:
         ranked = list(MODES)

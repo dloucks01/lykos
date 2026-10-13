@@ -44,7 +44,7 @@ def build_poc_stage(ctx) -> dict:
     if not input_sha:
         raise ValueError("build_poc requires params.input_sha (a crashing input)")
     timeout = float(p.get("timeout", 10))
-    mode, argv, mode_why = how_to_feed(ctx.conn, target, input_sha, p)
+    mode, argv, mode_why = how_to_feed(ctx.conn, target, input_sha, p, content=ctx.content)
 
     input_bytes = ctx.content.get_bytes(input_sha)
     target_bytes = ctx.content.path(target.sha256).read_bytes()

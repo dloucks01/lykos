@@ -81,7 +81,7 @@ def extract_stage(ctx) -> dict:
         ctx.progress(pct=100, msg="no comparison sinks to probe")
         return {}
 
-    mode = how_to_feed(ctx.conn, target, p.get("input_sha"), p)[0]
+    mode = how_to_feed(ctx.conn, target, p.get("input_sha"), p, content=ctx.content)[0]
     argv = list(p.get("argv") or [])
     timeout = float(p.get("timeout", 20))
     data = ctx.content.get_bytes(p["input_sha"]) if p.get("input_sha") else _PROBE
