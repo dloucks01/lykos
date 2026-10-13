@@ -85,3 +85,42 @@ def test_no_demonstrated_finding_means_no_link():
         cve = next(f for f in fd.list_by_target(t.id) if f.detector == "cve_fingerprint")
         assert "corroboration" not in {e.get("channel") for e in cve.evidence}
         store.close()
+
+
+def test_a_bare_version_match_is_a_candidate_not_a_corroboration(store, case, tmp_path):
+    """A version match is a statement about the BUILD, not about this run.
+
+    Measured on libtiff 4.0.3: 108 CVEs matched by banner and not one was reached. Filed at
+    `corroborated` -- the top non-demonstrated tier -- that reads as evidence about this binary,
+    and it made the tier meaningless, because a bare match and a match backed by a demonstrated
+    finding of the same class were indistinguishable. `candidate` is the tier for "this may be
+    here"; `cve_corroborate` raises it when something of that class is actually demonstrated.
+    """
+    from lykos.analyze import register
+    from lykos.analyze.fingerprint.stage import enqueue_cve_scan
+    from lykos.analyze.ingest import ingest
+    from lykos.db.dao import FindingDAO
+    from lykos.jobs import JobConfig, JobQueue, WorkerPool
+    register()
+    f = tmp_path / "fw.bin"
+    f.write_bytes(b"header OpenSSL 1.0.1f build\x00 padding" * 8)
+    target = ingest(store, case.id, f)
+    q = JobQueue(store.conn)
+    pool = WorkerPool(store.db_path, store.content, JobConfig(workers=1, poll_interval=0.02))
+    pool.start()
+    try:
+        run = enqueue_cve_scan(q, target)
+        assert pool.wait_idle(60) and q.runs.get(run.id).status == "done"
+    finally:
+        pool.stop(grace=3.0)
+    cves = [x for x in FindingDAO(store.conn).list_by_target(target.id)
+            if x.detector == "cve_fingerprint"]
+    assert cves, "the banner should still match a known-vulnerable OpenSSL"
+    assert all(c.state == "candidate" for c in cves), \
+        f"states: {sorted({c.state for c in cves})}"
+    # and it must SAY so, not merely be filed quietly at a lower tier
+    reach = [e for c in cves for e in (c.evidence or [])
+             if e.get("channel") == "reachability"]
+    assert reach, "a version match must SAY it is one, not merely sit at a lower tier"
+    detail = reach[0]["detail"].lower()
+    assert "version match only" in detail and "reached the defect" in detail, reach[:1]

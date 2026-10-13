@@ -35,7 +35,16 @@ def cve_stage(ctx) -> dict:
         evidence = [
             {"channel": "fingerprint",
              "detail": f"detected {m['library']} {m['version']} via banner \"{m['evidence']}\""},
-            {"channel": "cve", "detail": f"{m['cve']}{cvss}: {m['summary']}"}]
+            {"channel": "cve", "detail": f"{m['cve']}{cvss}: {m['summary']}"},
+            # Say what this IS. A version match is a statement about the build, not about this
+            # run: measured on libtiff 4.0.3, 108 CVEs matched and none was reached. Filed as a
+            # `candidate` because that is the tier for "this may be here" -- `cve_corroborate`
+            # raises it when a demonstrated finding of the same class turns up, and `cve_poc`
+            # raises it further when a trigger actually reproduces. Filing a bare match at
+            # `corroborated` made the top non-demonstrated tier mean nothing.
+            {"channel": "reachability",
+             "detail": "version match only: this build contains the affected version. Nothing in "
+                       "this run reached the defect, so this is exposure, not a demonstration."}]
         evidence += scan.exploit_evidence(m["cwe"])
         fd.upsert(target.id, target.case_id, {
             "cwe": m["cwe"], "severity": m["severity"], "detector": "cve_fingerprint",
@@ -43,7 +52,7 @@ def cve_stage(ctx) -> dict:
             "evidence": evidence,
             "function_addr": None, "site_addr": None,
             "dedup_key": f"{m['cve']}:{m['library']}:{m['version']}",
-            "state": "corroborated", "confidence": 0.85})
+            "state": "candidate", "confidence": 0.8})
 
     ctx.emit("cve.done", payload={
         "components": [{"library": d["library"], "version": d["version"]} for d in detected],

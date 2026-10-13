@@ -54,9 +54,15 @@ def corroborate_stage(ctx) -> dict:
             continue
         links += 1
         d = matching[0]
-        # annotate the CVE finding: corroborated, but not proven to BE this crash.
+        # annotate the CVE finding: corroborated, but not proven to BE this crash. The STATE is
+        # raised only from `candidate`, which is where a bare version match starts -- that is what
+        # "corroborated" is for, and it is the only thing separating "this build is old enough to
+        # contain the bug" from "and something of that class was demonstrated here". It is never
+        # raised past `corroborated`: proving it IS this CVE takes a reproducing trigger, which is
+        # `cve_poc`'s job.
+        _state = "corroborated" if cve.state == "candidate" else cve.state
         fd.upsert(target.id, target.case_id, {
-            "cwe": cve.cwe, "title": cve.title, "severity": cve.severity, "state": cve.state,
+            "cwe": cve.cwe, "title": cve.title, "severity": cve.severity, "state": _state,
             "detector": cve.detector, "dedup_key": cve.dedup_key,
             "confidence": min(0.92, (cve.confidence or 0.85) + 0.05),
             "evidence": [{"channel": "corroboration", "detail":
