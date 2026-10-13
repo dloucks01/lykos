@@ -50,14 +50,18 @@ def test_no_single_stage_takes_its_whole_phase():
     b = B.CaseBudget(900)
     assert b.slice("build_exploit") == pytest.approx(135.0)   # half of the recover allowance
     b.phase("search")
-    assert b.slice("fuzz") == pytest.approx(337.5)            # half of the search allowance
+    # a SAMPLER gets half of what the phase has left for samplers -- the allowance less the
+    # share the solver is owed (900 * 0.20): (675 - 180) / 2
+    assert b.slice("fuzz") == pytest.approx(247.5)
+    # a stage that SOLVES rather than samples gets half of the full allowance: 675 / 2
+    assert b.slice("concolic") == pytest.approx(337.5)
 
 
 def test_a_caller_may_ask_for_less_but_never_for_more():
     b = B.CaseBudget(900)
     b.phase("search")
     assert b.slice("env_fuzz", want=45.0) == pytest.approx(45.0)
-    assert b.slice("fuzz", want=10_000.0) == pytest.approx(337.5)
+    assert b.slice("fuzz", want=10_000.0) == pytest.approx(247.5)
 
 
 def test_a_slice_too_small_to_measure_anything_is_refused_outright():
@@ -309,3 +313,55 @@ def test_the_crashless_weaponizer_is_bounded_where_it_sits():
     body = _SRC[_SRC.index("def run_case_autopilot("):]
     m = re.search(r'_staged\(bud, store, t, "build_exploit", status, stop,[^)]*?\)', body, re.S)
     assert m and "want=" in m.group(0), "build_exploit must declare what it is worth"
+
+
+def test_a_sampler_cannot_spend_what_the_solver_is_owed():
+    """The phase reserve stops an earlier PHASE eating a later one; this is the same principle
+    inside the search phase, and it was measured as a real loss rather than anticipated.
+
+    On the HTB target quack_quack at a 600 s budget: `fuzz` 211.4 s + `directed_fuzz` 185.0 s
+    spent 396 s on 91,896 executions and found NOTHING, while `concolic` -- which reaches that
+    target's defect in 19.8 s when allowed to finish -- was handed 19.2 s of the 120 s it asked
+    for, and was cancelled before it could validate what it had already found. A blind campaign
+    cannot construct the input behind a `strstr(input, "Quack Quack")` gate at any budget.
+    """
+    t = [0.0]
+    b = B.CaseBudget(600.0, clock=lambda: t[0])
+    t[0] = 30.0
+    b.phase("search")
+    first = b.slice("fuzz", want=180.0)
+    t[0] += first
+    second = b.slice("directed_fuzz", want=120.0)
+    t[0] += second
+    solver = b.slice("concolic", want=120.0)
+    assert first == pytest.approx(150.0)
+    assert second == pytest.approx(75.0)
+    # the whole point: enough to explore AND validate, where before it was 19.2 s
+    assert solver > 90.0
+
+
+def test_the_reserve_is_released_once_the_solver_has_been_served():
+    """A reserve protects a stage that has not run yet. Held past that, the campaign that closes
+    the coverage loop -- re-fuzzing AROUND the branches concolic just unlocked, which is why it
+    is ordered there -- would be permanently denied the time to do it."""
+    t = [0.0]
+    b = B.CaseBudget(600.0, clock=lambda: t[0])
+    t[0] = 30.0
+    b.phase("search")
+    t[0] += b.slice("fuzz", want=180.0)
+    t[0] += b.slice("directed_fuzz", want=120.0)
+    t[0] += b.slice("concolic", want=120.0)
+    assert b.slice("directed_fuzz", want=120.0) > B.FLOOR_SECONDS
+
+
+def test_an_unused_solver_reserve_is_not_wasted():
+    """A target whose search finds a crash early never runs concolic. The reserve must then flow
+    to the `prove` phase rather than sitting idle."""
+    t = [0.0]
+    b = B.CaseBudget(600.0, clock=lambda: t[0])
+    t[0] = 30.0
+    b.phase("search")
+    for stage, want in (("fuzz", 180.0), ("coverage_fuzz", 180.0), ("directed_fuzz", 120.0)):
+        t[0] += b.slice(stage, want)
+    b.phase("prove")
+    assert b.available() > 300.0

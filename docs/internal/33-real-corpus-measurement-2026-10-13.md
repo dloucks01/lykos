@@ -208,11 +208,42 @@ cuts exploration to 11 s, and the solver then returns `generated: 1, unconstrain
 nothing, because this target needs the full ~19 s of exploration to reach the gate. Shrinking the
 solver's budget trades a silent cancel for a silent miss.
 
-The real fix is upstream, and it is the same theme as §4: `concolic` asked for `want=120.0` and
-was handed **19.2 s** -- 16% of its request -- while `fuzz` took 211.4 s and `directed_fuzz`
-185.0 s to produce 91,896 executions and nothing. Give the solver its request (or let the deadline
-exceed the stage's own budget by the margin the fuzz stages already get, `want * 1.2 + 10 s`) and
-this target returns to L1 with no other change.
+The fix is upstream, and it is the same theme as §4: `concolic` asked for `want=120.0` and was
+handed **19.2 s** -- 16% of its request -- while `fuzz` took 211.4 s and `directed_fuzz` 185.0 s
+to produce 91,896 executions and nothing.
+
+### FIXED, and re-measured: L1 is back
+
+Two changes, both in the allocation rather than in any analysis:
+
+* `budget.SOLVER_RESERVE` (0.20 of the case clock) and `SAMPLER_STAGES`: a sampler may not spend
+  what the solver is owed. This is the phase-reserve principle applied WITHIN the search phase --
+  a blind campaign cannot construct the input behind a `strstr(input, "Quack Quack")` gate at any
+  budget, and the solver does it in seconds, so the solver's share is not the samplers' to spend.
+  The reserve is RELEASED once a non-sampler search stage has been served, or the campaign that
+  closes the coverage loop afterwards would be permanently denied the time to do it.
+* `fuzz` and `coverage_fuzz` now declare `want=_CAMPAIGN_WANT` (180 s). They were the only stages
+  that declared nothing, which in `budget.slice` means "give me half of whatever this phase has
+  left".
+
+Re-measured, same target, same 600 s budget, nothing else changed:
+
+| | before | after |
+|---|---|---|
+| `concolic` slice | 19.2 s, **cancelled**, `generated: 0` | 21.0 s, **completed**, `found: 1` |
+| PoC | none | **L1, verified**, `signal=SIGABRT` |
+| finding | 2 candidates | **poc-backed CWE-787** "Reproduced crash (SIGABRT) under dynamic execution" |
+| executions | 91,896 | 87,416 |
+
+**The margin is thin and this is not finished.** The solver still gets 21 s of the 120 s it asks
+for, and it succeeded by about five seconds: `concolic` explored 18.52 s and then had to validate
+inside a deadline of roughly 26 s. Two reasons the reserve delivered less than the 97 s a
+straight simulation predicts: `directed_fuzz` is invoked three times, and every stage OVERSPENDS
+its slice by the worker margin plus the orchestrator grace (`fuzz` spent 180.8 s on a 150 s
+slice). The durable fix is the one doc 32 applied to the fuzz campaigns and never to the solver:
+let the stage's own budget be strictly smaller than the deadline that reaps it, so exploring and
+validating both fit. Do NOT do that by shrinking the exploration budget -- that was measured and
+reverted (see above).
 
 ## 6. Where the capability actually stands
 
@@ -222,11 +253,10 @@ this target returns to L1 with no other change.
 * **Demonstrate (crash/PoC) on real library software:** not yet, on this corpus. Every
   obstacle found so far was mechanical — detection, string truncation, invocation, loadability,
   budget — rather than a limit of the fuzzer, and four of six are now closed.
-* **Weaponize:** the recorded ceiling (L1 on a canaried stack overflow, L2 demonstrated libc
-  leak on `deathnote`, L3 on the no-PIE / leak-bearing-PIE / win()-bearing classes, doc 32 §7)
-  did NOT reproduce through the autopilot this round: five HTB targets at 240 s and
-  `quack_quack` twice at 600 s all returned **L0**, while the same crash is reachable in 19.8 s
-  from the concolic stage driven directly. `tictactoe` managed **zero executions** in 240 s --
+* **Weaponize:** `quack_quack` is back to **L1 verified** (poc-backed CWE-787) after the
+  allocation fix, which is the recorded ceiling for that target. The rest of the HTB sample was
+  measured BEFORE that fix and should be re-run: five targets at 240 s returned L0, and at least
+  `tictactoe`'s failure is a different one (zero executions). `tictactoe` managed **zero executions** in 240 s --
   `mem_oracle` 76.9 s and `disassemble` 46.9 s ate the clock, `coverage_fuzz` aborted
   ("Fork server handshake failed"), and every search stage was then skipped for want of budget.
   The exploitation machinery is intact; what is broken is what the autopilot hands it.

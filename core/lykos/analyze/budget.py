@@ -56,6 +56,26 @@ RESERVE_AFTER = {"recover": 0.70, "search": 0.25, "prove": 0.0}
 #: consumed a whole case.
 MAX_SINGLE_SHARE = 0.5
 
+#: Stages that SAMPLE the input space -- the blind and coverage-guided campaigns. They are the
+#: reason a phase needs an INTERNAL reserve as well as one for the phases after it: each takes
+#: the largest share it is allowed, and with two of them running in sequence the stages that
+#: SOLVE rather than sample run on what is left over.
+SAMPLER_STAGES = frozenset({"fuzz", "coverage_fuzz", "directed_fuzz", "net_fuzz", "env_fuzz",
+                            "boundary_fuzz", "libfuzzer"})
+
+#: What the SEARCH phase keeps back from its samplers for the stages that solve instead of
+#: sample (`concolic`). Measured on the HTB target quack_quack at a 600 s budget: `fuzz` 211.4 s
+#: plus `directed_fuzz` 185.0 s spent 396 s of the clock on 91,896 executions and found NOTHING,
+#: while `concolic` -- which reaches that target's defect in 19.8 s when it is allowed to finish
+#: -- was handed 19.2 s of the 120 s it asked for and was cancelled before it could validate
+#: what it had already found.
+#:
+#: The asymmetry is not a tuning preference. A blind campaign cannot construct the input behind
+#: a `strstr(input, "Quack Quack")` gate at any budget -- it has to invent the token byte by byte
+#: -- and the solver constructs it in seconds. So the solver's share is not the samplers' to
+#: spend, exactly as a phase's share is not an earlier phase's to spend.
+SOLVER_RESERVE = 0.20
+
 #: Below this a slice is not worth handing out: a two-second campaign measures nothing, and
 #: saying "no budget left" is more useful than pretending to run. Returned as 0.0 instead.
 FLOOR_SECONDS = 12.0
@@ -92,6 +112,8 @@ class CaseBudget:
         self._phase = PHASES[0]
         self._spent: dict = {}
         self._skipped: list = []
+        #: set once a non-sampler search stage has had its slice; see `slice`
+        self._solver_served = False
 
     # ---- the clock ------------------------------------------------------------------------
     def elapsed(self) -> float:
@@ -125,11 +147,26 @@ class CaseBudget:
         half); the slice is never more than that and never more than the phase allows.
         """
         avail = self.available()
+        # A sampler may not spend what the solver is owed: the phase-reserve principle, applied
+        # WITHIN the search phase. Without it the first campaign takes half of everything, the
+        # second takes half of the rest, and `concolic` -- ordered after them on purpose, so it
+        # can aim at what they left uncovered -- gets the dregs of its own phase.
+        if (self._phase == "search" and stage in SAMPLER_STAGES
+                and not self._solver_served):
+            avail = max(0.0, avail - self.total * SOLVER_RESERVE)
         if avail < FLOOR_SECONDS:
             return 0.0
         cap = max(FLOOR_SECONDS, avail * MAX_SINGLE_SHARE)
         s = cap if want is None else min(float(want), cap)
-        return 0.0 if s < FLOOR_SECONDS else round(s, 1)
+        if s < FLOOR_SECONDS:
+            return 0.0
+        # The reserve protects a stage that has NOT RUN YET. Once the solver has been served it
+        # is ordinary budget again, or the campaign that closes the coverage loop afterwards --
+        # re-fuzzing AROUND the branches concolic just unlocked, which is the whole point of
+        # running it there -- would be permanently denied the time to do it.
+        if self._phase == "search" and stage not in SAMPLER_STAGES:
+            self._solver_served = True
+        return round(s, 1)
 
     # ---- what actually happened -----------------------------------------------------------
     def record(self, stage: str, seconds: float) -> None:

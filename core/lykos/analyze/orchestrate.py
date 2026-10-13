@@ -310,6 +310,13 @@ def _apply_overrides(stage: str, params: Optional[dict], overrides: Optional[dic
     return out
 
 
+#: What a blind / coverage-guided campaign is WORTH, declared like every other stage's `want`.
+#: These two were the only stages that declared nothing, which in `budget.slice` means "give me
+#: half of whatever this phase has left" -- so on a 600 s case `fuzz` took 211.4 s and the
+#: solver after it got 19.2 s of the 120 s it asked for. A campaign's value also plateaus:
+#: measured on /usr/bin/xxd, `coverage_fuzz` returned "done" after 22 s of a 97 s allowance.
+_CAMPAIGN_WANT = 180.0
+
 #: Mirrors jobs.worker._BUDGET_MARGIN: the orchestrator must outlast the worker's kill deadline,
 #: or it stops waiting on a stage that was about to finish cleanly.
 _WORKER_MARGIN = 1.25
@@ -1026,8 +1033,9 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
             # channel, which is what this needs, since a bytecode target has no call edges and so
             # no channel ranking either.
             if _nonnative_image(t):
-                _staged(bud, store, t, "fuzz", status, stop, dyn)
-            elif _staged(bud, store, t, "coverage_fuzz", status, stop, dyn) != "done" or \
+                _staged(bud, store, t, "fuzz", status, stop, dyn, want=_CAMPAIGN_WANT)
+            elif _staged(bud, store, t, "coverage_fuzz", status, stop, dyn,
+                         want=_CAMPAIGN_WANT) != "done" or \
                     bud.slice("fuzz") > 0:
                 # The blind campaign is a SECOND campaign, not only a fallback. Measured on
                 # /usr/bin/xxd with a 400s budget: coverage_fuzz returned "done" after 22s of a
@@ -1044,7 +1052,7 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                 # happen, and the run then reports only static findings -- "nothing was run"
                 # wearing the face of "nothing was found", at campaign scale. The blind stage
                 # carries none of those preconditions, so it runs the same corpus regardless.
-                _staged(bud, store, t, "fuzz", status, stop, dyn)
+                _staged(bud, store, t, "fuzz", status, stop, dyn, want=_CAMPAIGN_WANT)
             _staged(bud, store, t, "directed_fuzz", status, stop, dyn, want=120.0)
             crashes = _distinct_crashes(store, tid)
             # Multi-channel retry: the best-guess channel is not always where the bug is (a file
