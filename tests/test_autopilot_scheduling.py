@@ -79,5 +79,12 @@ def test_the_params_free_stages_really_take_no_required_params():
     from lykos.analyze.orchestrate import _NO_PARAMS
     # multi_debug needs the crashing input, so it must NOT be listed.
     assert "multi_debug" not in _NO_PARAMS
-    for stage in ("extract_secrets", "synthesize_secret", "libfuzzer", "boundary_fuzz"):
+    for stage in ("extract_secrets", "synthesize_secret", "boundary_fuzz"):
         assert stage in _NO_PARAMS, stage
+    # A stage that reads `max_seconds` must NOT be listed, even though it requires no params:
+    # the list drops ALL params, so the budget's slice never arrives and the stage runs its own
+    # default instead. `libfuzzer` was listed and ran its 30 s default on a 900 s case -- the
+    # "30-second smoke test" defect, in the engine that is the most productive one there is on a
+    # library. "Requires no params" and "wants no params" are different questions.
+    for stage in ("libfuzzer", "fuzz", "coverage_fuzz", "concolic"):
+        assert stage not in _NO_PARAMS, stage

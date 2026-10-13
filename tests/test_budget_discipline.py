@@ -396,3 +396,51 @@ def test_an_unused_solver_reserve_is_not_wasted():
     # next phase rather than having been spent by the samplers.
     assert prove_gets(B.SOLVER_RESERVE) > prove_gets(0.0)
     assert prove_gets(B.SOLVER_RESERVE) > 600.0 * B.RESERVE_AFTER["search"]
+
+
+def test_a_stage_that_ran_and_refused_is_not_counted_as_work():
+    """Elapsed seconds are not evidence of work, and the scorecard only had seconds.
+
+    Measured on an ASan libtiff build: `libfuzzer` -- the one engine built for fuzzing a
+    library -- emitted `supported: false, "libFuzzer build failed: fatal error: 'tiffio.h' file
+    not found"`, and the scorecard showed `libfuzzer: 9.0` among the stages that completed. Nine
+    seconds of elapsed time reads as work, so a capability that had built nothing and fuzzed
+    nothing was indistinguishable from one that worked, in the run's own report. That is how a
+    broken engine survives a session of measurement.
+    """
+    from types import SimpleNamespace as NS
+    from lykos.analyze import orchestrate
+    declines = orchestrate._declines_from_events([
+        NS(type="libfuzzer.done", payload={"supported": False,
+           "note": "libFuzzer build failed: fatal error: 'tiffio.h' file not found"}),
+        NS(type="heap.done", payload={"ok": True, "errors": 0, "findings": 0}),
+        NS(type="poc.done", payload={"verified": True, "level": "L1"}),
+    ])
+    assert "libfuzzer" in declines and "tiffio.h" in declines["libfuzzer"]
+    # A stage that ran, applied, and found nothing is NOT a decline -- that distinction is the
+    # whole point: "clean" and "could not look" must never collapse into one row again.
+    assert "heap_check" not in declines, declines
+    assert "build_poc" not in declines, declines
+
+
+def test_every_event_prefix_maps_to_a_stage_that_exists():
+    """The declines are keyed by STAGE, while stages emit events under their own prefixes
+    (`heaptrace.done` for `heap_trace`, `re.done` for `disassemble`). A typo here does not fail
+    loudly -- it files the decline against a stage name nobody schedules, and the capability
+    goes quiet again, which is the exact failure this ledger exists to end."""
+    from lykos.analyze import orchestrate, register
+    from lykos.jobs.registry import list_stages
+    register()
+    names = set(list_stages())
+    unknown = sorted(v for v in orchestrate._EVENT_STAGE.values() if v not in names)
+    assert not unknown, f"event map points at non-existent stages: {unknown}"
+
+
+def test_the_card_says_which_capabilities_were_never_scheduled():
+    """"Is the pipeline using everything it has" must be answerable from a run, not from
+    reading the orchestrator. Case-level stages are excluded because they are not per-target
+    work, so their absence from a target's pass is correct rather than a gap."""
+    from lykos.analyze import orchestrate
+    assert "link_case" in orchestrate._NOT_PER_TARGET
+    assert "whole_system" in orchestrate._NOT_PER_TARGET
+    assert "fuzz" not in orchestrate._NOT_PER_TARGET, "fuzz is per-target work"

@@ -169,6 +169,27 @@ def _print_scorecard(card: dict) -> None:
         dear = list((bud.get("by_stage") or {}).items())[:4]
         if dear:
             print("  dearest      " + ", ".join(f"{k} {v:g}s" for k, v in dear))
+    # WHICH CAPABILITIES DID THEIR JOB. Without this the only readable signal was elapsed
+    # seconds, and a stage that refuses in nine seconds prints exactly like one that worked for
+    # nine. `libfuzzer` on an ASan libtiff build reported "build failed: 'tiffio.h' not found"
+    # and still showed up as 9.0s among the completed stages.
+    cap = card.get("capability") or {}
+    declined = card.get("declined") or {}
+    if cap:
+        print(f"  capability   {len(cap.get('worked') or [])} did work, "
+              f"{len(cap.get('declined') or [])} declined, "
+              f"{len(cap.get('errored') or [])} errored, "
+              f"{len(cap.get('never_scheduled') or [])} never scheduled "
+              f"(of {cap.get('registered', 0)} registered)")
+        if cap.get("errored"):
+            print("  ERRORED      " + ", ".join(cap["errored"][:6]))
+        if cap.get("never_scheduled"):
+            print("  not reached  " + ", ".join(cap["never_scheduled"][:8])
+                  + (" ..." if len(cap["never_scheduled"]) > 8 else ""))
+    if declined:
+        print("  declined (ran, but could not apply here):")
+        for stage, why in sorted(declined.items())[:8]:
+            print(f"               {stage:<14} {why[:88]}")
 
 
 def _print_findings(findings) -> None:

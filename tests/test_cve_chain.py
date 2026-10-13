@@ -130,3 +130,46 @@ def test_cve_crash_escalates_through_the_exploit_ladder(store, tmp_path):
         orchestrate._record_cve_weaponized(store, t, cve, lvl)
     chain = [f for f in FindingDAO(store.conn).list_by_target(t.id) if f.detector == "cve_chain"]
     assert chain and any("weaponized to L" in (f.title or "") for f in chain)
+
+
+def test_several_defects_get_several_exploits_best_crash_first(store):
+    """A binary with several distinct crashes must yield several EXPLOITS, not one.
+
+    `build_exploit` ran once, on `crashes[0]` -- DynResult order, i.e. whichever crash the
+    campaign happened to record first, which carries no information about exploitability. So a
+    three-defect target got three PoCs and one exploit attempt, and that attempt could land on
+    the sanitizer abort (whose PC is in the check machinery, so there is no corrupted return
+    address to take over) while the crash that reached instruction-pointer control was never
+    tried. The order is now what each crash has DEMONSTRATED: L2 first, abort last.
+    """
+    from types import SimpleNamespace as NS
+
+    from lykos.db.dao import PocDAO, TargetDAO
+    case = store.cases.create("order")
+    t = TargetDAO(store.conn).upsert(case.id, "t.bin", "e" * 64, size=16)
+    abort = NS(input_sha="a" * 64, signal_name="SIGABRT", fault_pc=0x1000)
+    plain = NS(input_sha="b" * 64, signal_name="SIGSEGV", fault_pc=0x2000)
+    owned = NS(input_sha="c" * 64, signal_name="SIGSEGV", fault_pc=0x4141414141414141)
+    PocDAO(store.conn).insert(t.id, case.id, level="L1", verified=True, input_sha=plain.input_sha)
+    PocDAO(store.conn).insert(t.id, case.id, level="L2", verified=True, input_sha=owned.input_sha)
+    PocDAO(store.conn).insert(t.id, case.id, level="L1", verified=True, input_sha=abort.input_sha)
+    order = orchestrate._exploit_order(store, t.id, [abort, plain, owned])
+    assert order[0] is owned, "the crash that reached L2 must be weaponized first"
+    assert order[-1] is abort, "a sanitizer abort is the least promising, so it goes last"
+    # and the cap exists, because build_exploit is the dearest stage in the pass
+    assert orchestrate._MAX_EXPLOITS >= 2, "one exploit per target is the bug this fixed"
+
+
+def test_an_unverified_poc_does_not_promote_its_crash_in_the_exploit_order(store):
+    """Only a VERIFIED level is evidence. Ranking on an unverified row would put the crash whose
+    PoC failed to reproduce ahead of one that actually demonstrated control."""
+    from types import SimpleNamespace as NS
+
+    from lykos.db.dao import PocDAO, TargetDAO
+    case = store.cases.create("order2")
+    t = TargetDAO(store.conn).upsert(case.id, "t.bin", "f" * 64, size=16)
+    claimed = NS(input_sha="d" * 64, signal_name="SIGSEGV", fault_pc=0x3000)
+    real = NS(input_sha="e" * 64, signal_name="SIGSEGV", fault_pc=0x3004)
+    PocDAO(store.conn).insert(t.id, case.id, level="L3", verified=False, input_sha=claimed.input_sha)
+    PocDAO(store.conn).insert(t.id, case.id, level="L1", verified=True, input_sha=real.input_sha)
+    assert orchestrate._exploit_order(store, t.id, [claimed, real])[0] is real

@@ -96,7 +96,11 @@ _NO_PARAMS = {"disassemble", "detect_cwe", "heap_trace", "oob_index", "chain_pri
               # reads static findings and never executes; libfuzzer builds its own harness from
               # source; boundary_fuzz discovers its own IPC channel. Each declines for itself
               # when it does not apply, which is why none of them needs a gate here.
-              "extract_secrets", "synthesize_secret", "libfuzzer", "boundary_fuzz",
+              # NOT libfuzzer: it reads `max_seconds` for its campaign length, and listing it
+              # here meant the budget's slice never reached it -- it ran its 30 s default on a
+              # 900 s case, which is the "30-second smoke test" defect in the stage that is the
+              # most productive engine there is on a library.
+              "extract_secrets", "synthesize_secret", "boundary_fuzz",
               # mem_oracle picks its own probe inputs (a recorded crash if there is one, else an
               # empty probe -- a default-path uninitialised read needs no input at all).
               "mem_oracle"}
@@ -686,6 +690,45 @@ def _max_verified_poc_level(store, target_id) -> int:
     return lv
 
 
+# How many distinct crashes get the L3 weaponizer. A binary with several defects should yield
+# several exploits, not one -- but `build_exploit` is the dearest stage in the pass (doc 32 item 4),
+# so this is a cap AND the budget declines it when the clock runs out. Three is the measured
+# compromise: enough for a multi-defect target, cheap enough that proving the first does not cost
+# the chance to prove the second.
+_MAX_EXPLOITS = 3
+
+
+def _exploit_order(store, target_id, crashes):
+    """The distinct crashes, most-exploitable first.
+
+    `crashes[0]` is DynResult order -- i.e. whichever crash the campaign happened to record first,
+    which carries no information about exploitability. Rank instead by what each crash has already
+    DEMONSTRATED by the time this runs: a crash the L2 stage drove to instruction-pointer control
+    is the one most likely to reach a working exploit, and a sanitizer abort is the least (its PC is
+    in the check machinery, so there is no corrupted return address to take over).
+    """
+    from ..db.dao import PocDAO
+    lvl = {}
+    for pc in PocDAO(store.conn).list_by_target(target_id):
+        if pc.input_sha and getattr(pc, "verified", False) and (pc.level or "")[1:].isdigit():
+            lvl[pc.input_sha] = max(lvl.get(pc.input_sha, 0), int(pc.level[1:]))
+
+    def _rank(cr):
+        hijack = 1 if _crash_hijack_hint(store, target_id, cr) else 0
+        abort = 1 if (cr.signal_name or "") == "SIGABRT" else 0
+        return (-lvl.get(cr.input_sha, 0), -hijack, abort)
+    return sorted(crashes, key=_rank)
+
+
+def _crash_hijack_hint(store, target_id, cr) -> bool:
+    """Does this crash carry evidence of control-flow corruption (a hijacked PC)?"""
+    try:
+        from .dynamic.stage import crash_hijack
+        return bool(crash_hijack(store.conn, target_id, cr.fault_pc))
+    except Exception:                                    # noqa: BLE001 -- ranking is best-effort
+        return False
+
+
 def _record_cve_weaponized(store, target, cve: str, level: int) -> None:
     """Record that a version-matched CVE was reproduced AND its crash escalated by the exploit ladder
     to L{level} -- the explicit CVE->exploit link (otherwise the escalation reads as a generic
@@ -755,6 +798,59 @@ def _note_static_memcorruption(store, target) -> None:
         _log.debug("static-memcorruption note failed for %s", target.id, exc_info=True)
 
 
+#: `<prefix>.done` -> the STAGE that emits it, for the prefixes that differ from the stage name.
+#: Every stage reports its own refusal in that event (`supported: false` / `applicable: false`)
+#: and the scorecard now reads it, so the two namespaces have to line up -- otherwise a decline
+#: is filed against a stage name that does not exist and silently disappears again.
+#: `msan`/`tsan` are deliberately absent: they are sub-engines of `fuzz`, and their absence is
+#: not a refusal BY fuzz. They are reported under their own names.
+_EVENT_STAGE = {
+    "behavior": "behavior_trace", "chain": "chain_primitive", "coverage": "coverage_fuzz",
+    "cve": "cve_scan", "detect": "detect_cwe", "findings": "detect_cwe",
+    "dynamic": "dynamic_run", "exploit": "build_exploit", "firmware": "firmware_carve",
+    "harness": "boundary_fuzz", "heap": "heap_check", "heaptrace": "heap_trace",
+    "inject": "synthesize_injection", "int_overflow": "int_overflow_scan",
+    "memoracle": "mem_oracle", "monitor": "debug_monitor", "multidebug": "multi_debug",
+    "poc": "build_poc", "primitive": "poc_primitive", "re": "disassemble",
+    "rootcause": "root_cause", "secret": "synthesize_secret", "secrets": "extract_secrets",
+    "source_cve": "source_cve_scan", "source_sink": "source_sink_scan",
+    "synth": "synthesize_poc", "system": "whole_system", "taint": "dynamic_taint",
+    "triage": "ingest_triage", "uaf": "uaf_scan",
+}
+
+#: Stages the autopilot is not expected to schedule per target, so their absence is not a gap:
+#: the case-level stages, and the front doors that run before a pass exists.
+_NOT_PER_TARGET = frozenset({"link_case", "ipc_model", "cross_taint", "whole_system",
+                             "ingest_triage"})
+
+
+def _declines_from_events(events) -> dict:
+    """{stage: why} for every stage that RAN and said it could not apply to this target.
+
+    This is the gap that let a broken capability look like a working one for a whole session.
+    `libfuzzer` is the measured case: on an ASan libtiff build it reported
+    `supported: false, "libFuzzer build failed: fatal error: 'tiffio.h' file not found"`, and the
+    scorecard showed `libfuzzer: 9.0` among the stages that completed. Nine seconds of elapsed
+    time reads as work. The one engine built for fuzzing a library had built nothing and fuzzed
+    nothing, and nothing in the run's own report said so.
+
+    A decline is not a failure -- `heap_check` on a managed target is correct to refuse -- which
+    is exactly why it has to be distinguishable from "ran and found nothing".
+    """
+    out: dict = {}
+    for e in events:
+        pl = e.payload if isinstance(e.payload, dict) else {}
+        et = e.type or ""
+        if not et.endswith(".done"):
+            continue
+        if pl.get("supported") is False or pl.get("applicable") is False or pl.get("ran") is False:
+            prefix = et[:-len(".done")]
+            stage = _EVENT_STAGE.get(prefix, prefix)
+            why = str(pl.get("note") or pl.get("reason") or "")[:240]
+            out.setdefault(stage, why or "declined without a reason")
+    return out
+
+
 SCORECARD_EVENT = "autopilot.scorecard"
 
 
@@ -808,6 +904,49 @@ def _scorecard(store, target, bud, status) -> dict:
     card["stages"] = counts
     card["stages_skipped_for_budget"] = list(
         dict.fromkeys(x["stage"] for x in spent["skipped_for_budget"]))
+
+    # WHAT EACH CAPABILITY DID, not just how long it took. Three outcomes used to be one:
+    # "ran and worked", "ran and refused" and "never scheduled at all" were all absent from the
+    # card, so the only readable signal was elapsed seconds -- and a stage that declines in nine
+    # seconds looks exactly like a stage that worked for nine seconds. Everything here is read
+    # from evidence the run already recorded.
+    declined = _declines_from_events(events)
+    # Ground truth is the RUN TABLE, not the plan. The plan is a display template
+    # (`_PLAN_STAGES`) and does not list every stage -- `fuzz` is absent from it -- so deriving
+    # "was this scheduled" from the plan reported the main fuzzing stage as never scheduled in a
+    # run that had just executed 3,553 inputs through it. Every stage that was enqueued has a row.
+    scheduled, errored_set, done_set = set(), set(), set()
+    try:
+        from ..db.dao import AnalysisRunDAO
+        for r in AnalysisRunDAO(store.conn).list_by_case(target.case_id):
+            if getattr(r, "target_id", None) not in (None, target.id):
+                continue                                 # another target in the same case
+            scheduled.add(r.stage)
+            if r.status == "error":
+                errored_set.add(r.stage)
+            elif r.status == "done":
+                done_set.add(r.stage)
+    except Exception:                                    # noqa: BLE001 -- advisory
+        _log.debug("scorecard: run table read failed", exc_info=True)
+    try:
+        from ..jobs.registry import list_stages
+        registered = set(list_stages())
+    except Exception:                                    # noqa: BLE001 -- advisory
+        registered = set()
+    errored = sorted(errored_set)
+    worked = sorted(st for st in done_set if st not in declined)
+    card["declined"] = declined
+    card["capability"] = {
+        "registered": len(registered),
+        "scheduled": len(scheduled),
+        "worked": worked,
+        "declined": sorted(declined),
+        "errored": errored,
+        # Registered but never scheduled for this target: the honest answer to "is the pipeline
+        # using everything it has". Case-level stages and the triage front door are excluded
+        # because they are not per-target work.
+        "never_scheduled": sorted(registered - scheduled - _NOT_PER_TARGET) if registered else [],
+    }
     store.events.append(SCORECARD_EVENT, case_id=target.case_id, payload=card)
     return card
 
@@ -831,6 +970,14 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
         # discovered mid-run (firmware_carve registers them as sub-targets). Those get appended and
         # analysed in the same pass.
         worklist = list(target_ids)
+        # SIBLINGS COUNT TOO, not only containers. The expansion below used to live in the
+        # firmware and packed branches alone, so a target discovered by anything else was never
+        # reached: a source PROJECT registers one target per executable it built (libtiff builds
+        # ~20 tools, each a different parser front end), and the pass analysed exactly the one it
+        # was handed. Any target in the case that nobody has analysed is work this pass should do.
+        for _sib in store.targets.list_by_case(case_id):
+            if _sib.id not in worklist:
+                worklist.append(_sib.id)
         done_tids: set = set()
         wi = 0
         while wi < len(worklist):
@@ -940,7 +1087,11 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
             # strongest crash finder available -- thousands of executions a second with a
             # sanitizer oracle, against a few hundred for out-of-process mutation. It builds its
             # own harness and reports unsupported for a binary-only target.
-            _staged(bud, store, t, "libfuzzer", status, stop, want=60.0)
+            # In-process fuzzing is the engine built for a library, and on one it outproduces
+            # everything else by orders of magnitude (libtiff 4.0.3: a sanitizer finding in 36
+            # executions, where 14,821 external file-channel executions found none). It asked
+            # for 60 s while `fuzz` asks for 180; on a source target that ranking is backwards.
+            _staged(bud, store, t, "libfuzzer", status, stop, want=180.0)
 
             # Weaponize every version-matched CVE -- a bespoke per-CVE trigger where one is
             # authored, else the library's format attack (zlib bomb, XML billion-laughs) and its
@@ -1126,11 +1277,23 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                 _staged(bud, store, t, "poc_primitive", status, stop, p, want=90.0)
                 _note_escalation(cve, lvl0)              # these three ran on THIS CVE crash's input
             if crashes and not stop.is_set():
-                rep = {"input_sha": crashes[0].input_sha}
-                cve0 = cve_origin.get(crashes[0].input_sha)
-                lvlb = _max_verified_poc_level(store, tid) if cve0 else 0
-                _staged(bud, store, t, "build_exploit", status, stop, rep, want=60.0)
-                _note_escalation(cve0, lvlb)             # build_exploit ran on this CVE crash's input
+                # WEAPONIZE EACH DISTINCT CRASH, best first. This ran once, on `crashes[0]` -- so a
+                # binary with three defects got three PoCs (the loop above) but only ever ONE
+                # exploit, and `crashes[0]` is DynResult order, which says nothing about which
+                # crash is exploitable. Ordering by what each crash has already demonstrated means
+                # the one that reached IP control is tried before the sanitizer abort that cannot
+                # be. The budget declines the rest when the clock is gone, which is the honest
+                # bound: `_MAX_EXPLOITS` caps the ambition, the clock caps the cost.
+                ordered = _exploit_order(store, tid, crashes)[:_MAX_EXPLOITS]
+                for cr_x in ordered:
+                    if stop.is_set():
+                        break
+                    rep_x = {"input_sha": cr_x.input_sha}
+                    cve_x = cve_origin.get(cr_x.input_sha)
+                    lvl_x = _max_verified_poc_level(store, tid) if cve_x else 0
+                    _staged(bud, store, t, "build_exploit", status, stop, rep_x, want=60.0)
+                    _note_escalation(cve_x, lvl_x)       # ran on THIS CVE crash's input
+                rep = {"input_sha": ordered[0].input_sha}
                 _staged(bud, store, t, "behavior_trace", status, stop, rep, want=45.0)
                 _staged(bud, store, t, "dynamic_taint", status, stop, rep, want=60.0)
                 # Follow fork/exec and blame the CHILD. A forking server or a target that
