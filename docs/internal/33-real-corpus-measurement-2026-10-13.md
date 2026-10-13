@@ -177,16 +177,42 @@ It is a two-link chain, and neither link is the fuzzer:
 The channel fix is confirmed at the stage level: across the three attempts the chosen mode went
 `arg` -> `file` -> `stdin`, and on `stdin` the SIGABRT returns.
 
-**But the full autopilot is still L0 on this target, and the reason is NOT yet identified.**
-91,896 executions at 600 s, `concolic` 19.2 s -- within a second of the 19.76 s the isolated run
-needed -- and no crash. So "disassemble was starved" is NOT a sufficient explanation: that stage
-costs well under a second on this 20 KB binary in the isolated run too. The most likely remaining
-link, unverified, is `how_to_feed`'s first branch: it returns the mode recorded by whichever
-`DynResult` matches `input_sha`, and the blind campaign runs before `concolic` and records plenty
-of them -- which would override the ranking this round just fixed. **Whoever picks this up: run
-the autopilot with the fuzz stages disabled and see whether concolic reaches SIGABRT; that
-isolates it in one run.** Do not assume the channel fix is sufficient end to end, because it
-measurably is not.
+### The autopilot is STILL L0 on this target, and the reason is now identified
+
+The channel fix does hold end to end -- captured from inside the autopilot,
+`concolic.start {'targets': ['0x4012ff','0x4013ae'], 'seeds': 0, 'mode': 'stdin'}`, and
+`fuzz.channels {'channels': ['stdin'], 'execs': 59081}`. The stage is aimed correctly now.
+
+What it comes back with is this:
+
+```
+concolic.explored  {'generated': 0, 'incomplete': True,
+                    'note': 'StageCancelled: subprocess .../angr-venv/bin/python cancelled'}
+```
+
+**The solver is killed at the instant it would have returned, and everything it found is
+discarded.** `spec["max_seconds"]` (angr's own exploration budget) and the subprocess kill
+timeout are the SAME number, and finding an input is not the deliverable -- `_validate` still has
+to run each generated input to turn it into a crash. Driven alone with the SAME 19 s slice, the
+stage explores for 19.13 s, validates, and files `confirmed: 2` with `signal=SIGABRT mode=stdin`.
+Inside the autopilot it is cancelled at 19.2 s with `generated: 0`.
+
+This is exactly the defect doc 32's process note records -- "handing one number to both the stage,
+as its campaign length, and the worker, as its kill deadline, killed every campaign at the instant
+it would have returned; the work was done and the summary discarded" -- which was fixed for the
+fuzz campaigns and never applied to `concolic`.
+
+**The obvious fix is measured and WRONG, so do not re-apply it.** Reserving part of the slice for
+validation (`explore_seconds = max_seconds * 0.6`) was tried here and reverted: at a 19 s slice it
+cuts exploration to 11 s, and the solver then returns `generated: 1, unconstrained: 0` and finds
+nothing, because this target needs the full ~19 s of exploration to reach the gate. Shrinking the
+solver's budget trades a silent cancel for a silent miss.
+
+The real fix is upstream, and it is the same theme as §4: `concolic` asked for `want=120.0` and
+was handed **19.2 s** -- 16% of its request -- while `fuzz` took 211.4 s and `directed_fuzz`
+185.0 s to produce 91,896 executions and nothing. Give the solver its request (or let the deadline
+exceed the stage's own budget by the margin the fuzz stages already get, `want * 1.2 + 10 s`) and
+this target returns to L1 with no other change.
 
 ## 6. Where the capability actually stands
 
