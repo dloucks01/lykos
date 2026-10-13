@@ -51,8 +51,8 @@ def test_no_single_stage_takes_its_whole_phase():
     assert b.slice("build_exploit") == pytest.approx(135.0)   # half of the recover allowance
     b.phase("search")
     # a SAMPLER gets half of what the phase has left for samplers -- the allowance less the
-    # share the solver is owed (900 * 0.20): (675 - 180) / 2
-    assert b.slice("fuzz") == pytest.approx(247.5)
+    # share the solver is owed (900 * 0.10): (675 - 90) / 2
+    assert b.slice("fuzz") == pytest.approx(292.5)
     # a stage that SOLVES rather than samples gets half of the full allowance: 675 / 2
     assert b.slice("concolic") == pytest.approx(337.5)
 
@@ -61,7 +61,7 @@ def test_a_caller_may_ask_for_less_but_never_for_more():
     b = B.CaseBudget(900)
     b.phase("search")
     assert b.slice("env_fuzz", want=45.0) == pytest.approx(45.0)
-    assert b.slice("fuzz", want=10_000.0) == pytest.approx(247.5)
+    assert b.slice("fuzz", want=10_000.0) == pytest.approx(292.5)
 
 
 def test_a_slice_too_small_to_measure_anything_is_refused_outright():
@@ -329,15 +329,18 @@ def test_a_sampler_cannot_spend_what_the_solver_is_owed():
     b = B.CaseBudget(600.0, clock=lambda: t[0])
     t[0] = 30.0
     b.phase("search")
-    first = b.slice("fuzz", want=180.0)
-    t[0] += first
-    second = b.slice("directed_fuzz", want=120.0)
-    t[0] += second
+    # The REAL order, which is what exposed the first version of this: several non-sampler
+    # stages run in the search phase BEFORE the campaigns, and releasing the reserve on any
+    # non-sampler therefore released it before `fuzz` even started.
+    for stage, want in (("build_exploit", 60.0), ("mem_oracle", 60.0),
+                        ("chain_primitive", 45.0), ("synthesize_poc", 45.0)):
+        t[0] += b.slice(stage, want)
+    t[0] += b.slice("fuzz", want=180.0)
+    t[0] += b.slice("directed_fuzz", want=120.0)
     solver = b.slice("concolic", want=120.0)
-    assert first == pytest.approx(150.0)
-    assert second == pytest.approx(75.0)
-    # the whole point: enough to explore AND validate, where before it was 19.2 s
-    assert solver > 90.0
+    # twice the 18.52 s + validation that reached quack_quack's defect, where the measured
+    # before-state was 21.0 s with the reserve released early, and 19.2 s with none at all
+    assert solver > 40.0
 
 
 def test_the_reserve_is_released_once_the_solver_has_been_served():
@@ -354,14 +357,42 @@ def test_the_reserve_is_released_once_the_solver_has_been_served():
     assert b.slice("directed_fuzz", want=120.0) > B.FLOOR_SECONDS
 
 
-def test_an_unused_solver_reserve_is_not_wasted():
-    """A target whose search finds a crash early never runs concolic. The reserve must then flow
-    to the `prove` phase rather than sitting idle."""
+def test_only_the_stage_the_reserve_is_FOR_releases_it():
+    """`build_exploit`, `mem_oracle`, `chain_primitive` and `synthesize_poc` all run in the
+    search phase BEFORE the campaigns. Releasing the reserve on any non-sampler therefore
+    released it before `fuzz` started, and the solver was barely better off: 21.0 s on
+    quack_quack where the model said 97.5, and 3.0 s on replaceme."""
     t = [0.0]
     b = B.CaseBudget(600.0, clock=lambda: t[0])
     t[0] = 30.0
     b.phase("search")
-    for stage, want in (("fuzz", 180.0), ("coverage_fuzz", 180.0), ("directed_fuzz", 120.0)):
-        t[0] += b.slice(stage, want)
-    b.phase("prove")
-    assert b.available() > 300.0
+    b.slice("mem_oracle", want=60.0)
+    b.slice("chain_primitive", want=45.0)
+    assert not b._solver_served, "a discovery stage must not release the solver's share"
+    b.slice("concolic", want=120.0)
+    assert b._solver_served
+
+
+def test_an_unused_solver_reserve_is_not_wasted():
+    """A target whose search finds a crash early never runs concolic. The reserve must then flow
+    to the `prove` phase rather than sitting idle."""
+    def prove_gets(reserve):
+        was = B.SOLVER_RESERVE
+        B.SOLVER_RESERVE = reserve
+        try:
+            t = [0.0]
+            b = B.CaseBudget(600.0, clock=lambda: t[0])
+            t[0] = 30.0
+            b.phase("search")
+            for stage, want in (("fuzz", 180.0), ("coverage_fuzz", 180.0),
+                                ("directed_fuzz", 120.0)):
+                t[0] += b.slice(stage, want)
+            b.phase("prove")
+            return b.available()
+        finally:
+            B.SOLVER_RESERVE = was
+
+    # Relational, not a magic number: the share the solver never claimed is still there for the
+    # next phase rather than having been spent by the samplers.
+    assert prove_gets(B.SOLVER_RESERVE) > prove_gets(0.0)
+    assert prove_gets(B.SOLVER_RESERVE) > 600.0 * B.RESERVE_AFTER["search"]

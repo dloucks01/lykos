@@ -154,3 +154,58 @@ def test_the_reader_set_holds_conversion_functions_only():
     numeric seeding -- that would spend calibration execs on every target in the suite."""
     for not_a_converter in ("fgets", "read", "fread", "gets", "memcpy", "strcpy", "printf"):
         assert not_a_converter not in _NUMERIC_READERS
+
+
+# --- specimens the binary documents for itself ------------------------------------------
+
+def test_a_documented_example_becomes_a_seed():
+    """Many CLI tools and prompt-driven services write their input grammar into a usage line or
+    a prompt. That example is a valid input BY CONSTRUCTION -- the author of the parser wrote it
+    -- and nothing was reading it: the strings mined for seeds were the program's ERROR messages,
+    which name the gate without passing it.
+
+    Measured on the HTB target `replaceme`, whose 192-byte stack buffer is overflowed by
+    `s/a/<long>/`: 63,234 blind and directed executions never constructed the expression, because
+    a mutator has to invent `s/`, two `/` delimiters and a long field at once. The binary's own
+    prompt says "in SED format (e.g. s/old/new/)".
+    """
+    from lykos.analyze.fuzz import textconf
+    seeds = textconf.example_seeds([
+        "Now, please enter the replacement string in SED format (e.g. s/old/new/).",
+        "Missing 's/' at the beginning of the replacement string.",
+    ])
+    assert b"s/old/new/" in seeds, seeds
+    # ...and the same shape with one field grown past any plausible buffer, which is the defect
+    # the example's own format hides
+    assert any(s.startswith(b"s/old/A") and len(s) > 200 for s in seeds), seeds
+
+
+def test_a_prose_string_is_not_mistaken_for_an_example():
+    """An example has to carry STRUCTURE -- a delimiter, an operator, a path. A bare word after
+    "e.g." is a value, which `keys_from` already mines, and seeding every such word would crowd
+    the corpus with noise."""
+    from lykos.analyze.fuzz import textconf
+    assert textconf.example_seeds(["pick a colour, e.g. red"]) == []
+    assert textconf.example_seeds(["say hello", "no examples here"]) == []
+    assert textconf.example_seeds([]) == []
+
+
+def test_the_symbol_table_is_not_mined_for_examples():
+    """A loose `e\\.?\\s?g\\.?` matched the bare "eg" inside "register_tm_clones" and the "e.g"
+    inside ".note.gnu.property", and offered "ister_tm_clones" and "nu.property" as examples of
+    the program's input format. Both dots and a separator are required."""
+    from lykos.analyze.fuzz import textconf
+    for junk in ("register_tm_clones", ".note.gnu.property", "__register_frame_info",
+                 "deregister_tm_clones", "e.gnu.something/x"):
+        assert textconf.example_seeds([junk]) == [], junk
+    # and the real thing still parses
+    assert b"s/old/new/" in textconf.example_seeds(
+        ["Now, enter the replacement string in SED format (e.g. s/old/new/)."])
+
+
+def test_documented_examples_are_bounded():
+    """Seeding is an optimisation, never a precondition: a binary that documents a hundred
+    examples must not displace the corpus."""
+    from lykos.analyze.fuzz import textconf
+    many = [f"e.g. k{i}=v{i}/x" for i in range(50)]
+    assert len(textconf.example_seeds(many)) <= 8

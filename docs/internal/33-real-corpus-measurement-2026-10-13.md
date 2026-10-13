@@ -253,13 +253,50 @@ reverted (see above).
 * **Demonstrate (crash/PoC) on real library software:** not yet, on this corpus. Every
   obstacle found so far was mechanical — detection, string truncation, invocation, loadability,
   budget — rather than a limit of the fuzzer, and four of six are now closed.
-* **Weaponize:** `quack_quack` is back to **L1 verified** (poc-backed CWE-787) after the
-  allocation fix, which is the recorded ceiling for that target. The rest of the HTB sample was
-  measured BEFORE that fix and should be re-run: five targets at 240 s returned L0, and at least
-  `tictactoe`'s failure is a different one (zero executions). `tictactoe` managed **zero executions** in 240 s --
-  `mem_oracle` 76.9 s and `disassemble` 46.9 s ate the clock, `coverage_fuzz` aborted
-  ("Fork server handshake failed"), and every search stage was then skipped for want of budget.
-  The exploitation machinery is intact; what is broken is what the autopilot hands it.
+* **Weaponize:** `quack_quack` is **L1 verified** (poc-backed CWE-787) and `el_pipo` is **L1
+  verified** (CWE-119) after the allocation fix; both were L0 before it. Of the rest:
+
+  * `replaceme` -- **still L0 after both fixes**, and the reason is neither of them. Its defect
+    is real and hand-reproducible (SIGSEGV: `'a'*128 + 's/a/' + 'B'*100 + '/'` overflows a
+    192-byte stack buffer in `do_replacement`, no canary; delivered as ONE bulk write, because
+    `read(0, buf, 0x80)` takes the first 128 bytes as the text and the remainder as the sed
+    expression). The pipeline files the class and a technique -- `oob_index` CWE-129,
+    `chain_primitive` recipe "oob_write -> oob-index-write" -- without demonstrating it.
+
+    What blocks it, measured:
+
+    1. **`concolic` cannot explore this binary.** It returns after **66 steps in 0.29 s** with
+       one state deadended, nothing active, nothing generated. NOT a budget problem: read
+       `by_stage` carefully, those numbers are ELAPSED time, so the "concolic 3.0 s" in both
+       runs is the stage FINISHING early, not being starved. (The same reading error is easy to
+       make on quack_quack, where 19.2 s elapsed WAS a deadline cancel -- the difference is the
+       `StageCancelled` note, not the number.) `no_gadgets` shows the same collapse, harder: 5
+       steps in 0.01 s.
+    2. **The campaign has the right token now but not at the right offset.** `example_seeds`
+       mines the specimen out of the binary's own prompt -- "in SED format (e.g. s/old/new/)" --
+       and emits `s/old/new/` plus a long-field variant `s/old/AAAA.../`, which is the crash
+       shape. But delivered as one blob the seed sits at offset 0, so `read` #1 swallows it as
+       the TEXT and the expression never reaches field two. The crash needs 128 bytes of text
+       (containing the needle) and THEN the expression.
+
+    So the remaining gap is record-layout-aware delivery: one field per prompt, each padded to
+    the size that `read` asks for. The pipeline already does exactly this for numbered-menu
+    targets (`heap_discover._drive` sends incrementally and `_render_op` pads a sized
+    `read(fd,buf,sz)` field to `sz`); what it lacks is the same for a LINEAR prompt protocol,
+    which is a menu minus the dispatch. That is a feature, not a tweak, and padding the example
+    to a guessed 128 would be a target-specific hack rather than a capability.
+  * `no_gadgets` -- L0, and NOT a budget failure: `concolic` returns after **5 steps in 0.01 s**
+    with nothing active or deadended, i.e. angr never explored the binary (it ships a bundled
+    `ld-2.35.so`). The recorded L1 for this challenge came from its ASan SOURCE build
+    (`a.lykos.bin`), not the prebuilt binary, so L0 here is consistent with that history.
+  * `tictactoe` -- **zero executions** at 240 s and again at 600 s, so more budget is not the
+    answer. DEFERRED by the operator on 2026-10-13: open and unexplained, not dismissed. At
+    600 s the clock went `disassemble` 121.4 s, `coverage_fuzz` 118.1 s dying on "lease
+    expired", `mem_oracle` 90.5 s, and then `fuzz` 35.5 s that recorded NO executions at all
+    (`by_engine: {}`) -- most likely the live menu crawl consuming the whole campaign slice
+    before any input was delivered. Two stages also died on lease expiry, burning 148 s.
+
+  The exploitation machinery is intact; what was broken is what the autopilot hands it.
 
 ## Process note
 

@@ -238,3 +238,60 @@ class KeyValueMutator:
                 # one very long line: the `fgets` buffer itself is a boundary
                 lines[r.randrange(len(lines))] = self._line() * r.randint(4, 40)
         return b"\n".join(lines)
+
+
+# A specimen the program DOCUMENTS for itself. Many CLI tools and prompt-driven services write
+# their input grammar into a usage line or a prompt -- "in SED format (e.g. s/old/new/)" -- and
+# that example is a valid input by construction, written by the author of the parser that reads
+# it. Nothing in the pipeline was reading it: the strings mined for seeds were the program's
+# ERROR messages ("Missing 's/' at the beginning of the replacement string."), which name the
+# gate without passing it.
+#
+# Measured need, on the HTB target `replaceme`: its defect is a 192-byte stack buffer overflowed
+# by `s/a/<long>/`, and 63,234 blind and directed executions never constructed the expression,
+# because a mutator has to invent `s/`, two `/` delimiters and a long replacement field at once.
+# The binary names the shape in its own prompt.
+#: `e.g.` with BOTH dots and a separator after it, because the loose form mined junk from the
+#: symbol table: `e\.?\s?g\.?` matched the bare "eg" inside "register_tm_clones" and the "e.g"
+#: inside ".note.gnu.property", yielding "ister_tm_clones" and "nu.property" as "examples".
+_EXAMPLE = re.compile(
+    r"(?:(?<![A-Za-z])e\.g\.|(?<![A-Za-z])eg\.|for example|examples?\s*[:,]|such as|"
+    r"format\s*[:,])\s*[\"'(\[]?([^\s\"'()\[\]]{3,96})")
+
+#: A field pushed past any plausible fixed-size buffer. The example documents the SHAPE; the
+#: defect behind it is almost always a length, so each field is also offered long.
+_LONG_FIELD = 256
+
+#: Runs inside the example that look like a FIELD rather than punctuation or a keyword: the
+#: `old` and `new` of `s/old/new/`, the `KEY` and `VALUE` of `KEY=VALUE`.
+_FIELDISH = re.compile(r"[A-Za-z0-9_.-]{2,}")
+
+
+def example_seeds(strings, *, limit: int = 8) -> list:
+    """Input specimens the binary documents for itself, plus a long-field variant of each.
+
+    The example is a valid input written by the author of the parser; the long variant is the
+    same input with one field grown past any plausible buffer, which is the defect the example's
+    own format usually hides. Best-effort and bounded: a program that documents nothing yields
+    nothing, and seeding is an optimisation rather than a precondition.
+    """
+    out: list = []
+    for s in strings or ():
+        if not s or not isinstance(s, str):
+            continue
+        for m in _EXAMPLE.finditer(s):
+            ex = m.group(1).rstrip(".,;:)")
+            # a bare word is a value, not a grammar, and `keys_from` already mines those; the
+            # point here is an example carrying STRUCTURE (delimiters, an operator, a path)
+            if len(ex) < 3 or ex.isalnum():
+                continue
+            out.append(ex.encode("latin-1", "ignore"))
+            for f in _FIELDISH.finditer(ex):
+                out.append((ex[:f.start()] + "A" * _LONG_FIELD
+                            + ex[f.end():]).encode("latin-1", "ignore"))
+    seen, uniq = set(), []
+    for b in out:
+        if b not in seen:
+            seen.add(b)
+            uniq.append(b)
+    return uniq[:limit]

@@ -266,6 +266,14 @@ def format_aware_seeds(ctx, target) -> list:
     except Exception:
         pass
     try:
+        # A specimen the binary DOCUMENTS for itself -- "in SED format (e.g. s/old/new/)" -- is a
+        # valid input written by the author of the parser that reads it, plus a long-field
+        # variant of the same shape. What was mined before was the program's ERROR strings,
+        # which name the gate without passing it.
+        seeds += textconf.example_seeds(svals)
+    except Exception:
+        pass
+    try:
         keys = textconf.keys_from(svals)
         if keys:
             seeds.append(textconf.seed_for(keys))
@@ -1454,6 +1462,19 @@ def fuzz_stage(ctx) -> dict:
                     bseeds = (bseeds or []) + [_s]
             if bseeds:
                 corpus = bseeds + list(corpus)
+    # Documented specimens go in the corpus whatever model was chosen: they are evidence from
+    # the binary about its own input, not a guess, and a campaign that cannot pass the first
+    # gate measures nothing however good its mutator is.
+    try:
+        _ex = textconf.example_seeds([x.value for x in strings if getattr(x, "value", None)])
+        if _ex:
+            corpus = _ex + list(corpus)
+            ctx.emit("fuzz.seeds", payload={
+                "documented_examples": len(_ex),
+                "why": "the binary documents its own input format (usage/prompt 'e.g. ...'), "
+                       "so the example and a long-field variant of it seed the campaign"})
+    except Exception:
+        pass
     if not fmt and _reads_a_number(ctx, target):
         # No document format to model, and the target converts input text to a number: its bug
         # is behind a VALUE, not a length. `n * 16` wraps at 2**28, and the wrapped product is

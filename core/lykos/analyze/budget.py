@@ -63,6 +63,13 @@ MAX_SINGLE_SHARE = 0.5
 SAMPLER_STAGES = frozenset({"fuzz", "coverage_fuzz", "directed_fuzz", "net_fuzz", "env_fuzz",
                             "boundary_fuzz", "libfuzzer"})
 
+#: The stages the reserve exists FOR. Releasing it on ANY non-sampler was wrong and measurably
+#: so: `build_exploit`, `mem_oracle`, `chain_primitive` and `synthesize_poc` all run in the
+#: search phase BEFORE the campaigns, so the reserve was released before `fuzz` even started and
+#: the solver was barely better off -- `concolic` got 21.0 s of a 600 s case where the model
+#: predicted 97.5 s, and on `replaceme` it got 3.0 s.
+SOLVER_STAGES = frozenset({"concolic"})
+
 #: What the SEARCH phase keeps back from its samplers for the stages that solve instead of
 #: sample (`concolic`). Measured on the HTB target quack_quack at a 600 s budget: `fuzz` 211.4 s
 #: plus `directed_fuzz` 185.0 s spent 396 s of the clock on 91,896 executions and found NOTHING,
@@ -74,7 +81,14 @@ SAMPLER_STAGES = frozenset({"fuzz", "coverage_fuzz", "directed_fuzz", "net_fuzz"
 #: a `strstr(input, "Quack Quack")` gate at any budget -- it has to invent the token byte by byte
 #: -- and the solver constructs it in seconds. So the solver's share is not the samplers' to
 #: spend, exactly as a phase's share is not an earlier phase's to spend.
-SOLVER_RESERVE = 0.20
+#:
+#: SIZED FROM THE MEASURED NEED, not from a preference: `concolic` reached quack_quack's defect
+#: with 18.52 s of exploration plus a validation run, and 0.10 of a 600 s case leaves it 48.8 s
+#: -- about twice that, with headroom for a harder gate -- while the samplers keep 137 s, some
+#: 30,000 executions at the 220 exec/s measured on these targets. The larger reserve this started
+#: at (0.20) gave the solver 71 s it does not need and cut the blind campaign to 45 s, which is
+#: the wrong trade for any target whose defect a campaign CAN reach.
+SOLVER_RESERVE = 0.10
 
 #: Below this a slice is not worth handing out: a two-second campaign measures nothing, and
 #: saying "no budget left" is more useful than pretending to run. Returned as 0.0 instead.
@@ -164,7 +178,7 @@ class CaseBudget:
         # is ordinary budget again, or the campaign that closes the coverage loop afterwards --
         # re-fuzzing AROUND the branches concolic just unlocked, which is the whole point of
         # running it there -- would be permanently denied the time to do it.
-        if self._phase == "search" and stage not in SAMPLER_STAGES:
+        if self._phase == "search" and stage in SOLVER_STAGES:
             self._solver_served = True
         return round(s, 1)
 
