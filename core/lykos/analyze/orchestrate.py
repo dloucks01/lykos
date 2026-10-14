@@ -164,8 +164,19 @@ def _best_block_pct(store, target_id) -> Optional[float]:
 # ladder) start `pending` and become `skipped` if the run does not reach them. Repeats (directed
 # fuzz runs twice; root_cause/build_poc run per crash) update the same entry.
 _PLAN_STAGES = [
+    # Nine scheduled stages used to be missing from this list, and the plan is what the operator
+    # WATCHES -- so the run showed them doing nothing. `fuzz` was the costly one: on /usr/bin/xxd
+    # it performed 4,513 of the run's 7,272 executions and never appeared, so the live view sat
+    # on another stage's name while the main campaign ran. A stage absent from the plan is
+    # invisible progress, which is the same defect the test below it already names.
+    ("ingest_triage", "Triage"),
+    ("unpack", "Unpack (packed executable)"),
+    ("firmware_carve", "Carve firmware image"), ("firmware_rehost", "Rehost firmware"),
     ("dynamic_run", "Baseline execution"),
     ("disassemble", "Disassemble"), ("detect_cwe", "Static detectors"),
+    ("whole_system", "Whole-system emulation"),
+    ("ipc_model", "IPC model"), ("link_case", "Link related targets"),
+    ("cross_taint", "Cross-component taint"),
     ("cve_scan", "Known-CVE scan"), ("source_cve_scan", "Dependency-CVE scan"),
     ("embedded_audit", "RTOS config audit"), ("int_overflow_scan", "Int-overflow allocs"),
     ("uaf_scan", "Use-after-free scan"), ("source_sink_scan", "Tainted-sink scan"),
@@ -174,6 +185,7 @@ _PLAN_STAGES = [
     ("libfuzzer", "libFuzzer harness"), ("env_fuzz", "Env-var fuzzing"),
     ("cve_poc", "CVE weaponization"),
     ("cve_corroborate", "CVE corroboration"), ("synthesize_injection", "Injection probes"),
+    ("fuzz", "Black-box fuzzing"),
     ("coverage_fuzz", "Coverage fuzzing"), ("directed_fuzz", "Directed fuzzing"),
     ("heap_check", "Heap checks"), ("heap_trace", "Heap primitives"),
     ("oob_index", "Array-index probes"), ("mem_oracle", "Uninitialised-memory oracle"),
@@ -188,7 +200,11 @@ _PLAN_STAGES = [
 ]
 _PLAN_LABEL = dict(_PLAN_STAGES)
 # how far along a phase is, so a repeat/cache cannot regress a finished one back to running
-_PLAN_RANK = {"pending": 0, "running": 1, "skipped": 2, "cancelled": 3, "error": 4, "done": 5}
+# `declined` ranks with the other TERMINAL states: a stage that ran and refused is finished, and
+# a later `running` must not regress it (the repeats -- directed_fuzz, build_poc per crash -- are
+# what that guard is for).
+_PLAN_RANK = {"pending": 0, "running": 1, "skipped": 2, "cancelled": 3, "error": 4,
+              "declined": 5, "done": 5}
 
 
 def _init_plan(status, target, idx, total) -> None:
@@ -225,6 +241,44 @@ def _finalize_plan(status) -> None:
     status["updated"] = time.time()
 
 
+def _last_done_payload(store, target, stage):
+    """The payload of the most recent `<prefix>.done` event for this stage, or None."""
+    want = {p for p, st in _EVENT_STAGE.items() if st == stage} | {stage}
+    try:
+        events = store.events.list(case_id=target.case_id, limit=400)
+    except Exception:                                    # noqa: BLE001 -- advisory
+        return None
+    for e in reversed(events):
+        et = e.type or ""
+        if et.endswith(".done") and et[:-len(".done")] in want:
+            return e.payload if isinstance(e.payload, dict) else None
+    return None
+
+
+def _stage_decline(store, target, stage):
+    """The note a stage emitted when it RAN and refused, or None.
+
+    A decline reached the operator only in the end-of-run table, because the live plan recorded
+    it as `done` -- so watching a run, "libfuzzer worked" and "libfuzzer cannot apply to a
+    binary-only target" were the same line. `_declines_from_events` answers the same question
+    after the fact; this asks it for one stage, as it finishes.
+    """
+    want = {p for p, st in _EVENT_STAGE.items() if st == stage} | {stage}
+    try:
+        events = store.events.list(case_id=target.case_id, limit=400)
+    except Exception:                                    # noqa: BLE001 -- advisory
+        return None
+    for e in reversed(events):
+        et = e.type or ""
+        if not et.endswith(".done") or et[:-len(".done")] not in want:
+            continue
+        pl = e.payload if isinstance(e.payload, dict) else {}
+        if pl.get("supported") is False or pl.get("applicable") is False:
+            return str(pl.get("note") or pl.get("reason") or "could not apply here")[:200]
+        return None
+    return None
+
+
 def _stage_detail(store, target, stage) -> str:
     """A short 'what it found' summary for a COMPLETED step, shown inline in the plan so the
     progress view reads as results (`142 functions`, `58% cov · 2 crashes`, `CWE-122`), not just
@@ -254,6 +308,33 @@ def _stage_detail(store, target, stage) -> str:
             if ncr:
                 bits.append(f"{ncr} crash{'es' if ncr != 1 else ''}")
             return " · ".join(bits)
+        # THE ENGINES, which are the stages whose detail matters most and the ones that had
+        # none. On /usr/bin/xxd the live view read `ok Black-box fuzzing` with an empty cell
+        # while that stage performed 4,513 of the run's 7,272 executions -- so the line that
+        # should carry the campaign's result looked exactly like a stage that did nothing.
+        # Each campaign reports its own counts in its done event; this reads them back.
+        if stage in _EXEC_ENGINES:
+            pl = _last_done_payload(store, target, stage) or {}
+            bits = []
+            if pl.get("execs"):
+                bits.append(f"{int(pl['execs']):,} execs")
+            for key, word in (("crashes", "crash"), ("unique", "unique"),
+                              ("behaviours", "behaviours")):
+                if pl.get(key):
+                    n = int(pl[key])
+                    bits.append(f"{n} {word}{'es' if word == 'crash' and n != 1 else ''}")
+            if pl.get("starved"):
+                bits.append("STARVED (no budget to execute)")
+            if bits:
+                return " · ".join(bits)
+        if stage == "dynamic_run":
+            pl = _last_done_payload(store, target, "dynamic_run") or {}
+            if pl.get("ran") and pl.get("crashed"):
+                return "ran, FAULTED on the first input"
+            if pl.get("ran"):
+                return "ran, exited normally"
+            if pl:
+                return "DID NOT RUN: " + str(pl.get("note") or pl.get("isolation") or "")[:60]
         if stage == "root_cause":
             cwes = [f.cwe for f in FindingDAO(store.conn).list_by_target(tid) if f.cwe]
             return cwes[0] if cwes else ""
@@ -265,7 +346,17 @@ def _stage_detail(store, target, stage) -> str:
             return f"{len(pocs)} PoC" if pocs else ""
     except Exception:
         return ""
-    return ""
+    # RAN AND FOUND NOTHING is a result, and a blank cell is indistinguishable from a stage that
+    # did nothing at all. Most stages already say it in their own done event -- "no known
+    # component version banners found (stripped of version strings, or not a covered library)",
+    # "no comparisons observed on this input" -- and eleven lines of this run printed empty while
+    # that sentence sat in the event stream.
+    try:
+        pl = _last_done_payload(store, target, stage) or {}
+        note = str(pl.get("note") or pl.get("reason") or "").strip()
+        return note[:96] if note else ""
+    except Exception:                                    # noqa: BLE001 -- advisory
+        return ""
 
 
 def _emit_stage(store, case_id, stage, state, *, target_id=None, detail=None) -> None:
@@ -397,9 +488,11 @@ def _run_target_stage(store, target, stage, status, stop, params=None, *,
         except Exception:
             _log.debug("cache-hit reprojection failed for stage %s target %s", stage, target.id, exc_info=True)
             pass
-        d = _stage_detail(store, target, stage) or "cached"
-        _plan_set(status, stage, "done", d)
-        _emit_stage(store, target.case_id, stage, "done", target_id=target.id, detail=d)
+        _why = _stage_decline(store, target, stage)
+        d = _why or _stage_detail(store, target, stage) or "cached"
+        _plan_set(status, stage, "declined" if _why else "done", d)
+        _emit_stage(store, target.case_id, stage, "declined" if _why else "done",
+                    target_id=target.id, detail=d)
         return "done"
     t_begin = time.time()
     # The grace is PROPORTIONAL, and small. The worker's deadline fires at the slice and marks
@@ -417,7 +510,11 @@ def _run_target_stage(store, target, stage, status, stop, params=None, *,
         budget.record(stage, time.time() - t_begin)
     pstate = ({"done": "done", "cancelled": "cancelled", "timeout": "error",
                "error": "error"}).get(outcome, outcome or "error")
-    d = _stage_detail(store, target, stage) if pstate == "done" else None
+    _why = _stage_decline(store, target, stage) if pstate == "done" else None
+    if _why:
+        pstate, d = "declined", _why
+    else:
+        d = _stage_detail(store, target, stage) if pstate == "done" else None
     _plan_set(status, stage, pstate, d)
     _emit_stage(store, target.case_id, stage, pstate, target_id=target.id, detail=d)
     return outcome
@@ -852,6 +949,13 @@ _NOT_PER_TARGET = frozenset({"link_case", "ipc_model", "cross_taint", "whole_sys
                              "ingest_triage"})
 
 
+#: The stages whose wall time IS the search, for the scorecard's `search_seconds`. Wider than
+#: `_EXEC_BOUNDED` on purpose: `libfuzzer` and `concolic` search too, and leaving them out is
+#: what produced a fabricated executions-per-second figure.
+_EXEC_ENGINES = frozenset({"fuzz", "coverage_fuzz", "directed_fuzz", "libfuzzer", "net_fuzz",
+                           "env_fuzz", "concolic", "boundary_fuzz"})
+
+
 def _engine_seconds(by_stage: dict, engines) -> float:
     """Elapsed seconds of the stages that reported executions, for an honest rate.
 
@@ -949,6 +1053,33 @@ def _scorecard(store, target, bud, status) -> dict:
     card["executions"]["per_second"] = (round(execs / secs, 1)
                                         if (execs and secs >= 1.0) else None)
     card["budget"] = spent
+    # THE LADDER, and the work behind it. The operator was shown executions, stages, capability
+    # counts and findings -- and not the three numbers the gate has always asserted on:
+    #
+    #   * how long the SEARCH ENGINES actually held. "budget 134s of 180s" does not answer it;
+    #     libtiff at 200s showed six capabilities working and no crashes, which reads exactly
+    #     like a clean library, and the same tarball with a real search slice found a heap
+    #     overflow. A null result is worth what the search behind it was worth.
+    #   * how many CRASHES were recorded. A crash with no verified PoC is the one outcome that
+    #     most needs saying out loud, and it was visible only by reading the finding list.
+    #   * the verified POC LEVEL and WHERE THE BUNDLE IS. This is the thing the tool exists to
+    #     produce, and the run never printed it or its path.
+    card["search_seconds"] = round(
+        sum(float(v) for k, v in (spent.get("by_stage") or {}).items() if k in _EXEC_ENGINES), 1)
+    try:
+        from ..db.dao import DynResultDAO as _DRD
+        from ..db.dao import PocDAO as _PD
+        card["crashes"] = sum(1 for d in _DRD(store.conn).list_by_target(target.id) if d.crashed)
+        _pocs = _PD(store.conn).list_by_target(target.id)
+        _ver = [p for p in _pocs if getattr(p, "verified", False)
+                and str(p.level or "").startswith("L")]
+        card["poc"] = {
+            "level": max((int(str(p.level)[1]) for p in _ver), default=0),
+            "verified": len(_ver), "total": len(_pocs),
+            "bundles": [p.bundle_sha for p in _ver if getattr(p, "bundle_sha", None)][:4],
+        }
+    except Exception:                                    # noqa: BLE001 -- advisory
+        _log.debug("scorecard: crash/poc rollup failed", exc_info=True)
 
     plan = status.get("plan") or []
     counts: dict = {}

@@ -204,7 +204,13 @@ def test_the_baseline_execution_comes_before_any_analysis():
     later, and a run whose budget went elsewhere never ran the program at all."""
     assert _pos('"dynamic_run"') < _pos('"disassemble"')
     assert "dynamic_run" in O._TARGET
-    assert O._PLAN_STAGES[0][0] == "dynamic_run"
+    # In the PLAN (the display order) only the steps that decide WHAT the target is may precede
+    # it: a firmware image has to be carved and a packed stub unpacked before executing either
+    # one means anything, and triage is what tells them apart. Every ANALYSIS stage comes after.
+    _plan = [s for s, _ in O._PLAN_STAGES]
+    _before = _plan[:_plan.index("dynamic_run")]
+    assert set(_before) <= {"ingest_triage", "unpack", "firmware_carve", "firmware_rehost"}, \
+        f"analysis is planned before the baseline execution: {_before}"
 
 
 def test_every_autopilot_stage_call_carries_the_budget():

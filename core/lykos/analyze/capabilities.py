@@ -25,6 +25,68 @@ from . import substrate  # the ONE table of what each file_type can be run on
 # which used to be the second of twenty-two controls in one panel.
 FEED, FIND, PROVE = "feed", "find", "prove"
 
+# --------------------------------------------------------------------------- whose fault is it
+# A capability that RAN and refused is reporting one of two completely different things, and
+# until now they printed identically:
+#
+#   libfuzzer  no source for this target (libFuzzer needs C/C++ source to build a harness)
+#   libfuzzer  libFuzzer build failed: 'tiffio.h' file not found
+#
+# The first is the tool knowing its own limits on this target. The second is OUR defect, and it
+# means the run is INCOMPLETE for a reason the operator can have fixed -- which is exactly what
+# they need to know before they read "0 crashes" as a result. `real_corpus_gate.py` has
+# classified these since it was written; keeping its lists there alone meant the operator never
+# saw the distinction the gate was built around.
+#
+# Each entry below is a substring of a note a stage really emitted, so these lists are evidence,
+# not imagination. Order matters: BOUNDARY, then NOT_APPLICABLE, then OURS.
+
+#: A capability boundary stated honestly, however much the wording resembles a defect.
+#: `mem_oracle` saying "memcheck is a host-architecture dynamic translator and cannot run a
+#: non-host-architecture target" is the tool knowing what it is, and calling that our fault
+#: would train everyone to ignore the signal.
+DECLINE_BOUNDARY = (
+    "host-architecture", "host architecture", "cannot run a non-host",
+    "incompatible with afl", "shadow memory", "only supports", "x86-64 only",
+    "x86-64 native only", "needs native", "no gdbstub", "not supported for this",
+    "cross-arch", "the clr owns", "owns the instruction pointer",
+)
+#: A decline that describes the TARGET, not us.
+DECLINE_TARGET = (
+    "no source for this target", "no archived source tree", "no ipc channel",
+    "nothing here reads the environment", "no distinct custom allocator",
+    "no matched cve", "no heap", "not applicable", "the clr", "managed",
+    "no primitive", "needs params", "no crash", "not fuzzed under afl",
+    "supply the", "params.", "no fixed-size global", "no named custom allocator",
+    "does not terminate",
+)
+#: A decline whose reason is OURS. Every one of these has been a real defect.
+DECLINE_OURS = (
+    "build failed", "did not compile", "file not found", "no such file",
+    "undefined reference", "could not build", "failed to build", "not installed",
+    "no clang", "loader refused", "did not link", "no harness",
+)
+
+
+def classify_decline(note: str) -> str:
+    """"target" (its nature), "ours" (our defect) or "unknown" (nobody has classified it yet).
+
+    "unknown" is deliberately visible rather than silently lumped with "target": an unclassified
+    decline is one nobody has looked at, and the operator deciding whether to trust a null result
+    should be told that much.
+    """
+    low = (note or "").lower()
+    for s in DECLINE_BOUNDARY:
+        if s in low:
+            return "target"
+    for s in DECLINE_TARGET:
+        if s in low:
+            return "target"
+    for s in DECLINE_OURS:
+        if s in low:
+            return "ours"
+    return "unknown"
+
 GROUPS = (
     (FEED, "Feed", "how the target is invoked and what it is given"),
     (FIND, "Find", "discover a defect -- by execution, or statically"),

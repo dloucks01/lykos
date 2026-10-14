@@ -49,50 +49,11 @@ import sys
 if str(CORE) not in sys.path:
     sys.path.insert(0, str(CORE))
 
-#: A decline whose reason is OURS. These are substrings of the note a stage emits when it refuses;
-#: each one here has been a real defect, so the list is evidence rather than imagination.
-_OUR_FAULT = (
-    "build failed", "did not compile", "file not found", "no such file",
-    "undefined reference", "could not build", "failed to build", "not installed",
-    "no clang", "loader refused", "did not link", "no harness",
-)
-#: Checked BEFORE `_OUR_FAULT`: a capability boundary stated honestly is not a plumbing defect,
-#: however much its wording resembles one. `mem_oracle` saying "memcheck is a host-architecture
-#: dynamic translator and cannot run a non-host-architecture target" is the tool knowing its own
-#: limits -- the first version of this gate called it OUR fault on the strength of "cannot run",
-#: which would have trained us to ignore the gate.
-_BOUNDARY = (
-    "host-architecture", "host architecture", "cannot run a non-host",
-    "incompatible with afl", "shadow memory", "only supports", "x86-64 only",
-    "x86-64 native only", "needs native", "no gdbstub", "not supported for this",
-    "cross-arch", "the clr owns", "owns the instruction pointer",
-)
-#: A decline that describes the TARGET, not us. Allowed, and the gate must not punish it or every
-#: honest refusal becomes a failure and the gate gets ignored.
-_NOT_APPLICABLE = (
-    "no source for this target", "no archived source tree", "no ipc channel",
-    "nothing here reads the environment", "no distinct custom allocator",
-    "no matched cve", "no heap", "not applicable", "the clr", "managed",
-    "no primitive", "needs params", "no crash", "not fuzzed under afl",
-    # A decline that names what the OPERATOR would have to supply is the tool knowing the limit
-    # of what it can infer, not a defect. Measured on bzip2: "automated glibc-heap -> shell did
-    # not confirm: supply the menu op templates (params.add/free/view/edit/exit_seq ...)" -- the
-    # technique is for a CTF menu binary and bzip2 is not one. Deliberately narrower than "did
-    # not confirm" on its own, which could hide a real failure in the exploit chain. A note that
-    # names a `params.<knob>` is the same thing stated the other way round, and no plumbing
-    # failure mentions one.
-    "supply the", "params.",
-    # The TARGET does not have the structure the capability probes. Measured on
-    # what_does_the_f_say: `oob_index` wants a selectable object table and `heap_trace` wants an
-    # allocator to hook, and this binary has neither. Spelled out rather than generalised to
-    # "no ...", because `_OUR_FAULT` legitimately contains "no clang" and "no harness" and this
-    # list is checked first.
-    "no fixed-size global", "no named custom allocator",
-    # The target never returns. `zigzag` blocks forever on any input on any channel, so AFL
-    # cannot dry-run it at all -- a fact about the binary, not about our plumbing.
-    "does not terminate",
-)
-
+# The classifier lives in the ENGINE (`analyze.capabilities`), not here. It used to live only
+# here, which meant the gate drew a distinction -- "this capability refused because of OUR
+# defect" vs "because of the target" -- that the operator running `lykos analyze` never saw. One
+# definition, read by both.
+from lykos.analyze.capabilities import classify_decline as _classify_decline  # noqa: E402
 
 #: The stages that constitute the search. Their combined wall time is what a "0 crashes" row is
 #: actually worth: libtiff at a 200s budget reported 6 capabilities working and no crashes -- a row
@@ -130,20 +91,6 @@ class Row:
     #: Set when the budget was too small for this target's shape to be scored at all. Distinct
     #: from `ok`: the tool did not fail, the MEASUREMENT did, and the two must not print alike.
     invalid: str = ""
-
-
-def _classify_decline(note: str) -> str:
-    low = (note or "").lower()
-    for s in _BOUNDARY:
-        if s in low:
-            return "target"
-    for s in _NOT_APPLICABLE:
-        if s in low:
-            return "target"
-    for s in _OUR_FAULT:
-        if s in low:
-            return "ours"
-    return "unknown"
 
 
 def _stage_target(src: Path, work: Path) -> Path | None:

@@ -109,13 +109,16 @@ def _cmd_analyze(args) -> int:
         # allowed; a stage that never polls its own deadline cannot be interrupted, so the
         # tail allowance below is what keeps the command from hanging on one wedged stage.
         deadline = time.monotonic() + args.budget * 1.5 + 120.0
-        last = None
+        # WHAT EACH STAGE DID, as it happens. This printed `.. <stage>` on the stage NAME
+        # changing, so an operator watching a 15-minute run saw a dozen bare names and learned
+        # nothing: not whether a stage worked, refused, was skipped for budget or errored, and
+        # not what it found. All of that is already in `status["plan"]` -- the autopilot writes a
+        # state and a detail per stage -- and the loop was throwing it away.
+        seen: dict = {}
         while th.is_alive() and time.monotonic() < deadline:
             th.join(timeout=2.0)
-            cur = status.get("stage")
-            if cur and cur != last and not args.quiet:
-                print(f"  .. {cur}", flush=True)
-                last = cur
+            if not args.quiet:
+                _tick_plan(status, seen)
         if th.is_alive():
             stop.set()
             th.join(timeout=90)
@@ -125,6 +128,12 @@ def _cmd_analyze(args) -> int:
         _print_scorecard(card)
         findings = [f for f in FindingDAO(store.conn).list_by_target(t.id)]
         _print_findings(findings)
+        # THE DELIVERABLE. A verified PoC is a self-contained tarball with the target, the input
+        # and a runner script -- and the run never said it existed, let alone where. Anyone who
+        # wanted the thing the tool is for had to know that artifacts live in the case directory
+        # and that a bundle is the one with `poc-bundle` in its kind. Write them out next to
+        # wherever the operator is standing, and print the command that runs one.
+        _export_pocs(store, t, Path(args.out or ".").resolve())
         if args.report:
             from .report.html import to_html
             from .report.model import build_report
@@ -136,6 +145,68 @@ def _cmd_analyze(args) -> int:
         pool.stop()
         store.close()
     return rc
+
+
+#: How a plan state reads in the live view. The words are chosen so that "nothing was found" and
+#: "this could not run here" and "we ran out of time" are never the same line.
+_STATE_WORD = {
+    "running": "..",
+    "done": "ok",
+    "skipped": "--",       # out of budget, or not applicable before it started
+    "declined": "no",
+    "error": "!!",
+    "cancelled": "--",
+}
+
+
+def _tick_plan(status: dict, seen: dict) -> None:
+    """Print every plan entry whose state changed since the last tick."""
+    for p in list(status.get("plan") or []):
+        stage, state = p.get("stage"), p.get("state") or "pending"
+        if not stage or state == "pending":
+            continue
+        detail = (p.get("detail") or "").strip()
+        key = (state, detail)
+        if seen.get(stage) == key:
+            continue
+        seen[stage] = key
+        # A stage the run never reached is `skipped` with nothing to say, and `_finalize_plan`
+        # marks every remaining one at once -- which flooded the tail of the run with a dozen
+        # blank lines. The scorecard's "not reached" line already names them; a skip WITH a
+        # reason ("no budget left in the search phase") is the useful case and still prints.
+        if state in ("skipped", "cancelled") and not detail:
+            continue
+        word = _STATE_WORD.get(state, state[:2])
+        label = p.get("label") or stage
+        line = f"  {word} {label:<28}"
+        if state != "running" and detail:
+            line += f" {detail[:84]}"
+        print(line, flush=True)
+
+
+def _export_pocs(store, target, out_dir) -> None:
+    """Write every verified PoC bundle to disk and say how to run it."""
+    from .db.dao import PocDAO
+    try:
+        pocs = [p for p in PocDAO(store.conn).list_by_target(target.id)
+                if getattr(p, "verified", False) and getattr(p, "bundle_sha", None)]
+    except Exception:                                    # noqa: BLE001 -- advisory
+        return
+    if not pocs:
+        return
+    out_dir.mkdir(parents=True, exist_ok=True)
+    print("\n-- proof of concept " + "-" * 57)
+    for p in sorted(pocs, key=lambda x: str(x.level), reverse=True)[:6]:
+        name = f"{target.filename}-{p.level}-{str(p.bundle_sha)[:8]}.tar.gz"
+        dest = out_dir / name
+        try:
+            dest.write_bytes(store.content.get_bytes(p.bundle_sha))
+        except Exception:                                # noqa: BLE001 -- one bad artifact
+            continue
+        print(f"  {p.level}  {dest}")
+        print(f"      tar xzf {name} && sh poc/runner.sh   # prints what it proves, exits "
+              f"non-zero on the fault")
+    print("  RUN IN A SANDBOX OR VM: a PoC executes an untrusted binary. Authorized use only.")
 
 
 def _print_scorecard(card: dict) -> None:
@@ -169,6 +240,34 @@ def _print_scorecard(card: dict) -> None:
         dear = list((bud.get("by_stage") or {}).items())[:4]
         if dear:
             print("  dearest      " + ", ".join(f"{k} {v:g}s" for k, v in dear))
+    # HOW MUCH OF THAT WAS SEARCH. "budget 134s of 180s" does not answer it, and a null result is
+    # worth exactly what the search behind it was worth: libtiff at a 200s budget showed six
+    # capabilities working and no crashes -- indistinguishable from a clean library -- while the
+    # same tarball with a real search slice found a heap overflow in six executions.
+    if card.get("search_seconds") is not None:
+        _s = card["search_seconds"]
+        _tot = bud.get("elapsed") or 0
+        print(f"  search       {_s:g}s in the engines"
+              + (f" ({_s / _tot * 100:.0f}% of the run)" if _tot else "")
+              + ("   <- little of this run was spent searching" if _tot and _s < _tot * 0.25
+                 else ""))
+    # THE LADDER. This is what the tool exists to produce and the run never printed it.
+    poc = card.get("poc") or {}
+    ncr = card.get("crashes")
+    if ncr is not None or poc:
+        lvl = poc.get("level", 0)
+        ladder = {0: "L0 (no verified reproducer)",
+                  1: "L1 (verified crash reproducer)",
+                  2: "L2 (confirmed exploitation primitive)",
+                  3: "L3 (working exploit)"}.get(lvl, f"L{lvl}")
+        print(f"  crashes      {ncr or 0} recorded")
+        print(f"  poc          {ladder}"
+              + (f", {poc.get('verified', 0)} verified of {poc.get('total', 0)} built"
+                 if poc.get("total") else ""))
+        # A crash with no verified reproducer is the one outcome that most needs saying out loud.
+        if (ncr or 0) > 0 and lvl == 0:
+            print("               ^ a crash was recorded but NOTHING was verified -- the "
+                  "reproducer did not re-crash")
     # WHICH CAPABILITIES DID THEIR JOB. Without this the only readable signal was elapsed
     # seconds, and a stage that refuses in nine seconds prints exactly like one that worked for
     # nine. `libfuzzer` on an ASan libtiff build reported "build failed: 'tiffio.h' not found"
@@ -187,9 +286,28 @@ def _print_scorecard(card: dict) -> None:
             print("  not reached  " + ", ".join(cap["never_scheduled"][:8])
                   + (" ..." if len(cap["never_scheduled"]) > 8 else ""))
     if declined:
+        # WHOSE FAULT. These two printed identically until now:
+        #   libfuzzer  no source for this target (libFuzzer needs C/C++ source to build a harness)
+        #   libfuzzer  libFuzzer build failed: 'tiffio.h' file not found
+        # The first is a fact about the target. The second is our defect, and it means this run
+        # is INCOMPLETE for a reason that can be fixed -- which the operator needs before they
+        # read "0 crashes" as an answer.
+        from .analyze.capabilities import classify_decline
+        kinds = {stage: classify_decline(why) for stage, why in declined.items()}
+        ours = [s for s, k in kinds.items() if k == "ours"]
+        unknown = [s for s, k in kinds.items() if k == "unknown"]
         print("  declined (ran, but could not apply here):")
-        for stage, why in sorted(declined.items())[:8]:
-            print(f"               {stage:<14} {why[:88]}")
+        for stage, why in sorted(declined.items())[:10]:
+            mark = {"ours": "  [OUR DEFECT]", "unknown": "  [unclassified]"}.get(
+                kinds.get(stage), "")
+            print(f"               {stage:<14} {why[:74]}{mark}")
+        if ours:
+            print("  INCOMPLETE   " + ", ".join(sorted(ours))
+                  + " declined because of a defect on OUR side, not a property of this target."
+                  + " Treat this run's null results as unproven.")
+        if unknown:
+            print("  unclassified " + ", ".join(sorted(unknown))
+                  + " -- nobody has judged whether that reason is the target's or ours")
 
 
 def _print_findings(findings) -> None:
@@ -309,6 +427,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="case directory to keep (default: a temporary one)")
     an.add_argument("--name", default=None, help="case name")
     an.add_argument("--report", default=None, help="write an HTML report here")
+    an.add_argument("--out", default=None,
+                    help="where to write verified PoC bundles (default: the current directory)")
     an.add_argument("--workers", type=int, default=3, help="worker threads (default 3)")
     an.add_argument("-q", "--quiet", action="store_true", help="no per-stage progress")
     an.set_defaults(func=_cmd_analyze)
