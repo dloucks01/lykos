@@ -74,6 +74,12 @@ _NOT_APPLICABLE = (
     "nothing here reads the environment", "no distinct custom allocator",
     "no matched cve", "no heap", "not applicable", "the clr", "managed",
     "no primitive", "needs params", "no crash", "not fuzzed under afl",
+    # A decline that names what the OPERATOR would have to supply is the tool knowing the limit
+    # of what it can infer, not a defect. Measured on bzip2: "automated glibc-heap -> shell did
+    # not confirm: supply the menu op templates (params.add/free/view/edit/exit_seq ...)" -- the
+    # technique is for a CTF menu binary and bzip2 is not one. Deliberately narrower than "did
+    # not confirm" on its own, which could hide a real failure in the exploit chain.
+    "supply the",
 )
 
 
