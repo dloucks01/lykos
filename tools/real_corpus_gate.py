@@ -197,7 +197,17 @@ def run_one(src: Path, budget: float) -> Row:
         if staged is None:
             row.ok, row.problems = False, ["could not unpack"]
             return row
-        t = ingest(store, case.id, staged, filename=staged.name)
+        try:
+            t = ingest(store, case.id, staged, filename=staged.name)
+        except Exception as e:                           # noqa: BLE001 -- any ingest failure
+            # A target that cannot be ingested is a RESULT, not a reason to stop measuring. The
+            # zlib tarball raised NotAnalysable out of here ("source project did not build"),
+            # the exception left `main`, and the gate died with expat and bzip2 unmeasured --
+            # so one target's failure cost the rest of the corpus. The whole point of a gate is
+            # the table at the end.
+            row.ok = False
+            row.problems = [f"{type(e).__name__}: {str(e).splitlines()[0][:160]}"]
+            return row
         enqueue_triage(JobQueue(store.conn), t, force=True)
         pool.wait_idle(180)
         status, stop = {}, threading.Event()
