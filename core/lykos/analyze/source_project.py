@@ -196,9 +196,25 @@ def build_source_project(root, *, timeout: int = 300) -> dict:
 
     def _b_autotools():
         # `--disable-shared` is not a preference here, it is what makes the build RUNNABLE (above).
-        _, o1 = _run(["./configure", "--disable-shared"], cwd=root)
-        if "command not found" in o1 or "No such file" in o1:
-            _, o1 = _run(["./configure"], cwd=root)      # a non-autoconf `configure` may reject it
+        # But `configure` is not always autoconf's: zlib's is hand-written and ABORTS on an option
+        # it does not know ("unknown option: --disable-shared ... ./configure aborting"), leaving
+        # no usable Makefile. The retry used to be gated on "command not found"/"No such file",
+        # which that message does not contain, so the whole project fell through to the loose
+        # builder and failed there -- zlib ingested as "source project did not build", a
+        # regression introduced by adding the flag.
+        #
+        # So the retry is keyed on the OUTCOME, not on the wording of the complaint: if the first
+        # configure did not succeed, run it with no options at all. Static linking is what we
+        # want, not a requirement we can impose on every project's option vocabulary.
+        rc, o1 = _run(["./configure", "--disable-shared"], cwd=root)
+        if rc != 0:
+            rc2, o_retry = _run(["./configure"], cwd=root)
+            o1 = o1 + "\n-- configure rejected --disable-shared; retried without options --\n" \
+                 + o_retry
+            # zlib's own spelling for the same thing, tried only when the bare run also failed.
+            if rc2 != 0:
+                _, o3 = _run(["./configure", "--static"], cwd=root)
+                o1 = o1 + "\n-- retried with --static --\n" + o3
         _, o2 = _run(["make", "-j"], cwd=root)
         return "autotools", o1 + o2
 
@@ -213,10 +229,34 @@ def build_source_project(root, *, timeout: int = 300) -> dict:
         srcs = sorted(str(p) for p in root.rglob("*") if p.suffix in _SOURCE_EXT)
         if not srcs:
             return "loose", "no C/C++ sources found"
-        driver = str(wrapdir / "c++") if any(Path(s).suffix in _CXX_EXT for s in srcs) \
-            else str(wrapdir / "cc")
+        # Each file gets the driver for ITS OWN language. Picking one driver for the whole tree
+        # meant a single stray C++ file sent every .c file through c++ -- and K&R parameter lists
+        # (`void zcfree (opaque, ptr)`) are valid C89 and invalid C++, so zlib, whose tree carries
+        # contrib/iostream*/zfstream.cc, failed to compile its own zutil.c:
+        #     error: 'opaque' was not declared in this scope
+        # That is this project's oldest build defect in a new place: the gate's header already
+        # records "one .cxx file forcing a C project through clang++".
+        cxx_present = any(Path(x).suffix in _CXX_EXT for x in srcs)
+        objs, log = [], ""
+        for src in srcs:
+            drv = str(wrapdir / ("c++" if Path(src).suffix in _CXX_EXT else "cc"))
+            obj = str(Path(src).with_suffix(".lykos.o"))
+            # -fPIC always: the objects are compiled before we know whether this tree has a
+            # main(), and a pure LIBRARY links as a shared object below. PIC costs nothing for
+            # the executable link (PIE is the default anyway) and without it that fallback
+            # failed -- which is how a library with no main stopped ingesting at all.
+            rc, o = _run([drv, "-c", "-fPIC", src, "-o", obj])
+            log += o
+            if rc == 0 and Path(obj).exists():
+                objs.append(obj)
+        if not objs:
+            return "loose", log or "no translation unit compiled"
+        # Link with c++ when any C++ object is present, so libstdc++ comes along.
+        driver = str(wrapdir / ("c++" if cxx_present else "cc"))
+        srcs = objs                                      # the link steps below take the objects
         out = root / "a.lykos.bin"
-        _, log = _run([driver] + srcs + ["-o", str(out)])
+        _, l2 = _run([driver] + srcs + ["-o", str(out)])
+        log += l2
         if not out.exists():
             # No main() (a LIBRARY) -> link a shared object instead, so a pure library still
             # ingests. Static detectors run on it and the libFuzzer stage builds a harness for

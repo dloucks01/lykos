@@ -216,3 +216,60 @@ def test_library_source_builds_shared_object(tmp_path, gcc_or_skip):
                                     "void parse_record(char*s){ char t[16]; strcpy(t,s); }\n")
     r = build_source_project(tmp_path)
     assert r["ok"] and r["kind"] == "library" and r["primary"].name.endswith(".so"), r["log"][-300:]
+
+
+_KR_C = """#include <stdio.h>
+int helper(int);
+int kr_style(a, b)
+    int a; int b;                 /* K&R parameter list: valid C89, rejected by C++ */
+{ return a + b; }
+int main(void){ printf("%d\\n", kr_style(2,3) + helper(1)); return 0; }
+"""
+_CXX_HELPER = 'extern "C" int helper(int x) { return x * 10; }\n'
+
+
+def test_each_source_is_compiled_with_the_driver_for_its_own_language(tmp_path, gcc_or_skip):
+    """The loose builder picked ONE driver for the whole tree -- c++ if any source had a C++
+    extension -- so a single stray .cc file sent every .c file through c++. K&R parameter lists
+    are valid C89 and invalid C++, and zlib's tree carries contrib/iostream*/zfstream.cc, so the
+    build failed on zlib's own zutil.c:
+
+        error: 'opaque' was not declared in this scope
+          315 | void ZLIB_INTERNAL zcfree (opaque, ptr)
+
+    The gate's header already records this defect class in another place: "one .cxx file forcing
+    a C project through clang++"."""
+    (tmp_path / "main.c").write_text(_KR_C)
+    (tmp_path / "extra.cc").write_text(_CXX_HELPER)
+    built = build_source_project(tmp_path)
+    assert built.get("system") == "loose"
+    exe = built["primary"]
+    assert os.path.exists(exe)
+    # and the LINK used c++, or the C++ translation unit's runtime would be missing
+    r = subprocess.run([exe], capture_output=True, text=True, timeout=30)
+    assert r.stdout.strip() == "15", (r.returncode, r.stdout, r.stderr[-200:])
+
+
+def test_a_configure_that_rejects_our_option_is_retried_without_it(tmp_path, gcc_or_skip):
+    """`configure` is not always autoconf's. zlib's is hand-written and ABORTS on an option it
+    does not know -- "unknown option: --disable-shared ... ./configure aborting" -- leaving no
+    usable Makefile, so the project fell through to the loose builder and failed there. zlib
+    ingested as "source project did not build".
+
+    The retry was gated on "command not found"/"No such file", which that message does not
+    contain, so it never fired. Keying it on the OUTCOME instead works for any project's option
+    vocabulary."""
+    (tmp_path / "configure").write_text(
+        "#!/bin/sh\n"
+        'for a in "$@"; do\n'
+        '  case "$a" in --disable-shared)\n'
+        '    echo "unknown option: $a"; echo "aborting"; exit 1;; esac\n'
+        "done\n"
+        "printf 'all:\\n\\t$(CC) main.c -o built.bin\\n' > Makefile\n")
+    (tmp_path / "configure").chmod(0o755)
+    (tmp_path / "main.c").write_text("int main(void){return 0;}\n")
+    built = build_source_project(tmp_path)
+    assert built.get("system") == "autotools", built.get("system")
+    assert os.path.basename(built["primary"]) == "built.bin"
+    log = built.get("log") or ""
+    assert "retried without options" in log, "the retry is invisible in the build log"
