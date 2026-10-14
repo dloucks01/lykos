@@ -183,3 +183,44 @@ def test_the_synthesized_handle_harness_builds_and_reaches_the_bug(tmp_path, lib
                        cwd=str(tmp_path), env={**os.environ, "ASAN_OPTIONS": "detect_leaks=0"})
     both = (r.stdout or "") + (r.stderr or "")
     assert "stack-buffer-overflow" in both or "AddressSanitizer" in both, both[-700:]
+
+
+# ------------------------------------------- a sanitizer fault is a reproduction, not a near-miss
+def test_the_delivery_sweep_stops_on_a_sanitizer_fault():
+    """`build_poc` sweeps the delivery channels and broke only on `res.crashed` -- "was it killed
+    by a signal". A libFuzzer harness installs its own handlers and _Exit()s, so a real defect
+    comes back as exit 77 with the report on stderr. The sweep walked straight past the channel
+    that DID reproduce, `res` ended up being the last channel tried (argv, which the harness
+    ignores), and the sanitizer check after the loop had nothing to read.
+
+    Measured on expat 2.1.0, through the whole pipeline: `libfuzzer` recorded a crash,
+    `poc_primitive` reproduced it as SIGABRT, and the gate said "1 crash(es) recorded but NO
+    verified PoC"."""
+    from lykos.analyze.poc.stage import _san_report
+
+    class _R:
+        def __init__(self, crashed, stderr):
+            self.crashed, self.stderr, self.isolation = crashed, stderr, "bwrap"
+
+    ub = (b"/src/lib/xmltok_impl.c:694:3: runtime error: left shift of 1 by 31 places cannot be "
+          b"represented in type 'int'\nSUMMARY: UndefinedBehaviorSanitizer: undefined-behavior\n")
+    got = _san_report(_R(False, ub))
+    assert got and got["class"] == "undefined-behavior", got
+    # a signal crash is handled by the existing path, not this one
+    assert _san_report(_R(True, ub)) is None
+    assert _san_report(_R(False, b"")) is None
+    assert _san_report(None) is None
+    # a sanitizer SETUP failure is not a finding
+    assert _san_report(_R(False, b"AddressSanitizer failed to allocate 0x1000 bytes\n")) is None
+
+
+def test_the_sweep_breaks_on_it_in_the_loop_not_after():
+    """A source-level check, because the defect was entirely about WHERE the test happened: the
+    verdict was correct and applied to the wrong run."""
+    import pathlib as _p
+
+    import lykos.analyze.poc.stage as S
+    src = _p.Path(S.__file__).read_text()
+    body = src[src.index("for pre in (prefixes if"):src.index("verified = res.crashed")]
+    assert "_san = _san_report(res)" in body, "the sweep no longer asks inside the loop"
+    assert "if res.crashed or _san:" in body, "the sweep still breaks on a signal alone"

@@ -18,6 +18,19 @@ TOOL_VERSION = "poc-1"
 
 
 
+def _san_report(res):
+    """The sanitizer's own verdict for a replay that exited with a CODE rather than a signal.
+
+    `parse_asan_report` is used rather than a substring test because it already separates a real
+    report from a sanitizer SETUP failure ("AddressSanitizer failed to allocate"), which is not a
+    finding.
+    """
+    if res is None or getattr(res, "crashed", False) or not (getattr(res, "stderr", b"") or b""):
+        return None
+    from ..debug.rootcause import parse_asan_report
+    return parse_asan_report((res.stderr or b"").decode("utf-8", "replace"))
+
+
 class _SanitizerReplay:
     """A verdict for a fault the SANITIZER reported rather than the kernel.
 
@@ -153,6 +166,7 @@ def build_poc_stage(ctx) -> dict:
         tried = [f"socket/{proto}"]
         mode_why = (f"{mode_why}; replayed over a {proto.upper()} socket"
                     + (f" on port {port}" if port else ""))
+    _san = None
     for pre in (prefixes if (mode not in ("socket", "prompt")
                             and not (res is not None and res.crashed)) else []):
         argv = pre
@@ -162,12 +176,23 @@ def build_poc_stage(ctx) -> dict:
                               arch=target.arch, endianness=target.endianness, bits=target.bits,
                               env_overrides=run_env)
             tried.append(m if not pre else f"{m}+{' '.join(pre)}")
-            if res.crashed:
+            # A SANITIZER FAULT IS A REPRODUCTION, so the sweep has to stop on it. This loop
+            # broke only on `res.crashed` -- "was it killed by a signal" -- and a libFuzzer
+            # harness installs its own handlers and _Exit()s, so a real defect comes back as
+            # exit 77 with the report on stderr. The sweep therefore walked straight past the
+            # channel that DID reproduce and kept going; `res` ended up being the last channel
+            # tried (argv, which the harness ignores), the sanitizer check below had nothing to
+            # read, and the PoC was filed L0 unverified.
+            # Measured on expat 2.1.0: `file` delivery produced
+            #   xmltok_impl.c:694: runtime error: left shift of 1 by 31 places
+            # and the run reported "1 crash recorded but NO verified PoC".
+            _san = _san_report(res)
+            if res.crashed or _san:
                 if m != mode:
                     mode_why = f"{mode_why}, but it only crashed via {m}"
                 mode = m
                 break
-        if res is not None and res.crashed:
+        if res is not None and (res.crashed or _san):
             if not pre and prefixes[0]:
                 mode_why = f"{mode_why}; reproduces without {' '.join(prefixes[0])}"
             break
@@ -181,13 +206,11 @@ def build_poc_stage(ctx) -> dict:
     # states for a JVM fault ("an uncaught exception and exit 1, not a signal"), applied to the
     # verification itself. `parse_asan_report` is used rather than a substring test because it
     # already separates a real report from a sanitizer SETUP failure, which is not a finding.
-    if res is not None and not res.crashed and (res.stderr or b""):
-        from ..debug.rootcause import parse_asan_report
-        _san = parse_asan_report((res.stderr or b"").decode("utf-8", "replace"))
-        if _san:
-            res = _SanitizerReplay(_san, res.isolation, res.stderr)
-            mode_why = (f"{mode_why}; the fault is a {_san.get('sanitizer', 'sanitizer')} report"
-                        f" ({_san.get('class')}), not a signal")
+    _san = _san_report(res) if _san is None else _san
+    if res is not None and not res.crashed and _san:
+        res = _SanitizerReplay(_san, res.isolation, res.stderr)
+        mode_why = (f"{mode_why}; the fault is a {_san.get('class')} the sanitizer reported, "
+                    f"not a signal -- the process exits with a code")
     verified = res.crashed
     level = "L1" if verified else "L0"
 
