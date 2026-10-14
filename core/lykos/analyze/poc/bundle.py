@@ -36,12 +36,19 @@ def _argv_text(argv, *, carrier=None) -> str:
 
 
 def _runner(mode: str, argv, signal_name: str, run_cmd=None, runtime: str = "native",
-            main_class: str | None = None) -> bytes:
+            main_class: str | None = None, sanitizer: str = "") -> bytes:
     argv = list(argv or [])
     placed = INPUT_PLACEHOLDER in [str(a) for a in argv]
     # A jar is not executable and the JVM is not the target: `./target.bin` is a zip file, and
     # the reproducer has to name the runtime that reads it.
     exe, setup = "./target.bin", "chmod +x ./target.bin\n"
+    if sanitizer:
+        # A sanitizer build does not die on a signal by DEFAULT: ASan prints its report and calls
+        # _exit(1). The capture and the fuzzers set `abort_on_error=1` so the fault is a SIGABRT,
+        # and the bundle has to set it too -- otherwise the operator who unpacks this runs the
+        # reproducer, gets exit 1 where the README says 134, and concludes the PoC is broken.
+        # `detect_leaks=0` keeps LeakSanitizer's at-exit report from standing in for the defect.
+        setup += 'ASAN_OPTIONS="abort_on_error=1:detect_leaks=0"; export ASAN_OPTIONS\n'
     if runtime == "jar":
         exe, setup = "java -jar ./target.bin", ""
     elif runtime == "class":
@@ -100,6 +107,10 @@ def _runner(mode: str, argv, signal_name: str, run_cmd=None, runtime: str = "nat
         # failed when it worked.
         hint = (f'echo "exit status: $rc -- {signal_name} appears on stderr above as an '
                 'uncaught exception; the JVM exits 1 (or 3 on OutOfMemoryError)"')
+    elif sanitizer:
+        hint = (f'echo "exit status: $rc -- the {sanitizer} report is on stderr above; with '
+                'abort_on_error=1 (exported by this script) the process dies on SIGABRT, '
+                'so 134 is the expected status"')
     elif run_cmd:
         # A script reproducer (a shell-spawning exploit / a live leak) reports its OWN outcome;
         # "a crash shows as 128+signum" is wrong for it and made an L3 bundle read as a crash.
@@ -132,6 +143,41 @@ def _primitive_txt(prim: dict) -> bytes:
     # WORKING-EXPLOIT primitive (ret2win, ret2csu, execve, srop, a partial overwrite) carries
     # neither. Forcing the L2 template onto an L3 printed "Sentinel: 0x0 / Observed PC: 0x0" for a
     # confirmed exploit -- meaningless and misleading -- so each is described as what it is.
+    # An out-of-bounds ACCESS primitive has no control offset and no sentinel: nothing about it
+    # is a jump. Printing "Control offset: None / Sentinel: 0x0" under an L2 heading would be the
+    # same defect the comment above describes, one class further on, so it gets its own template
+    # stating the magnitude the sanitizer measured and the experiment that bounded it.
+    if prim.get("sanitizer_class"):
+        controlled = bool(prim.get("confirmed"))
+        lines = [
+            ("L2 exploitation primitive" if controlled else "L1 out-of-bounds access"),
+            "=" * (25 if controlled else 23),
+            f"Primitive: {prim.get('type')}",
+            f"Sanitizer class: {prim.get('sanitizer_class')}",
+            f"Access: {str(prim.get('access')).upper()} of size {prim.get('access_size')}",
+            f"Object: {prim.get('region_size')}-byte region",
+            f"Distance {prim.get('side') or 'past'} the object: "
+            f"{prim.get('distance_min')}..{prim.get('distance_max')} bytes",
+            f"Attacker-controlled distance: {controlled}",
+            "",
+            "The fault is reported BY THE SANITIZER, so the process exits with a code rather than",
+            "dying on a signal -- runner.sh reports that exit status, and the report itself is on",
+            "stderr. Nothing here claims instruction-pointer control: this primitive is the",
+            "access, and its effect is what the access does.",
+            "",
+        ]
+        if prim.get("observations"):
+            lines.append("Input variants detonated (this is the evidence for the line above):")
+            for o in prim["observations"][:10]:
+                lines.append(f"  {str(o.get('variant'))[:28]:28s} -> distance "
+                             f"{o.get('distance')} bytes")
+            if not controlled:
+                lines += ["",
+                          "Every variant read the same distance past the end, so the reach",
+                          "was not shown to be the attacker's to pick. The defect reproduces;",
+                          "the degree of control over it is unproven, and is reported so."]
+            lines.append("")
+        return ("\n".join(lines)).encode()
     if "marker" in prim or "observed_pc" in prim:
         lines = [
             "L2 exploitation primitive",
@@ -291,6 +337,9 @@ def build(target_bytes: bytes, input_bytes: bytes, meta: dict, stderr: bytes,
           mode: str, argv, signal_name: str, primitive: dict | None = None,
           extra_files: dict | None = None, run_cmd: str | None = None,
           runtime: str = "native", main_class: str | None = None) -> bytes:
+    # A sanitizer-reported fault needs a different reproducer and a different success criterion
+    # from a signal; the primitive is the only thing that knows which this is.
+    sanitizer = str((primitive or {}).get("sanitizer_class") or "")
     level = meta.get("level", "L1")
     if mode == "socket":                                 # the runner invokes this; ship it
         extra_files = dict(extra_files or {})
@@ -303,7 +352,13 @@ def build(target_bytes: bytes, input_bytes: bytes, meta: dict, stderr: bytes,
         extra_files.setdefault("replay_prompt.py", _PROMPT_REPLAY)
     script = extra_files and "exploit.py" in extra_files
     prim_line = ""
-    if primitive:
+    if sanitizer:
+        prim_line = (f"\nPrimitive: {primitive.get('type')} -- "
+                     f"{primitive.get('distance_min')}..{primitive.get('distance_max')} bytes "
+                     f"{primitive.get('side') or 'past'} a {primitive.get('region_size')}-byte "
+                     f"object (attacker-controlled distance="
+                     f"{primitive.get('confirmed')}). See PRIMITIVE.txt.\n")
+    elif primitive:
         prim_line = (f"\nPrimitive: {primitive.get('type')} at control offset "
                      f"{primitive.get('offset')} (confirmed={primitive.get('confirmed')}). "
                      "See PRIMITIVE.txt.\n")
@@ -326,6 +381,8 @@ def build(target_bytes: bytes, input_bytes: bytes, meta: dict, stderr: bytes,
               "PRIMITIVE.txt / stderr.txt - the primitive description and captured diagnostics"]
     what_success = ("the process is hijacked to the attacker-chosen code (you'll see its "
                     "marker output)" if level == "L3"
+                    else f"the {sanitizer} report appears on stderr and the process aborts "
+                         f"(exit 134)" if sanitizer
                     else f"the process dies with {signal_name} (a shell shows exit 128+signum)")
     readme = (
         "LYKOS PROOF-OF-CONCEPT BUNDLE\n"
@@ -355,7 +412,8 @@ def build(target_bytes: bytes, input_bytes: bytes, meta: dict, stderr: bytes,
         for name, data in (extra_files or {}).items():
             _add(tar, f"poc/{name}", data, mode=0o755 if name.endswith(".py") else 0o644)
         _add(tar, "poc/runner.sh",
-             _runner(mode, argv, signal_name, run_cmd, runtime, main_class), mode=0o755)
+             _runner(mode, argv, signal_name, run_cmd, runtime, main_class,
+                     sanitizer=sanitizer), mode=0o755)
         _add(tar, "poc/meta.json", json.dumps(meta, indent=2, sort_keys=True).encode())
         _add(tar, "poc/stderr.txt", stderr or b"")
         if primitive:

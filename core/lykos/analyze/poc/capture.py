@@ -59,8 +59,17 @@ def make_capture(ctx, helper: Path, exe, mode, base_argv, timeout, python):
                 return {"ok": False, "reason": "env mode but no NAME=@@ prefix recorded"}
             env = {var: data.decode("latin-1")}          # latin-1: lossless byte round-trip via JSON
         spec = {"exe": str(exe), "argv": argv, "stdin_file": stdin_file, "timeout": timeout}
-        if env:
-            spec["env"] = env
+        # A sanitizer build does NOT die on a signal by default: ASan prints its report and calls
+        # _exit(1), so to the ptrace helper the detonation looks like a program that ran and
+        # exited cleanly. Measured on a clang ASan build of a one-line out-of-bounds read: the
+        # cyclic pattern reproduced the defect every time and the stage declined with "cyclic
+        # pattern did not fault via any of stdin, file, arg" -- so no L2 primitive was ever
+        # reachable on a sanitizer build, which is every target the source-code path compiles.
+        # `abort_on_error=1` makes the fault a SIGABRT, which is what it is. `detect_leaks=0`
+        # keeps LeakSanitizer's at-exit report from standing in for the defect we are detonating.
+        env = dict(env or {})
+        env.setdefault("ASAN_OPTIONS", "abort_on_error=1:detect_leaks=0")
+        spec["env"] = env
         if breakpoints:
             spec["breakpoints"] = [int(a) for a in breakpoints]
         spec_path = work / "spec.json"

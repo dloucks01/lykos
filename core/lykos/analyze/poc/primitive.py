@@ -415,3 +415,87 @@ def memory_primitive_confirmed(cap: dict, prim: dict, word: int = 8, endian: str
     if prim.get("value_offset") is not None and prim.get("value_reg"):
         value_ok = (int(regs.get(prim["value_reg"], 0)) & mask) == (vmarker & mask)
     return addr_ok, value_ok
+
+
+#: The sanitizer classes whose report describes an access OUTSIDE an object's bounds. A
+#: use-after-free is deliberately not here: its distance field measures an offset INSIDE a freed
+#: region, which says nothing about how far an attacker can reach.
+OOB_CLASSES = frozenset({
+    "heap-buffer-overflow", "stack-buffer-overflow", "dynamic-stack-buffer-overflow",
+    "global-buffer-overflow", "stack-buffer-underflow",
+})
+
+
+def oob_access_primitive(observations: list) -> dict | None:
+    """What an out-of-bounds ACCESS the sanitizer reported is worth as an exploitation primitive.
+
+    This closes the hole the chain's PRIMITIVE link had: on a sanitizer build the process aborts
+    inside the ASan runtime, so the fault-time registers belong to the reporting machinery and
+    both register-based steps (instruction-pointer control, write-what-where) can say nothing.
+    The stage then reported "crash reproduced but no controllable primitive found" -- technically
+    true and completely empty -- and a heap out-of-bounds READ, which is what libtiff's
+    `putRGBcontig8bittile` defect is, got no verdict at all. Information disclosure is a
+    demonstrable effect; it just is not one a register capture can see.
+
+    `observations` is a list of `(label, report)` pairs, `report` being a `parse_asan_report`
+    result from detonating one input variant and `label` naming what was varied ("orig",
+    "len+64", "byte@0x1a=0xff"). The question asked of them is the one that separates a bug from
+    a primitive: does the attacker CHOOSE how far out of bounds the access goes? If the distance
+    past the end moves when the input moves, the reach is attacker-controlled and the disclosure
+    is parameterised rather than incidental. A label, not a length, because on a structured input
+    (a TIFF, a packet) the field that sets the read length is a VALUE, not the file's size, and
+    truncating such a file usually just stops it crashing.
+
+    Returns None when the observations do not describe one out-of-bounds access class.
+    """
+    seen = [(lbl, r) for lbl, r in observations
+            if isinstance(r, dict) and r.get("class") in OOB_CLASSES
+            and r.get("access") and r.get("distance") is not None]
+    if not seen:
+        return None
+    cls = seen[0][1]["class"]
+    access = seen[0][1]["access"]
+    # Mixing classes or directions means the variants provoked DIFFERENT defects, and averaging
+    # them would describe a bug that does not exist. Keep only the first one's shape.
+    seen = [(lbl, r) for lbl, r in seen if r["class"] == cls and r["access"] == access]
+    dists = sorted({r["distance"] for _lbl, r in seen})
+    pairs = [{"variant": lbl, "distance": r["distance"], "region_size": r.get("region_size"),
+              "access_size": r.get("access_size")} for lbl, r in seen]
+    controlled = len(dists) > 1
+    prim = {
+        "type": ("controlled-oob-" if controlled else "oob-") + access,
+        "sanitizer_class": cls,
+        "access": access,
+        "access_size": seen[0][1].get("access_size"),
+        "region_size": seen[0][1].get("region_size"),
+        "side": seen[0][1].get("side"),
+        "distance": dists[-1],
+        "distance_min": dists[0],
+        "distance_max": dists[-1],
+        "observations": pairs,
+        # Confirmed means the claim was DEMONSTRATED, not merely observed once. A distance that
+        # tracks the input is a demonstration (the variants are the experiment); a single fixed
+        # distance is a reproducible fault whose reach we have not shown to be ours to pick.
+        "confirmed": controlled,
+        "offset": None,
+    }
+    return prim
+
+
+def oob_effect(prim: dict) -> str:
+    """The demonstrable effect of an out-of-bounds access primitive, stated without inflation."""
+    access, region, size = prim.get("access"), prim.get("region_size"), prim.get("access_size")
+    far = prim.get("distance_max")
+    where = f"{far} bytes {prim.get('side') or 'past'} a {region}-byte object" \
+        if region is not None else f"{far} bytes out of bounds"
+    if access == "read":
+        what = (f"discloses {size} bytes of adjacent memory" if size
+                else "discloses adjacent memory")
+        reach = ("the distance tracks the input, so the attacker chooses how far to read"
+                 if prim.get("confirmed") else
+                 "the distance did not move with the input in this run")
+        return f"out-of-bounds read {where}: {what} or crashes the process -- {reach}"
+    reach = ("the distance tracks the input, so the attacker chooses where to write"
+             if prim.get("confirmed") else
+             "the distance did not move with the input in this run")
+    return f"out-of-bounds write {where}: corrupts adjacent memory -- {reach}"

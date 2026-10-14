@@ -10,6 +10,7 @@ vs return); everything else is pure stdlib.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -288,6 +289,28 @@ _ASAN_CWE = {
     "SEGV": ("CWE-476", "high"),
 }
 
+#: ASan's class name does NOT say which way the access went: `heap-buffer-overflow` is reported
+#: for a one-byte READ past the end and for a wild WRITE alike, and the table above resolved both
+#: to CWE-122 "heap-based buffer overflow" at severity CRITICAL. A read is not a write: it
+#: discloses or crashes, it does not corrupt, and calling it critical spends the reader's
+#: attention on the wrong finding. The report DOES state the direction ("READ of size 1 at ..."),
+#: so where it does, the class is resolved by it. Where it does not, the entry above stands --
+#: the same rule the UBSan table follows for the check that cannot distinguish them.
+_ASAN_BY_ACCESS = {
+    ("heap-buffer-overflow", "write"): ("CWE-122", "critical"),
+    ("heap-buffer-overflow", "read"): ("CWE-125", "high"),
+    ("stack-buffer-overflow", "write"): ("CWE-121", "critical"),
+    ("stack-buffer-overflow", "read"): ("CWE-125", "high"),
+    ("dynamic-stack-buffer-overflow", "write"): ("CWE-121", "critical"),
+    ("dynamic-stack-buffer-overflow", "read"): ("CWE-125", "high"),
+    ("global-buffer-overflow", "write"): ("CWE-787", "high"),
+    ("global-buffer-overflow", "read"): ("CWE-125", "high"),
+    ("stack-buffer-underflow", "write"): ("CWE-787", "critical"),
+    ("stack-buffer-underflow", "read"): ("CWE-125", "high"),
+    ("heap-use-after-free", "write"): ("CWE-416", "critical"),
+    ("heap-use-after-free", "read"): ("CWE-416", "high"),
+}
+
 # UndefinedBehaviorSanitizer names the exact check that fired in its "runtime error:" line, so the
 # report carries the bug class already -- classifying every one of them as CWE-758 ("reliance on
 # undefined behaviour") threw that away and reported an out-of-bounds array write as a vague
@@ -381,8 +404,51 @@ def parse_asan_report(text: str) -> Optional[dict]:
     for fm in re.finditer(r"#\d+ 0x[0-9a-f]+ in \S+ ([^\s:]+\.(?:c|cc|cpp|cxx|h|hpp)):(\d+)", t):
         src = f"{fm.group(1).split('/')[-1]}:{fm.group(2)}"
         break
-    return {"class": bug, "cwe": cwe, "severity": sev,
-            "detail": detail + (f" at {src}" if src else ""), "source": src}
+    out = {"class": bug, "cwe": cwe, "severity": sev,
+           "detail": detail + (f" at {src}" if src else ""), "source": src}
+    out.update(_access_detail(t))
+    refined = _ASAN_BY_ACCESS.get((bug, out.get("access") or ""))
+    if refined:
+        out["cwe"], out["severity"] = refined
+        out["detail"] = (f"AddressSanitizer: {bug.replace('-', ' ')} "
+                         f"({out['access'].upper()} of size {out.get('access_size')})"
+                         + (f" at {src}" if src else ""))
+    return out
+
+
+#: `READ of size 4 at 0x...` -- the access that faulted. ASan states the DIRECTION and WIDTH of
+#: the access, which no register capture can recover on a sanitizer build: the process aborts
+#: inside the ASan runtime, so the fault-time pc belongs to the reporting machinery and not to
+#: the instruction that went out of bounds.
+_ASAN_ACCESS = re.compile(r"\b(READ|WRITE) of size (\d+) at 0x([0-9a-f]+)")
+#: `0x... is located 5 bytes after 20-byte region [0x..,0x..)`. Clang 21 writes "after"/"before";
+#: older releases wrote "to the right of"/"to the left of". Both are accepted because a parser
+#: that silently matches neither reports an overflow with no magnitude, which reads as if the
+#: tool looked and found nothing to say.
+_ASAN_REGION = re.compile(
+    r"is located (\d+) bytes (after|before|inside|to the right of|to the left of)\s*"
+    r"(\d+)-byte region")
+_SIDE = {"after": "after", "to the right of": "after",
+         "before": "before", "to the left of": "before", "inside": "inside"}
+
+
+def _access_detail(t: str) -> dict:
+    """The magnitude of a sanitizer-reported out-of-bounds access: which way, how wide, how far
+    past the end, and how big the object was. This is the only place that information exists --
+    it is in the report text and nowhere else -- and it is what decides whether the defect is an
+    information disclosure, a corruption, or a one-byte nudge off the end."""
+    out: dict = {}
+    m = _ASAN_ACCESS.search(t or "")
+    if m:
+        out["access"] = m.group(1).lower()
+        out["access_size"] = int(m.group(2))
+        out["access_addr"] = int(m.group(3), 16)
+    r = _ASAN_REGION.search(t or "")
+    if r:
+        out["distance"] = int(r.group(1))
+        out["side"] = _SIDE.get(r.group(2), r.group(2))
+        out["region_size"] = int(r.group(3))
+    return out
 
 
 def classify(cap, disasm):

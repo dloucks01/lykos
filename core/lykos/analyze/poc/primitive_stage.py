@@ -17,7 +17,14 @@ _PRIM_CWE = {"instruction-pointer-control": "CWE-787",
              "write-what-where": "CWE-787",
              "arbitrary-write": "CWE-787",
              "arbitrary-read": "CWE-125",
-             "controlled-read": "CWE-125"}
+             "controlled-read": "CWE-125",
+             # A sanitizer-reported access, classified by the direction ASan states. An
+             # out-of-bounds READ is CWE-125 whether or not its distance is attacker-chosen; the
+             # distance decides the PoC LEVEL (L2 vs L1), not the weakness.
+             "controlled-oob-read": "CWE-125",
+             "oob-read": "CWE-125",
+             "controlled-oob-write": "CWE-787",
+             "oob-write": "CWE-787"}
 # root_cause classes that are already a memory-corruption defect and so are kept as-is.
 # The one definition lives beside the finding vocabulary; a second copy here would drift.
 from ...db.models import OUTRANKS_PRIMITIVE_CWES as _MEM_CORRUPTION
@@ -27,8 +34,16 @@ from ..debug import qemu_gdb, rootcause
 from ..dynamic import sandbox
 from ..dynamic.minimize import minimize
 from ..dynamic.stage import crash_finding_candidate, crash_hijack
+from ..fuzz.runner import place
 from . import bundle, primitive
-from .capture import MODES, how_to_feed, make_capture, make_qemu_capture, materialize_helper
+from .capture import (
+    MODES,
+    env_var_from_argv,
+    how_to_feed,
+    make_capture,
+    make_qemu_capture,
+    materialize_helper,
+)
 
 # ISAs whose indirect branch MASKS bit 0 of the loaded PC (ARM/AArch64 for Thumb interworking,
 # RISC-V because JALR is specified to clear it), so a captured fault PC is `value & ~1` and its
@@ -119,6 +134,107 @@ def _own_code(addr, base, ranges) -> bool:
     los = [lo for lo, _ in ranges]
     i = bisect.bisect_right(los, a) - 1
     return i >= 0 and a < ranges[i][1]
+
+
+#: How many input variants step 2b detonates. Each one is a full sandbox run, so this is a
+#: budget, not a sample size: it buys the ONE bit the verdict turns on (does the distance move?).
+_OOB_VARIANTS = 10
+#: Byte deltas tried at a sampled offset. A length field that sets a read size usually responds
+#: to being made larger, so a large additive delta and a saturated byte are the two probes most
+#: likely to move the distance without destroying the structure around them.
+_OOB_DELTAS = (0x40, 0xff)
+
+
+def _detonate_for_report(ctx, target, exe, mode, base_argv, data, timeout):
+    """Run `exe` on `data` and return the parsed sanitizer report, or None.
+
+    Separate from `make_capture` on purpose: the ptrace helper returns registers and throws the
+    child's stderr away, and for this class of defect the stderr IS the evidence. Nothing about
+    the registers of an ASan abort is informative.
+    """
+    from ..debug.rootcause import parse_asan_report
+    work = ctx.scratch()
+    argv, stdin_bytes, env = list(base_argv), None, None
+    if mode == "stdin":
+        stdin_bytes = data
+    elif mode == "file":
+        (work / "oob_input.bin").write_bytes(data)
+        argv = place(argv, str(work / "oob_input.bin"))
+    elif mode == "arg":
+        try:
+            argv = place(argv, sandbox.argv_arg(data, truncate=True))
+        except sandbox.ArgvNulError:
+            return None
+    elif mode == "env":
+        var, argv = env_var_from_argv(argv)
+        if not var:
+            return None
+        env = {var: data.decode("latin-1")}
+    else:
+        return None
+    try:
+        res = sandbox.run(exe, argv=argv, stdin=stdin_bytes, timeout=timeout,
+                          arch=target.arch, endianness=target.endianness, bits=target.bits,
+                          env_overrides=env)
+    except Exception:                                    # noqa: BLE001 -- advisory step
+        return None
+    return parse_asan_report((res.stderr or b"").decode("utf-8", "replace"))
+
+
+def _oob_variants(orig: bytes, pre: bytes, post: bytes):
+    """`(label, bytes)` inputs that probe whether the out-of-bounds distance is ours to choose.
+
+    Two families, because two shapes of input set the reach two different ways:
+      * the filler run -- an unstructured overflow reads/writes as far as the run is long, so
+        extending and truncating it moves the distance directly;
+      * a field value -- a structured input (a TIFF tag, a packet length) sets the reach with a
+        NUMBER, and its file size is irrelevant. Those are probed by raising sampled bytes.
+    """
+    out = [("orig", orig)]
+    body = orig[len(pre):len(orig) - len(post)] if (pre or post) else orig
+    if len(body) >= _MIN_FILLER_RUN:
+        filler = body[:1] or b"A"
+        for d in (64, 256):
+            out.append((f"filler+{d}", pre + body + filler * d + post))
+        half = len(body) // 2
+        if half >= _MIN_FILLER_RUN:
+            out.append((f"filler-{len(body) - half}", pre + body[:half] + post))
+    # Sampled byte probes, spread across the input so a length field anywhere in a header gets
+    # hit. Offsets are evenly spaced rather than random: a verdict that changes between two runs
+    # of the same stage on the same input is not a verdict.
+    room = max(0, _OOB_VARIANTS - len(out))
+    if room and orig:
+        step = max(1, len(orig) // max(1, room // len(_OOB_DELTAS) or 1))
+        for i in range(0, len(orig), step):
+            for d in _OOB_DELTAS:
+                if len(out) >= _OOB_VARIANTS:
+                    return out
+                b = bytearray(orig)
+                b[i] = (b[i] + d) & 0xFF if d != 0xFF else 0xFF
+                out.append((f"byte@{i:#x}={b[i]:#02x}", bytes(b)))
+    return out
+
+
+def _oob_primitive(ctx, target, exe, mode, base_argv, orig, pre, post, timeout):
+    """Step 2b: the out-of-bounds-access verdict, or None when this is not that kind of fault."""
+    first = _detonate_for_report(ctx, target, exe, mode, base_argv, orig, timeout)
+    if not first or first.get("class") not in primitive.OOB_CLASSES:
+        return None                                      # not a sanitizer-reported OOB access
+    ctx.progress(msg=f"{first['class']} ({first.get('access')}): varying the input to see "
+                     f"whether the out-of-bounds distance is attacker-controlled")
+    obs = [("orig", first)]
+    for label, data in _oob_variants(orig, pre, post)[1:]:
+        rep = _detonate_for_report(ctx, target, exe, mode, base_argv, data, timeout)
+        if rep:
+            obs.append((label, rep))
+    prim = primitive.oob_access_primitive(obs)
+    if prim is not None:
+        ctx.emit("primitive.oob", payload={
+            "class": prim["sanitizer_class"], "access": prim["access"],
+            "distance_min": prim["distance_min"], "distance_max": prim["distance_max"],
+            "region_size": prim["region_size"], "controlled": prim["confirmed"],
+            "variants_detonated": len(obs), "observations": prim["observations"][:10]})
+    return prim
 
 
 def primitive_stage(ctx) -> dict:
@@ -348,6 +464,28 @@ def primitive_stage(ctx) -> dict:
             return _finalize(ctx, target, target_bytes, mode, base_argv, cap0, control,
                              prim, confirmed, extra)
 
+        # 2b) NOTHING in the registers -- because on a sanitizer build there is nothing in the
+        # registers to find. ASan aborts inside its own runtime, so the fault-time pc belongs to
+        # the reporting machinery, `recover_ip_offset` sees no cyclic word and
+        # `analyze_memory_primitive` has no faulting access to read. The stage fell through to
+        # step 3 and said "crash reproduced but no controllable primitive found", which is
+        # technically true and completely empty: libtiff's `putRGBcontig8bittile` heap
+        # out-of-bounds READ -- a real, reachable, demonstrable information disclosure -- got no
+        # verdict at all, because the only verdicts on offer were about controlling the
+        # instruction pointer.
+        #
+        # The primitive for this class is in the REPORT, and the experiment is to vary the input
+        # and watch the distance past the end of the object move.
+        if not emulated:
+            prim = _oob_primitive(ctx, target, exe, mode, base_argv, orig, _pre, _post,
+                                  timeout)
+            if prim is not None:
+                control = frame(orig[len(_pre):len(orig) - len(_post)] if (_pre or _post)
+                                else orig)
+                extra = primitive.oob_effect(prim)
+                return _finalize(ctx, target, target_bytes, mode, base_argv, cap0, control,
+                                 prim, bool(prim.get("confirmed")), extra)
+
         # 3) crash reproduced but no controllable primitive found
         ctx.emit("primitive.done", payload={
             "primitive": ("register-control" if regs else None), "supported": True,
@@ -388,7 +526,13 @@ def _finalize(ctx, target, target_bytes, mode, base_argv, cap0, control, prim, c
                 "write-what-where": ("memory-corruption", "Memory corruption (arbitrary write)"),
                 "arbitrary-write": ("memory-corruption", "Memory corruption (arbitrary write)"),
                 "arbitrary-read": ("info-disclosure", "Information disclosure (memory leak)"),
-                "controlled-read": ("info-disclosure", "Information disclosure (memory leak)")}
+                "controlled-read": ("info-disclosure", "Information disclosure (memory leak)"),
+                "controlled-oob-read": ("info-disclosure",
+                                        "Information disclosure (out-of-bounds read)"),
+                "oob-read": ("info-disclosure", "Information disclosure (out-of-bounds read)"),
+                "controlled-oob-write": ("memory-corruption",
+                                         "Memory corruption (out-of-bounds write)"),
+                "oob-write": ("memory-corruption", "Memory corruption (out-of-bounds write)")}
         _kind_title = _EFF.get(prim.get("type"))
         # Key on the ORIGINAL crash's faulting address (as root_cause does), NOT this capture's,
         # so the primitive finding merges into the crash finding instead of forking a duplicate:
