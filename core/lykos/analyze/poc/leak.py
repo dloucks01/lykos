@@ -1723,7 +1723,7 @@ def _gate_preambles(target_bytes=b"", strings=(), known_inputs=(), cap=6) -> lis
 
 def auto_provoke_leak(exe, workdir, target_bytes, libc_data=b"", *, base_argv=(), timeout=6.0,
                       mem_mb=2048, read_cap=64, strings=(), known_inputs=(),
-                      drive_prompts=False) -> dict:
+                      drive_prompts=False, deadline=None) -> dict:
     """Best-effort automatic leak: drive the target with a format-string `%p` dump (sequential that
     fits `read_cap`, then positional to reach deeper slots) and classify what comes back. Returns
     the classification plus the winning trigger, or empties when nothing was disclosed (the target
@@ -1758,7 +1758,17 @@ def auto_provoke_leak(exe, workdir, target_bytes, libc_data=b"", *, base_argv=()
         triggers += [g + b"A" * n for n in (64, 128, 256)]
         triggers.append((g + seq)[:read_cap] + b"\n")
     best = {"pie_base": None, "libc_base": None, "canary": None, "trigger": None, "dump": b""}
+    # BOUNDED IN TIME. Every trigger spawns the target and waits on select for its timeout, and a
+    # target with no format sink pays that in full for each one -- so the cost is "number of
+    # triggers x timeout" and nothing related to the slice the caller was given. Profiled on
+    # `/usr/bin/xxd`: 33 spawns, 63 reads, 1,084 select calls, 109.4 s of a 109.8 s stage against
+    # a 25.5 s budget; the stage then overran its kill deadline, the heartbeat stopped, and the
+    # run was filed `lease expired` even though it had reached the right answer. A deadline stops
+    # the sweep where it is: a leak found in the first few triggers is found either way, and a
+    # target that has no leak costs what the caller can afford instead of what the list costs.
     for trig in triggers:
+        if deadline is not None and time.time() >= deadline:
+            break
         preexec = sandbox._rlimits(mem_mb, int(timeout) + 2, set_as=True)
         cmd = sandbox.isolate_prefix(exedir, net=False, rw_binds=[exedir]) + \
             [str(exe)] + [str(a) for a in base_argv]
