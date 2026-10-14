@@ -296,8 +296,17 @@ def main() -> int:
                          "own budget, so this multiplies the wall clock")
     a = ap.parse_args()
     if a.max_entry_points:
-        from lykos.analyze import ingest as _ingest
+        # `from lykos.analyze import ingest` gives the ingest FUNCTION, not the module: the
+        # package re-exports it and the name shadows the submodule. Setting MAX_ENTRY_POINTS on
+        # that function object is a silent no-op -- measured: the run went on registering six
+        # targets per library while the flag said two, and nothing anywhere said otherwise.
+        # Import the module by name, and assert the value actually moved, because a measurement
+        # tool whose knob quietly does nothing is worse than one without the knob.
+        from importlib import import_module
+        _ingest = import_module("lykos.analyze.ingest")
         _ingest.MAX_ENTRY_POINTS = max(1, a.max_entry_points)
+        assert _ingest.MAX_ENTRY_POINTS == max(1, a.max_entry_points), \
+            "--max-entry-points did not take effect"
     targets = [Path(x) for x in a.targets] or default_corpus()
     if not targets:
         print("no targets given and no default corpus on this machine"); return 2
