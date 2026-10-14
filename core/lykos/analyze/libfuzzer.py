@@ -156,6 +156,11 @@ _PARSERISH = re.compile(r"(open|parse|load|read|decode|import|scan|unpack|inflat
 # Directories that are not the library: a tool's private helper is reachable only through that
 # tool's own argv handling, so fuzzing it proves nothing about the library's API.
 _NOT_LIBRARY = ("test", "tests", "tools", "contrib", "examples", "example", "build-aux", "port")
+#: Directories holding a PLATFORM PORT's headers rather than the library's API. Their
+#: declarations are real -- they are just not the surface an application on this machine reaches,
+#: and a harness that includes one does not compile.
+_PORT_DIRS = ("amiga", "win32", "windows", "msvc", "vms", "os2", "macos", "watcom", "borland",
+              "mingw", "darwin", "aix", "hpux", "solaris", "android", "ios", "bcb5", "nt")
 
 
 def _declared_in_header(root, fn: str):
@@ -166,15 +171,28 @@ def _declared_in_header(root, fn: str):
     # is followed by `)`. Accepting the punctuation that can follow a declared name matches both
     # without matching prose that merely mentions the function.
     pat = re.compile(r"\b" + re.escape(fn) + r"\s*[(),;]")
+    hits = []
     for h in sorted(Path(root).rglob("*.h")):
-        if any(seg in _SKIP_DIRS for seg in h.relative_to(Path(root)).parts):
+        rel = h.relative_to(Path(root)).parts
+        if any(seg in _SKIP_DIRS for seg in rel):
+            continue
+        # A PORT's header is not the library's API. expat ships four headers declaring
+        # `XML_ParserCreate` and `sorted()` returned `amiga/include/inline4/expat.h` first -- an
+        # Amiga inline-macro wrapper. The name was found, so every caller believed the function
+        # was public, while a harness that INCLUDED that header would not compile here at all.
+        if any(seg in _PORT_DIRS for seg in rel[:-1]):
             continue
         try:
             if pat.search(h.read_text(errors="ignore")):
-                return h
+                hits.append(h)
         except OSError:
             continue
-    return None
+    if not hits:
+        return None
+    # The shallowest path wins, then the shortest: a library's own public header sits beside its
+    # sources (`lib/expat.h`), while a platform or bundled copy is nested deeper.
+    hits.sort(key=lambda h: (len(h.relative_to(Path(root)).parts), len(str(h))))
+    return hits[0]
 
 
 def pick_harness_fn(root) -> str | None:
@@ -344,6 +362,213 @@ def synth_file_harness(fn: str, params: list, *, closer: str | None = None,
             + "    }\n"
             "    unlink(path);\n"
             "    return 0;\n}\n")
+
+
+#: Names that RELEASE a handle. A harness that never releases leaks one per execution; libFuzzer
+#: runs tens of thousands of iterations in one process, so the library stops being able to
+#: allocate and the rest of the campaign tests the out-of-memory path instead of the parser.
+_DTOR_WORDS = re.compile(r"(free|destroy|close|delete|release|fini|cleanup|end|reset)", re.I)
+#: Names that CREATE one.
+_CTOR_WORDS = re.compile(r"(create|new|alloc|init|open|make|begin)", re.I)
+
+
+def _handle_type(param: str) -> str:
+    """The TYPE spelling of a parameter, with the variable name removed.
+
+    `"XML_Parser parser"` -> `"XML_Parser"`; `"struct foo *f"` -> `"struct foo *"`.
+    """
+    t = " ".join((param or "").split())
+    if not t:
+        return ""
+    if t.endswith("*"):
+        return t
+    parts = t.split(" ")
+    if len(parts) == 1:
+        return parts[0]                                  # an unnamed parameter: all type
+    last = parts[-1]
+    if last.startswith("*"):                             # `struct foo *f`
+        return " ".join(parts[:-1]) + " *"
+    return " ".join(parts[:-1])
+
+
+def _buf_len_at(params: list) -> int:
+    """Index of the first (pointer, length) PAIR in `params`, or -1.
+
+    This is the shape libFuzzer hands over directly, and finding it is what tells a
+    handle-threading consumer (`XML_Parse(XML_Parser, const char *s, int len, int isFinal)`) from
+    a function that merely happens to take a handle.
+    """
+    for i in range(len(params) - 1):
+        if _PTR_FIRST.match(params[i].strip()) and _LEN_PARAM.search(params[i + 1]):
+            return i
+    return -1
+
+
+def find_handle_triple(root):
+    """A create -> consume -> destroy triple, or None.
+
+    THE REACH GAP. `pick_harness_fn` requires a pointer-spelled first parameter, so it can only
+    reach a library whose entry point takes the bytes directly. The dominant shape in a C library
+    is not that: you make a handle, feed it, and free it --
+
+        XML_Parser XML_ParserCreate(const XML_Char *encoding);
+        enum XML_Status XML_Parse(XML_Parser parser, const char *s, int len, int isFinal);
+        void XML_ParserFree(XML_Parser parser);
+
+    `XML_Parser` is a typedef with no `*` in its spelling, so the ranked pick excluded expat's
+    real parser outright and the library was reachable only through a HAND-WRITTEN harness. The
+    same holds for libpng (`png_create_read_struct`/`png_read_png`/`png_destroy_read_struct`),
+    libxml2, sqlite3 and openssl: a hand-written harness per library does not generalise, and
+    this does.
+
+    Returns `{"header", "handle", "ctor", "ctor_params", "consume", "consume_params", "dtor",
+    "buf_at"}`. The header matters: the handle type is OPAQUE, so the harness cannot
+    forward-declare its way around it and has to `#include` the library's own public header --
+    which is what a real harness does anyway, and brings every prototype with it.
+    """
+    root = Path(root)
+    # 1. a CONSUMER: an opaque first parameter followed by a (pointer, length) pair.
+    cands = []
+    for p in sorted(root.rglob("*")):
+        if not (p.is_file() and p.suffix in _SRC_EXT):
+            continue
+        rel = p.relative_to(root).parts
+        if any(seg in _SKIP_DIRS for seg in rel) or any(seg in _NOT_LIBRARY for seg in rel[:-1]):
+            continue
+        try:
+            txt = p.read_text(errors="ignore")
+        except OSError:
+            continue
+        for m in _FN_DEF.finditer(txt):
+            name = m.group(1)
+            if name in _KEYWORDS or _DTOR_WORDS.search(name):
+                continue
+            params = [a.strip() for a in (m.group(2) or "").split(",") if a.strip()]
+            if len(params) < 3 or not _opaque_param(params[0]):
+                continue                                 # no handle to thread
+            at = _buf_len_at(params[1:])
+            if at < 0:
+                continue
+            htype = _handle_type(params[0])
+            if not htype or htype in ("void *", "void*"):
+                continue                                 # `void *` is not a named handle type
+            hdr = _declared_in_header(root, name)
+            score = (4 if hdr is not None else 0) + (3 if _PARSERISH.search(name) else 0)
+            cands.append((score, name, params, at + 1, htype, hdr))
+    if not cands:
+        return None
+    cands.sort(key=lambda c: (-c[0], c[1]))
+    for _score, name, params, buf_at, htype, hdr in cands:
+        if hdr is None:
+            continue                                     # a private function is not an API
+        ctor = _find_by_return(root, hdr, htype, _CTOR_WORDS, exclude={name})
+        if not ctor:
+            continue
+        dtor = _find_taking_only(root, htype, _DTOR_WORDS, exclude={name, ctor[0]})
+        return {"header": hdr, "handle": htype, "ctor": ctor[0], "ctor_params": ctor[1],
+                "consume": name, "consume_params": params, "dtor": dtor, "buf_at": buf_at}
+    return None
+
+
+def _find_by_return(root, header, htype: str, words, exclude=()):
+    """(name, params) of a function in `header` whose RETURN type is `htype`, or None.
+
+    The return type is matched in the text BEFORE the name rather than by parsing a declaration,
+    because a public header usually wraps it in an export macro -- expat writes
+    `XMLPARSEAPI(XML_Parser)` on the line above `XML_ParserCreate(...)` -- and no reasonable
+    regex for "a C declaration" survives that. Being loose here is safe: the candidate still has
+    to be named like a constructor, take only parameters we can supply, and link.
+    """
+    try:
+        txt = Path(header).read_text(errors="ignore")
+    except OSError:
+        return None
+    bare = htype.replace("*", "").strip()
+    for m in re.finditer(r"\b" + re.escape(bare) + r"\b([^;{}]{0,160}?)"
+                         r"([A-Za-z_]\w*)\s*\(([^;{}]*)\)\s*;", txt):
+        name, raw = m.group(2), m.group(3)
+        if name in exclude or name in _KEYWORDS or not words.search(name):
+            continue
+        params = [a.strip() for a in raw.split(",") if a.strip() and a.strip() != "void"]
+        # Every argument has to be one we can supply honestly. A pointer gets NULL, which is what
+        # an optional argument of this kind almost always means (expat: the encoding).
+        if any(a for a in params if _opaque_param(a) and "*" not in a):
+            continue
+        return (name, params)
+    return None
+
+
+def _find_taking_only(root, htype: str, words, exclude=()):
+    """The name of a function taking exactly one `htype`, named like a releaser, or None."""
+    bare = htype.replace("*", "").strip()
+    for p in sorted(Path(root).rglob("*")):
+        if not (p.is_file() and p.suffix in _SRC_EXT):
+            continue
+        try:
+            txt = p.read_text(errors="ignore")
+        except OSError:
+            continue
+        for m in _FN_DEF.finditer(txt):
+            name = m.group(1)
+            if name in exclude or not words.search(name):
+                continue
+            params = [a.strip() for a in (m.group(2) or "").split(",") if a.strip()]
+            if len(params) == 1 and bare and bare in params[0]:
+                return name
+    return None
+
+
+def _ctor_arg_values(params: list) -> list:
+    """Arguments for a CONSTRUCTOR. A pointer gets NULL and a scalar gets 0.
+
+    `_arg_values` exists for an opener and hands a pointer `(void*)"r"` -- a file MODE, which is
+    right for `TIFFOpen(path, "r")` and wrong here. Passing "r" as expat's encoding name made
+    `XML_ParserCreate` fail, so the harness returned at `if (!h)` on EVERY execution: a campaign
+    that runs forty thousand inputs and tests nothing. NULL is what an optional argument of this
+    kind means -- for expat, "use the encoding the document declares".
+    """
+    out = []
+    for a in params:
+        out.append("NULL" if "*" in a else "0")
+    return out
+
+
+def synth_handle_harness(triple: dict, *, cxx: bool = False) -> str:
+    """A harness that makes a handle, feeds the fuzz bytes through it, and frees it.
+
+    It INCLUDES the library's public header instead of forward-declaring: the handle type is
+    opaque, so there is nothing to forward-declare, and including the header is both what a real
+    harness does and what makes every prototype and typedef correct by construction.
+    """
+    hdr = Path(triple["header"]).name
+    h, ctor, consume, dtor = (triple["handle"], triple["ctor"], triple["consume"],
+                              triple.get("dtor"))
+    params, buf_at = triple["consume_params"], triple["buf_at"]
+    ctor_args = ", ".join(_ctor_arg_values(triple.get("ctor_params") or []))
+    # the call: handle, then the buffer and its length in the slots they occupy, then whatever
+    # trailing scalars the API takes. A trailing int is passed 1, not 0: in this shape it is
+    # almost always a "last chunk" / "finish now" flag (expat's `isFinal`), and 0 asks the
+    # library to wait for more data that a one-shot harness will never send.
+    args = ["h"]
+    i = 1
+    while i < len(params):
+        if i == buf_at:
+            args.append(f"({_handle_type(params[i])})data")
+            args.append("(int)size" if _LEN_PARAM.search(params[i + 1]) else "size")
+            i += 2
+            continue
+        args.append("1" if _LEN_PARAM.search(params[i]) else "0")
+        i += 1
+    fuzz_qual = 'extern "C" ' if cxx else ""
+    free_call = f"    {dtor}(h);\n" if dtor else ""
+    return ("#include <stdint.h>\n#include <stddef.h>\n#include <stdlib.h>\n"
+            f'#include "{hdr}"\n'
+            f"{fuzz_qual}int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {{\n"
+            f"    {h} h = {ctor}({ctor_args});\n"
+            "    if (!h) return 0;\n"
+            f"    {consume}({', '.join(args)});\n"
+            + free_call
+            + "    return 0;\n}\n")
 
 
 def synth_harness(fn: str, *, kind: str = "cstring", arg_type: str | None = None,
@@ -576,6 +801,37 @@ def _configure_if_needed(root, *, timeout: int = 300) -> bool:
         return False
 
 
+def config_defines(root) -> list:
+    """`-D` flags for the config headers this tree GENERATES, which autoconf would have supplied.
+
+    A configured autotools project compiles with `-DHAVE_CONFIG_H` (or a project-specific
+    spelling) and the sources are written to require it. We compile each translation unit
+    ourselves and never read the generated Makefile, so the define was missing -- and expat's
+    `xmlparse.c` does not merely lose a feature without it, it refuses to compile at all:
+
+        lib/xmlparse.c:83:2: error: memmove does not exist on this platform, nor is a
+                                    substitute available
+
+    That TU was then skipped like any other failing one, the link resolved `XML_ParserCreate`
+    from the SYSTEM libexpat via the undefined-symbol fallback, and the build reported ok. The
+    campaign ran twenty-one million executions against Debian's copy of the library instead of
+    the source tree it was pointed at, and nothing said so.
+
+    The mapping is the autoconf convention: `config.h` -> `HAVE_CONFIG_H`,
+    `expat_config.h` -> `HAVE_EXPAT_CONFIG_H`.
+    """
+    root = Path(root)
+    out = []
+    for tpl in sorted(root.rglob("*config.h.in"))[:20]:
+        gen = tpl.with_suffix("")                        # `expat_config.h.in` -> `expat_config.h`
+        if not gen.exists():
+            continue
+        flag = "-DHAVE_" + gen.name.replace(".h", "").upper() + "_H"
+        if flag not in out:
+            out.append(flag)
+    return out
+
+
 def known_harness(root):
     """(name, source) for a library this tree matches, or None.
 
@@ -597,7 +853,16 @@ def build_libfuzzer(root, out: Path, *, harness_fn: str | None = None,
     # PREFERENCE ORDER: the project's own harness (it knows its API best), then a known-library
     # harness that reaches the decode path, then a synthesized one that can only open the file.
     known = None if existing else known_harness(root)
+    # A CREATE -> CONSUME -> DESTROY triple, which is the dominant shape in a C library and the
+    # one the single-function pick cannot reach: it requires a pointer-spelled first parameter,
+    # and a handle type is a typedef (`XML_Parser`), so expat's real parser was excluded outright
+    # and the library was reachable only through a hand-written harness. Preferred over the
+    # single-function pick because threading the handle reaches the PARSER, where the pick's
+    # fallback reaches whatever function happened to take a buffer.
+    triple = None
     if not existing and not known and not harness_fn:
+        triple = find_handle_triple(root)
+    if not existing and not known and not harness_fn and not triple:
         harness_fn = pick_harness_fn(root)               # auto-harness a library's parser entry
     cxx = any(p.suffix in _CXX_EXT for p in _sources(root, exclude_main=False))
     cc = _clang(cxx)
@@ -619,10 +884,11 @@ def build_libfuzzer(root, out: Path, *, harness_fn: str | None = None,
     # the build -- so in-process fuzzing was unavailable on a project merely for having a contrib
     # directory. The entry point's own directory IS the library by construction: it is where the
     # function we are about to call is defined.
-    if (harness_fn or known) and not existing:
+    if (harness_fn or known or triple) and not existing:
         # For a known harness, scope by the OPEN symbol it is built around: the directory that
         # defines the library's entry point is the library.
-        anchor_fn = harness_fn or _KNOWN_HARNESSES[known[0]]["symbols"][0]
+        anchor_fn = (harness_fn or (triple or {}).get("consume")
+                     or _KNOWN_HARNESSES[known[0]]["symbols"][0])
         home = fn_def_file(root, anchor_fn)
         if home is not None and home.parent != root:
             lib_srcs = [x for x in srcs if home.parent in x.parents or x.parent == home.parent]
@@ -637,6 +903,13 @@ def build_libfuzzer(root, out: Path, *, harness_fn: str | None = None,
         h.write_text(src_text)
         srcs = srcs + [h]
         harness_desc = f"known-library harness for {name} (reaches the decode path)"
+    elif triple:
+        h = tmp / ("harness.cc" if cxx else "harness.c")
+        h.write_text(synth_handle_harness(triple, cxx=cxx))
+        srcs = srcs + [h]
+        harness_desc = (f"synthesized handle harness: {triple['ctor']}() -> "
+                        f"{triple['consume']}() -> {triple.get('dtor') or '(no free)'}"
+                        f" [reaches the parser through the library's own API]")
     elif harness_fn:
         h = tmp / ("harness.cc" if cxx else "harness.c")
         # match the target function's real signature and linkage so a C++ symbol (mangled) or a C
@@ -661,7 +934,9 @@ def build_libfuzzer(root, out: Path, *, harness_fn: str | None = None,
     else:
         return {"ok": False, "binary": None, "harness": None,
                 "log": "no LLVMFuzzerTestOneInput in the source and no harness_fn to synthesize one"}
-    incs = []
+    # What a configured autotools build would have on its command line. Without it expat's
+    # xmlparse.c does not compile at all (see `config_defines`).
+    incs = list(config_defines(root))
     for d in include_dirs(root):
         incs += ["-I", str(d)]
     # The harness is REQUIRED: skipping a translation unit is right for a platform shim or a test,
@@ -721,6 +996,7 @@ def _compile_and_link(srcs, incs, out: Path, tmp: Path, timeout: int, *, require
         i = failed_paths.index(Path(required))
         return {"ok": False, "binary": None,
                 "log": ("the HARNESS did not compile:\n" + failed[i])[-4000:]}
+    skipped_srcs = list(failed_paths)
     if failed:
         logs.append(f"{len(failed)}/{len(srcs)} translation units skipped (did not compile)")
         logs += failed[:5]
@@ -742,6 +1018,23 @@ def _compile_and_link(srcs, incs, out: Path, tmp: Path, timeout: int, *, require
         # translation unit compiled. Read the undefined symbols and ask for the libraries that
         # define them, then retry ONCE. Linking a library nothing needs is harmless; guessing
         # from the project's configure output is not available here, and the symbols are.
+        # THE TARGET'S OWN SYMBOLS MAY NOT COME FROM A SYSTEM LIBRARY. The fallback below exists
+        # for a project's external dependencies (libtiff needs zlib for its Deflate codec), and
+        # it happily resolved the library UNDER TEST as well: expat's `xmlparse.c` failed to
+        # compile for want of a config define, was skipped like any other failing unit, and
+        # `XML_ParserCreate` was then satisfied by `-lexpat`. The build reported ok and the
+        # campaign ran twenty-one million executions against Debian's uninstrumented copy of
+        # expat instead of the tree it was pointed at. A fuzzer that is not fuzzing the target
+        # has to fail loudly; a quiet success here is worse than no build at all.
+        _own = symbols_defined_in(skipped_srcs)
+        _borrowed = sorted(set(_UNDEF_RE.findall(err or "")) & _own)
+        if _borrowed:
+            return {"ok": False, "binary": None, "log": ("\n".join(logs) + "\n" + (
+                "refusing to link: " + ", ".join(_borrowed[:6]) + " is defined by this project's "
+                "own source, in a translation unit that did not compile. Resolving it from a "
+                "system library would fuzz the installed copy instead of this tree. Fix the "
+                "skipped unit (its error is above) -- the usual cause is a generated config "
+                "header or a missing -D."))[-4000:]}
         libs = _libs_for_undefined(err)
         if libs:
             retry = [drv] + _SAN + [str(o) for o in objs] + libs + ["-o", str(out)]
@@ -775,6 +1068,25 @@ _SYM_LIBS = (
     (re.compile(r"^(sin|cos|tan|pow|log|exp|floor|ceil|sqrt|fabs|atan2?|round)$"), "-lm"),
 )
 _UNDEF_RE = re.compile(r"undefined (?:reference to|symbol:?) [`'\"]?([A-Za-z_][\w]*)")
+
+
+def symbols_defined_in(srcs) -> set:
+    """The function names DEFINED by these translation units, by their definitions in the text.
+
+    Used to answer one question before borrowing a system library: is this undefined symbol one
+    of the TARGET's own? If it is, a `-l` flag does not fix the build -- it replaces the thing
+    under test with the distribution's copy, uninstrumented, and the campaign then measures
+    nothing while reporting millions of executions.
+    """
+    names: set = set()
+    for src in srcs or ():
+        try:
+            txt = Path(src).read_text(errors="ignore")
+        except OSError:
+            continue
+        for m in _FN_DEF.finditer(txt):
+            names.add(m.group(1))
+    return names
 
 
 def _libs_for_undefined(log: str) -> list:
