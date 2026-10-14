@@ -444,3 +444,24 @@ def test_the_card_says_which_capabilities_were_never_scheduled():
     assert "link_case" in orchestrate._NOT_PER_TARGET
     assert "whole_system" in orchestrate._NOT_PER_TARGET
     assert "fuzz" not in orchestrate._NOT_PER_TARGET, "fuzz is per-target work"
+
+
+def test_the_rate_is_divided_by_the_stages_that_actually_executed():
+    """A fabricated rate is worse than no rate.
+
+    The divisor was a fixed list of stage names that does not contain `libfuzzer`, so on a target
+    whose executions all came from in-process fuzzing it fell back to its 1e-3 floor and the card
+    reported **23,642,000.0/s** for 23,642 executions. That is the one field a reader uses to
+    judge whether a campaign was real, and nothing else in the card contradicted it.
+
+    Execution counts are keyed by EVENT prefix and timings by STAGE name, which is why this needs
+    a resolver rather than a dict lookup: `directed` is `directed_fuzz`.
+    """
+    from lykos.analyze.orchestrate import _engine_seconds
+    by_stage = {"fuzz": 162.9, "directed_fuzz": 126.1, "libfuzzer": 180.0, "disassemble": 78.2}
+    assert _engine_seconds(by_stage, ["libfuzzer"]) == 180.0
+    assert _engine_seconds(by_stage, ["directed"]) == 126.1, "event prefix must resolve to a stage"
+    assert _engine_seconds(by_stage, ["fuzz", "directed", "libfuzzer"]) == 469.0
+    # a stage that contributed nothing must not be counted, and an unknown engine adds no time
+    assert _engine_seconds(by_stage, ["nosuch"]) == 0.0
+    assert "disassemble" not in ("fuzz", "directed", "libfuzzer")

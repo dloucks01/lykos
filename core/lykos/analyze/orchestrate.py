@@ -824,6 +824,25 @@ _NOT_PER_TARGET = frozenset({"link_case", "ipc_model", "cross_taint", "whole_sys
                              "ingest_triage"})
 
 
+def _engine_seconds(by_stage: dict, engines) -> float:
+    """Elapsed seconds of the stages that reported executions, for an honest rate.
+
+    Execution counts are keyed by the EVENT prefix (`fuzz`, `directed`, `libfuzzer`) and the
+    budget's timings by STAGE name (`fuzz`, `directed_fuzz`, `libfuzzer`), so the two have to be
+    reconciled rather than assumed equal.
+    """
+    total = 0.0
+    for eng in engines:
+        stage = _EVENT_STAGE.get(eng, eng)
+        if stage in by_stage:
+            total += float(by_stage[stage] or 0.0)
+            continue
+        cand = next((k for k in by_stage if k == eng or k.startswith(eng + "_")), None)
+        if cand:
+            total += float(by_stage[cand] or 0.0)
+    return total
+
+
 def _declines_from_events(events) -> dict:
     """{stage: why} for every stage that RAN and said it could not apply to this target.
 
@@ -892,8 +911,15 @@ def _scorecard(store, target, bud, status) -> dict:
     card["executions"] = {"total": execs, "by_engine": by_stage}
 
     spent = bud.spent()
-    search = max(1e-3, sum(v for k, v in spent["by_stage"].items() if k in _EXEC_BOUNDED))
-    card["executions"]["per_second"] = round(execs / search, 1) if execs else 0.0
+    # Divide by the time the stages that ACTUALLY reported executions spent, not by a fixed list.
+    # `_EXEC_BOUNDED` does not contain `libfuzzer`, so on a target whose executions all came from
+    # in-process fuzzing the divisor fell back to its 1e-3 floor and the card reported
+    # **23,642,000.0/s**. A fabricated number in a report is worse than no number: it is the one
+    # field a reader uses to judge whether a campaign was real, and nothing else in the card
+    # contradicted it. When the contributing stages cannot be timed, say nothing.
+    secs = _engine_seconds(spent["by_stage"], by_stage.keys())
+    card["executions"]["per_second"] = (round(execs / secs, 1)
+                                        if (execs and secs >= 1.0) else None)
     card["budget"] = spent
 
     plan = status.get("plan") or []
