@@ -88,3 +88,40 @@ def test_the_params_free_stages_really_take_no_required_params():
     # library. "Requires no params" and "wants no params" are different questions.
     for stage in ("libfuzzer", "fuzz", "coverage_fuzz", "concolic"):
         assert stage not in _NO_PARAMS, stage
+
+
+def test_every_stage_the_pass_calls_is_in_the_enqueue_map():
+    """The mirror of the test above, and the one that was missing. `_run_target_stage` looks the
+    stage up in `_TARGET`, and a KeyError there is swallowed by its own `except Exception`: the
+    plan gets an "error" entry, an `autopilot.stage_error` event is appended, and the run
+    continues. So calling a stage that is not in the map does not crash -- it silently does
+    nothing and adds an error to the report.
+
+    Measured: a call to `ingest_triage` was added to the pass for targets the ingest path never
+    triaged, and nothing failed anywhere. It simply never triaged them, and recorded an errored
+    stage for the trouble."""
+    import re
+    src = pathlib.Path(analyze_pkg.__path__[0], "orchestrate.py").read_text()
+    body = src.split("def run_case_autopilot", 1)[1]
+    called = set(re.findall(r'_staged\(bud, store, t, "([a-z_]+)"', body))
+    assert called, "no _staged calls found -- the regex no longer matches the call site"
+    missing = sorted(called - set(_TARGET))
+    assert not missing, f"the pass calls stages that are not in _TARGET: {missing}"
+
+
+def test_a_params_free_stage_is_not_handed_params_it_cannot_take():
+    """`_run_target_stage` calls `fn(q, target, params=...)` unless the stage is in `_NO_PARAMS`.
+    An enqueue helper without a `params` keyword -- `enqueue_triage` has only `force` -- raises
+    TypeError there, which is swallowed the same way."""
+    import inspect
+
+    from lykos.analyze.orchestrate import _NO_PARAMS, _enqueue_fn
+    for stage, ref in _TARGET.items():
+        try:
+            fn = _enqueue_fn(ref)
+        except Exception:                 # noqa: BLE001 -- an optional dep, not our concern
+            continue
+        takes = "params" in inspect.signature(fn).parameters
+        if not takes:
+            assert stage in _NO_PARAMS, (
+                f"{stage}'s enqueue helper takes no `params`, so it must be in _NO_PARAMS")

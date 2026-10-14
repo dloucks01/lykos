@@ -32,6 +32,10 @@ from . import substrate
 
 # stage -> (module, enqueue-fn). Target-scoped unless listed in _CASE.
 _TARGET = {
+    # Normally run by the ingest path, before any autopilot exists for the case. It is here
+    # because the executables a source project ALSO builds are registered by `ingest` and
+    # nothing triages them -- so the pass has to. See the call site.
+    "ingest_triage": ("..analyze.ingest", "enqueue_triage"),
     # The FLOOR: one execution, before any analysis. See the call site for why it was missing.
     "dynamic_run": ("..analyze.dynamic", "enqueue_dynamic"),
     "disassemble": ("..analyze.disassemble", "enqueue_disassemble"),
@@ -88,7 +92,9 @@ _CASE = {
 # Stages whose enqueue-fn takes NO params. root_cause/build_poc/poc_primitive are NOT here: they
 # require params["input_sha"] (the crashing input), which the prove loop threads in -- listing
 # them dropped that input and every one failed with "requires params.input_sha".
-_NO_PARAMS = {"disassemble", "detect_cwe", "heap_trace", "oob_index", "chain_primitive",
+_NO_PARAMS = {# `enqueue_triage` takes no params at all, only `force`.
+              "ingest_triage",
+              "disassemble", "detect_cwe", "heap_trace", "oob_index", "chain_primitive",
               "synthesize_poc", "firmware_carve", "source_cve_scan", "embedded_audit",
               "int_overflow_scan", "uaf_scan", "source_sink_scan", "net_fuzz", "env_fuzz",
               "cve_corroborate", "cve_poc",
