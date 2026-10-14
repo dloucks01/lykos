@@ -10,7 +10,7 @@ from ..dynamic import sandbox
 from ..dynamic.stage import crash_dedup_key, crash_finding_candidate, crash_hijack
 from ..fuzz.runner import place
 from . import bundle
-from .capture import MODES, env_var_from_argv, how_to_feed
+from .capture import MODES, env_var_from_argv, how_to_feed, libfuzzer_harness
 
 BUILD_POC_STAGE = "build_poc"
 TOOL = "poc"
@@ -50,17 +50,6 @@ def _dyn_isolation(conn, target, input_sha):
     return None
 
 
-def _harness_sha(ctx, target, prefix: str):
-    """The stored libFuzzer harness whose sha starts with `prefix` (or any, for this target)."""
-    from ...db.dao import ArtifactDAO
-    arts = [a for a in ArtifactDAO(ctx.conn).list_by_case(target.case_id)
-            if a.kind == "libfuzzer-harness"]
-    for a in arts:
-        if prefix and a.sha256.startswith(prefix):
-            return a.sha256
-    return arts[-1].sha256 if arts and not prefix else None
-
-
 def build_poc_stage(ctx) -> dict:
     target = TargetDAO(ctx.conn).get(ctx.target_id) if ctx.target_id else None
     if target is None:
@@ -84,18 +73,15 @@ def build_poc_stage(ctx) -> dict:
     # a tool that never calls it, so a genuine memory-corruption finding would be filed as an
     # unverified L0 -- the same mistake prompted delivery made, in a new place. The run that found
     # it recorded the harness in its isolation tag, so this reads the record.
-    _iso = _dyn_isolation(ctx.conn, target, input_sha) or ""
-    if _iso.startswith("libfuzzer"):
-        h_sha = _iso.split("/", 1)[1] if "/" in _iso else ""
-        h_full = _harness_sha(ctx, target, h_sha)
-        if h_full:
-            exe = ctx.scratch() / "harness.bin"
-            exe.write_bytes(ctx.content.get_bytes(h_full))
-            os.chmod(exe, 0o755)
-            target_bytes = exe.read_bytes()              # the bundle must ship the HARNESS
-            mode, argv = "file", ["@@"]
-            mode_why = ("replayed against the libFuzzer harness the crash was found in "
-                        "(the ingested binary need not call the vulnerable path)")
+    _harness = libfuzzer_harness(ctx, target, input_sha)
+    if _harness:
+        exe = ctx.scratch() / "harness.bin"
+        exe.write_bytes(_harness)
+        os.chmod(exe, 0o755)
+        target_bytes = _harness                          # the bundle must ship the HARNESS
+        mode, argv = "file", ["@@"]
+        mode_why = ("replayed against the libFuzzer harness the crash was found in "
+                    "(the ingested binary need not call the vulnerable path)")
 
     def _delivery(m):
         """(argv, stdin, env_overrides) for one delivery channel."""

@@ -20,7 +20,7 @@ from lykos.analyze.dynamic import sandbox
 from lykos.analyze.ingest import ingest
 from lykos.analyze.poc import enqueue_primitive
 from lykos.analyze.poc import primitive as P
-from lykos.db.dao import ArtifactDAO, FindingDAO, PocDAO
+from lykos.db.dao import ArtifactDAO, DynResultDAO, FindingDAO, PocDAO
 from lykos.jobs import JobConfig, JobQueue, WorkerPool
 
 # A real clang 21 report, kept verbatim. The wording of the region line changed across releases
@@ -194,3 +194,73 @@ def test_a_controlled_oob_read_becomes_an_l2_primitive_end_to_end(store, case, p
                         check=False)
     assert rc.returncode == 134, (rc.returncode, rc.stdout[-400:], rc.stderr[-400:])
     assert b"heap-buffer-overflow" in rc.stderr, "the shipped reproducer lost the report"
+
+
+#: A libFuzzer harness takes its input as a FILE PATH in argv, which is what the in-process
+#: fuzzer hands it and what the replay has to reproduce.
+_OOB_READ_FILE = """#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+int sink;
+int main(int argc, char **argv){
+    unsigned char hdr[4];
+    FILE *f = argc > 1 ? fopen(argv[1], "rb") : NULL;
+    if (!f || fread(hdr, 1, 4, f) != 4) return 0;
+    char *p = malloc(20);
+    memset(p, 'A', 20);
+    sink = p[20 + (hdr[0] & 7)];
+    printf("%d\\n", sink);
+    return 0;
+}
+"""
+#: The ingested binary, which does NOT contain the defect. A library's shipped tool often does
+#: not call the vulnerable path at all -- that is the whole reason a harness is built.
+_BENIGN = """int main(int argc, char **argv){ (void)argc; (void)argv; return 0; }
+"""
+
+
+@pytest.mark.skipif(sandbox.host_arch() != "x86-64", reason="native sanitizer build")
+def test_a_libfuzzer_crash_is_detonated_against_the_harness(store, case, pool, tmp_path):
+    """`build_poc` replayed a libFuzzer crash against the harness it was found in;
+    `poc_primitive` staged the INGESTED binary instead. So it detonated a tool that never calls
+    the vulnerable path, nothing faulted, and the stage reported "no L2 primitive" for a defect
+    it had simply never reached -- the one real memory-safety finding in the corpus could get to
+    L1 and no further. One finding cannot sit at L1 because two stages disagree about what the
+    target is.
+
+    The test makes that disagreement fatal: the ingested binary here CANNOT crash, so an L2 is
+    only reachable by detonating the recorded harness.
+    """
+    import shutil
+    clang = shutil.which("clang")
+    if not clang:
+        pytest.skip("no clang for a sanitizer build")
+    hc = tmp_path / "h.c"; hc.write_text(_OOB_READ_FILE)
+    harness = tmp_path / "harness"
+    bc = tmp_path / "b.c"; bc.write_text(_BENIGN)
+    benign = tmp_path / "benign"
+    if subprocess.run([clang, "-g", "-O0", "-fsanitize=address", str(hc), "-o", str(harness)],
+                      capture_output=True, check=False).returncode or \
+       subprocess.run([clang, "-O0", str(bc), "-o", str(benign)],
+                      capture_output=True, check=False).returncode:
+        pytest.skip("build failed")
+
+    target = ingest(store, case.id, benign)              # the harmless tool is what we ingested
+    h_sha, _, _ = store.content.put_bytes(harness.read_bytes())
+    ArtifactDAO(store.conn).register(h_sha, case.id, "libfuzzer-harness", "harness.bin")
+    sha, _, _ = store.content.put_bytes(b"\x05BBB")
+    DynResultDAO(store.conn).insert(target.id, case.id, input_sha=sha, input_mode="file",
+                                    crashed=True, signal_name="heap-buffer-overflow",
+                                    isolation=f"libfuzzer/{h_sha[:12]}")
+    store.conn.commit()
+
+    q = JobQueue(store.conn)
+    run = enqueue_primitive(q, target, params={"input_sha": sha, "input_mode": "file",
+                                               "timeout": 10})
+    assert pool.wait_idle(240)
+    rec = q.runs.get(run.id)
+    if rec.status != "done":
+        pytest.skip("ptrace unavailable in this environment: " + str(rec.error))
+    l2 = [p for p in PocDAO(store.conn).list_by_target(target.id)
+          if p.level == "L2" and p.verified]
+    assert l2, "the crash was not detonated against the harness it was found in"

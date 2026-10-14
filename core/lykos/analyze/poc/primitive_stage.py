@@ -40,6 +40,7 @@ from .capture import (
     MODES,
     env_var_from_argv,
     how_to_feed,
+    libfuzzer_harness,
     make_capture,
     make_qemu_capture,
     materialize_helper,
@@ -281,6 +282,23 @@ def primitive_stage(ctx) -> dict:
     exe = ctx.scratch() / "target.bin"
     ctx.content.stage_target(target, exe.parent, exe.name)
     exe.chmod(0o755)
+
+    # Detonate the binary that ACTUALLY crashed. `build_poc` already replays a libFuzzer crash
+    # against the harness it was found in; this stage did not, so it detonated a tool that never
+    # calls the vulnerable path, the cyclic pattern did not fault, and the stage reported "no L2
+    # primitive" for a defect it had simply never reached. One finding cannot be at L1 because
+    # two stages disagree about what the target is.
+    _harness = libfuzzer_harness(ctx, target, input_sha)
+    if _harness:
+        exe = ctx.scratch() / "harness.bin"
+        exe.write_bytes(_harness)
+        exe.chmod(0o755)
+        target_bytes = _harness                          # the bundle must ship the HARNESS
+        mode, base_argv = "file", ["@@"]
+        mode_why = ("detonated against the libFuzzer harness the crash was found in "
+                    "(the ingested binary need not call the vulnerable path)")
+        ctx.emit("primitive.harness", payload={"bytes": len(_harness), "mode": mode,
+                                               "why": mode_why})
 
     # Static RE corroboration: recovered stack-buffer sizes predict IP-control offsets.
     word = 8 if (target.bits or 64) >= 64 else 4

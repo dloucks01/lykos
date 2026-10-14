@@ -122,6 +122,37 @@ MODES = ("stdin", "file", "arg")
 _ENV_PLACEHOLDER = "=@@"
 
 
+def libfuzzer_harness(ctx, target, input_sha):
+    """The stored libFuzzer harness the crash at `input_sha` was found in, or None.
+
+    A libFuzzer crash is a crash of the HARNESS, which is a different binary from the one that
+    was ingested. Replaying the input against the ingested binary is not a weaker test, it is the
+    wrong one: a heap overflow reached through `TIFFReadRGBAImage` does not reproduce under a
+    tool that never calls it. The run that found it recorded the harness in its isolation tag, so
+    this reads the record rather than guessing.
+
+    Lives here, beside `how_to_feed`, because it answers the same question that one does -- what
+    actually consumes this input -- and two stages have to agree on the answer. They did not:
+    `build_poc` staged the harness and `poc_primitive` staged the ingested binary, so the one
+    real memory-safety finding in the corpus could reach L1 and never L2.
+    """
+    from ...db.dao import ArtifactDAO, DynResultDAO
+    iso = ""
+    for r in DynResultDAO(ctx.conn).list_by_target(target.id):
+        if r.input_sha == input_sha and r.isolation:
+            iso = r.isolation
+            break
+    if not iso.startswith("libfuzzer"):
+        return None
+    prefix = iso.split("/", 1)[1] if "/" in iso else ""
+    arts = [a for a in ArtifactDAO(ctx.conn).list_by_case(target.case_id)
+            if a.kind == "libfuzzer-harness"]
+    sha = next((a.sha256 for a in arts if prefix and a.sha256.startswith(prefix)), None)
+    if sha is None and arts and not prefix:
+        sha = arts[-1].sha256
+    return ctx.content.get_bytes(sha) if sha else None
+
+
 def env_var_from_argv(argv):
     """(var_name, remaining_argv) for an env-delivered crash, or (None, argv) when there is none."""
     for i, a in enumerate(list(argv or [])):
