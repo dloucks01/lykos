@@ -156,6 +156,26 @@ _BUDGET_GRACE_S = 10.0
 #: full `heartbeat_interval`. See the handler for the measurement behind it.
 _RETRY_BEAT_S = 1.0
 
+#: Recorded on a run the budget cut off, so a reader can tell it from a hang.
+_SLICE_NOTE = "the budget slice ended while the stage was still working"
+#: How much of its slice a stage must have used for the cut-off to be the SLICE's doing rather
+#: than something else. A stage killed at a fifth of its slice did not run out of time.
+_SLICE_USED = 0.8
+
+
+def _slice_expired(run, started: float) -> bool:
+    """Did this run stop because the budget slice it was given ran out?
+
+    True only when a slice was given AND the stage actually used (nearly) all of it. Without the
+    second half, any StageTimeout on a budgeted run would be excused, including a genuine hang in
+    a stage whose slice happened to be generous.
+    """
+    try:
+        want = float((run.params or {}).get("max_seconds") or 0)
+    except (TypeError, ValueError):
+        return False
+    return want > 0 and (time.time() - started) >= want * _SLICE_USED
+
 
 def _beat_wait(cfg, *, failed: bool) -> float:
     """How long to wait before the next heartbeat attempt.
@@ -300,6 +320,7 @@ class WorkerPool:
         ctx = JobContext(q.conn, self.content, run, deadline=deadline, on_event=self.on_event)
         hb = _Heartbeat(self.db_path, run_id, wid, self.cfg, deadline=deadline)
         hb.start()
+        started = time.time()
         try:
             result = sd.fn(ctx)
             ctx.check_cancel()  # honor cancel/timeout requested during the stage
@@ -314,8 +335,26 @@ class WorkerPool:
             q.set_cancelled(run_id)
             self._bump("cancelled")
         except StageTimeout:
-            q.fail(run_id, "timeout", retryable=False, worker_id=wid)
-            self._bump("timeout")
+            # A campaign that runs out of its BUDGET SLICE has not failed -- it did as much work
+            # as the run could afford, which is a decision the orchestrator made, not an error in
+            # the stage. Both arrive here as StageTimeout, so they are told apart by whether a
+            # slice was in play at all: `max_seconds` is set exactly when a caller divided a
+            # budget (see `_run_timeout`).
+            #
+            # Measured on the libtiff tarball and on `zigzag`: `directed_fuzz` ended in `timeout`
+            # three times at 40s/32s/25s against slices of 41.7s/49.8s/23.3s -- it was cut off at
+            # the end of its own slice, every time, and each one was recorded as a stage error.
+            # "An error is never an acceptable outcome for a capability; a decline is" is the rule
+            # the gate holds us to, and these rows failed on it while nothing was wrong.
+            #
+            # A stage with NO slice that hits its registered ceiling is a different thing: that
+            # one really is a hang, and it still fails.
+            if _slice_expired(run, started):
+                q.set_cancelled(run_id, note=_SLICE_NOTE)
+                self._bump("slice_ended")
+            else:
+                q.fail(run_id, "timeout", retryable=False, worker_id=wid)
+                self._bump("timeout")
         except Exception as e:  # crashing stage: fail the job, keep the worker alive
             q.fail(run_id, repr(e), worker_id=wid)
             self._bump("error")

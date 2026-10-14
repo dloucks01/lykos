@@ -288,16 +288,21 @@ class JobQueue:
             self._rollback(mark); raise
         return result
 
-    def set_cancelled(self, run_id: str) -> bool:
+    def set_cancelled(self, run_id: str, note: Optional[str] = None) -> bool:
+        """Mark a running job cancelled. `note` records WHY in the row's error column -- a run
+        the budget cut off and a run a user stopped are both cancellations, and a reader of the
+        case store should not have to guess which."""
         mark = len(self._pending)
         self._begin_immediate()
         try:
             run = self.runs.get(run_id)
             if not run or run.status != "running":
                 self._rollback(mark); return False
-            self.conn.execute("UPDATE analysis_run SET status='cancelled', ended_at=? WHERE id=?",
-                              (_now(), run_id))
-            self._emit("job.cancelled", run_id=run_id, case_id=run.case_id)
+            self.conn.execute(
+                "UPDATE analysis_run SET status='cancelled', ended_at=?, error=COALESCE(?, error) "
+                "WHERE id=?", (_now(), note, run_id))
+            self._emit("job.cancelled", run_id=run_id, case_id=run.case_id,
+                       payload={"note": note} if note else None)
             self._commit()
         except Exception:
             self._rollback(mark); raise

@@ -70,3 +70,46 @@ def test_the_heartbeat_keeps_trying_through_a_failing_database(tmp_path, monkeyp
     assert len(attempts) > 10, (
         f"only {len(attempts)} attempts in 0.9s -- a failing beat still costs a full interval")
     assert threading.active_count() >= 1
+
+
+# ---------------------------------------------------------------- a slice is not a failure
+def test_a_campaign_cut_off_by_its_budget_slice_is_not_an_error():
+    """Measured on the libtiff tarball and on `zigzag`: `directed_fuzz` ended in `timeout` three
+    times at 40s/32s/25s against slices of 41.7s/49.8s/23.3s. It was cut off at the end of its
+    own slice every time, and every one was recorded as a stage ERROR -- which failed the gate's
+    rule that an error is never an acceptable outcome for a capability, while nothing was wrong.
+
+    A stage with NO slice that hits its registered ceiling is a different thing: that one really
+    is a hang, and it must still fail."""
+    import time as _t
+
+    from lykos.jobs.worker import _slice_expired
+
+    class _R:
+        def __init__(self, ms):
+            self.params = {"max_seconds": ms} if ms else {}
+
+    now = _t.time()
+    assert _slice_expired(_R(40), now - 38), "a campaign that used its whole slice reads as failed"
+    assert not _slice_expired(_R(40), now - 5), "a hang five seconds into a 40s slice is excused"
+    assert not _slice_expired(_R(None), now - 3600), "no slice was given: this is the real hang"
+    assert not _slice_expired(_R("junk"), now - 10)
+
+
+def test_the_worker_records_the_reason_it_stopped(tmp_path):
+    """End to end through the queue: a cancelled row has to say WHY, or a reader of the case
+    store cannot tell a budget cut-off from a user's stop."""
+    from lykos.casestore import CaseStore
+    from lykos.jobs import JobQueue
+    store = CaseStore.open(tmp_path / "case")
+    case = store.cases.create("x")
+    q = JobQueue(store.conn)
+    run = q.enqueue(case.id, "detect_cwe", tool="t", tool_version="1")
+    claimed = q.claim("w-1", ["quick"], 60)
+    assert claimed == run.id, (claimed, run.id)
+    from lykos.jobs.worker import _SLICE_NOTE
+    assert q.set_cancelled(run.id, note=_SLICE_NOTE)
+    row = q.runs.get(run.id)
+    assert row.status == "cancelled"
+    assert row.error == _SLICE_NOTE, (row.status, row.error)
+    store.close()
