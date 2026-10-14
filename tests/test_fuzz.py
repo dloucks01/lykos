@@ -520,3 +520,96 @@ def test_env_channel_self_gates_on_no_getenv(store, case, pool, gcc, tmp_path):
     env_crashes = [d for d in DynResultDAO(store.conn).list_by_target(target.id)
                    if d.crashed and d.input_mode == "env"]
     assert not env_crashes, "env channel fired on a target that reads no environment variable"
+
+
+# ------------------------------------------------- distillation is an optimiser, not a campaign
+def test_distillation_stops_when_its_time_is_up():
+    """Measured on zlib's ASan `example` binary: a 169-input corpus with 12,584 blocks armed took
+    150 seconds to trace -- five to twelve times the whole campaign slice the caller had
+    (34.2s/12.0s/12.0s) -- and the campaign that distillation exists to SPEED UP then executed
+    the target zero times and reported `starved: True`.
+
+    `cap` could not prevent it: a count bound is not a time bound when one item costs a second.
+    This is the same lesson as the leak sweep, in a new place."""
+    import time
+
+    from lykos.analyze.fuzz import distill as D
+
+    traced = []
+
+    class _FakeRes:
+        def __init__(self, blocks):
+            self.blocks_hit, self.crashed = blocks, False
+
+    import lykos.analyze.dynamic.sandbox as SB
+    real = SB.run_batch
+    try:
+        def fake_run_batch(exe, datas, **kw):
+            traced.append(datas[0])
+            time.sleep(0.02)                             # each trace costs real time
+            return [_FakeRes([0x1000 + len(traced)])]
+        SB.run_batch = fake_run_batch
+        inputs = [bytes([i]) * 4 for i in range(100)]
+        out = D.block_coverage("x", inputs, blocks=(0x1000,), deadline=time.time() + 0.2)
+    finally:
+        SB.run_batch = real
+    assert len(out) == len(inputs), "the result must stay aligned with the corpus"
+    assert 0 < len(traced) < len(inputs), f"traced {len(traced)} of {len(inputs)}"
+    # everything past the deadline comes back UNMEASURED, and distill keeps an unmeasured input
+    assert out[-1] == set()
+    kept = D.distill(inputs, out)["kept"]
+    assert len(kept) >= len(inputs) - len(traced), "an unmeasured input was dropped as redundant"
+
+
+def test_distillation_stops_asking_a_tracer_that_reports_nothing():
+    """`directed.coverage_unavailable`: "blocks were recovered and armed but the runner reported
+    no coverage for any input (ptrace may be unavailable in this sandbox)". The stage discovered
+    that AFTER tracing all 169 seeds. Eight probes are enough to know."""
+    from lykos.analyze.fuzz import distill as D
+
+    traced = []
+
+    class _Empty:
+        blocks_hit, crashed = (), False
+
+    import lykos.analyze.dynamic.sandbox as SB
+    real = SB.run_batch
+    try:
+        def fake_run_batch(exe, datas, **kw):
+            traced.append(datas[0])
+            return [_Empty()]
+        SB.run_batch = fake_run_batch
+        inputs = [bytes([i]) * 4 for i in range(80)]
+        out = D.block_coverage("x", inputs, blocks=(0x1000,))
+    finally:
+        SB.run_batch = real
+    assert len(traced) <= D._SILENT_TRACER_PROBES, \
+        f"asked a silent tracer {len(traced)} times"
+    assert all(c == set() for c in out)
+    # and nothing is dropped on that evidence
+    assert len(D.distill(inputs, out)["kept"]) == len(inputs)
+
+
+def test_a_working_tracer_is_not_cut_short():
+    """The bail must not fire on a target where tracing works -- that would silently stop
+    minsetting everywhere."""
+    from lykos.analyze.fuzz import distill as D
+
+    class _Res:
+        def __init__(self, b):
+            self.blocks_hit, self.crashed = b, False
+
+    import lykos.analyze.dynamic.sandbox as SB
+    real = SB.run_batch
+    n = []
+    try:
+        def fake_run_batch(exe, datas, **kw):
+            n.append(1)
+            return [_Res([0x1000 + len(n)])]
+        SB.run_batch = fake_run_batch
+        inputs = [bytes([i]) * 4 for i in range(40)]
+        out = D.block_coverage("x", inputs, blocks=(0x1000,))
+    finally:
+        SB.run_batch = real
+    assert len(n) == len(inputs), "a working tracer was cut short"
+    assert all(c for c in out)

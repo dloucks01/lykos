@@ -58,6 +58,11 @@ def _mine_dictionary(strings):
 # How many inputs the corpus may retain, and how big one may be. A blind campaign that keeps
 # everything spends its budget re-running near-duplicates of one enormous input.
 _MAX_CORPUS = 256
+#: The share of a campaign's own slice that may be spent preparing its seed corpus, and a floor
+#: so a very tight slice can still minset a handful of seeds. See the call site for the
+#: measurement: unbounded, distillation consumed five to twelve times the whole slice.
+_DISTILL_SHARE = 0.2
+_DISTILL_FLOOR_S = 5.0
 # Corpus distillation (afl-cmin-style): only bother minsetting a seed set bigger than this, and
 # trace at most this many seeds for the up-front coverage measurement.
 _DISTILL_MIN = 12
@@ -721,10 +726,17 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
     if all_blocks and len(corpus) > _DISTILL_MIN and runner_takes_blocks:
         try:
             from . import distill as _distill
+            # Bounded by TIME as well as by count. Distillation is an optimiser for the
+            # campaign, so spending more than a fraction of the campaign's own slice on it is
+            # self-defeating: on zlib's ASan `example` it took 150s of a 12-34s slice and the
+            # campaign it was preparing then executed the target ZERO times. `cap` could not
+            # prevent that -- a count bound is not a time bound when one item costs a second.
+            _dl = time.time() + max(_DISTILL_FLOOR_S, max_seconds * _DISTILL_SHARE)
             _d = _distill.distill_corpus(exe, corpus, all_blocks, mode=mode, base_argv=base_argv,
                                          timeout=exec_timeout, arch=target.arch,
                                          endianness=getattr(target, "endianness", None),
-                                         bits=getattr(target, "bits", None), cap=_DISTILL_CAP)
+                                         bits=getattr(target, "bits", None), cap=_DISTILL_CAP,
+                                         deadline=_dl)
             if _d["dropped"] > 0:
                 corpus = _d["kept"]
                 ctx.emit(f"{event_prefix}.distill", payload=_d["stats"])

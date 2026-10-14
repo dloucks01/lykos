@@ -21,7 +21,15 @@ own coverage ratchet grows it from there.
 """
 from __future__ import annotations
 
+import time
 from typing import Callable, Iterable, Optional
+
+#: How many inputs may come back with EMPTY coverage before we conclude the tracer is reporting
+#: nothing at all on this target and stop asking. Measured on zlib's ASan `example` binary:
+#: 12,584 blocks were recovered and armed, every one of 169 traces returned no coverage
+#: ("the runner reported no coverage for any input; the campaign ran blind"), and the stage spent
+#: 150 seconds of a 12-34 second slice finding that out 169 times over.
+_SILENT_TRACER_PROBES = 8
 
 
 def greedy_minset(coverage: dict, sizes: Optional[dict] = None) -> list:
@@ -64,7 +72,7 @@ def _ordkey(k):
 
 def block_coverage(exe, inputs, blocks, *, mode: str = "stdin", base_argv=(),
                    timeout: float = 2.0, arch=None, endianness=None, bits=None,
-                   host=None, cap: int = 256) -> list:
+                   host=None, cap: int = 256, deadline: Optional[float] = None) -> list:
     """Per-input reached-block sets via the sandbox block tracer.
 
     Each input is traced in ITS OWN batch: the tracer's breakpoints are one-shot *within* a batch,
@@ -75,27 +83,52 @@ def block_coverage(exe, inputs, blocks, *, mode: str = "stdin", base_argv=(),
     """
     return [c for c, _ in _trace(exe, inputs, blocks, mode=mode, base_argv=base_argv,
                                  timeout=timeout, arch=arch, endianness=endianness, bits=bits,
-                                 host=host, cap=cap)]
+                                 host=host, cap=cap, deadline=deadline)]
 
 
 def _trace(exe, inputs, blocks, *, mode="stdin", base_argv=(), timeout=2.0, arch=None,
-           endianness=None, bits=None, host=None, cap=256) -> list:
+           endianness=None, bits=None, host=None, cap=256, deadline=None) -> list:
     """[(reached_block_set, crashed_bool)] per input, each traced in its own batch (see
-    block_coverage). A crashed input is a reproducer the caller must keep regardless of coverage."""
+    block_coverage). A crashed input is a reproducer the caller must keep regardless of coverage.
+
+    Bounded two ways, because `cap` bounds the NUMBER of traces and the cost of one is a property
+    of the target, not of this module. On zlib's ASan `example` binary each trace of a 12,584-block
+    arming cost about a second, so a 169-input corpus under the default cap spent 150 seconds --
+    five to twelve times the whole campaign slice the caller had -- and the campaign that
+    distillation exists to speed up then got ZERO executions.
+
+      * `deadline` (wall clock): stop tracing and let the rest come back unmeasured. `distill`
+        keeps an unmeasured input ("absence of evidence is not redundancy"), so stopping early
+        costs minset quality and never correctness.
+      * a SILENT TRACER: if the first `_SILENT_TRACER_PROBES` traces all report no coverage, the
+        mechanism is not working on this target (no ptrace in the sandbox, a cross-arch image)
+        and the remaining traces cannot tell us anything either.
+    """
     from ..dynamic import sandbox
     blocks = tuple(blocks or ())
-    out = []
+    out, traced, silent = [], 0, 0
     for i, data in enumerate(inputs):
         if i >= cap or not blocks:
+            out.append((set(), False))
+            continue
+        if deadline is not None and time.time() >= deadline:
+            out.append((set(), False))
+            continue
+        if silent >= _SILENT_TRACER_PROBES and traced == silent:
             out.append((set(), False))
             continue
         res = sandbox.run_batch(exe, [data], mode=mode, base_argv=base_argv, timeout=timeout,
                                 arch=arch, endianness=endianness, bits=bits, host=host,
                                 blocks=blocks)
+        traced += 1
         if res:
-            out.append((set(res[0].blocks_hit or ()), bool(res[0].crashed)))
+            hit = set(res[0].blocks_hit or ())
+            out.append((hit, bool(res[0].crashed)))
+            if not hit:
+                silent += 1
         else:
             out.append((set(), False))
+            silent += 1
     return out
 
 
@@ -132,7 +165,8 @@ def distill(inputs: list, cover_sets: list, *, keep_idx: Iterable[int] = ()) -> 
 def distill_corpus(exe, inputs: list, blocks, *, keep_idx: Iterable[int] = (),
                    mode: str = "stdin", base_argv=(), timeout: float = 2.0,
                    arch=None, endianness=None, bits=None, host=None,
-                   cover_fn: Optional[Callable] = None, cap: int = 256) -> dict:
+                   cover_fn: Optional[Callable] = None, cap: int = 256,
+                   deadline: Optional[float] = None) -> dict:
     """Convenience: trace ``inputs`` for block coverage, then ``distill``. ``cover_fn`` replaces the
     tracer (for tests). Returns ``distill``'s dict."""
     keep = set(keep_idx)
@@ -140,7 +174,8 @@ def distill_corpus(exe, inputs: list, blocks, *, keep_idx: Iterable[int] = (),
         cover = [set(cover_fn(d)) for d in inputs]
     else:
         traced = _trace(exe, inputs, blocks, mode=mode, base_argv=base_argv, timeout=timeout,
-                        arch=arch, endianness=endianness, bits=bits, host=host, cap=cap)
+                        arch=arch, endianness=endianness, bits=bits, host=host, cap=cap,
+                        deadline=deadline)
         cover = [c for c, _ in traced]
         # a traced input that crashed is a reproducer -- keep it whatever its coverage.
         keep |= {i for i, (_, crashed) in enumerate(traced) if crashed}
