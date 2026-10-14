@@ -188,3 +188,53 @@ def test_the_gate_still_executes_the_bundles_it_ships():
         j = src.index('Case("', i + 10) if src.count('Case("', i + 10) else len(src)
         assert "want_bundle=True" in src[i:j], \
             "%s no longer executes its bundle" % case
+
+
+def _rc_gate():
+    """Import the real-corpus gate as a module. It lives in tools/, not on the package path."""
+    import importlib.util
+    import sys
+    path = pathlib.Path(__file__).resolve().parents[1] / "tools" / "real_corpus_gate.py"
+    spec = importlib.util.spec_from_file_location("rc_gate", path)
+    mod = importlib.util.module_from_spec(spec)
+    # Registered BEFORE exec: @dataclass resolves its annotations through sys.modules, and a
+    # module that is not there yet raises instead of loading.
+    sys.modules["rc_gate"] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_a_starved_source_run_is_not_reported_as_clean(tmp_path):
+    """libtiff at a 200s budget: 6 capabilities worked, 0 crashes, every invariant satisfied -- a
+    row that reads exactly like a library with no memory-safety bugs. The SAME tarball at 900s
+    produced a heap overflow and a verified L1 PoC. The difference was that the build had eaten
+    the budget before the first execution.
+
+    A gate that cannot tell those two runs apart launders a measurement failure into a clean
+    bill of health, which is the single most expensive thing this tool can do on an engagement."""
+    g = _rc_gate()
+    tar = tmp_path / "libfoo-1.0.tar.gz"
+    tar.write_bytes(b"")
+
+    # starved: a source project whose engines barely ran, and no crash to prove otherwise
+    why = g.unscoreable(tar, search=12.0, budget=200.0, crashes=0)
+    assert why, "a source project searched for 12s of 200s was reported as scoreable"
+    assert "starved" in why and "200s budget" in why and "larger --budget" in why
+
+    # not starved: the engines held a real slice
+    assert g.unscoreable(tar, search=600.0, budget=900.0, crashes=0) == ""
+    # not starved: it found something, so the search demonstrably reached the code
+    assert g.unscoreable(tar, search=12.0, budget=200.0, crashes=1) == ""
+    # a prebuilt binary has nothing to build, so the floor does not apply to it
+    exe = tmp_path / "xxd"
+    exe.write_bytes(b"\x7fELF")
+    assert g.unscoreable(exe, search=12.0, budget=200.0, crashes=0) == ""
+
+
+def test_an_unscoreable_corpus_fails_the_gate():
+    """Printing INVALID and then exiting 0 would be the same false clean one layer up: whatever
+    runs the gate in CI reads the exit status, not the table."""
+    gate = pathlib.Path(__file__).resolve().parents[1] / "tools" / "real_corpus_gate.py"
+    src = gate.read_text()
+    assert "return 1 if (bad or starved) else 0" in src, \
+        "a starved target no longer fails the gate's exit status"

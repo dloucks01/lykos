@@ -77,6 +77,20 @@ _NOT_APPLICABLE = (
 )
 
 
+#: The stages that constitute the search. Their combined wall time is what a "0 crashes" row is
+#: actually worth: libtiff at a 200s budget reported 6 capabilities working and no crashes -- a row
+#: that reads exactly like a clean library -- and the same target at 900s produced a heap overflow
+#: and a verified PoC. The build had eaten the budget. The number that distinguishes those two runs
+#: was never printed, so the gate could not tell a clean target from a starved one.
+_ENGINES = ("fuzz", "coverage_fuzz", "directed_fuzz", "libfuzzer", "net_fuzz", "env_fuzz",
+            "concolic")
+#: Below this many seconds of combined engine time, a source project has not been searched. The
+#: floor is measurement, not taste: the libtiff crash arrived 6 executions into the SGILog seed,
+#: but the in-process harness needed ~200s of that run to configure, build and link before the
+#: first execution happened at all.
+_SEARCH_FLOOR = 150.0
+
+
 @dataclass
 class Row:
     name: str
@@ -94,6 +108,11 @@ class Row:
     detected: int = 0
     problems: list = field(default_factory=list)
     elapsed: int = 0
+    #: Seconds the search engines actually held. A clean row is only evidence next to this.
+    search: float = 0.0
+    #: Set when the budget was too small for this target's shape to be scored at all. Distinct
+    #: from `ok`: the tool did not fail, the MEASUREMENT did, and the two must not print alike.
+    invalid: str = ""
 
 
 def _classify_decline(note: str) -> str:
@@ -121,6 +140,25 @@ def _stage_target(src: Path, work: Path) -> Path | None:
         return None
     tops = [d for d in work.iterdir() if d.is_dir()]
     return tops[0] if len(tops) == 1 else work
+
+
+def _is_source_project(src: Path) -> bool:
+    """A tarball or a directory has to be CONFIGURED, BUILT and LINKED before a single execution
+    happens. That work comes out of the same budget as the search, which is why a source target
+    needs a floor and a prebuilt binary does not."""
+    return src.is_dir() or src.suffix in (".gz", ".tgz", ".bz2", ".xz")
+
+
+def unscoreable(src: Path, search: float, budget: float, crashes: int) -> str:
+    """Why this run cannot be scored, or "" if it can.
+
+    Pure so it can be tested without a 900s campaign.
+    """
+    if crashes or not _is_source_project(src) or search >= _SEARCH_FLOOR:
+        return ""
+    return (f"search starved: the engines held {search:.0f}s of a {budget:.0f}s budget, under the "
+            f"{_SEARCH_FLOOR:.0f}s floor a source project needs after it is built. A clean row "
+            f"here is not evidence -- re-run with a larger --budget.")
 
 
 def run_one(src: Path, budget: float) -> Row:
@@ -198,6 +236,12 @@ def run_one(src: Path, budget: float) -> Row:
         if row.crashes and row.level == 0:
             row.problems.append(f"{row.crashes} crash(es) recorded but NO verified PoC")
         row.ok = not row.problems
+
+        # Was this run SCOREABLE? Separate question from whether it passed, and asked last so a
+        # starved run still reports every plumbing defect it did manage to expose.
+        by_stage = ((card.get("budget") or {}).get("by_stage") or {})
+        row.search = round(sum(float(v) for k, v in by_stage.items() if k in _ENGINES), 1)
+        row.invalid = unscoreable(src, row.search, budget, row.crashes)
         return row
     finally:
         row.elapsed = int(time.time() - t0)
@@ -235,26 +279,37 @@ def main() -> int:
     targets = [Path(x) for x in a.targets] or default_corpus()
     if not targets:
         print("no targets given and no default corpus on this machine"); return 2
-    print(f"{'TARGET':26s} {'RAN':8s} {'EXECS':>8s} {'RATE':>7s} "
+    print(f"{'TARGET':26s} {'RAN':8s} {'EXECS':>8s} {'RATE':>7s} {'SRCH':>6s} "
           f"{'WORK':>4s} {'DECL':>4s} {'ERR':>3s} {'CR':>3s} {'L':>2s} {'DEMO':>4s}  VERDICT")
-    print("-" * 118)
+    print("-" * 126)
     rows = []
     for src in targets:
         row = run_one(src, a.budget)
         rows.append(row)
-        verdict = "PASS" if row.ok else "FAIL: " + "; ".join(row.problems[:2])
+        if not row.ok:
+            verdict = "FAIL: " + "; ".join(row.problems[:2])
+        elif row.invalid:
+            verdict = "INVALID: budget too small to score"
+        else:
+            verdict = "PASS"
         print(f"{row.name[:26]:26s} {row.ran:8s} {row.execs:8,d} {row.rate:7.1f} "
-              f"{row.worked:4d} {row.declined:4d} {len(row.errored):3d} {row.crashes:3d} "
-              f"{row.level:2d} {row.demonstrated:4d}  {verdict}")
-    print("-" * 118)
+              f"{row.search:6.0f} {row.worked:4d} {row.declined:4d} {len(row.errored):3d} "
+              f"{row.crashes:3d} {row.level:2d} {row.demonstrated:4d}  {verdict}")
+    print("-" * 126)
     bad = [r for r in rows if not r.ok]
+    starved = [r for r in rows if r.ok and r.invalid]
     print(f"PLUMBING: {len(rows) - len(bad)}/{len(rows)} targets clean "
           f"({sum(r.elapsed for r in rows)}s total)")
     for r in bad:
         print(f"  {r.name}:")
         for pr in r.problems:
             print(f"     - {pr}")
-    return 1 if bad else 0
+    # An unscoreable run is not a pass. Exiting 0 on a starved corpus is the false clean this
+    # whole gate exists to prevent, so it is reported as loudly as a defect and fails the run.
+    for r in starved:
+        print(f"  {r.name}: NOT SCORED")
+        print(f"     - {r.invalid}")
+    return 1 if (bad or starved) else 0
 
 
 if __name__ == "__main__":
