@@ -78,8 +78,16 @@ _NOT_APPLICABLE = (
     # of what it can infer, not a defect. Measured on bzip2: "automated glibc-heap -> shell did
     # not confirm: supply the menu op templates (params.add/free/view/edit/exit_seq ...)" -- the
     # technique is for a CTF menu binary and bzip2 is not one. Deliberately narrower than "did
-    # not confirm" on its own, which could hide a real failure in the exploit chain.
-    "supply the",
+    # not confirm" on its own, which could hide a real failure in the exploit chain. A note that
+    # names a `params.<knob>` is the same thing stated the other way round, and no plumbing
+    # failure mentions one.
+    "supply the", "params.",
+    # The TARGET does not have the structure the capability probes. Measured on
+    # what_does_the_f_say: `oob_index` wants a selectable object table and `heap_trace` wants an
+    # allocator to hook, and this binary has neither. Spelled out rather than generalised to
+    # "no ...", because `_OUR_FAULT` legitimately contains "no clang" and "no harness" and this
+    # list is checked first.
+    "no fixed-size global", "no named custom allocator",
 )
 
 
