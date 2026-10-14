@@ -54,7 +54,18 @@ if str(CORE) not in sys.path:
 _OUR_FAULT = (
     "build failed", "did not compile", "file not found", "no such file",
     "undefined reference", "could not build", "failed to build", "not installed",
-    "no clang", "cannot run", "loader refused", "did not link", "no harness",
+    "no clang", "loader refused", "did not link", "no harness",
+)
+#: Checked BEFORE `_OUR_FAULT`: a capability boundary stated honestly is not a plumbing defect,
+#: however much its wording resembles one. `mem_oracle` saying "memcheck is a host-architecture
+#: dynamic translator and cannot run a non-host-architecture target" is the tool knowing its own
+#: limits -- the first version of this gate called it OUR fault on the strength of "cannot run",
+#: which would have trained us to ignore the gate.
+_BOUNDARY = (
+    "host-architecture", "host architecture", "cannot run a non-host",
+    "incompatible with afl", "shadow memory", "only supports", "x86-64 only",
+    "x86-64 native only", "needs native", "no gdbstub", "not supported for this",
+    "cross-arch", "the clr owns", "owns the instruction pointer",
 )
 #: A decline that describes the TARGET, not us. Allowed, and the gate must not punish it or every
 #: honest refusal becomes a failure and the gate gets ignored.
@@ -87,6 +98,9 @@ class Row:
 
 def _classify_decline(note: str) -> str:
     low = (note or "").lower()
+    for s in _BOUNDARY:
+        if s in low:
+            return "target"
     for s in _NOT_APPLICABLE:
         if s in low:
             return "target"
@@ -189,7 +203,13 @@ def run_one(src: Path, budget: float) -> Row:
         row.elapsed = int(time.time() - t0)
         pool.stop(grace=5.0)
         store.close()
-        shutil.rmtree(wd, ignore_errors=True)
+        # KEEP a failing target's case store. Deleting it meant every failure cost a full re-run
+        # to investigate -- and a gate whose failures are expensive to read is a gate that gets
+        # ignored. A clean target leaves nothing behind.
+        if row.ok:
+            shutil.rmtree(wd, ignore_errors=True)
+        else:
+            row.problems.append(f"case kept for diagnosis: {wd}")
 
 
 def default_corpus() -> list:
