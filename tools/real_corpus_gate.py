@@ -234,7 +234,13 @@ def run_one(src: Path, budget: float) -> Row:
         # to investigate -- and a gate whose failures are expensive to read is a gate that gets
         # ignored. A clean target leaves nothing behind.
         if row.ok:
+            # Twice, because once is not enough: a worker thread winding down after `pool.stop`
+            # recreates the content store's directory, so the first sweep left an empty
+            # `case/artifacts` behind on every clean target. `ignore_errors` hid it.
             shutil.rmtree(wd, ignore_errors=True)
+            if wd.exists():
+                time.sleep(0.5)
+                shutil.rmtree(wd, ignore_errors=True)
         else:
             row.problems.append(f"case kept for diagnosis: {wd}")
 
