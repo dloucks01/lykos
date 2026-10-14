@@ -18,7 +18,16 @@ def _default_caps() -> dict[str, int]:
 class JobConfig:
     workers: int = field(default_factory=_default_workers)
     poll_interval: float = 0.1          # queue poll when idle (seconds)
-    lease_seconds: int = 30             # job lease TTL
+    # Job lease TTL. It must survive a WRITE STORM, not just an idle moment: measured on
+    # /usr/bin/readelf, `detect_cwe` heartbeat normally for 111s, then lost three consecutive
+    # beats while thirteen other stages started and finished in the same 35s window, and the
+    # reaper marked a healthy, working stage `error` -- "an error is never an acceptable outcome
+    # for a capability" is the rule the gate holds us to. At 30s with a 10s beat the margin was
+    # exactly three beats, each with a 5s busy_timeout; the suite's own tests had already
+    # noticed, overriding this to 60-120 in a dozen files. 9 beats is the margin now. A wedged
+    # stage is still reclaimed -- `wedge_grace` handles the worker, and `_run_timeout` the
+    # deadline -- just 60s later than before.
+    lease_seconds: int = 90
     heartbeat_interval: float = 10.0    # worker heartbeat cadence
     # Per-stage wall-clock fallback for a stage that registers no `timeout=` of its own. A
     # non-None default is a hang ceiling: without it such a stage has no deadline, so a tool that

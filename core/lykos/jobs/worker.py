@@ -76,8 +76,10 @@ class _Heartbeat(threading.Thread):
     def run(self) -> None:
         conn = connect(self._db)
         q = JobQueue(conn)
+        wait = self._cfg.heartbeat_interval
         try:
-            while not self._stop.wait(self._cfg.heartbeat_interval):
+            while not self._stop.wait(wait):
+                wait = self._cfg.heartbeat_interval
                 # Stop RENEWING the lease once the job is past its deadline or a cancel was
                 # requested. A non-cooperative stage (stuck in a native angr/unicorn/pypcode call
                 # that never reaches a check) would otherwise have its lease extended forever, so
@@ -98,9 +100,14 @@ class _Heartbeat(threading.Thread):
                 except Exception:
                     # A transient failure (e.g. "database is locked") must not kill the heartbeat
                     # thread: if it dies the lease expires and a still-running job is requeued. Log
-                    # and retry on the next tick instead.
-                    _log.warning("heartbeat failed for run %s (worker %s); will retry",
-                                 self._run, self._wid, exc_info=True)
+                    # and retry -- but SOON, not after another full interval. Waiting the whole
+                    # interval after a 5s busy_timeout meant a write storm consumed a beat every
+                    # 15s, so three failures burned the entire lease and a working stage was
+                    # reaped. Retrying in a second turns each lost beat into one lost attempt
+                    # instead of one lost interval.
+                    wait = _beat_wait(self._cfg, failed=True)
+                    _log.warning("heartbeat failed for run %s (worker %s); retrying in %.0fs",
+                                 self._run, self._wid, wait, exc_info=True)
         finally:
             conn.close()
 
@@ -144,6 +151,20 @@ def _run_timeout(run, sd, cfg):
 #: phase after it.
 _BUDGET_MARGIN = 1.2
 _BUDGET_GRACE_S = 10.0
+
+#: How soon the heartbeat retries after a FAILED beat (a locked database), rather than waiting a
+#: full `heartbeat_interval`. See the handler for the measurement behind it.
+_RETRY_BEAT_S = 1.0
+
+
+def _beat_wait(cfg, *, failed: bool) -> float:
+    """How long to wait before the next heartbeat attempt.
+
+    Spelled out as a function so the decision can be tested without timing a thread: after a
+    FAILED beat the next attempt comes soon, because what failed is usually a 5s busy_timeout
+    under a write storm and the lease is measured in beats, not in attempts.
+    """
+    return min(_RETRY_BEAT_S, cfg.heartbeat_interval) if failed else cfg.heartbeat_interval
 
 
 class WorkerPool:
