@@ -533,6 +533,27 @@ def _run_case_stage(store, case_id, stage, status, stop) -> None:
         _wait(store, run.id, stop)
 
 
+#: Per-execution timeout handed to the campaigns when the target DOES NOT TERMINATE. A program
+#: that blocks after consuming its input reaches the same code at 1s as at 10s -- the input is
+#: long since read -- so the only thing the longer wait buys is fewer executions. Measured on
+#: `zigzag`, an interactive menu binary that blocks forever on every input on every channel: the
+#: baseline timed out at 10,006 ms and the blind campaign managed ONE execution in a 47-second
+#: slice. Nothing in that row said "this target never returns"; it read like a target that
+#: resists fuzzing.
+_NONTERM_EXEC_TIMEOUT = 1.0
+
+
+def _baseline_timed_out(store, target_id) -> bool:
+    """Did the baseline execution fail to terminate? `dynamic_run` records it on its own row."""
+    from ..db.dao import DynResultDAO
+    try:
+        rows = DynResultDAO(store.conn).list_by_target(target_id)
+    except Exception:                                    # noqa: BLE001 -- advisory
+        return False
+    base = [r for r in rows if (r.input_mode or "none") == "none"]
+    return bool(base) and all(getattr(r, "timed_out", False) for r in base)
+
+
 def _ranked_channels(store, target_id):
     """Input channels to try for a target, best-first (from the functions it imports), always
     ending with all channels attempted. Lets the autopilot fuzz the RIGHT channel and, on no crash,
@@ -1174,6 +1195,16 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
             from .poc.capture import no_import_evidence as _no_imports
             _blind = not channels or _no_imports(t)
             fz = {} if _blind else dyn
+            # A target that does not terminate pays its FULL per-execution timeout every time,
+            # so the campaigns get single-digit executions out of a whole slice. The input is
+            # consumed long before the program blocks, so a short timeout reaches the same code
+            # and buys forty times the executions.
+            if _baseline_timed_out(store, tid):
+                dyn = dict(dyn, exec_timeout=_NONTERM_EXEC_TIMEOUT)
+                fz = dict(fz, exec_timeout=_NONTERM_EXEC_TIMEOUT)
+                _emit_stage(store, t.case_id, "dynamic_run", "note", target_id=tid,
+                            detail=(f"the baseline did not terminate, so the campaigns use a "
+                                    f"{_NONTERM_EXEC_TIMEOUT:g}s per-execution timeout"))
             # DISCOVERY that needs NO fuzzer crash -- run it BEFORE the budget-draining fuzz/concolic,
             # for the same reason as the crashless weaponization above: a menu-driven heap / OOB target
             # rarely yields a blind-mutation crash, so with the old ordering heap_trace + oob_index +

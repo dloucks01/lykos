@@ -268,6 +268,21 @@ def coverage_stage(ctx) -> dict:
             "dropped_timeouts": len(slow), "kept": len(seeds),
             "why": "afl-fuzz aborts its dry run on a seed that times out, which would end the "
                    "campaign before a single execution; these are still fuzzed blind"})
+    if slow and not seeds:
+        # EVERY seed timed out. The old fallback substituted `_DEFAULT_SEEDS` here, and those
+        # time out too on a target that never terminates -- so afl-fuzz aborted its dry run on
+        # them and the stage raised, which is how `zigzag` (an interactive menu binary that
+        # blocks forever on any input, on any channel) produced a RuntimeError instead of a
+        # verdict. AFL cannot drive a target that does not return; that is a property of the
+        # target, so it is a decline, and the blind `fuzz` stage still runs it under rlimits.
+        note = (f"every one of the {len(slow)} seeds timed out: this target does not terminate "
+                f"on the {mode} channel, and afl-fuzz aborts its dry run on a seed that times "
+                f"out. The sandbox fuzzers still run it under their own per-execution limit.")
+        ctx.emit("coverage.done", payload={"supported": False, "backend": "aflpp",
+                                           "crash_inputs": 0, "unique": 0, "confirmed": 0,
+                                           "note": note})
+        ctx.progress(pct=100, msg="target does not terminate — AFL cannot dry-run it")
+        return {}
     seeds = seeds or list(_DEFAULT_SEEDS)
     seeds_dir = ctx.scratch() / "afl-in"
     seeds_dir.mkdir(parents=True, exist_ok=True)

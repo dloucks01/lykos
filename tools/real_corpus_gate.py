@@ -88,6 +88,9 @@ _NOT_APPLICABLE = (
     # "no ...", because `_OUR_FAULT` legitimately contains "no clang" and "no harness" and this
     # list is checked first.
     "no fixed-size global", "no named custom allocator",
+    # The target never returns. `zigzag` blocks forever on any input on any channel, so AFL
+    # cannot dry-run it at all -- a fact about the binary, not about our plumbing.
+    "does not terminate",
 )
 
 
