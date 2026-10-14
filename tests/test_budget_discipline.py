@@ -223,10 +223,26 @@ def test_the_phases_are_entered_in_order():
 
 def test_the_campaigns_are_inside_the_search_phase():
     """If a campaign were left in `recover` it would be capped by the 30% allowance, and if it
-    were in `prove` it would spend the reserve that exists to prove what it finds."""
+    were in `prove` it would spend the reserve that exists to prove what it finds.
+
+    `libfuzzer` WAS left in recover, beside `disassemble` and `detect_cwe`. Measured on the
+    libtiff tarball at 600s per target: `disassemble` took 138s and `detect_cwe` 237s (and was
+    cancelled anyway), the allowance was gone, and the autopilot skipped the one engine that
+    finds this library's bug -- "libfuzzer: skipped, no budget left in the recover phase", in the
+    run's own words. The same tarball at 900s had enough slack for it to run, found the heap
+    overflow and produced a verified PoC. That difference was budget luck, not design, and no
+    test said anything because this list did not name the strongest engine in the pipeline."""
     s, p = _pos('bud.phase("search")'), _pos('bud.phase("prove")')
-    for stage in ('"coverage_fuzz"', '"fuzz"', '"directed_fuzz"'):
+    for stage in ('"coverage_fuzz"', '"fuzz"', '"directed_fuzz"', '"libfuzzer"'):
         assert s < _pos(stage) < p, stage
+
+
+def test_in_process_fuzzing_leads_the_campaigns():
+    """On a library it outproduces out-of-process mutation by orders of magnitude -- libtiff
+    4.0.3: a sanitizer finding in 36 executions, where 14,821 external file-channel executions
+    found none. Ordered last among the campaigns it is the first thing a tight budget drops."""
+    assert _pos('"libfuzzer"') < _pos('"coverage_fuzz"')
+    assert _pos('"libfuzzer"') < _pos('"directed_fuzz"')
 
 
 def test_a_campaign_is_bounded_by_time_and_not_by_an_arbitrary_count():

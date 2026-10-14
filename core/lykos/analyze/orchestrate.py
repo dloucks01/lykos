@@ -1130,16 +1130,6 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
             # the generic fuzzers cannot reach at all: they drive stdin/argv/files. It discovers
             # its own channel and declines when there is none, so a plain binary pays nothing.
             _staged(bud, store, t, "boundary_fuzz", status, stop, want=45.0)
-            # On a SOURCE target, an in-process libFuzzer harness under ASan+UBSan is the
-            # strongest crash finder available -- thousands of executions a second with a
-            # sanitizer oracle, against a few hundred for out-of-process mutation. It builds its
-            # own harness and reports unsupported for a binary-only target.
-            # In-process fuzzing is the engine built for a library, and on one it outproduces
-            # everything else by orders of magnitude (libtiff 4.0.3: a sanitizer finding in 36
-            # executions, where 14,821 external file-channel executions found none). It asked
-            # for 60 s while `fuzz` asks for 180; on a source target that ranking is backwards.
-            _staged(bud, store, t, "libfuzzer", status, stop, want=180.0)
-
             # Weaponize every version-matched CVE -- a bespoke per-CVE trigger where one is
             # authored, else the library's format attack (zlib bomb, XML billion-laughs) and its
             # CWE-class probes -- recording a verified reproduction only if the target faults.
@@ -1227,6 +1217,24 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
             # strictly more. The stage no-ops without recovered stack buffers.
             if _expensive_substrate(t):
                 _staged(bud, store, t, "synthesize_poc", status, stop, want=45.0)
+            # On a SOURCE target, an in-process libFuzzer harness under ASan+UBSan is the
+            # strongest crash finder available -- thousands of executions a second with a
+            # sanitizer oracle, against a few hundred for out-of-process mutation. It builds its
+            # own harness and reports unsupported for a binary-only target.
+            # In-process fuzzing is the engine built for a library, and on one it outproduces
+            # everything else by orders of magnitude (libtiff 4.0.3: a sanitizer finding in 36
+            # executions, where 14,821 external file-channel executions found none).
+            #
+            # It is FIRST among the campaigns and inside the SEARCH phase, both for the same
+            # reason. It used to be scheduled in `recover`, beside `disassemble` and
+            # `detect_cwe`, and a campaign budgeted as recovery is capped by the 30% allowance
+            # that phase gets. Measured on the libtiff tarball at 600s per target:
+            # `disassemble` took 138s and `detect_cwe` 237s (and was CANCELLED anyway), so the
+            # allowance was gone and the autopilot skipped the one engine that finds this
+            # library's bug -- "libfuzzer: skipped, no budget left in the recover phase". The
+            # same tarball at 900s had enough slack for it to run, found the heap overflow and
+            # produced a verified PoC. That difference was budget luck, not design.
+            _staged(bud, store, t, "libfuzzer", status, stop, want=180.0)
             # coverage fuzz (AFL, falls back to blind if unavailable), then directed on the same
             # channel -- EXCEPT on a non-native image, where AFL cannot apply at all. AFL
             # instruments machine code: a .class/.jar is bytecode and a PE runs under wine, so
