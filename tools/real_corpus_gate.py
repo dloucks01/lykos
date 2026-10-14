@@ -191,7 +191,16 @@ def run_one(src: Path, budget: float) -> Row:
                               args=(wd / "case", case.id, [t.id], status, stop, budget),
                               daemon=True)
         th.start()
-        while th.is_alive() and time.time() - t0 < budget * 2 + 300:
+        # `budget` is PER TARGET, and a source project registers one target per executable it
+        # built -- libtiff builds six under the current ceiling. A fixed `budget * 2 + 300` wall
+        # clock therefore cut the run off a third of the way through and set `stop`, so the later
+        # targets were never analysed and the row reported a truncated pass as a whole one. The
+        # deadline scales with the targets the case actually has, counted as they appear (the
+        # extras are registered during ingest, the firmware/packed ones mid-run).
+        while th.is_alive():
+            n = max(1, len(TargetDAO(store.conn).list_by_case(case.id)))
+            if time.time() - t0 >= budget * n * 1.3 + 300:
+                break
             time.sleep(5)
         if th.is_alive():
             stop.set(); th.join(timeout=120)
@@ -275,7 +284,14 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("targets", nargs="*", help="binaries, source dirs or source tarballs")
     ap.add_argument("--budget", type=float, default=300.0, help="seconds per target")
+    ap.add_argument("--max-entry-points", type=int, default=None,
+                    help="how many of a source project's executables one case carries "
+                         "(default: the pipeline's own ceiling). Each is a full target with its "
+                         "own budget, so this multiplies the wall clock")
     a = ap.parse_args()
+    if a.max_entry_points:
+        from lykos.analyze import ingest as _ingest
+        _ingest.MAX_ENTRY_POINTS = max(1, a.max_entry_points)
     targets = [Path(x) for x in a.targets] or default_corpus()
     if not targets:
         print("no targets given and no default corpus on this machine"); return 2
