@@ -1018,9 +1018,23 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
             t = store.targets.get(tid)
             if not t:
                 continue
-            _init_plan(status, t, len(done_tids), len(worklist))
+            # A SIBLING TARGET HAS NEVER BEEN TRIAGED. The caller triages the target it hands
+            # us; the executables a source project also built were registered by `ingest` and
+            # nothing triaged them, so `file_type`, `arch` and `bits` were NULL for every one of
+            # libtiff's five extra tools. That is not a cosmetic gap: `coverage_fuzz` reads
+            # `target.arch` to find the matching afl-qemu-trace, got None, fell through to the
+            # un-suffixed lookup (this machine has afl-qemu-trace-x86-64, not a bare
+            # afl-qemu-trace) and ERRORED -- twice in one run, on a native x86-64 ELF the stage
+            # could have fuzzed. Every substrate guard keys off `file_type` too, so an untriaged
+            # target gets the wrong answer from each of them.
             bud = budget_mod.CaseBudget(budget_seconds, overrides=overrides)
             status["budget"] = bud.spent()                # serializable; refreshed as we go
+            if not t.file_type:
+                _staged(bud, store, t, "ingest_triage", status, stop)
+                t = store.targets.get(tid) or t
+            # The plan is built AFTER triage, not before: it is chosen from the target's
+            # substrate, and for an untriaged target that was an empty string.
+            _init_plan(status, t, len(done_tids), len(worklist))
             # A firmware image is not a program: carve it into its embedded binaries (each registered
             # as a sub-target) and analyse THOSE. Running native recovery on the raw blob finds nothing
             # and misses every component + secret.

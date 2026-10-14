@@ -242,3 +242,32 @@ def test_root_cause_cross_arch_unsupported(store, case, pool, gcc, tmp_path, mon
     finds = FindingDAO(store.conn).list_by_target(target.id)
     assert not [f for f in finds if any(e.get("channel") == "root-cause"
                                         for e in (f.evidence or []))]
+
+
+_NOFAULT = ("#include <stdio.h>\n"
+            "int main(int argc,char**argv){(void)argc;(void)argv;"
+            "char b[16];if(fgets(b,16,stdin)){}return 0;}\n")
+
+
+@pytest.mark.skipif(sandbox.host_arch() not in ("x86-64", "aarch64"),
+                    reason="root-cause capture is native-arch only")
+def test_an_input_argv_cannot_carry_is_declined_not_errored(store, case, pool, gcc, tmp_path):
+    """Measured on libtiff: the crash input is a TIFF, file and stdin delivery did not fault, the
+    mode loop reached `arg`, and the gdb branch handed the raw bytes to the debugger -- which
+    raised `ValueError: embedded null byte` out of the stage. root_cause ERRORED on a target it
+    was analysing correctly.
+
+    execve truncates an argument at the first NUL, so an error there is never the right outcome:
+    the channel cannot carry the input, which is a property of the channel. The stage must come
+    back `done` with a reason."""
+    b = _build(gcc, tmp_path, _NOFAULT, "nf", [])
+    if b is None:
+        pytest.skip("build failed")
+    target = ingest(store, case.id, b)
+    sha, _, _ = store.content.put_bytes(b"AAAA\x00\x00BBBB" * 8)   # NULs in the middle
+    q = JobQueue(store.conn)
+    run = enqueue_root_cause(q, target, params={"input_sha": sha, "input_mode": "arg",
+                                                "timeout": 6})
+    assert pool.wait_idle(60)
+    rec = q.runs.get(run.id)
+    assert rec.status == "done", f"root_cause errored on a NUL-bearing input: {rec.error}"

@@ -303,7 +303,17 @@ def root_cause_stage(ctx) -> dict:
                 stdin_file = str(ctx.scratch() / "stdin.bin")
                 (ctx.scratch() / "stdin.bin").write_bytes(input_bytes)
             elif m == "arg":
-                argv = place(argv, input_bytes.decode("latin-1"))
+                # execve truncates an argument at the first NUL, so that is what the program
+                # would actually receive -- and handing the raw bytes to the debugger instead
+                # raised `ValueError: embedded null byte` out of the stage. Measured on libtiff:
+                # the crash input is a TIFF, file and stdin delivery did not fault, the loop
+                # reached `arg`, and `root_cause` ERRORED on a target it was analysing correctly.
+                # An error is never an acceptable outcome for an input a channel cannot carry; a
+                # decline is. `sandbox.argv_arg` is the one place that rule is written down.
+                try:
+                    argv = place(argv, sandbox.argv_arg(input_bytes, truncate=True))
+                except sandbox.ArgvNulError as e:
+                    return {"ok": False, "reason": f"argv cannot carry this input: {e}"}
             elif m == "file":
                 (ctx.scratch() / "input.bin").write_bytes(input_bytes)
                 argv = place(argv, str(ctx.scratch() / "input.bin"))
