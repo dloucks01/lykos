@@ -31,7 +31,7 @@ from ..dynamic.stage import (
     is_hijack_pc,
     recovered_code_span,
 )
-from ..poc.capture import modes_for
+from ..poc.capture import modes_for, no_import_evidence
 from . import structure, textconf, xmlgrammar
 from .mutator import Mutator
 from .runner import invocation, run_input
@@ -1300,7 +1300,8 @@ def fuzz_stage(ctx) -> dict:
     channels = ([p["input_mode"]] if p.get("input_mode")
                 else modes_for(CallEdgeDAO(ctx.conn).list_by_target(target.id),
                                symbols=_triage_symbols_for(ctx, target),
-                               file_type=target.file_type))
+                               file_type=target.file_type,
+                               no_imports=no_import_evidence(target)))
     max_execs = int(p.get("max_execs", 3000))
     max_seconds = float(p.get("max_seconds", 30))
     exec_timeout = float(p.get("exec_timeout", 2))

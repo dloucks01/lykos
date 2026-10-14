@@ -540,7 +540,7 @@ def _ranked_channels(store, target_id):
     (ncompress), which a stdin-only campaign never reaches."""
     from ..db.dao import CallEdgeDAO, TargetDAO
     from .ingest import triage_symbols
-    from .poc.capture import modes_for
+    from .poc.capture import modes_for, no_import_evidence
     try:
         # A MANAGED target owns no machine code, so it has no call edges and the ranking had
         # nothing to go on: `arg` came first for every jar, .pyc and .NET assembly. Triage
@@ -559,7 +559,8 @@ def _ranked_channels(store, target_id):
             except Exception:                            # best-effort: fewer signals, not none
                 syms = ()
         chans = modes_for(CallEdgeDAO(store.conn).list_by_target(target_id), symbols=syms,
-                          file_type=getattr(tgt, "file_type", None))
+                          file_type=getattr(tgt, "file_type", None),
+                          no_imports=tgt is not None and no_import_evidence(tgt))
         return chans or ["stdin", "arg", "file"]
     except Exception:
         _log.debug("channel inference failed for %s", target_id, exc_info=True)
@@ -1172,6 +1173,17 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
             channels = _ranked_channels(store, tid)
             primary = channels[0] if channels else None
             dyn = {"input_mode": primary} if primary else {}
+            # PINNING a channel is right only when something chose it. The `fuzz` stage splits
+            # its budget across every channel it is given, and passing one collapses that sweep
+            # to a single guess -- which on `zigzag` (static-pie, stripped: no import table to
+            # rank by) was the wrong guess, so the campaign spent its whole slice delivering
+            # input where the program never reads it and managed nine executions. With no
+            # evidence to pin on, hand the stage nothing and let it sweep all three at a third
+            # of the budget each. A target whose imports DID say something keeps the full slice
+            # on the channel they named.
+            from .poc.capture import no_import_evidence as _no_imports
+            _blind = not channels or _no_imports(t)
+            fz = {} if _blind else dyn
             # DISCOVERY that needs NO fuzzer crash -- run it BEFORE the budget-draining fuzz/concolic,
             # for the same reason as the crashless weaponization above: a menu-driven heap / OOB target
             # rarely yields a blind-mutation crash, so with the old ordering heap_trace + oob_index +
@@ -1230,7 +1242,7 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
             # channel, which is what this needs, since a bytecode target has no call edges and so
             # no channel ranking either.
             if _nonnative_image(t):
-                _staged(bud, store, t, "fuzz", status, stop, dyn, want=_CAMPAIGN_WANT)
+                _staged(bud, store, t, "fuzz", status, stop, fz, want=_CAMPAIGN_WANT)
             elif _staged(bud, store, t, "coverage_fuzz", status, stop, dyn,
                          want=_CAMPAIGN_WANT) != "done" or \
                     bud.slice("fuzz") > 0:
@@ -1249,7 +1261,7 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                 # happen, and the run then reports only static findings -- "nothing was run"
                 # wearing the face of "nothing was found", at campaign scale. The blind stage
                 # carries none of those preconditions, so it runs the same corpus regardless.
-                _staged(bud, store, t, "fuzz", status, stop, dyn, want=_CAMPAIGN_WANT)
+                _staged(bud, store, t, "fuzz", status, stop, fz, want=_CAMPAIGN_WANT)
             _staged(bud, store, t, "directed_fuzz", status, stop, dyn, want=120.0)
             crashes = _distinct_crashes(store, tid)
             # Multi-channel retry: the best-guess channel is not always where the bug is (a file

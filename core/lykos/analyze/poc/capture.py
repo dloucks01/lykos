@@ -236,7 +236,27 @@ def _managed_channels(symbols):
     return has_stdin, has_file, has_stdin
 
 
-def modes_for(call_edges, given=None, symbols=(), file_type=None):
+def no_import_evidence(target) -> bool:
+    """True when this target has NO import table to consult, so the absence of input-function
+    names says nothing about what it reads.
+
+    A statically linked binary resolves `read`/`fopen` inside itself: there are no dynamic
+    imports by construction, and if it is also stripped there are no names at all. The ranking's
+    no-evidence default (`arg`, on the reasoning that a binary importing no input function reads
+    neither a file nor stdin) is sound only when the import table was actually READ -- which the
+    comment in `modes_for` says in as many words.
+
+    Measured on `zigzag`, a static-pie stripped HTB binary that reads a command menu from stdin:
+    every channel came out without evidence, `arg` ranked first, the orchestrator pinned it, and
+    the input never reached the program. Each execution then blocked until the 10s timeout, so
+    all three engines got NINE executions between them and two of them errored out. A
+    dynamically linked stripped binary is NOT this case -- its .dynsym still names its imports,
+    which is why /usr/bin/readelf (stripped, dynamic) ranked correctly.
+    """
+    return str(getattr(target, "linking", "") or "").lower().startswith("static")
+
+
+def modes_for(call_edges, given=None, symbols=(), file_type=None, *, no_imports=False):
     """The input channels to try, best first, always ending with every DELIVERABLE one attempted.
 
     Ranked by the input functions the binary actually imports, because "default to stdin" is
@@ -311,6 +331,14 @@ def modes_for(call_edges, given=None, symbols=(), file_type=None):
     # neither a file nor stdin, so argv is what is left. That is only sound while the evidence
     # is actually consulted, which is why the symbol names above matter: without them a target
     # whose edges were merely MISSING looked identical to one that reads nothing.
+    #
+    # `no_imports` is the case where it CANNOT be consulted: a statically linked binary has no
+    # dynamic imports at all, so "no input functions named" is silence, not a negative. Ranking
+    # argv first on silence sent the whole campaign at a channel the program never reads (see
+    # `no_import_evidence`). Stdin leads instead -- it is what an interactive binary reads, and
+    # every channel is still attempted below.
+    if no_imports and not ordered:
+        ordered += ["stdin", "file"]
     ordered.append("arg")
     for m in MODES:                          # ensure every channel is attempted
         if m not in ordered:
@@ -359,7 +387,8 @@ def how_to_feed(conn, target, input_sha, params, *, content=None):
             except Exception:                            # best-effort: fewer signals, not none
                 syms = ()
         ranked = modes_for(CallEdgeDAO(conn).list_by_target(target.id), symbols=syms,
-                           file_type=getattr(target, "file_type", None))
+                           file_type=getattr(target, "file_type", None),
+                           no_imports=no_import_evidence(target))
     except Exception:
         ranked = list(MODES)
     return (ranked or list(MODES))[0], list(params.get("argv") or []), \
