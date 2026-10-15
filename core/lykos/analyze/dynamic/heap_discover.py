@@ -603,6 +603,112 @@ def _try_uaf_reclaim(ctx, target, exe, workdir, model, opts, width, alloc):
     return {"metrics": {"reclaim": "demonstrated", "reclaim_size": hit["size"]}}
 
 
+def _pie_for(target, exe) -> bool:
+    """Is this target position-independent? From the target row when TRIAGE has filled it in, and
+    from the ELF header when it has not.
+
+    PIE decides whether every breakpoint is rebased to the load base, so getting it wrong
+    mis-places all of them and the stage reports "no heap primitive surfaced" -- a clean bill of
+    health from a tracer that never stopped anywhere. `mitigations` comes from triage, so a
+    heap_trace that runs before it read `pie=False` for a PIE binary **[measured: 22 sequences
+    driven, not one alloc or free event]**. The header is right there, and the mitigation parser
+    already in the tree reads it.
+    """
+    mit = getattr(target, "mitigations", None) or {}
+    if "pie" in mit:
+        return mit.get("pie") == "on"
+    from .. import elf as _elf
+    try:
+        return _elf.parse(Path(exe).read_bytes()).elf_type == "dyn"
+    except Exception:                                    # noqa: BLE001 -- advisory
+        return False
+
+
+def _add_free_ops(model: dict, opts: list):
+    """(add, free) menu options, WITHOUT needing a view option, or None.
+
+    `identify_heap_ops` needs all three roles because the output oracle reads a chunk back
+    through `view`. The tracer's oracle reads memory directly, so a target with no view -- which
+    is most of them -- still has a reclaim sequence worth driving, and this is the weaker lookup
+    that finds it. Picking a view op as `free` by mistake simply means nothing is freed and no
+    reclaim is observed; it cannot fabricate one.
+    """
+    if not (model and opts):
+        return None
+    add = next((o for o in opts if o in model and menu._is_alloc(model[o])), None)
+    free = next((o for o in opts if o in model and model[o] == ["idx"] and o != add), None)
+    return (add, free) if (add and free) else None
+
+
+def _reclaim_sequence(model: dict, opts: list, width, marker: bytes, size: int = 0x80):
+    """`add(victim); add(guard); free(victim); add(attacker, MARKER)` for the TRACER to watch.
+
+    Built from the crawled model so the fields are typed as the target expects, which is why it
+    cannot live in `heaptrace.heap_op_sequences` -- that generator is a static guess used only
+    when the crawl learned nothing, so the reclaim shape there was never driven against a target
+    whose crawl DID work, which is most of them **[measured: the shape existed and never ran]**.
+    """
+    ops = _add_free_ops(model, opts)
+    if not ops:
+        return None
+    add, free = ops
+    w = (_op_writes(add, model[add], width, idx=0, size=size, data=b"P" * 8)
+         + _op_writes(add, model[add], width, idx=1, size=size, data=b"G" * 8)
+         + _op_writes(free, model[free], width, idx=0)
+         + _op_writes(add, model[add], width, idx=2, size=size, data=marker)
+         # One more allocation, whose only job is to give the tracer a STOP after the marker has
+         # been written. The fill is the read() that follows the reclaiming malloc, so a sequence
+         # that ends at that malloc leaves the tracer nowhere to look: by the time the run is
+         # over the tracee has exited and its memory cannot be read **[measured: the reclaim was
+         # seen and the marker never was]**.
+         + _op_writes(add, model[add], width, idx=3, size=size, data=b"Z" * 8))
+    return b"".join(w)
+
+
+def _file_traced_reclaim(ctx, target, alloc, observation):
+    """File a reclaim the TRACER demonstrated, for a target with no output oracle.
+
+    Separate from `_try_uaf_reclaim` because the evidence is different in kind and the claim is
+    weaker in a specific way the text has to carry: the output route shows the program READING
+    the attacker's bytes back through the stale pointer, and this one shows only that the bytes
+    are in the chunk. Both are reclaim; only one of them includes a use.
+    """
+    import json as _json
+
+    from ...db.dao import FindingDAO
+    from ..poc import primitive as _prim
+    hit = _prim.reclaim_verdict_traced(observation)
+    if not hit:
+        return None
+    effect = _prim.reclaim_effect(hit)
+    detail = (f"Reclaim observed by the allocator tracer on {alloc['alloc_name']}/"
+              f"{alloc['free_name']}: the chunk at {hit.get('addr')} was freed, handed back out "
+              f"to a later allocation, and the marker bytes that allocation carried were read "
+              f"out of the process's memory at offset {hit.get('chunk_offset')}. The same chunk "
+              f"was sampled before the free and did not contain them. {effect}")
+    ctx.emit("heaptrace.reclaim", payload={
+        "type": hit["type"], "oracle": "traced-memory", "confirmed": True,
+        "size": hit.get("size"), "addr": hit.get("addr"),
+        "chunk_offset": hit.get("chunk_offset"), "allocator": alloc["alloc_name"]})
+    eff = [{"kind": "memory-corruption",
+            "title": "Attacker-controlled contents in a freed object (demonstrated)",
+            "status": "demonstrated", "detail": detail,
+            "proof": {"type": "uaf-reclaim-traced", "addr": hit.get("addr"),
+                      "offset": hit.get("chunk_offset"), "size": hit.get("size"),
+                      "marker": hit.get("marker")}}]
+    FindingDAO(ctx.conn).upsert(target.id, target.case_id, {
+        "cwe": "CWE-416", "title": "Use-after-free with a demonstrated reclaim (traced)",
+        "severity": "critical", "detector": "heap_trace", "state": "corroborated",
+        "confidence": 0.9,
+        "dedup_key": f"CWE-416:uaf-reclaim:{alloc['free_name']}",
+        "function_addr": alloc["free"], "site_addr": None, "site_detail": alloc["free_name"],
+        "evidence": [{"channel": "effects", "detail": _json.dumps(eff)},
+                     {"channel": "heap-trace", "detail": detail}]})
+    ctx.progress(msg=f"reclaim demonstrated by the tracer at {hit.get('addr')} "
+                     f"(no output oracle needed)")
+    return {"metrics": {"reclaim": "demonstrated", "reclaim_oracle": "traced-memory"}}
+
+
 def _try_uaf_leak(ctx, target, target_bytes, exe, workdir, model, opts, width, alloc):
     """Discover + file a use-after-free READ leak: a notebook whose Show-after-Remove prints a freed
     chunk discloses a libc/heap pointer WITHOUT faulting, so the watchpoint tracer never sees it.
@@ -758,7 +864,7 @@ def heap_trace_stage(ctx) -> dict:
                 return {}
             plt_mode = True
 
-        pie = (target.mitigations or {}).get("pie") == "on"
+        pie = _pie_for(target, exe)
         # PLT mode has no local `ret` to read rax from and no local allocator family to exclude.
         ret_offs = [] if plt_mode else _alloc_ret_offsets(exe, alloc["alloc_name"])
         # Allocator-family code ranges (alloc/free + their callees + same-stem functions), so a UAF
@@ -771,13 +877,21 @@ def heap_trace_stage(ctx) -> dict:
         # Fixed-width read(fd, buf, W) targets consume exactly W bytes per field (dreamdiary-style);
         # the crawl and the op-sequences must pad each field to W instead of newline-delimiting.
         width, model = shared_op_model(ctx, target, workdir, exe, opts)
+        from ..poc import primitive as _prim
         seqs = menu.menu_op_sequences(model, opts, width=width) \
-            or heaptrace.heap_op_sequences(opts) or [
+            or heaptrace.heap_op_sequences(opts, marker=_prim.RECLAIM_MARKER) or [
             b"1\n64\nA\n2\n0\n2\n0\n", b"1\n2\n2\n",                 # double-free
             b"1\n64\nA\n2\n0\n3\n0\n", b"1\n2\n3\n", b"1\n2\n3\n4\n",  # UAF (alloc, free, use)
             b"1\n2\n4\n", b"1\n64\nA\n2\n0\n4\n0\n",
             b"1\n16\nA\n2\n0\n" + b"B" * 128 + b"\n",               # heap overflow (over-long)
             b"1\n16\nA\n3\n0\n" + b"B" * 128 + b"\n"]
+        # The reclaim shape goes FIRST: the loop below stops at the first sequence that faults,
+        # and this one is four operations that also exercise alloc/free, so leading with it costs
+        # the fault hunt nothing and is the only way the reclaim oracle sees anything on a target
+        # that faults early.
+        _rseq = _reclaim_sequence(model, opts, width, _prim.RECLAIM_MARKER)
+        if _rseq:
+            seqs = [_rseq] + [x for x in seqs if x != _rseq]
         ctx.emit("heaptrace.allocator", payload={
             "alloc": alloc["alloc_name"], "free": alloc["free_name"],
             "alloc_addr": hex(alloc["alloc"]), "free_addr": hex(alloc["free"]),
@@ -792,6 +906,10 @@ def heap_trace_stage(ctx) -> dict:
         # available. Weaker than the marker proof (it says the chunk came back, not whose bytes
         # are in it) and worth reporting rather than discarding.
         reclaim_traced = False
+        #: The first `reclaim-controlled` observation the tracer made: the attacker's bytes in a
+        #: chunk that was handed back out, read from the process's own memory. This is what a
+        #: target with NO `view` option has instead of the output oracle.
+        reclaim_observed = None
         for i, seq in enumerate(seqs):
             if ctx.should_cancel():
                 break
@@ -802,6 +920,10 @@ def heap_trace_stage(ctx) -> dict:
                 "exe": str(exe), "stdin": seq.hex(), "free_off": alloc["free"],
                 "alloc_off": alloc["alloc"], "alloc_ret_offs": ret_offs, "pie": pie,
                 "alloc_is_plt": plt_mode,
+                # The tracer samples a freed chunk before and after it is handed back out and
+                # looks for these bytes. That is the ONLY reclaim oracle a target with no
+                # printing path has: the marker experiment below needs a `view` option.
+                "marker": _prim.RECLAIM_MARKER.hex(),
                 "ignore_ranges": ignore_ranges, "report": str(report), "timeout": 8}))
             cmd = (sandbox.isolate_prefix(str(workdir), net=False, rw_binds=[str(workdir)])
                    + ["python3", str(helper), str(spec), str(report)])
@@ -815,6 +937,9 @@ def heap_trace_stage(ctx) -> dict:
             except Exception:
                 continue
             reclaim_traced = reclaim_traced or bool(rep.get("reclaim"))
+            for _rc in (rep.get("reclaim_controlled") or []):
+                if not _rc.get("marker_before_free"):
+                    reclaim_observed = reclaim_observed or _rc
             if rep.get("double_free") or rep.get("use_after_free") or rep.get("heap_overflow"):
                 found = (seq, rep)
                 break
@@ -842,6 +967,14 @@ def heap_trace_stage(ctx) -> dict:
             reclaim_hit = _try_uaf_reclaim(ctx, target, exe, workdir, model, opts, width, alloc)
         except Exception:
             reclaim_hit = None
+        # No `view` option, so no output oracle -- which is most targets. The tracer read the
+        # chunk instead, and that evidence is filed by the same route so a silent target is not
+        # left with "the chunk came back" and nothing more.
+        if reclaim_hit is None and reclaim_observed:
+            try:
+                reclaim_hit = _file_traced_reclaim(ctx, target, alloc, reclaim_observed)
+            except Exception:
+                reclaim_hit = None
 
         if not found:
             if leak_hit:

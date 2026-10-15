@@ -71,7 +71,9 @@ def test_heap_op_sequences_include_the_reclaim_shape():
     seqs = heaptrace.heap_op_sequences(["1", "2", "3", "4"])
     reclaim = [s for s in seqs if s.count(b"1\n64\n") >= 3 and b"2\n0\n" in s]
     assert reclaim, "no free-then-same-size-allocate sequence"
-    # the reclaiming allocation carries a distinguishable payload, and the last shape USES the
+    # the reclaiming allocation carries the MARKER the tracer looks for -- one definition, which
+    # the stage passes to both this generator and the tracer spec -- and the last shape USES the
     # stale entry afterwards
-    assert any(b"RECLAIMED" in s for s in reclaim)
+    assert any(heaptrace.RECLAIM_MARKER in s for s in reclaim)
+    assert any(b"9999" in s for s in heaptrace.heap_op_sequences(["1", "2"], marker=b"9999"))
     assert any(s.rstrip().endswith(b"3\n0") for s in reclaim)

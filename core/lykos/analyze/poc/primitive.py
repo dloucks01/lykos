@@ -693,6 +693,41 @@ def reclaim_verdict(stale_view: bytes, control_view: bytes, *, marker: bytes = R
     }
 
 
+def reclaim_verdict_traced(observation: dict, *, marker: bytes = RECLAIM_MARKER) -> dict | None:
+    """The same question, answered by READING THE CHUNK instead of by the program's output.
+
+    The output route above needs a `view` option that prints a stored entry, and most targets
+    have none -- a service, a parser, a library harness. For those the only reclaim evidence was
+    the tracer's "the chunk came back", which says nothing about whose bytes are in it.
+
+    The ptrace tracer can read the tracee's memory, so it samples the chunk TWICE: once when it is
+    freed (the marker must not already be there) and again after a later allocation is handed the
+    same address. Marker absent before, present after, is a stricter control than the output route
+    can offer -- a program that echoes recent input cannot fool a read of the chunk itself.
+
+    `observation` is a `reclaim-controlled` event from the tracer. Returns None when the marker
+    was already in the chunk before the free, because then it proves nothing about who put it
+    there.
+    """
+    if not observation:
+        return None
+    if observation.get("marker_before_free"):
+        return None
+    return {
+        "type": "controlled-reclaim",
+        "lifetime": True,
+        "reclaim": True,
+        "confirmed": True,
+        "oracle": "traced-memory",
+        "size": observation.get("size"),
+        "addr": observation.get("addr"),
+        "chunk_offset": observation.get("offset"),
+        "marker": marker.decode("latin-1"),
+        "control_echoed": False,
+        "offset": None,
+    }
+
+
 def reclaim_effect(prim: dict) -> str:
     """What a demonstrated reclaim is worth, stated without inflation."""
     size = f"{prim.get('size'):#x}-byte " if prim.get("size") else ""
@@ -701,6 +736,17 @@ def reclaim_effect(prim: dict) -> str:
                 "where no reclaim was possible, so this target echoes recent input and the "
                 "experiment cannot distinguish a reclaim from an echo -- reported as "
                 "inconclusive rather than as a demonstration")
+    if prim.get("oracle") == "traced-memory":
+        at = prim.get("chunk_offset")
+        return (f"use-after-free with a DEMONSTRATED reclaim, read out of the process's own "
+                f"memory: a later allocation took the freed {size}chunk at {prim.get('addr')} "
+                f"and the attacker's bytes are in it"
+                + (f" at offset {at}" if at is not None else "")
+                + ". The chunk was sampled before the free as well -- the marker was not there "
+                "-- so the bytes arrived with the reclaiming allocation. This target has no "
+                "output path to read the stale pointer back through, so what is NOT shown is "
+                "heavier here than on the output route: not only what the program does with "
+                "those bytes, but whether it reads them at all")
     return (f"use-after-free with a DEMONSTRATED reclaim: a later allocation of the same "
             f"{size}size class took the freed chunk, and reading the stale entry returned the "
             f"bytes that allocation carried -- so the attacker chooses the contents of an object "

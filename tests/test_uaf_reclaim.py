@@ -211,3 +211,149 @@ def test_the_stage_files_the_reclaim_as_a_demonstrated_effect(store, case, tmp_p
     assert "demonstrated" in ev          # the effects channel carries the status
     # the claim stops where the evidence does
     assert "is NOT shown" in ev
+
+
+# --- the oracle for a target with NO output path ----------------------------------------------
+
+def test_the_traced_verdict_requires_the_marker_to_arrive_with_the_reclaim():
+    """The before/after pair is the whole control. Finding the marker in a reclaimed chunk proves
+    nothing if it was already there when the chunk was freed -- the victim could have carried it
+    -- so that observation is refused rather than reported with a caveat."""
+    ok = P.reclaim_verdict_traced({"addr": "0x55a0", "offset": 8, "size": 128,
+                                   "marker_before_free": False})
+    assert ok and ok["type"] == "controlled-reclaim" and ok["confirmed"]
+    assert ok["oracle"] == "traced-memory" and ok["chunk_offset"] == 8
+    assert P.reclaim_verdict_traced({"addr": "0x55a0", "offset": 8, "size": 128,
+                                     "marker_before_free": True}) is None
+    assert P.reclaim_verdict_traced({}) is None
+
+
+def test_the_traced_effect_says_the_use_was_not_shown():
+    """The output route shows the program READING the attacker's bytes back through the stale
+    pointer. This one shows only that the bytes are in the chunk, and the difference has to be in
+    the text rather than in the reader's head."""
+    traced = P.reclaim_effect(P.reclaim_verdict_traced(
+        {"addr": "0x55a0", "offset": 0, "size": 128, "marker_before_free": False}))
+    assert "read out of the process's own memory" in traced
+    assert "whether it reads them at all" in traced
+    assert "sampled before the free" in traced
+    output = P.reclaim_effect(P.reclaim_verdict(MARKER, b"", size=0x80))
+    assert "reading the stale entry returned" in output
+    assert "whether it reads them at all" not in output
+
+
+def test_the_tracer_samples_the_chunk_before_and_after():
+    """Pins the mechanism: the marker travels in the spec, the chunk is read at free time and
+    again after it is handed back out, and the result is reported separately from "the chunk came
+    back" -- which is all the tracer could say before."""
+    src = open(heaptrace.__file__.replace(".pyc", ".py")).read()
+    assert 'marker = bytes.fromhex(spec.get("marker")' in src
+    assert "pre_marker[ptr] = marker in read_mem(ptr, 64)" in src
+    assert '"event": "reclaim-controlled"' in src
+    assert '"reclaim_controlled"' in src
+    assert "def read_mem(" in src
+
+
+def test_one_marker_definition_reaches_both_the_sequences_and_the_tracer():
+    """Two markers almost the same name is how the definition scanner drifted; the stage passes
+    the one in `poc.primitive` to the op-sequence builder and to the tracer spec."""
+    stage = open(heap_discover.__file__.replace(".pyc", ".py")).read()
+    assert "heaptrace.heap_op_sequences(opts, marker=_prim.RECLAIM_MARKER)" in stage
+    assert '"marker": _prim.RECLAIM_MARKER.hex()' in stage
+    seqs = heaptrace.heap_op_sequences(["1", "2", "3", "4"], marker=b"1234567890123456")
+    assert any(b"1234567890123456" in s for s in seqs)
+
+
+#: A notebook with NO view option: add, free, exit. Nothing is ever printed from a chunk, so the
+#: output oracle has nothing to read and the tracer's memory read is the only way to tell whether
+#: the attacker's bytes landed in the freed chunk.
+_SILENT = r"""#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+static char *n[16];
+static long rl(void){ char b[32]; int i=0; unsigned char c; while(i<31){
+    if(read(0,&c,1)<1) break; if(c=='\n') break; b[i++]=c; } b[i]=0; return strtol(b,0,10); }
+int main(void){
+  setvbuf(stdout,0,2,0);
+  for(;;){
+    printf("1.add 2.free 3.exit\n> ");
+    long o = rl();
+    if(o==1){ printf("idx: "); long i=rl(); printf("size: "); long s=rl();
+              printf("data: ");
+              if(i>=0&&i<16&&s>0&&s<=0x800){ n[i]=malloc(s);
+                  if(n[i]){ memset(n[i],0,s); int m=0; unsigned char c;
+                      while(m<s-1){ if(read(0,&c,1)<1) break; if(c=='\n') break;
+                                    ((char*)n[i])[m++]=c; } } }
+              else { unsigned char c; while(read(0,&c,1)==1 && c!='\n'); } }
+    else if(o==2){ printf("idx: "); long i=rl();
+                   if(i>=0&&i<16&&n[i]) free(n[i]); }      /* slot NOT nulled: UAF */
+    else return 0; } }
+"""
+
+
+@pytest.mark.skipif(sandbox.host_arch() != "x86-64", reason="native heap experiment")
+def test_a_silent_target_still_gets_reclaim_evidence(store, case, tmp_path):
+    """End to end on a target with no printing path: the stage must file the reclaim from the
+    TRACER's memory read, because `identify_heap_ops` cannot find a view option and the output
+    experiment therefore never runs."""
+    from lykos.analyze import register
+    from lykos.analyze.dynamic import enqueue_heap_trace
+    from lykos.analyze.ingest import ingest
+    from lykos.db.dao import FindingDAO
+    from lykos.jobs import JobConfig, JobQueue, WorkerPool
+
+    exe = _build(tmp_path, _SILENT, "silent")
+    # the premise: there IS no view option on this target
+    opts = ["1", "2", "3"]
+    width, model = heap_discover.crawl_op_model(tmp_path, exe, opts)
+    assert heap_discover.identify_heap_ops(tmp_path, exe, model, opts, width) is None, \
+        "this fixture is supposed to have no view option"
+
+    register()
+    target = ingest(store, case.id, exe)
+    pool = WorkerPool(store.db_path, store.content,
+                      JobConfig(workers=1, lease_seconds=300, poll_interval=0.02,
+                                heartbeat_interval=5.0))
+    pool.start()
+    try:
+        q = JobQueue(store.conn)
+        run = enqueue_heap_trace(q, target)
+        assert pool.wait_idle(420)
+        rec = q.runs.get(run.id)
+        if rec.status != "done":
+            pytest.skip("heap_trace could not run here: " + str(rec.error))
+    finally:
+        pool.stop(grace=3.0)
+
+    finds = [f for f in FindingDAO(store.conn).list_by_target(target.id)
+             if "reclaim" in (f.title or "").lower()]
+    if not finds:
+        pytest.skip("the tracer saw no controlled reclaim on this host "
+                    "(ptrace/debug registers may be unavailable)")
+    f = finds[0]
+    assert f.cwe == "CWE-416" and f.detector == "heap_trace"
+    ev = " ".join(str(e.get("detail", "")) for e in (f.evidence or []))
+    assert "read out of the process's own memory" in ev, ev[:300]
+    assert "sampled before the free" in ev
+    assert "whether it reads them at all" in ev, "the weaker claim must say what it does not show"
+
+
+def test_pie_is_read_from_the_elf_when_triage_has_not_filled_it_in(tmp_path):
+    """Found while making the silent-target case work, and it is a false NEGATIVE of the worst
+    kind: `pie` decides whether every breakpoint is rebased to the load base, it comes from
+    triage, and a heap_trace that runs first read False for a PIE binary -- 22 sequences driven
+    and not one alloc or free event, reported as "no heap primitive surfaced"."""
+    class _T:
+        mitigations = None
+
+    class _Triaged:
+        mitigations = {"pie": "off"}
+
+    pie_exe = _build(tmp_path, _SILENT, "pie_probe")
+    assert heap_discover._pie_for(_T(), pie_exe) is True, \
+        "a PIE binary with no triage row was traced as non-PIE"
+    # the ROW wins when it has an answer: triage knows about more than the ELF type
+    assert heap_discover._pie_for(_Triaged(), pie_exe) is False
+    # and an unreadable target is not guessed into PIE
+    assert heap_discover._pie_for(_T(), tmp_path / "nope") is False

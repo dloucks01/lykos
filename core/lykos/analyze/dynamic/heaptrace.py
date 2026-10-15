@@ -67,7 +67,15 @@ def ret_offsets(func_bytes: bytes, limit: int = 8) -> list[int]:
     return [i for i, b in enumerate(func_bytes) if b == 0xC3][:limit]
 
 
-def heap_op_sequences(menu_options, *, max_seqs: int = 40) -> list[bytes]:
+#: Written into the allocation that takes a freed chunk, so the tracer can tell the attacker's
+#: bytes from whatever was there before. All digits: a menu that case-folds stored text mangles
+#: letters. The STAGE passes the one definition (`poc.primitive.RECLAIM_MARKER`) to both this and
+#: the tracer spec; this default only serves a direct caller.
+RECLAIM_MARKER = b"4718295036471829"
+
+
+def heap_op_sequences(menu_options, *, max_seqs: int = 40,
+                      marker: bytes = RECLAIM_MARKER) -> list[bytes]:
     """Menu input sequences that PROVOKE a double-free / UAF: for each option, drive it TWICE on
     the same object (allocate once, then repeat a free/delete option), which is the shape that
     frees a chunk that is already free. Includes create-then-double-act and a plain size-then-data
@@ -100,10 +108,11 @@ def heap_op_sequences(menu_options, *, max_seqs: int = 40) -> list[bytes]:
     # allocator hands the freed chunk straight back (LIFO), which is the observation that turns a
     # lifetime defect into a controllable one -- and no other sequence here provokes it, so the
     # tracer's reclaim event could never fire however many sequences it drove.
-    nd = b"RECLAIMED0000000"                            # all digits after the tag: case-fold safe
+    nd = marker                                         # the bytes the tracer looks for
     seqs.append(create + create
                 + opts[1].encode() + nl + b"0" + nl                     # free object 0
-                + opts[0].encode() + nl + b"64" + nl + nd + nl)         # same size: takes it back
+                + opts[0].encode() + nl + b"64" + nl + nd + nl          # same size: takes it back
+                + create)                                               # a stop AFTER the fill
     if len(opts) >= 3:                                  # ...and then USE the stale entry
         seqs.append(create + create + opts[1].encode() + nl + b"0" + nl
                     + opts[0].encode() + nl + b"64" + nl + nd + nl
@@ -165,6 +174,11 @@ if __name__ == "__main__":                                            # ---- the
         # the start. A read/write to a guard from program code = an out-of-bounds ARRAY access (the
         # guard sits just before/after a fixed-size global array = an unchecked index (CWE-129).
         static_watch = [(int(o), str(n)) for o, n in spec.get("static_watch", [])]
+        # The bytes the driving sequence writes into the allocation that RECLAIMS a freed chunk.
+        # With them the tracer can answer the question a target with no printing path cannot:
+        # are the ATTACKER's bytes in the chunk a stale pointer still addresses? Memory is read
+        # straight out of the child, so no `view` option and no program output is needed.
+        marker = bytes.fromhex(spec.get("marker") or "")
         # [start, end) offsets of the allocator FAMILY (alloc/free + helpers). A watchpoint that
         # fires from inside this code is the allocator's own bookkeeping / compaction, not a program
         # use-after-free -- ignore those, count only accesses from outside the allocator.
@@ -226,6 +240,17 @@ if __name__ == "__main__":                                            # ---- the
 
         def poke(addr, val):
             libc.ptrace(PTRACE_POKETEXT, pid, ctypes.c_void_p(addr), ctypes.c_void_p(val))
+
+        def read_mem(addr, n):
+            """`n` bytes of the tracee's memory, or b"" if unreadable. PEEK returns a word at a
+            time, which is all this needs: the marker sits at the start of a reclaimed chunk."""
+            out = bytearray()
+            for off in range(0, (n + 7) & ~7, 8):
+                w = peek(addr + off)
+                if w is None:
+                    break
+                out += w.to_bytes(8, "little")
+            return bytes(out[:n])
 
         # --- hardware watchpoints (DR0-3 + DR7) for use-after-free detection ---
         def poke_dr(n, val):
@@ -289,7 +314,38 @@ if __name__ == "__main__":                                            # ---- the
         signal.alarm(timeout)
 
         freed = set()                                    # pointers currently free
+        def check_reclaims():
+            """AFTER: is the marker in a chunk that was handed back out? This is the oracle for a
+            target with NO printing path -- the marker experiment in `heap_discover` needs a
+            `view` option to read the stale entry back, and most targets have none. Memory is
+            read straight out of the tracee, and the before/after pair is a stronger control than
+            the output route can offer: a program that echoes recent input cannot fool a read of
+            the chunk itself.
+            """
+            for chunk, info in list(pending_reclaim.items()):
+                data = read_mem(chunk, min(256, int(info["size"]) + 16))
+                if not data:
+                    continue
+                at = data.find(marker)
+                if at < 0:
+                    continue
+                del pending_reclaim[chunk]
+                events.append({"event": "reclaim-controlled", "addr": hex(chunk),
+                               "offset": at, "size": info["size"],
+                               # True would mean the marker was already there before the free,
+                               # which disqualifies the observation; it is reported either way.
+                               "marker_before_free": info["pre"]})
+
         live = {}                                        # live ptr -> {"size", "end", "slot"}
+        #: chunk -> was the marker ALREADY in it when it was freed? The before half of the
+        #: reclaim test: finding the marker after a reclaim means nothing if it was there
+        #: beforehand (the victim could have carried it), and the output oracle has no
+        #: equivalent of this check.
+        pre_marker = {}
+        #: chunk -> {"size", "pre"} for a chunk handed back out and not yet inspected. Read at
+        #: the next breakpoint, because at the allocation's RETURN the program has not filled it
+        #: yet -- the fill is the read() that comes after.
+        pending_reclaim = {}
         pending_size = 0                                  # rdi captured at the last alloc entry
         free_slots = [0, 1, 2, 3]                         # DR0-3 available for watchpoints
         watches = {}                                      # slot -> {"addr", "kind", "chunk"}
@@ -389,6 +445,8 @@ if __name__ == "__main__":                                            # ---- the
                                                "array": w.get("note"), "pc": hex(rg.rip)})
                     poke_dr(6, 0)
                     continue                              # the access already retired; resume
+                if pending_reclaim:
+                    check_reclaims()
                 bp = rg.rip - 1
                 info = bps.get(bp)
                 if info is None:
@@ -397,6 +455,10 @@ if __name__ == "__main__":                                            # ---- the
                 if kind == "free":
                     ptr = rg.rdi
                     if ptr:
+                        if marker:
+                            # BEFORE: the marker must not already be in this chunk, or finding it
+                            # after the reclaim would prove nothing about who put it there.
+                            pre_marker[ptr] = marker in read_mem(ptr, 64)
                         if ptr in freed:
                             events.append({"error": "double-free", "addr": hex(ptr)})
                         freed.add(ptr)
@@ -426,6 +488,9 @@ if __name__ == "__main__":                                            # ---- the
                     # fault, and a target with no printing path still gets the evidence.
                     if ptr in freed:
                         events.append({"event": "reclaim", "addr": hex(ptr), "size": size})
+                        if marker:
+                            pending_reclaim[ptr] = {"size": max(int(size or 0), 64),
+                                                    "pre": bool(pre_marker.get(ptr))}
                     freed.discard(ptr)                   # handed back out -> live again
                     if len(alloc_addrs) < 16:
                         alloc_addrs.append(ptr)          # deterministic (ASLR-off) chunk addresses
@@ -453,6 +518,13 @@ if __name__ == "__main__":                                            # ---- the
         except TimeoutError:
             events.append({"note": "timeout"})
         finally:
+            # One last look before the tracee dies: the fill may have happened after the last
+            # heap operation, which on a short sequence is the common case.
+            try:
+                if pending_reclaim and marker:
+                    check_reclaims()
+            except Exception:
+                pass
             signal.alarm(0)
             try:
                 os.kill(pid, signal.SIGKILL)
@@ -466,6 +538,12 @@ if __name__ == "__main__":                                            # ---- the
                    # handed back out to a later allocation.
                    "reclaim": any(e.get("event") == "reclaim" for e in events),
                    "reclaims": [e for e in events if e.get("event") == "reclaim"][:16],
+                   # The chunk came back AND the attacker's bytes are in it -- the half the
+                   # tracer could not show before, and the only reclaim evidence available on a
+                   # target with no printing path. `marker_before_free` disqualifies an
+                   # observation, so it travels with it rather than being filtered out here.
+                   "reclaim_controlled": [e for e in events
+                                          if e.get("event") == "reclaim-controlled"][:16],
                    "double_free": any(e.get("error") == "double-free" for e in events),
                    "use_after_free": any(e.get("error") == "use-after-free" for e in events),
                    "heap_overflow": any(e.get("error") == "heap-overflow" for e in events),
