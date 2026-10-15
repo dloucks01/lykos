@@ -287,6 +287,12 @@ _ASAN_CWE = {
     "attempting-free-on-address": ("CWE-590", "high"),
     "negative-size-param": ("CWE-1284", "medium"),
     "SEGV": ("CWE-476", "high"),
+    # NOT memory corruption. A library that believes a size field in its input allocates what the
+    # input asked for, and ASan reports that as its own class -- which was absent here, so the
+    # fallback called it CWE-119 at HIGH: a denial of service reported as a write primitive. It is
+    # a real defect (libtiff and libjpeg both carry CVEs for it) and it is a different one.
+    "allocation-size-too-big": ("CWE-789", "medium"),
+    "out-of-memory": ("CWE-400", "medium"),
 }
 
 #: ASan's class name does NOT say which way the access went: `heap-buffer-overflow` is reported
@@ -404,6 +410,13 @@ def parse_asan_report(text: str) -> Optional[dict]:
     for fm in re.finditer(r"#\d+ 0x[0-9a-f]+ in \S+ ([^\s:]+\.(?:c|cc|cpp|cxx|h|hpp)):(\d+)", t):
         src = f"{fm.group(1).split('/')[-1]}:{fm.group(2)}"
         break
+    # UBSan names the location in its own line and prints NO stack unless something aborts, so a
+    # recovered report (`-fsanitize-recover`, or a tool that captured only the verdict) carried a
+    # bug class and no site. The prefix is the site.
+    if src is None:
+        fm = re.search(r"^(\S+\.(?:c|cc|cpp|cxx|h|hpp)):(\d+):\d+: runtime error:", t, re.M)
+        if fm:
+            src = f"{fm.group(1).split('/')[-1]}:{fm.group(2)}"
     out = {"class": bug, "cwe": cwe, "severity": sev,
            "detail": detail + (f" at {src}" if src else ""), "source": src}
     out.update(_access_detail(t))

@@ -255,6 +255,28 @@ def _last_done_payload(store, target, stage):
     return None
 
 
+def _all_done_payloads(store, target, stage) -> list:
+    """Every `<prefix>.done` payload this stage emitted, oldest first.
+
+    A stage that runs TWICE reports twice, and `_last_done_payload` answers with the second one
+    only: after `libfuzzer` gained a second pass over the remaining entry points, the plan line
+    showed what that pass did and silently dropped what the first pass did -- including, on a
+    target where the first pass found the bug, the crash itself.
+    """
+    want = {p for p, st in _EVENT_STAGE.items() if st == stage} | {stage}
+    try:
+        events = store.events.list(case_id=target.case_id, limit=400)
+    except Exception:                                    # noqa: BLE001 -- advisory
+        return []
+    out = []
+    for e in events:
+        et = e.type or ""
+        if et.endswith(".done") and et[:-len(".done")] in want:
+            if isinstance(e.payload, dict):
+                out.append(e.payload)
+    return out
+
+
 def _stage_decline(store, target, stage):
     """The note a stage emitted when it RAN and refused, or None.
 
@@ -313,6 +335,24 @@ def _stage_detail(store, target, stage) -> str:
         # while that stage performed 4,513 of the run's 7,272 executions -- so the line that
         # should carry the campaign's result looked exactly like a stage that did nothing.
         # Each campaign reports its own counts in its done event; this reads them back.
+        if stage == "libfuzzer":
+            # SUMMED OVER THE PASSES, and counted in entry points: this is the one engine that
+            # runs more than once on purpose, and "2 entry points · 41,207 execs" is the fact
+            # the operator needs -- that the library was fuzzed through more than one door.
+            pls = _all_done_payloads(store, target, "libfuzzer")
+            if pls:
+                eps = sum(int(x.get("entry_points") or 0) for x in pls)
+                ex = sum(int(x.get("execs") or 0) for x in pls)
+                cr = sum(int(x.get("crashes") or 0) for x in pls)
+                bits = []
+                if eps:
+                    bits.append(f"{eps} entry point{'s' if eps != 1 else ''}")
+                if ex:
+                    bits.append(f"{ex:,} execs")
+                if cr:
+                    bits.append(f"{cr} finding{'s' if cr != 1 else ''}")
+                if bits:
+                    return " · ".join(bits)
         if stage in _EXEC_ENGINES:
             pl = _last_done_payload(store, target, stage) or {}
             bits = []
@@ -884,7 +924,14 @@ def _distinct_crashes(store, target_id):
         # defect), so one double-free is proved once, not 47 times -- EXCEPT a sanitizer abort,
         # which carries a defect_key (ASan class+source) separating two distinct defects that both
         # abort, so both reach the prove loop instead of collapsing. See crash_dedup_key.
-        key = ((d.signal_name, d.defect_key) if d.signal_name == "SIGABRT"
+        #
+        # The defect_key is the BUCKET every crash-filing stage already agrees on, so it is used
+        # wherever one was recorded and not only for SIGABRT. An in-process sanitizer fault has
+        # no fault PC at all -- the fault is a sanitizer verdict, not a signal -- so the fallback
+        # bucketed BY CLASS ALONE: libtiff's null dereference in `TIFFFillStrip` and a second
+        # null dereference elsewhere in the library were one crash, and only one of them was ever
+        # proved. With several entry points into one library that is the normal case, not an edge.
+        key = ((d.signal_name, d.defect_key) if d.defect_key
                else (d.signal_name, d.fault_pc))
         if key not in seen:
             seen.add(key)
@@ -950,6 +997,13 @@ _NOT_PER_TARGET = frozenset({"link_case", "ipc_model", "cross_taint", "whole_sys
 
 
 #: The stages whose wall time IS the search, for the scorecard's `search_seconds`. Wider than
+#: How many FURTHER entry points the second in-process pass may take: the rest of the plan, so
+#: no door is left out by an arithmetic mismatch between two constants (the plan holds
+#: `libfuzzer.MAX_HARNESSES` and the first pass takes one of them). How many actually run is the
+#: BUDGET's decision, not this number's -- the pass divides its one slice and leaves any door it
+#: cannot give `libfuzzer_stage.MIN_FUZZ_SECONDS` unrun, and says so.
+_MORE_ENTRY_POINTS = 5
+
 #: `_EXEC_BOUNDED` on purpose: `libfuzzer` and `concolic` search too, and leaving them out is
 #: what produced a fabricated executions-per-second figure.
 _EXEC_ENGINES = frozenset({"fuzz", "coverage_fuzz", "directed_fuzz", "libfuzzer", "net_fuzz",
@@ -1023,6 +1077,8 @@ def _scorecard(store, target, bud, status) -> dict:
     # One pass over the case's events: the baseline verdict and every campaign's own execution
     # count. `dynamic.done` already reports `ran`, which is the floor this whole card is about.
     by_stage: dict = {}
+    _done_execs: dict = {}                               # one report per run of a stage
+    _tick_execs: dict = {}                               # a running total, re-reported each tick
     try:
         events = store.events.list(case_id=target.case_id, limit=8000)
     except Exception:                                    # noqa: BLE001 -- advisory
@@ -1037,8 +1093,18 @@ def _scorecard(store, target, bud, status) -> dict:
         n = pl.get("execs")
         if isinstance(n, int) and n > 0 and "." in (e.type or ""):
             key = (e.type or "").split(".")[0]
-            if n > by_stage.get(key, 0):
-                by_stage[key] = n                        # a stage's last count, not a sum of ticks
+            # A PROGRESS TICK carries the campaign's running total, so ticks are read with `max`
+            # -- summing them would count the same executions once per tick. A `.done` event is
+            # one report per RUN of the stage, so those are summed: `libfuzzer` runs twice on a
+            # library (a second pass over the remaining entry points), and taking the larger of
+            # the two reported only the better half of the work. Whichever account is higher
+            # wins, which leaves a single-pass engine exactly where it was.
+            if e.type.endswith(".done"):
+                _done_execs[key] = _done_execs.get(key, 0) + n
+            else:
+                _tick_execs[key] = max(_tick_execs.get(key, 0), n)
+    for key in set(_done_execs) | set(_tick_execs):
+        by_stage[key] = max(_done_execs.get(key, 0), _tick_execs.get(key, 0))
     execs = sum(by_stage.values())
     card["executions"] = {"total": execs, "by_engine": by_stage}
 
@@ -1066,6 +1132,21 @@ def _scorecard(store, target, bud, status) -> dict:
     #     produce, and the run never printed it or its path.
     card["search_seconds"] = round(
         sum(float(v) for k, v in (spent.get("by_stage") or {}).items() if k in _EXEC_ENGINES), 1)
+    # WHICH DOORS INTO THE LIBRARY were fuzzed. On a source target this is the single most
+    # informative line about reach: a library has many entry points, in-process fuzzing goes
+    # through one harness at a time, and a run that reported "10,969 executions" said nothing
+    # about whether that was its parser or one string helper. Every harness the passes built,
+    # with what it did.
+    doors = [d for pl in _all_done_payloads(store, target, "libfuzzer")
+             for d in (pl.get("harnesses") or []) if isinstance(d, dict)]
+    if doors:
+        card["in_process"] = {
+            "entry_points": sum(1 for d in doors if d.get("built")),
+            "planned": len(doors),
+            "doors": [{"entry": d.get("entry"), "kind": d.get("kind"),
+                       "built": bool(d.get("built")), "execs": int(d.get("execs") or 0),
+                       "findings": int(d.get("crashes") or 0),
+                       "why": str(d.get("why") or "")[:160]} for d in doors]}
     try:
         from ..db.dao import DynResultDAO as _DRD
         from ..db.dao import PocDAO as _PD
@@ -1397,6 +1478,24 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
             # same tarball at 900s had enough slack for it to run, found the heap overflow and
             # produced a verified PoC. That difference was budget luck, not design.
             _staged(bud, store, t, "libfuzzer", status, stop, want=180.0)
+            # THE REST OF THE LIBRARY. One `libfuzzer` call fuzzes the strongest entry point,
+            # which on a real library is a fraction of its input surface: libtiff 4.0.3 offers
+            # six doors the synthesizer can reach and the campaign went through one of them. The
+            # second call takes the next few, and it is a SEPARATE call so that the first keeps
+            # its full slice -- breadth is worth having, and not at the price of the depth that
+            # found the bug the first harness finds. Each harness links objects the first compile
+            # already produced (measured: 13.4 s for the first, 0.5 s for each of the next five),
+            # so the extra reach costs fuzzing time and almost no build time.
+            #
+            # Guarded by what the stage ITSELF reported, because only it has the source tree and
+            # so only it can say how many entry points exist. The case budget decides whether
+            # there is room: this is a sampler in the search phase like any other, so the solver's
+            # reserve and the prove phase's are untouched by it.
+            _lf = _last_done_payload(store, t, "libfuzzer") or {}
+            if _lf.get("more_entry_points") and not stop.is_set():
+                _staged(bud, store, t, "libfuzzer", status, stop,
+                        {"harness_from": int(_lf.get("next_entry_point") or 1),
+                         "harness_max": _MORE_ENTRY_POINTS}, want=180.0)
             # coverage fuzz (AFL, falls back to blind if unavailable), then directed on the same
             # channel -- EXCEPT on a non-native image, where AFL cannot apply at all. AFL
             # instruments machine code: a .class/.jar is bytecode and a PE runs under wine, so

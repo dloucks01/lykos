@@ -9,11 +9,13 @@ each crash with its sanitizer report -- a confirmed finding with a source file:l
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import shutil
 import subprocess
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 _C_EXT = {".c"}
@@ -42,16 +44,34 @@ def _clang(cxx: bool):
     return shutil.which("clang++" if cxx else "clang")
 
 
+def find_harnesses(root, *, limit: int = 8) -> list:
+    """Every source file defining LLVMFuzzerTestOneInput, shallowest first.
+
+    A project that ships harnesses usually ships SEVERAL -- an OSS-Fuzz tree has one per entry
+    point, which is the very breadth we synthesize for a tree that has none -- and taking the
+    first one `rglob` happened to yield threw the rest away. They cannot be linked together (two
+    definitions of the same symbol), so each is its own build.
+    """
+    out = []
+    for p in sorted(Path(root).rglob("*")):
+        if not (p.is_file() and p.suffix in _SRC_EXT):
+            continue
+        rel = p.relative_to(Path(root)).parts
+        if any(seg in _SKIP_DIRS for seg in rel):
+            continue
+        try:
+            if _HARNESS_RE.search(p.read_text(errors="ignore")):
+                out.append(p)
+        except OSError:
+            pass
+    out.sort(key=lambda p: (len(p.relative_to(Path(root)).parts), str(p)))
+    return out[:max(0, limit)]
+
+
 def find_harness(root) -> Path | None:
-    """A source file defining LLVMFuzzerTestOneInput, if the project ships one."""
-    for p in Path(root).rglob("*"):
-        if p.is_file() and p.suffix in _SRC_EXT:
-            try:
-                if _HARNESS_RE.search(p.read_text(errors="ignore")):
-                    return p
-            except OSError:
-                pass
-    return None
+    """The project's own harness, if it ships one. See `find_harnesses`."""
+    found = find_harnesses(root, limit=1)
+    return found[0] if found else None
 
 
 # A function DEFINITION: optionally a return type, a name, a parameter list, then `{`. Two
@@ -89,23 +109,38 @@ def _opaque_param(param: str) -> bool:
     return not _FILLABLE.match(param.strip())
 
 
+_DEFS_CACHE: dict = {}
+
+
+def defs_index(root) -> dict:
+    """{name: (file, params)} for every function the library DEFINES, by one scanner.
+
+    `fn_params`, `fn_def_file` and `fn_first_arg_type` each carried their own ANSI-only pattern,
+    and that is how a correct plan produced a harness that crashes on its first input: zlib is
+    written in K&R style, the PLANNER learned to read it, and `fn_params("gzopen")` still
+    answered `[]`. The shape was then inferred as `cstring`, so the harness declared
+    `void gzopen(char *)` and called the real two-parameter `gzopen(path, mode)` with one
+    argument -- `mode` was whatever happened to be in the register, zlib dereferenced it, and the
+    campaign reported an ASan SEGV in zlib on execution one. A fabricated crash in a real library
+    is the worst output this tool can produce, and three copies of one regex is how it got there.
+    """
+    key = str(root)
+    if key in _DEFS_CACHE:
+        return _DEFS_CACHE[key]
+    idx: dict = {}
+    sa = static_aliases(root)
+    for path, txt in _library_srcs(root):
+        for name, params in _fn_defs(txt, sa):
+            if name in _KEYWORDS:
+                continue
+            idx.setdefault(name, (path, params))
+    return _cache_put(_DEFS_CACHE, key, idx)
+
+
 def fn_params(root, fn: str) -> list:
     """`fn`'s parameter type spellings, or [] when it is not found / takes none."""
-    for p in sorted(Path(root).rglob("*")):
-        if not (p.is_file() and p.suffix in _SRC_EXT):
-            continue
-        try:
-            txt = p.read_text(errors="ignore")
-        except OSError:
-            continue
-        for m in _FN_DEF.finditer(txt):
-            if m.group(1) != fn:
-                continue
-            raw = (m.group(2) or "").strip()
-            if not raw or raw == "void":
-                return []
-            return [a.strip() for a in raw.split(",") if a.strip()]
-    return []
+    params = defs_index(root).get(fn, (None, []))[1]
+    return [] if params == ["void"] else list(params)
 
 
 # An opener's matching closer, by name. Without one the harness leaks a handle per iteration
@@ -163,6 +198,23 @@ _PORT_DIRS = ("amiga", "win32", "windows", "msvc", "vms", "os2", "macos", "watco
               "mingw", "darwin", "aix", "hpux", "solaris", "android", "ios", "bcb5", "nt")
 
 
+#: A declaration whose parameter list is wrapped in a macro: `gzopen OF((const char *path, const
+#: char *mode))`. zlib and libpng (`PNGARG((...))`) both do it, as does every library that still
+#: supports a pre-ANSI compiler. The name the reader sees is then the MACRO's -- the constructor
+#: search read `gzopen OF((...))` as a function called `OF`, found no name that looked like a
+#: constructor, and zlib's `gzopen` -> `gzread` -> `gzclose` triple did not exist as far as the
+#: synthesizer was concerned. `#define OF(args) args`, so unwrapping it is what the preprocessor
+#: would do.
+#: Bounded on purpose: with an unlimited `.*?` an unbalanced `((` would match the next `))`
+#: hundreds of lines away and the substitution would mangle every declaration in between. A
+#: parameter list is never that long.
+_MACRO_ARGS = re.compile(r"\b[A-Z_]\w*\(\((.{0,400}?)\)\)", re.S)
+
+
+def _unwrap_macro_args(text: str) -> str:
+    return _MACRO_ARGS.sub(lambda m: "(" + m.group(1) + ")", text or "")
+
+
 def _declared_in_header(root, fn: str):
     """The header that declares `fn`, if any. A function in the PUBLIC header is the library's
     API -- the surface an application reaches, so a bug behind it is a bug anyone can reach."""
@@ -183,7 +235,12 @@ def _declared_in_header(root, fn: str):
         if any(seg in _PORT_DIRS for seg in rel[:-1]):
             continue
         try:
-            if pat.search(h.read_text(errors="ignore")):
+            # UNWRAPPED FIRST. A declaration whose parameter list is wrapped in a macro
+            # (`gzread OF((gzFile, voidp, unsigned))`) has no punctuation after the name, so the
+            # function read as undeclared and a public entry point was treated as private.
+            # zlib's `gzread` matched anyway, from an unrelated second mention in the header --
+            # i.e. by luck, which is the sort of thing that works until the next library.
+            if pat.search(_unwrap_macro_args(h.read_text(errors="ignore"))):
                 hits.append(h)
         except OSError:
             continue
@@ -195,41 +252,221 @@ def _declared_in_header(root, fn: str):
     return hits[0]
 
 
-def pick_harness_fn(root) -> str | None:
-    """Auto-select an entry function to fuzz in a LIBRARY with no in-tree harness.
+#: The per-tree scans below are cached because every scanner asks for them, and BOUNDED because
+#: the API server is long-lived: each analyzed target materializes its source into a fresh scratch
+#: path, so the key is never reused and an unbounded cache would hold every tree the process ever
+#: saw (libtiff alone indexes some two thousand names).
+_CACHE_ROOTS = 8
 
-    This returned the FIRST non-static function taking a `char*` in alphabetical file order,
-    which on libtiff 4.0.3 meant `convertHTMLcodes` -- an HTML-entity helper inside a command
-    line tool. In-process fuzzing then exercised a string unescaper while libtiff's own decoders
-    (where its CVEs are) were never called. The candidate set is unchanged; what is new is that
-    they are RANKED: the library's public, input-consuming API first.
+
+def _cache_put(cache: dict, key, value):
+    if len(cache) >= _CACHE_ROOTS:
+        cache.clear()
+    cache[key] = value
+    return value
+
+
+_ALIAS_CACHE: dict = {}
+_DEFINE_STATIC = re.compile(r"^[ \t]*#[ \t]*define[ \t]+([A-Za-z_]\w*)[ \t]+static\b", re.M)
+
+
+def static_aliases(root) -> frozenset:
+    """The project's own spellings of `static`, from its own `#define`s.
+
+    zlib writes `#define local static` in `zutil.h` and then `local int gz_load(...)` for every
+    internal function, so nothing in the tree is spelled `static` at all and half of `gzread.c`
+    read as public API. The project says what its keyword is; this reads it rather than carrying
+    a list of idioms (`local`, `PRIVATE`, `STATIC`) that is wrong for the next project.
     """
-    root = Path(root)
-    best, best_score = None, -(10 ** 6)
-    for p in sorted(root.rglob("*")):
-        if not (p.is_file() and p.suffix in _SRC_EXT):
+    key = str(root)
+    if key in _ALIAS_CACHE:
+        return _ALIAS_CACHE[key]
+    found = set()
+    try:
+        for h in sorted(Path(root).rglob("*")):
+            if not (h.is_file() and (h.suffix == ".h" or h.suffix in _SRC_EXT)):
+                continue
+            rel = h.relative_to(Path(root)).parts
+            if any(seg in _SKIP_DIRS for seg in rel):
+                continue
+            for m in _DEFINE_STATIC.finditer(h.read_text(errors="ignore")):
+                found.add(m.group(1))
+    except OSError:
+        pass
+    return _cache_put(_ALIAS_CACHE, key, frozenset(found))
+
+
+def _static_before(txt: str, start: int, statics=()) -> bool:
+    """Is the definition at `start` declared `static` (under any of the project's spellings)?
+
+    `_FN_DEF` refuses a definition whose line BEGINS with `static`, which is most of them and not
+    all: expat writes the storage class and the return type on the line above the name --
+
+        static int FASTCALL
+        attcmp(const void *p1, const void *p2)
+
+    -- so `attcmp` was ranked as one of the library's entry points. A static function is not
+    callable from another translation unit at all, so the harness synthesized for it cannot link:
+    the cost is not a weak candidate, it is a build that fails after paying for the library's
+    whole compile. Read the declaration back to its last boundary and look for the keyword.
+    """
+    head = txt[max(0, start - 240):start]
+    cut = max(head.rfind(";"), head.rfind("}"), head.rfind("{"), head.rfind("*/"))
+    words = "|".join(re.escape(w) for w in ("static", *statics))
+    return re.search(r"\b(?:" + words + r")\b", head[cut + 1:]) is not None
+
+
+#: A K&R (pre-ANSI) function DEFINITION: the parameter list is bare NAMES and the types follow it
+#: as declarations before the body. zlib 1.2.11 is written this way throughout --
+#:
+#:     int ZEXPORT uncompress (dest, destLen, source, sourceLen)
+#:         Bytef *dest;
+#:         uLongf *destLen;
+#:         const Bytef *source;
+#:         uLong sourceLen;
+#:     {
+#:
+#: -- so the ANSI pattern above matched NOTHING in the whole library: `_fn_defs` found zero
+#: functions in `uncompr.c`, `gzlib.c` and `gzread.c`, and zlib was reachable only through its
+#: `_KNOWN_HARNESSES` entry. The style is not a curiosity: it is what a lot of old, bug-rich C
+#: looks like, which is the code most worth fuzzing.
+_KR_DEF = re.compile(
+    r"(?:^|\n)[ \t]*(?!static\b|typedef\b|return\b|else\b|switch\b|case\b|while\b|if\b|for\b)"
+    r"(?:[A-Za-z_][\w \t*]*?[ \t*]+)?"
+    r"([A-Za-z_]\w*)[ \t]*\(([ \t]*[A-Za-z_]\w*(?:[ \t]*,[ \t]*[A-Za-z_]\w*)*[ \t]*)\)[ \t]*\r?\n"
+    r"((?:[ \t]*[A-Za-z_][^;{}()]*;[ \t]*\r?\n)+)"
+    r"[ \t]*\{",
+    re.M)
+
+
+def _kr_params(names: str, decls: str) -> list:
+    """Parameter spellings for a K&R definition, in the order the parameter list names them.
+
+    A declaration may name several (`int a, b;`), and the type belongs to all of them. A name the
+    declarations never mention defaults to `int`, which is what C89 says it is.
+    """
+    order = [n.strip() for n in names.split(",") if n.strip()]
+    typed: dict = {}
+    for line in decls.splitlines():
+        line = line.strip().rstrip(";").strip()
+        if not line:
             continue
-        rel = p.relative_to(root).parts
-        if any(seg in _SKIP_DIRS for seg in rel):
+        head, _, tail = line.rpartition(" ")
+        if not head:
             continue
-        # EXCLUDED, not penalised. A score penalty still let a sample program win when nothing in
-        # the library itself was a candidate: zlib's `gzlog_open` (from `examples/`) was picked and
-        # the link failed on `gzlog_close`, which is not compiled at all. A function outside the
-        # library is not a worse choice, it is not a choice.
+        # `Bytef *dest` -> type `Bytef *`; `int a, b` -> type `int` for both
+        parts = [x.strip() for x in line.split(",")]
+        first = parts[0]
+        m = re.match(r"^(.*?)([A-Za-z_]\w*)$", first)
+        if not m:
+            continue
+        base = m.group(1).strip()
+        typed[m.group(2)] = f"{base} {m.group(2)}".strip()
+        for extra in parts[1:]:
+            stars = "*" * extra.count("*")
+            nm = extra.replace("*", "").strip()
+            root_t = base.replace("*", "").strip()
+            if nm:
+                typed[nm] = f"{root_t} {stars}{nm}".strip()
+    return [typed.get(n, f"int {n}") for n in order]
+
+
+def _fn_defs(txt: str, statics=()):
+    """(name, params) for every NON-static function defined in `txt`, in either C style.
+
+    The storage class is looked for up to the NAME, not up to the start of the match: the return
+    type is part of the match (`local int \ngz_load(...)`), so a keyword sitting in front of the
+    type is inside it.
+    """
+    for m in _FN_DEF.finditer(txt):
+        if _static_before(txt, m.start(1), statics):
+            continue
+        yield m.group(1), [a.strip() for a in (m.group(2) or "").split(",") if a.strip()]
+    for m in _KR_DEF.finditer(txt):
+        if _static_before(txt, m.start(1), statics):
+            continue
+        params = _kr_params(m.group(2), m.group(3))
+        if params:
+            yield m.group(1), params
+
+
+def _library_srcs(root):
+    """The translation units a harness may call INTO, with their text: the files this tree's build
+    will actually compile, minus the ones that are not the library.
+
+    The two scanners below used to walk every `*.c` in the tree, which produced candidates that
+    could not be reached even in principle:
+
+      * a file with its OWN `main` is a PROGRAM, and `_sources(exclude_main=True)` drops it from
+        the build -- so bzip2's `fopen_output_safely` and expat's `getXMLCharset` (both in a tool's
+        translation unit, beside its `main`) were ranked as library entry points that could never
+        link, and the top five candidates for bzip2 were all bzip2.c's own helpers;
+      * a PLATFORM PORT's file is real code for another machine. expat ships `amiga/`, so
+        `_68k_commenthandler` ranked above every function in the library.
+
+    Reading each file once here also stops the scanners reading the whole tree twice.
+    """
+    out = []
+    for p in _sources(Path(root), exclude_main=True):
+        rel = p.relative_to(Path(root)).parts
+        if any(seg.lower() in _PORT_DIRS for seg in rel[:-1]):
+            continue
         if any(seg in _NOT_LIBRARY for seg in rel[:-1]):
             continue
         try:
             txt = p.read_text(errors="ignore")
         except OSError:
             continue
-        for m in _FN_DEF.finditer(txt):
-            name = m.group(1)
+        # A FUZZ HARNESS IS NOT THE LIBRARY. `_sources` keeps a harness file on purpose (it is
+        # the one `main`-like unit the build wants), and it is a plain source file with a
+        # non-static function in it -- so on a tree that ships its own harnesses,
+        # `LLVMFuzzerTestOneInput` was itself ranked as one of the library's entry points and a
+        # harness was synthesized to call it.
+        if _HARNESS_RE.search(txt):
+            continue
+        out.append((p, txt))
+    return out
+
+
+def rank_harness_fns(root, *, limit: int = 8) -> list:
+    """Entry functions worth fuzzing in a LIBRARY with no in-tree harness, strongest first.
+
+    This returned the FIRST non-static function taking a `char*` in alphabetical file order,
+    which on libtiff 4.0.3 meant `convertHTMLcodes` -- an HTML-entity helper inside a command
+    line tool. In-process fuzzing then exercised a string unescaper while libtiff's own decoders
+    (where its CVEs are) were never called. The candidate set is unchanged; what is new is that
+    they are RANKED: the library's public, input-consuming API first.
+
+    It also returned ONLY the winner, and a library is not one function. libtiff declares some
+    two hundred public entry points and we fuzzed one of them, so "we fuzzed libtiff" meant "we
+    fuzzed `TIFFOpen`" -- every decoder reached only if that one door happened to lead there.
+    Ranking already produced the whole ordered list; throwing all but its head away was the
+    waste. `plan_harnesses` takes as many as the budget can run.
+    """
+    root = Path(root)
+    best: dict = {}
+    # EXCLUSION, not a penalty. A score penalty still let a sample program win when nothing in
+    # the library itself was a candidate: zlib's `gzlog_open` (from `examples/`) was picked and
+    # the link failed on `gzlog_close`, which is not compiled at all. A function outside the
+    # library is not a worse choice, it is not a choice -- see `_library_srcs`.
+    _sa = static_aliases(root)
+    for _p, txt in _library_srcs(root):
+        for name, raw in _fn_defs(txt, _sa):
             if name in _KEYWORDS:
                 continue
-            raw = [a.strip() for a in (m.group(2) or "").split(",") if a.strip()]
             first = raw[0] if raw else ""
             if not _PTR_FIRST.match(first):
                 continue                                 # nothing to deliver the bytes through
+            # IT HAS TO BE AN INPUT. A `void *` with no `const` is an OUT parameter or an opaque
+            # context, and handing it the fuzz bytes is a misuse that faults inside the library:
+            # expat's `XmlInitUnknownEncoding(void *mem, ...)` WRITES an encoding table into
+            # `mem`, so a harness passing libFuzzer's buffer there earns a heap-buffer-overflow
+            # write in expat's own code -- a finding that would be filed against expat and caused
+            # entirely by us. `const` is the library telling us it only reads.
+            _const = first.lower().lstrip().startswith("const")
+            if not _const and re.match(r"^\s*(void|unsigned\s+char|uint8_t|u_char)\s*\*",
+                                       first, re.I):
+                continue
             # Every argument past the first has to be INVENTED by the harness, and an invented
             # one is a lie the library may crash on -- `TIFFClientOpen` is the public, perfectly
             # parser-ish entry point of libtiff and it takes eight callbacks, so a synthesized
@@ -238,13 +475,24 @@ def pick_harness_fn(root) -> str | None:
             score = -2 * max(0, len(raw) - 2)
             if any(_opaque_param(a) for a in raw[1:]):
                 score -= 6
+            if not _const:
+                score -= 3                               # plausibly input, but it does not say so
             if _PARSERISH.search(name):
                 score += 4
             if _declared_in_header(root, name) is not None:
                 score += 3
-            if score > best_score:
-                best, best_score = name, score
-    return best
+            if score > best.get(name, -(10 ** 6)):
+                best[name] = score
+    # Ties broken by NAME, so a plan is reproducible: two runs of the same tree have to build the
+    # same harnesses, or a finding cannot be attributed to the entry point that found it.
+    ranked = sorted(best.items(), key=lambda kv: (-kv[1], kv[0]))
+    return [name for name, _ in ranked[:max(0, limit)]]
+
+
+def pick_harness_fn(root) -> str | None:
+    """The single best entry function to fuzz, or None. See `rank_harness_fns`."""
+    ranked = rank_harness_fns(root, limit=1)
+    return ranked[0] if ranked else None
 
 
 def fn_first_arg_type(root, fn: str):
@@ -252,37 +500,21 @@ def fn_first_arg_type(root, fn: str):
     or "" when it takes no args, or None if not found. Needed to forward-declare `fn` in the harness
     so C++ name mangling matches -- `extern void fn()` mangles differently than `fn(const char*)` and
     fails to link. C is lenient, but the exact declaration is correct for both."""
-    pat = re.compile(r"\b" + re.escape(fn) + r"\s*\(([^)]*)\)\s*(?:const\s*)?\{", re.M)
-    for p in sorted(Path(root).rglob("*")):
-        if not (p.is_file() and p.suffix in _SRC_EXT):
-            continue
-        try:
-            m = pat.search(p.read_text(errors="ignore"))
-        except OSError:
-            continue
-        if not m:
-            continue
-        params = m.group(1).strip()
-        if not params or params == "void":
-            return ""
-        first = params.split(",")[0].strip()
-        first = re.sub(r"\b[A-Za-z_]\w*\s*$", "", first).strip() or first   # drop the param NAME
-        return first
-    return None
+    hit = defs_index(root).get(fn)
+    if hit is None:
+        return None
+    params = hit[1]
+    if not params or params == ["void"]:
+        return ""
+    first = params[0].strip()
+    # drop the parameter NAME, keeping the type spelling
+    return re.sub(r"\b[A-Za-z_]\w*\s*$", "", first).strip() or first
 
 
 def fn_def_file(root, fn) -> Path | None:
     """The source file that DEFINES `fn` (for its language: .c -> a C symbol, .cc/.cpp -> a mangled
     C++ symbol -- which decides whether the harness declares it `extern "C"`)."""
-    pat = re.compile(r"\b" + re.escape(fn) + r"\s*\([^)]*\)\s*(?:const\s*)?\{", re.M)
-    for p in sorted(Path(root).rglob("*")):
-        if p.is_file() and p.suffix in _SRC_EXT:
-            try:
-                if pat.search(p.read_text(errors="ignore")):
-                    return p
-            except OSError:
-                pass
-    return None
+    return defs_index(root).get(fn, (None, None))[0]
 
 
 def _arg_values(params: list) -> list:                   # noqa: D401
@@ -343,8 +575,21 @@ def synth_file_harness(fn: str, params: list, *, closer: str | None = None,
     """
     fuzz_qual = 'extern "C" ' if cxx else ""
     fn_qual = 'extern "C" ' if (cxx and c_linkage) else "extern "
-    args = ", ".join(["(void*)path"] + _arg_values(params[1:]))
-    decl = f'{fn_qual}void *{fn}({_types_only(params)});\n'
+    # A C++ SYMBOL IS MANGLED FROM ITS PARAMETER TYPES, so the declaration has to name the real
+    # ones. `_types_only` rewrites every pointer to `void *` -- which is what lets a C project's
+    # own typedefs be declared at all (see its docstring) and, for a C++ function, produces a
+    # declaration of a DIFFERENT function: `load(void*)` where the project defines
+    # `load(const char*)`, so the harness compiled and the link failed on an undefined symbol.
+    # C is unaffected either way: its symbol names carry no types.
+    mangled = cxx and not c_linkage
+    types = [_handle_type(a) for a in params] if mangled else []
+    if mangled:
+        args = ", ".join([f"({types[0]})path"]
+                         + [f"({ty}){v}" for ty, v in zip(types[1:], _arg_values(params[1:]))])
+        decl = f'{fn_qual}void *{fn}({", ".join(types) or "void"});\n'
+    else:
+        args = ", ".join(["(void*)path"] + _arg_values(params[1:]))
+        decl = f'{fn_qual}void *{fn}({_types_only(params)});\n'
     close_decl = f'{fn_qual}void {closer}(void *);\n' if closer else ""
     close_call = f"        if (h) {closer}(h);\n" if closer else ""
     return ("#include <stdint.h>\n#include <stddef.h>\n#include <stdlib.h>\n"
@@ -370,6 +615,10 @@ def synth_file_harness(fn: str, params: list, *, closer: str | None = None,
 _DTOR_WORDS = re.compile(r"(free|destroy|close|delete|release|fini|cleanup|end|reset)", re.I)
 #: Names that CREATE one.
 _CTOR_WORDS = re.compile(r"(create|new|alloc|init|open|make|begin)", re.I)
+#: Names that MANAGE MEMORY for the handle rather than consume input through it. `(void *ptr,
+#: size_t size)` is exactly the shape of a (buffer, length) pair, so expat's `XML_MemRealloc`
+#: ranked as the library's second-best consumer -- a reallocator fed fuzz bytes as a POINTER.
+_ALLOC_WORDS = re.compile(r"(malloc|realloc|calloc|_mem|mem_|memory)", re.I)
 
 
 def _handle_type(param: str) -> str:
@@ -391,7 +640,46 @@ def _handle_type(param: str) -> str:
     return " ".join(parts[:-1])
 
 
-def _buf_len_at(params: list) -> int:
+_TYPEDEF_PTR = re.compile(
+    r"typedef\s+(?:const\s+)?(?:unsigned\s+|signed\s+)?"
+    r"(?:void|char|uint8_t|u_char)\s+(?:[A-Z_]\w*\s+)?\*\s*([A-Za-z_]\w*)\s*;")
+_PTR_TYPEDEF_CACHE: dict = {}
+
+
+def byte_ptr_typedefs(root) -> frozenset:
+    """Names the project typedefs to a byte-or-void POINTER (`typedef void *voidp;`).
+
+    A buffer parameter does not have to be spelled with a `*`. zlib's reader is
+    `gzread(gzFile file, voidp buf, unsigned len)` -- a textbook (pointer, length) pair that
+    `_PTR_FIRST` could not see, so the library's one synthesizable door was `gzopen` followed by
+    `gzclose`: a harness that opens the fuzz file, reads its header and closes it again without
+    ever inflating a byte.
+    """
+    key = str(root)
+    if key in _PTR_TYPEDEF_CACHE:
+        return _PTR_TYPEDEF_CACHE[key]
+    found = set()
+    try:
+        for h in sorted(Path(root).rglob("*.h")):
+            rel = h.relative_to(Path(root)).parts
+            if any(seg in _SKIP_DIRS for seg in rel):
+                continue
+            for m in _TYPEDEF_PTR.finditer(h.read_text(errors="ignore")):
+                found.add(m.group(1))
+    except OSError:
+        pass
+    return _cache_put(_PTR_TYPEDEF_CACHE, key, frozenset(found))
+
+
+def is_byte_ptr(param: str, ptrs=()) -> bool:
+    """Can the fuzz bytes (or a buffer) be delivered through this parameter?"""
+    if _PTR_FIRST.match((param or "").strip()):
+        return True
+    ty = _handle_type(param or "").replace("const", "").strip()
+    return ty.rstrip("*").strip() in set(ptrs)
+
+
+def _buf_len_at(params: list, ptrs=()) -> int:
     """Index of the first (pointer, length) PAIR in `params`, or -1.
 
     This is the shape libFuzzer hands over directly, and finding it is what tells a
@@ -399,13 +687,13 @@ def _buf_len_at(params: list) -> int:
     a function that merely happens to take a handle.
     """
     for i in range(len(params) - 1):
-        if _PTR_FIRST.match(params[i].strip()) and _LEN_PARAM.search(params[i + 1]):
+        if is_byte_ptr(params[i], ptrs) and _LEN_PARAM.search(params[i + 1]):
             return i
     return -1
 
 
-def find_handle_triple(root):
-    """A create -> consume -> destroy triple, or None.
+def find_handle_triples(root, *, limit: int = 6) -> list:
+    """Every create -> consume -> destroy triple this tree offers, strongest first.
 
     THE REACH GAP. `pick_harness_fn` requires a pointer-spelled first parameter, so it can only
     reach a library whose entry point takes the bytes directly. The dominant shape in a C library
@@ -421,53 +709,64 @@ def find_handle_triple(root):
     libxml2, sqlite3 and openssl: a hand-written harness per library does not generalise, and
     this does.
 
-    Returns `{"header", "handle", "ctor", "ctor_params", "consume", "consume_params", "dtor",
-    "buf_at"}`. The header matters: the handle type is OPAQUE, so the harness cannot
+    A handle usually has SEVERAL consumers -- expat takes bytes through both `XML_Parse` and
+    `XML_ParseBuffer`, and a decoder library feeds the same handle from a file, a buffer and a
+    callback -- so one triple per handle type is a fraction of the library's input surface. The
+    constructor and destructor are resolved ONCE PER HANDLE TYPE and shared by its consumers:
+    finding them walks the tree, and doing that per consumer was the reason this only ever
+    returned one.
+
+    Each triple is `{"header", "handle", "ctor", "ctor_params", "consume", "consume_params",
+    "dtor", "buf_at"}`. The header matters: the handle type is OPAQUE, so the harness cannot
     forward-declare its way around it and has to `#include` the library's own public header --
     which is what a real harness does anyway, and brings every prototype with it.
     """
     root = Path(root)
     # 1. a CONSUMER: an opaque first parameter followed by a (pointer, length) pair.
     cands = []
-    for p in sorted(root.rglob("*")):
-        if not (p.is_file() and p.suffix in _SRC_EXT):
-            continue
-        rel = p.relative_to(root).parts
-        if any(seg in _SKIP_DIRS for seg in rel) or any(seg in _NOT_LIBRARY for seg in rel[:-1]):
-            continue
-        try:
-            txt = p.read_text(errors="ignore")
-        except OSError:
-            continue
-        for m in _FN_DEF.finditer(txt):
-            name = m.group(1)
-            if name in _KEYWORDS or _DTOR_WORDS.search(name):
+    _sa, _ptrs = static_aliases(root), byte_ptr_typedefs(root)
+    for _p, txt in _library_srcs(root):
+        for name, params in _fn_defs(txt, _sa):
+            if name in _KEYWORDS or _DTOR_WORDS.search(name) or _ALLOC_WORDS.search(name):
                 continue
-            params = [a.strip() for a in (m.group(2) or "").split(",") if a.strip()]
             if len(params) < 3 or not _opaque_param(params[0]):
                 continue                                 # no handle to thread
-            at = _buf_len_at(params[1:])
+            at = _buf_len_at(params[1:], _ptrs)
             if at < 0:
                 continue
             htype = _handle_type(params[0])
             if not htype or htype in ("void *", "void*"):
                 continue                                 # `void *` is not a named handle type
             hdr = _declared_in_header(root, name)
-            score = (4 if hdr is not None else 0) + (3 if _PARSERISH.search(name) else 0)
+            if hdr is None:
+                continue                                 # a private function is not an API
+            score = 4 + (3 if _PARSERISH.search(name) else 0)
             cands.append((score, name, params, at + 1, htype, hdr))
-    if not cands:
-        return None
     cands.sort(key=lambda c: (-c[0], c[1]))
+    out, resolved = [], {}
     for _score, name, params, buf_at, htype, hdr in cands:
-        if hdr is None:
-            continue                                     # a private function is not an API
-        ctor = _find_by_return(root, hdr, htype, _CTOR_WORDS, exclude={name})
+        if len(out) >= max(0, limit):
+            break
+        if htype not in resolved:
+            ctor = _find_by_return(root, hdr, htype, _CTOR_WORDS, exclude={name})
+            dtor = (_find_taking_only(root, htype, _DTOR_WORDS, exclude={name, ctor[0]},
+                                      kin=ctor[0]) if ctor else None)
+            resolved[htype] = (ctor, dtor)
+        ctor, dtor = resolved[htype]
         if not ctor:
             continue
-        dtor = _find_taking_only(root, htype, _DTOR_WORDS, exclude={name, ctor[0]})
-        return {"header": hdr, "handle": htype, "ctor": ctor[0], "ctor_params": ctor[1],
-                "consume": name, "consume_params": params, "dtor": dtor, "buf_at": buf_at}
-    return None
+        if name in (ctor[0], dtor):
+            continue
+        out.append({"header": hdr, "handle": htype, "ctor": ctor[0], "ctor_params": ctor[1],
+                    "consume": name, "consume_params": params, "dtor": dtor, "buf_at": buf_at,
+                    "ctor_file": ctor_opens_a_file(ctor[0], ctor[1])})
+    return out
+
+
+def find_handle_triple(root):
+    """The strongest create -> consume -> destroy triple, or None. See `find_handle_triples`."""
+    triples = find_handle_triples(root, limit=1)
+    return triples[0] if triples else None
 
 
 def _find_by_return(root, header, htype: str, words, exclude=()):
@@ -480,7 +779,7 @@ def _find_by_return(root, header, htype: str, words, exclude=()):
     to be named like a constructor, take only parameters we can supply, and link.
     """
     try:
-        txt = Path(header).read_text(errors="ignore")
+        txt = _unwrap_macro_args(Path(header).read_text(errors="ignore"))
     except OSError:
         return None
     bare = htype.replace("*", "").strip()
@@ -498,24 +797,102 @@ def _find_by_return(root, header, htype: str, words, exclude=()):
     return None
 
 
-def _find_taking_only(root, htype: str, words, exclude=()):
-    """The name of a function taking exactly one `htype`, named like a releaser, or None."""
+#: Words that RELEASE a handle for good, as against ones that merely end a phase of using it.
+#: Both match `_DTOR_WORDS`, and taking whichever the tree yielded first was wrong: libtiff's
+#: `TIFFImageIterEnd` matches "end" and sorts before `TIFFClose`, so the synthesized harness
+#: ended the iteration and never closed the file -- a leaked TIFF handle and an open descriptor
+#: on EVERY execution, which over a hundred thousand of them stops being a fuzzing campaign and
+#: becomes a test of the allocator.
+_DTOR_STRONG = re.compile(r"(free|destroy|close|delete|release|dispose)", re.I)
+
+
+def _find_taking_only(root, htype: str, words, exclude=(), kin: str | None = None):
+    """The name of the function that takes exactly one `htype` and releases it, or None.
+
+    Ranked, not first-found, on three pieces of evidence in order:
+
+      * it belongs to the SAME API as `kin` (the constructor), by shared name prefix. Without
+        this, libtiff's handle was released by `Fax3Close` -- a codec's private teardown that
+        takes a `TIFF*`, sorts before `TIFFClose`, and run against a non-fax image tears down
+        state that was never set up. A fault inside it is OUR bug, filed against the library;
+      * it RELEASES rather than ending a phase of use (`close` over `end`);
+      * among equals, the shortest name is the library's canonical one.
+    """
     bare = htype.replace("*", "").strip()
-    for p in sorted(Path(root).rglob("*")):
-        if not (p.is_file() and p.suffix in _SRC_EXT):
-            continue
-        try:
-            txt = p.read_text(errors="ignore")
-        except OSError:
-            continue
-        for m in _FN_DEF.finditer(txt):
-            name = m.group(1)
+    found = []
+    _sa = static_aliases(root)
+    for _p, txt in _library_srcs(root):
+        for name, params in _fn_defs(txt, _sa):
             if name in exclude or not words.search(name):
                 continue
-            params = [a.strip() for a in (m.group(2) or "").split(",") if a.strip()]
             if len(params) == 1 and bare and bare in params[0]:
-                return name
-    return None
+                found.append(name)
+    if not found:
+        return None
+    found.sort(key=lambda n: (-_shared_prefix(n, kin or ""),
+                              0 if _DTOR_STRONG.search(n) else 1, len(n), n))
+    return found[0]
+
+
+def _shared_prefix(a: str, b: str) -> int:
+    """How many leading characters two names share, case-insensitively."""
+    a, b = (a or "").lower(), (b or "").lower()
+    n = 0
+    while n < min(len(a), len(b)) and a[n] == b[n]:
+        n += 1
+    return n
+
+
+#: A constructor that OPENS something named, as against one that creates an empty object. The
+#: distinction decides where the fuzz bytes go, and getting it wrong costs the whole campaign:
+#: `TIFFOpen(const char *name, const char *mode)` and `XML_ParserCreate(const XML_Char *encoding)`
+#: have the same SHAPE -- a constructor taking a string -- and NULL is the right argument for
+#: exactly one of them. Passing NULL to the opener makes every execution return at `if (!h)`;
+#: passing a path to the creator makes expat reject the encoding and do the same.
+_OPENER_WORDS = re.compile(r"(open|load|read|from_?file|infile)", re.I)
+#: Parameter names that say "this is a file". Corroborates the function name above.
+_PATH_PARAM = re.compile(r"\b(path|file|filename|fname|fn|name)\b", re.I)
+
+
+def _is_string_param(param: str) -> bool:
+    low = (param or "").lower()
+    return "*" in low and ("char" in low or "wchar" in low)
+
+
+def ctor_opens_a_file(name: str, params: list) -> bool:
+    """Does this constructor want the NAME of something to open?
+
+    Evidence, not a guess: the function is named like an opener AND it takes a string. A creator
+    that happens to take a string (an encoding, a mode, a label) is not named `*Open`/`*Load`,
+    and an opener that takes no string has nothing to open.
+    """
+    if not any(_is_string_param(a) for a in params or ()):
+        return False
+    return bool(_OPENER_WORDS.search(name or "")
+                or any(_PATH_PARAM.search(a) for a in params or ()))
+
+
+def _opener_arg_values(params: list) -> list:
+    """Arguments for an opener: the fuzz FILE's path, then a mode string, then nothing invented.
+
+    The path goes in the first string parameter, which is where a C API puts it. A SECOND string
+    is the mode (`TIFFOpen(name, "r")`), and anything else gets NULL or 0 -- the same discipline
+    as `_ctor_arg_values`, since an argument we have to invent is a value the library may be
+    entitled to trust.
+    """
+    out, used_path = [], False
+    for a in params or ():
+        if _is_string_param(a):
+            if not used_path:
+                out.append("path")
+                used_path = True
+            else:
+                out.append('"r"')
+        elif "*" in a:
+            out.append("NULL")
+        else:
+            out.append("0")
+    return out
 
 
 def _ctor_arg_values(params: list) -> list:
@@ -533,13 +910,89 @@ def _ctor_arg_values(params: list) -> list:
     return out
 
 
+#: Bytes the harness offers a reader for its OUTPUT. Big enough for a real decoded strip or
+#: tile, small enough that a library writing past what it was told is a fault rather than a
+#: quietly-absorbed overrun. Heap, not stack: ASan then reports the overflow with the library's
+#: own write as the faulting frame and the harness only as the allocation site.
+_OUT_BUF = 1 << 16
+
+
+def synth_file_handle_harness(triple: dict, *, cxx: bool = False) -> str:
+    """A harness that writes the fuzz bytes to a FILE, opens a handle ON that file, and calls one
+    reader through the handle.
+
+    THE DOMINANT SHAPE IN A FILE-FORMAT LIBRARY, and the one neither synthesizer could reach.
+    `synth_handle_harness` threads the bytes through the consume call, which is right for a
+    streaming parser (`XML_Parse(p, data, len, 1)`) and wrong for a reader whose bytes come from
+    the file its handle was opened on: libtiff's decoders are reached as
+    `TIFFOpen(path, "r")` -> `TIFFReadEncodedStrip(tif, strip, buf, size)`, where `buf` is where
+    the decoded image is written TO. Synthesized the other way round, the constructor was handed
+    NULL for the filename, returned NULL, and the campaign tested the `if (!h)` branch a few
+    hundred thousand times -- which is how "we fuzzed libtiff's strip decoder" would have been
+    reported with no strip ever decoded.
+
+    So the (pointer, length) pair in the consumer is an OUTPUT buffer here, not the input. The
+    difference is decided by the constructor (`ctor_opens_a_file`), because that is where the
+    evidence is.
+    """
+    hdr = Path(triple["header"]).name
+    h, ctor, consume, dtor = (triple["handle"], triple["ctor"], triple["consume"],
+                              triple.get("dtor"))
+    params, buf_at = triple["consume_params"], triple["buf_at"]
+    ctor_args = ", ".join(_opener_arg_values(triple.get("ctor_params") or []))
+    args = ["h"]
+    i = 1
+    while i < len(params):
+        if i == buf_at:
+            args.append(f"({_handle_type(params[i])})out")
+            args.append(f"({_handle_type(params[i + 1])}){_OUT_BUF}")
+            i += 2
+            continue
+        args.append("0")
+        i += 1
+    fuzz_qual = 'extern "C" ' if cxx else ""
+    free_call = f"            {dtor}(h);\n" if dtor else ""
+    # THE HANDLE IS RELEASED BEFORE THE OUTPUT BUFFER. A reader may KEEP the buffer it was
+    # handed -- `TIFFReadBufferSetup` stores it as the handle's raw-data buffer -- so freeing
+    # ours first and closing afterwards would be a use-after-free committed by the harness and
+    # reported against the library. Freeing last cannot be wrong: nothing holds the pointer once
+    # the handle is gone.
+    return ("#include <stdint.h>\n#include <stddef.h>\n#include <stdlib.h>\n"
+            "#include <string.h>\n#include <unistd.h>\n"
+            f'#include "{hdr}"\n'
+            f"{fuzz_qual}int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {{\n"
+            '    char path[] = "/tmp/lykos-lfXXXXXX";\n'
+            "    int fd = mkstemp(path);\n"
+            "    if (fd < 0) return 0;\n"
+            "    long w = (long)write(fd, data, size);\n"
+            "    close(fd);\n"
+            "    if (w == (long)size) {\n"
+            f"        {h} h = {ctor}({ctor_args});\n"
+            "        if (h) {\n"
+            f"            void *out = malloc({_OUT_BUF});\n"
+            "            if (out) {\n"
+            f"                {consume}({', '.join(args)});\n"
+            "            }\n"
+            + free_call
+            + "            free(out);\n"
+            "        }\n"
+            "    }\n"
+            "    unlink(path);\n"
+            "    return 0;\n}\n")
+
+
 def synth_handle_harness(triple: dict, *, cxx: bool = False) -> str:
     """A harness that makes a handle, feeds the fuzz bytes through it, and frees it.
 
     It INCLUDES the library's public header instead of forward-declaring: the handle type is
     opaque, so there is nothing to forward-declare, and including the header is both what a real
     harness does and what makes every prototype and typedef correct by construction.
+
+    When the constructor OPENS A FILE the bytes belong in that file instead, which is a different
+    harness entirely -- see `synth_file_handle_harness`.
     """
+    if triple.get("ctor_file"):
+        return synth_file_handle_harness(triple, cxx=cxx)
     hdr = Path(triple["header"]).name
     h, ctor, consume, dtor = (triple["handle"], triple["ctor"], triple["consume"],
                               triple.get("dtor"))
@@ -572,17 +1025,34 @@ def synth_handle_harness(triple: dict, *, cxx: bool = False) -> str:
 
 
 def synth_harness(fn: str, *, kind: str = "cstring", arg_type: str | None = None,
-                  cxx: bool = False, c_linkage: bool = False) -> str:
+                  cxx: bool = False, c_linkage: bool = False, params: list | None = None) -> str:
     """A libFuzzer harness calling `fn` with the fuzz bytes. `cstring`: fn(char*) on a
     NUL-terminated copy; `buflen`: fn(const uint8_t*, size_t). `arg_type` is `fn`'s real first
     parameter spelling from the source so the forward declaration links (C++ mangles the signature).
     `cxx` emits a C++ harness (the fuzzer entry then needs `extern "C"`); `c_linkage` declares `fn`
-    itself `extern "C"` when it is a C symbol reached from a C++ harness."""
+    itself `extern "C"` when it is a C symbol reached from a C++ harness.
+
+    `params` is the function's full parameter list, which `buflen` needs: it declared only the
+    FIRST parameter's type and then called the function with two arguments, so every harness of
+    that shape failed to compile ("too many arguments to function call, expected 1, have 2").
+    The shape is chosen for a (pointer, length) signature, so this was every candidate whose
+    signature is the one libFuzzer hands over directly.
+    """
     fuzz_qual = 'extern "C" ' if cxx else ""
     fn_qual = 'extern "C" ' if (cxx and c_linkage) else "extern "
     if kind == "buflen":
-        decl = arg_type or "const unsigned char *, unsigned long"
-        pre, call = "", f"    {fn}(data, size);\n"
+        pre = ""
+        if params and len(params) >= 2:
+            mangled = cxx and not c_linkage
+            types = ([_handle_type(a) for a in params] if mangled
+                     else _types_only(params).split(", "))
+            args = [f"({types[0]})data", f"({types[1]})size"]
+            args += [f"({ty}){v}" for ty, v in zip(types[2:], _arg_values(params[2:]))]
+            decl = ", ".join(types)
+            call = f"    {fn}({', '.join(args)});\n"
+        else:
+            decl = arg_type or "const unsigned char *, unsigned long"
+            call = f"    {fn}(data, size);\n"
     else:
         at = arg_type if arg_type not in (None, "") else "char *"
         decl = at
@@ -844,26 +1314,124 @@ def known_harness(root):
     return None
 
 
+#: How many harnesses one plan may hold. The ceiling is about what a time budget can honestly
+#: run -- each harness is a separate build and a separate campaign -- not about what the tree
+#: offers: libtiff declares some two hundred public entry points.
+MAX_HARNESSES = 6
+
+
+def _slug(text) -> str:
+    """A short filesystem-safe name for a harness. It keys the corpus cache and names the
+    harness in a finding, so it has to be stable across runs of the same tree."""
+    keep = "".join(c if (c.isalnum() or c in "-_") else "-" for c in str(text))
+    while "--" in keep:
+        keep = keep.replace("--", "-")
+    return keep.strip("-")[:48] or "harness"
+
+
+def fn_spec(root, fn: str, kind=None) -> dict:
+    """A spec for synthesizing a harness around a single function."""
+    return {"kind": "function", "id": "fn-" + _slug(fn), "entry": f"{fn}()",
+            "fn": fn, "fn_kind": kind, "anchor": fn}
+
+
+def plan_harnesses(root, *, limit: int = MAX_HARNESSES) -> list:
+    """The harnesses worth building for this tree, strongest first.
+
+    ONE HARNESS WAS THE CEILING ON REACH. The builder resolved a single entry point and the
+    campaign fuzzed that one door: "we fuzzed expat" meant "we fuzzed `XML_Parse`", and every
+    other way bytes enter the library -- `XML_ParseBuffer`, a second handle type, a second
+    in-tree harness the project itself ships -- was unreachable at any budget. Nothing was wrong
+    with the choice; it was that there was only one.
+
+    The PREFERENCE ORDER is unchanged, and the first spec is exactly what the builder used to
+    resolve on its own: the project's own harnesses (they know its API best), then a
+    known-library harness that reaches the decode path, then handle triples through the public
+    API, then synthesized single-function calls. What is new is that the rest of the list
+    survives, for a caller with budget for it.
+
+    Each spec is `{kind, id, entry, ...}`; `build_libfuzzer(spec=...)` builds one.
+    """
+    root = Path(root)
+    limit = max(0, limit)
+    plan: list = []
+    for p in find_harnesses(root, limit=limit or 1):
+        rel = p.relative_to(root)
+        plan.append({"kind": "in-tree", "id": "tree-" + _slug(rel.as_posix()), "entry": str(rel),
+                     "path": p, "anchor": None})
+    known = known_harness(root)
+    if known:
+        plan.append({"kind": "known", "id": "known-" + _slug(known[0]), "entry": known[0],
+                     "name": known[0], "source": known[1],
+                     "anchor": _KNOWN_HARNESSES[known[0]]["symbols"][0]})
+    if len(plan) < limit:
+        # A triple the KNOWN harness already drives is not a second entry point: expat's
+        # known harness is `XML_ParserCreate`/`XML_Parse`/`XML_ParserFree`, which is also the
+        # strongest triple in the tree, and building both would spend half the slice fuzzing
+        # the same code twice.
+        covered = (known[1] if known else "")
+        for tri in find_handle_triples(root, limit=limit):
+            if re.search(r"\b" + re.escape(tri["consume"]) + r"\s*\(", covered):
+                continue
+            plan.append({"kind": "triple", "id": "tri-" + _slug(tri["consume"]),
+                         "entry": f"{tri['consume']}()", "triple": tri,
+                         "anchor": tri["consume"]})
+    if len(plan) < limit:
+        taken = {s.get("entry") for s in plan}
+        for fn in rank_harness_fns(root, limit=limit + 4):
+            if f"{fn}()" in taken:
+                continue
+            plan.append(fn_spec(root, fn))
+    # Deduplicated by id, because two kinds can name the same door (a triple's consumer is also
+    # a ranked function when its handle is pointer-spelled).
+    seen, out = set(), []
+    for s in plan:
+        if s["id"] in seen:
+            continue
+        seen.add(s["id"])
+        out.append(s)
+    return out[:limit]
+
+
+class BuildCache:
+    """Compiled library objects, reused across the harnesses built from one tree.
+
+    Each harness is a separate link of the SAME library objects, and compiling them is nearly
+    all of the clock: libtiff is eighty translation units under ASan+UBSan, tens of seconds,
+    against about one to compile a harness and link it against objects that already exist.
+    Without this, fuzzing four entry points would have spent its budget compiling the same
+    library four times over -- so breadth would have cost depth for no reason.
+    """
+
+    def __init__(self, directory):
+        self.dir = Path(directory)
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.objs: dict = {}                             # (src, incs) -> (obj|None, err|None)
+        self.compiled = 0
+        self.reused = 0
+
+
 def build_libfuzzer(root, out: Path, *, harness_fn: str | None = None,
-                    harness_kind: str | None = None, timeout: int = 300) -> dict:
+                    harness_kind: str | None = None, timeout: int = 300,
+                    spec: dict | None = None, cache: BuildCache | None = None) -> dict:
     """Build a libFuzzer target from the project at `root`. Uses an in-tree LLVMFuzzerTestOneInput
-    if present, else synthesizes one for `harness_fn`. Returns {ok, binary, harness, log}."""
+    if present, else synthesizes one. Returns {ok, binary, harness, log}.
+
+    `spec` names WHICH harness to build (see `plan_harnesses`); without one this resolves the
+    strongest, which is what it has always done. `cache` carries the library's compiled objects
+    between calls so building a second harness does not recompile the library.
+    """
     root = Path(root).resolve()
-    existing = find_harness(root)
-    # PREFERENCE ORDER: the project's own harness (it knows its API best), then a known-library
-    # harness that reaches the decode path, then a synthesized one that can only open the file.
-    known = None if existing else known_harness(root)
-    # A CREATE -> CONSUME -> DESTROY triple, which is the dominant shape in a C library and the
-    # one the single-function pick cannot reach: it requires a pointer-spelled first parameter,
-    # and a handle type is a typedef (`XML_Parser`), so expat's real parser was excluded outright
-    # and the library was reachable only through a hand-written harness. Preferred over the
-    # single-function pick because threading the handle reaches the PARSER, where the pick's
-    # fallback reaches whatever function happened to take a buffer.
-    triple = None
-    if not existing and not known and not harness_fn:
-        triple = find_handle_triple(root)
-    if not existing and not known and not harness_fn and not triple:
-        harness_fn = pick_harness_fn(root)               # auto-harness a library's parser entry
+    if spec is None:
+        if harness_fn:
+            spec = fn_spec(root, harness_fn, harness_kind)
+        else:
+            plan = plan_harnesses(root, limit=1)
+            spec = plan[0] if plan else None
+    if spec is None:
+        return {"ok": False, "binary": None, "harness": None,
+                "log": "no LLVMFuzzerTestOneInput in the source and no harness_fn to synthesize one"}
+    kind = spec["kind"]
     cxx = any(p.suffix in _CXX_EXT for p in _sources(root, exclude_main=False))
     cc = _clang(cxx)
     if not cc:
@@ -884,56 +1452,58 @@ def build_libfuzzer(root, out: Path, *, harness_fn: str | None = None,
     # the build -- so in-process fuzzing was unavailable on a project merely for having a contrib
     # directory. The entry point's own directory IS the library by construction: it is where the
     # function we are about to call is defined.
-    if (harness_fn or known or triple) and not existing:
-        # For a known harness, scope by the OPEN symbol it is built around: the directory that
-        # defines the library's entry point is the library.
-        anchor_fn = (harness_fn or (triple or {}).get("consume")
-                     or _KNOWN_HARNESSES[known[0]]["symbols"][0])
-        home = fn_def_file(root, anchor_fn)
+    if spec.get("anchor"):
+        home = fn_def_file(root, spec["anchor"])
         if home is not None and home.parent != root:
             lib_srcs = [x for x in srcs if home.parent in x.parents or x.parent == home.parent]
             if lib_srcs:
                 srcs = lib_srcs
-    harness_desc = None
-    if existing:
-        harness_desc = f"in-tree {existing.relative_to(root)}"
-    elif known:
-        name, src_text = known
+    h = None
+    # EVERY harness in the tree but the one being built has to go. Each defines
+    # `LLVMFuzzerTestOneInput`, so linking two of them fails on a duplicate symbol -- and this
+    # matters for the SYNTHESIZED kinds too, which can now be planned for a tree that also ships
+    # its own harnesses. Before the plan, a synthesized harness was only ever built for a tree
+    # with none, so the collision could not arise.
+    own = spec.get("path")
+    others = [x for x in find_harnesses(root, limit=MAX_HARNESSES) if x != own]
+    srcs = [x for x in srcs if x not in others]
+    if kind == "in-tree":
+        harness_desc = f"in-tree {spec['path'].relative_to(root)}"
+    elif kind == "known":
         h = tmp / "harness.c"
-        h.write_text(src_text)
+        h.write_text(spec["source"])
         srcs = srcs + [h]
-        harness_desc = f"known-library harness for {name} (reaches the decode path)"
-    elif triple:
+        harness_desc = f"known-library harness for {spec['name']} (reaches the decode path)"
+    elif kind == "triple":
+        tri = spec["triple"]
         h = tmp / ("harness.cc" if cxx else "harness.c")
-        h.write_text(synth_handle_harness(triple, cxx=cxx))
+        h.write_text(synth_handle_harness(tri, cxx=cxx))
         srcs = srcs + [h]
-        harness_desc = (f"synthesized handle harness: {triple['ctor']}() -> "
-                        f"{triple['consume']}() -> {triple.get('dtor') or '(no free)'}"
+        _in = "(fuzz file)" if tri.get("ctor_file") else "()"
+        harness_desc = (f"synthesized handle harness: {tri['ctor']}{_in} -> "
+                        f"{tri['consume']}() -> {tri.get('dtor') or '(no free)'}"
                         f" [reaches the parser through the library's own API]")
-    elif harness_fn:
+    else:
+        fn = spec["fn"]
         h = tmp / ("harness.cc" if cxx else "harness.c")
         # match the target function's real signature and linkage so a C++ symbol (mangled) or a C
         # symbol reached from a C++ harness both resolve at link time.
-        def_file = fn_def_file(root, harness_fn)
+        def_file = fn_def_file(root, fn)
         c_linkage = bool(def_file and def_file.suffix in _C_EXT)
         # The SHAPE is inferred from the signature unless the caller names one. It defaulted to
         # `cstring` for everything, which delivers the fuzz bytes as a string -- wrong for every
         # entry point that takes a FILENAME, i.e. every file-format library.
-        kind = harness_kind or harness_kind_for(root, harness_fn)
-        if kind == "file":
-            params = fn_params(root, harness_fn)
-            h.write_text(synth_file_harness(harness_fn, params,
-                                            closer=fn_closer(root, harness_fn),
+        fk = spec.get("fn_kind") or harness_kind_for(root, fn)
+        if fk == "file":
+            params = fn_params(root, fn)
+            h.write_text(synth_file_harness(fn, params, closer=fn_closer(root, fn),
                                             cxx=cxx, c_linkage=c_linkage))
         else:
-            h.write_text(synth_harness(harness_fn, kind=kind,
-                                       arg_type=fn_first_arg_type(root, harness_fn),
-                                       cxx=cxx, c_linkage=c_linkage))
+            h.write_text(synth_harness(fn, kind=fk, arg_type=fn_first_arg_type(root, fn),
+                                       cxx=cxx, c_linkage=c_linkage,
+                                       params=fn_params(root, fn)))
         srcs = srcs + [h]
-        harness_desc = f"synthesized for {harness_fn}() [{kind}]"
-    else:
-        return {"ok": False, "binary": None, "harness": None,
-                "log": "no LLVMFuzzerTestOneInput in the source and no harness_fn to synthesize one"}
+        harness_desc = f"synthesized for {fn}() [{fk}]"
     # What a configured autotools build would have on its command line. Without it expat's
     # xmlparse.c does not compile at all (see `config_defines`).
     incs = list(config_defines(root))
@@ -942,15 +1512,68 @@ def build_libfuzzer(root, out: Path, *, harness_fn: str | None = None,
     # The harness is REQUIRED: skipping a translation unit is right for a platform shim or a test,
     # and wrong for the one file that defines the entry point. Silently skipping it produced a link
     # error about `LLVMFuzzerTestOneInput` instead of the compile error that caused it.
-    res = _compile_and_link(srcs, incs, out, tmp, timeout,
-                            required=(h if (known or harness_fn) and not existing else None))
+    res = _compile_and_link(srcs, incs, out, tmp, timeout, required=h, cache=cache)
     shutil.rmtree(tmp, ignore_errors=True)
     res["harness"] = harness_desc
+    res["harness_id"] = spec["id"]
+    res["entry"] = spec.get("entry")
     return res
 
 
-def _compile_and_link(srcs, incs, out: Path, tmp: Path, timeout: int, *, required=None) -> dict:
-    """Compile each translation unit with the driver for ITS language, then link what compiled.
+def _obj_name(src, incs) -> str:
+    """A stable object-file name for one translation unit: content-addressed by what decides its
+    contents (the path and the flags), so a cached object is only reused for the same compile."""
+    key = str(src) + "\x00" + "\x00".join(incs)
+    return hashlib.sha1(key.encode("utf-8", "replace")).hexdigest()[:20] + ".o"
+
+
+def _compile_objs(srcs, incs, tmp: Path, timeout: int, cache=None) -> list:
+    """Compile each translation unit with the driver for ITS language. Returns [(src, obj, err)].
+
+    `cache` makes the library's objects outlive one build, which is what lets several harnesses
+    share one compile of the library (see `BuildCache`).
+    """
+    out_dir = cache.dir if cache is not None else tmp
+    todo = [s for s in srcs if cache is None or (str(s), tuple(incs)) not in cache.objs]
+
+    def _one(src):
+        src = Path(src)
+        obj = out_dir / _obj_name(src, incs)
+        drv = _clang(src.suffix in _CXX_EXT)
+        if not drv:
+            return None, f"{src.name}: no clang driver"
+        argv = [drv] + _SAN + ["-c", str(src), "-o", str(obj)] + incs
+        try:
+            r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        except (OSError, subprocess.SubprocessError) as e:
+            return None, f"{src.name}: {e}"
+        if r.returncode or not obj.exists():
+            return None, ((r.stderr or "") + (r.stdout or ""))[-400:]
+        return obj, None
+
+    fresh = {}
+    if todo:
+        with ThreadPoolExecutor(max_workers=min(8, (os.cpu_count() or 2))) as ex:
+            for src, got in zip(todo, ex.map(_one, todo)):
+                fresh[str(src)] = got
+    results = []
+    for src in srcs:
+        k = (str(src), tuple(incs))
+        if str(src) in fresh:
+            got = fresh[str(src)]
+            if cache is not None:
+                cache.objs[k] = got
+                cache.compiled += 1
+        else:
+            got = cache.objs[k]
+            cache.reused += 1
+        results.append((Path(src), got[0], got[1]))
+    return results
+
+
+def _compile_and_link(srcs, incs, out: Path, tmp: Path, timeout: int, *, required=None,
+                      cache=None) -> dict:
+    """Compile every translation unit, then link what compiled.
 
     One source file decided the language for the whole project, and `any(.cxx)` is true for
     libtiff -- it ships a single optional C++ stream wrapper (`tif_stream.cxx`). So eighty C
@@ -965,33 +1588,14 @@ def _compile_and_link(srcs, incs, out: Path, tmp: Path, timeout: int, *, require
     reported. The count of skipped units is in the log either way, so a build that quietly
     dropped half the project is visible rather than silently thinner than it looks.
     """
-    from concurrent.futures import ThreadPoolExecutor
     objs, failed, logs = [], [], []
-
     failed_paths = []
-
-    def _one(i_src):
-        i, src = i_src
-        obj = tmp / f"o{i}.o"
-        drv = _clang(src.suffix in _CXX_EXT)
-        if not drv:
-            return None, f"{src.name}: no clang driver"
-        argv = [drv] + _SAN + ["-c", str(src), "-o", str(obj)] + incs
-        try:
-            r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
-        except (OSError, subprocess.SubprocessError) as e:
-            return None, f"{src.name}: {e}"
-        if r.returncode or not obj.exists():
-            return None, ((r.stderr or "") + (r.stdout or ""))[-400:]
-        return obj, None
-
-    with ThreadPoolExecutor(max_workers=min(8, (os.cpu_count() or 2))) as ex:
-        for src, (obj, err) in zip(srcs, ex.map(_one, enumerate(srcs))):
-            if obj is not None:
-                objs.append(obj)
-            else:
-                failed.append(err or "")
-                failed_paths.append(Path(src))
+    for src, obj, err in _compile_objs(srcs, incs, tmp, timeout, cache=cache):
+        if obj is not None:
+            objs.append(obj)
+        else:
+            failed.append(err or "")
+            failed_paths.append(src)
     if required is not None and Path(required) in failed_paths:
         i = failed_paths.index(Path(required))
         return {"ok": False, "binary": None,
@@ -1103,12 +1707,68 @@ def _libs_for_undefined(log: str) -> list:
     return out
 
 
-_ASAN_HDR = re.compile(r"(==\d+==ERROR: (?:AddressSanitizer|UndefinedBehaviorSanitizer).*)", re.S)
+_ASAN_HDR = re.compile(r"(==\d+==\s?ERROR: (?:AddressSanitizer|UndefinedBehaviorSanitizer).*)", re.S)
+#: UBSan's own wording, which carries NO `ERROR:` header -- `tif_read.c:545:8: runtime error:
+#: load of null pointer of type 'uint64'`, followed by libFuzzer's `deadly signal` stack. Three
+#: of libtiff's five synthesized harnesses fault exactly this way, and with only the header form
+#: above the report came back EMPTY: a real null dereference inside `TIFFFillStrip` was filed as
+#: "crash under libFuzzer, CWE-787" with no source line, because the text that said what it was
+#: never left this function.
+_UBSAN_HDR = re.compile(r"(^\S+:\d+:\d+: runtime error: .*)", re.S | re.M)
+#: A fault with no sanitizer verdict at all (a plain SIGSEGV). Worth capturing for its stack:
+#: the classification falls back to "a crash", but the frames still name the faulting function.
+_SIGNAL_HDR = re.compile(r"(==\d+==\s?ERROR: libFuzzer: .*)", re.S)
+
+
+def fault_report(out: str):
+    """The sanitizer's own account of the fault, or None.
+
+    Whichever form appears EARLIEST wins, because the sanitizer prints its verdict before
+    libFuzzer prints the stack it died on: starting at the later text would drop the one line
+    that says what the bug is.
+    """
+    best = None
+    for pat in (_ASAN_HDR, _UBSAN_HDR, _SIGNAL_HDR):
+        m = pat.search(out or "")
+        if m and (best is None or m.start(1) < best.start(1)):
+            best = m
+    return best.group(1)[:4000] if best else None
+
+
+#: libFuzzer's artifact prefixes, and what each one is EVIDENCE OF. They are not all crashes:
+#: `oom-` is libFuzzer's RSS limit, which a library hits by believing a size field in the input
+#: -- a real resource-exhaustion defect, and not memory corruption. Filed as the same
+#: "crash under libFuzzer, CWE-787" as a heap overflow, it would overstate a denial of service as
+#: a write primitive, which is the kind of claim this pipeline exists not to make.
+ARTIFACT_KINDS = {"crash-": "crash", "oom-": "oom", "timeout-": "timeout", "leak-": "leak"}
+#: libFuzzer's own execution counter, from `-print_final_stats=1`.
+_UNITS_RE = re.compile(r"stat::number_of_executed_units:\s*(\d+)")
+#: Every progress line is prefixed with the execution count (`#4096\tpulse  cov: 211 ...`). The
+#: final-stats block does not print when the run ends in a crash, which is precisely the run whose
+#: count matters, so the counter is read from the log as well.
+_TICK_RE = re.compile(r"^#(\d+)\s", re.M)
+
+
+def executions(log: str) -> int:
+    """How many inputs libFuzzer executed, from its own output.
+
+    THE IN-PROCESS ENGINE WAS INVISIBLE. `run_libfuzzer` never reported a count and the stage
+    never emitted one, so the scorecard's executions came only from the out-of-process campaigns:
+    a library run that found its bug in-process reported the executions of the engines that found
+    nothing. The number was not wrong, it was absent -- and "20,618 executions" on a target whose
+    only real work was in-process said the opposite of what happened.
+    """
+    best = 0
+    for m in _UNITS_RE.finditer(log or ""):
+        best = max(best, int(m.group(1)))
+    for m in _TICK_RE.finditer(log or ""):
+        best = max(best, int(m.group(1)))
+    return best
 
 
 def run_libfuzzer(binary, workdir, *, seconds: int = 30, max_len: int = 4096,
                   corpus: list | None = None) -> dict:
-    """Run the libFuzzer `binary` for `seconds`. Returns {crashes:[{input, report}], runs, log}.
+    """Run the libFuzzer `binary` for `seconds`. Returns {crashes, corpus, execs, log}.
     Each crash is the reproducing input (bytes) plus the sanitizer report libFuzzer printed."""
     workdir = Path(workdir)
     art = workdir / "lf-artifacts"
@@ -1132,12 +1792,13 @@ def run_libfuzzer(binary, workdir, *, seconds: int = 30, max_len: int = 4096,
         out = (r.stderr or "") + (r.stdout or "")
     except subprocess.TimeoutExpired as e:
         out = (e.stderr or b"").decode("latin-1", "ignore") if isinstance(e.stderr, bytes) else (e.stderr or "")
-    m = _ASAN_HDR.search(out)
-    report = m.group(1)[:4000] if m else None
+    report = fault_report(out)
     for f in sorted(set(art.iterdir()) - before):
-        if f.name.startswith(("crash-", "oom-", "timeout-", "leak-")):
+        kind = next((k for pre, k in ARTIFACT_KINDS.items() if f.name.startswith(pre)), None)
+        if kind:
             try:
-                crashes.append({"input": f.read_bytes(), "report": report})
+                crashes.append({"input": f.read_bytes(), "report": report, "kind": kind,
+                                "artifact": f.name})
             except OSError:
                 pass
     # THE CORPUS IS THE PRODUCT, not a by-product. libFuzzer writes every input that reached new
@@ -1145,7 +1806,8 @@ def run_libfuzzer(binary, workdir, *, seconds: int = 30, max_len: int = 4096,
     # the stage's scratch directory, so every run started from nothing and re-derived the same
     # coverage. Coverage-guided fuzzing is the one engine whose work COMPOUNDS; discarding the
     # corpus discards the compounding. Handing it back lets the caller keep it.
-    return {"crashes": crashes, "log": out[-4000:], "corpus": _harvest(corpus_dir)}
+    return {"crashes": crashes, "log": out[-4000:], "corpus": _harvest(corpus_dir),
+            "execs": executions(out)}
 
 
 #: Bounds on a kept corpus: enough to matter, small enough to load every run. libFuzzer prefers
