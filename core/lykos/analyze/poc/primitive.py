@@ -739,6 +739,10 @@ def reclaim_verdict_traced(observation: dict, *, marker: bytes = RECLAIM_MARKER)
         "exec_function": (observation.get("exec") or {}).get("function"),
         "exec_addr": (observation.get("exec") or {}).get("addr"),
         "exec_aslr": (observation.get("exec") or {}).get("aslr"),
+        # Where the code address came from: the target's own disclosure, or the tracer's fixed
+        # load base. The claim's dependence on ASLR being off turns entirely on this.
+        "exec_source": (observation.get("exec") or {}).get("addr_source"),
+        "exec_leaked_base": (observation.get("exec") or {}).get("leaked_base"),
         "lifetime": True,
         "reclaim": True,
         "confirmed": True,
@@ -780,10 +784,13 @@ def reclaim_effect(prim: dict) -> str:
                     f"the program called through the dead object and ARRIVED at that function "
                     f"-- observed at a breakpoint on it, not inferred from the absence of a "
                     f"crash. That is code execution. Two limits travel with it: the function is "
-                    f"one the binary already contains (a redirect, not injected code), and the "
-                    f"address is absolute, which is knowable here only because this tracer "
-                    f"disables ASLR ({prim.get('exec_aslr')}) -- against a live PIE target the "
-                    f"same step needs a leak, which is a different capability")
+                    f"one the binary already contains (a redirect, not injected code), and "
+                    + ("the address came from a base the TARGET disclosed at runtime, which "
+                       "matches the one the tracer measured -- so it does not depend on ASLR "
+                       "being off" if prim.get("exec_source") == "leaked at runtime" else
+                       f"the address is absolute, which is knowable here only because this "
+                       f"tracer disables ASLR ({prim.get('exec_aslr')}) -- against a live PIE "
+                       f"target the same step needs a leak, which is a different capability"))
         if prim.get("effect_kind") == "control-flow-hijack":
             how = (f"it executed an indirect call/jump through `{prim['effect_via']}`, which "
                    f"held the attacker's bytes, and faulted at {prim.get('effect_pc')}"

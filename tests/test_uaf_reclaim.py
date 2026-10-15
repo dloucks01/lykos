@@ -726,3 +726,134 @@ def test_the_hijack_is_driven_to_code_execution_end_to_end(store, case, tmp_path
     # and the limits survive into the report
     assert "a redirect, not injected code" in ev
     assert "needs a leak" in ev
+
+
+# --- wiring the exec to the leak: an address that survives ASLR --------------------------------
+
+def test_the_leak_keeps_the_image_base_it_used_to_discard():
+    """`classify_leak` recovers the image base from the binary's own symbols and
+    `heap_uaf_leak` dropped it -- which is why a demonstrated redirect had to take its code
+    address from the tracer's fixed load base and carry an ASLR caveat. The number it needed was
+    being computed and thrown away."""
+    src = open(heap_discover.__file__.replace(".pyc", ".py")).read()
+    assert 'pie_seen.append(int(cls["pie_base"]))' in src
+    assert '"kind": "pie"' in src, "an image-base-only leak is an answer, not a miss"
+    # every return path carries it, so a libc leak does not hide the image base
+    assert src.count('"pie_base": (pie_seen[0] if pie_seen else None)') >= 3
+
+
+def test_the_exec_prefers_a_leaked_base_and_cross_checks_it():
+    """Two independent routes to one number is the only way to show the leaked base is RIGHT
+    rather than merely present: the tracer measures where the image landed, the target discloses
+    it, and the claim drops its ASLR caveat only when those agree."""
+    src = open(heap_discover.__file__.replace(".pyc", ".py")).read()
+    assert 'leaked = int((leak or {}).get("pie_base") or 0) or None' in src
+    assert "agree = (traced is None or leaked == traced)" in src
+    assert 'base, source = (leaked, "leaked at runtime")' in src
+
+    v = P.reclaim_verdict_traced({
+        "addr": "0x55a0", "offset": 0, "size": 128, "marker_before_free": False,
+        "use": {"pc": "0x55550e"},
+        "effect": {"kind": "control-flow-hijack", "via": "rax", "pc": "0x55550e"},
+        "exec": {"function": "win", "addr": "0x555555555189",
+                 "addr_source": "leaked at runtime", "leaked_base": "0x555555554000",
+                 "traced_base": "0x555555554000", "bases_agree": True,
+                 "aslr": "not relied on -- the base was disclosed by the target"}})
+    eff = P.reclaim_effect(v)
+    assert "came from a base the TARGET disclosed at runtime" in eff
+    assert "does not depend on ASLR being off" in eff
+    assert "disables ASLR" not in eff, "the caveat must go when the base was leaked"
+    # ...and it stays when it was not
+    t = P.reclaim_verdict_traced({
+        "addr": "0x55a0", "offset": 0, "size": 128, "marker_before_free": False,
+        "use": {"pc": "0x55550e"},
+        "effect": {"kind": "control-flow-hijack", "via": "rax", "pc": "0x55550e"},
+        "exec": {"function": "win", "addr": "0x555555555189",
+                 "addr_source": "tracer (ASLR off)", "aslr": "off (tracer)"}})
+    assert "disables ASLR" in P.reclaim_effect(t)
+    assert "needs a leak" in P.reclaim_effect(t)
+
+
+#: A notebook that BOTH discloses and calls: `show` writes the object's raw bytes (so a freed
+#: chunk's surviving code pointer leaks the image base) and `run` calls its first field. The tag
+#: pointer sits at offset 16 because tcache overwrites the first two words of a freed chunk with
+#: its fd and key.
+_LEAKY_CALLBACK = r"""#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+struct obj { void (*fn)(void); void *pad; void (*tag)(void); void (*tag2)(void);
+             char buf[88]; };
+static struct obj *n[16];
+static void hello(void){ /* the legitimate callback */ }
+static void win(void){ write(1, "WIN-REACHED\n", 12); }
+static long rl(void){ char b[32]; int i=0; unsigned char c; while(i<31){
+    if(read(0,&c,1)<1) break; if(c=='\n') break; b[i++]=c; } b[i]=0; return strtol(b,0,10); }
+int main(void){
+  setvbuf(stdout,0,2,0);
+  for(;;){
+    printf("1.add 2.free 3.show 4.run 5.exit\n> ");
+    long o = rl();
+    if(o==1){ printf("idx: "); long i=rl(); printf("size: "); long s=rl();
+              printf("data: ");
+              if(i>=0&&i<16&&s>0&&s<=0x800){ n[i]=malloc(s>sizeof(struct obj)?s:sizeof(struct obj));
+                  if(n[i]){ memset(n[i],0,sizeof(struct obj));
+                      /* TWO image pointers past the first two words: `recover_pie_base`
+                         wants at least two corroborating values, and tcache overwrites a freed
+                         chunk's first two words with its fd and key. */
+                      n[i]->fn=hello; n[i]->tag=hello; n[i]->tag2=win;
+                      int m=0; unsigned char c;
+                      while(m<(int)sizeof(struct obj)-1){ if(read(0,&c,1)<1) break;
+                          if(c=='\n') break; ((char*)n[i])[m++]=c; } } }
+              else { unsigned char c; while(read(0,&c,1)==1 && c!='\n'); } }
+    else if(o==2){ printf("idx: "); long i=rl();
+                   if(i>=0&&i<16&&n[i]) free(n[i]); }      /* slot NOT nulled: UAF */
+    else if(o==3){ printf("idx: "); long i=rl();
+                   if(i>=0&&i<16&&n[i]) fwrite(n[i],1,0x28,stdout), putchar('\n'); }
+    else if(o==4){ printf("idx: "); long i=rl();
+                   if(i>=0&&i<16&&n[i]) n[i]->fn(); }
+    else return 0; } }
+"""
+
+
+@pytest.mark.skipif(sandbox.host_arch() != "x86-64", reason="native heap experiment")
+def test_code_execution_at_a_leaked_address_end_to_end(store, case, tmp_path):
+    """The chain joined to the leak: the target discloses its own image base, the exec payload is
+    built from THAT, and the program arrives at the chosen function -- so the demonstration no
+    longer rests on the tracer disabling ASLR."""
+    from lykos.analyze import register
+    from lykos.analyze.dynamic import enqueue_heap_trace
+    from lykos.analyze.ingest import ingest
+    from lykos.db.dao import FindingDAO
+    from lykos.jobs import JobConfig, JobQueue, WorkerPool
+
+    exe = _build(tmp_path, _LEAKY_CALLBACK, "leakycb")
+    register()
+    target = ingest(store, case.id, exe)
+    pool = WorkerPool(store.db_path, store.content,
+                      JobConfig(workers=1, lease_seconds=420, poll_interval=0.02,
+                                heartbeat_interval=5.0))
+    pool.start()
+    try:
+        q = JobQueue(store.conn)
+        run = enqueue_heap_trace(q, target)
+        assert pool.wait_idle(600)
+        rec = q.runs.get(run.id)
+        if rec.status != "done":
+            pytest.skip("heap_trace could not run here: " + str(rec.error))
+    finally:
+        pool.stop(grace=3.0)
+
+    finds = FindingDAO(store.conn).list_by_target(target.id)
+    ev = " ".join(str(e.get("detail", "")) for f in finds for e in (f.evidence or []))
+    if "Driven to code execution" not in ev and "EXECUTED CODE" not in ev:
+        pytest.skip("the chain stopped before code execution here: " + ev[-220:])
+    assert "win" in ev
+    # The address must come from the TARGET's own disclosure, not from the tracer's fixed base:
+    # that is the whole point of the wiring, and this fixture discloses two image pointers so
+    # `recover_pie_base` can corroborate one.
+    assert "from leaked at runtime" in ev, ev[-400:]
+    assert "matches the one the tracer measured" in ev, \
+        "the leaked base must be cross-checked, or it is merely present rather than right"
+    assert "does not depend on ASLR being off" in ev
+    assert "disables ASLR" not in ev, "the caveat must go when the base came from the target"
