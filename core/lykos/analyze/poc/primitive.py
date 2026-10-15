@@ -920,6 +920,78 @@ def race_effect(prim: dict) -> str:
         how = (f"reproduced on all {n} runs of the same input, so it is reliable in this harness "
                f"-- which is a fact about this harness, not a guarantee about another machine, "
                f"and the bundle loops anyway")
-    return (f"{prim.get('sanitizer_class')}: {what}{where} -- {how}. What the race CAUSES is not "
-            f"shown here: that depends on what the unsynchronised value is used for, and this "
-            f"stage does not determine it")
+    widened = (" " + widening_effect(prim["widening"]) + ".") if prim.get("widening") else ""
+    return (f"{prim.get('sanitizer_class')}: {what}{where} -- {how}.{widened} What the race "
+            f"CAUSES is not shown here: that depends on what the unsynchronised value is used "
+            f"for, and this stage does not determine it")
+
+
+#: How many variants the widening experiment measures, and how many runs each one gets. Both are
+#: small on purpose: this is the most expensive experiment in the stage (every run is a process),
+#: and the question it answers is directional -- did the rate go UP -- not a precise rate.
+WIDEN_VARIANTS = 4
+WIDEN_RUNS = 6
+#: The chance of seeing a variant's hits under the BASELINE rate, below which the rise is called
+#: real. One-sided exact binomial; 5% is the conventional line and it is stated rather than tuned.
+WIDEN_ALPHA = 0.05
+
+
+def binomial_tail(k: int, n: int, p: float) -> float:
+    """P(X >= k) for X ~ Binomial(n, p). Exact, stdlib only.
+
+    Used to answer one question: if the defect really reports at the baseline rate, how surprising
+    is this variant's count? A rate that goes from 1-in-8 to 6-of-6 is not a coincidence (p ~ 4e-6)
+    and a rate that goes from 1-in-8 to 2-of-6 might easily be one (p ~ 0.2). Without this the
+    verdict would be comparing two small fractions by eye and calling the bigger one control.
+    """
+    from math import comb
+    if n <= 0 or k <= 0:
+        return 1.0
+    p = min(max(float(p), 0.0), 1.0)
+    k = min(k, n)
+    return min(1.0, sum(comb(n, i) * (p ** i) * ((1 - p) ** (n - i)) for i in range(k, n + 1)))
+
+
+def widening_verdict(base_hits: int, base_runs: int, trials: list) -> dict | None:
+    """Can the attacker make an intermittent defect RELIABLE by changing the input?
+
+    `trials` is `(label, hits, runs)` per variant. This is the step that separates a race that
+    exists from a race that can be used: a 1-in-8 defect is a curiosity to anyone who has to
+    reproduce it, and the same defect at 6-of-6 is a tool. Widening the window is how that is
+    done in practice -- a longer input to parse, a larger count to iterate -- so the experiment
+    is to vary the input and measure the RATE, not just whether a single run reported.
+
+    Returns the best widening with its exact one-sided p-value, or None when no variant's count
+    is surprising under the baseline rate. Pure: the caller does the running.
+    """
+    if base_runs <= 0 or not trials:
+        return None
+    base_rate = base_hits / base_runs
+    scored = []
+    for label, hits, runs in trials:
+        if not runs:
+            continue
+        rate = hits / runs
+        if rate <= base_rate:
+            continue
+        scored.append((binomial_tail(hits, runs, base_rate), -rate, label, hits, runs))
+    if not scored:
+        return None
+    scored.sort()
+    p, negrate, label, hits, runs = scored[0]
+    if p >= WIDEN_ALPHA:
+        return None
+    return {"variant": label, "hits": hits, "runs": runs, "rate": round(-negrate, 3),
+            "p_value": float(f"{p:.3g}"), "baseline_rate": round(base_rate, 3),
+            # Reliable ENOUGH to stop retrying: three expected hits at the widened rate.
+            "retries": min(60, max(3, int(round(3 * runs / hits)))) if hits else 60}
+
+
+def widening_effect(w: dict) -> str:
+    """What a demonstrated widening is worth, with the caveat the sample size demands."""
+    return (f"the window is the attacker's to WIDEN: variant `{w['variant']}` reported "
+            f"{w['hits']} of {w['runs']} runs ({w['rate']}) against a baseline of "
+            f"{w['baseline_rate']} -- a count that has a {w['p_value']} chance of arising at the "
+            f"baseline rate, so the defect is reliable on demand rather than a retry away, and "
+            f"the bundle ships THAT input. The baseline rate is itself an 8-sample estimate, so "
+            f"this is a directional result and not a published p-value")

@@ -351,3 +351,144 @@ def test_a_race_found_by_the_fuzz_stage_reaches_the_ladder(store, case, tmp_path
     assert all(d.crashed for d in rows)
     assert all((d.defect_key or "").startswith("tsan:") for d in rows)
     assert all(d.input_sha for d in rows), "a run with no input cannot be replayed"
+
+
+# --- window widening ---------------------------------------------------------------------------
+
+def test_the_binomial_tail_is_exact():
+    """The verdict compares two small fractions, and by eye the bigger one always looks like
+    control. 6-of-6 against a 1-in-8 baseline is not a coincidence; 2-of-6 easily is."""
+    assert P.binomial_tail(6, 6, 0.125) < 1e-5
+    assert 0.1 < P.binomial_tail(2, 6, 0.125) < 0.3
+    assert P.binomial_tail(0, 6, 0.125) == 1.0
+    assert P.binomial_tail(3, 0, 0.5) == 1.0
+    # a baseline of 1.0 makes everything unsurprising, which is the honest answer
+    assert P.binomial_tail(6, 6, 1.0) == 1.0
+
+
+def test_a_rate_that_rises_with_the_input_is_a_widening():
+    w = P.widening_verdict(1, 8, [("filler+256", 6, 6), ("byte@0x0=0xff", 2, 6)])
+    assert w and w["variant"] == "filler+256"
+    assert (w["hits"], w["runs"], w["rate"]) == (6, 6, 1.0)
+    assert w["p_value"] < 1e-5 and w["baseline_rate"] == 0.125
+    assert w["retries"] == 3, "a reliable input does not need twenty attempts"
+    eff = P.widening_effect(w)
+    assert "the attacker's to WIDEN" in eff
+    assert "the bundle ships THAT input" in eff
+    assert "directional result" in eff, "an 8-sample baseline is not a published p-value"
+
+
+def test_a_rate_that_wobbles_is_not_a_widening():
+    """The costlier mistake: calling noise control. 2-of-6 against 1-in-8 has a 17% chance of
+    arising at the baseline rate."""
+    assert P.widening_verdict(1, 8, [("byte@0x0=0xff", 2, 6)]) is None
+    assert P.widening_verdict(1, 8, [("v", 1, 6), ("w", 0, 6)]) is None
+    assert P.widening_verdict(1, 8, []) is None
+    assert P.widening_verdict(0, 0, [("v", 6, 6)]) is None
+
+
+def test_a_reliable_baseline_cannot_be_widened():
+    """Nothing to raise: every variant's count is unsurprising at a baseline of 1.0, so no
+    variant can be called an improvement."""
+    assert P.widening_verdict(8, 8, [("v", 6, 6), ("w", 6, 6)]) is None
+
+
+def test_the_widening_rides_on_the_race_effect():
+    prim = P.race_primitive(_runs(1, 8))
+    prim["widening"] = P.widening_verdict(1, 8, [("filler+256", 6, 6)])
+    eff = P.race_effect(prim)
+    assert "reproduced on 1 of 8 runs" in eff and "to WIDEN" in eff
+    assert "What the race CAUSES is not shown here" in eff, \
+        "a reliable race is still not a demonstrated consequence"
+
+
+def test_a_widened_bundle_ships_the_widened_input_and_fewer_attempts():
+    prim = P.race_primitive(_runs(1, 8))
+    prim["widening"] = P.widening_verdict(1, 8, [("filler+256", 6, 6)])
+    prim["retries"] = prim["widening"]["retries"]
+    prim["widening_trials"] = [{"variant": "filler+256", "hits": 6, "runs": 6}]
+    data = bundle.build(b"\x7fELF", b"WIDENED", {"level": "L1"}, b"", "stdin", [],
+                        "sanitizer-error", primitive=prim)
+    import io
+    import tarfile
+    with tarfile.open(fileobj=io.BytesIO(data)) as tf:
+        txt = tf.extractfile("poc/PRIMITIVE.txt").read().decode()
+        runner = tf.extractfile("poc/runner.sh").read().decode()
+        inp = tf.extractfile("poc/input.bin").read()
+        readme = tf.extractfile("poc/README.txt").read().decode()
+    assert inp == b"WIDENED"
+    assert "attempts=3" in runner, "a reliable input should not ask for 24 attempts"
+    assert "WINDOW WIDENING: the rate is the attacker's to raise." in txt
+    assert "input.bin in this bundle IS that variant" in txt
+    assert "exact one-sided binomial" in txt
+    assert "not the baseline one" in readme
+
+
+def test_a_failed_widening_is_reported_with_its_variants():
+    """An experiment that was run and showed nothing is evidence too -- and the alternative is a
+    reader who cannot tell it from an experiment nobody ran."""
+    prim = P.race_primitive(_runs(1, 8))
+    prim["widening_trials"] = [{"variant": "filler+256", "hits": 1, "runs": 6},
+                               {"variant": "byte@0x0=0xff", "hits": 2, "runs": 6}]
+    data = bundle.build(b"\x7fELF", b"A", {"level": "L1"}, b"", "stdin", [], "sanitizer-error",
+                        primitive=prim)
+    import io
+    import tarfile
+    with tarfile.open(fileobj=io.BytesIO(data)) as tf:
+        txt = tf.extractfile("poc/PRIMITIVE.txt").read().decode()
+    assert "attempted and NOT shown" in txt
+    assert "filler+256" in txt and "2/6" in txt
+
+
+def test_the_stage_widens_only_an_intermittent_defect(tmp_path):
+    """The budget rule: measuring a rate costs a process per run, so the most expensive
+    experiment here runs only where its answer can change what the operator does. A defect that
+    already reports on every run has no window left to widen."""
+    import lykos.analyze.poc.primitive_stage as PS
+
+    calls = []
+
+    def det(data):
+        calls.append(data)
+        return _rep()                                     # always reports: 8/8 baseline
+
+    class _Ctx:
+        def progress(self, **kw): pass
+        def emit(self, *a, **kw): pass
+        def should_cancel(self): return False
+
+    prim = PS._race_primitive(_Ctx(), None, None, "stdin", [], b"AAAA", 5, detonate=det)
+    assert prim and not prim["intermittent"] and prim["hits"] == prim["runs"]
+    assert "widening" not in prim and "widening_trials" not in prim
+    assert len(calls) == P.RACE_RUNS, f"spent {len(calls)} runs on a defect with no window"
+
+
+def test_the_stage_finds_a_widening_when_the_input_has_one(tmp_path):
+    """The stage's own path, with the detonator injected -- because a fixture that reports
+    intermittently ON PURPOSE is a flaky test, and the flakiness is the thing under test."""
+    import lykos.analyze.poc.primitive_stage as PS
+
+    seen = {"n": 0}
+
+    def det(data):
+        # the baseline input reports one run in four; a LONGER input always reports
+        if len(data) > 64:
+            return _rep()
+        seen["n"] += 1
+        return _rep() if seen["n"] % 4 == 1 else {}
+
+    class _Ctx:
+        def __init__(self): self.msgs = []
+        def progress(self, **kw): self.msgs.append(kw.get("msg", ""))
+        def emit(self, *a, **kw): pass
+        def should_cancel(self): return False
+
+    ctx = _Ctx()
+    prim = PS._race_primitive(ctx, None, None, "stdin", [], b"A" * 40, 5, detonate=det)
+    assert prim and prim["intermittent"], prim
+    assert prim.get("widening"), f"no widening found: {prim.get('widening_trials')}"
+    assert prim["widening"]["rate"] == 1.0
+    assert prim["retries"] == 3, "the attempt count should follow the WIDENED rate"
+    widened = prim.pop("widened_input")
+    assert len(widened) > 64, "the bundle would ship the baseline input, not the reliable one"
+    assert any("WIDEN" in m for m in ctx.msgs)

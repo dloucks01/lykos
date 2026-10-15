@@ -338,7 +338,13 @@ def _quantity_primitive(ctx, target, exe, mode, base_argv, orig, pre, post, time
     return prim
 
 
-def _race_primitive(ctx, target, exe, mode, base_argv, orig, timeout, first=None):
+def _is_race(rep) -> bool:
+    return bool(rep) and rep.get("sanitizer") == primitive.TSAN \
+        and rep.get("class") in primitive.RACE_CLASSES
+
+
+def _race_primitive(ctx, target, exe, mode, base_argv, orig, timeout, first=None,
+                    pre=b"", post=b"", detonate=None):
     """Step 2e: the concurrency verdict, measured by REPEATING the same input.
 
     The other three verdicts vary the input and watch a number move. A race's outcome does not
@@ -348,10 +354,12 @@ def _race_primitive(ctx, target, exe, mode, base_argv, orig, timeout, first=None
     needs a looping reproducer, and a fault that reproduces on none of the repeats is a fact about
     OUR evidence that has to be said out loud rather than shipped as a one-shot PoC.
     """
-    first = first or _detonate_for_report(ctx, target, exe, mode, base_argv, orig, timeout)
-    if not first or first.get("sanitizer") != primitive.TSAN:
-        return None
-    if first.get("class") not in primitive.RACE_CLASSES:
+    # One seam, so the stage's own logic can be tested without a binary whose flakiness is the
+    # thing under test: a race fixture that reports intermittently ON PURPOSE is a flaky test.
+    det = detonate or (lambda data: _detonate_for_report(ctx, target, exe, mode, base_argv,
+                                                         data, timeout))
+    first = first or det(orig)
+    if not _is_race(first):
         return None
     ctx.progress(msg=f"{first['class']}: repeating the SAME input {primitive.RACE_RUNS} times to "
                      f"measure how often it reports")
@@ -359,15 +367,44 @@ def _race_primitive(ctx, target, exe, mode, base_argv, orig, timeout, first=None
     for i in range(2, primitive.RACE_RUNS + 1):
         if ctx.should_cancel():
             break
-        obs.append((f"run{i}",
-                    _detonate_for_report(ctx, target, exe, mode, base_argv, orig, timeout)))
+        obs.append((f"run{i}", det(orig)))
     prim = primitive.race_primitive(obs)
+    if prim is not None and prim.get("intermittent"):
+        # WINDOW WIDENING, and only here. A defect that already reports on every run has no
+        # window left to widen, and measuring a rate costs a process per run -- so the most
+        # expensive experiment in this stage is spent only where its answer can change what the
+        # operator does. A 1-in-8 defect is a curiosity to whoever has to reproduce it; the same
+        # defect at 6-of-6 is a tool, and the difference is an input property.
+        variants = _probe_variants(orig, pre, post)[1:][:primitive.WIDEN_VARIANTS]
+        if variants:
+            ctx.progress(msg=f"{prim['hits']}/{prim['runs']} baseline: measuring whether the "
+                             f"input can WIDEN the window ({len(variants)} variants x "
+                             f"{primitive.WIDEN_RUNS} runs)")
+        trials, by_label = [], {}
+        for label, data in variants:
+            if ctx.should_cancel():
+                break
+            hits = 0
+            for _ in range(primitive.WIDEN_RUNS):
+                hits += 1 if _is_race(det(data)) else 0
+            trials.append((label, hits, primitive.WIDEN_RUNS))
+            by_label[label] = data
+        w = primitive.widening_verdict(prim["hits"], prim["runs"], trials)
+        prim["widening_trials"] = [{"variant": a, "hits": b, "runs": c} for a, b, c in trials]
+        if w:
+            prim["widening"] = w
+            prim["retries"] = w["retries"]          # a reliable input needs far fewer attempts
+            # The BYTES that made it reliable, for the bundle to ship. Popped by the caller
+            # before anything serialises `prim` -- raw bytes are not JSON.
+            prim["widened_input"] = by_label[w["variant"]]
     if prim is not None:
         ctx.emit("primitive.race", payload={
             "class": prim["sanitizer_class"], "runs": prim["runs"], "hits": prim["hits"],
             "rate": prim["rate"], "intermittent": prim["intermittent"],
             "retries": prim["retries"], "accesses": prim["accesses"],
             "race_sites": prim["race_sites"], "location": prim.get("location"),
+            "widening": prim.get("widening"),
+            "widening_trials": prim.get("widening_trials"),
             "observations": prim["observations"][:10]})
     return prim
 
@@ -659,10 +696,15 @@ def primitive_stage(ctx) -> dict:
 
             # 2e) a concurrency defect, whose experiment is a REPEAT rather than a variation.
             prim = _race_primitive(ctx, target, exe, mode, base_argv, orig, timeout,
-                                   first=_first)
+                                   first=_first, pre=_pre, post=_post)
             if prim is not None:
-                control = frame(orig[len(_pre):len(orig) - len(_post)] if (_pre or _post)
-                                else orig)
+                # The bundle ships the input that makes the defect RELIABLE where the experiment
+                # found one -- a reproducer for a 1-in-8 race should not be the 1-in-8 input when
+                # a 6-of-6 one is in hand. Popped here because `prim` is serialised downstream
+                # and raw bytes are not JSON.
+                _widened = prim.pop("widened_input", None)
+                control = _widened if _widened else frame(
+                    orig[len(_pre):len(orig) - len(_post)] if (_pre or _post) else orig)
                 extra = primitive.race_effect(prim)
                 return _finalize(ctx, target, target_bytes, mode, base_argv, cap0, control,
                                  prim, bool(prim.get("confirmed")), extra)

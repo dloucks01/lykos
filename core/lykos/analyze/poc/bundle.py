@@ -199,6 +199,30 @@ def _primitive_txt(prim: dict) -> bytes:
             f"Reproducer attempts: {prim.get('retries')} (runner.sh loops; it stops at the "
             f"first run that reports)",
             "",
+        ]
+        w = prim.get("widening")
+        if w:
+            lines += [
+                "WINDOW WIDENING: the rate is the attacker's to raise.",
+                f"  input variant     {w['variant']}",
+                f"  widened rate      {w['hits']}/{w['runs']} ({w['rate']}) against a baseline "
+                f"of {w['baseline_rate']}",
+                f"  chance under the baseline rate   {w['p_value']} (exact one-sided binomial)",
+                "  input.bin in this bundle IS that variant, not the baseline input.",
+                "  The baseline rate is an 8-sample estimate, so this is a directional result.",
+                "",
+            ]
+        elif prim.get("widening_trials"):
+            lines += [
+                "WINDOW WIDENING: attempted and NOT shown. No input variant reported often",
+                "enough to be surprising at the baseline rate, so the rate is not shown to be",
+                "the attacker's to raise -- the defect still needs retries. Variants tried:",
+            ]
+            for t in prim["widening_trials"][:6]:
+                lines.append(f"  {str(t.get('variant'))[:28]:28s} -> {t.get('hits')}/"
+                             f"{t.get('runs')}")
+            lines.append("")
+        lines += [
             f"Accesses: {', '.join(prim.get('accesses') or []) or '(not stated)'}",
             f"Object: {prim.get('location') or '(not stated)'}",
             "Sites (a race has more than one -- naming one describes half the defect):",
@@ -510,10 +534,15 @@ def build(target_bytes: bytes, input_bytes: bytes, meta: dict, stderr: bytes,
     script = extra_files and "exploit.py" in extra_files
     prim_line = ""
     if sanitizer and (primitive or {}).get("race"):
+        _w = (primitive or {}).get("widening")
         prim_line = (f"\nPrimitive: {primitive.get('type')} -- reported on "
                      f"{primitive.get('hits')}/{primitive.get('runs')} runs of the same input; "
                      f"runner.sh makes {primitive.get('retries')} attempts because a concurrency "
-                     f"defect does not reproduce on demand. See PRIMITIVE.txt.\n")
+                     f"defect does not reproduce on demand."
+                     + (f" The window WIDENS with the input: this bundle's input.bin is the "
+                        f"variant that reported {_w['hits']}/{_w['runs']}, not the baseline one."
+                        if _w else "")
+                     + " See PRIMITIVE.txt.\n")
     elif sanitizer and (primitive or {}).get("quantity"):
         prim_line = (f"\nPrimitive: {primitive.get('type')} -- "
                      f"{primitive.get('quantity_name')} "
