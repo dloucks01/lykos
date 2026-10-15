@@ -714,8 +714,23 @@ def reclaim_verdict_traced(observation: dict, *, marker: bytes = RECLAIM_MARKER)
     if observation.get("marker_before_free"):
         return None
     use = observation.get("use") or None
+    eff = observation.get("effect") or None
+    kind = (eff or {}).get("kind")
     return {
-        "type": "controlled-reclaim-used" if use else "controlled-reclaim",
+        "type": ("controlled-reclaim-hijack" if kind == "control-flow-hijack" else
+                 "controlled-reclaim-deref" if kind == "dereference" else
+                 "controlled-reclaim-used" if use else "controlled-reclaim"),
+        # WHAT the program did with the value it read. The three earlier facts are states of
+        # memory and an access; this is a consequence, and it comes from where the process
+        # FAULTED -- the pc became the attacker's bytes (it called through them) or the faulting
+        # address did (it dereferenced them). Never inferred from the signal alone.
+        "effect_kind": kind,
+        "effect_pc": (eff or {}).get("pc"),
+        "effect_fault_addr": (eff or {}).get("fault_addr"),
+        "effect_signal": (eff or {}).get("signal"),
+        # The register that carried the attacker's bytes into the control transfer, when the
+        # hijack showed itself that way rather than as a pc.
+        "effect_via": (eff or {}).get("via"),
         "lifetime": True,
         "reclaim": True,
         "confirmed": True,
@@ -750,13 +765,31 @@ def reclaim_effect(prim: dict) -> str:
                 + (f" at offset {at}" if at is not None else "")
                 + ". The chunk was sampled before the free as well -- the marker was not there "
                 "-- so the bytes arrived with the reclaiming allocation.")
+        if prim.get("effect_kind") == "control-flow-hijack":
+            how = (f"it executed an indirect call/jump through `{prim['effect_via']}`, which "
+                   f"held the attacker's bytes, and faulted at {prim.get('effect_pc')}"
+                   if prim.get("effect_via") else
+                   f"the instruction pointer became the attacker's own bytes "
+                   f"({prim.get('effect_pc')})")
+            return (head + f" AND THE PROGRAM CALLED THROUGH THEM: it read the chunk at pc "
+                    f"{prim.get('use_pc')} and then {how} -- a DEMONSTRATED control-flow "
+                    f"hijack, because the value it read was a function pointer and it called it. "
+                    f"What is still NOT shown is code execution: eight printable bytes make a "
+                    f"NON-CANONICAL address, so the transfer faults immediately here, and "
+                    f"turning it into a chosen target is the exploit stage's claim to make")
+        if prim.get("effect_kind") == "dereference":
+            return (head + f" AND THE PROGRAM DEREFERENCED THEM: it read the chunk at pc "
+                    f"{prim.get('use_pc')} and then touched the address those bytes spell "
+                    f"({prim.get('effect_fault_addr')}), so the attacker chooses an address the "
+                    f"program reads or writes through. What is NOT shown is which of the two it "
+                    f"would have been with a MAPPED address, nor what it would do there")
         if prim.get("used"):
             return (head + f" AND THE PROGRAM THEN READ THEM: its own code touched the chunk at "
                     f"pc {prim.get('use_pc')} after the reclaim, through a pointer it should "
                     f"have stopped using -- so the attacker's bytes reached a consumer, not just "
-                    f"a dead object. What is still NOT shown is what the program does with the "
-                    f"value: a function pointer among those bytes would be a hijack, and that is "
-                    f"the exploit stage's claim to make")
+                    f"a dead object. It did not fault afterwards, so what the program DOES with "
+                    f"the value is still not shown: a function pointer among those bytes would "
+                    f"be a hijack, and that is the exploit stage's claim to make")
         return (head + " This target has no output path to read the stale pointer back through, "
                 "and no operation in the driven surface touched the chunk after the reclaim, so "
                 "what is NOT shown is heavier here than on the output route: not only what the "

@@ -700,23 +700,54 @@ def _file_traced_reclaim(ctx, target, alloc, observation):
               f"was sampled before the free and did not contain them."
               + (f" The program then READ that chunk from its own code at pc "
                  f"{hit.get('use_pc')}." if hit.get("used") else "")
+              + ((f" It then executed an indirect call/jump through "
+                  f"`{hit.get('effect_via')}`, which held those bytes, and faulted at "
+                  f"{hit.get('effect_pc')}." if hit.get("effect_via") else
+                  f" It then faulted with the instruction pointer set to those bytes "
+                  f"({hit.get('effect_pc')}).")
+                 if hit.get("effect_kind") == "control-flow-hijack" else
+                 f" It then faulted touching the address those bytes spell "
+                 f"({hit.get('effect_fault_addr')})."
+                 if hit.get("effect_kind") == "dereference" else "")
               + f" {effect}")
     ctx.emit("heaptrace.reclaim", payload={
         "type": hit["type"], "oracle": "traced-memory", "confirmed": True,
         "size": hit.get("size"), "addr": hit.get("addr"), "used": hit.get("used"),
-        "use_pc": hit.get("use_pc"),
+        "use_pc": hit.get("use_pc"), "effect_kind": hit.get("effect_kind"),
+        "effect_pc": hit.get("effect_pc"),
         "chunk_offset": hit.get("chunk_offset"), "allocator": alloc["alloc_name"]})
-    eff = [{"kind": "memory-corruption",
-            "title": ("Attacker-controlled contents READ from a freed object (demonstrated)"
-                      if hit.get("used") else
-                      "Attacker-controlled contents in a freed object (demonstrated)"),
-            "status": "demonstrated", "detail": detail,
-            "proof": {"type": "uaf-reclaim-traced", "addr": hit.get("addr"),
-                      "offset": hit.get("chunk_offset"), "size": hit.get("size"),
-                      "marker": hit.get("marker"), "use_pc": hit.get("use_pc")}}]
+    _proof = {"type": "uaf-reclaim-traced", "addr": hit.get("addr"),
+              "offset": hit.get("chunk_offset"), "size": hit.get("size"),
+              "marker": hit.get("marker"), "use_pc": hit.get("use_pc"),
+              "effect_kind": hit.get("effect_kind"), "effect_pc": hit.get("effect_pc"),
+              "effect_fault_addr": hit.get("effect_fault_addr"),
+              "effect_via": hit.get("effect_via")}
+    if hit.get("effect_kind") == "control-flow-hijack":
+        # The instruction pointer became the attacker's own bytes. That is a hijack, which is a
+        # different effect KIND from "the contents are attacker-controlled" -- and RCE rides
+        # along as POTENTIAL for the same reason `poc_primitive` does it: the flow is hijacked,
+        # no attacker code has run, and the landing address here is unmapped on purpose.
+        eff = [{"kind": "control-flow-hijack",
+                "title": "Control-flow hijack through a reclaimed freed object (demonstrated)",
+                "status": "demonstrated", "detail": detail, "proof": _proof},
+               {"kind": "rce", "title": "Remote code execution", "status": "potential",
+                "detail": "the hijacked flow lands on the sentinel, which is unmapped; a chosen "
+                          "target and a payload are the exploit stage's work"}]
+    else:
+        eff = [{"kind": "memory-corruption",
+                "title": ("Attacker-controlled pointer DEREFERENCED from a freed object "
+                          "(demonstrated)" if hit.get("effect_kind") == "dereference" else
+                          "Attacker-controlled contents READ from a freed object (demonstrated)"
+                          if hit.get("used") else
+                          "Attacker-controlled contents in a freed object (demonstrated)"),
+                "status": "demonstrated", "detail": detail, "proof": _proof}]
     FindingDAO(ctx.conn).upsert(target.id, target.case_id, {
         "cwe": "CWE-416",
-        "title": ("Use-after-free: attacker bytes reclaimed AND read (traced)" if hit.get("used")
+        "title": ("Use-after-free: reclaimed object's bytes CALLED as a function pointer"
+                  if hit.get("effect_kind") == "control-flow-hijack" else
+                  "Use-after-free: reclaimed object's bytes DEREFERENCED as a pointer"
+                  if hit.get("effect_kind") == "dereference" else
+                  "Use-after-free: attacker bytes reclaimed AND read (traced)" if hit.get("used")
                   else "Use-after-free with a demonstrated reclaim (traced)"),
         "severity": "critical", "detector": "heap_trace", "state": "corroborated",
         "confidence": 0.9,
@@ -727,7 +758,8 @@ def _file_traced_reclaim(ctx, target, alloc, observation):
     ctx.progress(msg=f"reclaim demonstrated by the tracer at {hit.get('addr')} "
                      f"(no output oracle needed)")
     return {"metrics": {"reclaim": "demonstrated", "reclaim_oracle": "traced-memory",
-                        "reclaim_used": bool(hit.get("used"))}}
+                        "reclaim_used": bool(hit.get("used")),
+                        "reclaim_effect": hit.get("effect_kind")}}
 
 
 def _try_uaf_leak(ctx, target, target_bytes, exe, workdir, model, opts, width, alloc):
@@ -968,6 +1000,14 @@ def heap_trace_stage(ctx) -> dict:
                                  if u.get("addr") == _rc.get("addr")), None)
                     if _use and not reclaim_observed.get("use"):
                         reclaim_observed["use"] = _use
+                    # ...and WHAT it did with them. A hijack outranks a bare dereference, which
+                    # outranks an unexplained fault, so the strongest observation in this run
+                    # wins rather than whichever arrived first.
+                    _rank = {"control-flow-hijack": 3, "dereference": 2, "fault": 1}
+                    for _fx in (rep.get("reclaim_effect") or []):
+                        _cur = reclaim_observed.get("effect") or {}
+                        if _rank.get(_fx.get("kind"), 0) > _rank.get(_cur.get("kind"), 0):
+                            reclaim_observed["effect"] = _fx
             if rep.get("double_free") or rep.get("use_after_free") or rep.get("heap_overflow"):
                 found = (seq, rep)
                 break

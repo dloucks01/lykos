@@ -143,6 +143,7 @@ if __name__ == "__main__":                                            # ---- the
 
     PTRACE_TRACEME, PTRACE_PEEKTEXT, PTRACE_PEEKUSER, PTRACE_POKETEXT, PTRACE_POKEUSER = 0, 1, 3, 4, 6
     PTRACE_CONT, PTRACE_SINGLESTEP, PTRACE_GETREGS, PTRACE_SETREGS = 7, 9, 12, 13
+    PTRACE_GETSIGINFO = 0x4202                           # si_addr: WHERE the fault touched
     _DR = 848                                            # offsetof(struct user, u_debugreg) on x86-64
 
     class _Regs(ctypes.Structure):
@@ -346,6 +347,71 @@ if __name__ == "__main__":                                            # ---- the
                 stale_at[chunk] = at
                 arm(chunk + at, "stale", chunk, 0b11)
 
+        def siginfo_addr():
+            """`si_addr` of the pending signal -- the address the fault touched -- or None."""
+            buf = (ctypes.c_ubyte * 128)()
+            if libc.ptrace(PTRACE_GETSIGINFO, pid, None, ctypes.byref(buf)) == -1:
+                return None
+            # siginfo_t on x86-64: si_signo/si_errno/si_code are three ints, then the union; for
+            # SIGSEGV/SIGBUS the first member is void *si_addr at offset 16.
+            return int.from_bytes(bytes(buf[16:24]), "little")
+
+        def classify_fault(sig):
+            """WHAT the program did with the attacker's bytes, from where it faulted.
+
+            The last link of the reclaim chain. The three earlier facts are states of memory and
+            an access; this one is a consequence, and it is read off the fault rather than
+            guessed from the instruction stream: `pc == our bytes` means the program CALLED
+            through the value it read, and `fault address == our bytes` means it dereferenced it.
+            Anything else is reported as a fault after the reclaim with no mechanism claimed.
+            """
+            rg2 = getregs()
+            where = siginfo_addr()
+            words = {int.from_bytes(marker[i:i + 8], "little")
+                     for i in range(0, max(1, len(marker) - 7))}
+            kind, via = None, None
+            if rg2.rip in words:
+                # A CANONICAL but unmapped target: the fetch page-faults AT the target, so the
+                # pc IS the attacker's bytes.
+                kind = "control-flow-hijack"
+            elif where is not None and where in words:
+                kind = "dereference"
+            else:
+                # The common case for a printable sentinel, and it took a measurement to see:
+                # eight ASCII bytes make a NON-CANONICAL address (the top bytes can never be
+                # zero), so a jump to it raises #GP rather than a page fault -- and the kernel
+                # reports #GP as SIGSEGV with si_addr 0 and the pc still ON the faulting
+                # instruction. Neither of the two tests above can fire, and the hijack is real.
+                # The evidence is then: the faulting instruction is an INDIRECT CALL/JMP through
+                # a register, and that register holds the attacker's bytes.
+                code = read_mem(rg2.rip, 4) or b""
+                i = 0
+                while i < len(code) and 0x40 <= code[i] <= 0x4F:     # REX prefixes
+                    i += 1
+                indirect = (i + 1 < len(code) and code[i] == 0xFF
+                            and ((code[i + 1] >> 3) & 7) in (2, 3, 4, 5))
+                if indirect:
+                    for rn in ("rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp",
+                               "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"):
+                        if getattr(rg2, rn, None) in words:
+                            kind, via = "control-flow-hijack", rn
+                            break
+            # What is in the watched chunk AT THE FAULT. Without it a "fault" verdict is a dead
+            # end for whoever reads the report: the chunk held the marker when the reclaim was
+            # confirmed, and if it does not now, something overwrote it and that is the fact
+            # worth knowing.
+            now = {}
+            for chunk in list(stale_at)[:2]:
+                d8 = read_mem(chunk, 16)
+                if d8:
+                    now[hex(chunk)] = d8.hex()
+            events.append({"event": "reclaim-effect", "kind": kind or "fault",
+                           "signal": int(sig), "pc": hex(rg2.rip),
+                           "fault_addr": (hex(where) if where is not None else None),
+                           # WHICH register carried the attacker's bytes into the control
+                           # transfer, when that is how the hijack showed itself.
+                           "via": via, "chunk_now": now})
+
         live = {}                                        # live ptr -> {"size", "end", "slot"}
         #: chunk -> was the marker ALREADY in it when it was freed? The before half of the
         #: reclaim test: finding the marker after a reclaim means nothing if it was there
@@ -412,9 +478,20 @@ if __name__ == "__main__":                                            # ---- the
                 if os.WIFEXITED(status) or os.WIFSIGNALED(status):
                     break
                 if not (os.WIFSTOPPED(status) and os.WSTOPSIG(status) == signal.SIGTRAP):
-                    # deliver other signals (e.g. the target's own SIGSEGV) and continue
-                    libc.ptrace(PTRACE_CONT, pid, None,
-                                ctypes.c_void_p(os.WSTOPSIG(status)))
+                    _sig = os.WSTOPSIG(status)
+                    # A FAULT after a reclaim is the last question in the chain: the program read
+                    # the attacker's bytes, and this says what it DID with them. The marker is
+                    # eight ASCII digits, so as a machine word it is an unmapped address -- if
+                    # the program CALLS through it the pc IS our bytes, and if it dereferences it
+                    # the faulting address is. Nothing is inferred from the signal alone.
+                    if marker and stale_at and _sig in (signal.SIGSEGV, signal.SIGBUS,
+                                                        signal.SIGILL):
+                        try:
+                            classify_fault(_sig)
+                        except Exception:
+                            pass
+                    # deliver the signal (e.g. the target's own SIGSEGV) and continue
+                    libc.ptrace(PTRACE_CONT, pid, None, ctypes.c_void_p(_sig))
                     continue
                 rg = getregs()
                 # A hardware-watchpoint hit (DR6 B0-B3) = freed memory was ACCESSED. Count it as a
@@ -576,6 +653,11 @@ if __name__ == "__main__":                                            # ---- the
                    # this is the third -- the only one that shows a USE.
                    "reclaim_use": [e for e in events
                                    if e.get("event") == "reclaim-use"][:16],
+                   # ...and what the program DID with them. `kind` is "control-flow-hijack" when
+                   # the pc became our bytes, "dereference" when the faulting address did, and
+                   # "fault" when neither -- a consequence observed, never inferred.
+                   "reclaim_effect": [e for e in events
+                                      if e.get("event") == "reclaim-effect"][:8],
                    "double_free": any(e.get("error") == "double-free" for e in events),
                    "use_after_free": any(e.get("error") == "use-after-free" for e in events),
                    "heap_overflow": any(e.get("error") == "heap-overflow" for e in events),

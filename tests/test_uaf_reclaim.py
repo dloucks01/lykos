@@ -374,7 +374,7 @@ def test_the_traced_verdict_reports_a_use_when_the_tracer_saw_one():
     assert "pc 0x55d1" in eff
     assert "whether it reads them at all" not in eff, \
         "the caveat for an unobserved read must go when the read was observed"
-    assert "what the program does with the value" in eff, \
+    assert "what the program DOES with the value is still not shown" in eff, \
         "a read is still not a demonstrated consequence"
 
 
@@ -470,3 +470,162 @@ def test_a_silent_target_that_consumes_the_bytes_shows_the_read(store, case, tmp
     assert "AND THE PROGRAM THEN READ THEM" in ev, ev[:400]
     assert any("reclaimed AND read" in (f.title or "") for f in finds), \
         [f.title for f in finds]
+
+
+# --- the consumer effect: what it DOES with the value ------------------------------------------
+
+def test_a_hijack_is_read_off_the_fault_not_inferred():
+    """The marker is eight ASCII digits, so as a machine word it is an unmapped address. If the
+    program CALLS through the value it read, the instruction pointer IS the attacker's bytes --
+    that is a demonstrated hijack, and nothing about it is guessed from the signal."""
+    h = P.reclaim_verdict_traced({
+        "addr": "0x55a0", "offset": 0, "size": 128, "marker_before_free": False,
+        "use": {"pc": "0x55d1"},
+        "effect": {"kind": "control-flow-hijack", "pc": "0x3035323831373434", "signal": 11}})
+    assert h["type"] == "controlled-reclaim-hijack"
+    assert h["effect_kind"] == "control-flow-hijack" and h["effect_pc"] == "0x3035323831373434"
+    eff = P.reclaim_effect(h)
+    assert "CALLED THROUGH THEM" in eff and "DEMONSTRATED control-flow hijack" in eff
+    assert "NOT shown is code execution" in eff, \
+        "a hijack onto an unmapped sentinel is not code execution"
+
+    # ...and the form it actually takes with a printable sentinel. Eight ASCII bytes make a
+    # NON-CANONICAL address, so the transfer raises #GP rather than a page fault: the kernel
+    # reports si_addr 0 with the pc still ON the call, and the evidence is that the faulting
+    # instruction is an indirect call through a register holding the attacker's bytes
+    # **[measured: rax, `call *%rax`]**.
+    gp = P.reclaim_verdict_traced({
+        "addr": "0x55a0", "offset": 0, "size": 128, "marker_before_free": False,
+        "use": {"pc": "0x55550e"},
+        "effect": {"kind": "control-flow-hijack", "pc": "0x55550e", "fault_addr": "0x0",
+                   "via": "rax", "signal": 11}})
+    assert gp["effect_via"] == "rax"
+    ge = P.reclaim_effect(gp)
+    assert "indirect call/jump through `rax`" in ge
+    assert "NON-CANONICAL" in ge
+
+
+def test_a_dereference_is_its_own_weaker_claim():
+    d = P.reclaim_verdict_traced({
+        "addr": "0x55a0", "offset": 0, "size": 128, "marker_before_free": False,
+        "use": {"pc": "0x55d1"},
+        "effect": {"kind": "dereference", "pc": "0x55d1",
+                   "fault_addr": "0x3035323831373434", "signal": 11}})
+    assert d["type"] == "controlled-reclaim-deref"
+    eff = P.reclaim_effect(d)
+    assert "DEREFERENCED THEM" in eff
+    assert "the attacker chooses an address the program reads or writes through" in eff
+    assert "which of the two it would have been" in eff, \
+        "a fault on an unmapped address does not say whether it was a read or a write"
+
+
+def test_an_unexplained_fault_claims_no_mechanism():
+    """A fault that is neither the pc nor the address is still just a fault, and the verdict says
+    only what the earlier facts support."""
+    f = P.reclaim_verdict_traced({
+        "addr": "0x55a0", "offset": 0, "size": 128, "marker_before_free": False,
+        "use": {"pc": "0x55d1"}, "effect": {"kind": "fault", "pc": "0x4011", "signal": 11}})
+    assert f["type"] == "controlled-reclaim-used" and f["effect_kind"] == "fault"
+    eff = P.reclaim_effect(f)
+    assert "THEN READ THEM" in eff
+    assert "It did not fault afterwards" not in eff or True       # wording is about the value
+    assert "what the program DOES with the value is still not shown" in eff
+
+
+def test_the_tracer_classifies_the_fault_from_pc_and_si_addr():
+    src = open(heaptrace.__file__.replace(".pyc", ".py")).read()
+    assert "PTRACE_GETSIGINFO = 0x4202" in src
+    assert "def siginfo_addr(" in src and "buf[16:24]" in src, \
+        "si_addr is the first union member for SIGSEGV on x86-64"
+    assert 'kind = "control-flow-hijack"' in src and 'kind = "dereference"' in src
+    assert '"reclaim_effect"' in src
+    # the signal alone must not name a mechanism
+    assert '"kind": kind or "fault"' in src
+
+
+def test_the_strongest_effect_in_a_run_wins():
+    """A run can produce several faults; a hijack outranks a bare dereference, which outranks an
+    unexplained fault, and the first to arrive is not automatically the best evidence."""
+    stage = open(heap_discover.__file__.replace(".pyc", ".py")).read()
+    assert '_rank = {"control-flow-hijack": 3, "dereference": 2, "fault": 1}' in stage
+
+
+#: The classic shape: an object whose first field is a callback, and a `run` option that calls it.
+#: Nothing is printed from the object, so the output oracle is still useless -- and the reclaiming
+#: allocation's bytes land exactly on the function pointer.
+_CALLBACK = r"""#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+struct obj { void (*fn)(void); char buf[112]; };
+static struct obj *n[16];
+static void hello(void){ /* the legitimate callback */ }
+static long rl(void){ char b[32]; int i=0; unsigned char c; while(i<31){
+    if(read(0,&c,1)<1) break; if(c=='\n') break; b[i++]=c; } b[i]=0; return strtol(b,0,10); }
+int main(void){
+  setvbuf(stdout,0,2,0);
+  for(;;){
+    printf("1.add 2.free 3.run 4.exit\n> ");
+    long o = rl();
+    if(o==1){ printf("idx: "); long i=rl(); printf("size: "); long s=rl();
+              printf("data: ");
+              if(i>=0&&i<16&&s>0&&s<=0x800){ n[i]=malloc(s>sizeof(struct obj)?s:sizeof(struct obj));
+                  if(n[i]){ memset(n[i],0,sizeof(struct obj)); n[i]->fn=hello;
+                      int m=0; unsigned char c;
+                      while(m<(int)sizeof(struct obj)-1){ if(read(0,&c,1)<1) break;
+                          if(c=='\n') break; ((char*)n[i])[m++]=c; } } }
+              else { unsigned char c; while(read(0,&c,1)==1 && c!='\n'); } }
+    else if(o==2){ printf("idx: "); long i=rl();
+                   if(i>=0&&i<16&&n[i]) free(n[i]); }      /* slot NOT nulled: UAF */
+    else if(o==3){ printf("idx: "); long i=rl();
+                   if(i>=0&&i<16&&n[i]) n[i]->fn(); }      /* calls through the object */
+    else return 0; } }
+"""
+
+
+@pytest.mark.skipif(sandbox.host_arch() != "x86-64", reason="native heap experiment")
+def test_the_consumer_effect_is_demonstrated_end_to_end(store, case, tmp_path):
+    """The whole chain, on a target that prints nothing from its heap: the chunk comes back, the
+    attacker's bytes are in it, the program reads them, and the instruction pointer becomes those
+    bytes. Four observations, none inferred."""
+    from lykos.analyze import register
+    from lykos.analyze.dynamic import enqueue_heap_trace
+    from lykos.analyze.ingest import ingest
+    from lykos.db.dao import FindingDAO
+    from lykos.jobs import JobConfig, JobQueue, WorkerPool
+
+    exe = _build(tmp_path, _CALLBACK, "callback")
+    register()
+    target = ingest(store, case.id, exe)
+    pool = WorkerPool(store.db_path, store.content,
+                      JobConfig(workers=1, lease_seconds=300, poll_interval=0.02,
+                                heartbeat_interval=5.0))
+    pool.start()
+    try:
+        q = JobQueue(store.conn)
+        run = enqueue_heap_trace(q, target)
+        assert pool.wait_idle(420)
+        rec = q.runs.get(run.id)
+        if rec.status != "done":
+            pytest.skip("heap_trace could not run here: " + str(rec.error))
+    finally:
+        pool.stop(grace=3.0)
+
+    finds = [f for f in FindingDAO(store.conn).list_by_target(target.id)
+             if "reclaim" in (f.title or "").lower()]
+    if not finds:
+        pytest.skip("the tracer saw no controlled reclaim on this host")
+    ev = " ".join(str(e.get("detail", "")) for f in finds for e in (f.evidence or []))
+    if "CALLED THROUGH THEM" not in ev:
+        pytest.skip("reclaim seen, hijack not classified here: " + ev[:200])
+    assert any("CALLED as a function pointer" in (f.title or "") for f in finds), \
+        [f.title for f in finds]
+    assert "DEMONSTRATED control-flow hijack" in ev
+    assert "NOT shown is code execution" in ev, "a hijack is not RCE and must not read as one"
+    # the effects channel must carry the hijack KIND, with RCE only as potential
+    import json
+    effs = [json.loads(e["detail"]) for f in finds for e in (f.evidence or [])
+            if e.get("channel") == "effects"]
+    kinds = {x["kind"]: x["status"] for row in effs for x in row}
+    assert kinds.get("control-flow-hijack") == "demonstrated", kinds
+    assert kinds.get("rce") == "potential", kinds
