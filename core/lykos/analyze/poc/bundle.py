@@ -147,6 +147,45 @@ def _primitive_txt(prim: dict) -> bytes:
     # is a jump. Printing "Control offset: None / Sentinel: 0x0" under an L2 heading would be the
     # same defect the comment above describes, one class further on, so it gets its own template
     # stating the magnitude the sanitizer measured and the experiment that bounded it.
+    if prim.get("quantity"):
+        # A QUANTITY defect: no access, no dead object, and deliberately no L2 heading. What the
+        # experiment bounded is a number, and the template says which number and what it means.
+        controlled = bool(prim.get("confirmed"))
+        lim = (f"  ({prim.get('quantity_limit_name')}: {prim.get('quantity_limit')})"
+               if prim.get("quantity_limit") is not None else "")
+        lines = [
+            "L1 reproducer with a measured magnitude",
+            "=" * 39,
+            f"Primitive: {prim.get('type')}",
+            f"Sanitizer class: {prim.get('sanitizer_class')}",
+            f"{str(prim.get('quantity_name') or 'value').capitalize()}: "
+            f"{prim.get('quantity_min')}..{prim.get('quantity_max')}{lim}",
+            f"Attacker-controlled magnitude: {controlled}",
+            f"Effect: {prim.get('effect_kind')} ({prim.get('effect_status')})",
+            "",
+            f"What this is: {prim.get('meaning')}.",
+            "",
+            "This is NOT an L2 exploitation primitive and does not claim to be: nothing here",
+            "controls the instruction pointer or writes to a chosen address. The claim is the",
+            "magnitude and who picks it.",
+            "",
+        ]
+        if prim.get("effect_status") != "demonstrated":
+            lines += ["The sanitizer PREVENTED the consequence (it intercepted the call, or the",
+                      "access is undefined rather than performed), so the effect is recorded as",
+                      "potential: what a build without the sanitizer would do is an inference.",
+                      ""]
+        if prim.get("observations"):
+            lines.append("Input variants detonated (the evidence for the line above):")
+            for o in prim["observations"][:10]:
+                lines.append(f"  {str(o.get('variant'))[:28]:28s} -> {o.get('quantity')}")
+            if not controlled:
+                lines += ["",
+                          "Every variant produced the same number, so it is not shown to be the",
+                          "attacker's to pick. The defect reproduces; the degree of control over",
+                          "it is unproven, and is reported so."]
+            lines.append("")
+        return ("\n".join(lines)).encode()
     if prim.get("lifetime"):
         # A LIFETIME defect: the object is dead, so there is no distance past its end and, for a
         # double free, no access at all. Printing the out-of-bounds template here would state a
@@ -399,7 +438,14 @@ def build(target_bytes: bytes, input_bytes: bytes, meta: dict, stderr: bytes,
         extra_files.setdefault("replay_prompt.py", _PROMPT_REPLAY)
     script = extra_files and "exploit.py" in extra_files
     prim_line = ""
-    if sanitizer and (primitive or {}).get("lifetime"):
+    if sanitizer and (primitive or {}).get("quantity"):
+        prim_line = (f"\nPrimitive: {primitive.get('type')} -- "
+                     f"{primitive.get('quantity_name')} "
+                     f"{primitive.get('quantity_min')}..{primitive.get('quantity_max')} "
+                     f"(attacker-controlled={primitive.get('confirmed')}; "
+                     f"{primitive.get('effect_kind')}, {primitive.get('effect_status')}). "
+                     f"See PRIMITIVE.txt.\n")
+    elif sanitizer and (primitive or {}).get("lifetime"):
         # A dead object has no "distance past the end": what the experiment bounded is WHERE in
         # the freed chunk the access landed and HOW BIG the chunk was.
         prim_line = (f"\nPrimitive: {primitive.get('type')} -- offset "

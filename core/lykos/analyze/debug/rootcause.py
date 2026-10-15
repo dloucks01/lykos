@@ -357,6 +357,31 @@ def _classify_ubsan(msg: str):
 _ASAN_NONBUG = frozenset({"failed", "out", "hard", "requested", "cannot", "unable", "shadow",
                           "nested", "ignoring", "while", "thread", "internal", "atos"})
 
+#: Classes ASan words as a SENTENCE. The token regex takes the first word-like thing after the
+#: colon, which for these is English prose -- and two of those words are in the denylist above, so
+#: the report was not merely mislabelled but DROPPED. Measured: `attempting double-free on 0x...`
+#: came out as class `attempting` carrying CWE-119, and `requested allocation size 0x8000...
+#: exceeds maximum supported size` matched `requested`, which the denylist removes, so
+#: `parse_asan_report` returned None and a reachable, CVE-bearing defect class produced NO FINDING
+#: AT ALL -- the very outcome the comment on `allocation-size-too-big` below says it fixed, by an
+#: entry nothing could ever reach.
+_ASAN_SENTENCE = (
+    (re.compile(r"AddressSanitizer:\s*attempting double-free"), "double-free"),
+    (re.compile(r"AddressSanitizer:\s*attempting free on address"), "bad-free"),
+    (re.compile(r"AddressSanitizer:\s*requested allocation size 0x[0-9a-f]+.*?exceeds maximum"),
+     "allocation-size-too-big"),
+    # A looser second pass for the same class: the exact wording of this line has moved across
+    # clang releases ("exceeds maximum supported size", "exceeds the maximum"), and matching
+    # neither is how this report came to be dropped in the first place.
+    (re.compile(r"AddressSanitizer:\s*(?:requested )?allocation size .*?exceeds (?:maximum|the)"),
+     "allocation-size-too-big"),
+)
+#: How each sentence class reads in the finding's detail line.
+_SENTENCE_DETAIL = {
+    "bad-free": "free of an address that was never allocated",
+    "allocation-size-too-big": "allocation of an attacker-sized region refused by the allocator",
+}
+
 
 #: Stack frames that belong to the REPORTING machinery and not to the defect: the sanitizer
 #: runtimes, their interceptors and libFuzzer's own driver.
@@ -421,18 +446,11 @@ def parse_asan_report(text: str) -> Optional[dict]:
     # too-small address-space limit produces and which is NOT a finding. Requiring the colon,
     # plus a denylist for the odd non-bug token, keeps those out of the classification.
     m = re.search(r"(?:ERROR|SUMMARY):\s*AddressSanitizer:\s*([a-z][a-z0-9-]+)", t)
-    # A FREE-side defect states its class as a sentence, not as a token: ASan writes
-    # `ERROR: AddressSanitizer: attempting double-free on 0x... in thread T0`, and the first
-    # word-like thing after the colon is "attempting". Measured on a two-line double free: the
-    # finding came out as class `attempting`, CWE-119 ("memory buffer errors") at high -- a
-    # generic corruption label for a defect whose own CWE, 415, was already in the table two
-    # lines below. The sentence is matched before the token so the class is the defect.
-    sentence = re.search(r"AddressSanitizer:\s*attempting (double-free|free on address)", t)
+    # Some classes are stated as a SENTENCE rather than as a token, and the token regex above
+    # then picks the first word of English prose. Matched before it, so the class is the defect.
+    sentence = next((cls for rx, cls in _ASAN_SENTENCE if rx.search(t)), None)
     if sentence:
         m = None
-        bad_free = "double-free" if sentence.group(1) == "double-free" else "bad-free"
-    else:
-        bad_free = None
     # MemorySanitizer reports the one class ASan/UBSan cannot: a READ of memory that was never
     # initialized (CWE-457). It needs its own -fsanitize=memory build (clang, mutually exclusive
     # with ASan), so this fires only when such a binary is detonated -- see compile_source_msan.
@@ -448,13 +466,12 @@ def parse_asan_report(text: str) -> Optional[dict]:
     ub = re.search(r"runtime error:\s*(.+)", t)
     if m and m.group(1) in _ASAN_NONBUG:
         m = None
-    if not m and not msan and not tsan and not lsan and not ub and not bad_free:
+    if not m and not msan and not tsan and not lsan and not ub and not sentence:
         return None
-    if bad_free:
-        bug = bad_free
+    if sentence:
+        bug = sentence
         cwe, sev = _ASAN_CWE[bug]
-        detail = (f"AddressSanitizer: {bug.replace('-', ' ')}" if bug != "bad-free"
-                  else "AddressSanitizer: free of an address that was never allocated")
+        detail = f"AddressSanitizer: {_SENTENCE_DETAIL.get(bug, bug.replace('-', ' '))}"
     elif msan:
         bug = "use-of-uninitialized-value"
         cwe, sev = ("CWE-457", "medium")
@@ -496,6 +513,7 @@ def parse_asan_report(text: str) -> Optional[dict]:
     out = {"class": bug, "cwe": cwe, "severity": sev,
            "detail": detail + (f" at {src}" if src else ""), "source": src}
     out.update(_access_detail(t))
+    out.update(_quantity_detail(t, bug))
     refined = _ASAN_BY_ACCESS.get((bug, out.get("access") or ""))
     if refined:
         out["cwe"], out["severity"] = refined
@@ -523,6 +541,64 @@ _ASAN_REGION = re.compile(
     r"(\d+)-byte region")
 _SIDE = {"after": "after", "to the right of": "after",
          "before": "before", "to the left of": "before", "inside": "inside"}
+
+
+#: The NUMBER each quantity-shaped class is about, with what to call it and the limit it broke.
+#: These classes describe no access -- there is no distance past an object and no offset inside a
+#: dead one -- so neither the out-of-bounds verdict nor the lifetime verdict has anything to say
+#: about them. What their report does state is a MAGNITUDE, and whether the attacker chooses it is
+#: the one question that separates "this input happened to do it" from "the input decides".
+#: (class, what the number is, how to read it, how to read the SECOND number, what that one is).
+#: The second number is not always a limit -- for a leak it is the object count -- so it carries
+#: its own name rather than being printed as a bound the first one exceeded.
+_QUANTITIES = (
+    ("allocation-size-too-big", "requested allocation size",
+     re.compile(r"requested allocation size (0x[0-9a-f]+|\d+)"),
+     re.compile(r"exceeds maximum supported size of (0x[0-9a-f]+|\d+)"), "allocator maximum"),
+    ("out-of-memory", "allocation size",
+     re.compile(r"allocat\w* (?:of )?(0x[0-9a-f]+|\d+) bytes"), None, ""),
+    ("negative-size-param", "size argument",
+     re.compile(r"negative-size-param:\s*\(size=(-?\d+)\)"), None, ""),
+    ("memory-leak", "leaked bytes",
+     re.compile(r"(?:Direct|Indirect) leak of (\d+) byte"),
+     re.compile(r"in (\d+) object"), "objects"),
+    ("array-index-out-of-bounds", "index",
+     re.compile(r"\bindex (-?\d+) out of bounds"),
+     re.compile(r"out of bounds for type '[^']*\[(\d+)\]"), "array bound"),
+    ("bad-shift", "shift exponent",
+     re.compile(r"shift exponent (-?\d+)"), re.compile(r"for (\d+)-bit type"), "type width"),
+)
+
+
+def _int(text: str | None):
+    if text is None:
+        return None
+    try:
+        return int(text, 16) if text.lower().startswith("0x") else int(text)
+    except ValueError:
+        return None
+
+
+def _quantity_detail(t: str, bug: str) -> dict:
+    """The magnitude a quantity-shaped report states, and the limit it exceeded.
+
+    One field name for every class (`quantity`), because the verdict asks the same question of
+    all of them -- does it move when the input moves -- and only the WORDING differs.
+    """
+    for cls, name, rx, limit_rx, limit_name in _QUANTITIES:
+        if cls != bug:
+            continue
+        m = rx.search(t or "")
+        if m is None:
+            return {}
+        out = {"quantity": _int(m.group(1)), "quantity_name": name}
+        if limit_rx is not None:
+            lm = limit_rx.search(t or "")
+            if lm:
+                out["quantity_limit"] = _int(lm.group(1))
+                out["quantity_limit_name"] = limit_name
+        return out
+    return {}
 
 
 def _access_detail(t: str) -> dict:

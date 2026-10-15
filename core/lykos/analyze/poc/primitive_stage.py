@@ -43,6 +43,17 @@ _PRIM_CWE = {"instruction-pointer-control": "CWE-787",
 # the class it was given -- which is what `title_only` is for. Adding 762 here would have broken
 # the invariant that every replacement is itself a class the override outranks, so a second pass
 # over the same finding would flip the label back.
+
+#: How a quantity-shaped defect headlines. Separate from `_EFF` because these are not keyed on
+#: the verdict TYPE (which carries a `controlled-` prefix) but on the sanitizer class.
+_QUANTITY_TITLE = {
+    "allocation-size-too-big": "Resource exhaustion (attacker-sized allocation)",
+    "out-of-memory": "Resource exhaustion (memory)",
+    "memory-leak": "Resource exhaustion (memory leak)",
+    "negative-size-param": "Memory corruption (negative length to a memory routine)",
+    "array-index-out-of-bounds": "Memory corruption (out-of-bounds index)",
+    "bad-shift": "Undefined behaviour (shift exponent)",
+}
 # root_cause classes that are already a memory-corruption defect and so are kept as-is.
 # The one definition lives beside the finding vocabulary; a second copy here would drift.
 from ...db.models import OUTRANKS_PRIMITIVE_CWES as _MEM_CORRUPTION
@@ -238,9 +249,9 @@ def _probe_variants(orig: bytes, pre: bytes, post: bytes):
     return out
 
 
-def _oob_primitive(ctx, target, exe, mode, base_argv, orig, pre, post, timeout):
+def _oob_primitive(ctx, target, exe, mode, base_argv, orig, pre, post, timeout, first=None):
     """Step 2b: the out-of-bounds-access verdict, or None when this is not that kind of fault."""
-    first = _detonate_for_report(ctx, target, exe, mode, base_argv, orig, timeout)
+    first = first or _detonate_for_report(ctx, target, exe, mode, base_argv, orig, timeout)
     if not first or first.get("class") not in primitive.OOB_CLASSES:
         return None                                      # not a sanitizer-reported OOB access
     ctx.progress(msg=f"{first['class']} ({first.get('access')}): varying the input to see "
@@ -260,7 +271,7 @@ def _oob_primitive(ctx, target, exe, mode, base_argv, orig, pre, post, timeout):
     return prim
 
 
-def _lifetime_primitive(ctx, target, exe, mode, base_argv, orig, pre, post, timeout):
+def _lifetime_primitive(ctx, target, exe, mode, base_argv, orig, pre, post, timeout, first=None):
     """Step 2c: the lifetime-defect verdict (use-after-free, double free), or None.
 
     Same experiment as step 2b, different question. The out-of-bounds verdict asks how far past
@@ -268,7 +279,7 @@ def _lifetime_primitive(ctx, target, exe, mode, base_argv, orig, pre, post, time
     whether a lifetime defect is a primitive is whether the attacker chooses WHICH PART of the
     stale chunk is touched and HOW BIG the chunk is -- see `primitive.lifetime_primitive`.
     """
-    first = _detonate_for_report(ctx, target, exe, mode, base_argv, orig, timeout)
+    first = first or _detonate_for_report(ctx, target, exe, mode, base_argv, orig, timeout)
     if not first or first.get("class") not in primitive.LIFETIME_CLASSES:
         return None
     ctx.progress(msg=f"{first['class']}: varying the input to see whether the offset inside the "
@@ -291,6 +302,39 @@ def _lifetime_primitive(ctx, target, exe, mode, base_argv, orig, pre, post, time
             "controlled": prim["confirmed"], "used_at": prim.get("used_at"),
             "freed_at": prim.get("freed_at"), "allocated_at": prim.get("allocated_at"),
             "variants_detonated": len(obs), "observations": prim["observations"][:10]})
+    return prim
+
+
+def _quantity_primitive(ctx, target, exe, mode, base_argv, orig, pre, post, timeout, first=None):
+    """Step 2d: the verdict for a class whose report states a MAGNITUDE and no access.
+
+    Same experiment again, third question. A 35 TB allocation request, a leak, a negative length,
+    an out-of-bounds index: none of these describes an access past an object or a use of a dead
+    one, so steps 2b and 2c both decline and the ladder used to end on "no instruction-pointer /
+    memory primitive found" -- an answer to a question nobody asked about this defect. What the
+    report states is a number, and the question is whether the attacker picks it.
+    """
+    first = first or _detonate_for_report(ctx, target, exe, mode, base_argv, orig, timeout)
+    if not first or first.get("class") not in primitive.QUANTITY_CLASSES:
+        return None
+    if first.get("quantity") is None:
+        return None                                      # the class fits; the report has no number
+    ctx.progress(msg=f"{first['class']}: varying the input to see whether the "
+                     f"{first.get('quantity_name') or 'magnitude'} is attacker-controlled")
+    obs = [("orig", first)]
+    for label, data in _probe_variants(orig, pre, post)[1:]:
+        rep = _detonate_for_report(ctx, target, exe, mode, base_argv, data, timeout)
+        if rep:
+            obs.append((label, rep))
+    prim = primitive.quantity_primitive(obs)
+    if prim is not None:
+        ctx.emit("primitive.quantity", payload={
+            "class": prim["sanitizer_class"], "quantity_name": prim["quantity_name"],
+            "quantity_min": prim["quantity_min"], "quantity_max": prim["quantity_max"],
+            "quantity_limit": prim.get("quantity_limit"),
+            "effect_kind": prim["effect_kind"], "effect_status": prim["effect_status"],
+            "controlled": prim["confirmed"], "variants_detonated": len(obs),
+            "observations": prim["observations"][:10]})
     return prim
 
 
@@ -550,9 +594,15 @@ def primitive_stage(ctx) -> dict:
         #
         # The primitive for this class is in the REPORT, and the experiment is to vary the input
         # and watch the distance past the end of the object move.
+        _first = None
         if not emulated:
+            # ONE detonation for all three sanitizer verdicts and for the decline below. Each
+            # used to run its own copy to decide whether it applied, so the same input was
+            # detonated four times before any variant was tried -- four sandbox runs out of a
+            # budget that buys ten.
+            _first = _detonate_for_report(ctx, target, exe, mode, base_argv, orig, timeout)
             prim = _oob_primitive(ctx, target, exe, mode, base_argv, orig, _pre, _post,
-                                  timeout)
+                                  timeout, first=_first)
             if prim is not None:
                 control = frame(orig[len(_pre):len(orig) - len(_post)] if (_pre or _post)
                                 else orig)
@@ -565,7 +615,7 @@ def primitive_stage(ctx) -> dict:
             # does not apply to a dead object -- so both got "crash reproduced but no
             # instruction-pointer / memory primitive found" on every sanitizer build.
             prim = _lifetime_primitive(ctx, target, exe, mode, base_argv, orig, _pre, _post,
-                                       timeout)
+                                       timeout, first=_first)
             if prim is not None:
                 control = frame(orig[len(_pre):len(orig) - len(_post)] if (_pre or _post)
                                 else orig)
@@ -573,12 +623,31 @@ def primitive_stage(ctx) -> dict:
                 return _finalize(ctx, target, target_bytes, mode, base_argv, cap0, control,
                                  prim, bool(prim.get("confirmed")), extra)
 
-        # 3) crash reproduced but no controllable primitive found
+            # 2d) and the classes that describe a MAGNITUDE rather than an access.
+            prim = _quantity_primitive(ctx, target, exe, mode, base_argv, orig, _pre, _post,
+                                       timeout, first=_first)
+            if prim is not None:
+                control = frame(orig[len(_pre):len(orig) - len(_post)] if (_pre or _post)
+                                else orig)
+                extra = primitive.quantity_effect(prim)
+                return _finalize(ctx, target, target_bytes, mode, base_argv, cap0, control,
+                                 prim, bool(prim.get("confirmed")), extra)
+
+        # 3) nothing to claim. Where the defect's CLASS is one this stage cannot reason about --
+        # a data race, an uninitialised read -- say which and why, because the generic note reads
+        # as if the right question had been asked and answered. Measured: a ThreadSanitizer data
+        # race and an MSan uninitialised read both ended on "no instruction-pointer / memory
+        # primitive found", which sends the reader looking for a missing capability instead of at
+        # `mem_oracle` (the uninit verdict) or at a timing experiment this stage does not run.
+        _cls = (_first or {}).get("class")
+        _why = primitive.no_verdict_reason(_cls)
         ctx.emit("primitive.done", payload={
             "primitive": ("register-control" if regs else None), "supported": True,
-            "registers": regs, "signal": cap0.get("signal_name"),
-            "note": "crash reproduced but no instruction-pointer / memory primitive found"})
-        ctx.progress(pct=100, msg="crash without a controllable primitive")
+            "registers": regs, "signal": cap0.get("signal_name"), "sanitizer_class": _cls,
+            "note": (f"no primitive verdict for {_cls}: {_why}" if _why else
+                     "crash reproduced but no instruction-pointer / memory primitive found")})
+        ctx.progress(pct=100, msg=(f"{_cls}: no verdict ({_why[:60]})" if _why
+                                   else "crash without a controllable primitive"))
         return {}
     finally:
         shutil.rmtree(helper.parent, ignore_errors=True)
@@ -588,7 +657,12 @@ def _finalize(ctx, target, target_bytes, mode, base_argv, cap0, control, prim, c
               extra):
     """Bundle the demonstrating input, record an L2 (or L1) PoC, promote the crash finding on
     confirmation, and emit the result -- shared by every primitive kind."""
-    level = "L2" if confirmed else "L1"
+    # A verdict may CAP its own level. L2 means a confirmed exploitation primitive, and not every
+    # confirmed claim is one: an attacker-chosen allocation size or leak volume is an availability
+    # defect -- demonstrated, worth reporting, and not a primitive. Calling it one would inflate
+    # the single number in a report that exists to resist inflation. The verdict states the cap
+    # itself (`max_level`) rather than this function guessing from the type name.
+    level = "L2" if (confirmed and int(prim.get("max_level") or 2) >= 2) else "L1"
     control_sha = ctx.put_artifact("poc-l2-input", data=control)
     meta = {"target_sha256": target.sha256, "arch": target.arch, "input_mode": mode,
             "level": level, "primitive": prim, "tool_version": TOOL_VERSION}
@@ -640,6 +714,15 @@ def _finalize(ctx, target, target_bytes, mode, base_argv, cap0, control, prim, c
                 "alloc-dealloc-mismatch": ("memory-corruption",
                                            "Memory corruption (allocator mismatch)")}
         _kind_title = _EFF.get(prim.get("type"))
+        # A QUANTITY verdict carries its own effect kind and status -- availability for a refused
+        # allocation or a leak, memory corruption marked POTENTIAL for a negative length the
+        # sanitizer intercepted before the copy. Read off the verdict so there is one definition
+        # rather than a second table that has to agree with the first.
+        if prim.get("quantity"):
+            _title = _QUANTITY_TITLE.get(prim["sanitizer_class"], "Resource exhaustion")
+            _kind_title = (prim["effect_kind"],
+                           _title + ("" if prim["effect_status"] == "demonstrated"
+                                     else " (potential)"))
         # Key on the ORIGINAL crash's faulting address (as root_cause does), NOT this capture's,
         # so the primitive finding merges into the crash finding instead of forking a duplicate:
         # on a native target the fault PC is in the dedup key, and omitting it here split one
@@ -653,7 +736,8 @@ def _finalize(ctx, target, target_bytes, mode, base_argv, cap0, control, prim, c
             bundle_sha=bundle_sha, fault_pc=_fpc, hijack=_hj)
         if _kind_title:
             _kind, _title = _kind_title
-            cand["title"] = f"{_title} (demonstrated): L2 primitive"
+            cand["title"] = (f"{_title} (demonstrated): L2 primitive" if level == "L2"
+                             else f"{_title}: attacker-controlled magnitude")
             cand["authoritative"] = True
             # Keep root_cause's CWE only where it already names a MEMORY-CORRUPTION defect --
             # there it genuinely is more specific than a signal-derived class. Where it does not,
@@ -668,6 +752,14 @@ def _finalize(ctx, target, target_bytes, mode, base_argv, cap0, control, prim, c
             _prim_cwe = _PRIM_CWE.get(prim.get("type"))
             _prior = next((f for f in fd.list_by_target(target.id)
                            if f.dedup_key == cand["dedup_key"]), None)
+            # A QUANTITY verdict is not an override of root_cause's class -- it IS the
+            # sanitizer's class, and the crash finding it merges into was labelled from the
+            # SIGNAL. Measured: a refused 2 TB allocation went out as CWE-787 (out-of-bounds
+            # write) because SIGABRT resolves to that and `_PRIM_CWE` deliberately has no entry
+            # for this family. The same no-downgrade guard applies: a finding that already names
+            # memory corruption keeps it.
+            if prim.get("quantity") and prim.get("cwe"):
+                _prim_cwe = prim["cwe"]
             if _prim_cwe and (_prior.cwe if _prior else None) not in _MEM_CORRUPTION:
                 cand["cwe"] = _prim_cwe
                 cand["title_only"] = False
@@ -679,7 +771,11 @@ def _finalize(ctx, target, target_bytes, mode, base_argv, cap0, control, prim, c
             # proves it -- the confirmed primitive (RIP control / write-what-where / controlled
             # read), the exact input that achieves it, and how (offset, captured marker).
             _effects = [{
-                "kind": _kind, "title": _title, "status": "demonstrated", "detail": extra,
+                "kind": _kind, "title": _title,
+                # The verdict decides its own status: a consequence the sanitizer PREVENTED (a
+                # negative length intercepted before the copy, an index whose access is undefined
+                # rather than performed) is potential, not demonstrated.
+                "status": prim.get("effect_status") or "demonstrated", "detail": extra,
                 "proof": {"type": "bundle", "sha": bundle_sha, "input_sha": control_sha,
                           "note": extra}}]
             if prim.get("type") == "instruction-pointer-control":

@@ -704,3 +704,123 @@ def reclaim_effect(prim: dict) -> str:
             f"different size class, did not return them. What is NOT shown is what the program "
             f"then does with those bytes: a function pointer among them would be a hijack, and "
             f"that is the exploit stage's claim to make, not this one's")
+
+
+#: Classes whose report states a MAGNITUDE rather than an access: what the magnitude means, the
+#: effect kind it belongs to, and whether the sanitizer OBSERVED the consequence or prevented it.
+#:
+#: `status` is the honest half. A refused allocation really was requested and a leak really did
+#: leak, so those effects are DEMONSTRATED. A negative size handed to `memcpy` was intercepted
+#: before the copy, and an out-of-bounds index is undefined rather than executed, so for those the
+#: effect is POTENTIAL with its magnitude recorded -- the consequence is an inference about a build
+#: without the sanitizer, and an inference is not a demonstration.
+QUANTITY_CLASSES = {
+    "allocation-size-too-big": ("dos", "demonstrated",
+                                "the program asks its allocator for a region this big"),
+    "out-of-memory": ("dos", "demonstrated", "the program allocates this much"),
+    "memory-leak": ("dos", "demonstrated", "the program leaks this much and never frees it"),
+    "negative-size-param": ("memory-corruption", "potential",
+                            "a negative length reaches a memory routine, which without the "
+                            "sanitizer is an enormous unsigned one"),
+    "array-index-out-of-bounds": ("memory-corruption", "potential",
+                                  "the program indexes this far outside the array"),
+    "bad-shift": ("dos", "potential", "the program shifts by this much"),
+}
+
+
+def quantity_primitive(observations: list) -> dict | None:
+    """What a defect whose report states a QUANTITY is worth, and whether the quantity is ours.
+
+    Neither of the other two verdicts applies to these classes. There is no distance past the end
+    of an object (nothing went out of bounds) and no offset inside a dead one (nothing died), so
+    `oob_access_primitive` and `lifetime_primitive` both return None and the stage fell through to
+    "crash reproduced but no instruction-pointer / memory primitive found" -- which for a 35 TB
+    allocation request is not a near-miss but an answer to a question nobody asked.
+
+    What the report does state is a magnitude: the size requested, the bytes leaked, the index
+    used, the shift applied. The experiment is the one the other two verdicts already run -- vary
+    the input, see whether the number follows -- and a number that follows the input is a defect
+    the attacker parameterises rather than one this input happened to reach.
+
+    This verdict CANNOT reach L2 (`max_level` 1), whatever the experiment shows. L2 means a
+    confirmed exploitation primitive; an attacker-chosen allocation size is an availability
+    defect, and calling a controlled denial of service an exploitation primitive would inflate
+    the one number in a report that is supposed to resist inflation.
+    """
+    seen = [(lbl, r) for lbl, r in observations
+            if isinstance(r, dict) and r.get("class") in QUANTITY_CLASSES
+            and r.get("quantity") is not None]
+    if not seen:
+        return None
+    cls = seen[0][1]["class"]
+    seen = [(lbl, r) for lbl, r in seen if r["class"] == cls]
+    kind, status, meaning = QUANTITY_CLASSES[cls]
+    values = sorted({r["quantity"] for _l, r in seen})
+    first = seen[0][1]
+    controlled = len(values) > 1
+    return {
+        "type": ("controlled-" if controlled else "") + cls,
+        "sanitizer_class": cls,
+        "quantity": True,
+        "effect_kind": kind,
+        "effect_status": status,
+        "meaning": meaning,
+        "quantity_name": first.get("quantity_name") or "value",
+        "quantity_min": values[0],
+        "quantity_max": values[-1],
+        "quantity_limit": first.get("quantity_limit"),
+        "quantity_limit_name": first.get("quantity_limit_name") or "limit",
+        # The class the SANITIZER named, which is more specific than any signal-derived one: a
+        # SIGABRT from a refused allocation resolves to CWE-787 (out-of-bounds write) from the
+        # signal alone, and the report says CWE-789 (uncontrolled allocation size).
+        "cwe": first.get("cwe"),
+        "observations": [{"variant": lbl, "quantity": r.get("quantity")} for lbl, r in seen],
+        "confirmed": controlled,
+        # The ladder stops at L1 for this class of claim. See the docstring.
+        "max_level": 1,
+        "offset": None,
+    }
+
+
+def quantity_effect(prim: dict) -> str:
+    """The effect of a quantity-shaped defect, with the magnitude and nothing more."""
+    name = prim.get("quantity_name")
+    lo, hi = prim.get("quantity_min"), prim.get("quantity_max")
+    span = f"{name} {lo}" if lo == hi else f"{name} {lo}..{hi}"
+    lim = (f" against a {prim.get('quantity_limit_name')} of {prim.get('quantity_limit')}"
+           if prim.get("quantity_limit") is not None else "")
+    reach = ("the number tracks the input, so the attacker chooses it"
+             if prim.get("confirmed") else
+             "the number did not move with the input in this run, so it is not shown to be the "
+             "attacker's to pick")
+    tail = ("" if prim.get("effect_status") == "demonstrated" else
+            " The consequence itself is an inference about a build without the sanitizer, which "
+            "is why it is recorded as potential rather than demonstrated.")
+    return (f"{prim.get('sanitizer_class')}: {prim.get('meaning')} -- {span}{lim}. "
+            f"{reach}.{tail}")
+
+
+#: Classes this stage can say nothing useful about, and WHY -- so the run reports a reason instead
+#: of the generic "no instruction-pointer / memory primitive found", which reads as if the right
+#: question had been asked and answered.
+NO_VERDICT_REASON = {
+    "data race": "a data race's exploitability is a TIMING property; varying the input cannot "
+                 "show it, and this stage only varies the input",
+    "heap-use-after-free-tsan": "reported by ThreadSanitizer, where the lifetime error is a "
+                                "consequence of the race rather than of the input",
+    "thread leak": "a leaked thread is a resource defect with no input-dependent magnitude in "
+                   "the report",
+    "lock-order-inversion": "a lock-order inversion is a property of the code's lock graph, not "
+                            "of any one input",
+    "destroy of a locked mutex": "a concurrency-state defect; the report states no magnitude",
+    "signal-unsafe call": "an async-signal-safety defect; its reachability depends on signal "
+                          "delivery, not on the input bytes",
+    "use-of-uninitialized-value": "an uninitialised READ is only a disclosure if the value "
+                                  "reaches an output, which is `mem_oracle`'s verdict (CWE-457/"
+                                  "CWE-200) and not this stage's to duplicate",
+}
+
+
+def no_verdict_reason(sanitizer_class: str | None) -> str | None:
+    """Why this stage has nothing to say about `sanitizer_class`, or None if it should have."""
+    return NO_VERDICT_REASON.get(str(sanitizer_class or ""))
