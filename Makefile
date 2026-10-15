@@ -1,12 +1,15 @@
 # Lykos — offline dev + CI targets (P0.11). Runtime is stdlib-only.
 PY ?= python3
+#: Seconds per target for the real-corpus instruments. 600 is what ground truth was measured at.
+CORPUS_BUDGET ?= 600
 export PYTHONPATH := core
 
-.PHONY: doctor toolchain-bundle repo-tarball test coverage lint typecheck gui ci bundle verify eval eval-gate benchmark arch-gate real-gate dashboard release clean help
+.PHONY: doctor toolchain-bundle repo-tarball test coverage lint typecheck gui ci bundle verify eval eval-gate benchmark arch-gate real-gate corpus-gate corpus-regression dashboard release clean help
 
 help:
 	@echo "run the app with ./start (UI) and ./lykos (CLI); build the air-gap package with ./package"
 	@echo "make targets (dev/release): doctor toolchain-bundle repo-tarball test coverage lint typecheck gui ci bundle verify eval eval-gate benchmark arch-gate real-gate dashboard release clean"
+	@echo "real-corpus instruments (need ~/Downloads/libs, tens of minutes): corpus-gate corpus-regression"
 
 # What this host can and cannot do, and the install line for anything missing. On an
 # air-gapped workstation there is no package manager to ask, and "the stage declined" is a
@@ -181,6 +184,20 @@ arch-gate:
 # actually run. The other gates each cover a slice and leave the join uncovered.
 real-gate:
 	$(PY) -m lykos realgate
+
+# PLUMBING health on real binaries and real libraries: nothing errored, nothing declined for OUR
+# reason, a recorded crash produced a verified PoC, and how many of a library's doors were fuzzed.
+# A target with no findings PASSES -- that is the contract, and why the next target exists.
+corpus-gate:
+	$(PY) tools/real_corpus_gate.py --budget $(CORPUS_BUDGET)
+
+# Did we still FIND -- and still DEMONSTRATE -- the defects the last measured round found on the
+# real library corpus? Ground truth per library, with zlib and bzip2 as precision controls and a
+# REACH floor on every row so a clean table cannot come from a harness builder that stopped
+# working. Neither of these is in `release`: the corpus is upstream tarballs in ~/Downloads/libs,
+# not in the repo, and a full run is tens of minutes per library.
+corpus-regression:
+	$(PY) tools/corpus_regression.py --budget $(CORPUS_BUDGET)
 
 # Render the detection-quality regression dashboard from the recorded history.
 dashboard:

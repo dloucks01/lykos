@@ -110,6 +110,8 @@ make eval-gate         # detection-quality gate over the bundled corpus (0-FP tr
 make benchmark         # tracked precision/recall/F1 over the breadth corpus (non-gating)
 make arch-gate         # every architecture still reaches its PoC level
 make real-gate         # full chain on real programs (detect -> PoC -> attribution)
+make corpus-gate       # plumbing health on REAL binaries/libraries (needs a local corpus)
+make corpus-regression # did we still find AND demonstrate the defects we found before?
 make release           # ci + verify + all four gates
 make toolchain-bundle  # build the offline toolchain tarball (on a CONNECTED machine)
 make repo-tarball      # snapshot the repo for transfer (tracked files at HEAD, + sha256)
@@ -120,6 +122,13 @@ make clean             # remove build artifacts and caches
 
 `make lint` and `make typecheck` **fail** when their tool is missing rather than skipping, so
 `make ci` cannot go green without having actually run them.
+
+`make corpus-gate` and `make corpus-regression` are the only two targets that need material which
+is not in the repo: upstream library tarballs under `~/Downloads/libs`. They are not part of
+`make release` — a full run is tens of minutes per library — and they answer different questions.
+The gate asks whether the PLUMBING held on real material and passes a target with no findings; the
+regression benchmark asks whether the defects the last measured round DEMONSTRATED are still
+demonstrated, with clean libraries as precision controls. See `docs/internal/35-the-chain-*.md`.
 
 To (re)build the offline CVE database: `python tools/build_cvedb.py --sqlite --json --clibs`
 (on a connected machine). The small curated subset is committed; the full OSV match index and

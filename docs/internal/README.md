@@ -9,11 +9,15 @@ What's here:
 - **Roadmap & backlog** — `13-roadmap-milestones.md`, `20-open-work-backlog.md`
 - **Reviews & plans** — `21-crs-harvest-review.md`, `24-modernization-plan.md`,
   `30-missing-capabilities-implementation-plan.md` (sequenced plan for doc 20's open queue)
-- **Dated audits & handoffs** — `25-`…`29-`, `32-` (point-in-time code/capability audits and
-  session handoffs; they describe the state as of their date, not necessarily the current tree).
-  The newest, `32-next-steps-2026-10-09.md`, is the current forward queue and explains how to
-  measure breadth (`tools/breadth_probe.py`) versus conformance
-  (`tools/pipeline_conformance.py`) — they answer different questions.
+- **Dated audits & handoffs** — `25-`…`29-`, `32-`, `33-`, `34-` (point-in-time code/capability
+  audits and session handoffs; they describe the state as of their date, not necessarily the
+  current tree).
+- **`35-the-chain-2026-10-13.md` — start here.** The canonical process (vulnerability → PoC →
+  exploit → effect), the evidence each link must produce, the measured status of each, and the
+  four instruments that validate it: the unit suite, `tools/pipeline_conformance.py` (planted
+  bugs, end to end), `tools/real_corpus_gate.py` (plumbing health on real material) and
+  `tools/corpus_regression.py` (did we still find — and still demonstrate — what we found
+  before). `tools/breadth_probe.py` reports work on arbitrary binaries and has no pass mark.
 - **`archive/`** — early prototype and phase-0 planning tickets (historical)
 
 These are snapshots of thinking at a moment in time. When they disagree with the code, the code
