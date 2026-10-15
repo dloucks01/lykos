@@ -717,7 +717,8 @@ def reclaim_verdict_traced(observation: dict, *, marker: bytes = RECLAIM_MARKER)
     eff = observation.get("effect") or None
     kind = (eff or {}).get("kind")
     return {
-        "type": ("controlled-reclaim-hijack" if kind == "control-flow-hijack" else
+        "type": ("controlled-reclaim-exec" if observation.get("exec") else
+                 "controlled-reclaim-hijack" if kind == "control-flow-hijack" else
                  "controlled-reclaim-deref" if kind == "dereference" else
                  "controlled-reclaim-used" if use else "controlled-reclaim"),
         # WHAT the program did with the value it read. The three earlier facts are states of
@@ -731,6 +732,13 @@ def reclaim_verdict_traced(observation: dict, *, marker: bytes = RECLAIM_MARKER)
         # The register that carried the attacker's bytes into the control transfer, when the
         # hijack showed itself that way rather than as a pc.
         "effect_via": (eff or {}).get("via"),
+        # CODE EXECUTION: the hijack was aimed at a function the analysis chose, and the program
+        # arrived there. The end of the chain, and the only claim here that is about an effect
+        # rather than about a state of memory or a transfer.
+        "executed": bool(observation.get("exec")),
+        "exec_function": (observation.get("exec") or {}).get("function"),
+        "exec_addr": (observation.get("exec") or {}).get("addr"),
+        "exec_aslr": (observation.get("exec") or {}).get("aslr"),
         "lifetime": True,
         "reclaim": True,
         "confirmed": True,
@@ -765,6 +773,17 @@ def reclaim_effect(prim: dict) -> str:
                 + (f" at offset {at}" if at is not None else "")
                 + ". The chunk was sampled before the free as well -- the marker was not there "
                 "-- so the bytes arrived with the reclaiming allocation.")
+        if prim.get("executed"):
+            return (head + f" AND THE PROGRAM EXECUTED CODE OF THE ANALYSIS'S CHOOSING: with the "
+                    f"sentinel replaced by the address of `{prim.get('exec_function')}` "
+                    f"({prim.get('exec_addr')}) in bytes already shown to be attacker-chosen, "
+                    f"the program called through the dead object and ARRIVED at that function "
+                    f"-- observed at a breakpoint on it, not inferred from the absence of a "
+                    f"crash. That is code execution. Two limits travel with it: the function is "
+                    f"one the binary already contains (a redirect, not injected code), and the "
+                    f"address is absolute, which is knowable here only because this tracer "
+                    f"disables ASLR ({prim.get('exec_aslr')}) -- against a live PIE target the "
+                    f"same step needs a leak, which is a different capability")
         if prim.get("effect_kind") == "control-flow-hijack":
             how = (f"it executed an indirect call/jump through `{prim['effect_via']}`, which "
                    f"held the attacker's bytes, and faulted at {prim.get('effect_pc')}"

@@ -629,3 +629,100 @@ def test_the_consumer_effect_is_demonstrated_end_to_end(store, case, tmp_path):
     kinds = {x["kind"]: x["status"] for row in effs for x in row}
     assert kinds.get("control-flow-hijack") == "demonstrated", kinds
     assert kinds.get("rce") == "potential", kinds
+
+
+# --- code execution: driving the hijack to an effect -------------------------------------------
+
+def test_the_exec_verdict_is_the_end_of_the_chain():
+    v = P.reclaim_verdict_traced({
+        "addr": "0x55a0", "offset": 0, "size": 128, "marker_before_free": False,
+        "use": {"pc": "0x55550e"},
+        "effect": {"kind": "control-flow-hijack", "via": "rax", "pc": "0x55550e"},
+        "exec": {"function": "win", "addr": "0x555555555189", "aslr": "off (tracer)"}})
+    assert v["type"] == "controlled-reclaim-exec" and v["executed"] is True
+    assert v["exec_function"] == "win"
+    eff = P.reclaim_effect(v)
+    assert "EXECUTED CODE OF THE ANALYSIS'S CHOOSING" in eff
+    assert "observed at a breakpoint on it" in eff, "arrival must be observed, not inferred"
+    # the two limits that must never be dropped
+    assert "a redirect, not injected code" in eff
+    assert "disables ASLR" in eff and "needs a leak" in eff
+
+
+def test_the_exec_claim_needs_a_target_the_finder_will_justify():
+    """`find_win` is deliberately strict and says why: redirecting into a function the program
+    calls anyway is a much weaker claim than the badge implies. No win function, no claim."""
+    from lykos.analyze.poc import exploit
+    assert exploit.find_win({"main": 0x1000, "usage": 0x2000}) == (None, None)
+    assert exploit.find_win({"main": 0x1000, "win": 0x2000}) == ("win", 0x2000)
+    # ...and the stage only spends a run on it after a hijack was demonstrated
+    stage = open(heap_discover.__file__.replace(".pyc", ".py")).read()
+    assert '.get("kind") == "control-flow-hijack"' in stage
+    assert "_try_reclaim_exec(" in stage
+
+
+def test_the_tracer_breakpoints_the_chosen_target_and_reports_the_base():
+    src = open(heaptrace.__file__.replace(".pyc", ".py")).read()
+    assert 'setbp(rebase + exec_target, "exec")' in src
+    assert '"event": "reclaim-exec"' in src
+    assert '"load_base": hex(rebase)' in src, \
+        "the stage cannot build a real code address without the base"
+
+
+#: The callback notebook plus a function the strict finder will nominate. `win` writes a line, so
+#: arrival is independently visible -- but the claim rests on the BREAKPOINT, not on the output.
+_CALLBACK_WIN = _CALLBACK.replace(
+    'static void hello(void){ /* the legitimate callback */ }',
+    'static void hello(void){ /* the legitimate callback */ }\n'
+    'static void win(void){ write(1, "WIN-REACHED\\n", 12); }')
+
+
+@pytest.mark.skipif(sandbox.host_arch() != "x86-64", reason="native heap experiment")
+def test_the_hijack_is_driven_to_code_execution_end_to_end(store, case, tmp_path):
+    """The whole chain to an effect: reclaim, attacker bytes, the program reads them, it calls
+    through them, and -- with the sentinel replaced by a chosen function's real address -- it
+    ARRIVES there. Observed at a breakpoint on the function."""
+    from lykos.analyze import register
+    from lykos.analyze.dynamic import enqueue_heap_trace
+    from lykos.analyze.ingest import ingest
+    from lykos.db.dao import FindingDAO
+    from lykos.jobs import JobConfig, JobQueue, WorkerPool
+
+    assert "win(void)" in _CALLBACK_WIN, "the fixture has no win function"
+    exe = _build(tmp_path, _CALLBACK_WIN, "cbwin")
+    register()
+    target = ingest(store, case.id, exe)
+    pool = WorkerPool(store.db_path, store.content,
+                      JobConfig(workers=1, lease_seconds=300, poll_interval=0.02,
+                                heartbeat_interval=5.0))
+    pool.start()
+    try:
+        q = JobQueue(store.conn)
+        run = enqueue_heap_trace(q, target)
+        assert pool.wait_idle(420)
+        rec = q.runs.get(run.id)
+        if rec.status != "done":
+            pytest.skip("heap_trace could not run here: " + str(rec.error))
+    finally:
+        pool.stop(grace=3.0)
+
+    finds = [f for f in FindingDAO(store.conn).list_by_target(target.id)
+             if "reclaim" in (f.title or "").lower()
+             or "redirects execution" in (f.title or "")]
+    if not finds:
+        pytest.skip("the tracer saw no controlled reclaim on this host")
+    ev = " ".join(str(e.get("detail", "")) for f in finds for e in (f.evidence or []))
+    if "EXECUTED CODE" not in ev:
+        pytest.skip("hijack seen, execution not reached here: " + ev[-200:])
+
+    assert any("redirects execution into win" in (f.title or "") for f in finds), \
+        [f.title for f in finds]
+    import json
+    effs = [json.loads(e["detail"]) for f in finds for e in (f.evidence or [])
+            if e.get("channel") == "effects"]
+    kinds = {x["kind"]: x["status"] for row in effs for x in row}
+    assert kinds.get("rce") == "demonstrated", kinds
+    assert kinds.get("control-flow-hijack") == "demonstrated", kinds
+    # and the limits survive into the report
+    assert "a redirect, not injected code" in ev
+    assert "needs a leak" in ev

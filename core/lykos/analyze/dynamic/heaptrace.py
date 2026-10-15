@@ -180,6 +180,12 @@ if __name__ == "__main__":                                            # ---- the
         # are the ATTACKER's bytes in the chunk a stale pointer still addresses? Memory is read
         # straight out of the child, so no `view` option and no program output is needed.
         marker = bytes.fromhex(spec.get("marker") or "")
+        # A function the stage CHOSE, as a vaddr. Breakpointed so that "the program executed it"
+        # is an observation rather than an inference from a missing crash: the reclaim payload
+        # carries this address instead of the sentinel, and the breakpoint either fires or does
+        # not. The stage needs the load base to build that payload, so the report carries it.
+        exec_target = spec.get("exec_target")
+        exec_target = int(exec_target) if exec_target is not None else None
         # [start, end) offsets of the allocator FAMILY (alloc/free + helpers). A watchpoint that
         # fires from inside this code is the allocator's own bookkeeping / compaction, not a program
         # use-after-free -- ignore those, count only accesses from outside the allocator.
@@ -304,6 +310,8 @@ if __name__ == "__main__":                                            # ---- the
             poke(addr, (orig & ~0xFF) | 0xCC)
             bps[addr] = (kind, orig & 0xFF)
 
+        if exec_target is not None:
+            setbp(rebase + exec_target, "exec")
         if free_off is not None:
             setbp(rebase + free_off, "free")
         if alloc_base_off is not None:
@@ -573,6 +581,13 @@ if __name__ == "__main__":                                            # ---- the
                         if not any(w["chunk"] == ptr and w["kind"] == "uaf"
                                    for w in watches.values()):
                             arm(ptr, "uaf", ptr, 0b11)   # read+write on freed data = UAF
+                elif kind == "exec":
+                    # ARRIVAL at the chosen function. The attacker's own input carried this
+                    # address into the reclaimed object and the program called it, so this is
+                    # code execution observed at the target, not deduced from a signal.
+                    events.append({"event": "reclaim-exec", "addr": hex(bp),
+                                   "target": hex(exec_target or 0),
+                                   "returns_to": hex(peek(rg.rsp) or 0)})
                 elif kind == "alloc_enter":              # entry: capture the requested size (rdi)
                     pending_size = rg.rdi
                     if alloc_is_plt:                     # libc stub: no local ret -> catch the
@@ -637,6 +652,9 @@ if __name__ == "__main__":                                            # ---- the
                 pass
 
         json.dump({"events": events,
+                   # Where the image landed. ASLR is off in this tracer, so it is deterministic
+                   # -- and the stage needs it to put a real code address in a reclaim payload.
+                   "load_base": hex(rebase),
                    # Both halves of a use-after-free, reported separately because they are
                    # different observations: the program USED a dead chunk, and a dead chunk was
                    # handed back out to a later allocation.
@@ -658,6 +676,9 @@ if __name__ == "__main__":                                            # ---- the
                    # "fault" when neither -- a consequence observed, never inferred.
                    "reclaim_effect": [e for e in events
                                       if e.get("event") == "reclaim-effect"][:8],
+                   # The chosen function was ENTERED. The end of the chain.
+                   "reclaim_exec": [e for e in events
+                                    if e.get("event") == "reclaim-exec"][:8],
                    "double_free": any(e.get("error") == "double-free" for e in events),
                    "use_after_free": any(e.get("error") == "use-after-free" for e in events),
                    "heap_overflow": any(e.get("error") == "heap-overflow" for e in events),
