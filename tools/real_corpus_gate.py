@@ -91,6 +91,12 @@ class Row:
     #: Set when the budget was too small for this target's shape to be scored at all. Distinct
     #: from `ok`: the tool did not fail, the MEASUREMENT did, and the two must not print alike.
     invalid: str = ""
+    #: Entry points fuzzed IN-PROCESS, and how many the plan held. A library is not one function:
+    #: this is the reach the run actually had, where `execs` is only its volume.
+    doors: int = 0
+    doors_planned: int = 0
+    #: Facts worth printing that are not defects: a synthesized entry point the linker rejected.
+    notes: list = field(default_factory=list)
 
 
 def _stage_target(src: Path, work: Path) -> Path | None:
@@ -225,6 +231,27 @@ def run_one(src: Path, budget: float) -> Row:
         by_stage = ((card.get("budget") or {}).get("by_stage") or {})
         row.search = round(sum(float(v) for k, v in by_stage.items() if k in _ENGINES), 1)
         row.invalid = unscoreable(src, row.search, budget, row.crashes)
+
+        # REACH, not just volume. In-process fuzzing goes through one harness at a time, so a
+        # library fuzzed through one of its six doors and one fuzzed through all six report the
+        # same execution count. A door the plan held, built, and then could not run is a defect
+        # worth failing on; a door that did not BUILD is ours to fix and says so.
+        ip = card.get("in_process") or {}
+        row.doors = int(ip.get("entry_points") or 0)
+        row.doors_planned = int(ip.get("planned") or 0)
+        # A SYNTHESIZED door may simply not be one: `z_error` is declared in zlib's internal
+        # header and not exported, so the harness for it does not link -- the linker answering
+        # "that is not a door" is the check working, and it costs 0.2 s because the library's
+        # objects are already compiled. That is reported, not failed. The FIRST door is
+        # different: it is the harness the pipeline would have built when it built only one, so
+        # its failure is the whole engine failing on this target.
+        doors = list(ip.get("doors") or [])
+        for i, d in enumerate(doors):
+            if d.get("built") or "no budget" in (d.get("why") or ""):
+                continue
+            msg = f"entry point {d.get('entry')} did not build: {(d.get('why') or '')[:70]}"
+            (row.problems if i == 0 else row.notes).append(msg)
+        row.ok = not row.problems
         return row
     finally:
         row.elapsed = int(time.time() - t0)
@@ -284,9 +311,9 @@ def main() -> int:
     targets = [Path(x) for x in a.targets] or default_corpus()
     if not targets:
         print("no targets given and no default corpus on this machine"); return 2
-    print(f"{'TARGET':26s} {'RAN':8s} {'EXECS':>8s} {'RATE':>7s} {'SRCH':>6s} "
+    print(f"{'TARGET':26s} {'RAN':8s} {'EXECS':>8s} {'RATE':>7s} {'SRCH':>6s} {'DOOR':>5s} "
           f"{'WORK':>4s} {'DECL':>4s} {'ERR':>3s} {'CR':>3s} {'L':>2s} {'DEMO':>4s}  VERDICT")
-    print("-" * 126)
+    print("-" * 132)
     rows = []
     for src in targets:
         row = run_one(src, a.budget)
@@ -297,14 +324,19 @@ def main() -> int:
             verdict = "INVALID: budget too small to score"
         else:
             verdict = "PASS"
+        _doors = (f"{row.doors}/{row.doors_planned}" if row.doors_planned else "-")
         print(f"{row.name[:26]:26s} {row.ran:8s} {row.execs:8,d} {row.rate:7.1f} "
-              f"{row.search:6.0f} {row.worked:4d} {row.declined:4d} {len(row.errored):3d} "
-              f"{row.crashes:3d} {row.level:2d} {row.demonstrated:4d}  {verdict}")
-    print("-" * 126)
+              f"{row.search:6.0f} {_doors:>5s} {row.worked:4d} {row.declined:4d} "
+              f"{len(row.errored):3d} {row.crashes:3d} {row.level:2d} {row.demonstrated:4d}"
+              f"  {verdict}")
+    print("-" * 132)
     bad = [r for r in rows if not r.ok]
     starved = [r for r in rows if r.ok and r.invalid]
     print(f"PLUMBING: {len(rows) - len(bad)}/{len(rows)} targets clean "
           f"({sum(r.elapsed for r in rows)}s total)")
+    for r in rows:
+        for n in r.notes:
+            print(f"  note  {r.name}: {n}")
     for r in bad:
         print(f"  {r.name}:")
         for pr in r.problems:

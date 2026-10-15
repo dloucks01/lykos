@@ -251,6 +251,26 @@ def _print_scorecard(card: dict) -> None:
               + (f" ({_s / _tot * 100:.0f}% of the run)" if _tot else "")
               + ("   <- little of this run was spent searching" if _tot and _s < _tot * 0.25
                  else ""))
+    # THE DOORS. In-process fuzzing goes through one harness at a time, and a library has many
+    # entry points: "2,501 executions" is a different fact depending on whether they went through
+    # the parser or one string helper. Naming each door, and saying which were never opened, is
+    # what makes a null result on a library readable.
+    ip = card.get("in_process") or {}
+    if ip.get("doors"):
+        n, planned = ip.get("entry_points", 0), ip.get("planned", 0)
+        print(f"  entry points {n} fuzzed in-process"
+              + (f" of {planned} planned" if planned > n else ""))
+        for d in ip["doors"][:8]:
+            if d.get("built"):
+                mark = f"{d['execs']:,} execs" + (f", {d['findings']} finding(s)"
+                                                  if d.get("findings") else "")
+            elif "budget" in (d.get("why") or ""):
+                # It was planned and never reached, which is the budget's doing and not a
+                # failure of the harness -- the two must not read alike.
+                mark = "NOT RUN: " + d["why"]
+            else:
+                mark = "NOT BUILT: " + (d.get("why") or "no reason given")
+            print(f"    - {str(d.get('entry') or '?'):28} {mark}")
     # THE LADDER. This is what the tool exists to produce and the run never printed it.
     poc = card.get("poc") or {}
     ncr = card.get("crashes")

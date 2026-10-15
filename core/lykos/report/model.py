@@ -418,6 +418,15 @@ def _scorecard(store, case_id: str, target_id: str) -> dict:
         "stage_counts": best.get("stages") or {},
         "stages_skipped_for_budget": best.get("stages_skipped_for_budget") or [],
         "budget": best.get("budget") or {},
+        # WHITELISTED, which is why these were missing: the card carries them and the report
+        # dropped them on the floor. `in_process` is which doors into a library were fuzzed (a
+        # library fuzzed through one of six entry points and through all six report the same
+        # execution count); the other three are the ladder and the search behind it, which the
+        # CLI prints and the kept artifact did not.
+        "in_process": best.get("in_process") or {},
+        "search_seconds": best.get("search_seconds"),
+        "crashes_recorded": best.get("crashes"),
+        "poc": best.get("poc") or {},
     }
 
 

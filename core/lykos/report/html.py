@@ -163,6 +163,16 @@ def _target_html(t: dict) -> str:
         if by:
             rows.append(("By engine", esc(", ".join(f"{k} {v:,}" for k, v in
                                                     sorted(by.items(), key=lambda kv: -kv[1])))))
+    ip = ex.get("in_process") or {}
+    if ip.get("doors"):
+        # WHICH DOORS. In-process fuzzing goes through one harness at a time, so naming the entry
+        # points is the difference between "2,501 executions" meaning the parser and meaning one
+        # string helper.
+        rows.append(("Entry points", esc("; ".join(
+            f"{d.get('entry')} ({d['execs']:,} execs"
+            + (f", {d['findings']} finding(s)" if d.get("findings") else "") + ")"
+            if d.get("built") else f"{d.get('entry')} (not built)"
+            for d in ip["doors"][:8]))))
     bg = ex.get("budget") or {}
     if bg.get("total"):
         rows.append(("Time budget", f'{bg.get("elapsed", 0):g}s of {bg["total"]:g}s used'))
