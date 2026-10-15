@@ -69,10 +69,10 @@ from .capture import (
     MODES,
     env_var_from_argv,
     how_to_feed,
-    libfuzzer_harness,
     make_capture,
     make_qemu_capture,
     materialize_helper,
+    replay_exe_for,
 )
 
 # ISAs whose indirect branch MASKS bit 0 of the loaded PC (ARM/AArch64 for Thumb interworking,
@@ -338,6 +338,40 @@ def _quantity_primitive(ctx, target, exe, mode, base_argv, orig, pre, post, time
     return prim
 
 
+def _race_primitive(ctx, target, exe, mode, base_argv, orig, timeout, first=None):
+    """Step 2e: the concurrency verdict, measured by REPEATING the same input.
+
+    The other three verdicts vary the input and watch a number move. A race's outcome does not
+    depend on the bytes, so that experiment says nothing about it -- which is why this stage used
+    to decline the whole family by name. The property that IS measurable, and the one whoever acts
+    on the finding needs, is how often the same input shows the defect: a 1-in-8 race is real and
+    needs a looping reproducer, and a fault that reproduces on none of the repeats is a fact about
+    OUR evidence that has to be said out loud rather than shipped as a one-shot PoC.
+    """
+    first = first or _detonate_for_report(ctx, target, exe, mode, base_argv, orig, timeout)
+    if not first or first.get("sanitizer") != primitive.TSAN:
+        return None
+    if first.get("class") not in primitive.RACE_CLASSES:
+        return None
+    ctx.progress(msg=f"{first['class']}: repeating the SAME input {primitive.RACE_RUNS} times to "
+                     f"measure how often it reports")
+    obs = [("run1", first)]
+    for i in range(2, primitive.RACE_RUNS + 1):
+        if ctx.should_cancel():
+            break
+        obs.append((f"run{i}",
+                    _detonate_for_report(ctx, target, exe, mode, base_argv, orig, timeout)))
+    prim = primitive.race_primitive(obs)
+    if prim is not None:
+        ctx.emit("primitive.race", payload={
+            "class": prim["sanitizer_class"], "runs": prim["runs"], "hits": prim["hits"],
+            "rate": prim["rate"], "intermittent": prim["intermittent"],
+            "retries": prim["retries"], "accesses": prim["accesses"],
+            "race_sites": prim["race_sites"], "location": prim.get("location"),
+            "observations": prim["observations"][:10]})
+    return prim
+
+
 def primitive_stage(ctx) -> dict:
     import sys
     target = TargetDAO(ctx.conn).get(ctx.target_id) if ctx.target_id else None
@@ -388,7 +422,7 @@ def primitive_stage(ctx) -> dict:
     # calls the vulnerable path, the cyclic pattern did not fault, and the stage reported "no L2
     # primitive" for a defect it had simply never reached. One finding cannot be at L1 because
     # two stages disagree about what the target is.
-    _harness = libfuzzer_harness(ctx, target, input_sha)
+    _harness = replay_exe_for(ctx, target, input_sha)
     if _harness:
         exe = ctx.scratch() / "harness.bin"
         exe.write_bytes(_harness)
@@ -623,6 +657,16 @@ def primitive_stage(ctx) -> dict:
                 return _finalize(ctx, target, target_bytes, mode, base_argv, cap0, control,
                                  prim, bool(prim.get("confirmed")), extra)
 
+            # 2e) a concurrency defect, whose experiment is a REPEAT rather than a variation.
+            prim = _race_primitive(ctx, target, exe, mode, base_argv, orig, timeout,
+                                   first=_first)
+            if prim is not None:
+                control = frame(orig[len(_pre):len(orig) - len(_post)] if (_pre or _post)
+                                else orig)
+                extra = primitive.race_effect(prim)
+                return _finalize(ctx, target, target_bytes, mode, base_argv, cap0, control,
+                                 prim, bool(prim.get("confirmed")), extra)
+
             # 2d) and the classes that describe a MAGNITUDE rather than an access.
             prim = _quantity_primitive(ctx, target, exe, mode, base_argv, orig, _pre, _post,
                                        timeout, first=_first)
@@ -718,7 +762,12 @@ def _finalize(ctx, target, target_bytes, mode, base_argv, cap0, control, prim, c
         # allocation or a leak, memory corruption marked POTENTIAL for a negative length the
         # sanitizer intercepted before the copy. Read off the verdict so there is one definition
         # rather than a second table that has to agree with the first.
-        if prim.get("quantity"):
+        if prim.get("race"):
+            # A race's consequence depends on what the unsynchronised value is used for, which
+            # this stage does not determine -- so it headlines the DEFECT and files no effect
+            # claim. The reproduction rate is the contribution, and it is in the detail.
+            _kind_title = None
+        elif prim.get("quantity"):
             _title = _QUANTITY_TITLE.get(prim["sanitizer_class"], "Resource exhaustion")
             _kind_title = (prim["effect_kind"],
                            _title + ("" if prim["effect_status"] == "demonstrated"
@@ -732,7 +781,7 @@ def _finalize(ctx, target, target_bytes, mode, base_argv, cap0, control, prim, c
         _hj = crash_hijack(ctx.conn, target.id, _fpc)
         cand = crash_finding_candidate(
             cap0.get("signal_name"), control_sha, "ptrace", "primitive",
-            f"(L2 primitive: {extra})", state="poc-backed", confidence=0.98,
+            f"({level} primitive: {extra})", state="poc-backed", confidence=0.98,
             bundle_sha=bundle_sha, fault_pc=_fpc, hijack=_hj)
         if _kind_title:
             _kind, _title = _kind_title

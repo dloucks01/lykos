@@ -542,7 +542,11 @@ def lifetime_primitive(observations: list) -> dict | None:
     Returns None when the observations do not describe one lifetime defect class.
     """
     seen = [(lbl, r) for lbl, r in observations
-            if isinstance(r, dict) and r.get("class") in LIFETIME_CLASSES]
+            if isinstance(r, dict) and r.get("class") in LIFETIME_CLASSES
+            # TSan uses ASan's class name for its own lifetime report and provides none of the
+            # evidence this verdict reads (no offset inside the chunk, no chunk size). It is the
+            # race verdict's business; see `race_primitive`.
+            and r.get("sanitizer") != TSAN]
     if not seen:
         return None
     cls = seen[0][1]["class"]
@@ -804,23 +808,118 @@ def quantity_effect(prim: dict) -> str:
 #: of the generic "no instruction-pointer / memory primitive found", which reads as if the right
 #: question had been asked and answered.
 NO_VERDICT_REASON = {
-    "data race": "a data race's exploitability is a TIMING property; varying the input cannot "
-                 "show it, and this stage only varies the input",
-    "heap-use-after-free-tsan": "reported by ThreadSanitizer, where the lifetime error is a "
-                                "consequence of the race rather than of the input",
-    "thread leak": "a leaked thread is a resource defect with no input-dependent magnitude in "
-                   "the report",
-    "lock-order-inversion": "a lock-order inversion is a property of the code's lock graph, not "
-                            "of any one input",
-    "destroy of a locked mutex": "a concurrency-state defect; the report states no magnitude",
-    "signal-unsafe call": "an async-signal-safety defect; its reachability depends on signal "
-                          "delivery, not on the input bytes",
     "use-of-uninitialized-value": "an uninitialised READ is only a disclosure if the value "
                                   "reaches an output, which is `mem_oracle`'s verdict (CWE-457/"
                                   "CWE-200) and not this stage's to duplicate",
 }
+# The concurrency classes used to live in the table above, excused on the grounds that their
+# exploitability is a timing property and this stage only varies the input. The first half was
+# right and the conclusion was not: a concurrency defect has a measurable property that needs no
+# input variation at all, which is how OFTEN the same input shows it. See `race_primitive`.
 
 
 def no_verdict_reason(sanitizer_class: str | None) -> str | None:
     """Why this stage has nothing to say about `sanitizer_class`, or None if it should have."""
     return NO_VERDICT_REASON.get(str(sanitizer_class or ""))
+
+
+#: The ThreadSanitizer classes. What they have in common is not the defect but the EVIDENCE: a
+#: detector that reports what it happened to observe, so the same input reports a race on some
+#: runs and not others.
+RACE_CLASSES = frozenset({
+    "data-race", "thread-leak", "lock-order-inversion", "destroy-of-a-locked-mutex",
+    "signal-unsafe-call",
+    # TSan reports a lifetime error too, under the SAME class name ASan uses. Which verdict
+    # applies is decided by who reported it (`sanitizer`), not by the name: only ASan's version
+    # carries an offset inside a freed chunk to reason about, and TSan's is a consequence of the
+    # race rather than of the input.
+    "heap-use-after-free",
+})
+TSAN = "ThreadSanitizer"
+
+#: How many times the same input is detonated to measure the reproduction rate. Each one is a
+#: full sandbox run, so this buys the one number the verdict is about and no more: with 8 runs a
+#: 1-in-8 race is still seen, and the rate it reports (1/8) is the honest precision of 8 samples.
+RACE_RUNS = 8
+
+
+def race_primitive(observations: list) -> dict | None:
+    """What a concurrency defect is worth, measured the only way it can be: by REPEATING.
+
+    Every other verdict in this file varies the INPUT and watches a number move. That experiment
+    says nothing about a race, whose outcome does not depend on the bytes at all -- which is why
+    this stage used to decline the whole family by name. The question a race actually raises for
+    whoever has to act on it is different, and it is measurable: **does the same input fault every
+    time, or only sometimes, and how often?**
+
+    That number decides what the finding is worth. A defect that reports on 1 run in 8 is real and
+    needs retries; one that reports on 8 of 8 is reliable here. And a fault that reproduces on NONE
+    of the repeats is the most important of the three to say out loud, because the alternative is a
+    single-shot reproducer that the operator runs once, sees nothing, and concludes the tool lied
+    -- the "verified L1 whose bundle did not reproduce" failure this project opens its own chain
+    document with.
+
+    `observations` is `(label, report)` for N detonations of the SAME input (not of variants).
+    Returns None when no run produced a concurrency report AND none was expected.
+    """
+    runs = [(lbl, r if isinstance(r, dict) else {}) for lbl, r in observations]
+    if not runs:
+        return None
+    hits = [(lbl, r) for lbl, r in runs
+            if r.get("sanitizer") == TSAN and r.get("class") in RACE_CLASSES]
+    if not hits:
+        return None
+    cls = hits[0][1]["class"]
+    hits = [(lbl, r) for lbl, r in hits if r["class"] == cls]
+    n, k = len(runs), len(hits)
+    first = hits[0][1]
+    intermittent = 0 < k < n
+    # How many attempts a reproducer should make to be confident of seeing it. Three expected
+    # hits, bounded so a 1-in-8 observation does not ask the operator for hundreds of runs.
+    retries = min(60, max(3, int(round(3 * n / k)))) if k else 60
+    return {
+        "type": ("intermittent-" if intermittent else "") + cls,
+        "sanitizer_class": cls,
+        "race": True,
+        "runs": n,
+        "hits": k,
+        "rate": round(k / n, 3),
+        "intermittent": intermittent,
+        "retries": retries,
+        # A race has no single site: these are the accesses that collide, where each one is, and
+        # what the object IS. Naming one frame describes half the defect, and the half it names is
+        # whichever thread the detector happened to see second.
+        "accesses": first.get("accesses") or [],
+        "race_sites": [x for x in (first.get("race_sites") or []) if x],
+        "location": first.get("location"),
+        "cwe": first.get("cwe"),
+        "observations": [{"variant": lbl,
+                          "reported": r.get("sanitizer") == TSAN
+                          and r.get("class") in RACE_CLASSES} for lbl, r in runs],
+        # Confirmed means the fault was REPRODUCED, which for this class is the claim that was
+        # missing. It does not mean a primitive: see max_level.
+        "confirmed": k > 0,
+        # A concurrency verdict is never an L2. Nothing here controls memory or execution; what is
+        # measured is whether and how often the defect shows itself.
+        "max_level": 1,
+        "offset": None,
+    }
+
+
+def race_effect(prim: dict) -> str:
+    """What a measured concurrency defect is worth, stated without inflation."""
+    k, n = prim.get("hits"), prim.get("runs")
+    where = (" at " + " / ".join(prim["race_sites"][:2])) if prim.get("race_sites") else ""
+    what = (f"{' and '.join(prim.get('accesses') or ['two accesses'])} to "
+            f"{prim.get('location') or 'the same location'}")
+    if prim.get("intermittent"):
+        how = (f"reproduced on {k} of {n} runs of the SAME input, so it is a retry away rather "
+               f"than a coin that has to land: a reproducer has to loop, and the one in this "
+               f"bundle makes {prim.get('retries')} attempts")
+    else:
+        how = (f"reproduced on all {n} runs of the same input, so it is reliable in this harness "
+               f"-- which is a fact about this harness, not a guarantee about another machine, "
+               f"and the bundle loops anyway")
+    return (f"{prim.get('sanitizer_class')}: {what}{where} -- {how}. What the race CAUSES is not "
+            f"shown here: that depends on what the unsynchronised value is used for, and this "
+            f"stage does not determine it")

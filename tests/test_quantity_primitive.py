@@ -170,13 +170,17 @@ def test_a_class_that_fits_but_states_no_number_gets_no_verdict():
 
 # --- the classes where this stage should say WHY it has nothing -------------------------------
 
-def test_a_data_race_gets_a_reason_not_the_generic_note():
+def test_a_class_with_no_verdict_gets_a_reason_not_the_generic_note():
     """"no instruction-pointer / memory primitive found" reads as if the right question had been
-    asked and answered. For a data race the right question is a timing one this stage never
-    asks, and for an uninitialised read the answer belongs to mem_oracle."""
-    why = P.no_verdict_reason("data race")
-    assert why and "TIMING" in why
+    asked and answered. For an uninitialised read the right answer belongs to mem_oracle, and
+    saying so points the reader at it instead of at a missing capability.
+
+    A data race used to be excused here too, on the grounds that its exploitability is a timing
+    property and this stage only varies the input. The premise was right and the conclusion was
+    not -- see `race_primitive` -- so the excuse is gone and the verdict is real."""
     assert "mem_oracle" in P.no_verdict_reason("use-of-uninitialized-value")
+    assert P.no_verdict_reason("data-race") is None, \
+        "a data race is excused again; it has a verdict now"
     assert P.no_verdict_reason("heap-buffer-overflow") is None, \
         "a class this stage DOES have a verdict for must not be excused"
     assert P.no_verdict_reason(None) is None

@@ -532,6 +532,34 @@ def tsan_detonate(ctx, target, inputs, mode, exec_timeout, base_argv=()) -> int:
             found += 1
         except Exception:
             continue
+        # RECORD IT AS A RUN, or the ladder cannot see it. The prove loop iterates the
+        # dyn_result table; this stage filed only a Finding, so a real data race reached the
+        # report as `corroborated` and NOTHING downstream ever touched it -- no PoC, no
+        # reproduction rate, no looping reproducer, and the conformance gate's data-race case
+        # failed with the class found and nothing demonstrated **[measured]**. The libFuzzer
+        # stage had exactly this defect and the comment there says the same thing. The isolation
+        # tag names the TSAN build so `build_poc` replays against IT and not against the
+        # ASan/plain binary, which cannot report a race at all.
+        #
+        # Separately from the finding, and after the count, for two reasons learned by breaking
+        # it: this helper is called with a test double that has no `run_id`, and the enclosing
+        # `except: continue` swallowed the AttributeError and discarded a race it had already
+        # filed. A defect in the bookkeeping must not be able to retract a finding.
+        try:
+            DynResultDAO(ctx.conn).insert(
+                target.id, target.case_id, run_id=getattr(ctx, "run_id", None), input_sha=sha,
+                input_mode=mode, argv=list(tail), crashed=True,
+                signal_name=rep.get("class") or "data-race",
+                isolation="tsan", defect_key=f"tsan:{key}",
+                note=(rep.get("detail") or "ThreadSanitizer: data race")
+                     + (f" at {src}" if src else ""))
+        except Exception:
+            try:
+                ctx.emit("tsan.norun", payload={
+                    "note": "the race was filed as a finding but NOT recorded as a run, so the "
+                            "PoC ladder cannot reach it", "key": str(key)[:80]})
+            except Exception:
+                pass
     if found:
         ctx.emit("tsan.done", payload={"data_races": found})
     return found

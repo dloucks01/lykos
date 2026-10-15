@@ -36,7 +36,8 @@ def _argv_text(argv, *, carrier=None) -> str:
 
 
 def _runner(mode: str, argv, signal_name: str, run_cmd=None, runtime: str = "native",
-            main_class: str | None = None, sanitizer: str = "") -> bytes:
+            main_class: str | None = None, sanitizer: str = "", retries: int = 0,
+            marker: str = "") -> bytes:
     argv = list(argv or [])
     placed = INPUT_PLACEHOLDER in [str(a) for a in argv]
     # A jar is not executable and the JVM is not the target: `./target.bin` is a zip file, and
@@ -119,6 +120,38 @@ def _runner(mode: str, argv, signal_name: str, run_cmd=None, runtime: str = "nat
     else:
         hint = (f'echo "exit status: $rc (a crash by {signal_name} shows as 128+signum, '
                 'e.g. 139=SIGSEGV)"')
+    if retries > 1 and marker:
+        # A CONCURRENCY defect does not reproduce on demand: the detector reports what the
+        # scheduler happened to show it. A one-shot script therefore demonstrates nothing on the
+        # runs where the interleaving does not happen, and the operator -- who runs it once --
+        # concludes the finding is false. So loop, stop at the first run that REPORTS (the
+        # marker is the detector's own line, not an exit code: a sanitizer's exit status is the
+        # detector's, and other things exit non-zero too), and say what the rate was.
+        return ("#!/bin/sh\n"
+                f"# PoC reproducer for a CONCURRENCY defect. Expected result: {signal_name}.\n"
+                f"# It is NON-DETERMINISTIC: this script makes up to {retries} attempts and stops\n"
+                "# at the first one that reports. RUN IN A SANDBOX/VM -- this executes an\n"
+                "# untrusted binary. Authorized use only.\n"
+                'cd "$(dirname "$0")"\n'
+                f"{setup}"
+                f"attempts={retries}\n"
+                "i=1\n"
+                "rc=1\n"
+                "while [ $i -le $attempts ]; do\n"
+                f"  {invoke} > ./run.out 2> ./run.err\n"
+                "  rc=$?\n"
+                f"  if grep -q {shlex.quote(marker)} ./run.err 2>/dev/null; then\n"
+                '    echo "reproduced on attempt $i of $attempts"\n'
+                "    cat ./run.err\n"
+                "    exit $rc\n"
+                "  fi\n"
+                "  i=$((i+1))\n"
+                "done\n"
+                'cat ./run.err\n'
+                f'echo "did NOT reproduce in $attempts attempts -- a concurrency defect depends '
+                f'on the scheduler, so try more attempts, a loaded machine, or a different core '
+                f'count before concluding anything"\n'
+                "exit 1\n").encode()
     return ("#!/bin/sh\n"
             f"# PoC reproducer. Expected result: {signal_name}. RUN IN A SANDBOX/VM --\n"
             "# this executes an untrusted binary. Authorized use only.\n"
@@ -138,6 +171,14 @@ def _runner(mode: str, argv, signal_name: str, run_cmd=None, runtime: str = "nat
             'exit $rc\n').encode()
 
 
+def _race_marker(prim: dict) -> str:
+    """The detector's own report line for this class, which is what the looping reproducer greps
+    for. Not an exit code: a sanitizer's status belongs to the detector, and plenty of other
+    things exit non-zero."""
+    cls = str((prim or {}).get("sanitizer_class") or "").replace("-", " ")
+    return f"ThreadSanitizer: {cls}"
+
+
 def _primitive_txt(prim: dict) -> bytes:
     # An L2 IP-control primitive carries a sentinel address and the observed faulting PC; an L3
     # WORKING-EXPLOIT primitive (ret2win, ret2csu, execve, srop, a partial overwrite) carries
@@ -147,6 +188,36 @@ def _primitive_txt(prim: dict) -> bytes:
     # is a jump. Printing "Control offset: None / Sentinel: 0x0" under an L2 heading would be the
     # same defect the comment above describes, one class further on, so it gets its own template
     # stating the magnitude the sanitizer measured and the experiment that bounded it.
+    if prim.get("race"):
+        lines = [
+            "L1 reproducer for a NON-DETERMINISTIC defect",
+            "=" * 43,
+            f"Primitive: {prim.get('type')}",
+            f"Sanitizer class: {prim.get('sanitizer_class')}",
+            f"Reproduction rate: {prim.get('hits')} of {prim.get('runs')} runs of the SAME "
+            f"input ({prim.get('rate')})",
+            f"Reproducer attempts: {prim.get('retries')} (runner.sh loops; it stops at the "
+            f"first run that reports)",
+            "",
+            f"Accesses: {', '.join(prim.get('accesses') or []) or '(not stated)'}",
+            f"Object: {prim.get('location') or '(not stated)'}",
+            "Sites (a race has more than one -- naming one describes half the defect):",
+        ]
+        for site in (prim.get("race_sites") or []) or ["(not symbolized)"]:
+            lines.append(f"  {site}")
+        lines += [
+            "",
+            "What this does NOT claim: what the race CAUSES. That depends on what the",
+            "unsynchronised value is used for, and this stage does not determine it. Nothing",
+            "here is an exploitation primitive, which is why this is an L1 and not an L2.",
+            "",
+            "Per-run outcome (the evidence for the rate above):",
+        ]
+        for o in (prim.get("observations") or [])[:12]:
+            lines.append(f"  {str(o.get('variant'))[:10]:10s} -> "
+                         f"{'reported' if o.get('reported') else 'silent'}")
+        lines.append("")
+        return ("\n".join(lines)).encode()
     if prim.get("quantity"):
         # A QUANTITY defect: no access, no dead object, and deliberately no L2 heading. What the
         # experiment bounded is a number, and the template says which number and what it means.
@@ -438,7 +509,12 @@ def build(target_bytes: bytes, input_bytes: bytes, meta: dict, stderr: bytes,
         extra_files.setdefault("replay_prompt.py", _PROMPT_REPLAY)
     script = extra_files and "exploit.py" in extra_files
     prim_line = ""
-    if sanitizer and (primitive or {}).get("quantity"):
+    if sanitizer and (primitive or {}).get("race"):
+        prim_line = (f"\nPrimitive: {primitive.get('type')} -- reported on "
+                     f"{primitive.get('hits')}/{primitive.get('runs')} runs of the same input; "
+                     f"runner.sh makes {primitive.get('retries')} attempts because a concurrency "
+                     f"defect does not reproduce on demand. See PRIMITIVE.txt.\n")
+    elif sanitizer and (primitive or {}).get("quantity"):
         prim_line = (f"\nPrimitive: {primitive.get('type')} -- "
                      f"{primitive.get('quantity_name')} "
                      f"{primitive.get('quantity_min')}..{primitive.get('quantity_max')} "
@@ -513,9 +589,15 @@ def build(target_bytes: bytes, input_bytes: bytes, meta: dict, stderr: bytes,
         _add(tar, "poc/input.bin", input_bytes)
         for name, data in (extra_files or {}).items():
             _add(tar, f"poc/{name}", data, mode=0o755 if name.endswith(".py") else 0o644)
+        # A concurrency verdict asks for a LOOPING reproducer, and says how many attempts its
+        # own measured rate justifies. The marker is the detector's own report line, because a
+        # sanitizer's exit code belongs to the detector and other things exit non-zero too.
+        _race = (primitive or {}).get("race")
         _add(tar, "poc/runner.sh",
              _runner(mode, argv, signal_name, run_cmd, runtime, main_class,
-                     sanitizer=sanitizer), mode=0o755)
+                     sanitizer=sanitizer,
+                     retries=int((primitive or {}).get("retries") or 0) if _race else 0,
+                     marker=_race_marker(primitive) if _race else ""), mode=0o755)
         _add(tar, "poc/meta.json", json.dumps(meta, indent=2, sort_keys=True).encode())
         _add(tar, "poc/stderr.txt", stderr or b"")
         if primitive:

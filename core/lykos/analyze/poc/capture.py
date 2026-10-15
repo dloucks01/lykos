@@ -69,6 +69,16 @@ def make_capture(ctx, helper: Path, exe, mode, base_argv, timeout, python):
         # keeps LeakSanitizer's at-exit report from standing in for the defect we are detonating.
         env = dict(env or {})
         env.setdefault("ASAN_OPTIONS", "abort_on_error=1:detect_leaks=0")
+        # ThreadSanitizer is worse than ASan here: by DEFAULT it reports and carries on, so the
+        # process exits 66 at the end with no signal and no fault for the ptrace helper to see.
+        # `compile_source_tsan` links a `__tsan_default_options` hook that sets these, so OUR
+        # builds abort -- but a TSan binary from anywhere else does not, and measured on a plain
+        # `clang -fsanitize=thread` build of a two-thread race the stage declined before any
+        # verdict: the race reported on every run of the same input and nothing had faulted.
+        # `halt_on_error=1` stops at the first report, `abort_on_error=1` makes it a SIGABRT.
+        env.setdefault("TSAN_OPTIONS", "halt_on_error=1:abort_on_error=1")
+        # Same for UBSan, whose default is also to print and continue.
+        env.setdefault("UBSAN_OPTIONS", "halt_on_error=1:abort_on_error=1")
         spec["env"] = env
         if breakpoints:
             spec["breakpoints"] = [int(a) for a in breakpoints]
@@ -122,8 +132,9 @@ MODES = ("stdin", "file", "arg")
 _ENV_PLACEHOLDER = "=@@"
 
 
-def libfuzzer_harness(ctx, target, input_sha):
-    """The stored libFuzzer harness the crash at `input_sha` was found in, or None.
+def replay_exe_for(ctx, target, input_sha):
+    """The binary that actually consumes `input_sha` -- a libFuzzer harness or a sanitizer-variant
+    build -- or None when it is the ingested target itself.
 
     A libFuzzer crash is a crash of the HARNESS, which is a different binary from the one that
     was ingested. Replaying the input against the ingested binary is not a weaker test, it is the
@@ -142,6 +153,17 @@ def libfuzzer_harness(ctx, target, input_sha):
         if r.input_sha == input_sha and r.isolation:
             iso = r.isolation
             break
+    # A SANITIZER-VARIANT build is the same situation one step along: a data race is reported by
+    # the ThreadSanitizer binary and by nothing else, so replaying the input against the ingested
+    # (plain or ASan) binary is not a weaker test but the wrong one -- it cannot report a race at
+    # all, and a real CWE-362 would be filed unverified. Measured by the conformance gate's
+    # data-race case, which found the class and demonstrated nothing.
+    if iso in ("tsan", "msan"):
+        want = {"tsan": "tsan-blob", "msan": "msan-blob"}[iso]
+        art = next((a for a in ArtifactDAO(ctx.conn).list_by_case(target.case_id)
+                    if a.kind == want
+                    and (a.meta or {}).get("binary_sha") in (None, target.sha256)), None)
+        return ctx.content.get_bytes(art.sha256) if art else None
     if not iso.startswith("libfuzzer"):
         return None
     prefix = iso.split("/", 1)[1] if "/" in iso else ""

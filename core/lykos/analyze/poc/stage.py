@@ -10,7 +10,7 @@ from ..dynamic import sandbox
 from ..dynamic.stage import crash_dedup_key, crash_finding_candidate, crash_hijack
 from ..fuzz.runner import place
 from . import bundle
-from .capture import MODES, env_var_from_argv, how_to_feed, libfuzzer_harness
+from .capture import MODES, env_var_from_argv, how_to_feed, replay_exe_for
 
 BUILD_POC_STAGE = "build_poc"
 TOOL = "poc"
@@ -86,7 +86,7 @@ def build_poc_stage(ctx) -> dict:
     # a tool that never calls it, so a genuine memory-corruption finding would be filed as an
     # unverified L0 -- the same mistake prompted delivery made, in a new place. The run that found
     # it recorded the harness in its isolation tag, so this reads the record.
-    _harness = libfuzzer_harness(ctx, target, input_sha)
+    _harness = replay_exe_for(ctx, target, input_sha)
     if _harness:
         exe = ctx.scratch() / "harness.bin"
         exe.write_bytes(_harness)

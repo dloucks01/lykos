@@ -417,7 +417,12 @@ def _ubsan_site(t: str) -> Optional[str]:
 #: allocator frame inside each has no file:line, so the first frame that does is the project's.
 _ASAN_FREED_BY = re.compile(r"^freed by thread .*? here:$", re.M)
 _ASAN_ALLOCED_BY = re.compile(r"^(?:previously )?allocated by thread .*? here:$", re.M)
-_ASAN_FRAME = re.compile(r"#\d+ 0x[0-9a-f]+ in \S+ ([^\s:]+\.(?:c|cc|cpp|cxx|h|hpp)):(\d+)")
+#: A sanitizer stack frame that names a source file. The address and the `in` are OPTIONAL
+#: because ThreadSanitizer omits both -- it writes `#0 bump /src/race.c:6:66 (race+0xea472)` where
+#: ASan writes `#1 0x5a in main /src/x.c:12`. Requiring the ASan shape meant a data race had no
+#: site at all: not the two racing lines, and not even one **[measured]**.
+_ASAN_FRAME = re.compile(
+    r"#\d+ (?:0x[0-9a-f]+ in )?\S+ ([^\s:]+\.(?:c|cc|cpp|cxx|h|hpp)):(\d+)")
 
 
 def _section_site(t: str, header: re.Pattern) -> Optional[str]:
@@ -472,26 +477,32 @@ def parse_asan_report(text: str) -> Optional[dict]:
         bug = sentence
         cwe, sev = _ASAN_CWE[bug]
         detail = f"AddressSanitizer: {_SENTENCE_DETAIL.get(bug, bug.replace('-', ' '))}"
+        who = "AddressSanitizer"
     elif msan:
         bug = "use-of-uninitialized-value"
         cwe, sev = ("CWE-457", "medium")
         detail = "MemorySanitizer: use of uninitialized value"
+        who = "MemorySanitizer"
     elif tsan:
         bug = tsan.group(1).replace(" ", "-")
         cwe, sev = (("CWE-416", "high") if bug == "heap-use-after-free" else ("CWE-362", "high"))
         detail = f"ThreadSanitizer: {tsan.group(1)}"
+        who = "ThreadSanitizer"
     elif lsan:
         bug = "memory-leak"
         cwe, sev = ("CWE-401", "low")
         detail = "LeakSanitizer: detected memory leak"
+        who = "LeakSanitizer"
     elif m:
         bug = m.group(1)
         cwe, sev = _ASAN_CWE.get(bug, ("CWE-119", "high"))
         detail = f"AddressSanitizer: {bug.replace('-', ' ')}"
+        who = "AddressSanitizer"
     else:
         msg = ub.group(1).strip()
         bug, cwe, sev = _classify_ubsan(msg)
         detail = f"UndefinedBehaviorSanitizer: {msg[:120]}"
+        who = "UndefinedBehaviorSanitizer"
     # WHERE THE DEFECT IS. UBSan states it in its own report line, and that beats any stack walk:
     # a build that aborts on error hands libFuzzer a deadly signal, and the stack libFuzzer then
     # prints begins in the REPORTING machinery rather than in the library. Measured on expat
@@ -510,10 +521,17 @@ def parse_asan_report(text: str) -> Optional[dict]:
     # verdict (`-fsanitize-recover`, or a tool that captured only the summary) prints no stack.
     if src is None:
         src = _ubsan_site(t)
-    out = {"class": bug, "cwe": cwe, "severity": sev,
+    # WHICH sanitizer said so. Nothing set this, and `libfuzzer_stage` reads it with
+    # `cls.get("sanitizer", "AddressSanitizer")` -- so every UBSan and ThreadSanitizer finding
+    # ever filed claimed AddressSanitizer in its evidence **[measured]**. It is also the only
+    # honest way to tell TSan's `heap-use-after-free` from ASan's: same class name, different
+    # evidence, and only one of them has an offset inside a freed chunk to reason about.
+    out = {"class": bug, "cwe": cwe, "severity": sev, "sanitizer": who,
            "detail": detail + (f" at {src}" if src else ""), "source": src}
     out.update(_access_detail(t))
     out.update(_quantity_detail(t, bug))
+    if tsan:
+        out.update(_tsan_detail(t))
     refined = _ASAN_BY_ACCESS.get((bug, out.get("access") or ""))
     if refined:
         out["cwe"], out["severity"] = refined
@@ -599,6 +617,42 @@ def _quantity_detail(t: str, bug: str) -> dict:
                 out["quantity_limit_name"] = limit_name
         return out
     return {}
+
+
+#: What a ThreadSanitizer report states that nothing was reading: the two (or more) accesses that
+#: race, where each one is, and what the memory IS. A race has no single site -- naming only the
+#: first frame describes half of it, and the half it names is whichever thread the detector
+#: happened to see second.
+_TSAN_ACCESS = re.compile(
+    r"^\s*(?:Previous\s+)?(read|write|atomic read|atomic write)(?:\s+of size (\d+))?"
+    r".*?by (?:thread|main thread)", re.M | re.I)
+_TSAN_LOCATION = re.compile(r"^\s*Location is ([^\n]+?)\s*$", re.M)
+
+
+def _tsan_detail(t: str) -> dict:
+    """The accesses, their sites and the racing object, from a ThreadSanitizer report."""
+    out: dict = {}
+    accesses, sites = [], []
+    for m in _TSAN_ACCESS.finditer(t or ""):
+        accesses.append(m.group(1).lower())
+        # The first project frame BELOW this header is where that access happened. The sections
+        # are separated by a blank line, exactly like ASan's free/alloc stacks.
+        tail = (t or "")[m.end():]
+        end = tail.find("\n\n")
+        site = None
+        for fm in _ASAN_FRAME.finditer(tail if end < 0 else tail[:end]):
+            if _is_runtime_frame(fm.group(1)):
+                continue
+            site = f"{fm.group(1).split('/')[-1]}:{fm.group(2)}"
+            break
+        sites.append(site)
+    if accesses:
+        out["accesses"] = accesses[:4]
+        out["race_sites"] = sites[:4]
+    lm = _TSAN_LOCATION.search(t or "")
+    if lm:
+        out["location"] = lm.group(1)[:160]
+    return out
 
 
 def _access_detail(t: str) -> dict:
