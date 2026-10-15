@@ -335,6 +335,16 @@ if __name__ == "__main__":                                            # ---- the
                                # True would mean the marker was already there before the free,
                                # which disqualifies the observation; it is reported either way.
                                "marker_before_free": info["pre"]})
+                # Now watch for the READ. Armed HERE, after the marker is confirmed, which is
+                # what makes the observation unambiguous: the reclaiming owner's fill has already
+                # happened, so any later read of this chunk from the program's own code is a read
+                # of the ATTACKER's bytes by something that is not the filler. Before the reclaim
+                # the same address carries a `uaf` watch, whose meaning is different -- that one
+                # says "memory that is FREE was touched", and this one says "memory that now
+                # belongs to someone else was read through a pointer the program should have
+                # stopped using".
+                stale_at[chunk] = at
+                arm(chunk + at, "stale", chunk, 0b11)
 
         live = {}                                        # live ptr -> {"size", "end", "slot"}
         #: chunk -> was the marker ALREADY in it when it was freed? The before half of the
@@ -346,6 +356,10 @@ if __name__ == "__main__":                                            # ---- the
         #: the next breakpoint, because at the allocation's RETURN the program has not filled it
         #: yet -- the fill is the read() that comes after.
         pending_reclaim = {}
+        #: chunk -> the offset the marker was found at, for a chunk whose post-reclaim READ is
+        #: being watched. The reading half of the reclaim chain.
+        stale_at = {}
+        stale_seen = set()
         pending_size = 0                                  # rdi captured at the last alloc entry
         free_slots = [0, 1, 2, 3]                         # DR0-3 available for watchpoints
         watches = {}                                      # slot -> {"addr", "kind", "chunk"}
@@ -425,6 +439,19 @@ if __name__ == "__main__":                                            # ---- the
                                 uaf_seen.add(key)
                                 events.append({"error": "use-after-free", "addr": hex(w["chunk"]),
                                                "pc": hex(rg.rip)})
+                        # THE READING HALF: the program touched a chunk that was handed back
+                        # out and refilled with the attacker's bytes. Same conservatism as the
+                        # UAF case -- the target's own code only, never the allocator's -- and
+                        # reported under its own name, because "read memory that now belongs to
+                        # another object" is a different fact from "touched memory that is free".
+                        elif (w["kind"] == "stale" and in_code and not in_alloc):
+                            key = (w["chunk"], rg.rip)
+                            if key not in stale_seen:
+                                stale_seen.add(key)
+                                events.append({
+                                    "event": "reclaim-use", "addr": hex(w["chunk"]),
+                                    "pc": hex(rg.rip),
+                                    "marker_offset": stale_at.get(w["chunk"])})
                         # A WRITE to the qword just past a LIVE chunk is an overflow by
                         # construction; the writer is usually a libc strcpy/memcpy called by the
                         # program, so allow any PC except the allocator's own (its next-chunk setup
@@ -544,6 +571,11 @@ if __name__ == "__main__":                                            # ---- the
                    # observation, so it travels with it rather than being filtered out here.
                    "reclaim_controlled": [e for e in events
                                           if e.get("event") == "reclaim-controlled"][:16],
+                   # The program READ the attacker's bytes out of the reclaimed chunk. The chunk
+                   # coming back is one fact, the bytes being the attacker's is a second, and
+                   # this is the third -- the only one that shows a USE.
+                   "reclaim_use": [e for e in events
+                                   if e.get("event") == "reclaim-use"][:16],
                    "double_free": any(e.get("error") == "double-free" for e in events),
                    "use_after_free": any(e.get("error") == "use-after-free" for e in events),
                    "heap_overflow": any(e.get("error") == "heap-overflow" for e in events),

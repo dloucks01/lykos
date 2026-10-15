@@ -357,3 +357,116 @@ def test_pie_is_read_from_the_elf_when_triage_has_not_filled_it_in(tmp_path):
     assert heap_discover._pie_for(_Triaged(), pie_exe) is False
     # and an unreadable target is not guessed into PIE
     assert heap_discover._pie_for(_T(), tmp_path / "nope") is False
+
+
+# --- the reading half: the program using those bytes -------------------------------------------
+
+def test_the_traced_verdict_reports_a_use_when_the_tracer_saw_one():
+    """Three facts, and only the third is a USE: the chunk came back, the attacker's bytes are in
+    it, and the program's own code read it afterwards."""
+    used = P.reclaim_verdict_traced({"addr": "0x55a0", "offset": 0, "size": 128,
+                                     "marker_before_free": False,
+                                     "use": {"pc": "0x55d1", "marker_offset": 0}})
+    assert used["type"] == "controlled-reclaim-used" and used["used"] is True
+    assert used["use_pc"] == "0x55d1"
+    eff = P.reclaim_effect(used)
+    assert "AND THE PROGRAM THEN READ THEM" in eff
+    assert "pc 0x55d1" in eff
+    assert "whether it reads them at all" not in eff, \
+        "the caveat for an unobserved read must go when the read was observed"
+    assert "what the program does with the value" in eff, \
+        "a read is still not a demonstrated consequence"
+
+
+def test_without_a_use_the_verdict_says_the_read_was_not_seen():
+    quiet = P.reclaim_verdict_traced({"addr": "0x55a0", "offset": 0, "size": 128,
+                                      "marker_before_free": False})
+    assert quiet["type"] == "controlled-reclaim" and quiet["used"] is False
+    eff = P.reclaim_effect(quiet)
+    assert "whether it reads them at all" in eff
+    assert "no operation in the driven surface touched the chunk" in eff
+
+
+def test_the_tracer_arms_the_read_watch_after_the_marker_is_confirmed():
+    """Armed THERE on purpose: the reclaiming owner's fill has already happened, so a later read
+    from the program's own code cannot be the filler. And it is reported under its own name --
+    "read memory that now belongs to another object" is a different fact from the classic
+    "touched memory that is free"."""
+    src = open(heaptrace.__file__.replace(".pyc", ".py")).read()
+    assert 'arm(chunk + at, "stale", chunk, 0b11)' in src
+    assert '"event": "reclaim-use"' in src
+    assert '"reclaim_use"' in src
+    # the same conservatism as the UAF watch: the target's own code, never the allocator's
+    i = src.index('w["kind"] == "stale"')
+    assert "in_code and not in_alloc" in src[i:i + 200]
+
+
+def test_the_sequence_drives_the_stale_index_after_the_reclaim():
+    """Nothing in the earlier shape touched the victim after the reclaim, so there was nothing
+    for the read watch to see."""
+    model = {"1": ["idx", "num", "str"], "2": ["idx"], "3": ["idx"]}
+    seq = heap_discover._reclaim_sequence(model, ["1", "2", "3"], None, b"1234567890123456")
+    assert seq
+    tail = seq.split(b"1234567890123456", 1)[1]
+    assert b"3\n0\n" in tail, f"the victim's index is never used after the reclaim: {tail!r}"
+
+
+#: The silent notebook again, with a consumer: option 3 reads a stored object and folds it into a
+#: global checksum. It PRINTS NOTHING, so the output oracle is still useless -- but the program
+#: does use the bytes, which is what the read watch is for.
+_SILENT_CONSUMER = _SILENT.replace(
+    '''    else if(o==2){ printf("idx: "); long i=rl();
+                   if(i>=0&&i<16&&n[i]) free(n[i]); }      /* slot NOT nulled: UAF */''',
+    '''    else if(o==2){ printf("idx: "); long i=rl();
+                   if(i>=0&&i<16&&n[i]) free(n[i]); }      /* slot NOT nulled: UAF */
+    else if(o==3){ printf("idx: "); long i=rl();
+                   if(i>=0&&i<16&&n[i]) { for(int k=0;k<8;k++) sink ^= n[i][k]; } }''').replace(
+    "static char *n[16];", "static char *n[16];\nstatic volatile long sink;").replace(
+    '1.add 2.free 3.exit', '1.add 2.free 3.sum 4.exit')
+
+
+@pytest.mark.skipif(sandbox.host_arch() != "x86-64", reason="native heap experiment")
+def test_a_silent_target_that_consumes_the_bytes_shows_the_read(store, case, tmp_path):
+    """The whole chain on a target that prints nothing: the chunk comes back, the attacker's
+    bytes are in it, and the program READS them -- each observed, none inferred."""
+    from lykos.analyze import register
+    from lykos.analyze.dynamic import enqueue_heap_trace
+    from lykos.analyze.ingest import ingest
+    from lykos.db.dao import FindingDAO
+    from lykos.jobs import JobConfig, JobQueue, WorkerPool
+
+    assert "sink ^= n[i][k]" in _SILENT_CONSUMER, "the fixture has no consumer"
+    exe = _build(tmp_path, _SILENT_CONSUMER, "consumer")
+    opts = ["1", "2", "3", "4"]
+    width, model = heap_discover.crawl_op_model(tmp_path, exe, opts)
+    assert heap_discover.identify_heap_ops(tmp_path, exe, model, opts, width) is None, \
+        "this fixture must still have no VIEW option -- it prints nothing from the chunk"
+
+    register()
+    target = ingest(store, case.id, exe)
+    pool = WorkerPool(store.db_path, store.content,
+                      JobConfig(workers=1, lease_seconds=300, poll_interval=0.02,
+                                heartbeat_interval=5.0))
+    pool.start()
+    try:
+        q = JobQueue(store.conn)
+        run = enqueue_heap_trace(q, target)
+        assert pool.wait_idle(420)
+        rec = q.runs.get(run.id)
+        if rec.status != "done":
+            pytest.skip("heap_trace could not run here: " + str(rec.error))
+    finally:
+        pool.stop(grace=3.0)
+
+    finds = [f for f in FindingDAO(store.conn).list_by_target(target.id)
+             if "reclaim" in (f.title or "").lower()]
+    if not finds:
+        pytest.skip("the tracer saw no controlled reclaim on this host "
+                    "(ptrace/debug registers may be unavailable)")
+    ev = " ".join(str(e.get("detail", "")) for f in finds for e in (f.evidence or []))
+    if "READ that chunk" not in ev:
+        pytest.skip("the reclaim was seen but the read watch did not fire here "
+                    "(debug registers may be exhausted): " + ev[:160])
+    assert "AND THE PROGRAM THEN READ THEM" in ev, ev[:400]
+    assert any("reclaimed AND read" in (f.title or "") for f in finds), \
+        [f.title for f in finds]

@@ -713,12 +713,18 @@ def reclaim_verdict_traced(observation: dict, *, marker: bytes = RECLAIM_MARKER)
         return None
     if observation.get("marker_before_free"):
         return None
+    use = observation.get("use") or None
     return {
-        "type": "controlled-reclaim",
+        "type": "controlled-reclaim-used" if use else "controlled-reclaim",
         "lifetime": True,
         "reclaim": True,
         "confirmed": True,
         "oracle": "traced-memory",
+        # The READING half: the program touched the reclaimed chunk from its own code, at this
+        # pc, after the attacker's bytes were in it. Without this the verdict shows a state of
+        # memory; with it, a use.
+        "use_pc": (use or {}).get("pc"),
+        "used": bool(use),
         "size": observation.get("size"),
         "addr": observation.get("addr"),
         "chunk_offset": observation.get("offset"),
@@ -738,15 +744,23 @@ def reclaim_effect(prim: dict) -> str:
                 "inconclusive rather than as a demonstration")
     if prim.get("oracle") == "traced-memory":
         at = prim.get("chunk_offset")
-        return (f"use-after-free with a DEMONSTRATED reclaim, read out of the process's own "
+        head = (f"use-after-free with a DEMONSTRATED reclaim, read out of the process's own "
                 f"memory: a later allocation took the freed {size}chunk at {prim.get('addr')} "
                 f"and the attacker's bytes are in it"
                 + (f" at offset {at}" if at is not None else "")
                 + ". The chunk was sampled before the free as well -- the marker was not there "
-                "-- so the bytes arrived with the reclaiming allocation. This target has no "
-                "output path to read the stale pointer back through, so what is NOT shown is "
-                "heavier here than on the output route: not only what the program does with "
-                "those bytes, but whether it reads them at all")
+                "-- so the bytes arrived with the reclaiming allocation.")
+        if prim.get("used"):
+            return (head + f" AND THE PROGRAM THEN READ THEM: its own code touched the chunk at "
+                    f"pc {prim.get('use_pc')} after the reclaim, through a pointer it should "
+                    f"have stopped using -- so the attacker's bytes reached a consumer, not just "
+                    f"a dead object. What is still NOT shown is what the program does with the "
+                    f"value: a function pointer among those bytes would be a hijack, and that is "
+                    f"the exploit stage's claim to make")
+        return (head + " This target has no output path to read the stale pointer back through, "
+                "and no operation in the driven surface touched the chunk after the reclaim, so "
+                "what is NOT shown is heavier here than on the output route: not only what the "
+                "program does with those bytes, but whether it reads them at all")
     return (f"use-after-free with a DEMONSTRATED reclaim: a later allocation of the same "
             f"{size}size class took the freed chunk, and reading the stale entry returned the "
             f"bytes that allocation carried -- so the attacker chooses the contents of an object "

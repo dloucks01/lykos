@@ -662,6 +662,18 @@ def _reclaim_sequence(model: dict, opts: list, width, marker: bytes, size: int =
          # over the tracee has exited and its memory cannot be read **[measured: the reclaim was
          # seen and the marker never was]**.
          + _op_writes(add, model[add], width, idx=3, size=size, data=b"Z" * 8))
+    # THE READING HALF. Everything above shows the attacker's bytes sitting in the dead object;
+    # none of it shows the program touching them. So drive every OTHER option that takes an index
+    # against the VICTIM's index, after the reclaim: whichever one uses a stored object reads the
+    # attacker's bytes through a pointer the program should have stopped using, and the tracer's
+    # read watchpoint is armed on that chunk by then. An option that does something else is a few
+    # wasted writes; an option that frees it again is a double free the tracer reports anyway.
+    for other in opts:
+        if other in (add, free) or other not in model:
+            continue
+        if model[other][:1] != ["idx"]:
+            continue
+        w += _op_writes(other, model[other], width, idx=0)
     return b"".join(w)
 
 
@@ -685,19 +697,27 @@ def _file_traced_reclaim(ctx, target, alloc, observation):
               f"{alloc['free_name']}: the chunk at {hit.get('addr')} was freed, handed back out "
               f"to a later allocation, and the marker bytes that allocation carried were read "
               f"out of the process's memory at offset {hit.get('chunk_offset')}. The same chunk "
-              f"was sampled before the free and did not contain them. {effect}")
+              f"was sampled before the free and did not contain them."
+              + (f" The program then READ that chunk from its own code at pc "
+                 f"{hit.get('use_pc')}." if hit.get("used") else "")
+              + f" {effect}")
     ctx.emit("heaptrace.reclaim", payload={
         "type": hit["type"], "oracle": "traced-memory", "confirmed": True,
-        "size": hit.get("size"), "addr": hit.get("addr"),
+        "size": hit.get("size"), "addr": hit.get("addr"), "used": hit.get("used"),
+        "use_pc": hit.get("use_pc"),
         "chunk_offset": hit.get("chunk_offset"), "allocator": alloc["alloc_name"]})
     eff = [{"kind": "memory-corruption",
-            "title": "Attacker-controlled contents in a freed object (demonstrated)",
+            "title": ("Attacker-controlled contents READ from a freed object (demonstrated)"
+                      if hit.get("used") else
+                      "Attacker-controlled contents in a freed object (demonstrated)"),
             "status": "demonstrated", "detail": detail,
             "proof": {"type": "uaf-reclaim-traced", "addr": hit.get("addr"),
                       "offset": hit.get("chunk_offset"), "size": hit.get("size"),
-                      "marker": hit.get("marker")}}]
+                      "marker": hit.get("marker"), "use_pc": hit.get("use_pc")}}]
     FindingDAO(ctx.conn).upsert(target.id, target.case_id, {
-        "cwe": "CWE-416", "title": "Use-after-free with a demonstrated reclaim (traced)",
+        "cwe": "CWE-416",
+        "title": ("Use-after-free: attacker bytes reclaimed AND read (traced)" if hit.get("used")
+                  else "Use-after-free with a demonstrated reclaim (traced)"),
         "severity": "critical", "detector": "heap_trace", "state": "corroborated",
         "confidence": 0.9,
         "dedup_key": f"CWE-416:uaf-reclaim:{alloc['free_name']}",
@@ -706,7 +726,8 @@ def _file_traced_reclaim(ctx, target, alloc, observation):
                      {"channel": "heap-trace", "detail": detail}]})
     ctx.progress(msg=f"reclaim demonstrated by the tracer at {hit.get('addr')} "
                      f"(no output oracle needed)")
-    return {"metrics": {"reclaim": "demonstrated", "reclaim_oracle": "traced-memory"}}
+    return {"metrics": {"reclaim": "demonstrated", "reclaim_oracle": "traced-memory",
+                        "reclaim_used": bool(hit.get("used"))}}
 
 
 def _try_uaf_leak(ctx, target, target_bytes, exe, workdir, model, opts, width, alloc):
@@ -939,7 +960,14 @@ def heap_trace_stage(ctx) -> dict:
             reclaim_traced = reclaim_traced or bool(rep.get("reclaim"))
             for _rc in (rep.get("reclaim_controlled") or []):
                 if not _rc.get("marker_before_free"):
-                    reclaim_observed = reclaim_observed or _rc
+                    if reclaim_observed is None:
+                        reclaim_observed = dict(_rc)
+                    # The read, if the tracer saw one on this chunk: the third fact, and the only
+                    # one that shows a USE rather than a state of memory.
+                    _use = next((u for u in (rep.get("reclaim_use") or [])
+                                 if u.get("addr") == _rc.get("addr")), None)
+                    if _use and not reclaim_observed.get("use"):
+                        reclaim_observed["use"] = _use
             if rep.get("double_free") or rep.get("use_after_free") or rep.get("heap_overflow"):
                 found = (seq, rep)
                 break
