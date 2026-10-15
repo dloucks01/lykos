@@ -357,6 +357,34 @@ _ASAN_NONBUG = frozenset({"failed", "out", "hard", "requested", "cannot", "unabl
                           "nested", "ignoring", "while", "thread", "internal", "atos"})
 
 
+#: Stack frames that belong to the REPORTING machinery and not to the defect: the sanitizer
+#: runtimes, their interceptors and libFuzzer's own driver.
+_RUNTIME_FRAME = re.compile(
+    r"(?:ubsan|asan|msan|tsan|lsan|hwasan|sanitizer|interception)_"
+    r"|compiler-rt/|(?:^|/)Fuzzer[A-Za-z]*\.cpp$")
+#: The glibc path `abort()` raises through. glibc ships file names (`./nptl/pthread_kill.c`), so
+#: without this the first frame "naming a real source file" is the abort path on every build that
+#: halts on error. Matched on the DIRECTORY as well as the name, because a project is entitled to
+#: its own `signal.c` or `abort.c` and a frame in one of those is a frame in the target.
+_LIBC_RAISE = re.compile(
+    r"(?:^|/)(?:nptl|sysdeps|stdlib|signal|csu)/(?:[^/]+/)*[^/]*"
+    r"(?:pthread_kill|pthread_sigqueue|raise|abort|sigaction|sigsuspend)[^/]*\.c$")
+
+
+def _is_runtime_frame(path: str) -> bool:
+    """Is this stack frame the machinery that REPORTED the fault rather than the fault's site?"""
+    return bool(_RUNTIME_FRAME.search(path) or _LIBC_RAISE.search(path))
+
+
+def _ubsan_site(t: str) -> Optional[str]:
+    """The source location UBSan itself names, from its report line or its summary."""
+    fm = re.search(r"^(\S+\.(?:c|cc|cpp|cxx|h|hpp)):(\d+):\d+: runtime error:", t, re.M)
+    if fm is None:
+        fm = re.search(r"SUMMARY:\s*UndefinedBehaviorSanitizer:\s*\S+\s+"
+                       r"(\S+\.(?:c|cc|cpp|cxx|h|hpp)):(\d+)", t)
+    return f"{fm.group(1).split('/')[-1]}:{fm.group(2)}" if fm else None
+
+
 def parse_asan_report(text: str) -> Optional[dict]:
     """Turn an AddressSanitizer / UBSan report into a classification, with the source location
     when the build was symbolized. Returns None when the text carries no sanitizer report."""
@@ -405,18 +433,25 @@ def parse_asan_report(text: str) -> Optional[dict]:
         msg = ub.group(1).strip()
         bug, cwe, sev = _classify_ubsan(msg)
         detail = f"UndefinedBehaviorSanitizer: {msg[:120]}"
-    # The first stack frame that names a real source file (skip the sanitizer interceptors).
-    src = None
-    for fm in re.finditer(r"#\d+ 0x[0-9a-f]+ in \S+ ([^\s:]+\.(?:c|cc|cpp|cxx|h|hpp)):(\d+)", t):
-        src = f"{fm.group(1).split('/')[-1]}:{fm.group(2)}"
-        break
-    # UBSan names the location in its own line and prints NO stack unless something aborts, so a
-    # recovered report (`-fsanitize-recover`, or a tool that captured only the verdict) carried a
-    # bug class and no site. The prefix is the site.
+    # WHERE THE DEFECT IS. UBSan states it in its own report line, and that beats any stack walk:
+    # a build that aborts on error hands libFuzzer a deadly signal, and the stack libFuzzer then
+    # prints begins in the REPORTING machinery rather than in the library. Measured on expat
+    # 2.1.0: the left-shift fault at `xmltok_impl.c:694` was filed, keyed and deduped as
+    # `pthread_kill.c:43` -- the glibc file `abort()` raises from, which ships source names like
+    # any other. That is not merely a wrong label: the site is the DEDUP KEY for a sanitizer
+    # defect, so every UBSan fault in a campaign collapsed into one finding at one glibc line.
+    src = _ubsan_site(t) if ub and not (m or msan or tsan or lsan) else None
     if src is None:
-        fm = re.search(r"^(\S+\.(?:c|cc|cpp|cxx|h|hpp)):(\d+):\d+: runtime error:", t, re.M)
-        if fm:
+        for fm in re.finditer(
+                r"#\d+ 0x[0-9a-f]+ in \S+ ([^\s:]+\.(?:c|cc|cpp|cxx|h|hpp)):(\d+)", t):
+            if _is_runtime_frame(fm.group(1)):
+                continue                                 # the reporting machinery, not the bug
             src = f"{fm.group(1).split('/')[-1]}:{fm.group(2)}"
+            break
+    # A report whose stack held nothing but runtime frames, or none at all: a recovered UBSan
+    # verdict (`-fsanitize-recover`, or a tool that captured only the summary) prints no stack.
+    if src is None:
+        src = _ubsan_site(t)
     out = {"class": bug, "cwe": cwe, "severity": sev,
            "detail": detail + (f" at {src}" if src else ""), "source": src}
     out.update(_access_detail(t))

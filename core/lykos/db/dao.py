@@ -604,7 +604,14 @@ class FindingDAO(BaseDAO):
                 self.conn.execute(
                     "UPDATE finding SET state=?, severity=?, confidence=? WHERE id=?",
                     (state, severity, confidence, fid))
-            if c.get("function_addr") or c.get("site_addr"):
+            # A SITE is a place, and a place is not always an address. A sanitizer defect in a
+            # source build has no address at all -- it is `xmltok_impl.c:694`, which the stage
+            # passes as `site_detail` -- so requiring one of the two address fields meant every
+            # in-process library finding recorded NO site, and the only copy of the source
+            # location was a sentence inside an evidence string. Measured on expat 2.1.0: a
+            # confirmed CWE-758 whose site the report, the UI and the regression benchmark all
+            # read as empty.
+            if c.get("function_addr") or c.get("site_addr") or c.get("site_detail"):
                 self._record_site(fid, c, now)
 
     def reset_candidate_sites(self, target_id: str, detectors) -> int:
