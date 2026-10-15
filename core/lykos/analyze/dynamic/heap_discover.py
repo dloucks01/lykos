@@ -259,6 +259,16 @@ def _drive(workdir: Path, exe: Path, writes: list, *, timeout: float = 10.0, idl
             if not alive:
                 break
     finally:
+        # CLOSE STDIN before the process object is collected. The writes above are guarded, but
+        # the BufferedWriter's finalizer is not: when the target has already exited, flushing it
+        # during garbage collection raises BrokenPipeError outside any handler, which pytest
+        # surfaces as an unraisable-exception warning and an operator sees as noise in the log.
+        # Measured after this stage gained another drive -- more drives, more finalizers.
+        try:
+            if p.stdin:
+                p.stdin.close()
+        except Exception:
+            pass
         try:
             p.kill()
         except Exception:
