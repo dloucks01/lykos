@@ -96,6 +96,18 @@ def heap_op_sequences(menu_options, *, max_seqs: int = 40) -> list[bytes]:
         a, b2 = opts[1].encode(), opts[2].encode()
         seqs.append(create + create + a + nl + b"0" + nl + a + nl + b"0" + nl)
         seqs.append(create + b2 + nl + b"0" + nl + b2 + nl + b"0" + nl)
+    # RECLAIM shape: create two, free the first, then create a THIRD of the same size. The
+    # allocator hands the freed chunk straight back (LIFO), which is the observation that turns a
+    # lifetime defect into a controllable one -- and no other sequence here provokes it, so the
+    # tracer's reclaim event could never fire however many sequences it drove.
+    nd = b"RECLAIMED0000000"                            # all digits after the tag: case-fold safe
+    seqs.append(create + create
+                + opts[1].encode() + nl + b"0" + nl                     # free object 0
+                + opts[0].encode() + nl + b"64" + nl + nd + nl)         # same size: takes it back
+    if len(opts) >= 3:                                  # ...and then USE the stale entry
+        seqs.append(create + create + opts[1].encode() + nl + b"0" + nl
+                    + opts[0].encode() + nl + b"64" + nl + nd + nl
+                    + opts[2].encode() + nl + b"0" + nl)
     # heap-OVERFLOW shape: allocate a SMALL object, then drive each option with an over-long
     # payload (the classic "modify/edit" bug that writes past the requested size). Object id 0/1.
     small = opts[0].encode() + nl + b"16" + nl + b"A" * 8 + nl
@@ -405,6 +417,15 @@ if __name__ == "__main__":                                            # ---- the
                 else:                                    # alloc return: rax = new pointer
                     ptr = rg.rax
                     size, pending_size = pending_size, 0
+                    # RECLAIM: this allocation was handed the address of a chunk that is currently
+                    # FREE. The tracer already knew that -- it is what `freed.discard` below acts
+                    # on -- and threw it away, so the one observation that turns a lifetime defect
+                    # into a controllable one was computed and discarded on every run. It is not an
+                    # error (the allocator is behaving exactly as designed), so it is recorded
+                    # under `event` rather than `error`: nothing downstream may mistake it for a
+                    # fault, and a target with no printing path still gets the evidence.
+                    if ptr in freed:
+                        events.append({"event": "reclaim", "addr": hex(ptr), "size": size})
                     freed.discard(ptr)                   # handed back out -> live again
                     if len(alloc_addrs) < 16:
                         alloc_addrs.append(ptr)          # deterministic (ASLR-off) chunk addresses
@@ -440,6 +461,11 @@ if __name__ == "__main__":                                            # ---- the
                 pass
 
         json.dump({"events": events,
+                   # Both halves of a use-after-free, reported separately because they are
+                   # different observations: the program USED a dead chunk, and a dead chunk was
+                   # handed back out to a later allocation.
+                   "reclaim": any(e.get("event") == "reclaim" for e in events),
+                   "reclaims": [e for e in events if e.get("event") == "reclaim"][:16],
                    "double_free": any(e.get("error") == "double-free" for e in events),
                    "use_after_free": any(e.get("error") == "use-after-free" for e in events),
                    "heap_overflow": any(e.get("error") == "heap-overflow" for e in events),

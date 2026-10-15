@@ -491,6 +491,118 @@ def heap_uaf_leak(workdir: Path, exe: Path, ops: dict, model: dict, width, *, ta
     return heap_fallback
 
 
+#: Size classes the reclaim experiment tries, in order. 0x80 is a tcache bin (LIFO: the next
+#: same-size request returns the chunk just freed, which is the whole mechanism), 0x18 is the
+#: smallest bin a notebook typically allows. Two, because each is four process drives.
+_RECLAIM_SIZES = (0x80, 0x18)
+#: The size class the CONTROL allocation uses -- far enough from either of the above that no
+#: allocator returns the same chunk for it, so a marker that still comes back is an echo.
+_RECLAIM_CONTROL_SIZE = 0x500
+
+
+def heap_uaf_reclaim(workdir: Path, exe: Path, ops: dict, model: dict, width, *,
+                     timeout: float = 20.0) -> dict | None:
+    """Demonstrate that an attacker's own allocation TAKES the freed chunk, and that the program
+    then reads the attacker's bytes through the stale pointer.
+
+    The lifetime verdict in `poc_primitive` deliberately stops short of this: it reads a sanitizer
+    report, and ASan quarantines a freed chunk -- that is how the use is caught -- so under that
+    build nothing can ever reclaim it. Without a sanitizer the allocator behaves normally and the
+    target's own `view` option is the oracle:
+
+        add(victim, S)  add(guard, S)  free(victim)  add(attacker, S, MARKER)  view(victim)
+
+    If the view of the FREED entry prints the marker the LATER allocation carried, the attacker's
+    bytes occupy the chunk the stale pointer addresses. The control run allocates in a different
+    size class, where no reclaim is possible; it exists because a target that echoes recent input
+    out of a shared buffer would print the marker whatever the allocator did. See
+    `primitive.reclaim_verdict` for how the two runs combine into a verdict.
+
+    Returns the verdict dict (with `stale`/`control` output samples) or None.
+    """
+    from ..poc import primitive as _prim
+    add, free, view = ops["add"], ops["free"], ops["view"]
+
+    def _c(opt, **kw):
+        return _op_writes(opt, model[opt], width, **kw)
+
+    def _seq(victim_size, attacker_size):
+        # The guard keeps the victim off the top of the heap, so freeing it goes to a bin instead
+        # of being absorbed back into the wilderness -- without it there is nothing to reclaim.
+        # Both sizes are parameters rather than one of them closing over the loop variable: the
+        # whole experiment is the difference between them.
+        return (_c(add, idx=0, size=victim_size, data=b"P" * 8)
+                + _c(add, idx=1, size=victim_size, data=b"G" * 8)
+                + _c(free, idx=0)
+                + _c(add, idx=2, size=attacker_size, data=_prim.RECLAIM_MARKER)
+                + _c(view, idx=0))
+
+    for size in _RECLAIM_SIZES:
+        stale = _drive(workdir, exe, _seq(size, size), timeout=timeout)
+        if _prim.RECLAIM_MARKER not in (stale or b""):
+            continue
+        control = _drive(workdir, exe, _seq(size, _RECLAIM_CONTROL_SIZE), timeout=timeout)
+        verdict = _prim.reclaim_verdict(stale, control, size=size)
+        if verdict:
+            verdict["stale"] = (stale or b"")[-400:]
+            verdict["control"] = (control or b"")[-400:]
+            verdict["ops"] = {"add": add, "free": free, "view": view}
+            return verdict
+    return None
+
+
+def _try_uaf_reclaim(ctx, target, exe, workdir, model, opts, width, alloc):
+    """Run the reclaim experiment and file what it demonstrated. Returns a metrics dict or None.
+
+    Filed as its own finding (like the UAF-read leak beside it) rather than as another sentence on
+    the crash finding: "the attacker chooses the contents of an object the program still believes
+    it owns" is a different claim from "the program touched a dead chunk", and it is the one an
+    operator would act on first.
+    """
+    import json as _json
+
+    from ...db.dao import FindingDAO
+    from ..poc import primitive as _prim
+    if not (opts and model):
+        return None
+    ops = identify_heap_ops(workdir, exe, model, opts, width)
+    if not ops:
+        return None
+    hit = heap_uaf_reclaim(workdir, exe, ops, model, width)
+    if not hit:
+        return None
+    effect = _prim.reclaim_effect(hit)
+    detail = (f"Reclaim experiment on {alloc['alloc_name']}/{alloc['free_name']}: "
+              f"add -> free -> add({hit['size']:#x}, marker) -> view of the FREED index "
+              f"(options add={ops['add']!r} free={ops['free']!r} view={ops['view']!r}). {effect}")
+    ctx.emit("heaptrace.reclaim", payload={
+        "type": hit["type"], "confirmed": hit["confirmed"], "size": hit["size"],
+        "control_echoed": hit["control_echoed"], "ops": hit["ops"],
+        "allocator": alloc["alloc_name"]})
+    if not hit["confirmed"]:
+        # The oracle was unsound here. Say so and file NOTHING: an inconclusive experiment is not
+        # evidence, and a finding that has to be read carefully to discover it proves nothing is
+        # worse than no finding.
+        ctx.progress(msg="reclaim experiment inconclusive (the target echoes recent input)")
+        return {"metrics": {"reclaim": "inconclusive"}}
+    eff = [{"kind": "memory-corruption",
+            "title": "Attacker-controlled contents in a freed object (demonstrated)",
+            "status": "demonstrated", "detail": detail,
+            "proof": {"type": "uaf-reclaim", "size": hit["size"], "marker": hit["marker"],
+                      "view_op": ops["view"], "free_op": ops["free"], "add_op": ops["add"]}}]
+    FindingDAO(ctx.conn).upsert(target.id, target.case_id, {
+        "cwe": "CWE-416", "title": "Use-after-free with a demonstrated reclaim",
+        "severity": "critical", "detector": "heap_trace", "state": "corroborated",
+        "confidence": 0.95,
+        "dedup_key": f"CWE-416:uaf-reclaim:{alloc['free_name']}",
+        "function_addr": alloc["free"], "site_addr": None, "site_detail": alloc["free_name"],
+        "evidence": [{"channel": "effects", "detail": _json.dumps(eff)},
+                     {"channel": "heap-trace", "detail": detail}]})
+    ctx.progress(msg=f"reclaim demonstrated at size {hit['size']:#x} "
+                     f"(a later allocation took the freed chunk)")
+    return {"metrics": {"reclaim": "demonstrated", "reclaim_size": hit["size"]}}
+
+
 def _try_uaf_leak(ctx, target, target_bytes, exe, workdir, model, opts, width, alloc):
     """Discover + file a use-after-free READ leak: a notebook whose Show-after-Remove prints a freed
     chunk discloses a libc/heap pointer WITHOUT faulting, so the watchpoint tracer never sees it.
@@ -674,6 +786,12 @@ def heap_trace_stage(ctx) -> dict:
                          "operation sequences")
 
         found = None
+        # The tracer's own half of the reclaim evidence, collected across every sequence: on a
+        # target with no `view` option there is no oracle for the marker experiment below, and
+        # "a later allocation was handed the freed chunk" is then the only reclaim evidence
+        # available. Weaker than the marker proof (it says the chunk came back, not whose bytes
+        # are in it) and worth reporting rather than discarding.
+        reclaim_traced = False
         for i, seq in enumerate(seqs):
             if ctx.should_cancel():
                 break
@@ -696,6 +814,7 @@ def heap_trace_stage(ctx) -> dict:
                 rep = json.loads(report.read_text())
             except Exception:
                 continue
+            reclaim_traced = reclaim_traced or bool(rep.get("reclaim"))
             if rep.get("double_free") or rep.get("use_after_free") or rep.get("heap_overflow"):
                 found = (seq, rep)
                 break
@@ -713,12 +832,28 @@ def heap_trace_stage(ctx) -> dict:
         except Exception:
             leak_hit = None
 
+        # The RECLAIM half, for the same reason and unconditionally: it is the step that turns a
+        # use-after-free from "the program touched a dead chunk" into "the attacker chooses the
+        # contents of an object the program still believes it owns", and it is invisible to every
+        # other channel here -- the watchpoint tracer sees the use but not who filled the chunk,
+        # and the sanitizer path cannot see it at all because ASan quarantines the chunk.
+        reclaim_hit = None
+        try:
+            reclaim_hit = _try_uaf_reclaim(ctx, target, exe, workdir, model, opts, width, alloc)
+        except Exception:
+            reclaim_hit = None
+
         if not found:
             if leak_hit:
+                if reclaim_hit:
+                    leak_hit.setdefault("metrics", {}).update(reclaim_hit.get("metrics", {}))
                 return leak_hit
+            if reclaim_hit:
+                return reclaim_hit
             ctx.emit("heaptrace.done", payload={
                 "applicable": True, "double_free": False, "use_after_free": False,
                 "heap_overflow": False, "allocator": alloc["alloc_name"],
+                "reclaim_traced": reclaim_traced,
                 "note": (f"traced the target's own allocator ({alloc['alloc_name']}/"
                          f"{alloc['free_name']}) over {len(seqs)} operation sequences; no "
                          "double-free, use-after-free or heap overflow surfaced. Menu semantics "
@@ -739,9 +874,13 @@ def heap_trace_stage(ctx) -> dict:
                                          "wrote past the end of an allocated chunk")
         _seeds = ("Corrupts the adjacent chunk's header -> allocator metadata attack"
                   if _kind == "heap_overflow" else "Seeds tcache poisoning -> arbitrary write")
+        _rc = (" The tracer also saw the freed chunk handed back out to a LATER allocation, so "
+               "the reuse this class of attack needs happens here (what the later allocation "
+               "put in it is a separate question -- see the reclaim experiment)."
+               if reclaim_traced and _kind != "heap_overflow" else "")
         detail = (f"{_title} ({_cwe}) discovered on the target's own allocator "
                   f"{alloc['alloc_name']}/{alloc['free_name']}: the traced sequence {_why}. "
-                  f"{_seeds}. (op sequence {input_sha[:12]})")
+                  f"{_seeds}.{_rc} (op sequence {input_sha[:12]})")
         FindingDAO(ctx.conn).upsert(target.id, target.case_id, {
             "cwe": _cwe, "title": _title, "severity": "high" if _kind == "double_free" else "critical",
             "detector": "heap_trace", "state": "corroborated", "confidence": 0.85,
@@ -752,7 +891,7 @@ def heap_trace_stage(ctx) -> dict:
             "evidence": [{"channel": "heap-trace", "detail": detail}]})
         ctx.emit("heaptrace.done", payload={
             "applicable": True, "double_free": _kind == "double_free", "use_after_free": _kind == "uaf",
-            "heap_overflow": _kind == "heap_overflow",
+            "heap_overflow": _kind == "heap_overflow", "reclaim_traced": reclaim_traced,
             "allocator": alloc["alloc_name"], "input_sha": input_sha,
             # the aaheg chainer consumes this Vuln shape (double_free/uaf -> tcache-poison chain)
             "vuln": {"vclass": _kind, "note": f"{alloc['alloc_name']}/{alloc['free_name']}"}})
@@ -760,6 +899,8 @@ def heap_trace_stage(ctx) -> dict:
         metrics = {_kind: True}
         if leak_hit:                                     # a fault AND a UAF-read disclosure both fired
             metrics.update(leak_hit.get("metrics", {}))
+        if reclaim_hit:                                  # ...and the reclaim: a third thing
+            metrics.update(reclaim_hit.get("metrics", {}))
         return {"metrics": metrics, "output_shas": [input_sha]}
     finally:
         shutil.rmtree(workdir, ignore_errors=True)

@@ -62,3 +62,16 @@ def test_allocator_ranges_covers_family_and_transitive_callees():
     starts = {a for a, _ in rngs}
     assert {0x1000, 0x1100, 0x1200, 0x1300, 0x1400} <= starts   # family + callees
     assert 0x1500 not in starts                                  # main is NOT the allocator
+
+
+def test_heap_op_sequences_include_the_reclaim_shape():
+    """create, create, free(0), create(same size) -- the allocator hands the freed chunk straight
+    back. No other sequence frees and then allocates the same size, so the tracer's reclaim event
+    could never fire however many sequences it drove."""
+    seqs = heaptrace.heap_op_sequences(["1", "2", "3", "4"])
+    reclaim = [s for s in seqs if s.count(b"1\n64\n") >= 3 and b"2\n0\n" in s]
+    assert reclaim, "no free-then-same-size-allocate sequence"
+    # the reclaiming allocation carries a distinguishable payload, and the last shape USES the
+    # stale entry afterwards
+    assert any(b"RECLAIMED" in s for s in reclaim)
+    assert any(s.rstrip().endswith(b"3\n0") for s in reclaim)

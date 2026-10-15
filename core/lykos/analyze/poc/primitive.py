@@ -639,3 +639,68 @@ def lifetime_effect(prim: dict) -> str:
         what = (f"the same {size}-byte chunk is freed twice: the second free operates on the "
                 f"allocator's own free-list entry for a chunk it has already released")
     return f"{what} -- {_lifetime_control(prim)}. {_QUARANTINE}{trail}"
+
+
+#: The marker the reclaim experiment writes into the allocation that takes the dead chunk. ALL
+#: DIGITS on purpose: a menu target that case-folds stored text ("funkify", toupper) mangles
+#: letters, and `identify_heap_ops` learned the same lesson probing for the view option.
+RECLAIM_MARKER = b"4718295036471829"
+
+
+def reclaim_verdict(stale_view: bytes, control_view: bytes, *, marker: bytes = RECLAIM_MARKER,
+                    size: int | None = None) -> dict | None:
+    """Did the attacker's own allocation take the freed chunk, and did the program then read it?
+
+    This is the question the lifetime verdict deliberately does NOT answer. `lifetime_primitive`
+    works from a sanitizer report, and ASan holds a freed chunk in QUARANTINE -- that is how the
+    use is caught at all -- so under the build that produces that evidence nothing can ever
+    reclaim the chunk. The reclaim half therefore cannot be shown there, and was documented as
+    the open end of chain link 5.
+
+    It can be shown without a sanitizer, through the target's own output. Drive
+    `add(victim); add(guard); free(victim); add(attacker, same size class, MARKER); view(victim)`
+    and the question becomes one bit: does the view of the FREED entry print the marker the
+    LATER allocation carried? If it does, the attacker's bytes occupy the chunk the stale pointer
+    addresses and the program read them through it -- reclaim, controlled contents, and a use,
+    each observed rather than modelled.
+
+    `control_view` is the same sequence with the attacker's allocation in a DIFFERENT size class,
+    so no reclaim is possible. It exists because the oracle has an obvious failure mode: a target
+    that echoes recent input out of a shared buffer would print the marker whatever the allocator
+    did. If the control prints it too, the oracle is unsound on this target and the result is
+    INCONCLUSIVE -- which is reported, not quietly dropped and not counted as a demonstration.
+
+    Returns None when the marker never came back.
+    """
+    hit = marker in (stale_view or b"")
+    control = marker in (control_view or b"")
+    if not hit:
+        return None
+    confirmed = not control
+    return {
+        "type": "controlled-reclaim" if confirmed else "reclaim-inconclusive",
+        "lifetime": True,
+        "reclaim": True,
+        "confirmed": confirmed,
+        "size": size,
+        "marker": marker.decode("latin-1"),
+        "control_echoed": control,
+        "offset": None,
+    }
+
+
+def reclaim_effect(prim: dict) -> str:
+    """What a demonstrated reclaim is worth, stated without inflation."""
+    size = f"{prim.get('size'):#x}-byte " if prim.get("size") else ""
+    if not prim.get("confirmed"):
+        return ("the marker came back from the view of a freed entry AND from the control run "
+                "where no reclaim was possible, so this target echoes recent input and the "
+                "experiment cannot distinguish a reclaim from an echo -- reported as "
+                "inconclusive rather than as a demonstration")
+    return (f"use-after-free with a DEMONSTRATED reclaim: a later allocation of the same "
+            f"{size}size class took the freed chunk, and reading the stale entry returned the "
+            f"bytes that allocation carried -- so the attacker chooses the contents of an object "
+            f"the program still believes it owns. The control run, whose allocation was in a "
+            f"different size class, did not return them. What is NOT shown is what the program "
+            f"then does with those bytes: a function pointer among them would be a hijack, and "
+            f"that is the exploit stage's claim to make, not this one's")
