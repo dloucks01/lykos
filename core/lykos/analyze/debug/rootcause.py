@@ -285,6 +285,7 @@ _ASAN_CWE = {
     "double-free": ("CWE-415", "high"),
     "alloc-dealloc-mismatch": ("CWE-762", "medium"),
     "attempting-free-on-address": ("CWE-590", "high"),
+    "bad-free": ("CWE-590", "high"),
     "negative-size-param": ("CWE-1284", "medium"),
     "SEGV": ("CWE-476", "high"),
     # NOT memory corruption. A library that believes a size field in its input allocates what the
@@ -385,6 +386,30 @@ def _ubsan_site(t: str) -> Optional[str]:
     return f"{fm.group(1).split('/')[-1]}:{fm.group(2)}" if fm else None
 
 
+#: Where the object was freed, and where it was allocated. A lifetime defect has THREE locations
+#: -- the use, the free and the allocation -- and a report that names only the use tells whoever
+#: reads it the one thing they can already see from the stack. ASan prints both sections; the
+#: allocator frame inside each has no file:line, so the first frame that does is the project's.
+_ASAN_FREED_BY = re.compile(r"^freed by thread .*? here:$", re.M)
+_ASAN_ALLOCED_BY = re.compile(r"^(?:previously )?allocated by thread .*? here:$", re.M)
+_ASAN_FRAME = re.compile(r"#\d+ 0x[0-9a-f]+ in \S+ ([^\s:]+\.(?:c|cc|cpp|cxx|h|hpp)):(\d+)")
+
+
+def _section_site(t: str, header: re.Pattern) -> Optional[str]:
+    """The first project source location in the stack under `header`, or None."""
+    m = header.search(t or "")
+    if m is None:
+        return None
+    # The section ends at the next blank line; ASan separates them with one.
+    tail = t[m.end():]
+    end = tail.find("\n\n")
+    for fm in _ASAN_FRAME.finditer(tail if end < 0 else tail[:end]):
+        if _is_runtime_frame(fm.group(1)):
+            continue
+        return f"{fm.group(1).split('/')[-1]}:{fm.group(2)}"
+    return None
+
+
 def parse_asan_report(text: str) -> Optional[dict]:
     """Turn an AddressSanitizer / UBSan report into a classification, with the source location
     when the build was symbolized. Returns None when the text carries no sanitizer report."""
@@ -396,6 +421,18 @@ def parse_asan_report(text: str) -> Optional[dict]:
     # too-small address-space limit produces and which is NOT a finding. Requiring the colon,
     # plus a denylist for the odd non-bug token, keeps those out of the classification.
     m = re.search(r"(?:ERROR|SUMMARY):\s*AddressSanitizer:\s*([a-z][a-z0-9-]+)", t)
+    # A FREE-side defect states its class as a sentence, not as a token: ASan writes
+    # `ERROR: AddressSanitizer: attempting double-free on 0x... in thread T0`, and the first
+    # word-like thing after the colon is "attempting". Measured on a two-line double free: the
+    # finding came out as class `attempting`, CWE-119 ("memory buffer errors") at high -- a
+    # generic corruption label for a defect whose own CWE, 415, was already in the table two
+    # lines below. The sentence is matched before the token so the class is the defect.
+    sentence = re.search(r"AddressSanitizer:\s*attempting (double-free|free on address)", t)
+    if sentence:
+        m = None
+        bad_free = "double-free" if sentence.group(1) == "double-free" else "bad-free"
+    else:
+        bad_free = None
     # MemorySanitizer reports the one class ASan/UBSan cannot: a READ of memory that was never
     # initialized (CWE-457). It needs its own -fsanitize=memory build (clang, mutually exclusive
     # with ASan), so this fires only when such a binary is detonated -- see compile_source_msan.
@@ -411,9 +448,14 @@ def parse_asan_report(text: str) -> Optional[dict]:
     ub = re.search(r"runtime error:\s*(.+)", t)
     if m and m.group(1) in _ASAN_NONBUG:
         m = None
-    if not m and not msan and not tsan and not lsan and not ub:
+    if not m and not msan and not tsan and not lsan and not ub and not bad_free:
         return None
-    if msan:
+    if bad_free:
+        bug = bad_free
+        cwe, sev = _ASAN_CWE[bug]
+        detail = (f"AddressSanitizer: {bug.replace('-', ' ')}" if bug != "bad-free"
+                  else "AddressSanitizer: free of an address that was never allocated")
+    elif msan:
         bug = "use-of-uninitialized-value"
         cwe, sev = ("CWE-457", "medium")
         detail = "MemorySanitizer: use of uninitialized value"
@@ -442,8 +484,7 @@ def parse_asan_report(text: str) -> Optional[dict]:
     # defect, so every UBSan fault in a campaign collapsed into one finding at one glibc line.
     src = _ubsan_site(t) if ub and not (m or msan or tsan or lsan) else None
     if src is None:
-        for fm in re.finditer(
-                r"#\d+ 0x[0-9a-f]+ in \S+ ([^\s:]+\.(?:c|cc|cpp|cxx|h|hpp)):(\d+)", t):
+        for fm in _ASAN_FRAME.finditer(t):
             if _is_runtime_frame(fm.group(1)):
                 continue                                 # the reporting machinery, not the bug
             src = f"{fm.group(1).split('/')[-1]}:{fm.group(2)}"
@@ -473,8 +514,12 @@ _ASAN_ACCESS = re.compile(r"\b(READ|WRITE) of size (\d+) at 0x([0-9a-f]+)")
 #: older releases wrote "to the right of"/"to the left of". Both are accepted because a parser
 #: that silently matches neither reports an overflow with no magnitude, which reads as if the
 #: tool looked and found nothing to say.
+#: A LIFETIME defect words it "is located 5 bytes inside of 128-byte region" -- with an `of` the
+#: overflow wording does not have. Without it, every use-after-free and double-free reported no
+#: distance and no region size **[measured]**, which are the two numbers the primitive verdict for
+#: that class turns on: WHICH field of the stale object is touched, and HOW BIG the freed chunk is.
 _ASAN_REGION = re.compile(
-    r"is located (\d+) bytes (after|before|inside|to the right of|to the left of)\s*"
+    r"is located (\d+) bytes (after|before|inside|to the right of|to the left of)(?: of)?\s*"
     r"(\d+)-byte region")
 _SIDE = {"after": "after", "to the right of": "after",
          "before": "before", "to the left of": "before", "inside": "inside"}
@@ -496,6 +541,10 @@ def _access_detail(t: str) -> dict:
         out["distance"] = int(r.group(1))
         out["side"] = _SIDE.get(r.group(2), r.group(2))
         out["region_size"] = int(r.group(3))
+    for key, header in (("freed_at", _ASAN_FREED_BY), ("allocated_at", _ASAN_ALLOCED_BY)):
+        site = _section_site(t, header)
+        if site:
+            out[key] = site
     return out
 
 

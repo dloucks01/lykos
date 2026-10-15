@@ -499,3 +499,143 @@ def oob_effect(prim: dict) -> str:
              if prim.get("confirmed") else
              "the distance did not move with the input in this run")
     return f"out-of-bounds write {where}: corrupts adjacent memory -- {reach}"
+
+
+#: LIFETIME defects: the object is dead, and the question is no longer "how far past the end".
+#: Split in two because the two halves are answerable by different evidence -- a USE-side defect
+#: has an access to describe (direction, width, where in the dead object it landed), a FREE-side
+#: defect has no access at all and is about the allocator's own bookkeeping.
+UAF_CLASSES = frozenset({
+    "heap-use-after-free", "use-after-poison", "stack-use-after-return",
+    "stack-use-after-scope",
+})
+FREE_CLASSES = frozenset({"double-free", "bad-free", "alloc-dealloc-mismatch"})
+LIFETIME_CLASSES = UAF_CLASSES | FREE_CLASSES
+
+
+def lifetime_primitive(observations: list) -> dict | None:
+    """What a use-after-free or a double free is worth as an exploitation primitive.
+
+    The out-of-bounds verdict asks "does the attacker choose how FAR past the end the access
+    goes". That question has no meaning here: a use-after-free's distance is an offset INSIDE a
+    freed region, and a double free has no access to measure at all. So this link said nothing
+    about either class -- `poc_primitive` reported "crash reproduced but no instruction-pointer /
+    memory primitive found" for every lifetime defect on every sanitizer build, which is the
+    same empty verdict an out-of-bounds read used to get.
+
+    Two different questions make a lifetime defect exploitable, and the report answers both:
+
+      * **which part of the dead object is touched** -- the offset inside the freed chunk. If it
+        tracks the input, the attacker picks WHICH FIELD of whatever reclaims the chunk is read
+        or written: a function pointer, a length, a reference count.
+      * **how big the dead chunk is** -- the region size. If that tracks the input, the attacker
+        picks the SIZE CLASS the dangling pointer lands in, which is the grooming step every
+        use-after-free exploit and every tcache-dup double free needs: you choose the size so
+        that an allocation you control reclaims the chunk.
+
+    Either one moving is a demonstration that the defect is PARAMETERISED rather than incidental,
+    and that is what `confirmed` means here. What it does NOT mean is that reuse was shown:
+    ASan quarantines a freed chunk precisely so the use is caught instead of succeeding, so no
+    reclaim happens under the build that produces this evidence. `lifetime_effect` says so.
+
+    `observations` is the same `(label, report)` list the out-of-bounds verdict takes.
+    Returns None when the observations do not describe one lifetime defect class.
+    """
+    seen = [(lbl, r) for lbl, r in observations
+            if isinstance(r, dict) and r.get("class") in LIFETIME_CLASSES]
+    if not seen:
+        return None
+    cls = seen[0][1]["class"]
+    access = seen[0][1].get("access")
+    # Mixing classes or directions means the variants provoked DIFFERENT defects, and averaging
+    # them would describe a bug that does not exist -- the same rule the out-of-bounds verdict
+    # follows, and for the same reason.
+    seen = [(lbl, r) for lbl, r in seen
+            if r["class"] == cls and r.get("access") == access]
+    if cls in UAF_CLASSES and not access:
+        return None                                      # a use with no access is not evidence
+    offsets = sorted({r["distance"] for _l, r in seen
+                      if r.get("distance") is not None and r.get("side") == "inside"})
+    sizes = sorted({r["region_size"] for _l, r in seen if r.get("region_size") is not None})
+    offset_controlled = len(offsets) > 1
+    size_controlled = len(sizes) > 1
+    confirmed = offset_controlled or size_controlled
+    kind = f"uaf-{access}" if cls in UAF_CLASSES else cls
+    first = seen[0][1]
+    return {
+        "type": ("controlled-" if confirmed else "") + kind,
+        "sanitizer_class": cls,
+        "lifetime": True,
+        "access": access,
+        "access_size": first.get("access_size"),
+        "region_size": sizes[-1] if sizes else first.get("region_size"),
+        "region_size_min": sizes[0] if sizes else None,
+        "region_size_max": sizes[-1] if sizes else None,
+        "region_offset": offsets[-1] if offsets else first.get("distance"),
+        "region_offset_min": offsets[0] if offsets else None,
+        "region_offset_max": offsets[-1] if offsets else None,
+        "offset_controlled": offset_controlled,
+        "size_controlled": size_controlled,
+        # The three places a lifetime defect lives. A report that names only the use tells the
+        # reader the one thing the stack trace already showed them.
+        "used_at": first.get("source"),
+        "freed_at": first.get("freed_at"),
+        "allocated_at": first.get("allocated_at"),
+        "observations": [{"variant": lbl, "region_offset": r.get("distance"),
+                          "region_size": r.get("region_size")} for lbl, r in seen],
+        "confirmed": confirmed,
+        "offset": None,                                  # not an INPUT offset; see region_offset
+    }
+
+
+#: What the experiment showed about control, stated as what it is and not as more than it is.
+def _lifetime_control(prim: dict) -> str:
+    if prim.get("offset_controlled") and prim.get("size_controlled"):
+        return ("both the offset inside the chunk and the chunk size track the input, so the "
+                "attacker chooses the size class that reclaims it AND which field is touched")
+    if prim.get("offset_controlled"):
+        return (f"the offset inside the chunk tracks the input "
+                f"({prim.get('region_offset_min')}..{prim.get('region_offset_max')}), so the "
+                f"attacker chooses which field of the reclaiming object is touched")
+    if prim.get("size_controlled"):
+        return (f"the chunk SIZE tracks the input "
+                f"({prim.get('region_size_min')}..{prim.get('region_size_max')} bytes), so the "
+                f"attacker chooses which size class the dangling pointer lands in -- the "
+                f"grooming step this class of defect needs")
+    return "neither the offset nor the chunk size moved with the input in this run"
+
+
+#: The quarantine is why this evidence exists AND why it stops where it does. Said in the effect
+#: text rather than left for the reader to know, because "controlled use-after-free write" reads
+#: like a completed overwrite if nobody says that nothing reclaimed the chunk.
+_QUARANTINE = ("ASan holds the freed chunk in quarantine, so nothing reclaimed it here: what is "
+               "shown is that the defect is attacker-parameterised, not a completed overwrite")
+
+
+def lifetime_effect(prim: dict) -> str:
+    """The demonstrable effect of a lifetime defect, stated without inflation."""
+    cls = prim.get("sanitizer_class")
+    size, off = prim.get("region_size"), prim.get("region_offset")
+    where = (f"at offset {off} inside a {size}-byte freed chunk"
+             if size is not None and off is not None else "inside a freed chunk")
+    sites = [f"{k} {prim[v]}" for k, v in (("used at", "used_at"), ("freed at", "freed_at"),
+                                           ("allocated at", "allocated_at")) if prim.get(v)]
+    trail = (" [" + ", ".join(sites) + "]") if sites else ""
+    if cls in UAF_CLASSES:
+        width = f"{prim.get('access_size')} bytes" if prim.get("access_size") else "memory"
+        if prim.get("access") == "write":
+            what = (f"use-after-free WRITE of {width} {where}: the write lands in memory the "
+                    f"allocator has released, corrupting whatever object reclaims the chunk")
+        else:
+            what = (f"use-after-free READ of {width} {where}: returns whatever now occupies "
+                    f"released memory -- a disclosure of the heap's current contents")
+    elif cls == "alloc-dealloc-mismatch":
+        what = (f"the {size}-byte chunk is released through the wrong deallocator: the allocator "
+                f"applies bookkeeping for a different kind of object")
+    elif cls == "bad-free":
+        what = ("an address the allocator never handed out is freed: the allocator applies its "
+                "bookkeeping to memory it does not own")
+    else:
+        what = (f"the same {size}-byte chunk is freed twice: the second free operates on the "
+                f"allocator's own free-list entry for a chunk it has already released")
+    return f"{what} -- {_lifetime_control(prim)}. {_QUARANTINE}{trail}"

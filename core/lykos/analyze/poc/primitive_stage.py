@@ -24,7 +24,25 @@ _PRIM_CWE = {"instruction-pointer-control": "CWE-787",
              "controlled-oob-read": "CWE-125",
              "oob-read": "CWE-125",
              "controlled-oob-write": "CWE-787",
-             "oob-write": "CWE-787"}
+             "oob-write": "CWE-787",
+             # A LIFETIME defect's weakness is the lifetime error itself, in both directions: a
+             # use-after-free READ is still CWE-416, because the defect is the use of released
+             # memory and not the disclosure it happens to produce. As above, control decides the
+             # LEVEL and not the weakness.
+             "controlled-uaf-read": "CWE-416",
+             "uaf-read": "CWE-416",
+             "controlled-uaf-write": "CWE-416",
+             "uaf-write": "CWE-416",
+             "controlled-double-free": "CWE-415",
+             "double-free": "CWE-415",
+             "controlled-bad-free": "CWE-590",
+             "bad-free": "CWE-590"}
+# `alloc-dealloc-mismatch` is deliberately absent: its CWE (762) is not in the memory-corruption
+# family this map is allowed to install, and it does not need to be. root_cause already labels
+# that class CWE-762 from the sanitizer's own report, so the verdict relabels the TITLE and keeps
+# the class it was given -- which is what `title_only` is for. Adding 762 here would have broken
+# the invariant that every replacement is itself a class the override outranks, so a second pass
+# over the same finding would flip the label back.
 # root_cause classes that are already a memory-corruption defect and so are kept as-is.
 # The one definition lives beside the finding vocabulary; a second copy here would drift.
 from ...db.models import OUTRANKS_PRIMITIVE_CWES as _MEM_CORRUPTION
@@ -137,7 +155,7 @@ def _own_code(addr, base, ranges) -> bool:
     return i >= 0 and a < ranges[i][1]
 
 
-#: How many input variants step 2b detonates. Each one is a full sandbox run, so this is a
+#: How many input variants steps 2b/2c detonate. Each one is a full sandbox run, so this is a
 #: budget, not a sample size: it buys the ONE bit the verdict turns on (does the distance move?).
 _OOB_VARIANTS = 10
 #: Byte deltas tried at a sampled offset. A length field that sets a read size usually responds
@@ -182,8 +200,12 @@ def _detonate_for_report(ctx, target, exe, mode, base_argv, data, timeout):
     return parse_asan_report((res.stderr or b"").decode("utf-8", "replace"))
 
 
-def _oob_variants(orig: bytes, pre: bytes, post: bytes):
-    """`(label, bytes)` inputs that probe whether the out-of-bounds distance is ours to choose.
+def _probe_variants(orig: bytes, pre: bytes, post: bytes):
+    """`(label, bytes)` inputs that probe whether the reach of the defect is ours to choose.
+
+    Shared by the out-of-bounds verdict (does the DISTANCE past the end move?) and the lifetime
+    verdict (does the OFFSET inside the freed chunk, or its SIZE, move?). The families below are
+    about how an input sets a number, which is the same question in both cases.
 
     Two families, because two shapes of input set the reach two different ways:
       * the filler run -- an unstructured overflow reads/writes as far as the run is long, so
@@ -224,7 +246,7 @@ def _oob_primitive(ctx, target, exe, mode, base_argv, orig, pre, post, timeout):
     ctx.progress(msg=f"{first['class']} ({first.get('access')}): varying the input to see "
                      f"whether the out-of-bounds distance is attacker-controlled")
     obs = [("orig", first)]
-    for label, data in _oob_variants(orig, pre, post)[1:]:
+    for label, data in _probe_variants(orig, pre, post)[1:]:
         rep = _detonate_for_report(ctx, target, exe, mode, base_argv, data, timeout)
         if rep:
             obs.append((label, rep))
@@ -234,6 +256,40 @@ def _oob_primitive(ctx, target, exe, mode, base_argv, orig, pre, post, timeout):
             "class": prim["sanitizer_class"], "access": prim["access"],
             "distance_min": prim["distance_min"], "distance_max": prim["distance_max"],
             "region_size": prim["region_size"], "controlled": prim["confirmed"],
+            "variants_detonated": len(obs), "observations": prim["observations"][:10]})
+    return prim
+
+
+def _lifetime_primitive(ctx, target, exe, mode, base_argv, orig, pre, post, timeout):
+    """Step 2c: the lifetime-defect verdict (use-after-free, double free), or None.
+
+    Same experiment as step 2b, different question. The out-of-bounds verdict asks how far past
+    the end of an object the access reached; for a dead object that has no meaning. What decides
+    whether a lifetime defect is a primitive is whether the attacker chooses WHICH PART of the
+    stale chunk is touched and HOW BIG the chunk is -- see `primitive.lifetime_primitive`.
+    """
+    first = _detonate_for_report(ctx, target, exe, mode, base_argv, orig, timeout)
+    if not first or first.get("class") not in primitive.LIFETIME_CLASSES:
+        return None
+    ctx.progress(msg=f"{first['class']}: varying the input to see whether the offset inside the "
+                     f"freed chunk, or its size, is attacker-controlled")
+    obs = [("orig", first)]
+    for label, data in _probe_variants(orig, pre, post)[1:]:
+        rep = _detonate_for_report(ctx, target, exe, mode, base_argv, data, timeout)
+        if rep:
+            obs.append((label, rep))
+    prim = primitive.lifetime_primitive(obs)
+    if prim is not None:
+        ctx.emit("primitive.lifetime", payload={
+            "class": prim["sanitizer_class"], "access": prim.get("access"),
+            "region_offset_min": prim.get("region_offset_min"),
+            "region_offset_max": prim.get("region_offset_max"),
+            "region_size_min": prim.get("region_size_min"),
+            "region_size_max": prim.get("region_size_max"),
+            "offset_controlled": prim["offset_controlled"],
+            "size_controlled": prim["size_controlled"],
+            "controlled": prim["confirmed"], "used_at": prim.get("used_at"),
+            "freed_at": prim.get("freed_at"), "allocated_at": prim.get("allocated_at"),
             "variants_detonated": len(obs), "observations": prim["observations"][:10]})
     return prim
 
@@ -504,6 +560,19 @@ def primitive_stage(ctx) -> dict:
                 return _finalize(ctx, target, target_bytes, mode, base_argv, cap0, control,
                                  prim, bool(prim.get("confirmed")), extra)
 
+            # 2c) the same reasoning, one bug class further on. A use-after-free and a double
+            # free are the two defects this link had NO verdict for -- the distance experiment
+            # does not apply to a dead object -- so both got "crash reproduced but no
+            # instruction-pointer / memory primitive found" on every sanitizer build.
+            prim = _lifetime_primitive(ctx, target, exe, mode, base_argv, orig, _pre, _post,
+                                       timeout)
+            if prim is not None:
+                control = frame(orig[len(_pre):len(orig) - len(_post)] if (_pre or _post)
+                                else orig)
+                extra = primitive.lifetime_effect(prim)
+                return _finalize(ctx, target, target_bytes, mode, base_argv, cap0, control,
+                                 prim, bool(prim.get("confirmed")), extra)
+
         # 3) crash reproduced but no controllable primitive found
         ctx.emit("primitive.done", payload={
             "primitive": ("register-control" if regs else None), "supported": True,
@@ -550,7 +619,26 @@ def _finalize(ctx, target, target_bytes, mode, base_argv, cap0, control, prim, c
                 "oob-read": ("info-disclosure", "Information disclosure (out-of-bounds read)"),
                 "controlled-oob-write": ("memory-corruption",
                                          "Memory corruption (out-of-bounds write)"),
-                "oob-write": ("memory-corruption", "Memory corruption (out-of-bounds write)")}
+                "oob-write": ("memory-corruption", "Memory corruption (out-of-bounds write)"),
+                "controlled-uaf-read": ("info-disclosure",
+                                        "Information disclosure (use-after-free read)"),
+                "uaf-read": ("info-disclosure",
+                             "Information disclosure (use-after-free read)"),
+                "controlled-uaf-write": ("memory-corruption",
+                                         "Memory corruption (use-after-free write)"),
+                "uaf-write": ("memory-corruption", "Memory corruption (use-after-free write)"),
+                "controlled-double-free": ("memory-corruption",
+                                           "Memory corruption (allocator state, double free)"),
+                "double-free": ("memory-corruption",
+                                "Memory corruption (allocator state, double free)"),
+                "controlled-bad-free": ("memory-corruption",
+                                        "Memory corruption (free of a foreign address)"),
+                "bad-free": ("memory-corruption",
+                             "Memory corruption (free of a foreign address)"),
+                "controlled-alloc-dealloc-mismatch": (
+                    "memory-corruption", "Memory corruption (allocator mismatch)"),
+                "alloc-dealloc-mismatch": ("memory-corruption",
+                                           "Memory corruption (allocator mismatch)")}
         _kind_title = _EFF.get(prim.get("type"))
         # Key on the ORIGINAL crash's faulting address (as root_cause does), NOT this capture's,
         # so the primitive finding merges into the crash finding instead of forking a duplicate:

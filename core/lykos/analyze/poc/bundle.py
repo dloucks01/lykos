@@ -147,6 +147,53 @@ def _primitive_txt(prim: dict) -> bytes:
     # is a jump. Printing "Control offset: None / Sentinel: 0x0" under an L2 heading would be the
     # same defect the comment above describes, one class further on, so it gets its own template
     # stating the magnitude the sanitizer measured and the experiment that bounded it.
+    if prim.get("lifetime"):
+        # A LIFETIME defect: the object is dead, so there is no distance past its end and, for a
+        # double free, no access at all. Printing the out-of-bounds template here would state a
+        # magnitude about the wrong thing -- the same defect this file's comments describe twice
+        # already, one bug class further on.
+        controlled = bool(prim.get("confirmed"))
+        cls = prim.get("sanitizer_class")
+        lines = [
+            ("L2 exploitation primitive" if controlled else "L1 lifetime defect"),
+            "=" * (25 if controlled else 18),
+            f"Primitive: {prim.get('type')}",
+            f"Sanitizer class: {cls}",
+        ]
+        if prim.get("access"):
+            lines.append(f"Access: {str(prim.get('access')).upper()} of size "
+                         f"{prim.get('access_size')}")
+        lines += [
+            f"Freed chunk: {prim.get('region_size_min')}..{prim.get('region_size_max')} bytes "
+            f"(attacker-controlled size: {bool(prim.get('size_controlled'))})",
+            f"Offset inside the chunk: {prim.get('region_offset_min')}.."
+            f"{prim.get('region_offset_max')} "
+            f"(attacker-controlled offset: {bool(prim.get('offset_controlled'))})",
+            "",
+            "The three places this defect lives:",
+            f"  used at      {prim.get('used_at') or '(not symbolized)'}",
+            f"  freed at     {prim.get('freed_at') or '(not symbolized)'}",
+            f"  allocated at {prim.get('allocated_at') or '(not symbolized)'}",
+            "",
+            "What this does NOT claim: ASan holds a freed chunk in quarantine, which is how the",
+            "use is caught at all -- so nothing reclaimed the chunk during these runs and no",
+            "overwrite of a live object was demonstrated. What the variants below show is that",
+            "the defect is attacker-PARAMETERISED: the offset, or the size class, follows the",
+            "input. On a build without the sanitizer the same chunk is reusable.",
+            "",
+        ]
+        if prim.get("observations"):
+            lines.append("Input variants detonated (this is the evidence for the lines above):")
+            for o in prim["observations"][:10]:
+                lines.append(f"  {str(o.get('variant'))[:28]:28s} -> offset "
+                             f"{o.get('region_offset')} in {o.get('region_size')} bytes")
+            if not controlled:
+                lines += ["",
+                          "Every variant touched the same offset in a chunk of the same size, so",
+                          "neither is shown to be the attacker's to pick. The defect reproduces;",
+                          "the degree of control over it is unproven, and is reported so."]
+            lines.append("")
+        return ("\n".join(lines)).encode()
     if prim.get("sanitizer_class"):
         controlled = bool(prim.get("confirmed"))
         lines = [
@@ -352,7 +399,16 @@ def build(target_bytes: bytes, input_bytes: bytes, meta: dict, stderr: bytes,
         extra_files.setdefault("replay_prompt.py", _PROMPT_REPLAY)
     script = extra_files and "exploit.py" in extra_files
     prim_line = ""
-    if sanitizer:
+    if sanitizer and (primitive or {}).get("lifetime"):
+        # A dead object has no "distance past the end": what the experiment bounded is WHERE in
+        # the freed chunk the access landed and HOW BIG the chunk was.
+        prim_line = (f"\nPrimitive: {primitive.get('type')} -- offset "
+                     f"{primitive.get('region_offset_min')}..{primitive.get('region_offset_max')}"
+                     f" inside a {primitive.get('region_size_min')}.."
+                     f"{primitive.get('region_size_max')}-byte freed chunk "
+                     f"(attacker-controlled offset={primitive.get('offset_controlled')}, "
+                     f"size={primitive.get('size_controlled')}). See PRIMITIVE.txt.\n")
+    elif sanitizer:
         prim_line = (f"\nPrimitive: {primitive.get('type')} -- "
                      f"{primitive.get('distance_min')}..{primitive.get('distance_max')} bytes "
                      f"{primitive.get('side') or 'past'} a {primitive.get('region_size')}-byte "
