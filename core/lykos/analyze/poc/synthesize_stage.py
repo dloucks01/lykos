@@ -29,6 +29,9 @@ SYNTH_STAGE = "synthesize_poc"
 TOOL = "synth"
 TOOL_VERSION = "synth-1"
 
+from ..invocation import staged_name as _staged_name
+
+
 def _deliver(mode, payload, argv_base, ctx):
     if mode == "stdin":
         return list(argv_base), payload
@@ -66,7 +69,9 @@ def synthesize_stage(ctx) -> dict:
     timeout = float(p.get("timeout", 8))
 
     target_bytes = ctx.content.path(target.sha256).read_bytes()
-    exe = ctx.scratch() / "target.bin"
+    # Staged under the name the image dispatches on (busybox and any other multi-call
+    # binary refuse every input as `target.bin`): see invocation.staged_name.
+    exe = ctx.scratch() / _staged_name(ctx, target)
     ctx.content.stage_target(target, exe.parent, exe.name)
     os.chmod(exe, 0o755)
     if not argv_base:

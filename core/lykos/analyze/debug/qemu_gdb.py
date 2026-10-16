@@ -85,10 +85,13 @@ _ARG_REGS = {
     "loongarch": [f"r{i}" for i in range(4, 12)],     # a0-a7
     "sparcv9": [f"o{i}" for i in range(6)],           # caller side; the callee sees i0-i5
     "sh": [f"r{i}" for i in range(4, 8)],             # SuperH passes r4-r7
+    # Alpha names its registers symbolically in the stub's own description, so these are the
+    # names it answers with: a0-a5 are the six integer argument registers, $26 is `ra`.
+    "alpha": [f"a{i}" for i in range(6)],
 }
 _BP_KIND = {"arm": 4, "aarch64": 4, "mips": 4, "ppc": 4, "ppc64": 4,
             "riscv": 4, "riscv64": 4, "s390": 2,     # software-breakpoint length hint
-            "loongarch": 4, "sparcv9": 4, "m68k": 2, "sh": 2, "x86": 1}
+            "loongarch": 4, "sparcv9": 4, "m68k": 2, "sh": 2, "x86": 1, "alpha": 4}
 
 # ---------------------------------------------------------------- derived layouts
 # Every _LAYOUTS entry above is hand-written, which is how the register order gets subtly
@@ -119,6 +122,13 @@ _STUB_ABI = {
     "m68k": {"sp": "sp", "pc": "pc"},                 # SysV m68k passes arguments on the stack
     "sparcv9": {"sp": "sp", "pc": "pc"},              # sp is o6; caller args o0-o5
     "x86": {"sp": "esp", "pc": "eip"},                # cdecl passes arguments on the stack
+    # Alpha, VERIFIED against a live qemu-alpha stub on 2026-10-16: it serves a description of
+    # 66 registers naming them symbolically -- v0, t0-t7, s0-s5, fp, a0-a5, t8-t12, ra, at, gp,
+    # sp, zero, f0-f30, fpcr, pc, unique -- so `sp` and `pc` are exactly those names and the
+    # layout needs no hand-written table. This is what `archgate`'s alpha row was waiting for;
+    # qemu-hppa, probed the same way, serves NO description at all (0 registers), so PA-RISC
+    # still needs a transcribed layout and stays at L1 with that reason recorded.
+    "alpha": {"sp": "sp", "pc": "pc"},
 }
 _DERIVED: dict = {}                                   # arch -> layout, fetched once per process
 _REG_RE = re.compile(r'<reg\s+name="([^"]+)"[^>]*?bitsize="(\d+)"')

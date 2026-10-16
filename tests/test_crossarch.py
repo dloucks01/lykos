@@ -320,3 +320,23 @@ def test_a_decline_survives_the_window_the_scorecard_stores_it_in():
             if full != cut or cut == "unknown":
                 bad.append(f"{arch}/{stage}: full={full} truncated={cut}: {why[:70]}")
     assert not bad, "a decline's classification changes when it is truncated:\n" + "\n".join(bad)
+
+
+def test_alpha_is_derivable_and_hppa_is_not():
+    """Both were PROBED against a live stub on 2026-10-16, which is the only way to know.
+
+    `qemu-alpha` serves a target description of 66 registers, naming them symbolically -- v0,
+    t0-t7, s0-s5, fp, a0-a5, t8-t12, ra, at, gp, sp, zero, f0-f30, fpcr, pc, unique -- so `sp`
+    and `pc` are those exact names and the layout needs no hand-written table. `qemu-hppa`,
+    probed the same way with the same code, answers with NO description at all (0 registers),
+    like qemu-sh4: PA-RISC would need its layout transcribed from qemu's source and verified
+    against a live g-packet, so it stays at L1 with that recorded as the reason.
+
+    This is the pair the archgate rows for the two arches rest on; asserting the ISA manual
+    instead would be asserting a guess.
+    """
+    from lykos.analyze.debug import qemu_gdb as qg
+    assert qg.supported("alpha") and "alpha" not in qg._LAYOUTS
+    assert qg._sp_name("alpha") == "sp" and qg._pc_name("alpha") == "pc"
+    assert qg._ARG_REGS["alpha"][0] == "a0", "the stub names them a0-a5, not r16-r21"
+    assert not qg.supported("hppa"), "qemu-hppa serves no target description to derive from"

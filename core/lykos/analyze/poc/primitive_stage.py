@@ -107,6 +107,9 @@ TOOL_VERSION = "primitive-1"
 _MIN_FILLER_RUN = 16
 
 
+from ..invocation import staged_name as _staged_name
+
+
 def _overflow_frame(orig: bytes):
     """(prefix, suffix) around the longest single-byte run in the crashing input -- the filler that
     smashes the frame.
@@ -717,7 +720,9 @@ def primitive_stage(ctx) -> dict:
 
     orig = ctx.content.get_bytes(input_sha)
     target_bytes = ctx.content.path(target.sha256).read_bytes()
-    exe = ctx.scratch() / "target.bin"
+    # Staged under the name the image dispatches on (busybox and any other multi-call
+    # binary refuse every input as `target.bin`): see invocation.staged_name.
+    exe = ctx.scratch() / _staged_name(ctx, target)
     ctx.content.stage_target(target, exe.parent, exe.name)
     exe.chmod(0o755)
 

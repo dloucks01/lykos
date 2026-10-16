@@ -566,6 +566,23 @@ def exec_name_for(data: bytes) -> str:
         else ""
 
 
+def staged_name(ctx, target) -> str:
+    """The filename to stage this target under: the one it dispatches on, or "target.bin".
+
+    Every stage stages the target itself, under a hardcoded name, and for a multi-call image
+    that name decides whether the program runs at all. Measured: the `fuzz` stage found 8
+    reproducible SIGSEGVs in busybox's lzma decoder through the `lzcat` door, and `root_cause`
+    -- staging the same bytes as `target.bin` -- reported "input did not fault under the
+    debugger via any of stdin, file, arg", because busybox answered "applet not found" to all
+    three. The crash was real, reproducible and filed as a generic CWE-119 because the stage
+    that names the defect could not reach it.
+    """
+    try:
+        return exec_name_for(ctx.content.path(target.sha256).read_bytes()) or "target.bin"
+    except Exception:                                   # noqa: BLE001 -- never block staging
+        return "target.bin"
+
+
 def is_multicall(help_text: str) -> bool:
     """Does this text say the program is a multi-call binary?
 

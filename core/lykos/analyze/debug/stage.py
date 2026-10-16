@@ -28,6 +28,9 @@ TOOL = "rootcause"
 TOOL_VERSION = "rootcause-1"
 
 
+from ..invocation import staged_name as _staged_name
+
+
 def _hex(v):
     """Addresses reach the finding table as hex strings; the slice carries them as ints."""
     return None if v is None else (v if isinstance(v, str) else hex(v))
@@ -138,7 +141,9 @@ def _root_cause_managed(ctx, target, input_sha, base_argv, mode, timeout, runtim
     from ..runtime_fault import managed_fault
     rt = _managed_runtime(runtime)
     input_bytes = ctx.content.get_bytes(input_sha)
-    exe = ctx.scratch() / "target.bin"
+    # Staged under the name the image dispatches on (busybox and any other multi-call
+    # binary refuse every input as `target.bin`): see invocation.staged_name.
+    exe = ctx.scratch() / _staged_name(ctx, target)
     ctx.content.stage_target(target, exe.parent, exe.name)
     wf = ctx.scratch() / "input.bin"
     wf.write_bytes(input_bytes)
@@ -282,7 +287,9 @@ def root_cause_stage(ctx) -> dict:
 
     input_bytes = ctx.content.get_bytes(input_sha)
     target_bytes = ctx.content.path(target.sha256).read_bytes()
-    exe = ctx.scratch() / "target.bin"
+    # Staged under the name the image dispatches on (busybox and any other multi-call
+    # binary refuse every input as `target.bin`): see invocation.staged_name.
+    exe = ctx.scratch() / _staged_name(ctx, target)
     ctx.content.stage_target(target, exe.parent, exe.name)
     exe.chmod(0o755)
 

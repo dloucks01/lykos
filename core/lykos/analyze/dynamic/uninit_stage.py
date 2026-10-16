@@ -66,6 +66,9 @@ _TITLES = {
 }
 
 
+from ..invocation import staged_name as _staged_name
+
+
 def _decline(ctx, note: str) -> dict:
     ctx.emit("memoracle.done", payload={"supported": False, "note": note})
     ctx.progress(pct=100, msg=note[:90])
@@ -109,7 +112,9 @@ def mem_oracle_stage(ctx) -> dict:
                              "observed on this host -- nothing was checked, which is not the "
                              "same as nothing found")
 
-    exe = ctx.scratch() / "target.bin"
+    # Staged under the name the image dispatches on (busybox and any other multi-call
+    # binary refuse every input as `target.bin`): see invocation.staged_name.
+    exe = ctx.scratch() / _staged_name(ctx, target)
     ctx.content.stage_target(target, exe.parent, exe.name)
 
     shas = [p["input_sha"]] if p.get("input_sha") else _probe_inputs(ctx.conn, target)

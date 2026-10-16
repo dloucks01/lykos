@@ -63,6 +63,9 @@ _SIG_CWE = {
 _SIGNAL_ONLY_BUCKET = frozenset({"SIGABRT"})
 
 
+from ..invocation import staged_name as _staged_name
+
+
 def asan_defect_key(stderr) -> str | None:
     """A stable per-defect discriminator for a SANITIZER SIGABRT: the ASan/UBSan class + source
     basename (e.g. "heap-use-after-free@parser.c:88"). Returns None for a plain glibc abort with no
@@ -288,7 +291,9 @@ def dynamic_stage(ctx) -> dict:
         if var:
             env_overrides = {var: input_bytes.decode("latin-1")}
 
-    exe = ctx.scratch() / "target.bin"
+    # Staged under the name the image dispatches on (busybox and any other multi-call
+    # binary refuse every input as `target.bin`): see invocation.staged_name.
+    exe = ctx.scratch() / _staged_name(ctx, target)
     ctx.content.stage_target(target, exe.parent, exe.name)
     os.chmod(exe, 0o755)
 
