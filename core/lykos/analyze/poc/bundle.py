@@ -1,6 +1,7 @@
 """Self-contained PoC bundle builder (a .tar.gz an analyst can run offline)."""
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import shlex
@@ -37,12 +38,26 @@ def _argv_text(argv, *, carrier=None) -> str:
 
 def _runner(mode: str, argv, signal_name: str, run_cmd=None, runtime: str = "native",
             main_class: str | None = None, sanitizer: str = "", retries: int = 0,
-            marker: str = "") -> bytes:
+            marker: str = "", guard_page: str = "") -> bytes:
     argv = list(argv or [])
     placed = INPUT_PLACEHOLDER in [str(a) for a in argv]
     # A jar is not executable and the JVM is not the target: `./target.bin` is a zip file, and
     # the reproducer has to name the runtime that reads it.
     exe, setup = "./target.bin", "chmod +x ./target.bin\n"
+    if guard_page:
+        # THE DEFECT IS SILENT WITHOUT THIS. The crash was found with a guard-page allocator
+        # preloaded (AFL++'s libdislocator): every allocation sits at the end of its own page
+        # with an unmapped page behind it, so a heap out-of-bounds read or a use-after-free
+        # faults instead of quietly reading the next chunk. Replay it unguarded and the program
+        # exits 0, which reads as "the PoC does not work" when the defect is simply invisible.
+        # The library is part of AFL++ and is NOT shipped here (it is not ours to redistribute),
+        # so the runner looks for it and says plainly what is missing when it is absent.
+        setup += (f'GUARD="${{LYKOS_GUARD_PAGE:-{guard_page}}}"\n'
+                  'if [ -f "$GUARD" ]; then LD_PRELOAD="$GUARD"; export LD_PRELOAD;\n'
+                  'else echo "WARNING: guard-page allocator not found at $GUARD -- this defect'
+                  ' is a heap error that does NOT fault on its own." >&2;\n'
+                  '  echo "Install AFL++ (libdislocator.so) and set LYKOS_GUARD_PAGE to its'
+                  ' path." >&2; fi\n')
     if sanitizer:
         # A sanitizer build does not die on a signal by DEFAULT: ASan prints its report and calls
         # _exit(1). The capture and the fuzzers set `abort_on_error=1` so the fault is a SIGABRT,
@@ -591,7 +606,8 @@ sys.stderr.write("server exited %d without a fatal signal\n" % rc); sys.exit(1)
 def build(target_bytes: bytes, input_bytes: bytes, meta: dict, stderr: bytes,
           mode: str, argv, signal_name: str, primitive: dict | None = None,
           extra_files: dict | None = None, run_cmd: str | None = None,
-          runtime: str = "native", main_class: str | None = None) -> bytes:
+          runtime: str = "native", main_class: str | None = None,
+          guard_page: str = "") -> bytes:
     # A sanitizer-reported fault needs a different reproducer and a different success criterion
     # from a signal; the primitive is the only thing that knows which this is.
     sanitizer = str((primitive or {}).get("sanitizer_class") or "")
@@ -708,10 +724,25 @@ def build(target_bytes: bytes, input_bytes: bytes, meta: dict, stderr: bytes,
         _race = (primitive or {}).get("race")
         _add(tar, "poc/runner.sh",
              _runner(mode, argv, signal_name, run_cmd, runtime, main_class,
-                     sanitizer=sanitizer,
+                     sanitizer=sanitizer, guard_page=guard_page,
                      retries=int((primitive or {}).get("retries") or 0) if _race else 0,
                      marker=_race_marker(primitive) if _race else ""), mode=0o755)
-        _add(tar, "poc/meta.json", json.dumps(meta, indent=2, sort_keys=True).encode())
+        # LABEL THE BINARY THIS BUNDLE ACTUALLY SHIPS. `meta["target_sha256"]` is written by the
+        # caller and names the INGESTED target, which is no longer always the binary exploited:
+        # for a source drop the ingested target is the ASan+UBSan build and the chain is built
+        # against the uninstrumented twin (see ingest.compile_source_plain), whose addresses --
+        # and therefore every offset in this bundle -- are different. A reader cannot be left to
+        # infer which one the numbers belong to, so record the shipped binary's own hash and say
+        # when it differs.
+        _m = dict(meta)
+        _shipped = hashlib.sha256(target_bytes).hexdigest()
+        _m["exploited_sha256"] = _shipped
+        if _m.get("target_sha256") and _m["target_sha256"] != _shipped:
+            _m["exploited_build"] = ("not the ingested image: this bundle's target.bin is an "
+                                     "uninstrumented build of the same program, which is where "
+                                     "the defect is exploitable -- the instrumented build aborts "
+                                     "inside it. All offsets here are against target.bin")
+        _add(tar, "poc/meta.json", json.dumps(_m, indent=2, sort_keys=True).encode())
         _add(tar, "poc/stderr.txt", stderr or b"")
         if primitive:
             _add(tar, "poc/PRIMITIVE.txt", _primitive_txt(primitive))
@@ -831,6 +862,21 @@ def build_secret(target_bytes: bytes, secrets: list, meta: dict) -> bytes:
              (b'#!/bin/sh\n# Re-extract the embedded secret(s). Reads the file only; does not '
               b'execute it.\ncd "$(dirname "$0")"\npython3 ./extract.py ./target.bin\n'),
              mode=0o755)
-        _add(tar, "poc/meta.json", json.dumps(meta, indent=2, sort_keys=True).encode())
+        # LABEL THE BINARY THIS BUNDLE ACTUALLY SHIPS. `meta["target_sha256"]` is written by the
+        # caller and names the INGESTED target, which is no longer always the binary exploited:
+        # for a source drop the ingested target is the ASan+UBSan build and the chain is built
+        # against the uninstrumented twin (see ingest.compile_source_plain), whose addresses --
+        # and therefore every offset in this bundle -- are different. A reader cannot be left to
+        # infer which one the numbers belong to, so record the shipped binary's own hash and say
+        # when it differs.
+        _m = dict(meta)
+        _shipped = hashlib.sha256(target_bytes).hexdigest()
+        _m["exploited_sha256"] = _shipped
+        if _m.get("target_sha256") and _m["target_sha256"] != _shipped:
+            _m["exploited_build"] = ("not the ingested image: this bundle's target.bin is an "
+                                     "uninstrumented build of the same program, which is where "
+                                     "the defect is exploitable -- the instrumented build aborts "
+                                     "inside it. All offsets here are against target.bin")
+        _add(tar, "poc/meta.json", json.dumps(_m, indent=2, sort_keys=True).encode())
         _add(tar, "poc/README.txt", _secret_readme(meta, secrets))
     return buf.getvalue()

@@ -147,3 +147,29 @@ def test_build_poc_forwards_endianness_and_bits(store, case, pool, monkeypatch, 
 
     assert seen.get("endianness") == "little", "build_poc dropped endianness"
     assert seen.get("bits") == 64, "build_poc dropped bits"
+
+
+def _member(data: bytes, name: str) -> bytes:
+    with tarfile.open(fileobj=io.BytesIO(data)) as tar:
+        return tar.extractfile(name).read()
+
+
+def test_a_guard_page_bundle_carries_the_preload_and_says_why():
+    """A crash found under the guard-page allocator is SILENT without one.
+
+    The project's rule is that a verified PoC reproduces, so the preload has to travel with the
+    crash. The library belongs to AFL++ and is not ours to redistribute, so the runner looks for
+    it and -- this is the part that matters -- says plainly that the defect does not fault on its
+    own when it is missing, instead of exiting 0 and reading as a broken reproducer.
+    """
+    data = bundle.build(b"\x7fELFbin", b"AAAA", {"target_sha256": "abc", "arch": "x86-64"},
+                        b"", "stdin", [], "SIGSEGV",
+                        guard_page="/usr/lib/afl/libdislocator.so")
+    sh = _member(data, "poc/runner.sh").decode()
+    assert "libdislocator.so" in sh and "LD_PRELOAD" in sh
+    assert "LYKOS_GUARD_PAGE" in sh, "the operator can point it at their own copy"
+    assert "does NOT fault on its own" in sh
+    # and a bundle for an ordinary crash says nothing about any of it
+    plain = bundle.build(b"\x7fELFbin", b"AAAA", {"target_sha256": "abc", "arch": "x86-64"},
+                         b"", "stdin", [], "SIGSEGV")
+    assert "LD_PRELOAD" not in _member(plain, "poc/runner.sh").decode()

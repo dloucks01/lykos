@@ -7,7 +7,11 @@ import os
 from ...db.dao import DynResultDAO, FindingDAO, PocDAO, TargetDAO
 from ...jobs.registry import register_stage
 from ..dynamic import sandbox
-from ..dynamic.stage import crash_dedup_key, crash_finding_candidate, crash_hijack
+from ..dynamic.stage import (
+    crash_dedup_key,
+    crash_finding_candidate,
+    crash_key_parts,
+)
 from ..fuzz.runner import place
 from . import bundle
 from .capture import MODES, env_var_from_argv, how_to_feed, replay_exe_for
@@ -132,7 +136,14 @@ def build_poc_stage(ctx) -> dict:
         wf.write_bytes(input_bytes)
         return place(argv, str(wf)), b"", None
 
-    ctx.progress(msg="verifying PoC in a clean sandbox")
+    # Was this crash found under the GUARD-PAGE allocator? Then it is silent without one, and
+    # the verification has to re-run it the same way -- the same reason the prompted and socket
+    # branches above read the isolation tag rather than guessing. A heap out-of-bounds read in a
+    # stripped binary faults only because every allocation sits against an unmapped page; replay
+    # it unguarded and a genuinely confirmed crash is filed as an unverified L0.
+    _guard = sandbox.GUARD_PAGE_TAG in (_dyn_isolation(ctx.conn, target, input_sha) or "")
+    ctx.progress(msg="verifying PoC in a clean sandbox"
+                     + (" (guard-page allocator, as it was found)" if _guard else ""))
     # endianness/bits are load-bearing, not decoration: _qemu_for routes ppc64->ppc64le,
     # mips->mipsel and riscv->riscv32/64 on them. Omitting them hands a little-endian target
     # to the big-endian emulator, which cannot run it -- so the PoC "fails to reproduce" and
@@ -181,7 +192,7 @@ def build_poc_stage(ctx) -> dict:
             run_argv, stdin, run_env = _delivery(m)
             res = sandbox.run(exe, argv=run_argv, stdin=stdin, timeout=timeout,
                               arch=target.arch, endianness=target.endianness, bits=target.bits,
-                              env_overrides=run_env)
+                              env_overrides=run_env, guard_page=_guard)
             tried.append(m if not pre else f"{m}+{' '.join(pre)}")
             # A SANITIZER FAULT IS A REPRODUCTION, so the sweep has to stop on it. This loop
             # broke only on `res.crashed` -- "was it killed by a signal" -- and a libFuzzer
@@ -251,9 +262,17 @@ def build_poc_stage(ctx) -> dict:
     # baking it in produced `-c /tmp/lykos-<gone>/input.bin ... ./input.bin`: the reproducer
     # opens a missing file, throws NoSuchFileException, and demonstrates nothing. The bundle
     # places `./input.bin` itself.
+    # A crash found under the guard-page allocator travels WITH it: the bundle's runner.sh
+    # exports the preload and says, when the library is absent on the replaying machine, that
+    # this defect is a heap error which does not fault on its own. Shipping it silently would
+    # hand someone a reproducer that exits 0.
+    _guard_lib = ""
+    if _guard:
+        from ..dynamic import memoracle
+        _guard_lib = str(memoracle.dislocator_lib() or "")
     data = bundle.build(target_bytes, input_bytes, meta, res.stderr, mode, argv,
                         res.signal_name or "unknown", runtime=runtime,
-                        main_class=main_class)
+                        main_class=main_class, guard_page=_guard_lib)
     bundle_sha = ctx.put_artifact("poc-bundle", data=data,
                                   meta={"verified": verified, "level": level})
 
@@ -265,14 +284,17 @@ def build_poc_stage(ctx) -> dict:
         fd = FindingDAO(ctx.conn)
         # the SAME key the run that found this input filed it under, or a verified PoC opens a
         # second finding beside the crash it just proved instead of promoting it
-        fault_pc = DynResultDAO(ctx.conn).fault_pc_for(target.id, input_sha)
-        hj = crash_hijack(ctx.conn, target.id, fault_pc)
+        # "the SAME key" includes the DISCRIMINATOR. Without it a sanitizer abort was filed and
+        # looked up under `SIGABRT` while the fuzz stage had filed it under
+        # `SIGABRT:<class>@<file>:<line>` -- so this did the very thing the comment above warns
+        # against, and did it to every sanitizer-reported defect. See `crash_key_parts`.
+        fault_pc, disc, hj = crash_key_parts(ctx.conn, target.id, input_sha)
         fd.upsert(target.id, target.case_id, crash_finding_candidate(
             res.signal_name, input_sha, res.isolation, "poc", "(PoC verified)",
             state="poc-backed", confidence=0.95, bundle_sha=bundle_sha,
-            fault_pc=fault_pc, hijack=hj, file_type=target.file_type))
+            fault_pc=fault_pc, discriminator=disc, hijack=hj, file_type=target.file_type))
         fid = fd.id_for_dedup(
-            target.id, crash_dedup_key(res.signal_name, fault_pc, hijack=hj))
+            target.id, crash_dedup_key(res.signal_name, fault_pc, disc, hijack=hj))
         if fid:
             PocDAO(ctx.conn).set_finding(poc_id, fid)
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import platform
 import re
@@ -25,6 +26,10 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
+
+from ... import observe
+
+_log = logging.getLogger(__name__)
 
 # Cap on captured child output. communicate() buffered the child's ENTIRE stdout/stderr, so a
 # flooding target could OOM the worker; beyond this the reader keeps draining but discards.
@@ -157,7 +162,7 @@ def protect_dir(path) -> None:
         if path:
             _EXTRA_PROTECTED.add(str(Path(path).resolve()))
     except Exception:
-        pass
+        observe.absorbed(_log, "continuing")
 
 
 def _secret_mask_args() -> list:
@@ -267,7 +272,7 @@ def _batch_runner_path() -> str:
 
 def run_batch(exe, payloads, *, mode="stdin", base_argv=(), timeout: float = 2.0,
               arch=None, endianness=None, bits=None, host=None, mem_mb: int = 2048,
-              blocks=()):
+              blocks=(), guard_page: bool = False):
     """Execute many inputs inside ONE sandbox. Returns a list of RunResult, or None.
 
     `blocks` are image-relative basic-block addresses to watch; each result then carries the
@@ -309,11 +314,22 @@ def run_batch(exe, payloads, *, mode="stdin", base_argv=(), timeout: float = 2.0
     # then has no memory guard at all. Bound each target invocation's RESIDENT memory with ASan's
     # own hard_rss_limit_mb, the same guard run() uses, so a sanitizer build cannot OOM the host.
     env = None
-    if _is_sanitizer_exe(exe):
+    _san_build = _is_sanitizer_exe(exe)
+    if _san_build:
         env = dict(os.environ)
         _prior = env.get("ASAN_OPTIONS", "")
         env["ASAN_OPTIONS"] = ((_prior + ":") if _prior else "") + \
             f"abort_on_error=1:hard_rss_limit_mb={max(256, int(mem_mb))}:detect_leaks=0"
+    guarded = False
+    if guard_page:
+        # The batch runner applies this in the forked child, scoped to the target and never to
+        # the python tracer -- so it is handed over as LYKOS_PRELOAD rather than as LD_PRELOAD,
+        # which would preload into the tracer too.
+        _genv, guarded = guard_page_env(env, exe=exe, arch=arch, host=host,
+                                        sanitizer=_san_build)
+        if guarded:
+            env = dict(env if env is not None else os.environ)
+            env["LYKOS_PRELOAD"] = _genv.get("LD_PRELOAD", "").split(":")[0]
     rc, out, err, timed, _dur = _spawn(cmd, bytes(blob), budget,
                                        _rlimits(mem_mb, int(budget) + 5, set_as=False,
                                                 nproc=_nproc_cap(False)), env=env)
@@ -336,7 +352,9 @@ def run_batch(exe, payloads, *, mode="stdin", base_argv=(), timeout: float = 2.0
             reached = struct.unpack("<%dQ" % nnew, out[off:off + 8 * nnew])
             off += 8 * nnew
         crashed, sig, signame, exit_code = classify_rc(code)
-        results.append(RunResult(isolation="bwrap+netns+batch", crashed=bool(crashed),
+        results.append(RunResult(isolation="bwrap+netns+batch"
+                                 + ("+" + GUARD_PAGE_TAG if guarded else ""),
+                                 crashed=bool(crashed),
                                  timed_out=bool(flags & 1), exit_code=exit_code, signal=sig,
                                  signal_name=signame, stdout=so, stderr=se,
                                  duration_ms=per_ms, fault_pc=(fault_pc or None),
@@ -347,8 +365,87 @@ def run_batch(exe, payloads, *, mode="stdin", base_argv=(), timeout: float = 2.0
     return results
 
 
+def kill_quietly(proc, *, reap: float = 2.0) -> None:
+    """Close a child's pipes, then kill it -- its whole process group when it leads one.
+
+    The ORDER is the point. A half-filled stdin BufferedWriter finalised after the process it
+    writes to is gone raises an *unraisable* BrokenPipeError: it escapes `except`, cannot be
+    caught at the call site, and arrives later at GC time with a traceback pointing at whatever
+    line happened to trigger collection. A real-corpus run over `/usr/bin/*` and a set of HTB
+    pwn binaries printed dozens of them, all blaming `interaction._drive`, which had the usual
+    `finally: p.kill()` and nothing else. Thirteen cleanup blocks had that same shape.
+
+    The group kill is conditional on the child actually leading a group -- i.e. having been
+    spawned with `start_new_session=True`. Signalling the group of a child that did NOT is
+    signalling OUR OWN group, which kills the worker pool. That footgun is why this lives here
+    instead of being copied: every caller got to decide it correctly, and one of them wouldn't.
+    """
+    import os
+    import subprocess as _sp
+    for name in ("stdin", "stdout", "stderr"):
+        stream = getattr(proc, name, None)
+        if stream is None:
+            continue
+        try:
+            stream.close()
+        except Exception:                                # noqa: BLE001 -- already closed/broken
+            pass
+    try:
+        pid = proc.pid
+        if pid and os.getpgid(pid) == pid:               # a session leader: take the group
+            os.killpg(pid, 9)
+        else:
+            proc.kill()
+    except (OSError, ValueError, AttributeError):        # already reaped, or never started
+        try:
+            proc.kill()
+        except Exception:                                # noqa: BLE001
+            pass
+    try:
+        proc.wait(timeout=reap)
+    except (_sp.TimeoutExpired, OSError, ValueError):
+        pass
+
+
 def host_arch() -> str:
     return _HOST.get(platform.machine().lower(), platform.machine().lower())
+
+
+# --- the guard-page heap oracle -------------------------------------------------------------
+#
+# AFL++'s libdislocator places every allocation at the END of its own page with an unmapped page
+# just past it, and unmaps a page on free: a one-byte heap overflow SIGSEGVs where it would
+# otherwise corrupt the next chunk, and a use-after-free faults where it would otherwise read
+# stale bytes. For a stripped third-party binary -- no source, so no ASan -- it is the only heap
+# oracle there is, and the defect class it catches (an out-of-bounds READ) is precisely the one
+# that does not fault on its own.
+#
+# `memoracle` has built the preload environment since the oracle landed and `doctor` reports the
+# library; nothing ever called it, and `batch_runner`'s reader of LYKOS_PRELOAD had no writer.
+# It lives HERE now rather than in each caller, because the preconditions are the sandbox's own
+# facts: the preload object is host-architecture, so it cannot enter a qemu guest, and it must
+# never be layered on a sanitizer build that already instruments every allocation.
+GUARD_PAGE_TAG = "guardpage"
+
+
+def guard_page_env(base_env, *, exe, arch, host, sanitizer: bool):
+    """(env, applied) -- `base_env` with the guard-page allocator preloaded, when it can apply.
+
+    Three ways it cannot: a sanitizer build already instruments every allocation, a qemu guest
+    would need a guest-built preload object, and a STATICALLY linked binary has no dynamic
+    loader to read LD_PRELOAD at all -- which is most firmware and every busybox on this
+    machine, so claiming the oracle there would be claiming an oracle that did nothing.
+    """
+    if sanitizer or (arch and host and arch != host):
+        return base_env, False
+    if not _interp_of(exe):
+        return base_env, False
+    try:
+        from . import memoracle
+        env = memoracle.dislocator_preload(base_env, host_arch=host or "", target_arch=arch)
+    except Exception:                                   # noqa: BLE001 -- an oracle, never a blocker
+        return base_env, False
+    return (env, True) if env is not None else (base_env, False)
 
 
 def classify_rc(rc: Optional[int]):
@@ -440,6 +537,7 @@ def _bwrap_usable() -> bool:
                                capture_output=True, timeout=5)
             ok = r.returncode == 0
         except Exception:
+            observe.absorbed(_log, "keeping the default")
             ok = False
     _bwrap_cache = ok
     return ok
@@ -459,6 +557,7 @@ def _nproc_cap(emu: bool) -> int:
             _nproc_base = sum(len(os.listdir(f"/proc/{p}/task"))
                               for p in os.listdir("/proc") if p.isdigit())
         except Exception:
+            observe.absorbed(_log, "keeping the default")
             _nproc_base = 2048
     _, hard = resource.getrlimit(resource.RLIMIT_NPROC)
     cap = _nproc_base + (4096 if emu else 1024)          # emulation spawns extra worker threads
@@ -485,7 +584,7 @@ def _disable_aslr():
         if cur != -1:
             libc.personality(cur | _ADDR_NO_RANDOMIZE)
     except Exception:
-        pass
+        observe.absorbed(_log, "continuing")
 
 
 # A GENEROUS virtual-address cap for emulated (qemu-user) and Wine targets. A tight RLIMIT_AS
@@ -496,23 +595,31 @@ _EMU_AS_MB = 8192
 
 
 def _rlimits(mem_mb: int, cpu_s: int, set_as: bool, nproc: Optional[int] = None,
-             as_mb: Optional[int] = None):
+             as_mb: Optional[int] = None, aslr: bool = False):
     """Per-child resource caps. `set_as` caps RLIMIT_AS at `mem_mb` (the tight native/sanitizer-off
     bound); `as_mb`, when given, caps it at that value instead (the generous emu/wine bound) so no
     execution path is left with UNBOUNDED memory. Each limit is set in its own try so a platform
     that rejects one (e.g. RLIMIT_NPROC EPERM) cannot skip the safety-critical AS cap -- which is
-    applied FIRST for that reason."""
+    applied FIRST for that reason.
+
+    `aslr=True` LEAVES randomization on. The default off is right for crash reproduction, where a
+    stable address is the whole point, and wrong for the one experiment whose claim is about
+    randomization: an information-disclosure verdict that says "ASLR is defeated" has demonstrated
+    nothing if the process it ran had ASLR disabled. The recovery method does not need the
+    addresses to be stable -- it resolves a leaked pointer's page-invariant low bits against the
+    target's own symbol layout -- so that experiment can and should pay the real cost."""
     if nproc is None:
         nproc = _nproc_cap(False)              # default: baseline-aware native cap
     cap_mb = (mem_mb if set_as else as_mb)
     def _apply():
-        _disable_aslr()
+        if not aslr:
+            _disable_aslr()
         if cap_mb:                             # AS first: never skipped behind another limit
             try:
                 lim = cap_mb << 20
                 resource.setrlimit(resource.RLIMIT_AS, (lim, lim))
             except Exception:
-                pass
+                observe.absorbed(_log, "continuing")
         for _res, _val in ((resource.RLIMIT_CPU, (cpu_s, cpu_s + 1)),
                            (resource.RLIMIT_CORE, (0, 0)),
                            (resource.RLIMIT_FSIZE, (64 << 20, 64 << 20)),
@@ -520,7 +627,7 @@ def _rlimits(mem_mb: int, cpu_s: int, set_as: bool, nproc: Optional[int] = None,
             try:
                 resource.setrlimit(_res, _val)
             except Exception:
-                pass
+                observe.absorbed(_log, "continuing")
     return _apply
 
 
@@ -542,9 +649,10 @@ def _is_sanitizer_exe(exe) -> bool:
     hit = _SAN_EXE_CACHE.get(key)
     if hit is None:
         try:
-            from ..fuzz.aflpp import is_sanitizer_build       # lazy: avoids an import cycle
+            from ..fuzz.aflpp import is_sanitizer_build  # lazy: avoids an import cycle
             hit = bool(is_sanitizer_build(Path(exe).read_bytes()))
         except Exception:
+            observe.absorbed(_log, "keeping the default")
             hit = False
         if len(_SAN_EXE_CACHE) > 256:
             _SAN_EXE_CACHE.clear()
@@ -555,24 +663,24 @@ def _is_sanitizer_exe(exe) -> bool:
 _INTERP_CACHE: dict = {}
 
 
-def _relative_interp(exe) -> bool:
-    """True if the ELF at `exe` names a RELATIVE program interpreter (e.g. ./glibc/ld-linux.so).
+def _interp_of(exe):
+    """The ELF program interpreter's path, or b"" when there is none.
 
-    A relocated bundle (and much firmware) ships its own loader + libc and patchelf's the binary to
-    a relative interpreter path, which the kernel resolves against the process CWD. The sandbox
-    otherwise chdirs to its own tmpfs /tmp, where that path does not exist, so the loader is never
-    found and the program exits before main() -- turning every input into a silent no-op. The
-    caller uses this to chdir the sandbox into the staged bundle directory instead.
+    b"" means a STATICALLY linked binary (or a non-ELF), and that is a fact two callers need:
+    the sandbox chdir for a relative loader, and the guard-page oracle -- LD_PRELOAD is read by
+    the dynamic loader, so a static binary ignores it completely. Tagging such a run as guarded
+    would be a false claim about how the crash was found.
 
-    Cached by (path, mtime, size): run() is called thousands of times on one exe."""
+    Cached by (path, mtime, size): run() is called thousands of times on one exe.
+    """
     try:
         st = os.stat(exe)
         key = (str(exe), st.st_mtime_ns, st.st_size)
     except OSError:
-        return False
+        return b""
     hit = _INTERP_CACHE.get(key)
     if hit is None:
-        hit = False
+        hit = b""
         try:
             with open(exe, "rb") as fh:
                 head = fh.read(64)
@@ -596,25 +704,38 @@ def _relative_interp(exe) -> bool:
                         p_off = struct.unpack_from(fmt, ph, toff)[0]
                         p_fsz = struct.unpack_from(fmt, ph, tsz)[0]
                         fh.seek(p_off)
-                        interp = fh.read(min(p_fsz, 4096)).split(b"\x00", 1)[0]
-                        hit = bool(interp) and not interp.startswith(b"/")
+                        hit = fh.read(min(p_fsz, 4096)).split(b"\x00", 1)[0]
                         break
         except Exception:                                  # noqa: BLE001 -- unreadable/odd ELF
-            hit = False
+            hit = b""
         if len(_INTERP_CACHE) > 256:
             _INTERP_CACHE.clear()
         _INTERP_CACHE[key] = hit
     return hit
 
 
+def _relative_interp(exe) -> bool:
+    """True if the ELF at `exe` names a RELATIVE program interpreter (e.g. ./glibc/ld-linux.so).
+
+    A relocated bundle (and much firmware) ships its own loader + libc and patchelf's the binary to
+    a relative interpreter path, which the kernel resolves against the process CWD. The sandbox
+    otherwise chdirs to its own tmpfs /tmp, where that path does not exist, so the loader is never
+    found and the program exits before main() -- turning every input into a silent no-op. The
+    caller uses this to chdir the sandbox into the staged bundle directory instead.
+    """
+    interp = _interp_of(exe)
+    return bool(interp) and not interp.startswith(b"/")
+
+
 def _killpg(p):
     try:
         os.killpg(os.getpgid(p.pid), signal.SIGKILL)
     except Exception:
+        observe.absorbed(_log, "falling back")
         try:
             p.kill()
         except Exception:
-            pass
+            observe.absorbed(_log, "continuing")
 
 
 def _bwrap_probe_fresh() -> bool:
@@ -626,6 +747,7 @@ def _bwrap_probe_fresh() -> bool:
                            capture_output=True, timeout=5)
         return r.returncode == 0
     except Exception:
+        observe.absorbed(_log, "answering no")
         return False
 
 
@@ -887,8 +1009,10 @@ def _java() -> Optional[str]:
 
 def _is_jvm(path) -> bool:
     try:
-        head = Path(path).open("rb").read(8)
+        with Path(path).open("rb") as _f:
+            head = _f.read(8)
     except Exception:
+        observe.absorbed(_log, "answering no")
         return False
     from ..jvm import is_class
     if is_class(head + b"\x00" * 8):
@@ -903,6 +1027,7 @@ def _looks_like_jar(path) -> bool:
             names = z.namelist()
         return any(n.endswith(".class") for n in names) or "META-INF/MANIFEST.MF" in names
     except Exception:
+        observe.absorbed(_log, "answering no")
         return False
 
 
@@ -1138,7 +1263,8 @@ def _is_pyc(path) -> bool:
     version CPython actually shipped -- which is also what decides whether THIS interpreter can
     run it."""
     try:
-        head = Path(path).open("rb").read(16)
+        with Path(path).open("rb") as _f:
+            head = _f.read(16)
     except Exception:                                    # noqa: BLE001
         return False
     if len(head) < 16 or head[2:4] != b"\r\n":
@@ -1228,7 +1354,8 @@ def _wasm_signal(bug: str) -> str:
 def _is_wasm(path) -> bool:
     """A WebAssembly module: the `\0asm` magic followed by a version word."""
     try:
-        head = Path(path).open("rb").read(8)
+        with Path(path).open("rb") as _f:
+            head = _f.read(8)
     except Exception:                                    # noqa: BLE001
         return False
     return len(head) >= 8 and head[:4] == b"\x00asm"
@@ -1780,6 +1907,7 @@ def _is_pe(exe) -> bool:
             f.seek(off)
             return f.read(4) == b"PE\x00\x00"
     except Exception:
+        observe.absorbed(_log, "answering no")
         return False
 
 
@@ -1802,7 +1930,7 @@ def _ensure_wineprefix(wine: str, prefix: str) -> None:
         subprocess.run([wine, "wineboot", "--init"], env=env,
                        capture_output=True, timeout=180)
     except Exception:
-        pass
+        observe.absorbed(_log, "continuing")
 
 
 def _run_windows(exe, *, argv, stdin, timeout, mem_mb, capture, wineprefix,
@@ -1861,7 +1989,8 @@ def run(exe, *, argv=(), stdin: bytes = b"", timeout: float = 10.0,
         arch: Optional[str] = None, endianness: Optional[str] = None,
         bits: Optional[int] = None, host: Optional[str] = None, mem_mb: int = 2048,
         capture: int = 65536, wineprefix: Optional[str] = None, blocks=(),
-        env_overrides: Optional[dict] = None) -> RunResult:
+        env_overrides: Optional[dict] = None, aslr: bool = False,
+        guard_page: bool = False) -> RunResult:
     """`blocks` asks for coverage. On an EMULATED target that is the only way to get it: the
     ptrace tracer the batch runner uses cannot reach inside qemu, so every non-native campaign
     was running blind on output shape alone -- eleven of the twelve architectures the platform
@@ -1923,7 +2052,7 @@ def run(exe, *, argv=(), stdin: bytes = b"", timeout: float = 10.0,
     # hard_rss_limit_mb below. native non-san: the tight mem_mb cap.
     preexec = _rlimits(mem_mb, int(eff_timeout) + 2, set_as=(emu is None and not san),
                        nproc=_nproc_cap(emu is not None or san),
-                       as_mb=(max(mem_mb, _EMU_AS_MB) if emu else None))
+                       as_mb=(max(mem_mb, _EMU_AS_MB) if emu else None), aslr=aslr)
     env = None
     if san:
         env = dict(os.environ)
@@ -1936,6 +2065,11 @@ def run(exe, *, argv=(), stdin: bytes = b"", timeout: float = 10.0,
         # this the input had nowhere to go and the crash "did not reproduce".
         env = dict(env if env is not None else os.environ)
         env.update({str(k): v for k, v in env_overrides.items()})
+    guarded = False
+    if guard_page:
+        # Here the preload goes in as LD_PRELOAD: `run` execs the target itself (under bwrap or
+        # qemu), so there is no tracer of ours in the process to protect.
+        env, guarded = guard_page_env(env, exe=exe, arch=arch, host=host, sanitizer=san)
 
     iso = "rlimits-only" + ("+qemu" if emu else "")
     cmd = inner
@@ -1968,6 +2102,12 @@ def run(exe, *, argv=(), stdin: bytes = b"", timeout: float = 10.0,
             extra += ["--bind", tdir, tdir]
         cmd = ["bwrap"] + _BWRAP_ARGS[:-1] + extra + ["--"] + inner
         iso = ("bwrap+netns" + ("+qemu" if emu else ""))
+    if guarded:
+        # The tag is what makes the crash REPRODUCIBLE later: a fault that needs the guard-page
+        # allocator is silent without it, and `replay_exe_for`'s callers read this field to
+        # decide how to re-run an input. A crash recorded without saying so would be replayed
+        # unguarded, not reproduce, and be dropped as a false positive.
+        iso += "+" + GUARD_PAGE_TAG
 
     # Run in a throwaway working directory. The bwrap tier chdirs to its own tmpfs /tmp, but the
     # rlimits-only tier (no bwrap, or the runtime fallback below) otherwise inherits the SERVER's

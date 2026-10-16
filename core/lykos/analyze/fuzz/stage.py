@@ -881,6 +881,15 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
     ctx.content.stage_target(target, exe.parent, exe.name)
     os.chmod(exe, 0o755)
 
+    # THE GUARD-PAGE HEAP ORACLE, on wherever it can apply. libdislocator puts every allocation
+    # at the end of its own page with an unmapped page behind it, so a heap out-of-bounds READ --
+    # the class that otherwise runs on silently, and the class most of a stripped binary's CVEs
+    # are -- faults where the fuzzer can see it. The sandbox decides applicability (host-arch
+    # ELF, never a sanitizer build, library present) and records in the isolation tag whether it
+    # applied, which is what lets the crash be replayed the same way later. It is threaded to
+    # EVERY execution point below, including minimization and the crash re-runs: a crash found
+    # guarded and re-run unguarded does not reproduce, and would be dropped as a false positive.
+    guard = bool((ctx.params or {}).get("guard_page", True))
     corpus = list(corpus) or list(_DEFAULT_SEEDS)
     # Give the delivered input file the EXTENSION its format implies (voted from the corpus): a
     # parser that selects its handler by extension (mutool, ImageMagick, ...) rejects an
@@ -1063,7 +1072,8 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
             t_batch = time.time()
             results = sandbox.run_batch(exe, inputs, mode=mode, timeout=exec_timeout,
                                         arch=target.arch, endianness=target.endianness,
-                                        bits=target.bits, blocks=arm, base_argv=run_argv)
+                                        bits=target.bits, blocks=arm, base_argv=run_argv,
+                                        guard_page=guard)
             if results is None:
                 batchable = False                     # not available here; stay per-exec
             else:
@@ -1079,6 +1089,7 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
             kw = {"endianness": target.endianness, "bits": target.bits}
             if run_fn is run_input:
                 kw["base_argv"] = run_argv
+                kw["guard_page"] = guard
             # Only ever arm blocks we have not reached: the breakpoints are one-shot. Asked by
             # SIGNATURE rather than by identity, because the channel runner takes them too --
             # gated on `run_fn is run_input`, a network campaign could not be given coverage at
@@ -1154,7 +1165,7 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
                 # runs clean. Filing those left every downstream stage chasing a crash that
                 # cannot be reproduced, and the release gate failing with "PoC not reproduced".
                 if not _reproduces(run_fn, exe, mode, workfile, exec_timeout,
-                                   target, data, run_argv):
+                                   target, data, run_argv, guard_page=guard):
                     flaky += 1
                     continue
                 crashes_reproducible += 1
@@ -1191,6 +1202,7 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
                         kw = {"endianness": target.endianness, "bits": target.bits}
                         if run_fn is run_input:
                             kw["base_argv"] = _prefix
+                            kw["guard_page"] = guard
                         r = run_fn(exe, mode, workfile, exec_timeout, target.arch, d, **kw)[1]
                         return r.crashed and r.signal_name == _sig
 
@@ -1285,31 +1297,38 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
     try:
         msan_detonate(ctx, target, corpus, mode, exec_timeout, base_argv=base_argv)
     except Exception:
-        pass
+        observe.absorbed(_log, "continuing")
     # Data-race pass (CWE-362): detonate the same corpus against the ThreadSanitizer binary.
     try:
         tsan_detonate(ctx, target, corpus, mode, exec_timeout, base_argv=base_argv)
     except Exception:
-        pass
+        observe.absorbed(_log, "continuing")
     ctx.emit(f"{event_prefix}.done", payload=stats)
     ctx.progress(pct=100, msg=f"{execs} execs, {crashes} crashes, {len(seen_sigs)} unique, "
                              f"{len(seen_behaviour)} behaviours")
     return stats
 
 
-def _reproduces(run_fn, exe, mode, workfile, exec_timeout, target, data, prefix) -> bool:
+def _reproduces(run_fn, exe, mode, workfile, exec_timeout, target, data, prefix,
+                guard_page: bool = False) -> bool:
     """Does this input crash again, on its own, the way it was found?
 
     Through the campaign's OWN runner: a boundary-harness campaign delivers its input through a
     generated harness, and the default runner cannot deliver it at all -- checking with the
     wrong one discards every crash it finds.
+
+    `guard_page` is part of "the way it was found" for the same reason the argv prefix is: a
+    heap out-of-bounds caught by the guard-page allocator is SILENT without it, so re-running
+    unguarded would discard every crash the oracle exists to find.
     """
     kw = {"endianness": target.endianness, "bits": target.bits}
     if run_fn is run_input:
         kw["base_argv"] = prefix
+        kw["guard_page"] = guard_page
     try:
         _argv, res = run_fn(exe, mode, workfile, exec_timeout, target.arch, data, **kw)
     except Exception:
+        observe.absorbed(_log, "answering no")
         return False
     return bool(res.crashed)
 

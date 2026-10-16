@@ -1,8 +1,13 @@
 """Shared target-invocation helper for the fuzzing stages."""
 from __future__ import annotations
 
+import logging
+
+from ... import observe
 from ..dynamic import sandbox
 from ..invocation import INPUT_PLACEHOLDER, OUTPUT_PLACEHOLDER
+
+_log = logging.getLogger(__name__)
 
 
 def _sub_output(argv, workfile):
@@ -55,13 +60,16 @@ def invocation(mode, workfile, d: bytes, base_argv=()):
 
 
 def run_input(exe, mode, workfile, timeout, arch, d: bytes, *, endianness=None, bits=None,
-              base_argv=(), blocks=()):
+              base_argv=(), blocks=(), guard_page: bool = False):
     """One execution. `base_argv` is the option prefix the campaign is running under: a crash
     found with an option has to be re-run with it to mean anything. `blocks` asks for coverage,
-    which on an emulated target comes from qemu's own block log."""
+    which on an emulated target comes from qemu's own block log. `guard_page` asks for the
+    guard-page heap allocator, which turns a silent heap out-of-bounds into a SIGSEGV; the
+    sandbox decides whether it can apply and records in the isolation tag whether it did."""
     argv, stdin = invocation(mode, workfile, d, base_argv)
     return argv, sandbox.run(exe, argv=argv, stdin=stdin, timeout=timeout, arch=arch,
-                             endianness=endianness, bits=bits, blocks=blocks)
+                             endianness=endianness, bits=bits, blocks=blocks,
+                             guard_page=guard_page)
 
 
 def run_input_prompted(exe, d: bytes, *, timeout: float, fields=(), idle: float = 0.08):
@@ -149,7 +157,7 @@ def run_input_prompted(exe, d: bytes, *, timeout: float, fields=(), idle: float 
                 from . import menu as _m
                 _m._kill(proc)
             except Exception:
-                pass
+                observe.absorbed(_log, "continuing")
 
 
 def prompted_runner(fields=(), *, idle: float = 0.08):
