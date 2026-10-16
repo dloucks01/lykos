@@ -13,12 +13,14 @@ import base64
 import bisect
 import hashlib
 import inspect
+import logging
 import os
 import random
 import re
 import time
 from pathlib import Path
 
+from ... import observe
 from ...db.dao import CallEdgeDAO, DynResultDAO, FindingDAO, FunctionDAO, StringDAO, TargetDAO
 from ...hashing import canonical_json
 from ...jobs.registry import register_stage
@@ -35,6 +37,8 @@ from ..poc.capture import modes_for, no_import_evidence
 from . import structure, textconf, xmlgrammar
 from .mutator import Mutator
 from .runner import invocation, run_input
+
+_log = logging.getLogger(__name__)
 
 FUZZ_STAGE = "fuzz"
 TOOL = "fuzz"
@@ -200,6 +204,7 @@ def _triage_symbols_for(ctx, target) -> list:
         from ..ingest import triage_symbols
         return triage_symbols(ctx.conn, ctx.content, target)
     except Exception:
+        observe.absorbed(_log, "answering empty")
         return []
 
 
@@ -220,6 +225,7 @@ def _imports_for(ctx, target) -> list:
         names = [e.dst_name for e in CallEdgeDAO(ctx.conn).list_by_target(target.id)
                  if e.dst_name]
     except Exception:
+        observe.absorbed(_log, "keeping the default")
         names = []
     if not names:
         try:
@@ -227,8 +233,56 @@ def _imports_for(ctx, target) -> list:
             data = ctx.content.path(target.sha256).read_bytes()
             names = list((elfmod.parse(data).imports or {}).get("symbols") or [])
         except Exception:
+            observe.absorbed(_log, "keeping the default")
             names = []
     return [str(n).split("@")[0] for n in names if n]
+
+
+def value_seeds_for(ctx, target) -> set:
+    """The seeds that exist because of a VALUE, not because of a path.
+
+    Distillation drops an input whose basic blocks another input already covers, which is right
+    for a near-duplicate accumulated input and wrong for these. `show=2147483647` takes exactly
+    the branches `show=0` takes -- same compare, same call -- so block coverage cannot tell them
+    apart, and the one that matters is dropped. Measured on a heap over-read driven by a length
+    field: 121 seeds distilled to 1, the boundary seed among the 120 discarded, and the defect
+    was never reached in a 900 s autonomous pass though a single execution of that seed reports
+    it. `numeric_boundary_seeds` says the same thing in its own docstring -- blind mutation
+    "effectively never emits the DECIMAL TEXT of a 9-10 digit number ... it is not a matter of
+    budget" -- and then distillation threw the number away.
+
+    So these are forced-keep, exactly as a crash reproducer is: an input nothing in the campaign
+    can regenerate is not redundant, whatever its coverage.
+
+    Recomputed rather than threaded through `format_aware_seeds`, whose signature several stages
+    share; the string lookups behind it are the same ones that already ran.
+    """
+    out: set = set()
+    try:
+        svals = [x.value for x in _strings_for(ctx, target) if getattr(x, "value", None)]
+    except Exception:
+        observe.absorbed(_log, "answering an empty set")
+        return out
+    try:
+        keys = textconf.keys_from(svals)
+        if keys:
+            out |= {bytes(b) for b in textconf.boundary_seeds(keys) if b}
+    except Exception:
+        observe.absorbed(_log, "continuing")
+    try:
+        out |= {bytes(b) for b in textconf.numeric_boundary_seeds() if b}
+    except Exception:
+        observe.absorbed(_log, "continuing")
+    try:
+        # Mirrors the seeder: only the STRONGEST format candidate gets crash-shaped variants, so
+        # only its are forced-keep. Same reason -- they wrap a 32-bit bounds check while still
+        # pointing out of bounds, which is a value, not a path.
+        detected = structure.detect_formats(svals, _imports_for(ctx, target))
+        if detected:
+            out |= {bytes(b) for b in (structure.boundary_seeds(detected[0]) or ()) if b}
+    except Exception:
+        observe.absorbed(_log, "continuing")
+    return out
 
 
 def format_aware_seeds(ctx, target) -> list:
@@ -246,10 +300,12 @@ def format_aware_seeds(ctx, target) -> list:
     try:
         svals = [x.value for x in _strings_for(ctx, target) if getattr(x, "value", None)]
     except Exception:
+        observe.absorbed(_log, "falling back")
         return seeds
     try:
         imps = _imports_for(ctx, target)
     except Exception:
+        observe.absorbed(_log, "keeping the default")
         imps = []
     try:
         # EVERY format this binary looks like a reader for, strongest first -- not just the
@@ -269,7 +325,7 @@ def format_aware_seeds(ctx, target) -> list:
                 if s:
                     seeds.append(s)
     except Exception:
-        pass
+        observe.absorbed(_log, "continuing")
     try:
         # A specimen the binary DOCUMENTS for itself -- "in SED format (e.g. s/old/new/)" -- is a
         # valid input written by the author of the parser that reads it, plus a long-field
@@ -277,7 +333,7 @@ def format_aware_seeds(ctx, target) -> list:
         # which name the gate without passing it.
         seeds += textconf.example_seeds(svals)
     except Exception:
-        pass
+        observe.absorbed(_log, "continuing")
     try:
         keys = textconf.keys_from(svals)
         if keys:
@@ -287,7 +343,7 @@ def format_aware_seeds(ctx, target) -> list:
             # specific value that mutating a text placeholder rarely lands inside a short budget.
             seeds += textconf.boundary_seeds(keys)
     except Exception:
-        pass
+        observe.absorbed(_log, "continuing")
     # A target that parses a NUMBER out of its input has values that matter, not lengths: a
     # count multiplied into an allocation wraps at 2**32/elem_size, and no amount of byte
     # mutation emits the decimal text of such a number.
@@ -295,7 +351,7 @@ def format_aware_seeds(ctx, target) -> list:
         if _reads_a_number(ctx, target):
             seeds += textconf.numeric_boundary_seeds(8)
     except Exception:
-        pass
+        observe.absorbed(_log, "continuing")
     # the binary's own selective strings (magic tokens, config keywords, path prefixes)
     seeds += [s.encode("latin-1", "ignore") for s in svals[:8] if 2 <= len(s) <= 256]
     # Menu / interactive-protocol navigation seeds: a numbered-menu service hides its bug behind a
@@ -305,7 +361,7 @@ def format_aware_seeds(ctx, target) -> list:
         from . import menu
         seeds += menu.menu_seeds(svals)
     except Exception:
-        pass
+        observe.absorbed(_log, "continuing")
     return [s for s in seeds if s]
 
 
@@ -332,6 +388,7 @@ def menu_model_for(ctx, target, exe, workdir):
             return None
         return model, opts, width
     except Exception:
+        observe.absorbed(_log, "answering None")
         return None
 
 
@@ -351,14 +408,15 @@ def linear_protocol_for(ctx, target, exe, workdir):
     already handles and the prompted path costs a drain per field.
     """
     try:
-        from . import menu
         from ..dynamic.heap_discover import _spawn_menu
+        from . import menu
         svals = [x.value for x in _strings_for(ctx, target) if getattr(x, "value", None)]
         if menu.detect_menu(svals):
             return None
         fields = menu.crawl_linear(lambda: _spawn_menu(workdir, exe))
         return fields if len(fields) >= 2 else None
     except Exception:
+        observe.absorbed(_log, "answering None")
         return None
 
 
@@ -388,6 +446,7 @@ def msan_detonate(ctx, target, inputs, mode, exec_timeout, base_argv=()) -> int:
         msbin.write_bytes(ctx.content.path(msa.sha256).read_bytes())
         _os.chmod(msbin, 0o755)
     except Exception:
+        observe.absorbed(_log, "answering a default")
         return 0
     # MSan's default abort path spawns llvm-symbolizer, which DEADLOCKS when stderr is a captured
     # pipe (not a TTY) -- every detonation then times out and the pass silently finds nothing. Run
@@ -415,6 +474,7 @@ def msan_detonate(ctx, target, inputs, mode, exec_timeout, base_argv=()) -> int:
             r = sandbox.run_reaped(prefix + argv, input=stdin, timeout=per_timeout,
                                    capture_output=True, env=env)
         except Exception:
+            observe.absorbed(_log, "skipping this item")
             continue
         txt = (r.stderr or b"").decode("latin-1", "ignore")
         if "MemorySanitizer: use-of-uninitialized-value" not in txt:
@@ -458,6 +518,7 @@ def msan_detonate(ctx, target, inputs, mode, exec_timeout, base_argv=()) -> int:
                               "detail": _detail + f" (input {sha[:12]})"}]})
             found += 1
         except Exception:
+            observe.absorbed(_log, "skipping this item")
             continue
         # RECORD IT AS A RUN, for the reason spelled out in `tsan_detonate`: the PoC ladder
         # iterates dyn_result, and this pass filed only a Finding -- so a real uninitialised-
@@ -484,7 +545,7 @@ def msan_detonate(ctx, target, inputs, mode, exec_timeout, base_argv=()) -> int:
                     "note": "the uninitialised read was filed as a finding but NOT recorded as "
                             "a run, so the PoC ladder cannot reach it", "key": str(key)[:80]})
             except Exception:
-                pass
+                observe.absorbed(_log, "continuing")
     if found:
         ctx.emit("msan.done", payload={"uninitialized_reads": found})
     return found
@@ -505,6 +566,7 @@ def _msan_source_line(binpath, text):
             f, _, line = loc[0].rpartition(":")
             return f"{f.split('/')[-1]}:{line}" if f else None
     except Exception:
+        observe.absorbed(_log, "answering None")
         return None
     return None
 
@@ -530,6 +592,7 @@ def tsan_detonate(ctx, target, inputs, mode, exec_timeout, base_argv=()) -> int:
         tsbin.write_bytes(ctx.content.path(tsa.sha256).read_bytes())
         _os.chmod(tsbin, 0o755)
     except Exception:
+        observe.absorbed(_log, "answering a default")
         return 0
     env = dict(_os.environ)
     # halt on the first race; no symbolizer (it deadlocks on a captured-pipe stderr, as with MSan)
@@ -551,6 +614,7 @@ def tsan_detonate(ctx, target, inputs, mode, exec_timeout, base_argv=()) -> int:
             r = sandbox.run_reaped(prefix + [str(tsbin)] + tail, input=stdin, timeout=per_timeout,
                                    capture_output=True, env=env)
         except Exception:
+            observe.absorbed(_log, "skipping this item")
             continue
         txt = (r.stderr or b"").decode("latin-1", "ignore")
         if "ThreadSanitizer: data race" not in txt and "ThreadSanitizer: lock-order" not in txt:
@@ -576,6 +640,7 @@ def tsan_detonate(ctx, target, inputs, mode, exec_timeout, base_argv=()) -> int:
                               + (f" at {src}" if src else "") + f" (input {sha[:12]})"}]})
             found += 1
         except Exception:
+            observe.absorbed(_log, "skipping this item")
             continue
         # RECORD IT AS A RUN, or the ladder cannot see it. The prove loop iterates the
         # dyn_result table; this stage filed only a Finding, so a real data race reached the
@@ -604,7 +669,7 @@ def tsan_detonate(ctx, target, inputs, mode, exec_timeout, base_argv=()) -> int:
                     "note": "the race was filed as a finding but NOT recorded as a run, so the "
                             "PoC ladder cannot reach it", "key": str(key)[:80]})
             except Exception:
-                pass
+                observe.absorbed(_log, "continuing")
     if found:
         ctx.emit("tsan.done", payload={"data_races": found})
     return found
@@ -641,6 +706,87 @@ def _help_text(exe, target, exec_timeout):
     return best
 
 
+def _multicall_argv(ctx, invmod, help_text, probe, workdir):
+    """(argv, note, door) for ONE program inside a multi-call binary, or (None, None, {}).
+
+    `door` carries what the campaign needs downstream: the program's name, the channel the door
+    was VERIFIED on (so the input is delivered the way it was shown to be read, rather than the
+    way the whole image's imports suggest), and a valid seed if the image can make one.
+
+    The program is chosen from the verified doors, by `params.multicall_door` when the
+    orchestrator is taking them one at a time and otherwise the deepest parser available. Both
+    the count that was skipped and the doors that verified are emitted, because "we fuzzed
+    busybox" and "we fuzzed busybox's unlzma" are different claims and only one of them is
+    worth anything.
+    """
+    if not invmod.is_multicall(help_text):
+        # `_help_text` scores candidate outputs by how many option rows they carry and returns
+        # None for a program with none -- which is busybox exactly: no `-x` rows, and its 345
+        # programs printed as a wrapped comma-separated block. Ask the bare invocation itself,
+        # which is what a multi-call binary answers with its own banner. One execution, and only
+        # when the scored help text said nothing.
+        try:
+            r = probe([])
+            help_text = ((getattr(r, "stdout", b"") or b"") + b"\n"
+                         + (getattr(r, "stderr", b"") or b"")).decode("utf-8", "replace")
+        except Exception:                              # noqa: BLE001 -- best-effort probe
+            observe.absorbed(_log, "reading the bare invocation's banner")
+            return None, None, {}
+        if not invmod.is_multicall(help_text):
+            return None, None, {}
+    listing = None
+    flag = invmod.multicall_list_flag(help_text)
+    if flag:
+        try:
+            r = probe([flag])
+            listing = (getattr(r, "stdout", b"") or b"").decode("utf-8", "replace")
+        except Exception:                              # noqa: BLE001 -- best-effort probe
+            observe.absorbed(_log, "reading the multi-call listing")
+    names = invmod.multicall_names(help_text, list_output=listing)
+    if not names:
+        return None, None, {}
+    allowed = invmod.rank_multicall(names)
+    if not allowed:
+        ctx.emit("fuzz.multicall", payload={
+            "programs": len(names), "allowed": 0, "doors": [], "note": (
+                "this is a multi-call binary, and none of the programs it contains has the "
+                "shape of a single-input parser, so none was invoked")})
+        return None, None, {}
+    sample = workdir / "mc-sample"
+    sample.write_bytes(b"# lykos\n")
+
+    def _run(argv, stdin):
+        return probe([str(a).replace(invmod.INPUT_PLACEHOLDER, str(sample)) for a in argv], stdin)
+
+    doors = invmod.multicall_doors(_run, allowed, sample=b"")
+    if not doors:
+        ctx.emit("fuzz.multicall", payload={
+            "programs": len(names), "allowed": len(allowed), "doors": [], "note": (
+                "this is a multi-call binary, but no contained program accepted an invocation "
+                "we could verify, so the campaign was not pointed at one")})
+        return None, None, {}
+    want = ((ctx.params or {}).get("multicall_door") or "").strip()
+    pick = next((d for d in doors if d[0] == want), doors[0])
+    # The target makes its own seed. A decompressor rejects random bytes at the header, so a
+    # campaign without a valid archive never reaches the decoder -- and the image that holds
+    # `unlzma` also holds `lzma`, so the one thing this campaign needs is one execution away.
+    seed = invmod.multicall_seed(_run, pick[0])
+    ctx.emit("fuzz.multicall", payload={
+        "programs": len(names), "allowed": len(allowed),
+        "doors": [n for n, _ in doors], "chosen": pick[0],
+        "seed_bytes": len(seed), "seed_from": invmod.multicall_inverse(pick[0]),
+        "note": (f"multi-call binary: {len(names)} programs, {len(allowed)} with the shape of a "
+                 f"single-input parser, {len(doors)} verified by running them. Fuzzing "
+                 f"`{' '.join(pick[1])}` -- the image itself only dispatches."
+                 + (f" Seeded with {len(seed)} bytes the target's own "
+                    f"`{invmod.multicall_inverse(pick[0])}` produced." if seed else ""))})
+    return list(pick[1]), (f"multi-call binary: the campaign drives the contained program "
+                           f"`{' '.join(pick[1])}`, verified by running it "
+                           f"({len(doors)} of {len(names)} programs opened)"), {
+        "door": pick[0], "seeds": [seed] if seed else [],
+        "verified_on": "file" if invmod.INPUT_PLACEHOLDER in pick[1] else "stdin"}
+
+
 def _discover_argv(ctx, target, exec_timeout):
     """Work out the target's required arguments -- and CHECK them before using them.
 
@@ -668,13 +814,29 @@ def _discover_argv(ctx, target, exec_timeout):
         # Mine the option table from the target's OWN --help, so a tool that hides its flags there
         # (objdump/xmllint/exiv2/...) still gets a discovered, verifiable invocation.
         help_text = _help_text(exe, target, exec_timeout)
+
+        def _probe(a, stdin=b""):
+            return sandbox.run(exe, argv=[str(x) for x in a], stdin=stdin,
+                               timeout=max(4.0, exec_timeout * 2), arch=target.arch,
+                               endianness=target.endianness, bits=target.bits)
+
+        # A MULTI-CALL binary is many programs behind one image, and fuzzing the image fuzzes a
+        # dispatcher: `busybox` with no function prints its usage and exits, so a campaign
+        # against a 1 MB static busybox -- the single most common binary in the firmware this
+        # tool carves -- executed the program thousands of times and entered no parser at all.
+        # The programs behind the dispatch are where the bugs are: busybox 1.21.1's own CVE
+        # list leads with an out-of-bounds read in the unlzma decompressor.
+        door_argv, door_note, door = _multicall_argv(ctx, invmod, help_text, _probe, d)
+        if door_argv:
+            return door_argv, door_note, False, door
+
         found = invmod.discover([x.value for x in _strings_for(ctx, target)], help_text=help_text)
         # Real files behind every value that names one, or the proposal cannot be tested: a
         # service required to be given `-j <app.jar>` refuses the literal string "app.jar",
         # and the run then throws away an invocation that was right apart from a missing file.
         argv = invmod.materialize(found, d)
         if not argv:
-            return [], None, False
+            return [], None, False, {}
         sample = d / "sample"
         sample.write_bytes(b"# lykos\n")
 
@@ -684,16 +846,16 @@ def _discover_argv(ctx, target, exec_timeout):
                                bits=target.bits)
         v = invmod.verify(_run, exe, argv, str(sample))
     except Exception as e:                     # discovery is an optimisation, never a blocker
-        return [], f"invocation discovery failed: {e}", False
+        return [], f"invocation discovery failed: {e}", False, {}
     if v["accepted"] and v["bare_rejected"]:
         conf = any(f.get("kind") == "config" and not f.get("optional")
                    for f in found["flags"])
         return argv, (f"discovered from the binary's usage line and verified by running it: "
-                      f"{' '.join(argv)}"), conf
+                      f"{' '.join(argv)}"), conf, {}
     if not v["bare_rejected"]:
         return [], ("the target runs with no arguments, so no flags were added "
-                    f"(it does document {' '.join(argv)})"), False
-    return [], f"proposed {' '.join(argv)} but the target refused it -- {v['why']}", False
+                    f"(it does document {' '.join(argv)})"), False, {}
+    return [], f"proposed {' '.join(argv)} but the target refused it -- {v['why']}", False, {}
 
 
 def _takes_blocks(run_fn) -> bool:
@@ -747,7 +909,7 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
                 ctx.emit("fuzz.format", payload={"model": "menu", "auto": True,
                          "options": opts, "why": "the target drives a numbered menu; navigating it"})
     except Exception:
-        pass
+        observe.absorbed(_log, "continuing")
     # A WORD-command service -- `strncmp(cmd, "free", 4)` -- is a state machine like a numbered menu
     # but keyed on verbs the menu path cannot see. When no menu (and no explicit format model) fired,
     # mine the verbs (comparison literals, often too short for the string table) and seed ordered
@@ -765,7 +927,7 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
                 ctx.emit("fuzz.format", payload={"model": "command", "auto": True,
                          "verbs": verbs[:16], "why": "the target dispatches on text commands"})
         except Exception:
-            pass
+            observe.absorbed(_log, "continuing")
     mut = mutator or Mutator(rng, dictionary)          # menu / structure-aware mutator when supplied
     fd = FindingDAO(ctx.conn)
     dd = DynResultDAO(ctx.conn)
@@ -805,18 +967,25 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
             # campaign it was preparing then executed the target ZERO times. `cap` could not
             # prevent that -- a count bound is not a time bound when one item costs a second.
             _dl = time.time() + max(_DISTILL_FLOOR_S, max_seconds * _DISTILL_SHARE)
+            # Forced-keep the VALUE seeds -- see `value_seeds_for`. Without this the distiller
+            # drops a boundary seed because another input covers the same blocks, and a
+            # value-driven defect (a length field, a wrap threshold, an index) is invisible to
+            # block coverage by construction.
+            _vs = value_seeds_for(ctx, target)
+            _keep = {i for i, d in enumerate(corpus) if bytes(d) in _vs} if _vs else set()
             _d = _distill.distill_corpus(exe, corpus, all_blocks, mode=mode, base_argv=base_argv,
                                          timeout=exec_timeout, arch=target.arch,
                                          endianness=getattr(target, "endianness", None),
                                          bits=getattr(target, "bits", None), cap=_DISTILL_CAP,
-                                         deadline=_dl)
+                                         deadline=_dl, keep_idx=_keep)
             if _d["dropped"] > 0:
                 corpus = _d["kept"]
+                _d["stats"]["value_seeds_kept"] = len(_keep)
                 ctx.emit(f"{event_prefix}.distill", payload=_d["stats"])
                 ctx.progress(msg=f"{event_prefix} distilled corpus "
                                  f"{_d['stats']['in']} -> {_d['stats']['out']} seeds")
         except Exception:
-            pass
+            observe.absorbed(_log, "continuing")
     seen_blocks: set = set()
     # Sink-directed steering (AFLGo-style): `block_dist` maps a block address to its distance to a
     # target sink. We keep the lowest distance any input has reached, and RETAIN an input that gets
@@ -1231,6 +1400,7 @@ def _recovered_blocks(ctx, target):
     try:
         entry = parse_elf(blob).entry
     except Exception:
+        observe.absorbed(_log, "keeping the default")
         entry = None
     base = rootcause.image_base(fns, entry) or 0
     ranges = program_ranges(blob)
@@ -1394,12 +1564,21 @@ def fuzz_stage(ctx) -> dict:
     # How to invoke the target. `@@` marks where the input goes -- `["-c", "@@"]` for a
     # service that takes a config path behind a flag; without it the input is appended.
     base_argv = [str(a) for a in (p.get("argv") or [])]
-    auto_argv, wants_config = None, False
+    auto_argv, wants_config, door = None, False, {}
     if not base_argv and p.get("discover_argv", True):
-        base_argv, auto_argv, wants_config = _discover_argv(ctx, target, exec_timeout)
+        base_argv, auto_argv, wants_config, door = _discover_argv(ctx, target, exec_timeout)
     elif any(a for a in base_argv):
         wants_config = "@@" in base_argv
 
+    if door.get("verified_on") == "stdin" and not p.get("input_mode"):
+        # The door was VERIFIED with the input on stdin, so that is the channel this campaign
+        # delivers on. Ranking the channels from the image's imports instead would answer for
+        # busybox as a whole -- 345 programs' worth of imports -- and a decompressor handed its
+        # input as an argv string sees a filename that does not exist, on every execution.
+        channels = ["stdin"]
+        ctx.emit("fuzz.channel", payload={"mode": "stdin", "why": (
+            "the contained program was verified by running it with the input on stdin, which "
+            "is the channel it was shown to read")})
     if "@@" in base_argv and not p.get("input_mode"):
         # `@@` means "the PATH of the input file goes here". Delivering the input as a raw
         # argv string or over stdin then leaves the placeholder holding payload bytes where a
@@ -1472,6 +1651,11 @@ def fuzz_stage(ctx) -> dict:
     blocks = _recovered_blocks(ctx, target)
     flags = mine_flags(ctx.content.path(target.sha256).read_bytes())
     corpus = _load_external_seeds(p) or list(_DEFAULT_SEEDS)
+    if door.get("seeds"):
+        # A valid archive, made by the target's own compressor for the decompressor door this
+        # campaign is driving. It goes in FRONT: a decompressor checks its header first, so
+        # every generic seed above is rejected before the decoder runs at all.
+        corpus = list(door["seeds"]) + list(corpus)
     if p.get("seed_files") or p.get("seed_dir"):
         ctx.emit("fuzz.seeds", payload={"loaded": len(corpus),
                                         "from": [k for k in ("seed_files", "seed_dir") if p.get(k)]})
@@ -1587,7 +1771,7 @@ def fuzz_stage(ctx) -> dict:
                 "why": "the binary documents its own input format (usage/prompt 'e.g. ...'), "
                        "so the example and a long-field variant of it seed the campaign"})
     except Exception:
-        pass
+        observe.absorbed(_log, "continuing")
     if not fmt and _reads_a_number(ctx, target):
         # No document format to model, and the target converts input text to a number: its bug
         # is behind a VALUE, not a length. `n * 16` wraps at 2**28, and the wrapped product is
@@ -1633,6 +1817,7 @@ def fuzz_stage(ctx) -> dict:
             os.chmod(_exe_probe, 0o755)
             _lin_fields = linear_protocol_for(ctx, target, _exe_probe, _exe_probe.parent)
         except Exception:
+            observe.absorbed(_log, "keeping the default")
             _lin_fields = None
     if _lin_fields:
         from . import menu as _menu2
@@ -1693,7 +1878,7 @@ def _structure_mutator(p, rng, dictionary):
             if g is not None:
                 return _grammar.GrammarMutator(rng, g, dictionary)
         except Exception:
-            pass                                       # bad grammar: fall through to flat structure
+            observe.absorbed(_log, "continuing")
     from . import structure
     model = None
     if p.get("format"):

@@ -23,8 +23,9 @@ from typing import Optional
 
 _log = logging.getLogger(__name__)
 
+from .. import observe
 from ..casestore import CaseStore
-from ..db.dao import DynResultDAO, FindingDAO, FunctionDAO, PocDAO
+from ..db.dao import DynResultDAO, EventDAO, FindingDAO, FunctionDAO, PocDAO
 from ..db.models import STATIC_DETECTORS
 from ..jobs.queue import JobQueue
 from . import budget as budget_mod
@@ -128,7 +129,7 @@ def _wait(store, run_id: str, stop: threading.Event, timeout: float = 900.0) -> 
             try:
                 JobQueue(store.conn).cancel(run_id)
             except Exception:
-                pass
+                observe.absorbed(_log, "continuing")
             return "cancelled"
         r = store.runs.get(run_id)
         if r and r.status in _TERMINAL:
@@ -140,7 +141,7 @@ def _wait(store, run_id: str, stop: threading.Event, timeout: float = 900.0) -> 
     try:
         JobQueue(store.conn).cancel(run_id)
     except Exception:
-        pass
+        observe.absorbed(_log, "continuing")
     return "timeout"
 
 
@@ -241,18 +242,111 @@ def _finalize_plan(status) -> None:
     status["updated"] = time.time()
 
 
+#: Job events the worker emits when a run's thread has actually finished. The row status is NOT
+#: this: `q.cancel()` marks a row `cancelled` while the worker thread runs on inside the stage
+#: function, so a cancelled run can keep working for a minute after the row says otherwise.
+_JOB_TERMINAL = ("job.done", "job.cancelled", "job.failed", "job.error")
+
+
+def _settle(store, case_id: str, *, limit: float = 90.0) -> bool:
+    """Wait until every run this case scheduled has reported a terminal job event.
+
+    The scorecard was closing its books while work was still landing. When the budget runs out,
+    `_staged` cancels the pending runs and returns at once -- but a stage stuck in a
+    non-cooperative native call (afl, qemu, pypcode) does not notice until its own subprocess
+    timeout fires, and it emits its final `.done` whenever that happens.
+
+    Measured on the HTB binary `zigzag` (real-corpus gate, 2026-10-16), relative to the cancel:
+
+        +12s  job.cancel_requested
+        +14s  autopilot.scorecard      <- the card is built
+        +14s  autopilot.done
+        +32s  coverage.done            <- 18s late
+        +64s  directed.done {"execs": 64}   <- 50s late
+
+    The card recorded `executions.total = 0` for a target the campaigns had executed 64 times,
+    and the gate then failed it with "ran once but the campaigns executed it zero times" -- a
+    confidently wrong diagnosis, which this project treats as worse than no answer.
+
+    A quiet-window heuristic cannot fix that: the log was genuinely quiet at +14s and the work
+    landed 50 seconds later. So wait on the real signal instead. The cost is paid only when
+    stages were cancelled mid-flight, which is exactly when the numbers matter most -- and it is
+    bounded, because a wedged stage may never report at all. Returns whether everything reported.
+    """
+    import time as _t
+    placeholders = ",".join("?" * len(_JOB_TERMINAL))
+    deadline = _t.monotonic() + limit
+    while True:
+        try:
+            runs = store.conn.execute(
+                "SELECT COUNT(*) FROM analysis_run WHERE case_id=?", (case_id,)).fetchone()[0]
+            done = store.conn.execute(
+                f"SELECT COUNT(DISTINCT e.run_id) FROM event e "
+                f"JOIN analysis_run r ON r.id = e.run_id "
+                f"WHERE r.case_id=? AND e.type IN ({placeholders})",
+                (case_id, *_JOB_TERMINAL)).fetchone()[0]
+        except Exception:                                # noqa: BLE001 -- advisory
+            observe.absorbed(_log, "answering no")
+            return False
+        if done >= runs:
+            return True
+        if _t.monotonic() >= deadline:
+            _log.debug("scorecard: %d of %d runs still had not reported after %.0fs",
+                       runs - done, runs, limit)
+            return False
+        _t.sleep(0.3)
+
+
+def _done_payloads(store, target, stage) -> list:
+    """Every `<prefix>.done` payload this stage emitted in this case, oldest first.
+
+    Asked of the database BY TYPE. The three readers below each used to take a page of the
+    case's events -- `store.events.list(case_id=..., limit=400)` -- and filter it. That call is
+    `ORDER BY id ASC LIMIT ?`, so the page is the case's OLDEST 400 events, and a 420-second run
+    on one small ELF produces about 2,100. The consequences were not subtle:
+
+      * `primitive.done` -- the L2 result -- first appears at index 459, so it was outside the
+        page entirely and every reader saw "poc_primitive never reported".
+      * `exploit.done` spans index 216 to 2077. `reversed(page)` finds the newest event IN THE
+        PAGE, which is the one at 216: the pre-fuzz attempt that declines with "run fuzz/L2
+        first". The three later attempts, with the crash in hand, were invisible -- so a stage
+        that eventually succeeded would still be reported by its first refusal.
+      * `monitor.done`, `multidebug.done`, `taint.done`, `behavior.done` and
+        `cve_corroborate.done` all land past 2000 and were never visible at all.
+
+    `realgate._last_done_field` already works around this for one stage, and says why in its
+    docstring. The window is the bug, so there is no window here.
+    """
+    prefixes = {p for p, st in _EVENT_STAGE.items() if st == stage} | {stage}
+    try:
+        events = EventDAO(store.conn)
+        out = []
+        for prefix in sorted(prefixes):
+            out.extend(events.payloads_of_type(f"{prefix}.done", case_id=target.case_id))
+        return out
+    except Exception:                                    # noqa: BLE001 -- advisory
+        _log.debug("done-payload lookup failed for stage %s", stage, exc_info=True)
+        return []
+
+
 def _last_done_payload(store, target, stage):
     """The payload of the most recent `<prefix>.done` event for this stage, or None."""
-    want = {p for p, st in _EVENT_STAGE.items() if st == stage} | {stage}
+    payloads = _done_payloads(store, target, stage)
+    return payloads[-1] if payloads else None
+
+
+def _payloads_of(store, target, event_type) -> list:
+    """Every payload of ONE event type in this case, oldest first -- paged to the end.
+
+    Like `_done_payloads`, but for an event that is not a stage's `.done`: the multi-call door
+    report is emitted by `fuzz` before its campaign, and the orchestrator needs it to decide
+    whether there are more doors worth a second pass.
+    """
     try:
-        events = store.events.list(case_id=target.case_id, limit=400)
+        return EventDAO(store.conn).payloads_of_type(event_type, case_id=target.case_id)
     except Exception:                                    # noqa: BLE001 -- advisory
-        return None
-    for e in reversed(events):
-        et = e.type or ""
-        if et.endswith(".done") and et[:-len(".done")] in want:
-            return e.payload if isinstance(e.payload, dict) else None
-    return None
+        _log.debug("payload lookup failed for %s", event_type, exc_info=True)
+        return []
 
 
 def _all_done_payloads(store, target, stage) -> list:
@@ -263,18 +357,7 @@ def _all_done_payloads(store, target, stage) -> list:
     showed what that pass did and silently dropped what the first pass did -- including, on a
     target where the first pass found the bug, the crash itself.
     """
-    want = {p for p, st in _EVENT_STAGE.items() if st == stage} | {stage}
-    try:
-        events = store.events.list(case_id=target.case_id, limit=400)
-    except Exception:                                    # noqa: BLE001 -- advisory
-        return []
-    out = []
-    for e in events:
-        et = e.type or ""
-        if et.endswith(".done") and et[:-len(".done")] in want:
-            if isinstance(e.payload, dict):
-                out.append(e.payload)
-    return out
+    return _done_payloads(store, target, stage)
 
 
 def _stage_decline(store, target, stage):
@@ -285,19 +368,10 @@ def _stage_decline(store, target, stage):
     binary-only target" were the same line. `_declines_from_events` answers the same question
     after the fact; this asks it for one stage, as it finishes.
     """
-    want = {p for p, st in _EVENT_STAGE.items() if st == stage} | {stage}
-    try:
-        events = store.events.list(case_id=target.case_id, limit=400)
-    except Exception:                                    # noqa: BLE001 -- advisory
-        return None
-    for e in reversed(events):
-        et = e.type or ""
-        if not et.endswith(".done") or et[:-len(".done")] not in want:
-            continue
-        pl = e.payload if isinstance(e.payload, dict) else {}
-        if pl.get("supported") is False or pl.get("applicable") is False:
-            return str(pl.get("note") or pl.get("reason") or "could not apply here")[:200]
-        return None
+    pl = _last_done_payload(store, target, stage) or {}
+    if pl.get("supported") is False or pl.get("applicable") is False:
+        return str(pl.get("note") or pl.get("reason") or "could not apply here")[:200]
+    return None
     return None
 
 
@@ -385,6 +459,7 @@ def _stage_detail(store, target, stage) -> str:
                 return f"{v} verified PoC{'s' if v != 1 else ''}"
             return f"{len(pocs)} PoC" if pocs else ""
     except Exception:
+        observe.absorbed(_log, "answering empty")
         return ""
     # RAN AND FOUND NOTHING is a result, and a blank cell is indistinguishable from a stage that
     # did nothing at all. Most stages already say it in their own done event -- "no known
@@ -458,6 +533,14 @@ def _apply_overrides(stage: str, params: Optional[dict], overrides: Optional[dic
 #: measured on /usr/bin/xxd, `coverage_fuzz` returned "done" after 22 s of a 97 s allowance.
 _CAMPAIGN_WANT = 180.0
 
+#: What a blind campaign asks for, in EXECUTIONS. 18,000 is what the previous 180-second want
+#: bought on a plain x86-64 target at the measured ~105 exec/s, so a fast target is unchanged --
+#: and a slow one now gets the seconds that search actually costs instead of the same seconds and
+#: a fifth of the search. `budget.FLOOR_EXECS` refuses a slice too small to mean anything.
+_CAMPAIGN_EXECS = 18_000
+#: Directed fuzzing biases toward known sink sites, so it needs fewer: the old 120-second want.
+_DIRECTED_EXECS = 12_000
+
 #: Mirrors jobs.worker._BUDGET_MARGIN: the orchestrator must outlast the worker's kill deadline,
 #: or it stops waiting on a stage that was about to finish cleanly.
 _WORKER_MARGIN = 1.25
@@ -469,7 +552,7 @@ _EXEC_BOUNDED = frozenset({"fuzz", "coverage_fuzz", "directed_fuzz", "net_fuzz",
 
 
 def _run_target_stage(store, target, stage, status, stop, params=None, *,
-                      budget=None, want=None) -> Optional[str]:
+                      budget=None, want=None, want_execs=None) -> Optional[str]:
     """Run one stage and wait for it, within the slice its phase can afford.
 
     `budget` is the case's divided wall clock (`analyze.budget.CaseBudget`). The slice is handed
@@ -485,11 +568,15 @@ def _run_target_stage(store, target, stage, status, stop, params=None, *,
         return None
     secs = None
     if budget is not None:
-        secs = budget.slice(stage, want)
+        secs = budget.slice(stage, want, want_execs=want_execs)
         if secs <= 0.0:
             # Saying this is the point: "we ran out of time before this stage" and "this stage
             # found nothing" are different outcomes that used to look identical in a report.
-            why = f"no budget left in the {budget.current_phase} phase"
+            # A sampler can also be refused for a THIRD reason -- the clock it would get buys
+            # too few executions to mean anything on this target -- and that reason names the
+            # rate, so it is actionable rather than just a skip.
+            _sz = budget.sizing() if want_execs is not None else {}
+            why = (_sz.get("refused") or f"no budget left in the {budget.current_phase} phase")
             budget.skipped(stage, why)
             _plan_set(status, stage, "skipped", why)
             _emit_stage(store, target.case_id, stage, "skipped", target_id=target.id, detail=why)
@@ -561,6 +648,7 @@ def _run_target_stage(store, target, stage, status, stop, params=None, *,
 
 
 def _staged(budget, store, target, stage, status, stop, params=None, *, want=None,
+            want_execs=None,
             overrides=None):
     """`_run_target_stage` with the case budget in front, for the autopilot's own call sites.
 
@@ -571,7 +659,7 @@ def _staged(budget, store, target, stage, status, stop, params=None, *, want=Non
     over = overrides if overrides is not None else getattr(budget, "overrides", None)
     return _run_target_stage(store, target, stage, status, stop,
                              _apply_overrides(stage, params, over),
-                             budget=budget, want=want)
+                             budget=budget, want=want, want_execs=want_execs)
 
 
 def _run_target_stages(store, target, specs, status, stop) -> dict:
@@ -643,7 +731,7 @@ def _run_target_stages(store, target, specs, status, stop) -> dict:
         try:
             JobQueue(store.conn).cancel(rid)
         except Exception:
-            pass
+            observe.absorbed(_log, "continuing")
         timed_out = not stop.is_set()
         _plan_set(status, stage, "error" if timed_out else "cancelled")
         _emit_stage(store, target.case_id, stage, "error" if timed_out else "cancelled",
@@ -1003,6 +1091,11 @@ _NOT_PER_TARGET = frozenset({"link_case", "ipc_model", "cross_taint", "whole_sys
 #: BUDGET's decision, not this number's -- the pass divides its one slice and leaves any door it
 #: cannot give `libfuzzer_stage.MIN_FUZZ_SECONDS` unrun, and says so.
 _MORE_ENTRY_POINTS = 5
+#: How many more programs inside a MULTI-CALL binary one case fuzzes after the first. The same
+#: argument as `_MORE_ENTRY_POINTS`, one substrate over: busybox is 345 programs behind one
+#: dispatcher, the first campaign takes the deepest parser, and a library-style breadth pass
+#: over the next few costs fuzzing time and nothing else -- there is no build to repeat.
+_MORE_MULTICALL_DOORS = 4
 
 #: `_EXEC_BOUNDED` on purpose: `libfuzzer` and `concolic` search too, and leaving them out is
 #: what produced a fabricated executions-per-second figure.
@@ -1051,7 +1144,13 @@ def _declines_from_events(events) -> dict:
         if pl.get("supported") is False or pl.get("applicable") is False or pl.get("ran") is False:
             prefix = et[:-len(".done")]
             stage = _EVENT_STAGE.get(prefix, prefix)
-            why = str(pl.get("note") or pl.get("reason") or "")[:240]
+            # 600, not 240: `capabilities.classify_decline` reads THIS string -- the gate and
+            # the report both ask it whose fault a decline was -- so a prefix that drops the
+            # phrase naming the category turns an honest refusal into "unclassified", which
+            # the gate prints as a defect. Measured: ten foreign-architecture binaries failed
+            # the real-corpus gate on one decline note whose "cross-arch" sat at character 300.
+            # The notes are bounded prose; the longest in the tree is under 500 characters.
+            why = str(pl.get("note") or pl.get("reason") or "")[:600]
             out.setdefault(stage, why or "declined without a reason")
     return out
 
@@ -1059,7 +1158,8 @@ def _declines_from_events(events) -> dict:
 SCORECARD_EVENT = "autopilot.scorecard"
 
 
-def _scorecard(store, target, bud, status) -> dict:
+def _scorecard(store, target, bud, status, *, absorbed_base=None,
+               settled: bool = True) -> dict:
     """What this run actually DID to the target, recorded whether or not it found anything.
 
     The gap this closes, measured on four stock /usr/bin binaries: one of them
@@ -1079,11 +1179,16 @@ def _scorecard(store, target, bud, status) -> dict:
     by_stage: dict = {}
     _done_execs: dict = {}                               # one report per run of a stage
     _tick_execs: dict = {}                               # a running total, re-reported each tick
+    # `walk`, not a window. This card is built from many event types at once, so unlike the
+    # readers above it really does want every event -- and `limit=8000` was a ceiling, not a
+    # guarantee: a 420-second run on one small ELF already emits ~2,100 events, so a longer
+    # budget or a multi-target case passes 8,000. Past it the counts silently went missing, worst
+    # at the tail where the final campaign totals live.
+    events = []
     try:
-        events = store.events.list(case_id=target.case_id, limit=8000)
+        events = list(EventDAO(store.conn).walk(case_id=target.case_id))
     except Exception:                                    # noqa: BLE001 -- advisory
         _log.debug("scorecard: event read failed", exc_info=True)
-        events = []
     for e in events:
         pl = e.payload if isinstance(e.payload, dict) else {}
         if e.type == "dynamic.done" and "baseline" not in card:
@@ -1213,6 +1318,31 @@ def _scorecard(store, target, bud, status) -> dict:
         # because they are not per-target work.
         "never_scheduled": sorted(registered - scheduled - _NOT_PER_TARGET) if registered else [],
     }
+    # Errors the pipeline absorbed on purpose. Every one is a step that failed and was allowed to
+    # fail -- a parse that did not apply, a probe that could not run -- and before this there was
+    # no way to tell a run that absorbed nothing from a run that absorbed forty. The 187 handlers
+    # that were silent AND unexplained are now counted at their own site, so this is the number
+    # that says "something degraded quietly" out loud. Not a failure: a quantity to look at when
+    # the result is thinner than expected. `observe.absorbed_remote` folds in the standalone
+    # tracers, which run under a different interpreter and ship their list home in their result.
+    # Whether every run had reported when this card was built. False means a stage was still
+    # finishing, so the counts below are a floor rather than the total -- which a reader weighing
+    # "0 executions" has to know, because that is exactly how a wrong zero gets believed.
+    card["settled"] = bool(settled)
+    # What the clock was WORTH on this target. A bare execution count cannot tell a thorough
+    # search from a starved one: 2,761 executions is a good result at 5 exec/s and a near-total
+    # failure at 580. The rate and the budget a comparable search would need make it actionable.
+    try:
+        card["budget"] = {**(card.get("budget") or {}), "advice": bud.advice()}
+    except Exception:                                    # noqa: BLE001 -- advisory
+        observe.absorbed(_log, "keeping the default")
+    absorbed = observe.absorbed_since(absorbed_base or {})
+    card["absorbed"] = {
+        "total": sum(absorbed.values()),
+        "sites": len(absorbed),
+        # The worst offenders, named by module.function:line so they are directly openable.
+        "top": [{"site": k, "count": v} for k, v in list(absorbed.items())[:8]],
+    }
     store.events.append(SCORECARD_EVENT, case_id=target.case_id, payload=card)
     return card
 
@@ -1255,6 +1385,12 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                 continue
             done_tids.add(tid)
             status["target"] = len(done_tids)
+            # PER TARGET, not per case. The absorbed counter is process-wide (the worker pool
+            # outlives any one case), so a per-target figure has to be a difference -- and a
+            # single baseline taken at the top would add the first target's absorptions to the
+            # second one's scorecard. Firmware carving registers a child target per component,
+            # so several targets per case is the normal shape.
+            absorbed_base = observe.absorbed_counts()
             t = store.targets.get(tid)
             if not t:
                 continue
@@ -1272,6 +1408,26 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
             if not t.file_type:
                 _staged(bud, store, t, "ingest_triage", status, stop)
                 t = store.targets.get(tid) or t
+            # EXECUTIONS, not seconds. The clock is the operator's unit, but what a second
+            # BUYS is not constant: an ASan build of the same binary runs ~5x slower, and it is
+            # the only configuration whose oracle can see a heap out-of-bounds access at all.
+            # Dividing seconds therefore handed the search that can find the bug a 5x smaller
+            # one. See budget.exec_rate / budget.CaseBudget.slice(want_execs=...).
+            _sub = substrate.of(t.file_type)
+            _san = False
+            try:
+                from .fuzz.aflpp import is_sanitizer_build
+                _san = is_sanitizer_build(ctx_bytes := store.content.path(t.sha256).read_bytes())
+                del ctx_bytes
+            except Exception:                            # noqa: BLE001 -- advisory
+                observe.absorbed(_log, "keeping the default")
+            bud.set_exec_rate(budget_mod.exec_rate(_sub.execs_per_sec, sanitizer=_san))
+            if _san:
+                _adv = bud.advice()
+                ctx_note = _adv["note"]
+                store.events.append("budget.exec_rate", case_id=t.case_id,
+                                    payload={"target_id": t.id, "sanitizer": True, **_adv})
+                _log.info("instrumented build: %s", ctx_note)
             # The plan is built AFTER triage, not before: it is chosen from the target's
             # substrate, and for an untriaged target that was an empty string.
             _init_plan(status, t, len(done_tids), len(worklist))
@@ -1511,9 +1667,9 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
             # channel, which is what this needs, since a bytecode target has no call edges and so
             # no channel ranking either.
             if _nonnative_image(t):
-                _staged(bud, store, t, "fuzz", status, stop, fz, want=_CAMPAIGN_WANT)
+                _staged(bud, store, t, "fuzz", status, stop, fz, want_execs=_CAMPAIGN_EXECS)
             elif _staged(bud, store, t, "coverage_fuzz", status, stop, dyn,
-                         want=_CAMPAIGN_WANT) != "done" or \
+                         want_execs=_CAMPAIGN_EXECS) != "done" or \
                     bud.slice("fuzz") > 0:
                 # The blind campaign is a SECOND campaign, not only a fallback. Measured on
                 # /usr/bin/xxd with a 400s budget: coverage_fuzz returned "done" after 22s of a
@@ -1530,8 +1686,21 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                 # happen, and the run then reports only static findings -- "nothing was run"
                 # wearing the face of "nothing was found", at campaign scale. The blind stage
                 # carries none of those preconditions, so it runs the same corpus regardless.
-                _staged(bud, store, t, "fuzz", status, stop, fz, want=_CAMPAIGN_WANT)
-            _staged(bud, store, t, "directed_fuzz", status, stop, dyn, want=120.0)
+                _staged(bud, store, t, "fuzz", status, stop, fz, want_execs=_CAMPAIGN_EXECS)
+            # THE REST OF THE DISPATCH TABLE. A multi-call binary is many programs behind one
+            # image and the campaign above drove ONE of them -- the deepest parser among the
+            # doors the stage verified by running them. busybox 1.21.1 opens 14: every
+            # decompressor it carries, which is also where its own CVE list starts (an
+            # out-of-bounds read in unlzma). Taking the next few is the `libfuzzer` breadth pass
+            # again with no build to repeat, so it costs only fuzzing time.
+            _mc = (_payloads_of(store, t, "fuzz.multicall") or [{}])[-1]
+            _rest = [d for d in (_mc.get("doors") or []) if d != _mc.get("chosen")]
+            for _door in _rest[:_MORE_MULTICALL_DOORS]:
+                if stop.is_set():
+                    break
+                _staged(bud, store, t, "fuzz", status, stop, dict(fz, multicall_door=_door),
+                        want_execs=_CAMPAIGN_EXECS)
+            _staged(bud, store, t, "directed_fuzz", status, stop, dyn, want_execs=_DIRECTED_EXECS)
             crashes = _distinct_crashes(store, tid)
             # Multi-channel retry: the best-guess channel is not always where the bug is (a file
             # parser's overflow can be in the argv filename). If nothing crashed, drive the fast
@@ -1583,7 +1752,7 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
             cve_origin = _cve_crash_origins(store, tid)
             cve_best: dict = {}
 
-            def _note_escalation(cve, before):
+            def _note_escalation(cve, before, tid=tid, cve_best=cve_best):
                 after = _max_verified_poc_level(store, tid)
                 if cve and after > before and after >= 2:    # the ladder raised THIS CVE crash to L2/L3
                     cve_best[cve] = max(cve_best.get(cve, 0), after)
@@ -1710,7 +1879,13 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
             _finalize_plan(status)          # any step never reached is marked skipped
             # Record what this run DID, not only what it found. See _scorecard.
             try:
-                status["scorecard"] = _scorecard(store, t, bud, status)
+                # Let the log settle first: a stage cancelled when the budget ran out is still
+                # running, and its final `.done` -- carrying the executions it managed -- lands
+                # after this point. See _settle.
+                _settled = _settle(store, t.case_id)
+                status["scorecard"] = _scorecard(store, t, bud, status,
+                                                 absorbed_base=absorbed_base,
+                                                 settled=_settled)
             except Exception:                            # noqa: BLE001 -- never fail a run on this
                 _log.debug("scorecard failed for %s", tid, exc_info=True)
         # Case-level cross-binary analysis for a multi-binary case (a carved firmware's extracted
@@ -1735,6 +1910,6 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
         try:
             store.events.append("autopilot.error", level="error", case_id=case_id, payload={"error": str(e)})
         except Exception:
-            pass
+            observe.absorbed(_log, "continuing")
     finally:
         store.close()

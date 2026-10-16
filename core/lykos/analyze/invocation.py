@@ -470,6 +470,284 @@ def from_subcommands(help_text: str) -> "tuple[Optional[str], list]":
     return best, names
 
 
+# --------------------------------------------------------------------------- multi-call binaries
+# A MULTI-CALL binary is one executable that is many programs, chosen by the first positional
+# argument (or by argv[0] through a symlink). busybox is the canonical one and it is everywhere
+# this project's firmware work points: 347 programs in a 1 MB static image, and every embedded
+# device has one.
+#
+# `from_subcommands` cannot see it, for two reasons that are both about shape rather than about
+# busybox. Its dispatch hint wants `usage: tool <command>` and busybox writes
+# `Usage: busybox [function [arguments]...]`; and its row parser wants one command per line with
+# a description, where a multi-call binary prints a WRAPPED, comma-separated block of bare names
+# under `Currently defined functions:`. So the campaign fuzzed `busybox` itself -- which parses
+# nothing, prints its usage and exits -- and the parsers behind the dispatch (unlzma, tar, awk;
+# busybox 1.21.1's own CVE list is an out-of-bounds read in the unlzma decompressor and a
+# use-after-free in awk) were never reached at all.
+_MULTICALL_HINT = re.compile(r"(?im)multi-call binary"
+                             r"|^\s*usage:\s*\S+\s+\[?(?:function|applet)\b")
+#: The listing a multi-call binary offers about itself. Far better evidence than parsing wrapped
+#: help text, and it is the binary's own answer rather than ours.
+_LIST_FLAGS = ("--list", "--list-full")
+#: `Currently defined functions:` / `Applets:` and the block of bare names under it.
+_LIST_HEADER = re.compile(r"(?im)^[ \t]*(?:currently defined functions|applets|functions|"
+                          r"commands)[ \t]*:[ \t]*$")
+#: A bare name in such a block: `[`, `[[`, `add-shell`, `dpkg-deb`, `nslookup`. Comma- or
+#: whitespace-separated, and the `[`/`[[` forms are dropped because they are the test builtin.
+_LIST_NAME = re.compile(r"[a-z][a-z0-9][a-z0-9_.-]{0,20}")
+#: Programs a campaign must NOT invoke. These act on the HOST rather than parse an input, and
+#: "it runs in a sandbox" is not a reason to fire them: the sandbox bounds memory, the filesystem
+#: view and the process tree -- it does not change what `reboot`, `mkfs` or `passwd` MEAN. The
+#: list is deliberately about EFFECT, so it reads the same for any multi-call binary, not just
+#: busybox.
+_MULTICALL_DENY = re.compile(
+    r"(?i)^(?:reboot|halt|poweroff|shutdown|init|linuxrc|telinit|runlevel"
+    r"|kill|killall|killall5|pkill|fuser"
+    r"|rm|rmdir|shred|mkfs[.\w]*|mkdosfs|mke2fs|makedevs|mknod|devmem|fdisk|sfdisk|fsck\w*|wipefs|dd|mount|umount"
+    r"|swapon|swapoff|losetup|blockdev|mkswap|freeramdisk|fdformat|eject"
+    r"|insmod|rmmod|modprobe|depmod|lsmod|chroot|pivot_root|switch_root|setarch"
+    r"|hwclock|date|rdate|ntpd|adjtimex"
+    r"|passwd|chpasswd|adduser|deluser|addgroup|delgroup|add-shell|remove-shell"
+    r"|su|login|sulogin|getty|vlock|chown|chgrp|chmod|chattr"
+    r"|ifconfig|ifup|ifdown|ip|route|arp|arping|iptables|brctl|udhcpc|udhcpd|dhcprelay"
+    r"|telnetd|httpd|ftpd\w*|inetd|crond|klogd|syslogd|watchdog|nbd-client|zcip"
+    r"|poweroff|acpid|mdev|hotplug\w*|run-init|nohup|setsid|start-stop-daemon)$")
+#: Parser DEPTH, in order. Each entry is a shape rather than a name list, so it ranks the
+#: applets of any multi-call binary: a decompressor reads a whole format from one stream and is
+#: the deepest single-input parser a utility box has; then archive readers, then text/record
+#: parsers. `_READ_CMD_PRIORITY` orders what is left over, exactly as for a subcommand tool.
+_MULTICALL_PRIORITY = (
+    re.compile(r"^(?:un(?:lzma|xz|zip|compress|lzop|gzip)|lzcat|xzcat|bzcat|zcat|lzopcat|gunzip"
+               r"|bunzip2|lzma|xz|gzip|bzip2|lzop|compress)$"),
+    re.compile(r"^(?:tar|cpio|ar|rpm|rpm2cpio|dpkg|dpkg-deb|unzip|zip)$"),
+    re.compile(r"^(?:awk|sed|ed|diff|patch|od|hexdump|xxd|strings|base64|uudecode|uuencode"
+               r"|dos2unix|unix2dos|expand|unexpand|fold|sort|uniq|cut|tr|grep|egrep|fgrep)$"),
+    re.compile(r"^(?:cat|head|tail|wc|md5sum|sha1sum|sha256sum|sha512sum|cksum|cmp|file|readelf"
+               r"|nm|objdump|lsattr|stat)$"),
+)
+
+
+def is_multicall(help_text: str) -> bool:
+    """Does this text say the program is a multi-call binary?
+
+    Exposed because the caller has to decide whether to spend an execution looking for the
+    listing, and because `_help_text` -- which scores candidate help outputs by how many OPTION
+    rows they carry -- returns None for busybox: its usage has no `-x` rows at all, and its
+    programs are a wrapped comma-separated block rather than one described command per line. So
+    the stage asks this of the bare invocation's own output when the scored help text has
+    nothing to say, which is how the dispatcher is found on the one target it matters most for.
+    """
+    return bool(_MULTICALL_HINT.search(help_text or ""))
+
+
+def multicall_names(help_text: str, *, list_output: Optional[str] = None) -> list:
+    """The programs a multi-call binary contains, or [] when it is not one.
+
+    `list_output` is what the binary printed for its own listing flag (see `multicall_list_flag`);
+    when it is absent the names are read out of the block under the help text's own header, which
+    is the same information wrapped.
+    """
+    if not _MULTICALL_HINT.search(help_text or ""):
+        return []
+    text = list_output if list_output else _block_after_header(help_text or "")
+    if not text:
+        return []
+    out, seen = [], set()
+    for m in _LIST_NAME.finditer(text):
+        name = m.group(0)
+        if name in seen:
+            continue
+        seen.add(name)
+        out.append(name)
+    return out
+
+
+def _block_after_header(help_text: str) -> str:
+    """The wrapped block of names under `Currently defined functions:`, or ""."""
+    m = _LIST_HEADER.search(help_text)
+    if not m:
+        return ""
+    rest = help_text[m.end():]
+    # The block ends at the first blank line that is followed by something unindented, which is
+    # how busybox separates it from whatever a build appends after it.
+    lines = []
+    for ln in rest.splitlines():
+        if not ln.strip():
+            if lines:
+                break
+            continue
+        lines.append(ln)
+    return "\n".join(lines)
+
+
+def multicall_list_flag(help_text: str) -> Optional[str]:
+    """The listing flag this binary documents for itself, or None.
+
+    Taken from the help text rather than tried blind: a flag we invent is a flag some other
+    program means something else by.
+    """
+    low = (help_text or "").lower()
+    for flag in _LIST_FLAGS:
+        if flag in low:
+            return flag
+    return None
+
+
+def rank_multicall(names) -> list:
+    """The contained programs worth fuzzing, deepest parser first. An ALLOW-list, by shape.
+
+    A multi-call binary is not a subcommand tool with a few verbs: busybox lists 345 programs,
+    and among them are `reboot`, `mkfs.ext2`, `devmem` (physical memory), `passwd`, `nc`, `wget`
+    and the whole of service supervision. A deny-list is the wrong instrument for that -- it has
+    to be complete to be safe, and one name nobody thought of is a campaign firing `mkfs.vfat`
+    with a mutated argv. So this returns ONLY what a shape pattern recognises as a program that
+    reads one input and parses it: a decompressor, an archive reader, a text/record parser, a
+    hash or a dumper. Everything else is left alone, including things that would be harmless,
+    and the count of what was skipped is reported rather than hidden.
+
+    The order is the second half of the job: a budget buys a handful of doors out of 345, so
+    depth-first is what decides whether the search reaches a real parser. Decompressors come
+    first because one reads an entire format from a single stream -- and busybox 1.21.1's own
+    CVE list leads with an out-of-bounds read in the unlzma decompressor.
+    """
+    out = []
+    for n in names:
+        if len(n) < 2 or _MULTICALL_DENY.match(n) or n in _NONREAD_CMD:
+            continue
+        tier = next((i for i, pat in enumerate(_MULTICALL_PRIORITY) if pat.match(n)), None)
+        if tier is None:
+            continue                                  # unknown effect: not invoked
+        out.append((tier, n))
+    out.sort()
+    return [n for _, n in out]
+
+
+#: Argv shapes to try for one contained program, in order. Bare stdin first, because every
+#: decompressor and every filter in a utility box reads it; then the file positional; then the
+#: two list-an-archive forms, which is what an archive reader needs to parse a whole container
+#: without unpacking it anywhere.
+_MULTICALL_SHAPES = ((), (INPUT_PLACEHOLDER,), ("-t", INPUT_PLACEHOLDER), ("-tf", INPUT_PLACEHOLDER),
+                     ("-d",), ("-f", INPUT_PLACEHOLDER))
+#: A program whose BARE invocation compresses instead of parsing. Both directions accept the
+#: input and neither prints a usage line, so the probe below cannot tell them apart -- and the
+#: difference is the whole point: compressing our own mutated bytes exercises a writer, while
+#: `-d` runs the decompressor, which is the parser that reads attacker-controlled structure.
+_COMPRESSOR = re.compile(r"^(?:gzip|bzip2|xz|lzma|lzop|compress|zip)$")
+#: What a program prints when it did NOT accept the invocation. Checked in the OUTPUT rather than
+#: in the exit code: busybox exits 1 both for "usage" and for "that is not a valid archive", and
+#: the second one is a parser that ran, which is exactly what a door is.
+_REFUSED = re.compile(r"(?im)^\s*(?:usage|busybox\b.*multi-call|.*applet not found)")
+
+
+#: The program inside the SAME image that produces what a door consumes. A utility box ships
+#: both directions of every codec it has, so the target can generate its own valid seed -- which
+#: is the one thing a decompressor fuzzing campaign actually needs. Measured elsewhere in this
+#: project: jhead took 98,500 executions to find nothing where a valid sample found the bug in
+#: 60 seconds, because a parser rejects random bytes before reaching any of its own logic.
+_MULTICALL_INVERSE = {
+    "unlzma": "lzma", "lzcat": "lzma", "unxz": "xz", "xzcat": "xz",
+    "bunzip2": "bzip2", "bzcat": "bzip2", "gunzip": "gzip", "zcat": "gzip",
+    "unlzop": "lzop", "lzopcat": "lzop", "uncompress": "compress", "unzip": "zip",
+}
+
+
+def multicall_inverse(name: str) -> Optional[str]:
+    """The contained program that WRITES what `name` reads, or None."""
+    return _MULTICALL_INVERSE.get((name or "").lower())
+
+
+def multicall_seed(run, name: str, *, text: bytes = b"lykos seed\n" * 8) -> bytes:
+    """A valid input for this door, made by the target's own inverse program, or b"".
+
+    `run(argv, stdin) -> result` as for `multicall_doors`. The seed is the target's answer, not
+    ours: nothing here knows the LZMA header, and nothing here has to.
+    """
+    inverse = multicall_inverse(name)
+    if not inverse:
+        return b""
+    try:
+        r = run([inverse], text)
+    except Exception:                                   # noqa: BLE001 -- seeding is best-effort
+        return b""
+    out = getattr(r, "stdout", b"") or b""
+    # It has to be COMPRESSED output: not the text echoed back, and not the usage line a
+    # program prints when it does not have an inverse by that name -- a multi-call binary
+    # answers an unknown function with its own help, and help text makes a terrible seed.
+    if not out or out == text or _REFUSED.search(out.decode("utf-8", "replace")):
+        return b""
+    return bytes(out)
+
+
+#: Three names, one decoder: `bunzip2`, `bzcat` and `bzip2 -d` are the same code reached three
+#: ways, and a budget that buys five doors must not spend them all on bzip2. The family is what
+#: a door is really a door INTO, so the probe keeps the first that opens per family and moves on.
+#: Without this, busybox's eight verified doors were bunzip2/bzcat/bzip2/gunzip/gzip/lzcat/... --
+#: two distinct decoders in the first five, and `unlzma`, the one its CVE list names, unreached.
+_CODEC_FAMILY = {
+    "bunzip2": "bzip2", "bzcat": "bzip2", "bzip2": "bzip2",
+    "gunzip": "gzip", "zcat": "gzip", "gzip": "gzip",
+    "unlzma": "lzma", "lzcat": "lzma", "lzma": "lzma",
+    "unxz": "xz", "xzcat": "xz", "xz": "xz",
+    "unlzop": "lzop", "lzopcat": "lzop", "lzop": "lzop",
+    "uncompress": "compress", "compress": "compress", "zcat.compress": "compress",
+    "unzip": "zip", "zip": "zip",
+    "egrep": "grep", "fgrep": "grep", "grep": "grep",
+    "md5sum": "hash", "sha1sum": "hash", "sha256sum": "hash", "sha512sum": "hash",
+    "sha3sum": "hash", "cksum": "hash", "sum": "hash",
+    "hexdump": "hexdump", "hd": "hexdump", "od": "hexdump", "xxd": "hexdump",
+    "dos2unix": "d2u", "unix2dos": "d2u",
+    "uudecode": "uu", "uuencode": "uu",
+}
+
+
+def codec_family(name: str) -> str:
+    """The decoder `name` reaches, or the name itself when it is the only way in."""
+    return _CODEC_FAMILY.get((name or "").lower(), (name or "").lower())
+
+
+def multicall_doors(run, names, *, sample: bytes = b"", cap: int = 8,
+                    probe_cap: int = 24) -> list:
+    """[(program, argv)] for the contained programs that ACCEPT an invocation, verified by running.
+
+    Proposing is not knowing. `tar` with the input on stdin prints its usage and exits, `unlzma`
+    reads it, and nothing in a name says which -- so each candidate costs one execution against
+    the target's own behaviour, and a program that refuses every shape is dropped rather than
+    fuzzed through a door that was never open. That is the same contract `verify` applies to a
+    discovered flag set, for the same reason: an unverified proposal produces a campaign that
+    executes thousands of times and never enters the parser.
+
+    `run(argv, stdin) -> result` is injected so this is testable without a sandbox. Two bounds
+    on the cost, because 345 candidates * 6 shapes is not a budget anyone would spend looking
+    for a door: `cap` stops once enough are open, and `probe_cap` stops a binary whose programs
+    all refuse from being probed to the end of the list -- which under qemu is the expensive
+    case, at tens of milliseconds per execution.
+    """
+    doors: list = []
+    families: set = set()
+    for name in list(names)[:probe_cap]:
+        if len(doors) >= cap:
+            break
+        if codec_family(name) in families:
+            continue                                    # the same decoder, reached another way
+        shapes = _MULTICALL_SHAPES
+        if _COMPRESSOR.match(name):
+            shapes = (("-d",),) + tuple(sh for sh in shapes if sh != ("-d",))
+        for shape in shapes:
+            argv = [name] + [str(a) for a in shape]
+            try:
+                r = run(argv, sample)
+            except Exception:                           # noqa: BLE001 -- probing is best-effort
+                continue
+            blob = ((getattr(r, "stdout", b"") or b"") + b"\n"
+                    + (getattr(r, "stderr", b"") or b"")).decode("utf-8", "replace")
+            if _REFUSED.search(blob):
+                continue
+            doors.append((name, argv))
+            families.add(codec_family(name))
+            break
+    return doors
+
+
 def discover(strings, *, usage_hint: Optional[str] = None, help_text: Optional[str] = None) -> dict:
     """Everything we can say about how to invoke this target.
 

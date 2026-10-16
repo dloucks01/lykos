@@ -23,6 +23,9 @@ from pathlib import Path
 
 CORE = Path(__file__).resolve().parent.parent / "core"
 import sys
+
+from lykos import observe  # noqa: E402
+
 if str(CORE) not in sys.path:
     sys.path.insert(0, str(CORE))
 
@@ -35,6 +38,31 @@ _OVERFLOW_SRC = r"""#include <stdio.h>
 int main(void){ char b[64]; printf("in: ");
   if(scanf("%s", b) != 1) return 0;
   printf("hi %s\n", b); return 0; }"""
+
+
+# A MULTI-CALL binary: one image that is several programs, selected by the first positional
+# argument, with the bug behind one of them. busybox is the real article -- 345 programs in a
+# 1 MB static ELF, and the most common binary in the firmware this tool carves -- and the
+# pipeline used to fuzz the IMAGE, which parses nothing and prints its usage. The listing it
+# offers (`--list`) and the wrapped block under `Currently defined functions:` are both here
+# because the discovery reads whichever it finds. `reboot` is in the list and must never be
+# invoked: the campaign is allowed to drive a program only when its shape says it reads one
+# input, so a name nobody classified is left alone rather than fired with a mutated argv.
+_MULTICALL_SRC = r"""#include <stdio.h>
+#include <string.h>
+static void usage(void){
+  printf("FAKEBOX v1.0 (2026-10-16) multi-call binary.\n\n"
+         "Usage: fakebox [function [arguments]...]\n   or: fakebox --list\n\n"
+         "Currently defined functions:\n\tunlzma, reboot, cat\n"); }
+static void do_unlzma(void){
+  char buf[64]; char in[4096]; size_t n = fread(in, 1, sizeof in - 1, stdin);
+  in[n] = 0; strcpy(buf, in); printf("decoded %zu\n", strlen(buf)); }
+int main(int c, char **v){
+  if(c < 2){ usage(); return 1; }
+  if(!strcmp(v[1], "--list")){ printf("unlzma\nreboot\ncat\n"); return 0; }
+  if(!strcmp(v[1], "unlzma")){ do_unlzma(); return 0; }
+  if(!strcmp(v[1], "cat")){ int ch; while((ch = getchar()) != EOF) putchar(ch); return 0; }
+  usage(); return 1; }"""
 
 
 @dataclass
@@ -130,6 +158,14 @@ def _csc_build(source: str, out: str):
     """A (argv, output-glob) build pair that compiles one C# file with the SDK's csc."""
     return (["sh", "-c", _CSC_PRELUDE % (source, out)], out)
 
+
+#: Keep a FAILING case's store on disk instead of deleting it (`--keep-failed`).
+#: `corpus_regression.py` already does this ("case kept for diagnosis"); this gate did not, so a
+#: failure left nothing behind to look at -- the only evidence of WHY a case fell short is its
+#: event log, and the event log went with the directory. Measured the hard way: a case that
+#: reached L2 instead of L3 got diagnosed from a stale directory belonging to a different run,
+#: and the conclusion drawn from it was wrong.
+KEEP_FAILED = False
 
 _CASES: list[Case] = [
     Case("no_pie_ret2win",
@@ -608,6 +644,17 @@ int main(void){ setvbuf(stdout,0,2,0);
          cross="mips64el-linux-gnuabi64-", budget=420.0,
          note="ARCH mips64el: 64-bit little-endian MIPS, sharing its e_machine with MIPS32 -- the "
               "case that would have caught qemu-mips64el being unreachable"),
+
+    # The MULTI-CALL case. Without the dispatch discovery this target is unfuzzable: every
+    # execution of the bare image prints its usage and exits, which is a clean run against a
+    # program carrying an unbounded strcpy one argument away. The gate asserts the whole chain
+    # -- read the listing, allow-list by shape (so `reboot` is never invoked), verify the door
+    # by running it, fuzz THROUGH it, and reach a verified PoC.
+    Case("multicall_dispatch", _MULTICALL_SRC,
+         ["-fno-stack-protector", "-O0", "-no-pie", "-w"],
+         want_level=1, want_cwe=("CWE-121", "CWE-787", "CWE-119"), budget=300.0,
+         note="DISPATCH multi-call: the bug is behind `unlzma`, and the image itself only "
+              "dispatches -- busybox's shape, which is every firmware image's shape"),
 
     # ---- FILE FORMATS / FRONT-ENDS. The platform parses PE, JVM, CPython bytecode, WASM and
     # UPX-packed ELF, but every case above is a plain ELF, so a front-end could stop recognising its
@@ -1141,6 +1188,42 @@ int main(int argc, char **argv){ setvbuf(stdout,0,2,0);
               "string names both the flag AND its valid value, so discovery is possible -- demanding "
               "a magic value that appears nowhere would test nothing but luck"),
 
+    # ---- STRUCTURED INPUT -> L3. Every L3 case above hands the target a payload that is nothing
+    # but filler, so the ladder could reach a shell while being completely unable to inherit what
+    # L2 had learned -- and it was. `_l2_offset` paged a poc_primitive run's events with
+    # `limit=60`, the `primitive.done` carrying the confirmed offset is second-to-last of ~131, so
+    # the lookup returned None every time, the "prefer the confirmed L2 offset" branch was dead
+    # code, and build_exploit fell back to its own bare-cyclic probe.
+    #
+    # On an unstructured target that fallback works, which is why `no_pie_ret2win` stayed green
+    # and the defect shipped. Here it cannot work at all: the sink is behind a `key=value` parse,
+    # so a payload that is not a `name=` line never reaches the strcpy and nothing faults. The
+    # only route to L3 is to inherit the offset, the channel and the framing that L2 measured.
+    #
+    # Deliberately the EASIEST possible L3 otherwise -- no PIE, no canary, partial RELRO, an
+    # in-binary win() that execve's a shell -- so a failure here is about the handoff and nothing
+    # else.
+    Case("structured_l3_ret2win",
+         r"""#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+void win(void){ setuid(0); execl("/bin/sh","sh",NULL); }
+static void parse(const char *line){
+  char value[64];
+  const char *eq = strchr(line, '=');
+  if(!eq){ puts("no '=' in that line"); return; }
+  strcpy(value, eq + 1);                 /* unbounded: only reachable through a key=value line */
+  printf("set %s\n", value); }
+int main(void){ char line[512]; setvbuf(stdout,0,2,0);
+  while(fgets(line, sizeof line, stdin)) parse(line);
+  return 0; }""",
+         ["-no-pie", "-fno-stack-protector", "-O0", "-w"],
+         want_level=3, want_cwe=("CWE-121", "CWE-787", "CWE-119"), budget=420.0,
+         note="STRUCTURED INPUT to L3: the overflow sits behind a `key=value` parse, so the raw "
+              "cyclic pattern build_exploit falls back to cannot fault at all. Reaching L3 means "
+              "inheriting the offset, the channel AND the framing that poc_primitive confirmed"),
+
     # ---- SOURCE INPUT. The mission is "binaries AND source" and nothing covered the source half.
     # It also matters for capability, not just coverage: the platform builds a source target with
     # ASan+UBSan, and these three defects are exactly the ones that do NOT fault in a plain build,
@@ -1216,6 +1299,79 @@ int main(void){ setvbuf(stdout,0,2,0);
          as_source=True, budget=420.0,
          note="SOURCE integer overflow into an allocation: UBSan reports the wrap directly rather "
               "than waiting for a fault that may never come"),
+
+    # ---- THE LEAK -> ROP CHAIN. An out-of-bounds READ can never reach L3 by itself: it gives
+    # DISCLOSURE, and control-flow hijack needs a WRITE. So the honest chain is read -> ASLR
+    # defeat -> an existing write primitive -> ROP, and it only closes if four things cross the
+    # L2/L3 boundary together: the control offset, the input channel, the FRAMING, and the input
+    # that provokes the disclosure. The recovered base itself must NOT cross -- it belongs to a
+    # process that has already exited.
+    #
+    # Both defects are behind a structured command, which is the point: the generic leak sweep
+    # (`%p` dumps, runs of `A`) finds neither, and a bare cyclic reaches neither sink. And the
+    # program loops, because the disclosure and the overflow have to happen in the SAME process
+    # or the base is stale before it is used.
+    #
+    # `as_source`, which makes this the first case to demand L3 of a SOURCE drop. That path was
+    # structurally impossible until ingest kept an uninstrumented build: the ingested target is
+    # the ASan+UBSan build, which aborts at the copy before the corrupted return is reached, and
+    # aborts inside the over-read before the program prints anything.
+    Case("oob_leak_pie_ret2win",
+         r'''#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+void win(void){ setuid(0); execl("/bin/sh","sh",(char*)0); }
+/* its OWN frame, so the saved return sits just above the buffer */
+__attribute__((noinline)) static void greet(const char *d, size_t n){
+  char name[64]; memcpy(name, d, n); puts(name); }
+int main(void){ setvbuf(stdout,0,2,0); setvbuf(stdin,0,2,0);
+  char *buf = (char*)malloc(64);
+  void **nb = (void**)malloc(64);        /* the NEIGHBOUR a forward over-read runs into */
+  nb[0]=(void*)win; nb[1]=(void*)stdout; nb[2]=(void*)nb; nb[3]=(void*)win;
+  memset(buf,'X',64);
+  char line[512];
+  for(;;){ ssize_t n = read(0,line,sizeof(line)-1); if(n<=0) return 0; line[n]=0;
+    if(!strncmp(line,"show=",5)){        /* over-read: the LENGTH is the attacker's */
+      long w=strtol(line+5,NULL,10); if(w>0) fwrite(buf,1,(size_t)w,stdout);
+      fflush(stdout); continue; }
+    if(!strncmp(line,"name=",5)){ greet(line+5,(size_t)n-5); continue; }
+    return 0; } }''',
+         # want_cwe is EMPTY on purpose. `_scored` is `lvl_ok or bool(demod)`, so a case that
+         # lists CWEs passes the moment any matching poc-backed finding turns up, whatever level
+         # it reached -- this case passed twice at L2 while its source said `want_level=3`
+         # **[measured]**. With no CWE arm, only the level can satisfy it, and the level is the
+         # whole point here: every CWE this target carries is already gated by another case.
+         [], want_level=3, want_cwe=(),
+         as_source=True, budget=600.0,
+         note="SOURCE out-of-bounds READ whose disclosure defeats ASLR, in a program that also "
+              "has the write primitive to spend it on. Driven with the two inputs SUPPLIED, the "
+              "whole chain is confirmed end to end: the read's own output recovers the true PIE "
+              "and libc bases (10/10 runs, checked against /proc/<pid>/maps), poc_primitive "
+              "confirms IP control at offset 88 on the uninstrumented build in the `name=` "
+              "framing, and build_exploit replays the disclosure recipe live, relocates the "
+              "payload and pops a SHELL -- graded by a nonce challenge that comes back evaluated, "
+              "which an echoing target cannot fake [measured 2026-10-16]. The level asserted here "
+              "is L3 and the AUTOPILOT reaches it UNAIDED: 422s of this 600s budget, measured "
+              "2026-10-16. Getting there took four defects that all had to fall, and each was "
+              "invisible until the one before it was fixed:\n"
+              "        (1) a source drop's ingested target IS the ASan build, which aborts "
+              "inside the over-read (nothing reaches stdout) and at the overflow copy (the "
+              "corrupted return is never reached) -- so ingest keeps a `plain-blob` and the two "
+              "stages split the roles;\n"
+              "        (2) corpus distillation dropped the boundary seed, because `show=<big>` "
+              "covers the same blocks as `show=0` and coverage cannot see VALUES -- 121 seeds to "
+              "1. Value seeds are forced-keep now (`fuzz.stage.value_seeds_for`);\n"
+              "        (3) verb mining discarded `show=`, matching pure-alpha tokens only, so "
+              "the dispatch literal was never a verb and 16 symbol fragments filled the cap;\n"
+              "        (4) the seed budget went entirely to the triple enumeration "
+              "(n*(n-1)*(n-2) = 3,360 against a 96 cap), starving the argument-bearing and "
+              "single families to zero.\n"
+              "        A length argument's productive magnitude is MODERATE, not maximal: 65 "
+              "through 4294967295 all fault here and -1/LONG_MAX/SIZE_MAX fault NOTHING, "
+              "because the C library rejects an operation that large before touching memory. "
+              "Keep `want_cwe` empty: `_scored` is `lvl_ok or bool(demod)`, so a CWE arm would "
+              "let this pass at L2 and hide a regression in the whole chain."),
 
     # ---- MULTIPLE DEFECTS. Every case above asserts ONE effect on one target; the mission claim is
     # "find EVERY crash", so this binary carries two unrelated bugs behind a menu and both must be
@@ -1328,7 +1484,7 @@ def _bundle_reproduces(s, target, case, timeout: float = 120.0):
     blob = s.content.get_bytes(pocs[-1].bundle_sha)
     out = Path(tempfile.mkdtemp(prefix="conf-bundle-"))
     try:
-        tf = tarfile.open(fileobj=io.BytesIO(blob))
+        tf = tarfile.open(fileobj=io.BytesIO(blob))      # noqa: SIM115 -- closed in the finally
         try:
             tf.extractall(out, filter="data")            # py>=3.12; the bundle is our own tar
         except TypeError:                                # noqa: PERF203 -- older tarfile
@@ -1381,13 +1537,14 @@ def _scored(maxlvl, demod, case, file_type=None):
 
 
 def _run_case(case: Case, gcc: str) -> Result:
-    from lykos.casestore import CaseStore
     from lykos.analyze import register
-    from lykos.analyze.ingest import ingest, enqueue_triage
+    from lykos.analyze.ingest import enqueue_triage, ingest
     from lykos.analyze.orchestrate import run_case_autopilot
-    from lykos.db.dao import FindingDAO, TargetDAO
+    from lykos.casestore import CaseStore
+    from lykos.db.dao import TargetDAO
     from lykos.jobs import JobConfig, JobQueue, WorkerPool
     d = Path(tempfile.mkdtemp(prefix="conf-"))
+    keep = False                                 # set below when a FAILING case is worth keeping
     (d / "t.c").write_text(case.src)
     exe = d / case.name
     for need in case.requires:
@@ -1505,11 +1662,15 @@ def _run_case(case: Case, gcc: str) -> Result:
                                                            sorted({c for _, c, _ in demod}))
         else:
             why = "want L%d / %s demonstrated; got L%d" % (case.want_level, case.want_cwe, maxlvl)
+        if not ok and KEEP_FAILED:
+            keep = True
+            why += f" -- case kept for diagnosis: {d}"
         return Result(case.name, ok, "%s L%d%s" % (prof, maxlvl, "*" if early else ""), shown,
                       int(time.time() - t0), why)
     finally:
         pool.stop(grace=5.0); s.close()
-        shutil.rmtree(d, ignore_errors=True)
+        if not keep:
+            shutil.rmtree(d, ignore_errors=True)
 
 
 def verify_op_model_sharing(gcc: str) -> bool:
@@ -1602,7 +1763,41 @@ def verify_determinism(gcc: str, case_name: str = "argv_overflow", runs: int = 3
     return ok
 
 
+#: The CI subset. The full table is 63 cases and ~400 minutes of declared budget, which is a
+#: release gate, not a push gate -- so this harness ran by hand, which is to say it ran rarely,
+#: which is how a `limit=60` in the L2 -> L3 handoff survived in `main`.
+#:
+#: Chosen to cover the JOINS rather than the bug classes: the classes have unit tests, and every
+#: defect this harness has ever caught lived between two stages. Measured wall clock on a
+#: 16-thread laptop, 2026-10-16:
+#:
+#:   no_pie_ret2win     10s   the whole ladder, detect -> L1 -> L2 -> L3, end to end
+#:   argv_overflow     113s   L1 + the shipped bundle actually re-running elsewhere
+#:   clean_no_bug      172s   the precision control: a good target must demonstrate NOTHING
+#:   fmt_pyc             0s   front-end routing; triage only, no autopilot
+#:   fmt_wasm            0s     "
+#:   fmt_jvm_class       0s     "   (SKIPs without a JDK, which CI does not install)
+#:   fmt_upx_packed      0s     "
+#:
+#: ~5 minutes, and it fails rather than skips on a missing compiler. Keep it under ten: the
+#: moment this is slow enough to be worth skipping, it will be.
+SMOKE = (
+    "no_pie_ret2win",
+    "argv_overflow",
+    "clean_no_bug",
+    "fmt_pyc",
+    "fmt_wasm",
+    "fmt_jvm_class",
+    "fmt_upx_packed",
+)
+
+
 def run_all(names=None) -> list[Result]:
+    # This harness is a diagnostic instrument, so its diagnostics have to be readable. With
+    # nothing configured, a `_log.warning` from inside the engine reaches stderr through
+    # `logging.lastResort` -- no timestamp, no module, no line. `LYKOS_LOG` selects the level, so
+    # the default stays quiet; `LYKOS_LOG=debug` prints every absorbed step with its traceback.
+    observe.configure()
     gcc = shutil.which("gcc") or shutil.which("cc")
     if not gcc:
         print("no C compiler; skipping"); return []
@@ -1637,4 +1832,54 @@ def run_all(names=None) -> list[Result]:
 
 if __name__ == "__main__":
     import sys as _s
-    run_all(_s.argv[1:] or None)
+
+    # Exit status, which this never had: the harness printed a FAIL table and exited 0, so no
+    # Makefile target or CI job could gate on it -- and none did, so it ran by hand, which is to
+    # say rarely. A named case that does not exist is an error too, rather than a silent 0/0
+    # PASS: `--only=typo` used to print an empty table and succeed, which is exactly the
+    # decorative-gate failure this repo's Makefile warns about everywhere else.
+    _argv = _s.argv[1:]
+    _known = {c.name for c in _CASES}
+
+    if "--list" in _argv:
+        for _c in _CASES:
+            print("%-26s budget=%-5.0f %s" % (_c.name, _c.budget,
+                                              "[smoke]" if _c.name in SMOKE else ""))
+        print("\n%d cases, %d in the smoke subset" % (len(_CASES), len(SMOKE)))
+        _s.exit(0)
+
+    if "--keep-failed" in _argv:
+        KEEP_FAILED = True
+        _argv = [a for a in _argv if a != "--keep-failed"]
+
+    _FLAGS = {"--list", "--smoke", "--keep-failed"}
+    _unknown = [a for a in _argv if a.startswith("--") and a not in _FLAGS]
+    if _unknown:
+        # Silently ignoring a flag is how a typo passes for a working option: `--case foo` was
+        # accepted and dropped, and only the positional `foo` did anything.
+        print("unknown option(s): %s\nknown: --list, --smoke, --keep-failed"
+              % ", ".join(_unknown))
+        _s.exit(2)
+
+    if "--smoke" in _argv:
+        _names = list(SMOKE)
+        _argv = [a for a in _argv if a != "--smoke"]
+        _missing = [n for n in _names if n not in _known]
+        if _missing:
+            # A renamed case must not silently shrink the subset into nothing.
+            print("SMOKE names a case that no longer exists: %s" % ", ".join(_missing))
+            _s.exit(2)
+    else:
+        _names = [a for a in _argv if not a.startswith("--")] or None
+
+    if _names:
+        _bad = [n for n in _names if n not in _known]
+        if _bad:
+            print("unknown case(s): %s\nknown: %s" % (", ".join(_bad),
+                                                      ", ".join(sorted(_known))))
+            _s.exit(2)
+    _results = run_all(_names)
+    if not _results:
+        print("NO CASES RAN -- not a pass")
+        _s.exit(2)
+    _s.exit(1 if any(not r.ok for r in _results) else 0)
