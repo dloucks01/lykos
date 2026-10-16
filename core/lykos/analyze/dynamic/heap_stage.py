@@ -12,17 +12,21 @@ dynamically-linked target). Cross-arch via a per-arch shim under qemu is future 
 from __future__ import annotations
 
 import json
+import logging
 import os
 import subprocess
 import tempfile
 from pathlib import Path
 
+from ... import observe
 from ...db.dao import FindingDAO, TargetDAO
 from ...jobs.registry import register_stage
 from .. import substrate
 from ..fuzz.runner import place
 from ..poc.capture import how_to_feed
 from . import sandbox
+
+_log = logging.getLogger(__name__)
 
 HEAP_STAGE = "heap_check"
 TOOL = "heap"
@@ -44,6 +48,7 @@ def _shim_source() -> bytes:
         from importlib import resources
         return (resources.files("lykos.analyze.dynamic") / _SHIM_SRC).read_bytes()
     except Exception:
+        observe.absorbed(_log, "falling back")
         return (Path(__file__).parent / _SHIM_SRC).read_bytes()
 
 
@@ -72,10 +77,11 @@ def heap_stage(ctx) -> dict:
         ctx.progress(pct=100, msg=why[:90])
         return {}
     host = sandbox.host_arch()
-    if substrate.foreign_cpu(target.arch, target.file_type, host):
+    why = substrate.foreign_cpu_reason(target.arch, target.file_type, host,
+                                       "the guard-page heap checker")
+    if why:
         ctx.emit("heap.done", payload={"ok": False, "supported": False,
-                 "note": f"heap check is native-arch only (target {target.arch}, host {host}); "
-                         f"a per-arch shim under qemu is future work"})
+                 "note": why + " A per-arch shim under qemu is future work."})
         ctx.progress(pct=100, msg="heap check not supported for this cross-arch target")
         return {}
 

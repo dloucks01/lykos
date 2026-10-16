@@ -50,6 +50,11 @@ DECLINE_BOUNDARY = (
     "incompatible with afl", "shadow memory", "only supports", "x86-64 only",
     "x86-64 native only", "needs native", "no gdbstub", "not supported for this",
     "cross-arch", "the clr owns", "owns the instruction pointer",
+    # Emitted wherever a per-arch map (GDB argument registers, a shim ABI) is the obstacle
+    # rather than the format. `foreign_cpu_reason` is the canonical sentence for the pure
+    # arch case and already matches on "host architecture"; these are the sites where the
+    # arch question is entangled with a second one and the phrase is written by hand.
+    "native-arch only",
 )
 #: A decline that describes the TARGET, not us.
 DECLINE_TARGET = (
@@ -59,6 +64,11 @@ DECLINE_TARGET = (
     "no primitive", "needs params", "no crash", "not fuzzed under afl",
     "supply the", "params.", "no fixed-size global", "no named custom allocator",
     "does not terminate",
+    # `build_exploit` on a target nothing crashed: "cyclic pattern did not fault on any channel;
+    # run fuzz/L2 first". It is the same statement as "no crash" -- there is nothing to escalate
+    # -- and it went unclassified on six of the ten foreign-architecture binaries in the first
+    # cross-arch sweep, where no campaign found a crash in busybox to escalate.
+    "did not fault",
 )
 #: A decline whose reason is OURS. Every one of these has been a real defect.
 DECLINE_OURS = (
@@ -123,6 +133,15 @@ STAGES: dict = {
                                                   "pointer? (L2)"),
     "build_exploit":        (PROVE, "Exploit", "redirect execution to a chosen function (L3)"),
     "multi_debug":          (PROVE, "Multi-process", "follow fork/exec and blame the child"),
+    # Firmware. Both are launchable controls in the workbench and both were missing from this
+    # table, so `for_target` never returned them: the panel could not rank them, and could not
+    # disable them with a reason either. They decide at runtime (is there a filesystem to carve?
+    # is there a Cortex-M vector table?), so per this module's rule they report AVAILABLE on any
+    # substrate that could hold machine code and decline for themselves.
+    "firmware_carve":       (FEED,  "Carve firmware", "pull the real binaries out of an image "
+                                                      "and register each as its own target"),
+    "firmware_rehost":      (FEED,  "Rehost firmware", "emulate the core and model the "
+                                                       "peripherals so a bare-metal image runs"),
 }
 
 
@@ -153,6 +172,16 @@ def _why_unavailable(stage: str, target) -> Optional[str]:
         if why:
             return why
 
+    if stage in ("firmware_carve", "firmware_rehost"):
+        # Known in advance, and only this: a jar/class/.pyc/.wasm/.NET assembly is an artefact of
+        # a managed runtime, never a flashed image. Everything else -- ELF, PE, Mach-O, raw blob,
+        # firmware -- is left available, because whether an image actually carries a filesystem
+        # or a reset vector is something only the stage can answer by looking.
+        managed = substrate.managed_runtime(ftype)
+        if managed:
+            return (f"a firmware image is flashed machine code; this target is an artefact of "
+                    f"{managed}, so there is nothing to carve or rehost.")
+
     if stage == "heap_check":
         from .dynamic import sandbox
         host = sandbox.host_arch()
@@ -167,9 +196,9 @@ def _why_unavailable(stage: str, target) -> Optional[str]:
             return (f"the guard-page heap checker is a Linux/ELF LD_PRELOAD shim and cannot "
                     f"load into a {ftype.upper()} image -- nothing would be checked, which is "
                     f"not the same as nothing found.")
-        if substrate.foreign_cpu(arch, ftype, host):
-            return (f"heap check is native-arch only (target {arch}, host {host}); a per-arch "
-                    f"shim under qemu is future work.")
+        why = substrate.foreign_cpu_reason(arch, ftype, host, "the guard-page heap checker")
+        if why:
+            return why + " A per-arch shim under qemu is future work."
         if linking == "static":
             return ("this target is statically linked, so the LD_PRELOAD guard-page allocator "
                     "never loads -- nothing would be checked, which is not the same as "

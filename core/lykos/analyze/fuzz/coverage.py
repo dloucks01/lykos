@@ -10,7 +10,9 @@ into a Confirmed finding -- the same confirm pipeline the `fuzz` and `dynamic_ru
 from __future__ import annotations
 
 import base64
+import logging
 
+from ... import observe
 from ...db.dao import DynResultDAO, FindingDAO, TargetDAO
 from ...hashing import canonical_json
 from ...jobs.registry import register_stage
@@ -32,6 +34,8 @@ from .stage import (
     msan_detonate,
     tsan_detonate,
 )
+
+_log = logging.getLogger(__name__)
 
 COVERAGE_STAGE = "coverage_fuzz"
 TOOL = "aflpp"
@@ -128,6 +132,36 @@ def _unsupported(target, use_qemu=True):
             return None
     trace = aflpp.locate_qemu_trace(afl) if afl else None
     if trace is None:
+        # A FOREIGN-arch target is a different question from a missing tool. afl-qemu-trace is
+        # built for ONE guest, so coverage-guided fuzzing of a MIPS binary needs a MIPS tracer
+        # specifically -- and a host that has none cannot acquire one by having the operator
+        # install a package, because no distribution ships it (Kali's afl++ carries
+        # libAFLQemuDriver.a and no tracer at all). Raising there made the first cross-arch
+        # target ever put through the real corpus gate ERROR on a stage whose own fallback had
+        # already fuzzed it 3,934 times: the orchestrator runs the black-box `fuzz` campaign
+        # when this one does not finish, so the SEARCH happened and the run still reported a
+        # broken stage. A decline that names the guest is the honest answer, and it is also the
+        # classifiable one.
+        #
+        # On the NATIVE arch the raise stays: there a missing tracer IS an environment defect
+        # the operator fixes in ten minutes, and `lykos doctor` lists it as one.
+        # `afl is not None` matters: with AFL++ absent altogether the answer is "AFL++ not
+        # found", which is an environment defect on any architecture and stays loud.
+        if afl is not None and substrate.foreign_cpu(target.arch, target.file_type,
+                                                    sandbox.host_arch()):
+            cpu = {"x86-64": "x86_64", "x86": "i386"}.get(target.arch, target.arch)
+            # The sentence LEADS with the category, because the decline note is what the
+            # classifier reads and the scorecard stores a bounded prefix of it: the phrase that
+            # says "capability boundary" has to survive the truncation. It did not -- this note
+            # put "cross-arch" in its last clause and the first cross-arch sweep reported ten
+            # targets as declining for an unclassified reason.
+            return (f"cross-arch: AFL++ qemu-mode needs an afl-qemu-trace built for the GUEST, "
+                    f"and this host has none for {target.arch} -- no distribution packages "
+                    f"one. Build "
+                    f"it with CPU_TARGET={cpu} ./qemu_mode/build_qemu_support.sh in AFL++ and "
+                    f"point LYKOS_AFL at it. The black-box `fuzz` stage is the cross-arch "
+                    f"path and drives this target meanwhile: it routes through qemu-user for "
+                    f"any architecture and takes coverage from qemu's own block log.")
         # Missing TOOLING is not a property of the target -- it is a fixable defect in this
         # machine, and the stage still raises for it so it stays loud. Reported here only so
         # the workbench can grey the control with a reason instead of offering it.
@@ -154,12 +188,12 @@ def _msan_scan(ctx, target, out_dir, mode, exec_timeout, raw) -> int:
         q = out_dir / "default" / "queue"
         inputs += [f.read_bytes() for f in sorted(q.glob("id:*"))[:200]]
     except Exception:
-        pass
+        observe.absorbed(_log, "continuing")
     n = msan_detonate(ctx, target, inputs, mode, exec_timeout)
     try:
         n += tsan_detonate(ctx, target, inputs, mode, exec_timeout)
     except Exception:
-        pass
+        observe.absorbed(_log, "continuing")
     return n
 
 
@@ -324,8 +358,23 @@ def coverage_stage(ctx) -> dict:
     raw = aflpp.harvest_crashes(out_dir)
     failed = aflpp.campaign_failed(proc)
     if failed:
-        raise RuntimeError(
-            f"{failed}. No inputs were executed, so this is NOT a clean 'no crashes' result.")
+        # DECLINE, not raise. The detection is right and has to stay -- afl-fuzz can abort
+        # having produced no queue and no crashes and STILL exit 0, so without this a campaign
+        # that never executed the target reports a clean "0 crashes". But raising made the stage
+        # an ERROR, and the real-corpus gate rejects an error outright: "an error is never an
+        # acceptable outcome, a decline is". Measured on the HTB binary `portaloo`
+        # (2026-10-16): `Fork server handshake failed` at afl-forkserver.c:2205 -- a fact about
+        # what afl can instrument on this target, not a defect in this pipeline. The decline
+        # carries exactly the same information and lets the run continue to the stages that can
+        # still say something.
+        note = (f"{failed}. No inputs were executed, so this is NOT a clean 'no crashes' "
+                f"result -- the sandbox fuzzers still cover this target under their own "
+                f"per-execution limits.")
+        ctx.emit("coverage.done", payload={"supported": False, "backend": "aflpp",
+                                           "crash_inputs": 0, "unique": 0, "confirmed": 0,
+                                           "aborted": True, "note": note})
+        ctx.progress(pct=100, msg=f"afl-fuzz could not run this target: {failed[:70]}")
+        return {}
     # What the campaign actually DID -- "0 crashes" after two million executions and "0
     # crashes" after none are opposite conclusions, and the event could not tell them apart.
     stats = aflpp.campaign_stats(out_dir)
@@ -426,7 +475,7 @@ def coverage_stage(ctx) -> dict:
     try:
         _msan_scan(ctx, target, out_dir, mode, exec_timeout, raw)
     except Exception:
-        pass                                             # advisory; never fail the campaign over it
+        observe.absorbed(_log, "continuing")
     ctx.emit("coverage.done", payload={"crash_inputs": len(raw),
                                        "unique": len(seen_crashes), "confirmed": confirmed})
     ctx.progress(pct=100, msg=f"{len(raw)} crash inputs, {len(seen_crashes)} unique crashes")

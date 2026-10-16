@@ -12,6 +12,7 @@ L2 analyst guidance. Native x86-64 / ELF; the live-confirm path is non-PIE (a PI
 leak, which stays analyst-gated). Deterministic. """
 from __future__ import annotations
 
+import logging
 import re
 import shutil
 import struct
@@ -19,8 +20,11 @@ import sys
 import tempfile
 from pathlib import Path
 
+from ... import observe
 from ...jobs.registry import register_stage
 from .. import substrate
+
+_log = logging.getLogger(__name__)
 
 # NOTE: cross-subpackage imports (..dynamic, ..fuzz, sibling poc modules) are done LAZILY inside the
 # functions below -- importing at module load creates a poc <-> dynamic import cycle (poc.__init__
@@ -108,10 +112,11 @@ def chain_primitive_stage(ctx) -> dict:
     if target is None:
         raise ValueError("chain_primitive requires a target_id")
     host = sandbox.host_arch()
-    if (substrate.foreign_cpu(target.arch, target.file_type, host)
-            or (target.file_type or "").lower() not in ("elf", "")):
-        ctx.emit("chain.done", payload={"applicable": False,
-                 "note": "primitive chaining is native x86-64 / ELF only"})
+    _what = "primitive chaining"
+    why = (substrate.foreign_cpu_reason(target.arch, target.file_type, host, _what)
+           or substrate.native_only_reason(target.file_type, _what))
+    if why:
+        ctx.emit("chain.done", payload={"applicable": False, "note": why})
         return {}
 
     lead = _lead_finding(ctx.conn, target)
@@ -309,10 +314,10 @@ def _pie_run(spawn, width, leak_opt, writer, off, trig, win_vaddr, target_bytes,
     except (BrokenPipeError, OSError):
         return None, b""
     finally:
-        try:
-            proc.kill()
-        except Exception:
-            pass
+        # Close the pipes BEFORE killing: a half-filled stdin buffer finalised after the process
+        # is gone raises an unraisable BrokenPipeError no `except` here can catch.
+        from ..dynamic import sandbox as _sb
+        _sb.kill_quietly(proc)
 
 
 def _pie_leak_chain(ctx, target_bytes, exe, win, opts, model, width, workdir):
@@ -531,6 +536,7 @@ def _trace_alloc(ctx, exe, alloc_info, drive: bytes, width, workdir) -> tuple:
         rep = json.loads(report.read_text())
         addrs, sizes = rep.get("alloc_addrs") or [], rep.get("alloc_sizes") or []
     except Exception:
+        observe.absorbed(_log, "falling back")
         return None, None
     if not addrs:
         return None, None
@@ -734,6 +740,7 @@ def _attribution_proof(ctx, exe, seq, *, control=b"\n"):
         finally:
             shutil.rmtree(helper.parent, ignore_errors=True)
     except Exception:
+        observe.absorbed(_log, "answering None")
         return None
 
 

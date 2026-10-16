@@ -65,9 +65,12 @@ def test_sparc_needs_word_size(bits, want):
     assert _suf("sparc", "big", bits) == want
 
 
-@pytest.mark.parametrize("arch", ["aarch64", "s390", "x86-64", "x86", "m68k", "loongarch"])
+# aarch64 left this list on 2026-10-16: qemu-aarch64_be is installed, BE AArch64 is a real
+# target (it turns up in network gear), and the row that routes it is asserted by
+# `test_big_endian_aarch64_gets_the_big_endian_emulator` below.
+@pytest.mark.parametrize("arch", ["s390", "x86-64", "x86", "m68k", "loongarch"])
 def test_a_family_with_one_variant_is_unaffected_by_either_axis(arch):
-    """m68k is always big-endian, aarch64 always little; asking for the other must not invent a
+    """m68k is always big-endian and s390 likewise; asking for the other must not invent a
     second emulator name."""
     answers = {_suf(arch, e, b) for e in ("little", "big", None) for b in (32, 64, None)}
     assert len(answers) == 1, answers
@@ -83,11 +86,21 @@ def test_no_variant_resolves_to_a_bare_family_name_where_a_variant_exists():
 
 # ---- the two tables have to agree ---------------------------------------------------------
 
+#: Architectures the parser NAMES and no emulator on any host here can run. Listing them is the
+#: point: an arch that is unroutable because nobody wired it is a silent `unsupported-arch`,
+#: while one that is unroutable because qemu-user has no such guest is a fact about the world.
+#: Naming it still earns its place -- the report says "ia64" instead of "em-50".
+_NO_EMULATOR_ANYWHERE = {"ia64"}
+
+
 def test_every_arch_the_elf_parser_emits_can_be_routed():
     """A name the parser produces that the router does not know is a silent `unsupported-arch`."""
-    produced = {v for v in elf._MACHINES.values() if v}
+    produced = {v for v in elf._MACHINES.values() if v} - _NO_EMULATOR_ANYWHERE
     unroutable = sorted(a for a in produced if _suf(a, "little", 64) is None)
     assert not unroutable, unroutable
+    # and the exception list is not a dumping ground: every name on it must really have no guest
+    for arch in _NO_EMULATOR_ANYWHERE:
+        assert _suf(arch, "little", 64) is None, f"{arch} routes now -- take it off the list"
 
 
 def test_the_four_added_architectures_are_wired_in_both_tables():
@@ -239,3 +252,29 @@ def test_partial_information_never_returns_None_for_a_known_family(arch, endian,
     """Returning None here would be reported as `unsupported-arch` for an architecture that is
     perfectly supported."""
     assert _suf(arch, endian, bits)
+
+
+def test_big_endian_aarch64_gets_the_big_endian_emulator():
+    """The same defect as the ARM32/SH rows, one family over: qemu-aarch64_be is installed on a
+    stock host and every BE AArch64 target was handed qemu-aarch64, which would fault on its
+    first instruction. Found by pointing the router at the real emulator inventory rather than
+    at the arches a cross compiler happens to package."""
+    assert _suf("aarch64", "big", 64) == "aarch64_be"
+    assert _suf("aarch64", "little", 64) == "aarch64"
+    assert _suf("aarch64", None, 64) == "aarch64"        # unknown endianness: the common one
+
+
+def test_openrisc_is_routed_and_named():
+    """EM_OPENRISC with qemu-or1k installed: the xtensa/microblaze round again. The only thing
+    that kept it unsupported end-to-end was its absence from these two tables."""
+    assert elf._MACHINES[0x5C] == "or1k"
+    assert _QEMU["or1k"] == "or1k"
+    assert _suf("or1k") == "or1k"
+
+
+def test_an_arch_with_no_emulator_is_still_NAMED():
+    """IA-64 has no emulator here, so naming it buys no execution -- it buys the REPORT. An
+    unnamed machine prints as `em-50`, and "we could not run an em-50" reads like a parser
+    failure when it is an honest statement about this host."""
+    assert elf._MACHINES[0x32] == "ia64"
+    assert _suf("ia64") is None

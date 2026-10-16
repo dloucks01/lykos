@@ -30,6 +30,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from lykos.db.dao import EventDAO
+
 # The source buffer is deliberately oversized (64 KiB): SPARC keeps the return address in %i7,
 # a register window, so a stack-buffer overflow does NOT corrupt control flow there and a copy
 # that stays mapped never faults at all. Only a copy long enough to run off the end of the
@@ -85,6 +87,14 @@ MATRIX = [
     ArchCase("sh", "sh4-linux-gnu-gcc", "L3",
              note="qemu-sh4 serves no target description, so its layout is the one that stays "
                   "hand-written (verified against a live g-packet)"),
+    # Two ISAs whose qemu-user emulators ship on a stock host and whose cross compilers are a
+    # package away, so the ONLY reason they were uncovered is that nobody had asked. `_QEMU`
+    # has carried both since the xtensa/microblaze round; what no case asserted is that the
+    # ladder -- fault capture, the gdbstub layout, IP control, the redirect -- reaches them.
+    ArchCase("alpha", "alpha-linux-gnu-gcc", "L3", note="layout derived from the stub"),
+    ArchCase("hppa", "hppa-linux-gnu-gcc", "L3",
+             note="PA-RISC: the stack grows UP and the return address lives in %r2, so a "
+                  "bounded overflow reaching it is not the usual shape"),
     ArchCase("sparcv9", "sparc64-linux-gnu-gcc", "L1",
              note="register windows keep the return address in %i7, not on the stack: a "
                   "bounded overflow never corrupts control flow, so only a copy that runs off "
@@ -92,6 +102,17 @@ MATRIX = [
 ]
 
 _RANK = {"": 0, "L0": 1, "L1": 2, "L2": 3, "L3": 4}
+
+
+def _all_events(store, run_id) -> list:
+    """Every event of a run, paged to the end.
+
+    `store.events.list` is `ORDER BY id ASC LIMIT ?`, so a fixed `limit=` reads only a run's
+    OLDEST events -- and the `.done` event these notes want is the second-to-last of ~131. The
+    gate's verdict comes from PocDAO and was never wrong, but `l2_note`/`l3_note` -- the reason
+    an operator reads to find out why an architecture stalled -- were always None.
+    """
+    return list(EventDAO(store.conn).walk(run_id=run_id))
 
 
 def compile_case(case: ArchCase, outdir: Path) -> Optional[Path]:
@@ -161,7 +182,7 @@ def run_case(case: ArchCase, exe: Path, *, timeout: float = 30.0,
                     runs = [r for r in store.runs.list_by_case(cid)
                             if r.stage == "poc_primitive"]
                     evs = [e for r in runs
-                           for e in store.events.list(run_id=r.id, limit=40)
+                           for e in _all_events(store, r.id)
                            if e.type == "primitive.done"]
                     res["l2_note"] = (str(evs[-1].payload)[:160] if evs
                                       else (runs[-1].error if runs else None))
@@ -178,7 +199,7 @@ def run_case(case: ArchCase, exe: Path, *, timeout: float = 30.0,
                     runs = [r for r in store.runs.list_by_case(cid)
                             if r.stage == "build_exploit"]
                     evs = [e for r in runs
-                           for e in store.events.list(run_id=r.id, limit=40)
+                           for e in _all_events(store, r.id)
                            if e.type == "exploit.done"]
                     res["l3_note"] = (str(evs[-1].payload)[:160] if evs
                                       else (runs[-1].error if runs else None))

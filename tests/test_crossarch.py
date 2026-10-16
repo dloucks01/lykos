@@ -212,3 +212,111 @@ def test_superh_layout_is_hand_written_and_self_consistent():
     assert names[14] == "r14" and names[16] == "pc" and names[17] == "pr"
     assert qg._sp_name("sh") == "r15"
     assert qg.supported("sh") and qg.breakpoints_supported("sh")
+
+
+# --------------------------------------------------------------------- cross-arch DECLINES
+# The first foreign-architecture binary this project ever put through `real_corpus_gate.py` --
+# busybox 1.21.1 for big-endian MIPS, static, stripped -- FAILED the gate, and not one of the
+# five problems it reported was about MIPS. It ran: 3,934 executions at 61/s under qemu-user.
+# What failed was the bookkeeping around the run.
+#
+#   busybox-mips-be  yes  3,934  60.7  82s  WORK 9  DECL 7  ERR 1
+#     - stage errored: coverage_fuzz
+#     - oob_index declined, unclassified: out-of-bounds array-index probing is native x86-64 ...
+#     - heap_trace declined, unclassified: custom-allocator tracing is native x86-64 / ELF only
+#     - heap_check declined, unclassified: heap check is native-arch only (target mips, host ...
+#     - chain_primitive declined, unclassified: primitive chaining is native x86-64 / ELF only
+#
+# Each of those four declines was honest and correctly reached -- a host-ABI ptrace helper or
+# LD_PRELOAD shim genuinely cannot reach into a qemu-emulated guest. They were all unclassified
+# because the sentence was hand-written at each site and no phrasing matched the taxonomy in
+# `capabilities`, which is a classifier fed by substring. So the gate could not score ANY
+# cross-arch target: every one of them would fail on reasons that were right.
+_FOREIGN = ("mips", "mipsel", "mips64", "ppc", "ppc64", "ppc64le", "s390x", "sparc", "sh4",
+            "m68k", "riscv64", "aarch64", "arm", "microblaze")
+
+
+class _Foreign:
+    """The fields `_why_unavailable` reads. A foreign-arch ELF: real machine code, real
+    execution (under qemu-user), and no host process to instrument."""
+    def __init__(self, arch):
+        self.arch, self.file_type, self.linking = arch, "elf", "static"
+        self.mitigations, self.symbols = {}, []
+
+
+def test_no_cross_arch_decline_is_unclassified():
+    """Every stage that refuses a foreign-arch target must say so in words the taxonomy knows.
+
+    Asserted over the whole capability map rather than over the five sites that were wrong,
+    because the defect was not any one sentence -- it was that the sentence is written where
+    the stage happens to be and read somewhere else entirely.
+    """
+    from lykos.analyze.capabilities import STAGES, _why_unavailable, classify_decline
+    unknown = []
+    for arch in _FOREIGN:
+        t = _Foreign(arch)
+        for stage in STAGES:
+            why = _why_unavailable(stage, t)
+            if why and classify_decline(why) == "unknown":
+                unknown.append(f"{arch}/{stage}: {why[:80]}")
+    assert not unknown, "unclassified cross-arch declines:\n" + "\n".join(unknown)
+
+
+def test_cross_arch_decline_names_the_arch_and_the_host():
+    """The canonical sentence, so an operator reading one decline knows which side refused."""
+    from lykos.analyze import substrate
+    why = substrate.foreign_cpu_reason("mips", "elf", "x86-64", "custom-allocator tracing")
+    assert why and "mips" in why and "x86-64" in why
+    assert "custom-allocator tracing" in why          # reads as the stage's own
+    assert substrate.foreign_cpu_reason("x86-64", "elf", "x86-64", "anything") is None
+    # A managed target has no CPU named in `arch`, so this is not the reason that applies.
+    assert substrate.foreign_cpu_reason("jvm", "jar", "x86-64", "anything") is None
+
+
+def test_coverage_fuzz_declines_for_a_guest_it_has_no_tracer_for(monkeypatch):
+    """A missing GUEST tracer is a decline; a missing tracer on the NATIVE arch still raises.
+
+    `coverage_fuzz` ERRORED on the MIPS target, and an error is never an acceptable outcome in
+    this project -- a decline is. The reasoning that made it raise was sound for the case it was
+    written for (Ubuntu's afl++ omits afl-qemu-trace on a native host, which an operator fixes
+    in ten minutes) and wrong for this one: no distribution ships a MIPS tracer at all, the
+    orchestrator had already fuzzed the target 3,934 times through the black-box stage, and the
+    run still reported a broken stage.
+    """
+    from lykos.analyze.capabilities import classify_decline
+    from lykos.analyze.fuzz import aflpp, coverage
+    monkeypatch.setattr(aflpp, "locate_afl", lambda *a, **k: "/usr/bin/afl-fuzz")
+    monkeypatch.setattr(aflpp, "locate_qemu_trace", lambda *a, **k: None)
+    monkeypatch.setattr(aflpp, "locate_qemu_trace_for", lambda *a, **k: None)
+
+    why = coverage._unsupported(_Foreign("mips"), True)
+    assert why and why != coverage.toolchain_missing()      # a decline, so the stage will not raise
+    assert "mips" in why and "CPU_TARGET=mips" in why       # and it says how to get the capability
+    assert classify_decline(why) == "target"
+
+    host = sandbox.host_arch()
+    native = _Foreign(host)
+    assert coverage._unsupported(native, True) == coverage.toolchain_missing()
+
+
+def test_a_decline_survives_the_window_the_scorecard_stores_it_in():
+    """Classification must not depend on how long the sentence is.
+
+    `_declines_from_events` keeps a bounded prefix of each decline note, and
+    `classify_decline` reads that prefix -- so a note whose category phrase sits past the cut
+    is "unclassified", which the gate prints as a defect. That is exactly what happened: the
+    coverage_fuzz cross-arch decline put "cross-arch" in its last clause, and all ten
+    foreign-architecture binaries in the first sweep failed the gate on it. The window was
+    widened AND the sentences now lead with their category; this asserts the pair.
+    """
+    from lykos.analyze.capabilities import STAGES, _why_unavailable, classify_decline
+    bad = []
+    for arch in _FOREIGN:
+        for stage in STAGES:
+            why = _why_unavailable(stage, _Foreign(arch))
+            if not why:
+                continue
+            full, cut = classify_decline(why), classify_decline(why[:240])
+            if full != cut or cut == "unknown":
+                bad.append(f"{arch}/{stage}: full={full} truncated={cut}: {why[:70]}")
+    assert not bad, "a decline's classification changes when it is truncated:\n" + "\n".join(bad)

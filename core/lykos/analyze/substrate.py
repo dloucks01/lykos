@@ -310,6 +310,29 @@ def native_only_reason(file_type: Optional[str], what: str) -> Optional[str]:
             f"it cannot reach into.")
 
 
+def foreign_cpu_reason(arch: Optional[str], file_type: Optional[str], host: Optional[str],
+                       what: str) -> Optional[str]:
+    """Why a host-native technique cannot apply to machine code for ANOTHER CPU, or None.
+
+    The ARCH half of `native_only_reason`, which answers only the format question: a MIPS ELF
+    has backend NATIVE in this table -- it IS an ELF -- so it passes that gate, and five stages
+    each hand-wrote their own sentence for the arch case ("native x86-64 / ELF only",
+    "native-arch only (target mips, host x86-64)"). Not one of those phrasings was in the
+    decline taxonomy, so the first cross-arch target this project ever put through the real
+    corpus gate failed on four declines that were every one of them honest and correctly
+    reached: `classify_decline` read all four as "unclassified", which the gate prints as a
+    defect. Wording a classifier has to recognise cannot be hand-written per site.
+
+    `what` names the technique so the sentence reads as the stage's own.
+    """
+    if not foreign_cpu(arch, file_type, host):
+        return None
+    return (f"{what} drives a process through the host architecture's ABI, and this target is "
+            f"{arch} machine code on a {host} host: it executes only under qemu-user, where a "
+            f"host-ABI ptrace helper or LD_PRELOAD shim cannot reach it. The black-box fuzz "
+            f"path drives this target instead.")
+
+
 def no_machine_code_reason(file_type: Optional[str]) -> Optional[str]:
     """Why there is no machine code to disassemble or instrument, or None if there is."""
     s = of(file_type)

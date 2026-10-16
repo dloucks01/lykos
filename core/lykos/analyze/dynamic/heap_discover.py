@@ -8,6 +8,7 @@ primitive that seeds tcache poisoning -> arbitrary write. Native x86-64 / ELF on
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shutil
@@ -15,12 +16,15 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+from ... import observe
 from ...jobs.registry import register_stage
-from .. import invocation, substrate
+from .. import substrate
 from ..dynamic import sandbox
 from ..fuzz import menu
 from ..poc import exploit
 from . import heaptrace
+
+_log = logging.getLogger(__name__)
 
 HEAP_TRACE_STAGE = "heap_trace"
 _HELPER = Path(__file__).with_name("heaptrace.py")
@@ -112,6 +116,7 @@ def _crawl_menu_model(workdir: Path, exe: Path, opts: list[str], *, width=None) 
     try:
         return menu.crawl_menu(spawn, opts, per_option=2.5, width=width)
     except Exception:
+        observe.absorbed(_log, "answering empty")
         return {}
 
 
@@ -238,6 +243,7 @@ def _drive(workdir: Path, exe: Path, writes: list, *, timeout: float = 10.0, idl
     try:
         p = _spawn_menu(workdir, exe)
     except Exception:
+        observe.absorbed(_log, "answering empty")
         return b""
     out = b""
     try:
@@ -268,11 +274,11 @@ def _drive(workdir: Path, exe: Path, writes: list, *, timeout: float = 10.0, idl
             if p.stdin:
                 p.stdin.close()
         except Exception:
-            pass
+            observe.absorbed(_log, "continuing")
         try:
             p.kill()
         except Exception:
-            pass
+            observe.absorbed(_log, "continuing")
     return out
 
 
@@ -822,7 +828,12 @@ def _try_reclaim_exec(ctx, target, target_bytes, exe, workdir, helper, model, op
         sandbox.run_reaped(cmd, timeout=15, capture_output=True, cwd=str(workdir),
                            preexec_fn=sandbox._rlimits(2048, 20, set_as=False))
         rep = _json.loads(report.read_text())
+        # The tracer is a standalone script under its own interpreter and cannot
+        # import observe; what it absorbed comes home in the report.
+        observe.absorbed_remote("lykos.analyze.dynamic.heaptrace",
+                                rep.pop("absorbed", None))
     except Exception:
+        observe.absorbed(_log, "answering None")
         return None
     hit = next(iter(rep.get("reclaim_exec") or []), None)
     if not hit:
@@ -967,6 +978,7 @@ def _try_uaf_leak(ctx, target, target_bytes, exe, workdir, model, opts, width, a
     try:
         unsorted_off = int(_heap.unsorted_bin_offset(str(libc_path) if libc_path else None) or 0)
     except Exception:
+        observe.absorbed(_log, "keeping the default")
         unsorted_off = 0
     # The tcache-fill strategy drives ~18 menu ops (9 creates + 8 frees + a Show), each with a
     # prompt drain, so it needs a generous budget -- 10s starved it mid-fill and the Show never ran.
@@ -1052,10 +1064,11 @@ def heap_trace_stage(ctx) -> dict:
     if target is None:
         raise ValueError("heap_trace requires a target_id")
     host = sandbox.host_arch()
-    if (substrate.foreign_cpu(target.arch, target.file_type, host)
-            or (target.file_type or "").lower() not in ("elf", "")):
-        ctx.emit("heaptrace.done", payload={"applicable": False,
-                 "note": "custom-allocator tracing is native x86-64 / ELF only"})
+    _what = "custom-allocator tracing"
+    why = (substrate.foreign_cpu_reason(target.arch, target.file_type, host, _what)
+           or substrate.native_only_reason(target.file_type, _what))
+    if why:
+        ctx.emit("heaptrace.done", payload={"applicable": False, "note": why})
         return {}
 
     # elf_functions gives name -> INT addr from the symbol table (the DAO stores hex strings);
@@ -1169,10 +1182,12 @@ def heap_trace_stage(ctx) -> dict:
                 sandbox.run_reaped(cmd, timeout=15, capture_output=True, cwd=str(workdir),
                                    preexec_fn=sandbox._rlimits(2048, 20, set_as=False))
             except Exception:
+                observe.absorbed(_log, "skipping this item")
                 continue
             try:
                 rep = json.loads(report.read_text())
             except Exception:
+                observe.absorbed(_log, "skipping this item")
                 continue
             reclaim_traced = reclaim_traced or bool(rep.get("reclaim"))
             if rep.get("load_base") and not traced_base:
@@ -1210,6 +1225,7 @@ def heap_trace_stage(ctx) -> dict:
             leak_hit = _try_uaf_leak(ctx, target, target_bytes, exe, workdir, model, opts,
                                      width, alloc)
         except Exception:
+            observe.absorbed(_log, "keeping the default")
             leak_hit = None
 
         # The RECLAIM half, for the same reason and unconditionally: it is the step that turns a
@@ -1229,12 +1245,13 @@ def heap_trace_stage(ctx) -> dict:
                 if _ex:
                     reclaim_observed["exec"] = _ex
             except Exception:
-                pass
+                observe.absorbed(_log, "continuing")
         reclaim_hit = None
         try:
             reclaim_hit = _try_uaf_reclaim(ctx, target, exe, workdir, model, opts, width, alloc,
                                            traced=reclaim_observed)
         except Exception:
+            observe.absorbed(_log, "keeping the default")
             reclaim_hit = None
         # No `view` option, so no output oracle -- which is most targets. The tracer read the
         # chunk instead, and that evidence is filed by the same route so a silent target is not
@@ -1243,6 +1260,7 @@ def heap_trace_stage(ctx) -> dict:
             try:
                 reclaim_hit = _file_traced_reclaim(ctx, target, alloc, reclaim_observed)
             except Exception:
+                observe.absorbed(_log, "keeping the default")
                 reclaim_hit = None
 
         if not found:

@@ -106,7 +106,8 @@ _QEMU = {"x86-64": "x86_64", "x86": "i386", "aarch64": "aarch64", "arm": "arm",
          # Installed as qemu-user on a stock host and previously absent from both this table and
          # elf._MACHINES, so these were unsupported end-to-end with the emulator sitting right
          # there. xtensa is the ESP32; a firmware image for one is squarely in scope.
-         "xtensa": "xtensa", "microblaze": "microblaze", "hppa": "hppa", "alpha": "alpha"}
+         "xtensa": "xtensa", "microblaze": "microblaze", "hppa": "hppa", "alpha": "alpha",
+         "or1k": "or1k"}
 _HOST = {"x86_64": "x86-64", "amd64": "x86-64", "aarch64": "aarch64", "arm64": "aarch64",
          "armv7l": "arm", "mips": "mips", "ppc64": "ppc64", "ppc64le": "ppc64",
          "riscv64": "riscv64"}
@@ -399,6 +400,11 @@ _QEMU_VARIANTS: dict = {
     # exactly where big-endian ARM and SH turn up.
     "arm":    {("big", None): "armeb", ("little", None): "arm"},
     "sh":     {("big", None): "sh4eb", ("little", None): "sh4"},
+    # AArch64 ships a big-endian emulator as well (qemu-aarch64_be), and this table's own rule
+    # -- a family needing the endianness axis lists it -- was not applied to it: every BE
+    # AArch64 target was handed qemu-aarch64 and would fault at its first instruction. Same
+    # defect as the ARM32/SH row above, one family over.
+    "aarch64": {("big", None): "aarch64_be", ("little", None): "aarch64"},
 }
 
 

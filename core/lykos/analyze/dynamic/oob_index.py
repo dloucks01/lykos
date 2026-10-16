@@ -14,6 +14,7 @@ in its static-watch mode."""
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shutil
@@ -21,12 +22,15 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+from ... import observe
 from ...jobs.registry import register_stage
 from .. import substrate
 from ..dynamic import sandbox
 from ..fuzz import menu
 from ..poc import exploit
 from .heap_discover import shared_op_model
+
+_log = logging.getLogger(__name__)
 
 OOB_INDEX_STAGE = "oob_index"
 _HELPER = Path(__file__).with_name("heaptrace.py")
@@ -149,10 +153,11 @@ def oob_index_stage(ctx) -> dict:
     if target is None:
         raise ValueError("oob_index requires a target_id")
     host = sandbox.host_arch()
-    if (substrate.foreign_cpu(target.arch, target.file_type, host)
-            or (target.file_type or "").lower() not in ("elf", "")):
-        ctx.emit("oob_index.done", payload={"applicable": False,
-                 "note": "out-of-bounds array-index probing is native x86-64 / ELF only"})
+    _what = "out-of-bounds array-index probing"
+    why = (substrate.foreign_cpu_reason(target.arch, target.file_type, host, _what)
+           or substrate.native_only_reason(target.file_type, _what))
+    if why:
+        ctx.emit("oob_index.done", payload={"applicable": False, "note": why})
         return {}
 
     target_bytes = ctx.content.path(target.sha256).read_bytes()
@@ -216,7 +221,12 @@ def oob_index_stage(ctx) -> dict:
                         sandbox.run_reaped(cmd, timeout=15, capture_output=True, cwd=str(workdir),
                                            preexec_fn=sandbox._rlimits(2048, 20, set_as=False))
                         rep = json.loads(report.read_text())
+                        # The tracer is a standalone script under its own interpreter and cannot
+                        # import observe; what it absorbed comes home in the report.
+                        observe.absorbed_remote("lykos.analyze.dynamic.heaptrace",
+                                                rep.pop("absorbed", None))
                     except Exception:
+                        observe.absorbed(_log, "skipping this item")
                         continue
                     if rep.get("oob_index"):
                         ev = next((e for e in rep.get("events", [])

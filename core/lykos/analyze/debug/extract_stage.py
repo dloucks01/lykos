@@ -58,11 +58,16 @@ def extract_stage(ctx) -> dict:
         raise ValueError("extract_secrets requires a target_id")
     p = ctx.params or {}
     host = sandbox.host_arch()
-    if (substrate.foreign_cpu(target.arch, target.file_type, host)
-            or not secrets.supported(target.arch or host)):
-        ctx.emit("secrets.done", payload={"ok": False, "supported": False,
-                 "note": f"secret extraction is native-arch only (target {target.arch}, "
-                         f"host {host}); cross-arch via qemu-gdbstub is future work"})
+    why = substrate.foreign_cpu_reason(target.arch, target.file_type, host,
+                                       "secret extraction")
+    if why:
+        why += " Cross-arch via the qemu gdbstub is future work."
+    elif not secrets.supported(target.arch or host):
+        why = (f"secret extraction is native-arch only: there is no GDB argument-register map "
+               f"for {target.arch or host}, so a breakpoint on the comparison could not read "
+               f"its arguments")
+    if why:
+        ctx.emit("secrets.done", payload={"ok": False, "supported": False, "note": why})
         ctx.progress(pct=100, msg="secret extraction not supported for this target")
         return {}
 

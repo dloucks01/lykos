@@ -14,6 +14,8 @@ import struct
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from .. import observe
+
 _log = logging.getLogger(__name__)
 
 # e_machine -> normalized arch name (extend freely)
@@ -29,6 +31,12 @@ _MACHINES = {
     0xBD: "microblaze",     # EM_MICROBLAZE (189)
     0x0F: "hppa",           # EM_PARISC (15)
     0x9026: "alpha",        # EM_ALPHA -- Linux's unofficial value; there is no assigned one
+    0x5C: "or1k",           # EM_OPENRISC (92) -- qemu-or1k is installed on a stock host too
+    # IA-64 has NO emulator here, so naming it buys no execution. It buys the report: an
+    # unnamed machine prints as `em-50`, and "we could not run an em-50" reads like a parser
+    # failure when it is an honest statement about this host. Real material exists (the
+    # binary-samples corpus carries an ia64 bash), so the front end meets it.
+    0x32: "ia64",           # EM_IA_64 (50)
 }
 _ETYPES = {0: "none", 1: "rel", 2: "exec", 3: "dyn", 4: "core"}
 
@@ -657,4 +665,5 @@ def main_from_start(data: bytes) -> Optional[int]:
             return None
         return main
     except Exception:
+        observe.absorbed(_log, "answering None")
         return None
