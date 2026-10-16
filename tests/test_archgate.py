@@ -33,8 +33,16 @@ _NO_TOOLCHAIN = {
     "sparc": ("sparc-linux-gnu-gcc",),           # sparcv9 IS gated; the 32-bit name is not
     "xtensa": ("xtensa-linux-gnu-gcc", "xtensa-lx106-elf-gcc"),
     "microblaze": ("microblaze-linux-gnu-gcc",),
-    "hppa": ("hppa-linux-gnu-gcc", "hppa64-linux-gnu-gcc"),
-    "alpha": ("alpha-linux-gnu-gcc",),
+    # hppa and alpha LEFT this list on 2026-10-16: `apt install gcc-hppa-linux-gnu
+    # gcc-alpha-linux-gnu` made them measurable, so they owe the gate a row and have one (both
+    # measured at L1 -- see the MATRIX note for what stops them).
+    #
+    # or1k and ia64 arrived in `elf._MACHINES` the same day, for opposite reasons: qemu-or1k is
+    # installed and the arch was simply never wired, while IA-64 has no emulator here at all and
+    # is named only so the report stops printing `em-50`. Neither has a cross compiler packaged
+    # on this host, so neither can be gated.
+    "or1k": ("or1k-linux-gnu-gcc", "or1k-elf-gcc"),
+    "ia64": ("ia64-linux-gnu-gcc",),
 }
 
 

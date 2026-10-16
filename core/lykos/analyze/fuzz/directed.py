@@ -410,11 +410,15 @@ def directed_stage(ctx) -> dict:
         ctx.emit("directed.blockdist", payload={"targets": len(_sites),
                  "blocks_with_distance": len(bdist),
                  "nearest": round(min(bdist.values()), 2)})
+    # Staged under the name the image dispatches on, when it has one: a directed campaign
+    # against a busybox called `target.bin` reaches "applet not found" and nothing else.
+    from ..invocation import exec_name_for
     st = fuzz_campaign(ctx, target, corpus=corpus, dictionary=plan["dictionary"], mode=mode,
                        max_execs=max_execs, max_seconds=max_seconds, exec_timeout=exec_timeout,
                        rng=rng, detector="directed_fuzz", event_prefix="directed",
                        note_prefix=note_prefix, mutator=mutator, cover_blocks=blocks,
-                       block_dist=bdist)
+                       block_dist=bdist,
+                       exe_name=exec_name_for(ctx.content.path(target.sha256).read_bytes()))
     hit, known = st.get("blocks_hit", 0), st.get("blocks_known", 0)
     summary = {"backend": "directed", "execs": st.get("execs", 0), "crashes": st.get("crashes", 0),
                "directed": bool(plan["directed"]),

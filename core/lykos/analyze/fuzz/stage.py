@@ -808,7 +808,10 @@ def _discover_argv(ctx, target, exec_timeout):
         data = ctx.content.path(target.sha256).read_bytes()
         d = ctx.scratch() / "argvprobe"
         d.mkdir(parents=True, exist_ok=True)
-        exe = d / "target.bin"
+        # A multi-call binary dispatches on argv[0] FIRST: busybox staged as `target.bin`
+        # answers `target.bin: applet not found` and exits 1, to every probe and every input.
+        # The image states the name it needs in its own usage string, so stage it under that.
+        exe = d / (invmod.exec_name_for(data) or "target.bin")
         exe.write_bytes(data)
         exe.chmod(0o755)
         # Mine the option table from the target's OWN --help, so a tool that hides its flags there
@@ -870,14 +873,18 @@ def _takes_blocks(run_fn) -> bool:
 
 def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_seconds,
                   exec_timeout, rng, detector, event_prefix, note_prefix, run_fn=run_input,
-                  mutator=None, cover_blocks=(), cover_flags=(), base_argv=(), block_dist=None):
+                  mutator=None, cover_blocks=(), cover_flags=(), base_argv=(), block_dist=None,
+                  exe_name: str = ""):
     """Shared mutational campaign: mutate -> sandbox -> dedup-by-signal -> minimize ->
     dyn_result + Confirmed finding. Used by both the black-box `fuzz` stage and the directed
     stage (which supplies a corpus/dictionary aimed at specific sinks). Returns stats.
 
     `run_fn(exe, mode, workfile, timeout, arch, data) -> (argv, RunResult)` is the input
     delivery; boundary-driven harnessing (doc 17.4) swaps in a channel runner."""
-    exe = ctx.scratch() / "target.bin"
+    # `exe_name` is for an image that dispatches on its OWN filename (busybox and every other
+    # multi-call binary): staged as `target.bin` it refuses every input with "applet not found",
+    # so the campaign would execute thousands of times and enter nothing.
+    exe = ctx.scratch() / (exe_name or "target.bin")
     ctx.content.stage_target(target, exe.parent, exe.name)
     os.chmod(exe, 0o755)
 
@@ -1856,6 +1863,16 @@ def fuzz_stage(ctx) -> dict:
 
     share_execs = max(1, max_execs // len(channels))
     share_secs = max(1.0, max_seconds / len(channels))
+    # Mined from the TARGET, not from the door that was chosen: a multi-call image refuses
+    # every input under the wrong filename whether or not a door opened, so the campaign is
+    # staged under the name it demands either way.
+    from ..invocation import exec_name_for as _exec_name_for
+    _exec_name = _exec_name_for(ctx.content.path(target.sha256).read_bytes())
+    if _exec_name:
+        ctx.emit("fuzz.exec_name", payload={"name": _exec_name, "why": (
+            "this image dispatches on its own filename -- staged as target.bin it answers "
+            "'applet not found' to every input, so it is staged under the name its usage "
+            "string states")})
     totals = {"execs": 0, "crashes": 0, "crashes_reproducible": 0, "unique": 0,
               "behaviours": 0}
     blocks_hit = 0            # the most blocks any one channel reached (coverage is per-run)
@@ -1866,7 +1883,8 @@ def fuzz_stage(ctx) -> dict:
                            max_execs=share_execs, max_seconds=share_secs,
                            exec_timeout=exec_timeout, rng=rng, detector="fuzz",
                            event_prefix="fuzz", note_prefix=note, mutator=mutator,
-                           cover_blocks=blocks, cover_flags=flags, base_argv=base_argv, **_kw)
+                           cover_blocks=blocks, cover_flags=flags, base_argv=base_argv,
+                           exe_name=_exec_name, **_kw)
         for k in totals:
             totals[k] += st.get(k, 0)
         blocks_hit = max(blocks_hit, st.get("blocks_hit", 0))

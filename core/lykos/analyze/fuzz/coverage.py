@@ -337,7 +337,7 @@ def coverage_stage(ctx) -> dict:
     argv_template = None
     try:
         from .stage import _discover_argv
-        disc, _dnote, _wc = _discover_argv(ctx, target, exec_timeout)
+        disc, _dnote, _wc, _door = _discover_argv(ctx, target, exec_timeout)
         if disc and "@@" in disc:
             argv_template, mode = disc, "file"
             ctx.emit("coverage.invocation", payload={"argv": disc, "why": _dnote})

@@ -304,3 +304,41 @@ def test_doors_into_the_same_decoder_count_once():
     assert "lzma" in {inv.codec_family(n) for n in doors}, doors
     # and a program with no family twin is its own family
     assert inv.codec_family("awk") == "awk"
+
+
+def test_the_image_is_staged_under_the_name_it_dispatches_on():
+    """The miss that made the whole feature dead code inside the engine.
+
+    busybox dispatches on argv[0] FIRST. Staged as `target.bin` -- the name every stage in this
+    pipeline uses -- it answers `target.bin: applet not found` and exits 1, to every probe and
+    every input. Measured: a 600s campaign against busybox-x86_64 executed 31,379 times, found
+    no doors and recorded `"discovered": null`, while the same discovery driven by hand against
+    the file under its own name found 14. The image states the name it needs in its own usage
+    string.
+    """
+    assert inv.multicall_self_name(
+        "Usage: busybox [function [arguments]...]") == "busybox"
+    assert inv.multicall_self_name("Usage: toybox [applet [arguments]]") == "toybox"
+    assert inv.multicall_self_name("usage: tiffcp [options] input... output") is None
+    # the whole-binary form: a hint AND a name, mined from the strings
+    blob = (b"junk\x00BusyBox v1.21.1 (2013-07-08) multi-call binary.\x00"
+            b"Usage: busybox [function [arguments]...]\x00more junk\x00")
+    assert inv.exec_name_for(blob) == "busybox"
+    # no multi-call hint -> the usual target.bin
+    assert inv.exec_name_for(b"Usage: xxd [options] [infile [outfile]]\x00") == ""
+    # a name that is not a plain filename is refused rather than created
+    assert inv.exec_name_for(b" multi-call binary.\x00Usage: ../evil [function x]\x00") == ""
+
+
+def test_the_bundle_puts_the_binary_back_under_that_name():
+    """A reproducer that ran ./target.bin would exit 1 having parsed nothing."""
+    import io
+    import tarfile
+
+    from lykos.analyze.poc import bundle
+    data = bundle.build(b"\x7fELFbin", b"AAAA", {"target_sha256": "abc", "arch": "x86-64"},
+                        b"", "stdin", ["unlzma"], "SIGSEGV", exec_name="busybox")
+    with tarfile.open(fileobj=io.BytesIO(data)) as tar:
+        sh = tar.extractfile("poc/runner.sh").read().decode()
+    assert "cp ./target.bin ./busybox" in sh
+    assert "./busybox unlzma" in sh and "./target.bin unlzma" not in sh

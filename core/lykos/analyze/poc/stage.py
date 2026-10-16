@@ -80,7 +80,13 @@ def build_poc_stage(ctx) -> dict:
 
     input_bytes = ctx.content.get_bytes(input_sha)
     target_bytes = ctx.content.path(target.sha256).read_bytes()
-    exe = ctx.scratch() / "target.bin"
+    # A multi-call image dispatches on argv[0]: staged as `target.bin`, busybox answers
+    # "applet not found" and exits 1, so a crash found through one of its programs would be
+    # replayed against a dispatcher that refuses to run and filed as an unverified L0. Mined
+    # from the target's own usage string, exactly as the campaign mines it.
+    from ..invocation import exec_name_for
+    _exec_name = exec_name_for(ctx.content.path(target.sha256).read_bytes())
+    exe = ctx.scratch() / (_exec_name or "target.bin")
     ctx.content.stage_target(target, exe.parent, exe.name)
     os.chmod(exe, 0o755)
 
@@ -272,7 +278,8 @@ def build_poc_stage(ctx) -> dict:
         _guard_lib = str(memoracle.dislocator_lib() or "")
     data = bundle.build(target_bytes, input_bytes, meta, res.stderr, mode, argv,
                         res.signal_name or "unknown", runtime=runtime,
-                        main_class=main_class, guard_page=_guard_lib)
+                        main_class=main_class, guard_page=_guard_lib,
+                        exec_name=_exec_name)
     bundle_sha = ctx.put_artifact("poc-bundle", data=data,
                                   meta={"verified": verified, "level": level})
 

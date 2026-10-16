@@ -91,10 +91,20 @@ MATRIX = [
     # package away, so the ONLY reason they were uncovered is that nobody had asked. `_QEMU`
     # has carried both since the xtensa/microblaze round; what no case asserted is that the
     # ladder -- fault capture, the gdbstub layout, IP control, the redirect -- reaches them.
-    ArchCase("alpha", "alpha-linux-gnu-gcc", "L3", note="layout derived from the stub"),
-    ArchCase("hppa", "hppa-linux-gnu-gcc", "L3",
-             note="PA-RISC: the stack grows UP and the return address lives in %r2, so a "
-                  "bounded overflow reaching it is not the usual shape"),
+    # MEASURED at L1 on 2026-10-16, the day they were added, and recorded as L1 rather than
+    # quietly left at the L3 every other case expects. Both reach L1 -- the overflow is found
+    # and a verified PoC is produced -- and stop there for the same reason: neither arch is in
+    # `qemu_gdb._LAYOUTS` nor in `_STUB_ABI`, so `supported()` is False and the L2 stage has no
+    # register layout to read a faulting PC from. That is the whole gap, and closing it is two
+    # table entries plus an sp/pc register name VERIFIED against a live stub (the way sh4's
+    # hand-written layout was) -- not a claim to make from the ISA manual alone.
+    ArchCase("alpha", "alpha-linux-gnu-gcc", "L1",
+             note="no qemu-gdbstub layout yet (not in _LAYOUTS or _STUB_ABI), so the ladder "
+                  "stops at the verified crash"),
+    ArchCase("hppa", "hppa-linux-gnu-gcc", "L1",
+             note="no qemu-gdbstub layout yet; and PA-RISC's stack grows UP with the return "
+                  "address in %r2, so even with one a bounded overflow reaching it is not the "
+                  "usual shape"),
     ArchCase("sparcv9", "sparc64-linux-gnu-gcc", "L1",
              note="register windows keep the return address in %i7, not on the stack: a "
                   "bounded overflow never corrupts control flow, so only a copy that runs off "

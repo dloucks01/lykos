@@ -527,6 +527,45 @@ _MULTICALL_PRIORITY = (
 )
 
 
+#: `Usage: busybox [function [arguments]...]` -- the dispatcher's own name, in its own .rodata.
+_SELF_NAME = re.compile(r"(?im)^\s*usage:\s+([A-Za-z0-9_.+-]{2,24})\s+\[?(?:function|applet)\b")
+
+
+def multicall_self_name(text: str) -> Optional[str]:
+    """The name a multi-call binary insists on being invoked as, or None.
+
+    THIS IS NOT COSMETIC. busybox dispatches on argv[0] first: invoked as anything that is not
+    one of its applets -- and `target.bin`, the name every stage in this pipeline stages a
+    target under, is not -- it answers `target.bin: applet not found` and exits 1. Every probe,
+    every campaign execution and every replay against the renamed file hits that one line, which
+    is why the dispatcher discovery found 14 doors by hand and none inside the engine. The image
+    says what it wants to be called in its own usage string, so the fix is to read it and stage
+    the file under that name.
+    """
+    m = _SELF_NAME.search(text or "")
+    return m.group(1) if m else None
+
+
+def exec_name_for(data: bytes) -> str:
+    """The filename this binary has to be staged under, or "" for the usual `target.bin`.
+
+    Derived from the TARGET rather than from the run that found a crash, so the fuzz campaign,
+    the PoC replay and the shipped bundle each arrive at the same answer without a new field to
+    thread between them.
+    """
+    try:
+        strings = [getattr(x, "value", x) for x in raw_strings(data, minlen=8, limit=200000)]
+    except Exception:                                   # noqa: BLE001 -- best-effort
+        return ""
+    blob = "\n".join(s for s in strings if isinstance(s, str))
+    if not _MULTICALL_HINT.search(blob):
+        return ""
+    name = multicall_self_name(blob)
+    # A name with a path separator or an odd character is not something to create a file from.
+    return name if name and name.replace("-", "").replace("_", "").replace(".", "").isalnum() \
+        else ""
+
+
 def is_multicall(help_text: str) -> bool:
     """Does this text say the program is a multi-call binary?
 

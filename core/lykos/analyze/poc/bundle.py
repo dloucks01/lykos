@@ -38,12 +38,20 @@ def _argv_text(argv, *, carrier=None) -> str:
 
 def _runner(mode: str, argv, signal_name: str, run_cmd=None, runtime: str = "native",
             main_class: str | None = None, sanitizer: str = "", retries: int = 0,
-            marker: str = "", guard_page: str = "") -> bytes:
+            marker: str = "", guard_page: str = "", exec_name: str = "") -> bytes:
     argv = list(argv or [])
     placed = INPUT_PLACEHOLDER in [str(a) for a in argv]
     # A jar is not executable and the JVM is not the target: `./target.bin` is a zip file, and
     # the reproducer has to name the runtime that reads it.
     exe, setup = "./target.bin", "chmod +x ./target.bin\n"
+    if exec_name and exec_name != "target.bin":
+        # A MULTI-CALL binary is its own filename: busybox dispatches on argv[0] and answers
+        # `target.bin: applet not found` under any other name, so a reproducer that ran
+        # ./target.bin would exit 1 having parsed nothing. Same shape as the .class case below,
+        # which also has to put the file back under the name the runtime expects.
+        setup = (f"cp ./target.bin ./{shlex.quote(exec_name)}\n"
+                 f"chmod +x ./{shlex.quote(exec_name)}\n")
+        exe = "./" + exec_name
     if guard_page:
         # THE DEFECT IS SILENT WITHOUT THIS. The crash was found with a guard-page allocator
         # preloaded (AFL++'s libdislocator): every allocation sits at the end of its own page
@@ -607,7 +615,7 @@ def build(target_bytes: bytes, input_bytes: bytes, meta: dict, stderr: bytes,
           mode: str, argv, signal_name: str, primitive: dict | None = None,
           extra_files: dict | None = None, run_cmd: str | None = None,
           runtime: str = "native", main_class: str | None = None,
-          guard_page: str = "") -> bytes:
+          guard_page: str = "", exec_name: str = "") -> bytes:
     # A sanitizer-reported fault needs a different reproducer and a different success criterion
     # from a signal; the primitive is the only thing that knows which this is.
     sanitizer = str((primitive or {}).get("sanitizer_class") or "")
@@ -724,7 +732,7 @@ def build(target_bytes: bytes, input_bytes: bytes, meta: dict, stderr: bytes,
         _race = (primitive or {}).get("race")
         _add(tar, "poc/runner.sh",
              _runner(mode, argv, signal_name, run_cmd, runtime, main_class,
-                     sanitizer=sanitizer, guard_page=guard_page,
+                     sanitizer=sanitizer, guard_page=guard_page, exec_name=exec_name,
                      retries=int((primitive or {}).get("retries") or 0) if _race else 0,
                      marker=_race_marker(primitive) if _race else ""), mode=0o755)
         # LABEL THE BINARY THIS BUNDLE ACTUALLY SHIPS. `meta["target_sha256"]` is written by the
