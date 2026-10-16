@@ -26,14 +26,6 @@ def hash_bytes(data: bytes, algo: str = "sha256") -> str:
     return h.hexdigest()
 
 
-def hash_file(path: str | Path, algo: str = "sha256") -> str:
-    h = hashlib.new(algo)
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(_CHUNK), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
 def hash_all_file(path: str | Path) -> dict[str, Any]:
     """One pass over the file → md5/sha1/sha256 + size."""
     md5, sha1, sha256 = hashlib.md5(), hashlib.sha1(), hashlib.sha256()
@@ -58,10 +50,6 @@ def canonical_json(obj: Any) -> bytes:
     return json.dumps(
         obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False
     ).encode("utf-8")
-
-
-def params_hash(params: dict[str, Any] | None) -> str:
-    return hash_bytes(canonical_json(params or {}))
 
 
 def compute_cache_key(

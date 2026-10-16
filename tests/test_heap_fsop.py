@@ -5,7 +5,6 @@ import shutil
 import subprocess
 
 import pytest
-
 from lykos.analyze.poc import heap, leak
 
 _SYS_LIBC = next(iter(glob.glob("/usr/lib/x86_64-linux-gnu/libc.so.6")
@@ -74,7 +73,7 @@ def test_heap_strategy_stage_confirms_l3(store, case, notes_bin):
     """The `heap` strategy wires the automated chain into build_exploit: a menu target with a UAF,
     run through the full stage, files a verified L3 (default op templates match the notes menu)."""
     from lykos.analyze import register
-    from lykos.analyze.ingest import ingest, enqueue_triage
+    from lykos.analyze.ingest import enqueue_triage, ingest
     from lykos.analyze.poc import enqueue_exploit
     from lykos.db.dao import PocDAO
     from lykos.jobs import JobConfig, JobQueue, WorkerPool
@@ -132,7 +131,7 @@ def test_heap_auto_strategy_is_push_button(store, case, menu_notes_bin):
     on its own, filing a verified L3. This is the push-button promotion of the previously
     analyst-gated heap finisher. The numbered-menu gate keeps it off non-heap auto targets."""
     from lykos.analyze import register
-    from lykos.analyze.ingest import ingest, enqueue_triage
+    from lykos.analyze.ingest import enqueue_triage, ingest
     from lykos.analyze.poc import enqueue_exploit
     from lykos.db.dao import PocDAO
     from lykos.jobs import JobConfig, JobQueue, WorkerPool

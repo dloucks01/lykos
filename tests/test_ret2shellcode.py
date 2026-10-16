@@ -70,7 +70,7 @@ def _stage(store):
 def _drive(store, pool, exe):
     from lykos.analyze.ingest import enqueue_triage, ingest
     from lykos.analyze.poc import enqueue_exploit
-    from lykos.db.dao import PocDAO, TargetDAO
+    from lykos.db.dao import PocDAO
     from lykos.jobs import JobQueue
     t = ingest(store, store.cases.create("sc").id, exe, filename="v")
     q = JobQueue(store.conn)

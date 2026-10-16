@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import logging
 import os
 import shutil
 import tarfile
@@ -18,6 +19,7 @@ import zipfile
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from .. import observe
 from ..casestore import CaseStore  # noqa: F401  (some handlers construct it directly)
 from ..db.dao import DynResultDAO, FindingDAO, FunctionDAO, PocDAO, StringDAO
 from ..jobs import JobQueue
@@ -30,11 +32,11 @@ from .serializers import (
     _event,
     _finding,
     _function,  # noqa: F401
-    _poc,
     _run,
-    _stringref,
     _target,
 )
+
+_log = logging.getLogger(__name__)
 
 # Bodies at or below this size are extracted in memory (the proven, simple path); larger uploads
 # have their file part streamed to disk so a big binary/firmware never sits fully in RAM.
@@ -138,7 +140,7 @@ class EndpointsMixin:
             try:
                 plan = (self._advice_for(s, t) or {}).get("plan") or []
             except Exception:
-                pass
+                observe.absorbed(_log, "continuing")
             done = {r.stage for r in s.runs.list_by_case(t.case_id)
                     if r.target_id == tid and r.status == "done"}
             return self._json({
@@ -156,6 +158,7 @@ class EndpointsMixin:
             from ..analyze.fuzz.coverage import _unsupported
             return _unsupported(t)
         except Exception:
+            observe.absorbed(_log, "answering None")
             return None
 
     def _target_strings(self, s, tid):
@@ -333,6 +336,7 @@ class EndpointsMixin:
                 blob = s.content.path(t.sha256).read_bytes()
                 imports = list(elf_functions(blob))
             except Exception:
+                observe.absorbed(_log, "keeping the default")
                 imports = []
         # How to invoke it, read off the binary's own usage line and option string. Static
         # only here: advice must stay fast, and running the target to CHECK the proposal
@@ -342,6 +346,7 @@ class EndpointsMixin:
             found = invmod.discover(self._target_strings(s, tid))
             found["proposed_argv"] = invmod.propose_argv(found)
         except Exception:
+            observe.absorbed(_log, "keeping the default")
             found = None
         crashes = sum(1 for d in DynResultDAO(s.conn).list_by_target(tid) if d.crashed)
         pocs = [p for p in PocDAO(s.conn).list_by_target(tid) if p.verified]
@@ -497,6 +502,39 @@ class EndpointsMixin:
         finally:
             s.close()
 
+    def _get_scorecard(self, cid):
+        """WHAT THIS RUN DID, per target: executions, which stages worked, which declined and
+        why, which were never scheduled, and what the run absorbed.
+
+        The web UI could not show any of this. The CLI prints it and the HTML report renders it,
+        but there was no endpoint, so the primary interface -- the one `./start` opens -- showed
+        findings with no account of the work behind them. A null result is only worth something
+        next to that account: of two targets with zero crashes, one executed 2,756 times and the
+        other executed zero because a stage upstream ate the budget, and nothing in the UI told
+        them apart.
+
+        Read from the EVENT LOG rather than from the live autopilot record, so it survives a
+        server restart, a reopened case, and a case produced by `lykos analyze` on the CLI --
+        none of which have an in-memory record. `payloads_of_type` takes no limit: the scorecard
+        is the last event a target emits, which is the first thing a windowed read drops.
+        """
+        from ..db.dao import EventDAO
+        s = self._store()
+        try:
+            if not s.cases.get(cid):
+                return self._json({"error": "no case"}, 404)
+            from ..analyze.orchestrate import SCORECARD_EVENT
+            cards = EventDAO(s.conn).payloads_of_type(SCORECARD_EVENT, case_id=cid)
+            # One per target, latest wins: the autopilot re-emits if a target is re-run.
+            by_target: dict = {}
+            for card in cards:
+                tid = card.get("target_id")
+                if tid:
+                    by_target[tid] = card
+            return self._json({"cards": list(by_target.values())})
+        finally:
+            s.close()
+
     def _get_verifications(self, cid):
         """The false-positive review verdicts for a case, `{input_sha: verdict}` (the latest for
         each input). Persisted as `replay-verdict` artifacts by the replay endpoint; without a way
@@ -605,6 +643,7 @@ class EndpointsMixin:
                     try:
                         text = s.content.get_bytes(a.sha256).decode("utf-8", "replace")
                     except Exception:
+                        observe.absorbed(_log, "keeping the default")
                         text = None
                     m = a.meta or {}
                     return self._json({"source": text, "filename": m.get("filename"),
@@ -630,6 +669,7 @@ class EndpointsMixin:
             try:
                 out = cached_output_json(s, rid)
             except Exception:
+                observe.absorbed(_log, "keeping the default")
                 out = None
             return self._json({"run_id": rid, "stage": r.stage, "status": r.status,
                                "error": r.error, "output": out})
@@ -658,12 +698,14 @@ class EndpointsMixin:
             return self._json({"error": "no artifact"}, 404)
         raw = path.read_bytes()
         try:
-            tf = tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz")
+            tf = tarfile.open(fileobj=io.BytesIO(raw),           # noqa: SIM115 -- closed in
+                              mode="r:gz")                      # the finally below; a `with`
+                                                                # cannot span the 415 return
         except Exception:                                    # noqa: BLE001 -- not a tar.gz bundle
             return self._json({"error": "not a poc bundle"}, 415)
         TEXT = {"README.txt", "meta.json", "PRIMITIVE.txt", "runner.sh", "exploit.py", "recipe.json",
                 "stderr.txt"}
-        files, meta, primitive, run_cmd = [], {}, {}, None
+        files, meta, run_cmd = [], {}, None
         try:
             for m in tf.getmembers():
                 if not m.isfile():

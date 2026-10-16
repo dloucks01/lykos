@@ -35,6 +35,19 @@ _NOISE = {
 # CRT / compiler-emitted symbol names that leak into the token scan and are never commands.
 _NOISE_SUBSTR = ("dummy", "clones", "dtors", "ctors", "gmon", "tm_clone", "cxa", "libc",
                  "deregister", "register_tm", "start_main", "frame", "init_array", "fini")
+#: Separators a dispatcher writes INSIDE its own comparison literal: `strncmp(line,"show=",5)`.
+#: The literal is the dispatch token, so the verb is `show=` and a command is `show=<argument>` --
+#: one line, not two. Mining the bare word instead produces `show`, which that very strncmp
+#: rejects, so the handler is never entered however many sequences are tried.
+_ARG_SEPS = "=:"
+#: A verb, with the separator kept when the literal carries one.
+_VERB = re.compile(r"([a-z][a-z_]{1,11})([=:]?)")
+#: Arguments to try after a separator. A long filler for a copy in the handler, then the same
+#: boundary/wrap values a config field gets -- because a handler that takes a NUMBER (a length, a
+#: count, an index) is the shape whose defect no amount of byte mutation reaches: see
+#: textconf.numeric_boundary_seeds on why the decimal text of a 10-digit number never appears.
+_ARG_FILLERS = (b"A" * 64, b"A" * 256)
+_ARG_NUMERIC = 10
 
 
 def _tokens(data: bytes, minlen: int) -> list[str]:
@@ -56,16 +69,63 @@ def mine_verbs(data: bytes, *, cap: int = 16) -> list[str]:
     verbs: list[str] = []
     seen: set[str] = set()
     for t in _tokens(data, 3):
-        if not re.fullmatch(r"[a-z][a-z_]{1,11}", t) or t in _NOISE or t in seen:
+        m = _VERB.fullmatch(t)
+        if m is None or t in seen:
             continue
-        if any(sub in t for sub in _NOISE_SUBSTR):     # CRT / compiler symbol, never a command
+        word = m.group(1)                              # the separator is not part of the NAME
+        if word in _NOISE:
+            continue
+        if any(sub in word for sub in _NOISE_SUBSTR):  # CRT / compiler symbol, never a command
             continue
         seen.add(t)
         verbs.append(t)
-    # Shortest first: a command verb is usually a terse word and the sequence budget is finite, so
-    # the likeliest verbs lead (and calibration runs the seeds built from them before any mutation).
-    verbs.sort(key=lambda v: (len(v), v))
+    # KEYED FIRST, then shortest. A token whose literal already carries `=` or `:` is not a guess:
+    # a compiler emits `show=` only because the program compares against it, whereas a bare
+    # lowercase word is any identifier, string fragment or debug name that happened to survive the
+    # scan. Ranking them together let sixteen such fragments fill the whole `cap` and leave the one
+    # real dispatch token out of it -- measured on a target whose commands are `show=` and `name=`:
+    # neither was mined, while `buf`, `std`, `uptr` and `data_` were **[measured]**.
+    verbs.sort(key=lambda v: (v[-1] not in _ARG_SEPS, len(v), v))
     return verbs[:cap]
+
+
+#: Magnitudes that make a LENGTH, COUNT or INDEX argument fault, in the order that works.
+#:
+#: Measured on a `show=<n>` handler reading n bytes out of a 64-byte buffer: every value from 65
+#: to 4294967295 reports a heap-buffer-overflow, and `-1`, LONG_MAX and SIZE_MAX report NOTHING
+#: AT ALL -- the C library rejects an operation that large before it touches any memory, so the
+#: read never happens. Leading with the biggest value, which is the intuitive choice and the one
+#: this code made first, therefore spends the seed budget on the only values that cannot work.
+#:
+#: These come first for that reason; `textconf`'s wrap thresholds follow, because those are tuned
+#: for ALLOCATION arithmetic (`n * 16` wrapping a 32-bit size) where huge genuinely is the point.
+#: `-1` is kept -- a signed length reaching memcpy becomes SIZE_MAX and faults on other targets --
+#: just not first. `0` goes last: it cannot over-read anything.
+_REACH_FIRST = (b"4096", b"256", b"65536", b"1048576", b"1024")
+
+
+def _dangerous_first(limit: int) -> list[bytes]:
+    """Boundary argument values, ordered so the ones that actually fault lead.
+
+    `textconf`'s own order puts the type boundaries first (`0`, `-1`, `INT_MAX`, ...) and that
+    order is a contract for its callers, so this reorders its own slice rather than touching it.
+    """
+    from .textconf import _BOUNDARY_VALUES
+
+    def rank(v: bytes):
+        try:
+            n = int(v)
+        except ValueError:
+            return (3, 0)
+        if n == 0:
+            return (4, 0)                    # cannot over-read; last
+        if n < 0:
+            return (2, n)                    # SIZE_MAX once used as a length, but often rejected
+        if n > 0xFFFFFFFF:
+            return (3, -n)                   # measured: rejected before any memory is touched
+        return (1, -n)                       # in range, biggest first
+    rest = [v for v in sorted(_BOUNDARY_VALUES, key=rank) if v not in _REACH_FIRST]
+    return (list(_REACH_FIRST) + rest)[:max(0, limit)]
 
 
 def command_seeds(verbs, *, max_seeds: int = 96) -> list[bytes]:
@@ -83,7 +143,11 @@ def command_seeds(verbs, *, max_seeds: int = 96) -> list[bytes]:
     count is n*(n-1)*(n-2); the verb list is already capped small and the whole set is truncated to
     `max_seeds`, with the mutator covering longer / rarer sequences during the campaign."""
     vs = [v.encode() for v in verbs if v]
-    if len(vs) < 2:
+    keyed = [v for v in vs if v[-1:].decode("latin-1") in _ARG_SEPS]
+    # A single BARE verb is not a sequence and never was. A single KEYED verb is still worth
+    # driving: there is nothing to order, but there is an argument to vary, and the argument is
+    # where its handler's defect lives.
+    if len(vs) < 2 and not keyed:
         return []
     payload = b"A" * 64
     doubles = [v + _NL + v + _NL for v in vs]              # double-free / double-use
@@ -92,14 +156,37 @@ def command_seeds(verbs, *, max_seeds: int = 96) -> list[bytes]:
     pairs = [a + _NL + b + _NL for a in vs for b in vs if a != b]
     overflow = [v + _NL + payload + _NL for v in vs]       # write handler overflow
     singles = [v + _NL for v in vs]
-    seeds = doubles + triples + pairs + overflow + singles
+    # `show=<argument>` -- ON THE VERB'S OWN LINE, which is the only form its strncmp accepts.
+    # Numbers included, and they are the point: a handler that reads a length or an index out of
+    # the argument has a defect selected by the VALUE, and `show=0` reaches the same code as
+    # `show=2147483647` while doing nothing at all.
+    args = list(_ARG_FILLERS) + _dangerous_first(_ARG_NUMERIC)
+    # BY ARGUMENT, not by verb: `[k + a for k in keyed for a in args]` spends every one of the
+    # first verb's arguments before the second verb gets its first, so under the cap only the
+    # earliest verb was ever driven with a large value. Each verb now gets argument one before
+    # any verb gets argument two.
+    keyed_args = [k + a + _NL for a in args for k in keyed]
+    # ROUND-ROBIN, not concatenation. Taken in order, the triple enumeration is n*(n-1)*(n-2) --
+    # 3,360 sequences for the 16 verbs this miner returns -- so with `max_seeds` at 96 the seeds
+    # were 16 doubles and 80 triples, and the overflow and single families never appeared at all
+    # **[measured]**. A family that is always truncated to nothing is a family that is not tested,
+    # so each gets a turn and the cap costs breadth rather than whole shapes.
+    families = [keyed_args, doubles, triples, pairs, overflow, singles]
     out: list[bytes] = []
     seen: set[bytes] = set()
-    for s in seeds:
-        if s not in seen:
-            seen.add(s)
-            out.append(s)
-    return out[:max_seeds]
+    i = 0
+    while len(out) < max_seeds and any(i < len(f) for f in families):
+        for fam in families:
+            if i >= len(fam):
+                continue
+            if len(out) >= max_seeds:
+                break
+            cand = fam[i]
+            if cand not in seen:
+                seen.add(cand)
+                out.append(cand)
+        i += 1
+    return out
 
 
 class CommandMutator:

@@ -28,6 +28,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+from lykos import observe  # noqa: E402
+
 ROOT = Path(__file__).resolve().parent.parent
 VT = ROOT / "examples" / "vuln-targets"
 BIN = VT / "bin"
@@ -81,14 +83,14 @@ DEFAULT_SET = ["ncompress_x86-64_cve", "jhead_x86-64", "gif2rgb_x86-64", "unzip_
 def run_target(binpath: Path, spec: dict, fuzz_timeout: int, log=print) -> dict:
     """Run the full chain on one binary; return {arch, cwes, max_level, crash_confirmed}."""
     from lykos.analyze import register
-    from lykos.analyze.ingest import ingest, enqueue_triage
-    from lykos.analyze.disassemble import enqueue_disassemble
-    from lykos.analyze.detect.stage import enqueue_detect
-    from lykos.analyze.fuzz.stage import enqueue_fuzz
     from lykos.analyze.debug.stage import enqueue_root_cause
-    from lykos.analyze.poc.stage import enqueue_build_poc
-    from lykos.analyze.poc.primitive_stage import enqueue_primitive
+    from lykos.analyze.detect.stage import enqueue_detect
+    from lykos.analyze.disassemble import enqueue_disassemble
+    from lykos.analyze.fuzz.stage import enqueue_fuzz
+    from lykos.analyze.ingest import enqueue_triage, ingest
     from lykos.analyze.poc.exploit_stage import enqueue_exploit
+    from lykos.analyze.poc.primitive_stage import enqueue_primitive
+    from lykos.analyze.poc.stage import enqueue_build_poc
     from lykos.casestore import CaseStore
     from lykos.db.dao import DynResultDAO, FindingDAO, PocDAO
     from lykos.jobs import JobConfig, JobQueue, WorkerPool
@@ -179,6 +181,12 @@ def score(result: dict, spec: dict) -> dict:
 
 
 def main(argv=None) -> int:
+    # These harnesses are diagnostic instruments, so their diagnostics have to be readable. With
+    # nothing configured, a `_log.warning` from inside the engine reaches stderr through
+    # `logging.lastResort` -- no timestamp, no module, no line -- which is how a gate run prints
+    # "run <uuid> is past its deadline" with no indication of which stage said it. `LYKOS_LOG`
+    # still selects the level, so the default stays quiet.
+    observe.configure()
     ap = argparse.ArgumentParser(description="lykos recall benchmark over the vuln-targets corpus")
     ap.add_argument("--only", help="comma-separated target basenames (default: x86-64 set)")
     ap.add_argument("--cross", action="store_true", help="also run the cross-arch jhead targets")

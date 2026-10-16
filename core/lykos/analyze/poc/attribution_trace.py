@@ -25,6 +25,22 @@ import platform
 import signal
 import sys
 
+# ---------------------------------------------------------------------------------- absorbed
+# This driver runs as a standalone script under a different interpreter (the parent copies it to
+# a scratch dir), so `lykos.observe` is not importable here. The counter still has to reach the
+# parent, because a silently-skipped step in a tracer is exactly what turns a real crash into
+# "no crash observed" -- so absorbed steps ride home in the JSON result and the parent folds
+# them into its own counter. See observe.absorbed_remote.
+_ABSORBED: list = []
+
+
+def _absorbed(what):
+    """Record a deliberately-absorbed failure, with the live exception's repr."""
+    import sys as _sys
+    exc = _sys.exc_info()[1]
+    _ABSORBED.append({"what": what, "exc": repr(exc)[:200]})
+
+
 PTRACE_TRACEME = 0
 PTRACE_PEEKDATA = 2
 PTRACE_CONT = 7
@@ -128,12 +144,12 @@ def trace(exe, argv, stdin_file, timeout, *, max_writes=4000, max_bytes=65536):
                 resource.setrlimit(resource.RLIMIT_AS, (lim, lim))
                 resource.setrlimit(resource.RLIMIT_FSIZE, (64 << 20, 64 << 20))
             except Exception:
-                pass
+                _absorbed("continuing")
             libc.ptrace(PTRACE_TRACEME, 0, 0, 0)
             os.execv(exe, [exe] + [a.encode("latin-1", "ignore") if isinstance(a, str) else a
                                    for a in argv])
         except Exception:
-            pass
+            _absorbed("continuing")
         os._exit(127)
 
     # ---- parent (tracer) ----
@@ -239,10 +255,12 @@ def trace(exe, argv, stdin_file, timeout, *, max_writes=4000, max_bytes=65536):
 
 
 def main(argv):
-    spec = json.loads(open(argv[1]).read())
+    with open(argv[1]) as _f:
+        spec = json.loads(_f.read())
     res = trace(spec["exe"], spec.get("argv", []), spec.get("stdin_file"),
                 spec.get("timeout", 10), max_writes=spec.get("max_writes", 4000),
                 max_bytes=spec.get("max_bytes", 65536))
+    res["absorbed"] = _ABSORBED
     sys.stdout.write(json.dumps(res))
     return 0
 

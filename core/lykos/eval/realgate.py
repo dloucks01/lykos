@@ -34,12 +34,19 @@ were validated by hand against ncompress 4.2.4 (CVE-2001-1413) and jhead 3.04.
 from __future__ import annotations
 
 import io
+import logging
 import shutil
 import subprocess
 import tarfile
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from lykos.db.dao import EventDAO
+
+from .. import observe
+
+_log = logging.getLogger(__name__)
 
 # no-canary so the saved return address is reachable, PIE so symbolisation has to rebase.
 _CFLAGS = ["-O0", "-fno-stack-protector", "-w"]
@@ -366,6 +373,7 @@ def _bundle_reproduces(store, bundle_sha, *, runtime: str = "native",
         # runner.sh reports the child's status; a crash shows as 128+signum
         return any(f"exit status: {128 + s}" in out for s in (4, 6, 7, 8, 11))
     except Exception:
+        observe.absorbed(_log, "answering no")
         return False
     finally:
         shutil.rmtree(d, ignore_errors=True)
@@ -557,19 +565,27 @@ def _asserts(case: RealCase) -> dict:
 
 
 def _done_field(store, cid, stage, event_type, field_name):
-    """Read one field out of a stage's completion event."""
-    runs = [r for r in store.runs.list_by_case(cid) if r.stage == stage]
-    for r in reversed(runs):
-        for e in store.events.list(run_id=r.id, limit=60):
-            if e.type == event_type and isinstance(e.payload, dict):
-                return e.payload.get(field_name)
+    """Read one field out of a stage's completion event.
+
+    By TYPE, not out of a page of the run's events. This paged `limit=60` -- the same window bug
+    `_last_done_field` below documents for `fuzz` -- and a poc_primitive run emits ~131 events
+    with its `primitive.done` second-to-last, so the gate's `offset` detail was always None.
+    """
+    for payload in EventDAO(store.conn).payloads_of_type(
+            event_type, case_id=cid, stage=stage, newest_first=True):
+        if field_name in payload:
+            return payload.get(field_name)
     return None
 
 
 def _last_done_field(store, cid, stage, event_type, field_name):
-    """Like `_done_field`, but scans ALL of a run's events to the end and returns the LAST
-    match. Needed for a TERMINAL event of a high-volume stage: fuzz emits a progress event
-    every 250 execs, so its final `fuzz.channels` summary sits far past a small page window."""
+    """Like `_done_field`, but returns the LAST match rather than the newest-with-the-field.
+
+    Kept distinct because the two answer different questions on a stage that reports the same
+    field repeatedly: `_done_field` wants whichever report carries it, this wants the final
+    value. Both are now unwindowed, which is what this one's original comment was about -- fuzz
+    emits a progress event every 250 execs, so its final `fuzz.channels` summary sits far past
+    any small page."""
     runs = [r for r in store.runs.list_by_case(cid) if r.stage == stage]
     for r in reversed(runs):
         found = None

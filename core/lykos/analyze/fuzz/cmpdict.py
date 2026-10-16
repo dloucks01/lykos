@@ -23,7 +23,12 @@ value is *computed* from the input (not a constant) still needs those. Constants
 """
 from __future__ import annotations
 
+import logging
 from typing import Iterable
+
+from ... import observe
+
+_log = logging.getLogger(__name__)
 
 # P-Code comparison opcodes whose constant operand is a value the input is tested against. The
 # unsigned/signed equality and ordering tests cover magic bytes, tags, enum/opcode dispatch and
@@ -168,4 +173,5 @@ def _is_addrlike(value: int, is_addr) -> bool:
     try:
         return bool(is_addr(value))
     except Exception:
+        observe.absorbed(_log, "answering no")
         return False

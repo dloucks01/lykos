@@ -124,8 +124,13 @@ def env_fuzz_stage(ctx) -> dict:
                         f": {budget} executions is what fits in this stage's budget"})
             max_execs = budget
     ctx.progress(msg=f"fuzzing {len(names)} environment variable(s): {', '.join(names[:6])}")
+    # The stage's own clock, polled per execution. `max_execs` is sized from a measured exec/s
+    # rate and that rate does not hold on an interactive target, where each run blocks for the
+    # whole timeout -- so the cap alone let this stage overrun its deadline until the reaper
+    # reclaimed it and the run was recorded as `error: lease expired`.
     res = envfuzz.fuzz_env(str(exe), names, argv=argv, max_execs=max_execs,
-                           seed=int(p.get("seed", 1337)), timeout=timeout, run=runner)
+                           seed=int(p.get("seed", 1337)), timeout=timeout, run=runner,
+                           should_stop=lambda: ctx.should_cancel() or ctx.timed_out())
 
     if not res.crashed:
         # "it never started" is not "it never crashed". Without this a runtime that refused the

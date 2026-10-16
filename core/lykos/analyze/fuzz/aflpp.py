@@ -7,12 +7,17 @@ minimize/finding pipeline. AFL++ (with afl-qemu) ships in the full offline bundl
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import re
 import shutil
 import subprocess
 from pathlib import Path
 from typing import Optional
+
+from ... import observe
+
+_log = logging.getLogger(__name__)
 
 
 def locate_afl(config: Optional[str] = None) -> Optional[Path]:
@@ -68,6 +73,7 @@ def qemu_trace_arch(trace: Optional[Path]) -> Optional[str]:
         if m:
             arch = _GUEST_ARCH.get(m.group(1).decode("ascii", "replace").lower())
     except Exception:
+        observe.absorbed(_log, "keeping the default")
         arch = None
     _guest_cache[key] = arch
     return arch
@@ -230,7 +236,46 @@ def run_campaign(afl: Path, exe, seeds_dir, out_dir, *, seconds: int = 30,
         # Native (afl-cc-instrumented) build: CmpLog is the same idea via a second, cmplog-
         # instrumented copy of the target that AFL runs alongside the main one (`-c <binary>`).
         cmd = [cmd[0], "-c", str(cmplog)] + cmd[1:]
-    return subprocess.run(cmd, env=env, capture_output=True, timeout=int(seconds) + 90)
+    # afl-fuzz enforces `-V` itself; this is the backstop for when it does not. On a real HTB
+    # binary under `-Q` it overran, the `TimeoutExpired` propagated out of `coverage_fuzz`, and
+    # the stage was recorded as an ERROR -- which the real-corpus gate rejects outright, because
+    # an error is never an acceptable outcome while a decline is. A campaign that overruns has
+    # usually still written a queue and maybe crashes, so stop it and keep what it produced;
+    # `campaign_failed` / `campaign_stats` / `harvest_crashes` then decide whether anything ran.
+    #
+    # Output goes to FILES, not pipes. Killing a process whose output is piped can block on a
+    # surviving grandchild still holding the write end -- and afl under `-Q` has several (the
+    # forkserver, the qemu tracer). Files cannot block, and survive the kill so the stderr tail
+    # the caller reports is still there.
+    import tempfile
+
+    from ..dynamic import sandbox as _sandbox
+    with tempfile.TemporaryDirectory(prefix="afl-io-") as _io:
+        o_path, e_path = Path(_io) / "stdout", Path(_io) / "stderr"
+        with o_path.open("wb") as _o, e_path.open("wb") as _e:
+            proc = subprocess.Popen(cmd, env=env, stdout=_o, stderr=_e,
+                                    start_new_session=True)
+            try:
+                rc = proc.wait(timeout=int(seconds) + 90)
+                overran = False
+            except subprocess.TimeoutExpired:
+                _sandbox.kill_quietly(proc)
+                rc, overran = -9, True
+        out, err = o_path.read_bytes(), e_path.read_bytes()
+    if overran:
+        # Say so in the stderr the caller reports, so "0 crashes" from an overrun campaign is
+        # never read as a clean negative.
+        err += (b"\n[lykos] afl-fuzz overran its %ds budget by more than 90s and was stopped; "
+                b"whatever queue and crashes it had written are kept\n" % int(seconds))
+        # Report success ONLY if it actually produced something. An overrun that wrote a queue
+        # really did fuzz, and calling that an error throws the work away; an overrun that wrote
+        # nothing did NOT fuzz, and must not be reported as a clean "0 crashes" -- so it keeps
+        # the kill status and falls into the caller's existing "no output" path. The two are
+        # opposite conclusions and the return value has to tell them apart.
+        if (out_dir / "default").exists() or (out_dir / "crashes").exists() \
+                or (out_dir / "queue").exists():
+            rc = 0
+    return subprocess.CompletedProcess(cmd, rc, out, err)
 
 
 # afl-fuzz exits 0 after printing these, so the return code alone does not tell you it failed

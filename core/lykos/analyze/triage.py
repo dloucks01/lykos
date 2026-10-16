@@ -5,10 +5,12 @@ tool_version yields byte-identical JSON and the result cache (JE-16) hits on re-
 """
 from __future__ import annotations
 
+import logging
 import math
 from pathlib import Path
 from typing import Any, Optional
 
+from .. import observe
 from . import dotnet as dotnetmod
 from . import elf as elfmod
 from . import filetype
@@ -17,6 +19,8 @@ from . import macho as machomod
 from . import pe as pemod
 from . import pyc as pycmod
 from . import wasm as wasmmod
+
+_log = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 1
 TOOL = "elf-stdlib"
@@ -116,22 +120,26 @@ def _firmware_fallback(data: bytes) -> Optional[dict]:
     try:
         from .firmware.headerless import analyze_blob
     except Exception:
+        observe.absorbed(_log, "keeping the default")
         analyze_blob = None
     if analyze_blob is not None:
         try:
             hl = analyze_blob(blob)
         except Exception:
+            observe.absorbed(_log, "keeping the default")
             hl = None
         if hl and hl.get("arch"):
             return {"mode": "headerless", "headerless": hl}
     try:
         from .firmware.carve import scan_signatures
     except Exception:
+        observe.absorbed(_log, "keeping the default")
         scan_signatures = None
     if scan_signatures is not None:
         try:
             hits = scan_signatures(blob)
         except Exception:
+            observe.absorbed(_log, "keeping the default")
             hits = []
         # offset 0 would already have been a container magic; we want EMBEDDED content
         embedded = [h for h in hits if (h.get("offset") or 0) > 0]

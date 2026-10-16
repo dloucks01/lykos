@@ -80,10 +80,6 @@ _TRUST_HINT = re.compile(r"(?i)javax/net/ssl/X509TrustManager|TrustAllCerts|"
                          r"ALLOW_ALL_HOSTNAME_VERIFIER")
 
 
-def _owner(call: str) -> str:
-    return call.rsplit(".", 1)[0]
-
-
 def analyze(info, *, max_sites: int = 40) -> list:
     """Findings for a parsed jar/class. Each names the classes the call appears in."""
     out: list = []

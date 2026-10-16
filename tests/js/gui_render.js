@@ -259,6 +259,62 @@ function renderInfo(vnode) {
     /clear/i.test(renderInfo(h(C.CaseOverview,
       { findings: ovFindings, pocs: ovPocs, filter: { severity: "critical" }, onFilter() {} })).all));
 
+  // ---------- RunScorecard: what the run DID ----------
+  // The workbench showed findings with no account of the work behind them: no executions, no
+  // declines, no never-scheduled list, no absorbed count. There was no endpoint to ask, so of
+  // two targets with zero crashes, one that executed 2,756 times and one that executed zero
+  // because a stage upstream ate the budget looked identical. This is a REAL card, copied from
+  // a 420-second run on one small ELF.
+  const realCard = {
+    target_id: "t1", filename: "vuln",
+    baseline: { ran: true, crashed: false, note: "" },
+    executions: { total: 14737, per_second: 76.9, by_engine: { fuzz: 10473, directed: 4264 } },
+    crashes: 64,
+    capability: {
+      registered: 45, scheduled: 34, worked: new Array(22).fill("s"),
+      declined: new Array(12).fill("s"), errored: [],
+      never_scheduled: ["concolic", "firmware_carve", "net_fuzz", "poc_diff", "unpack"],
+    },
+    declined: { libfuzzer: "no source for this target (libFuzzer needs C/C++ source)" },
+    absorbed: { total: 3, sites: 2, top: [{ site: "lykos.analyze.elf.parse:118", count: 2 }] },
+  };
+  info = renderInfo(h(C.RunScorecard, { cards: [realCard], targetName: "vuln" }));
+  ck("RunScorecard renders without throwing", info.threw.length === 0);
+  ck("RunScorecard reports the baseline verdict", /ran, exited normally/.test(info.all));
+  ck("RunScorecard reports executions and the per-engine split",
+    /14,737/.test(info.all) && /fuzz 10,473/.test(info.all));
+  // The walk concatenates each text node with its own separator, and this line is built from
+  // several interpolations, so match whitespace loosely rather than pinning the spacing.
+  ck("RunScorecard reports the capability tally against the registry",
+    /22\s+did work/.test(info.all) && /of\s+45\s+registered/.test(info.all)
+    && /12\s+declined/.test(info.all));
+  ck("RunScorecard names the stages never reached", /concolic/.test(info.all));
+  ck("RunScorecard gives a decline its reason", /no source for this target/.test(info.all));
+  ck("RunScorecard reports what the run absorbed, with the worst site",
+    /3 best-effort/.test(info.all) && /lykos\.analyze\.elf\.parse:118/.test(info.all));
+  // Zero absorbed is the USEFUL reading: it says a thin result is the target's doing, not ours.
+  info = renderInfo(h(C.RunScorecard, {
+    cards: [Object.assign({}, realCard, { absorbed: { total: 0, sites: 0, top: [] } })] }));
+  ck("RunScorecard says so when a run absorbed nothing",
+    /nothing . no step failed quietly/.test(info.all));
+  // An INCOMPLETE card: a stage was still finishing when it was built, so every count is a
+  // floor. On `zigzag` the card said 0 executions while a cancelled stage went on to report 64,
+  // and the gate then failed the target with "executed it zero times". A reader has to be able
+  // to see which kind of zero they are looking at.
+  info = renderInfo(h(C.RunScorecard, {
+    cards: [Object.assign({}, realCard, { settled: false })] }));
+  ck("RunScorecard flags a card built before every stage reported",
+    /Incomplete/.test(info.all) && /floor, not a total/.test(info.all));
+  ck("RunScorecard does not cry incomplete when it settled",
+    !/Incomplete/.test(renderInfo(h(C.RunScorecard,
+      { cards: [Object.assign({}, realCard, { settled: true })] })).all));
+  ck("RunScorecard is empty-safe with no card",
+    renderInfo(h(C.RunScorecard, { cards: [] })).threw.length === 0);
+  // A card for another binary must not be shown as this one's.
+  info = renderInfo(h(C.RunScorecard, { cards: [realCard], targetName: "other" }));
+  ck("RunScorecard falls back to the first card rather than rendering nothing",
+    info.threw.length === 0 && /14,737/.test(info.all));
+
   console.log(pass ? "ALL PASS" : "FAILURES ABOVE");
   process.exit(pass ? 0 : 1);
 })().catch((e) => { console.log("FAIL  harness threw: " + (e && e.stack || e)); process.exit(1); });

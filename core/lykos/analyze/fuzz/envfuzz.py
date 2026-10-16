@@ -86,7 +86,10 @@ def _run_with_env(exe: str, argv: list, env_overrides: dict, timeout: float = 5.
         proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         proc.kill()
-        proc.wait()
+        try:
+            proc.wait(timeout=2)                         # bounded: a forked child must not wedge us
+        except subprocess.TimeoutExpired:
+            pass
         return None
     return proc.returncode
 
@@ -100,7 +103,7 @@ def _crashes(exe, argv, overrides, timeout):
 
 
 def fuzz_env(exe: str, env_names, *, argv=(), seeds=(), max_execs: int = 1500, seed: int = 1337,
-             timeout: float = 5.0, run=None) -> EnvFuzzResult:
+             timeout: float = 5.0, run=None, should_stop=None) -> EnvFuzzResult:
     """Fuzz a value into the candidate env vars until one crashes `exe`, then ATTRIBUTE the crash to
     the single variable that reproduces it. Shotgun (all names set to the same payload) finds the
     bug fast; the per-variable re-run names the culprit and confirms it, killing one-off flakes.
@@ -109,6 +112,15 @@ def fuzz_env(exe: str, env_names, *, argv=(), seeds=(), max_execs: int = 1500, s
     signal path. A managed target cannot be exec'd and does not fault with a signal -- its defect
     is an uncaught exception -- so the only way this channel reaches a jar, a .pyc or a .NET
     assembly is for the caller to supply the runner that knows how to start it.
+
+    `should_stop() -> bool` is polled before every execution, and it is not optional in practice.
+    This loop bounded itself only by `max_execs`, and `max_execs` is sized from a MEASURED
+    exec/s rate -- which does not hold on an interactive target, where every run blocks for the
+    full `timeout` instead of milliseconds. On the HTB binary `power_greed` (real-corpus gate,
+    2026-10-16) the stage ran so far past its deadline that the heartbeat stopped renewing and
+    the reaper reclaimed the row: the run was recorded as `error: lease expired`, and the gate's
+    contract is that an error is never an acceptable outcome while a decline is. A stage that
+    loops has to watch its own clock -- the same poll `fuzz/stage.py` already does.
     """
     if not env_names:
         return EnvFuzzResult(False, note="no candidate env vars")
@@ -120,8 +132,16 @@ def fuzz_env(exe: str, env_names, *, argv=(), seeds=(), max_execs: int = 1500, s
     argv = list(argv)
     n = 0
     payloads = list(corpus)
+    stop = should_stop if should_stop is not None else (lambda: False)
     while n < max_execs:
+        if stop():
+            return EnvFuzzResult(False, execs=n, note=f"stopped after {n} execution(s): out of "
+                                                      f"budget or cancelled")
         for data in payloads:
+            if stop():
+                return EnvFuzzResult(False, execs=n,
+                                     note=f"stopped after {n} execution(s): out of budget or "
+                                          f"cancelled")
             n += 1
             val = data.replace(b"\x00", b"")             # execve env truncates at NUL
             crashed, _, _ = fire({name: val.decode("latin-1") for name in env_names})

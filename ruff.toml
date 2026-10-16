@@ -1,11 +1,48 @@
 # Repo-wide lint config (P0.11). Governs core/ and tests/ uniformly.
 # Runtime is stdlib-only; these are style/correctness gates, not deps.
-line-length = 100
+# 120, re-baselined 2026-10-16. It was 100, and the tree was lint-clean at that limit when the
+# config landed (commit ce50eee). It then drifted to 859 E501 violations -- 14 -> 269 -> 739 -> 859
+# across September and October -- because .github/workflows/ci.yml never ran `make lint`: the gate
+# existed, was documented as mandatory, and nothing executed it. Of the drift, 97% sat in 101-120
+# and 41% of it was executable code (not comments), so reflowing it blind was the riskier change in
+# dense exploit paths. The genuine outliers above 120 WERE reflowed, with content asserted
+# identical. The fix that actually holds is ci.yml now running lint and typecheck -- raise or lower
+# this number deliberately, but never again to make a red gate go green.
+line-length = 120
 target-version = "py311"
 
 # The phase-0 exit demo is a narrative walkthrough script, not a maintained test.
 extend-exclude = ["tests/phase0_exit_demo.py"]
 
 [lint]
-select = ["E", "F", "W", "I"]   # pycodestyle, pyflakes, isort
+# E/F/W/I: pycodestyle, pyflakes, isort.
+#
+# The four rules after them were added 2026-10-16 because each one had already caught a real
+# defect in this tree that E/F/W/I could not see, and nothing was stopping any of them coming
+# back. They are narrow and the tree is clean against all four, so they cost nothing to keep:
+#
+#   B023    a closure over a loop variable. 7 sites, all called in the iteration that defined
+#           them -- so latent, not live, and the first one deferred to a thread or a later phase
+#           would have silently used the last loop value.
+#   SIM115  a file handle left to the garbage collector. 20 sites. carve.py leaked one fd per
+#           file across an unpacked firmware filesystem, and three subprocess drivers wrote the
+#           RESULT the parent reads as `json.dump(out, open(path, "w"))` -- those drivers are
+#           killed on timeout, so a handle the interpreter never flushed left partial JSON.
+#   RUF013  `x: bytes = None`: a signature that states a type it then violates.
+#   B904    an exception re-raised inside a handler without `from`, which buries the domain
+#           error (StageTimeout) under the plumbing that noticed it (TimeoutExpired).
+select = ["E", "F", "W", "I", "B023", "SIM115", "RUF013", "B904"]
 ignore = ["E402", "E702"]       # deliberate lazy imports; compact `stmt; return` guards
+
+[lint.per-file-ignores]
+# The conformance harness embeds whole C, C++ and shell programs as string literals -- that is
+# what a synthetic target IS here -- and reflowing a line of C to satisfy a Python line limit
+# makes the C unreadable to no benefit. Everything else in tools/ is held to the same bar as
+# core/, which it was not until 2026-10-16: `ruff check core tests` never looked at tools/, so
+# the directory holding every gate was the one directory with no gate on it.
+"tools/pipeline_conformance.py" = ["E501"]
+# SIM115 earns its place in core, where a stage runs for minutes and a driver is killed on
+# timeout. A test process opens the system libc, reads it, and exits seconds later; there is no
+# handle to leak and no interpreter left to leak it in. Enforcing it here would be 28 edits of
+# pure noise -- and noise is how a gate stops being read.
+"tests/*" = ["SIM115"]

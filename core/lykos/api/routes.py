@@ -39,6 +39,7 @@ _CASE_REPORT = re.compile(r"^/cases/([^/]+)/report$")
 _CASE_EXPORT = re.compile(r"^/cases/([^/]+)/export$")
 _CASE_SYSMAP = re.compile(r"^/cases/([^/]+)/systemmap$")
 _CASE_VERIFS = re.compile(r"^/cases/([^/]+)/verifications$")
+_CASE_SCORECARD = re.compile(r"^/cases/([^/]+)/scorecard$")
 _CASE_AUTOPILOT = re.compile(r"^/cases/([^/]+)/autopilot$")
 _CASE_AUTOPILOT_CANCEL = re.compile(r"^/cases/([^/]+)/autopilot/cancel$")
 
@@ -87,5 +88,5 @@ def _read_static(relpath: str) -> bytes:
         base = (Path(__file__).parent / "static").resolve()
         target = base.joinpath(*parts).resolve()
         if base != target and base not in target.parents:
-            raise FileNotFoundError(relpath)
+            raise FileNotFoundError(relpath) from None
         return target.read_bytes()

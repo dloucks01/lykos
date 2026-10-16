@@ -75,7 +75,8 @@ def _load_project(angr, spec, binary):
 
 
 def main(spec_path, out_path):
-    spec = json.load(open(spec_path))
+    with open(spec_path) as _f:
+        spec = json.load(_f)
     result = {"ok": False, "generated": [], "reached_targets": [], "stats": {}, "note": None}
     try:
         import logging

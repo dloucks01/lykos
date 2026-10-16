@@ -8,10 +8,9 @@ import subprocess
 
 import pytest
 from lykos.analyze import register
-from lykos.analyze.poc import fmt
 from lykos.analyze.dynamic import sandbox
 from lykos.analyze.ingest import enqueue_triage, ingest
-from lykos.analyze.poc import enqueue_exploit
+from lykos.analyze.poc import enqueue_exploit, fmt
 from lykos.db.dao import FindingDAO, PocDAO
 from lykos.jobs import JobConfig, JobQueue, WorkerPool
 

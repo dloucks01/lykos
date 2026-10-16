@@ -101,13 +101,15 @@ make doctor            # capability report for this host
 make test              # the full suite
 make lint typecheck    # ruff; mypy (strict over the infra core — see mypy.ini)
 make gui               # headless GUI harnesses (needs node)
-make ci                # lint + typecheck + gui + test
+make ci                # lint + typecheck + gui + test + conformance-smoke
 make coverage          # line/branch coverage INCLUDING the subprocess-only engines
 ./start                # serve the API + UI on 127.0.0.1:8787 (case store in .cases/)
 make bundle            # build the standalone dist/lykos.pyz zipapp
 make verify            # build it, then prove it serves the UI and triages offline
 make eval-gate         # detection-quality gate over the bundled corpus (0-FP tripwire)
 make benchmark         # tracked precision/recall/F1 over the breadth corpus (non-gating)
+make conformance-smoke # the stage-to-stage joins, 7 cases, ~5 min (runs on every push)
+make conformance       # all 64 join cases through the real autopilot (tens of minutes)
 make arch-gate         # every architecture still reaches its PoC level
 make real-gate         # full chain on real programs (detect -> PoC -> attribution)
 make corpus-gate       # plumbing health on REAL binaries/libraries (needs a local corpus)
@@ -121,7 +123,36 @@ make clean             # remove build artifacts and caches
 ```
 
 `make lint` and `make typecheck` **fail** when their tool is missing rather than skipping, so
-`make ci` cannot go green without having actually run them.
+`make ci` cannot go green without having actually run them. `.github/workflows/ci.yml` runs all
+of `make ci`'s gates, and `tests/test_gates_are_wired.py` asserts that it does — for two months
+it ran only `test`, and in that window lint drifted from 14 violations to 859 and four undefined
+names reached `main` inside `except` handlers.
+
+**`make conformance` is the only thing that tests the joins.** Unit tests cover the stages; this
+drives one tiny synthetic target per bug class through the *real* autopilot, with a live worker
+pool and a wall-clock budget, and asserts the expected demonstrated effect comes out. Every
+defect it has caught lived *between* two stages — most recently a `limit=60` in the L2→L3 handoff
+that made L3 unreachable on any target whose input needs structure, while both stages' own tests
+stayed green. The 7-case `conformance-smoke` subset runs per push; the full table is in
+`make release`.
+
+### Diagnostics
+
+Nothing in the engine configured logging, so every `_log.debug(..., exc_info=True)` written to
+leave evidence of a swallowed error was discarded before it reached anything. It is connected
+now:
+
+```sh
+./lykos --log debug analyze ./target      # every absorbed error, with its traceback and site
+LYKOS_LOG=debug LYKOS_LOG_FILE=run.log ./lykos analyze ./target
+```
+
+Because nobody reads a debug log, a swallowed error is also **counted**, keyed on the handler's
+own `module.function:line`, and the run reports the total: `absorbed  nothing — no step failed
+quietly in this run`, or the count and the worst sites. The standalone tracer and emulator
+drivers run under a different interpreter and cannot import the counter, so they ship what they
+absorbed back in the JSON result they already return. `tests/test_observability.py` asserts that
+no broad `except` in `core/` is both silent and unexplained.
 
 `make corpus-gate` and `make corpus-regression` are the only two targets that need material which
 is not in the repo: upstream library tarballs under `~/Downloads/libs`. They are not part of
@@ -144,8 +175,9 @@ core/lykos/        the platform (stdlib only)
   eval/            benchmark corpora and the quality gates
   jobs/            the job queue and worker pool
   toolchain.py     one inventory of every external tool  <- `lykos doctor` reads this
+  observe.py       logging setup + the absorbed-error counter  <- `--log` reads this
 tests/             the suite, incl. js/ harnesses for the UI
-tools/             dev-time builders (e.g. the offline CVE database)
+tools/             dev-time builders, and pipeline_conformance.py (the stage-to-stage joins)
 docs/              design docs; internal/ archive/ are historical, not maintained
 examples/          runnable demos and fixture builders
 packaging/         zipapp build, offline verify, and bundle scripts

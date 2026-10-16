@@ -39,29 +39,33 @@ def name(cwe):
     return CWE.get(cwe, (cwe, "info"))[0]
 
 
-def default_severity(cwe):
-    return CWE.get(cwe, (cwe, "info"))[1]
-
-
 # One plain-language sentence per CWE -- what the weakness IS and why it matters -- for the UI to
 # show on hover/click of a CWE badge, so an analyst does not have to leave the tool to look it up.
 CWE_DESC = {
-    "CWE-119": "Code reads or writes outside the intended bounds of a memory buffer, corrupting adjacent data or crashing.",
-    "CWE-120": "Data is copied into a buffer without checking it fits, so a long input overruns the buffer (classic overflow).",
-    "CWE-121": "A buffer on the call stack is overflowed, which can overwrite the saved return address and hijack control flow.",
+    "CWE-119": "Code reads or writes outside the intended bounds of a memory buffer, corrupting adjacent data or "
+               "crashing.",
+    "CWE-120": "Data is copied into a buffer without checking it fits, so a long input overruns the buffer (classic "
+               "overflow).",
+    "CWE-121": "A buffer on the call stack is overflowed, which can overwrite the saved return address and hijack "
+               "control flow.",
     "CWE-122": "A heap-allocated buffer is overflowed, corrupting heap metadata or neighbouring allocations.",
     "CWE-125": "Code reads memory before the start or past the end of a buffer, leaking data or crashing.",
     "CWE-416": "Memory is used after it has been freed, letting an attacker control the freed contents.",
     "CWE-476": "A NULL pointer is dereferenced, typically crashing the program (denial of service).",
     "CWE-787": "Code writes past the bounds of a buffer, corrupting memory and often enabling code execution.",
-    "CWE-134": "A format string is built from untrusted input, letting an attacker read or write memory via format specifiers.",
+    "CWE-134": "A format string is built from untrusted input, letting an attacker read or write memory via format "
+               "specifiers.",
     "CWE-242": "A function that is unsafe by design (e.g. gets()) is used and cannot be made safe.",
     "CWE-676": "A function that is easy to misuse (e.g. strcpy, alloca) is used without the required safeguards.",
     "CWE-78":  "Untrusted input reaches a shell/command, letting an attacker run arbitrary OS commands.",
     "CWE-190": "An arithmetic operation wraps past the integer's range, producing a wrong (often tiny) size or index.",
-    "CWE-22":  "A filesystem path is built from untrusted input without restriction, so \"../\" or an absolute path lets an attacker read or write files outside the intended directory.",
-    "CWE-789": "An allocation size is taken from untrusted input, so an attacker can force a huge allocation (denial of service) or, if the size arithmetic wraps, a too-small buffer that is then overflowed.",
-    "CWE-89":  "An SQL query is built from untrusted input without parameterization, so an attacker can alter the query -- read or modify data, or bypass authentication.",
+    "CWE-22":  "A filesystem path is built from untrusted input without restriction, so \"../\" or an "
+               "absolute path lets "
+               "an attacker read or write files outside the intended directory.",
+    "CWE-789": "An allocation size is taken from untrusted input, so an attacker can force a huge allocation (denial "
+               "of service) or, if the size arithmetic wraps, a too-small buffer that is then overflowed.",
+    "CWE-89":  "An SQL query is built from untrusted input without parameterization, so an attacker can alter the "
+               "query -- read or modify data, or bypass authentication.",
     "CWE-259": "A password is hard-coded in the binary, so anyone who reads it gains access.",
     "CWE-321": "A cryptographic key is hard-coded in the binary, so the key is not secret.",
     "CWE-798": "Credentials are embedded in the code, usable by anyone who inspects the binary.",
@@ -72,9 +76,11 @@ CWE_DESC = {
     "CWE-377": "A temporary file is created insecurely, allowing races or predictable-name attacks.",
     "CWE-693": "A protection mechanism is missing or bypassable, weakening the intended defense.",
     "CWE-250": "Code runs with more privilege than it needs, widening the impact of any other bug.",
-    "CWE-367": "A path is checked (access/stat) then used (open/exec); an attacker can swap it in between (symlink race).",
+    "CWE-367": "A path is checked (access/stat) then used (open/exec); an attacker can swap it in between (symlink "
+               "race).",
     "CWE-457": "A variable is read before it is initialized, so its value is whatever was left in that memory.",
-    "CWE-822": "Code calls or dereferences a pointer read from writable memory (e.g. a function pointer in a heap object); if that memory can be corrupted, the pointer redirects control flow.",
+    "CWE-822": "Code calls or dereferences a pointer read from writable memory (e.g. a function pointer in a heap "
+               "object); if that memory can be corrupted, the pointer redirects control flow.",
 }
 
 

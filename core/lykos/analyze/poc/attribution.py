@@ -22,12 +22,16 @@ their existing check for other guests.
 from __future__ import annotations
 
 import json
+import logging
 import secrets
 import tempfile
 from pathlib import Path
 
+from ... import observe
 from ..dynamic import sandbox
 from ..fuzz.runner import place
+
+_log = logging.getLogger(__name__)
 
 _HELPER = "attribution_trace.py"
 
@@ -53,6 +57,7 @@ def materialize_helper() -> Path:
         from importlib import resources
         data = (resources.files("lykos.analyze.poc") / _HELPER).read_bytes()
     except Exception:
+        observe.absorbed(_log, "keeping the default")
         data = (Path(__file__).parent / _HELPER).read_bytes()
     p = d / _HELPER
     p.write_bytes(data)
@@ -85,7 +90,10 @@ def make_attributed_capture(ctx, helper: Path, exe, mode, base_argv, timeout, py
         proc = ctx.run_subprocess([python, str(helper), str(spec_path)], timeout=timeout + 30)
         out = (proc.stdout or b"").decode("latin-1", "ignore").strip()
         try:
-            return json.loads(out) if out else {"ok": False, "reason": "no output"}
+            res = json.loads(out) if out else {"ok": False, "reason": "no output"}
+            observe.absorbed_remote("lykos.analyze.poc.attribution_trace",
+                                    res.pop("absorbed", None))
+            return res
         except json.JSONDecodeError:
             return {"ok": False, "reason": "bad helper output: " + out[:200]}
 

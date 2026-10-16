@@ -7,10 +7,12 @@ model is JSON-serializable and self-contained: it embeds the reproducibility met
 from __future__ import annotations
 
 import json
+import logging
 import time
 from typing import Any, Optional
 
 from .. import __version__ as _lykos_version
+from .. import observe
 from ..analyze.detect import catalog
 from ..db.dao import (
     AnalysisRunDAO,
@@ -21,6 +23,8 @@ from ..db.dao import (
 )
 from ..db.models import FINDING_STATES, SEVERITIES
 from ..jobs.registry import cached_output_json
+
+_log = logging.getLogger(__name__)
 
 
 def _best_coverage(store, runs) -> Optional[dict]:
@@ -41,6 +45,7 @@ def _best_coverage(store, runs) -> Optional[dict]:
         try:
             out = cached_output_json(store, r.id)
         except Exception:
+            observe.absorbed(_log, "keeping the default")
             out = None
         cov = (out or {}).get("coverage") if isinstance(out, dict) else None
         if not cov:
@@ -356,6 +361,7 @@ def build_report(
                 "entropy": t.entropy, "ingested_at": _iso(t.ingested_at),
                 "fuzz_coverage": _best_coverage(store, _target_runs),
                 "execution": execution,
+                "exploited_build": _exploited_build(store, case_id, t.id),
                 "findings": findings_out,
             })
 
@@ -389,6 +395,31 @@ def build_report(
     }
 
 
+def _exploited_build(store, case_id: str, target_id: str) -> dict:
+    """Which IMAGE the exploit was built and confirmed against, when it is not the ingested one.
+
+    For a source drop the ingested target is the ASan+UBSan build, and L3 is impossible on it --
+    it abort()s at the overflow copy before the corrupted return is reached. `build_exploit`
+    therefore works against the uninstrumented build of the same source and records the swap
+    (`exploit.build_choice`). The report has to say so, because the target header prints the
+    INGESTED sha and every offset in the findings below it belongs to the other image. A reader
+    who takes the two to be the same binary is being misled by omission -- the PoC bundle's own
+    `meta.json` already carries `exploited_sha256` and the report was the last place that did not.
+
+    `{}` when no swap happened, which is the normal case for an ingested binary.
+    """
+    try:
+        from ..db.dao import EventDAO
+        for pl in EventDAO(store.conn).payloads_of_type(
+                "exploit.build_choice", case_id=case_id, target_id=target_id):
+            if pl.get("build"):
+                return {"build": pl.get("build"), "bytes": pl.get("bytes"),
+                        "note": pl.get("note")}
+    except Exception:                                    # noqa: BLE001 -- the report must render
+        return {}
+    return {}
+
+
 def _scorecard(store, case_id: str, target_id: str) -> dict:
     """The autopilot's own record of the work done on this target, or {} if it never ran.
 
@@ -398,11 +429,13 @@ def _scorecard(store, case_id: str, target_id: str) -> dict:
     """
     try:
         from ..analyze.orchestrate import SCORECARD_EVENT
+        from ..db.dao import EventDAO
+        # Asked for by type. This scanned the case's first 8,000 events for the scorecard, and
+        # the scorecard is emitted LAST -- the first thing a window cuts. A 420-second run on one
+        # small ELF already produces ~2,100 events, so a longer budget or a multi-target case
+        # would have silently rendered the whole "what this run did" card as empty.
         best = None
-        for e in store.events.list(case_id=case_id, limit=8000):
-            if e.type != SCORECARD_EVENT:
-                continue
-            pl = e.payload if isinstance(e.payload, dict) else {}
+        for pl in EventDAO(store.conn).payloads_of_type(SCORECARD_EVENT, case_id=case_id):
             if pl.get("target_id") == target_id:
                 best = pl
         if not best:
@@ -427,6 +460,15 @@ def _scorecard(store, case_id: str, target_id: str) -> dict:
         "search_seconds": best.get("search_seconds"),
         "crashes_recorded": best.get("crashes"),
         "poc": best.get("poc") or {},
+        # Errors the run absorbed on purpose, counted per site. The report already distinguishes
+        # "ran and found nothing" from "never ran"; this is the third case it could not express --
+        # "ran, and some steps inside it failed quietly". Zero is the useful reading: it says a
+        # thin result is the target's doing and not ours.
+        "absorbed": best.get("absorbed") or {},
+        # False means a stage was still finishing when the card was built, so every count above
+        # is a FLOOR rather than a total. A reader weighing "0 executions" has to know which they
+        # are looking at: that is precisely how a wrong zero gets believed.
+        "settled": best.get("settled", True),
     }
 
 

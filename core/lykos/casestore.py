@@ -25,7 +25,7 @@ _CasePlan = tuple[str, str, tuple[Any, ...]]
 from .db.connection import transaction
 from .db.dao import AnalysisRunDAO, ArtifactDAO, CaseDAO, EventDAO, RunArtifactDAO, TargetDAO
 from .db.migrations import init_db
-from .db.models import Artifact
+from .db.models import Artifact, Target
 from .hashing import hash_all_file, hash_bytes
 
 _ARTIFACTS = "artifacts"
@@ -136,7 +136,7 @@ class ContentStore:
             raise IOError(f"artifact {sha256} failed integrity check")
         return data
 
-    def stage_target(self, target, workdir, name: str = "target.bin", *,
+    def stage_target(self, target: Target, workdir: str | Path, name: str = "target.bin", *,
                      mode: int = 0o755) -> Path:
         """Materialise a target for RUNNING: write its binary to <workdir>/<name> and every
         companion dep (a bundled loader / libc / data file) to its path RELATIVE to the workdir,

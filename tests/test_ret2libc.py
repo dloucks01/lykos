@@ -108,7 +108,7 @@ def test_ret2libc_leak_spawns_a_shell(r2l_bin):
     ret_align = rop.find_gadget(data, "ret")
     assert pop_rdi and puts_plt and puts_got, "fixture address resolution failed"
     nm = subprocess.run(["nm", str(exe)], capture_output=True, text=True).stdout
-    main = next((int(l.split()[0], 16) for l in nm.splitlines() if l.endswith(" T main")), None)
+    main = next((int(ln.split()[0], 16) for ln in nm.splitlines() if ln.endswith(" T main")), None)
     assert main
     ld = open(_SYS_LIBC, "rb").read()
     syms = rop.libc_symbols(ld, ("puts", "system"))

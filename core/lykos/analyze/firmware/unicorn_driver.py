@@ -29,31 +29,80 @@ import random
 import struct
 import sys
 
+# ---------------------------------------------------------------------------------- absorbed
+# This driver runs as a standalone script under a different interpreter (the parent copies it to
+# a scratch dir), so `lykos.observe` is not importable here. The counter still has to reach the
+# parent, because a silently-skipped step in a tracer is exactly what turns a real crash into
+# "no crash observed" -- so absorbed steps ride home in the JSON result and the parent folds
+# them into its own counter. See observe.absorbed_remote.
+_ABSORBED: list = []
+
+
+def _absorbed(what):
+    """Record a deliberately-absorbed failure, with the live exception's repr."""
+    import sys as _sys
+    exc = _sys.exc_info()[1]
+    _ABSORBED.append({"what": what, "exc": repr(exc)[:200]})
+
+
 try:
     import unicorn
     from unicorn import (
-        UC_ARCH_ARM, UC_ARCH_ARM64, UC_ARCH_MIPS, UC_ARCH_PPC, UC_ARCH_RISCV,
-        UC_HOOK_BLOCK, UC_HOOK_MEM_READ_UNMAPPED, UC_HOOK_MEM_READ, UC_HOOK_MEM_WRITE,
-        UC_HOOK_MEM_WRITE_UNMAPPED, UC_HOOK_MEM_FETCH_UNMAPPED, UC_HOOK_INTR,
-        UC_MEM_FETCH_PROT, UC_MEM_FETCH_UNMAPPED, UC_MEM_READ_PROT, UC_MEM_READ_UNMAPPED,
-        UC_MEM_WRITE_PROT, UC_MEM_WRITE_UNMAPPED,
-        UC_MODE_ARM, UC_MODE_THUMB, UC_MODE_MIPS32, UC_MODE_MIPS64,
-        UC_MODE_PPC32, UC_MODE_RISCV32, UC_MODE_RISCV64,
-        UC_MODE_BIG_ENDIAN, UC_MODE_LITTLE_ENDIAN,
-        Uc, UcError,
+        UC_ARCH_ARM,
+        UC_ARCH_ARM64,
+        UC_ARCH_MIPS,
+        UC_ARCH_PPC,
+        UC_ARCH_RISCV,
+        UC_HOOK_BLOCK,
+        UC_HOOK_INTR,
+        UC_HOOK_MEM_FETCH_UNMAPPED,
+        UC_HOOK_MEM_READ,
+        UC_HOOK_MEM_READ_UNMAPPED,
+        UC_HOOK_MEM_WRITE,
+        UC_HOOK_MEM_WRITE_UNMAPPED,
+        UC_MEM_FETCH_PROT,
+        UC_MEM_FETCH_UNMAPPED,
+        UC_MEM_READ_PROT,
+        UC_MEM_READ_UNMAPPED,
+        UC_MEM_WRITE_PROT,
+        UC_MEM_WRITE_UNMAPPED,
+        UC_MODE_ARM,
+        UC_MODE_BIG_ENDIAN,
+        UC_MODE_LITTLE_ENDIAN,
+        UC_MODE_MIPS32,
+        UC_MODE_MIPS64,
+        UC_MODE_PPC32,
+        UC_MODE_RISCV32,
+        UC_MODE_RISCV64,
+        UC_MODE_THUMB,
+        Uc,
+        UcError,
     )
-    from unicorn.arm_const import (UC_ARM_REG_PC, UC_ARM_REG_SP, UC_ARM_REG_LR, UC_ARM_REG_R0,
-                                   UC_CPU_ARM_CORTEX_M3)
-    from unicorn.arm64_const import (UC_ARM64_REG_PC, UC_ARM64_REG_SP, UC_ARM64_REG_X0,
-                                     UC_ARM64_REG_X30)
-    from unicorn.mips_const import (UC_MIPS_REG_PC, UC_MIPS_REG_SP, UC_MIPS_REG_V0,
-                                    UC_MIPS_REG_RA)
-    from unicorn.ppc_const import UC_PPC_REG_PC, UC_PPC_REG_1, UC_PPC_REG_3, UC_PPC_REG_LR
-    from unicorn.riscv_const import (UC_RISCV_REG_PC, UC_RISCV_REG_SP, UC_RISCV_REG_A0,
-                                     UC_RISCV_REG_RA)
+    from unicorn.arm64_const import (
+        UC_ARM64_REG_PC,
+        UC_ARM64_REG_SP,
+        UC_ARM64_REG_X0,
+        UC_ARM64_REG_X30,
+    )
+    from unicorn.arm_const import (
+        UC_ARM_REG_LR,
+        UC_ARM_REG_PC,
+        UC_ARM_REG_R0,
+        UC_ARM_REG_SP,
+        UC_CPU_ARM_CORTEX_M3,
+    )
+    from unicorn.mips_const import UC_MIPS_REG_PC, UC_MIPS_REG_RA, UC_MIPS_REG_SP, UC_MIPS_REG_V0
+    from unicorn.ppc_const import UC_PPC_REG_1, UC_PPC_REG_3, UC_PPC_REG_LR, UC_PPC_REG_PC
+    from unicorn.riscv_const import (
+        UC_RISCV_REG_A0,
+        UC_RISCV_REG_PC,
+        UC_RISCV_REG_RA,
+        UC_RISCV_REG_SP,
+    )
     try:
         from unicorn import UC_MODE_PPC64
     except Exception:
+        _absorbed("keeping the default")
         UC_MODE_PPC64 = UC_MODE_PPC32
     HAVE = True
     IMPORT_ERR = ""
@@ -199,7 +248,7 @@ def run_once(cfg, blob, base, sp, entry, fuzz, budget, handlers=None):
         try:
             uc.ctl_set_cpu_model(UC_CPU_ARM_CORTEX_M3)
         except Exception:
-            pass
+            _absorbed("continuing")
     flash_size = max(0x10000, (len(blob) + 0xFFF) & ~0xFFF)
     uc.mem_map(base, flash_size)
     uc.mem_write(base, blob)
@@ -438,6 +487,7 @@ def run_once(cfg, blob, base, sp, entry, fuzz, budget, handlers=None):
                 try:
                     fpc = uc.reg_read(cfg["pc"])
                 except Exception:
+                    _absorbed("keeping the default")
                     fpc = 0
                 st["fault"] = {"addr": fpc, "pc": fpc, "kind": "invalid", "error": str(e)}
             break
@@ -507,7 +557,8 @@ def _vector_table(blob):
 
 
 def main():
-    spec = json.load(open(sys.argv[1]))
+    with open(sys.argv[1]) as _f:
+        spec = json.load(_f)
     archkey = _resolve_arch(spec) if HAVE else None
     out = {"ok": False, "unicorn_available": HAVE, "arch": archkey or spec.get("arch")}
     if not HAVE:
@@ -517,7 +568,8 @@ def main():
     else:
         try:
             cfg = _arch_table()[archkey]
-            blob = open(spec["blob"], "rb").read()
+            with open(spec["blob"], "rb") as _f:
+                blob = _f.read()
             base = int(spec.get("base") if spec.get("base") is not None else 0x08000000)
             if cfg["cortex_m"]:
                 vsp, ventry = _vector_table(blob)
@@ -543,7 +595,9 @@ def main():
             out["ok"] = True
         except Exception as e:
             out["error"] = repr(e)
-    json.dump(out, open(sys.argv[2], "w"))
+    with open(sys.argv[2], "w") as _f:    # explicit close: this driver is killed on timeout and
+        out["absorbed"] = _ABSORBED
+        json.dump(out, _f)                # a handle the GC never reached leaves partial JSON
 
 
 if __name__ == "__main__":

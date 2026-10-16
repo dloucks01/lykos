@@ -4,11 +4,11 @@ PY ?= python3
 CORPUS_BUDGET ?= 600
 export PYTHONPATH := core
 
-.PHONY: doctor toolchain-bundle repo-tarball test coverage lint typecheck gui ci bundle verify eval eval-gate benchmark arch-gate real-gate corpus-gate corpus-regression dashboard release clean help
+.PHONY: doctor toolchain-bundle repo-tarball test coverage lint typecheck gui ci bundle verify eval eval-gate benchmark arch-gate real-gate conformance conformance-smoke corpus-gate corpus-regression dashboard release clean help
 
 help:
 	@echo "run the app with ./start (UI) and ./lykos (CLI); build the air-gap package with ./package"
-	@echo "make targets (dev/release): doctor toolchain-bundle repo-tarball test coverage lint typecheck gui ci bundle verify eval eval-gate benchmark arch-gate real-gate dashboard release clean"
+	@echo "make targets (dev/release): doctor toolchain-bundle repo-tarball test coverage lint typecheck gui ci bundle verify eval eval-gate benchmark arch-gate real-gate conformance conformance-smoke dashboard release clean"
 	@echo "real-corpus instruments (need ~/Downloads/libs, tens of minutes): corpus-gate corpus-regression"
 
 # What this host can and cannot do, and the install line for anything missing. On an
@@ -57,7 +57,7 @@ coverage:
 lint:
 	@command -v ruff >/dev/null 2>&1 || { \
 	  echo "ruff not installed -- gate cannot run. pip install ruff" >&2; exit 1; }
-	ruff check core tests
+	ruff check core tests tools
 
 # Two-tier gate (see mypy.ini): strict over the infra core (db/jobs/hashing/casestore),
 # errors not reported for the dict-passing analysis/API/report/eval layers.
@@ -85,7 +85,7 @@ gui:
 	  echo "== $$h"; node "$$h" "$(GUI_PAGE)" || exit 1; \
 	done
 
-ci: lint typecheck gui test
+ci: lint typecheck gui test conformance-smoke
 	@echo "CI complete"
 
 bundle:
@@ -185,6 +185,24 @@ arch-gate:
 real-gate:
 	$(PY) -m lykos realgate
 
+# END-TO-END CONFORMANCE: one tiny synthetic target per bug class / weaponization capability,
+# each driven through the REAL autopilot with a live worker pool and a wall-clock budget, and
+# asserted to produce the expected demonstrated effect. This is the only thing that exercises the
+# JOINS between stages -- and for most of its life nothing ran it, because it had no exit status
+# and no target here. Both of those were the same bug: a gate nothing can fail is not a gate.
+#
+# Every defect it has ever caught lived between two stages, not inside one. The last was a
+# `limit=60` in the L2 -> L3 handoff that made L3 unreachable on any target whose input needs
+# structure, while every unit test for both stages stayed green.
+#
+#   conformance-smoke  7 cases, ~5 min, runs on every push (see SMOKE in the harness)
+#   conformance        all 63, tens of minutes, part of `make release`
+conformance-smoke:
+	$(PY) tools/pipeline_conformance.py --smoke
+
+conformance:
+	$(PY) tools/pipeline_conformance.py
+
 # PLUMBING health on real binaries and real libraries: nothing errored, nothing declined for OUR
 # reason, a recorded crash produced a verified PoC, and how many of a library's doors were fuzzed.
 # A target with no findings PASSES -- that is the contract, and why the next target exists.
@@ -204,7 +222,7 @@ dashboard:
 	$(PY) -m lykos dashboard --html eval-dashboard.html
 
 # Full release bar: code checks + packaged-artifact verify + detection-quality gate.
-release: ci verify eval-gate arch-gate real-gate
+release: ci verify eval-gate arch-gate real-gate conformance
 	@echo "release gate complete"
 
 clean:

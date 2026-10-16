@@ -5,6 +5,7 @@ to disk so it works from a zipapp)."""
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -12,6 +13,10 @@ import sys
 import tempfile
 from pathlib import Path
 from typing import Optional
+
+from ... import observe
+
+_log = logging.getLogger(__name__)
 
 _DRIVER = "angr_driver.py"
 # angr/Z3/CLE keep only ACTIVE states capped; spilled/deferred/unconstrained stashes still grow,
@@ -27,6 +32,7 @@ def _mem_preexec():
     try:
         import resource
     except Exception:
+        observe.absorbed(_log, "answering None")
         return None
 
     def _apply():
@@ -35,7 +41,7 @@ def _mem_preexec():
             try:
                 resource.setrlimit(_res, (cap, cap))
             except Exception:
-                pass
+                observe.absorbed(_log, "continuing")
     return _apply
 
 
@@ -88,6 +94,7 @@ def _materialize_driver() -> Path:
         from importlib import resources
         data = (resources.files("lykos.analyze.symbolic") / _DRIVER).read_bytes()
     except Exception:
+        observe.absorbed(_log, "keeping the default")
         data = (Path(__file__).parent / _DRIVER).read_bytes()
     p = d / _DRIVER
     p.write_bytes(data)

@@ -1,6 +1,7 @@
 name: ci
 
-# Unit tests + the detection-quality release gate, on every push and PR. The gate uses the
+# Static gates (lint/typecheck/gui) + unit tests + the detection-quality release gate,
+# on every push and PR. The gate uses the
 # no-JVM RE backend the product ships with (rizin + pypcode) rather than Ghidra headless: Ghidra
 # takes ~1 min/case (≈48 min for the two corpus passes) which is far too slow for a push gate,
 # while the native backend runs the whole gate in well under two minutes and is what offline
@@ -14,6 +15,37 @@ permissions:
   contents: read
 
 jobs:
+  # The static gates `make ci` runs. They were in the Makefile from the start, documented there as
+  # "gates, not suggestions", and no CI job ever invoked them -- so of `make ci`'s four gates
+  # (lint, typecheck, gui, test) only `test` was enforced. E501 drifted 14 -> 269 -> 739 -> 859
+  # violations across two months, and four undefined names reached `main` in `except` handlers
+  # (ruff F821 flags every one of them). These are seconds of runtime; they run on every push.
+  static-gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Lint + type gates
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff mypy
+      - name: lint (ruff)
+ruff check core tests tools
+      # Two-tier (mypy.ini): strict over db/jobs/hashing/casestore, not reported for the
+      # dict-passing analysis/API/report/eval layers.
+      - name: typecheck (mypy)
+        run: PYTHONPATH=core mypy core/lykos
+      # The GUI harnesses render the page's script against a stubbed DOM. Under pytest they SKIP
+      # when node is absent, and a skip is invisible in a green run -- which is why they run here
+      # with node installed, where a missing harness FAILs.
+      - name: gui harnesses (node)
+        run: make gui
+
   tests:
     runs-on: ubuntu-latest
     steps:
@@ -42,6 +74,13 @@ jobs:
           pip install pypcode
       - name: Unit tests
         run: PYTHONPATH=core python -m pytest tests/ -q
+      # The JOINS between stages. Unit tests cover the stages; nothing covered the handoffs, and
+      # every defect this harness has caught lived in one -- most recently a `limit=60` that made
+      # L3 unreachable on any structured-input target while both stages' own tests stayed green.
+      # The harness had no exit status and no Makefile target, so it only ever ran by hand.
+      # This is the 7-case subset (~5 min); `make conformance` runs all 63 in `make release`.
+      - name: conformance (smoke) — the stage-to-stage joins
+        run: PYTHONPATH=core python tools/pipeline_conformance.py --smoke
 
   eval-gate:
     runs-on: ubuntu-latest

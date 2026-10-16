@@ -87,3 +87,34 @@ def test_cache_hit_backfills_new_target_row(store, case, pool, sample_elf):
     assert t2b.arch == "x86-64" and t2b.bits == 64 and t2b.file_type == "elf"
     # idempotent: a second call is a no-op once arch is set
     assert backfill_triage_denorm(store, t2.id, r2.id) is False
+
+
+def test_a_source_drop_also_keeps_an_uninstrumented_build(store, case, tmp_path):
+    """The build that FINDS a defect is not always the build that can DEMONSTRATE it.
+
+    For a source drop the ingested target IS the ASan+UBSan build -- that is the point of
+    compiling it -- and two experiments are impossible on it. An out-of-bounds READ aborts inside
+    the read, so the bytes it returned never reach stdout and "does this disclosure defeat ASLR"
+    cannot be asked. A stack overflow is reported and abort()ed at the copy, so the corrupted
+    return address is never reached and no hijack can be confirmed. Both are what the program
+    does on an attacker's machine, and neither is observable on the instrument.
+
+    So ingest keeps a plain build beside the MSan and TSan ones, keyed to the instrumented
+    binary's sha. Asserted here rather than left to the stage that needs it, because without the
+    artifact that stage can only decline, and it declines with a sentence that reads like a
+    limitation of the analysis.
+    """
+    src = tmp_path / "tiny.c"
+    src.write_text("#include <string.h>\n"
+                   "int main(int c,char**v){ char b[8]; if(c>1) strcpy(b,v[1]); return b[0]; }\n")
+    t = ingest(store, case.id, src, filename="tiny.c")
+    arts = {a.kind: a for a in store.artifacts.list_by_case(case.id)}
+    assert "plain-blob" in arts, f"only got {sorted(arts)}"
+    plain = store.content.get_bytes(arts["plain-blob"].sha256)
+    instrumented = store.content.path(t.sha256).read_bytes()
+    from lykos.analyze.fuzz.aflpp import is_sanitizer_build
+    assert is_sanitizer_build(instrumented), "the ingested target should be the sanitizer build"
+    assert not is_sanitizer_build(plain), "the plain build must carry no sanitizer runtime"
+    # keyed to the target it belongs to, or a case with two source files would hand the wrong
+    # program to whichever stage asked first
+    assert (arts["plain-blob"].meta or {}).get("binary_sha") == t.sha256

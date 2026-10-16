@@ -96,7 +96,7 @@ def test_find_aarch64_gadgets_records_ldp_offset():
     finally:
         rop._loads = orig
     assert any(c["src"] == 28 and c["br"] == 27 for c in g["callers"])
-    ld = next(l for l in g["loaders"] if {l["r1"], l["r2"]} == {27, 28})
+    ld = next(x for x in g["loaders"] if {x["r1"], x["r2"]} == {27, 28})
     assert ld["a_off"] == 80, f"ldp [sp,#80] offset not recovered: {ld}"
 
 

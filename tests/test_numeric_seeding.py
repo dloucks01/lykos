@@ -18,7 +18,6 @@ lands on something small enough to allocate. Those are derived from the element 
 guessed per target, because elem_size is almost always a small power of two or a small struct.
 """
 import pytest
-
 from lykos.analyze.fuzz import textconf
 from lykos.analyze.fuzz.stage import _NUMERIC_READERS, _reads_a_number
 

@@ -12,7 +12,6 @@ import struct
 import subprocess
 
 import pytest
-
 from lykos.analyze.poc import cve_poc_stage, cve_triggers
 
 _HAS_CC = shutil.which("gcc") or shutil.which("cc")

@@ -41,3 +41,20 @@ packaging/_vendor/
 core/lykos/analyze/fingerprint/data/cvedb.sqlite
 core/lykos/analyze/fingerprint/data/cve.sqlite
 core/lykos/analyze/fingerprint/data/*.sqlite.building
+
+# libFuzzer/AFL artifacts dropped in the cwd. The engine is always driven with an explicit
+# -artifact_prefix into the case workdir (libfuzzer.py), but a hand-run of a built harness lands
+# them here -- and one (crash-2ab19295...) was committed that way and sat in the tree unreferenced.
+crash-*
+oom-*
+timeout-*
+leak-*
+
+# PoC bundles `lykos analyze` writes NEXT TO ITSELF. `--out` defaults to the cwd, so running the
+# CLI from the repo root drops `<name>-L<n>-<sha>.tar.gz` into the tree -- six of them, from one
+# run, while checking something else. Same lesson as the libFuzzer artifacts above: the engine is
+# careful about where it puts things and a hand-run is not.
+*-L0-*.tar.gz
+*-L1-*.tar.gz
+*-L2-*.tar.gz
+*-L3-*.tar.gz

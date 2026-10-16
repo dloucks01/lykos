@@ -146,15 +146,45 @@ def test_the_step_numbers_are_unique():
     assert nums == ["1", "2", "3"], nums
 
 
+def _stage_buttons():
+    """stage -> button id, from the workbench's own map."""
+    h = _HTML.read_text()
+    m = re.search(r'_STAGE_BTN = \{(.*?)\};', h, re.S)
+    assert m, "the stage->button map must exist"
+    return dict(re.findall(r'(\w+):"(\w+)"', m.group(1))), h
+
+
+def test_every_mapped_button_exists():
+    """The map must not point at a control that was renamed or removed."""
+    mapped, h = _stage_buttons()
+    for stage, btn in mapped.items():
+        assert f'id="{btn}"' in h, f"{stage} points at a control that does not exist: {btn}"
+
+
 def test_every_launchable_control_is_covered_by_the_capability_map():
     """A button the map does not know about can never be disabled, which is how a
-    substrate-blind panel comes back one stage at a time."""
-    h = _HTML.read_text()
-    ids = set(re.findall(r'_STAGE_BTN = \{(.*?)\};', h, re.S))
-    assert ids, "the stage->button map must exist"
-    mapped = set(re.findall(r'(\w+):"(\w+)"', list(ids)[0]))
-    for stage, btn in mapped:
-        assert f'id="{btn}"' in h, f"{stage} points at a control that does not exist: {btn}"
+    substrate-blind panel comes back one stage at a time.
+
+    This asserted the WRONG DIRECTION for as long as it existed: it checked that each mapped
+    stage pointed at a real button, which is the test above. The invariant it was written for
+    runs the other way -- every launchable stage needs a row in capabilities.STAGES, or
+    `for_target` never returns it and the panel can neither rank it nor grey it out with a
+    reason. `firmware_carve` and `firmware_rehost` were both launchable and both missing, and
+    this test passed the whole time."""
+    mapped, _ = _stage_buttons()
+    missing = sorted(set(mapped) - set(cap.STAGES))
+    assert not missing, ("launchable stages with no capability row (the panel cannot disable "
+                         "them with a reason): %s" % missing)
+
+
+def test_the_capability_map_only_names_real_stages():
+    """The other direction: a row for a stage the registry does not have is a control that
+    renders and then fails to enqueue."""
+    import lykos.analyze  # noqa: F401 -- registers every stage
+    from lykos.jobs import registry
+    known = set(getattr(registry, "_STAGES", None) or registry.STAGES)
+    unknown = sorted(set(cap.STAGES) - known)
+    assert not unknown, "capability rows for stages that do not exist: %s" % unknown
 
 
 def test_the_board_groups_by_evidence_tier():

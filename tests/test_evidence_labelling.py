@@ -17,7 +17,6 @@ import pathlib
 import tempfile
 
 import pytest
-
 from lykos.analyze.dynamic.stage import _SIG_CWE
 from lykos.analyze.orchestrate import _STATIC_DETECTORS
 from lykos.casestore import CaseStore

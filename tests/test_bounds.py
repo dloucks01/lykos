@@ -505,7 +505,7 @@ def _argv1_load(out_reg):
     """`v[1]` as gcc -O0 emits it: *(*(RBP-0x50) + 8) -- a double indirection (load argv, add 8,
     deref). The slice must carry it as a canonical value so the same source correlates between a
     strlen guard and the strcpy it protects."""
-    return [f"INT_ADD reg:RBP:8 const:0xffffffffffffffb0:8 -> unique:0x20:8",   # RBP-0x50
+    return ["INT_ADD reg:RBP:8 const:0xffffffffffffffb0:8 -> unique:0x20:8",   # RBP-0x50
             "LOAD const:0x1b1:8 unique:0x20:8 -> reg:RAX:8",                     # RAX = argv
             "INT_ADD reg:RAX:8 const:0x8:8 -> reg:RAX:8",                        # RAX = argv + 8
             f"LOAD const:0x1b1:8 reg:RAX:8 -> reg:{out_reg}:8"]                  # out = argv[1]

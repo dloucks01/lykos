@@ -108,6 +108,13 @@ export const api = {
   // the event stream).
   verifications: (caseId) => _req("GET", `/cases/${caseId}/verifications`),
 
+  // WHAT EACH RUN DID, per target: executions, which stages worked / declined (and why) /
+  // were never scheduled, and what the run absorbed. Read from the event log, so it survives a
+  // restart, a reopened case and a case produced by `lykos analyze` on the CLI. The UI had no
+  // way to fetch any of this -- findings were shown with no account of the work behind them,
+  // and a null result is only worth something next to that account.
+  scorecard: (caseId) => _req("GET", `/cases/${caseId}/scorecard`),
+
   // Server-side background Autopilot: keeps running after the tab closes.
   startBackground: (caseId, targetIds) => _req("POST", `/cases/${caseId}/autopilot`, { body: { target_ids: targetIds } }),
   backgroundStatus: (caseId) => _req("GET", `/cases/${caseId}/autopilot`),

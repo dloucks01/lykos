@@ -8,8 +8,12 @@ from __future__ import annotations
 
 import datetime as _dt
 import html as _html
+import logging
 
+from .. import observe
 from .history import regressions, series
+
+_log = logging.getLogger(__name__)
 
 
 def _pct(x):
@@ -20,6 +24,7 @@ def _short_ts(ts):
     try:
         return _dt.datetime.fromtimestamp(int(ts)).strftime("%Y-%m-%d %H:%M")
     except Exception:
+        observe.absorbed(_log, "falling back")
         return str(ts)
 
 

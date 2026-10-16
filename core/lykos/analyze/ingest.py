@@ -99,6 +99,49 @@ def compile_source(src: Path, filename: str, out: Path) -> dict:
     raise NotAnalysable(f"could not compile {filename}:\n{last[:2000]}")
 
 
+def compile_source_plain(src: Path, filename: str, out: Path):
+    """Best-effort UNINSTRUMENTED build of the same source, or None.
+
+    The one experiment a sanitizer build cannot run is the one that asks what the program ITSELF
+    emits. For a source drop the ingested target IS the ASan+UBSan build (that is the whole point
+    of compiling it), and on an out-of-bounds READ that build aborts inside the read -- so the
+    bytes the read returned never reach stdout, and "does this disclosure defeat ASLR" is
+    unanswerable on the only binary available. Measured: the disclosure verdict declined with
+    "the ingested program is a sanitizer build" on every source target, which is exactly the path
+    where out-of-bounds reads are detected at all.
+
+    So build the program a second time with nothing added: same compiler, same permissive flags,
+    no sanitizer, no abort-on-error TU. An out-of-bounds read then does what it does on an
+    attacker's machine -- returns adjacent memory and keeps going -- and the bytes can be read.
+    Kept as a `plain-blob` artifact keyed to the INSTRUMENTED binary's sha, the same way the MSan
+    and TSan builds are, so any stage can ask for "the plain build of this target".
+
+    No PIE/ASLR flags are forced either way: the point is to run what this program is, and a
+    recovered load base is only meaningful against the layout the program actually gets.
+    """
+    ext = Path(filename).suffix.lower()
+    is_cxx = ext in _CXX_EXT
+    cc = shutil.which("gcc" if not is_cxx else "g++") or shutil.which(
+        "clang" if not is_cxx else "clang++")
+    if not cc:
+        return None
+    lang = "c++" if is_cxx else "c"
+    argv = [cc, "-g", "-O1", "-fno-omit-frame-pointer", "-w",
+            "-Wno-error=implicit-function-declaration", "-Wno-error=implicit-int",
+            "-Wno-error=int-conversion", "-D_GNU_SOURCE",
+            # Same _FORTIFY_SOURCE suppression as the instrumented build, for the opposite
+            # reason: there glibc aborting first costs a file:line, here it costs the whole
+            # experiment -- a fortified `read`/`memcpy` kills the process instead of returning
+            # the adjacent bytes, and the disclosure that does exist reads as absent.
+            "-U_FORTIFY_SOURCE", "-D_FORTIFY_SOURCE=0",
+            "-x", lang, str(src), "-x", "none", "-o", str(out)]
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return {"ok": True, "compiler": Path(cc).name} if (r.returncode == 0 and out.exists()) else None
+
+
 def compile_source_msan(src: Path, filename: str, out: Path):
     """Best-effort MemorySanitizer build, or None. MSan reports the ONE memory-safety class the
     ASan+UBSan build cannot -- a READ of never-initialized memory (CWE-457) -- so detonating the same
@@ -435,6 +478,14 @@ def ingest(store, case_id: str, path: str | Path, filename: Optional[str] = None
                 store.put_artifact(case_id, "msan-blob", src=msanout,
                                    meta={"binary_sha": info["sha256"], "filename": fname})
                 meta["msan"] = True
+            # An UNINSTRUMENTED build of the same source. Not for finding anything -- for the
+            # one question the instrumented builds cannot answer, which is what the program
+            # emits when the defect is NOT fatal. See compile_source_plain.
+            plainout = Path(td) / ((Path(fname).stem or "a") + ".plain")
+            if compile_source_plain(path, fname, plainout) and plainout.exists():
+                store.put_artifact(case_id, "plain-blob", src=plainout,
+                                   meta={"binary_sha": info["sha256"], "filename": fname})
+                meta["plain"] = True
             # A THIRD, ThreadSanitizer build: catches the data-race class (CWE-362) no other
             # sanitizer sees; the fuzz stage detonates the corpus against it. Best-effort.
             tsanout = Path(td) / ((Path(fname).stem or "a") + ".tsan")

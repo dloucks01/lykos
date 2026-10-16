@@ -22,9 +22,11 @@ with a string-mined dictionary and says so.
 from __future__ import annotations
 
 import base64
+import logging
 import random
 from collections import defaultdict
 
+from ... import observe
 from ...db.dao import (
     ArtifactDAO,
     CallEdgeDAO,
@@ -45,6 +47,8 @@ from .stage import (
     _structure_mutator,
     fuzz_campaign,
 )
+
+_log = logging.getLogger(__name__)
 
 
 def _cmp_tokens_for(functions, keep=None):
@@ -221,6 +225,7 @@ def plan_directed_campaign(findings, functions, call_edges, strings, extra_targe
         _svals = [getattr(s, "value", s) for s in (strings or [])]
         menu_seeds = _menu.menu_seeds([v for v in _svals if isinstance(v, str)])
     except Exception:
+        observe.absorbed(_log, "keeping the default")
         menu_seeds = []
     if not targets:
         # Undirected: still plant input-to-state tokens mined from every function's comparison
@@ -273,6 +278,7 @@ def _prior_corpus(ctx, target, limit=64, maxbytes=8192):
         try:
             b = ctx.content.get_bytes(sha)
         except Exception:
+            observe.absorbed(_log, "skipping this item")
             continue
         if 0 < len(b) <= maxbytes:
             out.append(b)
@@ -329,6 +335,7 @@ def _auto_weggli_targets(ctx, target, functions, *, timeout: float = 90.0):
                      "hits": [{"title": t["title"], "cwe": t["cwe"]} for t in tgts[:8]]})
         return tgts
     except Exception:
+        observe.absorbed(_log, "answering empty")
         return []
     finally:
         shutil.rmtree(d, ignore_errors=True)
@@ -410,7 +417,8 @@ def directed_stage(ctx) -> dict:
                        block_dist=bdist)
     hit, known = st.get("blocks_hit", 0), st.get("blocks_known", 0)
     summary = {"backend": "directed", "execs": st.get("execs", 0), "crashes": st.get("crashes", 0),
-               "directed": bool(plan["directed"]), "top_target": _target_label(plan["targets"]) if plan["directed"] else None,
+               "directed": bool(plan["directed"]),
+               "top_target": _target_label(plan["targets"]) if plan["directed"] else None,
                "coverage": {"kind": "block", "blocks_hit": hit, "blocks_known": known,
                             "pct": round(100.0 * hit / known, 1) if known else None}}
     sha = ctx.put_artifact("fuzz-summary", data=canonical_json(summary))

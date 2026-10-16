@@ -14,6 +14,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -173,7 +174,7 @@ class JobContext:
                         reason = "timeout" if (over_local or self.timed_out()) else "cancelled"
                         self._emit_exec(cmd, start, rc=None, note=reason)
                         raise (StageTimeout if reason == "timeout" else StageCancelled)(
-                            f"subprocess {cmd[0]} {reason}")
+                            f"subprocess {cmd[0]} {reason}") from None
                     continue
                 break  # child exited on its own
             t_out.join(timeout=5)
@@ -207,14 +208,15 @@ class JobContext:
             except OSError:
                 pass
 
-    def _emit_exec(self, cmd, start, *, rc=None, out=b"", err=b"", note=None) -> None:
+    def _emit_exec(self, cmd: Sequence[str], start: float, *, rc: int | None = None,
+                   out: bytes = b"", err: bytes = b"", note: str | None = None) -> None:
         """Publish one 'job.exec' event: the tool command that just ran and a short tail of its
         output. Feeds the live console panel so an operator can see the actual commands and I/O go
         by. Best-effort -- a telemetry emit must never fail the subprocess it describes."""
         try:
             import os as _os
 
-            def _short(b, n=400):
+            def _short(b: bytes | str | None, n: int = 400) -> str | None:
                 s = (b or b"")[-n:].decode("utf-8", "replace") if isinstance(b, (bytes, bytearray)) \
                     else str(b or "")[-n:]
                 return s.strip() or None

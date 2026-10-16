@@ -15,10 +15,6 @@ import re
 import selectors
 import time
 
-# a numbered menu item: "1 - Add", "2. Modify", "[3] Print", "(4) Delete", "5) Quit", "6: exit".
-# The digit is delimited by a closing bracket OR a separator, and a LETTER must follow (so version
-# strings like "1.5 GB" or "2.3.4" do not read as menu options).
-_OPT = re.compile(r"^\s*[\[\(<]?\s*(\d{1,2})\s*(?:[\]\)>]|[-.):|])\s*[A-Za-z]")
 # the same item found ANYWHERE in a line, not only at its start: a compact menu prints every
 # option on ONE line ("1)alloc 2)free 3)use 0)quit"), so anchoring to the line start sees only the
 # first. A separator must precede the digit (start / space / a table border) so a version string

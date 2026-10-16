@@ -15,10 +15,15 @@ platform will then decline to run.
 """
 from __future__ import annotations
 
+import logging
 import shutil
 import subprocess
 from dataclasses import dataclass, field
 from typing import Callable, Optional
+
+from . import observe
+
+_log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -95,19 +100,8 @@ def _probe_pypcode():
         import pypcode
         return f"pypcode {getattr(pypcode, '__version__', '?')}"
     except Exception:
+        observe.absorbed(_log, "answering None")
         return None
-
-
-def _bundle_ghidra():
-    """Ghidra's install root. `<root>/support/analyzeHeadless` is what the locator returns,
-    and the locator already searches /opt/ghidra* and <repo>/vendor/ghidra -- so a copy placed
-    at either is found with no configuration on the offline side."""
-    from .analyze.ghidra import locate_ghidra
-    p = locate_ghidra()
-    if not p:
-        return []
-    root = p.parent.parent if p.parent.name == "support" else p.parent
-    return [root] if (root / "support").is_dir() else []
 
 
 def _bundle_symqemu():
@@ -158,6 +152,7 @@ def _probe_afl_qemu():
         try:
             arch = qemu_trace_arch(c)
         except Exception:
+            observe.absorbed(_log, "keeping the default")
             arch = None
         if arch and arch not in seen:
             seen[arch] = str(c)
@@ -422,27 +417,6 @@ def survey() -> list:
 def missing(tier: Optional[str] = None) -> list:
     """Tools not present, optionally filtered to one tier."""
     return [t for t, got in survey() if not got and (tier is None or t.tier == tier)]
-
-
-def bundle_paths() -> list:
-    """[(key, [paths])] for every tool that ships as a directory copy rather than a deb
-    (currently SymQEMU; Ghidra is no longer bundled -- rizin/rz-ghidra + pypcode replaced it)."""
-    out = []
-    for t in TOOLS:
-        if not t.bundle:
-            continue
-        try:
-            paths = [p for p in t.bundle() if p]
-        except Exception as e:                          # noqa: BLE001
-            # Never silent: a bundle probe that raises would otherwise drop the tool from the
-            # offline tarball with no trace -- the exact failure this module exists to prevent
-            # (a REQUIRED engine like Ghidra arriving absent, found only at first disassemble).
-            raise RuntimeError(
-                f"bundle probe for {t.key!r} failed: {e!r}; refusing to build a bundle that "
-                f"would silently omit it") from e
-        if paths:
-            out.append((t.key, paths))
-    return out
 
 
 def apt_packages() -> list:

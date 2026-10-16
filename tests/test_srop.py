@@ -7,7 +7,7 @@ from lykos.analyze.poc import rop
 def test_sigreturn_frame_amd64_layout():
     f = rop.sigreturn_frame(rip=0xdeadbeef, rax=59, rdi=0x1234, rsi=0, rdx=0, rsp=0x7fff)
     assert len(f) == 248
-    at = lambda o: struct.unpack_from("<Q", f, o)[0]
+    at = lambda o: struct.unpack_from("<Q", f, o)[0]        # noqa: E731
     assert at(0x68) == 0x1234       # rdi
     assert at(0x90) == 59           # rax
     assert at(0xA0) == 0x7fff       # rsp
@@ -20,7 +20,7 @@ def test_build_srop_execve_structure():
     payload = rop.build_srop_execve(40, syscall=0x401014, binsh=0x404000, length=512,
                                     pop_rax=0x401234, rsp=0x404200)
     assert len(payload) >= 40 + 24 + 248
-    at = lambda o: struct.unpack_from("<Q", payload, o)[0]
+    at = lambda o: struct.unpack_from("<Q", payload, o)[0]  # noqa: E731
     assert at(40) == 0x401234       # pop rax ; ret
     assert at(48) == 15             # rt_sigreturn number
     assert at(56) == 0x401014       # syscall gadget
@@ -47,7 +47,7 @@ from lykos.analyze.dynamic import sandbox  # noqa: E402
 def test_build_srop_execve_plant_structure():
     s1, s2 = rop.build_srop_execve_plant(40, syscall=0x401128, rax15=(0x401126, "pop"),
                                          writable=0x404040)
-    q = lambda b, o: struct.unpack_from("<Q", b, o)[0]
+    q = lambda b, o: struct.unpack_from("<Q", b, o)[0]      # noqa: E731
     # stage1: cyclic(40) + (pop rax;15;syscall) + a read-frame that pivots rsp INTO `writable`
     assert q(s1, 40) == 0x401126 and q(s1, 48) == 15 and q(s1, 56) == 0x401128
     f1 = s1[64:64 + 248]

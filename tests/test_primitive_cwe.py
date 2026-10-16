@@ -13,7 +13,6 @@ id -- so anyone filtering for memory corruption would never see a confirmed IP h
 stack offset.
 """
 import pytest
-
 from lykos.analyze.poc import primitive_stage as PS
 
 

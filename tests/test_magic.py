@@ -5,15 +5,14 @@ recovers the overflow distance empirically and confirms with a planted marker + 
 (a wrong magic at the same offset must NOT print it)."""
 from __future__ import annotations
 
-import struct
 import subprocess
 
 import pytest
 from lykos.analyze import register
+from lykos.analyze.dynamic import sandbox
 from lykos.analyze.ingest import enqueue_triage, ingest
 from lykos.analyze.poc import enqueue_exploit
 from lykos.analyze.poc.rop import find_magic_gates
-from lykos.analyze.dynamic import sandbox
 from lykos.db.dao import FindingDAO, PocDAO
 from lykos.jobs import JobConfig, JobQueue, WorkerPool
 
@@ -99,7 +98,6 @@ def test_find_magic_gates_direct_compare_bytes():
     from lykos.analyze.poc import rop
     seg = b"\x90" * 4 + b"\x81\x7d\xfc\xb3\xba\x37\x13\x74\x02" + b"\x90" * 4
     # emulate a single exec load segment by monkeypatching _loads
-    import types
     orig = rop._loads
     rop._loads = lambda data: [(0, len(seg), 0x1000, 1)]
     try:

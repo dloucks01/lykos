@@ -7,7 +7,6 @@ other's specific names. Chained in the order (jvm, pyc), `IndexError` comes back
 consulted before either fallback, and this file pins that.
 """
 import pytest
-
 from lykos.analyze import dotnet, jvm, pyc
 from lykos.analyze.runtime_fault import managed_fault
 

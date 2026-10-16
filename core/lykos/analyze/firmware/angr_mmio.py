@@ -19,6 +19,22 @@ import base64
 import json
 import sys
 
+# ---------------------------------------------------------------------------------- absorbed
+# This driver runs as a standalone script under a different interpreter (the parent copies it to
+# a scratch dir), so `lykos.observe` is not importable here. The counter still has to reach the
+# parent, because a silently-skipped step in a tracer is exactly what turns a real crash into
+# "no crash observed" -- so absorbed steps ride home in the JSON result and the parent folds
+# them into its own counter. See observe.absorbed_remote.
+_ABSORBED: list = []
+
+
+def _absorbed(what):
+    """Record a deliberately-absorbed failure, with the live exception's repr."""
+    import sys as _sys
+    exc = _sys.exc_info()[1]
+    _ABSORBED.append({"what": what, "exc": repr(exc)[:200]})
+
+
 try:
     import angr
     import archinfo
@@ -50,6 +66,7 @@ def _arch_obj(key, endian):
     try:
         return archinfo.arch_from_id(name, endness=end), thumb
     except Exception:
+        _absorbed("falling back")
         return archinfo.arch_from_id(name), thumb
 
 
@@ -58,7 +75,8 @@ def run(spec):
     if key not in _ARCH:
         return {"ok": True, "supported": False, "seeds": [], "coverage": 0,
                 "note": f"angr oracle does not model {key!r} as a flat blob"}
-    blob = open(spec["blob"], "rb").read()
+    with open(spec["blob"], "rb") as _f:
+        blob = _f.read()
     base = int(spec.get("base", 0x08000000))
     entry = int(spec["entry"]) if spec.get("entry") is not None else base
     steps = int(spec.get("steps", 160))
@@ -74,7 +92,7 @@ def run(spec):
     try:
         state.regs.sp = int(spec.get("sp")) if spec.get("sp") is not None else (base + 0x100000)
     except Exception:
-        pass
+        _absorbed("continuing")
 
     # every MMIO read becomes a fresh, ordered symbolic value; we log them to reconstruct the
     # byte stream a path needs.
@@ -84,6 +102,7 @@ def run(spec):
         try:
             a = state.solver.eval(addr)
         except Exception:
+            _absorbed("answering no")
             return False
         return any(lo <= a < hi for lo, hi in _MMIO)
 
@@ -93,6 +112,7 @@ def run(spec):
         try:
             concrete = st.solver.eval(addr)
         except Exception:
+            _absorbed("returning early")
             return
         if not any(lo <= concrete < hi for lo, hi in _MMIO):
             return
@@ -130,6 +150,7 @@ def run(spec):
             try:
                 v = s.solver.eval(sym)
             except Exception:
+                _absorbed("keeping the default")
                 v = 0
             stream += int(v).to_bytes(int(length), "big" if spec.get("endianness") == "big" else "little")
         if stream:
@@ -141,7 +162,8 @@ def run(spec):
 
 
 def main():
-    spec = json.load(open(sys.argv[1]))
+    with open(sys.argv[1]) as _f:
+        spec = json.load(_f)
     out = {"ok": False, "angr_available": HAVE, "seeds": []}
     if not HAVE:
         out["error"] = "angr not importable: " + IMPORT_ERR
@@ -150,7 +172,9 @@ def main():
             out.update(run(spec))
         except Exception as e:
             out["error"] = repr(e)
-    json.dump(out, open(sys.argv[2], "w"))
+    with open(sys.argv[2], "w") as _f:    # explicit close: this driver is killed on timeout and
+        out["absorbed"] = _ABSORBED
+        json.dump(out, _f)                # a handle the GC never reached leaves partial JSON
 
 
 if __name__ == "__main__":

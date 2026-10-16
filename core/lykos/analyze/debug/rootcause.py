@@ -92,9 +92,6 @@ def module_base(maps, target_path):
     return min(starts) if starts else 0
 
 
-_ENTRY_NAMES = ("entry", "_start", "__start")
-
-
 def _is_entry_name(name: str) -> bool:
     """True for the disassembler's name of the ELF entry point. Ghidra calls it `entry`/`_start`;
     rizin AND radare2 both call it `entry0` (and would use `entry1`... for extra entries) -- which

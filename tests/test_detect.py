@@ -7,9 +7,9 @@ from lykos.analyze.detect.detectors import (
     _copy_dest_class,
     correlate,
     dangerous_api,
-    toctou_race,
     hardcoded_secrets,
     stack_buffer_overflow,
+    toctou_race,
 )
 from lykos.analyze.detect.stage import enqueue_detect
 from lykos.db.dao import CallEdgeDAO, FindingDAO, FunctionDAO, StringDAO

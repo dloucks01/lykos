@@ -431,6 +431,7 @@ def test_a_stage_that_ran_and_refused_is_not_counted_as_work():
     broken engine survives a session of measurement.
     """
     from types import SimpleNamespace as NS
+
     from lykos.analyze import orchestrate
     declines = orchestrate._declines_from_events([
         NS(type="libfuzzer.done", payload={"supported": False,

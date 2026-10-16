@@ -22,7 +22,7 @@ _log = logging.getLogger(__name__)
 # Zstandard: stdlib `compression.zstd` from Python 3.14, else the third-party `zstandard` if present,
 # else None (zstd streams are then IDENTIFIED but not extracted). Resolved once, at import.
 try:
-    from compression import zstd as _zstd_mod          # Python 3.14+ stdlib
+    from compression import zstd as _zstd_mod  # Python 3.14+ stdlib
 
     def _zstd_decompress(blob, cap):
         d = _zstd_mod.ZstdDecompressor()
@@ -300,7 +300,8 @@ def _walk_tree(root: str) -> list[dict]:
             try:
                 if os.path.getsize(full) > _MAX_FS_FILE:
                     continue
-                blob = open(full, "rb").read()
+                with open(full, "rb") as _f:          # a loop over every unpacked file:
+                    blob = _f.read()                  # leaking one fd each exhausts the limit
             except OSError:
                 continue
             total += len(blob)

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import os
 import pty
 import select
@@ -21,8 +22,11 @@ import subprocess
 import time
 from pathlib import Path
 
+from .. import observe
 from ..analyze.dynamic import sandbox
 from . import ws
+
+_log = logging.getLogger(__name__)
 
 _HARD_CAP = 600.0        # overall wall-clock ceiling for one console session
 
@@ -173,7 +177,8 @@ def _killpg(proc, sig):
     try:
         os.killpg(os.getpgid(proc.pid), sig)
     except Exception:
+        observe.absorbed(_log, "falling back")
         try:
             proc.kill()
         except Exception:
-            pass
+            observe.absorbed(_log, "continuing")

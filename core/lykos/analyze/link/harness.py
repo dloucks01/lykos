@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import errno
 import fcntl
+import logging
 import os
 import shutil
 import socket
@@ -25,8 +26,11 @@ import time
 from pathlib import Path
 from typing import Optional
 
+from ... import observe
 from ..dynamic import sandbox
 from ..dynamic.sandbox import RunResult
+
+_log = logging.getLogger(__name__)
 
 # families this harness can drive (others: report unsupported)
 # Datagram channels matter for a whole class of target this platform is pointed at: a
@@ -312,6 +316,7 @@ class ChannelSession:
         try:
             out, err = self.proc.communicate(timeout=3)
         except Exception:
+            observe.absorbed(_log, "keeping the default")
             out, err = b"", b""
         rc = self.proc.returncode
         self.proc = None
@@ -332,7 +337,7 @@ class ChannelSession:
             try:
                 self.proc.kill()
             except Exception:
-                pass
+                observe.absorbed(_log, "continuing")
         self.proc = None
 
     def close(self):
@@ -412,6 +417,7 @@ def channel_run(exe, family, key, payload: bytes, *, timeout: float = 5.0,
         try:
             out, err = p.communicate(timeout=5)
         except Exception:
+            observe.absorbed(_log, "keeping the default")
             out, err = b"", b""
         rc, timed = None, True
     th.join(timeout=0.5)

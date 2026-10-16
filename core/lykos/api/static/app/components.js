@@ -855,6 +855,70 @@ export function UnavailablePanel({ items }) {
 }
 
 
+export function RunScorecard({ cards, targetName }) {
+  if (!cards || !cards.length) return null;
+  const card = (targetName && cards.find((c) => c.filename === targetName)) || cards[0];
+  if (!card) return null;
+  const ex = card.executions || {};
+  const cap = card.capability || {};
+  const declined = card.declined || {};
+  const ab = card.absorbed || {};
+  const base = card.baseline || {};
+  const byEngine = Object.entries(ex.by_engine || {}).sort((a, b) => b[1] - a[1]);
+  const rate = ex.per_second ? ` (${ex.per_second}/s)` : "";
+  const never = cap.never_scheduled || [];
+  return html`
+    <div class="card scorecard">
+      <div class="unavail-head">What this run did${card.filename ? ` — ${card.filename}` : ""}</div>
+      <div class="unavail-sub">
+        A null result is only worth something next to the work behind it. Two targets with no
+        crashes look identical until you know one executed thousands of times and the other
+        executed zero because a stage upstream took the budget.
+      </div>
+      ${card.settled === false ? html`<div class="unavail-sub">
+        <strong>Incomplete</strong> — a stage was still finishing when this card was built, so the
+        counts below are a floor, not a total.</div>` : null}
+      <ul class="unavail-list">
+        <li><span class="unavail-name">Baseline</span><span class="unavail-why">${
+          base.ran === undefined ? "not recorded"
+            : base.ran ? (base.crashed ? "ran, FAULTED" : "ran, exited normally")
+            : `DID NOT RUN — ${base.note || "no reason recorded"}`}</span></li>
+        <li><span class="unavail-name">Executions</span><span class="unavail-why">${
+          (ex.total || 0).toLocaleString()}${rate}${byEngine.length
+            ? ` — ${byEngine.map(([k, v]) => `${k} ${v.toLocaleString()}`).join(", ")}` : ""}</span></li>
+        <li><span class="unavail-name">Capabilities</span><span class="unavail-why">${
+          (cap.worked || []).length} did work, ${(cap.declined || []).length} declined, ${
+          (cap.errored || []).length} errored, ${never.length} never scheduled (of ${
+          cap.registered || 0} registered)</span></li>
+        ${card.crashes != null ? html`<li><span class="unavail-name">Crashes</span>
+          <span class="unavail-why">${card.crashes} recorded</span></li>` : null}
+        ${never.length ? html`<li><span class="unavail-name">Not reached</span>
+          <span class="unavail-why">${never.slice(0, 8).join(", ")}${
+            never.length > 8 ? " …" : ""}</span></li>` : null}
+        ${/* Errors the run absorbed on purpose. Zero is the useful reading: it says a thin
+              result is the target's doing and not ours. */ ""}
+        <li><span class="unavail-name">Absorbed</span><span class="unavail-why">${
+          ab.total ? `${ab.total} best-effort step(s) failed quietly at ${ab.sites} site(s)`
+            : ab.total === 0 ? "nothing — no step failed quietly in this run"
+            : "not recorded"}</span></li>
+      </ul>
+      ${ab.top && ab.top.length ? html`
+        <ul class="unavail-list">
+          ${ab.top.slice(0, 4).map((e) => html`<li key=${e.site}>
+            <span class="unavail-name">${e.count}×</span>
+            <span class="unavail-why">${e.site}</span></li>`)}
+        </ul>` : null}
+      ${Object.keys(declined).length ? html`
+        <div class="unavail-sub">Ran, but could not apply here:</div>
+        <ul class="unavail-list">
+          ${Object.entries(declined).slice(0, 10).map(([stage, why]) => html`
+            <li key=${stage}><span class="unavail-name">${stage}</span>
+              <span class="unavail-why">${why}</span></li>`)}
+        </ul>` : null}
+    </div>`;
+}
+
+
 // ── Workbench shell (C²) components ──────────────────────────────────────────────────────
 // A shield icon (checked when a live exploit was demonstrated).
 function shieldSvg(stroke, checked) {

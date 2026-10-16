@@ -8,7 +8,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from . import __version__
+from . import __version__, observe
 from .casestore import CaseStore
 from .db.migrations import current_version
 
@@ -237,6 +237,12 @@ def _print_scorecard(card: dict) -> None:
         print("  out of time  " + ", ".join(card["stages_skipped_for_budget"][:8]))
     if bud.get("total"):
         print(f"  budget       {bud.get('elapsed', 0):g}s of {bud['total']:g}s")
+        # What that clock was WORTH here. 2,761 executions is a good result at 5 exec/s and a
+        # near-total failure at 580, and the count alone cannot tell them apart.
+        _adv = bud.get("advice") or {}
+        if _adv.get("note"):
+            print(f"  exec rate    {_adv['note']}"
+                  + ("" if _adv.get("measured") else "  (estimated from the substrate)"))
         dear = list((bud.get("by_stage") or {}).items())[:4]
         if dear:
             print("  dearest      " + ", ".join(f"{k} {v:g}s" for k, v in dear))
@@ -305,6 +311,23 @@ def _print_scorecard(card: dict) -> None:
         if cap.get("never_scheduled"):
             print("  not reached  " + ", ".join(cap["never_scheduled"][:8])
                   + (" ..." if len(cap["never_scheduled"]) > 8 else ""))
+    # Errors the run absorbed on purpose, counted at their own site. Zero is the interesting
+    # number: it says the thin result above is the target's doing and not ours. A non-zero one is
+    # not a failure either -- a parser that did not apply absorbs on every candidate -- but it is
+    # the first place to look when a run found less than expected, and `--log debug` then prints
+    # each one with its traceback.
+    if card.get("settled") is False:
+        print("  INCOMPLETE   a stage was still finishing when this card was built, so the "
+              "counts above\n               are a floor, not a total")
+    absorbed = card.get("absorbed") or {}
+    if absorbed.get("total"):
+        print(f"  absorbed     {absorbed['total']} best-effort step(s) failed quietly, "
+              f"at {absorbed.get('sites', 0)} site(s)")
+        for row in (absorbed.get("top") or [])[:3]:
+            print(f"               {row.get('count'):>4}x {row.get('site')}")
+        print("               (re-run with --log debug for each one's traceback)")
+    elif absorbed:
+        print("  absorbed     nothing -- no step failed quietly in this run")
     if declined:
         # WHOSE FAULT. These two printed identically until now:
         #   libfuzzer  no source for this target (libFuzzer needs C/C++ source to build a harness)
@@ -347,6 +370,14 @@ def _print_findings(findings) -> None:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="lykos", description="lykos core CLI")
     p.add_argument("--version", action="version", version=f"lykos {__version__}")
+    # Nothing in the tree configured logging, so every `_log.debug(..., exc_info=True)` written
+    # to leave evidence of a swallowed error was discarded before it reached anything. This is
+    # the switch that connects it. `debug` also makes `observe.absorbed` print each absorbed
+    # step with its traceback and the exact handler that absorbed it.
+    p.add_argument("--log", default=None, metavar="LEVEL",
+                   choices=["debug", "info", "warning", "error"],
+                   help=f"log level for diagnostics (default from ${observe.LEVEL_VAR}, else "
+                        f"warning); ${observe.FILE_VAR} adds a file sink")
     sub = p.add_subparsers(dest="command", required=True)
 
     db = sub.add_parser("db", help="database lifecycle")
@@ -839,7 +870,8 @@ def _cmd_eval(args: argparse.Namespace) -> int:
         for arch, cc in targets:
             rep = harness.run(cases, stage="static", min_state=args.min_state,
                               workers=args.workers, gcc=cc,
-                              progress=lambda m: print(f"[{arch}] {m}", file=sys.stderr, flush=True))
+                              progress=lambda m, arch=arch: print(f"[{arch}] {m}",
+                                                                 file=sys.stderr, flush=True))
             o = rep.metrics.get("overall", {})
             fp, fn = int(o.get("fp", 0)), int(o.get("fn", 0))
             measured[arch] = {"fp": fp, "fn": fn}
@@ -918,6 +950,7 @@ def main(argv: list[str] | None = None) -> int:
     vendorenv.activate()
     parser = build_parser()
     args = parser.parse_args(argv)
+    observe.configure(getattr(args, "log", None))
     return args.func(args)
 
 

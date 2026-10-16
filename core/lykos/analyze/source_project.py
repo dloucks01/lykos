@@ -184,6 +184,24 @@ def build_source_project(root, *, timeout: int = 300) -> dict:
     # instrumented ELF needing only host libraries (libasan/libz/libm), which is what the sanitizer
     # build is for. Verified on libtiff 4.0.3: `tools/tiffcrop` becomes a 7 MB ASan ELF that runs,
     # and so do tiffinfo/tiffcp/tiff2pdf/tiffdump/tiffmedian.
+    # `-B` (always remake) on every make, because a source tree handed to us may ALREADY be
+    # built -- which is the normal state of a tree someone has been working in. Without it:
+    #
+    #   * `make` has nothing to do, so it produces no file newer than the attempt, and
+    #     `_elf_executables(root, since=start)` finds nothing. The builder is judged to have
+    #     failed and the chain falls through to `loose`, which links every `main()` in the tree
+    #     into one executable -- bzip2 ships four (bzip2.c, bzip2recover.c, spewG.c,
+    #     unzcrash.c) -- and dies on "multiple definition of `main`". Measured on
+    #     ~/Downloads/libs/bzip2-1.0.6: reported "source project did not build" for a project
+    #     that builds in seconds.
+    #
+    #   * and the worse half: the existing binary was built with the PROJECT's flags, not ours.
+    #     This whole path exists to force ASan+UBSan through the project's own build system, so
+    #     reusing a stale artefact would quietly analyse an uninstrumented binary and report the
+    #     absence of sanitizer findings as a result.
+    #
+    # The cost is a full rebuild of a tree that was already built, which is the right trade: the
+    # instrumentation is the point.
     def _b_cmake():
         bd = root / "_lykos_build"
         bd.mkdir(exist_ok=True)
@@ -191,7 +209,7 @@ def build_source_project(root, *, timeout: int = 300) -> dict:
                       f"-DCMAKE_C_COMPILER={wrapdir/'cc'}", f"-DCMAKE_CXX_COMPILER={wrapdir/'c++'}",
                       "-DBUILD_SHARED_LIBS=OFF",
                       "-DCMAKE_BUILD_TYPE=Debug"], cwd=root)
-        _, o2 = _run(["cmake", "--build", str(bd), "-j"], cwd=root)
+        _, o2 = _run(["cmake", "--build", str(bd), "-j", "--clean-first"], cwd=root)
         return "cmake", o1 + o2
 
     def _b_autotools():
@@ -215,12 +233,12 @@ def build_source_project(root, *, timeout: int = 300) -> dict:
             if rc2 != 0:
                 _, o3 = _run(["./configure", "--static"], cwd=root)
                 o1 = o1 + "\n-- retried with --static --\n" + o3
-        _, o2 = _run(["make", "-j"], cwd=root)
+        _, o2 = _run(["make", "-B", "-j"], cwd=root)
         return "autotools", o1 + o2
 
     def _b_make():
         # Pass the wrapped CC/flags as make VARIABLES too (override the Makefile's own).
-        _, o = _run(["make", "-j", f"CC={wrapdir/'cc'}", f"CXX={wrapdir/'c++'}",
+        _, o = _run(["make", "-B", "-j", f"CC={wrapdir/'cc'}", f"CXX={wrapdir/'c++'}",
                      f"CFLAGS={flags}", f"CXXFLAGS={flags}",
                      "LDFLAGS=-fsanitize=address,undefined"])
         return "make", o

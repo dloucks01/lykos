@@ -237,6 +237,7 @@ def test_effects_promote_across_stages_and_title_only_keeps_cwe(store, case):
     relabels the title, but keeps the specific CWE via title_only -- so the finding ends up
     'RCE (demonstrated)' at CWE-121 with the proving bundle attached."""
     import json
+
     from lykos.db.dao import FindingDAO
     t = _target(store, case)
     fd = FindingDAO(store.conn)

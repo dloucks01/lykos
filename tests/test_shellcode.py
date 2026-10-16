@@ -10,7 +10,7 @@ import time
 import pytest
 from lykos.analyze import register
 from lykos.analyze.dynamic import sandbox
-from lykos.analyze.ingest import ingest, enqueue_triage
+from lykos.analyze.ingest import enqueue_triage, ingest
 from lykos.analyze.poc import enqueue_exploit, shellcode
 from lykos.db.dao import FindingDAO, PocDAO
 from lykos.jobs import JobConfig, JobQueue, WorkerPool

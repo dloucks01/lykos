@@ -18,6 +18,7 @@ import re
 import tarfile
 from pathlib import Path
 
+from ... import observe
 from ...db.dao import ArtifactDAO, FindingDAO, TargetDAO
 from ...jobs.registry import register_stage
 from . import scan
@@ -194,6 +195,7 @@ def _parse_cargo_lock(text: str) -> list:
         import tomllib
         data = tomllib.loads(text)
     except Exception:
+        observe.absorbed(_log, "falling back")
         return out
     for pkg in data.get("package", []):
         if isinstance(pkg, dict) and pkg.get("name") and pkg.get("version"):
@@ -329,6 +331,7 @@ def parse_source_tree(root: Path) -> list:
             try:
                 text = p.read_text("utf-8", "replace")
             except Exception:
+                observe.absorbed(_log, "keeping the default")
                 text = ""
             for lib, rx in _HEADER_MACROS:
                 m = rx.search(text)

@@ -12,7 +12,6 @@ import subprocess
 from pathlib import Path
 
 import pytest
-
 from lykos.analyze.dynamic import sandbox
 
 _INDEXED_BY_INPUT_LENGTH = (

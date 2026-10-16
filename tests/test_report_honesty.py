@@ -265,3 +265,89 @@ def test_structured_evidence_never_reaches_the_line_a_reader_sees():
     assert '{"kind"' not in res["message"]["text"], "raw JSON in the alert a reader sees"
     assert "wrote past b[64]" in res["message"]["text"]
     assert res["properties"]["effects"] == effs, "the data must still be there, structured"
+
+
+def test_the_report_names_the_image_the_exploit_was_built_against(tmp_path):
+    """The target header prints the INGESTED sha; for a source drop that is not what was exploited.
+
+    `compile_source` builds ASan+UBSan and that build IS the ingested target, which is right for
+    finding the defect and makes L3 impossible on it -- AddressSanitizer abort()s at the overflow
+    copy before the corrupted return is reached. So `build_exploit` works against the
+    uninstrumented build of the same source. Every offset in the findings then belongs to an
+    image whose hash appears nowhere in the report, and a reader taking the two to be the same
+    binary is misled by omission. The PoC bundle's own meta.json already carried
+    `exploited_sha256`; the report was the last place that did not say it.
+    """
+    from lykos.casestore import CaseStore
+    from lykos.report.html import to_html
+    from lykos.report.model import _exploited_build, build_report
+
+    store = CaseStore.open(tmp_path / "case")
+    try:
+        c = store.cases.create("x")
+        t = store.targets.upsert(c.id, "prog.c", "a" * 64, size=100)
+        # no swap recorded -> nothing claimed, which is the normal case for an ingested binary
+        assert _exploited_build(store, c.id, t.id) == {}
+        assert "Exploited build" not in to_html(build_report(store, c.id))
+
+        run = store.runs.create(c.id, "build_exploit", target_id=t.id, status="done")
+        store.events.append("exploit.build_choice", case_id=c.id, run_id=run.id, payload={
+            "build": "uninstrumented", "bytes": 22384,
+            "note": "the ingested binary is the ASan+UBSan build, which aborts inside the "
+                    "overflow before the corrupted return is reached"})
+        got = _exploited_build(store, c.id, t.id)
+        assert got["build"] == "uninstrumented" and got["bytes"] == 22384
+
+        html = to_html(build_report(store, c.id))
+        assert "Exploited build" in html
+        # and it must say WHICH WAY ROUND, not merely that two builds exist
+        assert "not the" in html and "SHA-256 above" in html
+    finally:
+        store.close()
+
+
+def test_every_crash_finding_filer_uses_the_whole_dedup_key():
+    """A finding key has THREE parts and seven call sites were each building two of them.
+
+    `crash_dedup_key(signal, fault_pc, discriminator)` separates two sanitizer defects that both
+    SIGABRT -- that is the only thing keeping them apart, because an ASan abort's fault PC is in
+    the sanitizer's own machinery and identical for every defect. The fuzz stage passed the
+    discriminator; the poc, primitive, exploit, synthesize, root_cause and multidebug sites did
+    not, so each filed or looked up `dynamic-crash:SIGABRT` while the fuzz stage had filed
+    `dynamic-crash:SIGABRT:<class>@<file>:<line>`.
+
+    Measured on a program with four demonstrated defects: three correctly separated findings from
+    the fuzz stage, plus ONE more holding all four defects' evidence -- 20 entries, titled after
+    whichever verdict ran last, with a CWE from a different defect than its title and a severity
+    from neither. Several of those sites carry a comment promising they merge into the crash
+    finding; they were doing the opposite.
+
+    Read as an AST so a comment mentioning the discriminator cannot satisfy it.
+    """
+    import ast
+
+    checked = 0
+    for mod in ("analyze/poc/stage.py", "analyze/poc/synthesize_stage.py",
+                "analyze/poc/primitive_stage.py", "analyze/poc/exploit_stage.py",
+                "analyze/debug/stage.py", "analyze/debug/multidebug.py"):
+        src = pathlib.Path("core/lykos") / mod
+        tree = ast.parse(src.read_text())
+        for call in [n for n in ast.walk(tree) if isinstance(n, ast.Call)]:
+            fname = getattr(call.func, "id", None) or getattr(call.func, "attr", None)
+            if fname == "crash_dedup_key":
+                # positional (signal, pc, disc) or keyword; a two-arg call is the bug
+                has_disc = len(call.args) >= 3 or any(k.arg == "discriminator"
+                                                     for k in call.keywords)
+                # the managed-runtime key is NOT a signal bucket: `kind` is an exception name, so
+                # the fault pc already separates those and no sanitizer class exists for them
+                managed = (call.args and getattr(call.args[0], "id", "") == "kind")
+                assert has_disc or managed, (
+                    f"{mod}:{call.lineno} keys a crash finding without the discriminator")
+                checked += 1
+            if fname == "crash_finding_candidate":
+                kw = {k.arg for k in call.keywords}
+                if "fault_pc" in kw:          # a crash-keyed filing, so it needs the third part
+                    assert "discriminator" in kw, (
+                        f"{mod}:{call.lineno} files a crash finding without the discriminator")
+                    checked += 1
+    assert checked >= 6, f"only {checked} key site(s) found; did they move?"

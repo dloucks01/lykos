@@ -70,6 +70,9 @@ def _nontraced_preexec(sanitizer):
                 lim = _BATCH_AS_MB << 20
                 resource.setrlimit(resource.RLIMIT_AS, (lim, lim))
         except Exception:
+            # preexec_fn runs in the forked child, between fork and exec. No channel exists here,
+            # and the process is replaced a moment later; an rlimit that would not set leaves this
+            # exec less contained, which is not the same as a run that did not happen.
             pass
     return _apply
 
@@ -254,6 +257,9 @@ def _trace_one(libc, argv, stdin_data, timeout, blocks, exe, plan=None, sanitize
                 resource.setrlimit(resource.RLIMIT_FSIZE, (64 << 20, 64 << 20))
                 resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
             except Exception:
+                # Forked child, pre-execv. Nothing here can be reported anywhere -- raising would
+                # abort the exec -- and an rlimit we could not set means a weaker sandbox for this
+                # one exec, not a failed measurement.
                 pass
             if sanitizer:
                 # No AS cap for this build, so bound resident memory the ASan way. Merge, don't
@@ -281,6 +287,9 @@ def _trace_one(libc, argv, stdin_data, timeout, blocks, exe, plan=None, sanitize
                     pass
             os.execv(argv[0], argv)
         except Exception:
+            # This is the forked CHILD, between fork and execv. There is no result channel and
+            # no observe to reach: exiting 127 IS the report, and the parent reads it as a failed
+            # exec rather than as a target that ran and exited 127 on its own.
             os._exit(127)
     os.close(w_out); os.close(w_err); os.close(r_in)
     # Feed stdin from a thread. The tracee is stopped at execve and not yet reading fd 0, so a
@@ -507,6 +516,9 @@ def main():
             except subprocess.TimeoutExpired:
                 rc, so, se, flags = 0, b"", b"", 1
             except Exception:
+                # Already reported, in the one channel this loop has: `flags=2` goes into the
+                # binary record the parent reads, and the parent treats it as "this exec did not
+                # produce a usable result" rather than as a clean run.
                 rc, so, se, flags = 0, b"", b"", 2
         out.write(struct.pack("<iIIBIQ", rc, len(so), len(se), flags, len(reached), fault_pc))
         out.write(so); out.write(se)

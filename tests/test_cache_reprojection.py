@@ -75,6 +75,7 @@ def test_orchestrate_reprojects_on_disassemble_cache_hit(store, case, monkeypatc
     blind with no block coverage. _run_target_stage must reproject on a cache hit, like the HTTP
     route does."""
     import threading
+
     from lykos.analyze import orchestrate
     disassemble.register()
     target, run = _target_with_cached_disasm(store, case)

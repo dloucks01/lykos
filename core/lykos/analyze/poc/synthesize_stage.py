@@ -17,11 +17,10 @@ from __future__ import annotations
 
 import os
 
-from ...db.dao import (CallEdgeDAO, DynResultDAO, FindingDAO, PocDAO, StringDAO,
-                       TargetDAO)
+from ...db.dao import CallEdgeDAO, DynResultDAO, FindingDAO, PocDAO, StringDAO, TargetDAO
 from ...jobs.registry import register_stage
 from ..dynamic import sandbox
-from ..dynamic.stage import asan_defect_key, crash_dedup_key, crash_finding_candidate
+from ..dynamic.stage import asan_defect_key, crash_dedup_key, crash_finding_candidate, crash_key_parts
 from . import bundle, primitive
 from .capture import modes_for
 from .primitive_stage import _hydrate_frames
@@ -153,11 +152,14 @@ def _finalize(ctx, target, target_bytes, payload, mode, run_argv, res, cand, off
                                      signal_name=res.signal_name, input_sha=input_sha,
                                      bundle_sha=bundle_sha)
     fd = FindingDAO(ctx.conn)
-    fault_pc = DynResultDAO(ctx.conn).fault_pc_for(target.id, input_sha)
+    # With the discriminator, or a sanitizer abort is filed under the signal alone and does not
+    # meet the per-defect finding the fuzz stage filed. See `crash_key_parts`.
+    fault_pc, disc, _ = crash_key_parts(ctx.conn, target.id, input_sha)
     fd.upsert(target.id, target.case_id, crash_finding_candidate(
         res.signal_name, input_sha, res.isolation, "synth_overflow", f"({detail})",
-        state="poc-backed", confidence=0.95, bundle_sha=bundle_sha, fault_pc=fault_pc))
-    fid = fd.id_for_dedup(target.id, crash_dedup_key(res.signal_name, fault_pc))
+        state="poc-backed", confidence=0.95, bundle_sha=bundle_sha, fault_pc=fault_pc,
+        discriminator=disc))
+    fid = fd.id_for_dedup(target.id, crash_dedup_key(res.signal_name, fault_pc, disc))
     if fid:
         PocDAO(ctx.conn).set_finding(poc_id, fid)
 

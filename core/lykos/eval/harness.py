@@ -19,9 +19,8 @@ from ..analyze import register as register_stages
 from ..analyze.detect.stage import enqueue_detect
 from ..analyze.disassemble import enqueue_disassemble
 from ..analyze.fuzz.stage import enqueue_fuzz
-from ..analyze.ingest import enqueue_triage
 from ..analyze.ghidra import locate_ghidra
-from ..analyze.ingest import ingest
+from ..analyze.ingest import enqueue_triage, ingest
 from ..casestore import CaseStore
 from ..db.dao import FindingDAO
 from ..jobs import JobConfig, JobQueue, WorkerPool

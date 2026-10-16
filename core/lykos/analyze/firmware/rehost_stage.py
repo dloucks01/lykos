@@ -10,11 +10,15 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 
+from ... import observe
 from ...db.dao import FindingDAO, TargetDAO
 from ...jobs.registry import register_stage
 from .headerless import analyze_blob
 from .rehost import locate_unicorn_python, run_angr_mmio, run_rehost
+
+_log = logging.getLogger(__name__)
 
 REHOST_STAGE = "firmware_rehost"
 TOOL = "lykos-rehost"
@@ -89,7 +93,7 @@ def firmware_rehost_stage(ctx) -> dict:
         if auto:
             ctx.emit("firmware_rehost.handlers", payload={"auto_handlers": len(auto)})
     except Exception:
-        pass
+        observe.absorbed(_log, "continuing")
     # Symbolic MMIO oracle (optional, deterministic): angr solves peripheral-read values that
     # reach deep code -- including arbitrary gate constants the Unicorn value-set search cannot
     # guess -- and we feed those as Unicorn fuzz seeds. Any failure degrades to no extra seeds.
@@ -98,6 +102,7 @@ def firmware_rehost_stage(ctx) -> dict:
             from ..symbolic.concolic import locate_angr_python
             angr_py = locate_angr_python(p.get("angr_python"))
         except Exception:
+            observe.absorbed(_log, "keeping the default")
             angr_py = None
         if angr_py is not None:
             aspec = {"blob": spec["blob"], "arch": spec["arch"], "base": spec["base"],

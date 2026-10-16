@@ -18,7 +18,12 @@ call's own basic block, which is where argument set-up lives in unoptimised code
 """
 from __future__ import annotations
 
+import logging
+
+from ... import observe
 from .taint import ARCH_ABI, _arch_key, _key, _parse
+
+_log = logging.getLogger(__name__)
 
 # sink -> (destination argument index, length argument index). A sink whose length is
 # implicit (strcpy/strcat copy until NUL) has no length index: the bound is the SOURCE, which
@@ -104,6 +109,7 @@ def _slice_block(instrs, upto_addr, bases, bits, sp=None):
             try:
                 mnem, _ins, outk, toks = _parse(pc)
             except Exception:
+                observe.absorbed(_log, "skipping this item")
                 continue
             if sp is not None and mnem == "STORE" and len(toks) >= 4:
                 addr = _key(toks[2])
@@ -297,6 +303,7 @@ def base_offsets(blocks, bases, ak: str) -> dict:
             try:
                 mnem, _i, outk, toks = _parse(pc)
             except Exception:
+                observe.absorbed(_log, "skipping this item")
                 continue
             if outk is None or len(toks) < 2:
                 continue
@@ -550,6 +557,7 @@ def _spill_slot(instrs, after_addr, regs, bases, bits, sp=None):
             try:
                 mnem, _i, outk, toks = _parse(pc)
             except Exception:
+                observe.absorbed(_log, "skipping this item")
                 continue
             if mnem == "COPY" and outk is not None and len(toks) >= 2:
                 c = _const_of(toks[1])
@@ -828,6 +836,7 @@ def _slot_store_counts(blocks, bases, bits):
                 try:
                     mnem, _i, outk, toks = _parse(pc)
                 except Exception:
+                    observe.absorbed(_log, "skipping this item")
                     continue
                 if mnem == "STORE" and len(toks) >= 4:
                     a = regaddr.get(_key(toks[2]))
@@ -912,6 +921,7 @@ def _param0_spill_slot(blocks, param0_regs, bases, bits):
                 try:
                     mnem, _i, outk, toks = _parse(pc)
                 except Exception:
+                    observe.absorbed(_log, "skipping this item")
                     continue
                 if mnem == "INT_ADD" and outk is not None and len(toks) >= 3:
                     for rk, dtok in ((_key(toks[1]), toks[2]), (_key(toks[2]), toks[1])):
@@ -1130,6 +1140,7 @@ def _returned_value(instrs, retregs, bases, bits):
             try:
                 mnem, _ins, outk, toks = _parse(pc)
             except Exception:
+                observe.absorbed(_log, "skipping this item")
                 continue
             if outk is None:
                 continue
@@ -1264,6 +1275,7 @@ def _memset_sizes(func_irs, call_edges, bases, bits, ak):
 def classify_program(func_irs: dict, call_edges, frames: dict, arch, bits=64) -> dict:
     """site_addr -> verdict, for every copy sink whose call site we can read."""
     import os as _osb
+
     from .catalog import normalize
     out: dict = {}
     by_site = {}
@@ -1561,6 +1573,7 @@ def branch_predicate(instrs, slot, bases):
             try:
                 mnem, _i, outk, toks = _parse(pc)
             except Exception:
+                observe.absorbed(_log, "skipping this item")
                 continue
             if mnem == "CBRANCH" and len(toks) >= 3 and toks[1].startswith("ram:"):
                 try:

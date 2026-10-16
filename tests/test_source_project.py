@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+from pathlib import Path
 
 import pytest
 from lykos.analyze import register
@@ -149,6 +150,7 @@ def test_ingest_source_from_mismatched_ondisk_name(store, case, gcc_or_skip):
     path by giving ingest a wrong-extension file plus a source `filename`."""
     import tempfile
     from pathlib import Path
+
     from lykos.analyze.ingest import ingest
     blob = Path(tempfile.mkdtemp()) / "body.bin"            # the on-disk name the HTTP path uses
     blob.write_text("#include <string.h>\nint main(int c,char**v){char b[8];"
@@ -166,8 +168,12 @@ def test_failed_source_build_surfaces_reason_not_bundle_error(store, case, monke
     ingest now carries the build log into the error when the input was recognised as source."""
     import tempfile
     from pathlib import Path
-    from lykos.analyze.ingest import NotAnalysable, ingest   # submodule attrs (package re-exports the func)
+
     from lykos.analyze import source_project
+    from lykos.analyze.ingest import (  # submodule attrs (package re-exports the func)
+        NotAnalysable,
+        ingest,
+    )
     d = Path(tempfile.mkdtemp())
     (d / "proj").mkdir()
     (d / "proj" / "m.c").write_text("int main(){return 0;}\n")      # recognised as source, no ELF
@@ -187,9 +193,10 @@ def test_static_detect_runs_on_instrumented_source_binary(store, case, gcc_or_sk
     findings."""
     import tempfile
     from pathlib import Path
-    from lykos.analyze.ingest import ingest, enqueue_triage
-    from lykos.analyze.disassemble import enqueue_disassemble
+
     from lykos.analyze.detect import enqueue_detect
+    from lykos.analyze.disassemble import enqueue_disassemble
+    from lykos.analyze.ingest import enqueue_triage, ingest
     from lykos.jobs import JobConfig, JobQueue, WorkerPool
     register()
     src = Path(tempfile.mkdtemp()) / "t.c"
@@ -273,3 +280,69 @@ def test_a_configure_that_rejects_our_option_is_retried_without_it(tmp_path, gcc
     assert os.path.basename(built["primary"]) == "built.bin"
     log = built.get("log") or ""
     assert "retried without options" in log, "the retry is invisible in the build log"
+
+
+# ---------------------------------------------------------------- an ALREADY-BUILT source tree
+# The normal state of a tree someone has been working in, and it defeated the whole path. `make`
+# had nothing to do, so no file was newer than the attempt, `_elf_executables(root, since=start)`
+# found none, the builder was judged to have failed, and the chain fell through to `loose` --
+# which links every `main()` in the tree into one executable. bzip2 ships four (bzip2.c,
+# bzip2recover.c, spewG.c, unzcrash.c), so it died on "multiple definition of `main`" and the
+# tool reported "source project did not build" for a project that builds in seconds.
+#
+# The worse half is quieter: had detection found the stale binary, it was built with the
+# PROJECT's flags. This path exists to force ASan+UBSan through the project's own build system,
+# so reusing that artefact would analyse an uninstrumented binary and report the absence of
+# sanitizer findings as a result.
+
+
+def test_every_builder_forces_a_rebuild():
+    """`-B` / `--clean-first` on every builder. A source-level guard because reproducing this
+    needs a tree that is already built, which a fixture would have to build first -- and the
+    build is the slow part."""
+    import inspect
+
+    from lykos.analyze import source_project
+    src = inspect.getsource(source_project.build_source_project)
+    assert '["make", "-B", "-j"]' in src, "the autotools builder does not force a rebuild"
+    assert '"make", "-B", "-j", f"CC=' in src, "the make builder does not force a rebuild"
+    assert '"--clean-first"' in src, "the cmake builder does not force a rebuild"
+
+
+def test_a_prebuilt_tree_is_rebuilt_not_reused(tmp_path, gcc_or_skip):
+    """The behaviour, on a tiny project that mimics the shape: a Makefile, several `main`s, and
+    an artefact already in place with a newer mtime than its sources."""
+    import os
+    import time
+
+    from lykos.analyze.source_project import build_source_project
+    root = tmp_path / "proj"
+    root.mkdir()
+    (root / "tool.c").write_text(
+        "#include <stdio.h>\n#include <string.h>\n"
+        "int main(int c, char**v){char b[8]; if(c>1) strcpy(b,v[1]);"
+        " printf(\"%s\\n\", b); return 0;}\n")
+    # a SECOND main, which is what makes the loose fallback impossible
+    (root / "helper.c").write_text("int main(void){return 0;}\n")
+    (root / "Makefile").write_text(
+        "all: tool helper\ntool: tool.c\n\t$(CC) $(CFLAGS) tool.c -o tool\n"
+        "helper: helper.c\n\t$(CC) $(CFLAGS) helper.c -o helper\n")
+    # pre-build it with the PROJECT's flags (no sanitizer), and make the artefacts newest
+    os.system(f"cd {root} && make >/dev/null 2>&1")
+    assert (root / "tool").exists(), "the fixture did not pre-build"
+    plain = (root / "tool").stat().st_size
+    time.sleep(0.05)
+    os.utime(root / "tool", None)
+    os.utime(root / "helper", None)
+
+    r = build_source_project(root) or {}
+    assert r.get("ok"), f"an already-built tree did not build: {(r.get('log') or '')[-400:]}"
+    assert r.get("system") == "make", \
+        f"fell through to {r.get('system')!r} instead of using the project's Makefile"
+    exe = Path(r["primary"])
+    # the instrumented binary is substantially larger than the project's own
+    assert exe.stat().st_size > plain, \
+        "the artefact was reused rather than rebuilt with our instrumentation"
+    out = subprocess.run(["nm", "-D", str(exe)], capture_output=True, text=True).stdout.lower()
+    dyn = subprocess.run(["readelf", "-d", str(exe)], capture_output=True, text=True).stdout.lower()
+    assert "asan" in out or "asan" in dyn, "the rebuilt binary carries no ASan"

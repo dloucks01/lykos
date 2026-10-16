@@ -5,6 +5,7 @@ stdlib-based. Clear, graceful failure when Unicorn is absent (like the angr/SymQ
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -12,6 +13,10 @@ import sys
 import tempfile
 from pathlib import Path
 from typing import Optional
+
+from ... import observe
+
+_log = logging.getLogger(__name__)
 
 _DRIVER = "unicorn_driver.py"
 _ANGR_DRIVER = "angr_mmio.py"
@@ -68,6 +73,7 @@ def _materialize(name: str) -> Path:
         from importlib import resources
         data = (resources.files("lykos.analyze.firmware") / name).read_bytes()
     except Exception:
+        observe.absorbed(_log, "keeping the default")
         data = (Path(__file__).parent / name).read_bytes()
     p = d / name
     p.write_bytes(data)
@@ -95,11 +101,15 @@ def run_angr_mmio(python: Path, spec: dict, *, ctx=None, timeout: int = 180) -> 
                 subprocess.run(cmd, timeout=timeout + 30, capture_output=True, check=False)
             if out_path.exists():
                 data = json.loads(out_path.read_text())
+                # The driver runs under the vendored venv python and cannot import
+                # observe, so what it absorbed rides home in its result.
+                observe.absorbed_remote("lykos.analyze.firmware.angr_mmio",
+                                        data.pop("absorbed", None))
                 return list(data.get("seeds", []))[:8]
         finally:
             shutil.rmtree(work, ignore_errors=True)
     except Exception:
-        pass
+        observe.absorbed(_log, "continuing")
     return []
 
 
@@ -120,6 +130,10 @@ def run_rehost(python: Path, spec: dict, *, ctx=None, timeout: int = 180) -> dic
             raise RuntimeError(f"unicorn driver produced no output "
                                f"(rc={getattr(proc, 'returncode', '?')}): {tail}")
         data = json.loads(out_path.read_text())
+        # The driver runs under the vendored venv python and cannot import
+        # observe, so what it absorbed rides home in its result.
+        observe.absorbed_remote("lykos.analyze.firmware.unicorn_driver",
+                                data.pop("absorbed", None))
         if not data.get("ok"):
             raise RuntimeError("rehost failed: " + str(data.get("error", "unknown")))
         return data

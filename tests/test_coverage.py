@@ -65,16 +65,27 @@ def test_arg_mode_is_fed_over_stdin_not_argv(monkeypatch, tmp_path):
 
     captured = {}
 
+    # `run_campaign` drives afl with Popen, not subprocess.run: `run`'s timeout path does
+    # `kill()` then an unbounded `communicate()`, which can block forever on afl's surviving
+    # qemu children still holding the write end of the pipe. The invocation is what this test
+    # is about, so the fake stands in for Popen and records it.
     class _P:
         returncode = 0
-        stdout = b""
-        stderr = b""
+        stdout = None
+        stderr = None
+        pid = 1
 
-    def fake_run(cmd, **kw):
+        def wait(self, timeout=None):
+            return 0
+
+        def kill(self):
+            pass
+
+    def fake_popen(cmd, **kw):
         captured["cmd"] = list(cmd)
         return _P()
 
-    monkeypatch.setattr(aflpp.subprocess, "run", fake_run)
+    monkeypatch.setattr(aflpp.subprocess, "Popen", fake_popen)
     aflpp.run_campaign(Path("/bin/true"), Path("/bin/true"), tmp_path, tmp_path,
                        seconds=1, mode="arg", qemu=False)
     assert "@@" not in captured["cmd"], "arg mode must be fed over stdin, not placed in argv"
@@ -245,18 +256,30 @@ def test_qemu_campaign_enables_compcov_input_to_state(monkeypatch, tmp_path):
     qemu-mode (prebuilt-binary) path, and a native build must instead get a `-c <cmplog>` copy."""
     import subprocess as _sp
     from pathlib import Path
+
     from lykos.analyze.fuzz import aflpp
     seen = {}
 
+    # `run_campaign` drives afl with Popen, not subprocess.run: `run`'s timeout path does
+    # `kill()` then an unbounded `communicate()`, which can block forever on afl's surviving
+    # qemu children still holding the write end of the pipe. The invocation is what this test
+    # is about, so the fake stands in for Popen and records it.
     class _P:
         returncode = 0
-        stdout = b""
-        stderr = b""
+        stdout = None
+        stderr = None
+        pid = 1
 
-    def fake_run(cmd, env=None, **kw):
+        def wait(self, timeout=None):
+            return 0
+
+        def kill(self):
+            pass
+
+    def fake_popen(cmd, env=None, **kw):
         seen["cmd"], seen["env"] = cmd, env or {}
         return _P()
-    monkeypatch.setattr(_sp, "run", fake_run)
+    monkeypatch.setattr(_sp, "Popen", fake_popen)
     exe = tmp_path / "t"; exe.write_bytes(b"\x7fELF")
     sd = tmp_path / "in"; sd.mkdir(); od = tmp_path / "out"
 

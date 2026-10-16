@@ -12,6 +12,7 @@ that faults behind a flag is replayed under that flag. Deterministic; runs via r
 from __future__ import annotations
 
 import json
+import logging
 import re
 import shutil
 import sys
@@ -21,7 +22,10 @@ from pathlib import Path
 # A CTF/win banner: NAME{...}. Used to recognise a no-crash exploit's success output.
 _FLAG_RE = re.compile(rb"[A-Za-z_][A-Za-z0-9_]{1,15}\{[^}\n]{2,64}\}")
 
+from ... import observe
 from ...jobs.registry import register_stage
+
+_log = logging.getLogger(__name__)
 
 POC_DIFF_STAGE = "poc_diff"
 
@@ -123,6 +127,7 @@ def _replay_on(ctx, run_input, exe, target, dr, input_sha, workdir, *, times: in
     try:
         data = ctx.content.get_bytes(input_sha)
     except Exception:
+        observe.absorbed(_log, "falling back")
         return {"error": "input unavailable", "reproduced": None, "mode": None}
     mode = (dr.input_mode if dr else None) or "stdin"
     argv = list(dr.argv) if (dr and dr.argv) else []
@@ -134,6 +139,7 @@ def _replay_on(ctx, run_input, exe, target, dr, input_sha, workdir, *, times: in
             _, res = run_input(exe, mode, workdir / "in.bin", timeout, target.arch, data,
                                endianness=target.endianness, bits=target.bits, base_argv=base_argv)
         except Exception:
+            observe.absorbed(_log, "skipping this item")
             continue                                 # unbuildable delivery is not a crash
         if res.crashed:
             crashed += 1
@@ -157,14 +163,14 @@ def _win_name(ctx, fdao, fnd, poc):
             if meta.get("target"):
                 return meta["target"]
         except Exception:
-            pass
+            observe.absorbed(_log, "continuing")
     if fnd is not None:
         try:
             for s in fdao.sites(fnd.id):
                 if s.get("detail"):
                     return s["detail"]
         except Exception:
-            pass
+            observe.absorbed(_log, "continuing")
     return None
 
 
@@ -184,6 +190,7 @@ def _verify_win_on(ctx, run_input, exe_b, exe_a, b, b_bytes, dr, input_sha, work
     try:
         data = ctx.content.get_bytes(input_sha)
     except Exception:
+        observe.absorbed(_log, "falling back")
         return {"error": "input unavailable", "reproduced": None, "mode": None, "method": None}
     mode = (dr.input_mode if dr else None) or "stdin"
     argv = list(dr.argv) if (dr and dr.argv) else []
@@ -195,6 +202,7 @@ def _verify_win_on(ctx, run_input, exe_b, exe_a, b, b_bytes, dr, input_sha, work
         try:
             win_addr = exploit.elf_functions(b_bytes).get(win_name)
         except Exception:
+            observe.absorbed(_log, "keeping the default")
             win_addr = None
         if win_addr:
             from .capture import make_capture, materialize_helper
@@ -227,6 +235,7 @@ def _marker_verify(ctx, run_input, exe_b, exe_a, b, data, mode, base_argv, workd
             _, res = run_input(exe, mode, workdir / "in.bin", timeout, b.arch, d,
                                endianness=b.endianness, bits=b.bits, base_argv=base_argv)
         except Exception:
+            observe.absorbed(_log, "answering None")
             return None
         return res.stdout or b""
 

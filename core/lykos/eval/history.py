@@ -13,6 +13,8 @@ import subprocess
 import time
 from pathlib import Path
 
+from .. import observe
+
 DEFAULT_PATH = "eval-history.jsonl"
 
 _log = logging.getLogger(__name__)
@@ -24,6 +26,7 @@ def _git_rev():
                            capture_output=True, text=True, timeout=5)
         return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
     except Exception:
+        observe.absorbed(_log, "answering None")
         return None
 
 

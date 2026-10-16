@@ -42,11 +42,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "core"))
 
+from lykos import observe  # noqa: E402
 from lykos.analyze import register  # noqa: E402
 from lykos.analyze.ingest import enqueue_triage, ingest  # noqa: E402
 from lykos.analyze.orchestrate import SCORECARD_EVENT, run_case_autopilot  # noqa: E402
 from lykos.casestore import CaseStore  # noqa: E402
-from lykos.db.dao import AnalysisRunDAO, FindingDAO, TargetDAO  # noqa: E402
+from lykos.db.dao import AnalysisRunDAO, EventDAO, FindingDAO, TargetDAO  # noqa: E402
 from lykos.jobs import JobConfig, JobQueue, WorkerPool  # noqa: E402
 
 
@@ -83,11 +84,12 @@ def probe(path: Path, workdir: Path, budget: float, overrides=None) -> dict:
             out["forced_stop"] = True
         out["seconds"] = int(time.time() - t0)
 
-        card = {}
-        for e in store.events.list(case_id=case.id, limit=8000):
-            if e.type == SCORECARD_EVENT and isinstance(e.payload, dict):
-                card = e.payload
-        out["scorecard"] = card
+        # By type, unwindowed: the scorecard is the LAST event of the case, so `limit=8000` was
+        # a ceiling that a longer budget or a multi-target case would silently cross -- and the
+        # probe would then report an empty scorecard as if the run had done nothing.
+        events = EventDAO(store.conn)
+        cards = events.payloads_of_type(SCORECARD_EVENT, case_id=case.id)
+        out["scorecard"] = cards[-1] if cards else {}
 
         runs = AnalysisRunDAO(store.conn).list_by_case(case.id)
         by: dict = {}
@@ -97,8 +99,10 @@ def probe(path: Path, workdir: Path, budget: float, overrides=None) -> dict:
         out["errors"] = [(r.stage, (r.error or "")[:100]) for r in runs if r.status == "error"]
 
         # What each stage said when it declined -- the operator-facing half of a null result.
+        # `walk`, because this one really does need every event: it matches on payload fields
+        # across every event type rather than on one type.
         says = []
-        for e in store.events.list(case_id=case.id, limit=8000):
+        for e in events.walk(case_id=case.id):
             pl = e.payload if isinstance(e.payload, dict) else {}
             note = pl.get("note")
             if note and (pl.get("applicable") is False or pl.get("supported") is False
@@ -141,6 +145,12 @@ def _row(r: dict) -> str:
 
 
 def main() -> int:
+    # These harnesses are diagnostic instruments, so their diagnostics have to be readable. With
+    # nothing configured, a `_log.warning` from inside the engine reaches stderr through
+    # `logging.lastResort` -- no timestamp, no module, no line -- which is how a gate run prints
+    # "run <uuid> is past its deadline" with no indication of which stage said it. `LYKOS_LOG`
+    # still selects the level, so the default stays quiet.
+    observe.configure()
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("binaries", nargs="*",
                     help="files to probe (default: a random /usr/bin sample)")

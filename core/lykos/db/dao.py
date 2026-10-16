@@ -5,11 +5,14 @@ columns are (de)serialized via repository helpers.
 """
 from __future__ import annotations
 
+import builtins
+import logging
 import sqlite3
 import time
-from collections.abc import Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from typing import Any, Optional
 
+from .. import observe
 from ..hashing import new_id
 from .connection import transaction
 from .models import (
@@ -33,6 +36,8 @@ from .models import (
     Target,
 )
 from .repository import BaseDAO, as_bool, as_flag, as_int_bool, dumps, loads
+
+_log = logging.getLogger(__name__)
 
 _TABLE_CASE = '"case"'  # reserved word — must be quoted everywhere
 
@@ -325,9 +330,20 @@ class EventDAO(BaseDAO):
         ev.id = int(cur.lastrowid)
         return ev
 
+    #: Rows per page when walking an event log to the end. Large enough that a case with a few
+    #: thousand events is two or three queries, small enough that none of them is a big read.
+    _PAGE = 2000
+
     def list(self, *, case_id: Optional[str] = None, run_id: Optional[str] = None,
              after_id: int = 0, limit: int = 100) -> list[Event]:
-        """Cursor pagination by monotonic id (feeds the UI log panel + WS backfill)."""
+        """Cursor pagination by monotonic id (feeds the UI log panel + WS backfill).
+
+        NOTE for callers looking for a stage's terminal event: this is `ORDER BY id ASC LIMIT ?`,
+        so a fixed `limit=` with no `after_id` returns the OLDEST events. A `.done` event is by
+        construction near the END -- seven callers got this wrong at once, and the worst of them
+        made L3 unreachable. Use `payloads_of_type` (one event type) or `walk` (every event) and
+        let them page; neither takes a limit, so neither can truncate.
+        """
         clauses: list[str] = ["id > ?"]
         params: list[Any] = [after_id]
         if case_id is not None:
@@ -340,6 +356,60 @@ class EventDAO(BaseDAO):
             params,
         ).fetchall()
         return [self._row(r) for r in rows]
+
+    def walk(self, *, case_id: Optional[str] = None,
+             run_id: Optional[str] = None) -> Iterator[Event]:
+        """Every matching event, oldest first, paged to the end.
+
+        For a caller that needs the whole log (a scorecard summing per-engine counts, a sweep for
+        decline notes across event types). Takes no limit, so it cannot silently stop early.
+        """
+        after = 0
+        while True:
+            batch = self.list(case_id=case_id, run_id=run_id, after_id=after, limit=self._PAGE)
+            if not batch:
+                return
+            yield from batch
+            last = batch[-1].id
+            if last is None:                             # unreachable: list() reads the rowid
+                return
+            after = last
+
+    def payloads_of_type(self, type: str, *, case_id: Optional[str] = None,
+                         run_id: Optional[str] = None, target_id: Optional[str] = None,
+                         stage: Optional[str] = None, status: Optional[str] = None,
+                         newest_first: bool = False) -> builtins.list[dict[str, Any]]:
+        """The payloads of one event type, in id order, with no window.
+
+        `target_id` / `stage` / `status` filter through the owning `analysis_run`, which is how a
+        later stage asks "what did poc_primitive conclude for this target?" without paging that
+        run's ~130 events. Non-dict payloads are dropped: every caller here wants a mapping.
+        """
+        clauses: builtins.list[str] = ["e.type = ?"]
+        params: builtins.list[Any] = [type]
+        if case_id is not None:
+            clauses.append("e.case_id = ?"); params.append(case_id)
+        if run_id is not None:
+            clauses.append("e.run_id = ?"); params.append(run_id)
+        join = ""
+        if target_id is not None or stage is not None or status is not None:
+            join = "JOIN analysis_run r ON r.id = e.run_id"
+            if target_id is not None:
+                clauses.append("r.target_id = ?"); params.append(target_id)
+            if stage is not None:
+                clauses.append("r.stage = ?"); params.append(stage)
+            if status is not None:
+                clauses.append("r.status = ?"); params.append(status)
+        order = "DESC" if newest_first else "ASC"
+        rows = self.conn.execute(
+            f"SELECT e.payload_json FROM event e {join} "
+            f"WHERE {' AND '.join(clauses)} ORDER BY e.id {order}", params).fetchall()
+        out: builtins.list[dict[str, Any]] = []
+        for r in rows:
+            payload = loads(r["payload_json"])
+            if isinstance(payload, dict):
+                out.append(payload)
+        return out
 
     @staticmethod
     def _row(r: sqlite3.Row) -> Event:
@@ -515,13 +585,13 @@ def _merge_effect_evidence(evidence: list) -> list:
     eff_entries = [e for e in evidence if e.get("channel") == "effects"]
     if len(eff_entries) < 2:
         return evidence
-    from ..effects import merge_effects          # leaf module: no analysis-layer dependency here
+    from ..effects import merge_effects  # leaf module: no analysis-layer dependency here
     merged: list = []
     for e in eff_entries:
         try:
             merged = merge_effects(merged, loads(e.get("detail") or "[]"))
         except Exception:
-            pass
+            observe.absorbed(_log, "continuing")
     rest = [e for e in evidence if e.get("channel") != "effects"]
     rest.append({"channel": "effects", "detail": dumps(merged)})
     return rest
@@ -614,7 +684,7 @@ class FindingDAO(BaseDAO):
             if c.get("function_addr") or c.get("site_addr") or c.get("site_detail"):
                 self._record_site(fid, c, now)
 
-    def reset_candidate_sites(self, target_id: str, detectors) -> int:
+    def reset_candidate_sites(self, target_id: str, detectors: Iterable[str]) -> int:
         """Clear the CANDIDATE-state (rule-channel) sites of the target's findings authored by the
         given static detectors, before those detectors re-run.
 
@@ -636,7 +706,7 @@ class FindingDAO(BaseDAO):
                 (target_id, *dets))
             return cur.rowcount or 0
 
-    def prune_empty_findings(self, target_id: str, detectors) -> int:
+    def prune_empty_findings(self, target_id: str, detectors: Iterable[str]) -> int:
         """Delete the target's candidate findings authored by `detectors` that have NO sites left
         -- the orphan rows a re-detect leaves when the gate drops a whole class to zero. Findings
         the dynamic channel promoted (state past 'candidate') are kept. finding_site/finding_verdict

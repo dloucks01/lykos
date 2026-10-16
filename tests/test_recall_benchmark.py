@@ -115,8 +115,8 @@ def test_jhead_file_arg_seeding_reproduces_crash(tmp_path):
     (triage -> fuzz(seed_files) -> build_poc; no disassembly): a verified L1 crash PoC. Regresses if
     external file seeding breaks again."""
     from lykos.analyze import register
-    from lykos.analyze.ingest import ingest, enqueue_triage
     from lykos.analyze.fuzz.stage import enqueue_fuzz
+    from lykos.analyze.ingest import enqueue_triage, ingest
     from lykos.analyze.poc.stage import enqueue_build_poc
     from lykos.casestore import CaseStore
     from lykos.db.dao import DynResultDAO, PocDAO

@@ -157,7 +157,7 @@ def _emit(ctx, *, pct=None, msg=None):
         else:
             ctx.progress(msg=msg)
     except Exception:
-        pass
+        observe.absorbed(_log, "continuing")
 
 
 def _readj(path: Path, default):
@@ -186,6 +186,7 @@ def _vn(ctx, v) -> str:
         try:
             rn = ctx.getRegisterName(v.space, v.offset, v.size)
         except Exception:
+            observe.absorbed(_log, "keeping the default")
             rn = None
         return f"reg:{rn}:{v.size}" if rn else f"register:{hex(v.offset)}:{v.size}"
     if sp == "const":
@@ -398,7 +399,7 @@ def analyze(binary: Path, *, ctx=None, timeout: int = 900) -> dict:
         from .. import vendorenv
         vendorenv.activate()
     except Exception:
-        pass
+        observe.absorbed(_log, "continuing")
     cli = locate_native()
     if cli is None:
         raise RuntimeError("no rizin/radare2 found for the native RE backend")
@@ -420,7 +421,7 @@ def analyze(binary: Path, *, ctx=None, timeout: int = 900) -> dict:
         if _mva is not None:
             main_seed = f"af @ {hex(_mva)}; afn main @ {hex(_mva)}; "
     except Exception:
-        pass
+        observe.absorbed(_log, "continuing")
 
     # Pass 1: program metadata + function list + strings + imports, each redirected to a file.
     _run(cli, binary, "aaa;" + main_seed + ";".join([
@@ -605,6 +606,7 @@ def decompile_one(binary: Path, addr, *, ctx=None, timeout: int = 120) -> str:
     try:
         cli = locate_native()
     except Exception:
+        observe.absorbed(_log, "keeping the default")
         cli = None
     if cli is None or addr is None:
         return ""
@@ -647,6 +649,7 @@ def _has_pdg(cli: Path, binary: Path, ctx, timeout: int) -> bool:
             return False
         return "pdg" in txt.lower() or len(txt.strip()) > 8
     except Exception:
+        observe.absorbed(_log, "answering no")
         return False
     finally:
         shutil.rmtree(d, ignore_errors=True)
@@ -894,6 +897,8 @@ def _build_functions(T: Path, fn_by_addr: dict, lifter: "_Lifter", embedded: boo
 
 
 import re as _re
+
+from .. import observe
 
 _ANSI = _re.compile(r"\x1b\[[0-9;]*m")
 

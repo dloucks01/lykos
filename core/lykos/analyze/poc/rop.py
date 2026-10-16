@@ -8,10 +8,15 @@ by reaching `system` under a breakpoint with RDI pointing at "/bin/sh".
 """
 from __future__ import annotations
 
+import logging
 import re
 import shutil
 import struct
 import subprocess
+
+from ... import observe
+
+_log = logging.getLogger(__name__)
 
 # useful x86-64 gadget byte patterns (the VA of the match is the gadget address)
 GADGETS = {
@@ -267,6 +272,7 @@ def _sections(data: bytes) -> dict:
 
         return {_name(sh[0]): (sh[off_i], sh[sz_i], sh[ent_i]) for sh in shs}
     except Exception:
+        observe.absorbed(_log, "answering empty")
         return {}
 
 
@@ -319,29 +325,6 @@ def libc_symbols(data: bytes, names) -> dict:
     return out
 
 
-def _libc_symbol_values(data: bytes) -> set:
-    """Every DEFINED function/object symbol VALUE (unrelocated vaddr) in .dynsym -- the anchors a
-    leaked libc pointer's page offset can be matched against, to recover the libc base."""
-    secs = _sections(data)
-    ds = secs.get(".dynsym")
-    if not ds:
-        return set()
-    is64, endc = _elf_class_endian(data)
-    entsize = ds[2] or (24 if is64 else 16)
-    vals = set()
-    for o in range(ds[0], ds[0] + ds[1], entsize):
-        try:
-            if is64:
-                _n, info, _oth, shndx, value, _sz = struct.unpack_from(endc + "IBBHQQ", data, o)
-            else:
-                _n, value, _sz, info, _oth, shndx = struct.unpack_from(endc + "IIIBBH", data, o)
-        except struct.error:
-            break
-        if shndx != 0 and value and (info & 0xF) in (1, 2):   # STT_OBJECT / STT_FUNC, defined
-            vals.add(value)
-    return vals
-
-
 # Distinctive libc symbols a real leak commonly discloses (FILE structs, environ, key functions);
 # a curated anchor set so a stack/PIE value can't coincidentally corroborate a bogus base.
 _LEAK_ANCHOR_SYMS = (
@@ -351,7 +334,7 @@ _LEAK_ANCHOR_SYMS = (
     "read", "write", "malloc", "free", "setvbuf", "__stack_chk_fail", "exit")
 
 
-def recover_libc_base(leaked, libc_data: bytes):
+def recover_libc_base(leaked, libc_data: bytes, *, allow_single: bool = False):
     """Recover a libc's load base from leaked runtime pointers, the same page-offset method as
     exploit.recover_pie_base but anchored on the LIBC's own exported symbols. A leaked pointer to a
     libc symbol (a FILE like _IO_2_1_stdout_, a function address in the GOT) has `& 0xfff` equal to
@@ -365,24 +348,65 @@ def recover_libc_base(leaked, libc_data: bytes):
     environ, a few well-known functions) rather than all of libc's thousands: with thousands of
     anchors a stack/PIE value coincidentally matches some symbol's page offset ~every time, so two
     of them corroborate a bogus base (a leaked stack address masqueraded as libc). The curated set
-    keeps the real leaks (stdout/stderr/environ/puts...) while making a false 2-way match unlikely."""
+    keeps the real leaks (stdout/stderr/environ/puts...) while making a false 2-way match unlikely.
+
+    `allow_single` accepts a base from ONE leaked pointer when that pointer's page offset is
+    matched by EXACTLY ONE anchor in the curated set -- the same contract, and the same wording,
+    as `exploit.recover_pie_base`. It exists because a HEAP over-read is not a stack over-read: a
+    stack dump hands over a dozen different slots, while a heap neighbour commonly holds one
+    distinctive pointer repeated at a fixed stride (a FILE* in every element of an array). Thirty
+    two copies of `stdout` are one slot, not thirty two, so the two-slot rule rejects a leak that
+    is in fact unambiguous. Uniqueness across the anchors is what makes it safe: if no other
+    curated symbol shares that page offset, the value can only be that symbol."""
     anchors: dict = {}
     for va in libc_symbols(libc_data, _LEAK_ANCHOR_SYMS).values():
         anchors.setdefault(va & 0xFFF, []).append(va)
     if not anchors:
         return None
-    support: dict = {}
+    # HOW OFTEN each value appeared, not just which values appeared. An over-read returns live
+    # memory and STALE memory together: a freed chunk holds whatever pointers used to be there,
+    # and one of those can match a curated anchor's page offset by chance. A live pointer in a
+    # structured region repeats -- an array of FILE* holds `stdout` in every element -- and
+    # garbage in a dead chunk does not. That difference is the only evidence available here, and
+    # it was being thrown away by collecting values into a set.
+    counts: dict = {}
     for v in leaked:
         v = int(v)
-        if not (0x1000 <= v <= 0x7FFFFFFFFFFF):
-            continue
+        if 0x1000 <= v <= 0x7FFFFFFFFFFF:
+            counts[v] = counts.get(v, 0) + 1
+    support: dict = {}
+    for v in counts:
         for va in anchors.get(v & 0xFFF, ()):
             base = v - va
             if base > 0 and (base & 0xFFF) == 0:
                 support.setdefault(base, set()).add(v)
-    best = max(support, key=lambda b: len(support[b]), default=None)
-    if best is None or len(support[best]) < 2:
+
+    def _score(b):
+        # distinct corroborating slots first -- that is the strong rule and nothing displaces it;
+        # then the multiplicity of the best-repeated value under this base.
+        return (len(support[b]), max(counts[v] for v in support[b]))
+
+    best = max(support, key=_score, default=None)
+    if best is None:
         return None
+    if len(support[best]) >= 2:
+        return best
+    if not allow_single:
+        return None
+    # One slot. Accept it only when its page offset is matched by exactly one anchor, so the
+    # value cannot be any other symbol -- and only when nothing ELSE is equally well supported.
+    # `max` used to break a tie between two one-slot candidates by dict order, so a stale
+    # pointer in the freed memory next door could be preferred over the live `stdout` beside it
+    # and the function returned a WRONG base: measured once in eight runs of a 1 KiB heap
+    # over-read, under load, which is the worst answer this can give -- a caller cannot tell it
+    # from a right one, where None it can.
+    lone = next(iter(support[best]))
+    if len(anchors.get(lone & 0xFFF, ())) != 1:
+        return None
+    rivals = [b for b in support if b != best and len(support[b]) == 1
+              and max(counts[v] for v in support[b]) >= counts[lone]]
+    if rivals:
+        return None                                 # nothing distinguishes them; decline
     return best
 
 
@@ -484,7 +508,7 @@ def section_addr(data: bytes, name: str):
             if data[so + sh[0]:end].decode("latin-1", "replace") == name and sh[3]:
                 return sh[3]                            # sh_addr
     except Exception:
-        pass
+        observe.absorbed(_log, "continuing")
     return None
 
 

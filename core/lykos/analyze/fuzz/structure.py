@@ -19,6 +19,7 @@ import re
 import struct
 import zlib
 
+from ... import observe
 from .mutator import Mutator
 
 _log = logging.getLogger(__name__)
@@ -446,7 +447,8 @@ def _seed_spec(spec, payload):
     return fields, blobs
 
 
-def seed_for(model: "FormatModel", payload: bytes = b"A" * 64, tail: bytes = None) -> bytes:
+def seed_for(model: "FormatModel", payload: bytes = b"A" * 64,
+             tail: bytes | None = None) -> bytes:
     """A minimal input the format's own gate accepts.
 
     The model already declares the magic and which integer sizes which blob, so a valid
@@ -782,9 +784,6 @@ _ELF_SHSTR = b"\x00.shstrtab\x00"
 _ELF_EHSIZE = 64
 _ELF_SHENT = 64
 _ELF_NSHDR = 3                                     # NULL, .shstrtab, one PROGBITS
-_ELF_SHOFF = _ELF_EHSIZE + len(_ELF_SHSTR)
-
-
 def _elf_shdrs() -> bytes:
     def sh(name, typ, off, size, link=0, entsize=0, flags=0):
         return struct.pack("<IIQQQQIIQQ", name, typ, flags, 0, off, size, link, 0, 1, entsize)
@@ -1570,7 +1569,7 @@ def _b64safe(b: bytes):
         if all(32 <= c < 127 or c in (9, 10, 13) for c in b):
             return s
     except Exception:
-        pass
+        observe.absorbed(_log, "continuing")
     return {"b64": base64.b64encode(b).decode("ascii")}
 
 

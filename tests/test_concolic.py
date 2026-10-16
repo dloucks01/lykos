@@ -182,7 +182,6 @@ def test_concolic_stage_survives_exploration_failure(store, case, pool, gated, t
 def test_concolic_blob_fallback_loads_headerless(tmp_path):
     """A headerless blob (no ELF/PE header) previously raised CLECompatibilityError and failed the
     stage. With an arch hint the driver falls back to angr's raw 'blob' loader and runs."""
-    import json
     from lykos.analyze.symbolic import concolic as _c
     blob = tmp_path / "raw.bin"
     blob.write_bytes(b"\x55\x89\xe5\x83\xec\x10\xc7\x45\xfc\x00\x00\x00\x00\xeb\x0a" * 16)

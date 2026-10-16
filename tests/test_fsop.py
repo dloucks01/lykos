@@ -11,8 +11,7 @@ import subprocess
 import time
 
 import pytest
-
-from lykos.analyze.poc import heap, rop
+from lykos.analyze.poc import heap
 
 _SYS_LIBC = next(iter(glob.glob("/usr/lib/x86_64-linux-gnu/libc.so.6")
                       + glob.glob("/lib/x86_64-linux-gnu/libc.so.6")), None)

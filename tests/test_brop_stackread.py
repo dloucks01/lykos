@@ -139,7 +139,8 @@ int main(void){
     struct sockaddr_in a; memset(&a,0,sizeof a); a.sin_family=AF_INET; a.sin_addr.s_addr=INADDR_ANY; a.sin_port=0;
     if(bind(s,(void*)&a,sizeof a)) return 1; listen(s,16);
     for(;;){ int c=accept(s,0,0); if(c<0) continue;
-        if(fork()==0){ close(s); dup2(c,0);dup2(c,1);dup2(c,2); handle(c); write(c,"OK\n",3); close(c); _exit(0);} close(c);} }
+        if(fork()==0){ close(s); dup2(c,0);dup2(c,1);dup2(c,2);
+            handle(c); write(c,"OK\n",3); close(c); _exit(0);} close(c);} }
 '''
 
 

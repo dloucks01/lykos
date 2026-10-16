@@ -11,7 +11,7 @@ import pytest
 from lykos.analyze import register
 from lykos.analyze.dynamic import sandbox
 from lykos.analyze.elf import parse
-from lykos.analyze.ingest import ingest, enqueue_triage
+from lykos.analyze.ingest import enqueue_triage, ingest
 from lykos.db.dao import TargetDAO
 from lykos.jobs import JobConfig, JobQueue, WorkerPool
 

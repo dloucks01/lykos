@@ -25,8 +25,20 @@ from ..jobs import JobConfig, WorkerPool
 from . import ws
 from .autopilot import AutopilotMixin
 from .endpoints import EndpointsMixin
-from .serializers import (_INGEST, _call_edge, _case, _csv, _dynresult, _event, _finding,
-                          _function, _poc, _run, _stringref, _target)
+from .serializers import (
+    _INGEST,
+    _call_edge,
+    _case,
+    _csv,
+    _dynresult,
+    _event,
+    _finding,
+    _function,
+    _poc,
+    _run,
+    _stringref,
+    _target,
+)
 
 # What `_get_report` can actually produce. Anything else used to fall through to
 # HTML, so `?format=md` returned 200 and a web page rather than saying it is not a
@@ -120,12 +132,48 @@ def _hostname_only(value: str) -> str:
     return v.rsplit(":", 1)[0] if ":" in v else v
 
 
+import logging
+
+from .. import observe
 from .routes import (  # route table + traversal-safe static reader (extracted from this module)
-    _ARTIFACT, _ARTIFACT_BUNDLE, _ASSET_TYPES, _CASE_AUTOPILOT, _CASE_AUTOPILOT_CANCEL, _CASE_EVENTS, _CASE_EXPORT,
-    _CASE_FIND, _CASE_ID, _CASE_REPORT, _CASE_RUNS, _CASE_SYSMAP, _CASE_TARGETS, _CASE_VERIFS,
-    _FIND_ID, _FUNC_ID, _RUN_CANCEL, _RUN_ID, _RUN_OUTPUT, _STATIC_ASSET, _TARGET_ADVICE,
-    _TARGET_CAPS, _TARGET_CG, _TARGET_DYN, _TARGET_FIND, _TARGET_FUNCS, _TARGET_ID, _TARGET_INVOKE,
-    _TARGET_POC, _TARGET_REPLAY, _TARGET_SOURCE, _TARGET_STR, _read_static, _read_ui)
+    _ARTIFACT,
+    _ARTIFACT_BUNDLE,
+    _ASSET_TYPES,
+    _CASE_AUTOPILOT,
+    _CASE_AUTOPILOT_CANCEL,
+    _CASE_EVENTS,
+    _CASE_EXPORT,
+    _CASE_FIND,
+    _CASE_ID,
+    _CASE_REPORT,
+    _CASE_RUNS,
+    _CASE_SCORECARD,
+    _CASE_SYSMAP,
+    _CASE_TARGETS,
+    _CASE_VERIFS,
+    _FIND_ID,
+    _FUNC_ID,
+    _RUN_CANCEL,
+    _RUN_ID,
+    _RUN_OUTPUT,
+    _STATIC_ASSET,
+    _TARGET_ADVICE,
+    _TARGET_CAPS,
+    _TARGET_CG,
+    _TARGET_DYN,
+    _TARGET_FIND,
+    _TARGET_FUNCS,
+    _TARGET_ID,
+    _TARGET_INVOKE,
+    _TARGET_POC,
+    _TARGET_REPLAY,
+    _TARGET_SOURCE,
+    _TARGET_STR,
+    _read_static,
+    _read_ui,
+)
+
+_log = logging.getLogger(__name__)
 
 
 class Handler(EndpointsMixin, AutopilotMixin, BaseHTTPRequestHandler):
@@ -289,6 +337,7 @@ class Handler(EndpointsMixin, AutopilotMixin, BaseHTTPRequestHandler):
         try:
             body = _read_ui()
         except Exception:
+            observe.absorbed(_log, "falling back")
             return self._json({"error": "ui not found"}, 404)
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -301,6 +350,7 @@ class Handler(EndpointsMixin, AutopilotMixin, BaseHTTPRequestHandler):
         try:
             body = _read_static(relpath)
         except Exception:
+            observe.absorbed(_log, "falling back")
             return self._json({"error": "not found"}, 404)
         ext = os.path.splitext(relpath)[1].lower()
         self.send_response(200)
@@ -441,6 +491,9 @@ class Handler(EndpointsMixin, AutopilotMixin, BaseHTTPRequestHandler):
             m = _CASE_VERIFS.match(path)
             if m:
                 return self._get_verifications(m.group(1))
+            m = _CASE_SCORECARD.match(path)
+            if m:
+                return self._get_scorecard(m.group(1))
             m = _CASE_AUTOPILOT.match(path)
             if m:
                 return self._get_autopilot(m.group(1))
@@ -501,7 +554,7 @@ class Handler(EndpointsMixin, AutopilotMixin, BaseHTTPRequestHandler):
                                     fdao.set_decompiled(fn.id, code)
                                     fn.decompiled = code
                         except Exception:
-                            pass
+                            observe.absorbed(_log, "continuing")
                     d = _function(fn, code=True)
                     ce = CallEdgeDAO(s.conn)
                     d["callees"] = [_call_edge(e) for e in ce.callees_of(fn.target_id, fn.addr)]
@@ -795,6 +848,10 @@ def serve(case_dir: str | Path, socket_path: Optional[str] = None, *,
     """
     import lykos.analyze  # noqa: F401  registers the ingest_triage stage
 
+    # The server is a second entry point into the same engine, so it needs the log connected
+    # too; without this a `lykos serve` run absorbs errors exactly as silently as before.
+    observe.configure()
+
     if not socket_path and not http:
         raise ValueError("serve() needs socket_path and/or http")
     store = CaseStore.open(case_dir)
@@ -840,7 +897,7 @@ def shutdown(servers, pool):
         try:
             s.stop_event.set()
         except Exception:
-            pass
+            observe.absorbed(_log, "continuing")
         s.shutdown()
         s.server_close()
     pool.stop()

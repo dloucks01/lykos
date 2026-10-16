@@ -13,7 +13,6 @@ import subprocess
 from pathlib import Path
 
 import pytest
-
 from lykos.analyze import pyc
 from lykos.analyze.dynamic import sandbox
 from lykos.analyze.runtime_fault import managed_fault

@@ -5,9 +5,11 @@ cross-arch (emulated) targets are captured via qemu-user's gdbstub (pc-based IP 
 from __future__ import annotations
 
 import json
+import pathlib
+import re
 import shutil
 
-from ...db.dao import DynResultDAO, FindingDAO, FunctionDAO, PocDAO, TargetDAO
+from ...db.dao import FindingDAO, FunctionDAO, PocDAO, TargetDAO
 
 # What a CONFIRMED primitive proves about the defect, used only where root_cause's class does
 # not already name a memory-corruption weakness (see the comment at the override below).
@@ -56,13 +58,20 @@ _QUANTITY_TITLE = {
 }
 # root_cause classes that are already a memory-corruption defect and so are kept as-is.
 # The one definition lives beside the finding vocabulary; a second copy here would drift.
+import logging
+
+from ... import observe
 from ...db.models import OUTRANKS_PRIMITIVE_CWES as _MEM_CORRUPTION
 from ...jobs.registry import register_stage
 from .. import substrate
 from ..debug import qemu_gdb, rootcause
 from ..dynamic import sandbox
 from ..dynamic.minimize import minimize
-from ..dynamic.stage import crash_finding_candidate, crash_hijack
+from ..dynamic.stage import (
+    crash_finding_candidate,
+    crash_key_parts,
+)
+from ..fuzz import aflpp
 from ..fuzz.runner import place
 from . import bundle, primitive
 from .capture import (
@@ -72,8 +81,17 @@ from .capture import (
     make_capture,
     make_qemu_capture,
     materialize_helper,
+    plain_build_bytes,
     replay_exe_for,
 )
+
+_log = logging.getLogger(__name__)
+
+#: A decimal run long enough to be a field rather than a stray digit in a word. Bounded
+#: above so a 40-digit blob is not multiplied into a gigabyte of input.
+_DECIMAL_RUN = re.compile(rb"[0-9]{1,9}")
+#: Ceiling on a grown decimal field: far past any plausible buffer, still cheap to run.
+_DECIMAL_CAP = 1 << 20
 
 # ISAs whose indirect branch MASKS bit 0 of the loaded PC (ARM/AArch64 for Thumb interworking,
 # RISC-V because JALR is specified to clear it), so a captured fault PC is `value & ~1` and its
@@ -142,6 +160,7 @@ def _hydrate_frames(ctx, target_id, target=None):
             ranges = program_ranges(blob)
             base = rootcause.image_base(functions, parse_elf(blob).entry) or 0
         except Exception:
+            observe.absorbed(_log, "keeping the default")
             ranges = ()
     frames = {}
     for f in functions:
@@ -186,7 +205,7 @@ def _detonate_for_report(ctx, target, exe, mode, base_argv, data, timeout):
     return rep
 
 
-def _detonate_capturing(ctx, target, exe, mode, base_argv, data, timeout):
+def _detonate_capturing(ctx, target, exe, mode, base_argv, data, timeout, *, aslr=False):
     """`(report, stdout)` for one detonation.
 
     The uninitialised-memory verdict needs the program's OWN OUTPUT, not just its report: MSan
@@ -218,7 +237,7 @@ def _detonate_capturing(ctx, target, exe, mode, base_argv, data, timeout):
     try:
         res = sandbox.run(exe, argv=argv, stdin=stdin_bytes, timeout=timeout,
                           arch=target.arch, endianness=target.endianness, bits=target.bits,
-                          env_overrides=env)
+                          env_overrides=env, aslr=aslr)
     except Exception:                                    # noqa: BLE001 -- advisory step
         return None, b""
     return (parse_asan_report((res.stderr or b"").decode("utf-8", "replace")),
@@ -236,9 +255,42 @@ def _probe_variants(orig: bytes, pre: bytes, post: bytes):
       * the filler run -- an unstructured overflow reads/writes as far as the run is long, so
         extending and truncating it moves the distance directly;
       * a field value -- a structured input (a TIFF tag, a packet length) sets the reach with a
-        NUMBER, and its file size is irrelevant. Those are probed by raising sampled bytes.
+        NUMBER, and its file size is irrelevant. Those are probed two ways: by GROWING a decimal
+        digit run, which is how a textual length field is written and the only mutation that
+        keeps it a number; and by raising sampled bytes, which is what reaches a binary field.
     """
     out = [("orig", orig)]
+    # A DECIMAL FIELD, raised. The docstring below promises this family -- "a structured input
+    # sets the reach with a NUMBER" -- and the implementation only ever raised sampled BYTES,
+    # which is not the same thing at all: adding 0x10 to a digit of `400` gives a non-digit that
+    # `strtol` stops at, so the number gets SMALLER and the access comes back in bounds. Measured
+    # on a `show=<N>` over-read: 1 of 17 variants faulted, every distance was identical, and the
+    # verdict was "the distance did not move with the input" on a read whose length the attacker
+    # literally types. Growing the digit run keeps it a valid number and makes the reach move,
+    # which is the one experiment that separates this defect from a primitive.
+    for m in _DECIMAL_RUN.finditer(orig):
+        if len(out) >= _OOB_VARIANTS:
+            break
+        txt = m.group(0)
+        try:
+            n = int(txt)
+        except ValueError:                               # pragma: no cover - regex guarantees it
+            continue
+        if n >= _DECIMAL_CAP:
+            # Already past any plausible buffer. Growing it further asks the target to read
+            # billions of bytes for no extra evidence, and clamping instead would SHRINK the
+            # field -- the opposite mutation, and the one that stops it faulting.
+            continue
+        emitted = set()
+        for mult, tag in ((4, "x4"), (16, "x16")):
+            if len(out) >= _OOB_VARIANTS:
+                break
+            grown = str(min(n * mult if n else 4096, _DECIMAL_CAP)).encode()
+            if grown == txt or grown in emitted:
+                continue
+            emitted.add(grown)
+            out.append((f"dec@{m.start():#x}={tag}",
+                        orig[:m.start()] + grown + orig[m.end():]))
     body = orig[len(pre):len(orig) - len(post)] if (pre or post) else orig
     if len(body) >= _MIN_FILLER_RUN:
         filler = body[:1] or b"A"
@@ -277,12 +329,134 @@ def _oob_primitive(ctx, target, exe, mode, base_argv, orig, pre, post, timeout, 
             obs.append((label, rep))
     prim = primitive.oob_access_primitive(obs)
     if prim is not None:
+        # `overrun_*` beside `distance_*`, because they answer different questions and only one
+        # of them is the magnitude of the defect: `distance` is where the access STARTED relative
+        # to the object, and a bulk access that begins inside and runs off the end starts at
+        # offset 0 -- so a 400-byte read of a 64-byte buffer was reported as distance 0 and read
+        # as "not out of bounds at all". See `primitive._overrun`.
         ctx.emit("primitive.oob", payload={
             "class": prim["sanitizer_class"], "access": prim["access"],
             "distance_min": prim["distance_min"], "distance_max": prim["distance_max"],
+            "overrun_min": prim.get("overrun_min"), "overrun_max": prim.get("overrun_max"),
             "region_size": prim["region_size"], "controlled": prim["confirmed"],
             "variants_detonated": len(obs), "observations": prim["observations"][:10]})
+        # ...and for a READ, whether the bytes reach the attacker and defeat ASLR. This is what
+        # the rung above needs: a recovered base is the input `build_exploit` otherwise has to
+        # obtain from a stack over-read, which a heap over-read never provides.
+        disc = _oob_disclosure(ctx, target, mode, base_argv, orig, prim, timeout)
+        if disc and disc.get("proved"):
+            prim["disclosure"] = {k: disc[k] for k in
+                                  ("pie_base", "libc_base", "canary", "rule", "note",
+                                   "input_sha")}
     return prim
+
+
+#: Where to look for the host libc image, so a leaked libc pointer can be corroborated against
+#: real symbol offsets rather than against a guess. Absent is not fatal: the PIE base and the
+#: canary come from the target's own layout, and only the libc rung needs this.
+_LIBC_PATHS = ("/usr/lib/x86_64-linux-gnu/libc.so.6", "/lib/x86_64-linux-gnu/libc.so.6",
+               "/usr/lib/libc.so.6", "/lib64/libc.so.6")
+
+
+def _host_libc_bytes() -> bytes:
+    for cand in _LIBC_PATHS:
+        try:
+            p = pathlib.Path(cand)
+            if p.exists():
+                return p.read_bytes()
+        except OSError:
+            continue
+    return b""
+
+
+def _oob_disclosure(ctx, target, mode, base_argv, orig, prim, timeout):
+    """Does the out-of-bounds READ hand its bytes back, and do they defeat ASLR?
+
+    The experiment the out-of-bounds verdict could not do. `oob_access_primitive` proves the
+    access is out of bounds and that the attacker chooses how far past the end it reaches; it
+    cannot say whether what came back is worth anything, and that is what decides the rung above.
+    Adjacent memory full of pointers defeats ASLR; adjacent memory full of pixel data does not.
+
+    An OOB READ can never reach L3 by itself -- disclosure is not control -- so this does not
+    pretend to. What it produces is the one input `build_exploit` cannot otherwise obtain for a
+    position-independent or ASLR'd target: a recovered load base. The exploit stage already knows
+    what to do with one (it consumes `recon["pie_base"]`/`recon["libc_base"]` from a stack
+    over-read); a heap over-read never reaches that code, so the base it needs stops here.
+
+    Two things make the experiment possible at all:
+
+      * **Not on the build that found it.** Under ASan the process aborts INSIDE the read, so
+        nothing reaches stdout -- the build that DETECTS the leak is the one build that cannot
+        DEMONSTRATE it. This detonates the ingested program, which is what an attacker has.
+      * **No output differencing.** The uninitialised-value class was measured undecidable that
+        way, and this class does not need it: a pointer's low 12 bits are page-invariant under
+        ASLR, so a leaked slot validates itself against the target's own symbol layout. The
+        benign run is still made, but only to report how many bytes were EXTRA. It is never the
+        oracle (see `leak.disclosed_bases`).
+
+    Returns the disclosure dict, or None when the fault is not a read, nothing was emitted, or
+    the only build available aborts inside the read -- and emits the reason in that last case,
+    because "no base recovered" and "the leak was never observable here" are not the same answer.
+    """
+    if prim.get("access") != "read":
+        return None                                      # a write discloses nothing to its caller
+    from . import leak as _leak
+    try:
+        target_bytes = ctx.content.path(target.sha256).read_bytes()
+        plain = ctx.scratch() / "disclose" / "plain.bin"
+        plain.parent.mkdir(parents=True, exist_ok=True)
+        blob = plain_build_bytes(ctx, target)
+        if blob is not None:
+            plain.write_bytes(blob)
+            target_bytes = blob                          # resolve the leak against THIS layout
+        elif aflpp.is_sanitizer_build(target_bytes):
+            # Nothing to detonate that would survive the read. Say so rather than reporting a
+            # quiet "no pointers found", which reads as evidence the leak is harmless.
+            ctx.emit("primitive.disclosure", payload={
+                "proved": False, "rule": "not-observable",
+                "note": "the only build of this program here is instrumented, so it aborts "
+                        "inside the out-of-bounds read and emits nothing; the disclosure is not "
+                        "observable without an uninstrumented build of the same source"})
+            return None
+        else:
+            ctx.content.stage_target(target, plain.parent, plain.name)
+        plain.chmod(0o755)
+        # An input that stays in bounds, for the EXTRA-bytes figure only. Short rather than
+        # empty: a parser handed nothing often refuses before it prints anything at all, and a
+        # baseline of "" would overstate how much the out-of-bounds run disclosed.
+        benign = orig[:8] if len(orig) > 8 else b"\x00" * 4
+        # WITH ASLR ON. Every other run in this stage disables it so a crash reproduces at a
+        # stable address, and for this one experiment that would hollow out the claim: a verdict
+        # that says "ASLR is defeated" has demonstrated nothing about randomization if the
+        # process it read had randomization turned off. The method does not need the stability --
+        # it resolves a leaked pointer's page-invariant low bits against the target's own symbol
+        # layout -- so this pays the real cost and the recovered base is a real one.
+        _r1, oob_out = _detonate_capturing(ctx, target, plain, mode, base_argv, orig, timeout,
+                                           aslr=True)
+        _r2, base_out = _detonate_capturing(ctx, target, plain, mode, base_argv, benign, timeout,
+                                            aslr=True)
+        if not oob_out:
+            return None                                  # the read happens, but nothing escapes
+        d = _leak.disclosed_bases(oob_out, target_bytes, _host_libc_bytes(), baseline=base_out)
+    except Exception:                                     # noqa: BLE001 -- best-effort experiment
+        observe.absorbed(_log, "answering None")
+        return None
+    # The provoking INPUT, not just the result. The rung above cannot use a recovered base -- it
+    # is stale as soon as this process exits -- so what it inherits is the recipe: this input, on
+    # the channel L2 measured, re-run in the weaponizer's own process to recover the base live.
+    d["input_sha"] = (ctx.params or {}).get("input_sha")
+    ctx.emit("primitive.disclosure", payload={
+        "proved": d["proved"], "rule": d["rule"], "distinct_pointers": d["distinct"],
+        "pie_base": d["pie_base"], "libc_base": d["libc_base"], "canary": d["canary"],
+        "disclosed_bytes": d["disclosed_bytes"], "note": d["note"],
+        "input_sha": d["input_sha"]})
+    # `disclosed_bytes` is None when the benign run printed nothing, so there was no baseline to
+    # subtract -- not zero bytes. Say "data" rather than render it as "None byte(s)".
+    _vol = (f"{d['disclosed_bytes']} byte(s)" if isinstance(d.get("disclosed_bytes"), int)
+            else "data")
+    ctx.progress(msg=("the read's own output defeats ASLR: " + d["note"])[:90] if d["proved"]
+                 else f"the read discloses {_vol}, but no base could be corroborated")
+    return d
 
 
 def _lifetime_primitive(ctx, target, exe, mode, base_argv, orig, pre, post, timeout, first=None):
@@ -573,6 +747,36 @@ def primitive_stage(ctx) -> dict:
         ctx.emit("primitive.harness", payload={"bytes": len(_harness), "mode": mode,
                                                "kind": _kind, "why": mode_why})
 
+    # TWO BINARIES, TWO JOBS. The sanitizer build is the INSTRUMENT: it names the defect's class
+    # and its file:line, and nothing else can. It is also useless for the instruction-pointer
+    # experiment, and step 2b below already says why -- ASan aborts inside its own runtime, so
+    # the fault-time pc belongs to the reporting machinery, the cyclic word is nowhere in the
+    # registers and there is no faulting access to read. The workaround was to add verdicts that
+    # need no registers (2b-2f), which is right as far as it goes and leaves the rung that
+    # matters most unreachable: a source drop could never produce an IP-control offset, so
+    # `build_exploit` inherited nothing and fell back to its own bare cyclic -- which cannot
+    # fault on a structured input at all.
+    #
+    # So run the CAPTURE against the uninstrumented build of the same source when there is one,
+    # and keep the REPORT on the instrumented build. The two answer different questions and must
+    # not be the same binary. Not applied to a harness (`_harness`): a libFuzzer harness or a
+    # TSan/MSan variant IS the program that faulted, and there is no plain twin of it.
+    cap_exe, cap_bytes, cap_plain = exe, target_bytes, False
+    if not _harness:
+        _plain = plain_build_bytes(ctx, target)
+        if _plain is not None and aflpp.is_sanitizer_build(target_bytes):
+            cap_exe = ctx.scratch() / "plain" / "target.bin"
+            cap_exe.parent.mkdir(parents=True, exist_ok=True)
+            cap_exe.write_bytes(_plain)
+            cap_exe.chmod(0o755)
+            cap_bytes, cap_plain = _plain, True
+            ctx.emit("primitive.capture_build", payload={
+                "build": "uninstrumented", "bytes": len(_plain),
+                "note": "the control-offset experiments run against the uninstrumented build of "
+                        "this source; the sanitizer build aborts inside its own runtime, so the "
+                        "cyclic marker never reaches a register. The defect's class and site "
+                        "still come from the sanitizer build"})
+
     # Static RE corroboration: recovered stack-buffer sizes predict IP-control offsets.
     word = 8 if (target.bits or 64) >= 64 else 4
     endian = "big" if target.endianness == "big" else "little"
@@ -585,11 +789,14 @@ def primitive_stage(ctx) -> dict:
     length = min(max(len(orig) * 2, need, 256), 4096)
     helper = materialize_helper()
     try:
-        def _capture_for(m):
+        def _capture_for(m, which=None):
+            # `which` picks the binary -- see "TWO BINARIES, TWO JOBS" above. Defaults to
+            # whichever one the sweep below settled on.
+            which = which or cap_exe
             if emulated:
-                return make_qemu_capture(exe, target.arch, m, base_argv, timeout,
+                return make_qemu_capture(which, target.arch, m, base_argv, timeout,
                                          endianness=target.endianness, bits=target.bits)
-            return make_capture(ctx, helper, exe, m, base_argv, timeout, sys.executable)
+            return make_capture(ctx, helper, which, m, base_argv, timeout, sys.executable)
 
         # Structure-preserving framing: a structured input (a config `name=<AAAA...>`, a packet)
         # only faults when the bytes AROUND the overflow stay intact -- the smash is the long filler
@@ -627,27 +834,57 @@ def primitive_stage(ctx) -> dict:
         # Prefer the structure-preserving framing (keeps a `name=` prefix etc.); fall back to the
         # raw pattern so an input whose longest run is NOT the overflow still works exactly as
         # before. `active_frame` is whichever reproduced the fault, reused for the confirm step.
-        identity = (lambda b: b)
+        identity = (lambda b: b)              # noqa: E731
         framings = ([frame, identity] if (_pre or _post) else [identity])
         active_frame = identity
         cap0 = {}
-        for fr in framings:
-            for m in [mode] + [x for x in MODES if x != mode]:
-                capture = _capture_for(m)
-                cap0 = capture(fr(pattern))
-                if m not in tried:
-                    tried.append(m)
+        # Sweep the UNINSTRUMENTED build first and the instrumented one second, because they
+        # fault for different reasons and only one of them can answer each question. The plain
+        # build faults where the program really breaks -- a corrupted return, a wild store -- and
+        # that is the only place the cyclic marker is visible in a register. The sanitizer build
+        # faults EARLIER, inside its own runtime, on defects the plain build survives silently
+        # (an over-read, a use-after-free), which is what the class verdicts in 2b-2f read.
+        #
+        # Taking the plain build ALONE was measured to be worse than either: the bare cyclic does
+        # not fault on it, so the stage returned "cyclic pattern did not fault" and never reached
+        # the class verdicts -- an out-of-bounds read that had been producing a proved ASLR
+        # defeat produced nothing at all. Falling back keeps every verdict that worked before and
+        # adds the control offset that none of them could reach.
+        for _which, _bytes, _is_plain in ([(cap_exe, cap_bytes, True)] if cap_plain else []) + [
+                (exe, target_bytes, False)]:
+            for fr in framings:
+                for m in [mode] + [x for x in MODES if x != mode]:
+                    capture = _capture_for(m, _which)
+                    cap0 = capture(fr(pattern))
+                    if m not in tried:
+                        tried.append(m)
+                    if cap0.get("ok") and cap0.get("signal_name"):
+                        active_frame, mode = fr, m
+                        break
                 if cap0.get("ok") and cap0.get("signal_name"):
-                    active_frame, mode = fr, m
                     break
             if cap0.get("ok") and cap0.get("signal_name"):
+                cap_exe, cap_bytes, cap_plain = _which, _bytes, _is_plain
+                if cap_plain:
+                    ctx.progress(msg="the cyclic faults on the uninstrumented build, so the "
+                                     "control offset is measurable")
                 break
+            if _is_plain:
+                ctx.progress(msg="the uninstrumented build does not fault on a bare cyclic; "
+                                 "falling back to the sanitizer build for a class verdict")
         frame = active_frame                       # confirm uses the framing that actually faulted
+        # ...and build_exploit inherits it. An offset is only meaningful against the framing it
+        # was measured in, and L3 re-derives its own from whatever crash input it is handed:
+        # `_overflow_frame` needs a long single-byte filler run to see any structure, which a
+        # fuzzer blob often lacks even when the target genuinely needs a `name=` prefix. This
+        # swept framings against the LIVE target and kept the one that faulted, so record it.
+        _frame_bytes = ((_pre, _post) if active_frame is not identity else (b"", b""))
         capture = _capture_for(mode)
         if not cap0.get("ok") or not cap0.get("signal_name"):
             ctx.emit("primitive.done", payload={
                 "primitive": None, "supported": True, "input_modes_tried": tried,
                 "note": ("cyclic pattern did not fault via any of " + ", ".join(tried)
+                         + (" (uninstrumented build)" if cap_plain else "")
                          + ": " + str(cap0.get("reason", "")))})
             ctx.progress(pct=100, msg="no fault under cyclic pattern (tried %s)"
                          % ", ".join(tried))
@@ -709,8 +946,8 @@ def primitive_stage(ctx) -> dict:
                 extra += (f"; corroborated by static stack frame -- {static_match['size']}-byte"
                           f" buffer {static_match['buffer']}{_slack_txt(fp_slack)}"
                           f" = offset {off}")
-            return _finalize(ctx, target, target_bytes, mode, base_argv, cap0, control,
-                             prim, True, extra)
+            return _finalize(ctx, target, cap_bytes, mode, base_argv, cap0, control,
+                             prim, True, extra, frame=_frame_bytes)
 
         # 1c) nothing confirmed -- if we had a trusted dynamic offset, still report it as an
         # unconfirmed IP-control primitive (the crash reproduces; the marker just didn't pin).
@@ -728,8 +965,8 @@ def primitive_stage(ctx) -> dict:
                 extra += (f"; corroborated by static stack frame -- {static_match['size']}-byte"
                           f" buffer {static_match['buffer']}{_slack_txt(fp_slack)}"
                           f" = offset {offset}")
-            return _finalize(ctx, target, target_bytes, mode, base_argv, cap0, control,
-                             prim, False, extra)
+            return _finalize(ctx, target, cap_bytes, mode, base_argv, cap0, control,
+                             prim, False, extra, frame=_frame_bytes)
 
         # 2) memory primitive (write-what-where / controlled read at a faulting mem access)
         memp = primitive.analyze_memory_primitive(cap0, length, disasm, endian=endian,
@@ -752,8 +989,8 @@ def primitive_stage(ctx) -> dict:
                      f"(offset {memp['addr_offset']}"
                      + (f", value offset {memp['value_offset']}"
                         if memp.get("value_offset") is not None else "") + f") via `{disasm}`")
-            return _finalize(ctx, target, target_bytes, mode, base_argv, cap0, control,
-                             prim, confirmed, extra)
+            return _finalize(ctx, target, cap_bytes, mode, base_argv, cap0, control,
+                             prim, confirmed, extra, frame=_frame_bytes)
 
         # 2b) NOTHING in the registers -- because on a sanitizer build there is nothing in the
         # registers to find. ASan aborts inside its own runtime, so the fault-time pc belongs to
@@ -781,7 +1018,7 @@ def primitive_stage(ctx) -> dict:
                                 else orig)
                 extra = primitive.oob_effect(prim)
                 return _finalize(ctx, target, target_bytes, mode, base_argv, cap0, control,
-                                 prim, bool(prim.get("confirmed")), extra)
+                                 prim, bool(prim.get("confirmed")), extra, frame=_frame_bytes)
 
             # 2c) the same reasoning, one bug class further on. A use-after-free and a double
             # free are the two defects this link had NO verdict for -- the distance experiment
@@ -794,7 +1031,7 @@ def primitive_stage(ctx) -> dict:
                                 else orig)
                 extra = primitive.lifetime_effect(prim)
                 return _finalize(ctx, target, target_bytes, mode, base_argv, cap0, control,
-                                 prim, bool(prim.get("confirmed")), extra)
+                                 prim, bool(prim.get("confirmed")), extra, frame=_frame_bytes)
 
             # 2e) a concurrency defect, whose experiment is a REPEAT rather than a variation.
             prim = _race_primitive(ctx, target, exe, mode, base_argv, orig, timeout,
@@ -809,7 +1046,7 @@ def primitive_stage(ctx) -> dict:
                     orig[len(_pre):len(orig) - len(_post)] if (_pre or _post) else orig)
                 extra = primitive.race_effect(prim)
                 return _finalize(ctx, target, target_bytes, mode, base_argv, cap0, control,
-                                 prim, bool(prim.get("confirmed")), extra)
+                                 prim, bool(prim.get("confirmed")), extra, frame=_frame_bytes)
 
             # 2d) and the classes that describe a MAGNITUDE rather than an access.
             prim = _quantity_primitive(ctx, target, exe, mode, base_argv, orig, _pre, _post,
@@ -819,7 +1056,7 @@ def primitive_stage(ctx) -> dict:
                                 else orig)
                 extra = primitive.quantity_effect(prim)
                 return _finalize(ctx, target, target_bytes, mode, base_argv, cap0, control,
-                                 prim, bool(prim.get("confirmed")), extra)
+                                 prim, bool(prim.get("confirmed")), extra, frame=_frame_bytes)
 
             # 2f) the uninitialised-value class: the last one in this stage with no verdict of
             # its own. Its experiment is not a variation but a LOOK AT THE BYTES -- see
@@ -831,7 +1068,7 @@ def primitive_stage(ctx) -> dict:
                                 else orig)
                 extra = primitive.uninit_effect(prim)
                 return _finalize(ctx, target, target_bytes, mode, base_argv, cap0, control,
-                                 prim, bool(prim.get("confirmed")), extra)
+                                 prim, bool(prim.get("confirmed")), extra, frame=_frame_bytes)
 
         # 3) nothing to claim. Where the defect's CLASS is one this stage cannot reason about --
         # a data race, an uninitialised read -- say which and why, because the generic note reads
@@ -854,7 +1091,7 @@ def primitive_stage(ctx) -> dict:
 
 
 def _finalize(ctx, target, target_bytes, mode, base_argv, cap0, control, prim, confirmed,
-              extra):
+              extra, *, frame=(b"", b"")):
     """Bundle the demonstrating input, record an L2 (or L1) PoC, promote the crash finding on
     confirmation, and emit the result -- shared by every primitive kind."""
     # A verdict may CAP its own level. L2 means a confirmed exploitation primitive, and not every
@@ -931,6 +1168,17 @@ def _finalize(ctx, target, target_bytes, mode, base_argv, cap0, control, prim, c
                            ("Information disclosure (uninitialised memory)"
                             if prim.get("escaped")
                             else "Use of an uninitialised value (potential)"))
+        elif prim.get("disclosure"):
+            # An out-of-bounds read that returns pixel data and one that returns the image load
+            # base are both "information disclosure", and only one of them hands an attacker the
+            # missing half of a chain. Say which this is in the HEADLINE: the distinction decides
+            # whether a reader goes looking for a write primitive to pair it with, and burying it
+            # in the detail line means the two findings sort identically.
+            _d = prim["disclosure"]
+            _got = ", ".join(n for n, k in (("image base", "pie_base"), ("libc base", "libc_base"),
+                                            ("stack canary", "canary")) if _d.get(k) is not None)
+            _kind_title = ("info-disclosure",
+                           f"ASLR defeated by an out-of-bounds read (discloses the {_got})")
         elif prim.get("quantity"):
             _title = _QUANTITY_TITLE.get(prim["sanitizer_class"], "Resource exhaustion")
             _kind_title = (prim["effect_kind"],
@@ -941,12 +1189,13 @@ def _finalize(ctx, target, target_bytes, mode, base_argv, cap0, control, prim, c
         # on a native target the fault PC is in the dedup key, and omitting it here split one
         # defect into two poc-backed findings.
         _orig = (ctx.params or {}).get("input_sha")
-        _fpc = DynResultDAO(ctx.conn).fault_pc_for(target.id, _orig) if _orig else None
-        _hj = crash_hijack(ctx.conn, target.id, _fpc)
+        # ...and the DISCRIMINATOR, or a sanitizer abort keys to the signal alone and merges
+        # every such defect into one finding. See `crash_key_parts`.
+        _fpc, _disc, _hj = crash_key_parts(ctx.conn, target.id, _orig)
         cand = crash_finding_candidate(
             cap0.get("signal_name"), control_sha, "ptrace", "primitive",
             f"({level} primitive: {extra})", state="poc-backed", confidence=0.98,
-            bundle_sha=bundle_sha, fault_pc=_fpc, hijack=_hj)
+            bundle_sha=bundle_sha, fault_pc=_fpc, discriminator=_disc, hijack=_hj)
         if _kind_title:
             _kind, _title = _kind_title
             cand["title"] = (f"{_title} (demonstrated): L2 primitive" if level == "L2"
@@ -1017,9 +1266,32 @@ def _finalize(ctx, target, target_bytes, mode, base_argv, cap0, control, prim, c
         fid = fd.id_for_dedup(target.id, cand["dedup_key"])   # the pc-keyed crash finding
         if fid:
             PocDAO(ctx.conn).set_finding(poc_id, fid)
-    ctx.emit("primitive.done", payload={
+    # `mode` is recorded alongside the offset because this stage is the only one that RESOLVES
+    # it: the loop above feeds the crashing input down every channel until one faults, so by here
+    # the channel is measured, not guessed. build_exploit inherits the offset from this payload
+    # and used to re-guess the channel from how_to_feed, which ranks a `file` parser first on any
+    # fopen import -- so a stdin smash in a binary that also opens a config file was delivered
+    # as argv, where a NUL inside the win address truncates the copy. Its own re-probe cannot
+    # correct that: it uses a bare cyclic, which a structured target never faults on at all.
+    # `mode` and `frame_*` travel with the offset because this stage is the only one that
+    # MEASURES them: the sweep above feeds the crashing input down every channel, in both
+    # framings, until one faults. build_exploit used to inherit the offset alone and re-infer the
+    # other two -- the channel from the import table, the framing from its own minimization --
+    # and an offset against the wrong framing lands beside the control slot.
+    # A recovered load base travels with them for the same reason, and it is the only one of the
+    # four that build_exploit cannot measure for itself at all: it obtains a base from a STACK
+    # over-read, and a heap over-read -- the shape this disclosure comes from -- never reaches
+    # that code. Without this, an out-of-bounds read that provably defeats ASLR was recorded as
+    # L2 and the rung above started again from "the target is PIE and we have no leak".
+    _fp, _fs = frame
+    _payload = {
         "primitive": prim["type"], "supported": True, "offset": prim.get("offset"),
-        "confirmed": confirmed, "level": level, "bundle": bundle_sha})
+        "confirmed": confirmed, "level": level, "bundle": bundle_sha,
+        "mode": mode, "base_argv": [str(a) for a in (base_argv or [])],
+        "frame_prefix": (_fp or b"").hex(), "frame_suffix": (_fs or b"").hex()}
+    if prim.get("disclosure"):
+        _payload["disclosure"] = prim["disclosure"]
+    ctx.emit("primitive.done", payload=_payload)
     ctx.progress(pct=100, msg=(f"L2 confirmed: {prim['type']}") if confirmed
                  else f"{prim['type']} indicated (unconfirmed)")
     return {"output_shas": [bundle_sha], "output_kind": "poc-bundle"}

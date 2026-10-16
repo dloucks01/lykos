@@ -251,6 +251,7 @@ def test_prior_corpus_reuses_concolic_and_crasher_inputs(store, case):
     solved-inputs first, then crashers -- so coverage compounds across stages instead of each
     campaign starting from string-mined tokens. This closes the concolic->fuzz loop."""
     from types import SimpleNamespace
+
     from lykos.analyze.fuzz.directed import _prior_corpus
     from lykos.db.dao import DynResultDAO, TargetDAO
     t = TargetDAO(store.conn).upsert(case.id, filename="t", sha256="d" * 64, size=1,

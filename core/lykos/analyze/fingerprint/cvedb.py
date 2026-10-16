@@ -38,10 +38,6 @@ def index_path() -> "Path | None":
     return cand if cand.is_file() else None
 
 
-def index_available() -> bool:
-    return index_path() is not None
-
-
 def _ro(path: "Path | None") -> "sqlite3.Connection | None":
     if path is None:
         return None
@@ -94,10 +90,6 @@ def reference_path() -> "Path | None":
     if recce and Path(recce).is_file():
         return Path(recce)
     return None
-
-
-def reference_available() -> bool:
-    return reference_path() is not None
 
 
 def reference_detail(cve: str) -> "dict | None":

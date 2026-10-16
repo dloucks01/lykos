@@ -243,9 +243,10 @@ def test_format_string_demonstrates_disclosure_with_proof(store, pool, gcc, tmp_
     disclosure, headlines the finding as such, and attaches the captured leaked memory as a proof
     artifact (with %n write-what-where flagged as the potential next effect)."""
     import json
+
+    from lykos.analyze.ingest import ingest
     from lykos.analyze.poc import enqueue_inject
     from lykos.db.dao import CallEdgeDAO, FindingDAO
-    from lykos.analyze.ingest import ingest
     from lykos.jobs import JobQueue
     b = tmp_path / "fs2"
     (tmp_path / "fs2.c").write_text(_FMT)

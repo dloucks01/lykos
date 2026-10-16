@@ -5,7 +5,6 @@ endpoint mixin can share the one projection of each row into JSON.
 """
 from __future__ import annotations
 
-
 _INGEST = "ingest_triage"
 
 

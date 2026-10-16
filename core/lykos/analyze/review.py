@@ -20,6 +20,7 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 
+from .. import observe
 from ..db.dao import DynResultDAO
 from .fuzz.runner import run_input
 
@@ -79,5 +80,5 @@ def replay_verdict(store, target, input_sha: str, *, times: int = 5,
                                data=json.dumps(verdict).encode(),
                                meta={"input_sha": input_sha, "target_id": target.id, **verdict})
         except Exception:
-            pass
+            observe.absorbed(_log, "continuing")
     return verdict

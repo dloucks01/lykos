@@ -9,7 +9,7 @@ import { isFolderPick, folderArchive } from "./archive.js";
 import { runAutopilotCase, newController, cancel as cancelAutopilot, coverageOf } from "./autopilot.js";
 import { rankFindings, pocsForFinding, fmtTime, progressText, stageLabel, dedupeFindings, buildRunLog, buildVerdicts, filterByViz } from "./util.js";
 import {
-  html, DropZone, TargetSummary, ProgressLog, ConsolePanel, FindingCard, EmptyResults, Spinner, UnavailablePanel, SystemMap, CoveragePanel, CodeView, PipelinePlan, EvidenceModal, FunctionsModal, VerdictStrip, VerdictCard, AnalysisDrawer, ShellVerdict, ExploitsPanel, DrawerFacts, TargetBar, FunctionsPanel, StringsPanel, DisasmPanel, DiffPanel, CrashesPanel, CallGraphCanvas, CaseOverview,
+  html, DropZone, TargetSummary, ProgressLog, ConsolePanel, FindingCard, EmptyResults, Spinner, UnavailablePanel, RunScorecard, SystemMap, CoveragePanel, CodeView, PipelinePlan, EvidenceModal, FunctionsModal, VerdictStrip, VerdictCard, AnalysisDrawer, ShellVerdict, ExploitsPanel, DrawerFacts, TargetBar, FunctionsPanel, StringsPanel, DisasmPanel, DiffPanel, CrashesPanel, CallGraphCanvas, CaseOverview,
 } from "./components.js";
 
 let _conSeq = 0;
@@ -102,6 +102,10 @@ function App() {
   const [disasmSel, setDisasmSel] = useState({});     // targetId -> selected function id
   const [diffVerify, setDiffVerify] = useState(null); // poc_diff run result for the Diff tab
   const [bg, setBg] = useState(null);               // server-side background autopilot status
+  // WHAT THE RUN DID, per target. The UI showed findings with no account of the work behind
+  // them, and there was no endpoint to ask: the CLI printed this and the HTML report rendered
+  // it, while the primary interface could not.
+  const [scorecard, setScorecard] = useState([]);
   const [bgActivity, setBgActivity] = useState(null); // {msg, pct} live intra-stage progress
   const [consoleLines, setConsoleLines] = useState([]); // job.exec: tool commands + I/O
   const consoleSeen = useRef(new Set());              // de-dupe exec events by server id
@@ -417,7 +421,7 @@ function App() {
         const adv = await api.advice(ts[0].id).catch(() => null);
         setAdvice(adv);
       }
-      const [fs, psArrays, sm, verifs] = await Promise.all([
+      const [fs, psArrays, sm, verifs, cards] = await Promise.all([
         api.caseFindings(cid).catch(() => []),
         Promise.all((ts || []).map((t) => api.pocs(t.id).catch(() => []))),
         // Cross-binary system map (multi-binary cases) and the false-positive review verdicts
@@ -425,11 +429,13 @@ function App() {
         // SystemMap panel and every VerifyBadge. Fetch them from the server on reopen.
         (ts || []).length > 1 ? api.systemmap(cid).catch(() => null) : Promise.resolve(null),
         api.verifications(cid).catch(() => ({})),
+        api.scorecard(cid).catch(() => null),
       ]);
       setFindings(fs || []);
       setPocs((psArrays || []).flat());
       setSysmap(sm);
       setVerifications(verifs || {});
+      setScorecard((cards && cards.cards) || []);
       // Rebuild the coverage panel from the fuzz runs' outputs, so a reopened case shows how
       // much of each binary the earlier search reached -- keeping the best block-coverage read.
       const cov = {};
@@ -476,7 +482,7 @@ function App() {
       setError(`could not pack the folder: ${e.message || e}`);
       return;
     }
-    if (!append) { setLog([]); setFindings([]); setPocs([]); setAdvice(null); setRan(false); setUnavailable([]); setSysmap(null); setCoverage({}); setVerifications({}); setBg(null); bgPollRef.current++; bgEventsAfter.current = -1; }
+    if (!append) { setLog([]); setFindings([]); setPocs([]); setAdvice(null); setRan(false); setUnavailable([]); setSysmap(null); setCoverage({}); setVerifications({}); setScorecard([]); setBg(null); bgPollRef.current++; bgEventsAfter.current = -1; }
     try {
       const cid = await ensureCase();
       const got = append ? [...targets] : [];
@@ -677,8 +683,12 @@ function App() {
     ` : bg && (bg.state === "cancelled" || bg.state === "error") ? html`
       <button class="btn primary" onClick=${onBackground}>▷ Resume run</button>
     ` : !running ? html`
-      <button class="btn primary" onClick=${onAutopilot}>${ran ? "Run Autopilot again" : "▶ Run Autopilot"}</button>
-      <button class="btn ghost small" onClick=${onBackground} title="run on the server; survives closing the tab">▷ In background</button>
+      <button class="btn primary" onClick=${onBackground}
+              title="the full pipeline on the server: every applicable stage, a wall-clock budget it divides between phases, and a scorecard of what it did">
+        ${ran ? "Run Autopilot again" : "▶ Run Autopilot"}</button>
+      <button class="btn ghost small" onClick=${onAutopilot}
+              title="run the stages from this tab instead: finer per-stage feedback, but a shorter pipeline and no scorecard — closing the tab stops it">
+        ⚙ In this tab</button>
     ` : html`
       <button class="btn danger" onClick=${onCancel}>■ Stop</button>
     `}`;
@@ -905,6 +915,7 @@ function App() {
               </div>
             ` : html`<div class="wb-soon">This view is coming to the workbench.</div>`}
 
+            <${RunScorecard} cards=${scorecard} targetName=${activeTarget && activeTarget.filename} />
             <${UnavailablePanel} items=${unavailable} />
           </main>
         </div>

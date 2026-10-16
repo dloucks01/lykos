@@ -10,8 +10,10 @@ of exported names.
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any, Optional
 
+from ... import observe
 from ...db.dao import (
     AnalysisRunDAO,
     ArtifactDAO,
@@ -19,6 +21,8 @@ from ...db.dao import (
     RunArtifactDAO,
     TargetDAO,
 )
+
+_log = logging.getLogger(__name__)
 
 _MAX_DETAIL_SYMS = 60
 
@@ -42,6 +46,7 @@ def _triage_records(conn, content, case_id: str) -> dict[str, dict]:
                 try:
                     rec = json.loads(content.get_bytes(a.sha256))
                 except Exception:
+                    observe.absorbed(_log, "keeping the default")
                     rec = {}
                 break
         out[tid] = rec
@@ -153,4 +158,5 @@ def edge_symbols(detail: Optional[str]) -> list[str]:
     try:
         return json.loads(detail).get("symbols", []) or []
     except Exception:
+        observe.absorbed(_log, "answering empty")
         return []

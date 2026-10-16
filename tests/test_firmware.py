@@ -131,6 +131,7 @@ def test_headerless_detects_aarch64_and_riscv_blobs():
     AArch64 (Cortex-A, servers) and RISC-V (RVC-heavy). Near-exact prologue encodings, so this is
     dominant-and-dense without tripping on random data."""
     import struct
+
     from lykos.analyze.firmware.headerless import analyze_blob
 
     # AArch64: stp x29,x30,[sp,#-16]! ; mov x29,sp ; <body> ; ret  -- repeated

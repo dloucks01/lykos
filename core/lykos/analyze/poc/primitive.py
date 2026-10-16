@@ -426,6 +426,43 @@ OOB_CLASSES = frozenset({
 })
 
 
+def _overrun(report: dict):
+    """How far OUT OF BOUNDS this access reached, on the side the sanitizer named, or None.
+
+    `distance` alone does not answer that, and what it means depends entirely on `side` -- which
+    is why this cannot be a subtraction done at the call site:
+
+      * `inside`  -- the access STARTS in the object and is wider than what is left of it. The
+                     distance is an offset from the object's START, so the part out of bounds is
+                     `distance + size - region`. This is the shape a length field produces (one
+                     big read or copy off the end), and it is the one that was being reported as
+                     distance 0, i.e. as not out of bounds at all.
+      * `after`   -- the reported ADDRESS is the first byte out of bounds, `distance` past the
+                     end, but `size` is the whole operation's width and may include bytes that
+                     were in bounds. Measured: `READ of size 400 at 0x..060` against region
+                     `[0x..020,0x..060)` -- the read began at the region's start, so 336 bytes
+                     were out of bounds, not 400. `distance + size` therefore overstates a
+                     straddling access by up to the region's size, and `size - region` under-
+                     states one that lies entirely past the end. Take whichever is larger and
+                     at least one byte: that is true in all three cases and overstates none.
+      * `before`  -- an underflow: `distance` bytes before the start is how far out it reaches.
+
+    None when the report did not say, in which case the caller keeps using `distance` unchanged
+    -- a verdict is not improved by inventing a number the sanitizer never gave.
+    """
+    size, region, side = report.get("access_size"), report.get("region_size"), report.get("side")
+    dist = report.get("distance")
+    if dist is None or not isinstance(size, int):
+        return None
+    if side == "after":
+        return max(int(dist) + 1, size - region if isinstance(region, int) else 1)
+    if side == "before":
+        return int(dist)
+    if side == "inside" and isinstance(region, int) and region >= 0:
+        return max(0, int(dist) + size - region)
+    return None
+
+
 def oob_access_primitive(observations: list) -> dict | None:
     """What an out-of-bounds ACCESS the sanitizer reported is worth as an exploitation primitive.
 
@@ -460,8 +497,18 @@ def oob_access_primitive(observations: list) -> dict | None:
     seen = [(lbl, r) for lbl, r in seen if r["class"] == cls and r["access"] == access]
     dists = sorted({r["distance"] for _lbl, r in seen})
     pairs = [{"variant": lbl, "distance": r["distance"], "region_size": r.get("region_size"),
-              "access_size": r.get("access_size")} for lbl, r in seen]
-    controlled = len(dists) > 1
+              "access_size": r.get("access_size"), "overrun": _overrun(r)} for lbl, r in seen]
+    # HOW FAR PAST THE END, not where the access started. ASan reports the ADDRESS it caught,
+    # and for a bulk access that begins inside the object and runs off the end that address is
+    # the object's own start -- distance 0. So a 400-byte read of a 64-byte buffer was recorded
+    # as "0 bytes past a 64-byte object", which reads as "not out of bounds at all" for the
+    # single commonest shape of this defect: a length field driving one big read or copy, which
+    # is exactly libtiff's `putRGBcontig8bittile` **[measured on a `show=<N>` over-read]**. And
+    # since every variant started at offset 0 too, the distance never moved and the reach was
+    # reported as not attacker-controlled on a read whose length the attacker types.
+    overs = sorted({o for o in (_overrun(r) for _lbl, r in seen) if o is not None})
+    reach = overs or dists                           # no sizes reported -> the start is all we have
+    controlled = len(reach) > 1
     prim = {
         "type": ("controlled-oob-" if controlled else "oob-") + access,
         "sanitizer_class": cls,
@@ -472,6 +519,8 @@ def oob_access_primitive(observations: list) -> dict | None:
         "distance": dists[-1],
         "distance_min": dists[0],
         "distance_max": dists[-1],
+        "overrun_min": reach[0],
+        "overrun_max": reach[-1],
         "observations": pairs,
         # Confirmed means the claim was DEMONSTRATED, not merely observed once. A distance that
         # tracks the input is a demonstration (the variants are the experiment); a single fixed
@@ -485,7 +534,11 @@ def oob_access_primitive(observations: list) -> dict | None:
 def oob_effect(prim: dict) -> str:
     """The demonstrable effect of an out-of-bounds access primitive, stated without inflation."""
     access, region, size = prim.get("access"), prim.get("region_size"), prim.get("access_size")
-    far = prim.get("distance_max")
+    # The REACH past the end (see `_overrun`), falling back to the start offset for a verdict
+    # recorded before that was measured.
+    far = prim.get("overrun_max")
+    if far is None:
+        far = prim.get("distance_max")
     where = f"{far} bytes {prim.get('side') or 'past'} a {region}-byte object" \
         if region is not None else f"{far} bytes out of bounds"
     if access == "read":
@@ -494,7 +547,15 @@ def oob_effect(prim: dict) -> str:
         reach = ("the distance tracks the input, so the attacker chooses how far to read"
                  if prim.get("confirmed") else
                  "the distance did not move with the input in this run")
-        return f"out-of-bounds read {where}: {what} or crashes the process -- {reach}"
+        # WHAT the disclosed bytes were worth, when the disclosure experiment ran and answered.
+        # Without it a read that provably defeats ASLR and one that returns a screen of pixel
+        # data are the same sentence, and they are not remotely the same finding.
+        disc = prim.get("disclosure") or {}
+        got = [n for n, k in (("the image load base", "pie_base"), ("the libc base", "libc_base"),
+                              ("the stack canary", "canary")) if disc.get(k) is not None]
+        extra = (f"; the disclosed bytes recover {', '.join(got)} ({disc.get('rule')}), "
+                 f"defeating ASLR for a chain built on another primitive" if got else "")
+        return f"out-of-bounds read {where}: {what} or crashes the process -- {reach}{extra}"
     reach = ("the distance tracks the input, so the attacker chooses where to write"
              if prim.get("confirmed") else
              "the distance did not move with the input in this run")

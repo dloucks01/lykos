@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 
+from ... import observe
 from ...db.dao import CallEdgeDAO, FindingDAO, FunctionDAO, StringDAO, TargetDAO
 from ...jobs.registry import register_stage
 from . import bounds, scriptscan, taint
@@ -277,6 +278,7 @@ def _program_only(ctx, target, functions):
         blob = ctx.content.path(target.sha256).read_bytes()
         ranges = program_ranges(blob)
     except Exception:
+        observe.absorbed(_log, "keeping the default")
         ranges = []
     if not ranges:
         return functions, edges, 0
@@ -285,6 +287,7 @@ def _program_only(ctx, target, functions):
     try:
         entry = parse_elf(blob).entry
     except Exception:
+        observe.absorbed(_log, "keeping the default")
         entry = None
     base = rootcause.image_base(functions, entry) or 0
     los = [lo for lo, _ in ranges]
@@ -330,6 +333,7 @@ def _export_seeds(ctx, target, functions, func_irs):
         blob = ctx.content.path(target.sha256).read_bytes()
         exported = set(_elf_symbols(blob, 2))              # STT_FUNC
     except Exception:
+        observe.absorbed(_log, "falling back")
         return {}, 0
     if not exported:
         return {}, 0
@@ -534,6 +538,7 @@ def detect_stage(ctx) -> dict:
             data = ctx.content.path(target.sha256).read_bytes()
             lang = scriptscan.language_for(target.filename, data)
         except Exception:
+            observe.absorbed(_log, "keeping the default")
             lang = None
         if lang:
             return _detect_script(ctx, target, lang, data)
@@ -668,6 +673,7 @@ def detect_stage(ctx) -> dict:
                                                 target.bits or 64, _ak)
                 heap_regions = {fa: set(c.keys()) for fa, c in _caps.items()}
         except Exception:
+            observe.absorbed(_log, "keeping the default")
             heap_regions = {}
         tainted_sites = taint.analyze_program(func_irs, dctx.call_edges, target.arch,
                                               entry_seeds=entry_seeds, mem_out=derefs,

@@ -10,12 +10,17 @@ import types
 
 import pytest
 from lykos.analyze import register
-from lykos.analyze.detect.detectors import (DetectContext, scanf_bounded_overflow,
-                                            _norm_call, _str_flag_for_reg, _stack_slot_for_reg)
+from lykos.analyze.detect import enqueue_detect
+from lykos.analyze.detect.detectors import (
+    DetectContext,
+    _norm_call,
+    _stack_slot_for_reg,
+    _str_flag_for_reg,
+    scanf_bounded_overflow,
+)
+from lykos.analyze.disassemble import enqueue_disassemble
 from lykos.analyze.dynamic import sandbox
 from lykos.analyze.ingest import enqueue_triage, ingest
-from lykos.analyze.disassemble import enqueue_disassemble
-from lykos.analyze.detect import enqueue_detect
 from lykos.db.dao import FindingDAO
 from lykos.jobs import JobConfig, JobQueue, WorkerPool
 

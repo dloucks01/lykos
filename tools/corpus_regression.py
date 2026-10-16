@@ -71,6 +71,7 @@ from corpus_run import (  # noqa: E402
     set_max_entry_points,
     unscoreable,
 )
+from lykos import observe  # noqa: E402
 
 #: Where the corpus tarballs live. Not in the repo: they are upstream releases, several MB each,
 #: and an absent one is reported as SKIP rather than silently passing.
@@ -141,10 +142,14 @@ GROUND_TRUTH: dict[str, dict] = {
              "note": "UBSan null pointer use reading td_stripbytecount, reachable only through "
                      "TIFFReadRawStrip/TIFFReadEncodedStrip. Site measured 2026-10-14, class "
                      "measured 2026-10-15"},
-            {"id": "tiff-read-545", "cwe": "", "site": "tif_read.c:545",
+            {"id": "tiff-read-545", "cwe": "CWE-476", "site": "tif_read.c:545",
              "through": "TIFFReadEncodedStrip", "min_level": 1, "tier": "reach",
-             "note": "site measured 2026-10-14 behind the same pair of doors; the check that "
-                     "fired was not recorded"},
+             "note": "null-pointer dereference. Site measured 2026-10-14 behind the same pair "
+                     "of doors with the check unrecorded; the CLASS measured 2026-10-16, "
+                     "confirmed through TIFFOpen -> TIFFReadEncodedStrip -> TIFFClose. Recording "
+                     "it closes the hole an empty `cwe` leaves: an entry that names no class "
+                     "matches any class, so a detector that regressed from CWE-476 to something "
+                     "else here would still have scored a hit"},
             {"id": "tiff-dirread-3766", "cwe": "", "site": "tif_dirread.c:3766",
              "through": "", "min_level": 1, "tier": "reach",
              "note": "site measured 2026-10-14 in directory reading; class not recorded"},
@@ -159,12 +164,19 @@ GROUND_TRUTH: dict[str, dict] = {
         "min_doors": 1,
         "defects": [
             {"id": "expat-namingbitmap-shift", "cwe": "CWE-758",
-             "site": ["xmltok_impl.c:694", "xmltok.c:147"],
+             "site": ["xmltok_impl.c:694", "xmltok.c:147", "xmltok.c:133"],
              "through": "XML_Parse", "min_level": 1,
              "note": "signed left shift of 1 by 31 places in the namingBitmap bit test. "
-                     "xmltok_impl.c:694 measured 2026-10-14, xmltok.c:147 measured 2026-10-15 "
-                     "(xmltok.c includes xmltok_impl.c, and the two lines are the same macro "
-                     "family reached by different inputs). Unreachable until the harness could "
+                     "xmltok_impl.c:694 measured 2026-10-14, xmltok.c:147 measured 2026-10-15, "
+                     "xmltok.c:133 measured 2026-10-16 "
+                     "(xmltok.c includes xmltok_impl.c, and the three lines are the same macro "
+                     "family reached by different inputs). :133 and :147 are BOTH the body of "
+                     "UTF8_GET_NAMING2 -- `namingBitmap[...] & (1 << (byte[1] & 0x1F))`, "
+                     "xmltok.c:55 -- expanded in utf8_isName2 (namePages) and utf8_isNmstrt2 "
+                     "(nmstrtPages); which one UBSan names depends only on whether the input "
+                     "reaches a name character or a name-start character first, so a list that "
+                     "held only one of them scored the same defect as a MISS. Unreachable until "
+                     "the harness could "
                      "be synthesized for a handle-first API (XML_ParserCreate -> XML_Parse -> "
                      "XML_ParserFree) AND the build stopped resolving XML_Parse from -lexpat, "
                      "which had the campaign fuzzing Debian's copy of the library"},
@@ -228,6 +240,12 @@ class LibResult:
     unexpected: list = field(default_factory=list)
     #: Reach-tier defects this run did not demonstrate. Printed, not failed.
     watch: list = field(default_factory=list)
+    #: Errors the run absorbed on purpose. This benchmark scores WHAT WAS FOUND against ground
+    #: truth, so the interesting correlation is a miss next to a rise here: a library that went
+    #: from 6 demonstrated to 3 while absorbing twice as much did not get harder, our plumbing
+    #: got worse. Reported, never gated -- a real library legitimately absorbs some.
+    absorbed: int = 0
+    absorbed_sites: int = 0
     problems: list = field(default_factory=list)
     kept: str = ""
 
@@ -309,6 +327,8 @@ def score_library(name: str, spec: dict, ev: Evidence) -> LibResult:
     r.doors, r.doors_planned = ev.doors_built, ev.doors_planned
     r.execs, r.crashes, r.level = ev.execs, ev.n_crashes, ev.verified_level
     r.search = ev.search_seconds(ENGINES)
+    _ab = (ev.scorecard or {}).get("absorbed") or {}
+    r.absorbed, r.absorbed_sites = int(_ab.get("total") or 0), int(_ab.get("sites") or 0)
 
     # --- is this run scoreable at all? Two ways it is not.
     starved = unscoreable(ev.src, r.search, ev.budget, r.crashes)
@@ -431,6 +451,13 @@ def main(argv=None) -> int:
                          "slice of wall clock")
     ap.add_argument("--json", help="write the scoreboard here")
     a = ap.parse_args(argv)
+    # These harnesses are diagnostic instruments, so their diagnostics have to be readable. With
+    # nothing configured, a `_log.warning` from inside the engine reaches stderr through
+    # `logging.lastResort` -- no timestamp, no module, no line -- which is how a gate run prints
+    # "run <uuid> is past its deadline" with no indication of which stage said it. `LYKOS_LOG`
+    # still selects the level, so the default stays quiet.
+    observe.configure()
+
     set_max_entry_points(a.max_entry_points)
 
     names = a.only.split(",") if a.only else list(GROUND_TRUTH)
@@ -458,9 +485,9 @@ def main(argv=None) -> int:
                   f"{(u['sites'] or ['no site'])[0]}")
 
     print("\n" + "=" * 100)
-    print(f"{'LIBRARY':<16}{'DOORS':<8}{'EXECS':>12}{'SRCH':>7}{'CR':>4}{'L':>3}  "
+    print(f"{'LIBRARY':<16}{'DOORS':<8}{'EXECS':>12}{'SRCH':>7}{'CR':>4}{'L':>3}{'ABS':>7}  "
           f"{'DEFECTS':<16}VERDICT")
-    print("-" * 100)
+    print("-" * 108)
     want = got = reach_want = reach_got = 0
     for r in rows:
         shown = [d for d in r.defects if d.verdict != "XFAIL" and d.tier == "anchor"]
@@ -473,9 +500,10 @@ def main(argv=None) -> int:
         tally = f"{dem}/{len(shown)} demo" if shown else "clean control"
         if reach:
             tally += f" +{sum(1 for d in reach if d.verdict == 'DEMONSTRATED')}/{len(reach)}"
+        _abs = (f"{r.absorbed}/{r.absorbed_sites}" if r.absorbed else "-")
         print(f"{r.name:<16}{f'{r.doors}/{r.doors_planned}':<8}{r.execs:>12,}{r.search:>7.0f}"
-              f"{r.crashes:>4}{r.level:>3}  {tally:<16}{r.verdict}")
-    print("-" * 100)
+              f"{r.crashes:>4}{r.level:>3}{_abs:>7}  {tally:<16}{r.verdict}")
+    print("-" * 108)
     print(f"REAL-CORPUS SCORE: {got}/{want} anchor defects DEMONSTRATED on "
           f"{len(rows)} librar{'y' if len(rows) == 1 else 'ies'}"
           + (f", {reach_got}/{reach_want} of the reach-tier defects (budget-dependent, "

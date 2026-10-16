@@ -135,6 +135,16 @@ def _target_html(t: dict) -> str:
         # arch/bits/endianness are placeholders triage fills for a substrate that has no
         # processor; printing "jvm/64 big" describes nothing and reads like a CPU.
         rows.append(("Runtime", rt.get("label")))
+    # Immediately after the hashes, because it is what qualifies them: this row says the
+    # offsets below belong to a DIFFERENT image from the SHA-256 above. See
+    # `model._exploited_build`.
+    xb = t.get("exploited_build") or {}
+    if xb.get("build") and xb["build"] != "ingested":
+        rows.append(("Exploited build",
+                     f'{xb["build"]} build of the same source'
+                     + (f' ({xb["bytes"]} bytes)' if xb.get("bytes") else "")
+                     + " — the offsets in the findings below are against THIS image, not the "
+                       "SHA-256 above"))
     cov = t.get("fuzz_coverage")
     if cov:
         cov_txt = (f'{cov.get("pct")}% of blocks ({cov.get("blocks_hit")}/{cov.get("blocks_known")})'
@@ -176,6 +186,26 @@ def _target_html(t: dict) -> str:
     bg = ex.get("budget") or {}
     if bg.get("total"):
         rows.append(("Time budget", f'{bg.get("elapsed", 0):g}s of {bg["total"]:g}s used'))
+    _adv = bg.get("advice") or {}
+    if _adv.get("note"):
+        rows.append(("Execution rate", esc(_adv["note"])))
+    # Errors the run absorbed on purpose. The card already separates "ran and found nothing" from
+    # "never ran"; this is the third reading it could not express -- "ran, and steps inside it
+    # failed quietly" -- and a reader weighing a null result needs it. Nothing absorbed is the
+    # claim worth printing: it says the thin result is the target's doing, not ours.
+    if ex.get("settled") is False:
+        rows.append(("Incomplete", "a stage was still finishing when this card was built — the "
+                                   "counts above are a floor, not a total"))
+    ab = ex.get("absorbed") or {}
+    if ab:
+        n, sites = ab.get("total") or 0, ab.get("sites") or 0
+        if n:
+            top = "; ".join(f'{r.get("count")}x {r.get("site")}' for r in (ab.get("top") or [])[:3])
+            rows.append(("Absorbed errors",
+                         esc(f"{n} best-effort step(s) failed quietly at {sites} site(s)"
+                             + (f" — {top}" if top else ""))))
+        else:
+            rows.append(("Absorbed errors", "none — no step failed quietly in this run"))
     p.append(_kv(rows))
     skipped = ex.get("stages_skipped_for_budget") or []
     never_ran = (base is not None and not base.get("ran"))

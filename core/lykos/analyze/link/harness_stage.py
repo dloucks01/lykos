@@ -9,13 +9,17 @@ A crash becomes a Confirmed finding whose evidence records the boundary it enter
 from __future__ import annotations
 
 import base64
+import logging
 import random
 
+from ... import observe
 from ...db.dao import ComponentEdgeDAO, StringDAO, TargetDAO
 from ...jobs.registry import register_stage
 from ..fuzz import structure
 from ..fuzz.stage import _mine_dictionary, _recovered_blocks, fuzz_campaign
 from .harness import DRIVABLE, ChannelSession, channel_run
+
+_log = logging.getLogger(__name__)
 
 BOUNDARY_STAGE = "boundary_fuzz"
 TOOL = "lykos-harness"
@@ -45,6 +49,7 @@ def _discovered_argv(ctx, target, key=None):
         found = discover(rows)
         argv = propose_argv(found)
     except Exception:
+        observe.absorbed(_log, "answering empty")
         return []
     host, port = _hostport_of(key)
     kinds = {f["flag"]: f.get("kind") for f in found.get("flags") or []}

@@ -7,6 +7,7 @@ absent the disassemble stage fails with a clear message and Phase-0 triage still
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -14,6 +15,10 @@ import tempfile
 from glob import glob
 from pathlib import Path
 from typing import Optional
+
+from .. import observe
+
+_log = logging.getLogger(__name__)
 
 _HEADLESS = "analyzeHeadless"
 _SCRIPT = "ExportAnalysis.java"
@@ -52,6 +57,7 @@ def _materialize_scripts() -> Path:
         from importlib import resources
         data = (resources.files("lykos.analyze.ghidra_scripts") / _SCRIPT).read_bytes()
     except Exception:
+        observe.absorbed(_log, "keeping the default")
         data = (Path(__file__).parent / "ghidra_scripts" / _SCRIPT).read_bytes()
     (d / _SCRIPT).write_bytes(data)
     return d

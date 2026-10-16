@@ -12,6 +12,7 @@ future isolated path (doc 17.3). Native-arch (or per-arch qemu-user) only.
 """
 from __future__ import annotations
 
+import logging
 import os
 import socket
 import subprocess
@@ -20,7 +21,10 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
+from ... import observe
 from ..dynamic import sandbox
+
+_log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -144,7 +148,7 @@ def _run_once(*, emu, services, entry, channel, entry_input, timeout, readiness,
             try:
                 p.wait(timeout=2)
             except Exception:
-                pass
+                observe.absorbed(_log, "continuing")
 
     outcomes = []
     for comp, p in procs:

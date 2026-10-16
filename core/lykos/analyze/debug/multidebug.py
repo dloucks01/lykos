@@ -10,16 +10,20 @@ unsupported when GDB is absent or the target is cross-arch.
 from __future__ import annotations
 
 import json
+import logging
 import os
 
-from ...db.dao import CallEdgeDAO, DynResultDAO, FindingDAO, FunctionDAO, TargetDAO
+from ... import observe
+from ...db.dao import CallEdgeDAO, FindingDAO, FunctionDAO, TargetDAO
 from ...jobs.registry import register_stage
 from .. import elf, substrate
 from ..dynamic import sandbox
-from ..dynamic.stage import crash_dedup_key
+from ..dynamic.stage import crash_dedup_key, crash_key_parts
 from ..fuzz.runner import place
 from ..poc.capture import MODES, how_to_feed
 from . import gdb, rootcause
+
+_log = logging.getLogger(__name__)
 
 MULTI_DEBUG_STAGE = "multi_debug"
 TOOL = "lykos-multidebug"
@@ -144,7 +148,7 @@ def multi_debug_stage(ctx) -> dict:
     try:
         elf_entry = elf.parse(exe.read_bytes()).entry
     except Exception:
-        pass                                  # not an ELF, or unreadable: match absolutely
+        observe.absorbed(_log, "continuing")
     rc = rootcause.analyze(cap, functions, call_edges, findings, str(exe),
                            victim.arch or host, fdao.sites_by_target(victim.id), elf_entry)
     v = rc["classification"]
@@ -170,13 +174,14 @@ def multi_debug_stage(ctx) -> dict:
               if report["multiproc"]
               else f"debug: {v['class']} — {rc['summary']}")
     crash_fn = (rc["slice"].get("crash_function") or {})
-    _fault_pc = (DynResultDAO(ctx.conn).fault_pc_for(victim.id, input_sha)
-                 if input_sha else None)
+    # The discriminator is part of that key: without it this merged into `SIGABRT` rather than
+    # into the per-defect finding, which is the opposite of what the comment below promises.
+    _fault_pc, _disc, _ = crash_key_parts(ctx.conn, victim.id, input_sha)
     # Keyed by the CRASH's dedup key, so this MERGES into the finding the fuzzer/PoC stages
     # already filed. Not marked `authoritative`, so `upsert` leaves the discoverer's detector
     # alone -- this stage adds its cross-process evidence without re-crediting the defect to
     # itself. (The local lookup that used to do this here is gone: one rule, in upsert.)
-    _key = crash_dedup_key(cap["signal_name"], _fault_pc)
+    _key = crash_dedup_key(cap["signal_name"], _fault_pc, _disc)
     fdao.upsert(victim.id, victim.case_id, {
         "cwe": v["cwe"], "title": f"Root cause ({relation}): {v['class']}",
         "severity": v["severity"], "state": "confirmed", "confidence": 0.9,

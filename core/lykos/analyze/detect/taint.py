@@ -17,8 +17,10 @@ the analysis models where attacker bytes GO, not whether the destination is larg
 """
 from __future__ import annotations
 
+import logging
 from collections import defaultdict, deque
 
+from ... import observe
 from .catalog import (
     DANGEROUS,
     OUT_PARAM_SOURCES,
@@ -26,6 +28,8 @@ from .catalog import (
     SOURCES,
     normalize,
 )
+
+_log = logging.getLogger(__name__)
 
 # Per-arch calling convention (register NAMES, upper-cased; families cover sub-registers).
 # Per-arch calling convention. "frame" lists the registers that legitimately serve as a
@@ -299,6 +303,7 @@ def _apply(taint, ops, bases=(), aliases=None, mem_out=None, via=None, heap_regi
         try:
             mnem, ins, outk, toks = _parse(pc)
         except Exception:
+            observe.absorbed(_log, "skipping this item")
             continue
 
         if outk is not None and mnem == "COPY" and len(toks) >= 2:
@@ -519,6 +524,7 @@ def _push_taint(ops, taint, base):
         try:
             mnem, _, outk, toks = _parse(pc)
         except Exception:
+            observe.absorbed(_log, "skipping this item")
             continue
         if mnem == "INT_SUB" and outk == ("reg", base) and len(toks) >= 2 \
                 and _key(toks[1]) == ("reg", base):
@@ -710,15 +716,6 @@ def _run(ir, abi, callmap, dstmap, func_addrs, entry_params, ret_tainted, *, ove
     exits = [a for a in order if not by_addr[a].get("succ")] or order
     ret_bool = any(("reg", r) in OUT[a] for a in exits for r in retregs)
     return flagged, ret_bool, contribs
-
-
-def analyze_function(ir, callmap, arch):
-    """Intra-procedural only (kept for direct use/tests)."""
-    ak = _arch_key(arch)
-    if not ak or not _has_abi(ARCH_ABI[ak]):
-        return set()
-    flagged, _, _ = _run(ir, ARCH_ABI[ak], callmap, {}, set(), set(), {})
-    return flagged
 
 
 def analyze_program(func_irs, call_edges, arch, *, entry_seeds=None, mem_out=None,

@@ -53,7 +53,8 @@ def test_js_regex_exec_is_not_command_injection():
     regexy = b"var m = /ab+c/.exec(input); if (rquickExpr.exec(selector)) {} str.exec(x);\n"
     assert not any(f["cwe"] == "CWE-78" for f in S.scan(regexy, "javascript"))
     assert any(f["cwe"] == "CWE-78" for f in S.scan(b"child_process.exec(userInput)\n", "javascript"))
-    assert any(f["cwe"] == "CWE-78" for f in S.scan(b"const {execSync}=require('child_process');execSync(c)\n", "javascript"))
+    js = b"const {execSync}=require('child_process');execSync(c)\n"
+    assert any(f["cwe"] == "CWE-78" for f in S.scan(js, "javascript"))
 
 
 def test_minified_megaline_yields_candidates_not_corroborated():
@@ -96,8 +97,8 @@ def test_language_detection_by_extension_and_shebang():
 
 def test_detect_route_files_scriptscan_findings(store, case):
     from lykos.analyze import register
-    from lykos.analyze.ingest import enqueue_triage, ingest
     from lykos.analyze.detect.stage import DETECT_STAGE
+    from lykos.analyze.ingest import enqueue_triage, ingest
     from lykos.db.dao import FindingDAO
     from lykos.jobs import JobConfig, JobQueue, WorkerPool
 

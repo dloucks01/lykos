@@ -16,6 +16,19 @@ from __future__ import annotations
 
 import re
 
+# ---------------------------------------------------------------------------------- absorbed
+# This tracer runs as a standalone script: the parent copies it into a scratch dir and runs it
+# with `python3 heaptrace.py spec.json report.json`, so `lykos.observe` is not importable. A
+# step skipped quietly here is exactly what turns a real use-after-free into "no heap error
+# observed", so absorbed steps ride home in report.json and the parent folds them in.
+_ABSORBED: list = []
+
+
+def _absorbed(what):
+    exc = sys.exc_info()[1]
+    _ABSORBED.append({"what": what, "exc": repr(exc)[:200]})
+
+
 # ---------------------------------------------------------------- allocator identification (pure)
 _ALLOC_RE = re.compile(r"(?:^|_)(?:m|c|re|x|z)?alloc(?:_\w+)?$|(?:^|_)new(?:_\w+)?$|alloc(?:ate)?$",
                        re.I)
@@ -153,7 +166,8 @@ if __name__ == "__main__":                                            # ---- the
             "gs_base", "ds", "es", "fs", "gs")]
 
     def main() -> int:
-        spec = json.load(open(sys.argv[1]))
+        with open(sys.argv[1]) as _f:
+            spec = json.load(_f)
         exe = spec["exe"]
         stdin_bytes = bytes.fromhex(spec.get("stdin", ""))
         # alloc/free tracking is optional: with neither, the tracer runs in pure OOB-index mode
@@ -206,7 +220,7 @@ if __name__ == "__main__":                                            # ---- the
                 if cur != -1:
                     libc.personality(cur | 0x0040000)    # ADDR_NO_RANDOMIZE
             except Exception:
-                pass
+                _absorbed("continuing")
             libc.ptrace(PTRACE_TRACEME, 0, None, None)
             try:
                 os.execv(exe, [exe])
@@ -287,14 +301,15 @@ if __name__ == "__main__":                                            # ---- the
             the target's OWN code, so a libc mem* the allocator calls is not read as a program UAF."""
             base = code_end = 0
             name = exe.split("/")[-1]
-            for line in open(f"/proc/{pid}/maps"):
-                if name not in line and exe not in line:
-                    continue
-                a, b = line.split()[0].split("-")
-                if base == 0:
-                    base = int(a, 16)
-                if "x" in line.split()[1]:               # executable segment of the exe
-                    code_end = max(code_end, int(b, 16))
+            with open(f"/proc/{pid}/maps") as _maps:
+                for line in _maps:
+                    if name not in line and exe not in line:
+                        continue
+                    a, b = line.split()[0].split("-")
+                    if base == 0:
+                        base = int(a, 16)
+                    if "x" in line.split()[1]:               # executable segment of the exe
+                        code_end = max(code_end, int(b, 16))
             return base, (code_end or (base + (1 << 24)))
 
         base, code_end = load_base()
@@ -497,7 +512,7 @@ if __name__ == "__main__":                                            # ---- the
                         try:
                             classify_fault(_sig)
                         except Exception:
-                            pass
+                            _absorbed("continuing")
                     # deliver the signal (e.g. the target's own SIGSEGV) and continue
                     libc.ptrace(PTRACE_CONT, pid, None, ctypes.c_void_p(_sig))
                     continue
@@ -643,7 +658,7 @@ if __name__ == "__main__":                                            # ---- the
                 if pending_reclaim and marker:
                     check_reclaims()
             except Exception:
-                pass
+                _absorbed("continuing")
             signal.alarm(0)
             try:
                 os.kill(pid, signal.SIGKILL)
@@ -651,49 +666,54 @@ if __name__ == "__main__":                                            # ---- the
             except OSError:
                 pass
 
-        json.dump({"events": events,
-                   # Where the image landed. ASLR is off in this tracer, so it is deterministic
-                   # -- and the stage needs it to put a real code address in a reclaim payload.
-                   "load_base": hex(rebase),
-                   # Both halves of a use-after-free, reported separately because they are
-                   # different observations: the program USED a dead chunk, and a dead chunk was
-                   # handed back out to a later allocation.
-                   "reclaim": any(e.get("event") == "reclaim" for e in events),
-                   "reclaims": [e for e in events if e.get("event") == "reclaim"][:16],
-                   # The chunk came back AND the attacker's bytes are in it -- the half the
-                   # tracer could not show before, and the only reclaim evidence available on a
-                   # target with no printing path. `marker_before_free` disqualifies an
-                   # observation, so it travels with it rather than being filtered out here.
-                   "reclaim_controlled": [e for e in events
-                                          if e.get("event") == "reclaim-controlled"][:16],
-                   # The program READ the attacker's bytes out of the reclaimed chunk. The chunk
-                   # coming back is one fact, the bytes being the attacker's is a second, and
-                   # this is the third -- the only one that shows a USE.
-                   "reclaim_use": [e for e in events
-                                   if e.get("event") == "reclaim-use"][:16],
-                   # ...and what the program DID with them. `kind` is "control-flow-hijack" when
-                   # the pc became our bytes, "dereference" when the faulting address did, and
-                   # "fault" when neither -- a consequence observed, never inferred.
-                   "reclaim_effect": [e for e in events
-                                      if e.get("event") == "reclaim-effect"][:8],
-                   # The chosen function was ENTERED. The end of the chain.
-                   "reclaim_exec": [e for e in events
-                                    if e.get("event") == "reclaim-exec"][:8],
-                   "double_free": any(e.get("error") == "double-free" for e in events),
-                   "use_after_free": any(e.get("error") == "use-after-free" for e in events),
-                   "heap_overflow": any(e.get("error") == "heap-overflow" for e in events),
-                   "oob_index": any(e.get("error") == "oob-index" for e in events),
-                   "alloc_addrs": [hex(a) for a in alloc_addrs],
-                   "alloc_sizes": alloc_sizes},
-                  open(report, "w"))
+        # Explicit close: this driver is killed on timeout, and a handle the GC never reached
+        # leaves the parent a truncated report that it then fails to parse -- silently.
+        with open(report, "w") as _rf:
+            json.dump({"events": events,
+                       # Where the image landed. ASLR is off in this tracer, so it is deterministic
+                       # -- and the stage needs it to put a real code address in a reclaim payload.
+                       "load_base": hex(rebase),
+                       # Both halves of a use-after-free, reported separately because they are
+                       # different observations: the program USED a dead chunk, and a dead chunk was
+                       # handed back out to a later allocation.
+                       "reclaim": any(e.get("event") == "reclaim" for e in events),
+                       "reclaims": [e for e in events if e.get("event") == "reclaim"][:16],
+                       # The chunk came back AND the attacker's bytes are in it -- the half the
+                       # tracer could not show before, and the only reclaim evidence available on a
+                       # target with no printing path. `marker_before_free` disqualifies an
+                       # observation, so it travels with it rather than being filtered out here.
+                       "reclaim_controlled": [e for e in events
+                                              if e.get("event") == "reclaim-controlled"][:16],
+                       # The program READ the attacker's bytes out of the reclaimed chunk. The chunk
+                       # coming back is one fact, the bytes being the attacker's is a second, and
+                       # this is the third -- the only one that shows a USE.
+                       "reclaim_use": [e for e in events
+                                       if e.get("event") == "reclaim-use"][:16],
+                       # ...and what the program DID with them. `kind` is "control-flow-hijack" when
+                       # the pc became our bytes, "dereference" when the faulting address did, and
+                       # "fault" when neither -- a consequence observed, never inferred.
+                       "reclaim_effect": [e for e in events
+                                          if e.get("event") == "reclaim-effect"][:8],
+                       # The chosen function was ENTERED. The end of the chain.
+                       "reclaim_exec": [e for e in events
+                                        if e.get("event") == "reclaim-exec"][:8],
+                       "double_free": any(e.get("error") == "double-free" for e in events),
+                       "use_after_free": any(e.get("error") == "use-after-free" for e in events),
+                       "heap_overflow": any(e.get("error") == "heap-overflow" for e in events),
+                       "oob_index": any(e.get("error") == "oob-index" for e in events),
+                       "alloc_addrs": [hex(a) for a in alloc_addrs],
+                       "alloc_sizes": alloc_sizes,
+                       "absorbed": _ABSORBED},
+                      _rf)
         return 0
 
     try:
         sys.exit(main())
     except Exception as e:                               # noqa: BLE001 -- helper: report, don't crash
         try:
-            json.dump({"events": [], "error": repr(e), "double_free": False},
-                      open(sys.argv[2] if len(sys.argv) > 2 else "/dev/null", "w"))
+            with open(sys.argv[2] if len(sys.argv) > 2 else "/dev/null", "w") as _ef:
+                json.dump({"events": [], "error": repr(e), "double_free": False,
+                           "absorbed": _ABSORBED}, _ef)
         except Exception:
-            pass
+            _absorbed("continuing")
         sys.exit(1)

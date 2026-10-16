@@ -19,12 +19,17 @@ path, so they can't yet be told apart from a target's real persistence write.
 """
 from __future__ import annotations
 
+import logging
 import os
 import re
 import shutil
 import struct
 import subprocess
 import tempfile
+
+from ... import observe
+
+_log = logging.getLogger(__name__)
 
 # api name -> behavior category. v1 traces the categories that attribute *cleanly* to the target
 # under Wine (TID + ret-range). Registry writes and file I/O are deliberately NOT here: Wine's
@@ -104,7 +109,8 @@ def _pe_image_range(exe):
     """Static (ImageBase, end) from the PE headers -- the fallback when +module didn't log a
     runtime range (e.g. no relocation, base honoured)."""
     try:
-        d = open(exe, "rb").read(4096)
+        with open(exe, "rb") as _f:
+            d = _f.read(4096)
         e = struct.unpack_from("<I", d, 0x3C)[0]
         if d[e:e + 4] != b"PE\x00\x00":
             return None
@@ -117,6 +123,7 @@ def _pe_image_range(exe):
         size = struct.unpack_from("<I", d, opt + 56)[0]
         return base, base + size
     except Exception:
+        observe.absorbed(_log, "answering None")
         return None
 
 

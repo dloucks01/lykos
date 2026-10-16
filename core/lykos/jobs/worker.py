@@ -20,12 +20,14 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Callable, Optional
 
+from .. import observe
 from ..casestore import ContentStore
 from ..db.connection import connect
+from ..db.models import AnalysisRun
 from .config import JobConfig
 from .context import JobContext, StageCancelled, StageTimeout
 from .queue import JobQueue
-from .registry import get_stage, validate_params
+from .registry import StageDef, get_stage, validate_params
 
 _log = logging.getLogger("lykos.jobs.worker")
 
@@ -56,21 +58,31 @@ class _Active:
     """What a worker is currently running: its slot and the HARD deadline past which it is judged
     wedged (a non-cooperative in-process call the heartbeat/cancel cannot interrupt)."""
 
-    __slots__ = ("slot", "hard_deadline")
+    __slots__ = ("slot", "hard_deadline", "stage", "run_id")
 
-    def __init__(self, slot: _Slot, hard_deadline: Optional[float]) -> None:
+    def __init__(self, slot: _Slot, hard_deadline: Optional[float], stage: str = "?",
+                 run_id: str = "?") -> None:
         self.slot = slot
         self.hard_deadline = hard_deadline
+        # So the supervisor can say WHICH stage wedged. It could only say "worker-2", and a
+        # worker index is not a diagnosis -- the stage is the thing you go and fix.
+        self.stage = stage
+        self.run_id = run_id
 
 
 class _Heartbeat(threading.Thread):
     """Periodically extends a running job's lease from its OWN connection."""
 
     def __init__(self, db_path: Path, run_id: str, worker_id: str, cfg: JobConfig,
-                 deadline: Optional[float] = None):
+                 deadline: Optional[float] = None, stage: str = "?"):
         super().__init__(daemon=True)
         self._db, self._run, self._wid, self._cfg = db_path, run_id, worker_id, cfg
         self._deadline = deadline
+        # The STAGE, so the two messages below can say what wedged. They named the run's uuid,
+        # which answers nothing: the question a reader has is "which stage hangs on this target",
+        # and finding out meant going to the database with the uuid in hand. A real-corpus run
+        # printed `run c7bbd521... is past its deadline` and that was the entire diagnosis.
+        self._stage = stage
         self._stop = threading.Event()
 
     def run(self) -> None:
@@ -88,13 +100,14 @@ class _Heartbeat(threading.Thread):
                 # the lease lapse lets reap() mark it failed/requeue so the case moves on; when the
                 # stuck stage finally returns, complete() sees the lease lost and discards.
                 if self._deadline is not None and time.time() > self._deadline:
-                    _log.warning("run %s is past its deadline and unresponsive; letting its lease "
-                                 "lapse so the reaper can reclaim it", self._run)
+                    _log.warning("stage %s (run %s) is past its deadline and unresponsive; "
+                                 "letting its lease lapse so the reaper can reclaim it",
+                                 self._stage, self._run)
                     return
                 try:
                     if q.is_cancel_requested(self._run):
-                        _log.info("run %s cancel-requested but unresponsive; letting its lease "
-                                  "lapse for the reaper", self._run)
+                        _log.info("stage %s (run %s) cancel-requested but unresponsive; letting "
+                                  "its lease lapse for the reaper", self._stage, self._run)
                         return
                     q.heartbeat(self._run, self._wid, self._cfg.lease_seconds)
                 except Exception:
@@ -115,7 +128,7 @@ class _Heartbeat(threading.Thread):
         self._stop.set()
 
 
-def _run_timeout(run, sd, cfg):
+def _run_timeout(run: AnalysisRun, sd: StageDef, cfg: JobConfig) -> float | None:
     """This run's deadline: the budget its CALLER gave it, else the stage's own default.
 
     A stage's registered timeout is a safety net sized for the worst case it might legitimately
@@ -163,7 +176,7 @@ _SLICE_NOTE = "the budget slice ended while the stage was still working"
 _SLICE_USED = 0.8
 
 
-def _slice_expired(run, started: float) -> bool:
+def _slice_expired(run: AnalysisRun, started: float) -> bool:
     """Did this run stop because the budget slice it was given ran out?
 
     True only when a slice was given AND the stage actually used (nearly) all of it. Without the
@@ -177,7 +190,7 @@ def _slice_expired(run, started: float) -> bool:
     return want > 0 and (time.time() - started) >= want * _SLICE_USED
 
 
-def _beat_wait(cfg, *, failed: bool) -> float:
+def _beat_wait(cfg: JobConfig, *, failed: bool) -> float:
     """How long to wait before the next heartbeat attempt.
 
     Spelled out as a function so the decision can be tested without timing a thread: after a
@@ -314,11 +327,12 @@ class WorkerPool:
         # Register this execution so the supervisor can reclaim the slot if the stage wedges. Only
         # a stage WITH a deadline gets a hard deadline; an intentionally-unbounded stage does not.
         hard = (deadline + self.cfg.wedge_grace) if deadline else None
-        active = _Active(slot, hard)
+        active = _Active(slot, hard, stage=run.stage, run_id=run_id)
         with self._alock:
             self._active[idx] = active
         ctx = JobContext(q.conn, self.content, run, deadline=deadline, on_event=self.on_event)
-        hb = _Heartbeat(self.db_path, run_id, wid, self.cfg, deadline=deadline)
+        hb = _Heartbeat(self.db_path, run_id, wid, self.cfg, deadline=deadline,
+                        stage=run.stage)
         hb.start()
         started = time.time()
         try:
@@ -404,9 +418,10 @@ class WorkerPool:
                                 and now > act.hard_deadline:
                             if act.slot.release():
                                 self._bump("wedged_reclaimed")
-                                _log.error("worker-%d wedged past its hard deadline; reclaimed its "
-                                           "concurrency slot and spawned a replacement (the stuck "
-                                           "thread is abandoned)", i)
+                                _log.error("worker-%d wedged in stage %s (run %s) past its hard "
+                                           "deadline; reclaimed its concurrency slot and spawned "
+                                           "a replacement (the stuck thread is abandoned)",
+                                           i, act.stage, act.run_id)
                             with self._alock:
                                 if self._active.get(i) is act:
                                     self._active.pop(i, None)
@@ -443,5 +458,6 @@ def _mem_available_mb() -> Optional[int]:
             if line.startswith("MemAvailable:"):
                 return int(line.split()[1]) // 1024
     except Exception:
+        observe.absorbed(_log, "answering None")
         return None
     return None

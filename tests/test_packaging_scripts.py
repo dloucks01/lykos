@@ -342,8 +342,8 @@ def test_web_ui_runtime_is_not_git_ignored(rel):
 def test_web_ui_runtime_ships_via_git_archive():
     """End-to-end: the files the import map references must actually be inside a git archive of
     the working tree -- the exact mechanism make-runnable uses to assemble the package."""
-    import tempfile
     import os
+    import tempfile
     with tempfile.TemporaryDirectory() as td:
         idx = os.path.join(td, "index")
         env = {**os.environ, "GIT_INDEX_FILE": idx}

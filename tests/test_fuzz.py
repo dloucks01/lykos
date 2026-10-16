@@ -205,7 +205,8 @@ def test_load_external_seeds_from_files_and_dir(tmp_path):
     crashing sample could be seeded this way. base64 `seeds` still works; bad/oversized entries
     are skipped, never fatal."""
     import base64
-    from lykos.analyze.fuzz.stage import _load_external_seeds, _MAX_SEED_BYTES
+
+    from lykos.analyze.fuzz.stage import _MAX_SEED_BYTES, _load_external_seeds
 
     f1 = tmp_path / "a.conf"; f1.write_bytes(b"key=value\n")
     sd = tmp_path / "corpus"; sd.mkdir()

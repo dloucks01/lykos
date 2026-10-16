@@ -22,8 +22,8 @@ import signal
 import socket
 import subprocess
 import time
-from pathlib import Path
 
+from ... import observe
 from ..detect.catalog import normalize
 from ..dynamic import sandbox
 from .mutator import Mutator
@@ -188,7 +188,7 @@ def _killtree(proc) -> None:
     try:
         proc.wait(timeout=2)
     except Exception:
-        pass
+        observe.absorbed(_log, "continuing")
 
 
 def _default_corpus() -> list:

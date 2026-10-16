@@ -6,18 +6,22 @@ via qemu-user's gdbstub."""
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import sys
 
-from ...db.dao import CallEdgeDAO, DynResultDAO, FindingDAO, FunctionDAO, TargetDAO
+from ... import observe
+from ...db.dao import CallEdgeDAO, FindingDAO, FunctionDAO, TargetDAO
 from ...jobs.registry import register_stage
 from .. import elf, substrate
 from ..dynamic import sandbox
-from ..dynamic.stage import crash_dedup_key
+from ..dynamic.stage import crash_dedup_key, crash_key_parts
 from ..fuzz.runner import place
 from ..poc.capture import MODES, how_to_feed, make_capture, make_qemu_capture, materialize_helper
 from . import gdb, qemu_gdb, rootcause
+
+_log = logging.getLogger(__name__)
 
 ROOT_CAUSE_STAGE = "root_cause"
 TOOL = "rootcause"
@@ -356,7 +360,7 @@ def root_cause_stage(ctx) -> dict:
         try:
             elf_entry = elf.parse(target_bytes).entry
         except Exception:
-            pass                                  # not an ELF, or unreadable: match absolutely
+            observe.absorbed(_log, "continuing")
         report = rootcause.analyze(cap, functions, call_edges, findings,
                                    str(exe), target.arch or host, sites_by_finding, elf_entry)
         report["backend"] = backend
@@ -373,6 +377,7 @@ def root_cause_stage(ctx) -> dict:
                                               ctx.scratch(), timeout, target)
                 parsed = rootcause.parse_asan_report(asan_text)
             except Exception:
+                observe.absorbed(_log, "keeping the default")
                 parsed = None
             if parsed:
                 report["classification"] = parsed
@@ -402,6 +407,7 @@ def root_cause_stage(ctx) -> dict:
                 vg = memoracle.valgrind_triage(exe, input_bytes, mode=mode, base_argv=base_argv,
                                                timeout=min(120.0, max(30.0, timeout * 12)))
             except Exception:
+                observe.absorbed(_log, "keeping the default")
                 vg = None
             if vg:
                 klass = _VG_ASAN.get(vg["kind"], vg["kind"])
@@ -440,8 +446,15 @@ def root_cause_stage(ctx) -> dict:
         crash_fn = (report["slice"].get("crash_function") or {})
         fdao = FindingDAO(ctx.conn)
         # from the run that FOUND the input, not from this capture, so every stage that files
-        # a crash finding derives the same key and they merge instead of multiplying
-        _fault_pc = DynResultDAO(ctx.conn).fault_pc_for(target.id, input_sha)
+        # a crash finding derives the same key and they merge instead of multiplying.
+        #
+        # THE DISCRIMINATOR IS PART OF THAT KEY, and this read only half of it. The fuzz stage
+        # keys a sanitizer abort per defect (`SIGABRT:heap-buffer-overflow@f.c:46`) while this
+        # keyed it by the signal alone -- so the comment above was describing an invariant this
+        # line broke: the two landed in DIFFERENT buckets, root_cause opened a finding of its own
+        # instead of classifying the crash finding, and every sanitizer-aborting defect on the
+        # target merged into that one. See `crash_key_parts`.
+        _fault_pc, _disc, _ = crash_key_parts(ctx.conn, target.id, input_sha)
         fdao.upsert(target.id, target.case_id, {
             "cwe": v["cwe"], "title": f"{eff_title}: {v['class']}",
             "severity": v["severity"],
@@ -451,7 +464,7 @@ def root_cause_stage(ctx) -> dict:
             # that found the input, not from this capture, so every stage derives the same key.
             "site_addr": _hex(crash_fn.get("static_addr")),
             "function_addr": crash_fn.get("func_addr"),
-            "dedup_key": crash_dedup_key(cap["signal_name"], _fault_pc),
+            "dedup_key": crash_dedup_key(cap["signal_name"], _fault_pc, _disc),
             # root_cause is the authoritative classifier: its specific class (from the debugger,
             # and on a sanitizer build from ASan's own report) replaces the generic signal-derived
             # class the fuzz/dynamic stage first filed the crash under.

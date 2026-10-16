@@ -14,6 +14,7 @@ primitive.recover_ip_offset: {pc, sp, regs, signal, signal_name, arch, isolation
 """
 from __future__ import annotations
 
+import logging
 import os
 import re
 import signal as _signal
@@ -22,7 +23,10 @@ import subprocess
 import time
 from pathlib import Path
 
+from ... import observe
 from ..dynamic import sandbox
+
+_log = logging.getLogger(__name__)
 
 _SIGNALS = {4: "SIGILL", 5: "SIGTRAP", 6: "SIGABRT", 7: "SIGBUS", 8: "SIGFPE",
             11: "SIGSEGV"}
@@ -463,13 +467,14 @@ def _kill(proc):
     try:
         os.killpg(os.getpgid(proc.pid), _signal.SIGKILL)
     except Exception:
+        observe.absorbed(_log, "falling back")
         try:
             proc.kill()
         except Exception:
-            pass
+            observe.absorbed(_log, "continuing")
     # Reap it: without a wait() the killed qemu lingers as a zombie and its stdin/stdout/stderr
     # fds leak, accumulating across a root-cause / monitor loop.
     try:
         proc.wait(timeout=5)
     except Exception:
-        pass
+        observe.absorbed(_log, "continuing")

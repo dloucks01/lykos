@@ -94,9 +94,6 @@ def run_gdb(gdb: Path, exe, argv, stdin_file, *, ctx=None, timeout: int = 30) ->
 
 _FORK = re.compile(r"fork to child process (\d+)")
 _EXECED = re.compile(r"is executing new program:\s*(\S+)")
-_CRASH_THREAD = re.compile(r"Thread (\d+)\.\d+[^\n]*received signal")
-
-
 def run_gdb_follow(gdb: Path, exe, argv, stdin_file, *, ctx=None, timeout: int = 30) -> dict:
     """Multi-process capture (doc 17.3): follow fork/exec into spawned children and capture
     the fault of whichever process actually crashes. Adds fork/exec attribution to the

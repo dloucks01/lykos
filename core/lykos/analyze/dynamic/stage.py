@@ -4,18 +4,20 @@ promotes findings past the static ceiling)."""
 from __future__ import annotations
 
 import base64
+import logging
 import os
 
+from ... import observe
 from ...db.dao import DynResultDAO, FindingDAO, TargetDAO
 from ...jobs.registry import register_stage
 from ..fuzz.runner import place
 from . import sandbox
 
+_log = logging.getLogger(__name__)
+
 DYNAMIC_STAGE = "dynamic_run"
 TOOL = "sandbox"
 TOOL_VERSION = "sandbox-1"
-_MARGIN = 30
-
 # Isolation labels sandbox.run() returns when the target NEVER EXECUTED (no qemu for the arch,
 # no wine/JVM, a PE that could not be launched). A non-crash from one of these is "could not
 # run", not "ran and exited cleanly" -- absence of evidence is not evidence of absence.
@@ -61,7 +63,7 @@ _SIG_CWE = {
 _SIGNAL_ONLY_BUCKET = frozenset({"SIGABRT"})
 
 
-def asan_defect_key(stderr) -> Optional[str]:
+def asan_defect_key(stderr) -> str | None:
     """A stable per-defect discriminator for a SANITIZER SIGABRT: the ASan/UBSan class + source
     basename (e.g. "heap-use-after-free@parser.c:88"). Returns None for a plain glibc abort with no
     sanitizer report -- which keeps the signal-only bucket, so a double free's dozens of identical
@@ -75,6 +77,7 @@ def asan_defect_key(stderr) -> Optional[str]:
                 if isinstance(stderr, (bytes, bytearray)) else str(stderr))
         rep = parse_asan_report(text)
     except Exception:
+        observe.absorbed(_log, "answering None")
         return None
     if not rep:
         return None
@@ -126,6 +129,7 @@ def recovered_code_span(conn, target_id):
     try:
         fns = FunctionDAO(conn).list_by_target(target_id)
     except Exception:
+        observe.absorbed(_log, "answering None")
         return None
     for f in fns:
         a = _pc_addr(getattr(f, "addr", None))
@@ -167,6 +171,34 @@ def find_crash_finding(conn, target_id, signal_name, input_sha=None):
     return (fd.id_for_dedup(target_id, crash_dedup_key(signal_name, pc, disc, hijack=hijack))
             if (pc or disc or hijack) else None) \
         or fd.id_for_dedup(target_id, crash_dedup_key(signal_name))
+
+
+def crash_key_parts(conn, target_id, input_sha):
+    """`(fault_pc, defect_key, hijack)` -- the three things `crash_dedup_key` needs, read from
+    the CRASH itself rather than from whichever stage happens to be filing.
+
+    Exists because four stages each assembled two of the three. Every one looked up
+    `fault_pc_for` and called `crash_hijack`, and not one looked up `defect_key_for`, so each
+    finding they filed for a SANITIZER abort landed in the signal-only bucket
+    `dynamic-crash:SIGABRT`. That bucket matches none of the per-defect buckets the fuzz stage
+    files, so rather than PROMOTING the crash finding it opened a new one -- and then every
+    sanitizer-aborting defect on the target merged into that one.
+
+    Measured on a program with four demonstrated defects (heap over-read at :46, stack over-read
+    at :22, stack overflow at :21, uninitialised disclosure at :30): the fuzz stage filed three
+    correctly separated findings and the primitive stage filed a fourth holding ALL FOUR defects'
+    evidence -- 20 entries, titled after whichever verdict ran last, carrying a CWE from a
+    different defect than its title. `crash_dedup_key`'s own docstring says every stage that
+    files one must agree; this is how they agree.
+
+    The discriminator is what separates two sanitizer defects that both abort. For a plain signal
+    it is None and the key is unchanged.
+    """
+    from ...db.dao import DynResultDAO
+    dd = DynResultDAO(conn)
+    pc = dd.fault_pc_for(target_id, input_sha) if input_sha else None
+    disc = dd.defect_key_for(target_id, input_sha) if input_sha else None
+    return pc, disc, is_hijack_pc(pc, recovered_code_span(conn, target_id))
 
 
 def crash_finding_candidate(signal_name, input_sha, isolation, detector, extra="",

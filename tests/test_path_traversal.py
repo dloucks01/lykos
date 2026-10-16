@@ -4,17 +4,16 @@ promoted to a corroborated CWE-22 only when the taint channel proves the path ar
 untrusted input. Previously CWE-22 existed only on the JVM path; this brings it to native/ELF."""
 from __future__ import annotations
 
-import subprocess
 import types
 
 import pytest
 from lykos.analyze import register
-from lykos.analyze.detect.detectors import DetectContext, dangerous_api
-from lykos.analyze.detect.catalog import DANGEROUS, SINK_TAINT_ARGS, normalize
-from lykos.analyze.dynamic import sandbox
-from lykos.analyze.ingest import ingest, enqueue_triage
-from lykos.analyze.disassemble import enqueue_disassemble
 from lykos.analyze.detect import enqueue_detect
+from lykos.analyze.detect.catalog import DANGEROUS, SINK_TAINT_ARGS
+from lykos.analyze.detect.detectors import DetectContext, dangerous_api
+from lykos.analyze.disassemble import enqueue_disassemble
+from lykos.analyze.dynamic import sandbox
+from lykos.analyze.ingest import enqueue_triage, ingest
 from lykos.jobs import JobConfig, JobQueue, WorkerPool
 
 

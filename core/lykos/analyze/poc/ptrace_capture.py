@@ -19,6 +19,22 @@ import signal
 import struct
 import sys
 
+# ---------------------------------------------------------------------------------- absorbed
+# This driver runs as a standalone script under a different interpreter (the parent copies it to
+# a scratch dir), so `lykos.observe` is not importable here. The counter still has to reach the
+# parent, because a silently-skipped step in a tracer is exactly what turns a real crash into
+# "no crash observed" -- so absorbed steps ride home in the JSON result and the parent folds
+# them into its own counter. See observe.absorbed_remote.
+_ABSORBED: list = []
+
+
+def _absorbed(what):
+    """Record a deliberately-absorbed failure, with the live exception's repr."""
+    import sys as _sys
+    exc = _sys.exc_info()[1]
+    _ABSORBED.append({"what": what, "exc": repr(exc)[:200]})
+
+
 PTRACE_TRACEME = 0
 PTRACE_PEEKTEXT = 1
 PTRACE_PEEKDATA = 2
@@ -228,13 +244,13 @@ def capture(exe, argv, stdin_file, timeout, breakpoints=None, env=None):
                 resource.setrlimit(resource.RLIMIT_AS, (lim, lim))
                 resource.setrlimit(resource.RLIMIT_FSIZE, (64 << 20, 64 << 20))
             except Exception:
-                pass
+                _absorbed("continuing")
             try:                                           # deterministic addresses: ASLR off
                 cur = libc.personality(0xffffffff)         # query, then OR in ADDR_NO_RANDOMIZE
                 if cur != -1:
                     libc.personality(cur | 0x0040000)
             except Exception:
-                pass
+                _absorbed("continuing")
             libc.ptrace(PTRACE_TRACEME, 0, 0, 0)
             # argv elements arrive through JSON as latin-1 text (the lossless round-trip
             # for arbitrary bytes). They MUST go back to bytes the same way: os.execv
@@ -253,7 +269,7 @@ def capture(exe, argv, stdin_file, timeout, breakpoints=None, env=None):
                 os.execve(exe, [exe] + [_argv_bytes(a) for a in argv], full)
             os.execv(exe, [exe] + [_argv_bytes(a) for a in argv])
         except Exception:
-            pass
+            _absorbed("continuing")
         os._exit(127)
 
     # ---- parent (tracer) ----
@@ -325,13 +341,15 @@ def capture(exe, argv, stdin_file, timeout, breakpoints=None, env=None):
 
 
 def main(spec_path):
-    spec = json.load(open(spec_path))
+    with open(spec_path) as _f:
+        spec = json.load(_f)
     try:
         res = capture(spec["exe"], spec.get("argv", []), spec.get("stdin_file"),
                       float(spec.get("timeout", 10)), breakpoints=spec.get("breakpoints"),
                       env=spec.get("env"))
     except Exception as e:                             # noqa: BLE001
         res = {"ok": False, "reason": f"{type(e).__name__}: {e}"}
+    res["absorbed"] = _ABSORBED
     sys.stdout.write(json.dumps(res))
     return 0
 

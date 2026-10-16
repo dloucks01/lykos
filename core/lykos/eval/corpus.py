@@ -339,7 +339,8 @@ int main(int c, char**v){ if(c>1){ int n=atoi(v[1]); char*b=malloc(n*4); if(b){ 
 #include <string.h>
 #include <limits.h>
 int main(int c, char**v){ if(c>1){ long n=atol(v[1]);
-  if(n>0 && n < (long)(INT_MAX/4)){ char*b=malloc((size_t)n*4); if(b){ memset(b,0,(size_t)n*4); free(b);} } } return 0; }
+  if(n>0 && n < (long)(INT_MAX/4)){ char*b=malloc((size_t)n*4);
+    if(b){ memset(b,0,(size_t)n*4); free(b);} } } return 0; }
 """, note="multiply guarded against wrap before the allocation"),
 
     # ---- CWE-120 through a heap round-trip (exercises P1.2 region taint): input stored into a

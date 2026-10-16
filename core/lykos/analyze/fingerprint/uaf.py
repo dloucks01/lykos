@@ -40,10 +40,6 @@ _IDENT = r"[A-Za-z_]\w*"
 _FREE = re.compile(rf"\b(?:free|cfree|kfree|kvfree|vfree|vPortFree|pvPortFree|g_free|"
                    rf"OPENSSL_free|CRYPTO_free)\s*\(\s*({_IDENT})\s*\)")
 _DELETE = re.compile(rf"\bdelete\s*(?:\[\s*\])?\s+({_IDENT})\s*;")
-# a reassignment of the pointer (clears the freed state): `p =` but not `==`, `<=`, `>=`, `!=`.
-_WINDOW = 40            # lines after the free to look for a use, within the same function
-
-
 def _assigns(line: str, var: str) -> bool:
     return re.search(rf"(?<![=!<>])\b{re.escape(var)}\s*=(?!=)", line) is not None
 

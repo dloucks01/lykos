@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import re
 import selectors
-import struct
 import subprocess
 import time
 from dataclasses import dataclass
@@ -198,10 +197,10 @@ def _drive(exe, workdir, steps, *, idle=0.2, timeout=8.0):
         o, _ = menu._drain(p, sel, idle=idle, deadline=min(end, time.monotonic() + 2.0))
         out += o.encode("latin1") if isinstance(o, str) else (o or b"")
     finally:
-        try:
-            p.kill()
-        except Exception:                                    # noqa: BLE001
-            pass
+        # Close the pipes BEFORE killing: a half-filled stdin buffer finalised after the
+        # process is gone raises an unraisable BrokenPipeError that no `except` here can
+        # catch. A real-corpus run printed dozens of them, all blaming this function.
+        sandbox.kill_quietly(p)
     return out
 
 
@@ -290,10 +289,10 @@ def _drive_bridge(exe, workdir, caps, *, timeout, max_steps=12):
         o, _ = menu._drain(p, sel, idle=0.2, deadline=min(end, time.monotonic() + 2.0))
         out += o.encode("latin1") if isinstance(o, str) else (o or b"")
     finally:
-        try:
-            p.kill()
-        except Exception:                                # noqa: BLE001
-            pass
+        # Close the pipes BEFORE killing: a half-filled stdin buffer finalised after the
+        # process is gone raises an unraisable BrokenPipeError that no `except` here can
+        # catch. A real-corpus run printed dozens of them, all blaming this function.
+        sandbox.kill_quietly(p)
     return out, recipe
 
 

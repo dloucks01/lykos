@@ -4,12 +4,16 @@ L2 primitive stage and the root-cause stage."""
 from __future__ import annotations
 
 import json
+import logging
 import tempfile
 from pathlib import Path
 
+from ... import observe
 from ..dynamic import sandbox
 from ..fuzz.runner import place
 from ..invocation import OUTPUT_PLACEHOLDER
+
+_log = logging.getLogger(__name__)
 
 
 def _sub_out(argv, work):
@@ -28,6 +32,7 @@ def materialize_helper() -> Path:
         from importlib import resources
         data = (resources.files("lykos.analyze.poc") / _HELPER).read_bytes()
     except Exception:
+        observe.absorbed(_log, "keeping the default")
         data = (Path(__file__).parent / _HELPER).read_bytes()
     p = d / _HELPER
     p.write_bytes(data)
@@ -87,7 +92,12 @@ def make_capture(ctx, helper: Path, exe, mode, base_argv, timeout, python):
         proc = ctx.run_subprocess([python, str(helper), str(spec_path)], timeout=timeout + 30)
         out = (proc.stdout or b"").decode("latin-1", "ignore").strip()
         try:
-            return json.loads(out) if out else {"ok": False, "reason": "no output"}
+            res = json.loads(out) if out else {"ok": False, "reason": "no output"}
+            # The tracer runs as a standalone script and keeps its own absorbed list (it
+            # cannot import observe); this is where it comes home. A silently-skipped step
+            # in the capture helper is what turns a real crash into "no fatal signal".
+            observe.absorbed_remote("lykos.analyze.poc.ptrace_capture", res.pop("absorbed", None))
+            return res
         except json.JSONDecodeError:
             return {"ok": False, "reason": "bad helper output: " + out[:200]}
 
@@ -130,6 +140,33 @@ MODES = ("stdin", "file", "arg")
 # env_fuzz records its delivery as an argv prefix element "NAME=@@" (@@ being the input placeholder),
 # so the variable's name survives on the DynResult and the replay can set the right one.
 _ENV_PLACEHOLDER = "=@@"
+
+
+def plain_build_bytes(ctx, target):
+    """The UNINSTRUMENTED build of this target's source, or None when there is none.
+
+    Lives here for the reason `replay_exe_for` and `how_to_feed` do: it answers "which binary is
+    the one to run", and two stages have to agree on the answer. `poc_primitive` asks it to
+    observe what an out-of-bounds READ disclosed -- the instrumented build aborts inside the read
+    and emits nothing -- and `build_exploit` asks it for the whole chain, because AddressSanitizer
+    reports a stack overflow and abort()s before the corrupted return is ever reached. If the two
+    disagreed, the leak would be resolved against one image's layout and the ROP built against
+    another's, and nothing would say so.
+
+    Ingest keeps the build as a `plain-blob` artifact keyed to the instrumented binary's sha,
+    beside the MSan and TSan builds -- see `ingest.compile_source_plain` for why it has to exist.
+    A target ingested as a BINARY has no such artifact and needs none: it already is the program
+    as shipped, and None is the right answer for it.
+    """
+    from ...db.dao import ArtifactDAO
+    try:
+        for a in ArtifactDAO(ctx.conn).list_by_case(target.case_id):
+            if a.kind == "plain-blob" and (a.meta or {}).get("binary_sha") in (None,
+                                                                              target.sha256):
+                return ctx.content.get_bytes(a.sha256)
+    except Exception:                                    # noqa: BLE001
+        observe.absorbed(_log, "falling back to the ingested build")
+    return None
 
 
 def replay_exe_for(ctx, target, input_sha):
@@ -204,7 +241,8 @@ _FILE_FUNCS = {"fopen", "fopen64", "open", "open64", "freopen"}
 # parser reads its own FILE* with exactly those, so they must not pull ranking toward stdin
 # (jhead is fopen+fread; the real-gate arm_config fixture is fopen+fgets). Without this split a
 # binary that merely reads its flag file was classed as file-input and every stdin payload --
-# the real channel -- was delivered where the program never reads it (a stdin reader that also opens a fixed file: concolic
+# the real channel -- was delivered where the program never reads it (a stdin reader that also
+# opens a fixed file: concolic
 # solved the gate to unconstrained-IP, then the input was dumped as an unread file of zeros).
 _STDIN_INTERACTIVE = {"read", "gets", "scanf", "__isoc99_scanf", "getchar", "getchar_unlocked",
                       "getline"}
@@ -382,6 +420,16 @@ def modes_for(call_edges, given=None, symbols=(), file_type=None, *, no_imports=
     return kept or ordered
 
 
+#: The two `why` values that mean the channel was ESTABLISHED rather than inferred -- the
+#: analyst named it, or the dynamic run that found this very input recorded what it used. Any
+#: other `why` is the import-table ranking, which this function's own docstring calls a starting
+#: guess. Exported because `build_exploit` defers to L2's measured channel only over a guess, and
+#: a second copy of these sentences there would fail open the moment either was reworded.
+FEED_GIVEN = "given"
+FEED_RECORDED = "recorded by the run that found it"
+FEED_AUTHORITATIVE = frozenset({FEED_GIVEN, FEED_RECORDED})
+
+
 def how_to_feed(conn, target, input_sha, params, *, content=None):
     """(mode, argv, why) -- how this input reached the program when it crashed.
 
@@ -393,7 +441,7 @@ def how_to_feed(conn, target, input_sha, params, *, content=None):
     """
     from ...db.dao import DynResultDAO
     if params.get("input_mode"):
-        return params["input_mode"], list(params.get("argv") or []), "given"
+        return params["input_mode"], list(params.get("argv") or []), FEED_GIVEN
     for r in DynResultDAO(conn).list_by_target(target.id):
         if r.input_sha == input_sha and r.input_mode:
             # dyn_result.argv is the FLAG PREFIX, never the thing carrying the input: the
@@ -402,7 +450,7 @@ def how_to_feed(conn, target, input_sha, params, *, content=None):
             # `jhead /tmp/<gone>/input.bin /tmp/new/input.bin`; jhead stops at the missing
             # first file and never reaches the crashing one, so a real crash was filed as
             # "did not reproduce".
-            return r.input_mode, list(r.argv or []), "recorded by the run that found it"
+            return r.input_mode, list(r.argv or []), FEED_RECORDED
     # Nothing recorded: rank the channels by what the binary imports rather than assuming
     # stdin. A file parser given its input on stdin looks exactly like a program with no bug.
     from ...db.dao import CallEdgeDAO
@@ -422,6 +470,7 @@ def how_to_feed(conn, target, input_sha, params, *, content=None):
                            file_type=getattr(target, "file_type", None),
                            no_imports=no_import_evidence(target))
     except Exception:
+        observe.absorbed(_log, "keeping the default")
         ranked = list(MODES)
     return (ranked or list(MODES))[0], list(params.get("argv") or []), \
         "inferred from the imported input calls"

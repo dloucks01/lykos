@@ -52,6 +52,7 @@ def test_heap_op_sequences_include_uaf_cross_option():
 
 def test_allocator_ranges_covers_family_and_transitive_callees():
     from types import SimpleNamespace as NS
+
     from lykos.analyze.dynamic import heap_discover
     # ta_alloc calls memclear; ta_free calls compact; both + same-stem must be ignored ranges
     fns = {"ta_alloc": 0x1000, "ta_free": 0x1100, "ta_safe": 0x1200, "compact": 0x1300,

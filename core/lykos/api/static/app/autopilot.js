@@ -1,12 +1,22 @@
-// Autopilot: one click, every applicable capability, demonstrable result.
+// The IN-TAB autopilot: runs the pipeline from the browser, stage by stage, for fine-grained
+// per-stage feedback. Secondary by design -- the primary "▶ Run Autopilot" button posts to
+// /cases/<id>/autopilot and the SERVER runs `analyze.orchestrate.run_case_autopilot`.
 //
-// The user's goal is the fewest clicks between "here is a binary" and "here is a working
-// proof-of-concept, or the exact steps to exploit it" -- and to go DEEP: exercise every
-// analysis capability the target supports, not just the shortest path to one crash. The server
-// already computes what is RECOMMENDED (GET /targets/<id>/advice) and what is POSSIBLE at all
-// (GET /targets/<id>/capabilities). Autopilot runs the full applicable pipeline in a sensible
-// order, threads a crashing input through the stages that need one, reports what each stage
-// actually found (not just that it finished), and names the capabilities it skipped and why.
+// Prefer the server one. It is the same engine the CLI and every gate drive: it schedules every
+// registered stage, divides a wall-clock budget between the recover/search/prove phases, records
+// a baseline execution, and emits the scorecard the workbench now shows. This file schedules a
+// hand-maintained SUBSET and has none of that.
+//
+// This header used to open "one click, every applicable capability". It never was: the file knew
+// 28 of the engine's 45 stages, and because the primary button ran this file, a user clicking the
+// obvious button got 17 fewer capabilities than a CLI user -- with nothing on screen saying so.
+// The gap is declared stage by stage below and asserted by tests/test_webui_completeness.py, so
+// adding a stage to the engine and forgetting this file fails a test instead of quietly shipping
+// a shorter run.
+//
+// The server still computes what is RECOMMENDED (GET /targets/<id>/advice) and what is POSSIBLE
+// (GET /targets/<id>/capabilities); everything here is gated on that, so an inapplicable stage is
+// skipped with a reason rather than failing.
 
 import { api, waitForRun } from "./api.js";
 import { stageLabel } from "./util.js";
@@ -20,6 +30,31 @@ const DYNAMIC_BACKENDS = new Set([
 // there is one. Everything is gated on the server's per-target availability, so an inapplicable
 // stage (boundary fuzz on a lone ELF, firmware carve on an executable) is skipped with a reason
 // rather than failing. `core` stages run even if the capability map does not list them.
+
+// -------------------------------------------------------------------------------------
+// Stages the SERVER autopilot runs and this one does not. Declared, not forgotten: the
+// test that reads these comments fails if the engine gains a stage and this list does
+// not. Click "▶ Run Autopilot" (the server) to get them.
+//
+// the engine routes these itself, per target, off the substrate table; offering them here would
+// mean duplicating that routing in the browser:
+// not-in-tab: ingest_triage, unpack
+//
+// source-only: they need an archived source tree, which the workbench does not upload:
+// not-in-tab: embedded_audit, int_overflow_scan, libfuzzer, source_cve_scan, source_sink_scan, uaf_scan
+//
+// the heap / out-of-bounds chain. Each one consumes the previous one's artifact -- a menu crawl,
+// an op model, a primitive -- and that cross-stage threading is what the server autopilot does:
+// not-in-tab: chain_primitive, heap_trace, mem_oracle, oob_index
+//
+// input channels the workbench cannot configure from the browser:
+// not-in-tab: env_fuzz, net_fuzz
+//
+// they read evidence other stages recorded, so they only mean anything at the end of a full
+// server-side pass:
+// not-in-tab: cve_corroborate, cve_poc, poc_diff
+// -------------------------------------------------------------------------------------
+
 const PIPELINE = [
   { stage: "disassemble", core: true, phase: "recover" },
   { stage: "detect_cwe", core: true, phase: "recover" },

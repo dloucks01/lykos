@@ -8,14 +8,18 @@ poc-backed finding carrying the exact demonstrating input.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 
+from ... import observe
 from ...db.dao import CallEdgeDAO, FindingDAO, PocDAO, TargetDAO
 from ...jobs.registry import register_stage
 from ..detect.catalog import normalize
 from ..dynamic import sandbox
 from . import bundle, injection
+
+_log = logging.getLogger(__name__)
 
 INJECT_STAGE = "synthesize_injection"
 TOOL = "inject"
@@ -64,7 +68,7 @@ def _nav_preambles(ctx, target, target_bytes):
     before the payload is read. Returns only the non-empty prefixes, in cheapest-first order; the
     bare attempt is made separately so an already-reachable sink costs exactly what it did before.
     """
-    from ...db.dao import StringDAO                   # local: a sibling-scope import here bites
+    from ...db.dao import StringDAO  # local: a sibling-scope import here bites
     from .. import interaction
     try:                                              # detect_menu needs DISASSEMBLER strings --
         strings = [s.value for s in StringDAO(ctx.conn).list_by_target(target.id)]
@@ -120,7 +124,7 @@ def synthesize_injection_stage(ctx) -> dict:
         marker = _marker()
         payloads = spec["payloads"](marker)
 
-        def _attempt(payload, mode, nav=b""):
+        def _attempt(payload, mode, nav=b"", spec=spec, marker=marker):
             run_argv, stdin = _deliver(mode, payload, argv_base, ctx, nav)
             res = sandbox.run(exe, argv=run_argv, stdin=stdin, timeout=timeout,
                               arch=target.arch, endianness=target.endianness, bits=target.bits)
@@ -181,7 +185,7 @@ def _leaked_words(out: bytes, marker: str):
                 if len(s) >= 4:
                     ascii_hits.append(s)
             except Exception:
-                pass
+                observe.absorbed(_log, "continuing")
     return words, ascii_hits
 
 

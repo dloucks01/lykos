@@ -5,7 +5,6 @@ import struct
 import subprocess
 
 import pytest
-
 from lykos.analyze.poc import exploit as ex
 
 

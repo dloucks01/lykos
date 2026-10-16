@@ -11,11 +11,11 @@ import types
 
 import pytest
 from lykos.analyze import register
-from lykos.analyze.detect.detectors import DetectContext, heap_fptr_call, _reg_defined_by_mem_load
+from lykos.analyze.detect import enqueue_detect
+from lykos.analyze.detect.detectors import DetectContext, _reg_defined_by_mem_load, heap_fptr_call
+from lykos.analyze.disassemble import enqueue_disassemble
 from lykos.analyze.dynamic import sandbox
 from lykos.analyze.ingest import enqueue_triage, ingest
-from lykos.analyze.disassemble import enqueue_disassemble
-from lykos.analyze.detect import enqueue_detect
 from lykos.db.dao import FindingDAO
 from lykos.jobs import JobConfig, JobQueue, WorkerPool
 

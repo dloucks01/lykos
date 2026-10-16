@@ -15,7 +15,6 @@ import tempfile
 from pathlib import Path
 
 import pytest
-
 from lykos.analyze.firmware import angr_mmio as amod
 from lykos.analyze.firmware import unicorn_driver as drv
 from lykos.analyze.firmware.rehost import locate_unicorn_python, run_angr_mmio
@@ -280,6 +279,7 @@ def test_hal_signatures_detect_weak_default_handlers():
     Default_Handler) is mapped to skip, while a real handler is left alone -- no disassembler or
     SDK data needed."""
     import struct as _s
+
     from lykos.analyze.firmware import hal_signatures as hs
     img = bytearray(0x80)
     _s.pack_into("<I", img, 0x00, 0x20010000)

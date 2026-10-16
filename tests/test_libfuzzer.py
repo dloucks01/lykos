@@ -75,6 +75,7 @@ def test_libfuzzer_stage_confirms_finding_with_source_line(store, case, pool):
         pytest.skip("no gcc to build the source project at ingest")
     import tempfile
     from pathlib import Path
+
     from lykos.analyze.ingest import ingest
     from lykos.analyze.libfuzzer_stage import enqueue_libfuzzer
     from lykos.db.dao import FindingDAO
@@ -97,6 +98,7 @@ def test_libfuzzer_stage_confirms_finding_with_source_line(store, case, pool):
 def test_pick_harness_fn():
     import tempfile
     from pathlib import Path
+
     from lykos.analyze.libfuzzer import pick_harness_fn
     d = Path(tempfile.mkdtemp())
     (d / "a.c").write_text("static void helper(char*x){(void)x;}\n"
@@ -115,6 +117,7 @@ def test_libfuzzer_on_pure_library_auto_harness(store, case, pool):
         pytest.skip("no gcc to build the library at ingest")
     import tempfile
     from pathlib import Path
+
     from lykos.analyze.ingest import ingest
     from lykos.analyze.libfuzzer_stage import enqueue_libfuzzer
     from lykos.db.dao import FindingDAO
@@ -140,6 +143,7 @@ def test_libfuzzer_cpp_project_name_mangling(store, case, pool):
         pytest.skip("no g++ to build the C++ project at ingest")
     import tempfile
     from pathlib import Path
+
     from lykos.analyze.ingest import ingest
     from lykos.analyze.libfuzzer_stage import enqueue_libfuzzer
     from lykos.db.dao import FindingDAO
@@ -150,7 +154,8 @@ def test_libfuzzer_cpp_project_name_mangling(store, case, pool):
                                   " if(n[0]) std::printf(\" \"); }\n")
     (d / "main.cpp").write_text("#include <cstdio>\nvoid load(const char*);\n"
                                 "int main(){ char b[256]; if(std::fgets(b,256,stdin)) load(b); return 0; }\n")
-    (d / "Makefile").write_text("app: main.cpp parser.cpp\n\t$(CXX) $(CXXFLAGS) main.cpp parser.cpp -o app $(LDFLAGS)\n")
+    (d / "Makefile").write_text("app: main.cpp parser.cpp\n"
+                                "\t$(CXX) $(CXXFLAGS) main.cpp parser.cpp -o app $(LDFLAGS)\n")
     t = ingest(store, case.id, d, filename="cpproj")
     run = enqueue_libfuzzer(JobQueue(store.conn), t, params={"harness_fn": "load", "seconds": 15})
     assert pool.wait_idle(90) and store.runs.get(run.id).status == "done"

@@ -12,7 +12,6 @@ import subprocess
 from dataclasses import dataclass
 
 import pytest
-
 from lykos.analyze.fuzz import netfuzz
 
 _HAS_CC = shutil.which("gcc") or shutil.which("cc")
