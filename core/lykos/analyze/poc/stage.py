@@ -86,15 +86,22 @@ def build_poc_stage(ctx) -> dict:
     # a tool that never calls it, so a genuine memory-corruption finding would be filed as an
     # unverified L0 -- the same mistake prompted delivery made, in a new place. The run that found
     # it recorded the harness in its isolation tag, so this reads the record.
-    _harness = replay_exe_for(ctx, target, input_sha)
+    _harness, _kind = replay_exe_for(ctx, target, input_sha)
     if _harness:
         exe = ctx.scratch() / "harness.bin"
         exe.write_bytes(_harness)
         os.chmod(exe, 0o755)
         target_bytes = _harness                          # the bundle must ship the HARNESS
-        mode, argv = "file", ["@@"]
-        mode_why = ("replayed against the libFuzzer harness the crash was found in "
-                    "(the ingested binary need not call the vulnerable path)")
+        if _kind == "libfuzzer":
+            # A harness takes a FILE, whatever channel the ingested target used.
+            mode, argv = "file", ["@@"]
+            mode_why = ("replayed against the libFuzzer harness the crash was found in "
+                        "(the ingested binary need not call the vulnerable path)")
+        else:
+            # A sanitizer-variant build is the SAME program compiled again, so its input channel
+            # is the one already discovered. Overriding it fed the program nothing at all.
+            mode_why = ("replayed against the sanitizer build that reported it (the same program "
+                        "and the same input channel; no other build reports this class)")
 
     def _delivery(m):
         """(argv, stdin, env_overrides) for one delivery channel."""

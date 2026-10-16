@@ -923,18 +923,208 @@ def quantity_effect(prim: dict) -> str:
             f"{reach}.{tail}")
 
 
+#: The MemorySanitizer class. One name, two defects, and the report tells them apart: a value
+#: that was merely USED (a branch on an uninitialised flag -- real, internal, CWE-457) and a value
+#: that LEFT THE PROCESS through an output call (stack or heap residue disclosed, CWE-200).
+UNINIT_CLASSES = frozenset({"use-of-uninitialized-value"})
+MSAN = "MemorySanitizer"
+
+#: Below this many bytes, "they are all the same byte" is not evidence of a fill -- a short run of
+#: zeroes is ordinary data. Above it, a uniform block is a sanitizer (or calloc) having filled the
+#: memory, and nothing about the program's residue can be read off it.
+_FILL_MIN = 16
+#: A marker has to be distinctive enough that finding it in the output means something. Eight
+#: bytes of a filler run would match residue that merely happens to be filler.
+MARKER_MIN = 8
+
+
+def residue_verdict(disclosed: bytes, marker: bytes, target_bytes: bytes = b"",
+                    *, word: int = 8, endian: str = "little") -> dict:
+    """WHAT the disclosed bytes are -- the question an uninitialised-read report never answers.
+
+    MSan says a value was undefined and that it reached an output. Both halves are about the
+    DEFECT; neither is about the consequence, and the consequence is decided entirely by what
+    happened to be in that memory. A dead frame holding 128 bytes of zeroes is a bug to fix; the
+    same frame holding the previous call's input buffer, or a saved return address, is an exploit
+    primitive. This is the uninitialised-memory analogue of the reclaim experiment: there, the
+    question was whether the attacker owns the contents of a freed chunk; here, whether the
+    attacker owns the contents of memory that was never written at all.
+
+    Four outcomes, strongest first, and the order matters:
+
+      * `input` -- the marker planted in the input came out. The attacker chooses what leaks.
+      * `pointer` -- the bytes corroborate an image base (>=2 agreeing pointers, `classify_leak`).
+        That is an ASLR defeat, which is exactly what the exploit stage consumes.
+      * `filled` -- the bytes are one value repeated. Something FILLED this memory, so there is no
+        residue here to reason about and no claim to make. Measured, and the reason this check
+        comes before the other two: on the ASan build a fresh frame reads as zeroes and a fresh
+        heap allocation as 0xbe (`malloc_fill_byte`), so a residue verdict taken from that binary
+        would be measuring the sanitizer rather than the program.
+      * `unknown` -- bytes escaped and nothing recognisable was in them.
+    """
+    out: dict = {"residue": "unknown", "residue_bytes": len(disclosed or b"")}
+    if not disclosed:
+        return out
+    body = bytes(disclosed)
+    if len(body) >= _FILL_MIN and len(set(body)) == 1:
+        out["residue"] = "filled"
+        out["fill_byte"] = body[0]
+        return out
+    if marker and len(marker) >= MARKER_MIN:
+        at = body.find(marker)
+        if at >= 0:
+            out["residue"] = "input"
+            out["marker_offset"] = at
+            out["marker"] = marker[:32].hex()
+            return out
+    # Word-decode and ask the leak classifier. Only an image base is claimed: a libc base needs
+    # the libc image to corroborate against (which this stage does not have) and a canary is a
+    # single word with a null low byte, which residue reproduces by accident.
+    vals = [int.from_bytes(body[i:i + word], endian)
+            for i in range(0, len(body) - word + 1, word)]
+    try:
+        from .leak import classify_leak
+        base = classify_leak(vals, target_bytes or b"").get("pie_base")
+    except Exception:                                    # noqa: BLE001 -- advisory classifier
+        base = None
+    if base:
+        out["residue"] = "pointer"
+        out["pie_base"] = base
+    return out
+
+
+def uninit_primitive(observations: list, residue: dict | None = None) -> dict | None:
+    """What an uninitialised-value defect is worth: did it ESCAPE, how much, and whose bytes.
+
+    This was the last sanitizer class in this file with no verdict of its own. The reason given
+    for declining it was that an uninitialised read is only a disclosure if the value reaches an
+    output, and that `mem_oracle` already draws that line -- which was true about the LINE and
+    wrong about the owner. MSan draws it too, in the report this stage already has in hand, and
+    it draws it for the input the ladder is actually holding: `mem_oracle` is a bounded triage
+    pass over inputs it chooses for itself, so "some run of this program discloses" and "THIS
+    crashing input discloses" are different claims and only the second one can carry a bundle.
+
+    Three facts come from the report (`_msan_detail`): the output call the bytes reached, the
+    volume that reached it, and the origin -- a dead stack frame or a recycled heap chunk. One
+    comes from the family's shared experiment: vary the input and see whether the volume moves.
+    The last comes from `residue_verdict`, which looks at the bytes themselves.
+
+    Levels. An escape whose bytes are shown to be the attacker's (or to carry an image base) is
+    an information-disclosure primitive and may reach L2 -- the same standing the out-of-bounds
+    and use-after-free READ verdicts already have, for the same reason: memory the program did
+    not intend to expose, reaching an output, with the content accounted for. An escape whose
+    residue is unrecognised stops at L1: bytes left the process and what they were is not shown.
+    A value that never escaped stops at L1 whatever the experiment says, because nothing left the
+    process to call a disclosure.
+    """
+    seen = [(lbl, r) for lbl, r in observations
+            if isinstance(r, dict) and r.get("class") in UNINIT_CLASSES
+            and r.get("sanitizer") == MSAN]
+    if not seen:
+        return None
+    first = seen[0][1]
+    escaped = first.get("escape_bytes") is not None
+    vols = sorted({r["escape_bytes"] for _l, r in seen if r.get("escape_bytes") is not None})
+    sized = len(vols) > 1
+    res = dict(residue or {})
+    kind = res.get("residue") or "unknown"
+    ours = escaped and kind in ("input", "pointer")
+    prefix = "controlled-" if (escaped and (ours or sized)) else ""
+    return {
+        "type": prefix + ("uninit-disclosure" if escaped else "uninit-read"),
+        "sanitizer_class": first.get("class"),
+        "uninit": True,
+        "escaped": escaped,
+        "escape_fn": first.get("escape_fn"),
+        "escape_offset": first.get("escape_offset"),
+        "volume_min": vols[0] if vols else None,
+        "volume_max": vols[-1] if vols else None,
+        "volume_controlled": sized,
+        "origin": first.get("origin"),
+        "origin_var": first.get("origin_var"),
+        "origin_site": first.get("origin_site"),
+        "use_site": first.get("source"),
+        # What was IN the disclosed bytes, and by what evidence. Kept verbatim from the
+        # experiment so the bundle and the report cannot disagree with each other about it.
+        "residue": kind,
+        "residue_bytes": res.get("residue_bytes"),
+        "marker_offset": res.get("marker_offset"),
+        "fill_byte": res.get("fill_byte"),
+        "pie_base": res.get("pie_base"),
+        # CWE-200 where the bytes left the process, CWE-457 where the value was only used. The
+        # report sets this too; it is read off the observation rather than recomputed so there is
+        # one definition of the distinction.
+        "cwe": first.get("cwe") or ("CWE-200" if escaped else "CWE-457"),
+        "effect_kind": "info-disclosure" if escaped else None,
+        # An escape is DEMONSTRATED: MSan observed the bytes entering the output call, and on the
+        # same run they came out of it. A value that was only used internally has no effect to
+        # demonstrate -- the defect is real and its consequence is not shown.
+        "effect_status": "demonstrated" if escaped else "potential",
+        "observations": [{"variant": lbl, "volume": r.get("escape_bytes"),
+                          "escaped": r.get("escape_bytes") is not None} for lbl, r in seen],
+        "confirmed": bool(ours or (escaped and sized)),
+        "max_level": 2 if ours else 1,
+        "offset": first.get("escape_offset"),
+    }
+
+
+#: How the residue verdict reads in prose, and what it does NOT establish.
+_RESIDUE_TXT = {
+    "input": "the marker planted in the input came back out of the program's own output, so "
+             "what leaks is the attacker's to choose",
+    "pointer": "the disclosed bytes corroborate an image base, so this leak defeats ASLR -- the "
+               "input the exploit stage needs and cannot otherwise get",
+    "filled": "the disclosed bytes are a single value repeated, which means something FILLED "
+              "this memory before the read: on an instrumented build that is the sanitizer "
+              "(a zeroed frame, or 0xbe from `malloc_fill_byte`), so there is no residue here "
+              "to attribute and none is claimed",
+    "unknown": "what was in the disclosed bytes is not established -- no planted marker came "
+               "back and no corroborating pointer was recovered from them",
+}
+
+
+def uninit_effect(prim: dict) -> str:
+    """The effect of an uninitialised-value defect: escape, volume, origin, and whose bytes."""
+    origin = ({"stack": "a dead stack frame", "heap": "a recycled heap allocation"}
+              .get(prim.get("origin") or "", "memory that was never written"))
+    var = f" (`{prim['origin_var']}`)" if prim.get("origin_var") else ""
+    where = f", declared at {prim['origin_site']}" if prim.get("origin_site") else ""
+    if not prim.get("escaped"):
+        return (f"use-of-uninitialized-value: the program uses a value from {origin}{var}"
+                f"{where}, and the value does NOT leave the process -- MSan reports no output "
+                f"call receiving it. The defect is real (CWE-457) and its consequence is not "
+                f"shown: what an undefined value is worth depends on what the code does with "
+                f"it, and nothing here establishes that")
+    lo, hi = prim.get("volume_min"), prim.get("volume_max")
+    span = f"{lo} bytes" if lo == hi else f"{lo}..{hi} bytes"
+    vol = (f"{span} of {origin}{var}{where} reach `{prim.get('escape_fn')}` from offset "
+           f"{prim.get('escape_offset')}")
+    sized = (" The volume tracks the input, so the attacker sizes the disclosure."
+             if prim.get("volume_controlled") else "")
+    return (f"uninitialised-memory disclosure: {vol} -- {_RESIDUE_TXT.get(prim.get('residue'))}."
+            f"{sized}")
+
+
 #: Classes this stage can say nothing useful about, and WHY -- so the run reports a reason instead
 #: of the generic "no instruction-pointer / memory primitive found", which reads as if the right
 #: question had been asked and answered.
-NO_VERDICT_REASON = {
-    "use-of-uninitialized-value": "an uninitialised READ is only a disclosure if the value "
-                                  "reaches an output, which is `mem_oracle`'s verdict (CWE-457/"
-                                  "CWE-200) and not this stage's to duplicate",
-}
-# The concurrency classes used to live in the table above, excused on the grounds that their
-# exploitability is a timing property and this stage only varies the input. The first half was
-# right and the conclusion was not: a concurrency defect has a measurable property that needs no
-# input variation at all, which is how OFTEN the same input shows it. See `race_primitive`.
+NO_VERDICT_REASON: dict = {}
+# EMPTY, and it is worth recording what used to be in it, because both entries were excuses that
+# survived one reading each.
+#
+# The concurrency classes were excused on the grounds that their exploitability is a timing
+# property and this stage only varies the input. The first half was right and the conclusion was
+# not: a concurrency defect has a measurable property that needs no input variation at all, which
+# is how OFTEN the same input shows it. See `race_primitive`.
+#
+# `use-of-uninitialized-value` was excused on the grounds that an uninitialised read is only a
+# disclosure if the value reaches an output, and that `mem_oracle` already owns that line. True
+# about the line, wrong about the owner: MSan draws it in the report this stage already holds, and
+# draws it for the input the ladder is holding rather than for inputs another stage chose. See
+# `uninit_primitive`.
+#
+# The mechanism stays. It is the right shape for the next class that genuinely has no verdict, and
+# a named decline reads nothing like the generic "no primitive found".
 
 
 def no_verdict_reason(sanitizer_class: str | None) -> str | None:

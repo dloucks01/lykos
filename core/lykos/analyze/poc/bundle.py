@@ -281,6 +281,80 @@ def _primitive_txt(prim: dict) -> bytes:
                           "it is unproven, and is reported so."]
             lines.append("")
         return ("\n".join(lines)).encode()
+    if prim.get("uninit"):
+        escaped = bool(prim.get("escaped"))
+        res = prim.get("residue")
+        lines = [
+            ("L2 information-disclosure primitive" if prim.get("confirmed") and escaped
+             else "L1 uninitialised-memory disclosure" if escaped
+             else "L1 use of an uninitialised value"),
+            "=" * 35,
+            f"Primitive: {prim.get('type')}",
+            f"Sanitizer class: {prim.get('sanitizer_class')} (MemorySanitizer)",
+            "",
+        ]
+        if escaped:
+            lines += [
+                f"Left the process: {prim.get('volume_min')}..{prim.get('volume_max')} bytes "
+                f"reached `{prim.get('escape_fn')}` from offset {prim.get('escape_offset')}",
+                f"Attacker sizes the disclosure: {bool(prim.get('volume_controlled'))}",
+            ]
+        else:
+            lines += [
+                "Left the process: NOTHING. MemorySanitizer reports no output call receiving",
+                "the value, so this is the internal half of the class (CWE-457) and no",
+                "disclosure is claimed.",
+            ]
+        lines += [
+            "",
+            "Where the undefined value came from (NOT where it was used -- the line to fix is",
+            "the one that declared or allocated without an initialiser):",
+            f"  origin       {prim.get('origin') or '(not stated)'}"
+            + (f" variable `{prim.get('origin_var')}`" if prim.get("origin_var") else ""),
+            f"  declared at  {prim.get('origin_site') or '(not symbolized)'}",
+            f"  used at      {prim.get('use_site') or '(not symbolized)'}",
+            "",
+        ]
+        if escaped:
+            lines += ["Whose bytes escaped:", f"  verdict: {res}"]
+            if res == "input":
+                lines += [
+                    f"  a {prim.get('residue_bytes')}-byte marker planted in input.bin came back",
+                    f"  out of the program's own output at offset {prim.get('marker_offset')}.",
+                    "  The attacker chooses the contents of memory the program never wrote: the",
+                    "  uninitialised-memory counterpart of reclaiming a freed chunk.",
+                ]
+            elif res == "pointer":
+                lines += [
+                    f"  the disclosed bytes corroborate an image base "
+                    f"({prim.get('pie_base'):#x})." if prim.get("pie_base") else
+                    "  the disclosed bytes corroborate an image base.",
+                    "  This leak defeats ASLR, which is the input an exploit otherwise cannot get.",
+                ]
+            elif res == "filled":
+                lines += [
+                    f"  every disclosed byte is {prim.get('fill_byte')}, so something FILLED this",
+                    "  memory before the read -- on an instrumented build, the sanitizer itself",
+                    "  (a zeroed frame, or 0xbe from ASan's malloc_fill_byte). There is no",
+                    "  residue here to attribute and none is claimed. On a build that does not",
+                    "  fill, the same read discloses whatever was last there.",
+                ]
+            else:
+                lines += [
+                    "  not established. No planted marker came back and no corroborating",
+                    "  pointer was recovered, so the bytes left the process and what they were",
+                    "  is unproven. Reported as such rather than guessed at.",
+                ]
+            lines.append("")
+        if prim.get("observations"):
+            lines.append("Input variants detonated (the evidence for the volume above):")
+            for o in prim["observations"][:10]:
+                lines.append(f"  {str(o.get('variant'))[:28]:28s} -> "
+                             + (f"{o.get('volume')} bytes out" if o.get("escaped")
+                                else "no escape reported"))
+            lines.append("")
+        return ("\n".join(lines)).encode()
+
     if prim.get("lifetime"):
         # A LIFETIME defect: the object is dead, so there is no distance past its end and, for a
         # double free, no access at all. Printing the out-of-bounds template here would state a
@@ -550,6 +624,16 @@ def build(target_bytes: bytes, input_bytes: bytes, meta: dict, stderr: bytes,
                      f"(attacker-controlled={primitive.get('confirmed')}; "
                      f"{primitive.get('effect_kind')}, {primitive.get('effect_status')}). "
                      f"See PRIMITIVE.txt.\n")
+    elif sanitizer and (primitive or {}).get("uninit"):
+        prim_line = (
+            (f"\nPrimitive: {primitive.get('type')} -- "
+             f"{primitive.get('volume_min')}..{primitive.get('volume_max')} bytes of "
+             f"{primitive.get('origin') or 'uninitialised'} memory reached "
+             f"`{primitive.get('escape_fn')}`; residue: {primitive.get('residue')}. "
+             f"See PRIMITIVE.txt.\n")
+            if (primitive or {}).get("escaped") else
+            (f"\nPrimitive: {primitive.get('type')} -- an uninitialised value is USED and does "
+             f"not leave the process, so no disclosure is claimed. See PRIMITIVE.txt.\n"))
     elif sanitizer and (primitive or {}).get("lifetime"):
         # A dead object has no "distance past the end": what the experiment bounded is WHERE in
         # the freed chunk the access landed and HOW BIG the chunk was.

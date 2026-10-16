@@ -182,6 +182,19 @@ def _detonate_for_report(ctx, target, exe, mode, base_argv, data, timeout):
     child's stderr away, and for this class of defect the stderr IS the evidence. Nothing about
     the registers of an ASan abort is informative.
     """
+    rep, _out = _detonate_capturing(ctx, target, exe, mode, base_argv, data, timeout)
+    return rep
+
+
+def _detonate_capturing(ctx, target, exe, mode, base_argv, data, timeout):
+    """`(report, stdout)` for one detonation.
+
+    The uninitialised-memory verdict needs the program's OWN OUTPUT, not just its report: MSan
+    names the bytes undefined as they enter the output call and the call then goes through, so the
+    residue it is complaining about is on stdout of the very same run **[measured]**. That is what
+    makes "whose bytes are these" answerable at all, and the answer is the difference between a
+    disclosure of zeroes and a disclosure of the attacker's own input.
+    """
     from ..debug.rootcause import parse_asan_report
     work = ctx.scratch()
     argv, stdin_bytes, env = list(base_argv), None, None
@@ -194,21 +207,22 @@ def _detonate_for_report(ctx, target, exe, mode, base_argv, data, timeout):
         try:
             argv = place(argv, sandbox.argv_arg(data, truncate=True))
         except sandbox.ArgvNulError:
-            return None
+            return None, b""
     elif mode == "env":
         var, argv = env_var_from_argv(argv)
         if not var:
-            return None
+            return None, b""
         env = {var: data.decode("latin-1")}
     else:
-        return None
+        return None, b""
     try:
         res = sandbox.run(exe, argv=argv, stdin=stdin_bytes, timeout=timeout,
                           arch=target.arch, endianness=target.endianness, bits=target.bits,
                           env_overrides=env)
     except Exception:                                    # noqa: BLE001 -- advisory step
-        return None
-    return parse_asan_report((res.stderr or b"").decode("utf-8", "replace"))
+        return None, b""
+    return (parse_asan_report((res.stderr or b"").decode("utf-8", "replace")),
+            res.stdout or b"")
 
 
 def _probe_variants(orig: bytes, pre: bytes, post: bytes):
@@ -409,6 +423,85 @@ def _race_primitive(ctx, target, exe, mode, base_argv, orig, timeout, first=None
     return prim
 
 
+#: Bytes of marker planted in the input for the residue experiment. Long enough that finding it
+#: in the output means something (a short run matches ordinary filler), short enough to survive
+#: being placed inside a structured input's body.
+_RESIDUE_MARKER = bytes.fromhex("5ec0de15ca1dbeef") * 2
+
+
+def _uninit_primitive(ctx, target, exe, mode, base_argv, orig, pre, post, timeout,
+                      first=None, target_bytes=b""):
+    """Step 2f: the uninitialised-value verdict, or None when this is not that kind of report.
+
+    Two experiments, because the report leaves two different questions open.
+
+    HOW MUCH escapes is the family's shared experiment: vary the input, watch the volume move.
+
+    WHOSE BYTES escape is the one this class actually turns on, and it is answerable only because
+    of a measured fact about MSan: the interceptor reports the undefined bytes and then performs
+    the write, so the residue is on the run's own stdout. The experiment plants a distinctive
+    marker in the input and looks for it there. On the shape this defect usually takes -- one
+    call reads input into its frame, a later call at the same depth reads its own frame
+    uninitialised -- the marker comes straight back out, and that is the attacker choosing the
+    contents of memory the program never wrote.
+
+    Note which binary this runs on. It is the MSan build, deliberately: the ASan build zeroes a
+    fresh frame and fills a fresh heap allocation with 0xbe, so a residue verdict taken from it
+    measures the sanitizer and not the program **[measured]**. `residue_verdict` detects that
+    anyway -- a uniform block is reported as `filled` and claims nothing -- so the honest answer
+    survives being run on the wrong build; it just stops being informative.
+    """
+    first = first or _detonate_for_report(ctx, target, exe, mode, base_argv, orig, timeout)
+    if (not first or first.get("class") not in primitive.UNINIT_CLASSES
+            or first.get("sanitizer") != primitive.MSAN):
+        return None
+    escaped = first.get("escape_bytes") is not None
+    ctx.progress(msg=("uninitialised memory reached `%s`: measuring the volume and whose bytes "
+                      "they are" % first.get("escape_fn")) if escaped else
+                 "uninitialised value used internally: checking whether it ever leaves")
+    obs = [("orig", first)]
+    for label, data in _probe_variants(orig, pre, post)[1:]:
+        rep = _detonate_for_report(ctx, target, exe, mode, base_argv, data, timeout)
+        if rep:
+            obs.append((label, rep))
+
+    # The residue experiment. Only where something escaped -- with nothing leaving the process
+    # there is no disclosed byte to attribute, and a run spent on it would answer no question.
+    res = None
+    if escaped:
+        body = orig[len(pre):len(orig) - len(post)] if (pre or post) else orig
+        marker = _RESIDUE_MARKER
+        if len(body) >= len(marker):
+            # Planted at the START of the body, where a program that reads input into a buffer
+            # puts it. Padded back to the original length so the input's structure (and any
+            # length field that describes it) still holds.
+            planted = pre + marker + body[len(marker):] + post
+        else:
+            planted = pre + marker + post
+        rep2, out2 = _detonate_capturing(ctx, target, exe, mode, base_argv, planted, timeout)
+        off = int((rep2 or first).get("escape_offset") or 0)
+        # `target_bytes` is the binary actually being detonated (the MSan build, resolved by
+        # `replay_exe_for`) -- an image base is corroborated against the image it came from.
+        res = primitive.residue_verdict(bytes(out2 or b"")[off:], marker,
+                                        target_bytes=target_bytes or b"",
+                                        word=8 if (target.bits or 64) >= 64 else 4,
+                                        endian="big" if target.endianness == "big" else "little")
+        if rep2:
+            obs.append(("marker", rep2))
+
+    prim = primitive.uninit_primitive(obs, residue=res)
+    if prim is not None:
+        ctx.emit("primitive.uninit", payload={
+            "class": prim["sanitizer_class"], "escaped": prim["escaped"],
+            "escape_fn": prim.get("escape_fn"), "volume_min": prim.get("volume_min"),
+            "volume_max": prim.get("volume_max"), "origin": prim.get("origin"),
+            "origin_site": prim.get("origin_site"), "residue": prim.get("residue"),
+            "marker_offset": prim.get("marker_offset"), "pie_base": prim.get("pie_base"),
+            "controlled": prim["confirmed"], "variants_detonated": len(obs),
+            "observations": prim["observations"][:10]})
+    return prim
+
+
 def primitive_stage(ctx) -> dict:
     import sys
     target = TargetDAO(ctx.conn).get(ctx.target_id) if ctx.target_id else None
@@ -459,17 +552,26 @@ def primitive_stage(ctx) -> dict:
     # calls the vulnerable path, the cyclic pattern did not fault, and the stage reported "no L2
     # primitive" for a defect it had simply never reached. One finding cannot be at L1 because
     # two stages disagree about what the target is.
-    _harness = replay_exe_for(ctx, target, input_sha)
+    _harness, _kind = replay_exe_for(ctx, target, input_sha)
     if _harness:
         exe = ctx.scratch() / "harness.bin"
         exe.write_bytes(_harness)
         exe.chmod(0o755)
         target_bytes = _harness                          # the bundle must ship the HARNESS
-        mode, base_argv = "file", ["@@"]
-        mode_why = ("detonated against the libFuzzer harness the crash was found in "
-                    "(the ingested binary need not call the vulnerable path)")
+        if _kind == "libfuzzer":
+            mode, base_argv = "file", ["@@"]
+            mode_why = ("detonated against the libFuzzer harness the crash was found in "
+                        "(the ingested binary need not call the vulnerable path)")
+        else:
+            # KEEP the discovered channel. A sanitizer-variant build is the same program, and
+            # forcing a file argument on one that reads stdin runs it with no input: measured on
+            # an MSan uninitialised-memory disclosure, where the defect still reported (it needs
+            # no input) and so every experiment that varies the input silently had nothing to
+            # vary -- the volume could not move and the planted marker never reached the program.
+            mode_why = ("detonated against the sanitizer build that reported it (the same "
+                        "program and the same input channel)")
         ctx.emit("primitive.harness", payload={"bytes": len(_harness), "mode": mode,
-                                               "why": mode_why})
+                                               "kind": _kind, "why": mode_why})
 
     # Static RE corroboration: recovered stack-buffer sizes predict IP-control offsets.
     word = 8 if (target.bits or 64) >= 64 else 4
@@ -719,6 +821,18 @@ def primitive_stage(ctx) -> dict:
                 return _finalize(ctx, target, target_bytes, mode, base_argv, cap0, control,
                                  prim, bool(prim.get("confirmed")), extra)
 
+            # 2f) the uninitialised-value class: the last one in this stage with no verdict of
+            # its own. Its experiment is not a variation but a LOOK AT THE BYTES -- see
+            # `_uninit_primitive`.
+            prim = _uninit_primitive(ctx, target, exe, mode, base_argv, orig, _pre, _post,
+                                     timeout, first=_first, target_bytes=target_bytes)
+            if prim is not None:
+                control = frame(orig[len(_pre):len(orig) - len(_post)] if (_pre or _post)
+                                else orig)
+                extra = primitive.uninit_effect(prim)
+                return _finalize(ctx, target, target_bytes, mode, base_argv, cap0, control,
+                                 prim, bool(prim.get("confirmed")), extra)
+
         # 3) nothing to claim. Where the defect's CLASS is one this stage cannot reason about --
         # a data race, an uninitialised read -- say which and why, because the generic note reads
         # as if the right question had been asked and answered. Measured: a ThreadSanitizer data
@@ -809,6 +923,14 @@ def _finalize(ctx, target, target_bytes, mode, base_argv, cap0, control, prim, c
             # this stage does not determine -- so it headlines the DEFECT and files no effect
             # claim. The reproduction rate is the contribution, and it is in the detail.
             _kind_title = None
+        elif prim.get("uninit"):
+            # Headlined by WHETHER THE BYTES LEFT. A disclosure of residue is an information
+            # disclosure and says so; a value used only inside the process has no effect to
+            # claim, so it headlines the defect and files its consequence as potential.
+            _kind_title = (prim["effect_kind"] or "info-disclosure",
+                           ("Information disclosure (uninitialised memory)"
+                            if prim.get("escaped")
+                            else "Use of an uninitialised value (potential)"))
         elif prim.get("quantity"):
             _title = _QUANTITY_TITLE.get(prim["sanitizer_class"], "Resource exhaustion")
             _kind_title = (prim["effect_kind"],
@@ -851,11 +973,25 @@ def _finalize(ctx, target, target_bytes, mode, base_argv, cap0, control, prim, c
             # memory corruption keeps it.
             if prim.get("quantity") and prim.get("cwe"):
                 _prim_cwe = prim["cwe"]
+            # Same situation, one class further on: the uninitialised-value family's weakness is
+            # the sanitizer's own (CWE-457, or CWE-200 once the bytes have left the process) and
+            # `_PRIM_CWE` deliberately has no entry for it -- neither id belongs to the
+            # memory-corruption family that table is allowed to install.
+            if prim.get("uninit") and prim.get("cwe"):
+                _prim_cwe = prim["cwe"]
             if _prim_cwe and (_prior.cwe if _prior else None) not in _MEM_CORRUPTION:
                 cand["cwe"] = _prim_cwe
                 cand["title_only"] = False
                 if prim.get("type") == "instruction-pointer-control":
                     cand["severity"] = "critical"       # RIP control, confirmed under ptrace
+                elif prim.get("uninit"):
+                    # From the VERDICT, not from the signal. MemorySanitizer halts the process,
+                    # so `_SIG_CWE["SIGABRT"]` rates every uninitialised read `high` -- including
+                    # the half where nothing left the process, which the sanitizer itself rates
+                    # medium. That is the substrate deciding the severity instead of the defect,
+                    # which is the complaint written out in full beside the PE exceptions in
+                    # that same table.
+                    cand["severity"] = "high" if prim.get("escaped") else "medium"
             else:
                 cand["title_only"] = True              # keep root_cause's specific CWE
             # Promote the matching end effect to DEMONSTRATED and attach the L2 bundle that

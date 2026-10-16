@@ -133,8 +133,18 @@ _ENV_PLACEHOLDER = "=@@"
 
 
 def replay_exe_for(ctx, target, input_sha):
-    """The binary that actually consumes `input_sha` -- a libFuzzer harness or a sanitizer-variant
-    build -- or None when it is the ingested target itself.
+    """`(binary, kind)` for whatever actually consumes `input_sha`: a libFuzzer harness
+    (`"libfuzzer"`), a sanitizer-variant build (`"sanitizer"`), or `(None, "")` when it is the
+    ingested target itself.
+
+    The KIND is returned because the two replacements say OPPOSITE things about the input channel,
+    and a caller that cannot tell them apart gets one of them wrong. A libFuzzer harness takes a
+    FILE argument whatever the target's own channel was; a sanitizer-variant build is the same
+    program compiled again, so its channel is unchanged. Both callers forced `("file", ["@@"])` on
+    everything this function returned, so an MSan build of a program that reads STDIN was handed a
+    filename in argv and ran with no input at all: the defect still reported (it needs no input),
+    and the verdict that asks what the attacker's bytes do could see nothing of theirs -- 128 bytes
+    of a dead frame escaped and the residue came back `unknown` **[measured]**.
 
     A libFuzzer crash is a crash of the HARNESS, which is a different binary from the one that
     was ingested. Replaying the input against the ingested binary is not a weaker test, it is the
@@ -163,16 +173,16 @@ def replay_exe_for(ctx, target, input_sha):
         art = next((a for a in ArtifactDAO(ctx.conn).list_by_case(target.case_id)
                     if a.kind == want
                     and (a.meta or {}).get("binary_sha") in (None, target.sha256)), None)
-        return ctx.content.get_bytes(art.sha256) if art else None
+        return (ctx.content.get_bytes(art.sha256), "sanitizer") if art else (None, "")
     if not iso.startswith("libfuzzer"):
-        return None
+        return None, ""
     prefix = iso.split("/", 1)[1] if "/" in iso else ""
     arts = [a for a in ArtifactDAO(ctx.conn).list_by_case(target.case_id)
             if a.kind == "libfuzzer-harness"]
     sha = next((a.sha256 for a in arts if prefix and a.sha256.startswith(prefix)), None)
     if sha is None and arts and not prefix:
         sha = arts[-1].sha256
-    return ctx.content.get_bytes(sha) if sha else None
+    return (ctx.content.get_bytes(sha), "libfuzzer") if sha else (None, "")
 
 
 def env_var_from_argv(argv):

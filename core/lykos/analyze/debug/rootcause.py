@@ -532,6 +532,16 @@ def parse_asan_report(text: str) -> Optional[dict]:
     out.update(_quantity_detail(t, bug))
     if tsan:
         out.update(_tsan_detail(t))
+    if msan:
+        # WHETHER IT ESCAPED. The class is one name for two defects an operator must triage
+        # differently, and only the report can tell them apart -- see `_msan_detail`.
+        out.update(_msan_detail(t))
+        if out.get("escape_bytes") is not None:
+            out["cwe"], out["severity"] = "CWE-200", "high"
+            out["detail"] = (f"MemorySanitizer: {out.get('escape_bytes')} bytes of "
+                             f"{out.get('origin') or 'uninitialised'} memory reached "
+                             f"`{out.get('escape_fn')}`"
+                             + (f" at {src}" if src else ""))
     refined = _ASAN_BY_ACCESS.get((bug, out.get("access") or ""))
     if refined:
         out["cwe"], out["severity"] = refined
@@ -652,6 +662,61 @@ def _tsan_detail(t: str) -> dict:
     lm = _TSAN_LOCATION.search(t or "")
     if lm:
         out["location"] = lm.group(1)[:160]
+    return out
+
+
+#: What a MemorySanitizer report states, and what each line is worth.
+#:
+#: `Uninitialized bytes in write at offset 0 inside [0x7ffe..., 128)` is the line that matters
+#: most, and it is printed only when the undefined bytes reached an INTERCEPTOR -- a write, a
+#: send, a printf. That is the difference between CWE-457 (the program used a value it never
+#: initialised: real, internal, nothing escaped) and CWE-200 (stack or heap residue left the
+#: process), and MSan draws it by observation rather than by inference. It is printed BEFORE the
+#: `WARNING:` line **[measured, clang 21]**, so anything that scans only the text after the
+#: warning misses the one distinction the class turns on. Clang 21 names the interceptor `write`;
+#: older releases write `__interceptor_write`, so the prefix is stripped rather than required.
+_MSAN_ESCAPE = re.compile(
+    r"Uninitialized bytes in (\S+?) at offset (\d+) inside \[0x[0-9a-f]+,\s*(\d+)\)")
+#: Where the undefined value CAME FROM, which `-fsanitize-memory-track-origins` exists to say and
+#: which decides what the residue IS: a dead stack frame holds the previous call's locals (so, on
+#: a program that reads input into one, the attacker's own bytes), a recycled heap chunk holds a
+#: previously freed object. The variable's name comes free and is the thing a maintainer fixes.
+_MSAN_ORIGIN_STACK = re.compile(
+    r"Uninitialized value was created by an allocation of '([^']*)' in the stack frame")
+_MSAN_ORIGIN_HEAP = re.compile(r"Uninitialized value was created by a heap allocation")
+_MSAN_ORIGIN_HDR = re.compile(r"^\s*Uninitialized value was created by .*$", re.M)
+
+
+def _msan_detail(t: str) -> dict:
+    """Whether the undefined value ESCAPED, how much of it, and where it came from.
+
+    Three facts, all of them in the report text and none of them anywhere else. Without this the
+    class arrives as a bare `use-of-uninitialized-value` and every one of them looks alike: the
+    branch on an uninitialised flag that never leaves the process reads exactly like 128 bytes of
+    a dead stack frame going out on a socket.
+    """
+    out: dict = {}
+    t = t or ""
+    m = _MSAN_ESCAPE.search(t)
+    if m:
+        out["escape_fn"] = m.group(1).replace("__interceptor_", "")[:64]
+        out["escape_offset"] = int(m.group(2))
+        # The size of the buffer handed to the output call. It BOUNDS the disclosure rather than
+        # measuring it: MSan says these bytes are undefined from `offset` on, not how many of
+        # them are, so this is reported as the volume that reached the output and read as such.
+        out["escape_bytes"] = int(m.group(3))
+    sm = _MSAN_ORIGIN_STACK.search(t)
+    if sm:
+        out["origin"] = "stack"
+        out["origin_var"] = sm.group(1)[:64]
+    elif _MSAN_ORIGIN_HEAP.search(t):
+        out["origin"] = "heap"
+    site = _section_site(t, _MSAN_ORIGIN_HDR)
+    if site:
+        # NOT the use site. A report that names only where the value was USED sends whoever has
+        # to fix it to the line that reads the variable, when the line to change is the one that
+        # declared or allocated it without an initialiser.
+        out["origin_site"] = site
     return out
 
 

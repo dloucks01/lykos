@@ -172,18 +172,27 @@ def test_a_class_that_fits_but_states_no_number_gets_no_verdict():
 
 def test_a_class_with_no_verdict_gets_a_reason_not_the_generic_note():
     """"no instruction-pointer / memory primitive found" reads as if the right question had been
-    asked and answered. For an uninitialised read the right answer belongs to mem_oracle, and
-    saying so points the reader at it instead of at a missing capability.
+    asked and answered, so a class this stage genuinely cannot reason about gets a NAMED decline
+    instead -- the mechanism, which is what this test is about.
 
-    A data race used to be excused here too, on the grounds that its exploitability is a timing
-    property and this stage only varies the input. The premise was right and the conclusion was
-    not -- see `race_primitive` -- so the excuse is gone and the verdict is real."""
-    assert "mem_oracle" in P.no_verdict_reason("use-of-uninitialized-value")
-    assert P.no_verdict_reason("data-race") is None, \
-        "a data race is excused again; it has a verdict now"
-    assert P.no_verdict_reason("heap-buffer-overflow") is None, \
-        "a class this stage DOES have a verdict for must not be excused"
-    assert P.no_verdict_reason(None) is None
+    Both entries it was written for are gone, each after one reading. A data race was excused on
+    the grounds that its exploitability is a timing property and this stage only varies the input;
+    the premise was right and the conclusion was not, because the rate needs no variation at all
+    (`race_primitive`). An uninitialised read was excused on the grounds that it is only a
+    disclosure if the value reaches an output and that `mem_oracle` owns that line; MSan draws the
+    same line in the report this stage already holds (`uninit_primitive`).
+
+    So the table is empty and must stay wired: every class this stage SEES now has a verdict, and
+    the next one that does not should decline by name rather than generically."""
+    assert P.NO_VERDICT_REASON == {}, \
+        "an excuse is back in the table; it needs a verdict, not a reason"
+    for cls in ("use-of-uninitialized-value", "data-race", "heap-buffer-overflow", None):
+        assert P.no_verdict_reason(cls) is None, f"{cls} is excused again; it has a verdict now"
+    P.NO_VERDICT_REASON["a-future-class"] = "because the evidence does not exist"
+    try:
+        assert "evidence" in P.no_verdict_reason("a-future-class"), "the mechanism is unwired"
+    finally:
+        P.NO_VERDICT_REASON.pop("a-future-class")
 
 
 def test_the_stage_reports_the_reason():

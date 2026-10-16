@@ -377,6 +377,7 @@ def msan_detonate(ctx, target, inputs, mode, exec_timeout, base_argv=()) -> int:
     import os as _os
 
     from ...db.dao import ArtifactDAO
+    from ..debug.rootcause import parse_asan_report
     try:
         arts = ArtifactDAO(ctx.conn).list_by_case(target.case_id)
         msa = next((a for a in arts if a.kind == "msan-blob"
@@ -418,6 +419,12 @@ def msan_detonate(ctx, target, inputs, mode, exec_timeout, base_argv=()) -> int:
         txt = (r.stderr or b"").decode("latin-1", "ignore")
         if "MemorySanitizer: use-of-uninitialized-value" not in txt:
             continue
+        # Parse it, for the one distinction this class turns on: whether the undefined bytes
+        # merely got USED or actually LEFT THE PROCESS through an output call. MSan states it and
+        # nothing was reading it, so every uninitialised read in a campaign -- a branch on a
+        # stale flag and 128 bytes of a dead frame going out on a socket -- was filed under one
+        # title, one CWE and one severity.
+        rep = parse_asan_report(txt) or {}
         src = _msan_source_line(msbin, txt)
         # dedup by source line; when addr2line yields nothing, key on the raw (binary+0xOFFSET)
         # frame so DISTINCT unlocated reads don't all collapse into one "uninit" finding.
@@ -429,17 +436,51 @@ def msan_detonate(ctx, target, inputs, mode, exec_timeout, base_argv=()) -> int:
         seen.add(key)
         try:
             sha = ctx.put_artifact("msan-input", data=data)
+            _cwe = rep.get("cwe") or "CWE-457"
+            _escaped = rep.get("escape_bytes") is not None
             fd.upsert(target.id, target.case_id, {
-                "cwe": "CWE-457", "title": "Use of uninitialized value", "severity": "medium",
+                "cwe": _cwe,
+                "title": ("Uninitialized memory disclosed to output" if _escaped
+                          else "Use of uninitialized value"),
+                "severity": rep.get("severity") or "medium",
                 "detector": "msan", "state": "corroborated", "confidence": 0.8,
-                "dedup_key": f"CWE-457:msan:{key}", "function_addr": None, "site_addr": None,
+                "dedup_key": f"{_cwe}:msan:{key}", "function_addr": None, "site_addr": None,
                 "site_detail": src,
                 "evidence": [{"channel": "sanitizer",
-                              "detail": "MemorySanitizer: use of uninitialized value"
-                              + (f" at {src}" if src else "") + f" (input {sha[:12]})"}]})
+                              "detail": (rep.get("detail")
+                                         or "MemorySanitizer: use of uninitialized value")
+                              + (f" at {src}" if src and not rep.get("detail") else "")
+                              + f" (input {sha[:12]})"}]})
             found += 1
         except Exception:
             continue
+        # RECORD IT AS A RUN, for the reason spelled out in `tsan_detonate`: the PoC ladder
+        # iterates dyn_result, and this pass filed only a Finding -- so a real uninitialised-
+        # memory disclosure reached the report as `corroborated` and nothing downstream ever
+        # touched it. No bundle, no volume, no verdict on whose bytes escaped. The isolation tag
+        # names the MSAN build so `replay_exe_for` detonates IT: no other build reports this
+        # class, and the ASan one destroys the evidence (it zeroes a fresh frame and fills a
+        # fresh heap allocation with 0xbe) **[measured]**.
+        #
+        # `crashed=True` is how the ladder recognises a run worth proving. It is the right word
+        # here in the only sense that matters downstream -- the detector halted the process on a
+        # defect it observed -- and the report never calls it a crash: the verdict carries the
+        # class, and an uninitialised read that discloses is titled a disclosure.
+        try:
+            DynResultDAO(ctx.conn).insert(
+                target.id, target.case_id, run_id=getattr(ctx, "run_id", None), input_sha=sha,
+                input_mode=mode, argv=list(tail), crashed=True,
+                signal_name=rep.get("class") or "use-of-uninitialized-value",
+                isolation="msan", defect_key=f"msan:{key}",
+                note=(rep.get("detail") or "MemorySanitizer: use of uninitialized value")
+                     + (f" at {src}" if src else ""))
+        except Exception:
+            try:
+                ctx.emit("msan.norun", payload={
+                    "note": "the uninitialised read was filed as a finding but NOT recorded as "
+                            "a run, so the PoC ladder cannot reach it", "key": str(key)[:80]})
+            except Exception:
+                pass
     if found:
         ctx.emit("msan.done", payload={"uninitialized_reads": found})
     return found

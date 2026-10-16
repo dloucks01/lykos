@@ -1159,6 +1159,27 @@ int main(void){ char b[64]; int i;
          note="SOURCE off-by-one: built with ASan by the platform, so the single-byte overflow is "
               "observable where the plain-binary case cannot fault"),
 
+    Case("src_uninit_disclosure",
+         r"""#include <unistd.h>
+/* The shape a real uninitialised disclosure takes: one call reads input into its frame and
+   returns, a later call at the same stack depth reads its own frame -- which it never wrote --
+   and sends it out. Nothing faults, nothing goes out of bounds, and the bytes that leave are
+   whatever the previous call left behind, i.e. the attacker's input. */
+static void take(void){ char buf[128]; ssize_t n = read(0, buf, sizeof buf); (void)n; }
+static void emit(void){ char b[128]; write(1, b, 128); }
+int main(void){ take(); emit(); return 0; }""",
+         [], want_level=2, want_cwe=("CWE-200", "CWE-457"),
+         as_source=True, budget=420.0,
+         note="SOURCE uninitialised DISCLOSURE, and the whole chain for it: the MSan build "
+              "reports it, the fuzz pass RECORDS it as a run (it used to file a finding and "
+              "nothing else, so the ladder could never see it), and the primitive verdict then "
+              "measures the escape -- which output call, how many bytes, which origin -- and "
+              "plants a marker in the input to establish WHOSE bytes left the process. L2 is "
+              "earned only by that last step. Note the limit this case respects: the escape is "
+              "an intercepted `write`, because a disclosure laundered through uninstrumented "
+              "libc formatting (printf(\"%.64s\", uninit)) loses its shadow and MSan stays "
+              "silent on it -- see src_uninit_read's note."),
+
     Case("src_uninit_read",
          r"""#include <stdio.h>
 static void fill(void){ volatile char pad[64]; for(int i=0;i<64;i++) pad[i]='S'; }
