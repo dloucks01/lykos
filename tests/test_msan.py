@@ -1,8 +1,16 @@
-"""MemorySanitizer path (CWE-457): a source target compiles to a second MSan binary at ingest, and
-detonating an input that reads uninitialized memory against it yields a corroborated CWE-457 finding.
+"""MemorySanitizer path: a source target compiles to a second MSan binary at ingest, and detonating
+an input that reads uninitialized memory against it yields a corroborated finding.
+
 Guards the three integration bugs found the hard way: detonation lives on the sandbox-fuzz path (not
 coverage_fuzz, which skips ASan builds); MSan runs with symbolize=0 (llvm-symbolizer deadlocks under
-captured pipes) and the source line comes from addr2line; and ctx.put_artifact returns the sha str."""
+captured pipes) and the source line comes from addr2line; and ctx.put_artifact returns the sha str.
+
+And two more that were found later. The class is one name for TWO defects -- a value merely used
+(CWE-457) and a value that LEFT THE PROCESS through an output call (CWE-200) -- which only the
+report distinguishes; this pass filed both under one title, one CWE and one severity. This
+fixture's uninitialised buffer reaches `write`, deliberately (a syscall the compiler cannot elide),
+so it is the ESCAPING one and must be labelled as such. Separately, the pass filed a finding and
+recorded NO run, so the PoC ladder -- which iterates dyn_result -- could never reach it."""
 import shutil
 import tempfile
 from pathlib import Path
@@ -51,9 +59,30 @@ def test_msan_detonate_finds_uninitialized_read(store, case):
     assert n == 1, "the 'U' input triggers the uninitialized read; the other does not"
 
     findings = FindingDAO(store.conn).list_by_target(target.id)
-    uninit = [f for f in findings if f.cwe == "CWE-457"]
-    assert uninit, "a CWE-457 finding must be filed"
+    # The bytes reach `write`, so this is the DISCLOSURE half of the class. Filing it as a bare
+    # CWE-457 says the program used a value it never initialised and stops there, which is the
+    # true-but-smaller claim: stack residue left the process and MSan observed it doing so.
+    uninit = [f for f in findings if f.detector == "msan"]
+    assert uninit, "no MemorySanitizer finding was filed"
     f = uninit[0]
+    assert f.cwe == "CWE-200", \
+        f"an uninitialised buffer reaching write(2) is an exposure, not just a read: {f.cwe}"
+    assert "disclosed to output" in (f.title or ""), f.title
+    assert f.severity == "high", f.severity
     assert f.state == "corroborated" and f.detector == "msan"
     detail = " ".join(e.get("detail", "") for e in (f.evidence or []))
     assert "u.c:" in detail, detail  # addr2line-recovered source line in the evidence
+    assert "reached `write`" in detail, detail
+
+    # RECORDED AS A RUN, or the ladder cannot see it -- the defect `tsan_detonate` and the
+    # libFuzzer stage each had before this one. The isolation tag must name the MSAN build: no
+    # other build reports this class, and the ASan one destroys the evidence (it zeroes a fresh
+    # frame and fills a fresh heap allocation with 0xbe).
+    from lykos.db.dao import DynResultDAO
+    rows = [r for r in DynResultDAO(store.conn).list_by_target(target.id)
+            if (r.isolation or "") == "msan"]
+    assert rows, "the uninitialised read was filed as a finding and recorded as no RUN"
+    assert rows[0].input_sha and rows[0].crashed
+    assert rows[0].input_mode == "stdin", \
+        "the channel has to survive: the ladder replays through it"
+    assert (rows[0].defect_key or "").startswith("msan:")

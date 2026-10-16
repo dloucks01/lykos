@@ -438,6 +438,14 @@ def msan_detonate(ctx, target, inputs, mode, exec_timeout, base_argv=()) -> int:
             sha = ctx.put_artifact("msan-input", data=data)
             _cwe = rep.get("cwe") or "CWE-457"
             _escaped = rep.get("escape_bytes") is not None
+            # The location, from whichever source has one. This pass runs with `symbolize=0`
+            # (llvm-symbolizer deadlocks on a captured-pipe stderr), so the report carries no
+            # file:line at all and the parser's detail names no site -- `_msan_source_line`
+            # recovers it with addr2line instead. Appended unless the detail already says it, so
+            # a symbolized report does not get its own site twice.
+            _detail = rep.get("detail") or "MemorySanitizer: use of uninitialized value"
+            if src and src not in _detail:
+                _detail += f" at {src}"
             fd.upsert(target.id, target.case_id, {
                 "cwe": _cwe,
                 "title": ("Uninitialized memory disclosed to output" if _escaped
@@ -447,10 +455,7 @@ def msan_detonate(ctx, target, inputs, mode, exec_timeout, base_argv=()) -> int:
                 "dedup_key": f"{_cwe}:msan:{key}", "function_addr": None, "site_addr": None,
                 "site_detail": src,
                 "evidence": [{"channel": "sanitizer",
-                              "detail": (rep.get("detail")
-                                         or "MemorySanitizer: use of uninitialized value")
-                              + (f" at {src}" if src and not rep.get("detail") else "")
-                              + f" (input {sha[:12]})"}]})
+                              "detail": _detail + f" (input {sha[:12]})"}]})
             found += 1
         except Exception:
             continue
@@ -472,8 +477,7 @@ def msan_detonate(ctx, target, inputs, mode, exec_timeout, base_argv=()) -> int:
                 input_mode=mode, argv=list(tail), crashed=True,
                 signal_name=rep.get("class") or "use-of-uninitialized-value",
                 isolation="msan", defect_key=f"msan:{key}",
-                note=(rep.get("detail") or "MemorySanitizer: use of uninitialized value")
-                     + (f" at {src}" if src else ""))
+                note=_detail)
         except Exception:
             try:
                 ctx.emit("msan.norun", payload={
