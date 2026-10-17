@@ -895,18 +895,57 @@ def _opener_arg_values(params: list) -> list:
     return out
 
 
+#: A constructor parameter that is a CAPACITY, not a flag. Zero is a legal value for a mode or
+#: an option bitmask and a MISUSE for a table size, a bucket count or an initial length.
+_CAPACITY_WORDS = frozenset({"size", "sz", "len", "length", "count", "cnt", "capacity", "cap",
+                             "entries", "slots", "buckets", "nmemb", "nitems", "nelem", "n"})
+#: Identifiers in a parameter declaration, so the NAME can be read without the type. `size_t
+#: opt` is an option that happens to be declared with a size type, and treating its type as the
+#: signal would hand 16 to a flag; `int initial_capacity` is a capacity whose word sits behind
+#: an underscore, where a `\b`-anchored pattern does not match at all.
+_IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _is_capacity_param(decl: str) -> bool:
+    names = _IDENT.findall(decl or "")
+    if not names:
+        return False
+    return bool(_CAPACITY_WORDS & set(re.split(r"[^a-z0-9]+", names[-1].lower())))
+#: What a sane caller passes. json-c's own code calls `lh_table_new` with
+#: JSON_OBJECT_DEF_HASH_ENTRIES == 16, which is the kind of number every container picks.
+_CAPACITY_DEFAULT = "16"
+
+
 def _ctor_arg_values(params: list) -> list:
-    """Arguments for a CONSTRUCTOR. A pointer gets NULL and a scalar gets 0.
+    """Arguments for a CONSTRUCTOR. A pointer gets NULL, a capacity gets 16, anything else 0.
 
     `_arg_values` exists for an opener and hands a pointer `(void*)"r"` -- a file MODE, which is
     right for `TIFFOpen(path, "r")` and wrong here. Passing "r" as expat's encoding name made
     `XML_ParserCreate` fail, so the harness returned at `if (!h)` on EVERY execution: a campaign
     that runs forty thousand inputs and tests nothing. NULL is what an optional argument of this
     kind means -- for expat, "use the encoding the document declares".
+
+    THE CAPACITY RULE IS THE SAME LESSON, MEASURED ON json-c 0.13.1. Every scalar got 0, so the
+    synthesized door was
+        lh_table_new(0, NULL, NULL, NULL); lh_table_insert_w_hash(t, data, size, ...)
+    and `linkhash.c` does `n = h % t->size` -- a divide by zero, reported as two confirmed
+    CWE-369 findings plus a poc-backed "control-flow hijack (potential)" in a library whose own
+    code calls that constructor with 16 (`JSON_OBJECT_DEF_HASH_ENTRIES`) and whose header
+    documents the argument as "initial table size". A hash table of size zero is MISUSE BY THE
+    CALLER, and a crash we caused by misusing the API is not a defect in the API. Meanwhile the
+    library's real parser, fuzzed through its in-tree harness in the same run, took 5,508,986
+    executions without a single crash.
+
+    A fabricated crash in a real library is the worst thing this tool can emit.
     """
     out = []
     for a in params:
-        out.append("NULL" if "*" in a else "0")
+        if "*" in a:
+            out.append("NULL")
+        elif _is_capacity_param(a):
+            out.append(_CAPACITY_DEFAULT)
+        else:
+            out.append("0")
     return out
 
 

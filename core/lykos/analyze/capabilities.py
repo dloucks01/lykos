@@ -64,6 +64,10 @@ DECLINE_TARGET = (
     "no primitive", "needs params", "no crash", "not fuzzed under afl",
     "supply the", "params.", "no fixed-size global", "no named custom allocator",
     "does not terminate",
+    # An ELF shared object handed to an execution stage: ET_DYN with no entry point. A library
+    # is linked against, not run, and the refusal is about the TARGET's nature -- see
+    # `sandbox._is_elf_shared_object` for the fabricated "control-flow hijack" it prevents.
+    "has no entry point",
     # `build_exploit` on a target nothing crashed: "cyclic pattern did not fault on any channel;
     # run fuzz/L2 first". It is the same statement as "no crash" -- there is nothing to escalate
     # -- and it went unclassified on six of the ten foreign-architecture binaries in the first

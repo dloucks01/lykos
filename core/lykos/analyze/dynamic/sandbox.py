@@ -286,6 +286,8 @@ def run_batch(exe, payloads, *, mode="stdin", base_argv=(), timeout: float = 2.0
     amortising the namespace, not by giving one up.
     """
     host = host or host_arch()
+    if _is_elf_shared_object(exe):
+        return None                                      # a library: see run(), same reason
     if (_is_pe(exe) or _is_jvm(exe) or _is_pyc(exe) or _is_wasm(exe) or _is_dotnet(exe)
             or (arch and host and arch != host)):
         # Wine, the JVM, CPython, the CLR and qemu stay per-exec. The batch runner execs the
@@ -446,6 +448,39 @@ def guard_page_env(base_env, *, exe, arch, host, sanitizer: bool):
     except Exception:                                   # noqa: BLE001 -- an oracle, never a blocker
         return base_env, False
     return (env, True) if env is not None else (base_env, False)
+
+
+#: An ELF SHARED OBJECT is not a program: ET_DYN, no program interpreter, and an entry point of
+#: zero. A PIE executable is also ET_DYN, which is why the type alone decides nothing -- it has
+#: a PT_INTERP and a real entry point.
+#:
+#: MEASURED on json-c 0.13.1, and it fabricated the worst finding this tool can emit. The cmake
+#: build produces no executables, so `source_project.build_source_project` fell back to
+#: `_elf_libraries` and returned `libjson-c.so` as the primary target WITH `kind: "library"` --
+#: correctly labelled, and then executed anyway. The loader faulted before any user code, the
+#: program counter landed at 0x7ffff7f6b000 (a non-executable page in the loader's own mapping),
+#: and `rootcause.classify` read "pc not in executable memory" as exactly what it says:
+#:
+#:   control-flow-hijack (CWE-787) in entry0: program counter 0x7ffff7f6b000 is not in
+#:   executable memory (attacker-controlled execution transfer)
+#:
+#: filed poc-backed, as "Remote code execution / control-flow hijack" in a JSON library. 17
+#: identical "crashes", every one of them us running a library as a program. The refusal lives
+#: HERE, at the single door every execution goes through, so no stage has to remember.
+def _is_elf_shared_object(exe) -> bool:
+    try:
+        with open(exe, "rb") as fh:
+            head = fh.read(32)
+    except OSError:
+        return False
+    if head[:4] != b"\x7fELF" or len(head) < 32:
+        return False
+    en = "little" if head[5] == 1 else "big"
+    if int.from_bytes(head[16:18], en) != 3:              # not ET_DYN -> not a library
+        return False
+    entry = int.from_bytes(head[24:32], en) if head[4] == 2 \
+        else int.from_bytes(head[24:28], en)
+    return entry == 0 and not _interp_of(exe)
 
 
 def classify_rc(rc: Optional[int]):
@@ -1996,6 +2031,13 @@ def run(exe, *, argv=(), stdin: bytes = b"", timeout: float = 10.0,
     was running blind on output shape alone -- eleven of the twelve architectures the platform
     builds real targets for. qemu logs the guest PC of each translated block itself."""
     host = host or host_arch()
+    if _is_elf_shared_object(exe):
+        # Not a crash and not a clean run: this image has no entry point, so nothing of the
+        # program ever ran. See `_is_elf_shared_object` for the finding this prevents.
+        return RunResult(isolation="not-runnable", crashed=False, timed_out=False,
+                         note="an ELF shared object has no entry point: a library is LINKED "
+                              "AGAINST, not executed. Fuzz it through a harness (the libFuzzer "
+                              "path) rather than by running it")
     # ORDER MATTERS: a .NET assembly satisfies _is_pe too, and wine cannot execute managed code
     # without Wine Mono -- which reported `crashed=False` with no note, a clean verdict on a
     # target that never ran. The managed test has to come first.

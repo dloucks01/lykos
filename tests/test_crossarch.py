@@ -416,3 +416,44 @@ def test_hppa_registers_come_back_from_a_live_stub(tmp_path):
         assert binascii.unhexlify(g[:8]) != b"\x00\x00\x00\x00", "word 0 is not gr0"
     finally:
         p.kill()
+
+
+def test_a_shared_object_is_not_executed(tmp_path):
+    """A library is LINKED AGAINST, not run -- and running one fabricated the worst finding this
+    tool can emit.
+
+    Measured on json-c 0.13.1: its cmake build produces no executables, so the source-project
+    builder fell back to shared objects and returned `libjson-c.so` as the primary target,
+    labelled `kind: "library"` and then executed anyway. The loader faulted before any user code
+    at a non-executable page in its own mapping, and root_cause read that exactly as it reads:
+
+      control-flow-hijack (CWE-787) in entry0: program counter 0x7ffff7f6b000 is not in
+      executable memory (attacker-controlled execution transfer)
+
+    filed poc-backed as "Remote code execution / control-flow hijack" in a JSON library, 17
+    times. The refusal lives at the single door every execution goes through.
+    """
+    import subprocess
+
+    from lykos.analyze.capabilities import classify_decline
+    from lykos.analyze.dynamic import sandbox as S
+    src = tmp_path / "l.c"; src.write_text("int answer(void){return 42;}\n")
+    lib = tmp_path / "libl.so"
+    if subprocess.run(["gcc", "-shared", "-fPIC", "-w", str(src), "-o", str(lib)],
+                      capture_output=True).returncode:
+        pytest.skip("cannot build a shared object here")
+    assert S._is_elf_shared_object(str(lib))
+    # a PIE EXECUTABLE is also ET_DYN, which is why the type alone decides nothing
+    exe = tmp_path / "p"
+    src2 = tmp_path / "p.c"; src2.write_text("int main(void){return 0;}\n")
+    subprocess.run(["gcc", "-pie", "-fPIE", "-w", str(src2), "-o", str(exe)],
+                   capture_output=True, check=False)
+    if exe.exists():
+        assert not S._is_elf_shared_object(str(exe))
+
+    r = S.run(str(lib), argv=[], stdin=b"", timeout=5)
+    assert not r.crashed, "a library that 'crashes' is the loader, not the program"
+    assert r.isolation == "not-runnable" and "no entry point" in (r.note or "")
+    assert S.run_batch(str(lib), [b"A"], timeout=2) is None
+    # and the refusal has to be classifiable, or the gate reads it as our defect
+    assert classify_decline(r.note) == "target"

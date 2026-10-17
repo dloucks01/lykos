@@ -230,3 +230,37 @@ def test_the_sweep_breaks_on_it_in_the_loop_not_after():
     body = src[src.index("for pre in (prefixes if"):src.index("verified = res.crashed")]
     assert "_san = _san_report(res)" in body, "the sweep no longer asks inside the loop"
     assert "if res.crashed or _san:" in body, "the sweep still breaks on a signal alone"
+
+
+# ------------------------------------------------- a crash WE caused is not a finding
+def test_a_constructors_capacity_is_not_zero():
+    """Measured on json-c 0.13.1, and it fabricated three findings.
+
+    Every scalar constructor argument used to be 0, so the synthesized door was
+
+        lh_table_new(0, NULL, NULL, NULL);  lh_table_insert_w_hash(t, data, size, ...)
+
+    and `linkhash.c` does `n = h % t->size`. The run reported two confirmed CWE-369
+    divide-by-zeros and a poc-backed "control-flow hijack (potential)" against a library whose
+    own code calls that constructor with `JSON_OBJECT_DEF_HASH_ENTRIES` == 16 and whose header
+    documents the argument as "initial table size" -- while json-c's real parser, fuzzed through
+    its in-tree harness in the same run, took 5,508,986 executions and crashed zero times.
+
+    A hash table of size zero is misuse by the caller. A crash we caused by misusing an API is
+    not a defect in that API, and emitting one is the worst thing this tool can do.
+    """
+    assert L._ctor_arg_values(["int size"]) == ["16"]
+    assert L._ctor_arg_values(["size_t nmemb", "unsigned buckets"]) == ["16", "16"]
+    assert L._ctor_arg_values(["int initial_capacity"]) == ["16"]
+    # a pointer still means "the optional thing you did not ask for"
+    assert L._ctor_arg_values(["const char *encoding"]) == ["NULL"]
+    # and a flag or a mode is legitimately zero -- "no options"
+    assert L._ctor_arg_values(["int flags", "unsigned mode", "int opt"]) == ["0", "0", "0"]
+    # The NAME decides, not the type: `size_t opt` is an option declared with a size type, and
+    # reading the type as the signal would hand 16 to a flag. An unnamed parameter stays 0.
+    assert L._ctor_arg_values(["size_t opt"]) == ["0"]
+    assert L._ctor_arg_values(["int"]) == ["0"]
+    assert L._ctor_arg_values(["unsigned num_buckets"]) == ["16"]
+    # the real json-c signature, end to end
+    assert L._ctor_arg_values(["int size", "lh_entry_free_fn *free_fn", "lh_hash_fn *hash_fn",
+                               "lh_equal_fn *equal_fn"]) == ["16", "NULL", "NULL", "NULL"]
