@@ -96,6 +96,10 @@ MECHANISM = {
     "redos": ("CWE-1333",),
     "privilege": ("CWE-250", "CWE-271", "CWE-732"),
     "untrusted-pointer": ("CWE-822", "CWE-823", "CWE-825"),
+    "buffer-underwrite": ("CWE-124", "CWE-786", "CWE-127"),
+    "signedness": ("CWE-195", "CWE-196", "CWE-194"),
+    "dangling-stack": ("CWE-562",),
+    "cert-validation": ("CWE-295", "CWE-297", "CWE-599"),
 }
 _CWE_TO_MECH = {c: m for m, cs in MECHANISM.items() for c in cs}
 
@@ -163,6 +167,20 @@ def substrate_of(case) -> str:
     if cross:
         isa = cross.split("-")[0]
         return "wine" if "mingw" in cross else "q:" + _ISA_ALIAS.get(isa, isa)
+    # A case BUILT by something other than a C compiler runs on that something. Only the
+    # front-end cases carry `want_file_type` (they exist to assert triage), so every managed
+    # DEFECT case fell through to "native" and was counted against the host CPU: measured, the
+    # jvm/pyc/.NET/WASM out-of-bounds cases all read `substrate=native`, which both overstated
+    # native coverage and left the managed columns holding nothing but the front-end row -- the
+    # grid said this engine had never been pointed at a defect inside a runtime. The builder
+    # names the runtime, so read it from the build command rather than from a naming convention.
+    build = " ".join(str(a) for a in (getattr(case, "build", None) or ((), ""))[0])
+    for needle, sub in ((" javac", "jvm"), ("java ", "jvm"), (".pyc", "cpython"),
+                        ("py_compile", "cpython"), ("csc ", "clr"), ("mcs ", "clr"),
+                        ("dotnet", "clr"), ("wat2wasm", "wasm"), ("wasm", "wasm"),
+                        ("upx ", "native")):
+        if needle in build:
+            return sub
     if getattr(case, "as_source", False):
         return "src"
     if "firmware" in case.name:

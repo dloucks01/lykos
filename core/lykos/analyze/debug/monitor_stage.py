@@ -177,6 +177,45 @@ def _parse_sink_addrs(raw) -> dict:
     return out
 
 
+def _merge_into_crash_finding(ctx, target, cwe, detail) -> bool:
+    """Attach a runtime observation to the CRASH FINDING for the input the monitor ran on, instead
+    of opening a parallel row for the same defect.
+
+    This stage runs on an input the ladder already proved (the orchestrator hands it
+    `ordered[0].input_sha`), so when it observes `read()` copying 511 bytes into a 64-byte buffer
+    it is describing the same overflow the crash finding describes -- with better evidence than
+    the crash itself has. Filed under its own dedup key it became a second, weaker row: measured
+    across 22 kept conformance stores, `monitor/CWE-121` stayed `corroborated` 9 times out of 9,
+    every time beside a poc-backed crash finding for the same bug. `FindingDAO.upsert` merges
+    evidence and keeps the HIGHER state, so landing on the crash's key adds the observation
+    without ever weakening what is already proved.
+
+    Returns False when there is no crash finding to merge into (the monitor ran on a non-crashing
+    input, or nothing has been filed yet), and the caller keeps its own row."""
+    sha = (ctx.params or {}).get("input_sha")
+    if not sha:
+        return False
+    from ...db.dao import DynResultDAO, FindingDAO
+    from ..dynamic.stage import find_crash_finding
+    sig = next((d.signal_name for d in DynResultDAO(ctx.conn).list_by_target(target.id)
+                if d.input_sha == sha and d.crashed and d.signal_name), None)
+    if not sig:
+        return False
+    fid = find_crash_finding(ctx.conn, target.id, sig, sha)
+    if not fid:
+        return False
+    fd = FindingDAO(ctx.conn)
+    row = fd.get(fid)
+    if row is None or not row.dedup_key:
+        return False
+    fd.upsert(target.id, target.case_id, {
+        "cwe": row.cwe or cwe, "title": row.title, "severity": row.severity,
+        "detector": row.detector, "state": row.state, "confidence": row.confidence,
+        "dedup_key": row.dedup_key,
+        "evidence": [{"channel": "monitor", "detail": detail}]})
+    return True
+
+
 def monitor_stage(ctx) -> dict:
     target = TargetDAO(ctx.conn).get(ctx.target_id) if ctx.target_id else None
     if target is None:
@@ -277,13 +316,15 @@ def monitor_stage(ctx) -> dict:
         elif k == "copy" and isinstance(h.get("length"), int) and h["length"] >= 0:
             cap = bufsz.get(h.get("caller_name"))
             if cap is not None and h["length"] > cap:
-                fd.upsert(target.id, target.case_id, _finding(
-                    "CWE-121", f"Stack overflow observed: {fn}() copied {h['length']} bytes "
-                    f"into {h['caller_name']}()'s {cap}-byte buffer", "critical",
-                    f"{fn}() copied {h['length']} bytes at runtime; {h['caller_name']}()'s "
-                    f"smallest recovered stack buffer is {cap} bytes (overflow)",
-                    dedup=f"CWE-121:runtime:{h.get('caller_name')}:{fn}", conf=0.9,
-                    state="corroborated"))
+                detail = (f"{fn}() copied {h['length']} bytes at runtime; {h['caller_name']}()'s "
+                          f"smallest recovered stack buffer is {cap} bytes (overflow)")
+                # The same defect as the crash this monitor ran on, when there is one: merge.
+                if not _merge_into_crash_finding(ctx, target, "CWE-121", detail):
+                    fd.upsert(target.id, target.case_id, _finding(
+                        "CWE-121", f"Stack overflow observed: {fn}() copied {h['length']} bytes "
+                        f"into {h['caller_name']}()'s {cap}-byte buffer", "critical", detail,
+                        dedup=f"CWE-121:runtime:{h.get('caller_name')}:{fn}", conf=0.9,
+                        state="corroborated"))
                 findings += 1
 
     # a compact runtime call log (first 40) for the UI/report

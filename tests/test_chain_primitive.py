@@ -463,3 +463,38 @@ def test_the_cpp_vtable_pass_does_not_trust_one_encoding():
     at = inspect.getsource(chain._cpp_vtable_uaf_at)
     assert "max(size, int(pad_to or 0))" in at, "a fixed-width read must get its full width"
     assert "sel + menu._scalar(str(idx).encode(), width) if send_idx else sel" in at
+
+
+def test_the_leads_include_the_detectors_that_name_the_primitive():
+    """Measured across 22 kept conformance stores: `tainted_deref/CWE-787` ("writes through a
+    pointer computed from input") stayed below poc-backed 13 times out of 13, and
+    `heap_fptr_call/CWE-822` ("indirect call through a function pointer in an object field") 5 out
+    of 5 -- every single occurrence. Both NAME the primitive this stage exists to finish, and the
+    lead set was the two dynamic detectors, so a static detector that found the exact shape of the
+    bug had no way to hand it over."""
+    assert set(chain._LEAD_DETECTORS) >= {"heap_trace", "oob_index", "tainted_deref",
+                                          "heap_fptr_call"}
+    assert chain._VCLASS["CWE-787"] == "oob_write"      # a pointer write IS a write-what-where
+    assert chain._VCLASS["CWE-822"] == "heap_overflow"  # an indirect call through a field
+
+
+def test_a_dynamic_lead_outranks_a_static_one():
+    """A traced use-after-free is a fact about this run; a pattern match is a fact about the code.
+    At equal confidence the dynamic lead goes first."""
+    import inspect
+    src = inspect.getsource(chain._lead_finding)
+    assert 'f.detector in ("heap_trace", "oob_index")' in src
+
+
+def test_a_chained_lead_is_promoted_and_a_stalled_one_records_its_ceiling():
+    """One defect was reading as two unrelated rows -- `Use-after-free: corroborated` beside
+    `Control-flow hijack (demonstrated)` -- with nothing saying they are the same bug, and the
+    recipe row said nothing about where the attempt ended either. The PoC is carried back to the
+    lead, and a lead whose chain stalls gets the ceiling and the reason on its own row."""
+    import inspect
+    for f in (chain._file_l3, chain._file_pie_l3, chain._file_www_l3):
+        assert "_promote_lead" in inspect.getsource(f), f.__name__
+    assert "_annotate_lead_ceiling" in inspect.getsource(chain._file_recipe)
+    promote = inspect.getsource(chain._promote_lead)
+    assert '"state": "poc-backed"' in promote and '"dedup_key": lead.dedup_key' in promote
+    assert '"detector": lead.detector' in promote, "the detector that found it keeps the credit"

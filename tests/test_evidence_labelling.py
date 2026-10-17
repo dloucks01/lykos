@@ -264,3 +264,20 @@ def test_a_static_only_mechanism_can_be_asserted_at_all():
     # ...and it does not loosen a case that claims a level: that one still needs the level.
     lv = next(x for x in pc._CASES if x.name == "null_deref")
     assert lv.strict_level and not pc._scored(0, [], lv, statics={"CWE-798"})[0]
+
+
+def test_a_second_unbounded_buffer_still_gets_its_own_poc():
+    """`_has_demonstrated` asks "did SOMETHING overflow on this target", which is the wrong
+    question for a binary with two unbounded buffers: the fuzzer's first crash satisfies it, the
+    synthesis stage is skipped, and the second buffer's finding keeps its `candidate` state
+    forever. Measured across 22 kept conformance stores, `stack_frame/CWE-121` stayed below
+    poc-backed 5 times out of 5 -- every occurrence -- and the stage that exists to prove exactly
+    that shape was never asked for it."""
+    import inspect
+
+    from lykos.analyze import orchestrate
+    src = inspect.getsource(orchestrate.run_case_autopilot)
+    assert "_unproven_frame_lead(store, tid)" in src
+    helper = inspect.getsource(orchestrate._unproven_frame_lead)
+    assert 'f.state != "poc-backed"' in helper
+    assert orchestrate._FRAME_DETECTORS >= {"stack_frame", "scanf_bounded_overflow"}

@@ -838,6 +838,14 @@ def _cve_crash_origins(store, target_id) -> dict:
 # fourteen. See db.models.STATIC_DETECTORS.
 _STATIC_DETECTORS = STATIC_DETECTORS
 # The unbounded stack/buffer-copy family that synthesize_poc exists to demonstrate.
+#: The heap/lifetime defects the crashless menu->shell strategy exists for. Asked per DEFECT, so
+#: a target that already reached L3 on a DIFFERENT bug still gets its heap bug weaponized.
+_HEAP_CWES = frozenset({"CWE-122", "CWE-415", "CWE-416", "CWE-590", "CWE-787", "CWE-129"})
+
+#: Detectors that recover a stack buffer statically -- the leads `synthesize_poc` turns into a
+#: reproduced crash without fuzzing.
+_FRAME_DETECTORS = frozenset({"stack_frame", "scanf_bounded_overflow"})
+
 _OVERFLOW_CWES = frozenset({"CWE-119", "CWE-120", "CWE-121", "CWE-122", "CWE-125", "CWE-193",
                             "CWE-242", "CWE-787"})
 
@@ -918,6 +926,35 @@ def _expensive_substrate(target) -> bool:
         return substrate.foreign_cpu(target.arch, target.file_type, sandbox.host_arch())
     except Exception:                                    # noqa: BLE001 -- ordering hint only
         _log.debug("substrate-cost check failed", exc_info=True)
+        return False
+
+
+def _unproven_frame_lead(store, target_id) -> bool:
+    """Is there a recovered-frame finding -- a static unbounded stack buffer -- that still has no
+    PoC? `_has_demonstrated` answers "did SOMETHING overflow on this target", and that is the
+    wrong question for a binary with more than one buffer: the first crash satisfies it and every
+    other frame stays a candidate."""
+    try:
+        return any(f.detector in _FRAME_DETECTORS and f.state != "poc-backed"
+                   for f in FindingDAO(store.conn).list_by_target(target_id))
+    except Exception:                                    # noqa: BLE001 -- advisory check only
+        _log.debug("frame-lead check failed for %s", target_id, exc_info=True)
+        return False
+
+
+def _unexploited(store, target_id, cwes) -> bool:
+    """Is there a finding in `cwes` on this target that is NOT poc-backed?
+
+    The question the crashless L3 strategies were asking is `_max_verified_poc_level(...) < 3`,
+    which is about the TARGET and not about the defect: a binary with a stack overflow, a format
+    sink and a heap notebook reaches L3 on the first of them and the other two strategies are then
+    skipped entirely -- one exploit per binary, however many exploitable defects it has. Each
+    strategy exists for a specific defect, so each should ask about that defect."""
+    try:
+        return any((f.cwe or "") in cwes and f.state != "poc-backed"
+                   for f in FindingDAO(store.conn).list_by_target(target_id))
+    except Exception:                                    # noqa: BLE001 -- advisory check only
+        _log.debug("unexploited check failed for %s", target_id, exc_info=True)
         return False
 
 
@@ -1751,7 +1788,17 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
             # `not crashes` then skipped the synthesis the hard one needs -- so "find every crash"
             # held for one defect per target but not for several in one binary. The stage no-ops
             # when no stack buffers were recovered, so the added cost is one detonation.
-            if not stop.is_set() and (not crashes or not _has_demonstrated(store, tid, _OVERFLOW_CWES)):
+            # ...and when a RECOVERED FRAME still has no PoC of its own. The gate above asks
+            # whether an overflow was demonstrated ANYWHERE on the target, which is not the same
+            # question: a binary with two unbounded buffers gets one crash from the fuzzer, the
+            # target then "has a demonstrated overflow", and the second buffer's static finding
+            # keeps its `candidate` state forever. Measured across 22 kept conformance stores,
+            # `stack_frame/CWE-121` stayed below poc-backed 5 times out of 5 -- every occurrence --
+            # and the stage that exists to prove exactly that shape was never asked. One
+            # detonation per unproven frame lead is the whole cost.
+            if not stop.is_set() and (not crashes
+                                      or not _has_demonstrated(store, tid, _OVERFLOW_CWES)
+                                      or _unproven_frame_lead(store, tid)):
                 _staged(bud, store, t, "synthesize_poc", status, stop, want=45.0)
                 crashes = _distinct_crashes(store, tid)
             # CVE -> exploit chain: which of these crashes were REPRODUCED by a matched-CVE trigger,
@@ -1819,10 +1866,16 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
             # format strategy directly. The stage self-gates (x86-64, writable GOT, a looping sink)
             # and reports an honest ceiling (full-RELRO / PIE blocks the GOT overwrite) rather than
             # faking it -- so the demonstrated info-disclosure stands and RCE stays potential.
-            if not stop.is_set() and _max_verified_poc_level(store, tid) < 3:
-                fmt_hit = any(
-                    f.cwe == "CWE-134" and f.state in ("corroborated", "confirmed", "poc-backed")
-                    for f in FindingDAO(store.conn).list_by_target(tid))
+            if not stop.is_set() and _unexploited(store, tid, {"CWE-134"}):
+                # `candidate` counts. The gate asked for a CORROBORATED CWE-134, and the
+                # detector that finds a printf sink is static -- it files `candidate` and stays
+                # there unless something else happens to confirm it. Measured across 22 kept
+                # conformance stores: `dangerous_api/CWE-134` appeared 12 times and was below
+                # corroborated in 10 of them, so on ten targets with a format sink the L3 strategy
+                # was never attempted at all. The stage self-gates hard (x86-64, a writable GOT, a
+                # sink reached in a loop) and reports an honest ceiling when it cannot, so the cost
+                # of asking is bounded and the cost of not asking is the whole rung.
+                fmt_hit = any(f.cwe == "CWE-134" for f in FindingDAO(store.conn).list_by_target(tid))
                 if fmt_hit:
                     _staged(bud, store, t, "build_exploit", status, stop,
                                       {"strategy": "format"})
@@ -1835,7 +1888,7 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
             # self-gates (confirms only by a spawned shell; a target whose primitive is not
             # discovered or whose menu does not match just returns an honest "not confirmed"), so
             # this is a bounded attempt, not a false positive.
-            if not stop.is_set() and _max_verified_poc_level(store, tid) < 3:
+            if not stop.is_set() and _unexploited(store, tid, _HEAP_CWES):
                 try:
                     from .poc.exploit_stage import _looks_like_heap_menu
                     tb = store.content.path(t.sha256).read_bytes()

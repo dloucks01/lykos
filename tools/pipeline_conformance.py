@@ -1774,6 +1774,129 @@ int main(void){ setvbuf(stdout,0,2,0);
               "finding for the hang; the only one filed is `dangerous_api/CWE-134`, which is "
               "about printf-family calls and not about this at all."),
 
+    # ---- THIRD WAVE. Each of these is a mechanism whose WEAPONIZATION story differs from its
+    # nearest neighbour, which is the test for being its own row: a negative index reaches what
+    # lies BEFORE a buffer (saved registers, the canary, the preceding global) where an unchecked
+    # positive one reaches what lies after; a signed length that becomes huge is a different fix
+    # from a product that wraps; a function pointer read out of a FILE needs no corruption at all.
+    Case("deserialize_fnptr",
+         r"""#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+void win(void){ execl("/bin/sh","sh",(char*)0); }
+struct state { void (*render)(void); char name[32]; };
+static void plain(void){ printf("plain\n"); }
+int main(int argc, char **argv){ setvbuf(stdout,0,2,0);
+  struct state s; s.render = plain; strcpy(s.name,"new");
+  if(argc > 1){ FILE *f = fopen(argv[1],"rb");
+    if(f){ fread(&s, 1, sizeof s, f); fclose(f); } }   /* a FUNCTION POINTER out of the file */
+  printf("%.32s\n", s.name);
+  s.render();                                          /* ...and called */
+  return 0; }""",
+         ["-no-pie", "-fno-stack-protector", "-O0", "-w"],
+         want_level=0, want_cwe=(), budget=420.0, mechanism="deserialization",
+         note="BUG CLASS unsafe deserialisation (CWE-502) in C, which is what `fread` of a struct "
+              "IS: the saved state carries a function pointer and the file restores it. No "
+              "overflow, no groom, no leak -- the control value is a field, and the only thing "
+              "between the input and the call is that someone trusted the file. The channel is a "
+              "FILE rather than stdin, which is also the point: a cache or session file is the "
+              "classic place this is forgotten."),
+
+    Case("buffer_underwrite",
+         r"""#include <stdio.h>
+long before = 0x1234;                        /* what lies BEFORE the table */
+long table[8];
+int main(void){ setvbuf(stdout,0,2,0);
+  long i, v;
+  printf("idx: "); if(scanf("%ld",&i)!=1) return 0;
+  printf("val: "); if(scanf("%ld",&v)!=1) return 0;
+  if(i < 8) table[i] = v;                    /* bound on the HIGH side only */
+  printf("before=%ld table0=%ld\n", before, table[0]); return 0; }""",
+         ["-no-pie", "-O0", "-w"],
+         want_level=0, want_cwe=(), budget=300.0, mechanism="buffer-underwrite",
+         note="BUG CLASS buffer underwrite (CWE-124/786): the index is bounded on the HIGH side "
+              "only, so a negative one writes BEFORE the array. A different weaponization story "
+              "from the unchecked positive index: what lies before a buffer is the saved frame, "
+              "the canary or the preceding global, and the reach is backwards -- which is why the "
+              "boundary values an index probe drives have to include negatives at all."),
+
+    Case("signedness_length",
+         r"""#include <stdio.h>
+#include <string.h>
+int main(void){ setvbuf(stdout,0,2,0);
+  char dst[64]; char src[256]; memset(src,'A',sizeof src);
+  int n; printf("len: "); if(scanf("%d",&n)!=1) return 0;
+  if(n < 64) memcpy(dst, src, (size_t)n);    /* n == -1 passes the check, then becomes huge */
+  printf("copied %d\n", n); return 0; }""",
+         ["-no-pie", "-fno-stack-protector", "-O0", "-w"],
+         want_level=0, want_cwe=(), budget=300.0, mechanism="signedness",
+         note="BUG CLASS signed-to-unsigned conversion (CWE-195/196). The bound check is SIGNED "
+              "and the copy length is UNSIGNED, so a negative value passes the check and arrives "
+              "at memcpy as something near SIZE_MAX. Distinct from an overflow in a product: the "
+              "arithmetic is correct, the TYPE is wrong, and the fix is a different line."),
+
+    Case("stack_address_return",
+         r"""#include <stdio.h>
+#include <string.h>
+static char *make(const char *in){ char buf[64]; strncpy(buf,in,63); buf[63]=0; return buf; }
+int main(void){ setvbuf(stdout,0,2,0);
+  char line[64]; printf("name: ");
+  if(!fgets(line,sizeof line,stdin)) return 0;
+  char *p = make(line);                      /* a pointer to a DEAD frame */
+  printf("hi %.63s\n", p); return 0; }""",
+         [], as_source=True,
+         want_level=0, want_cwe=(), budget=420.0, mechanism="dangling-stack",
+         note="BUG CLASS return of a stack address (CWE-562) -> use after return. The frame is "
+              "gone the moment `make` returns, and whether the bytes survive to the printf is a "
+              "matter of what the next call reuses -- so the plain build often prints the right "
+              "answer and the defect is invisible. ASan's `detect_stack_use_after_return` is the "
+              "oracle, which is why this is handed over as SOURCE."),
+
+    Case("decompression_bomb",
+         r"""#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <zlib.h>
+int main(void){ setvbuf(stdout,0,2,0);
+  static unsigned char in[1<<16]; size_t n = fread(in,1,sizeof in,stdin);
+  if(!n) return 0;
+  z_stream z; memset(&z,0,sizeof z);
+  if(inflateInit(&z) != Z_OK) return 1;
+  z.next_in = in; z.avail_in = (unsigned)n;
+  unsigned long total = 0;
+  static unsigned char out[1<<16];
+  for(;;){ z.next_out = out; z.avail_out = sizeof out;
+    int r = inflate(&z, Z_NO_FLUSH);
+    total += sizeof out - z.avail_out;       /* no cap on the OUTPUT size */
+    if(r == Z_STREAM_END || r < 0) break;
+    if(z.avail_in == 0 && z.avail_out != 0) break; }
+  inflateEnd(&z);
+  printf("inflated %lu\n", total); return 0; }""",
+         ["-no-pie", "-O0", "-w", "-lz"], requires=("/usr/include/zlib.h",),
+         want_level=0, want_cwe=(), budget=300.0, mechanism="decompression-bomb",
+         note="BUG CLASS decompression bomb (CWE-409): the inflate loop has no cap on the output "
+              "it will produce, so a small input decides how much work the process does. The "
+              "defect is a RATIO, not a fault -- nothing is corrupted and nothing crashes -- so "
+              "the oracle has to be resource accounting rather than a signal."),
+
+    Case("cert_validation",
+         r"""#include <stdio.h>
+#include <openssl/ssl.h>
+int main(void){ setvbuf(stdout,0,2,0);
+  SSL_library_init();
+  SSL_CTX *c = SSL_CTX_new(TLS_client_method());
+  if(!c) return 1;
+  SSL_CTX_set_verify(c, SSL_VERIFY_NONE, 0);  /* the peer's certificate is never checked */
+  printf("ctx ready\n"); SSL_CTX_free(c); return 0; }""",
+         ["-no-pie", "-O0", "-w", "-lssl", "-lcrypto"],
+         requires=("/usr/include/openssl/ssl.h",),
+         want_level=0, want_cwe=(), budget=240.0, mechanism="cert-validation",
+         note="BUG CLASS improper certificate validation (CWE-295): the context is told not to "
+              "verify the peer. Nothing crashes, nothing leaks locally, and there is no input at "
+              "all -- the defect is a CONSTANT passed to one call, which makes it the cleanest "
+              "test of whether this platform can say anything about a configuration defect."),
+
     # ---- INJECTION. A whole bug family the platform has probes for (command, path, SQL, XXE,
     # SSRF) and which nothing asserted: these need no memory corruption at all, so none of the
     # crash machinery above would ever surface them.

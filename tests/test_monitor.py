@@ -279,3 +279,23 @@ def test_winmonitor_live_captures_command():
     assert r["ok"], r.get("note")
     execs = [h for h in r["hits"] if h["kind"] == "exec"]
     assert any(h["value"] == "echo unlocked" for h in execs)
+
+
+def test_a_monitored_overflow_merges_into_the_crash_it_describes():
+    """The monitor runs on an input the ladder already proved, so an observed `read()` copying 511
+    bytes into a 64-byte buffer describes the SAME defect as the crash finding -- with better
+    evidence than the crash itself carries. Filed under its own key it became a second, weaker
+    row: measured across 22 kept conformance stores, `monitor/CWE-121` stayed `corroborated` 9
+    times out of 9, every time beside a poc-backed crash finding for the same bug. `upsert` merges
+    evidence and keeps the higher state, so landing on the crash's key can only add."""
+    import inspect
+
+    from lykos.analyze.debug import monitor_stage
+    src = inspect.getsource(monitor_stage.monitor_stage)
+    i = src.index('h["length"] > cap')
+    assert "_merge_into_crash_finding(ctx, target" in src[i:], "the merge must be tried first"
+    assert src.index("_merge_into_crash_finding", i) < src.index("dedup=f\"CWE-121:runtime:", i)
+    m = inspect.getsource(monitor_stage._merge_into_crash_finding)
+    assert '"state": row.state' in m and '"detector": row.detector' in m, \
+        "merging must not rewrite the crash finding's own state or detector"
+    assert '"channel": "monitor"' in m, "the observation keeps its own channel"

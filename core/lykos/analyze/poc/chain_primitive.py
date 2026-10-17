@@ -43,8 +43,21 @@ _NL = b"\n"
 _WIN_OUT = re.compile(rb"[A-Za-z_][A-Za-z0-9_]{1,15}\{[^}\n]{2,}\}|/bin/sh|^[#$] ", re.I | re.M)
 # CWE -> the aaheg vuln class the discovered primitive represents.
 _VCLASS = {"CWE-415": "double_free", "CWE-416": "uaf", "CWE-122": "heap_overflow",
-           "CWE-129": "oob_write"}
-_LEAD_DETECTORS = ("heap_trace", "oob_index")
+           "CWE-129": "oob_write",
+           # A pointer WRITE computed from input is a write-what-where by another name, and an
+           # indirect call through a field is the hijack this stage searches for -- the same two
+           # routes the CWE-129 and CWE-122 leads take.
+           "CWE-787": "oob_write", "CWE-822": "heap_overflow"}
+#: Which detectors produce a lead worth chaining. Measured across 22 kept conformance stores:
+#: `tainted_deref/CWE-787` ("writes through a pointer computed from input") stayed below
+#: poc-backed 13 times out of 13, and `heap_fptr_call/CWE-822` ("indirect call through a function
+#: pointer in an object field") 5 out of 5 -- every single occurrence. Both NAME the primitive this
+#: stage exists to finish, and neither was ever read: the lead set was the two dynamic detectors,
+#: so a static detector that found the exact shape of the bug could not hand it over. They are
+#: tried last (`confidence` orders the leads, and a static candidate carries less), so a dynamic
+#: lead still goes first and the only cost on a target with no real primitive is the searches'
+#: own attempt caps.
+_LEAD_DETECTORS = ("heap_trace", "oob_index", "tainted_deref", "heap_fptr_call")
 
 
 def _p64(v: int) -> bytes:
@@ -73,11 +86,14 @@ def _drive_overflow(fields, payload: bytes, *, idx: bytes = b"1", num: bytes = b
 
 
 def _lead_finding(conn, target):
-    """The discovered primitive to chain: the highest-confidence heap_trace / oob_index finding."""
+    """The discovered primitive to chain: the highest-confidence lead from any detector that names
+    one (see `_LEAD_DETECTORS`). A DYNAMIC lead outranks a static one at equal confidence, because
+    a traced use-after-free is a fact about this run and a pattern match is a fact about the code."""
     from ...db.dao import FindingDAO
     leads = [f for f in FindingDAO(conn).list_by_target(target.id)
              if f.detector in _LEAD_DETECTORS and f.cwe in _VCLASS]
-    return max(leads, key=lambda f: f.confidence, default=None)
+    return max(leads, key=lambda f: (f.confidence, f.detector in ("heap_trace", "oob_index")),
+               default=None)
 
 
 def _recipe(vclass: str, win, target_bytes: bytes, glibc=None) -> dict:
@@ -817,6 +833,35 @@ def _attribution_proof(ctx, exe, seq, *, control=b"\n"):
         return None
 
 
+def _promote_lead(ctx, target, lead, *, level, bundle_sha, detail) -> None:
+    """Carry the PoC back to the finding that LED to it.
+
+    Every filer here writes a NEW finding for the exploit and leaves the lead where it was, so one
+    defect reads as two unrelated rows: `Use-after-free -- corroborated` beside `Control-flow
+    hijack (demonstrated)`, with nothing saying they are the same bug. Measured across 22 kept
+    conformance stores, a chained lead stayed below poc-backed EVERY time -- 12/12 for
+    `oob_index/CWE-129`, 5/5 for `heap_trace/CWE-416` -- which is a large part of what "a lot of
+    potentials that dead end" actually is: the potential WAS carried, and its row was not updated.
+
+    The lead keeps its own CWE, title and detector (it is still the defect that was found, and the
+    detector that found it deserves the credit); what changes is that it becomes poc-backed, with
+    the bundle as its proof and a line saying what the chain reached."""
+    import json as _json
+
+    from ...db.dao import FindingDAO
+    try:
+        FindingDAO(ctx.conn).upsert(target.id, target.case_id, {
+            "cwe": lead.cwe, "title": lead.title, "severity": "critical",
+            "detector": lead.detector, "state": "poc-backed", "confidence": 0.99,
+            "dedup_key": lead.dedup_key,
+            "evidence": [{"channel": "effects", "detail": _json.dumps([{
+                "kind": "rce", "title": f"Chained to {level}", "status": "demonstrated",
+                "detail": detail,
+                "proof": {"type": "bundle", "sha": bundle_sha, "note": detail}}])}]})
+    except Exception:                                    # noqa: BLE001 -- never fail the filing
+        observe.absorbed(_log, "leaving the lead's state alone")
+
+
 def _file_l3(ctx, target, lead, vclass, win_name, win_addr, seq, *, blame, writer, off, trig,
              exe=None):
     from ...db.dao import FindingDAO, PocDAO
@@ -857,6 +902,7 @@ def _file_l3(ctx, target, lead, vclass, win_name, win_addr, seq, *, blame, write
     fid = fd.id_for_dedup(target.id, cand["dedup_key"])
     if fid:
         PocDAO(ctx.conn).set_finding(poc_id, fid)
+    _promote_lead(ctx, target, lead, level="L3", bundle_sha=bundle_sha, detail=eff)
     ctx.emit("chain.done", payload={"applicable": True, "confirmed": True, "vclass": vclass,
              "win": win_name, "offset": off, "writer": writer, "trigger": trig,
              "bundle": bundle_sha, "proof_level": (proof or {}).get("level", "breakpoint_only")})
@@ -963,6 +1009,7 @@ def _file_pie_l3(ctx, target, lead, vclass, win_name, *, win_vaddr, leak_opt, wr
     fid = fd.id_for_dedup(target.id, cand["dedup_key"])
     if fid:
         PocDAO(ctx.conn).set_finding(poc_id, fid)
+    _promote_lead(ctx, target, lead, level="L3", bundle_sha=bundle_sha, detail=eff)
     ctx.emit("chain.done", payload={"applicable": True, "confirmed": True, "vclass": vclass,
              "win": win_name, "leak": leak_opt, "writer": writer, "offset": off, "trigger": trig,
              "pie": True, "bundle": bundle_sha})
@@ -1209,6 +1256,7 @@ def _file_www_l3(ctx, target, lead, vclass, res, *, arr, writer, reader, width, 
     fid = fd.id_for_dedup(target.id, cand["dedup_key"])
     if fid:
         PocDAO(ctx.conn).set_finding(poc_id, fid)
+    _promote_lead(ctx, target, lead, level="L3", bundle_sha=bundle_sha, detail=eff)
     ctx.emit("chain.done", payload={"applicable": True, "confirmed": True, "vclass": vclass,
              "win": None, "exploit": "www-fsop", "shell": True, "writer": writer, "reader": reader,
              "libc_base": hex(res["libc_base"]), "forged": res["fp_name"], "cells": res["cells"],
@@ -1217,6 +1265,27 @@ def _file_www_l3(ctx, target, lead, vclass, res, *, arr, writer, reader, width, 
     return {"output_shas": [bundle_sha], "output_kind": "poc-bundle",
             "metrics": {"chained": True, "level": "L3", "vclass": vclass, "shell": True,
                         "exploit": "www-fsop"}}
+
+
+def _annotate_lead_ceiling(ctx, target, lead, *, level, why) -> None:
+    """Record on the LEAD how far its chain got and why it stopped.
+
+    `_file_recipe` writes a second row ("Exploitation recipe: ...") and leaves the lead untouched,
+    so one defect becomes two corroborated rows and NEITHER says where the attempt ended --
+    measured, `chain_primitive`'s own recipe finding stayed below poc-backed 7 times out of 7
+    alongside the `oob_index` lead that produced it. A reader then sees two potentials and no
+    account of what was tried. The ceiling goes on the lead, in its own channel, so it survives
+    the next re-run of whichever detector owns the row."""
+    from ...db.dao import FindingDAO
+    try:
+        FindingDAO(ctx.conn).upsert(target.id, target.case_id, {
+            "cwe": lead.cwe, "title": lead.title, "severity": lead.severity,
+            "detector": lead.detector, "state": lead.state, "confidence": lead.confidence,
+            "dedup_key": lead.dedup_key,
+            "evidence": [{"channel": "chain-ceiling",
+                          "detail": f"weaponization reached {level} and stopped: {why}"}]})
+    except Exception:                                    # noqa: BLE001 -- never fail the filing
+        observe.absorbed(_log, "leaving the lead alone")
 
 
 def _file_recipe(ctx, target, lead, vclass, win, recipe, why) -> None:
@@ -1232,7 +1301,7 @@ def _file_recipe(ctx, target, lead, vclass, win, recipe, why) -> None:
         "confidence": 0.5, "dedup_key": f"chain-recipe:{vclass}:{target.id}",
         "site_detail": tech,
         "evidence": [{"channel": "chain", "detail": detail}]})
-
+    _annotate_lead_ceiling(ctx, target, lead, level="L2", why=why)
 
 def register() -> None:
     register_stage(CHAIN_STAGE, chain_primitive_stage, resource_class="cpu",

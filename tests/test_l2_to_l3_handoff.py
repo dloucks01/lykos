@@ -361,3 +361,36 @@ def test_build_exploit_prefers_the_confirmed_framing_over_its_own_derivation():
     assert "_pre, _post = _l2f" in src
     # ...and the early read is for the recipes that detonate on their own, with the same source.
     assert "_measured_frame" in src and "frame=_measured_frame" in src
+
+
+def test_a_candidate_format_sink_still_drives_the_l3_strategy():
+    """The gate asked for a CORROBORATED CWE-134, and the detector that finds a printf sink is
+    static: it files `candidate` and stays there unless something else happens to confirm it.
+    Measured across 22 kept conformance stores, `dangerous_api/CWE-134` appeared 12 times and was
+    below corroborated in 10 of them -- so on ten targets with a format sink the crashless L3
+    strategy was never attempted. The stage self-gates hard (x86-64, writable GOT, a looping
+    sink), so asking costs one declined stage and not asking costs the rung."""
+    import inspect
+
+    from lykos.analyze import orchestrate
+    src = inspect.getsource(orchestrate.run_case_autopilot)
+    i = src.index("fmt_hit = any(")
+    line = src[i:src.index("\n", src.index("list_by_target(tid))", i))]
+    assert "state" not in line, "a candidate format sink must not be filtered out: " + line
+
+
+def test_a_second_exploitable_defect_still_gets_its_strategy():
+    """Both crashless L3 strategies asked `_max_verified_poc_level(target) < 3` -- a question about
+    the TARGET, not about the defect each strategy exists for. A binary with a stack overflow, a
+    format sink and a heap notebook reaches L3 on the first of them and the other two are then
+    skipped entirely: one exploit per binary, however many exploitable defects it has. Each asks
+    about its own defect now."""
+    import inspect
+
+    from lykos.analyze import orchestrate
+    src = inspect.getsource(orchestrate.run_case_autopilot)
+    assert '_unexploited(store, tid, {"CWE-134"})' in src, "the format strategy must ask per defect"
+    assert "_unexploited(store, tid, _HEAP_CWES)" in src, "the heap strategy must ask per defect"
+    helper = inspect.getsource(orchestrate._unexploited)
+    assert 'f.state != "poc-backed"' in helper
+    assert {"CWE-416", "CWE-122", "CWE-129"} <= orchestrate._HEAP_CWES
