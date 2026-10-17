@@ -296,6 +296,17 @@ def installed_headers(root) -> frozenset:
                 for var in set(re.findall(r"\$[{(]([A-Za-z_]\w*)[})]", blob)):
                     blob += " " + setvars.get(var, "")
                 names.update(_HDR_NAME.findall(blob))
+    # A STATEMENT WE CANNOT CHECK IS NOT EVIDENCE. On a tree nobody has configured, the public
+    # header may not exist yet -- libsndfile's `sndfile.h` is generated from `sndfile.h.in` --
+    # and acting on the rule then excludes every candidate the tree really has while the API it
+    # names is unreachable. If not one installed header is on disk, the honest answer is the
+    # same as having found no rule at all: unknown.
+    try:
+        on_disk = {h.name for h in list(root.rglob("*.h"))[:4000]}
+    except OSError:
+        on_disk = set()
+    if names and not (names & on_disk):
+        names = set()
     return _cache_put(_INSTALLED_CACHE, key, frozenset(names))
 
 
@@ -1476,7 +1487,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
 }
 
 
-def _configure_if_needed(root, *, timeout: int = 300) -> bool:
+def ensure_configured(root, *, timeout: int = 300) -> bool:
     """Run the project's own `configure` when a header it generates is missing.
 
     Detected from the templates the tree ships (`*.h.in`): if a template's generated header is
@@ -1674,7 +1685,7 @@ def build_libfuzzer(root, out: Path, *, harness_fn: str | None = None,
     # pipeline the archived tree is post-build and has them; a tree handed over directly does not,
     # and that difference is exactly the kind of "works on the machine we tested" gap that only
     # shows up on someone else's target.
-    _configure_if_needed(root, timeout=timeout)
+    ensure_configured(root, timeout=timeout)
     tmp = Path(tempfile.mkdtemp(prefix="lykos-lf-"))
     srcs = _sources(root, exclude_main=True)
     # Compile THE LIBRARY the entry point belongs to, not the whole repository. Building every

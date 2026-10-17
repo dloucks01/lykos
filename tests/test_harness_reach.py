@@ -435,3 +435,14 @@ def test_a_vendored_harness_is_not_this_projects_harness(lib_with_vendored):
     assert L.find_harnesses(lib_with_vendored) == []
     assert L.find_harness(lib_with_vendored) is None
     assert not any(s["kind"] == "in-tree" for s in L.plan_harnesses(lib_with_vendored))
+
+
+def test_an_install_rule_for_a_header_that_does_not_exist_is_not_evidence(lib_with_internals):
+    """libsndfile's public `sndfile.h` is generated from `sndfile.h.in`, so on a tree nobody has
+    configured the stated API is not on disk. Acting on the rule then excludes every candidate
+    the tree really has in favour of one that cannot be reached at all -- the honest answer is
+    the same as having found no rule: unknown."""
+    (lib_with_internals / "Makefile.am").write_text("nodist_include_HEADERS = generated.h\n")
+    assert L.installed_headers(lib_with_internals) == frozenset()
+    doors = [t["consume"] for t in L.find_handle_triples(lib_with_internals, limit=4)]
+    assert "my_inner_feed" in doors and "my_parse" in doors

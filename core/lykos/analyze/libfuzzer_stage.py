@@ -380,6 +380,13 @@ def libfuzzer_stage(ctx) -> dict:
         # length against the end of the window, and with `limit=first+width` those are equal by
         # construction. So the second pass was never scheduled: libtiff reported DOOR 1/1 with
         # six doors in the tree. Planning costs 0.2-0.4s on a real library.
+        # CONFIGURE BEFORE PLANNING. The plan is read off the tree's headers, and a tree
+        # nobody has configured does not have the generated ones -- libsndfile's public
+        # `sndfile.h` comes from `sndfile.h.in`, so on a pristine checkout the planner could
+        # see only the internal API it is now required to ignore. The build has always
+        # configured; it did it AFTER the door was chosen, which is one step too late. Cheap
+        # when the tree is already configured, which in the pipeline it is.
+        LF.ensure_configured(src)
         plan = LF.plan_harnesses(src, limit=max(first + width, LF.MAX_HARNESSES))
         window = plan[first:first + width]
     if not window:
