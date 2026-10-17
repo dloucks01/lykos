@@ -34,6 +34,13 @@ class WasmInfo:
     exported_symbols: list = field(default_factory=list)
     func_count: int = 0
     mem_pages: Optional[int] = None
+    #: The indirect-call table's initial size, and the function indices the element section
+    #: places in it. A C function POINTER on wasm32 is an index into this table, not an address,
+    #: so a linear-memory overflow over a stored callback redirects `call_indirect` to whichever
+    #: entry the written integer names -- and the search for that is a sweep over a table whose
+    #: size is right here in the module.
+    table_size: Optional[int] = None
+    table_funcs: list = field(default_factory=list)
     has_start: bool = False
     toolchain_hint: str = "unknown"
     mitigations: dict = field(default_factory=dict)
@@ -132,6 +139,43 @@ def _parse_section(sec_id: int, body: bytes, info: WasmInfo):
             info.mem_pages = min(initial, 0x10000)               # wasm32 max is 65536 pages; clamp
     elif sec_id == 8:                                            # start section
         info.has_start = True
+    elif sec_id == 4:                                            # table section -> initial size
+        count, pos = _uleb(body, 0)
+        if count and pos < len(body):
+            pos += 1                                             # reftype
+            flags, pos = _uleb(body, pos)
+            initial, pos = _uleb(body, pos)
+            info.table_size = min(initial, _MAX_VEC)
+    elif sec_id == 9:                                            # element section -> table contents
+        count, pos = _uleb(body, 0)
+        for _ in range(min(count, 16)):                           # a C module has one or two
+            if pos >= len(body):
+                break
+            flags, pos = _uleb(body, pos)
+            if flags == 0:                                        # active, table 0, offset expr
+                pos = _skip_const_expr(body, pos)
+                n, pos = _uleb(body, pos)
+                for _ in range(min(n, _MAX_VEC)):
+                    if pos >= len(body):
+                        break
+                    fi, pos = _uleb(body, pos)
+                    info.table_funcs.append(fi)
+            else:
+                break                                             # passive/declarative: not needed
+
+
+def _skip_const_expr(body: bytes, pos: int) -> int:
+    """Advance past a constant expression (`i32.const N end`), which is how an active element
+    segment states its table offset."""
+    while pos < len(body) and body[pos] != 0x0B:                 # 0x0B = end
+        if body[pos] == 0x41:                                    # i32.const <sleb>
+            pos += 1
+            while pos < len(body) and body[pos] & 0x80:
+                pos += 1
+            pos += 1
+            continue
+        pos += 1
+    return pos + 1
 
 
 def _skip_import_desc(body: bytes, pos: int, kind: int) -> int:

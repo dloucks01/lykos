@@ -1047,7 +1047,7 @@ int main(void){ setvbuf(stdout,0,2,0); setvbuf(stdin,0,2,0);
     # guard is an honest open gap -- and asserting it would test the mutator's luck, not this
     # pipeline. What IS tested: a JVM uncaught exception becoming a demonstrated finding.
     Case("jvm_oob_index", "",
-         [], want_level=0, want_cwe=("CWE-129", "CWE-125", "CWE-20"),
+         [], want_level=1, strict_level=True, want_cwe=("CWE-129", "CWE-125", "CWE-20"),
          requires=("javac", "java"), budget=420.0,
          build=(["sh", "-c",
                  "printf 'import java.io.*;\\npublic class Idx{public static void main(String[] a)"
@@ -1057,7 +1057,8 @@ int main(void){ setvbuf(stdout,0,2,0); setvbuf(stdin,0,2,0);
                  "System.out.println(\"slot \"+i+\" = \"+t[i]);}}' > Idx.java && javac Idx.java"],
                 "Idx.class"),
          note="JVM DYNAMIC: an array indexed by the unvalidated input length, demonstrated as an "
-              "uncaught ArrayIndexOutOfBoundsException rather than merely identified as bytecode"),
+              "uncaught ArrayIndexOutOfBoundsException rather than merely identified as bytecode"
+              " Measured with --ceiling: L1 (directed_fuzz/CWE-129, 247s). The matrix read L0 for this because the case demanded L0, not because the ladder stopped there -- and demanding the rung was unsafe until the bundle could carry it: the gate judged every reproducer by a NATIVE crash's exit status (>=128), and an uncaught JVM exception exits 1."),
 
     Case("fmt_pyc", "",
          [], want_level=0, want_cwe=(), want_file_type="pyc", budget=120.0,
@@ -1073,14 +1074,15 @@ int main(void){ setvbuf(stdout,0,2,0); setvbuf(stdin,0,2,0);
     # input's LENGTH so a broad class of inputs reaches it, for the reason spelled out on
     # jvm_oob_index: a `int(line)` guard would test the mutator's luck instead of the pipeline.
     Case("pyc_oob_index", "",
-         [], want_level=0, want_cwe=("CWE-129", "CWE-125", "CWE-20"),
+         [], want_level=1, strict_level=True, want_cwe=("CWE-129", "CWE-125", "CWE-20"),
          requires=("python3",), budget=420.0,
          build=(["sh", "-c",
                  "printf 'import sys\ns = sys.stdin.readline()\nt = [1, 2, 3, 4]\n"
                  "print(\"slot\", len(s), \"=\", t[len(s)])\n' > oob.py && "
                  "python3 -m py_compile oob.py"], "oob.*.pyc"),
          note="PYC DYNAMIC: a list indexed by the unvalidated input length, demonstrated as an "
-              "uncaught IndexError rather than merely identified as CPython bytecode"),
+              "uncaught IndexError rather than merely identified as CPython bytecode"
+              " Measured with --ceiling: L1 (fuzz/CWE-129 + root_cause/CWE-129, 218s). The deliverable was the blocker, not the ladder: `poc/stage` mapped only jar and class, so a .pyc fell through to the native branch and the reproducer said `./target.bin < ./input.bin` -- a file the shell cannot execute."),
 
     Case("fmt_wasm", "",
          [], want_level=0, want_cwe=(), want_file_type="wasm", budget=120.0,
@@ -1102,7 +1104,7 @@ int main(void){ setvbuf(stdout,0,2,0); setvbuf(stdin,0,2,0);
     # nothing. Only an access past the END of linear memory traps, which is this platform's
     # honest ceiling on this substrate and is recorded on wasm.TRAP_CWE.
     Case("wasm_oob_store", "",
-         [], want_level=0, want_cwe=("CWE-119", "CWE-787", "CWE-125", "CWE-129"),
+         [], want_level=1, strict_level=True, want_cwe=("CWE-119", "CWE-787", "CWE-125", "CWE-129"),
          requires=("node", "clang"), budget=420.0,
          build=(["sh", "-c",
                  "printf 'static char buf[64];\n"
@@ -1115,7 +1117,47 @@ int main(void){ setvbuf(stdout,0,2,0); setvbuf(stdin,0,2,0);
                  "clang --target=wasm32 -nostdlib -Wl,--no-entry -O0 -o w2.wasm w2.c"],
                 "w2.wasm"),
          note="WASM DYNAMIC: a store at an offset taken from the input, demonstrated as an "
-              "out-of-bounds trap rather than merely identified as a wasm module"),
+              "out-of-bounds trap rather than merely identified as a wasm module"
+              " Measured with --ceiling. A WASM module is not a process: the bundle ships the driver that instantiates it, and the verdict is report.json's status rather than an exit code, because node exits 0 whether the module trapped or not."),
+
+    # The hijack a sandboxed substrate CAN have. The engine's own guard says it right: the
+    # WebAssembly engine owns the instruction pointer and no linear-memory corruption gives it up,
+    # so "control-flow hijack" in the native sense is not a claim this runtime supports. This is a
+    # different claim. A C function pointer on wasm32 is a 4-byte INDEX into
+    # __indirect_function_table, held in linear memory like any other field -- so an overflow
+    # changes which function the module's own `call_indirect` dispatches to, with the engine's
+    # type check still enforced and no further reach than the host's grants to this module.
+    #
+    # `win` executes `__builtin_trap()` precisely so the effect is unforgeable: the engine's trap
+    # message becomes "unreachable", which `plain` (which returns) can never produce. The sweep
+    # confirms against two controls -- the module's behaviour on a payload that never reaches the
+    # pointer, and a benign table slot AT THE SAME OFFSET.
+    Case("wasm_fnptr_hijack", "",
+         [], want_level=3, want_cwe=(), mechanism="type-confusion",
+         requires=("node", "clang"), budget=480.0,
+         build=(["sh", "-c",
+                 "printf 'typedef void (*cb_t)(void);\n"
+                 "static void plain(void) { }\n"
+                 "static void win(void)   { __builtin_trap(); }\n"
+                 "__attribute__((used)) static cb_t handlers[2] = { plain, win };\n"
+                 "struct obj { char buf[32]; cb_t cb; };\n"
+                 "static struct obj o = { .cb = plain };\n"
+                 "__attribute__((export_name(\"take\"))) void take(char *p, int n) {\n"
+                 "  for (int i = 0; i < n; i++) o.buf[i] = p[i];\n"
+                 "  o.cb(); }\n' > w3.c && "
+                 "clang --target=wasm32 -O1 -nostdlib -Wl,--no-entry -Wl,--export-all "
+                 "-o w3.wasm w3.c"],
+                "w3.wasm"),
+         note="WASM FUNCTION-POINTER HIJACK (CWE-787 -> an attacker-chosen indirect call). The "
+              "overflow runs out of `buf` into `cb`, which on wasm32 is a table INDEX rather than "
+              "an address -- so none of the native machinery applies: there is no PC to recover an "
+              "offset from, and a wrong index does not fault anywhere near its own value. The "
+              "table is small and the module enumerates it in its element section, so the search "
+              "is a sweep rather than a leak. Hand-proved first: slot 1 (plain) leaves the module "
+              "clean and slot 2 (win) traps with \"unreachable\", and the engine's own driver then "
+              "found it in 35 runs. The sandbox is the ceiling and the finding says so: no native "
+              "code executes and there is no shell -- the demonstrated effect is control of which "
+              "function the module calls."),
 
     # CHANNEL x FORMAT, the cell no case covered. Every non-stdin case above is a native ELF and
     # every managed case is stdin-only, so nothing asked whether a channel the ranking OFFERS can
@@ -1129,7 +1171,7 @@ int main(void){ setvbuf(stdout,0,2,0); setvbuf(stdin,0,2,0);
     # so a clean verdict here means the channel delivered nothing -- which is precisely what the
     # ranking was spending its budget on before.
     Case("wasm_argv_trap", "",
-         [], want_level=0, want_cwe=("CWE-119", "CWE-787", "CWE-125"),
+         [], want_level=1, strict_level=True, want_cwe=("CWE-119", "CWE-787", "CWE-125"),
          requires=("node", "clang"), budget=300.0,
          build=(["sh", "-c",
                  "printf '__attribute__((import_module(\"wasi_snapshot_preview1\"), "
@@ -1142,7 +1184,8 @@ int main(void){ setvbuf(stdout,0,2,0); setvbuf(stdin,0,2,0);
                  "clang --target=wasm32 -nostdlib -Wl,--no-entry -O0 -o w3.wasm w3.c"],
                 "w3.wasm"),
          note="WASM ARGV: a WASI command whose only input channel is argv, demonstrated as an "
-              "out-of-bounds trap -- a clean verdict here means the channel delivered nothing"),
+              "out-of-bounds trap -- a clean verdict here means the channel delivered nothing"
+              " Measured with --ceiling. Same deliverable shape as wasm_oob_store: the host travels with the bundle and the trap verdict comes back in a file."),
 
     # A .NET assembly IS a PE, so for as long as the dispatch asked only "is it a PE" this went
     # to WINE -- which cannot execute managed code without Wine Mono. Nothing ran, and the run
@@ -1166,12 +1209,13 @@ int main(void){ setvbuf(stdout,0,2,0); setvbuf(stdin,0,2,0);
     # file under a generated name, with no runtimeconfig.json and no .dll extension, and the
     # `dotnet` muxer refuses both. If either were unhandled every execution would be a non-run.
     Case("dotnet_oob_index", "",
-         [], want_level=0, want_cwe=("CWE-129", "CWE-125", "CWE-20"),
+         [], want_level=1, strict_level=True, want_cwe=("CWE-129", "CWE-125", "CWE-20"),
          requires=("dotnet",), budget=480.0,
          build=_csc_build(_CS_OOB, 'oobnet.dll'),
          note="DOTNET DYNAMIC: an array indexed by the unvalidated input length, demonstrated "
               "as an unhandled IndexOutOfRangeException under the CLR rather than merely "
-              "identified as a .NET assembly"),
+              "identified as a .NET assembly"
+              " Measured with --ceiling. The deliverable needed two things an ingested assembly never has: a .dll filename (the muxer dispatches on the extension) and a generated runtimeconfig.json, both of which the bundle now writes in its setup."),
 
     Case("fmt_upx_packed", "",
          [], want_level=0, want_cwe=(), want_file_type="elf", budget=120.0,
@@ -1640,6 +1684,59 @@ int main(void){ setvbuf(stdout,0,2,0);
               "plausible-looking number -- so this is handed over as SOURCE for the platform's own "
               "sanitizer build. Measured: `tsan/CWE-362` at L1, which is the family's ceiling by "
               "construction -- a race is a scheduling fact, not an attacker-chosen write."),
+
+    # ---- THE CONTROLLED INGREDIENT. Several classes sit at L1 only because the fixture withholds
+    # the one thing that makes them exploitable, not because the class caps there. A write through
+    # NULL is a denial of service; the same missing check with an attacker-chosen OFFSET is
+    # address control. Bytes staged in an executable page are a TTP; the same page CALLED is code
+    # execution. These cases supply the ingredient and demand the rung it buys.
+    Case("unchecked_malloc_offset",
+         r"""#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+int main(void){ setvbuf(stdout,0,2,0);
+  char line[64];
+  printf("size: "); if(!fgets(line,sizeof line,stdin)) return 0;
+  size_t n = (size_t)strtoull(line,0,10);
+  long *p = malloc(n);                       /* return value never checked */
+  printf("slot: "); if(!fgets(line,sizeof line,stdin)) return 0;
+  long i = strtol(line,0,10);                /* ...and the index is the attacker's */
+  p[i] = 0x4141414141414141L;                /* so the faulting ADDRESS is chosen, not NULL */
+  printf("ok\n"); return 0; }""",
+         ["-no-pie", "-O0", "-w"],
+         want_level=2, want_cwe=(), budget=360.0, mechanism="unchecked-return",
+         strict_level=True,
+         note="BUG CLASS unchecked return + attacker-chosen offset (CWE-252 -> CWE-787). "
+              "`unchecked_malloc` measures L1 because every fault is at address 0: a denial of "
+              "service, and the address-control verdict correctly refuses to call a fixed address "
+              "a primitive. Here the SAME missing check is paired with an index the input "
+              "supplies, so the fault address moves with the input -- which is the definition the "
+              "address-control verdict was built on, and the rung the pair earns."),
+
+    Case("jit_page_executed",
+         r"""#include <stdio.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
+int main(void){ setvbuf(stdout,0,2,0);
+  void *pg = mmap(0, 0x1000, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+  if(pg == MAP_FAILED) return 1;
+  char b[256]; printf("code: ");
+  ssize_t n = read(0, b, sizeof b);
+  if(n <= 0) return 0;
+  memcpy(pg, b, (size_t)n);
+  mprotect(pg, 0x1000, PROT_READ|PROT_EXEC);   /* a plugin/JIT loader: the page is made code... */
+  ((void(*)(void))pg)();                       /* ...and CALLED */
+  printf("returned\n"); return 0; }""",
+         ["-no-pie", "-fno-stack-protector", "-O0", "-w"],
+         want_level=3, want_cwe=(), budget=420.0, mechanism="code-injection",
+         note="BUG CLASS code injection (CWE-94) where the program does the hard part itself: a "
+              "plugin/JIT loader copies the input into a page it then makes executable AND CALLS. "
+              "`mprotect_shellcode` measures L1 because it stages the bytes and returns -- "
+              "control never reaches them, and the page's address is never disclosed, so there is "
+              "nothing to redirect to. Here no exploitation is required at all: the only question "
+              "is whether the pipeline synthesizes bytes that DO something (a shell) rather than "
+              "just crashing the process, which is what the shellcode strategy exists for."),
 
     # ---- SECOND WAVE: mechanisms whose DETECTOR may or may not exist. Each of these lands at
     # want_level=0 / want_cwe=() for the same reason as the wave above -- the case is the

@@ -294,10 +294,19 @@ With that fixed, the obvious question was whether the ladder stops there or the 
 nobody had asked: all four managed defect cases demand L0. Two measurements in, the answer is
 the cases.
 
-| case | ceiling | what carried it |
-|---|---|---|
-| `jvm_oob_index` | **L1** | `directed_fuzz/CWE-129`, 247s |
-| `pyc_oob_index` | **L1** | `fuzz/CWE-129` + `root_cause/CWE-129`, 218s |
+| case | substrate | ceiling | what carried it |
+|---|---|---|---|
+| `jvm_oob_index` | jvm | **L1** | `directed_fuzz/CWE-129`, 247s |
+| `pyc_oob_index` | cpython | **L1** | `fuzz` + `root_cause/CWE-129`, 218s |
+| `dotnet_oob_index` | clr | **L1** | `fuzz/CWE-129`, 296s |
+| `wasm_oob_store` | wasm | **L1** | `fuzz` + `root_cause/CWE-119`, 150s |
+| `wasm_argv_trap` | wasm | **L1** | 111s |
+
+All five, 5/5, and all five now DEMAND it with `strict_level` -- so the grid reads `bad-index L1`
+on clr/cpython/jvm/wasm and `oob-read`/`oob-write L1` across them, where it used to hold nothing
+but the front-end row. The ladder was never what stopped at L0: every runtime already reports
+`crashed=True` with the exception name as the signal, so `verified = res.crashed` was always
+satisfiable.
 
 But demanding that rung would have been unsafe, because the DELIVERABLE was broken in two places
 and nothing was asking it to work:

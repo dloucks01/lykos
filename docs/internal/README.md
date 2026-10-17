@@ -9,6 +9,9 @@ What's here:
 - **Roadmap & backlog** — `13-roadmap-milestones.md`, `20-open-work-backlog.md`
 - **Reviews & plans** — `21-crs-harvest-review.md`, `24-modernization-plan.md`,
   `30-missing-capabilities-implementation-plan.md` (sequenced plan for doc 20's open queue)
+- **`38-technique-program-2026-10-17.md`** — every exploitation technique in one of three
+  states: driven end to end, knowledge-base only, or absent. The ordered program for the
+  second two, and the two that honestly end in a version-gated refusal.
 - **`37-weaponization-depth-2026-10-17.md`** — every matrix cell showed the level a case DEMANDS,
   so four mechanism rows read L0/L2 and nobody could say whether that was the engine or the
   fixture. `--ceiling` measures the reach; four rungs raised, three honest ceilings recorded.

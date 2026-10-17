@@ -27,7 +27,21 @@ GADGETS = {
     "pop_rsi_r15": b"\x5e\x41\x5f\xc3",  # pop rsi ; pop r15 ; ret (libc_csu)
     "jmp_rsp": b"\xff\xe4",           # jmp rsp  -- redirect PC to the stack (ret2shellcode, no leak)
     "call_rsp": b"\xff\xd4",          # call rsp -- same, pushing a return first
+    # STACK PIVOT. The answer when the overflow reaches the saved return address and then runs out
+    # of room: a chain needs several words past it and a short overflow has one or two, so the
+    # first word redirects RSP into a buffer that IS long enough and the chain lives there.
+    #   leave; ret   -- rsp = rbp + 8, so whoever controls the saved RBP controls the new stack
+    #   pop rsp; ret -- rsp comes straight off the stack: the next word IS the new stack pointer
+    #   xchg rax,rsp -- pivot to a register already pointing at the buffer (common after a read
+    #                   wrapper returns it)
+    "leave_ret": b"\xc9\xc3",         # leave ; ret
+    "pop_rsp": b"\x5c\xc3",           # pop rsp ; ret
+    "xchg_rax_rsp": b"\x48\x94\xc3",  # xchg rax, rsp ; ret
 }
+
+#: `add rsp, imm8 ; ret` -- the third pivot shape, and the only one whose encoding carries a
+#: PARAMETER (how far the stack moves), so it is searched rather than matched: 48 83 C4 <imm8> C3.
+_ADD_RSP_IMM8 = (b"\x48\x83\xc4", b"\xc3")
 
 
 def _loads(data):
@@ -90,6 +104,52 @@ def find_gadget(data: bytes, name: str):
 # does rdx=r15; rsi=r14; edi=r13d; call [r12+rbx*8] -- a full 3-argument controlled call.
 CSU_POP = bytes([0x5b, 0x5d, 0x41, 0x5c, 0x41, 0x5d, 0x41, 0x5e, 0x41, 0x5f, 0xc3])
 CSU_CALL = bytes([0x4c, 0x89, 0xfa, 0x4c, 0x89, 0xf6, 0x44, 0x89, 0xef, 0x41, 0xff, 0x14, 0xdc])
+
+
+def find_pivots(data: bytes) -> list:
+    """Every stack-pivot gadget in an executable segment, as [{insn, va, kind, delta}].
+
+    A pivot is what makes a SHORT overflow exploitable. The engine already recovers the offset to
+    the saved return address and, when only a word or two follows it, correctly reports that the
+    chain does not fit -- an L2 primitive with no L3. The pivot moves RSP somewhere that does fit:
+
+      * `leave; ret` consumes the saved RBP, which the same overflow wrote, so the attacker names
+        the new stack outright. Two words of overflow are enough.
+      * `pop rsp; ret` takes the new stack pointer from the next word on the old stack.
+      * `add rsp, N; ret` steps forward into a region the same write already filled.
+      * `xchg rax, rsp; ret` pivots to a register that already points at the buffer.
+
+    Ordered by how little the attacker has to know: `leave; ret` first (it needs only the saved
+    RBP, which the overflow supplies), then the pops, then the register exchange."""
+    out = []
+    for name, kind in (("leave_ret", "rbp"), ("pop_rsp", "stack"), ("xchg_rax_rsp", "reg:rax")):
+        va = find_gadget(data, name)
+        if va:
+            out.append({"insn": name.replace("_", " "), "va": va, "kind": kind, "delta": None})
+    # add rsp, imm8 ; ret -- one entry per distinct displacement, smallest first
+    pre, post = _ADD_RSP_IMM8
+    seen = set()
+    for off, sz, va, fl in _loads(data):
+        if not (fl & 1):
+            continue
+        seg = data[off:off + sz]
+        i = 0
+        while True:
+            j = seg.find(pre, i)
+            if j < 0 or j + 5 > len(seg):
+                break
+            i = j + 1
+            if seg[j + 4:j + 5] != post:
+                continue
+            delta = seg[j + 3]
+            if delta in seen or delta == 0:
+                continue
+            seen.add(delta)
+            out.append({"insn": f"add rsp, 0x{delta:x} ; ret", "va": va + j,
+                        "kind": "advance", "delta": delta})
+    out.sort(key=lambda g: ({"rbp": 0, "stack": 1, "advance": 2}.get(g["kind"], 3),
+                            g["delta"] or 0))
+    return out
 
 
 def find_csu(data: bytes):
