@@ -14,17 +14,17 @@ An exploitation technique is in one of three states here, and the difference is 
 ret2system, ret2csu, ret2dlresolve, ret2plt, SROP, BROP (blind, forking server), one_gadget, ORW
 and seccomp-aware ORW, mprotect→shellcode, format-string `%n` → GOT / ret2win /
 write-what-where, magic-value overwrite, PIE one-byte partial overwrite, tcache poisoning, House
-of Apple 2 (one-piece, split, and the five-cell form for a one-word-at-a-time writer), the heap
-and C++ hijacks (adjacent code pointer, vtable, indexed-write GOT), and — new — the WASM
-indirect-call redirect.
+of Apple 2 (one-piece, split, and the cell form for a one-word-at-a-time writer — with either
+`system` or `setcontext` as the fake `__doallocate`), the heap and C++ hijacks (adjacent code
+pointer, vtable, indexed-write GOT), and — new — the WASM indirect-call redirect, the stack pivot
+and `setcontext` register control.
 
 **Knowledge-base only:** fastbin_dup, House of Spirit, House of Force, unlink, unsorted-bin
 attack, large-bin attack.
 
-**Absent:** stack pivot; `setcontext` register control; `__exit_funcs`/`atexit` and TLS
-`dtor_list`; House of Apple 1/3, House of Cat and `_IO_list_all` corruption; tcache stashing and
-`tcache_perthread_struct`; ret2vdso; JOP/COP; canary byte-brute against a forking server;
-`_rtld_global` lock gadgets.
+**Absent:** `__exit_funcs`/`atexit` and TLS `dtor_list`; House of Apple 1/3, House of Cat and
+`_IO_list_all` corruption; tcache stashing and `tcache_perthread_struct`; ret2vdso; JOP/COP;
+canary byte-brute against a forking server; `_rtld_global` lock gadgets.
 
 ## The order, and why
 
@@ -32,13 +32,40 @@ Each item below is one unit of work: the technique, a fixture where it is the ON
 conformance case demanding the rung, and a measured run. The order is value × feasibility on the
 glibc actually installed here, not textbook order.
 
-1. **Stack pivot** (`leave; ret`, `pop rsp`, `add rsp, N`). No allocator dependence, pure gadget
-   work, and it unlocks a class the engine currently abandons: an overflow with only a few words
-   past the saved return address cannot hold a ret2libc chain, so today it stops at L2 with the
-   offset proved. A pivot moves `rsp` into a buffer that CAN hold the chain.
-2. **`setcontext` register control.** One controlled write plus a pointer to a fake `ucontext`
-   gives every register, which is the standard modern finish for a write-what-where when the
-   FILE route is blocked. Pairs directly with the five-cell writer already built.
+1. ~~**Stack pivot**~~ — **DONE.** `rop.find_pivots`/`pivot_placement`/`build_pivot_chain`/
+   `pivot_fits` and a `pivot` strategy in `exploit_stage`. `stack_pivot_shell` PASSes L3 through
+   the autopilot in 133s. The thing that had to be measured rather than read: the pivoted stack is
+   not a place the chain reads words from, it *is* the stack, so what the placement needs is
+   **writable memory below the chain**, not room inside the buffer. With the chain at the buffer's
+   start the pivot fired and the process died in `_dl_runtime_resolve_xsavec`; with the PLT slot
+   pre-resolved, `system()` itself still segfaulted on 192, 448 and 960 bytes of slack and spawned
+   a shell on 1984. A 256-byte buffer with 8 KiB of unrelated globals underneath works.
+2. ~~**`setcontext` register control**~~ — **DONE.** `rop.find_setcontext` locates the
+   register-loading entry by decoding `mov reg,[rdx+disp]` out of the byte stream (it must skip
+   the prologue's `fldenv [rcx]`/`ldmxcsr [rdx+0x1c0]`, or the forged context would need a valid
+   fpregs *pointer* too — the usable entry is **+0x35** here, not the +61 the write-ups quote),
+   and `heap.setcontext_fsop_cells` is the FSOP plan `leak.indexed_write_fsop` now tries first.
+
+   It works on one instruction in the caller: `_IO_wdoallocbuf` does `mov rdx,rdi` before
+   `call [rax+0x68]`, so at the controlled call RDX holds the FILE pointer — **the forged FILE is
+   its own `ucontext`**. The gregs offsets land on fields that are dead by then (`_chain` = RDI,
+   `_fileno` = RSI, `_freeres_list` = RIP) or that we are setting anyway (`_wide_data` = RSP, so
+   the pivoted stack is the forged wide_data by construction, not a free parameter).
+
+   Two `_flags` bits carry it, and neither was obvious:
+   * `_IO_UNBUFFERED` must be **cleared** — `_IO_wdoallocbuf` opens `test BYTE PTR [rdi],0x2` and
+     the unbuffered path never reaches the vtable call. The `system` plan only gets away with
+     leaving it alone because `" /bin/sh"`'s leading space clears it by accident.
+   * `_IO_USER_LOCK` must be **set** — `_IO_flockfile` is
+     `if ((fp->_flags & _IO_USER_LOCK) == 0) _IO_lock_lock (*fp->_lock)`, so setting it stops
+     `_lock` being dereferenced. That is the only reason fp+0x88 is free to be `gregs[RDX] = 0`,
+     and a NULL rdx is what lets RIP go **straight to `execve("/bin/sh", NULL, NULL)` with no
+     chain and no gadget at all** — which matters, because this glibc has no `pop rdx; ret` in an
+     executable segment (a raw `blob.find(b"\x5a\xc3")` finds one in `.rodata` and the jump
+     faults on *execute*, with `si_addr == rip`).
+
+   Nine cells, measured live on the `oob_index_write` fixture and through the generated bundle
+   reproducer. `system` stays as the fallback plan and keeps its own test.
 3. **Large-bin attack → `_IO_list_all` / House of Cat.** The modern no-hook chain: a large-bin
    attack writes a HEAP pointer to a chosen address, which is exactly what corrupting
    `_IO_list_all` needs. Covers the case where `_IO_2_1_stderr_` is unusable.

