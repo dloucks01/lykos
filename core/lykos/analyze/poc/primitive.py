@@ -1365,3 +1365,138 @@ def widening_effect(w: dict) -> str:
             f"baseline rate, so the defect is reliable on demand rather than a retry away, and "
             f"the bundle ships THAT input. The baseline rate is itself an 8-sample estimate, so "
             f"this is a directional result and not a published p-value")
+
+
+# --------------------------------------------------------------- address control, no sanitizer
+# THE CLASS EVERY REAL BINARY ACTUALLY PRESENTS. `oob_access_primitive` answers "does the
+# attacker choose how far out of bounds this goes?" from a SANITIZER report, which exists only
+# for a target we compiled ourselves. A stripped third-party binary gives a signal, a faulting
+# instruction and -- from the ptrace helper, which has recorded it all along -- the address the
+# fault touched. Nothing read it for a verdict, so every real-corpus finding in this project
+# tops out at L1: libtiff, expat and busybox are all "verified crash, no primitive".
+#
+# Measured on busybox 1.21.1, found through the `lzcat` door: 8 reproducible SIGSEGVs,
+# `mov al,BYTE PTR [rdx+rax*1]` at the fault, and `root_cause` filed it as a NULL-pointer
+# dereference (CWE-476, medium, "denial of service") because THAT input's address happened to
+# land at 0. A second input faulted at 0x5dc12e14. One observation cannot tell those apart; the
+# question only has an answer across several.
+#
+# The question asked here is the same one the sanitizer family asks, measured differently: vary
+# the input, hold the faulting INSTRUCTION fixed, and watch the ADDRESS. If it moves with the
+# input, the attacker chooses where the program reads or writes -- which is a primitive -- and if
+# it does not, this is a fixed wild pointer and the honest answer is a denial of service.
+_ADDR_LABEL = re.compile(r"byte@(0x[0-9a-fA-F]+|\d+)=(0x[0-9a-fA-F]+|\d+)")
+#: Below this many distinct faulting observations the question cannot be asked at all.
+_MIN_ADDR_OBS = 3
+
+
+def _label_parts(label: str):
+    """(offset, value) from a `byte@<off>=<val>` label, or (None, None)."""
+    m = _ADDR_LABEL.search(label or "")
+    if not m:
+        return None, None
+    return int(m.group(1), 0), int(m.group(2), 0)
+
+
+def address_primitive(observations, *, disasm: str = "", is_write: bool = False) -> dict | None:
+    """What the faulting ADDRESS of an uninstrumented crash is worth as a primitive.
+
+    `observations` is [(label, capture)] -- captures from the ptrace/gdbstub helper, one per
+    input variant, labelled `orig` or `byte@<off>=<val>`. Returns None when the question cannot
+    be asked (too few faults, or the faulting instruction moved, which means the variants are
+    hitting different defects and their addresses are not comparable).
+
+    Otherwise returns a verdict with `controlled` either way, because "the address is FIXED at
+    0x0" is a real answer -- a denial of service and not a primitive -- and reporting it is what
+    keeps the L2 claim meaningful.
+    """
+    seen = []
+    for label, cap in observations or []:
+        if not (cap or {}).get("ok") or not cap.get("signal_name"):
+            continue
+        addr, pc = cap.get("fault_addr"), cap.get("pc")
+        if addr is None or pc is None:
+            continue
+        off, val = _label_parts(label)
+        seen.append({"label": label, "addr": int(addr), "pc": int(pc), "off": off, "val": val})
+    if len(seen) < _MIN_ADDR_OBS:
+        return None
+    pcs = {s["pc"] for s in seen}
+    if len(pcs) != 1:
+        # Different instructions fault in different variants: these are not observations of one
+        # access, and comparing their addresses would invent a primitive out of two bugs.
+        return None
+    pc = seen[0]["pc"]
+    # DETERMINISM first: the same label twice with two addresses means the address is not a
+    # function of the input at all (ASLR of a heap pointer, a timestamp, a PID).
+    by_label: dict = {}
+    for s in seen:
+        by_label.setdefault(s["label"], set()).add(s["addr"])
+    nondet = sorted(lbl for lbl, addrs in by_label.items() if len(addrs) > 1)
+
+    addrs = sorted({s["addr"] for s in seen})
+    access = "write" if is_write else "read"
+    base = {"type": "address-control", "access": access, "pc": pc, "disasm": disasm,
+            "addr_min": addrs[0], "addr_max": addrs[-1], "span": addrs[-1] - addrs[0],
+            "observations": len(seen), "samples": [(s["label"], s["addr"]) for s in seen][:12],
+            "nondeterministic": nondet,
+            "cwe": "CWE-787" if is_write else "CWE-125"}
+    if len(addrs) == 1:
+        a = addrs[0]
+        return dict(base, controlled=False, confirmed=False, max_level=1,
+                    effect_kind="denial-of-service", offset=None, stride=None,
+                    note=(f"the faulting address is FIXED at 0x{a:x} across "
+                          f"{len(seen)} input variants, so the attacker does not choose where "
+                          f"this {access} goes: a denial of service, not a primitive."
+                          + (" The address is in the first page, i.e. a null/near-null "
+                             "dereference." if a < 0x1000 else "")))
+    if nondet:
+        return dict(base, controlled=False, confirmed=False, max_level=1,
+                    effect_kind="nondeterministic", offset=None, stride=None,
+                    note=(f"the faulting address varies between runs of the SAME input "
+                          f"({', '.join(nondet)}), so it is not a function of the input: no "
+                          f"claim about attacker control can be made from these runs."))
+
+    # Which input byte moves it, and by how much per unit. Chosen by the WIDEST span, because a
+    # byte that shifts the address by a page says more about reach than one that shifts it by 1.
+    best = None
+    groups: dict = {}
+    for s in seen:
+        if s["off"] is not None:
+            groups.setdefault(s["off"], []).append(s)
+    for off, rows in groups.items():
+        pts = sorted({(r["val"], r["addr"]) for r in rows})
+        if len({a for _v, a in pts}) < 2:
+            continue
+        span = pts[-1][1] - pts[0][1]
+        dv = pts[-1][0] - pts[0][0]
+        stride = (span // dv) if dv else None
+        # LINEAR means an index: every pair agrees on the stride. A non-linear mover is still
+        # control, just not an array index, so the stride is reported as None rather than a lie.
+        if stride:
+            for (v1, a1), (v2, a2) in zip(pts, pts[1:]):
+                if v2 != v1 and (a2 - a1) != stride * (v2 - v1):
+                    stride = None
+                    break
+        cand = {"offset": off, "stride": stride, "span": abs(span), "points": pts}
+        if best is None or cand["span"] > best["span"]:
+            best = cand
+    if best is None:
+        # The address moved, but not traceably to one byte we varied -- control is still
+        # demonstrated (two addresses from two inputs), the lever is just not identified.
+        return dict(base, controlled=True, confirmed=True, max_level=2, offset=None, stride=None,
+                    effect_kind=("arbitrary-write" if is_write else "arbitrary-read"),
+                    note=(f"the faulting address moves with the input (0x{addrs[0]:x} .. "
+                          f"0x{addrs[-1]:x}) at one fixed instruction, so the attacker chooses "
+                          f"where this {access} goes; no single input byte was isolated as the "
+                          f"lever."))
+    stride_txt = (f" {best['stride']} bytes of address per unit, i.e. an index into "
+                  f"{best['stride']}-byte elements," if best["stride"] else "")
+    return dict(base, controlled=True, confirmed=True, max_level=2,
+                offset=best["offset"], stride=best["stride"],
+                effect_kind=("arbitrary-write" if is_write else "arbitrary-read"),
+                note=(f"input byte {best['offset']} chooses the address this {access} touches:"
+                      f"{stride_txt} observed 0x{best['points'][0][1]:x} .. "
+                      f"0x{best['points'][-1][1]:x} over {len(best['points'])} values of that "
+                      f"byte, at one fixed instruction (pc 0x{pc:x}"
+                      + (f", `{disasm}`" if disasm else "") + ")."))

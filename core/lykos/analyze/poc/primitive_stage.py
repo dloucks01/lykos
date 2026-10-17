@@ -104,7 +104,13 @@ TOOL = "primitive"
 TOOL_VERSION = "primitive-1"
 
 
-_MIN_FILLER_RUN = 16
+# 4, not 16. This threshold decides whether structure-preserving framing is OFFERED at all --
+# and it is only an offer: the stage sweeps the framings against the live target and keeps
+# whichever actually faults, so a bad guess costs one detonation. Measured on busybox's lzcat
+# crash, whose 22 bytes carry a 9-byte filler run: at 16 the framing was never offered, the
+# cyclic replaced the whole input, the LZMA header went with it and the target stopped faulting.
+# A threshold that silently ends the chain is worse than an extra execution.
+_MIN_FILLER_RUN = 4
 
 
 from ..invocation import staged_name as _staged_name
@@ -886,13 +892,40 @@ def primitive_stage(ctx) -> dict:
         _frame_bytes = ((_pre, _post) if active_frame is not identity else (b"", b""))
         capture = _capture_for(mode)
         if not cap0.get("ok") or not cap0.get("signal_name"):
+            # A cyclic pattern establishes CONTROL OF THE RETURN ADDRESS, and a read-class defect
+            # has no return address to control -- so this exit was the end of the chain for every
+            # out-of-bounds read in a real binary, and for every defect behind a parser that
+            # rejects a De Bruijn pattern at its header (busybox's lzma decoder: the crash is 22
+            # bytes with a 9-byte filler run, below `_overflow_frame`'s threshold, so the pattern
+            # replaced the whole input and the target stopped faulting).
+            #
+            # The crashing input itself still faults. Ask the question that fits the evidence we
+            # have: does the attacker choose the ADDRESS?
+            ctx.progress(msg="cyclic did not fault; measuring whether the input chooses the "
+                             "faulting address")
+            # Native only: the experiment reads `fault_addr`, which comes from ptrace's
+            # siginfo. A qemu gdbstub capture has registers and no siginfo, and the emulated
+            # path has its own policy for what it can conclude.
+            _av, _demo, _dcap, _dmode = (None, b"", {}, "")
+            if not emulated:
+                _av, _demo, _dcap, _dmode = _address_verdict(
+                    ctx, lambda m: _capture_for(m), [mode] + [x for x in MODES if x != mode],
+                    orig, target.arch or "x86-64",
+                    siblings=_address_siblings(ctx, target, input_sha))
+            if _av and _av.get("confirmed"):
+                return _finalize(ctx, target, target_bytes, _dmode, base_argv, _dcap, _demo,
+                                 _av, True, {"input_modes_tried": tried})
             ctx.emit("primitive.done", payload={
                 "primitive": None, "supported": True, "input_modes_tried": tried,
+                "address_verdict": _av,
                 "note": ("cyclic pattern did not fault via any of " + ", ".join(tried)
                          + (" (uninstrumented build)" if cap_plain else "")
-                         + ": " + str(cap0.get("reason", "")))})
-            ctx.progress(pct=100, msg="no fault under cyclic pattern (tried %s)"
-                         % ", ".join(tried))
+                         + ": " + str(cap0.get("reason", ""))
+                         + (" " + str(_av.get("note")) if _av else ""))})
+            ctx.progress(pct=100, msg=((_av.get("effect_kind") + ": " + _av["note"][:60])
+                                       if _av else
+                                       "no fault under cyclic pattern (tried %s)"
+                                       % ", ".join(tried)))
             return {}
 
         rec = primitive.recover_ip_offset(cap0, length, endian=endian, word=word)
@@ -1083,6 +1116,19 @@ def primitive_stage(ctx) -> dict:
         # `mem_oracle` (the uninit verdict) or at a timing experiment this stage does not run.
         _cls = (_first or {}).get("class")
         _why = primitive.no_verdict_reason(_cls)
+        # The cyclic faulted and said nothing about control -- which is the read-class defect's
+        # normal outcome, since there is no saved return address in play. Ask the address
+        # question here too, for the same reason it is asked when the cyclic does not fault at
+        # all. Skipped when a SANITIZER reported the defect: those classes have their own
+        # verdicts above, measured from a report rather than from a faulting instruction.
+        if not _cls and not emulated:
+            _av, _demo, _dcap, _dmode = _address_verdict(
+                ctx, lambda m: _capture_for(m), [mode] + [x for x in MODES if x != mode],
+                orig, target.arch or "x86-64",
+                siblings=_address_siblings(ctx, target, input_sha))
+            if _av and _av.get("confirmed"):
+                return _finalize(ctx, target, target_bytes, _dmode, base_argv, _dcap, _demo,
+                                 _av, True, {"after": "no register control"})
         ctx.emit("primitive.done", payload={
             "primitive": ("register-control" if regs else None), "supported": True,
             "registers": regs, "signal": cap0.get("signal_name"), "sanitizer_class": _cls,
@@ -1093,6 +1139,126 @@ def primitive_stage(ctx) -> dict:
         return {}
     finally:
         shutil.rmtree(helper.parent, ignore_errors=True)
+
+
+#: How many input bytes the address experiment may probe, and with which values. Each probe is
+#: one ptrace-captured detonation (milliseconds native), so the budget is generous for the
+#: minimized crash inputs this runs on and bounded for anything larger.
+_ADDR_PROBE_OFFSETS = 48
+_ADDR_PROBE_VALUES = (0x00, 0x40, 0x80, 0xff)
+
+
+#: Sibling crashes to fold in. The campaign that produced this input usually produced several,
+#: and they are the cheapest observations available: already recorded, already known to fault.
+_ADDR_SIBLINGS = 6
+
+
+def _address_siblings(ctx, target, input_sha, limit: int = _ADDR_SIBLINGS) -> list:
+    """Other recorded crashing inputs for this target -- free observations for the experiment.
+
+    Single-byte variation answers "does THIS byte move the address". Two crashes from the same
+    fuzzing campaign answer a broader question -- does the address move with the input at all --
+    and they cost nothing to collect, because the run that found them already stored them.
+    Measured on busybox: one input's fault lands at 0x0 and another's at a mapped-page address,
+    which is the difference between "null-pointer DoS" and "the attacker chooses where".
+    """
+    out: list = []
+    try:
+        from ...db.dao import DynResultDAO
+        seen = {input_sha}
+        for r in DynResultDAO(ctx.conn).list_by_target(target.id):
+            if not getattr(r, "crashed", False):
+                continue
+            sha = getattr(r, "input_sha", None)
+            if not sha or sha in seen:
+                continue
+            seen.add(sha)
+            try:
+                out.append((sha, ctx.content.get_bytes(sha)))
+            except Exception:                          # noqa: BLE001 -- an evicted artifact
+                observe.absorbed(_log, "skipping a sibling crash")
+            if len(out) >= limit:
+                break
+    except Exception:                                  # noqa: BLE001 -- advisory
+        observe.absorbed(_log, "continuing without sibling crashes")
+    return out
+
+
+def _address_verdict(ctx, capture_for, modes, orig: bytes, arch: str, siblings=()):
+    """(verdict, demonstrating-input, capture, mode) for the ADDRESS of an uninstrumented fault.
+
+    The experiment the sanitizer families cannot run on a stripped binary: re-detonate the
+    crashing input, then vary one byte at a time and watch where the fault lands. The ptrace
+    helper has recorded `fault_addr` (si_addr) all along; nothing ever read it for a verdict, so
+    a crash whose address the attacker chooses -- an arbitrary read or write -- was reported as
+    "crash reproduced but no controllable primitive found", and `root_cause` filed whichever
+    address that one input happened to produce (0x0 for busybox's lzcat crash, which made a
+    controlled read read as a null-pointer denial of service).
+
+    Returns (None, ...) when the input does not fault here at all, which is the one case where
+    the caller's existing decline is the honest answer.
+    """
+    base_cap, base_mode = None, None
+    for m in modes:
+        cap = capture_for(m)(orig)
+        if cap.get("ok") and cap.get("signal_name") and cap.get("fault_addr") is not None:
+            base_cap, base_mode = cap, m
+            break
+    if base_cap is None:
+        return None, b"", {}, ""
+    cap_fn = capture_for(base_mode)
+    disasm = rootcause.disasm_one(bytes.fromhex(base_cap.get("pc_bytes", "")), arch)
+    is_write = rootcause._is_memory_write(disasm)
+    # NOT this family's question. A fault at a `ret`, or with the PC outside executable memory,
+    # is instruction-pointer control: the address it "touched" is the hijacked target, which
+    # moves with the input for a reason the cyclic experiment exists to measure exactly. Reading
+    # it as "the attacker chooses where this read goes" would relabel a control-flow hijack as a
+    # read primitive -- measured on the stack-overflow fixture, which this branch now declines.
+    _cls = (rootcause.classify(base_cap, disasm) or {}).get("class")
+    if _cls in ("control-flow-hijack", "stack-return-overwrite"):
+        return None, b"", {}, ""
+    base_addr = int(base_cap["fault_addr"])
+    # The same input twice: an address that moves between runs of ONE input is not a function of
+    # the input (a heap pointer under ASLR, a pid, a clock) and no control claim can be made.
+    obs = [("orig", base_cap), ("orig", cap_fn(orig))]
+    best = (0, None, b"")                                  # (|delta|, offset, input)
+    step = max(1, len(orig) // _ADDR_PROBE_OFFSETS)
+    for off in range(0, len(orig), step):
+        v = 0xFF if orig[off] != 0xFF else 0x00
+        var = bytearray(orig); var[off] = v
+        cap = cap_fn(bytes(var))
+        obs.append((f"byte@{off}=0x{v:02x}", cap))
+        if cap.get("ok") and cap.get("fault_addr") is not None:
+            d = abs(int(cap["fault_addr"]) - base_addr)
+            if d > best[0]:
+                best = (d, off, bytes(var))
+    # The campaign's OTHER crashes, each one a free observation of the same question.
+    for sha, data in siblings or ():
+        cap = cap_fn(data)
+        obs.append((f"crash@{sha[:8]}", cap))
+        if cap.get("ok") and cap.get("fault_addr") is not None:
+            d = abs(int(cap["fault_addr"]) - base_addr)
+            if d > best[0]:
+                best = (d, None, data)                 # a different input, not a byte lever
+    # The lever found, now its SCALE: several values of that one byte, which is what separates
+    # "an index into N-byte elements" from "some other byte-dependent address".
+    if best[1] is not None:
+        for v in _ADDR_PROBE_VALUES:
+            if v == orig[best[1]]:
+                continue
+            var = bytearray(orig); var[best[1]] = v
+            obs.append((f"byte@{best[1]}=0x{v:02x}", cap_fn(bytes(var))))
+    verdict = primitive.address_primitive(obs, disasm=disasm, is_write=is_write)
+    demo = best[2] or orig
+    demo_cap = base_cap
+    if verdict and verdict.get("controlled"):
+        for lbl, cap in obs:
+            if cap.get("ok") and cap.get("fault_addr") == verdict.get("addr_max"):
+                demo_cap = cap
+                break
+    else:
+        demo = orig
+    return verdict, demo, demo_cap, base_mode
 
 
 def _finalize(ctx, target, target_bytes, mode, base_argv, cap0, control, prim, confirmed,
@@ -1296,6 +1462,14 @@ def _finalize(ctx, target, target_bytes, mode, base_argv, cap0, control, prim, c
         "frame_prefix": (_fp or b"").hex(), "frame_suffix": (_fs or b"").hex()}
     if prim.get("disclosure"):
         _payload["disclosure"] = prim["disclosure"]
+    if prim.get("type") == "address-control":
+        # The verdict's own facts, in the event, because `primitive` here is only the type NAME
+        # and this family's whole claim is quantitative: which instruction, which input byte,
+        # what range of addresses. A reader -- or the report, or build_exploit -- cannot act on
+        # "address-control" alone.
+        _payload["address"] = {k: prim.get(k) for k in (
+            "access", "pc", "disasm", "addr_min", "addr_max", "span", "offset", "stride",
+            "cwe", "effect_kind", "observations", "controlled", "note")}
     ctx.emit("primitive.done", payload=_payload)
     ctx.progress(pct=100, msg=(f"L2 confirmed: {prim['type']}") if confirmed
                  else f"{prim['type']} indicated (unconfirmed)")

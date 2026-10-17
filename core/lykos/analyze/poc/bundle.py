@@ -265,6 +265,41 @@ def _primitive_txt(prim: dict) -> bytes:
                          f"{'reported' if o.get('reported') else 'silent'}")
         lines.append("")
         return ("\n".join(lines)).encode()
+    if prim.get("type") == "address-control":
+        # NO sanitizer, NO control offset, NO sentinel: this verdict is measured from the faulting
+        # instruction and the address it touched, across input variants. Saying it in those terms
+        # is the whole point -- a reader has to be able to see that the claim is "the attacker
+        # chooses WHERE", not "the attacker controls the program counter".
+        lines = [
+            "L2 primitive: the attacker chooses the ADDRESS",
+            "=" * 46,
+            f"Access: {prim.get('access')}  ({prim.get('cwe')})",
+            f"Faulting instruction: pc 0x{int(prim.get('pc') or 0):x}"
+            + (f"  `{prim.get('disasm')}`" if prim.get("disasm") else ""),
+            f"Address range observed: 0x{int(prim.get('addr_min') or 0):x} .. "
+            f"0x{int(prim.get('addr_max') or 0):x}  (span {prim.get('span')} bytes)",
+        ]
+        if prim.get("offset") is not None:
+            lines.append(f"Input byte that moves it: {prim.get('offset')}"
+                         + (f", {prim.get('stride')} bytes of address per unit"
+                            if prim.get("stride") else ""))
+        lines += [
+            f"Observations: {prim.get('observations')} detonations, one faulting instruction "
+            f"throughout",
+            "",
+            "HOW THIS WAS MEASURED",
+            "  The crashing input was re-detonated, then one byte at a time was varied and the",
+            "  address the fault touched (si_addr, from ptrace) recorded. The instruction is the",
+            "  same in every observation, so the variants are one access, not several defects.",
+            "  A FIXED address across variants would have been reported as a denial of service",
+            "  instead -- which is what a single observation of this defect looks like.",
+            "",
+            "SAMPLES (label -> faulting address)",
+        ]
+        for lbl, addr in (prim.get("samples") or [])[:10]:
+            lines.append(f"  {lbl:18s} 0x{int(addr):x}")
+        lines += ["", str(prim.get("note") or ""), ""]
+        return "\n".join(lines).encode()
     if prim.get("quantity"):
         # A QUANTITY defect: no access, no dead object, and deliberately no L2 heading. What the
         # experiment bounded is a number, and the template says which number and what it means.
@@ -673,6 +708,14 @@ def build(target_bytes: bytes, input_bytes: bytes, meta: dict, stderr: bytes,
                      f"{primitive.get('side') or 'past'} a {primitive.get('region_size')}-byte "
                      f"object (attacker-controlled distance="
                      f"{primitive.get('confirmed')}). See PRIMITIVE.txt.\n")
+    elif (primitive or {}).get("type") == "address-control":
+        prim_line = (f"\nPrimitive: the attacker chooses the address of an out-of-bounds "
+                     f"{primitive.get('access')} -- 0x{int(primitive.get('addr_min') or 0):x}"
+                     f" .. 0x{int(primitive.get('addr_max') or 0):x} from one faulting "
+                     f"instruction"
+                     + (f", input byte {primitive.get('offset')} is the lever"
+                        if primitive.get("offset") is not None else "")
+                     + ". See PRIMITIVE.txt.\n")
     elif primitive:
         prim_line = (f"\nPrimitive: {primitive.get('type')} at control offset "
                      f"{primitive.get('offset')} (confirmed={primitive.get('confirmed')}). "

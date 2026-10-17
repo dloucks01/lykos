@@ -430,3 +430,95 @@ def test_overflow_frame_isolates_the_filler_run():
     pre, post = _overflow_frame(b"key=" + b"B" * 200)
     framed = pre + primitive.cyclic(64) + post
     assert framed.startswith(b"key=") and b"aaaa" in framed
+
+
+# ------------------------------------------------- the shape a real binary actually presents
+# A header-gated parser with an unvalidated index, no `win()`, and a READ: the three properties
+# that together made every real-corpus finding in this project stop at L1.
+#
+#  * the header gate means a cyclic pattern never reaches the defect -- `aaaabaaac...` is not a
+#    valid container, so the De Bruijn experiment reports "did not fault" and the chain ended;
+#  * a read has no saved return address to control, so the IP-control question has no answer;
+#  * one observation cannot distinguish "the attacker chooses the address" from "a wild pointer
+#    happened to land at 0" -- busybox's lzcat crash was filed CWE-476 denial-of-service for
+#    exactly that reason, on an input whose address landed in the first page.
+_INDEXED_READ = (
+    "#include <stdio.h>\n#include <stdlib.h>\n"
+    "int main(void){\n"
+    "  unsigned char *p = malloc(32);\n"
+    "  unsigned char hdr[8];\n"
+    "  if (fread(hdr, 1, 8, stdin) != 8) return 0;\n"
+    "  if (hdr[0] != 'L' || hdr[1] != 'Z') return 0;       /* a container header */\n"
+    "  size_t idx = (size_t)hdr[4] * 0x100000;             /* unvalidated index */\n"
+    "  printf(\"%02x\\n\", p[idx]);                          /* OOB read, address = f(input) */\n"
+    "  return 0; }\n")
+
+
+@pytest.mark.skipif(sandbox.host_arch() not in ("x86-64", "aarch64"),
+                    reason="L2 primitive analysis is native-arch only")
+def test_an_indexed_read_is_an_address_primitive_not_a_dos(store, case, pool, gcc, tmp_path):
+    """The seam this closes: a crash whose ADDRESS the input chooses is an L2 primitive, and the
+    evidence for it is already in every capture (`fault_addr`, from ptrace's siginfo)."""
+    b = _build(gcc, tmp_path, _INDEXED_READ, "idx", ["-w"])
+    if b is None:
+        pytest.skip("build failed")
+    crash = b"LZ\x00\x00\x40\x00\x00\x00"                  # header + index byte 0x40
+    r = sandbox.run(str(b), stdin=crash, timeout=10)
+    if not r.crashed:
+        pytest.skip("the fixture does not fault on this host's memory layout")
+
+    target = ingest(store, case.id, b)
+    sha, _, _ = store.content.put_bytes(crash)
+    q = JobQueue(store.conn)
+    run = enqueue_primitive(q, target, params={"input_sha": sha, "input_mode": "stdin",
+                                               "timeout": 8})
+    assert pool.wait_idle(180) and q.runs.get(run.id).status == "done"
+
+    pocs = PocDAO(store.conn).list_by_target(target.id)
+    assert pocs, "no PoC recorded for an input whose faulting address the attacker chooses"
+    assert pocs[-1].level == "L2", f"expected L2, got {pocs[-1].level}"
+    assert pocs[-1].verified
+
+    from lykos.db.dao import EventDAO
+    done = EventDAO(store.conn).payloads_of_type("primitive.done", case_id=case.id)
+    assert (done[-1] or {}).get("primitive") == "address-control", done[-1]
+    prim = (done[-1] or {}).get("address") or {}
+    assert prim.get("controlled") and prim.get("access") == "read"
+    # the index byte IS the header's index field, and the stride is the element size the
+    # program multiplies it by -- both read off the live target, not assumed
+    assert prim.get("offset") == 4, prim
+    assert prim.get("stride") == 0x100000, prim
+
+
+def test_address_primitive_separates_control_from_a_wild_pointer():
+    """The pure verdict, which is where the honesty lives."""
+    def cap(addr, pc=0x401136):
+        return {"ok": True, "signal_name": "SIGSEGV", "fault_addr": addr, "pc": pc}
+
+    # an index: one byte scales the address
+    obs = [("orig", cap(0x41000)), ("orig", cap(0x41000))] + [
+        (f"byte@4=0x{v:02x}", cap(0x1000 + v * 0x100000)) for v in (0x00, 0x40, 0x80, 0xff)]
+    v = P.address_primitive(obs, disasm="movzx eax,BYTE PTR [rax+rdx*1]")
+    assert v["controlled"] and v["confirmed"] and v["max_level"] == 2
+    assert v["offset"] == 4 and v["stride"] == 0x100000
+    assert v["access"] == "read" and v["cwe"] == "CWE-125"
+
+    # a FIXED address is a denial of service, and saying so is the point
+    fixed = P.address_primitive([(f"byte@2=0x{v:02x}", cap(0)) for v in (1, 2, 3)])
+    assert not fixed["controlled"] and fixed["max_level"] == 1
+    assert fixed["effect_kind"] == "denial-of-service" and "null/near-null" in fixed["note"]
+
+    # a write is the stronger claim, and it is labelled as one
+    w = P.address_primitive(obs, disasm="mov BYTE PTR [rax+rdx*1],cl", is_write=True)
+    assert w["access"] == "write" and w["cwe"] == "CWE-787"
+    assert w["effect_kind"] == "arbitrary-write"
+
+    # two different faulting instructions are two defects, not one primitive
+    assert P.address_primitive([("a", cap(1, pc=1)), ("b", cap(2, pc=2)),
+                                ("c", cap(3, pc=3))]) is None
+    # an address that moves between runs of the SAME input is not input-controlled
+    nd = P.address_primitive([("orig", cap(0x1000)), ("orig", cap(0x9000)),
+                              ("byte@1=0xff", cap(0x5000))])
+    assert not nd["controlled"] and nd["effect_kind"] == "nondeterministic"
+    # too few observations: no claim either way
+    assert P.address_primitive([("orig", cap(1)), ("byte@0=0xff", cap(2))]) is None
