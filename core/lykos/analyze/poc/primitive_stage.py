@@ -485,8 +485,14 @@ def _address_disclosure(ctx, target, mode, base_argv, orig, prim, timeout):
             _rep, out = _detonate_capturing(ctx, target, plain, mode, base_argv, bytes(var),
                                             timeout, aslr=True)
             # A variant that still faults tells us nothing: the read has to RETURN for its bytes
-            # to reach the output.
-            if not out or len(out) <= len(base_out or b""):
+            # to reach the output. "More than the baseline" is NOT the test, though, and using it
+            # as one cost a proved disclosure: the baseline is the input truncated to 8 bytes,
+            # and on a `dump=<index>` line that truncation is still a valid dump command -- so
+            # the baseline printed the same 128 bytes as the real run and the comparison rejected
+            # a leak that was right there. `disclosed_bases` says the same thing about its own
+            # `baseline` argument: it is for reporting how many bytes were EXTRA, never the
+            # oracle. So the gate is "it survived and printed something" and the resolver judges.
+            if not out:
                 continue
             cand = _leak.disclosed_bases(out, target_bytes, _host_libc_bytes(),
                                          baseline=base_out)

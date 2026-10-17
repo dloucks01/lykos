@@ -721,17 +721,33 @@ int main(void){ setvbuf(stdout,0,2,0); setvbuf(stdin,0,2,0);
       fwrite(tmp, 1, sizeof(tmp), stdout); fflush(stdout); continue; }
     if(!strncmp(line,"name=",5)){ greet(line+5,(size_t)n-5); continue; }
     return 0; } }''',
-         # MEASURED at L2 on 2026-10-16 and recorded as L2, not left red at the L3 it is aiming
-         # at. What the autopilot does reach, unaided, is: the `dump=` branch (dispatch-prefix
-         # seeding), the address-control verdict on its over-read (25 of 30 variants faulted, 2
-         # distinct addresses, "arbitrary-read"), a PROVED disclosure from replaying that input
-         # unguarded (8 live pointers, PIE and libc bases recovered with ASLR on), and a
-         # confirmed IP-control offset of 71 in the `name=\n` framing. The L3 attempt then
-         # inherits all four and its leak step reports "no leak matched before the target read
-         # input" -- the recipe is replayed in the weaponizer's own process and the raw-pointer
-         # output does not reach its leak matcher in time. That is the next thing to fix and it
-         # is one named step, not an unknown.
-         ["-fno-stack-protector", "-w"], want_level=2, want_cwe=(), budget=600.0,
+         # L3, MEASURED, three consecutive runs: 132s, 171s, 169s on 2026-10-16. The autopilot
+         # reaches it UNAIDED from a stripped PIE binary with no source and therefore no
+         # sanitizer twin, which is the shape that had capped every real finding in this project
+         # at L1. What has to happen in those ~150 seconds, in order:
+         #
+         #   1. both branches of the dispatcher are entered -- `_dispatch_prefix_seeds` puts each
+         #      mined `key=` token at offset 0, because once the `name=` overflow is found the
+         #      corpus fills with inputs carrying that prefix and `dump=` is only ever inserted
+         #      mid-line, where `strncmp(line,"dump=",5)` never matches;
+         #   2. the `dump=` over-read faults -- and only because the guard-page allocator is on,
+         #      so the L2 captures have to preload it too (`make_capture(guard_page=)`), or the
+         #      crash is silent where it is re-run and the stage answers "did not fault";
+         #   3. the ADDRESS is measured as the attacker's: 25 of 30 single-byte variants faulted
+         #      across one routine (an unrolled memcpy faults at several PCs, so the unit is a
+         #      code page, not an instruction) with the address moving;
+         #   4. the same input, replayed UNGUARDED on the plain build, discloses 8 live pointers
+         #      and `leak.disclosed_bases` resolves the PIE and libc bases with ASLR ON. The
+         #      gate for a survivor is "it printed something", never "more than the baseline":
+         #      the baseline is the input truncated to 8 bytes, which on a `dump=<n>` line is
+         #      still a valid dump command, and comparing against it threw away a proved leak;
+         #   5. the control offset (71) and the `name=\n` framing both come from the ONE payload
+         #      that measured them -- a confirmed L2 with no offset must not answer for the
+         #      framing (`_l2_control_run`);
+         #   6. `build_exploit` replays the disclosure recipe live, relocates the payload to the
+         #      base it just recovered, and pops a SHELL graded by a nonce challenge that comes
+         #      back evaluated, which an echoing target cannot fake.
+         ["-fno-stack-protector", "-w"], want_level=3, want_cwe=(), budget=600.0,
          note="BINARY out-of-bounds READ whose ADDRESS the attacker chooses, in a program that "
               "also has the write primitive to spend the ASLR defeat on. No source, so no "
               "sanitizer twin: the read is measured from the faulting address and the "
