@@ -205,3 +205,32 @@ from a branch REGISTER, which is why the L2 record now carries its `source`.
 
 `heap_fnptr_system` — the same notebook with no `win` anywhere and `system` imported for an
 ordinary reason (a `4.date` option) — **PASSES at L3 in 104 s**, autonomous.
+
+## ...and on a PIE binary, with no leak at all
+
+The two cases above are no-PIE, so `win` and `system@plt` are link-time constants. `heap_fnptr_pie_leak`
+is the same notebook built `-fPIE -pie`, where nothing is known until the process runs, plus a
+`4.dump` that prints the object raw — so the callback, a CODE pointer, reaches stdout.
+
+Two routes were open and the cheaper one is the one that fired. The leak route works: measured by
+hand, the dump leaks `plain()` and `leak.disclosed_bases` resolves the image base from it alone
+(*"one leaked slot whose page offset matches exactly one symbol, so it is unambiguous. ASLR is
+defeated from the leak alone"*). But PIE randomises the page base and not the low 12 bits, and
+`plain` and `win` differ only in their LOW BYTE — so overwriting ONE byte of the callback turns one
+into the other, deterministically, with no information leak whatsoever. That recipe
+(`_pie_partial_overwrite_exploit`) already existed; what it could not do was DELIVER the byte,
+because it builds and detonates its own payload instead of going through the generic path, and so
+never saw the framing. One byte as a program's whole input drives no menu at all.
+
+`build_exploit` now derives the measured framing once, before the ladder, from the record L2 left,
+and the partial-overwrite path takes it. Measured:
+
+```
+primitive.done  offset 32, source "reg:rdx", confirmed, level L2,
+                frame_prefix "1\n0\n1\n1\n2\n1\n512\n", frame_suffix "3\n1\n", frame_relength true
+exploit.done    exploit "ret2win-partial", offset 32, confirmed
+```
+
+**`heap_fnptr_pie_leak` PASSES at L3 in 100 s**, autonomous, on a PIE target with ASLR on and no
+leak used. All three forms of the heap-callback hijack now reach a demonstrated effect: with a
+win (126 s), with no win at all (104 s), and PIE (100 s).
