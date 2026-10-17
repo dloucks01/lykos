@@ -55,6 +55,23 @@ _LAYOUTS = {
     # then verified against a live g-packet -- 59 32-bit registers (236 bytes), with an
     # all-'A' overflow landing at indices 14, 16 and 17, i.e. exactly r14 (frame pointer), pc
     # and pr (link register). $sp is r15 and the return address is pr.
+    # PA-RISC. qemu-hppa serves NO target description (0 registers from `qXfer:features:read`,
+    # probed 2026-10-16), so this is the second layout that has to be hand-written -- and, like
+    # sh4's, it was verified against a LIVE g-packet rather than read off a manual. 128 words
+    # came back for a static hppa binary stopped at a fault, and the hypothesis
+    # [psw][gr1..gr31][sar][iaoq_f][iasq_f][iaoq_b] is pinned by three facts in that dump:
+    #
+    #   * word 33 and word 35 differ by exactly 4 -- the instruction-address queue pair the
+    #     architecture defines (iaoq_f is the executing instruction, iaoq_b the next);
+    #   * word 30 is 0x40001fc0, a stack address, which is r30 == SP on this ABI;
+    #   * word 0 is 0x0001ff00, which cannot be gr0 (architecturally always zero) and is a PSW
+    #     bit pattern, so the GPRs start at index 1.
+    #
+    # The low two bits of an instruction address carry the PRIVILEGE LEVEL on hppa, so a PC read
+    # here is `pc & ~3` as an address -- the same masking the Thumb and SuperH entries need for
+    # their own reasons.
+    "hppa":    [("psw", 4)] + [(f"r{i}", 4) for i in range(1, 32)]
+               + [("sar", 4), ("pc", 4), ("iasq_f", 4), ("iaoq_b", 4)],
     "sh":      [(f"r{i}", 4) for i in range(16)]
                + [("pc", 4), ("pr", 4), ("gbr", 4), ("vbr", 4), ("mach", 4), ("macl", 4),
                   ("sr", 4), ("fpul", 4), ("fpscr", 4)]
@@ -71,7 +88,7 @@ _LAYOUTS = {
 # regs["r15"]. The arch gate did not catch it because s390's PoC path goes through r14, its
 # link register, and never asks for the stack.
 _SP = {"aarch64": "sp", "riscv": "x2", "riscv64": "x2", "arm": "sp", "ppc64": "r1",
-       "ppc": "r1", "mips": "r29", "sh": "r15", "s390": "r15"}
+       "ppc": "r1", "mips": "r29", "sh": "r15", "s390": "r15", "hppa": "r30"}
 # integer argument registers per ISA calling convention (in order), named as in _LAYOUTS
 _ARG_REGS = {
     "aarch64": [f"x{i}" for i in range(8)],
@@ -85,13 +102,15 @@ _ARG_REGS = {
     "loongarch": [f"r{i}" for i in range(4, 12)],     # a0-a7
     "sparcv9": [f"o{i}" for i in range(6)],           # caller side; the callee sees i0-i5
     "sh": [f"r{i}" for i in range(4, 8)],             # SuperH passes r4-r7
+    "hppa": ["r26", "r25", "r24", "r23"],             # PA-RISC passes arg0-arg3 in r26..r23
     # Alpha names its registers symbolically in the stub's own description, so these are the
     # names it answers with: a0-a5 are the six integer argument registers, $26 is `ra`.
     "alpha": [f"a{i}" for i in range(6)],
 }
 _BP_KIND = {"arm": 4, "aarch64": 4, "mips": 4, "ppc": 4, "ppc64": 4,
             "riscv": 4, "riscv64": 4, "s390": 2,     # software-breakpoint length hint
-            "loongarch": 4, "sparcv9": 4, "m68k": 2, "sh": 2, "x86": 1, "alpha": 4}
+            "loongarch": 4, "sparcv9": 4, "m68k": 2, "sh": 2, "x86": 1, "alpha": 4,
+            "hppa": 4}
 
 # ---------------------------------------------------------------- derived layouts
 # Every _LAYOUTS entry above is hand-written, which is how the register order gets subtly

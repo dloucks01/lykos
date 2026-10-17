@@ -1,4 +1,5 @@
 """Cross-architecture L2/root-cause via qemu-user's gdbstub (emulated targets)."""
+import shutil
 import struct
 
 import pytest
@@ -339,4 +340,79 @@ def test_alpha_is_derivable_and_hppa_is_not():
     assert qg.supported("alpha") and "alpha" not in qg._LAYOUTS
     assert qg._sp_name("alpha") == "sp" and qg._pc_name("alpha") == "pc"
     assert qg._ARG_REGS["alpha"][0] == "a0", "the stub names them a0-a5, not r16-r21"
-    assert not qg.supported("hppa"), "qemu-hppa serves no target description to derive from"
+    # hppa is supported too, as of the same day -- but by the OTHER route, which is the point of
+    # this pair: nothing can be derived from a stub that serves no description, so PA-RISC has a
+    # hand-written layout (verified against a live g-packet) while alpha has none at all.
+    assert qg.supported("hppa") and "hppa" in qg._LAYOUTS
+    assert "hppa" not in qg._STUB_ABI, "there is no description to derive hppa from"
+
+
+# --------------------------------------------------------------- PA-RISC, the second hand-written
+# layout. `qemu-hppa` serves NO target description -- `qXfer:features:read` comes back with zero
+# registers, probed 2026-10-16 -- so hppa cannot be derived the way alpha, m68k, loongarch,
+# sparcv9 and x86 are. Like sh4's, its layout is transcribed and then VERIFIED against a live
+# g-packet, because a register order read off a manual is a guess with a citation.
+def test_the_hppa_layout_is_shaped_the_way_the_live_stub_answered():
+    """The three facts in the measured dump that pin the layout, as assertions.
+
+    128 words came back for a static hppa binary stopped at a fault:
+      * words 33 and 35 differ by exactly 4 -- the instruction-address queue pair (iaoq_f is the
+        executing instruction, iaoq_b the next), which is what identifies the PC at all;
+      * word 30 held a stack address, i.e. r30 == SP on this ABI;
+      * word 0 held 0x0001ff00, which cannot be gr0 (architecturally always zero), so the GPRs
+        start at index 1 and the first word is the PSW.
+    """
+    from lykos.analyze.debug import qemu_gdb as qg
+    lay = qg._layout_for("hppa")
+    names = [n for n, _ in lay]
+    assert names[0] == "psw", "gr0 is always zero; a non-zero word 0 is the PSW"
+    assert names[1:32] == [f"r{i}" for i in range(1, 32)]
+    assert names.index("pc") == 33 and names.index("iaoq_b") == 35
+    assert all(w == 4 for _n, w in lay), "PA-RISC here is 32-bit"
+    assert qg._sp_name("hppa") == "r30" and qg._pc_name("hppa") == "pc"
+    assert qg._ARG_REGS["hppa"] == ["r26", "r25", "r24", "r23"]
+    assert qg.supported("hppa") and "hppa" not in qg._STUB_ABI
+
+
+@pytest.mark.skipif(not shutil.which("qemu-hppa") or not shutil.which("hppa-linux-gnu-gcc"),
+                    reason="needs qemu-hppa and an hppa cross compiler")
+def test_hppa_registers_come_back_from_a_live_stub(tmp_path):
+    """The layout, parsed by the project's own `_parse_regs`, off a real fault."""
+    import binascii
+    import socket
+    import subprocess
+    import time
+
+    from lykos.analyze.debug import qemu_gdb as qg
+    src = tmp_path / "ov.c"
+    src.write_text("#include <stdio.h>\nint main(void){char b[64];"
+                   "if(scanf(\"%s\", b)!=1) return 0; printf(\"%s\\n\", b); return 0;}\n")
+    exe = tmp_path / "ov"
+    if subprocess.run(["hppa-linux-gnu-gcc", "-O0", "-fno-stack-protector", "-static", "-w",
+                       str(src), "-o", str(exe)], capture_output=True).returncode:
+        pytest.skip("hppa build failed")
+    port = 12833
+    p = subprocess.Popen(["qemu-hppa", "-g", str(port), str(exe)], stdin=subprocess.PIPE,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        sock = None
+        for _ in range(60):
+            try:
+                sock = socket.create_connection(("127.0.0.1", port), timeout=0.3)
+                break
+            except OSError:
+                time.sleep(0.1)
+        if sock is None:
+            pytest.skip("no gdbstub connection")
+        qg._txn(sock, "qSupported")
+        p.stdin.write(b"A" * 400 + b"\n")
+        p.stdin.flush()
+        assert qg._txn(sock, "c", timeout=15).startswith("T"), "the stub reported no stop"
+        g = qg._txn(sock, "g", timeout=15)
+        assert len(g) >= 36 * 8, "the g-packet is shorter than the layout"
+        regs = qg._parse_regs(g, "hppa", endianness="big")
+        assert regs["iaoq_b"] == regs["pc"] + 4, "the instruction queue pair did not line up"
+        assert regs["r30"] > 0x1000, "r30 does not look like a stack pointer"
+        assert binascii.unhexlify(g[:8]) != b"\x00\x00\x00\x00", "word 0 is not gr0"
+    finally:
+        p.kill()
