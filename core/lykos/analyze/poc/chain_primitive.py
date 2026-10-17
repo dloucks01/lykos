@@ -232,17 +232,28 @@ def chain_primitive_stage(ctx) -> dict:
                                         blame=(f"option {writer} writes index {idx} "
                                                f"({tgt_name} at {hex(tgt_addr)}) := &{win_name}"),
                                         writer=writer, off=None, trig=trig, exe=exe)
-                # heap overflow / oob write -> overwrite an adjacent code pointer directly
+                # heap overflow / oob write -> overwrite an adjacent code pointer directly.
+                # Every PRIMER in turn, not one: `menu.alloc_primers` supplies the default pair of
+                # objects and, for a count-taking creator, the wrap thresholds that make the
+                # allocation UNDERSIZED -- which is the only state in which an integer overflow
+                # has an overflow to find at all.
                 alloc = next((o for o in opts if o in model and menu._is_alloc(model[o])), None)
-                prime = (2 * (menu._scalar(alloc.encode(), width)
-                              + menu._fill(model[alloc], width=width))) if alloc else b""
                 writers = [o for o in opts if o in model and "str" in model[o]] or opts
-                found = _search_hijack(ctx, capture, prime, model, writers, list(opts) + [None],
-                                       win_addr, width=width)
-                if found:
+                for i, prime in enumerate(menu.alloc_primers(model, alloc, width) or [b""]):
+                    found = _search_hijack(ctx, capture, prime, model, writers,
+                                           list(opts) + [None], win_addr, width=width)
+                    if not found:
+                        continue
                     seq, writer, off, trig = found
+                    # Say WHY the overflow was possible when the answer is the primer: a wrap
+                    # primer means the allocation was undersized by its own size arithmetic, and
+                    # a report that omits that names the consequence without the defect.
+                    undersized = ("; the allocation was undersized first -- option "
+                                  f"{alloc}'s count wrapped the size computation (CWE-190), which "
+                                  "is what gives the copy anything to run past" if i else "")
                     return _file_l3(ctx, target, lead, vclass, win_name, win_addr, seq,
-                                    blame=f"option {writer} overwrites a code pointer at +{off}",
+                                    blame=(f"option {writer} overwrites a code pointer at +{off}"
+                                           + undersized),
                                     writer=writer, off=off, trig=trig, exe=exe)
         finally:
             shutil.rmtree(helper.parent, ignore_errors=True)

@@ -96,13 +96,22 @@ def menu_seeds(strings, *, max_seeds: int = 64) -> list[bytes]:
 # the tracer sees nothing. We LEARN each option's field template by driving the live process one
 # prompt at a time (below), then compose correctly-typed operation sequences from it.
 
+#: A PLURAL object noun asks HOW MANY; the singular asks WHICH ONE. "entries:" is a count and
+#: "entry:" is an index, and the same holds for records/items/slots/blocks -- which is why these
+#: live here and their singulars stay in `_IDX_KW` below. Measured: an `add(idx, records)` creator
+#: whose count prompt reads `records: ` was typed as a STRING, so the crawl answered it "lykos",
+#: `strtol` returned 0, the option allocated nothing, and no option in the menu named a size --
+#: the whole op-model was unusable and every sequence drove objects that did not exist.
+_PLURAL_COUNT = (r"\b(records|items|entries|elements|rows|columns|cols|chunks|blocks|lines|"
+                 r"fields|slots|notes|nodes|frames|packets|pages|users|accounts)\b")
+
 # A prompt naming a size/count/age is a NUMBER; one naming an id/index/slot is an INDEX (its
 # boundary values -- 0, capacity -- are what an OOB-index probe drives); else a STRING.
 # The index keywords are index INDICATORS only (id/index/slot/...), never object nouns like
 # "author" -- "Author Note size" is a size, not an index, so NUM must win there.
 _NUM_KW = re.compile(r"(size|\bsz\b|length|\blen\b|count|number|\bnum\b|\bage\b|amount|\bqty\b|quantity|"
                      r"bytes|how many|price|score|year|\bhow much\b|\bvalue\b|\bval\b|"
-                     r"\bbig\b|\bhow long\b|capacity|\bbuf(fer)? ?size\b)", re.I)
+                     r"\bbig\b|\bhow long\b|capacity|\bbuf(fer)? ?size\b|" + _PLURAL_COUNT + r")", re.I)
 _IDX_KW = re.compile(r"(\bid\b|\bidx\b|index|\bslot\b|\bentry\b|position|\bpos\b|\bwhich\b|"
                      r"\bno\.?\b|\bpage\b)", re.I)
 
@@ -430,11 +439,58 @@ def _fill(fields, *, big_last: bool = False, idx: bytes = b"1", num: bytes = b"1
 def _is_alloc(fields) -> bool:
     """An allocating option (add/create) reads a size (num), usually with a string to fill AFTER it
     -- the "how many bytes?" then the buffer. A size-only option (just num(s), the classic
-    `malloc(size)` menu) also allocates. Leading name/label strings before the size are fine."""
+    `malloc(size)` menu) also allocates. Leading name/label strings before the size are fine.
+
+    `add(slot, count)` counts too -- a size into a SLOT TABLE, with the buffer filled by a separate
+    option (`fill(slot)`). That shape was not recognised at all, so a menu whose only creator is
+    `1.add(idx, records)` named NO allocator and every op sequence began by driving an object that
+    had never been created **[measured]**. It is also the shape where an integer overflow in the
+    allocation matters: the copy length is recomputed by the other option, from the count, so the
+    wrap under-allocates without under-copying."""
     ni = next((i for i, f in enumerate(fields) if f == "num"), None)
     if ni is None:
         return False
-    return any(f == "str" for f in fields[ni + 1:]) or all(f == "num" for f in fields)
+    return (any(f == "str" for f in fields[ni + 1:])
+            or all(f == "num" for f in fields)
+            or all(f in ("num", "idx") for f in fields))
+
+
+def alloc_primers(model: dict, alloc, width=None) -> list[bytes]:
+    """Input that creates TWO live objects with an allocating option -- the state every overflow,
+    use-after-free and code-pointer hijack sequence starts from. Shared by the op-sequence builder
+    and the primitive-chaining search, which each had their own copy of it, each wrong in the same
+    two ways:
+
+      * DISTINCT SLOTS. `one + one` drove the option's default id twice, so a slot-table menu ended
+        up with ONE live object and a leaked chunk -- and an overflow needs a neighbour to reach.
+        Both copies carried a comment claiming two objects; neither made two.
+      * An UNDERSIZED allocation, which no other shape can reach. Where the creator takes a count
+        and the buffer is filled by a SEPARATE option, the copy length is recomputed from that
+        count, so size arithmetic that wraps (`(unsigned)(n * 16)`) allocates nothing like enough
+        and the fill runs off the chunk -- an integer overflow with something to aim. The wrap
+        thresholds are the only counts that do it: byte mutation effectively never emits the
+        decimal text of a nine-digit number, and the "large" values every other shape drives (999,
+        0x7FFFFFFF) make malloc REFUSE rather than under-allocate. Only for a count-WITHOUT-buffer
+        creator: where the size field is followed by the string it fills, a wrap under-copies by
+        the same amount and there is no overflow to find -- which also leaves every size-then-data
+        notebook's budget exactly as it was.
+
+    Default primer first, so a caller that stops at the first success behaves as it always did."""
+    if alloc is None:
+        return []
+    fields = model.get(alloc) or []
+
+    def _op(**kw):
+        return _scalar(str(alloc).encode(), width) + _fill(fields, width=width, **kw)
+
+    if any(x == "idx" for x in fields):
+        out = [_op(idx=b"0") + _op(idx=b"1")]
+    else:
+        one = _op()
+        out = [one + one]
+    if "num" in fields and "str" not in fields:
+        out += [_op(idx=b"0", num=wn) + _op(idx=b"1", num=b"2") for wn in _WRAP_NUMS]
+    return out
 
 
 def menu_op_sequences(model: dict, options, *, max_seqs: int = 48, width=None,
@@ -484,10 +540,7 @@ def menu_op_sequences(model: dict, options, *, max_seqs: int = 48, width=None,
     seqs: list[bytes] = []
     # --- the precise path: prime objects with a candidate creator, then drive each option with an
     #     over-long last string / a repeated id / a bad index / a trigger after the write. ---
-    primers = []
-    if alloc is not None:
-        one = _op(alloc)
-        primers.append(one + one)                        # two objects: ids 0 and 1 both exist
+    primers = list(alloc_primers(model, alloc, width))
     for c in idx_only[:3]:
         primers.append(_op(c, idx=b"0") + _op(c, idx=b"1"))
     # The ops that CARRY a payload go first for every primer. An option with a string field is the
@@ -513,6 +566,15 @@ def menu_op_sequences(model: dict, options, *, max_seqs: int = 48, width=None,
                 for tr in idx_only:
                     mine.append(prime + _op(o, big_last=True, idx=iv, no_term=True)
                                 + _op(tr, idx=iv))
+                    # ...and the NEIGHBOUR's. An overflow runs forward, so the code pointer it
+                    # reaches first belongs to the next object, not this one -- and when the
+                    # callback sits at the START of the record (`struct { void (*show)(); char
+                    # text[]; }`) the overflowed object's own pointer is BEHIND the write and can
+                    # never be reached. Only the same id was ever detonated, so that whole layout
+                    # was invisible: the write landed, nothing called it, and the sequence faulted
+                    # nowhere **[measured]**.
+                    mine.append(prime + _op(o, big_last=True, idx=iv, no_term=True)
+                                + _op(tr, idx=(b"1" if iv == b"0" else b"0")))
                 if all(x == "idx" for x in f):           # double-free / UAF: index-only op, twice
                     mine.append(prime + _op(o, idx=iv) + _op(o, idx=iv))
             if idx_opt:
@@ -552,6 +614,12 @@ def menu_op_sequences(model: dict, options, *, max_seqs: int = 48, width=None,
             out.append(s)
     return out[:max_seqs]
 
+
+#: Counts whose product with a common element size WRAPS a 32-bit size_t computation, so the
+#: allocation is tiny while the copy that follows is huge. One per element size, because which one
+#: a target multiplies by is not visible from the menu: 2**32//16, //8, //4, and 2**32 itself (a
+#: `n + 1` or `n * 1` allocation).
+_WRAP_NUMS = (b"268435456", b"536870912", b"1073741824", b"4294967296")
 
 # Numeric values worth trying for a size/count/index field: boundaries, a negative (unchecked
 # index / signed-vs-unsigned), and sizes that overflow a typical stack or heap buffer.

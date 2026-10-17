@@ -335,7 +335,9 @@ def test_the_named_allocator_is_not_trusted_alone():
     been created. The size-flow candidate is still tried; it is no longer the only one."""
     assert menu._is_alloc(_NOTEBOOK["2"]), "the premise: the edit looks like an allocator"
     seqs = menu.menu_op_sequences(_NOTEBOOK, _NB_OPTS, allocates=True)
-    assert any(s.startswith(b"2\n1\n16\n") for s in seqs)      # the old, named-allocator primer
+    # the named-allocator primer, now on TWO DISTINCT SLOTS: it used to drive the same default id
+    # twice, which leaves a slot table with one live object -- and an overflow needs a neighbour.
+    assert any(s.startswith(b"2\n0\n16\n") for s in seqs)
     assert any(s.startswith(b"1\n0\n1\n1\n") for s in seqs)    # ...and the index-only one
 
 
@@ -416,3 +418,31 @@ def test_output_after_a_completed_write_is_not_a_field():
     assert not menu._skipped_prompt("ok\n")
     assert not menu._skipped_prompt("")
     assert not menu._skipped_prompt("deleted")
+
+
+def test_a_plural_object_noun_asks_how_many():
+    """A prompt's NUMBER is a vocabulary, and the vocabulary had no object nouns in it: an
+    `add(idx, records)` creator whose count prompt reads `records: ` was typed as a string, the
+    crawl answered it "lykos", `strtol` returned 0 and the option allocated nothing -- so no option
+    in that menu named a size and the whole op-model was unusable **[measured]**. The plural is
+    the signal: "entries" asks how many, "entry" asks which one."""
+    for plural, singular in (("records: ", "record: "), ("entries: ", "entry: "),
+                             ("slots: ", "slot: "), ("pages: ", "page: ")):
+        assert menu.classify_prompt(plural) == "num", plural
+        assert menu.classify_prompt(singular) in ("idx", "str"), singular
+    assert menu.classify_prompt("how many blocks? ") == "num"
+    assert menu.classify_prompt("name: ") == "str"           # still a string
+
+
+def test_a_count_creator_is_primed_with_the_wrap_thresholds():
+    """The primer set for `add(slot, count)`: the default pair of objects first, then the counts
+    whose product with a common element size wraps a 32-bit size computation -- the only state in
+    which an integer overflow has an undersized allocation to overflow. Not offered where the size
+    field is followed by the buffer it fills, because there a wrap under-copies by the same amount
+    and there is nothing to find."""
+    pr = menu.alloc_primers({"1": ["idx", "num"]}, "1")
+    assert pr[0] == b"1\n0\n16\n1\n1\n16\n", pr[0]            # distinct slots, ordinary size
+    assert any(b"268435456" in s for s in pr[1:]) and len(pr) >= 3
+    assert all(s.endswith(b"1\n1\n2\n") for s in pr[1:]), "the NEIGHBOUR stays a normal object"
+    # size-then-data: no wrap primers
+    assert len(menu.alloc_primers({"2": ["idx", "num", "str"]}, "2")) == 1

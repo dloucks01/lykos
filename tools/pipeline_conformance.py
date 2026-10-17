@@ -208,6 +208,34 @@ KEEP_FAILED = False
 #: and integer-overflow at L0 purely because that is what their cases demand.
 CEILING = False
 
+#: The integer overflow that is WORTH something: the size arithmetic wraps, so the allocation is
+#: undersized, and the copy length is recomputed from the saved count -- by a separate option, in
+#: 64-bit -- so the fill runs off the chunk with CONTENT WE CHOSE. `int_overflow_alloc` wraps too
+#: but memsets 'A's over its own heap with no neighbour worth reaching, which is why that case
+#: measures L1 and stops: a magnitude verdict, nothing to aim.
+SRC_INT_OVERFLOW_FNPTR = r'''#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+void win(void){ execl("/bin/sh","sh",(char*)0); }
+struct rec { void (*show)(struct rec *); char text[]; };
+static void plain(struct rec *r){ printf("%s\n", r->text); }
+struct rec *db[16]; long cnt[16];
+static long rl(void){ char b[32]; int i=0,c; while(i<31){ c=getchar(); if(c<0||c=='\n')break; b[i++]=c; } b[i]=0; return strtol(b,0,10); }
+int main(void){ setvbuf(stdout,0,2,0); setvbuf(stdin,0,2,0);
+  while(1){ printf("1.add 2.fill 3.show 4.exit\n> ");
+    long o=rl();
+    if(o==1){ printf("idx: "); long i=rl(); printf("records: "); long n=rl();
+              if(i>=0&&i<16&&n>0){ unsigned sz=(unsigned)(n*16);      /* 32-bit multiply WRAPS */
+                                   db[i]=malloc(sizeof(void(*)(struct rec*))+sz);
+                                   if(db[i]){ db[i]->show=plain; cnt[i]=n; } } }
+    else if(o==2){ printf("idx: "); long i=rl(); printf("data: ");
+              if(i>=0&&i<16&&db[i]){ size_t n=(size_t)cnt[i]*16, k=0; int c;    /* the REAL size */
+                while(k<n){ c=getchar(); if(c<0||c=='\n') break; db[i]->text[k++]=(char)c; } } }
+    else if(o==3){ printf("idx: "); long i=rl(); if(i>=0&&i<16&&db[i]) db[i]->show(db[i]); }
+    else return 0; } }'''
+
+
 #: The menu notebook whose edit overflows an inline buffer into the object's OWN callback.
 #: Kept beside the case list rather than inline, like the other multi-line sources here.
 SRC_HEAP_FNPTR = r'''#include <stdio.h>
@@ -1219,6 +1247,23 @@ int main(void){ setvbuf(stdout,0,2,0);
               "import. It also needed the coverage_fuzz->fuzz fallback: afl-fuzz aborts its dry "
               "run on one timing-out seed, and a native target then got no fuzzing at all."),
 
+    Case("int_overflow_fnptr", SRC_INT_OVERFLOW_FNPTR,
+         ["-no-pie", "-fno-stack-protector", "-O0", "-w"],
+         want_level=3, want_cwe=(), budget=480.0, mechanism="integer-overflow",
+         note="BUG CLASS integer overflow (CWE-190) WEAPONIZED. Measured with --ceiling, the "
+              "class stopped at L1: int_overflow_alloc's wrap memsets 'A's over its own heap, so "
+              "there is nothing to aim and the verdict family is magnitude. Here the wrap "
+              "under-allocates and a SEPARATE option recomputes the copy length from the saved "
+              "count in 64-bit, so the fill runs off the chunk with content we choose, into the "
+              "next record's callback -- CWE-190 -> CWE-122 -> control. Three things had to "
+              "change, each measured on this fixture: `add(slot, count)` was not recognised as an "
+              "allocator at all (a size into a slot table, with the buffer filled by another "
+              "option); the named allocator's primer drove the same default id twice, so a slot "
+              "table held one object and an overflow had no neighbour to reach; and only the "
+              "WRITTEN object was ever detonated, which makes a `struct { void (*show)(); char "
+              "text[]; }` layout invisible -- the overflow runs forward, past this record's "
+              "pointer, into the next one's. The wrap thresholds are the only counts that do it: "
+              "999 and 0x7FFFFFFF make malloc refuse rather than under-allocate."),
     Case("off_by_one",
          r"""#include <stdio.h>
 #include <string.h>
