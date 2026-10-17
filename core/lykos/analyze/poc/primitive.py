@@ -127,14 +127,70 @@ def _stack_words(cap: dict):
         yield (base + i) - sp, stack[i:i + 8]
 
 
-def recover_ip_offset(cap: dict, length: int, n: int = 4, endian: str = "little", word: int = 8):
+#: An INDIRECT BRANCH that takes its target FROM A REGISTER: `call rdx` / `callq *%rdx`,
+#: `jmp rax`, `blr x8` (aarch64), `jalr t1` (riscv), `blx r3` (arm).
+#:
+#: Register-DIRECT only, and the two exclusions are the point of the pattern. A direct
+#: `call 0x401136` names no register, so any crash at a direct call would otherwise read as
+#: control. `call qword ptr [rax+0x30]` takes its target from MEMORY the register points at --
+#: a controlled pointer read and then branched through, which is a weaker claim and a different
+#: one; the sentinel refuses it anyway (the confirming run faults reading `MARKER+0x30` and never
+#: arrives at MARKER), so matching it would only cost a detonation.
+_INDIRECT_BRANCH = re.compile(
+    r"^\s*(?:call|callq|jmp|jmpq|blr|blx|bx|br|jalr|jr)\b[\s*]*"
+    r"\*?%?([a-z][a-z0-9]{1,5})\s*$", re.I)
+#: PPC branches through a SPECIAL register named by the mnemonic rather than by an operand:
+#: `bctrl` is "call the address in CTR", which `_INDIRECT_BRANCH` cannot express.
+_IMPLICIT_BRANCH_REG = {"bctr": "ctr", "bctrl": "ctr", "blrl": "lr"}
+#: 32-bit disassembly names the same register `eax` where the capture calls it `eax` too, but a
+#: 64-bit capture may name it `rax` while a 32-bit-mode disassembly says `eax`. Try both spellings.
+_REG_ALIASES = {"e": "r"}
+
+
+def indirect_branch_reg(disasm: str, regs=()) -> str:
+    """The register an indirect branch at the fault takes its target from, or "".
+
+    A hijacked FUNCTION POINTER does not put attacker bytes in the program counter. On x86-64 a
+    call through a register holding a non-canonical address raises #GP, and the kernel reports
+    SIGSEGV with the pc at the CALL ITSELF -- the attacker's bytes are in the register. Measured
+    on a heap notebook whose overflow reaches the object's own callback:
+
+        pc  = 0x401489      -> cyclic_find = -1   (the call site, inside the program)
+        rdx = 0x6161616261616161 -> cyclic_find = 32   (the pattern, at the pointer's offset)
+        disasm = `call   rdx`
+
+    so `recover_ip_offset` answered None and the whole ladder stopped at a reproduced crash on a
+    target whose control was complete. The instruction names the register; the register holds the
+    offset; the sentinel confirms it -- MARKER is a canonical address, so a confirming run really
+    does arrive at it and the pc really does equal it.
+    """
+    mnem = (str(disasm or "").strip().split() or [""])[0].lower()
+    if mnem in _IMPLICIT_BRANCH_REG:                     # `bctrl` -- the register is the mnemonic's
+        name = _IMPLICIT_BRANCH_REG[mnem]
+        return name if (not regs or name in regs) else ""
+    m = _INDIRECT_BRANCH.match(disasm or "")
+    if not m:
+        return ""
+    name = m.group(1).lower()
+    if not regs or name in regs:
+        return name
+    for pre, sub in _REG_ALIASES.items():               # `eax` in the text, `rax` in the capture
+        if name.startswith(pre) and (sub + name[1:]) in regs:
+            return sub + name[1:]
+    return name if name in regs else ""
+
+
+def recover_ip_offset(cap: dict, length: int, n: int = 4, endian: str = "little", word: int = 8,
+                      disasm: str = ""):
     """Recover the instruction-pointer-control offset from a cyclic-pattern crash capture.
 
-    Checks the program counter itself (canonical case), then the return-address slot the
-    stack pointer indexes at the fault, then adjacent slots. `endian`/`word` describe the
-    target so the PC's bytes are read in the right order (a big-endian PC's bytes are MSB
-    first). Stack-slot bytes are raw memory, already in input order. Returns (offset, source)
-    or None."""
+    Checks the program counter itself (canonical case), then a return-address REGISTER, then --
+    given the faulting instruction in `disasm` -- the register an indirect branch takes its
+    target from (a hijacked function pointer: the pc is the call site, see
+    `indirect_branch_reg`), then the return-address slot the stack pointer indexes at the fault
+    and its neighbours. `endian`/`word` describe the target so the PC's bytes are read in the
+    right order (a big-endian PC's bytes are MSB first). Stack-slot bytes are raw memory, already
+    in input order. Returns (offset, source) or None."""
     pc = cap.get("pc")
     regs = cap.get("regs") or {}
     pc_off = -1
@@ -171,6 +227,13 @@ def recover_ip_offset(cap: dict, length: int, n: int = 4, endian: str = "little"
         return pc_off, "pc"
     if ra_off != -1:
         return ra_off, ra_name
+    # An INDIRECT BRANCH through a controlled register -- a hijacked function pointer, where the
+    # pc is the call site and the target is in the register. See `indirect_branch_reg`.
+    ibr = indirect_branch_reg(disasm, regs)
+    if ibr and ibr in regs:
+        off = cyclic_find(_reg_window(int(regs[ibr]), word, endian, n), length, n)
+        if off != -1:
+            return off, "reg:" + ibr
     # prefer the slot SP points at (the return address the ret tried to load), then neighbors
     words = dict(_stack_words(cap))
     for rel in (0, -8, 8, -16, 16):

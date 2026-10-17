@@ -310,3 +310,109 @@ def test_an_example_is_GROWN_to_fill_a_slot_not_clipped_into_it():
     assert grown.startswith(b"s/old/") and grown.endswith(b"/")
     assert menu._grow_to(b"s/old/new/", 4) == b"", "no room means no seed, not a broken one"
     assert menu._grow_to(b"////", 64) == b"", "nothing field-shaped to grow"
+
+
+# ------------------------------------------- the op-sequence that proves a heap overflow
+#
+# A heap overflow into an object's own callback is invisible until something CALLS it: the
+# corrupting write and the detonation are different menu operations. Three separate things had to
+# be true for that sequence to exist at all, and each was measured on a
+# `1.add(idx) 2.edit(idx,len,data) 3.show(idx) 4.free(idx)` notebook.
+_NOTEBOOK = {"1": ["idx"], "2": ["idx", "num", "str"], "3": ["idx"], "4": ["idx"], "5": []}
+_NB_OPTS = ["1", "2", "3", "4", "5"]
+
+
+def test_an_index_only_option_can_be_the_allocator():
+    """`new(slot)` for a FIXED-SIZE record asks for no size, so it is neither a size-flow option
+    nor a no-arg one -- and the whole menu produced no sequences at all."""
+    seqs = menu.menu_op_sequences(_NOTEBOOK, _NB_OPTS, allocates=True)
+    assert any(s.startswith(b"1\n0\n1\n1\n") for s in seqs), "nothing primed with add(0); add(1)"
+
+
+def test_the_named_allocator_is_not_trusted_alone():
+    """`2` here reads a size and then a buffer, which is exactly an EDIT's shape too, so it is
+    named as the allocator -- and every sequence then began by editing an object that had never
+    been created. The size-flow candidate is still tried; it is no longer the only one."""
+    assert menu._is_alloc(_NOTEBOOK["2"]), "the premise: the edit looks like an allocator"
+    seqs = menu.menu_op_sequences(_NOTEBOOK, _NB_OPTS, allocates=True)
+    assert any(s.startswith(b"2\n1\n16\n") for s in seqs)      # the old, named-allocator primer
+    assert any(s.startswith(b"1\n0\n1\n1\n") for s in seqs)    # ...and the index-only one
+
+
+def test_a_write_is_followed_by_a_trigger_with_no_stray_terminator():
+    """The sequence that matters: create, overflow the buffer, then CALL the object. The data
+    field is governed by the length we just supplied, so the newline a line-based field would
+    need is one byte too many here -- it stays in the pipe and the next operation reads it as
+    menu choice 0, which turned "write, then call" into "write, then exit"."""
+    seqs = menu.menu_op_sequences(_NOTEBOOK, _NB_OPTS, allocates=True)
+    want = [s for s in seqs if s.startswith(b"1\n0\n1\n1\n2\n0\n") and s.endswith(b"3\n0\n")]
+    assert want, "no overflow-then-trigger sequence"
+    s = want[0]
+    body = s.split(b"\n", 7)[-1]                     # everything after `...2\n0\n<len>\n`
+    assert body.startswith(b"B" * 64)
+    assert b"B\n3\n0\n" not in s, "a stray newline between the write and the trigger"
+    assert s.endswith(b"B3\n0\n"), "the trigger must follow the last payload byte directly"
+
+
+def test_a_data_field_keeps_its_newline_when_nothing_follows():
+    """Only a sequence that CONTINUES is desynced by the terminator; a line-based reader needs
+    it, so the plain write shapes are unchanged."""
+    out = menu._fill(["idx", "num", "str"], big_last=True)
+    assert out.endswith(b"\n")
+    assert menu._fill(["idx", "num", "str"], big_last=True, no_term=True).endswith(b"B")
+
+
+def test_a_menu_with_no_creating_option_still_emits_nothing():
+    """With nothing but index-only options we cannot tell `new(slot)` from `delete(slot)`, so the
+    evidence has to come from the caller -- heap_discover has resolved a malloc/free pair by the
+    time it asks."""
+    assert menu.menu_op_sequences({"1": ["idx"], "2": ["idx"]}, ["1", "2"]) == []
+
+
+def test_a_prompt_the_option_skipped_is_still_a_field(tmp_path):
+    """An edit reads its data only when the slot holds an object -- `printf("data: ");
+    if (db[i]) read(...)` -- and an isolated crawl never primes one. The option printed
+    `data: `, skipped the read and looped back, so the model said `2 -> [idx, num]`: no buffer,
+    so no generated sequence could overflow anything, and a notebook whose overflow is three
+    operations deep fuzzed 6,064 times with zero crashes **[measured]**."""
+    import subprocess
+    import sys
+    import textwrap
+    prog = tmp_path / "guarded.py"
+    prog.write_text(textwrap.dedent('''
+        import sys
+        live = {}
+        while True:
+            sys.stdout.write("1.add 2.edit 3.exit\\n> "); sys.stdout.flush()
+            op = (sys.stdin.readline() or "3").strip()
+            if op == "1":
+                sys.stdout.write("idx: "); sys.stdout.flush(); i = sys.stdin.readline()
+                live[i.strip()] = True
+            elif op == "2":
+                sys.stdout.write("idx: "); sys.stdout.flush(); i = sys.stdin.readline().strip()
+                sys.stdout.write("len: "); sys.stdout.flush(); n = sys.stdin.readline()
+                sys.stdout.write("data: "); sys.stdout.flush()
+                if i in live:                      # the guard an isolated crawl never satisfies
+                    sys.stdin.read(int(n.strip() or 0))
+            else:
+                break
+    '''))
+
+    def spawn():
+        return subprocess.Popen([sys.executable, str(prog)], stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    model = menu.crawl_menu(spawn, ["1", "2", "3"], idle=0.3, per_option=8.0)
+    assert model.get("2") == ["idx", "num", "str"], model
+    # ...and with the buffer in the model, the overflow-then-trigger sequence exists.
+    seqs = menu.menu_op_sequences(model, ["1", "2", "3"], allocates=True)
+    assert any(s.startswith(b"1\n0\n1\n1\n2\n0\n") and s.endswith(b"1\n0\n") for s in seqs)
+
+
+def test_output_after_a_completed_write_is_not_a_field():
+    """`ok\\n` printed after the data WAS read is output, not a question: a prompt ends in
+    `:`/`>`/`?` and leaves its line unfinished."""
+    assert menu._skipped_prompt("data: ")
+    assert menu._skipped_prompt("Note> ")
+    assert not menu._skipped_prompt("ok\n")
+    assert not menu._skipped_prompt("")
+    assert not menu._skipped_prompt("deleted")

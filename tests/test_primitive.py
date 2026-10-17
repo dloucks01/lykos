@@ -617,3 +617,104 @@ def test_a_masked_pc_does_not_outrank_the_register_that_holds_the_real_target():
     unrelated = {"pc": 0x6161617661616174, "arch": "aarch64",
                  "regs": {"x30": 0x6262626262626262}}
     assert P.recover_ip_offset(unrelated, 600) == (76, "pc")
+
+
+# --------------------------------------------- a framing that keeps a LENGTH field honest
+def test_a_preserved_length_field_follows_the_payload():
+    """Structure-preserving framing has to preserve what the structure MEANS. The prefix of a
+    menu-driven write is `2\\n0\\n512\\n` -- option, index, and the number of bytes the target is
+    about to `read()` -- so splicing a 1,064-byte cyclic in behind a field that still says 512
+    leaves 552 bytes of pattern in the pipe: the target reads its 512, the next operation reads
+    pattern garbage instead of the option that DETONATES the write, and the stage reported
+    "cyclic pattern did not fault" on a target whose crash it had been handed."""
+    from lykos.analyze.poc.primitive_stage import _overflow_frame, filler_run_len, relength_prefix
+    orig = b"1\n0\n1\n1\n2\n0\n512\n" + b"B" * 512 + b"3\n0\n"
+    pre, post = _overflow_frame(orig)
+    assert (pre, post) == (b"1\n0\n1\n1\n2\n0\n512\n", b"3\n0\n")
+    assert filler_run_len(orig) == 512
+    assert relength_prefix(pre, 512, 1064) == b"1\n0\n1\n1\n2\n0\n1064\n"
+
+
+def test_a_number_that_is_not_a_length_is_left_alone():
+    """The field rewritten is the one that GOVERNS the copy, which is what "at least as large as
+    the filler it precedes" means. An index or an id is smaller than the payload it indexes."""
+    from lykos.analyze.poc.primitive_stage import relength_prefix
+    assert relength_prefix(b"4\n0\n", 512, 1064) == b"4\n0\n"          # an index
+    assert relength_prefix(b"name=", 512, 64) == b"name="             # no number at all
+    assert relength_prefix(b"", 512, 64) == b""
+    assert relength_prefix(b"2\n0\n512\n", 0, 64) == b"2\n0\n512\n"   # no filler run to govern
+
+
+def test_the_length_field_is_rewritten_in_every_separator_shape():
+    """A length is not always newline-terminated: `size=512&` and `512 ` occur too."""
+    from lykos.analyze.poc.primitive_stage import relength_prefix
+    assert relength_prefix(b"size=512 ", 512, 64) == b"size=64 "
+    assert relength_prefix(b"len:512", 512, 64) == b"len:64"
+
+
+# ------------------------------------- control through a hijacked FUNCTION POINTER
+#
+# A smashed return address puts the attacker's bytes in the program counter. A hijacked function
+# pointer does not: on x86-64 a call through a register holding a non-canonical address raises
+# #GP, and the kernel reports SIGSEGV with the pc AT THE CALL. Measured on a heap notebook whose
+# overflow reaches the object's own callback:
+#
+#     pc  = 0x401489           -> cyclic_find = -1   (the call site, inside the program)
+#     rdx = 0x6161616261616161 -> cyclic_find = 32   (the pattern, at the pointer's offset)
+#     disasm = `call   rdx`
+#
+# so the recovery answered None and the ladder stopped at a reproduced crash on a target whose
+# control was complete.
+def test_an_indirect_branch_names_its_register():
+    from lykos.analyze.poc.primitive import indirect_branch_reg as ibr
+    regs = {"rdx": 1, "rax": 1, "x8": 1, "t1": 1, "r3": 1}
+    assert ibr("call   rdx", regs) == "rdx"
+    assert ibr("callq  *%rdx", regs) == "rdx"           # AT&T syntax
+    assert ibr("jmp    rax", regs) == "rax"
+    assert ibr("blr x8", regs) == "x8"                  # aarch64
+    assert ibr("jalr   t1", regs) == "t1"               # riscv
+    assert ibr("blx r3", regs) == "r3"                  # arm
+
+
+def test_a_direct_call_and_a_memory_operand_name_no_register():
+    """A direct `call 0x401136` names no register and must not match, or any crash at a call
+    reads as control. `call qword ptr [rax+0x30]` takes its target from MEMORY the register
+    points at -- a controlled pointer read and then branched through, which is a different and
+    weaker claim; the sentinel refuses it anyway (the confirming run faults reading
+    `MARKER+0x30` and never arrives at MARKER)."""
+    from lykos.analyze.poc.primitive import indirect_branch_reg as ibr
+    assert ibr("call   0x401136", {"rdx": 1}) == ""
+    assert ibr("call   qword ptr [rax + 0x30]", {"rax": 1}) == ""
+    assert ibr("ret", {}) == ""
+    assert ibr("", {}) == ""
+
+
+def test_the_offset_comes_from_the_branch_register_when_the_pc_is_the_call_site():
+    from lykos.analyze.poc import primitive as P
+    pat = P.cyclic(256)
+    word = P._reg_window  # noqa: F841 - documents where the window helper lives
+    target = int.from_bytes(bytes(pat[32:40]), "little")
+    cap = {"pc": 0x401489, "sp": 0x7fff0000, "regs": {"rdx": target, "rax": 0x404040},
+           "stack": "", "stack_base": 0x7fff0000}
+    assert P.recover_ip_offset(cap, 256) is None, "the premise: nothing without the instruction"
+    assert P.recover_ip_offset(cap, 256, disasm="call   rdx") == (32, "reg:rdx")
+
+
+def test_a_controlled_register_alone_is_not_control():
+    """Attacker bytes land in registers all the time -- a copy loop leaves them in rdx. Only the
+    instruction that BRANCHES through one makes it control."""
+    from lykos.analyze.poc import primitive as P
+    pat = P.cyclic(256)
+    cap = {"pc": 0x401489, "sp": 0x7fff0000,
+           "regs": {"rdx": int.from_bytes(bytes(pat[32:40]), "little")},
+           "stack": "", "stack_base": 0x7fff0000}
+    assert P.recover_ip_offset(cap, 256, disasm="mov    qword [rax], rdx") is None
+
+
+def test_ppc_names_its_branch_register_in_the_mnemonic():
+    """PPC branches through a SPECIAL register the mnemonic names rather than an operand:
+    `bctrl` is "call the address in CTR"."""
+    from lykos.analyze.poc.primitive import indirect_branch_reg as ibr
+    assert ibr("bctrl", {"ctr": 1}) == "ctr"
+    assert ibr("bctr", {"ctr": 1}) == "ctr"
+    assert ibr("bctrl", {"rdx": 1}) == "", "not a register this capture has"

@@ -115,6 +115,47 @@ _MIN_FILLER_RUN = 4
 
 from ..invocation import staged_name as _staged_name
 
+#: The last decimal field in a preserved prefix: `...\n512\n` before the filler run. A target
+#: that asks how many bytes it is about to read puts that number here.
+_TRAILING_NUM = re.compile(rb"(?:\A|[\n ,=:])(\d{1,10})[\n ,=:]*\Z")
+
+
+def relength_prefix(pre: bytes, run_len: int, new_len: int) -> bytes:
+    """`pre` with its trailing LENGTH field rewritten from `run_len` to `new_len`, or unchanged.
+
+    A structure-preserving framing has to preserve what the structure MEANS. The prefix of a
+    menu-driven write is `2\n0\n512\n` -- option, index, and the number of bytes the target is
+    about to `read()` -- so splicing a 1,064-byte cyclic in behind a field that still says 512
+    leaves 552 bytes of pattern in the pipe: the target reads its 512, the next operation reads
+    pattern garbage instead of the option that DETONATES the write, and the stage reports
+    "cyclic pattern did not fault" on a target whose crash it was handed **[measured]**.
+
+    Rewritten only when the field's value is at least the filler it governs, which is what makes
+    it a length rather than an index or an id: the index in `2\n0\n512\n` is 0 and 0 < 512, so
+    the field that is actually rewritten here is the one immediately before the payload. A
+    prefix whose last number is too small is left exactly as it was.
+    """
+    m = _TRAILING_NUM.search(pre or b"")
+    if not m or run_len <= 0:
+        return pre
+    try:
+        if int(m.group(1)) < run_len:
+            return pre
+    except ValueError:                                   # pragma: no cover - \d+ is an int
+        return pre
+    return pre[:m.start(1)] + str(int(new_len)).encode() + pre[m.end(1):]
+
+
+def filler_run_len(orig: bytes) -> int:
+    """Length of the longest single-byte run in `orig` -- the filler `_overflow_frame` frames."""
+    best = run_s = 0
+    for i in range(1, len(orig or b"") + 1):
+        if i < len(orig) and orig[i] == orig[run_s]:
+            continue
+        best = max(best, i - run_s)
+        run_s = i
+    return best
+
 
 def _overflow_frame(orig: bytes):
     """(prefix, suffix) around the longest single-byte run in the crashing input -- the filler that
@@ -979,9 +1020,21 @@ def primitive_stage(ctx) -> dict:
                 ctx.emit("primitive.minimized", payload={"from": len(orig), "to": len(mini)})
                 orig = mini
         _pre, _post = _overflow_frame(orig)
+        _run = filler_run_len(orig)
 
-        def frame(payload):
+        def frame_relen(payload):
+            # The length field in the prefix follows the payload's length: see relength_prefix.
+            return relength_prefix(_pre, _run, len(payload)) + payload + _post
+
+        def frame_plain(payload):
             return _pre + payload + _post
+        # The length-aware framing is an OFFER, exactly like the framing itself: the field it
+        # rewrites is the last number before the filler, and "at least as large as the filler it
+        # precedes" is evidence rather than proof -- a `count=9999` that happens to sit in front
+        # of a short run would be rewritten too. It only goes out when it CHANGES the prefix, and
+        # the plain framing follows it, so a wrong guess costs one detonation.
+        _relen_differs = relength_prefix(_pre, _run, 1) != _pre
+        frame = frame_relen if _relen_differs else frame_plain
 
         ctx.progress(msg=f"detonating {length}-byte cyclic pattern under "
                          + (f"qemu-{target.arch} gdbstub" if emulated else "ptrace"))
@@ -994,7 +1047,8 @@ def primitive_stage(ctx) -> dict:
         # raw pattern so an input whose longest run is NOT the overflow still works exactly as
         # before. `active_frame` is whichever reproduced the fault, reused for the confirm step.
         identity = (lambda b: b)              # noqa: E731
-        framings = ([frame, identity] if (_pre or _post) else [identity])
+        framings = ([frame_relen] if _relen_differs else [])
+        framings += ([frame_plain] if (_pre or _post) else []) + [identity]
         active_frame = identity
         cap0 = {}
         # Sweep the UNINSTRUMENTED build first and the instrumented one second, because they
@@ -1038,6 +1092,7 @@ def primitive_stage(ctx) -> dict:
         # fuzzer blob often lacks even when the target genuinely needs a `name=` prefix. This
         # swept framings against the LIVE target and kept the one that faulted, so record it.
         _frame_bytes = ((_pre, _post) if active_frame is not identity else (b"", b""))
+        _frame_relength = active_frame is frame_relen
         capture = _capture_for(mode)
         if not cap0.get("ok") or not cap0.get("signal_name"):
             # A cyclic pattern establishes CONTROL OF THE RETURN ADDRESS, and a read-class defect
@@ -1086,11 +1141,14 @@ def primitive_stage(ctx) -> dict:
                                        % ", ".join(tried)))
             return {}
 
-        rec = primitive.recover_ip_offset(cap0, length, endian=endian, word=word)
-        regs = primitive.controlled_registers(cap0, length, endian=endian, word=word)
+        # The faulting INSTRUCTION first: it decides whether the pc is where control went (a
+        # `ret`) or where control was HANDED OVER (an indirect `call` through a register), and
+        # the recovery needs to know which.
         disasm = rootcause.disasm_one(bytes.fromhex(cap0.get("pc_bytes", "")),
                                       target.arch or host)
         mnem = (disasm or "").split()[0] if disasm else ""
+        rec = primitive.recover_ip_offset(cap0, length, endian=endian, word=word, disasm=disasm)
+        regs = primitive.controlled_registers(cap0, length, endian=endian, word=word)
 
         # 1) instruction-pointer control. Trust the dynamic slot heuristic only when the fault
         # is actually at a return (else a fuzzed buffer of stack locals looks like a retaddr); a
@@ -1106,6 +1164,7 @@ def primitive_stage(ctx) -> dict:
         #     `(pc | 1)` restores the exact slot;
         #   - the static-frame predictions (also the sole source when the fault isn't a ret).
         trusted = rec is not None and (rec[1] in ("pc",) + primitive.ra_regs(cap0)
+                                       or str(rec[1]).startswith("reg:")
                                        or mnem in ("ret", "retq", "retn"))
         confirm_cands = []                         # (offset, source, static_match, fp_slack)
         if trusted:
@@ -1143,7 +1202,7 @@ def primitive_stage(ctx) -> dict:
                           f" buffer {static_match['buffer']}{_slack_txt(fp_slack)}"
                           f" = offset {off}")
             return _finalize(ctx, target, cap_bytes, mode, base_argv, cap0, control,
-                             prim, True, extra, frame=_frame_bytes)
+                             prim, True, extra, frame=_frame_bytes, relength=_frame_relength)
 
         # 1c) nothing confirmed -- if we had a trusted dynamic offset, still report it as an
         # unconfirmed IP-control primitive (the crash reproduces; the marker just didn't pin).
@@ -1162,7 +1221,7 @@ def primitive_stage(ctx) -> dict:
                           f" buffer {static_match['buffer']}{_slack_txt(fp_slack)}"
                           f" = offset {offset}")
             return _finalize(ctx, target, cap_bytes, mode, base_argv, cap0, control,
-                             prim, False, extra, frame=_frame_bytes)
+                             prim, False, extra, frame=_frame_bytes, relength=_frame_relength)
 
         # 2) memory primitive (write-what-where / controlled read at a faulting mem access)
         memp = primitive.analyze_memory_primitive(cap0, length, disasm, endian=endian,
@@ -1186,7 +1245,7 @@ def primitive_stage(ctx) -> dict:
                      + (f", value offset {memp['value_offset']}"
                         if memp.get("value_offset") is not None else "") + f") via `{disasm}`")
             return _finalize(ctx, target, cap_bytes, mode, base_argv, cap0, control,
-                             prim, confirmed, extra, frame=_frame_bytes)
+                             prim, confirmed, extra, frame=_frame_bytes, relength=_frame_relength)
 
         # 2b) NOTHING in the registers -- because on a sanitizer build there is nothing in the
         # registers to find. ASan aborts inside its own runtime, so the fault-time pc belongs to
@@ -1214,7 +1273,7 @@ def primitive_stage(ctx) -> dict:
                                 else orig)
                 extra = primitive.oob_effect(prim)
                 return _finalize(ctx, target, target_bytes, mode, base_argv, cap0, control,
-                                 prim, bool(prim.get("confirmed")), extra, frame=_frame_bytes)
+                                 prim, bool(prim.get("confirmed")), extra, frame=_frame_bytes, relength=_frame_relength)
 
             # 2c) the same reasoning, one bug class further on. A use-after-free and a double
             # free are the two defects this link had NO verdict for -- the distance experiment
@@ -1227,7 +1286,7 @@ def primitive_stage(ctx) -> dict:
                                 else orig)
                 extra = primitive.lifetime_effect(prim)
                 return _finalize(ctx, target, target_bytes, mode, base_argv, cap0, control,
-                                 prim, bool(prim.get("confirmed")), extra, frame=_frame_bytes)
+                                 prim, bool(prim.get("confirmed")), extra, frame=_frame_bytes, relength=_frame_relength)
 
             # 2e) a concurrency defect, whose experiment is a REPEAT rather than a variation.
             prim = _race_primitive(ctx, target, exe, mode, base_argv, orig, timeout,
@@ -1242,7 +1301,7 @@ def primitive_stage(ctx) -> dict:
                     orig[len(_pre):len(orig) - len(_post)] if (_pre or _post) else orig)
                 extra = primitive.race_effect(prim)
                 return _finalize(ctx, target, target_bytes, mode, base_argv, cap0, control,
-                                 prim, bool(prim.get("confirmed")), extra, frame=_frame_bytes)
+                                 prim, bool(prim.get("confirmed")), extra, frame=_frame_bytes, relength=_frame_relength)
 
             # 2d) and the classes that describe a MAGNITUDE rather than an access.
             prim = _quantity_primitive(ctx, target, exe, mode, base_argv, orig, _pre, _post,
@@ -1252,7 +1311,7 @@ def primitive_stage(ctx) -> dict:
                                 else orig)
                 extra = primitive.quantity_effect(prim)
                 return _finalize(ctx, target, target_bytes, mode, base_argv, cap0, control,
-                                 prim, bool(prim.get("confirmed")), extra, frame=_frame_bytes)
+                                 prim, bool(prim.get("confirmed")), extra, frame=_frame_bytes, relength=_frame_relength)
 
             # 2f) the uninitialised-value class: the last one in this stage with no verdict of
             # its own. Its experiment is not a variation but a LOOK AT THE BYTES -- see
@@ -1264,7 +1323,7 @@ def primitive_stage(ctx) -> dict:
                                 else orig)
                 extra = primitive.uninit_effect(prim)
                 return _finalize(ctx, target, target_bytes, mode, base_argv, cap0, control,
-                                 prim, bool(prim.get("confirmed")), extra, frame=_frame_bytes)
+                                 prim, bool(prim.get("confirmed")), extra, frame=_frame_bytes, relength=_frame_relength)
 
         # 3) nothing to claim. Where the defect's CLASS is one this stage cannot reason about --
         # a data race, an uninitialised read -- say which and why, because the generic note reads
@@ -1450,7 +1509,7 @@ def _address_verdict(ctx, capture_for, modes, orig: bytes, arch: str, siblings=(
 
 
 def _finalize(ctx, target, target_bytes, mode, base_argv, cap0, control, prim, confirmed,
-              extra, *, frame=(b"", b"")):
+              extra, *, frame=(b"", b""), relength: bool = False):
     """Bundle the demonstrating input, record an L2 (or L1) PoC, promote the crash finding on
     confirmation, and emit the result -- shared by every primitive kind."""
     # A verdict may CAP its own level. L2 means a confirmed exploitation primitive, and not every
@@ -1647,7 +1706,11 @@ def _finalize(ctx, target, target_bytes, mode, base_argv, cap0, control, prim, c
         "primitive": prim["type"], "supported": True, "offset": prim.get("offset"),
         "confirmed": confirmed, "level": level, "bundle": bundle_sha,
         "mode": mode, "base_argv": [str(a) for a in (base_argv or [])],
-        "frame_prefix": (_fp or b"").hex(), "frame_suffix": (_fs or b"").hex()}
+        "frame_prefix": (_fp or b"").hex(), "frame_suffix": (_fs or b"").hex(),
+        # Whether the prefix's trailing LENGTH field was rewritten to the payload's length. The
+        # offset was measured in that framing and means nothing in the other one, so it travels
+        # with the prefix and the suffix -- see `relength_prefix`.
+        "frame_relength": bool(relength)}
     if prim.get("disclosure"):
         _payload["disclosure"] = prim["disclosure"]
     if prim.get("type") == "address-control":

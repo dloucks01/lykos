@@ -195,3 +195,74 @@ def test_a_static_binary_is_not_claimed_as_guarded(tmp_path, gcc):
     if M.dislocator_lib() is not None and sandbox._interp_of(str(dyn)):
         assert sandbox.guard_page_env(None, exe=str(dyn), arch="x86-64", host="x86-64",
                                       sanitizer=False)[1]
+
+
+# --- the oracle that HIDES the defect ---------------------------------------------------------
+# The guard page makes a heap over-read fault. It also suppresses an overflow the KERNEL
+# performs: `read(fd, buf, n)` into a buffer at the end of its page returns EFAULT rather than
+# faulting, so the copy never lands and the program runs on undisturbed. Two oracles, two
+# classes of overflow, and each hides the other's -- which is why the campaign now runs every
+# SEED under both.
+_KERNEL_WRITTEN_OVERFLOW = r"""#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+struct o { char t[32]; void (*f)(void); };
+static void ok(void){ printf("ok\n"); }
+static long rl(void){ char b[32]; int i=0,c; while(i<31){ c=getchar(); if(c<0||c=='\n')break; b[i++]=c; } b[i]=0; return strtol(b,0,10); }
+struct o *x;
+int main(void){ setvbuf(stdout,0,2,0); setvbuf(stdin,0,2,0);
+  while(1){ printf("1.new 2.fill 3.use 4.quit\n> ");
+    long c=rl();
+    if(c==1){ x=malloc(sizeof *x); if(x) x->f=ok; }
+    else if(c==2){ long n=rl(); if(x&&n>0) read(0,x->t,(size_t)n); }  /* the KERNEL writes past t */
+    else if(c==3){ if(x) x->f(); }                   /* ...and calling it is what notices */
+    else return 0; } }"""
+
+
+def test_a_kernel_written_overflow_is_hidden_by_the_guard_page(tmp_path, gcc):
+    """The measurement that justifies running every seed under both oracles.
+
+    `read(2)` into a buffer at the end of a guarded page cannot fault the process: the kernel
+    checks the destination and returns EFAULT, the bytes are never copied, and the function
+    pointer the overflow was supposed to overwrite still holds its original value. Measured on
+    the heap-notebook conformance fixture, whose crashing SEED is SIGSEGV plain and exit 0 under
+    libdislocator: the campaign ran 5,810 executions and reported zero crashes on a target that
+    crashes on its own seed.
+    """
+    import subprocess
+
+    import pytest
+    from lykos.analyze.dynamic import sandbox
+    src = tmp_path / "kw.c"; src.write_text(_KERNEL_WRITTEN_OVERFLOW)
+    exe = tmp_path / "kw"
+    if subprocess.run([gcc, "-O0", "-w", "-no-pie", str(src), "-o", str(exe)],
+                      capture_output=True).returncode != 0:
+        pytest.skip("build failed")
+    if M.dislocator_lib() is None:
+        pytest.skip("libdislocator not installed here")
+    # create, overflow the object's buffer with EXACTLY the length we declared, then call it
+    data = b"1\n2\n512\n" + b"B" * 512 + b"3\n"
+
+    plain = sandbox.run(str(exe), stdin=data, timeout=10)
+    assert plain.crashed and plain.signal_name == "SIGSEGV", \
+        "the fixture is supposed to crash WITHOUT the oracle"
+
+    guarded = sandbox.run(str(exe), stdin=data, timeout=10, guard_page=True)
+    assert sandbox.GUARD_PAGE_TAG in guarded.isolation
+    assert not guarded.crashed, (
+        "a kernel-performed write past a guarded page cannot copy the whole payload: the write "
+        "stops at the page boundary, the rest of the sequence is read as data, and the operation "
+        "that would call the overwritten pointer is never selected -- if this ever starts "
+        "crashing, the dual-oracle seed sweep is no longer the reason the class is found")
+
+
+def test_the_campaign_calibrates_every_seed_under_both_oracles():
+    """Structural: the seed queue carries its ORACLE, and both flags are in it. The mutation
+    phase keeps the stage's chosen oracle -- only the seeds are doubled, which is a few dozen
+    executions."""
+    import pathlib
+
+    from lykos.analyze.fuzz import stage as fstage
+    src = pathlib.Path(fstage.__file__).read_text()
+    assert "[(s, guard) for s in _seeds] + [(s, not guard) for s in _seeds]" in src
+    assert "guard_page=guard_eff" in src, "the batch must follow the queue's oracle"

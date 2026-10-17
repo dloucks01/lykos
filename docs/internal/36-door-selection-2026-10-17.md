@@ -97,3 +97,87 @@ libsndfile's row in `tools/real_corpus_gate.py`, same tarball, same 600 s budget
   entry supplies the four virtual-IO callbacks and sizes the read buffer the way libsndfile
   documents it (`frames * channels` shorts), with the seek callback CLAMPED — an out-of-range
   seek we honoured would be our out-of-bounds read, filed against the library.
+
+---
+
+# The heap overflow nobody could demonstrate — same day, weaponization
+
+`tools/coverage_matrix.py` asks what each MECHANISM reaches, and the answer for **heap-overflow**
+was L0 on both axes it appears on — while the lifetime classes beside it (UAF, double-free) reach
+L3 through the FSOP chain. Every heap case in the conformance gate was a lifetime case; the class
+with the most real-world CVEs behind it had no case at all, and the machinery to finish it
+(`chain_primitive`: "overwrite an adjacent CODE pointer with the win address, trigger the use, and
+CONFIRM control reached it") had been written and was never exercised on one.
+
+The new case, `heap_fnptr_hijack`, is the common shape and not a contrived one: a notebook menu
+over `struct note { char text[32]; void (*show)(struct note *); }`, an edit that takes its own
+length, and a separate option that INVOKES the callback. Two properties make it a test of the
+chain rather than of a crash finder — the corrupting write and the detonation are DIFFERENT menu
+operations, and the pointer is overwritten in place, so what faults is a call through our bytes.
+
+Five defects stood between "crash found" and "shell", and each was invisible until the one before
+it was fixed. Every one is a measurement, in order:
+
+1. **The case passed at L1 while its source said `want_level=3`.** `_scored` is
+   `lvl_ok or bool(demod)`, so any poc-backed finding carrying a listed CWE passes the case
+   whatever level it reached. `want_cwe=()` now, for the same reason `oob_leak_pie_ret2win`
+   carries none: the LEVEL is the claim.
+2. **The fixture's own accidental use-after-free was the easier bug.** `free` did not NULL its
+   slot, so every crash the campaign found was `add(i); free(i); show(i)` — three tokens long —
+   and the overflow the case exists for was never driven. It NULLs now; the lifetime classes are
+   gated by the `heap_fsop` cases.
+3. **The menu model had no buffer in it.** An edit reads its data only when the slot holds an
+   object (`printf("data: "); if (db[i]) read(...)`), and an isolated crawl never primes one, so
+   the option printed `data: `, skipped the read and looped back: the model said
+   `2 -> [idx, num]`. No generated sequence could overflow anything and the campaign ran 6,064
+   executions with zero crashes. A prompt that is printed and not read is still a field — the
+   prompt is the evidence it exists, the guard is why it was not read — and it only counts when
+   the line is UNFINISHED (`data: ` yes, `ok\n` no, which is output).
+4. **Three primers, and the named one was trusted.** A size-then-buffer flow is exactly an
+   EDIT's shape too, so `2` was named as the allocator and every sequence began by editing an
+   object that had never been created. `new(slot)` for a fixed-size record asks for no size at
+   all, so it was not a candidate in the first place. Every candidate is primed with in turn now,
+   interleaved under the cap, with the payload-bearing options first — and a stray newline after
+   a length-governed data field is dropped when another operation follows it, because it was
+   being read as menu choice 0 and turned "write, then call" into "write, then exit".
+   6 of 48 generated sequences now fault, one of them through the hijacked callback.
+5. **The cyclic pattern could not reproduce the crash it was handed.** Structure-preserving
+   framing keeps the bytes around the filler, and for a menu-driven write those bytes include
+   the LENGTH the target is about to read: `2\n0\n512\n` in front of a 1,064-byte cyclic leaves
+   552 bytes of pattern in the pipe, the next operation reads garbage instead of the option that
+   detonates the write, and the stage reported "cyclic pattern did not fault". The field follows
+   the payload now, rewritten only when it is at least as large as the filler it precedes (an
+   index is smaller), offered as one more framing in the sweep, and recorded with the prefix and
+   suffix so L3 inherits the same framing the offset was measured in.
+6. **A hijacked function pointer does not put the attacker's bytes in the program counter.** On
+   x86-64 a call through a register holding a non-canonical address raises #GP and the kernel
+   reports SIGSEGV with the pc AT THE CALL:
+
+   ```
+   pc  = 0x401489           -> cyclic_find = -1   (the call site, inside the program)
+   rdx = 0x6161616261616161 -> cyclic_find = 32   (the pattern, at the pointer's offset)
+   disasm = `call   rdx`
+   ```
+
+   `controlled_registers` already saw `{rdx: 32}`; nothing connected it to the branch. The
+   faulting INSTRUCTION names the register (register-direct forms only — `call [rax+0x30]` reads
+   its target from memory, a weaker claim the sentinel would refuse anyway), and the sentinel
+   settles it: MARKER is a canonical address, so a confirming run really does arrive there.
+   Measured: `recover_ip_offset -> (32, 'reg:rdx')`, and the confirming detonation lands with
+   `pc = 0x1337c0de1337`.
+
+7. **The guard-page oracle HID the bug.** Every execution of the campaign preloads
+   libdislocator, and a write the KERNEL performs cannot fault the process: `read(fd, buf, n)`
+   into a buffer at the end of a guarded page copies only as far as the page boundary, the rest
+   of the sequence is then read as data, and the operation that would call the overwritten
+   pointer is never selected. The crashing seed is SIGSEGV plain and **exit 0 guarded** — 5,810
+   executions, zero crashes, on a target that crashes on its own seed. The two oracles catch
+   different overflows and each hides the other's (busybox's lzma read faults ONLY under the
+   guard page), so every calibration seed now runs under BOTH; the mutation phase keeps the
+   stage's chosen oracle, and the isolation tag still records which one found a crash, so the
+   PoC replays the way it was found.
+
+**Result, measured 2026-10-17:** `heap_fnptr_hijack` **PASSES at L3 in 126 s**, through the real
+autopilot, with `want_cwe=()` so only the level can satisfy it — `exploit/CWE-119`,
+`primitive/CWE-787`, `root_cause/CWE-787`. The heap-overflow row of the coverage matrix is no
+longer L0.

@@ -1126,7 +1126,10 @@ def heap_trace_stage(ctx) -> dict:
         # the crawl and the op-sequences must pad each field to W instead of newline-delimiting.
         width, model = shared_op_model(ctx, target, workdir, exe, opts)
         from ..poc import primitive as _prim
-        seqs = menu.menu_op_sequences(model, opts, width=width) \
+        # `allocates=True`: the malloc/free pair above is the evidence that an option in this
+        # menu creates something, which is what lets an index-only `new(slot)` be tried as a
+        # primer -- a fixed-size record asks for no size and so names no allocator in the model.
+        seqs = menu.menu_op_sequences(model, opts, width=width, allocates=True) \
             or heaptrace.heap_op_sequences(opts, marker=_prim.RECLAIM_MARKER) or [
             b"1\n64\nA\n2\n0\n2\n0\n", b"1\n2\n2\n",                 # double-free
             b"1\n64\nA\n2\n0\n3\n0\n", b"1\n2\n3\n", b"1\n2\n3\n4\n",  # UAF (alloc, free, use)

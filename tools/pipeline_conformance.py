@@ -193,6 +193,30 @@ def _csc_build(source: str, out: str):
 #: and the conclusion drawn from it was wrong.
 KEEP_FAILED = False
 
+#: The menu notebook whose edit overflows an inline buffer into the object's OWN callback.
+#: Kept beside the case list rather than inline, like the other multi-line sources here.
+SRC_HEAP_FNPTR = r'''#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+void win(void){ execl("/bin/sh","sh",(char*)0); }
+struct note { char text[32]; void (*show)(struct note *); };
+static void plain(struct note *n){ printf("%s\n", n->text); }
+struct note *db[16];
+static long rl(void){ char b[32]; int i=0,c; while(i<31){ c=getchar(); if(c<0||c=='\n')break; b[i++]=c; } b[i]=0; return strtol(b,0,10); }
+int main(void){ setvbuf(stdout,0,2,0); setvbuf(stdin,0,2,0);
+  while(1){ printf("1.add 2.edit 3.show 4.free 5.exit\n> ");
+    long o=rl();
+    if(o==1){ printf("idx: "); long i=rl();
+              if(i>=0&&i<16){ db[i]=malloc(sizeof(struct note));
+                              if(db[i]){ db[i]->show=plain; strcpy(db[i]->text,"new"); } } }
+    else if(o==2){ printf("idx: "); long i=rl(); printf("len: "); long n=rl(); printf("data: ");
+              if(i>=0&&i<16&&db[i]&&n>0) read(0, db[i]->text, (size_t)n); }  /* len unbounded */
+    else if(o==3){ printf("idx: "); long i=rl(); if(i>=0&&i<16&&db[i]) db[i]->show(db[i]); }
+    else if(o==4){ printf("idx: "); long i=rl(); if(i>=0&&i<16){ free(db[i]); db[i]=0; } }
+    else return 0; } }'''
+
+
 _CASES: list[Case] = [
     Case("no_pie_ret2win",
          r'''#include <stdio.h>
@@ -287,6 +311,37 @@ int main(void){ setvbuf(stdout,0,2,0); setvbuf(stdin,0,2,0);
          ["-fPIE", "-pie", "-O0", "-w"],
          want_level=2, want_cwe=("CWE-416","CWE-200"),
          note="name-gate + y/n + char-loop + uninit-reuse -> libc leak (L2)"),
+
+    # HEAP OVERFLOW -> an adjacent CODE POINTER -> shell. The class with the most real-world
+    # CVEs behind it (libtiff, libsndfile and openjpeg all carry heap-overflow CVEs) demanded
+    # only L0 in the coverage matrix, while the lifetime cases beside it reach L3: every heap
+    # case here was a double-free, a UAF or an uninitialised reuse. The CHAIN for it already
+    # exists -- `heap_trace` reports CWE-122 and `chain_primitive` overwrites an adjacent code
+    # pointer with a win address and confirms control reached it -- and nothing measured it.
+    #
+    # The shape is the common one and not a contrived one: a struct with an inline buffer
+    # followed by a callback (`struct note { char text[32]; void (*show)(...); }`), an edit that
+    # takes its own length, and a separate option that INVOKES the callback. Two properties make
+    # it a real test of the chain rather than of a crash finder: the corrupting write and the
+    # detonation are DIFFERENT menu operations, so nothing faults until the right pair is driven
+    # in the right order; and the pointer is overwritten in place, so the fault PC is whatever
+    # bytes we wrote -- control, not a wild read.
+    Case("heap_fnptr_hijack",
+         SRC_HEAP_FNPTR,
+         ["-no-pie", "-fno-stack-protector", "-O0", "-w"],
+         # want_cwe is EMPTY on purpose, for the reason spelled out on `oob_leak_pie_ret2win`:
+         # `_scored` is `lvl_ok or bool(demod)`, so a CWE arm passes the case the moment any
+         # matching poc-backed finding appears. Measured: with ("CWE-122","CWE-787","CWE-119")
+         # this case passed at **L1** -- the crash was found and verified and the hijack never
+         # ran. The LEVEL is the whole claim here; the crash itself is gated by other cases.
+         want_level=3, want_cwe=(), budget=420.0,
+         note="menu notebook, heap overflow past an inline buffer into the object's own callback "
+              "-> call it -> shell (L3). no-PIE so the win address is static: the PIE form of "
+              "this needs a leak, which is a different case. `free` NULLs its slot on purpose: "
+              "the first version did not, and the accidental use-after-free was the EASIER bug "
+              "-- every crash the campaign found was `add(i); free(i); show(i)`, three tokens "
+              "long, and the overflow this case exists for was never driven **[measured]**. The "
+              "lifetime classes are gated by the heap_fsop cases beside it"),
 
     Case("heap_fsop_shell",
          r'''#include <stdio.h>

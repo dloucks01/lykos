@@ -946,7 +946,23 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
         mm = menu_model_for(ctx, target, exe, exe.parent)
         if mm:
             model, opts, mwidth = mm
-            op_seeds = [s for s in _menu.menu_op_sequences(model, opts, width=mwidth) if s]
+            # Does this target ALLOCATE? It decides whether an index-only option may be tried as
+            # the creator (`new(slot)` for a fixed-size record asks for no size, so the model
+            # cannot name it), and the import table is the evidence -- the same test the heap
+            # chain's own gate uses. Without it, a notebook whose menu is
+            # `1.add(idx) 2.edit(idx,len,data) 3.show(idx) 4.free(idx)` had every seed begin by
+            # editing an object that had never been created: 6,736 executions, zero crashes, on
+            # a target whose overflow is three operations deep **[measured]**.
+            _alloc_seen = False
+            try:
+                from ..poc import rop as _rop
+                _got = _rop.got_entries(exe.read_bytes())
+                _alloc_seen = any(n in _got for n in ("malloc", "calloc", "realloc",
+                                                      "_Znwm", "_Znam"))
+            except Exception:                            # noqa: BLE001 -- evidence, not a gate
+                observe.absorbed(_log, "assuming no allocator")
+            op_seeds = [s for s in _menu.menu_op_sequences(model, opts, width=mwidth,
+                                                           allocates=_alloc_seen) if s]
             if op_seeds:
                 corpus = list(corpus) + op_seeds
                 ctx.progress(msg=f"{event_prefix} learned {len(op_seeds)} menu-op seeds")
@@ -1069,10 +1085,21 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
     # every seed for the same reason. Verbatim, so the seed's own bytes reach the parser; the
     # boundary-value configs the JVM path puts first in the corpus are exactly the payloads this
     # detonates first. Bounded so a large distilled corpus cannot eat the whole budget on replay.
-    replay: list = list(corpus)[:_CALIBRATE_CAP]
+    # EVERY SEED UNDER BOTH ORACLES, because they catch different overflows and each HIDES the
+    # other's. The guard page makes a heap over-READ fault where the fuzzer can see it; it also
+    # suppresses an overflow the KERNEL performs -- `read(fd, buf, n)` into a buffer at the end
+    # of its page returns EFAULT instead of faulting, the copy never lands, and the program runs
+    # on. Measured on the heap-notebook fixture: the sequence that overwrites an object's
+    # callback and calls it is SIGSEGV plain and exit 0 under libdislocator, so a campaign that
+    # ran every execution guarded reported 5,810 executions and zero crashes on a target that
+    # crashes on its own seed. Only the seeds are doubled (a few dozen executions): the
+    # mutation phase keeps the stage's chosen oracle.
+    _seeds = list(corpus)[:_CALIBRATE_CAP]
+    replay: list = [(s, guard) for s in _seeds] + [(s, not guard) for s in _seeds]
     ctx.progress(msg=f"{event_prefix} campaign")
     while execs < max_execs and time.time() < deadline and not ctx.should_cancel():
         calibrating = bool(replay)
+        guard_eff = guard
         prefix: list = []
         base_ms = sorted(cheap_ms)[len(cheap_ms) // 2]
         if batchable and flags and not calibrating:
@@ -1096,8 +1123,14 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
         if calibrating:
             # Verbatim seeds first, in corpus order (boundary-value configs lead), up to the
             # batch size -- never mutated, so a seed that crashes is caught as itself.
-            take = min(len(replay), max(1, want))
-            inputs = replay[:take]
+            # One oracle per batch: `run_batch` preloads (or does not) for the whole batch, so
+            # the queue is consumed in runs of the same flag.
+            guard_eff = replay[0][1]
+            take = 0
+            cap = min(len(replay), max(1, want))
+            while take < cap and replay[take][1] == guard_eff:
+                take += 1
+            inputs = [d for d, _g in replay[:take]]
             del replay[:take]
         else:
             inputs = [mut.mutate(rng.choice(corpus), corpus) for _ in range(max(1, want))]
@@ -1110,7 +1143,7 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
             results = sandbox.run_batch(exe, inputs, mode=mode, timeout=exec_timeout,
                                         arch=target.arch, endianness=target.endianness,
                                         bits=target.bits, blocks=arm, base_argv=run_argv,
-                                        guard_page=guard)
+                                        guard_page=guard_eff)
             if results is None:
                 batchable = False                     # not available here; stay per-exec
             else:
@@ -1126,7 +1159,7 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
             kw = {"endianness": target.endianness, "bits": target.bits}
             if run_fn is run_input:
                 kw["base_argv"] = run_argv
-                kw["guard_page"] = guard
+                kw["guard_page"] = guard_eff
             # Only ever arm blocks we have not reached: the breakpoints are one-shot. Asked by
             # SIGNATURE rather than by identity, because the channel runner takes them too --
             # gated on `run_fn is run_input`, a network campaign could not be given coverage at
@@ -1202,7 +1235,7 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
                 # runs clean. Filing those left every downstream stage chasing a crash that
                 # cannot be reproduced, and the release gate failing with "PoC not reproduced".
                 if not _reproduces(run_fn, exe, mode, workfile, exec_timeout,
-                                   target, data, run_argv, guard_page=guard):
+                                   target, data, run_argv, guard_page=guard_eff):
                     flaky += 1
                     continue
                 crashes_reproducible += 1
@@ -1231,7 +1264,7 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
                 if bucket not in seen_sigs:
                     seen_sigs[bucket] = 1
 
-                    def _same(d, _sig=sig, _prefix=run_argv):
+                    def _same(d, _sig=sig, _prefix=run_argv, _guard=guard_eff):
                         # Minimize under the SAME invocation the crash was found and confirmed
                         # with: a crash behind an option (jhead's `-cmd`) does not reproduce
                         # without it, so a flag-less predicate would be false from the first
@@ -1239,7 +1272,7 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
                         kw = {"endianness": target.endianness, "bits": target.bits}
                         if run_fn is run_input:
                             kw["base_argv"] = _prefix
-                            kw["guard_page"] = guard
+                            kw["guard_page"] = _guard
                         r = run_fn(exe, mode, workfile, exec_timeout, target.arch, d, **kw)[1]
                         return r.crashed and r.signal_name == _sig
 

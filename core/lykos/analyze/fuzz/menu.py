@@ -149,6 +149,39 @@ def _tail_prompt(chunk: str) -> str:
     return after if after.strip() else ""
 
 
+#: A question, not output: a prompt ends in `:`/`>`/`?` and the program then stops writing, so
+#: the line is UNFINISHED. `ok\n` after a completed write is output and must not count.
+_PROMPT_TAIL = re.compile(r"[:>?]\s*\Z")
+
+
+def _skipped_prompt(head: str) -> bool:
+    """Did the option print a prompt for a field it then did NOT read?
+
+    An edit reads its data only when the slot holds an object -- `printf("data: ");
+    if (db[i]) read(...)` -- and an isolated crawl never primes one, so the option prints
+    `data: `, skips the read and loops back to the menu. The prompt is the evidence the field
+    exists; the guard is why it was not read this time. Without it the model said
+    `2 -> [idx, num]`, no sequence could overflow anything, and a notebook whose overflow is
+    three operations deep fuzzed 6,064 times with zero crashes **[measured]**.
+    """
+    if not head or head.endswith("\n"):
+        return False                                     # a finished line is output, not a question
+    return bool(_PROMPT_TAIL.search(head)) and classify_prompt(_tail_prompt(head)) == "str"
+
+
+def _menu_start(text: str) -> int:
+    """Index where the re-printed menu begins in a drained chunk, or len(text).
+
+    Needed to read what the option printed BEFORE it looped back: the prompt for a field it
+    skipped sits there, and `_tail_prompt` over the whole chunk would classify the menu instead.
+    Matched by OPTION rather than by line, because a prompt with no newline and the menu that
+    follows it share one line -- `data: 1.add 2.edit 3.show 4.free 5.exit` is exactly the chunk
+    this has to cut in two.
+    """
+    m = _OPT_SCAN.search(str(text or ""))
+    return m.start() if m else len(text or "")
+
+
 def _looks_like_menu(text: str) -> bool:
     """The option list re-appeared -- the current option's sub-flow has finished and looped."""
     return len(detect_menu([text])) >= 2
@@ -178,8 +211,16 @@ def _scalar(value: bytes, width) -> bytes:
     return (value + b" " * (width or 0))[:width] if width else value + _NL
 
 
-def _data(payload: bytes, width) -> bytes:
-    return payload if width else payload + _NL
+def _data(payload: bytes, width, term: bool = True) -> bytes:
+    """The data field's bytes. The newline is a TERMINATOR for a line-based reader, and one byte
+    too many for a `read(fd, buf, size)` whose size we just supplied: it stays in the pipe and the
+    next operation reads it as an empty line. That only matters when another operation FOLLOWS --
+    every sequence used to end at the write -- and it is how the one sequence that proves a heap
+    overflow (write the object's callback, then CALL it) quietly became "write, then exit": the
+    stray newline was read as menu choice 0 **[measured]**."""
+    if width:
+        return payload
+    return payload + _NL if term else payload
 
 
 def _drain(proc, sel, *, idle: float, deadline: float) -> tuple[str, bool]:
@@ -269,6 +310,16 @@ def crawl_menu(spawn, options, *, max_fields: int = 10, idle: float = 0.2,
             for _ in range(max_fields):
                 out, alive = _drain(proc, sel, idle=idle, deadline=deadline)
                 if _looks_like_menu(out):
+                    # A PROMPT PRINTED AND NOT WAITED ON is still a field. An edit reads its data
+                    # only when the slot holds an object -- `printf("data: "); if (db[i]) read(...)`
+                    # -- and an isolated crawl never primes one, so the option printed `data: `,
+                    # skipped the read and looped straight back to the menu. The model then said
+                    # `2 -> [idx, num]`: no buffer, so no sequence could overflow anything, and a
+                    # notebook whose overflow is three operations deep fuzzed 6,064 times with
+                    # zero crashes **[measured]**. The prompt is the evidence the field exists;
+                    # the guard is why it was not read this time.
+                    if _skipped_prompt(out[:_menu_start(out)]):
+                        fields.append("str")
                     returned = True
                     break
                 if not alive:
@@ -335,7 +386,7 @@ _OVERFLOW = 512   # bytes past a typical stack/heap buffer -- reaches the saved 
 
 
 def _fill(fields, *, big_last: bool = False, idx: bytes = b"1", num: bytes = b"16",
-          big: bytes = b"B" * 200, width=None) -> bytes:
+          big: bytes = b"B" * 200, width=None, no_term: bool = False) -> bytes:
     """Input for ONE invocation of an option with the given field template. `big_last` makes the
     last STRING field over-long (the overflow payload); otherwise every field gets a small in-bounds
     value of the right type. A string that FOLLOWS a size field is padded to that many bytes, so a
@@ -369,10 +420,10 @@ def _fill(fields, *, big_last: bool = False, idx: bytes = b"1", num: bytes = b"1
                     sz = 0
         elif big_last and i == last_str:
             n = _OVERFLOW if size_idx >= 0 else len(big)
-            out += _data(b"B" * n, width)                        # fill the over-large read
+            out += _data(b"B" * n, width, term=not (no_term and sz))
         else:
             payload = b"A" * sz if 0 < sz <= 4096 else b"AAAA"   # match the preceding size
-            out += _data(payload, width)
+            out += _data(payload, width, term=not (no_term and sz))
     return bytes(out)
 
 
@@ -386,7 +437,8 @@ def _is_alloc(fields) -> bool:
     return any(f == "str" for f in fields[ni + 1:]) or all(f == "num" for f in fields)
 
 
-def menu_op_sequences(model: dict, options, *, max_seqs: int = 40, width=None) -> list[bytes]:
+def menu_op_sequences(model: dict, options, *, max_seqs: int = 48, width=None,
+                      allocates: bool = False) -> list[bytes]:
     """Correctly-typed heap operation sequences built from a crawled menu model.
 
     Picks an allocating option (a size-then-string flow) to prime an object, then drives every other
@@ -400,14 +452,28 @@ def menu_op_sequences(model: dict, options, *, max_seqs: int = 40, width=None) -
     opts = [str(o) for o in (options or [])]
     present = [o for o in opts if o in model]
     alloc = next((o for o in present if _is_alloc(model[o])), None)
-    # A no-ARGUMENT option (empty field template) is a candidate allocator or trigger the size-flow
-    # heuristic cannot name: a fixed-size `malloc` reads nothing, and so do the bare `free`/`use`/
-    # `print` operations whose SEQUENCE is the double-free / use-after-free. With neither a size-flow
-    # allocator nor any no-arg option there is nothing that can build heap state, so still empty --
-    # which keeps a menu of index-only operations (delete/modify by id, no create) from emitting
-    # sequences that act on objects it can never allocate.
+    # THREE SHAPES OF PRIMER, because none of them can be told from the others by its fields:
+    #   * a size-flow option (`add(size, data)`) -- the one this function has always used;
+    #   * a no-ARGUMENT option (empty template) -- a fixed-size `malloc`, and equally the bare
+    #     `free`/`use`/`print` whose SEQUENCE is the double-free / use-after-free;
+    #   * an INDEX-ONLY option (`new(slot)`) -- a fixed-size record in a slot table,
+    #     `db[i] = malloc(sizeof *db[i])`, which asks for no size at all.
+    # The third was missing and the first was TRUSTED, and both halves of that cost the same
+    # target: a menu of `1.add(idx) 2.edit(idx,len,data) 3.show(idx) 4.free(idx)` names `2` as
+    # its allocator (a size followed by a buffer is exactly an edit's shape too), so every
+    # sequence began by editing an object that had never been created and nothing in the menu
+    # ever allocated. EVERY candidate is now primed with in turn -- which is what the tracer and
+    # the fault are for -- and the sequences are interleaved so a later candidate still gets its
+    # strongest shapes in under the cap.
     noarg = [o for o in present if not model[o]]
-    if alloc is None and not noarg:
+    # The index-only shape needs evidence from OUTSIDE the menu that the target allocates at all:
+    # with nothing but index-only options, `new(slot)` and `delete(slot)` are the same template.
+    # heap_discover has resolved a malloc/free pair by the time it asks; a caller that cannot say
+    # gets exactly the old answer, and a menu of index-only operations with no create still
+    # emits nothing.
+    idx_only = ([o for o in present if model[o] and all(x == "idx" for x in model[o])]
+                if allocates else [])
+    if alloc is None and not noarg and not idx_only:
         return []
     def _op(o, **kw):                                    # option choice + its filled fields
         return _scalar(o.encode(), width) + _fill(model[o], width=width, **kw)
@@ -416,29 +482,59 @@ def menu_op_sequences(model: dict, options, *, max_seqs: int = 40, width=None) -
     # handed a valid navigation that ALREADY lands a bad index in the handler to build from.
     oob = (b"-1", b"-2", b"9999")
     seqs: list[bytes] = []
-    # --- precise path: a size-flow allocator (add/create reading a size) was identified. Prime two
-    #     objects, then drive each option with an over-long last string / doubled id / bad index. ---
+    # --- the precise path: prime objects with a candidate creator, then drive each option with an
+    #     over-long last string / a repeated id / a bad index / a trigger after the write. ---
+    primers = []
     if alloc is not None:
         one = _op(alloc)
-        prime = one + one                                # two objects: ids 0 and 1 both exist
-        for o in present:
+        primers.append(one + one)                        # two objects: ids 0 and 1 both exist
+    for c in idx_only[:3]:
+        primers.append(_op(c, idx=b"0") + _op(c, idx=b"1"))
+    # The ops that CARRY a payload go first for every primer. An option with a string field is the
+    # only one that can overflow anything, and the cap is tight: with the options taken in menu
+    # order, the index-only shapes of a four-option menu filled it and the one sequence that
+    # mattered -- overflow, then call -- fell one item past the end **[measured]**.
+    ordered = ([o for o in present if "str" in model[o]]
+               + [o for o in present if model[o] and "str" not in model[o]])
+    per_primer = []
+    for prime in primers:
+        mine: list = []
+        for o in ordered:
             f = model[o]
             if not f:
                 continue
             idx_opt = any(x == "idx" for x in f)
             for iv in (b"0", b"1"):                      # target id 0 and 1 (0- or 1-based tables)
-                seqs.append(prime + _op(o, big_last=True, idx=iv))
+                mine.append(prime + _op(o, big_last=True, idx=iv))
+                # ...and then an index-only option, which is where an overwritten CODE POINTER is
+                # CALLED. The corrupting write and the detonation are DIFFERENT operations, so a
+                # sequence that stops at the write faults nowhere -- an overflow into the
+                # object's own callback is invisible until something calls it.
+                for tr in idx_only:
+                    mine.append(prime + _op(o, big_last=True, idx=iv, no_term=True)
+                                + _op(tr, idx=iv))
                 if all(x == "idx" for x in f):           # double-free / UAF: index-only op, twice
-                    seqs.append(prime + _op(o, idx=iv) + _op(o, idx=iv))
+                    mine.append(prime + _op(o, idx=iv) + _op(o, idx=iv))
             if idx_opt:
                 for iv in oob:                           # unchecked-index (CWE-129)
-                    seqs.append(prime + _op(o, idx=iv))
-                    seqs.append(prime + _op(o, big_last=True, idx=iv))
+                    mine.append(prime + _op(o, idx=iv))
+                    mine.append(prime + _op(o, big_last=True, idx=iv))
+        per_primer.append(mine)
+    # INTERLEAVED, not concatenated: the cap is a few dozen sequences and one primer's shapes run
+    # to more than that on a five-option menu, so a concatenated list spends the whole budget on
+    # whichever candidate happened to be named first -- which is the mistake above, in a second
+    # form. Round-robin gives every candidate its strongest shapes.
+    for i in range(max((len(m) for m in per_primer), default=0)):
+        for m in per_primer:
+            if i < len(m):
+                seqs.append(m[i])
     # --- generic path: reach use-after-free / double-free / double-use even when the allocator and
     #     the trigger take NO argument, which the size-flow heuristic above cannot name. An
     #     alloc->free->use flow is literally "select every option in order", and no single-option
     #     seed reaches it; a no-arg double-free is the SAME option twice once an object is live. ---
     gprime = b"".join(_op(o) for o in noarg) or (_op(alloc) if alloc else b"")
+    if not gprime and idx_only:
+        gprime = _op(idx_only[0], idx=b"0")
     seqs.append(b"".join(_op(o) for o in present))       # walk every option in menu order
     seqs.append(b"".join(_op(o) for o in reversed(present)))   # and in reverse
     for o in present:
