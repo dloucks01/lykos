@@ -1685,6 +1685,67 @@ int main(void){ setvbuf(stdout,0,2,0);
               "sanitizer build. Measured: `tsan/CWE-362` at L1, which is the family's ceiling by "
               "construction -- a race is a scheduling fact, not an attacker-chosen write."),
 
+    # THE CHAIN THAT DOES NOT FIT. Every L2->L3 route in this engine puts its chain where the
+    # overflow lands, and a `read` with a fixed count that stops just after the frame leaves room
+    # for the return address and nothing else: a 3-word system("/bin/sh") chain cannot be placed
+    # there at any offset, so the honest verdict was an L2 primitive and no L3. The pivot moves
+    # the stack instead of filling it.
+    Case("stack_pivot_shell",
+         r"""#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+char cmd[64] = "/bin/sh";            /* a command string at a fixed address (no-PIE) */
+/* Writable space BELOW the chain, which is what the pivoted stack actually needs: measured,
+   `system()` segfaults with 192, 448 or 960 bytes under it and spawns a shell with 1984. The
+   slack does not have to be inside the buffer -- the stack keeps growing past the buffer's start
+   into whatever is mapped writable there, which is what these 8 KiB of other globals are. */
+static char pad[8192];
+static char notes[256];              /* the buffer field ONE lands in: the chain's home */
+/* A tiny -O0 binary contains no `pop rdi; ret` anywhere, while a real one has thousands of
+   gadgets -- so the fixture plants the one the chain needs rather than making gadget scarcity
+   the defect under test. */
+__attribute__((naked, used)) void gadgets(void){ __asm__("pop %rdi; ret"); }
+/* A framed read: exactly n bytes. A single `read` of a pipe returns whatever has arrived, which
+   made the measured control offset differ run to run (3499, 2416, 2831); a fixed count does not. */
+static void read_exact(char *p, size_t n){ size_t g = 0;
+  while (g < n) { ssize_t r = read(0, p + g, n - g); if (r <= 0) break; g += (size_t)r; } }
+static void use(const char *src){ char small[64]; memcpy(small, src, 80); printf("ok %.64s\n", small); }
+int main(void){ setvbuf(stdout,0,2,0);
+  system("true");                     /* a program that shells out once: system@plt is RESOLVED */
+  pad[0] = 1;                         /* keep the padding global (and its writable pages) */
+  printf("note: "); read_exact(notes, sizeof notes);   /* field 1: the chain's home */
+  char line[128];
+  printf("name: "); ssize_t m = read(0, line, sizeof line - 1);
+  if(m <= 0) return 0;
+  use(line);                           /* copies exactly 80 bytes into 64: 64 + rbp + ret */
+  return 0; }""",
+         ["-no-pie", "-fno-stack-protector", "-O0", "-w"],
+         want_level=3, want_cwe=(), budget=480.0, mechanism="stack-overflow",
+         note="TECHNIQUE stack pivot (doc 38, item 1). `use()` copies exactly 80 bytes into a "
+              "64-byte frame: the write reaches the saved return address and carries ONE word past "
+              "it, so the chain it needs -- pop rdi, &\"/bin/sh\", system@plt -- cannot be placed "
+              "there at any offset. The chain lives in `notes`, which field ONE fills, and "
+              "`leave; ret` moves rsp there. Four things were measured the hard way. `offset` is "
+              "the distance to the RETURN ADDRESS, so the saved RBP goes one word BELOW it -- "
+              "writing it into the return slot returns to the buffer's own address and segfaults. "
+              "The pivoted stack is used by every function the chain CALLS, so the chain sits high "
+              "in the buffer with slack underneath: with it at the buffer's start the pivot "
+              "worked, pop rdi and system@plt both ran, and the process died inside "
+              "`_dl_runtime_resolve_xsavec`, which needs hundreds of bytes below the call and a "
+              "64-byte-aligned save area -- which is also why this program calls `system(\"true\")` "
+              "once at startup, so the slot is already resolved. And `system()` itself needs room: "
+              "measured, 192, 448 and 960 bytes of slack all segfault and 1984 spawns a shell -- "
+              "but the space that counts is WRITABLE MEMORY BELOW the chain rather than space "
+              "inside the buffer, which is what the 8 KiB `pad` global supplies for a 256-byte "
+              "`notes`. "
+              "A single `read` of a pipe returns whatever has arrived, so field one is read by "
+              "COUNT: with a partial read the measured offset differed run to run. And a "
+              "newline-framed first field would need PACED delivery, which the L2 cyclic probe "
+              "cannot do -- it tries stdin, file and arg, so a defect reachable only through "
+              "paced fields never gets a primitive measured at all (that gap is doc 38's own "
+              "next item, and this case deliberately does not depend on it)."),
+
     # ---- THE CONTROLLED INGREDIENT. Several classes sit at L1 only because the fixture withholds
     # the one thing that makes them exploitable, not because the class caps there. A write through
     # NULL is a denial of service; the same missing check with an attacker-chosen OFFSET is
