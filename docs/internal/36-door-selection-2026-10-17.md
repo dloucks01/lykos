@@ -88,9 +88,11 @@ libsndfile's row in `tools/real_corpus_gate.py`, same tarball, same 600 s budget
   `tools/corpus_regression.py` is 1 for exactly that reason. The first door compiles 188
   translation units under ASan+UBSan; the five behind it cost almost no build time and all of
   their fuzzing time. A reach floor above 1 needs a bigger slice, not a planner change.
-* **A callback is still a candidate.** openjpeg's ranked tail holds `error_callback()` and
-  `info_callback()` — functions the library calls, not entry points. They cost a share of a
-  slice and report clean.
+* ~~A callback is still a candidate.~~ Closed in the same round: a name that says the LIBRARY
+  calls it (`*_callback`, `*_cb`, `*_handler`, `on_*`) is penalised, not excluded — the name is a
+  convention, not a contract, so a tree whose only candidates are callbacks still offers them,
+  last. openjpeg's tail is now `jpwl_markcomp()` and `gene_cache()` instead of
+  `error_callback()` and `info_callback()`.
 * **The honesty rule for a known harness is unchanged and still hand-written.** The libsndfile
   entry supplies the four virtual-IO callbacks and sizes the read buffer the way libsndfile
   documents it (`frames * channels` shorts), with the seek callback CLAMPED — an out-of-range

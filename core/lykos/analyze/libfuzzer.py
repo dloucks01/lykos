@@ -593,6 +593,10 @@ def _library_srcs(root):
     return out
 
 
+#: Named like something the library calls rather than something a caller calls.
+_CALLBACKISH = re.compile(r"(?:^|_)(?:callback|cb|handler|hook)$|^on_", re.I)
+
+
 def rank_harness_fns(root, *, limit: int = 8) -> list:
     """Entry functions worth fuzzing in a LIBRARY with no in-tree harness, strongest first.
 
@@ -644,6 +648,14 @@ def rank_harness_fns(root, *, limit: int = 8) -> list:
                 score -= 3                               # plausibly input, but it does not say so
             if _PARSERISH.search(name):
                 score += 4
+            # A CALLBACK IS CALLED BY THE LIBRARY, so it is not a way IN: openjpeg's ranked tail
+            # held `error_callback()` and `info_callback()`, which take the message the library
+            # has already built and print it. Fuzzing one spends a door's share of the slice and
+            # reports a clean campaign, which reads as breadth. A penalty and not an exclusion,
+            # because the name is a convention and not a contract -- a tree whose only
+            # candidates are callbacks still offers them, last.
+            if _CALLBACKISH.search(name):
+                score -= 6
             _hdr = _declared_in_header(root, name)
             if _hdr is not None:
                 score += 3

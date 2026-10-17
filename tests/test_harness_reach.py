@@ -496,3 +496,17 @@ def test_the_root_is_never_a_program_directory(lib):
     there is nothing left to fuzz at all -- bzip2 is that project."""
     (lib / "CMakeLists.txt").write_text("add_executable(mytool tool.c)\n")
     assert L.program_dirs(lib) == frozenset()
+
+
+def test_a_callback_sinks_below_a_real_entry_point(lib):
+    """openjpeg's ranked tail held `error_callback()` and `info_callback()`: functions the
+    LIBRARY calls, with arguments it owns. Fuzzing one spends a door's share of the slice and
+    reports a clean campaign, which reads as breadth."""
+    (lib / "lib" / "cb.c").write_text(
+        "#include <stdio.h>\n"
+        "void error_callback(const char *msg, void *client) { (void)client; "
+        'fprintf(stderr, "%s", msg); }\n'
+        "int probe_header(const char *s) { return s ? s[0] : 0; }\n")
+    ranked = L.rank_harness_fns(lib, limit=10)
+    assert "error_callback" in ranked, "a penalty, not an exclusion: the name is a convention"
+    assert ranked.index("probe_header") < ranked.index("error_callback")
