@@ -266,16 +266,40 @@ Observed on two different server cases, including one run before any of this rou
 existed, so it is pre-existing. It costs roughly 90 seconds per server case and does not change the
 verdict.
 
+## 7. The prompt-paced capture channel -- DONE
+
+Not an exploitation technique but a DELIVERY shape, and it was capping a whole class of defect at
+L1 regardless of how good the technique catalogue was. A prompt-driven target reads each field with
+its own `read(0, ...)`, so a bulk feed desyncs it. The campaign paced
+(`fuzz.runner.run_input_prompted`) and the bundle paced (`replay_prompt.py`), but the ptrace
+capture that the L2 primitive and the root-cause stage both drive had no `prompt` branch and no
+`else` -- an input recorded as prompted left stdin unset, the child ran with no input, and the
+helper reported "no fatal signal". A real crash, a wrong setup, nothing saying so.
+
+Fixed in `ptrace_capture.py` (paced stdin over a pipe, the child's own output as the clock),
+`capture.py` (one shared `paced_chunks` split, `sweep_modes` adding `prompt` only when the input
+has more than one field, `how_to_feed` reading the prompted isolation tag), with the sweep sites in
+the L2 and root-cause stages wired through it. The silence is closed structurally too: an
+unrecognised delivery mode is now an explicit refusal rather than a child run with no input.
+
+`prompt_protocol_overflow` raised **L1 -> L2**, strict; measured L2 with `--ceiling`
+(`primitive/CWE-119` + `chain_primitive/CWE-787`, 137s). L3 is a different seam: the exploit
+recipes frame their chain through `_measured_frame` as one blob, so weaponizing a prompt protocol
+needs that framing to pace too, which this case does not yet assert.
+
 ## Still to do in this programme
 
-7. **The exit-handler family**, as one unit: `_rtld_global`/`_dl_fini` first because it skips
-   PTR_MANGLE entirely, then `__exit_funcs`/`atexit` and the TLS `dtor_list`, which share the
-   mangled-pointer problem. Everything built so far reaches control flow through stdio or a saved
-   return address; `exit()` is still unmodelled.
-8. **Zip-slip / archive extraction traversal.** It has a real native sink (libarchive) and a real
+8. **The exit-handler family** (`__exit_funcs`/`atexit`, the TLS `dtor_list`, `_rtld_global`).
+   Everything built so far reaches control flow through stdio or a saved return address; `exit()`
+   is still unmodelled. The foundations were checked this round and the conclusion is that this is
+   a larger piece of work than it looks, not a quick wire-up: every exit-handler flavor stores its
+   function pointer under glibc's pointer guard, so there is no flavor that side-steps it, and a
+   working route therefore needs a guard-recovery step with its own design and its own negative
+   controls. Worth doing deliberately, with a planted-bug fixture, rather than bolted on.
+9. **Zip-slip / archive extraction traversal.** It has a real native sink (libarchive) and a real
    oracle, but the oracle is a FILESYSTEM effect and the probe framework grades output. Closing it
    means giving a probe a filesystem oracle, which is a framework change worth doing on its own.
-9. **An alphanumeric / printable-only encoder.** Not reachable by extending `encode_avoiding`: the
+10. **An alphanumeric / printable-only encoder.** Not reachable by extending `encode_avoiding`: the
    XOR stub's own bytes are non-printable, so it needs a sub-encoder.
 
 ## Noted but deliberately not built
