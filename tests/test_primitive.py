@@ -522,3 +522,61 @@ def test_address_primitive_separates_control_from_a_wild_pointer():
     assert not nd["controlled"] and nd["effect_kind"] == "nondeterministic"
     # too few observations: no claim either way
     assert P.address_primitive([("orig", cap(1)), ("byte@0=0xff", cap(2))]) is None
+
+
+# ------------------------------------------------------- L2 -> L3: steering the controlled read
+# An address the attacker chooses is only a step toward an exploit if the bytes come back. The
+# input that MEASURED the control crashes -- that is how the address was measured -- so there is
+# nothing on stdout to resolve. The verdict names the lever, though, so turning it down lands the
+# same read inside a mapped page: the program survives and prints what it read.
+_LEAKY_INDEX = (
+    "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n"
+    "int main(void){\n"
+    "  unsigned char *p = malloc(64); memset(p, 'A', 64);\n"
+    "  void **q = malloc(64);\n"
+    "  q[0] = (void*)&main; q[1] = (void*)&puts; q[2] = (void*)p;\n"
+    "  unsigned char hdr[16];\n"
+    "  if (fread(hdr, 1, 8, stdin) != 8) return 0;\n"
+    "  if (memcmp(hdr, \"LZMA\", 4) != 0) { puts(\"bad magic\"); return 1; }\n"
+    "  size_t idx = (size_t)hdr[5] * 0x10000;          /* unvalidated index */\n"
+    "  fwrite(p + idx, 1, 128, stdout);                 /* OOB read: address = f(input) */\n"
+    "  return 0; }\n")
+
+
+@pytest.mark.skipif(sandbox.host_arch() not in ("x86-64", "aarch64"),
+                    reason="L2 primitive analysis is native-arch only")
+def test_a_steered_read_discloses_a_base_and_hands_the_recipe_to_l3(store, case, pool, gcc,
+                                                                    tmp_path):
+    """The bridge: controlled address -> steer into mapped memory -> resolve a leaked pointer.
+
+    What crosses to L3 is the provoking INPUT, never the base -- the base belongs to a process
+    that has already exited and is worthless to a later one under ASLR.
+    """
+    b = _build(gcc, tmp_path, _LEAKY_INDEX, "leakidx", ["-w"])
+    if b is None:
+        pytest.skip("build failed")
+    crash = b"LZMA\x00\x05\x00\x00"                     # index 5 -> far out of bounds, faults
+    if not sandbox.run(str(b), stdin=crash, timeout=10).crashed:
+        pytest.skip("the fixture does not fault on this host's memory layout")
+
+    target = ingest(store, case.id, b)
+    sha, _, _ = store.content.put_bytes(crash)
+    q = JobQueue(store.conn)
+    run = enqueue_primitive(q, target, params={"input_sha": sha, "input_mode": "stdin",
+                                               "timeout": 8})
+    assert pool.wait_idle(240) and q.runs.get(run.id).status == "done"
+
+    from lykos.db.dao import EventDAO
+    ev = EventDAO(store.conn)
+    done = ev.payloads_of_type("primitive.done", case_id=case.id)
+    assert (done[-1] or {}).get("primitive") == "address-control", done[-1]
+
+    disc = ev.payloads_of_type("primitive.disclosure", case_id=case.id)
+    assert disc, "the steering experiment never reported"
+    d = disc[-1]
+    assert d.get("proved"), d
+    assert d.get("pie_base"), "a code pointer was on stdout and no PIE base came back"
+    assert d.get("input_sha"), "L3 inherits the INPUT; without it the recipe cannot be replayed"
+    assert d.get("steered_byte") == 5, d
+    # and the L2 payload carries the disclosure, which is what _l2_disclosure_triggers reads
+    assert (done[-1] or {}).get("disclosure", {}).get("input_sha") == d["input_sha"]

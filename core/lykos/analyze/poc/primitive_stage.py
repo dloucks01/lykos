@@ -378,6 +378,125 @@ def _host_libc_bytes() -> bytes:
     return b""
 
 
+def _plain_for_disclosure(ctx, target):
+    """(exe, binary-bytes) of an UNINSTRUMENTED build to observe a disclosure on, or None.
+
+    Shared by the two disclosure experiments -- the sanitizer-measured out-of-bounds read and the
+    address-control one -- because the staging rule is the same and this project has paid for
+    keeping two copies of one rule before. Under ASan the process aborts INSIDE the read, so the
+    build that DETECTS the leak is the one build that cannot DEMONSTRATE it; what an attacker has
+    is the plain program. The bytes come back too, because a leaked pointer is resolved against
+    the layout of the binary that was actually run.
+    """
+    target_bytes = ctx.content.path(target.sha256).read_bytes()
+    plain = ctx.scratch() / "disclose" / "plain.bin"
+    plain.parent.mkdir(parents=True, exist_ok=True)
+    blob = plain_build_bytes(ctx, target)
+    if blob is not None:
+        plain.write_bytes(blob)
+        target_bytes = blob
+    elif aflpp.is_sanitizer_build(target_bytes):
+        # Nothing to detonate that would survive the read. Say so rather than reporting a quiet
+        # "no pointers found", which reads as evidence the leak is harmless.
+        ctx.emit("primitive.disclosure", payload={
+            "proved": False, "rule": "not-observable",
+            "note": "the only build of this program here is instrumented, so it aborts inside "
+                    "the out-of-bounds read and emits nothing; the disclosure is not observable "
+                    "without an uninstrumented build of the same source"})
+        return None
+    else:
+        ctx.content.stage_target(target, plain.parent, plain.name)
+    plain.chmod(0o755)
+    return plain, target_bytes
+
+
+#: Values to try for the lever byte when steering a controlled read INTO mapped memory. ZERO
+#: first, then small: the address is the attacker's index times a stride, so index 0 starts the
+#: read at the object itself and runs off its end into the adjacent chunk -- the classic place a
+#: live pointer sits -- and the smallest indices stay nearest it.
+_DISCLOSE_VALUES = (0x00, 0x01, 0x02, 0x03, 0x04, 0x08, 0x10, 0x20)
+
+
+def _address_disclosure(ctx, target, mode, base_argv, orig, prim, timeout):
+    """Steer the controlled read into MAPPED memory and see whether the program hands bytes back.
+
+    The L2 -> L3 bridge for the address-control family. `_oob_disclosure` can detonate the input
+    that FOUND the defect, because a sanitizer-measured over-read survives on the plain build and
+    prints. Here the measured input is one that CRASHES -- that is how the address was measured --
+    so there is nothing on stdout to resolve. But the verdict named the lever: the input byte that
+    chooses the address, and the stride it moves by. Turn the lever down and the same read lands
+    inside a mapped page, the program survives, and whatever it printed is the disclosure.
+
+    Everything after that is the existing machinery: `leak.disclosed_bases` resolves a leaked
+    pointer's page-invariant low bits against the binary's own symbol layout, with ASLR ON, and
+    `build_exploit` inherits the provoking INPUT (never the base, which dies with the process).
+
+    Returns the disclosure dict, or None when the fault is a write, no lever was isolated, every
+    steered variant still crashes, or nothing recoverable reached the output.
+    """
+    if prim.get("access") != "read" or prim.get("offset") is None:
+        return None
+    off = int(prim["offset"])
+    if off >= len(orig):
+        return None
+    from . import leak as _leak
+    try:
+        staged = _plain_for_disclosure(ctx, target)
+        if staged is None:
+            return None
+        plain, target_bytes = staged
+        benign = orig[:8] if len(orig) > 8 else b"\x00" * 4
+        _r2, base_out = _detonate_capturing(ctx, target, plain, mode, base_argv, benign,
+                                            timeout, aslr=True)
+        # Judge a survivor by WHAT it disclosed, not by how much. Every surviving variant here
+        # prints the same number of bytes, so "most bytes" picked whichever ran first -- measured
+        # on the fixture: index 1 lands in mapped-but-zero heap under the sandbox's larger arena,
+        # survives, prints 128 zero bytes and resolves nothing, while index 0 runs off the end of
+        # the object into the adjacent chunk and hands back a live code pointer. The question the
+        # experiment exists to answer is whether a BASE comes back, so ask it per survivor.
+        best = None
+        for v in _DISCLOSE_VALUES:
+            if v == orig[off]:
+                continue
+            var = bytearray(orig); var[off] = v
+            _rep, out = _detonate_capturing(ctx, target, plain, mode, base_argv, bytes(var),
+                                            timeout, aslr=True)
+            # A variant that still faults tells us nothing: the read has to RETURN for its bytes
+            # to reach the output.
+            if not out or len(out) <= len(base_out or b""):
+                continue
+            cand = _leak.disclosed_bases(out, target_bytes, _host_libc_bytes(),
+                                         baseline=base_out)
+            if cand.get("proved"):
+                best = (bytes(var), out, cand)
+                break
+            if best is None or int(cand.get("distinct") or 0) > int(best[2].get("distinct") or 0):
+                best = (bytes(var), out, cand)
+        if best is None:
+            ctx.emit("primitive.disclosure", payload={
+                "proved": False, "rule": "no-survivor",
+                "note": (f"the read's address is the attacker's to choose, but no value of input "
+                         f"byte {off} both survived and printed more than the baseline, so the "
+                         f"bytes it reads were not observed leaving the process")})
+            return None
+        d = best[2]
+    except Exception:                                     # noqa: BLE001 -- best-effort experiment
+        observe.absorbed(_log, "answering None")
+        return None
+    # The provoking input is the STEERED variant, not the crashing one the verdict was measured
+    # from, so it is stored and named here -- `_l2_disclosure_triggers` fetches these bytes and
+    # re-runs them in the weaponizer's own process to recover the base live.
+    d["input_sha"] = ctx.put_artifact("poc-l2-disclosure-input", data=best[0])
+    ctx.emit("primitive.disclosure", payload={
+        "proved": d["proved"], "rule": d["rule"], "distinct_pointers": d["distinct"],
+        "pie_base": d["pie_base"], "libc_base": d["libc_base"], "canary": d["canary"],
+        "disclosed_bytes": d["disclosed_bytes"], "note": d["note"],
+        "steered_byte": off, "steered_to": best[0][off], "input_sha": d["input_sha"]})
+    ctx.progress(msg=(("the steered read defeats ASLR: " + d["note"]) if d["proved"]
+                      else "the steered read discloses data, but no base was corroborated")[:90])
+    return d
+
+
 def _oob_disclosure(ctx, target, mode, base_argv, orig, prim, timeout):
     """Does the out-of-bounds READ hand its bytes back, and do they defeat ASLR?
 
@@ -411,25 +530,10 @@ def _oob_disclosure(ctx, target, mode, base_argv, orig, prim, timeout):
         return None                                      # a write discloses nothing to its caller
     from . import leak as _leak
     try:
-        target_bytes = ctx.content.path(target.sha256).read_bytes()
-        plain = ctx.scratch() / "disclose" / "plain.bin"
-        plain.parent.mkdir(parents=True, exist_ok=True)
-        blob = plain_build_bytes(ctx, target)
-        if blob is not None:
-            plain.write_bytes(blob)
-            target_bytes = blob                          # resolve the leak against THIS layout
-        elif aflpp.is_sanitizer_build(target_bytes):
-            # Nothing to detonate that would survive the read. Say so rather than reporting a
-            # quiet "no pointers found", which reads as evidence the leak is harmless.
-            ctx.emit("primitive.disclosure", payload={
-                "proved": False, "rule": "not-observable",
-                "note": "the only build of this program here is instrumented, so it aborts "
-                        "inside the out-of-bounds read and emits nothing; the disclosure is not "
-                        "observable without an uninstrumented build of the same source"})
+        staged = _plain_for_disclosure(ctx, target)
+        if staged is None:
             return None
-        else:
-            ctx.content.stage_target(target, plain.parent, plain.name)
-        plain.chmod(0o755)
+        plain, target_bytes = staged
         # An input that stays in bounds, for the EXTRA-bytes figure only. Short rather than
         # empty: a parser handed nothing often refuses before it prints anything at all, and a
         # baseline of "" would overstate how much the out-of-bounds run disclosed.
@@ -913,6 +1017,16 @@ def primitive_stage(ctx) -> dict:
                     orig, target.arch or "x86-64",
                     siblings=_address_siblings(ctx, target, input_sha))
             if _av and _av.get("confirmed"):
+                # L2 -> L3: a controlled READ is only a step if its bytes come back. Steer the
+                # lever into mapped memory and let the existing leak machinery judge what the
+                # program printed; `build_exploit` picks the recipe up from `disclosure`.
+                _disc = _address_disclosure(ctx, target, _dmode or mode, base_argv, orig, _av,
+                                            timeout)
+                if _disc:
+                    _av["disclosure"] = {k: _disc[k] for k in
+                                         ("proved", "rule", "pie_base", "libc_base", "canary",
+                                          "distinct", "disclosed_bytes", "note", "input_sha")
+                                         if k in _disc}
                 return _finalize(ctx, target, target_bytes, _dmode, base_argv, _dcap, _demo,
                                  _av, True, {"input_modes_tried": tried})
             ctx.emit("primitive.done", payload={
@@ -1127,6 +1241,13 @@ def primitive_stage(ctx) -> dict:
                 orig, target.arch or "x86-64",
                 siblings=_address_siblings(ctx, target, input_sha))
             if _av and _av.get("confirmed"):
+                _disc = _address_disclosure(ctx, target, _dmode or mode, base_argv, orig, _av,
+                                            timeout)
+                if _disc:
+                    _av["disclosure"] = {k: _disc[k] for k in
+                                         ("proved", "rule", "pie_base", "libc_base", "canary",
+                                          "distinct", "disclosed_bytes", "note", "input_sha")
+                                         if k in _disc}
                 return _finalize(ctx, target, target_bytes, _dmode, base_argv, _dcap, _demo,
                                  _av, True, {"after": "no register control"})
         ctx.emit("primitive.done", payload={
