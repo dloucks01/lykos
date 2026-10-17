@@ -1826,13 +1826,21 @@ int main(void){ setvbuf(stdout,0,2,0);
   printf("returned\n"); return 0; }""",
          ["-no-pie", "-fno-stack-protector", "-O0", "-w"],
          want_level=3, want_cwe=(), budget=420.0, mechanism="code-injection",
+         strict_level=True,
          note="BUG CLASS code injection (CWE-94) where the program does the hard part itself: a "
               "plugin/JIT loader copies the input into a page it then makes executable AND CALLS. "
-              "`mprotect_shellcode` measures L1 because it stages the bytes and returns -- "
-              "control never reaches them, and the page's address is never disclosed, so there is "
-              "nothing to redirect to. Here no exploitation is required at all: the only question "
-              "is whether the pipeline synthesizes bytes that DO something (a shell) rather than "
-              "just crashing the process, which is what the shellcode strategy exists for."),
+              "Every strategy in the stage was wrong for this shape. `_mprotect_shellcode` BUILDS "
+              "this situation with a ROP chain and so needs gadgets, an overflow offset and an "
+              "analyst-supplied page symbol -- none of which exist here, because the program "
+              "already did the work; and everything else needs a saved return address to "
+              "overwrite, when this program hands control over on purpose. Measured before the "
+              "fix: L2. The pipeline found the input being executed (it crashes on whatever the "
+              "fuzzer sent), classified the fault as a memory error and stopped, because nothing "
+              "asked whether bytes WE choose would do something instead of crashing. The answer "
+              "is 25 bytes of position-independent execve(\"/bin/sh\") on stdin -- no offset, no "
+              "gadget, no leak -- so `_self_exec_exploit` runs before every strategy that needs "
+              "an offset, gated on an mprotect/mmap import, and confirms with an int3 negative "
+              "control at the same length so a target that merely echoes the marker cannot pass."),
 
     # ---- SECOND WAVE: mechanisms whose DETECTOR may or may not exist. Each of these lands at
     # want_level=0 / want_cwe=() for the same reason as the wave above -- the case is the

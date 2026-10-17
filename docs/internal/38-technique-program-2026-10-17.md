@@ -17,7 +17,8 @@ write-what-where, magic-value overwrite, PIE one-byte partial overwrite, tcache 
 of Apple 2 (one-piece, split, and the cell form for a one-word-at-a-time writer — with either
 `system` or `setcontext` as the fake `__doallocate`), the heap and C++ hijacks (adjacent code
 pointer, vtable, indexed-write GOT), and — new — the WASM indirect-call redirect, the stack pivot,
-`setcontext` register control, and House of Cat (`_IO_list_all` → a FILE that is entirely ours).
+`setcontext` register control, House of Cat (`_IO_list_all` → a FILE that is entirely ours), and
+the self-executing input.
 
 **Knowledge-base, now with measured verdicts** — every entry's primitive, preconditions and
 emitted chain are decided against the libc in hand (`Env(libc_data=...)`), and each says UNKNOWN
@@ -192,6 +193,28 @@ glibc actually installed here, not textbook order.
    still does not check. It also drops the classic worked example where it does not apply:
    `global_max_fast` is the usual thing to overwrite with "an unchosen large value", and on a libc
    with no fastbins that variable does not exist.
+
+## One the gate found rather than the catalogue: the self-executing input
+
+Not on the list above, because it is not a technique so much as the absence of one. A plugin or
+JIT loader copies its input into a page, makes it executable and **calls it** — so there is no
+saved return address to overwrite and no instruction pointer to hijack; the program hands control
+over on purpose.
+
+Every strategy in `exploit_stage` was wrong for that shape. `_mprotect_shellcode` *builds* this
+situation with a ROP chain and therefore needs gadgets, an overflow offset and an analyst-supplied
+page symbol, none of which exist when the program already did the work; everything else needs an
+offset. Measured before the fix, `jit_page_executed` reached **L2**: the pipeline found the input
+being executed (it crashes on whatever the fuzzer sent), classified the fault as a memory error
+and stopped, because nothing asked whether bytes *we* choose would do something instead of
+crashing.
+
+The answer is 25 bytes. `_self_exec_exploit` runs before every strategy that needs an offset,
+gated on an `mprotect`/`mmap` import, and sends position-independent `execve("/bin/sh")` on the
+input channel — no offset, no gadget, no leak. It confirms with an **int3 negative control at the
+same length on the same channel**, which is what makes the marker mean anything: `_spawn_and_mark`
+proves a shell by writing `echo <marker>` and reading it back, so a target that merely echoed its
+stdin would otherwise pass without executing a thing.
 
 ## The allocator facts this round measured
 
