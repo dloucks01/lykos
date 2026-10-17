@@ -59,6 +59,13 @@ def find_harnesses(root, *, limit: int = 8) -> list:
         rel = p.relative_to(Path(root)).parts
         if any(seg in _SKIP_DIRS for seg in rel):
             continue
+        # A VENDORED PROJECT'S HARNESS IS NOT THIS PROJECT'S. mupdf bundles harfbuzz and
+        # freetype, each of which ships its own libFuzzer harness, and they are shallower than
+        # anything mupdf writes -- so the plan for mupdf was five harnesses fuzzing harfbuzz and
+        # freetype, with every finding filed against mupdf. The bundled code is reachable the
+        # honest way, through mupdf's own entry points.
+        if any(seg.lower() in _VENDOR_DIRS for seg in rel[:-1]):
+            continue
         try:
             if _HARNESS_RE.search(p.read_text(errors="ignore")):
                 out.append(p)
@@ -196,6 +203,13 @@ _NOT_LIBRARY = ("test", "tests", "tools", "contrib", "examples", "example", "bui
 #: and a harness that includes one does not compile.
 _PORT_DIRS = ("amiga", "win32", "windows", "msvc", "vms", "os2", "macos", "watcom", "borland",
               "mingw", "darwin", "aix", "hpux", "solaris", "android", "ios", "bcb5", "nt")
+#: Directories holding ANOTHER PROJECT, bundled. openjpeg vendors zlib, libtiff and lcms2 under
+#: `thirdparty/`, so the plan for openjpeg was `known zlib`, `TIFFOpen()`, `gzopen()` and
+#: `cmsOpenProfileFromFile()` -- four doors into four other libraries, each finding filed against
+#: openjpeg. A vendored library's API is not this target's API, the same way a platform port's is
+#: not; its code is still compiled and still reachable THROUGH openjpeg's own entry points.
+_VENDOR_DIRS = ("thirdparty", "third_party", "3rdparty", "external", "externals", "vendor",
+                "subprojects", "deps", "dependencies")
 
 
 #: A declaration whose parameter list is wrapped in a macro: `gzopen OF((const char *path, const
@@ -266,7 +280,7 @@ def installed_headers(root) -> frozenset:
             # taking it would have made zlib's own `zlib.h` "not installed" and excluded
             # `gzopen` from the candidates it has always been found through.
             if any(seg.lower() in _NOT_LIBRARY or seg.lower() in _PORT_DIRS
-                   for seg in rel[:-1]):
+                   or seg.lower() in _VENDOR_DIRS for seg in rel[:-1]):
                 continue
             try:
                 txt = _strip_comments(bf.read_text(errors="ignore"))
@@ -309,7 +323,7 @@ def _declared_in_header(root, fn: str):
         # `XML_ParserCreate` and `sorted()` returned `amiga/include/inline4/expat.h` first -- an
         # Amiga inline-macro wrapper. The name was found, so every caller believed the function
         # was public, while a harness that INCLUDED that header would not compile here at all.
-        if any(seg in _PORT_DIRS for seg in rel[:-1]):
+        if any(seg in _PORT_DIRS or seg in _VENDOR_DIRS for seg in rel[:-1]):
             continue
         try:
             # UNWRAPPED FIRST. A declaration whose parameter list is wrapped in a macro
@@ -492,7 +506,8 @@ def _library_srcs(root):
     out = []
     for p in _sources(Path(root), exclude_main=True):
         rel = p.relative_to(Path(root)).parts
-        if any(seg.lower() in _PORT_DIRS for seg in rel[:-1]):
+        if any(seg.lower() in _PORT_DIRS or seg.lower() in _VENDOR_DIRS
+               for seg in rel[:-1]):
             continue
         if any(seg in _NOT_LIBRARY for seg in rel[:-1]):
             continue

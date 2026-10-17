@@ -367,3 +367,71 @@ def test_a_public_header_wins_the_tie_over_an_internal_one(lib_with_internals):
     (lib_with_internals / "Makefile.am").write_text("nodist_include_HEADERS = mylib.h\n")
     (lib_with_internals / "lib" / "ml.h").write_text("int my_parse(my_parser, const char *, int, int);\n")
     assert L._declared_in_header(lib_with_internals, "my_parse").name == "mylib.h"
+
+
+# ------------------------------------------------------- a bundled library is not this library
+#
+# openjpeg vendors zlib, libtiff and lcms2 under `thirdparty/`, and the plan for openjpeg came
+# out as `known zlib`, `TIFFOpen()`, `gzopen()`, `cmsOpenProfileFromFile()` -- four doors into
+# four OTHER libraries, every finding filed against openjpeg. The vendored code is still
+# compiled and still reachable, through openjpeg's own entry points, which is the only honest
+# way to reach it.
+_VENDOR_HDR = """#ifndef OTHERLIB_H
+#define OTHERLIB_H
+typedef struct other_s *other;
+other other_create(const char *opts);
+int other_parse(other p, const char *s, int len, int flags);
+void other_free(other p);
+#endif
+"""
+_VENDOR_SRC = """#include <stdlib.h>
+#include <string.h>
+#include "otherlib.h"
+struct other_s { int n; char buf[16]; };
+other other_create(const char *opts) { (void)opts; return (other)calloc(1, sizeof(struct other_s)); }
+int other_parse(other p, const char *s, int len, int flags) {
+    (void)flags;
+    if (p && len > 0) { memcpy(p->buf, s, (size_t)len); }
+    return 1;
+}
+void other_free(other p) { free(p); }
+"""
+
+
+@pytest.fixture
+def lib_with_vendored(lib):
+    for where in ("thirdparty", "external"):
+        d = lib / where / "otherlib"
+        d.mkdir(parents=True)
+        (d / "otherlib.h").write_text(_VENDOR_HDR)
+        (d / "otherlib.c").write_text(_VENDOR_SRC)
+        (d / "Makefile.am").write_text("include_HEADERS = otherlib.h\n")
+    return lib
+
+
+def test_a_vendored_library_is_not_a_door(lib_with_vendored):
+    doors = [t["consume"] for t in L.find_handle_triples(lib_with_vendored, limit=6)]
+    assert "my_parse" in doors
+    assert "other_parse" not in doors
+    entries = [s.get("entry") for s in L.plan_harnesses(lib_with_vendored)]
+    assert not any("other" in (e or "") for e in entries), entries
+
+
+def test_a_vendored_header_is_not_this_projects_api(lib_with_vendored):
+    """`_declared_in_header` is what `known_harness` gates on, so a vendored zlib.h made
+    openjpeg match the zlib known harness -- a harness for a library nobody asked about."""
+    assert L._declared_in_header(lib_with_vendored, "other_parse") is None
+    assert "otherlib.h" not in L.installed_headers(lib_with_vendored)
+
+
+def test_a_vendored_harness_is_not_this_projects_harness(lib_with_vendored):
+    """mupdf bundles harfbuzz and freetype, both of which ship a libFuzzer harness, and both sit
+    SHALLOWER than anything mupdf writes -- so the plan for mupdf was five harnesses fuzzing
+    harfbuzz and freetype under mupdf's name."""
+    h = lib_with_vendored / "thirdparty" / "otherlib" / "fuzz.c"
+    h.write_text("#include <stdint.h>\n#include <stddef.h>\n"
+                 "int LLVMFuzzerTestOneInput(const uint8_t *d, size_t n) { (void)d; (void)n; "
+                 "return 0; }\n")
+    assert L.find_harnesses(lib_with_vendored) == []
+    assert L.find_harness(lib_with_vendored) is None
+    assert not any(s["kind"] == "in-tree" for s in L.plan_harnesses(lib_with_vendored))
