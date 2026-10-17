@@ -331,6 +331,24 @@ def test_a_second_pass_with_nothing_left_is_not_a_decline(lib):
     assert '"supported": True' in body, body[:400]
 
 
+def test_a_pass_whose_doors_were_all_starved_is_not_a_decline(lib):
+    """The second pass is scheduled to open the doors the first had no room for, and the first
+    had already spent the stage's slice -- so every door in the window was starved and the stage
+    reported `supported: false, "no budget left in this stage's slice"`. The real-corpus gate
+    then FAILED libsndfile for an unclassifiable decline on a run where this same capability had
+    just fuzzed 11,545 inputs through door 1 and found a real UBSan defect in `common.c:174`.
+    Out of time is not a refusal."""
+    src = pathlib.Path(
+        L.__file__).parents[0].joinpath("libfuzzer_stage.py").read_text()
+    body = src.split('all("no budget" in (r.get("why") or "") for r in rows)')[1].split(
+        "if not built:")[0]
+    assert '"supported": True' in body, body[:400]
+    # ...and the doors it never attempted are still offered, so the pass is repeatable rather
+    # than consumed.
+    assert '"next_entry_point": first' in body
+    assert '"more_entry_points": True' in body
+
+
 # ------------------------------- a tree that ships a harness AND has doors
 
 _ZH = "int zparse(const char *s, int n);\n"

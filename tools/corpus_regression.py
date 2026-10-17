@@ -182,6 +182,28 @@ GROUND_TRUTH: dict[str, dict] = {
                      "which had the campaign fuzzing Debian's copy of the library"},
         ],
     },
+    "libsndfile-1.0.28": {
+        "archive": "libsndfile-1.0.28.tar.gz",
+        # 1/6 measured at a 600s budget, and 1 is the floor rather than 2 because the five
+        # behind it are opened by a second pass whose slice the budget decides -- the first
+        # door alone compiles 188 translation units under ASan+UBSan. The door that matters is
+        # the one in the floor: a run that opens NONE of them is the state this library was in
+        # before, when the planner chose `psf_allocate()` -> `psf_fopen()` out of the internal
+        # `src/common.h` and the harness did not compile at all.
+        "min_doors": 1,
+        "defects": [
+            {"id": "sndfile-common-174-negate", "cwe": "CWE-190", "site": "common.c:174",
+             "through": "sndfile", "require_through": True, "min_level": 1,
+             "note": "UBSan: negation of -2147483648 cannot be represented in type 'int', in "
+                     "psf_log_printf's integer formatter. Measured 2026-10-17 through the "
+                     "libsndfile known harness (sf_open_virtual -> sf_readf_short -> sf_close) "
+                     "seeded with a valid 44-byte RIFF/WAVE header: 11,545 executions at "
+                     "57.7/s, filed confirmed and verified to L1. `require_through` because "
+                     "this entry point IS the point of the test -- libsndfile's decoders sit "
+                     "behind an open that wants a path, so no synthesized harness reaches them, "
+                     "and the virtual-IO door is the only honest way in"},
+        ],
+    },
     # --- precision controls. Clean is the expected answer for code this heavily fuzzed, which is
     # exactly why they need a REACH floor: without one, a broken harness builder passes here.
     "zlib-1.2.11": {

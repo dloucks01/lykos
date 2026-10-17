@@ -439,6 +439,22 @@ def libfuzzer_stage(ctx) -> dict:
     nxt = first + len(window)
     more = len(plan) > nxt
     built = [r for r in rows if r["built"]]
+    if not built and rows and all("no budget" in (r.get("why") or "") for r in rows):
+        # OUT OF TIME IS NOT A REFUSAL. This is the SECOND pass, scheduled to open the doors the
+        # first pass had no room for, and the first pass had already spent the stage's slice --
+        # so every door in the window was starved and the stage reported `supported: false`
+        # with "no budget left in this stage's slice". The gate then failed libsndfile for a
+        # capability declining with a reason nobody could classify, on a run where the same
+        # capability had just fuzzed 11,545 inputs through door 1 and found a real defect. The
+        # capability applies and it ran; what it lacked was budget, and the honest shape for
+        # that is the one the empty-window branch above already uses.
+        note = (f"no budget left in this stage's slice for door(s) {first + 1}-{nxt}; "
+                f"raise --budget to open them")
+        ctx.emit("libfuzzer.done", payload={"supported": True, "crashes": 0, "execs": 0,
+                 "entry_points": 0, "harnesses": rows, "harness_from": first,
+                 "next_entry_point": first, "more_entry_points": True, "note": note})
+        ctx.progress(pct=100, msg=note[:90])
+        return {"metrics": {"supported": True, "entry_points": 0, "more_entry_points": True}}
     if not built:
         why = next((r.get("why") for r in rows if r.get("why")), "no harness could be built")
         note = ("no LLVMFuzzerTestOneInput in the source; pass params.harness_fn to synthesize a "
