@@ -268,3 +268,53 @@ def test_the_campaign_calibrates_every_seed_under_both_oracles():
     src = pathlib.Path(fstage.__file__).read_text()
     assert "[(s, guard) for s in _seeds] + [(s, not guard) for s in _seeds]" in src
     assert "guard_page=guard_eff" in src, "the batch must follow the queue's oracle"
+
+
+# ---------------------------------------------------------- what the disclosed residue is WORTH
+# memcheck proves undefined bytes reached a write syscall -- an effect, and where this stage used
+# to stop. Stack residue full of POINTERS defeats ASLR and residue full of padding does not, and
+# the whole L2 disclosure ladder hangs off a FAULT (an MSan build aborts inside the read), so on a
+# plain binary the class had no path to a primitive however good the bytes were.
+_UNINIT_PTR_SRC = '''#include <stdio.h>
+#include <string.h>
+static void greet(void){ puts("hello"); }
+struct session { void (*cb)(void); char name[24]; long id; };
+static void setup(void){ struct session s; s.cb=greet; strcpy(s.name,"admin"); s.id=7;
+  printf("session %ld ready\\n", s.id); }
+static void dump(void){ char b[64]; fwrite(b,1,sizeof b,stdout); }
+int main(void){ setvbuf(stdout,0,2,0); setup(); dump(); return 0; }
+'''
+
+
+def test_the_uninit_disclosure_arm_asks_what_the_bytes_were():
+    """Pinned at the source level, because the ORDER and the gate are the point: the CWE-200
+    finding is filed either way, and the L2 primitive only on a base the leak corroborates."""
+    import inspect
+
+    from lykos.analyze.dynamic import uninit_stage
+    src = inspect.getsource(uninit_stage.mem_oracle_stage)
+    i = src.index('if kind == "uninit-disclosure" and not leaked:')
+    j = src.index("_disclosed_bases(", i)
+    k = src.index("_file_uninit_l2(", i)
+    assert i < j < k
+    assert 'disc.get("proved")' in src[j:k], "the L2 claim must be gated on a corroborated base"
+
+
+def test_an_uninitialised_read_can_disclose_the_image_base(tmp_path, gcc):
+    """The rung itself, end to end on a real PIE binary under live ASLR: the dead frame of one
+    function holds a code pointer, the next function writes its own uninitialised frame out, and
+    `disclosed_bases` recovers the load base from two independent leaked slots. Nothing faults."""
+    import subprocess
+
+    import pytest
+
+    from lykos.analyze.poc import leak
+    c = tmp_path / "u.c"; c.write_text(_UNINIT_PTR_SRC)
+    exe = tmp_path / "u"
+    if subprocess.run([gcc, "-fPIE", "-pie", "-fno-stack-protector", "-O0", "-w", str(c),
+                       "-o", str(exe)], capture_output=True).returncode:
+        pytest.skip("build failed")
+    out = b"".join(subprocess.run([str(exe)], capture_output=True).stdout for _ in range(2))
+    d = leak.disclosed_bases(out, exe.read_bytes(), b"")
+    assert d["proved"] and d["pie_base"], d.get("note")
+    assert d["pie_base"] % 0x1000 == 0

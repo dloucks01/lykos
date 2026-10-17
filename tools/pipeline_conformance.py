@@ -1329,6 +1329,32 @@ int main(void){ setvbuf(stdout,0,2,0); fill(); leak(); return 0; }""",
     # ---- INJECTION. A whole bug family the platform has probes for (command, path, SQL, XXE,
     # SSRF) and which nothing asserted: these need no memory corruption at all, so none of the
     # crash machinery above would ever surface them.
+    Case("uninit_pointer_leak",
+         r"""#include <stdio.h>
+#include <string.h>
+static void greet(void){ puts("hello"); }
+struct session { void (*cb)(void); char name[24]; long id; };
+static void setup(void){ struct session s; s.cb=greet; strcpy(s.name,"admin"); s.id=7;
+  printf("session %ld ready\n", s.id); }          /* the frame dies here, with its pointer in it */
+static void dump(void){ char b[64]; fwrite(b,1,sizeof b,stdout); }   /* never initialised */
+int main(void){ setvbuf(stdout,0,2,0); setup(); dump(); return 0; }""",
+         # PIE on purpose: a leaked code pointer only MEANS something where the image base is
+         # randomised, and that is the claim -- ASLR defeated by a read that never faults.
+         ["-fPIE", "-pie", "-fno-stack-protector", "-O0", "-w"],
+         want_level=2, want_cwe=("CWE-457", "CWE-200", "CWE-908"), budget=300.0,
+         mechanism="uninitialised",
+         note="BUG CLASS uninitialised read WEAPONIZED (CWE-457/908 -> CWE-200 -> L2). Measured "
+              "with --ceiling, uninit_stack_read stops at L0: memcheck proves undefined bytes "
+              "reached a write syscall, and that was the end of what could be said. The whole L2 "
+              "disclosure ladder hangs off a FAULT -- an MSan build aborts in the read, which is "
+              "how the src_uninit_* cases reach L2 -- so on a plain binary the class had no path "
+              "to a primitive however good the leaked bytes were. The difference that decides it "
+              "is WHAT the residue is: `setup`'s dead frame holds a code pointer, `dump` writes "
+              "the frame out raw, and leak.disclosed_bases recovers the image base from it -- "
+              "validated against this binary's own symbol layout, not against a second run "
+              "(residue cannot be told from residue that way). A padding leak still files as "
+              "CWE-200 and stays there, which is a result, not a failure."),
+
     Case("cmd_injection",
          r"""#include <stdio.h>
 #include <stdlib.h>

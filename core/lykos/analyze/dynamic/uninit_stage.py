@@ -92,6 +92,99 @@ def _probe_inputs(conn, target) -> list:
     return out[:_MAX_RUNS]
 
 
+#: What a disclosure of residue is WORTH. memcheck proves undefined bytes reached a write syscall
+#: -- an effect, and the end of what this stage could say. But stack and heap residue full of
+#: POINTERS defeats ASLR, and residue full of padding does not, and that difference decides
+#: whether a reader goes looking for a write primitive to pair the leak with. The out-of-bounds
+#: READ arm already draws it (`leak.disclosed_bases`, which validates a base against the target's
+#: own symbol layout rather than against a second run), and nothing connected the uninitialised
+#: read to it: on a plain binary with no sanitizer build to crash in, the whole class stopped at
+#: a CWE-200 finding, L0, however good the bytes were **[measured on uninit_stack_read]**.
+_LEAK_RUNS = 2
+
+
+def _disclosed_bases(ctx, target, exe, data, mode, argv, timeout):
+    """Run the UNINSTRUMENTED target (memcheck's own output is not the program's) under live ASLR
+    and ask what its bytes prove. Returns `leak.disclosed_bases`' verdict, or None."""
+    from ..poc import leak as _leak
+    from ..poc.exploit_stage import _libc_bytes_for
+    try:
+        target_bytes = ctx.content.path(target.sha256).read_bytes()
+    except Exception:                                    # noqa: BLE001
+        return None
+    libc_data = _libc_bytes_for(ctx, target) or b""
+    out = b""
+    for _ in range(_LEAK_RUNS):                          # ASLR is on: two runs, different bases
+        r = sandbox.run(exe, argv=list(argv or []), stdin=(data if mode == "stdin" else b""),
+                        timeout=min(float(timeout), 20.0), aslr=True)
+        out += (r.stdout or b"") + (r.stderr or b"")
+        if not out:
+            return None
+    d = _leak.disclosed_bases(out, target_bytes, libc_data)
+    return d if d.get("proved") else d or None
+
+
+def _file_uninit_l2(ctx, target, cand, disc, mode, sha) -> bool:
+    """File the proved disclosure as an L2 primitive: the residue carried a pointer and the base it
+    anchors was corroborated against this binary's own layout. Same rung, and the same claim, as
+    the out-of-bounds read arm -- a disclosure primitive, not a hijack."""
+    import json as _json
+
+    from ...db.dao import FindingDAO, PocDAO
+    from ..poc import bundle
+    got = ", ".join(n for n, k in (("image base", "pie_base"), ("libc base", "libc_base"),
+                                   ("stack canary", "canary")) if disc.get(k) is not None)
+    if not got:
+        return False
+    where = ", ".join(f"{n} {v:#x}" for n, v in
+                      (("PIE base", disc.get("pie_base")), ("libc base", disc.get("libc_base")),
+                       ("canary", disc.get("canary"))) if isinstance(v, int))
+    # The classifier's own note is not quoted: it is written for the out-of-bounds READ arm and
+    # says so, and a finding must not describe itself as a different defect.
+    detail = (f"ASLR defeated by an uninitialised read: the stale {disc.get('origin') or 'stack'} "
+              f"bytes memcheck saw reach a write syscall carry live pointers, and the {got} they "
+              f"anchor ({where}) was corroborated against this binary's own symbol layout by the "
+              f"{disc.get('rule') or 'page-offset'} rule -- not against a second run, because "
+              f"residue cannot be told from residue that way. The read never faults, so no "
+              f"crash-driven stage can reach this.")
+    try:
+        target_bytes = ctx.content.path(target.sha256).read_bytes()
+    except Exception:                                    # noqa: BLE001
+        return False
+    data = b"" if not sha else (ctx.content.get_bytes(sha) or b"")
+    meta = {"target_sha256": target.sha256, "arch": target.arch, "level": "L2",
+            "primitive": "address-disclosure (uninitialised read)",
+            "pie_base": disc.get("pie_base"), "libc_base": disc.get("libc_base"),
+            "tool_version": TOOL_VERSION}
+    blob = bundle.build(target_bytes, data, meta, b"", mode, list(cand.get("argv") or []), None,
+                        primitive={"type": "address-disclosure", "confirmed": True,
+                                   "note": "uninitialised read"})
+    bundle_sha = ctx.put_artifact("poc-bundle", data=blob, meta={"level": "L2", "verified": True})
+    input_sha = sha or ctx.put_artifact("uninit-disclosure-input", data=data)
+    poc_id = PocDAO(ctx.conn).insert(target.id, target.case_id, level="L2", verified=True,
+                                     signal_name=None, input_sha=input_sha, bundle_sha=bundle_sha)
+    fd = FindingDAO(ctx.conn)
+    c2 = {"cwe": "CWE-200", "title": f"ASLR defeated by an uninitialised read (discloses the {got})"
+                                    " (demonstrated): L2 primitive",
+          "severity": "high", "detector": TOOL, "state": "poc-backed", "confidence": 0.95,
+          "authoritative": True, "title_only": True,
+          "dedup_key": f"CWE-200:uninit-disclosure:aslr:{target.id}",
+          "evidence": [{"channel": "effects", "detail": _json.dumps([{
+              "kind": "info-disclosure", "status": "demonstrated",
+              "title": "ASLR defeated by an uninitialised read", "detail": detail,
+              "proof": {"type": "bundle", "sha": bundle_sha, "input_sha": input_sha,
+                        "note": detail}}])}]}
+    fd.upsert(target.id, target.case_id, c2)
+    fid = fd.id_for_dedup(target.id, c2["dedup_key"])
+    if fid:
+        PocDAO(ctx.conn).set_finding(poc_id, fid)
+    ctx.emit("memoracle.disclosure", payload={
+        "proved": True, "pie_base": disc.get("pie_base"), "libc_base": disc.get("libc_base"),
+        "canary": disc.get("canary"), "bundle": bundle_sha, "level": "L2"})
+    ctx.progress(msg=f"L2: the uninitialised read discloses the {got}")
+    return True
+
+
 def mem_oracle_stage(ctx) -> dict:
     target = TargetDAO(ctx.conn).get(ctx.target_id) if ctx.target_id else None
     if target is None:
@@ -121,6 +214,7 @@ def mem_oracle_stage(ctx) -> dict:
     timeout = float(p.get("timeout", 120))
     fd = FindingDAO(ctx.conn)
     filed, seen, tried = 0, set(), []
+    leaked = False                                       # an L2 disclosure primitive, filed once
 
     # The empty probe goes LAST: a recorded input exercises more of the program, but a default-path
     # disclosure needs no input at all, so the list must never be empty.
@@ -169,6 +263,19 @@ def mem_oracle_stage(ctx) -> dict:
                 }])})
         fd.upsert(target.id, target.case_id, cand)
         filed += 1
+        if kind == "uninit-disclosure" and not leaked:
+            # ...and WHAT the bytes were. The disclosure is the effect; the base it anchors is
+            # the primitive, and only one of the two is worth pairing with a write.
+            disc = _disclosed_bases(ctx, target, exe, data, mode, argv, timeout)
+            if disc and disc.get("proved"):
+                cand["argv"] = list(argv or [])
+                leaked = _file_uninit_l2(ctx, target, cand, disc, mode, sha)
+            elif disc is not None:
+                ctx.emit("memoracle.disclosure", payload={
+                    "proved": False, "disclosed_bytes": disc.get("disclosed_bytes"),
+                    "note": "the residue that left the process anchors no base: an information "
+                            "disclosure with nothing in it that defeats ASLR (which is a RESULT, "
+                            "not a failure -- padding leaks are the common case)"})
 
     note = ("no uninitialised-memory or heap error observed on the inputs tried -- those paths "
             "were clean, which is not the same as the program being clean"
