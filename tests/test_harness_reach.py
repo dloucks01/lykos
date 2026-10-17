@@ -264,3 +264,106 @@ def test_a_constructors_capacity_is_not_zero():
     # the real json-c signature, end to end
     assert L._ctor_arg_values(["int size", "lh_entry_free_fn *free_fn", "lh_hash_fn *hash_fn",
                                "lh_equal_fn *equal_fn"]) == ["16", "NULL", "NULL", "NULL"]
+
+
+# ------------------------------------------------------------------ the PUBLIC door, not any door
+#
+# Being declared in *some* header was the whole test for "this is the library's API", and
+# libsndfile's `src/common.h` -- the internal structs -- passed it. The strongest triple in the
+# tree was therefore `psf_allocate()` -> `psf_fopen()`: a door no application has, on a handle a
+# harness cannot honestly build. It did not even compile ("use of undeclared identifier
+# 'psf_allocate'"), so the library fuzzed at 34 exec/s through nothing while `sf_open` ->
+# `sf_read_*` -> `sf_close` went untouched.
+_INTERNAL_HDR = """#ifndef MYLIB_PRIV_H
+#define MYLIB_PRIV_H
+#include "mylib.h"
+typedef struct my_inner_s *my_inner;
+my_inner my_inner_alloc(void);
+int my_inner_feed(my_inner p, const char *s, int len, int flags);
+void my_inner_free(my_inner p);
+#endif
+"""
+_INTERNAL_SRC = """#include <stdlib.h>
+#include <string.h>
+#include "mylib_priv.h"
+struct my_inner_s { int n; char buf[16]; };
+my_inner my_inner_alloc(void) { return (my_inner)calloc(1, sizeof(struct my_inner_s)); }
+int my_inner_feed(my_inner p, const char *s, int len, int flags) {
+    (void)flags;
+    if (p && len > 0) { memcpy(p->buf, s, (size_t)len); }
+    return 1;
+}
+void my_inner_free(my_inner p) { free(p); }
+"""
+
+
+@pytest.fixture
+def lib_with_internals(lib):
+    (lib / "lib" / "mylib_priv.h").write_text(_INTERNAL_HDR)
+    (lib / "lib" / "inner.c").write_text(_INTERNAL_SRC)
+    return lib
+
+
+def test_an_install_rule_names_the_api(lib_with_internals):
+    """The project states which headers it ships; both automake and cmake spellings are read."""
+    (lib_with_internals / "Makefile.am").write_text(
+        "lib_LTLIBRARIES = libmylib.la\n"
+        "nodist_include_HEADERS = mylib.h\n")
+    assert L.installed_headers(lib_with_internals) == frozenset({"mylib.h"})
+    assert L.header_is_installed(lib_with_internals, "lib/mylib.h")
+    assert not L.header_is_installed(lib_with_internals, "lib/mylib_priv.h")
+
+
+def test_a_variable_in_an_install_rule_is_expanded(lib_with_internals):
+    """zlib installs through `install(FILES ${ZLIB_PUBLIC_HDRS})`, so the rule names no file."""
+    (lib_with_internals / "CMakeLists.txt").write_text(
+        "set(MYLIB_PUBLIC_HDRS\n    lib/mylib.h\n)\n"
+        "set(MYLIB_PRIVATE_HDRS lib/mylib_priv.h)\n"
+        "install(FILES ${MYLIB_PUBLIC_HDRS} DESTINATION include)\n")
+    assert L.installed_headers(lib_with_internals) == frozenset({"mylib.h"})
+
+
+def test_a_commented_out_install_rule_installs_nothing(lib_with_internals):
+    """openjpeg ships `#install(FILES mj2.h` -- a header it decided NOT to install."""
+    (lib_with_internals / "CMakeLists.txt").write_text(
+        "install(FILES lib/mylib.h DESTINATION include)\n"
+        "#install(FILES lib/mylib_priv.h DESTINATION include)\n")
+    assert L.installed_headers(lib_with_internals) == frozenset({"mylib.h"})
+
+
+def test_a_bundled_projects_install_rule_is_not_this_librarys(lib_with_internals):
+    """zlib ships `contrib/minizip`, whose `minizip_include_HEADERS` names zip.h and unzip.h.
+    Reading it would make zlib's own `zlib.h` private and lose `gzopen` -- the door that works."""
+    (lib_with_internals / "Makefile.am").write_text("nodist_include_HEADERS = mylib.h\n")
+    (lib_with_internals / "contrib" / "minilib").mkdir(parents=True)
+    (lib_with_internals / "contrib" / "minilib" / "Makefile.am").write_text(
+        "minilib_include_HEADERS = zip.h unzip.h\n")
+    assert L.installed_headers(lib_with_internals) == frozenset({"mylib.h"})
+
+
+def test_a_tree_that_states_nothing_keeps_every_candidate(lib_with_internals):
+    """bzip2 installs with a shell script. An unknown answer is not "nothing is public": the
+    triple through the internal header is still the only door there is, and it still works."""
+    assert L.installed_headers(lib_with_internals) == frozenset()
+    doors = [t["consume"] for t in L.find_handle_triples(lib_with_internals, limit=4)]
+    assert "my_inner_feed" in doors
+
+
+def test_the_internal_api_is_not_planned_as_a_door(lib_with_internals):
+    """With the API stated, the internal triple is EXCLUDED -- not merely outranked, because a
+    penalty still wins when the internal door is the only candidate left in the window."""
+    (lib_with_internals / "Makefile.am").write_text("nodist_include_HEADERS = mylib.h\n")
+    doors = [t["consume"] for t in L.find_handle_triples(lib_with_internals, limit=4)]
+    assert "my_parse" in doors
+    assert "my_inner_feed" not in doors
+    entries = [s.get("entry") for s in L.plan_harnesses(lib_with_internals)]
+    assert "my_parse()" in entries
+    assert "my_inner_feed()" not in entries
+
+
+def test_a_public_header_wins_the_tie_over_an_internal_one(lib_with_internals):
+    """libsndfile declares `sf_close` in both the shipped `sndfile.h` and the internal
+    `common.h`, same directory and same depth, and the shorter NAME used to win."""
+    (lib_with_internals / "Makefile.am").write_text("nodist_include_HEADERS = mylib.h\n")
+    (lib_with_internals / "lib" / "ml.h").write_text("int my_parse(my_parser, const char *, int, int);\n")
+    assert L._declared_in_header(lib_with_internals, "my_parse").name == "mylib.h"

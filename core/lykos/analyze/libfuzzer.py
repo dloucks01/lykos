@@ -215,6 +215,83 @@ def _unwrap_macro_args(text: str) -> str:
     return _MACRO_ARGS.sub(lambda m: "(" + m.group(1) + ")", text or "")
 
 
+#: An install rule names the headers a project SHIPS, which is the definition of its API.
+#: `include_HEADERS`, `pkginclude_HEADERS`, `nobase_include_HEADERS`, `libtiffinclude_HEADERS`
+#: and libsndfile's `nodist_include_HEADERS` are all the same automake rule under a prefix.
+_INSTALL_AUTOMAKE = re.compile(r"^[ \t]*\w*include_HEADERS[ \t]*\+?=((?:[^\n\\]|\\\n)*)", re.M)
+_INSTALL_CMAKE = re.compile(r"\binstall\s*\(\s*FILES\b(.{0,2000}?)\)", re.S | re.I)
+_INSTALL_MESON = re.compile(r"\binstall_headers\s*\((.{0,2000}?)\)", re.S)
+#: `set(ZLIB_PUBLIC_HDRS ... zlib.h)` -- zlib installs its headers through a variable, so the
+#: install rule itself names no file at all.
+_CMAKE_SET = re.compile(r"\bset\s*\(\s*([A-Za-z_]\w*)(.{0,2000}?)\)", re.S | re.I)
+_HDR_NAME = re.compile(r"[\w.+-]+\.h(?:h|pp|xx)?\b")
+_BUILD_FILES = ("Makefile.am", "CMakeLists.txt", "meson.build")
+_INSTALLED_CACHE: dict = {}
+
+
+def _strip_comments(text: str) -> str:
+    """`#install(FILES mj2.h ...)` is openjpeg declining to install that header, not installing it."""
+    return re.sub(r"(?m)^[ \t]*#.*$", "", text or "")
+
+
+def installed_headers(root) -> frozenset:
+    """The BASENAMES of the headers this project installs, from its own build files.
+
+    A function declared in a header the project ships is reachable by an application; one
+    declared only in an internal header is not. Nothing distinguished them, so libsndfile's
+    strongest triple came out of `src/common.h` -- `psf_allocate()` -> `psf_fopen()` -> a
+    `SF_PRIVATE` the library builds for itself. That harness did not even compile
+    ("use of undeclared identifier 'psf_allocate'"), and had it compiled it would have fuzzed
+    an API no caller can reach while `sf_open` -> `sf_read_*` -> `sf_close`, the door every
+    application uses, went untested. The project already says which headers are its API; this
+    reads the statement instead of guessing from a path.
+
+    Basenames, not paths, because an install rule is written relative to its own build file and
+    may name a header this build has yet to generate (`nodist_include_HEADERS = sndfile.h`).
+    Empty when the tree states nothing -- bzip2 installs with a shell script -- and every caller
+    treats an empty answer as "unknown", never as "nothing is public".
+    """
+    key = str(root)
+    if key in _INSTALLED_CACHE:
+        return _INSTALLED_CACHE[key]
+    root = Path(root)
+    names: set = set()
+    for name in _BUILD_FILES:
+        for bf in sorted(root.rglob(name))[:64]:
+            rel = bf.relative_to(root).parts
+            if any(seg in _SKIP_DIRS for seg in rel):
+                continue
+            # A BUNDLED PROJECT'S install rule is not this library's. zlib ships
+            # `contrib/minizip`, whose `minizip_include_HEADERS` names `zip.h` and `unzip.h` --
+            # taking it would have made zlib's own `zlib.h` "not installed" and excluded
+            # `gzopen` from the candidates it has always been found through.
+            if any(seg.lower() in _NOT_LIBRARY or seg.lower() in _PORT_DIRS
+                   for seg in rel[:-1]):
+                continue
+            try:
+                txt = _strip_comments(bf.read_text(errors="ignore"))
+            except OSError:
+                continue
+            found = []
+            for pat in (_INSTALL_AUTOMAKE, _INSTALL_CMAKE, _INSTALL_MESON):
+                found += [m.group(1) for m in pat.finditer(txt)]
+            if not found:
+                continue
+            setvars = {m.group(1): m.group(2) for m in _CMAKE_SET.finditer(txt)}
+            for blob in found:
+                for var in set(re.findall(r"\$[{(]([A-Za-z_]\w*)[})]", blob)):
+                    blob += " " + setvars.get(var, "")
+                names.update(_HDR_NAME.findall(blob))
+    return _cache_put(_INSTALLED_CACHE, key, frozenset(names))
+
+
+def header_is_installed(root, header) -> bool:
+    """Does this project ship `header`? False only when it ships a DIFFERENT set -- an unknown
+    answer (a tree with no install rule) is not evidence that a header is private."""
+    installed = installed_headers(root)
+    return (not installed) or Path(header).name in installed
+
+
 def _declared_in_header(root, fn: str):
     """The header that declares `fn`, if any. A function in the PUBLIC header is the library's
     API -- the surface an application reaches, so a bug behind it is a bug anyone can reach."""
@@ -246,9 +323,15 @@ def _declared_in_header(root, fn: str):
             continue
     if not hits:
         return None
-    # The shallowest path wins, then the shortest: a library's own public header sits beside its
-    # sources (`lib/expat.h`), while a platform or bundled copy is nested deeper.
-    hits.sort(key=lambda h: (len(h.relative_to(Path(root)).parts), len(str(h))))
+    # A header the project INSTALLS wins outright: libsndfile declares `sf_close` in both the
+    # shipped `sndfile.h` and the internal `common.h` (same directory, same depth), and the
+    # tie-break below picked `common.h` for being the shorter name -- so a public entry point
+    # was reported through a header no application includes. Then the shallowest path, then the
+    # shortest: a library's own public header sits beside its sources (`lib/expat.h`), while a
+    # platform or bundled copy is nested deeper.
+    _ins = installed_headers(root)
+    hits.sort(key=lambda h: (0 if h.name in _ins else 1,
+                             len(h.relative_to(Path(root)).parts), len(str(h))))
     return hits[0]
 
 
@@ -479,8 +562,16 @@ def rank_harness_fns(root, *, limit: int = 8) -> list:
                 score -= 3                               # plausibly input, but it does not say so
             if _PARSERISH.search(name):
                 score += 4
-            if _declared_in_header(root, name) is not None:
+            _hdr = _declared_in_header(root, name)
+            if _hdr is not None:
                 score += 3
+                # The project SHIPS this header, so an application can reach the function --
+                # the difference between libsndfile's `sf_open` and its internal `psf_fopen`.
+                # A bonus and not an exclusion here: a single function is called through its own
+                # forward declaration, so an internal one still compiles, still runs, and is
+                # worth fuzzing once the public doors are taken.
+                if header_is_installed(root, _hdr) and installed_headers(root):
+                    score += 4
             if score > best.get(name, -(10 ** 6)):
                 best[name] = score
     # Ties broken by NAME, so a plan is reproducible: two runs of the same tree have to build the
@@ -740,6 +831,14 @@ def find_handle_triples(root, *, limit: int = 6) -> list:
             hdr = _declared_in_header(root, name)
             if hdr is None:
                 continue                                 # a private function is not an API
+            # NOR IS AN INTERNAL ONE. Being declared in *some* header was the whole test, and
+            # libsndfile's `src/common.h` -- the struct definitions the library keeps to itself
+            # -- passed it, so the strongest triple in the tree was `psf_allocate` ->
+            # `psf_fopen`: a door no application has, on a handle the harness cannot honestly
+            # build. Excluded rather than penalised, because a penalty still wins when the
+            # internal API is the only candidate, and a triple through it cannot be a finding.
+            if not header_is_installed(root, hdr):
+                continue
             score = 4 + (3 if _PARSERISH.search(name) else 0)
             cands.append((score, name, params, at + 1, htype, hdr))
     cands.sort(key=lambda c: (-c[0], c[1]))
@@ -1276,6 +1375,85 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         }
     }
     unlink(path);
+    return 0;
+}
+""",
+    },
+    # libsndfile: every decoder sits behind an open, and `sf_open` wants a PATH -- so the only
+    # door a synthesized harness could reach was a function taking the bytes directly, of which
+    # libsndfile has none. `sf_open_virtual` is the library's own documented answer: the caller
+    # supplies the four I/O callbacks, which is how the bytes get in without a file at all.
+    "sndfile": {
+        "symbols": ("sf_open_virtual", "sf_readf_short", "sf_close"),
+        "source": r"""
+#include <stdint.h>
+#include <stddef.h>
+#include <stdlib.h>
+#include <string.h>
+#include "sndfile.h"
+
+typedef struct { const uint8_t *data; sf_count_t size, pos; } lykos_vio;
+
+static sf_count_t vio_len(void *u) { return ((lykos_vio *)u)->size; }
+static sf_count_t vio_tell(void *u) { return ((lykos_vio *)u)->pos; }
+
+static sf_count_t vio_seek(sf_count_t off, int whence, void *u) {
+    lykos_vio *d = (lykos_vio *)u;
+    sf_count_t at = d->pos;
+    if (whence == SEEK_SET) at = off;
+    else if (whence == SEEK_CUR) at = d->pos + off;
+    else if (whence == SEEK_END) at = d->size + off;
+    /* CLAMPED. The callbacks are ours, so an out-of-range seek that we honoured would be our
+       out-of-bounds read reported against libsndfile. A real file refuses it the same way. */
+    if (at < 0) at = 0;
+    if (at > d->size) at = d->size;
+    d->pos = at;
+    return at;
+}
+
+static sf_count_t vio_read(void *ptr, sf_count_t count, void *u) {
+    lykos_vio *d = (lykos_vio *)u;
+    sf_count_t left = d->size - d->pos;
+    if (count > left) count = left;                 /* a short read at EOF, like read(2) */
+    if (count <= 0) return 0;
+    memcpy(ptr, d->data + d->pos, (size_t)count);
+    d->pos += count;
+    return count;
+}
+
+static sf_count_t vio_write(const void *ptr, sf_count_t count, void *u) {
+    (void)ptr; (void)u;                             /* SFM_READ never writes */
+    return count;
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+    SF_VIRTUAL_IO vio;
+    lykos_vio d;
+    SF_INFO info;
+    SNDFILE *snd;
+
+    vio.get_filelen = vio_len;
+    vio.seek = vio_seek;
+    vio.read = vio_read;
+    vio.write = vio_write;
+    vio.tell = vio_tell;
+    d.data = data; d.size = (sf_count_t)size; d.pos = 0;
+    memset(&info, 0, sizeof info);
+
+    snd = sf_open_virtual(&vio, SFM_READ, &info, &d);
+    if (!snd) return 0;
+    /* sf_readf_short documents the buffer as frames * channels shorts, and `channels` is
+       libsndfile's own answer about this file -- so an overrun of it is libsndfile's defect.
+       The frame count only bounds the allocation; the loop decodes the whole file. */
+    if (info.channels > 0 && info.channels <= 64) {
+        const sf_count_t frames = 2048;
+        short *buf = (short *)malloc((size_t)frames * (size_t)info.channels * sizeof *buf);
+        if (buf) {
+            while (sf_readf_short(snd, buf, frames) > 0) { }
+            free(buf);
+        }
+    }
+    sf_close(snd);
     return 0;
 }
 """,

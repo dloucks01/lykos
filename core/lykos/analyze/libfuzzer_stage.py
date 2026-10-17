@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import re
 import tarfile
 import time
 from pathlib import Path
@@ -255,6 +256,33 @@ def _file_crash(ctx, target, fd, cr, *, harness_sha, harness_desc, entry, seen) 
         return False
 
 
+#: `clang` prints the diagnostics first and `N errors generated.` last, so a tail of the log is
+#: the summary line and whatever scrolled past it -- the message that says WHAT went wrong is at
+#: the top. libsndfile's failure read "...rated." in the row and the real cause ("use of
+#: undeclared identifier 'psf_allocate'") was only in the full log nobody prints.
+_FIRST_ERROR = re.compile(r"^.*?\b(?:error|fatal error):\s*(.{0,200})", re.M)
+_UNDECLARED = re.compile(r"(?:use of undeclared identifier|implicit declaration of function|"
+                         r"unknown type name)\s*'([^']+)'")
+
+
+def _build_why(log: str) -> str:
+    """One line saying why a harness did not build, naming the cause rather than the tail.
+
+    A door whose symbol the harness cannot even DECLARE is a planning mistake, not a toolchain
+    one -- the entry point was taken from a header the harness does not include, or from one the
+    project keeps to itself -- so the note says so instead of leaving an operator to guess from
+    `2 errors generated.`
+    """
+    log = log or ""
+    first = _FIRST_ERROR.search(log)
+    why = (first.group(1).strip() if first else log[-240:].strip()) or "no diagnostic"
+    und = _UNDECLARED.search(log)
+    if und:
+        why = (f"the chosen entry point is not declared where the harness can see it: "
+               f"'{und.group(1)}' -- {why}")
+    return "libFuzzer build failed: " + why[:240]
+
+
 def _fuzz_one(ctx, target, src, spec, *, seconds, cache, corpus_root, max_len, fd, seen) -> dict:
     """Build one harness and fuzz with it. Returns a row describing what it did."""
     from . import libfuzzer as LF
@@ -263,7 +291,7 @@ def _fuzz_one(ctx, target, src, spec, *, seconds, cache, corpus_root, max_len, f
     out = ctx.scratch() / f"lf-{spec['id']}.bin"
     build = LF.build_libfuzzer(src, out, spec=spec, cache=cache)
     if not build["ok"]:
-        row["why"] = ("libFuzzer build failed: " + (build["log"] or "")[-240:])
+        row["why"] = _build_why(build["log"])
         return row
     row["built"], row["harness"] = True, build["harness"]
     # SEED IT with the format this target reads. `run_libfuzzer` has always taken a corpus and
@@ -377,9 +405,15 @@ def libfuzzer_stage(ctx) -> dict:
     # building counts against it. A harness that cannot be given `MIN_FUZZ_SECONDS` is left
     # unrun and SAID SO, rather than being run for two seconds and reported as a campaign.
     t0 = time.monotonic()
-    share = seconds if len(window) == 1 else max(MIN_FUZZ_SECONDS, seconds / len(window))
-    for spec in window:
+    for i, spec in enumerate(window):
         left = seconds - (time.monotonic() - t0)
+        # DIVIDED AMONG WHAT IS LEFT TO DO, not among what the window started with. A fixed
+        # `seconds / len(window)` share meant the time a FAILED door spent compiling was lost
+        # to nobody's benefit: libsndfile's first door died in a compile error and the five
+        # behind it were each still held to a sixth of the slice, so the stage finished early
+        # with time unspent. Each door now gets an equal share of the time that remains.
+        share = seconds if len(window) == 1 else max(MIN_FUZZ_SECONDS,
+                                                    left / (len(window) - i))
         if len(window) > 1 and left < MIN_FUZZ_SECONDS:
             rows.append({"id": spec["id"], "entry": spec.get("entry"), "kind": spec["kind"],
                          "built": False, "execs": 0, "crashes": 0, "seconds": 0,
