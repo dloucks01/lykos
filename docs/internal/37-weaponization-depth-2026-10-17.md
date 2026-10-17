@@ -280,3 +280,43 @@ The mechanism axis, before this round and after:
 | conformance cases | 71 | **92** |
 | (mechanism, case) pairs | 145 | **168** |
 | rows demanding L3 | 8 | **15** |
+
+## 8. The managed runtimes were identify-only, and the deliverable was why
+
+Corrected, the substrate grid said something stark: every L3 is on `native`, and `jvm`,
+`cpython`, `clr`, `wasm`, `fw` and `wine` cap at **L0**. It also said it for the wrong reason --
+only the front-end cases carry `want_file_type`, so every managed DEFECT case fell through
+`substrate_of` to "native" and was counted against the host CPU. The jvm, pyc, .NET and WASM
+out-of-bounds cases all read `substrate=native`, which overstated native coverage and left the
+managed columns holding nothing but the front-end row.
+
+With that fixed, the obvious question was whether the ladder stops there or the CASES do, and
+nobody had asked: all four managed defect cases demand L0. Two measurements in, the answer is
+the cases.
+
+| case | ceiling | what carried it |
+|---|---|---|
+| `jvm_oob_index` | **L1** | `directed_fuzz/CWE-129`, 247s |
+| `pyc_oob_index` | **L1** | `fuzz/CWE-129` + `root_cause/CWE-129`, 218s |
+
+But demanding that rung would have been unsafe, because the DELIVERABLE was broken in two places
+and nothing was asking it to work:
+
+* **Three of the four runtimes had no reproducer at all.** `poc/stage` mapped `jar` and `class`,
+  so a `.pyc`, a .NET assembly and a WASM module fell through to the native branch and the
+  bundle's runner said `./target.bin < ./input.bin` -- a file the shell cannot execute. Each now
+  gets its real invocation: CPython under the flags the sandbox measured it with; a .NET assembly
+  copied to `app.dll` beside a generated `app.runtimeconfig.json`, because the muxer dispatches
+  on the extension and a framework-dependent assembly will not start without that file; and a
+  WASM module instantiated by the driver, which travels inside the bundle.
+* **The gate judged every bundle as a native crash** (`rc >= 128`). An uncaught JVM or CPython
+  exception exits 1, a .NET abort 134 or 1, and a trapped WASM module leaves node exiting 0 with
+  the verdict in a file -- so a good managed reproducer would have been called broken. The bundle
+  records its own runtime and success criterion in `meta.json` and the gate reads that.
+
+Both were proved by execution rather than asserted: a real `.pyc` bundle, unpacked into a fresh
+directory and run through its own `runner.sh`, exits 1 with `IndexError: list index out of
+range`; a WASM bundle leaves `{"status":"trap","message":"memory access out of bounds"}` in
+`report.json`. The first WASM attempt came back `notdrivable` -- the driver correctly refusing a
+throwaway module that traps on an empty input too, which is its calling convention and not a
+defect.
