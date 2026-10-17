@@ -23,7 +23,13 @@ _ALIGN = 0x10
 _MINSIZE = 0x20
 SIZE_SZ = 8
 TCACHE_MAX_BINS = 64
-TCACHE_COUNT = 7                       # chunks per size-class bin
+#: The DEFAULT chunks-per-bin a tcache holds, for the simulator and for callers that have no
+#: compiler to measure with. It is not a constant of nature and the textbook 7 is already wrong
+#: on current glibc: measured on this host, chunk 0x90 spills out of the tcache on the SEVENTEENTH
+#: free, so the capacity is 16. Any recipe that fills exactly 7 and expects the next free to reach
+#: a bin silently gets nothing -- which is why the live routes fill until they OBSERVE a spill
+#: rather than counting to a number. Use `tcache_capacity()` when a count has to be right.
+TCACHE_COUNT = 7                       # chunks per size-class bin (glibc's historical default)
 MAX_FAST = 0x80                        # default global_max_fast (chunk size); <= -> fastbin
 MIN_LARGE = 0x400                      # chunk size at/above this is a large bin (else small)
 
@@ -524,6 +530,184 @@ def house_of_apple2_targets(libc_data: bytes) -> dict:
 _LB_NEXTSIZE_MSG = b"malloc(): largebin double linked list corrupted (nextsize)\x00"
 
 
+def guard_sites(libc_data: bytes, message: bytes):
+    """How many places in this libc jump to the `malloc_printerr` call that prints `message`.
+
+    This is how every allocator-hardening question here gets answered: a check is PRESENT OR
+    ABSENT in the code, and counting the jumps that reach its error string settles it without a
+    version table and without depending on the compiler's register allocation. One site means one
+    of a pair of similar code paths is checked; two means both.
+
+    Returns None when the string is absent or its reference cannot be found."""
+    from . import rop
+    off = libc_data.find(message)
+    if off < 0:
+        return None
+    segs = rop._loads(libc_data)
+    str_va = rop._va_of(segs, off)
+    if str_va is None:
+        return None
+    lea_va = None
+    for seg_off, sz, va, flags in segs:
+        if not (flags & 1):                            # executable segments only
+            continue
+        i, end = seg_off, seg_off + sz
+        while True:
+            i = libc_data.find(b"\x48\x8d\x3d", i, end)
+            if i < 0:
+                break
+            disp = _struct.unpack_from("<i", libc_data, i + 3)[0]
+            if va + (i - seg_off) + 7 + disp == str_va:
+                lea_va = va + (i - seg_off)
+                break
+            i += 1
+        if lea_va is not None:
+            break
+    if lea_va is None:
+        return None
+    sites = 0
+    for seg_off, sz, va, flags in segs:
+        if not (flags & 1):
+            continue
+        for i in range(seg_off, seg_off + sz - 6):
+            b = libc_data[i]
+            if b == 0x0F and 0x80 <= libc_data[i + 1] <= 0x8F:          # jcc rel32
+                tgt = va + (i - seg_off) + 6 + _struct.unpack_from("<i", libc_data, i + 2)[0]
+            elif 0x70 <= b <= 0x7F:                                      # jcc rel8
+                tgt = va + (i - seg_off) + 2 + _struct.unpack_from("<b", libc_data, i + 1)[0]
+            else:
+                continue
+            if tgt == lea_va:
+                sites += 1
+    return sites
+
+
+# --- tcache stashing: the unlink glibc still does not check -------------------------------------
+#
+# `_int_malloc`'s smallbin path hands out `last(bin)` through a GUARDED unlink and then stashes
+# the bin's remaining same-size chunks into the tcache through an UNGUARDED one:
+#
+#     bck = tc_victim->bk;  bin->bk = bck;  bck->fd = bin;  tcache_put (tc_victim, tc_idx);
+#
+# so corrupting the to-be-stashed chunk's `bk` to TARGET-0x10 writes `&smallbin[i]` to TARGET and
+# then stashes the FAKE chunk at TARGET-0x10, and the next allocation of that size RETURNS TARGET.
+# Nothing here is safe-linked -- smallbin fd/bk never were -- so unlike tcache poisoning it needs
+# no heap leak to mangle a pointer with.
+#
+# Measured on this host, and all three findings change the recipe the write-ups give:
+#
+#   * "malloc(): smallbin double linked list corrupted" has ONE site on 2.35 and on 2.43, so the
+#     stashing unlink is still unchecked.
+#   * the tcache holds 16 chunks per bin on 2.43, not the textbook 7.
+#   * `calloc` NO LONGER BYPASSES THE TCACHE on 2.43 -- it takes the tcache head like malloc. The
+#     write-ups all use calloc to reach the smallbin path while the tcache still has room. What
+#     still bypasses it here is `memalign` with an alignment above 0x10, and a GROWING `realloc`.
+#
+# The last one has a consequence worth stating, because it contradicts the usual description of
+# this technique as "write a libc address AND get an allocation". Reaching the smallbin path with
+# an ordinary malloc requires that tcache bin to be EMPTY, so the stash loop starts at count 0,
+# always has room for the fake chunk, and stashes it on the next iteration -- and `tcache_put`
+# writes the fake's `next` at fake+0x10, which is TARGET, the same slot the unlink just wrote
+# `&bin` into. So with a plain malloc trigger the libc write is TRANSIENT and the deliverable is
+# the arbitrary allocation; keeping the write needs a tcache-bypassing trigger and a tcache filled
+# to capacity-1, so that the loop stops after the first stash.
+_SMALLBIN_MSG = b"malloc(): smallbin double linked list corrupted\x00"
+
+
+def smallbin_stash_guard(libc_data: bytes) -> dict:
+    """Whether this libc's tcache-stashing unlink is still unchecked, and so whether the stashing
+    attack exists at all. One guard site means only the first unlink is checked (the attack is
+    live); two means the stashing loop is checked as well."""
+    from . import rop
+    v = rop.libc_version(libc_data)
+    ver = ".".join(str(x) for x in v) if v else "?"
+    if libc_data.find(_SMALLBIN_MSG) < 0:
+        return {"sites": 0, "unchecked": True, "glibc": ver,
+                "reason": "no smallbin unlink check in this libc at all: both unlinks are free"}
+    sites = guard_sites(libc_data, _SMALLBIN_MSG)
+    if sites is None:
+        return {"sites": None, "unchecked": None, "glibc": ver,
+                "reason": "the error string's reference could not be located, so the guard sites "
+                          "cannot be counted"}
+    unchecked = sites < 2
+    return {"sites": sites, "unchecked": unchecked, "glibc": ver,
+            "reason": (f"glibc {ver}: {sites} guard site -- only the first smallbin unlink is "
+                       "checked, so the stashing loop's `bck->fd = bin` is still a write to a "
+                       "chosen address and the fake chunk still reaches the tcache"
+                       if unchecked else
+                       f"glibc {ver}: {sites} guard sites -- the stashing loop checks "
+                       "`bck->fd == tc_victim` too, so the technique is dead on this libc")}
+
+
+def tcache_bypass_allocators(libc_path=None) -> dict:
+    """Which allocation functions still reach `_int_malloc` without consulting the tcache, MEASURED
+    by running each one after a free and seeing whether it hands back the freed chunk.
+
+    This decides the tcache stashing attack's trigger, and it is exactly the detail the published
+    recipes get wrong on current glibc: they use `calloc`, which on this host takes the tcache head
+    like malloc does. Returns {name: bool} plus "measured": False when there is no compiler."""
+    import os
+    import shutil
+    import subprocess
+    import tempfile
+    key = os.path.realpath(libc_path) if libc_path else "system"
+    cache = getattr(tcache_bypass_allocators, "_cache", None)
+    if cache is None:
+        cache = tcache_bypass_allocators._cache = {}
+    if key in cache:
+        return cache[key]
+    gcc = shutil.which("gcc") or shutil.which("cc")
+    if not gcc:
+        cache[key] = {"measured": False}
+        return cache[key]
+    d = tempfile.mkdtemp(prefix="lykos-bypass-")
+    try:
+        src = os.path.join(d, "a.c")
+        with open(src, "w") as f:
+            f.write('#include <stdio.h>\n#include <stdlib.h>\n#include <malloc.h>\n'
+                    'static void probe(const char *n, void *(*f)(size_t), size_t sz){\n'
+                    '  void *a = malloc(sz), *g = malloc(sz); (void)g; free(a);\n'
+                    '  void *c = f(sz); printf("%s %d\\n", n, c != a); free(c); }\n'
+                    'static void *f_calloc(size_t n){ return calloc(1, n); }\n'
+                    'static void *f_memalign(size_t n){ return memalign(0x40, n); }\n'
+                    'static void *f_realloc(size_t n){ return realloc(malloc(0x18), n); }\n'
+                    'int main(void){ probe("calloc", f_calloc, 0x88);\n'
+                    '  probe("memalign", f_memalign, 0x88);\n'
+                    '  probe("realloc", f_realloc, 0x88); return 0; }\n')
+        exe = os.path.join(d, "a")
+        env = dict(os.environ)
+        if libc_path:
+            env["LD_LIBRARY_PATH"] = (os.path.dirname(os.path.realpath(libc_path)) + ":"
+                                      + env.get("LD_LIBRARY_PATH", ""))
+        if subprocess.run([gcc, "-O0", "-w", src, "-o", exe], capture_output=True).returncode:
+            cache[key] = {"measured": False}
+            return cache[key]
+        out = subprocess.run([exe], capture_output=True, text=True, timeout=20, env=env).stdout
+        res = {"measured": True}
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) == 2:
+                res[parts[0]] = parts[1] == "1"
+        cache[key] = res if len(res) > 1 else {"measured": False}
+        return cache[key]
+    except Exception:                                  # noqa: BLE001 -- a probe, never fatal
+        cache[key] = {"measured": False}
+        return cache[key]
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def smallbin_index(chunk_size: int) -> int:
+    """glibc's `smallbin_index` for 64-bit: the bin a chunk under 0x400 lands in."""
+    return chunk_size >> 4
+
+
+def small_bin_bin_head(unsorted_off: int, chunk_size: int) -> int:
+    """Offset from the libc base to `bin_at(av, smallbin_index(chunk_size))` -- what the fd/bk of
+    a chunk in that smallbin disclose, so the stashing attack gets its libc leak for free."""
+    return unsorted_off + (smallbin_index(chunk_size) - 1) * 0x10
+
+
 def largebin_index(chunk_size: int) -> int:
     """glibc's `largebin_index_64`. Two chunks must land in the SAME bin for the attack to have a
     resident to corrupt, and the bin's head address is `unsorted_bin_offset + (index-1)*0x10`."""
@@ -564,47 +748,11 @@ def large_bin_guard(libc_data: bytes) -> dict:
         return {"sites": 0, "arbitrary": True, "glibc": ver,
                 "reason": "no largebin nextsize check in this libc at all (pre-2.30): the "
                           "insertion writes unchecked"}
-    segs = rop._loads(libc_data)
-    str_va = rop._va_of(segs, off)
-    if str_va is None:
+    sites = guard_sites(libc_data, _LB_NEXTSIZE_MSG)
+    if sites is None:
         return {"sites": None, "arbitrary": None, "glibc": ver,
-                "reason": "the error string is not inside a PT_LOAD segment, so its references "
+                "reason": "the error string's reference could not be located, so the guard sites "
                           "cannot be counted"}
-    lea_va = None
-    for seg_off, sz, va, flags in segs:
-        if not (flags & 1):                            # executable segments only
-            continue
-        i = seg_off
-        end = seg_off + sz
-        while True:
-            i = libc_data.find(b"\x48\x8d\x3d", i, end)
-            if i < 0:
-                break
-            disp = _struct.unpack_from("<i", libc_data, i + 3)[0]
-            if va + (i - seg_off) + 7 + disp == str_va:
-                lea_va = va + (i - seg_off)
-                break
-            i += 1
-        if lea_va is not None:
-            break
-    if lea_va is None:
-        return {"sites": None, "arbitrary": None, "glibc": ver,
-                "reason": "could not find the instruction that loads the error string, so the "
-                          "guard sites cannot be counted"}
-    sites = 0
-    for seg_off, sz, va, flags in segs:
-        if not (flags & 1):
-            continue
-        for i in range(seg_off, seg_off + sz - 6):
-            b = libc_data[i]
-            if b == 0x0F and 0x80 <= libc_data[i + 1] <= 0x8F:          # jcc rel32
-                tgt = va + (i - seg_off) + 6 + _struct.unpack_from("<i", libc_data, i + 2)[0]
-            elif 0x70 <= b <= 0x7F:                                      # jcc rel8
-                tgt = va + (i - seg_off) + 2 + _struct.unpack_from("<b", libc_data, i + 1)[0]
-            else:
-                continue
-            if tgt == lea_va:
-                sites += 1
     arbitrary = sites < 2
     return {"sites": sites, "arbitrary": arbitrary, "glibc": ver,
             "reason": (f"glibc {ver}: {sites} guard site(s) -- the short insertion branch writes "
@@ -615,6 +763,70 @@ def large_bin_guard(libc_data: bytes) -> dict:
                        "then overwrites, so the write only lands where TARGET already holds the "
                        "resident chunk's address. The technique is a pointer swap here, not an "
                        "arbitrary write")}
+
+
+def tcache_capacity(libc_path=None, chunk_size: int = 0x90):
+    """How many chunks of `chunk_size` this libc's tcache actually holds, MEASURED: compile a
+    probe that frees same-size chunks one at a time and watch for the free whose chunk links into
+    a main_arena bin instead (its `fd` becomes a libc pointer rather than a safe-linked word).
+    Cached per (libc, size). Returns None when there is no compiler or the probe fails, and the
+    caller should then fill-until-spill rather than trust `TCACHE_COUNT`.
+
+    Worth measuring because the number moved: glibc's historical default is 7 and this host's
+    2.43 holds 16, so a recipe that frees seven chunks and expects the eighth to reach the
+    unsorted bin quietly does nothing at all."""
+    import os
+    import shutil
+    import subprocess
+    import tempfile
+    key = (os.path.realpath(libc_path) if libc_path else "system", int(chunk_size))
+    cache = getattr(tcache_capacity, "_cache", None)
+    if cache is None:
+        cache = tcache_capacity._cache = {}
+    if key in cache:
+        return cache[key]
+    gcc = shutil.which("gcc") or shutil.which("cc")
+    if not gcc:
+        cache[key] = None
+        return None
+    req = max(0x18, int(chunk_size) - 8)               # request whose chunk is chunk_size
+    d = tempfile.mkdtemp(prefix="lykos-tcache-")
+    try:
+        src = os.path.join(d, "a.c")
+        with open(src, "w") as f:
+            # Spot the spill by the KEY field, not by guessing what a pointer looks like. Every
+            # tcache entry carries the same `tcache_key`, and that key is a full-width random
+            # word -- it passes any "is this a libc pointer" threshold test, which is exactly how
+            # a naive check mistakes a tcache entry for a binned chunk. A chunk that spilled into
+            # a bin has a bin pointer there instead, so the first free whose second word stops
+            # matching the first free's is the spill.
+            f.write('#include <stdlib.h>\n#include <stdio.h>\n#include <stdint.h>\n'
+                    '#define M 256\n'
+                    'int main(void){ void *v[M], *g[M]; uintptr_t key = 0;\n'
+                    '  for (int i=0;i<M;i++){ v[i]=malloc(%d); g[i]=malloc(%d); }\n'
+                    '  for (int i=0;i<M;i++){ free(v[i]);\n'
+                    '    uintptr_t k = ((uintptr_t*)v[i])[1];\n'
+                    '    if (i == 0){ key = k; continue; }\n'
+                    '    if (k != key){ printf("%%d\\n", i); return 0; } }\n'
+                    '  puts("-1"); return 0; }\n' % (req, req))
+        exe = os.path.join(d, "a")
+        env = dict(os.environ)
+        cmd = [gcc, "-O0", "-w", src, "-o", exe]
+        if libc_path:                                  # run the probe against THAT libc
+            ldir = os.path.dirname(os.path.realpath(libc_path))
+            env["LD_LIBRARY_PATH"] = ldir + ":" + env.get("LD_LIBRARY_PATH", "")
+        if subprocess.run(cmd, capture_output=True).returncode:
+            cache[key] = None
+            return None
+        out = subprocess.run([exe], capture_output=True, text=True, timeout=20, env=env).stdout
+        n = int(out.strip() or -1)
+        cache[key] = n if n > 0 else None
+        return cache[key]
+    except Exception:                                  # noqa: BLE001 -- a probe, never fatal
+        cache[key] = None
+        return None
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
 
 
 def unsorted_bin_offset(libc_path=None):

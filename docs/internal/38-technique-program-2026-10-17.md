@@ -20,9 +20,10 @@ pointer, vtable, indexed-write GOT), and — new — the WASM indirect-call redi
 `setcontext` register control, and House of Cat (`_IO_list_all` → a FILE that is entirely ours).
 
 **Knowledge-base only:** fastbin_dup, House of Spirit, House of Force, unlink, unsorted-bin
-attack. The large-bin attack is now knowledge-base *with a measured verdict* (below).
+attack. The large-bin attack and tcache stashing are now knowledge-base *with measured verdicts*
+and emitted chains whose every constant was measured on the libc in hand (below).
 
-**Absent:** `__exit_funcs`/`atexit` and TLS `dtor_list`; House of Apple 1/3; tcache stashing and
+**Absent:** `__exit_funcs`/`atexit` and TLS `dtor_list`; House of Apple 1/3;
 `tcache_perthread_struct`; ret2vdso; JOP/COP; canary byte-brute against a forking server;
 `_rtld_global` lock gadgets.
 
@@ -104,8 +105,50 @@ glibc actually installed here, not textbook order.
    an arbitrary write, and `_IO_list_all` — which holds a libc pointer — is out of reach by that
    route. `aaheg`'s entry now says exactly that, differently per libc, and says "UNKNOWN" rather
    than guessing when it was handed no libc bytes.
-4. **tcache stashing / `tcache_perthread_struct`.** Arbitrary allocation by corrupting the
-   per-thread cache's own bookkeeping; works where a single free is all the program offers.
+4. ~~**tcache stashing**~~ — **DONE as a measured chain, and three things the recipes say are
+   wrong on current glibc.**
+
+   The primitive is real and still unguarded here. `_int_malloc`'s smallbin path hands out
+   `last(bin)` through a *checked* unlink and then stashes the bin's remaining same-size chunks
+   into the tcache through an unchecked one:
+
+   ```
+   bck = tc_victim->bk;  bin->bk = bck;  bck->fd = bin;  tcache_put (tc_victim, tc_idx);
+   ```
+
+   `heap.smallbin_stash_guard` counts the jumps reaching `malloc(): smallbin double linked list
+   corrupted` — **one site on 2.35 and on 2.43**, so only the first unlink is checked. Corrupt the
+   to-be-stashed chunk's `bk` to `TARGET-0x10` and the next allocation of that size **returns
+   TARGET**. Nothing in a smallbin is safe-linked, so unlike tcache poisoning this needs no heap
+   leak to mangle a pointer with. Proved live: `*TARGET` reads back `"STASHED!"`.
+
+   What the write-ups get wrong, all three measured here:
+
+   * **The tcache holds 16 chunks per bin, not 7.** `heap.tcache_capacity()` measures it with a
+     probe that calibrates on the first freed chunk's `tcache_key` rather than guessing what a
+     pointer looks like — necessary, because `tcache_key` is a full-width random word and passes
+     any `> 0x7f0000000000` test, which is exactly how a tcache entry gets mistaken for a chunk
+     sitting in a bin. A recipe that frees seven and expects the eighth to reach a bin does
+     nothing at all.
+   * **`calloc` no longer bypasses the tcache.** Every published version of this attack triggers
+     the smallbin path with `calloc` while the tcache still has room. On 2.43 `calloc` takes the
+     tcache head like `malloc`. `heap.tcache_bypass_allocators()` measures who still does bypass
+     it: **`memalign` with an alignment above 0x10, and a growing `realloc`**.
+   * **"Write a libc address AND get an allocation" is not both at once.** Reaching the smallbin
+     path with a plain `malloc` requires that tcache bin to be *empty*, so the stash loop starts
+     at count 0, always has room for the fake chunk, and stashes it on the next iteration — and
+     `tcache_put` writes the fake's `next` at `fake+0x10`, which is TARGET, over the `&bin` the
+     unlink just put there. With a plain trigger the write is **transient** and the deliverable is
+     the arbitrary allocation. Keeping the write needs a tcache-bypassing trigger plus a tcache
+     filled to capacity−1, so the loop stops after the first stash.
+
+   One more trap, stated in the emitted chain: after stashing the fake the loop reads `fake->bk`
+   as the next `last(bin)`, and a NULL there **hangs** rather than crashes — glibc's
+   `if (tc_victim != 0)` skips the body without advancing the loop. So `*(TARGET+0x8)` must be set
+   to the bin head, which terminates it cleanly.
+
+   `tcache_perthread_struct` stays absent: it is an amplifier on top of tcache poisoning (which is
+   already driven), not a way in, so it waits for a target that needs it.
 5. **fastbin_dup.** The pre-tcache double-free, still reachable by filling the tcache bin first;
    the fallback when the chunk size is above the tcache ceiling.
 6. **House of Spirit.** Free a fake chunk inside a buffer we control, and malloc hands it back —

