@@ -113,15 +113,22 @@ def _disclosed_bases(ctx, target, exe, data, mode, argv, timeout):
     except Exception:                                    # noqa: BLE001
         return None
     libc_data = _libc_bytes_for(ctx, target) or b""
-    out = b""
-    for _ in range(_LEAK_RUNS):                          # ASLR is on: two runs, different bases
+    # EACH RUN CLASSIFIED ON ITS OWN, never concatenated. ASLR is on, so two runs disclose
+    # pointers from two different bases: joining them hands the classifier slots that corroborate
+    # nothing, and the corroboration rule then rejects a leak that each run proves by itself
+    # **[measured on the format-string fixture: 24 pointers, no base]**. The second run exists
+    # because a run may disclose nothing, not to pool evidence.
+    last = None
+    for _ in range(_LEAK_RUNS):
         r = sandbox.run(exe, argv=list(argv or []), stdin=(data if mode == "stdin" else b""),
                         timeout=min(float(timeout), 20.0), aslr=True)
-        out += (r.stdout or b"") + (r.stderr or b"")
+        out = (r.stdout or b"") + (r.stderr or b"")
         if not out:
-            return None
-    d = _leak.disclosed_bases(out, target_bytes, libc_data)
-    return d if d.get("proved") else d or None
+            continue
+        last = _leak.disclosed_bases(out, target_bytes, libc_data)
+        if last.get("proved"):
+            return last
+    return last
 
 
 def _file_uninit_l2(ctx, target, cand, disc, mode, sha) -> bool:

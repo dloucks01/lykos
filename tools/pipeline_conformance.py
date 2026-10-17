@@ -1220,8 +1220,16 @@ int main(void){ setvbuf(stdout,0,2,0);
                    if(i>=0&&i<n) free(p[i]); }      /* not nulled: freeing twice is a double free */
     else return 0; } }""",
          ["-fPIE", "-pie", "-O0", "-w"],
-         want_level=0, want_cwe=("CWE-415", "CWE-416"), budget=300.0,
-         note="BUG CLASS double free (CWE-415): the slot is never nulled, so two frees of one index"),
+         want_level=1, want_cwe=("CWE-415", "CWE-416"), budget=300.0,
+         note="BUG CLASS double free (CWE-415): the slot is never nulled, so two frees of one "
+              "index. L1 is this case's CEILING and the reason is the fixture's own interface, "
+              "not a gap: `1.alloc` takes no size and no data and there is no view and no edit, "
+              "so the program offers no way to WRITE a forged chunk and no way to READ one back. "
+              "Every route past a double free needs one or both -- tcache poisoning needs the "
+              "write, a libc leak needs the read -- so glibc's abort is the whole observable "
+              "effect. Measured with --ceiling; the demand is L1 so that losing the abort is a "
+              "regression, and the notebooks that DO have those options (heap_fsop_*) carry the "
+              "L3 claim for this class."),
 
     Case("int_overflow_alloc",
          r"""#include <stdio.h>
@@ -1313,8 +1321,19 @@ int main(void){ setvbuf(stdout,0,2,0);
   printf(f);                                 /* user-controlled format: %p/%s READ, not a write */
   printf("\n"); return 0; }""",
          ["-no-pie", "-fno-stack-protector", "-O0", "-w"],
-         want_level=0, want_cwe=("CWE-134", "CWE-200"), budget=300.0,
-         note="BUG CLASS format-string READ/disclosure (CWE-134/200) -- the gate only had the %n WRITE"),
+         want_level=2, want_cwe=("CWE-134", "CWE-200"), budget=300.0,
+         mechanism="format-string",
+         note="BUG CLASS format-string READ/disclosure (CWE-134/200) -- the gate only had the %n "
+              "WRITE. Measured with --ceiling, the class stopped at L1: the probe confirmed the "
+              "bug and filed the leaked words, and nothing asked what they were WORTH, so a %p "
+              "dump that defeats ASLR ranked with one that prints padding. Two things were wrong. "
+              "`disclosed_bases` harvested only the RAW-WORD rendering -- it claimed hex text too "
+              "and parsed none of it -- so a printed pointer was invisible to the one function "
+              "that can resolve it; and the recon payload asked for eight %p, which confirms the "
+              "bug and resolves nothing, because the pointers that anchor a base sit deeper than "
+              "the eighth varargs slot (8 and 12 directives proved a base 0/4 runs, 24 proved it "
+              "4/4). There is no L3 here and that is a property of the target, not a gap: one "
+              "printf, one shot, no second call site to redirect."),
 
     Case("uninit_stack_read",
          r"""#include <stdio.h>
@@ -1499,7 +1518,8 @@ int main(void){ setvbuf(stdout,0,2,0);
     # ---- C++ . Every case so far is C: mangled symbols, vtables and operator new/delete are a
     # different recovery problem, and the platform has a C++ UAF -> vtable-hijack path.
     Case("cpp_uaf_vtable", "",
-         [], want_level=0, want_cwe=("CWE-416", "CWE-843", "CWE-824"), budget=420.0,
+         [], want_level=2, want_cwe=("CWE-416", "CWE-843", "CWE-824"), budget=420.0,
+         mechanism="type-confusion",
          build=(["sh", "-c",
                  "cat > t.cpp <<'EOF'\n"
                  "#include <cstdio>\n#include <cstring>\n#include <cstdlib>\n#include <unistd.h>\n"
@@ -1515,7 +1535,42 @@ int main(void){ setvbuf(stdout,0,2,0);
                  "    else return 0; } }\nEOF\n"
                  "g++ -fno-stack-protector -O0 -w t.cpp -o cpp_uaf"], "cpp_uaf"),
          note="C++ use-after-free into a virtual call (CWE-416/843): delete leaves the pointer live, "
-              "then the vtable pointer is overwritten and the next virtual call dispatches through it"),
+              "then the vtable pointer is overwritten and the next virtual call dispatches through "
+              "it. L2 is this case's CEILING, measured with --ceiling, and it is the fixture's "
+              "doing: g++ builds PIE, and the program discloses no pointer and contains no win "
+              "function, so there is no address to aim the forged vtable at -- `_cpp_vtable_uaf` "
+              "builds its fake table inline at the reclaimed chunk, which needs the chunk address, "
+              "and that is only deterministic with ASLR off. The confirmed lifetime primitive "
+              "(offset-in-chunk + chunk size) is the honest rung here."),
+
+    #: The same defect with the two things the PIE case cannot have: a reachable win and a fixed
+    #: image. `_cpp_vtable_uaf` has been able to finish this chain all along and NOTHING gated it:
+    #: the only C++ case in the table is PIE and win-less, so the matrix read type-confusion at the
+    #: level that fixture can reach and the capability went untested.
+    Case("cpp_uaf_vtable_win", "",
+         [], want_level=3, want_cwe=(), budget=420.0, mechanism="type-confusion",
+         build=(["sh", "-c",
+                 "cat > w.cpp <<'EOF'\n"
+                 "#include <cstdio>\n#include <cstring>\n#include <cstdlib>\n#include <unistd.h>\n"
+                 "struct Base { virtual void speak(){ puts(\"base\"); } virtual ~Base(){} char buf[32]; };\n"
+                 "struct Derived : Base { void speak() override { puts(\"derived\"); } };\n"
+                 "extern \"C\" void win(){ execl(\"/bin/sh\",\"sh\",(char*)0); }\n"
+                 "int main(){ setvbuf(stdout,0,2,0);\n"
+                 "  Base *o = new Derived();\n"
+                 "  for(;;){ printf(\"1.use 2.del 3.write 4.exit\\n> \");\n"
+                 "    int c; if(scanf(\"%d\",&c)!=1) return 0; getchar();\n"
+                 "    if(c==1) o->speak();                 /* virtual call, usable after delete */\n"
+                 "    else if(c==2) delete o;              /* pointer not nulled: UAF */\n"
+                 "    else if(c==3){ printf(\"data: \"); read(0, o, 48); }  /* overwrite the vtable ptr */\n"
+                 "    else return 0; } }\nEOF\n"
+                 "g++ -no-pie -fno-stack-protector -O0 -w w.cpp -o cpp_uaf_win"], "cpp_uaf_win"),
+         note="C++ use-after-free -> VTABLE HIJACK to a win (CWE-416/843 -> control flow). Same "
+              "defect as cpp_uaf_vtable, which measures L2 because g++ builds PIE and that fixture "
+              "has no win: there is no address to aim a forged vtable at. Non-PIE and with a win "
+              "reachable, the fake table is built INLINE in the reclaimed chunk (slot 0 -> chunk+8, "
+              "every following word -> win), so a `mov rax,[obj]; call [rax+N]` dispatch enters win "
+              "for every small N with no leak and no fixture gadget. The engine could already do "
+              "this and nothing in the table demanded it."),
 
     # ---- PARAMETER-DRIVEN. A tool that refuses to run without its flags is a channel of its own:
     # nothing happens on any input until the required option is supplied.

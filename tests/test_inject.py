@@ -262,7 +262,15 @@ def test_format_string_demonstrates_disclosure_with_proof(store, pool, gcc, tmp_
         pytest.skip("sandbox unavailable")
     f = next((f for f in FindingDAO(store.conn).list_by_target(target.id)
               if f.detector == "inject_synth" and f.cwe == "CWE-134"), None)
-    assert f is not None and "disclosure" in f.title.lower() and "demonstrated" in f.title.lower()
+    # Either headline is right, and WHICH one is the point: a leak that resolves a base says so
+    # ("ASLR defeated ... discloses the image base", matching the out-of-bounds read arm's wording)
+    # and ranks as an L2 primitive; one that prints padding stays an information disclosure.
+    assert f is not None and "demonstrated" in f.title.lower()
+    low = f.title.lower()
+    assert "disclosure" in low or "discloses" in low, f.title
+    from lykos.db.dao import PocDAO
+    levels = {pc.level for pc in PocDAO(store.conn).list_by_target(target.id) if pc.verified}
+    assert ("L2" in levels) == ("l2 primitive" in low), (f.title, levels)
     effs = json.loads(next(e["detail"] for e in f.evidence if e["channel"] == "effects"))
     leak = next(e for e in effs if e["kind"] == "info-disclosure")
     assert leak["status"] == "demonstrated" and leak["proof"]["sha"]        # captured evidence

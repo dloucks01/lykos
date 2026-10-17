@@ -189,7 +189,32 @@ def _leaked_words(out: bytes, marker: str):
     return words, ascii_hits
 
 
-def _disclosure_effect(ctx, spec, hit, input_sha, bundle_sha):
+def _fmt_bases(ctx, target, hit):
+    """What a format string's leak PROVES, not just that it leaked. `%p` output is pointer-shaped
+    text, and a disclosure of stack padding and a disclosure of the image base are both "memory
+    leak" until someone resolves them -- the second one hands over the missing half of a chain.
+    `leak.disclosed_bases` answers it against the target's OWN symbol layout (a pointer's low 12
+    bits are page-invariant), so a base is accepted only where it is anchored, never guessed.
+
+    Classified on the ONE captured run. Pooling runs would be wrong: under ASLR each run's
+    pointers belong to a different base, and slots from two bases corroborate nothing."""
+    from . import leak as _leak
+    out = hit.get("out") or b""
+    if not out:
+        return {}
+    try:
+        target_bytes = ctx.content.path(target.sha256).read_bytes()
+    except Exception:                                    # noqa: BLE001
+        return {}
+    from .exploit_stage import _libc_bytes_for
+    try:
+        return _leak.disclosed_bases(out, target_bytes, _libc_bytes_for(ctx, target) or b"")
+    except Exception:                                    # noqa: BLE001
+        observe.absorbed(_log, "classifying the format-string leak")
+        return {}
+
+
+def _disclosure_effect(ctx, spec, hit, input_sha, bundle_sha, bases=None):
     """The end effect an injection PoC demonstrates, with the captured output as proof. Returns
     (eff_line, headline_title, effects_evidence_entry). For a format string, the proof is the
     leaked memory itself (persisted), including any secret bytes it exposed."""
@@ -202,14 +227,28 @@ def _disclosure_effect(ctx, spec, hit, input_sha, bundle_sha):
                 + " ".join(words[:8])
                 + (f" -- decodes to {', '.join(repr(a) for a in ascii_hits[:3])} "
                    "(leaked stack strings / secrets)" if ascii_hits else ""))
-        effs = [{"kind": "info-disclosure", "title": "Information disclosure (memory leak)",
+        # WHAT the words were. The headline distinction: padding and the image base are both a
+        # "memory leak" until one of them is resolved, and only one of them defeats ASLR.
+        got = ", ".join(f"{n} {v:#x}" for n, v in
+                        (("image base", (bases or {}).get("pie_base")),
+                         ("libc base", (bases or {}).get("libc_base")),
+                         ("stack canary", (bases or {}).get("canary"))) if isinstance(v, int))
+        if got:
+            note += (f" -- and those pointers RESOLVE: {got}, corroborated against the target's "
+                     f"own symbol layout by the {(bases or {}).get('rule') or 'page-offset'} rule. "
+                     "ASLR is defeated from this leak alone (an L2 disclosure primitive).")
+        effs = [{"kind": "info-disclosure",
+                 "title": ("ASLR defeated by a format string" if got
+                           else "Information disclosure (memory leak)"),
                  "status": "demonstrated", "detail": note,
                  "proof": {"type": "artifact", "sha": proof_sha, "input_sha": input_sha,
                            "note": note}},
                 {"kind": "memory-corruption",
                  "title": "Memory corruption (arbitrary write)", "status": "potential",
                  "detail": "the same format string can write with %n (write-what-where)"}]
-        title = "Information disclosure (memory leak) (demonstrated): format string"
+        title = (f"ASLR defeated by a format string (discloses the {got.split(' 0x')[0]}) "
+                 "(demonstrated): L2 primitive" if got
+                 else "Information disclosure (memory leak) (demonstrated): format string")
     elif cwe in ("CWE-78", "CWE-94"):
         effs = [{"kind": "injection", "title": "Command / code injection", "status": "demonstrated",
                  "detail": "an injected command ran (its marker appeared in output)",
@@ -272,19 +311,27 @@ def _finalize(ctx, target, target_bytes, spec, hit):
     if nav:
         detail += (f" -- reached by navigating first with {nav.decode('latin-1')!r} "
                    "(the sink is behind a menu branch / input gate)")
+    # L2 where the leak RESOLVES a base. The injection PoCs are all filed at L1 -- "this defect is
+    # real and here is a reproducer" -- and for a format-string READ that was the ceiling, measured:
+    # the class demonstrated a leak and could not say the leak was worth anything, so a %p dump that
+    # defeats ASLR ranked with one that prints padding. An anchored base is a disclosure PRIMITIVE,
+    # the same rung the out-of-bounds read arm claims for the same evidence.
+    bases = _fmt_bases(ctx, target, hit) if spec.get("cwe") == "CWE-134" else {}
+    level = "L2" if bases.get("proved") else "L1"
     meta = {"target_sha256": target.sha256, "arch": target.arch, "input_mode": mode,
-            "argv": run_argv, "level": "L1", "cwe": spec["cwe"], "injection": spec["title"],
+            "argv": run_argv, "level": level, "cwe": spec["cwe"], "injection": spec["title"],
             "tool_version": TOOL_VERSION}
     if nav:
         meta["navigation"] = nav.decode("latin-1")
     data = bundle.build(target_bytes, delivered, meta, b"", mode, run_argv, "none")
-    bundle_sha = ctx.put_artifact("poc-bundle", data=data, meta={"verified": True, "level": "L1"})
-    poc_id = PocDAO(ctx.conn).insert(target.id, target.case_id, level="L1", verified=True,
+    bundle_sha = ctx.put_artifact("poc-bundle", data=data, meta={"verified": True, "level": level})
+    poc_id = PocDAO(ctx.conn).insert(target.id, target.case_id, level=level, verified=True,
                                      signal_name=None, input_sha=input_sha, bundle_sha=bundle_sha)
     # The end effect this injection DEMONSTRATES, headlined on the finding, with the captured
     # evidence as proof: a format string leaks live memory (stack words, often secrets), a
     # command injection runs an attacker command, a traversal reads an out-of-scope file.
-    eff_line, eff_title, eff_evidence = _disclosure_effect(ctx, spec, hit, input_sha, bundle_sha)
+    eff_line, eff_title, eff_evidence = _disclosure_effect(ctx, spec, hit, input_sha, bundle_sha,
+                                                           bases=bases)
     ev = [{"channel": "injection", "detail": detail},
           {"channel": "poc", "detail": f"verified PoC bundle {bundle_sha[:12]}"}]
     if eff_evidence:
@@ -299,7 +346,9 @@ def _finalize(ctx, target, target_bytes, spec, hit):
     fid = fd.id_for_dedup(target.id, f"{spec['cwe']}:inject:{mode}")
     if fid:
         PocDAO(ctx.conn).set_finding(poc_id, fid)
-    return {"cwe": spec["cwe"], "mode": mode, "bundle": bundle_sha, "input_sha": input_sha}
+    return {"cwe": spec["cwe"], "mode": mode, "bundle": bundle_sha, "input_sha": input_sha,
+            "level": level, "bases": {k: v for k, v in bases.items()
+                                      if k in ("pie_base", "libc_base", "canary", "rule")}}
 
 
 def register() -> None:

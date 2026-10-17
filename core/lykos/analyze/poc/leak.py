@@ -1752,6 +1752,14 @@ def disclosed_bases(output: bytes, target_bytes: bytes, libc_data: bytes = b"", 
     # asserts the bogus variants "fail corroboration", and against the two-slot rule they do;
     # against the single-slot rule they do the opposite, which is what went unnoticed.
     raw = list(_le_pointer_words(output, cap=4096))
+    # ...and the HEX TEXT rendering, which this claimed to harvest and did not. A binary over-read
+    # echoes memory as raw words; a program that PRINTS what it read -- `%p`, a format-string leak,
+    # a debug dump -- emits `0x55...`/`0x7f...` as characters, and not one of those bytes passes the
+    # raw-word test. Measured on the format-string read fixture: 30 `%p` disclosed a PIE code
+    # pointer, two libc pointers and the stack, and this function reported `distinct: 0`. A printed
+    # pointer is a primary rendering and as trustworthy as a raw one (it is an explicit pointer
+    # print, not a coincidence of bytes), so it joins the STRICT pool rather than the fallback one.
+    raw += [int(m.group(1), 16) for m in re.finditer(rb"0[xX]([0-9a-fA-F]{6,16})\b", output)]
     folded = [v for v in _case_fold_pointer_candidates(output) if v not in raw]
     vals = raw + folded
     # STRICT first: two distinct slots corroborating one base. Then the unambiguous-single rule,
