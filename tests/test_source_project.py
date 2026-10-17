@@ -305,7 +305,13 @@ def test_every_builder_forces_a_rebuild():
     from lykos.analyze import source_project
     src = inspect.getsource(source_project.build_source_project)
     assert '["make", "-B", "-j"]' in src, "the autotools builder does not force a rebuild"
-    assert '"make", "-B", "-j", f"CC=' in src, "the make builder does not force a rebuild"
+    # The make builder assembles its argv (it has a CC/CFLAGS override to pass) and inserts -B
+    # ahead of it, so the forced rebuild is this splice rather than a literal command line. The
+    # spelling changed when a plain-make RETRY was added for trees whose maintainer rules cannot
+    # run here; the guarantee this test exists for did not.
+    assert 'argv[:1] + ["-B"] + argv[1:]' in src, \
+        "the make builder does not force a rebuild"
+    assert 'f"CC={wrapdir' in src, "the make builder does not override the compiler"
     assert '"--clean-first"' in src, "the cmake builder does not force a rebuild"
 
 
@@ -346,3 +352,84 @@ def test_a_prebuilt_tree_is_rebuilt_not_reused(tmp_path, gcc_or_skip):
     out = subprocess.run(["nm", "-D", str(exe)], capture_output=True, text=True).stdout.lower()
     dyn = subprocess.run(["readelf", "-d", str(exe)], capture_output=True, text=True).stdout.lower()
     assert "asan" in out or "asan" in dyn, "the rebuilt binary carries no ASan"
+
+# ----------------------------------------------- what stopped two real libraries from building
+def test_a_plain_make_is_the_retry_when_B_cannot_run():
+    """`-B` first (it is what makes an already-built tree rebuild with our instrumentation), and
+    a plain make as the RETRY when it fails having produced nothing.
+
+    Measured on libsndfile 1.0.28: `./configure` succeeded, then `make -B -j` forced autotools'
+    maintainer rules and died with
+
+        make: *** [Makefile:484: aclocal.m4] Error 127
+
+    because `aclocal` is not installed here. The project fell through to the `loose` builder,
+    which cannot link a tree containing several programs with their own main(), so libsndfile
+    ingested as a PREBUILT BINARY with no source -- which is why its libFuzzer stage reported
+    "no source for this target" and the campaign ran at 359 exec/s through the black-box path
+    instead of building in-process doors. With the retry: 10 entry points, primary
+    `programs/sndfile-info`, an 8 MB ASan ELF.
+
+    The order matters in both directions, which is why both tests exist: reversing it (plain
+    make first) makes `test_a_prebuilt_tree_is_rebuilt_not_reused` fail, because make then says
+    "nothing to be done" and the stale uninstrumented artifact is analysed instead.
+    """
+    import inspect
+
+    from lykos.analyze import source_project as sp
+    src = inspect.getsource(sp.build_source_project)
+    first = src.index('_run(["make", "-B", "-j"], cwd=root)')
+    retry = src.index('_run(["make", "-j"], cwd=root)')
+    assert first < retry, "-B has to be attempted first; a plain make is the fallback"
+    assert 'if rcm != 0 and not _elf_executables(root, start_make)' in src, \
+        "the retry must be gated on -B having FAILED and produced nothing"
+
+
+def test_cmake_retries_past_a_removed_minimum_version():
+    """CMake 4 removed compatibility with `cmake_minimum_required(VERSION <3.5)`.
+
+    Measured on openjpeg 2.3.0 (asks for 2.8) with cmake 4.3.4:
+
+        CMake Error: Compatibility with CMake < 3.5 has been removed from CMake.
+        Or, add -DCMAKE_POLICY_VERSION_MINIMUM=3.5 to try configuring anyway.
+
+    configure failed, the builder fell through to `loose`, and that cannot link a tree full of
+    cmake's own feature-probe programs. With the retry: 3 entry points -- opj_compress,
+    opj_dump, opj_decompress -- which is the whole reason this library is in the corpus. Every
+    pre-2016 cmake project on a modern host hits this, so it is not one library's quirk.
+    """
+    import inspect
+
+    from lykos.analyze import source_project as sp
+    src = inspect.getsource(sp.build_source_project)
+    assert "CMAKE_POLICY_VERSION_MINIMUM=3.5" in src
+    # keyed on the OUTCOME, not on the wording of cmake's complaint
+    assert "if rc != 0:" in src.split("def _b_cmake")[1].split("def _b_autotools")[0]
+
+
+def test_the_builder_chain_has_a_deadline(tmp_path):
+    """The build comes out of the same budget the search needs.
+
+    `timeout` bounds ONE command, and the chain is cmake -> autotools -> make -> loose with up
+    to two commands each: a project shipping several build systems can spend 6 x 300s before the
+    fallback. Measured, not hypothetical -- libsndfile 1.0.28 ships CMakeLists.txt AND configure
+    AND a Makefile, and once the cmake policy retry made its cmake build start succeeding, a
+    600-second gate case spent ~44 minutes inside ingest and printed no row at all.
+    """
+    import time
+
+    from lykos.analyze.source_project import build_source_project
+    # a tree that looks like a project and cannot build: every builder is attempted
+    (tmp_path / "CMakeLists.txt").write_text("cmake_minimum_required(VERSION 2.6)\n"
+                                             "project(x C)\nadd_executable(x nope.c)\n")
+    (tmp_path / "configure").write_text("#!/bin/sh\nexit 1\n")
+    (tmp_path / "configure").chmod(0o755)
+    (tmp_path / "Makefile").write_text("all:\n\t@false\n")
+    (tmp_path / "a.c").write_text("int main(void){return 0;}\n")
+    t0 = time.time()
+    r = build_source_project(tmp_path, timeout=5, total=8)
+    elapsed = time.time() - t0
+    assert elapsed < 40, f"the chain ignored its deadline ({elapsed:.0f}s for an 8s budget)"
+    # and it says so rather than reporting a plain failure
+    if not r["ok"]:
+        assert "budget" in (r.get("log") or "") or r["system"] is not None

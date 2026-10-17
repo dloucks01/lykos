@@ -142,7 +142,7 @@ def _elf_libraries(root: Path, since: float):
     return sorted(out, key=lambda p: p.stat().st_size, reverse=True)
 
 
-def build_source_project(root, *, timeout: int = 300) -> dict:
+def build_source_project(root, *, timeout: int = 300, total: int | None = None) -> dict:
     """Build the project rooted at `root` with sanitizers forced in. Returns
     {ok, system, binaries:[Path], primary:Path|None, compiler, log}. `binaries` is largest-first;
     `primary` is the biggest produced executable. `ok` is False (with the build log) when nothing
@@ -164,10 +164,25 @@ def build_source_project(root, *, timeout: int = 300) -> dict:
     env["CXXFLAGS"] = (env.get("CXXFLAGS", "") + " " + flags).strip()
     env["LDFLAGS"] = (env.get("LDFLAGS", "") + " -fsanitize=address,undefined").strip()
 
+    # A DEADLINE FOR THE WHOLE CHAIN, not just per command. `timeout` bounds one command, and the
+    # chain is cmake -> autotools -> make -> loose with up to two commands each: a project that
+    # ships several build systems can therefore spend 6 x 300s before the fallback, and that is
+    # measured, not hypothetical. libsndfile 1.0.28 ships CMakeLists.txt AND configure AND a
+    # Makefile; once the cmake policy retry made its cmake build start succeeding, the gate run
+    # spent ~44 minutes inside ingest and printed no row at all for a 600-second case. The build
+    # is not free time -- it comes out of the same budget the search needs.
+    deadline = time.time() + float(total if total is not None else timeout * 3)
+
+    def _left() -> float:
+        return max(0.0, deadline - time.time())
+
     def _run(argv, cwd=root):
+        slice_s = min(float(timeout), _left())
+        if slice_s <= 1.0:
+            return 1, f"{argv[0]}: skipped, the build budget is spent"
         try:
             r = subprocess.run(argv, cwd=str(cwd), env=env, capture_output=True, text=True,
-                               timeout=timeout)
+                               timeout=slice_s)
             return r.returncode, (r.stdout or "") + (r.stderr or "")
         except (OSError, subprocess.SubprocessError) as e:
             return 1, f"{argv[0]}: {e}"
@@ -205,14 +220,29 @@ def build_source_project(root, *, timeout: int = 300) -> dict:
     def _b_cmake():
         bd = root / "_lykos_build"
         bd.mkdir(exist_ok=True)
-        _, o1 = _run(["cmake", "-S", str(root), "-B", str(bd),
-                      f"-DCMAKE_C_COMPILER={wrapdir/'cc'}", f"-DCMAKE_CXX_COMPILER={wrapdir/'c++'}",
-                      "-DBUILD_SHARED_LIBS=OFF",
-                      "-DCMAKE_BUILD_TYPE=Debug"], cwd=root)
+        conf = ["cmake", "-S", str(root), "-B", str(bd),
+                f"-DCMAKE_C_COMPILER={wrapdir/'cc'}", f"-DCMAKE_CXX_COMPILER={wrapdir/'c++'}",
+                "-DBUILD_SHARED_LIBS=OFF", "-DCMAKE_BUILD_TYPE=Debug"]
+        rc, o1 = _run(conf, cwd=root)
+        if rc != 0:
+            # CMake 4 REMOVED compatibility with `cmake_minimum_required(VERSION <3.5)`, so every
+            # pre-2016 project is refused outright on this host (cmake 4.3.4):
+            #     Compatibility with CMake < 3.5 has been removed from CMake.
+            #     Or, add -DCMAKE_POLICY_VERSION_MINIMUM=3.5 to try configuring anyway.
+            # Measured on openjpeg 2.3.0, whose CMakeLists asks for 2.8: configure failed, the
+            # builder fell through to `loose`, and that cannot link a tree full of cmake's own
+            # feature-probe programs (each with its own main). Retried on the OUTCOME rather
+            # than on the wording, the way the autotools builder retries `--disable-shared`.
+            rc2, o_retry = _run(conf + ["-DCMAKE_POLICY_VERSION_MINIMUM=3.5"], cwd=root)
+            o1 = o1 + "\n-- cmake refused the project's minimum version; retried with " \
+                      "CMAKE_POLICY_VERSION_MINIMUM=3.5 --\n" + o_retry
+            if rc2 != 0:
+                return "cmake", o1
         _, o2 = _run(["cmake", "--build", str(bd), "-j", "--clean-first"], cwd=root)
         return "cmake", o1 + o2
 
     def _b_autotools():
+        start_make = time.time()
         # `--disable-shared` is not a preference here, it is what makes the build RUNNABLE (above).
         # But `configure` is not always autoconf's: zlib's is hand-written and ABORTS on an option
         # it does not know ("unknown option: --disable-shared ... ./configure aborting"), leaving
@@ -233,14 +263,44 @@ def build_source_project(root, *, timeout: int = 300) -> dict:
             if rc2 != 0:
                 _, o3 = _run(["./configure", "--static"], cwd=root)
                 o1 = o1 + "\n-- retried with --static --\n" + o3
-        _, o2 = _run(["make", "-B", "-j"], cwd=root)
+        # `-B` FIRST, then a plain make as the retry -- in that order, because each fixes a
+        # failure the other causes.
+        #
+        #   * `-B` is what makes an ALREADY-BUILT tree get rebuilt with our instrumentation.
+        #     Without it make says "nothing to be done", the stale uninstrumented artifact is
+        #     analysed, and nothing anywhere says so (test_a_prebuilt_tree_is_rebuilt_not_reused).
+        #   * but `-B` also forces autotools' MAINTAINER rules, so a freshly unpacked release
+        #     tarball tries to regenerate aclocal.m4 -> `aclocal` -> not installed here:
+        #         make: *** [Makefile:484: aclocal.m4] Error 127
+        #     and libsndfile 1.0.28 fell through to the `loose` builder, which cannot link a tree
+        #     containing several programs with their own main(). It then ingested as a PREBUILT
+        #     BINARY with no source, so its libFuzzer stage said "no source for this target" and
+        #     the campaign ran at 359 exec/s instead of building in-process doors.
+        #
+        # So: force the rebuild, and if that leaves nothing, build the ordinary way. Measured
+        # after the retry: libsndfile yields 10 entry points, primary `programs/sndfile-info`.
+        rcm, o2 = _run(["make", "-B", "-j"], cwd=root)
+        if rcm != 0 and not _elf_executables(root, start_make) \
+                and not _elf_libraries(root, start_make):
+            _, o2b = _run(["make", "-j"], cwd=root)
+            o2 = o2 + "\n-- `make -B` failed and produced nothing (maintainer rules need tools "
+            o2 = o2 + "this host lacks); retried without -B --\n" + o2b
         return "autotools", o1 + o2
 
     def _b_make():
-        # Pass the wrapped CC/flags as make VARIABLES too (override the Makefile's own).
-        _, o = _run(["make", "-B", "-j", f"CC={wrapdir/'cc'}", f"CXX={wrapdir/'c++'}",
-                     f"CFLAGS={flags}", f"CXXFLAGS={flags}",
-                     "LDFLAGS=-fsanitize=address,undefined"])
+        # Pass the wrapped CC/flags as make VARIABLES too (override the Makefile's own). Same
+        # order as the autotools builder above and for the same measured reasons: `-B` forces
+        # the rebuild that makes our instrumentation real, and a plain make is the retry for a
+        # tree whose maintainer rules cannot run here.
+        start_make = time.time()
+        argv = ["make", "-j", f"CC={wrapdir/'cc'}", f"CXX={wrapdir/'c++'}",
+                f"CFLAGS={flags}", f"CXXFLAGS={flags}",
+                "LDFLAGS=-fsanitize=address,undefined"]
+        rcm, o = _run(argv[:1] + ["-B"] + argv[1:])
+        if rcm != 0 and not _elf_executables(root, start_make) \
+                and not _elf_libraries(root, start_make):
+            _, o2 = _run(argv)
+            o = o + "\n-- `make -B` failed and produced nothing; retried without -B --\n" + o2
         return "make", o
 
     def _b_loose():
@@ -301,6 +361,9 @@ def build_source_project(root, *, timeout: int = 300) -> dict:
     full_log, system = "", None
     try:
         for build in builders:
+            if _left() <= 1.0:
+                full_log += "\n== build budget spent; remaining builders not attempted ==\n"
+                break
             start = time.time()                          # attribute binaries to THIS builder only
             system, log = build()
             full_log += f"\n== {system} ==\n{log}"
