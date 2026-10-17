@@ -35,6 +35,7 @@ _RA_REGS = ("lr", "x30", "r31", "ra")
 # instruction-pointer control to a register that merely happens to hold cyclic bytes.
 # s390's absence here was why it recovered a nonsense offset (2004) and never reached L2.
 _RA_BY_ARCH = {
+    "alpha": ("ra",),                                # $26, named `ra` by qemu's own description
     "aarch64": ("x30",),
     "arm": ("lr", "r14"),
     "ppc": ("lr",),
@@ -135,19 +136,41 @@ def recover_ip_offset(cap: dict, length: int, n: int = 4, endian: str = "little"
     first). Stack-slot bytes are raw memory, already in input order. Returns (offset, source)
     or None."""
     pc = cap.get("pc")
-    if pc is not None:
-        off = cyclic_find(_reg_window(pc, word, endian, n), length, n)
-        if off != -1:
-            return off, "pc"
-    # link-register ABIs (PPC lr, ARM/aarch64 lr/x30, MIPS $ra): the branch target the epilogue
-    # loads. On PPC the fetched pc is lr with the low bits masked by aligned fetch, so the pc
-    # search misses but the RA register holds the exact controlled value.
     regs = cap.get("regs") or {}
+    pc_off = -1
+    if pc is not None:
+        pc_off = cyclic_find(_reg_window(pc, word, endian, n), length, n)
+    # link-register ABIs (PPC lr, ARM/aarch64 lr/x30, MIPS $ra, alpha ra): the branch target the
+    # epilogue loads. The docstring's PPC case is the easy one -- the pc search MISSES and the
+    # register rescues it. Alpha is the hard one, and it was measured: the fetch unit clears the
+    # low two bits of the branch target, so the pc holds `ra & ~3`, and that one changed byte
+    # makes the pc's window match the cyclic sequence FOUR BYTES EARLY -- an exact match at a
+    # wrong offset, so the pc search does not miss and the register was never consulted.
+    #
+    #   cyclic(600), archgate's own fixture, qemu-alpha gdbstub:
+    #     pc = 0x6161617661616174 -> cyclic_find = 76     (wrong)
+    #     ra = 0x6161617661616175 -> cyclic_find = 80     (right)
+    #   and the sentinel test settles it: with the marker at 80, ra holds it and the pc holds
+    #   `ra & ~3`; with the marker at 76, neither does.
+    #
+    # So when a return-address register ALSO resolves and the pc is a masked version of it, the
+    # register is the trustworthy source: its bytes are what the program loaded, the pc's are
+    # what the fetch unit made of them.
+    ra_off, ra_name = -1, ""
     for rn in ra_regs(cap):
         if rn in regs:
-            off = cyclic_find(_reg_window(regs[rn], word, endian, n), length, n)
-            if off != -1:
-                return off, rn
+            cand = cyclic_find(_reg_window(regs[rn], word, endian, n), length, n)
+            if cand != -1:
+                ra_off, ra_name = cand, rn
+                break
+    if ra_off != -1 and pc_off != -1 and ra_off != pc_off and pc is not None:
+        rav = regs.get(ra_name)
+        if isinstance(rav, int) and pc in (rav & ~0b11, rav & ~0b1):
+            return ra_off, ra_name                   # the pc is the masked copy; trust the register
+    if pc_off != -1:
+        return pc_off, "pc"
+    if ra_off != -1:
+        return ra_off, ra_name
     # prefer the slot SP points at (the return address the ret tried to load), then neighbors
     words = dict(_stack_words(cap))
     for rel in (0, -8, 8, -16, 16):

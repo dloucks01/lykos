@@ -91,20 +91,20 @@ MATRIX = [
     # package away, so the ONLY reason they were uncovered is that nobody had asked. `_QEMU`
     # has carried both since the xtensa/microblaze round; what no case asserted is that the
     # ladder -- fault capture, the gdbstub layout, IP control, the redirect -- reaches them.
-    # MEASURED at L1 on 2026-10-16, the day they were added, and recorded as L1 rather than
-    # quietly left at the L3 every other case expects. Both reach L1 -- the overflow is found
-    # and a verified PoC is produced -- and stop there for the same reason: neither arch is in
-    # `qemu_gdb._LAYOUTS` nor in `_STUB_ABI`, so `supported()` is False and the L2 stage has no
-    # register layout to read a faulting PC from. That is the whole gap, and closing it is two
-    # table entries plus an sp/pc register name VERIFIED against a live stub (the way sh4's
-    # hand-written layout was) -- not a claim to make from the ISA manual alone.
-    ArchCase("alpha", "alpha-linux-gnu-gcc", "L1",
-             note="no qemu-gdbstub layout yet (not in _LAYOUTS or _STUB_ABI), so the ladder "
-                  "stops at the verified crash"),
+    # Added 2026-10-16 at L1 (no gdbstub layout for either), and re-measured the same day once
+    # both had one. They went opposite ways, and the gate now records what each MEASURED.
+    ArchCase("alpha", "alpha-linux-gnu-gcc", "L3",
+             note="layout DERIVED from qemu-alpha's own target description (66 registers, named "
+                  "symbolically); its fetch unit clears the low 2 bits of a branch target, so "
+                  "the captured pc is `ra & ~3` and the control offset has to come from `ra` -- "
+                  "the pc's window matches the cyclic sequence 4 bytes early, exactly"),
     ArchCase("hppa", "hppa-linux-gnu-gcc", "L1",
-             note="no qemu-gdbstub layout yet; and PA-RISC's stack grows UP with the return "
-                  "address in %r2, so even with one a bounded overflow reaching it is not the "
-                  "usual shape"),
+             note="layout HAND-WRITTEN (qemu-hppa serves no target description at all) and "
+                  "verified against a live g-packet. The ladder stops at L1 for an architectural "
+                  "reason, measured: the cyclic reaches r21 and r28 but never the program "
+                  "counter, because PA-RISC keeps the return address in the frame marker and "
+                  "the stack grows UP -- a bounded forward overflow of a local does not touch "
+                  "it. Same shape as sparcv9's register windows, one ISA over"),
     ArchCase("sparcv9", "sparc64-linux-gnu-gcc", "L1",
              note="register windows keep the return address in %i7, not on the stack: a "
                   "bounded overflow never corrupts control flow, so only a copy that runs off "
@@ -179,7 +179,14 @@ def run_case(case: ArchCase, exe: Path, *, timeout: float = 30.0,
             pocs = PocDAO(store.conn).list_by_target(target.id)
             if any(p.verified and p.level == "L1" for p in pocs):
                 res["reached"] = "L1"
-            if _RANK[case.expect] >= _RANK["L2"] and res["reached"] == "L1":
+            # ALWAYS escalate, whatever this case EXPECTS. Gating the attempt on the
+            # expectation makes the gate blind in the one direction that matters: alpha and hppa
+            # were recorded at L1 the day they were added, and when both later got a
+            # qemu-gdbstub layout -- the exact thing their notes said was missing -- the gate
+            # kept reporting L1 because `expect` was L1 and the L2 attempt was never made. An
+            # expectation is a BAR to clear, not a budget; the same trap capped
+            # `addr_leak_pie_ret2win` at L2 on the conformance side.
+            if res["reached"] == "L1":
                 sha = store.put_artifact(cid, "archgate-seed",
                                          data=b"A" * res.get("crash_len", 600)).sha256
                 enqueue_primitive(q, target, params={"input_sha": sha, "input_mode": "stdin",
@@ -196,7 +203,7 @@ def run_case(case: ArchCase, exe: Path, *, timeout: float = 30.0,
                            if e.type == "primitive.done"]
                     res["l2_note"] = (str(evs[-1].payload)[:160] if evs
                                       else (runs[-1].error if runs else None))
-            if _RANK[case.expect] >= _RANK["L3"] and res["reached"] == "L2":
+            if res["reached"] == "L2":
                 # L3 reads the offset L2 just confirmed (see exploit_stage._l2_offset), so it
                 # must run after it -- which is the documented ladder order anyway.
                 enqueue_exploit(q, target, params={"input_mode": "stdin",
@@ -265,6 +272,14 @@ def table(report: dict) -> str:
         rows.append(f"{r['label']:11} {str(r.get('bits') or '?'):>6} "
                     f"{str(r.get('crash_len') or '-'):>7} {r['expect']:>7} "
                     f"{(r['reached'] or '-'):>8}  {r.get('note','')}{mark}")
+        # WHY it stopped where it did, on the line under it. The reason was recorded in the
+        # JSON and printed nowhere, so the table said "L1" next to a static note that could
+        # be months out of date -- which is how alpha and hppa went on claiming "no
+        # qemu-gdbstub layout yet" after both had one.
+        for key, label in (("l2_note", "L2"), ("l3_note", "L3")):
+            if r.get(key) and _RANK.get(r.get("reached") or "", 0) < _RANK[label]:
+                rows.append(f"{'':11} {'':>6} {'':>7} {'':>7} {'':>8}  {label} stopped: "
+                            f"{str(r[key])[:150]}")
     for s in report.get("skipped", []):
         rows.append(f"{s['label']:11} {'SKIP':>6} {'':>7} {'':>7} {'':>8}  {s['reason']}")
     return "\n".join(rows)

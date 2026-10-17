@@ -590,3 +590,30 @@ def test_a_steered_read_discloses_a_base_and_hands_the_recipe_to_l3(store, case,
     assert d.get("steered_byte") == 5, d
     # and the L2 payload carries the disclosure, which is what _l2_disclosure_triggers reads
     assert (done[-1] or {}).get("disclosure", {}).get("input_sha") == d["input_sha"]
+
+
+def test_a_masked_pc_does_not_outrank_the_register_that_holds_the_real_target():
+    """Measured on alpha, and it cost an L2.
+
+    The fetch unit clears the low two bits of a branch target, so the captured pc is `ra & ~3`.
+    That one changed byte made the pc's 4-byte window match the cyclic sequence FOUR BYTES
+    EARLY -- an exact match at a wrong offset. The pc search therefore did not miss (which is
+    the case the link-register branch below it was written for), the register was never
+    consulted, and the sentinel placed at the recovered offset landed nowhere:
+
+        cyclic(600), archgate's own fixture, qemu-alpha gdbstub
+          pc = 0x6161617661616174 -> 76   (wrong)
+          ra = 0x6161617661616175 -> 80   (right, and the sentinel at 80 lands in ra)
+    """
+    cap = {"pc": 0x6161617661616174, "arch": "alpha",
+           "regs": {"pc": 0x6161617661616174, "ra": 0x6161617661616175}}
+    assert P.recover_ip_offset(cap, 600) == (80, "ra")
+
+    # An ISA with no return-address register is untouched: the pc is the only source there.
+    assert P.recover_ip_offset({"pc": 0x6161617661616174, "arch": "x86-64",
+                                "regs": {}}, 600) == (76, "pc")
+    # And where the pc is NOT a masked copy of the register, the pc still wins -- the register
+    # may simply hold stale cyclic bytes from an earlier frame.
+    unrelated = {"pc": 0x6161617661616174, "arch": "aarch64",
+                 "regs": {"x30": 0x6262626262626262}}
+    assert P.recover_ip_offset(unrelated, 600) == (76, "pc")
