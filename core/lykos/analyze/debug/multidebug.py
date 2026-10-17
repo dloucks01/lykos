@@ -20,7 +20,7 @@ from .. import elf, substrate
 from ..dynamic import sandbox
 from ..dynamic.stage import crash_dedup_key, crash_key_parts
 from ..fuzz.runner import place
-from ..poc.capture import MODES, how_to_feed
+from ..poc.capture import how_to_feed, sweep_modes
 from . import gdb, rootcause
 
 _log = logging.getLogger(__name__)
@@ -108,7 +108,7 @@ def multi_debug_stage(ctx) -> dict:
     # fault, and "no fault reproduced" then means "we fed it wrong" while reading as a real
     # negative -- the same defect root_cause and build_poc had.
     tried = []
-    for m in [mode] + [x for x in MODES if x != mode]:
+    for m in sweep_modes(mode, input_bytes):
         argv, stdin_file = _deliver(m)
         ctx.progress(msg=f"detonating entry under gdb (follow-fork/exec, {m})")
         cap = gdb.run_gdb_follow(gpath, exe, argv, stdin_file, ctx=ctx, timeout=int(timeout))

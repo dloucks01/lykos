@@ -15,9 +15,11 @@ import ctypes
 import json
 import os
 import platform
+import select
 import signal
 import struct
 import sys
+import time
 
 # ---------------------------------------------------------------------------------- absorbed
 # This driver runs as a standalone script under a different interpreter (the parent copies it to
@@ -214,10 +216,23 @@ def _argv_bytes(a):
         return a.encode("utf-8", "surrogateescape")
 
 
-def capture(exe, argv, stdin_file, timeout, breakpoints=None, env=None):
+def capture(exe, argv, stdin_file, timeout, breakpoints=None, env=None,
+            stdin_chunks=None, idle=0.08):
     """Run `exe` under ptrace and capture the fault. When `breakpoints` (x86-64 VAs) are given,
     set software breakpoints and, if execution reaches one, report `breakpoint_hit` instead of
-    (or before) a fault -- used to confirm a control-flow hijack reached a chosen function."""
+    (or before) a fault -- used to confirm a control-flow hijack reached a chosen function.
+
+    `stdin_chunks` delivers input ONE FIELD PER PROMPT instead of redirecting a file onto stdin.
+    A prompt-driven target reads with `read(0, ...)`, which returns whatever is available, so a
+    bulk feed puts every field into field one and the program rejects it or desyncs -- the whole
+    blob lands in the first `read` and the second reaches EOF. The campaign already knew this
+    (`fuzz.runner.run_input_prompted`) and so did the shipped bundle (`replay_prompt.py`), but
+    this tracer did not, so a crash recorded as `input_mode="prompt"` was captured with NO INPUT
+    AT ALL and reported as "no fatal signal" -- which capped every prompt-paced defect at L1.
+
+    Paced mode keeps the child's stdin as a PIPE and its stdout/stderr as a second pipe, and
+    writes the next chunk once the child's output has been quiet for `idle` seconds. It cannot
+    use a file redirect, because pacing is the point."""
     host = _host()
     if host not in ("x86-64", "aarch64"):
         return {"ok": False, "reason": f"unsupported host arch {host}", "arch": host}
@@ -225,14 +240,34 @@ def capture(exe, argv, stdin_file, timeout, breakpoints=None, env=None):
         breakpoints = None                             # software int3 breakpoints: x86-64 only
     libc = _libc()
 
+    paced = bool(stdin_chunks)
+    in_r = in_w = out_r = out_w = -1
+    if paced:
+        in_r, in_w = os.pipe()
+        out_r, out_w = os.pipe()
+
     pid = os.fork()
     if pid == 0:                                       # ---- child ----
         try:
-            if stdin_file:
-                fd = os.open(stdin_file, os.O_RDONLY)
-                os.dup2(fd, 0)
-            dn = os.open(os.devnull, os.O_WRONLY)
-            os.dup2(dn, 1); os.dup2(dn, 2)
+            if paced:
+                # stdin is a PIPE the tracer feeds a field at a time, and stdout/stderr come back
+                # to the tracer because its output is the clock the pacing runs on. Everything
+                # else keeps /dev/null: a target that prints megabytes must not fill a pipe
+                # nobody drains.
+                os.dup2(in_r, 0)
+                os.dup2(out_w, 1)
+                os.dup2(out_w, 2)
+                for fd in (in_r, in_w, out_r, out_w):
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+            else:
+                if stdin_file:
+                    fd = os.open(stdin_file, os.O_RDONLY)
+                    os.dup2(fd, 0)
+                dn = os.open(os.devnull, os.O_WRONLY)
+                os.dup2(dn, 1); os.dup2(dn, 2)
             try:
                 import resource
                 resource.setrlimit(resource.RLIMIT_CPU, (int(timeout) + 1, int(timeout) + 2))
@@ -273,6 +308,66 @@ def capture(exe, argv, stdin_file, timeout, breakpoints=None, env=None):
         os._exit(127)
 
     # ---- parent (tracer) ----
+    if paced:
+        for fd in (in_r, out_w):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        os.set_blocking(out_r, False)
+        os.set_blocking(in_w, False)
+
+    pump = {"fed": 0, "quiet_since": time.time(), "closed": False, "out": bytearray()}
+
+    def _pump_once():
+        """Drain whatever the child has said; feed the next field when it goes quiet.
+
+        The clock is the child's own output, not a fixed delay: that is what makes this track a
+        target whose prompts are slow without waiting for a target whose prompts are fast."""
+        try:
+            data = os.read(out_r, 65536)
+        except (BlockingIOError, InterruptedError):
+            data = None
+        except OSError:
+            data = b""
+        if data:
+            if len(pump["out"]) < 65536:
+                pump["out"] += data
+            pump["quiet_since"] = time.time()
+            return
+        if time.time() - pump["quiet_since"] < idle:
+            return
+        if pump["fed"] < len(stdin_chunks):
+            try:
+                os.write(in_w, stdin_chunks[pump["fed"]])
+            except (BlockingIOError, InterruptedError):
+                return                                 # pipe full: try again next tick
+            except OSError:
+                pump["fed"] = len(stdin_chunks)        # the child is gone; stop feeding
+                return
+            pump["fed"] += 1
+            pump["quiet_since"] = time.time()
+        elif not pump["closed"]:
+            # EOF, so a `while (fgets(...))` loop ends instead of blocking until the alarm.
+            pump["closed"] = True
+            try:
+                os.close(in_w)
+            except OSError:
+                pass
+
+    def _wait():
+        """`os.waitpid(pid, 0)`, except that in paced mode the tracer has to keep feeding the
+        child while it waits -- a blocking waitpid would deadlock against a child blocked on a
+        `read` the tracer has not performed yet."""
+        if not paced:
+            return os.waitpid(pid, 0)
+        while True:
+            w, status = os.waitpid(pid, os.WNOHANG)
+            if w == pid:                               # test the PID: status 0 is a real exit(0)
+                return w, status
+            select.select([out_r], [], [], 0.02)
+            _pump_once()
+
     def _alarm(_s, _f):
         try:
             os.kill(pid, signal.SIGKILL)
@@ -281,7 +376,7 @@ def capture(exe, argv, stdin_file, timeout, breakpoints=None, env=None):
     signal.signal(signal.SIGALRM, _alarm)
     signal.alarm(max(1, int(timeout)))
 
-    os.waitpid(pid, 0)                                 # initial stop at execv (SIGTRAP)
+    _wait()                                            # initial stop at execv (SIGTRAP)
     bp_orig = {}
     if breakpoints:                                    # loaded image is now mapped
         for addr in breakpoints:
@@ -292,7 +387,7 @@ def capture(exe, argv, stdin_file, timeout, breakpoints=None, env=None):
     result = {"ok": False, "reason": "no fatal signal", "arch": host}
     while True:
         try:
-            _wpid, status = os.waitpid(pid, 0)
+            _wpid, status = _wait()
         except ChildProcessError:
             break
         if os.WIFEXITED(status) or os.WIFSIGNALED(status):
@@ -337,6 +432,17 @@ def capture(exe, argv, stdin_file, timeout, breakpoints=None, env=None):
         os.waitpid(pid, 0)
     except ChildProcessError:
         pass
+    if paced:
+        for fd in (out_r,) + ((in_w,) if not pump["closed"] else ()):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        # How many fields actually went in, so a capture that delivered only field one is
+        # distinguishable from one that delivered all of them and still did not fault.
+        result["fields_delivered"] = pump["fed"]
+        result["fields_total"] = len(stdin_chunks)
+        result["target_output"] = bytes(pump["out"][:4096]).decode("latin-1", "replace")
     return result
 
 
@@ -344,9 +450,15 @@ def main(spec_path):
     with open(spec_path) as _f:
         spec = json.load(_f)
     try:
+        chunks = spec.get("stdin_chunks")
+        # latin-1 is the lossless byte round-trip through JSON, the same convention argv and env
+        # already use in this helper.
+        if chunks is not None:
+            chunks = [c.encode("latin-1") if isinstance(c, str) else bytes(c) for c in chunks]
         res = capture(spec["exe"], spec.get("argv", []), spec.get("stdin_file"),
                       float(spec.get("timeout", 10)), breakpoints=spec.get("breakpoints"),
-                      env=spec.get("env"))
+                      env=spec.get("env"), stdin_chunks=chunks,
+                      idle=float(spec.get("idle", 0.08)))
     except Exception as e:                             # noqa: BLE001
         res = {"ok": False, "reason": f"{type(e).__name__}: {e}"}
     res["absorbed"] = _ABSORBED

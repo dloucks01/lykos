@@ -18,7 +18,7 @@ from .. import elf, substrate
 from ..dynamic import sandbox
 from ..dynamic.stage import crash_dedup_key, crash_key_parts
 from ..fuzz.runner import place
-from ..poc.capture import MODES, how_to_feed, make_capture, make_qemu_capture, materialize_helper
+from ..poc.capture import how_to_feed, make_capture, make_qemu_capture, materialize_helper, sweep_modes
 from . import gdb, qemu_gdb, rootcause
 
 _log = logging.getLogger(__name__)
@@ -149,7 +149,7 @@ def _root_cause_managed(ctx, target, input_sha, base_argv, mode, timeout, runtim
     wf.write_bytes(input_bytes)
     tried = []
     res = None
-    for m in [mode] + [x for x in MODES if x != mode]:
+    for m in sweep_modes(mode, input_bytes):
         argv, stdin = (place(base_argv, str(wf)), b"") if m != "stdin" else (
             list(base_argv), input_bytes)
         ctx.progress(msg=f"reproducing under {rt['name']} ({m})")
@@ -335,7 +335,7 @@ def root_cause_stage(ctx) -> dict:
     # Try the mode we believe in, then the others. A crashing input fed the wrong way looks
     # exactly like an input that does not crash, and reporting that as "no fault reproduced"
     # turns a wrong setup into what reads as a clean negative result.
-    order = [mode] + [m for m in MODES if m != mode]
+    order = sweep_modes(mode, input_bytes)
     tried = []
     for m in order:
         ctx.progress(msg=f"capturing fault under {backend} ({m})")

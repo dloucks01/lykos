@@ -75,7 +75,6 @@ from ..fuzz import aflpp
 from ..fuzz.runner import place
 from . import bundle, primitive
 from .capture import (
-    MODES,
     env_var_from_argv,
     how_to_feed,
     make_capture,
@@ -83,6 +82,7 @@ from .capture import (
     materialize_helper,
     plain_build_bytes,
     replay_exe_for,
+    sweep_modes,
 )
 
 _log = logging.getLogger(__name__)
@@ -1066,7 +1066,10 @@ def primitive_stage(ctx) -> dict:
         for _which, _bytes, _is_plain in ([(cap_exe, cap_bytes, True)] if cap_plain else []) + [
                 (exe, target_bytes, False)]:
             for fr in framings:
-                for m in [mode] + [x for x in MODES if x != mode]:
+                # The FRAMED pattern decides whether paced delivery is worth trying: the bare
+                # cyclic has no field boundaries, but `b"go\n" + cyclic + b"\n"` has three, and
+                # it is the framed bytes that get delivered.
+                for m in sweep_modes(mode, fr(pattern)):
                     capture = _capture_for(m, _which)
                     cap0 = capture(fr(pattern))
                     if m not in tried:
@@ -1112,7 +1115,7 @@ def primitive_stage(ctx) -> dict:
             _av, _demo, _dcap, _dmode = (None, b"", {}, "")
             if not emulated:
                 _av, _demo, _dcap, _dmode = _address_verdict(
-                    ctx, lambda m: _capture_for(m), [mode] + [x for x in MODES if x != mode],
+                    ctx, lambda m: _capture_for(m), sweep_modes(mode, orig),
                     orig, target.arch or "x86-64",
                     siblings=_address_siblings(ctx, target, input_sha))
             if _av and _av.get("confirmed"):
@@ -1340,7 +1343,7 @@ def primitive_stage(ctx) -> dict:
         # verdicts above, measured from a report rather than from a faulting instruction.
         if not _cls and not emulated:
             _av, _demo, _dcap, _dmode = _address_verdict(
-                ctx, lambda m: _capture_for(m), [mode] + [x for x in MODES if x != mode],
+                ctx, lambda m: _capture_for(m), sweep_modes(mode, orig),
                 orig, target.arch or "x86-64",
                 siblings=_address_siblings(ctx, target, input_sha))
             if _av and _av.get("confirmed"):

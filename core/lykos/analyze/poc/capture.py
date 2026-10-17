@@ -74,7 +74,22 @@ def make_capture(ctx, helper: Path, exe, mode, base_argv, timeout, python, *,
             if not var:
                 return {"ok": False, "reason": "env mode but no NAME=@@ prefix recorded"}
             env = {var: data.decode("latin-1")}          # latin-1: lossless byte round-trip via JSON
+        elif mode == PROMPT:
+            chunks = paced_chunks(data)                  # set on the spec below
+        elif mode == "socket":
+            # A socket crash has no exec-time carrier at all; `poc/stage.py` spawns the server
+            # and sends. Say so rather than running the target with no input.
+            return {"ok": False, "reason": "socket delivery has no exec-time carrier, so the "
+                                           "ptrace capture cannot reproduce it"}
+        else:
+            # EXPLICIT, because the silence here is what capped a whole delivery shape at L1: an
+            # unrecognised mode fell through this chain leaving stdin unset, so the child ran with
+            # NO INPUT and the helper honestly reported "no fatal signal". The crash was real, the
+            # setup was wrong, and nothing said so.
+            return {"ok": False, "reason": f"capture does not know how to deliver via {mode!r}"}
         spec = {"exe": str(exe), "argv": argv, "stdin_file": stdin_file, "timeout": timeout}
+        if mode == PROMPT:
+            spec["stdin_chunks"] = [c.decode("latin-1") for c in chunks]
         # A sanitizer build does NOT die on a signal by default: ASan prints its report and calls
         # _exit(1), so to the ptrace helper the detonation looks like a program that ran and
         # exited cleanly. Measured on a clang ASan build of a one-line out-of-bounds read: the
@@ -142,6 +157,12 @@ def make_qemu_capture(exe, arch, mode, base_argv, timeout, *, endianness=None, b
         elif mode == "file":
             (work / "input.bin").write_bytes(data)
             argv = place(argv, str(work / "input.bin"))
+        elif mode != "stdin":
+            # Same honesty as the native path: the gdbstub hands qemu one blob on stdin, so there
+            # is no pacing here. An emulated prompt-driven target is a real gap, and saying so
+            # beats running it with no input and reporting that it did not fault.
+            return {"ok": False, "reason": f"emulated capture cannot deliver via {mode!r} "
+                                           "(qemu's gdbstub takes one bulk stdin blob)"}
         return qemu_gdb.capture(exe, arch, argv=argv, stdin=stdin, timeout=timeout,
                                 endianness=endianness, bits=bits, breakpoints=breakpoints)
 
@@ -154,6 +175,40 @@ def make_qemu_capture(exe, arch, mode, base_argv, timeout, *, endianness=None, b
 # mode -- how_to_feed returns it for a crash env_fuzz recorded, and the capture/bundle paths below
 # honour it -- which is what lets such a crash be replayed into a verified PoC.
 MODES = ("stdin", "file", "arg")
+
+#: The PROMPT channel is not in MODES and must not be: it is not a channel at all but a PACING
+#: POLICY on stdin, so putting it there would make every target in the generic sweep pay for an
+#: extra execution per input, and would make `substrate.channels` claim a physical carrier that
+#: does not exist. It is reached when the run that found the crash recorded it (`how_to_feed`
+#: returns "prompt") or when `sweep_modes` adds it because the input has more than one field.
+PROMPT = "prompt"
+
+
+def paced_chunks(data: bytes) -> list:
+    """The blob split into the fields a prompt-driven target reads, one per prompt.
+
+    ONE definition, because the campaign and the capture have to pace IDENTICALLY -- a crash
+    found with one split and replayed with another is a crash that does not reproduce, and that
+    is the failure this whole channel exists to prevent. `fuzz.runner.run_input_prompted` calls
+    this too.
+
+    Every element of the split gets its newline back, INCLUDING a trailing empty one: a blob that
+    ends in a newline means a final bare "\n" went in, which for a target reading with `read(0,
+    ...)` is a field, not nothing."""
+    return [ln + b"\n" for ln in bytes(data).split(b"\n")]
+
+
+def sweep_modes(mode, data: bytes, *, deliverable=None) -> list:
+    """The delivery modes to try for `data`, in order, starting with the one we believe in.
+
+    `prompt` is appended only when it could MATTER -- the input has at least two fields -- so a
+    single-line input does not pay for a redundant paced execution that is byte-for-byte the same
+    as the bulk one. It leads when it is the recorded mode, because then it is not a guess."""
+    order = [mode] + [m for m in MODES if m != mode]
+    if mode != PROMPT and len(paced_chunks(data or b"")) > 1 \
+            and (deliverable is None or "stdin" in deliverable):
+        order.append(PROMPT)
+    return order
 
 # env_fuzz records its delivery as an argv prefix element "NAME=@@" (@@ being the input placeholder),
 # so the variable's name survives on the DynResult and the replay can set the right one.
@@ -461,6 +516,14 @@ def how_to_feed(conn, target, input_sha, params, *, content=None):
     if params.get("input_mode"):
         return params["input_mode"], list(params.get("argv") or []), FEED_GIVEN
     for r in DynResultDAO(conn).list_by_target(target.id):
+        # PROMPTED delivery is recorded in the ISOLATION tag, not in `input_mode`: the campaign
+        # runs the prompt protocol over the stdin CHANNEL (`channels = ["stdin"]` in fuzz/stage),
+        # so the mode it stores is "stdin" and the pacing is what the tag remembers. `poc/stage`
+        # already reads that tag to replay an L1; the capture paths did not, so they swept the
+        # bulk channels, none of which can deliver a prompt protocol, and concluded the input did
+        # not fault. Reading the same record makes `prompt` the mode they START from.
+        if r.input_sha == input_sha and "prompted" in (r.isolation or ""):
+            return PROMPT, list(r.argv or []), FEED_RECORDED
         if r.input_sha == input_sha and r.input_mode:
             # dyn_result.argv is the FLAG PREFIX, never the thing carrying the input: the
             # carrier is a scratch path that no longer exists by the time anything replays it,

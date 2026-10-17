@@ -901,14 +901,28 @@ int main(void){ setvbuf(stdout,0,2,0);
   use(second);                                          /* unbounded copy into 64 bytes */
   return 0; }""",
          ["-no-pie", "-fno-stack-protector", "-O0", "-w"],
-         want_level=1, want_cwe=("CWE-121", "CWE-787", "CWE-119"), budget=300.0,
+         want_level=2, want_cwe=("CWE-121", "CWE-787", "CWE-119"), budget=300.0,
          want_bundle=True,
+         strict_level=True,
          note="CHANNEL prompt: a linear prompt protocol, reachable ONLY one field per prompt. "
-              "Both halves are asserted here -- the pipeline must find it (which needs prompted "
-              "delivery in the campaign) and the shipped bundle must reproduce it (which needs a "
-              "reproducer that paces the same way, not `< input.bin`). A bulk feed desyncs and "
-              "the program says so, which is why a half-fix reads as a verified L1 whose bundle "
-              "does nothing."),
+              "Three halves are asserted here -- the pipeline must find it (which needs prompted "
+              "delivery in the campaign), the shipped bundle must reproduce it (which needs a "
+              "reproducer that paces the same way, not `< input.bin`), and the PRIMITIVE must be "
+              "recoverable from it. A bulk feed desyncs and the program says so, which is why a "
+              "half-fix reads as a verified L1 whose bundle does nothing. "
+              "Raised from L1 to L2 once the capture path learned to pace, and the measurement "
+              "behind that is the point: the campaign paced (`run_input_prompted`) and the bundle "
+              "paced (`replay_prompt.py`), but the ptrace capture that the L2 primitive and the "
+              "root-cause stage both drive had NO `prompt` branch and NO `else` -- so an input "
+              "recorded as prompted left stdin unset, the child ran with NO INPUT AT ALL, and the "
+              "helper honestly reported \"no fatal signal\". A real crash, a wrong setup, and "
+              "nothing saying so; that silence is what held every prompt-paced defect at L1 "
+              "however good the technique catalogue got. Measured with --ceiling after the fix: "
+              "L2, primitive/CWE-119 + chain_primitive/CWE-787, 137s. L3 is NOT reached and the "
+              "reason is a different seam: `_spawn_and_mark` already takes a paced LIST of "
+              "writes, but the exploit recipes deliver their chain through `_measured_frame`, "
+              "which builds one blob -- so weaponizing a prompt protocol needs that framing to "
+              "pace too, and this case does not assert it yet."),
 
     # ---- BUILD REALISM. Real binaries are optimised and stripped; -O0 with symbols hides any
     # reliance on symbol names or on an unoptimised frame layout.

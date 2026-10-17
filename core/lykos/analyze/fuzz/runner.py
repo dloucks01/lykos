@@ -117,11 +117,15 @@ def run_input_prompted(exe, d: bytes, *, timeout: float, fields=(), idle: float 
         # One line per prompt. A blob with FEWER lines than the target has fields simply stops
         # feeding -- stdin is then closed, which is what makes the target proceed or exit rather
         # than block until the deadline.
-        for line in d.split(b"\n"):
+        # `capture.paced_chunks` is the ONE definition of this split, because the ptrace capture
+        # has to pace identically: a crash found with one split and replayed with another is a
+        # crash that does not reproduce.
+        from ..poc.capture import paced_chunks
+        for chunk in paced_chunks(d):
             if not alive or time.monotonic() >= deadline:
                 break
             try:
-                proc.stdin.write(line + b"\n")
+                proc.stdin.write(chunk)
                 proc.stdin.flush()
             except (OSError, ValueError):                # the target is gone: that is a result
                 break
