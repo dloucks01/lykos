@@ -352,6 +352,12 @@ def test_build_exploit_prefers_the_confirmed_framing_over_its_own_derivation():
 
     from lykos.analyze.poc import exploit_stage
     src = inspect.getsource(exploit_stage.build_exploit_stage)
-    i, j = src.index("_overflow_frame("), src.index("_l2_frame(ctx, target)")
+    # The OFFSET path's own derivation runs first and L2's answer overrides it. Matched on the
+    # ASSIGNMENT (`_l2f = `) rather than on any call to `_l2_frame`, because the PIE recipes above
+    # the ladder read the same measured framing for their own detonations -- they build their
+    # payloads themselves, so a framing they cannot see is a payload that never reaches the sink.
+    i, j = src.index("_overflow_frame("), src.index("_l2f = _l2_frame(ctx, target)")
     assert i < j, "L2's framing must override the local derivation, not precede it"
     assert "_pre, _post = _l2f" in src
+    # ...and the early read is for the recipes that detonate on their own, with the same source.
+    assert "_measured_frame" in src and "frame=_measured_frame" in src

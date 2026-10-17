@@ -209,7 +209,11 @@ def test_minimize_reproduces_under_the_same_invocation_it_was_found_with():
 
     from lykos.analyze.fuzz import stage as fz
     camp = inspect.getsource(fz.fuzz_campaign)
-    assert "def _same(d, _sig=sig, _prefix=run_argv):" in camp
+    # ...and the ORACLE travels with the invocation for the same reason the argv prefix does: the
+    # calibration phase runs each seed guarded and unguarded (they catch different overflows and
+    # each hides the other's), so a minimizer that used the stage's default would shrink a crash
+    # found plain while preloading the guard page, watch it stop reproducing, and keep nothing.
+    assert "def _same(d, _sig=sig, _prefix=run_argv, _guard=guard_eff):" in camp
     assert 'kw["base_argv"] = _prefix' in camp
 
 

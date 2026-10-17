@@ -49,6 +49,7 @@ for _p in (CORE, TOOLS):
         sys.path.insert(0, str(_p))
 
 import pipeline_conformance as pc  # noqa: E402
+from lykos import observe  # noqa: E402
 from lykos.eval import archgate  # noqa: E402
 
 #: CWE -> mechanism. Several CWEs map to one mechanism on purpose: 121/122/787/119/120 are all
@@ -239,6 +240,10 @@ def _grid(data, axis, title, measured_mode):
 
 
 def main() -> int:
+    # A diagnostic instrument's own diagnostics have to be readable: with nothing configured a
+    # `_log.warning` from inside the engine reaches stderr through `logging.lastResort`, with no
+    # timestamp, module or line. `LYKOS_LOG` still selects the level, so the default stays quiet.
+    observe.configure()
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--measured", type=Path,

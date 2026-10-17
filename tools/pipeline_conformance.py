@@ -246,6 +246,33 @@ int main(void){ setvbuf(stdout,0,2,0); setvbuf(stdin,0,2,0);
     else return 0; } }'''
 
 
+#: The PIE form: the object's own dump leaks the callback, which is a code pointer, so the
+#: hijack address can be RELOCATED. Every address in this one is runtime-dependent.
+SRC_FNPTR_PIE = r'''#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+struct note { char text[32]; void (*show)(struct note *); };
+static void plain(struct note *n){ printf("%s\n", n->text); }
+void win(void){ execl("/bin/sh","sh",(char*)0); }
+struct note *db[8];
+static long rl(void){ char b[32]; int i=0,c;
+  while(i<31){ c=getchar(); if(c<0||c=='\n')break; b[i++]=c; }
+  b[i]=0; return strtol(b,0,10); }
+int main(void){ setvbuf(stdout,0,2,0); setvbuf(stdin,0,2,0);
+  while(1){ printf("1.new 2.edit 3.show 4.dump 5.exit\n> ");
+    long o=rl();
+    if(o==1){ printf("idx: "); long i=rl();
+              if(i>=0&&i<8){ db[i]=malloc(sizeof(struct note));
+                             if(db[i]){ db[i]->show=plain; strcpy(db[i]->text,"new"); } } }
+    else if(o==2){ printf("idx: "); long i=rl(); printf("len: "); long n=rl(); printf("data: ");
+              if(i>=0&&i<8&&db[i]&&n>0) read(0, db[i]->text, (size_t)n); }   /* len unbounded */
+    else if(o==3){ printf("idx: "); long i=rl(); if(i>=0&&i<8&&db[i]) db[i]->show(db[i]); }
+    else if(o==4){ printf("idx: "); long i=rl();
+              if(i>=0&&i<8&&db[i]) fwrite(db[i],1,sizeof(struct note),stdout); }  /* leaks show */
+    else return 0; } }'''
+
+
 _CASES: list[Case] = [
     Case("no_pie_ret2win",
          r'''#include <stdio.h>
@@ -392,6 +419,26 @@ int main(void){ setvbuf(stdout,0,2,0); setvbuf(stdin,0,2,0);
          want_level=3, want_cwe=(), budget=420.0,
          note="menu notebook, heap overflow into the object's own callback with NO win function "
               "-> system(\"/bin/sh\") through the hijacked object pointer -> shell (L3)"),
+
+    # ...and the PIE form, which is what every modern binary is. The two cases above are no-PIE,
+    # so `win`/`system@plt` are link-time constants; here NOTHING is known until the process runs.
+    # The object's own `4.dump` prints it raw, and the first thing in it past the buffer is the
+    # callback -- a CODE pointer, so a disclosure of 8 bytes is a defeat of ASLR:
+    # `base = leaked - offset(plain)`, and the hijack address follows.
+    #
+    # Measured by hand (2026-10-17): dump leaks `plain()` at 0x55da45e9b1b9, the base resolves,
+    # `win` relocates to base+0x11d4, and the same overflow-then-call sequence spawns a shell. What
+    # the autopilot has to do is exactly that: provoke the leak, resolve it against the symbol
+    # layout (`leak.disclosed_bases` -- the low 12 bits are page-invariant), and rebuild the
+    # payload at the relocated address.
+    Case("heap_fnptr_pie_leak",
+         SRC_FNPTR_PIE,
+         ["-fPIE", "-pie", "-fno-stack-protector", "-O0", "-w"],
+         mechanism="heap-overflow",
+         want_level=3, want_cwe=(), budget=600.0,
+         note="PIE menu notebook: dump leaks the object's callback (a code pointer) -> resolve the "
+              "PIE base -> overflow the buffer into the callback with the RELOCATED win address "
+              "-> call it -> shell (L3)"),
 
     Case("heap_fsop_shell",
          r'''#include <stdio.h>
