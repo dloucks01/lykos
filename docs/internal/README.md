@@ -9,6 +9,9 @@ What's here:
 - **Roadmap & backlog** — `13-roadmap-milestones.md`, `20-open-work-backlog.md`
 - **Reviews & plans** — `21-crs-harvest-review.md`, `24-modernization-plan.md`,
   `30-missing-capabilities-implementation-plan.md` (sequenced plan for doc 20's open queue)
+- **`37-weaponization-depth-2026-10-17.md`** — every matrix cell showed the level a case DEMANDS,
+  so four mechanism rows read L0/L2 and nobody could say whether that was the engine or the
+  fixture. `--ceiling` measures the reach; four rungs raised, three honest ceilings recorded.
 - **`36-door-selection-2026-10-17.md`** — in-process fuzzing reaches a library through one
   function at a time, so "did we fuzz it?" is answered by a function NAME. Four real trees, three
   wrong names, and why no instrument could see it: a door that is not a door produces a clean row.

@@ -276,3 +276,34 @@ def test_format_string_demonstrates_disclosure_with_proof(store, pool, gcc, tmp_
     assert leak["status"] == "demonstrated" and leak["proof"]["sha"]        # captured evidence
     assert store.content.get_bytes(leak["proof"]["sha"])                    # proof is fetchable
     assert any(e["kind"] == "memory-corruption" for e in effs)              # %n -> write, potential
+
+
+# ------------------------------------------------- what a confirmation PROVES decides the rung
+def test_the_rung_follows_what_the_oracle_showed():
+    """Every injection PoC was filed at L1 because the ladder was built around crashes, where L1 is
+    a verified crash and the effect is two rungs further on. An injection has no crash and its
+    oracle IS the effect -- the shell ran our `echo`, the database returned our row, /etc/passwd
+    came back -- so a confirmed one is a demonstrated effect. Two exceptions, both deliberate."""
+    from lykos.analyze.poc import inject_stage
+    from lykos.analyze.poc.injection import PROBES
+    lvl = inject_stage._level_for
+
+    assert lvl(PROBES["command-injection"], {}, {}) == "L3"          # our command ran
+    assert lvl(PROBES["path-traversal"], {}, {}) == "L3"             # /etc/passwd came back
+    assert lvl(PROBES["xxe"], {}, {}) == "L3"
+    assert lvl(PROBES["ssrf"], {}, {}) == "L3"
+
+    # a memory leak is chain material, not an end effect: levelled by what it RESOLVES
+    fs = PROBES["format-string"]
+    assert lvl(fs, {}, {"proved": True, "pie_base": 0x555555554000}) == "L2"
+    assert lvl(fs, {}, {"proved": False}) == "L1"
+    assert lvl(fs, {}, {}) == "L1"
+
+    # SQL injection: the UNION branch returns DATA (the effect); an error only proves the string
+    # reaches the parser, which is control of the query -- a primitive.
+    sq = PROBES["sql-injection"]
+    union = {"out": b"row: LYKOSMARK|x", "payload": b"' UNION SELECT 'LYKOSMARK' -- ",
+             "marker": "LYKOSMARK"}
+    err = {"out": b'unrecognized token: "\'"', "payload": b"'", "marker": "LYKOSMARK"}
+    assert lvl(sq, union, {}) == "L3"
+    assert lvl(sq, err, {}) == "L2"

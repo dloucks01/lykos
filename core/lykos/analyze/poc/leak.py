@@ -1708,6 +1708,24 @@ def classify_leak(vals, target_bytes: bytes, libc_data: bytes = b"") -> dict:
     }
 
 
+def _ptr_shaped(v: int) -> bool:
+    """Does this value have the SHAPE of an x86-64 userspace pointer: top two bytes zero and the
+    next byte 0x7f (libc/mmap/stack) or 0x55/0x56 (a PIE image mapping)?
+
+    `_le_pointer_words` applies this test by construction -- it is how a raw over-read is scanned
+    at all -- and the hex-text harvest had no equivalent, which is worse than it sounds: a `%p`
+    dump prints stack residue, and residue includes ASCII words (`0x4f2d544552434553` is
+    "SECRET-O"). Each one is a 64-bit candidate with a 1-in-4096 chance of matching any single
+    curated anchor's page offset, and a dump offers a dozen of them against ten anchors. Measured
+    immediately: a 32-directive dump of the format-string fixture "proved" libc base
+    0x1f7f6b000 -- not a libc base at all, from a word that was never a pointer.
+
+    A non-PIE image pointer (0x4xxxxx) is excluded along with them, and that is right rather than
+    unfortunate: a non-PIE image has no load base to disclose, so "ASLR defeated by this leak" is
+    a claim about nothing."""
+    return (v >> 48) == 0 and ((v >> 40) & 0xFF) in (0x7F, 0x55, 0x56)
+
+
 def disclosed_bases(output: bytes, target_bytes: bytes, libc_data: bytes = b"", *,
                     baseline: bytes = b"") -> dict:
     """What an out-of-bounds READ proves about ASLR, from the program's OWN output.
@@ -1759,7 +1777,9 @@ def disclosed_bases(output: bytes, target_bytes: bytes, libc_data: bytes = b"", 
     # pointer, two libc pointers and the stack, and this function reported `distinct: 0`. A printed
     # pointer is a primary rendering and as trustworthy as a raw one (it is an explicit pointer
     # print, not a coincidence of bytes), so it joins the STRICT pool rather than the fallback one.
-    raw += [int(m.group(1), 16) for m in re.finditer(rb"0[xX]([0-9a-fA-F]{6,16})\b", output)]
+    raw += [v for v in (int(m.group(1), 16)
+                        for m in re.finditer(rb"0[xX]([0-9a-fA-F]{6,16})\b", output))
+            if _ptr_shaped(v)]
     folded = [v for v in _case_fold_pointer_candidates(output) if v not in raw]
     vals = raw + folded
     # STRICT first: two distinct slots corroborating one base. Then the unambiguous-single rule,

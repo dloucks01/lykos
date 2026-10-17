@@ -615,11 +615,21 @@ def menu_op_sequences(model: dict, options, *, max_seqs: int = 48, width=None,
     return out[:max_seqs]
 
 
-#: Counts whose product with a common element size WRAPS a 32-bit size_t computation, so the
-#: allocation is tiny while the copy that follows is huge. One per element size, because which one
-#: a target multiplies by is not visible from the menu: 2**32//16, //8, //4, and 2**32 itself (a
-#: `n + 1` or `n * 1` allocation).
-_WRAP_NUMS = (b"268435456", b"536870912", b"1073741824", b"4294967296")
+#: Counts that make a size computation UNDER-ALLOCATE, so the allocation is tiny while the copy
+#: that follows is huge. Three families, because the arithmetic that wraps is not visible from the
+#: menu and each family needs a different value:
+#:
+#:   * a 32-bit product -- 2**32//16, //8, //4, and 2**32 itself for `n + 1` / `n * 1`;
+#:   * a 32-bit product truncated to 16 bits (`unsigned short sz = n * 16`), where the thresholds
+#:     are 2**16 over the same element sizes -- four orders of magnitude lower, so none of the
+#:     32-bit values comes anywhere near them;
+#:   * zero, for `malloc(n * k)` with the length taken from somewhere else, and for the `n - 1`
+#:     shape whose allocation is the one that wraps.
+#:
+#: 32-bit first: a 64-bit host's `size_t` arithmetic is the common case, and a caller that stops
+#: at the first success should not pay for the rarer ones.
+_WRAP_NUMS = (b"268435456", b"536870912", b"1073741824", b"4294967296",
+              b"4096", b"8192", b"16384", b"65536", b"0")
 
 # Numeric values worth trying for a size/count/index field: boundaries, a negative (unchecked
 # index / signed-vs-unsigned), and sizes that overflow a typical stack or heap buffer.

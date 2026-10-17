@@ -109,6 +109,13 @@ class Case:
     # acceptable alternatives, because one defect maps to several CWEs depending on which stage
     # files it (a stack overflow lands as CWE-121, -787 or -119).
     want_all_cwe: tuple = ()
+    # Make `want_level` BINDING. `_scored` is `lvl_ok or bool(demod)`, which exists so a case can
+    # also pass on a demonstrated want_cwe finding from a weaker stage -- and that quietly makes a
+    # RAISED want_level unenforceable: a case can demand L2, reach L1, and pass green on its CWE
+    # arm **[measured on format_read_leak: PASS at L1 against want_level=2]**. A case whose whole
+    # point is the rung it reaches sets this, and then the level is the only way through. (A case
+    # with no want_cwe is already strict by construction, since there is nothing else to pass on.)
+    strict_level: bool = False
     # Toolchain prefix for a cross-architecture case ("aarch64-linux-gnu-"); the case SKIPS when the
     # cross compiler is absent rather than failing the gate on a machine that cannot build it.
     cross: str = ""
@@ -1221,6 +1228,7 @@ int main(void){ setvbuf(stdout,0,2,0);
     else return 0; } }""",
          ["-fPIE", "-pie", "-O0", "-w"],
          want_level=1, want_cwe=("CWE-415", "CWE-416"), budget=300.0,
+         strict_level=True,
          note="BUG CLASS double free (CWE-415): the slot is never nulled, so two frees of one "
               "index. L1 is this case's CEILING and the reason is the fixture's own interface, "
               "not a gap: `1.alloc` takes no size and no data and there is no view and no edit, "
@@ -1299,6 +1307,7 @@ int main(void){ setvbuf(stdout,0,2,0);
          ["-no-pie", "-fno-stack-protector", "-O0", "-w"],
          want_level=3, want_cwe=("CWE-129", "CWE-787", "CWE-125", "CWE-119"), budget=420.0,
          mechanism="bad-index",
+         strict_level=True,
          note="BUG CLASS out-of-bounds INDEX write (CWE-129): unbounded index into a global table "
               "-- and the WEAPONIZATION of a write-what-where with NOTHING to point it at. There "
               "is no win function here, no system() in the PLT and no controlled pointer argument "
@@ -1323,6 +1332,7 @@ int main(void){ setvbuf(stdout,0,2,0);
          ["-no-pie", "-fno-stack-protector", "-O0", "-w"],
          want_level=2, want_cwe=("CWE-134", "CWE-200"), budget=300.0,
          mechanism="format-string",
+         strict_level=True,
          note="BUG CLASS format-string READ/disclosure (CWE-134/200) -- the gate only had the %n "
               "WRITE. Measured with --ceiling, the class stopped at L1: the probe confirmed the "
               "bug and filed the leaked words, and nothing asked what they were WORTH, so a %p "
@@ -1332,8 +1342,40 @@ int main(void){ setvbuf(stdout,0,2,0);
               "that can resolve it; and the recon payload asked for eight %p, which confirms the "
               "bug and resolves nothing, because the pointers that anchor a base sit deeper than "
               "the eighth varargs slot (8 and 12 directives proved a base 0/4 runs, 24 proved it "
-              "4/4). There is no L3 here and that is a property of the target, not a gap: one "
-              "printf, one shot, no second call site to redirect."),
+              "4/4 -- see format_read_leak_pie). `-no-pie` means there is no image base to "
+              "disclose here, so what the dump has to anchor is a LIBC pointer -- which it does, "
+              "attributed: `ASLR defeated by a format string (discloses the libc base) "
+              "(demonstrated): L2 primitive`. Driven standalone outside the autopilot the same "
+              "payload anchors nothing 3/3 runs, which is the class's real texture: whether a "
+              "varargs dump reaches an anchorable pointer depends on what the stack happens to "
+              "hold under that environment. There is no L3 either, and that is the target too: "
+              "one printf, one shot, no second call site to redirect."),
+
+    #: The same read, PIE. This is where "the leak defeats ASLR" is a claim about something: the
+    #: image base is randomised, two leaked slots anchor it, and the measurement is 4/4 runs.
+    Case("format_read_leak_pie",
+         r"""#include <stdio.h>
+int main(void){ setvbuf(stdout,0,2,0);
+  char f[128]; char secret[32] = "SECRET-ON-THE-STACK";
+  printf("say: ");
+  if(!fgets(f,sizeof f,stdin)) return 0;
+  printf(f);                                 /* user-controlled format: %p/%s READ, not a write */
+  printf("\n"); return 0; }""",
+         ["-fPIE", "-pie", "-fno-stack-protector", "-O0", "-w"],
+         want_level=2, want_cwe=("CWE-134", "CWE-200"), budget=300.0,
+         mechanism="format-string", strict_level=True,
+         note="BUG CLASS format-string READ, weaponized to the rung it earns: an L2 DISCLOSURE "
+              "PRIMITIVE. The probe confirmed the bug and filed the leaked words, and nothing "
+              "asked what they were WORTH, so a dump that defeats ASLR ranked with one that prints "
+              "padding. Three measurements shaped the fix, all under the sandbox the probe uses "
+              "(sandbox.run, ASLR off), 4 runs each, counting only PLAUSIBLE bases: `disclosed_"
+              "bases` parsed no hex text at all, so a PRINTED pointer was invisible to the one "
+              "function that can resolve it; the recon payload asked for eight %p, and 24 "
+              "directives proved a base 0/4 while 32 and 40 proved it 4/4; and the hex-text "
+              "candidates needed the same POINTER SHAPE test the raw-word scan applies by "
+              "construction -- without it a stack ASCII word (0x4f2d544552434553 is \"SECRET-O\") "
+              "is a 64-bit candidate with a 1-in-4096 chance of matching any curated anchor's page "
+              "offset, and a 32-directive dump duly \"proved\" libc base 0x1f7f6b000."),
 
     Case("uninit_stack_read",
          r"""#include <stdio.h>
@@ -1362,6 +1404,7 @@ int main(void){ setvbuf(stdout,0,2,0); setup(); dump(); return 0; }""",
          ["-fPIE", "-pie", "-fno-stack-protector", "-O0", "-w"],
          want_level=2, want_cwe=("CWE-457", "CWE-200", "CWE-908"), budget=300.0,
          mechanism="uninitialised",
+         strict_level=True,
          note="BUG CLASS uninitialised read WEAPONIZED (CWE-457/908 -> CWE-200 -> L2). Measured "
               "with --ceiling, uninit_stack_read stops at L0: memcheck proves undefined bytes "
               "reached a write syscall, and that was the end of what could be said. The whole L2 "
@@ -1385,8 +1428,15 @@ int main(void){ setvbuf(stdout,0,2,0);
   snprintf(cmd,sizeof cmd,"ping -c1 %s", host);   /* user text spliced into a shell command */
   return system(cmd); }""",
          ["-no-pie", "-O0", "-w"],
-         want_level=0, want_cwe=("CWE-78", "CWE-77", "CWE-88"), budget=300.0,
-         note="INJECTION command (CWE-78): user input spliced into system()"),
+         want_level=3, want_cwe=("CWE-78", "CWE-77", "CWE-88"), budget=300.0,
+         mechanism="command-injection",
+         strict_level=True,
+         note="INJECTION command (CWE-78): user input spliced into system(). L3, and measured at "
+              "L1 before this round: the probe's oracle requires the marker to appear WITHOUT the "
+              "literal `echo <marker>` in the output, so the only way it fires is that the shell "
+              "RAN our command -- demonstrated remote code execution. Everything here was filed "
+              "L1 because the ladder was built around crashes, where L1 is a verified crash and "
+              "the effect is two rungs further on; for an injection the oracle IS the effect."),
 
     Case("path_traversal",
          r"""#include <stdio.h>
@@ -1404,9 +1454,16 @@ int main(void){ setvbuf(stdout,0,2,0);
   size_t n=fread(buf,1,sizeof buf-1,f); buf[n]=0; fclose(f);
   printf("%s", buf); return 0; }""",
          ["-no-pie", "-O0", "-w"],
-         want_level=0, want_cwe=("CWE-22", "CWE-23", "CWE-36"), budget=300.0,
+         want_level=3, want_cwe=("CWE-22", "CWE-23", "CWE-36"), budget=300.0,
+         mechanism="path-traversal",
+         strict_level=True,
          note="INJECTION path traversal (CWE-22): user name concatenated into a path under a base "
-              "directory that EXISTS, so ../ actually resolves and the read can be demonstrated"),
+              "directory that EXISTS, so ../ actually resolves and the read can be demonstrated. "
+              "L3, and measured at L1 before this round: the oracle is /etc/passwd's own content "
+              "coming back, which is the attacker's end goal -- an arbitrary file read -- and not "
+              "a step toward one. A memory leak is levelled differently and deliberately: "
+              "pointer-shaped words out of a stack are chain material, so the format string is "
+              "levelled by what its leak RESOLVES."),
 
     Case("sql_injection",
          r"""#include <stdio.h>
@@ -1425,7 +1482,7 @@ int main(void){ setvbuf(stdout,0,2,0);
          ["-no-pie", "-O0", "-w", "-lsqlite3"],
          want_level=0, want_cwe=("CWE-89", "CWE-943"), budget=300.0,
          requires=("/usr/include/sqlite3.h",),
-         note="INJECTION SQL (CWE-89) through sqlite3_exec, a sink the prober recognises. SKIPS "
+         note="The L3 rule applies here too and could NOT be measured on this host (sqlite3 headers absent, so the case SKIPs): the demand stays at the level that was measured. INJECTION SQL (CWE-89) through sqlite3_exec, a sink the prober recognises. SKIPS "
               "where sqlite3 headers are absent -- an untested sink is not a broken one"),
 
     Case("xxe_injection",
@@ -1447,9 +1504,11 @@ int main(void){ setvbuf(stdout,0,2,0);
   if(txt) xmlFree(txt);
   xmlFreeDoc(d); xmlCleanupParser(); return 0; }""",
          ["-no-pie", "-O0", "-w", "-I/usr/include/libxml2", "-lxml2"],
-         want_level=0, want_cwe=("CWE-611", "CWE-827", "CWE-200"), budget=300.0,
+         want_level=3, want_cwe=("CWE-611", "CWE-827", "CWE-200"),
+         mechanism="xxe", budget=300.0,
          requires=("/usr/include/libxml2/libxml/parser.h",),
-         note="INJECTION XXE (CWE-611) through xmlReadMemory with entity expansion enabled"),
+         strict_level=True,
+         note="L3, measured at L1 before this round: the oracle is /etc/passwd's own content arriving through a SYSTEM entity, which is the file read itself and not a step toward one. INJECTION XXE (CWE-611) through xmlReadMemory with entity expansion enabled"),
 
     Case("ssrf_injection",
          r"""#include <stdio.h>
@@ -1465,7 +1524,7 @@ int main(void){ setvbuf(stdout,0,2,0);
          ["-no-pie", "-O0", "-w", "-lcurl"],
          want_level=0, want_cwe=("CWE-918",), budget=300.0,
          requires=("/usr/include/curl/curl.h",),
-         note="INJECTION SSRF (CWE-918): a user-controlled URL handed to curl. SKIPS without curl "
+         note="The L3 rule applies here too and could NOT be measured on this host (libcurl headers absent, so the case SKIPs): the demand stays at the level that was measured. INJECTION SSRF (CWE-918): a user-controlled URL handed to curl. SKIPS without curl "
               "headers"),
 
     # ---- ALTERNATE WEAPONIZATION. Only ret2win, format-%n and heap FSOP were ever asserted. These
@@ -1525,7 +1584,7 @@ int main(void){ setvbuf(stdout,0,2,0);
                  "#include <cstdio>\n#include <cstring>\n#include <cstdlib>\n#include <unistd.h>\n"
                  "struct Base { virtual void speak(){ puts(\"base\"); } virtual ~Base(){} char buf[32]; };\n"
                  "struct Derived : Base { void speak() override { puts(\"derived\"); } };\n"
-                 "int main(){ setvbuf(stdout,0,2,0);\n"
+                 "int main(){ setvbuf(stdout,0,2,0); setvbuf(stdin,0,2,0);\n"
                  "  Base *o = new Derived();\n"
                  "  for(;;){ printf(\"1.use 2.del 3.write 4.exit\\n> \");\n"
                  "    int c; if(scanf(\"%d\",&c)!=1) return 0; getchar();\n"
@@ -1534,6 +1593,7 @@ int main(void){ setvbuf(stdout,0,2,0);
                  "    else if(c==3){ printf(\"data: \"); read(0, o, 48); }  /* overwrite the vtable ptr */\n"
                  "    else return 0; } }\nEOF\n"
                  "g++ -fno-stack-protector -O0 -w t.cpp -o cpp_uaf"], "cpp_uaf"),
+         strict_level=True,
          note="C++ use-after-free into a virtual call (CWE-416/843): delete leaves the pointer live, "
               "then the vtable pointer is overwritten and the next virtual call dispatches through "
               "it. L2 is this case's CEILING, measured with --ceiling, and it is the fixture's "
@@ -1541,7 +1601,10 @@ int main(void){ setvbuf(stdout,0,2,0);
               "function, so there is no address to aim the forged vtable at -- `_cpp_vtable_uaf` "
               "builds its fake table inline at the reclaimed chunk, which needs the chunk address, "
               "and that is only deterministic with ASLR off. The confirmed lifetime primitive "
-              "(offset-in-chunk + chunk size) is the honest rung here."),
+              "(offset-in-chunk + chunk size) is the honest rung here. stdin is unbuffered for "
+              "the same reason as cpp_uaf_vtable_win: with the default full buffering the first "
+              "scanf drains fd 0 into stdio and the `read(0, obj, 48)` writes nothing at all, so "
+              "the fixture would be asserting a ceiling for an overwrite that never happened."),
 
     #: The same defect with the two things the PIE case cannot have: a reachable win and a fixed
     #: image. `_cpp_vtable_uaf` has been able to finish this chain all along and NOTHING gated it:
@@ -1555,22 +1618,32 @@ int main(void){ setvbuf(stdout,0,2,0);
                  "struct Base { virtual void speak(){ puts(\"base\"); } virtual ~Base(){} char buf[32]; };\n"
                  "struct Derived : Base { void speak() override { puts(\"derived\"); } };\n"
                  "extern \"C\" void win(){ execl(\"/bin/sh\",\"sh\",(char*)0); }\n"
-                 "int main(){ setvbuf(stdout,0,2,0);\n"
-                 "  Base *o = new Derived();\n"
-                 "  for(;;){ printf(\"1.use 2.del 3.write 4.exit\\n> \");\n"
+                 "static Base *o = 0;\n"
+                 "int main(){ setvbuf(stdout,0,2,0); setvbuf(stdin,0,2,0);\n"
+                 "  for(;;){ printf(\"1.new 2.del 3.write 4.use 5.exit\\n> \");\n"
                  "    int c; if(scanf(\"%d\",&c)!=1) return 0; getchar();\n"
-                 "    if(c==1) o->speak();                 /* virtual call, usable after delete */\n"
-                 "    else if(c==2) delete o;              /* pointer not nulled: UAF */\n"
-                 "    else if(c==3){ printf(\"data: \"); read(0, o, 48); }  /* overwrite the vtable ptr */\n"
+                 "    if(c==1) o = new Derived();        /* the allocating option */\n"
+                 "    else if(c==2) delete o;            /* pointer not nulled: UAF */\n"
+                 "    else if(c==3){ if(o){ printf(\"data: \"); read(0, o, 48); } }\n"
+                 "    else if(c==4){ if(o) o->speak(); } /* the dangling virtual call */\n"
                  "    else return 0; } }\nEOF\n"
                  "g++ -no-pie -fno-stack-protector -O0 -w w.cpp -o cpp_uaf_win"], "cpp_uaf_win"),
          note="C++ use-after-free -> VTABLE HIJACK to a win (CWE-416/843 -> control flow). Same "
               "defect as cpp_uaf_vtable, which measures L2 because g++ builds PIE and that fixture "
               "has no win: there is no address to aim a forged vtable at. Non-PIE and with a win "
-              "reachable, the fake table is built INLINE in the reclaimed chunk (slot 0 -> chunk+8, "
-              "every following word -> win), so a `mov rax,[obj]; call [rax+N]` dispatch enters win "
-              "for every small N with no leak and no fixture gadget. The engine could already do "
-              "this and nothing in the table demanded it."),
+              "reachable, the fake table is built INLINE in the reclaimed chunk (slot 0 -> "
+              "chunk+8, every following word -> win), so a `mov rax,[obj]; call [rax+N]` dispatch "
+              "enters win for every small N with no leak and no fixture gadget. The engine could "
+              "already do this and nothing in the table demanded it. The menu is the shape "
+              "`_cpp_vtable_uaf` documents and SEARCHES for -- an option that allocates, then the "
+              "rest permuted as (free, edit, use). Measured: with the allocation done once at "
+              "startup instead (cpp_uaf_vtable's shape) the search cannot succeed, because the "
+              "only `use` option is needed as the detonator and `new` then has to be the quit "
+              "entry, which ends the process before the sequence starts. stdin is UNBUFFERED on "
+              "purpose: with the default full buffering the first `scanf` slurps a 4 KiB block "
+              "off fd 0 into stdio, so the `read(0, obj, 48)` that follows finds the descriptor "
+              "already drained and writes nothing -- the overwrite silently never happens, which "
+              "is what the first version of this fixture measured."),
 
     # ---- PARAMETER-DRIVEN. A tool that refuses to run without its flags is a channel of its own:
     # nothing happens on any input until the required option is supplied.
@@ -1933,7 +2006,9 @@ def _scored(maxlvl, demod, case, file_type=None):
     # satisfy the level test, or `maxlvl >= 0` makes every such case pass unconditionally (which
     # silently turned three bug-class cases green while they produced nothing but STATIC findings).
     lvl_ok = bool(case.want_level) and maxlvl >= case.want_level
-    ok = lvl_ok or bool(demod)
+    # `strict_level` makes the level the only way through; see the field's own note for the
+    # measurement that asked for it.
+    ok = lvl_ok if (case.want_level and case.strict_level) else (lvl_ok or bool(demod))
     # Stop early only on the LEVEL when one is claimed: a demonstrated want_cwe finding often turns
     # up earlier and from a weaker stage, and stopping on it would cut the case short of its own
     # claim. With no level claimed, the want_cwe finding IS the claim, so stop on it.

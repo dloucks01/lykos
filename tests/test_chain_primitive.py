@@ -441,3 +441,25 @@ def test_leak_slots_prefer_a_function_the_program_has_certainly_called():
     resolves no libc base -- so the read order is what makes the leak work on the first try."""
     order = chain._LEAK_SLOT_ORDER
     assert order.index("setvbuf") < order.index("printf") < order.index("exit")
+
+
+def test_the_cpp_vtable_pass_does_not_trust_one_encoding():
+    """Three inferences had to stop being trusted alone before this hijack fired, each measured on
+    a `1.new 2.del 3.write 4.use` notebook:
+
+      * ONE width for the whole program. A C++ notebook reads its menu choice line-wise and ONE
+        data option reads a fixed block (`read(0, obj, 48)`) -- that single raw read made the
+        crawl call the target 48-byte fixed-width, so every option selector went out padded to 48
+        bytes and 46 bytes of filler desynced the menu.
+      * An index after every selector. A program that does not read one leaves it in the pipe,
+        where the next `read(0, obj, 48)` swallows it and the forged vtable pointer lands two
+        bytes into the object.
+      * The payload sized from the ALLOCATION. `new Derived()` asks for 40 bytes and the read
+        wants 48, so the write was eight bytes short: it ate the detonating option's own bytes and
+        then waited for more, and the capture came back "no fatal signal"."""
+    import inspect
+    src = inspect.getsource(chain._cpp_vtable_uaf)
+    assert "[width, None]" in src and "send_idx in (True, False)" in src
+    at = inspect.getsource(chain._cpp_vtable_uaf_at)
+    assert "max(size, int(pad_to or 0))" in at, "a fixed-width read must get its full width"
+    assert "sel + menu._scalar(str(idx).encode(), width) if send_idx else sel" in at

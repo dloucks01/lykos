@@ -528,13 +528,21 @@ def _primitive_txt(prim: dict) -> bytes:
     return ("\n".join(lines)).encode()
 
 
-# what each level proves and what a successful run looks like
+# What each level proves and what a successful run looks like.
+#
+# Worded for every class this ladder now carries, not just memory corruption. An injection PoC
+# never crashes and hijacks nothing -- its oracle is the effect itself (the shell ran our command,
+# the database returned our row, /etc/passwd came back) -- and at L3 the old text promised the
+# reader a control-flow hijack that the bundle does not contain.
 _LEVEL_MEANING = {
     "L0": "a crash reproducer -- the input makes the target fault",
-    "L1": "a verified crash reproducer -- the crash is real and repeatable",
-    "L2": "an exploitation PRIMITIVE -- attacker control of the instruction pointer or a "
-          "memory read/write (not merely a crash); see PRIMITIVE.txt",
-    "L3": "a working EXPLOIT -- control flow is hijacked to attacker-chosen code",
+    "L1": "a verified reproducer -- the defect is real and repeatable (a crash, or a confirmed "
+          "injection whose effect was observed)",
+    "L2": "an exploitation PRIMITIVE -- attacker control of the instruction pointer, a memory "
+          "read/write, or a disclosure that resolves an address (not merely a crash); see "
+          "PRIMITIVE.txt",
+    "L3": "a working EXPLOIT -- the attacker's own effect happens: control flow hijacked to "
+          "attacker-chosen code, or an injected command, query or file read carried out",
 }
 
 

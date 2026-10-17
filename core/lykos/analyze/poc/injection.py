@@ -31,10 +31,13 @@ def cmdi_confirm(out: bytes, payload: str, marker: str) -> bool:
 #: How many `%p` the recon payload asks for. Eight was the original width and it CONFIRMS the bug
 #: (two interpreted directives are proof enough) while resolving nothing: the pointers that anchor a
 #: base -- the saved return into the image, a libc pointer -- sit deeper than the eighth varargs
-#: slot. Measured on the format-string read fixture, 4 runs each: 8 and 12 directives proved a base
-#: 0/4, and 24 proved it 4/4, on both PIE and non-PIE. The short payload stays, and is tried after,
-#: for a sink whose buffer truncates the long one.
-_FMT_DEEP = 24
+#: slot. Measured under the sandbox the probe actually uses (`sandbox.run`, ASLR off), 4 runs each,
+#: counting only PLAUSIBLE bases: 24 directives proved one 0/4 on both fixtures, 32 proved the PIE
+#: image base 4/4, and 40 proved a base 4/4 on PIE and non-PIE alike -- the depth at which the dump
+#: reaches a libc pointer that a curated anchor matches. The short payloads stay, and are tried
+#: after, for a sink whose buffer truncates this one (a truncated format string still interprets
+#: the directives that fit, so the confirmation is not lost either way).
+_FMT_DEEP = 40
 
 
 def fmt_payloads(marker: str):
@@ -129,28 +132,58 @@ def xxe_payloads(marker=None):
 
 
 # name -> {cwe, severity, sinks, payloads(marker)->list, confirm(out,payload,marker)->bool, title}
+#: WHAT A CONFIRMATION PROVES, which is not the same for every class and decides the rung.
+#:
+#: Every PoC here was filed at L1 -- "the defect is real, here is a reproducer" -- because the
+#: ladder was built around crashes, where L1 means a verified crash and the effect is two rungs
+#: further on. For an injection there is no crash and the oracle is the effect itself: the marker
+#: appears in the output only because the shell RAN our `echo`, the DB returned our row, or
+#: /etc/passwd came back. That is the end of the chain, not a step in it, and filing demonstrated
+#: command execution one rung above "identified" understates every injection this platform finds.
+#:
+#: A MEMORY leak is the exception and stays where it is: pointer-shaped words out of a stack are
+#: chain material, not an end effect, so the format string is levelled by whether its leak
+#: RESOLVES a base (an L2 disclosure primitive) -- see inject_stage.
+_PROVES_EFFECT = "effect"           # the oracle showed the attacker's end goal happen -> L3
+_PROVES_CAPABILITY = "capability"   # the oracle showed only that the sink is reachable -> L2
+_PROVES_LEAK = "leak"               # a memory disclosure: levelled by what it resolves
+
+
+def sqli_returned_data(out: bytes, payload, marker: str) -> bool:
+    """Did the DATABASE hand back the attacker's row (the UNION branch of `sqli_confirm`), or did
+    only an error prove the string reaches the parser? The first is data disclosure demonstrated;
+    the second is control of the query -- a primitive -- and the two are different rungs."""
+    mk = marker.encode()
+    pb = payload if isinstance(payload, bytes) else str(payload).encode()
+    return mk in out and pb not in out
+
+
 PROBES = {
     "command-injection": {
         "cwe": "CWE-78", "severity": "critical",
         "sinks": {"system", "popen", "execl", "execlp", "execv", "execve", "execvp"},
         "payloads": lambda m: cmdi_payloads(m), "confirm": cmdi_confirm,
+        "proves": _PROVES_EFFECT,
         "title": "OS command injection", "binary": False},
     "format-string": {
         "cwe": "CWE-134", "severity": "high",
         "sinks": {"printf", "fprintf", "sprintf", "snprintf", "vprintf", "vfprintf",
                   "syslog", "err", "warn"},
         "payloads": lambda m: fmt_payloads(m), "confirm": fmt_confirm,
+        "proves": _PROVES_LEAK,
         "title": "Format string", "binary": True},
     "path-traversal": {
         "cwe": "CWE-22", "severity": "high",
         "sinks": {"fopen", "fopen64", "open", "open64", "freopen"},
         "payloads": lambda m: traversal_payloads(), "confirm": traversal_confirm,
+        "proves": _PROVES_EFFECT,
         "title": "Path traversal", "binary": True},
     "ssrf": {
         "cwe": "CWE-918", "severity": "high",
         # a user-controlled URL handed to an HTTP/URL client. curl is the dominant C one.
         "sinks": {"curl_easy_setopt", "curl_easy_perform", "curl_easy_init", "curl_url_set"},
         "payloads": lambda m: ssrf_payloads(m), "confirm": traversal_confirm,
+        "proves": _PROVES_EFFECT,
         "title": "Server-side request forgery (SSRF)", "binary": True},
     "xxe": {
         "cwe": "CWE-611", "severity": "high",
@@ -160,6 +193,7 @@ PROBES = {
                   "xmlParseFile", "xmlParseDoc", "xmlCtxtReadMemory", "xmlCtxtReadFile",
                   "xmlCtxtReadDoc", "xmlParseDocument", "XML_Parse"},
         "payloads": lambda m: xxe_payloads(m), "confirm": traversal_confirm,
+        "proves": _PROVES_EFFECT,
         "title": "XML external entity (XXE)", "binary": True},
     "sql-injection": {
         "cwe": "CWE-89", "severity": "critical",
@@ -168,5 +202,6 @@ PROBES = {
         "sinks": {"sqlite3_exec", "sqlite3_get_table", "sqlite3_prepare", "sqlite3_prepare_v2",
                   "mysql_query", "mysql_real_query", "PQexec", "PQexecParams"},
         "payloads": lambda m: sqli_payloads(m), "confirm": sqli_confirm,
+        "proves": _PROVES_EFFECT,
         "title": "SQL injection", "binary": True},
 }

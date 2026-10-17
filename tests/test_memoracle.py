@@ -307,7 +307,6 @@ def test_an_uninitialised_read_can_disclose_the_image_base(tmp_path, gcc):
     import subprocess
 
     import pytest
-
     from lykos.analyze.poc import leak
     c = tmp_path / "u.c"; c.write_text(_UNINIT_PTR_SRC)
     exe = tmp_path / "u"

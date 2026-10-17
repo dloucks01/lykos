@@ -189,6 +189,31 @@ def _leaked_words(out: bytes, marker: str):
     return words, ascii_hits
 
 
+def _level_for(spec, hit, bases) -> str:
+    """The rung this confirmation earns. See `injection._PROVES_EFFECT`: for an injection the
+    oracle IS the effect -- the shell ran our `echo`, the database returned our row, /etc/passwd
+    came back -- so a confirmed one is a DEMONSTRATED EFFECT (L3), not a verified defect awaiting
+    weaponization. Everything here was filed L1 because the ladder was built around crashes.
+
+    Two deliberate exceptions, both measured rather than assumed:
+
+      * A memory leak is chain material, not an end effect. The format string is levelled by what
+        its leak RESOLVES: a corroborated image/libc base is an L2 disclosure primitive, and a
+        dump of stack padding stays L1 however many words it printed.
+      * Error-based SQL injection proves the string reaches the parser and nothing more -- control
+        of the query, which is a primitive (L2). The UNION branch, where the DATABASE hands back
+        the attacker's row, is the effect (L3)."""
+    proves = spec.get("proves")
+    if proves == injection._PROVES_LEAK:
+        return "L2" if (bases or {}).get("proved") else "L1"
+    if proves == injection._PROVES_EFFECT:
+        if spec.get("cwe") == "CWE-89" and not injection.sqli_returned_data(
+                hit.get("out") or b"", hit.get("payload") or b"", hit.get("marker") or ""):
+            return "L2"
+        return "L3"
+    return "L2" if proves == injection._PROVES_CAPABILITY else "L1"
+
+
 def _fmt_bases(ctx, target, hit):
     """What a format string's leak PROVES, not just that it leaked. `%p` output is pointer-shaped
     text, and a disclosure of stack padding and a disclosure of the image base are both "memory
@@ -317,7 +342,7 @@ def _finalize(ctx, target, target_bytes, spec, hit):
     # defeats ASLR ranked with one that prints padding. An anchored base is a disclosure PRIMITIVE,
     # the same rung the out-of-bounds read arm claims for the same evidence.
     bases = _fmt_bases(ctx, target, hit) if spec.get("cwe") == "CWE-134" else {}
-    level = "L2" if bases.get("proved") else "L1"
+    level = _level_for(spec, hit, bases)
     meta = {"target_sha256": target.sha256, "arch": target.arch, "input_mode": mode,
             "argv": run_argv, "level": level, "cwe": spec["cwe"], "injection": spec["title"],
             "tool_version": TOOL_VERSION}

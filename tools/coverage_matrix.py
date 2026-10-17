@@ -122,6 +122,18 @@ def oracle_of(case) -> str:
     return "signal + guard page"
 
 
+#: One ISA, one column. The conformance cases name a substrate by their CROSS-COMPILER prefix and
+#: the ISA ladder names it by the engine's own arch label, and for four architectures those are
+#: different words for the same thing -- so the grid grew `q:riscv64` beside `q:riscv`, `q:s390x`
+#: beside `q:s390`, `q:powerpc64` beside `q:ppc64`. Both halves then read as half-covered: the
+#: conformance case for an ISA demands L1 (it is there to prove the pipeline REACHES the
+#: architecture), the ladder case measures L3 on the same toolchain, and splitting them showed
+#: four cells at L1 that are L3 **[measured: the same `riscv64-linux-gnu-gcc` in both]**.
+_ISA_ALIAS = {"powerpc": "ppc", "powerpc64": "ppc64", "powerpc64le": "ppc64le",
+              "riscv64": "riscv", "s390x": "s390", "sparc64": "sparcv9", "sh4": "sh",
+              "loongarch64": "loongarch"}
+
+
 def substrate_of(case) -> str:
     """A SHORT label, because this is a grid: `q:mips64el` has to fit in a column."""
     ft = (getattr(case, "want_file_type", "") or "").lower()
@@ -130,7 +142,8 @@ def substrate_of(case) -> str:
                 "wasm": "wasm", "dotnet": "clr"}.get(ft, ft[:7])
     cross = (getattr(case, "cross", "") or "")
     if cross:
-        return "wine" if "mingw" in cross else "q:" + cross.split("-")[0]
+        isa = cross.split("-")[0]
+        return "wine" if "mingw" in cross else "q:" + _ISA_ALIAS.get(isa, isa)
     if getattr(case, "as_source", False):
         return "src"
     if "firmware" in case.name:
