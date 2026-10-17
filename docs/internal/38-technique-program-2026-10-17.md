@@ -216,6 +216,9 @@ same length on the same channel**, which is what makes the marker mean anything:
 proves a shell by writing `echo <marker>` and reading it back, so a target that merely echoed its
 stdin would otherwise pass without executing a thing.
 
+`jit_page_executed` now PASSes **L3** through the autopilot in 103s, filing
+`build_exploit/CWE-94` — the one rung the gate found that the catalogue had not asked for.
+
 ## The allocator facts this round measured
 
 Worth separating from the techniques, because they invalidate recipes across the board and none of

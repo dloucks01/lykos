@@ -1840,7 +1840,8 @@ int main(void){ setvbuf(stdout,0,2,0);
               "is 25 bytes of position-independent execve(\"/bin/sh\") on stdin -- no offset, no "
               "gadget, no leak -- so `_self_exec_exploit` runs before every strategy that needs "
               "an offset, gated on an mprotect/mmap import, and confirms with an int3 negative "
-              "control at the same length so a target that merely echoes the marker cannot pass."),
+              "control at the same length so a target that merely echoes the marker cannot pass. "
+              "Measured after: PASS L3, build_exploit/CWE-94, 103s."),
 
     # ---- SECOND WAVE: mechanisms whose DETECTOR may or may not exist. Each of these lands at
     # want_level=0 / want_cwe=() for the same reason as the wave above -- the case is the
