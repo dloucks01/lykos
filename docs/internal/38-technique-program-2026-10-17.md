@@ -19,9 +19,10 @@ of Apple 2 (one-piece, split, and the cell form for a one-word-at-a-time writer 
 pointer, vtable, indexed-write GOT), and — new — the WASM indirect-call redirect, the stack pivot,
 `setcontext` register control, and House of Cat (`_IO_list_all` → a FILE that is entirely ours).
 
-**Knowledge-base only:** fastbin_dup, House of Spirit, House of Force, unlink, unsorted-bin
-attack. The large-bin attack and tcache stashing are now knowledge-base *with measured verdicts*
-and emitted chains whose every constant was measured on the libc in hand (below).
+**Knowledge-base, now with measured verdicts** — every entry's primitive, preconditions and
+emitted chain are decided against the libc in hand (`Env(libc_data=...)`), and each says UNKNOWN
+rather than guessing when handed no libc: fastbin_dup, House of Spirit, House of Force, safe
+unlink, unsorted-bin attack, tcache stashing, large-bin attack.
 
 **Absent:** `__exit_funcs`/`atexit` and TLS `dtor_list`; House of Apple 1/3;
 `tcache_perthread_struct`; ret2vdso; JOP/COP; canary byte-brute against a forking server;
@@ -149,14 +150,66 @@ glibc actually installed here, not textbook order.
 
    `tcache_perthread_struct` stays absent: it is an amplifier on top of tcache poisoning (which is
    already driven), not a way in, so it waits for a target that needs it.
-5. **fastbin_dup.** The pre-tcache double-free, still reachable by filling the tcache bin first;
-   the fallback when the chunk size is above the tcache ceiling.
-6. **House of Spirit.** Free a fake chunk inside a buffer we control, and malloc hands it back —
-   the route when the program frees a pointer we can influence but never allocates for us.
-7. **Safe unlink.** Narrow on modern glibc (`P->fd->bk == P` must hold), but the shape it needs —
-   a global array of object pointers — is exactly what every notebook fixture has.
-8. **Unsorted-bin attack.** Writes `main_arena+96` to a chosen address: not arbitrary data, so
-   the deliverable is a counter/size overwrite (e.g. `global_max_fast`), stated as such.
+5. ~~**fastbin_dup**~~ — **DEAD ON 2.43, and not because of a check: THERE ARE NO FASTBINS.**
+
+   One probe binary, run against two libcs, settles it:
+
+   | | glibc 2.35 | glibc 2.43 |
+   |---|---|---|
+   | tcache capacity (chunk 0x20) | 7 | **16** |
+   | where the next free lands | **FASTBIN** (mangled `fd`, `bk` untouched) | **a BIN** (`fd` *and* `bk` are arena pointers) |
+   | `double free or corruption (fasttop)` | present | **absent** |
+   | `mallopt mxfast` (sets `global_max_fast`) | present | **absent** |
+
+   `heap.fastbins_present()` reads that verdict out of the bytes and
+   `heap.post_tcache_destination()` confirms it live; a test asserts the two agree, in opposite
+   directions, on both libcs. The entry stays listed where the size fits — an omitted technique
+   reads as "not considered" — and carries the refusal plus a pointer at tcache_poisoning (already
+   driven) and tcache_stashing.
+
+6. ~~**House of Spirit**~~ — **DONE: it did not die with the fastbins, it MOVED.**
+
+   The classic framing ("forge a fastbin-size chunk") is void on 2.43, but the technique is not:
+   the entry now follows the forged chunk to wherever this libc actually puts it and names the
+   checks it has to survive there. A tcache-range chunk lands in the **tcache**, where the
+   constraints are 16-byte alignment (`free(): unaligned chunk detected in tcache 2`), a size
+   field whose tcache index matches the bin, and a `key` word that must not already equal
+   `tcache_key` (`free(): double free detected in tcache 2`) — and, notably, **no next-size
+   check**, which makes it *easier* than the fastbin form, not harder. Anything above the ceiling
+   lands in a bin and faces the full set.
+
+7. ~~**Safe unlink**~~ — **DONE as a constrained write, with the constraint named.**
+   `heap.guard_sites` reports `corrupted double-linked list` at **two sites on both 2.35 and
+   2.43**, so the forged `fd`/`bk` must satisfy `fd->bk == P && bk->fd == P`. That is what makes
+   this a write of `&P-0x18` *into P*, not an arbitrary value at an arbitrary address — plus
+   `corrupted size vs. prev_size`, so the forged `prev_size` has to match the fake size exactly.
+   The entry says so instead of calling it "near-arbitrary".
+
+8. ~~**Unsorted-bin attack**~~ — **DONE as a refusal with a redirect.**
+   `malloc(): unsorted double linked list corrupted` is at **two sites on both libcs**: the scan
+   verifies `bck->fd == victim`, so TARGET must already hold `&victim` and the write is not free.
+   The entry says BLOCKED, and points at tcache_stashing, whose stashing unlink is the one glibc
+   still does not check. It also drops the classic worked example where it does not apply:
+   `global_max_fast` is the usual thing to overwrite with "an unchosen large value", and on a libc
+   with no fastbins that variable does not exist.
+
+## The allocator facts this round measured
+
+Worth separating from the techniques, because they invalidate recipes across the board and none of
+them is what the literature says:
+
+* **the tcache holds 16 chunks per bin on glibc 2.43**, not 7 (`heap.tcache_capacity()`);
+* **there are no fastbins on 2.43** (`heap.fastbins_present()`, `post_tcache_destination()`);
+* **`calloc` no longer bypasses the tcache**; `memalign` above 0x10 alignment and a growing
+  `realloc` still do (`heap.tcache_bypass_allocators()`);
+* **the large-bin insertion's short branch is now guarded** (two sites on 2.43, one on 2.35), so
+  that attack is a pointer swap rather than an arbitrary write (`heap.large_bin_guard()`);
+* **the tcache-stashing unlink is still unguarded** on both (`heap.smallbin_stash_guard()`).
+
+Every one of these is answered by `heap.guard_sites()` (count the jumps reaching a check's error
+string) or by a compiled probe, never by a version table — and the probes calibrate rather than
+threshold, because `tcache_key` is a full-width random word that passes any "looks like a libc
+pointer" test and will otherwise make a tcache entry look like a binned chunk.
 
 ## Two that end in a verdict rather than a chain
 

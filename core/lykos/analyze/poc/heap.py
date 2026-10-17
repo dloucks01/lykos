@@ -697,6 +697,115 @@ def tcache_bypass_allocators(libc_path=None) -> dict:
         shutil.rmtree(d, ignore_errors=True)
 
 
+# --- are there fastbins at all? ------------------------------------------------------------------
+#
+# A whole family of techniques (fastbin_dup, and House of Spirit's classic form) exists because a
+# fastbin free is the cheapest one in the allocator: a singly-linked push with almost no checks.
+# On this host that family has no ground to stand on, and not because of a new check -- measured
+# with ONE probe binary run against two libcs:
+#
+#   glibc 2.35: the 7th free leaves the tcache and lands in a FASTBIN (mangled `fd`, `bk`
+#               untouched), and the libc carries both `double free or corruption (fasttop)` and
+#               the `mallopt mxfast` knob that sets `global_max_fast`.
+#   glibc 2.43: the 17th free leaves the tcache and lands in a BIN (`fd` AND `bk` are arena
+#               pointers), and the libc carries NEITHER string.
+#
+# So fastbins are gone from 2.43. fastbin_dup has nothing to dup into, and House of Spirit has to
+# aim its forged chunk at the TCACHE instead -- which is still reachable but has its own checks
+# (alignment, size, and the double-free key), so it is a different recipe rather than the same one
+# at a different size.
+_FASTTOP_MSG = b"double free or corruption (fasttop)\x00"
+
+
+def fastbins_present(libc_data: bytes) -> dict:
+    """Whether this libc still has fastbins, decided from its bytes: the `fasttop` double-free
+    check and the `mxfast` knob that sets `global_max_fast` both exist only where fastbins do.
+
+    Returns {present, glibc, reason}. `present` is None when the evidence disagrees, which is a
+    result and not a default -- a caller must not quietly assume either way."""
+    from . import rop
+    v = rop.libc_version(libc_data)
+    ver = ".".join(str(x) for x in v) if v else "?"
+    fasttop = libc_data.find(_FASTTOP_MSG) >= 0
+    mxfast = libc_data.find(b"memory_mallopt_mxfast") >= 0
+    if fasttop and mxfast:
+        return {"present": True, "glibc": ver,
+                "reason": f"glibc {ver}: the fasttop double-free check and the mxfast knob are "
+                          "both here, so fastbins exist"}
+    if not fasttop and not mxfast:
+        return {"present": False, "glibc": ver,
+                "reason": f"glibc {ver}: neither the `fasttop` double-free check nor the `mxfast` "
+                          "knob that sets global_max_fast is in this libc -- FASTBINS ARE GONE, "
+                          "so a free past the tcache goes straight to a bin. Every technique "
+                          "whose first step is 'reach the fastbin' has nothing to reach"}
+    return {"present": None, "glibc": ver,
+            "reason": f"glibc {ver}: the evidence disagrees (fasttop check: {fasttop}, mxfast "
+                      "knob: {mxfast}) -- measure where a freed chunk actually lands with "
+                      "`post_tcache_destination` before relying on either answer"}
+
+
+def post_tcache_destination(libc_path=None, chunk_size: int = 0x30):
+    """Where a chunk of `chunk_size` actually goes once its tcache bin is full, MEASURED: free
+    same-size chunks until one stops carrying the tcache key, then read its two words.
+
+    "fastbin" -- `fd` is a mangled pointer and `bk` is untouched;
+    "bin"     -- `fd` and `bk` are both arena pointers;
+    None      -- no compiler, or the chunk never left the tcache.
+
+    This is the live half of `fastbins_present`, and it is the one that settles it: the strings say
+    what the libc was built with, this says what the allocator does."""
+    import os
+    import shutil
+    import subprocess
+    import tempfile
+    key = (os.path.realpath(libc_path) if libc_path else "system", int(chunk_size))
+    cache = getattr(post_tcache_destination, "_cache", None)
+    if cache is None:
+        cache = post_tcache_destination._cache = {}
+    if key in cache:
+        return cache[key]
+    gcc = shutil.which("gcc") or shutil.which("cc")
+    if not gcc:
+        cache[key] = None
+        return None
+    req = max(0x18, int(chunk_size) - 8)
+    d = tempfile.mkdtemp(prefix="lykos-fastbin-")
+    try:
+        src = os.path.join(d, "a.c")
+        with open(src, "w") as f:
+            f.write('#include <stdio.h>\n#include <stdlib.h>\n#include <stdint.h>\n'
+                    '#define M 128\n'
+                    'int main(void){ void *v[M], *g[M]; uintptr_t key = 0;\n'
+                    '  for (int i=0;i<M;i++){ v[i]=malloc(%d); g[i]=malloc(%d); }\n'
+                    '  for (int i=0;i<M;i++){ free(v[i]);\n'
+                    '    uintptr_t fd=((uintptr_t*)v[i])[0], bk=((uintptr_t*)v[i])[1];\n'
+                    '    if (i==0){ key = bk; continue; }\n'
+                    '    if (bk != key){ puts(bk ? "bin" : "fastbin"); return 0; } }\n'
+                    '  puts("tcache"); return 0; }\n' % (req, req))
+        exe = os.path.join(d, "a")
+        env = dict(os.environ)
+        argv = [exe]
+        if libc_path:
+            ldir = os.path.dirname(os.path.realpath(libc_path))
+            ld = os.path.join(ldir, "ld-linux-x86-64.so.2")
+            if os.path.exists(ld):                     # run the SAME binary against that libc
+                argv = [ld, "--library-path", ldir, exe]
+            else:
+                env["LD_LIBRARY_PATH"] = ldir + ":" + env.get("LD_LIBRARY_PATH", "")
+        if subprocess.run([gcc, "-O0", "-w", src, "-o", exe], capture_output=True).returncode:
+            cache[key] = None
+            return None
+        out = subprocess.run(argv, capture_output=True, text=True, timeout=20, env=env).stdout
+        got = out.strip()
+        cache[key] = got if got in ("bin", "fastbin") else None
+        return cache[key]
+    except Exception:                                  # noqa: BLE001 -- a probe, never fatal
+        cache[key] = None
+        return None
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def smallbin_index(chunk_size: int) -> int:
     """glibc's `smallbin_index` for 64-bit: the bin a chunk under 0x400 lands in."""
     return chunk_size >> 4
