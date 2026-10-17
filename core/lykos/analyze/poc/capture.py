@@ -39,8 +39,19 @@ def materialize_helper() -> Path:
     return p
 
 
-def make_capture(ctx, helper: Path, exe, mode, base_argv, timeout, python):
-    """Return capture(data)->dict: run `exe` on `data` (via `mode`) under the ptrace helper."""
+def make_capture(ctx, helper: Path, exe, mode, base_argv, timeout, python, *,
+                 guard_page: bool = False):
+    """Return capture(data)->dict: run `exe` on `data` (via `mode`) under the ptrace helper.
+
+    `guard_page` preloads the guard-page allocator into the TRACED CHILD -- never into this
+    helper -- for a crash that was FOUND under it. Measured, and it is the trap the oracle
+    itself creates: an over-read of 64 bytes past a 64-byte chunk faults only when every
+    allocation sits against an unmapped page, so the campaign found ten such crashes in the
+    `dump=` branch of the address-leak fixture and the L2 stage replied "cyclic pattern did not
+    fault" to all of them -- it was re-running them unguarded, where they are silent. An oracle
+    whose crashes the next stage cannot see is worse than no oracle: it manufactures findings
+    that die at the next rung.
+    """
     work = helper.parent
 
     def capture(data: bytes, breakpoints=None) -> dict:
@@ -84,6 +95,13 @@ def make_capture(ctx, helper: Path, exe, mode, base_argv, timeout, python):
         env.setdefault("TSAN_OPTIONS", "halt_on_error=1:abort_on_error=1")
         # Same for UBSan, whose default is also to print and continue.
         env.setdefault("UBSAN_OPTIONS", "halt_on_error=1:abort_on_error=1")
+        if guard_page:
+            # Through spec["env"], which the helper applies with execve to the child alone; the
+            # tracer is python and must not have an allocator shim preloaded under it.
+            from ..dynamic import memoracle
+            _lib = memoracle.dislocator_lib()
+            if _lib:
+                env.setdefault("LD_PRELOAD", str(_lib))
         spec["env"] = env
         if breakpoints:
             spec["breakpoints"] = [int(a) for a in breakpoints]

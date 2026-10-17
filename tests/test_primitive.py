@@ -513,9 +513,19 @@ def test_address_primitive_separates_control_from_a_wild_pointer():
     assert w["access"] == "write" and w["cwe"] == "CWE-787"
     assert w["effect_kind"] == "arbitrary-write"
 
-    # two different faulting instructions are two defects, not one primitive
-    assert P.address_primitive([("a", cap(1, pc=1)), ("b", cap(2, pc=2)),
-                                ("c", cap(3, pc=3))]) is None
+    # Faults in two different ROUTINES are two defects, not one primitive.
+    assert P.address_primitive([("a", cap(1, pc=0x401000)), ("b", cap(2, pc=0x502000)),
+                                ("c", cap(3, pc=0x603000))]) is None
+    # ...but several instructions of ONE routine are one defect. glibc's memcpy faults at
+    # whichever instruction of its unrolled loop runs off the end, so the PC moves with the
+    # alignment while the defect does not: measured on the address-leak fixture, 8 of 13
+    # variants faulted with 2 distinct addresses and an exact-PC rule discarded all of it.
+    unrolled = [("orig", cap(0x7fff1000, pc=0x401120)),
+                ("byte@6=0xff", cap(0x7fff2000, pc=0x401135)),
+                ("byte@7=0xff", cap(0x7fff2000, pc=0x401140))]
+    u = P.address_primitive(unrolled, disasm="rep movsb")
+    assert u and u["controlled"] and u["max_level"] == 2
+    assert len(u["faulting_pcs"]) == 3 and "one routine" in u["note"]
     # an address that moves between runs of the SAME input is not input-controlled
     nd = P.address_primitive([("orig", cap(0x1000)), ("orig", cap(0x9000)),
                               ("byte@1=0xff", cap(0x5000))])

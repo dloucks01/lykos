@@ -125,7 +125,6 @@ def test_the_guard_page_turns_a_silent_heap_read_into_a_fault(tmp_path, gcc):
     an oracle that depends on bubblewrap being available.
     """
     import pytest
-
     from lykos.analyze.dynamic import sandbox
     exe = _build_silent_oob(tmp_path, gcc)
     if exe is None:
@@ -155,7 +154,6 @@ def test_the_guard_page_declines_where_it_cannot_apply(tmp_path, gcc):
     instruments every allocation -- layering this on either is how an oracle becomes a crash
     that is not the target's fault."""
     import pytest
-
     from lykos.analyze.dynamic import sandbox
     if M.dislocator_lib() is None:
         pytest.skip("libdislocator not installed here")
@@ -181,7 +179,6 @@ def test_a_static_binary_is_not_claimed_as_guarded(tmp_path, gcc):
     import subprocess
 
     import pytest
-
     from lykos.analyze.dynamic import sandbox
     src = tmp_path / "s.c"; src.write_text("int main(void){return 0;}")
     static = tmp_path / "s"

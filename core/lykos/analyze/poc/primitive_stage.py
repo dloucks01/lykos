@@ -378,6 +378,22 @@ def _host_libc_bytes() -> bytes:
     return b""
 
 
+def _crash_isolation(ctx, target, input_sha) -> str:
+    """The isolation tag the run that FOUND this input recorded, or "".
+
+    The record of HOW a crash was produced, which the stages that re-run it have to honour: a
+    libFuzzer harness, a prompted delivery, a socket -- and now a guard-page allocator.
+    """
+    try:
+        from ...db.dao import DynResultDAO
+        for r in DynResultDAO(ctx.conn).list_by_target(target.id):
+            if r.input_sha == input_sha and r.isolation:
+                return str(r.isolation)
+    except Exception:                                    # noqa: BLE001 -- advisory
+        observe.absorbed(_log, "answering unknown isolation")
+    return ""
+
+
 def _plain_for_disclosure(ctx, target):
     """(exe, binary-bytes) of an UNINSTRUMENTED build to observe a disclosure on, or None.
 
@@ -434,11 +450,10 @@ def _address_disclosure(ctx, target, mode, base_argv, orig, prim, timeout):
     Returns the disclosure dict, or None when the fault is a write, no lever was isolated, every
     steered variant still crashes, or nothing recoverable reached the output.
     """
-    if prim.get("access") != "read" or prim.get("offset") is None:
+    if prim.get("access") != "read":
         return None
-    off = int(prim["offset"])
-    if off >= len(orig):
-        return None
+    off = prim.get("offset")
+    off = int(off) if off is not None and int(off) < len(orig) else None
     from . import leak as _leak
     try:
         staged = _plain_for_disclosure(ctx, target)
@@ -454,11 +469,19 @@ def _address_disclosure(ctx, target, mode, base_argv, orig, prim, timeout):
         # survives, prints 128 zero bytes and resolves nothing, while index 0 runs off the end of
         # the object into the adjacent chunk and hands back a live code pointer. The question the
         # experiment exists to answer is whether a BASE comes back, so ask it per survivor.
+        # THE ORIGINAL INPUT FIRST, unsteered. A read found under the guard-page allocator
+        # faults only BECAUSE of the oracle: without it the same read is silent, which is the
+        # one condition under which its bytes reach the output. So the first candidate is simply
+        # the crashing input replayed on the plain build -- measured on the address-leak fixture,
+        # whose `dump=` over-read reads 64 bytes past a 64-byte chunk and prints them happily
+        # once nothing is guarding the page. Steering is for the case where the read is far out
+        # of bounds on its own.
+        candidates = [(None, bytes(orig))]
+        if off is not None:
+            candidates += [(v, bytes(bytearray(orig)[:off]) + bytes([v]) + bytes(orig[off + 1:]))
+                           for v in _DISCLOSE_VALUES if v != orig[off]]
         best = None
-        for v in _DISCLOSE_VALUES:
-            if v == orig[off]:
-                continue
-            var = bytearray(orig); var[off] = v
+        for v, var in candidates:
             _rep, out = _detonate_capturing(ctx, target, plain, mode, base_argv, bytes(var),
                                             timeout, aslr=True)
             # A variant that still faults tells us nothing: the read has to RETURN for its bytes
@@ -475,9 +498,13 @@ def _address_disclosure(ctx, target, mode, base_argv, orig, prim, timeout):
         if best is None:
             ctx.emit("primitive.disclosure", payload={
                 "proved": False, "rule": "no-survivor",
-                "note": (f"the read's address is the attacker's to choose, but no value of input "
-                         f"byte {off} both survived and printed more than the baseline, so the "
-                         f"bytes it reads were not observed leaving the process")})
+                "note": ("the read's address is the attacker's to choose, but no variant both "
+                         "survived and printed more than the baseline"
+                         + (f" (the crashing input and {len(candidates) - 1} values of input "
+                            f"byte {off} were tried)" if off is not None else
+                            " (only the crashing input could be tried: no single input byte was "
+                            "isolated as the lever)")
+                         + ", so the bytes it reads were not observed leaving the process")})
             return None
         d = best[2]
     except Exception:                                     # noqa: BLE001 -- best-effort experiment
@@ -491,7 +518,8 @@ def _address_disclosure(ctx, target, mode, base_argv, orig, prim, timeout):
         "proved": d["proved"], "rule": d["rule"], "distinct_pointers": d["distinct"],
         "pie_base": d["pie_base"], "libc_base": d["libc_base"], "canary": d["canary"],
         "disclosed_bytes": d["disclosed_bytes"], "note": d["note"],
-        "steered_byte": off, "steered_to": best[0][off], "input_sha": d["input_sha"]})
+        "steered_byte": off, "steered_to": (best[0][off] if off is not None else None),
+        "input_sha": d["input_sha"]})
     ctx.progress(msg=(("the steered read defeats ASLR: " + d["note"]) if d["proved"]
                       else "the steered read discloses data, but no base was corroborated")[:90])
     return d
@@ -904,6 +932,15 @@ def primitive_stage(ctx) -> dict:
     length = min(max(len(orig) * 2, need, 256), 4096)
     helper = materialize_helper()
     try:
+        # Was this crash found under the guard-page allocator? Then every detonation here needs
+        # it too, or the input is silent and the stage concludes "did not fault". The run that
+        # found it recorded the oracle in its isolation tag, which is the same field
+        # `replay_exe_for` reads to tell a libFuzzer harness from the ingested binary.
+        _found_guarded = sandbox.GUARD_PAGE_TAG in (_crash_isolation(ctx, target, input_sha) or "")
+        if _found_guarded:
+            ctx.progress(msg="this crash was found under the guard-page allocator, so the "
+                             "captures preload it too")
+
         def _capture_for(m, which=None):
             # `which` picks the binary -- see "TWO BINARIES, TWO JOBS" above. Defaults to
             # whichever one the sweep below settled on.
@@ -911,7 +948,8 @@ def primitive_stage(ctx) -> dict:
             if emulated:
                 return make_qemu_capture(which, target.arch, m, base_argv, timeout,
                                          endianness=target.endianness, bits=target.bits)
-            return make_capture(ctx, helper, which, m, base_argv, timeout, sys.executable)
+            return make_capture(ctx, helper, which, m, base_argv, timeout, sys.executable,
+                                guard_page=_found_guarded)
 
         # Structure-preserving framing: a structured input (a config `name=<AAAA...>`, a packet)
         # only faults when the bytes AROUND the overflow stay intact -- the smash is the long filler
@@ -1320,12 +1358,22 @@ def _address_verdict(ctx, capture_for, modes, orig: bytes, arch: str, siblings=(
     the caller's existing decline is the honest answer.
     """
     base_cap, base_mode = None, None
+    tried: list = []
     for m in modes:
         cap = capture_for(m)(orig)
+        tried.append(f"{m}:" + ("fault@0x%x" % cap["fault_addr"]
+                                if cap.get("ok") and cap.get("fault_addr") is not None
+                                else str(cap.get("signal_name") or cap.get("reason") or "no")))
         if cap.get("ok") and cap.get("signal_name") and cap.get("fault_addr") is not None:
             base_cap, base_mode = cap, m
             break
     if base_cap is None:
+        # An experiment that says nothing has to say WHY: this is the one branch where the
+        # answer is "the crash we were handed does not reproduce here", which is a different
+        # statement from "the address is fixed" and sends the reader somewhere else entirely.
+        ctx.emit("primitive.address", payload={
+            "ran": False, "channels": tried,
+            "why": "the crashing input did not fault under the capture on any channel"})
         return None, b"", {}, ""
     cap_fn = capture_for(base_mode)
     disasm = rootcause.disasm_one(bytes.fromhex(base_cap.get("pc_bytes", "")), arch)
@@ -1337,6 +1385,10 @@ def _address_verdict(ctx, capture_for, modes, orig: bytes, arch: str, siblings=(
     # read primitive -- measured on the stack-overflow fixture, which this branch now declines.
     _cls = (rootcause.classify(base_cap, disasm) or {}).get("class")
     if _cls in ("control-flow-hijack", "stack-return-overwrite"):
+        ctx.emit("primitive.address", payload={
+            "ran": False, "class": _cls,
+            "why": ("this fault is instruction-pointer control, which the cyclic experiment "
+                    "measures; the address question does not apply to it")})
         return None, b"", {}, ""
     base_addr = int(base_cap["fault_addr"])
     # The same input twice: an address that moves between runs of ONE input is not a function of
@@ -1370,6 +1422,15 @@ def _address_verdict(ctx, capture_for, modes, orig: bytes, arch: str, siblings=(
             var = bytearray(orig); var[best[1]] = v
             obs.append((f"byte@{best[1]}=0x{v:02x}", cap_fn(bytes(var))))
     verdict = primitive.address_primitive(obs, disasm=disasm, is_write=is_write)
+    _faulted = [lbl for lbl, c in obs
+                if (c or {}).get("ok") and (c or {}).get("fault_addr") is not None]
+    ctx.emit("primitive.address", payload={
+        "ran": True, "channel": base_mode, "observations": len(obs), "faulted": len(_faulted),
+        "distinct_addresses": len({int(c["fault_addr"]) for _l, c in obs
+                                   if (c or {}).get("fault_addr") is not None}),
+        "verdict": (verdict or {}).get("effect_kind"),
+        "why": None if verdict else ("fewer than three of the variants faulted at one "
+                                     "instruction, so the question could not be asked")})
     demo = best[2] or orig
     demo_cap = base_cap
     if verdict and verdict.get("controlled"):

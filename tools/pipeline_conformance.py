@@ -691,6 +691,59 @@ int main(void){ setvbuf(stdout,0,2,0);
          note="REAL-SHAPED: header-gated parser, unvalidated index, read-class, no win() -- "
               "the L2 verdict comes from the faulting ADDRESS moving with the input"),
 
+    # The SAME chain, from a BINARY. The case above is a source drop, so the platform builds its
+    # own ASan twin and the over-read is measured from a sanitizer report. A third-party binary
+    # has no such twin: the read is measured from the faulting ADDRESS (poc/primitive.py's
+    # address-control family) and the disclosure from steering that address into mapped memory.
+    # The leak is driven by an INDEX rather than a length for exactly that reason -- a length
+    # over-read reads from the object's own start, which the sanitizer family already covers,
+    # while an index chooses WHERE, which is what a stripped binary presents.
+    Case("addr_leak_pie_ret2win",
+         r'''#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+void win(void){ setuid(0); execl("/bin/sh","sh",(char*)0); }
+/* its OWN frame, so the saved return sits just above the buffer */
+__attribute__((noinline)) static void greet(const char *d, size_t n){
+  char name[64]; memcpy(name, d, n); puts(name); }
+int main(void){ setvbuf(stdout,0,2,0); setvbuf(stdin,0,2,0);
+  unsigned char *buf = (unsigned char*)malloc(64);
+  void **nb = (void**)malloc(64);        /* the NEIGHBOUR the read runs into at index 0 */
+  nb[0]=(void*)win; nb[1]=(void*)stdout; nb[2]=(void*)nb; nb[3]=(void*)win;
+  memset(buf,'X',64);
+  char line[512];
+  for(;;){ ssize_t n = read(0,line,sizeof(line)-1); if(n<=0) return 0; line[n]=0;
+    if(!strncmp(line,"dump=",5)){        /* the INDEX is the attacker's: it chooses WHERE */
+      unsigned long i = strtoul(line+5,NULL,10);
+      unsigned char tmp[128];
+      memcpy(tmp, buf + i*0x1000, sizeof(tmp));   /* the PROCESS reads it, so a bad address faults */
+      fwrite(tmp, 1, sizeof(tmp), stdout); fflush(stdout); continue; }
+    if(!strncmp(line,"name=",5)){ greet(line+5,(size_t)n-5); continue; }
+    return 0; } }''',
+         # MEASURED at L2 on 2026-10-16 and recorded as L2, not left red at the L3 it is aiming
+         # at. What the autopilot does reach, unaided, is: the `dump=` branch (dispatch-prefix
+         # seeding), the address-control verdict on its over-read (25 of 30 variants faulted, 2
+         # distinct addresses, "arbitrary-read"), a PROVED disclosure from replaying that input
+         # unguarded (8 live pointers, PIE and libc bases recovered with ASLR on), and a
+         # confirmed IP-control offset of 71 in the `name=\n` framing. The L3 attempt then
+         # inherits all four and its leak step reports "no leak matched before the target read
+         # input" -- the recipe is replayed in the weaponizer's own process and the raw-pointer
+         # output does not reach its leak matcher in time. That is the next thing to fix and it
+         # is one named step, not an unknown.
+         ["-fno-stack-protector", "-w"], want_level=2, want_cwe=(), budget=600.0,
+         note="BINARY out-of-bounds READ whose ADDRESS the attacker chooses, in a program that "
+              "also has the write primitive to spend the ASLR defeat on. No source, so no "
+              "sanitizer twin: the read is measured from the faulting address and the "
+              "disclosure from steering that address back into mapped memory.\n"
+              "The `memcpy` into a local is load-bearing and was measured: the first version of "
+              "this fixture handed the out-of-bounds pointer straight to `fwrite` on an "
+              "UNBUFFERED stream, so the read happened inside write(2) -- the kernel returns "
+              "EFAULT rather than faulting the process, and `dump=99999999` exited 0 with the "
+              "guard-page allocator preloaded. A crash-driven search cannot see that read at "
+              "all, which is a real blind spot and not this case's subject: with the copy, the "
+              "process touches the address itself."),
+
     # ---- FILE FORMATS / FRONT-ENDS. The platform parses PE, JVM, CPython bytecode, WASM and
     # UPX-packed ELF, but every case above is a plain ELF, so a front-end could stop recognising its
     # container entirely without the gate noticing. These assert the one property the probe shows

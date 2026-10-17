@@ -115,9 +115,17 @@ def test_the_lookup_does_not_depend_on_a_window_into_a_runs_events():
     assert "payloads_of_type(" in shared, \
         "it must ask EventDAO for the event type, not page a run's events"
     assert 'stage="poc_primitive"' in shared and 'status="done"' in shared
+    # Each selector must reach the shared lookup -- directly, or through `_l2_control_run`,
+    # which is the one that picks the payload carrying the offset. The delegation exists because
+    # the three have to answer from ONE payload: a second verdict family (address-control)
+    # confirms an L2 with no offset and empty framing, and when `_l2_frame` answered from
+    # whichever payload had the keys first it handed L3 "unstructured" for a target whose smash
+    # only lands behind `name=`.
+    assert "_confirmed_l2(ctx, target)" in code(exploit_stage._l2_control_run)
     for fn in (_l2_offset, _l2_mode, _l2_frame):
         body = code(fn)
-        assert "_confirmed_l2(ctx, target)" in body, \
+        assert ("_confirmed_l2(ctx, target)" in body
+                or "_l2_control_run(ctx, target)" in body), \
             f"{fn.__name__} must read through the shared, unwindowed lookup"
         assert "SELECT" not in body.upper(), f"{fn.__name__} hand-rolls its own query"
 
@@ -282,6 +290,32 @@ def test_offset_channel_and_framing_all_come_from_the_same_run(store, case):
     ctx = _Ctx(store.conn)
     assert (_l2_offset(ctx, t), _l2_mode(ctx, t), _l2_frame(ctx, t)) == (
         _OFFSET, "file", (b"cfg=", b"\n"))
+
+
+def test_a_later_l2_without_an_offset_does_not_shadow_the_framing(store, case):
+    """The regression that cost an L3. A second verdict family -- address-control, which measures
+    the faulting ADDRESS rather than the instruction pointer -- confirms an L2 that has no
+    control offset and no framing, and it is the NEWER event. `_l2_frame` scanned for the first
+    payload carrying the framing keys, found two empty strings, and told build_exploit the target
+    was unstructured: the `name=` prefix was dropped, the relocated win address landed in a line
+    the program rejects, and the run reported "leak worked but the success marker was not
+    observed" while holding a correct base and a correct offset **[measured 2026-10-16]**.
+    """
+    t = _target(store, case)
+    _primitive_run(store, t, confirmed=True, offset=_OFFSET, mode="stdin",
+                   frame=(b"name=\n", b"\n"))
+    # ...and then the address-control verdict lands, newer, with neither
+    runs, events = AnalysisRunDAO(store.conn), EventDAO(store.conn)
+    run = runs.create(case.id, "poc_primitive", target_id=t.id, params={}, tool="poc",
+                      tool_version="1")
+    events.append("primitive.done", case_id=case.id, run_id=run.id,
+                  payload={"primitive": "address-control", "confirmed": True, "offset": None,
+                           "mode": "stdin", "frame_prefix": "", "frame_suffix": ""})
+    runs.set_status(run.id, "done")
+    ctx = _Ctx(store.conn)
+    assert _l2_offset(ctx, t) == _OFFSET
+    assert _l2_frame(ctx, t) == (b"name=\n", b"\n"), \
+        "the framing must come from the run that measured the offset"
 
 
 def test_a_corrupt_framing_does_not_raise(store, case):

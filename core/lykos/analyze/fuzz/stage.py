@@ -50,6 +50,36 @@ _DEFAULT_SEEDS = [b"", b"A" * 8, b"%s%s%s%n", b"0", b"-1", b"../../etc/passwd",
                   b"A" * 256, b"A" * 1024, b"A" * 4096]
 
 
+#: A dispatch token is matched at the START of the line (`strncmp(line, "dump=", 5)`), so a
+#: mutator that inserts it anywhere reaches that branch only by luck -- and once the campaign has
+#: found ONE bug, its corpus fills with inputs that carry the OTHER prefix and keep it through
+#: mutation. Measured on the `addr_leak_pie_ret2win` fixture, which has two dispatch branches and
+#: a defect behind each: 21 of 21 crashes were the `name=` overflow, the campaign's own inputs
+#: show `dump=` being inserted mid-line ("name=.dump=.name=..."), and the read behind `dump=` --
+#: the one that defeats ASLR -- was never reached, so the chain stopped at L2 for want of a base.
+_PREFIX_TOKEN = __import__("re").compile(rb"^[A-Za-z_][A-Za-z0-9_.-]{1,20}[=:]$")
+#: Bodies to try after a dispatch token: a number (an index, a length, a count), a long filler
+#: (a copy into a fixed buffer) and a huge number (the wrap/out-of-range case).
+_PREFIX_BODIES = (b"0", b"1", b"A" * 96, b"99999999")
+
+
+def _dispatch_prefix_seeds(dictionary, cap: int = 8) -> list:
+    """Seeds that put each mined dispatch token where the program actually tests for it.
+
+    Cheap -- a handful of inputs, no execution -- and it is the difference between fuzzing one
+    branch of a command dispatcher and fuzzing several. The token has to look like a dispatch
+    key (`name=`, `show:`), not like any string in the image, or this floods the corpus.
+    """
+    out: list = []
+    for tok in dictionary:
+        if not _PREFIX_TOKEN.match(tok or b""):
+            continue
+        out += [tok + body for body in _PREFIX_BODIES]
+        if len(out) >= cap * len(_PREFIX_BODIES):
+            break
+    return out
+
+
 def _mine_dictionary(strings):
     toks = []
     for s in strings:
@@ -1686,6 +1716,17 @@ def fuzz_stage(ctx) -> dict:
         ctx.emit("fuzz.seeds", payload={"loaded": len(corpus),
                                         "from": [k for k in ("seed_files", "seed_dir") if p.get(k)]})
     dictionary = _mine_dictionary(strings)
+    _pfx = _dispatch_prefix_seeds(dictionary)
+    if _pfx:
+        # In FRONT of the corpus: a dispatch branch nobody has entered yet is worth more than
+        # another mutation of the branch that already crashed.
+        corpus = _pfx + list(corpus)
+        ctx.emit("fuzz.dispatch_seeds", payload={
+            "tokens": sorted({t.split(b"=")[0].split(b":")[0].decode("latin-1", "replace")
+                              for t in _pfx})[:12], "seeds": len(_pfx),
+            "why": ("a dispatch token is matched at the START of the line, so each mined "
+                    "`key=`/`key:` token is seeded as a prefix with a number, a filler and an "
+                    "out-of-range number behind it")})
     # The target's own strings give the tokens visible in the IMAGE. The ones that matter most for
     # getting past a gate are often not there: a magic value that is COMPUTED (a decoded header, a
     # checksum, a token read from a config or the environment) exists only at runtime. libtokencap

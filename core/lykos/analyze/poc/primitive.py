@@ -1422,9 +1422,16 @@ def address_primitive(observations, *, disasm: str = "", is_write: bool = False)
     if len(seen) < _MIN_ADDR_OBS:
         return None
     pcs = {s["pc"] for s in seen}
-    if len(pcs) != 1:
-        # Different instructions fault in different variants: these are not observations of one
-        # access, and comparing their addresses would invent a primitive out of two bugs.
+    # ONE ROUTINE, not one instruction. "Different instructions are different defects" is right
+    # about two unrelated bugs and wrong about a vectorized copy: glibc's `memcpy` faults at
+    # whichever instruction of its unrolled SSE/AVX loop runs off the end, so the PC moves with
+    # the alignment while the defect does not. Measured on the address-leak fixture: 8 of 13
+    # variants faulted, 2 distinct addresses came back -- the address was demonstrably the
+    # attacker's -- and the exact-PC rule threw the whole thing away. A code PAGE is the
+    # practical unit of "the same routine": an unrolled loop lives within a few hundred bytes,
+    # and two genuinely different defects in one 4 KiB page of code would be a coincidence this
+    # verdict can afford, because the ADDRESS evidence is what carries the claim either way.
+    if len({pc >> 12 for pc in pcs}) != 1:
         return None
     pc = seen[0]["pc"]
     # DETERMINISM first: the same label twice with two addresses means the address is not a
@@ -1437,6 +1444,7 @@ def address_primitive(observations, *, disasm: str = "", is_write: bool = False)
     addrs = sorted({s["addr"] for s in seen})
     access = "write" if is_write else "read"
     base = {"type": "address-control", "access": access, "pc": pc, "disasm": disasm,
+            "faulting_pcs": sorted(pcs)[:8],
             "addr_min": addrs[0], "addr_max": addrs[-1], "span": addrs[-1] - addrs[0],
             "observations": len(seen), "samples": [(s["label"], s["addr"]) for s in seen][:12],
             "nondeterministic": nondet,
@@ -1487,9 +1495,11 @@ def address_primitive(observations, *, disasm: str = "", is_write: bool = False)
         return dict(base, controlled=True, confirmed=True, max_level=2, offset=None, stride=None,
                     effect_kind=("arbitrary-write" if is_write else "arbitrary-read"),
                     note=(f"the faulting address moves with the input (0x{addrs[0]:x} .. "
-                          f"0x{addrs[-1]:x}) at one fixed instruction, so the attacker chooses "
-                          f"where this {access} goes; no single input byte was isolated as the "
-                          f"lever."))
+                          f"0x{addrs[-1]:x}) in one routine"
+                          + (f" ({len(pcs)} instructions of an unrolled copy)" if len(pcs) > 1
+                             else f" (pc 0x{pc:x})")
+                          + f", so the attacker chooses where this {access} goes; no single "
+                          f"input byte was isolated as the lever."))
     stride_txt = (f" {best['stride']} bytes of address per unit, i.e. an index into "
                   f"{best['stride']}-byte elements," if best["stride"] else "")
     return dict(base, controlled=True, confirmed=True, max_level=2,
@@ -1498,5 +1508,7 @@ def address_primitive(observations, *, disasm: str = "", is_write: bool = False)
                 note=(f"input byte {best['offset']} chooses the address this {access} touches:"
                       f"{stride_txt} observed 0x{best['points'][0][1]:x} .. "
                       f"0x{best['points'][-1][1]:x} over {len(best['points'])} values of that "
-                      f"byte, at one fixed instruction (pc 0x{pc:x}"
-                      + (f", `{disasm}`" if disasm else "") + ")."))
+                      f"byte, in one routine ("
+                      + (f"{len(pcs)} instructions of an unrolled copy, first at "
+                         if len(pcs) > 1 else "pc ")
+                      + f"0x{pc:x}" + (f", `{disasm}`" if disasm else "") + ")."))

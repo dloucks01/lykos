@@ -274,11 +274,25 @@ def test_parameter_driven_target_is_discovered_and_crashed(store, case, pool, gc
     assert pool.wait_idle(90) and q.runs.get(run.id).status == "done"
     crashes = [d for d in DynResultDAO(store.conn).list_by_target(target.id) if d.crashed]
     assert crashes, "no crash: the parameter-driven target was never driven past its arg gate"
-    argv = crashes[0].argv or []
+    # ANY recorded crash whose invocation carries a shape-synthesized id, not `crashes[0]`.
+    # The campaign also fuzzes OPTION PREFIXES, so a crash can be recorded under
+    # `-s -t -c @@ -s 111-111-111-111 -t 0` -- a prefix the flag fuzzer prepended in front of
+    # the discovered invocation (getopt takes the last value, so it still reproduces). Reading
+    # the FIRST `-s` of the FIRST crash then found the fuzzed flag rather than the discovered
+    # one, which made this test depend on which campaign happened to crash first: it passed
+    # until dispatch-prefix seeding made an earlier batch crash, and the capability it is about
+    # -- synthesizing a value the validator accepts -- was unchanged either way.
+    def _sid(argv):
+        for i, a in enumerate(argv or []):
+            if str(a) == "-s" and i + 1 < len(argv):
+                if re.fullmatch(r"\d{3}-\d{3}-\d{3}-\d{3}", str(argv[i + 1])):
+                    return str(argv[i + 1])
+        return None
+    hits = [(c, _sid(c.argv)) for c in crashes if _sid(c.argv)]
+    assert hits, ("no crashing invocation carried a shape-synthesized -s value: "
+                  + "; ".join(str(c.argv) for c in crashes[:3]))
+    argv = hits[0][0].argv or []
     joined = " ".join(str(a) for a in argv)
-    assert "-s" in argv, f"the required -s flag was not in the crashing invocation: {argv}"
-    sid = argv[argv.index("-s") + 1]
-    assert re.fullmatch(r"\d{3}-\d{3}-\d{3}-\d{3}", sid), f"-s value not shape-synthesized: {sid!r}"
     assert "@@" in joined or any("conf" in str(a) or "/" in str(a) for a in argv)  # config delivered
 
 
@@ -614,3 +628,24 @@ def test_a_working_tracer_is_not_cut_short():
         SB.run_batch = real
     assert len(n) == len(inputs), "a working tracer was cut short"
     assert all(c for c in out)
+
+
+def test_a_dispatch_token_is_seeded_where_the_program_tests_for_it():
+    """`strncmp(line, "dump=", 5)` matches at OFFSET 0, so a token inserted mid-line reaches that
+    branch by luck only -- and once a campaign has found one bug its corpus fills with inputs
+    carrying the other prefix and keeps it through mutation.
+
+    Measured on a fixture with two dispatch branches and a defect behind each: 21 of 21 crashes
+    were the first branch's overflow, the campaign's own inputs show the second token being
+    inserted mid-line (`name=\\x00dump=\\x00name=...`), and the defect behind it was never
+    reached -- so the chain stopped one rung short for want of what that branch discloses.
+    """
+    from lykos.analyze.fuzz.stage import _dispatch_prefix_seeds
+    seeds = _dispatch_prefix_seeds([b"name=", b"dump=", b"show:", b"AAAA", b"/bin/sh", b"%s"])
+    assert b"dump=0" in seeds and b"name=0" in seeds and b"show:0" in seeds
+    assert any(s.startswith(b"dump=") and len(s) > 50 for s in seeds), "a filler body too"
+    assert any(s == b"dump=99999999" for s in seeds), "and an out-of-range number"
+    # NOT every string in the image: that floods the corpus with noise
+    assert not any(s.startswith(b"AAAA") or s.startswith(b"/bin/sh") for s in seeds)
+    # bounded
+    assert len(_dispatch_prefix_seeds([b"k%d=" % i for i in range(100)])) <= 40
