@@ -128,7 +128,13 @@ def _save_corpus(cache, units: list) -> int:
 
 
 #: `known-library harness for <name>` -> the format model whose seeds that library parses.
-_HARNESS_FORMAT = {"tiff": "tiff", "expat": "xml", "zlib": "gzip", "bzip2": "bzip2"}
+#: The known harness names the format, which is better evidence than a strings ranking. The
+#: libsndfile one reads audio through `sf_open_virtual`, and RIFF/WAVE is the container every
+#: one of its decoders is reached through: the engine found `common.c:174` from a hand-made
+#: 44-byte WAVE header in ~3,000 executions, where an empty corpus has to invent `RIFF....WAVE`
+#: before it parses anything at all.
+_HARNESS_FORMAT = {"tiff": "tiff", "expat": "xml", "zlib": "gzip", "bzip2": "bzip2",
+                   "sndfile": "riff"}
 
 
 def _known_format(harness_desc):
