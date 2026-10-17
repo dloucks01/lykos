@@ -255,7 +255,13 @@ def build_poc_stage(ctx) -> dict:
             "argv": argv, "expected_signal": res.signal_name, "isolation": res.isolation,
             "verified": verified, "tool_version": TOOL_VERSION,
             "recorded_signal": wanted, "signal_matches_finding": not mismatch}
-    runtime = {"jar": "jar", "class": "class"}.get((target.file_type or "").lower(), "native")
+    # EVERY runtime the bundle can replay, not just the JVM's two. A .pyc, a .NET assembly and a
+    # WASM module all fell through to "native" here, and the reproducer then said
+    # `./target.bin < ./input.bin` -- a file the shell cannot execute. The fault was reproduced
+    # and the deliverable was broken, which is most of why those substrates read as
+    # identification-only in the coverage matrix.
+    runtime = {"jar": "jar", "class": "class", "pyc": "pyc", "dotnet": "dotnet",
+               "wasm": "wasm"}.get((target.file_type or "").lower(), "native")
     main_class = None
     if runtime == "class":
         # The class name comes from the file, not the target row: the JVM resolves a class by

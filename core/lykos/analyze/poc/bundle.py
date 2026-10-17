@@ -4,9 +4,15 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import logging
+import pathlib
 import shlex
 import tarfile
 import time
+
+from ... import observe
+
+_log = logging.getLogger(__name__)
 
 
 def _add(tar, name, data: bytes, mode=0o644):
@@ -81,6 +87,30 @@ def _runner(mode: str, argv, signal_name: str, run_cmd=None, runtime: str = "nat
         cls = (main_class or "Main").replace("/", ".")
         exe = f"java -cp . {shlex.quote(cls)}"
         setup = f"cp ./target.bin ./{shlex.quote(cls.rsplit('.', 1)[-1] + '.class')}\n"
+    # THE OTHER THREE RUNTIMES. Only `jar` and `class` were ever mapped, so a .pyc, a .NET
+    # assembly or a WASM module fell through to the native branch and the reproducer said
+    # `./target.bin < ./input.bin` -- a file the shell cannot execute. Every managed substrate
+    # except the JVM therefore had no deliverable at all, which is most of why the matrix shows
+    # them capped at identification: the fault is reproduced and nothing can be shipped for it.
+    elif runtime == "pyc":
+        # Loadable under any filename, unlike a bare .class. The flags are the ones the sandbox
+        # runs with, so the reproducer executes what was measured.
+        exe, setup = "python3 -E -s -X faulthandler ./target.bin", ""
+    elif runtime == "dotnet":
+        # The `dotnet` muxer dispatches on the .dll extension and a framework-dependent assembly
+        # will not start without `<stem>.runtimeconfig.json` beside it -- an ingested assembly has
+        # neither. `rollForward` is set so the bundle starts on whatever major the replaying
+        # machine has, rather than only on the version this run happened to see.
+        exe = "dotnet ./app.dll"
+        setup = ("cp ./target.bin ./app.dll\n"
+                 "cat > ./app.runtimeconfig.json <<'LYKOS_EOF'\n"
+                 + _runtimeconfig_json() + "\nLYKOS_EOF\n")
+    elif runtime == "wasm":
+        # A module is not a process: it is instantiated by a host, and the trap verdict comes back
+        # in a FILE because a WASI module writes to fd 2 itself and could forge a marker there.
+        # The driver that decides how to feed the module travels with the bundle.
+        exe = "node --no-warnings ./wasm_driver.js ./target.bin ./report.json"
+        setup = ""
     pre = _argv_text(argv, carrier="./input.bin")
     if run_cmd:                                          # script-based reproducer (e.g. PIE)
         invoke = run_cmd
@@ -131,6 +161,18 @@ def _runner(mode: str, argv, signal_name: str, run_cmd=None, runtime: str = "nat
         # failed when it worked.
         hint = (f'echo "exit status: $rc -- {signal_name} appears on stderr above as an '
                 'uncaught exception; the JVM exits 1 (or 3 on OutOfMemoryError)"')
+    elif runtime == "pyc":
+        hint = (f'echo "exit status: $rc -- {signal_name} appears on stderr above as a Python '
+                'traceback; CPython exits 1 on an uncaught exception"')
+    elif runtime == "dotnet":
+        hint = (f'echo "exit status: $rc -- {signal_name} appears on stderr above as an '
+                'unhandled .NET exception; the CLR aborts (134) or exits non-zero"')
+    elif runtime == "wasm":
+        # The driver always exits 0: a module that traps is still a successful node run, so the
+        # exit code says nothing and the report is the verdict.
+        hint = ('echo "the WASM verdict is in ./report.json -- status \\"trap\\" means the '
+                'module faulted on this input; the status above is node exiting cleanly, not '
+                'the module:"; cat ./report.json; printf "\\n"')
     elif sanitizer:
         hint = (f'echo "exit status: $rc -- the {sanitizer} report is on stderr above; with '
                 'abort_on_error=1 (exported by this script) the process dies on SIGABRT, '
@@ -654,6 +696,22 @@ sys.stderr.write("server exited %d without a fatal signal\n" % rc); sys.exit(1)
 '''
 
 
+def _runtimeconfig_json() -> str:
+    """The minimal `runtimeconfig.json` a framework-dependent assembly needs to start, against
+    whatever Microsoft.NETCore.App this machine has -- with `rollForward` so the bundle still
+    starts on a replaying machine with a different major."""
+    ver = "8.0.0"
+    try:
+        from ..dynamic import sandbox as _sb
+        ver = _sb._clr_framework_version() or ver
+    except Exception:                                    # noqa: BLE001 -- a default is fine here
+        pass
+    tfm = ".".join(ver.split(".")[:2])
+    return json.dumps({"runtimeOptions": {
+        "tfm": f"net{tfm}", "rollForward": "latestMajor",
+        "framework": {"name": "Microsoft.NETCore.App", "version": ver}}}, indent=2)
+
+
 def build(target_bytes: bytes, input_bytes: bytes, meta: dict, stderr: bytes,
           mode: str, argv, signal_name: str, primitive: dict | None = None,
           extra_files: dict | None = None, run_cmd: str | None = None,
@@ -666,6 +724,14 @@ def build(target_bytes: bytes, input_bytes: bytes, meta: dict, stderr: bytes,
     if mode == "socket":                                 # the runner invokes this; ship it
         extra_files = dict(extra_files or {})
         extra_files.setdefault("replay_socket.py", _SOCKET_REPLAY)
+    if runtime == "wasm":                                # the host that instantiates the module
+        extra_files = dict(extra_files or {})
+        try:
+            from ..dynamic import sandbox as _sb
+            extra_files.setdefault(
+                "wasm_driver.js", pathlib.Path(_sb._wasm_driver_path()).read_bytes())
+        except Exception:                                # noqa: BLE001 -- bundle without it
+            observe.absorbed(_log, "shipping the bundle without the WASM driver")
     if mode == "prompt":
         # A prompt-protocol crash cannot be a `< input.bin` one-liner: delivered in bulk the
         # whole file lands in field one and field two reaches EOF, so the reproducer the operator
