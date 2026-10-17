@@ -446,3 +446,53 @@ def test_an_install_rule_for_a_header_that_does_not_exist_is_not_evidence(lib_wi
     assert L.installed_headers(lib_with_internals) == frozenset()
     doors = [t["consume"] for t in L.find_handle_triples(lib_with_internals, limit=4)]
     assert "my_inner_feed" in doors and "my_parse" in doors
+
+
+def test_a_standalone_driver_is_not_a_harness(lib):
+    """openjpeg ships `tests/fuzzers/fuzzingengine.c`: it DECLARES LLVMFuzzerTestOneInput and
+    defines `main`, because it is the driver you link instead of libFuzzer. Mentioning the symbol
+    was the whole test, so that file was openjpeg's top-ranked door -- a build with two `main`s
+    and no entry point, and the first door failing is the whole engine failing on the target."""
+    (lib / "fuzzers").mkdir()
+    (lib / "fuzzers" / "engine.c").write_text(
+        "#include <stdlib.h>\n"
+        "int LLVMFuzzerTestOneInput(void *buf, size_t len);\n"
+        "int main(int argc, char **argv) { (void)argv; "
+        "return LLVMFuzzerTestOneInput(\" \", 1) + argc; }\n")
+    assert L.find_harnesses(lib) == []
+    (lib / "fuzzers" / "real.cc").write_text(
+        "#include <stdint.h>\n#include <stddef.h>\n"
+        'extern "C" int LLVMFuzzerTestOneInput(const uint8_t *d, size_t n)\n'
+        "{ (void)d; (void)n; return 0; }\n")
+    assert [p.name for p in L.find_harnesses(lib)] == ["real.cc"]
+
+
+def test_a_directory_that_builds_programs_is_not_the_library(lib):
+    """`_NOT_LIBRARY` is a list of NAMES, and the names keep being different: libsndfile's
+    regression program lives in `regtest/`, so `db_open` -- a sqlite wrapper from a test driver
+    -- was ranked as a libsndfile entry point, and openjpeg's tools live in `src/bin/`. The
+    project's own build file says which a directory is."""
+    (lib / "lib" / "Makefile.am").write_text("lib_LTLIBRARIES = libmylib.la\n")
+    (lib / "regtest").mkdir()
+    (lib / "regtest" / "Makefile.am").write_text("noinst_PROGRAMS = mylib-regtest\n")
+    (lib / "regtest" / "driver.c").write_text(
+        "#include <string.h>\nint db_open(const char *path) { char b[8]; "
+        "strcpy(b, path); return (int)b[0]; }\n")
+    assert L.program_dirs(lib) == frozenset({pathlib.Path("regtest")})
+    assert "db_open" not in L.rank_harness_fns(lib, limit=10)
+
+
+def test_a_directory_that_builds_both_is_still_the_library(lib):
+    """libsndfile's `src/` builds the library AND its unit-test programs; dropping it would
+    leave nothing to fuzz."""
+    (lib / "lib" / "Makefile.am").write_text(
+        "lib_LTLIBRARIES = libmylib.la\ncheck_PROGRAMS = mylib_test\n")
+    assert L.program_dirs(lib) == frozenset()
+    assert "my_parser_create" in L.rank_harness_fns(lib, limit=10)
+
+
+def test_the_root_is_never_a_program_directory(lib):
+    """A project that builds one program at its top level still has to offer its sources, or
+    there is nothing left to fuzz at all -- bzip2 is that project."""
+    (lib / "CMakeLists.txt").write_text("add_executable(mytool tool.c)\n")
+    assert L.program_dirs(lib) == frozenset()

@@ -26,6 +26,13 @@ _HARNESS_SYM = "LLVMFuzzerTestOneInput"
 # uses -- and a missed main collides with libFuzzer's own ("multiple definition of `main'").
 _MAIN_RE = re.compile(r"^(?:[A-Za-z_][\w \t*]*[ \t*]+)?main[ \t]*\(", re.M)
 _HARNESS_RE = re.compile(_HARNESS_SYM)
+#: A harness DEFINES the entry point. openjpeg ships `tests/fuzzers/fuzzingengine.c`, which
+#: declares `LLVMFuzzerTestOneInput` and defines `main` -- it is OSS-Fuzz's standalone driver,
+#: the thing you link INSTEAD of libFuzzer. Mentioning the symbol was the whole test, so that
+#: driver was openjpeg's top-ranked door: it would have linked a second `main` against
+#: libFuzzer's own and left the entry point undefined, and a first door that cannot build is
+#: the whole engine failing on the target.
+_HARNESS_DEF = re.compile(_HARNESS_SYM + r"\s*\([^;{]*\)\s*\{", re.S)
 # `nonnull-attribute` RECOVERS, everything else is fatal. Measured on libtiff 4.0.3: the very
 # first interesting input reaches `TIFFFetchStripThing`, where a strip array with count 0 does
 # `memcpy(dst, NULL, 0)` -- technically undefined, practically harmless, and it ABORTED the
@@ -67,7 +74,7 @@ def find_harnesses(root, *, limit: int = 8) -> list:
         if any(seg.lower() in _VENDOR_DIRS for seg in rel[:-1]):
             continue
         try:
-            if _HARNESS_RE.search(p.read_text(errors="ignore")):
+            if _HARNESS_DEF.search(p.read_text(errors="ignore")):
                 out.append(p)
         except OSError:
             pass
@@ -246,6 +253,51 @@ _INSTALLED_CACHE: dict = {}
 def _strip_comments(text: str) -> str:
     """`#install(FILES mj2.h ...)` is openjpeg declining to install that header, not installing it."""
     return re.sub(r"(?m)^[ \t]*#.*$", "", text or "")
+
+
+#: A directory that builds PROGRAMS and no library is not the library, whatever it is called.
+#: `_NOT_LIBRARY` is a list of names, and the names keep being different: libsndfile's regression
+#: PROGRAM lives in `regtest/`, so `db_open` and `db_close` -- a sqlite wrapper from a test
+#: driver -- were ranked as libsndfile entry points, and openjpeg's command line tools live in
+#: `src/bin/`. The project's own build file says which it is.
+_AM_PROGRAMS = re.compile(r"^[ \t]*\w*_PROGRAMS[ \t]*\+?=", re.M)
+_AM_LIBRARIES = re.compile(r"^[ \t]*\w*_(?:LTLIBRARIES|LIBRARIES)[ \t]*\+?=", re.M)
+_CMAKE_EXE = re.compile(r"\badd_executable\s*\(", re.I)
+_CMAKE_LIB = re.compile(r"\badd_library\s*\(", re.I)
+_MESON_EXE = re.compile(r"\bexecutable\s*\(")
+_MESON_LIB = re.compile(r"\b(?:static_|shared_)?library\s*\(")
+_PROGRAM_CACHE: dict = {}
+
+
+def program_dirs(root) -> frozenset:
+    """Directories this project builds PROGRAMS in and no library, relative to `root`.
+
+    Read from the build files, not from a list of directory names: a program's helper function
+    is not an entry point into the library -- it cannot be reached by any caller of the library
+    and, with `main` excluded from the build, it usually cannot even link. The root is never
+    reported, because a project that builds one program at its top level still has to offer
+    those sources as candidates or there is nothing left to fuzz.
+    """
+    key = str(root)
+    if key in _PROGRAM_CACHE:
+        return _PROGRAM_CACHE[key]
+    root = Path(root)
+    out: set = set()
+    pairs = (("Makefile.am", _AM_PROGRAMS, _AM_LIBRARIES),
+             ("CMakeLists.txt", _CMAKE_EXE, _CMAKE_LIB),
+             ("meson.build", _MESON_EXE, _MESON_LIB))
+    for name, exe, lib in pairs:
+        for bf in sorted(root.rglob(name))[:200]:
+            rel = bf.relative_to(root).parts
+            if any(seg in _SKIP_DIRS for seg in rel) or len(rel) == 1:
+                continue                                 # never the root: see above
+            try:
+                txt = _strip_comments(bf.read_text(errors="ignore"))
+            except OSError:
+                continue
+            if exe.search(txt) and not lib.search(txt):
+                out.add(Path(*rel[:-1]))
+    return _cache_put(_PROGRAM_CACHE, key, frozenset(out))
 
 
 def installed_headers(root) -> frozenset:
@@ -515,12 +567,16 @@ def _library_srcs(root):
     Reading each file once here also stops the scanners reading the whole tree twice.
     """
     out = []
+    _progs = program_dirs(root)
     for p in _sources(Path(root), exclude_main=True):
         rel = p.relative_to(Path(root)).parts
         if any(seg.lower() in _PORT_DIRS or seg.lower() in _VENDOR_DIRS
                for seg in rel[:-1]):
             continue
         if any(seg in _NOT_LIBRARY for seg in rel[:-1]):
+            continue
+        # The project's own answer, for the directories whose names we would never guess.
+        if any(Path(*rel[:i]) in _progs for i in range(1, len(rel))):
             continue
         try:
             txt = p.read_text(errors="ignore")
