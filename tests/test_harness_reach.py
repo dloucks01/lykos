@@ -178,7 +178,13 @@ def test_the_synthesized_handle_harness_builds_and_reaches_the_bug(tmp_path, lib
         L._KNOWN_HARNESSES.update(saved)
     assert res["ok"], (res.get("log") or "")[-600:]
     assert "handle harness" in (res.get("harness") or "")
-    r = subprocess.run([str(out), "-runs=4000", "-max_len=64"],
+    # 40,000 runs and a PINNED libFuzzer seed. The planted bug needs an input that starts with
+    # 'X' and is longer than 16 bytes, which is ~1/256 of random inputs: at 4,000 runs with a
+    # fresh RNG every time this assertion failed about one run in six (measured), and a gate that
+    # fails one time in six teaches everyone to re-run it. With the seed fixed the campaign is
+    # the same every time, so the test is deterministic in BOTH directions -- if the harness ever
+    # stops reaching the bug, it fails every time instead of sometimes.
+    r = subprocess.run([str(out), "-runs=40000", "-max_len=64", "-seed=1"],
                        capture_output=True, text=True, timeout=180,
                        cwd=str(tmp_path), env={**os.environ, "ASAN_OPTIONS": "detect_leaks=0"})
     both = (r.stdout or "") + (r.stderr or "")
