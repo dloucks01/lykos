@@ -811,6 +811,64 @@ int main(void){ setvbuf(stdout,0,2,0);
               "stack buffer in a handler that RETURNS -- reachable only over a connection, and "
               "replayable only by spawning the server and sending (no exec-time carrier exists)"),
 
+    #: The one shape where a stack canary is a WEAKNESS rather than a defence. No gate case had
+    #: ever driven the forking-server BROP path at all, canary or not.
+    Case("forking_server_canary_brute",
+         r"""#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <signal.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+void win(void){ system("/bin/sh"); }
+/* The handler RETURNS and then answers, which is what gives a crash-vs-survived oracle: a wrong
+   canary byte aborts in __stack_chk_fail and the reply never comes. */
+static int vuln(int fd){ char b[64]; read(fd, b, 512); return 0; }
+static void handle(int fd){ dup2(fd,0); dup2(fd,1); dup2(fd,2); vuln(fd); write(fd,"OK",2); }
+int main(void){ setvbuf(stdout,0,2,0);
+  signal(SIGCHLD, SIG_IGN);
+  int s = socket(AF_INET, SOCK_STREAM, 0); if(s<0) return 1;
+  int one=1; setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+  struct sockaddr_in a; memset(&a,0,sizeof a);
+  a.sin_family=AF_INET; a.sin_addr.s_addr=htonl(INADDR_LOOPBACK); a.sin_port=0;
+  if(bind(s,(struct sockaddr*)&a,sizeof a)<0) return 1;
+  if(listen(s,16)<0) return 1;
+  puts("listening");
+  /* fork() per connection: ASLR and the canary both roll ONCE, in the parent. */
+  for(;;){ int c=accept(s,0,0); if(c<0) continue;
+           if(fork()==0){ close(s); handle(c); _exit(0); } close(c); } }""",
+         ["-fPIE", "-pie", "-fstack-protector-all", "-O0", "-w"],
+         want_level=3, want_cwe=("CWE-121", "CWE-787", "CWE-119"), budget=900.0,
+         mechanism="stack-overflow",
+         strict_level=True,
+         note="BUG CLASS stack overflow over a socket, on the one target shape where a STACK "
+              "CANARY makes exploitation EASIER. The dispatch used to say the opposite in a "
+              "comment -- \"PIE + CANARY: the leak-free partial-overwrite / BROP paths below "
+              "cannot work, the canary must be leaked and written back\" -- and for a one-shot "
+              "process that is true. A server that fork()s per connection is the exception: the "
+              "canary is generated once, at the PARENT's TLS setup, and every child inherits it, "
+              "exactly as every child inherits the parent's ASLR layout. So the same "
+              "crash-vs-survived oracle that BROP uses to read a saved return address reads the "
+              "CANARY a byte at a time -- a wrong byte aborts in __stack_chk_fail and the "
+              "handler's post-return reply never arrives -- at 7x256 connections worst case, "
+              "glibc's own NUL low byte giving one of the eight away. Measured on this fixture: "
+              "canary recovered in 1.4s, then a 1-byte partial overwrite reaches win() in 1.2s. "
+              "Three things had to be measured rather than assumed. (1) The saved return "
+              "address's slot cannot be found by probing for \"the first word past the canary "
+              "whose corruption crashes\": that finds the saved RBP, because a wild rbp makes "
+              "`leave` set rsp from garbage and the child dies too -- it was measured at 80 when "
+              "the real answer was 88, and the partial overwrite silently missed. It is found by "
+              "READING past the canary and telling the two apart by content (a stack pointer vs a "
+              "main-image code pointer), which the byte-at-a-time read gives for free because it "
+              "writes the canary back as it accumulates. (2) The survival oracle cannot key on a "
+              "literal `OK`: the token is calibrated from the server's own reply to a harmless "
+              "probe, or the path declines for want of an oracle. (3) The reproducer cannot bake "
+              "the canary in -- a re-spawned server has a different one -- so it re-runs the "
+              "read, which is the exploit anyway. The negative control that matters here is "
+              "flipping one byte of the canary we wrote back: it spawns no shell, which is what "
+              "proves the recovered canary was load-bearing."),
+
     Case("prompt_protocol_overflow",
          r"""#include <stdio.h>
 #include <string.h>
@@ -2263,6 +2321,118 @@ int main(void){ setvbuf(stdout,0,2,0);
          requires=("/usr/include/libxml2/libxml/parser.h",),
          strict_level=True,
          note="L3, measured at L1 before this round: the oracle is /etc/passwd's own content arriving through a SYSTEM entity, which is the file read itself and not a step toward one. INJECTION XXE (CWE-611) through xmlReadMemory with entity expansion enabled"),
+
+    #: XInclude is NOT an XXE variant. This parser applies the standard XXE fix -- no
+    #: XML_PARSE_NOENT, so external entities are never substituted -- and is still exposed.
+    Case("xinclude_disclosure",
+         r"""#include <stdio.h>
+#include <string.h>
+#include <libxml/parser.h>
+#include <libxml/xinclude.h>
+#include <libxml/tree.h>
+int main(void){ setvbuf(stdout,0,2,0);
+  static char doc[8192];
+  size_t n = fread(doc, 1, sizeof doc - 1, stdin); doc[n] = 0;
+  /* NO XML_PARSE_NOENT: external entities are NOT substituted, which is the accepted XXE fix.
+     XInclude is a separate feature and reads files anyway. */
+  xmlDocPtr d = xmlReadMemory(doc, (int)n, "in.xml", NULL, XML_PARSE_NONET);
+  if(!d){ printf("parse failed\n"); return 1; }
+  xmlXIncludeProcess(d);
+  xmlChar *out = NULL; int len = 0;
+  xmlDocDumpMemory(d, &out, &len);
+  printf("doc: %.*s\n", len, out ? (char*)out : "");
+  if(out) xmlFree(out);
+  xmlFreeDoc(d); xmlCleanupParser(); return 0; }""",
+         ["-no-pie", "-O0", "-w", "-I/usr/include/libxml2", "-lxml2"],
+         want_level=3, want_cwe=("CWE-611", "CWE-827", "CWE-200"),
+         mechanism="xxe", budget=300.0,
+         requires=("/usr/include/libxml2/libxml/xinclude.h",),
+         strict_level=True,
+         note="INJECTION XInclude file disclosure (CWE-611) -- and the reason it is a probe of its "
+              "own rather than another xxe payload. The accepted fix for XXE is to parse without "
+              "XML_PARSE_NOENT so a SYSTEM entity is never substituted. This fixture does exactly "
+              "that, and `xxe_injection`'s entity payload comes back with the entity UNEXPANDED "
+              "(measured). XInclude is a separate libxml2 feature with its own file-reading power, "
+              "so `<xi:include href=\"file:///etc/passwd\" parse=\"text\"/>` returns the file "
+              "regardless -- measured on the same binary, same run. `parse=\"text\"` is load "
+              "bearing: the default parse=\"xml\" tries to parse /etc/passwd AS XML and fails. The "
+              "oracle is the file's own content, so this is L3 by the same reasoning as xxe: the "
+              "disclosure IS the effect, not a step toward one."),
+
+    #: Command execution in a binary with no `system` and no `popen` anywhere in it.
+    Case("wordexp_command_substitution",
+         r"""#include <stdio.h>
+#include <string.h>
+#include <wordexp.h>
+int main(void){ setvbuf(stdout,0,2,0);
+  char in[512]; printf("path: ");
+  if(!fgets(in, sizeof in, stdin)) return 0;
+  in[strcspn(in, "\n")] = 0;
+  /* a "safe" path expander: no system(), no popen() -- but wordexp() performs the shell's own
+     command substitution, so $(...) and backticks RUN. */
+  wordexp_t we;
+  if(wordexp(in, &we, 0) != 0){ printf("bad pattern\n"); return 1; }
+  for(size_t i = 0; i < we.we_wordc; i++) printf("word: %s\n", we.we_wordv[i]);
+  wordfree(&we); return 0; }""",
+         ["-no-pie", "-O0", "-w"],
+         want_level=3, want_cwe=("CWE-78", "CWE-77"),
+         mechanism="command-injection", budget=300.0,
+         strict_level=True,
+         note="INJECTION command execution with NO command-execution sink in the binary. The "
+              "`command-injection` probe keys on system/popen/exec*; this target imports none of "
+              "them, so nothing fired. `wordexp()` performs the shell's own expansions -- command "
+              "substitution among them -- which makes it a command-execution sink that reads like "
+              "a path utility. The payload set has to be its own, measured: `$(echo MARK)` and "
+              "the backtick form both run, while the cmdi set's `; echo MARK` is REJECTED by "
+              "wordexp as a syntax error (\"bad pattern\"), so reusing that payload list would "
+              "have confirmed nothing. The oracle is the existing one and the right one -- the "
+              "marker appears because the injected `echo` ran, and the literal `echo MARK` does "
+              "not appear, which is what separates execution from an echo of our own input."),
+
+    #: Query control proven by the evaluator's own error. CAPABILITY, not EFFECT -- see the note.
+    Case("xpath_injection",
+         r"""#include <stdio.h>
+#include <string.h>
+#include <libxml/parser.h>
+#include <libxml/xpath.h>
+static const char *DOC =
+  "<users><user><name>alice</name><public>hello</public><secret>S3CRET-A</secret></user>"
+  "<user><name>bob</name><public>world</public><secret>S3CRET-B</secret></user></users>";
+int main(void){ setvbuf(stdout,0,2,0);
+  char in[512]; printf("user: ");
+  if(!fgets(in, sizeof in, stdin)) return 0;
+  in[strcspn(in, "\n")] = 0;
+  xmlDocPtr d = xmlReadMemory(DOC, (int)strlen(DOC), "d.xml", NULL, 0);
+  xmlXPathContextPtr c = xmlXPathNewContext(d);
+  char q[1024];
+  /* the expression is CONCATENATED, so the input is part of the query, not a value in it */
+  snprintf(q, sizeof q, "/users/user[name='%s']/public", in);
+  xmlXPathObjectPtr o = xmlXPathEvalExpression((const xmlChar*)q, c);
+  if(!o){ printf("xpath failed\n"); return 1; }
+  if(o->nodesetval)
+    for(int i = 0; i < o->nodesetval->nodeNr; i++){
+      xmlChar *t = xmlNodeGetContent(o->nodesetval->nodeTab[i]);
+      printf("row: %s\n", t ? (char*)t : ""); if(t) xmlFree(t); }
+  xmlXPathFreeObject(o); xmlXPathFreeContext(c); xmlFreeDoc(d);
+  xmlCleanupParser(); return 0; }""",
+         ["-no-pie", "-O0", "-w", "-I/usr/include/libxml2", "-lxml2"],
+         want_level=2, want_cwe=("CWE-643", "CWE-91"),
+         mechanism="xpath-injection", budget=300.0,
+         requires=("/usr/include/libxml2/libxml/xpath.h",),
+         strict_level=True,
+         note="INJECTION XPath (CWE-643), and a deliberate CAPABILITY verdict rather than an "
+              "effect one. The expression is concatenated, so `x'] | //* | //a[name='` unions in "
+              "node sets the original could never reach -- measured on this fixture, a lookup "
+              "restricted to `public` returned every `secret` element in the document. But the "
+              "generic oracle cannot be that: a probe does not know what the document holds, and "
+              "XPath 1.0 gives an injected expression no way to make the engine emit a marker of "
+              "OUR choosing -- `|` unions node sets and cannot introduce a literal, and there is "
+              "no `document()` outside XSLT. So the confirmation is the evaluator's own error on "
+              "an unbalanced quote (\"XPath error : Invalid predicate\"), which proves the string "
+              "reaches the expression parser and which a target that binds or escapes its value "
+              "never produces. That is control of the query -- L2 -- and the same rung, for the "
+              "same reason, as error-based SQL injection's branch in `sqli_confirm`. Claiming "
+              "demonstrated disclosure off a generic payload would be a guess about the document."),
 
     Case("ssrf_injection",
          r"""#include <stdio.h>

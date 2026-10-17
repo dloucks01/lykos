@@ -1,0 +1,292 @@
+# The TTP gaps doc 38 did not cover (2026-10-17)
+
+Doc 38 closed an ordered list of heap and FSOP techniques. This one starts from a different
+question -- *what is missing across the whole platform, not just the heap catalogue* -- and was
+built from a survey of what is actually in the tree (`exploit_stage`'s strategy dispatch, `rop.py`,
+`heap.py`, the `aaheg` catalogue, `injection.PROBES`, the conformance cases), not from a textbook
+list. The survey's first result was that the tree is broader than doc 38 claimed: SROP, BROP
+partial-overwrite, ret2csu, ret2dlresolve, one-gadget, ORW/seccomp, House of Apple 2, House of Cat,
+setcontext, mprotect-shellcode and cross-arch ret2libc are all real and gated.
+
+What follows is what was not.
+
+## The cheap ones: primitives we already produce, bridged to effects we already demonstrate
+
+### 1. `environ` -> a stack address -- DONE
+
+**The gap.** Arbitrary read existed in three forms and `environ` was already in
+`rop._LEAK_ANCHOR_SYMS`, but only as a *corroborating anchor* for a libc base. Nothing read
+`libc_base + environ` to obtain a STACK address, so an arbitrary read whose process had no
+reachable heap target had nowhere to go.
+
+**Built.** `rop.exec_range`/`is_return_site`/`libc_symbol_ranges`/`saved_return_slots`/
+`main_return_images`/`build_stack_ret2libc`/`environ_stack_targets`, and a `stack` plan in
+`leak.indexed_write_fsop` -- tried LAST, so every existing plan's measured behaviour is byte for
+byte unchanged.
+
+**Measured, not read:**
+
+* A saved return address is told from a code pointer that merely lives in a local by **the bytes
+  BEFORE it decoding as a `call`**. Nothing about register allocation or frame layout changes that.
+  8/8 positives and 6/6 negatives against objdump on a real build.
+* Main's saved return address points into `__libc_start_call_main`, which **no libc exports**. It
+  is identified NEGATIVELY: the first libc code pointer below `environ` that is not inside
+  `__libc_start_main` (exported, with its size). The two libc return addresses above main's both
+  belong to frames that are never returned from -- `__libc_start_main` calls
+  `__libc_start_call_main`, which is noreturn. Measured at -0x130 below `environ`'s value.
+* The walk stops at 0x400 bytes. Deeper slots are the frames of whatever is reading our input, and
+  a chain written there is scribbled over by the next `printf` before that frame ever returns --
+  seen as a write that did not read back and a process dead at the trigger.
+* The chain must be written at **both rsp parities**: `system`'s prologue has a `movaps`, and one
+  parity segfaults (-11) while the other spawns a shell.
+
+**Gate.** `environ_saved_return` -- the same unbounded index, on a program that has closed stderr
+(so `_IO_un_link` took the FILE the other plans forge off `_IO_list_all`) with a 512-byte table
+(under House of Cat's 0x390). On that fixture the setcontext plan's 9 cells all land and the
+trigger does nothing, the system plan's 5 do the same, House of Cat is excluded for room -- and the
+stack plan spawns a shell. **PASS L3 in 36s**; the generated bundle reproducer re-derives the slot
+and pops a shell standalone under full ASLR.
+
+### 2. The SSP / `argv[0]` read oracle -- a MEASURED REFUSAL, not a build
+
+**The gap as stated.** Overwrite `argv[0]` with a pointer and let `__stack_chk_fail` print
+`*** stack smashing detected ***: <argv[0]> terminated` -- an arbitrary-read oracle that exists
+precisely on canary-on targets, which is where leaks are hardest.
+
+**It is dead.** glibc dropped `__libc_argv[0]` from that message. Measured two ways rather than
+asserted from a version: the message printed by a live overflow is
+`*** stack smashing detected ***: terminated` on **both** the host's glibc 2.43 and the cached
+glibc 2.35, and the format string in each libc's bytes is `*** %s ***: terminated\n` -- **one**
+conversion, where the trick needs two (the reason, then the program name).
+
+**Built instead.** `rop.ssp_leak_feasible(libc_data)`, which decides it from the libc's own bytes
+by counting the conversions in `__fortify_fail`'s format string, and says UNKNOWN when handed no
+libc rather than defaulting to the historical answer. Same philosophy as `heap.guard_sites`: never
+assert a libc capability from a version number.
+
+### 3. The canary, brute-forced against a forking server -- DONE
+
+**The gap.** `brop.py` bruted the randomised PIE nibble but had no canary brute, so a forking
+server with `canary=on` capped below the BROP machinery sitting next to it. The dispatch said so in
+a comment: *"PIE + CANARY: the leak-free partial-overwrite / BROP paths below cannot work -- the
+canary must be leaked and written back."* For a one-shot process that is true. For a forking server
+it is exactly backwards.
+
+**Why it is backwards.** The canary is generated once, at the PARENT's TLS setup, and every forked
+child inherits it -- exactly as every child inherits the parent's ASLR layout. So the same
+crash-vs-survived oracle BROP uses to read a saved return address reads the CANARY a byte at a
+time: a wrong byte aborts in `__stack_chk_fail` and the handler's post-return reply never arrives.
+7 x 256 connections at worst, and glibc's own NUL low byte gives one of the eight away.
+
+**Built.** `brop.brute_canary`, `brop.brute_frame`, `brop.canary_pad`,
+`brop.calibrate_survive_token`, a `pad` parameter on `candidate_overwrites`/`brute_ret2win`, and a
+canary branch in `_pie_brop_server_exploit` -- which now runs BEFORE the stdin-driven canary
+weaponizer, because that one would spend its whole budget timing out against a process blocked in
+`accept()`.
+
+**Measured, not read:**
+
+* **The saved return address's slot cannot be probed for.** "The first word past the canary whose
+  corruption crashes the child" is the saved RBP, not the return address: a wild rbp makes `leave`
+  set rsp from garbage and the child dies too. Measured at 80 when the real answer was 88, and the
+  partial overwrite silently missed. It has to be found by READING past the canary and telling the
+  two apart by CONTENT -- a stack pointer vs a main-image code pointer -- which the byte-at-a-time
+  read gives for free, because it writes the canary back as it accumulates.
+* **The survival oracle cannot key on a literal.** `make_survive_oracle`'s `b"OK"` default was the
+  test fixture's own reply. `calibrate_survive_token` reads whatever the server answers to a
+  harmless probe, and the path declines when the server answers nothing -- otherwise every
+  connection looks like a crash and the brute reports the first byte it tried.
+* **A canary cannot be baked into a reproducer**: a re-spawned server has a different one. The
+  reproducer re-runs the byte-at-a-time read, which is the exploit anyway.
+* The control that matters is flipping one byte of the canary we wrote back. It spawns no shell,
+  which is what proves the recovered canary was load-bearing.
+
+**Timings on the fixture:** canary recovered in 1.4s; the full frame read (canary + rbp + return
+address, 32 bytes) in 97s; the leak-free 1-byte partial overwrite to `win()` in 1.2s.
+
+**Gate.** `forking_server_canary_brute` -- **PASS L3 in 252s, `pie=on can=on`,
+`build_exploit/CWE-121`** -- and it is the FIRST gate case to drive the forking-server BROP path at
+all, canary or not. Those paths had only ever had unit tests. One thing the run surfaced on the
+way: `synthesize_injection` wedges on a forking-server target and has its lease reclaimed, which
+costs the run time but not the verdict.
+
+## 4. Shellcode craft -- DONE
+
+`shellcode.py` was 45 bytes of `execve` plus a bad-char encoder. Two real failure modes had no
+answer at all, and the encoder turned out not to work for the commonest constraint there is.
+
+**`egg_hunter` / `egg` (48 bytes).** For a target whose EXECUTABLE buffer is too small but which
+holds a larger copy of our input somewhere else -- an environment variable, argv, a heap copy of a
+file. The hunter goes in the small one and the payload in whatever has room, with no address known
+to either side. Measured finding a payload at 0x100, 0x4000 and 0x100000 bytes, and declining when
+the tag is broken. Two details were measured rather than read:
+
+* the walk starts at `lea rdx, [rip]`, not at 0. From the bottom of the address space it is one
+  `access()` syscall per page across 47 bits and it never arrives -- the first version hung.
+* the probe is `access(rdx + 8, 0)`, not `access(rdx, 0)`. The comparison reads EIGHT bytes
+  (`scasd` twice), so a window whose first byte is on a mapped page and whose last is not faults
+  even though the probe passed. Seen as a SIGSEGV at exactly the distance where the scan crossed
+  into unmapped memory. Probing the window's END covers both pages in one syscall, because the walk
+  only ever enters pages it has already validated.
+
+`access` is the probe rather than a SIGSEGV handler because its -EFAULT return reports an unmapped
+page WITHOUT taking a signal, so the hunter leaves the target's own handlers alone.
+
+**`find_socket_execve_binsh` (82 bytes) / `dup2_execve_binsh` (40).** `execve_binsh` alone is
+useless on a network target: the shell inherits the service's stdio, which goes to a log or
+/dev/null, and nothing reaches the attacker. The usual alternative is a reverse shell, which needs
+outbound egress -- and could not be verified by this repo's own standard, since the sandbox runs
+with `net=False`. `getpeername(fd)` returning 0 is the test, and it is the right one: it succeeds
+only on a socket that HAS a peer, so a LISTENING socket fails it (ENOTCONN) and so does every file,
+pipe and tty (ENOTSOCK). Measured walking 0, 1, 2 (ENOTSOCK), 3 (EBADF -- the listening socket the
+child closed) and finding 4; shell over the connection; int3 control at the same length fails.
+
+**`encode_avoiding` rewritten.** Three choices, each forced by a banned set defeating the obvious
+one:
+
+* the `jmp`/`call`/`pop` get-PC replaces `lea rsi, [rip+N]`. A forward RIP-relative reference has
+  only a disp32, so it wrote three NUL bytes into the decoder's own displacement -- and
+  `exploit_stage` asks for exactly `{0x00, 0x0a}` ("a line reader stops at NUL / newline") at a
+  call site that could therefore **never** succeed. A backward `call` is a small negative disp32,
+  which is 0xff bytes and no NULs, and its pushed return address IS the payload's address.
+* `dec dl; jnz` replaces `loop`. `loop` needs the whole of rcx zeroed first, and every short way to
+  zero it (`xor ecx,ecx`, `sub ecx,ecx`) encodes ModRM 0xc9 -- which HTB execute's banned set, the
+  one real set this module was built against, bans.
+* the loop body takes 0-3 filler bytes, searched alongside the keys, because even then the `jnz`'s
+  own displacement came out 0xf6, also banned. **A stub with fixed bytes is only ever LUCKY with
+  respect to a banned set; searching a small variant space is what makes it robust.**
+
+Plus a 4-byte rolling key as a fallback, and the `push imm8` length load is gone: it SIGN-EXTENDS,
+so a payload of 128 bytes or more set rcx to ~2^64 and the decode loop ran over the address space.
+
+Measured: all four stubs now encode against `{NUL,LF}`, a line-reader set, HTB and HTB+NUL+LF;
+`{NUL,LF}` was previously impossible for every payload. Both decoders and the hunter are proved by
+EXECUTION. The honest remaining limit is the stub's own fixed alphabet -- against a random 40-byte
+banned set the dominant outcome is still "no encoding", and no key or padding can move those bytes.
+
+**Not built, with reasons.** A reverse shell: unverifiable under `net=False`, so it could only be
+claimed, not demonstrated. An alphanumeric/printable-only encoder: not reachable as an extension of
+this design, since the XOR stub's own bytes are non-printable -- it needs a sub-encoder, which is
+its own piece of work.
+
+## 5. Kernel -- what is possible here, measured
+
+Two facts bound this item, both measured on the host rather than assumed:
+
+* **there is no kernel build tree** (`/lib/modules/$(uname -r)/build` does not exist), so a
+  planted-bug module cannot be compiled -- which means no conformance fixture, by the same logic
+  that makes every other case in the gate possible;
+* **`qemu-system-*` is not installed**, so no kernel can be booted. Every dynamic rung is therefore
+  out of reach: no ret2usr, no kROP, no `modprobe_path`, no heap spray, because none of them can be
+  *run*, and this platform's standard is a demonstrated effect.
+
+So the honest scope is static, and the finding was that lykos could not see a kernel module at all.
+Measured on two real modules from this host (`binfmt_misc.ko`, `test_bpf.ko`):
+
+| | before | after |
+|---|---|---|
+| imports reported | **0** | 65 / 51 |
+| exports reported | **0** | 4 / 6 |
+| call sites recovered | **0 named** | 163 / 902, exact |
+| `relro` / `bind_now` | `off` (fabricated) | `unknown` |
+
+Three things were wrong, and each is plumbing rather than analysis -- the usual shape:
+
+1. **Imports came only from `.dynsym`.** An ET_REL object has none; its external references are
+   UNDEFINED entries in `.symtab`. Every import-gated detector and every injection probe keys on
+   `imported_symbols`, so a `.ko` was silently invisible to all of them.
+2. **`relro` and `bind_now` were reported as `off`.** They are properties of a LINK, and a
+   relocatable object has not been linked -- it has no program headers, so there is no
+   `PT_GNU_RELRO` to find and no `DT_FLAGS` to read. Reporting `off` states a fact about the file
+   that is not in the file.
+3. **The call graph is in the relocations, not the instructions.** In an unlinked object every
+   external call is `call <self+5>` with a placeholder displacement; the callee's name appears only
+   in `.rela.text`. Measured on `binfmt_misc.ko`: `call <scanarg+0x5>` with
+   `R_X86_64_PLT32 __check_object_size-0x4` beside it. A disassembler that does not apply
+   relocations loses every callee name, so each call-edge detector saw edges pointing back into
+   their own function.
+
+`elf.rel_call_sites` reads them directly -- exact, not heuristic, and needing no backend: the
+relocation names the symbol, the section header names the section, `r_offset` is the byte. Verified
+against `readelf` to the entry: 163/163 and 902/902. It then surfaced `_copy_from_user` at
+`.text+0x13b` and `.text+0x4f9` in `binfmt_misc.ko` -- that module's actual user-input surface.
+
+The kernel sinks added to the `DANGEROUS` catalogue are advisory severities on purpose, on the same
+footing as `memcpy`: the sink is certain, the defect needs the data flow. What is different about
+them is the boundary -- the argument comes from an unprivileged process, so an unvalidated length is
+a privilege-boundary violation rather than a crash in the caller's own program.
+
+## 6. App-layer injection -- three classes added, the rest refused
+
+`injection.PROBES` had six classes. The constraint that decides what can be added is this
+platform's own standard: a probe needs a NATIVE sink symbol and an OFFLINE, forgery-proof oracle.
+Three classes clear it.
+
+* **XInclude (CWE-611)** -- and it is NOT an XXE variant, which is the point. The accepted XXE fix
+  is to parse without `XML_PARSE_NOENT` so a SYSTEM entity is never substituted. Measured on one
+  binary built exactly that way: the entity payload came back with the entity UNEXPANDED, and
+  `<xi:include href="file:///etc/passwd" parse="text"/>` returned the file. `parse="text"` is
+  load-bearing -- the default `parse="xml"` tries to parse /etc/passwd AS XML and fails.
+* **`wordexp` command substitution (CWE-78)** -- command execution in a binary with no `system`,
+  no `popen` and no `exec*` anywhere in it, so the existing `command-injection` probe does not even
+  apply. Its payload set has to be its own: measured, `$(echo MARK)` and the backtick form run,
+  while the cmdi set's `; echo MARK` is REJECTED by `wordexp` as a syntax error.
+* **XPath (CWE-643)** -- deliberately a CAPABILITY verdict (L2), not an effect one. The union
+  payload really does disclose: on the fixture, a lookup restricted to `public` returned every
+  `secret` in the document. But a probe does not know what the document holds, and XPath 1.0 gives
+  an injected expression no way to make the engine emit a marker of OUR choosing -- `|` unions node
+  sets and cannot introduce a literal, and there is no `document()` outside XSLT. So the oracle is
+  the evaluator's own error on an unbalanced quote, which proves the string reaches the expression
+  parser and which a target that binds or escapes its value never produces. Same rung, same
+  reasoning, as error-based SQL injection's branch in `sqli_confirm`.
+
+**Refused, with the reason.** SSTI, JNDI/log4shell and prototype pollution have no native sink in
+this platform (Java and JavaScript territory; the JVM front-end reaches L1 and cannot execute an
+attacker class). LDAP and NoSQL injection have real C sinks but no offline oracle -- both need a
+live server, so a probe could only report that the sink exists, which `dangerous_api` already does.
+Zip-slip has a real sink and a real oracle, but the oracle is "a file appeared outside the
+destination directory", which the probe framework cannot see: it grades OUTPUT. That one is a
+framework change, not a probe.
+
+## Found on the way
+
+**`socket_overflow` fails its bundle check, and has nothing to do with this round.** Measured
+twice with this round's changes and once on a CLEAN tree at `065dc30`: identical verdict, identical
+740s -- `L1 verified but the BUNDLE does not reproduce: bundle ran but exited 0 (want >=128, a
+signal)`. So it is pre-existing and deterministic, not a flake and not a regression. The shape of
+it: `_bundle_reproduces` reads `$?` and wants 128+signum, and this target's `main` loops forever on
+`accept()`, so a `runner.sh` that returns 0 promptly means the payload never reached the handler on
+replay. That is a socket-channel BUNDLE problem -- the detection half works, `net_fuzz` files
+CWE-119 at L1 -- and it belongs to the bundle/replay seam, not to this programme. Diagnosing it
+needs a `--keep-failed` run to open the shipped `runner.sh`.
+
+`synthesize_injection` **wedges on a TCP-server target** and has its lease reclaimed by the
+supervisor (`worker-N wedged in stage synthesize_injection ... the stuck thread is abandoned`).
+Observed on two different server cases, including one run before any of this round's probes
+existed, so it is pre-existing. It costs roughly 90 seconds per server case and does not change the
+verdict.
+
+## Still to do in this programme
+
+7. **The exit-handler family**, as one unit: `_rtld_global`/`_dl_fini` first because it skips
+   PTR_MANGLE entirely, then `__exit_funcs`/`atexit` and the TLS `dtor_list`, which share the
+   mangled-pointer problem. Everything built so far reaches control flow through stdio or a saved
+   return address; `exit()` is still unmodelled.
+8. **Zip-slip / archive extraction traversal.** It has a real native sink (libarchive) and a real
+   oracle, but the oracle is a FILESYSTEM effect and the probe framework grades output. Closing it
+   means giving a probe a filesystem oracle, which is a framework change worth doing on its own.
+9. **An alphanumeric / printable-only encoder.** Not reachable by extending `encode_avoiding`: the
+   XOR stub's own bytes are non-printable, so it needs a sub-encoder.
+
+## Noted but deliberately not built
+
+* **House of Apple 1/3** -- only needed when the FSOP route we have is blocked, and House of Apple
+  2 + House of Cat + setcontext already cover the reachable shapes.
+* **`tcache_perthread_struct`** -- an amplifier on tcache poisoning, not a way in.
+* **ret2vdso** -- `_execve_rop_exploit` already handles the static-binary case it would serve.
+* **JOP/COP** -- matters against CFI / no-`ret` binaries, and nothing in the corpus produces those.
+* **Windows is structurally capped, not merely unimplemented.** `substrate.py` is explicit: PE
+  dispatches to wine, which AFL cannot instrument and whose `wineserver` our ptrace supervision
+  cannot follow (`batchable=False`). SEH overwrite and DLL search-order hijack need that
+  supervision problem solved first, not the techniques written.
+* **ARM hardening** -- PAC is nop'd in the fixtures rather than defeated; BTI and MTE unmodelled.

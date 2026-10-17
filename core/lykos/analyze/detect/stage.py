@@ -509,6 +509,27 @@ def _detect_pyc(ctx, target, data) -> dict:
     return {}
 
 
+def _rel_edges(ctx, target) -> list:
+    """Call edges of an ET_REL target, synthesised from its relocations. Empty for a linked
+    binary, whose call graph the disassembler already has -- adding them there would duplicate
+    every edge."""
+    from ...db.models import CallEdge
+    from .. import elf as elfmod
+    if (target.file_type or "").lower() != "elf":
+        return []
+    try:
+        data = ctx.content.path(target.sha256).read_bytes()
+    except Exception:                                    # noqa: BLE001
+        return []
+    out = []
+    for s in elfmod.rel_call_sites(data):
+        out.append(CallEdge(
+            id="", target_id=target.id, created_at=0,
+            src_addr=(hex(s["func_addr"]) if s.get("func_addr") is not None else None),
+            site_addr=hex(s["offset"]), dst_addr=None, dst_name=s["name"], external=True))
+    return out
+
+
 def detect_stage(ctx) -> dict:
     target = TargetDAO(ctx.conn).get(ctx.target_id) if ctx.target_id else None
     if target is None:
@@ -551,6 +572,14 @@ def detect_stage(ctx) -> dict:
     # can say which code is the program's own, detection listens to it -- the same attribution
     # coverage uses. When it cannot (stripped, no local symbols), nothing is filtered.
     functions, edges, dropped = _program_only(ctx, target, functions)
+    # A RELOCATABLE object -- a Linux kernel module, a firmware object file, any `.o` -- has its
+    # call graph in its RELOCATIONS, not its instructions: the displacement of every external call
+    # is a placeholder (`call <self+5>`) and the callee's name lives in `.rela.text`. The
+    # disassembler therefore produces edges that all point back into their own function, and every
+    # call-edge detector sees no sinks at all. These edges are exact (the relocation names the
+    # symbol and gives the byte it patches) and they are ADDED to the recovered ones rather than
+    # replacing them, so internal calls the disassembler did resolve are kept.
+    edges = edges + _rel_edges(ctx, target)
     # hydrate decompiler stack frames + per-function IR (heavy; omitted from the list view) for
     # size-aware detection and call-site destination analysis (the CWE-121 stack-dest gate). Both
     # come from the same full-function load, so we do it once here and reuse it for the taint pass.

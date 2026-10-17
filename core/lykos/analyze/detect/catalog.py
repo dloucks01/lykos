@@ -139,6 +139,33 @@ DANGEROUS = {
     "mysql_real_query": ("CWE-89", "medium", "mysql_real_query -- check the SQL is parameterized"),
     "PQexec":           ("CWE-89", "medium", "PQexec -- check the SQL is parameterized"),
     "PQexecParams":     ("CWE-89", "low",    "PQexecParams -- parameterized, verify the template"),
+    # --- KERNEL (a .ko / ET_REL object). The boundary these cross is the one that matters: the
+    # argument comes from an unprivileged process, so a length or index that is not validated on
+    # the kernel side is a privilege boundary violation, not a crash in the caller's own program.
+    # Advisory severities, because whether the size is checked needs the data flow -- the same
+    # footing as `memcpy` above, and the same reason: the SINK is certain, the defect is not.
+    "copy_from_user":   ("CWE-1285", "medium", "copy_from_user -- validate the length against the "
+                                               "destination before trusting a user-supplied size"),
+    "_copy_from_user":  ("CWE-1285", "medium", "_copy_from_user -- validate the length against the "
+                                               "destination before trusting a user-supplied size"),
+    "__copy_from_user": ("CWE-1285", "medium", "__copy_from_user -- the double-underscore form "
+                                               "skips access_ok(); the caller must do it"),
+    "copy_to_user":     ("CWE-200",  "medium", "copy_to_user -- a length past the source leaks "
+                                               "kernel memory to the calling process"),
+    "_copy_to_user":    ("CWE-200",  "medium", "_copy_to_user -- a length past the source leaks "
+                                               "kernel memory to the calling process"),
+    "__copy_to_user":   ("CWE-200",  "medium", "__copy_to_user -- skips access_ok(); the caller "
+                                               "must do it"),
+    "memdup_user":      ("CWE-789",  "low",    "memdup_user -- a user-controlled size becomes a "
+                                               "kernel allocation"),
+    "vmemdup_user":     ("CWE-789",  "low",    "vmemdup_user -- a user-controlled size becomes a "
+                                               "kernel allocation"),
+    "strncpy_from_user": ("CWE-120", "low",    "strncpy_from_user -- bound by the DESTINATION, not "
+                                               "by what the user sent"),
+    "simple_write_to_buffer": ("CWE-787", "low", "simple_write_to_buffer -- check the available "
+                                                 "length, not the requested one"),
+    "sprint_symbol":    ("CWE-200",  "low",    "sprint_symbol -- resolves a kernel address to a "
+                                               "name, defeating KASLR if it reaches userspace"),
 }
 
 # APIs whose presence is worth REPORTING but is not by itself a defect claim. `memcpy` is a

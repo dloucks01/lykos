@@ -316,6 +316,14 @@ def parse(data: bytes) -> ElfInfo:
     try:
         dsym = by_name.get(".dynsym")
         dstr = by_name.get(".dynstr")
+        # A RELOCATABLE object (ET_REL) has no .dynsym at all: its external references are
+        # UNDEFINED entries in .symtab, resolved by whoever links or loads it. A Linux kernel
+        # module is exactly that, so without this fallback a .ko parsed as zero imports and zero
+        # exports -- which silently blinded every import-gated detector and every injection probe
+        # to the entire class of target, since each of them gates on `imported_symbols`.
+        if info.elf_type == "rel" and not dsym:
+            dsym = by_name.get(".symtab")
+            dstr = by_name.get(".strtab")
         _symsize = 24 if is64 else 16            # sizeof(Elf64_Sym) / sizeof(Elf32_Sym)
         if dsym and dstr and dsym["entsize"] >= _symsize:
             strblob = data[dstr["offset"]:dstr["offset"] + dstr["size"]]
@@ -384,6 +392,13 @@ def parse(data: bytes) -> ElfInfo:
            else ("off" if info.elf_type == "exec" else "unknown"))
     bind_now = bool(dt_flags & DF_BIND_NOW) or bool(df1 & DF_1_NOW)
     relro = "on" if (gnu_relro and bind_now) else ("partial" if gnu_relro else "off")
+    # RELRO and bind-now are properties of a LINK, and a relocatable object has not been linked:
+    # it has no program headers, so there is no PT_GNU_RELRO to find and no DT_FLAGS to read.
+    # Reporting them as "off" states a fact about the file that is not in the file -- the same
+    # fabrication the mitigation audit was about -- so they are unknown here.
+    _rel_obj = info.elf_type == "rel"
+    if _rel_obj:
+        relro = "unknown"
     # Surface bind_now as its OWN field, not only folded into relro. The two differ in a way that
     # decides exploit technique: a GOT-WRITE (format %hhn, GOT overwrite) needs a WRITABLE GOT, and
     # ret2dlresolve needs LAZY binding -- both dead under bind-now -- while a GOT-READ leak (puts@got)
@@ -399,7 +414,8 @@ def parse(data: bytes) -> ElfInfo:
                             "prctl", "syscall"}) and ("prctl" in _imps or any(
                                 s.startswith("seccomp") for s in _imps))
     info.mitigations = {"nx": nx, "pie": pie, "relro": relro,
-                        "bind_now": "on" if bind_now else "off",
+                        "bind_now": ("unknown" if _rel_obj
+                                     else "on" if bind_now else "off"),
                         "canary": "on" if canary else "off",
                         "fortify": "on" if fortify else "off",
                         "seccomp": "on" if seccomp else "off"}
@@ -667,3 +683,148 @@ def main_from_start(data: bytes) -> Optional[int]:
     except Exception:
         observe.absorbed(_log, "answering None")
         return None
+
+
+# --------------------------------------------- relocatable objects: the call graph is in the relocs
+#: x86-64 / AArch64 / ARM relocation types that a CALL or a tail JUMP uses. In a relocatable object
+#: the instruction's own displacement is a placeholder (-4, i.e. `call <self+5>`), so a disassembler
+#: that does not apply relocations loses the callee's NAME entirely -- measured on a real kernel
+#: module, where every external call reads `call <scanarg+0x5>` and the symbol
+#: (`__check_object_size`) appears only in `.rela.text`. Reading the relocation recovers it exactly.
+_CALL_RELOCS = {
+    "x86-64": {2, 4},        # R_X86_64_PC32, R_X86_64_PLT32
+    "x86": {2, 4},           # R_386_PC32, R_386_PLT32
+    "aarch64": {283},        # R_AARCH64_CALL26 (and JUMP26 = 282, added below)
+    "arm": {28, 29},         # R_ARM_CALL, R_ARM_JUMP24
+}
+_CALL_RELOCS["aarch64"].add(282)
+
+
+SHT_REL, SHT_RELA = 9, 4
+
+
+def _raw_sections(data: bytes, is64: bool, endc: str) -> list:
+    """Section headers as [{name, type, flags, addr, offset, size, link, info, entsize}], with
+    `name` resolved through .shstrtab. `parse` builds a reduced view of these for reporting; the
+    relocation walk needs link/info/entsize, which that view drops."""
+    e_shoff, e_shentsize, e_shnum = _section_header_table(data, is64, endc)
+    shstrndx = struct.unpack_from(endc + "H", data, 0x3E if is64 else 0x32)[0]
+    out = []
+    for i in range(e_shnum):
+        o = e_shoff + i * e_shentsize
+        if o + (64 if is64 else 40) > len(data):
+            break
+        if is64:
+            (nm, ty, fl, addr, off, sz, lnk, inf, _al, ent) = struct.unpack_from(
+                endc + "IIQQQQIIQQ", data, o)
+        else:
+            (nm, ty, fl, addr, off, sz, lnk, inf, _al, ent) = struct.unpack_from(
+                endc + "IIIIIIIIII", data, o)
+        out.append({"name_off": nm, "type": ty, "flags": fl, "addr": addr, "offset": off,
+                    "size": sz, "link": lnk, "info": inf, "entsize": ent, "name": ""})
+    if shstrndx < len(out):
+        base = out[shstrndx]["offset"]
+        for sec in out:
+            end = data.find(b"\x00", base + sec["name_off"])
+            sec["name"] = data[base + sec["name_off"]:
+                               end if end >= 0 else len(data)].decode("utf-8", "replace")
+    return out
+
+
+def rel_call_sites(data: bytes, info: Optional[ElfInfo] = None) -> list:
+    """Call sites of a RELOCATABLE object (ET_REL), read from its relocations as
+    [{section, offset, name, type, addend}].
+
+    This is the call graph of a Linux kernel module, a firmware object file or any `.o` -- targets
+    whose external references are undefined `.symtab` entries and whose call instructions carry a
+    placeholder displacement. Every call-edge detector in this engine keys on a callee NAME, so
+    without this an ET_REL target produced edges that all pointed back into their own function and
+    no sink was ever recognised.
+
+    Exact rather than heuristic: the relocation names the symbol, the section header names the
+    section it patches, and `r_offset` is the byte in that section. Only relocations against
+    UNDEFINED symbols are returned -- a reloc against a locally defined symbol is an internal
+    call, which a disassembler resolves on its own."""
+    info = info or parse(data)
+    if info.elf_type != "rel":
+        return []
+    want = _CALL_RELOCS.get((info.arch or "").lower())
+    is64 = info.bits == 64
+    endc = "<" if (info.endianness or "little") == "little" else ">"
+    try:
+        sh = _raw_sections(data, is64, endc)
+        symtab = next((x for x in sh if x["type"] == SHT_SYMTAB), None)
+        if not symtab or symtab["link"] >= len(sh):
+            return []
+        strtab = sh[symtab["link"]]
+        strblob = data[strtab["offset"]:strtab["offset"] + strtab["size"]]
+        symsize = 24 if is64 else 16
+
+        def _symname(off):
+            end = strblob.find(b"\x00", off)
+            return strblob[off:end if end >= 0 else len(strblob)].decode("utf-8", "replace")
+
+        # Defined FUNC symbols, so each call site can name the function it is IN. Without this a
+        # module's findings have no `function_addr` and every site collapses to a bare offset.
+        owners = []
+        nsym = _fits(data, symtab["offset"], symsize,
+                     symtab["size"] // symsize if symsize else 0)
+        for k in range(nsym):
+            so = symtab["offset"] + k * symsize
+            if is64:
+                st_name, st_info, _o2, st_shndx, st_val, st_sz = struct.unpack_from(
+                    endc + "IBBHQQ", data, so)
+            else:
+                st_name, st_val, st_sz, st_info, _o2, st_shndx = struct.unpack_from(
+                    endc + "IIIBBH", data, so)
+            if (st_info & 0xF) == STT_FUNC and st_shndx not in (0, 0xFFF1) and st_sz:
+                owners.append((st_shndx, st_val, st_val + st_sz, _symname(st_name)))
+
+        def _owner(shndx, off):
+            for sx, lo, hi, nm in owners:
+                if sx == shndx and lo <= off < hi:
+                    return nm, lo
+            return None, None
+
+        out = []
+        for sec in sh:
+            if sec["type"] != SHT_RELA or sec["entsize"] < (24 if is64 else 12):
+                continue
+            target = sh[sec["info"]]["name"] if sec["info"] < len(sh) else ""
+            # Only code sections: a relocation in .data or .rodata is a pointer, not a call site.
+            if not (target.startswith(".text") or target.startswith(".init")
+                    or target.startswith(".exit")):
+                continue
+            n = _fits(data, sec["offset"], sec["entsize"],
+                      sec["size"] // sec["entsize"] if sec["entsize"] else 0)
+            for k in range(n):
+                o = sec["offset"] + k * sec["entsize"]
+                if is64:
+                    r_off, r_info, r_add = struct.unpack_from(endc + "QQq", data, o)
+                    sym_idx, r_type = r_info >> 32, r_info & 0xFFFFFFFF
+                else:
+                    r_off, r_info, r_add = struct.unpack_from(endc + "IIi", data, o)
+                    sym_idx, r_type = r_info >> 8, r_info & 0xFF
+                if want is not None and r_type not in want:
+                    continue
+                so = symtab["offset"] + sym_idx * symsize
+                if so + symsize > len(data):
+                    continue
+                if is64:
+                    st_name, _i, _o2, st_shndx, _v, _sz = struct.unpack_from(
+                        endc + "IBBHQQ", data, so)
+                else:
+                    st_name, _v, _sz, _i, _o2, st_shndx = struct.unpack_from(
+                        endc + "IIIBBH", data, so)
+                if st_shndx != 0:
+                    continue                 # locally defined: an internal call
+                end = strblob.find(b"\x00", st_name)
+                nm = strblob[st_name:end if end >= 0 else len(strblob)].decode("utf-8", "replace")
+                if nm:
+                    fn, fa = _owner(sec["info"], r_off)
+                    out.append({"section": target, "offset": r_off, "name": nm,
+                                "type": r_type, "addend": r_add,
+                                "func": fn, "func_addr": fa})
+        return out
+    except Exception:                        # noqa: BLE001
+        return []

@@ -1732,3 +1732,42 @@ def environ_stack_targets(libc_data: bytes) -> dict:
                                                  if n in syms),
             "pop_rdi": pop_rdi, "binsh": binsh, "system": syms["system"],
             "ret": find_gadget(libc_data, "ret") or 0}
+
+
+# --- the SSP message as a read oracle: a measured refusal -------------------------------------
+#: `__fortify_fail`'s format string. The classic canary-era trick is to overwrite `argv[0]` with a
+#: pointer and let `__stack_chk_fail` print what it points at -- an arbitrary-read oracle that
+#: exists only on canary-on targets, which is where a leak is hardest to come by. glibc removed
+#: the program name from that message, so the trick is dead; the question is whether it is dead in
+#: THIS libc, and the libc's own bytes answer it without a version table. The format carried
+#: `*** %s ***: %s terminated\n` (two conversions: the reason, then `__libc_argv[0]`) and now
+#: carries `*** %s ***: terminated\n` (one).
+_SSP_FMT = b"*** %s ***"
+
+
+def ssp_leak_feasible(libc_data: bytes) -> dict:
+    """Whether `__stack_chk_fail`'s message still discloses `argv[0]`, decided by counting the
+    conversions in `__fortify_fail`'s own format string.
+
+    Returns {ok, conversions, format, reason}. `ok` is False when the message takes one argument
+    (the reason alone), which means overwriting `argv[0]` discloses nothing and a canary-on target
+    needs a different oracle -- an out-of-bounds read, a format string, or the byte-at-a-time
+    canary brute a forking server allows. UNKNOWN (ok None) when handed no libc bytes, rather than
+    defaulting to the historical answer."""
+    if not libc_data:
+        return {"ok": None, "conversions": 0, "format": "",
+                "reason": "no libc bytes: whether the SSP message discloses argv[0] is unknown"}
+    idx = libc_data.find(_SSP_FMT)
+    if idx < 0:
+        return {"ok": False, "conversions": 0, "format": "",
+                "reason": "this libc has no `*** %s ***` fortify message at all"}
+    end = libc_data.find(b"\x00", idx)
+    fmt = libc_data[idx:end if end > idx else idx + 64]
+    n = fmt.count(b"%s")
+    return {"ok": n >= 2, "conversions": n, "format": fmt.decode("latin-1", "replace"),
+            "reason": (f"{fmt.decode('latin-1', 'replace')!r} takes {n} conversions: "
+                       + ("the second is `__libc_argv[0]`, so overwriting argv[0] with a pointer "
+                          "makes __stack_chk_fail print what it points at"
+                          if n >= 2 else
+                          "the reason only -- glibc dropped `__libc_argv[0]` from the message, so "
+                          "overwriting argv[0] discloses nothing"))}
