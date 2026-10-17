@@ -1286,7 +1286,7 @@ def _scorecard(store, target, bud, status, *, absorbed_base=None,
     # (`_PLAN_STAGES`) and does not list every stage -- `fuzz` is absent from it -- so deriving
     # "was this scheduled" from the plan reported the main fuzzing stage as never scheduled in a
     # run that had just executed 3,553 inputs through it. Every stage that was enqueued has a row.
-    scheduled, errored_set, done_set = set(), set(), set()
+    scheduled, errored_set, done_set, cut_set = set(), set(), set(), set()
     try:
         from ..db.dao import AnalysisRunDAO
         for r in AnalysisRunDAO(store.conn).list_by_case(target.case_id):
@@ -1297,6 +1297,14 @@ def _scorecard(store, target, bud, status, *, absorbed_base=None,
                 errored_set.add(r.stage)
             elif r.status == "done":
                 done_set.add(r.stage)
+            elif r.status == "cancelled":
+                # STOPPED SHORT, which is neither of the two outcomes the card had. A stage the
+                # budget cut off did no work and refused nothing, so it fell out of the card
+                # entirely: `detect_cwe` on an 8 MB ASan libsndfile build vanished from a run
+                # that had scheduled it, and the reader saw 0 findings from a detector that was
+                # never allowed to finish. Counting it as an error was the other half of the
+                # same mistake -- running out of a slice is a normal result on a big target.
+                cut_set.add(r.stage)
     except Exception:                                    # noqa: BLE001 -- advisory
         _log.debug("scorecard: run table read failed", exc_info=True)
     try:
@@ -1313,6 +1321,7 @@ def _scorecard(store, target, bud, status, *, absorbed_base=None,
         "worked": worked,
         "declined": sorted(declined),
         "errored": errored,
+        "cancelled": sorted(cut_set),
         # Registered but never scheduled for this target: the honest answer to "is the pipeline
         # using everything it has". Case-level stages and the triage front door are excluded
         # because they are not per-target work.

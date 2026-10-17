@@ -304,10 +304,17 @@ def _print_scorecard(card: dict) -> None:
         print(f"  capability   {len(cap.get('worked') or [])} did work, "
               f"{len(cap.get('declined') or [])} declined, "
               f"{len(cap.get('errored') or [])} errored, "
-              f"{len(cap.get('never_scheduled') or [])} never scheduled "
+              + (f"{len(cap['cancelled'])} cut short, " if cap.get("cancelled") else "")
+              + f"{len(cap.get('never_scheduled') or [])} never scheduled "
               f"(of {cap.get('registered', 0)} registered)")
         if cap.get("errored"):
             print("  ERRORED      " + ", ".join(cap["errored"][:6]))
+        # A stage the budget stopped is not a failure and not a result: it is a stage whose
+        # answer nobody has. Saying so is the difference between "found nothing" and
+        # "was not allowed to look".
+        if cap.get("cancelled"):
+            print("  cut short    " + ", ".join(cap["cancelled"][:6])
+                  + " (out of budget -- raise --budget to let them finish)")
         if cap.get("never_scheduled"):
             print("  not reached  " + ", ".join(cap["never_scheduled"][:8])
                   + (" ..." if len(cap["never_scheduled"]) > 8 else ""))

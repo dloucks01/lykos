@@ -177,6 +177,16 @@ def score_run(ev: Evidence, src: Path, budget: float) -> Row:
             continue
         msg = f"entry point {d.get('entry')} did not build: {(d.get('why') or '')[:70]}"
         (row.problems if i == 0 else row.notes).append(msg)
+    # A stage the BUDGET stopped is neither a failure nor a result, and it used to be neither
+    # visible nor distinguishable: the heartbeat let the lease lapse on purpose, the reaper
+    # recorded `error: lease expired`, and this gate failed the target on "stage errored" for
+    # doing exactly what it was told. It is a NOTE, because how much budget to give a target is
+    # the operator's decision -- but a silent one would leave "0 findings" and "never finished
+    # looking" reading alike.
+    _cut = list(cap.get("cancelled") or [])
+    if _cut:
+        row.notes.append("cut short by the budget: " + ",".join(_cut[:4])
+                         + " -- their answer is unknown, not negative")
     _ab = card.get("absorbed") or {}
     row.absorbed = int(_ab.get("total") or 0)
     row.absorbed_sites = int(_ab.get("sites") or 0)

@@ -157,3 +157,31 @@ def test_a_budget_stop_is_cancelled_not_errored(tmp_path):
         assert q.runs.get(run2.id).status in ("queued", "error")
     finally:
         store.close()
+
+
+def test_a_stage_the_budget_cut_off_is_reported_as_such(tmp_path):
+    """The scorecard had two outcomes for a stage -- it worked, or it declined -- and a cancelled
+    run was neither, so it fell out of the card entirely: `detect_cwe` vanished from a run that
+    had scheduled it, and a reader saw 0 findings from a detector that was never allowed to
+    finish. Calling it an error was the other half of the same mistake."""
+    from lykos.analyze.budget import CaseBudget
+    from lykos.analyze.orchestrate import _scorecard
+    from lykos.casestore import CaseStore
+    from lykos.jobs import JobQueue
+    store = CaseStore.open(tmp_path / "c")
+    try:
+        case = store.cases.create("budget")
+        target = store.targets.upsert(case.id, "t.bin", "0" * 64, size=1, file_type="elf")
+        q = JobQueue(store.conn)
+        run = q.enqueue(case.id, "detect_cwe", target_id=target.id, params={})
+        assert q.claim("w1", ["quick"], 1) == run.id
+        q.cancel(run.id)
+        store.conn.execute("UPDATE analysis_run SET lease_expires_at=1 WHERE id=?", (run.id,))
+        store.conn.commit()
+        q.reap()
+        cap = _scorecard(store, target, CaseBudget(60.0), {"state": "done"})["capability"]
+        assert cap["cancelled"] == ["detect_cwe"]
+        assert "detect_cwe" not in cap["errored"]
+        assert "detect_cwe" not in cap["worked"]
+    finally:
+        store.close()
