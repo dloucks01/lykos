@@ -38,6 +38,10 @@ class Env:
     glibc: tuple = (2, 42)
     tcache: bool = True
     has_leak: bool = True             # arbitrary addresses assume a leak (PIE/heap/libc)
+    #: The libc the target actually links, when we have it. Some techniques are decided by a
+    #: check that is PRESENT OR ABSENT in the code rather than by a version number, and reading
+    #: the bytes beats believing a version table -- see `heap.large_bin_guard`.
+    libc_data: bytes = b""
 
 
 # --------------------------------------------------------------- technique knowledge base
@@ -194,7 +198,32 @@ def _unsorted_bin_attack(v: Vuln, g: Goal, e: Env):
                    "glibc>=2.29 added a bk-integrity check -- pair with a large-bin attack"]
 
 
+def _large_bin_guard(e: Env) -> dict:
+    """Whether this environment's large-bin insertion still writes unchecked. Decided from the
+    libc's own bytes when we have them, and otherwise from the version, with that said out loud."""
+    from . import heap as _heap
+    if e.libc_data:
+        g = dict(_heap.large_bin_guard(e.libc_data))
+        g["measured"] = g.get("sites") is not None
+        return g
+    return {"sites": None, "arbitrary": None, "measured": False,
+            "glibc": ".".join(str(x) for x in e.glibc),
+            "reason": "no libc bytes supplied, so whether this glibc guards the short insertion "
+                      "branch is UNKNOWN -- pass Env(libc_data=...) to decide it"}
+
+
+def _large_bin_primitive(e: Env) -> str:
+    g = _large_bin_guard(e)
+    if g["arbitrary"] is True:
+        return "write a heap address to a chosen location"
+    if g["arbitrary"] is False:
+        return ("replace a stored pointer to one of our chunks with a pointer to another "
+                "(NOT an arbitrary write on this libc)")
+    return "write a heap address to a chosen location (unverified: no libc supplied)"
+
+
 def _large_bin_attack(v: Vuln, g: Goal, e: Env):
+    guard = _large_bin_guard(e)
     steps = [
         {"op": "alloc", "handle": "L1", "size": v.size, "note": "large-bin size"},
         {"op": "alloc", "handle": "G1", "size": v.size, "note": "guard (blocks consolidation)"},
@@ -210,9 +239,31 @@ def _large_bin_attack(v: Vuln, g: Goal, e: Env):
         {"op": "alloc", "handle": "__", "size": v.size + 0x1000,
          "note": "inserting L2 into the large bin writes &L2 to L1.bk_nextsize+0x20 == TARGET"},
     ]
-    return steps, ["large-bin size (chunk >= 0x400)",
-                   "writes a heap address (&L2) to TARGET",
-                   "the modern controlled-write go-to (glibc>=2.30)"]
+    precond = ["large-bin size (chunk >= 0x400), and above the tcache ceiling (chunk > 0x410) so "
+               "the free does not go to the tcache instead",
+               "L1 and L2 must land in the SAME large bin: largebin_index() groups sizes, so "
+               "heap.largebin_index(chunk_L1) == heap.largebin_index(chunk_L2)",
+               "writes &L2 (a heap address) to TARGET"]
+    if guard["arbitrary"] is False:
+        steps.append({"op": "note", "detail": guard["reason"]})
+        steps.append({"op": "note", "detail":
+                      "so TARGET must ALREADY hold &L1 for the write to land. `_IO_list_all` "
+                      "holds a libc pointer, so it is not reachable this way on this libc -- use "
+                      "heap.build_house_of_cat with a primitive that can write it directly, or a "
+                      "target that stores a pointer to one of our own chunks."})
+        precond.append("BLOCKED as an arbitrary write: " + guard["reason"])
+        precond.append("still usable as a pointer swap where TARGET already holds &L1")
+    elif guard["arbitrary"] is True:
+        steps.append({"op": "note", "detail": guard["reason"]})
+        steps.append({"op": "note", "detail":
+                      "TARGET = `_IO_list_all` turns this into a full chain: the FILE it then "
+                      "points at is entirely ours, so heap.build_house_of_cat supplies the blob "
+                      "and exit()'s stream flush runs it."})
+        precond.append("the short insertion branch is unguarded here, so TARGET is free")
+    else:
+        steps.append({"op": "note", "detail": guard["reason"]})
+        precond.append("guard status UNKNOWN: " + guard["reason"])
+    return steps, precond
 
 
 # advisory techniques: preconditions, the primitive yielded, and a full generated chain.
@@ -247,6 +298,9 @@ _ADVISORY = [
                 "scanning it writes &main_arena.bins[..] to TARGET."},
     {"technique": "large_bin_attack",
      "primitive": "write a heap/controlled address to a chosen location",
+     # Decided per-libc rather than stated once: the guard that makes or breaks this technique is
+     # present or absent in the code, and `Env.libc_data` lets us read which.
+     "primitive_for": _large_bin_primitive,
      "applies": lambda v, e: v.vclass in ("uaf", "heap_overflow")
      and request2size(v.size) >= 0x400,
      "build": _large_bin_attack,
@@ -269,7 +323,8 @@ def _advisory_for(vuln: Vuln, env: Env) -> list:
         if not t["applies"](vuln, env):
             continue
         steps, precond = t["build"](vuln, Goal("arbitrary_alloc"), env)
-        out.append({"technique": t["technique"], "primitive": t["primitive"],
+        prim = t["primitive_for"](env) if t.get("primitive_for") else t["primitive"]
+        out.append({"technique": t["technique"], "primitive": prim,
                     "outline": t["summary"], "generated": True, "auto": False,
                     "confirmed_on_real_glibc": t.get("confirmed", False),
                     "steps": steps, "preconditions": precond})

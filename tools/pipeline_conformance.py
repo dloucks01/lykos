@@ -1421,6 +1421,41 @@ int main(void){ setvbuf(stdout,0,2,0);
               "wide jump table placed inside `table` itself. exit() flushes the forged FILE and "
               "_IO_wfile_overflow calls system(\" /bin/sh\"). Confirmed by a shell."),
 
+    #: The same bug, on a target that PROMPTS ON STDERR. That one change kills both FSOP plans
+    #: that forge a FILE glibc owns -- the program reads `_IO_2_1_stderr_` between our cells, so a
+    #: half-built FILE is executed -- and leaves only the route that forges nothing of glibc's.
+    Case("house_of_cat_list_all",
+         r"""#include <stdio.h>
+long table[128];                              /* big enough to hold a whole fake FILE */
+int main(void){ setvbuf(stdout,0,2,0);
+  for(;;){ fprintf(stderr, "1.set 2.get 3.exit\n> ");   /* prompts on STDERR, so stderr is USED */
+    int o; if(scanf("%d",&o)!=1) return 0;
+    if(o==1){ long i,v; fprintf(stderr, "idx: "); if(scanf("%ld",&i)!=1) return 0;
+              fprintf(stderr, "val: "); if(scanf("%ld",&v)!=1) return 0;
+              table[i]=v; }                 /* index never bounded: an arbitrary relative write */
+    else if(o==2){ long i; fprintf(stderr, "idx: "); if(scanf("%ld",&i)!=1) return 0;
+                   printf("%ld\n", table[i]); }
+    else return 0; } }""",
+         ["-no-pie", "-fno-stack-protector", "-O0", "-w"],
+         want_level=3, want_cwe=("CWE-129", "CWE-787", "CWE-125", "CWE-119"), budget=420.0,
+         mechanism="bad-index",
+         strict_level=True,
+         note="BUG CLASS out-of-bounds INDEX write again, but on the shape that defeats every "
+              "FSOP plan which forges a FILE glibc already owns. `oob_index_write` works because "
+              "`_IO_2_1_stderr_` is a FILE the program never touches, so a cell-at-a-time "
+              "delivery can leave it half-built between writes; prompt on stderr instead and the "
+              "program's own next prompt runs THROUGH the half-built FILE. Measured: the "
+              "setcontext plan fails, the system plan fails, and the run falls through to HOUSE "
+              "OF CAT -- build the whole FILE, its _IO_wide_data and its fake _wide_vtable inside "
+              "`table`, then write ONE pointer, `_IO_list_all := &table`, so exit()'s stream "
+              "flush walks a FILE that is entirely ours. It needs the FEWEST leaks of the three "
+              "plans (no _wide_data read-back, no _flags read) and it takes the setcontext "
+              "finish, so the effect is execve(\"/bin/sh\", NULL, NULL). The `_mode` field is "
+              "what makes a self-built FILE work at all: _IO_flush_all's narrow test reads "
+              "_IO_write_base/_IO_write_ptr at 0x20/0x28, which a blob delivered at a heap chunk "
+              "address cannot choose, so _mode is set to 1 and the WIDE pair -- inside the blob "
+              "-- carries the test instead."),
+
     Case("format_read_leak",
          r"""#include <stdio.h>
 int main(void){ setvbuf(stdout,0,2,0);

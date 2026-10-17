@@ -16,15 +16,15 @@ and seccomp-aware ORW, mprotect→shellcode, format-string `%n` → GOT / ret2wi
 write-what-where, magic-value overwrite, PIE one-byte partial overwrite, tcache poisoning, House
 of Apple 2 (one-piece, split, and the cell form for a one-word-at-a-time writer — with either
 `system` or `setcontext` as the fake `__doallocate`), the heap and C++ hijacks (adjacent code
-pointer, vtable, indexed-write GOT), and — new — the WASM indirect-call redirect, the stack pivot
-and `setcontext` register control.
+pointer, vtable, indexed-write GOT), and — new — the WASM indirect-call redirect, the stack pivot,
+`setcontext` register control, and House of Cat (`_IO_list_all` → a FILE that is entirely ours).
 
 **Knowledge-base only:** fastbin_dup, House of Spirit, House of Force, unlink, unsorted-bin
-attack, large-bin attack.
+attack. The large-bin attack is now knowledge-base *with a measured verdict* (below).
 
-**Absent:** `__exit_funcs`/`atexit` and TLS `dtor_list`; House of Apple 1/3, House of Cat and
-`_IO_list_all` corruption; tcache stashing and `tcache_perthread_struct`; ret2vdso; JOP/COP;
-canary byte-brute against a forking server; `_rtld_global` lock gadgets.
+**Absent:** `__exit_funcs`/`atexit` and TLS `dtor_list`; House of Apple 1/3; tcache stashing and
+`tcache_perthread_struct`; ret2vdso; JOP/COP; canary byte-brute against a forking server;
+`_rtld_global` lock gadgets.
 
 ## The order, and why
 
@@ -66,9 +66,44 @@ glibc actually installed here, not textbook order.
 
    Nine cells, measured live on the `oob_index_write` fixture and through the generated bundle
    reproducer. `system` stays as the fallback plan and keeps its own test.
-3. **Large-bin attack → `_IO_list_all` / House of Cat.** The modern no-hook chain: a large-bin
-   attack writes a HEAP pointer to a chosen address, which is exactly what corrupting
-   `_IO_list_all` needs. Covers the case where `_IO_2_1_stderr_` is unusable.
+3. ~~**Large-bin attack → `_IO_list_all` / House of Cat**~~ — **DONE, and it split in two.**
+
+   **House of Cat is driven.** `heap.build_house_of_cat` builds the FILE, its `_IO_wide_data` and
+   its fake `_wide_vtable` as one blob, and `leak.indexed_write_fsop` gained it as a third plan
+   (`cat`) after `setcontext` and `system`. The caller writes the blob and then ONE pointer,
+   `_IO_list_all := &blob`. It needs the fewest leaks of the three plans — no `_wide_data`
+   read-back, no `_flags` read — and it takes the setcontext finish, so the effect is
+   `execve("/bin/sh", NULL, NULL)`.
+
+   What makes a self-built FILE work is `_mode`. `_IO_flush_all` fires on
+   `(_mode <= 0 && _IO_write_ptr > _IO_write_base) || (_mode > 0 && wide write_ptr > wide
+   write_base)`, and a blob delivered at a heap CHUNK address cannot choose the narrow pair at
+   0x20/0x28 — in a chunk sitting in a large bin those are `fd_nextsize` and `bk_nextsize`,
+   pointers glibc wrote. So `_mode` is 1 and the wide pair, inside the blob, carries the test.
+
+   The conformance case is the shape that forces it: `house_of_cat_list_all` is the same unbounded
+   index as `oob_index_write` but the target **prompts on stderr**, so the program reads
+   `_IO_2_1_stderr_` between our cells and both plans that forge a FILE glibc owns execute a
+   half-built one. Measured: setcontext fails, system fails, cat wins. PASS L3 in 23s.
+
+   **The large-bin attack itself is version-gated, and the gate is read from the bytes.** The
+   insertion ends in `victim->bk_nextsize->fd_nextsize = victim`, so corrupting the resident
+   chunk's `bk_nextsize` to `TARGET-0x20` writes the new chunk's address to TARGET. Whether that
+   is an *arbitrary* write depends on whether the branch is preceded by
+   `if (fwd->bk_nextsize->fd_nextsize != fwd) malloc_printerr(...)` — and that compare reads
+   `*(bk_nextsize + 0x20)`, **the very slot the write then overwrites**, so a guarded branch only
+   writes where TARGET already holds the resident chunk's address.
+
+   `heap.large_bin_guard` counts the guard sites by counting the jumps that reach the error
+   string's loader — no version table, no reliance on the compiler's register choices. Measured
+   on this host: **glibc 2.35 → one site** (the short branch writes unchecked: a real arbitrary
+   write), **glibc 2.43 → two sites** (both guarded). Confirmed live both ways on 2.43: with
+   TARGET untouched the process dies with glibc's own
+   `malloc(): largebin double linked list corrupted (nextsize)`; with TARGET pre-seeded to the
+   resident chunk's address the write lands. So on 2.43 the technique is a **pointer swap**, not
+   an arbitrary write, and `_IO_list_all` — which holds a libc pointer — is out of reach by that
+   route. `aaheg`'s entry now says exactly that, differently per libc, and says "UNKNOWN" rather
+   than guessing when it was handed no libc bytes.
 4. **tcache stashing / `tcache_perthread_struct`.** Arbitrary allocation by corrupting the
    per-thread cache's own bookkeeping; works where a single free is all the program offers.
 5. **fastbin_dup.** The pre-tcache double-free, still reachable by filling the tcache bin first;
