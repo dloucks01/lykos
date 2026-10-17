@@ -12,6 +12,7 @@ No external targets -- every binary is compiled here from a C string with gcc; s
 from __future__ import annotations
 
 import io
+import json
 import shutil
 import subprocess
 import tarfile
@@ -2467,7 +2468,13 @@ def _bundle_reproduces(s, target, case, timeout: float = 120.0):
     "exit status: 139" in both the working and the broken case; only `$?` tells them apart.
 
     A crash reproducer exits 128+signum (the shell's convention for a signal-killed child), so
-    >=128 is the bar. A clean exit is the failure this exists to catch.
+    >=128 is the bar FOR A NATIVE TARGET. It is the wrong bar for every other runtime, and that
+    was the fourth defect of exactly this shape: an uncaught JVM or CPython exception exits 1, a
+    .NET abort exits 134 or 1, and a WASM module that trapped leaves node exiting 0 with the
+    verdict in report.json -- so this check would have called a perfectly good managed reproducer
+    broken, which is a reason not to demand a bundle for one, which is how the managed substrates
+    stayed at identification. The bundle now records which runtime made it and what counts as
+    success (`meta.json`'s `runtime`/`verdict`), so the bar is the runtime's own.
     """
     from lykos.db.dao import PocDAO, TargetDAO
     tids = [t.id for t in TargetDAO(s.conn).list_by_case(target.case_id)] or [target.id]
@@ -2491,11 +2498,42 @@ def _bundle_reproduces(s, target, case, timeout: float = 120.0):
                                capture_output=True, timeout=timeout)
         except subprocess.TimeoutExpired:
             return False, "bundle runner.sh did not finish in %gs" % timeout
-        if r.returncode >= 128:
+        # The runtime's own criterion, read from the bundle rather than assumed.
+        verdict, runtime = {}, "native"
+        try:
+            _m = json.loads((roots[0] / "meta.json").read_text())
+            verdict = _m.get("verdict") or {}
+            runtime = str(_m.get("runtime") or "native")
+        except Exception:                                # noqa: BLE001 -- fall back to the native bar
+            pass
+        want_exit = str(verdict.get("exit") or "signal")
+        blob_out = (r.stdout + r.stderr).decode("utf-8", "replace")
+        tail = blob_out.strip().splitlines()
+        if want_exit == "signal":
+            if r.returncode >= 128:
+                return True, ""
+            return False, "bundle ran but exited %d (want >=128, a signal): %s" % (
+                r.returncode, (tail or [""])[-1][:70])
+        if want_exit == "nonzero":
+            marker = str(verdict.get("stderr") or "")
+            if r.returncode != 0 and (not marker or marker in blob_out):
+                return True, ""
+            return False, ("bundle ran under %s and exited %d%s: %s" % (
+                runtime, r.returncode,
+                "" if not marker else " without %r in its output" % marker,
+                (tail or [""])[-1][:70]))
+        if want_exit == "any":                           # the verdict is in a file the host wrote
+            name = str(verdict.get("file") or "report.json")
+            want = str(verdict.get("contains") or "")
+            try:
+                got = (roots[0] / name).read_text()
+            except OSError as e:
+                return False, f"bundle ran under {runtime} but wrote no {name} ({e})"
+            if want and want.replace(" ", "") not in got.replace(" ", ""):
+                return False, (f"bundle ran under {runtime} and {name} does not say {want!r}: "
+                               f"{got[:70]}")
             return True, ""
-        tail = (r.stdout + r.stderr).decode("utf-8", "replace").strip().splitlines()
-        return False, "bundle ran but exited %d (want >=128, a signal): %s" % (
-            r.returncode, (tail or [""])[-1][:70])
+        return False, f"bundle declares an unknown success criterion {want_exit!r}"
     finally:
         shutil.rmtree(out, ignore_errors=True)
 

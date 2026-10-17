@@ -696,6 +696,27 @@ sys.stderr.write("server exited %d without a fatal signal\n" % rc); sys.exit(1)
 '''
 
 
+#: How to tell, mechanically, that a reproducer worked -- per runtime. `exit` is the shell status
+#: to expect; `signal` means ">=128, the shell's convention for a signal-killed child"; `nonzero`
+#: means the runtime reports an uncaught fault and exits non-zero; `file` means the verdict is in
+#: a FILE the runner prints, because the host process exits cleanly either way.
+_VERDICT_BY_RUNTIME = {
+    "native": {"exit": "signal",
+               "note": "a native crash kills the process: the shell reports 128+signum"},
+    "jar": {"exit": "nonzero", "stderr": "Exception",
+            "note": "an uncaught JVM exception: exit 1 (3 on OutOfMemoryError), trace on stderr"},
+    "class": {"exit": "nonzero", "stderr": "Exception",
+              "note": "an uncaught JVM exception: exit 1, the stack trace is on stderr"},
+    "pyc": {"exit": "nonzero", "stderr": "Traceback",
+            "note": "an uncaught Python exception: exit 1, the traceback is on stderr"},
+    "dotnet": {"exit": "nonzero", "stderr": "xception",
+               "note": "an unhandled .NET exception: the CLR aborts (134) or exits non-zero"},
+    "wasm": {"exit": "any", "file": "report.json", "contains": '"status":"trap"',
+             "note": "a WASM module is not a process: node exits 0 whether the module trapped or "
+                     "not, so the verdict is report.json's status"},
+}
+
+
 def _runtimeconfig_json() -> str:
     """The minimal `runtimeconfig.json` a framework-dependent assembly needs to start, against
     whatever Microsoft.NETCore.App this machine has -- with `rollForward` so the bundle still
@@ -862,6 +883,15 @@ def build(target_bytes: bytes, input_bytes: bytes, meta: dict, stderr: bytes,
         _m = dict(meta)
         _shipped = hashlib.sha256(target_bytes).hexdigest()
         _m["exploited_sha256"] = _shipped
+        # WHAT RUNS THIS, and therefore how to judge the result. A reproducer's exit status means
+        # different things per runtime -- 128+signum for a native crash, 1 for an uncaught JVM or
+        # CPython exception, 134 for a .NET abort, and 0 for a WASM module that trapped (node
+        # exits cleanly and the verdict is in report.json). Anything that checks a bundle
+        # mechanically has to be told which: the one consumer that does, the conformance gate's
+        # `_bundle_reproduces`, required >=128 and would have called a perfectly good JVM
+        # reproducer broken.
+        _m["runtime"] = runtime
+        _m["verdict"] = _VERDICT_BY_RUNTIME.get(runtime, _VERDICT_BY_RUNTIME["native"])
         if _m.get("target_sha256") and _m["target_sha256"] != _shipped:
             _m["exploited_build"] = ("not the ingested image: this bundle's target.bin is an "
                                      "uninstrumented build of the same program, which is where "

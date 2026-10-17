@@ -173,3 +173,82 @@ def test_a_guard_page_bundle_carries_the_preload_and_says_why():
     plain = bundle.build(b"\x7fELFbin", b"AAAA", {"target_sha256": "abc", "arch": "x86-64"},
                          b"", "stdin", [], "SIGSEGV")
     assert "LD_PRELOAD" not in _member(plain, "poc/runner.sh").decode()
+
+
+# ------------------------------------------------- a managed PoC is a deliverable or it is nothing
+def _unpack(data):
+    import io
+    import pathlib
+    import tarfile
+    import tempfile
+    out = pathlib.Path(tempfile.mkdtemp())
+    tarfile.open(fileobj=io.BytesIO(data)).extractall(out, filter="data")
+    return next(d for d in out.iterdir() if (d / "runner.sh").exists())
+
+
+def test_every_runtime_gets_a_runner_it_can_actually_execute():
+    """`poc/stage` mapped two runtimes -- jar and class -- so a .pyc, a .NET assembly and a WASM
+    module fell through to "native" and the reproducer said `./target.bin < ./input.bin`: a file
+    the shell cannot execute. The fault was reproduced and the DELIVERABLE was broken, which is
+    most of why those substrates read as identification-only in the coverage matrix."""
+    from lykos.analyze.poc import bundle
+    want = {"pyc": "python3", "dotnet": "dotnet ./app.dll", "wasm": "wasm_driver.js",
+            "class": "java -cp", "native": "./target.bin"}
+    for runtime, needle in want.items():
+        root = _unpack(bundle.build(b"\x00", b"A", {"level": "L1"}, b"", "stdin", [], "SIGSEGV",
+                                    runtime=runtime, main_class="Idx"))
+        runner = (root / "runner.sh").read_text()
+        assert needle in runner, f"{runtime}: {needle!r} missing from runner.sh"
+    # the WASM host travels with the bundle: a module is not a process
+    root = _unpack(bundle.build(b"\x00", b"A", {"level": "L1"}, b"", "stdin", [], "trap",
+                                runtime="wasm"))
+    assert (root / "wasm_driver.js").exists()
+
+
+def test_the_bundle_says_how_to_judge_its_own_result():
+    """A reproducer's exit status means different things per runtime -- 128+signum for a native
+    crash, 1 for an uncaught JVM or CPython exception, 134 for a .NET abort, and 0 for a WASM
+    module that trapped (node exits cleanly; the verdict is in report.json). Anything checking a
+    bundle mechanically has to be told which, and the one consumer that does -- the conformance
+    gate -- required >=128 and would have called a good managed reproducer broken."""
+    import json
+
+    from lykos.analyze.poc import bundle
+    for runtime, exit_kind in (("native", "signal"), ("class", "nonzero"), ("pyc", "nonzero"),
+                               ("dotnet", "nonzero"), ("wasm", "any")):
+        root = _unpack(bundle.build(b"\x00", b"A", {"level": "L1"}, b"", "stdin", [], "SIGSEGV",
+                                    runtime=runtime, main_class="Idx"))
+        m = json.loads((root / "meta.json").read_text())
+        assert m["runtime"] == runtime
+        assert m["verdict"]["exit"] == exit_kind, (runtime, m["verdict"])
+    # ...and the gate reads that instead of assuming a signal
+    import inspect
+    import pathlib
+    import sys
+    tools = pathlib.Path(__file__).resolve().parents[1] / "tools"
+    if str(tools) not in sys.path:
+        sys.path.insert(0, str(tools))
+    import pipeline_conformance as pc
+    src = inspect.getsource(pc._bundle_reproduces)
+    assert 'want_exit == "nonzero"' in src and 'want_exit == "any"' in src
+    assert 'verdict.get("exit")' in src
+
+
+def test_a_pyc_poc_bundle_reproduces_for_real(tmp_path):
+    """End to end on a real .pyc: build the bundle, unpack it into a fresh directory, run its own
+    runner.sh, and require the runtime's own criterion -- a non-zero exit with a traceback."""
+    import json
+    import py_compile
+    import subprocess
+
+    from lykos.analyze.poc import bundle
+    src = tmp_path / "idx.py"
+    src.write_text("import sys\ns = sys.stdin.readline().rstrip('\\n')\nt = [0,1,2,3]\n"
+                   "print('slot', len(s), '=', t[len(s)])\n")
+    pyc = py_compile.compile(str(src), cfile=str(tmp_path / "idx.pyc"), doraise=True)
+    root = _unpack(bundle.build(open(pyc, "rb").read(), b"AAAAAAAA\n",
+                                {"level": "L1"}, b"", "stdin", [], "IndexError", runtime="pyc"))
+    r = subprocess.run(["sh", "./runner.sh"], cwd=str(root), capture_output=True, timeout=60)
+    m = json.loads((root / "meta.json").read_text())
+    txt = (r.stdout + r.stderr).decode("utf-8", "replace")
+    assert r.returncode != 0 and m["verdict"]["stderr"] in txt, txt[-300:]
