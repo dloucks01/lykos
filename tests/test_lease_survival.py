@@ -113,3 +113,47 @@ def test_the_worker_records_the_reason_it_stopped(tmp_path):
     assert row.status == "cancelled"
     assert row.error == _SLICE_NOTE, (row.status, row.error)
     store.close()
+
+
+def test_a_budget_stop_is_cancelled_not_errored(tmp_path):
+    """A lapsed lease means two opposite things and they must not record alike.
+
+    The heartbeat thread stops renewing ON PURPOSE when a run passes its budget deadline, so
+    "lease expired" there means "this stage ran out of the slice the budget gave it". Only an
+    unmarked lapse is the wedge the reaper was written for. Recording the first as an ERROR made
+    every oversized target fail the real-corpus gate on its own invariant -- "an error is never
+    an acceptable outcome, a decline is" -- and it was measured on libsndfile 1.0.28, whose 8 MB
+    ASan `sndfile-info` carries 801 functions and 271,495 instructions, so `detect_cwe` cannot
+    finish inside its slice even on an idle machine:
+
+        libsndfile-1.0.28.tar.gz ... ERR 1 ... FAIL: stage errored: detect_cwe
+        detect_cwe | error | lease expired
+    """
+    from lykos.casestore import CaseStore
+    from lykos.jobs import JobQueue
+    store = CaseStore.open(tmp_path / "c")
+    try:
+        case = store.cases.create("budget")
+        q = JobQueue(store.conn)
+        # a run that the budget stopped: claimed, then cancel-flagged, then its lease lapses
+        run = q.enqueue(case.id, "detect_cwe", params={})
+        claimed = q.claim("w1", ["quick"], 1)
+        assert claimed == run.id
+        q.cancel(run.id)                                 # what the heartbeat now does on its way out
+        store.conn.execute("UPDATE analysis_run SET lease_expires_at=1 WHERE id=?", (run.id,))
+        store.conn.commit()
+        assert q.reap() == 1
+        row = q.runs.get(run.id)
+        assert row.status == "cancelled", f"a budget stop recorded as {row.status}"
+        assert "budget" in (row.error or "")
+
+        # and a run nobody cancelled is still the wedge case: requeued or errored, as before
+        run2 = q.enqueue(case.id, "disassemble", params={})
+        c2 = q.claim("w1", ["quick"], 1)
+        assert c2 == run2.id
+        store.conn.execute("UPDATE analysis_run SET lease_expires_at=1 WHERE id=?", (run2.id,))
+        store.conn.commit()
+        assert q.reap() == 1
+        assert q.runs.get(run2.id).status in ("queued", "error")
+    finally:
+        store.close()

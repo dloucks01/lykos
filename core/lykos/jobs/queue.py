@@ -345,6 +345,8 @@ class JobQueue:
                        payload={"error": error})
 
     def reap(self, now: Optional[int] = None) -> int:
+        """Reclaim runs whose lease has lapsed. A run the budget stopped is CANCELLED; a run
+        that simply went unresponsive is requeued or errored, as before."""
         now = now or _now()
         mark = len(self._pending)
         self._begin_immediate()
@@ -353,6 +355,24 @@ class JobQueue:
                 "SELECT * FROM analysis_run WHERE status='running' "
                 "AND lease_expires_at IS NOT NULL AND lease_expires_at < ?", (now,)).fetchall()
             for r in rows:
+                # A lease lapses for two completely different reasons and they must not record
+                # alike. The heartbeat thread STOPS RENEWING on purpose when a run passes its
+                # budget deadline (see worker.Heartbeat.run), so "lease expired" there means
+                # "this stage ran out of the slice the budget gave it" -- a cancellation. Only a
+                # lease that lapsed with no cancel pending is the wedge case the reaper was
+                # written for. Recording the first as `error` made every oversized target fail
+                # the real-corpus gate on its own invariant ("an error is never an acceptable
+                # outcome, a decline is"): measured on libsndfile 1.0.28, whose 8 MB ASan
+                # `sndfile-info` has 801 functions and 271,495 instructions, so `detect_cwe`
+                # cannot finish inside its slice on an idle machine.
+                if r["cancel_requested"]:
+                    self.conn.execute(
+                        "UPDATE analysis_run SET status='cancelled', ended_at=?, "
+                        "lease_expires_at=NULL, error=? WHERE id=?",
+                        (_now(), "past its budget slice", r["id"]))
+                    self._emit("job.cancelled", run_id=r["id"], case_id=r["case_id"],
+                               payload={"error": "past its budget slice"})
+                    continue
                 self._requeue_or_error(r, "lease expired")
             self._commit()
         except Exception:

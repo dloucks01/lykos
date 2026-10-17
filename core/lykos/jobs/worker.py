@@ -103,6 +103,16 @@ class _Heartbeat(threading.Thread):
                     _log.warning("stage %s (run %s) is past its deadline and unresponsive; "
                                  "letting its lease lapse so the reaper can reclaim it",
                                  self._stage, self._run)
+                    # Say WHY before going, so the reaper records a cancellation rather than an
+                    # error. The two outcomes look identical from the row -- a lapsed lease --
+                    # and they mean opposite things: this one is "the budget ran out", which is
+                    # a normal result for a big target, while an unmarked lapse is a stage that
+                    # wedged. `cancel()` is the existing channel for "stop this run".
+                    try:
+                        q.cancel(self._run)
+                    except Exception:                    # noqa: BLE001 -- best effort on the way out
+                        _log.debug("could not flag run %s as budget-cancelled", self._run,
+                                   exc_info=True)
                     return
                 try:
                     if q.is_cancel_requested(self._run):
