@@ -217,6 +217,29 @@ int main(void){ setvbuf(stdout,0,2,0); setvbuf(stdin,0,2,0);
     else return 0; } }'''
 
 
+#: The same hijack with NO win function: the callback takes the object, and `system` is
+#: imported for an ordinary reason (`4.date`).
+SRC_FNPTR_SYSTEM = r'''#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+struct cmd { char arg[32]; void (*run)(struct cmd *); };
+static void echo_arg(struct cmd *c){ printf("%s\n", c->arg); }
+struct cmd *db[8];
+static long rl(void){ char b[32]; int i=0,c; while(i<31){ c=getchar(); if(c<0||c=='\n')break; b[i++]=c; } b[i]=0; return strtol(b,0,10); }
+int main(void){ setvbuf(stdout,0,2,0); setvbuf(stdin,0,2,0);
+  while(1){ printf("1.new 2.set 3.run 4.date 5.exit\n> ");
+    long o=rl();
+    if(o==1){ printf("idx: "); long i=rl();
+              if(i>=0&&i<8){ db[i]=malloc(sizeof(struct cmd));
+                             if(db[i]){ db[i]->run=echo_arg; strcpy(db[i]->arg,"hi"); } } }
+    else if(o==2){ printf("idx: "); long i=rl(); printf("len: "); long n=rl(); printf("arg: ");
+              if(i>=0&&i<8&&db[i]&&n>0) read(0, db[i]->arg, (size_t)n); }   /* len unbounded */
+    else if(o==3){ printf("idx: "); long i=rl(); if(i>=0&&i<8&&db[i]) db[i]->run(db[i]); }
+    else if(o==4){ system("date"); }      /* the legitimate `system` import -- no win() anywhere */
+    else return 0; } }'''
+
+
 _CASES: list[Case] = [
     Case("no_pie_ret2win",
          r'''#include <stdio.h>
@@ -342,6 +365,25 @@ int main(void){ setvbuf(stdout,0,2,0); setvbuf(stdin,0,2,0);
               "-- every crash the campaign found was `add(i); free(i); show(i)`, three tokens "
               "long, and the overflow this case exists for was never driven **[measured]**. The "
               "lifetime classes are gated by the heap_fsop cases beside it"),
+
+    # ...and the same hijack with NO WIN FUNCTION, which is the case every real target is.
+    # `find_win` is deliberately strict (a suggestive name, or a local function that calls a
+    # shell-spawner) and that strictness is why L3 was unreachable on real binaries: ncompress has
+    # a reachable overflow and confirmed IP control and no function called `win`. Here `system` is
+    # imported for an ordinary reason -- a `4.date` menu option -- and `main` is excluded from the
+    # win search by name, so nothing in the tree is a win.
+    #
+    # An indirect call gives ONE jump and no return address, so every stack recipe (pop-rdi + system,
+    # SROP, ret2csu) is unavailable. What IS available is the convention: `obj->run(obj)` hands the
+    # callee the object, whose first bytes are ours -- so "/bin/sh" at offset 0 and `system@plt` at
+    # the control offset is the entire exploit. Filed only on a spawned shell, because arrival at
+    # `system` proves the overwrite while the ARGUMENT is what the shell proves.
+    Case("heap_fnptr_system",
+         SRC_FNPTR_SYSTEM,
+         ["-no-pie", "-fno-stack-protector", "-O0", "-w"],
+         want_level=3, want_cwe=(), budget=420.0,
+         note="menu notebook, heap overflow into the object's own callback with NO win function "
+              "-> system(\"/bin/sh\") through the hijacked object pointer -> shell (L3)"),
 
     Case("heap_fsop_shell",
          r'''#include <stdio.h>

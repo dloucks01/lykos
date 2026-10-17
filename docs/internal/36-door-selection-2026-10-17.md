@@ -181,3 +181,27 @@ it was fixed. Every one is a measurement, in order:
 autopilot, with `want_cwe=()` so only the level can satisfy it — `exploit/CWE-119`,
 `primitive/CWE-787`, `root_cause/CWE-787`. The heap-overflow row of the coverage matrix is no
 longer L0.
+
+## ...and then without a win function at all
+
+`find_win` is strict on purpose — a suggestive name, or a local function that calls a
+shell-spawner — and that strictness is the stated reason L3 was unreachable on real binaries:
+*"ncompress has a reachable stack overflow and confirmed instruction-pointer control but imports
+nothing that spawns a shell and has no function called `win`."* An indirect call makes it worse:
+one jump, no return address, so every stack recipe (pop-rdi + system, SROP, ret2csu,
+ret2dlresolve) is unavailable too.
+
+What is available is the convention. The dominant C callback shape passes the object ITSELF as
+the callback's first argument — `obj->run(obj)` — so when the overwritten pointer is `system`,
+the argument is already the object, and the object's first bytes are the start of our payload.
+`"/bin/sh\0"` at offset 0 and `system@plt` at the control offset is the entire exploit.
+
+It is filed **only on a spawned shell** (`require_shell`), and that is not caution for its own
+sake: arrival at `system` proves the pointer was overwritten, while the ARGUMENT — the half this
+recipe is about — is proved by the shell coming up. It is also what keeps the recipe honest on a
+shape it does not fit, since a smashed return address reaches `system` just as well with rdi
+holding whatever the program left there. The recipe is offered only where L2 recovered control
+from a branch REGISTER, which is why the L2 record now carries its `source`.
+
+`heap_fnptr_system` — the same notebook with no `win` anywhere and `system` imported for an
+ordinary reason (a `4.date` option) — **PASSES at L3 in 104 s**, autonomous.

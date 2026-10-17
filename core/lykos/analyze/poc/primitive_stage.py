@@ -1704,6 +1704,11 @@ def _finalize(ctx, target, target_bytes, mode, base_argv, cap0, control, prim, c
     _fp, _fs = frame
     _payload = {
         "primitive": prim["type"], "supported": True, "offset": prim.get("offset"),
+        # WHERE the control came from: "pc", a return-address register, `reg:<r>` for an indirect
+        # branch through a register (a hijacked function pointer), or a stack slot. L3 needs it to
+        # choose: the one-jump recipes that pass the OBJECT as the callee's argument only apply to
+        # the indirect-call shape, and claiming one on a smashed return address would be a lie.
+        "source": prim.get("source"),
         "confirmed": confirmed, "level": level, "bundle": bundle_sha,
         "mode": mode, "base_argv": [str(a) for a in (base_argv or [])],
         "frame_prefix": (_fp or b"").hex(), "frame_suffix": (_fs or b"").hex(),
