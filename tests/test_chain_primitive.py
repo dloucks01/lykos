@@ -410,3 +410,34 @@ def test_attribution_proof_credits_only_an_attributed_differential_win(tmp_path)
 
 def test_attribution_proof_is_best_effort_without_exe():
     assert chain._attribution_proof(_ShimCtx(), None, b"x") is None
+
+
+def test_no_win_tries_the_write_what_where_shell_before_settling_for_a_recipe():
+    """The frontier this moved. `_oob_write_hijack` can only aim a GOT slot at a win that exists,
+    so a target with no win function -- no `system` in the PLT, no controlled pointer argument at
+    any call site -- used to stop at an L2 recipe whose own text said a leak-based chain was
+    analyst work. An arbitrary WRITE needs no win: it leaks the libc base through the paired read
+    and forges a FILE. Pinned at the source level because the ORDER is the whole point: once
+    `_file_recipe` has run, the case is filed as L2 and nothing reopens it."""
+    import inspect
+    src = inspect.getsource(chain.chain_primitive_stage)
+    i = src.index("if win is None:")
+    j = src.index("_www_shell(", i)
+    k = src.index("_file_recipe(", i)
+    assert i < j < k, "the no-win branch must try the FSOP route before filing the L2 recipe"
+
+
+def test_the_exit_sequences_cover_a_crawl_that_learned_nothing():
+    """The trigger has to work on a target the crawl said nothing about: a non-numeric token fails
+    the `scanf("%d", &op) != 1` guard these loops are written with, which returns from main and
+    flushes the forged FILE just as a quit option would."""
+    assert chain._exit_sequences([], {}, None) == [b"q\n"]
+    # an option the crawl learned NO fields for is the quit entry; it is tried first
+    assert chain._exit_sequences(["1", "3"], {"1": ["idx", "num"]}, None) == [b"3\n", b"q\n"]
+
+
+def test_leak_slots_prefer_a_function_the_program_has_certainly_called():
+    """A lazily-bound GOT slot still holds a PLT stub until its function runs, and that value
+    resolves no libc base -- so the read order is what makes the leak work on the first try."""
+    order = chain._LEAK_SLOT_ORDER
+    assert order.index("setvbuf") < order.index("printf") < order.index("exit")

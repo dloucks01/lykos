@@ -199,6 +199,15 @@ def _csc_build(source: str, out: str):
 #: and the conclusion drawn from it was wrong.
 KEEP_FAILED = False
 
+#: Run every case to the END of its budget instead of stopping the moment its criterion is met
+#: (`--ceiling`). The early stop is right for a gate -- a case that has demonstrated what it
+#: asserts is done -- but it makes the level in the PROFILE column the level we STOPPED at, so
+#: `coverage_matrix.py --measured` reads a want_level=0 case as L0 no matter what the ladder could
+#: actually have reached on it. Nothing in the repo could answer "how far does this mechanism get",
+#: which is the only question worth asking before deepening one: the matrix showed bad-index at L2
+#: and integer-overflow at L0 purely because that is what their cases demand.
+CEILING = False
+
 #: The menu notebook whose edit overflows an inline buffer into the object's OWN callback.
 #: Kept beside the case list rather than inline, like the other multi-line sources here.
 SRC_HEAP_FNPTR = r'''#include <stdio.h>
@@ -1235,8 +1244,20 @@ int main(void){ setvbuf(stdout,0,2,0);
                    printf("%ld\n", table[i]); }
     else return 0; } }""",
          ["-no-pie", "-fno-stack-protector", "-O0", "-w"],
-         want_level=0, want_cwe=("CWE-129", "CWE-787", "CWE-125", "CWE-119"), budget=300.0,
-         note="BUG CLASS out-of-bounds INDEX write (CWE-129): unbounded index into a global table"),
+         want_level=3, want_cwe=("CWE-129", "CWE-787", "CWE-125", "CWE-119"), budget=420.0,
+         mechanism="bad-index",
+         note="BUG CLASS out-of-bounds INDEX write (CWE-129): unbounded index into a global table "
+              "-- and the WEAPONIZATION of a write-what-where with NOTHING to point it at. There "
+              "is no win function here, no system() in the PLT and no controlled pointer argument "
+              "at any call site, so the GOT overwrite _oob_write_hijack does needs a target that "
+              "does not exist; measured with --ceiling, the class stopped at an L2 recipe saying a "
+              "leak-based chain was analyst work. The two halves of the same bug finish it: the "
+              "unchecked index READS a GOT slot (a resolved libc address) to recover the libc base "
+              "under live ASLR, then WRITES five House-of-Apple-2 cells over _IO_2_1_stderr_ -- a "
+              "FILE this program never touches, which is what makes a cell-at-a-time delivery "
+              "possible when the target's own prompt runs between every write -- with the fake "
+              "wide jump table placed inside `table` itself. exit() flushes the forged FILE and "
+              "_IO_wfile_overflow calls system(\" /bin/sh\"). Confirmed by a shell."),
 
     Case("format_read_leak",
          r"""#include <stdio.h>
@@ -1893,7 +1914,8 @@ def _run_case(case: Case, gcc: str) -> Result:
                 continue
             if _scored(ml, dm, case, file_type=tg.file_type)[1]:
                 early = True
-                break
+                if not CEILING:                          # --ceiling: keep going, measure the max
+                    break
         if th.is_alive():
             stop.set(); th.join(timeout=60)
         maxlvl, demod, fs = _verdict(s, t, case)
@@ -2074,8 +2096,11 @@ def run_all(names=None) -> list[Result]:
     print("-" * 110)
     npass = sum(1 for r in results if r.ok)
     print("CONFORMANCE: %d/%d bug-classes demonstrated end-to-end through the real autopilot "
-          "(%ds total; * = stopped as soon as the case's criterion was met)"
-          % (npass, len(results), sum(r.elapsed for r in results)))
+          "(%ds total; * = %s)"
+          % (npass, len(results), sum(r.elapsed for r in results),
+             "criterion met, then run on to the end of the budget anyway (--ceiling): the level "
+             "shown is the CEILING" if CEILING
+             else "stopped as soon as the case's criterion was met"))
     # Infrastructure check (not a bug class): the cross-stage op-model artifact actually composes two
     # stages. Only when the full run exercised the shared crawl, i.e. not a name-filtered subset.
     if not names:
@@ -2109,12 +2134,16 @@ if __name__ == "__main__":
         KEEP_FAILED = True
         _argv = [a for a in _argv if a != "--keep-failed"]
 
-    _FLAGS = {"--list", "--smoke", "--keep-failed"}
+    if "--ceiling" in _argv:
+        CEILING = True
+        _argv = [a for a in _argv if a != "--ceiling"]
+
+    _FLAGS = {"--list", "--smoke", "--keep-failed", "--ceiling"}
     _unknown = [a for a in _argv if a.startswith("--") and a not in _FLAGS]
     if _unknown:
         # Silently ignoring a flag is how a typo passes for a working option: `--case foo` was
         # accepted and dropped, and only the positional `foo` did anything.
-        print("unknown option(s): %s\nknown: --list, --smoke, --keep-failed"
+        print("unknown option(s): %s\nknown: --list, --smoke, --keep-failed, --ceiling"
               % ", ".join(_unknown))
         _s.exit(2)
 
