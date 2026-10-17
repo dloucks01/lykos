@@ -112,6 +112,12 @@ class Case:
     # Toolchain prefix for a cross-architecture case ("aarch64-linux-gnu-"); the case SKIPS when the
     # cross compiler is absent rather than failing the gate on a machine that cannot build it.
     cross: str = ""
+    # What the defect IS, for `tools/coverage_matrix.py`, which otherwise reads the mechanism off
+    # `want_cwe`. A case that asserts a LEVEL and nothing else carries no CWE arm on purpose
+    # (`_scored` is `lvl_ok or bool(demod)`), and so fell into the matrix's "(level only)" row --
+    # the two cases that took heap-overflow from L0 to L3 were invisible on the heap-overflow row
+    # they had just moved. Only needed when `want_cwe` is empty.
+    mechanism: str = ""
     # FRONT-END check: triage must identify the container as this file_type. With want_level 0 and no
     # want_cwe it is the WHOLE assertion, and the case then needs only ingest+triage -- no autopilot --
     # which is both the honest claim (these formats demonstrate no effect yet) and nearly free to run.
@@ -357,6 +363,7 @@ int main(void){ setvbuf(stdout,0,2,0); setvbuf(stdin,0,2,0);
          # matching poc-backed finding appears. Measured: with ("CWE-122","CWE-787","CWE-119")
          # this case passed at **L1** -- the crash was found and verified and the hijack never
          # ran. The LEVEL is the whole claim here; the crash itself is gated by other cases.
+         mechanism='heap-overflow',
          want_level=3, want_cwe=(), budget=420.0,
          note="menu notebook, heap overflow past an inline buffer into the object's own callback "
               "-> call it -> shell (L3). no-PIE so the win address is static: the PIE form of "
@@ -381,6 +388,7 @@ int main(void){ setvbuf(stdout,0,2,0); setvbuf(stdin,0,2,0);
     Case("heap_fnptr_system",
          SRC_FNPTR_SYSTEM,
          ["-no-pie", "-fno-stack-protector", "-O0", "-w"],
+         mechanism='heap-overflow',
          want_level=3, want_cwe=(), budget=420.0,
          note="menu notebook, heap overflow into the object's own callback with NO win function "
               "-> system(\"/bin/sh\") through the hijacked object pointer -> shell (L3)"),
@@ -1543,7 +1551,8 @@ int main(void){ setvbuf(stdout,0,2,0); setvbuf(stdin,0,2,0);
          # it reached -- this case passed twice at L2 while its source said `want_level=3`
          # **[measured]**. With no CWE arm, only the level can satisfy it, and the level is the
          # whole point here: every CWE this target carries is already gated by another case.
-         [], want_level=3, want_cwe=(),
+         [], mechanism='oob-read',
+         want_level=3, want_cwe=(),
          as_source=True, budget=600.0,
          note="SOURCE out-of-bounds READ whose disclosure defeats ASLR, in a program that also "
               "has the write primitive to spend it on. Driven with the two inputs SUPPLIED, the "

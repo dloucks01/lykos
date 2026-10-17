@@ -208,7 +208,9 @@ _KERNEL_WRITTEN_OVERFLOW = r"""#include <stdio.h>
 #include <unistd.h>
 struct o { char t[32]; void (*f)(void); };
 static void ok(void){ printf("ok\n"); }
-static long rl(void){ char b[32]; int i=0,c; while(i<31){ c=getchar(); if(c<0||c=='\n')break; b[i++]=c; } b[i]=0; return strtol(b,0,10); }
+static long rl(void){ char b[32]; int i=0,c;
+  while(i<31){ c=getchar(); if(c<0||c=='\n')break; b[i++]=c; }
+  b[i]=0; return strtol(b,0,10); }
 struct o *x;
 int main(void){ setvbuf(stdout,0,2,0); setvbuf(stdin,0,2,0);
   while(1){ printf("1.new 2.fill 3.use 4.quit\n> ");

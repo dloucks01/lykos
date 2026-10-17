@@ -164,6 +164,12 @@ def mechanisms_of(case) -> list:
         if m and m not in out:
             out.append(m)
     if not out:
+        # A case that asserts a LEVEL and nothing else carries no CWE arm on purpose, so it says
+        # its mechanism outright. Without this the two cases that took heap-overflow from L0 to
+        # L3 showed up under "(level only)" and the heap-overflow row still read L0.
+        named = str(getattr(case, "mechanism", "") or "")
+        if named:
+            return [named]
         if getattr(case, "clean", False):
             return ["(precision control)"]
         if getattr(case, "want_file_type", ""):
