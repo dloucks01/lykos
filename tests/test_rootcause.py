@@ -271,3 +271,28 @@ def test_an_input_argv_cannot_carry_is_declined_not_errored(store, case, pool, g
     assert pool.wait_idle(60)
     rec = q.runs.get(run.id)
     assert rec.status == "done", f"root_cause errored on a NUL-bearing input: {rec.error}"
+
+
+def test_a_fault_in_the_stack_guard_page_is_recursion_not_an_oob_write():
+    """A write fault immediately below the [stack] mapping is the guard page, and what walks into
+    it is a stack that grew as far as the rlimit allows: uncontrolled recursion (CWE-674), a
+    denial of service. Reading it as an out-of-bounds write is wrong twice -- the address is
+    wherever the stack ended rather than one the input chose, and there is no primitive to chain,
+    so the lead sends a reader looking for a write they cannot have. Measured on a recursion
+    fixture whose depth comes from the input: CWE-787, "invalid write", severity high."""
+    from lykos.analyze.debug import rootcause as rc
+    maps = [{"start": 0x7FFFFFFDE000, "end": 0x7FFFFFFFF000, "perms": "rw-p", "path": "[stack]"},
+            {"start": 0x400000, "end": 0x402000, "perms": "r-xp", "path": "/t/x"}]
+    cap = {"signal_name": "SIGSEGV", "pc": 0x401100, "fault_addr": 0x7FFFFFFDDFF8, "maps": maps}
+    got = rc.classify(cap, "mov QWORD PTR [rax],rdx")
+    assert got["cwe"] == "CWE-674" and got["class"] == "stack-exhaustion", got
+    assert "denial of service" in got["detail"]
+    # ...and a wild write far from the stack is still an out-of-bounds write
+    cap["fault_addr"] = 0x4142434445
+    assert rc.classify(cap, "mov QWORD PTR [rax],rdx")["cwe"] == "CWE-787"
+
+
+def test_stack_exhaustion_offers_no_write_primitive():
+    from lykos.analyze.debug import exploitability as ex
+    assert ex._CLASS_EFFECTS["stack-exhaustion"] == []
+    assert ex._CWE_CLASS["CWE-674"] == "stack-exhaustion"

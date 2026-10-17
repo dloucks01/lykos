@@ -175,3 +175,108 @@ half-covered — the conformance case for an ISA demands L1 because it is there 
 REACHES the architecture, while the ladder case measures L3 on the same toolchain. Four cells read
 L1 that are L3.
 
+## 6. Mechanisms with no case at all
+
+`coverage_matrix.MECHANISM` named twenty-one mechanisms and the matrix printed the rows that some
+case happened to carry a CWE for. Four of the named ones — null-deref, div-by-zero, race,
+resource-exhaustion — had NO fixture, so their rows did not exist, and the grid read as if the
+taxonomy stopped where the case list stopped. Twelve new fixtures, each landing with
+`want_level=0 / want_cwe=()` so it cannot fail, measured with `--ceiling`, and only then demanding
+what it reached:
+
+| case | mechanism | why it is its own mechanism |
+|---|---|---|
+| `null_deref` | null-deref | the cheapest crash there is, and `printf("%s", NULL)` is NOT it — glibc prints `(null)` and the program survives |
+| `div_by_zero` | div-by-zero | a different SIGNAL (SIGFPE); the fault classification is signal-driven and nothing asserted a non-SEGV fault |
+| `stack_exhaustion` | stack-exhaustion | the fault address is the stack guard, not anything the attacker chose — a DoS, and the verdict should say so |
+| `alloc_size_dos` | resource-exhaustion | the magnitude family: the attacker chooses how much memory is asked for, and there is nothing to hijack |
+| `memory_leak` | resource-exhaustion | never crashes; valgrind's leak summary is the only oracle |
+| `invalid_free` | lifetime | the family's third member after UAF and double free, and the one with no case |
+| `int_underflow_alloc` | integer-overflow | a wrap in a LENGTH gives a count near SIZE_MAX: it faults at once, so there is nothing to place |
+| `int_truncation_fnptr` | integer-truncation | correct in 64 bits, stored into 16 — under-allocates at 4096 records where the overflow twin needs 268435456 |
+| `unchecked_malloc` | unchecked-return | an allocation the attacker makes FAIL turns the next copy into a write through NULL |
+| `hardcoded_secret` | hardcoded-secret | no memory is corrupted and nothing crashes; the defect is the string, and the effect is the authentication it passes |
+| `race_counter` | race | TSan is the only oracle; the concurrency family is capped at L1 because a race is a scheduling fact, not an attacker-chosen write |
+| `cpp_uaf_vtable_win` | type-confusion | the non-PIE, win-bearing half of the C++ UAF, which nothing gated |
+
+And the table gained the mechanisms it never named: integer-truncation, unchecked-return,
+stack-exhaustion, hardcoded-secret, deserialization, symlink-follow, temp-file, weak-crypto,
+search-path, decompression-bomb, redos, privilege. The test for belonging is that the mechanism
+changes what can be DONE with the defect — a truncation under-allocates where an overflow
+over-allocates, so one is weaponizable and the other is a refused malloc.
+
+## 7. What the new cases measured, including three holes
+
+| case | ceiling | what it says |
+|---|---|---|
+| `int_truncation_fnptr` | **L3** | the truncation family's thresholds work; a new mechanism row at the top rung |
+| `null_deref` | L1 | `root_cause/CWE-476`, the right class |
+| `div_by_zero` | L1 | `root_cause/CWE-369` — the first case on a non-SEGV signal |
+| `invalid_free` | L1 | `root_cause/CWE-590`, the lifetime family's third member |
+| `int_underflow_alloc` | L1 | a wrap in a LENGTH faults at once; nothing to place, as predicted |
+| `unchecked_malloc` | L1 | the dereference is reported; naming the missing CHECK is a labelling gap |
+| `alloc_size_dos` | L1 | the magnitude family's honest ceiling |
+| `race_counter` | L1 | `tsan/CWE-362` — the concurrency family's ceiling by construction |
+| `stack_exhaustion` | L1 | **and it was mislabelled**: see below |
+| `memory_leak` | GAP | no CWE-401 at all |
+| `hardcoded_secret` | GAP | `hardcoded_secrets` files nothing |
+
+Three things came out of this that are worth more than the rows:
+
+**A stack-guard fault was an "invalid write".** A write immediately below the `[stack]` mapping is
+the guard page, and what walks into it is a stack that grew as far as the rlimit allows. It came
+back `root_cause/CWE-787`, severity high — an out-of-bounds-write lead for an address the input
+never chose, with no primitive to chain. `classify` now recognises the guard page as CWE-674 and
+`exploitability` offers it no write primitive, the same way it offers none for a null dereference.
+
+**A mechanism whose evidence can only be STATIC could not be asserted at all.** "Detected is not
+demonstrated" is right for memory corruption, and for a credential in `.rodata`, a predictable
+PRNG seed or an insecure temp-file name there is nothing to run: the static fact IS the finding.
+`_verdict` drops every static detector, so `want_cwe` can never match and `want_level=0` claims
+nothing — such a case came back FAIL with the detector that found it printed in its own reason
+column. `want_static_cwe` is the assertion they can keep, deliberately separate from the
+demonstrated ones.
+
+**Two fixtures measured a hole, and a hole has no honest verdict.** `clean` claims the opposite,
+a want_* demand makes the case permanently red, and deleting the case loses the fixture and the
+measurement together. `known_gap` reports GAP, is counted apart from the pass rate and excluded
+from the exit status, and the note says what is missing:
+
+* `memory_leak` — the leak is real and `memoracle` already maps a leak-only run to CWE-401. What
+  is missing is in between: `mem_oracle`'s probe list is recorded crash inputs plus the empty one,
+  a target that never crashes contributes none, and on empty input this program's first `fgets`
+  returns NULL and it leaks nothing.
+* `hardcoded_secret` — `hardcoded_secrets` looks for a secret-SHAPED value (an assignment to a
+  password-ish name, high-entropy base64/hex). A plaintext credential compared with `strcmp`
+  against a literal has neither shape: the evidence is the COMPARISON, not the string.
+
+The binary `off_by_one` case moves here too. It was failing before this round for a reason its own
+note already stated — two bytes past a 64-byte stack buffer land in padding, the guard page is a
+heap allocator, memcheck does not track stack bounds, and ASan needs source, which
+`src_off_by_one` has and this case deliberately does not.
+
+### The verification pass
+
+All eighteen new cases, normal mode, one serial run:
+
+```
+CONFORMANCE: 12/12 bug-classes demonstrated end-to-end through the real autopilot (1954s)
+MEASURED HOLES (reported, not graded): off_by_one, memory_leak, hardcoded_secret,
+                                       toctou_access, search_path_hijack, redos_regex
+```
+
+`int_truncation_fnptr` L3 in 31s, `untrusted_pointer` L2, `race_counter` L1 on `tsan/CWE-362`,
+`temp_file` and `weak_prng_token` green on their static assertions in 2s each. Both labelling
+fixes show up where they should: `stack_exhaustion` now reports `root_cause/CWE-674` instead of
+CWE-787, and `unchecked_malloc` reports `root_cause/CWE-476` now that its copy is bounded and the
+fuzzer can no longer find a different bug in the same fixture.
+
+The mechanism axis, before this round and after:
+
+| | before | after |
+|---|---|---|
+| mechanisms NAMED in the taxonomy | 21 | **34** |
+| mechanism ROWS in the matrix | 20 | **33** |
+| conformance cases | 71 | **92** |
+| (mechanism, case) pairs | 145 | **168** |
+| rows demanding L3 | 8 | **15** |

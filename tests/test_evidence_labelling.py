@@ -237,3 +237,30 @@ def test_an_unscoreable_corpus_fails_the_gate():
     src = gate.read_text()
     assert "return 1 if (bad or starved) else 0" in src, \
         "a starved target no longer fails the gate's exit status"
+
+
+def test_a_static_only_mechanism_can_be_asserted_at_all():
+    """"Detected is not demonstrated" is the right rule for memory corruption -- a pattern match
+    is not a crash -- and it left a whole family of mechanisms unassertable: for a credential in
+    .rodata, a predictable PRNG seed or an insecure temp-file name there is nothing to RUN, so
+    `_verdict` (which drops every static detector) can never match a want_cwe, and want_level=0
+    claims no level. Measured: such a case came back FAIL with the detector that found it printed
+    in the reason column. `want_static_cwe` is the assertion those cases can keep, and it stays
+    separate from the demonstrated ones rather than being folded into them."""
+    import pathlib
+    import sys
+    tools = pathlib.Path(__file__).resolve().parents[1] / "tools"
+    if str(tools) not in sys.path:
+        sys.path.insert(0, str(tools))
+    import pipeline_conformance as pc  # the module, under its own name
+
+    c = next(x for x in pc._CASES if x.name == "hardcoded_secret")
+    assert c.want_static_cwe == ("CWE-798",) and not c.want_cwe and not c.want_level
+    ok, done = pc._scored(0, [], c, statics={"CWE-798"})
+    assert ok and done, "the static finding IS the claim for this case"
+    assert pc._scored(0, [], c, statics={"CWE-120"}) == (False, False)
+    assert pc._scored(0, [], c, statics=set()) == (False, False)
+
+    # ...and it does not loosen a case that claims a level: that one still needs the level.
+    lv = next(x for x in pc._CASES if x.name == "null_deref")
+    assert lv.strict_level and not pc._scored(0, [], lv, statics={"CWE-798"})[0]

@@ -116,6 +116,23 @@ class Case:
     # point is the rung it reaches sets this, and then the level is the only way through. (A case
     # with no want_cwe is already strict by construction, since there is nothing else to pass on.)
     strict_level: bool = False
+    # A case whose evidence can only ever be STATIC. "Detected is not demonstrated" is the right
+    # rule for memory corruption -- a pattern match is not a crash -- and for a credential in
+    # .rodata, a predictable PRNG seed or an insecure temp-file name there is nothing to run: the
+    # static fact IS the finding. Those cases had no way to be asserted at all (`_verdict`
+    # excludes every static detector, so want_cwe can never match and want_level=0 means no level
+    # is claimed), which is why they came back FAIL with the detector that found them printed in
+    # the reason column. Satisfied when a STATIC detector names one of these, in any state.
+    want_static_cwe: tuple = ()
+    # A case that records a MEASURED HOLE. Some fixtures carry a real defect that nothing in this
+    # pipeline can state today -- a plaintext credential compared with strcmp, a leak that needs
+    # an input the oracle's probe list does not contain, two bytes past a stack buffer that land
+    # in padding. Such a case has no honest verdict: `clean` claims the opposite (that there is
+    # nothing to find), a want_* demand makes it permanently RED, and dropping the case loses both
+    # the fixture and the measurement. It reports GAP, is excluded from the pass count and from
+    # the exit status, and its note says what is missing -- so the hole is visible every run
+    # instead of being remembered. The moment a detector lands, the case gets a real demand.
+    known_gap: bool = False
     # Toolchain prefix for a cross-architecture case ("aarch64-linux-gnu-"); the case SKIPS when the
     # cross compiler is absent rather than failing the gate on a machine that cannot build it.
     cross: str = ""
@@ -238,6 +255,33 @@ int main(void){ setvbuf(stdout,0,2,0); setvbuf(stdin,0,2,0);
                                    if(db[i]){ db[i]->show=plain; cnt[i]=n; } } }
     else if(o==2){ printf("idx: "); long i=rl(); printf("data: ");
               if(i>=0&&i<16&&db[i]){ size_t n=(size_t)cnt[i]*16, k=0; int c;    /* the REAL size */
+                while(k<n){ c=getchar(); if(c<0||c=='\n') break; db[i]->text[k++]=(char)c; } } }
+    else if(o==3){ printf("idx: "); long i=rl(); if(i>=0&&i<16&&db[i]) db[i]->show(db[i]); }
+    else return 0; } }'''
+
+
+#: The TRUNCATION twin of SRC_INT_OVERFLOW_FNPTR: the size computation is correct in 64 bits and
+#: then stored into 16, so a count four orders of magnitude lower under-allocates. Same weapon,
+#: completely different threshold -- which is why the primer values are a family per arithmetic
+#: and not one list of "big numbers".
+SRC_INT_TRUNC_FNPTR = r'''#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+void win(void){ execl("/bin/sh","sh",(char*)0); }
+struct rec { void (*show)(struct rec *); char text[]; };
+static void plain(struct rec *r){ printf("%s\n", r->text); }
+struct rec *db[16]; long cnt[16];
+static long rl(void){ char b[32]; int i=0,c; while(i<31){ c=getchar(); if(c<0||c=='\n')break; b[i++]=c; } b[i]=0; return strtol(b,0,10); }
+int main(void){ setvbuf(stdout,0,2,0); setvbuf(stdin,0,2,0);
+  while(1){ printf("1.add 2.fill 3.show 4.exit\n> ");
+    long o=rl();
+    if(o==1){ printf("idx: "); long i=rl(); printf("records: "); long n=rl();
+              if(i>=0&&i<16&&n>0){ unsigned short sz=(unsigned short)(n*16);  /* TRUNCATED to 16 */
+                                   db[i]=malloc(sizeof(void(*)(struct rec*))+sz);
+                                   if(db[i]){ db[i]->show=plain; cnt[i]=n; } } }
+    else if(o==2){ printf("idx: "); long i=rl(); printf("data: ");
+              if(i>=0&&i<16&&db[i]){ size_t n=(size_t)cnt[i]*16, k=0; int c;   /* the real size */
                 while(k<n){ c=getchar(); if(c<0||c=='\n') break; db[i]->text[k++]=(char)c; } } }
     else if(o==3){ printf("idx: "); long i=rl(); if(i>=0&&i<16&&db[i]) db[i]->show(db[i]); }
     else return 0; } }'''
@@ -1280,6 +1324,16 @@ int main(void){ setvbuf(stdout,0,2,0);
               "text[]; }` layout invisible -- the overflow runs forward, past this record's "
               "pointer, into the next one's. The wrap thresholds are the only counts that do it: "
               "999 and 0x7FFFFFFF make malloc refuse rather than under-allocate."),
+    Case("int_truncation_fnptr", SRC_INT_TRUNC_FNPTR,
+         ["-no-pie", "-fno-stack-protector", "-O0", "-w"],
+         want_level=3, want_cwe=(), budget=480.0, mechanism="integer-truncation",
+         note="BUG CLASS integer TRUNCATION (CWE-197/681) weaponized. A mechanism the matrix did "
+              "not name: the size arithmetic is correct in 64 bits and then STORED into 16, so the "
+              "allocation is undersized for a count four orders of magnitude below the wrap "
+              "thresholds an overflow needs -- 4096 records here, where int_overflow_fnptr needs "
+              "268435456. One list of 'big numbers' cannot cover both, so `menu.alloc_primers` "
+              "carries a family per arithmetic (32-bit product, 16-bit truncated product, zero) "
+              "and the 32-bit family stays first because it is the common case."),
     Case("off_by_one",
          r"""#include <stdio.h>
 #include <string.h>
@@ -1290,6 +1344,7 @@ int main(void){ char b[64]; int i;
   printf("hi %s\n", b); return 0; }""",
          ["-no-pie", "-fno-stack-protector", "-O0", "-w"],
          want_level=0, want_cwe=("CWE-787", "CWE-121", "CWE-119", "CWE-193"), budget=300.0,
+         known_gap=True,
          note="BUG CLASS off-by-one / single-byte overflow (CWE-193/787). KNOWN GAP -- two bytes past a 64-byte buffer lands in padding or the saved frame pointer and does not fault, so there is no crash to find, and no static detector files CWE-193."),
 
     Case("oob_index_write",
@@ -1386,6 +1441,338 @@ int main(void){ setvbuf(stdout,0,2,0); fill(); leak(); return 0; }""",
          ["-no-pie", "-fno-stack-protector", "-O0", "-w"],
          want_level=0, want_cwe=("CWE-457", "CWE-200", "CWE-908"), budget=240.0,
          note="BUG CLASS use of uninitialised stack memory (CWE-457/908) -> disclosure. Was a known gap: the read never faults, so every crash-centric stage is blind to it, and a DIFFERENTIAL oracle cannot see it either -- fill() overwrites any pre-seeded pattern microseconds before leak() reads it, and the program takes no input, so there is no knob. The `mem_oracle` stage runs valgrind memcheck, whose shadow memory sees the read itself and distinguishes undefined bytes reaching a WRITE syscall (CWE-200, the disclosure, an effect that actually happened) from a merely internal uninitialised read (CWE-457)."),
+
+    # ---- MECHANISMS WITH NO CASE. `coverage_matrix.MECHANISM` has named null-deref,
+    # div-by-zero, race and resource-exhaustion since it was written, and not one of them had a
+    # fixture -- so the row did not exist and the matrix read as if the taxonomy stopped at the
+    # classes someone happened to write a case for. These are the measurement, not the claim:
+    # each lands with want_level=0 / want_cwe=() so it cannot fail, is measured with --ceiling,
+    # and only then demands what it reached.
+    Case("null_deref",
+         r"""#include <stdio.h>
+#include <string.h>
+int main(void){ setvbuf(stdout,0,2,0);
+  char line[64]; char *p = 0;
+  printf("name: "); if(!fgets(line,sizeof line,stdin)) return 0;
+  if(line[0]=='a') p = line;               /* only ONE branch initialises it */
+  printf("len %zu\n", strlen(p)); return 0; }""",
+         ["-no-pie", "-O0", "-w"],
+         want_level=1, want_cwe=(), budget=240.0, mechanism="null-deref", strict_level=True,
+         note="BUG CLASS null-pointer dereference (CWE-476). A branch leaves the pointer NULL and "
+              "the next read of it faults -- the cheapest crash there is, and the mechanism had no "
+              "case. Note printf(\"%s\", NULL) is NOT it: glibc prints \"(null)\" and the program "
+              "survives, so the fixture dereferences through strlen."),
+
+    Case("div_by_zero",
+         r"""#include <stdio.h>
+int main(void){ setvbuf(stdout,0,2,0);
+  int n; printf("n: "); if(scanf("%d",&n)!=1) return 0;
+  printf("%d\n", 100/n); return 0; }       /* n == 0 -> SIGFPE */""",
+         ["-no-pie", "-O0", "-w"],
+         want_level=1, want_cwe=(), budget=240.0, mechanism="div-by-zero", strict_level=True,
+         note="BUG CLASS divide by zero (CWE-369) -> SIGFPE. A different SIGNAL from every other "
+              "case here, which is the point: the ladder's fault classification is signal-driven "
+              "and nothing asserted that a non-SEGV fault is reproduced and levelled at all."),
+
+    Case("stack_exhaustion",
+         r"""#include <stdio.h>
+#include <string.h>
+static long rec(long n){ char pad[4096]; memset(pad,n&0xff,sizeof pad);
+  return n<=0 ? pad[0] : rec(n-1)+pad[1]; }   /* depth from the input: unbounded recursion */
+int main(void){ setvbuf(stdout,0,2,0);
+  long n; printf("depth: "); if(scanf("%ld",&n)!=1) return 0;
+  printf("%ld\n", rec(n)); return 0; }""",
+         ["-no-pie", "-fno-stack-protector", "-O0", "-w"],
+         want_level=1, want_cwe=(), budget=300.0, mechanism="stack-exhaustion", strict_level=True,
+         note="BUG CLASS uncontrolled recursion (CWE-674): the depth comes from the input, each "
+              "frame is 4 KiB, and the guard page below the stack ends it. The fault address is "
+              "the stack guard rather than anything the attacker chose, which is exactly why this "
+              "is a denial of service and not a write primitive. Measured, the verdict machinery "
+              "did NOT say so: a write fault in the guard page came back `root_cause/CWE-787`, "
+              "\"invalid write\", severity high -- an out-of-bounds write lead for an address the "
+              "input never chose. `classify` now recognises a fault immediately below the "
+              "[stack] mapping as CWE-674 and `exploitability` offers it no write primitive."),
+
+    Case("alloc_size_dos",
+         r"""#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+int main(void){ setvbuf(stdout,0,2,0);
+  unsigned long n; printf("size: "); if(scanf("%lu",&n)!=1) return 0;
+  char *p = malloc(n);                      /* attacker-chosen allocation, unbounded */
+  if(!p){ printf("alloc failed\n"); return 1; }
+  memset(p,'A',1); printf("ok %lu\n", n); free(p); return 0; }""",
+         ["-no-pie", "-O0", "-w"],
+         want_level=1, want_cwe=(), budget=300.0, mechanism="resource-exhaustion",
+         strict_level=True,
+         note="BUG CLASS allocation size from untrusted input (CWE-789/770). Measured with "
+              "--ceiling: L1 -- the fuzzer drives the size past what malloc will serve, the "
+              "unchecked NULL turns the memset that follows into a write through it, and the "
+              "crash reproduces. The magnitude family: "
+              "the attacker chooses how much memory the process asks for, and there is nothing to "
+              "hijack -- the honest ceiling for this class is a reproduced resource fault, and the "
+              "measurement is what sets the demand."),
+
+    Case("memory_leak",
+         r"""#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+int main(void){ setvbuf(stdout,0,2,0);
+  char line[64];
+  while(fgets(line,sizeof line,stdin)){
+    char *p = malloc(4096);                 /* one per request, never freed */
+    if(!p) return 1;
+    strncpy(p,line,16);
+    if(line[0]=='q') break; }
+  printf("done\n"); return 0; }""",
+         ["-no-pie", "-O0", "-w"],
+         want_level=0, want_cwe=(), budget=300.0, mechanism="resource-exhaustion",
+         known_gap=True,
+         note="BUG CLASS memory leak (CWE-401): an allocation per request that is never freed. "
+              "Never crashes, so every crash-centric stage is blind to it; valgrind's leak summary "
+              "is the only oracle that sees it, and `memoracle` already maps a leak-only run to "
+              "CWE-401. MEASURED HOLE: no CWE-401 finding at all. The oracle needs an INPUT that "
+              "reaches the loop, and `mem_oracle`'s probe list is recorded crash inputs plus the "
+              "empty one -- a target that never crashes contributes none, and on empty input this "
+              "program's first `fgets` returns NULL and it leaks nothing. The leak is real, the "
+              "classifier for it exists, and what is missing is the input selection in between."),
+
+    Case("invalid_free",
+         r"""#include <stdio.h>
+#include <stdlib.h>
+int main(void){ setvbuf(stdout,0,2,0);
+  char buf[64]; char *p = buf;
+  int n; printf("n: "); if(scanf("%d",&n)!=1) return 0;
+  if(n>0){ p = malloc(64); if(!p) return 1; }
+  free(p);                                  /* n <= 0 frees a STACK pointer */
+  printf("freed\n"); return 0; }""",
+         ["-no-pie", "-O0", "-w"],
+         want_level=1, want_cwe=(), budget=300.0, mechanism="lifetime", strict_level=True,
+         note="BUG CLASS free of a non-heap pointer (CWE-590). glibc detects it and aborts, so the "
+              "signal is SIGABRT with an allocator message -- the lifetime family's third member "
+              "(after use-after-free and double free) and the one with no case. `memoracle` "
+              "already maps it; nothing asserted it end to end."),
+
+    Case("int_underflow_alloc",
+         r"""#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+int main(void){ setvbuf(stdout,0,2,0);
+  char hdr[32]; printf("len: ");
+  if(!fgets(hdr,sizeof hdr,stdin)) return 0;
+  size_t len = (size_t)strtoul(hdr,0,10);
+  char *p = malloc(64);
+  if(!p) return 1;
+  size_t pad = 16 - len;                    /* len > 16 UNDERFLOWS to a huge count */
+  memset(p,'A',pad);                        /* ...and the copy runs off the end */
+  printf("padded %zu\n", pad); free(p); return 0; }""",
+         ["-no-pie", "-O0", "-w"],
+         want_level=1, want_cwe=(), budget=300.0, mechanism="integer-overflow", strict_level=True,
+         note="BUG CLASS integer UNDERFLOW (CWE-191). The mirror of int_overflow_alloc and a "
+              "different weaponization story: a wrap in the ALLOCATION under-allocates and can be "
+              "aimed (see int_overflow_fnptr), while a wrap in a LENGTH produces a count near "
+              "SIZE_MAX, so the copy faults at once and there is nothing to place. L1 is the "
+              "honest ceiling for this shape, and recording that is the point of the case."),
+
+    Case("unchecked_malloc",
+         r"""#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+int main(void){ setvbuf(stdout,0,2,0);
+  char line[128]; printf("size: ");
+  if(!fgets(line,sizeof line,stdin)) return 0;
+  size_t n = (size_t)strtoull(line,0,10);
+  char *p = malloc(n);                       /* return value never checked */
+  printf("data: "); if(!fgets(line,sizeof line,stdin)) return 0;
+  size_t k = strlen(line); if(k > n) k = n;  /* the COPY is bounded: no overflow here */
+  memcpy(p,line,k);                          /* p is NULL when the allocation was refused */
+  printf("%zu\n", k); free(p); return 0; }""",
+         ["-no-pie", "-O0", "-w"],
+         want_level=1, want_cwe=(), budget=300.0, mechanism="unchecked-return", strict_level=True,
+         note="BUG CLASS unchecked return value (CWE-252/391): malloc's NULL is never tested, so "
+              "an allocation the attacker makes fail turns the next copy into a write through "
+              "NULL. The copy is deliberately BOUNDED by the allocation: the first version of "
+              "this fixture used `strcpy` and the fuzzer found the unbounded copy instead, "
+              "reporting CWE-122 -- a real defect, and not the one the case is for. What the "
+              "pipeline reports now is the dereference (CWE-476), which is the manifestation; "
+              "naming the missing CHECK would need the allocation and the fault tied together, "
+              "and that is a labelling gap this case pins rather than closes."),
+
+    Case("hardcoded_secret",
+         r"""#include <stdio.h>
+#include <string.h>
+int main(void){ setvbuf(stdout,0,2,0);
+  char pw[64]; printf("password: ");
+  if(!fgets(pw,sizeof pw,stdin)) return 0;
+  pw[strcspn(pw,"\n")]=0;
+  if(!strcmp(pw,"s3cr3t-admin-9931")){      /* the credential is IN the binary */
+    printf("LYKOS{access-granted}\n"); return 0; }
+  printf("denied\n"); return 1; }""",
+         ["-no-pie", "-O0", "-w"],
+         want_level=0, want_cwe=(), want_static_cwe=("CWE-798",), budget=300.0,
+         mechanism="hardcoded-secret", known_gap=True,
+         note="BUG CLASS hardcoded credential (CWE-798). No memory is corrupted and nothing "
+              "crashes: the defect IS the string in .rodata, and the demonstrated effect is the "
+              "authentication it passes. Unlike every other case here the win needs no exploit at "
+              "all -- just reading the binary and typing what it says -- which is precisely why a "
+              "crash-centric pipeline can miss it entirely. MEASURED HOLE: `hardcoded_secrets` "
+              "files nothing here. It looks for a secret-SHAPED value (an assignment to a "
+              "password-ish name, high-entropy base64/hex), and a plaintext credential compared "
+              "with `strcmp` against a string literal has neither shape -- the evidence is the "
+              "COMPARISON, not the string. Nothing else in the pipeline reads it either, so the "
+              "case records the hole: the fixture, and the measurement that the detector misses it."),
+
+    Case("race_counter",
+         r"""#include <stdio.h>
+#include <pthread.h>
+static int counter;                          /* no mutex, no atomics */
+static void *bump(void *a){ for(int i=0;i<200000;i++) counter++; return 0; }
+int main(void){ setvbuf(stdout,0,2,0);
+  pthread_t t[4];
+  for(int i=0;i<4;i++) pthread_create(&t[i],0,bump,0);
+  for(int i=0;i<4;i++) pthread_join(t[i],0);
+  printf("%d\n", counter); return 0; }""",
+         ["-lpthread"], as_source=True,
+         want_level=1, want_cwe=("CWE-362",), budget=360.0, mechanism="race", strict_level=True,
+         note="BUG CLASS data race (CWE-362): four threads increment one unsynchronised counter. "
+              "TSAN is the only oracle that sees it -- the program never crashes and prints a "
+              "plausible-looking number -- so this is handed over as SOURCE for the platform's own "
+              "sanitizer build. Measured: `tsan/CWE-362` at L1, which is the family's ceiling by "
+              "construction -- a race is a scheduling fact, not an attacker-chosen write."),
+
+    # ---- SECOND WAVE: mechanisms whose DETECTOR may or may not exist. Each of these lands at
+    # want_level=0 / want_cwe=() for the same reason as the wave above -- the case is the
+    # measurement -- and for several of them the honest outcome is "nothing files this today",
+    # which is a HOLE the matrix should show rather than a row it should omit.
+    Case("untrusted_pointer",
+         r"""#include <stdio.h>
+#include <stdlib.h>
+int main(void){ setvbuf(stdout,0,2,0);
+  char line[64]; printf("addr: ");
+  if(!fgets(line,sizeof line,stdin)) return 0;
+  unsigned long a = strtoul(line,0,0);
+  unsigned long *p = (unsigned long *)a;   /* an ADDRESS straight from the input */
+  printf("%lu\n", *p); return 0; }         /* ...dereferenced */""",
+         ["-no-pie", "-O0", "-w"],
+         want_level=2, want_cwe=(), budget=300.0, mechanism="untrusted-pointer",
+         strict_level=True,
+         note="BUG CLASS untrusted pointer dereference (CWE-822/823): the input IS the address. "
+              "The strongest shape of attacker control there is -- no overflow, no groom, the "
+              "faulting address is chosen outright -- which is exactly what the address-control "
+              "verdict was built to recognise, and no case asserted it. Measured with --ceiling: "
+              "L2 -- `primitive/CWE-476` plus `tainted_deref/CWE-125`, an address-control "
+              "primitive confirmed from the fault address across input variants. L3 would need "
+              "somewhere worth pointing it, and a read of one word is not a write."),
+
+    Case("toctou_access",
+         r"""#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+int main(void){ setvbuf(stdout,0,2,0);
+  char name[128], path[256]; char buf[256];
+  printf("file: "); if(!fgets(name,sizeof name,stdin)) return 0;
+  name[strcspn(name,"\n")]=0;
+  snprintf(path,sizeof path,"/tmp/lykos_toctou/%s", name);
+  if(access(path, R_OK) != 0){ printf("denied\n"); return 1; }   /* check... */
+  FILE *f=fopen(path,"rb");                                      /* ...then use: a race */
+  if(!f){ printf("gone\n"); return 1; }
+  size_t n=fread(buf,1,sizeof buf-1,f); buf[n]=0; fclose(f);
+  printf("%s", buf); return 0; }""",
+         ["-no-pie", "-O0", "-w"],
+         want_level=0, want_cwe=(), budget=300.0, mechanism="race", known_gap=True,
+         note="BUG CLASS TOCTOU file race (CWE-367): the path is checked with access() and then "
+              "opened, so a symlink swapped in between gets the open. Winning it needs a second "
+              "process the prober does not have, which is the point of the case: the DETECTION "
+              "has to come from the pattern (check-then-use on the same path), not from a crash. "
+              "MEASURED HOLE: nothing files it. `toctou` and `toctou_race` are in the static "
+              "detector set and both read SOURCE; this is a binary, and no stage looks for the "
+              "access()-then-open() pair in a disassembly. The only finding is `dangerous_api`, "
+              "which does not name this defect."),
+
+    Case("temp_file",
+         r"""#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+int main(void){ setvbuf(stdout,0,2,0);
+  char tmpl[] = "/tmp/lykosXXXXXX";
+  char *name = mktemp(tmpl);               /* predictable name, race to create it */
+  if(!name || !*name) return 1;
+  FILE *f = fopen(name,"w");               /* no O_EXCL: an attacker can pre-create it */
+  if(!f) return 1;
+  char line[64]; printf("note: ");
+  if(fgets(line,sizeof line,stdin)) fputs(line,f);
+  fclose(f); printf("wrote %s\n", name); remove(name); return 0; }""",
+         ["-no-pie", "-O0", "-w"],
+         want_level=0, want_cwe=(), want_static_cwe=("CWE-377",), budget=240.0,
+         mechanism="temp-file",
+         note="BUG CLASS insecure temporary file (CWE-377): mktemp hands back a name and the open "
+              "that follows has no O_EXCL, so the window between them is the bug. mktemp is a "
+              "libc function the linker itself warns about, so the import alone is evidence -- "
+              "this measures whether anything in the pipeline says so."),
+
+    Case("weak_prng_token",
+         r"""#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+int main(void){ setvbuf(stdout,0,2,0);
+  srand((unsigned)time(0));                /* seeded from the clock: guessable */
+  printf("token %d\n", rand());            /* ...and used as a secret */
+  char line[64]; printf("guess: ");
+  if(!fgets(line,sizeof line,stdin)) return 0;
+  printf("%s\n", atoi(line)==rand() ? "LYKOS{predicted}" : "no"); return 0; }""",
+         ["-no-pie", "-O0", "-w"],
+         want_level=0, want_cwe=(), want_static_cwe=("CWE-330",), budget=240.0,
+         mechanism="weak-crypto",
+         note="BUG CLASS cryptographically weak PRNG used for a secret (CWE-338/330). Nothing "
+              "crashes and no memory is touched: the defect is that rand() seeded from time() is "
+              "predictable, so the token can be computed rather than brute-forced. Detecting it "
+              "is an IMPORT question (srand/rand reaching a value treated as a secret) and "
+              "demonstrating it needs a predictor, which is a capability this measures the "
+              "absence of."),
+
+    Case("search_path_hijack",
+         r"""#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+int main(void){ setvbuf(stdout,0,2,0);
+  char line[64]; printf("mode: ");
+  if(!fgets(line,sizeof line,stdin)) return 0;
+  if(line[0]=='l') system("ls /tmp >/dev/null");   /* RELATIVE program name: PATH decides */
+  else system("date >/dev/null");
+  printf("ran\n"); return 0; }""",
+         ["-no-pie", "-O0", "-w"],
+         want_level=0, want_cwe=(), budget=240.0, mechanism="search-path", known_gap=True,
+         note="BUG CLASS untrusted search path (CWE-426/427): system() with a relative program "
+              "name resolves through PATH, so whoever controls the environment chooses the "
+              "binary. The input does not even have to be attacker-controlled for this to be a "
+              "finding, which is why it is a different mechanism from command injection -- the "
+              "same sink, a different thing wrong with it. MEASURED HOLE: the only evidence is "
+              "`dangerous_api/CWE-78` -- \"system() is dangerous\" -- which is the SINK and not "
+              "this defect: it does not distinguish a relative program name (whoever controls "
+              "PATH chooses the binary, with no attacker input at all) from an injected argument. "
+              "Asserting CWE-78 here would be asserting the wrong mechanism."),
+
+    Case("redos_regex",
+         r"""#include <stdio.h>
+#include <string.h>
+#include <regex.h>
+int main(void){ setvbuf(stdout,0,2,0);
+  regex_t re;
+  if(regcomp(&re, "^(a+)+$", REG_EXTENDED)) return 1;   /* nested quantifier */
+  char line[256]; printf("subject: ");
+  if(!fgets(line,sizeof line,stdin)) return 0;
+  line[strcspn(line,"\n")]=0;
+  printf("%s\n", regexec(&re,line,0,0,0)==0 ? "match" : "no match");
+  regfree(&re); return 0; }""",
+         ["-no-pie", "-O0", "-w"],
+         want_level=0, want_cwe=(), budget=300.0, mechanism="redos", known_gap=True,
+         note="BUG CLASS catastrophic backtracking (CWE-1333): a nested quantifier against a long "
+              "non-matching subject takes exponential time, so the input makes the program HANG "
+              "rather than crash. A timeout is the only oracle, and a timeout is the one outcome "
+              "a fuzzer is built to discard as flaky -- this measures which way that goes. "
+              "MEASURED HOLE: it goes the discarding way. 300s of the real autopilot produced no "
+              "finding for the hang; the only one filed is `dangerous_api/CWE-134`, which is "
+              "about printf-family calls and not about this at all."),
 
     # ---- INJECTION. A whole bug family the platform has probes for (command, path, SQL, XXE,
     # SSRF) and which nothing asserted: these need no memory corruption at all, so none of the
@@ -1882,10 +2269,12 @@ class Result:
     findings: list = field(default_factory=list)
     elapsed: int = 0
     reason: str = ""
+    gap: bool = False                        # a measured hole: see Case.known_gap
 
 
 def _verdict(s, target, case):
-    """(max verified poc level, demonstrated findings matching want_cwe, all demonstrated findings).
+    """(max verified poc level, demonstrated findings matching want_cwe, all demonstrated findings,
+    the CWEs STATIC detectors named).
 
     The SINGLE definition of "this case succeeded", used both to poll for early completion and to
     score the run, so the two can never disagree. A demonstrated finding is one from a non-static
@@ -1927,7 +2316,12 @@ def _verdict(s, target, case):
         wanted += list(req) if isinstance(req, (tuple, list)) else [req]
     demod = [(f.detector, f.cwe, (f.title or "")[:40]) for f in fs
              if f.detector not in _STATIC_DETECTORS and any(w in (f.cwe or "") for w in wanted)]
-    return maxlvl, demod, fs
+    # What the STATIC detectors named, in ANY state (`hardcoded_secrets` deliberately leaves its
+    # findings at `candidate`, so the state filter above would drop the only evidence a
+    # want_static_cwe case can ever have).
+    statics = {f.cwe for f in FindingDAO(s.conn).list_by_case(target.case_id)
+               if f.detector in _STATIC_DETECTORS and f.cwe}
+    return maxlvl, demod, fs, statics
 
 
 def _bundle_reproduces(s, target, case, timeout: float = 120.0):
@@ -1983,7 +2377,7 @@ def _bundle_reproduces(s, target, case, timeout: float = 120.0):
         shutil.rmtree(out, ignore_errors=True)
 
 
-def _scored(maxlvl, demod, case, file_type=None):
+def _scored(maxlvl, demod, case, file_type=None, statics=()):
     """Did this case pass, and is it finished? `done` gates the early stop, so it must never be true
     before the case has shown everything it asserts -- otherwise the run is cut short of its own
     claim (which is how an earlier version let a format case 'pass' at L1)."""
@@ -1995,6 +2389,10 @@ def _scored(maxlvl, demod, case, file_type=None):
             return False, False
     if case.clean:                                       # precision: nothing may be demonstrated
         return (maxlvl == 0 and not demod), False        # never stop early -- absence needs the time
+    # A static-only claim IS the whole claim when the case makes no other: see want_static_cwe.
+    if case.want_static_cwe and not (case.want_level or case.want_cwe or case.want_all_cwe):
+        hit = bool({c for c in (statics or ()) if c} & set(case.want_static_cwe))
+        return hit, hit
     if case.want_all_cwe:                                # every listed defect must be demonstrated
         got = {c for _, c, _ in demod}
         def _met(req):
@@ -2110,17 +2508,17 @@ def _run_case(case: Case, gcc: str) -> Result:
         while th.is_alive() and time.time() - t0 < case.budget:
             time.sleep(1.0)
             try:
-                ml, dm, _ = _verdict(s, t, case)
+                ml, dm, _, st = _verdict(s, t, case)
             except Exception:                            # noqa: BLE001 -- a transient DB lock; retry
                 continue
-            if _scored(ml, dm, case, file_type=tg.file_type)[1]:
+            if _scored(ml, dm, case, file_type=tg.file_type, statics=st)[1]:
                 early = True
                 if not CEILING:                          # --ceiling: keep going, measure the max
                     break
         if th.is_alive():
             stop.set(); th.join(timeout=60)
-        maxlvl, demod, fs = _verdict(s, t, case)
-        ok, _ = _scored(maxlvl, demod, case, file_type=tg.file_type)
+        maxlvl, demod, fs, statics = _verdict(s, t, case)
+        ok, _ = _scored(maxlvl, demod, case, file_type=tg.file_type, statics=statics)
         shown = demod or [(f.detector, f.cwe, (f.title or "")[:30]) for f in fs]
         # The bundle check runs LAST and can only turn a case red, never green: a case has to
         # earn its level first, and then its deliverable has to work. It is deliberately able to
@@ -2140,8 +2538,18 @@ def _run_case(case: Case, gcc: str) -> Result:
         elif case.want_all_cwe:
             why = "want ALL of %s demonstrated; got %s" % (case.want_all_cwe,
                                                            sorted({c for _, c, _ in demod}))
+        elif case.want_static_cwe and not (case.want_level or case.want_cwe):
+            why = "want a STATIC detector to name one of %s; got %s" % (
+                list(case.want_static_cwe), sorted(c for c in statics if c) or "no static findings")
         else:
             why = "want L%d / %s demonstrated; got L%d" % (case.want_level, case.want_cwe, maxlvl)
+        if case.known_gap:
+            # No verdict to give: the case exists to keep the fixture and the measurement, and
+            # its note says what is missing. Reported, counted apart, never red.
+            return Result(case.name, True, "%s L%d%s" % (prof, maxlvl, "*" if early else ""),
+                          shown, int(time.time() - t0),
+                          "KNOWN GAP (nothing here states this defect yet) -- " + (why or "")
+                          .strip(), gap=True)
         if not ok and KEEP_FAILED:
             keep = True
             why += f" -- case kept for diagnosis: {d}"
@@ -2293,12 +2701,16 @@ def run_all(names=None) -> list[Result]:
         # listed, and the old line dropped the one sentence that said the deliverable is broken.
         if not r.ok and r.reason:
             f = r.reason if not r.findings else "%s -- found %s" % (r.reason, f)
-        print("%-24s | %-4s | %-26s | %s [%ds]" % (r.name, "PASS" if r.ok else "FAIL", r.profile, f, r.elapsed))
+        print("%-24s | %-4s | %-26s | %s [%ds]" % (
+            r.name, "GAP" if r.gap else ("PASS" if r.ok else "FAIL"), r.profile, f, r.elapsed))
     print("-" * 110)
-    npass = sum(1 for r in results if r.ok)
+    gaps = [r for r in results if r.gap]
+    npass = sum(1 for r in results if r.ok and not r.gap)
+    if gaps:
+        print("MEASURED HOLES (reported, not graded): %s" % ", ".join(r.name for r in gaps))
     print("CONFORMANCE: %d/%d bug-classes demonstrated end-to-end through the real autopilot "
           "(%ds total; * = %s)"
-          % (npass, len(results), sum(r.elapsed for r in results),
+          % (npass, len(results) - len(gaps), sum(r.elapsed for r in results),
              "criterion met, then run on to the end of the budget anyway (--ceiling): the level "
              "shown is the CEILING" if CEILING
              else "stopped as soon as the case's criterion was met"))

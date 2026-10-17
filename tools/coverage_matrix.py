@@ -77,6 +77,25 @@ MECHANISM = {
     "ssrf": ("CWE-918",),
     "race": ("CWE-362", "CWE-367"),
     "resource-exhaustion": ("CWE-400", "CWE-770", "CWE-789", "CWE-835", "CWE-401"),
+    # Mechanisms this table did not name at all. Each is a DIFFERENT defect from its neighbour in
+    # a way that changes what can be done with it, which is the test for belonging here: a
+    # truncation under-allocates where an overflow over-allocates (so one is weaponizable and the
+    # other is a refused malloc), an unchecked return turns an allocation failure the attacker
+    # CHOOSES into a write through NULL, recursion exhausts a stack rather than a heap, and a
+    # credential in .rodata needs no memory corruption at all.
+    "integer-truncation": ("CWE-197", "CWE-681"),
+    "unchecked-return": ("CWE-252", "CWE-391", "CWE-690"),
+    "stack-exhaustion": ("CWE-674",),
+    "hardcoded-secret": ("CWE-798", "CWE-259", "CWE-321"),
+    "deserialization": ("CWE-502",),
+    "symlink-follow": ("CWE-59", "CWE-61"),
+    "temp-file": ("CWE-377", "CWE-378"),
+    "weak-crypto": ("CWE-327", "CWE-328", "CWE-338"),
+    "search-path": ("CWE-426", "CWE-427", "CWE-428"),
+    "decompression-bomb": ("CWE-409",),
+    "redos": ("CWE-1333",),
+    "privilege": ("CWE-250", "CWE-271", "CWE-732"),
+    "untrusted-pointer": ("CWE-822", "CWE-823", "CWE-825"),
 }
 _CWE_TO_MECH = {c: m for m, cs in MECHANISM.items() for c in cs}
 

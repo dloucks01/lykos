@@ -763,6 +763,24 @@ def classify(cap, disasm):
         return {"class": "illegal-instruction", "cwe": "CWE-119", "severity": "high",
                 "detail": "illegal instruction (corrupted code or control flow)"}
 
+    # STACK EXHAUSTION, before any bounds verdict. A fault immediately BELOW the [stack] mapping
+    # is the guard page the kernel keeps there, and the thing that walks into it is a stack that
+    # has grown as far as the rlimit allows -- uncontrolled recursion (CWE-674), a denial of
+    # service. Reading it as an out-of-bounds write is wrong twice over: the address is not one
+    # the attacker placed (it is wherever the stack happened to end) and there is no primitive to
+    # chain, so the lead sends a reader looking for a write they cannot have. Measured on a
+    # recursion fixture whose depth comes from the input: `root_cause/CWE-787`, "invalid write",
+    # severity high. The window is deliberately narrow -- a page or two below the mapping -- and
+    # an ordinary wild write lands nowhere near it.
+    stack_map = next((m for m in maps if "[stack]" in (m.get("path") or "")), None)
+    if fault is not None and stack_map and 0 <= (int(stack_map["start"]) - fault) <= 0x10000:
+        return {"class": "stack-exhaustion", "cwe": "CWE-674", "severity": "high",
+                "detail": f"fault at 0x{fault:x}, just below the stack mapping at "
+                          f"0x{int(stack_map['start']):x}: the stack grew into its guard page "
+                          "(uncontrolled recursion / unbounded stack allocation). The faulting "
+                          "address is where the stack ended, not an address the input chose, so "
+                          "this is a denial of service and not a write primitive."}
+
     mnem = (disasm or "").split()[0] if disasm else ""
     if mnem in ("ret", "retq", "retn"):
         return {"class": "stack-return-overwrite", "cwe": "CWE-121", "severity": "critical",
