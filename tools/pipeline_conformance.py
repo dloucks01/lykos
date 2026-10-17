@@ -24,11 +24,16 @@ from pathlib import Path
 CORE = Path(__file__).resolve().parent.parent / "core"
 import sys
 
-from lykos import observe  # noqa: E402
-
+# The path insert has to come BEFORE the first `lykos` import, and it did not: the observe round
+# added `from lykos import observe` at the top of this block, above the two lines that make
+# `lykos` importable at all, so running the gate the way its own usage line says --
+# `python3 tools/pipeline_conformance.py <case>` -- died with ModuleNotFoundError. The insert
+# below was dead code and the tool only worked for a caller who had already set PYTHONPATH.
+# A gate that cannot be started is a gate nothing runs.
 if str(CORE) not in sys.path:
     sys.path.insert(0, str(CORE))
 
+from lykos import observe  # noqa: E402,I001
 
 
 
@@ -63,6 +68,27 @@ int main(int c, char **v){
   if(!strcmp(v[1], "unlzma")){ do_unlzma(); return 0; }
   if(!strcmp(v[1], "cat")){ int ch; while((ch = getchar()) != EOF) putchar(ch); return 0; }
   usage(); return 1; }"""
+
+
+# The shape a real binary presents, and the one every planted L3 case here avoids: a container
+# header the input must satisfy, an unvalidated index taken from that header, a READ rather than
+# a write, and no `win()` to return to. Those three properties are what put a ceiling on every
+# real-corpus finding this project has: the De Bruijn pattern the L2 control experiment uses is
+# not a valid container, so it never reaches the defect; a read has no saved return address to
+# control; and a single observation cannot tell "the attacker chooses the address" from "a wild
+# pointer landed at 0". The magic is a memcmp literal so the comparison-dictionary miner can
+# find it -- the fuzzer has to get through the gate on its own, which is the point of the case.
+_INDEXED_READ_SRC = r"""#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+int main(void){
+  unsigned char *p = malloc(32);
+  unsigned char hdr[16];
+  if (fread(hdr, 1, 8, stdin) != 8) return 0;
+  if (memcmp(hdr, "LZMA", 4) != 0) { puts("bad magic"); return 1; }
+  size_t idx = (size_t)hdr[5] * 0x100000;               /* unvalidated index from the header */
+  printf("%02x\n", p[idx]);                             /* OOB read: address = f(input) */
+  return 0; }"""
 
 
 @dataclass
@@ -655,6 +681,15 @@ int main(void){ setvbuf(stdout,0,2,0);
          want_level=1, want_cwe=("CWE-121", "CWE-787", "CWE-119"), budget=300.0,
          note="DISPATCH multi-call: the bug is behind `unlzma`, and the image itself only "
               "dispatches -- busybox's shape, which is every firmware image's shape"),
+
+    # A read-class defect behind a header gate, with the address the attacker's to choose. The
+    # level asserted here is what it MEASURED on 2026-10-16, not what would be nice: see the
+    # address-control verdict family in poc/primitive.py.
+    Case("indexed_read_l2", _INDEXED_READ_SRC,
+         ["-O0", "-w"],
+         want_level=2, want_cwe=("CWE-125", "CWE-129", "CWE-119"), budget=420.0,
+         note="REAL-SHAPED: header-gated parser, unvalidated index, read-class, no win() -- "
+              "the L2 verdict comes from the faulting ADDRESS moving with the input"),
 
     # ---- FILE FORMATS / FRONT-ENDS. The platform parses PE, JVM, CPython bytecode, WASM and
     # UPX-packed ELF, but every case above is a plain ELF, so a front-end could stop recognising its
