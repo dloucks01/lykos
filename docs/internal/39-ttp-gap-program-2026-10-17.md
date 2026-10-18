@@ -339,3 +339,44 @@ UNKNOWN-without-bytes.
   cannot follow (`batchable=False`). SEH overwrite and DLL search-order hijack need that
   supervision problem solved first, not the techniques written.
 * **ARM hardening** -- PAC is nop'd in the fixtures rather than defeated; BTI and MTE unmodelled.
+
+## The ROP catalogue, driven to L3 (and two measured ceilings)
+
+The gate proved the core ROP/exploitation techniques at L3 but had no dedicated L3 case for five
+named variants that existed only as autopilot strategies + unit tests. Research
+(ir0nstone, HackTricks, the SROP paper, the glibc 2.34 CSU hardening, one_gadget docs) pinned down
+the canonical shape of each; the result:
+
+**Gate-proven at L3 this round** (fixtures that force each as the only route):
+* `srop_execve_plant` -- SROP, L3. read() delivery (not scanf, which can't carry a binary
+  sigreturn frame), static + no system + no "/bin/sh" + NX, so the auto dispatch falls through to
+  SROP's forge-frame / plant-"/bin/sh" / execve path.
+* `orw_seccomp_disclose` -- ORW, L3. A seccomp filter kills execve, so a shell finisher SIGSYSes
+  and the only L3 route is an open/read/write disclosure of a planted-marker file.
+* `ret2dlresolve_nolibc` -- ret2dlresolve, L3. No system PLT, no "/bin/sh", no leak; forge
+  Rela/Sym/string in a >=0x100 .bss and resolve system() through the loader. Needs the pop gadgets
+  in-image (glibc 2.34 removed the CSU gadgets a minimal binary used to supply), so the fixture
+  carries an explicit gadget block.
+
+**Two measured ceilings** -- correctly implemented, version/architecture-sensitive, and honestly
+not gate-forceable on this host:
+* **one-gadget is dead on glibc 2.43.** `rop.find_one_gadgets` matches the classic
+  `lea rdi,[rip->"/bin/sh"]` -> execve single-jump pattern; measured, it finds **1** on the cached
+  glibc 2.35 and **0** on the host's 2.43. A genuine glibc evolution (the pattern matches on 2.35,
+  so it is not a stale finder), the same shape as "no fastbins on 2.43". The finisher is wired into
+  the libc-leak path and tried opportunistically; on 2.43 it yields nothing, so system("/bin/sh")
+  is the finisher that fires. Not a gap -- a fact about the libc.
+* **ret2csu is structurally subsumed on x86-64.** The technique needs the CSU_POP gadget
+  (`5b 5d 41 5c 41 5d 41 5e 41 5f c3`) to load r12-r15 before the CSU_CALL. That byte string ends
+  in `41 5f c3`, whose `5f c3` tail IS a `pop rdi; ret` -- so every binary carrying the ret2csu
+  gadgets also carries a pop-rdi gadget, and ret2csu additionally requires the same `system` + 
+  "/bin/sh" that plain ret2system does. The autopilot therefore always prefers ret2system, and
+  ret2csu can never be the minimal route a fixture forces. This is the concrete mechanism behind
+  the write-ups' verdict that ret2csu is "irrelevant in the real world", and glibc 2.34 removed the
+  CSU gadgets outright. It stays as an explicit-strategy last resort; it is not auto-gate-forceable.
+
+**Not a regression, cleared by a controlled test:** the full 108-case run showed `stack_pivot_shell`
+and `addr_leak_pie_ret2win` at L2, but both reach L3 in isolation (stack_pivot at 104s vs 172s
+under full-gate load). The drop was budget pressure under whole-run load, not broken code -- and
+`sweep_modes` was hardened (prompt capture is now a recorded-mode channel, not guessed from a 0x0a
+byte in the payload) to cut the avoidable per-detonation cost that aggravated it.
