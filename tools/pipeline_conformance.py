@@ -2507,6 +2507,79 @@ int main(void){ char buf[64]; read(0, buf, 512); return 0; }""",
               "ASLR with no leak (the frame sets every register at once) and needs only the one "
               "syscall gadget."),
 
+    #: ORW (open/read/write) to L3: a seccomp filter kills execve, so a shell finisher dies with
+    #: SIGSYS and the autopilot must DISCLOSE a file instead -- leak libc via puts, then open/read/
+    #: write a chain. The oracle is the disclosure (a random marker in a file the strategy plants).
+    Case("orw_seccomp_disclose",
+         r'''__asm__(".text\n.globl lykos_gadgets\nlykos_gadgets:\n.byte 0x5f,0xc3\n.byte 0x5e,0xc3\n.byte 0x5a,0xc3\n.byte 0xc3\n");
+#include <stdio.h>
+#include <unistd.h>
+#include <linux/seccomp.h>
+#include <linux/filter.h>
+#include <sys/prctl.h>
+#include <linux/audit.h>
+#include <stddef.h>
+#include <errno.h>
+/* A seccomp filter that KILLS execve/execveat, so a shell finisher dies with SIGSYS and the
+   autopilot must disclose the flag with an open/read/write chain instead. open/read/write stay
+   allowed. puts() is imported so the ORW path can leak libc exactly as ret2libc does. */
+static void sandbox(void){
+  struct sock_filter f[] = {
+    BPF_STMT(BPF_LD|BPF_W|BPF_ABS, offsetof(struct seccomp_data, nr)),
+    BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, 59, 1, 0),   /* execve */
+    BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, 322, 0, 1),  /* execveat */
+    BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_KILL_PROCESS),
+    BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW),
+  };
+  struct sock_fprog p = { .len = sizeof f/sizeof f[0], .filter = f };
+  prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+  prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &p);
+}
+int main(void){ setvbuf(stdout,0,2,0); sandbox();
+  puts("go");                                   /* puts import -> leakable libc */
+  char buf[64]; read(0, buf, 512); return 0; }  /* overflow */
+''',
+         ["-no-pie", "-fno-stack-protector", "-O0", "-w"],
+         want_level=3, want_cwe=("CWE-121", "CWE-787", "CWE-119"), budget=900.0,
+         mechanism="stack-overflow", strict_level=True,
+         note="TTP ORW (open/read/write) to a demonstrated file disclosure. A seccomp filter "
+              "KILLS execve/execveat, so every shell finisher dies with SIGSYS -- the auto "
+              "dispatch is gated on seccomp=on to take the ORW route instead. It leaks libc "
+              "through puts() (lazy GOT, ASLR on) exactly as ret2libc would, then builds an "
+              "open/read/write chain that opens a file the strategy plants (a random marker, "
+              "absolute path because bwrap runs with cwd=/tmp), reads it, and writes it to "
+              "stdout. Confirmation is the marker coming back -- the disclosure IS the effect, "
+              "the same reasoning as the injection oracles. The pop rdi/rsi/rdx gadgets are "
+              "present in the image (a real exploitable binary has them; a minimal one on glibc "
+              "2.34+ does not, since the CSU gadgets were removed, so the fixture carries an "
+              "explicit gadget block)."),
+
+    #: ret2dlresolve to L3: no system PLT, no "/bin/sh", no leak -- forge a relocation and resolve
+    #: system() through the dynamic linker. Lazy binding (partial/no RELRO) is the precondition.
+    Case("ret2dlresolve_nolibc",
+         r'''__asm__(".text\n.globl lykos_gadgets\nlykos_gadgets:\n.byte 0x5f,0xc3\n.byte 0x5e,0xc3\n.byte 0x5a,0xc3\n.byte 0xc3\n");
+#include <unistd.h>
+/* Dynamic, no-PIE, lazy binding (partial RELRO), a read() overflow, and NO puts/printf that
+   leaks libc and NO system() -- so ret2libc-leak and ret2system both fail and the autopilot must
+   forge a relocation and resolve system() through the dynamic linker with no leak. The global
+   array gives a .bss large enough to hold the forged Rela/Sym/string structures. */
+char scratch[512];
+int main(void){ char buf[64]; read(0, buf, 512); scratch[0] = buf[0]; return 0; }
+''',
+         ["-no-pie", "-fno-stack-protector", "-Wl,-z,norelro", "-Wl,-z,lazy", "-O0", "-w"],
+         want_level=3, want_cwe=("CWE-121", "CWE-787", "CWE-119"), budget=900.0,
+         mechanism="stack-overflow", strict_level=True,
+         note="TTP ret2dlresolve to a live shell with NO leak at all. Dynamic, no-PIE, lazily "
+              "bound (linked -z norelro -z lazy), a read() overflow, no system() in the PLT and "
+              "no puts/printf that leaks libc -- so ret2system, execve-rop and ret2libc-leak all "
+              "fail and the auto dispatch falls through to dlresolve. The strategy uses read() to "
+              "plant forged Elf64_Rela/Elf64_Sym/string structures in writable memory, then "
+              "returns into the PLT stub with an index that makes _dl_runtime_resolve resolve and "
+              "call system(\"/bin/sh\"). The pop rdi/rsi/rdx gadgets must be in the IMAGE "
+              "(there is no leak to borrow libc gadgets), and glibc 2.34+ removed the CSU gadgets "
+              "a minimal binary used to carry, so the fixture provides an explicit gadget block, and a 512-byte global gives a .bss large enough (>=0x100) to hold the forged structures -- "
+              "which a real exploitable target of this shape would have. Confirmed by a shell."),
+
     Case("nowin_dynamic_overflow",
          r"""#include <stdio.h>
 #include <unistd.h>
