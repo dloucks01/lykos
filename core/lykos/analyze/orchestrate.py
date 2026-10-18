@@ -662,7 +662,7 @@ def _staged(budget, store, target, stage, status, stop, params=None, *, want=Non
                              budget=budget, want=want, want_execs=want_execs)
 
 
-def _run_target_stages(store, target, specs, status, stop) -> dict:
+def _run_target_stages(store, target, specs, status, stop, *, budget=None, want=None) -> dict:
     """Enqueue several INDEPENDENT target stages at once and wait for all of them, letting the worker
     pool run them concurrently under its per-class concurrency caps -- the single sandbox governor
     (quick/io/cpu/vm) that already bounds how many sandbox runs execute at once. An independent
@@ -673,10 +673,18 @@ def _run_target_stages(store, target, specs, status, stop) -> dict:
     `specs` is a list of (stage, params). The caller GUARANTEES the stages do not consume each other's
     Findings/artifacts; a stage that reads another's output must stay a serial _run_target_stage after
     this batch. Per-stage plan/event/cache-hit handling mirrors _run_target_stage exactly. Returns
-    {stage: outcome}."""
+    {stage: outcome}.
+
+    `budget`/`want` bound each stage to a slice of the phase clock, exactly as `_run_target_stage`
+    does. Without this the batch ran every stage against the 3600s hang-ceiling, and a target that
+    does not terminate -- a server that blocks forever -- made `heap_check`/`heap_trace` drive it
+    for hundreds of seconds EACH, blowing the whole case budget (measured on a 22MB WebDriver
+    server: 486s + 399s on a 420s budget). `max_seconds` becomes the worker's per-run deadline, so a
+    runaway discovery pass is now bounded by what the phase can afford rather than by a wedge."""
     from ..jobs.registry import reproject_cache_hit
     pending: dict = {}                                    # run_id -> stage
     outcomes: dict = {}
+    max_slice = 0.0
     for stage, params in specs:
         if stop.is_set():
             break
@@ -684,6 +692,19 @@ def _run_target_stages(store, target, specs, status, stop) -> dict:
         status["updated"] = time.time()
         _plan_set(status, stage, "running")
         _emit_stage(store, target.case_id, stage, "running", target_id=target.id)
+        if budget is not None:
+            secs = budget.slice(stage, want)
+            if secs is not None and secs <= 0.0:
+                budget.skipped(stage, f"no budget left in the {budget.current_phase} phase")
+                _plan_set(status, stage, "skipped", "no budget")
+                _emit_stage(store, target.case_id, stage, "skipped", target_id=target.id)
+                outcomes[stage] = "skipped"
+                continue
+            if secs:
+                params = dict(params or {})
+                params["max_seconds"] = (min(float(params["max_seconds"]), secs)
+                                         if params.get("max_seconds") else secs)
+                max_slice = max(max_slice, secs)
         try:
             fn = _enqueue_fn(_TARGET[stage])
             q = JobQueue(store.conn)
@@ -709,7 +730,14 @@ def _run_target_stages(store, target, specs, status, stop) -> dict:
             pending[run.id] = stage
     # Poll every queued run to a terminal state; the pool's workers execute them in parallel, bounded
     # by the per-class caps. Finalize each stage the instant it finishes, exactly as the serial path.
-    deadline = time.time() + 900.0
+    # When the stages are budgeted, the poll fallback is their own slice plus the worker's wedge
+    # grace (a wedged stage is reclaimed that much past its deadline) -- never a flat 900s that would
+    # let a bounded batch sit idle. Serial run of the batch (a 1-worker pool) is covered by summing.
+    if budget is not None and max_slice > 0.0:
+        batch_budget = max_slice * max(1, len(specs)) + 120.0
+    else:
+        batch_budget = 900.0
+    deadline = time.time() + batch_budget
     while pending and time.time() < deadline:
         if stop.is_set():
             break
@@ -1717,7 +1745,8 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
             # so the campaigns get single-digit executions out of a whole slice. The input is
             # consumed long before the program blocks, so a short timeout reaches the same code
             # and buys forty times the executions.
-            if _baseline_timed_out(store, tid):
+            _nonterm = _baseline_timed_out(store, tid)
+            if _nonterm:
                 dyn = dict(dyn, exec_timeout=_NONTERM_EXEC_TIMEOUT)
                 fz = dict(fz, exec_timeout=_NONTERM_EXEC_TIMEOUT)
                 _emit_stage(store, t.case_id, "dynamic_run", "note", target_id=tid,
@@ -1737,8 +1766,20 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
             # per-class caps (the single sandbox governor), halving this phase on a multi-core box
             # without oversubscribing the sandbox. chain_primitive then runs SERIALLY after them --
             # its _lead_finding consumes the heap_trace / oob_index Findings, so it must see them done.
-            _run_target_stages(store, t, [("heap_check", dyn), ("heap_trace", None),
-                                          ("oob_index", None)], status, stop)
+            # Budgeted: each discovery pass gets a slice of the phase, so a non-terminating target
+            # cannot make one of them (heap_check/heap_trace drive the live process repeatedly) run
+            # for hundreds of seconds and blow the case budget. `want` is generous so a legitimate
+            # menu-driven heap target is not starved; `budget.slice` caps it to what the phase affords.
+            # A target whose baseline never terminates (a server that blocks forever) cannot be
+            # menu-crawled -- every option-drive just hits its timeout -- so the crawl-driven
+            # discovery passes are told, and skip the crawl with a clear note instead of wedging
+            # for their whole slice and being hard-reclaimed (which read as an ERROR, not a
+            # deliberate skip). heap_check is a single guarded run, already bounded, and keeps the
+            # short per-exec timeout from `dyn`.
+            _ht = {"baseline_nonterm": True} if _nonterm else None
+            _run_target_stages(store, t, [("heap_check", dyn), ("heap_trace", _ht),
+                                          ("oob_index", _ht)], status, stop,
+                               budget=bud, want=90.0)
             # A defect that never crashes is invisible to every stage above and below this one.
             # Shadow memory sees an uninitialised read as it happens, and tells a disclosure --
             # undefined bytes reaching a write syscall, which IS the effect -- from a merely

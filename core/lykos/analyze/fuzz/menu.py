@@ -287,8 +287,17 @@ def drive_to_menu(proc, sel, *, idle: float, deadline: float, width=None, tries:
     return out, alive
 
 
+#: Most options a menu crawl will drive. A real interactive heap/menu challenge advertises a
+#: handful; `detect_menu` keys on every numbered token in the binary's strings, so a large stripped
+#: binary (a 24MB server, say) yields dozens of spurious "options". Driving each one spawns and
+#: times out the process, which is how a crawl ran for a stage's whole budget and was then hard-
+#: reclaimed. Capping keeps the crawl bounded on a pathological target without touching a real menu.
+_CRAWL_MAX_OPTIONS = 40
+
+
 def crawl_menu(spawn, options, *, max_fields: int = 10, idle: float = 0.2,
-               per_option: float = 3.0, width=None) -> dict[str, list[str]]:
+               per_option: float = 3.0, width=None, deadline: float | None = None,
+               max_options: int = _CRAWL_MAX_OPTIONS) -> dict[str, list[str]]:
     """Learn each option's ordered field template by DRIVING the live process one prompt at a time.
 
     `spawn()` returns a fresh subprocess.Popen (stdin=PIPE, stdout=PIPE, stderr merged) -- the stage
@@ -296,9 +305,16 @@ def crawl_menu(spawn, options, *, max_fields: int = 10, idle: float = 0.2,
     menu, select the option, then repeatedly: read to the next prompt, classify it, feed a typed
     value, and record the field -- until the menu re-appears (flow done) or the process exits. Pure
     best-effort: any failure yields no template (the caller falls back). `width` selects the
-    fixed-width (read(fd, buf, W)) encoding; None drives the target line-by-line."""
+    fixed-width (read(fd, buf, W)) encoding; None drives the target line-by-line.
+
+    `deadline` (absolute `time.monotonic()`) stops the crawl between options when the stage's own
+    time is nearly up, so a crawl of many spurious options cannot run past the stage's budget and
+    be hard-reclaimed (which the UI shows as an ERROR rather than a completed step). `max_options`
+    caps how many are driven for the same reason."""
     model: dict[str, list[str]] = {}
-    for opt in options:
+    for opt in options[:max_options]:
+        if deadline is not None and time.monotonic() > deadline:
+            break
         proc = None
         try:
             proc = spawn()

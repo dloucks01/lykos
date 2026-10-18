@@ -29,6 +29,13 @@ _log = logging.getLogger(__name__)
 HEAP_TRACE_STAGE = "heap_trace"
 _HELPER = Path(__file__).with_name("heaptrace.py")
 
+#: Most allocator operation-sequences a single heap_trace run will drive. Each is a ptrace-helper
+#: drive bounded to ~15s; the reclaim shape and the most-faulting shapes lead, so the first dozen
+#: carry the signal. Uncapped, a target with its own bundled allocator (libffi's ffi_closure_alloc
+#: in chromedriver) produced 40+ and a single uncooperative drive could overrun the stage's hard
+#: deadline, which is reclaimed as an ERROR instead of a clean "nothing surfaced".
+_MAX_TRACE_SEQS = 12
+
 
 def _alloc_ret_offsets(exe: Path, alloc_name: str) -> list[int]:
     """`ret` offsets inside the alloc function, via objdump, so an alloc-return breakpoint reads
@@ -103,10 +110,12 @@ def _libc_plt_pair(exe: Path) -> dict | None:
     return None
 
 
-def _crawl_menu_model(workdir: Path, exe: Path, opts: list[str], *, width=None) -> dict:
+def _crawl_menu_model(workdir: Path, exe: Path, opts: list[str], *, width=None,
+                      deadline=None) -> dict:
     """Learn each menu option's typed field template by driving the sandboxed target interactively.
     `width` (from `_read_width`) selects the fixed-width read(fd, buf, W) input encoding when the
-    target is not line-based. Best-effort: any failure yields {} and the caller falls back."""
+    target is not line-based. Best-effort: any failure yields {} and the caller falls back.
+    `deadline` (absolute `time.monotonic()`) bounds the crawl so it cannot outlast the stage."""
     def spawn():
         cmd = sandbox.isolate_prefix(str(workdir), net=False, rw_binds=[str(workdir)],
                                      chdir=str(workdir)) + [str(exe)]
@@ -114,21 +123,21 @@ def _crawl_menu_model(workdir: Path, exe: Path, opts: list[str], *, width=None) 
                                 stderr=subprocess.STDOUT, cwd=str(workdir),
                                 preexec_fn=sandbox._rlimits(2048, 20, set_as=False))
     try:
-        return menu.crawl_menu(spawn, opts, per_option=2.5, width=width)
+        return menu.crawl_menu(spawn, opts, per_option=2.5, width=width, deadline=deadline)
     except Exception:
         observe.absorbed(_log, "answering empty")
         return {}
 
 
-def crawl_op_model(workdir: Path, exe: Path, opts: list) -> tuple:
+def crawl_op_model(workdir: Path, exe: Path, opts: list, *, deadline=None) -> tuple:
     """Shared menu op-model derivation: read the fixed-width input width, then crawl each option's
     typed field template at that width. The heap, out-of-bounds-index, primitive-chaining and fuzz
     stages all drive the SAME two steps, which MUST stay in sync (the width selects the crawl's field
     encoding); folding them here keeps a crawl fix from drifting across four call sites. Each stage
     still derives `opts` itself, since the strings source differs. Returns (width, model); model is
-    {} when there is no menu (`opts` empty) or the crawl fails."""
+    {} when there is no menu (`opts` empty) or the crawl fails. `deadline` bounds the live crawl."""
     width = _read_width(exe)
-    model = _crawl_menu_model(workdir, exe, opts, width=width) if opts else {}
+    model = _crawl_menu_model(workdir, exe, opts, width=width, deadline=deadline) if opts else {}
     return width, model
 
 
@@ -179,7 +188,16 @@ def shared_op_model(ctx, target, workdir: Path, exe: Path, opts: list) -> tuple:
         if hit is not None:
             ctx.progress(msg="op-model: reused shared crawl (no re-drive)")
             return hit
-    width, model = crawl_op_model(workdir, exe, opts)
+    # Stop crawling with time to spare before the stage's own deadline, so the crawl of a
+    # pathological option list cannot run the stage past its budget (and be hard-reclaimed as an
+    # ERROR). Leave a quarter of the remaining slice, floored at 20s, for the work after the crawl.
+    deadline = None
+    dl = getattr(ctx, "deadline", None)
+    if dl:
+        import time as _t
+        remaining = dl - _t.time()
+        deadline = _t.monotonic() + max(5.0, remaining - max(20.0, remaining * 0.25))
+    width, model = crawl_op_model(workdir, exe, opts, deadline=deadline)
     if opts and model:                                   # only share a crawl that actually learned a flow
         _store_op_model(ctx, target, opts, width, model)
     return width, model
@@ -1071,6 +1089,22 @@ def heap_trace_stage(ctx) -> dict:
         ctx.emit("heaptrace.done", payload={"applicable": False, "note": why})
         return {}
 
+    # A target whose baseline never terminates (a server that blocks forever) cannot be menu-
+    # crawled: this stage drives the live process once per option to learn its field templates,
+    # and against a non-terminating target every drive runs to its timeout -- dozens of them, for
+    # the stage's whole budget slice, after which the worker hard-reclaims it (which the UI then
+    # shows as an ERROR, not the deliberate skip it should be). A server is not a heap-service
+    # challenge binary, so say so and stop, rather than wedging. The autopilot passes this when the
+    # baseline timed out; a direct API launch simply never sets it.
+    if (ctx.params or {}).get("baseline_nonterm"):
+        ctx.emit("heaptrace.done", payload={
+            "applicable": False,
+            "note": ("the target's baseline did not terminate (a server or interactive process "
+                     "that blocks), so its menu cannot be crawled and there is no custom-allocator "
+                     "flow to trace -- heap tracing is skipped for this target, not failed")})
+        ctx.progress(pct=100, msg="non-terminating target: heap trace skipped (nothing to crawl)")
+        return {}
+
     # elf_functions gives name -> INT addr from the symbol table (the DAO stores hex strings);
     # a hand-rolled allocator is a NAMED local symbol, exactly what this reads.
     target_bytes = ctx.content.path(target.sha256).read_bytes()
@@ -1143,6 +1177,15 @@ def heap_trace_stage(ctx) -> dict:
         _rseq = _reclaim_sequence(model, opts, width, _prim.RECLAIM_MARKER)
         if _rseq:
             seqs = [_rseq] + [x for x in seqs if x != _rseq]
+        # Cap the sequences actually traced. Each is a ptrace-helper drive bounded to ~15s, but a
+        # target that bundles its own allocator (chromedriver carries libffi -> ffi_closure_alloc)
+        # yields dozens, and against an uncooperative process a single drive can overrun its reap
+        # and push the whole loop past the stage's hard deadline -- which is reclaimed as an ERROR
+        # rather than a clean "nothing surfaced". The reclaim shape leads and the rest are ordered
+        # by how often they fault, so the first few carry the signal; the long tail is what blew
+        # the budget. `ctx.should_cancel()` in the loop is the second bound, for a slice tighter
+        # than the cap.
+        seqs = seqs[:_MAX_TRACE_SEQS]
         ctx.emit("heaptrace.allocator", payload={
             "alloc": alloc["alloc_name"], "free": alloc["free_name"],
             "alloc_addr": hex(alloc["alloc"]), "free_addr": hex(alloc["free"]),
@@ -1330,8 +1373,14 @@ def heap_trace_stage(ctx) -> dict:
 
 
 def register() -> None:
+    # An explicit ceiling, like heap_check's: this stage drives the live process many times to
+    # crawl its menu and trace its allocator, and with no timeout it inherited the 3600s hang-
+    # ceiling -- so a target that never terminates (a server blocking forever) made it drive for
+    # hundreds of seconds. The autopilot tightens this further with a per-phase budget slice
+    # (`_run_target_stages(..., budget=, want=)`); the MIN of the two applies, so a direct
+    # single-stage launch from the API is bounded by this and a budgeted run by its slice.
     register_stage(HEAP_TRACE_STAGE, heap_trace_stage, resource_class="cpu",
-                   tool="ptrace", tool_version="1")
+                   tool="ptrace", tool_version="1", timeout=180)
 
 
 def enqueue_heap_trace(queue, target, *, params=None, force: bool = True):

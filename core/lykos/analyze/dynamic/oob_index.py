@@ -160,6 +160,18 @@ def oob_index_stage(ctx) -> dict:
         ctx.emit("oob_index.done", payload={"applicable": False, "note": why})
         return {}
 
+    # Same reason as heap_trace: a non-terminating baseline (a server that blocks) cannot be menu-
+    # crawled, so `shared_op_model` would drive it to timeout once per option for the whole budget
+    # slice. Skip with a clear note rather than wedge and be reclaimed as an ERROR.
+    if (ctx.params or {}).get("baseline_nonterm"):
+        ctx.emit("oob_index.done", payload={
+            "applicable": False,
+            "note": ("the target's baseline did not terminate (a server or interactive process), "
+                     "so its menu cannot be crawled to reach an index-selectable array -- "
+                     "out-of-bounds-index probing is skipped for this target, not failed")})
+        ctx.progress(pct=100, msg="non-terminating target: oob-index probing skipped")
+        return {}
+
     target_bytes = ctx.content.path(target.sha256).read_bytes()
     sym_arrays = _array_candidates(exploit.elf_objects_sized(target_bytes))
     pie = (target.mitigations or {}).get("pie") == "on"
