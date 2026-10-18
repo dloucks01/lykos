@@ -2482,6 +2482,31 @@ int main(void){ char b[64]; printf("in: ");
          note="TTP static+no-PIE, no win/system: the ret2syscall / SROP shape (a dynamic ret2libc "
               "has no PLT to lean on here)"),
 
+    #: SROP driven to L3. read() (not scanf) so the binary sigreturn frame -- NULs and all --
+    #: actually reaches the buffer; static + no system + no "/bin/sh" so every earlier auto route
+    #: (ret2system, execve-rop, shellcode-stack) is starved and SROP is the one left.
+    Case("srop_execve_plant",
+         r"""#include <unistd.h>
+/* A stack overflow delivered by read(), statically linked, with no system(), no "/bin/sh" in the
+   image, and NX on. ret2system has no PLT, execve-rop has no "/bin/sh", shellcode-stack has no
+   executable stack -- so the auto dispatch falls through to SROP, which forges a sigreturn frame,
+   PLANTS "/bin/sh" into .bss with a first syscall, then execve()s it. The statically-linked libc
+   supplies the `syscall` and `pop rax; ret` gadgets. */
+int main(void){ char buf[64]; read(0, buf, 512); return 0; }""",
+         ["-static", "-no-pie", "-fno-stack-protector", "-O0", "-w"],
+         want_level=3, want_cwe=("CWE-121", "CWE-787", "CWE-119"), budget=1200.0,
+         mechanism="stack-overflow", strict_level=True,
+         note="TTP SROP to a live shell. The existing static_no_libc_overflow names this shape "
+              "but caps at L1 because it delivers with scanf %s, which stops at whitespace and "
+              "cannot carry a ~248-byte binary sigreturn frame (NULs, spaces); read() can. Forced "
+              "as the route: static (no system PLT, no puts leak), no /bin/sh in the image "
+              "(execve-rop needs one), NX on (no shellcode-stack) -- so the auto dispatch reaches "
+              "SROP. rop.srop_feasible finds the syscall gadget, a pop-rax gadget and a writable "
+              ".bss; with no /bin/sh present the plant path forges a frame that read()s /bin/sh "
+              "into .bss, then a second frame execve()s it. Confirmed by a shell. SROP bypasses "
+              "ASLR with no leak (the frame sets every register at once) and needs only the one "
+              "syscall gadget."),
+
     Case("nowin_dynamic_overflow",
          r"""#include <stdio.h>
 #include <unistd.h>
