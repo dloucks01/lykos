@@ -141,6 +141,8 @@
   .plan-dot.dot-done { background: var(--ok); }
   .plan-dot.dot-running { background: var(--run); transform: scale(1.35); box-shadow: 0 0 0 3px color-mix(in srgb, var(--run) 25%, transparent); }
   .plan-dot.dot-error { background: var(--bad); }
+  .plan-dot.dot-timeout { background: var(--warn); outline: 1px dashed color-mix(in srgb, var(--warn) 60%, transparent); }
+  .plan-nowtimeout { color: var(--warn); }
   .plan-dot.dot-skipped { background: color-mix(in srgb, var(--faint) 40%, transparent); }
   .plan-dot.dot-cancelled { background: var(--warn); }
   .plan-dot.dot-pending { background: var(--line); }

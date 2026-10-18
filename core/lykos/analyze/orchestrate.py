@@ -204,8 +204,8 @@ _PLAN_LABEL = dict(_PLAN_STAGES)
 # `declined` ranks with the other TERMINAL states: a stage that ran and refused is finished, and
 # a later `running` must not regress it (the repeats -- directed_fuzz, build_poc per crash -- are
 # what that guard is for).
-_PLAN_RANK = {"pending": 0, "running": 1, "skipped": 2, "cancelled": 3, "error": 4,
-              "declined": 5, "done": 5}
+_PLAN_RANK = {"pending": 0, "running": 1, "skipped": 2, "cancelled": 3, "timeout": 4,
+              "error": 4, "declined": 5, "done": 5}
 
 
 def _init_plan(status, target, idx, total) -> None:
@@ -219,6 +219,7 @@ def _init_plan(status, target, idx, total) -> None:
 
 
 def _plan_set(status, stage, state, detail=None) -> None:
+    now = time.time()
     for p in status.get("plan", []):
         if p["stage"] != stage:
             continue
@@ -228,10 +229,21 @@ def _plan_set(status, stage, state, detail=None) -> None:
             if detail is not None:
                 p["detail"] = detail
             return
+        # Timestamps so the UI can show elapsed time per stage -- the single signal that tells a
+        # slow-but-working stage apart from a hang. `started` is stamped when the step first goes
+        # running; `ended` + `elapsed` when it reaches a terminal state. The user asked never to
+        # have to question where something hung: a running stage with a growing elapsed is alive,
+        # a terminal stage shows how long it took, and nothing is left to inference.
+        if state == "running" and p["state"] != "running":
+            p["started"] = now
+        elif state in ("done", "skipped", "cancelled", "error", "timeout", "declined"):
+            p["ended"] = now
+            if p.get("started"):
+                p["elapsed"] = round(now - p["started"], 1)
         p["state"] = state
         if detail is not None:
             p["detail"] = detail
-        status["updated"] = time.time()
+        status["updated"] = now
         return
 
 
@@ -635,7 +647,7 @@ def _run_target_stage(store, target, stage, status, stop, params=None, *,
     outcome = _wait(store, run.id, stop, **({"timeout": wait_for} if wait_for else {}))
     if budget is not None:
         budget.record(stage, time.time() - t_begin)
-    pstate = ({"done": "done", "cancelled": "cancelled", "timeout": "error",
+    pstate = ({"done": "done", "cancelled": "cancelled", "timeout": "timeout",
                "error": "error"}).get(outcome, outcome or "error")
     _why = _stage_decline(store, target, stage) if pstate == "done" else None
     if _why:
@@ -745,7 +757,7 @@ def _run_target_stages(store, target, specs, status, stop, *, budget=None, want=
             r = store.runs.get(rid)
             if r and r.status in _TERMINAL:
                 stage = pending.pop(rid)
-                pstate = ({"done": "done", "cancelled": "cancelled", "timeout": "error",
+                pstate = ({"done": "done", "cancelled": "cancelled", "timeout": "timeout",
                            "error": "error"}).get(r.status, r.status or "error")
                 d = _stage_detail(store, target, stage) if pstate == "done" else None
                 _plan_set(status, stage, pstate, d)
@@ -761,8 +773,10 @@ def _run_target_stages(store, target, specs, status, stop, *, budget=None, want=
         except Exception:
             observe.absorbed(_log, "continuing")
         timed_out = not stop.is_set()
-        _plan_set(status, stage, "error" if timed_out else "cancelled")
-        _emit_stage(store, target.case_id, stage, "error" if timed_out else "cancelled",
+        # Cut by the batch's own deadline, not a crash: report it as a timeout so the UI shows a
+        # bounded stop ("ran out of its budget"), never a red error the user has to investigate.
+        _plan_set(status, stage, "timeout" if timed_out else "cancelled")
+        _emit_stage(store, target.case_id, stage, "timeout" if timed_out else "cancelled",
                     target_id=target.id)
         outcomes[stage] = "timeout" if timed_out else "cancelled"
     return outcomes

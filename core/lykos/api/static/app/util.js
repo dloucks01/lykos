@@ -14,6 +14,19 @@ export const STATE_LABEL = {
   candidate: "Candidate",
 };
 
+// A short elapsed string ("3s", "2m14s", "1h03m") for a pipeline stage's duration. Used so the
+// plan panel can show how long each stage has run -- a running stage with a growing elapsed is
+// visibly alive, and a finished stage shows what it cost, so a hang is never mistaken for work.
+export function fmtElapsed(sec) {
+  if (sec == null || !isFinite(sec) || sec < 0) return "";
+  const s = Math.round(sec);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60), r = s % 60;
+  if (m < 60) return `${m}m${String(r).padStart(2, "0")}s`;
+  const h = Math.floor(m / 60);
+  return `${h}h${String(m % 60).padStart(2, "0")}m`;
+}
+
 // Plain-language gloss shown under the badge so a reader who is not steeped in the pipeline
 // knows what the state actually claims.
 export const STATE_GLOSS = {

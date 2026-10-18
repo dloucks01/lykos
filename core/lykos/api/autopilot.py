@@ -11,6 +11,7 @@ should follow to finish decomposing the God-object.
 from __future__ import annotations
 
 import threading
+import time
 
 
 class AutopilotMixin:
@@ -65,6 +66,10 @@ class AutopilotMixin:
                 return self._json({"state": "none"})
             st = dict(rec["status"])
             st["running"] = rec["thread"].is_alive()
+        # Server clock, so the UI can show each stage's elapsed time (now - plan[i].started) in the
+        # server's own time base -- no client/server clock skew. The elapsed on a running stage is
+        # the signal that tells slow-but-working apart from a hang.
+        st["now"] = time.time()
         return self._json(st)
 
     def _cancel_autopilot(self, cid):

@@ -908,7 +908,7 @@ function App() {
               <div class="wb-panel"><${DiffPanel} targets=${targets} findings=${ranked} onVerify=${runPocDiff} verify=${diffVerify} /></div>
             ` : tab === "console" ? html`
               <div class="wb-panel">
-                ${bg && bg.plan ? html`<${PipelinePlan} plan=${bg.plan} targetName=${bg.target_name} target=${bg.target} targets=${bg.targets} />` : null}
+                ${bg && bg.plan ? html`<${PipelinePlan} plan=${bg.plan} targetName=${bg.target_name} target=${bg.target} targets=${bg.targets} now=${bg.now} />` : null}
                 <${ProgressLog} entries=${log} running=${running} />
                 <${ConsolePanel} lines=${consoleLines} />
                 <${CoveragePanel} coverage=${coverage} targets=${targets} onDrill=${browseFunctions} />

@@ -6,7 +6,7 @@ import { h } from "preact";
 import { useState, useRef, useEffect } from "preact/hooks";
 import htm from "htm";
 import {
-  STATE_LABEL, STATE_GLOSS, isDemonstrated, fmtBytes, shortHash, runTone, stageLabel,
+  STATE_LABEL, STATE_GLOSS, isDemonstrated, fmtBytes, shortHash, runTone, stageLabel, fmtElapsed,
   SEV_ORDER, maxPocLevel, histogram,
 } from "./util.js";
 
@@ -42,14 +42,28 @@ const _PLAN_ICON = { done: "✓", error: "✕", skipped: "–", cancelled: "■"
 // A COMPACT progress summary -- deliberately not a stage list (the Run log already is one). It
 // gives what the log does not: overall progress at a glance, the step running right now, and the
 // shape of what is still ahead (the dot strip, each dot a stage; hover for its name + detail).
-export function PipelinePlan({ plan, targetName, target, targets }) {
+export function PipelinePlan({ plan, targetName, target, targets, now }) {
   if (!plan || !plan.length) return null;
   const active = plan.filter((p) => p.state !== "skipped");
   const done = active.filter((p) => p.state === "done").length;
   const total = active.length || plan.length;
   const running = plan.find((p) => p.state === "running");
   const errored = plan.find((p) => p.state === "error");
+  const timedout = plan.find((p) => p.state === "timeout");
   const pct = Math.round((100 * done) / Math.max(1, total));
+  // Elapsed for a stage: a finished stage carries its own `elapsed`; a RUNNING one is timed live
+  // against the server clock (`now`) so a growing number proves it is alive, not hung.
+  const elapsedOf = (p) => (p.state === "running" && now && p.started) ? (now - p.started)
+    : (typeof p.elapsed === "number" ? p.elapsed : null);
+  const runElapsed = running ? elapsedOf(running) : null;
+  const dotTitle = (p) => {
+    const e = elapsedOf(p);
+    const et = e != null ? ` · ${fmtElapsed(e)}` : "";
+    const st = p.state === "timeout" ? " (cut short — out of budget)"
+      : p.state === "skipped" ? " (skipped)" : p.state === "cancelled" ? " (stopped)"
+      : p.state === "error" ? " (error)" : "";
+    return `${p.label}${st}${p.detail ? ` — ${p.detail}` : ""}${et}`;
+  };
   return html`
     <div class="plan card compact">
       <div class="plan-head">
@@ -59,13 +73,16 @@ export function PipelinePlan({ plan, targetName, target, targets }) {
       </div>
       <div class="plan-bar"><div class=${`plan-fill${errored ? " err" : ""}`} style=${`width:${Math.max(3, pct)}%`}></div></div>
       <div class="plan-now">
-        ${running ? html`<${Spinner} label=${running.label + (running.detail ? ` — ${running.detail}` : "")} />`
+        ${running ? html`<${Spinner} label=${running.label
+              + (runElapsed != null ? ` · ${fmtElapsed(runElapsed)}` : "")
+              + (running.detail ? ` — ${running.detail}` : "")} />`
           : errored ? html`<span class="plan-nowerr">✕ ${errored.label}${errored.detail ? ` — ${errored.detail}` : " failed"}</span>`
+          : timedout ? html`<span class="plan-nowtimeout">⧖ ${timedout.label} cut short — out of budget (raise it to let it finish)</span>`
           : html`<span class="plan-nowok">✓ all ${total} steps complete</span>`}
       </div>
       <div class="plan-dots">
         ${plan.map((p) => html`<span class=${`plan-dot dot-${p.state}`} key=${p.stage}
-          title=${p.label + (p.detail ? ` — ${p.detail}` : "")}></span>`)}
+          title=${dotTitle(p)}></span>`)}
       </div>
     </div>`;
 }
