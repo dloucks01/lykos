@@ -6,6 +6,7 @@ stores the full analysis JSON as an artifact. Fails clearly if Ghidra is not ava
 from __future__ import annotations
 
 import os
+import subprocess
 
 from ..db.dao import CallEdgeDAO, FunctionDAO, StringDAO, TargetDAO
 from ..hashing import canonical_json
@@ -111,7 +112,42 @@ def disassemble_stage(ctx) -> dict:
                 "No native RE backend (rizin/radare2) found. Install rizin+rz-ghidra, or set "
                 "LYKOS_DECOMPILER=ghidra to use Ghidra headless.")
         ctx.progress(msg="running native RE backend (%s + pypcode P-Code, no JVM)" % cli.name)
-        result = native_re.analyze(blob, ctx=ctx, timeout=_TIMEOUT)
+        # Recover strings + imports CHEAPLY and persist them FIRST. The full `analyze()` runs these
+        # behind the expensive `aaa`, so on a large binary where the structural analysis cannot
+        # finish within the budget they were lost with it and the target reported zero findings
+        # (measured: a 24MB server timed `aaa` out -> 0 strings, 0 findings, read as "clean"). With
+        # the strings persisted up front, the string-keyed detectors still have input and a big
+        # binary never silently reads as clean.
+        _qf_strings = 0
+        try:
+            _qf = native_re.quick_facts(blob, ctx=ctx, timeout=min(90, _TIMEOUT))
+            if _qf.get("strings"):
+                StringDAO(ctx.conn).replace_for_target(target.id, _qf["strings"])
+                _qf_strings = len(_qf["strings"])
+        except Exception:
+            _qf_strings = 0
+        try:
+            result = native_re.analyze(blob, ctx=ctx, timeout=_TIMEOUT)
+        except Exception as e:
+            # A user cancel must still abort; a BUDGET deadline (or a rizin call that overran its
+            # own cap) on a large binary is "cut short", not a failure -- keep the strings/imports
+            # already persisted, report the truncation plainly, and let detection run on them.
+            if type(e).__name__ == "StageCancelled" or (ctx._db_cancel()
+                                                        if hasattr(ctx, "_db_cancel") else False):
+                raise
+            if type(e).__name__ != "StageTimeout" and not isinstance(e, subprocess.TimeoutExpired):
+                raise
+            _mb = round(blob.stat().st_size / 1048576, 1)
+            ctx.emit("re.done", payload={
+                "functions": 0, "call_edges": 0, "strings": _qf_strings,
+                "partial": True, "truncated": True,
+                "note": (f"the structural analysis of this {_mb} MB binary did not finish within "
+                         f"the budget; {_qf_strings} strings (and imports) were recovered and the "
+                         f"string-keyed detectors ran on them, but function and call-graph recovery "
+                         f"is incomplete -- raise --budget to analyse more of it")})
+            ctx.progress(pct=100, msg=f"analysis truncated on a {_mb} MB binary: "
+                                      f"strings/imports recovered, functions incomplete")
+            return {"output_shas": [], "output_kind": "ghidra-analysis", "truncated": True}
     else:
         headless = ghidra.locate_ghidra()
         if headless is None:

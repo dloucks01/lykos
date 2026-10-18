@@ -389,6 +389,50 @@ def _faddr(f: dict):
     return a if a is not None else f.get("addr")
 
 
+def quick_facts(binary: Path, *, ctx=None, timeout: int = 60) -> dict:
+    """Strings + imports + program metadata with NO auto-analysis -- fast and size-independent.
+
+    `analyze()` runs these behind the expensive `aaa` in one invocation, so on a large binary where
+    `aaa` cannot finish within the budget the strings and imports are lost too and the target
+    reports zero findings (a 24MB server timed out `aaa` -> 0 strings, 0 findings). This extracts
+    just the cheap facts (`izj`/`iij`/`ij` -- none need `aaa`) so the disassemble stage can persist
+    them FIRST; the detectors that key on strings and imports then still have input even when the
+    full structural analysis is cut short. Returns {"program", "strings", "imports"}; best-effort
+    (an empty result on any failure, never raising)."""
+    try:
+        from .. import vendorenv
+        vendorenv.activate()
+    except Exception:
+        observe.absorbed(_log, "continuing")
+    cli = locate_native()
+    if cli is None:
+        return {"program": {}, "strings": [], "imports": []}
+    binary = Path(binary)
+    import tempfile
+    scratch = ctx.scratch() if ctx is not None else Path(tempfile.mkdtemp(prefix="lykos-qf-"))
+    T = Path(scratch) / "qf"
+    T.mkdir(parents=True, exist_ok=True)
+    try:
+        _run(cli, binary, ";".join([
+            _redir("ij", T / "ij"), _redir("izj", T / "strings"), _redir("iij", T / "imports")]),
+            ctx=ctx, timeout=timeout, scratch=T)
+    except Exception:
+        observe.absorbed(_log, "quick_facts extraction cut short")
+    ij = _readj(T / "ij", {})
+    binf = ij.get("bin", {}) if isinstance(ij, dict) else {}
+    core = ij.get("core", {}) if isinstance(ij, dict) else {}
+    izj = _readj(T / "strings", [])
+    iij = _readj(T / "imports", [])
+    strings = [{"addr": hex(s["vaddr"]) if isinstance(s.get("vaddr"), int) else "",
+                "value": s.get("string") or "", "xrefs": []}
+               for s in (izj if isinstance(izj, list) else []) if isinstance(s, dict)]
+    imports = [i.get("name") for i in (iij if isinstance(iij, list) else [])
+               if isinstance(i, dict) and i.get("name")]
+    prog = {"format": core.get("format") or binf.get("class") or "",
+            "arch": binf.get("arch") or "", "bits": binf.get("bits") or 0}
+    return {"program": prog, "strings": strings, "imports": imports}
+
+
 def analyze(binary: Path, *, ctx=None, timeout: int = 900) -> dict:
     """Full native analysis producing the ghidra.parse_result schema, via file redirection
     (portable across rizin and radare2)."""
