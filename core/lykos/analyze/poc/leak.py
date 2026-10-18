@@ -2837,3 +2837,61 @@ def indexed_write_fsop(exe, workdir, *, write_cell, read_cell, libc_data, leak_s
             break
     last["plans_tried"] = tried
     return last
+
+
+# --- disclosed code pointers ---------------------------------------------------------------------
+# A memory disclosure often leaks CODE pointers: a saved return address, a stored callback, a
+# vtable entry. On a STRIPPED binary whose win()-like function is reached only through such a
+# stored pointer, the disassembler never analyses it (no call references it) and `find_win` cannot
+# see it -- but the leak hands its runtime address over directly. These extract those pointers so
+# the exploit stage can try each as a ret2win target, CONFIRMED by a spawned shell (so a pointer
+# that is not a shell-spawner is rejected, not faked).
+
+def executable_vaddr_ranges(data: bytes) -> list:
+    """[(lo, hi)] virtual-address ranges of the PF_X PT_LOAD segments, from the program headers.
+    Needs no symbols, so it works on a stripped binary."""
+    if len(data) < 64 or data[:4] != b"\x7fELF":
+        return []
+    is64 = data[4] == 2
+    endc = "<" if data[5] == 1 else ">"
+    try:
+        if is64:
+            e_phoff = struct.unpack_from(endc + "Q", data, 0x20)[0]
+            e_phentsize, e_phnum = struct.unpack_from(endc + "HH", data, 0x36)
+        else:
+            e_phoff = struct.unpack_from(endc + "I", data, 0x1c)[0]
+            e_phentsize, e_phnum = struct.unpack_from(endc + "HH", data, 0x2a)
+        out = []
+        for i in range(e_phnum):
+            off = e_phoff + i * e_phentsize
+            if is64:
+                p_type, p_flags = struct.unpack_from(endc + "II", data, off)
+                p_vaddr = struct.unpack_from(endc + "Q", data, off + 0x10)[0]
+                p_memsz = struct.unpack_from(endc + "Q", data, off + 0x28)[0]
+            else:
+                p_type = struct.unpack_from(endc + "I", data, off)[0]
+                p_vaddr = struct.unpack_from(endc + "I", data, off + 0x8)[0]
+                p_memsz = struct.unpack_from(endc + "I", data, off + 0x14)[0]
+                p_flags = struct.unpack_from(endc + "I", data, off + 0x18)[0]
+            if p_type == 1 and (p_flags & 0x1) and p_memsz:      # PT_LOAD && PF_X
+                out.append((p_vaddr, p_vaddr + p_memsz))
+        return out
+    except Exception:
+        observe.absorbed(_log, "no program headers")
+        return []
+
+
+def disclosed_code_pointers(blob: bytes, ranges, *, word: int = 8, limit: int = 8) -> list:
+    """Values in `blob` (scanned at every byte offset, little-endian) that fall inside one of the
+    executable `ranges` -- i.e. leaked code pointers -- ordered by how often each appears (a
+    deliberately-stored callback is leaked more than once, so the most-repeated pointer is the
+    best win candidate), then by address. At most `limit`."""
+    if not ranges or len(blob) < word:
+        return []
+    from collections import Counter
+    counts: Counter = Counter()
+    for i in range(0, len(blob) - word + 1):
+        v = int.from_bytes(blob[i:i + word], "little")
+        if any(lo <= v < hi for lo, hi in ranges):
+            counts[v] += 1
+    return [v for v, _ in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))][:limit]
