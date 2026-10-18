@@ -111,14 +111,15 @@ def locate_native(config: Optional[str] = None) -> Optional[Path]:
 #: fraction, not a fixed number, precisely because another system has different memory than this
 #: one: 60% leaves ~40% of whatever is free for the OS and other apps, on a 4GB laptop or a 256GB
 #: server alike, computed fresh at the moment the child starts.
-_MEM_CAP_FRACTION = 0.6
+_MEM_CAP_FRACTION = 0.7
 #: A floor so a normal binary's analysis is never starved on a modest host; and a lower bound below
 #: which we do not bother capping (the host is already too small to protect this way).
 _MEM_FLOOR_MB = 1024
 #: An absolute ceiling: past this, rizin is not memory-starved, and a bigger cap just lets a
 #: pathological binary map more before it is stopped. Keeps a 256GB server from handing one
-#: analysis 150GB.
-_MEM_CEILING_MB = 16384
+#: analysis an absurd cap. Raised to 24GB so a large stripped binary gets room to analyse while
+#: 70% of free RAM still leaves ~30% headroom for the host.
+_MEM_CEILING_MB = 24576
 
 
 def _mem_available_mb() -> Optional[int]:
