@@ -76,15 +76,15 @@ gen_wrappers() {
   tc="$1"; wdir="$tc/.wrappers"
   rm -rf "$wdir"; mkdir -p "$wdir"
   # RELOCATABLE: each wrapper resolves the toolchain root from its OWN location at run time, so
-  # the whole tree can be unzipped anywhere and just run -- no absolute paths baked in. Library
-  # dirs are stored as subpaths and prefixed with $r (the resolved root) inside the wrapper.
-  rellibs=""
-  for d in "$tc"/usr/local/lib "$tc"/usr/lib "$tc"/usr/lib/*-linux-gnu "$tc"/lib \
-           "$tc"/lib/*-linux-gnu "$tc"/usr/lib64 "$tc"/lib64; do
-    [ -d "$d" ] || continue
-    sub=${d#"$tc"/}
-    rellibs="${rellibs:+$rellibs:}\$r/$sub"
-  done
+  # the whole tree can be unzipped anywhere and just run -- no absolute paths baked in.
+  #
+  # The wrapper does NOT set LD_LIBRARY_PATH. Glibc-independence comes from relink-bundle.sh, which
+  # gives every bundled ELF its own loader + rpath into the bundle libs. A process-wide
+  # LD_LIBRARY_PATH here would be not just redundant but HARMFUL: a tool fronted by a #!/bin/sh
+  # script (valgrind, wine-stable, ...) runs that script under the HOST /bin/sh, and an exported
+  # LD_LIBRARY_PATH pointing at the bundle's newer libc would make the host loader try to load it
+  # for /bin/sh -- the exact old-loader-vs-new-libc crash. So the wrapper is a pure, relocatable
+  # exec; the bundle's libraries stay private to the bundle's own (relinked) ELFs.
   n=0
   for bindir in "$tc"/usr/local/bin "$tc"/usr/bin "$tc"/usr/sbin "$tc"/bin "$tc"/sbin; do
     [ -d "$bindir" ] || continue
@@ -94,19 +94,17 @@ gen_wrappers() {
       [ -e "$wdir/$name" ] && continue                # first bin dir wins on a name clash
       relreal=${real#"$tc"/}
       { printf '#!/bin/sh\n'
-        printf '# lykos scoped wrapper (relocatable): the bundle library path applies to THIS\n'
-        printf '# process only and is resolved from the wrapper location -- unzip anywhere and\n'
-        printf '# run. The laptop'\''s own binaries are never relinked. Regenerate with setup.sh.\n'
+        printf '# lykos relocatable wrapper: resolves the bundle root from its own location and\n'
+        printf '# execs the real tool, which relink-bundle.sh already made glibc-self-contained.\n'
+        printf '# No LD_LIBRARY_PATH -- see gen_wrappers in setup-toolchain.sh for why.\n'
         printf 'r=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)\n'
-        printf 'export LD_LIBRARY_PATH="%s${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"\n' "$rellibs"
         printf 'exec "$r/%s" "$@"\n' "$relreal"
       } > "$wdir/$name"
       chmod +x "$wdir/$name"
       n=$((n+1))
     done
   done
-  echo "  generated $n relocatable tool wrappers in $wdir"
-  echo "  (bundle libraries stay private to bundle tools -- nothing on the system is relinked)"
+  echo "  generated $n relocatable tool wrappers in $wdir (glibc-independence via relink, not LD_LIBRARY_PATH)"
 }
 
 # 1. The extracted, relocatable prefix the apt-sourced engines run from (bwrap, gdb, qemu-*,

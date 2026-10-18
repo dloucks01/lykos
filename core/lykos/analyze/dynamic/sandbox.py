@@ -1922,11 +1922,22 @@ def did_not_run(isolation: Optional[str]) -> bool:
 
 
 def _wine() -> Optional[str]:
-    # Debian ships the binary as `wine-stable` (or `wine-development`) and exposes `wine` only as
-    # an update-alternatives symlink -- which does NOT travel in the relocatable offline bundle,
-    # so on the laptop only `wine-stable` exists. Try the versioned names too or PE execution is
-    # silently unavailable there despite Wine being bundled. Running the binary under its own
-    # name is equivalent to `wine`.
+    # Prefer the bundle's OWN wine loader when running from a vendored toolchain. Debian's
+    # `wine-stable` wrapper is a shell script that hardcodes /usr/lib/wine (absolute) and aborts
+    # with "unable to find wine executable" in a relocated bundle -- but the real loader at
+    # <toolchain>/usr/lib/wine/wine64 (or /wine) runs directly once relink made it self-contained.
+    try:
+        from ...vendorenv import toolchain_prefix
+        pfx = toolchain_prefix()
+        if pfx:
+            for cand in ("usr/lib/wine/wine64", "usr/lib/wine/wine", "usr/lib/wine/wine32"):
+                p = pfx / cand
+                if p.is_file() and os.access(p, os.X_OK):
+                    return str(p)
+    except Exception:
+        observe.absorbed(_log, "no vendored wine loader; falling back to PATH")
+    # Ordinary host: Debian ships the binary as `wine-stable`/`wine-development` and exposes `wine`
+    # only as an update-alternatives symlink. Running the binary under its own name equals `wine`.
     return (shutil.which("wine") or shutil.which("wine64")
             or shutil.which("wine-stable") or shutil.which("wine-development"))
 

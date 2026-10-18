@@ -16,7 +16,7 @@ DIST="$ROOT/dist"
 say(){ printf '\n== %s\n' "$*"; }
 die(){ echo "ERROR: $*" >&2; exit 1; }
 
-command -v zip >/dev/null 2>&1 || die "need zip (apt-get install zip)"
+command -v xz >/dev/null 2>&1 || die "need xz (apt-get install xz-utils)"
 
 # This script needs patchelf to make the vendored Python (and, at run time via relink-bundle.sh,
 # the tools) self-contained. If the build host has none, use the STATIC patchelf we ship -- the
@@ -70,6 +70,14 @@ cp -a "$BUN/toolchain" "$V/toolchain"
 if [ -n "$(ls -A "$BUN/afl-qemu" 2>/dev/null)" ]; then
   mkdir -p "$V/toolchain/usr/local/bin"
   for f in "$BUN"/afl-qemu/*; do install -m 0755 "$f" "$V/toolchain/usr/local/bin/"; done
+fi
+# weggli (source variant analysis) is a cargo/release binary, not an apt package, so the container
+# collect never carries it. Inject one via LYKOS_WEGGLI_BIN; it lands in usr/local/bin where it is
+# wrapped (so `which weggli` finds it) and relinked (so it runs on an older target's glibc).
+if [ -n "${LYKOS_WEGGLI_BIN:-}" ] && [ -x "$LYKOS_WEGGLI_BIN" ]; then
+  mkdir -p "$V/toolchain/usr/local/bin"
+  install -m0755 "$LYKOS_WEGGLI_BIN" "$V/toolchain/usr/local/bin/weggli"
+  say "injected weggli from $LYKOS_WEGGLI_BIN"
 fi
 # engine venvs: keep their ORIGINAL pyvenv.cfg -- they were built for the TARGET distro's
 # Python (the bundle is distro-locked), not this build host's.
@@ -193,6 +201,11 @@ TCU="$V/toolchain/usr"
 # THIS build host's native GNU triple (x86_64-linux-gnu, aarch64-linux-gnu, ...). The trim keeps
 # the native compiler and mispoints nothing when the build host is not x86_64.
 NATIVE_TRIPLE="$(gcc -dumpmachine 2>/dev/null || echo x86_64-linux-gnu)"
+# These tools provide NO analysis capability (the pipeline runs foreign binaries under qemu-user,
+# which stays; it never cross-compiles, and PoCs are input bytes). They are the bulk of the size,
+# so they are trimmed by DEFAULT. Set LYKOS_FULL=1 to keep them (a complete-but-large "everything"
+# bundle) -- they are relinked like everything else and work on the target, they just cost ~6.7GB.
+if [ -z "${LYKOS_FULL:-}" ]; then
 #   (a) cross-compiler backends + their support libs (native usr/libexec/gcc/<native> stays)
 rm -rf "$TCU/libexec/gcc-cross" "$TCU/lib/gcc-cross" 2>/dev/null || true
 #   (b) per-arch cross driver + LTO binaries under bin/. x86_64-linux-gnu-* IS the native
@@ -230,6 +243,9 @@ find "$TCU/bin" -maxdepth 1 \( -name 'clang*' -o -name 'llvm*' -o -name 'llc' -o
 #       Python API from static files. Nothing in the analysis path runs node.
 find "$TCU/bin" -maxdepth 1 \( -name 'node' -o -name 'nodejs' \) -exec rm -f {} + 2>/dev/null || true
 find "$TCU/lib" -name 'libnode.so*' -exec rm -f {} + 2>/dev/null || true
+else
+  echo "  LYKOS_FULL=1: keeping cross-compilers, MinGW, LLVM/clang and Node (everything, +~6.7GB)"
+fi
 #   Guard: the native compiler and the foreign-exec substrate MUST survive the trim, or the
 #   bundle is silently broken. Fail the build loudly if any did not.
 for need in \
@@ -369,10 +385,11 @@ exec "$here/lykos" doctor "$@" < /dev/null
 EOF
 chmod +x "$APP/DOCTOR.sh"
 cat > "$APP/RUN-HERE-FIRST.txt" <<'EOF'
-lykos -- offline, unzip-and-run. No installation. Nothing is written outside this folder.
+lykos -- offline, extract-and-run. No installation. Nothing is written outside this folder.
 
-  1. You already unzipped this (use `unzip -o` if it prompts). Everything is inside ./vendor.
+  1. You extracted this with the .EXTRACT.sh script (needs only tar + xz). Everything is inside ./vendor.
   2. Check what this host can do:   ./lykos doctor       (or ./DOCTOR.sh)
+     (the FIRST run self-relinks the bundled tools to the bundle's own glibc -- a few seconds)
   3. Run it:                        ./start              (or ./RUN.sh)
      Then open http://127.0.0.1:8787 in a browser on this machine.
 
@@ -381,27 +398,51 @@ under vendor/toolchain and run through relocatable wrappers, so they use ONLY th
 libraries -- your laptop's libraries are never replaced or relinked. See docs/offline-packaging.md.
 EOF
 
-say "zipping the single runnable package"
+say "packaging the runnable tree (xz-compressed, split to fit optical media)"
 STAMP="$(date +%Y%m%d)"; ARCH="$(uname -m)"
-OUT="$DIST/lykos-offline-$STAMP-$ARCH.zip"
-rm -f "$OUT"
-( cd "$STAGE" && zip -q -r -y "$OUT" lykos )   # -y: store symlinks as symlinks (venvs, libs)
-# A DUPLICATE PATH inside the zip makes `unzip` stop and prompt "replace? [y]" -- which reads as a
-# hang on the offline laptop. Check the ARCHIVE (not the staging tree, which cannot hold a dup)
-# and fail the build so a prompting bundle never ships.
-if command -v zipinfo >/dev/null 2>&1; then
-  zdups="$(zipinfo -1 "$OUT" | sort | uniq -d | head)"
-  [ -z "$zdups" ] || { echo "duplicate paths in the archive:"; echo "$zdups"; die "the zip has duplicate paths -- unzip would prompt on the laptop; fix the sanitise step"; }
+BASE="lykos-offline-$STAMP-$ARCH"
+rm -f "$DIST/$BASE".tar.xz "$DIST/$BASE".tar.xz.part-* "$DIST/$BASE".EXTRACT.sh "$DIST/$BASE".sha256 2>/dev/null || true
+# tar the whole runnable tree and compress with THREADED xz (-T0). xz (xz-utils) has shipped in the
+# Kali/Debian base for over a decade, so the target needs nothing bundled to extract -- and xz packs
+# binaries far tighter than zip, so fewer discs. Symlinks are stored as symlinks (tar default).
+( cd "$STAGE" && tar -c lykos | xz ${LYKOS_XZ:--9} -T0 ) > "$DIST/$BASE.tar.xz"
+total=$(stat -c%s "$DIST/$BASE.tar.xz")
+# Split to the operator's optical media (default 4600 MiB/volume so a 4.7GB disc holds one; override
+# with LYKOS_SPLIT_MB). A single archive stays whole when it already fits.
+SPLIT_MB="${LYKOS_SPLIT_MB:-4600}"
+if [ "$total" -gt "$(( SPLIT_MB * 1024 * 1024 ))" ]; then
+  ( cd "$DIST" && split -b "${SPLIT_MB}m" -d -a 2 "$BASE.tar.xz" "$BASE.tar.xz.part-" && rm -f "$BASE.tar.xz" )
+  parts="$(cd "$DIST" && ls "$BASE".tar.xz.part-*)"
+  ( cd "$DIST" && sha256sum $parts > "$BASE.sha256" )
+  mode="SPLIT into $(echo "$parts" | wc -w) volume(s) of <= ${SPLIT_MB} MiB -- one per disc"
+else
+  ( cd "$DIST" && sha256sum "$BASE.tar.xz" > "$BASE.sha256" )
+  mode="single archive ($(du -h "$DIST/$BASE.tar.xz" | cut -f1)) -- fits one disc"
 fi
-( cd "$DIST" && sha256sum "$(basename "$OUT")" > "$(basename "$OUT").sha256" )
+# A self-contained reassemble+verify+extract script the operator runs on the laptop (installs nothing).
+cat > "$DIST/$BASE.EXTRACT.sh" <<'XEOF'
+#!/bin/sh
+# Reassemble (if split), verify, and extract the lykos offline package. Needs only tar + xz
+# (xz-utils) -- present on every Kali/Debian by default. Copy ALL parts, the .sha256, and this
+# script off the disc(s) into ONE empty directory, then: sh THIS-SCRIPT. Nothing is installed.
+set -eu
+cd "$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+base=$(basename "$0" .EXTRACT.sh)
+command -v xz >/dev/null 2>&1 || { echo "need xz (apt-get install xz-utils; present on Kali by default)" >&2; exit 1; }
+echo "verifying checksums..."; sha256sum -c "$base.sha256"
+echo "extracting (a few minutes)..."
+if [ -f "$base.tar.xz" ]; then xz -dc "$base.tar.xz" | tar -x
+else cat "$base".tar.xz.part-* | xz -dc | tar -x; fi
+echo "done -- now:  cd lykos && ./lykos doctor    (then ./start for the web UI)"
+XEOF
+chmod +x "$DIST/$BASE.EXTRACT.sh"
 
-say "done"
-printf '  %s (%s)\n' "$OUT" "$(du -h "$OUT" | cut -f1)"
-cat "$OUT.sha256" | sed 's/^/  /'
+say "done -- $mode"
+( cd "$DIST" && ls -lh "$BASE".* | sed 's/^/  /' )
 cat <<EOF
 
-On the offline laptop (verify, then unzip and run -- nothing is installed):
-  sha256sum -c $(basename "$OUT").sha256
-  unzip -o $(basename "$OUT")     # -o = never prompt; extracts non-interactively
-  cd lykos && ./RUN.sh
+Burn to disc(s) -- everything named $BASE.* (the volumes, the .sha256, and the .EXTRACT.sh).
+On the offline laptop, copy them ALL into one empty writable directory (NOT the read-only disc), then:
+  sh $BASE.EXTRACT.sh        # verifies, reassembles, extracts (needs only tar + xz)
+  cd lykos && ./lykos doctor # first run self-relinks the tools; then ./start
 EOF

@@ -248,6 +248,51 @@ def activate(force: bool = False) -> dict:
                 summary["bin"].append(str(jbin))
                 break
 
+    # Valgrind's launcher (valgrind.bin) finds its tool cores (memcheck-amd64-linux, ...) at a
+    # compiled-in absolute path -- /usr/libexec/valgrind -- which on the target is the host's, not
+    # the bundle's, so it reports "failed to start tool 'memcheck'". The cores honour $VALGRIND_LIB,
+    # so point it at the bundle's copy. Only when unset (an operator's choice wins).
+    if prefix and not os.environ.get("VALGRIND_LIB"):
+        for sub in ("usr/libexec/valgrind", "usr/lib/valgrind", "usr/lib64/valgrind"):
+            vl = prefix / sub
+            if vl.is_dir() and list(vl.glob("memcheck-*")):
+                os.environ["VALGRIND_LIB"] = str(vl)
+                env["VALGRIND_LIB"] = str(vl)
+                break
+
+    # Wine finds its server and builtin DLLs at compiled-in absolute paths (/usr/lib/...), which on
+    # the target are the host's, not the bundle's. Point the loader/server/DLL-path env at the
+    # bundle's copies so PE execution works offline. Only when unset. (sandbox._wine already selects
+    # the bundle's real wine64 loader over Debian's hardcoded wine-stable wrapper script.)
+    if prefix and (prefix / "usr/lib/wine/wine64").is_file():
+        if not os.environ.get("WINELOADER"):
+            os.environ["WINELOADER"] = str(prefix / "usr/lib/wine/wine64")
+            env["WINELOADER"] = os.environ["WINELOADER"]
+        for s in ("usr/lib/wine/wineserver64", "usr/lib/wine/wineserver"):
+            if (prefix / s).is_file() and not os.environ.get("WINESERVER"):
+                os.environ["WINESERVER"] = str(prefix / s)
+                env["WINESERVER"] = os.environ["WINESERVER"]
+                break
+        _wdll = [str(prefix / d) for d in (
+            "usr/lib/x86_64-linux-gnu/wine/x86_64-unix",
+            "usr/lib/x86_64-linux-gnu/wine/x86_64-windows",
+            "usr/lib/x86_64-linux-gnu/wine/i386-windows",
+            "usr/lib/wine") if (prefix / d).is_dir()]
+        if _wdll and not os.environ.get("WINEDLLPATH"):
+            os.environ["WINEDLLPATH"] = os.pathsep.join(_wdll)
+            env["WINEDLLPATH"] = os.environ["WINEDLLPATH"]
+
+    # libdislocator (AFL++ guard-page heap oracle) ships under usr/lib/afl in the bundle, which its
+    # locator (dislocator_lib) does not search -- it looks at the host's /usr/lib/afl and AFL_PATH.
+    # Point LYKOS_DISLOCATOR at the bundle's copy so the oracle is available offline. Only when unset.
+    if prefix and not os.environ.get("LYKOS_DISLOCATOR"):
+        for sub in ("usr/lib/afl/libdislocator.so", "usr/lib/afl++/libdislocator.so"):
+            dl = prefix / sub
+            if dl.is_file():
+                os.environ["LYKOS_DISLOCATOR"] = str(dl)
+                env["LYKOS_DISLOCATOR"] = str(dl)
+                break
+
     # A relocated GCC (and the cross-compilers) looks for system headers and startup files at
     # absolute /usr paths, which are empty on a minimal target -- so `#include <string.h>` and
     # linking fail even though the bundle carries them. Point the compilers at the vendored
