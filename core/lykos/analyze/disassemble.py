@@ -129,24 +129,36 @@ def disassemble_stage(ctx) -> dict:
         try:
             result = native_re.analyze(blob, ctx=ctx, timeout=_TIMEOUT)
         except Exception as e:
-            # A user cancel must still abort; a BUDGET deadline (or a rizin call that overran its
-            # own cap) on a large binary is "cut short", not a failure -- keep the strings/imports
-            # already persisted, report the truncation plainly, and let detection run on them.
-            if type(e).__name__ == "StageCancelled" or (ctx._db_cancel()
-                                                        if hasattr(ctx, "_db_cancel") else False):
+            # Only a hard engine failure (not a cut-short) should propagate as an error.
+            _cut = (type(e).__name__ in ("StageTimeout", "StageCancelled")
+                    or isinstance(e, subprocess.TimeoutExpired))
+            if not _cut:
                 raise
-            if type(e).__name__ != "StageTimeout" and not isinstance(e, subprocess.TimeoutExpired):
-                raise
+            # Cut short -- by the stage deadline, by the autopilot's budget stop (which cancels the
+            # run), or by a rizin call overrunning its own cap. Either way it is NOT a failure and
+            # must NOT read as a clean 0-findings: emit a coverage note so detect's result is always
+            # explained, keeping the strings/imports already persisted. The note fires whether the
+            # cut came as a timeout or a cancel, because on a large binary even the cheap string
+            # extraction can exceed the slice (measured: a 142MB Go binary recovered 0 strings in an
+            # 89s disassemble slice) and the operator must see WHY, not infer it from a small number.
             _mb = round(blob.stat().st_size / 1048576, 1)
+            _recovered = (f"{_qf_strings} strings (and imports) were recovered and the string-keyed "
+                          f"detectors ran on them, but function and call-graph recovery is "
+                          f"incomplete" if _qf_strings else
+                          "not even the string table was fully extracted at this size")
             ctx.emit("re.done", payload={
                 "functions": 0, "call_edges": 0, "strings": _qf_strings,
                 "partial": True, "truncated": True,
-                "note": (f"the structural analysis of this {_mb} MB binary did not finish within "
-                         f"the budget; {_qf_strings} strings (and imports) were recovered and the "
-                         f"string-keyed detectors ran on them, but function and call-graph recovery "
-                         f"is incomplete -- raise --budget to analyse more of it")})
-            ctx.progress(pct=100, msg=f"analysis truncated on a {_mb} MB binary: "
-                                      f"strings/imports recovered, functions incomplete")
+                "note": (f"the analysis of this {_mb} MB binary did not finish within the budget; "
+                         f"{_recovered} -- raise --budget (or see docs/internal/40) to analyse "
+                         f"more of it")})
+            ctx.progress(pct=100, msg=f"analysis cut short on a {_mb} MB binary "
+                                      f"({_qf_strings} strings recovered); not a clean result")
+            # A user cancel still aborts the stage (honest status); a budget/deadline cut returns
+            # the partial so the run proceeds to detection on whatever was recovered.
+            if type(e).__name__ == "StageCancelled" or (ctx._db_cancel()
+                                                        if hasattr(ctx, "_db_cancel") else False):
+                raise
             return {"output_shas": [], "output_kind": "ghidra-analysis", "truncated": True}
     else:
         headless = ghidra.locate_ghidra()
