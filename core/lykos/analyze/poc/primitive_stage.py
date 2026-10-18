@@ -473,6 +473,33 @@ def _plain_for_disclosure(ctx, target):
 #: live pointer sits -- and the smallest indices stay nearest it.
 _DISCLOSE_VALUES = (0x00, 0x01, 0x02, 0x03, 0x04, 0x08, 0x10, 0x20)
 
+#: Small DECIMAL fields to steer a numeric index/length toward. The same intent as
+#: `_DISCLOSE_VALUES`, one level up: the lever is a `dump=<N>` style decimal field, not a raw
+#: byte, so the small values are the ASCII numbers, not the small bytes.
+_DISCLOSE_DECIMALS = (b"0", b"1", b"2", b"4", b"8")
+
+
+def _digit_runs(data: bytes):
+    """Maximal runs of ASCII digits in `data`, as (start, end) half-open spans.
+
+    A decimal index/length field (`dump=<N>`) is the lever for an address-control read, but a
+    single-byte flip of one of its digits does not isolate as one: `strtoul` of a flipped digit
+    is not linear in the byte (0xff is not a digit at all, so the field re-parses to a different
+    number), so `address_primitive` legitimately reports no byte lever and `offset` is None. The
+    field is still the lever; steer it as a WHOLE, which is what this finds.
+    """
+    runs, i, n = [], 0, len(data)
+    while i < n:
+        if 0x30 <= data[i] <= 0x39:
+            j = i
+            while j < n and 0x30 <= data[j] <= 0x39:
+                j += 1
+            runs.append((i, j))
+            i = j
+        else:
+            i += 1
+    return runs
+
 
 def _address_disclosure(ctx, target, mode, base_argv, orig, prim, timeout):
     """Steer the controlled read into MAPPED memory and see whether the program hands bytes back.
@@ -521,6 +548,22 @@ def _address_disclosure(ctx, target, mode, base_argv, orig, prim, timeout):
         if off is not None:
             candidates += [(v, bytes(bytearray(orig)[:off]) + bytes([v]) + bytes(orig[off + 1:]))
                            for v in _DISCLOSE_VALUES if v != orig[off]]
+        # Steer the numeric index/length field toward zero. The crashing input the campaign
+        # found is often FAR out of bounds (`dump=99` -> +0x63000), so it faults with or without
+        # the guard page and discloses nothing when replayed -- while the SMALLEST index reads
+        # just off the end of the object into the adjacent chunk, which is where a live pointer
+        # sits. A single-byte lever covers a raw binary index; this covers the decimal field that
+        # `address_primitive` cannot isolate as one byte (so `off` is None), which is the common
+        # shape for a text protocol. Measured on the address-leak fixture: `dump=0` discloses the
+        # neighbour chunk and `leak.disclosed_bases` resolves the PIE and libc bases with ASLR on,
+        # where `dump=99` (the found crash) discloses nothing.
+        _seen_vars = {bytes(orig)} | {var for _v, var in candidates}
+        for lo, hi in _digit_runs(orig):
+            for small in _DISCLOSE_DECIMALS:
+                var = bytes(orig[:lo]) + small + bytes(orig[hi:])
+                if var not in _seen_vars:
+                    _seen_vars.add(var)
+                    candidates.append((None, var))
         best = None
         for v, var in candidates:
             _rep, out = _detonate_capturing(ctx, target, plain, mode, base_argv, bytes(var),
@@ -546,12 +589,15 @@ def _address_disclosure(ctx, target, mode, base_argv, orig, prim, timeout):
             ctx.emit("primitive.disclosure", payload={
                 "proved": False, "rule": "no-survivor",
                 "note": ("the read's address is the attacker's to choose, but no variant both "
-                         "survived and printed more than the baseline"
-                         + (f" (the crashing input and {len(candidates) - 1} values of input "
-                            f"byte {off} were tried)" if off is not None else
-                            " (only the crashing input could be tried: no single input byte was "
-                            "isolated as the lever)")
-                         + ", so the bytes it reads were not observed leaving the process")})
+                         "survived and printed more than the baseline "
+                         + (f"(the crashing input and {len(candidates) - 1} steered variants "
+                            f"were tried: {len(_DISCLOSE_VALUES)} values of input byte {off}"
+                            if off is not None else
+                            f"(the crashing input and {len(candidates) - 1} steered variants "
+                            f"were tried: no single input byte isolated as the lever")
+                         + (f", plus small decimal values of {len(_digit_runs(orig))} numeric "
+                            f"field(s)" if _digit_runs(orig) else "")
+                         + "), so the bytes it reads were not observed leaving the process")})
             return None
         d = best[2]
     except Exception:                                     # noqa: BLE001 -- best-effort experiment
@@ -566,6 +612,7 @@ def _address_disclosure(ctx, target, mode, base_argv, orig, prim, timeout):
         "pie_base": d["pie_base"], "libc_base": d["libc_base"], "canary": d["canary"],
         "disclosed_bytes": d["disclosed_bytes"], "note": d["note"],
         "steered_byte": off, "steered_to": (best[0][off] if off is not None else None),
+        "steered_input": best[0][:32].decode("latin-1"),
         "input_sha": d["input_sha"]})
     ctx.progress(msg=(("the steered read defeats ASLR: " + d["note"]) if d["proved"]
                       else "the steered read discloses data, but no base was corroborated")[:90])

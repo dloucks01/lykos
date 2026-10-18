@@ -1507,7 +1507,6 @@ def address_primitive(observations, *, disasm: str = "", is_write: bool = False)
         seen.append({"label": label, "addr": int(addr), "pc": int(pc), "off": off, "val": val})
     if len(seen) < _MIN_ADDR_OBS:
         return None
-    pcs = {s["pc"] for s in seen}
     # ONE ROUTINE, not one instruction. "Different instructions are different defects" is right
     # about two unrelated bugs and wrong about a vectorized copy: glibc's `memcpy` faults at
     # whichever instruction of its unrolled SSE/AVX loop runs off the end, so the PC moves with
@@ -1517,8 +1516,22 @@ def address_primitive(observations, *, disasm: str = "", is_write: bool = False)
     # practical unit of "the same routine": an unrolled loop lives within a few hundred bytes,
     # and two genuinely different defects in one 4 KiB page of code would be a coincidence this
     # verdict can afford, because the ADDRESS evidence is what carries the claim either way.
-    if len({pc >> 12 for pc in pcs}) != 1:
+    #
+    # The observations are NOT all one defect, though: `_address_verdict` folds in sibling
+    # crashes as free data, and a sibling can be a different defect entirely -- a stack smash
+    # that hijacks the return and faults in libc or at a garbage PC, a whole page away. Bailing
+    # when the PCs span more than one page let ONE such sibling discard a sound read verdict
+    # (measured: the `dump=` read's own 7 observations, poisoned by a `name=` overflow sibling
+    # that faulted elsewhere -> null, so no disclosure, so the case capped at L2). Keep the
+    # observations in the BASE crash's own fault page -- the routine the handed input (the first
+    # observation) hit -- and judge those; the off-page siblings were answering a different
+    # question. Anchoring to the base rather than to a majority vote means a pile of same-page
+    # siblings from a second defect cannot outvote the one defect this experiment is about.
+    base_page = seen[0]["pc"] >> 12
+    seen = [s for s in seen if (s["pc"] >> 12) == base_page]
+    if len(seen) < _MIN_ADDR_OBS:
         return None
+    pcs = {s["pc"] for s in seen}
     pc = seen[0]["pc"]
     # DETERMINISM first: the same label twice with two addresses means the address is not a
     # function of the input at all (ASLR of a heap pointer, a timestamp, a PID).

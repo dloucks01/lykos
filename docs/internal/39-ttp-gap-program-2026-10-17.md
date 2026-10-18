@@ -380,3 +380,40 @@ and `addr_leak_pie_ret2win` at L2, but both reach L3 in isolation (stack_pivot a
 under full-gate load). The drop was budget pressure under whole-run load, not broken code -- and
 `sweep_modes` was hardened (prompt capture is now a recorded-mode channel, not guessed from a 0x0a
 byte in the payload) to cut the avoidable per-detonation cost that aggravated it.
+
+## 2026-10-18 -- `addr_leak_pie_ret2win` WAS broken, not budget pressure (correction)
+
+The line above was wrong about `addr_leak_pie_ret2win`. Driven in isolation and sampled 3x (not
+once), the case was a DETERMINISTIC L2 at HEAD, not a load artefact -- and the cause was three
+independent defects on the binary out-of-bounds-READ path, each of which alone caps the case.
+Measured end to end: with all three fixed the autopilot reaches L3 unaided from the stripped PIE
+3/3 (182s/184s/183s); with any one reverted it falls back to L2.
+
+1. **`_distinct_crashes` collapsed two distinct defects.** A fuzzer's batch runner stores a crash
+   with the signal but **no fault PC**, so the `dump=<N>` over-read (which faults inside the
+   program's own `memcpy`) and the `name=` stack smash (a write) both keyed as `(SIGSEGV, None)`
+   and only ONE survived dedup -- non-deterministically, and usually the write. The read that
+   carries the ASLR defeat never reached the primitive stage. Fix: `orchestrate._recover_missing_
+   fault_pcs` re-captures an **in-image** fault PC (relativised to the load base from `maps`) for
+   the stdin crashes in a genuinely colliding bucket, so the two defects split. Hijack/libc PCs
+   are left None on purpose, so a single stack smash still collapses instead of fanning out.
+
+2. **`address_primitive` discarded the verdict on a poisoning sibling.** `_address_verdict` folds
+   sibling crashes in as free observations; a `name=` hijack sibling faults a page away, and the
+   `len({pc>>12}) != 1` guard then threw the whole read verdict away (`faulted: 8, verdict: null`).
+   Fix: anchor to the BASE crash's own fault page and judge those observations; off-page siblings
+   are a different defect answering a different question.
+
+3. **The disclosure never steered the index to zero.** The `dump=<N>` lever is a DECIMAL field,
+   which cannot isolate as a single-byte lever (a flipped digit re-parses to a different number),
+   so `offset` is None and `_address_disclosure` tried only the crashing input -- `dump=99`, far
+   out of bounds, which faults again and discloses nothing. Fix: steer each numeric field toward
+   zero (`_DISCLOSE_DECIMALS`); `dump=0` reads just off the 64-byte object into the neighbour
+   chunk, `leak.disclosed_bases` resolves the PIE and libc bases with ASLR on, and `build_exploit`
+   relocates `win` and pops the shell.
+
+Regression-checked across the dedup-sensitive cases (double_free, heap_uaf_read, argv_overflow,
+indexed_read_l2, prompt_protocol_overflow, stripped_opt_overflow, heap_fnptr_system,
+multicall_dispatch): all still pass at their levels, no hijack fan-out. The lesson for the record:
+"reaches L3 in isolation" was asserted from single runs; 3x sampling showed it was deterministic
+L2, and the budget-pressure story masked three real bugs. Gate conclusions are now 3x-sampled.

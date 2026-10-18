@@ -976,6 +976,15 @@ class DynResultDAO(BaseDAO):
             (target_id, input_sha)).fetchone()
         return int(r["fault_pc"]) if r and r["fault_pc"] is not None else None
 
+    def set_fault_pc(self, row_id: str, fault_pc: int) -> None:
+        """Record a fault PC recovered AFTER the crash was first stored. A fuzzer's batch runner
+        often stores a crash with no fault PC (it has the signal, not the faulting address), and
+        that gap collapses two genuinely distinct defects of the same signal into one dedup
+        bucket. A later ptrace re-capture can supply the PC; persisting it here makes the dedup
+        key meaningful without re-capturing on every read."""
+        self.conn.execute("UPDATE dyn_result SET fault_pc=? WHERE id=? AND fault_pc IS NULL",
+                          (int(fault_pc), row_id))
+
     def defect_key_for(self, target_id: str, input_sha: str) -> Optional[str]:
         """The sanitizer-defect discriminator for this input's crash (ASan class+source), or None.
         Read by every stage that files/looks-up a SIGABRT crash finding so they agree on the key

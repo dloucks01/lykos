@@ -1040,11 +1040,111 @@ def _record_cve_weaponized(store, target, cve: str, level: int) -> None:
         _log.debug("recording cve_chain finding failed", exc_info=True)
 
 
-def _distinct_crashes(store, target_id):
-    seen, out = set(), []
-    for d in DynResultDAO(store.conn).list_by_target(target_id):
-        if not (d.crashed and d.input_sha):
+#: Cap on how many fault-PC-less crashes `_distinct_crashes` will re-capture to split a
+#: collapsing bucket. A re-capture is one short ptrace run; the cap bounds the cost on a target
+#: with a large crash corpus while still separating the handful of genuinely distinct defects.
+_MAX_FAULT_PC_RECOVERY = 16
+
+
+def _recover_missing_fault_pcs(store, target_id, crashes):
+    """Fill in the fault PC of stdin crashes that collapse into one `(signal, None)` bucket.
+
+    A fuzzer's batch runner stores a crash with the SIGNAL but no faulting address, so two
+    genuinely distinct defects of the same signal -- an out-of-bounds READ that faults inside the
+    program's own code and a stack smash that faults at a `ret` -- land in the same `(signal,
+    None)` bucket and only ONE is ever proved. Measured on the address-leak fixture: the `dump=`
+    read (the disclosure that carries the ASLR defeat) collapsed with the `name=` write and never
+    reached the primitive stage, capping the case at L2.
+
+    The recovered PC is recorded ONLY when the fault is inside the target's OWN executable image
+    (a real in-code defect, which is a true discriminator): the `maps` from the capture say where
+    the image is loaded, so the PC is both classified and relativised from them. A fault OUTSIDE
+    the image -- a control-flow hijack into garbage, or a libc routine reached through many call
+    sites -- is left as None on purpose, so every such crash keeps collapsing into the one
+    `(signal, None)` bucket instead of fanning a single stack smash into one finding per garbage
+    PC. Deliberately narrow so it cannot perturb targets without the collision: it runs ONLY for
+    the stdin crashes inside a genuinely colliding bucket, only on a native host, and is entirely
+    best-effort -- any failure leaves the row exactly as it was.
+    """
+    from ..db.dao import TargetDAO
+    from .dynamic import sandbox
+    # Only act where a bucket actually collides: a `(signal, None)` bucket with >1 distinct input.
+    buckets: dict = {}
+    for d in crashes:
+        if d.defect_key or d.fault_pc is not None or d.input_mode not in (None, "stdin"):
             continue
+        buckets.setdefault(d.signal_name, []).append(d)
+    collide = [d for rows in buckets.values() if len({r.input_sha for r in rows}) > 1
+               for d in rows]
+    if not collide:
+        return
+    target = TargetDAO(store.conn).get(target_id)
+    if not target or (target.arch or "") != sandbox.host_arch():
+        return                                           # native only; an emulated re-capture is
+        #                                                  heavier and this is a best-effort split
+    try:
+        from .poc.capture import make_capture, materialize_helper
+        import pathlib
+        import sys as _sys
+        import tempfile
+        helper = materialize_helper()
+        workdir = pathlib.Path(tempfile.mkdtemp(prefix="faultpc-"))
+        exe = store.content.stage_target(target, workdir, name="target.bin")
+    except Exception:                                    # noqa: BLE001
+        observe.absorbed(_log, "no capture for fault-pc recovery")
+        return
+
+    class _Ctx:
+        def run_subprocess(self, argv, timeout=None):
+            import subprocess
+            return subprocess.run(argv, capture_output=True, timeout=timeout)
+
+    dao = DynResultDAO(store.conn)
+    done = 0
+    for d in collide:
+        if done >= _MAX_FAULT_PC_RECOVERY:
+            break
+        guard = sandbox.GUARD_PAGE_TAG in (d.isolation or "")
+        try:
+            data = store.content.get_bytes(d.input_sha)
+            cap = make_capture(_Ctx(), helper, exe, "stdin", [], 4, _sys.executable,
+                               guard_page=guard)(data)
+        except Exception:                                # noqa: BLE001
+            observe.absorbed(_log, "fault-pc recapture failed", input_sha=d.input_sha)
+            continue
+        done += 1
+        pc = cap.get("pc") if cap.get("ok") and cap.get("signal_name") else None
+        if pc is None:
+            continue
+        # In-image only, relativised to the IMAGE LOAD BASE -- the lowest of the target's own
+        # mappings, which is the convention the fuzzer's own fault_pc uses, so a recovered PC and
+        # a fuzzer-recorded one for the same code site agree. A PC inside the target's executable
+        # segment is an in-code defect (a true discriminator); a PC in no target mapping at all is
+        # a hijack/libc fault, left as None so it collapses rather than fans out.
+        own = [m for m in (cap.get("maps") or [])
+               if (m.get("path") or "").endswith(("/target.bin", exe.name))]
+        image_base = min((m["start"] for m in own), default=None)
+        in_code = any("x" in (m.get("perms") or "") and m["start"] <= int(pc) < m["end"]
+                      for m in own)
+        if image_base is None or not in_code:
+            continue
+        rel = int(pc) - image_base
+        d.fault_pc = rel
+        try:
+            dao.set_fault_pc(d.id, rel)
+        except Exception:                                # noqa: BLE001 -- persistence is advisory
+            observe.absorbed(_log, "fault-pc persist failed")
+
+
+def _distinct_crashes(store, target_id):
+    crashes = [d for d in DynResultDAO(store.conn).list_by_target(target_id)
+               if d.crashed and d.input_sha]
+    # Recover the fault PC of any stdin crashes that would otherwise collapse into one
+    # `(signal, None)` bucket, so two genuinely distinct in-code defects both reach the prove
+    # loop. Hijacks stay None and keep collapsing (see `_recover_missing_fault_pcs`).
+    _recover_missing_fault_pcs(store, target_id, crashes)
+    seen, out = set(), []
+    for d in crashes:
         # A SIGABRT is bucketed by signal alone (its PC is in the abort/check machinery, not the
         # defect), so one double-free is proved once, not 47 times -- EXCEPT a sanitizer abort,
         # which carries a defect_key (ASan class+source) separating two distinct defects that both
@@ -1056,6 +1156,10 @@ def _distinct_crashes(store, target_id):
         # bucketed BY CLASS ALONE: libtiff's null dereference in `TIFFFillStrip` and a second
         # null dereference elsewhere in the library were one crash, and only one of them was ever
         # proved. With several entry points into one library that is the normal case, not an edge.
+        #
+        # A recovered IN-CODE fault PC (above) separates distinct defects of one signal -- the
+        # `dump=` read vs the `name=` write -- while a hijack keeps its None PC and so stays in
+        # the one `(signal, None)` bucket, i.e. a single stack smash does not fan out.
         key = ((d.signal_name, d.defect_key) if d.defect_key
                else (d.signal_name, d.fault_pc))
         if key not in seen:

@@ -1034,7 +1034,17 @@ int main(void){ setvbuf(stdout,0,2,0); setvbuf(stdin,0,2,0);
       fwrite(tmp, 1, sizeof(tmp), stdout); fflush(stdout); continue; }
     if(!strncmp(line,"name=",5)){ greet(line+5,(size_t)n-5); continue; }
     return 0; } }''',
-         # L3, MEASURED, three consecutive runs: 132s, 171s, 169s on 2026-10-16. The autopilot
+         # L3, MEASURED, three consecutive runs: 182s, 184s, 183s on 2026-10-18 (first reached
+         # 132s/171s/169s on 2026-10-16, then REGRESSED to a deterministic L2 and was restored by
+         # a three-part fix -- see docs/internal/39). The three defects, each of which alone caps
+         # the case: (a) the fuzzer records these crashes with no fault PC, so `_distinct_crashes`
+         # collapsed the `dump=` READ and the `name=` WRITE into one `(signal, None)` bucket and
+         # the read often never reached the prove loop -- orchestrate now re-captures an in-code
+         # fault PC to split them; (b) `address_primitive` bailed when a `name=` hijack sibling
+         # faulted a page away, discarding the read verdict -- it now anchors to the base crash's
+         # own fault page; (c) the `dump=<N>` lever is a DECIMAL field that cannot isolate as a
+         # single byte, so disclosure only ever tried the far-OOB crash -- `_address_disclosure`
+         # now steers the numeric field to zero (`dump=0` reads the neighbour chunk). The autopilot
          # reaches it UNAIDED from a stripped PIE binary with no source and therefore no
          # sanitizer twin, which is the shape that had capped every real finding in this project
          # at L1. What has to happen in those ~150 seconds, in order:
