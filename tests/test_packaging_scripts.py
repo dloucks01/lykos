@@ -104,9 +104,11 @@ def test_setup_never_puts_bundle_libraries_on_a_shared_search_path():
 
 
 def test_a_generated_wrapper_scopes_the_library_path_and_execs_the_real_binary(tmp_path):
-    """Run the wrapper generator for real and inspect a wrapper: it must set LD_LIBRARY_PATH for
-    its own process only (a plain `export` in a one-shot shim, inherited by nothing the laptop
-    runs) and then exec the vendored binary."""
+    """Run the wrapper generator for real and inspect a wrapper: it is a pure, relocatable exec of
+    the vendored binary. It must NOT set LD_LIBRARY_PATH -- glibc-independence comes from
+    relink-bundle.sh (each ELF gets its own loader + rpath), and a process-wide LD_LIBRARY_PATH
+    would crash a tool fronted by a /bin/sh script (valgrind, wine-stable) by making the host shell
+    load the bundle's newer libc."""
     tc = tmp_path / "toolchain"
     (tc / "usr" / "bin").mkdir(parents=True)
     (tc / "usr" / "lib" / "x86_64-linux-gnu").mkdir(parents=True)
@@ -126,8 +128,11 @@ def test_a_generated_wrapper_scopes_the_library_path_and_execs_the_real_binary(t
     # libs/exec are prefixed with $r. So the tree can be unzipped anywhere and just run.
     assert str(tc) not in body, "wrapper baked an absolute path (not relocatable)"
     assert "cd -- " in body and 'dirname -- "$0"' in body, "wrapper does not resolve its own root"
-    assert 'export LD_LIBRARY_PATH="' in body
-    assert "$r/usr/lib/x86_64-linux-gnu" in body, "wrapper omits the (relative) bundle libs"
+    # The wrapper must NOT pollute the process-wide library path (it would break script-fronted
+    # tools -- see the docstring); glibc-independence is relink's job, not the wrapper's. Check for
+    # an actual assignment/export, not the word (the wrapper's comment explains its absence).
+    assert "export LD_LIBRARY_PATH" not in body and "LD_LIBRARY_PATH=" not in body, \
+        "wrapper sets LD_LIBRARY_PATH -- breaks valgrind/wine on an older target"
     assert 'exec "$r/usr/bin/gdb" "$@"' in body, "wrapper does not exec the real binary via $r"
     # and it actually runs, resolving $r from its own location
     run = subprocess.run(["sh", str(wrapper)], capture_output=True, text=True, timeout=10)
