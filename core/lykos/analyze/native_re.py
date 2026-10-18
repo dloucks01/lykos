@@ -128,6 +128,8 @@ def _mem_available_mb() -> Optional[int]:
             if line.startswith("MemAvailable:"):
                 return int(line.split()[1]) // 1024
     except Exception:
+        # No readable /proc/meminfo (non-Linux, restricted container): return None so the caller
+        # leaves the analysis child uncapped -- the prior behaviour -- rather than guessing a cap.
         return None
     return None
 
@@ -166,6 +168,9 @@ def _mem_cap_preexec():
             lim = cap_mb << 20
             resource.setrlimit(resource.RLIMIT_AS, (lim, lim))
         except Exception:
+            # Runs post-fork, pre-exec in the child: no logging is possible here. If the limit
+            # cannot be set (no resource module, hardened sandbox), proceed uncapped rather than
+            # abort the analysis -- the cap is a safety margin, not a correctness requirement.
             pass
     return _apply
 

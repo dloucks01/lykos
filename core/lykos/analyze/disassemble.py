@@ -125,6 +125,9 @@ def disassemble_stage(ctx) -> dict:
                 StringDAO(ctx.conn).replace_for_target(target.id, _qf["strings"])
                 _qf_strings = len(_qf["strings"])
         except Exception:
+            # Best-effort pre-pass: if the cheap strings/imports recovery fails for any reason,
+            # the full analyze() below runs next and surfaces the real error (or its coverage
+            # note), so swallowing here silently and falling back to 0 persisted strings is right.
             _qf_strings = 0
         try:
             result = native_re.analyze(blob, ctx=ctx, timeout=_TIMEOUT)
