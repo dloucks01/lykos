@@ -91,15 +91,18 @@ def test_prompt_is_not_one_of_the_blanket_sweep_modes():
     assert cap.MODES == ("stdin", "file", "arg")
 
 
-def test_sweep_modes_adds_prompt_only_when_there_is_more_than_one_field():
+def test_sweep_modes_tries_prompt_only_when_it_is_the_recorded_mode():
+    """Prompt is a RECORDED-mode channel, not a guess from the payload's bytes. A binary overflow
+    payload routinely contains 0x0a, and a speculative paced capture on every such input is pure
+    budget cost -- under full-gate load it is what tips a budget-tight L3 case down to L2. So an
+    input with newlines does NOT pull in a prompt attempt unless the run recorded it as prompted."""
     assert cap.sweep_modes("stdin", b"AAAA") == ["stdin", "file", "arg"]
-    assert cap.sweep_modes("stdin", b"go\nAAAA\n")[-1] == cap.PROMPT
-    # recorded as prompted -> it LEADS, because then it is not a guess
+    # a newline-bearing payload under a non-prompt mode gets NO speculative prompt attempt
+    assert cap.PROMPT not in cap.sweep_modes("stdin", b"go\nAAAA\n")
+    assert cap.PROMPT not in cap.sweep_modes("file", b"go\n" + b"\x90" * 300)
+    # recorded as prompted (how_to_feed returns PROMPT from the isolation tag) -> it LEADS
     assert cap.sweep_modes(cap.PROMPT, b"go\nAAAA\n")[0] == cap.PROMPT
-    # and it is not added twice
     assert cap.sweep_modes(cap.PROMPT, b"go\nAAAA\n").count(cap.PROMPT) == 1
-    # a substrate that cannot carry stdin cannot carry a prompt protocol either
-    assert cap.PROMPT not in cap.sweep_modes("file", b"go\nAAAA\n", deliverable=["file", "arg"])
 
 
 # ---------------------------------------------------------------------------- the capability, live
@@ -132,12 +135,13 @@ def test_the_campaign_reproduces_the_same_signal_as_the_capture(prompt_exe):
 
 
 def test_a_cyclic_pattern_faults_when_framed_and_paced(prompt_exe):
-    """What makes L2 reachable: the bare cyclic has no field boundaries, but framed as the crash
-    was framed (`b"go\\n" + cyclic + b"\\n"`) it has three, and the pc comes back."""
+    """What makes L2 reachable once the run is on the PROMPT mode: the bare cyclic has no field
+    boundaries, but framed as the crash was framed (`b"go\\n" + cyclic + b"\\n"`) it has three, and
+    the pc comes back. The capture is driven on the recorded PROMPT mode explicitly -- the sweep
+    does NOT reach prompt speculatively from the newline (see the sweep-modes test above)."""
     from lykos.analyze.poc import primitive
     framed = b"go\n" + primitive.cyclic(300) + b"\n"
     assert len(cap.paced_chunks(framed)) == 3
-    assert cap.sweep_modes("stdin", framed)[-1] == cap.PROMPT
     r = cap.make_capture(_Ctx(), cap.materialize_helper(), prompt_exe, cap.PROMPT, [], 10,
                          sys.executable)(framed)
     assert r.get("ok") and r.get("signal_name") == "SIGSEGV", r

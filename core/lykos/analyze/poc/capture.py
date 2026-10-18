@@ -198,17 +198,21 @@ def paced_chunks(data: bytes) -> list:
     return [ln + b"\n" for ln in bytes(data).split(b"\n")]
 
 
-def sweep_modes(mode, data: bytes, *, deliverable=None) -> list:
+def sweep_modes(mode, data: bytes = b"", *, deliverable=None) -> list:
     """The delivery modes to try for `data`, in order, starting with the one we believe in.
 
-    `prompt` is appended only when it could MATTER -- the input has at least two fields -- so a
-    single-line input does not pay for a redundant paced execution that is byte-for-byte the same
-    as the bulk one. It leads when it is the recorded mode, because then it is not a guess."""
-    order = [mode] + [m for m in MODES if m != mode]
-    if mode != PROMPT and len(paced_chunks(data or b"")) > 1 \
-            and (deliverable is None or "stdin" in deliverable):
-        order.append(PROMPT)
-    return order
+    `prompt` is tried only when it is the RECORDED mode -- i.e. `how_to_feed` returned it from the
+    run's isolation tag (`...prompted`), which is the authoritative signal that the crash was found
+    one field per prompt. It is NOT guessed from the payload's bytes: an earlier version appended
+    `prompt` whenever the input contained a newline, but a binary overflow payload routinely
+    contains `0x0a`, so that fired a slow paced capture (a pipe write + idle wait per field) on
+    cases that are not prompt protocols at all -- pure budget cost, and under full-gate load it is
+    exactly what tips a budget-tight L3 case down to L2. A crash found via a bulk channel reproduces
+    via that channel by construction, so there is nothing to gain from speculatively pacing it.
+
+    `data`/`deliverable` are kept for call-site stability and future use; the order now depends only
+    on `mode`."""
+    return [mode] + [m for m in MODES if m != mode]
 
 # env_fuzz records its delivery as an argv prefix element "NAME=@@" (@@ being the input placeholder),
 # so the variable's name survives on the DynResult and the replay can set the right one.
