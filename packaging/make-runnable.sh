@@ -17,6 +17,18 @@ say(){ printf '\n== %s\n' "$*"; }
 die(){ echo "ERROR: $*" >&2; exit 1; }
 
 command -v zip >/dev/null 2>&1 || die "need zip (apt-get install zip)"
+
+# This script needs patchelf to make the vendored Python (and, at run time via relink-bundle.sh,
+# the tools) self-contained. If the build host has none, use the STATIC patchelf we ship -- the
+# same binary the offline target relinks with -- so a host without patchelf can still build a
+# package. Put it on PATH under the name `patchelf` so every call below resolves.
+if ! command -v patchelf >/dev/null 2>&1; then
+  _pf="$ROOT/packaging/bin/patchelf-static-$(uname -m)"
+  [ -x "$_pf" ] || die "no patchelf on PATH and no static one at $_pf (see packaging/bin/README.md)"
+  _pfbin="$(mktemp -d)"; ln -sf "$_pf" "$_pfbin/patchelf"; PATH="$_pfbin:$PATH"; export PATH
+  echo "  using the vendored static patchelf (host has none): $_pf"
+fi
+
 TC="$(ls -1t "$DIST"/lykos-toolchain-*.tar.zst 2>/dev/null | head -1 || true)"
 [ -n "$TC" ] || die "no toolchain bundle in dist/ -- run 'make toolchain-bundle' first"
 
@@ -251,10 +263,21 @@ CLOSDIR="$V/toolchain/usr/lib/${MULTIARCH:-x86_64-linux-gnu}"; mkdir -p "$CLOSDI
 # hash, and updated as we copy. (The old per-lib `find` over a 4 GB tree was O(elfs x libs x tree)
 # and crawled.) Everything runs with errexit OFF so a non-ELF file or an empty grep is normal flow.
 HAVE="$STAGE/.closure_have"
-find "$V" -type f \( -name '*.so' -o -name '*.so.*' \) -printf '%f\n' 2>/dev/null | sort -u > "$HAVE"
-_is_core_lib() { case "$1" in \
-  libc.so*|libm.so*|libdl.so*|libpthread.so*|librt.so*|libresolv.so*|libutil.so*|libnsl.so*|\
-  ld-linux*|linux-vdso*|libgcc_s.so*|libcrypt.so*) return 0 ;; *) return 1 ;; esac ; }
+# Index what the bundle ALREADY has, by soname basename -- but ONLY from the NATIVE lib dirs. The
+# cross-compilers ship FOREIGN libc.so.6/libm.so.6/libstdc++.so.6 under usr/<triple>/lib and
+# usr/lib32; counting those by basename would make the NATIVE libraries look "already present" so
+# the closure skips them, and the bundle then falls back to the (older) target's glibc. Excluding
+# the per-target dirs from the index keeps native deduping while still vendoring native libs.
+find "$V" -type f \( -name '*.so' -o -name '*.so.*' \) 2>/dev/null \
+  | grep -vE '/(lib32|libx32)/|/usr/[a-z0-9_]+-linux-[a-z0-9]+/|/usr/[a-z0-9_]+-w64-[a-z0-9]+/' \
+  | sed 's#.*/##' | sort -u > "$HAVE"
+# GLIBC INDEPENDENCE (Option B): vendor the native glibc family too (libc/libm/libpthread/libdl/
+# librt/libresolv/libnss_*/libgcc_s/...), so the bundle carries a COMPLETE, self-consistent glibc
+# and relink-bundle.sh can run every tool under the bundle's own loader -- independent of the
+# (older) target's glibc. Only the kernel-provided vDSO is skipped (never a real file), and the
+# dynamic LOADER is handled explicitly after the closure (it is a PT_INTERP, not a NEEDED entry,
+# so ldd never lists it). This is what lets a bundle built on glibc 2.43 run on a 2.31 host.
+_is_core_lib() { case "$1" in linux-vdso*|ld-linux*) return 0 ;; *) return 1 ;; esac ; }
 _vendor_needed_of() {                                  # copy the not-yet-bundled NEEDED libs of $1
   ldd "$1" 2>/dev/null | awk '/=> \//{print $3}' | while IFS= read -r lib; do
     [ -f "$lib" ] || continue
@@ -279,10 +302,52 @@ done
 set -e                                                 # closure pass done -- restore errexit
 printf '  closure vendored; vendor/ is now %s\n' "$(du -sh "$V" | cut -f1)"
 
+# Vendor the full NATIVE glibc runtime EXPLICITLY. Two reasons the ldd-closure cannot be trusted
+# for it: (1) the LOADER is a PT_INTERP, never a NEEDED entry, so ldd never lists it; (2) the NSS
+# modules (libnss_files/dns/compat -- used by getpwuid/getaddrinfo) are dlopen'd by name, not
+# NEEDED, so ldd never lists them either. Copy this host's libc6 + libgcc + libstdc++ runtime
+# (loader, libc/libm/libdl/libpthread/..., all libnss_*, and the gconv charset modules) straight
+# into the native multiarch dir, so the bundle carries a COMPLETE, self-consistent glibc that
+# relink can point every tool at -- independent of the (older) target's glibc.
+_vendor_pkg_libs() {
+  dpkg -L "$1" 2>/dev/null | grep -E '/(x86_64-linux-gnu|lib64)/' | while IFS= read -r f; do
+    [ -f "$f" ] || continue
+    case "$f" in
+      */gconv/*) mkdir -p "$CLOSDIR/gconv"; cp -aL "$f" "$CLOSDIR/gconv/" 2>/dev/null || true ;;
+      *.so|*.so.*) cp -aL "$f" "$CLOSDIR/" 2>/dev/null || true ;;
+    esac
+  done
+}
+for _pkg in libc6 libgcc-s1 libstdc++6; do _vendor_pkg_libs "$_pkg"; done
+echo "  + native glibc runtime (libc6 + libgcc + libstdc++, incl libnss_* and gconv) -> $CLOSDIR"
+# The bundle MUST end up with a native loader and libc, or relink/tools fail on the target.
+ls "$CLOSDIR"/ld-*.so.* >/dev/null 2>&1 || die "no native loader landed in $CLOSDIR -- relink would fail on the target (is libc6 installed on this build host?)"
+[ -f "$CLOSDIR/libc.so.6" ] || die "native libc.so.6 did not land in $CLOSDIR -- the bundle would use the target's glibc"
+
 say "generating relocatable scoped wrappers"
 # reuse setup.sh's generator so there is one implementation of the wrapper contract
 eval "$(sed -n '/^gen_wrappers() {/,/^}/p' "$ROOT/packaging/setup-toolchain.sh")"
 gen_wrappers "$V/toolchain"
+
+# ---- GLIBC INDEPENDENCE: place the static patchelf the target uses to relink at first run ----
+# The wrappers above put the bundle's LIBRARIES on LD_LIBRARY_PATH, but each tool is still STARTED
+# by the loader named in its PT_INTERP -- an absolute path to the *host's* ld-linux. On a target
+# OLDER than this build host, that old loader cannot drive the bundle's newer libc. So the bundle
+# ships relink-bundle.sh (in packaging/, carried by the git archive) and a STATIC patchelf; ./lykos
+# runs them on first use to repoint every bundled ELF at the bundle's OWN loader. patchelf must be
+# static -- it runs before the bundle's glibc is usable, on a host whose glibc may be older.
+say "staging the glibc-independence relinker (static patchelf)"
+mkdir -p "$V/toolchain/.relink"
+_arch="$(uname -m)"
+if [ -f "$ROOT/packaging/bin/patchelf-static-$_arch" ]; then
+  install -m0755 "$ROOT/packaging/bin/patchelf-static-$_arch" "$V/toolchain/.relink/patchelf"
+  printf '  %s -> vendor/toolchain/.relink/patchelf (static)\n' "patchelf-static-$_arch"
+elif command -v patchelf >/dev/null 2>&1 && file "$(command -v patchelf)" 2>/dev/null | grep -q 'statically linked'; then
+  install -m0755 "$(command -v patchelf)" "$V/toolchain/.relink/patchelf"
+  echo "  host patchelf is static -> vendor/toolchain/.relink/patchelf"
+else
+  die "no static patchelf to ship (packaging/bin/patchelf-static-$_arch missing and host patchelf is not static). The target needs a static patchelf to relink the bundle; see packaging/bin/README.md to regenerate it."
+fi
 
 say "launcher + quickstart"
 # The package ships the repo's own ./start and ./lykos launchers. They are already offline aware:

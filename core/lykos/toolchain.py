@@ -429,6 +429,31 @@ def apt_packages() -> list:
     return sorted(out)
 
 
+def bundle_paths() -> list:
+    """Non-apt tools to copy into the offline bundle, as ``[(key, [paths]), ...]``.
+
+    Some engines are not apt packages on this host (SymQEMU is a source build, and anything else
+    a Tool marks with a ``bundle`` callable). The collector pulls the deb-installable tools with
+    ``apt_packages``; this covers the rest, driven by the SAME ``TOOLS`` table so the two cannot
+    drift. A tool whose ``bundle`` callable returns nothing (not built/installed here) is skipped,
+    and a callable that raises is skipped too -- a missing extra must not abort the whole collect.
+    Returns only entries that actually have paths, in declaration order.
+    """
+    out: list = []
+    for t in TOOLS:
+        if not t.bundle:
+            continue
+        try:
+            paths = t.bundle() or []
+        except Exception as e:                          # noqa: BLE001
+            # A probe/locator for an absent extra may raise; that just means "not here to bundle".
+            observe.absorbed(_log, f"bundle_paths: {t.key} not bundled ({e!r})")
+            continue
+        if paths:
+            out.append((t.key, list(paths)))
+    return out
+
+
 def report(*, verbose: bool = False) -> str:
     """A human-readable capability report for this host."""
     rows = survey()

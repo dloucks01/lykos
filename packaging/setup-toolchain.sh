@@ -139,8 +139,15 @@ if [ -n "$(ls -A "$HERE/venvs" 2>/dev/null)" ]; then
     name="$(basename "$v")"
     rm -rf "${DEST:?}/$name"
     cp -a "$v" "$DEST/$name"
+    # Point the venv at the BUNDLE's own python (self-sufficient: no dependency on whatever
+    # python3 the target happens to have, or whether it has one at all). Fall back to a host
+    # python only when the bundle carries none. vendorenv also repoints venvs to the vendored
+    # interpreter at RUN time, so this keeps the two consistent rather than at odds.
     if [ -f "$DEST/$name/pyvenv.cfg" ]; then
-      sed -i "s|^home = .*|home = $(dirname "$(command -v python3)")|" "$DEST/$name/pyvenv.cfg"
+      _vpy="$(ls -d "$DEST"/toolchain/usr/bin/python3.[0-9]* 2>/dev/null | sort -V | tail -1)"
+      [ -n "$_vpy" ] || _vpy="$DEST/toolchain/usr/bin/python3"
+      if [ -x "$_vpy" ]; then _vhome="$(dirname "$_vpy")"; else _vhome="$(dirname "$(command -v python3)")"; fi
+      sed -i "s|^home = .*|home = $_vhome|" "$DEST/$name/pyvenv.cfg"
     fi
     if "$DEST/$name/bin/python" -c "import sys" 2>/dev/null; then
       echo "  $name -> $DEST/$name"

@@ -7,6 +7,16 @@
 # in a plain clone it uses the system python3. Override with LYKOS_PYTHON=/path/to/python3.
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
+# Air-gap bundle: on first run (or after the folder was moved/copied, e.g. off a disc), make the
+# vendored tools AND the bundle's own python glibc-independent, so they run on a target that is
+# OLDER than the host that built the bundle. It repoints every bundled ELF's loader at the
+# bundle's own ld-linux. Pure shell + a STATIC patchelf -- no glibc or python needed -- and a
+# fast no-op in a plain clone (no vendor/toolchain) or once already done for this location.
+if [ -d "$here/vendor/toolchain" ] && [ -f "$here/packaging/relink-bundle.sh" ]; then
+    sh "$here/packaging/relink-bundle.sh" "$here/vendor" || \
+        echo "lykos: warning -- bundle relink did not complete; vendored tools may fail to start on an older host (is the folder writable? run from a copy, not the read-only disc)" >&2
+fi
+
 PY=${LYKOS_PYTHON:-}
 if [ -z "$PY" ]; then
     if [ -x "$here/vendor/toolchain/usr/bin/python3" ]; then
