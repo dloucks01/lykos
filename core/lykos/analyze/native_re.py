@@ -107,6 +107,68 @@ def locate_native(config: Optional[str] = None) -> Optional[Path]:
     return None
 
 
+#: What fraction of the host's CURRENTLY-AVAILABLE memory an analysis child may use. The cap is a
+#: fraction, not a fixed number, precisely because another system has different memory than this
+#: one: 60% leaves ~40% of whatever is free for the OS and other apps, on a 4GB laptop or a 256GB
+#: server alike, computed fresh at the moment the child starts.
+_MEM_CAP_FRACTION = 0.6
+#: A floor so a normal binary's analysis is never starved on a modest host; and a lower bound below
+#: which we do not bother capping (the host is already too small to protect this way).
+_MEM_FLOOR_MB = 1024
+#: An absolute ceiling: past this, rizin is not memory-starved, and a bigger cap just lets a
+#: pathological binary map more before it is stopped. Keeps a 256GB server from handing one
+#: analysis 150GB.
+_MEM_CEILING_MB = 16384
+
+
+def _mem_available_mb() -> Optional[int]:
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) // 1024
+    except Exception:
+        return None
+    return None
+
+
+def _mem_cap_mb() -> Optional[int]:
+    """How many MB of virtual address space an analysis child may use on THIS host, right now, or
+    None to leave it uncapped. A fraction of currently-available memory (so it adapts to the
+    machine the package runs on), floored so normal work is not starved and ceiled so a huge host
+    does not hand one analysis an absurd cap."""
+    avail = _mem_available_mb()
+    if avail is None or avail < _MEM_FLOOR_MB:
+        return None                                      # can't read it, or too small to help
+    return int(max(_MEM_FLOOR_MB, min(avail * _MEM_CAP_FRACTION, _MEM_CEILING_MB)))
+
+
+def _mem_cap_preexec():
+    """A child preexec that caps VIRTUAL address space to leave the HOST headroom.
+
+    rizin's whole-program analysis of a large binary grows without bound -- measured at ~3.5GB RSS
+    and climbing on a 136MB Go binary -- and lykos ran it with NO memory limit, so on the laptop or
+    server this is packaged onto it could exhaust RAM and take the whole MACHINE down, not just the
+    analysis. Cap the child's RLIMIT_AS at a fraction of what is free RIGHT NOW (so the cap suits
+    whatever host it runs on) and a huge-binary analysis fails GRACEFULLY -- rizin hits the cap and
+    exits, disassemble recovers whatever was persisted and reports a truncation -- instead of
+    OOMing the box. Measured: a 2GB cap held rizin's RSS to 1.8GB on the 136MB target that reached
+    3.5GB uncapped. Only RLIMIT_AS is set, not RLIMIT_FSIZE, because rizin writes its analysis JSON
+    to redirected files that legitimately exceed any small size cap. Returns None when memory
+    cannot be read, leaving the child uncapped (the prior behaviour)."""
+    cap_mb = _mem_cap_mb()
+    if cap_mb is None:
+        return None
+
+    def _apply():
+        try:
+            import resource
+            lim = cap_mb << 20
+            resource.setrlimit(resource.RLIMIT_AS, (lim, lim))
+        except Exception:
+            pass
+    return _apply
+
+
 def _run(cli: Path, binary: Path, script: str, *, ctx=None, timeout: int,
          scratch: Optional[Path] = None) -> None:
     """Run a rizin/radare2 command script. Output is captured by the script itself via per-
@@ -135,10 +197,14 @@ def _run(cli: Path, binary: Path, script: str, *, ctx=None, timeout: int,
         # treats it as a COMMAND STREAM and blocks reading it -- so `disassemble` hangs forever
         # with no CPU whenever the server's stdin is not already /dev/null (e.g. ./RUN.sh launched
         # so the worker inherits an open pipe). Immediate EOF makes rizin quit after -i as intended.
+        # Cap the child's memory to leave the host headroom: a large-binary analysis must never be
+        # able to OOM the laptop it is packaged onto (see `_mem_cap_preexec`).
+        _pre = _mem_cap_preexec()
         if ctx is not None:
-            ctx.run_subprocess(cmd, timeout=timeout, stdin=subprocess.DEVNULL)
+            ctx.run_subprocess(cmd, timeout=timeout, stdin=subprocess.DEVNULL, preexec_fn=_pre)
         else:
-            subprocess.run(cmd, capture_output=True, timeout=timeout, stdin=subprocess.DEVNULL)
+            subprocess.run(cmd, capture_output=True, timeout=timeout, stdin=subprocess.DEVNULL,
+                           preexec_fn=_pre)
     finally:
         try:
             os.unlink(spath)

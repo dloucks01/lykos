@@ -78,3 +78,68 @@ third is a genuine research area, scoped here with a roadmap grounded in the cur
 
 Every item keeps the standing transparency rule: whatever is skipped, capped, or truncated is
 REPORTED as a coverage note, never inferred from a small number.
+
+## End-to-end to a demonstrable PoC on a large binary (research, 2026-10-18)
+
+Measured while writing this: rizin's whole-binary `aaa` on the 136MB `nuclei` (a Go binary) runs at
+100% CPU with RSS climbing past 2.4GB in the first 45s -- it is WORKING, not frozen, but
+whole-image analysis is CPU- and memory-bound to the point of being the wrong tool. The literature
+is unanimous on the alternative: **you do not analyse a huge binary whole to reach a PoC; you
+harness a component.** That is how OSS-Fuzz, the AIxCC teams, and essentially all practical
+large-target work operate.
+
+The end-to-end chain for a large target, and where lykos stands on each link:
+
+1. **Attack-surface identification -- from cheap facts, not full CFG.** Pick the input-handling
+   component from imports, strings, exports and the entry path (the strings-first fix already
+   recovers these on a huge binary). lykos does import/string/export triage today; it does not yet
+   RANK components by attacker-reachability to choose a harness target.
+
+2. **Targeted harness around that component** -- the single highest-leverage capability.
+   * *Source or known library present:* a libFuzzer-style harness that calls the component
+     directly. lykos already has this lane (`plan_harnesses` + `BuildCache`, one harness per
+     library). LLM-assisted harness generation is now strong where source exists -- HarnessAgent
+     reports ~81-87% three-shot success across 243 OSS-Fuzz targets and 15 new vulnerabilities
+     ([arXiv:2512.03420](https://arxiv.org/pdf/2512.03420)), coverage-feedback steering the next
+     harness toward under-explored regions ([FuzzAgent](https://arxiv.org/pdf/2605.14431)); the
+     known failure mode is generic harnesses that crash on wrong input constraints
+     ([SAFuzz](https://arxiv.org/pdf/2602.11209)).
+   * *Binary-only (our large-binary case):* **snapshot fuzzing** -- snapshot the process deep past
+     initialization at the parser entry and fuzz the register/memory state. Nyx/Nyx-Net (KVM
+     snapshots, stateful targets, [arXiv:2111.03013](https://arxiv.org/pdf/2111.03013)), AWS
+     Snapchange, and `wtf` (closed-source Windows/Linux, [appsec.guide](https://appsec.guide/docs/fuzzing/snapshot-fuzzing/))
+     are the tools. "No source" does NOT mean "no harness": each needs a fuzzer module defining how
+     to inject input and detect a crash, and a chosen snapshot point past init. This lane does not
+     exist in lykos yet and is the main thing we need to BUILD to go end-to-end on a stripped large
+     binary.
+
+3. **Directed fuzzing toward a recovered sink** -- reach deep bugs without exhaustively fuzzing.
+   AFLGo scores seed distance to a target site and powers seeds closer to it, and can reproduce a
+   crash from a bug report even without the original input
+   ([AFLGo](https://acmccs.github.io/papers/p2329-bohmeAemb.pdf)); CAFL adds ordered sink +
+   data-condition constraints and reports 2.88x faster crash reproduction
+   ([CAFL, USENIX Sec '21](https://www.usenix.org/system/files/sec21fall-lee-gwangmu.pdf)); LeoFuzz
+   coordinates multiple target sequences ([arXiv:2206.14977](https://arxiv.org/pdf/2206.14977)).
+   lykos has a `directed_fuzz` stage; it needs sinks recovered by a LIGHT analysis of the component
+   (step 1), not the memory-exploding whole-image pass.
+
+4. **Crash -> primitive -> exploit.** This is the one link lykos already does well end-to-end (the
+   address-leak case reaches a real L3 shell). A harness/snapshot crash feeds the same
+   root_cause -> poc_primitive -> build_exploit chain; execution-state-aware reasoning is the
+   current research frontier for turning a crash into a proof-of-vulnerability
+   ([arXiv:2602.13574](https://arxiv.org/html/2602.13574v1)).
+
+**What we need to BUILD, in order of leverage:**
+1. A **component attack-surface ranker** over the cheap facts (imports/strings/exports/entry), to
+   pick a harness target without whole-CFG recovery.
+2. A **binary-only snapshot-fuzzing lane** (Nyx or Snapchange, or a qemu-snapshot driver) that
+   snapshots at the chosen component entry and fuzzes from there -- the missing piece for a
+   stripped large binary. For targets with source/a known library, extend the existing libFuzzer
+   harness lane with coverage-steered (optionally LLM-assisted) harness generation.
+3. **Light, component-scoped analysis** (lighter rizin modes on the component only) to feed
+   `directed_fuzz` the sinks to steer toward -- never `aaa` on the whole image.
+4. Reuse the existing **crash -> primitive -> exploit** chain unchanged.
+
+The honest summary: lykos can already go crash -> L3 exploit; the large-binary gap is entirely in
+REACHING a crash in a huge image, and the answer is component harnessing + snapshot/directed
+fuzzing, not better whole-binary analysis.
