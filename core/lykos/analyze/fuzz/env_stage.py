@@ -108,6 +108,19 @@ def env_fuzz_stage(ctx) -> dict:
     ctx.content.stage_target(target, exe.parent, exe.name)
     os.chmod(exe, 0o755)
 
+    # A shared object has no entry point, so executing it faults in the loader before any user
+    # code -- and thus before any getenv -- runs. The native runner here is a bare subprocess
+    # (`_run_with_env`'s Popen), NOT sandbox.run, so it does not get run()'s shared-object guard:
+    # without this the loader fault is filed as a crash and `root_cause` promotes it to a
+    # fabricated CONFIRMED critical control-flow hijack. Observed on libfreerdp3.so, where it was
+    # the ONE execution of a whole run (baseline DID NOT RUN, the crash did not re-verify) and
+    # still landed as critical CWE-787. A library is fuzzed through a harness, not by running it.
+    if sandbox._is_elf_shared_object(exe):
+        ctx.emit("env_fuzz.done", payload={"applicable": False,
+                 "note": "an ELF shared object has no entry point: a library is LINKED AGAINST, "
+                         "not executed, so no environment reaches it -- fuzz it through a harness"})
+        return {}
+
     argv = [str(a) for a in (p.get("argv") or [])]
     timeout = float(p.get("exec_timeout", 5))
     runner, ran = _managed_runner(exe, argv, timeout, sub)

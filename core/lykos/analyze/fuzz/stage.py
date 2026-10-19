@@ -918,6 +918,25 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
     ctx.content.stage_target(target, exe.parent, exe.name)
     os.chmod(exe, 0o755)
 
+    # A shared object has no entry point: run()/run_batch both refuse it (every execution comes
+    # back "not-runnable"), so the loop below would spin its whole budget on no-op executions and
+    # enter nothing. Worse, on rare harness hiccups one of those no-ops has surfaced as a fault
+    # that `root_cause` promoted to a CONFIRMED critical control-flow hijack -- a fabricated RCE on
+    # an image that never ran as a program (observed on libfreerdp3.so: baseline DID NOT RUN, the
+    # "crash" did not re-verify, yet it was filed critical). A library is fuzzed through a harness
+    # (the libFuzzer path), not by executing it, so refuse the campaign here rather than record
+    # anything from it. Mirrors `sandbox._is_elf_shared_object`; see its callers in sandbox.run.
+    from ..dynamic import sandbox as _sandbox
+    if _sandbox._is_elf_shared_object(exe):
+        ctx.progress(pct=100, msg=(f"{event_prefix}: an ELF shared object has no entry point -- "
+                                   "not executed as a program (fuzz it through a harness)"))
+        ctx.emit(f"{event_prefix}.done", payload={"execs": 0, "crashes": 0,
+                 "note": "shared object: no entry point, not executed as a program"})
+        return {"execs": 0, "crashes": 0, "flaky": 0, "crashes_reproducible": 0, "unique": 0,
+                "starved": False, "directed_kept": 0, "nearest_sink_dist": None,
+                "behaviours": 0, "corpus": 0, "kept": 0, "execs_per_sec": 0,
+                "blocks_hit": 0, "blocks_known": 0, "coverage": "none"}
+
     # THE GUARD-PAGE HEAP ORACLE, on wherever it can apply. libdislocator puts every allocation
     # at the end of its own page with an unmapped page behind it, so a heap out-of-bounds READ --
     # the class that otherwise runs on silently, and the class most of a stripped binary's CVEs

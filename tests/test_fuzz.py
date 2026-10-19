@@ -649,3 +649,106 @@ def test_a_dispatch_token_is_seeded_where_the_program_tests_for_it():
     assert not any(s.startswith(b"AAAA") or s.startswith(b"/bin/sh") for s in seeds)
     # bounded
     assert len(_dispatch_prefix_seeds([b"k%d=" % i for i in range(100)])) <= 40
+
+
+# ---------------------------------------------------- a library is not a program
+_LIB_SRC = ("#include <string.h>\n"
+            "int parse(const char *s){ char b[8]; strcpy(b, s); return b[0]; }\n")
+
+
+def test_fuzz_refuses_a_shared_object_instead_of_fabricating_a_crash(store, case, pool, gcc,
+                                                                     tmp_path):
+    """A shared object has no entry point, so executing it faults in the loader before any user
+    code runs. That loader fault was being promoted to a 'confirmed critical CWE-787 RCE' -- a
+    fabricated exploit on an image that never ran as a program.
+
+    Measured on libfreerdp3.so at --budget 600: the baseline correctly reported DID NOT RUN, yet
+    the directed campaign spun 30,248 no-op 'executions' and one of them surfaced a loader fault
+    (pc outside any executable mapping) that `root_cause` filed as a confirmed critical
+    control-flow hijack -- non-reproducible ('the reproducer did not re-crash'), once in ~30k. The
+    run()/run_batch guards stop the COMMON path, but the campaign must refuse the image up front
+    so no execution of it can surface at all -- a library is fuzzed through a harness (the
+    libFuzzer path), never by running it."""
+    so = tmp_path / "libvuln.so"
+    c = tmp_path / "vuln.c"
+    c.write_text(_LIB_SRC)
+    if subprocess.run([gcc, "-shared", "-fPIC", "-O0", str(c), "-o", str(so)],
+                      capture_output=True).returncode != 0:
+        pytest.skip("build failed")
+    from lykos.analyze.dynamic import sandbox
+    assert sandbox._is_elf_shared_object(so), "fixture must be a no-entry-point shared object"
+
+    target = ingest(store, case.id, so)
+    q = JobQueue(store.conn)
+    run = enqueue_fuzz(q, target, params={
+        "input_mode": "stdin", "max_execs": 4000, "max_seconds": 25, "exec_timeout": 1})
+    assert pool.wait_idle(60) and q.runs.get(run.id).status == "done"
+
+    assert not [d for d in DynResultDAO(store.conn).list_by_target(target.id) if d.crashed], \
+        "a shared object produced a crash -- it must not be executed as a program"
+    assert not [f for f in FindingDAO(store.conn).list_by_target(target.id)
+                if f.state == "confirmed"], \
+        "no confirmed finding may come from executing a library"
+
+
+def test_the_campaign_short_circuits_a_shared_object_before_the_loop():
+    """Source guard: the behavioural test above needs a C compiler, so this ensures the gate
+    itself is not silently dropped. `fuzz_campaign` must refuse an ELF shared object up front
+    (before spending the budget on no-op executions), not rely only on run()/run_batch returning
+    not-runnable for each of thousands of iterations."""
+    import inspect
+
+    from lykos.analyze.fuzz import stage
+    src = inspect.getsource(stage.fuzz_campaign)
+    assert "_is_elf_shared_object" in src, "the campaign must check for a shared object"
+    head = src[:src.index("_is_elf_shared_object")]
+    assert "while execs <" not in head, "the shared-object guard must come BEFORE the exec loop"
+
+
+# ------------------------------------------------- env channel refuses a shared object
+_ENV_VULN_LIB = (
+    "#include <string.h>\n#include <stdlib.h>\n"
+    "int configure(void){ char buf[64];\n"
+    "  char*v=getenv(\"APP_CONFIG\"); if(v){ strcpy(buf,v); return buf[0]; } return 0; }\n")
+
+
+def test_env_channel_refuses_a_shared_object(store, case, pool, gcc, tmp_path):
+    """The env channel's native runner is a bare subprocess (not sandbox.run), so it had no
+    shared-object guard: it executed libfreerdp3.so, the loader faulted before any getenv, and
+    that fault was filed as a crash and promoted to a fabricated confirmed critical CWE-787. The
+    library here calls getenv (so the applicability gate passes on its import) but has no entry
+    point, and the stage must refuse to run it -- no env crash, no finding."""
+    from lykos.analyze.disassemble import enqueue_disassemble
+    from lykos.analyze.fuzz.env_stage import enqueue_env_fuzz
+    from lykos.analyze.ingest import enqueue_triage
+    src = tmp_path / "envlib.c"; src.write_text(_ENV_VULN_LIB)
+    so = tmp_path / "libenvvuln.so"
+    if subprocess.run([gcc, "-shared", "-fPIC", "-O0", "-w", str(src), "-o", str(so)],
+                      capture_output=True).returncode != 0:
+        pytest.skip("build failed")
+    from lykos.analyze.dynamic import sandbox
+    assert sandbox._is_elf_shared_object(so), "fixture must be a no-entry-point shared object"
+
+    target = ingest(store, case.id, so, filename="libenvvuln.so")
+    q = JobQueue(store.conn)
+    for fn in (enqueue_triage, enqueue_disassemble):
+        fn(q, target, force=True); assert pool.wait_idle(300)
+    run = enqueue_env_fuzz(q, target, params={"max_execs": 400}, force=True)
+    assert pool.wait_idle(300) and q.runs.get(run.id).status == "done"
+    assert not [d for d in DynResultDAO(store.conn).list_by_target(target.id) if d.crashed], \
+        "the env channel executed a shared object and recorded a loader fault as a crash"
+    assert not [f for f in FindingDAO(store.conn).list_by_target(target.id)
+                if f.state == "confirmed"], "no confirmed finding may come from running a library"
+
+
+def test_the_bare_env_runner_backstops_a_shared_object():
+    """Source guard for the backstop inside the runner itself: `_run_with_env` is the single
+    native exec door for the env channel and must refuse a shared object even if a future caller
+    forgets the stage-level gate."""
+    import inspect
+
+    from lykos.analyze.fuzz import envfuzz
+    src = inspect.getsource(envfuzz._run_with_env)
+    assert "_is_elf_shared_object" in src
+    head = src[:src.index("_is_elf_shared_object")]
+    assert "Popen" not in head, "the guard must come before the subprocess is spawned"

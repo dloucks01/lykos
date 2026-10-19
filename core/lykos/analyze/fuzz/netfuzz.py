@@ -98,6 +98,11 @@ _PR_SET_PDEATHSIG = 1
 
 
 def _spawn_server(exe: str, argv: list, mem_mb: int = 1024) -> "subprocess.Popen | None":
+    # A shared object has no entry point: spawning it as a server faults in the loader rather than
+    # binding a port. Refuse it like a spawn failure (the campaign then reports "no-listen", which
+    # is honest) rather than execute a library as a program -- the same guard sandbox.run has.
+    if sandbox._is_elf_shared_object(exe):
+        return None
     rlimits = sandbox._rlimits(mem_mb, 60, set_as=True, nproc=64)
 
     def preexec():

@@ -72,7 +72,15 @@ class EnvFuzzResult:
 
 def _run_with_env(exe: str, argv: list, env_overrides: dict, timeout: float = 5.0):
     """Run `exe` once with the given env vars set (plus a minimal PATH), return its exit status
-    (negative = killed by that signal), or None on spawn failure. rlimits-only."""
+    (negative = killed by that signal), or None on spawn failure. rlimits-only.
+
+    This is a bare subprocess, so unlike `sandbox.run` it does not reject an un-runnable image on
+    its own. A shared object has no entry point and faults in the loader every time; returning
+    None (spawn-failure, not a crash) keeps that loader fault from being read as a defect. The
+    caller (env_fuzz_stage) already declines a shared object up front -- this is the backstop for
+    any other caller."""
+    if sandbox._is_elf_shared_object(exe):
+        return None
     env = {k: os.environ[k] for k in ("PATH", "LANG", "LC_ALL") if k in os.environ}
     env.update(env_overrides)
     try:
