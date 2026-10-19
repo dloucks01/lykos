@@ -166,6 +166,25 @@ def test_the_stage_declines_on_anything_it_cannot_natively_run(ftype):
     assert uninit_stage.MEM_ORACLE_STAGE == "mem_oracle"
 
 
+def test_memcheck_uninit_lane_is_declined_on_go_and_rust_binaries():
+    """A runtime-managed, bounds-checked language (Go, Rust) makes memcheck's uninitialised-read
+    lane a false-positive generator -- its runtime legitimately reads slots memcheck has not seen
+    written, so EVERY such binary yields a 'confirmed CWE-457' that is runtime noise (observed
+    identically on kubectl/helm/terraform). The stage must gate on toolchain_hint and decline,
+    not file a misleading finding. (Source-level guard: the behavioural path needs a built Go
+    binary; this ensures the gate itself is not silently dropped.)"""
+    import inspect
+
+    from lykos.analyze.dynamic import uninit_stage
+    src = inspect.getsource(uninit_stage.mem_oracle_stage)
+    assert "toolchain_hint" in src, "the Go/Rust gate reads target.toolchain_hint"
+    assert '"go"' in src or "'go'" in src or 'startswith("go")' in src, "must gate Go"
+    assert "rust" in src, "must gate Rust"
+    # and it must decline (not raise / not file) -- the gate uses _decline
+    gate = src[src.index("toolchain_hint"):]
+    assert "_decline" in gate, "the Go/Rust path must _decline, not file a finding"
+
+
 def test_the_stage_is_scheduled_and_visible_to_the_operator():
     from lykos.analyze import capabilities
     from lykos.analyze.orchestrate import _PLAN_STAGES, _TARGET

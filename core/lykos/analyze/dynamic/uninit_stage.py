@@ -212,6 +212,21 @@ def mem_oracle_stage(ctx) -> dict:
                              "observed on this host -- nothing was checked, which is not the "
                              "same as nothing found")
 
+    # Runtime-managed, bounds-checked languages (Go, Rust) make memcheck's uninitialised-read lane
+    # a FALSE-POSITIVE generator: their runtimes legitimately read stack/heap slots memcheck has
+    # not seen written (Go's goroutine stack growth/reuse above all), so EVERY Go/Rust binary
+    # yields a "confirmed CWE-457 uninitialised read" that is runtime noise, not an app bug --
+    # observed identically on kubectl, helm and terraform. Decline the lane with that reason rather
+    # than file a misleading confirmed finding; the language already provides the safety this lane
+    # looks for. (The crash-classification caller still runs valgrind on a REAL fault via gdb.)
+    _tc = (getattr(target, "toolchain_hint", "") or "").lower()
+    if _tc.startswith("go") or _tc.startswith("rust"):
+        return _decline(ctx, f"memcheck's uninitialised-read lane is skipped on a {_tc} binary: its "
+                             f"runtime does legitimate uninitialised-looking stack/heap reads that "
+                             f"memcheck reports as errors (a false positive in every {_tc} binary, "
+                             f"not an app bug) -- and {_tc} is bounds-checked, so the memory-safety "
+                             f"classes this lane looks for are handled by the language")
+
     # Staged under the name the image dispatches on (busybox and any other multi-call
     # binary refuse every input as `target.bin`): see invocation.staged_name.
     exe = ctx.scratch() / _staged_name(ctx, target)
