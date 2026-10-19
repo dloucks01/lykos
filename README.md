@@ -117,7 +117,9 @@ make corpus-regression # did we still find AND demonstrate the defects we found 
 make release           # ci + verify + all four gates
 make toolchain-bundle  # build the offline toolchain tarball (on a CONNECTED machine)
 make repo-tarball      # snapshot the repo for transfer (tracked files at HEAD, + sha256)
-./package              # ONE unzip-and-run .zip: repo + fully-populated vendor/ (no install)
+./package              # ONE extract-and-run package: repo + fully-populated vendor/, no install
+                       # -> dist/lykos-offline-<date>-<arch>.tar.xz (+ disc-split .part-NN,
+                       #    .sha256, .EXTRACT.sh). On the laptop: sh *.EXTRACT.sh; cd lykos; ./start
 make dashboard         # detection-quality regression dashboard from eval-history.jsonl
 make clean             # remove build artifacts and caches
 ```

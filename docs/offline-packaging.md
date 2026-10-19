@@ -218,17 +218,20 @@ cannot.
 
 ## Offline setup runbook (no install)
 
-Doc 11 is the design position on running offline. This is the procedure.
-
-Two things move to the offline workstation, and they are deliberately separate:
+Doc 11 is the design position on running offline. This is the procedure. The recommended path
+(§ "How it is delivered" below) folds everything into **one** extract-and-run package; the table
+here names the two pieces it is built from, which you can also carry separately (the "lean
+alternative").
 
 | | What | Size | How it travels |
 |---|---|---|---|
-| **the repo** | lykos itself — stdlib-only, no pip packages | ~1 MB | one tarball (`git archive`), built on a connected machine |
-| **the toolchain bundle** | rizin + rz-ghidra + pypcode (the RE backend), a matching Python interpreter, qemu-user, GDB, AFL++, Wine, the angr/Unicorn venvs | ~1.5 GB | one tarball, built on a connected machine |
+| **the repo** | lykos itself — stdlib-only, no pip packages | ~1 MB | inside the package (or `git archive` on its own) |
+| **the toolchain bundle** | rizin + rz-ghidra + pypcode (the RE backend), a matching Python interpreter, qemu-user, GDB, AFL++, Wine, the angr/Unicorn venvs | ~1.5 GB | inside the package (or its own `.tar.zst`) |
 
-They are separate because the repo changes constantly and the toolchain almost never does.
-Re-cutting the ~1 MB repo tarball is cheap; re-carrying 3 GB is not.
+The default `./package` output is a single `lykos-offline-<date>-<arch>` archive (split into
+disc-sized volumes when it does not fit one disc) carrying both. The two can also move separately
+— the repo changes constantly and the toolchain almost never does, so re-cutting the ~1 MB repo is
+cheap while re-carrying ~1.5 GB is not.
 
 **Neither package is installed on the offline side. Both run in place.** The repo runs
 straight from its extracted directory (`./start`, or `./lykos ...`). The toolchain
@@ -253,104 +256,115 @@ cross-architecture execution (qemu-user), and the coverage-guided and symbolic e
 
 ---
 
-### How it is delivered — one unzip-and-run folder
+### How it is delivered — one extract-and-run package
 
-Build a single self-contained folder on a connected machine, carry the `.zip`, unzip it on the
-offline laptop, and run it in place. No install, nothing written outside the folder.
+Build **one** self-contained package on a connected machine, carry it (one file, or a few
+disc-sized volumes), extract it on the offline laptop with a script that needs only `tar` + `xz`,
+and run it in place. No install, no `setup.sh` step, nothing written outside the folder — the
+`vendor/` tree is already fully populated inside the package.
 
-| Build (connected machine) | Carry | Run on the laptop |
-|---|---|---|
-| `./package` (needs the toolchain bundle) | one `dist/lykos-airgapped-*.zip` | `unzip -o` + `./start` |
+| Build (connected machine) | Carry | Extract on the laptop | Run |
+|---|---|---|---|
+| `make toolchain-bundle` then `./package` | `dist/lykos-offline-<date>-<arch>.*` (the `.tar.xz` **or** its `.part-NN` volumes, plus `.sha256` and `.EXTRACT.sh`) | `sh lykos-offline-*.EXTRACT.sh` | `cd lykos && ./start` |
 
-The folder is fully self-contained for **Python**: it vendors its own interpreter (ABI-matched to
-the pypcode wheel and the engine venvs), so the laptop needs no particular `python3` of its own.
-The one thing it cannot escape is **glibc skew** — the vendored native binaries are linked against
-the build host's glibc — so build it on a base whose glibc is **≤** the laptop's (the oldest you
-must support), or the binaries won't load.
+`./package` wraps `packaging/make-runnable.sh`. It writes an xz-compressed archive and, when the
+archive is larger than one optical disc, **splits it into ≤4600 MiB volumes** (override with
+`LYKOS_SPLIT_MB`) so each fits a 4.7 GB disc, alongside a self-contained `*.EXTRACT.sh` that
+reassembles, verifies the `.sha256`, and extracts — using only `tar` and `xz`, which ship on every
+Kali/Debian base, so the laptop needs nothing bundled to unpack it. (`LYKOS_XZ=-4` trades ratio
+for a faster build when you are iterating; the default `-9` is for the disc you burn.)
+
+The package is self-contained for **Python**: it vendors its own interpreter (ABI-matched to the
+pypcode wheel and the engine venvs), so the laptop needs no particular `python3` of its own.
+
+**Glibc independence (runs on an OLDER laptop than the build host).** The vendored native binaries
+are linked against the build host's glibc, so a bundle built on today's Kali would normally refuse
+to load on a laptop whose glibc is older. The package defeats this: on the **first run**
+(`./lykos …` or `./start`, also after the folder is copied off a disc) the launcher runs
+`packaging/relink-bundle.sh`, which repoints every bundled ELF's interpreter and rpath at the
+bundle's **own** loader and libraries (a static `patchelf` ships for this, since it must run before
+the bundle's glibc is usable). After that one-time relink — a few seconds, stamped so it is a no-op
+afterwards — the tools resolve only the bundle's libraries and the laptop's glibc is never
+consulted. So you still build on a convenient modern machine, and it runs on the older air-gapped
+VM with **no capability loss**. See `relink-bundle.sh` and the "never touches host libraries" note
+below. (A plain `git clone` with no `vendor/toolchain` skips the relink entirely.)
 
 ---
 
-### 1. On a connected machine
+### 1. On a connected machine — build the one package
 
 ```sh
 git clone <lykos> && cd lykos
 make test                       # confirm the repo is sound before packaging anything
-bash packaging/collect-toolchain.sh
-## collects inside a container matching the target distro (Kali rolling by default; needs
-## podman or docker), or pass --target native to collect from an ABI-identical host.
+make toolchain-bundle           # collect engines inside a container matching the target distro
+## (Kali rolling by default; needs podman or docker. Pass --target native to collect from an
+##  ABI-identical host, but prefer the container -- a native collect misses already-installed deps.)
 ## -> dist/lykos-toolchain-<distro>-<date>-<arch>.tar.zst  (+ its sha256)
 
-git archive --format=tar.gz --prefix=lykos/ -o dist/lykos-repo.tar.gz HEAD
-## the repo's tracked files at HEAD, no .git history, no build artifacts. -> dist/lykos-repo.tar.gz
-( cd dist && sha256sum lykos-repo.tar.gz > lykos-repo.tar.gz.sha256 )
+./package                       # fold the working tree + a fully-populated vendor/ into one package
+## -> dist/lykos-offline-<date>-<arch>.tar.xz           (one file if it fits a disc)
+##    dist/lykos-offline-<date>-<arch>.tar.xz.part-NN   (volumes, if larger than one disc)
+##    dist/lykos-offline-<date>-<arch>.sha256           (checksums)
+##    dist/lykos-offline-<date>-<arch>.EXTRACT.sh       (reassemble + verify + extract script)
 ```
 
-`make repo-tarball` runs both lines above; `make toolchain-bundle` runs the collector. The
-toolchain collector prints the bundle's sha256 for you; the `git archive` line does not, so the
-`repo-tarball` target cuts the repo tarball's checksum for you as shown.
+`./package` (a thin wrapper over `packaging/make-runnable.sh`) snapshots the **working tree**, not
+`HEAD` — so uncommitted fixes ship — and bakes the collected toolchain into `vendor/` so the
+package is complete with no later placement step. It reuses the newest
+`dist/lykos-toolchain-*.tar.zst`, so re-cut a package after a code change without re-collecting the
+toolchain (which almost never changes). The optional heavy extras — the cross-compilers, LLVM,
+MinGW, Node — ride along only when you pass `LYKOS_FULL=1`; the default package already runs every
+stage for the common host-arch workflow.
 
-Both tarballs are written to `dist/`, which is **gitignored** — they are build artifacts, never
-committed to the repo. They travel to the offline side by sneakernet, not by `git`. The repo
-tarball is a point-in-time snapshot with no history: it runs in place but cannot `git log`, diff,
-or pull updates. Carry a `git bundle` instead (`git bundle create dist/lykos.bundle --all`) only
-if you need version control on the far side.
+Everything is written to `dist/`, which is **gitignored** — build artifacts, never committed, carried
+by sneakernet. Burn (or copy) **everything named `lykos-offline-<date>-<arch>.*`**: the `.tar.xz`
+*or* all its `.part-NN` volumes, the `.sha256`, and the `.EXTRACT.sh`.
 
-The collector takes its package list from `lykos.toolchain` — the same table `lykos doctor`
-reports and this document describes — so a tool cannot be added in one place and forgotten in
-the others.
+**Lean alternative (two tarballs).** If you would rather carry the ~1 MB repo and the ~1.5 GB
+toolchain separately — e.g. you re-cut the repo often — `make repo-tarball` writes
+`dist/lykos-repo.tar.gz` and the toolchain bundle is placed on the far side by its own `setup.sh`
+(`LYKOS_ROOT=$PWD /tmp/lt/setup.sh`, which verifies the manifest and copies `toolchain/` under
+`vendor/`). The combined `./package` output above is the recommended path; this one trades a larger
+re-carry for a smaller repo refresh.
 
-Carry both tarballs to the offline side, **each with the sha256 you printed** (verify them on
-arrival, not just on departure — the point of the checksum is the journey):
+### 2. On the offline workstation — extract and run
 
-* `lykos-toolchain-<distro>-<date>-<arch>.tar.zst`
-* `lykos-repo.tar.gz`
-
-### 2. On the offline workstation
+Copy all the package files off the disc(s) into **one empty, writable** directory (not the
+read-only disc), then:
 
 ```sh
-tar xzf lykos-repo.tar.gz                   # creates ./lykos/
+sh lykos-offline-<date>-<arch>.EXTRACT.sh   # verifies .sha256, reassembles volumes, extracts ./lykos/
+                                            # needs only tar + xz (present on every Kali/Debian)
 cd lykos
-./lykos doctor     # what works right now, before the toolchain is placed
+./lykos doctor                              # FIRST run self-relinks the bundled tools (a few seconds)
 ```
 
-Then the toolchain. Nothing is installed: `setup.sh` places the extracted tree under the
-repo's `vendor/` and lykos runs it from there.
+Nothing is installed and nothing is written outside `./lykos`. The first `./lykos` (or `./start`)
+invocation runs `packaging/relink-bundle.sh` once — repointing the bundled binaries at the bundle's
+own glibc so they load on this (older) laptop — then stamps it done. `doctor` prints what this host
+can now do; a tool it still names as missing is a bundle gap, not an environment problem.
+
+### 3. Start the console
 
 ```sh
-mkdir -p /tmp/lt && tar xf lykos-toolchain-*.tar.zst -C /tmp/lt
-/tmp/lt/setup.sh --verify-only              # checksums only, places nothing
-LYKOS_ROOT=$PWD /tmp/lt/setup.sh            # verifies, places under vendor/, then re-runs doctor
+./start                                     # local server, loopback only -> http://127.0.0.1:8787
 ```
 
-`setup.sh` verifies before it places anything: every file the manifest lists must match its
-hash, **and** the set of files in the bundle must equal the set the manifest names — an
-unlisted file (one an attacker added to ride along when the `toolchain/` tree is copied) is
-refused, not placed. It uses no `sudo` and no package manager; it copies `toolchain/` to
-`vendor/toolchain`, the `angr`/`unicorn` venvs to `vendor/`, and (only if the collect image
-packaged the optional Ghidra) Ghidra to `vendor/ghidra`, then finishes by printing the capability
-report — so the outcome is a list of what you can now do, not a claim that it worked.
+`./start` (or `./RUN.sh`) brings up the web UI; `./lykos analyze <binary> --budget 600` runs the
+same pipeline from the shell. Both use the bundle's own vendored Python — the laptop needs no
+`python3` of its own.
 
-If you extract the bundle directly at `<repo>/vendor` (rename the extracted directory to
-`vendor`), even `setup.sh` is optional: lykos finds `vendor/toolchain` on its own. `setup.sh`
-is still worth running, because it repoints the venvs at this host's `python3` and runs the
-verification. Point lykos at a toolchain in a non-default location with `LYKOS_VENDOR=<dir>`
-or `LYKOS_TOOLCHAIN=<dir>/toolchain`.
-
-The manifest (`SHA256SUMS`) is **unsigned**: it proves the bundle arrived un-corrupted and
-un-added-to, not that it is authentic. An attacker who can rewrite the whole bundle can rewrite
-the manifest to match, so carry the bundle over a trusted channel. (Future step: sign
-`SHA256SUMS` and verify the signature here.)
-
-### 3. Confirm
+### 4. Confirm (optional, on a machine with the quality gate)
 
 ```sh
 ./lykos doctor --strict   # exit 1 if a REQUIRED tool is missing
-make test                                          # stages whose tool is absent skip, and say so
-make release                                       # the full quality gate, ~25 min
+make test                 # stages whose tool is absent skip, and say so
 ```
 
-`make test` skipping is the designed behaviour, not a gap: a stage whose engine is absent
-declines with a reason. `lykos doctor` is how you tell the two apart.
+`make test` skipping is the designed behaviour, not a gap: a stage whose engine is absent declines
+with a reason. `lykos doctor` is how you tell the two apart. The bundle's `SHA256SUMS`/`.sha256`
+manifests are **unsigned** — they prove the package arrived un-corrupted and un-added-to, not that
+it is authentic — so carry it over a trusted channel.
 
 ---
 
@@ -373,7 +387,7 @@ The table below is the same data, for planning before you build the bundle.
 | optional | afl-qemu-trace (per guest) | `coverage_fuzz` on a non-host architecture | declines for those guests, and prints the build command |
 | optional | JDK / Java | building and running JAR targets | Java targets analyse statically but cannot execute |
 | optional | Wine | PE execution, behaviour trace, Win32 monitor | PE analyses statically; `synthesize_poc` still derives an overflow from the frame |
-| optional | cross compilers | the architecture gate's fixtures | `make arch-gate` covers fewer architectures. **Not shipped in the `./package` bundle** — the pipeline compiles source only natively and *executes* foreign-arch binaries under qemu-user (which stays, with each arch's runtime libs), so it never cross-compiles; only the arch-gate self-test needs them |
+| optional | cross compilers | the architecture gate's fixtures | `make arch-gate` covers fewer architectures. **Not in the default `./package` bundle; add with `LYKOS_FULL=1 ./package`** — the pipeline compiles source only natively and *executes* foreign-arch binaries under qemu-user (which stays, with each arch's runtime libs), so it never cross-compiles; only the arch-gate self-test needs them, so the default package omits them and `LYKOS_FULL=1` folds them (plus LLVM, MinGW, Node) back in |
 | optional | angr / SymQEMU | `concolic` | the stage declines |
 | optional | Unicorn | `firmware_rehost` | declines; carving and headerless ID still work |
 | optional | Node.js | `make gui` harnesses | that target fails; the UI is unaffected |

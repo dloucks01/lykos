@@ -1,7 +1,9 @@
 #!/bin/sh
-# package -- build the ONE unzip-and-run offline folder (a single .zip: the repo + a fully
-# populated vendor/ of engines, no install). Run this on a CONNECTED build machine; carry the
-# resulting dist/lykos-offline-*.zip to the offline laptop, unzip, and ./start.
+# package -- build the ONE extract-and-run offline package (the repo + a fully populated vendor/
+# of engines, no install). Run this on a CONNECTED build machine; it writes an xz-compressed
+# dist/lykos-offline-<date>-<arch>.tar.xz (split into disc-sized .part-NN volumes when larger than
+# one disc) plus a self-contained .EXTRACT.sh and .sha256. Carry them to the offline laptop, run
+# `sh lykos-offline-*.EXTRACT.sh` (needs only tar + xz), then `cd lykos && ./start`.
 # Prerequisite: an offline toolchain bundle in dist/ (build it with: make toolchain-bundle).
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 exec bash "$here/packaging/make-runnable.sh" "$@"
