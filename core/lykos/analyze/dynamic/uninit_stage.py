@@ -238,7 +238,7 @@ def mem_oracle_stage(ctx) -> dict:
         tried.append({"input_sha": sha, "mode": mode})
         ctx.progress(msg=f"memcheck under {mode} ({len(tried)}/{_MAX_RUNS})")
         verdict = memoracle.valgrind_triage(exe, data, mode=mode, base_argv=argv,
-                                            timeout=timeout)
+                                            timeout=timeout, ctx=ctx)
         if not verdict or verdict["kind"] in seen:
             continue
         seen.add(verdict["kind"])

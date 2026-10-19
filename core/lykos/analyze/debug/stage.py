@@ -412,7 +412,7 @@ def root_cause_stage(ctx) -> dict:
             try:
                 from ..dynamic import memoracle
                 vg = memoracle.valgrind_triage(exe, input_bytes, mode=mode, base_argv=base_argv,
-                                               timeout=min(120.0, max(30.0, timeout * 12)))
+                                               timeout=min(120.0, max(30.0, timeout * 12)), ctx=ctx)
             except Exception:
                 observe.absorbed(_log, "keeping the default")
                 vg = None

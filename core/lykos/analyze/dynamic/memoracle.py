@@ -30,6 +30,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -333,7 +334,8 @@ def parse_memcheck(stderr: bytes) -> Optional[dict]:
 
 
 def valgrind_triage(exe, data: bytes, *, mode: str = "stdin", base_argv=(),
-                    timeout: float = 60.0, input_path: Optional[str] = None) -> Optional[dict]:
+                    timeout: float = 60.0, input_path: Optional[str] = None,
+                    ctx=None) -> Optional[dict]:
     """Run one input under Valgrind memcheck and classify the memory error, or None.
 
     `mode` mirrors the sandbox: ``stdin`` feeds ``data`` on stdin; ``file`` writes it to a temp file
@@ -372,10 +374,18 @@ def valgrind_triage(exe, data: bytes, *, mode: str = "stdin", base_argv=(),
         cmd = [vg, "--error-exitcode=0", "--exit-on-first-error=no",
                "--leak-check=summary", "--errors-for-leak-kinds=definite",
                "--track-origins=yes", "-q", *argv]
+        _t0 = time.time()
         try:
             r = subprocess.run(cmd, input=stdin_data, capture_output=True, timeout=timeout)
         except (OSError, subprocess.SubprocessError):
             return None
+        # Surface the valgrind command + its memcheck summary in the live tool-command console
+        # (valgrind feeds the target's stdin, so it runs its own subprocess, not ctx.run_subprocess).
+        if ctx is not None:
+            try:
+                ctx.record_exec(cmd, start=_t0, rc=r.returncode, out=r.stdout, err=r.stderr)
+            except Exception:
+                pass
         verdict = parse_memcheck(r.stderr or b"")
         if verdict is not None:
             verdict["via"] = "valgrind"

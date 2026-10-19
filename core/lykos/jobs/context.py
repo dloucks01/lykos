@@ -234,6 +234,14 @@ class JobContext:
         except Exception:                                    # noqa: BLE001
             pass
 
+    def record_exec(self, cmd: Sequence[str], *, start: float, rc: int | None = None,
+                    out: bytes = b"", err: bytes = b"", note: str | None = None) -> None:
+        """Publish a 'job.exec' console event for a tool a stage ran through its OWN subprocess
+        (not run_subprocess) -- e.g. valgrind, which must feed the target's stdin and so cannot use
+        the managed runner. `start` is time.time() captured just before the tool launched. This is
+        how such a tool still shows up in the live tool-command console. Best-effort."""
+        self._emit_exec(cmd, start, rc=rc, out=out, err=err, note=note)
+
     @staticmethod
     def _kill_group(proc: subprocess.Popen) -> None:
         try:
