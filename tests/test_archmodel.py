@@ -10,7 +10,14 @@ from lykos.analyze.poc import archmodel
 
 
 def test_registry_covers_the_shipped_arches():
-    assert set(archmodel.MODELS) == {"aarch64", "arm", "riscv64", "ppc64", "loongarch"}
+    assert set(archmodel.MODELS) == {"aarch64", "arm", "riscv64", "ppc64", "loongarch", "s390"}
+
+
+def test_s390_is_big_endian_with_r2_arg():
+    m = archmodel.model_for("s390")
+    assert m is archmodel.model_for("s390x") and m.endian == "big" and m.arg0_reg == "r2"
+    assert m.slug == "s390x-ret2libc"
+    assert m.pack(0x1000f04) == b"\x00\x00\x00\x00\x01\x00\x0f\x04"      # big-endian address
 
 
 def test_model_for_resolves_aliases():
@@ -25,7 +32,7 @@ def test_model_for_resolves_aliases():
     assert archmodel.model_for("loongarch64") is archmodel.MODELS["loongarch"]
     assert archmodel.model_for("loongarch").slug == "loongarch64-ret2libc"
     assert archmodel.model_for("ARM") is archmodel.MODELS["arm"]     # case-insensitive
-    assert archmodel.model_for("s390") is None
+    assert archmodel.model_for("mips") is None                       # not yet a shipped model
     assert archmodel.model_for(None) is None
 
 

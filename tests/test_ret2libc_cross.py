@@ -20,6 +20,8 @@ _ARM_GCC = shutil.which("arm-linux-gnueabihf-gcc")
 _ARM_QEMU = shutil.which("qemu-arm") or shutil.which("qemu-arm-static")
 _LA_GCC = shutil.which("loongarch64-linux-gnu-gcc")
 _LA_QEMU = shutil.which("qemu-loongarch64") or shutil.which("qemu-loongarch64-static")
+_SZ_GCC = shutil.which("s390x-linux-gnu-gcc")
+_SZ_QEMU = shutil.which("qemu-s390x") or shutil.which("qemu-s390x-static")
 
 
 def _one_seg(seg, va=0x10000):
@@ -126,6 +128,27 @@ def test_find_loongarch64_gadgets_decodes_caller_and_loader():
     assert ld["regs"][23] == 8 and ld["regs"][24] == 0 and ld["raoff"] == 24 and ld["spadj"] == 32
 
 
+def test_find_s390x_gadgets_decodes_lgr_r2_then_branch():
+    """The s390x scanner finds `lgr %r2, %rS` immediately followed by a register branch (basr/br),
+    recording src and the branch register; a `lgr %r3,..` (not r2) is not a caller. Big-endian,
+    variable-length; byte-decoded (host objdump cannot disassemble s390x), verified against binutils."""
+    seg = bytes.fromhex("b9040029"   # lgr  %r2, %r9
+                        "0dea"       # basr %r14, %r10    -> caller (src=9, br=10)
+                        "b904002b"   # lgr  %r2, %r11
+                        "07fc"       # br   %r12          -> caller (src=11, br=12)
+                        "b9040039"   # lgr  %r3, %r9      (destination r3, not r2 -> not a caller)
+                        "0dea")      # basr %r14, %r10
+    orig = rop._loads
+    rop._loads = lambda data: [(0, len(seg), 0x1000000, 1)]
+    try:
+        g = rop.find_s390x_r2libc_gadgets(seg)
+    finally:
+        rop._loads = orig
+    pairs = {(c["src"], c["br"]) for c in g["callers"]}
+    assert (9, 10) in pairs and (11, 12) in pairs
+    assert len(g["callers"]) == 2                        # the lgr %r3 pair is correctly excluded
+
+
 @pytest.mark.skipif(not (_RV_GCC and _RV_QEMU), reason="needs riscv64-linux-gnu-gcc + qemu-riscv64")
 def test_auto_files_l3_riscv64_ret2libc(store, tmp_path):
     """strategy=auto drives an NX-on RISC-V 64 stack overflow to a confirmed L3 ret2libc: an epilogue
@@ -173,6 +196,18 @@ def test_auto_files_l3_loongarch64_ret2libc(store, tmp_path):
     archmodel abstraction -- a gadget finder (rop.find_loongarch64_r2libc_gadgets) + a MODELS row +
     a candidate generator, no new confirm/file tail."""
     _run_cross_e2e(store, tmp_path, _LA_GCC, "loongarch", "loongarch64-ret2libc")
+
+
+@pytest.mark.skipif(not (_SZ_GCC and _SZ_QEMU),
+                    reason="needs s390x-linux-gnu-gcc + qemu-s390x")
+def test_auto_files_l3_s390x_ret2libc(store, tmp_path):
+    """strategy=auto drives an NX-on s390x (big-endian) overflow to a confirmed L3 ret2libc: the
+    vulnerable frame's lmg restores callee-saved regs + the saved LR (r14), pointed at a
+    `lgr r2,rS ; basr r14,rB` caller -> system("/bin/sh"); confirmed by a spawned shell under
+    qemu-user + a negative control. The first big-endian ISA through the archmodel abstraction --
+    it exercises ArchModel.pack's big-endian path and the payload-truncation that preserves the
+    prologue-saved stack pointer (lmg restores r15)."""
+    _run_cross_e2e(store, tmp_path, _SZ_GCC, "s390", "s390x-ret2libc")
 
 
 # A vulnerable program whose `vuln` keeps several values live ACROSS the overflowing read(), forcing

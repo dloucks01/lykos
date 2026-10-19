@@ -1124,6 +1124,47 @@ def find_loongarch64_r2libc_gadgets(data: bytes) -> dict:
     return {"callers": callers, "loaders": loaders}
 
 
+# ---------------------------------------------------------------- s390x (IBM Z) ret2libc gadgets
+def _s390_decode(data: bytes, p: int):
+    """Decode the s390x (z/Architecture) instructions a ret2libc caller cares about, at byte `p`.
+    Returns (op, a, b, ilen): op in {lgr, basr, br} or None; for `lgr` a=rd/b=rs, for basr/br b=the
+    branch-target register. `ilen` is the instruction length, always valid so the stream can advance
+    (s390 is variable-length: the top two bits of the first byte give 2/4/4/6). Big-endian; host
+    objdump cannot disassemble s390x. Encodings verified against binutils gas/objdump."""
+    b0 = data[p]
+    ilen = (2, 4, 4, 6)[b0 >> 6]
+    if b0 == 0xB9:                                        # RRE (4 bytes); B904 == lgr rd, rs
+        if p + 4 <= len(data) and data[p + 1] == 0x04 and data[p + 2] == 0x00:
+            return ("lgr", data[p + 3] >> 4, data[p + 3] & 0xF, 4)
+        return (None, 0, 0, 4)
+    if b0 == 0x0D and p + 2 <= len(data):                # RR; basr rA, rB -> call rB (save ret in rA)
+        return ("basr", data[p + 1] >> 4, data[p + 1] & 0xF, 2)
+    if b0 == 0x07 and p + 2 <= len(data) and (data[p + 1] >> 4) == 0xF:
+        return ("br", 0, data[p + 1] & 0xF, 2)           # bcr 15, rB == br rB (unconditional)
+    return (None, 0, 0, ilen)
+
+
+def find_s390x_r2libc_gadgets(data: bytes) -> dict:
+    """s390x caller gadgets: `lgr %r2, %rS ; (basr %r?,%rB | br %rB)` -- set the first argument (r2)
+    from a controllable GPR, then branch to another. The vulnerable frame's own `lmg` epilogue is the
+    loader (it restores r9..r15 off the overflow); WHICH offset controls which GPR is discovered at
+    runtime by a tagged detonation (as for PowerPC64), so this returns only the callers. Returns
+    {"callers":[{va,src,br}]} (register numbers). Big-endian; host objdump cannot disassemble s390x."""
+    callers = []
+    for off, sz, va, flags in _loads(data):
+        if not (flags & 1):
+            continue
+        p, end = off, off + sz
+        while p < end:
+            op, a, b, ln = _s390_decode(data, p)
+            if op == "lgr" and a == 2:                   # lgr %r2, %rS
+                n = _s390_decode(data, p + ln) if p + ln < end else (None, 0, 0, 0)
+                if n[0] in ("basr", "br"):
+                    callers.append({"va": va + (p - off), "src": b, "br": n[2]})
+            p += ln or 2
+    return {"callers": callers}
+
+
 # ---------------------------------------------------------------- PowerPC64 (ELFv2) ret2libc gadgets
 # PPC64 callee-saved GPRs are r14..r31 -- the registers a function epilogue restores from its frame,
 # hence the ones a stack overflow of that frame can control.
