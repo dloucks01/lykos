@@ -82,6 +82,23 @@ fi
 # engine venvs: keep their ORIGINAL pyvenv.cfg -- they were built for the TARGET distro's
 # Python (the bundle is distro-locked), not this build host's.
 for v in "$BUN"/venvs/*-venv; do [ -d "$v" ] && cp -a "$v" "$V/$(basename "$v")"; done
+# SAFETY NET: angr 10.x dropped claripy from its dependencies, so a venv built with `pip install
+# angr` lacks it and lykos's concolic engine (angr_driver imports claripy) fails. claripy is pure
+# Python (its solver, z3, is already vendored), so install it straight into the venv's site-packages
+# with the build host's pip -- it needs no compiled extension and nothing to relink. A no-op when it
+# is already present. The collect pip spec also now requests claripy, so fresh bundles carry it.
+for av in "$V"/angr-venv; do
+  [ -d "$av" ] || continue
+  sp="$(ls -d "$av"/lib/python*/site-packages 2>/dev/null | head -1)"
+  [ -n "$sp" ] || continue
+  if [ ! -d "$sp/claripy" ]; then
+    if python3 -m pip install --quiet --target "$sp" claripy >/dev/null 2>&1; then
+      echo "  angr venv: installed missing claripy into $(basename "$av")"
+    else
+      echo "  WARNING: angr venv lacks claripy and it could not be installed -- concolic (angr) will be unavailable"
+    fi
+  fi
+done
 # vendored Python site (pypcode) -> vendor/pysite (lykos puts it on sys.path)
 [ -d "$BUN/pysite" ] && [ -n "$(ls -A "$BUN/pysite" 2>/dev/null)" ] && cp -a "$BUN/pysite" "$V/pysite"
 # non-apt engines staged under extras/

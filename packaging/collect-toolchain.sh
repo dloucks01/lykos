@@ -138,7 +138,7 @@ if [ -z "$(find /stage/toolchain -iname "rizin" -o -iname "rz-ghidra*" 2>/dev/nu
 fi
 
 say "python venvs (this distro s interpreter)"
-for spec in "angr:angr" "unicorn:unicorn keystone-engine"; do
+for spec in "angr:angr claripy" "unicorn:unicorn keystone-engine"; do
   name="${spec%%:*}"; want="${spec#*:}"
   python3 -m venv "/stage/venvs/$name-venv" >/dev/null 2>&1 || continue
   "/stage/venvs/$name-venv/bin/pip" install -q --upgrade pip >/dev/null 2>&1 || true

@@ -41,7 +41,7 @@ say "non-apt tools"
 PYTHONPATH="$ROOT/core" python3 "$ROOT/packaging/_bundle_extras.py" "$WORK/extras"
 
 say "python venvs"
-for spec in "angr:angr" "unicorn:unicorn keystone-engine"; do
+for spec in "angr:angr claripy" "unicorn:unicorn keystone-engine"; do
   name="${spec%%:*}"; want="${spec#*:}"
   python3 -m venv "$WORK/venvs/$name-venv" 2>/dev/null || continue
   if "$WORK/venvs/$name-venv/bin/pip" install --quiet $want >/dev/null 2>&1; then
