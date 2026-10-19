@@ -450,9 +450,66 @@ def guard_page_env(base_env, *, exe, arch, host, sanitizer: bool):
     return (env, True) if env is not None else (base_env, False)
 
 
-#: An ELF SHARED OBJECT is not a program: ET_DYN, no program interpreter, and an entry point of
-#: zero. A PIE executable is also ET_DYN, which is why the type alone decides nothing -- it has
-#: a PT_INTERP and a real entry point.
+def _has_df_1_pie(exe) -> bool:
+    """True if the ELF declares DF_1_PIE (0x08000000) in its DT_FLAGS_1 dynamic entry.
+
+    The linker sets DF_1_PIE on position-independent EXECUTABLES -- including static-PIE ones,
+    which have NO PT_INTERP -- and never on a shared library. file(1) reads exactly this bit to
+    tell a "pie executable" from a "shared object" when both are ET_DYN without an interpreter.
+    We use it so a static-PIE is not mistaken for a non-runnable library.
+    """
+    try:
+        with open(exe, "rb") as fh:
+            head = fh.read(64)
+            if head[:4] != b"\x7fELF" or len(head) < 64:
+                return False
+            is64 = head[4] == 2
+            en = "<" if head[5] == 1 else ">"              # EI_DATA: 1=LE, 2=BE
+            if is64:
+                phoff = struct.unpack_from(en + "Q", head, 0x20)[0]
+                phentsize, phnum = struct.unpack_from(en + "HH", head, 0x36)
+            else:
+                phoff = struct.unpack_from(en + "I", head, 0x1C)[0]
+                phentsize, phnum = struct.unpack_from(en + "HH", head, 0x2A)
+            dyn_off = dyn_sz = 0
+            for i in range(min(phnum, 128)):
+                fh.seek(phoff + i * phentsize)
+                ph = fh.read(phentsize)
+                if len(ph) < phentsize or struct.unpack_from(en + "I", ph, 0)[0] != 2:
+                    continue                               # not PT_DYNAMIC
+                if is64:
+                    dyn_off, dyn_sz = struct.unpack_from(en + "QQ", ph, 8)[0], \
+                        struct.unpack_from(en + "Q", ph, 32)[0]
+                else:
+                    dyn_off, dyn_sz = struct.unpack_from(en + "I", ph, 4)[0], \
+                        struct.unpack_from(en + "I", ph, 16)[0]
+                break
+            if not dyn_sz:
+                return False
+            fh.seek(dyn_off)
+            dyn = fh.read(min(dyn_sz, 1 << 16))
+            step = 16 if is64 else 8
+            fmt = en + ("Q" if is64 else "I")              # d_tag, d_val (read both unsigned)
+            vshift = 8 if is64 else 4
+            DT_NULL, DT_FLAGS_1, DF_1_PIE = 0, 0x6FFFFFFB, 0x08000000
+            for off in range(0, len(dyn) - step + 1, step):
+                tag = struct.unpack_from(fmt, dyn, off)[0]
+                if tag == DT_NULL:
+                    break
+                if tag == DT_FLAGS_1:
+                    return bool(struct.unpack_from(fmt, dyn, off + vshift)[0] & DF_1_PIE)
+    except Exception:                                      # noqa: BLE001 -- unreadable/odd ELF
+        return False
+    return False
+
+
+#: An ELF SHARED OBJECT is not a program: ET_DYN with no program interpreter. A PIE executable is
+#: also ET_DYN, which is why the type alone decides nothing -- a normal PIE carries a PT_INTERP
+#: (the dynamic loader) that a library does not, and a static-PIE carries DF_1_PIE. The ENTRY POINT
+#: is NOT a discriminator: many distros (Debian's libz.so.1 among them) link a library with a
+#: nonzero entry stub, so an earlier `entry == 0` test wrongly let those through to be executed as
+#: programs -- fabricating a confirmed-critical CWE on stock system libraries. The only runnable
+#: ET_DYN-without-PT_INTERP is a static-PIE executable, carved out here by DF_1_PIE as file(1) does.
 #:
 #: MEASURED on json-c 0.13.1, and it fabricated the worst finding this tool can emit. The cmake
 #: build produces no executables, so `source_project.build_source_project` fell back to
@@ -478,9 +535,9 @@ def _is_elf_shared_object(exe) -> bool:
     en = "little" if head[5] == 1 else "big"
     if int.from_bytes(head[16:18], en) != 3:              # not ET_DYN -> not a library
         return False
-    entry = int.from_bytes(head[24:32], en) if head[4] == 2 \
-        else int.from_bytes(head[24:28], en)
-    return entry == 0 and not _interp_of(exe)
+    # ET_DYN: a shared library UNLESS it is runnable -- a normal PIE (has PT_INTERP) or a
+    # static-PIE executable (DF_1_PIE). The entry point is irrelevant: libraries may carry a stub.
+    return not _interp_of(exe) and not _has_df_1_pie(exe)
 
 
 def classify_rc(rc: Optional[int]):

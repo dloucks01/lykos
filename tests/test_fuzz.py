@@ -752,3 +752,44 @@ def test_the_bare_env_runner_backstops_a_shared_object():
     assert "_is_elf_shared_object" in src
     head = src[:src.index("_is_elf_shared_object")]
     assert "Popen" not in head, "the guard must come before the subprocess is spawned"
+
+
+def test_a_shared_object_with_a_nonzero_entry_point_is_still_refused(gcc, tmp_path):
+    """The REGRESSION that shipped: the guard keyed on `entry == 0`, but Debian (and others) link
+    a shared library with a NONZERO entry stub -- e.g. libz.so.1 at 0x3310. Such a library slipped
+    past the guard, was executed as a PIE, faulted in the loader, and was filed as a confirmed
+    critical CWE on a stock system library. The discriminator is ET_DYN + no PT_INTERP (a PIE has
+    an interpreter; a static-PIE carries DF_1_PIE); the entry point is irrelevant."""
+    from lykos.analyze.dynamic import sandbox
+    so = tmp_path / "libentry.so"
+    c = tmp_path / "e.c"; c.write_text("int f(int x){ return x + 1; }\n")
+    if subprocess.run([gcc, "-shared", "-fPIC", "-O0", str(c), "-o", str(so)],
+                      capture_output=True).returncode != 0:
+        pytest.skip("build failed")
+    # Force a nonzero e_entry, exactly as a Debian-style .so carries, without depending on the
+    # toolchain default: patch the ELF header's entry field in place.
+    data = bytearray(so.read_bytes())
+    is64 = data[4] == 2
+    en = "little" if data[5] == 1 else "big"
+    off, size = (24, 8) if is64 else (24, 4)
+    data[off:off + size] = (0x3310).to_bytes(size, en)      # a nonzero entry, like libz.so.1
+    so.write_bytes(bytes(data))
+    assert not sandbox._interp_of(so), "a shared object has no PT_INTERP"
+    assert sandbox._is_elf_shared_object(so), \
+        "a shared object with a nonzero entry stub must still be refused (the libz regression)"
+
+
+def test_a_static_pie_executable_is_not_mistaken_for_a_library(gcc, tmp_path):
+    """The one runnable ET_DYN-without-PT_INTERP: a static-PIE executable, marked DF_1_PIE. The
+    guard must NOT refuse it, or we would decline to fuzz a legitimate program. file(1) reads the
+    same bit to tell a 'pie executable' from a 'shared object'."""
+    from lykos.analyze.dynamic import sandbox
+    exe = tmp_path / "sp"
+    c = tmp_path / "m.c"; c.write_text("int main(void){ return 0; }\n")
+    if subprocess.run([gcc, "-static-pie", "-fPIE", str(c), "-o", str(exe)],
+                      capture_output=True).returncode != 0:
+        pytest.skip("static-pie unsupported by this toolchain")
+    assert not sandbox._interp_of(exe), "a static-PIE has no PT_INTERP"
+    assert sandbox._has_df_1_pie(exe), "a static-PIE must carry DF_1_PIE"
+    assert not sandbox._is_elf_shared_object(exe), \
+        "a static-PIE executable must be runnable, not refused as a library"
