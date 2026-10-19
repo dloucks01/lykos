@@ -10,7 +10,14 @@ from lykos.analyze.poc import archmodel
 
 
 def test_registry_covers_the_shipped_arches():
-    assert set(archmodel.MODELS) == {"aarch64", "arm", "riscv64", "ppc64", "loongarch", "s390"}
+    assert set(archmodel.MODELS) == {"aarch64", "arm", "riscv64", "ppc64", "loongarch", "s390", "ppc"}
+
+
+def test_ppc32_is_32bit_big_endian():
+    m = archmodel.model_for("ppc")
+    assert m is archmodel.model_for("powerpc") and m.word == 4 and m.endian == "big"
+    assert m.arg0_reg == "r3" and m.slug == "ppc32-ret2libc"
+    assert m.pack(0x10001d00) == b"\x10\x00\x1d\x00"                  # 4-byte big-endian address
 
 
 def test_s390_is_big_endian_with_r2_arg():

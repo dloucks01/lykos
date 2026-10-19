@@ -22,6 +22,8 @@ _LA_GCC = shutil.which("loongarch64-linux-gnu-gcc")
 _LA_QEMU = shutil.which("qemu-loongarch64") or shutil.which("qemu-loongarch64-static")
 _SZ_GCC = shutil.which("s390x-linux-gnu-gcc")
 _SZ_QEMU = shutil.which("qemu-s390x") or shutil.which("qemu-s390x-static")
+_PPC32_GCC = shutil.which("powerpc-linux-gnu-gcc")
+_PPC32_QEMU = shutil.which("qemu-ppc") or shutil.which("qemu-ppc-static")
 
 
 def _one_seg(seg, va=0x10000):
@@ -149,6 +151,27 @@ def test_find_s390x_gadgets_decodes_lgr_r2_then_branch():
     assert len(g["callers"]) == 2                        # the lgr %r3 pair is correctly excluded
 
 
+def test_find_ppc_gadgets_be_clean_selection():
+    """The PowerPC finder in big-endian/clean mode accepts `mtctr rC ; mr r3,rT ; bctr` with both
+    callee-saved, and REJECTS a tail where an instruction between `mr r3` and bctr clobbers r3
+    (common on ppc32). Byte-decoded big-endian; host objdump cannot disassemble PPC; encodings
+    verified against binutils gas."""
+    clean = struct.pack(">III", 0x7FC903A6, 0x7FE3FB78, 0x4E800420)   # mtctr r30; mr r3,r31; bctr
+    dirty = struct.pack(">IIII", 0x7FC903A6, 0x7FE3FB78,              # mtctr r30; mr r3,r31;
+                        0x38630001, 0x4E800420)                       # addi r3,r3,1 (clobbers r3!); bctr
+
+    def run(seg):
+        orig = rop._loads
+        rop._loads = lambda data: [(0, len(seg), 0x10000000, 1)]
+        try:
+            return rop.find_ppc64_r2libc_gadgets(seg, endian="big")["callers"]
+        finally:
+            rop._loads = orig
+    c = run(clean)
+    assert any(x["va"] == 0x10000000 and x["ctr"] == 30 and x["arg"] == 31 for x in c)
+    assert run(dirty) == []                              # the r3-clobbering tail is not a usable gadget
+
+
 @pytest.mark.skipif(not (_RV_GCC and _RV_QEMU), reason="needs riscv64-linux-gnu-gcc + qemu-riscv64")
 def test_auto_files_l3_riscv64_ret2libc(store, tmp_path):
     """strategy=auto drives an NX-on RISC-V 64 stack overflow to a confirmed L3 ret2libc: an epilogue
@@ -208,6 +231,16 @@ def test_auto_files_l3_s390x_ret2libc(store, tmp_path):
     it exercises ArchModel.pack's big-endian path and the payload-truncation that preserves the
     prologue-saved stack pointer (lmg restores r15)."""
     _run_cross_e2e(store, tmp_path, _SZ_GCC, "s390", "s390x-ret2libc")
+
+
+@pytest.mark.skipif(not (_PPC32_GCC and _PPC32_QEMU),
+                    reason="needs powerpc-linux-gnu-gcc + qemu-ppc")
+def test_auto_files_l3_ppc32_ret2libc(store, tmp_path):
+    """strategy=auto drives an NX-on PowerPC 32-bit (ELF32, big-endian) overflow to a confirmed L3
+    ret2libc: the saved lr -> a clean `mtctr rC ; mr r3,rT ; bctr` caller -> system("/bin/sh");
+    confirmed by a spawned shell under qemu-user + a negative control. The first 32-bit big-endian
+    ISA through the archmodel abstraction (4-byte-slot tag discovery + clean PPC gadget selection)."""
+    _run_cross_e2e(store, tmp_path, _PPC32_GCC, "ppc", "ppc32-ret2libc")
 
 
 # A vulnerable program whose `vuln` keeps several values live ACROSS the overflowing read(), forcing

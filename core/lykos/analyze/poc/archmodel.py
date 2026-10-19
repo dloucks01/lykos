@@ -62,11 +62,14 @@ MODELS: dict[str, ArchModel] = {
     # s390x (IBM Z) -- the first BIG-ENDIAN model, exercising ArchModel.pack's big-endian path.
     # Its first argument register is r2, and its link register is r14 (saved on the stack).
     "s390": ArchModel("s390", 8, "big", "r2", "r2", "s390x", "s390x-ret2libc"),
+    # PowerPC 32-bit (ELF32, big-endian) -- the first 32-bit big-endian model (word=4). Its first
+    # argument register is r3, and its link register is lr (saved on the stack).
+    "ppc": ArchModel("ppc", 4, "big", "r3", "r3", "PowerPC32", "ppc32-ret2libc"),
 }
 
 #: arch aliases that map onto a MODELS key (mirrors the arch gates in exploit_stage).
 _ALIASES = {"arm64": "aarch64", "riscv": "riscv64", "ppc64le": "ppc64", "powerpc64": "ppc64",
-            "loongarch64": "loongarch", "s390x": "s390"}
+            "loongarch64": "loongarch", "s390x": "s390", "powerpc": "ppc"}
 
 
 def model_for(arch: Optional[str]) -> Optional[ArchModel]:
