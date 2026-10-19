@@ -164,8 +164,14 @@ def _run_cross_e2e(store, tmp_path, gcc, arch_name, exploit_name, opt="-O1", ext
     src = tmp_path / "v.c"
     src.write_text(_SRC)
     exe = tmp_path / "v"
-    cmd = [gcc, opt, "-fno-stack-protector", "-no-pie", "-static", "-w",
-           *extra, str(src), "-o", str(exe)]
+    # Disable _FORTIFY_SOURCE: the distro cross-toolchains enable it by default, and at the -O1/-O2
+    # this fixture needs (to force live values into callee-saved registers for the ROP gadgets)
+    # FORTIFY turns `read(0, buf, 512)` into `__read_chk(..., 64)`, which ABORTS on the overflow
+    # before the saved return address is ever corrupted -- so the ret-overwrite L2 the exploit needs
+    # never occurs and no L3 is filed. -fno-stack-protector does NOT disable FORTIFY. (The -O0
+    # ret2win fixtures in archgate are unaffected because FORTIFY needs optimisation to fire.)
+    cmd = [gcc, opt, "-fno-stack-protector", "-U_FORTIFY_SOURCE", "-D_FORTIFY_SOURCE=0",
+           "-no-pie", "-static", "-w", *extra, str(src), "-o", str(exe)]
     if subprocess.run(cmd, capture_output=True).returncode:
         pytest.skip(f"cannot build {arch_name} ret2libc fixture")
     register()

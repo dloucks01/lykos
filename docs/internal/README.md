@@ -9,6 +9,10 @@ What's here:
 - **Roadmap & backlog** — `13-roadmap-milestones.md`, `20-open-work-backlog.md`
 - **Reviews & plans** — `21-crs-harvest-review.md`, `24-modernization-plan.md`,
   `30-missing-capabilities-implementation-plan.md` (sequenced plan for doc 20's open queue)
+- **`41-weaponization-breadth-2026-10-19.md`** — breadth, where 37/38 measured depth: the plan
+  to push more ISAs from L1 to a real L3 (an `ArchModel` abstraction + a strategy march across
+  architectures, each live-verified under qemu-user), plus the Windows/PE weaponization gap and
+  the `Exploit_Dev` (XDS) validation corpus. Sequenced; cross-arch depth leads.
 - **`38-technique-program-2026-10-17.md`** — every exploitation technique in one of three
   states: driven end to end, knowledge-base only, or absent. The ordered program for the
   second two, and the two that honestly end in a version-gated refusal.
