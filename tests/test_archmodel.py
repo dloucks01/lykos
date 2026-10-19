@@ -9,18 +9,21 @@ from __future__ import annotations
 from lykos.analyze.poc import archmodel
 
 
-def test_registry_covers_the_four_shipped_arches():
-    assert set(archmodel.MODELS) == {"aarch64", "arm", "riscv64", "ppc64"}
+def test_registry_covers_the_shipped_arches():
+    assert set(archmodel.MODELS) == {"aarch64", "arm", "riscv64", "ppc64", "loongarch"}
 
 
 def test_model_for_resolves_aliases():
     # the aliases mirror the arch gates in exploit_stage: arm64->aarch64, riscv->riscv64,
-    # ppc64le/powerpc64->ppc64.
+    # ppc64le/powerpc64->ppc64, loongarch64->loongarch.
     assert archmodel.model_for("aarch64").slug == "aarch64-ret2libc"
     assert archmodel.model_for("arm64") is archmodel.MODELS["aarch64"]
     assert archmodel.model_for("riscv") is archmodel.MODELS["riscv64"]
     assert archmodel.model_for("ppc64le") is archmodel.MODELS["ppc64"]
     assert archmodel.model_for("powerpc64") is archmodel.MODELS["ppc64"]
+    assert archmodel.model_for("loongarch") is archmodel.MODELS["loongarch"]
+    assert archmodel.model_for("loongarch64") is archmodel.MODELS["loongarch"]
+    assert archmodel.model_for("loongarch").slug == "loongarch64-ret2libc"
     assert archmodel.model_for("ARM") is archmodel.MODELS["arm"]     # case-insensitive
     assert archmodel.model_for("s390") is None
     assert archmodel.model_for(None) is None

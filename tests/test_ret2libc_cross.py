@@ -18,6 +18,8 @@ _A64_GCC = shutil.which("aarch64-linux-gnu-gcc")
 _A64_QEMU = shutil.which("qemu-aarch64") or shutil.which("qemu-aarch64-static")
 _ARM_GCC = shutil.which("arm-linux-gnueabihf-gcc")
 _ARM_QEMU = shutil.which("qemu-arm") or shutil.which("qemu-arm-static")
+_LA_GCC = shutil.which("loongarch64-linux-gnu-gcc")
+_LA_QEMU = shutil.which("qemu-loongarch64") or shutil.which("qemu-loongarch64-static")
 
 
 def _one_seg(seg, va=0x10000):
@@ -100,6 +102,30 @@ def test_find_aarch64_gadgets_records_ldp_offset():
     assert ld["a_off"] == 80, f"ldp [sp,#80] offset not recovered: {ld}"
 
 
+def test_find_loongarch64_gadgets_decodes_caller_and_loader():
+    """The LoongArch scanner finds a caller (`move $a0,$s0 ; jr $s1`) and a contiguous epilogue loader
+    that restores two s-regs + ra, reading each load's sp offset exactly. Encodings are byte-decoded
+    (host objdump cannot disassemble LoongArch) and were verified against binutils gas."""
+    seg = b""
+    seg += struct.pack("<I", 0x001502E4)  # move $a0, $s0 (r23)
+    seg += struct.pack("<I", 0x4C000300)  # jr   $s1 (r24)               -> caller (src=23, br=24)
+    # a loader epilogue: ld.d $s0,8($sp); ld.d $s1,0($sp); ld.d $ra,24($sp); addi.d $sp,$sp,32; ret
+    seg += struct.pack("<I", 0x28C02077)  # ld.d $s0 (r23), 8($sp)
+    seg += struct.pack("<I", 0x28C00078)  # ld.d $s1 (r24), 0($sp)
+    seg += struct.pack("<I", 0x28C06061)  # ld.d $ra (r1), 24($sp)
+    seg += struct.pack("<I", 0x02C08063)  # addi.d $sp, $sp, 32
+    seg += struct.pack("<I", 0x4C000020)  # ret  (jirl $zero, $ra, 0)
+    orig = rop._loads
+    rop._loads = lambda data: [(0, len(seg), 0x120000000, 1)]
+    try:
+        g = rop.find_loongarch64_r2libc_gadgets(seg)
+    finally:
+        rop._loads = orig
+    assert any(c["va"] == 0x120000000 and c["src"] == 23 and c["br"] == 24 for c in g["callers"])
+    ld = next(ll for ll in g["loaders"] if 23 in ll["regs"] and 24 in ll["regs"])
+    assert ld["regs"][23] == 8 and ld["regs"][24] == 0 and ld["raoff"] == 24 and ld["spadj"] == 32
+
+
 @pytest.mark.skipif(not (_RV_GCC and _RV_QEMU), reason="needs riscv64-linux-gnu-gcc + qemu-riscv64")
 def test_auto_files_l3_riscv64_ret2libc(store, tmp_path):
     """strategy=auto drives an NX-on RISC-V 64 stack overflow to a confirmed L3 ret2libc: an epilogue
@@ -136,6 +162,17 @@ def test_auto_files_l3_arm_ret2libc(store, tmp_path):
     `pop {r0,..,pc}` gadget sets r0=&"/bin/sh" and pc=&system -> system("/bin/sh"); confirmed by a
     spawned shell under qemu-user + a negative control."""
     _run_cross_e2e(store, tmp_path, _ARM_GCC, "arm", "arm-ret2libc")
+
+
+@pytest.mark.skipif(not (_LA_GCC and _LA_QEMU),
+                    reason="needs loongarch64-linux-gnu-gcc + qemu-loongarch64")
+def test_auto_files_l3_loongarch64_ret2libc(store, tmp_path):
+    """strategy=auto drives an NX-on LoongArch64 overflow to a confirmed L3 ret2libc: an epilogue
+    loader restores callee-saved regs + ra, a `move a0,sS ; jr sB` caller calls system("/bin/sh");
+    confirmed by a spawned shell under qemu-user + a negative control. The first ISA added through the
+    archmodel abstraction -- a gadget finder (rop.find_loongarch64_r2libc_gadgets) + a MODELS row +
+    a candidate generator, no new confirm/file tail."""
+    _run_cross_e2e(store, tmp_path, _LA_GCC, "loongarch", "loongarch64-ret2libc")
 
 
 # A vulnerable program whose `vuln` keeps several values live ACROSS the overflowing read(), forcing

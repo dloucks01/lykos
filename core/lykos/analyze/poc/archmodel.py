@@ -57,10 +57,13 @@ MODELS: dict[str, ArchModel] = {
     "arm":     ArchModel("arm", 4, "little", "r0", "r0", "ARM", "arm-ret2libc"),
     "riscv64": ArchModel("riscv64", 8, "little", "x10", "a0", "RISC-V 64", "riscv64-ret2libc"),
     "ppc64":   ArchModel("ppc64", 8, "little", "r3", "r3", "PowerPC64", "ppc64-ret2libc"),
+    # LoongArch names its GPRs r0..r31 in the gdbstub layout; a0 (the first argument) is r4.
+    "loongarch": ArchModel("loongarch", 8, "little", "r4", "a0", "LoongArch64", "loongarch64-ret2libc"),
 }
 
 #: arch aliases that map onto a MODELS key (mirrors the arch gates in exploit_stage).
-_ALIASES = {"arm64": "aarch64", "riscv": "riscv64", "ppc64le": "ppc64", "powerpc64": "ppc64"}
+_ALIASES = {"arm64": "aarch64", "riscv": "riscv64", "ppc64le": "ppc64", "powerpc64": "ppc64",
+            "loongarch64": "loongarch"}
 
 
 def model_for(arch: Optional[str]) -> Optional[ArchModel]:

@@ -1029,6 +1029,101 @@ def find_riscv64_r2libc_gadgets(data: bytes) -> dict:
     return {"callers": callers, "loaders": loaders}
 
 
+# ---------------------------------------------------------------- LoongArch64 ret2libc gadgets
+# LoongArch callee-saved GPRs are r22 (fp/s9) and r23..r31 (s0..s8) -- the registers a function
+# epilogue restores from its frame, hence the ones a stack overflow of that frame can control.
+_LA_SREG = set(range(22, 32))
+
+
+def _la_decode(w: int):
+    """Decode the LoongArch (LA64) instructions a ret2libc chain cares about, from one 32-bit word.
+    Returns (op, a, b): op in {move, jr, jalr, ret, ldsp, addisp, nop} or None. For `move` a=rd, b=rj;
+    for jr/jalr/ret a=the branch-target register; for ldsp a=rd, b=the sp-relative byte offset; for
+    addisp a=3 (sp), b=the sp adjustment. Fixed 4-byte little-endian encoding; host objdump cannot
+    disassemble LoongArch. Opcode widths differ per format and are prefix-free, so each test reads its
+    own field: `or` is 3R (op[31:15]=0x2A), `jirl` is 1RI16 (op[31:26]=0x13), `ld.d`/`addi.d` are
+    2RI12 (op[31:22]=0x0A3 / 0x00B). Encodings verified against binutils gas/objdump."""
+    rd, rj, rk = w & 0x1F, (w >> 5) & 0x1F, (w >> 10) & 0x1F
+    if (w >> 15) == 0x2A:                                # or rd, rj, rk
+        return ("move", rd, rj) if rk == 0 else None     # or with $zero == move
+    if (w >> 26) == 0x13:                                # jirl rd, rj, offs16
+        if ((w >> 10) & 0xFFFF) != 0:
+            return None                                  # only a displacement-free jirl is a clean jump
+        if rd == 0 and rj == 1:
+            return ("ret", 1, 0)                         # jirl $zero, $ra == ret
+        if rd == 0:
+            return ("jr", rj, 0)                         # jirl $zero, rj
+        if rd == 1:
+            return ("jalr", rj, 0)                       # jirl $ra, rj
+        return None
+    si12 = (w >> 10) & 0xFFF
+    si12 = si12 - 0x1000 if si12 & 0x800 else si12
+    if (w >> 22) == 0x0A3 and rj == 3:                   # ld.d rd, $sp, si12
+        return ("ldsp", rd, si12)
+    if (w >> 22) == 0x00B and rd == 3 and rj == 3:       # addi.d $sp, $sp, si12
+        return ("addisp", 3, si12)
+    if w == 0x03400000:                                  # andi $zero, $zero, 0 == nop
+        return ("nop", 0, 0)
+    return None
+
+
+def _la_stream(data: bytes):
+    """Linear decode of every executable byte as a LoongArch instruction stream: [(va, rec)]."""
+    out = []
+    for off, sz, va, flags in _loads(data):
+        if not (flags & 1):
+            continue
+        p, end = off, off + sz
+        while p + 4 <= end:
+            out.append((va + (p - off), _la_decode(int.from_bytes(data[p:p + 4], "little"))))
+            p += 4
+    return out
+
+
+def find_loongarch64_r2libc_gadgets(data: bytes) -> dict:
+    """LoongArch64 two-gadget ret2libc gadgets (pure byte decode; host objdump cannot disassemble it):
+
+      caller: `move $a0, $sS ; (jr|jalr) $sB`  -- set the first argument a0 from a callee-saved reg,
+              then jump to another callee-saved one.
+      loader: a contiguous function epilogue `ld.d $sX,oX($sp); ... ; ld.d $ra,oRA($sp); addi.d
+              $sp,$sp,N; jr $ra` that restores two callee-saved regs AND the return address off the
+              attacker stack.
+
+    Chaining a loader that restores {S,B} with a caller whose {src,br}=={S,B} gives system("/bin/sh"):
+    the loader sets $sS=&"/bin/sh", $sB=&system and $ra=caller; the caller does $a0=$sS; jr $sB.
+    Returns {"callers":[{va,src,br}], "loaders":[{va,regs:{reg:off},raoff,spadj}]} (reg = GPR number).
+    Only an epilogue of ld.d/addi.d-sp/move/nop before the ret is taken, so `regs`/offsets are exact.
+    Mirrors the RISC-V finder; the structure is identical, only the instruction decode differs."""
+    s = _la_stream(data)
+    callers, loaders = [], []
+    for i in range(len(s) - 1):
+        va, rec = s[i]
+        if rec and rec[0] == "move" and rec[1] == 4 and rec[2] in _LA_SREG:   # move $a0, $sS
+            nrec = s[i + 1][1]
+            if nrec and nrec[0] in ("jr", "jalr") and nrec[1] in _LA_SREG:
+                callers.append({"va": va, "src": rec[2], "br": nrec[1]})
+    for i, (va, rec) in enumerate(s):
+        if not (rec and rec[0] == "ret"):
+            continue
+        regs, raoff, spadj, entry, j = {}, None, 0, va, i - 1
+        while j >= 0:                                    # walk back over the contiguous epilogue
+            o = s[j][1]
+            if not o or o[0] not in ("ldsp", "addisp", "move", "nop"):
+                break
+            if o[0] == "ldsp":
+                if o[1] == 1:
+                    raoff = o[2]
+                elif o[1] in _LA_SREG:
+                    regs[o[1]] = o[2]
+            elif o[0] == "addisp":
+                spadj = o[2]
+            entry = s[j][0]
+            j -= 1
+        if raoff is not None and len(regs) >= 2:
+            loaders.append({"va": entry, "regs": regs, "raoff": raoff, "spadj": spadj})
+    return {"callers": callers, "loaders": loaders}
+
+
 # ---------------------------------------------------------------- PowerPC64 (ELFv2) ret2libc gadgets
 # PPC64 callee-saved GPRs are r14..r31 -- the registers a function epilogue restores from its frame,
 # hence the ones a stack overflow of that frame can control.
