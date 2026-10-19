@@ -59,7 +59,12 @@ def _dynresult(d):
 def _finding(f, sites=None, site_count=None, proven=0):
     """Serialize a finding. `sites` is the list of places the defect occurs; `site_count` is
     the cheap aggregate for list views. A finding is a DEFECT -- the sites are evidence."""
+    # Attach the CWE's name + plain-language description so the workbench can explain the number
+    # in place (the hover tooltip), instead of showing a bare "CWE-787" the analyst has to look up.
+    from ..cwe import cwe_info
+    _cwe_name, _cwe_desc = cwe_info(f.cwe)
     d = {"id": f.id, "target_id": f.target_id, "case_id": f.case_id, "cwe": f.cwe,
+         "cwe_name": _cwe_name, "cwe_desc": _cwe_desc,
          "title": f.title, "severity": f.severity, "state": f.state,
          "confidence": f.confidence, "function_addr": f.function_addr,
          "site_addr": f.site_addr, "detector": f.detector, "evidence": f.evidence,

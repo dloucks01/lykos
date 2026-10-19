@@ -1022,12 +1022,14 @@ def _max_verified_poc_level(store, target_id) -> int:
     return lv
 
 
-# How many distinct crashes get the L3 weaponizer. A binary with several defects should yield
-# several exploits, not one -- but `build_exploit` is the dearest stage in the pass (doc 32 item 4),
-# so this is a cap AND the budget declines it when the clock runs out. Three is the measured
-# compromise: enough for a multi-defect target, cheap enough that proving the first does not cost
-# the chance to prove the second.
-_MAX_EXPLOITS = 3
+# How many distinct crashes get the L3 weaponizer. The policy is: weaponize EVERY distinct crash
+# (they are already fault-PC-deduped to a handful), best-first, and let the BUDGET be the real
+# limiter -- `build_exploit` is the dearest stage (doc 32 item 4), so when the clock runs out the
+# budget declines the rest. `_MAX_EXPLOITS` is therefore only a high SAFETY ceiling against a
+# pathological target that somehow presents dozens of genuinely distinct defects; it is not meant
+# to bite on an ordinary target. (It was 3 -- a multi-defect binary then produced several PoCs but
+# at most three exploits, leaving real, weaponizable defects un-weaponized while budget remained.)
+_MAX_EXPLOITS = 64
 
 
 def _exploit_order(store, target_id, crashes):
@@ -1993,8 +1995,9 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                 # exploit, and `crashes[0]` is DynResult order, which says nothing about which
                 # crash is exploitable. Ordering by what each crash has already demonstrated means
                 # the one that reached IP control is tried before the sanitizer abort that cannot
-                # be. The budget declines the rest when the clock is gone, which is the honest
-                # bound: `_MAX_EXPLOITS` caps the ambition, the clock caps the cost.
+                # be. Now EVERY distinct crash is weaponized (best-first), not just the top three;
+                # the budget declines the rest when the clock is gone, so the clock -- not an
+                # arbitrary count -- is the honest bound. `_MAX_EXPLOITS` is only a safety ceiling.
                 ordered = _exploit_order(store, tid, crashes)[:_MAX_EXPLOITS]
                 for cr_x in ordered:
                     if stop.is_set():

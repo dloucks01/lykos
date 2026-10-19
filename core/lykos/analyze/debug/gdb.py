@@ -78,7 +78,16 @@ def _capture_cmds(stdin_file):
         "run" + ((" < " + stdin_file) if stdin_file else ""),
         'printf "LYKOS_PC %#lx\\n", $pc',
         "print $_siginfo",
-        "x/16xb $pc",
+        # Dump bytes at $pc -- but $pc after a control-flow hijack is often an UNMAPPED address,
+        # and a bare `x` then errors and ABORTS the batch script, so `info proc mappings`/`bt`
+        # below never run and gdb exits 1 (reads as an error in the console). Wrap it: on failure
+        # record that the PC is unmapped -- which is itself evidence of a hijack -- and carry on.
+        "python",
+        "try:",
+        '    gdb.execute("x/16xb $pc")',
+        "except gdb.error as _e:",
+        '    gdb.write("x/16xb $pc -> %s (pc unmapped -- control flow redirected to an invalid address)\\n" % _e)',
+        "end",
         "info proc mappings",
         "bt",
         "quit",
@@ -112,7 +121,16 @@ def run_gdb_follow(gdb: Path, exe, argv, stdin_file, *, ctx=None, timeout: int =
         "run" + ((" < " + stdin_file) if stdin_file else ""),
         'printf "LYKOS_PC %#lx\\n", $pc',
         "print $_siginfo",
-        "x/16xb $pc",
+        # Dump bytes at $pc -- but $pc after a control-flow hijack is often an UNMAPPED address,
+        # and a bare `x` then errors and ABORTS the batch script, so `info proc mappings`/`bt`
+        # below never run and gdb exits 1 (reads as an error in the console). Wrap it: on failure
+        # record that the PC is unmapped -- which is itself evidence of a hijack -- and carry on.
+        "python",
+        "try:",
+        '    gdb.execute("x/16xb $pc")',
+        "except gdb.error as _e:",
+        '    gdb.write("x/16xb $pc -> %s (pc unmapped -- control flow redirected to an invalid address)\\n" % _e)',
+        "end",
         "info proc mappings",
         "bt",
         "quit",

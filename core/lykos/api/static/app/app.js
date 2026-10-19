@@ -909,8 +909,11 @@ function App() {
             ` : tab === "console" ? html`
               <div class="wb-panel">
                 ${bg && bg.plan ? html`<${PipelinePlan} plan=${bg.plan} targetName=${bg.target_name} target=${bg.target} targets=${bg.targets} now=${bg.now} />` : null}
-                <${ProgressLog} entries=${log} running=${running} />
+                <!-- Lead with the live tool-command console (the actual rizin/gdb/qemu/afl commands
+                     and their I/O) -- that is what "Console" means and what an analyst wants to see;
+                     the human-readable Run log follows it. -->
                 <${ConsolePanel} lines=${consoleLines} />
+                <${ProgressLog} entries=${log} running=${running} />
                 <${CoveragePanel} coverage=${coverage} targets=${targets} onDrill=${browseFunctions} />
               </div>
             ` : html`<div class="wb-soon">This view is coming to the workbench.</div>`}

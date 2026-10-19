@@ -58,3 +58,4 @@ leak-*
 *-L1-*.tar.gz
 *-L2-*.tar.gz
 *-L3-*.tar.gz
+.cases-web/
