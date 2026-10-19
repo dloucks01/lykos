@@ -13,14 +13,18 @@ here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 # bundle's own ld-linux. Pure shell + a STATIC patchelf -- no glibc or python needed -- and a
 # fast no-op in a plain clone (no vendor/toolchain) or once already done for this location.
 if [ -d "$here/vendor/toolchain" ] && [ -f "$here/packaging/relink-bundle.sh" ]; then
-    sh "$here/packaging/relink-bundle.sh" "$here/vendor" || \
+    # strip host loader vars: the relink runs host coreutils (sh/find/od) as children, which a
+    # poisoned LD_LIBRARY_PATH/LD_PRELOAD would break before the bundle's own python is even chosen.
+    env -u LD_LIBRARY_PATH -u LD_PRELOAD sh "$here/packaging/relink-bundle.sh" "$here/vendor" || \
         echo "lykos: warning -- bundle relink did not complete; vendored tools may fail to start on an older host (is the folder writable? run from a copy, not the read-only disc)" >&2
 fi
 
 PY=${LYKOS_PYTHON:-}
+BUNDLED_PY=0
 if [ -z "$PY" ]; then
     if [ -x "$here/vendor/toolchain/usr/bin/python3" ]; then
         PY="$here/vendor/toolchain/usr/bin/python3"      # air-gap bundle's own interpreter (ABI-matched)
+        BUNDLED_PY=1
     else
         PY=python3
     fi
@@ -30,7 +34,19 @@ if [ ! -x "$PY" ] && ! command -v "$PY" >/dev/null 2>&1; then
     exit 1
 fi
 
-if [ -d "$here/vendor" ]; then                           # air-gap engines (P-Code, qemu, ...) present
+if [ "$BUNDLED_PY" = 1 ]; then
+    # HERMETIC. The bundle ships an ABI-matched interpreter with its own stdlib and (via the
+    # relink) its own glibc. Host-leaked environment would break it: PYTHONHOME points the
+    # interpreter at a foreign stdlib ("could not find platform independent libraries");
+    # PYTHONPATH/user-site inject mismatched host modules ahead of ours; LD_LIBRARY_PATH/LD_PRELOAD
+    # make an OLDER host libc or preload win over the relinked rpath (the very glibc skew the
+    # relink exists to prevent). The bundle needs none of them, so drop them all; PYTHONPATH is
+    # set to ONLY our core (not appended to the host's), and -s/NOUSERSITE ignore ~/.local.
+    exec env -u PYTHONHOME -u PYTHONSTARTUP -u PYTHONEXECUTABLE -u LD_LIBRARY_PATH -u LD_PRELOAD \
+        PYTHONPATH="$here/core" PYTHONNOUSERSITE=1 LYKOS_VENDOR="$here/vendor" \
+        "$PY" -s -m lykos "$@"
+fi
+if [ -d "$here/vendor" ]; then                           # vendor engines present, system python in use
     exec env PYTHONPATH="$here/core${PYTHONPATH:+:$PYTHONPATH}" LYKOS_VENDOR="$here/vendor" \
         "$PY" -m lykos "$@"
 fi
