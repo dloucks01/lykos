@@ -1876,16 +1876,32 @@ def _host_loadable(exe) -> Optional[str]:
             "detectors still apply; execution does not")
 
 
+#: Dynamic-loader failures that mean the program never ran, DEFINITIVE regardless of exit code.
+#: A missing library ("error while loading shared libraries: ... cannot open shared object")
+#: exits 127; a glibc TOO OLD for the image ("libc.so.6: version `GLIBC_2.34' not found (required
+#: by <prog>)") exits 1 -- so we cannot gate on rc here. These strings are specific enough that no
+#: ordinary program prints them as its own output. This is the common air-gap case: a binary built
+#: for a newer glibc than the (older) target, which must read as "never ran", not "clean".
+_LOADER_FAIL_MARKERS = (
+    b"error while loading shared libraries",
+    b"cannot open shared object file",
+    b"not found (required by",            # the glibc version-mismatch tail, any rc
+)
+
+
 def _exec_failed(rc: int, err: bytes) -> bool:
     """Post-hoc: did the process never actually start?
 
-    `rc == 127` is the shell's "command not found", which is what execvp's ENOEXEC fallback
-    produces, and 126 is "found but not executable". Require a marker as well so a target that
-    legitimately exits 127 is not mistaken for a non-run.
+    A dynamic-loader failure is conclusive on its own (see `_LOADER_FAIL_MARKERS`) whatever the
+    exit code. Otherwise `rc == 127` is the shell's "command not found" (execvp's ENOEXEC
+    fallback) and 126 is "found but not executable"; there we require a marker too, so a target
+    that legitimately exits 127 is not mistaken for a non-run.
     """
+    low = (err or b"").lower()
+    if any(m in low for m in _LOADER_FAIL_MARKERS):
+        return True
     if rc not in (126, 127):
         return False
-    low = (err or b"").lower()
     return any(m in low for m in _EXEC_FAIL_MARKERS)
 
 

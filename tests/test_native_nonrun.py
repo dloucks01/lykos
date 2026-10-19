@@ -69,6 +69,20 @@ def test_the_post_hoc_check_needs_both_the_code_and_a_marker():
     assert not sandbox._exec_failed(1, b"exec format error\n")
 
 
+def test_dynamic_loader_failure_is_a_nonrun_whatever_the_exit_code():
+    """The air-gap case: a binary built for a NEWER glibc than the (older) target. A glibc
+    VERSION mismatch exits 1 (not 127) and prints `version `GLIBC_2.34' not found (required by
+    ...)`; a MISSING library exits 127 with `error while loading shared libraries`. Both mean the
+    image never ran and must be caught regardless of exit code -- otherwise the target reads as a
+    clean campaign when in fact nothing executed."""
+    assert sandbox._exec_failed(
+        1, b"/bad: /lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.34' not found (required by /bad)\n")
+    assert sandbox._exec_failed(
+        127, b"/t/x: error while loading shared libraries: libfoo.so.1: cannot open shared object file\n")
+    # a program that merely mentions 'not found' in its own output (and exits cleanly) is NOT a non-run
+    assert not sandbox._exec_failed(0, b"config key 'timeout' not found, using default\n")
+
+
 # ---- the regression that matters: a real target must still run and still crash -------------
 
 @pytest.fixture(scope="module")
