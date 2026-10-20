@@ -385,6 +385,8 @@ def valgrind_triage(exe, data: bytes, *, mode: str = "stdin", base_argv=(),
             try:
                 ctx.record_exec(cmd, start=_t0, rc=r.returncode, out=r.stdout, err=r.stderr)
             except Exception:
+                # Advisory console echo only: a record_exec failure must not sink the memcheck
+                # verdict parsed below -- the analysis value is in r.stderr, not the live echo.
                 pass
         verdict = parse_memcheck(r.stderr or b"")
         if verdict is not None:
