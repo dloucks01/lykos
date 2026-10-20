@@ -13,6 +13,7 @@ import re
 import shutil
 import struct
 import subprocess
+from functools import lru_cache
 
 from ... import observe
 
@@ -82,7 +83,14 @@ def _va_of(segs, file_off, need_x=False):
     return None
 
 
+@lru_cache(maxsize=4096)
 def _find_exec(data: bytes, pat: bytes):
+    # Cached: the same target/libc bytes are scanned for the same opcode pattern many times in one
+    # run -- build_exploit alone runs 4+ times per target (early + per-crash + format + heap), and
+    # poc_primitive/leak/chain_primitive/brop call the gadget finders independently. The result is an
+    # immutable VA (int) or None, so caching cannot be corrupted by a caller mutating it; keyed on the
+    # bytes VALUE, so a different build (plain vs sanitizer) or the libc vs the target is a distinct
+    # entry. This is the hot inner scan behind find_gadget and every br/jmp/bx finder.
     segs = _loads(data)
     for off, sz, _va, flags in segs:
         if not (flags & 1):                            # executable segments only
@@ -260,6 +268,7 @@ def find_one_gadgets(data: bytes):
     return sorted(out, key=lambda g: g["offset"])
 
 
+@lru_cache(maxsize=512)
 def find_string(data: bytes, s: bytes):
     """VA of byte string `s` (NUL-terminated form preferred) in a loaded segment, or None."""
     segs = _loads(data)
@@ -938,6 +947,7 @@ def find_aarch64_r2libc_gadgets(data: bytes) -> dict:
     return {"callers": callers, "loaders": loaders}
 
 
+@lru_cache(maxsize=64)
 def find_aarch64_execve_site(data: bytes):
     """The address of a `mov x8, #221 ; svc #0` sequence -- libc's execve syscall site. Reaching it
     with x0=&"/bin/sh", x1=0, x2=0 is execve("/bin/sh", NULL, NULL): a cross-arch L3 that needs no
