@@ -93,8 +93,15 @@ def _addr(x):
         return None
 
 
-def select_targets(findings):
-    """Rank static candidate findings that carry a function address as fuzzing targets."""
+def select_targets(findings, cve_cwes=frozenset()):
+    """Rank static candidate findings that carry a function address as fuzzing targets.
+
+    `cve_cwes` is the set of CWE classes a version-matched CVE named on this target (from the
+    cve_fingerprint / cve_source findings). A sink whose class a KNOWN CVE in a linked component is
+    about is a better bet than an unflagged one -- a matched CWE-787 in a bundled libtiff says the
+    write-overflow sinks are where to steer -- so it is boosted above its state/severity score. The
+    CVE match itself names no function in a stripped binary, so it cannot be a target directly; this
+    is how its signal reaches the directed campaign (previously it steered only cve_poc)."""
     out = []
     for f in findings:
         if f.detector not in _TARGET_DETECTORS or f.function_addr is None:
@@ -103,11 +110,13 @@ def select_targets(findings):
             (e.get("channel") if isinstance(e, dict) else "") in
             ("taint-dataflow", "taint-reachability")
             for e in (f.evidence or []))
+        cve_class = bool(f.cwe and f.cwe in cve_cwes)
         score = (_STATE_RANK.get(f.state, 0) * 100 + (50 if has_taint else 0)
-                 + _SEV_RANK.get(f.severity, 0) * 5 + f.confidence)
+                 + _SEV_RANK.get(f.severity, 0) * 5 + f.confidence
+                 + (250 if cve_class else 0))        # a known-CVE's own class leads the ranking
         out.append({"function_addr": f.function_addr, "site_addr": f.site_addr,
                     "cwe": f.cwe, "detector": f.detector, "title": f.title,
-                    "has_taint": has_taint, "score": score})
+                    "has_taint": has_taint, "cve_class": cve_class, "score": score})
     out.sort(key=lambda t: t["score"], reverse=True)
     return out
 
@@ -217,7 +226,13 @@ def plan_directed_campaign(findings, functions, call_edges, strings, extra_targe
     to binary functions (``weggli.to_targets``) -- merged with the detector-derived targets so the
     campaign steers toward them too. This closes the loop from a source pattern match to a
     coverage-guided campaign aimed at the flagged function."""
-    targets = select_targets(findings) + list(extra_targets or ())
+    # CWE classes a version-matched CVE named on this target: the directed campaign steers toward
+    # sinks of those classes first (see select_targets), closing the loop from "a known-vulnerable
+    # component is linked" to "fuzz the kind of bug it is known for" -- previously a CVE match
+    # steered only cve_poc.
+    cve_cwes = frozenset(f.cwe for f in findings
+                         if f.detector in ("cve_fingerprint", "cve_source") and f.cwe)
+    targets = select_targets(findings, cve_cwes) + list(extra_targets or ())
     # Menu-navigation seeds so the campaign starts INSIDE a numbered menu (heap/service targets),
     # not blindly at the front door. Best-effort; empty when the binary is not menu-driven.
     try:

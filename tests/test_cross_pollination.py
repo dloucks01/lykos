@@ -120,3 +120,29 @@ def test_l2_to_l3_prefers_the_crash_being_weaponized(store):
         assert _l2_offset(ctx, tgt) in (40, 72)
     finally:
         _STAGE.input_sha = None
+
+
+def test_directed_fuzz_boosts_sinks_of_a_matched_cve_class():
+    """GAP 5: a sink whose CWE class a version-matched CVE named leads the directed-fuzz ranking,
+    above an equal-state sink of an unmatched class -- so a known-vulnerable linked component steers
+    the campaign, not just cve_poc."""
+    from types import SimpleNamespace as NS
+    from lykos.analyze.fuzz.directed import select_targets
+    fs = [
+        NS(detector="dangerous_api", function_addr="0x1000", site_addr="0x1004",
+           cwe="CWE-134", title="printf(user)", state="candidate", severity="high",
+           confidence=0.8, evidence=[]),
+        NS(detector="dangerous_api", function_addr="0x2000", site_addr="0x2004",
+           cwe="CWE-787", title="memcpy overflow", state="candidate", severity="high",
+           confidence=0.8, evidence=[]),
+        NS(detector="cve_fingerprint", function_addr=None, site_addr=None, cwe="CWE-787",
+           title="CVE-2020-0000 libfoo 1.2.3", state="corroborated", severity="critical",
+           confidence=0.9, evidence=[]),
+    ]
+    # Without the CVE signal, the two sinks tie (same state/sev/conf) -> input order.
+    base = select_targets(fs)
+    assert {t["cwe"] for t in base} == {"CWE-134", "CWE-787"}
+    # With the matched CVE class, the CWE-787 sink (the known CVE's class) leads.
+    ranked = select_targets(fs, cve_cwes=frozenset({"CWE-787"}))
+    assert ranked[0]["cwe"] == "CWE-787" and ranked[0]["cve_class"] is True
+    assert ranked[1]["cwe"] == "CWE-134" and ranked[1]["cve_class"] is False
