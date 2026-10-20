@@ -564,6 +564,13 @@
   .rail-dot.d-ok { background: var(--ok); } .rail-dot.d-none { background: var(--faint); }
   .rail-tname { flex: 1 1 auto; font-size: .9rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .rail-tlvl { flex: 0 0 auto; font-family: var(--mono); font-size: .72rem; color: var(--muted); }
+  /* Remove-file button: hidden until the row is hovered/active so it does not clutter the list. */
+  .rail-rm { flex: 0 0 auto; width: 18px; height: 18px; line-height: 16px; padding: 0; border-radius: 5px;
+    border: none; background: transparent; color: var(--muted); cursor: pointer; font-size: .8rem;
+    opacity: 0; transition: opacity .12s, background .12s, color .12s; }
+  .rail-target:hover .rail-rm, .rail-target.active .rail-rm { opacity: .75; }
+  .rail-rm:hover { background: var(--bad); color: #fff; opacity: 1; }
+  .rail-rm:disabled { opacity: 0 !important; cursor: default; }
   .rail-pipe { display: flex; flex-direction: column; gap: 9px; font-size: .84rem; }
   .rail-step { display: flex; align-items: center; gap: 9px; color: var(--muted); }
   .rail-step .rs-ico { flex: 0 0 14px; text-align: center; }

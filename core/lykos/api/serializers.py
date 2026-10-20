@@ -27,11 +27,16 @@ def _case(c):
 
 
 def _target(t):
+    # `deps` on the row maps a companion file's relative path -> its content hash (a multi-file
+    # upload -- a binary with its bundled libs, or a firmware drop -- ingests as ONE target
+    # carrying the rest as deps). Project only the NAMES, so the workbench can show what a folder
+    # upload actually ingested without exposing the host-side paths the values may hold.
     return {"id": t.id, "case_id": t.case_id, "filename": t.filename, "sha256": t.sha256,
             "md5": t.md5, "sha1": t.sha1, "size": t.size, "file_type": t.file_type,
             "arch": t.arch, "bits": t.bits, "endianness": t.endianness,
             "linking": t.linking, "stripped": t.stripped, "mitigations": t.mitigations,
-            "entropy": t.entropy, "toolchain_hint": t.toolchain_hint}
+            "entropy": t.entropy, "toolchain_hint": t.toolchain_hint,
+            "deps": sorted((t.deps or {}).keys()) or None}
 
 
 def _poc(x):

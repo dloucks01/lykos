@@ -69,6 +69,23 @@ function bgEventToLog(ev) {
   return null;
 }
 
+// A fuzzing / coverage / directed event -> one compact Console line, so an operator can watch
+// what the fuzzer is actually doing (campaign start, crash harvest, did-not-run reason) in real
+// time instead of a silent run. Prefers an explicit message/note, else a few scalar fields;
+// skips the bulky array payloads (argv, channels, candidates) that are not line-sized.
+function fuzzSummary(type, p) {
+  if (p.msg) return p.msg;
+  if (p.note) return p.note;
+  const skip = new Set(["argv", "channels", "arrays", "candidates", "blocks"]);
+  const bits = [];
+  for (const [k, v] of Object.entries(p)) {
+    if (v == null || typeof v === "object" || skip.has(k)) continue;
+    bits.push(`${k}=${v}`);
+    if (bits.length >= 6) break;
+  }
+  return bits.length ? bits.join("  ") : type;
+}
+
 function App() {
   const [caseId, setCaseId] = useState(null);
   const [targets, setTargets] = useState([]);
@@ -356,6 +373,13 @@ function App() {
               continue;
             }
             if (ev.type === "job.exec") { pushConsole(ev.id, ev.payload); continue; }
+            // Fuzzing/coverage/directed milestones -> the Console, so "what is the fuzzer doing?"
+            // has a visible answer. Discrete domain events only (campaign start, harvest, done,
+            // did-not-run) -- not the per-batch job.progress above, which would flood the log.
+            if (/^(coverage|fuzz|directed|env_fuzz|net_fuzz|libfuzzer|concolic|harness)[._]/.test(ev.type)) {
+              pushConsole(ev.id, { cmd: fuzzSummary(ev.type, ev.payload || {}), note: ev.type });
+              continue;
+            }
             const row = bgEventToLog(ev);
             if (row) { pushLog(row); setBgActivity(null); }
           }
@@ -475,6 +499,11 @@ function App() {
     try {
       if (isFolderPick(fileList)) {
         pushLog({ tone: "ok", text: `Packing ${files.length} files into a source archive…` });
+        // Show WHAT is going in -- a folder upload that silently became "nothing" was the real
+        // engagement complaint. List the member paths (capped) so the operator sees the contents.
+        const names = files.map((f) => f.webkitRelativePath || f.name).filter(Boolean);
+        if (names.length) pushLog({ tone: "info", text:
+          `Contents: ${names.slice(0, 40).join(", ")}${names.length > 40 ? `  …(+${names.length - 40} more)` : ""}` });
         files = [await folderArchive(fileList)];
       }
     } catch (e) {
@@ -500,6 +529,11 @@ function App() {
         if (srcResp && srcResp.source) t.source = srcResp;
         got.push(t);
         pushLog({ tone: "ok", text: `Uploaded ${t.filename} — triaged as ${t.file_type || "unknown"}.` });
+        // A multi-file (binary + its libs) upload ingests as ONE target carrying companion deps;
+        // name them so the operator sees what actually came in rather than one opaque row.
+        const deps = Array.isArray(t.deps) ? t.deps : (t.deps ? Object.keys(t.deps) : []);
+        if (deps.length) pushLog({ tone: "info", text:
+          `  with ${deps.length} companion file${deps.length > 1 ? "s" : ""}: ${deps.slice(0, 20).join(", ")}${deps.length > 20 ? ", …" : ""}` });
       }
       setTargets(got);
       if (got.length && !advice) {
@@ -512,6 +546,24 @@ function App() {
       setUploading(false);
     }
   }, [ensureCase, pushLog, targets, advice]);
+
+  // Remove an uploaded file from the left rail. The server (DELETE /targets/<id>) cascades the
+  // target's rows and component edges; here we drop it from the list and move focus off it.
+  const removeTarget = useCallback(async (id) => {
+    const victim = targets.find((t) => t.id === id);
+    try {
+      await api.deleteTarget(id);
+    } catch (e) {
+      setError(`could not remove the file: ${e.message || e}`);
+      return;
+    }
+    const left = targets.filter((t) => t.id !== id);
+    setTargets(left);
+    if (activeTid === id) setActiveTid(left.length ? left[0].id : null);
+    // Prune its PoCs from the merged view; case-wide findings refresh on the next results read.
+    setPocs((ps) => (ps || []).filter((p) => p.target_id !== id));
+    pushLog({ tone: "info", text: `Removed ${victim ? victim.filename : "file"} from the case.` });
+  }, [targets, activeTid, pushLog]);
 
   const onAutopilot = useCallback(async () => {
     if (!targets.length) return;
@@ -780,12 +832,15 @@ function App() {
                 ${targets.map((t) => {
                   const v = verdicts.find((x) => x.target.id === t.id);
                   const on = activeTarget && t.id === activeTarget.id;
-                  return html`<button class=${`rail-target${on ? " active" : ""}`} key=${t.id}
+                  return html`<div class=${`rail-target${on ? " active" : ""}`} key=${t.id}
                     onClick=${() => { setActiveTid(t.id); setTab("findings"); setViz(null); }}>
                     <span class=${`rail-dot ${dotClass(v)}`}></span>
                     <span class="rail-tname">${t.filename}</span>
                     <span class="rail-tlvl">${lvlTag(v)}</span>
-                  </button>`;
+                    <button class="rail-rm" title="Remove this file" aria-label=${`Remove ${t.filename}`}
+                      disabled=${running || (bg && bg.running)}
+                      onClick=${(e) => { e.stopPropagation(); removeTarget(t.id); }}>✕</button>
+                  </div>`;
                 })}
               </div>
               ${!running && !(bg && bg.running) ? html`<div style="margin-top:8px;"><${DropZone} onFiles=${(fl) => onFiles(fl, true)} busy=${uploading} compact=${true} /></div>` : null}

@@ -251,7 +251,9 @@ def _target_html(t: dict) -> str:
 def _finding_html(f: dict) -> str:
     sev = f.get("severity", "info")
     state = f.get("state", "candidate")
-    p = ['<article class="finding">']
+    # Severity rides on the article as a class so the stylesheet can colour a left border -- a
+    # reader scans the report by severity at a glance instead of reading every badge.
+    p = [f'<article class="finding sev-{esc(sev)}">']
     p.append('<div class="fhead">')
     p.append(f'<span class="ftitle">{esc(f.get("title") or f.get("cwe") or "finding")}</span>')
     p.append(_badge(sev, _SEV_COLOR.get(sev, "#8b8d98")))
@@ -342,24 +344,34 @@ body{margin:0;background:var(--bg);color:var(--text);font-family:var(--sans);
   background:rgba(122,162,200,.08);font-size:12.5px;line-height:1.5}
 .eyebrow{text-transform:uppercase;letter-spacing:.08em;font-size:11px;color:var(--faint);
   font-weight:600}
-h1{font-size:26px;margin:6px 0 14px;letter-spacing:-.02em}
+h1{font-size:28px;margin:6px 0 14px;letter-spacing:-.022em;font-weight:700}
 h2{font-size:16px;margin:0 0 12px;letter-spacing:-.01em}
+/* A thin accent band across the top of the page -- a small masthead cue that this is a report. */
+.wrap::before{content:"";display:block;height:3px;border-radius:999px;margin:0 0 26px;
+  background:linear-gradient(90deg,var(--accent),color-mix(in srgb,var(--accent) 25%,transparent))}
 .rpt-head{margin-bottom:24px;padding-bottom:20px;border-bottom:1px solid var(--border)}
 .notes{margin:12px 0 0;color:var(--muted)}
 .card{background:var(--surface);border:1px solid var(--border);border-radius:12px;
-  padding:20px;margin:16px 0}
+  padding:22px;margin:16px 0;box-shadow:0 1px 2px rgba(0,0,0,.04)}
 .kv{display:grid;grid-template-columns:auto 1fr;gap:3px 16px;margin:4px 0}
 .kv .k{color:var(--faint);font-size:12px;white-space:nowrap}
 .kv .v{word-break:break-all}
-.stats{display:flex;gap:28px;flex-wrap:wrap;margin-bottom:12px}
-.stat .num{font-size:30px;font-weight:700;letter-spacing:-.03em}
+/* Stat tiles as little surface cards, so the summary reads as a scorecard rather than loose text. */
+.stats{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:14px}
+.stat{background:var(--surface-2);border:1px solid var(--border);border-radius:10px;
+  padding:12px 16px;min-width:88px}
+.stat .num{font-size:30px;font-weight:700;letter-spacing:-.03em;line-height:1.05}
 .stat .lbl{font-size:11px;color:var(--faint);text-transform:uppercase;letter-spacing:.06em}
 .chips{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0}
 .badge{display:inline-flex;align-items:center;gap:5px;padding:2px 9px;border-radius:999px;
   font-size:11px;font-weight:600;color:var(--bc);border:1px solid var(--bc);
   background:color-mix(in srgb,var(--bc) 12%,transparent);white-space:nowrap}
 .target>.tname{font-size:15px;word-break:break-all}
-.finding{border-top:1px solid var(--border);padding:16px 0 4px;margin-top:12px}
+/* Each finding carries a severity-coloured left border so the page is scannable by risk. */
+.finding{border-top:1px solid var(--border);padding:16px 0 4px 14px;margin-top:12px;
+  border-left:3px solid var(--sev,#8b8d98);border-top-left-radius:2px}
+.finding.sev-critical{--sev:#e5484d} .finding.sev-high{--sev:#f76808}
+.finding.sev-medium{--sev:#ffb224} .finding.sev-low{--sev:#46a758} .finding.sev-info{--sev:#8b8d98}
 .fhead{display:flex;align-items:center;gap:10px;margin-bottom:8px;flex-wrap:wrap}
 .ftitle{font-weight:600;font-size:14px}
 .evlabel{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--faint);

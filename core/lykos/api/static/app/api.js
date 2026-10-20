@@ -55,6 +55,8 @@ export const api = {
   // ---- targets ----
   listTargets: (caseId) => _req("GET", `/cases/${caseId}/targets`),
   getTarget: (id) => _req("GET", `/targets/${id}`),
+  // Remove an uploaded file from the case (the server cascades its rows + component edges).
+  deleteTarget: (id) => _req("DELETE", `/targets/${id}`),
 
   // Upload a file to a case. Accepts a File/Blob; the filename rides in a header so the
   // server does not need multipart parsing for the common single-file case.
