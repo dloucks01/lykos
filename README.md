@@ -116,6 +116,9 @@ make corpus-gate       # plumbing health on REAL binaries/libraries (needs a loc
 make corpus-regression # did we still find AND demonstrate the defects we found before?
 make release           # ci + verify + all four gates
 make toolchain-bundle  # build the offline toolchain tarball (on a CONNECTED machine)
+make engines           # build the dynamic engines the base bundle omits (afl-qemu-trace per guest,
+                       #   libqasan, weggli, symqemu) -> dist/engines/ + engines.env; run after
+                       #   toolchain-bundle, then source engines.env before ./package
 make repo-tarball      # snapshot the repo for transfer (tracked files at HEAD, + sha256)
 ./package              # ONE extract-and-run package: repo + fully-populated vendor/, no install
                        # -> dist/lykos-offline-<date>-<arch>.tar.xz (+ disc-split .part-NN,
