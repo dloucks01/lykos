@@ -2660,6 +2660,13 @@ def indexed_write_fsop(exe, workdir, *, write_cell, read_cell, libc_data, leak_s
 
     def _attempt(plan: str, align: bool = False) -> dict:
         T = targets[plan]
+        if plan == "setcontext" and T.get("rip_at") is None:
+            # setcontext's push-continuation (the pushed-RIP offset) was not located in this libc,
+            # so the register-load finisher cannot place execve. Report it and let the plan loop
+            # fall through to the system / cat routes rather than crashing on a None offset.
+            return {"ok": False, "reason": "setcontext's pushed-RIP offset was not found in this "
+                    "libc (its register-load tail differs here), so the setcontext finisher is "
+                    "unavailable -- the system/cat route is used instead"}
         try:
             p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                  stderr=subprocess.STDOUT, cwd=exedir, start_new_session=True,
