@@ -103,8 +103,21 @@ find "$@" -type f 2>/dev/null | while IFS= read -r f; do
   [ "$(od -An -N4 -tx1 "$f" 2>/dev/null | tr -d ' \n')" = "7f454c46" ] || continue
   # never touch the loader itself (patchelf-ing ld-linux corrupts it)
   [ "$(CDPATH= cd -- "$(dirname "$f")" && pwd)/$(basename "$f")" = "$LDREAL" ] && continue
-  # dynamic exe / PIE -> repoint its interpreter at the bundle loader (static exes/.so have none)
-  if "$PATCHELF" --print-interpreter "$f" >/dev/null 2>&1; then
+  # A STATICALLY LINKED / static-PIE executable (no PT_INTERP and no NEEDED libraries) is already
+  # self-contained: it carries its own startup and has no glibc dependency to repoint. patchelf must
+  # NOT touch it -- `--set-rpath` rewrites the program headers and breaks the self-relocation a
+  # static-PIE performs at startup, so the binary then SIGSEGVs before main. This silently corrupted
+  # EVERY vendored qemu-user (they ship static-PIE): on an air-gapped host with no system qemu to
+  # fall back to, all cross-arch analysis/exploitation died with SIGSEGV **[measured 2026-10-20:
+  # pristine qemu-aarch64 0/5 SIGSEGV; the same binary after --set-rpath 8/8]**. A shared library
+  # (.so) also has no interpreter but DOES list NEEDED libraries, so it still needs the rpath below
+  # and is NOT skipped here.
+  has_interp=no; "$PATCHELF" --print-interpreter "$f" >/dev/null 2>&1 && has_interp=yes
+  if [ "$has_interp" = no ] && [ -z "$("$PATCHELF" --print-needed "$f" 2>/dev/null)" ]; then
+    continue
+  fi
+  # dynamic exe / PIE -> repoint its interpreter at the bundle loader (.so have none)
+  if [ "$has_interp" = yes ]; then
     "$PATCHELF" --set-interpreter "$LDREAL" "$f" 2>/dev/null || true
   fi
   # give it (exe or .so) an rpath into the bundle libs, ahead of anything it already had, so a

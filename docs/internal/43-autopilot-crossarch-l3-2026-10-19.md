@@ -101,3 +101,35 @@ Two bounded fixes:
 
 Result — three consecutive in-process bundle Autopilot runs on `vuln_aarch64` at 300 s: **L3, L3,
 L3**, no wedge **[measured 2026-10-20]**. Air-gap (fresh server under `bwrap`) validation follows.
+
+## Addendum 2 (2026-10-20) — the REAL blocker: the relink corrupted every vendored qemu-user
+
+The two fixes above are correct but were not the reason cross-arch stayed at L1 through the webgui
+Autopilot. Driving the FRESH-SERVER bundle (`./lykos serve`) under `bwrap --unshare-net` still gave
+cross-arch L1, with `build_exploit` reporting the gdbstub never came up. Instrumenting the capture
+showed qemu dying with **rc=-11 (SIGSEGV)** at startup, empty stderr -- and only in the server.
+
+The trap: on this dev box the host has `/usr/bin/qemu-*`, and `sandbox._qemu_for` fell back to it
+whenever the vendored one was not resolved, so every in-process test (and `airgap_capability.py`)
+quietly used the **host** qemu and reported L3. The webgui launcher puts the bundle's own
+`.wrappers/qemu-*` first, so the server used the **vendored** qemu -- which is broken:
+
+* pristine `qemu-aarch64` from the toolchain tarball (static-PIE): **0/5 SIGSEGV** -- works.
+* the same binary after the bundle's first-run relink (`patchelf --set-rpath`): **8/8 SIGSEGV**.
+* every vendored arch (x86_64/s390x/riscv64/ppc/…) is static-PIE and all 3/3 SIGSEGV after relink.
+
+`packaging/relink-bundle.sh` walked every ELF and ran `patchelf --set-rpath` on it. patchelf
+rewriting the program headers of a **static-PIE** executable breaks the self-relocation it performs
+before `main`, so it faults at startup. A static-PIE binary has no glibc dependency to repoint in
+the first place, so the relink was both unnecessary and destructive for it. On an air-gapped host
+with no system qemu to mask it, this made ALL cross-arch analysis and exploitation non-functional --
+which no in-process test caught, because they used the host qemu.
+
+Fix: `relink-bundle.sh` now skips any ELF with no PT_INTERP **and** no NEEDED libraries (a
+static / static-PIE executable -- self-contained), while a `.so` (no interp but has NEEDED) is still
+given its rpath. Since the relink runs at first-run `./lykos doctor` from the shipped script, a
+rebuilt bundle carries the fix and ships a working qemu.
+
+**Lesson for the test harness:** validate the vendored engine explicitly (e.g. assert
+`_qemu_for` resolved under `vendor/` and that `qemu-<arch> <exe>` does not fault) so a host-tool
+fallback can never again make a broken bundle look healthy.
