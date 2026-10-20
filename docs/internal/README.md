@@ -9,6 +9,11 @@ What's here:
 - **Roadmap & backlog** — `13-roadmap-milestones.md`, `20-open-work-backlog.md`
 - **Reviews & plans** — `21-crs-harvest-review.md`, `24-modernization-plan.md`,
   `30-missing-capabilities-implementation-plan.md` (sequenced plan for doc 20's open queue)
+- **`43-autopilot-crossarch-l3-2026-10-19.md`** — the cross-arch L3 capability existed in
+  `build_exploit` but the Autopilot never reached it: the crashless `build_exploit(strategy="auto")`
+  sat last in the recover phase and was starved of budget, so cross-arch L3 was a lottery on the
+  fuzzer's crash yield (aarch64 fell to L1). Running it first fixes it — aarch64 L1→L3, riscv64 L3
+  with zero fuzzer crashes, no regressions. Also records the worker-pool harness footgun.
 - **`42-strategy-expansion-2026-10-19.md`** — the outcome of the strategy tracks past ret2libc:
   NX-off execstack ret2shellcode is done for every buildable arch (riscv64/ppc64le/s390x/ppc32
   added; mips blocked on toolchain), and multi-register syscall-ROP (execve-syscall/mprotect) is

@@ -159,6 +159,17 @@ above is the maximal bounded primitive and is itself arbitrary command execution
 revisit it is cross-arch SROP (a sigreturn frame restores all registers, needing no arg-pop gadgets).
 See `internal/42-strategy-expansion-2026-10-19.md`.
 
+**The Autopilot now reaches cross-arch L3 (2026-10-19).** The ret2libc chains above lived in the
+`build_exploit` stage, but the *Autopilot* only reached them when the qemu-user fuzzer happened to
+land the overflow crash: its crashless `build_exploit(strategy="auto")` -- which recovers the offset
+deterministically and needs no crash (~1 s to a verified shell on every ISA) -- sat last in the
+recover phase and was starved of budget, so `aarch64` fell to **L1** while `s390x` (more crashes)
+reached L3. Running that crashless attempt **first in the recover phase** (before `dynamic_run` and
+the heavy `disassemble`/`detect_cwe`) fixes it: in-process `run_case_autopilot` at a 300 s budget now
+drives `aarch64` L1->**L3**, `riscv64` to **L3 with zero fuzzer crashes**, and `ppc32`/`s390x` to L3,
+with `x86-64` unchanged at its fixture ceiling -- no regressions. See
+`internal/43-autopilot-crossarch-l3-2026-10-19.md`.
+
 | arch | L1 | L2 | L3 (ret2win offset) |
 |---|---|---|---|
 | x86-64 | yes | yes | **yes** (72) |

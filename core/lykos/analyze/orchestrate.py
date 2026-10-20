@@ -1666,6 +1666,24 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
             # loader, missing runtime, needs an argument) is a different situation from one that
             # runs and survives, and every later stage's result is read in that light.
             bud.phase("recover")
+            # WEAPONIZE FIRST, before anything that can spend the phase allowance. The crashless
+            # build_exploit(strategy="auto") recovers its own IP-control offset with a deterministic
+            # cyclic probe and drives the ret2win / ret2libc / cross-arch ret2libc chain -- a ~1 s
+            # path to L3 on every buildable ISA **[measured 2026-10-19: aarch64 1.1s, s390x 1.0s,
+            # ppc 0.9s, riscv64 0.9s, loongarch 1.3s, each a verified shell]**. It MUST precede the
+            # two stages below: `dynamic_run` blocks on a target that reads stdin and waits out its
+            # whole slice, and `disassemble` is heavy on a large static binary -- together they
+            # time out and consume the entire recover allowance, so build_exploit scheduled after
+            # them (or in `prove`, after fuzz/concolic have burned the wall clock) is handed 0 s and
+            # skipped "no budget left", on EVERY run. The qemu-gated fuzzer rarely lands the overflow
+            # crash that this probe finds instantly, so for a cross-arch target this is the ONLY
+            # route to a demonstrated shell -- the previous placement left them stuck at L1. Gated
+            # on < L3 so a target already weaponized elsewhere pays nothing, and the stage self-gates
+            # per arch/mitigation (PIE-emulated, managed runtimes, no gadget) and declines cheaply.
+            if not stop.is_set() and _max_verified_poc_level(store, tid) < 3:
+                _staged(bud, store, t, "build_exploit", status, stop,
+                        {"strategy": "auto"}, want=60.0)
+            # THE FLOOR: run once to see the target work, then recover + detect.
             _staged(bud, store, t, "dynamic_run", status, stop, want=30.0)
             # Recover + detect.
             _staged(bud, store, t, "disassemble", status, stop)
@@ -1720,25 +1738,11 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
             # Demonstrate injection / format-string leaks by probing the binary's sinks directly
             # (no crash needed) -- a printf(user) leaks live memory, a system(user) runs a command.
             _staged(bud, store, t, "synthesize_injection", status, stop, want=30.0)
-            # Leak-centric weaponization that needs NO crash -- run it BEFORE the budget-draining
-            # fuzz/concolic below, so a modern-hardened target (PIE / stack canary / full RELRO) that
-            # blind mutation can't crash still reaches its demonstrable effect within a time budget.
-            # strategy="auto" provokes its own leak (a %p/%s over-read behind the input prompts, a
-            # format sink, a heap UAF/menu) and drives the canary-bypass ret2win/ret2libc, the
-            # format-%n saved-return overwrite, the heap FSOP chain, or files the demonstrated ASLR
-            # info-leak (L2) when no shell is reachable. The overflow-based auto paths that DO need a
-            # crash offset just no-op here and are covered by the crash-driven build_exploit later.
-            # Self-gates per arch/mitigation and reports honest ceilings -- a bounded attempt, not a
-            # false positive. (Placed early precisely because the old end-of-pass slot was never
-            # reached once fuzz/concolic had spent the budget.)
-            # Bounded by the PRE-SEARCH allowance on purpose. Running it early is itself an
-            # earlier fix (the end-of-pass slot was never reached once fuzz had spent the
-            # budget), and moving it back would undo that -- but unbounded it took its full
-            # registered 300s on a jpegtran that had no crash yet and the run ended before any
-            # fuzzer started. It keeps its early slot and can no longer spend the search's share.
-            if not stop.is_set() and _max_verified_poc_level(store, tid) < 3:
-                _staged(bud, store, t, "build_exploit", status, stop,
-                        {"strategy": "auto"}, want=60.0)
+            # (The crashless, leak-centric build_exploit(strategy="auto") -- canary-bypass
+            # ret2win/ret2libc, the format-%n saved-return overwrite, the heap FSOP chain, the ASLR
+            # info-leak, and the overflow-offset ret2libc all in one -- now runs FIRST in this phase,
+            # before dynamic_run/disassemble can spend the allowance; see the top of the block. It
+            # used to sit here, last in the phase, where it was handed 0 s and skipped on every run.)
             # SEARCH: everything from here actually executes the target with attacker input, so
             # it gets the largest share and the phase reserve stops an earlier stage spending it.
             bud.phase("search")
@@ -2061,8 +2065,10 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                 if heap_menu:
                     _staged(bud, store, t, "build_exploit", status, stop,
                                       {"strategy": "heap"})
-            # (The crashless leak-centric build_exploit(strategy="auto") now runs EARLY, before
-            # fuzz/concolic, so a time-boxed pass reaches it; see above. It is not repeated here.)
+            # (The crashless build_exploit(strategy="auto") runs FIRST in the recover phase -- see
+            # the top of the per-target block -- so it reaches its ~1 s ret2libc/ret2win chain
+            # before the stages that time out on a blocking stdin read or a heavy static
+            # disassembly can spend the phase allowance. It is not repeated here.)
             # Review each demonstrated finding: replay its input several times so a flaky crash is
             # flagged rather than trusted, and a reopened case carries the verdict. Verified-PoC
             # inputs come first (never dropped), then any distinct crash; capped so a target with
