@@ -158,7 +158,15 @@ def synthesize_injection_stage(ctx) -> dict:
             confirmed.append({"probe": name, **_finalize(ctx, target, target_bytes, spec, hit)})
 
     ctx.emit("inject.done", payload={"ok": True, "confirmed": len(confirmed),
-             "results": [{"probe": c["probe"], "cwe": c["cwe"], "mode": c["mode"]}
+             # input_sha + resolved_base are the HANDOFF to build_exploit: a CWE-134 leak that
+             # already resolved a PIE/libc base is a measured disclosure recipe, so L3's leak recon
+             # can replay this exact input instead of re-deriving the %p offset from scratch (see
+             # exploit_stage._l2_disclosure_triggers). Carried here because the event is the only
+             # cross-stage channel; the bases themselves do NOT cross (ASLR makes them per-process).
+             "results": [{"probe": c["probe"], "cwe": c["cwe"], "mode": c["mode"],
+                          "input_sha": c.get("input_sha"), "level": c.get("level"),
+                          "resolved_base": bool((c.get("bases") or {}).get("pie_base")
+                                                or (c.get("bases") or {}).get("libc_base"))}
                          for c in confirmed],
              "note": None if confirmed else
                      "no injection confirmed on the entry channel or behind any of the %d "

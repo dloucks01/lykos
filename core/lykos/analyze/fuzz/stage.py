@@ -1643,6 +1643,33 @@ def _in_program(addr, ranges) -> bool:
     return i >= 0 and addr < ranges[i][1]
 
 
+def _recovered_gate_tokens(ctx, target) -> list:
+    """The values `extract_secrets` recovered as input-compared GATES, as dictionary tokens.
+
+    extract_secrets breaks on the target's comparison functions under GDB and records -- in the
+    `secrets.done` event -- every constant the program checked OUR input against (a password, magic
+    bytes, an expected token), with `gate=True` for the ones that were actually compared against the
+    input. The autopilot runs it in the recover phase BEFORE every campaign precisely so the fuzzer
+    can get PAST those gates instead of waiting to invent the magic bytes (orchestrate.py's
+    "the values every later stage needs in order to get PAST a gate" comment) -- but nothing read
+    them back. This is that consumer: the persisted gates go to the FRONT of the dictionary, same as
+    the libtokencap runtime tokens. It reuses the single GDB pass extract_secrets already did rather
+    than re-running the target, and it surfaces gates on a non-host-arch target too (extract_secrets
+    runs under the target's own debugger), where the host-arch-only libtokencap path cannot."""
+    try:
+        from ...db.dao import EventDAO
+        toks: list = []
+        for pl in EventDAO(ctx.conn).payloads_of_type("secrets.done", target_id=target.id,
+                                                       stage="extract_secrets"):
+            for r in (pl.get("recovered") or []):
+                v = r.get("value")
+                if r.get("gate") and isinstance(v, str) and 1 <= len(v) <= 128:
+                    toks.append(v.encode("latin-1", "ignore"))
+        return list(dict.fromkeys(toks))                 # de-duped, order preserved
+    except Exception:                                    # noqa: BLE001 -- the dictionary is advisory
+        return []
+
+
 def fuzz_stage(ctx) -> dict:
     target = TargetDAO(ctx.conn).get(ctx.target_id) if ctx.target_id else None
     if target is None:
@@ -1779,6 +1806,18 @@ def fuzz_stage(ctx) -> dict:
             "why": ("a dispatch token is matched at the START of the line, so each mined "
                     "`key=`/`key:` token is seeded as a prefix with a number, a filler and an "
                     "out-of-range number behind it")})
+    # Gate values extract_secrets already recovered under GDB (run in the recover phase, before this
+    # campaign): the exact constants the program compared our input against. To the FRONT -- a
+    # comparison the program actually performed beats a .rodata string -- and reused from the one
+    # pass extract_secrets did, rather than re-run here.
+    _gate_tokens = _recovered_gate_tokens(ctx, target)
+    if _gate_tokens:
+        dictionary = _gate_tokens + [t for t in dictionary if t not in set(_gate_tokens)]
+        ctx.emit("fuzz.dictionary", payload={
+            "gate_tokens": len(_gate_tokens), "total": len(dictionary),
+            "sample": [t.decode("latin-1", "replace")[:32] for t in _gate_tokens[:8]],
+            "why": "values extract_secrets saw the target compare our input against -- seeded so "
+                   "the fuzzer gets past the gate instead of having to invent the magic bytes"})
     # The target's own strings give the tokens visible in the IMAGE. The ones that matter most for
     # getting past a gate are often not there: a magic value that is COMPUTED (a decoded header, a
     # checksum, a token read from a config or the environment) exists only at runtime. libtokencap
