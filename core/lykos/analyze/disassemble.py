@@ -51,10 +51,24 @@ def _edges_from_funcs(funcs) -> list:
     return edges
 
 
-def _persist_analysis(conn, target_id: str, result: dict) -> tuple:
+def _persist_analysis(conn, target_id: str, result: dict, target_bytes: bytes = None) -> tuple:
     """Write the recovered functions / call edges / strings onto a target row. Shared by the
-    stage body and the cache-hit reprojection so both project identical DB state."""
+    stage body and the cache-hit reprojection so both project identical DB state.
+
+    When `target_bytes` is given, a FLIRT-style library-ID pass first NAMES the security-relevant
+    libc functions (system/strcpy/gets/...) in a stripped STATIC binary and propagates the names
+    onto the call edges -- without it those calls stay `fcn.XXXX`, invisible to dangerous_api and
+    the symbol-driven exploit paths (625 functions, 0 named, 0 findings on a static strcpy target).
+    Best-effort: library-ID must never break recovery persistence."""
     funcs = result.get("functions", [])
+    if target_bytes:
+        try:
+            from . import flirt
+            n = flirt.relabel(target_bytes, funcs)       # mutates funcs + their call dst_names
+            if n:
+                result["flirt_named"] = n
+        except Exception:                                # noqa: BLE001 -- never break persistence
+            pass
     FunctionDAO(conn).replace_for_target(target_id, funcs)
     edges = _edges_from_funcs(funcs)
     CallEdgeDAO(conn).replace_for_target(target_id, edges)
@@ -75,7 +89,14 @@ def reproject_disassemble(store, target_id: str, run_id: str) -> bool:
     result = cached_output_json(store, run_id)
     if not isinstance(result, dict) or "functions" not in result:
         return False
-    _persist_analysis(store.conn, target_id, result)
+    tb = None
+    try:
+        t = TargetDAO(store.conn).get(target_id)
+        if t and t.sha256:
+            tb = open(str(store.content.path(t.sha256)), "rb").read()
+    except Exception:                                    # noqa: BLE001 -- relabel is best-effort
+        tb = None
+    _persist_analysis(store.conn, target_id, result, target_bytes=tb)
     return True
 
 
@@ -175,8 +196,14 @@ def disassemble_stage(ctx) -> dict:
         ghidra.run_headless(headless, blob, out, ctx=ctx, timeout=_TIMEOUT)
         ctx.check_cancel()
         result = ghidra.parse_result(out)
-    # functions + call graph/xrefs (reachability + taint sinks for Phase 3) + strings
-    funcs, edges, strings = _persist_analysis(ctx.conn, target.id, result)
+    # functions + call graph/xrefs (reachability + taint sinks for Phase 3) + strings. Hand the
+    # bytes to the persist pass so FLIRT library-ID can name stripped-static libc sinks.
+    _tb = None
+    try:
+        _tb = open(str(blob), "rb").read()
+    except Exception:                                    # noqa: BLE001 -- relabel is best-effort
+        _tb = None
+    funcs, edges, strings = _persist_analysis(ctx.conn, target.id, result, target_bytes=_tb)
 
     # Honest completeness bookkeeping. `analyze()` is exhaustive by default but returns a partial
     # result rather than raising when a batch times out or the function set was capped, so we
