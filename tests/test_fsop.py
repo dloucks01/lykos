@@ -11,6 +11,7 @@ import subprocess
 import time
 
 import pytest
+from _env import glibc_setcontext_layout
 from lykos.analyze.poc import heap
 
 _SYS_LIBC = next(iter(glob.glob("/usr/lib/x86_64-linux-gnu/libc.so.6")
@@ -184,6 +185,7 @@ def _fsop_preconditions():
         pytest.skip("no C compiler")
 
 
+@glibc_setcontext_layout
 def test_indexed_write_fsop_reaches_a_shell_with_no_win_function(tmp_path_factory):
     """The whole no-win route, live: an unbounded `table[i]` read recovers the libc base from a GOT
     slot under real ASLR, the paired write places the cells over _IO_2_1_stderr_, and exit() spawns
@@ -206,6 +208,7 @@ def test_indexed_write_fsop_system_plan_still_reaches_a_shell(tmp_path_factory):
     assert res["plan"] == "system" and len(res["cells"]) == 5
 
 
+@glibc_setcontext_layout
 def test_find_setcontext_lands_on_the_register_load():
     """`rop.find_setcontext` has to skip setcontext's own prologue: the symbol begins with an
     rt_sigprocmask and then `mov rcx,[rdx+0xe0]; fldenv [rcx]; ldmxcsr [rdx+0x1c0]`, which would
@@ -248,6 +251,7 @@ def test_setcontext_fsop_cells_turn_both_flag_bits():
     assert T["rsp"] == 0xA0 and not any(a == 0x1000 + 0xA0 for a, _ in cells)
 
 
+@glibc_setcontext_layout
 def test_setcontext_fsop_targets_name_execve_not_system():
     """The point of the plan: the effect is execve, which `system` could not be."""
     if not _SYS_LIBC:

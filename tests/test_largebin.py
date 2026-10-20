@@ -12,6 +12,7 @@ import subprocess
 import time
 
 import pytest
+from _env import glibc_hardened_heap
 from lykos.analyze.poc import aaheg, heap
 
 _SYS_LIBC = next(iter(glob.glob("/usr/lib/x86_64-linux-gnu/libc.so.6")
@@ -191,6 +192,7 @@ def test_cat_plan_is_unavailable_without_room_for_the_blob(tmp_path):
     assert "libc" in res["reason"] or "FSOP plan" in res["reason"]
 
 
+@glibc_hardened_heap
 def test_large_bin_write_lands_only_when_the_guard_is_satisfied(tmp_path):
     """The measurement behind the verdict, both ways, live.
 
@@ -402,6 +404,7 @@ def _is_libc_ptr(x):
     return 0x7F0000000000 < x < 0x800000000000
 
 
+@glibc_hardened_heap
 def test_tcache_stashing_makes_malloc_return_a_chosen_address(tmp_path):
     """The live measurement behind the stated primitive: corrupt the to-be-stashed chunk's `bk`
     and the next allocation of that size comes back at an address we picked."""

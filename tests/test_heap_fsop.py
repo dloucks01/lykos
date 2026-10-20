@@ -5,6 +5,7 @@ import shutil
 import subprocess
 
 import pytest
+from _env import glibc_hardened_heap
 from lykos.analyze.poc import heap, leak
 
 _SYS_LIBC = next(iter(glob.glob("/usr/lib/x86_64-linux-gnu/libc.so.6")
@@ -48,6 +49,7 @@ def notes_bin(tmp_path_factory):
     return exe
 
 
+@glibc_hardened_heap
 def test_heap_fsop_exploit_spawns_shell(notes_bin):
     """End-to-end on the host libc: a notes menu with a UAF is driven fully automatically to a real
     shell -- unsorted-bin libc leak, tcache-fd heap leak, tcache poison of _IO_2_1_stdout_, then the
@@ -125,6 +127,7 @@ def menu_notes_bin(tmp_path_factory):
     return exe
 
 
+@glibc_hardened_heap
 def test_heap_auto_strategy_is_push_button(store, case, menu_notes_bin):
     """The `auto` strategy (no analyst `strategy=heap`) now RECOGNISES a menu-driven heap target --
     a malloc/free pair plus a numbered menu -- and runs the tcache-poison + House-of-Apple-2 chain
@@ -152,6 +155,7 @@ def test_heap_auto_strategy_is_push_button(store, case, menu_notes_bin):
         pool.stop(grace=3.0)
 
 
+@glibc_hardened_heap
 def test_render_heap_script_reproduces_shell(notes_bin, tmp_path):
     """The bundled standalone reproducer (render_heap_script) re-drives the notes menu to a shell
     on its own -- no lykos imports -- proving the L3 bundle is self-reproducing."""
