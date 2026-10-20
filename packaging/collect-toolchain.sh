@@ -136,6 +136,28 @@ if [ -z "$(find /stage/toolchain -iname "rizin" -o -iname "rz-ghidra*" 2>/dev/nu
   echo "  WARNING: rizin (the RE backend) is not in this bundle -- disassembly will have no"
   echo "           default engine. Collect on an image that packages rizin + rz-ghidra (Kali)."
 fi
+# The next four engines are built SEPARATELY from this apt collect (per-guest / heavy source
+# builds / a cargo binary), so the default container path never carries them -- warn, so a
+# complete-looking bundle does not ship silently missing them.
+if [ -z "$(find /stage -iname "afl-qemu-trace*" 2>/dev/null | head -1)" ]; then
+  echo "  WARNING: afl-qemu-trace is not in this bundle -- coverage fuzzing (qemu-mode) will be"
+  echo "           unavailable. Build per guest via examples/afl-qemu/build.sh and inject it with"
+  echo "           LYKOS_AFLQEMU_DIR through make-runnable.sh."
+fi
+if [ -z "$(find /stage -iname "weggli*" 2>/dev/null | head -1)" ]; then
+  echo "  WARNING: weggli is not in this bundle -- source variant analysis will be unavailable."
+  echo "           Build the cargo release binary and inject it with LYKOS_WEGGLI_BIN through"
+  echo "           make-runnable.sh."
+fi
+if [ -z "$(find /stage -iname "libqasan.so" 2>/dev/null | head -1)" ]; then
+  echo "  WARNING: libqasan is not in this bundle -- the heap depth oracle (QEMU-mode ASan) will be"
+  echo "           unavailable. Build it from AFL++ qemu_mode/libqasan and place it under usr/lib/afl."
+fi
+if [ -z "$(find /stage -iname "symqemu*" 2>/dev/null | head -1)" ]; then
+  echo "  WARNING: symqemu is not in this bundle -- concolic execution will be unavailable. Build"
+  echo "           it via packaging/build-symqemu.sh and inject it with LYKOS_SYMQEMU_DIR through"
+  echo "           make-runnable.sh."
+fi
 
 say "python venvs (this distro s interpreter)"
 for spec in "angr:angr claripy" "unicorn:unicorn keystone-engine"; do

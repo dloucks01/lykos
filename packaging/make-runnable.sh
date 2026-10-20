@@ -180,6 +180,25 @@ for m in ("ctypes", "ssl", "sqlite3", "lzma", "bz2", "hashlib", "zlib", "socket"
     __import__(m)
 print("  vendored python self-check OK (no LD_LIBRARY_PATH):", sys.version.split()[0])
 PYCHK
+# Unicorn smoke-test: the bundled Unicorn is a venv whose compiled _unicorn extension is ABI-locked
+# to one Python minor, so air-gapped it can fail to load (interpreter/ABI mismatch) -- and nothing
+# would catch it until a firmware-rehosting run on the laptop. Actually CONSTRUCT a Uc object, under
+# the VENDORED interpreter the venv is repointed to at RUN time (its own bin/python still points at
+# the collect host here), with the venv site-packages on PYTHONPATH. Optional engine: WARN loudly on
+# failure, do not fail the package build (the core interpreter self-check above is the one that dies).
+UVENV="$V/unicorn-venv"
+if [ -d "$UVENV" ]; then
+  usp="$(ls -d "$UVENV"/lib/python*/site-packages 2>/dev/null | head -1)"
+  if [ -n "$usp" ] && env -i HOME=/tmp PATH=/usr/bin:/bin PYTHONPATH="$usp" "$TUB/python$PYV" \
+       -c 'import unicorn; unicorn.Uc(unicorn.UC_ARCH_ARM, unicorn.UC_MODE_ARM)' >/dev/null 2>&1; then
+    echo "  unicorn self-check OK: constructed a Uc object under the vendored Python $PYV"
+  else
+    echo "  WARNING: the bundled Unicorn failed to construct a Uc object under the vendored Python --" >&2
+    echo "           firmware rehosting will be UNAVAILABLE on the target. The unicorn-venv compiled" >&2
+    echo "           extension is ABI-locked to one Python minor; the vendored interpreter ($PYV) must" >&2
+    echo "           match the Python the venv was built with -- rebuild the toolchain bundle on Python $PYV." >&2
+  fi
+fi
 printf '  vendored Python %s + stdlib (%s); venvs are repointed at RUN time by vendorenv\n' \
   "$PYV" "$(du -sh "$TUL/python$PYV" 2>/dev/null | cut -f1)"
 

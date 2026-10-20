@@ -293,6 +293,18 @@ def activate(force: bool = False) -> dict:
                 env["LYKOS_DISLOCATOR"] = str(dl)
                 break
 
+    # libqasan (AFL++ QEMU-mode ASan heap oracle) ships under usr/lib/afl in the bundle, which its
+    # locator (libqasan_lib) does not search -- it looks at the host's /usr/lib/afl and AFL_PATH.
+    # Point LYKOS_QASAN at the bundle's copy so the oracle is available offline. Only when unset.
+    if prefix and not os.environ.get("LYKOS_QASAN"):
+        for sub in ("usr/lib/afl/libqasan.so", "usr/local/lib/afl/libqasan.so",
+                    "usr/lib/afl++/libqasan.so", "usr/local/lib/afl++/libqasan.so"):
+            ql = prefix / sub
+            if ql.is_file():
+                os.environ["LYKOS_QASAN"] = str(ql)
+                env["LYKOS_QASAN"] = str(ql)
+                break
+
     # A relocated GCC (and the cross-compilers) looks for system headers and startup files at
     # absolute /usr paths, which are empty on a minimal target -- so `#include <string.h>` and
     # linking fail even though the bundle carries them. Point the compilers at the vendored
