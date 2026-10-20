@@ -64,6 +64,12 @@ live shell / marker / breakpoint, never asserted.
 
 ## Part B — Cross-arch ELF depth program (the focus)
 
+> **Status (updated 2026-10-19):** M1 (the `ArchModel` abstraction) is built; ret2libc L3 now spans
+> **8 arches** (x86-64/aarch64/arm32/riscv64/ppc64le + **loongarch64/s390x/ppc32-BE**) and execstack
+> ret2shellcode **7 arches**. See `coverage.md` (cross-arch section) and
+> `42-strategy-expansion-2026-10-19.md` for the measured outcome, including why multi-register
+> syscall-ROP (#1/#3 below, NX-on) is gadget-blocked on the RISC arches.
+
 ### B.1 Ground truth as of today
 
 Tooling columns are what is installed **on this build host** [observed, 2026-10-19]; ladder

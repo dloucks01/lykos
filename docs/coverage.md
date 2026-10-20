@@ -131,10 +131,33 @@ control, then **raised to a demonstrated effect**: the same payload is detonated
 forgery-proof marker -- the finding is recorded as demonstrated RCE only when a real shell EVALUATES
 the challenge (solved form present, raw echo absent), else it keeps the register-state proof as the
 floor (a control-flow-confirmed L3). All four (AArch64/ARM/RISC-V 64/PowerPC64) spawn a real shell
-here. All are driven push-button by the `auto` strategy. The remaining ROP/heap/format strategies
-(ret2csu, SROP, dlresolve, mprotect shellcode, heap/FSOP, the PIE info-leak) are still x86-64 machine
-code and stay native-only; MIPS/PPC-BE ret2libc is designed but unverified here (qemu present, no
-cross-compiler to build a fixture).
+here. All are driven push-button by the `auto` strategy. The x86-64-glibc strategies (ret2csu, SROP,
+dlresolve, mprotect shellcode, heap/FSOP, the PIE info-leak) are still x86-64 machine code and stay
+native-only (the 2026-10-19 update below records what has since generalised).
+
+**Cross-arch ret2libc generalised + three more ISAs (2026-10-19).** The four bespoke chains above
+were refactored behind one `ArchModel` abstraction + a shared driver (`poc/archmodel.py`): adding an
+ISA is now a registry row + a small candidate generator, not a ~130-line copy. Through it, three more
+architectures reach a demonstrated-shell **ret2libc L3**: **LoongArch64**, **s390x** (the first
+big-endian target -- link register r14, saved on the stack) and **PowerPC 32-bit (ELF32, BE)** --
+bringing NX-on ret2libc to **eight** arches (x86-64, aarch64, arm32, riscv64, ppc64le, loongarch64,
+s390x, ppc32). s390x required making the tagged-offset discovery endianness-aware; ppc32 required a
+4-byte tag and a *clean* PPC gadget selector (reject a `mtctr/mr r3/bctr` tail that clobbers r3,
+common on ppc32). **PPC64 big-endian (ELFv1) stays blocked**: the installed glibc has no clean
+one-shot `mtctr rC; mr r3,rT; bctr` caller with both registers callee-saved.
+
+**Execstack ret2shellcode (NX-off) now spans seven arches (2026-10-19):** x86-64, aarch64, arm,
+**riscv64, ppc64le, s390x, ppc32** -- inject an `execve("/bin/sh")` stub into an executable-stack
+overflow and reach it via a jump-through-register gadget (`br/blr`, `bx/blx`, `jr/jalr`,
+`mtctr;bctr`, `br %rX`), confirmed by a spawned shell under qemu-user. mips is the only gap (no MIPS
+cross-compiler on the build host; qemu + the register layout already exist).
+
+**execve-syscall / mprotect via multi-register ROP is gadget-blocked on the RISC arches** (not
+engine-blocked): aarch64 (the richest arch) has zero usable `set x0,x1; ret` gadgets, so the argument
+registers cannot be controlled by return-oriented gadgets -- the one-argument ret2libc->`system`
+above is the maximal bounded primitive and is itself arbitrary command execution. The honest path to
+revisit it is cross-arch SROP (a sigreturn frame restores all registers, needing no arg-pop gadgets).
+See `internal/42-strategy-expansion-2026-10-19.md`.
 
 | arch | L1 | L2 | L3 (ret2win offset) |
 |---|---|---|---|
