@@ -1608,17 +1608,33 @@ def _allint(b):
         return False
 
 
+# The high byte (bits 40-47) of a leaked x86-64 userspace pointer. Classic Linux pinned the PIE
+# image at 0x55/0x56 and libc/mmap/stack at 0x7f, and the recogniser hardcoded exactly those. A
+# kernel with more mmap entropy spreads BOTH across the whole high half of the 47-bit VA -- measured
+# on one such kernel: PIE/heap 0x56-0x64, libc/stack 0x71-0x7f -- so pinning 0x55/0x56/0x7f missed
+# ~14 of every 15 real pointers and the leak recovery resolved a base on only one run in several.
+# Accept any top byte in [0x10, 0x7f] (top two bytes still zero): that spans every observed layout
+# AND classic Linux, rejects small non-pointer words (< 16 TiB), and leaves the chance hits to be
+# dropped by the cross-pointer / page-offset corroboration downstream, which is where false pointers
+# were always meant to die.
+_PTR_HI_MIN, _PTR_HI_MAX = 0x10, 0x7F
+
+
+def _is_ptr_hi(b: int) -> bool:
+    return _PTR_HI_MIN <= b <= _PTR_HI_MAX
+
+
 def _le_pointer_words(data: bytes, cap: int = 256) -> list:
     """Little-endian 8-byte words in `data` that look like an x86-64 userspace pointer: the top two
-    bytes zero and the next byte 0x7f (libc/mmap/stack) or 0x55/0x56 (a PIE image mapping). A raw
-    stack over-read (CWE-125) echoes memory as BINARY, not hex, so the saved return into
-    __libc_start_main, environ/stack and PIE code pointers sit there as raw words -- harvesting them
-    gives classify_leak the multiple corroborating pointers it needs to pin a base from an
-    un-labelled leak. All byte offsets are scanned (a text prefix can push pointers off 8-byte
-    alignment); spurious hits are filtered downstream by cross-pointer corroboration."""
+    bytes zero and the next byte in the high-half range [0x10, 0x7f] (libc/mmap/stack/PIE/heap --
+    see `_PTR_HI_MIN`). A raw stack over-read (CWE-125) echoes memory as BINARY, not hex, so the
+    saved return into __libc_start_main, environ/stack and PIE code pointers sit there as raw words
+    -- harvesting them gives classify_leak the multiple corroborating pointers it needs to pin a
+    base from an un-labelled leak. All byte offsets are scanned (a text prefix can push pointers off
+    8-byte alignment); spurious hits are filtered downstream by cross-pointer corroboration."""
     out = []
     for i in range(0, max(0, len(data) - 7)):
-        if data[i + 6] == 0 and data[i + 7] == 0 and data[i + 5] in (0x7F, 0x55, 0x56):
+        if data[i + 6] == 0 and data[i + 7] == 0 and _is_ptr_hi(data[i + 5]):
             out.append(int.from_bytes(data[i:i + 8], "little"))
             if len(out) >= cap:
                 break

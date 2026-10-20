@@ -679,6 +679,31 @@ def _disable_aslr():
         observe.absorbed(_log, "continuing")
 
 
+_SETARCH_CACHE: Optional[str] = None
+
+
+def _norandom_prefix(aslr: bool = False) -> list:
+    """An argv prefix that turns OFF randomization for the exec'd child from INSIDE the sandbox.
+
+    `_disable_aslr` sets ADDR_NO_RANDOMIZE on the PARENT via personality() before it execs. That
+    works for an unwrapped child, but bubblewrap runs the target in a new USER namespace and on
+    some kernels the parent's personality does NOT carry into it -- so a child that must land at a
+    stable address (crash reproduction, and every leak/ret2x experiment that resolves a disclosed
+    pointer against the target's own layout) still gets full ASLR, silently. `setarch -R`, exec'd
+    right before the target inside the namespace, sets the personality THERE and does take effect;
+    it exec-replaces itself, so the final process is the target (same PID -- ptrace/waitpid/proc
+    all still see it). Best-effort: [] when `aslr` leaves randomization on, or setarch is absent
+    (the parent-personality path still applies where there is no user namespace)."""
+    global _SETARCH_CACHE
+    if aslr:
+        return []
+    if _SETARCH_CACHE is None:
+        _SETARCH_CACHE = shutil.which("setarch") or ""
+    if not _SETARCH_CACHE:
+        return []
+    return [_SETARCH_CACHE, platform.machine(), "-R"]
+
+
 # A GENEROUS virtual-address cap for emulated (qemu-user) and Wine targets. A tight RLIMIT_AS
 # breaks qemu's guest reservation, but an uncapped run lets a guest/PE memory bomb map host memory
 # without bound and OOM the platform -- so bound it well above normal need but finite. Empirically
@@ -843,7 +868,8 @@ def _bwrap_probe_fresh() -> bool:
         return False
 
 
-def isolate_prefix(exedir: str, *, net: bool, ro_binds=(), rw_binds=(), chdir: str = "") -> list:
+def isolate_prefix(exedir: str, *, net: bool, ro_binds=(), rw_binds=(), chdir: str = "",
+                   aslr: bool = False) -> list:
     """bwrap argv prefix that contains a target for the debug/PoC paths that spawn it directly
     (the gdb stub, the native gdb tools, the leak harness). Read-only root (with /home and /root
     masked), tmpfs /tmp, pid namespace and die-with-parent, plus the target's own directory
@@ -872,7 +898,11 @@ def isolate_prefix(exedir: str, *, net: bool, ro_binds=(), rw_binds=(), chdir: s
     # dir -- pass it (usually == exedir, which rw_binds also makes writable) for such a target.
     if chdir:
         cmd += ["--chdir", str(chdir)]
-    return cmd + ["--"]
+    # Disable ASLR INSIDE the namespace (bwrap's user namespace drops the parent's
+    # ADDR_NO_RANDOMIZE on some kernels). `aslr=True` leaves it on for the rare caller that wants
+    # real randomization. No-op when setarch is absent -- the caller's personality preexec, where
+    # it sets one, still applies on hosts without a user namespace.
+    return cmd + ["--"] + _norandom_prefix(aslr)
 
 
 def run_reaped(cmd, *, input=None, timeout=None, capture_output=False, **kw):
@@ -2226,7 +2256,10 @@ def run(exe, *, argv=(), stdin: bytes = b"", timeout: float = 10.0,
             # directory writable; it holds nothing else.
             tdir = str(Path(trace_log).parent)
             extra += ["--bind", tdir, tdir]
-        cmd = ["bwrap"] + _BWRAP_ARGS[:-1] + extra + ["--"] + inner
+        # Native targets: disable ASLR inside the namespace (the parent personality does not
+        # survive bwrap's user namespace on some kernels). Emulated targets keep qemu's own guest
+        # layout, so setarch on the host qemu process is not applied here.
+        cmd = ["bwrap"] + _BWRAP_ARGS[:-1] + extra + ["--"] + _norandom_prefix(aslr or emu is not None) + inner
         iso = ("bwrap+netns" + ("+qemu" if emu else ""))
     if guarded:
         # The tag is what makes the crash REPRODUCIBLE later: a fault that needs the guard-page

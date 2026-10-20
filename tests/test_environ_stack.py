@@ -224,7 +224,13 @@ def test_environ_route_spawns_a_shell_where_every_file_plan_fails(tmp_path):
     for plan in ("setcontext", "system"):
         bad = run((plan,))
         assert not bad["ok"], f"{plan} should not reach a shell on a closed stderr"
-        assert "no trigger spawned a shell" in (bad.get("reason") or ""), bad.get("reason")
+        # The file plan must not spawn a shell on a closed-stderr target. On glibc <= 2.42 it places
+        # every cell and the trigger does nothing ("no trigger spawned a shell"); on a libc whose
+        # setcontext finisher is unavailable (2.43's moved register-load tail) the setcontext plan
+        # instead declines up front -- both are the same verdict: this file plan did not reach L3.
+        reason = bad.get("reason") or ""
+        assert ("no trigger spawned a shell" in reason
+                or "setcontext finisher is unavailable" in reason), reason
 
     res = run(("stack",))
     assert res["ok"], res.get("reason")

