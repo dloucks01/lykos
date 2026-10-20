@@ -307,8 +307,25 @@ make toolchain-bundle           # collect engines inside a container matching th
 ## or docker. Pass --target native to collect from an ABI-identical host, but prefer the container
 ## -- a native collect misses already-installed deps.
 ## -> dist/lykos-toolchain-<distro>-<date>-<arch>.tar.zst  (+ its sha256)
+## collect-toolchain.sh now WARNS when a separately-built engine is absent from the tree
+## (afl-qemu-trace, libqasan, weggli, symqemu) -- heed those warnings, or the bundle ships
+## WITHOUT coverage fuzzing / firmware depth and the box reports "no coverage fuzzing".
+
+## --- Build the DYNAMIC ENGINES the apt toolchain does NOT include, then inject them. WITHOUT
+## --- this step the bundle is complete-LOOKING but has no coverage-guided fuzzing: Kali's afl++
+## --- deb carries libAFLQemuDriver.a and NO tracer, so AFL++ qemu-mode has nothing to run.
+examples/afl-qemu/build.sh x86_64         # coverage fuzzing for native targets (do this at minimum)
+examples/afl-qemu/build.sh aarch64 arm mips mipsel   # + any guest arch you will fuzz
+export LYKOS_AFLQEMU_DIR=$HOME/.local/bin  # dir holding the built afl-qemu-trace-* binaries
+export LYKOS_WEGGLI_BIN=/path/to/weggli    # optional: source variant analysis (a static release bin)
+packaging/build-symqemu.sh ; export LYKOS_SYMQEMU_DIR=vendor/symqemu   # optional: concolic (x86_64)
+## libqasan (optional heap shadow oracle under QEMU): build from AFL++ qemu_mode/libqasan and drop
+## libqasan.so under the toolchain tree's usr/lib/afl -- vendorenv now discovers it via LYKOS_QASAN.
 
 ./package                       # fold the working tree + a fully-populated vendor/ into one package
+## make-runnable.sh injects the engines named above, vendors a matching Python so the unicorn/angr
+## venvs load (it SMOKE-TESTS unicorn.Uc() and warns if the ABI does not match), closes the
+## shared-lib deps, and relinks every dynamic ELF to the bundle loader.
 ## -> dist/lykos-offline-<date>-<arch>.tar.xz           (one file if it fits a disc)
 ##    dist/lykos-offline-<date>-<arch>.tar.xz.part-NN   (volumes, if larger than one disc)
 ##    dist/lykos-offline-<date>-<arch>.sha256           (checksums)
