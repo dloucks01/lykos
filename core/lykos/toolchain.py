@@ -86,10 +86,19 @@ def _probe_ghidra():
 
 
 def _probe_rizin():
-    """The native RE backend CLI (rizin, else radare2). This is the default decompiler now."""
+    """The native RE backend CLI (rizin, else radare2). This is the default decompiler now.
+
+    Capture its version banner too (via `-v`), not just the path: doctor could not tell an
+    operator their rizin was too old/incompatible -- an old bundled rizin or a fallback to an old
+    host r2 recovers nothing and silently starves every function-keyed detector. `_v` returns the
+    first `-v` line; fall back to the bare path if the banner cannot be read so a present-but-quiet
+    tool still reports as installed."""
     from .analyze.native_re import locate_native
     p = locate_native()
-    return str(p) if p else None
+    if p is None:
+        return None
+    ver = _v(p, "-v")                              # first line of `rizin -v` / `r2 -v`
+    return f"{ver} ({p})" if ver else str(p)
 
 
 def _probe_pypcode():

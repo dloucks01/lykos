@@ -184,11 +184,23 @@ def disassemble_stage(ctx) -> dict:
     total = result.get("total_functions", len(funcs))
     partial = bool(result.get("partial"))
     failed = int(result.get("failed_batches") or 0)
+    # A rizin that crashed / returned empty (old bundled rizin, a fallback to an old host r2, a
+    # missing arch plugin) recovers 0 functions but USED to read as a clean "ran, 0 functions" --
+    # every function-keyed detector then silently starved. analyze() now flags that as a recovery
+    # FAILURE; say so in the note and the progress line rather than a silent clean small result.
+    recovery_failed = bool(result.get("recovery_failed"))
+    rec_note = result.get("recovery_error") or ""
     sha = ctx.put_artifact("ghidra-analysis", data=canonical_json(result))
     ctx.emit("re.done", payload={"functions": len(funcs), "call_edges": len(edges),
                                  "strings": len(strings), "total_functions": total,
                                  "partial": partial, "failed_batches": failed,
+                                 "recovery_failed": recovery_failed,
+                                 "note": rec_note or None,
                                  "language": result.get("program", {}).get("language")})
+    if recovery_failed:
+        ctx.progress(pct=100, msg="recovery FAILED — %d functions recovered (%s); not a clean "
+                                  "result" % (len(funcs), rec_note or "rizin produced no program"))
+        return {"output_shas": [sha], "output_kind": "ghidra-analysis"}
     suffix = ""
     if partial:
         suffix = (f" — partial: {len(funcs)}/{total} functions recovered"

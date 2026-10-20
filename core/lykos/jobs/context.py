@@ -281,11 +281,22 @@ class JobContext:
             disp = [_os.path.basename(argv[0]) if argv else ""]
             for a in argv[1:]:
                 disp.append(_os.path.basename(a) if (a.startswith("/") and _os.sep in a[1:]) else a)
+            # Only a FAILED run's stderr is an error. rizin (and many analysers) write benign
+            # analysis warnings to stderr on a clean rc==0 run; surfacing those in `err` made the
+            # autopilot console render them as red "errors" -- the "Rizin errors in the console"
+            # the operator saw. So carry stderr in `err` only when the process actually failed
+            # (rc not in (0, None)); a clean run keeps its stderr tail in the non-error `warn`
+            # field. A non-zero rc still ships its stderr in `err`, so real failures stay visible.
+            failed = rc not in (0, None)
+            err_tail = _short(err)
             self.emit("job.exec", "info", {
                 "tool": _os.path.basename(argv[0]) if argv else "",
                 "cmd": " ".join(disp)[:500],
                 "rc": rc, "ms": int((time.time() - start) * 1000),
-                "out": _short(out), "err": _short(err), "note": note})
+                "out": _short(out),
+                "err": err_tail if failed else None,
+                "warn": err_tail if (not failed and err_tail) else None,
+                "note": note})
         except Exception:                                    # noqa: BLE001
             pass
 

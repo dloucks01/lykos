@@ -176,11 +176,16 @@ def _mem_cap_preexec():
 
 
 def _run(cli: Path, binary: Path, script: str, *, ctx=None, timeout: int,
-         scratch: Optional[Path] = None) -> None:
+         scratch: Optional[Path] = None) -> Optional[subprocess.CompletedProcess]:
     """Run a rizin/radare2 command script. Output is captured by the script itself via per-
     command file redirection (`cmd > file`), NOT by parsing stdout -- this is the only approach
     that is portable across rizin and radare2. rizin's `?e` markers do not print and abort the
     command chain, and rizin warns to stderr during `ij`, so we never rely on stdout ordering.
+
+    Returns the CompletedProcess (returncode + captured stdout/stderr), so a caller that needs to
+    tell a CLEAN empty result from a rizin that actually CRASHED can look at rc/stderr -- most
+    callers ignore it (output comes from the redirected files). stderr is NOT a failure signal on
+    its own: rizin writes analysis warnings there on a clean run.
 
     The script is delivered through a file with `-i`, never inline with `-c`: a statically linked
     sanitizer build carries thousands of functions, and the per-function structural/decompile
@@ -207,10 +212,10 @@ def _run(cli: Path, binary: Path, script: str, *, ctx=None, timeout: int,
         # able to OOM the laptop it is packaged onto (see `_mem_cap_preexec`).
         _pre = _mem_cap_preexec()
         if ctx is not None:
-            ctx.run_subprocess(cmd, timeout=timeout, stdin=subprocess.DEVNULL, preexec_fn=_pre)
-        else:
-            subprocess.run(cmd, capture_output=True, timeout=timeout, stdin=subprocess.DEVNULL,
-                           preexec_fn=_pre)
+            return ctx.run_subprocess(cmd, timeout=timeout, stdin=subprocess.DEVNULL,
+                                      preexec_fn=_pre)
+        return subprocess.run(cmd, capture_output=True, timeout=timeout,
+                              stdin=subprocess.DEVNULL, preexec_fn=_pre)
     finally:
         try:
             os.unlink(spath)
@@ -248,6 +253,16 @@ def _readj(path: Path, default):
 def _redir(cmd: str, path: Path) -> str:
     """A rizin command whose output is redirected to a file (`cmd > path`)."""
     return f"{cmd} > {path}"
+
+
+def _tail_stderr(err, n: int = 400) -> str:
+    """Short, printable tail of a child's captured stderr (bytes or str), for a diagnostic note /
+    log line; "" when there is nothing."""
+    if not err:
+        return ""
+    if isinstance(err, (bytes, bytearray)):
+        return bytes(err[-n:]).decode("utf-8", "replace").strip()
+    return str(err)[-n:].strip()
 
 
 def _vn(ctx, v) -> str:
@@ -540,10 +555,23 @@ def analyze(binary: Path, *, ctx=None, timeout: int = 900) -> dict:
         observe.absorbed(_log, "continuing")
 
     # Pass 1: program metadata + function list + strings + imports, each redirected to a file.
-    _run(cli, binary, "aaa;" + main_seed + ";".join([
+    # Keep the CompletedProcess: pass 1 is the run that discovers the function list, so its
+    # rc/stderr is what tells a genuinely CLEAN "0 functions" apart from a rizin that crashed or
+    # fell back to an old/incompatible build and recovered nothing (see the empty-recovery check
+    # after the function list is parsed).
+    _p1 = _run(cli, binary, "aaa;" + main_seed + ";".join([
         _redir("ij", T / "ij"), _redir("aflj", T / "funcs"),
         _redir("izj", T / "strings"), _redir("iij", T / "imports")]),
         ctx=ctx, timeout=timeout, scratch=T)
+    _p1_rc = getattr(_p1, "returncode", None)
+    _p1_err = _tail_stderr(getattr(_p1, "stderr", None))
+    # rizin warns to stderr by design, but a NON-ZERO exit is a real problem: surface its stderr
+    # tail to the log so an old/absent/incompatible rizin is visible even when it still produced
+    # some output. (The empty-recovery decision below additionally treats stderr-with-rc!=0 and
+    # the 0-functions case as a failure.)
+    if _p1_rc not in (0, None):
+        _log.warning("rizin/r2 exited rc=%s during analysis pass 1%s", _p1_rc,
+                     f"; stderr tail: {_p1_err}" if _p1_err else "")
     ij = _readj(T / "ij", {})
     binf = ij.get("bin", {}) if isinstance(ij, dict) else {}
     core = ij.get("core", {}) if isinstance(ij, dict) else {}
@@ -704,12 +732,30 @@ def analyze(binary: Path, *, ctx=None, timeout: int = 900) -> dict:
     strings = _build_strings(cli, binary, izj, T, ctx=ctx, timeout=timeout)
     imports = [i.get("name") for i in iij if isinstance(i, dict) and i.get("name")]
 
+    # Empty recovery that is actually a FAILURE, not a clean "0 functions". When rizin crashed,
+    # returned non-zero, or wrote to stderr while recovering ZERO functions (old bundled rizin, a
+    # fallback to an old host r2, a missing arch plugin), the old result read as "ran clean, 0
+    # functions" and every function-keyed detector silently starved. Flag it so the stage reports
+    # recovery FAILED with the rc/stderr, rather than a silent clean small result.
+    recovery_failed = (len(functions) == 0
+                       and (_p1_rc not in (0, None) or bool(_p1_err)))
+    recovery_error = ""
+    if recovery_failed:
+        recovery_error = (f"rizin/r2 recovered 0 functions (rc={_p1_rc}"
+                          + (f", stderr: {_p1_err}" if _p1_err else "")
+                          + ") -- the disassembler produced no program (an old/incompatible "
+                            "rizin/r2 or a missing arch plugin); every function-keyed detector "
+                            "would see an empty program")
+
     return {"program": prog, "function_count": len(functions),
             "functions": functions, "strings": strings, "imports": imports,
             # honest bookkeeping: how complete this analysis is, surfaced by the stage.
             "total_functions": total_fns, "analyzed_functions": len(functions),
-            "partial": bool(failed_batches) or (_MAX_FUNCS and total_fns > _MAX_FUNCS),
-            "failed_batches": failed_batches}
+            "partial": bool(failed_batches) or recovery_failed
+                       or (_MAX_FUNCS and total_fns > _MAX_FUNCS),
+            "failed_batches": failed_batches,
+            # an empty recovery that was really a crash/incompatible-rizin, not a clean 0.
+            "recovery_failed": recovery_failed, "recovery_error": recovery_error}
 
 
 def decompile_one(binary: Path, addr, *, ctx=None, timeout: int = 120) -> str:
