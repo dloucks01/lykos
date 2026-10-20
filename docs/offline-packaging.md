@@ -281,9 +281,14 @@ pypcode wheel and the engine venvs), so the laptop needs no particular `python3`
 are linked against the build host's glibc, so a bundle built on today's Kali would normally refuse
 to load on a laptop whose glibc is older. The package defeats this: on the **first run**
 (`./lykos …` or `./start`, also after the folder is copied off a disc) the launcher runs
-`packaging/relink-bundle.sh`, which repoints every bundled ELF's interpreter and rpath at the
-bundle's **own** loader and libraries (a static `patchelf` ships for this, since it must run before
-the bundle's glibc is usable). After that one-time relink — a few seconds, stamped so it is a no-op
+`packaging/relink-bundle.sh`, which repoints each **dynamically linked** bundled ELF's interpreter
+and rpath at the bundle's **own** loader and libraries (a static `patchelf` ships for this, since it
+must run before the bundle's glibc is usable). **Self-contained static / static-PIE binaries — the
+qemu-user emulators among them — are deliberately left untouched: they carry their own startup and
+have no host glibc to repoint, and `patchelf`-ing a static-PIE executable rewrites its program
+headers and breaks the self-relocation it performs before `main`, which SIGSEGVs it at startup (this
+silently broke every vendored qemu and, with it, all cross-arch execution; see
+`internal/43-autopilot-crossarch-l3-2026-10-19.md`).** After that one-time relink — a few seconds, stamped so it is a no-op
 afterwards — the tools resolve only the bundle's libraries and the laptop's glibc is never
 consulted. So you still build on a convenient modern machine, and it runs on the older air-gapped
 VM with **no capability loss**. See `relink-bundle.sh` and the "never touches host libraries" note
