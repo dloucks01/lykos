@@ -85,3 +85,14 @@ def test_relabel_is_a_noop_on_a_non_elf_or_named_target(ref_archive):
     funcs = [{"addr": "0x1000", "name": "my_real_func", "calls": []}]
     flirt.relabel(b"\x7fELF\x02" + b"\x00" * 60, funcs)
     assert funcs[0]["name"] == "my_real_func"
+
+
+def test_ifunc_stub_resolves_an_ifunc_sink(ref_archive, static_bin):
+    """strcpy/str*/mem* are IFUNCs: the body is identified but the CALL lands on a resolver thunk
+    (jmp *[rip+GOT]), not the body. ifunc_stub_names must chain GOT -> IRELATIVE resolver -> the
+    named variant the resolver lea's, so the thunk/GOT -- and the call edge to it -- gets the name."""
+    sigs = flirt.build_signatures(open(ref_archive, "rb").read())
+    tgt = static_bin.read_bytes()
+    named = flirt.identify(tgt, None, sigs)
+    stubs = flirt.ifunc_stub_names(tgt, named)
+    assert "strcpy" in stubs.values(), "IFUNC thunk/GOT for strcpy was not resolved to a name"

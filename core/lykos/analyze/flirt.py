@@ -295,6 +295,111 @@ def identify(target_bytes: bytes, functions=None, signatures: dict = None) -> di
     return found
 
 
+_R_X86_64_IRELATIVE = 37
+
+
+def _rela_sections(target: bytes):
+    """(off, size, entsize) for every SHT_RELA section of an ELF64 (static IRELATIVE relocs live
+    in .rela.plt, which readelf -r hides on a static binary but whose section is present)."""
+    out = []
+    if len(target) < 64 or target[:4] != b"\x7fELF" or target[4] != 2:
+        return out
+    endc = "<" if target[5] == 1 else ">"
+    e_shoff = struct.unpack_from(endc + "Q", target, 40)[0]
+    e_shentsize, e_shnum = struct.unpack_from(endc + "HH", target, 58)
+    for i in range(e_shnum):
+        b = e_shoff + i * e_shentsize
+        if b + 64 > len(target):
+            break
+        _nm, typ, _fl, _ad, off, size, _lk, _inf, _al, ent = \
+            struct.unpack_from(endc + "IIQQQQIIQQ", target, b)
+        if typ == 4 and ent >= 24:                       # SHT_RELA
+            out.append((off, size, ent))
+    return out
+
+
+def _irelative_map(target: bytes) -> dict:
+    """{GOT-slot vaddr: resolver vaddr} from the IRELATIVE relocations -- each GOT slot a static
+    IFUNC thunk jumps through, and the resolver that (at startup) fills it with a variant."""
+    endc = "<" if len(target) > 5 and target[5] == 1 else ">"
+    out = {}
+    for off, size, ent in _rela_sections(target):
+        for k in range(0, size, ent):
+            if off + k + 24 > len(target):
+                break
+            r_offset, r_info, r_addend = struct.unpack_from(endc + "QQq", target, off + k)
+            if (r_info & 0xFFFFFFFF) == _R_X86_64_IRELATIVE:
+                out[r_offset] = r_addend & 0xFFFFFFFFFFFFFFFF
+    return out
+
+
+def _lea_targets(target: bytes, func_va: int, span: int = 192):
+    """RIP-relative `lea reg,[rip+disp32]` targets within a function -- an IFUNC resolver loads its
+    candidate variant addresses this way, so a resolver is identified by the variants it lea's."""
+    off = _va_to_off(target, func_va)
+    if off is None:
+        return
+    code = target[off: off + span]
+    i = 0
+    n = len(code) - 6
+    while i < n:
+        if code[i] == 0x48 and code[i + 1] == 0x8D and (code[i + 2] & 0xC7) == 0x05:  # lea r64,[rip+d]
+            disp = struct.unpack_from("<i", code, i + 3)[0]
+            yield func_va + i + 7 + disp
+            i += 7
+        else:
+            i += 1
+
+
+def ifunc_stub_names(target_bytes: bytes, named: dict) -> dict:
+    """{thunk/GOT vaddr: canonical name} for static IFUNC sinks. A call to e.g. strcpy() lands on a
+    tiny `jmp *[rip+GOT]` thunk (the body is reached only after the startup IRELATIVE resolver runs),
+    so the call EDGE points at the thunk, not the named variant body. Chain it: the GOT slot's
+    IRELATIVE addend is the resolver, the resolver lea's the variant bodies this module already named,
+    so the GOT slot -- and every thunk jumping through it, and every edge to such a thunk -- is that
+    name. `named` is {hex_va: name} of the already-matched variant bodies."""
+    irel = _irelative_map(target_bytes)
+    if not irel:
+        return {}
+    named_ints = {}
+    for k, v in named.items():
+        try:
+            named_ints[int(str(k), 16)] = v
+        except (TypeError, ValueError):
+            pass
+    got_name: dict = {}
+    for got_va, resolver in irel.items():
+        for tgt in _lea_targets(target_bytes, resolver):
+            if tgt in named_ints:
+                got_name[got_va] = named_ints[tgt]
+                break
+    if not got_name:
+        return {}
+    out: dict = {hex(g): n for g, n in got_name.items()}   # an edge may point at the GOT slot
+    # Scan executable segments for `jmp *[rip+disp32]` (ff 25) thunks pointing at a named GOT slot;
+    # name the thunk (and, if an endbr64 precedes it, that entry too -- the call lands there).
+    for seg_off, seg_va, seg_size in _exec_ranges(target_bytes):
+        seg = target_bytes[seg_off: seg_off + seg_size]
+        pos = 0
+        while True:
+            k = seg.find(b"\xff\x25", pos)
+            if k < 0:
+                break
+            pos = k + 1
+            if k + 6 > len(seg):
+                continue
+            disp = struct.unpack_from("<i", seg, k + 2)[0]
+            got = seg_va + k + 6 + disp
+            name = got_name.get(got)
+            if name:
+                out[hex(seg_va + k)] = name
+                if k >= 4 and seg[k - 4:k] == b"\xf3\x0f\x1e\xfa":       # endbr64 before the jmp
+                    out[hex(seg_va + k - 4)] = name
+                if k >= 1 and seg[k - 1] == 0xF2:                        # a bnd prefix
+                    out[hex(seg_va + k - 1)] = name
+    return out
+
+
 _SIG_CACHE = None
 # Names a recovery backend hands an unidentified function; only these (or an empty name) are
 # overwritten -- a real symbol / dynamic import is never clobbered.
@@ -339,6 +444,13 @@ def relabel(target_bytes: bytes, funcs: list) -> int:
     named = identify(target_bytes, None, sigs)           # {hex_va: canonical name}
     if not named:
         return 0
+    # Extend with the IFUNC thunks/GOT slots: a str*/mem* CALL lands on a resolver thunk, not the
+    # named variant body, so without this the overflow-sink edges (strcpy/strcat/memcpy) stay
+    # unnamed even though the body is identified.
+    try:
+        named.update(ifunc_stub_names(target_bytes, named))
+    except Exception:                                    # noqa: BLE001 -- the direct names still stand
+        pass
 
     def _hx(a):
         try:
