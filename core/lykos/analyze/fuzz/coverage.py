@@ -169,7 +169,12 @@ def _unsupported(target, use_qemu=True):
     guest = aflpp.qemu_trace_arch(trace)
     if guest and target.arch and guest != target.arch:
         cpu = {"x86-64": "x86_64", "x86": "i386"}.get(target.arch, target.arch)
-        return (f"the installed afl-qemu-trace emulates {guest}, and this target is "
+        # LEAD with the category, as the `trace is None` sibling above does: the classifier reads
+        # this note and the scorecard stores only a bounded PREFIX of it, so "cross-arch" has to
+        # come first to survive the truncation -- otherwise every non-host guest here declines for
+        # an "unknown" reason (a trace that emulates the wrong guest is the same host/guest
+        # capability boundary as having no trace at all).
+        return (f"cross-arch: the installed afl-qemu-trace emulates {guest}, and this target is "
                 f"{target.arch} -- it would abort at the fork-server handshake. Build a "
                 f"matching one (CPU_TARGET={cpu} ./qemu_mode/build_qemu_support.sh in "
                 f"AFL++) and point LYKOS_AFL at it, or use the black-box `fuzz` stage, "
