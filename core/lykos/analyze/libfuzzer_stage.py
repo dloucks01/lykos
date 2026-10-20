@@ -15,8 +15,9 @@ import tarfile
 import time
 from pathlib import Path
 
-from ..db.dao import ArtifactDAO, DynResultDAO, FindingDAO, TargetDAO
+from ..db.dao import DynResultDAO, FindingDAO, TargetDAO
 from ..jobs.registry import register_stage
+from .source_lookup import source_project_for
 from .debug.rootcause import parse_asan_report
 
 TOOL, TOOL_VERSION = "libfuzzer", "libfuzzer-1"
@@ -28,11 +29,9 @@ LF_CORPUS_UNITS = 2000
 def _materialize_source(ctx, target) -> Path | None:
     """Recover the target's source into a scratch directory: the archived source-project tree, or a
     single source-code file. None when the target was not built from source."""
-    arts = ArtifactDAO(ctx.conn).list_by_case(target.case_id)
     d = ctx.scratch() / "src"
     d.mkdir(parents=True, exist_ok=True)
-    proj = next((a for a in arts if a.kind == "source-project"
-                 and (a.meta or {}).get("binary_sha") == target.sha256), None)
+    proj = source_project_for(ctx.conn, target)
     if proj:
         try:
             with tarfile.open(fileobj=io.BytesIO(ctx.content.path(proj.sha256).read_bytes()),
@@ -43,8 +42,7 @@ def _materialize_source(ctx, target) -> Path | None:
             return d
         except Exception:                                # noqa: BLE001
             return None
-    single = next((a for a in arts if a.kind == "source-code"
-                   and (a.meta or {}).get("binary_sha") == target.sha256), None)
+    single = source_project_for(ctx.conn, target, kind="source-code")
     if single:
         try:
             fn = (single.meta or {}).get("filename") or "a.c"

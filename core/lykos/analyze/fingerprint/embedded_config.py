@@ -17,6 +17,7 @@ from pathlib import Path
 
 from ...db.dao import FindingDAO, TargetDAO
 from ...jobs.registry import register_stage
+from ..source_lookup import source_project_for
 
 _log = logging.getLogger(__name__)
 
@@ -126,9 +127,7 @@ def embedded_audit_stage(ctx) -> dict:
     target = TargetDAO(ctx.conn).get(ctx.target_id) if ctx.target_id else None
     if target is None:
         raise ValueError("embedded_audit requires a target_id")
-    proj = next((a for a in ArtifactDAO(ctx.conn).list_by_case(target.case_id)
-                 if a.kind == "source-project"
-                 and (a.meta or {}).get("binary_sha") == target.sha256), None)
+    proj = source_project_for(ctx.conn, target)
     if proj is None:
         ctx.emit("embedded_audit.done", payload={"applicable": False,
                  "note": "no archived source tree (RTOS config lives in source)"})

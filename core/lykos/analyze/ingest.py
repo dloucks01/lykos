@@ -367,34 +367,45 @@ def gather_bundle(dirpath) -> tuple[Optional[Path], dict[str, str]]:
 MAX_ENTRY_POINTS = 6
 
 
+def _source_tree_tgz(root, *, skip_binary=None) -> bytes:
+    """A gzipped tar of a source tree -- the `source-project` artifact the source bug detectors read
+    (they read the TEXT, not a built binary). Skips VCS/build dirs, object/library files, the built
+    binary, and oversized files."""
+    import io
+    import tarfile
+
+    root = Path(root)
+    skip_binary = Path(skip_binary) if skip_binary is not None else None
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        for p in sorted(root.rglob("*")):
+            if not p.is_file():
+                continue
+            rel = p.relative_to(root)
+            if any(seg in (".git", "_lykos_build", "node_modules") for seg in rel.parts):
+                continue
+            if (p.suffix in {".o", ".a", ".so", ".lo", ".la"} or p == skip_binary
+                    or p.stat().st_size > 8 << 20):
+                continue
+            try:
+                tf.add(str(p), arcname=rel.as_posix())
+            except OSError:
+                pass
+    return buf.getvalue()
+
+
 def _ingest_built_project(store, case_id, root, built, filename):
     """Ingest the binary produced by building a source PROJECT: store the primary instrumented
     executable as the target, keep the source TREE (tar.gz) keyed to its hash so the code view can
     show real source with the sanitizer's file:line attributions, and record the build provenance."""
-    import io
-    import tarfile
-
     root = Path(root)
     primary = Path(built["primary"])
     info = hash_all_file(primary)
     if not info["size"]:
         raise NotAnalysable(f"{filename}: project built an empty binary")
     # archive the source tree (skip build outputs and VCS/build dirs) for the code view + provenance
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
-        for p in sorted(root.rglob("*")):
-            if not p.is_file():
-                continue
-            rel = p.relative_to(root).as_posix()
-            if any(seg in (".git", "_lykos_build", "node_modules") for seg in p.relative_to(root).parts):
-                continue
-            if p.suffix in {".o", ".a", ".so", ".lo", ".la"} or p == primary or p.stat().st_size > 8 << 20:
-                continue
-            try:
-                tf.add(str(p), arcname=rel)
-            except OSError:
-                pass
-    store.put_artifact(case_id, "source-project", data=buf.getvalue(),
+    buf_bytes = _source_tree_tgz(root, skip_binary=primary)
+    store.put_artifact(case_id, "source-project", data=buf_bytes,
                        meta={"binary_sha": info["sha256"], "filename": filename,
                              "build_system": built.get("system"), "compiler": built.get("compiler"),
                              "other_binaries": [b.name for b in built.get("binaries", [])[1:8]]})
@@ -418,6 +429,16 @@ def _ingest_built_project(store, case_id, root, built, filename):
             store.put_artifact(case_id, "target-blob", src=ex)
             store.targets.upsert(case_id, ex.name, xi["sha256"],
                                  md5=xi["md5"], sha1=xi["sha1"], size=xi["size"])
+            # Key the SAME source tree to THIS entry point too, not only the primary: a multi-binary
+            # project (libtiff builds ~20 tools) otherwise had the tree bound to one sha, so every
+            # other entry point's source detectors reported "no archived source tree". The content
+            # store is content-addressed, so the identical tar.gz dedups to one blob -- only a cheap
+            # per-sha artifact row is added. (source_lookup's case-level fallback also covers this,
+            # but an exact key is better than a fallback that declines when the case holds several.)
+            store.put_artifact(case_id, "source-project", data=buf_bytes,
+                               meta={"binary_sha": xi["sha256"], "filename": ex.name,
+                                     "build_system": built.get("system"),
+                                     "compiler": built.get("compiler")})
         except OSError:
             continue
     return main
@@ -455,7 +476,22 @@ def ingest(store, case_id: str, path: str | Path, filename: Optional[str] = None
                 raise NotAnalysable(
                     f"{path.name}: source project did not build:\n{build_log.strip()[-600:]}")
             raise NotAnalysable(f"{path.name}: no analysable binary found in the bundle")
-        return ingest(store, case_id, main, filename=filename or main.name, deps=dep_files)
+        tgt = ingest(store, case_id, main, filename=filename or main.name, deps=dep_files)
+        if build_log is not None:
+            # It WAS a source project but did not fully build (no/partial toolchain on the air-gapped
+            # box -- missing cmake/autotools, a CMake min-version rejection, ...). The source bug
+            # detectors read the source TEXT, not the built binary, so archive the tree ANYWAY --
+            # keyed to the binary we did ingest -- and record that the build failed with its log.
+            # Without this every source detector reported "no archived source tree" even though the
+            # source is right here, and the operator never saw that the build was why.
+            try:
+                store.put_artifact(case_id, "source-project", data=_source_tree_tgz(path),
+                                   meta={"binary_sha": tgt.sha256,
+                                         "filename": filename or path.name, "build_failed": True,
+                                         "build_log": (build_log or "").strip()[-2000:]})
+            except Exception:                        # noqa: BLE001 -- best-effort source enrichment
+                pass
+        return tgt
     fname = filename or path.name
     if not path.stat().st_size:
         raise NotAnalysable(f"{fname} is empty (0 bytes) -- nothing to analyse")

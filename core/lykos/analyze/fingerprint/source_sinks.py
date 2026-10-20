@@ -23,6 +23,7 @@ from pathlib import Path
 
 from ...db.dao import ArtifactDAO, FindingDAO, TargetDAO
 from ...jobs.registry import register_stage
+from ..source_lookup import source_project_for
 
 _log = logging.getLogger(__name__)
 
@@ -170,9 +171,7 @@ def source_sink_stage(ctx) -> dict:
     target = TargetDAO(ctx.conn).get(ctx.target_id) if ctx.target_id else None
     if target is None:
         raise ValueError("source_sink_scan requires a target_id")
-    proj = next((a for a in ArtifactDAO(ctx.conn).list_by_case(target.case_id)
-                 if a.kind == "source-project"
-                 and (a.meta or {}).get("binary_sha") == target.sha256), None)
+    proj = source_project_for(ctx.conn, target)
     if proj is None:
         ctx.emit("source_sink.done", payload={"applicable": False,
                  "note": "no archived source tree (this detector reads C/C++ source)"})

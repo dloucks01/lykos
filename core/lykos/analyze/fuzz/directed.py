@@ -28,7 +28,6 @@ from collections import defaultdict
 
 from ... import observe
 from ...db.dao import (
-    ArtifactDAO,
     CallEdgeDAO,
     DynResultDAO,
     FindingDAO,
@@ -38,6 +37,7 @@ from ...db.dao import (
 )
 from ...hashing import canonical_json
 from ...jobs.registry import register_stage
+from ..source_lookup import source_project_for
 from ..detect.catalog import SOURCES, normalize
 from . import cmpdict
 from .stage import (
@@ -324,12 +324,8 @@ def _auto_weggli_targets(ctx, target, functions, *, timeout: float = 90.0):
     from .. import weggli
     if weggli.weggli_bin() is None:
         return []
-    art = None
-    for a in ArtifactDAO(ctx.conn).list_by_case(target.case_id):
-        if a.kind in ("source-project", "source-code") \
-                and (a.meta or {}).get("binary_sha") == target.sha256:
-            art = a
-            break
+    art = (source_project_for(ctx.conn, target)
+           or source_project_for(ctx.conn, target, kind="source-code"))
     if art is None:
         return []
     d = Path(tempfile.mkdtemp(prefix="lykos-weggli-"))

@@ -21,6 +21,7 @@ from pathlib import Path
 from ... import observe
 from ...db.dao import ArtifactDAO, FindingDAO, TargetDAO
 from ...jobs.registry import register_stage
+from ..source_lookup import source_project_for
 from . import scan
 
 _log = logging.getLogger(__name__)
@@ -361,9 +362,7 @@ def source_cve_stage(ctx) -> dict:
     if target is None:
         raise ValueError("source_cve_scan requires a target_id")
     # Recover the archived source tree for this target (built-from-source projects only).
-    arts = ArtifactDAO(ctx.conn).list_by_case(target.case_id)
-    proj = next((a for a in arts if a.kind == "source-project"
-                 and (a.meta or {}).get("binary_sha") == target.sha256), None)
+    proj = source_project_for(ctx.conn, target)
     if proj is None:
         ctx.emit("source_cve.done", payload={"applicable": False,
                  "note": "no archived source tree (target was not built from a source project)"})
