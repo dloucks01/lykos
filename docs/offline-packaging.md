@@ -329,6 +329,14 @@ source dist/engines/engines.env  # exports LYKOS_AFLQEMU_DIR / LYKOS_QASAN / LYK
 ##   cargo install weggli --root dist/engines/weggli-root        # source variant analysis
 ##   packaging/build-symqemu.sh                                  # concolic (x86_64, needs docker)
 
+## FLIRT library-ID of stripped STATIC binaries needs the TARGET distro's libc.a as its reference
+## (it matches the exact function bodies a static link pulls in). That archive ships with libc6-dev,
+## a build-essential dependency, so `make toolchain-bundle` already collects it IN THE TARGET
+## DISTRO'S CONTAINER -- i.e. the bundle carries the Kali (glibc 2.42) libc.a, which is the right
+## reference for binaries built on that box, not the analysis host's glibc. vendorenv auto-points
+## LYKOS_REF_LIBC_A at the bundled copy; collect-toolchain WARNS if libc.a is missing. Override with
+## LYKOS_REF_LIBC_A=/path/to/target/libc.a if analysing binaries from a different distro.
+
 ./package                       # fold the working tree + a fully-populated vendor/ into one package
 ## make-runnable.sh injects the engines named above, vendors a matching Python so the unicorn/angr
 ## venvs load (it SMOKE-TESTS unicorn.Uc() and warns if the ABI does not match), closes the

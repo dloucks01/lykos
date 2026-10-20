@@ -305,6 +305,21 @@ def activate(force: bool = False) -> dict:
                 env["LYKOS_QASAN"] = str(ql)
                 break
 
+    # libc.a is the reference the FLIRT library-ID pass (analyze/flirt.py) matches a STRIPPED STATIC
+    # binary against -- it carries the exact function bodies a static link pulls in. The bundle's
+    # copy (from build-essential -> libc6-dev, collected in the TARGET distro's container) is the
+    # RIGHT reference: it matches the glibc the operator's static binaries were built against (e.g.
+    # Kali's 2.42), not whatever the analysis host happens to run. Point LYKOS_REF_LIBC_A at it so
+    # flirt.reference_archive() uses the bundled archive instead of a host /usr path that an
+    # air-gapped box may not have. Only when unset, so an operator override wins.
+    if prefix and not os.environ.get("LYKOS_REF_LIBC_A"):
+        for sub in ("usr/lib/x86_64-linux-gnu/libc.a", "usr/lib64/libc.a", "usr/lib/libc.a"):
+            la = prefix / sub
+            if la.is_file():
+                os.environ["LYKOS_REF_LIBC_A"] = str(la)
+                env["LYKOS_REF_LIBC_A"] = str(la)
+                break
+
     # A relocated GCC (and the cross-compilers) looks for system headers and startup files at
     # absolute /usr paths, which are empty on a minimal target -- so `#include <string.h>` and
     # linking fail even though the bundle carries them. Point the compilers at the vendored

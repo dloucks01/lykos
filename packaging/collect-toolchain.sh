@@ -158,6 +158,12 @@ if [ -z "$(find /stage -iname "symqemu*" 2>/dev/null | head -1)" ]; then
   echo "           it via packaging/build-symqemu.sh and inject it with LYKOS_SYMQEMU_DIR through"
   echo "           make-runnable.sh."
 fi
+if [ -z "$(find /stage -iname "libc.a" 2>/dev/null | head -1)" ]; then
+  echo "  WARNING: libc.a is not in this bundle -- FLIRT library-ID of STRIPPED STATIC binaries will"
+  echo "           be disabled (libc sinks like system/strcpy/gets stay fcn.XXXX and dangerous_api"
+  echo "           cannot see them). It ships with libc6-dev (a build-essential dependency); ensure"
+  echo "           that package is collected, or point LYKOS_REF_LIBC_A at the target distro's libc.a."
+fi
 
 say "python venvs (this distro s interpreter)"
 for spec in "angr:angr claripy" "unicorn:unicorn keystone-engine"; do
