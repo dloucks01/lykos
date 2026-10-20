@@ -139,6 +139,38 @@ def test_format_auto_got_to_shell(store, case, pool, fmt_loop_bin):
                for pc in PocDAO(store.conn).list_by_target(t.id)), "no confirmed L3 format->shell"
 
 
+@pytest.fixture
+def fmt_fgets_bin(gcc, tmp_path_factory, x86_64_only):
+    """A LINE-BUFFERED format-string service: the loop reads with fgets (stops at a newline), which
+    is what a real echo/menu service almost always uses. The auto chain must deliver its overwrite
+    and "/bin/sh" as COMPLETE LINES or fgets blocks and no shell spawns -- the regression this guards."""
+    d = tmp_path_factory.mktemp("fmtfgets")
+    (d / "v.c").write_text(
+        "#include <stdio.h>\n"
+        "int main(void){ setbuf(stdout,0); char buf[200];\n"
+        "  puts(\"echo service\");\n"
+        "  while (fgets(buf, sizeof buf, stdin)) { printf(buf); fflush(stdout); } return 0; }\n")
+    out = d / "fmtfgets"
+    if subprocess.run([gcc, "-O0", "-fno-stack-protector", "-no-pie", "-w",
+                       str(d / "v.c"), "-o", str(out)], capture_output=True).returncode != 0:
+        pytest.skip("cannot build fgets format-string target")
+    return out
+
+
+def test_format_auto_got_to_shell_fgets(store, case, pool, fmt_fgets_bin):
+    """Regression: an fgets-based printf(user) sink reached L2 but the auto format->shell chain wrote
+    its overwrite and "/bin/sh" without a trailing newline, so fgets never returned and the shell
+    never spawned ("format GOT->system did not spawn a shell"). With the line terminator it confirms."""
+    from lykos.analyze.poc import enqueue_exploit
+    t = ingest(store, case.id, fmt_fgets_bin, filename="fmtfgets")
+    q = JobQueue(store.conn)
+    enqueue_triage(q, t, force=True); assert pool.wait_idle(40)
+    run = enqueue_exploit(q, t, params={"input_mode": "stdin", "timeout": 25})
+    assert pool.wait_idle(180) and q.runs.get(run.id).status == "done"
+    assert any(pc.level == "L3" and pc.verified
+               for pc in PocDAO(store.conn).list_by_target(t.id)), "no confirmed L3 format->shell (fgets)"
+
+
 def test_format_write_refuses_got_overwrite_under_full_relro(store, case, pool, fmt_bin_fullrelro):
     """Full RELRO / bind-now remaps the GOT read-only before main, so a %hhn GOT overwrite silently
     faulted. The stage must now REFUSE with an honest reason (GOT read-only -> use fmt_write_addr),
