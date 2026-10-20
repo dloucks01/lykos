@@ -1775,6 +1775,12 @@ def _finalize(ctx, target, target_bytes, mode, base_argv, cap0, control, prim, c
     _fp, _fs = frame
     _payload = {
         "primitive": prim["type"], "supported": True, "offset": prim.get("offset"),
+        # The crash this L2 was MEASURED on. build_exploit weaponizes a specific crash; with several
+        # distinct defects on one target it must inherit the offset/channel/disclosure measured on
+        # THAT crash, not the newest L2 from an unrelated one. L3 prefers the matching input_sha and
+        # falls back to any (so the crashless early attempt is unaffected). See exploit_stage
+        # `_confirmed_l2`/`_l2_disclosure_triggers`.
+        "input_sha": (ctx.params or {}).get("input_sha"),
         # WHERE the control came from: "pc", a return-address register, `reg:<r>` for an indirect
         # branch through a register (a hijacked function pointer), or a stack slot. L3 needs it to
         # choose: the one-jump recipes that pass the OBJECT as the callee's argument only apply to

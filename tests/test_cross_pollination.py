@@ -91,3 +91,32 @@ def test_injection_leak_not_used_when_it_resolved_no_base(store):
             {"probe": "fmt", "cwe": "CWE-134", "mode": "stdin",
              "input_sha": sha, "level": "L1", "resolved_base": False}]})
     assert _l2_disclosure_triggers(_Ctx(store), store.targets.get(t.id)) == []
+
+
+def test_l2_to_l3_prefers_the_crash_being_weaponized(store):
+    """GAP 4: with several confirmed L2s on one target, build_exploit inherits the offset measured on
+    the crash it is weaponizing (_STAGE.input_sha), not the newest from an unrelated defect -- while
+    the crashless early attempt (no input_sha) still takes the newest, and a lone unrelated L2 is a
+    fallback, not filtered out."""
+    from lykos.analyze.poc import exploit_stage
+    from lykos.analyze.poc.exploit_stage import _confirmed_l2, _l2_offset, _STAGE
+    cid, t = _target(store)
+    # crash A (offset 40), then crash B (offset 72) -- B is newer
+    _emit(store, cid, t.id, "poc_primitive", "primitive.done",
+          {"primitive": "ret", "supported": True, "confirmed": True, "offset": 40,
+           "mode": "stdin", "input_sha": "shaA"})
+    _emit(store, cid, t.id, "poc_primitive", "primitive.done",
+          {"primitive": "ret", "supported": True, "confirmed": True, "offset": 72,
+           "mode": "stdin", "input_sha": "shaB"})
+    ctx = _Ctx(store); tgt = store.targets.get(t.id)
+    try:
+        _STAGE.input_sha = "shaA"                      # weaponizing crash A
+        assert _l2_offset(ctx, tgt) == 40, "did not prefer the weaponized crash's L2"
+        _STAGE.input_sha = "shaB"
+        assert _l2_offset(ctx, tgt) == 72
+        _STAGE.input_sha = None                        # crashless early attempt -> newest
+        assert _l2_offset(ctx, tgt) == 72
+        _STAGE.input_sha = "shaC"                      # no L2 for this crash -> falls back to some L2
+        assert _l2_offset(ctx, tgt) in (40, 72)
+    finally:
+        _STAGE.input_sha = None
