@@ -302,8 +302,10 @@ below. (A plain `git clone` with no `vendor/toolchain` skips the relink entirely
 git clone <lykos> && cd lykos
 make test                       # confirm the repo is sound before packaging anything
 make toolchain-bundle           # collect engines inside a container matching the target distro
-## (Kali rolling by default; needs podman or docker. Pass --target native to collect from an
-##  ABI-identical host, but prefer the container -- a native collect misses already-installed deps.)
+## wraps packaging/collect-toolchain.sh, which dpkg-deb -x extracts every engine's debs into a
+## relocatable toolchain/ tree (no apt/dpkg on the target). Kali rolling by default; needs podman
+## or docker. Pass --target native to collect from an ABI-identical host, but prefer the container
+## -- a native collect misses already-installed deps.
 ## -> dist/lykos-toolchain-<distro>-<date>-<arch>.tar.zst  (+ its sha256)
 
 ./package                       # fold the working tree + a fully-populated vendor/ into one package
@@ -329,8 +331,10 @@ by sneakernet. Burn (or copy) **everything named `lykos-offline-<date>-<arch>.*`
 toolchain separately — e.g. you re-cut the repo often — `make repo-tarball` writes
 `dist/lykos-repo.tar.gz` and the toolchain bundle is placed on the far side by its own `setup.sh`
 (`LYKOS_ROOT=$PWD /tmp/lt/setup.sh`, which verifies the manifest and copies `toolchain/` under
-`vendor/`). The combined `./package` output above is the recommended path; this one trades a larger
-re-carry for a smaller repo refresh.
+`vendor/`). To check a bundle's integrity before trusting it without placing anything, run
+`setup.sh --verify-only` first — it verifies every listed file's SHA256 and exits, placing nothing.
+The combined `./package` output above is the recommended path; this one trades a larger re-carry for
+a smaller repo refresh.
 
 ### 2. On the offline workstation — extract and run
 
