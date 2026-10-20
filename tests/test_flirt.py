@@ -96,3 +96,41 @@ def test_ifunc_stub_resolves_an_ifunc_sink(ref_archive, static_bin):
     named = flirt.identify(tgt, None, sigs)
     stubs = flirt.ifunc_stub_names(tgt, named)
     assert "strcpy" in stubs.values(), "IFUNC thunk/GOT for strcpy was not resolved to a name"
+
+
+@pytest.fixture
+def aarch64_static_bin(tmp_path):
+    gcc = shutil.which("aarch64-linux-gnu-gcc")
+    if not gcc or not flirt.reference_archive(flirt._EM_AARCH64):
+        pytest.skip("no aarch64 cross toolchain / aarch64 libc.a")
+    c = tmp_path / "v.c"
+    c.write_text(
+        "#include <string.h>\n#include <stdlib.h>\n#include <unistd.h>\n"
+        "void proc(char*in){char b[64]; strcpy(b,in);}\n"
+        "int main(void){char l[256]; int n=read(0,l,255); l[n>0?n:0]=0; proc(l);"
+        " system(\"true\"); return 0;}\n")
+    out = tmp_path / "a64stat"
+    r = subprocess.run([gcc, "-static", "-no-pie", "-fno-stack-protector", "-w",
+                        str(c), "-o", str(out)], capture_output=True)
+    if r.returncode != 0 or not out.exists():
+        pytest.skip("cannot build a static aarch64 binary")
+    strip = shutil.which("aarch64-linux-gnu-strip") or shutil.which("strip")
+    subprocess.run([strip, "--strip-all", str(out)], capture_output=True)
+    return out
+
+
+def test_flirt_names_sinks_in_a_stripped_static_aarch64_binary(aarch64_static_bin):
+    """FLIRT is arch-aware: the signature bodies + relocation masks come from the aarch64 libc.a,
+    so a stripped static ARM64 binary (a common firmware shape) gets its libc sinks named too."""
+    tgt = aarch64_static_bin.read_bytes()
+    assert flirt._target_machine(tgt) == flirt._EM_AARCH64
+    sigs = flirt.build_signatures(open(flirt.reference_archive(flirt._EM_AARCH64), "rb").read())
+    named = flirt.identify(tgt, None, sigs)
+    assert "system" in named.values(), "FLIRT did not name system() in the aarch64 static binary"
+    # relabel must also apply (arch gate accepts aarch64), naming a synthetic edge to system.
+    sys_va = next(a for a, n in named.items() if n == "system")
+    funcs = [{"addr": "0x400000", "name": "fcn.00400000",
+              "calls": [{"site_addr": "0x400004", "dst_addr": sys_va,
+                         "dst_name": "fcn." + sys_va[2:], "external": False}]}]
+    assert flirt.relabel(tgt, funcs) >= 1
+    assert funcs[0]["calls"][0]["dst_name"] == "system"

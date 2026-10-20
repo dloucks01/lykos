@@ -103,6 +103,7 @@ def _ar_members(data: bytes):
 # relocation entries -- no disassembly, and exact rather than a heuristic.
 _SHT_SYMTAB, _SHT_RELA = 2, 4
 _STT_FUNC = 2
+_EM_X86_64, _EM_AARCH64 = 62, 183        # ELF e_machine values FLIRT builds signatures for
 # x86-64 relocs that patch a 4-byte PC-relative operand (a call/jmp/lea target): the variant bytes.
 _R_PC32_WIDTH = {2: 4, 4: 4, 1: 8, 9: 4, 10: 4, 11: 4}   # PC32/PLT32 -> 4; 64 -> 8; GOTPCREL... -> 4
 
@@ -112,6 +113,7 @@ def _o_signatures(obj: bytes, out: dict) -> None:
     if len(obj) < 64 or obj[:4] != b"\x7fELF" or obj[4] != 2:   # ELFCLASS64 only
         return
     endc = "<" if obj[5] == 1 else ">"
+    e_machine = struct.unpack_from(endc + "H", obj, 18)[0]      # 62 x86-64, 183 aarch64
     e_shoff = struct.unpack_from(endc + "Q", obj, 40)[0]
     e_shentsize, e_shnum, e_shstrndx = struct.unpack_from(endc + "HHH", obj, 58)
     if not e_shoff or not e_shnum:
@@ -149,9 +151,16 @@ def _o_signatures(obj: bytes, out: dict) -> None:
                     break
                 r_offset, r_info = struct.unpack_from(endc + "QQ", obj, p)
                 r_type = r_info & 0xFFFFFFFF
-                w = _R_PC32_WIDTH.get(r_type, 4)
-                for b in range(r_offset, r_offset + w):
-                    mset.add(b)
+                if e_machine == _EM_AARCH64:
+                    # aarch64 relocs patch bits INSIDE a 4-byte instruction (CALL26/ADRP/LO12/...),
+                    # not a clean trailing operand -- so mask the whole aligned instruction word.
+                    base4 = r_offset & ~3
+                    for b in range(base4, base4 + 4):
+                        mset.add(b)
+                else:
+                    w = _R_PC32_WIDTH.get(r_type, 4)         # x86-64: a 4/8-byte PC-relative operand
+                    for b in range(r_offset, r_offset + w):
+                        mset.add(b)
 
     nsym = symtab["size"] // symtab["ent"]
     for i in range(nsym):
@@ -400,25 +409,33 @@ def ifunc_stub_names(target_bytes: bytes, named: dict) -> dict:
     return out
 
 
-_SIG_CACHE = None
+_SIG_CACHE: dict = {}        # e_machine -> {name: [(sig, mask)]}, built on demand per target arch
 # Names a recovery backend hands an unidentified function; only these (or an empty name) are
 # overwritten -- a real symbol / dynamic import is never clobbered.
 _GENERIC = ("fcn.", "loc.", "sub_", "func.", "unk.", "imp.", "sym.func.")
 
 
-def _signatures() -> dict:
-    global _SIG_CACHE
-    if _SIG_CACHE is None:
-        path = reference_archive()
-        if not path:
-            _SIG_CACHE = {}
-        else:
+def _target_machine(target_bytes: bytes) -> Optional[int]:
+    if len(target_bytes) < 20 or target_bytes[:4] != b"\x7fELF" or target_bytes[4] != 2:
+        return None
+    endc = "<" if target_bytes[5] == 1 else ">"
+    return struct.unpack_from(endc + "H", target_bytes, 18)[0]
+
+
+def _signatures(machine: int) -> dict:
+    """Signatures for the given target arch, from that arch's reference libc.a. Cached per machine
+    (x86-64 and aarch64 are separate reference archives)."""
+    if machine not in _SIG_CACHE:
+        path = reference_archive(machine)
+        sigs = {}
+        if path:
             try:
                 with open(path, "rb") as f:
-                    _SIG_CACHE = build_signatures(f.read())
+                    sigs = build_signatures(f.read())
             except Exception:                            # noqa: BLE001
-                _SIG_CACHE = {}
-    return _SIG_CACHE
+                sigs = {}
+        _SIG_CACHE[machine] = sigs
+    return _SIG_CACHE[machine]
 
 
 def _is_generic(name) -> bool:
@@ -427,18 +444,19 @@ def _is_generic(name) -> bool:
 
 
 def relabel(target_bytes: bytes, funcs: list) -> int:
-    """Name the security-relevant libc functions in a STRIPPED STATIC x86-64 target by matching its
-    code against libc.a signatures, and propagate the names onto the call EDGES so the call-graph
-    detectors (dangerous_api keys on dst_name) see `system`/`strcpy`/... instead of `fcn.XXXX`.
+    """Name the security-relevant libc functions in a STRIPPED STATIC target (x86-64 or aarch64) by
+    matching its code against that arch's libc.a signatures, and propagate the names onto the call
+    EDGES so the call-graph detectors (dangerous_api keys on dst_name) see `system`/`strcpy`/...
+    instead of `fcn.XXXX`.
 
     Mutates `funcs` in place (each is a dict with `addr`, `name`, and `calls`=[{dst_addr, dst_name,
     ...}]); returns how many names were applied. A no-op -- so a dynamic/named target is untouched --
-    when there is no reference archive, the target is not x86-64 ELF, or nothing matches. Only a
-    generic/blank name is ever overwritten."""
-    if (not target_bytes or len(target_bytes) < 5 or target_bytes[:4] != b"\x7fELF"
-            or target_bytes[4] != 2):                    # ELFCLASS64 only (the signatures are x86-64)
+    when there is no reference archive for the arch, the target is not a supported ELF64 arch, or
+    nothing matches. Only a generic/blank name is ever overwritten."""
+    machine = _target_machine(target_bytes)
+    if machine not in (_EM_X86_64, _EM_AARCH64):         # the arches with a signature/mask rule
         return 0
-    sigs = _signatures()
+    sigs = _signatures(machine)
     if not sigs:
         return 0
     named = identify(target_bytes, None, sigs)           # {hex_va: canonical name}
@@ -446,11 +464,14 @@ def relabel(target_bytes: bytes, funcs: list) -> int:
         return 0
     # Extend with the IFUNC thunks/GOT slots: a str*/mem* CALL lands on a resolver thunk, not the
     # named variant body, so without this the overflow-sink edges (strcpy/strcat/memcpy) stay
-    # unnamed even though the body is identified.
-    try:
-        named.update(ifunc_stub_names(target_bytes, named))
-    except Exception:                                    # noqa: BLE001 -- the direct names still stand
-        pass
+    # unnamed even though the body is identified. x86-64 only -- the thunk/resolver decoding
+    # (ff25 jmp, rip-relative lea) is x86-64-specific; an aarch64 target still gets the body names
+    # and every DIRECT call edge, just not the IFUNC-stub edges.
+    if machine == _EM_X86_64:
+        try:
+            named.update(ifunc_stub_names(target_bytes, named))
+        except Exception:                                # noqa: BLE001 -- the direct names still stand
+            pass
 
     def _hx(a):
         try:
@@ -483,15 +504,23 @@ def relabel(target_bytes: bytes, funcs: list) -> int:
     return applied
 
 
-def reference_archive() -> Optional[str]:
-    """Where to read the reference libc.a: an operator override, then the usual host locations.
-    In the air-gap bundle the operator points LYKOS_REF_LIBC_A at the target distro's libc.a."""
+def reference_archive(machine: int = _EM_X86_64) -> Optional[str]:
+    """Where to read the reference libc.a for the target ARCH: an operator override, then the usual
+    host locations. In the air-gap bundle vendorenv points LYKOS_REF_LIBC_A (x86-64) /
+    LYKOS_REF_LIBC_A_AARCH64 at the target distro's archive. A cross `/usr/<triple>/lib/libc.a` is
+    the aarch64 fallback (present with the aarch64 cross toolchain)."""
     import os
-    env = os.environ.get("LYKOS_REF_LIBC_A")
-    cands = ([env] if env else []) + [
-        "/usr/lib/x86_64-linux-gnu/libc.a", "/usr/lib/libc.a", "/usr/lib64/libc.a",
-        "/usr/lib/x86_64-linux-gnu/libc_pic.a",
-    ]
+    if machine == _EM_AARCH64:
+        env = os.environ.get("LYKOS_REF_LIBC_A_AARCH64")
+        cands = ([env] if env else []) + [
+            "/usr/aarch64-linux-gnu/lib/libc.a", "/usr/lib/aarch64-linux-gnu/libc.a",
+        ]
+    else:
+        env = os.environ.get("LYKOS_REF_LIBC_A")
+        cands = ([env] if env else []) + [
+            "/usr/lib/x86_64-linux-gnu/libc.a", "/usr/lib/libc.a", "/usr/lib64/libc.a",
+            "/usr/lib/x86_64-linux-gnu/libc_pic.a",
+        ]
     for c in cands:
         if c and os.path.isfile(c):
             return c
