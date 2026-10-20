@@ -9,6 +9,7 @@ Export/import archive the whole directory so a case moves intact between offline
 """
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import sqlite3
@@ -30,6 +31,8 @@ from .hashing import hash_all_file, hash_bytes
 
 _ARTIFACTS = "artifacts"
 
+_log = logging.getLogger(__name__)
+
 
 def _make_runnable(exe: Path, workdir: Path) -> None:
     """Make a staged bundled binary run from ANY cwd: repoint a RELATIVE ELF interpreter (a
@@ -44,6 +47,18 @@ def _make_runnable(exe: Path, workdir: Path) -> None:
                                 text=True, timeout=20).stdout.strip()
     except Exception:                                    # noqa: BLE001 -- static exe / no interp
         interp = ""
+    try:
+        needed = subprocess.run([pe, "--print-needed", str(exe)], capture_output=True,
+                                text=True, timeout=20).stdout.strip()
+    except Exception:                                    # noqa: BLE001 -- static exe / no needed
+        needed = ""
+    # A STATICALLY LINKED / static-PIE executable has neither a PT_INTERP nor any NEEDED library:
+    # it is self-contained and carries its own startup. patchelf must NOT touch it -- `--set-rpath`
+    # rewrites the program headers and breaks the pre-main self-relocation a static-PIE performs,
+    # so it then SIGSEGVs before main (the exact bug relink-bundle.sh already guards against). A
+    # shared object (.so) also has no interpreter but DOES list NEEDED libs, so it is not skipped.
+    if not interp and not needed:
+        return
     args = [pe]
     if interp and not interp.startswith("/"):            # a relative, bundled loader
         loader = workdir / Path(interp).name
@@ -150,8 +165,11 @@ class ContentStore:
         exe.write_bytes(self.path(target.sha256).read_bytes())
         try:
             exe.chmod(mode)
-        except OSError:
-            pass
+        except OSError as e:
+            # A swallowed chmod failure leaves the staged target without +x and no diagnostic;
+            # downstream that reads as a clean no-finding run on a target that never got to
+            # execute. Surface it so the not-runnable cause is visible.
+            _log.warning("could not chmod staged target %s (%s); it may be not-runnable", exe, e)
         deps = getattr(target, "deps", None) or {}
         for rel, sha in deps.items():
             rp = Path(rel)

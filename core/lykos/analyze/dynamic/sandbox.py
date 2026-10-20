@@ -1987,6 +1987,14 @@ def _exec_failed(rc: int, err: bytes) -> bool:
     low = (err or b"").lower()
     if any(m in low for m in _LOADER_FAIL_MARKERS):
         return True
+    # A qemu-user run that cannot find the GUEST's dynamic loader prints
+    #   qemu-<arch>: Could not open '/lib/ld-...': No such file or directory
+    # on stderr and exits 1 -- not rc 126/127, and not a glibc loader string, so it read as a
+    # clean exit-1 run and the did-not-run accounting never fired. Gate TIGHTLY on that exact
+    # shape (a `qemu-`-prefixed stderr line carrying "could not open") so a genuine target that
+    # merely prints "could not open" and exits 1 is not mistaken for a non-run.
+    if (err or b"").lstrip().startswith(b"qemu-") and b"could not open" in low:
+        return True
     if rc not in (126, 127):
         return False
     return any(m in low for m in _EXEC_FAIL_MARKERS)
