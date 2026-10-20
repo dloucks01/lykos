@@ -167,8 +167,12 @@ recover phase and was starved of budget, so `aarch64` fell to **L1** while `s390
 reached L3. Running that crashless attempt **first in the recover phase** (before `dynamic_run` and
 the heavy `disassemble`/`detect_cwe`) fixes it: in-process `run_case_autopilot` at a 300 s budget now
 drives `aarch64` L1->**L3**, `riscv64` to **L3 with zero fuzzer crashes**, and `ppc32`/`s390x` to L3,
-with `x86-64` unchanged at its fixture ceiling -- no regressions. See
-`internal/43-autopilot-crossarch-l3-2026-10-19.md`.
+with `x86-64` unchanged at its fixture ceiling -- no regressions. A second, independent defect made
+it non-deterministic even so: `qemu_gdb.capture`'s flat 5 s gdbstub-connect deadline timed out on a
+cold start / under fuzz saturation, and `build_exploit` read the empty capture as "did not fault" and
+declined L3. The connect now tolerates a cold start and respawns only a dead qemu, and the probe
+tells a capture failure apart from a real no-crash -- so three consecutive bundle Autopilot runs on
+`vuln_aarch64` land L3/L3/L3. See `internal/43-autopilot-crossarch-l3-2026-10-19.md`.
 
 | arch | L1 | L2 | L3 (ret2win offset) |
 |---|---|---|---|

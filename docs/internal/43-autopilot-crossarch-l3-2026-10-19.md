@@ -69,3 +69,35 @@ waits*; a pool must stay alive for the whole run (the server starts one — `api
 defect and the fix above were re-confirmed only after the harness kept the pool running; the earlier
 "dynamic_run/disassemble timeout" specifics were harness noise, but the net starvation of the
 recover-phase `build_exploit` is real and reproduces with a live worker.
+
+## Addendum (2026-10-20) — the deeper cause: a flaky qemu-gdbstub capture
+
+Running the FULL bundle through the webgui Autopilot under `bwrap --unshare-net` surfaced a second,
+independent defect the placement fix alone did not cover: cross-arch L3 was still
+**non-deterministic** (aarch64 L1 one run, L3 the next, with identical inputs). Instrumenting the
+cyclic probe showed why — `debug/qemu_gdb.capture` gave the gdbstub a flat **5 s** to accept a
+connection and returned an empty `{note: "gdbstub did not accept a connection"}` when it did not.
+`build_exploit` read that empty capture as *"the cyclic did not fault on any channel"* and declined
+L3 — a **capture failure misread as a program that did not crash** **[measured 2026-10-20]**. Two
+situations triggered it: the FIRST qemu invocation in a fresh server process pays a cold start
+(binfmt, a relinked loader, a cold TB cache) over 5 s; and the prove-phase crash-driven
+`build_exploit` runs after the fuzz campaigns have saturated the host. A direct `enqueue_exploit`
+(warm, no load) always reached L3 — which is why the capability looked present but the Autopilot
+delivered it only by luck.
+
+Two bounded fixes:
+
+* **`debug/qemu_gdb.capture`** — the connect deadline is now `max(12 s, timeout)` (cold start), and a
+  failed connect **respawns on a fresh port only when qemu actually died** (it lost the
+  `_free_port`->bind race); a qemu that is alive-but-slow under saturation **fails fast** after one
+  wait rather than burning repeated deadlines (an earlier 4x10 s retry *wedged* the stage past its
+  worker deadline — bounded-on-death is the fix). Benefits every caller (L2 `poc_primitive`,
+  `root_cause`, the cross-arch ret2libc confirmation), not only `build_exploit`.
+* **`poc/exploit_stage` cyclic probe** — a capture that could not RUN (a connection / did-not-stop
+  note, no `ok`) is now told apart from a clean run with no signal: the connection note is retried
+  once and otherwise reported honestly ("the overflow probe could not run … re-run, or the
+  crash-driven path covers it"); only a clean miss sweeps the other channels. An empty capture can
+  no longer read as "did not fault".
+
+Result — three consecutive in-process bundle Autopilot runs on `vuln_aarch64` at 300 s: **L3, L3,
+L3**, no wedge **[measured 2026-10-20]**. Air-gap (fresh server under `bwrap`) validation follows.

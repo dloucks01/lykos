@@ -268,63 +268,102 @@ def capture(exe, arch, *, argv=(), stdin: bytes = b"", timeout: float = 8.0,
         return {"note": f"no qemu-user for {arch}", "arch": arch}
     if not supported(arch):
         return {"note": f"no gdbstub register layout for {arch}", "arch": arch}
-    port = port or _free_port()
     exedir = str(Path(exe).resolve().parent)
-    # Detonating a hostile guest: contain the filesystem and cap resources. The network
-    # namespace is KEPT (net=True) so the loopback gdb stub is still reachable; on an offline
-    # host loopback is not egress. rlimits bound memory-adjacent abuse (forks, file size, CPU)
-    # without RLIMIT_AS, which qemu-user needs generously.
-    cmd = sandbox.isolate_prefix(exedir, net=True) + \
-        [qemu, "-g", str(port), str(exe), *[_argv_bytes(a) for a in argv]]
-    # stdout/stderr are DEVNULL: the capture is driven entirely over the gdbstub SOCKET and the
-    # guest's output is never read, so leaving them as PIPEs let a guest that writes >~64 KiB block
-    # on the full pipe -- it then never reaches the fault, the socket read times out, and the
-    # capture is lost ("guest did not stop"). A chatty target silently defeated root-cause.
-    proc = subprocess.Popen(
-        cmd,
-        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        start_new_session=True,
-        preexec_fn=sandbox._rlimits(4096, int(timeout) + 30, set_as=False,
-                                    nproc=sandbox._nproc_cap(True)))
-    try:
-        if proc.stdin:                               # deliver input; the guest reads it once run
-            try:
-                proc.stdin.write(stdin)
-                proc.stdin.close()
-            except BrokenPipeError:
-                pass
-        sock = _connect(port, deadline=time.time() + 5)
-        if not sock:
-            return {"note": "gdbstub did not accept a connection", "arch": arch}
+    # A FAILED CONNECTION IS NOT A FAILED PROGRAM. The gdbstub "did not accept a connection" when
+    # qemu lost a port race (another process grabbed the free port between _free_port and bind) or
+    # was simply slow to open the stub under load -- and that happens exactly in the PROVE phase of
+    # a full autopilot, after the fuzz campaigns have left the host busy. The old single 5 s attempt
+    # turned that transient into a dict with no `ok`/`signal_name`, which build_exploit read as "the
+    # cyclic did not fault on any channel" and declined L3 -- so a cross-arch target reached a shell
+    # only when the connect happened to win the race **[measured 2026-10-20: aarch64 L1 vs L3 across
+    # identical runs]**. Respawn on a fresh port, with a load-tolerant deadline, before giving up.
+    # Only when WE pick the port can we retry; a caller-pinned port is used exactly once.
+    _pinned = bool(port)
+    _attempts = 1 if _pinned else 2
+    # Was a flat 5 s. The FIRST qemu-user invocation in a fresh server process pays a cold start
+    # (binfmt, a relinked binary's loader, a cold TB cache) that can exceed 5 s under load, so the
+    # early crashless build_exploit's connect timed out and the capture came back empty -- which the
+    # caller read as "the cyclic did not fault". Give the stub longer to open.
+    _connect_deadline = max(12.0, float(timeout))
+    regs = sig = bp_alias = None
+    for _att in range(_attempts):
+        port = port if _pinned else _free_port()
+        # Detonating a hostile guest: contain the filesystem and cap resources. The network
+        # namespace is KEPT (net=True) so the loopback gdb stub is still reachable; on an offline
+        # host loopback is not egress. rlimits bound memory-adjacent abuse (forks, file size, CPU)
+        # without RLIMIT_AS, which qemu-user needs generously.
+        cmd = sandbox.isolate_prefix(exedir, net=True) + \
+            [qemu, "-g", str(port), str(exe), *[_argv_bytes(a) for a in argv]]
+        # stdout/stderr are DEVNULL: the capture is driven entirely over the gdbstub SOCKET and the
+        # guest's output is never read, so leaving them as PIPEs let a guest that writes >~64 KiB
+        # block on the full pipe -- it then never reaches the fault, the socket read times out, and
+        # the capture is lost ("guest did not stop"). A chatty target silently defeated root-cause.
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            preexec_fn=sandbox._rlimits(4096, int(timeout) + 30, set_as=False,
+                                        nproc=sandbox._nproc_cap(True)))
         try:
-            bp_alias = {}
-            if breakpoints:
-                # Confirming a control-flow hijack means proving execution REACHED a chosen
-                # address, which a fault alone cannot show. Software breakpoints do that on
-                # any ISA the stub speaks for.
-                kind = _BP_KIND.get(arch, 4)
-                for a in breakpoints:
-                    a = int(a)
-                    placed = a & ~1 if arch in LSB_MASKED_PC else a
-                    bp_alias[placed] = a          # report back what the CALLER asked for
-                    _txn(sock, f"Z0,{placed:x},{kind}")
-            stop = _txn(sock, "c", timeout=timeout)  # continue until the guest stops
-            sig = int(stop[1:3], 16) if stop[:1] in ("T", "S") else None
-            if sig is None:
-                return {"note": f"target exited without a fault (reply {stop[:8]!r})",
-                        "arch": arch}
-            if not _ensure_layout(arch, sock):
-                return {"note": f"gdbstub for {arch} serves no target description",
-                        "arch": arch}
-            regs = _parse_regs(_txn(sock, "g", timeout=timeout), arch, endianness)
-        except socket.timeout:
-            # The guest never reached a stop within the budget (hang / long loop). A raised
-            # exception here is not a clean capture -- report it as "could not run", honestly.
-            return {"note": "guest did not stop within timeout", "arch": arch}
+            if proc.stdin:                           # deliver input; the guest reads it once run
+                try:
+                    proc.stdin.write(stdin)
+                    proc.stdin.close()
+                except BrokenPipeError:
+                    pass
+            # Liveness-aware: stop waiting the moment qemu exits. A qemu that LOST THE PORT RACE
+            # (another process bound the free port first) dies immediately, so a fresh-port respawn
+            # fixes it cheaply; a qemu that is simply SLOW under saturation is still alive, and
+            # retrying it would only burn another full deadline and risk wedging the stage -- so
+            # that case fails fast after one wait. This is why the retry is bounded to death, not to
+            # every connection failure.
+            sock = None
+            _dl = time.time() + _connect_deadline
+            while time.time() < _dl:
+                if proc.poll() is not None:              # qemu exited before the stub came up
+                    break
+                try:
+                    sock = socket.create_connection(("127.0.0.1", port), timeout=1)
+                    break
+                except OSError:
+                    time.sleep(0.05)
+            if not sock:
+                _died = proc.poll() is not None
+                # Respawn only a DEAD qemu (port race), never a live-but-slow one, and never a
+                # caller-pinned port. Otherwise report the empty capture honestly.
+                if _died and not _pinned and _att < _attempts - 1:
+                    continue
+                return {"note": "gdbstub did not accept a connection", "arch": arch}
+            try:
+                bp_alias = {}
+                if breakpoints:
+                    # Confirming a control-flow hijack means proving execution REACHED a chosen
+                    # address, which a fault alone cannot show. Software breakpoints do that on
+                    # any ISA the stub speaks for.
+                    kind = _BP_KIND.get(arch, 4)
+                    for a in breakpoints:
+                        a = int(a)
+                        placed = a & ~1 if arch in LSB_MASKED_PC else a
+                        bp_alias[placed] = a          # report back what the CALLER asked for
+                        _txn(sock, f"Z0,{placed:x},{kind}")
+                stop = _txn(sock, "c", timeout=timeout)  # continue until the guest stops
+                sig = int(stop[1:3], 16) if stop[:1] in ("T", "S") else None
+                if sig is None:
+                    return {"note": f"target exited without a fault (reply {stop[:8]!r})",
+                            "arch": arch}
+                if not _ensure_layout(arch, sock):
+                    return {"note": f"gdbstub for {arch} serves no target description",
+                            "arch": arch}
+                regs = _parse_regs(_txn(sock, "g", timeout=timeout), arch, endianness)
+            except socket.timeout:
+                # The guest never reached a stop within the budget (hang / long loop). A raised
+                # exception here is not a clean capture -- report it as "could not run", honestly.
+                return {"note": "guest did not stop within timeout", "arch": arch}
+            finally:
+                sock.close()
         finally:
-            sock.close()
-    finally:
-        _kill(proc)
+            _kill(proc)
+        break                                        # connected and ran: we have regs/sig
     pc = regs.get(_pc_name(arch))
     sp = regs.get(_sp_name(arch))
     hit = None
