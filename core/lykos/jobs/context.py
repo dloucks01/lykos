@@ -7,6 +7,7 @@ group on cancel or timeout (readies native tools in later phases).
 from __future__ import annotations
 
 import atexit
+import logging
 import os
 import shutil
 import signal
@@ -47,6 +48,37 @@ def _atexit_kill_children() -> None:
 
 
 atexit.register(_atexit_kill_children)
+
+_log = logging.getLogger("lykos.jobs.context")
+
+# Scratch targets are STAGED here and then EXECUTED, so the staging filesystem must allow exec. A
+# hardened / air-gapped box frequently mounts /tmp (and $TMPDIR) `noexec`, where `chmod +x` succeeds
+# but execve() returns EACCES -- which makes every staged native target "not executable" and
+# silently kills the whole dynamic pipeline (no L1/L2/L3, only static findings). Probe the system
+# tempdir once; if it is noexec, stage under a lykos-owned work dir on the case-store filesystem.
+_SYS_TMP_EXECOK: Optional[bool] = None
+
+
+def _is_exec_capable(d: Path) -> bool:
+    """True if a file written under `d` and chmod +x can actually be execve()'d (i.e. `d` is not on
+    a noexec mount). Best-effort: a probe directory is created, a 2-line /bin/sh no-op is run, and
+    the directory removed. False on any error (treated as not exec-capable)."""
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+        probe = Path(tempfile.mkdtemp(dir=str(d), prefix=".xchk-"))
+    except OSError:
+        return False
+    try:
+        f = probe / "x"
+        f.write_text("#!/bin/sh\nexit 0\n")
+        f.chmod(0o755)
+        try:
+            return subprocess.run([str(f)], stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.DEVNULL, timeout=5).returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            return False
+    finally:
+        shutil.rmtree(probe, ignore_errors=True)
 
 
 class StageCancelled(Exception):
@@ -127,8 +159,31 @@ class JobContext:
     # -- scratch dir --
     def scratch(self) -> Path:
         if self._scratch is None:
-            self._scratch = Path(tempfile.mkdtemp(prefix=f"lykos-{self.run_id[:8]}-"))
+            self._scratch = Path(tempfile.mkdtemp(prefix=f"lykos-{self.run_id[:8]}-",
+                                                  dir=self._scratch_base()))
         return self._scratch
+
+    def _scratch_base(self) -> Optional[str]:
+        """Base dir for the (executable) scratch staging area: the system tempdir normally, but a
+        lykos-owned work dir on the case-store filesystem when the tempdir is mounted noexec -- the
+        cause of "executables were not executable". None means "use the system tempdir". The noexec
+        probe is cached per process; the fallback dir is chosen from this context's content root."""
+        global _SYS_TMP_EXECOK
+        if _SYS_TMP_EXECOK is None:
+            _SYS_TMP_EXECOK = _is_exec_capable(Path(tempfile.gettempdir()))
+        if _SYS_TMP_EXECOK:
+            return None
+        try:
+            work = Path(self.content.root) / ".work"
+            if _is_exec_capable(work):
+                _log.warning("system tempdir (%s) is noexec; staging runnable targets under %s",
+                             tempfile.gettempdir(), work)
+                return str(work)
+        except Exception:                               # noqa: BLE001 -- fall back to the tempdir
+            pass
+        _log.warning("system tempdir is noexec and no exec-capable fallback was found; staged "
+                     "targets may fail to execute -- set TMPDIR to an exec-capable path")
+        return None
 
     def cleanup(self) -> None:
         if self._scratch and self._scratch.exists():
