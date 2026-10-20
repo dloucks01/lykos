@@ -66,6 +66,12 @@ def test_no_module_keeps_a_second_list_of_the_non_run_isolations():
     assert not offenders, [str(f) for f in offenders]
     src = (root / "lykos/analyze/dynamic/stage.py").read_text()
     assert "sandbox.did_not_run(res.isolation)" in src
+    # The fuzz campaign is the main crash finder; a target that never executed (noexec staging,
+    # unsupported arch, a guest that could not load) must record a did-not-run row and bail, not
+    # spin the budget and report a clean empty campaign. Guard both halves of that here.
+    fz = (root / "lykos/analyze/fuzz/stage.py").read_text()
+    assert "sandbox.did_not_run(res.isolation)" in fz, "fuzz campaign must detect a non-run"
+    assert '"did_not_run": True' in fz, "fuzz campaign must record/report the non-run"
 
 
 # ---- what does this target run on? ---------------------------------------------------------

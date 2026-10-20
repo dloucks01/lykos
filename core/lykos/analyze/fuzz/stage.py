@@ -901,6 +901,23 @@ def _takes_blocks(run_fn) -> bool:
         return False
 
 
+def _not_run_reason(isolation, note: str = "") -> str:
+    """A human reason a campaign's target never executed, from its not-runnable isolation tag. The
+    runner's own `note` (e.g. 'no qemu-user for aarch64 on x86_64') is preferred; otherwise map the
+    sentinel isolation to an operator-actionable hint."""
+    iso = (isolation or "not-runnable").strip()
+    if note and note.strip():
+        return f"{iso}: {note.strip()}"
+    if iso.startswith("unsupported-arch"):
+        return f"{iso}: no qemu-user for the target architecture (bundle/build it for this guest)"
+    if iso.endswith("-missing"):
+        return f"{iso}: the required runtime is not installed or bundled"
+    if iso == "not-runnable" or iso.endswith("/not-runnable"):
+        return (f"{iso}: the staged target could not be executed -- a noexec /tmp (set TMPDIR to an "
+                "exec-capable path), a missing/incompatible loader, or a guest that could not load")
+    return iso
+
+
 def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_seconds,
                   exec_timeout, rng, detector, event_prefix, note_prefix, run_fn=run_input,
                   mutator=None, cover_blocks=(), cover_flags=(), base_argv=(), block_dist=None,
@@ -1017,6 +1034,14 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
     seen_sigs: dict = {}
     code_span = recovered_code_span(ctx.conn, target.id)   # classify an out-of-code (hijack) PC
     seen_behaviour, kept = set(), 0
+    # Did the target EVER actually execute? A definitive not-runnable isolation (noexec staging /
+    # EACCES, unsupported arch, a qemu guest that could not load, a missing runtime) means every
+    # "execution" was a no-op. After the first batch we check this and, if nothing ran, record ONE
+    # did-not-run row so the report says WHY instead of reading as a clean empty campaign -- then
+    # stop rather than spin the whole budget on executions that cannot run.
+    ran_any = False
+    first_notrun_iso = None
+    first_notrun_note = ""
     # Has the coverage channel EVER answered? A runner that returns block data -- even an empty
     # set -- proves coverage is live and block-novelty is trustworthy. If blocks were armed but
     # nothing ever came back (ptrace refused in this namespace, a runner that cannot report),
@@ -1194,6 +1219,14 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
             # input -- so the prefix travels with the input it crashed.
             argv = list(run_argv)
             execs += 1
+            # Did this execution actually run the program? A definitive not-runnable isolation means
+            # it did not (see the did-not-run bail after this batch).
+            if not ran_any:
+                if sandbox.did_not_run(res.isolation):
+                    first_notrun_iso = first_notrun_iso or res.isolation
+                    first_notrun_note = first_notrun_note or (res.note or "")
+                else:
+                    ran_any = True
             # Keep anything that made the program behave in a way we have not seen. This is the
             # ratchet: without it the corpus never grows and a deeper path is reachable only by a
             # single lucky mutation from a seed.
@@ -1326,6 +1359,21 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
                               fault_pc=res.fault_pc,
                               defect_key=(asan_defect_key(res.stderr)
                                           if res.signal_name == "SIGABRT" else None))
+        # The whole first batch executed but NOTHING ran as a program -- record why and stop,
+        # instead of spending the budget on no-op executions and reporting a clean empty campaign.
+        if not ran_any and execs > 0:
+            reason = _not_run_reason(first_notrun_iso, first_notrun_note)
+            dd.insert(target.id, target.case_id, run_id=ctx.run_id, input_mode=mode,
+                      crashed=False, isolation=first_notrun_iso or "not-runnable", note=reason)
+            ctx.emit(f"{event_prefix}.done", payload={"execs": execs, "crashes": 0,
+                     "did_not_run": True, "isolation": first_notrun_iso or "not-runnable",
+                     "note": reason})
+            ctx.progress(pct=100, msg=f"{event_prefix}: target did not run -- {reason}")
+            return {"execs": execs, "crashes": 0, "flaky": 0, "crashes_reproducible": 0,
+                    "unique": 0, "starved": True, "directed_kept": 0, "nearest_sink_dist": None,
+                    "behaviours": 0, "corpus": len(corpus), "kept": 0, "execs_per_sec": 0,
+                    "blocks_hit": 0, "blocks_known": len(all_blocks), "coverage": "none",
+                    "did_not_run": True}
         if execs % 250 == 0:
             ctx.emit(f"{event_prefix}.progress", payload={"execs": execs, "crashes": crashes,
                                                           "unique": len(seen_sigs),

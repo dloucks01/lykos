@@ -218,7 +218,16 @@ def coverage_stage(ctx) -> dict:
     # runs natively, so the native arch can run WITHOUT afl-qemu-trace (doc 30 P3.1).
     why = _unsupported(target, use_qemu)
     if why and why == toolchain_missing(use_qemu):
-        # environment, not target: raise so the run is visibly broken rather than a clean zero
+        # Environment, not target: the stage is meant to FAIL VISIBLY -- a missing afl-qemu-trace
+        # is a 10-minute fix the operator must see, not a silent clean zero (see test_crossarch /
+        # test_afl_arch). But a bare RuntimeError surfaced to the operator only as "aflpp did not
+        # complete", hiding the fix. Emit the actionable reason (warn-level, so the autopilot
+        # console shows it) BEFORE raising. The blind `fuzz` stage still runs the target for crashes,
+        # so this does not block L1 -- it just loses coverage guidance until the tracer is built.
+        ctx.emit("coverage.toolchain", level="warn",
+                 payload={"supported": False, "backend": "aflpp", "toolchain_missing": True,
+                          "note": why})
+        ctx.progress(pct=100, msg="coverage fuzzing unavailable: " + why[:80])
         raise RuntimeError(why)
     if why:
         ctx.emit("coverage.done", payload={"supported": False, "backend": "aflpp",
