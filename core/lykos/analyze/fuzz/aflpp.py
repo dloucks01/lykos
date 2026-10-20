@@ -194,7 +194,8 @@ def input_suffix(seeds) -> str:
 
 def run_campaign(afl: Path, exe, seeds_dir, out_dir, *, seconds: int = 30,
                  mode: str = "file", qemu: bool = True, afl_path: Optional[str] = None,
-                 cmplog: Optional[Path] = None, argv_template=None, input_file=None):
+                 cmplog: Optional[Path] = None, argv_template=None, input_file=None,
+                 qemu_ld_prefix: Optional[str] = None):
     # NOTE: AFL keeps its default memory cap here. Sanitizer builds (which need `-m none`) are
     # deliberately NOT run through this path -- an uncapped run OOM'd the host -- they are fuzzed
     # by the sandbox `fuzz`/`directed_fuzz` stages under rlimits instead (see coverage_stage).
@@ -232,6 +233,12 @@ def run_campaign(afl: Path, exe, seeds_dir, out_dir, *, seconds: int = 30,
         # intercepts strcmp/memcmp-family calls. Measured on gif2rgb: 751 -> 1534 edges. The compcov
         # plugin is built into qemuafl, so this is free when present and simply a no-op if not.
         env.setdefault("AFL_COMPCOV_LEVEL", "2")
+        # The guest sysroot for a CROSS-ARCH target: afl-qemu-trace is qemu under the hood, so a
+        # dynamically-linked foreign ELF needs QEMU_LD_PREFIX to find its loader -- without it the
+        # fork-server handshake fails the instant the first exec hits the loader (the "Fork server
+        # handshake failed" abort seen on a cross-arch campaign), and the whole campaign is lost.
+        if qemu_ld_prefix:
+            env.setdefault("QEMU_LD_PREFIX", qemu_ld_prefix)
     elif cmplog is not None:
         # Native (afl-cc-instrumented) build: CmpLog is the same idea via a second, cmplog-
         # instrumented copy of the target that AFL runs alongside the main one (`-c <binary>`).

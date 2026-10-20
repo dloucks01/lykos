@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import base64
 import logging
+from pathlib import Path
 
 from ... import observe
 from ...db.dao import DynResultDAO, FindingDAO, TargetDAO
@@ -361,9 +362,13 @@ def coverage_stage(ctx) -> dict:
     ctx.progress(msg=f"AFL++ qemu-mode, {seconds}s budget")
     ctx.emit("coverage.start", payload={"backend": "aflpp", "seconds": seconds,
                                         "afl": str(afl)})
+    # Cross-arch under -Q: hand afl-qemu-trace the guest sysroot so a dynamically-linked foreign
+    # ELF actually loads (else the fork-server handshake fails and the campaign produces nothing).
+    _ld_prefix = sandbox.qemu_ld_prefix(target.arch, target.endianness, target.bits,
+                                        exedir=str(Path(exe).resolve().parent)) if use_qemu else None
     proc = aflpp.run_campaign(afl, exe, seeds_dir, out_dir, seconds=seconds, afl_path=afl_path,
                               mode=mode, qemu=use_qemu, argv_template=argv_template,
-                              input_file=input_file)
+                              input_file=input_file, qemu_ld_prefix=_ld_prefix)
     if proc.returncode != 0 and not (out_dir / "default").exists() \
             and not (out_dir / "crashes").exists():
         tail = (proc.stderr or b"")[-800:].decode("latin-1", "ignore")

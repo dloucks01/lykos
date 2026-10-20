@@ -618,6 +618,70 @@ def _qemu_for(arch, endianness=None, bits=None) -> Optional[str]:
     return shutil.which("qemu-" + suf) if suf else None
 
 
+# A guest SYSROOT for qemu-user. QEMU_LD_PREFIX tells the emulator where the GUEST's dynamic
+# loader and shared libraries live; without it a dynamically-linked foreign ELF -- the common
+# case for firmware and for any cross-compiled binary -- cannot find /lib/ld-*.so, so qemu prints
+#   qemu-<arch>: Could not open '/lib/ld-...': No such file or directory
+# and the program exits before main(). The emulator was present and the image triaged fine, yet
+# nothing ever ran. One sysroot per target resolves it. (`_exec_failed` already RECOGNISES the
+# failure; this is what lets the run SUCCEED.)
+#
+# arch -> the host cross-sysroot directory names to try under /usr. A dev/Kali box with the cross
+# toolchains installed carries these (/usr/aarch64-linux-gnu, ...). Endianness/word-size exact
+# sysroots are rarely installed, so this is arch-keyed and best-effort; the operator override is
+# the precise answer for firmware (its libc must match the image).
+_SYSROOT_TRIPLES: dict = {
+    "aarch64": ("aarch64-linux-gnu",),
+    "arm": ("arm-linux-gnueabihf", "arm-linux-gnueabi"),
+    "riscv64": ("riscv64-linux-gnu",), "riscv": ("riscv64-linux-gnu",),
+    "mips": ("mips-linux-gnu",), "mipsel": ("mipsel-linux-gnu",),
+    "mips64": ("mips64-linux-gnuabi64", "mips64-linux-gnu"),
+    "ppc": ("powerpc-linux-gnu",), "ppc64": ("powerpc64-linux-gnu",),
+    "ppc64le": ("powerpc64le-linux-gnu",), "s390": ("s390x-linux-gnu",),
+    "sparc64": ("sparc64-linux-gnu",), "sparcv9": ("sparc64-linux-gnu",),
+    "sh": ("sh4-linux-gnu",), "m68k": ("m68k-linux-gnu",),
+    "loongarch": ("loongarch64-linux-gnu",),
+}
+
+
+def _dir_has_guest_loader(d) -> bool:
+    """Does directory `d` look like a guest sysroot -- does it carry an ELF dynamic loader?"""
+    try:
+        p = Path(d)
+        for sub in ("lib", "lib64", "usr/lib", "usr/lib64"):
+            ld = p / sub
+            if ld.is_dir():
+                for name in os.listdir(ld):
+                    if name.startswith("ld-") or name.startswith("ld."):
+                        return True
+    except OSError:
+        pass
+    return False
+
+
+def qemu_ld_prefix(arch, endianness=None, bits=None, exedir=None) -> Optional[str]:
+    """Best QEMU_LD_PREFIX (guest sysroot) for an emulated target, or None if none is found.
+
+    Order of preference:
+      1. LYKOS_QEMU_SYSROOT -- the operator points this at an uploaded firmware rootfs, whose
+         libc matches the image. This is the correct answer for firmware; a host cross-sysroot's
+         glibc will usually be a different version and crash the guest at load.
+      2. The binary's OWN directory, when a loader sits beside it -- a carved firmware rootfs, or
+         a relocated bundle that stages the guest libs next to the target.
+      3. The host cross-arch sysroot /usr/<triple> (present on a box with the cross toolchains).
+    """
+    env_ovr = os.environ.get("LYKOS_QEMU_SYSROOT")
+    if env_ovr and Path(env_ovr).is_dir():
+        return env_ovr
+    if exedir and _dir_has_guest_loader(exedir):
+        return str(Path(exedir).resolve())
+    for triple in _SYSROOT_TRIPLES.get(arch or "", ()):
+        cand = Path("/usr") / triple
+        if _dir_has_guest_loader(cand):
+            return str(cand)
+    return None
+
+
 def _bwrap_usable() -> bool:
     global _bwrap_cache
     if _bwrap_cache is not None:
@@ -2234,6 +2298,18 @@ def run(exe, *, argv=(), stdin: bytes = b"", timeout: float = 10.0,
         # Here the preload goes in as LD_PRELOAD: `run` execs the target itself (under bwrap or
         # qemu), so there is no tracer of ours in the process to protect.
         env, guarded = guard_page_env(env, exe=exe, arch=arch, host=host, sanitizer=san)
+
+    if emu:
+        # Cross-arch: hand qemu-user the guest sysroot so a dynamically-linked foreign ELF finds
+        # its loader and libraries and actually reaches main(). Without this the run above exits
+        # at the loader and reads as "not-runnable" (correct, but it never ran). `/` is bound into
+        # bwrap read-only, so a sysroot under /usr (or an operator rootfs under /) is visible
+        # inside the sandbox with no extra bind. setdefault: an explicit env_overrides wins.
+        _sysroot = qemu_ld_prefix(arch, endianness, bits,
+                                  exedir=str(Path(exe).resolve().parent))
+        if _sysroot:
+            env = dict(env if env is not None else os.environ)
+            env.setdefault("QEMU_LD_PREFIX", _sysroot)
 
     iso = "rlimits-only" + ("+qemu" if emu else "")
     cmd = inner

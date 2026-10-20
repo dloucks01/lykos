@@ -15,6 +15,7 @@ beacons, anti-analysis and persistence. Deterministic; two backends behind one e
 from __future__ import annotations
 
 import json
+import os
 import re
 import shlex
 import shutil
@@ -213,9 +214,15 @@ def trace_qemu(exe, arch, *, endianness=None, bits=None, argv=(), stdin=b"", tim
         # Contain the (hostile) guest: bwrap read-only root, net unshared, rlimits. qemu writes
         # its -strace log to a file under `d`, so `d` is bound WRITABLE; the exe dir is read-only.
         cmd = sandbox.isolate_prefix(exedir, net=False, rw_binds=[str(d)]) + inner
+        # Guest sysroot, so a dynamically-linked foreign ELF actually executes under qemu-user
+        # (else the -strace log is empty and we report "did not execute").
+        _qenv = os.environ
+        _sysroot = sandbox.qemu_ld_prefix(arch, endianness, bits, exedir=exedir)
+        if _sysroot:
+            _qenv = dict(os.environ); _qenv.setdefault("QEMU_LD_PREFIX", _sysroot)
         note = timed_out = None
         try:
-            sandbox.run_reaped(cmd, input=stdin, capture_output=True, timeout=timeout,
+            sandbox.run_reaped(cmd, input=stdin, capture_output=True, timeout=timeout, env=_qenv,
                                preexec_fn=sandbox._rlimits(4096, int(timeout) + 5, set_as=False,
                                                            nproc=sandbox._nproc_cap(True)))
         except subprocess.TimeoutExpired:

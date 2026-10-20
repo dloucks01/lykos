@@ -280,6 +280,15 @@ def capture(exe, arch, *, argv=(), stdin: bytes = b"", timeout: float = 8.0,
     # Only when WE pick the port can we retry; a caller-pinned port is used exactly once.
     _pinned = bool(port)
     _attempts = 1 if _pinned else 2
+    # Hand qemu the GUEST sysroot (QEMU_LD_PREFIX) so a dynamically-linked foreign ELF finds its
+    # loader and reaches the fault. Without it the stub comes up, the guest dies at the loader,
+    # and the capture is empty -- which build_exploit reads as "the cyclic did not fault" and
+    # declines L3. This is a second cause of the cross-arch L1-vs-L3 flakiness noted above.
+    _qenv = os.environ
+    _sysroot = sandbox.qemu_ld_prefix(arch, endianness, bits, exedir=exedir)
+    if _sysroot:
+        _qenv = dict(os.environ)
+        _qenv.setdefault("QEMU_LD_PREFIX", _sysroot)
     # Was a flat 5 s. The FIRST qemu-user invocation in a fresh server process pays a cold start
     # (binfmt, a relinked binary's loader, a cold TB cache) that can exceed 5 s under load, so the
     # early crashless build_exploit's connect timed out and the capture came back empty -- which the
@@ -301,7 +310,7 @@ def capture(exe, arch, *, argv=(), stdin: bytes = b"", timeout: float = 8.0,
         proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            start_new_session=True,
+            start_new_session=True, env=_qenv,
             preexec_fn=sandbox._rlimits(4096, int(timeout) + 30, set_as=False,
                                         nproc=sandbox._nproc_cap(True)))
         try:
