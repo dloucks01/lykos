@@ -314,13 +314,20 @@ make toolchain-bundle           # collect engines inside a container matching th
 ## --- Build the DYNAMIC ENGINES the apt toolchain does NOT include, then inject them. WITHOUT
 ## --- this step the bundle is complete-LOOKING but has no coverage-guided fuzzing: Kali's afl++
 ## --- deb carries libAFLQemuDriver.a and NO tracer, so AFL++ qemu-mode has nothing to run.
-examples/afl-qemu/build.sh x86_64         # coverage fuzzing for native targets (do this at minimum)
-examples/afl-qemu/build.sh aarch64 arm mips mipsel   # + any guest arch you will fuzz
-export LYKOS_AFLQEMU_DIR=$HOME/.local/bin  # dir holding the built afl-qemu-trace-* binaries
-export LYKOS_WEGGLI_BIN=/path/to/weggli    # optional: source variant analysis (a static release bin)
-packaging/build-symqemu.sh ; export LYKOS_SYMQEMU_DIR=vendor/symqemu   # optional: concolic (x86_64)
-## libqasan (optional heap shadow oracle under QEMU): build from AFL++ qemu_mode/libqasan and drop
-## libqasan.so under the toolchain tree's usr/lib/afl -- vendorenv now discovers it via LYKOS_QASAN.
+make engines                    # one shot: afl-qemu-trace per guest + libqasan + weggli + symqemu
+## wraps packaging/build-engines.sh -> stages them under dist/engines/ and writes
+## dist/engines/engines.env with the LYKOS_* exports. EACH engine is best-effort: a host missing
+## one engine's prerequisites skips it and the rest still build, and the run ends with a
+## built/missing summary (nothing is silently "written off"). Pick the afl-qemu-trace guest set
+## with ENGINES_GUESTS, omit engines with ENGINES_SKIP:
+##   ENGINES_GUESTS="aarch64 arm x86_64 mips mipsel" make engines
+##   ENGINES_SKIP="symqemu" make engines            # e.g. no docker on this host
+source dist/engines/engines.env  # exports LYKOS_AFLQEMU_DIR / LYKOS_QASAN / LYKOS_WEGGLI_BIN / LYKOS_SYMQEMU_DIR
+## Under the hood `make engines` runs these, which you can still invoke by hand for one engine:
+##   examples/afl-qemu/build.sh x86_64 dist/engines/afl-qemu    # one guest tracer
+##   make -C /tmp/aflsrc/qemu_mode/libqasan                      # libqasan.so (reuses the AFL++ clone)
+##   cargo install weggli --root dist/engines/weggli-root        # source variant analysis
+##   packaging/build-symqemu.sh                                  # concolic (x86_64, needs docker)
 
 ./package                       # fold the working tree + a fully-populated vendor/ into one package
 ## make-runnable.sh injects the engines named above, vendors a matching Python so the unicorn/angr

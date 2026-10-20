@@ -4,11 +4,12 @@ PY ?= python3
 CORPUS_BUDGET ?= 600
 export PYTHONPATH := core
 
-.PHONY: doctor toolchain-bundle repo-tarball test coverage lint typecheck gui ci bundle verify eval eval-gate benchmark arch-gate real-gate conformance conformance-smoke corpus-gate corpus-regression dashboard release clean help
+.PHONY: doctor toolchain-bundle engines repo-tarball test coverage lint typecheck gui ci bundle verify eval eval-gate benchmark arch-gate real-gate conformance conformance-smoke corpus-gate corpus-regression dashboard release clean help
 
 help:
 	@echo "run the app with ./start (UI) and ./lykos (CLI); build the air-gap package with ./package"
-	@echo "make targets (dev/release): doctor toolchain-bundle repo-tarball test coverage lint typecheck gui ci bundle verify eval eval-gate benchmark arch-gate real-gate conformance conformance-smoke dashboard release clean"
+	@echo "make targets (dev/release): doctor toolchain-bundle engines repo-tarball test coverage lint typecheck gui ci bundle verify eval eval-gate benchmark arch-gate real-gate conformance conformance-smoke dashboard release clean"
+	@echo "air-gap build order (connected host): toolchain-bundle -> engines -> source engines.env -> ./package"
 	@echo "real-corpus instruments (need ~/Downloads/libs, tens of minutes): corpus-gate corpus-regression"
 
 # What this host can and cannot do, and the install line for anything missing. On an
@@ -20,6 +21,15 @@ doctor:
 # Build the air-gap toolchain bundle (run on a CONNECTED machine). See docs/23.
 toolchain-bundle:
 	bash packaging/collect-toolchain.sh
+
+# Build the dynamic engines the default bundle omits (afl-qemu-trace per guest, libqasan, weggli,
+# symqemu) and stage them under dist/engines/ with an engines.env of LYKOS_* exports. Run on a
+# CONNECTED host AFTER toolchain-bundle; then `source dist/engines/engines.env` before ./package so
+# the bundle carries them. Each engine is best-effort -- a missing prerequisite skips that one and
+# the rest still build (the run ends with a built/missing summary). Set ENGINES_GUESTS to choose
+# the afl-qemu-trace guest set, ENGINES_SKIP to omit engines. See docs/offline-packaging.md.
+engines:
+	bash packaging/build-engines.sh
 
 # Package the repo itself for sneakernet to the air-gapped side: tracked files at HEAD, no
 # .git history, no build artifacts. The companion to toolchain-bundle. See docs/23.
