@@ -8,6 +8,7 @@ the test runs and must pass. Importable because tests/ has no __init__.py (pytes
 it on sys.path).
 """
 import os
+import shutil
 
 import pytest
 
@@ -47,3 +48,13 @@ glibc_setcontext_layout = pytest.mark.skipif(
     reason=f"setcontext's register-load/push-RIP layout this asserts is the glibc <= 2.42 shape; "
            f"this host's glibc {_GLIBC} moved it, so the setcontext finisher is unavailable here "
            f"(the pipeline falls through to system/cat) -- exercised on an older-glibc target")
+
+# The SystemZ (s390x) static recovery is validated against rizin proper: rizin leaves the xref DB
+# empty on s390 but disassembles it correctly, so call edges are harvested from the instruction
+# stream AND the static libc imports (read, ...) are named. The r2/radare2 fallback recovers the
+# call graph but does not attach the static `read` import name to the vuln edge here. The air-gap
+# bundle ships rizin, so this runs there; on a host with only r2/radare2 it skips.
+needs_rizin = pytest.mark.skipif(
+    shutil.which("rizin") is None,
+    reason="SystemZ call-edge/import naming is validated against rizin; only r2/radare2 is present "
+           "here, which recovers the s390 call graph but does not name the static `read` import")

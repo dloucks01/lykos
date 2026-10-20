@@ -8,6 +8,7 @@ import shutil
 import subprocess
 
 import pytest
+from _env import needs_rizin
 from lykos.analyze import native_re
 
 _RV_GCC = shutil.which("riscv64-linux-gnu-gcc")
@@ -78,6 +79,7 @@ def test_riscv64_recovered_via_sleigh(tmp_path):
     assert main and any(c.get("dst_name") == "vuln" for c in main["calls"])   # main -> vuln edge
 
 
+@needs_rizin
 @pytest.mark.skipif(not (_S390_GCC and _RIZIN), reason="needs s390x-linux-gnu-gcc + rizin")
 def test_s390_call_edges_recovered(tmp_path):
     exe = _build(tmp_path, _S390_GCC)
