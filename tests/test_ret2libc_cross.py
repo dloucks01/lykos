@@ -306,3 +306,84 @@ def _run_cross_e2e(store, tmp_path, gcc, arch_name, exploit_name, opt="-O1", ext
     f = fdao.get(fid)
     assert "Remote code execution (demonstrated)" in f.title, \
         f"{arch_name} ret2libc did not demonstrate a spawned-shell effect: {f.title!r}"
+
+
+@pytest.mark.skipif(not (_A64_GCC and _A64_QEMU),
+                    reason="needs aarch64-linux-gnu-gcc + qemu-aarch64")
+def test_execve_syscall_l3_aarch64(store, tmp_path):
+    """strategy=execve drives an NX-on AArch64 overflow to a confirmed L3 execve-syscall that needs
+    NO `system` symbol: a clean `ldp x1,x2` loader zeroes argv/envp, then the ret2libc caller
+    (`mov x0,xS; blr xB`) runs with xS=&"/bin/sh" and xB pointed at libc's `mov x8,#221; svc` ->
+    execve("/bin/sh",0,0). Confirmed by reaching the svc with x0=&"/bin/sh" AND x1==x2==0 (the extra
+    register check that keeps it honest when a live interactive shell cannot echo a marker under
+    emulation), plus a negative control. doc 42 called multi-register syscall-ROP gadget-blocked on
+    aarch64; this builds it with the loader-chain, since the one-shot `ldp x0,*` gadgets this libc
+    has are unusable (store to [x0] / clobber x0 / branch -- rop._a64_body_hazard rejects them)."""
+    from lykos.analyze import register
+    from lykos.analyze.ingest import enqueue_triage, ingest
+    from lykos.analyze.poc import enqueue_exploit
+    from lykos.db.dao import FindingDAO, PocDAO
+    from lykos.jobs import JobConfig, JobQueue, WorkerPool
+    src = tmp_path / "v.c"
+    src.write_text(_SRC)
+    exe = tmp_path / "v"
+    cmd = [_A64_GCC, "-O1", "-fno-stack-protector", "-U_FORTIFY_SOURCE", "-D_FORTIFY_SOURCE=0",
+           "-no-pie", "-static", "-w", str(src), "-o", str(exe)]
+    if subprocess.run(cmd, capture_output=True).returncode:
+        pytest.skip("cannot build aarch64 execve fixture")
+    register()
+    pool = WorkerPool(store.db_path, store.content, JobConfig(workers=2, poll_interval=0.02))
+    pool.start()
+    try:
+        t = ingest(store, store.cases.create("xev").id, exe, filename="v")
+        q = JobQueue(store.conn)
+        enqueue_triage(q, t, force=True)
+        assert pool.wait_idle(180)
+        run = enqueue_exploit(q, t, params={"strategy": "execve", "timeout": 20})
+        assert pool.wait_idle(600) and q.runs.get(run.id).status == "done"
+    finally:
+        pool.stop(grace=3.0)
+    l3 = [pc for pc in PocDAO(store.conn).list_by_target(t.id) if pc.level == "L3" and pc.verified]
+    assert l3, "no confirmed L3 aarch64 execve-syscall"
+    fdao = FindingDAO(store.conn)
+    fid = fdao.id_for_dedup(t.id, f"exploit:aarch64-execve-syscall:{t.id}")
+    assert fid, "no aarch64-execve-syscall finding filed"
+    assert "execve-syscall" in fdao.get(fid).title
+
+
+def test_find_aarch64_execve_site_decodes_movz_svc():
+    """find_aarch64_execve_site returns the `movz x8,#221` va of a `movz x8,#221; svc #0` pair."""
+    seg = (struct.pack("<I", 0xD503201F)                          # nop (padding)
+           + struct.pack("<I", 0xD2800008 | (221 << 5))           # movz x8, #221
+           + struct.pack("<I", 0xD4000001))                       # svc #0
+    orig = rop._loads
+    rop._loads = lambda data: [(0, len(seg), 0x11000, 1)]
+    try:
+        assert rop.find_aarch64_execve_site(seg) == 0x11000 + 4   # the movz, not the svc
+    finally:
+        rop._loads = orig
+
+
+def test_aarch64_loader_clean_flag_rejects_hostile_bodies():
+    """The loader finder's `clean` flag is False for a body that branches, stores, or clobbers a
+    loaded reg between the arg-pop and the x29,x30 epilogue (such a gadget only chains for specific
+    values), and True for a simple restore body -- the distinction the execve-syscall chain needs."""
+    LDP_X1X2 = 0xA9410BE1                 # ldp x1, x2, [sp, #16]
+    EPI = 0xA8C27BFD                      # ldp x29, x30, [sp], #32
+    RET = 0xD65F03C0
+    NOP = 0xD503201F
+    def _clean_for(body):
+        seg = struct.pack("<I", LDP_X1X2) + struct.pack("<I", body) + \
+            struct.pack("<I", EPI) + struct.pack("<I", RET)
+        orig = rop._loads
+        rop._loads = lambda data: [(0, len(seg), 0x20000, 1)]
+        try:
+            ls = [ll for ll in rop.find_aarch64_r2libc_gadgets(seg)["loaders"]
+                  if {ll["r1"], ll["r2"]} == {1, 2}]
+            return ls[0]["clean"] if ls else None
+        finally:
+            rop._loads = orig
+    assert _clean_for(NOP) is True                       # simple body -> clean
+    assert _clean_for(0x54000001) is False               # b.ne -> branch in body
+    assert _clean_for(0xF9000020) is False               # str x0,[x1] -> store in body
+    assert _clean_for(0x52800001) is False               # movz x1,#0 -> clobbers loaded x1

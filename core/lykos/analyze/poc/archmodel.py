@@ -109,23 +109,43 @@ def drive_cross_ret2libc(
     candidates: Iterable[Candidate],
     shell_effect: Callable,
     tool_version: str,
+    technique: str = "ret2libc",
+    finisher: str = 'system("/bin/sh")',
+    site_name: str = "system",
+    slug: Optional[str] = None,
+    extra_regs: Optional[dict] = None,
 ) -> Optional[dict]:
-    """Arch-agnostic cross-arch ret2libc driver: confirm each candidate over `cap` (reach `system`
-    with the first-argument register == &"/bin/sh"), pass a negative control, then raise the first
-    that holds to a demonstrated effect via `shell_effect` and file the identical L3 PoC bundle +
-    finding. Returns the stage result dict on success, else None. `cap` is a make_qemu_capture
-    callable; `shell_effect(exe, target, payload, timeout)` returns truthy when a real shell ran."""
+    """Arch-agnostic cross-arch driver: confirm each candidate over `cap` (reach the chosen `system`
+    breakpoint with the first-argument register == &"/bin/sh"), pass a negative control, then raise
+    the first that holds to a demonstrated effect via `shell_effect` and file the identical L3 PoC
+    bundle + finding. Returns the stage result dict on success, else None. `cap` is a
+    make_qemu_capture callable; `shell_effect(exe, target, payload, timeout)` returns truthy when a
+    real shell ran.
+
+    `technique`/`finisher`/`site_name` describe the mechanism in the finding and progress text. They
+    default to the ret2libc-> system("/bin/sh") case every cross-arch ret2libc uses; the aarch64
+    execve-syscall path reuses this exact confirm/bundle machinery with `system`=the execve svc site,
+    `technique="execve-syscall"`, `finisher='execve("/bin/sh", NULL, NULL)'`, `site_name="the execve
+    syscall site"` -- the breakpoint-reached-with-arg0=&"/bin/sh" + negative-control + spawned-shell
+    proof is identical; only the label differs."""
     import json
 
     from ...db.dao import FindingDAO, PocDAO
     from . import bundle, exploit
 
     arg0 = model.arg0_reg
+    slug = slug or model.slug                    # distinct per mechanism so findings don't dedup-collide
     for c in candidates:
         if ctx.should_cancel():
             return None
         cap0 = cap(c.payload, breakpoints=[system])
-        if not (exploit.reached(cap0, system) and (cap0.get("regs") or {}).get(arg0) == binsh):
+        _regs0 = cap0.get("regs") or {}
+        if not (exploit.reached(cap0, system) and _regs0.get(arg0) == binsh):
+            continue
+        # Mechanisms that need MORE than the first argument set (execve-syscall needs x1==0 envp/argv
+        # and x2==0) assert those too, so a register-confirmed finding is honest even when no live
+        # shell comes up: reaching the syscall with a non-NULL argv/envp would fault, not exec.
+        if extra_regs and any(_regs0.get(r) != v for r, v in extra_regs.items()):
             continue
         # negative control: with the argument-feeding bytes corrupted, system must NOT see &"/bin/sh"
         if (cap(c.neg_payload, breakpoints=[system]).get("regs") or {}).get(arg0) == binsh:
@@ -134,15 +154,15 @@ def drive_cross_ret2libc(
         # shell system("/bin/sh") spawns with a forgery-proof marker (qemu relays execve to the host).
         shelled = shell_effect(exe, target, c.payload, timeout)
         proof = ("a shell spawned under qemu-user and EVALUATED a forgery-proof marker" if shelled else
-                 f"reached system with {model.arg0_label}=&\"/bin/sh\" under the qemu debugger, "
+                 f"reached {site_name} with {model.arg0_label}=&\"/bin/sh\" under the qemu debugger, "
                  f"passing a negative control (register-state proof; a live shell did not come up "
                  f"under emulation)")
         blame = f"{c.blame_body}; {proof}."
-        input_sha = ctx.put_artifact(f"{model.slug}-input", data=c.payload)
+        input_sha = ctx.put_artifact(f"{slug}-input", data=c.payload)
         meta = {"target_sha256": target.sha256, "arch": target.arch, "level": "L3",
-                "exploit": model.slug, "offset": c.offset, "system": hex(system),
+                "exploit": slug, "offset": c.offset, "system": hex(system),
                 "binsh": hex(binsh), "tool_version": tool_version}
-        primitive = {"type": model.slug, "offset": c.offset, "confirmed": True, "note": blame}
+        primitive = {"type": slug, "offset": c.offset, "confirmed": True, "note": blame}
         primitive.update(c.primitive_extra)
         data = bundle.build(target_bytes, c.payload, meta, b"", "stdin", base_argv, "SIGTRAP",
                             primitive=primitive)
@@ -150,17 +170,17 @@ def drive_cross_ret2libc(
         poc_id = PocDAO(ctx.conn).insert(target.id, target.case_id, level="L3", verified=True,
                                          signal_name=None, input_sha=input_sha, bundle_sha=bundle_sha)
         fd = FindingDAO(ctx.conn)
-        title = (f"Remote code execution (demonstrated): L3 {model.label} ret2libc -> shell"
+        title = (f"Remote code execution (demonstrated): L3 {model.label} {technique} -> shell"
                  if shelled else
-                 f"Control-flow hijack (confirmed): L3 {model.label} ret2libc -> system(\"/bin/sh\")")
+                 f"Control-flow hijack (confirmed): L3 {model.label} {technique} -> {finisher}")
         cand = {"cwe": model.cwe, "title": title,
                 "severity": "critical", "detector": "build_exploit", "state": "poc-backed",
                 "confidence": 0.99, "authoritative": True, "title_only": True,
-                "dedup_key": f"exploit:{model.slug}:{target.id}",
-                "site_detail": 'system("/bin/sh")',
+                "dedup_key": f"exploit:{slug}:{target.id}",
+                "site_detail": finisher,
                 "evidence": [{"channel": "effects", "detail": json.dumps([{
                     "kind": "rce" if shelled else "control-flow-hijack",
-                    "title": f"{model.label} ret2libc",
+                    "title": f"{model.label} {technique}",
                     "status": "demonstrated" if shelled else "confirmed",
                     "detail": blame, "proof": {"type": "bundle", "sha": bundle_sha,
                                                "input_sha": input_sha, "note": blame}}])}]}
@@ -169,11 +189,11 @@ def drive_cross_ret2libc(
         if fid:
             PocDAO(ctx.conn).set_finding(poc_id, fid)
         ctx.emit("exploit.done", payload={"supported": True, "confirmed": True,
-                 "shell": bool(shelled), "exploit": model.slug, "offset": c.offset,
+                 "shell": bool(shelled), "exploit": slug, "offset": c.offset,
                  "bundle": bundle_sha})
         ctx.progress(pct=100, msg=f"L3 {'RCE (shell spawned)' if shelled else 'CONFIRMED'}: "
-                     f"{model.label} ret2libc -> system(\"/bin/sh\") {c.progress_tail}".rstrip())
+                     f"{model.label} {technique} -> {finisher} {c.progress_tail}".rstrip())
         return {"output_shas": [bundle_sha], "output_kind": "poc-bundle",
-                "metrics": {"confirmed": True, "level": "L3", "exploit": model.slug,
+                "metrics": {"confirmed": True, "level": "L3", "exploit": slug,
                             "offset": c.offset, "shell": bool(shelled)}}
     return None

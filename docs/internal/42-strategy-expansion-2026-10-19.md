@@ -83,3 +83,34 @@ exactly as `docs/overview.md` already scopes L3 ("frontier research, best-effort
 **Net:** the strongest *bounded* cross-arch weaponization is the shipped ret2libc (NX-on, 8 arches) +
 execstack ret2shellcode (NX-off, 7 arches). A's syscall-ROP is not a bounded deliverable on the RISC
 targets and is left as documented research.
+
+---
+
+## Update (2026-10-20) — AArch64 execve-syscall is NOT gadget-blocked after all; it is shipped
+
+Section A above concluded multi-register syscall-ROP was gadget-blocked on the RISC arches, citing
+"0 usable `set x0,x1; ret` gadgets" on the aarch64 fixture. A fresh, deeper gadget audit refined
+that into a build:
+
+* The **one-shot** `ldp x0,x1 ; ret` gadget is genuinely absent, and the `ldp x0,*` loaders that DO
+  exist are unusable -- the only `ldp x0,x1` loader has a `cmp x1,x0 ; b.ne` body (chains only when
+  x0==x1), and the only `ldp x0,x2` loader **stores to `[x0]`** (SIGSEGVs on the read-only "/bin/sh"
+  string) and then `mov w0,#0` (clobbers the argument). `rop._a64_body_hazard` now rejects such
+  branch/store/clobber bodies, and `find_aarch64_r2libc_gadgets` tags each loader `clean`.
+* But x0 does not have to come from an `ldp x0,*` loader. AArch64 ret2libc already sets x0 via the
+  **caller** `mov x0,xS ; blr xB` fed by a CALLEE-SAVED loader -- clean and plentiful. The
+  execve-syscall chain reuses exactly that, with two changes: a clean `ldp x1,x2` loader runs FIRST
+  to zero argv/envp (they survive the caller, which touches neither), and the caller's `xB` is
+  pointed at libc's `mov x8,#221 ; svc` instead of `system`. Result:
+  `L0 (ldp x1,x2 -> 0,0) -> LB (ldp xS,xB) -> caller (mov x0,xS=&"/bin/sh"; blr xB=svc) ->
+  execve("/bin/sh", NULL, NULL)`.
+
+Shipped as `_aarch64_execve_syscall_exploit` (strategy `execve`, and an `auto` fallback AFTER
+ret2libc declines -- i.e. the target links no `system`). Confirmed over the qemu gdbstub by reaching
+the svc with x0=&"/bin/sh" AND x1==x2==0 (an `extra_regs` check on `drive_cross_ret2libc`, so a
+register-confirmed finding is honest even when an interactive `/bin/sh` cannot echo a marker under
+emulation) plus a negative control. **[measured 2026-10-20: `strategy=execve` files L3
+`aarch64-execve-syscall` on the static fixture; tests in `test_ret2libc_cross.py`.]** The ret2libc ->
+`system` path remains preferred where `system` is linked (simpler, and a spawned-shell demonstration);
+execve-syscall is the route when it is not. s390x/ppc/riscv multi-register syscall-ROP remain
+documented research -- the same loader-chain construction is the path to try there next.
