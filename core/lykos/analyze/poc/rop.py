@@ -1179,6 +1179,22 @@ def find_s390x_r2libc_gadgets(data: bytes) -> dict:
     return {"callers": callers}
 
 
+def find_br_gadgets_s390x(data: bytes):
+    """s390x `br %rX` (== bcr 15,%rX) gadgets as [{insn, reg, va}] -- branch to the address in rX, the
+    s390x `jmp <reg>` for reaching injected shellcode on an execstack when rX points at the buffer."""
+    out = []
+    for off, sz, va, flags in _loads(data):
+        if not (flags & 1):
+            continue
+        p, end = off, off + sz
+        while p < end:
+            o = _s390_decode(data, p)
+            if o[0] == "br" and o[2] != 0:               # br %rX (rX != 0)
+                out.append({"insn": f"br %r{o[2]}", "reg": f"r{o[2]}", "va": va + (p - off)})
+            p += o[3] or 2
+    return out
+
+
 # ---------------------------------------------------------------- PowerPC64 (ELFv2) ret2libc gadgets
 # PPC64 callee-saved GPRs are r14..r31 -- the registers a function epilogue restores from its frame,
 # hence the ones a stack overflow of that frame can control.
@@ -1270,6 +1286,20 @@ def find_ppc64_r2libc_gadgets(data: bytes, endian: str = "little", clean=None) -
         if ctr is not None and arg is not None and ctr != arg:
             callers.append({"va": start, "ctr": ctr, "arg": arg})
     return {"callers": callers}
+
+
+def find_mtctr_bctr_gadgets_ppc(data: bytes, endian: str = "little"):
+    """PowerPC `mtctr rX ; bctr[l]` gadgets as [{insn, reg, va}] -- branch to the address in rX, the
+    PPC `jmp <reg>` for reaching injected shellcode on an execstack when rX points at the input
+    buffer. Pure byte decode; `endian` is the target's byte order."""
+    words = list(_ppc_words(data, endian))
+    out = []
+    for i in range(len(words) - 1):
+        va, w = words[i]
+        if _ppc_is_mtctr(w) and words[i + 1][1] in (0x4E800420, 0x4E800421):
+            n = (w >> 21) & 0x1F
+            out.append({"insn": f"mtctr r{n}; bctr", "reg": f"r{n}", "va": va})
+    return out
 
 
 def find_magic_gates(data: bytes):
