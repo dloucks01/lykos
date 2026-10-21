@@ -21,12 +21,26 @@ from .mutator import Mutator
 _log = logging.getLogger(__name__)
 
 _GETENV = {"getenv", "secure_getenv", "getenv_r"}
-_ENV_NAME = re.compile(r"^[A-Z][A-Z0-9_]{2,40}$")
-# UPPER-case tokens that are not environment variables -- compiler/format/constant noise that would
+# An env-var name: the classic UPPER_SNAKE (LD_PRELOAD, MY_CONFIG), OR a lower/mixed-case token that
+# carries an underscore (app_config_path, http_proxy) -- the all-caps-only pattern missed every
+# program that names its variables in lower case, and on a stripped/large binary where the string
+# table is truncated it recovered nothing at all (the "getenv used but no names" dead end).
+_ENV_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+$|^[A-Z][A-Z0-9]{2,40}$")
+# tokens that are not environment variables -- compiler/format/constant noise that would
 # otherwise be shotgunned as candidate env names.
 _NOT_ENV = {"GCC", "GNU", "GLIBC", "ELF", "NULL", "TRUE", "FALSE", "NAN", "ERROR", "WARNING",
             "DEBUG", "INFO", "FATAL", "NOTICE", "STDIN", "STDOUT", "STDERR", "EOF", "ASCII",
             "UTF", "JSON", "XML", "HTTP", "HTTPS", "TCP", "UDP", "GET", "POST", "OK"}
+# When a binary demonstrably READS the environment (getenv import) but no names could be recovered
+# from its strings -- a stripped/large binary whose .rodata name strings were not in the truncated
+# string table -- fuzz the names most worth trying on any program: loader-injection vectors and the
+# conventional configuration knobs. Fuzzing these is cheap (bounded by max_execs) and far better
+# than declining the lane. A precise recovery (slicing each getenv call's .rodata arg) is the
+# follow-up; this guarantees the lane never silently gives up.
+_COMMON_ENV = ["LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT", "PATH", "HOME", "TMPDIR", "TMP",
+               "SHELL", "IFS", "LANG", "LC_ALL", "NLSPATH", "HTTP_PROXY", "HTTPS_PROXY",
+               "NO_PROXY", "CONFIG", "CONFIG_PATH", "CONFIG_FILE", "LOG", "LOGFILE", "LOG_LEVEL",
+               "DEBUG", "VERBOSE", "PLUGIN_PATH", "DATA_DIR", "PASSWORD", "TOKEN", "SECRET"]
 
 
 # The same channel on a MANAGED runtime. A jar, a .pyc and a .NET assembly own no machine code,
@@ -49,17 +63,21 @@ def uses_getenv(call_edges, symbols=()) -> bool:
     return bool(substrate.symbol_names(symbols) & _MANAGED_GETENV)
 
 
-def env_var_candidates(strings, limit: int = 24) -> list:
-    """UPPER_SNAKE tokens that look like environment-variable names, from the binary's strings."""
+def env_var_candidates(strings, limit: int = 24, *, fallback: bool = True) -> list:
+    """Tokens that look like environment-variable names, from the binary's strings. When `fallback`
+    and the scan finds NONE, return the common-name list so a getenv-using target is still fuzzed
+    rather than declined (the stripped/large-binary case)."""
     out, seen = [], set()
     for s in strings:
         t = (s or "").strip()
-        if _ENV_NAME.match(t) and t not in _NOT_ENV and t not in seen:
+        if _ENV_NAME.match(t) and t.upper() not in _NOT_ENV and t not in seen:
             seen.add(t)
             out.append(t)
     # Prefer names with an underscore (the strongest env convention: MY_CONFIG, LD_PRELOAD) but keep
     # the plain ones too (HOME, CONFIG). Underscored first, then by appearance.
     out.sort(key=lambda t: (0 if "_" in t else 1))
+    if not out and fallback:
+        return list(_COMMON_ENV)[:limit]
     return out[:limit]
 
 
