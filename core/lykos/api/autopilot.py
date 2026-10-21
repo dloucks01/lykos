@@ -21,6 +21,25 @@ class AutopilotMixin:
     _AUTOPILOTS: dict = {}
     _AUTOPILOTS_LOCK = threading.Lock()
 
+    @staticmethod
+    def _normalize_overrides(over: dict) -> dict:
+        """Turn the web invocation controls into the autopilot's override dict. `argv` may arrive as
+        a shell-quoted STRING (e.g. "-c @@") -- split it exactly as the CLI's --argv does, so the
+        web GUI and the CLI accept the same thing. `input_mode` is validated against the channels
+        the stages understand; anything else (incl. "auto") is dropped so discovery runs."""
+        import shlex
+        out = dict(over)
+        av = out.get("argv")
+        if isinstance(av, str):
+            try:
+                out["argv"] = shlex.split(av)
+            except ValueError:
+                out.pop("argv", None)                    # unbalanced quotes: ignore rather than 500
+        im = out.get("input_mode")
+        if im not in ("stdin", "arg", "file", "env", "none"):
+            out.pop("input_mode", None)                  # "auto"/blank/garbage -> let discovery decide
+        return out
+
     def _start_autopilot(self, cid):
         """Start (or restart) a server-side Autopilot for a case: a daemon thread that drives the
         pipeline to a PoC and keeps running after the client disconnects."""
@@ -49,6 +68,8 @@ class AutopilotMixin:
             except (TypeError, ValueError):
                 secs = None
             over = body.get("overrides") if isinstance(body.get("overrides"), dict) else None
+            if over:
+                over = self._normalize_overrides(over)
             status["budget_seconds"] = secs
             th = threading.Thread(
                 target=orchestrate.run_case_autopilot,

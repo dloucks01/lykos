@@ -118,7 +118,13 @@ export const api = {
   scorecard: (caseId) => _req("GET", `/cases/${caseId}/scorecard`),
 
   // Server-side background Autopilot: keeps running after the tab closes.
-  startBackground: (caseId, targetIds, budgetSeconds) => _req("POST", `/cases/${caseId}/autopilot`, { body: budgetSeconds ? { target_ids: targetIds, budget_seconds: budgetSeconds } : { target_ids: targetIds } }),
+  startBackground: (caseId, targetIds, budgetSeconds, overrides) => _req("POST", `/cases/${caseId}/autopilot`, {
+    body: {
+      target_ids: targetIds,
+      ...(budgetSeconds ? { budget_seconds: budgetSeconds } : {}),
+      ...(overrides && Object.keys(overrides).length ? { overrides } : {}),
+    },
+  }),
   backgroundStatus: (caseId) => _req("GET", `/cases/${caseId}/autopilot`),
   cancelBackground: (caseId) => _req("POST", `/cases/${caseId}/autopilot/cancel`),
   events: (caseId, after = 0) => _req("GET", `/cases/${caseId}/events?after=${after}`),

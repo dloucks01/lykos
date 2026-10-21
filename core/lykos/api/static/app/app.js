@@ -132,6 +132,8 @@ function App() {
   const [diffVerify, setDiffVerify] = useState(null); // poc_diff run result for the Diff tab
   const [bg, setBg] = useState(null);               // server-side background autopilot status
   const [budgetMin, setBudgetMin] = useState("");   // Autopilot budget in MINUTES ("" = size-aware default)
+  const [invArgv, setInvArgv] = useState("");       // operator invocation: argv template, @@ = input file
+  const [invMode, setInvMode] = useState("auto");   // input channel: auto|stdin|file|arg|env
   // WHAT THE RUN DID, per target. The UI showed findings with no account of the work behind
   // them, and there was no endpoint to ask: the CLI printed this and the HTML report rendered
   // it, while the primary interface could not.
@@ -507,11 +509,17 @@ function App() {
     try {
       // minutes -> seconds; blank/0 sends nothing, so the server picks a size-aware default.
       const secs = Number(budgetMin) > 0 ? Math.round(Number(budgetMin) * 60) : undefined;
-      await api.startBackground(caseId, targets.map((t) => t.id), secs);
+      // Operator invocation: how the binary is really run. argv is a shell string with @@ for the
+      // input file (the server shlex-splits it, like the CLI's --argv); the channel overrides the
+      // autopilot's guess. Both optional -- blank/"auto" lets discovery decide, as today.
+      const overrides = {};
+      if (invArgv.trim()) overrides.argv = invArgv.trim();
+      if (invMode && invMode !== "auto") overrides.input_mode = invMode;
+      await api.startBackground(caseId, targets.map((t) => t.id), secs, overrides);
       setRan(true);
       pollBackground(caseId);
     } catch (e) { setError(e.message || String(e)); }
-  }, [caseId, targets, pollBackground, budgetMin]);
+  }, [caseId, targets, pollBackground, budgetMin, invArgv, invMode]);
 
 
   // Upload one or more files. `append` adds to the current case; otherwise it starts fresh.
@@ -642,8 +650,11 @@ function App() {
       });
       if (ev.kind === "verification") setVerifications((cur) => ({ ...cur, [ev.input_sha]: ev.verification }));
     };
+    const overrides = {};
+    if (invArgv.trim()) overrides.argv = invArgv.trim();
+    if (invMode && invMode !== "auto") overrides.input_mode = invMode;
     try {
-      await runAutopilotCase(ctrl, emit, { targetIds: ids, caseId });
+      await runAutopilotCase(ctrl, emit, { targetIds: ids, caseId, overrides });
     } catch (e) {
       pushLog({ tone: "bad", text: `Autopilot stopped: ${e.message}` });
     } finally {
@@ -651,7 +662,7 @@ function App() {
       setRunning(false);
       ctrlRef.current = null;
     }
-  }, [targets, caseId, advice, pushLog, refreshResults]);
+  }, [targets, caseId, advice, pushLog, refreshResults, invArgv, invMode]);
 
   const onCancel = useCallback(() => {
     if (ctrlRef.current) cancelAutopilot(ctrlRef.current);
@@ -770,6 +781,19 @@ function App() {
                value=${budgetMin} onInput=${(e) => setBudgetMin(e.target.value)}
                style="width:11em" />
       </label>
+      <label class="inv-field" title="How the binary is really invoked, as a shell string with @@ where the fuzzed input file goes — e.g.  -c @@  or  parse --in @@. Blank = lykos discovers it. This is the single thing that decides whether the fuzzer reaches the parser; it reaches every stage, same as the CLI's --argv.">
+        <input type="text" placeholder="invocation (e.g.  -c @@)"
+               value=${invArgv} onInput=${(e) => setInvArgv(e.target.value)}
+               style="width:14em" />
+      </label>
+      <select class="inv-mode" title="input channel — how the fuzzed bytes reach the target. Auto lets lykos decide (and @@ in the invocation implies a file)."
+              value=${invMode} onChange=${(e) => setInvMode(e.target.value)}>
+        <option value="auto">channel: auto</option>
+        <option value="stdin">stdin</option>
+        <option value="file">file (@@)</option>
+        <option value="arg">first arg</option>
+        <option value="env">env var</option>
+      </select>
       <button class="btn ghost small" onClick=${onAutopilot}
               title="run the stages from this tab instead: finer per-stage feedback, but a shorter pipeline and no scorecard — closing the tab stops it">
         ⚙ In this tab</button>

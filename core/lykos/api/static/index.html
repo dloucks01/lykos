@@ -171,6 +171,12 @@
   .btn.danger { background: var(--bad); border-color: var(--bad); color: #fff; font-weight: 600; }
   .btn.big { font-size: 1.05rem; padding: 12px 28px; }
   .btn.small { padding: 5px 10px; font-size: .8rem; }
+  .inv-field input, .inv-mode { background: var(--panel-2); color: var(--ink); border: 1px solid var(--line);
+    border-radius: 7px; padding: 6px 9px; font-size: .82rem; }
+  .inv-field input { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+  .inv-field input::placeholder { color: var(--faint); }
+  .inv-field input:focus, .inv-mode:focus { outline: none; border-color: var(--accent); }
+  .inv-mode { cursor: pointer; }
   .btn.ghost { background: transparent; }
   .theme-toggle { padding: 6px 10px; font-size: 1rem; line-height: 1; }
 

@@ -309,8 +309,28 @@ async function runStage(ctrl, emit, stage, { targetId, caseId, params } = {}) {
 
 // The full run. `emit` receives {kind, ...} progress objects; the UI turns them into a log and
 // refreshes findings. Resolves with a summary when the pipeline is exhausted.
-export async function runAutopilot(ctrl, emit, { targetId, caseId, silentDone = false }) {
+// A minimal shell-ish split for the operator's invocation string ("-c @@", `parse --in @@`),
+// quote-aware enough for real command lines. The server's --argv / autopilot path uses Python's
+// shlex; this is the in-tab equivalent so the two modes accept the same thing.
+function shellSplit(s) {
+  const out = []; let cur = ""; let q = null; let has = false;
+  for (const ch of String(s)) {
+    if (q) { if (ch === q) q = null; else cur += ch; }
+    else if (ch === '"' || ch === "'") { q = ch; has = true; }
+    else if (/\s/.test(ch)) { if (has) { out.push(cur); cur = ""; has = false; } }
+    else { cur += ch; has = true; }
+  }
+  if (has) out.push(cur);
+  return out;
+}
+
+export async function runAutopilot(ctrl, emit, { targetId, caseId, silentDone = false, overrides = {} }) {
   emit({ kind: "start", targetId });
+  // Operator invocation wins over the autopilot's guess, and reaches EVERY stage (mirrors the
+  // server's _apply_overrides). argv may be a shell string or an already-split list.
+  const ovArgv = typeof overrides.argv === "string" ? shellSplit(overrides.argv)
+    : (Array.isArray(overrides.argv) ? overrides.argv : null);
+  const ovMode = overrides.input_mode || null;
 
   // What to do (advice) and what is possible at all (capabilities).
   let advice = null, caps = null;
@@ -339,12 +359,18 @@ export async function runAutopilot(ctrl, emit, { targetId, caseId, silentDone = 
   const backendEntry = advice && (advice.plan || []).find((p) => p.stage === advice.backend);
   const dynParams = { ...DEEP, ...((backendEntry && backendEntry.params) || {}) };
   if (advice && advice.input_mode && dynParams.input_mode == null) dynParams.input_mode = advice.input_mode;
+  if (ovMode) dynParams.input_mode = ovMode;                 // operator fact beats the advice guess
+  if (ovArgv) dynParams.argv = ovArgv;
   const chosenBackend = advice && DYNAMIC_BACKENDS.has(advice.backend) ? advice.backend
     : (available.has("coverage_fuzz") ? "coverage_fuzz" : "fuzz");
 
   const run = async (stage, params, core) => {
     if (ctrl.cancelled || !canRun(stage, core)) return;
-    await runStage(ctrl, emit, stage, { targetId, caseId, params });
+    // The operator's invocation reaches every stage, not just the fuzzers (matches _apply_overrides).
+    const merged = { ...params };
+    if (ovArgv) merged.argv = ovArgv;
+    if (ovMode) merged.input_mode = ovMode;
+    await runStage(ctrl, emit, stage, { targetId, caseId, params: merged });
     emit({ kind: "refresh" });
   };
   const inMode = dynParams.input_mode;
@@ -505,13 +531,13 @@ async function runCaseStage(ctrl, emit, stage, caseId, label) {
 // The whole run for a case: every target's deep pipeline, then the case-level analyses that
 // look across binaries. This is what "complete every capability" means -- a single upload runs
 // the target pipeline; several uploads additionally get IPC modelling and cross-binary taint.
-export async function runAutopilotCase(ctrl, emit, { targetIds, caseId }) {
+export async function runAutopilotCase(ctrl, emit, { targetIds, caseId, overrides = {} }) {
   const ids = targetIds || [];
   const perTarget = [];
   for (let i = 0; i < ids.length; i++) {
     if (ctrl.cancelled) return finish(emit, "cancelled", []);
     if (ids.length > 1) emit({ kind: "info", message: `Target ${i + 1} of ${ids.length}` });
-    perTarget.push(await runAutopilot(ctrl, emit, { targetId: ids[i], caseId, silentDone: true }));
+    perTarget.push(await runAutopilot(ctrl, emit, { targetId: ids[i], caseId, silentDone: true, overrides }));
   }
   // Case-level: cross-binary analysis over the whole case.
   if (!ctrl.cancelled && caseId && ids.length >= 1) {
