@@ -101,3 +101,45 @@ useful alone; together they reach bugs in daemons/libraries/parsers we currently
 Each increment is proven end-to-end through `tools/pipeline_conformance.py` with the existing cases
 held green (no capability lost), as doc 44/45 did. Related: [[engagement-large-binary-round]],
 [[airgap-engagement-gaps]], [[lykos-project]].
+
+## Progress (2026-10-21)
+
+- **T1 ranker** — DONE (`harness/rank.py`), demonstrated on asterisk's 4,675 functions.
+- **T2 executor + libc stubs + fuzz loop** — DONE (`harness/emulate.py`, `harness/fuzz.py`): drives
+  one function under unicorn, finds the OOB from a benign seed. 7 harness tests.
+- **T2 #3 `harness` stage** — DONE (`harness/harness_stage.py`): rank -> harness-fuzz -> file a
+  function-level finding with honest provenance. Registered + in the orchestrator stage map, but
+  DELIBERATELY NOT in the default autopilot plan (operator steer: stop adding fuzzing to every run).
+
+## Phase 2 -- the NON-fuzzing program (operator steer, 2026-10-21)
+
+"We just keep adding more fuzzing -- there are other things that bring about exploits." Correct:
+fuzzing is one corner of DISCOVER, and only crash-shaped bugs. The asterisk run produced real
+NON-fuzz findings -- `popen`/`execvp` (CWE-78), `sqlite3_prepare` (CWE-89), weak crypto, predictable
+PRNG, an indirect call through a function pointer (CWE-822), an OOB index (CWE-129) -- and
+demonstrated ZERO. Closing that is the work. Avenues, most-grounded first:
+
+1. **Dataflow / taint-to-sink proof (injection & logic).** THE gap is in the code: injection sinks
+   are corroborated by CALL-GRAPH REACHABILITY, explicitly "not data flow" (`detect/detectors.py`
+   ~line 1056). Add argument-origin data flow at the sink call site: is the sink's key argument a
+   CONSTANT string literal (safe -- `popen("/bin/df")`) or DERIVED from untrusted input (the real
+   injection)? Reuse the pcode abstract-interpreter already in `detect/bounds.py` (it tracks
+   register/stack values through COPY/INT_ADD/... over a function's P-Code). First increment:
+   classify each flagged injection sink's arg0 as literal-vs-computed and adjust the finding
+   (constant -> downgrade/suppress, a precision win on asterisk's over-flagging; tainted -> a
+   data-flow-CONFIRMED injection surface). Pure static, no fuzzing.
+2. **N-day / CVE identification by fingerprinting (not version strings).** asterisk's CVE scan found
+   nothing (stripped of version banners) yet it IS Asterisk 22.5.2 with known SIP-parser CVEs.
+   Function-level structural/FLIRT-style fingerprinting identifies the component version even
+   stripped -> maps to a CVE -> a precise weaponizable lead. Most pentests land N-days.
+3. **Structural static queries over the decompilation (CodeQL-for-binaries).** Query the recovered
+   IR for bug SHAPES (tainted length into a copy, missing bounds check, free-then-use, uninit read)
+   without running. weggli does this for source; apply it to the binary's decompilation.
+4. **Logic / auth / state-machine bugs.** Auth bypass, access control, type confusion, protocol
+   state violations -- the program doing the WRONG thing, not crashing. Needs intended-vs-actual
+   modeling; the hardest tier.
+5. **Exploit composition.** Turn a bug into an exploit without fuzzing: ROP/ret2libc, heap grooming,
+   leak->ASLR-defeat->control. Concrete grounded gap: ret2system on a STRIPPED binary did not find a
+   `pop rdi; ret` gadget that provably EXISTS (fp2) -- `build_exploit` / `rop.find_gadget` under-finds.
+
+Order: start with #1 (most code-grounded), then #2 (highest real-engagement value), then #3-#5.
