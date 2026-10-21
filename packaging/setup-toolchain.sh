@@ -93,12 +93,31 @@ gen_wrappers() {
       name="$(basename "$real")"
       [ -e "$wdir/$name" ] && continue                # first bin dir wins on a name clash
       relreal=${real#"$tc"/}
+      # COMPILER DRIVERS get `--sysroot=<toolchain root>` injected. gcc/clang were configured
+      # --prefix=/usr, so their specs reference system-absolute lib/header/loader paths
+      # (/usr/lib/x86_64-linux-gnu/libc_nonshared.a, /lib64/ld-linux-...) that do not exist in the
+      # relocated bundle -- without --sysroot, compiling uploaded source / PoC harnesses / libFuzzer
+      # targets fails offline with "cannot find ...". The bundle keeps only the NATIVE compiler
+      # (cross-compilers are pruned in make-runnable), so one sysroot is always correct. Matches
+      # real drivers only -- never gcc-ar / gcc-nm / gcc-ranlib / cpp / gcov.
+      is_cc=0
+      case "$name" in
+        gcc|g++|cc|c++|clang|clang++) is_cc=1 ;;
+        gcc-[0-9]*|g++-[0-9]*|clang-[0-9]*|clang++-[0-9]*) is_cc=1 ;;
+        *-gcc|*-g++|*-cc|*-c++|*-clang|*-clang++) is_cc=1 ;;
+        *-gcc-[0-9]*|*-g++-[0-9]*|*-clang-[0-9]*|*-clang++-[0-9]*) is_cc=1 ;;
+      esac
       { printf '#!/bin/sh\n'
         printf '# lykos relocatable wrapper: resolves the bundle root from its own location and\n'
         printf '# execs the real tool, which relink-bundle.sh already made glibc-self-contained.\n'
         printf '# No LD_LIBRARY_PATH -- see gen_wrappers in setup-toolchain.sh for why.\n'
         printf 'r=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)\n'
-        printf 'exec "$r/%s" "$@"\n' "$relreal"
+        if [ "$is_cc" = 1 ]; then
+          printf '# compiler driver: relocate its /usr-prefixed lib/header/loader search into the bundle\n'
+          printf 'exec "$r/%s" --sysroot="$r" "$@"\n' "$relreal"
+        else
+          printf 'exec "$r/%s" "$@"\n' "$relreal"
+        fi
       } > "$wdir/$name"
       chmod +x "$wdir/$name"
       n=$((n+1))

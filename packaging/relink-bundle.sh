@@ -91,6 +91,17 @@ done
 LDREAL=$(CDPATH= cd -- "$(dirname "$LD")" && pwd)/$(basename "$LD")
 mkdir -p "$TC/.relink"
 
+# Make the loader reachable at its STANDARD interpreter path under the toolchain root. The bundle's
+# gcc/clang are relocated with `--sysroot=<toolchain>` (see the compiler wrappers), and ld then
+# checks that the OUTPUT binary's interpreter (/lib64/ld-linux-* on x86-64, /lib/ld-* elsewhere)
+# exists UNDER the sysroot at LINK time -- failing with "cannot find /lib64/ld-linux-... inside
+# <toolchain>" when the apt collect omitted the /lib64 usrmerge symlink. Recreate it -> the real
+# loader so compiling uploaded source / PoC harnesses / libFuzzer targets works offline.
+_lbn=$(basename "$LDREAL")
+for _ldir in "$TC/lib64" "$TC/lib"; do
+  mkdir -p "$_ldir" 2>/dev/null && ln -sf "$LDREAL" "$_ldir/$_lbn" 2>/dev/null || true
+done
+
 # the roots to walk: the toolchain tree always, plus any vendored python venvs / pysite present
 set -- "$TC"
 for extra in "$VENDOR"/*-venv "$VENDOR"/pysite "$VENDOR"/symqemu; do
@@ -121,12 +132,43 @@ find "$@" -type f 2>/dev/null | while IFS= read -r f; do
   if [ "$has_interp" = no ] && [ -z "$("$PATCHELF" --print-needed "$f" 2>/dev/null)" ]; then
     continue
   fi
-  # dynamic exe / PIE -> repoint its interpreter at the bundle loader (.so have none)
   if [ "$has_interp" = yes ]; then
-    "$PATCHELF" --set-interpreter "$LDREAL" "$f" 2>/dev/null || true
+    # DYNAMIC EXECUTABLE. Repoint its interpreter at the bundle loader + add the rpath -- but on a
+    # COPY first, because patchelf 0.19.1 CORRUPTS some large binaries: gcc's 42 MB cc1 segfaults the
+    # loader after --set-interpreter (measured: pristine cc1 runs fine via the bundle loader; the
+    # patched one rc=139), which silently killed source compilation + the libFuzzer lane on the
+    # air-gapped laptop while the gcc DRIVER (small, patches cleanly) looked fine. So: patch a copy,
+    # verify the bundle loader can still resolve it, and only then adopt it. If the patch corrupts
+    # the binary, keep the PRISTINE one and front it with a loader-wrapper -- running a pristine
+    # binary as `<bundle-ld> --library-path <rpath> <binary>` is glibc-independent AND patch-free.
+    tmp="$f.relinktmp"
+    if cp -p "$f" "$tmp" 2>/dev/null; then
+      "$PATCHELF" --set-interpreter "$LDREAL" "$tmp" 2>/dev/null || true
+      curx=$("$PATCHELF" --print-rpath "$tmp" 2>/dev/null || true)
+      case "$curx" in
+        "$RPATH"|"$RPATH":*) ;;
+        "") "$PATCHELF" --set-rpath "$RPATH" "$tmp" 2>/dev/null || true ;;
+        *)  "$PATCHELF" --set-rpath "$RPATH:$curx" "$tmp" 2>/dev/null || true ;;
+      esac
+      if "$LDREAL" --list "$tmp" >/dev/null 2>&1; then
+        mv -f "$tmp" "$f"                           # patched binary is sound -- adopt it
+      else
+        rm -f "$tmp"                                # patchelf corrupted it -- wrapper the pristine one
+        mv -f "$f" "$f.real"
+        { printf '#!/bin/sh\n'
+          printf '# lykos loader-wrapper: patchelf corrupts this binary (0.19.1 large-ELF bug), so the\n'
+          printf '# PRISTINE copy beside it is run through the bundle loader with the bundle library path.\n'
+          printf 'exec "%s" --library-path "%s" "%s.real" "$@"\n' "$LDREAL" "$RPATH" "$f"
+        } > "$f"
+        chmod 0755 "$f"
+      fi
+    fi
+    printf 'x' >> "$TC/.relink/.count"
+    continue
   fi
-  # give it (exe or .so) an rpath into the bundle libs, ahead of anything it already had, so a
-  # child exec'd without LD_LIBRARY_PATH still resolves the bundle's libraries
+  # SHARED LIBRARY (no interpreter): give it an rpath into the bundle libs, ahead of anything it had,
+  # so a child exec'd without LD_LIBRARY_PATH still resolves the bundle's libraries. (.so are loaded,
+  # not exec'd, so the wrapper path above does not apply; patchelf's rpath edit on a .so is safe.)
   cur=$("$PATCHELF" --print-rpath "$f" 2>/dev/null || true)
   case "$cur" in
     "$RPATH"|"$RPATH":*) ;;                       # already leads with ours
