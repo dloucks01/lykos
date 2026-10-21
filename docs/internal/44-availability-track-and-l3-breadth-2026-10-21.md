@@ -49,6 +49,34 @@ Every promotion is proven **end to end through the real Autopilot** (`run_case_a
 `WorkerPool`) via `tools/pipeline_conformance.py`, with the existing sanitizer/overflow cases held
 green (no capability lost). Each item lands as its own commit with a `[measured]` result here.
 
+## Gap analysis (measured 2026-10-21, after memory_leak)
+
+Not every "L1/L2" case is a true L3 gap -- several are DELIBERATE fixture ceilings whose CWE is
+already demonstrated at L3 by a richer fixture, so driving the bare one to L3 only duplicates:
+- `double_free` (CWE-415): co-CWE CWE-416 is L3 in `heap_fsop_*`; the bare fixture has no write/read
+  primitive by design. SKIP.
+- `format_read_leak` (CWE-134/200): both CWEs are L3 via the format-WRITE ret2win cases; the read
+  fixture is a deliberate L2 disclosure. SKIP.
+
+TRUE gaps (no L3 anywhere for the CWE):
+- **Availability family** (`alloc_size_dos`, `stack_exhaustion`): both already reach L1 -- but
+  MISCLASSIFIED. Measured: `alloc_size_dos` driven with a huge size faults under the guard-page
+  allocator and is filed `fuzz/CWE-119 "Control-flow hijack (SIGSEGV)"` -- a critical-hijack label
+  on a resource-exhaustion DoS (the `CWE-789` static flag is corroborated alongside). The real task
+  is to RECLASSIFY the huge-alloc / deep-recursion SIGSEGV as resource-exhaustion (CWE-400/789/674),
+  NOT a hijack, and then level it on the availability ladder -- delicate (must not relabel genuine
+  hijacks: gate on the CWE-789/static signal + the crashing input being an oversized count + the
+  fault site being in the allocator/recursion, not a return-address overwrite).
+- **`int_overflow_alloc` / `int_underflow_alloc`** (CWE-190/122/131): int overflow -> undersized
+  alloc -> heap overflow -> fnptr hijack. The fnptr-hijack end exists (`int_overflow_fnptr` is L3);
+  the gap is the alloc-overflow chain + a fixture with a clobberable target.
+- **`untrusted_pointer`** (arbitrary read, L2): level by what the read RESOLVES -- read a chosen
+  sensitive address (ASLR defeat / planted secret) = disclosure realised (L3), mirroring the
+  path-traversal/SQLi "effect realised" rung. Needs the poc path to pick a meaningful target addr.
+
+Each is per-class exploitation/classification engineering with its own autopilot-verified rung --
+a deliberate program, not a quick sweep. memory_leak was the clean one (LSan directly observes it).
+
 ## Progress log
 
 - **A — availability ladder, memory_leak → L3 [measured].** `poc/dos.py` (new) `escalate()` hangs
