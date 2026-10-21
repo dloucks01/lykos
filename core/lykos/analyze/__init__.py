@@ -14,6 +14,7 @@ from .dynamic import register as _register_dynamic
 from .fingerprint import register as _register_fingerprint
 from .firmware import register as _register_firmware
 from .fuzz import register as _register_fuzz
+from .harness import register as _register_harness
 from .ingest import INGEST_TRIAGE_STAGE, ingest  # noqa: F401
 from .ingest import register as _register_ingest
 from .libfuzzer_stage import register as _register_libfuzzer
@@ -29,6 +30,7 @@ def register() -> None:
     _register_detect()
     _register_dynamic()
     _register_fuzz()
+    _register_harness()
     _register_libfuzzer()
     _register_poc()
     _register_symbolic()

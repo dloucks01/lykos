@@ -54,6 +54,7 @@ _TARGET = {
     "coverage_fuzz": ("..analyze.fuzz", "enqueue_coverage_fuzz"),
     "fuzz": ("..analyze.fuzz", "enqueue_fuzz"),
     "directed_fuzz": ("..analyze.fuzz", "enqueue_directed_fuzz"),
+    "harness": ("..analyze.harness", "enqueue_harness"),
     "heap_check": ("..analyze.dynamic", "enqueue_heap_check"),
     "heap_trace": ("..analyze.dynamic", "enqueue_heap_trace"),
     "oob_index": ("..analyze.dynamic", "enqueue_oob_index"),
