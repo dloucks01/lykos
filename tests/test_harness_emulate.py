@@ -36,6 +36,44 @@ def _build(gcc, tmp_path):
     return exe.read_bytes(), addr
 
 
+_SRC_LIBC = r"""
+#include <string.h>
+static int t[8] = {1,2,3,4,5,6,7,8};
+int lookup(char *buf, int len){
+  int idx = 0;
+  memcpy(&idx, buf, 4);   /* external call: must be stubbed for the function to run */
+  return t[idx];          /* OOB read when idx is out of range */
+}
+int main(void){ char z[4]={0}; return lookup(z,4); }
+"""
+
+
+def _build_named(gcc, tmp_path, src, sym, extra=()):
+    s = tmp_path / "t.c"
+    s.write_text(src)
+    exe = tmp_path / "t"
+    subprocess.run([gcc, "-no-pie", "-O0", "-w", *extra, str(s), "-o", str(exe)], check=True)
+    addr = None
+    for line in subprocess.run(["nm", str(exe)], capture_output=True, text=True).stdout.splitlines():
+        p = line.split()
+        if len(p) == 3 and p[2] == sym:
+            addr = int(p[0], 16)
+    assert addr, f"{sym} not found"
+    return exe.read_bytes(), addr
+
+
+def test_libc_stub_lets_a_function_run_and_still_catches_oob(gcc, tmp_path):
+    import struct
+    data, addr = _build_named(gcc, tmp_path, _SRC_LIBC, "lookup", extra=("-fno-builtin",))
+    # in-bounds index: memcpy is stubbed so the function runs to a clean return (needs the TLS/
+    # canary setup too -- a canary-protected function reads fs:[0x28] on entry).
+    ok = run_function(data, addr, struct.pack("<i", 0))
+    assert ok.returned and not ok.crashed, ok.note
+    # out-of-range index: the OOB read faults -- reached ONLY because the memcpy call was stubbed.
+    bad = run_function(data, addr, struct.pack("<i", 0x20000000))
+    assert bad.crashed and bad.access == "read"
+
+
 def test_executor_distinguishes_clean_return_from_fault(gcc, tmp_path):
     data, addr = _build(gcc, tmp_path)
     # a mapped address (the harness's own input window) -> the deref reads it -> clean return
