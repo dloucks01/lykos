@@ -56,10 +56,13 @@ function bgEventToLog(ev) {
   const p = ev.payload || {};
   if (ev.type === "autopilot.stage") {
     if (!p.state || p.state === "running") return null;
-    const status = p.state === "error" ? "error" : "done";
-    const suffix = p.state === "skipped" ? " (skipped)" : p.state === "cancelled" ? " (stopped)" : "";
-    return { kind: "stage", stage: p.stage,
-             label: (p.label || p.stage) + suffix,
+    // Report the stage outcome HONESTLY. A stage that DECLINED (ran and could not do its work --
+    // afl aborted, no IPC channel, target would not start), was SKIPPED (never reached), timed
+    // out, or was cancelled is NOT a success and must not render as a green check. The backend
+    // already distinguishes these (orchestrate `_emit_stage`); only the UI was flattening them.
+    const status = ({ error: "error", timeout: "timeout", declined: "declined",
+                      skipped: "skipped", cancelled: "cancelled" })[p.state] || "done";
+    return { kind: "stage", stage: p.stage, label: (p.label || p.stage),
              detail: p.detail || null, status };
   }
   if (ev.type === "autopilot.done") {

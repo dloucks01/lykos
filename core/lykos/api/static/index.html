@@ -142,7 +142,9 @@
   .plan-dot.dot-running { background: var(--run); transform: scale(1.35); box-shadow: 0 0 0 3px color-mix(in srgb, var(--run) 25%, transparent); }
   .plan-dot.dot-error { background: var(--bad); }
   .plan-dot.dot-timeout { background: var(--warn); outline: 1px dashed color-mix(in srgb, var(--warn) 60%, transparent); }
+  .plan-dot.dot-declined { background: var(--warn); outline: 1px solid color-mix(in srgb, var(--warn) 70%, transparent); }
   .plan-nowtimeout { color: var(--warn); }
+  .plan-nowdecl { color: var(--warn); }
   .plan-dot.dot-skipped { background: color-mix(in srgb, var(--faint) 40%, transparent); }
   .plan-dot.dot-cancelled { background: var(--warn); }
   .plan-dot.dot-pending { background: var(--line); }
@@ -168,6 +170,8 @@
   .st-ico { flex: 0 0 16px; width: 16px; text-align: center; font-size: .8rem; font-weight: 700; line-height: 1.4; }
   .st-ok { color: var(--ok); }
   .st-bad { color: var(--bad); }
+  .st-decl { color: var(--warn); }   /* declined / timed out: ran but did not do its work */
+  .st-skip { color: var(--muted); }  /* skipped / cancelled: never completed its work */
   .st-run { flex: 0 0 16px; width: 12px; height: 12px; margin: 3px 2px 0; border: 2px solid var(--line);
     border-top-color: var(--run); border-radius: 50%; animation: rot .7s linear infinite; }
   .log-row.st-running .log-label { color: var(--run); }

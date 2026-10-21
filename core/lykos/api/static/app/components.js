@@ -38,7 +38,8 @@ export function SevDot({ severity }) {
 // the server-side background run's status.plan, so a glance shows progress, not just a scrolling
 // log. Each step carries a state (pending/running/done/skipped/error/cancelled) and an optional
 // detail. Conditional steps the run never reached show as "skipped".
-const _PLAN_ICON = { done: "✓", error: "✕", skipped: "–", cancelled: "■" };
+const _PLAN_ICON = { done: "✓", error: "✕", skipped: "–", cancelled: "■",
+                     declined: "⊘", timeout: "⧖" };
 // A COMPACT progress summary -- deliberately not a stage list (the Run log already is one). It
 // gives what the log does not: overall progress at a glance, the step running right now, and the
 // shape of what is still ahead (the dot strip, each dot a stage; hover for its name + detail).
@@ -50,6 +51,7 @@ export function PipelinePlan({ plan, targetName, target, targets, now }) {
   const running = plan.find((p) => p.state === "running");
   const errored = plan.find((p) => p.state === "error");
   const timedout = plan.find((p) => p.state === "timeout");
+  const declined = active.filter((p) => p.state === "declined").length;
   const pct = Math.round((100 * done) / Math.max(1, total));
   // Elapsed for a stage: a finished stage carries its own `elapsed`; a RUNNING one is timed live
   // against the server clock (`now`) so a growing number proves it is alive, not hung.
@@ -60,6 +62,7 @@ export function PipelinePlan({ plan, targetName, target, targets, now }) {
     const e = elapsedOf(p);
     const et = e != null ? ` · ${fmtElapsed(e)}` : "";
     const st = p.state === "timeout" ? " (cut short — out of budget)"
+      : p.state === "declined" ? " (declined — could not run on this target)"
       : p.state === "skipped" ? " (skipped)" : p.state === "cancelled" ? " (stopped)"
       : p.state === "error" ? " (error)" : "";
     return `${p.label}${st}${p.detail ? ` — ${p.detail}` : ""}${et}`;
@@ -78,6 +81,7 @@ export function PipelinePlan({ plan, targetName, target, targets, now }) {
               + (running.detail ? ` — ${running.detail}` : "")} />`
           : errored ? html`<span class="plan-nowerr">✕ ${errored.label}${errored.detail ? ` — ${errored.detail}` : " failed"}</span>`
           : timedout ? html`<span class="plan-nowtimeout">⧖ ${timedout.label} cut short — out of budget (raise it to let it finish)</span>`
+          : declined ? html`<span class="plan-nowdecl">⊘ ${done}/${total} ran · ${declined} declined (could not run on this target — see the log)</span>`
           : html`<span class="plan-nowok">✓ all ${total} steps complete</span>`}
       </div>
       <div class="plan-dots">
@@ -208,9 +212,14 @@ export function TargetSummary({ target, advice, index, onBrowseFunctions }) {
 // glance, never two lines. An INFO row is a plain note (advice headline, "N distinct crashes").
 function LogRow({ e }) {
   if (e.kind === "stage") {
+    // Each terminal status gets its OWN mark. Only "done" is a green check; a stage that declined,
+    // was skipped, timed out or was cancelled did NOT accomplish its work and must say so.
+    const MARK = { error: ["st-bad", "✕"], timeout: ["st-decl", "⧖"],
+                   declined: ["st-decl", "⊘"], skipped: ["st-skip", "–"],
+                   cancelled: ["st-skip", "■"], done: ["st-ok", "✓"] };
+    const [cls, ch] = MARK[e.status] || MARK.done;
     const icon = e.status === "running" ? html`<span class="st-run"></span>`
-      : e.status === "error" ? html`<span class="st-ico st-bad">✕</span>`
-      : html`<span class="st-ico st-ok">✓</span>`;
+      : html`<span class=${`st-ico ${cls}`}>${ch}</span>`;
     return html`
       <li class=${`log-row st-${e.status}`}>
         ${icon}
