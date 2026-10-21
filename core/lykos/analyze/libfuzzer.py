@@ -2077,6 +2077,55 @@ def executions(log: str) -> int:
     return best
 
 
+#: How many candidate inputs the deterministic replay pass will re-run when the fuzzing loop left
+#: no crash with a usable source. Harvested crash inputs are always replayed (there are few); this
+#: caps the SEED replay so a clean target carrying a big kept corpus (up to CORPUS_MAX_UNITS) is not
+#: re-executed one unit per process. Largest seeds first, because size is what drives an overflow.
+_REPLAY_SEED_CAP = 24
+
+
+def _report_has_source(report: str | None) -> bool:
+    """Whether a sanitizer report pins the defect to a source file:line. This is the property the
+    libfuzzer_stage confirmation turns on, so it is also the signal for whether a replay is needed."""
+    try:
+        from .debug.rootcause import parse_asan_report
+        cls = parse_asan_report(report or "")
+        return bool(cls and cls.get("source"))
+    except Exception:
+        return False
+
+
+def _replay_report(binary, workdir: Path, data: bytes) -> str:
+    """Replay ONE input through the harness directly (`binary <file>`, no fuzzing loop) and return
+    the sanitizer report, or "".
+
+    The fuzzing loop runs with abort_on_error=1 so that a CORPUS-SEED crash (execs 0-1) can abort()
+    before llvm-symbolizer finishes walking the stack -- the `parse.c:3` frame then prints as a bare
+    address and the source line is lost -- and a run that ends in TimeoutExpired can have its stderr
+    truncated so no report is captured at all. A lone-file replay is a single, deterministic exec
+    outside the loop and its timeout, with halt_on_error + abort_on_error off so the symbolizer
+    finishes. This is what makes a seed-triggered crash and its source line reproducible run to run."""
+    try:
+        f = Path(workdir) / "lf-replay.in"
+        f.write_bytes(bytes(data))
+    except OSError:
+        return ""
+    env = dict(os.environ)
+    env["ASAN_OPTIONS"] = ("abort_on_error=0:detect_leaks=0:symbolize=1:halt_on_error=1:"
+                           + env.get("ASAN_OPTIONS", ""))
+    # The crash itself is instant; the cost is llvm-symbolizer parsing the statically-linked ASan
+    # binary's DWARF, measured at ~9 s idle and several times that with a cold symbolizer or under a
+    # loaded box. 120 s keeps a slow-but-succeeding symbolization from being cut to an empty report
+    # (which was the replay's own flake). Only the ONE reproducing replay pays this -- the pass
+    # breaks on the first sourced report, and a non-crashing candidate exits fast with no symbolizer.
+    try:
+        r = subprocess.run([str(binary), str(f)], capture_output=True, text=True, timeout=120,
+                           env=env, cwd=str(workdir))
+    except (subprocess.TimeoutExpired, OSError):
+        return ""
+    return fault_report((r.stderr or "") + (r.stdout or "")) or ""
+
+
 def run_libfuzzer(binary, workdir, *, seconds: int = 30, max_len: int = 4096,
                   corpus: list | None = None) -> dict:
     """Run the libFuzzer `binary` for `seconds`. Returns {crashes, corpus, execs, log}.
@@ -2112,6 +2161,57 @@ def run_libfuzzer(binary, workdir, *, seconds: int = 30, max_len: int = 4096,
                                 "artifact": f.name})
             except OSError:
                 pass
+    # A sanitizer fired but NO artifact was harvested: the crash is real (the report proves it), the
+    # artifact write just lost the race with the sanitizer's abort() -- which is the common case when
+    # a CORPUS SEED crashes on the initial replay (execs 0-1), before libFuzzer flushes `crash-*`.
+    # Treating that as "no crash" made seed-triggered overflows undetectable and the crash reporting
+    # nondeterministic. Recover the crashing input from libFuzzer's "Running: <file>" line (the unit
+    # it was executing), else the largest seed, and record it so the crash is never lost.
+    if report and not crashes:
+        import re as _re
+        crash_input = b""
+        m = _re.search(r"Running:\s*(\S+)", out)
+        if m:
+            try:
+                crash_input = Path(m.group(1)).read_bytes()
+            except OSError:
+                crash_input = b""
+        if not crash_input and corpus:
+            crash_input = max((bytes(s) for s in corpus), key=len, default=b"")
+        crashes.append({"input": crash_input, "report": report, "kind": "crash", "artifact": None})
+    # DETERMINISTIC REPLAY. The report the fuzzing loop captured can be incomplete under CPU
+    # contention -- a corpus-seed crash can abort() before the symbolizer finishes (source line
+    # lost), and a timed-out run's stderr can be truncated so no report is captured at all -- which
+    # made a SEEDED overflow report nondeterministically and its source line flaky. When no crash
+    # yet carries a usable source, replay the candidate inputs ONE AT A TIME through the harness
+    # directly (see `_replay_report`) and take the first that reproduces with a source. Harvested
+    # crash inputs are always tried; seeds are tried largest-first but capped, so a clean target
+    # carrying a big kept corpus is not re-executed one unit per process.
+    if not any(_report_has_source(c.get("report")) for c in crashes):
+        seen_inputs, candidates = set(), []
+        for c in crashes:                                # harvested crash inputs first (always few)
+            ci = c.get("input")
+            if ci and bytes(ci) not in seen_inputs:
+                seen_inputs.add(bytes(ci)); candidates.append(bytes(ci))
+        for s in sorted((bytes(x) for x in (corpus or [])), key=len, reverse=True)[:_REPLAY_SEED_CAP]:
+            if s not in seen_inputs:
+                seen_inputs.add(s); candidates.append(s)
+        best_rep, best_input = "", b""
+        for data in candidates:
+            rep = _replay_report(binary, workdir, data)
+            if not rep:
+                continue
+            if not best_rep:
+                best_rep, best_input = rep, data         # keep any reproduction as a floor
+            if _report_has_source(rep):
+                best_rep, best_input = rep, data          # a sourced one wins outright
+                break
+        if best_rep:
+            if crashes:
+                crashes[0]["report"] = best_rep           # enrich the sourceless crash in place
+            else:
+                crashes.append({"input": best_input, "report": best_rep, "kind": "crash",
+                                "artifact": None})         # a crash the loop missed entirely
     # THE CORPUS IS THE PRODUCT, not a by-product. libFuzzer writes every input that reached new
     # coverage into this directory -- 1,208 of them in one 420 s run on libtiff -- and it lived in
     # the stage's scratch directory, so every run started from nothing and re-derived the same

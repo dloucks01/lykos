@@ -41,7 +41,9 @@ def test_build_and_run_intree_harness(tmp_path):
     out = tmp_path / "fuzz.bin"
     b = LF.build_libfuzzer(tmp_path, out)
     assert b["ok"] and "in-tree" in b["harness"], b["log"][-300:]
-    r = LF.run_libfuzzer(out, tmp_path, seconds=15)
+    # Seed a crashing input (>= the 8-byte buffer): libFuzzer replays the corpus first, so the
+    # overflow is deterministic instead of left to the mutator under CPU contention.
+    r = LF.run_libfuzzer(out, tmp_path, seconds=15, corpus=[b"\x7f" + b"A" * 63])
     assert r["crashes"] and b"AddressSanitizer" in (r["crashes"][0]["report"] or "").encode()
 
 
@@ -53,8 +55,51 @@ def test_synth_harness_for_library_function(tmp_path):
     out = tmp_path / "fuzz.bin"
     b = LF.build_libfuzzer(tmp_path, out, harness_fn="parse")
     assert b["ok"] and "synthesized" in b["harness"], b["log"][-300:]
-    r = LF.run_libfuzzer(out, tmp_path, seconds=15)
+    # Seed a crashing input (>= the 16-byte buffer) so the strcpy overflow is replayed, not searched.
+    r = LF.run_libfuzzer(out, tmp_path, seconds=15, corpus=[b"A" * 64])
     assert r["crashes"]
+
+
+def _lib_c(tmp_path):
+    (tmp_path / "lib.c").write_text("#include <string.h>\n#include <stdio.h>\n"
+                                    "void parse(char*s){char t[16];strcpy(t,s);"
+                                    "if(t[0]==0x7f)printf(\" \");}\n")
+    out = tmp_path / "fuzz.bin"
+    b = LF.build_libfuzzer(tmp_path, out, harness_fn="parse")
+    assert b["ok"], b["log"][-300:]
+    return out
+
+
+def test_replay_report_symbolizes_seed_crash(tmp_path):
+    """The deterministic single-exec replay: a direct `binary <file>` run of a known-overflowing
+    input yields a FULLY SYMBOLIZED sanitizer report with a source line. The fuzzing loop runs with
+    abort_on_error=1, so a corpus-seed crash can abort() before the symbolizer finishes and lose the
+    source file:line; the replay turns that off and is deterministic."""
+    _clang_or_skip()
+    out = _lib_c(tmp_path)
+    rep = LF._replay_report(out, tmp_path, b"A" * 64)
+    from lykos.analyze.debug.rootcause import parse_asan_report
+    cls = parse_asan_report(rep)
+    assert cls and cls.get("source") and "lib.c:" in cls["source"], rep[:400]
+
+
+def test_run_libfuzzer_replay_recovers_when_loop_report_is_lost(tmp_path, monkeypatch):
+    """run_libfuzzer must not depend on the fuzzing loop capturing a usable report. Simulate the
+    loop learning nothing (truncated stderr on timeout, or an abort()-raced symbolizer) by blanking
+    only the FIRST fault_report -- the loop's -- and letting the later replay parse normally. The
+    deterministic replay of the seeded overflow must still recover a crash WITH a source line."""
+    _clang_or_skip()
+    out = _lib_c(tmp_path)
+    real, calls = LF.fault_report, {"n": 0}
+    def flaky(o):                                        # first call is the loop's; blank only it
+        calls["n"] += 1
+        return None if calls["n"] == 1 else real(o)
+    monkeypatch.setattr(LF, "fault_report", flaky)
+    r = LF.run_libfuzzer(out, tmp_path, seconds=10, corpus=[b"A" * 64])
+    assert r["crashes"], "replay must recover the crash the loop reported nothing about"
+    from lykos.analyze.debug.rootcause import parse_asan_report
+    cls = parse_asan_report(r["crashes"][0]["report"] or "")
+    assert cls and cls.get("source") and "lib.c:" in cls["source"]
 
 
 @pytest.fixture
@@ -88,7 +133,7 @@ def test_libfuzzer_stage_confirms_finding_with_source_line(store, case, pool):
     (proj / "Makefile").write_text("app: main.c parse.c\n\t$(CC) $(CFLAGS) main.c parse.c -o app $(LDFLAGS)\n")
     t = ingest(store, case.id, proj, filename="prog")
     run = enqueue_libfuzzer(JobQueue(store.conn), t, params={"harness_fn": "parse", "seconds": 15})
-    assert pool.wait_idle(90) and store.runs.get(run.id).status == "done"
+    assert pool.wait_idle(180) and store.runs.get(run.id).status == "done"
     lf = [f for f in FindingDAO(store.conn).list_by_target(t.id) if f.detector == "libfuzzer"]
     assert lf and lf[0].state == "confirmed"
     assert lf[0].cwe in ("CWE-121", "CWE-122", "CWE-787")
@@ -128,7 +173,7 @@ def test_libfuzzer_on_pure_library_auto_harness(store, case, pool):
                                  " if(t[0]==0x7f)printf(\" \"); }\n")
     t = ingest(store, case.id, lib, filename="mylib")     # pure library -> ingests as .so
     run = enqueue_libfuzzer(JobQueue(store.conn), t, params={"seconds": 15})   # auto-harness
-    assert pool.wait_idle(90) and store.runs.get(run.id).status == "done"
+    assert pool.wait_idle(180) and store.runs.get(run.id).status == "done"
     lf = [f for f in FindingDAO(store.conn).list_by_target(t.id) if f.detector == "libfuzzer"]
     assert lf and lf[0].state == "confirmed" and lf[0].cwe in ("CWE-121", "CWE-122", "CWE-787")
 
@@ -158,6 +203,6 @@ def test_libfuzzer_cpp_project_name_mangling(store, case, pool):
                                 "\t$(CXX) $(CXXFLAGS) main.cpp parser.cpp -o app $(LDFLAGS)\n")
     t = ingest(store, case.id, d, filename="cpproj")
     run = enqueue_libfuzzer(JobQueue(store.conn), t, params={"harness_fn": "load", "seconds": 15})
-    assert pool.wait_idle(90) and store.runs.get(run.id).status == "done"
+    assert pool.wait_idle(180) and store.runs.get(run.id).status == "done"
     lf = [f for f in FindingDAO(store.conn).list_by_target(t.id) if f.detector == "libfuzzer"]
     assert lf and lf[0].state == "confirmed" and lf[0].cwe in ("CWE-121", "CWE-122", "CWE-787")

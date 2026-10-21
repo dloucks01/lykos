@@ -316,6 +316,12 @@ def _fuzz_one(ctx, target, src, spec, *, seconds, cache, corpus_root, max_len, f
     cache_dir = (corpus_root / spec["id"]) if corpus_root is not None else None
     kept = _load_corpus(cache_dir, pool=corpus_root)
     corpus = kept + [c for c in corpus if c not in kept]
+    # Always prime with a few GENERIC over-long inputs: a plain stack overflow (strcpy/memcpy/sprintf
+    # into a small array) is then hit on the FIRST replay instead of left to the mutator to grow an
+    # input large enough -- which a short, CPU-contended campaign may not do in time. Cheap, and it
+    # helps a real overflow target as much as a tiny harness; the mutator still explores past them.
+    _generic = [b"A" * n for n in (16, 64, 256, 1024)]
+    corpus = corpus + [g for g in _generic if g not in corpus]
     ctx.progress(msg=f"libFuzzer: {spec.get('entry')} for {int(seconds)}s"
                      + (f", {len(corpus)} seeds" if corpus else ""))
     res = LF.run_libfuzzer(build["binary"], ctx.scratch() / spec["id"], seconds=int(seconds),
