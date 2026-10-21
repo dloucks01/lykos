@@ -311,6 +311,19 @@ def build_poc_stage(ctx) -> dict:
         if fid:
             PocDAO(ctx.conn).set_finding(poc_id, fid)
 
+        # A verified memory leak is an availability defect at L1; escalate it up the availability
+        # ladder in place -- an unbounded-amplification primitive (L2) and a realised, host-safe
+        # denial-of-service impact (L3). This is the one point that holds the leak's reproducing
+        # input, the target and the sanitizer/plain builds, so the escalation hangs off it rather
+        # than needing its own orchestrator stage. Fully guarded: it can only ADD a higher PoC,
+        # never retract the L1 just filed.
+        if res.signal_name == "memory-leak":
+            try:
+                from . import dos
+                dos.escalate(ctx, target, input_sha, mode, argv_base=argv)
+            except Exception:
+                pass                                     # escalation only ADDS; never fail the L1
+
     ctx.emit("poc.done", payload={"verified": verified, "level": level,
                                   "signal": res.signal_name, "bundle": bundle_sha,
                                   "recorded_signal": wanted,

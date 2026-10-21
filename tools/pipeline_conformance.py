@@ -1734,9 +1734,16 @@ int main(void){ setvbuf(stdout,0,2,0);
     if(line[0]=='q') break; }
   printf("done\n"); return 0; }""",
          [], as_source=True,
-         want_level=1, want_cwe=("CWE-401",), budget=300.0, mechanism="resource-exhaustion",
+         want_level=3, want_cwe=("CWE-401",), budget=360.0, mechanism="resource-exhaustion",
          strict_level=True,
-         note="BUG CLASS memory leak (CWE-401): an allocation per request that is never freed. "
+         note="BUG CLASS memory leak (CWE-401) driven up the AVAILABILITY ladder to L3. L1 = the "
+              "leak is detected and reproduced (LeakSanitizer build, see below). L2 = an unbounded "
+              "amplification primitive (bytes/request measured linear on the LSan build, no "
+              "ceiling). L3 = denial of service REALISED under a host-safe memory cap: driven under "
+              "a 32 MB RLIMIT_AS, a benign request exits cleanly while the amplified request stream "
+              "takes the allocation-failure path -- the differential is the proof (poc/dos.py, hung "
+              "off build_poc once the leak is verified). "
+              "BUG CLASS memory leak (CWE-401): an allocation per request that is never freed. "
               "Never crashes, so crash-centric stages are blind to it, and valgrind (the classic "
               "oracle) is glibc-version coupled. CLOSED by a dedicated LeakSanitizer build, so the "
               "case is ingested AS SOURCE (like the MSan/TSan cases) -- the -fsanitize=leak build is "
