@@ -120,6 +120,35 @@ def test_a_machine_can_hold_one_emulator_per_guest(monkeypatch, tmp_path):
     assert aflpp.locate_qemu_trace_for(afl, "mips") is None
 
 
+def test_native_x86_64_coverage_is_not_starved_by_a_mismatched_default(monkeypatch, tmp_path):
+    """The starvation this whole path exists to prevent, on the HOST architecture. The bare
+    `afl-qemu-trace` on PATH is built for the WRONG guest (aarch64 on the build host that produced the
+    cross-arch e2e matrix), but `make engines` also builds an arch-suffixed `afl-qemu-trace-x86-64`
+    beside it (GUESTS defaults to `aarch64 arm x86_64`). For a NATIVE x86-64 binary-only target the
+    selector must return the x86-64 one -- NOT fall through to the bare aarch64 binary (which aborts at
+    the fork-server handshake) and NOT return None (which needlessly starves coverage-guided fuzzing on
+    the host arch and drops the campaign to the black-box fuzzer). The coverage gate must then report
+    the target as supported. Regression guard for the matrix host that had only an aarch64 tracer."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    afl = bindir / "afl-fuzz"
+    afl.write_text("")
+    (bindir / "afl-qemu-trace").write_text("")            # the bare default: the WRONG guest (aarch64)
+    (bindir / "afl-qemu-trace-x86-64").write_text("")     # the matching one `make engines` builds
+    by_name = {"afl-qemu-trace": "aarch64", "afl-qemu-trace-x86-64": "x86-64"}
+    monkeypatch.setattr(aflpp, "qemu_trace_arch", lambda t: by_name.get(pathlib.Path(t).name))
+    monkeypatch.setattr(aflpp, "locate_afl", lambda _c: afl)
+    aflpp._guest_cache.clear()
+    # the suffixed x86-64 tracer wins over the bare aarch64 default for a native x86-64 target
+    got = aflpp.locate_qemu_trace_for(afl, "x86-64")
+    assert got is not None and got.name == "afl-qemu-trace-x86-64"
+    # ...and the aarch64 guest is still served by the bare default
+    assert aflpp.locate_qemu_trace_for(afl, "aarch64").name == "afl-qemu-trace"
+    # the coverage gate therefore reports BOTH as supported -- native x86-64 is not starved
+    assert _unsupported(_T(arch="x86-64")) is None
+    assert _unsupported(_T(arch="aarch64")) is None
+
+
 def test_an_override_pointing_at_the_wrong_guest_is_refused(monkeypatch, tmp_path):
     """Naming a file afl-qemu-trace-arm does not make it emulate ARM. An unverified override
     would abort at the fork-server handshake, which is the failure this path exists to
