@@ -20,6 +20,133 @@ _STATE_COLOR = {
     "confirmed": "#46a758", "poc-backed": "#8e4ec6",
 }
 
+_LEVEL_COLOR = {"L0": "#8b8d98", "L1": "#5b9dd9", "L2": "#f76808", "L3": "#e5484d"}
+#: What each rung MEANS, in one line -- the impact ladder, so a reader who does not live in it
+#: can read the verdict. Canonical source: bundle._LEVEL_MEANING.
+_LEVEL_GLOSS = {
+    "L0": "observed (a crash was seen)",
+    "L1": "reproduced — a verified reproducer exists",
+    "L2": "exploitation primitive — attacker control of a corruption/injection established",
+    "L3": "working exploit — the attacker's end goal was realised (control hijack, injected "
+          "command/query/read carried out, or a denial of service)",
+}
+
+#: CWE -> concise, actionable remediation. Keyed by the exact CWE; `_remediation` falls back along
+#: the family and then to a sane default, so a report never shows a finding with no guidance.
+_REMEDIATION = {
+    "CWE-120": "Bound every copy to the destination size; replace unbounded copies (strcpy/"
+               "sprintf/gets) with their sized forms (strlcpy/snprintf) and validate input length.",
+    "CWE-121": "Do not size stack buffers from untrusted length; use sized copies and enable "
+               "stack canaries (-fstack-protector-strong) and FORTIFY_SOURCE.",
+    "CWE-122": "Validate allocation sizes and copy bounds before writing into heap buffers; "
+               "prefer allocators/containers that track capacity.",
+    "CWE-125": "Bounds-check the index/offset before reading; reject out-of-range input at the "
+               "trust boundary.",
+    "CWE-787": "Bounds-check before writing; use sized copies, and build with FORTIFY_SOURCE and a "
+               "stack protector so an overflow is caught rather than exploited.",
+    "CWE-134": "Never pass untrusted data as the format string; use a constant format and pass the "
+               "data as an argument (printf(\"%s\", s), not printf(s)).",
+    "CWE-416": "Null the pointer on free and never reuse it; adopt RAII/smart pointers or a "
+               "use-after-free sanitizer in CI to catch reclaimed-object access.",
+    "CWE-415": "Free each allocation exactly once; null after free and centralise ownership so a "
+               "second free is impossible.",
+    "CWE-476": "Check every allocation/return for NULL before dereferencing; fail closed on the "
+               "error path.",
+    "CWE-190": "Validate and range-check arithmetic on untrusted values; use checked/widening "
+               "arithmetic before it feeds an allocation or index.",
+    "CWE-191": "Guard subtractions that can wrap on untrusted operands before they size an "
+               "allocation or a copy.",
+    "CWE-78": "Never build a shell command from untrusted input; use execve with an argument "
+              "vector (no shell), and allowlist/validate arguments.",
+    "CWE-89": "Use parameterised queries / prepared statements; never concatenate untrusted input "
+              "into SQL.",
+    "CWE-22": "Canonicalise and confine paths to an allowlisted base directory; reject '..' and "
+              "absolute paths from untrusted input.",
+    "CWE-611": "Disable external entity and DTD processing in the XML parser.",
+    "CWE-918": "Allowlist destinations server-side and resolve/validate the target host; block "
+               "internal address ranges and redirects.",
+    "CWE-401": "Free every allocation on all paths, including error paths; run a leak sanitizer in "
+               "CI to catch the regression.",
+    "CWE-400": "Bound resource consumption from untrusted input (size/time/recursion caps) and "
+               "fail closed when a limit is reached.",
+    "CWE-674": "Convert unbounded recursion to iteration or cap the depth; reject input that would "
+               "exceed it.",
+    "CWE-789": "Validate the requested allocation size against a sane maximum before allocating.",
+    "CWE-770": "Enforce quotas/limits on resources allocated from untrusted input.",
+    "CWE-457": "Initialise every variable before use; build with an uninitialised-memory sanitizer "
+               "in CI.",
+    "CWE-200": "Do not return pointers, addresses, or uninitialised memory to untrusted callers; "
+               "scrub buffers before they cross the boundary.",
+    "CWE-362": "Protect shared state with appropriate locking/atomics; run a thread sanitizer in CI.",
+    "CWE-369": "Reject a zero (or INT_MIN/-1) divisor from untrusted input before dividing.",
+    "CWE-798": "Remove embedded credentials/keys; load secrets from a managed store or environment "
+               "at runtime and rotate the exposed ones.",
+    "CWE-295": "Verify the full certificate chain and hostname; never disable validation.",
+    "CWE-502": "Do not deserialize untrusted data into live objects; use a data-only format with a "
+               "strict schema.",
+}
+#: Family roots, tried before the default, so an unlisted buffer-overflow CWE still gets overflow
+#: guidance rather than the generic line.
+_REMEDIATION_FAMILY = {
+    "CWE-119": _REMEDIATION["CWE-787"],
+    "CWE-131": _REMEDIATION["CWE-190"],
+}
+_REMEDIATION_DEFAULT = ("Validate and sanitise the untrusted input at the trust boundary, fail "
+                        "closed on the error path, and add a regression test that exercises this "
+                        "input so the fix is verified and stays fixed.")
+
+
+def _remediation(cwe: str | None) -> str:
+    if not cwe:
+        return _REMEDIATION_DEFAULT
+    return _REMEDIATION.get(cwe) or _REMEDIATION_FAMILY.get(cwe) or _REMEDIATION_DEFAULT
+
+
+def _finding_level(f: dict) -> tuple:
+    """(level_str, verified_bool) -- the highest PoC rung this finding reached, '' if none."""
+    best, ver = "", False
+    for pc in f.get("pocs") or []:
+        lvl = pc.get("level") or ""
+        if lvl and (best == "" or lvl > best):
+            best, ver = lvl, bool(pc.get("verified"))
+        elif lvl and lvl == best and pc.get("verified"):
+            ver = True
+    return best, ver
+
+
+def _target_verdict(t: dict) -> dict:
+    """A one-line verdict for a target, derived from its findings: the strongest outcome and the
+    severity that frames it. The whole report leads with this -- impact first, counts second."""
+    findings = t.get("findings") or []
+    ex = t.get("execution") or {}
+    best_lvl = ""
+    worst_sev = None
+    sev_order = {"critical": 5, "high": 4, "medium": 3, "low": 2, "info": 1}
+    for f in findings:
+        lvl, _ = _finding_level(f)
+        if lvl and (best_lvl == "" or lvl > best_lvl):
+            best_lvl = lvl
+        s = f.get("severity")
+        if s and (worst_sev is None or sev_order.get(s, 0) > sev_order.get(worst_sev, 0)):
+            worst_sev = s
+    base = ex.get("baseline")
+    never_ran = base is not None and not base.get("ran")
+    if best_lvl == "L3":
+        return {"label": "Exploited — working exploit demonstrated (L3)", "level": "L3",
+                "tone": "critical"}
+    if best_lvl == "L2":
+        return {"label": "Exploitation primitive established (L2)", "level": "L2", "tone": "high"}
+    if best_lvl == "L1":
+        return {"label": "Reproduced crash — verified reproducer (L1)", "level": "L1",
+                "tone": "high"}
+    if findings:
+        return {"label": f"Static findings only — {len(findings)} not yet demonstrated dynamically",
+                "level": "", "tone": worst_sev or "medium"}
+    if never_ran:
+        return {"label": "Inconclusive — the target never executed (see execution gaps)",
+                "level": "", "tone": "medium"}
+    return {"label": "No defects demonstrated", "level": "", "tone": "info"}
+
 
 def esc(s: Any) -> str:
     return _html.escape("" if s is None else str(s))
@@ -58,12 +185,35 @@ def to_html(report: dict[str, Any]) -> str:
         parts.append(f'<p class="notes">{esc(case["notes"])}</p>')
     parts.append('</header>')
 
-    # ---- summary ----
-    parts.append('<section class="card"><h2>Summary</h2>')
+    # ---- executive summary ----
+    targets = report.get("targets", [])
+    verdicts = [(t, _target_verdict(t)) for t in targets]
+    # Impact FIRST: the strongest outcome across the whole case, in one sentence, before any count.
+    levels_seen = [v["level"] for _t, v in verdicts if v["level"]]
+    top_level = max(levels_seen) if levels_seen else ""
+    n_exploited = sum(1 for _t, v in verdicts if v["level"] == "L3")
+    n_prim = sum(1 for _t, v in verdicts if v["level"] == "L2")
+    n_repro = sum(1 for _t, v in verdicts if v["level"] == "L1")
+    if top_level:
+        headline = {"L3": f"Working exploit demonstrated (L3) on {n_exploited} of {len(targets)} "
+                          "target(s).",
+                    "L2": f"Exploitation primitive established (L2) on {n_prim} of {len(targets)} "
+                          "target(s); no full exploit demonstrated.",
+                    "L1": f"Crash reproduced (L1) on {n_repro} of {len(targets)} target(s); no "
+                          "exploitation primitive demonstrated."}[top_level]
+        htone = {"L3": "critical", "L2": "high", "L1": "high"}[top_level]
+    elif any(t.get("findings") for t in targets):
+        headline = "Static findings reported; none demonstrated dynamically in this run."
+        htone = "medium"
+    else:
+        headline = "No defects were demonstrated on the targets in scope."
+        htone = "info"
+    parts.append('<section class="card"><h2>Executive summary</h2>')
+    parts.append(f'<p class="headline tone-{htone}">{esc(headline)}</p>')
     parts.append('<div class="stats">')
-    parts.append(_stat(summ.get("findings", 0), "findings"))
     parts.append(_stat(summ.get("targets", 0), "targets"))
-    parts.append(_stat(summ.get("confirmed", 0), "confirmed"))
+    parts.append(_stat(summ.get("findings", 0), "findings"))
+    parts.append(_stat(top_level or "—", "highest impact"))
     parts.append(_stat(summ.get("poc_backed", 0), "PoC-backed"))
     parts.append('</div>')
     bysev = summ.get("by_severity", {})
@@ -72,10 +222,16 @@ def to_html(report: dict[str, Any]) -> str:
         parts.append('<div class="chips">' + "".join(
             _badge(f"{k} · {v}", _SEV_COLOR.get(k, "#8b8d98")) for k, v in bysev.items())
             + '</div>')
-    if bystate:
-        parts.append('<div class="chips">' + "".join(
-            _badge(f"{k} · {v}", _STATE_COLOR.get(k, "#8b8d98")) for k, v in bystate.items())
-            + '</div>')
+    # Per-target verdict at a glance -- the reader sees which binary is the problem before scrolling.
+    if len(targets) >= 1:
+        parts.append('<table class="verdicts"><tbody>')
+        for t, v in verdicts:
+            lvlb = _badge(v["level"], _LEVEL_COLOR.get(v["level"], "#8b8d98")) if v["level"] else ""
+            parts.append(
+                f'<tr><td class="mono vt-name">{esc(t.get("filename"))}</td>'
+                f'<td class="vt-verdict"><span class="vdot tone-{esc(v["tone"])}"></span>'
+                f'{esc(v["label"])} {lvlb}</td></tr>')
+        parts.append('</tbody></table>')
     parts.append('</section>')
 
     # ---- reproducibility ----
@@ -120,6 +276,12 @@ def _stat(n: Any, label: str) -> str:
 def _target_html(t: dict) -> str:
     p = ['<section class="card target">']
     p.append(f'<h2 class="tname mono">{esc(t.get("filename"))}</h2>')
+    # Verdict banner: the one line a reader needs before the detail -- what was proven, how far.
+    v = _target_verdict(t)
+    lvlb = (_badge(f'{v["level"]} · {_LEVEL_GLOSS.get(v["level"], "")}',
+                   _LEVEL_COLOR.get(v["level"], "#8b8d98")) if v["level"] else "")
+    p.append(f'<div class="verdict tone-{esc(v["tone"])}"><span class="vdot tone-{esc(v["tone"])}">'
+             f'</span><span class="vlabel">{esc(v["label"])}</span>{lvlb}</div>')
     mits = t.get("mitigations") or {}
     mit_txt = " ".join(f"{k}={v}" for k, v in mits.items()) if mits else "—"
     rt = t.get("runtime") or {}
@@ -266,6 +428,12 @@ def _finding_html(f: dict) -> str:
     p.append('<div class="fhead">')
     p.append(f'<span class="ftitle">{esc(f.get("title") or f.get("cwe") or "finding")}</span>')
     p.append(_badge(sev, _SEV_COLOR.get(sev, "#8b8d98")))
+    # The impact rung FIRST after severity: a reader triages by "was it exploited?" before "what
+    # kind of bug is it?".
+    lvl, lvl_ver = _finding_level(f)
+    if lvl:
+        p.append(_badge(f'{lvl}{"" if lvl_ver else " (unverified)"}',
+                        _LEVEL_COLOR.get(lvl, "#8b8d98")))
     p.append(_badge(state, _STATE_COLOR.get(state, "#8b8d98")))
     v = f.get("verification")
     if v and v.get("runs"):
@@ -273,6 +441,8 @@ def _finding_html(f: dict) -> str:
         p.append(_badge(f'{"verified" if ok else "flaky"} {v.get("crashed")}/{v.get("runs")}',
                         "#3fb950" if ok else "#d29922"))
     p.append('</div>')
+    if lvl:
+        p.append(f'<div class="fimpact">Impact: {esc(_LEVEL_GLOSS.get(lvl, ""))}</div>')
     cwe = f.get("cwe")
     p.append(_kv([
         ("CWE", f'{cwe} — {f.get("cwe_name")}' if cwe else None),
@@ -325,6 +495,21 @@ def _finding_html(f: dict) -> str:
                      f'<span class="mono">{esc(pc.get("signal") or "")}</span> '
                      f'<span class="muted">{ok}</span>{dl}</div>')
         p.append('</div>')
+    # How to reproduce: the concrete recipe a reader re-runs -- the channel, the crashing input
+    # hash, and the PoC bundle. Anchored to hashes so it is deterministic.
+    crashes = f.get("crashes", [])
+    repro = crashes[0] if crashes else None
+    if repro:
+        chan = esc(repro.get("input_mode") or "stdin")
+        ish = esc((repro.get("input_sha") or "")[:16])
+        p.append('<div class="evlabel">Reproduction</div>'
+                 f'<div class="repro mono">Feed input <b>{ish}…</b> via the <b>{chan}</b> channel; '
+                 f'the target raises {esc(repro.get("signal") or "a fault")}. The PoC bundle above '
+                 'carries the exact bytes and the invocation.</div>')
+    # Remediation: every finding ends with what to DO about it -- the report is a fix list, not
+    # just an inventory.
+    p.append('<div class="evlabel">Remediation</div>'
+             f'<div class="remed">{esc(_remediation(f.get("cwe")))}</div>')
     p.append('</article>')
     return "".join(p)
 
@@ -357,6 +542,26 @@ body{margin:0;background:var(--bg);color:var(--text);font-family:var(--sans);
 .diags ul{margin:0;padding-left:16px}
 .diags li{margin:3px 0;line-height:1.45}
 .diag-stage{font-family:var(--mono);font-size:.82em;color:var(--accent);margin-right:4px}
+/* tone tokens shared by the headline, verdict banner and verdict dots */
+.tone-critical{--tone:#e5484d} .tone-high{--tone:#f76808} .tone-medium{--tone:#ffb224}
+.tone-low{--tone:#46a758} .tone-info{--tone:#8b8d98}
+.headline{font-size:16px;font-weight:650;line-height:1.45;margin:0 0 14px;padding-left:12px;
+  border-left:4px solid var(--tone,#8b8d98)}
+.verdicts{width:100%;border-collapse:collapse;margin-top:12px;font-size:13px}
+.verdicts td{padding:7px 10px;border-top:1px solid var(--border);vertical-align:top}
+.vt-name{white-space:nowrap;color:var(--muted);width:1%}
+.vt-verdict{line-height:1.6}
+.vdot{display:inline-block;width:9px;height:9px;border-radius:50%;background:var(--tone,#8b8d98);
+  margin-right:7px;vertical-align:middle}
+.verdict{display:flex;align-items:center;gap:9px;flex-wrap:wrap;margin:2px 0 14px;padding:10px 12px;
+  border-radius:9px;background:color-mix(in srgb,var(--tone,#8b8d98) 10%,transparent);
+  border:1px solid color-mix(in srgb,var(--tone,#8b8d98) 35%,transparent);font-weight:600}
+.vlabel{font-size:14px}
+.fimpact{font-size:12.5px;color:var(--muted);margin:2px 0 6px}
+.repro{margin:2px 0;padding:8px 10px;border-radius:7px;background:var(--surface-2);
+  font-size:12px;line-height:1.5;word-break:break-word}
+.remed{margin:2px 0;padding:8px 10px;border-left:3px solid #46a758;
+  background:color-mix(in srgb,#46a758 8%,transparent);font-size:12.5px;line-height:1.5}
 .eyebrow{text-transform:uppercase;letter-spacing:.08em;font-size:11px;color:var(--faint);
   font-weight:600}
 h1{font-size:28px;margin:6px 0 14px;letter-spacing:-.022em;font-weight:700}
