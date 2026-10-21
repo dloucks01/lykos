@@ -268,6 +268,15 @@ def run_campaign(afl: Path, exe, seeds_dir, out_dir, *, seconds: int = 30,
         # handshake failed" abort seen on a cross-arch campaign), and the whole campaign is lost.
         if qemu_ld_prefix:
             env.setdefault("QEMU_LD_PREFIX", qemu_ld_prefix)
+            # QEMU_LD_PREFIX fixes the loader's default search, but a supplied sysroot is often a
+            # FLAT directory of .so files (or uses a layout the loader's defaults miss). Put its
+            # library dirs on LD_LIBRARY_PATH too -- the guest glibc loader reads it, so a
+            # dynamically-linked target finds its deps regardless of how the sysroot is laid out.
+            from ..dynamic.sandbox import _sysroot_lib_dirs
+            _libdirs = [str(d) for d in _sysroot_lib_dirs(qemu_ld_prefix)]
+            if _libdirs:
+                env["LD_LIBRARY_PATH"] = ":".join(
+                    _libdirs + ([env["LD_LIBRARY_PATH"]] if env.get("LD_LIBRARY_PATH") else []))
     elif cmplog is not None:
         # Native (afl-cc-instrumented) build: CmpLog is the same idea via a second, cmplog-
         # instrumented copy of the target that AFL runs alongside the main one (`-c <binary>`).
@@ -318,6 +327,33 @@ def run_campaign(afl: Path, exe, seeds_dir, out_dir, *, seconds: int = 30,
 _ABORTED = (b"PROGRAM ABORT", b"Fork server handshake failed",
             b"handshake with the injected code")
 
+_LD_MISSING = re.compile(
+    rb"error while loading shared libraries:\s*([^\s:]+):\s*cannot open shared object", re.I)
+_LD_SYMBOL = re.compile(rb"symbol lookup error:\s*(\S+):\s*undefined symbol:\s*(\S+)", re.I)
+_QEMU_NOLOADER = re.compile(rb"Could not open ['\"](/lib[^'\"]*ld[^'\"]*)['\"]", re.I)
+
+
+def _loader_failure_hint(err: bytes) -> Optional[str]:
+    """If a child's stderr shows a dynamic-loader failure, a one-line cause + remedy; else None.
+    This is the authoritative 'why the handshake failed' when the reason is a missing / wrong
+    shared library -- the common case for a real dynamically-linked target off its own system."""
+    m = _LD_MISSING.search(err)
+    if m:
+        return (f"missing shared library '{m.group(1).decode('latin-1', 'ignore')}'. "
+                "Supply the target's libraries: set LYKOS_QEMU_SYSROOT to a directory holding its "
+                "loader + .so files (rootfs layout), or ingest the binary as a DIRECTORY with them.")
+    m = _LD_SYMBOL.search(err)
+    if m:
+        return (f"a shared library is the WRONG version (undefined symbol "
+                f"'{m.group(2).decode('latin-1', 'ignore')}' needed by "
+                f"'{m.group(1).decode('latin-1', 'ignore')}'). Supply the target's OWN libraries "
+                "(the versions it was built against) via LYKOS_QEMU_SYSROOT or a directory ingest.")
+    m = _QEMU_NOLOADER.search(err)
+    if m:
+        return (f"the dynamic loader '{m.group(1).decode('latin-1', 'ignore')}' is not present "
+                "where the target runs. Set LYKOS_QEMU_SYSROOT to a sysroot that contains it.")
+    return None
+
 
 def campaign_failed(proc) -> Optional[str]:
     """A one-line reason the campaign did not actually fuzz, or None if it ran.
@@ -330,6 +366,13 @@ def campaign_failed(proc) -> Optional[str]:
     for marker in _ABORTED:
         if marker in err:
             tail = err.split(b"PROGRAM ABORT")[-1][:200].decode("utf-8", "replace").strip()
+            # When afl's abort is a handshake failure, the ROOT cause is usually in the target's
+            # own last words, which afl echoes ("the target binary terminated ... last output").
+            # A loader/linker failure there means the target never reached main -- so report THAT
+            # (which library, missing vs wrong-version) rather than the generic handshake line.
+            lib_hint = _loader_failure_hint(err)
+            if lib_hint:
+                return f"the target could not start: {lib_hint}"
             return f"afl-fuzz aborted: {tail or marker.decode()}"
     if proc.returncode not in (0, None):
         return f"afl-fuzz exited {proc.returncode}"

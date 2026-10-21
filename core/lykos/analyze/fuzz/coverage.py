@@ -371,6 +371,16 @@ def coverage_stage(ctx) -> dict:
     # ELF actually loads (else the fork-server handshake fails and the campaign produces nothing).
     _ld_prefix = sandbox.qemu_ld_prefix(target.arch, target.endianness, target.bits,
                                         exedir=str(Path(exe).resolve().parent)) if use_qemu else None
+    # Dynamic-dependency preflight: a dynamically-linked target whose loader or .so deps are not
+    # present dies in the loader before afl's injected forkserver can hand back -- the "Fork server
+    # handshake failed" the operator keeps seeing. Resolve the deps first and SAY which library is
+    # missing (and how to supply it), so the real cause is on the record whether or not the campaign
+    # then aborts. Non-blocking: the campaign still launches (a dep may resolve via a mechanism this
+    # static check cannot see), and `campaign_failed` carries the same hint if it does abort.
+    _dep_ok, _dep_why = sandbox.resolve_dynamic_deps(exe, sysroot=_ld_prefix)
+    if not _dep_ok:
+        ctx.emit("coverage.deps", payload={"resolved": False, "note": _dep_why})
+        ctx.progress(msg="missing shared libraries — the handshake will fail until they are supplied")
     proc = aflpp.run_campaign(afl, exe, seeds_dir, out_dir, seconds=seconds, afl_path=afl_path,
                               mode=mode, qemu=use_qemu, argv_template=argv_template,
                               input_file=input_file, qemu_ld_prefix=_ld_prefix)
@@ -394,6 +404,10 @@ def coverage_stage(ctx) -> dict:
         note = (f"{failed}. No inputs were executed, so this is NOT a clean 'no crashes' "
                 f"result -- the sandbox fuzzers still cover this target under their own "
                 f"per-execution limits.")
+        if not _dep_ok:
+            # The handshake almost certainly failed because the target could not start: lead with
+            # the concrete cause and remedy, not the opaque afl abort.
+            note = f"{_dep_why} (afl reported: {failed})"
         ctx.emit("coverage.done", payload={"supported": False, "backend": "aflpp",
                                            "crash_inputs": 0, "unique": 0, "confirmed": 0,
                                            "aborted": True, "note": note})

@@ -682,6 +682,120 @@ def qemu_ld_prefix(arch, endianness=None, bits=None, exedir=None) -> Optional[st
     return None
 
 
+# --- Dynamic-dependency preflight -------------------------------------------------------------
+# A dynamically-linked target cannot start -- under afl-qemu-trace, under qemu-user, or natively --
+# until its PT_INTERP loader AND every DT_NEEDED shared library are present where the loader looks.
+# When one is missing the process dies IN THE LOADER, before main(), which afl can only report as
+# "Fork server handshake failed" and qemu as "Could not open '/lib/ld-...'". Resolving the deps
+# ahead of time lets the operator see the real cause -- which library, and how to supply it --
+# instead of an opaque handshake abort. Pure/stdlib; it catches the "cannot open shared object
+# file" class. A present-but-wrong-version library (a "symbol lookup error") cannot be seen
+# statically and is caught by afl's stderr backstop (`aflpp.campaign_failed`) instead.
+
+#: loader/linker failure signatures, in a child's stderr, that mean "the target never reached main".
+LOADER_FAIL_SIGS = (
+    b"error while loading shared libraries",
+    b"cannot open shared object file",
+    b"symbol lookup error",
+    b"undefined symbol",
+    b"Could not open '/lib/ld",
+    b"Could not open \"/lib/ld",
+    b"No such file or directory",     # only meaningful together with one of the above / a loader path
+)
+
+
+def _sysroot_lib_dirs(root) -> list:
+    root = Path(root)
+    out = []
+    for sub in ("lib", "lib64", "usr/lib", "usr/lib64", "usr/local/lib",
+                "lib/x86_64-linux-gnu", "usr/lib/x86_64-linux-gnu",
+                "lib/i386-linux-gnu", "usr/lib/i386-linux-gnu"):
+        d = root / sub
+        if d.is_dir():
+            out.append(d)
+    if not out and root.is_dir():
+        out.append(root)                 # a flat directory of .so files is a valid answer too
+    return out
+
+
+def _host_lib_dirs() -> list:
+    dirs = []
+    for d in os.environ.get("LD_LIBRARY_PATH", "").split(":"):
+        if d and Path(d).is_dir():
+            dirs.append(Path(d))
+    for d in ("/lib", "/lib64", "/usr/lib", "/usr/lib64", "/usr/local/lib",
+              "/usr/lib/x86_64-linux-gnu", "/lib/x86_64-linux-gnu"):
+        if Path(d).is_dir():
+            dirs.append(Path(d))
+    return dirs
+
+
+def _ldconfig_cache() -> dict:
+    """soname -> path, from the host's ldconfig cache. Best-effort; empty when ldconfig is absent.
+    This is the authoritative host picture (it reflects every configured library directory), so
+    consulting it keeps the resolver from FALSELY declaring a system library missing."""
+    try:
+        r = subprocess.run(["ldconfig", "-p"], capture_output=True, timeout=5)
+    except Exception:
+        return {}
+    cache: dict = {}
+    for line in r.stdout.decode("latin-1", "ignore").splitlines():
+        line = line.strip()
+        if " => " not in line:
+            continue
+        name = line.split(" ", 1)[0]
+        cache.setdefault(name, line.split(" => ", 1)[1].strip())
+    return cache
+
+
+def resolve_dynamic_deps(target, sysroot=None) -> tuple:
+    """Whether a target's PT_INTERP loader and DT_NEEDED libraries can be found.
+
+    Returns ``(ok, detail)``. ``ok`` is True for a static binary, for one whose linking cannot be
+    read here (never block on uncertainty), or when every needed library and the loader resolve
+    against ``sysroot`` (if given) or the host. When ``ok`` is False, ``detail`` names the missing
+    pieces and how to supply them. Deliberately conservative: it only reports a dependency missing
+    when it is absent from the sysroot/host lib dirs AND the ldconfig cache, so it never blocks a
+    campaign that would in fact have run.
+    """
+    from ..elf import parse
+    try:
+        data = bytes(target) if isinstance(target, (bytes, bytearray)) else Path(target).read_bytes()
+        info = parse(data)
+    except Exception:
+        return True, ""                              # unreadable here -> let the run speak
+    if (info.linking or "") != "dynamic":
+        return True, ""                              # static / static-pie: nothing to resolve
+    libs = list(info.imports.get("libraries") or [])
+    interp = info.interpreter or ""
+    if sysroot:
+        libdirs, cache = _sysroot_lib_dirs(sysroot), {}
+        interp_ok = bool(interp) and (Path(sysroot) / interp.lstrip("/")).exists()
+        where = f"the sysroot ({sysroot})"
+        remedy = ("populate that directory with the target's own loader and libraries in a rootfs "
+                  "layout (lib/, lib64/, usr/lib/)")
+    else:
+        libdirs, cache = _host_lib_dirs(), _ldconfig_cache()
+        interp_ok = (not interp) or Path(interp).exists()
+        where = "this host"
+        remedy = ("supply the target's own libraries -- set LYKOS_QEMU_SYSROOT to a directory "
+                  "holding its loader + .so files (rootfs layout), or ingest the binary as a "
+                  "DIRECTORY that contains them")
+
+    def _found(name):
+        return any((d / name).exists() for d in libdirs) or (name in cache)
+
+    missing = [lib for lib in libs if not _found(lib)]
+    if interp and not interp_ok:
+        missing = [f"{interp} (the dynamic loader)"] + missing
+    if not missing:
+        return True, ""
+    shown = ", ".join(missing[:8]) + (" ..." if len(missing) > 8 else "")
+    return False, (f"the target is dynamically linked and these dependencies are not present on "
+                   f"{where}: {shown}. The process dies in the loader before main(), so afl can "
+                   f"only report 'Fork server handshake failed'. Remedy: {remedy}.")
+
+
 def _bwrap_usable() -> bool:
     global _bwrap_cache
     if _bwrap_cache is not None:
