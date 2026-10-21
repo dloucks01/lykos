@@ -383,7 +383,9 @@ int main(void){ setvbuf(stdout,0,2,0); setvbuf(stdin,0,2,0);
   char b[64]; puts("bio?"); read(0,b,64); write(1,b,256);
   puts("cmd?"); read(0,b,256); return 0; }''',
          ["-pie", "-fPIE", "-fstack-protector-all", "-O0", "-w"],
-         want_level=2, want_cwe=("CWE-121", "CWE-200", "CWE-787"),
+         want_level=3, want_cwe=("CWE-121", "CWE-200", "CWE-787"),  # raised L2->L3: --ceiling measured a
+         # verified L3 PoC (build_exploit/CWE-121) on this PIE+canary+full-RELRO target, so the gate now
+         # enforces the achievable rung on a fully-hardened shape rather than passing at a stale L2.
          note="gated PIE+canary over-read leak -> ret2win / info-leak"),
 
     Case("format_fullrelro_ret2win",
@@ -928,8 +930,11 @@ int main(void){ setvbuf(stdout,0,2,0);
     # reliance on symbol names or on an unoptimised frame layout.
     Case("stripped_opt_overflow", _OVERFLOW_SRC,
          ["-no-pie", "-fno-stack-protector", "-O2", "-s", "-w"],
-         want_level=1, want_cwe=("CWE-121", "CWE-787", "CWE-119"), budget=300.0,
-         note="BUILD: -O2 and STRIPPED -- no symbols to lean on, optimised frame"),
+         want_level=2, want_cwe=("CWE-121", "CWE-787", "CWE-119"), budget=300.0,
+         note="BUILD: -O2 and STRIPPED -- no symbols to lean on, optimised frame. want_level raised "
+              "L1->L2: --ceiling measured an L2 primitive (CWE-119/121/787) through the real autopilot, "
+              "so the gate enforces that rung rather than under-demanding L1. L2 is the honest ceiling "
+              "here (this fixture has no reachable win()/clean gadget for L3)."),
 
     # ---- ARCHITECTURE. Everything else is x86-64, so an aarch64 regression is invisible. Skips
     # cleanly when the cross toolchain is absent.
