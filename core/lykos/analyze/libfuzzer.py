@@ -2092,6 +2092,8 @@ def _report_has_source(report: str | None) -> bool:
         cls = parse_asan_report(report or "")
         return bool(cls and cls.get("source"))
     except Exception:
+        # Best-effort predicate: if the report cannot be classified, treat it as sourceless so the
+        # replay pass still runs (it loses nothing -- a replay that also yields no source is a no-op).
         return False
 
 
