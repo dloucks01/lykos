@@ -274,6 +274,10 @@ def build_report(
         # with 2,756 executions and no crash (a real clean result) while another executed ZERO
         # times because a stage upstream spent the budget, and the two reports were identical.
         execution.update(_scorecard(store, case_id, t.id))
+        # The actionable "why" behind a thin dynamic result -- missing shared library, a target that
+        # needs a config/args, a campaign that never reached the parser. Carried into the report so
+        # a blocked run is never mistaken for a clean one.
+        execution["diagnostics"] = _diagnostics(store, case_id, t.id)
         crash_by_input: dict[str, Any] = {}
         for d in crashes:
             if d.input_sha and d.input_sha not in crash_by_input:
@@ -418,6 +422,35 @@ def _exploited_build(store, case_id: str, target_id: str) -> dict:
     except Exception:                                    # noqa: BLE001 -- the report must render
         return {}
     return {}
+
+
+#: diagnostic events that carry a human `note` explaining why a dynamic stage did little or
+#: nothing -- the actionable "why" an operator needs in the deliverable (a missing shared library,
+#: a target that needs a config/args, a campaign that never reached the parser, coverage that could
+#: not be measured). These are the difference between "0 crashes" reading as clean vs. as blocked.
+_DIAGNOSTIC_EVENTS = (
+    "coverage.deps", "coverage.noprogress", "coverage.starved", "coverage.coverage_unavailable",
+    "fuzz.noprogress", "directed_fuzz.noprogress", "fuzz.coverage_unavailable",
+)
+
+
+def _diagnostics(store, case_id: str, target_id: str) -> list:
+    """Deduped diagnostic notes for a target -- why a dynamic stage did little or nothing. These
+    make a thin result legible in the deliverable instead of a silent clean zero. Best-effort."""
+    out: list = []
+    seen: set = set()
+    try:
+        from ..db.dao import EventDAO
+        dao = EventDAO(store.conn)
+        for et in _DIAGNOSTIC_EVENTS:
+            for pl in dao.payloads_of_type(et, case_id=case_id, target_id=target_id):
+                note = (pl.get("note") or "").strip()
+                if note and note not in seen:
+                    seen.add(note)
+                    out.append({"stage": et.split(".")[0], "note": note})
+    except Exception:                                    # noqa: BLE001 -- the report must render
+        return out
+    return out
 
 
 def _scorecard(store, case_id: str, target_id: str) -> dict:

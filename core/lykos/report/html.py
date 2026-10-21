@@ -229,6 +229,15 @@ def _target_html(t: dict) -> str:
         if ex.get("failed_stages"):
             p.append('Stages that failed: ' + esc(", ".join(ex["failed_stages"])) + '. ')
         p.append('An absent result from these is not evidence of absence.</p>')
+    # The actionable WHY: a missing shared library, a target that needs a config/args, a campaign
+    # that never reached the parser. This is what turns "fix it" from guesswork into a to-do list.
+    diags = ex.get("diagnostics") or []
+    if diags:
+        p.append('<div class="diags"><b>Why a dynamic stage did little or nothing</b><ul>')
+        for d in diags[:8]:
+            p.append(f'<li><span class="diag-stage">{esc(d.get("stage"))}</span> '
+                     f'{esc(d.get("note"))}</li>')
+        p.append('</ul></div>')
     if rt.get("ceiling_why"):
         p.append(f'<p class="ceiling"><b>Analysis ceiling — {esc(rt.get("ceiling"))}.</b> '
                  f'{esc(rt["ceiling_why"])}</p>')
@@ -342,6 +351,12 @@ body{margin:0;background:var(--bg);color:var(--text);font-family:var(--sans);
 .muted{color:var(--muted)}
 .ceiling{margin:8px 0 0;padding:8px 10px;border-left:3px solid #7aa2c8;
   background:rgba(122,162,200,.08);font-size:12.5px;line-height:1.5}
+.diags{margin:8px 0 0;padding:8px 10px;border-left:3px solid var(--accent);
+  background:color-mix(in srgb,var(--accent) 7%,transparent);font-size:12.5px}
+.diags b{display:block;margin-bottom:4px}
+.diags ul{margin:0;padding-left:16px}
+.diags li{margin:3px 0;line-height:1.45}
+.diag-stage{font-family:var(--mono);font-size:.82em;color:var(--accent);margin-right:4px}
 .eyebrow{text-transform:uppercase;letter-spacing:.08em;font-size:11px;color:var(--faint);
   font-weight:600}
 h1{font-size:28px;margin:6px 0 14px;letter-spacing:-.022em;font-weight:700}
