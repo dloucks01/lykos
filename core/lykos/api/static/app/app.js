@@ -119,6 +119,7 @@ function App() {
   const [disasmSel, setDisasmSel] = useState({});     // targetId -> selected function id
   const [diffVerify, setDiffVerify] = useState(null); // poc_diff run result for the Diff tab
   const [bg, setBg] = useState(null);               // server-side background autopilot status
+  const [budgetMin, setBudgetMin] = useState("");   // Autopilot budget in MINUTES ("" = size-aware default)
   // WHAT THE RUN DID, per target. The UI showed findings with no account of the work behind
   // them, and there was no endpoint to ask: the CLI printed this and the HTML report rendered
   // it, while the primary interface could not.
@@ -480,11 +481,13 @@ function App() {
   const onBackground = useCallback(async () => {
     if (!caseId || !targets.length) return;
     try {
-      await api.startBackground(caseId, targets.map((t) => t.id));
+      // minutes -> seconds; blank/0 sends nothing, so the server picks a size-aware default.
+      const secs = Number(budgetMin) > 0 ? Math.round(Number(budgetMin) * 60) : undefined;
+      await api.startBackground(caseId, targets.map((t) => t.id), secs);
       setRan(true);
       pollBackground(caseId);
     } catch (e) { setError(e.message || String(e)); }
-  }, [caseId, targets, pollBackground]);
+  }, [caseId, targets, pollBackground, budgetMin]);
 
 
   // Upload one or more files. `append` adds to the current case; otherwise it starts fresh.
@@ -738,6 +741,11 @@ function App() {
       <button class="btn primary" onClick=${onBackground}
               title="the full pipeline on the server: every applicable stage, a wall-clock budget it divides between phases, and a scorecard of what it did">
         ${ran ? "Run Autopilot again" : "▶ Run Autopilot"}</button>
+      <label class="budget-field" title="per-target wall-clock budget in minutes; blank = auto (scales with binary size: ~55min at 20MB, ~3.6h at 100MB). A large binary needs a large budget.">
+        <input type="number" min="1" step="5" placeholder="budget (min, auto)"
+               value=${budgetMin} onInput=${(e) => setBudgetMin(e.target.value)}
+               style="width:11em" />
+      </label>
       <button class="btn ghost small" onClick=${onAutopilot}
               title="run the stages from this tab instead: finer per-stage feedback, but a shorter pipeline and no scorecard — closing the tab stops it">
         ⚙ In this tab</button>
