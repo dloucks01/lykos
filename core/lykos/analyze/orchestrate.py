@@ -1912,10 +1912,18 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
             # it: "fuzz" appeared only in the stage registry. It splits its budget across every
             # channel, which is what this needs, since a bytecode target has no call edges and so
             # no channel ranking either.
+            # Size the primary campaigns to the OPERATOR'S budget, not a fixed exec count: a large
+            # --budget must buy a longer search. affordable_execs() is this stage-share's execs at
+            # the target's rate; max() keeps the meaningful floor on a small budget, and slice()
+            # still caps each call to the single-stage share + phase reserve so one campaign cannot
+            # eat the case. Before this, a fixed 12-18k execs ran ~30s regardless of budget -- the
+            # "raising --budget did nothing, directed fuzzing still cut out at 30s" an operator hit.
+            _camp_execs = max(_CAMPAIGN_EXECS, bud.affordable_execs())
+            _dir_execs = max(_DIRECTED_EXECS, bud.affordable_execs())
             if _nonnative_image(t):
-                _staged(bud, store, t, "fuzz", status, stop, fz, want_execs=_CAMPAIGN_EXECS)
+                _staged(bud, store, t, "fuzz", status, stop, fz, want_execs=_camp_execs)
             elif _staged(bud, store, t, "coverage_fuzz", status, stop, dyn,
-                         want_execs=_CAMPAIGN_EXECS) != "done" or \
+                         want_execs=_camp_execs) != "done" or \
                     bud.slice("fuzz") > 0:
                 # The blind campaign is a SECOND campaign, not only a fallback. Measured on
                 # /usr/bin/xxd with a 400s budget: coverage_fuzz returned "done" after 22s of a
@@ -1932,7 +1940,7 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                 # happen, and the run then reports only static findings -- "nothing was run"
                 # wearing the face of "nothing was found", at campaign scale. The blind stage
                 # carries none of those preconditions, so it runs the same corpus regardless.
-                _staged(bud, store, t, "fuzz", status, stop, fz, want_execs=_CAMPAIGN_EXECS)
+                _staged(bud, store, t, "fuzz", status, stop, fz, want_execs=_camp_execs)
             # THE REST OF THE DISPATCH TABLE. A multi-call binary is many programs behind one
             # image and the campaign above drove ONE of them -- the deepest parser among the
             # doors the stage verified by running them. busybox 1.21.1 opens 14: every
@@ -1945,8 +1953,8 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                 if stop.is_set():
                     break
                 _staged(bud, store, t, "fuzz", status, stop, dict(fz, multicall_door=_door),
-                        want_execs=_CAMPAIGN_EXECS)
-            _staged(bud, store, t, "directed_fuzz", status, stop, dyn, want_execs=_DIRECTED_EXECS)
+                        want_execs=_camp_execs)
+            _staged(bud, store, t, "directed_fuzz", status, stop, dyn, want_execs=_dir_execs)
             crashes = _distinct_crashes(store, tid)
             # Multi-channel retry: the best-guess channel is not always where the bug is (a file
             # parser's overflow can be in the argv filename). If nothing crashed, drive the fast

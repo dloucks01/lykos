@@ -243,6 +243,16 @@ class CaseBudget:
         """Seconds this target needs to perform `execs` executions, at its measured rate."""
         return max(0.0, float(execs) / self.rate)
 
+    def affordable_execs(self) -> int:
+        """Executions a single search campaign's TIME-SHARE can buy at this target's rate, so a
+        campaign can be SIZED to the operator's budget instead of a fixed count. Passed back as
+        `want_execs`: a large --budget then buys a longer search, while `slice()` still enforces the
+        same single-stage share (MAX_SINGLE_SHARE) and phase reserve, so one campaign cannot eat the
+        case. Read-only -- no `_solver_served` side effect; `slice()` does the authoritative
+        accounting. Fixes the "raising --budget did nothing, fuzzing still stops at ~30s" an operator
+        hit: a fixed 12-18k execs ran ~30s no matter how large the budget was."""
+        return int(max(0.0, self.available() * MAX_SINGLE_SHARE) * self.rate)
+
     def slice(self, stage: str, want: Optional[float] = None,
               *, want_execs: Optional[float] = None) -> float:
         """Seconds this stage may have, or 0.0 when there is no room left for it.
