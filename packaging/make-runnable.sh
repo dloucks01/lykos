@@ -78,6 +78,20 @@ if [ -n "${LYKOS_WEGGLI_BIN:-}" ] && [ -x "$LYKOS_WEGGLI_BIN" ]; then
   mkdir -p "$V/toolchain/usr/local/bin"
   install -m0755 "$LYKOS_WEGGLI_BIN" "$V/toolchain/usr/local/bin/weggli"
   say "injected weggli from $LYKOS_WEGGLI_BIN"
+else
+  say "WARNING: weggli NOT injected (LYKOS_WEGGLI_BIN unset/invalid -- run build-engines.sh and 'source dist/engines/engines.env' first); source variant-analysis will be absent on the target"
+fi
+# libqasan (QEMU-AddressSanitizer runtime) is LD_PRELOADed under afl qemu-mode to catch heap errors
+# a plain qemu run cannot see. It is built by build-engines.sh (not apt), so the container collect
+# never carries it and make-runnable must inject it -- at usr/lib/afl/libqasan.so, exactly where
+# vendorenv.py auto-sets LYKOS_QASAN from. It is a .so (the shared-lib closure + on-target relink
+# cover it) and is preloaded, not exec'd, so it needs no PATH wrapper.
+if [ -n "${LYKOS_QASAN:-}" ] && [ -f "$LYKOS_QASAN" ]; then
+  mkdir -p "$V/toolchain/usr/lib/afl"
+  install -m0755 "$LYKOS_QASAN" "$V/toolchain/usr/lib/afl/libqasan.so"
+  say "injected libqasan from $LYKOS_QASAN"
+else
+  say "WARNING: libqasan NOT injected (LYKOS_QASAN unset/missing -- run build-engines.sh and 'source dist/engines/engines.env' first); the qasan heap-error lane will be absent"
 fi
 # engine venvs: keep their ORIGINAL pyvenv.cfg -- they were built for the TARGET distro's
 # Python (the bundle is distro-locked), not this build host's.
