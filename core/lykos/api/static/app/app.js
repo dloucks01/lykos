@@ -9,7 +9,7 @@ import { isFolderPick, folderArchive } from "./archive.js";
 import { runAutopilotCase, newController, cancel as cancelAutopilot, coverageOf } from "./autopilot.js";
 import { rankFindings, pocsForFinding, fmtTime, progressText, stageLabel, dedupeFindings, buildRunLog, buildVerdicts, filterByViz } from "./util.js";
 import {
-  html, DropZone, TargetSummary, ProgressLog, ConsolePanel, FindingCard, EmptyResults, Spinner, UnavailablePanel, RunScorecard, SystemMap, CoveragePanel, CodeView, PipelinePlan, EvidenceModal, FunctionsModal, VerdictStrip, VerdictCard, AnalysisDrawer, ShellVerdict, ExploitsPanel, DrawerFacts, TargetBar, FunctionsPanel, StringsPanel, DisasmPanel, DiffPanel, CrashesPanel, CallGraphCanvas, CaseOverview,
+  html, DropZone, TargetSummary, ProgressLog, ConsolePanel, FuzzConsole, FindingCard, EmptyResults, Spinner, UnavailablePanel, RunScorecard, SystemMap, CoveragePanel, CodeView, PipelinePlan, EvidenceModal, FunctionsModal, VerdictStrip, VerdictCard, AnalysisDrawer, ShellVerdict, ExploitsPanel, DrawerFacts, TargetBar, FunctionsPanel, StringsPanel, DisasmPanel, DiffPanel, CrashesPanel, CallGraphCanvas, CaseOverview,
 } from "./components.js";
 
 let _conSeq = 0;
@@ -72,6 +72,15 @@ function bgEventToLog(ev) {
   return null;
 }
 
+// The human label for a fuzzing stage, from its event-type prefix (e.g. "directed_fuzz.progress").
+const _FUZZ_LABEL = { fuzz: "Black-box fuzzing", directed: "Directed fuzzing",
+  directed_fuzz: "Directed fuzzing", coverage: "Coverage fuzzing", coverage_fuzz: "Coverage fuzzing",
+  env_fuzz: "Env-var fuzzing", net_fuzz: "Network fuzzing", libfuzzer: "libFuzzer harness" };
+function fuzzStageLabel(type) {
+  const head = String(type).split(".")[0];
+  return _FUZZ_LABEL[head] || _FUZZ_LABEL[head.split("_")[0]] || head;
+}
+
 // A fuzzing / coverage / directed event -> one compact Console line, so an operator can watch
 // what the fuzzer is actually doing (campaign start, crash harvest, did-not-run reason) in real
 // time instead of a silent run. Prefers an explicit message/note, else a few scalar fields;
@@ -130,6 +139,7 @@ function App() {
   const [bgActivity, setBgActivity] = useState(null); // {msg, pct} live intra-stage progress
   const [consoleLines, setConsoleLines] = useState([]); // job.exec: tool commands + I/O
   const consoleSeen = useRef(new Set());              // de-dupe exec events by server id
+  const [fuzzLive, setFuzzLive] = useState(null);     // live fuzzing telemetry (latest .progress)
   // The effective theme: an explicit choice (data-theme, set pre-paint from localStorage) wins,
   // else the OS preference. The toggle flips it, applies it to <html>, and persists the choice.
   const [theme, setTheme] = useState(() => {
@@ -381,6 +391,16 @@ function App() {
             // has a visible answer. Discrete domain events only (campaign start, harvest, done,
             // did-not-run) -- not the per-batch job.progress above, which would flood the log.
             if (/^(coverage|fuzz|directed|env_fuzz|net_fuzz|libfuzzer|concolic|harness)[._]/.test(ev.type)) {
+              // Live fuzzing telemetry: a `.progress` carries execs/rate/elapsed/budget/coverage,
+              // and the stage's terminal event clears the live panel. Everything else is a console
+              // milestone line.
+              if (/\.progress$/.test(ev.type)) {
+                const p = ev.payload || {};
+                setFuzzLive({ stage: ev.type.split(/[._]/)[0], label: fuzzStageLabel(ev.type),
+                              ...p, at: Date.now() });
+              } else if (/\.(done|coverage_unavailable|noprogress|deps)$/.test(ev.type)) {
+                setFuzzLive(null);
+              }
               pushConsole(ev.id, { cmd: fuzzSummary(ev.type, ev.payload || {}), note: ev.type });
               continue;
             }
@@ -405,6 +425,7 @@ function App() {
         setTimeout(tick, 2500);
       } else if (st && (st.state === "done" || st.state === "cancelled" || st.state === "error")) {
         setBgActivity(null);
+        setFuzzLive(null);
         refreshResults(cid, targets);
       }
     };
@@ -867,6 +888,7 @@ function App() {
                 </div>
               </div>` : null}
             <div class="rail-run">
+              <${FuzzConsole} live=${fuzzLive} />
               ${bgActivity ? html`<div class="bg-activity">${bgActivity.pct != null ? html`<span class="bg-pct">${Math.round(bgActivity.pct)}%</span>` : null}<span class="bg-act-msg">${bgActivity.msg}</span></div>` : null}
               ${runControls}
             </div>
@@ -978,6 +1000,7 @@ function App() {
                 <!-- Lead with the live tool-command console (the actual rizin/gdb/qemu/afl commands
                      and their I/O) -- that is what "Console" means and what an analyst wants to see;
                      the human-readable Run log follows it. -->
+                <${FuzzConsole} live=${fuzzLive} />
                 <${ConsolePanel} lines=${consoleLines} />
                 <${ProgressLog} entries=${log} running=${running} />
                 <${CoveragePanel} coverage=${coverage} targets=${targets} onDrill=${browseFunctions} />

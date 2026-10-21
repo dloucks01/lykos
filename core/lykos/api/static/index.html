@@ -145,6 +145,18 @@
   .plan-dot.dot-declined { background: var(--warn); outline: 1px solid color-mix(in srgb, var(--warn) 70%, transparent); }
   .plan-nowtimeout { color: var(--warn); }
   .plan-nowdecl { color: var(--warn); }
+  /* live fuzzing panel */
+  .fz { padding: 10px 12px; }
+  .fz-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; }
+  .fz-budget { font-size: .78rem; color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .fz-eta { color: var(--run); }
+  .fz-bar { height: 5px; border-radius: 3px; background: var(--panel-2); overflow: hidden; margin-bottom: 10px; }
+  .fz-fill { height: 100%; background: var(--run); transition: width .4s ease; }
+  .fz-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(58px, 1fr)); gap: 8px; }
+  .fz-stat { text-align: center; }
+  .fz-stat-v { font-size: 1.02rem; font-weight: 700; color: var(--ink); font-variant-numeric: tabular-nums; }
+  .fz-stat-v.fz-hit { color: var(--bad); }
+  .fz-stat-k { font-size: .66rem; text-transform: uppercase; letter-spacing: .04em; color: var(--faint); margin-top: 1px; }
   .plan-dot.dot-skipped { background: color-mix(in srgb, var(--faint) 40%, transparent); }
   .plan-dot.dot-cancelled { background: var(--warn); }
   .plan-dot.dot-pending { background: var(--line); }

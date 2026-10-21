@@ -1242,6 +1242,7 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
     _seeds = list(corpus)[:_CALIBRATE_CAP]
     replay: list = [(s, guard) for s in _seeds] + [(s, not guard) for s in _seeds]
     ctx.progress(msg=f"{event_prefix} campaign")
+    last_emit = time.time()                      # live-console heartbeat, independent of exec count
     while execs < max_execs and time.time() < deadline and not ctx.should_cancel():
         calibrating = bool(replay)
         guard_eff = guard
@@ -1475,11 +1476,22 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
                     "behaviours": 0, "corpus": len(corpus), "kept": 0, "execs_per_sec": 0,
                     "blocks_hit": 0, "blocks_known": len(all_blocks), "coverage": "none",
                     "did_not_run": True}
-        if execs % 250 == 0:
-            ctx.emit(f"{event_prefix}.progress", payload={"execs": execs, "crashes": crashes,
-                                                          "unique": len(seen_sigs),
-                                                          "behaviours": len(seen_behaviour),
-                                                          "corpus": len(corpus)})
+        # Progress heartbeat for the live console. Emit every 250 execs OR every 3 s, whichever
+        # comes first -- the time floor matters because a SLOW campaign (a target that hits its
+        # per-exec timeout on every input) reaches 250 execs only every few minutes, which is why
+        # the console looked frozen. The payload carries everything a live view needs: rate, how
+        # much of the budget is spent, coverage reached, and the running crash tally.
+        _now = time.time()
+        if execs % 250 == 0 or (_now - last_emit) >= 3.0:
+            last_emit = _now
+            _elapsed = max(1e-3, max_seconds - max(0.0, deadline - _now))
+            ctx.emit(f"{event_prefix}.progress", payload={
+                "execs": execs, "crashes": crashes, "unique": len(seen_sigs),
+                "behaviours": len(seen_behaviour), "corpus": len(corpus),
+                "elapsed": round(_elapsed, 1), "budget": round(max_seconds, 1),
+                "pct": min(100, round(100 * _elapsed / max(1e-3, max_seconds))),
+                "execs_per_sec": round(execs / _elapsed),
+                "blocks_hit": len(seen_blocks), "blocks_known": len(all_blocks)})
 
     elapsed = max(1e-3, max_seconds - max(0.0, deadline - time.time()))
     # An execution rate this low means the campaign barely ran, and "0 crashes" from 16

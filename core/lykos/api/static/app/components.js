@@ -253,6 +253,50 @@ export function ProgressLog({ entries, running }) {
     </div>`;
 }
 
+// The LIVE FUZZING panel: a real-time readout of the campaign in flight, so a long run is never a
+// black box. Fed by the stage's `.progress` heartbeat (every ~3 s, even when the target is slow),
+// it shows how far through the budget it is, the execution rate, coverage reached, and the running
+// crash tally -- the numbers an operator otherwise had to guess at for half an hour.
+function _fmtN(n) {
+  if (n == null || isNaN(n)) return "—";
+  n = Number(n);
+  if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`;
+  if (n >= 1e3) return `${(n / 1e3).toFixed(1)}k`;
+  return String(Math.round(n));
+}
+export function FuzzConsole({ live }) {
+  if (!live) return null;
+  const budget = Number(live.budget) || 0;
+  const elapsed = Number(live.elapsed) || 0;
+  const pct = live.pct != null ? Number(live.pct) : (budget ? Math.min(100, 100 * elapsed / budget) : 0);
+  const eta = budget && elapsed < budget ? budget - elapsed : null;
+  const edges = live.blocks_hit != null ? live.blocks_hit : null;
+  const known = live.blocks_known || 0;
+  const cov = (edges != null && known) ? `${edges}/${known} (${Math.round(100 * edges / known)}%)`
+    : (edges != null ? `${edges}` : "—");
+  const stat = (label, value, cls) => html`
+    <div class="fz-stat">
+      <div class="fz-stat-v ${cls || ""}">${value}</div>
+      <div class="fz-stat-k">${label}</div>
+    </div>`;
+  return html`
+    <div class="card fz">
+      <div class="fz-head">
+        <${Spinner} label=${live.label || "Fuzzing"} />
+        <span class="fz-budget">${fmtElapsed(elapsed)}${budget ? ` / ${fmtElapsed(budget)}` : ""}${
+          eta != null ? html` · <span class="fz-eta">~${fmtElapsed(eta)} left</span>` : ""}</span>
+      </div>
+      <div class="fz-bar"><div class="fz-fill" style=${`width:${Math.max(2, Math.min(100, pct))}%`}></div></div>
+      <div class="fz-stats">
+        ${stat("execs", _fmtN(live.execs))}
+        ${stat("exec/s", _fmtN(live.execs_per_sec))}
+        ${stat("coverage", cov)}
+        ${stat("behaviours", _fmtN(live.behaviours))}
+        ${stat("crashes", _fmtN(live.crashes), (Number(live.crashes) > 0 ? "fz-hit" : ""))}
+      </div>
+    </div>`;
+}
+
 // A live console: the actual tool commands (rizin, angr, afl, pypcode worker...) and a tail of
 // their I/O, streamed from the server's job.exec events. Separate from the Run log (which is the
 // human "what it found"): this is the "what it is doing right now", proof that work is happening.
