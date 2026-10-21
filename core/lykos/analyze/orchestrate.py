@@ -1606,7 +1606,18 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
             # afl-qemu-trace) and ERRORED -- twice in one run, on a native x86-64 ELF the stage
             # could have fuzzed. Every substrate guard keys off `file_type` too, so an untriaged
             # target gets the wrong answer from each of them.
-            bud = budget_mod.CaseBudget(budget_seconds, overrides=overrides)
+            # When no budget was specified (the web Autopilot button sends none), scale the default
+            # by the binary's size rather than using a flat 900s: a 20-100MB binary spends most of a
+            # short budget on recon before the fuzzers get a slice -- exactly how a real large-binary
+            # run came back with only static findings. An explicit --budget / budget_seconds always
+            # wins; this only fills the "caller sent nothing" case. (CLI passes an explicit default,
+            # so it is unaffected; this is the web/API path.)
+            eff_budget = budget_seconds
+            if eff_budget is None:
+                _mb = (t.size or 0) / 1_000_000.0
+                eff_budget = max(budget_mod.DEFAULT_TARGET_BUDGET,
+                                 min(21600.0, budget_mod.DEFAULT_TARGET_BUDGET + _mb * 120.0))
+            bud = budget_mod.CaseBudget(eff_budget, overrides=overrides)
             status["budget"] = bud.spent()                # serializable; refreshed as we go
             if not t.file_type:
                 _staged(bud, store, t, "ingest_triage", status, stop)
