@@ -461,7 +461,7 @@ def root_cause_stage(ctx) -> dict:
         # line broke: the two landed in DIFFERENT buckets, root_cause opened a finding of its own
         # instead of classifying the crash finding, and every sanitizer-aborting defect on the
         # target merged into that one. See `crash_key_parts`.
-        _fault_pc, _disc, _ = crash_key_parts(ctx.conn, target.id, input_sha)
+        _fault_pc, _disc, _hj = crash_key_parts(ctx.conn, target.id, input_sha)
         fdao.upsert(target.id, target.case_id, {
             "cwe": v["cwe"], "title": f"{eff_title}: {v['class']}",
             "severity": v["severity"],
@@ -471,7 +471,16 @@ def root_cause_stage(ctx) -> dict:
             # that found the input, not from this capture, so every stage derives the same key.
             "site_addr": _hex(crash_fn.get("static_addr")),
             "function_addr": crash_fn.get("func_addr"),
-            "dedup_key": crash_dedup_key(cap["signal_name"], _fault_pc, _disc),
+            # Carry the HIJACK flag in the key too, so this authoritative classification lands on
+            # the SAME finding the discoverer filed. The fuzz/dynamic stage, with no process maps,
+            # keys ANY out-of-code fault PC as a hijack (`:cfh`) -- which is right for an attacker-
+            # controlled PC but WRONG for a fault inside a legitimately-called library routine
+            # (a memset/memcpy on a bad pointer lands in libc, outside the main image). root_cause
+            # HAS maps and knows the difference; keying the same bucket lets its real class
+            # (null-pointer-dereference, out-of-bounds write, ...) OVERWRITE the provisional
+            # "control-flow hijack" label instead of forking a second finding beside it. A genuine
+            # hijack classifies as one here too, so the label is unchanged for real hijacks.
+            "dedup_key": crash_dedup_key(cap["signal_name"], _fault_pc, _disc, hijack=_hj),
             # root_cause is the authoritative classifier: its specific class (from the debugger,
             # and on a sanitizer build from ASan's own report) replaces the generic signal-derived
             # class the fuzz/dynamic stage first filed the crash under.
