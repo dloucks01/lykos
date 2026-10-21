@@ -110,71 +110,70 @@ done
 
 echo "relink: making the bundle glibc-independent (loader: ${LDREAL#"$ROOT"/})"
 rm -f "$TC/.relink/.count"; : > "$TC/.relink/.count"
-# Walk every regular file and patch the ELF ones. The pipe puts the loop in a subshell, so the
-# running count is kept in a file rather than a variable. Bundle paths contain no newlines.
+# TWO PASSES over every regular file, patching the ELF ones. Shared libraries are relinked FIRST,
+# then executables -- because an executable is validated below by asking the bundle loader to resolve
+# it, and that resolution loads the exe's NEEDED .so. If those .so are not relinked yet when the exe
+# is validated, the validation spuriously fails and the exe gets WRAPPERED -- which breaks a compiler
+# that re-execs its own frontend: clang runs `<self> -cc1`, and under a loader-wrapper (`ld-linux
+# <clang>`) /proc/self/exe is ld-linux, so it runs `ld-linux -cc1` -> "cannot open shared object".
+# Relinking the .so first (e.g. libLLVM.so, which clang NEEDs) lets clang validate cleanly and be
+# PATCHED, not wrappered. The pipe puts each loop in a subshell, so the running count lives in a file.
+#
+# A STATICALLY LINKED / static-PIE binary (no PT_INTERP and no NEEDED libs) is self-contained and is
+# NEVER touched: `--set-rpath` rewrites its program headers and breaks the self-relocation a static-PIE
+# does at startup -> SIGSEGV before main. That silently corrupted EVERY vendored qemu-user (static-PIE)
+# [measured 2026-10-20: pristine qemu-aarch64 0/5 SIGSEGV; after --set-rpath 8/8]. A .so has no
+# interpreter but DOES list NEEDED libs, so it still gets the rpath (pass 1).
+_elf() {  # shared skip-checks: prints nothing, returns 0 if $1 is a bundle ELF we may relink
+  case "$1" in */.relink/*) return 1 ;; esac
+  [ "$(od -An -N4 -tx1 "$1" 2>/dev/null | tr -d ' \n')" = "7f454c46" ] || return 1
+  [ "$(CDPATH= cd -- "$(dirname "$1")" && pwd)/$(basename "$1")" = "$LDREAL" ] && return 1
+  return 0
+}
+
+# ---- pass 1: shared libraries (no interpreter, but NEEDED libs) -> rpath in place ----
 find "$@" -type f 2>/dev/null | while IFS= read -r f; do
-  # never touch our own tooling dir (the static patchelf lives there)
-  case "$f" in */.relink/*) continue ;; esac
-  # cheap one-process ELF magic check (7f 45 4c 46)
-  [ "$(od -An -N4 -tx1 "$f" 2>/dev/null | tr -d ' \n')" = "7f454c46" ] || continue
-  # never touch the loader itself (patchelf-ing ld-linux corrupts it)
-  [ "$(CDPATH= cd -- "$(dirname "$f")" && pwd)/$(basename "$f")" = "$LDREAL" ] && continue
-  # A STATICALLY LINKED / static-PIE executable (no PT_INTERP and no NEEDED libraries) is already
-  # self-contained: it carries its own startup and has no glibc dependency to repoint. patchelf must
-  # NOT touch it -- `--set-rpath` rewrites the program headers and breaks the self-relocation a
-  # static-PIE performs at startup, so the binary then SIGSEGVs before main. This silently corrupted
-  # EVERY vendored qemu-user (they ship static-PIE): on an air-gapped host with no system qemu to
-  # fall back to, all cross-arch analysis/exploitation died with SIGSEGV **[measured 2026-10-20:
-  # pristine qemu-aarch64 0/5 SIGSEGV; the same binary after --set-rpath 8/8]**. A shared library
-  # (.so) also has no interpreter but DOES list NEEDED libraries, so it still needs the rpath below
-  # and is NOT skipped here.
-  has_interp=no; "$PATCHELF" --print-interpreter "$f" >/dev/null 2>&1 && has_interp=yes
-  if [ "$has_interp" = no ] && [ -z "$("$PATCHELF" --print-needed "$f" 2>/dev/null)" ]; then
-    continue
-  fi
-  if [ "$has_interp" = yes ]; then
-    # DYNAMIC EXECUTABLE. Repoint its interpreter at the bundle loader + add the rpath -- but on a
-    # COPY first, because patchelf 0.19.1 CORRUPTS some large binaries: gcc's 42 MB cc1 segfaults the
-    # loader after --set-interpreter (measured: pristine cc1 runs fine via the bundle loader; the
-    # patched one rc=139), which silently killed source compilation + the libFuzzer lane on the
-    # air-gapped laptop while the gcc DRIVER (small, patches cleanly) looked fine. So: patch a copy,
-    # verify the bundle loader can still resolve it, and only then adopt it. If the patch corrupts
-    # the binary, keep the PRISTINE one and front it with a loader-wrapper -- running a pristine
-    # binary as `<bundle-ld> --library-path <rpath> <binary>` is glibc-independent AND patch-free.
-    tmp="$f.relinktmp"
-    if cp -p "$f" "$tmp" 2>/dev/null; then
-      "$PATCHELF" --set-interpreter "$LDREAL" "$tmp" 2>/dev/null || true
-      curx=$("$PATCHELF" --print-rpath "$tmp" 2>/dev/null || true)
-      case "$curx" in
-        "$RPATH"|"$RPATH":*) ;;
-        "") "$PATCHELF" --set-rpath "$RPATH" "$tmp" 2>/dev/null || true ;;
-        *)  "$PATCHELF" --set-rpath "$RPATH:$curx" "$tmp" 2>/dev/null || true ;;
-      esac
-      if "$LDREAL" --list "$tmp" >/dev/null 2>&1; then
-        mv -f "$tmp" "$f"                           # patched binary is sound -- adopt it
-      else
-        rm -f "$tmp"                                # patchelf corrupted it -- wrapper the pristine one
-        mv -f "$f" "$f.real"
-        { printf '#!/bin/sh\n'
-          printf '# lykos loader-wrapper: patchelf corrupts this binary (0.19.1 large-ELF bug), so the\n'
-          printf '# PRISTINE copy beside it is run through the bundle loader with the bundle library path.\n'
-          printf 'exec "%s" --library-path "%s" "%s.real" "$@"\n' "$LDREAL" "$RPATH" "$f"
-        } > "$f"
-        chmod 0755 "$f"
-      fi
-    fi
-    printf 'x' >> "$TC/.relink/.count"
-    continue
-  fi
-  # SHARED LIBRARY (no interpreter): give it an rpath into the bundle libs, ahead of anything it had,
-  # so a child exec'd without LD_LIBRARY_PATH still resolves the bundle's libraries. (.so are loaded,
-  # not exec'd, so the wrapper path above does not apply; patchelf's rpath edit on a .so is safe.)
+  _elf "$f" || continue
+  "$PATCHELF" --print-interpreter "$f" >/dev/null 2>&1 && continue       # has interp -> exe (pass 2)
+  [ -z "$("$PATCHELF" --print-needed "$f" 2>/dev/null)" ] && continue    # no needed -> static, skip
   cur=$("$PATCHELF" --print-rpath "$f" 2>/dev/null || true)
   case "$cur" in
-    "$RPATH"|"$RPATH":*) ;;                       # already leads with ours
+    "$RPATH"|"$RPATH":*) ;;
     "") "$PATCHELF" --set-rpath "$RPATH" "$f" 2>/dev/null || true ;;
     *)  "$PATCHELF" --set-rpath "$RPATH:$cur" "$f" 2>/dev/null || true ;;
   esac
+  printf 'x' >> "$TC/.relink/.count"
+done
+
+# ---- pass 2: dynamic executables -> repoint interpreter + rpath, on a COPY, validated ----
+# patchelf 0.19.1 CORRUPTS some large binaries (gcc's 42MB cc1 segfaults the loader after
+# --set-interpreter). So patch a copy, verify the bundle loader still resolves it, and adopt it only
+# if sound; if the patch corrupts it, keep the PRISTINE binary + front it with a loader-wrapper.
+find "$@" -type f 2>/dev/null | while IFS= read -r f; do
+  _elf "$f" || continue
+  "$PATCHELF" --print-interpreter "$f" >/dev/null 2>&1 || continue        # no interp -> not an exe
+  tmp="$f.relinktmp"
+  if cp -p "$f" "$tmp" 2>/dev/null; then
+    "$PATCHELF" --set-interpreter "$LDREAL" "$tmp" 2>/dev/null || true
+    curx=$("$PATCHELF" --print-rpath "$tmp" 2>/dev/null || true)
+    case "$curx" in
+      "$RPATH"|"$RPATH":*) ;;
+      "") "$PATCHELF" --set-rpath "$RPATH" "$tmp" 2>/dev/null || true ;;
+      *)  "$PATCHELF" --set-rpath "$RPATH:$curx" "$tmp" 2>/dev/null || true ;;
+    esac
+    if "$LDREAL" --list "$tmp" >/dev/null 2>&1; then
+      mv -f "$tmp" "$f"                             # patched binary is sound -- adopt it
+    else
+      rm -f "$tmp"                                  # patchelf corrupted it -- wrapper the pristine one
+      mv -f "$f" "$f.real"
+      { printf '#!/bin/sh\n'
+        printf '# lykos loader-wrapper: patchelf corrupts this binary (0.19.1 large-ELF bug), so the\n'
+        printf '# PRISTINE copy beside it is run through the bundle loader with the bundle library path.\n'
+        printf 'exec "%s" --library-path "%s" "%s.real" "$@"\n' "$LDREAL" "$RPATH" "$f"
+      } > "$f"
+      chmod 0755 "$f"
+    fi
+  fi
   printf 'x' >> "$TC/.relink/.count"
 done
 

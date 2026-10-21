@@ -113,8 +113,10 @@ gen_wrappers() {
         printf '# No LD_LIBRARY_PATH -- see gen_wrappers in setup-toolchain.sh for why.\n'
         printf 'r=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)\n'
         if [ "$is_cc" = 1 ]; then
-          printf '# compiler driver: relocate its /usr-prefixed lib/header/loader search into the bundle\n'
-          printf 'exec "$r/%s" --sysroot="$r" "$@"\n' "$relreal"
+          printf '# compiler driver: relocate its /usr-prefixed lib/header search into the bundle with\n'
+          printf '# --sysroot, and -B so it finds the bundle ld/as/collect2 (clang execs a bare "ld"\n'
+          printf '# via posix_spawn and otherwise fails "unable to execute command: No such file").\n'
+          printf 'exec "$r/%s" --sysroot="$r" -B"$r/usr/bin" "$@"\n' "$relreal"
         else
           printf 'exec "$r/%s" "$@"\n' "$relreal"
         fi
