@@ -320,6 +320,18 @@ def activate(force: bool = False) -> dict:
                 env["LYKOS_REF_LIBC_A"] = str(la)
                 break
 
+    # The aarch64 reference for FLIRT on a stripped static ARM64 binary (a common cross-arch /
+    # firmware shape): the cross dev package libc6-dev-arm64-cross extracts to
+    # usr/aarch64-linux-gnu/lib/libc.a. Point LYKOS_REF_LIBC_A_AARCH64 at the bundled copy so
+    # flirt.reference_archive(aarch64) finds it offline. Only when unset.
+    if prefix and not os.environ.get("LYKOS_REF_LIBC_A_AARCH64"):
+        for sub in ("usr/aarch64-linux-gnu/lib/libc.a", "usr/lib/aarch64-linux-gnu/libc.a"):
+            la = prefix / sub
+            if la.is_file():
+                os.environ["LYKOS_REF_LIBC_A_AARCH64"] = str(la)
+                env["LYKOS_REF_LIBC_A_AARCH64"] = str(la)
+                break
+
     # A relocated GCC (and the cross-compilers) looks for system headers and startup files at
     # absolute /usr paths, which are empty on a minimal target -- so `#include <string.h>` and
     # linking fail even though the bundle carries them. Point the compilers at the vendored

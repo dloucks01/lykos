@@ -336,6 +336,9 @@ source dist/engines/engines.env  # exports LYKOS_AFLQEMU_DIR / LYKOS_QASAN / LYK
 ## reference for binaries built on that box, not the analysis host's glibc. vendorenv auto-points
 ## LYKOS_REF_LIBC_A at the bundled copy; collect-toolchain WARNS if libc.a is missing. Override with
 ## LYKOS_REF_LIBC_A=/path/to/target/libc.a if analysing binaries from a different distro.
+## For a stripped static AARCH64 binary (cross-arch / firmware), FLIRT uses the aarch64 libc.a from
+## libc6-dev-arm64-cross -- the collector now pulls it (and the other libc6-dev-<arch>-cross dev libs)
+## explicitly, since the cross gcc only Recommends it; vendorenv wires LYKOS_REF_LIBC_A_AARCH64.
 
 ./package                       # fold the working tree + a fully-populated vendor/ into one package
 ## make-runnable.sh injects the engines named above, vendors a matching Python so the unicorn/angr

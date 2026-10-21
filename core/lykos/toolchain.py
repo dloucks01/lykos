@@ -245,13 +245,33 @@ def cross_compilers() -> list:
     return sorted(out)
 
 
+# Cross triple -> Debian multiarch name, for the `libc6-dev-<arch>-cross` dev package that carries
+# that arch's static libc.a (FLIRT's reference for a stripped STATIC cross binary). The cross gcc
+# only RECOMMENDS it, so --no-install-recommends drops it unless we name it explicitly. The collector
+# skips any package not in the target distro (apt-cache guard), so naming an arch the distro lacks is
+# harmless.
+_CROSS_DEB_ARCH = {
+    "aarch64-linux-gnu": "arm64", "arm-linux-gnueabihf": "armhf", "arm-linux-gnueabi": "armel",
+    "riscv64-linux-gnu": "riscv64", "powerpc64le-linux-gnu": "ppc64el",
+    "powerpc64-linux-gnu": "ppc64", "powerpc-linux-gnu": "powerpc",
+    "mips64el-linux-gnu": "mips64el", "mipsel-linux-gnu": "mipsel", "mips-linux-gnu": "mips",
+    "s390x-linux-gnu": "s390x", "sparc64-linux-gnu": "sparc64", "m68k-linux-gnu": "m68k",
+    "sh4-linux-gnu": "sh4", "loongarch64-linux-gnu": "loong64",
+}
+
+
 def _cross_apt() -> tuple:
-    """Debian package names for those compilers: <triple>-gcc ships in gcc-<triple>."""
+    """Debian package names for those compilers: <triple>-gcc ships in gcc-<triple>, and the cross
+    static libc (FLIRT's reference for a stripped static cross binary) in libc6-dev-<arch>-cross."""
     pkgs = set()
     try:
         for cc in cross_compilers():
             if cc.endswith("-gcc"):
-                pkgs.add("gcc-" + cc[:-4])
+                triple = cc[:-4]
+                pkgs.add("gcc-" + triple)
+                deb = _CROSS_DEB_ARCH.get(triple)
+                if deb:
+                    pkgs.add("libc6-dev-%s-cross" % deb)   # the arch's libc.a for FLIRT
     except Exception:                                   # noqa: BLE001
         pass
     pkgs.add("gcc-mingw-w64-x86-64")                    # PE fixtures, not in the arch matrix
