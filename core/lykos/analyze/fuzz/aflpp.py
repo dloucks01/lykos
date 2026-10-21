@@ -225,7 +225,12 @@ def run_campaign(afl: Path, exe, seeds_dir, out_dir, *, seconds: int = 30,
     else:
         target = [str(exe)] + ([slot] if mode == "file" else [])
     ffile = ["-f", str(input_file)] if input_file else []
-    cmd = [str(afl)] + (["-Q"] if qemu else []) + ffile + \
+    # A generous, auto-extending per-exec timeout for qemu-mode: a real binary under qemu runs
+    # several times slower than native, and AFL's default calibration timeout marks it "too slow"
+    # and can abort the whole run. `<ms>+` keeps going and skips the slow entries instead of
+    # failing. Native (instrumented) runs keep AFL's own auto-calibration.
+    tmout = ["-t", "5000+"] if qemu else []
+    cmd = [str(afl)] + (["-Q"] if qemu else []) + tmout + ffile + \
         ["-i", str(seeds_dir), "-o", str(out_dir), "-V", str(int(seconds)), "--"] + target
     env = dict(os.environ)
     if afl_path:
@@ -244,6 +249,19 @@ def run_campaign(afl: Path, exe, seeds_dir, out_dir, *, seconds: int = 30,
         # intercepts strcmp/memcmp-family calls. Measured on gif2rgb: 751 -> 1534 edges. The compcov
         # plugin is built into qemuafl, so this is free when present and simply a no-op if not.
         env.setdefault("AFL_COMPCOV_LEVEL", "2")
+        # A LARGE binary takes far longer to reach the fork point under qemu than a small one --
+        # qemu translates the path from _start through libc init before handing back, and the gate's
+        # tiny ELF does this in well under a second while a 20-100MB real-world binary does not. The
+        # DEFAULT fork-server init timeout then aborts the handshake ("Fork server handshake failed")
+        # and the whole coverage campaign is lost before a single input runs. Scale the window with
+        # the binary's size (base 120s, +3s per MB, capped at 600s) and skip the binary check -Q does
+        # not need (the target is uninstrumented by design). setdefault, so an operator's env wins.
+        try:
+            _mb = Path(exe).stat().st_size / (1024 * 1024)
+        except OSError:
+            _mb = 0
+        env.setdefault("AFL_FORKSRV_INIT_TMOUT", str(int(min(600_000, 120_000 + _mb * 3_000))))
+        env.setdefault("AFL_SKIP_BIN_CHECK", "1")
         # The guest sysroot for a CROSS-ARCH target: afl-qemu-trace is qemu under the hood, so a
         # dynamically-linked foreign ELF needs QEMU_LD_PREFIX to find its loader -- without it the
         # fork-server handshake fails the instant the first exec hits the loader (the "Fork server

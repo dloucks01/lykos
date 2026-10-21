@@ -1541,6 +1541,15 @@ def _scorecard(store, target, bud, status, *, absorbed_base=None,
     return card
 
 
+#: Size thresholds (MB) for large-binary mode. Past LARGE, whole-binary structural analysis
+#: (rizin `aaa`) does not finish in a reasonable budget (doc 40: measured on 24MB+), so depth comes
+#: from coverage- and directed-fuzzing of the reachable attack surface, not from decompiling the
+#: whole image. Past HUGE, whole-PROGRAM symbolic execution is skipped outright: angr loading a
+#: ~90MB+ image OOMs/stalls and spends the budget for nothing, while the fuzzers still make progress.
+_LARGE_BINARY_MB = 40
+_HUGE_BINARY_MB = 90
+
+
 def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                        stop: threading.Event, budget_seconds: Optional[float] = None,
                        overrides: Optional[dict] = None) -> None:
@@ -1625,6 +1634,20 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
             # The plan is built AFTER triage, not before: it is chosen from the target's
             # substrate, and for an untriaged target that was an empty string.
             _init_plan(status, t, len(done_tids), len(worklist))
+            # Large-binary mode. Past a size where whole-binary structural analysis and whole-program
+            # symbolic execution stop being tractable, the reachable attack surface is still best
+            # explored by EXECUTION -- coverage + directed fuzzing (the afl handshake-timeout fix now
+            # survives a big binary) -- not by angr loading the whole image. `size_mb` gates the
+            # doomed symbolic lane below and the note tells the operator to give it a large budget.
+            size_mb = (t.size or 0) / 1_000_000.0
+            if size_mb >= _LARGE_BINARY_MB:
+                store.events.append("autopilot.large_binary", case_id=t.case_id, payload={
+                    "target_id": t.id, "size_mb": round(size_mb, 1),
+                    "mode": "huge" if size_mb >= _HUGE_BINARY_MB else "large",
+                    "note": ("structural analysis is budget-capped and (for a huge binary) "
+                             "whole-program symbolic execution is skipped; depth comes from "
+                             "coverage + directed fuzzing -- give it a large --budget (hours for "
+                             "a ~100MB binary).")})
             # A firmware image is not a program: carve it into its embedded binaries (each registered
             # as a sub-target) and analyse THOSE. Running native recovery on the raw blob finds nothing
             # and misses every component + secret.
@@ -1931,7 +1954,18 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
             # block-coverage number means guarded branches (magic values, length checks) were
             # never reached -- exactly what concolic solves for.
             cov_pct = _best_block_pct(store, tid)
-            if not crashes or (cov_pct is not None and cov_pct < 60):
+            want_concolic = not crashes or (cov_pct is not None and cov_pct < 60)
+            # Whole-program symbolic execution does not scale to a huge binary: angr loads the entire
+            # image (CLE) and OOMs/stalls, burning the budget the fuzzers could still spend. Skip it
+            # with a clear reason rather than letting it fail late -- the user saw exactly this as an
+            # angr TypeError on a large target. Large-but-not-huge still runs concolic.
+            if want_concolic and size_mb >= _HUGE_BINARY_MB:
+                store.events.append("concolic.skipped", case_id=t.case_id, payload={
+                    "target_id": tid, "size_mb": round(size_mb, 1),
+                    "reason": ("binary too large for whole-program symbolic execution (angr would "
+                               "OOM/stall); coverage + directed fuzzing carry the depth here")})
+                want_concolic = False
+            if want_concolic:
                 _staged(bud, store, t, "concolic", status, stop, dyn, want=120.0)
                 # Close the coverage loop: re-fuzz once more, now that directed_fuzz automatically
                 # reuses concolic's solved inputs as seeds -- so the fuzzer explores AROUND the
