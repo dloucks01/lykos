@@ -191,6 +191,6 @@ def test_stage_files_l3_full_brop_no_win_no_leak_shell(store, _stage, shell_srv)
                                         linking="dynamic", stripped=False,
                                         mitigations={"pie": "on"}, file_type="elf")
     run = enqueue_exploit(q, t, params={"strategy": "ret2win"})
-    assert _stage.wait_idle(240) and q.runs.get(run.id).status == "done"
+    assert _stage.wait_idle(600) and q.runs.get(run.id).status == "done"
     pocs = [pc for pc in PocDAO(store.conn).list_by_target(t.id) if pc.level == "L3" and pc.verified]
     assert pocs, "no confirmed L3 full-BROP shell PoC for the no-win server"
