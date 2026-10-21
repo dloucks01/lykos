@@ -74,7 +74,15 @@ _SEED_SCREEN_TIMEOUT = 3.0
 
 
 def _drop_timeout_seeds(ctx, target, exe, seeds, mode) -> set:
-    """Indices of seeds that time out, so they never reach afl-fuzz's dry run.
+    """Indices of seeds afl-fuzz's dry run would REJECT -- those that TIME OUT or CRASH.
+
+    afl-fuzz aborts the WHOLE campaign on a single dry-run seed that hangs ("results in a
+    timeout") or crashes ("We need at least one valid input seed that does not crash!"), so one
+    bad default/format seed means the target gets no coverage fuzzing at all -- observed on a
+    binary whose only seeds crash it under afl-qemu. Screening hands afl only seeds it will
+    accept. A crashing seed is NOT lost: the blind `fuzz` stage still runs every seed for crashes,
+    and if EVERY seed is dropped the caller declines with a clear reason instead of afl's cryptic
+    abort.
 
     STDIN only: a file/argv seed has to be staged per execution and the invocation it needs is
     not settled at this point, whereas a stdin seed costs one native exec. Returns an empty set
@@ -89,7 +97,7 @@ def _drop_timeout_seeds(ctx, target, exe, seeds, mode) -> set:
         for i, data in enumerate(seeds):
             r = sandbox.run(exe, stdin=data, timeout=_SEED_SCREEN_TIMEOUT, arch=target.arch,
                             endianness=target.endianness, bits=target.bits)
-            if r.timed_out:
+            if r.timed_out or r.crashed:                 # afl's dry run rejects either
                 bad.add(i)
     except Exception:                                    # noqa: BLE001 -- advisory screening
         return set()
@@ -320,22 +328,23 @@ def coverage_stage(ctx) -> dict:
         seeds = [s for i, s in enumerate(seeds) if i not in slow]
         ctx.emit("coverage.seeds", payload={
             "dropped_timeouts": len(slow), "kept": len(seeds),
-            "why": "afl-fuzz aborts its dry run on a seed that times out, which would end the "
-                   "campaign before a single execution; these are still fuzzed blind"})
+            "why": "afl-fuzz aborts its dry run on a seed that times out OR crashes, which would "
+                   "end the campaign before a single execution; these are still fuzzed blind"})
     if slow and not seeds:
-        # EVERY seed timed out. The old fallback substituted `_DEFAULT_SEEDS` here, and those
-        # time out too on a target that never terminates -- so afl-fuzz aborted its dry run on
-        # them and the stage raised, which is how `zigzag` (an interactive menu binary that
-        # blocks forever on any input, on any channel) produced a RuntimeError instead of a
-        # verdict. AFL cannot drive a target that does not return; that is a property of the
-        # target, so it is a decline, and the blind `fuzz` stage still runs it under rlimits.
-        note = (f"every one of the {len(slow)} seeds timed out: this target does not terminate "
-                f"on the {mode} channel, and afl-fuzz aborts its dry run on a seed that times "
-                f"out. The sandbox fuzzers still run it under their own per-execution limit.")
+        # EVERY seed timed out OR crashed. The old fallback substituted `_DEFAULT_SEEDS` here, and
+        # those fail afl's dry run the same way on a target that never terminates (zigzag, an
+        # interactive menu binary) or that crashes on every seed under afl-qemu (a daemon fed a
+        # stdin seed it is not built to parse) -- so afl aborted and the stage raised. AFL cannot
+        # dry-run a target that only hangs/crashes on its seeds; that is a property of the target,
+        # so it is a decline, and the blind `fuzz` stage still runs it under rlimits.
+        note = (f"every one of the {len(slow)} seeds timed out or crashed under afl's dry run: "
+                f"afl-fuzz needs at least one seed that runs cleanly on the {mode} channel, and "
+                f"this target has none. The sandbox fuzzers still run it under their own "
+                f"per-execution limit, and any crashing seed is itself handled there.")
         ctx.emit("coverage.done", payload={"supported": False, "backend": "aflpp",
                                            "crash_inputs": 0, "unique": 0, "confirmed": 0,
                                            "note": note})
-        ctx.progress(pct=100, msg="target does not terminate — AFL cannot dry-run it")
+        ctx.progress(pct=100, msg="no afl-usable seed (all time out or crash) — sandbox fuzzers cover it")
         return {}
     seeds = seeds or list(_DEFAULT_SEEDS)
     seeds_dir = ctx.scratch() / "afl-in"
