@@ -158,11 +158,22 @@ def stage_qemu_trace(trace: Path, workdir) -> str:
 
 
 def is_sanitizer_build(data: bytes) -> bool:
-    """Is this ELF built with AddressSanitizer/UBSan? Cheap byte-scan for the runtime's marker
-    symbol. Sanitizer builds need special AFL handling (no memory cap, longer fork-server
-    startup), which must NOT be applied to ordinary targets -- an uncapped ordinary target can
-    allocate without bound and OOM the host."""
-    return b"__asan_init" in data or b"__asan_report" in data or b"__ubsan_handle" in data
+    """Is this ELF built with a sanitizer runtime (ASan/UBSan/MSan/TSan/LSan)? Cheap byte-scan for
+    the runtime's marker symbol. Sanitizer builds need special handling (no RLIMIT_AS cap, longer
+    fork-server startup) which must NOT be applied to ordinary targets -- an uncapped ordinary
+    target can allocate without bound and OOM the host.
+
+    EVERY sanitizer runtime reserves a huge fixed virtual region at startup (ASan/MSan ~20TB of
+    shadow; LSan's primary allocator a fixed 0x500000000000 base), so an RLIMIT_AS cap makes that
+    mmap fail. For the aborting sanitizers (ASan/UBSan/MSan/TSan, built here with abort_on_error=1)
+    the failure is a spurious pre-main SIGABRT that merely looks like a crash; for LeakSanitizer,
+    which reports at a clean exit rather than aborting, the allocator CHECK-fails and the leak is
+    NEVER reported -- so a standalone `-fsanitize=leak` build has to be recognised here or the PoC
+    replay (`sandbox.run`) caps its address space and the leak silently vanishes. MSan/TSan/LSan are
+    mutually exclusive with ASan, so their own `__{m,t,l}san_init` markers are what identify them
+    (an LSan build carries no `__asan_init`)."""
+    return (b"__asan_init" in data or b"__asan_report" in data or b"__ubsan_handle" in data
+            or b"__msan_init" in data or b"__tsan_init" in data or b"__lsan_init" in data)
 
 
 # Leading-bytes -> the file EXTENSION a format sniffer expects. Many parsers (mutool/ImageMagick/

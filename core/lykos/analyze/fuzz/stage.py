@@ -601,6 +601,107 @@ def _msan_source_line(binpath, text):
     return None
 
 
+def lsan_detonate(ctx, target, inputs, mode, exec_timeout, base_argv=()) -> int:
+    """Detonate a set of inputs against the target's LeakSanitizer build (built at ingest for source
+    targets) to surface MEMORY LEAKS (CWE-401) -- an allocation never freed. A leak does NOT crash and
+    the rest of the pipeline runs ASan with detect_leaks=0, so it must be driven here against a
+    dedicated `-fsanitize=leak` build whose LSAN_OPTIONS (not the disabled ASAN_OPTIONS) governs the
+    scan. LSan reports AT EXIT, so a benign input that reaches an allocation triggers it; a
+    guaranteed-allocating probe is prepended so the pass fires even on an empty corpus. Findings land
+    'corroborated' (the sanitizer directly observed the leak) with the allocation site. Fully guarded.
+
+    Runs under the SAME bubblewrap containment as every other target (attacker-controlled native code)
+    via isolate_prefix + run_reaped; a wall-clock budget bounds the cost (it fires once per campaign)."""
+    import os as _os
+
+    from ...db.dao import ArtifactDAO
+    from ..debug.rootcause import parse_asan_report
+    try:
+        arts = ArtifactDAO(ctx.conn).list_by_case(target.case_id)
+        la = next((a for a in arts if a.kind == "lsan-blob"
+                   and (a.meta or {}).get("binary_sha") == target.sha256), None)
+        if not la:
+            return 0
+        lsbin = ctx.scratch() / "target.lsan"
+        lsbin.write_bytes(ctx.content.path(la.sha256).read_bytes())
+        _os.chmod(lsbin, 0o755)
+    except Exception:
+        observe.absorbed(_log, "answering a default")
+        return 0
+    # symbolize=0 for the same reason as msan_detonate: llvm-symbolizer deadlocks on a captured-pipe
+    # stderr. Recover the allocation site ourselves with addr2line on the raw frame offset. LSan's
+    # own default exit code (23) already distinguishes a leak report from a clean exit.
+    env = dict(_os.environ)
+    env["LSAN_OPTIONS"] = "symbolize=0:exitcode=23"
+    exedir = str(lsbin.parent)
+    prefix = sandbox.isolate_prefix(exedir, net=False)
+    per_timeout = max(2, int(exec_timeout))
+    deadline = time.monotonic() + max(15.0, min(90.0, per_timeout * 30))
+    _cancel = getattr(ctx, "should_cancel", None)
+    fd = FindingDAO(ctx.conn)
+    wf = ctx.scratch() / "lsan-in.bin"
+    # A leak only surfaces once the program reaches an allocation and EXITS, so a benign allocating
+    # probe is tried first -- otherwise an empty/early-returning corpus never frees nothing to see.
+    probe = b"lykos-leak-probe\nlykos-leak-probe\nq\n"
+    found, seen = 0, set()
+    for data in ([probe] + list(inputs))[:400]:
+        if time.monotonic() > deadline or (_cancel is not None and _cancel()):
+            break
+        data = data or b""
+        tail, stdin = invocation(mode, wf, data, base_argv)
+        argv = [str(lsbin)] + tail
+        try:
+            r = sandbox.run_reaped(prefix + argv, input=stdin, timeout=per_timeout,
+                                   capture_output=True, env=env)
+        except Exception:
+            observe.absorbed(_log, "skipping this item")
+            continue
+        txt = (r.stderr or b"").decode("latin-1", "ignore")
+        if "LeakSanitizer: detected memory leaks" not in txt and "Direct leak of" not in txt:
+            continue
+        rep = parse_asan_report(txt) or {}
+        src = _msan_source_line(lsbin, txt)          # the allocation site (addr2line, symbolize=0)
+        _raw = re.search(r"\(\S+\+0x[0-9a-fA-F]+\)", txt)
+        key = src or (_raw.group(0) if _raw else
+                      hashlib.sha1(txt[:256].encode("latin-1", "ignore")).hexdigest()[:12])
+        if key in seen:
+            continue
+        seen.add(key)
+        _cwe = rep.get("cwe") or "CWE-401"
+        _detail = rep.get("detail") or "LeakSanitizer: detected memory leak"
+        if src and src not in _detail:
+            _detail += f" at {src}"
+        try:
+            sha = ctx.put_artifact("lsan-input", data=data)
+            fd.upsert(target.id, target.case_id, {
+                "cwe": _cwe, "title": "Memory leak",
+                "severity": rep.get("severity") or "low",
+                "detector": "lsan", "state": "corroborated", "confidence": 0.8,
+                "dedup_key": f"{_cwe}:lsan:{key}", "function_addr": None, "site_addr": None,
+                "site_detail": src,
+                "evidence": [{"channel": "sanitizer",
+                              "detail": _detail + f" (input {sha[:12]})"}]})
+            found += 1
+        except Exception:
+            observe.absorbed(_log, "skipping this item")
+            continue
+        # RECORD IT AS A RUN so the ladder can see it (as msan/tsan do): the isolation tag names the
+        # LSAN build so replay detonates IT (no other build reports a leak -- the ASan build runs with
+        # detect_leaks=0). crashed=True in the only sense downstream cares about: the detector halted
+        # the process (exit 23) on a defect it observed; the verdict carries CWE-401, not "crash".
+        try:
+            DynResultDAO(ctx.conn).insert(
+                target.id, target.case_id, run_id=getattr(ctx, "run_id", None), input_sha=sha,
+                input_mode=mode, argv=list(tail), crashed=True,
+                signal_name=rep.get("class") or "memory-leak",
+                isolation="lsan", defect_key=f"lsan:{key}", note=_detail)
+        except Exception:
+            observe.absorbed(_log, "continuing")
+    if found:
+        ctx.emit("lsan.done", payload={"memory_leaks": found})
+    return found
+
+
 def tsan_detonate(ctx, target, inputs, mode, exec_timeout, base_argv=()) -> int:
     """Detonate a set of inputs against the target's ThreadSanitizer build (built at ingest for
     source targets) to surface data races (CWE-362) -- the concurrency class no other sanitizer
@@ -1438,6 +1539,13 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
     # Data-race pass (CWE-362): detonate the same corpus against the ThreadSanitizer binary.
     try:
         tsan_detonate(ctx, target, corpus, mode, exec_timeout, base_argv=base_argv)
+    except Exception:
+        observe.absorbed(_log, "continuing")
+    # Memory-leak pass (CWE-401): detonate the same corpus against the LeakSanitizer binary. A leak
+    # surfaces only at a normal exit (ASan runs detect_leaks=0 everywhere else), so this dedicated
+    # -fsanitize=leak build + corpus is the one place it is caught.
+    try:
+        lsan_detonate(ctx, target, corpus, mode, exec_timeout, base_argv=base_argv)
     except Exception:
         observe.absorbed(_log, "continuing")
     ctx.emit(f"{event_prefix}.done", payload=stats)

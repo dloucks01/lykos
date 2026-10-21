@@ -282,8 +282,13 @@ def replay_exe_for(ctx, target, input_sha):
     # (plain or ASan) binary is not a weaker test but the wrong one -- it cannot report a race at
     # all, and a real CWE-362 would be filed unverified. Measured by the conformance gate's
     # data-race case, which found the class and demonstrated nothing.
-    if iso in ("tsan", "msan"):
-        want = {"tsan": "tsan-blob", "msan": "msan-blob"}[iso]
+    # A MEMORY LEAK (CWE-401) is reported by the standalone LeakSanitizer build and by nothing
+    # else: the ingested (plain or ASan) binary runs with `detect_leaks=0` precisely so LSan's
+    # at-exit report cannot stand in for the crash being detonated, so replaying the input against
+    # it reproduces no leak and a real CWE-401 would be filed unverified. The run that found it
+    # tagged its isolation `lsan`, so replay against the `-fsanitize=leak` build.
+    if iso in ("tsan", "msan", "lsan"):
+        want = {"tsan": "tsan-blob", "msan": "msan-blob", "lsan": "lsan-blob"}[iso]
         art = next((a for a in ArtifactDAO(ctx.conn).list_by_case(target.case_id)
                     if a.kind == want
                     and (a.meta or {}).get("binary_sha") in (None, target.sha256)), None)

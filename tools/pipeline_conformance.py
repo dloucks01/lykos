@@ -1733,17 +1733,21 @@ int main(void){ setvbuf(stdout,0,2,0);
     strncpy(p,line,16);
     if(line[0]=='q') break; }
   printf("done\n"); return 0; }""",
-         ["-no-pie", "-O0", "-w"],
-         want_level=0, want_cwe=(), budget=300.0, mechanism="resource-exhaustion",
-         known_gap=True,
+         [], as_source=True,
+         want_level=1, want_cwe=("CWE-401",), budget=300.0, mechanism="resource-exhaustion",
+         strict_level=True,
          note="BUG CLASS memory leak (CWE-401): an allocation per request that is never freed. "
-              "Never crashes, so every crash-centric stage is blind to it; valgrind's leak summary "
-              "is the only oracle that sees it, and `memoracle` already maps a leak-only run to "
-              "CWE-401. MEASURED HOLE: no CWE-401 finding at all. The oracle needs an INPUT that "
-              "reaches the loop, and `mem_oracle`'s probe list is recorded crash inputs plus the "
-              "empty one -- a target that never crashes contributes none, and on empty input this "
-              "program's first `fgets` returns NULL and it leaks nothing. The leak is real, the "
-              "classifier for it exists, and what is missing is the input selection in between."),
+              "Never crashes, so crash-centric stages are blind to it, and valgrind (the classic "
+              "oracle) is glibc-version coupled. CLOSED by a dedicated LeakSanitizer build, so the "
+              "case is ingested AS SOURCE (like the MSan/TSan cases) -- the -fsanitize=leak build is "
+              "only made on a source drop. ingest compiles a `-fsanitize=leak` binary with a baked "
+              "`__lsan_default_options` (symbolize=0, so the replay does not deadlock the symbolizer); "
+              "LSAN_OPTIONS governs it, so the pipeline-wide ASAN_OPTIONS detect_leaks=0 does not "
+              "silence it. `lsan_detonate` drives the corpus -- plus a guaranteed-allocating probe -- "
+              "against it, so a benign input reaches the malloc and LSan reports the leak at exit; "
+              "parse_asan_report classifies it CWE-401, filed 'corroborated'. The leak run is tagged "
+              "isolation=lsan, so `replay_exe_for` replays against the LSan build and `build_poc` "
+              "verifies the report (a code-23 exit, not a signal) into an L1 PoC."),
 
     Case("invalid_free",
          r"""#include <stdio.h>

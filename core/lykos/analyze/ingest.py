@@ -205,6 +205,46 @@ def compile_source_tsan(src: Path, filename: str, out: Path):
     return out if (r.returncode == 0 and out.exists()) else None
 
 
+def compile_source_lsan(src: Path, filename: str, out: Path):
+    """Best-effort LeakSanitizer build (`-fsanitize=leak`), or None. LSan reports MEMORY LEAKS
+    (CWE-401) -- an allocation that is never freed -- which no other build here catches: the rest of
+    the pipeline runs with ASAN_OPTIONS `detect_leaks=0` so LSan's at-exit report cannot stand in for
+    the crash being detonated (see poc/capture.py). A STANDALONE `-fsanitize=leak` binary reads
+    LSAN_OPTIONS, NOT ASAN_OPTIONS, so that global disable does not silence it. A leak surfaces at
+    normal EXIT (LSan runs its scan atexit), so this build is driven with the corpus -- a benign input
+    that reaches an allocation -- not the crashes. gcc and clang both ship LSan."""
+    ext = Path(filename).suffix.lower()
+    cc = shutil.which("clang++" if ext in _CXX_EXT else "clang") or \
+        shutil.which("g++" if ext in _CXX_EXT else "gcc")
+    if not cc:
+        return None
+    # Bake `symbolize=0` into the binary via `__lsan_default_options`, exactly as the TSan build
+    # bakes its options. LSan is driven in two places -- `lsan_detonate` (which sets LSAN_OPTIONS
+    # in the environment) AND the PoC replay in `poc/stage.py` (plain `sandbox.run`, no env) -- and
+    # only the baked default covers the second. It must be symbolize=0 for the same reason MSan's
+    # detonation is: llvm-symbolizer deadlocks on a captured-pipe stderr, so a symbolizing replay
+    # would hang to its timeout and the leak report would never be read. LSan's own default exit
+    # code is already 23, which is non-zero, so the replay sees a report-bearing exit.
+    opts_c = out.parent / "_lykos_lsan_opts.c"
+    opts_c.write_text('const char *__lsan_default_options(void){return "symbolize=0";}\n')
+    lang = "c++" if ext in _CXX_EXT else "c"
+    # -O0, NOT -O1: at -O1 the compiler (clang especially) keeps the allocated pointer live in a
+    # callee-saved register or a surviving stack slot, so LeakSanitizer's reachability scan finds it
+    # at exit and classifies a genuine leak as "still reachable" -- it reports NOTHING and exits 0
+    # (measured: clang 21 -O1 misses this fixture's leak, -O0 catches it; gcc -O1 happened to catch
+    # it, so the gap was compiler-dependent). Optimization hiding a leak is exactly backwards for a
+    # leak oracle, so this build drops to -O0 where the dead pointer is unreachable and LSan reports.
+    argv = [cc, "-g", "-O0", "-fno-omit-frame-pointer", "-fsanitize=leak",
+            "-w", "-Wno-error=implicit-function-declaration", "-Wno-error=implicit-int",
+            "-Wno-error=int-conversion", "-D_GNU_SOURCE",
+            "-x", lang, str(src), "-x", "none", str(opts_c), "-o", str(out)]
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out if (r.returncode == 0 and out.exists()) else None
+
+
 def _apply_triage_denorm(targets: TargetDAO, target_id: str, rec: dict) -> None:
     targets.update_triage(
         target_id, file_type=rec["file_type"], arch=rec["arch"], bits=rec["bits"],
@@ -529,6 +569,15 @@ def ingest(store, case_id: str, path: str | Path, filename: Optional[str] = None
                 store.put_artifact(case_id, "tsan-blob", src=tsanout,
                                    meta={"binary_sha": info["sha256"], "filename": fname})
                 meta["tsan"] = True
+            # A FOURTH, LeakSanitizer build: catches memory leaks (CWE-401) -- an allocation never
+            # freed -- which the ASan build cannot report (the pipeline runs detect_leaks=0 so LSan's
+            # at-exit report never masks the crash being detonated). Standalone -fsanitize=leak, so
+            # LSAN_OPTIONS (not the disabled ASAN_OPTIONS) controls it; the fuzz stage drives it.
+            lsanout = Path(td) / ((Path(fname).stem or "a") + ".lsan")
+            if compile_source_lsan(path, fname, lsanout) and lsanout.exists():
+                store.put_artifact(case_id, "lsan-blob", src=lsanout,
+                                   meta={"binary_sha": info["sha256"], "filename": fname})
+                meta["lsan"] = True
             store.put_artifact(case_id, "source-code", data=path.read_bytes(),
                                meta={"binary_sha": info["sha256"], "filename": fname, **meta})
             store.put_artifact(case_id, "target-blob", src=binout)

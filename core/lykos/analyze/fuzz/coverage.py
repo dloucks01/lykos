@@ -32,6 +32,7 @@ from .stage import (
     _DEFAULT_SEEDS,
     _recovered_blocks,
     format_aware_seeds,
+    lsan_detonate,
     msan_detonate,
     tsan_detonate,
 )
@@ -198,6 +199,10 @@ def _msan_scan(ctx, target, out_dir, mode, exec_timeout, raw) -> int:
     n = msan_detonate(ctx, target, inputs, mode, exec_timeout)
     try:
         n += tsan_detonate(ctx, target, inputs, mode, exec_timeout)
+    except Exception:
+        observe.absorbed(_log, "continuing")
+    try:
+        n += lsan_detonate(ctx, target, inputs, mode, exec_timeout)
     except Exception:
         observe.absorbed(_log, "continuing")
     return n
