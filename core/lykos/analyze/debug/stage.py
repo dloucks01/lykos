@@ -12,7 +12,7 @@ import shutil
 import sys
 
 from ... import observe
-from ...db.dao import CallEdgeDAO, FindingDAO, FunctionDAO, TargetDAO
+from ...db.dao import CallEdgeDAO, DynResultDAO, FindingDAO, FunctionDAO, TargetDAO
 from ...jobs.registry import register_stage
 from .. import elf, substrate
 from ..dynamic import sandbox
@@ -302,6 +302,31 @@ def root_cause_stage(ctx) -> dict:
         helper_dir = helper.parent
     backend = ("qemu-gdbstub" if emulated else "gdb" if gpath is not None else "ptrace")
 
+    # Was this crash FOUND under the guard-page allocator? Then it is SILENT without one, and this
+    # capture must replay it the same way -- exactly as build_poc and the primitive stage already
+    # do. Without this, root_cause runs the fault unguarded, sees no crash, declines, and the
+    # provisional fuzz-stage classification (which with no maps calls ANY out-of-code fault a
+    # "control-flow hijack", including a memset/memcpy fault that merely landed in libc) is never
+    # corrected. `_guard_preload` is the libdislocator path for the gdb backend's `set environment`;
+    # the ptrace helper computes its own from `guard_page=True`.
+    from ..fuzz.aflpp import is_sanitizer_build
+    _dyn_iso = None
+    for _r in DynResultDAO(ctx.conn).list_by_target(target.id):
+        if _r.input_sha == input_sha and _r.isolation:
+            _dyn_iso = _r.isolation
+            break
+    _guard = (not emulated) and sandbox.GUARD_PAGE_TAG in (_dyn_iso or "")
+    _guard_preload = None
+    if _guard:
+        try:
+            _genv, _applied = sandbox.guard_page_env(
+                dict(os.environ), exe=str(exe), arch=target.arch, host=host,
+                sanitizer=is_sanitizer_build(target_bytes))
+            if _applied:
+                _guard_preload = (_genv.get("LD_PRELOAD", "").split(":")[0] or None)
+        except Exception:                                # noqa: BLE001 -- the guard is best-effort
+            observe.absorbed(_log, "capturing unguarded")
+
     def _capture_with(m):
         if emulated:
             return make_qemu_capture(exe, target.arch, m, base_argv, timeout,
@@ -328,9 +353,10 @@ def root_cause_stage(ctx) -> dict:
             elif m == "file":
                 (ctx.scratch() / "input.bin").write_bytes(input_bytes)
                 argv = place(argv, str(ctx.scratch() / "input.bin"))
-            return gdb.run_gdb(gpath, exe, argv, stdin_file, ctx=ctx, timeout=int(timeout))
-        return make_capture(ctx, helper, exe, m, base_argv, timeout, sys.executable)(
-            input_bytes)
+            return gdb.run_gdb(gpath, exe, argv, stdin_file, ctx=ctx, timeout=int(timeout),
+                               preload=_guard_preload)
+        return make_capture(ctx, helper, exe, m, base_argv, timeout, sys.executable,
+                            guard_page=_guard)(input_bytes)
 
     # Try the mode we believe in, then the others. A crashing input fed the wrong way looks
     # exactly like an input that does not crash, and reporting that as "no fault reproduced"

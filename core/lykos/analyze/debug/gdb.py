@@ -68,11 +68,18 @@ def _drive_gdb(gdb: Path, exe, argv, stdin_file, cmds, *, ctx, timeout: int) -> 
 
 
 # gdb command block for a single-process fault capture.
-def _capture_cmds(stdin_file):
+def _capture_cmds(stdin_file, preload: str | None = None):
     # Arguments go on gdb's OWN command line via --args, not spliced into the `run` line:
     # that line is parsed as a gdb command, so a binary payload is mangled by quoting long
     # before execve ever sees it.
-    return [
+    pre = []
+    if preload:
+        # The crash was FOUND under the guard-page allocator (libdislocator); it is SILENT without
+        # one. Preload it into the inferior so the capture reproduces the same fault -- otherwise
+        # root_cause runs unguarded, sees no crash, and the provisional (maps-free) classification
+        # is never corrected. `set environment` seeds the child's env before `run`.
+        pre = [f"set environment LD_PRELOAD {preload}"]
+    return pre + [
         "set pagination off", "set confirm off", "set height 0", "set width 0",
         "set debuginfod enabled off",     # no network under --unshare-net; avoid the probe
         "run" + ((" < " + stdin_file) if stdin_file else ""),
@@ -94,10 +101,11 @@ def _capture_cmds(stdin_file):
     ]
 
 
-def run_gdb(gdb: Path, exe, argv, stdin_file, *, ctx=None, timeout: int = 30) -> dict:
+def run_gdb(gdb: Path, exe, argv, stdin_file, *, ctx=None, timeout: int = 30,
+            preload: str | None = None) -> dict:
     if stdin_file:                                     # absolute: the `run < file` redirect is
         stdin_file = str(Path(stdin_file).resolve())   # resolved before bwrap chdirs to /tmp
-    return _parse(_drive_gdb(gdb, exe, argv, stdin_file, _capture_cmds(stdin_file),
+    return _parse(_drive_gdb(gdb, exe, argv, stdin_file, _capture_cmds(stdin_file, preload),
                              ctx=ctx, timeout=timeout))
 
 
