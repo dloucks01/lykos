@@ -52,6 +52,24 @@ def worth_filing(value: str, is_gate: bool, caller: str | None) -> bool:
                 or _SECRET_KW.search(caller or ""))
 
 
+def _is_inherited_env(val: str) -> bool:
+    """True when `val` is an ambient ENVIRONMENT entry (NAME=VALUE matching this process's own
+    environ), not a constant baked into the target.
+
+    The probe captures the dynamic loader's / libc's strcmp against the inherited environment, and
+    those entries would otherwise be filed as the target's 'hard-coded' secret -- which both
+    FABRICATES findings and LEAKS the operator's own environment (home paths, SSH_AUTH_SOCK, tokens)
+    into the deliverable, an opsec problem on an engagement. The target inherits the operator's env,
+    so an exact `NAME == os.environ[NAME]` match is the ambient environment and never the binary's
+    own value (a genuine hard-coded `NAME=value` in the target would have to coincide exactly with a
+    variable the operator happens to have set to the same value -- implausible)."""
+    import os as _os
+    if "=" not in val:
+        return False
+    name, _, value = val.partition("=")
+    return bool(name) and _os.environ.get(name) == value
+
+
 def extract_stage(ctx) -> dict:
     target = TargetDAO(ctx.conn).get(ctx.target_id) if ctx.target_id else None
     if target is None:
@@ -122,6 +140,11 @@ def extract_stage(ctx) -> dict:
             cands = [(a0, False), (a1, False)]
         for val, is_gate in cands:
             if not _printable(val) or not (1 <= len(val) <= 128):
+                continue
+            if _is_inherited_env(val):
+                # The ambient environment the loader/libc compared, not the target's constant --
+                # excluded from both findings and the recovered inventory so the operator's own
+                # environment never reaches the report. See `_is_inherited_env`.
                 continue
             if val in seen:
                 continue
