@@ -304,14 +304,28 @@ done
 #   (d) MinGW Windows cross toolchain -- builds PE fixtures only (Wine still RUNS PE binaries)
 rm -rf "$TCU/lib/gcc/x86_64-w64-mingw32" "$TCU/x86_64-w64-mingw32" "$TCU/share/mingw-w64" 2>/dev/null || true
 find "$TCU/bin" -maxdepth 1 -name '*-w64-mingw32-*' -exec rm -f {} + 2>/dev/null || true
-#   (e) LLVM/clang -- only a FALLBACK compiler (native gcc preferred everywhere); nothing links it
-rm -rf "$TCU/lib/llvm-21" 2>/dev/null || true
-# LLVM/clang C++ dev HEADERS (compile-only). Do NOT touch the rest of usr/include -- the native
-# gcc needs the C headers to compile uploaded source.
+#   (e) LLVM/clang -- clang DRIVES the libFuzzer source-coverage lane (-fsanitize=fuzzer) and
+#   afl-clang-fast, so it is NOT optional and must survive. KEEP the clang driver, libLLVM.so (clang
+#   links it dynamically) and the clang resource dir (lib/clang/<v> -- the libFuzzer/ASan runtimes +
+#   builtin headers -fsanitize needs). Drop only what the analysis path never invokes: the standalone
+#   LLVM tools (lld/llc/opt/...), the giant static archives (clang links the .so, not the .a), and the
+#   compile-against-LLVM dev headers. (A stale earlier version rm -rf'd ALL of llvm-21, which silently
+#   removed the clang that had just been collected and left libFuzzer dead on the air-gapped laptop.)
+LLVM="$TCU/lib/llvm-21"
+if [ -d "$LLVM" ]; then
+  # giant static archives (libLLVM*.a / libclang*.a / libLTO*) -- keep the clang_rt sanitizer runtimes
+  find "$LLVM/lib" -maxdepth 1 -name '*.a' ! -name 'libclang_rt.*' -exec rm -f {} + 2>/dev/null || true
+  # standalone LLVM tools nothing in the analysis path runs; clang* + the sanitizer runtimes stay
+  find "$LLVM/bin" -maxdepth 1 -type f ! -name 'clang*' -exec rm -f {} + 2>/dev/null || true
+fi
+# LLVM/clang C++ DEV headers (compile-AGAINST-LLVM only). clang's OWN builtin headers live under
+# lib/clang/<v>/include and are NOT here, so dropping these does not affect compiling uploaded source.
 rm -rf "$TCU/include/llvm-21" "$TCU/include/clang" "$TCU/include/clang-c" \
        "$TCU/include/lld" "$TCU/include/lldb" "$TCU/include/mlir" "$TCU/include/polly" 2>/dev/null || true
-find "$TCU/lib/$NATIVE_TRIPLE" -maxdepth 1 \( -name 'libLLVM*' -o -name 'libclang*' \) -exec rm -f {} + 2>/dev/null || true
-find "$TCU/bin" -maxdepth 1 \( -name 'clang*' -o -name 'llvm*' -o -name 'llc' -o -name 'opt' \
+# static LLVM/clang archives in the native lib dir (keep libLLVM.so* / libclang.so* -- clang needs them)
+find "$TCU/lib/$NATIVE_TRIPLE" -maxdepth 1 \( -name 'libLLVM*.a' -o -name 'libclang*.a' \) -exec rm -f {} + 2>/dev/null || true
+# standalone LLVM/lld tools from usr/bin, but KEEP clang* (the libFuzzer / afl-clang-fast driver)
+find "$TCU/bin" -maxdepth 1 \( -name 'llvm*' -o -name 'llc' -o -name 'opt' \
   -o -name 'lli' -o -name 'ld.lld' -o -name 'lld*' -o -name 'wasm-ld' \) -exec rm -f {} + 2>/dev/null || true
 #   (f) Node.js -- only the `make gui` JS test harness uses it; the web console is served by the
 #       Python API from static files. Nothing in the analysis path runs node.

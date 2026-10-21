@@ -4,7 +4,7 @@ PY ?= python3
 CORPUS_BUDGET ?= 600
 export PYTHONPATH := core
 
-.PHONY: doctor toolchain-bundle engines repo-tarball test coverage lint typecheck gui ci bundle verify eval eval-gate benchmark arch-gate real-gate conformance conformance-smoke corpus-gate corpus-regression dashboard release clean help
+.PHONY: doctor toolchain-bundle engines repo-tarball test coverage lint typecheck gui ci bundle verify verify-e2e eval eval-gate benchmark arch-gate real-gate conformance conformance-smoke corpus-gate corpus-regression dashboard release clean help
 
 help:
 	@echo "run the app with ./start (UI) and ./lykos (CLI); build the air-gap package with ./package"
@@ -103,6 +103,13 @@ bundle:
 
 verify: bundle
 	bash packaging/verify.sh
+
+# Offline END-TO-END capability gate: in a cold, tool-less, network-less Kali container, exercise
+# EVERY analysis/weaponization lane from the bundle alone and drive a vulnerable ELF to a verified
+# L3 PoC. Fails if any lane is present-but-broken -- the net that catches the "only static findings"
+# air-gap failure. Needs podman/docker + an offline .tar.xz (make-runnable). See packaging/test-offline-e2e.sh.
+verify-e2e:
+	bash packaging/test-offline-e2e.sh
 
 eval:
 	$(PY) -m lykos eval --out eval-report.json
