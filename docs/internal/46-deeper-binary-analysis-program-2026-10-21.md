@@ -162,3 +162,28 @@ Order: start with #1 (most code-grounded), then #2 (highest real-engagement valu
   e.g. Asterisk 22.5.2 -> its SIP CVEs -- even stripped, no banner).
 - **AGREED NEXT after #2: upgrade the taint engine to a memory/points-to model** (unblocks #1-static
   for buffer-content injections -- the daemon-parser class).
+
+### Engine-extension design (scoped 2026-10-21, ready to build as a FOCUSED effort)
+
+`taint.py` is NOT memory-blind: it already taints STACK SLOTS (STORE/LOAD of a value into/out of a
+`[base+const]` frame slot, kill-on-overwrite, line ~321/341) and HEAP REGIONS (a tainted STORE
+through a known heap-pointer slot taints `("hmem",base,off)`, and a LOAD from it comes back tainted;
+`_region_slots`/`heap_regions`). The precise gap is the DAEMON-PARSER shape: a buffer received via a
+POINTER PARAMETER (`handle(char *buf, size_t n)`), whose bytes live in the caller/heap -- the callee
+has no frame slot for them, so its `*buf` LOADs are not resolved to a tracked region and taint stops.
+
+EXTENSION (mirror the heap-region machinery, do not invent a new one):
+1. a new seed kind -- "param i points to ATTACKER-CONTROLLED memory" (a buffer-pointer seed), seeded
+   for the ranked parser entry functions (T1) and for the direct SOURCES whose out-buffer is a
+   pointer (`fread(buf,..)`, `recv(buf,..)`);
+2. register that pointer as a tainted region (like a heap region), so a LOAD through it -- and
+   through pointer arithmetic derived from it (`_origins` already spans PTRADD/PTRSUB/COPY) -- returns
+   taint;
+3. propagate the buffer-pointer-taint across the inter-procedural fixpoint (a tainted buffer passed
+   to a callee seeds the callee's corresponding param as a buffer-pointer).
+
+PRECISION IS THE WHOLE RISK: over-tainting fabricates injection findings. Guards: keep it as
+CONSERVATIVE as the heap-region path (only seeded/known buffer pointers, not any pointer); gate it
+behind a param so it can be A/B'd; and hold the FULL conformance suite green (a spurious injection on
+any existing case = over-taint, fail). Validate it CONFIRMS a stack/pointer-buffer parser injection a
+register-only run misses. This is a focused build, not a marathon-tail edit.
