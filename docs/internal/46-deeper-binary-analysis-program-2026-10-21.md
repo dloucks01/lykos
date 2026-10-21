@@ -143,3 +143,22 @@ demonstrated ZERO. Closing that is the work. Avenues, most-grounded first:
    `pop rdi; ret` gadget that provably EXISTS (fp2) -- `build_exploit` / `rop.find_gadget` under-finds.
 
 Order: start with #1 (most code-grounded), then #2 (highest real-engagement value), then #3-#5.
+
+### Update (2026-10-21, after investigation)
+
+- **#1 static dataflow is WALLED by a fundamental engine limit.** `taint.py` is register-granularity
+  by its own docstring -- "no precise memory/points-to model, so buffer taint via pointer args is
+  not tracked." So it catches register-level flows (`system(getenv(x))`) but NOT the daemon-parser
+  case (`recv(buf); popen(cmd_built_from_buf)`), and seeding a buffer POINTER would not taint the
+  bytes. Confirming daemon-parser injections statically needs a MEMORY/POINTS-TO taint model -- a
+  major engine upgrade (operator steer: do this AFTER #2). The dynamic routes (T2 harness, concolic)
+  model memory and are the near-term way to reach these.
+- **#2 N-day -- FIRST INCREMENT DONE.** `cve_scan` now also scans the target's DT_NEEDED DEPENDENCY
+  libraries (companions or `LYKOS_QEMU_SYSROOT`) -- a dynamically-linked binary's component versions
+  live in `libssl.so`/`libxml2.so`/... , not the main binary -- and emits the DT_NEEDED soname BOM
+  (the component surface, present even when stripped). Measured on asterisk: 16-soname BOM, and
+  `libcrypto.so.3` -> OpenSSL 3.5.5 -> 27 CVEs, which the main-binary scan found zero of. NEXT for
+  #2: function-level structural fingerprinting (identify the product version of the MAIN binary --
+  e.g. Asterisk 22.5.2 -> its SIP CVEs -- even stripped, no banner).
+- **AGREED NEXT after #2: upgrade the taint engine to a memory/points-to model** (unblocks #1-static
+  for buffer-content injections -- the daemon-parser class).
