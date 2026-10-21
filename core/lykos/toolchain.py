@@ -441,10 +441,18 @@ TOOLS: tuple = (
 )
 
 
-def survey() -> list:
-    """[(Tool, found_str_or_None)] for this host, in declaration order."""
+def survey(progress=None) -> list:
+    """[(Tool, found_str_or_None)] for this host, in declaration order. `progress(tool)`, when
+    given, is called BEFORE each probe -- several probes spawn subprocesses with multi-second
+    timeouts (rizin/gdb/clang/java/wine/qemu), so a caller can show which one is running instead of
+    appearing to hang."""
     out = []
     for t in TOOLS:
+        if progress is not None:
+            try:
+                progress(t)
+            except Exception:                           # noqa: BLE001 -- progress must never fail a probe
+                pass
         try:
             got = t.probe()
         except Exception as e:                          # noqa: BLE001
@@ -495,9 +503,10 @@ def bundle_paths() -> list:
     return out
 
 
-def report(*, verbose: bool = False) -> str:
-    """A human-readable capability report for this host."""
-    rows = survey()
+def report(*, verbose: bool = False, rows=None) -> str:
+    """A human-readable capability report for this host. Pass `rows` from a prior `survey()` to
+    format without re-probing (so a streaming caller probes once)."""
+    rows = survey() if rows is None else rows
     width = max(len(t.title) for t, _ in rows)
     lines: list = []
     by_tier: dict = {"required": [], "recommended": [], "optional": []}

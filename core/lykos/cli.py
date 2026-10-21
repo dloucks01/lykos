@@ -754,7 +754,23 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
         print(json.dumps(toolchain.as_dict(), indent=2))
     else:
         print(vendorenv.status_line())
-        print(toolchain.report(verbose=args.verbose))
+        # Probe with a live indicator: several probes spawn subprocesses with multi-second timeouts,
+        # so the whole report used to appear only after many seconds of silence -- indistinguishable
+        # from a hang, worse right after the first-run relink. Stream which tool is being probed
+        # (overwritten in place), then print the full grouped report from the same single survey.
+        _tty = sys.stdout.isatty()
+
+        def _progress(t):
+            if _tty:
+                sys.stdout.write(f"\r  probing {t.title:<40}")
+            else:
+                sys.stdout.write(f"  probing {t.title}...\n")
+            sys.stdout.flush()
+        rows = toolchain.survey(progress=_progress)
+        if _tty:
+            sys.stdout.write("\r" + " " * 52 + "\r")     # clear the progress line
+            sys.stdout.flush()
+        print(toolchain.report(verbose=args.verbose, rows=rows))
     if args.strict:
         return 1 if toolchain.missing("required") else 0
     return 0
