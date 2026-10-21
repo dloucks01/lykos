@@ -65,11 +65,17 @@ MODELS: dict[str, ArchModel] = {
     # PowerPC 32-bit (ELF32, big-endian) -- the first 32-bit big-endian model (word=4). Its first
     # argument register is r3, and its link register is lr (saved on the stack).
     "ppc": ArchModel("ppc", 4, "big", "r3", "r3", "PowerPC32", "ppc32-ret2libc"),
+    # SuperH SH-4 (ELF32, little-endian by default; sh4eb is big) -- 16-bit fixed instructions and a
+    # link register PR, not a stack-popped return. Its first argument register is r4 (args r4-r7).
+    # The default row is little-endian (the sh4-linux-gnu toolchain); the sh4 candidate generator
+    # packs addresses in the TARGET's byte order, so a big-endian sh4eb target is handled too.
+    "sh": ArchModel("sh", 4, "little", "r4", "r4", "SuperH SH-4", "sh4-ret2libc"),
 }
 
 #: arch aliases that map onto a MODELS key (mirrors the arch gates in exploit_stage).
 _ALIASES = {"arm64": "aarch64", "riscv": "riscv64", "ppc64le": "ppc64", "powerpc64": "ppc64",
-            "loongarch64": "loongarch", "s390x": "s390", "powerpc": "ppc"}
+            "loongarch64": "loongarch", "s390x": "s390", "powerpc": "ppc",
+            "sh4": "sh", "sh4eb": "sh", "superh": "sh"}
 
 
 def model_for(arch: Optional[str]) -> Optional[ArchModel]:

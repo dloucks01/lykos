@@ -1278,6 +1278,60 @@ def find_br_gadgets_s390x(data: bytes):
     return out
 
 
+# ---------------------------------------------------------------- SuperH SH-4 ret2libc gadgets
+# SH-4 callee-saved GPRs are r8..r14 (r15 is the stack pointer) -- the registers a function epilogue
+# restores from its frame with `mov.l @r15+,rN`, hence the ones a stack overflow of that frame can
+# control. r4..r7 (the argument registers) are caller-saved, so the epilogue does NOT restore r4:
+# the first argument must be set by a caller GADGET, not by the loader frame as on s390x/ppc.
+_SH_CALLEE = set(range(8, 15))
+
+
+def _sh_decode(w: int):
+    """Decode the SuperH SH-4 instructions a ret2libc caller cares about, from one 16-bit word.
+    Returns (op, a, b) or None: `mov` a=Rn(dest)/b=Rm(src); `jsr`/`jmp` a=Rn(branch-target reg)/b=0.
+    SH-4 is fixed 16-bit; host objdump CAN disassemble it, but the decode is tiny and keeps the finder
+    self-contained + endian-parameterized. Encodings (verified against sh4-linux-gnu-objdump bytes,
+    e.g. `a3 64`=`mov r10,r4`, `0b 4a`=`jsr @r10`): mov Rm,Rn = 0110nnnnmmmm0011 (0x6..3);
+    jsr @Rn = 0100nnnn00001011 (0x4n0b); jmp @Rn = 0100nnnn00101011 (0x4n2b)."""
+    if (w & 0xF00F) == 0x6003:                           # mov Rm, Rn
+        return ("mov", (w >> 8) & 0xF, (w >> 4) & 0xF)
+    if (w & 0xF0FF) == 0x400B:                           # jsr @Rn (call; saves return in PR)
+        return ("jsr", (w >> 8) & 0xF, 0)
+    if (w & 0xF0FF) == 0x402B:                           # jmp @Rn (branch; leaves PR untouched)
+        return ("jmp", (w >> 8) & 0xF, 0)
+    return None
+
+
+def find_sh4_r2libc_gadgets(data: bytes, endian: str = "little") -> dict:
+    """SuperH SH-4 caller gadgets for ret2libc: a register branch `(jsr|jmp) @rB` whose DELAY SLOT is
+    `mov rS,r4` -- so entering at the branch sets the first argument r4=rS and then jumps to rB.
+
+    SH-4 branches are delayed: the instruction after `(jsr|jmp) @rB` executes before control transfers.
+    A gadget `jsr @rB ; mov rS,r4` therefore sets r4 from rS and calls rB in one shot. The vulnerable
+    frame's own epilogue (`mov.l @r15+,rN` restoring r8..r14, then `lds.l @r15+,pr ; rts`) is the
+    loader: it reloads the callee-saved regs AND PR off the overflow, so pointing PR at this gadget
+    with rS=&"/bin/sh" and rB=&system gives system("/bin/sh"). WHICH buffer offset controls PR and each
+    GPR is discovered at runtime by a tagged detonation (as for s390x/ppc), so this returns only the
+    callers. Only src/br in the callee-saved set (r8..r14) are kept -- a volatile register cannot be
+    controlled by the overflow. Returns {"callers":[{va,src,br}]} (register numbers). `endian` is the
+    target's byte order (sh4 little, sh4eb big)."""
+    order = "big" if endian == "big" else "little"
+    callers = []
+    for off, sz, va, flags in _loads(data):
+        if not (flags & 1):
+            continue
+        p, end = off, off + sz
+        while p + 4 <= end:                              # need the branch AND its delay slot
+            br = _sh_decode(int.from_bytes(data[p:p + 2], order))
+            if br and br[0] in ("jsr", "jmp") and br[1] in _SH_CALLEE:
+                dly = _sh_decode(int.from_bytes(data[p + 2:p + 4], order))
+                if dly and dly[0] == "mov" and dly[1] == 4 and dly[2] in _SH_CALLEE \
+                        and dly[2] != br[1]:             # mov rS,r4 in the delay slot, S != branch reg
+                    callers.append({"va": va + (p - off), "src": dly[2], "br": br[1]})
+            p += 2
+    return {"callers": callers}
+
+
 # ---------------------------------------------------------------- PowerPC64 (ELFv2) ret2libc gadgets
 # PPC64 callee-saved GPRs are r14..r31 -- the registers a function epilogue restores from its frame,
 # hence the ones a stack overflow of that frame can control.

@@ -80,7 +80,7 @@ of `/bin/sh`). execve-syscall / mprotect-ROP would be reachable only through gen
 (JOP/COP, stack pivots to a leaked buffer, SROP where a sigreturn exists) — a research track, scoped
 exactly as `docs/overview.md` already scopes L3 ("frontier research, best-effort, scoped").
 
-**Net:** the strongest *bounded* cross-arch weaponization is the shipped ret2libc (NX-on, 8 arches) +
+**Net:** the strongest *bounded* cross-arch weaponization is the shipped ret2libc (NX-on, 9 arches) +
 execstack ret2shellcode (NX-off, 7 arches). A's syscall-ROP is not a bounded deliverable on the RISC
 targets and is left as documented research.
 

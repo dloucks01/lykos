@@ -64,8 +64,8 @@ live shell / marker / breakpoint, never asserted.
 
 ## Part B — Cross-arch ELF depth program (the focus)
 
-> **Status (updated 2026-10-19):** M1 (the `ArchModel` abstraction) is built; ret2libc L3 now spans
-> **8 arches** (x86-64/aarch64/arm32/riscv64/ppc64le + **loongarch64/s390x/ppc32-BE**) and execstack
+> **Status (updated 2026-10-21):** M1 (the `ArchModel` abstraction) is built; ret2libc L3 now spans
+> **9 arches** (x86-64/aarch64/arm32/riscv64/ppc64le + **loongarch64/s390x/ppc32-BE/sh4**) and execstack
 > ret2shellcode **7 arches**. See `coverage.md` (cross-arch section) and
 > `42-strategy-expansion-2026-10-19.md` for the measured outcome, including why multi-register
 > syscall-ROP (#1/#3 below, NX-on) is gadget-blocked on the RISC arches.
@@ -87,7 +87,7 @@ code [observed]. "RCE L3" = a shell/execve demonstrated, i.e. the rungs above re
 | ppc (32, BE) | ✓ | ✓ | hand | ✓ | ✓ | ✓ | ✗ | gadget model (BE/ELFv1) |
 | ppc64 (BE) | ✓ | ✓ | hand | ✓ | ✓ | ✓ | ✗ | LE-only gate (`exploit_stage.py:638`) + ELFv1 descriptors/TOC |
 | s390x | ✓ | ✓ | hand | ✓ | ✓ | ✓ | ✗ | gadget model (BE, r14 link reg) |
-| sh4 | ✓ | ✓ | hand | ✓ | ✓ | ✓ | ✗ | gadget model |
+| sh4 | ✓ | ✓ | hand | ✓ | ✓ | ✓ | ✓ ret2libc | deeper rungs; arg reg r4 is caller-saved (caller gadget sets it) |
 | loongarch64 | ✓ | ✓ | derived | ✓ | ✓ | ✓ | ✗ | gadget model |
 | m68k | ✓ | ✓ | derived | **✗** | ✓ | ✓ | ✗ | not in `_ARG_REGS`; stack-arg ROP model |
 | sparc64 (v9) | ✓ | ✓ | derived | ✓ | ✓ | **✗ (L1)** | ✗ | **architectural** — register windows |

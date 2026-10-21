@@ -10,7 +10,16 @@ from lykos.analyze.poc import archmodel
 
 
 def test_registry_covers_the_shipped_arches():
-    assert set(archmodel.MODELS) == {"aarch64", "arm", "riscv64", "ppc64", "loongarch", "s390", "ppc"}
+    assert set(archmodel.MODELS) == {"aarch64", "arm", "riscv64", "ppc64", "loongarch", "s390",
+                                     "ppc", "sh"}
+
+
+def test_sh4_is_32bit_little_endian_with_r4_arg():
+    m = archmodel.model_for("sh")
+    assert m is archmodel.model_for("sh4") and m.word == 4 and m.endian == "little"
+    assert m.arg0_reg == "r4" and m.slug == "sh4-ret2libc"
+    assert m.pack(0x400a3c) == b"\x3c\x0a\x40\x00"                    # 4-byte little-endian address
+    assert archmodel.model_for("sh4eb") is m and archmodel.model_for("superh") is m
 
 
 def test_ppc32_is_32bit_big_endian():

@@ -24,6 +24,8 @@ _SZ_GCC = shutil.which("s390x-linux-gnu-gcc")
 _SZ_QEMU = shutil.which("qemu-s390x") or shutil.which("qemu-s390x-static")
 _PPC32_GCC = shutil.which("powerpc-linux-gnu-gcc")
 _PPC32_QEMU = shutil.which("qemu-ppc") or shutil.which("qemu-ppc-static")
+_SH_GCC = shutil.which("sh4-linux-gnu-gcc")
+_SH_QEMU = shutil.which("qemu-sh4") or shutil.which("qemu-sh4-static")
 
 
 def _one_seg(seg, va=0x10000):
@@ -151,6 +153,31 @@ def test_find_s390x_gadgets_decodes_lgr_r2_then_branch():
     assert len(g["callers"]) == 2                        # the lgr %r3 pair is correctly excluded
 
 
+def test_find_sh4_gadgets_decodes_delay_slot_caller():
+    """The SH-4 scanner finds `(jsr|jmp) @rB` whose DELAY SLOT is `mov rS,r4`, recording src=S and
+    br=B only when both are callee-saved (r8..r14) and distinct. A volatile branch register (r3) or a
+    src==br pair is not a usable gadget. 16-bit fixed encoding, verified against sh4-linux-gnu-objdump
+    bytes (e.g. `a3 64`=`mov r10,r4`, `0b 4a`=`jsr @r10`)."""
+    seg = b""
+    seg += struct.pack("<H", 0x490B)   # jsr @r9
+    seg += struct.pack("<H", 0x6483)   #   mov r8,r4   (delay slot)  -> caller (src=8, br=9)
+    seg += struct.pack("<H", 0x4A2B)   # jmp @r10
+    seg += struct.pack("<H", 0x64B3)   #   mov r11,r4  (delay slot)  -> caller (src=11, br=10)
+    seg += struct.pack("<H", 0x430B)   # jsr @r3  (volatile branch reg)
+    seg += struct.pack("<H", 0x6483)   #   mov r8,r4                 -> NOT a caller (r3 not callee-saved)
+    seg += struct.pack("<H", 0x490B)   # jsr @r9
+    seg += struct.pack("<H", 0x6493)   #   mov r9,r4                 -> NOT a caller (src==br)
+    orig = rop._loads
+    rop._loads = lambda data: [(0, len(seg), 0x400000, 1)]
+    try:
+        g = rop.find_sh4_r2libc_gadgets(seg)
+    finally:
+        rop._loads = orig
+    pairs = {(c["src"], c["br"]) for c in g["callers"]}
+    assert (8, 9) in pairs and (11, 10) in pairs
+    assert len(g["callers"]) == 2                        # volatile-reg and src==br cases excluded
+
+
 def test_find_ppc_gadgets_be_clean_selection():
     """The PowerPC finder in big-endian/clean mode accepts `mtctr rC ; mr r3,rT ; bctr` with both
     callee-saved, and REJECTS a tail where an instruction between `mr r3` and bctr clobbers r3
@@ -241,6 +268,17 @@ def test_auto_files_l3_ppc32_ret2libc(store, tmp_path):
     confirmed by a spawned shell under qemu-user + a negative control. The first 32-bit big-endian
     ISA through the archmodel abstraction (4-byte-slot tag discovery + clean PPC gadget selection)."""
     _run_cross_e2e(store, tmp_path, _PPC32_GCC, "ppc", "ppc32-ret2libc")
+
+
+@pytest.mark.skipif(not (_SH_GCC and _SH_QEMU), reason="needs sh4-linux-gnu-gcc + qemu-sh4")
+def test_auto_files_l3_sh4_ret2libc(store, tmp_path):
+    """strategy=auto drives an NX-on SuperH SH-4 (ELF32, little-endian) overflow to a confirmed L3
+    ret2libc: the vulnerable frame's epilogue restores the callee-saved GPRs + the saved PR, pointed
+    at a `(jsr|jmp) @rB ; mov rS,r4` caller (the arg register r4 is set in the branch DELAY SLOT) ->
+    system("/bin/sh"); confirmed by a spawned shell under qemu-user + a negative control. SH-4 is the
+    first 16-bit-fixed-instruction ISA through the archmodel abstraction, and the first whose argument
+    register is caller-saved -- so a caller gadget sets the argument, not the loader frame."""
+    _run_cross_e2e(store, tmp_path, _SH_GCC, "sh", "sh4-ret2libc")
 
 
 # A vulnerable program whose `vuln` keeps several values live ACROSS the overflowing read(), forcing

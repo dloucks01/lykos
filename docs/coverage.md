@@ -143,7 +143,10 @@ big-endian target -- link register r14, saved on the stack) and **PowerPC 32-bit
 bringing NX-on ret2libc to **eight** arches (x86-64, aarch64, arm32, riscv64, ppc64le, loongarch64,
 s390x, ppc32). s390x required making the tagged-offset discovery endianness-aware; ppc32 required a
 4-byte tag and a *clean* PPC gadget selector (reject a `mtctr/mr r3/bctr` tail that clobbers r3,
-common on ppc32). **PPC64 big-endian (ELFv1) stays blocked**: the installed glibc has no clean
+common on ppc32). **SuperH SH-4 (2026-10-21) makes nine**: the first 16-bit-fixed-instruction ISA and
+the first whose argument register (r4) is CALLER-saved, so the loader frame cannot set it -- PR is
+pointed at a `(jsr|jmp) @rB ; mov rS,r4` caller that sets r4 in the branch DELAY SLOT. **PPC64
+big-endian (ELFv1) stays blocked**: the installed glibc has no clean
 one-shot `mtctr rC; mr r3,rT; bctr` caller with both registers callee-saved.
 
 **Execstack ret2shellcode (NX-off) now spans seven arches (2026-10-19):** x86-64, aarch64, arm,
