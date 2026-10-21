@@ -140,6 +140,12 @@ def _probe_afl():
     return str(p) if p else None
 
 
+def _probe_clang():
+    # clang drives the libFuzzer source-coverage lane (-fsanitize=fuzzer) and afl-clang-fast. The
+    # bundle historically omitted it, so that lane silently vanished on the air-gapped laptop.
+    return _v("clang", "--version")
+
+
 def _probe_afl_qemu():
     """Which GUESTS the available afl-qemu-trace binaries emulate.
 
@@ -360,6 +366,12 @@ TOOLS: tuple = (
          "make eval-gate / real-gate skip; analysis of supplied binaries is unaffected",
          "apt-get install build-essential", _probe_cc, tier="recommended",
          apt=("build-essential",)),
+    Tool("clang", "clang + libFuzzer/ASan runtime",
+         "coverage_fuzz of SOURCE via libFuzzer (-fsanitize=fuzzer) and afl-clang-fast instrumentation",
+         "libFuzzer source-coverage is unavailable (afl qemu-mode for binaries + afl-gcc-fast for "
+         "source remain); this gap shipped silently in earlier bundles",
+         "apt-get install clang libclang-rt-dev", _probe_clang, tier="optional",
+         apt=("clang", "libclang-rt-dev")),
     Tool("afl", "AFL++", "coverage_fuzz (fork-server, coverage-guided)",
          "black-box fuzz only -- measured ~40x slower on ARM",
          "apt-get install afl++", _probe_afl, tier="optional", apt=("afl++",)),

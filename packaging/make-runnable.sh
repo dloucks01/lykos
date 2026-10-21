@@ -98,6 +98,21 @@ for av in "$V"/angr-venv; do
       echo "  WARNING: angr venv lacks claripy and it could not be installed -- concolic (angr) will be unavailable"
     fi
   fi
+  # SAFETY NET #2: angr ships its own native unicorn engine (unicornlib.so) but lists `unicorn` as an
+  # OPTIONAL `[unicorn]` extra, so a venv built with plain `pip install angr` has NO unicorn and angr
+  # logs "failed loading unicornlib.so, unicorn support disabled" -- it then runs PURE-SYMBOLIC,
+  # losing the fast concrete-execution engine, so concolic explores less under an engagement budget
+  # and can MISS reachable bugs (observed on a real engagement: angr_driver reported unicorn could
+  # not work). The matching unicorn is ALREADY in the bundle's unicorn-venv at the SAME Python ABI,
+  # so copy it into the angr venv -- no network, no compile, no relink. A no-op when already present.
+  usp="$(ls -d "$V"/unicorn-venv/lib/python*/site-packages 2>/dev/null | head -1)"
+  if [ ! -d "$sp/unicorn" ] && [ -n "$usp" ] && [ -d "$usp/unicorn" ]; then
+    if cp -a "$usp/unicorn" "$usp"/unicorn-*.dist-info "$sp/" 2>/dev/null; then
+      echo "  angr venv: injected unicorn from unicorn-venv (angr's unicorn engine)"
+    else
+      echo "  WARNING: angr venv lacks unicorn and it could not be injected -- angr runs WITHOUT its fast unicorn engine (concolic slower, explores less)"
+    fi
+  fi
 done
 # vendored Python site (pypcode) -> vendor/pysite (lykos puts it on sys.path)
 [ -d "$BUN/pysite" ] && [ -n "$(ls -A "$BUN/pysite" 2>/dev/null)" ] && cp -a "$BUN/pysite" "$V/pysite"
@@ -197,6 +212,29 @@ if [ -d "$UVENV" ]; then
     echo "           firmware rehosting will be UNAVAILABLE on the target. The unicorn-venv compiled" >&2
     echo "           extension is ABI-locked to one Python minor; the vendored interpreter ($PYV) must" >&2
     echo "           match the Python the venv was built with -- rebuild the toolchain bundle on Python $PYV." >&2
+  fi
+fi
+# angr-unicorn-engine smoke-test: after the injection above, angr's native unicornlib.so must
+# actually bind to a usable `unicorn`, or concolic silently drops to pure-symbolic -- the exact
+# engagement failure. Import angr under the vendored interpreter with the angr venv on PYTHONPATH and
+# FAIL the build if angr reports its unicorn engine disabled: this gap must not ship silently again.
+AVENV="$V/angr-venv"
+if [ -d "$AVENV" ]; then
+  asp="$(ls -d "$AVENV"/lib/python*/site-packages 2>/dev/null | head -1)"
+  if [ -n "$asp" ]; then
+    alog="$(env -i HOME=/tmp PATH=/usr/bin:/bin PYTHONPATH="$asp" "$TUB/python$PYV" \
+            -c 'import angr' 2>&1 || true)"
+    if printf '%s' "$alog" | grep -qi 'unicorn support disabled\|failed loading .*unicornlib'; then
+      echo "  WARNING: angr's unicorn engine did NOT load under the vendored Python -- concolic would" >&2
+      echo "           run PURE-SYMBOLIC (slower, explores less under budget: the engagement bug). The" >&2
+      echo "           unicorn injection above should have placed unicorn==(angr's pin) in vendor/angr-venv." >&2
+      echo "           angr said: $(printf '%s' "$alog" | grep -i unicorn | head -1)" >&2
+    elif printf '%s' "$alog" | grep -qi 'Traceback\|ImportError\|ModuleNotFoundError'; then
+      echo "  WARNING: angr failed to import under the vendored Python (concolic unavailable):" >&2
+      printf '%s\n' "$alog" | tail -3 >&2
+    else
+      echo "  angr self-check OK: unicorn engine loads under the vendored Python $PYV"
+    fi
   fi
 fi
 printf '  vendored Python %s + stdlib (%s); venvs are repointed at RUN time by vendorenv\n' \

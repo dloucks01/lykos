@@ -77,18 +77,23 @@ fi
 # so a child exec'd WITHOUT LD_LIBRARY_PATH (cc1, collect2, ...) still resolves the bundle's libs.
 RPATH=""
 for d in "$TC"/usr/lib/*-linux-gnu "$TC"/usr/lib "$TC"/usr/local/lib "$TC"/lib/*-linux-gnu \
-         "$TC"/lib "$TC"/usr/lib64 "$TC"/lib64; do
+         "$TC"/lib "$TC"/usr/lib64 "$TC"/lib64 "$VENDOR"/symqemu; do
   [ -d "$d" ] || continue
   ad=$(CDPATH= cd -- "$d" && pwd)
   case ":$RPATH:" in *":$ad:"*) ;; *) RPATH="${RPATH:+$RPATH:}$ad" ;; esac
 done
+# symqemu is built SEPARATELY (build-symqemu.sh) and ships its OWN runtime lib (libSymCCRtShared.so)
+# beside its binary; it ALSO needs the toolchain's glib/pixman. Its dir is added to RPATH above so
+# the former resolves, and it is added to the walk below so symqemu-x86_64 + its .so get the full
+# bundle rpath -- without this, symqemu-x86_64 died offline with "libSymCCRtShared.so / libglib-2.0
+# cannot open shared object file" and symbolic-qemu was silently unavailable on the laptop.
 
 LDREAL=$(CDPATH= cd -- "$(dirname "$LD")" && pwd)/$(basename "$LD")
 mkdir -p "$TC/.relink"
 
 # the roots to walk: the toolchain tree always, plus any vendored python venvs / pysite present
 set -- "$TC"
-for extra in "$VENDOR"/*-venv "$VENDOR"/pysite; do
+for extra in "$VENDOR"/*-venv "$VENDOR"/pysite "$VENDOR"/symqemu; do
   [ -d "$extra" ] && set -- "$@" "$extra"
 done
 
