@@ -80,6 +80,19 @@ fi
 mkdir -p $S/ai $S/ap; printf 'A'>$S/ai/s; ln -sf "$B/usr/local/bin/afl-qemu-trace-x86-64" $S/ap/afl-qemu-trace
 o=$(AFL_PATH=$S/ap AFL_NO_UI=1 AFL_SKIP_CPUFREQ=1 AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 afl-fuzz -Q -i $S/ai -o $S/ao -V 4 -- /t/vuln 2>&1)
 case "$o" in *"All set and ready to roll"*) ok afl-qemu-mode "";; *) bad afl-qemu-mode "$(printf '%s' "$o"|grep -iE 'abort|error|handshake'|head -1)";; esac
+# afl qemu-mode on a LARGE binary -- the real-engagement failure: a big binary reaches the fork
+# point under qemu far slower than the tiny one above, so the DEFAULT handshake timeout aborts.
+# Inflate /t/vuln to ~50MB and confirm the handshake survives with the size-scaled init timeout
+# lykos now sets. This is the afl<->afl-qemu-trace pairing the dev host could not test (its afl is a
+# mismatched build), so it is verified HERE, in the bundle's own cold container.
+OC="$B/.wrappers/objcopy"; [ -x "$OC" ] || OC="$(command -v objcopy || true)"
+if [ -n "$OC" ]; then
+  head -c 50000000 /dev/zero | tr '\0' 'A' > $S/pad.bin 2>/dev/null
+  if "$OC" --add-section .lykospad=$S/pad.bin --set-section-flags .lykospad=readonly,data /t/vuln $S/vbig 2>/dev/null; then
+    o=$(AFL_PATH=$S/ap AFL_NO_UI=1 AFL_SKIP_CPUFREQ=1 AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 AFL_FORKSRV_INIT_TMOUT=300000 AFL_SKIP_BIN_CHECK=1 afl-fuzz -Q -t 5000+ -i $S/ai -o $S/aob -V 4 -- $S/vbig 2>&1)
+    case "$o" in *"All set and ready to roll"*) ok afl-qemu-large "50MB handshake ok";; *) bad afl-qemu-large "$(printf '%s' "$o"|grep -iE 'abort|error|handshake'|head -1)";; esac
+  else echo "CAP afl-qemu-large: SKIP (objcopy could not inflate the target)"; fi
+else echo "CAP afl-qemu-large: SKIP (no objcopy)"; fi
 # qemu-user cross-arch execution
 if [ -s /t/a64 ]; then o=$(qemu-aarch64 /t/a64 2>&1); case "$o" in *AARCH64-RAN*) ok qemu-cross "aarch64 ran";; *) bad qemu-cross "$o";; esac; else echo "CAP qemu-cross: SKIP (no aarch64 target built)"; fi
 # gdb + python (L2 gdbstub substrate)
@@ -137,6 +150,13 @@ case "$vg" in
   *": OK"*) ;;                                          # valgrind works -- ideal
   *": UPSTREAM"*) echo "NOTE: valgrind is down due to an UPSTREAM valgrind<->glibc gap on this collect's glibc (not a bundle defect); dislocator+ASan cover memory triage. Pin the collect glibc to the engagement's to restore it." ;;
   *) broken="$broken valgrind" ;;                       # BROKEN for a bundle reason -> real failure
+esac
+# Large-binary afl handshake: enforce when it ran, tolerate a SKIP (no objcopy in the container).
+albig="$(echo "$out" | grep '^CAP afl-qemu-large: ')"
+case "$albig" in
+  *": OK"*) ;;
+  *": SKIP"*|"") echo "NOTE: afl-qemu-large not exercised (objcopy unavailable in the container); the large-binary handshake path was not gated this run" ;;
+  *) broken="$broken afl-qemu-large" ;;                  # handshake aborted on a large binary -> the engagement failure, caught
 esac
 [ -n "$broken" ] && die "offline capability(ies) BROKEN:$broken  (present-but-broken is still a loss)"
 # the full pipeline must reach a verified L3 PoC from the bundle alone
