@@ -1655,10 +1655,11 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                 store.events.append("autopilot.large_binary", case_id=t.case_id, payload={
                     "target_id": t.id, "size_mb": round(size_mb, 1),
                     "mode": "huge" if size_mb >= _HUGE_BINARY_MB else "large",
-                    "note": ("structural analysis is budget-capped and (for a huge binary) "
-                             "whole-program symbolic execution is skipped; depth comes from "
-                             "coverage + directed fuzzing -- give it a large --budget (hours for "
-                             "a ~100MB binary).")})
+                    "note": ("every lane still runs -- nothing is skipped by size. The expensive "
+                             "ones are SCOPED to stay tractable: structural analysis prioritises the "
+                             "attack-surface functions and symbolic execution loads lib-free and "
+                             "explores from a bounded budget. Give it a large --budget (hours for a "
+                             "~100MB binary) so the scoped lanes have room.")})
             # A firmware image is not a program: carve it into its embedded binaries (each registered
             # as a sub-target) and analyse THOSE. Running native recovery on the raw blob finds nothing
             # and misses every component + secret.
@@ -1966,18 +1967,15 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
             # never reached -- exactly what concolic solves for.
             cov_pct = _best_block_pct(store, tid)
             want_concolic = not crashes or (cov_pct is not None and cov_pct < 60)
-            # Whole-program symbolic execution does not scale to a huge binary: angr loads the entire
-            # image (CLE) and OOMs/stalls, burning the budget the fuzzers could still spend. Skip it
-            # with a clear reason rather than letting it fail late -- the user saw exactly this as an
-            # angr TypeError on a large target. Large-but-not-huge still runs concolic.
-            if want_concolic and size_mb >= _HUGE_BINARY_MB:
-                store.events.append("concolic.skipped", case_id=t.case_id, payload={
-                    "target_id": tid, "size_mb": round(size_mb, 1),
-                    "reason": ("binary too large for whole-program symbolic execution (angr would "
-                               "OOM/stall); coverage + directed fuzzing carry the depth here")})
-                want_concolic = False
+            # Concolic runs REGARDLESS of size -- a large binary must not lose the symbolic-execution
+            # capability. It is kept tractable by SCOPING, not skipping: angr loads with
+            # auto_load_libs=False and explores from a bounded state/step budget, and on a large
+            # binary the orchestrator hands it the attack-surface targets rather than the whole image
+            # (see concolic's own large-binary handling). A longer slice on a large binary so the
+            # scoped exploration has room.
             if want_concolic:
-                _staged(bud, store, t, "concolic", status, stop, dyn, want=120.0)
+                _concolic_want = 240.0 if size_mb >= _LARGE_BINARY_MB else 120.0
+                _staged(bud, store, t, "concolic", status, stop, dyn, want=_concolic_want)
                 # Close the coverage loop: re-fuzz once more, now that directed_fuzz automatically
                 # reuses concolic's solved inputs as seeds -- so the fuzzer explores AROUND the
                 # guarded branches concolic just unlocked, instead of the run ending at them.

@@ -24,16 +24,25 @@ rather than a planted fixture. Reported symptoms, mapped to cause:
   timeout — all `setdefault`, so an operator's env still wins. (Not reproducible on the dev host:
   its `afl-fuzz`↔`afl-qemu-trace` are a mismatched build — the "host-qemu masking trap" from
   [[airgap-crossarch-qemu-fix]] — so this is verified in the bundle's cold-container gate, not here.)
-- **Large-binary mode** (`analyze/orchestrate.py`): a size flag (`_LARGE_BINARY_MB=40`,
-  `_HUGE_BINARY_MB=90`). Past LARGE, an `autopilot.large_binary` event tells the operator structural
-  analysis is capped and to give a big budget. Past HUGE, whole-program symbolic execution is
-  **skipped** (angr would OOM/stall) with a clear `concolic.skipped` event, so the budget goes to
-  the fuzzers instead. **[measured]** through the real Autopilot on inflated native ELFs:
-  - 45 MB (large): `large_binary` fired, 11 findings, planted overflow driven to **L2** (~180 s).
-  - 95 MB + vuln (huge): `large_binary` fired, planted overflow driven to **L2** (~200 s).
-  - 95 MB no-vuln (huge): `large_binary` + `concolic.skipped` fired; the doomed angr lane was
-    skipped. Even with afl-qemu down on the dev host, the directed-fuzz + crashless overflow-synth
-    path found and exploited the vuln — i.e. NOT a silent "static only".
+- **Large-binary mode** (`analyze/orchestrate.py`) — **purely additive; no lane is ever dropped by
+  size** (operator constraint: a large binary must lose NO capability). A size flag
+  (`_LARGE_BINARY_MB=40`, `_HUGE_BINARY_MB=90`) emits an `autopilot.large_binary` event and gives
+  the scoped lanes a longer slice + a size-scaled budget. The expensive lanes are kept tractable by
+  SCOPING, not skipping: concolic runs at every size (angr already loads `auto_load_libs=False` and
+  explores from a bounded state/step budget; measured below it handles a 95MB image in ~2s / 324MB),
+  and structural analysis prioritises the attack surface (doc 40 roadmap). An earlier revision
+  skipped concolic past HUGE — reverted, because skipping is degradation.
+  **[measured]** through the real Autopilot on inflated native ELFs:
+  - 45 MB & 95 MB: `large_binary` fired, 11 findings each, planted overflow driven to **L2**
+    (~180–200 s) — even with afl-qemu down on the dev host (directed-fuzz + crashless
+    overflow-synth carried it), i.e. NOT a silent "static only".
+  - angr_driver on the 95 MB binary: ok, 1 input generated, 324MB RSS, 2.0s — large binaries do
+    NOT need the symbolic lane skipped.
+- **Concolic resilience** (`symbolic/angr_driver.py`): the stdin `SimFile` model varies by angr
+  version — a plain `SimFile` as `stdin=` raised "can't handle sim file" (TypeError) on the bundle's
+  angr and took the whole lane down. Now it falls back SimFile → SimFileStream → default symbolic
+  stdin, so a version/model quirk degrades the binding at worst, never the lane. Verified the
+  primary path is unchanged on angr 9.2.217 (95MB + small binary both still generate inputs).
 
 **Build-time (packaging):**
 

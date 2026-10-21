@@ -106,6 +106,25 @@ def main(spec_path, out_path):
         symbytes = claripy.BVS("lykos_input", 8 * size)
         extras = {angr.options.LAZY_SOLVES}
 
+        def _stdin_state():
+            # The stdin SimFile model varies across angr versions -- a plain `SimFile` passed as
+            # `stdin=` raised a TypeError ("can't handle sim file") on one bundle's angr, which took
+            # the whole concolic lane down for that target. Try the SimFile, then a SimFileStream,
+            # then a plain state with angr's own default symbolic stdin. The capability is preserved
+            # (exploration still runs); only the explicit input binding is given up in the last
+            # fallback, and `preconstrain` is already guarded. A lane that degrades beats a lane that
+            # disappears.
+            try:
+                sf = angr.SimFile("stdin", content=symbytes, size=size)
+                return proj.factory.full_init_state(stdin=sf, add_options=extras)
+            except Exception:                                # noqa: BLE001
+                pass
+            try:
+                sfs = angr.SimFileStream(name="stdin", content=symbytes, size=size)
+                return proj.factory.full_init_state(stdin=sfs, add_options=extras)
+            except Exception:                                # noqa: BLE001
+                return proj.factory.full_init_state(add_options=extras)
+
         def make_state(preconstrain=None):
             if mode == "arg":
                 st = proj.factory.full_init_state(
@@ -116,8 +135,7 @@ def main(spec_path, out_path):
                     args=[binary, "/lykos_input"], add_options=extras)
                 st.fs.insert("/lykos_input", sf)
             else:                                            # stdin
-                sf = angr.SimFile("stdin", content=symbytes, size=size)
-                st = proj.factory.full_init_state(stdin=sf, add_options=extras)
+                st = _stdin_state()
             if preconstrain is not None:
                 try:
                     for i, byte in enumerate(preconstrain[:size]):
