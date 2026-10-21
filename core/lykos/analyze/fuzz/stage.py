@@ -1529,6 +1529,21 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
                      "any input (ptrace may be unavailable in this sandbox); the campaign fell "
                      "back to output-shape novelty. This is not a clean 'no crashes' result -- "
                      "coverage-guided search did not run.")})
+    # A campaign that RAN plenty but never got past the program's front gate (many execs, one
+    # behaviour, no coverage, no crash) is almost always the target refusing the input before it
+    # parses it: it needs a config/data file, specific arguments, or a working directory it cannot
+    # find. Say so, with the remedy -- the operator watched it run for half an hour and a bare
+    # "starved" tells them nothing actionable.
+    starved_reason = None
+    if starved and execs >= 200 and not entered and crashes == 0:
+        starved_reason = (
+            "the target executed but never varied its behaviour or reached new code -- it is "
+            "bailing out before it parses the input. That usually means it needs a config/data "
+            "file, command-line arguments, or a specific working directory it cannot find. Provide "
+            "its runtime files by ingesting the binary as a DIRECTORY that contains them (they are "
+            "staged beside it), and verify `./target < input` runs normally by hand first.")
+        ctx.emit(f"{event_prefix}.noprogress", payload={"execs": execs, "note": starved_reason})
+    stats["starved_reason"] = starved_reason
     # Uninitialized-read pass (CWE-457): detonate the corpus we just built against the MSan binary.
     # This is the RIGHT place for source targets -- they compile to an ASan build that coverage_fuzz
     # skips, so they are fuzzed here, and the corpus is the only place uninitialized reads surface.

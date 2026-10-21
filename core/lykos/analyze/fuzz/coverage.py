@@ -424,6 +424,21 @@ def coverage_stage(ctx) -> dict:
                      "this target, or each execution may be hitting the timeout. A clean "
                      "'0 crashes' from a campaign that never ran says nothing about the "
                      "binary.")})
+    else:
+        # Ran plenty but covered almost no edges and found nothing: the target is bailing before
+        # it parses the input -- the classic "it needs a config/data file, arguments, or a working
+        # directory" case. A clean '0 crashes' here says nothing about the binary, so say why.
+        _execs = int(stats["execs_done"]) if stats.get("execs_done", "").isdigit() else 0
+        _edges = int(stats["edges_found"]) if stats.get("edges_found", "").isdigit() else None
+        if _execs >= 1000 and _edges is not None and _edges < 15 and len(raw) == 0:
+            ctx.emit("coverage.noprogress", payload={
+                "execs_done": _execs, "edges_found": _edges,
+                "note": ("the campaign ran many executions but reached almost no new code and "
+                         "found no crash -- the target is bailing out before it parses the input. "
+                         "It most likely needs a config/data file, command-line arguments, or a "
+                         "specific working directory. Ingest the binary as a DIRECTORY containing "
+                         "its runtime files (they are staged beside it), and check `./target "
+                         "< input` runs normally by hand.")})
 
     fd = FindingDAO(ctx.conn)
     dd = DynResultDAO(ctx.conn)
