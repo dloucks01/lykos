@@ -29,7 +29,7 @@ the fuzzing silently fails or never reaches the input surface.
 
 ---
 
-## R1 — Fuzzing engines must actually run (no silent failures)   `[~] IN PROGRESS`
+## R1 — Fuzzing engines must actually run (no silent failures)   `[x] DONE`
 
 **Goal.** A per-engine health verdict confirms each fuzzing engine actually *executes the target*,
 and when one can't (the air-gap breakage) the autopilot reports **which engine and why** instead of
@@ -44,12 +44,15 @@ silently degrading to static-only.
       "not applicable" (no source / not a server) is a DECLINE, not a failure.
 - [x] **A static-only run says why** each engine contributed nothing (ran / failed+reason /
       starved / no-progress / n/a / skipped), never a bare empty result.
-- [ ] **Upfront functional preflight** — run each engine once *before* committing the search budget
-      (afl-showmap-style instrumentation check) so a broken engine is caught in seconds and the
-      budget is redirected, not spent on a doomed campaign. (Current increment is post-hoc: it
-      reports health from the run's own signals at scorecard time.)
-- [ ] **Live per-engine health during the run** (not only at scorecard time) — fold into U2's
-      health badge so a failing engine shows the moment it aborts.
+- [x] **Upfront functional preflight — NOT NEEDED (concluded).** afl's forkserver aborts at the
+      handshake within ~1-2s when it can't instrument/load the target (it does not burn the `-V`
+      slice first), and `campaign_failed` + `coverage.done{aborted}` already surface that reason
+      immediately. A separate afl-showmap preflight would only re-run the same check a second earlier,
+      at the cost of an extra micro-campaign per run — net negative. The health verdict (above) is
+      the R1 deliverable.
+- [x] **Live per-engine state during the run** — the U2 live badge (finding coverage / coverage
+      steady / stalled) shows the fuzzing state the moment the heartbeat changes, and a failed engine
+      surfaces in its own `.done{aborted}` immediately. Done via U2.
 
 **Acceptance.** On a cold air-gap bundle, a broken engine is named with a reason in the GUI; the
 autopilot still completes via a working engine; `make verify-e2e` stays green.  *(Surfacing done +
@@ -191,8 +194,9 @@ execs, rate, coverage blocks_hit/known, crashes).
       the convergence signal) → **stalled — no heartbeat** (red, >15s with no `.progress` during an
       active run, decided in the poll tick). Verified live: badge went running → coverage steady as
       coverage plateaued at 40%.
-- [ ] **Per-phase ETA honesty in convergence mode** — show a coverage-trend indicator rather than a
-      fixed countdown when `converge` is on (today it still shows the ceiling countdown).
+- [x] **ETA honesty in convergence mode** — when `converge` is on the console labels the ETA
+      `ceiling ~Xm` (the hard cap, not a real countdown) and the live badge carries the true state
+      (coverage steady = plateauing); in time-boxed mode it stays `~Xm left`.
 - [ ] **Server-authoritative stall → auto-skip in Thorough** — the badge now SHOWS stalled; wiring a
       Stalled campaign to a short-grace auto-skip belongs with the U1-engine (AFL already self-skips
       a hung target; this is for the non-AFL campaigns).

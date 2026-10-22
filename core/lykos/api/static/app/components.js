@@ -274,7 +274,7 @@ function FuzzStateBadge({ state }) {
     + `border:1px solid ${c}55;border-radius:10px;padding:1px 8px;white-space:nowrap`}>${state.label}</span>`;
 }
 
-export function FuzzConsole({ live, state }) {
+export function FuzzConsole({ live, state, converge }) {
   if (!live) return null;
   const budget = Number(live.budget) || 0;
   const elapsed = Number(live.elapsed) || 0;
@@ -295,7 +295,8 @@ export function FuzzConsole({ live, state }) {
         <${Spinner} label=${live.label || "Fuzzing"} />
         <${FuzzStateBadge} state=${state} />
         <span class="fz-budget">${fmtElapsed(elapsed)}${budget ? ` / ${fmtElapsed(budget)}` : ""}${
-          eta != null ? html` · <span class="fz-eta">~${fmtElapsed(eta)} left</span>` : ""}</span>
+          eta != null ? html` · <span class="fz-eta">${converge
+            ? `ceiling ~${fmtElapsed(eta)}` : `~${fmtElapsed(eta)} left`}</span>` : ""}</span>
       </div>
       <div class="fz-bar"><div class="fz-fill" style=${`width:${Math.max(2, Math.min(100, pct))}%`}></div></div>
       <div class="fz-stats">

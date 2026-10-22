@@ -1103,7 +1103,7 @@ function App() {
                 <!-- Lead with the live tool-command console (the actual rizin/gdb/qemu/afl commands
                      and their I/O) -- that is what "Console" means and what an analyst wants to see;
                      the human-readable Run log follows it. -->
-                <${FuzzConsole} live=${fuzzLive} state=${fuzzState} />
+                <${FuzzConsole} live=${fuzzLive} state=${fuzzState} converge=${!!(bg && bg.converge)} />
                 <${ConsolePanel} lines=${consoleLines} />
                 <${ProgressLog} entries=${log} running=${running} />
                 <${CoveragePanel} coverage=${coverage} targets=${targets} onDrill=${browseFunctions} />
