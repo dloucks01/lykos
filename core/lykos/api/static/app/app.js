@@ -144,6 +144,8 @@ function App() {
   const consoleSeen = useRef(new Set());              // de-dupe exec events by server id
   const [fuzzLive, setFuzzLive] = useState(null);     // live fuzzing telemetry (latest .progress)
   const [fuzzHealth, setFuzzHealth] = useState(null); // per-engine fuzzing health verdict (R1)
+  const [fuzzState, setFuzzState] = useState(null);   // live Running/Converging/Stalled badge (U2)
+  const fuzzTrendRef = useRef({ cov: null, grewAt: 0, seenAt: 0 }); // coverage-growth trend
   // The effective theme: an explicit choice (data-theme, set pre-paint from localStorage) wins,
   // else the OS preference. The toggle flips it, applies it to <html>, and persists the choice.
   const [theme, setTheme] = useState(() => {
@@ -406,10 +408,30 @@ function App() {
               // milestone line.
               if (/\.progress$/.test(ev.type)) {
                 const p = ev.payload || {};
+                const now = Date.now();
                 setFuzzLive({ stage: ev.type.split(/[._]/)[0], label: fuzzStageLabel(ev.type),
-                              ...p, at: Date.now() });
+                              ...p, at: now });
+                // U2 live state: is coverage still growing (Running), has it gone flat at a healthy
+                // rate (Converging/steady), or are heartbeats still arriving at all? The "stalled"
+                // (no-heartbeat) case is decided in the poll tick, since it is the ABSENCE of this.
+                const cov = p.blocks_hit != null ? Number(p.blocks_hit)
+                          : (p.edges_found != null ? Number(p.edges_found) : null);
+                const tr = fuzzTrendRef.current;
+                let grew = false;
+                if (cov != null && !Number.isNaN(cov)) {
+                  if (tr.cov == null || cov > tr.cov) { grew = true; tr.grewAt = now; }
+                  tr.cov = Math.max(tr.cov == null ? 0 : tr.cov, cov);
+                }
+                tr.seenAt = now;
+                const sinceGrowth = tr.grewAt ? now - tr.grewAt : 0;
+                if (cov == null) setFuzzState({ label: "running", tone: "ok" });
+                else if (grew) setFuzzState({ label: "finding coverage", tone: "ok" });
+                else if (sinceGrowth > 20000) setFuzzState({ label: "coverage steady", tone: "warn" });
+                else setFuzzState({ label: "running", tone: "ok" });
               } else if (/\.(done|coverage_unavailable|noprogress|deps)$/.test(ev.type)) {
                 setFuzzLive(null);
+                setFuzzState(null);
+                fuzzTrendRef.current = { cov: null, grewAt: 0, seenAt: 0 };
               }
               pushConsole(ev.id, { cmd: fuzzSummary(ev.type, ev.payload || {}), note: ev.type });
               continue;
@@ -431,11 +453,21 @@ function App() {
       setBg(st && st.state && st.state !== "none" ? st : null);
       await tailEvents();
       if (st && st.running) {
+        // U2 stalled detection: a campaign was heartbeating (seenAt set) but has gone quiet for a
+        // while -- the target wedged / afl hung -- which is the ABSENCE of a `.progress`, so it is
+        // caught here rather than in the event handler. The heartbeat is every <=3s, so 15s of
+        // silence is a real stall, not a slow target between beats.
+        const tr = fuzzTrendRef.current;
+        if (tr.seenAt && Date.now() - tr.seenAt > 15000) {
+          setFuzzState({ label: "stalled — no heartbeat", tone: "bad" });
+        }
         refreshResults(cid, targets);
         setTimeout(tick, 2500);
       } else if (st && (st.state === "done" || st.state === "cancelled" || st.state === "error")) {
         setBgActivity(null);
         setFuzzLive(null);
+        setFuzzState(null);
+        fuzzTrendRef.current = { cov: null, grewAt: 0, seenAt: 0 };
         refreshResults(cid, targets);
       }
     };
@@ -560,7 +592,7 @@ function App() {
       setError(`could not pack the folder: ${e.message || e}`);
       return;
     }
-    if (!append) { setLog([]); setFindings([]); setPocs([]); setAdvice(null); setRan(false); setUnavailable([]); setSysmap(null); setCoverage({}); setVerifications({}); setScorecard([]); setFuzzHealth(null); setBg(null); bgPollRef.current++; bgEventsAfter.current = -1; }
+    if (!append) { setLog([]); setFindings([]); setPocs([]); setAdvice(null); setRan(false); setUnavailable([]); setSysmap(null); setCoverage({}); setVerifications({}); setScorecard([]); setFuzzHealth(null); setFuzzState(null); fuzzTrendRef.current = { cov: null, grewAt: 0, seenAt: 0 }; setBg(null); bgPollRef.current++; bgEventsAfter.current = -1; }
     try {
       const cid = await ensureCase();
       const got = append ? [...targets] : [];
@@ -936,15 +968,16 @@ function App() {
                   </div>`)}
                 </div>
               </div>` : null}
-            <div class="rail-run">
-              <${FuzzConsole} live=${fuzzLive} />
-              ${bgActivity ? html`<div class="bg-activity">${bgActivity.pct != null ? html`<span class="bg-pct">${Math.round(bgActivity.pct)}%</span>` : null}<span class="bg-act-msg">${bgActivity.msg}</span></div>` : null}
-            </div>
           </nav>
 
-          <!-- main: run bar + verdict + tabs + panel -->
+          <!-- main: run bar + live fuzz console + verdict + tabs + panel -->
           <main class="wb-main">
             <div class="wb-runbar">${runControls}</div>
+            <!-- Live fuzzing telemetry + the Running/Converged/Stalled badge, directly under the run
+                 bar so it is visible DURING a run (it used to sit at the bottom of the long rail,
+                 below the fold, where the operator never saw it). Renders only while fuzzing. -->
+            <${FuzzConsole} live=${fuzzLive} state=${fuzzState} />
+            ${bgActivity ? html`<div class="bg-activity">${bgActivity.pct != null ? html`<span class="bg-pct">${Math.round(bgActivity.pct)}%</span>` : null}<span class="bg-act-msg">${bgActivity.msg}</span></div>` : null}
             <${TargetBar} target=${activeTarget} onBrowseFunctions=${browseFunctions} />
             ${multi ? (() => {
               const dem = verdicts.filter((v) => v.status === "demonstrated").length;
@@ -1049,7 +1082,7 @@ function App() {
                 <!-- Lead with the live tool-command console (the actual rizin/gdb/qemu/afl commands
                      and their I/O) -- that is what "Console" means and what an analyst wants to see;
                      the human-readable Run log follows it. -->
-                <${FuzzConsole} live=${fuzzLive} />
+                <${FuzzConsole} live=${fuzzLive} state=${fuzzState} />
                 <${ConsolePanel} lines=${consoleLines} />
                 <${ProgressLog} entries=${log} running=${running} />
                 <${CoveragePanel} coverage=${coverage} targets=${targets} onDrill=${browseFunctions} />

@@ -264,7 +264,17 @@ function _fmtN(n) {
   if (n >= 1e3) return `${(n / 1e3).toFixed(1)}k`;
   return String(Math.round(n));
 }
-export function FuzzConsole({ live }) {
+// U2 live state badge: Running (coverage growing) / coverage steady (plateauing — the convergence
+// signal) / stalled (heartbeats stopped). Colours: ok=green, warn=amber, bad=red.
+const _FS_COLOR = { ok: "#2ec28a", warn: "#d9a441", bad: "#e5534b" };
+function FuzzStateBadge({ state }) {
+  if (!state || !state.label) return null;
+  const c = _FS_COLOR[state.tone] || "#8a94a6";
+  return html`<span style=${`margin-left:8px;font-size:.72rem;font-weight:600;color:${c};`
+    + `border:1px solid ${c}55;border-radius:10px;padding:1px 8px;white-space:nowrap`}>${state.label}</span>`;
+}
+
+export function FuzzConsole({ live, state }) {
   if (!live) return null;
   const budget = Number(live.budget) || 0;
   const elapsed = Number(live.elapsed) || 0;
@@ -283,6 +293,7 @@ export function FuzzConsole({ live }) {
     <div class="card fz">
       <div class="fz-head">
         <${Spinner} label=${live.label || "Fuzzing"} />
+        <${FuzzStateBadge} state=${state} />
         <span class="fz-budget">${fmtElapsed(elapsed)}${budget ? ` / ${fmtElapsed(budget)}` : ""}${
           eta != null ? html` · <span class="fz-eta">~${fmtElapsed(eta)} left</span>` : ""}</span>
       </div>
