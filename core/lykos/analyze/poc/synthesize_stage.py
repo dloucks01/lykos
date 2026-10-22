@@ -85,7 +85,7 @@ def synthesize_stage(ctx) -> dict:
             from .. import invocation as _inv
             _strings = [x.value for x in StringDAO(ctx.conn).list_by_target(target.id)
                         if getattr(x, "value", None)]
-            _found = _inv.discover(_strings)
+            _found = _inv.discover(_strings, prog=getattr(target, "filename", None))
             _cand = _inv.materialize(_found, ctx.scratch())
             if _cand:
                 _smp = ctx.scratch() / "inv-sample"

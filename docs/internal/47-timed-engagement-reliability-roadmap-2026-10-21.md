@@ -60,21 +60,43 @@ validated on fp3: `fuzz.health` event lands, verdict + per-engine reasons render
 
 ---
 
-## R2 — Automatic invocation & seed discovery   `[ ] TODO`
+## R2 — Automatic invocation & seed discovery   `[~] IN PROGRESS`
 
 **Goal.** Detect when a target can't be driven as-is and **synthesize + supply** what it needs, so
 the fuzzer reaches the real input surface rather than bouncing off ignored argv.
 
-- [ ] Detect "needs a config file" / "needs a parameter" from usage strings, getopt/argv parsing,
-      required-arg patterns (`usage: x -c <file>`, `x parse <file>`).
-- [ ] Synthesize a plausible config/param + a valid seed automatically and thread it to every
-      dynamic stage (not just the fuzzer) — matches the `--argv`/`--input-mode` override path.
-- [ ] Surface the chosen invocation in the GUI ("driving as: `x -c <generated.conf> @@`") and let the
-      operator correct it.
+**Finding (2026-10-21): R2 is far more built than the roadmap implied.** `invocation.discover()` →
+`propose_argv()` → `materialize()` already parse usage/getopt/help, pick an input slot, and
+**synthesize real config/jar/path files on disk** behind value flags, wired into the fuzz stage
+(`fuzz/stage.py`), synthesize_stage, and the `/invocation` endpoint. So R2 is closing specific gaps
+found by running the machinery on a REAL daemon (asterisk), not building it from scratch.
 
-**Acceptance.** A binary that needs `-c <config>` or a positional file is auto-driven to a crash
+- [x] **Self-name usage anchoring** (`discover(..., prog=<binary name>)`). A large daemon embeds
+      hundreds of INTERNAL-command usages ("Usage: core show version", "Usage: bridge kick <id>");
+      `from_usage` mixed their flags into a garbage option set and picked the richest internal line,
+      so asterisk got invented flags + an **empty** proposed argv and was fuzzed with no args →
+      static-only. `prog` makes the program's OWN usage (`Usage: asterisk [OPTIONS]`) authoritative.
+      Threaded into the fuzz stage, synthesize_stage, and both invocation endpoints. Unit-tested;
+      32 invocation tests green. *(Measured on asterisk: garbage flags → correctly isolated own
+      usage.)*
+- [ ] **R2.b · Isolate the getopt optstring + relax the cap.** `from_optstring` UNIONS matches
+      across strings (asterisk → 50 bogus flags incl. `-0..-9`) and `discover`'s `<=12` cap then
+      drops it — so asterisk's real optstring `BC:cde:FfG:ghIiL:M:mnpqRrs:TtU:VvWXx:` (which has
+      `C:` = the config flag) is thrown away. Pick the single best getopt string and trust ONE
+      well-formed optstring past 12 flags. **Precision-sensitive** (the cap exists because trusting
+      optstrings "invented sixty flags for a program with five") → needs the conformance guard.
+- [ ] **R2.c · Dynamic `--help`/`-h` extraction.** When the strings are terse (`[OPTIONS]`), run
+      the target with `--help`/`-h`/`-?` in the sandbox and parse the printed option table — the
+      authoritative flag list for a program that documents at runtime, not in static strings.
+- [ ] **R2.d · Daemon runtime needs (overlaps P5).** A plausible config *with content* (not an empty
+      `-C` file), a working directory / data dir, and env vars the target reads — asterisk needs a
+      config dir + runtime dir to initialize at all, which `materialize`'s single-file synth misses.
+- [ ] **Surface the chosen invocation in the GUI** ("driving as: `asterisk -C <generated.conf>`")
+      and let the operator correct it.
+
+**Acceptance.** A binary that needs `-c <config>` or a positional file is auto-driven to its parser
 (or an honest "couldn't synthesize a valid invocation: <reason>") without the operator hand-setting
-argv; web GUI shows and allows editing the chosen invocation.
+argv; the web GUI shows and allows editing the chosen invocation.
 
 **Cross-refs.** memory: webgui-cli-parity (the #1 reason real binaries return static-only).
 

@@ -196,7 +196,8 @@ class EndpointsMixin:
             if not t:
                 return self._json({"error": "no target"}, 404)
             found = invmod.discover(self._target_strings(s, tid),
-                                    usage_hint=body.get("usage_hint"))
+                                    usage_hint=body.get("usage_hint"),
+                                    prog=getattr(t, "filename", None))
             d = Path(tempfile.mkdtemp(prefix="lykos-invocation-"))
             try:
                 # Into the EXE's directory: the sandbox masks /tmp and binds back only that
@@ -343,7 +344,8 @@ class EndpointsMixin:
         # is what POST /targets/<id>/invocation is for.
         try:
             from ..analyze import invocation as invmod
-            found = invmod.discover(self._target_strings(s, tid))
+            found = invmod.discover(self._target_strings(s, tid),
+                                    prog=getattr(t, "filename", None))
             found["proposed_argv"] = invmod.propose_argv(found)
         except Exception:
             observe.absorbed(_log, "keeping the default")

@@ -964,7 +964,12 @@ def _discover_argv(ctx, target, exec_timeout):
         if door_argv:
             return door_argv, door_note, False, door
 
-        found = invmod.discover([x.value for x in _strings_for(ctx, target)], help_text=help_text)
+        # `prog` anchors usage-line discovery on the program's OWN name: a large daemon embeds
+        # hundreds of internal-command usages ("Usage: core show version") that are not how you
+        # invoke it, and mixing their flags produced a garbage option set + empty argv -> the
+        # daemon was fuzzed with no args and came back static-only.
+        found = invmod.discover([x.value for x in _strings_for(ctx, target)], help_text=help_text,
+                                prog=getattr(target, "filename", None))
         # Real files behind every value that names one, or the proposal cannot be tested: a
         # service required to be given `-j <app.jar>` refuses the literal string "app.jar",
         # and the run then throws away an invocation that was right apart from a missing file.

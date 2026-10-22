@@ -352,3 +352,34 @@ def test_a_flag_only_reader_still_gets_its_read_flag():
     found = {"subcommand": None, "output_positional": False,
              "flags": [{"flag": "-r", "takes_value": True, "optional": True, "kind": "path"}]}
     assert invocation.propose_argv(found) == ["-r", invocation.INPUT_PLACEHOLDER]
+
+
+def test_self_name_anchoring_ignores_internal_command_usages():
+    """A large daemon (asterisk) embeds hundreds of INTERNAL command usages ('Usage: core show
+    version', 'Usage: bridge kick <id>') alongside its own 'Usage: asterisk [OPTIONS]'. Without
+    anchoring, from_usage mixed their flags into a garbage option set and picked the richest
+    internal line; `prog` makes the program's OWN usage authoritative."""
+    strings = [
+        "Usage: core show version",
+        "Usage: bridge kick <bridge-id> <channel-name | all>",   # the richest-looking, but wrong
+        "Usage: core set debug <level> <module>",
+        "Usage: asterisk [OPTIONS]",                              # the program's own usage
+        "random noise string",
+    ]
+    # Without prog: no anchoring -> it can latch onto an internal-command usage line.
+    _flags, usage_noanchor = invocation.from_usage(strings)
+    # With prog: the program's own usage wins, and the internal-command flags are not mixed in.
+    flags, usage = invocation.from_usage(strings, prog="asterisk")
+    assert usage == "Usage: asterisk [OPTIONS]"
+    assert "kick" not in (usage or "")
+    # the internal 'bridge kick <bridge-id>' positional must NOT have contributed flags
+    assert all(not f.startswith("-bridge") for f in flags)
+    # path form of prog resolves by basename
+    _f2, usage2 = invocation.from_usage(strings, prog="/usr/sbin/asterisk")
+    assert usage2 == "Usage: asterisk [OPTIONS]"
+
+
+def test_discover_threads_prog_to_usage_selection():
+    strings = ["Usage: bridge kick <bridge-id> <channel>", "Usage: foo [OPTIONS]", "noise"]
+    found = invocation.discover(strings, prog="foo")
+    assert found.get("usage") == "Usage: foo [OPTIONS]"

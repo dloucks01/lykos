@@ -347,15 +347,37 @@ def from_help(lines) -> tuple:
     return takes, placeholders, names
 
 
-def from_usage(strings) -> tuple:
-    """(flags, usage line). The usage text is the only place the VALUE SHAPES are written."""
+def _names_prog(usage_line: str, prog: str) -> bool:
+    """Does this usage line name the PROGRAM ITSELF -- `Usage: asterisk [OPTIONS]` -- rather than
+    one of its internal commands (`Usage: core show version`)? The token right after `usage:` is
+    the subject; compare its basename to the binary's."""
+    m = re.search(r"(?i)\busage\b\s*:?\s+(\S+)", usage_line or "")
+    if not m:
+        return False
+    first = m.group(1).rsplit("/", 1)[-1].strip("'\"").lower()
+    p = (prog or "").rsplit("/", 1)[-1].strip().lower()
+    return bool(p) and (first == p or first == p + "," or first.startswith(p + "["))
+
+
+def from_usage(strings, *, prog: Optional[str] = None) -> tuple:
+    """(flags, usage line). The usage text is the only place the VALUE SHAPES are written.
+
+    `prog` (the binary's name) is the fix for a large daemon: asterisk embeds HUNDREDS of internal
+    command usages (`Usage: core show version`, `Usage: bridge kick <id>`) that are not how you
+    invoke the program, and mixing their flags together invented a garbage option set and an empty
+    proposed argv -- so the daemon was fuzzed with no args, never reached its parser, and the run
+    came back static-only. When any usage line NAMES THE PROGRAM ITSELF (`Usage: asterisk
+    [OPTIONS]`), only those are authoritative; the internal-command usages are ignored."""
+    lines = [s for s in strings if s and _USAGE_LINE.search(s) and len(s) <= 512]
+    if prog:
+        named = [s for s in lines if _names_prog(s, prog)]
+        if named:
+            lines = named                                # the program's own usage wins outright
     flags: dict = {}
     usage = None
     best = -1
-    for s in strings:
-        t = s or ""
-        if not _USAGE_LINE.search(t) or len(t) > 512:
-            continue
+    for s in lines:
+        t = s
         # the richest usage line, not the first: programs print a bare "Usage:" header and
         # then the real synopsis, and reporting the header loses every bracket with it
         n = sum(1 for _ in _USAGE_FLAG.finditer(t))
@@ -804,7 +826,8 @@ def multicall_doors(run, names, *, sample: bytes = b"", cap: int = 8,
     return doors
 
 
-def discover(strings, *, usage_hint: Optional[str] = None, help_text: Optional[str] = None) -> dict:
+def discover(strings, *, usage_hint: Optional[str] = None, help_text: Optional[str] = None,
+             prog: Optional[str] = None) -> dict:
     """Everything we can say about how to invoke this target.
 
     The USAGE LINE is the authority on which flags exist, and the others only refine it. That
@@ -822,7 +845,7 @@ def discover(strings, *, usage_hint: Optional[str] = None, help_text: Optional[s
     strings = [s for s in (strings or []) if s]
     if usage_hint:
         strings = list(strings) + [usage_hint]
-    use, usage = from_usage(strings)
+    use, usage = from_usage(strings, prog=prog)
     opt = from_optstring(strings)
     cmp_ = from_argv_compares(strings)
     help_flags, help_ph, help_names = (from_help((help_text or "").splitlines())
