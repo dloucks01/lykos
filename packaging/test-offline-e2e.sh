@@ -42,6 +42,18 @@ static void sink(const char *s,long n){ char b[64]; memcpy(b,s,n); write(1,b,1);
 int main(void){ static char in[1<<16]; long n=read(0,in,sizeof in); if(n>0) sink(in,n); return 0; }
 CEOF
 gcc -no-pie -fno-stack-protector -O0 -w "$T/vuln.c" -o "$T/vuln" || die "could not build the vuln target"
+# 1b) a command-injection ELF (argv -> system). This drives a DIFFERENT L3 synthesizer than the
+# ret2win target above: inject_stage realizes the effect dynamically (a spawned-shell marker), not a
+# ROP/control-flow build_exploit. Proving BOTH offline catches an offline-specific regression in
+# either synthesizer -- the old gate proved only the memory-corruption -> ret2win chain.
+cat > "$T/cmdi.c" <<'CEOF'
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+int main(int argc, char **argv){ char cmd[512]; if (argc < 2) return 0;
+  snprintf(cmd, sizeof cmd, "echo got: %s", argv[1]); system(cmd); return 0; }
+CEOF
+gcc -no-pie -fno-stack-protector -O0 -w "$T/cmdi.c" -o "$T/cmdi" || die "could not build the cmdi target"
 # 2) a cross-arch (aarch64 static) ELF, to prove qemu-user actually RUNS a foreign binary offline
 if command -v aarch64-linux-gnu-gcc >/dev/null 2>&1; then
   printf '#include <unistd.h>\nint main(){write(1,"AARCH64-RAN\\n",12);return 0;}\n' > "$T/a64.c"
@@ -120,8 +132,14 @@ case "$o" in *S[0-9]*) ok angr-symbolic "stepped";; *) bad angr-symbolic "$(prin
 /lykos/vendor/angr-venv/bin/python -c 'import angr' 2>&1 | grep -qi 'unicorn support disabled\|failed loading.*unicornlib' && bad angr-unicorn-engine "disabled" || ok angr-unicorn-engine "loaded"
 # unicorn emulation
 /lykos/vendor/unicorn-venv/bin/python -c 'import unicorn as u;m=u.Uc(u.UC_ARCH_X86,u.UC_MODE_64);m.mem_map(0x1000,0x1000);m.mem_write(0x1000,b"\x90\x90");m.emu_start(0x1000,0x1002);print("x")' 2>/dev/null|grep -q x && ok unicorn "emulated" || bad unicorn "emu failed"
-echo "--- END-TO-END ANALYZE ---"
+echo "--- END-TO-END ANALYZE (memory-corruption -> ret2win L3) ---"
 ./lykos analyze /t/vuln --budget ${BUDGET:-480} --input-mode stdin --out $S/out --case-store $S/case -q 2>&1
+# Second L3 class, a DIFFERENT synthesizer: command injection -> inject_stage. No --input-mode (the
+# payload rides the argv channel inject_stage must discover). Bracketed so the gate can assert on it.
+echo "--- END-TO-END ANALYZE (command injection -> inject_stage L3) ---"
+echo "CMDI-BEGIN"
+./lykos analyze /t/cmdi --budget ${CMDI_BUDGET:-150} --out $S/outc --case-store $S/casec -q 2>&1
+echo "CMDI-END"
 echo "SWEEP COMPLETE"
 PEOF
 
@@ -129,7 +147,7 @@ KEEPID=""; case "$RT" in *podman*) KEEPID="--userns=keep-id";; esac
 say "cold-container functional capability gate (offline, non-root, no host tools)  base=$BASE  budget=${BUDGET}s"
 out="$("$RT" run --rm --network none $KEEPID --user "$(id -u):$(id -g)" -e BUDGET="$BUDGET" \
       -v "$RD":/lykos -v "$T/probe.sh":/t/probe.sh:ro -v "$T/scratch":/scratch \
-      -v "$T/vuln":/t/vuln:ro -v "$T/a64":/t/a64:ro \
+      -v "$T/vuln":/t/vuln:ro -v "$T/cmdi":/t/cmdi:ro -v "$T/a64":/t/a64:ro \
       "$BASE" sh /t/probe.sh 2>&1 || true)"
 echo "$out" | sed 's/^/  | /'
 
@@ -159,8 +177,14 @@ case "$albig" in
   *) broken="$broken afl-qemu-large" ;;                  # handshake aborted on a large binary -> the engagement failure, caught
 esac
 [ -n "$broken" ] && die "offline capability(ies) BROKEN:$broken  (present-but-broken is still a loss)"
-# the full pipeline must reach a verified L3 PoC from the bundle alone
+# the full pipeline must reach a verified L3 PoC from the bundle alone (memory-corruption -> ret2win)
 echo "$out" | grep -q 'proof of concept' && echo "$out" | grep -qE '^\s*L3\b' || \
   die "no verified L3 PoC -- the bundle reached only static/partial analysis offline"
+# ...and a SECOND, distinct L3 synthesizer must work offline too: command injection -> inject_stage.
+# Proving two independent L3 paths (ROP control-flow AND a realized command-exec effect) is what the
+# old single-class gate could not do -- an offline regression in either synthesizer is now caught.
+cmdi_out="$(printf '%s\n' "$out" | sed -n '/CMDI-BEGIN/,/CMDI-END/p')"
+printf '%s\n' "$cmdi_out" | grep -qE '^\s*L3\b' && printf '%s\n' "$cmdi_out" | grep -q 'CWE-78' || \
+  die "command-injection class did not reach a verified L3 offline (inject_stage synthesizer regressed)"
 
-say "OFFLINE E2E GATE PASSED -- every lane works on a cold, tool-less, offline Kali container, and a vulnerable ELF reached a verified L3 PoC from the bundle alone"
+say "OFFLINE E2E GATE PASSED -- every lane works on a cold, tool-less, offline Kali container, and TWO distinct L3 synthesizers (memory-corruption ret2win AND command-injection) reached a verified L3 PoC from the bundle alone"

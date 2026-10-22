@@ -398,15 +398,22 @@ warning, P10 BinDiff/patch-diff.
       reaches L3; source int_overflow/uaf reach it via the source-fuzz path. Honest ceilings (NOT
       fabricated): logic/auth (CWE-252/732/696), hygiene (weak crypto/rand/tmp), secrets (L0-secret),
       managed runtimes, cross-arch fmt/heap. One real fixable-but-unwired gap remains → P11.
-- [ ] **P11 · Go/Rust injection L3.** `inject_stage.PROBES` (injection.py:232) match C libc symbols only,
-      so a native Go `os/exec.Command` / Rust injection sink is never probed. Add Go/Rust sink symbols
-      (SAFE — inject realizes the effect dynamically, a non-injectable sink just yields no marker). Needs
-      Go/Rust test binaries + confirmation the disassembler recovers clean Go call-edges before shipping.
-- [ ] **P12 · Offline gate proves L3 BREADTH.** `make verify-e2e` drives only ONE L3 class (native
-      x86-64 ret2win) in the cold `--network none` container; heap/fmt/leak-ret2libc/cross-arch/BROP/SROP
-      L3 are proven only by connected-host gates (conformance/arch-gate/real-gate). Extend
-      `packaging/test-offline-e2e.sh` to drive a representative target per L3 class to L3 in-container, so
-      an offline-specific L3 regression is caught. (Bundle contains every tool — pure-Python synthesis.)
+- [x] **P11 · Go/Rust injection L3** — commit `e1f90f0`. `inject_stage` folds `lang_sinks` findings into
+      its applicable probes by CWE (78→command, 22→path, 89→sql, 918→ssrf) and runs the SAME dynamic
+      probe, so a native Go `os_exec.Command` / Rust `Command::spawn` injection reaches L3. `lang_sinks`
+      also fixed to detect Go/Rust with no recorded toolchain (Go `runtime.*`, Rust `::h<hex>` mangling)
+      and match Rust sinks as current rizin renders them (`::`, trait-impl `...Command>::do_exec`), keying
+      on EXEC methods not `Command::new` (clap false positive). Verified live: Go vuln→L3, Go safe→flagged
+      but NO L3 (dynamic confirm declines), Rust vuln→L3. 5 unit tests. See [[l3-reachability-map]].
+- [x] **P12 · Offline gate proves L3 BREADTH** — `packaging/test-offline-e2e.sh` now drives a SECOND,
+      distinct L3 synthesizer in the cold `--network none` container: command injection → `inject_stage`
+      (argv→system), alongside the existing memory-corruption→ret2win (`build_exploit`). Both must reach a
+      verified L3 from the bundle alone or the gate fails, so an offline-specific regression in EITHER
+      synthesizer is caught. VERIFIED by running the gate against `dist/lykos-offline-20261021` (podman,
+      --network none): all CAP lanes OK, ret2win L3 (13/13), command-injection L3 (1/1), "GATE PASSED".
+      (Format-string was evaluated as a third class but its ad-hoc target topped out at L2 — a reliable
+      CWE-134 L3 target needs the hand-crafted conformance shape, so it was left out to keep the gate
+      deterministic; heap/leak-ret2libc/cross-arch/BROP/SROP L3 stay on the connected-host gates.)
 
 - [x] **(a) Single-address ret2win to an in-image shell call** (stripped/no-PIE, NUL-safe) —
       `rop.find_shell_call_wins` + `_shellcall_ret2win_exploit`, commit `11499af`. Reaches L3 where
