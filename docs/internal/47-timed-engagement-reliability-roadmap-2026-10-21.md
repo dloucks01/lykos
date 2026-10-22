@@ -248,9 +248,18 @@ upgrade improves what the non-fuzz recover phase can confirm).
 - [x] **Avenue #3 — structural decompiler queries** — ALREADY BUILT: `analyze/weggli.py` runs a
       curated pack of structural (AST) pattern queries; `directed.py` uses weggli hits to steer the
       campaign toward source-flagged code. (Audit 2026-10-21.)
-- [ ] **Avenue #4 — logic / auth bugs** (broken-contract checks beyond memory safety) — a genuine
-      NEW capability class (lykos does memory-corruption + injection today). **Large, dedicated
-      build; not started.**
+- [~] **Avenue #4 — logic / auth bugs** (broken-contract checks beyond memory safety) — a genuine
+      NEW capability class (lykos did memory-corruption + injection only). **First increment landed:**
+      the **unchecked privilege-management return** detector (`detect/detectors.py unchecked_privdrop`,
+      CWE-252 / CWE-273). A privileged daemon that calls setuid/setgid/seteuid/…/chroot and ignores
+      the result keeps its privileges on failure — a logic bug that never crashes, so no fuzzer or
+      memory-safety detector sees it. Pure-static: reads the disassembly after the call and flags a
+      return value that is REDEFINED (or clobbered by the next call) before any read; a value that is
+      TESTED, STORED, or PASSED ON is correctly left alone (high precision). Honest CANDIDATE
+      (attacker-reachability/exploitability not claimed). x86/x86-64. Validated unit + e2e A/B
+      (`tests/test_unchecked_privdrop.py`, 10 tests); 69 existing detector tests green.
+      *Remaining in the class:* auth-comparison / hardcoded-credential-gate shapes, access-control
+      and protocol-state violations (need intended-vs-actual modeling — the hard tier).
 - [x] **Avenue #5 — exploit composition on stripped (partial)** — the (a) ret2win shell-call fix is
       one increment; more composition work possible.
 - [x] **Harness track T1 / T2** — T1 fuzz-worthiness ranker + T2 emulated single-function executor +

@@ -544,6 +544,109 @@ def stack_buffer_overflow(ctx: DetectContext):
     return out
 
 
+# ------------------------- unchecked privilege-management return (logic/auth: CWE-252 / CWE-273)
+# A privileged daemon that calls setuid()/setgid()/chroot() and IGNORES the result keeps its
+# privileges (or stays unchrooted) when the call fails -- a classic logic/auth defect that never
+# crashes and is not injection or memory corruption: the program simply does the WRONG thing. The
+# textbook case is `setuid(pw->pw_uid); /* continue as root if it failed */`. We flag a call to one
+# of these whose return value is provably DISCARDED, read straight off the disassembly.
+_PRIV_RET_FUNCS = {
+    "setuid", "setgid", "seteuid", "setegid", "setreuid", "setregid",
+    "setresuid", "setresgid", "setgroups", "initgroups", "chroot",
+}
+_RAX = ("rax", "eax", "ax", "al")
+_RMW_MNEMS = {"add", "sub", "and", "or", "xor", "shl", "shr", "sar", "sal", "rol", "ror", "inc",
+              "dec", "neg", "not", "imul", "mul", "adc", "sbb", "test", "cmp", "movzx", "movsx"}
+
+
+def _reg_in(text: str) -> bool:
+    return any(re.search(r"\b" + r + r"\b", text) for r in _RAX)
+
+
+def _touches_return(mnem: str, ops: list):
+    """How the instruction first touches the return register (rax/eax), Intel syntax (dest first):
+    'read' (the value is tested / used as a source / stored / passed on -> it was checked or kept),
+    'write' (the register is redefined -> the value was discarded), or None (not touched)."""
+    if mnem == "call":
+        return "write"                                   # a later call clobbers rax before any read
+    if not ops:
+        return None
+    if mnem in ("xor", "sub") and len(ops) == 2 and ops[0] == ops[1] and ops[0] in _RAX:
+        return "write"                                   # self-zero of the return reg
+    reads = any(_reg_in(o) for o in ops[1:])             # the reg as a SOURCE operand
+    if ops[0].startswith("[") and _reg_in(ops[0]):
+        reads = True                                     # used as a memory base/index = read
+    if mnem in _RMW_MNEMS and not ops[0].startswith("[") and _reg_in(ops[0]):
+        reads = True                                     # read-modify-write reads its destination
+    if reads:
+        return "read"
+    if ops[0] in _RAX:
+        return "write"                                   # register destination = redefine
+    return None
+
+
+def _return_discarded(ir: dict, site_addr) -> bool:
+    """True iff the return value of the call at `site_addr` is provably DISCARDED: scanning forward
+    within the SAME basic block, the FIRST instruction that touches the return register writes it
+    (a redefine, a self-zero, or a later `call`) before any read. A read first means it was checked
+    or kept. If the register is never touched and the block ends (ret/jmp/branch) we return False
+    (UNKNOWN): the value may propagate to the caller or be checked in a successor, so we stay
+    conservative and never call a real check a bug."""
+    site = _naddr(site_addr)
+    if not ir or site is None:
+        return False
+    seq = None
+    for b in ir.get("blocks", []) or []:
+        ins = b.get("instructions") or []
+        addrs = [_naddr(i.get("addr")) for i in ins]
+        if site in addrs:
+            seq = ins[addrs.index(site) + 1:]            # instructions AFTER the call, same block
+            break
+    if not seq:
+        return False
+    for i in seq:
+        t = (i.get("text") or "").split(";")[0].strip().lower()
+        if not t:
+            continue
+        parts = t.split(None, 1)
+        ops = [o.strip() for o in parts[1].split(",")] if len(parts) > 1 else []
+        kind = _touches_return(parts[0], ops)
+        if kind == "read":
+            return False                                 # checked / used / stored -> not discarded
+        if kind == "write":
+            return True                                  # redefined before any read -> discarded
+    return False
+
+
+@register_detector
+def unchecked_privdrop(ctx: DetectContext):
+    """Flag a privilege-management call whose return value is discarded (CWE-252 / CWE-273) -- a
+    logic/auth bug: on failure the program keeps its privileges and carries on."""
+    if not (_is_x86(ctx.arch) and ctx.func_irs):         # the rax/eax scan is x86/x86-64 only
+        return []
+    out = []
+    for e in ctx.call_edges:
+        n = normalize(e.dst_name)
+        if n not in _PRIV_RET_FUNCS:
+            continue
+        ir = ctx.func_irs.get(e.src_addr)
+        if ir is None or not _return_discarded(ir, e.site_addr):
+            continue
+        out.append(_cand(
+            "CWE-252",
+            f"Unchecked return value of privilege-management call {n}()",
+            "high", "unchecked_privdrop",
+            [{"channel": "pattern", "detail": (
+                f"call to {n}() at {e.site_addr} discards its return value (not tested before the "
+                f"return register is clobbered). If {n}() fails, execution continues with the "
+                "original privileges -- CWE-252 / CWE-273 (improper check for dropped privileges). "
+                "A static pattern: attacker-reachability / exploitability is not proven here.")}],
+            function_addr=e.src_addr, site_addr=e.site_addr,
+            site_detail=f"{n}() return discarded at {e.site_addr}",
+            dedup_key=f"CWE-252:unchecked_privdrop:{n}", confidence=0.55))
+    return out
+
+
 # ------------------------------- width-bounded scanf that STILL overflows (the off-by-one class)
 # `scanf("%16s", buf)` with `char buf[16]` is NOT safe: the conversion writes up to 16 chars PLUS a
 # terminating NUL = 17 bytes into a 16-byte buffer. The width bound fools the coarse detector above
