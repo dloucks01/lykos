@@ -285,8 +285,19 @@ upgrade improves what the non-fuzz recover phase can confirm).
         certificates + annotations. A/B validated (`tests/test_concolic_reach.py`): reached→certified,
         drained→annotated-not-dropped (confidence preserved), cutoff→untouched; existing stub +
         real-angr concolic tests green.
-  - [ ] **T6 · State-machine / sequence driving** — recover the parse dispatch, drive sequences. The
-        hard, later tier.
+  - [x] **T6 · State-machine / sequence driving** (v1) — the executor now drives a function with an
+        ORDERED SEQUENCE of messages in ONE emulator state (`emulate.run_sequence`): globals (.bss/
+        .data) and the heap persist between calls, each call gets a fresh stack + input buffer, so a
+        fault that lives in a state only entered after a specific message prefix becomes reachable.
+        `run_function` is now the single-message case of `run_sequence` (no behavior change -- 210
+        tests confirm). Fuzz gained a `sequence=True` mode (`fuzz.py`): the flat buffer is framed into
+        messages on a separator (default '\n'), dictionary tokens are also chained into a multi-message
+        seed. The `harness` stage runs a bounded, ADDITIVE sequence pass per candidate, filing only
+        faults the single-call pass could not reach (reports message count + faulting index).
+        Validated A/B (`tests/test_harness_t6.py`): an A->B->C state-gated fault is reached by the
+        sequence (seq_index=2) and by sequence-fuzzing, and is UNREACHABLE by any single call or the
+        wrong order. v1 scope: delimiter-framed sequences; length-prefixed / binary framing and
+        automatic dispatch-loop recovery are the follow-up tier.
 - [ ] **Wire the `harness` stage into the default autopilot plan** (currently registered + in the
       stage map but not in the default pipeline) — overlaps with I1.
 

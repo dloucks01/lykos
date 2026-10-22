@@ -50,6 +50,7 @@ class HarnessResult:
     access: str = ""                 # "read" | "write" | "fetch"
     blocks: set = field(default_factory=set)   # basic-block start addresses reached (coverage)
     huge_alloc: Optional[int] = None  # T5: an attacker-controlled allocation SIZE (CWE-789 DoS)
+    seq_index: Optional[int] = None   # T6: which message in a driven sequence faulted
     note: str = ""
 
 
@@ -261,22 +262,11 @@ def _emulate_libc(uc, name, res, heap, regs) -> None:
         res.note = (res.note + "; " if res.note else "") + f"fault in {nm}()"
 
 
-def run_function(elf_bytes: bytes, func_addr: int, input_bytes: bytes, *,
-                 arg_shape: str = "ptr_len", max_insns: int = _MAX_INSNS) -> HarnessResult:
-    """Execute ONE function with `input_bytes` as its buffer argument; report fault + coverage.
-
-    `arg_shape`: "ptr_len" -> rdi=&input, rsi=len; "ptr" -> rdi=&input. Reaching the sentinel
-    return means the function returned cleanly; an access to unmapped memory means it faulted
-    (a memory-safety bug reached by driving this one function).
-    """
-    import time as _time
-    from unicorn import (UC_ARCH_X86, UC_HOOK_BLOCK, UC_HOOK_MEM_FETCH_UNMAPPED,
-                         UC_HOOK_MEM_READ_UNMAPPED, UC_HOOK_MEM_WRITE_UNMAPPED, UC_MODE_64,
-                         UC_PROT_ALL, Uc, UcError)
-    from unicorn.x86_const import (UC_X86_REG_RAX, UC_X86_REG_RCX, UC_X86_REG_RDI,
-                                   UC_X86_REG_RDX, UC_X86_REG_RIP, UC_X86_REG_RSI,
-                                   UC_X86_REG_RSP)
-    res = HarnessResult()
+def _setup(elf_bytes: bytes, res: HarnessResult):
+    """Create the emulator, map the ELF + stack/input/heap/sentinel/TLS, set the fake stack canary.
+    Returns (uc, plt, heap) on success or None (with res.note set) on a mapping failure."""
+    from unicorn import UC_ARCH_X86, UC_MODE_64, UC_PROT_ALL, Uc
+    from unicorn.x86_const import UC_X86_REG_FS_BASE
     uc = Uc(UC_ARCH_X86, UC_MODE_64)
     try:
         _map_segments(uc, elf_bytes)
@@ -287,26 +277,29 @@ def run_function(elf_bytes: bytes, func_addr: int, input_bytes: bytes, *,
         uc.mem_map(_TLS_ADDR, _PAGE, UC_PROT_ALL)        # fake TLS so the stack canary read works
     except Exception as e:                               # noqa: BLE001
         res.note = f"map failed: {e}"
-        return res
+        return None
     # A real function reads its stack canary from `fs:[0x28]`. Point FS at a fake TLS block with a
     # fixed canary there, so the read succeeds and the setup/return values match (no spurious
     # __stack_chk_fail). Without this every canary-protected function faults at 0x28 on entry.
-    from unicorn.x86_const import UC_X86_REG_FS_BASE
     uc.reg_write(UC_X86_REG_FS_BASE, _TLS_ADDR)
     uc.mem_write(_TLS_ADDR + 0x28, b"\x11\x22\x33\x44\x55\x66\x77\x00")
-    buf = input_bytes[:_INPUT_SZ]
-    uc.mem_write(_INPUT_ADDR, buf)
-    sp = ((_STACK_TOP - 0x1000) & ~0xF) - 8
-    uc.mem_write(sp, _SENTINEL.to_bytes(8, "little"))    # sentinel return: `ret` lands here
-    uc.reg_write(UC_X86_REG_RSP, sp)
-    uc.reg_write(UC_X86_REG_RDI, _INPUT_ADDR)
-    if arg_shape == "ptr_len":
-        uc.reg_write(UC_X86_REG_RSI, len(buf))
+    return uc, _plt_map(elf_bytes), {"next": _HEAP_ADDR}
 
-    plt = _plt_map(elf_bytes)
-    heap = {"next": _HEAP_ADDR}
+
+def _drive_messages(uc, func_addr: int, messages, res: HarnessResult, plt, heap, *,
+                    arg_shape: str, max_insns: int) -> HarnessResult:
+    """Call `func_addr` once per message, IN ORDER, reusing ONE emulator state so globals (.bss/
+    .data) and the heap persist between calls -- this is what lets a sequence reach a state a
+    single call cannot (T6). Each call gets a fresh stack + input buffer; coverage accumulates
+    across the whole sequence. The sequence stops at the first call that faults or ends abnormally;
+    `res.seq_index` records which message that was."""
+    import time as _time
+    from unicorn import (UC_HOOK_BLOCK, UC_HOOK_MEM_FETCH_UNMAPPED, UC_HOOK_MEM_READ_UNMAPPED,
+                         UC_HOOK_MEM_WRITE_UNMAPPED, UcError)
+    from unicorn.x86_const import (UC_X86_REG_RAX, UC_X86_REG_RCX, UC_X86_REG_RDI, UC_X86_REG_RDX,
+                                   UC_X86_REG_RIP, UC_X86_REG_RSI, UC_X86_REG_RSP)
     pending = {"name": None}
-    deadline = _time.time() + 10.0                       # wall-clock runaway guard
+    deadline = {"t": 0.0}
 
     def _on_block(uc_, addr, size, _ud):
         res.blocks.add(addr)
@@ -314,7 +307,7 @@ def run_function(elf_bytes: bytes, func_addr: int, input_bytes: bytes, *,
         if nm is not None:                               # a call into the PLT: emulate the external
             pending["name"] = nm
             uc_.emu_stop()
-        elif _time.time() > deadline:
+        elif _time.time() > deadline["t"]:
             res.note = "wall-clock budget"
             uc_.emu_stop()
 
@@ -329,40 +322,96 @@ def run_function(elf_bytes: bytes, func_addr: int, input_bytes: bytes, *,
     uc.hook_add(UC_HOOK_MEM_READ_UNMAPPED | UC_HOOK_MEM_WRITE_UNMAPPED
                 | UC_HOOK_MEM_FETCH_UNMAPPED, _on_unmapped)
 
-    cur = func_addr
-    calls = 0
-    while True:
-        pending["name"] = None
-        try:
-            uc.emu_start(cur, _SENTINEL, count=max_insns)
-        except UcError:
-            if not res.crashed and pending["name"] is None:
-                res.note = res.note or "emulation error (unsupported instruction)"
-                res.fault_pc = uc.reg_read(UC_X86_REG_RIP)
-            break
+    for idx, msg in enumerate(messages):
+        buf = bytes(msg)[:_INPUT_SZ]
+        uc.mem_write(_INPUT_ADDR, b"\x00" * min(_INPUT_SZ, len(buf) + 8))  # clear stale tail
+        uc.mem_write(_INPUT_ADDR, buf)
+        sp = ((_STACK_TOP - 0x1000) & ~0xF) - 8
+        uc.mem_write(sp, _SENTINEL.to_bytes(8, "little"))  # sentinel return: `ret` lands here
+        uc.reg_write(UC_X86_REG_RSP, sp)
+        uc.reg_write(UC_X86_REG_RDI, _INPUT_ADDR)
+        if arg_shape == "ptr_len":
+            uc.reg_write(UC_X86_REG_RSI, len(buf))
+        res.returned = False
+        res.note = ""                                     # per-call; a prior clean call left it empty
+        deadline["t"] = _time.time() + 10.0               # wall-clock runaway guard, per call
+        cur = func_addr
+        calls = 0
+        while True:
+            pending["name"] = None
+            try:
+                uc.emu_start(cur, _SENTINEL, count=max_insns)
+            except UcError:
+                if not res.crashed and pending["name"] is None:
+                    res.note = res.note or "emulation error (unsupported instruction)"
+                    res.fault_pc = uc.reg_read(UC_X86_REG_RIP)
+                break
+            if res.crashed:
+                break
+            if pending["name"] is None:
+                # no pending external -> reached the sentinel (clean return) or a budget stop
+                if uc.reg_read(UC_X86_REG_RIP) in (_SENTINEL, 0) and not res.note:
+                    res.returned = True
+                break
+            calls += 1
+            if calls > _MAX_CALLS:
+                res.note = "too many external calls"
+                break
+            # simulate the `call`'s callee: pop the return address, emulate the libc func, resume.
+            rsp = uc.reg_read(UC_X86_REG_RSP)
+            try:
+                retaddr = int.from_bytes(uc.mem_read(rsp, 8), "little")
+            except UcError:
+                res.note = "bad stack at external call"
+                break
+            uc.reg_write(UC_X86_REG_RSP, rsp + 8)
+            _emulate_libc(uc, pending["name"], res, heap,
+                          (UC_X86_REG_RDI, UC_X86_REG_RSI, UC_X86_REG_RDX, UC_X86_REG_RCX,
+                           UC_X86_REG_RAX, UC_X86_REG_RIP))
+            if res.crashed:
+                break
+            cur = retaddr
         if res.crashed:
+            res.seq_index = idx
             break
-        if pending["name"] is None:
-            # stopped with no pending external -> reached the sentinel (clean return) or a budget stop
-            if uc.reg_read(UC_X86_REG_RIP) in (_SENTINEL, 0) and not res.note:
-                res.returned = True
+        if res.note:                                      # abnormal end (budget / bad stack / error)
             break
-        calls += 1
-        if calls > _MAX_CALLS:
-            res.note = "too many external calls"
-            break
-        # simulate the `call`'s callee: pop the return address, emulate the libc function, resume.
-        rsp = uc.reg_read(UC_X86_REG_RSP)
-        try:
-            retaddr = int.from_bytes(uc.mem_read(rsp, 8), "little")
-        except UcError:
-            res.note = "bad stack at external call"
-            break
-        uc.reg_write(UC_X86_REG_RSP, rsp + 8)
-        _emulate_libc(uc, pending["name"], res, heap,
-                      (UC_X86_REG_RDI, UC_X86_REG_RSI, UC_X86_REG_RDX, UC_X86_REG_RCX,
-                       UC_X86_REG_RAX, UC_X86_REG_RIP))
-        if res.crashed:
-            break
-        cur = retaddr
     return res
+
+
+def run_function(elf_bytes: bytes, func_addr: int, input_bytes: bytes, *,
+                 arg_shape: str = "ptr_len", max_insns: int = _MAX_INSNS) -> HarnessResult:
+    """Execute ONE function with `input_bytes` as its buffer argument; report fault + coverage.
+
+    `arg_shape`: "ptr_len" -> rdi=&input, rsi=len; "ptr" -> rdi=&input. Reaching the sentinel
+    return means the function returned cleanly; an access to unmapped memory means it faulted
+    (a memory-safety bug reached by driving this one function). A single-message `run_sequence`.
+    """
+    res = HarnessResult()
+    setup = _setup(elf_bytes, res)
+    if setup is None:
+        return res
+    uc, plt, heap = setup
+    return _drive_messages(uc, func_addr, [input_bytes], res, plt, heap,
+                           arg_shape=arg_shape, max_insns=max_insns)
+
+
+def run_sequence(elf_bytes: bytes, func_addr: int, messages, *,
+                 arg_shape: str = "ptr_len", max_insns: int = _MAX_INSNS) -> HarnessResult:
+    """Drive a stateful function with a SEQUENCE of messages in one emulator state (T6).
+
+    A dispatch-style parser transitions between states as it consumes messages; a bug can live in
+    a state only reachable after a specific prefix (e.g. after a HELLO then an AUTH). Each message
+    is a fresh call with its own stack and input buffer, but globals and the heap carry over, so a
+    later call sees the state the earlier calls established. Coverage is cumulative; the result's
+    `seq_index` says which message faulted. With a single message this is exactly `run_function`."""
+    res = HarnessResult()
+    if not messages:
+        res.note = "empty sequence"
+        return res
+    setup = _setup(elf_bytes, res)
+    if setup is None:
+        return res
+    uc, plt, heap = setup
+    return _drive_messages(uc, func_addr, list(messages), res, plt, heap,
+                           arg_shape=arg_shape, max_insns=max_insns)

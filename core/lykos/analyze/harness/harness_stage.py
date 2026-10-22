@@ -110,6 +110,52 @@ def harness_stage(ctx) -> dict:
                     "reachable-if-driven lead for a daemon whose entry path a concolic/reachability "
                     "pass must still connect. Not a program-level verified PoC.")}]})
             findings += 1
+        # T6 sequence driving: drive the function with ORDERED message sequences in one emulator
+        # state, reaching a fault that lives in a state only entered after a specific message
+        # prefix -- which the single-call pass above can never reach. Additive and bounded: a short
+        # extra pass that only files crashes at sites the single-call pass did NOT already find.
+        if p.get("sequence", True):
+            single_sites = {(c["result"].fault_pc, c["result"].access) for c in fr.crashes}
+            try:
+                sfr = fuzz_function(data, rf.addr, arg_shape=shape, dictionary=dict_words,
+                                    sequence=True,
+                                    budget_execs=int(p.get("harness_seq_execs", 3000)),
+                                    budget_seconds=float(p.get("harness_seq_seconds", 8.0)))
+            except Exception as e:                           # noqa: BLE001 -- never sink the stage
+                sfr = None
+                ctx.emit("harness.progress", payload={"func": hex(rf.addr),
+                                                       "seq_error": str(e)[:120]})
+            if sfr and sfr.crashes:
+                ctx.emit("harness.progress", payload={"func": hex(rf.addr), "name": rf.name,
+                         "seq_execs": sfr.execs, "seq_crashes": len(sfr.crashes)})
+                for c in sfr.crashes:
+                    r = c["result"]
+                    if (r.fault_pc, r.access) in single_sites:
+                        continue                             # the single-call pass already filed it
+                    inp = c["input"]
+                    msgs = [m for m in inp.split(b"\n") if m]
+                    sha = ctx.put_artifact("harness-seq-input", data=inp)
+                    cwe, kind = _ACCESS_CWE.get(r.access, ("CWE-119", "memory fault"))
+                    fault = hex(r.fault_addr) if r.fault_addr is not None else "?"
+                    pc = hex(r.fault_pc) if r.fault_pc is not None else "?"
+                    nth = (r.seq_index + 1) if r.seq_index is not None else "?"
+                    fd.upsert(target.id, target.case_id, {
+                        "cwe": cwe, "severity": "high",
+                        "title": f"Harness-demonstrated {kind} in {label} (stateful sequence)"[:200],
+                        "detector": "harness", "state": "corroborated", "confidence": 0.8,
+                        "site_addr": pc if r.fault_pc is not None else None,
+                        "function_addr": hex(rf.addr),
+                        "dedup_key": f"harness:{rf.addr:#x}:{r.fault_pc or 0:#x}:{r.access}",
+                        "evidence": [{"channel": "harness", "detail": (
+                            f"driving {label}({shape}) with an ORDERED SEQUENCE of {len(msgs)} "
+                            f"message(s), input {sha[:12]} ({len(inp)} B, '\\n'-framed) faults on "
+                            f"message {nth}: {r.access} at {fault}, pc {pc}. This fault is only "
+                            "reachable after the earlier messages drive the parser into the "
+                            "faulting state -- the single-call pass cannot reach it. PROVENANCE: "
+                            "demonstrated at the FUNCTION level (the sequence was replayed directly "
+                            "under the emulator); program-level reachability for a daemon must still "
+                            "be connected by a concolic/reachability pass.")}]})
+                    findings += 1
         # T5 resource oracle: a fuzzed input drove an attacker-controlled huge allocation (CWE-789).
         for o in fr.oracle_hits:
             r = o["result"]

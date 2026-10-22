@@ -16,7 +16,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
-from .emulate import HarnessResult, run_function
+from .emulate import HarnessResult, run_function, run_sequence
 
 # T4 (doc 46): the binary's OWN comparison constants, fed back as a fuzzing dictionary. A parser
 # gates on magic values, length limits and opcodes it checks the input against (`cmp eax,
@@ -112,16 +112,33 @@ def _mutate(rng: random.Random, data: bytes, words: list) -> bytes:
     return bytes(b[:0x10000])
 
 
+def _split_messages(data: bytes, sep: bytes, cap: int) -> list:
+    """Frame a flat fuzzed buffer into an ordered message SEQUENCE for a stateful parser (T6).
+    Split on the separator (a line/record delimiter); drop empty frames; cap the count. With no
+    separator present it is a single message -- so a non-framed input degrades to one call and the
+    sequence driver behaves exactly like the single-call driver (no false sequencing)."""
+    parts = [p for p in data.split(sep) if p] if sep else [data]
+    if not parts:
+        parts = [data or b"\x00"]
+    return parts[:cap]
+
+
 def fuzz_function(elf_bytes: bytes, func_addr: int, seeds: Optional[list] = None, *,
                   arg_shape: str = "ptr_len", budget_execs: int = 20000,
                   budget_seconds: float = 60.0, max_crashes: int = 8, max_oracle: int = 2,
-                  dictionary: Optional[list] = None, seed: int = 1337) -> FuzzResult:
+                  dictionary: Optional[list] = None, sequence: bool = False,
+                  seq_sep: bytes = b"\n", max_messages: int = 6, seed: int = 1337) -> FuzzResult:
     """Coverage-guided fuzz of one function. Returns crashing inputs + the corpus it built.
 
     `dictionary` (T4): the function's own constant operands -- magic values, length limits, opcodes
     it compares the input against. They are spliced during mutation AND placed verbatim at offset 0
     of a seed input (the common gate position), so the campaign gets past a magic/length gate a
-    blind mutator would have to invent byte by byte."""
+    blind mutator would have to invent byte by byte.
+
+    `sequence` (T6): drive each candidate as an ORDERED SEQUENCE of messages (the flat buffer split
+    on `seq_sep`, capped at `max_messages`) through `run_sequence`, so state a stateful parser only
+    enters after a specific message prefix becomes reachable. The crash reproducer is the whole
+    buffer plus the separator convention; `HarnessResult.seq_index` says which message faulted."""
     rng = random.Random(seed)
     fr = FuzzResult()
     corpus = [bytes(s) for s in (seeds or [b"\x00\x00\x00\x00\x00\x00\x00\x00"]) if s is not None]
@@ -129,18 +146,30 @@ def fuzz_function(elf_bytes: bytes, func_addr: int, seeds: Optional[list] = None
         corpus = [b"\x00" * 8]
     dict_words = [bytes(w) for w in (dictionary or []) if w]
     words = _INTERESTING + dict_words
+
+    def _drive(buf: bytes) -> HarnessResult:
+        if sequence:
+            return run_sequence(elf_bytes, func_addr, _split_messages(buf, seq_sep, max_messages),
+                                arg_shape=arg_shape)
+        return run_function(elf_bytes, func_addr, buf, arg_shape=arg_shape)
+
     seen_crash_sites: set = set()
     t0 = time.time()
     # seed the corpus + coverage from the initial inputs, then from each dictionary constant placed
     # at the buffer's start (where a header magic/length field sits) -- a direct gate pass to try.
     pending = list(corpus) + [w + b"\x00" * 16 for w in dict_words]
+    # In sequence mode, also try the dictionary tokens assembled INTO a multi-message input: the
+    # parser's own constants are the likeliest valid messages, and chaining them explores state
+    # transitions a single token never would.
+    if sequence and dict_words:
+        pending.append(seq_sep.join(dict_words[:max_messages]))
     corpus = []
     deadline = t0 + budget_seconds
     while (fr.execs < budget_execs and time.time() < deadline
            and len(fr.crashes) < max_crashes):
         data = (pending.pop() if pending
                 else _mutate(rng, rng.choice(corpus) if corpus else b"\x00" * 8, words))
-        r: HarnessResult = run_function(elf_bytes, func_addr, data, arg_shape=arg_shape)
+        r: HarnessResult = _drive(data)
         fr.execs += 1
         new = r.blocks - fr.blocks
         if new:
