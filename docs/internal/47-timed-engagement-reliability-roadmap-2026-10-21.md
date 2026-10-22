@@ -79,18 +79,27 @@ found by running the machinery on a REAL daemon (asterisk), not building it from
       Threaded into the fuzz stage, synthesize_stage, and both invocation endpoints. Unit-tested;
       32 invocation tests green. *(Measured on asterisk: garbage flags → correctly isolated own
       usage.)*
-- [ ] **R2.b · Isolate the getopt optstring + relax the cap.** `from_optstring` UNIONS matches
-      across strings (asterisk → 50 bogus flags incl. `-0..-9`) and `discover`'s `<=12` cap then
-      drops it — so asterisk's real optstring `BC:cde:FfG:ghIiL:M:mnpqRrs:TtU:VvWXx:` (which has
-      `C:` = the config flag) is thrown away. Pick the single best getopt string and trust ONE
-      well-formed optstring past 12 flags. **Precision-sensitive** (the cap exists because trusting
-      optstrings "invented sixty flags for a program with five") → needs the conformance guard.
-- [ ] **R2.c · Dynamic `--help`/`-h` extraction.** When the strings are terse (`[OPTIONS]`), run
-      the target with `--help`/`-h`/`-?` in the sandbox and parse the printed option table — the
-      authoritative flag list for a program that documents at runtime, not in static strings.
+- [x] **Native shared-library dep resolution (the keystone).** A native dynamically-linked daemon
+      off its own system exited at the loader ("error while loading shared libraries ...") and read
+      as not-runnable, so its `--help` mining, baseline and fuzzing ALL silently found nothing.
+      `sandbox.run` now, for a native target, prepends an operator `LYKOS_QEMU_SYSROOT`'s lib dirs to
+      `LD_LIBRARY_PATH` **and binds the sysroot into bwrap** (a /tmp sysroot is otherwise masked) --
+      mirroring `aflpp.run_campaign`. Additive + opt-in (fires only when the sysroot is set; can turn
+      a not-runnable into a run, never the reverse). Unit-tested; 23 dynamic tests green. **Proven on
+      the real asterisk**: with the rig sysroot, `asterisk -h` now reaches main, prints its help, and
+      `discover(help_text=...)` recovers `-C` (config) + the exact version string (22.5.2 -> a bonus
+      for N-day / avenue #2).
+- [x] **R2.c · Dynamic `--help`/`-h` extraction** already existed (`fuzz/stage.py:_help_text` tries
+      `--help`/`-h`/`help`/`--usage`, scores the option table, feeds `discover`). It was dead for
+      dynamically-linked daemons because the target couldn't load; the dep fix above unblocks it, and
+      self-name anchoring keeps the terse static usage from poisoning the richer `--help` result.
+- [ ] **R2.b · Isolate the getopt optstring + relax the cap** — now a FALLBACK for the static-only
+      case (no `--help` obtainable). `from_optstring` UNIONS matches (asterisk → 50 bogus flags) and
+      `discover`'s `<=12` cap drops the real `BC:cde:FfG:...`. Pick the single best getopt string and
+      trust one well-formed optstring past 12. **Precision-sensitive** → needs the conformance guard.
 - [ ] **R2.d · Daemon runtime needs (overlaps P5).** A plausible config *with content* (not an empty
-      `-C` file), a working directory / data dir, and env vars the target reads — asterisk needs a
-      config dir + runtime dir to initialize at all, which `materialize`'s single-file synth misses.
+      `-C` file), a working/data dir, and env vars the target reads — asterisk needs a config + runtime
+      dir to fully initialize, which `materialize`'s single-file synth misses.
 - [ ] **Surface the chosen invocation in the GUI** ("driving as: `asterisk -C <generated.conf>`")
       and let the operator correct it.
 

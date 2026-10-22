@@ -2413,6 +2413,7 @@ def run(exe, *, argv=(), stdin: bytes = b"", timeout: float = 10.0,
         # qemu), so there is no tracer of ours in the process to protect.
         env, guarded = guard_page_env(env, exe=exe, arch=arch, host=host, sanitizer=san)
 
+    native_sysroot = None                                # a native sysroot to bind into bwrap, below
     if emu:
         # Cross-arch: hand qemu-user the guest sysroot so a dynamically-linked foreign ELF finds
         # its loader and libraries and actually reaches main(). Without this the run above exits
@@ -2424,6 +2425,25 @@ def run(exe, *, argv=(), stdin: bytes = b"", timeout: float = 10.0,
         if _sysroot:
             env = dict(env if env is not None else os.environ)
             env.setdefault("QEMU_LD_PREFIX", _sysroot)
+    elif os.environ.get("LYKOS_QEMU_SYSROOT"):
+        # NATIVE dynamically-linked target off its own system: the operator supplies its libraries
+        # via LYKOS_QEMU_SYSROOT (a rootfs or a flat lib dir). Prepend its lib dirs to
+        # LD_LIBRARY_PATH so the host loader finds the deps and the program reaches main() --
+        # otherwise the run exits at the loader ("error while loading shared libraries ...") and
+        # reads as not-runnable, which is exactly why a dynamically-linked daemon's --help, baseline
+        # and fuzzing all silently found nothing (measured on asterisk: missing libasteriskpj.so.2).
+        # Additive + opt-in: it fires ONLY when the operator set a sysroot, so a target whose deps
+        # are already present is unaffected; it can turn a not-runnable into a run, never the
+        # reverse. Mirrors the native dep wiring aflpp.run_campaign already does for the afl path.
+        try:
+            _libdirs = [str(d) for d in _sysroot_lib_dirs(os.environ["LYKOS_QEMU_SYSROOT"])]
+        except Exception:                                # noqa: BLE001 -- best-effort
+            _libdirs = []
+        if _libdirs:
+            env = dict(env if env is not None else os.environ)
+            _ld = env.get("LD_LIBRARY_PATH")
+            env["LD_LIBRARY_PATH"] = ":".join(_libdirs + ([_ld] if _ld else []))
+            native_sysroot = os.environ["LYKOS_QEMU_SYSROOT"]
 
     iso = "rlimits-only" + ("+qemu" if emu else "")
     cmd = inner
@@ -2454,6 +2474,11 @@ def run(exe, *, argv=(), stdin: bytes = b"", timeout: float = 10.0,
             # directory writable; it holds nothing else.
             tdir = str(Path(trace_log).parent)
             extra += ["--bind", tdir, tdir]
+        if native_sysroot and os.path.isdir(native_sysroot):
+            # The native sysroot's lib dirs are on LD_LIBRARY_PATH (above), but a sysroot under
+            # /tmp is MASKED by the sandbox's tmpfs, so the loader would still not find the deps.
+            # Bind it read-only at its own path so LD_LIBRARY_PATH resolves inside the sandbox.
+            extra += ["--ro-bind", native_sysroot, native_sysroot]
         # Native targets: disable ASLR inside the namespace (the parent personality does not
         # survive bwrap's user namespace on some kernels). Emulated targets keep qemu's own guest
         # layout, so setarch on the host qemu process is not applied here.
