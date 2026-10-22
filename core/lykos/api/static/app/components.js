@@ -313,7 +313,7 @@ export function RunHeader({ bg }) {
     </div>`;
 }
 
-export function FuzzConsole({ live, state, converge }) {
+export function FuzzConsole({ live, state, converge, compact }) {
   if (!live) return null;
   const budget = Number(live.budget) || 0;
   const elapsed = Number(live.elapsed) || 0;
@@ -323,6 +323,26 @@ export function FuzzConsole({ live, state, converge }) {
   const known = live.blocks_known || 0;
   const cov = (edges != null && known) ? `${edges}/${known} (${Math.round(100 * edges / known)}%)`
     : (edges != null ? `${edges}` : "—");
+  // Compact: a single-line pulse for the always-on top strip, so live fuzzing is visible on every
+  // tab WITHOUT repeating the full telemetry card that the Console tab already owns. The user saw
+  // the big panel twice (top + Console); this is the top half, deliberately slim.
+  if (compact) {
+    return html`
+      <div class="card fz fz-compact">
+        <${Spinner} label=${live.label || "Fuzzing"} />
+        <${FuzzStateBadge} state=${state} />
+        <span class="fz-compact-stats">
+          <span><b>${_fmtN(live.execs)}</b> execs</span>
+          <span><b>${_fmtN(live.execs_per_sec)}</b>/s</span>
+          <span>cov <b>${cov}</b></span>
+          <span class=${Number(live.crashes) > 0 ? "fz-hit" : ""}><b>${_fmtN(live.crashes)}</b> crashes</span>
+        </span>
+        <span class="fz-budget">${fmtElapsed(elapsed)}${budget ? ` / ${fmtElapsed(budget)}` : ""}${
+          eta != null ? html` · <span class="fz-eta">${converge
+            ? `ceiling ~${fmtElapsed(eta)}` : `~${fmtElapsed(eta)} left`}</span>` : ""}</span>
+        <span class="fz-compact-hint">full telemetry in the Console tab →</span>
+      </div>`;
+  }
   const stat = (label, value, cls) => html`
     <div class="fz-stat">
       <div class="fz-stat-v ${cls || ""}">${value}</div>
@@ -362,6 +382,38 @@ const _FH_ENGINE = { coverage_fuzz: "coverage-guided (AFL)", fuzz: "blind fuzz",
                      directed_fuzz: "sink-directed", net_fuzz: "network/socket",
                      boundary_fuzz: "IPC/boundary", env_fuzz: "environment",
                      libfuzzer: "libFuzzer (source)", concolic: "concolic solver" };
+
+// The results-tab counterpart to FuzzHealthPanel. When no dynamic engine ran (verdict "none") the
+// point is NOT "go make it run" -- the deterministic synthesizers (synthesize_poc, build_exploit
+// auto, synthesize_injection, concolic) are supposed to carry static findings to L2/L3 *candidates*
+// with no execution at all. So this banner reports that dynamic VERIFICATION was unavailable (so
+// rungs are candidate, not confirmed) and tells the operator execution is an OPTIONAL extra
+// verifier -- it does not frame library-staging as the way to get results.
+export function DynamicCoverageBanner({ health, ran }) {
+  if (!ran || !health || !Array.isArray(health.engines) || !health.engines.length) return null;
+  const v = health.verdict;
+  if (v !== "none" && v !== "degraded") return null;
+  const none = v === "none";
+  const color = none ? "#d9a441" : "#d9a441";
+  const bg = "rgba(217,164,65,.08)";
+  return html`
+    <div class="card" style=${`border-left:3px solid ${color};background:${bg};padding:12px 14px;margin-bottom:12px`}>
+      <div style="font-weight:700;font-size:13px;display:flex;align-items:center;gap:8px">
+        <span style=${`color:${color}`}>${none ? "Dynamic verification unavailable" : "Dynamic verification degraded"}</span>
+        <span style="font-weight:500;opacity:.7;font-size:12px">— rungs below are candidates, not executed here</span>
+      </div>
+      <div style="font-size:12.5px;opacity:.9;margin-top:6px;line-height:1.5">${health.note}</div>
+      ${none ? html`
+        <div style="font-size:12px;opacity:.85;margin-top:8px;line-height:1.5">
+          The deterministic analysis — static recovery, taint, the exploit synthesizers — runs
+          regardless and produces findings and PoC/exploit <i>recipes</i> without executing anything.
+          Those are the deliverables here. Running the target (optional: point the <b>target
+          libraries dir</b> field at its loader + <code>.so</code>s, or ingest it as a directory)
+          only adds <i>confirmation</i> — it turns a candidate rung into an executed one. It is not
+          required to get the PoC.
+        </div>` : null}
+    </div>`;
+}
 
 export function FuzzHealthPanel({ health }) {
   if (!health || !Array.isArray(health.engines) || !health.engines.length) return null;

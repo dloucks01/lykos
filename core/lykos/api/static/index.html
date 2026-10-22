@@ -157,6 +157,13 @@
   .fz-stat-v { font-size: 1.02rem; font-weight: 700; color: var(--ink); font-variant-numeric: tabular-nums; }
   .fz-stat-v.fz-hit { color: var(--bad); }
   .fz-stat-k { font-size: .66rem; text-transform: uppercase; letter-spacing: .04em; color: var(--faint); margin-top: 1px; }
+  /* compact live strip: the always-on top-of-main pulse, not the full Console-tab card */
+  .fz-compact { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 7px 12px; }
+  .fz-compact-stats { display: inline-flex; gap: 14px; flex-wrap: wrap; font-size: .8rem; color: var(--muted);
+    font-variant-numeric: tabular-nums; }
+  .fz-compact-stats b { color: var(--ink); font-weight: 700; }
+  .fz-compact-stats .fz-hit b { color: var(--bad); }
+  .fz-compact-hint { margin-left: auto; font-size: .7rem; color: var(--faint); white-space: nowrap; }
   .plan-dot.dot-skipped { background: color-mix(in srgb, var(--faint) 40%, transparent); }
   .plan-dot.dot-cancelled { background: var(--warn); }
   .plan-dot.dot-pending { background: var(--line); }
@@ -612,6 +619,14 @@
   .wb-runbar .budget-lbl { color: var(--muted); font-size: .82rem; }
   .wb-runbar .budget-val { color: var(--ink); font-size: .82rem; font-variant-numeric: tabular-nums;
     display: inline-block; min-width: 3.4em; text-align: right; }
+  /* budget presets: quick / standard / thorough markers under the slider */
+  .wb-runbar .budget-presets { display: inline-flex; gap: 6px; margin-left: 8px; }
+  .wb-runbar .budget-preset { display: inline-flex; align-items: baseline; gap: 4px; cursor: pointer;
+    border: 1px solid var(--line); border-radius: 999px; background: transparent; color: var(--muted);
+    font-size: .72rem; padding: 2px 9px; }
+  .wb-runbar .budget-preset:hover { border-color: var(--run); color: var(--ink); }
+  .wb-runbar .budget-preset.active { border-color: var(--run); background: color-mix(in srgb, var(--run) 15%, transparent); color: var(--ink); }
+  .wb-runbar .budget-preset .bp-min { font-size: .64rem; color: var(--faint); font-variant-numeric: tabular-nums; }
   .wb-runbar .spacer { flex: 1 1 auto; }
   /* grouped run controls: a titled fieldset per cluster (budget / engines / invocation), replacing
      the old flat row of copy-pasted inline-styled labels. Reuses the design tokens + mirrors the

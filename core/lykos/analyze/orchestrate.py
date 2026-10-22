@@ -402,6 +402,18 @@ def _stage_detail(store, target, stage) -> str:
             n = FindingDAO(store.conn).count_by_target(tid)
             return f"{n} finding{'s' if n != 1 else ''}" if n else ""
         if stage in ("coverage_fuzz", "directed_fuzz", "heap_check"):
+            # A campaign that could not EXECUTE the target (afl fork-server handshake, missing
+            # loader/.so, sandbox refusal) says so in its own done event. That is the single most
+            # important thing this row can carry -- "ran, found nothing" and "could not run the
+            # target at all" are OPPOSITE outcomes -- so surface it before the coverage/crash tally,
+            # which would otherwise render an empty cell indistinguishable from a clean pass and let
+            # the operator read a setup failure as "no bug". This is the run-log half of the health
+            # banner: the WHY, inline on the stage that failed.
+            apl = _last_done_payload(store, target, stage) or {}
+            if apl.get("aborted") or apl.get("did_not_run"):
+                why = str(apl.get("note") or apl.get("reason")
+                          or "could not execute the target").strip()
+                return "could not run — " + why[:92]
             from ..report.model import _best_coverage
             t = store.targets.get(tid)
             runs = [r for r in store.runs.list_by_case(t.case_id) if r.target_id == tid]
@@ -443,6 +455,12 @@ def _stage_detail(store, target, stage) -> str:
                     return " · ".join(bits)
         if stage in _EXEC_ENGINES:
             pl = _last_done_payload(store, target, stage) or {}
+            # Same rule as the coverage engines: a campaign that could not run the target reports
+            # it, and that reason outranks the (zero) exec tally.
+            if pl.get("aborted") or pl.get("did_not_run"):
+                why = str(pl.get("note") or pl.get("reason")
+                          or "could not execute the target").strip()
+                return "could not run — " + why[:92]
             bits = []
             if pl.get("execs"):
                 bits.append(f"{int(pl['execs']):,} execs")
@@ -590,7 +608,8 @@ def _run_target_stage(store, target, stage, status, stop, params=None, *,
             # too few executions to mean anything on this target -- and that reason names the
             # rate, so it is actionable rather than just a skip.
             _sz = budget.sizing() if want_execs is not None else {}
-            why = (_sz.get("refused") or f"no budget left in the {budget.current_phase} phase")
+            why = (_sz.get("refused")
+                   or f"budget for the {budget.current_phase} phase was already spent before this stage was reached")
             budget.skipped(stage, why)
             _plan_set(status, stage, "skipped", why)
             _emit_stage(store, target.case_id, stage, "skipped", target_id=target.id, detail=why)
@@ -736,9 +755,10 @@ def _run_target_stages(store, target, specs, status, stop, *, budget=None, want=
         if budget is not None:
             secs = budget.slice(stage, want)
             if secs is not None and secs <= 0.0:
-                budget.skipped(stage, f"no budget left in the {budget.current_phase} phase")
-                _plan_set(status, stage, "skipped", "no budget")
-                _emit_stage(store, target.case_id, stage, "skipped", target_id=target.id)
+                why = f"budget for the {budget.current_phase} phase was already spent before this stage was reached"
+                budget.skipped(stage, why)
+                _plan_set(status, stage, "skipped", why)
+                _emit_stage(store, target.case_id, stage, "skipped", target_id=target.id, detail=why)
                 outcomes[stage] = "skipped"
                 continue
             if secs:

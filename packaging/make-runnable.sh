@@ -78,8 +78,10 @@ if [ -n "${LYKOS_WEGGLI_BIN:-}" ] && [ -x "$LYKOS_WEGGLI_BIN" ]; then
   mkdir -p "$V/toolchain/usr/local/bin"
   install -m0755 "$LYKOS_WEGGLI_BIN" "$V/toolchain/usr/local/bin/weggli"
   say "injected weggli from $LYKOS_WEGGLI_BIN"
+elif [ "${LYKOS_ALLOW_NO_ENGINES:-0}" = "1" ]; then
+  say "WARNING: weggli NOT injected (LYKOS_ALLOW_NO_ENGINES=1); source variant-analysis will be absent on the target"
 else
-  say "WARNING: weggli NOT injected (LYKOS_WEGGLI_BIN unset/invalid -- run build-engines.sh and 'source dist/engines/engines.env' first); source variant-analysis will be absent on the target"
+  die "weggli NOT available (LYKOS_WEGGLI_BIN unset/invalid). The last bundle shipped WITHOUT it and that is the bug we are fixing -- run packaging/build-engines.sh and 'source dist/engines/engines.env', then re-run. To build a bundle deliberately without it, set LYKOS_ALLOW_NO_ENGINES=1."
 fi
 # libqasan (QEMU-AddressSanitizer runtime) is LD_PRELOADed under afl qemu-mode to catch heap errors
 # a plain qemu run cannot see. It is built by build-engines.sh (not apt), so the container collect
@@ -90,8 +92,10 @@ if [ -n "${LYKOS_QASAN:-}" ] && [ -f "$LYKOS_QASAN" ]; then
   mkdir -p "$V/toolchain/usr/lib/afl"
   install -m0755 "$LYKOS_QASAN" "$V/toolchain/usr/lib/afl/libqasan.so"
   say "injected libqasan from $LYKOS_QASAN"
+elif [ "${LYKOS_ALLOW_NO_ENGINES:-0}" = "1" ]; then
+  say "WARNING: libqasan NOT injected (LYKOS_ALLOW_NO_ENGINES=1); the qasan heap-error lane will be absent"
 else
-  say "WARNING: libqasan NOT injected (LYKOS_QASAN unset/missing -- run build-engines.sh and 'source dist/engines/engines.env' first); the qasan heap-error lane will be absent"
+  die "libqasan NOT available (LYKOS_QASAN unset/missing). The last shipped bundle was missing it (the operator hit exactly this) -- run packaging/build-engines.sh and 'source dist/engines/engines.env', then re-run. To build a bundle deliberately without it, set LYKOS_ALLOW_NO_ENGINES=1."
 fi
 # engine venvs: keep their ORIGINAL pyvenv.cfg -- they were built for the TARGET distro's
 # Python (the bundle is distro-locked), not this build host's.

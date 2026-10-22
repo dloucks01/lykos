@@ -9,7 +9,7 @@ import { isFolderPick, folderArchive } from "./archive.js";
 import { runAutopilotCase, newController, cancel as cancelAutopilot, coverageOf } from "./autopilot.js";
 import { rankFindings, pocsForFinding, fmtTime, progressText, stageLabel, dedupeFindings, buildRunLog, buildVerdicts, filterByViz } from "./util.js";
 import {
-  html, DropZone, TargetSummary, ProgressLog, ConsolePanel, FuzzConsole, RunHeader, FuzzHealthPanel, FindingCard, EmptyResults, Spinner, UnavailablePanel, RunScorecard, SystemMap, CoveragePanel, CodeView, PipelinePlan, EvidenceModal, FunctionsModal, VerdictStrip, VerdictCard, AnalysisDrawer, ShellVerdict, ExploitsPanel, DrawerFacts, TargetBar, FunctionsPanel, StringsPanel, DisasmPanel, DiffPanel, CrashesPanel, CallGraphCanvas, CaseOverview,
+  html, DropZone, TargetSummary, ProgressLog, ConsolePanel, FuzzConsole, RunHeader, FuzzHealthPanel, DynamicCoverageBanner, FindingCard, EmptyResults, Spinner, UnavailablePanel, RunScorecard, SystemMap, CoveragePanel, CodeView, PipelinePlan, EvidenceModal, FunctionsModal, VerdictStrip, VerdictCard, AnalysisDrawer, ShellVerdict, ExploitsPanel, DrawerFacts, TargetBar, FunctionsPanel, StringsPanel, DisasmPanel, DiffPanel, CrashesPanel, CallGraphCanvas, CaseOverview,
 } from "./components.js";
 
 let _conSeq = 0;
@@ -929,11 +929,22 @@ function App() {
             : "per-target wall-clock budget in minutes. The non-fuzzing analysis (static, CVE, taint, crashless exploit) is complete regardless; this is how long fuzzing gets. Blank = auto (scales with binary size)."}>
           <span class="budget-lbl">${converge ? "ceiling" : "budget"}</span>
           <input type="range" min="5" max="120" step="5" aria-label="fuzzing budget (minutes)"
+                 list="budget-presets"
                  value=${budgetMin === "" ? 20 : budgetMin}
                  onInput=${(e) => setBudgetMin(e.target.value)}
                  style="vertical-align:middle;width:9em" />
+          <datalist id="budget-presets">
+            <option value="5"></option><option value="20"></option><option value="60"></option>
+          </datalist>
           <span class="budget-val">${budgetMin === "" ? "20 min" : `${budgetMin} min`}</span>
         </label>
+        <div class="budget-presets" role="group" aria-label="budget presets">
+          ${[["quick", 5], ["standard", 20], ["thorough", 60]].map(([lbl, m]) => html`
+            <button type="button" key=${lbl}
+              class=${`budget-preset${Number(budgetMin === "" ? 20 : budgetMin) === m ? " active" : ""}`}
+              title=${`${lbl} — ${m} min`}
+              onClick=${() => setBudgetMin(String(m))}>${lbl}<span class="bp-min">${m}m</span></button>`)}
+        </div>
         <label class="run-check" title="Run to convergence: keep fuzzing until coverage stops growing (the slider becomes the safety ceiling), instead of stopping at a fixed time. For when you can leave it running.">
           <input type="checkbox" checked=${converge} onChange=${(e) => setConverge(e.target.checked)} />
           <span>to convergence</span>
@@ -1117,10 +1128,10 @@ function App() {
                 <code>${name} ${argv}</code>
                 <span class=${`da-src da-${op ? "op" : "auto"}`}>${src}</span></div>`;
             })()}
-            <!-- Live fuzzing telemetry + the Running/Converged/Stalled badge, directly under the run
-                 bar so it is visible DURING a run (it used to sit at the bottom of the long rail,
-                 below the fold, where the operator never saw it). Renders only while fuzzing. -->
-            <${FuzzConsole} live=${fuzzLive} state=${fuzzState} />
+            <!-- Live fuzzing pulse + the Running/Converged/Stalled badge, directly under the run
+                 bar so it is visible DURING a run on ANY tab. COMPACT here (a one-line strip): the
+                 full telemetry card lives in the Console tab, so the same panel is not drawn twice. -->
+            <${FuzzConsole} live=${fuzzLive} state=${fuzzState} compact=${true} />
             ${bgActivity ? html`<div class="bg-activity">${bgActivity.pct != null ? html`<span class="bg-pct">${Math.round(bgActivity.pct)}%</span>` : null}<span class="bg-act-msg">${bgActivity.msg}</span></div>` : null}
             <${TargetBar} target=${activeTarget} onBrowseFunctions=${browseFunctions} />
             ${multi ? (() => {
@@ -1160,6 +1171,11 @@ function App() {
 
             ${tab === "findings" ? html`
               <div class="wb-panel">
+                <!-- When NO dynamic engine could execute the target, say so HERE, next to the
+                     findings -- a static-only (L0) result is a setup outcome, not a clean binary,
+                     and the remedy (supply the target's libraries) belongs where the operator reads
+                     the results, not only in the Console tab. -->
+                <${DynamicCoverageBanner} health=${fuzzHealth} ran=${ran} />
                 ${activeRanked.length ? html`<${CaseOverview} findings=${activeRanked}
                   pocs=${activePocs} filter=${viz} onFilter=${setViz} />` : null}
                 ${activeRanked.length ? html`
