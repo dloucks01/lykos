@@ -255,8 +255,19 @@ upgrade improves what the non-fuzz recover phase can confirm).
       one increment; more composition work possible.
 - [x] **Harness track T1 / T2** — T1 fuzz-worthiness ranker + T2 emulated single-function executor +
       coverage-guided loop + the `harness` stage (NOT in the default plan yet). Commits per doc 46.
-- [ ] **Harness track T3-T6** — T3 sink-directed concolic (reachability certificates), T4 constant/
-      grammar-guided input, T5 richer oracles, T6 state-machine / sequence driving. **Not started.**
+- **Harness track T3-T6** (building on T1/T2):
+  - [x] **T4 · Constant-guided input** — `dictionary_from_ir` mines the function's own comparison
+        constants (magic values / length limits / opcodes, LE+BE) off its disassembly and feeds them
+        to the harness fuzz loop as a dictionary (spliced + seeded at offset 0). Validated A/B: a bug
+        hidden behind a `0xCAFEBABE` magic gate is UNREACHED by the blind campaign and REACHED once
+        the constant is in the dictionary; 70 harness tests green.
+  - [ ] **T5 · Richer oracles** — beyond SIGSEGV: unbounded-allocation / per-run memory growth,
+        new-edge anomalies, allocator-invariant violations in the emulated executor.
+  - [ ] **T3 · Sink-directed concolic (reachability certificates)** — for each static finding, solve
+        for an input that reaches+triggers its site (→ demonstrated) or prove it unreachable (→ drop
+        the false positive). Reuses angr.
+  - [ ] **T6 · State-machine / sequence driving** — recover the parse dispatch, drive sequences. The
+        hard, later tier.
 - [ ] **Wire the `harness` stage into the default autopilot plan** (currently registered + in the
       stage map but not in the default pipeline) — overlaps with I1.
 

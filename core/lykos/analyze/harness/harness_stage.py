@@ -61,19 +61,31 @@ def harness_stage(ctx) -> dict:
     execs = int(p.get("harness_execs", 8000))
     per_sec = float(p.get("harness_seconds", 20.0))
     fd = FindingDAO(ctx.conn)
+    # T4 (doc 46): feed each function its OWN comparison constants as a fuzzing dictionary -- the
+    # magic values / length limits / opcodes it gates on, so the campaign gets past a gate a blind
+    # mutator never would. Map func addr -> IR once (the ranker gives int addrs; the DB keys by str).
+    from .fuzz import dictionary_from_ir
+    from .rank import _to_int
+    _id_by_addr = {}
+    for _f in FunctionDAO(ctx.conn).list_by_target(target.id):
+        _ai = _to_int(_f.addr)
+        if _ai is not None:
+            _id_by_addr[_ai] = _f.id
     findings = 0
     for rf in cands:
         shape = "ptr_len" if rf.ptr_len == 2 else "ptr"
         label = rf.name or hex(rf.addr)
-        ctx.progress(msg=f"harness-fuzzing {label} ({shape})")
+        _full = FunctionDAO(ctx.conn).get(_id_by_addr.get(rf.addr)) if rf.addr in _id_by_addr else None
+        dict_words = dictionary_from_ir(_full.ir if _full else None)
+        ctx.progress(msg=f"harness-fuzzing {label} ({shape}, {len(dict_words)} dict)")
         try:
             fr = fuzz_function(data, rf.addr, arg_shape=shape, budget_execs=execs,
-                               budget_seconds=per_sec)
+                               budget_seconds=per_sec, dictionary=dict_words)
         except Exception as e:                           # noqa: BLE001 -- one function must not sink the stage
             ctx.emit("harness.progress", payload={"func": hex(rf.addr), "error": str(e)[:120]})
             continue
         ctx.emit("harness.progress", payload={
-            "func": hex(rf.addr), "name": rf.name, "execs": fr.execs,
+            "func": hex(rf.addr), "name": rf.name, "execs": fr.execs, "dict_words": len(dict_words),
             "coverage": len(fr.blocks), "crashes": len(fr.crashes)})
         for c in fr.crashes:
             r = c["result"]
