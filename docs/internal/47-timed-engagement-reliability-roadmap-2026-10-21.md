@@ -230,8 +230,10 @@ upgrade improves what the non-fuzz recover phase can confirm).
       corroborated precision 1.000 UNCHANGED on the eval benchmark with it on (no fabrication);
       29 taint+ranker tests green. *(Default off/opt-in until a full conformance green; enabling by
       default is then a one-line change.)*
-- [ ] **Avenue #1 — static injection confirmation** — blocked on (b); unblocks once the taint engine
-      tracks buffer-pointer taint.
+- [x] **Avenue #1 — static injection confirmation** — UNBLOCKED by (b). The buffer-pointer seeding
+      confirms a daemon-parser buffer-content injection (a callback-reached parser's buffer feeding a
+      dangerous sink) statically, as an honest candidate. (Further depth possible, but the wall is
+      down.)
 - [x] **Avenue #2 — N-day fingerprinting (first increment)** — DT_NEEDED BOM + dependency-.so banner
       scan + CVE match, commit `f876e40` (validated on asterisk: OpenSSL 3.5.5 + 27 CVEs).
 - [ ] **Avenue #2 extension** — main-binary structural / FLIRT version fingerprinting (identify the
