@@ -266,9 +266,17 @@ upgrade improves what the non-fuzz recover phase can confirm).
       mode immediate from the ABI arg register and flags only the others-writable ones (0777/0666
       flagged; 0755/0644 not; a computed mode is never guessed — no FP). x86-64. Validated unit +
       e2e A/B (`tests/test_world_writable.py`, 10 tests).
-      *Remaining in the class:* auth-comparison / hardcoded-credential-gate shapes, precise CWE-134
-      format-string (literal-vs-computed format arg — today only a low-confidence flag), protocol-
-      state violations (need intended-vs-actual modeling — the hard tier).
+      **Third increment landed:** the **privilege-drop order** detector (`privilege_drop_order`,
+      CWE-696 / CERT POS36-C). Dropping the user id before the group id is a revocation-order bug:
+      once `setuid()` gives up root the process may lack the privilege to `setgid()`, which then
+      fails silently and leaves it in the privileged group. Per function, flags when the first
+      uid-drop precedes the first gid-drop. Arch-agnostic (reasons over call-site addresses, no
+      disasm). Honest candidate (notes "confirm both calls lie on the same execution path" — the one
+      known approximation). Validated unit + e2e A/B (`tests/test_privilege_drop_order.py`, 7 tests).
+      *Remaining in the class:* auth-comparison / hardcoded-credential-gate shapes (precise only when
+      scoped to hash/key-shaped literals, else FP-prone), precise CWE-134 format-string (literal-vs-
+      computed format arg needs real taint — the walled engine limit, so a naive version fabricates
+      FPs and is deliberately NOT built), protocol-state violations (the hard, spec-modeling tier).
 - [x] **Avenue #5 — exploit composition on stripped (partial)** — the (a) ret2win shell-call fix is
       one increment; more composition work possible.
 - [x] **Harness track T1 / T2** — T1 fuzz-worthiness ranker + T2 emulated single-function executor +

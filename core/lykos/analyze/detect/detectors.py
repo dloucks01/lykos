@@ -725,6 +725,49 @@ def world_writable_perms(ctx: DetectContext):
     return out
 
 
+# ------------------------- privilege-drop order (logic/access-control: CWE-696, CERT POS36-C) -----
+# Dropping the user id before the group id is a classic revocation-order bug: once setuid() has
+# relinquished root, the process may no longer have the privilege to call setgid(), which then fails
+# -- silently -- and the process keeps the privileged GROUP. The correct order is setgroups/setgid
+# THEN setuid. Arch-agnostic: it reasons over call-site ADDRESSES, not disassembly.
+_SETUID_FAM = {"setuid", "setreuid", "setresuid", "seteuid"}
+_SETGID_FAM = {"setgid", "setregid", "setresgid", "setegid", "setgroups", "initgroups"}
+
+
+@register_detector
+def privilege_drop_order(ctx: DetectContext):
+    """Flag a function whose FIRST user-id drop precedes its first group-id drop (CWE-696)."""
+    uid_by_fn: dict = defaultdict(list)
+    gid_by_fn: dict = defaultdict(list)
+    for e in ctx.call_edges:
+        n = normalize(e.dst_name)
+        fa, sa = _naddr(e.src_addr), _naddr(e.site_addr)
+        if fa is None or sa is None:
+            continue
+        if n in _SETUID_FAM:
+            uid_by_fn[fa].append(sa)
+        elif n in _SETGID_FAM:
+            gid_by_fn[fa].append(sa)
+    out = []
+    for fa, uids in uid_by_fn.items():
+        gids = gid_by_fn.get(fa)
+        if not gids or min(uids) >= min(gids):           # no gid drop, or gid already dropped first
+            continue
+        out.append(_cand(
+            "CWE-696",
+            "Privileges dropped in the wrong order (setuid before setgid)",
+            "medium", "privilege_drop_order",
+            [{"channel": "pattern", "detail": (
+                f"this function drops the user id (uid-drop at {min(uids):#x}) BEFORE the group id "
+                f"(gid-drop at {min(gids):#x}). Once the uid is relinquished the process may lack "
+                "the privilege to drop the gid, which then fails silently and leaves the process in "
+                "the privileged group -- CWE-696 / CERT POS36-C. Correct order is setgroups/setgid "
+                "then setuid. Static ordering: confirm both calls lie on the same execution path.")}],
+            function_addr=hex(fa), site_addr=hex(min(uids)),
+            dedup_key=f"CWE-696:privilege_drop_order:{fa:#x}", confidence=0.5))
+    return out
+
+
 # ------------------------------- width-bounded scanf that STILL overflows (the off-by-one class)
 # `scanf("%16s", buf)` with `char buf[16]` is NOT safe: the conversion writes up to 16 chars PLUS a
 # terminating NUL = 17 bytes into a 16-byte buffer. The width bound fools the coarse detector above
