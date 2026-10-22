@@ -274,6 +274,45 @@ function FuzzStateBadge({ state }) {
     + `border:1px solid ${c}55;border-radius:10px;padding:1px 8px;white-space:nowrap`}>${state.label}</span>`;
 }
 
+// A persistent, whole-run live header for the Console (the activity hub). FuzzConsole only renders
+// during a fuzz stage -- it needs live `.progress` telemetry -- so recover / detect / prove showed
+// nothing live. This shows for EVERY phase, driven by the background status (`bg`): the current
+// stage, how far through the plan, which target (when multi-binary), and elapsed / budget / ETA,
+// whether the run is foreground or detached. It reuses the fz-* card styling (no new CSS).
+export function RunHeader({ bg }) {
+  if (!bg) return null;
+  if (!(bg.running || bg.state === "running" || bg.state === "starting")) return null;
+  const now = Number(bg.now) || Date.now() / 1000;
+  const started = Number(bg.started) || now;
+  const elapsed = Math.max(0, now - started);
+  const budget = Number(bg.budget_seconds) || 0;
+  const converge = !!bg.converge;
+  const eta = budget && elapsed < budget ? budget - elapsed : null;
+  const pct = budget ? Math.min(100, 100 * elapsed / budget) : 0;
+  const plan = bg.plan || [];
+  const DONE = { done: 1, skipped: 1, declined: 1, cancelled: 1, error: 1, timeout: 1 };
+  const done = plan.filter((p) => DONE[p.state]).length;
+  const cur = bg.stage ? plan.find((p) => p.stage === bg.stage) : null;
+  const stageLabel = bg.paused ? "Paused" : (cur ? cur.label : (bg.stage || "starting"));
+  const multi = Number(bg.targets) > 1;
+  const stat = (label, value, cls) => html`
+    <div class="fz-stat"><div class="fz-stat-v ${cls || ""}">${value}</div><div class="fz-stat-k">${label}</div></div>`;
+  return html`
+    <div class="card fz">
+      <div class="fz-head">
+        <${Spinner} label=${bg.paused ? "Paused" : `Run — ${stageLabel}`} />
+        <span class="fz-budget">${fmtElapsed(elapsed)}${budget ? ` / ${fmtElapsed(budget)}` : ""}${
+          eta != null ? html` · <span class="fz-eta">${converge
+            ? `ceiling ~${fmtElapsed(eta)}` : `~${fmtElapsed(eta)} left`}</span>` : ""}</span>
+      </div>
+      ${budget ? html`<div class="fz-bar"><div class="fz-fill" style=${`width:${Math.max(2, Math.min(100, pct))}%`}></div></div>` : null}
+      <div class="fz-stats">
+        ${stat("stage", plan.length ? `${done}/${plan.length}` : "—")}
+        ${multi ? stat("target", `${(Number(bg.target) || 0) + 1}/${bg.targets}`) : null}
+      </div>
+    </div>`;
+}
+
 export function FuzzConsole({ live, state, converge }) {
   if (!live) return null;
   const budget = Number(live.budget) || 0;

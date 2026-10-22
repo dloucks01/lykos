@@ -9,7 +9,7 @@ import { isFolderPick, folderArchive } from "./archive.js";
 import { runAutopilotCase, newController, cancel as cancelAutopilot, coverageOf } from "./autopilot.js";
 import { rankFindings, pocsForFinding, fmtTime, progressText, stageLabel, dedupeFindings, buildRunLog, buildVerdicts, filterByViz } from "./util.js";
 import {
-  html, DropZone, TargetSummary, ProgressLog, ConsolePanel, FuzzConsole, FuzzHealthPanel, FindingCard, EmptyResults, Spinner, UnavailablePanel, RunScorecard, SystemMap, CoveragePanel, CodeView, PipelinePlan, EvidenceModal, FunctionsModal, VerdictStrip, VerdictCard, AnalysisDrawer, ShellVerdict, ExploitsPanel, DrawerFacts, TargetBar, FunctionsPanel, StringsPanel, DisasmPanel, DiffPanel, CrashesPanel, CallGraphCanvas, CaseOverview,
+  html, DropZone, TargetSummary, ProgressLog, ConsolePanel, FuzzConsole, RunHeader, FuzzHealthPanel, FindingCard, EmptyResults, Spinner, UnavailablePanel, RunScorecard, SystemMap, CoveragePanel, CodeView, PipelinePlan, EvidenceModal, FunctionsModal, VerdictStrip, VerdictCard, AnalysisDrawer, ShellVerdict, ExploitsPanel, DrawerFacts, TargetBar, FunctionsPanel, StringsPanel, DisasmPanel, DiffPanel, CrashesPanel, CallGraphCanvas, CaseOverview,
 } from "./components.js";
 
 let _conSeq = 0;
@@ -1240,6 +1240,9 @@ function App() {
               <div class="wb-panel"><${DiffPanel} targets=${targets} findings=${ranked} onVerify=${runPocDiff} verify=${diffVerify} onPatchDiff=${runPatchDiff} patch=${patchDiff} /></div>
             ` : tab === "console" ? html`
               <div class="wb-panel">
+                <!-- Lead with the persistent, whole-run live header (every phase, not just fuzzing),
+                     so the Console is a live run command-center. -->
+                <${RunHeader} bg=${bg} />
                 ${bg && bg.plan ? html`<${PipelinePlan} plan=${bg.plan} targetName=${bg.target_name} target=${bg.target} targets=${bg.targets} now=${bg.now} />` : null}
                 <!-- Lead with the live tool-command console (the actual rizin/gdb/qemu/afl commands
                      and their I/O) -- that is what "Console" means and what an analyst wants to see;
