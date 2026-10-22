@@ -77,7 +77,11 @@ TOOL_VERSION = "directed-1"
 
 # detectors whose findings name a code site worth steering toward (static candidates only;
 # crash/dynamic findings are already confirmed, so they are not fuzzing *targets*).
-_TARGET_DETECTORS = {"dangerous_api", "weak_crypto", "weak_random", "insecure_tmp"}
+_TARGET_DETECTORS = {"dangerous_api", "weak_crypto", "weak_random", "insecure_tmp",
+                     # the harness drives a function to a FUNCTION-level fault and names the function
+                     # addr; steering concolic/directed_fuzz at that function (seeded with the
+                     # harness's gate-passing input) is how that lead climbs to a program-level crash.
+                     "harness"}
 _STATE_RANK = {"corroborated": 3, "candidate": 2, "confirmed": 1, "poc-backed": 0}
 _SEV_RANK = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
 

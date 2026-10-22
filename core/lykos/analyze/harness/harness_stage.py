@@ -8,9 +8,12 @@ must still establish. The finding says exactly that and does NOT claim a program
 """
 from __future__ import annotations
 
-from ...db.dao import FindingDAO, FunctionDAO, TargetDAO
+from ...db.dao import DynResultDAO, FindingDAO, FunctionDAO, TargetDAO
 from ...jobs.registry import register_stage
 from ..detect.catalog import DANGEROUS, SOURCES, normalize
+from ..dynamic import sandbox
+from ..fuzz.runner import invocation
+from ..poc.capture import how_to_feed
 from .emulate import _HUGE_ALLOC, available
 from .fuzz import fuzz_function
 from .rank import rank_functions
@@ -56,6 +59,75 @@ def _drive_shape(rf) -> str:
     guess the common `f(buf, len)` and set the length too, so a `if (len < N) return;` guard does
     not early-return on an uninitialised length and mask the bug."""
     return "ptr" if rf.ptr_len == 1 else "ptr_len"
+
+
+def _replay_against_program(ctx, target, p, leads) -> int:
+    """THE HARNESS -> L3 BRIDGE (honest). A harness crash is demonstrated at the FUNCTION level; to
+    climb the ladder it must become a PROGRAM-level fact. For each function-level crashing input, run
+    the WHOLE program with that input over the operator's channel and record a real `DynResult`:
+
+      * the program faults  -> a genuine program-level crash row (crashed=True). This is exactly what
+        the autopilot prove-ladder consumes (`_distinct_crashes` -> root_cause -> build_poc ->
+        poc_primitive -> build_exploit), so the lead now reaches L3 like any fuzzer-found crash, AND
+        its finding is raised to `confirmed` on a new `harness-replay` channel (a channel can only
+        RAISE -- the honesty invariant).
+      * the program does NOT fault -> a non-crash row (crashed=False) whose input_sha then seeds
+        concolic and directed_fuzz (`_gather_seeds` reads DynResult rows): the harness's hard-won,
+        gate-passing input becomes the seed a steered reachability pass mutates toward a real crash.
+
+    Nothing is fabricated: every row reflects a real execution of the program, and L3 is only ever
+    reached when the program actually crashes. Returns the number of program-level crashes."""
+    if not leads:
+        return 0
+    try:
+        exe = ctx.content.stage_target(target, ctx.scratch(), "target.bin")
+    except Exception as e:                                   # noqa: BLE001 -- staging is best-effort
+        ctx.emit("harness.progress", payload={"replay_error": f"stage_target: {str(e)[:120]}"})
+        return 0
+    mode, base_argv, _why = how_to_feed(ctx.conn, target, p.get("input_sha"), p, content=ctx.content)
+    exec_timeout = float(p.get("exec_timeout", 2))
+    workfile = ctx.scratch() / "harness-replay.bin"
+    dd, fd = DynResultDAO(ctx.conn), FindingDAO(ctx.conn)
+    prog_crashes = 0
+    seen = set()
+    for lead in leads[: int(p.get("replay_cap", 12))]:
+        if ctx.should_cancel():
+            break
+        sha, inp = lead["sha"], lead["input"]
+        if sha in seen:
+            continue
+        seen.add(sha)
+        try:
+            argv, stdin = invocation(mode, workfile, inp, base_argv)
+            r = sandbox.run(exe, argv=argv, stdin=(stdin if mode == "stdin" else b""),
+                            timeout=exec_timeout, arch=target.arch,
+                            endianness=target.endianness, bits=target.bits)
+        except Exception as e:                               # noqa: BLE001 -- one replay must not sink it
+            ctx.emit("harness.progress", payload={"replay_error": str(e)[:120], "input": sha[:12]})
+            continue
+        dd.insert(target.id, target.case_id, run_id=ctx.run_id, input_sha=sha,
+                  input_mode=mode, argv=[], exit_code=r.exit_code, signal=r.signal,
+                  signal_name=r.signal_name, crashed=r.crashed, isolation=r.isolation,
+                  duration_ms=r.duration_ms,
+                  note=("harness-replay: " + ("PROGRAM-LEVEL CRASH of the harness function-level "
+                        "input" if r.crashed else "no program-level fault -- kept as a reachability "
+                        "seed for concolic/directed_fuzz")))
+        if r.crashed:
+            prog_crashes += 1
+            # raise the finding to confirmed: a second, PROGRAM-LEVEL channel now agrees.
+            fd.upsert(target.id, target.case_id, {
+                "cwe": lead["cwe"], "title": lead["title"], "severity": lead["severity"],
+                "detector": "harness", "state": "confirmed",
+                "confidence": max(lead.get("confidence", 0.8), 0.9),
+                "site_addr": lead.get("site_addr"), "function_addr": lead.get("function_addr"),
+                "dedup_key": lead["dedup_key"],
+                "evidence": [{"channel": "harness-replay", "detail": (
+                    f"the function-level crashing input {sha[:12]} ({len(inp)} B) ALSO faults the "
+                    f"whole program when delivered over '{mode}' ({r.signal_name or 'crash'}) -- a "
+                    "program-level crash. This promotes the lead from function-level to a real "
+                    "program crash the exploit ladder can escalate (root_cause -> build_poc -> "
+                    "poc_primitive -> build_exploit).")}]})
+    return prog_crashes
 
 
 def harness_stage(ctx) -> dict:
@@ -107,6 +179,7 @@ def harness_stage(ctx) -> dict:
         if _ai is not None:
             _id_by_addr[_ai] = _f.id
     findings = 0
+    prog_leads = []          # function-level crashes to replay against the whole program (-> L3)
     for rf in cands:
         shape = _drive_shape(rf)
         label = rf.name or hex(rf.addr)
@@ -130,13 +203,15 @@ def harness_stage(ctx) -> dict:
             cwe, kind = _ACCESS_CWE.get(r.access, ("CWE-119", "memory fault"))
             fault = hex(r.fault_addr) if r.fault_addr is not None else "?"
             pc = hex(r.fault_pc) if r.fault_pc is not None else "?"
+            dedup = f"harness:{rf.addr:#x}:{r.fault_pc or 0:#x}:{r.access}"
+            title = f"Harness-demonstrated {kind} in {label} (function-level)"[:200]
             fd.upsert(target.id, target.case_id, {
                 "cwe": cwe, "severity": "high",
-                "title": f"Harness-demonstrated {kind} in {label} (function-level)"[:200],
+                "title": title,
                 "detector": "harness", "state": "corroborated", "confidence": 0.8,
                 "site_addr": pc if r.fault_pc is not None else None,
                 "function_addr": hex(rf.addr),
-                "dedup_key": f"harness:{rf.addr:#x}:{r.fault_pc or 0:#x}:{r.access}",
+                "dedup_key": dedup,
                 "evidence": [{"channel": "harness", "detail": (
                     f"driving {label}({shape}) directly under the emulator, input "
                     f"{sha[:12]} ({len(inp)} B) faults: {r.access} at {fault}, pc {pc}. "
@@ -144,6 +219,10 @@ def harness_stage(ctx) -> dict:
                     "directly with this input) -- a confirmed bug for a library API, and a "
                     "reachable-if-driven lead for a daemon whose entry path a concolic/reachability "
                     "pass must still connect. Not a program-level verified PoC.")}]})
+            prog_leads.append({"sha": sha, "input": inp, "cwe": cwe, "title": title,
+                               "severity": "high", "confidence": 0.8,
+                               "site_addr": pc if r.fault_pc is not None else None,
+                               "function_addr": hex(rf.addr), "dedup_key": dedup})
             findings += 1
         # T6 sequence driving: drive the function with ORDERED message sequences in one emulator
         # state, reaching a fault that lives in a state only entered after a specific message
@@ -174,13 +253,19 @@ def harness_stage(ctx) -> dict:
                     fault = hex(r.fault_addr) if r.fault_addr is not None else "?"
                     pc = hex(r.fault_pc) if r.fault_pc is not None else "?"
                     nth = (r.seq_index + 1) if r.seq_index is not None else "?"
+                    dedup = f"harness:{rf.addr:#x}:{r.fault_pc or 0:#x}:{r.access}"
+                    title = f"Harness-demonstrated {kind} in {label} (stateful sequence)"[:200]
+                    prog_leads.append({"sha": sha, "input": inp, "cwe": cwe, "title": title,
+                                       "severity": "high", "confidence": 0.8,
+                                       "site_addr": pc if r.fault_pc is not None else None,
+                                       "function_addr": hex(rf.addr), "dedup_key": dedup})
                     fd.upsert(target.id, target.case_id, {
                         "cwe": cwe, "severity": "high",
-                        "title": f"Harness-demonstrated {kind} in {label} (stateful sequence)"[:200],
+                        "title": title,
                         "detector": "harness", "state": "corroborated", "confidence": 0.8,
                         "site_addr": pc if r.fault_pc is not None else None,
                         "function_addr": hex(rf.addr),
-                        "dedup_key": f"harness:{rf.addr:#x}:{r.fault_pc or 0:#x}:{r.access}",
+                        "dedup_key": dedup,
                         "evidence": [{"channel": "harness", "detail": (
                             f"driving {label}({shape}) with an ORDERED SEQUENCE of {len(msgs)} "
                             f"message(s), input {sha[:12]} ({len(inp)} B, '\\n'-framed) faults on "
@@ -212,11 +297,22 @@ def harness_stage(ctx) -> dict:
                     "FUNCTION level (called directly with this input); program-level reachability "
                     "for a daemon must still be connected by a later pass.")}]})
             findings += 1
+    # The harness -> L3 bridge: replay the function-level crashes against the WHOLE program so a
+    # real program crash becomes a DynResult the exploit ladder escalates, and the rest become
+    # reachability seeds. Honest -- every row is a real execution; L3 only on a genuine crash.
+    prog_crashes = 0
+    if prog_leads and p.get("replay", True):
+        ctx.progress(msg=f"harness: replaying {len(prog_leads)} function-level crash(es) "
+                         "against the whole program")
+        prog_crashes = _replay_against_program(ctx, target, p, prog_leads)
     ctx.emit("harness.done", payload={"supported": True, "functions": len(cands),
-             "findings": findings})
+             "findings": findings, "program_crashes": prog_crashes})
+    esc = (f"; {prog_crashes} reproduced at PROGRAM level (escalatable to L3)" if prog_crashes
+           else (f"; {len(prog_leads)} seeded for concolic/directed_fuzz reachability"
+                 if prog_leads else ""))
     ctx.progress(pct=100, msg=f"harness: {findings} function-level fault(s) across "
-                             f"{len(cands)} driven target(s)")
-    return {"findings": findings, "functions": len(cands)}
+                             f"{len(cands)} driven target(s){esc}")
+    return {"findings": findings, "functions": len(cands), "program_crashes": prog_crashes}
 
 
 def enqueue_harness(queue, target, *, params=None, force: bool = True):

@@ -1181,6 +1181,17 @@ def _recover_missing_fault_pcs(store, target_id, crashes):
             observe.absorbed(_log, "fault-pc persist failed")
 
 
+def _has_unproven_harness_leads(store, target_id) -> bool:
+    """True when the on-demand `harness` stage left a function-level lead that has not yet been
+    demonstrated at the program level (state still candidate/corroborated). Used to force the steered
+    concolic pass so such a lead gets a chance to climb to a program crash and then L3."""
+    from ..db.dao import FindingDAO
+    for f in FindingDAO(store.conn).list_by_target(target_id):
+        if (f.detector or "") == "harness" and (f.state or "candidate") in ("candidate", "corroborated"):
+            return True
+    return False
+
+
 def _distinct_crashes(store, target_id):
     crashes = [d for d in DynResultDAO(store.conn).list_by_target(target_id)
                if d.crashed and d.input_sha]
@@ -2012,6 +2023,13 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
             # never reached -- exactly what concolic solves for.
             cov_pct = _best_block_pct(store, tid)
             want_concolic = not crashes or (cov_pct is not None and cov_pct < 60)
+            # An ON-DEMAND harness run leaves function-level leads the fuzzer did not reach from the
+            # entry: force the steered concolic pass so it drives toward those functions (seeded with
+            # the harness's gate-passing inputs, now DynResult rows) even when other crashes exist --
+            # otherwise a harness-only lead would never be escalated. Gated on harness having run, so
+            # the default plan (no harness) is unaffected ("stop adding fuzzing to every run").
+            if not want_concolic and _has_unproven_harness_leads(store, tid):
+                want_concolic = True
             # Concolic runs REGARDLESS of size -- a large binary must not lose the symbolic-execution
             # capability. It is kept tractable by SCOPING, not skipping: angr loads with
             # auto_load_libs=False and explores from a bounded state/step budget, and on a large
