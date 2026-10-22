@@ -9,7 +9,7 @@ import { isFolderPick, folderArchive } from "./archive.js";
 import { runAutopilotCase, newController, cancel as cancelAutopilot, coverageOf } from "./autopilot.js";
 import { rankFindings, pocsForFinding, fmtTime, progressText, stageLabel, dedupeFindings, buildRunLog, buildVerdicts, filterByViz } from "./util.js";
 import {
-  html, DropZone, TargetSummary, ProgressLog, ConsolePanel, FuzzConsole, FindingCard, EmptyResults, Spinner, UnavailablePanel, RunScorecard, SystemMap, CoveragePanel, CodeView, PipelinePlan, EvidenceModal, FunctionsModal, VerdictStrip, VerdictCard, AnalysisDrawer, ShellVerdict, ExploitsPanel, DrawerFacts, TargetBar, FunctionsPanel, StringsPanel, DisasmPanel, DiffPanel, CrashesPanel, CallGraphCanvas, CaseOverview,
+  html, DropZone, TargetSummary, ProgressLog, ConsolePanel, FuzzConsole, FuzzHealthPanel, FindingCard, EmptyResults, Spinner, UnavailablePanel, RunScorecard, SystemMap, CoveragePanel, CodeView, PipelinePlan, EvidenceModal, FunctionsModal, VerdictStrip, VerdictCard, AnalysisDrawer, ShellVerdict, ExploitsPanel, DrawerFacts, TargetBar, FunctionsPanel, StringsPanel, DisasmPanel, DiffPanel, CrashesPanel, CallGraphCanvas, CaseOverview,
 } from "./components.js";
 
 let _conSeq = 0;
@@ -142,6 +142,7 @@ function App() {
   const [consoleLines, setConsoleLines] = useState([]); // job.exec: tool commands + I/O
   const consoleSeen = useRef(new Set());              // de-dupe exec events by server id
   const [fuzzLive, setFuzzLive] = useState(null);     // live fuzzing telemetry (latest .progress)
+  const [fuzzHealth, setFuzzHealth] = useState(null); // per-engine fuzzing health verdict (R1)
   // The effective theme: an explicit choice (data-theme, set pre-paint from localStorage) wins,
   // else the OS preference. The toggle flips it, applies it to <html>, and persists the choice.
   const [theme, setTheme] = useState(() => {
@@ -392,6 +393,12 @@ function App() {
             // Fuzzing/coverage/directed milestones -> the Console, so "what is the fuzzer doing?"
             // has a visible answer. Discrete domain events only (campaign start, harvest, done,
             // did-not-run) -- not the per-batch job.progress above, which would flood the log.
+            if (ev.type === "fuzz.health") {
+              // R1: the per-engine health verdict (not telemetry) -- capture it, don't log it as a
+              // console line. Says WHY the dynamic engines contributed what they did.
+              setFuzzHealth(ev.payload || null);
+              continue;
+            }
             if (/^(coverage|fuzz|directed|env_fuzz|net_fuzz|libfuzzer|concolic|harness)[._]/.test(ev.type)) {
               // Live fuzzing telemetry: a `.progress` carries execs/rate/elapsed/budget/coverage,
               // and the stage's terminal event clears the live panel. Everything else is a console
@@ -487,6 +494,10 @@ function App() {
       setSysmap(sm);
       setVerifications(verifs || {});
       setScorecard((cards && cards.cards) || []);
+      // Reopened case: recover the fuzzing-health verdict from the latest scorecard card (it lives
+      // in the live event stream otherwise, which a reopen has no access to).
+      const _fh = ((cards && cards.cards) || []).map((c) => c && c.fuzz_health).filter(Boolean);
+      if (_fh.length) setFuzzHealth(_fh[_fh.length - 1]);
       // Rebuild the coverage panel from the fuzz runs' outputs, so a reopened case shows how
       // much of each binary the earlier search reached -- keeping the best block-coverage read.
       const cov = {};
@@ -546,7 +557,7 @@ function App() {
       setError(`could not pack the folder: ${e.message || e}`);
       return;
     }
-    if (!append) { setLog([]); setFindings([]); setPocs([]); setAdvice(null); setRan(false); setUnavailable([]); setSysmap(null); setCoverage({}); setVerifications({}); setScorecard([]); setBg(null); bgPollRef.current++; bgEventsAfter.current = -1; }
+    if (!append) { setLog([]); setFindings([]); setPocs([]); setAdvice(null); setRan(false); setUnavailable([]); setSysmap(null); setCoverage({}); setVerifications({}); setScorecard([]); setFuzzHealth(null); setBg(null); bgPollRef.current++; bgEventsAfter.current = -1; }
     try {
       const cid = await ensureCase();
       const got = append ? [...targets] : [];
@@ -1031,6 +1042,7 @@ function App() {
               </div>
             ` : html`<div class="wb-soon">This view is coming to the workbench.</div>`}
 
+            <${FuzzHealthPanel} health=${fuzzHealth} />
             <${RunScorecard} cards=${scorecard} targetName=${activeTarget && activeTarget.filename} />
             <${UnavailablePanel} items=${unavailable} />
           </main>

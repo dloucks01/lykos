@@ -29,24 +29,32 @@ the fuzzing silently fails or never reaches the input surface.
 
 ---
 
-## R1 — Fuzzing engines must actually run (no silent failures)   `[ ] TODO`
+## R1 — Fuzzing engines must actually run (no silent failures)   `[~] IN PROGRESS`
 
-**Goal.** Before/at run start, a per-engine **preflight self-test** confirms each fuzzing engine
-actually *executes the target and produces real execs/coverage*. When one can't run (the air-gap
-breakage), the autopilot reports **which engine and why** and falls back, instead of silently
-degrading to static-only.
+**Goal.** A per-engine health verdict confirms each fuzzing engine actually *executes the target*,
+and when one can't (the air-gap breakage) the autopilot reports **which engine and why** instead of
+silently degrading to static-only.
 
-- [ ] Preflight for each engine: afl-qemu-trace (instrumentation), coverage_fuzz / afl, blind
-      `fuzz`, concolic — each must demonstrably run the target once and return execs/coverage.
-- [ ] On failure: a visible, specific diagnosis event (e.g. "afl-qemu-trace failed to instrument on
-      this host: <reason>; fell back to coverage_fuzz") surfaced in the web-GUI run log.
-- [ ] A run that produces static-only findings must say *why* fuzzing contributed nothing (declined
-      vs failed vs starved), never look like a clean empty result.
-- [ ] Fold the live "is this engine producing execs/coverage" signal into the health indicator (see
-      U2) so a stalled/failed engine is visible immediately.
+- [x] **Per-engine health verdict + surfacing** — `fuzz/health.py` (`summarize`, unit-tested) folds
+      the scattered per-stage signals (afl handshake abort, starved, noprogress, did-not-run,
+      declined) into one `{engines, verdict, note}`; `orchestrate` emits it as a `fuzz.health` event
+      + stores it in the scorecard; the web GUI renders it (`FuzzHealthPanel`). A `verdict: none`
+      is the alert that a static-only result is a tooling outcome, not a clean binary. FAILED is
+      reserved for a concrete execution failure (aborted/did_not_run) so it stays trustworthy;
+      "not applicable" (no source / not a server) is a DECLINE, not a failure.
+- [x] **A static-only run says why** each engine contributed nothing (ran / failed+reason /
+      starved / no-progress / n/a / skipped), never a bare empty result.
+- [ ] **Upfront functional preflight** — run each engine once *before* committing the search budget
+      (afl-showmap-style instrumentation check) so a broken engine is caught in seconds and the
+      budget is redirected, not spent on a doomed campaign. (Current increment is post-hoc: it
+      reports health from the run's own signals at scorecard time.)
+- [ ] **Live per-engine health during the run** (not only at scorecard time) — fold into U2's
+      health badge so a failing engine shows the moment it aborts.
 
-**Acceptance.** On a cold air-gap bundle, a deliberately-broken engine is named with a reason in the
-GUI; the autopilot still completes via a working engine; `make verify-e2e` stays green.
+**Acceptance.** On a cold air-gap bundle, a broken engine is named with a reason in the GUI; the
+autopilot still completes via a working engine; `make verify-e2e` stays green.  *(Surfacing done +
+validated on fp3: `fuzz.health` event lands, verdict + per-engine reasons render. Upfront preflight
++ live-during-run still open.)*
 
 **Cross-refs.** memory: offline-bundle-tool-gaps, airgap-engagement-gaps, engagement-large-binary-round.
 

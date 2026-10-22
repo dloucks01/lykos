@@ -297,6 +297,45 @@ export function FuzzConsole({ live }) {
     </div>`;
 }
 
+// R1 (doc 47): per-engine fuzzing health. The honest answer to "why did this run find nothing
+// dynamically" -- afl could not instrument the target (handshake/loader), a campaign was starved,
+// the target reached no code because it needs a config/args, or the engine was simply not
+// applicable (no source for libFuzzer, not a server for net_fuzz). A `verdict` of "none" is the
+// alert that a static-only result here is a tooling outcome, not a clean binary. Fed by the
+// server's `fuzz.health` event / scorecard, so the GUI never silently presents an empty run.
+const _FH_COLOR = { ok: "#2ec28a", failed: "#e5534b", error: "#e5534b", noprogress: "#d9a441",
+                    starved: "#d9a441", declined: "#8a94a6", skipped: "#8a94a6", not_run: "#8a94a6" };
+const _FH_LABEL = { ok: "ran", failed: "FAILED", error: "error", noprogress: "no progress",
+                    starved: "starved", declined: "n/a", skipped: "skipped", not_run: "—" };
+const _FH_ENGINE = { coverage_fuzz: "coverage-guided (AFL)", fuzz: "blind fuzz",
+                     directed_fuzz: "sink-directed", net_fuzz: "network/socket",
+                     boundary_fuzz: "IPC/boundary", env_fuzz: "environment",
+                     libfuzzer: "libFuzzer (source)", concolic: "concolic solver" };
+
+export function FuzzHealthPanel({ health }) {
+  if (!health || !Array.isArray(health.engines) || !health.engines.length) return null;
+  const v = health.verdict;
+  const banner = v === "ok" ? "#2ec28a" : v === "degraded" ? "#d9a441" : "#e5534b";
+  return html`
+    <div class="card" style="padding:10px 12px">
+      <div style=${`border-left:3px solid ${banner};padding-left:10px;margin-bottom:8px`}>
+        <div style="font-weight:600;font-size:13px">Fuzzing engine health</div>
+        <div style="font-size:12px;opacity:.8;margin-top:2px">${health.note}</div>
+      </div>
+      <div>
+        ${health.engines.map((e) => html`
+          <div key=${e.engine} style="display:flex;gap:10px;align-items:baseline;padding:3px 0;font-size:12px">
+            <span style="flex:0 0 150px">${_FH_ENGINE[e.engine] || e.engine}</span>
+            <span style=${`flex:0 0 72px;font-weight:600;color:${_FH_COLOR[e.status] || "#8a94a6"}`}>${_FH_LABEL[e.status] || e.status}</span>
+            <span style="flex:1;opacity:.75;overflow:hidden;text-overflow:ellipsis">${
+              e.status === "ok"
+                ? `${_fmtN(e.execs)} execs${e.coverage ? ` · ${e.coverage}` : ""}`
+                : (e.reason || "")}</span>
+          </div>`)}
+      </div>
+    </div>`;
+}
+
 // A live console: the actual tool commands (rizin, angr, afl, pypcode worker...) and a tail of
 // their I/O, streamed from the server's job.exec events. Separate from the Run log (which is the
 // human "what it found"): this is the "what it is doing right now", proof that work is happening.

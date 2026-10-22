@@ -1538,6 +1538,22 @@ def _scorecard(store, target, bud, status, *, absorbed_base=None,
         # The worst offenders, named by module.function:line so they are directly openable.
         "top": [{"site": k, "count": v} for k, v in list(absorbed.items())[:8]],
     }
+    # R1 (doc 47): one honest per-engine fuzzing-health verdict. The per-stage failure signals
+    # already exist (afl handshake abort, a starved campaign, a target that reached no code because
+    # it needs a config/args) but were scattered -- so a run that produced static-only findings
+    # looked like a clean 'no bugs' instead of "the fuzzers could not run here, and here is why".
+    # `health.summarize` folds them into {engines:[...], verdict, note}; a `none` verdict is the
+    # alert that this run's dynamic coverage is a tooling outcome, not a property of the binary.
+    # (Uses the per-TARGET plan to choose which engines to report; events are the case's, so in a
+    # multi-target case an engine's signal could carry over -- acceptable, same scoping as by_engine.)
+    try:
+        from .fuzz import health as _fuzz_health
+        card["fuzz_health"] = _fuzz_health.summarize(
+            status.get("plan") or [],
+            [{"type": e.type, "payload": e.payload} for e in events])
+        store.events.append("fuzz.health", case_id=target.case_id, payload=card["fuzz_health"])
+    except Exception:                                    # noqa: BLE001 -- advisory, never fail on it
+        _log.debug("fuzz-health summary failed for %s", target.id, exc_info=True)
     store.events.append(SCORECARD_EVENT, case_id=target.case_id, payload=card)
     return card
 
