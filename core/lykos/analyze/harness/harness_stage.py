@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from ...db.dao import FindingDAO, FunctionDAO, TargetDAO
 from ...jobs.registry import register_stage
+from ..detect.catalog import DANGEROUS, SOURCES, normalize
 from .emulate import _HUGE_ALLOC, available
 from .fuzz import fuzz_function
 from .rank import rank_functions
@@ -22,6 +23,39 @@ _ACCESS_CWE = {"read": ("CWE-125", "out-of-bounds read"),
                "write": ("CWE-787", "out-of-bounds write"),
                "fetch": ("CWE-119", "control-flow corruption")}
 _X86_64 = {"x86-64", "x86_64", "amd64"}
+
+#: Names that are IMPORTED libc routines, not the program's own code: the decompiler recovers their
+#: PLT thunk as a "function", but driving it is pointless (it just jumps through the GOT) and -- since
+#: its signature is the known libc prototype -- it scores a perfect harnessable shape and crowds the
+#: real parsers out of the candidate list. Exclude them from driving.
+_LIBC_THUNKS = set(DANGEROUS) | set(SOURCES) | {
+    "memcpy", "memmove", "memset", "mempcpy", "strlen", "strnlen", "strchr", "strrchr", "strcmp",
+    "strncmp", "puts", "putchar", "putc", "printf", "fprintf", "vprintf", "snprintf", "fwrite",
+    "fputs", "fflush", "setvbuf", "malloc", "calloc", "realloc", "free", "exit", "abort",
+    "__stack_chk_fail", "__libc_start_main", "__cxa_finalize", "__assert_fail", "perror",
+}
+
+
+def _is_import_thunk(rf) -> bool:
+    return normalize(rf.name) in _LIBC_THUNKS
+
+
+def _drivable(rf) -> bool:
+    """A function the harness can meaningfully drive: NOT an imported-libc thunk, and either a
+    pointer-shaped prototype OR a real parser (touches a dangerous sink / reads input) whose param
+    types the decompiler simply did not recover -- common on -O0 and stripped builds, where the old
+    `ptr_len >= 1` gate silently dropped the actual vulnerable function."""
+    if _is_import_thunk(rf):
+        return False
+    return rf.ptr_len >= 1 or bool(rf.sinks) or bool(rf.sources)
+
+
+def _drive_shape(rf) -> str:
+    """How to hand the fuzzed buffer to the function. ptr_len=2 (pointer+length recovered) -> set
+    both; ptr_len=1 (a lone pointer, no length) -> pointer only; ptr_len=0 (nothing recovered) ->
+    guess the common `f(buf, len)` and set the length too, so a `if (len < N) return;` guard does
+    not early-return on an uninitialised length and mask the bug."""
+    return "ptr" if rf.ptr_len == 1 else "ptr_len"
 
 
 def harness_stage(ctx) -> dict:
@@ -46,15 +80,16 @@ def harness_stage(ctx) -> dict:
         return {}
 
     ranked = rank_functions(ctx.conn, target.id, top=int(p.get("rank_top", 40)))
-    # Only functions with a POINTER argument can be driven by this model (we point it at the fuzzed
-    # buffer). A top-ranked parser that ingests via fd/FILE instead is not directly harnessable yet.
-    cands = [r for r in ranked if r.ptr_len >= 1][:int(p.get("max_functions", 6))]
+    # Drive the program's own promising parsers -- never an imported-libc PLT thunk -- pointing the
+    # fuzzed buffer at their pointer argument. A ranked function that touches a sink / reads input is
+    # driven even when its param TYPES were not recovered (the old `ptr_len >= 1` gate dropped the
+    # real vulnerable function on -O0 / stripped builds; see _drivable / _drive_shape).
+    cands = [r for r in ranked if _drivable(r)][:int(p.get("max_functions", 6))]
     if not cands:
         ctx.emit("harness.done", payload={"supported": True, "findings": 0,
-                 "note": ("no pointer-argument function among the top ranked targets -- the "
-                          "promising parsers take input via fd/FILE, which this harness model does "
-                          "not drive yet")})
-        ctx.progress(pct=100, msg="harness: no pointer-arg target to drive")
+                 "note": ("no drivable parser among the top ranked targets -- the promising ones "
+                          "take input via fd/FILE, which this harness model does not drive yet")})
+        ctx.progress(pct=100, msg="harness: no drivable target")
         return {}
 
     data = ctx.content.path(target.sha256).read_bytes()
@@ -73,7 +108,7 @@ def harness_stage(ctx) -> dict:
             _id_by_addr[_ai] = _f.id
     findings = 0
     for rf in cands:
-        shape = "ptr_len" if rf.ptr_len == 2 else "ptr"
+        shape = _drive_shape(rf)
         label = rf.name or hex(rf.addr)
         _full = FunctionDAO(ctx.conn).get(_id_by_addr.get(rf.addr)) if rf.addr in _id_by_addr else None
         dict_words = dictionary_from_ir(_full.ir if _full else None)
