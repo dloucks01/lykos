@@ -245,9 +245,12 @@ upgrade improves what the non-fuzz recover phase can confirm).
       scan + CVE match, commit `f876e40` (validated on asterisk: OpenSSL 3.5.5 + 27 CVEs).
 - [ ] **Avenue #2 extension** — main-binary structural / FLIRT version fingerprinting (identify the
       product+version of the MAIN binary, not just its linked deps). **Not started.**
-- [ ] **Avenue #3 — structural decompiler queries** (weggli/structural pattern queries over recovered
-      code). **Not started.**
-- [ ] **Avenue #4 — logic / auth bugs** (broken-contract checks beyond memory safety). **Not started.**
+- [x] **Avenue #3 — structural decompiler queries** — ALREADY BUILT: `analyze/weggli.py` runs a
+      curated pack of structural (AST) pattern queries; `directed.py` uses weggli hits to steer the
+      campaign toward source-flagged code. (Audit 2026-10-21.)
+- [ ] **Avenue #4 — logic / auth bugs** (broken-contract checks beyond memory safety) — a genuine
+      NEW capability class (lykos does memory-corruption + injection today). **Large, dedicated
+      build; not started.**
 - [x] **Avenue #5 — exploit composition on stripped (partial)** — the (a) ret2win shell-call fix is
       one increment; more composition work possible.
 - [x] **Harness track T1 / T2** — T1 fuzz-worthiness ranker + T2 emulated single-function executor +
@@ -261,9 +264,19 @@ upgrade improves what the non-fuzz recover phase can confirm).
 
 ## Proactively-identified gaps (model-sourced — confirm against code, then prioritize)
 
-Operator-real gaps surfaced without being asked, grounded in how a time-boxed, air-gapped
-engagement on real binaries actually goes. Each needs a quick confirm against the current code
-before building (some are partly done — note that rather than rebuild).
+**AUDITED 2026-10-21 — most already exist in the mature system** (the "confirm against code before
+building" caveat paid off; these were largely re-discoveries, not gaps).
+
+**Already built (verified):** P1 crash triage/ranking (`crash_dedup_key` by signal+fault_pc+
+discriminator, `exploitability` ratings, `CrashesPanel`); P4 target-corpus seeding (`_strings_for`
+dictionary + format models + boundary configs + menu op-sequences); P5 env/filesystem (env_fuzz +
+getenv detection + a writable per-run CWD); P6 stateful/menu driving (`fuzz/menu.py`,
+`fuzz/command.py`, `interaction.py`); P7 hang/DoS (CWE-835 "input that does not terminate" +
+resource-exhaustion); P9 multi-binary (`CaseOverview` + link_case/cross_taint/whole_system).
+
+**Genuine remaining (nicher):** P2 mid-fuzz checkpoint-resume (the server run already survives
+tab-close + persists; true mid-campaign resume is the gap, low value), P8 bundle/version freshness
+warning, P10 BinDiff/patch-diff.
 
 - [ ] **P1 · Crash triage & exploitability ranking.** A run that yields many crashes should
       auto-dedup by root cause and rank by exploitability so the operator sees the few that matter,
