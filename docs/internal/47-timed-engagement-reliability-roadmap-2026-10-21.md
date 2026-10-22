@@ -165,22 +165,30 @@ both modes.
 
 ---
 
-## U2 — Live progress + ETA + health (Running / Converged / Stalled-hung)   `[ ] TODO`
+## U2 — Live progress + ETA + health (Running / Converged / Stalled-hung)   `[~] IN PROGRESS`
 
 **Goal.** A live panel in the GUI driven by `backgroundStatus` (`status.budget` =
 {total, elapsed, remaining, phase}) + the event stream (`*.progress` heartbeats:
 execs, rate, coverage blocks_hit/known, crashes).
 
-- [ ] Overall: current phase, elapsed/total, **ETA** (remaining; a hard countdown in time-boxed
-      modes; a coverage-trend indicator in Thorough).
-- [ ] Live fuzz telemetry: execs/s, coverage %, crash tally, current stage.
-- [ ] Health badge off real signals: **Running** (new edge/corpus recently, healthy rate),
-      **Converged** (healthy rate, flat coverage for a window), **Stalled/hung** (rate ≈ 0, or no
-      heartbeat for H seconds). In Thorough a Stalled campaign gets a short grace then auto-skip so
-      it can't eat the safety ceiling.
+- [x] **Live fuzz telemetry + ETA** — the `FuzzConsole` shows elapsed/budget, a progress bar, **ETA**
+      (`~Xm left`), execs, exec/s, coverage %, behaviours, crashes. MOVED out of the bottom of the
+      long pipeline rail (below the fold, never seen) to directly under the run bar in the main
+      content, so it is visible DURING a run. Verified live on fileparser3.
+- [x] **Live health badge** — derived from the heartbeat trend in the GUI: **finding coverage**
+      (green, coverage still growing) → **coverage steady** (amber, flat for 20s at a healthy rate —
+      the convergence signal) → **stalled — no heartbeat** (red, >15s with no `.progress` during an
+      active run, decided in the poll tick). Verified live: badge went running → coverage steady as
+      coverage plateaued at 40%.
+- [ ] **Per-phase ETA honesty in convergence mode** — show a coverage-trend indicator rather than a
+      fixed countdown when `converge` is on (today it still shows the ceiling countdown).
+- [ ] **Server-authoritative stall → auto-skip in Thorough** — the badge now SHOWS stalled; wiring a
+      Stalled campaign to a short-grace auto-skip belongs with the U1-engine (AFL already self-skips
+      a hung target; this is for the non-AFL campaigns).
 
 **Acceptance.** During a GUI run the operator can see how much is left, how fast it's going, how much
-of the program is covered, and whether it's progressing / done / stuck — without reading logs.
+of the program is covered, and whether it's progressing / done / stuck — without reading logs. *(Met
+for the live telemetry/ETA/badge; convergence-ETA wording + non-AFL auto-skip remain.)*
 
 ---
 
