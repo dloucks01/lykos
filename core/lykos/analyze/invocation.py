@@ -99,7 +99,7 @@ def verb_subcommand(usage, prog=None):
     return None
 
 
-_OPTSTRING = re.compile(r"^[+-]?:?(?=[^:]*:)([A-Za-z0-9]:{0,2}){2,24}$")
+_OPTSTRING = re.compile(r"^[+-]?:?(?=[^:]*:)([A-Za-z0-9]:{0,2}){2,40}$")
 # usage: prog -c <config> --jar=FILE
 _USAGE_FLAG = re.compile(r"(--?[A-Za-z][A-Za-z0-9_-]*)(?:[= ]+([<\[]?[A-Za-z0-9_.<>\[\]-]+))?")
 _USAGE_LINE = re.compile(r"(?i)\busage\b\s*:?\s")
@@ -292,25 +292,41 @@ _NOT_OPTSTRING = {"usage", "error", "warning", "note", "info", "fatal", "debug",
 
 
 def from_optstring(strings) -> dict:
-    """Flags from a getopt option string. `{flag: takes_value}`."""
-    out: dict = {}
+    """Flags from the SINGLE BEST getopt option string. `{flag: takes_value}`.
+
+    A program has ONE getopt string; UNIONING every optstring-like string across the binary
+    invented dozens of bogus flags (asterisk: 50 flags incl. `-0..-9`, from several matching
+    strings) and `discover`'s cap then dropped the lot -- throwing away the REAL options (asterisk's
+    `BC:cde:FfG:ghIiL:M:mnpqRrs:TtU:VvWXx:`, where `C:` is the config flag). Pick the longest
+    well-formed candidate that carries value-colons (a getopt string that actually takes a
+    config/file), and parse THAT one. Returning one real string instead of a union is what lets the
+    caller trust it past its small-count cap."""
+    best = None
+    best_score = -1
     for s in strings:
         t = (s or "").strip()
-        if not (3 <= len(t) <= 64) or not _OPTSTRING.match(t):
+        if not (3 <= len(t) <= 72) or not _OPTSTRING.match(t):
             continue
         if t.lower().rstrip(":").lstrip("+-") in _NOT_OPTSTRING:
             continue
-        body = t.lstrip("+-").lstrip(":")
-        i = 0
-        while i < len(body):
-            ch = body[i]
-            n = 0
-            while i + 1 + n < len(body) and body[i + 1 + n] == ":":
-                n += 1
-            if ch.isalnum():
-                # two colons is an OPTIONAL value; one is required
-                out["-" + ch] = n >= 1
-            i += 1 + n
+        # A real getopt string TAKES arguments (has value-colons) and is longer; prefer those so a
+        # short colon-less accidental match never wins over the program's actual option string.
+        score = len(t) + (16 if ":" in t.lstrip("+-:") else 0)
+        if score > best_score:
+            best, best_score = t, score
+    out: dict = {}
+    if best is None:
+        return out
+    body = best.lstrip("+-").lstrip(":")
+    i = 0
+    while i < len(body):
+        ch = body[i]
+        n = 0
+        while i + 1 + n < len(body) and body[i + 1 + n] == ":":
+            n += 1
+        if ch.isalnum():
+            out["-" + ch] = n >= 1       # two colons is an OPTIONAL value; one is required
+        i += 1 + n
     return out
 
 
@@ -909,7 +925,12 @@ def discover(strings, *, usage_hint: Optional[str] = None, help_text: Optional[s
         # no usage line, but --help gave us a real, verifiable option table: trust it.
         flags_in, sources, confidence = dict(help_flags), ["help"], "high"
         _refine(flags_in, sources)
-    elif len(opt) and len(opt) <= 12:
+    elif len(opt) and len(opt) <= 40:
+        # `opt` is now ONE getopt string's flags (from_optstring picks the single best, not a union),
+        # so a large count is a real large option set (a daemon like asterisk has ~29) rather than
+        # dozens of unioned false matches -- the reason the old <=12 cap existed. Confidence stays
+        # `medium`: a getopt string is authoritative about which flags exist, but the usage line and
+        # --help (above) carry the value SHAPES, which this path lacks.
         flags_in, sources, confidence = dict(opt), ["getopt"], "medium"
     else:
         # No flags, but a usable invocation can still be named by positionals: a converter's

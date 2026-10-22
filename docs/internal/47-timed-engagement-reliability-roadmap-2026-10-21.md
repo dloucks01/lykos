@@ -96,7 +96,7 @@ found by running the machinery on a REAL daemon (asterisk), not building it from
       `--help`/`-h`/`help`/`--usage`, scores the option table, feeds `discover`). It was dead for
       dynamically-linked daemons because the target couldn't load; the dep fix above unblocks it, and
       self-name anchoring keeps the terse static usage from poisoning the richer `--help` result.
-- [ ] **R2.b · Isolate the getopt optstring + relax the cap** — now a FALLBACK for the static-only
+- [x] **R2.b · Isolate the getopt optstring + relax the cap** -- DONE — now a FALLBACK for the static-only
       case (no `--help` obtainable). `from_optstring` UNIONS matches (asterisk → 50 bogus flags) and
       `discover`'s `<=12` cap drops the real `BC:cde:FfG:...`. Pick the single best getopt string and
       trust one well-formed optstring past 12. **Precision-sensitive** → needs the conformance guard.

@@ -403,3 +403,21 @@ def test_verb_file_does_not_fire_without_a_file_positional():
     assert invocation.verb_subcommand("usage: tool start --daemon") is None
     # a converter (two bare positionals) stays a converter, not a verb-dispatch
     assert invocation.verb_subcommand("usage: conv input output") is None
+
+
+def test_optstring_picks_the_single_best_not_a_union():
+    """R2.b: a program has ONE getopt string. Unioning every optstring-like match invented dozens of
+    bogus flags (asterisk: 50, incl -0..-9) which the count cap then dropped -- losing the real
+    options. from_optstring now takes the single best (longest, value-colon-carrying) candidate."""
+    strings = [
+        "BC:cde:FfG:ghIiL:M:mnpqRrs:TtU:VvWXx:",   # the real one: 29 flags, -C takes a config value
+        "a:b:c:",                                   # a shorter decoy optstring
+        "0123456789ABCDEF",                         # noise: no colon, not a getopt string
+    ]
+    opt = invocation.from_optstring(strings)
+    assert opt.get("-C") is True, "the real getopt string's value flag -C (config) must be recovered"
+    assert "-9" not in opt and "-0" not in opt, "decoy/noise strings must NOT union into the flags"
+    assert len(opt) == 29
+    # discover trusts the single real getopt string past the old <=12 cap
+    found = invocation.discover(strings)
+    assert any(f["flag"] == "-C" for f in (found.get("flags") or []))
