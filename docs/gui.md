@@ -1,80 +1,100 @@
 # The Workbench UI
 
----
+The analyst-facing interface is a **dependency-free Preact + htm single page**, served by the local
+API (`core/lykos/api/`, static assets under `core/lykos/api/static/app/`). There is **no build step**
+and no framework install: the ESM runtime is vendored, the page is plain JavaScript modules, and the
+core stays stdlib-only. It was chosen over a Tauri/Electron desktop target for zero-install, offline
+delivery — `./start` serves it on loopback and the operator opens it in a browser.
 
-## GUI: Architecture, Views, and Visual Design System
+> Historical note: an earlier `gui.md` specified a Tauri (Rust webview) + React + TypeScript + WebGL
+> desktop app. That target was **not** built; this document describes the shipped browser workbench.
+> The design-system principles from that plan (§"Visual & interaction design", below) *were* kept.
 
-The UI is a first-class deliverable: IDA/Ghidra/Binary-Ninja-class RE views + a fuzzing dashboard + a
-findings board, unified and *stylized*. It must make the **human the decision-maker** at every
-candidate→confirmed→PoC promotion (the ~32% ceiling means the analyst is in charge).
+## Frontend architecture
 
-### 9.1 Frontend architecture
-- **Shell:** Tauri (Rust + system webview) preferred for a light, offline, native-feeling desktop app;
-  Electron acceptable if webview inconsistencies bite. (Decision + rationale in `architecture.md`.)
-- **UI stack:** React + TypeScript, a component library themed to our design system, virtualized lists for
-  huge disassembly/finding tables, a canvas/WebGL graph renderer (Sigma/Cytoscape/custom) for CFG/callgraph.
-- **Live data:** websocket to the backend event bus — fuzzing metrics, job progress, log tails stream in real time.
-- **Layout:** dockable/tab panels (VS Code-style) so analysts arrange disasm + decompile + hex + debugger
-  as they like; per-case saved layouts.
+- **Stack:** Preact + htm (tagged-template JSX, no transpile), ES modules, served static by the API.
+- **Files** (`core/lykos/api/static/app/`): `app.js` (the top-level workbench view and run state),
+  `components.js` (the finding cards, tabs, panels, call-graph, charts), `autopilot.js` (the run
+  lifecycle + polling), `api.js` (fetch wrappers), `util.js` (formatting/helpers), `archive.js`
+  (Recent analyses). A `/classic.html` fallback view remains for a minimal UI.
+- **Live data:** the page polls the API for run status and streams the run log; "Run in background"
+  keeps the run alive server-side (`orchestrate.py`) after the tab closes, and a case is reopenable
+  from **Recent analyses** with its run log, coverage, findings and verify badges restored.
+- **Backend coupling:** the Python backend loads once at startup — static GUI files update on a
+  browser reload, but backend changes need a server restart.
 
-### 9.2 Core views
-1. **Case dashboard** — pipeline DAG (`architecture.md`) with per-stage status, run/skip/re-run, resource usage,
-   headline finding counts by state and severity.
-2. **Reverse-engineering workspace** — synchronized: disassembly | decompiled+summarized pseudo-C |
-   interactive CFG | callgraph | hex/bytes | strings/imports. Click a function anywhere → all panes follow.
-   Inline the deterministic name/type suggestions (signatures, corpus-diff, runtime metadata, heuristics)
-   with accept/reject + provenance (`pipeline.md`).
-3. **Findings board** — the heart of the tool. Cards move across lanes **Candidate → Corroborated →
-   Confirmed → PoC-backed** (`pipeline.md`). Each card: CWE tags, confidence, evidence trail, involved functions,
-   and one-click jumps to the RE site / crash / PoC. Filter by CWE/severity/state/vector.
-4. **Dynamic-analysis + debugger** — sandbox tier selector, run controls, live trace, register/stack/memory,
-   heap visualizer, breakpoints/watchpoints, syscall/API log. (`pipeline.md`)
-5. **Fuzzing dashboard** — live coverage-over-time, execs/sec, unique-crash feed, corpus stats, per-instance
-   status, campaign start/stop/resume; click a crash → triage view. (`pipeline.md`)
-6. **Triage + PoC studio** — crash detail, minimized input, root-cause slice, exploitability, the PoC ladder
-   with a "build/verify PoC" action and the recorded demo player. (`pipeline.md`)
-7. **Report builder** — assemble findings into a report, preview, export HTML/PDF/SARIF. (`pipeline.md`)
-8. **Recovery view** — the deterministic naming stack (`pipeline.md`): signature/FID matches, corpus-diff name
-   transfers (BinDiff), runtime-metadata recovery (Go pclntab / C++ RTTI), and behavioral tags, each with
-   provenance and confidence, batch accept/reject. (Deterministic naming — decision `overview.md`.)
+## Layout
 
-### 9.3 Visual & interaction design system ("highly stylized, organized, neat")
-- **Aesthetic:** dark-first, high-contrast "operator console" — think a refined SOC/RE cockpit. Restrained
-  accent palette (one cool base + semantic accents), generous spacing, strong typographic hierarchy.
-- **Semantic color = state, everywhere consistent:** severity (info→critical) and finding-state colors are
-  defined once as tokens and reused across board, tables, graphs, reports. Color never the *only* signal
-  (accessibility): pair with icon/shape/label.
-- **Typography:** a crisp UI sans for chrome; a good monospace (ligature-free) for code/hex/disasm.
-- **Density modes:** "comfortable" vs "dense" for long RE sessions.
-- **Motion:** subtle, purposeful (state transitions on the board, live-metric easing) — never decorative jitter.
-- **Consistency primitives:** shared tokens (color/space/radius/elevation), one icon set, one graph style, a
-  documented component kit. Light + dark themes from the same tokens.
-- **Keyboard-first:** command palette, vim-ish nav in code panes, shortcut for every frequent action.
-- Build a small **living style guide** page inside the app so views stay visually coherent as they grow.
+A three-zone workbench for **one engagement at a time**:
 
-### 9.4 As built — the "workbench" (shipped UI)
-The shipped interface is a **dependency-free Preact + htm** single page served by the API
-(`core/lykos/api/static/`, no build step, ESM vendored under `static/vendor/`) — chosen over the
-Tauri/React target for zero-install offline delivery. The classic view remains at `/classic.html`.
+- **Header** — the lykos mark, a `server ready` status pill, **New analysis**, a light/dark theme
+  toggle, and a **Classic UI** link to the fallback view.
+- **Left rail** — **TARGETS** (the binaries in the case, with "add more binaries / source folder" to
+  unlock IPC modelling and cross-binary taint) and the full **PIPELINE** as a live checklist: every
+  stage with its real status (✓ ran, – not run / not applicable), driven by the server's per-stage
+  `state`.
+- **Run bar** — grouped controls: **BUDGET** (a slider + "to convergence"), **ENGINES** (black-box,
+  coverage, directed, concolic, libfuzzer, deep-seed toggles), **INVOCATION** (target-libraries dir,
+  argv, input-mode channel), and **Continue run** / pause / resume.
+- **Main pane** — the per-target header (format · arch · size + mitigation chips: `NX`, `PIE`,
+  `RELRO`, `CANARY`, `FORTIFY`, `SECCOMP` for ELF; `ASLR`, `DEP`, `SafeSEH`, `CFG` for PE), a status
+  card (crash state, static-finding count, coverage %, and the **L1 ▸ L2 ▸ L3** ladder), then a tab
+  strip with **HTML / SARIF / JSON** export.
 
-Centered on **one-click Autopilot**: drop a binary or C/C++ **source** file → Autopilot runs the
-full pipeline (recover → detect → fuzz → **coverage loop** → prove → enrich → review) and drives
-each crash up the PoC ladder to a demonstrable end effect. "Run in background" survives closing
-the tab (server-side `orchestrate.py`); the case is reopenable from **Recent analyses** with its
-run log, coverage, findings and verify badges restored.
+## The tabs
 
-Finding card, results-first:
-- **Headline = the end effect** (§8.6): e.g. *"Remote code execution / control-flow hijack
-  (demonstrated): L3 working exploit"*, not "reproduced crash".
-- **END EFFECT badges** — each achievable effect as `demonstrated` (green) or `potential` (amber),
-  and every demonstrated effect prints its concrete evidence with a **download link to the proof
-  artifact** (the L2/L3 PoC bundle, the crashing input, or the captured leaked bytes).
-- Exploitability rating, "How it can be exploited" (mechanism → reached → primitive → exploit),
-  "What an attacker does next", the false-positive **replay verdict** badge, and "View code".
-- Near-duplicate crashes collapse; a control-flow-hijack's attacker-controlled fault PC never
+1. **Overview** — a severity donut, top CWEs, the **weaponization ladder** (L0 Detected → L1 Crash →
+   L2 Primitive → L3 Exploit, with the reached rung highlighted and the contributing sources), and
+   the findings list. Each finding is **results-first**: the headline is the worst demonstrated end
+   effect (e.g. "out-of-bounds write in parse_record"), with a state badge (Candidate / Corroborated
+   / Confirmed / PoC-backed), a **"HOW IT CAN BE EXPLOITED — click any line to go deeper"** block
+   whose EVIDENCE lines state the honest provenance (e.g. "demonstrated at the FUNCTION level … Not a
+   program-level verified PoC"), and **View code** / **Inspect evidence** actions. Inspect evidence
+   opens the **evidence trail** (the recorded signals + "View code at 0x…" + raw JSON). A `candidate`
+   section collapses lower-confidence, not-yet-demonstrated patterns.
+2. **Exploits** — the crash → primitive → working-exploit chain for this target, or an explanation of
+   why it is empty, plus the **"What this run did"** panel that frames a null result by the work
+   behind it (total executions, per-engine split).
+3. **Code** — **Functions & call graph** (a live, pan/zoom/clickable call graph), **Disassembly**,
+   **Strings**, and a **Deep function fuzzing** action.
+4. **Dynamic** — per-binary **fuzzing coverage** (block coverage = % of recovered code exercised,
+   drill into a binary's functions) and the **Fuzzing engine health** table.
+5. **Diff** — two-binary (patch) comparison: add a second build and lykos diffs the findings and, when
+   one version has a working PoC, re-runs it against the other to confirm a fix.
+6. **Console** — the run log (live, and reconstructed on reopen, with per-stage errors).
+
+### Honesty surfaced in the UI
+
+The **Fuzzing engine health** table reports, for every engine, whether it `ran` / `skipped` / is
+`n/a` and *why* ("no budget left / not reached", "no source for this target", "nothing here reads the
+environment") — so a clean "0 crashes" is never mistaken for a thorough negative. Findings state their
+ceiling in plain language, and the L-ladder shows which rungs are reached and which are honestly not.
+
+## Run controls
+
+Every CLI capability is reachable from the run bar (web-GUI/CLI parity is a firm requirement): the
+per-phase/stage budget, the engine toggles, the per-stage skip allowlist (black-box mode), target
+libraries / sysroot, deep-seed (Autopilot derives the seeds/inputs it needs), and the operator
+invocation (argv / input-mode / channel). A run can be **paused**, **resumed**, and explicitly
+**continued**; pausing does not burn the budget clock. "Run in background" detaches the run from the
+tab.
+
+## Visual & interaction design system
+
+Kept from the original design plan, and realized with CSS custom properties:
+
+- **Dark-first operator console**, high contrast, restrained accent palette, generous spacing, strong
+  typographic hierarchy. A **light/dark theme** toggle (persisted, OS-preference aware) derives both
+  themes from the **same tokens** defined once on `:root` in `index.html`.
+- **Semantic color = state, consistently** — severity (info → critical) and finding-state colors are
+  tokens reused across the board, tables, graph and report. Color is never the only signal (paired
+  with icon/shape/label) for accessibility.
+- **Typography** — a crisp UI sans for chrome, a monospace for code/hex/disassembly.
+- **Near-duplicate crashes collapse** — a control-flow-hijack's attacker-controlled fault PC never
   splits one overflow into many findings (`dedupeFindings`).
 
-Also: rich file/mitigations panel, a **run log** (live + reconstructed on reopen, with per-stage
-errors), a **fuzzing-coverage** panel (block coverage = % of recovered code exercised), the
-cross-binary **system map**, and a **light/dark theme** toggle (persisted, OS-preference aware) —
-both themes from the same CSS tokens.
+## Pointers
+
+Pipeline stages and their outputs: `pipeline.md`. The layered system (GUI → local API →
+orchestration → engines → storage): `architecture.md`. The candidate → confirmed → PoC-backed
+promotion model and the L-ladder: `pipeline.md` and `docs/internal/` (current-state doc).

@@ -7,34 +7,43 @@
 ### Layered model
 ```
 +-------------------------------------------------------------------------+
-|  GUI (analyst workstation)      `gui.md`                                    |
-|  RE views · findings board · fuzzing dashboard · debugger · reports       |
-+---------------------------- local API (IPC) ----------------------------+
-|  Orchestration / Pipeline Engine the architecture section                                |
-|  job queue · scheduler · resource governor · run cache · event bus        |
+|  Browser workbench (Preact + htm, no build step)      `gui.md`            |
+|  results-first Autopilot view · findings board · fuzzing/coverage panels  |
+|  · disasm/strings/call-graph · PoC bundles · reports                      |
++------------ local API (stdlib HTTP + WebSocket, loopback only) ----------+
+|  Orchestration / pipeline engine        (`analyze/orchestrate.py`)        |
+|  stage DAG · job queue · scheduler · concurrency governor · run cache ·   |
+|  per-case budget (`analyze/budget.py`) · event stream                     |
 +-------------------------------------------------------------------------+
-|  Analysis Services (workers)                                              |
-|   Ingestion/Loaders (03) | Static RE (03) | Stripped Recovery (04)        |
-|   CWE Detection (05)      | Dynamic/Sandbox (06) | Harness+Fuzz (07)       |
-|   Symbolic/Concolic (05/08) | Triage+PoC (08) | Reporting (08/12)          |
+|  Analysis stages (workers)                                                |
+|   ingest/triage | static RE / disasm | stripped recovery (FLIRT-style)    |
+|   CWE detection | dynamic/sandbox | harness + fuzz                         |
+|   symbolic/concolic | triage + PoC ladder | reporting                     |
 +-------------------------------------------------------------------------+
-|  Core: Data Model + Artifact Store (12) · Plugin API · Config · Logging   |
+|  Core: case DB + content-addressed artifact store · plugin API ·          |
+|  config · logging + absorbed-error counter                                |
 +-------------------------------------------------------------------------+
-|  Bundled toolchain (11): Ghidra, rizin, angr, AFL++, QEMU/Qiling, GDB,    |
-|  capstone/unicorn/keystone, CASR, sig DBs, CWE catalog, local models      |
+|  Optional vendored engines (extracted under vendor/, run in place):       |
+|  rizin + pypcode (SLEIGH), Ghidra (optional), angr, SymQEMU, AFL++ /       |
+|  libFuzzer, qemu-user, GDB, Unicorn, libqasan; bundled sig/CVE/CWE packs   |
 +-------------------------------------------------------------------------+
 ```
 
 ### Process model
-- **Backend core** = a long-lived local service (Python + FastAPI over a Unix socket / loopback only).
-  Owns the data model, job queue, and event bus. No external network binding — ever.
-- **Workers** = separate processes so a crashing analyzer (or a detonating target) can't take down the UI.
-  Heavy/native tools (Ghidra headless, fuzzers, QEMU) run as managed subprocesses.
-- **Frontend** = desktop shell (Tauri or Electron) rendering a web UI, talking to the backend over the
-  local socket + a websocket for live events (fuzzing stats, log tails, job progress). See this document.
-- **Isolation domains** = dynamic-analysis targets run in their own sandbox/VM, never in a worker's own
-  address space (except deliberate Unicorn/Qiling in-process emulation of *foreign* code, which cannot
-  execute host syscalls). See `pipeline.md`.
+- **Backend core** = a long-lived local service — a Python **stdlib** `ThreadingHTTPServer` over a Unix
+  domain socket (or loopback TCP), with a hand-rolled WebSocket for events. No FastAPI/uvicorn, no pip
+  packages. Owns the data model, job queue, and event stream. No external network binding — ever.
+- **Workers** = a thread pool with per-resource-class concurrency caps and a coarse memory guard
+  (`jobs/worker.py`). Heavy/native tools (Ghidra headless, fuzzers, qemu) run as managed **subprocesses**
+  (killed as a process group on timeout), so a crashing engine or a detonating target can't take down the
+  server. (Full process-level worker isolation is deferred until more native tools land.)
+- **Frontend** = the browser workbench — Preact + htm as ES modules loaded via an **import map from the
+  bundled `vendor/`** (no build step, no npm, no CDN) — served as static files by the local API and talking
+  to it over HTTP + a WebSocket for live events (fuzzing stats, log tails, job progress). See `gui.md`.
+- **Isolation domains** = dynamic-analysis targets run under **bubblewrap + a network namespace** (or an
+  rlimit fallback), and cross-arch targets under **qemu-user**, never in a worker's own address space
+  (except deliberate Unicorn in-process emulation of a *single function*, which cannot execute host
+  syscalls). Stronger microVM / full-system tiers are a design target, not yet shipped. See `pipeline.md`.
 
 ### Pipeline / job engine
 - A **DAG of stages** per case: `load → disasm → decompile → recover(strip) → static-cwe → dynamic-triage
@@ -57,16 +66,16 @@
 ### Module boundaries (each is independently testable + swappable)
 | Module | Input | Output | Backed by |
 |---|---|---|---|
-| Loader | file bytes | memory map, arch, entry, sections | LIEF, Ghidra, custom |
-| Disassembler | mapped image | instructions, basic blocks | Ghidra/rizin/capstone |
-| Decompiler | function | pseudo-C + types | Ghidra (P-Code) |
-| Recovery | stripped image | named funcs, lib IDs | sig DBs + ML (`pipeline.md`) |
+| Loader | file bytes | memory map, arch, entry, sections | stdlib parsers (`elf.py`/`pe.py`/`macho.py`), rizin/Ghidra |
+| Disassembler | mapped image | instructions, basic blocks | rizin + pypcode (default), Ghidra (optional) |
+| Decompiler | function | pseudo-C + types | rizin + rz-ghidra / pypcode P-Code |
+| Recovery | stripped image | named funcs, lib IDs | sig DBs (FLIRT-style) + corpus diff (`pipeline.md`) |
 | CWE detectors | IR + decomp + traces | candidate findings | rules/taint/symbolic |
-| Sandbox runner | binary + input + policy | trace, coverage, crash | QEMU/Qiling/nsjail |
+| Sandbox runner | binary + input + policy | trace, coverage, crash | bubblewrap + qemu-user |
 | Harness builder | vector spec | runnable harness | templates + codegen |
-| Fuzzer | harness + corpus | crashes, coverage | AFL++/honggfuzz/libFuzzer |
-| Symbolic | image + target state | solved input / constraints | angr/Triton |
-| Triage | crash | dedup key, exploitability | CASR/GDB |
+| Fuzzer | harness + corpus | crashes, coverage | AFL++ / libFuzzer |
+| Symbolic | image + target state | solved input / constraints | angr / SymQEMU |
+| Triage | crash | dedup key, exploitability | in-house (stdlib) + GDB |
 | PoC synth | confirmed finding | PoC bundle | templates + symbolic |
 | Reporter | findings | HTML/PDF/SARIF | templating |
 
@@ -105,10 +114,10 @@ Case
 ```
 
 ### Storage
-- **SQLite** for structured data (cases, targets, functions, findings, jobs, crashes, poc metadata).
-- **DuckDB** (optional) for heavy analytical queries over large trace/coverage tables.
-- **Vector index** (FAISS/hnswlib) for function embeddings (`pipeline.md`).
-- **Content-addressed artifact store:** every artifact (binary, corpus, crash input, trace, model output,
+- **SQLite** for all structured data (cases, targets, functions, findings, jobs, crashes, poc metadata).
+  One file per case; each worker thread opens its own connection. No external DB engine.
+- **Function similarity** is deterministic structural/graph hashing (`pipeline.md`) — no vector index / embedding DB.
+- **Content-addressed artifact store:** every artifact (binary, corpus, crash input, trace, analysis output,
   recording) stored by hash; DB rows reference hashes. Dedup + integrity for free.
 
 ### Key entities (illustrative fields)
@@ -141,6 +150,12 @@ Bias: **orchestrate proven, deterministic OSS** behind a lean custom core we own
 The engines are CPU-only, with no GPU dependency. Prefer permissive licenses (offline redistribution). "Primary"
 = default; "alt" = swappable behind the module interface.
 
+> **Shipped vs. planned.** The engines lykos drives **today** are rizin + pypcode, Ghidra (optional),
+> angr, SymQEMU, AFL++ / libFuzzer, qemu-user, GDB, Unicorn, libqasan and bubblewrap, plus in-house
+> stdlib parsers, triage and gadget/ROP finders. Rows below that name **Qiling, microVM isolation
+> (Firecracker/cloud-hypervisor), LibAFL, Nyx, Triton, honggfuzz, CASR, RetroWrite/MTSan, BinDiff,
+> Semgrep** are design targets behind the module interface, **not yet bundled**.
+
 ### Deployment target (decision `overview.md`)
 - **Kali VM**, ~32 GB RAM, 4+ cores, **nested virtualization available** (KVM inside the VM works, verify per
   host). So KVM-backed microVMs and accelerated system emulation are viable, not just TCG.
@@ -148,35 +163,37 @@ The engines are CPU-only, with no GPU dependency. Prefer permissive licenses (of
 - **Fully self-contained package:** everything needed to run ships in the installer (`offline-packaging.md`).
 
 ### Languages
-- **Backend/orchestration:** Python 3.12 (richest deterministic RE/exploit ecosystem: angr, pwntools,
-  Qiling, LIEF, Ghidra bridge). Hot paths in **Rust** or C where needed.
-- **Fuzzing substrate:** **AFL++** primary; **LibAFL** (Rust) where a composable custom engine helps.
-- **Frontend:** TypeScript + React in a desktop shell (Tauri preferred; Electron acceptable).
+- **Backend/orchestration:** Python 3.12, **standard library only — no pip packages in the core.** The
+  heavy engines (Ghidra, rizin, angr, AFL++, qemu, GDB) are optional, separately bundled, and driven as
+  **subprocesses** from `vendor/`; the one optional in-process extension is **pypcode** (Ghidra's SLEIGH
+  lifter, no JVM), imported defensively in a separate worker process.
+- **Fuzzing substrate:** **AFL++** for binary targets; **libFuzzer** (via a clang wrapper) for source targets.
+- **Frontend:** **Preact + htm** as ES modules (import map, no build step, no npm/CDN), served as static
+  files by the local API. Not a desktop shell.
 
 ### Core engines (module → tool → license)
 | Role | Primary | Alt | License notes |
 |---|---|---|---|
-| Loader/parser | LIEF | Ghidra loaders | permissive |
+| Loader/parser | **hand-rolled stdlib** (`elf.py`/`pe.py`/`macho.py`) | Ghidra / rizin loaders | n/a (own code) |
 | Disassembly/decompile | **rizin + rz-ghidra + pypcode** (Ghidra P-Code, no JVM) | Ghidra headless (optional alternate, `LYKOS_DECOMPILER=ghidra`), angr | permissive / LGPL |
-| Quick disasm/asm | capstone/keystone | — | BSD |
+| Quick disasm/lift | pypcode / rizin linear sweep | — | permissive |
 | Signature matching | Ghidra FID · FLIRT-style · rizin zignatures | — | permissive |
 | Binary diffing / name transfer | **BinDiff** | Diaphora, Ghidra Version Tracking | free/GPL — separate process |
-| Runtime-metadata recovery | Go pclntab / C++ RTTI / DWARF parsers | LIEF | permissive |
-| CPU emulation | Unicorn | — | GPLv2 (separate process) |
-| OS/syscall emulation | Qiling | — | GPLv2 |
-| System/foreign emulation | QEMU (+KVM, nested) | — | GPLv2 |
-| MicroVM isolation | Firecracker / cloud-hypervisor (nested KVM) | gVisor | Apache-2.0 |
-| Process sandbox | bubblewrap / nsjail | firejail | permissive |
-| Symbolic/concolic | angr | Triton, SymCC/SymQEMU | BSD / permissive |
-| Fuzzing | AFL++ / LibAFL | honggfuzz, libFuzzer | Apache / check AFL++ deps |
-| Snapshot fuzzing | Nyx (nested KVM+QEMU) | — | verify license before bundling |
-| Binary sanitizer | QASan | RetroWrite, MTSan | permissive/research — verify |
-| Debugger | GDB (+Python, GEF/pwndbg-style) | LLDB | GPLv3 (separate process) |
-| Crash triage | CASR | custom gdb | Apache-2.0 |
-| Gadgets/exploit | ROPgadget/ropper + pwntools | — | permissive |
-| Rule pattern-match (secondary) | Semgrep / Weggli over decompiled C | Ghidra P-Code scripts | permissive |
-| Vector/similarity | structural/graph + function hashing | — | (deterministic) |
-| Data store | SQLite (+ DuckDB for trace analytics) | — | public-domain/MIT |
+| Runtime-metadata recovery | Go pclntab / C++ RTTI / DWARF parsers (stdlib) | — | n/a (own code) |
+| CPU / single-function emulation | Unicorn | — | GPLv2 (separate process) |
+| Foreign-arch userland emulation | qemu-user | — | GPLv2 (separate process) |
+| MicroVM isolation | *(planned)* Firecracker / cloud-hypervisor | gVisor | Apache-2.0 |
+| Process sandbox | bubblewrap (+ netns) | rlimit fallback | permissive |
+| Symbolic/concolic | angr · SymQEMU | *(planned)* Triton | BSD / permissive |
+| Fuzzing | AFL++ · libFuzzer | *(planned)* LibAFL, honggfuzz | Apache / check AFL++ deps |
+| Snapshot fuzzing | *(planned)* Nyx | — | verify license before bundling |
+| Binary sanitizer | libqasan (QASan) | *(planned)* RetroWrite, MTSan | permissive/research — verify |
+| Debugger | GDB (+Python) | LLDB | GPLv3 (separate process) |
+| Crash triage | **in-house (stdlib)** dedup + classify | GDB | n/a (own code) |
+| Gadgets/exploit | **in-house (stdlib)** gadget/ROP finder (`poc/rop.py`) | — | n/a (own code) |
+| Rule pattern-match (secondary) | Weggli over decompiled C | Ghidra P-Code scripts | permissive |
+| Vector/similarity | structural/graph + function hashing (stdlib) | — | (deterministic) |
+| Data store | SQLite | — | public-domain |
 
 > **Licensing action item:** GPL tools (QEMU, Unicorn, Qiling, GDB, BinDiff) are fine as **separate bundled
 > processes**; avoid static linking that would impose copyleft on our code. Dropping ML model weights removes
@@ -189,15 +206,16 @@ The engines are CPU-only, with no GPU dependency. Prefer permissive licenses (of
   for naming/summary *suggestions*; nothing depends on it and it is not bundled.
 
 ### Data & platform
-- **DB:** SQLite (cases, findings, jobs, provenance) + DuckDB for analytics over large trace tables.
+- **DB:** SQLite only (cases, findings, jobs, provenance) — one file per case, no external DB engine.
 - **Artifact store:** content-addressed files on disk (hash-named), referenced from SQLite.
-- **Packaging:** offline OCI/Podman images or a Nix/`apt` offline repo for reproducible installs (`offline-packaging.md`).
+- **Packaging:** a single **extract-and-run** offline package (the repo + a fully populated `vendor/`
+  tree, no install) plus a standalone `dist/lykos.pyz` zipapp (`offline-packaging.md`).
 - **Target OS:** pinned Kali/Debian-family matching the VM; document the exact base.
 
 ### Harvest the engines, own the glue (decision `overview.md`)
 Build a **lean custom orchestration core** (job queue, stage DAG, data model, GUI) that one person can
 understand and maintain over a long horizon. **Harvest aggressively at the tool/library level** (Ghidra,
-angr, AFL++/LibAFL, QEMU, CASR, BinDiff, ROPgadget, signature DBs). **Study** open Cyber Reasoning Systems
+rizin, angr, AFL++, qemu, GDB, signature DBs). **Study** open Cyber Reasoning Systems
 (e.g., Trail of Bits' Buttercup) for orchestration *ideas only* — do not fork them; they are online
 and source/patch-shaped, the opposite of our offline, binary-only, deterministic posture.
 

@@ -9,18 +9,24 @@ Turn raw bytes into a rich, queryable, architecture-normalized program model tha
 analysis and the GUI read from.
 
 ### 3.1 Ingestion & loading
-- **Triage first:** file type (magic), format parsing (LIEF), hashes, entropy (packing/encryption hint),
-  detected packers (UPX etc. → unpack step), embedded files (binwalk-style carving for firmware),
-  compiler/toolchain fingerprint, mitigations present (NX, PIE, RELRO, canary, CFI/CET).
+- **Triage first:** file type (magic, `filetype.py`), format parsing with **hand-rolled stdlib parsers** —
+  ELF (`elf.py`), PE/COFF (`pe.py`), Mach-O (`macho.py`), no LIEF/pefile — hashes, entropy
+  (packing/encryption hint), detected packers (UPX etc. → unpack step), embedded files (the stdlib
+  signature carver `firmware/carve.py`, binwalk-style), compiler/toolchain fingerprint, and the
+  **mitigations the header advertises** — ELF: NX, PIE, RELRO, canary, FORTIFY, seccomp; PE: ASLR, DEP,
+  SafeSEH, CFG. Dispatch across formats is `triage.py`.
 - **Loaders (pluggable):** ELF, PE, Mach-O, raw/headerless (wizard: arch, endianness, base addr, entry,
-  memory map), firmware blob (carve + map), bytecode (route to appropriate handler). See this document for custom ISAs.
+  memory map), firmware blob (carve + map), bytecode (route to appropriate handler). See the
+  stripped-recovery section for custom ISAs.
 - **Library identity:** detect dynamic deps; for static binaries, identify the linked libc/toolchain via
   bundled signatures (critical for stripped analysis + exploitation later).
 
 ### 3.2 Disassembly, decompilation, structure
-Primary engine: **Ghidra headless** (Apache-2.0, scriptable, SLEIGH for custom arch, solid decompiler).
-Secondary: **rizin/Cutter** for fast interactive disasm and a second opinion; **capstone** for quick linear
-sweeps. Produce and persist:
+Shipped default — the **native backend** (`native_re.py`, `disassemble.py`): **rizin** for structure and
+disassembly + **rz-ghidra / pypcode** for decompilation (Ghidra's P-Code and SLEIGH lifter as a C++/Python
+module, **no JVM**). **Ghidra headless** is an optional alternate (`LYKOS_DECOMPILER=ghidra`). SLEIGH
+(via pypcode, run in an isolated worker) covers **rizin-blind architectures** and custom ISAs. Both heavy
+engines are optional and vendored under `vendor/`. Produce and persist:
 - Instructions + basic blocks + **CFG per function** and a **program callgraph**.
 - **Decompiled pseudo-C** per function (Ghidra P-Code → C).
 - **Cross-references** (code/data), string table, constants, import/export tables, symbol table (if any).
@@ -29,7 +35,7 @@ sweeps. Produce and persist:
 ### 3.3 Program IR (the contract for detectors)
 Normalize Ghidra **P-Code** (or an equivalent lifted IR) into a stable internal IR so CWE detectors are
 architecture-independent. Persist:
-- SSA-ish lifted operations, per-function CFG, def-use, call sites with resolved/възможни targets.
+- SSA-ish lifted operations, per-function CFG, def-use, call sites with resolved/possible targets.
 - A queryable graph (functions, blocks, calls, data refs) — store in the case DB for fast UI + rule queries.
 This IR is what the plugin API exposes. Rules should never touch raw x86 vs ARM directly.
 
@@ -179,7 +185,7 @@ with **deterministic** validators only (decision `overview.md`).
 > The table below is the summary; `coverage.md` is the authority.
 | CWE family | Examples | Primary channel |
 |---|---|---|
-| **Memory safety** | 119/125/787 OOB, **416 UAF**, 415 double-free, 476 NULL-deref | dynamic (QASan/RetroWrite) + symbolic |
+| **Memory safety** | 119/125/787 OOB, **416 UAF**, 415 double-free, 476 NULL-deref | dynamic (QASan + sanitizers) + symbolic |
 | **Stack/heap overflow** | 121/122, 787 | fuzz + sanitizer, corroborate static |
 | **Integer** | 190/191 overflow/underflow, 681 conversion | static taint + symbolic |
 | **Format string** | 134 | static pattern + taint (fmt arg tainted) |
@@ -237,13 +243,16 @@ stage for anything reaching Confirmed.
 ### 6.1 Tiered isolation (choose per target/trust)
 | Tier | Mechanism | Use for | Escape risk |
 |---|---|---|---|
-| T0 in-process emulation | Unicorn / Qiling (guest code can't issue host syscalls) | surgical single-function exec, foreign arch | very low |
-| T1 process sandbox | bubblewrap / nsjail + seccomp + namespaces + rlimits | benign-ish native same-arch runs | low-med |
-| T2 microVM | Firecracker / cloud-hypervisor (KVM) | untrusted native code, fast boot, snapshots | low |
-| T3 full-system VM | QEMU-system (+KVM if same arch) | foreign arch, kernel/driver, firmware, max isolation | lowest |
+| T0 in-process emulation | Unicorn (guest code can't issue host syscalls) | surgical single-function exec, foreign arch | very low |
+| T1 process sandbox | bubblewrap + network namespace + rlimits | benign-ish native same-arch runs | low-med |
+| T2 microVM | Firecracker / cloud-hypervisor (KVM) — *planned* | untrusted native code, fast boot, snapshots | low |
+| T3 full-system VM | QEMU-system (+KVM if same arch) — *planned* | foreign arch, kernel/driver, firmware, max isolation | lowest |
 
-**Default policy:** unknown/untrusted binary → **T2/T3**. Never run untrusted native code in a worker's own
-address space. In-process emulation (T0) is safe *only* because emulated guest code cannot make host syscalls.
+**Shipped today** (`dynamic/sandbox.py`): **T1** bubblewrap + netns (read-only root, tmpfs cwd, no net),
+with a plain **rlimit fallback** when bwrap is absent; foreign-arch targets run under **qemu-user**; **T0**
+Unicorn drives single functions. **T2/T3 microVM and full-system tiers are design targets, not yet shipped.**
+Never run untrusted native code in a worker's own address space. In-process emulation (T0) is safe *only*
+because emulated guest code cannot make host syscalls.
 
 ### 6.2 Containment invariants (always on)
 - **No network egress** by default; optional **fake-services** mode (INetSim/FakeNet-style, bundled) when a
@@ -251,34 +260,36 @@ address space. In-process emulation (T0) is safe *only* because emulated guest c
 - **Filesystem:** ephemeral overlay per run; target sees a synthetic rootfs; host FS never mounted writable.
 - **Resource caps:** CPU time, wall clock, memory, PID/FD counts, disk quota; hard kill on breach.
 - **Snapshot/restore** between runs so state never leaks run-to-run and fuzzing can reset fast.
-- **Anti-analysis handling:** detect anti-debug/anti-VM/timing checks (flagged in this document.7) and, where in
-  scope, neutralize (patch checks, hide debugger) — but log every modification.
+- **Anti-analysis handling:** detect anti-debug/anti-VM/timing checks (flagged in the stripped-recovery
+  section) and, where in scope, neutralize (patch checks, hide debugger) — but log every modification.
 
-### 6.3 Execution & emulation backends
-- **Native + KVM** when workstation arch == target arch (fastest).
-- **QEMU user-mode** for foreign-arch userland binaries.
-- **QEMU system-mode** for full OS / kernel / driver / firmware targets.
-- **Qiling** for OS/syscall emulation with a fabricated environment (great for partial binaries).
+### 6.3 Execution & emulation backends (what ships)
+- **Native, under the T1 sandbox** (bubblewrap + netns) when workstation arch == target arch (fastest).
+- **qemu-user** for foreign-arch userland binaries — the cross-arch workhorse (L1 crash repro runs here).
 - **Unicorn** for raw CPU-only emulation of a single function with a synthesized register/memory state
-  (feeds harnessing, the fuzzing section).
-- **Firmware/embedded + multi-binary systems:** rehost with **Fuzzware**-style precise MMIO modeling,
-  **ES-Fuzz** adaptive MMIO, **GDMA** DMA rehosting (`internal/16-sota-references.md`); run multiple linked/IPC-connected components
-  together in one isolation domain with multi-process debugging. **Full treatment in this document.**
+  (feeds harnessing, the fuzzing section), and for the early **Cortex-M firmware rehosting** track.
+- *Planned, not yet shipped:* QEMU **system-mode** for full OS / kernel / driver targets, and Qiling-style
+  full OS/syscall emulation with a fabricated environment.
+- **Firmware/embedded + multi-binary systems:** images are **carved** (`firmware/carve.py`) into their
+  embedded binaries and the headerless loader (`firmware/headerless.py`) identifies bare-metal blobs;
+  precise peripheral/MMIO modeling (**Fuzzware**-style, **ES-Fuzz** adaptive MMIO, **GDMA** DMA rehosting,
+  `internal/16-sota-references.md`) is a design target. **Full treatment in the multi-binary/firmware section.**
 
 ### 6.4 Instrumentation, tracing, coverage
 - **Coverage:** edge/block coverage via QEMU-mode or DynamoRIO/Frida — the fuel for coverage-guided fuzzing.
 - **Tracing:** syscall trace, API/library-call trace, memory-access trace, and a full **execution trace**
   for time-travel/root-cause. Optionally record replayable traces (rr-style where feasible).
-- **Binary sanitizers** (memory safety without source — Gap F): **QASan** (QEMU+ASan, cross-arch) as the
-  default; **RetroWrite** (static ASan rewrite, low overhead) for x86-64 PIE; **MTSan** for AArch64. These
-  turn silent corruption into a labeled, located, deduplicable event.
-- **Taint tracking (dynamic):** DTA over QEMU/libdft-style to confirm source→sink at runtime.
+- **Binary sanitizers** (memory safety without source — Gap F): **libqasan / QASan** (QEMU + ASan,
+  cross-arch) is the shipped default; **RetroWrite** (static ASan rewrite) and **MTSan** (AArch64) are
+  design targets, not yet shipped. These turn silent corruption into a labeled, located, deduplicable event.
+- **Taint tracking (dynamic):** DTA over QEMU/libdft-style to confirm source→sink at runtime (planned).
 
-### 6.5 Integrated debugger
-- **GDB** (+ Python API, GEF/pwndbg-style enrichment) and/or LLDB, driven from the GUI (`gui.md`): breakpoints,
-  stepping, register/memory/stack views, heap visualization, watchpoints. Attach to native (T1/T2) or via
-  gdbstub to QEMU (T3) and even to Unicorn/Qiling (T0). Reverse-debugging where the backend supports it.
-- The debugger is also *programmatic*: triage and PoC stages script it.
+### 6.5 Debugger (programmatic)
+- Fault capture and register state are **programmatic**, not an interactive GUI debugger: on the host ISA
+  via **ptrace/GDB** (`poc/ptrace_capture.py`, `debug/gdb.py`); cross-arch via a hand-rolled **GDB Remote
+  Serial Protocol client** over qemu-user's gdbstub (`debug/qemu_gdb.py`), which recovers the exact
+  fault-time PC and registers on any qemu-supported ISA — no gdb-multiarch needed.
+- The triage and PoC stages drive it (breakpoint-reached confirmation, register capture, negative controls).
 
 ### 6.6 What dynamic analysis produces
 Coverage maps, traces, crash records (signal, faulting IP, backtrace, sanitizer report), confirmed taint
@@ -318,8 +329,9 @@ Find where untrusted data enters, using static taint + a light dynamic probe:
   fuzz input to the tainted parameter); the **analyst reviews and hand-tunes** it. We compile/emulate and
   validate it doesn't trivially crash on setup. This is the honest limit: auto-harnessing library
   functions is assisted, not automatic.
-- **Emulation harness (no runnable program):** drive a single function under Unicorn/Qiling with a
-  synthesized state (the dynamic-analysis section T0) — lets us fuzz code that can't be launched as a process.
+- **Emulation harness (no runnable program):** drive a single function under **Unicorn**
+  (`harness/emulate.py`) with a synthesized state (the dynamic-analysis section T0) — lets us fuzz code
+  that can't be launched as a process.
 - Persist harnesses as first-class, editable artifacts (analyst can hand-tune generated ones).
 
 ### 7.3 Seed corpus & dictionaries (cheap, high impact)
@@ -330,19 +342,24 @@ Find where untrusted data enters, using static taint + a light dynamic probe:
 - Corpus minimization (afl-cmin/tmin) and periodic distillation during the campaign.
 
 ### 7.4 Fuzzing engines & modes
-- **Substrate: LibAFL** (composable Rust) so we run *one* configurable engine with pluggable backends
-  instead of shelling out to many. Fall back to stock **AFL++** where it's simplest.
-- **Binary-only backends:** AFL++/LibAFL **qemu-mode**, **frida-mode**, or static rewrite (**RetroWrite**).
-- **Snapshot fuzzing: Nyx** (KVM+QEMU) for stateful, kernel, and network targets (up to 300× throughput; `internal/16-sota-references.md`).
-- **Source available (rare):** libFuzzer/AFL++ with ASan.
-- **Structure-aware:** grammar/format-aware mutators for structured inputs.
-- Feature set: CmpLog/RedQueen (magic-value bypass), persistent mode, parallel multi-core with shared corpus.
+- **Substrate: AFL++** (`fuzz/aflpp.py`) plus an in-house **blind + coverage-guided** engine (breakpoint /
+  qemu-trace coverage) for binary-only targets. A single composable Rust engine (**LibAFL**) is a design
+  target, not shipped.
+- **Binary-only backend:** AFL++ **qemu-mode** (shipped). frida-mode / static-rewrite backends are planned.
+- **Source available (a first-class lane):** **libFuzzer** and AFL++ with **ASan + UBSan** — a compiler
+  wrapper forces the sanitizer flags through the project's own build, so a crash is a *confirmed* finding
+  with source file:line and CWE (`libfuzzer.py`, `source_project.py`).
+- **Structure-aware:** grammar / format-aware mutators for structured inputs (`fuzz/grammar.py`,
+  `xmlgrammar.py`, `structure.py`, `textconf.py`).
+- **Magic-value bypass:** an in-house constant/compare **dictionary** (`fuzz/cmpdict.py`); full
+  CmpLog/RedQueen via AFL++ where the instrumented build supports it.
+- *Planned:* snapshot fuzzing (**Nyx**) for stateful/kernel/network targets (`internal/16-sota-references.md`).
 
 ### 7.5 Hybrid & directed fuzzing (get past plateaus and reach candidates)
-- **Hybrid concolic:** pair the fuzzer with **SymQEMU** (binary, no pre-instrumentation) or a **QSYM**-style
-  engine; when coverage stalls, the symbolic side solves the hard branch and injects a new seed (Driller
-  pattern). **Fuzzolic / SymFusion / LeanSym / SymSAN** are scalability-tuning alternatives (`internal/16-sota-references.md`); LibAFL's
-  concolic-tracing module wires them in.
+- **Hybrid concolic (shipped):** pair the fuzzer with **angr** or **SymQEMU** (binary, no
+  pre-instrumentation); when coverage stalls, the symbolic side solves the hard branch and injects a new
+  seed (Driller pattern) — the loop the Autopilot runs in 7.7. **Fuzzolic / SymFusion / LeanSym / SymSAN**
+  are scalability-tuning alternatives studied for later (`internal/16-sota-references.md`).
 - **Directed greybox fuzzing** toward a specific finding, all deterministic (`internal/16-sota-references.md`): **BEACON** (provable
   path pruning), **SelectFuzz** (target-relevant path selection), **WindRanger** (data-flow fitness, pairs
   with our taint), **AFLGopher** (feasibility-aware), and **SAST-guided** fuzzing that drives directly from
@@ -398,12 +415,14 @@ The PoC bundle is inspectable in the workbench (Reproduce / Payload hexdump / Te
 served by `GET /artifacts/{sha}/bundle`.
 
 ### 8.1 Crash triage
-- **De-duplication:** cluster crashes by normalized stack hash / faulting-IP + call context. Thousands of
-  fuzzer crashes → a handful of unique bugs. Use **CASR** (crash analysis + dedup) as the engine.
-- **Minimization:** shrink each crashing input (afl-tmin) to the smallest reliable reproducer.
+- **De-duplication:** cluster crashes by normalized stack hash / faulting-IP + call context, with an
+  **in-house (stdlib)** deduper — no external CASR dependency. Thousands of fuzzer crashes → a handful of
+  unique bugs.
+- **Minimization:** shrink each crashing input to the smallest reliable reproducer (`dynamic/minimize.py`,
+  or afl-tmin when present).
 - **Classification:** signal type, read vs write, near-null vs wild, sanitizer verdict (heap-overflow / UAF /
-  double-free / stack-overflow), and an **exploitability score** (CASR / `!exploitable`-style heuristics:
-  PC control? corrupted return addr? controllable write target?).
+  double-free / stack-overflow), and an **exploitability score** (`!exploitable`-style heuristics in
+  `debug/exploitability.py`: PC control? corrupted return addr? controllable write target?).
 - Attach each crash to its finding and promote the finding to **Confirmed**.
 
 ### 8.2 Root-cause analysis
@@ -430,9 +449,14 @@ proves impact; L3 is a scoped, analyst-in-the-loop research track, never adverti
 - **Primitive PoC (L2):** identify controllable bytes → offsets, compute overflow offset to saved return
   address / function pointer, detect heap layout primitives (**MAZE** Dig&Fill for layout, **ARCHEAP**/
   **AAHEG** for fastbin/unlink strategies, `internal/16-sota-references.md`). Demonstrate control, e.g., set PC to a chosen value.
-- **Exploit PoC (L3, scoped):** template library (ret2win, ret2libc/ROP with a bundled gadget finder like
-  ROPgadget/ropper, format-string write) + pwntools-style scripting. Honest ceiling: even DARPA CGC fully
-  auto-exploited only one heap bug. Provide *assisted* exploitation with analyst-in-the-loop, not push-button.
+- **Exploit PoC (L3, scoped):** a template library (ret2win, ret2libc/ROP, SROP, execve-syscall,
+  magic-value overwrite, format-string `%n` write, glibc-heap→shell, shellcode) built on an **in-house
+  (stdlib) gadget/ROP finder** (`poc/rop.py`, e.g. `rop.find_one_gadgets`) — **no ROPgadget/ropper/pwntools
+  dependency** — with its own payload assembly and a bad-char XOR encoder. x86-64 is the full path; a
+  cross-arch ret2libc ladder covers aarch64/arm/riscv64/ppc64le/ppc32/s390x/loongarch64/sh4
+  (`poc/archmodel.py`). Each attempt is **confirmed by a live shell / marker / breakpoint under a negative
+  control, never asserted**. Honest ceiling: even DARPA CGC fully auto-exploited only one heap bug, so L3
+  stays a scoped, analyst-in-the-loop track, not push-button.
 - **Bundle contents (every PoC):** input file(s), harness, environment/rootfs spec, a self-contained **runner
   script**, the expected observable (crash signature / controlled register / popped shell), a recorded
   **asciinema/video** of it firing, and the isolation tier it was validated in. Re-runnable offline, standalone.
@@ -507,7 +531,7 @@ components (arch/format/mitigations), edges are relationships, and findings can 
 ### 17.3 Multi-binary dynamic analysis
 - **Whole-system detonation:** run the entire component set together in one isolation domain (system-mode
   QEMU or a microVM, the dynamic-analysis section) so *real* IPC/linking happens; snapshot the whole system, not one process.
-- **Selective emulation:** or run one component under Qiling with the others **stubbed/modeled** (fast, but
+- **Selective emulation:** or run one component under a Qiling-style syscall emulator (planned) with the others **stubbed/modeled** (fast, but
   requires channel contracts). Choose per goal.
 - **Multi-process debugging:** follow-fork/exec, attach to spawned children, set breakpoints across
   processes, and correlate a crash in B back to the input that entered A (**cross-boundary blame**).

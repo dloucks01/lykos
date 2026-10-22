@@ -24,7 +24,7 @@ vs *frontier research*, so the roadmap does not over-promise.
 |---|---|---|
 | Load ELF/PE/Mach-O, disassemble, decompile | Solved (Ghidra/rizin) | Orchestrate + present |
 | CFG/callgraph/xref, string/const analysis | Solved | Orchestrate + present |
-| Stripped-binary function recovery via signatures | Mostly solved (FLIRT/FCG/sig DBs) | Bundle DBs + ML assist |
+| Stripped-binary function recovery via signatures | Mostly solved (FLIRT/FCG/sig DBs) | Bundle DBs + deterministic matching (no ML) |
 | Static CWE pattern + taint detection | Solved but **noisy** | Orchestrate + confidence scoring |
 | Known-CVE detection (binary version banners **+** source dependency manifests + vendored headers) | Solved for known components | Fingerprint → bundled offline CVE DB (OSV + NVD-CPE) match |
 | CVE **weaponization** (per-CVE + CWE-class triggers) | Hard, scoped | Trigger fires; repro recorded **only** on a real fault |
