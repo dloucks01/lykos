@@ -19,6 +19,11 @@ spec.json:
 out.json:
   ok, angr_version, generated:[{input_b64, reached, from_seed}], reached_targets:[...],
   stats:{...}, note, error
+  drained   True iff the search hit a natural fixpoint (no active/deferred/spilled/errored
+            states left) -- the only condition under which "did not reach target X" licenses an
+            UNREACHABLE claim for X (T3 reachability certificate).
+  cutoff    True iff the search was stopped early (deadline / SIGALRM / state-cap / step-cap);
+            a cut-off search that missed a target proves nothing about reachability.
 
 Deterministic and offline. Always writes a JSON result, even on failure, so the core can
 report a clear message rather than a stack trace.
@@ -151,10 +156,12 @@ def main(spec_path, out_path):
 
         deadline = time.time() + max_seconds
         steps = {"n": 0}
+        timed_out = {"v": False}                             # the soft deadline fired during stepping
 
         def step_func(lsm):
             steps["n"] += 1
             if time.time() > deadline:
+                timed_out["v"] = True
                 lsm.move(from_stash="active", to_stash="deferred")
             if len(lsm.active) > max_states:
                 lsm.split(from_stash="active", limit=max_states, to_stash="spilled")
@@ -228,10 +235,25 @@ def main(spec_path, out_path):
                 result["generated"].append(g)
 
         result["reached_targets"] = sorted(reached)
+        # Reachability-certificate soundness (T3): distinguish a search that reached a NATURAL
+        # FIXPOINT -- every path found/avoided/deadended, nothing left to explore -- from one that
+        # was CUT OFF (deadline, SIGALRM, state-cap spill, step-cap, or any errored path). Only a
+        # drained search licenses an "unreachable" claim for a target we did not reach; a cut-off
+        # search that missed a target proves nothing. `errored > 0` also forfeits the claim: an
+        # errored path is indeterminate, not a dead end.
+        deferred = len(simgr.stashes.get("deferred", []))
+        spilled = len(simgr.stashes.get("spilled", []))
+        errored = len(getattr(simgr, "errored", []) or [])
+        step_cap_hit = (not targets) and steps["n"] >= 2000 and len(simgr.active) > 0
+        leftover = len(simgr.active) + deferred + spilled
+        cutoff = bool(result.get("incomplete")) or timed_out["v"] or step_cap_hit
+        result["cutoff"] = cutoff
+        result["drained"] = (leftover == 0) and (errored == 0) and not cutoff
         result["stats"] = {
             "steps": steps["n"], "found": len(simgr.stashes.get("found", [])),
             "unconstrained": len(simgr.stashes.get("unconstrained", [])),
             "deadended": len(simgr.deadended), "active": len(simgr.active),
+            "deferred": deferred, "spilled": spilled, "errored": errored,
             "elapsed_s": round(time.time() - (deadline - max_seconds), 2)}
         result["ok"] = True
         _write(out_path, result)

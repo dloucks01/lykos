@@ -268,9 +268,23 @@ upgrade improves what the non-fuzz recover phase can confirm).
         provenance (no fault = not a memory-corruption crash). Validated A/B: `malloc(attacker_len)`
         trips the oracle, a fixed `malloc(16)` does not, and the DoS lead is NOT mis-filed as a crash.
         210 harness/emulate/rank/fuzz tests green.
-  - [ ] **T3 · Sink-directed concolic (reachability certificates)** — for each static finding, solve
-        for an input that reaches+triggers its site (→ demonstrated) or prove it unreachable (→ drop
-        the false positive). Reuses angr.
+  - [x] **T3 · Sink-directed concolic (reachability certificates)** — the concolic lane already
+        steered angr `find=` at each finding's `site_addr`/`function_addr`; T3 adds the *certificate*
+        and makes the verdict three-valued and honesty-preserving:
+        · **REACHED** → the lead is promoted to `corroborated` AND a replayable **reachability
+          certificate** (concrete input + real invocation terms: mode/argv/@@, input artifact,
+          angr version, model note) is filed as an artifact and cited in the evidence. Matching is
+          now detector-agnostic (static dangerous-api, taint, and harness function-level leads all
+          qualify), by site OR function addr, raising only not-yet-proven leads.
+        · **UNREACHABLE** → only when the search hit a NATURAL FIXPOINT (driver reports `drained`
+          and not `cutoff`: no active/deferred/spilled/errored states left). The lead is ANNOTATED
+          for de-prioritization on a separate zero-weight `reachability` channel — NEVER dropped or
+          downgraded (the model is partial: libs unloaded, one modeled entry, bounded).
+        · **INCOMPLETE** → a search cut off by budget/timeout/state-cap makes NO reachability claim.
+        Driver (`angr_driver.py`) now emits `drained`/`cutoff`; stage (`symbolic/stage.py`) files
+        certificates + annotations. A/B validated (`tests/test_concolic_reach.py`): reached→certified,
+        drained→annotated-not-dropped (confidence preserved), cutoff→untouched; existing stub +
+        real-angr concolic tests green.
   - [ ] **T6 · State-machine / sequence driving** — recover the parse dispatch, drive sequences. The
         hard, later tier.
 - [ ] **Wire the `harness` stage into the default autopilot plan** (currently registered + in the
