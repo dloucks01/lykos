@@ -383,3 +383,23 @@ def test_discover_threads_prog_to_usage_selection():
     strings = ["Usage: bridge kick <bridge-id> <channel>", "Usage: foo [OPTIONS]", "noise"]
     found = invocation.discover(strings, prog="foo")
     assert found.get("usage") == "Usage: foo [OPTIONS]"
+
+
+def test_verb_file_subcommand_discovery():
+    """R2.f: `usage: tool parse <file>` -- a written-out VERB before a file positional -- is a
+    dispatch invocation the generic subcommand finder misses (the verb is not a `<command>`
+    metavar). Without it the parser is fuzzed as `tool <file>` and never gets past its usage."""
+    for usage, verb in (("usage: %s parse <file>", "parse"),
+                        ("usage: tool check <input>", "check"),
+                        ("usage: prog validate <path>", "validate"),
+                        ("usage: x run FILE", "run")):
+        found = invocation.discover([usage], prog="tool")
+        assert found.get("subcommand") == verb, usage
+        assert invocation.propose_argv(found) == [verb, invocation.INPUT_PLACEHOLDER], usage
+
+
+def test_verb_file_does_not_fire_without_a_file_positional():
+    # a bare verb with no file positional is not a drivable file invocation
+    assert invocation.verb_subcommand("usage: tool start --daemon") is None
+    # a converter (two bare positionals) stays a converter, not a verb-dispatch
+    assert invocation.verb_subcommand("usage: conv input output") is None

@@ -69,6 +69,36 @@ def output_positional(usage) -> bool:
     return len(bare) >= 2 and any(_OUT_WORD.match(w) for w in bare[1:])
 
 
+#: A file-ish positional metavar word: file / input / path / src / doc / image / data (any affix).
+_FILE_POS = re.compile(r"(?i)(?:^|[_-])(?:in|input|infile|file|path|src|source|doc|image|img|data)"
+                       r"(?:$|[_-]|name|arg)")
+
+
+def verb_subcommand(usage, prog=None):
+    """A literal command VERB that precedes a FILE positional -- `usage: tool parse <file>`,
+    `tool check <input>`. This dispatch shape (`tool <verb> <inputfile>`) is how a surprising number
+    of real parsers are driven, and the generic `from_subcommands` misses it because the verb is
+    WRITTEN OUT, not given as a `<command>` metavar -- so the autopilot fuzzed `tool <file>`, bounced
+    off the usage banner, and never reached the parser. Returns the verb (the input then goes as the
+    positional after it), or None. Conservative: usage must read `<prog-token> <verb> ... <file-pos>`
+    with no flags before the file and a plausible lowercase verb."""
+    if not usage:
+        return None
+    t = re.sub(r"(?i)^.*?\busage\b\s*:?\s*", "", usage)
+    t = re.sub(r"\[[^\]]*\]", " ", t)                     # drop [optional] groups
+    toks = [w for w in re.split(r"\s+", t) if w and not w.startswith("-")]
+    if len(toks) < 3:                                    # need prog, verb, and a file positional
+        return None
+    verb = toks[1].strip("<>[]().")                      # toks[0] is the program token (name/%s/path)
+    if not re.match(r"^[a-z][a-z0-9_-]{1,18}$", verb) or verb in ("file", "input", "path"):
+        return None
+    for w in toks[2:]:
+        name = w.strip("<>[]().").lower()
+        if _FILE_POS.search(name) or name in ("file", "input", "path", "infile", "f"):
+            return verb
+    return None
+
+
 _OPTSTRING = re.compile(r"^[+-]?:?(?=[^:]*:)([A-Za-z0-9]:{0,2}){2,24}$")
 # usage: prog -c <config> --jar=FILE
 _USAGE_FLAG = re.compile(r"(--?[A-Za-z][A-Za-z0-9_-]*)(?:[= ]+([<\[]?[A-Za-z0-9_.<>\[\]-]+))?")
@@ -882,11 +912,14 @@ def discover(strings, *, usage_hint: Optional[str] = None, help_text: Optional[s
     elif len(opt) and len(opt) <= 12:
         flags_in, sources, confidence = dict(opt), ["getopt"], "medium"
     else:
-        # No flags, but a converter's `input output` usage still names a usable invocation (the two
-        # positionals), so carry output_positional out even on the "none" path.
-        return {"flags": [], "usage": usage, "sources": (["subcommand"] if subcmd else []),
-                "confidence": "medium" if subcmd else "none",
-                "output_positional": output_positional(usage), "subcommand": subcmd}
+        # No flags, but a usable invocation can still be named by positionals: a converter's
+        # `input output`, a `<command>`-metavar dispatch (from_subcommands), OR a written-out verb
+        # before a file positional (`tool parse <file>` -- verb_subcommand). The last is R2.f: without
+        # it a verb-dispatched parser is fuzzed as `tool <file>` and never gets past its usage banner.
+        sub = subcmd or verb_subcommand(usage, prog)
+        return {"flags": [], "usage": usage, "sources": (["subcommand"] if sub else []),
+                "confidence": "medium" if sub else "none",
+                "output_positional": output_positional(usage), "subcommand": sub}
 
     placeholders = {}
     for text in ([usage] if usage else []):

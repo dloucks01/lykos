@@ -106,11 +106,13 @@ found by running the machinery on a REAL daemon (asterisk), not building it from
       `coverage.invocation` event. Verified live (`fileparser3 parse @@ · operator`). Also fixed the
       cancelled/errored run state collapsing the whole run bar to a bare "Resume run" (the operator
       lost the budget/invocation/convergence controls) — it now keeps the full controls.
-- [ ] **R2.f · Discover `tool <subcommand> <file>` invocations.** Found live: fp3's real invocation
-      is `parse <file>`, but `discover`/`propose_argv` returns an EMPTY argv for it (a leading verb +
-      a positional file), so the autopilot fuzzes `fileparser3 <file>`, bounces off the usage banner,
-      and only reaches L3 via the STATIC exploit composition — not fuzzing. Recognize a leading
-      subcommand + a file positional (like the dispatch path already handles `tool draw @@`).
+- [x] **R2.f · Discover `tool <subcommand> <file>` invocations.** `verb_subcommand()` recognizes a
+      written-out VERB before a file positional (`tool parse <file>`, `check <input>`, `run FILE`) --
+      the generic subcommand finder missed it (the verb is not a `<command>` metavar), so a
+      verb-dispatched parser was fuzzed as `tool <file>` and never got past its usage. Now
+      `discover` → `['parse', '@@']`. Conservative (verb + file positional, no flags before it);
+      converters/flagged tools unchanged. Unit-tested; 34 invocation tests green. *(fp3: `parse
+      <file>` now auto-discovers — the autopilot drives the parser instead of bouncing off usage.)*
 
 **Acceptance.** A binary that needs `-c <config>` or a positional file is auto-driven to its parser
 (or an honest "couldn't synthesize a valid invocation: <reason>") without the operator hand-setting
