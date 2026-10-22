@@ -150,11 +150,13 @@ def summarize(plan: list, events: list) -> dict:
             note += f"; {len(failed)} failed to run ({failed[0]['reason']})"
     elif not reachable:
         verdict = "none"
-        note = ("no dynamic engine ran here -- every fuzzer declined or was skipped; this run's "
-                "dynamic coverage is zero (not a clean 'no bugs' result)")
+        note = ("No dynamic engine ran -- every fuzzer declined or was skipped -- so this run's "
+                "dynamic coverage is zero and NOTHING could escalate past L0. Every verified rung "
+                "(L1 crash, L2 primitive, L3 exploit) requires executing the target; a static-only "
+                "result here is a tooling/setup outcome, not a clean 'no bugs' binary.")
     else:
         verdict = "none" if failed else "degraded"
         lead = (failed or reachable)[0]
-        note = (f"no engine executed the target -- {lead['engine']}: {lead['reason']}. "
-                "A static-only result here is a tooling outcome, not a clean binary.")
+        note = (f"No dynamic engine could execute the target, so nothing escalated past L0 "
+                f"(static findings only). {lead['engine']}: {lead['reason']}")
     return {"engines": engines, "verdict": verdict, "note": note}

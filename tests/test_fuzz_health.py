@@ -43,7 +43,9 @@ def test_nothing_ran_is_verdict_none():
     assert statuses["fuzz"] == health.FAILED
     assert statuses["net_fuzz"] == health.DECLINED
     assert verdict == "none"
-    assert "tooling outcome" in r["note"]
+    # The note must tie the zero-dynamic-coverage result to the thing the operator sees -- that
+    # nothing could escalate past L0 -- not just report a failed engine.
+    assert "past L0" in r["note"]
 
 
 def test_noprogress_flags_invocation_need():
