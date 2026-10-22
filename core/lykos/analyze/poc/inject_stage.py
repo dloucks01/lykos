@@ -17,7 +17,7 @@ from ...db.dao import CallEdgeDAO, FindingDAO, PocDAO, TargetDAO
 from ...jobs.registry import register_stage
 from ..detect.catalog import normalize
 from ..dynamic import sandbox
-from . import bundle, injection
+from . import bundle, injection, recipe
 
 _log = logging.getLogger(__name__)
 
@@ -172,6 +172,14 @@ def synthesize_injection_stage(ctx) -> dict:
         if hit:
             confirmed.append({"probe": name, **_finalize(ctx, target, target_bytes, spec, hit)})
 
+    # NON-EXECUTED RECIPES: a probe that did not CONFIRM is not a probe that found nothing. The
+    # binary imports the sink, and we built a concrete marked payload for it; that payload is a
+    # deliverable the operator carries to the live target. Emit one corroborated recipe per applicable
+    # probe that stayed unconfirmed (air-gap sandbox, sink behind state we could not reach, or simply
+    # not injectable here) rather than discarding it -- fuzzing is not the only thing that escalates.
+    if not confirmed:
+        _file_injection_recipes(ctx, target, applicable, channels, len(navs or []))
+
     ctx.emit("inject.done", payload={"ok": True, "confirmed": len(confirmed),
              # input_sha + resolved_base are the HANDOFF to build_exploit: a CWE-134 leak that
              # already resolved a PIE/libc base is a measured disclosure recipe, so L3's leak recon
@@ -188,6 +196,50 @@ def synthesize_injection_stage(ctx) -> dict:
                      "navigation preamble(s) tried (menu branches / input gates)" % len(navs or [])})
     ctx.progress(pct=100, msg=f"{len(confirmed)} injection PoC(s) confirmed")
     return {}
+
+
+# The rung a CONFIRMED injection of each class earns (see _level_for). Used for the recipe's
+# candidate ceiling: command/code execution and the end-effect classes target L3, a format-string
+# read / traversal / query-control tops out at the L2 primitive it would give.
+_INJECT_RECIPE_LEVEL = {"CWE-78": "L3", "CWE-94": "L3", "CWE-89": "L2", "CWE-918": "L3",
+                        "CWE-611": "L2", "CWE-22": "L2", "CWE-134": "L2"}
+
+
+def _file_injection_recipes(ctx, target, applicable, channels, n_navs) -> None:
+    """For each applicable injection probe that did not confirm, file a corroborated recipe carrying
+    the concrete marked payload + delivery channel. Honest: state via recipe.file_recipe (never
+    poc-backed, no verified PoC row), effect reported as a candidate ceiling, not demonstrated."""
+    leads = {}
+    try:
+        for f in FindingDAO(ctx.conn).list_by_target(target.id):
+            if f.cwe and f.cwe not in leads and (f.detector or "") in ("dangerous_api", "lang_sinks"):
+                leads[f.cwe] = f
+    except Exception:                                    # noqa: BLE001 -- lead linkage is best-effort
+        observe.absorbed(_log, "no leads")
+    chan = (channels or ["stdin"])[0]
+    for name, spec in applicable.items():
+        cwe = spec.get("cwe", "")
+        try:
+            payloads = spec["payloads"](_marker())
+        except Exception:                                # noqa: BLE001
+            payloads = []
+        p0 = payloads[0] if payloads else b""
+        pb = p0 if isinstance(p0, bytes) else str(p0).encode()
+        shown = pb.decode("latin-1")[:80]
+        tech = f"{name} via {chan}"
+        why = ("could not confirm by execution here -- no runtime marker on the entry channel or "
+               f"behind any of the {n_navs} navigation preamble(s) tried (air-gap / sink behind "
+               "unreached state / not injectable)")
+        recipe.file_recipe(
+            ctx, target, cwe=cwe, technique=tech,
+            target_level=_INJECT_RECIPE_LEVEL.get(cwe, "L2"),
+            severity=spec.get("severity", "high"), detector="inject_synth",
+            dedup_key=f"recipe:{cwe}:inject-{name}:{target.id}",
+            title=f"Exploitation recipe: {spec.get('title', name)} ({name})",
+            summary=(f"the binary imports the {name} sink; candidate payload {shown!r} delivered "
+                     f"over {chan} is built to trigger it"),
+            why_not_executed=why, lead=leads.get(cwe),
+            input_bytes=pb, input_mode=chan)
 
 
 _HEXWORD = re.compile(rb"0x[0-9a-f]{4,}|\(nil\)|\(null\)")

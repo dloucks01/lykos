@@ -17,7 +17,7 @@ from ...db.dao import DynResultDAO, FindingDAO, PocDAO, TargetDAO
 from ...jobs.registry import register_stage
 from ..dynamic import sandbox
 from ..dynamic.stage import crash_finding_candidate
-from . import cve_triggers
+from . import cve_triggers, recipe
 
 _log = logging.getLogger(__name__)
 
@@ -137,6 +137,7 @@ def cve_poc_stage(ctx) -> dict:
     deadline = time.monotonic() + WALLCLOCK_BUDGET
     fired = 0
     faulted_groups = set()          # a group ("lib:zlib"/"cwe:CWE-787") records one fault, then skips
+    tried = []                      # items we detonated but did not reproduce -> become recipes
     for item in plan:
         if fired >= DETONATION_CAP or time.monotonic() >= deadline:
             break
@@ -152,6 +153,14 @@ def cve_poc_stage(ctx) -> dict:
             reproduced.append(item.label)
             if item.group:
                 faulted_groups.add(item.group)
+        else:
+            tried.append(item)
+
+    # NON-EXECUTED RECIPES: a CVE trigger that did not fault here is not proof of absence -- the
+    # target may be unaffected OR could not be executed in this environment. The concrete trigger
+    # input (the bytes + channel for a known CVE) is a deliverable regardless, so file it as a
+    # corroborated recipe (deduped by group, capped) rather than discarding it.
+    _file_cve_recipes(ctx, target, tried, faulted_groups, matched)
 
     bespoke_tried = [cve for cve, _f in matched if cve_triggers.for_cve(cve) is not None]
     ctx.emit("cve_poc.done", payload={"applicable": True, "bespoke_tried": bespoke_tried,
@@ -159,6 +168,41 @@ def cve_poc_stage(ctx) -> dict:
     ctx.progress(pct=100, msg=(f"reproduced {', '.join(reproduced)}" if reproduced
                                else "no CVE trigger reproduced a fault on this target"))
     return {}
+
+
+def _file_cve_recipes(ctx, target, tried, faulted_groups, matched) -> None:
+    """One corroborated recipe per CVE trigger that was tried but did not fault here, carrying the
+    concrete trigger bytes + channel. Deduped by group, capped. Honest via recipe.file_recipe."""
+    cwe_lead = {}
+    for _cve, _f in matched:
+        if _f.cwe:
+            cwe_lead.setdefault(_f.cwe, _f)
+    seen, filed = set(), 0
+    for item in tried:
+        if filed >= 8:
+            break
+        grp = item.group or item.label
+        if (item.group and item.group in faulted_groups) or grp in seen:
+            continue
+        seen.add(grp)
+        trig = item.trigger
+        cwe = getattr(trig, "cwe", None) or "CWE-1395"       # CWE-1395: vulnerable 3rd-party component
+        lead = cwe_lead.get(cwe)
+        try:
+            data = bytes(trig.data) if trig.data is not None else b""
+        except Exception:                                    # noqa: BLE001
+            data = b""
+        recipe.file_recipe(
+            ctx, target, cwe=cwe, technique=f"CVE trigger ({item.label})", target_level="L1",
+            severity="high", detector="cve_poc",
+            dedup_key=f"recipe:cve:{item.label}:{target.id}",
+            title=f"Exploitation recipe: {item.label} trigger",
+            summary=(f"a concrete trigger for {item.label} is built ({len(data)} bytes over "
+                     f"{trig.channel}); {getattr(trig, 'note', '') or 'feed it to reproduce the CVE'}"),
+            why_not_executed=("the trigger did not fault here -- the target may be patched/unaffected "
+                              "or could not be executed in this environment"),
+            lead=lead, input_bytes=data, input_mode=trig.channel)
+        filed += 1
 
 
 def register() -> None:

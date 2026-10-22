@@ -21,7 +21,7 @@ from ...db.dao import CallEdgeDAO, DynResultDAO, FindingDAO, PocDAO, StringDAO, 
 from ...jobs.registry import register_stage
 from ..dynamic import sandbox
 from ..dynamic.stage import asan_defect_key, crash_dedup_key, crash_finding_candidate, crash_key_parts
-from . import bundle, primitive
+from . import bundle, primitive, recipe
 from .capture import modes_for
 from .primitive_stage import _hydrate_frames
 
@@ -121,10 +121,41 @@ def synthesize_stage(ctx) -> dict:
                     return _finalize(ctx, target, target_bytes, payload, mode, run_argv,
                                      res, c, off, slack, tried)
 
+    # NON-EXECUTED RECIPE: the overflow input is DERIVED from the recovered frame, not from a
+    # fuzzer -- the exact offset + sentinel-at-return-slot payload exists whether or not this one
+    # detonation faulted (it may not have reached the buffer here: menu/protocol gating, wrong
+    # channel, or the target could not be executed at all). Emit it as a corroborated recipe + the
+    # concrete bytes rather than discarding a computed L1 just because confirmation was unavailable.
+    top = candidates[0]
+    rec_off = int(top.get("offset") or 0)
+    rec_payload = primitive.control_input(rec_off, rec_off + word * 4 + 16, word, endian)
+    lead = None
+    try:
+        for f in FindingDAO(ctx.conn).list_by_target(target.id):
+            if (f.detector or "") == "stack_buffer_overflow" or (f.cwe in ("CWE-121", "CWE-787")):
+                lead = f
+                break
+    except Exception:                                    # noqa: BLE001 -- lead linkage is best-effort
+        lead = None
+    recipe.file_recipe(
+        ctx, target, cwe=(lead.cwe if lead and lead.cwe else "CWE-121"),
+        technique="stack-overflow return-address overwrite", target_level="L1",
+        severity="high", detector="synth_overflow",
+        dedup_key=f"recipe:stack-overflow:{top['buffer']}:{target.id}",
+        title=f"Exploitation recipe: stack overflow of {top['buffer']}",
+        summary=(f"{top['size']}-byte buffer {top['buffer']}: write {rec_off} bytes of cyclic "
+                 f"filler then a sentinel at the saved return address (word {word}B, {endian}-endian) "
+                 f"to take control of the return address"),
+        why_not_executed=(f"the {tried} synthesized input(s) did not fault in this sandbox -- the "
+                          "buffer may be gated behind menu/protocol navigation or the target could "
+                          "not be executed here"),
+        lead=lead, input_bytes=rec_payload, input_mode=(modes or ["stdin"])[0], argv=argv_base or None)
     ctx.emit("synth.done", payload={"ok": True, "crashed": False, "tried": tried,
-             "note": "synthesized overflow inputs did not reproduce a crash -- the buffer may "
-                     "not be reachable directly (menu/protocol navigation); try fuzzing/concolic"})
-    ctx.progress(pct=100, msg=f"no crash from {tried} synthesized inputs (buffer not reached)")
+             "recipe": True,
+             "note": "synthesized overflow inputs did not reproduce a crash -- filed the computed "
+                     "offset/payload as a corroborated recipe; the buffer may not be reachable "
+                     "directly (menu/protocol navigation) or the target could not be executed"})
+    ctx.progress(pct=100, msg=f"no crash from {tried} inputs -- filed overflow recipe for {top['buffer']}")
     return {}
 
 
