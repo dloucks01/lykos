@@ -596,8 +596,11 @@
   .rail-pipe { display: flex; flex-direction: column; gap: 9px; font-size: .84rem; }
   .rail-step { display: flex; align-items: center; gap: 9px; color: var(--muted); }
   .rail-step .rs-ico { flex: 0 0 14px; text-align: center; }
-  .rail-step.rs-done .rs-ico { color: var(--ok); } .rail-step.rs-run { color: var(--ink); font-weight: 600; }
-  .rail-step.rs-run .rs-ico { color: var(--run); }
+  .rail-step.rs-done .rs-ico { color: var(--ok); }
+  .rail-step.rs-running { color: var(--ink); font-weight: 600; }
+  .rail-step.rs-running .rs-ico { color: var(--run); }
+  .rail-step.rs-error .rs-ico { color: var(--bad); }
+  .rail-step.rs-skipped, .rail-step.rs-cancelled, .rail-step.rs-declined { color: var(--faint); }
   .rail-run { margin-top: auto; }
   .rail-run .btn { width: 100%; justify-content: center; }
   /* The primary run controls, as a full-width horizontal bar at the top of the main content

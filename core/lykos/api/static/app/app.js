@@ -1045,8 +1045,8 @@ function App() {
               <div>
                 <div class="rail-sec-h">Pipeline</div>
                 <div class="rail-pipe">
-                  ${bg.plan.map((s) => html`<div class=${`rail-step rs-${s.status || "pending"}`} key=${s.stage}>
-                    <span class="rs-ico">${s.status === "done" ? "✓" : s.status === "running" ? "◆" : s.status === "error" ? "✕" : "·"}</span>
+                  ${bg.plan.map((s) => html`<div class=${`rail-step rs-${s.state || "pending"}`} key=${s.stage}>
+                    <span class="rs-ico">${s.state === "done" ? "✓" : s.state === "running" ? "◆" : s.state === "error" ? "✕" : (s.state === "skipped" || s.state === "cancelled") ? "–" : "·"}</span>
                     <span>${s.label || s.stage}</span>
                   </div>`)}
                 </div>
