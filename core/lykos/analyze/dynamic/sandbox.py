@@ -644,15 +644,30 @@ _SYSROOT_TRIPLES: dict = {
 }
 
 
+#: dynamic-loader basenames across the libc families/arches we emulate (glibc, musl, ppc ld64).
+_LOADER_PREFIXES = ("ld-", "ld.", "ld64.", "ld-linux", "ld-musl", "dl-")
+
+
 def _dir_has_guest_loader(d) -> bool:
-    """Does directory `d` look like a guest sysroot -- does it carry an ELF dynamic loader?"""
+    """Does directory `d` look like a guest sysroot -- does it carry an ELF dynamic loader?
+
+    Scans the TOP LEVEL as well as the lib dirs, including the multiarch layout. A directory-
+    ingested target (or a carved rootfs) often stages its loader beside the binary or under
+    `lib/<triple>/`, not only in `lib64/`; missing those made `qemu_ld_prefix` return None, so
+    afl-qemu fell back to the LAPTOP's glibc and a target built against a newer glibc died with
+    `symbol lookup error: ... undefined symbol` -- the "Fork server handshake failed" the operator
+    kept seeing EVEN AFTER supplying the libs. Finding the loader here routes QEMU_LD_PREFIX at the
+    target's OWN libraries instead."""
     try:
         p = Path(d)
-        for sub in ("lib", "lib64", "usr/lib", "usr/lib64"):
-            ld = p / sub
+        for sub in ("", "lib", "lib64", "usr/lib", "usr/lib64", "usr/local/lib",
+                    "lib/x86_64-linux-gnu", "usr/lib/x86_64-linux-gnu",
+                    "lib/aarch64-linux-gnu", "usr/lib/aarch64-linux-gnu",
+                    "lib/arm-linux-gnueabihf", "usr/lib/arm-linux-gnueabihf"):
+            ld = (p / sub) if sub else p
             if ld.is_dir():
                 for name in os.listdir(ld):
-                    if name.startswith("ld-") or name.startswith("ld."):
+                    if name.startswith(_LOADER_PREFIXES):
                         return True
     except OSError:
         pass
