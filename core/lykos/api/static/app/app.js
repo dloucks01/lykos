@@ -1248,12 +1248,14 @@ function App() {
                 <${ConsolePanel} lines=${consoleLines} />
                 <${ProgressLog} entries=${log} running=${running} />
                 <${CoveragePanel} coverage=${coverage} targets=${targets} onDrill=${browseFunctions} />
+                <!-- Run-mechanics live in the Console (the activity hub), NOT duplicated onto every
+                     tab (they used to render outside the tab switch, so engine health + "what this
+                     run did" painted on Overview, Exploits, Dynamic and Diff too -- the overlap). -->
+                <${FuzzHealthPanel} health=${fuzzHealth} />
+                <${RunScorecard} cards=${scorecard} targetName=${activeTarget && activeTarget.filename} />
+                <${UnavailablePanel} items=${unavailable} />
               </div>
             ` : html`<div class="wb-soon">This view is coming to the workbench.</div>`}
-
-            <${FuzzHealthPanel} health=${fuzzHealth} />
-            <${RunScorecard} cards=${scorecard} targetName=${activeTarget && activeTarget.filename} />
-            <${UnavailablePanel} items=${unavailable} />
           </main>
         </div>
       `}
