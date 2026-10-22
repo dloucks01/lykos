@@ -647,6 +647,84 @@ def unchecked_privdrop(ctx: DetectContext):
     return out
 
 
+# ------------------------- world-writable file permissions (logic/access-control: CWE-732) -------
+# A chmod()/fchmod() with an others-writable mode leaves a file any local user can rewrite -- a
+# config, a script, a lock or a binary an attacker then controls. This is NOT a crash or injection:
+# it is an access-control contract broken with a constant. umask does NOT apply to chmod/fchmod, so
+# a literal mode IS the final permission, which makes the check precise: we read the mode immediate
+# straight off the register the ABI passes it in.
+#: call -> the register (and its 32-bit alias) that carries mode_t on x86-64 SysV.
+_CHMOD_MODE_REG = {"chmod": ("rsi", "esi"), "fchmod": ("rsi", "esi"), "lchmod": ("rsi", "esi"),
+                   "fchmodat": ("rdx", "edx")}
+_IMM_RE = re.compile(r"^mov\s+(\w+)\s*,\s*(0x[0-9a-fA-F]+|\d+)\s*$", re.I)
+
+
+def _imm_into_reg(ir: dict, site_addr, regs) -> "Optional[int]":
+    """The immediate most recently moved into `regs` (a register and its 32-bit alias) BEFORE the
+    call at `site_addr`, within the same basic block -- e.g. `mov esi, 0x1ff` ahead of `call chmod`.
+    Returns None if the mode is computed (not a literal) or the register is clobbered first, so a
+    non-constant mode is never guessed at (no false positive)."""
+    site = _naddr(site_addr)
+    if not ir or site is None:
+        return None
+    seq = None
+    for b in ir.get("blocks", []) or []:
+        ins = b.get("instructions") or []
+        addrs = [_naddr(i.get("addr")) for i in ins]
+        if site in addrs:
+            seq = ins[:addrs.index(site)]             # instructions strictly BEFORE the call
+            break
+    if not seq:
+        return None
+    for i in reversed(seq):
+        t = (i.get("text") or "").split(";")[0].strip().lower()
+        m = _IMM_RE.match(t)
+        if m and m.group(1) in regs:
+            v = m.group(2)
+            return int(v, 16) if v.lower().startswith("0x") else int(v)
+        # the register written by any other instruction before we found a literal -> value is not a
+        # constant we can read; stop rather than reach past the real definition.
+        parts = t.split(None, 1)
+        if len(parts) > 1:
+            dst = parts[1].split(",", 1)[0].strip()
+            if dst in regs:
+                return None
+    return None
+
+
+@register_detector
+def world_writable_perms(ctx: DetectContext):
+    """Flag chmod()/fchmod() that sets an OTHERS-WRITABLE mode (CWE-732) -- an access-control bug:
+    the file becomes modifiable by any local user. x86-64 (the mode is read from its arg register)."""
+    if not (_is_x86(ctx.arch) and ctx.bits == 64 and ctx.func_irs):
+        return []
+    out = []
+    for e in ctx.call_edges:
+        n = normalize(e.dst_name)
+        regs = _CHMOD_MODE_REG.get(n)
+        if not regs:
+            continue
+        ir = ctx.func_irs.get(e.src_addr)
+        if ir is None:
+            continue
+        mode = _imm_into_reg(ir, e.site_addr, regs)
+        if mode is None or not (mode & 0o0002):          # others-write bit must be set
+            continue
+        out.append(_cand(
+            "CWE-732",
+            f"World-writable file permissions set via {n}()",
+            "medium", "world_writable_perms",
+            [{"channel": "pattern", "detail": (
+                f"{n}() at {e.site_addr} sets mode 0{mode & 0o7777:o}, which is OTHERS-WRITABLE. "
+                "umask does not apply to chmod/fchmod, so this is the file's final permission: any "
+                "local user can modify it (a config, script, lock or binary the program trusts) -- "
+                "CWE-732. A static pattern; whether the file is security-relevant is not proven.")}],
+            function_addr=e.src_addr, site_addr=e.site_addr,
+            site_detail=f"{n}(mode=0{mode & 0o7777:o}) at {e.site_addr}",
+            dedup_key=f"CWE-732:world_writable_perms:{n}", confidence=0.6))
+    return out
+
+
 # ------------------------------- width-bounded scanf that STILL overflows (the off-by-one class)
 # `scanf("%16s", buf)` with `char buf[16]` is NOT safe: the conversion writes up to 16 chars PLUS a
 # terminating NUL = 17 bytes into a 16-byte buffer. The width bound fools the coarse detector above

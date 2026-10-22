@@ -258,8 +258,17 @@ upgrade improves what the non-fuzz recover phase can confirm).
       TESTED, STORED, or PASSED ON is correctly left alone (high precision). Honest CANDIDATE
       (attacker-reachability/exploitability not claimed). x86/x86-64. Validated unit + e2e A/B
       (`tests/test_unchecked_privdrop.py`, 10 tests); 69 existing detector tests green.
-      *Remaining in the class:* auth-comparison / hardcoded-credential-gate shapes, access-control
-      and protocol-state violations (need intended-vs-actual modeling — the hard tier).
+      **Second increment landed:** the **world-writable file permissions** detector
+      (`detect/detectors.py world_writable_perms`, CWE-732). A `chmod`/`fchmod`/`fchmodat` with an
+      others-writable mode leaves a file any local user can rewrite (a config/script/lock/binary the
+      program trusts) — an access-control contract broken with a constant, not a crash. umask does
+      not apply to chmod/fchmod, so the literal mode IS the final permission: the detector reads the
+      mode immediate from the ABI arg register and flags only the others-writable ones (0777/0666
+      flagged; 0755/0644 not; a computed mode is never guessed — no FP). x86-64. Validated unit +
+      e2e A/B (`tests/test_world_writable.py`, 10 tests).
+      *Remaining in the class:* auth-comparison / hardcoded-credential-gate shapes, precise CWE-134
+      format-string (literal-vs-computed format arg — today only a low-confidence flag), protocol-
+      state violations (need intended-vs-actual modeling — the hard tier).
 - [x] **Avenue #5 — exploit composition on stripped (partial)** — the (a) ret2win shell-call fix is
       one increment; more composition work possible.
 - [x] **Harness track T1 / T2** — T1 fuzz-worthiness ranker + T2 emulated single-function executor +
