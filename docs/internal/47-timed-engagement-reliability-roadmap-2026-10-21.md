@@ -165,6 +165,43 @@ upgrade improves what the non-fuzz recover phase can confirm).
 - [ ] **Wire the `harness` stage into the default autopilot plan** (currently registered + in the
       stage map but not in the default pipeline) — overlaps with I1.
 
+---
+
+## Proactively-identified gaps (model-sourced — confirm against code, then prioritize)
+
+Operator-real gaps surfaced without being asked, grounded in how a time-boxed, air-gapped
+engagement on real binaries actually goes. Each needs a quick confirm against the current code
+before building (some are partly done — note that rather than rebuild).
+
+- [ ] **P1 · Crash triage & exploitability ranking.** A run that yields many crashes should
+      auto-dedup by root cause and rank by exploitability so the operator sees the few that matter,
+      not fifty. (Partly exists — unique-sig dedup, `distinctCrashes`; confirm + surface a ranked
+      view in the GUI.)
+- [ ] **P2 · Run resume / checkpointing.** Resume an interrupted or long Thorough run from the case
+      DB instead of restarting the search from zero — matters most for convergence runs and if the
+      environment kills a background run (which it does here).
+- [ ] **P3 · Operator curation of findings.** In the GUI: mark false-positive / confirm / annotate,
+      feeding the engagement report. Precision is the standing bar, so the operator must be able to
+      triage and the tool must remember it.
+- [ ] **P4 · Comprehensive auto-corpus seeding from the target.** Mine strings, embedded samples,
+      format magic, and companion files for valid seeds so fuzzing starts from real inputs, not
+      noise. (Partly exists — strings/format models; make it exhaustive + show what was seeded.)
+- [ ] **P5 · Environment & filesystem setup discovery.** Beyond config/param (R2): env vars the
+      target reads (getenv), files it opens at fixed paths, a required CWD / data dir — detect and
+      supply so the target runs at all.
+- [ ] **P6 · Stateful / interactive / menu-driven driving.** Detect op-sequence protocols (a
+      handshake, a numbered menu) and drive them; many real daemons need a sequence to reach the
+      bug. (Overlaps harness T6.)
+- [ ] **P7 · Target hang / DoS capture.** A target that hangs on an input is itself a finding
+      (CWE-835 / CWE-400), not a discarded timeout — capture and reproduce it.
+- [ ] **P8 · Bundle / version freshness check.** The GUI warns when the running air-gap disc lags
+      main (missing fixes) — "it didn't work" has partly been stale discs (memory notes several
+      fixes landed after the 20261021 disc).
+- [ ] **P9 · Multi-binary engagement view.** An engagement is many binaries; a cross-target queue +
+      dashboard (done / has-findings / needs-attention) and batch analysis, not one case at a time.
+- [ ] **P10 · BinDiff / patch-diff N-day.** Diff a target against a known-good or prior version to
+      localize the changed (patched/vulnerable) code; complements avenue #2.
+
 ## Done
 
 - [x] **(a) Single-address ret2win to an in-image shell call** (stripped/no-PIE, NUL-safe) —
