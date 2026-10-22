@@ -130,6 +130,7 @@ function App() {
   const [disasmFn, setDisasmFn] = useState(null);     // getFunction detail for the Disassembly tab
   const [disasmSel, setDisasmSel] = useState({});     // targetId -> selected function id
   const [diffVerify, setDiffVerify] = useState(null); // poc_diff run result for the Diff tab
+  const [harnessRun, setHarnessRun] = useState(null); // on-demand harness (deep fn fuzzing) status
   const [bg, setBg] = useState(null);               // server-side background autopilot status
   const [budgetMin, setBudgetMin] = useState("");   // Autopilot budget in MINUTES ("" = size-aware default)
   const [converge, setConverge] = useState(false);  // run-to-convergence (minutes become the ceiling)
@@ -759,6 +760,26 @@ function App() {
     } catch (e) { setDiffVerify({ key, error: e.message || String(e) }); }
   }, []);
 
+  // Operator-initiated DEEP FUNCTION FUZZING (the harness stage: T1 rank -> T2 drive -> T4
+  // constant-dict -> T5 DoS oracle -> T6 stateful sequences). Deliberately NOT part of the default
+  // run (operator steer: not every binary wants per-function fuzzing); the operator triggers it on
+  // demand here. Declines cleanly on a non-x86-64 target or before disassemble, and files its
+  // function-level findings into the usual panels.
+  const runHarness = useCallback(async (tid) => {
+    if (!tid || (harnessRun && harnessRun.running)) return;
+    setHarnessRun({ targetId: tid, running: true });
+    try {
+      const run = await api.createRun("harness", { targetId: tid, params: {} });
+      await waitForRun(run.run_id, { timeoutMs: 300000 });
+      const out = await api.runOutput(run.run_id);
+      const res = (out && out.output) || {};
+      await refreshResults(caseId, targets);
+      setHarnessRun({ targetId: tid, result: res });
+    } catch (e) {
+      setHarnessRun({ targetId: tid, error: e.message || String(e) });
+    }
+  }, [caseId, targets, refreshResults, harnessRun]);
+
   // Lazily fetch a tab's data the first time it is needed for the focused target (and always the
   // crash rows, which gate the conditional Crashes tab). Cached per target so switching is instant.
   const _at = activeTid || (targets[0] && targets[0].id);
@@ -1058,9 +1079,27 @@ function App() {
               </div>
             ` : tab === "functions" ? html`
               <div class="wb-panel">
-                <div class="fn-viewtabs">
-                  <button class=${`fn-viewtab${fnView === "graph" ? " active" : ""}`} onClick=${() => setFnView("graph")}>Call graph</button>
-                  <button class=${`fn-viewtab${fnView === "table" ? " active" : ""}`} onClick=${() => setFnView("table")}>Functions</button>
+                <div class="fn-topbar">
+                  <div class="fn-viewtabs">
+                    <button class=${`fn-viewtab${fnView === "graph" ? " active" : ""}`} onClick=${() => setFnView("graph")}>Call graph</button>
+                    <button class=${`fn-viewtab${fnView === "table" ? " active" : ""}`} onClick=${() => setFnView("table")}>Functions</button>
+                  </div>
+                  <div class="fn-actions">
+                    ${harnessRun && harnessRun.targetId === _atid && !harnessRun.running ? html`
+                      <span class=${`fn-harness-note${harnessRun.error ? " bad" : ""}`}>
+                        ${harnessRun.error
+                          ? `harness: ${harnessRun.error}`
+                          : `harness: ${harnessRun.result && harnessRun.result.findings != null
+                              ? `${harnessRun.result.findings} finding(s), ${harnessRun.result.functions || 0} fn driven`
+                              : "done"}`}
+                      </span>` : null}
+                    <button class="fn-harness" disabled=${!!(harnessRun && harnessRun.running) || !_atid}
+                      title="Rank this binary's functions and fuzz the most promising ones directly under the emulator — constant-guided inputs, an unbounded-allocation oracle, and stateful message sequences. Operator-initiated; not part of a normal run. x86-64; needs disassembly first."
+                      onClick=${() => runHarness(_atid)}>
+                      ${harnessRun && harnessRun.running && harnessRun.targetId === _atid
+                        ? html`<${Spinner} /> Deep fuzzing…` : "⚡ Deep function fuzzing"}
+                    </button>
+                  </div>
                 </div>
                 ${fnView === "graph"
                   ? html`<${CallGraphCanvas} functions=${activeFuncs} edges=${_atid ? cgByT[_atid] : null}

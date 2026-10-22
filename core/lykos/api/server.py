@@ -717,6 +717,10 @@ class Handler(EndpointsMixin, AutopilotMixin, BaseHTTPRequestHandler):
         "source_sink_scan": ("..analyze.fingerprint", "enqueue_source_sink_scan"),
         "net_fuzz": ("..analyze.fuzz", "enqueue_net_fuzz"),
         "env_fuzz": ("..analyze.fuzz", "enqueue_env_fuzz"),
+        # On-demand ONLY (deliberately not in the default plan -- operator steer against adding
+        # fuzzing to every run). The binary-libFuzzer harness: rank functions (T1), drive them
+        # directly (T2), with constant-dict (T4), DoS oracle (T5) and stateful sequences (T6).
+        "harness": ("..analyze.harness", "enqueue_harness"),
         "cve_corroborate": ("..analyze.fingerprint", "enqueue_cve_corroborate"),
         "cve_poc": ("..analyze.poc", "enqueue_cve_poc"),
         "unpack": ("..analyze.unpack", "enqueue_unpack"),

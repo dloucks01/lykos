@@ -771,8 +771,18 @@
   .diff-verify-list { display: flex; flex-direction: column; gap: 4px; margin: 6px 2px 4px; }
   .dvr { font-family: var(--mono); font-size: .8rem; color: var(--muted); }
   /* Call-graph canvas: pan/zoom SVG of the internal call graph */
+  .fn-topbar { display: flex; align-items: center; justify-content: space-between; gap: 10px;
+    flex-wrap: wrap; margin-bottom: 8px; }
   .fn-viewtabs { display: inline-flex; gap: 2px; background: var(--panel-2); border: 1px solid var(--line);
-    border-radius: 8px; padding: 2px; margin-bottom: 8px; }
+    border-radius: 8px; padding: 2px; }
+  .fn-actions { display: inline-flex; align-items: center; gap: 10px; }
+  .fn-harness { font-size: .82rem; padding: 5px 14px; border-radius: 7px; border: 1px solid var(--line);
+    background: var(--panel-2); color: var(--ink); cursor: pointer; font: inherit; font-weight: 600;
+    display: inline-flex; align-items: center; gap: 6px; }
+  .fn-harness:hover:not(:disabled) { border-color: var(--accent, #6ea8fe); color: var(--accent, #6ea8fe); }
+  .fn-harness:disabled { opacity: .55; cursor: default; }
+  .fn-harness-note { font-size: .78rem; color: var(--muted); }
+  .fn-harness-note.bad { color: var(--bad, #e06c75); }
   .fn-viewtab { font-size: .82rem; padding: 4px 12px; border-radius: 6px; border: none; background: transparent;
     color: var(--muted); cursor: pointer; font: inherit; }
   .fn-viewtab.active { background: var(--panel); color: var(--ink); font-weight: 600; }
