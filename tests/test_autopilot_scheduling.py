@@ -125,3 +125,15 @@ def test_a_params_free_stage_is_not_handed_params_it_cannot_take():
         if not takes:
             assert stage in _NO_PARAMS, (
                 f"{stage}'s enqueue helper takes no `params`, so it must be in _NO_PARAMS")
+
+
+def test_the_api_dispatch_tables_are_derived_from_the_autopilot_registry():
+    """The server's on-demand dispatch tables (`Handler._TARGET_STAGES` / `_CASE_STAGES`) must be
+    DERIVED from the autopilot's own (`_TARGET` / `_CASE`), not a hand-maintained second copy. A
+    duplicated table is exactly how `patch_diff` fell out of sync with the scheduler (fixed in
+    583f1fe): it was added to some lists and not others. Deriving them makes a stage added to the
+    autopilot automatically API-dispatchable, and this pins the single source of truth so the two
+    can never diverge again."""
+    from lykos.api.server import Handler
+    assert Handler._TARGET_STAGES == _TARGET, "the API target-stage table drifted from orchestrate._TARGET"
+    assert Handler._CASE_STAGES == _CASE, "the API case-stage table drifted from orchestrate._CASE"

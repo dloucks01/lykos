@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import parse_qs, urlparse
 
+from ..analyze import orchestrate as _orchestrate
 from ..casestore import CaseStore, ContentStore
 from ..db.connection import connect
 from ..db.dao import CallEdgeDAO, DynResultDAO, EventDAO, FindingDAO, FunctionDAO, PocDAO, StringDAO
@@ -26,7 +27,6 @@ from . import ws
 from .autopilot import AutopilotMixin
 from .endpoints import EndpointsMixin
 from .serializers import (
-    _INGEST,
     _call_edge,
     _case,
     _csv,
@@ -682,60 +682,15 @@ class Handler(EndpointsMixin, AutopilotMixin, BaseHTTPRequestHandler):
     # ~90-line elif chain over 25 names, which had to be edited in two places to add a stage
     # and silently accepted any unknown name through its final else. Imports stay lazy (they
     # pull in heavy optional backends), so the value is the module path, not the function.
-    _CASE_STAGES = {
-        "link_case": ("..analyze.link", "enqueue_link"),
-        "ipc_model": ("..analyze.link", "enqueue_ipc"),
-        "whole_system": ("..analyze.link", "enqueue_whole_system"),
-        "cross_taint": ("..analyze.link", "enqueue_cross_taint"),
-    }
-    _TARGET_STAGES = {
-        _INGEST: ("..analyze.ingest", "enqueue_triage"),
-        "disassemble": ("..analyze.disassemble", "enqueue_disassemble"),
-        "detect_cwe": ("..analyze.detect", "enqueue_detect"),
-        "dynamic_run": ("..analyze.dynamic", "enqueue_dynamic"),
-        "fuzz": ("..analyze.fuzz", "enqueue_fuzz"),
-        "libfuzzer": ("..analyze.libfuzzer_stage", "enqueue_libfuzzer"),
-        "coverage_fuzz": ("..analyze.fuzz", "enqueue_coverage_fuzz"),
-        "directed_fuzz": ("..analyze.fuzz", "enqueue_directed_fuzz"),
-        "concolic": ("..analyze.symbolic", "enqueue_concolic"),
-        "build_poc": ("..analyze.poc", "enqueue_build_poc"),
-        "poc_primitive": ("..analyze.poc", "enqueue_primitive"),
-        "build_exploit": ("..analyze.poc", "enqueue_exploit"),
-        "synthesize_poc": ("..analyze.poc", "enqueue_synthesize"),
-        "synthesize_injection": ("..analyze.poc", "enqueue_inject"),
-        "synthesize_secret": ("..analyze.poc", "enqueue_secret"),
-        "boundary_fuzz": ("..analyze.link", "enqueue_boundary"),
-        "heap_check": ("..analyze.dynamic", "enqueue_heap_check"),
-        "heap_trace": ("..analyze.dynamic", "enqueue_heap_trace"),
-        "oob_index": ("..analyze.dynamic", "enqueue_oob_index"),
-        "mem_oracle": ("..analyze.dynamic", "enqueue_mem_oracle"),
-        "chain_primitive": ("..analyze.poc", "enqueue_chain"),
-        "poc_diff": ("..analyze.poc", "enqueue_poc_diff"),
-        "patch_diff": ("..analyze.patch_diff_stage", "enqueue_patch_diff"),
-        "root_cause": ("..analyze.debug", "enqueue_root_cause"),
-        "multi_debug": ("..analyze.debug", "enqueue_multi_debug"),
-        "debug_monitor": ("..analyze.debug", "enqueue_monitor"),
-        "extract_secrets": ("..analyze.debug", "enqueue_extract"),
-        "behavior_trace": ("..analyze.debug", "enqueue_behavior_trace"),
-        "dynamic_taint": ("..analyze.debug", "enqueue_taint"),
-        "cve_scan": ("..analyze.fingerprint", "enqueue_cve_scan"),
-        "source_cve_scan": ("..analyze.fingerprint", "enqueue_source_cve_scan"),
-        "embedded_audit": ("..analyze.fingerprint", "enqueue_embedded_audit"),
-        "int_overflow_scan": ("..analyze.fingerprint", "enqueue_int_overflow_scan"),
-        "uaf_scan": ("..analyze.fingerprint", "enqueue_uaf_scan"),
-        "source_sink_scan": ("..analyze.fingerprint", "enqueue_source_sink_scan"),
-        "net_fuzz": ("..analyze.fuzz", "enqueue_net_fuzz"),
-        "env_fuzz": ("..analyze.fuzz", "enqueue_env_fuzz"),
-        # On-demand ONLY (deliberately not in the default plan -- operator steer against adding
-        # fuzzing to every run). The binary-libFuzzer harness: rank functions (T1), drive them
-        # directly (T2), with constant-dict (T4), DoS oracle (T5) and stateful sequences (T6).
-        "harness": ("..analyze.harness", "enqueue_harness"),
-        "cve_corroborate": ("..analyze.fingerprint", "enqueue_cve_corroborate"),
-        "cve_poc": ("..analyze.poc", "enqueue_cve_poc"),
-        "unpack": ("..analyze.unpack", "enqueue_unpack"),
-        "firmware_carve": ("..analyze.firmware", "enqueue_firmware"),
-        "firmware_rehost": ("..analyze.firmware", "enqueue_rehost"),
-    }
+    # SINGLE SOURCE OF TRUTH: the autopilot's own dispatch tables (orchestrate._CASE / _TARGET).
+    # These were hand-duplicated here, which is exactly how `patch_diff` fell out of sync with the
+    # scheduler (regression fixed in 583f1fe). Deriving them means a stage added to the autopilot is
+    # automatically API-dispatchable, and the two tables can never diverge again. The invariant is
+    # pinned by tests/test_autopilot_scheduling.py. (`harness` is in _TARGET but deliberately NOT in
+    # the default plan -- the operator steer against adding fuzzing to every run -- which is governed
+    # by _PLAN_STAGES in orchestrate, not by which stages are dispatchable here.)
+    _CASE_STAGES = dict(_orchestrate._CASE)
+    _TARGET_STAGES = dict(_orchestrate._TARGET)
 
 
 
