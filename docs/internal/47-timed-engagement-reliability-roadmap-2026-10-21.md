@@ -307,8 +307,17 @@ upgrade improves what the non-fuzz recover phase can confirm).
         sequence (seq_index=2) and by sequence-fuzzing, and is UNREACHABLE by any single call or the
         wrong order. v1 scope: delimiter-framed sequences; length-prefixed / binary framing and
         automatic dispatch-loop recovery are the follow-up tier.
-- [ ] **Wire the `harness` stage into the default autopilot plan** (currently registered + in the
-      stage map but not in the default pipeline) — overlaps with I1.
+- [x] **Make the `harness` stage reachable from the web GUI** — resolved as ON-DEMAND, not default
+      (the operator steer is "stop adding fuzzing to every run", so wiring it into the default plan
+      would be wrong). Added `harness` to the API's on-demand `_TARGET_STAGES` map and a **"Deep
+      function fuzzing"** button in the GUI's Code→Functions view (`createRun("harness")` → progress
+      → findings). Also fixed, found by running it on a real -O0 binary through the GUI: the ranker
+      drove the `memcpy`/`puts` **PLT import thunks** and skipped the actual `parse_record` parser
+      (its param types weren't recovered → `ptr_len=0`), returning zero findings. `harness_stage`
+      now excludes import thunks and drives any non-thunk function with a sink/source signal even
+      without recovered param types, defaulting the unknown shape to `f(buf,len)`. Verified live:
+      the GUI button drives `parse_record` (T4 magic dictionary passes the gate) and files a CWE-787
+      out-of-bounds-write finding. Commits `b50021e` (ranker), `338c0cf` (exposure), `73ef53a` (note).
 
 ---
 
