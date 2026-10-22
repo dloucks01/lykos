@@ -1692,6 +1692,10 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
             if not t.file_type:
                 _staged(bud, store, t, "ingest_triage", status, stop)
                 t = store.targets.get(tid) or t
+            else:
+                # already triaged (a re-run): mark the plan row done rather than leaving it
+                # "pending" -> "skipped", which read as "Triage never ran" in the rail.
+                _plan_set(status, "ingest_triage", "done", "already triaged")
             # EXECUTIONS, not seconds. The clock is the operator's unit, but what a second
             # BUYS is not constant: an ASan build of the same binary runs ~5x slower, and it is
             # the only configuration whose oracle can see a heap out-of-bounds access at all.
