@@ -771,10 +771,12 @@ function App() {
     try {
       const run = await api.createRun("harness", { targetId: tid, params: {} });
       await waitForRun(run.run_id, { timeoutMs: 300000 });
-      const out = await api.runOutput(run.run_id);
-      const res = (out && out.output) || {};
       await refreshResults(caseId, targets);
-      setHarnessRun({ targetId: tid, result: res });
+      // The stage's summary is not surfaced as run output, so count the harness findings directly.
+      const fs = await api.targetFindings(tid).catch(() => null);
+      const list = Array.isArray(fs) ? fs : (fs && fs.items) || (fs && fs.findings) || [];
+      const n = list.filter((f) => f.detector === "harness").length;
+      setHarnessRun({ targetId: tid, result: { findings: n } });
     } catch (e) {
       setHarnessRun({ targetId: tid, error: e.message || String(e) });
     }
@@ -1090,7 +1092,7 @@ function App() {
                         ${harnessRun.error
                           ? `harness: ${harnessRun.error}`
                           : `harness: ${harnessRun.result && harnessRun.result.findings != null
-                              ? `${harnessRun.result.findings} finding(s), ${harnessRun.result.functions || 0} fn driven`
+                              ? `${harnessRun.result.findings} function-level finding(s)`
                               : "done"}`}
                       </span>` : null}
                     <button class="fn-harness" disabled=${!!(harnessRun && harnessRun.running) || !_atid}
