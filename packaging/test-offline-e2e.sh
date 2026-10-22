@@ -177,6 +177,12 @@ case "$albig" in
   *) broken="$broken afl-qemu-large" ;;                  # handshake aborted on a large binary -> the engagement failure, caught
 esac
 [ -n "$broken" ] && die "offline capability(ies) BROKEN:$broken  (present-but-broken is still a loss)"
+# afl coverage fuzzing must RUN inside the real pipeline, not just in the CAP probe. The CAP lane
+# invokes afl directly on the real trace binary, so it missed the bug where lykos's own coverage_fuzz
+# staged a relocatable .wrappers/ SHELL script as the fork-server QEMU and every run aborted at the
+# handshake. Assert the analyze never reports that abort -- this is binary coverage fuzzing working.
+echo "$out" | grep -qiE 'coverage_fuzz.*(abort|handshake)|Fork server handshake failed' && \
+  die "afl coverage_fuzz aborted offline (fork-server handshake) -- binary coverage fuzzing is broken in the bundle"
 # the full pipeline must reach a verified L3 PoC from the bundle alone (memory-corruption -> ret2win)
 echo "$out" | grep -q 'proof of concept' && echo "$out" | grep -qE '^\s*L3\b' || \
   die "no verified L3 PoC -- the bundle reached only static/partial analysis offline"

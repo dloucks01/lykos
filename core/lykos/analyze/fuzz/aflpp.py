@@ -135,6 +135,40 @@ def locate_qemu_trace_for(afl: Optional[Path], arch: Optional[str]) -> Optional[
     return None
 
 
+def _resolve_trace_binary(trace: Path) -> Path:
+    """The REAL afl-qemu-trace ELF behind a relocatable shell wrapper.
+
+    afl-fuzz `-Q` execs the trace as its fork-server QEMU and speaks a pipe protocol over fixed
+    descriptors (198/199); a shell WRAPPER between afl and qemu breaks that handshake -- the exact
+    "Fork server handshake failed" abort that killed EVERY coverage_fuzz run from the air-gap bundle,
+    whose tools ship as `.wrappers/<name>` scripts (`exec "$r/usr/local/bin/<name>" "$@"`) to stay
+    relocatable. The real binary is already relink-self-contained (the wrapper sets no LD_LIBRARY_PATH),
+    so afl can exec it directly. Follow a non-ELF wrapper to the ELF it execs; leave a real ELF alone."""
+    t = Path(trace)
+    try:
+        with open(t, "rb") as f:
+            if f.read(4) == b"\x7fELF":
+                return t                               # already the real emulator binary
+    except OSError:
+        return t
+    try:
+        text = t.read_text(errors="replace")
+    except OSError:
+        return t
+    m = re.search(r'exec\s+"([^"]+)"', text)           # the wrapper's `exec "<path>" "$@"`
+    if not m:
+        return t
+    tgt = m.group(1)
+    # the bundle wrapper resolves its root as `$r = <wrapper_dir>/..` then execs "$r/usr/local/bin/..."
+    root = t.resolve().parent.parent
+    for var in ("$r", "${r}"):
+        tgt = tgt.replace(var, str(root))
+    cand = Path(tgt)
+    if not cand.is_absolute():
+        cand = (t.resolve().parent / cand)
+    return cand if cand.exists() else t
+
+
 def stage_qemu_trace(trace: Path, workdir) -> str:
     """Put `trace` where afl-fuzz will find it, and return the AFL_PATH to use.
 
@@ -143,16 +177,22 @@ def stage_qemu_trace(trace: Path, workdir) -> str:
     that with names alone, so the chosen one is linked under the expected name in a private
     directory and AFL_PATH is pointed at it. Nothing is copied: a symlink keeps the 9 MB
     binary in one place and makes the indirection visible if anyone looks.
+
+    The link points at the REAL ELF, never a shell wrapper: afl's `-Q` fork server cannot hand
+    the fork-server descriptors through a shell `exec` and aborts at the handshake (see
+    `_resolve_trace_binary`) -- the air-gap bundle's relocatable `.wrappers/afl-qemu-trace-*`
+    scripts tripped exactly this on every coverage_fuzz run.
     """
     d = Path(workdir) / "aflpath"
     d.mkdir(parents=True, exist_ok=True)
     link = d / "afl-qemu-trace"
     if link.exists() or link.is_symlink():
         link.unlink()
+    real = _resolve_trace_binary(Path(trace).resolve())
     try:
-        link.symlink_to(Path(trace).resolve())
+        link.symlink_to(real)
     except OSError:
-        shutil.copy2(Path(trace).resolve(), link)     # no symlinks here (some sandboxes)
+        shutil.copy2(real, link)                       # no symlinks here (some sandboxes)
         link.chmod(0o755)
     return str(d)
 
