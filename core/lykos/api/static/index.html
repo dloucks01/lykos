@@ -173,7 +173,7 @@
   .btn.small { padding: 5px 10px; font-size: .8rem; }
   .inv-field input, .inv-mode { background: var(--panel-2); color: var(--ink); border: 1px solid var(--line);
     border-radius: 7px; padding: 6px 9px; font-size: .82rem; }
-  .inv-field input { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+  .inv-field input { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; width: 14em; }
   .inv-field input::placeholder { color: var(--faint); }
   .inv-field input:focus, .inv-mode:focus { outline: none; border-color: var(--accent); }
   .inv-mode { cursor: pointer; }
@@ -607,8 +607,18 @@
     border-radius: var(--radius); }
   .wb-runbar .budget-field, .wb-runbar .converge-field { display: inline-flex; align-items: center; gap: 6px; }
   .wb-runbar .budget-lbl { color: var(--muted); font-size: .82rem; }
-  .wb-runbar .budget-val { color: var(--ink); font-size: .82rem; font-variant-numeric: tabular-nums; }
+  .wb-runbar .budget-val { color: var(--ink); font-size: .82rem; font-variant-numeric: tabular-nums;
+    display: inline-block; min-width: 3.4em; text-align: right; }
   .wb-runbar .spacer { flex: 1 1 auto; }
+  /* grouped run controls: a titled fieldset per cluster (budget / engines / invocation), replacing
+     the old flat row of copy-pasted inline-styled labels. Reuses the design tokens + mirrors the
+     .fn-topbar cluster look. */
+  .wb-runbar .run-group { display: inline-flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    border: 1px solid var(--line); border-radius: var(--radius); padding: 2px 10px 5px; margin: 0; }
+  .wb-runbar .run-group legend { font-size: .62rem; text-transform: uppercase; letter-spacing: .05em;
+    color: var(--muted); padding: 0 4px; }
+  .wb-runbar .run-check { display: inline-flex; align-items: center; gap: 6px; }
+  .wb-runbar .engine-toggles { display: inline-flex; align-items: center; gap: 12px 14px; flex-wrap: wrap; }
   /* "driving as": the invocation the target is actually run with (R2). */
   .driving-as { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: .8rem;
     color: var(--muted); margin: -4px 2px 2px; }

@@ -875,70 +875,65 @@ function App() {
               title="the full pipeline on the server: every applicable stage, a wall-clock budget it divides between phases, and a scorecard of what it did">
         ${(bg && (bg.state === "cancelled" || bg.state === "error")) ? "Run Autopilot again"
           : (ran ? "Run Autopilot again" : "▶ Run Autopilot")}</button>
-      <label class="budget-field" title=${converge
-          ? "run-to-convergence: keep fuzzing until coverage plateaus; this slider is the SAFETY CEILING (max minutes). The non-fuzzing analysis is complete either way — only fuzzing depth changes."
-          : "per-target wall-clock budget in minutes. The non-fuzzing analysis (static, CVE, taint, crashless exploit) is complete regardless; this is how long fuzzing gets. Blank = auto (scales with binary size)."}>
-        <span class="budget-lbl">${converge ? "ceiling" : "budget"}</span>
-        <input type="range" min="5" max="120" step="5"
-               value=${budgetMin === "" ? 20 : budgetMin}
-               onInput=${(e) => setBudgetMin(e.target.value)}
-               style="vertical-align:middle;width:9em" />
-        <span class="budget-val" style="display:inline-block;min-width:3.4em;text-align:right">${
-          budgetMin === "" ? "20 min" : `${budgetMin} min`}</span>
-      </label>
-      <label class="converge-field" style="display:inline-flex;gap:4px;align-items:center;margin-left:8px"
-             title="Run to convergence: keep fuzzing until coverage stops growing (the slider becomes the safety ceiling), instead of stopping at a fixed time. For when you can leave it running.">
-        <input type="checkbox" checked=${converge} onChange=${(e) => setConverge(e.target.checked)} />
-        <span>run to convergence</span>
-      </label>
-      <label class="converge-field" style="display:inline-flex;gap:4px;align-items:center;margin-left:8px"
-             title="Black-box fuzzing (the built-in `fuzz` stage). Uncheck to skip it for this run — the rest of the pipeline (coverage/directed fuzzing, concolic, the full exploit ladder) still runs. Useful when black-box mutation is just burning budget on this target.">
-        <input type="checkbox" checked=${blackBox} onChange=${(e) => setBlackBox(e.target.checked)} />
-        <span>black-box fuzzing</span>
-      </label>
-      <label class="converge-field" style="display:inline-flex;gap:4px;align-items:center;margin-left:8px"
-             title="Coverage-guided fuzzing (AFL++ qemu-mode). Uncheck to skip it for this run.">
-        <input type="checkbox" checked=${covFuzz} onChange=${(e) => setCovFuzz(e.target.checked)} />
-        <span>coverage fuzzing</span>
-      </label>
-      <label class="converge-field" style="display:inline-flex;gap:4px;align-items:center;margin-left:8px"
-             title="Directed fuzzing (steered at flagged sinks / leads). Uncheck to skip it for this run.">
-        <input type="checkbox" checked=${dirFuzz} onChange=${(e) => setDirFuzz(e.target.checked)} />
-        <span>directed fuzzing</span>
-      </label>
-      <label class="converge-field" style="display:inline-flex;gap:4px;align-items:center;margin-left:8px"
-             title="Concolic execution (angr/symqemu) — solves guarded branches. Uncheck to skip it for this run (it can be the slowest stage).">
-        <input type="checkbox" checked=${concolicOn} onChange=${(e) => setConcolicOn(e.target.checked)} />
-        <span>concolic</span>
-      </label>
-      <label class="converge-field" style="display:inline-flex;gap:4px;align-items:center;margin-left:8px"
-             title="Source libFuzzer campaign (only applies when source is available). Uncheck to skip it for this run.">
-        <input type="checkbox" checked=${libfuzzerOn} onChange=${(e) => setLibfuzzerOn(e.target.checked)} />
-        <span>libfuzzer</span>
-      </label>
-      <label class="converge-field" style="display:inline-flex;gap:4px;align-items:center;margin-left:8px"
-             title="Deep seed discovery: synthesize parser-buffer seeds for daemon/library functions the autopilot's entry-point seeding cannot reach. Findings are candidate-tier (attacker-reachability assumed, not proven). Normal auto-seeding (format models, dictionaries, entry params) runs regardless.">
-        <input type="checkbox" checked=${deepSeed} onChange=${(e) => setDeepSeed(e.target.checked)} />
-        <span>deep seed discovery</span>
-      </label>
-      <label class="inv-field" title="The target's OWN shared libraries: a directory holding its loader (ld-linux…) and .so files. Point afl-qemu / concolic at these so a binary built against a different glibc runs against its own libraries instead of this host's — the fix for 'symbol lookup error / Fork server handshake failed'. Leave blank to use the host's libraries.">
-        <input type="text" placeholder="target libraries dir (optional)"
-               value=${sysroot} onInput=${(e) => setSysroot(e.target.value)}
-               style="min-width:14em" />
-      </label>
-      <label class="inv-field" title="How the binary is really invoked, as a shell string with @@ where the fuzzed input file goes — e.g.  -c @@  or  parse --in @@. Blank = lykos discovers it. This is the single thing that decides whether the fuzzer reaches the parser; it reaches every stage, same as the CLI's --argv.">
-        <input type="text" placeholder="invocation (e.g.  -c @@)"
-               value=${invArgv} onInput=${(e) => setInvArgv(e.target.value)}
-               style="width:14em" />
-      </label>
-      <select class="inv-mode" title="input channel — how the fuzzed bytes reach the target. Auto lets lykos decide (and @@ in the invocation implies a file)."
-              value=${invMode} onChange=${(e) => setInvMode(e.target.value)}>
-        <option value="auto">channel: auto</option>
-        <option value="stdin">stdin</option>
-        <option value="file">file (@@)</option>
-        <option value="arg">first arg</option>
-        <option value="env">env var</option>
-      </select>
+      <fieldset class="run-group">
+        <legend>budget</legend>
+        <label class="budget-field" title=${converge
+            ? "run-to-convergence: keep fuzzing until coverage plateaus; this slider is the SAFETY CEILING (max minutes). The non-fuzzing analysis is complete either way — only fuzzing depth changes."
+            : "per-target wall-clock budget in minutes. The non-fuzzing analysis (static, CVE, taint, crashless exploit) is complete regardless; this is how long fuzzing gets. Blank = auto (scales with binary size)."}>
+          <span class="budget-lbl">${converge ? "ceiling" : "budget"}</span>
+          <input type="range" min="5" max="120" step="5" aria-label="fuzzing budget (minutes)"
+                 value=${budgetMin === "" ? 20 : budgetMin}
+                 onInput=${(e) => setBudgetMin(e.target.value)}
+                 style="vertical-align:middle;width:9em" />
+          <span class="budget-val">${budgetMin === "" ? "20 min" : `${budgetMin} min`}</span>
+        </label>
+        <label class="run-check" title="Run to convergence: keep fuzzing until coverage stops growing (the slider becomes the safety ceiling), instead of stopping at a fixed time. For when you can leave it running.">
+          <input type="checkbox" checked=${converge} onChange=${(e) => setConverge(e.target.checked)} />
+          <span>to convergence</span>
+        </label>
+      </fieldset>
+      <fieldset class="run-group">
+        <legend>engines</legend>
+        <div class="engine-toggles">
+          <label class="run-check" title="Black-box fuzzing (the built-in fuzz stage). Uncheck to skip it for this run — the rest of the pipeline (coverage/directed fuzzing, concolic, the full exploit ladder) still runs. Useful when black-box mutation is just burning budget on this target.">
+            <input type="checkbox" checked=${blackBox} onChange=${(e) => setBlackBox(e.target.checked)} /><span>black-box</span>
+          </label>
+          <label class="run-check" title="Coverage-guided fuzzing (AFL++ qemu-mode). Uncheck to skip it for this run.">
+            <input type="checkbox" checked=${covFuzz} onChange=${(e) => setCovFuzz(e.target.checked)} /><span>coverage</span>
+          </label>
+          <label class="run-check" title="Directed fuzzing (steered at flagged sinks / leads). Uncheck to skip it for this run.">
+            <input type="checkbox" checked=${dirFuzz} onChange=${(e) => setDirFuzz(e.target.checked)} /><span>directed</span>
+          </label>
+          <label class="run-check" title="Concolic execution (angr/symqemu) — solves guarded branches. Uncheck to skip it for this run (it can be the slowest stage).">
+            <input type="checkbox" checked=${concolicOn} onChange=${(e) => setConcolicOn(e.target.checked)} /><span>concolic</span>
+          </label>
+          <label class="run-check" title="Source libFuzzer campaign (only applies when source is available). Uncheck to skip it for this run.">
+            <input type="checkbox" checked=${libfuzzerOn} onChange=${(e) => setLibfuzzerOn(e.target.checked)} /><span>libfuzzer</span>
+          </label>
+          <label class="run-check" title="Deep seed discovery: synthesize parser-buffer seeds for daemon/library functions the autopilot's entry-point seeding cannot reach. Findings are candidate-tier (attacker-reachability assumed, not proven). Normal auto-seeding (format models, dictionaries, entry params) runs regardless.">
+            <input type="checkbox" checked=${deepSeed} onChange=${(e) => setDeepSeed(e.target.checked)} /><span>deep seed</span>
+          </label>
+        </div>
+      </fieldset>
+      <fieldset class="run-group">
+        <legend>invocation</legend>
+        <label class="inv-field" title="The target's OWN shared libraries: a directory holding its loader (ld-linux…) and .so files. Point afl-qemu / concolic at these so a binary built against a different glibc runs against its own libraries instead of this host's — the fix for 'symbol lookup error / Fork server handshake failed'. Leave blank to use the host's libraries.">
+          <input type="text" placeholder="target libraries dir" aria-label="target libraries directory"
+                 value=${sysroot} onInput=${(e) => setSysroot(e.target.value)} />
+        </label>
+        <label class="inv-field" title="How the binary is really invoked, as a shell string with @@ where the fuzzed input file goes — e.g.  -c @@  or  parse --in @@. Blank = lykos discovers it. This is the single thing that decides whether the fuzzer reaches the parser; it reaches every stage, same as the CLI's --argv.">
+          <input type="text" placeholder="invocation (e.g.  -c @@)" aria-label="invocation argv"
+                 value=${invArgv} onInput=${(e) => setInvArgv(e.target.value)} />
+        </label>
+        <select class="inv-mode" aria-label="input channel" title="input channel — how the fuzzed bytes reach the target. Auto lets lykos decide (and @@ in the invocation implies a file)."
+                value=${invMode} onChange=${(e) => setInvMode(e.target.value)}>
+          <option value="auto">channel: auto</option>
+          <option value="stdin">stdin</option>
+          <option value="file">file (@@)</option>
+          <option value="arg">first arg</option>
+          <option value="env">env var</option>
+        </select>
+      </fieldset>
       <button class="btn ghost small" onClick=${onAutopilot}
               title="run the stages from this tab instead: finer per-stage feedback, but a shorter pipeline and no scorecard — closing the tab stops it">
         ⚙ In this tab</button>
