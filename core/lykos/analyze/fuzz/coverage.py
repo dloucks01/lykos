@@ -428,12 +428,26 @@ def coverage_stage(ctx) -> dict:
     stats = aflpp.campaign_stats(out_dir)
     ctx.emit("coverage.harvest", payload={"crash_inputs": len(raw), **stats})
     if stats.get("execs_done", "").isdigit() and int(stats["execs_done"]) < 100:
+        # Say WHY it executed almost nothing from the signals already in hand, instead of guessing
+        # the same two causes every time: a missing-library/handshake failure, a per-exec timeout,
+        # and rejected seeds are different facts the operator acts on differently.
+        try:
+            _eps = float(stats.get("execs_per_sec") or 0)
+        except ValueError:
+            _eps = 0.0
+        if not _dep_ok:
+            _why = f"the target could not load its libraries, so afl executed almost nothing: {_dep_why}"
+        elif _eps and exec_timeout and _eps <= (1.0 / max(exec_timeout, 0.001)) * 1.5:
+            _why = (f"almost every execution is hitting the per-exec timeout ({exec_timeout:g}s) "
+                    f"at {_eps:g} exec/s, so the campaign made no progress")
+        else:
+            _why = ("the campaign executed almost nothing -- the seeds are most likely rejected by "
+                    "this target (wrong format/extension), so afl never got past the corpus")
         ctx.emit("coverage.starved", payload={
-            "execs_done": stats.get("execs_done"),
-            "note": ("the campaign executed almost nothing -- the seeds may be rejected by "
-                     "this target, or each execution may be hitting the timeout. A clean "
-                     "'0 crashes' from a campaign that never ran says nothing about the "
-                     "binary.")})
+            "execs_done": stats.get("execs_done"), "execs_per_sec": stats.get("execs_per_sec"),
+            "dep_ok": _dep_ok,
+            "note": (_why + ". A clean '0 crashes' from a campaign that never ran says nothing "
+                     "about the binary.")})
     else:
         # Ran plenty but covered almost no edges and found nothing: the target is bailing before
         # it parses the input -- the classic "it needs a config/data file, arguments, or a working

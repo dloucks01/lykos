@@ -902,9 +902,14 @@ export function SystemMap({ map }) {
   const nodes = (map && map.nodes) || [];
   if (nodes.length < 2) return null;
   const nameOf = (id) => (nodes.find((n) => n.id === id) || {}).filename || id.slice(0, 8);
+  // Collapsible: the edge list of a multi-binary case can be long and pushes the results off
+  // screen. A native <details> (no hook) starts open only while the list is short.
   return html`
-    <div class="card sysmap">
-      <div class="sysmap-head">Case components — cross-binary analysis</div>
+    <details class="card sysmap" open=${edges.length <= 6}>
+      <summary class="sysmap-head" style="cursor:pointer;display:flex;align-items:center;gap:8px">
+        <span>Case components — cross-binary analysis</span>
+        ${edges.length ? html`<span class="tab-n">${edges.length}</span>` : null}
+      </summary>
       ${edges.length ? html`
         <div class="sysmap-sub">${edges.length} resolved call boundar${edges.length === 1 ? "y" : "ies"} between binaries. These are what IPC modelling, cross-binary taint and whole-system detonation drive.</div>
         <ul class="sysmap-edges">
@@ -917,7 +922,7 @@ export function SystemMap({ map }) {
             </li>`)}
         </ul>
       ` : html`<div class="sysmap-sub">No call boundary resolves between these binaries — they do not import each other's symbols, so there is no cross-binary path to analyse.</div>`}
-    </div>`;
+    </details>`;
 }
 
 // How much of each binary the fuzzing actually reached. A coverage bar per target makes "the

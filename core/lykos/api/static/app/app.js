@@ -832,11 +832,18 @@ function App() {
       const run = await api.createRun("harness", { targetId: tid, params: {} });
       await waitForRun(run.run_id, { timeoutMs: 300000 });
       await refreshResults(caseId, targets);
-      // The stage's summary is not surfaced as run output, so count the harness findings directly.
       const fs = await api.targetFindings(tid).catch(() => null);
       const list = Array.isArray(fs) ? fs : (fs && fs.items) || (fs && fs.findings) || [];
       const n = list.filter((f) => f.detector === "harness").length;
-      setHarnessRun({ targetId: tid, result: { findings: n } });
+      // The stage says WHY it declined (x86-64 only / run disassemble first / no drivable parser)
+      // in its return; read it so the badge shows the reason instead of a bare "0 findings" that
+      // reads as "does nothing". A genuine zero-crash run is reported distinctly too.
+      const out = await api.runOutput(run.run_id).then((r) => r.output).catch(() => null);
+      setHarnessRun({ targetId: tid, result: {
+        findings: n,
+        supported: out ? out.supported !== false : true,
+        note: out && out.note,
+        functions: out && out.functions } });
     } catch (e) {
       setHarnessRun({ targetId: tid, error: e.message || String(e) });
     }
@@ -1204,12 +1211,18 @@ function App() {
                   </div>
                   <div class="fn-actions">
                     ${harnessRun && harnessRun.targetId === _atid && !harnessRun.running ? html`
-                      <span class=${`fn-harness-note${harnessRun.error ? " bad" : ""}`}>
-                        ${harnessRun.error
-                          ? `harness: ${harnessRun.error}`
-                          : `harness: ${harnessRun.result && harnessRun.result.findings != null
-                              ? `${harnessRun.result.findings} function-level finding(s)`
-                              : "done"}`}
+                      <span class=${`fn-harness-note${harnessRun.error || (harnessRun.result && harnessRun.result.supported === false) ? " bad" : ""}`}>
+                        ${(() => {
+                          if (harnessRun.error) return `harness: ${harnessRun.error}`;
+                          const r = harnessRun.result || {};
+                          // A clean decline (x86-64 only / run disassemble first / no drivable
+                          // parser) must read as a declined reason, not a silent "0 findings".
+                          if (r.supported === false) return `harness declined — ${r.note || "not applicable to this target"}`;
+                          if (r.findings) return `harness: ${r.findings} function-level finding(s)`;
+                          // Supported run with no crash: distinguish from a decline.
+                          if (r.note) return `harness: ${r.note}`;
+                          return `harness: 0 faults${r.functions != null ? ` — ${r.functions} function(s) driven` : ""}`;
+                        })()}
                       </span>` : null}
                     <button class="fn-harness" disabled=${!!(harnessRun && harnessRun.running) || !_atid}
                       title="Rank this binary's functions and fuzz the most promising ones directly under the emulator — constant-guided inputs, an unbounded-allocation oracle, and stateful message sequences. Operator-initiated; not part of a normal run. x86-64; needs disassembly first."

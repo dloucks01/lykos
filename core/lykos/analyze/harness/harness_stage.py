@@ -137,19 +137,20 @@ def harness_stage(ctx) -> dict:
     p = ctx.params or {}
     # Gating -- decline cleanly (never raise) with a reason the operator can act on.
     if (target.arch or "") not in _X86_64:
-        ctx.emit("harness.done", payload={"supported": False,
-                 "note": f"the harness executor is x86-64 only; this target is {target.arch}"})
+        note = f"the harness executor is x86-64 only; this target is {target.arch}"
+        ctx.emit("harness.done", payload={"supported": False, "note": note})
         ctx.progress(pct=100, msg="harness: x86-64 only")
-        return {}
+        return {"supported": False, "findings": 0, "note": note}
     if not available():
-        ctx.emit("harness.done", payload={"supported": False, "note": "unicorn is not available"})
+        note = "unicorn is not available"
+        ctx.emit("harness.done", payload={"supported": False, "note": note})
         ctx.progress(pct=100, msg="harness: unicorn unavailable")
-        return {}
+        return {"supported": False, "findings": 0, "note": note}
     if not FunctionDAO(ctx.conn).list_by_target(target.id):
-        ctx.emit("harness.done", payload={"supported": False,
-                 "note": "no recovered functions -- run disassemble first"})
+        note = "no recovered functions -- run disassemble first"
+        ctx.emit("harness.done", payload={"supported": False, "note": note})
         ctx.progress(pct=100, msg="harness: disassemble first")
-        return {}
+        return {"supported": False, "findings": 0, "note": note}
 
     ranked = rank_functions(ctx.conn, target.id, top=int(p.get("rank_top", 40)))
     # Drive the program's own promising parsers -- never an imported-libc PLT thunk -- pointing the
@@ -158,11 +159,11 @@ def harness_stage(ctx) -> dict:
     # real vulnerable function on -O0 / stripped builds; see _drivable / _drive_shape).
     cands = [r for r in ranked if _drivable(r)][:int(p.get("max_functions", 6))]
     if not cands:
-        ctx.emit("harness.done", payload={"supported": True, "findings": 0,
-                 "note": ("no drivable parser among the top ranked targets -- the promising ones "
-                          "take input via fd/FILE, which this harness model does not drive yet")})
+        note = ("no drivable parser among the top ranked targets -- the promising ones "
+                "take input via fd/FILE, which this harness model does not drive yet")
+        ctx.emit("harness.done", payload={"supported": True, "findings": 0, "note": note})
         ctx.progress(pct=100, msg="harness: no drivable target")
-        return {}
+        return {"supported": True, "findings": 0, "note": note}
 
     data = ctx.content.path(target.sha256).read_bytes()
     execs = int(p.get("harness_execs", 8000))

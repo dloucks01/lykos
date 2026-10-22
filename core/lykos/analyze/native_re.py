@@ -56,6 +56,14 @@ _BATCH = max(1, int(os.environ.get("LYKOS_FUNC_BATCH", "500") or "500"))
 # pass is still quick. Above it, `aaa` per batch would dominate the runtime, so we use the fast
 # per-function path and recover buffers from stack geometry instead.
 _AAA_MAX = int(os.environ.get("LYKOS_AAA_MAX", "2000") or "2000")
+# Whole-program `aaa` (full autoanalysis: reference emulation, type propagation, autonaming) grows
+# super-linearly with image size and TIMES OUT on a very large binary -- a 160MB .so never returns,
+# so pass 1 fails and the target recovers NOTHING (no functions -> no detectors -> no escalation).
+# Above this file size, pass 1 uses the lighter `aa` (analyze all: entry/symbol + call-graph function
+# recovery), which completes and still yields the function list; buffers are then recovered from
+# stack geometry, exactly the fallback the >_AAA_MAX function path already uses. The point is that a
+# large binary comes back ANALYZED-but-lighter instead of not at all. Env-overridable.
+_AAA_FULL_MAX_MB = float(os.environ.get("LYKOS_AAA_FULL_MAX_MB", "48") or "48")
 # The (advisory, slowest) decompiled-C pass. Decompiling thousands of functions up front would take
 # many minutes and risk losing everything on a timeout, and the detectors use the pypcode P-Code,
 # not the C. So we decompile up to this many up front (small binaries come back fully decompiled),
@@ -559,7 +567,20 @@ def analyze(binary: Path, *, ctx=None, timeout: int = 900) -> dict:
     # rc/stderr is what tells a genuinely CLEAN "0 functions" apart from a rizin that crashed or
     # fell back to an old/incompatible build and recovered nothing (see the empty-recovery check
     # after the function list is parsed).
-    _p1 = _run(cli, binary, "aaa;" + main_seed + ";".join([
+    #
+    # SIZE-GATED analysis depth: `aaa` times out on a very large image (a 160MB .so never returns),
+    # which fails the whole stage and recovers nothing. Above _AAA_FULL_MAX_MB, use the lighter `aa`
+    # so the function list still comes back; the structural/buffer recovery already has a non-`aaa`
+    # fallback for large targets.
+    try:
+        _size_mb = binary.stat().st_size / (1024.0 * 1024.0)
+    except OSError:
+        _size_mb = 0.0
+    _aa_cmd = "aaa" if _size_mb < _AAA_FULL_MAX_MB else "aa"
+    if _aa_cmd != "aaa":
+        _emit(ctx, msg=(f"large binary ({_size_mb:.0f}MB): using fast analysis ({_aa_cmd}) to avoid "
+                        "an autoanalysis timeout; buffers recovered from stack geometry"))
+    _p1 = _run(cli, binary, _aa_cmd + ";" + main_seed + ";".join([
         _redir("ij", T / "ij"), _redir("aflj", T / "funcs"),
         _redir("izj", T / "strings"), _redir("iij", T / "imports")]),
         ctx=ctx, timeout=timeout, scratch=T)

@@ -1870,6 +1870,14 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                 _is_server = False
             if _is_server:
                 _staged(bud, store, t, "net_fuzz", status, stop, want=45.0)
+            else:
+                # Not a server -> net_fuzz is INAPPLICABLE, not a budget casualty. If left unstaged
+                # it stays `pending` and _finalize_plan turns it into "skipped", which the health
+                # panel then renders as "no budget left / not reached" -- a misleading tooling
+                # verdict for a binary that simply has no socket to fuzz. Record the honest decline.
+                why = "no socket-server imports (bind/listen/accept/recvfrom) -- not a server"
+                _plan_set(status, "net_fuzz", "declined", why)
+                _emit_stage(store, t.case_id, "net_fuzz", "declined", target_id=tid, detail=why)
             # An IPC/protocol boundary (a unix socket, a pipe, a datagram listener) is a channel
             # the generic fuzzers cannot reach at all: they drive stdin/argv/files. It discovers
             # its own channel and declines when there is none, so a plain binary pays nothing.

@@ -147,6 +147,56 @@ def _drive(opt: str, model: dict, boundary: int, *, width=None) -> bytes:
     return menu._scalar(opt.encode(), width) + menu._scalar(str(boundary).encode(), width)
 
 
+def _file_oob_index_candidates(ctx, target, arrays, why) -> int:
+    """File CWE-129 CANDIDATES for statically-recovered fixed-size arrays when the index bound could
+    not be CONFIRMED by execution (foreign CPU, a non-terminating/un-crawlable target, or no probe
+    could run at all). Honest: state 'candidate', low confidence, 'recovered statically, not
+    demonstrated'. Shares the confirmed path's dedup_key so a later dynamic confirmation PROMOTES
+    this row instead of forking a second one -- and it is an `oob_index`/CWE-129 row, so it is a
+    chain_primitive lead that becomes the oob-index-write recipe with no execution. Returns the count
+    filed. This is why a real air-gap run no longer loses the array-index finding entirely."""
+    from ...db.dao import FindingDAO
+    fd = FindingDAO(ctx.conn)
+    n = 0
+    for arr in (arrays or [])[:2]:
+        detail = (f"Improper validation of array index (CWE-129), recovered statically: the "
+                  f"fixed-size global array {arr['name']}[{arr['cap']}] (stride "
+                  f"{arr.get('stride', _WORD)}B) is indexed by a scaled register. The bound was NOT "
+                  f"verified by execution here ({why}). If an input-controlled id reaches this "
+                  f"access with a missing/off-by-one bound check, reading a pointer or writing a "
+                  f"field through the out-of-bounds slot yields an arbitrary read/write primitive "
+                  f"-- candidate, not demonstrated.")
+        fd.upsert(target.id, target.case_id, {
+            "cwe": "CWE-129", "title": "Improper validation of array index", "severity": "high",
+            "detector": "oob_index", "state": "candidate", "confidence": 0.4,
+            "dedup_key": f"CWE-129:oobindex:{arr['name']}",
+            "function_addr": None, "site_addr": None, "site_detail": arr["name"],
+            "evidence": [{"channel": "oob-index-static", "detail": detail}]})
+        n += 1
+    return n
+
+
+def _static_arrays(ctx, target):
+    """Fixed-size arrays recovered WITHOUT executing the target: symbol-table objects (arch-
+    independent) first, then the stripped-binary disassembly recovery. Best-effort."""
+    try:
+        tb = ctx.content.path(target.sha256).read_bytes()
+    except Exception:                                    # noqa: BLE001
+        return []
+    try:
+        arrs = _array_candidates(exploit.elf_objects_sized(tb))
+    except Exception:                                    # noqa: BLE001
+        arrs = []
+    if arrs:
+        return arrs
+    try:
+        exe = Path(tempfile.mkdtemp(prefix="lykos-oobstat-")) / "t.bin"
+        exe.write_bytes(tb)
+        return _array_candidates_symfree(exe)
+    except Exception:                                    # noqa: BLE001
+        return []
+
+
 def oob_index_stage(ctx) -> dict:
     from ...db.dao import FindingDAO, StringDAO, TargetDAO
     target = TargetDAO(ctx.conn).get(ctx.target_id) if ctx.target_id else None
@@ -157,19 +207,27 @@ def oob_index_stage(ctx) -> dict:
     why = (substrate.foreign_cpu_reason(target.arch, target.file_type, host, _what)
            or substrate.native_only_reason(target.file_type, _what))
     if why:
-        ctx.emit("oob_index.done", payload={"applicable": False, "note": why})
+        # Cannot RUN the target here (foreign CPU / non-native), but the array shape is recoverable
+        # statically -- so the CWE-129 finding survives air-gap and feeds chain_primitive's recipe,
+        # instead of vanishing because the only producer was dynamic.
+        n = _file_oob_index_candidates(ctx, target, _static_arrays(ctx, target), why)
+        ctx.emit("oob_index.done", payload={"applicable": False, "note": why,
+                 "static_candidates": n})
         return {}
 
     # Same reason as heap_trace: a non-terminating baseline (a server that blocks) cannot be menu-
     # crawled, so `shared_op_model` would drive it to timeout once per option for the whole budget
     # slice. Skip with a clear note rather than wedge and be reclaimed as an ERROR.
     if (ctx.params or {}).get("baseline_nonterm"):
+        n = _file_oob_index_candidates(
+            ctx, target, _static_arrays(ctx, target),
+            "the target's baseline did not terminate, so its menu could not be crawled to confirm")
         ctx.emit("oob_index.done", payload={
-            "applicable": False,
+            "applicable": False, "static_candidates": n,
             "note": ("the target's baseline did not terminate (a server or interactive process), "
                      "so its menu cannot be crawled to reach an index-selectable array -- "
-                     "out-of-bounds-index probing is skipped for this target, not failed")})
-        ctx.progress(pct=100, msg="non-terminating target: oob-index probing skipped")
+                     f"out-of-bounds-index probing is skipped; filed {n} static CWE-129 candidate(s)")})
+        ctx.progress(pct=100, msg="non-terminating target: oob-index probing skipped (static candidates filed)")
         return {}
 
     target_bytes = ctx.content.path(target.sha256).read_bytes()
@@ -210,6 +268,7 @@ def oob_index_stage(ctx) -> dict:
         ctx.progress(msg=f"probing {len(arrays)} table(s) over {len(idx_opts)} index option(s)")
 
         found = None
+        probed_ok = False                                 # did ANY probe actually execute the target?
         for arr in arrays:
             if found or ctx.should_cancel():
                 break
@@ -233,6 +292,7 @@ def oob_index_stage(ctx) -> dict:
                         sandbox.run_reaped(cmd, timeout=15, capture_output=True, cwd=str(workdir),
                                            preexec_fn=sandbox._rlimits(2048, 20, set_as=False))
                         rep = json.loads(report.read_text())
+                        probed_ok = True                  # a probe ran and produced a report
                         # The tracer is a standalone script under its own interpreter and cannot
                         # import observe; what it absorbed comes home in the report.
                         observe.absorbed_remote("lykos.analyze.dynamic.heaptrace",
@@ -247,13 +307,29 @@ def oob_index_stage(ctx) -> dict:
                         break
 
         if not found:
+            if not probed_ok:
+                # No probe actually executed the target (sandbox refusal / missing libraries). Saying
+                # "every index stayed in bounds" here would be a FALSE clean result -- the bound was
+                # never exercised. File the static candidate(s) and say so plainly.
+                n = _file_oob_index_candidates(
+                    ctx, target, arrays,
+                    "no probe could execute the target here (sandbox/missing libraries), so the "
+                    "index bound was never exercised")
+                ctx.emit("oob_index.done", payload={
+                    "applicable": True, "oob_index": False, "probed": False,
+                    "arrays": [a["name"] for a in arrays], "static_candidates": n,
+                    "note": ("could NOT execute the target to probe the array index -- this is not a "
+                             f"clean 'in bounds' result; filed {n} static CWE-129 candidate(s) instead")})
+                ctx.progress(pct=100, msg="could not execute to probe -- filed static oob-index candidate(s)")
+                return {"metrics": {"applicable": True, "oob_index": False, "probed": False,
+                                    "static_candidates": n}}
             ctx.emit("oob_index.done", payload={
-                "applicable": True, "oob_index": False,
+                "applicable": True, "oob_index": False, "probed": True,
                 "arrays": [a["name"] for a in arrays],
                 "note": (f"probed {len(arrays)} array table(s) with boundary indices; every index "
                          "stayed in bounds (the id validation looks correct).")})
             ctx.progress(pct=100, msg="no out-of-bounds array index surfaced")
-            return {"metrics": {"applicable": True, "oob_index": False}}
+            return {"metrics": {"applicable": True, "oob_index": False, "probed": True}}
 
         arr, opt, boundary, seq, ev = found
         input_sha = ctx.put_artifact("oob-index-sequence", data=seq)
