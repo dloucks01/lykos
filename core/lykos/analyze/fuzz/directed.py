@@ -81,7 +81,10 @@ _TARGET_DETECTORS = {"dangerous_api", "weak_crypto", "weak_random", "insecure_tm
                      # the harness drives a function to a FUNCTION-level fault and names the function
                      # addr; steering concolic/directed_fuzz at that function (seeded with the
                      # harness's gate-passing input) is how that lead climbs to a program-level crash.
-                     "harness"}
+                     "harness",
+                     # patch_diff names the function that changed between builds (where the patched
+                     # vuln lives); steering the search there is the "diff -> drive" N-day loop.
+                     "patch_diff"}
 _STATE_RANK = {"corroborated": 3, "candidate": 2, "confirmed": 1, "poc-backed": 0}
 _SEV_RANK = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
 

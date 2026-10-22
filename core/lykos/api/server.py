@@ -703,6 +703,7 @@ class Handler(EndpointsMixin, AutopilotMixin, BaseHTTPRequestHandler):
         "mem_oracle": ("..analyze.dynamic", "enqueue_mem_oracle"),
         "chain_primitive": ("..analyze.poc", "enqueue_chain"),
         "poc_diff": ("..analyze.poc", "enqueue_poc_diff"),
+        "patch_diff": ("..analyze.patch_diff_stage", "enqueue_patch_diff"),
         "root_cause": ("..analyze.debug", "enqueue_root_cause"),
         "multi_debug": ("..analyze.debug", "enqueue_multi_debug"),
         "debug_monitor": ("..analyze.debug", "enqueue_monitor"),
