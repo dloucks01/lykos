@@ -100,8 +100,17 @@ found by running the machinery on a REAL daemon (asterisk), not building it from
 - [ ] **R2.d · Daemon runtime needs (overlaps P5).** A plausible config *with content* (not an empty
       `-C` file), a working/data dir, and env vars the target reads — asterisk needs a config + runtime
       dir to fully initialize, which `materialize`'s single-file synth misses.
-- [ ] **Surface the chosen invocation in the GUI** ("driving as: `asterisk -C <generated.conf>`")
-      and let the operator correct it.
+- [x] **Surface the chosen invocation in the GUI** — a "DRIVING AS `<target> <argv>` · operator /
+      auto-discovered" line under the run bar, so "did the fuzzer reach the parser" is visible rather
+      than a guess. Operator value from the client's invocation input; auto-discovered value from the
+      `coverage.invocation` event. Verified live (`fileparser3 parse @@ · operator`). Also fixed the
+      cancelled/errored run state collapsing the whole run bar to a bare "Resume run" (the operator
+      lost the budget/invocation/convergence controls) — it now keeps the full controls.
+- [ ] **R2.f · Discover `tool <subcommand> <file>` invocations.** Found live: fp3's real invocation
+      is `parse <file>`, but `discover`/`propose_argv` returns an EMPTY argv for it (a leading verb +
+      a positional file), so the autopilot fuzzes `fileparser3 <file>`, bounces off the usage banner,
+      and only reaches L3 via the STATIC exploit composition — not fuzzing. Recognize a leading
+      subcommand + a file positional (like the dispatch path already handles `tool draw @@`).
 
 **Acceptance.** A binary that needs `-c <config>` or a positional file is auto-driven to its parser
 (or an honest "couldn't synthesize a valid invocation: <reason>") without the operator hand-setting

@@ -609,6 +609,15 @@
   .wb-runbar .budget-lbl { color: var(--muted); font-size: .82rem; }
   .wb-runbar .budget-val { color: var(--ink); font-size: .82rem; font-variant-numeric: tabular-nums; }
   .wb-runbar .spacer { flex: 1 1 auto; }
+  /* "driving as": the invocation the target is actually run with (R2). */
+  .driving-as { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: .8rem;
+    color: var(--muted); margin: -4px 2px 2px; }
+  .driving-as .da-lbl { color: var(--faint); text-transform: uppercase; letter-spacing: .04em; font-size: .68rem; }
+  .driving-as code { font-family: var(--mono); color: var(--ink); background: var(--panel-2);
+    border: 1px solid var(--line); border-radius: 5px; padding: 1px 7px; }
+  .driving-as .da-src { font-size: .7rem; border-radius: 10px; padding: 1px 7px; border: 1px solid var(--line); }
+  .driving-as .da-auto { color: var(--accent-2); border-color: color-mix(in srgb, var(--accent-2) 40%, transparent); }
+  .driving-as .da-op { color: var(--muted); }
 
   /* compact verdict header for the shell */
   .wb-verdict { display: flex; align-items: center; gap: 18px; }

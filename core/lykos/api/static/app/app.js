@@ -146,6 +146,7 @@ function App() {
   const [fuzzHealth, setFuzzHealth] = useState(null); // per-engine fuzzing health verdict (R1)
   const [fuzzState, setFuzzState] = useState(null);   // live Running/Converging/Stalled badge (U2)
   const fuzzTrendRef = useRef({ cov: null, grewAt: 0, seenAt: 0 }); // coverage-growth trend
+  const [invChosen, setInvChosen] = useState(null);   // auto-discovered invocation (R2: "driving as")
   // The effective theme: an explicit choice (data-theme, set pre-paint from localStorage) wins,
   // else the OS preference. The toggle flips it, applies it to <html>, and persists the choice.
   const [theme, setTheme] = useState(() => {
@@ -402,6 +403,13 @@ function App() {
               setFuzzHealth(ev.payload || null);
               continue;
             }
+            if (ev.type === "coverage.invocation") {
+              // R2: the invocation the autopilot AUTO-DISCOVERED and is driving the target with
+              // (so the fuzzer reaches the parser, not the usage banner). Surface it as "driving as".
+              const p = ev.payload || {};
+              if (p.argv) setInvChosen({ argv: p.argv, why: p.why, source: "auto-discovered" });
+              continue;
+            }
             if (/^(coverage|fuzz|directed|env_fuzz|net_fuzz|libfuzzer|concolic|harness)[._]/.test(ev.type)) {
               // Live fuzzing telemetry: a `.progress` carries execs/rate/elapsed/budget/coverage,
               // and the stage's terminal event clears the live panel. Everything else is a console
@@ -592,7 +600,7 @@ function App() {
       setError(`could not pack the folder: ${e.message || e}`);
       return;
     }
-    if (!append) { setLog([]); setFindings([]); setPocs([]); setAdvice(null); setRan(false); setUnavailable([]); setSysmap(null); setCoverage({}); setVerifications({}); setScorecard([]); setFuzzHealth(null); setFuzzState(null); fuzzTrendRef.current = { cov: null, grewAt: 0, seenAt: 0 }; setBg(null); bgPollRef.current++; bgEventsAfter.current = -1; }
+    if (!append) { setLog([]); setFindings([]); setPocs([]); setAdvice(null); setRan(false); setUnavailable([]); setSysmap(null); setCoverage({}); setVerifications({}); setScorecard([]); setFuzzHealth(null); setFuzzState(null); setInvChosen(null); fuzzTrendRef.current = { cov: null, grewAt: 0, seenAt: 0 }; setBg(null); bgPollRef.current++; bgEventsAfter.current = -1; }
     try {
       const cid = await ensureCase();
       const got = append ? [...targets] : [];
@@ -816,12 +824,11 @@ function App() {
     ${bg && bg.running ? html`
       <div class="bg-status"><${Spinner} label=${`Background — ${bg.stage ? stageLabelSafe(bg.stage) : "starting"}`} /></div>
       <button class="btn ghost small" onClick=${() => api.cancelBackground(caseId)}>■ Stop background</button>
-    ` : bg && (bg.state === "cancelled" || bg.state === "error") ? html`
-      <button class="btn primary" onClick=${onBackground}>▷ Resume run</button>
     ` : !running ? html`
       <button class="btn primary" onClick=${onBackground}
               title="the full pipeline on the server: every applicable stage, a wall-clock budget it divides between phases, and a scorecard of what it did">
-        ${ran ? "Run Autopilot again" : "▶ Run Autopilot"}</button>
+        ${(bg && (bg.state === "cancelled" || bg.state === "error")) ? "Run Autopilot again"
+          : (ran ? "Run Autopilot again" : "▶ Run Autopilot")}</button>
       <label class="budget-field" title=${converge
           ? "run-to-convergence: keep fuzzing until coverage plateaus; this slider is the SAFETY CEILING (max minutes). The non-fuzzing analysis is complete either way — only fuzzing depth changes."
           : "per-target wall-clock budget in minutes. The non-fuzzing analysis (static, CVE, taint, crashless exploit) is complete regardless; this is how long fuzzing gets. Blank = auto (scales with binary size)."}>
@@ -973,6 +980,20 @@ function App() {
           <!-- main: run bar + live fuzz console + verdict + tabs + panel -->
           <main class="wb-main">
             <div class="wb-runbar">${runControls}</div>
+            <!-- R2: how the target is actually being driven (operator-supplied or auto-discovered),
+                 so "did the fuzzer reach the parser" is visible rather than a guess. -->
+            ${(() => {
+              const op = invArgv.trim();
+              const argv = op ? op
+                : (invChosen ? (Array.isArray(invChosen.argv) ? invChosen.argv.join(" ") : invChosen.argv) : null);
+              if (!argv) return null;
+              const src = op ? "operator" : "auto-discovered";
+              const name = activeTarget ? activeTarget.filename : "target";
+              return html`<div class="driving-as" title=${(invChosen && invChosen.why) || "how the target is invoked; @@ is where the fuzzed input goes"}>
+                <span class="da-lbl">driving as</span>
+                <code>${name} ${argv}</code>
+                <span class=${`da-src da-${op ? "op" : "auto"}`}>${src}</span></div>`;
+            })()}
             <!-- Live fuzzing telemetry + the Running/Converged/Stalled badge, directly under the run
                  bar so it is visible DURING a run (it used to sit at the bottom of the long rail,
                  below the fold, where the operator never saw it). Renders only while fuzzing. -->
