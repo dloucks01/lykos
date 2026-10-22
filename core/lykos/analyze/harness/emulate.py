@@ -33,6 +33,13 @@ _HEAP_ADDR = 0x0000CC0000000000      # bump-allocator region for the malloc/call
 _HEAP_SZ = 0x1000000                 # 16 MiB heap
 _TLS_ADDR = 0x0000DD0000000000       # a fake TLS block so `fs:[0x28]` (the stack canary) is valid
 _MAX_INSNS = 2_000_000               # per-segment instruction runaway guard
+#: libc stubs that only READ their arguments -- a fault inside one is an over-READ (CWE-125), not a
+#: write. Everything else (memset/strcpy dest, unknown) is treated as a write, as before.
+_READ_ONLY_STUBS = frozenset({
+    "strlen", "strnlen", "strcmp", "strncmp", "strcasecmp", "strncasecmp", "memcmp", "bcmp",
+    "strchr", "strrchr", "strstr", "strspn", "strcspn", "strpbrk", "strtok", "atoi", "atol",
+    "atoll", "strtol", "strtoul", "strtoll", "puts", "fputs", "printf", "fprintf", "__printf_chk",
+    "__fprintf_chk", "perror", "putchar", "putc"})
 _MAX_CALLS = 200_000                 # external-call runaway guard
 # T5 oracle (doc 46): a single allocation this large, requested by a parser we fed a SMALL fuzzed
 # input, is an attacker-controlled allocation size -- CWE-789 (unbounded allocation) / CWE-400 DoS.
@@ -258,7 +265,11 @@ def _emulate_libc(uc, name, res, heap, regs) -> None:
             _set(0)
     except UcError:
         res.crashed = True
-        res.access = "write"
+        # A fault INSIDE a libc stub that only READS its arguments (strlen/strcmp/memcmp/... over an
+        # attacker-controlled pointer that over-reads unmapped memory) is a CWE-125 out-of-bounds
+        # READ -- hardcoding "write" filed it as a CWE-787 out-of-bounds WRITE (wrong CWE, wrong
+        # remediation, wrong exploit primitive). Write-side stubs (memset/strcpy dest) keep "write".
+        res.access = "read" if nm in _READ_ONLY_STUBS else "write"
         res.note = (res.note + "; " if res.note else "") + f"fault in {nm}()"
 
 

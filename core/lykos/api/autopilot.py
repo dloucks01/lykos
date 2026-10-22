@@ -10,6 +10,7 @@ should follow to finish decomposing the God-object.
 """
 from __future__ import annotations
 
+import copy
 import threading
 import time
 
@@ -44,7 +45,10 @@ class AutopilotMixin:
         """Start (or restart) a server-side Autopilot for a case: a daemon thread that drives the
         pipeline to a PoC and keeps running after the client disconnects."""
         from ..analyze import orchestrate
-        body = self._json_body() or {}
+        body = self._json_body()
+        if body is None:
+            return          # a malformed / over-size body: _json_body already sent the error.
+                            # `or {}` would double-respond AND start an unwanted run over every target.
         s = self._store()
         try:
             if not s.cases.get(cid):
@@ -99,7 +103,10 @@ class AutopilotMixin:
             rec = AutopilotMixin._AUTOPILOTS.get(cid)
             if not rec:
                 return self._json({"state": "none"})
-            st = dict(rec["status"])
+            # DEEP copy under the lock: the autopilot thread keeps mutating the nested `plan` entry
+            # dicts (adding started/ended/elapsed keys via _plan_set), so a shallow dict() would let
+            # json.dumps iterate them mid-mutation -> "dictionary changed size during iteration" 500.
+            st = copy.deepcopy(rec["status"])
             st["running"] = rec["thread"].is_alive()
             st["paused"] = bool(rec.get("pause") and rec["pause"].is_set())
         # Server clock, so the UI can show each stage's elapsed time (now - plan[i].started) in the

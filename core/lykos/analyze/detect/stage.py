@@ -681,7 +681,15 @@ def detect_stage(ctx) -> dict:
         name = getattr(det, "__name__", "")
         if name in optional and not optional[name]:
             continue
-        cands += det(dctx)
+        try:
+            cands += det(dctx)
+        except Exception as e:                           # noqa: BLE001
+            # One detector hitting a degenerate decompiler frame (e.g. a buffer var with offset=None,
+            # or a hex-string offset) must NOT sink the WHOLE stage -- that would file ZERO findings
+            # on a target that has real ones elsewhere (hiding findings == the precision rule's other
+            # half). Skip the failing detector, keep the rest.
+            ctx.emit("detect.detector_error", level="warn",
+                     payload={"detector": name, "error": str(e)[:160]})
     cands = correlate(cands, dctx)
 
     # inter-procedural data-flow taint over P-Code: flag sink sites whose argument

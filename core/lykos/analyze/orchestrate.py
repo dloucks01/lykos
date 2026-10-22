@@ -674,10 +674,13 @@ def _staged(budget, store, target, stage, status, stop, params=None, *, want=Non
     _pause = getattr(budget, "pause", None)
     if _pause is not None and _pause.is_set() and not stop.is_set():
         status["paused"] = True
+        _pt0 = time.monotonic()
         while _pause.is_set() and not stop.is_set():
             status["updated"] = time.time()
             time.sleep(0.5)
         status["paused"] = False
+        if budget is not None:                      # do not charge the pause to the wall clock
+            budget.add_paused(time.monotonic() - _pt0)
     if stage in getattr(budget, "skip_stages", ()):
         why = "disabled for this run by the operator"
         if budget is not None:

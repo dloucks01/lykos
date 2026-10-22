@@ -42,6 +42,12 @@ def function_fingerprint(fn: dict) -> dict:
     h.update(f"{len(blocks)}|{edges}|".encode())
     for k, v in sorted(hist.items()):
         h.update(f"{k}:{v};".encode())
+    # Fold the CALLEE SET into the hash (it was computed but ignored): a security patch that swaps a
+    # call target -- strcpy -> a bounded wrapper, memcpy -> a checked copy -- leaves the `call`
+    # mnemonic unchanged, so without this the patched function hashed identical and read "unchanged",
+    # hiding exactly the function the diff exists to localize. (Operand/immediate-only edits, e.g.
+    # cmp 64->32, still collapse -- a known fingerprint limitation; variant.similarity catches those.)
+    h.update(("|callees:" + ",".join(callees)).encode())
     return {"name": fn.get("name"), "addr": fn.get("addr"), "blocks": len(blocks),
             "edges": edges, "ninsn": ninsn, "callees": callees, "hash": h.hexdigest()}
 

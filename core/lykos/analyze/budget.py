@@ -199,6 +199,10 @@ class CaseBudget:
         self.total = float(DEFAULT_TARGET_BUDGET if total is None else total)
         self._clock = clock
         self._start = clock()
+        #: Seconds the run spent PAUSED, excluded from `elapsed()` so a pause does not burn the
+        #: wall-clock budget (the whole point of pause -- "no work is lost"). `_staged` banks each
+        #: pause interval here via `add_paused()`.
+        self._paused_total = 0.0
         self._phase = PHASES[0]
         self._spent: dict = {}
         self._skipped: list = []
@@ -213,7 +217,13 @@ class CaseBudget:
 
     # ---- the clock ------------------------------------------------------------------------
     def elapsed(self) -> float:
-        return max(0.0, self._clock() - self._start)
+        return max(0.0, self._clock() - self._start - self._paused_total)
+
+    def add_paused(self, seconds: float) -> None:
+        """Exclude a pause interval from the budget clock, so resuming does not finish the run with
+        zero budget left. Called by the autopilot's `_staged` after each pause-wait."""
+        if seconds and seconds > 0:
+            self._paused_total += float(seconds)
 
     def remaining(self) -> float:
         return max(0.0, self.total - self.elapsed())

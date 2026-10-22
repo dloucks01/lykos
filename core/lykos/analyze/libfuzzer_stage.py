@@ -36,9 +36,10 @@ def _materialize_source(ctx, target) -> Path | None:
         try:
             with tarfile.open(fileobj=io.BytesIO(ctx.content.path(proj.sha256).read_bytes()),
                               mode="r:gz") as tf:
-                for m in tf.getmembers():
-                    if m.isfile() and not m.name.startswith("/") and ".." not in m.name:
-                        tf.extract(m, d)
+                # filter="data" rejects absolute/.. members AND symlink/hardlink escapes (a naive
+                # name check misses a symlink member pointing outside, then a file written through
+                # it) -- the attacker-supplied source tree must not escape the scratch dir.
+                tf.extractall(d, filter="data")
             return d
         except Exception:                                # noqa: BLE001
             return None

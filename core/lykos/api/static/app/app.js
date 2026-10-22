@@ -502,6 +502,11 @@ function App() {
         setFuzzState(null);
         fuzzTrendRef.current = { cov: null, grewAt: 0, seenAt: 0 };
         refreshResults(cid, targets);
+      } else {
+        // st === null (a transient status-fetch failure: timeout/ECONNRESET under fuzzing load) or a
+        // not-yet-terminal state -> KEEP POLLING. Without this one blip froze the live UI for the
+        // rest of the run (the spinner, plan, findings and fuzz badges all stopped updating).
+        setTimeout(tick, 2500);
       }
     };
     tick();
