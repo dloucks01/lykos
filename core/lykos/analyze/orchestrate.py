@@ -84,6 +84,7 @@ _TARGET = {
     "libfuzzer": ("..analyze.libfuzzer_stage", "enqueue_libfuzzer"),
     "boundary_fuzz": ("..analyze.link", "enqueue_boundary"),
     "poc_diff": ("..analyze.poc", "enqueue_poc_diff"),
+    "patch_diff": ("..analyze.patch_diff_stage", "enqueue_patch_diff"),
 }
 _CASE = {
     "link_case": ("..analyze.link", "enqueue_link"),

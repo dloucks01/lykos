@@ -311,7 +311,12 @@ def test_the_cli_passes_the_budget_and_the_overrides_to_the_autopilot():
     src = inspect.getsource(_cmd_analyze)
     assert "args.budget" in src and "over" in src
     sig = inspect.signature(O.run_case_autopilot)
-    assert list(sig.parameters)[-2:] == ["budget_seconds", "overrides"]
+    # budget_seconds + overrides must be in the signature (the CLI passes both). They used to be
+    # the last two params; later additive params (skip_stages, pause) now follow them, so check
+    # presence and relative order rather than a brittle tail-position match.
+    params = list(sig.parameters)
+    assert "budget_seconds" in params and "overrides" in params
+    assert params.index("budget_seconds") < params.index("overrides")
 
 
 def test_nothing_that_consumes_a_crash_runs_before_the_stages_that_produce_one():
