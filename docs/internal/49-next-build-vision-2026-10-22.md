@@ -15,11 +15,39 @@ start at the top and go.
 
 There is one unifying idea under all four of the operator's asks: **lykos already knows the path
 from a target to a proven exploit — target → recover → search → prove → finding → L0→L1→L2→L3 → PoC
-— but nothing in the product shows that path.** The code buries it across parallel lists, the GUI
-renders a flat finding list, the report renders flat sections. The whole of this roadmap is: make
-the path that already exists in the data visible, navigable, and the organizing spine of the code,
-the GUI, and the report. "More things that link or show a path from one thing to the next" is not a
-fifth item — it is the point of the other four.
+— and the current GUI already *draws* most of the pieces of that path; what it does not yet do is
+let you walk it as one connected flow.** The whole of this roadmap is: take the pieces that already
+exist and weave them into one navigable spine, across the code, the GUI, and the report. "More
+things that link or show a path from one thing to the next" is not a fifth item — it is the point of
+the other four.
+
+## Live-GUI reality check (2026-10-22) — what already exists
+
+An earlier draft of this doc said "nothing in the product shows the path." After driving the running
+build live (case `hdemo2` on `127.0.0.1:8799`, every tab + the evidence drill-down), that framing was
+**too harsh and is corrected here.** The current build is a polished dark-theme *workbench* with a
+real design-token system, a `Classic UI` fallback (so this modern view is already the default), and —
+importantly — most of the visualization this roadmap wanted **already shipped**:
+
+- **L0→L1→L2→L3 weaponization ladder** — a header widget on every finding/overview.
+- **A live, rendered call graph** (Code tab: `main → parse_record → memcpy/puts`, drag/zoom/click),
+  plus Disassembly and Strings subtabs and "Deep function fuzzing".
+- **Evidence trails** — each finding has "HOW IT CAN BE EXPLOITED — click any line to go deeper" and
+  an evidence-trail modal with "View code at 0x…" + raw JSON.
+- **Per-binary coverage** bars with drill-in (Dynamic tab).
+- **Honesty surfaced already** — findings state their ceiling ("demonstrated at the FUNCTION level …
+  Not a program-level verified PoC"); a **Fuzzing engine health** table says why each engine
+  ran/skipped/n-a; a **"What this run did"** panel frames the null result by the work behind it
+  (219,980 executions). This is precision-as-UX and it is live today.
+- **Full run controls** (budget slider + "to convergence", 5 engine toggles + deep-seed, invocation
+  libs/argv/channel, black-box, Continue run, pause/resume) and **HTML/SARIF/JSON export**.
+
+So the honest gap is **not** "build visualization" — it is that these pieces live in **separate tabs
+and modals and do not cross-link**. From a finding you cannot yet click through to *its* node in the
+call graph → *its* coverage → *its* ladder rung as one motion. The code's parallel-list disease
+(Theme 1a) is real and unchanged. The revised roadmap below reflects this: the GUI theme becomes
+"weave the existing surfaces into one clickable spine," and the figure library becomes "add the
+*missing* figures + a shared cross-link layer," not a from-scratch build.
 
 ## Guiding constraints (unchanged, carried into every item)
 
@@ -91,11 +119,16 @@ Theme 2 affordable; doing Theme 2 on top of the god component would just grow it
 
 ---
 
-## Theme 2 — GUI overhaul: rethink how everything is presented
+## Theme 2 — GUI: weave the existing surfaces into one navigable spine
 
-Today: a left rail of pipeline items (the static-rendering bug is fixed) and a tabbed main pane. It
-is a *control panel*. The operator asked us to rethink it completely. The reframe: **the GUI is a map
-of one engagement, and the operator navigates by following the path.**
+Today (verified live, see the reality check above): a left rail of pipeline items with live status, a
+run bar, and a rich tabbed main pane — Overview (severity / top-CWE / L-ladder / findings), Exploits
+(chain narrative), Code (**live call graph** + disassembly + strings), Dynamic (coverage), Diff,
+Console — with evidence-trail modals, the engine-health table, and the honest "what this run did"
+panel. It is already far past a "control panel." The gap is **connective tissue**: the surfaces don't
+cross-link, so the operator can't *walk* a finding through them. The reframe: **the GUI is a map of
+one engagement, and every surface links to the next step on the path.** The overhaul is mostly
+cross-linking + one new map view, not rebuilding the tabs.
 
 ### 2a. The engagement map (new primary view)
 A single always-visible diagram of the run as a left-to-right flow:
@@ -110,17 +143,22 @@ Each node is live (pending / running / done / skipped / error, driven by `s.stat
 left-rail bug taught us to trust), clickable, and shows its yield (how many leads, which findings).
 This is the "path from one thing to the next" made literal and is the home screen.
 
-### 2b. Finding-centric navigation with visible provenance
-Click a finding and see its **full provenance chain as a path**, not a flat card:
+### 2b. Finding-centric navigation with visible provenance (upgrade the existing evidence trail)
+The evidence-trail modal already exists ("click any line to go deeper" → EVIDENCE TRAIL + "View code
+at 0x…"). The upgrade: turn that modal into a **cross-linked inline path**, not a dead-end popup —
 `stage that found it → detector → corroborating evidence (taint source→sink, CVE match, bounds
-witness) → L-ladder rung with the justification for that rung → the PoC and its reproduction`.
-Every hop is a link. This is where precision becomes legible: the operator can *see* why a finding
-is CONFIRMED vs candidate, and what would raise it.
+witness) → the function's node in the Code call graph → its coverage row → L-ladder rung with the
+justification → the PoC and its reproduction`. Every hop is a real link that actually navigates the
+other tabs (today "View code at 0x…" is the only working hop). This is where precision becomes
+legible: the operator *sees* why a finding is CONFIRMED vs candidate, and what would raise it.
 
-### 2c. The L-ladder as a first-class, visible progression
-Per finding, render L0→L1→L2→L3 as a rung diagram: which rungs are reached, the evidence at each,
-and (honestly) why a rung is *not* reached — "drained vs cutoff" for concolic, "no second witness"
-for bounds. This turns the honesty invariants into a feature the operator can read.
+### 2c. The L-ladder as a first-class progression (extend the existing header widget)
+The L0→L1→L2→L3 ladder widget already renders per finding/overview, and the honest ceilings already
+appear in the finding prose and the engine-health table. The extension: make the ladder itself a
+**per-rung diagram** — which rungs are reached, the evidence *at* each rung, and (honestly) why a
+rung is *not* reached ("drained vs cutoff" for concolic, "no second witness" for bounds) — wired into
+the 2b path so clicking a rung jumps to its evidence. This promotes honesty data that is today spread
+across prose + the engine-health table into one readable rung view.
 
 ### 2d. Keep every control, make them contextual
 All the run controls shipped this cycle (per-phase/stage budget, sysroot/libs, deep-seed, per-stage
@@ -157,19 +195,25 @@ evidence → L-level → PoC.
 ## Theme 4 — Diagrams, figures, and the connective tissue
 
 The operator asked for more diagrams/figures *and* "more things that link or show a path from one
-thing to the next." Same engine serves both: a small, offline, deterministic **SVG figure library**
-in core (stdlib-only — we emit SVG strings; no graphviz runtime dep) that both the GUI and the report
-render from the same data.
+thing to the next." The GUI already renders a live **call graph** (Code tab) and **coverage** bars,
+but those are GUI-only (interactive JS) and don't appear in the HTML/PDF report, and nothing emits
+the other figures. So the figure engine has two jobs: (a) add the **missing** figures, and (b) give
+every figure a **shared cross-link layer** + a **static-SVG renderer** so the same data draws in both
+the interactive GUI and the air-gap report. A small, offline, deterministic **SVG figure library** in
+core (stdlib-only — we emit SVG strings; no graphviz runtime dep) serves both.
 
-Figures to build, each doubling as a navigation surface in the GUI and a static image in the report:
-1. **Pipeline/engagement DAG** — the Theme-2a map; nodes link to stage detail.
-2. **Taint path** — source → … → sink, the actual propagation the taint engine already computes;
-   nodes link to code locations.
-3. **Call graph / CFG slice** around a finding or a patched function (native_re already has the CFG).
-4. **L-ladder rung diagram** — Theme 2c, per finding.
-5. **Patch-diff map** — changed functions ranked by how much the body moved (patchdiff.diff already
-   returns `changed[].moved` + new/dropped callees); the figure makes "this is the fix" obvious.
-6. **Finding provenance chain** — the spine of GUI 2b and report provenance.
+Figures, each doubling as a GUI navigation surface and a static report image (status noted):
+1. **Pipeline/engagement DAG** — the Theme-2a map; nodes link to stage detail. *(new)*
+2. **Taint path** — source → … → sink, the propagation the taint engine already computes; nodes link
+   to code locations. *(data exists, not drawn)*
+3. **Call graph / CFG slice** around a finding or patched function. *(call graph already renders live
+   in the Code tab — add the CFG slice, the static-SVG report version, and the finding→node link)*
+4. **L-ladder rung diagram** — Theme 2c. *(ladder widget exists; make it a per-rung diagram)*
+5. **Patch-diff map** — changed functions ranked by how much the body moved (`patchdiff.diff` already
+   returns `changed[].moved` + new/dropped callees); the figure makes "this is the fix" obvious. *(new)*
+6. **Finding provenance chain** — the spine of GUI 2b and report provenance. *(new; promotes the
+   existing evidence-trail modal into a drawn, linkable path)*
+7. **Coverage** — already drawn in the GUI; add the static-SVG report version. *(GUI-only today)*
 
 Deterministic layout (no physics sim — layered DAG, fixed seed) so a report figure is byte-stable
 across runs and reviewable in git. Every figure is a plain inline `<svg>` that works in the air-gap
@@ -179,14 +223,25 @@ browser and embeds in the PDF.
 
 ## Suggested phase order (what to do first)
 
+Reordered after the live-GUI reality check: the GUI surfaces already exist, so the cheapest
+high-value win is **cross-linking them**, which moves ahead of the figure library.
+
 1. **1a stage registry** — unlocks the catalog the GUI/report render from and kills the parallel-list
-   bug class. Small, high leverage, do first.
-2. **1d GUI decomposition + 4 figure library** — the substrate for the whole GUI/report overhaul.
-3. **2a engagement map + 2b provenance** — the visible-path payoff; the operator sees it immediately.
-4. **3 report restructure** over the same model + figures.
-5. **1b/1c god-module splits + analysis cache + confirm-hardening** — interleave as the touched areas
+   bug class. Small, high leverage, do first. (Unchanged.)
+2. **2b cross-link the existing surfaces** — wire the evidence-trail modal → the function's call-graph
+   node → its coverage row → its ladder rung into real navigation (today only "View code at 0x…"
+   works). Highest value-per-effort because it builds on surfaces that already render; pairs with a
+   first slice of 1d (a small shared store so a click in one tab can drive another).
+3. **1d GUI decomposition + figure library** — decompose `App()` (1283L) into feature components;
+   build the figure library scoped to the *missing* figures + the static-SVG renderer + the shared
+   cross-link layer (not a from-scratch viz build — call graph & coverage already render).
+4. **2a engagement map + the new figures** — the pipeline DAG home view, plus taint-path, provenance
+   chain, and patch-diff map (figures 1, 2, 5, 6).
+5. **3 report restructure** — reorganize around the path and pull the static-SVG figures (incl. the
+   call-graph and coverage versions that are GUI-only today) into HTML/PDF, all from the one model.
+6. **1b/1c god-module splits + analysis cache + confirm-hardening** — interleave as the touched areas
    come up (do the exploit_stage split *with* the audit's confirm-hardening so no site is missed).
-6. **2c L-ladder view + 2d contextual controls** — polish that makes precision legible.
+7. **2c ladder rung diagram + 2d contextual controls** — polish that makes precision legible.
 
 ## Explicitly not in scope here (tracked elsewhere)
 - GAP C (bounds-OOB promotion, 2–4h) — doc 48 / memory.
