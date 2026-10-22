@@ -143,12 +143,19 @@ become the **safety ceiling** and the search runs until coverage plateaus. Non-f
       `POST /autopilot {converge}` → `_start_autopilot` → `run_case_autopilot(converge=)` →
       `status["converge"]`. In convergence mode the per-target budget is the ceiling (slider minutes,
       or a 6h default when blank). JS + py imports clean; 12 autopilot tests green.
-- [ ] **U1-engine · coverage-plateau auto-stop + stalled-engine auto-skip** (the real convergence).
-      Today convergence runs to the ceiling and the live coverage/health panel shows the plateau for
-      the operator to stop on; next, stop the search phase automatically when coverage has not grown
-      for a window (healthy rate) and auto-skip a campaign whose rate collapsed / heartbeat stopped
-      (Stalled/hung — see U2). ADDITIVE: only affects `converge=True` runs, so the existing
-      conformance (all `converge=False`) is unaffected and the single-case guard suffices.
+- [x] **U1-engine · coverage-plateau auto-stop** — in convergence mode the coverage campaign runs
+      with AFL's own `AFL_EXIT_WHEN_DONE=1`, so it stops when AFL has cycled every path with no new
+      find for a while (its coverage-plateau signal) instead of burning the full `-V` ceiling; the
+      ceiling stays the hard upper bound. Threaded `converge` through `run_case_autopilot` → the
+      dynamic params → `coverage_stage` → `aflpp.run_campaign`. **Stuck/hung is covered natively**:
+      AFL's forkserver marks a hung target (per-exec timeout) and skips it, and a wedged campaign is
+      caught by the orchestrator's stage-deadline reaper. ADDITIVE (fires only for `converge=True`),
+      so existing conformance (all `converge=False`) is unchanged; unit-tested (the flag is set iff
+      converge) + afl/coverage tests green.
+- [ ] **U1-engine (remaining) · plateau for the non-AFL campaigns + a live "Converged/Stalled"
+      badge.** The blind/`directed_fuzz` sandbox campaigns run to the ceiling in convergence mode
+      (no AFL plateau signal there); a coverage-growth monitor could stop them too. Surface the
+      live Running/Converged/Stalled state in the GUI (overlaps U2).
 - [ ] (dropped) Quick/Standard/Thorough detents + Quick's smart-only+blind-slice profile — folded
       into "pick fewer minutes" + the checkbox; revisit only if the operator wants named presets.
 

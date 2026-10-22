@@ -206,7 +206,7 @@ def input_suffix(seeds) -> str:
 def run_campaign(afl: Path, exe, seeds_dir, out_dir, *, seconds: int = 30,
                  mode: str = "file", qemu: bool = True, afl_path: Optional[str] = None,
                  cmplog: Optional[Path] = None, argv_template=None, input_file=None,
-                 qemu_ld_prefix: Optional[str] = None):
+                 qemu_ld_prefix: Optional[str] = None, converge: bool = False):
     # NOTE: AFL keeps its default memory cap here. Sanitizer builds (which need `-m none`) are
     # deliberately NOT run through this path -- an uncapped run OOM'd the host -- they are fuzzed
     # by the sandbox `fuzz`/`directed_fuzz` stages under rlimits instead (see coverage_stage).
@@ -242,6 +242,14 @@ def run_campaign(afl: Path, exe, seeds_dir, out_dir, *, seconds: int = 30,
         "AFL_NO_AFFINITY": "1",
         "AFL_BENCH_JUST_ONE": "0",
     })
+    if converge:
+        # Run-to-convergence (doc 47 U1): stop when AFL has cycled through every path with no new
+        # find for a while -- its own coverage-plateau signal -- instead of burning the full `-V`
+        # ceiling. `-V` (set from `seconds`, the convergence ceiling) stays the hard upper bound, so
+        # a target that never plateaus is still bounded. AFL's forkserver already handles a hung
+        # target (per-exec timeout -> the input is marked a hang and skipped), so "stuck" is covered
+        # natively. setdefault keeps an operator's explicit env.
+        env.setdefault("AFL_EXIT_WHEN_DONE", "1")
     if qemu:
         # Input-to-state (COMPCOV): the qemu tracer instruments comparisons and splits multi-byte
         # ones, so AFL learns the magic value / checksum / length a branch demands and reaches code a

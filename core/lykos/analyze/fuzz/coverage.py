@@ -392,7 +392,8 @@ def coverage_stage(ctx) -> dict:
         ctx.progress(msg="missing shared libraries — the handshake will fail until they are supplied")
     proc = aflpp.run_campaign(afl, exe, seeds_dir, out_dir, seconds=seconds, afl_path=afl_path,
                               mode=mode, qemu=use_qemu, argv_template=argv_template,
-                              input_file=input_file, qemu_ld_prefix=_ld_prefix)
+                              input_file=input_file, qemu_ld_prefix=_ld_prefix,
+                              converge=bool(p.get("converge")))
     if proc.returncode != 0 and not (out_dir / "default").exists() \
             and not (out_dir / "crashes").exists():
         tail = (proc.stderr or b"")[-800:].decode("latin-1", "ignore")

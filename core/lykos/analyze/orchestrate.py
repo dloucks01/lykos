@@ -1838,6 +1838,12 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                 _emit_stage(store, t.case_id, "dynamic_run", "note", target_id=tid,
                             detail=(f"the baseline did not terminate, so the campaigns use a "
                                     f"{_NONTERM_EXEC_TIMEOUT:g}s per-execution timeout"))
+            # Run-to-convergence: the coverage campaign stops on AFL's own plateau signal
+            # (AFL_EXIT_WHEN_DONE) instead of burning the whole ceiling. Threaded via the dynamic
+            # params so coverage_stage -> aflpp.run_campaign sees it.
+            if converge:
+                dyn = dict(dyn, converge=True)
+                fz = dict(fz, converge=True)
             # DISCOVERY that needs NO fuzzer crash -- run it BEFORE the budget-draining fuzz/concolic,
             # for the same reason as the crashless weaponization above: a menu-driven heap / OOB target
             # rarely yields a blind-mutation crash, so with the old ordering heap_trace + oob_index +
