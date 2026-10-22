@@ -939,12 +939,12 @@ function App() {
             <div class="rail-run">
               <${FuzzConsole} live=${fuzzLive} />
               ${bgActivity ? html`<div class="bg-activity">${bgActivity.pct != null ? html`<span class="bg-pct">${Math.round(bgActivity.pct)}%</span>` : null}<span class="bg-act-msg">${bgActivity.msg}</span></div>` : null}
-              ${runControls}
             </div>
           </nav>
 
-          <!-- main: verdict + tabs + panel -->
+          <!-- main: run bar + verdict + tabs + panel -->
           <main class="wb-main">
+            <div class="wb-runbar">${runControls}</div>
             <${TargetBar} target=${activeTarget} onBrowseFunctions=${browseFunctions} />
             ${multi ? (() => {
               const dem = verdicts.filter((v) => v.status === "demonstrated").length;
