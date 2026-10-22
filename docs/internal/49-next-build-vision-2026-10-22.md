@@ -221,6 +221,63 @@ browser and embeds in the PDF.
 
 ---
 
+## Theme 5 — Architecture, Windows, and scale (the capability-depth track)
+
+Operator ask (2026-10-22): *"other architectures at this level of depth … go further L0→L3 … go
+deeper with Windows binaries … analyze larger binaries 100 MB and up without issues, especially
+Windows applications."* These are **capability-depth** tracks, orthogonal to the GUI/report/code
+themes above, each targeting a specific gap catalogued in `50-current-state`. All additive — they
+never degrade the depth that already works (x86-64 full L3, the 8-arch ret2libc set, the honest
+degradation posture).
+
+### 5a. Architecture → full L3 depth (not just ret2libc)
+Today non-x86 L3 is the cross-arch **ret2libc** driver only; the chain algebra is x86-64-only, so the
+8 synth arches are confined to **no-PIE / fixed-address** targets, and mips + the capture-only arches
+don't synthesize at all. The lever is the existing `archmodel.ArchModel` abstraction — extend it
+past ret2libc:
+- **A cross-arch info-leak / ASLR-defeat primitive** — the single biggest unlock. `leak.py` is
+  entirely x86-64 pop-gadget + rsp-alignment; without a per-arch leak, non-x86 L3 can't touch a PIE
+  target. Build it behind `ArchModel`.
+- **Generalize the ROP-chain builders** (`rop.py`: ret2csu / dlresolve / SROP / one-gadget) behind
+  per-arch gadget vocabularies, instead of the x86-64 byte patterns.
+- **Fill the obvious holes:** shellcode stubs for **loongarch64 / sh4** (ret2libc-only today); a
+  **mips gadget decoder + `_mips_ret2libc`** (mips already has full L1/L2 capture — "infra present,
+  synthesis missing").
+- Target metric: raise N arches from ret2libc-only to **leak + ROP L3** against PIE targets.
+
+### 5b. Deeper Windows / PE (break the L2/L3 wall)
+A PE reaches **L1** (Wine crash, incl. SEH) but stops dead at L2/L3 (doc 50). Two walls + finishing
+work:
+- **L2 — RIP capture under Wine.** `ptrace_capture.py` can't follow Win64 state through wineserver.
+  Need a Wine-aware confirmation channel: parse the Wine crash **context** (registers at fault) from
+  the unhandled-exception report, or attach via Wine's debug interface, to confirm IP control.
+- **L3 — a Win64 weaponizer.** `build_exploit` is ELF + System V only. Add a **Windows ABI model**
+  (rcx/rdx/r8/r9 + 32-byte shadow space) in `archmodel`, **SEH-overwrite** exploitation, and
+  **WinExec / VirtualProtect / LoadLibrary** gadget synthesis + Windows shellcode. Gate on it the way
+  the ELF path gates on SysV.
+- **Finishing work:** populate PE **exports / TLS callbacks / resources / relocations** (`pe.py`); a
+  **Windows static sink catalog** (`wsprintf`, Win32 copy/format APIs — today only generic libc
+  names match); and a **coverage lane for PE** that isn't 1-exec/s Wine (a PE instrumentation or
+  emulation path), without which large Windows targets have no execution-based depth.
+- Target: PE reaches **L2**, then **L3** on a straightforward stack-overflow Windows target.
+
+### 5c. 100 MB+ without degradation (especially Windows)
+The "large/huge" modes are advisory; the real ceiling is ~24 MB where whole-program `aaa` stops
+finishing (doc 50). Make big binaries first-class:
+- **Gate `aaa` by size** — use `aa`+`aac` or the batched per-function path for **pass 1** too (today
+  the batched path only governs pass 2), so function/call-graph recovery survives above ~24 MB.
+- **Replace the taint hard-drop** (`detect/taint.py` returns zero dataflow above 6000 functions) with
+  a **ranked top-N** over sink-adjacent / reachable functions — degrade gracefully, don't disable.
+- **Streaming / mmap reads** instead of whole-file `read_bytes` (three sites add the full file to RSS).
+- **Scope concolic** to a function/region instead of whole-image load (angr OOMs on 90 MB+).
+- **Large PE specifically** assumes-ELF for its execution depth and collapses to static+concolic — it
+  needs 5b's PE coverage lane to have any dynamic depth at 100 MB+.
+- Preserve the honesty posture: every remaining cap stays **reported, never silent**.
+- Target: a 100 MB native ELF **and** a 100 MB PE both get real function/call-graph recovery + taint
+  within budget.
+
+---
+
 ## Suggested phase order (what to do first)
 
 Reordered after the live-GUI reality check: the GUI surfaces already exist, so the cheapest
@@ -243,11 +300,17 @@ high-value win is **cross-linking them**, which moves ahead of the figure librar
    come up (do the exploit_stage split *with* the audit's confirm-hardening so no site is missed).
 7. **2c ladder rung diagram + 2d contextual controls** — polish that makes precision legible.
 
+**Theme 5 (capability depth) runs as a parallel track**, prioritized by engagement value rather than
+the GUI sequence above: **5c (100 MB+ reliability)** and **5b (Windows L2→L3)** unblock real targets,
+so they lead; **5a (arch depth)** follows. Each is additive and measured against the current-state
+baseline in `50-current-state`.
+
 ## Explicitly not in scope here (tracked elsewhere)
 - GAP C (bounds-OOB promotion, 2–4h) — doc 48 / memory.
 - The remaining audit follow-ups (doc 48) fold into 1b/1c where they touch the same code; the rest
   (batch-runner loader-failure detection, netfuzz stderr drain, relink-move corruption,
   symqemu doctor probe) stay on the doc-48 list.
 
-Related: [[drive-the-roadmap-proactively]], [[webgui-cli-parity]], the codebase audit
+Related: [[drive-the-roadmap-proactively]], [[webgui-cli-parity]], the current-state reference
+(`docs/internal/50-current-state-2026-10-22.md`) and the codebase audit
 (`docs/internal/48-codebase-audit-2026-10-22.md`).

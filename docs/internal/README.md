@@ -1,46 +1,35 @@
 # Internal working notes
 
-Development-process artifacts, kept for reference but not part of the user- or
-operator-facing documentation. The reference docs a user needs are in the parent
-[`docs/`](../) directory (architecture, CWE detection, data model, the air-gap runbook, …).
+Development-process notes, not user- or operator-facing. The reference docs a user needs are in the
+parent [`docs/`](../) directory (overview, architecture, pipeline, gui, coverage, offline-packaging).
 
-What's here:
+This folder now holds **only the current set**. The dated planning / strategy / audit series that
+preceded it (docs 01–46, plus the early `prototype/` and `tasks/` tickets) has been moved to
+[`archive/`](archive/) — kept for the decision/rationale record, not as a description of the current
+build.
 
-- **Roadmap & backlog** — `13-roadmap-milestones.md`, `20-open-work-backlog.md`
-- **Reviews & plans** — `21-crs-harvest-review.md`, `24-modernization-plan.md`,
-  `30-missing-capabilities-implementation-plan.md` (sequenced plan for doc 20's open queue)
-- **`43-autopilot-crossarch-l3-2026-10-19.md`** — the cross-arch L3 capability existed in
-  `build_exploit` but the Autopilot never reached it: the crashless `build_exploit(strategy="auto")`
-  sat last in the recover phase and was starved of budget, so cross-arch L3 was a lottery on the
-  fuzzer's crash yield (aarch64 fell to L1). Running it first fixes it — aarch64 L1→L3, riscv64 L3
-  with zero fuzzer crashes, no regressions. Also records the worker-pool harness footgun.
-- **`42-strategy-expansion-2026-10-19.md`** — the outcome of the strategy tracks past ret2libc:
-  NX-off execstack ret2shellcode is done for every buildable arch (riscv64/ppc64le/s390x/ppc32
-  added; mips blocked on toolchain), and multi-register syscall-ROP (execve-syscall/mprotect) is
-  shown empirically to be gadget-blocked on the RISC arches — a research track, not a bounded task.
-- **`41-weaponization-breadth-2026-10-19.md`** — breadth, where 37/38 measured depth: the plan
-  to push more ISAs from L1 to a real L3 (an `ArchModel` abstraction + a strategy march across
-  architectures, each live-verified under qemu-user), plus the Windows/PE weaponization gap and
-  the `Exploit_Dev` (XDS) validation corpus. Sequenced; cross-arch depth leads.
-- **`38-technique-program-2026-10-17.md`** — every exploitation technique in one of three
-  states: driven end to end, knowledge-base only, or absent. The ordered program for the
-  second two, and the two that honestly end in a version-gated refusal.
-- **`37-weaponization-depth-2026-10-17.md`** — every matrix cell showed the level a case DEMANDS,
-  so four mechanism rows read L0/L2 and nobody could say whether that was the engine or the
-  fixture. `--ceiling` measures the reach; four rungs raised, three honest ceilings recorded.
-- **`36-door-selection-2026-10-17.md`** — in-process fuzzing reaches a library through one
-  function at a time, so "did we fuzz it?" is answered by a function NAME. Four real trees, three
-  wrong names, and why no instrument could see it: a door that is not a door produces a clean row.
-- **Dated audits & handoffs** — `25-`…`29-`, `32-`, `33-`, `34-` (point-in-time code/capability
-  audits and session handoffs; they describe the state as of their date, not necessarily the
-  current tree).
-- **`35-the-chain-2026-10-13.md` — start here.** The canonical process (vulnerability → PoC →
-  exploit → effect), the evidence each link must produce, the measured status of each, and the
-  four instruments that validate it: the unit suite, `tools/pipeline_conformance.py` (planted
-  bugs, end to end), `tools/real_corpus_gate.py` (plumbing health on real material) and
-  `tools/corpus_regression.py` (did we still find — and still demonstrate — what we found
-  before). `tools/breadth_probe.py` reports work on arbitrary binaries and has no pass mark.
-- **`archive/`** — early prototype and phase-0 planning tickets (historical)
+## Current docs
 
-These are snapshots of thinking at a moment in time. When they disagree with the code, the code
-wins; `./lykos doctor` and the test suite are the source of truth for what the tool actually does.
+- **[`50-current-state-2026-10-22.md`](50-current-state-2026-10-22.md) — start here.** What lykos
+  actually does today: the L0→L3 capability matrix across architectures, the Windows/PE depth and its
+  L2/L3 wall, the large-binary (100 MB+) ceiling, and the honest-degradation posture. Supersedes the
+  archived series as the "what is true now" reference.
+- **[`49-next-build-vision-2026-10-22.md`](49-next-build-vision-2026-10-22.md)** — the forward plan:
+  the code/GUI/report overhaul (make the existing target→…→L3→PoC path a navigable spine) plus the
+  Theme 5 capability track (architecture depth, Windows L2→L3, 100 MB+ scale) that targets the gaps in
+  doc 50.
+- **[`48-codebase-audit-2026-10-22.md`](48-codebase-audit-2026-10-22.md)** — the latest whole-codebase
+  audit: the fixes applied and the prioritized follow-ups still open.
+- **[`47-timed-engagement-reliability-roadmap-2026-10-21.md`](47-timed-engagement-reliability-roadmap-2026-10-21.md)**
+  — the open-items tracker (fuzz robustness, auto-invocation, progress/ETA/health).
+
+## Ground truth
+
+These notes are a point-in-time view. **When they disagree with the code, the code wins** —
+`./lykos doctor` and the test suite are the source of truth for what the tool actually does.
+
+## [`archive/`](archive/)
+
+The dated 01–46 series (gap analyses, roadmaps, strategy expansions, weaponization-depth and
+large-binary programs, dated audits and handoffs) and the early prototype / phase-0 tickets. Historical:
+each describes the state as of its date. Kept so the *why* behind a decision is recoverable; not current.
