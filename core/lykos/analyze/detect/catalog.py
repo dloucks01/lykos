@@ -276,6 +276,19 @@ SINK_TAINT_ARGS = {
     "mysql_real_query":   frozenset({1}),
     "PQexec":             frozenset({1}),         # PQexec(conn, SQL)
     "PQexecParams":       frozenset({1}),
+    # Kernel user-copy sinks: the user-controlled SIZE/length arg. Without this they fell back to
+    # the "any argument" rule, which fired on the EXPECTED tainted user pointer (the whole point of
+    # copy_from_user) instead of the LENGTH -- the actual bug. Narrows the match; never widens it.
+    "copy_from_user":    frozenset({2}),          # copy_from_user(dst, user_src, n)
+    "_copy_from_user":   frozenset({2}),
+    "__copy_from_user":  frozenset({2}),
+    "copy_to_user":      frozenset({2}),          # copy_to_user(user_dst, src, n)
+    "_copy_to_user":     frozenset({2}),
+    "__copy_to_user":    frozenset({2}),
+    "memdup_user":       frozenset({1}),          # memdup_user(user_src, len)
+    "vmemdup_user":      frozenset({1}),
+    "strncpy_from_user": frozenset({2}),          # strncpy_from_user(dst, user_src, count)
+    "simple_write_to_buffer": frozenset({4}),     # (to, available, ppos, user_from, count)
 }
 
 
