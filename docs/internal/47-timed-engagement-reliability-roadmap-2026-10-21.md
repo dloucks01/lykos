@@ -385,6 +385,29 @@ warning, P10 BinDiff/patch-diff.
 
 ## Done
 
+- [x] **(L3-1) harness (the one non-pipeline stage) now reaches L3** — commit `de16dd3`. It dead-ended
+      at a corroborated FUNCTION-level finding (no DynResult crash → no escalation). Now `harness_stage`
+      replays each function-level crashing input against the WHOLE program over the operator's channel
+      and records a REAL DynResult: a genuine program crash is escalated by the existing prove-ladder to
+      L3 (verified live: harness fault → program-level crash → L1→L2→L3 PoC), a non-crash becomes a
+      reachability seed. `harness` added to `directed._TARGET_DETECTORS`; the autopilot forces the
+      steered concolic+prove pass when unproven harness leads exist. Honest: every row is a real run,
+      L3 only on a real crash. See memory [[l3-reachability-map]].
+- [x] **(L3-2) full finding-source → L3 audit** (memory [[l3-reachability-map]]). Every memory-corruption
+      / format-string (CWE-134 feeds `build_exploit(strategy=format)`) / C-injection / memory-leak source
+      reaches L3; source int_overflow/uaf reach it via the source-fuzz path. Honest ceilings (NOT
+      fabricated): logic/auth (CWE-252/732/696), hygiene (weak crypto/rand/tmp), secrets (L0-secret),
+      managed runtimes, cross-arch fmt/heap. One real fixable-but-unwired gap remains → P11.
+- [ ] **P11 · Go/Rust injection L3.** `inject_stage.PROBES` (injection.py:232) match C libc symbols only,
+      so a native Go `os/exec.Command` / Rust injection sink is never probed. Add Go/Rust sink symbols
+      (SAFE — inject realizes the effect dynamically, a non-injectable sink just yields no marker). Needs
+      Go/Rust test binaries + confirmation the disassembler recovers clean Go call-edges before shipping.
+- [ ] **P12 · Offline gate proves L3 BREADTH.** `make verify-e2e` drives only ONE L3 class (native
+      x86-64 ret2win) in the cold `--network none` container; heap/fmt/leak-ret2libc/cross-arch/BROP/SROP
+      L3 are proven only by connected-host gates (conformance/arch-gate/real-gate). Extend
+      `packaging/test-offline-e2e.sh` to drive a representative target per L3 class to L3 in-container, so
+      an offline-specific L3 regression is caught. (Bundle contains every tool — pure-Python synthesis.)
+
 - [x] **(a) Single-address ret2win to an in-image shell call** (stripped/no-PIE, NUL-safe) —
       `rop.find_shell_call_wins` + `_shellcall_ret2win_exploit`, commit `11499af`. Reaches L3 where
       the recovered call-graph misses the `system`-calling function and a NUL-truncating strcpy sink
