@@ -53,6 +53,10 @@ const DYNAMIC_BACKENDS = new Set([
 // they read evidence other stages recorded, so they only mean anything at the end of a full
 // server-side pass:
 // not-in-tab: cve_corroborate, cve_poc, poc_diff
+//
+// they need operator input the in-tab run does not have: harness is started from the Code tab's
+// function view, and patch_diff needs a second build picked as the baseline to diff against:
+// not-in-tab: harness, patch_diff
 // -------------------------------------------------------------------------------------
 
 const PIPELINE = [

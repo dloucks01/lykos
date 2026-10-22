@@ -28,7 +28,7 @@ import pathlib
 import lykos.analyze as analyze_pkg
 import lykos.cli as C
 from lykos.analyze.capabilities import classify_decline
-from lykos.analyze.orchestrate import _CASE, _PLAN_STAGES, _TARGET
+from lykos.analyze.orchestrate import _CASE, _ON_DEMAND, _PLAN_STAGES, _TARGET
 
 
 def _cli_src():
@@ -91,7 +91,7 @@ def test_every_scheduled_stage_appears_in_the_plan_the_operator_watches():
     on /usr/bin/xxd it performed 4,513 of the run's 7,272 executions and never appeared, so the
     live view sat on another stage's name while the main campaign ran."""
     planned = {s for s, _ in _PLAN_STAGES}
-    missing = sorted((set(_TARGET) | set(_CASE)) - planned)
+    missing = sorted((set(_TARGET) | set(_CASE)) - planned - set(_ON_DEMAND))
     assert not missing, f"scheduled but never shown to the operator: {missing}"
 
 

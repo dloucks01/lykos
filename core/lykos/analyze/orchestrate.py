@@ -92,6 +92,13 @@ _CASE = {
     "cross_taint": ("..analyze.link", "enqueue_cross_taint"),
     "whole_system": ("..analyze.link", "enqueue_whole_system"),
 }
+#: In the dispatch table (so the API and CLI can run them) but deliberately NOT scheduled by the
+#: autopilot: each needs an operator decision a run does not have. Listed so the plan does not show
+#: them as "skipped / no budget" on every run, and so a stage cannot fall out of the schedule unseen.
+_ON_DEMAND = {
+    "harness": "started from the Code tab's function view on the functions the operator picks",
+    "patch_diff": "needs a second build chosen as the baseline to diff against",
+}
 # Stages whose enqueue-fn takes NO params. root_cause/build_poc/poc_primitive are NOT here: they
 # require params["input_sha"] (the crashing input), which the prove loop threads in -- listing
 # them dropped that input and every one failed with "requires params.input_sha".

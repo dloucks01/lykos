@@ -321,7 +321,7 @@ def build_poc_stage(ctx) -> dict:
             try:
                 from . import dos
                 dos.escalate(ctx, target, input_sha, mode, argv_base=argv)
-            except Exception:
+            except Exception:  # escalation only ADDS a higher PoC; never fail the L1
                 pass                                     # escalation only ADDS; never fail the L1
 
     ctx.emit("poc.done", payload={"verified": verified, "level": level,

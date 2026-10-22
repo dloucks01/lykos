@@ -83,5 +83,7 @@ def test_afl_declines_a_target_it_cannot_dry_run():
     between = src[i:j]
     assert "if slow and not seeds:" in between, \
         "all-seeds-dropped still falls through to the default seeds, which time out too"
-    assert "does not terminate" in between, "the decline does not say what is true of the target"
+    # The decline now covers both causes afl's dry run rejects (a seed that hangs OR crashes), so
+    # it names what is true of the target rather than assuming non-termination.
+    assert "timed out or crashed" in between, "the decline does not say what is true of the target"
     assert '"supported": False' in between, "AFL's inability here must be a decline, not an error"

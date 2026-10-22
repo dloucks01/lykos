@@ -751,7 +751,7 @@ def _ldconfig_cache() -> dict:
     consulting it keeps the resolver from FALSELY declaring a system library missing."""
     try:
         r = subprocess.run(["ldconfig", "-p"], capture_output=True, timeout=5)
-    except Exception:
+    except Exception:  # no ldconfig here: an empty cache only means 'not known missing'
         return {}
     cache: dict = {}
     for line in r.stdout.decode("latin-1", "ignore").splitlines():
@@ -777,7 +777,7 @@ def resolve_dynamic_deps(target, sysroot=None) -> tuple:
     try:
         data = bytes(target) if isinstance(target, (bytes, bytearray)) else Path(target).read_bytes()
         info = parse(data)
-    except Exception:
+    except Exception:  # unparseable here: let the run itself report it
         return True, ""                              # unreadable here -> let the run speak
     if (info.linking or "") != "dynamic":
         return True, ""                              # static / static-pie: nothing to resolve

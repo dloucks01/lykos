@@ -68,7 +68,9 @@ def _js_pipeline():
 def test_the_primary_autopilot_button_runs_the_server_pipeline():
     """The obvious button has to be the complete one. `onBackground` is the server-side autopilot
     -- all 45 stages, the phase budget, the baseline execution and the scorecard."""
-    m = re.search(r'class="btn primary"[^>]*onClick=\$\{(\w+)\}[^>]*>\s*\$\{ran \?', APP, re.S)
+    # Anchored on the button's own label, not on how the label expression is written (it grew
+    # cancelled/error branches ahead of the `ran ?` test, which broke the old anchor).
+    m = re.search(r'class="btn primary"\s+onClick=\$\{(\w+)\}(?:(?!</button>).)*?Run Autopilot', APP, re.S)
     assert m, "could not find the primary Run Autopilot button"
     assert m.group(1) == "onBackground", (
         "the primary Autopilot button runs %s; it must run onBackground (the server pipeline), "

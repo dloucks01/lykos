@@ -143,7 +143,7 @@ def escalate(ctx, target, input_sha, mode, argv_base=()) -> dict:
         return {}                                        # amplification maps cleanly to a stream
     try:
         input_bytes = ctx.content.get_bytes(input_sha)
-    except Exception:
+    except Exception:  # input artifact gone: nothing to escalate, the L1 stands
         return {}
     unit = _unit_request(input_bytes)
     argv_base = list(argv_base or [])
@@ -227,7 +227,7 @@ def _file_poc(ctx, target, input_sha, mode, argv_base, level, bpr, impact) -> di
                     f"with no ceiling (measured linear on the sanitizer build)")
     try:
         input_bytes = ctx.content.get_bytes(input_sha)
-    except Exception:
+    except Exception:  # input artifact gone: nothing to escalate, the L1 stands
         return {}
     meta = {"target_sha256": target.sha256, "arch": target.arch, "input_mode": mode,
             "argv": list(argv_base), "level": level, "cwe": "CWE-401",
