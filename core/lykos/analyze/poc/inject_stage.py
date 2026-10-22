@@ -103,6 +103,21 @@ def synthesize_injection_stage(ctx) -> dict:
     call_edges = CallEdgeDAO(ctx.conn).list_by_target(target.id)
     names = {normalize(e.dst_name) for e in call_edges if e.dst_name}
     applicable = {k: v for k, v in injection.PROBES.items() if names & v["sinks"]}
+    # Native Go / Rust injection sinks are managed-runtime symbols (`os_exec.Command`,
+    # `std..process..Command`, `database/sql.(*DB).Query`, ...), not the C libc names in PROBES, so
+    # the set-match above never sees them. The `lang_sinks` detector already recognises them
+    # (substring-matched on the managed symbol) and files a finding carrying the CWE; fold those in
+    # by CWE so inject_stage probes them with the SAME dynamic machinery. Confirmation is still a
+    # real runtime marker, so a Go binary that is NOT actually injectable (e.g. `exec.Command(name)`
+    # with no shell) simply never confirms -- no fabricated finding.
+    _CWE_TO_PROBE = {"CWE-78": "command-injection", "CWE-22": "path-traversal",
+                     "CWE-89": "sql-injection", "CWE-918": "ssrf"}
+    for f in FindingDAO(ctx.conn).list_by_target(target.id):
+        if (f.detector or "") != "lang_sinks":
+            continue
+        pk = _CWE_TO_PROBE.get(f.cwe)
+        if pk and pk not in applicable and pk in injection.PROBES:
+            applicable[pk] = injection.PROBES[pk]
     if not applicable:
         ctx.emit("inject.done", payload={"ok": True, "confirmed": 0,
                  "note": "the binary imports no command/format/file sinks to probe"})

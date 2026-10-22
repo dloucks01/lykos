@@ -96,25 +96,53 @@ _GO_SINKS = (
     ("http.Post", "CWE-918", "medium", "outbound HTTP request to a runtime URL (SSRF)"),
     ("template.HTML", "CWE-79", "medium", "unescaped HTML from a runtime value (XSS)"),
 )
+# Rust std symbols (current rizin renders `::`, e.g. `std::sys::process::unix::common::Command::spawn`;
+# older builds rendered `..`). The command sinks are the EXECUTION methods -- spawn / do_exec / output
+# / status -- not `Command::new`, because the clap arg-parser also has a `Command::new` that never
+# execs, so keying on construction would be a false candidate. Match both separators to survive the
+# rizin rendering change.
 _RUST_SINKS = (
-    ("process..Command", "CWE-78", "high", "OS command execution (std::process::Command)"),
-    ("Command..new", "CWE-78", "high", "OS command execution (std::process::Command::new)"),
+    # The exec/spawn methods are rendered either directly (`...common::Command::spawn`) or through the
+    # trait-impl form (`_<impl ...Command>::do_exec`), which inserts a `>` before `::` -- match both.
+    ("Command::spawn", "CWE-78", "high", "OS command execution (std::process::Command::spawn)"),
+    ("Command>::spawn", "CWE-78", "high", "OS command execution (std::process::Command::spawn)"),
+    ("Command..spawn", "CWE-78", "high", "OS command execution (std::process::Command::spawn)"),
+    ("Command::do_exec", "CWE-78", "high", "OS command execution (std::process::Command exec)"),
+    ("Command>::do_exec", "CWE-78", "high", "OS command execution (std::process::Command exec)"),
+    ("Command..do_exec", "CWE-78", "high", "OS command execution (std::process::Command exec)"),
+    ("Command::output", "CWE-78", "high", "OS command execution (std::process::Command::output)"),
+    ("Command>::output", "CWE-78", "high", "OS command execution (std::process::Command::output)"),
+    ("Command::status", "CWE-78", "high", "OS command execution (std::process::Command::status)"),
+    ("Command>::status", "CWE-78", "high", "OS command execution (std::process::Command::status)"),
+    ("fs::read", "CWE-22", "medium", "file read with a runtime path (std::fs)"),
     ("fs..read", "CWE-22", "medium", "file read with a runtime path (std::fs)"),
+    ("File::open", "CWE-22", "medium", "file open with a runtime path (std::fs::File)"),
     ("File..open", "CWE-22", "medium", "file open with a runtime path (std::fs::File)"),
+    ("File::create", "CWE-22", "medium", "file create with a runtime path"),
     ("File..create", "CWE-22", "medium", "file create with a runtime path"),
 )
 # Untrusted-input sources (call-graph reachability). Go: argv/env/flags, stdin readers, HTTP req.
 _GO_SOURCES = ("os.Args", "os.Getenv", "flag._FlagSet_", "bufio._Reader_.Read", "bufio._Scanner_.",
                "http._Request_", "ioutil.ReadAll", "io.ReadAll", "os.Stdin")
-_RUST_SOURCES = ("env..args", "env..var", "io..stdin", "read_line", "read_to_string")
+_RUST_SOURCES = ("env::args", "env..args", "env::var", "env..var", "io::stdin", "io..stdin",
+                 "read_line", "read_to_string")
+#: a Rust binary's call graph is unmistakable -- symbols carry the `::h<16 hex>` mangling hash, and
+#: the panic runtime (`rust_begin_unwind` / `core::panicking`) is always linked. Used to recognise a
+#: Rust target when triage did not record the toolchain (it often does not for a static Rust ELF).
+_RUST_SIG = re.compile(r"::h[0-9a-f]{16}\b")
 
 
 @register_detector
 def lang_sinks(ctx: DetectContext):
     tc = (ctx.toolchain or "").lower()
-    # detect language from the toolchain hint, or fall back to the call graph (Go has runtime.*).
+    # detect language from the toolchain hint, or fall back to the call graph (Go has runtime.*;
+    # Rust carries the `::h<hex>` symbol mangling and the panic runtime). The fallback matters: a
+    # static Rust/Go ELF often reaches detect with no recorded toolchain, and without it lang_sinks
+    # silently returned nothing on exactly the native-service binaries it exists for.
     is_go = tc == "go" or any("runtime." in (e.dst_name or "") for e in ctx.call_edges)
-    is_rust = tc == "rust"
+    is_rust = not is_go and (tc == "rust" or any(
+        ("rust_begin_unwind" in (e.dst_name or "") or "core::panicking" in (e.dst_name or "")
+         or _RUST_SIG.search(e.dst_name or "")) for e in ctx.call_edges))
     if not (is_go or is_rust):
         return []
     sinks = _GO_SINKS if is_go else _RUST_SINKS
