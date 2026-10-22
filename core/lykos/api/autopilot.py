@@ -71,11 +71,21 @@ class AutopilotMixin:
             if over:
                 over = self._normalize_overrides(over)
             converge = bool(body.get("converge"))
+            # Stages the operator switched OFF for this run (GUI checkboxes). Restricted to a safe
+            # allowlist so a malformed request cannot skip triage/disassembly and hollow out the run;
+            # the search/prove stages can be dropped without breaking the rest (the ladder just has
+            # fewer crash sources). `skip_stages: ["fuzz"]` is "uncheck black-box fuzzing".
+            _skippable = {"fuzz", "coverage_fuzz", "directed_fuzz", "libfuzzer", "concolic"}
+            raw_skip = body.get("skip_stages")
+            skip_stages = (sorted(_skippable & {str(s) for s in raw_skip})
+                           if isinstance(raw_skip, list) else [])
             status["budget_seconds"] = secs
             status["converge"] = converge
+            status["skip_stages"] = skip_stages
             th = threading.Thread(
                 target=orchestrate.run_case_autopilot,
-                args=(self.server.case_dir, cid, target_ids, status, stop, secs, over, converge),
+                args=(self.server.case_dir, cid, target_ids, status, stop, secs, over, converge,
+                      skip_stages),
                 name=f"autopilot-{cid[:8]}", daemon=True)
             AutopilotMixin._AUTOPILOTS[cid] = {"thread": th, "status": status, "stop": stop}
             th.start()

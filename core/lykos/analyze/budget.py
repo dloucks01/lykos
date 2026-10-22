@@ -180,12 +180,18 @@ class CaseBudget:
     """
 
     def __init__(self, total: Optional[float] = None, *, clock=time.monotonic,
-                 overrides: Optional[dict] = None):
+                 overrides: Optional[dict] = None, skip_stages=None):
         #: The operator's invocation facts (argv, seed files, input mode), carried here because
         #: this object is already the per-target run context threaded to every stage call --
         #: `orchestrate._OVERRIDE_SCOPE` decides which stage may be handed which key. They are
         #: knowledge rather than inference, so they win over what the pipeline guesses.
         self.overrides = dict(overrides or {})
+        #: Stages the operator switched OFF for this run (e.g. the black-box `fuzz` stage). The
+        #: autopilot's scheduling chokepoints (`_staged`, `_run_target_stages`) skip these before
+        #: spending any budget, so an operator can drop a stage they do not want on a given run
+        #: without editing the plan. A deliberate operator choice, recorded as a `skipped` plan row
+        #: with that reason -- not a silent omission.
+        self.skip_stages = set(skip_stages or ())
         self.total = float(DEFAULT_TARGET_BUDGET if total is None else total)
         self._clock = clock
         self._start = clock()

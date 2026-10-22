@@ -118,7 +118,7 @@ export const api = {
   scorecard: (caseId) => _req("GET", `/cases/${caseId}/scorecard`),
 
   // Server-side background Autopilot: keeps running after the tab closes.
-  startBackground: (caseId, targetIds, budgetSeconds, overrides, converge) => _req("POST", `/cases/${caseId}/autopilot`, {
+  startBackground: (caseId, targetIds, budgetSeconds, overrides, converge, skipStages) => _req("POST", `/cases/${caseId}/autopilot`, {
     body: {
       target_ids: targetIds,
       ...(budgetSeconds ? { budget_seconds: budgetSeconds } : {}),
@@ -126,6 +126,9 @@ export const api = {
       // Run-to-convergence: keep fuzzing until coverage plateaus rather than stopping at a fixed
       // clock; the minutes then act as the safety ceiling. See doc 47 U1.
       ...(converge ? { converge: true } : {}),
+      // Stages the operator unchecked for this run (e.g. ["fuzz"] = no black-box fuzzing). The
+      // server validates against a safe allowlist before honouring it.
+      ...(skipStages && skipStages.length ? { skip_stages: skipStages } : {}),
     },
   }),
   backgroundStatus: (caseId) => _req("GET", `/cases/${caseId}/autopilot`),

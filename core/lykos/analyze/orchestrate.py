@@ -669,6 +669,13 @@ def _staged(budget, store, target, stage, status, stop, params=None, *, want=Non
     review: `_run_target_stage` still exists for the API's single-stage launches, where the
     stage's registered timeout is the right ceiling.
     """
+    if stage in getattr(budget, "skip_stages", ()):
+        why = "disabled for this run by the operator"
+        if budget is not None:
+            budget.skipped(stage, why)
+        _plan_set(status, stage, "skipped", why)
+        _emit_stage(store, target.case_id, stage, "skipped", target_id=target.id, detail=why)
+        return "skipped"
     over = overrides if overrides is not None else getattr(budget, "overrides", None)
     return _run_target_stage(store, target, stage, status, stop,
                              _apply_overrides(stage, params, over),
@@ -701,6 +708,14 @@ def _run_target_stages(store, target, specs, status, stop, *, budget=None, want=
     for stage, params in specs:
         if stop.is_set():
             break
+        if stage in getattr(budget, "skip_stages", ()):
+            why = "disabled for this run by the operator"
+            if budget is not None:
+                budget.skipped(stage, why)
+            _plan_set(status, stage, "skipped", why)
+            _emit_stage(store, target.case_id, stage, "skipped", target_id=target.id, detail=why)
+            outcomes[stage] = "skipped"
+            continue
         status["stage"] = stage
         status["updated"] = time.time()
         _plan_set(status, stage, "running")
@@ -1585,7 +1600,8 @@ _CONVERGENCE_CEILING_SECONDS = 21600.0
 
 def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                        stop: threading.Event, budget_seconds: Optional[float] = None,
-                       overrides: Optional[dict] = None, converge: bool = False) -> None:
+                       overrides: Optional[dict] = None, converge: bool = False,
+                       skip_stages=None) -> None:
     """The background pipeline. Owns its OWN CaseStore connection (SQLite is per-thread).
 
     `budget_seconds` is the wall clock EACH TARGET gets, divided among the phases by
@@ -1659,7 +1675,7 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
             # panel shows the plateau for the operator to stop on.)
             if converge and budget_seconds is None:
                 eff_budget = _CONVERGENCE_CEILING_SECONDS
-            bud = budget_mod.CaseBudget(eff_budget, overrides=overrides)
+            bud = budget_mod.CaseBudget(eff_budget, overrides=overrides, skip_stages=skip_stages)
             status["budget"] = bud.spent()                # serializable; refreshed as we go
             if not t.file_type:
                 _staged(bud, store, t, "ingest_triage", status, stop)

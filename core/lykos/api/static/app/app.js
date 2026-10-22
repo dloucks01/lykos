@@ -134,6 +134,7 @@ function App() {
   const [bg, setBg] = useState(null);               // server-side background autopilot status
   const [budgetMin, setBudgetMin] = useState("");   // Autopilot budget in MINUTES ("" = size-aware default)
   const [converge, setConverge] = useState(false);  // run-to-convergence (minutes become the ceiling)
+  const [blackBox, setBlackBox] = useState(true);    // include the black-box `fuzz` stage (uncheck to skip)
   const [invArgv, setInvArgv] = useState("");       // operator invocation: argv template, @@ = input file
   const [invMode, setInvMode] = useState("auto");   // input channel: auto|stdin|file|arg|env
   // WHAT THE RUN DID, per target. The UI showed findings with no account of the work behind
@@ -570,11 +571,14 @@ function App() {
       const overrides = {};
       if (invArgv.trim()) overrides.argv = invArgv.trim();
       if (invMode && invMode !== "auto") overrides.input_mode = invMode;
-      await api.startBackground(caseId, targets.map((t) => t.id), secs, overrides, converge);
+      // Stages the operator switched off for this run. Black-box fuzzing is the `fuzz` stage; the
+      // rest of the pipeline (coverage/directed fuzzing, concolic, the whole L-ladder) is unaffected.
+      const skipStages = blackBox ? [] : ["fuzz"];
+      await api.startBackground(caseId, targets.map((t) => t.id), secs, overrides, converge, skipStages);
       setRan(true);
       pollBackground(caseId);
     } catch (e) { setError(e.message || String(e)); }
-  }, [caseId, targets, pollBackground, budgetMin, invArgv, invMode, converge]);
+  }, [caseId, targets, pollBackground, budgetMin, invArgv, invMode, converge, blackBox]);
 
 
   // Upload one or more files. `append` adds to the current case; otherwise it starts fresh.
@@ -867,6 +871,11 @@ function App() {
              title="Run to convergence: keep fuzzing until coverage stops growing (the slider becomes the safety ceiling), instead of stopping at a fixed time. For when you can leave it running.">
         <input type="checkbox" checked=${converge} onChange=${(e) => setConverge(e.target.checked)} />
         <span>run to convergence</span>
+      </label>
+      <label class="converge-field" style="display:inline-flex;gap:4px;align-items:center;margin-left:8px"
+             title="Black-box fuzzing (the built-in `fuzz` stage). Uncheck to skip it for this run — the rest of the pipeline (coverage/directed fuzzing, concolic, the full exploit ladder) still runs. Useful when black-box mutation is just burning budget on this target.">
+        <input type="checkbox" checked=${blackBox} onChange=${(e) => setBlackBox(e.target.checked)} />
+        <span>black-box fuzzing</span>
       </label>
       <label class="inv-field" title="How the binary is really invoked, as a shell string with @@ where the fuzzed input file goes — e.g.  -c @@  or  parse --in @@. Blank = lykos discovers it. This is the single thing that decides whether the fuzzer reaches the parser; it reaches every stage, same as the CLI's --argv.">
         <input type="text" placeholder="invocation (e.g.  -c @@)"
