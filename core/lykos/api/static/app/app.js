@@ -98,7 +98,14 @@ function fuzzSummary(type, p) {
   return bits.length ? bits.join("  ") : type;
 }
 
+// Run options persist across reloads / "New analysis" so an operator who re-runs the same target
+// shape does not retype argv, the libs dir, and the engine choices each time. Best-effort: a private
+// window or blocked storage just falls back to the defaults.
+const RUNOPTS_KEY = "lykos-runopts";
+function loadRunOpts() { try { return JSON.parse(localStorage.getItem(RUNOPTS_KEY) || "{}") || {}; } catch { return {}; } }
+
 function App() {
+  const _ro = loadRunOpts();
   const [caseId, setCaseId] = useState(null);
   const [targets, setTargets] = useState([]);
   const [advice, setAdvice] = useState(null);
@@ -130,19 +137,29 @@ function App() {
   const [disasmFn, setDisasmFn] = useState(null);     // getFunction detail for the Disassembly tab
   const [disasmSel, setDisasmSel] = useState({});     // targetId -> selected function id
   const [diffVerify, setDiffVerify] = useState(null); // poc_diff run result for the Diff tab
+  const [patchDiff, setPatchDiff] = useState(null);   // patch_diff (changed-function localization) result
   const [harnessRun, setHarnessRun] = useState(null); // on-demand harness (deep fn fuzzing) status
   const [bg, setBg] = useState(null);               // server-side background autopilot status
-  const [budgetMin, setBudgetMin] = useState("");   // Autopilot budget in MINUTES ("" = size-aware default)
-  const [converge, setConverge] = useState(false);  // run-to-convergence (minutes become the ceiling)
-  const [blackBox, setBlackBox] = useState(true);    // include the black-box `fuzz` stage (uncheck to skip)
-  const [covFuzz, setCovFuzz] = useState(true);      // coverage-guided (afl qemu-mode) fuzzing
-  const [dirFuzz, setDirFuzz] = useState(true);      // directed fuzzing
-  const [concolicOn, setConcolicOn] = useState(true); // concolic (angr/symqemu) execution
-  const [libfuzzerOn, setLibfuzzerOn] = useState(true); // source libFuzzer campaign
-  const [sysroot, setSysroot] = useState("");        // target-libraries dir -> QEMU_LD_PREFIX
-  const [deepSeed, setDeepSeed] = useState(false);   // aggressive parser-buffer seed synthesis
-  const [invArgv, setInvArgv] = useState("");       // operator invocation: argv template, @@ = input file
-  const [invMode, setInvMode] = useState("auto");   // input channel: auto|stdin|file|arg|env
+  const [budgetMin, setBudgetMin] = useState(_ro.budgetMin ?? "");   // Autopilot budget in MINUTES ("" = size-aware default)
+  const [converge, setConverge] = useState(_ro.converge ?? false);  // run-to-convergence (minutes become the ceiling)
+  const [blackBox, setBlackBox] = useState(_ro.blackBox ?? true);    // include the black-box `fuzz` stage (uncheck to skip)
+  const [covFuzz, setCovFuzz] = useState(_ro.covFuzz ?? true);      // coverage-guided (afl qemu-mode) fuzzing
+  const [dirFuzz, setDirFuzz] = useState(_ro.dirFuzz ?? true);      // directed fuzzing
+  const [concolicOn, setConcolicOn] = useState(_ro.concolicOn ?? true); // concolic (angr/symqemu) execution
+  const [libfuzzerOn, setLibfuzzerOn] = useState(_ro.libfuzzerOn ?? true); // source libFuzzer campaign
+  const [sysroot, setSysroot] = useState(_ro.sysroot ?? "");        // target-libraries dir -> QEMU_LD_PREFIX
+  const [deepSeed, setDeepSeed] = useState(_ro.deepSeed ?? false);   // aggressive parser-buffer seed synthesis
+  const [invArgv, setInvArgv] = useState(_ro.invArgv ?? "");       // operator invocation: argv template, @@ = input file
+  const [invMode, setInvMode] = useState(_ro.invMode ?? "auto");   // input channel: auto|stdin|file|arg|env
+  // Persist the run options so they survive a reload / "New analysis".
+  useEffect(() => {
+    try {
+      localStorage.setItem(RUNOPTS_KEY, JSON.stringify({
+        budgetMin, converge, blackBox, covFuzz, dirFuzz, concolicOn, libfuzzerOn,
+        sysroot, deepSeed, invArgv, invMode }));
+    } catch { /* storage blocked (private window) -- defaults are fine */ }
+  }, [budgetMin, converge, blackBox, covFuzz, dirFuzz, concolicOn, libfuzzerOn,
+      sysroot, deepSeed, invArgv, invMode]);
   // WHAT THE RUN DID, per target. The UI showed findings with no account of the work behind
   // them, and there was no endpoint to ask: the CLI printed this and the HTML report rendered
   // it, while the primary interface could not.
@@ -783,6 +800,21 @@ function App() {
     } catch (e) { setDiffVerify({ key, error: e.message || String(e) }); }
   }, []);
 
+  // Patch-diff (N-day): localize the functions whose body changed between baseline A and build B
+  // (the patch_diff stage), file them as steerable leads, and refresh so they show in the findings.
+  const runPatchDiff = useCallback(async (aId, bId) => {
+    const key = aId + ">" + bId;
+    if (!aId || !bId || aId === bId) { setPatchDiff({ key, error: "pick two different builds" }); return; }
+    setPatchDiff({ key, running: true });
+    try {
+      const run = await api.createRun("patch_diff", { targetId: bId, params: { baseline_target_id: aId } });
+      await waitForRun(run.run_id);
+      const out = await api.runOutput(run.run_id);
+      setPatchDiff({ key, data: (out && out.output) || { leads: 0, changed: 0 } });
+      refreshResults(caseId, targets);
+    } catch (e) { setPatchDiff({ key, error: e.message || String(e) }); }
+  }, [caseId, targets, refreshResults]);
+
   // Operator-initiated DEEP FUNCTION FUZZING (the harness stage: T1 rank -> T2 drive -> T4
   // constant-dict -> T5 DoS oracle -> T6 stateful sequences). Deliberately NOT part of the default
   // run (operator steer: not every binary wants per-function fuzzing); the operator triggers it on
@@ -1190,7 +1222,7 @@ function App() {
                 ${cveFindings.map(cardFor)}
               </div>
             ` : tab === "diff" ? html`
-              <div class="wb-panel"><${DiffPanel} targets=${targets} findings=${ranked} onVerify=${runPocDiff} verify=${diffVerify} /></div>
+              <div class="wb-panel"><${DiffPanel} targets=${targets} findings=${ranked} onVerify=${runPocDiff} verify=${diffVerify} onPatchDiff=${runPatchDiff} patch=${patchDiff} /></div>
             ` : tab === "console" ? html`
               <div class="wb-panel">
                 ${bg && bg.plan ? html`<${PipelinePlan} plan=${bg.plan} targetName=${bg.target_name} target=${bg.target} targets=${bg.targets} now=${bg.now} />` : null}

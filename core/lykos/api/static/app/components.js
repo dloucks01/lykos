@@ -1361,7 +1361,7 @@ function diffRowVerdict(r) {
   }
   return r.reproduced ? "still faults (" + (r.signal || "crash") + ")" : "no fault";
 }
-export function DiffPanel({ targets, findings, onVerify, verify }) {
+export function DiffPanel({ targets, findings, onVerify, verify, onPatchDiff, patch }) {
   const ts = targets || [];
   const [a, setA] = useState(ts[0] && ts[0].id);
   const [b, setB] = useState(ts[1] && ts[1].id);
@@ -1384,10 +1384,24 @@ export function DiffPanel({ targets, findings, onVerify, verify }) {
         <span style="color:var(--faint)">→</span>
         <span style="color:var(--muted);font-size:.8rem">B</span>
         <select class="diff-sel" value=${b} onChange=${(e) => setB(e.target.value)}>${ts.map((t) => html`<option value=${t.id} key=${t.id}>${t.filename}</option>`)}</select>
-        ${onVerify ? html`<button class="btn small primary" style="margin-left:auto"
+        ${onPatchDiff ? html`<button class="btn small" style="margin-left:auto"
+          title="Patch-diff: localize the functions whose body changed between A (baseline) and B, and file them as leads the search then steers at (N-day)."
+          disabled=${patch && patch.running} onClick=${() => onPatchDiff(a, b)}>
+          ${patch && patch.running ? "Diffing…" : "Find changed functions"}</button>` : null}
+        ${onVerify ? html`<button class="btn small primary" style=${onPatchDiff ? "" : "margin-left:auto"}
           disabled=${verify && verify.running} onClick=${() => onVerify(a, b)}>
           ${verify && verify.running ? "Verifying…" : "Verify fix — re-run A's PoCs on B"}</button>` : null}
       </div>
+      ${patch && patch.key === a + ">" + b ? (patch.running
+        ? html`<${Spinner} label=${`Diffing ${name(a)} → ${name(b)} for changed functions…`} />`
+        : patch.error ? html`<div class="cat-intro">Patch-diff failed: ${patch.error}</div>`
+        : patch.data ? html`<div class="diff-verify dv-fixed">
+            ${(patch.data.leads || 0) > 0
+              ? `${patch.data.leads} changed function(s) localized as leads — the search now steers at them (see Findings).`
+              : ((patch.data.changed || 0) > 0
+                 ? `${patch.data.changed} function(s) changed, but none carried a usable address to steer at.`
+                 : "No changed functions between these builds (or one side isn't disassembled yet).")}
+          </div>` : null) : null}
       ${verify && verify.key === a + ">" + b ? (verify.running
         ? html`<${Spinner} label=${`Re-running ${name(a)}'s PoC inputs against ${name(b)}…`} />`
         : verify.error ? html`<div class="cat-intro">Verification failed: ${verify.error}</div>`
