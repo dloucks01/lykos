@@ -929,6 +929,144 @@ def scanf_bounded_overflow(ctx: DetectContext):
     return out
 
 
+# ---------------------------------------------------------------- format string (CWE-134) --------
+# A variadic format function whose format is NOT a string literal AND that is called with zero
+# format arguments -- `printf(buf)` where a correct call would be `printf("%s", buf)`. This is
+# exactly GCC's `-Wformat-security` / `-Wformat=2` shape, and it is a security bug class on its own:
+# if that run-time format is attacker-influenced the `%n`/`%s`/`%p` conversions give an arbitrary
+# read and write, and even when it is not, a stray `%` corrupts output. It is reported precisely
+# WITHOUT taint analysis because it rests on two STRUCTURAL facts, not an inferred dataflow:
+#   (1) the format register is fed by a run-time value -- a pointer loaded from memory, or the
+#       address of a stack buffer -- NOT the address of a `.rodata` constant string (a `lea` of a
+#       `str.`/RIP-relative operand). This is what excludes the one false positive the naive
+#       "non-literal format" rule produces: `printf(cond ? "a" : "b")` selects between two rodata
+#       `lea`s, so it classifies as a literal and is never flagged.
+#   (2) no format ARGUMENT register is set up in the call's argument window (the instructions since
+#       the previous call). `printf("%s", buf)` writes rsi, so it is excluded; `printf(buf)` does
+#       not, so it is the flagged shape.
+# Deliberately NOT built the naive way (flagging every non-literal format) -- that fabricates FPs,
+# which the precision rule forbids. The v* family (vprintf/vfprintf/...) is excluded: it always
+# carries a va_list argument, so (2) never holds, and a `void log(const char*f,...){vfprintf(..,f,ap);}`
+# wrapper -- the CORRECT pattern -- would otherwise be a huge FP source. Indeterminate provenance
+# (format from a call return, a bare parameter, arithmetic) is skipped, not guessed: a false
+# negative is acceptable, a fabricated finding is not. x86-64 only (the provenance scan is Intel).
+_FMT_FUNCS = {                                   # name -> (format-arg register, the registers AFTER it)
+    "printf":   ("rdi", ("rsi", "rdx", "rcx", "r8", "r9")),
+    "fprintf":  ("rsi", ("rdx", "rcx", "r8", "r9")),
+    "dprintf":  ("rsi", ("rdx", "rcx", "r8", "r9")),
+    "sprintf":  ("rsi", ("rdx", "rcx", "r8", "r9")),
+    "snprintf": ("rdx", ("rcx", "r8", "r9")),
+    "syslog":   ("rsi", ("rdx", "rcx", "r8", "r9")),
+}
+_ARGREG_SUBS = {
+    "rdi": {"rdi", "edi", "di", "dil"},
+    "rsi": {"rsi", "esi", "si", "sil"},
+    "rdx": {"rdx", "edx", "dx", "dl"},
+    "rcx": {"rcx", "ecx", "cx", "cl"},
+    "r8":  {"r8", "r8d", "r8w", "r8b"},
+    "r9":  {"r9", "r9d", "r9w", "r9b"},
+}
+
+
+def _fmt_source_class(texts, reg: str, slot_names=None):
+    """Classify what feeds the format register `reg` at a printf-family call (scanning `texts`,
+    the instructions before the call, newest definition wins, one reg-to-reg move hop allowed):
+
+      'literal' -- the address of a constant string: `lea reg, str.x` / `lea reg,[rip+..]`. SAFE.
+      'dynamic' -- a run-time value: a pointer loaded from memory (`mov reg,[..]`) or the address
+                   of a stack buffer (`lea reg,[rbp-..]`/a named frame slot). The CWE-134 shape.
+      None      -- indeterminate (reg set by a call return / a bare register / arithmetic / an
+                   immediate address). NOT flagged -- precision over recall."""
+    cur = reg
+    for _ in range(2):                                # at most one mov hop, then the defining instr
+        for t in reversed(texts):
+            body = t.split(";")[0]
+            m = re.match(r"\s*lea\s+" + re.escape(cur) + r"\s*,\s*(.+)$", body, re.I)
+            if m:
+                tgt = m.group(1)
+                if _R2_STR_SYM.search(tgt) or "rip" in tgt.lower():
+                    return "literal"                  # &"...": a constant rodata string
+                if re.search(r"\brbp\b|\brsp\b", tgt, re.I):
+                    return "dynamic"                  # &stack_buffer -> printf(local_buf)
+                if slot_names:
+                    mn = re.search(r"\[\s*(?:[a-z]+\s+)?([A-Za-z_][\w.]*)\s*\]", tgt)
+                    if mn and mn.group(1) in slot_names:
+                        return "dynamic"              # &named frame local
+                return "literal"                      # unknown lea target -> assume const (no FP)
+            if re.match(r"\s*mov\s+" + re.escape(cur) + r"\s*,\s*(?:[a-z]+\s+)?\[", body, re.I):
+                return "dynamic"                      # pointer loaded from memory (a variable/global)
+            mv = re.match(r"\s*mov\s+" + re.escape(cur) + r"\s*,\s*([a-z0-9]+)\s*$", body, re.I)
+            if mv and mv.group(1).lower() in _X86_REGS:
+                cur = mv.group(1).lower()
+                break                                 # follow the move, re-scan for the new register
+            if re.match(r"\s*(mov|movabs|lea|add|sub|xor|or|and|pop|imul|call)\s+"
+                        + re.escape(cur) + r"\b", body, re.I):
+                return None                           # defined by something we cannot call a literal
+        else:
+            return None
+    return None
+
+
+def _writes_arg_reg(texts, regs) -> bool:
+    """True if any register in `regs` (or a sub-register of it) is a DESTINATION operand in
+    `texts` -- i.e. a format argument was set up. Err toward True (a false 'has an argument' only
+    costs a missed finding, never a fabricated one)."""
+    subs = set()
+    for r in regs:
+        subs |= _ARGREG_SUBS[r]
+    for t in texts:
+        b = t.split(";")[0]
+        m = re.match(r"\s*[a-z]+\s+([a-z0-9]+)\s*,", b, re.I)    # dest = first operand
+        if m and m.group(1).lower() in subs:
+            return True
+    return False
+
+
+@register_detector
+def format_string(ctx: DetectContext):
+    if not (_is_x86(ctx.arch) and ctx.bits == 64) or not ctx.func_irs:
+        return []
+    out = []
+    for faddr, ir in ctx.func_irs.items():
+        frame = ctx.frames.get(faddr) or {}
+        slot_names = {v["name"]: int(v["offset"]) for v in (frame.get("vars") or [])
+                      if v.get("name") and v.get("offset") is not None}
+        flat = [(i.get("addr"), (i.get("text") or ""))
+                for b in ir.get("blocks", []) or [] for i in (b.get("instructions") or [])]
+        texts = [t for _, t in flat]
+        for idx, (addr, text) in enumerate(flat):
+            name = _norm_call(text)
+            if name not in _FMT_FUNCS:
+                continue
+            fmt_reg, following = _FMT_FUNCS[name]
+            pre = texts[:idx]
+            if _fmt_source_class(pre, fmt_reg, slot_names) != "dynamic":
+                continue                              # literal or indeterminate -> not a bug we prove
+            # the argument set-up window: instructions since the previous call. A written following
+            # arg register means a format argument was passed -> printf(fmt, x), not printf(x).
+            win = []
+            for b in reversed(pre):
+                if re.search(r"\bcall\b", b.split(";")[0], re.I):
+                    break
+                win.append(b)
+            if _writes_arg_reg(win, following):
+                continue
+            out.append(_cand(
+                "CWE-134",
+                f"Non-literal format string with no arguments passed to {name}()",
+                "high", "format_string",
+                [{"channel": "pattern",
+                  "detail": (f"{name}() at {addr} takes its format from a run-time value (not a "
+                             f"string literal) and is called with no format arguments -- the GCC "
+                             f"-Wformat-security shape. If that value is attacker-influenced the "
+                             f"%n/%s/%p conversions yield an arbitrary read and write (CWE-134); "
+                             f"the format's provenance is structural here, not taint-proven")}],
+                function_addr=faddr, site_addr=addr,
+                site_detail=f"{name}(<non-literal format>) with zero format arguments",
+                dedup_key=f"CWE-134:format_string:{name}", confidence=0.5))
+    return out
+
+
 # ---------------------------- indirect call through a function pointer stored in an object field
 # `call *[obj+off]` (or `mov r,[obj+off]; call r`) invokes a function pointer read from writable
 # memory. When `obj` is a heap allocation whose contents an attacker can corrupt -- a UAF, a heap
