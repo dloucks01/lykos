@@ -70,10 +70,12 @@ class AutopilotMixin:
             over = body.get("overrides") if isinstance(body.get("overrides"), dict) else None
             if over:
                 over = self._normalize_overrides(over)
+            converge = bool(body.get("converge"))
             status["budget_seconds"] = secs
+            status["converge"] = converge
             th = threading.Thread(
                 target=orchestrate.run_case_autopilot,
-                args=(self.server.case_dir, cid, target_ids, status, stop, secs, over),
+                args=(self.server.case_dir, cid, target_ids, status, stop, secs, over, converge),
                 name=f"autopilot-{cid[:8]}", daemon=True)
             AutopilotMixin._AUTOPILOTS[cid] = {"thread": th, "status": status, "stop": stop}
             th.start()

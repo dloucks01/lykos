@@ -129,27 +129,32 @@ finding is running blind to it.
 
 ---
 
-## U1 — Mode slider: Quick / Standard / Thorough   `[ ] TODO`
+## U1 — Run depth: a minutes slider + a run-to-convergence checkbox   `[~] IN PROGRESS`
 
-**Goal.** A slider in the GUI (three labeled detents) that sets run depth; drives the **server-side
+**Design (operator's call):** a single **slider in minutes** plus a **run-to-convergence checkbox**
+— clearer than three detents (no ambiguous "half-converged" position). Drives the **server-side
 background autopilot** (`startBackground`, the mature phase/budget model), not a duplicated JS one.
+Unchecked → the minutes are a hard wall-clock budget (exact ETA countdown). Checked → the minutes
+become the **safety ceiling** and the search runs until coverage plateaus. Non-fuzz analysis is
+**complete either way** — only fuzzing depth changes.
 
-| Mode | Non-fuzz | Fuzzing | Stop condition | ETA |
-|---|---|---|---|---|
-| **Quick** | full | smart engines (directed → concolic → coverage) + a short blind slice (~60-90s) | ~10 min cap | exact countdown |
-| **Standard** | full | all engines, time-boxed | ~20-30 min cap (default) | exact countdown |
-| **Thorough** | full | all engines → **run to coverage convergence** | coverage plateau; hard safety ceiling (default 6h, editable) | plateau/trend, not a false countdown |
+- [x] **GUI control + plumbing** — minutes slider (5–120) with a live readout; `run to convergence`
+      checkbox (slider relabels "budget"→"ceiling"); `api.startBackground(..., converge)` →
+      `POST /autopilot {converge}` → `_start_autopilot` → `run_case_autopilot(converge=)` →
+      `status["converge"]`. In convergence mode the per-target budget is the ceiling (slider minutes,
+      or a 6h default when blank). JS + py imports clean; 12 autopilot tests green.
+- [ ] **U1-engine · coverage-plateau auto-stop + stalled-engine auto-skip** (the real convergence).
+      Today convergence runs to the ceiling and the live coverage/health panel shows the plateau for
+      the operator to stop on; next, stop the search phase automatically when coverage has not grown
+      for a window (healthy rate) and auto-skip a campaign whose rate collapsed / heartbeat stopped
+      (Stalled/hung — see U2). ADDITIVE: only affects `converge=True` runs, so the existing
+      conformance (all `converge=False`) is unaffected and the single-case guard suffices.
+- [ ] (dropped) Quick/Standard/Thorough detents + Quick's smart-only+blind-slice profile — folded
+      into "pick fewer minutes" + the checkbox; revisit only if the operator wants named presets.
 
-- [ ] Slider UI with the three detents + a live readout of the concrete meaning (minutes, or "until
-      convergence"); minutes nudgeable for Quick/Standard.
-- [ ] Quick keeps a small blind slice (not smart-only) — catches shallow surface bugs cheaply.
-- [ ] Server budget profiles for Quick/Standard (smart-engine priority in Quick).
-- [ ] Thorough = convergence mode: search runs until coverage plateaus (no new edge for N min),
-      bounded by a hard safety ceiling.
-- [ ] Non-fuzz analysis is **complete in every mode** — only fuzzing depth varies.
-
-**Acceptance.** Picking a mode visibly changes the budget/behavior; Quick finishes ~10 min with full
-non-fuzz + a crash hunt; Thorough runs to a reported convergence and stops.
+**Acceptance.** The checkbox visibly switches budget↔ceiling; a convergence run keeps fuzzing past a
+fixed clock and (U1-engine) stops itself when coverage plateaus; non-fuzz findings are complete in
+both modes.
 
 ---
 

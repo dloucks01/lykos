@@ -118,11 +118,14 @@ export const api = {
   scorecard: (caseId) => _req("GET", `/cases/${caseId}/scorecard`),
 
   // Server-side background Autopilot: keeps running after the tab closes.
-  startBackground: (caseId, targetIds, budgetSeconds, overrides) => _req("POST", `/cases/${caseId}/autopilot`, {
+  startBackground: (caseId, targetIds, budgetSeconds, overrides, converge) => _req("POST", `/cases/${caseId}/autopilot`, {
     body: {
       target_ids: targetIds,
       ...(budgetSeconds ? { budget_seconds: budgetSeconds } : {}),
       ...(overrides && Object.keys(overrides).length ? { overrides } : {}),
+      // Run-to-convergence: keep fuzzing until coverage plateaus rather than stopping at a fixed
+      // clock; the minutes then act as the safety ceiling. See doc 47 U1.
+      ...(converge ? { converge: true } : {}),
     },
   }),
   backgroundStatus: (caseId) => _req("GET", `/cases/${caseId}/autopilot`),

@@ -1567,9 +1567,14 @@ _LARGE_BINARY_MB = 40
 _HUGE_BINARY_MB = 90
 
 
+#: Default safety ceiling for a run-to-convergence run when the operator set no minutes: a long but
+#: bounded campaign (6h), so a wedged/slow target cannot run forever.
+_CONVERGENCE_CEILING_SECONDS = 21600.0
+
+
 def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                        stop: threading.Event, budget_seconds: Optional[float] = None,
-                       overrides: Optional[dict] = None) -> None:
+                       overrides: Optional[dict] = None, converge: bool = False) -> None:
     """The background pipeline. Owns its OWN CaseStore connection (SQLite is per-thread).
 
     `budget_seconds` is the wall clock EACH TARGET gets, divided among the phases by
@@ -1581,7 +1586,8 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
     """
     store = CaseStore(case_dir)
     try:
-        status.update({"state": "running", "targets": len(target_ids), "started": time.time()})
+        status.update({"state": "running", "targets": len(target_ids), "started": time.time(),
+                        "converge": bool(converge)})
         # Worklist, not a fixed loop: a firmware image is a CONTAINER whose embedded binaries are
         # discovered mid-run (firmware_carve registers them as sub-targets). Those get appended and
         # analysed in the same pass.
@@ -1634,6 +1640,14 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                 _mb = (t.size or 0) / 1_000_000.0
                 eff_budget = max(budget_mod.DEFAULT_TARGET_BUDGET,
                                  min(21600.0, budget_mod.DEFAULT_TARGET_BUDGET + _mb * 120.0))
+            # Run-to-convergence (doc 47 U1): the budget is a SAFETY CEILING, not a target -- the
+            # operator's intent is "keep going until coverage plateaus". The slider's minutes are
+            # that ceiling when given; with none, use a high default (6h) so a long campaign is
+            # bounded but not cut short. (The coverage-plateau auto-stop + stalled-engine auto-skip
+            # is the next increment; today the run uses the ceiling and the live coverage/health
+            # panel shows the plateau for the operator to stop on.)
+            if converge and budget_seconds is None:
+                eff_budget = _CONVERGENCE_CEILING_SECONDS
             bud = budget_mod.CaseBudget(eff_budget, overrides=overrides)
             status["budget"] = bud.spent()                # serializable; refreshed as we go
             if not t.file_type:
