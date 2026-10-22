@@ -133,6 +133,38 @@ of the program is covered, and whether it's progressing / done / stuck — witho
 
 ---
 
+---
+
+## Carried-over / parallel open items (deeper-analysis capability — detail in doc 46)
+
+These are **not** part of the timed-engagement UX line above, but they are open and must not be lost.
+Full design + evidence live in `docs/internal/46-deeper-binary-analysis-program-2026-10-21.md`;
+tracked here so there is one index. Several of these feed the reliability work (e.g. the taint
+upgrade improves what the non-fuzz recover phase can confirm).
+
+- [ ] **(b) Taint-engine memory / points-to upgrade** — `AGREED NEXT after (a)`. `detect/taint.py` is
+      register-granularity, so static dataflow cannot confirm a buffer-content injection reaching a
+      daemon parser (avenue #1 is WALLED by this). Upgrade to a memory/points-to model
+      (buffer-pointer-param taint, mirroring the heap-region model), gated + A/B-able +
+      conformance-guarded. Design scoped in doc 46 "Engine-extension design". **Not started.**
+- [ ] **Avenue #1 — static injection confirmation** — blocked on (b); unblocks once the taint engine
+      tracks buffer-pointer taint.
+- [x] **Avenue #2 — N-day fingerprinting (first increment)** — DT_NEEDED BOM + dependency-.so banner
+      scan + CVE match, commit `f876e40` (validated on asterisk: OpenSSL 3.5.5 + 27 CVEs).
+- [ ] **Avenue #2 extension** — main-binary structural / FLIRT version fingerprinting (identify the
+      product+version of the MAIN binary, not just its linked deps). **Not started.**
+- [ ] **Avenue #3 — structural decompiler queries** (weggli/structural pattern queries over recovered
+      code). **Not started.**
+- [ ] **Avenue #4 — logic / auth bugs** (broken-contract checks beyond memory safety). **Not started.**
+- [x] **Avenue #5 — exploit composition on stripped (partial)** — the (a) ret2win shell-call fix is
+      one increment; more composition work possible.
+- [x] **Harness track T1 / T2** — T1 fuzz-worthiness ranker + T2 emulated single-function executor +
+      coverage-guided loop + the `harness` stage (NOT in the default plan yet). Commits per doc 46.
+- [ ] **Harness track T3-T6** — T3 sink-directed concolic (reachability certificates), T4 constant/
+      grammar-guided input, T5 richer oracles, T6 state-machine / sequence driving. **Not started.**
+- [ ] **Wire the `harness` stage into the default autopilot plan** (currently registered + in the
+      stage map but not in the default pipeline) — overlaps with I1.
+
 ## Done
 
 - [x] **(a) Single-address ret2win to an in-image shell call** (stripped/no-PIE, NUL-safe) —
