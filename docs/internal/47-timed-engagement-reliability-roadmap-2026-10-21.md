@@ -216,11 +216,20 @@ Full design + evidence live in `docs/internal/46-deeper-binary-analysis-program-
 tracked here so there is one index. Several of these feed the reliability work (e.g. the taint
 upgrade improves what the non-fuzz recover phase can confirm).
 
-- [ ] **(b) Taint-engine memory / points-to upgrade** — `AGREED NEXT after (a)`. `detect/taint.py` is
-      register-granularity, so static dataflow cannot confirm a buffer-content injection reaching a
-      daemon parser (avenue #1 is WALLED by this). Upgrade to a memory/points-to model
-      (buffer-pointer-param taint, mirroring the heap-region model), gated + A/B-able +
-      conformance-guarded. Design scoped in doc 46 "Engine-extension design". **Not started.**
+- [x] **(b) Taint-engine buffer-pointer-param taint** — DONE, done right. The empirical finding
+      REFINED the design: the engine already PROPAGATES taint from a seeded buffer-pointer param
+      (stack-spill tracking + the load-through-tainted-pointer rule), verified on the daemon-parser
+      shape. The real gap was SEEDING — the stage only seeds `argv` at `main` (or every export for a
+      `.so`), so a parser reached by a callback/dispatch in an executable is never seeded and its
+      sinks are invisible (avenue #1's wall). Fix: `_parser_buffer_seeds` seeds the T1-RANKED parser
+      entries' buffer parameter (recovered pointer params, or arg 0 on a stripped build) as
+      attacker-controlled; a second A/B pass diffs the new sink sites and files them as honest
+      CANDIDATES (attacker-reachability ASSUMED, never corroborated), with a `taint-buffer-param`
+      evidence note. Gated by `LYKOS_BUFFER_SEED`. **Validated:** recovers a callback-reached
+      parser's injection a register-only + export-fallback run misses (unit + stage A/B tests);
+      corroborated precision 1.000 UNCHANGED on the eval benchmark with it on (no fabrication);
+      29 taint+ranker tests green. *(Default off/opt-in until a full conformance green; enabling by
+      default is then a one-line change.)*
 - [ ] **Avenue #1 — static injection confirmation** — blocked on (b); unblocks once the taint engine
       tracks buffer-pointer taint.
 - [x] **Avenue #2 — N-day fingerprinting (first increment)** — DT_NEEDED BOM + dependency-.so banner

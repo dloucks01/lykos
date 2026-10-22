@@ -351,6 +351,54 @@ def _export_seeds(ctx, target, functions, func_irs):
     return seeds, len(seeds)
 
 
+#: Cap on buffer-pointer-seeded parser entries (like _MAX_EXPORT_SEEDS): seeding every ranked
+#: function would re-taint half the program and its candidate findings would be noise.
+_MAX_BUFFER_SEEDS = 24
+
+
+def _parser_buffer_seeds(ctx, target, functions) -> dict:
+    """{func addr: {pointer-param index}} -- the (b) BUFFER-POINTER seed (doc 46).
+
+    A parser reached only through a callback / dispatch / vtable has no static call edge from an
+    input source, so the source->sink flow never reaches it and its sinks are invisible -- the
+    daemon-parser gap behind avenue #1. The engine CAN propagate taint from a buffer-pointer param
+    (verified: a seeded param flows to the sink); the stage just never seeds a non-`main` entry.
+    The T1 ranker already finds the parser-shaped functions (a pointer param AND a dangerous sink);
+    seed their BUFFER parameter as attacker-controlled. Findings from these seeds are tiered as
+    CANDIDATES by the caller -- attacker-reachability is ASSUMED, not demonstrated. Gated behind
+    LYKOS_BUFFER_SEED so the precision effect is measurable before/after; empty when off."""
+    import os as _os
+    if _os.environ.get("LYKOS_BUFFER_SEED", "0") != "1":
+        return {}
+    try:
+        from ..harness.rank import _to_int, rank_functions
+        ranked = rank_functions(ctx.conn, target.id, top=_MAX_BUFFER_SEEDS * 2)
+    except Exception:                                    # noqa: BLE001 -- ranking is best-effort
+        observe.absorbed(_log, "no ranker for buffer seeds")
+        return {}
+    # The ranker keys by INT address; func_irs / entry_seeds key by the function table's `.addr`
+    # (a hex string). Map back, or the seed silently matches nothing and the feature is a no-op.
+    by_int = {}
+    for f in functions:
+        ai = _to_int(getattr(f, "addr", None))
+        if ai is not None:
+            by_int[ai] = f.addr
+    seeds: dict = {}
+    for rf in ranked:
+        # A PARSER shape: it reaches a dangerous sink. Seed the recovered pointer (buffer) params;
+        # on a STRIPPED binary the decompiler recovers no param types (ptr_params empty), which is
+        # the common real-engagement case -- fall back to arg 0, where a parser's input buffer
+        # conventionally sits. Conservative: only ranked, sink-reaching functions, and the findings
+        # are tiered CANDIDATES (attacker-reachability assumed).
+        key = by_int.get(rf.addr)
+        if key is None or not rf.sinks:
+            continue
+        seeds[key] = set(rf.ptr_params) if rf.ptr_params else {0}
+        if len(seeds) >= _MAX_BUFFER_SEEDS:
+            break
+    return seeds
+
+
 def _detect_jvm(ctx, target) -> dict:
     """Detection for a Java target, which has no machine code for the P-Code channels.
 
@@ -666,6 +714,7 @@ def detect_stage(ctx) -> dict:
     # deliberate deep run.
     taint_cap = int(p_det.get("max_taint_functions") or taint._MAX_FUNCS)
     taint_skipped = None
+    buffer_only = set()                   # (b) sink sites reached ONLY from a seeded buffer param
     if not taint._arch_key(target.arch):
         # No ABI model for this arch (e.g. mips64/s390x/sparc64 that ingest still accepts):
         # analyze_program would return an empty set with no notice, indistinguishable from
@@ -708,6 +757,24 @@ def detect_stage(ctx) -> dict:
                                               entry_seeds=entry_seeds, mem_out=derefs,
                                               max_funcs=taint_cap, skipped_out=oversized,
                                               heap_regions=heap_regions)
+        # (b) BUFFER-POINTER SEED: a parser reached only via a callback/dispatch gets no source->
+        # sink flow, so its sinks are invisible. Re-run with the ranked parser entries' buffer
+        # params seeded as attacker-controlled; the NEW sites (not already reached by a real source)
+        # are tiered as CANDIDATES below -- attacker-reachability ASSUMED, never corroborated.
+        _buf_seeds = _parser_buffer_seeds(ctx, target, dctx.functions)
+        if _buf_seeds:
+            _merged = {a: set(idx) for a, idx in (entry_seeds or {}).items()}
+            for a, idx in _buf_seeds.items():
+                _merged[a] = _merged.get(a, set()) | set(idx)
+            _with_buf = taint.analyze_program(func_irs, dctx.call_edges, target.arch,
+                                              entry_seeds=_merged, max_funcs=taint_cap,
+                                              heap_regions=heap_regions)
+            buffer_only = set(_with_buf) - set(tainted_sites)
+            ctx.emit("taint.buffer_seed", payload={
+                "seeded_parsers": len(_buf_seeds), "new_sites": len(buffer_only),
+                "note": ("ranked parser entries' buffer parameters seeded as attacker-controlled; "
+                         "the new sink sites are filed as candidates (attacker-reachability assumed, "
+                         "not demonstrated)")})
         if oversized:
             # One level down from the whole-analysis ceiling: a single function past the block
             # limit is skipped entire, and "no tainted flow here" was indistinguishable from
@@ -726,7 +793,7 @@ def detect_stage(ctx) -> dict:
     # whose call to a dangerous sink taint reaches
     touched = {d["function_addr"] for d in derefs}
     touched |= {c["function_addr"] for c in cands
-                if c.get("site_addr") in tainted_sites and c.get("function_addr")}
+                if c.get("site_addr") in (set(tainted_sites) | buffer_only) and c.get("function_addr")}
     # P1.4: argc is a size/range source, not data-flow taint -- so scan the entry function (which
     # receives argc) for the integer-overflow/allocation shapes without pushing taint through every
     # argc guard. entry_seeds keys are the argv/argc entry points.
@@ -750,6 +817,19 @@ def detect_stage(ctx) -> dict:
             c["evidence"].append({"channel": "taint-dataflow",
                                   "detail": "tainted value reaches a sink argument "
                                             "(intra-procedural P-Code taint)"})
+        elif c["detector"] == "dangerous_api" and c.get("site_addr") in buffer_only:
+            # (b) buffer-pointer seed: a dangerous sink reachable from this function's BUFFER
+            # PARAMETER, but reached by NO demonstrated input source -- the function has a parser
+            # shape (pointer param + sink) and is likely driven via a callback/dispatch the call
+            # graph does not see. Honest CANDIDATE: attacker-reachability is assumed, not shown, so
+            # it is NOT promoted to corroborated. A modest confidence bump above a bare rule hit.
+            c["confidence"] = max(c["confidence"], 0.55)
+            c["evidence"].append({"channel": "taint-buffer-param",
+                                  "detail": "a dangerous sink is reachable from this function's "
+                                            "buffer parameter; the function has a parser shape "
+                                            "(pointer arg + sink) but no demonstrated input source "
+                                            "reaches it, so attacker-reachability is ASSUMED "
+                                            "(likely a callback/dispatch-reached parser)"})
 
     # Bounds channel: can this copy actually exceed its destination? The rule channel flags
     # every memcpy/strncpy and the taint channel confirms "attacker data reaches it", which on

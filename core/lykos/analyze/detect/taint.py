@@ -10,8 +10,11 @@ Taint origins are (a) calls to catalog.SOURCES (read/fgets/getenv/...) and (b) t
 point's own parameters -- argv/envp, which the loader hands to main with no call site to
 observe (see catalog.ENTRY_PARAM_SOURCES).
 
-Honest limits: register-granularity (no precise memory/points-to model, so buffer taint via
-pointer args is not tracked) and raw low-P-Code (call args inferred from ABI registers).
+Memory model: register-granularity, plus constant-offset frame SLOTS, HEAP REGIONS (a tainted store
+through a known heap-pointer slot taints the allocation), and -- when a pointer PARAMETER is seeded
+as attacker-controlled (SOURCE out-buffers, and the ranked parser entries under LYKOS_BUFFER_SEED,
+doc 46 (b)) -- taint flows through its dereferences via the load-through-tainted-pointer rule. Not a
+full points-to model. Raw low-P-Code: call args inferred from ABI registers.
 Path-insensitive: a flow guarded by a correct bounds check still reports as a flow, because
 the analysis models where attacker bytes GO, not whether the destination is large enough.
 """

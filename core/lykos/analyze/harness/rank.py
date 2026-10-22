@@ -63,6 +63,14 @@ def _ptr_len_confidence(param_types: list) -> int:
     return (2 if (has_ptr and has_len) else 1 if has_ptr else 0)
 
 
+def _ptr_param_indices(param_types: list) -> list:
+    """Indices of the pointer-to-bytes parameters -- the buffer(s) a parser reads. Used by the
+    taint channel's buffer-pointer seeding (doc 46 (b)): a parser reached only through a
+    callback/dispatch gets no source->sink flow, so its buffer param is seeded as attacker-controlled."""
+    return [i for i, t in enumerate(param_types)
+            if ("*" in t) or any(h in t for h in _PTR_HINTS)]
+
+
 @dataclass
 class RankedFn:
     addr: int
@@ -73,11 +81,13 @@ class RankedFn:
     sources: list = field(default_factory=list)      # input-reading callees (recv/read/fgets/...)
     sinks: list = field(default_factory=list)         # dangerous callees (strcpy/memcpy/system/...)
     ptr_len: int = 0                                  # harnessable-shape confidence (0..2)
+    ptr_params: list = field(default_factory=list)    # indices of the pointer (buffer) parameters
 
     def as_dict(self) -> dict[str, Any]:
         return {"addr": hex(self.addr), "name": self.name, "size": self.size, "score": self.score,
                 "reasons": self.reasons, "sources": sorted(set(self.sources)),
-                "sinks": sorted(set(self.sinks)), "ptr_len": self.ptr_len}
+                "sinks": sorted(set(self.sinks)), "ptr_len": self.ptr_len,
+                "ptr_params": list(self.ptr_params)}
 
 
 # Score weights. Ingesting input is the strongest signal (that is where attacker bytes ENTER, the
@@ -161,7 +171,8 @@ def rank_functions(conn, target_id: str, *, top: int = 40) -> list[RankedFn]:
             reasons.append("an input-reaches-a-pointer/index finding is sited here")
         ranked.append(RankedFn(addr=f["lo"], name=f["name"], size=f["size"], score=score,
                                reasons=reasons, sources=sorted(f["sources"]),
-                               sinks=sorted(f["sinks"]), ptr_len=f["ptr_len"]))
+                               sinks=sorted(f["sinks"]), ptr_len=f["ptr_len"],
+                               ptr_params=list(f.get("ptr_params") or [])))
     # A function only worth ranking if it has ANY signal; a scoreless function is noise.
     ranked = [r for r in ranked if r.score > 0]
     ranked.sort(key=lambda r: (-r.score, -r.size))
@@ -187,6 +198,7 @@ def _load_functions(conn, target_id: str) -> list[dict]:
             # more edges than blocks means at least one back-edge: the function loops.
             "loopy": edges > blocks and blocks > 0,
             "ptr_len": _ptr_len_confidence(ptypes),
+            "ptr_params": _ptr_param_indices(ptypes),
             "sources": set(), "sinks": set(), "taint": False,
         })
     return out
