@@ -1612,6 +1612,18 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
     pipeline unreached -- see the table in `budget.py`.
     """
     store = CaseStore(case_dir)
+    # Operator run-env from the GUI/API overrides, set once for this run: a target-libraries
+    # directory becomes QEMU_LD_PREFIX so afl-qemu / concolic run the binary against ITS OWN glibc
+    # (the symbol-lookup -> handshake fix, now reachable without the CLI), and deep-seed enables the
+    # aggressive parser-buffer seeding for daemon targets whose entry the autopilot cannot seed
+    # (candidate-tier, honest). A GUI-supplied value wins; absent, the server's own env stands.
+    _ov = overrides or {}
+    if _ov.get("sysroot") or _ov.get("deep_seed"):
+        import os as _os
+        if _ov.get("sysroot"):
+            _os.environ["LYKOS_QEMU_SYSROOT"] = str(_ov["sysroot"])
+        if _ov.get("deep_seed"):
+            _os.environ["LYKOS_BUFFER_SEED"] = "1"
     try:
         status.update({"state": "running", "targets": len(target_ids), "started": time.time(),
                         "converge": bool(converge)})

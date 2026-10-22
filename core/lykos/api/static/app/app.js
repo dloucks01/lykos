@@ -135,6 +135,12 @@ function App() {
   const [budgetMin, setBudgetMin] = useState("");   // Autopilot budget in MINUTES ("" = size-aware default)
   const [converge, setConverge] = useState(false);  // run-to-convergence (minutes become the ceiling)
   const [blackBox, setBlackBox] = useState(true);    // include the black-box `fuzz` stage (uncheck to skip)
+  const [covFuzz, setCovFuzz] = useState(true);      // coverage-guided (afl qemu-mode) fuzzing
+  const [dirFuzz, setDirFuzz] = useState(true);      // directed fuzzing
+  const [concolicOn, setConcolicOn] = useState(true); // concolic (angr/symqemu) execution
+  const [libfuzzerOn, setLibfuzzerOn] = useState(true); // source libFuzzer campaign
+  const [sysroot, setSysroot] = useState("");        // target-libraries dir -> QEMU_LD_PREFIX
+  const [deepSeed, setDeepSeed] = useState(false);   // aggressive parser-buffer seed synthesis
   const [invArgv, setInvArgv] = useState("");       // operator invocation: argv template, @@ = input file
   const [invMode, setInvMode] = useState("auto");   // input channel: auto|stdin|file|arg|env
   // WHAT THE RUN DID, per target. The UI showed findings with no account of the work behind
@@ -571,14 +577,27 @@ function App() {
       const overrides = {};
       if (invArgv.trim()) overrides.argv = invArgv.trim();
       if (invMode && invMode !== "auto") overrides.input_mode = invMode;
-      // Stages the operator switched off for this run. Black-box fuzzing is the `fuzz` stage; the
-      // rest of the pipeline (coverage/directed fuzzing, concolic, the whole L-ladder) is unaffected.
-      const skipStages = blackBox ? [] : ["fuzz"];
+      // Target's OWN libraries (a directory holding its loader + .so files). Sets QEMU_LD_PREFIX so
+      // afl-qemu / concolic run the binary against its own glibc -- the symbol-lookup->handshake fix,
+      // straight from the GUI (no CLI, no env var to set on the air-gap laptop).
+      if (sysroot.trim()) overrides.sysroot = sysroot.trim();
+      // Deep seed discovery: let the autopilot synthesize parser-buffer seeds for daemon targets
+      // whose entry it cannot seed (candidate-tier). Normal auto-seeding runs either way.
+      if (deepSeed) overrides.deep_seed = true;
+      // Per-stage on/off. Each unchecked engine is skipped for this run; the server validates
+      // against a safe allowlist (never triage/disassembly). The rest of the pipeline is unaffected.
+      const skipStages = [];
+      if (!blackBox) skipStages.push("fuzz");
+      if (!covFuzz) skipStages.push("coverage_fuzz");
+      if (!dirFuzz) skipStages.push("directed_fuzz");
+      if (!concolicOn) skipStages.push("concolic");
+      if (!libfuzzerOn) skipStages.push("libfuzzer");
       await api.startBackground(caseId, targets.map((t) => t.id), secs, overrides, converge, skipStages);
       setRan(true);
       pollBackground(caseId);
     } catch (e) { setError(e.message || String(e)); }
-  }, [caseId, targets, pollBackground, budgetMin, invArgv, invMode, converge, blackBox]);
+  }, [caseId, targets, pollBackground, budgetMin, invArgv, invMode, converge, blackBox,
+      covFuzz, dirFuzz, concolicOn, libfuzzerOn, sysroot, deepSeed]);
 
 
   // Upload one or more files. `append` adds to the current case; otherwise it starts fresh.
@@ -876,6 +895,36 @@ function App() {
              title="Black-box fuzzing (the built-in `fuzz` stage). Uncheck to skip it for this run — the rest of the pipeline (coverage/directed fuzzing, concolic, the full exploit ladder) still runs. Useful when black-box mutation is just burning budget on this target.">
         <input type="checkbox" checked=${blackBox} onChange=${(e) => setBlackBox(e.target.checked)} />
         <span>black-box fuzzing</span>
+      </label>
+      <label class="converge-field" style="display:inline-flex;gap:4px;align-items:center;margin-left:8px"
+             title="Coverage-guided fuzzing (AFL++ qemu-mode). Uncheck to skip it for this run.">
+        <input type="checkbox" checked=${covFuzz} onChange=${(e) => setCovFuzz(e.target.checked)} />
+        <span>coverage fuzzing</span>
+      </label>
+      <label class="converge-field" style="display:inline-flex;gap:4px;align-items:center;margin-left:8px"
+             title="Directed fuzzing (steered at flagged sinks / leads). Uncheck to skip it for this run.">
+        <input type="checkbox" checked=${dirFuzz} onChange=${(e) => setDirFuzz(e.target.checked)} />
+        <span>directed fuzzing</span>
+      </label>
+      <label class="converge-field" style="display:inline-flex;gap:4px;align-items:center;margin-left:8px"
+             title="Concolic execution (angr/symqemu) — solves guarded branches. Uncheck to skip it for this run (it can be the slowest stage).">
+        <input type="checkbox" checked=${concolicOn} onChange=${(e) => setConcolicOn(e.target.checked)} />
+        <span>concolic</span>
+      </label>
+      <label class="converge-field" style="display:inline-flex;gap:4px;align-items:center;margin-left:8px"
+             title="Source libFuzzer campaign (only applies when source is available). Uncheck to skip it for this run.">
+        <input type="checkbox" checked=${libfuzzerOn} onChange=${(e) => setLibfuzzerOn(e.target.checked)} />
+        <span>libfuzzer</span>
+      </label>
+      <label class="converge-field" style="display:inline-flex;gap:4px;align-items:center;margin-left:8px"
+             title="Deep seed discovery: synthesize parser-buffer seeds for daemon/library functions the autopilot's entry-point seeding cannot reach. Findings are candidate-tier (attacker-reachability assumed, not proven). Normal auto-seeding (format models, dictionaries, entry params) runs regardless.">
+        <input type="checkbox" checked=${deepSeed} onChange=${(e) => setDeepSeed(e.target.checked)} />
+        <span>deep seed discovery</span>
+      </label>
+      <label class="inv-field" title="The target's OWN shared libraries: a directory holding its loader (ld-linux…) and .so files. Point afl-qemu / concolic at these so a binary built against a different glibc runs against its own libraries instead of this host's — the fix for 'symbol lookup error / Fork server handshake failed'. Leave blank to use the host's libraries.">
+        <input type="text" placeholder="target libraries dir (optional)"
+               value=${sysroot} onInput=${(e) => setSysroot(e.target.value)}
+               style="min-width:14em" />
       </label>
       <label class="inv-field" title="How the binary is really invoked, as a shell string with @@ where the fuzzed input file goes — e.g.  -c @@  or  parse --in @@. Blank = lykos discovers it. This is the single thing that decides whether the fuzzer reaches the parser; it reaches every stage, same as the CLI's --argv.">
         <input type="text" placeholder="invocation (e.g.  -c @@)"
