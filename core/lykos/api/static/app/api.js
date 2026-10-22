@@ -133,6 +133,8 @@ export const api = {
   }),
   backgroundStatus: (caseId) => _req("GET", `/cases/${caseId}/autopilot`),
   cancelBackground: (caseId) => _req("POST", `/cases/${caseId}/autopilot/cancel`),
+  pauseBackground: (caseId) => _req("POST", `/cases/${caseId}/autopilot/pause`),
+  resumeBackground: (caseId) => _req("POST", `/cases/${caseId}/autopilot/resume`),
   events: (caseId, after = 0) => _req("GET", `/cases/${caseId}/events?after=${after}`),
   reportUrl: (caseId, fmt = "html") => `/cases/${caseId}/report?format=${fmt}`,
   artifactUrl: (sha) => `/artifacts/${sha}`,

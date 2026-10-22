@@ -669,6 +669,15 @@ def _staged(budget, store, target, stage, status, stop, params=None, *, want=Non
     review: `_run_target_stage` still exists for the API's single-stage launches, where the
     stage's registered timeout is the right ceiling.
     """
+    # Pause BETWEEN stages: the stage in flight has already finished (no work lost); if the operator
+    # set the pause event, wait here until they resume or stop.
+    _pause = getattr(budget, "pause", None)
+    if _pause is not None and _pause.is_set() and not stop.is_set():
+        status["paused"] = True
+        while _pause.is_set() and not stop.is_set():
+            status["updated"] = time.time()
+            time.sleep(0.5)
+        status["paused"] = False
     if stage in getattr(budget, "skip_stages", ()):
         why = "disabled for this run by the operator"
         if budget is not None:
@@ -1601,7 +1610,7 @@ _CONVERGENCE_CEILING_SECONDS = 21600.0
 def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                        stop: threading.Event, budget_seconds: Optional[float] = None,
                        overrides: Optional[dict] = None, converge: bool = False,
-                       skip_stages=None) -> None:
+                       skip_stages=None, pause=None) -> None:
     """The background pipeline. Owns its OWN CaseStore connection (SQLite is per-thread).
 
     `budget_seconds` is the wall clock EACH TARGET gets, divided among the phases by
@@ -1687,7 +1696,8 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
             # panel shows the plateau for the operator to stop on.)
             if converge and budget_seconds is None:
                 eff_budget = _CONVERGENCE_CEILING_SECONDS
-            bud = budget_mod.CaseBudget(eff_budget, overrides=overrides, skip_stages=skip_stages)
+            bud = budget_mod.CaseBudget(eff_budget, overrides=overrides, skip_stages=skip_stages,
+                                        pause=pause)
             status["budget"] = bud.spent()                # serializable; refreshed as we go
             if not t.file_type:
                 _staged(bud, store, t, "ingest_triage", status, stop)

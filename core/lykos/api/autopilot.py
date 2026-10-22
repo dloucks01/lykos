@@ -82,12 +82,14 @@ class AutopilotMixin:
             status["budget_seconds"] = secs
             status["converge"] = converge
             status["skip_stages"] = skip_stages
+            pause = threading.Event()
             th = threading.Thread(
                 target=orchestrate.run_case_autopilot,
                 args=(self.server.case_dir, cid, target_ids, status, stop, secs, over, converge,
-                      skip_stages),
+                      skip_stages, pause),
                 name=f"autopilot-{cid[:8]}", daemon=True)
-            AutopilotMixin._AUTOPILOTS[cid] = {"thread": th, "status": status, "stop": stop}
+            AutopilotMixin._AUTOPILOTS[cid] = {"thread": th, "status": status, "stop": stop,
+                                               "pause": pause}
             th.start()
         return self._json({"started": True, "targets": len(target_ids)}, 202)
 
@@ -99,6 +101,7 @@ class AutopilotMixin:
                 return self._json({"state": "none"})
             st = dict(rec["status"])
             st["running"] = rec["thread"].is_alive()
+            st["paused"] = bool(rec.get("pause") and rec["pause"].is_set())
         # Server clock, so the UI can show each stage's elapsed time (now - plan[i].started) in the
         # server's own time base -- no client/server clock skew. The elapsed on a running stage is
         # the signal that tells slow-but-working apart from a hang.
@@ -111,4 +114,19 @@ class AutopilotMixin:
             if not rec:
                 return self._json({"error": "no run"}, 404)
             rec["stop"].set()
+            if rec.get("pause"):
+                rec["pause"].clear()           # unblock a paused run so it can see the stop
         return self._json({"cancelling": True})
+
+    def _pause_autopilot(self, cid, want_pause: bool):
+        """Pause (suspend between stages) or resume a running Autopilot. A paused run finishes the
+        stage in flight, then waits -- no work is lost -- until resumed or stopped."""
+        with AutopilotMixin._AUTOPILOTS_LOCK:
+            rec = AutopilotMixin._AUTOPILOTS.get(cid)
+            if not rec or not rec.get("pause"):
+                return self._json({"error": "no run"}, 404)
+            if want_pause:
+                rec["pause"].set()
+            else:
+                rec["pause"].clear()
+        return self._json({"paused": want_pause})

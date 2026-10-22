@@ -900,12 +900,22 @@ function App() {
   // The run controls (used in the rail): background running / resume / run / stop.
   const runControls = html`
     ${bg && bg.running ? html`
-      <div class="bg-status"><${Spinner} label=${`Background — ${bg.stage ? stageLabelSafe(bg.stage) : "starting"}`} /></div>
+      <div class="bg-status"><${Spinner} label=${bg.paused
+        ? "Paused — will resume where it left off"
+        : `Background — ${bg.stage ? stageLabelSafe(bg.stage) : "starting"}`} /></div>
+      ${bg.paused
+        ? html`<button class="btn small primary" title="resume the run from where it paused"
+                 onClick=${() => api.resumeBackground(caseId)}>▶ Resume</button>`
+        : html`<button class="btn ghost small" title="pause between stages — the current stage finishes, then it waits (no work lost) until you resume"
+                 onClick=${() => api.pauseBackground(caseId)}>⏸ Pause</button>`}
       <button class="btn ghost small" onClick=${() => api.cancelBackground(caseId)}>■ Stop background</button>
     ` : !running ? html`
       <button class="btn primary" onClick=${onBackground}
-              title="the full pipeline on the server: every applicable stage, a wall-clock budget it divides between phases, and a scorecard of what it did">
-        ${(bg && (bg.state === "cancelled" || bg.state === "error")) ? "Run Autopilot again"
+              title=${bg && bg.state === "cancelled"
+                ? "continue: re-runs the pipeline, reusing every stage that already completed (cached) so it picks up where it was stopped rather than starting over"
+                : "the full pipeline on the server: every applicable stage, a wall-clock budget it divides between phases, and a scorecard of what it did"}>
+        ${(bg && bg.state === "cancelled") ? "▶ Continue run"
+          : (bg && bg.state === "error") ? "Run Autopilot again"
           : (ran ? "Run Autopilot again" : "▶ Run Autopilot")}</button>
       <fieldset class="run-group">
         <legend>budget</legend>

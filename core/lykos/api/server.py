@@ -141,6 +141,8 @@ from .routes import (  # route table + traversal-safe static reader (extracted f
     _ASSET_TYPES,
     _CASE_AUTOPILOT,
     _CASE_AUTOPILOT_CANCEL,
+    _CASE_AUTOPILOT_PAUSE,
+    _CASE_AUTOPILOT_RESUME,
     _CASE_EVENTS,
     _CASE_EXPORT,
     _CASE_FIND,
@@ -619,6 +621,12 @@ class Handler(EndpointsMixin, AutopilotMixin, BaseHTTPRequestHandler):
             m = _CASE_AUTOPILOT_CANCEL.match(path)
             if m:
                 return self._cancel_autopilot(m.group(1))
+            m = _CASE_AUTOPILOT_PAUSE.match(path)
+            if m:
+                return self._pause_autopilot(m.group(1), True)
+            m = _CASE_AUTOPILOT_RESUME.match(path)
+            if m:
+                return self._pause_autopilot(m.group(1), False)
             m = _CASE_AUTOPILOT.match(path)
             if m:
                 return self._start_autopilot(m.group(1))

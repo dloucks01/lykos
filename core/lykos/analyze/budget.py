@@ -180,7 +180,7 @@ class CaseBudget:
     """
 
     def __init__(self, total: Optional[float] = None, *, clock=time.monotonic,
-                 overrides: Optional[dict] = None, skip_stages=None):
+                 overrides: Optional[dict] = None, skip_stages=None, pause=None):
         #: The operator's invocation facts (argv, seed files, input mode), carried here because
         #: this object is already the per-target run context threaded to every stage call --
         #: `orchestrate._OVERRIDE_SCOPE` decides which stage may be handed which key. They are
@@ -192,6 +192,10 @@ class CaseBudget:
         #: without editing the plan. A deliberate operator choice, recorded as a `skipped` plan row
         #: with that reason -- not a silent omission.
         self.skip_stages = set(skip_stages or ())
+        #: An optional threading.Event the operator can SET to pause the run BETWEEN stages (no
+        #: work is lost -- the stage in flight finishes, then the autopilot waits here until the
+        #: event is cleared or the run is stopped). None = never pauses.
+        self.pause = pause
         self.total = float(DEFAULT_TARGET_BUDGET if total is None else total)
         self._clock = clock
         self._start = clock()

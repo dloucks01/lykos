@@ -42,6 +42,8 @@ _CASE_VERIFS = re.compile(r"^/cases/([^/]+)/verifications$")
 _CASE_SCORECARD = re.compile(r"^/cases/([^/]+)/scorecard$")
 _CASE_AUTOPILOT = re.compile(r"^/cases/([^/]+)/autopilot$")
 _CASE_AUTOPILOT_CANCEL = re.compile(r"^/cases/([^/]+)/autopilot/cancel$")
+_CASE_AUTOPILOT_PAUSE = re.compile(r"^/cases/([^/]+)/autopilot/pause$")
+_CASE_AUTOPILOT_RESUME = re.compile(r"^/cases/([^/]+)/autopilot/resume$")
 
 # Assets the SPA loads after index.html: the vendored ESM runtime and the app modules. Only these
 # subtrees are served, and only plain web asset types -- nothing else under the package is
