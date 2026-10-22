@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from ...db.dao import FindingDAO, FunctionDAO, TargetDAO
 from ...jobs.registry import register_stage
-from .emulate import available
+from .emulate import _HUGE_ALLOC, available
 from .fuzz import fuzz_function
 from .rank import rank_functions
 
@@ -86,7 +86,8 @@ def harness_stage(ctx) -> dict:
             continue
         ctx.emit("harness.progress", payload={
             "func": hex(rf.addr), "name": rf.name, "execs": fr.execs, "dict_words": len(dict_words),
-            "coverage": len(fr.blocks), "crashes": len(fr.crashes)})
+            "coverage": len(fr.blocks), "crashes": len(fr.crashes),
+            "oracle_hits": len(fr.oracle_hits)})
         for c in fr.crashes:
             r = c["result"]
             inp = c["input"]
@@ -108,6 +109,27 @@ def harness_stage(ctx) -> dict:
                     "directly with this input) -- a confirmed bug for a library API, and a "
                     "reachable-if-driven lead for a daemon whose entry path a concolic/reachability "
                     "pass must still connect. Not a program-level verified PoC.")}]})
+            findings += 1
+        # T5 resource oracle: a fuzzed input drove an attacker-controlled huge allocation (CWE-789).
+        for o in fr.oracle_hits:
+            r = o["result"]
+            inp = o["input"]
+            sha = ctx.put_artifact("harness-alloc-input", data=inp)
+            size = r.huge_alloc or 0
+            fd.upsert(target.id, target.case_id, {
+                "cwe": "CWE-789", "severity": "medium",
+                "title": f"Harness-demonstrated unbounded allocation in {label} (function-level)"[:200],
+                "detector": "harness", "state": "corroborated", "confidence": 0.65,
+                "function_addr": hex(rf.addr),
+                "dedup_key": f"harness-alloc:{rf.addr:#x}",
+                "evidence": [{"channel": "harness", "detail": (
+                    f"driving {label}({shape}) directly under the emulator, a {len(inp)}-byte input "
+                    f"{sha[:12]} causes an allocation request of {size:,} bytes "
+                    f"(>= {_HUGE_ALLOC:,} B). A size this large driven from a small input is an "
+                    "attacker-controlled (unbounded) allocation -- a memory-exhaustion / DoS lead "
+                    "(CWE-789/400), not a memory-corruption fault. PROVENANCE: demonstrated at the "
+                    "FUNCTION level (called directly with this input); program-level reachability "
+                    "for a daemon must still be connected by a later pass.")}]})
             findings += 1
     ctx.emit("harness.done", payload={"supported": True, "functions": len(cands),
              "findings": findings})

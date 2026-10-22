@@ -34,6 +34,11 @@ _HEAP_SZ = 0x1000000                 # 16 MiB heap
 _TLS_ADDR = 0x0000DD0000000000       # a fake TLS block so `fs:[0x28]` (the stack canary) is valid
 _MAX_INSNS = 2_000_000               # per-segment instruction runaway guard
 _MAX_CALLS = 200_000                 # external-call runaway guard
+# T5 oracle (doc 46): a single allocation this large, requested by a parser we fed a SMALL fuzzed
+# input, is an attacker-controlled allocation size -- CWE-789 (unbounded allocation) / CWE-400 DoS.
+# A legitimate parser does not malloc 64 MiB off a few KB of input; a `malloc(len_field)` with the
+# length under the attacker's control does.
+_HUGE_ALLOC = 0x4000000              # 64 MiB
 
 
 @dataclass
@@ -44,6 +49,7 @@ class HarnessResult:
     fault_pc: Optional[int] = None    # where it was executing when it faulted
     access: str = ""                 # "read" | "write" | "fetch"
     blocks: set = field(default_factory=set)   # basic-block start addresses reached (coverage)
+    huge_alloc: Optional[int] = None  # T5: an attacker-controlled allocation SIZE (CWE-789 DoS)
     note: str = ""
 
 
@@ -220,14 +226,20 @@ def _emulate_libc(uc, name, res, heap, regs) -> None:
         elif nm == "memcmp":
             _set(0 if bytes(uc.mem_read(a0, a2)) == bytes(uc.mem_read(a1, a2)) else 1)
         elif nm == "malloc":
+            if a0 >= _HUGE_ALLOC and res.huge_alloc is None:
+                res.huge_alloc = int(a0)                 # T5: attacker-controlled allocation size
             _set(_alloc(a0))
         elif nm == "calloc":
-            n = a0 * a1
+            n = a0 * a1                                  # true product (no C wraparound in the stub)
+            if n >= _HUGE_ALLOC and res.huge_alloc is None:
+                res.huge_alloc = int(n)                  # a huge count*size the input drove
             p = _alloc(n)
             if p:
                 uc.mem_write(p, b"\x00" * ((n + 15) & ~15))
             _set(p)
         elif nm == "realloc":
+            if a1 >= _HUGE_ALLOC and res.huge_alloc is None:
+                res.huge_alloc = int(a1)
             _set(_alloc(a1) if a1 else 0)                # fresh block, best-effort (no copy)
         elif nm in ("free",):
             _set(0)

@@ -78,6 +78,7 @@ _INTERESTING = [
 class FuzzResult:
     execs: int = 0
     crashes: list = field(default_factory=list)       # [{"input": bytes, "result": HarnessResult}]
+    oracle_hits: list = field(default_factory=list)   # T5: [{"input": bytes, "result": HarnessResult}]
     corpus: list = field(default_factory=list)        # coverage-increasing inputs kept
     blocks: set = field(default_factory=set)          # cumulative coverage reached
     elapsed: float = 0.0
@@ -113,7 +114,7 @@ def _mutate(rng: random.Random, data: bytes, words: list) -> bytes:
 
 def fuzz_function(elf_bytes: bytes, func_addr: int, seeds: Optional[list] = None, *,
                   arg_shape: str = "ptr_len", budget_execs: int = 20000,
-                  budget_seconds: float = 60.0, max_crashes: int = 8,
+                  budget_seconds: float = 60.0, max_crashes: int = 8, max_oracle: int = 2,
                   dictionary: Optional[list] = None, seed: int = 1337) -> FuzzResult:
     """Coverage-guided fuzz of one function. Returns crashing inputs + the corpus it built.
 
@@ -150,6 +151,17 @@ def fuzz_function(elf_bytes: bytes, func_addr: int, seeds: Optional[list] = None
             if site not in seen_crash_sites:
                 seen_crash_sites.add(site)
                 fr.crashes.append({"input": data, "result": r})
+        # T5 oracle: a fuzzed input drove an attacker-controlled huge allocation (no fault needed).
+        # One or two witnesses suffice -- prefer the smallest input (tiny input -> giant alloc is the
+        # strongest shape), but never let bookkeeping sink the campaign.
+        if r.huge_alloc is not None:
+            if len(fr.oracle_hits) < max_oracle:
+                fr.oracle_hits.append({"input": data, "result": r})
+            else:
+                biggest = max(range(len(fr.oracle_hits)),
+                              key=lambda i: len(fr.oracle_hits[i]["input"]))
+                if len(data) < len(fr.oracle_hits[biggest]["input"]):
+                    fr.oracle_hits[biggest] = {"input": data, "result": r}
     fr.corpus = corpus
     fr.elapsed = round(time.time() - t0, 2)
     return fr

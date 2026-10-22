@@ -261,8 +261,13 @@ upgrade improves what the non-fuzz recover phase can confirm).
         to the harness fuzz loop as a dictionary (spliced + seeded at offset 0). Validated A/B: a bug
         hidden behind a `0xCAFEBABE` magic gate is UNREACHED by the blind campaign and REACHED once
         the constant is in the dictionary; 70 harness tests green.
-  - [ ] **T5 · Richer oracles** — beyond SIGSEGV: unbounded-allocation / per-run memory growth,
-        new-edge anomalies, allocator-invariant violations in the emulated executor.
+  - [x] **T5 · Richer oracles** — beyond SIGSEGV. First oracle landed: **unbounded allocation**
+        (CWE-789/400 DoS). The libc stubs record `HarnessResult.huge_alloc` when `malloc/calloc/realloc`
+        is driven with a size ≥ 64 MiB; the fuzz loop collects `oracle_hits` (smallest-input witness)
+        and `harness_stage` files them as medium-severity DoS leads with honest function-level
+        provenance (no fault = not a memory-corruption crash). Validated A/B: `malloc(attacker_len)`
+        trips the oracle, a fixed `malloc(16)` does not, and the DoS lead is NOT mis-filed as a crash.
+        210 harness/emulate/rank/fuzz tests green.
   - [ ] **T3 · Sink-directed concolic (reachability certificates)** — for each static finding, solve
         for an input that reaches+triggers its site (→ demonstrated) or prove it unreachable (→ drop
         the false positive). Reuses angr.
