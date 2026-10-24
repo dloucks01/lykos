@@ -50,7 +50,7 @@ def test_nothing_ran_is_verdict_none():
 
 def test_noprogress_flags_invocation_need():
     plan = [{"stage": "directed_fuzz", "state": "done", "detail": ""}]
-    events = [{"type": "directed_fuzz.noprogress",
+    events = [{"type": "directed.noprogress",
                "payload": {"execs": 40000, "edges_found": 3,
                            "note": "ran many executions but reached almost no new code -- most "
                                    "likely needs a config/data file or arguments"}}]

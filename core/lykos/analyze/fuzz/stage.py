@@ -1024,6 +1024,13 @@ def _not_run_reason(isolation, note: str = "") -> str:
     return iso
 
 
+#: Attempts after which a campaign where NONE reached the program stops (an error loop).
+_ERROR_LOOP_SAMPLE = 64
+
+#: The campaign's event prefix -> the autopilot stage (engine) it runs as.
+_ENGINE_OF_PREFIX = {"fuzz": "fuzz", "directed": "directed_fuzz", "harness": "boundary_fuzz"}
+
+
 def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_seconds,
                   exec_timeout, rng, detector, event_prefix, note_prefix, run_fn=run_input,
                   mutator=None, cover_blocks=(), cover_flags=(), base_argv=(), block_dist=None,
@@ -1165,6 +1172,12 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
     # never taken -- which is the difference between a few thousand distinct behaviours and
     # tens of thousands of distinct paths.
     all_blocks = set(cover_blocks or ())
+    # One line per attempt (see fuzz/attempts.py): the only way to tell a campaign that tested
+    # 20,000 inputs from one that tried 20,000 times and never started the program.
+    from . import attempts as _attempts
+    alog = _attempts.AttemptLog(
+        ctx, _ENGINE_OF_PREFIX.get(event_prefix, event_prefix), event_prefix,
+        unit=("blocks" if all_blocks else "behaviours"), target_id=target.id)
     # Corpus distillation: before spending the budget, drop seeds whose block coverage another seed
     # already covers, so the campaign starts from a small high-coverage minset instead of re-running
     # near-duplicate accumulated inputs (ISSTA'21: minset quality dominates fuzzer choice). Crashers
@@ -1372,8 +1385,10 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
                 novel = bool(new_blocks)
             else:
                 novel = b not in seen_behaviour
-            if b not in seen_behaviour:
+            new_behaviour = b not in seen_behaviour
+            if new_behaviour:
                 seen_behaviour.add(b)
+            kept_this = False
             if novel or closer:
                 if not res.crashed and len(data) <= _MAX_KEEP:  # noqa: SIM102
                     if len(corpus) < _MAX_CORPUS:
@@ -1384,8 +1399,17 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
                         # which is most of them -- the interesting paths are discovered late.
                         corpus[rng.randrange(len(corpus))] = data
                     kept += 1
+                    kept_this = True
                     if closer and not novel:
                         directed_kept += 1
+            if all_blocks and cover_reported:
+                alog.set_unit("blocks")
+                _new_units = len(new_blocks)
+            else:
+                alog.set_unit("behaviours")
+                _new_units = 1 if new_behaviour else 0
+            alog.record_result(data, res, phase=("seed" if calibrating else "mutate"),
+                               argv=prefix, new=_new_units, kept=kept_this)
             if res.crashed:
                 crashes += 1
                 # A crash that does not happen again is not a finding. Some targets REWRITE
@@ -1394,7 +1418,7 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
                 # runs clean. Filing those left every downstream stage chasing a crash that
                 # cannot be reproduced, and the release gate failing with "PoC not reproduced".
                 if not _reproduces(run_fn, exe, mode, workfile, exec_timeout,
-                                   target, data, run_argv, guard_page=guard_eff):
+                                   target, data, run_argv, guard_page=guard_eff, alog=alog):
                     flaky += 1
                     continue
                 crashes_reproducible += 1
@@ -1433,6 +1457,7 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
                             kw["base_argv"] = _prefix
                             kw["guard_page"] = _guard
                         r = run_fn(exe, mode, workfile, exec_timeout, target.arch, d, **kw)[1]
+                        alog.record_result(d, r, phase="minimize", argv=_prefix)
                         return r.crashed and r.signal_name == _sig
 
                     budget = min(200, max(20, max_execs - execs))
@@ -1466,10 +1491,22 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
                               fault_pc=res.fault_pc,
                               defect_key=(asan_defect_key(res.stderr)
                                           if res.signal_name == "SIGABRT" else None))
+        # An ERROR LOOP: the program "ran" as far as the sandbox is concerned, but the loader refused
+        # it every time (missing .so, wrong interpreter -> exit 127). Without this the campaign spent
+        # its whole budget re-proving it -- measured: 3,100 attempts across fuzz + directed on one
+        # target, every one "error while loading shared libraries". Stop after a fair sample and say
+        # why, so the budget goes to the stages that do not need execution.
+        _c = alog.tally.counts
+        if (alog.tally.total >= _ERROR_LOOP_SAMPLE and not _c["crash"] and not alog.progressed()
+                and _c["no_start"] >= 0.95 * alog.tally.total):
+            ran_any = False
+            first_notrun_iso = "loader-failed"
+            first_notrun_note = alog.tally.verdict()[1]
         # The whole first batch executed but NOTHING ran as a program -- record why and stop,
         # instead of spending the budget on no-op executions and reporting a clean empty campaign.
         if not ran_any and execs > 0:
             reason = _not_run_reason(first_notrun_iso, first_notrun_note)
+            alog.finish(did_not_run=True)
             dd.insert(target.id, target.case_id, run_id=ctx.run_id, input_mode=mode,
                       crashed=False, isolation=first_notrun_iso or "not-runnable", note=reason)
             ctx.emit(f"{event_prefix}.done", payload={"execs": execs, "crashes": 0,
@@ -1496,7 +1533,8 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
                 "elapsed": round(_elapsed, 1), "budget": round(max_seconds, 1),
                 "pct": min(100, round(100 * _elapsed / max(1e-3, max_seconds))),
                 "execs_per_sec": round(execs / _elapsed),
-                "blocks_hit": len(seen_blocks), "blocks_known": len(all_blocks)})
+                "blocks_hit": len(seen_blocks), "blocks_known": len(all_blocks),
+                "outcomes": alog.snapshot()})
 
     elapsed = max(1e-3, max_seconds - max(0.0, deadline - time.time()))
     # An execution rate this low means the campaign barely ran, and "0 crashes" from 16
@@ -1552,7 +1590,14 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
     # find. Say so, with the remedy -- the operator watched it run for half an hour and a bare
     # "starved" tells them nothing actionable.
     starved_reason = None
-    if starved and execs >= 200 and not entered and crashes == 0:
+    _verdict, _vnote = alog.tally.verdict(alog.progressed() or crashes > 0)
+    if _verdict in (_attempts.ERRORING, _attempts.TIMING_OUT, _attempts.REJECTING):
+        # The attempt log KNOWS why it never got anywhere -- quote that instead of guessing
+        # "needs a config file" for what is really a loader error or a hang on every input.
+        starved_reason = _vnote
+        ctx.emit(f"{event_prefix}.noprogress", payload={"execs": execs, "note": starved_reason,
+                                                        "verdict": _verdict})
+    elif starved and execs >= 200 and not entered and crashes == 0:
         starved_reason = (
             "the target executed but never varied its behaviour or reached new code -- it is "
             "bailing out before it parses the input. That usually means it needs a config/data "
@@ -1580,6 +1625,8 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
         lsan_detonate(ctx, target, corpus, mode, exec_timeout, base_argv=base_argv)
     except Exception:
         observe.absorbed(_log, "continuing")
+    _att = alog.finish()
+    stats["attempts"] = {k: _att.get(k) for k in ("counts", "verdict", "verdict_note", "value", "log")}
     ctx.emit(f"{event_prefix}.done", payload=stats)
     ctx.progress(pct=100, msg=f"{execs} execs, {crashes} crashes, {len(seen_sigs)} unique, "
                              f"{len(seen_behaviour)} behaviours")
@@ -1587,7 +1634,7 @@ def fuzz_campaign(ctx, target, *, corpus, dictionary, mode, max_execs, max_secon
 
 
 def _reproduces(run_fn, exe, mode, workfile, exec_timeout, target, data, prefix,
-                guard_page: bool = False) -> bool:
+                guard_page: bool = False, alog=None) -> bool:
     """Does this input crash again, on its own, the way it was found?
 
     Through the campaign's OWN runner: a boundary-harness campaign delivers its input through a
@@ -1607,6 +1654,8 @@ def _reproduces(run_fn, exe, mode, workfile, exec_timeout, target, data, prefix,
     except Exception:
         observe.absorbed(_log, "answering no")
         return False
+    if alog is not None:
+        alog.record_result(data, res, phase="reproduce", argv=prefix)
     return bool(res.crashed)
 
 

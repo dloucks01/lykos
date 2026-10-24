@@ -686,6 +686,42 @@ class EndpointsMixin:
         # ceiling, and get_bytes() would load the whole blob into memory per concurrent request.
         return self._stream_file(path, "application/octet-stream")
 
+    def _get_attempts(self, sha, qs):
+        """One fuzz engine's per-attempt log (fuzz/attempts.py), filtered and paged:
+        ?outcome=no_start,crash  ?phase=mutate  ?errors_only=1  ?offset=0&limit=200.
+        The summary is judged over the WHOLE log whatever the filter."""
+        from ..analyze.fuzz import attempts as _attempts
+        path = self.server.content.path(sha)
+        if not path.exists():
+            return self._json({"error": "no artifact"}, 404)
+
+        def _list(name):
+            v = (qs.get(name) or [""])[0]
+            return [x for x in v.split(",") if x] or None
+        from .server import _int_param
+        limit = max(1, min(2000, _int_param(qs, "limit", 200)))
+        offset = max(0, _int_param(qs, "offset", 0))
+        try:
+            out = _attempts.read_log(path, outcome=_list("outcome"), phase=_list("phase"),
+                                     offset=offset, limit=limit,
+                                     errors_only=(qs.get("errors_only") or ["0"])[0] in ("1", "true"))
+        except Exception as e:                           # noqa: BLE001 -- not an attempt log
+            return self._json({"error": f"not a fuzz attempt log: {e}"}, 415)
+        return self._json(out)
+
+    def _get_attempt_logs(self, case_id):
+        """Every fuzz attempt log in the case, newest first, with its summary (no rows)."""
+        from ..analyze.fuzz.attempts import LOG_KIND
+        from ..db.dao import ArtifactDAO
+        s = self._store()
+        try:
+            arts = [a for a in ArtifactDAO(s.conn).list_by_case(case_id) if a.kind == LOG_KIND]
+        finally:
+            s.close()
+        arts.sort(key=lambda a: a.created_at, reverse=True)
+        return self._json([{"sha256": a.sha256, "created_at": a.created_at, "size": a.size,
+                            **(a.meta or {})} for a in arts])
+
     def _get_bundle(self, sha):
         """Open a PoC bundle (.tar.gz) and return its INNER contents for the exploit inspector: the
         meta/primitive, small text files (README, meta.json, PRIMITIVE.txt, runner.sh, exploit.py)

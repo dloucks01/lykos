@@ -313,6 +313,43 @@ export function RunHeader({ bg }) {
     </div>`;
 }
 
+// How each fuzz attempt ENDED (fuzz/attempts.py). The palette reads at a glance: green ran
+// cleanly, grey exited with an error (normal for most mutated inputs), amber hung, red crashed,
+// and the dark-red "never reached the program" is the error-loop signal.
+export const OUTCOME_META = {
+  clean_exit: { label: "ran clean", color: "var(--ok)" },
+  error_exit: { label: "error exit", color: "var(--info)" },
+  timeout: { label: "timeout", color: "var(--warn)" },
+  crash: { label: "crash", color: "var(--high)" },
+  no_start: { label: "never reached", color: "var(--bad)" },
+};
+const _OUTCOME_ORDER = ["clean_exit", "error_exit", "timeout", "crash", "no_start"];
+
+// A thin stacked bar + legend of attempt outcomes. `counts` is {outcome: n}.
+export function OutcomeBar({ counts, compact }) {
+  const c = counts || {};
+  const total = _OUTCOME_ORDER.reduce((a, k) => a + (Number(c[k]) || 0), 0);
+  if (!total) return null;
+  const parts = _OUTCOME_ORDER.filter((k) => Number(c[k]) > 0);
+  return html`
+    <span class=${`ob${compact ? " ob-compact" : ""}`}>
+      <span class="ob-bar" role="img" aria-label=${parts.map((k) => `${OUTCOME_META[k].label} ${c[k]}`).join(", ")}>
+        ${parts.map((k) => html`<span class="ob-seg" title=${`${OUTCOME_META[k].label}: ${_fmtN(c[k])} (${Math.round(100 * c[k] / total)}%)`}
+          style=${`width:${Math.max(1.5, 100 * c[k] / total)}%;background:${OUTCOME_META[k].color}`}></span>`)}
+      </span>
+      ${compact ? null : html`<span class="ob-legend">${parts.map((k) => html`
+        <span class="ob-key"><i style=${`background:${OUTCOME_META[k].color}`}></i>${OUTCOME_META[k].label} ${Math.round(100 * c[k] / total)}%</span>`)}</span>`}
+    </span>`;
+}
+
+// Live: is this campaign an error loop? True once enough attempts are in and (almost) none reached
+// the program -- the one live signal worth shouting about.
+function _liveErroring(oc) {
+  const c = oc || {};
+  const total = _OUTCOME_ORDER.reduce((a, k) => a + (Number(c[k]) || 0), 0);
+  return total >= 20 && (Number(c.no_start) || 0) >= 0.9 * total;
+}
+
 export function FuzzConsole({ live, state, converge, compact }) {
   if (!live) return null;
   const budget = Number(live.budget) || 0;
@@ -336,6 +373,8 @@ export function FuzzConsole({ live, state, converge, compact }) {
           <span><b>${_fmtN(live.execs_per_sec)}</b>/s</span>
           <span>cov <b>${cov}</b></span>
           <span class=${Number(live.crashes) > 0 ? "fz-hit" : ""}><b>${_fmtN(live.crashes)}</b> crashes</span>
+          ${live.outcomes ? html`<${OutcomeBar} counts=${live.outcomes} compact=${true} />` : null}
+          ${_liveErroring(live.outcomes) ? html`<span class="fz-err">erroring: no attempt is reaching the program</span>` : null}
         </span>
         <span class="fz-budget">${fmtElapsed(elapsed)}${budget ? ` / ${fmtElapsed(budget)}` : ""}${
           eta != null ? html` · <span class="fz-eta">${converge
@@ -365,6 +404,15 @@ export function FuzzConsole({ live, state, converge, compact }) {
         ${stat("behaviours", _fmtN(live.behaviours))}
         ${stat("crashes", _fmtN(live.crashes), (Number(live.crashes) > 0 ? "fz-hit" : ""))}
       </div>
+      ${live.outcomes ? html`
+        <div class="fz-outcomes">
+          <span class="fz-outcomes-k">how attempts are ending</span>
+          <${OutcomeBar} counts=${live.outcomes} />
+        </div>` : null}
+      ${_liveErroring(live.outcomes) ? html`
+        <div class="fz-err-banner">Erroring: ${_fmtN(live.outcomes.no_start)} attempts so far never reached the
+          program (it is not starting, or the input is not being delivered). Nothing is being tested —
+          the engine's attempt log will quote the error when it finishes.</div>` : null}
     </div>`;
 }
 
@@ -375,9 +423,23 @@ export function FuzzConsole({ live, state, converge, compact }) {
 // alert that a static-only result here is a tooling outcome, not a clean binary. Fed by the
 // server's `fuzz.health` event / scorecard, so the GUI never silently presents an empty run.
 const _FH_COLOR = { ok: "#2ec28a", failed: "#e5534b", error: "#e5534b", noprogress: "#d9a441",
-                    starved: "#d9a441", declined: "#8a94a6", skipped: "#8a94a6", not_run: "#8a94a6" };
+                    starved: "#d9a441", no_gain: "#d9a441", declined: "#8a94a6", skipped: "#8a94a6",
+                    not_run: "#8a94a6" };
 const _FH_LABEL = { ok: "ran", failed: "FAILED", error: "error", noprogress: "no progress",
-                    starved: "starved", declined: "n/a", skipped: "skipped", not_run: "—" };
+                    starved: "starved", no_gain: "no gain", declined: "n/a", skipped: "skipped",
+                    not_run: "—" };
+
+// "Did it earn its time": coverage the seeds reached vs. what mutation added, and when it last grew.
+function _valueLine(v) {
+  if (!v || !["blocks", "behaviours", "edges"].includes(v.unit) || v.gained == null) return null;
+  const bits = [`+${_fmtN(v.gained)} ${v.unit} beyond seeds (seeds: ${_fmtN(v.seed_coverage || 0)})`];
+  if (v.last_gain_s != null) {
+    bits.push(`last gain at ${fmtElapsed(v.last_gain_s)}${v.idle_tail_pct != null ? `, idle the last ${v.idle_tail_pct}%` : ""}`);
+  } else if (v.gained === 0) {
+    bits.push("never gained");
+  }
+  return bits.join(" · ");
+}
 const _FH_ENGINE = { coverage_fuzz: "coverage-guided (AFL)", fuzz: "blind fuzz",
                      directed_fuzz: "sink-directed", net_fuzz: "network/socket",
                      boundary_fuzz: "IPC/boundary", env_fuzz: "environment",
@@ -415,10 +477,10 @@ export function DynamicCoverageBanner({ health, ran }) {
     </div>`;
 }
 
-export function FuzzHealthPanel({ health }) {
+export function FuzzHealthPanel({ health, onOpenLog }) {
   if (!health || !Array.isArray(health.engines) || !health.engines.length) return null;
   const v = health.verdict;
-  const banner = v === "ok" ? "#2ec28a" : v === "degraded" ? "#d9a441" : "#e5534b";
+  const banner = v === "ok" ? "#2ec28a" : (v === "degraded" || v === "idle") ? "#d9a441" : "#e5534b";
   return html`
     <div class="card" style="padding:10px 12px">
       <div style=${`border-left:3px solid ${banner};padding-left:10px;margin-bottom:8px`}>
@@ -426,15 +488,26 @@ export function FuzzHealthPanel({ health }) {
         <div style="font-size:12px;opacity:.8;margin-top:2px">${health.note}</div>
       </div>
       <div>
-        ${health.engines.map((e) => html`
-          <div key=${e.engine} style="display:flex;gap:10px;align-items:baseline;padding:3px 0;font-size:12px">
-            <span style="flex:0 0 150px">${_FH_ENGINE[e.engine] || e.engine}</span>
-            <span style=${`flex:0 0 72px;font-weight:600;color:${_FH_COLOR[e.status] || "#8a94a6"}`}>${_FH_LABEL[e.status] || e.status}</span>
-            <span style="flex:1;opacity:.75;overflow:hidden;text-overflow:ellipsis">${
-              e.status === "ok"
-                ? `${_fmtN(e.execs)} execs${e.coverage ? ` · ${e.coverage}` : ""}`
-                : (e.reason || "")}</span>
-          </div>`)}
+        ${health.engines.map((e) => {
+          const val = _valueLine(e.value);
+          return html`
+          <div key=${e.engine} class="fh-row">
+            <div style="display:flex;gap:10px;align-items:baseline;font-size:12px">
+              <span style="flex:0 0 150px">${_FH_ENGINE[e.engine] || e.engine}</span>
+              <span style=${`flex:0 0 72px;font-weight:600;color:${_FH_COLOR[e.status] || "#8a94a6"}`}>${_FH_LABEL[e.status] || e.status}</span>
+              <span style="flex:1;opacity:.75;min-width:0">${
+                e.status === "ok"
+                  ? `${_fmtN(e.execs)} execs${e.afl_execs ? ` (AFL: ${_fmtN(e.afl_execs)})` : ""}${e.coverage ? ` · ${e.coverage}` : ""}${e.reason ? ` — ${e.reason}` : ""}`
+                  : (e.reason || "")}</span>
+              ${e.log && onOpenLog ? html`<button class="btn xsmall ghost" title="every attempt this engine made: what was sent and how it ended"
+                onClick=${() => onOpenLog(e.log, e.engine)}>attempt log</button>` : null}
+            </div>
+            ${e.outcomes || val ? html`
+              <div class="fh-detail">
+                ${e.outcomes ? html`<${OutcomeBar} counts=${e.outcomes} />` : null}
+                ${val ? html`<span class="fh-value">${val}</span>` : null}
+              </div>` : null}
+          </div>`; })}
       </div>
     </div>`;
 }
@@ -1696,4 +1769,110 @@ export function CaseOverview({ findings, pocs, filter, onFilter }) {
       </div>
     </div>
   </div>`;
+}
+
+
+// One fuzz engine's per-attempt log: every execution, what was sent, how it ended. Filter by
+// outcome / phase, page through, download the whole gzipped JSONL.
+const _PHASES = ["seed", "mutate", "minimize", "reproduce", "confirm", "afl-seed", "afl-queue",
+                 "afl-crash", "afl-hang"];
+
+export function AttemptLogModal({ sha, engine, fetchPage, artifactUrl, onClose }) {
+  const [filter, setFilter] = useState({ outcome: "", phase: "", errorsOnly: false, offset: 0 });
+  const [data, setData] = useState(null);
+  const [err, setErr] = useState(null);
+  const limit = 200;
+  useEffect(() => {
+    let live = true;
+    setErr(null);
+    fetchPage(sha, { ...filter, limit }).then((d) => { if (live) setData(d); })
+      .catch((e) => { if (live) setErr(e.message || String(e)); });
+    return () => { live = false; };
+  }, [sha, filter.outcome, filter.phase, filter.errorsOnly, filter.offset]);
+  if (!sha) return null;
+  const sm = (data && data.summary) || {};
+  const set = (k, v) => setFilter((f) => ({ ...f, [k]: v, offset: k === "offset" ? v : 0 }));
+  const rows = (data && data.rows) || [];
+  const total = data ? data.total : 0;
+  const matched = data ? data.matched : 0;
+  const tops = Object.entries(sm.top_errors || {}).flatMap(([o, l]) => (l || []).slice(0, 2).map((t) => ({ o, ...t })));
+  return html`
+    <div class="modal-back" onClick=${onClose}>
+      <div class="modal attempts" role="dialog" aria-modal="true" tabindex="-1"
+        aria-label=${`Attempt log for ${engine}`} onClick=${(e) => e.stopPropagation()}>
+        <div class="ev-head">
+          <div>
+            <div class="ev-title">Attempt log — ${_FH_ENGINE[engine] || engine}</div>
+            <div class="ev-sub">${_fmtN(total)} attempts · verdict <b>${sm.verdict || "…"}</b>
+              ${data && data.header && data.header.unit ? html` · coverage unit: ${data.header.unit}` : null}</div>
+          </div>
+          <span style="display:flex;gap:6px">
+            <a class="btn xsmall" href=${artifactUrl(sha)} download=${`${engine}-attempts.jsonl.gz`}>⬇ full log</a>
+            <button class="btn ghost small" onClick=${onClose}>✕ Close</button>
+          </span>
+        </div>
+        ${sm.verdict_note ? html`<div class=${`att-verdict att-${sm.verdict}`}>${sm.verdict_note}</div>` : null}
+        ${sm.counts ? html`<div class="att-bar"><${OutcomeBar} counts=${sm.counts} /></div>` : null}
+        ${tops.length ? html`
+          <div class="att-tops">
+            <div class="ev-sec-h">Most common error output</div>
+            ${tops.map((t) => html`<div class="att-top"><span class="att-o" style=${`color:${(OUTCOME_META[t.o] || {}).color}`}>${(OUTCOME_META[t.o] || {}).label || t.o}</span>
+              <span class="att-n">×${_fmtN(t.count)}</span>${t.rc != null ? html`<code>rc ${t.rc}</code>` : null}
+              <span class="att-msg">${t.msg || "(no stderr)"}</span></div>`)}
+          </div>` : null}
+        <div class="att-filters">
+          <button class=${`chip${!filter.outcome && !filter.errorsOnly ? " on" : ""}`} onClick=${() => setFilter({ outcome: "", phase: filter.phase, errorsOnly: false, offset: 0 })}>all</button>
+          <button class=${`chip${filter.errorsOnly ? " on" : ""}`} onClick=${() => setFilter({ outcome: "", phase: filter.phase, errorsOnly: true, offset: 0 })}>not clean</button>
+          ${_OUTCOME_ORDER.map((o) => html`<button class=${`chip${filter.outcome === o ? " on" : ""}`}
+            onClick=${() => setFilter({ outcome: o, phase: filter.phase, errorsOnly: false, offset: 0 })}>
+            <i style=${`background:${OUTCOME_META[o].color}`}></i>${OUTCOME_META[o].label}${sm.counts && sm.counts[o] != null ? ` ${_fmtN(sm.counts[o])}` : ""}</button>`)}
+          <select class="att-phase" value=${filter.phase} onChange=${(e) => set("phase", e.target.value)}>
+            <option value="">every phase</option>
+            ${_PHASES.map((p) => html`<option value=${p}>${p}</option>`)}
+          </select>
+        </div>
+        ${err ? html`<div class="att-verdict att-erroring">${err}</div>` : null}
+        <div class="att-table-wrap">
+          <table class="att-table">
+            <thead><tr><th>#</th><th>t</th><th>phase</th><th>outcome</th><th>rc / sig</th><th>ms</th><th>len</th><th>new</th><th>input (first bytes)</th><th>stderr / note</th></tr></thead>
+            <tbody>
+              ${rows.map((r) => html`<tr key=${r.i}>
+                <td class="num">${r.i}</td><td class="num">${r.t != null ? Number(r.t).toFixed(2) : ""}</td>
+                <td>${r.ph}</td>
+                <td><span class="att-o" style=${`color:${(OUTCOME_META[r.o] || {}).color || "var(--muted)"}`}>${(OUTCOME_META[r.o] || {}).label || r.o}</span>${r.kept ? html` <span class="att-kept" title="joined the corpus">kept</span>` : null}</td>
+                <td><code>${r.sig || (r.rc == null ? "" : r.rc)}</code></td>
+                <td class="num">${r.ms != null ? r.ms : ""}</td><td class="num">${r.len}</td>
+                <td class="num">${r.new || ""}</td>
+                <td><code class="att-hex" title=${`sha256 ${r.in}…${r.argv ? `\nflags: ${r.argv.join(" ")}` : ""}`}>${r.head}</code></td>
+                <td class="att-msg">${r.err || r.note || ""}</td>
+              </tr>`)}
+            </tbody>
+          </table>
+          ${data && !rows.length ? html`<div class="att-empty">No attempts match this filter.</div>` : null}
+        </div>
+        <div class="att-pager">
+          <span>${matched ? `${_fmtN(filter.offset + 1)}–${_fmtN(filter.offset + rows.length)} of ${_fmtN(matched)}` : ""}</span>
+          <button class="btn xsmall ghost" disabled=${filter.offset === 0} onClick=${() => set("offset", Math.max(0, filter.offset - limit))}>‹ prev</button>
+          <button class="btn xsmall ghost" disabled=${filter.offset + rows.length >= matched} onClick=${() => set("offset", filter.offset + limit)}>next ›</button>
+        </div>
+      </div>
+    </div>`;
+}
+
+// Every attempt log in the case (older runs too), newest first.
+export function AttemptLogsList({ logs, onOpen }) {
+  if (!Array.isArray(logs) || !logs.length) return null;
+  return html`
+    <details class="card att-list">
+      <summary class="sysmap-head" style="cursor:pointer">Fuzz attempt logs <span class="tab-n">${logs.length}</span></summary>
+      <div class="sysmap-sub">One log per fuzz engine per run: every execution, what was sent and how it ended.</div>
+      ${logs.map((l) => html`
+        <div key=${l.sha256} class="att-list-row">
+          <span style="flex:0 0 150px">${_FH_ENGINE[l.engine] || l.engine}</span>
+          <span style="flex:0 0 90px" class="num">${_fmtN(l.attempts)} attempts</span>
+          <span style="flex:0 0 160px"><${OutcomeBar} counts=${l.counts} compact=${true} /></span>
+          <span style="flex:1;opacity:.75;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title=${l.verdict_note || ""}>${l.verdict}${l.verdict_note ? ` — ${l.verdict_note}` : ""}</span>
+          <button class="btn xsmall ghost" onClick=${() => onOpen(l.sha256, l.engine)}>open</button>
+        </div>`)}
+    </details>`;
 }

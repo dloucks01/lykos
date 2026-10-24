@@ -13,6 +13,7 @@ import os
 import random
 import re
 import subprocess
+import time
 
 from ..detect.catalog import normalize
 from ..dynamic import sandbox
@@ -97,31 +98,52 @@ def _run_with_env(exe: str, argv: list, env_overrides: dict, timeout: float = 5.
     None (spawn-failure, not a crash) keeps that loader fault from being read as a defect. The
     caller (env_fuzz_stage) already declines a shared object up front -- this is the backstop for
     any other caller."""
+    return _run_with_env_detail(exe, argv, env_overrides, timeout)["rc"]
+
+
+def _run_with_env_detail(exe: str, argv: list, env_overrides: dict, timeout: float = 5.0) -> dict:
+    """`_run_with_env`, keeping what the attempt log needs: {rc, timed_out, spawn_failed, stderr,
+    ms}. `rc` is None on a spawn failure OR a timeout -- the two are told apart here, and only
+    here, which is the difference between "never started" and "started and hung"."""
+    out = {"rc": None, "timed_out": False, "spawn_failed": False, "stderr": b"", "ms": 0}
     if sandbox._is_elf_shared_object(exe):
-        return None
+        out["spawn_failed"] = True
+        return out
     env = {k: os.environ[k] for k in ("PATH", "LANG", "LC_ALL") if k in os.environ}
     env.update(env_overrides)
+    t0 = time.time()
     try:
         proc = subprocess.Popen([exe] + [str(a) for a in argv], stdin=subprocess.DEVNULL,
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=env,
+                                # baseline-aware: RLIMIT_NPROC counts EVERY process this user
+                                # runs, so a flat 64 failed every fork on a busy desktop
                                 preexec_fn=sandbox._rlimits(1024, int(timeout) + 2, set_as=True,
-                                                            nproc=64))
+                                                            nproc=sandbox._nproc_cap(False)))
     except Exception:                                    # noqa: BLE001
-        return None
+        out["spawn_failed"] = True
+        return out
     try:
-        proc.wait(timeout=timeout)
+        _o, err = proc.communicate(timeout=timeout)
+        out["stderr"] = (err or b"")[:4096]
     except subprocess.TimeoutExpired:
         proc.kill()
         try:
-            proc.wait(timeout=2)                         # bounded: a forked child must not wedge us
+            proc.communicate(timeout=2)                  # bounded: a forked child must not wedge us
         except subprocess.TimeoutExpired:
             pass
-        return None
-    return proc.returncode
+        out["timed_out"] = True
+        out["ms"] = int((time.time() - t0) * 1000)
+        return out
+    out["rc"] = proc.returncode
+    out["ms"] = int((time.time() - t0) * 1000)
+    return out
 
 
-def _crashes(exe, argv, overrides, timeout):
-    rc = _run_with_env(exe, argv, overrides, timeout)
+def _crashes(exe, argv, overrides, timeout, on_attempt=None, data=b"", phase="mutate"):
+    d = _run_with_env_detail(exe, argv, overrides, timeout)
+    if on_attempt is not None:
+        on_attempt(data, d, phase, overrides)
+    rc = d["rc"]
     if rc is None:
         return False, None, None
     crashed, sig, sig_name, _ = sandbox.classify_rc(rc)
@@ -129,7 +151,8 @@ def _crashes(exe, argv, overrides, timeout):
 
 
 def fuzz_env(exe: str, env_names, *, argv=(), seeds=(), max_execs: int = 1500, seed: int = 1337,
-             timeout: float = 5.0, run=None, should_stop=None) -> EnvFuzzResult:
+             timeout: float = 5.0, run=None, should_stop=None,
+             on_attempt=None) -> EnvFuzzResult:
     """Fuzz a value into the candidate env vars until one crashes `exe`, then ATTRIBUTE the crash to
     the single variable that reproduces it. Shotgun (all names set to the same payload) finds the
     bug fast; the per-variable re-run names the culprit and confirms it, killing one-off flakes.
@@ -150,14 +173,25 @@ def fuzz_env(exe: str, env_names, *, argv=(), seeds=(), max_execs: int = 1500, s
     """
     if not env_names:
         return EnvFuzzResult(False, note="no candidate env vars")
-    fire = run if run is not None else (lambda ov: _crashes(exe, argv, ov, timeout))
+    # `on_attempt(data, detail, phase, overrides)` sees every execution (the attempt log). A
+    # managed runner only answers crashed-or-not, so its detail is reduced to that.
+    if run is not None:
+        def fire(ov, _d=b"", _ph="mutate"):
+            r = run(ov)
+            if on_attempt is not None:
+                on_attempt(_d, {"rc": None if r[0] else 0, "crashed": bool(r[0]),
+                                "signal_name": r[2], "managed": True}, _ph, ov)
+            return r
+    else:
+        def fire(ov, _d=b"", _ph="mutate"):
+            return _crashes(exe, argv, ov, timeout, on_attempt, _d, _ph)
     rng = random.Random(seed)
     mut = Mutator(rng)
     corpus = [s for s in seeds if s] or [b"A" * 8, b"A" * 128, b"%n%n%n%n", b"../../etc/passwd",
                                          b"A" * 512, b";id", b"$(id)"]
     argv = list(argv)
     n = 0
-    payloads = list(corpus)
+    payloads = corpus_view = list(corpus)
     stop = should_stop if should_stop is not None else (lambda: False)
     while n < max_execs:
         if stop():
@@ -170,11 +204,12 @@ def fuzz_env(exe: str, env_names, *, argv=(), seeds=(), max_execs: int = 1500, s
                                           f"cancelled")
             n += 1
             val = data.replace(b"\x00", b"")             # execve env truncates at NUL
-            crashed, _, _ = fire({name: val.decode("latin-1") for name in env_names})
+            crashed, _, _ = fire({name: val.decode("latin-1") for name in env_names}, val,
+                                 "seed" if payloads is corpus_view else "mutate")
             if crashed:
                 # attribute: which single variable reproduces it?
                 for name in env_names:
-                    c2, sig, signame = fire({name: val.decode("latin-1")})
+                    c2, sig, signame = fire({name: val.decode("latin-1")}, val, "reproduce")
                     if c2:
                         return EnvFuzzResult(True, payload=val, var=name, signal_name=signame,
                                              signal_num=sig, execs=n, note=f"env {name}")

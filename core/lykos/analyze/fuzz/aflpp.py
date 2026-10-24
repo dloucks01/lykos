@@ -450,7 +450,11 @@ def campaign_stats(out_dir) -> dict:
                          # edge coverage: AFL's own measure of how much of the target the
                          # campaign actually exercised. `bitmap_cvg` is a percentage of the
                          # shared-memory edge map filled; `edges_found` is the absolute count.
-                         "bitmap_cvg", "edges_found"):
+                         "bitmap_cvg", "edges_found",
+                         # did the campaign EARN its time: inputs it found beyond the seeds, when
+                         # it last found one, and how repeatable the target's paths are.
+                         "corpus_found", "last_find", "start_time", "last_update", "run_time",
+                         "stability", "saved_hangs", "saved_crashes"):
                     out[k] = v
         except OSError:
             pass
@@ -483,3 +487,68 @@ def harvest_crashes(out_dir) -> list:
             seen.add(key)
             inputs.append(data)
     return inputs
+
+
+def _afl_name_meta(name: str) -> dict:
+    """AFL++ names every saved input after how it was found:
+    `id:000012,src:000003,time:1234,execs:5678,op:havoc,rep:2,+cov`. Parsed into a dict so the
+    attempt log can say which input produced which, when, and whether it added coverage."""
+    out: dict = {}
+    for part in name.split(","):
+        k, sep, v = part.partition(":")
+        if sep:
+            out[k] = v
+        elif part == "+cov":
+            out["cov"] = True
+        elif part:
+            out.setdefault("flags", []).append(part)
+    for k in ("time", "execs"):
+        if k in out and str(out[k]).isdigit():
+            out[k] = int(out[k])
+    return out
+
+
+def saved_entries(out_dir, kind: str = "queue") -> list:
+    """[(path, meta)] for every input AFL saved under `kind` (queue | crashes | hangs), in id
+    order. The queue is the corpus: the seeds AFL imported (`orig:`) plus every input it kept
+    because it reached new coverage -- the only per-input record AFL leaves of its campaign."""
+    out = Path(out_dir)
+    rows = []
+    for d in list(out.glob(f"*/{kind}")) + [out / kind]:
+        if not d.is_dir():
+            continue
+        for f in sorted(d.iterdir()):
+            if f.is_file() and f.name.startswith("id:"):
+                rows.append((f, _afl_name_meta(f.name)))
+    return rows
+
+
+def plot_series(out_dir) -> list:
+    """AFL++'s `plot_data` (its coverage-over-time log) as a list of dicts keyed by the header's
+    own column names, so a column added or reordered between AFL versions is still read right.
+    Empty when the file is missing or unreadable."""
+    for name in ("default/plot_data", "plot_data"):
+        f = Path(out_dir) / name
+        if not f.exists():
+            continue
+        try:
+            lines = f.read_text(errors="replace").splitlines()
+        except OSError:
+            return []
+        if not lines or not lines[0].startswith("#"):
+            return []
+        cols = [c.strip() for c in lines[0].lstrip("#").split(",")]
+        rows = []
+        for ln in lines[1:]:
+            vals = [v.strip() for v in ln.split(",")]
+            if len(vals) != len(cols):
+                continue
+            r = {}
+            for c, v in zip(cols, vals):
+                try:
+                    r[c] = float(v.rstrip("%"))
+                except ValueError:
+                    r[c] = v
+            rows.append(r)
+        return rows
+    return []

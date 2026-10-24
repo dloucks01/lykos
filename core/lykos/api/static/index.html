@@ -856,6 +856,50 @@
     background: color-mix(in srgb, var(--accent) 12%, var(--panel-2)); }
   /* Dialogs are focusable containers; keep the programmatic focus-on-open ring quiet. */
   .modal:focus { outline: none; }
+  /* fuzz attempt outcomes (fuzz/attempts.py) */
+  .ob { display: inline-flex; align-items: center; gap: 10px; flex-wrap: wrap; min-width: 0; }
+  .ob-bar { display: inline-flex; width: 180px; max-width: 100%; height: 8px; border-radius: 4px;
+    overflow: hidden; background: var(--panel-2); flex: 0 0 auto; }
+  .ob-compact .ob-bar { width: 90px; height: 6px; }
+  .ob-seg { display: block; height: 100%; }
+  .ob-legend { display: inline-flex; flex-wrap: wrap; gap: 10px; font-size: 11px; color: var(--muted); }
+  .ob-key i, .chip i { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 4px; vertical-align: middle; }
+  .fz-outcomes { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 10px; font-size: 12px; }
+  .fz-outcomes-k { color: var(--muted); }
+  .fz-err { color: var(--bad); font-weight: 600; font-size: 12px; }
+  .fz-err-banner { margin-top: 10px; padding: 8px 10px; border-left: 3px solid var(--bad);
+    background: color-mix(in srgb, var(--bad) 10%, transparent); font-size: 12.5px; line-height: 1.5; }
+  .fh-row { padding: 4px 0; border-bottom: 1px solid color-mix(in srgb, var(--line) 50%, transparent); }
+  .fh-row:last-child { border-bottom: 0; }
+  .fh-detail { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin: 4px 0 2px 160px; font-size: 11.5px; }
+  .fh-value { color: var(--muted); }
+  @media (max-width: 640px) { .fh-detail { margin-left: 0; } }
+  .modal.attempts { padding: 0; max-width: 1100px; width: 96%; max-height: 90vh; display: flex; flex-direction: column; }
+  .att-verdict { margin: 0 16px 8px; padding: 8px 10px; border-left: 3px solid var(--ok); background: var(--panel-2); font-size: 12.5px; line-height: 1.5; }
+  .att-erroring, .att-crashing_all { border-left-color: var(--bad); }
+  .att-rejecting, .att-timing_out, .att-too_few { border-left-color: var(--warn); }
+  .att-bar { margin: 0 16px 8px; }
+  .att-tops { margin: 0 16px 8px; font-size: 12px; }
+  .att-top { display: flex; gap: 8px; align-items: baseline; padding: 2px 0; min-width: 0; }
+  .att-n { color: var(--muted); flex: 0 0 auto; }
+  .att-msg { font-family: var(--mono); font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+  .att-filters { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 0 16px 8px; }
+  .chip { background: var(--panel-2); border: 1px solid var(--line); color: var(--ink); border-radius: 999px;
+    padding: 2px 10px; font-size: 11.5px; cursor: pointer; }
+  .chip.on { border-color: var(--accent); color: var(--accent); }
+  .att-phase { background: var(--panel-2); color: var(--ink); border: 1px solid var(--line); border-radius: 6px; font-size: 11.5px; padding: 2px 6px; }
+  .att-table-wrap { overflow: auto; flex: 1 1 auto; margin: 0 16px; border: 1px solid var(--line); border-radius: 8px; }
+  .att-table { width: 100%; border-collapse: collapse; font-size: 11.5px; }
+  .att-table th { position: sticky; top: 0; background: var(--panel-2); text-align: left; font-weight: 600; color: var(--muted); padding: 5px 8px; white-space: nowrap; }
+  .att-table td { padding: 3px 8px; border-top: 1px solid color-mix(in srgb, var(--line) 60%, transparent); white-space: nowrap; }
+  .att-table td.att-msg { max-width: 360px; }
+  .att-table .num { text-align: right; font-variant-numeric: tabular-nums; }
+  .att-hex { font-size: 11px; color: var(--muted); }
+  .att-o { font-weight: 600; }
+  .att-kept { font-size: 10px; color: var(--accent); border: 1px solid var(--accent); border-radius: 4px; padding: 0 3px; }
+  .att-empty { padding: 16px; color: var(--muted); text-align: center; }
+  .att-pager { display: flex; justify-content: flex-end; align-items: center; gap: 8px; padding: 10px 16px; font-size: 12px; color: var(--muted); }
+  .att-list-row { display: flex; gap: 10px; align-items: center; font-size: 12px; padding: 4px 0; min-width: 0; }
   /* Honour a reduced-motion preference: no spinners whirring, no eased transitions. */
   @media (prefers-reduced-motion: reduce) {
     *, *::before, *::after {

@@ -9,7 +9,7 @@ import { isFolderPick, folderArchive } from "./archive.js";
 import { runAutopilotCase, newController, cancel as cancelAutopilot, coverageOf } from "./autopilot.js";
 import { rankFindings, pocsForFinding, fmtTime, progressText, stageLabel, dedupeFindings, buildRunLog, buildVerdicts, filterByViz } from "./util.js";
 import {
-  html, DropZone, TargetSummary, ProgressLog, ConsolePanel, FuzzConsole, RunHeader, FuzzHealthPanel, DynamicCoverageBanner, FindingCard, EmptyResults, Spinner, UnavailablePanel, RunScorecard, SystemMap, CoveragePanel, CodeView, PipelinePlan, EvidenceModal, FunctionsModal, VerdictStrip, VerdictCard, AnalysisDrawer, ShellVerdict, ExploitsPanel, DrawerFacts, TargetBar, FunctionsPanel, StringsPanel, DisasmPanel, DiffPanel, CrashesPanel, CallGraphCanvas, CaseOverview,
+  html, DropZone, TargetSummary, ProgressLog, ConsolePanel, FuzzConsole, RunHeader, FuzzHealthPanel, AttemptLogModal, AttemptLogsList, DynamicCoverageBanner, FindingCard, EmptyResults, Spinner, UnavailablePanel, RunScorecard, SystemMap, CoveragePanel, CodeView, PipelinePlan, EvidenceModal, FunctionsModal, VerdictStrip, VerdictCard, AnalysisDrawer, ShellVerdict, ExploitsPanel, DrawerFacts, TargetBar, FunctionsPanel, StringsPanel, DisasmPanel, DiffPanel, CrashesPanel, CallGraphCanvas, CaseOverview,
 } from "./components.js";
 
 let _conSeq = 0;
@@ -86,6 +86,10 @@ function fuzzStageLabel(type) {
 // time instead of a silent run. Prefers an explicit message/note, else a few scalar fields;
 // skips the bulky array payloads (argv, channels, candidates) that are not line-sized.
 function fuzzSummary(type, p) {
+  // An engine's attempt-log summary: its verdict over every attempt it made.
+  if (/\.attempts$/.test(type) && p.verdict_note) {
+    return `${p.engine || type.split(".")[0]}: ${p.verdict_note}`;
+  }
   if (p.msg) return p.msg;
   if (p.note) return p.note;
   const skip = new Set(["argv", "channels", "arrays", "candidates", "blocks"]);
@@ -169,6 +173,8 @@ function App() {
   const consoleSeen = useRef(new Set());              // de-dupe exec events by server id
   const [fuzzLive, setFuzzLive] = useState(null);     // live fuzzing telemetry (latest .progress)
   const [fuzzHealth, setFuzzHealth] = useState(null); // per-engine fuzzing health verdict (R1)
+  const [attemptLogs, setAttemptLogs] = useState([]);  // every fuzz attempt log in the case
+  const [openLog, setOpenLog] = useState(null);        // {sha, engine} shown in the log viewer
   const [fuzzState, setFuzzState] = useState(null);   // live Running/Converging/Stalled badge (U2)
   const fuzzTrendRef = useRef({ cov: null, grewAt: 0, seenAt: 0 }); // coverage-growth trend
   const [invChosen, setInvChosen] = useState(null);   // auto-discovered invocation (R2: "driving as")
@@ -393,6 +399,7 @@ function App() {
     setFindings(fs || []);
     setPocs((psArrays || []).flat());
     setSysmap(sm);
+    api.attemptLogs(id).then((l) => setAttemptLogs(Array.isArray(l) ? l : [])).catch(() => {});
   }, [caseId, targets]);
 
   // Poll the server-side background Autopilot for a case. It keeps running even if this tab is
@@ -427,6 +434,10 @@ function App() {
               // console line. Says WHY the dynamic engines contributed what they did.
               setFuzzHealth(ev.payload || null);
               continue;
+            }
+            if (/\.attempts$/.test(ev.type)) {
+              // An engine finished and stored its attempt log: refresh the case's list.
+              api.attemptLogs(cid).then((l) => setAttemptLogs(Array.isArray(l) ? l : [])).catch(() => {});
             }
             if (ev.type === "coverage.invocation") {
               // R2: the invocation the autopilot AUTO-DISCOVERED and is driving the target with
@@ -646,7 +657,7 @@ function App() {
       setError(`could not pack the folder: ${e.message || e}`);
       return;
     }
-    if (!append) { setLog([]); setFindings([]); setPocs([]); setAdvice(null); setRan(false); setUnavailable([]); setSysmap(null); setCoverage({}); setVerifications({}); setScorecard([]); setFuzzHealth(null); setFuzzState(null); setInvChosen(null); fuzzTrendRef.current = { cov: null, grewAt: 0, seenAt: 0 }; setBg(null); bgPollRef.current++; bgEventsAfter.current = -1; }
+    if (!append) { setLog([]); setFindings([]); setPocs([]); setAdvice(null); setRan(false); setUnavailable([]); setSysmap(null); setCoverage({}); setVerifications({}); setScorecard([]); setFuzzHealth(null); setAttemptLogs([]); setOpenLog(null); setFuzzState(null); setInvChosen(null); fuzzTrendRef.current = { cov: null, grewAt: 0, seenAt: 0 }; setBg(null); bgPollRef.current++; bgEventsAfter.current = -1; }
     try {
       const cid = await ensureCase();
       const got = append ? [...targets] : [];
@@ -1283,7 +1294,8 @@ function App() {
                 <!-- Run-mechanics live in the Console (the activity hub), NOT duplicated onto every
                      tab (they used to render outside the tab switch, so engine health + "what this
                      run did" painted on Overview, Exploits, Dynamic and Diff too -- the overlap). -->
-                <${FuzzHealthPanel} health=${fuzzHealth} />
+                <${FuzzHealthPanel} health=${fuzzHealth} onOpenLog=${(sha, engine) => setOpenLog({ sha, engine })} />
+                <${AttemptLogsList} logs=${attemptLogs} onOpen=${(sha, engine) => setOpenLog({ sha, engine })} />
                 <${RunScorecard} cards=${scorecard} targetName=${activeTarget && activeTarget.filename} />
                 <${UnavailablePanel} items=${unavailable} />
               </div>
@@ -1292,6 +1304,8 @@ function App() {
         </div>
       `}
 
+      ${openLog ? html`<${AttemptLogModal} sha=${openLog.sha} engine=${openLog.engine}
+        fetchPage=${api.attemptLog} artifactUrl=${api.artifactUrl} onClose=${() => setOpenLog(null)} />` : null}
       ${codeFn ? html`<${CodeView} fn=${codeFn.fn} finding=${codeFn.finding} source=${codeFn.source}
         crumbs=${codeFn.crumbs} xbinCallers=${codeFn.xbinCallers}
         onNavigate=${(name) => followCall(name, codeFn.targetId, codeFn.crumbs)}

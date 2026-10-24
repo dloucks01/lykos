@@ -142,6 +142,16 @@ export const api = {
   // size, kind, text?|hexdump?}], download }. Lets the UI show the exploit -- repro script,
   // payload hexdump, technique notes -- inline instead of only offering the tarball.
   bundle: (sha) => _req("GET", `/artifacts/${sha}/bundle`),
+  // A fuzz engine's per-attempt log (every execution and how it ended), filtered + paged, and the
+  // list of every such log in a case.
+  attemptLog: (sha, { outcome, phase, errorsOnly, offset = 0, limit = 200 } = {}) => {
+    const q = new URLSearchParams({ offset: String(offset), limit: String(limit) });
+    if (outcome) q.set("outcome", outcome);
+    if (phase) q.set("phase", phase);
+    if (errorsOnly) q.set("errors_only", "1");
+    return _req("GET", `/artifacts/${sha}/attempts?${q}`);
+  },
+  attemptLogs: (caseId) => _req("GET", `/cases/${caseId}/attempt-logs`),
 };
 
 // Poll a run until it reaches a terminal status. Resolves with the final run record.

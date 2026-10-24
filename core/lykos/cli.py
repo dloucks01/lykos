@@ -209,6 +209,95 @@ def _export_pocs(store, target, out_dir) -> None:
     print("  RUN IN A SANDBOX OR VM: a PoC executes an untrusted binary. Authorized use only.")
 
 
+def _print_fuzz_health(fh) -> None:
+    """Per-engine fuzzing health -- the same verdicts the web GUI's panel shows, including how the
+    attempts ENDED, so a CLI run can tell a campaign from an error loop too."""
+    if not fh or not fh.get("engines"):
+        return
+    print(f"  fuzzing      {fh.get('verdict')}: {fh.get('note')}")
+    for e in fh["engines"]:
+        oc = e.get("outcomes") or {}
+        mix = ", ".join(f"{k.replace('_', ' ')} {v:,}" for k, v in oc.items() if v)
+        val = e.get("value") or {}
+        gain = (f"; +{val['gained']} {val['unit']} beyond seeds"
+                if val.get("unit") in ("blocks", "behaviours", "edges") and val.get("gained") is not None
+                else "")
+        line = f"    - {e['engine']:<14} {e['status']:<10}"
+        if e.get("execs"):
+            line += f" {e['execs']:,} attempts"
+        if mix:
+            line += f" ({mix})"
+        line += gain
+        if e.get("reason"):
+            line += f" -- {e['reason']}"
+        print(line[:300])
+        if e.get("log"):
+            print(f"      log: lykos fuzz-log --case-store <case> --log {e['log'][:12]}")
+
+
+def _cmd_fuzz_log(args: argparse.Namespace) -> int:
+    """Print a fuzz engine's per-attempt log: every execution, what was sent and how it ended.
+    The CLI twin of the web GUI's attempt-log viewer."""
+    import json as _json
+
+    from .analyze.fuzz import attempts as _attempts
+    from .casestore import CaseStore
+    store = CaseStore.open(Path(args.case_store))
+    logs = []
+    for case in store.cases.list():
+        for a in store.artifacts.list_by_case(case.id):
+            if a.kind == _attempts.LOG_KIND:
+                logs.append(a)
+    logs.sort(key=lambda a: a.created_at)
+    if args.engine:
+        logs = [a for a in logs if (a.meta or {}).get("engine") == args.engine]
+    if args.target:
+        logs = [a for a in logs if str((a.meta or {}).get("target_id") or "").startswith(args.target)]
+    if args.log:
+        logs = [a for a in logs if a.sha256.startswith(args.log)]
+    if not logs:
+        print("no fuzz attempt logs match (they are written by runs made with this build)",
+              file=sys.stderr)
+        return 1
+    if not (args.log or args.engine) or args.list:
+        for a in logs:
+            m = a.meta or {}
+            c = m.get("counts") or {}
+            mix = ", ".join(f"{k.replace('_', ' ')} {v:,}" for k, v in c.items() if v)
+            print(f"{a.sha256[:12]}  {str(m.get('engine')):<14} {m.get('attempts', 0):>8,} "
+                  f"attempts  {str(m.get('verdict')):<12} {mix}")
+        if args.list or len(logs) > 1:
+            print("\nshow one: --log <id>  (or --engine <name> for its latest)")
+            return 0
+    a = logs[-1]
+    out = _attempts.read_log(store.content.path(a.sha256),
+                             outcome=[x for x in (args.outcome or "").split(",") if x] or None,
+                             phase=[x for x in (args.phase or "").split(",") if x] or None,
+                             offset=args.offset, limit=args.limit, errors_only=args.errors_only)
+    if args.json:
+        print(_json.dumps(out, indent=1))
+        return 0
+    sm, hd = out["summary"], out["header"]
+    print(f"engine {hd.get('engine')}  log {a.sha256[:12]}  {out['total']:,} attempts  "
+          f"verdict {sm['verdict']}")
+    print(f"  {sm['verdict_note']}")
+    for o, tops in (sm.get("top_errors") or {}).items():
+        for t in tops[:2]:
+            print(f"  top {o:<10} x{t['count']:<6,} rc={t['rc']}  {t['msg']}")
+    print(f"\n{'#':>7} {'t(s)':>8} {'phase':<9} {'outcome':<11} {'rc/sig':<9} {'ms':>6} "
+          f"{'len':>6} {'new':>4}  input / stderr")
+    for r in out["rows"]:
+        rcs = r.get("sig") or ("" if r.get("rc") is None else str(r.get("rc")))
+        tail = r.get("err") or r.get("note") or ""
+        print(f"{r.get('i', 0):>7} {r.get('t', 0):>8.2f} {str(r.get('ph')):<9} "
+              f"{str(r.get('o')):<11} {rcs:<9} {r.get('ms', ''):>6} {r.get('len', 0):>6} "
+              f"{r.get('new', ''):>4}  {r.get('head', '')[:24]}{'  ' + tail if tail else ''}"[:220])
+    shown = len(out["rows"])
+    if out["matched"] > args.offset + shown:
+        print(f"\n{out['matched'] - args.offset - shown:,} more -- use --offset {args.offset + shown}")
+    return 0
+
+
 def _print_scorecard(card: dict) -> None:
     """What the run DID. Printed before the findings, because it is what makes them readable."""
     if not card:
@@ -277,6 +366,7 @@ def _print_scorecard(card: dict) -> None:
             else:
                 mark = "NOT BUILT: " + (d.get("why") or "no reason given")
             print(f"    - {str(d.get('entry') or '?'):28} {mark}")
+    _print_fuzz_health(card.get("fuzz_health"))
     # THE LADDER. This is what the tool exists to produce and the run never printed it.
     poc = card.get("poc") or {}
     ncr = card.get("crashes")
@@ -490,6 +580,24 @@ def build_parser() -> argparse.ArgumentParser:
     an.add_argument("--workers", type=int, default=3, help="worker threads (default 3)")
     an.add_argument("-q", "--quiet", action="store_true", help="no per-stage progress")
     an.set_defaults(func=_cmd_analyze)
+
+    fl = sub.add_parser("fuzz-log",
+                        help="show a fuzz engine's per-attempt log: every execution and how it ended")
+    fl.add_argument("--case-store", required=True, help="the case directory")
+    fl.add_argument("--engine", default=None,
+                    help="fuzz | directed_fuzz | coverage_fuzz | env_fuzz | net_fuzz | boundary_fuzz")
+    fl.add_argument("--target", default=None, help="target id (prefix)")
+    fl.add_argument("--log", default=None, help="a log id (prefix) from --list")
+    fl.add_argument("--list", action="store_true", help="list the logs only")
+    fl.add_argument("--outcome", default=None,
+                    help="filter: no_start,crash,timeout,error_exit,clean_exit (comma-separated)")
+    fl.add_argument("--phase", default=None,
+                    help="filter: seed,mutate,minimize,reproduce,afl-seed,afl-queue,afl-crash,...")
+    fl.add_argument("--errors-only", action="store_true", help="every attempt that did not exit 0")
+    fl.add_argument("--offset", type=int, default=0)
+    fl.add_argument("--limit", type=int, default=200)
+    fl.add_argument("--json", action="store_true", help="raw JSON (summary + rows)")
+    fl.set_defaults(func=_cmd_fuzz_log)
 
     dr = sub.add_parser("doctor",
                         help="what this host can and cannot do, and how to fix the gaps")

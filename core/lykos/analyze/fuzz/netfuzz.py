@@ -103,7 +103,7 @@ def _spawn_server(exe: str, argv: list, mem_mb: int = 1024) -> "subprocess.Popen
     # is honest) rather than execute a library as a program -- the same guard sandbox.run has.
     if sandbox._is_elf_shared_object(exe):
         return None
-    rlimits = sandbox._rlimits(mem_mb, 60, set_as=True, nproc=64)
+    rlimits = sandbox._rlimits(mem_mb, 60, set_as=True, nproc=sandbox._nproc_cap(False))
 
     def preexec():
         rlimits()
@@ -266,7 +266,7 @@ def replay_once(exe: str, proto: str, payload: bytes, *, argv=(), port: "int | N
 
 def fuzz_server(exe: str, proto: str, *, argv=(), seeds=(), port: "int | None" = None,
                 max_execs: int = 1500, seed: int = 1337,
-                listen_timeout: float = 5.0) -> NetFuzzResult:
+                listen_timeout: float = 5.0, on_attempt=None) -> NetFuzzResult:
     """Spawn `exe`, find its listening port, and fuzz it over a socket until a payload crashes it
     or the budget runs out. On a crash, respawn to CONFIRM the same payload reproduces before
     reporting it (kills one-off flakes). Returns a NetFuzzResult."""
@@ -274,14 +274,25 @@ def fuzz_server(exe: str, proto: str, *, argv=(), seeds=(), port: "int | None" =
     mut = Mutator(rng)
     corpus = [s for s in seeds if s] or _default_corpus()
     found = {"port": port}
+    # `on_attempt(data, detail, phase)` sees every delivery (the attempt log). detail: {outcome,
+    # rc, note}. A server that is still up after a payload "handled" it (clean); one that died
+    # is classified by its exit status; a refused connection means the payload never arrived.
+    _att = on_attempt or (lambda *_a, **_k: None)
 
     def _run_campaign(confirm_payload=None):
+        ph = "confirm" if confirm_payload else "mutate"
         proc = _spawn_server(exe, list(argv))
         if proc is None:
+            _att(confirm_payload or b"", {"outcome": "no_start", "rc": None,
+                                          "note": "server process could not be spawned"}, ph)
             return None, None, "spawn-failed", 0
         try:
             p = _wait_for_port(proc, proto, port, listen_timeout)
             if p is None:
+                rc0 = proc.poll()
+                _att(confirm_payload or b"", {"outcome": "no_start", "rc": rc0,
+                     "note": (f"server exited ({rc0}) before listening" if rc0 is not None
+                              else f"no {proto} listening port within {listen_timeout:g}s")}, ph)
                 return None, None, "no-listen", 0
             found["port"] = p
             payloads = [confirm_payload] if confirm_payload else list(corpus)
@@ -289,15 +300,25 @@ def fuzz_server(exe: str, proto: str, *, argv=(), seeds=(), port: "int | None" =
             while confirm_payload or n < max_execs:
                 for data in payloads:
                     n += 1
+                    refused = None
                     try:
                         _send_once(proto, p, data)
-                    except OSError:
+                    except OSError as e:
                         # connection refused/reset -> the server may have just died; check below
-                        pass
+                        refused = str(e)[:120]
                     # a crash lands just after delivery; wait a beat so we don't race the kernel.
                     rc = _poll_death(proc, timeout=(0.6 if confirm_payload else 0.15))
-                    if rc is not None:
+                    if rc is None:
+                        _att(data, {"outcome": "no_start" if refused else "clean_exit",
+                                    "rc": None, "note": (f"send failed: {refused}" if refused
+                                                         else "server alive after payload")},
+                             ph if confirm_payload or n > len(corpus) else "seed")
+                    else:
                         crashed, _sig, sig_name, _ = sandbox.classify_rc(rc)
+                        _att(data, {"outcome": "crash" if crashed else "error_exit", "rc": rc,
+                                    "sig": sig_name if crashed else None,
+                                    "note": f"server died ({sig_name if crashed else f'exit {rc}'})"},
+                             ph)
                         return (data if crashed else None), (-rc if rc < 0 else None), \
                             (sig_name if crashed else f"exit{rc}"), n
                     if confirm_payload:

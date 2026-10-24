@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import time
 from pathlib import Path
 
 from ... import observe
@@ -73,7 +74,7 @@ def toolchain_missing(use_qemu=True):
 _SEED_SCREEN_TIMEOUT = 3.0
 
 
-def _drop_timeout_seeds(ctx, target, exe, seeds, mode) -> set:
+def _drop_timeout_seeds(ctx, target, exe, seeds, mode, alog=None) -> set:
     """Indices of seeds afl-fuzz's dry run would REJECT -- those that TIME OUT or CRASH.
 
     afl-fuzz aborts the WHOLE campaign on a single dry-run seed that hangs ("results in a
@@ -97,6 +98,9 @@ def _drop_timeout_seeds(ctx, target, exe, seeds, mode) -> set:
         for i, data in enumerate(seeds):
             r = sandbox.run(exe, stdin=data, timeout=_SEED_SCREEN_TIMEOUT, arch=target.arch,
                             endianness=target.endianness, bits=target.bits)
+            if alog is not None:
+                alog.record_result(data, r, phase="afl-seed",
+                                   note="pre-screen: would afl's dry run accept this seed?")
             if r.timed_out or r.crashed:                 # afl's dry run rejects either
                 bad.add(i)
     except Exception:                                    # noqa: BLE001 -- advisory screening
@@ -323,7 +327,14 @@ def coverage_stage(ctx) -> dict:
     # flag-independent (`-t msec+` only changes AFL's auto-calculation, not this abort), costs
     # one fast native exec per seed, and is reported rather than silent -- the blind `fuzz`
     # stage has no such restriction and still runs them.
-    slow = _drop_timeout_seeds(ctx, target, exe, seeds, mode)
+    # The attempt log (fuzz/attempts.py). AFL runs thousands of executions a second inside its own
+    # process and records only what it KEEPS, so this log holds: every seed screened here, every
+    # input AFL saved (corpus, crashes, hangs) with how AFL found it, and a replay of the saved
+    # inputs through our own runner to see how each one actually ENDS.
+    from . import attempts as _attempts
+    alog = _attempts.AttemptLog(ctx, "coverage_fuzz", "coverage", unit="edges",
+                                target_id=target.id)
+    slow = _drop_timeout_seeds(ctx, target, exe, seeds, mode, alog=alog)
     if slow:
         seeds = [s for i, s in enumerate(seeds) if i not in slow]
         ctx.emit("coverage.seeds", payload={
@@ -341,9 +352,10 @@ def coverage_stage(ctx) -> dict:
                 f"afl-fuzz needs at least one seed that runs cleanly on the {mode} channel, and "
                 f"this target has none. The sandbox fuzzers still run it under their own "
                 f"per-execution limit, and any crashing seed is itself handled there.")
+        _att = alog.finish()
         ctx.emit("coverage.done", payload={"supported": False, "backend": "aflpp",
                                            "crash_inputs": 0, "unique": 0, "confirmed": 0,
-                                           "note": note})
+                                           "note": note, "attempts": _brief(_att)})
         ctx.progress(pct=100, msg="no afl-usable seed (all time out or crash) — sandbox fuzzers cover it")
         return {}
     seeds = seeds or list(_DEFAULT_SEEDS)
@@ -418,9 +430,10 @@ def coverage_stage(ctx) -> dict:
             # The handshake almost certainly failed because the target could not start: lead with
             # the concrete cause and remedy, not the opaque afl abort.
             note = f"{_dep_why} (afl reported: {failed})"
+        _att = alog.finish(afl_aborted=failed)
         ctx.emit("coverage.done", payload={"supported": False, "backend": "aflpp",
                                            "crash_inputs": 0, "unique": 0, "confirmed": 0,
-                                           "aborted": True, "note": note})
+                                           "aborted": True, "note": note, "attempts": _brief(_att)})
         ctx.progress(pct=100, msg=f"afl-fuzz could not run this target: {failed[:70]}")
         return {}
     # What the campaign actually DID -- "0 crashes" after two million executions and "0
@@ -501,6 +514,8 @@ def coverage_stage(ctx) -> dict:
         if ctx.should_cancel():
             break
         res = _replay(data)
+        alog.record_result(data, res, phase="afl-crash",
+                           note=None if res.crashed else "AFL saved it as a crash; did not reproduce here")
         if not res.crashed:
             continue                                  # not reproducible in our sandbox
         sig = res.signal_name
@@ -528,6 +543,7 @@ def coverage_stage(ctx) -> dict:
         def _same(d, _sig=sig):
             r = run_input(exe, mode, workfile, exec_timeout, target.arch, d,
                           base_argv=replay_argv, endianness=target.endianness, bits=target.bits)[1]
+            alog.record_result(d, r, phase="minimize")
             return r.crashed and r.signal_name == _sig
 
         mdata, _ = minimize(_same, data, cap=200)
@@ -553,8 +569,12 @@ def coverage_stage(ctx) -> dict:
         _msan_scan(ctx, target, out_dir, mode, exec_timeout, raw)
     except Exception:
         observe.absorbed(_log, "continuing")
+    _att = _log_afl_campaign(ctx, alog, out_dir, stats, exe=exe, mode=mode, target=target,
+                             replay_argv=replay_argv, exec_timeout=exec_timeout,
+                             seconds=seconds, workfile=workfile)
     ctx.emit("coverage.done", payload={"crash_inputs": len(raw),
-                                       "unique": len(seen_crashes), "confirmed": confirmed})
+                                       "unique": len(seen_crashes), "confirmed": confirmed,
+                                       "attempts": _brief(_att)})
     ctx.progress(pct=100, msg=f"{len(raw)} crash inputs, {len(seen_crashes)} unique crashes")
     # Persist the campaign's own measure of how much it exercised, so the run's output carries
     # the coverage it achieved -- not just its crash count. `bitmap_cvg` is AFL's edge-map
@@ -572,6 +592,110 @@ def coverage_stage(ctx) -> dict:
     # Persist as the run's output artifact so /runs/<id>/output carries the coverage achieved.
     sha = ctx.put_artifact("fuzz-summary", data=canonical_json(summary))
     return {"output_shas": [sha], "output_kind": "fuzz-summary"}
+
+
+def _brief(att: dict) -> dict:
+    return {k: (att or {}).get(k) for k in ("counts", "verdict", "verdict_note", "value", "log")}
+
+
+_QUEUE_REPLAY_CAP = 300           # saved inputs replayed through our runner, at most
+
+
+def _log_afl_campaign(ctx, alog, out_dir, stats, *, exe, mode, target, replay_argv, exec_timeout,
+                      seconds, workfile) -> dict:
+    """Fold what AFL kept into the attempt log and finish it. Never raises (advisory).
+
+    * every queue entry (the corpus: imported seeds + inputs AFL kept for new coverage), with
+      AFL's own provenance (src/op/time/execs/+cov) -- replayed through our runner, up to a cap
+      and a time slice, so each line also says how that input actually ENDS on this target;
+    * every hang AFL saved (AFL's verdict: timeout);
+    * the value measure from AFL's own numbers: edges the seeds reached (first plot_data row)
+      vs. at the end, and when it last found anything (fuzzer_stats last_find - start_time)."""
+    try:
+        queue = aflpp.saved_entries(out_dir, "queue")
+        deadline = time.time() + min(90.0, 10.0 + 0.15 * float(seconds or 30))
+        replayed = 0
+        batch: list = []
+
+        def _flush():
+            nonlocal replayed
+            if not batch:
+                return
+            datas = [d for d, _m in batch]
+            res = None
+            try:
+                res = sandbox.run_batch(exe, datas, mode=mode, base_argv=replay_argv,
+                                        timeout=exec_timeout, arch=target.arch,
+                                        endianness=target.endianness, bits=target.bits)
+            except Exception:                            # noqa: BLE001 -- fall back per input
+                res = None
+            if not res:
+                res = [run_input(exe, mode, workfile, exec_timeout, target.arch, d,
+                                 base_argv=replay_argv, endianness=target.endianness,
+                                 bits=target.bits)[1] for d in datas]
+            for (d, m), r in zip(batch, res):
+                alog.record_result(d, r, phase="afl-queue", note=m.get("op") or
+                                   ("seed" if "orig" in m else None))
+                replayed += 1
+            batch.clear()
+
+        for f, meta in queue:
+            try:
+                data = f.read_bytes()
+            except OSError:
+                continue
+            m = {k: meta[k] for k in ("id", "src", "op", "time", "execs", "orig", "cov")
+                 if k in meta}
+            if replayed + len(batch) < _QUEUE_REPLAY_CAP and time.time() < deadline \
+                    and not ctx.should_cancel():
+                batch.append((data, m))
+                if len(batch) >= 32:
+                    _flush()
+                continue
+            # Past the cap: still one line per saved input, with AFL's provenance, unreplayed.
+            alog.record(data, outcome="not_replayed", phase="afl-queue", extra={"afl": m})
+        _flush()
+        for f, meta in aflpp.saved_entries(out_dir, "hangs"):
+            try:
+                data = f.read_bytes()
+            except OSError:
+                continue
+            alog.record(data, outcome="timeout", phase="afl-hang",
+                        note="AFL saved this input as a hang", extra={"afl": {
+                            k: meta[k] for k in ("id", "src", "op", "time") if k in meta}})
+        # Value: AFL's own coverage numbers.
+        series = aflpp.plot_series(out_dir)
+
+        def _num(v):
+            try:
+                return float(str(v).rstrip("%"))
+            except (TypeError, ValueError):
+                return None
+        final_edges = _num(stats.get("edges_found"))
+        seed_edges = _num(series[0].get("edges_found")) if series else None
+        last_gain = None
+        lf, st = _num(stats.get("last_find")), _num(stats.get("start_time"))
+        if lf and st and lf >= st:
+            last_gain = lf - st
+        if seed_edges is not None or final_edges is not None:
+            alog.set_value(seed=int(seed_edges or 0),
+                           gained=int(max(0.0, (final_edges or 0) - (seed_edges or 0))),
+                           last_gain_s=last_gain)
+        timeline = [{"t": r.get("relative_time"), "edges": r.get("edges_found"),
+                     "execs": r.get("total_execs"), "corpus": r.get("corpus_count")}
+                    for r in series[:: max(1, len(series) // 60)]] if series else []
+        return alog.finish(afl_execs=_num(stats.get("execs_done")),
+                           afl_corpus_found=_num(stats.get("corpus_found")),
+                           afl_stability=stats.get("stability"), afl_timeline=timeline,
+                           queue_saved=len(queue), queue_replayed=replayed,
+                           logged_note=("AFL executes inside its own process and records only the "
+                                        "inputs it keeps; this log holds every seed screened, every "
+                                        "input AFL saved (replayed here up to "
+                                        f"{_QUEUE_REPLAY_CAP}), its crashes and hangs, and its "
+                                        "coverage timeline"))
+    except Exception:                                    # noqa: BLE001 -- advisory
+        observe.absorbed(_log, "attempt log incomplete")
+        return alog.finish()
 
 
 def register() -> None:

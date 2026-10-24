@@ -37,8 +37,8 @@ from ...db.dao import (
 )
 from ...hashing import canonical_json
 from ...jobs.registry import register_stage
-from ..source_lookup import source_project_for
 from ..detect.catalog import SOURCES, normalize
+from ..source_lookup import source_project_for
 from . import cmpdict
 from .stage import (
     _DEFAULT_SEEDS,

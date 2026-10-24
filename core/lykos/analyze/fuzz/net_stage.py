@@ -55,13 +55,33 @@ def net_fuzz_stage(ctx) -> dict:
 
     argv = [str(a) for a in (p.get("argv") or [])]
     ctx.progress(msg=f"fuzzing {proto.upper()} server over a socket")
+    # Every delivery, with what happened to the server (fuzz/attempts.py).
+    from . import attempts as _attempts
+    alog = _attempts.AttemptLog(ctx, "net_fuzz", "net_fuzz", unit="none", target_id=target.id)
+
+    def _on_attempt(data, d, phase):
+        o = d.get("outcome") or "error_exit"
+        # The engine's own explanation is the "error text" for a delivery that went wrong, so
+        # the verdict can quote it ("no tcp listening port within 5s").
+        alog.record(data, outcome=o, phase=phase, rc=d.get("rc"), sig=d.get("sig"),
+                    stderr=(d.get("note") or "").encode() if o != "clean_exit" else b"",
+                    note=d.get("note"), extra={"proto": proto})
+
     res = netfuzz.fuzz_server(str(exe), proto, argv=argv, port=p.get("port"),
                               max_execs=int(p.get("max_execs", 1500)),
-                              seed=int(p.get("seed", 1337)))
+                              seed=int(p.get("seed", 1337)), on_attempt=_on_attempt)
+    _att = alog.finish()
+    _att_brief = {k: _att.get(k) for k in ("counts", "verdict", "verdict_note", "log")}
 
     if not res.crashed:
+        _erroring = _att.get("verdict") == _attempts.ERRORING or res.note in ("spawn-failed",
+                                                                                "no-listen")
         ctx.emit("net_fuzz.done", payload={"applicable": True, "crashed": False,
-                 "execs": res.execs, "port": res.port, "note": res.note})
+                 "execs": res.execs, "port": res.port,
+                 "note": (_att.get("verdict_note") if _att.get("verdict") == _attempts.ERRORING
+                          else ((_att.get("top_errors") or {}).get("no_start") or [{}])[0].get("msg")
+                          or res.note if _erroring else res.note),
+                 "did_not_run": _erroring, "attempts": _att_brief})
         ctx.progress(pct=100, msg=f"{res.execs} socket exec(s), no crash ({res.note})")
         return {}
 
@@ -76,7 +96,7 @@ def net_fuzz_stage(ctx) -> dict:
         extra=f"(reproduced over a {proto.upper()} socket on port {res.port})"))
     ctx.emit("net_fuzz.done", payload={"applicable": True, "crashed": True,
              "signal": res.signal_name, "port": res.port, "proto": proto,
-             "input_sha": input_sha, "execs": res.execs})
+             "input_sha": input_sha, "execs": res.execs, "attempts": _att_brief})
     ctx.progress(pct=100, msg=f"{proto.upper()} crash: {res.signal_name} on port {res.port}")
     return {}
 

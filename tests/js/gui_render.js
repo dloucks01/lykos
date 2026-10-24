@@ -145,6 +145,28 @@ function renderInfo(vnode) {
   const solo = renderInfo(h(C.SystemMap, { map: { nodes: [{ id: "a1", filename: "x" }], edges: [] } }));
   ck("SystemMap shows nothing for a single-binary case", solo.tags.length === 0 && solo.all.trim() === "");
 
+  // ---- FuzzHealthPanel: how every fuzz attempt ENDED, and whether the campaign gained anything ----
+  info = renderInfo(h(C.FuzzHealthPanel, { onOpenLog() {}, health: { verdict: "idle",
+    note: "1 engine(s) executed the target but none reached any code beyond its seeds",
+    engines: [
+      { engine: "fuzz", status: "failed", execs: 900, log: "ab".repeat(32),
+        reason: "900 of 900 attempts never reached the program -- exit 127, libfoo.so.1",
+        outcomes: { no_start: 900 } },
+      { engine: "coverage_fuzz", status: "no_gain", execs: 300, afl_execs: 51000, log: "cd".repeat(32),
+        reason: "ran 300 attempts but reached nothing beyond what its seeds reached",
+        outcomes: { clean_exit: 30, error_exit: 270 },
+        value: { unit: "edges", seed_coverage: 31, gained: 0, last_gain_s: null } },
+    ] } }));
+  ck("FuzzHealthPanel names an error loop with the loader message",
+    info.threw.length === 0 && /FAILED/.test(info.all) && /libfoo\.so\.1/.test(info.all));
+  ck("FuzzHealthPanel shows a no-gain engine and what its seeds reached",
+    /no gain/.test(info.all) && /\+0 edges beyond seeds \(seeds: 31\)/.test(info.all) && /never gained/.test(info.all));
+  ck("FuzzHealthPanel offers each engine's attempt log",
+    (info.all.match(/attempt log/g) || []).length === 2);
+  info = renderInfo(h(C.OutcomeBar, { counts: { clean_exit: 25, error_exit: 75 } }));
+  ck("OutcomeBar labels each outcome with its share", /ran clean\s*25\s*%/.test(info.all) && /error exit\s*75\s*%/.test(info.all));
+  ck("OutcomeBar renders nothing with no attempts", renderInfo(h(C.OutcomeBar, { counts: {} })).all.trim() === "");
+
   // ---- CoveragePanel: how much of the binary the fuzzing reached ----
   info = renderInfo(h(C.CoveragePanel, {
     targets: [{ id: "t1", filename: "prog" }],

@@ -141,9 +141,30 @@ def env_fuzz_stage(ctx) -> dict:
     # rate and that rate does not hold on an interactive target, where each run blocks for the
     # whole timeout -- so the cap alone let this stage overrun its deadline until the reaper
     # reclaimed it and the run was recorded as `error: lease expired`.
+    # Every execution, with how it ended (fuzz/attempts.py). This channel has no coverage signal,
+    # so the log's job here is the outcome mix: "never started" vs "hung" vs "ran and exited".
+    from . import attempts as _attempts
+    alog = _attempts.AttemptLog(ctx, "env_fuzz", "env_fuzz", unit="none", target_id=target.id)
+
+    def _on_attempt(data, d, phase, ov):
+        rc = d.get("rc")
+        if d.get("managed"):
+            o = "crash" if d.get("crashed") else "clean_exit"
+        else:
+            o = _attempts.classify_rc(rc, timed_out=d.get("timed_out", False),
+                                      spawn_failed=d.get("spawn_failed", False),
+                                      stderr=d.get("stderr", b""))
+        sig = d.get("signal_name") or (sandbox.classify_rc(rc)[2] if rc is not None and rc < 0
+                                       else None)
+        alog.record(data, outcome=o, phase=phase, rc=rc, sig=sig, ms=d.get("ms"),
+                    stderr=d.get("stderr", b""), extra={"vars": sorted(ov)})
+
     res = envfuzz.fuzz_env(str(exe), names, argv=argv, max_execs=max_execs,
                            seed=int(p.get("seed", 1337)), timeout=timeout, run=runner,
-                           should_stop=lambda: ctx.should_cancel() or ctx.timed_out())
+                           should_stop=lambda: ctx.should_cancel() or ctx.timed_out(),
+                           on_attempt=_on_attempt)
+    _att = alog.finish()
+    _att_brief = {k: _att.get(k) for k in ("counts", "verdict", "verdict_note", "log")}
 
     if not res.crashed:
         # "it never started" is not "it never crashed". Without this a runtime that refused the
@@ -152,9 +173,13 @@ def env_fuzz_stage(ctx) -> dict:
         if runner is not None and not ran["ok"]:
             note = (f"the {sub.runtime or sub.backend} never executed this target, so the "
                     f"environment channel was not actually tested: {ran['why']}")
+        elif _att.get("verdict") == _attempts.ERRORING:
+            note = _att.get("verdict_note") or note
         ctx.emit("env_fuzz.done", payload={"applicable": True, "crashed": False,
                  "execs": res.execs, "vars": names, "note": note,
-                 "ran": (ran["ok"] if runner is not None else True)})
+                 "ran": (ran["ok"] if runner is not None else True),
+                 "did_not_run": _att.get("verdict") == _attempts.ERRORING,
+                 "attempts": _att_brief})
         ctx.progress(pct=100, msg=f"{res.execs} exec(s), no crash ({note})"[:90])
         return {}
 
@@ -168,7 +193,8 @@ def env_fuzz_stage(ctx) -> dict:
         res.signal_name, input_sha, iso, "env_fuzz",
         extra=f"(reproduced by setting the environment variable {res.var})"))
     ctx.emit("env_fuzz.done", payload={"applicable": True, "crashed": True,
-             "signal": res.signal_name, "var": res.var, "input_sha": input_sha, "execs": res.execs})
+             "signal": res.signal_name, "var": res.var, "input_sha": input_sha, "execs": res.execs,
+             "attempts": _att_brief})
     ctx.progress(pct=100, msg=f"env crash: {res.signal_name} via ${res.var}")
     return {}
 

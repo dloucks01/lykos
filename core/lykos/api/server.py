@@ -137,8 +137,10 @@ import logging
 from .. import observe
 from .routes import (  # route table + traversal-safe static reader (extracted from this module)
     _ARTIFACT,
+    _ARTIFACT_ATTEMPTS,
     _ARTIFACT_BUNDLE,
     _ASSET_TYPES,
+    _CASE_ATTEMPT_LOGS,
     _CASE_AUTOPILOT,
     _CASE_AUTOPILOT_CANCEL,
     _CASE_AUTOPILOT_PAUSE,
@@ -579,6 +581,12 @@ class Handler(EndpointsMixin, AutopilotMixin, BaseHTTPRequestHandler):
             m = _ARTIFACT_BUNDLE.match(path)
             if m:
                 return self._get_bundle(m.group(1))
+            m = _ARTIFACT_ATTEMPTS.match(path)
+            if m:
+                return self._get_attempts(m.group(1), qs)
+            m = _CASE_ATTEMPT_LOGS.match(path)
+            if m:
+                return self._get_attempt_logs(m.group(1))
             m = _ARTIFACT.match(path)
             if m:
                 return self._get_artifact(m.group(1))

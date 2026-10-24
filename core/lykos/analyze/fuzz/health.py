@@ -20,9 +20,12 @@ from typing import Optional
 ENGINES = {
     "coverage_fuzz": ("coverage", "coverage-guided fuzz (AFL)"),
     "fuzz": ("fuzz", "blind fuzz"),
-    "directed_fuzz": ("directed_fuzz", "sink-directed fuzz"),
+    # The prefix is what the stage EMITS, not its name: directed fuzz runs the shared campaign under
+    # `directed.*` and the boundary harness under `harness.*`. Keyed by stage name here, these two
+    # never matched an event, so both always read "ran" off the plan state with 0 execs.
+    "directed_fuzz": ("directed", "sink-directed fuzz"),
     "net_fuzz": ("net_fuzz", "network/socket fuzz"),
-    "boundary_fuzz": ("boundary_fuzz", "IPC/boundary fuzz"),
+    "boundary_fuzz": ("harness", "IPC/boundary fuzz"),
     "env_fuzz": ("env_fuzz", "environment fuzz"),
     "libfuzzer": ("libfuzzer", "libFuzzer (source)"),
     "concolic": ("concolic", "concolic solver"),
@@ -35,6 +38,7 @@ STARVED = "starved"       # executed almost nothing (seeds rejected, or per-exec
 ERROR = "error"           # the stage raised
 OK = "ok"                 # really executed the target (execs > 0, coverage where instrumented)
 DECLINED = "declined"     # not applicable to this target (e.g. net_fuzz on a non-server) -- not a fault
+NO_GAIN = "no_gain"       # ran fine, but reached nothing its seeds had not already reached, no crash
 SKIPPED = "skipped"       # no budget left / not reached
 NOT_RUN = "not_run"       # in the plan but no state yet
 
@@ -63,6 +67,11 @@ def _classify(stage: str, state: Optional[str], detail: str, evs: dict) -> dict:
     done = evs.get("done") or {}
     harvest = evs.get("harvest") or {}
     progress = evs.get("progress") or {}
+    # The per-attempt log's summary (fuzz/attempts.py): every execution's outcome, the verdict they
+    # add up to, and whether the campaign reached anything beyond its seeds.
+    att = evs.get("attempts") or done.get("attempts") or {}
+    if att.get("engine") not in (None, stage):
+        att = {}                                         # a different engine sharing this prefix
     execs = (_int(done.get("execs")) or _int(done.get("execs_done"))
              or _int(harvest.get("execs_done")) or _int(progress.get("execs")) or 0)
     # coverage, when the engine instruments: "<hit>/<known>" blocks or AFL edges.
@@ -72,14 +81,28 @@ def _classify(stage: str, state: Optional[str], detail: str, evs: dict) -> dict:
     coverage = (f"{hit}/{known} blocks" if hit is not None and known
                 else f"{edges} edges" if edges else None)
 
+    if not execs and att.get("attempts"):
+        execs = int(att["attempts"])
+
     def mk(status, reason):
-        return {"engine": stage, "status": status, "reason": reason,
-                "execs": execs, "coverage": coverage}
+        e = {"engine": stage, "status": status, "reason": reason,
+             "execs": execs, "coverage": coverage}
+        if att:
+            e["outcomes"] = att.get("counts")
+            e["attempt_verdict"] = att.get("verdict")
+            e["value"] = att.get("value")
+            e["log"] = att.get("log")
+            if att.get("afl_execs"):
+                e["afl_execs"] = att.get("afl_execs")
+        return e
 
     # Plan-level outcomes that mean the engine never got to run its own logic.
     if state == "error":
         return mk(ERROR, detail or "the stage raised an error")
-    if state in ("skipped", "cancelled"):
+    # A plan state of skipped/cancelled is the PLAN's view; if the engine actually ran (it emitted a
+    # terminal event or an attempt log -- a repeat pass, a directed re-run) its own record wins.
+    # Measured: directed_fuzz ran three times, 2,000 attempts, and read "skipped / no budget".
+    if state in ("skipped", "cancelled") and not (done or att):
         return mk(SKIPPED, detail or "no budget left / not reached")
     if state == "declined":
         return mk(DECLINED, detail or "not applicable to this target")
@@ -96,9 +119,12 @@ def _classify(stage: str, state: Optional[str], detail: str, evs: dict) -> dict:
     #    not a server for net_fuzz, wrong format -- a decline, not a broken engine. Keeping these
     #    apart is the whole point: "afl could not instrument this target" and "libFuzzer needs
     #    source" are different facts and only the first is a problem to fix.
-    if done.get("supported") is False:
+    if done.get("supported") is False or done.get("applicable") is False:
         return mk(DECLINED, done.get("note") or done.get("reason") or detail
                   or "not applicable to this target")
+    #  * the attempt log says it was an error loop: (almost) no attempt reached the program.
+    if att.get("verdict") == "erroring":
+        return mk(FAILED, att.get("verdict_note") or "no attempt reached the program")
     if "noprogress" in evs:
         return mk(NOPROGRESS, (evs["noprogress"].get("note")
                                or "ran but reached almost no code -- likely needs a config/"
@@ -108,6 +134,18 @@ def _classify(stage: str, state: Optional[str], detail: str, evs: dict) -> dict:
                   or "executed almost nothing -- seeds rejected or per-exec timeout")
         return mk(STARVED, reason)
     if execs > 0:
+        # Ran -- but did it EARN its time? A campaign that reached nothing its seeds had not
+        # already reached and found no crash executed the target without testing anything new.
+        val = att.get("value") or {}
+        found = (_int(done.get("crashes")) or _int(done.get("unique")) or _int(done.get("confirmed"))
+                 or (1 if done.get("crashed") else 0) or 0)
+        if val.get("unit") in ("blocks", "behaviours", "edges") and val.get("gained") == 0 \
+                and not found:
+            return mk(NO_GAIN, (f"ran {execs:,} attempts but reached nothing beyond what its "
+                                f"seeds reached ({val.get('seed_coverage', 0)} {val['unit']}) and "
+                                f"found no crash -- the mutations added no coverage"))
+        if att.get("verdict") == "crashing_all":
+            return mk(OK, att.get("verdict_note"))
         return mk(OK, None)
     # `done` with no abort/starved/noprogress signal and no recorded execs is AMBIGUOUS, not a
     # failure: a solver (concolic) reports no exec count by nature, and on a short or budget-cut run
@@ -125,7 +163,8 @@ def summarize(plan: list, events: list) -> dict:
     (list of {stage,state,detail}) and the emitted `events` (list of {type,payload}).
 
     Returns {"engines": [ {engine,status,reason,execs,coverage}, ... ],
-             "verdict": "ok"|"degraded"|"none", "note": <one line>}.
+             "verdict": "ok"|"idle"|"degraded"|"none", "note": <one line>}.
+    `idle`: engines executed the target but none reached anything beyond its seeds or crashed.
     `verdict`: `ok` if any engine really executed the target; `none` if NOTHING dynamic ran (the
     alert that a static-only result is a tooling outcome, not a clean binary); `degraded` in between
     (something ran, but an engine that should have worked failed)."""
@@ -140,12 +179,25 @@ def summarize(plan: list, events: list) -> dict:
         detail = ((p or {}).get("detail") or "").strip()
         engines.append(_classify(stage, state, detail, evs))
 
-    ran_ok = [e for e in engines if e["status"] == OK]
+    # "Executed the target" needs executions: a solver that finished with zero (concolic on a
+    # binary nothing could run) is OK as a stage but is not evidence the target ran.
+    ran_ok = [e for e in engines if e["status"] == OK and (e.get("execs") or 0) > 0]
+    no_gain = [e for e in engines if e["status"] == NO_GAIN]
     failed = [e for e in engines if e["status"] in (FAILED, ERROR)]
-    reachable = [e for e in engines if e["status"] in (OK, NOPROGRESS, STARVED, FAILED, ERROR)]
-    if ran_ok:
+    reachable = [e for e in engines
+                 if e["status"] in (OK, NO_GAIN, NOPROGRESS, STARVED, FAILED, ERROR)]
+    if not ran_ok and no_gain:
+        verdict = "idle"
+        note = (f"{len(no_gain)} engine(s) executed the target but none reached any code beyond "
+                f"what their seeds reached, and none found a crash -- the fuzzing ran but did not "
+                f"test anything new. Open an engine's attempt log to see how its inputs ended.")
+        if failed:
+            note += f" {len(failed)} engine(s) failed to run ({failed[0]['reason']})."
+    elif ran_ok:
         verdict = "ok"
         note = f"{len(ran_ok)} engine(s) executed the target"
+        if no_gain:
+            note += f"; {len(no_gain)} ran without gaining anything"
         if failed:
             note += f"; {len(failed)} failed to run ({failed[0]['reason']})"
     elif not reachable:
