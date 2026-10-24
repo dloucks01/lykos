@@ -60,3 +60,6 @@ leak-*
 *-L3-*.tar.gz
 .cases-web/
 .cases-web2/
+
+# build stamp written by packaging/make-runnable.sh into the shipped tree only
+/BUILD_INFO.json

@@ -47,6 +47,15 @@ mkdir -p "$STAGE"
 git -C "$ROOT" archive --prefix=lykos/ "$commit" | tar -x -C "$STAGE"
 APP="$STAGE/lykos"
 
+# Build stamp: the archive carries no .git, so without this an air-gap disc can only report its
+# code date and the GUI cannot tell a stale disc from a current one. HEAD is the commit the
+# operator can look up; `dirty` says the snapshot also carried uncommitted working-tree changes.
+head_sha="$(git -C "$ROOT" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"
+branch="$(git -C "$ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
+if [ "$(git -C "$ROOT" rev-parse "HEAD^{tree}" 2>/dev/null)" = "$tree" ]; then dirty=false; else dirty=true; fi
+printf '{"commit": "%s", "branch": "%s", "dirty": %s, "built": "%s", "label": "%s"}\n' \
+  "$head_sha" "$branch" "$dirty" "$(date -Is)" "${LYKOS_BUILD_LABEL:-runnable}" > "$APP/BUILD_INFO.json"
+
 say "extracting the toolchain bundle"
 tar xf "$TC" -C "$BUN"
 
