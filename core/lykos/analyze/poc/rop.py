@@ -84,20 +84,27 @@ def _va_of(segs, file_off, need_x=False):
 
 
 @lru_cache(maxsize=4096)
-def _find_exec(data: bytes, pat: bytes):
+def _find_exec(data: bytes, pat: bytes, align: int = 1):
     # Cached: the same target/libc bytes are scanned for the same opcode pattern many times in one
     # run -- build_exploit alone runs 4+ times per target (early + per-crash + format + heap), and
     # poc_primitive/leak/chain_primitive/brop call the gadget finders independently. The result is an
     # immutable VA (int) or None, so caching cannot be corrupted by a caller mutating it; keyed on the
     # bytes VALUE, so a different build (plain vs sanitizer) or the libc vs the target is a distinct
     # entry. This is the hot inner scan behind find_gadget and every br/jmp/bx finder.
+    #
+    # `align`: a FIXED-WIDTH ISA (AArch64/ARM 4, RISC-V 2 with compressed code) only executes an
+    # instruction at an aligned address. An unaligned byte match straddles two real instructions
+    # -- branching to it faults -- and stopping at it would hide the real, aligned gadget further
+    # on. So keep searching past misaligned hits. x86 (variable width) keeps the default 1.
     segs = _loads(data)
-    for off, sz, _va, flags in segs:
+    for off, sz, va, flags in segs:
         if not (flags & 1):                            # executable segments only
             continue
         idx = data.find(pat, off, off + sz)
-        if idx >= 0:
-            return _va_of(segs, idx, need_x=True)
+        while idx >= 0:
+            if align <= 1 or (va + (idx - off)) % align == 0:
+                return _va_of(segs, idx, need_x=True)
+            idx = data.find(pat, idx + 1, off + sz)
     return None
 
 
@@ -150,6 +157,8 @@ def find_pivots(data: bytes) -> list:
             if seg[j + 4:j + 5] != post:
                 continue
             delta = seg[j + 3]
+            if delta >= 0x80:                            # imm8 is SIGN-extended: 0xf8 is rsp -= 8,
+                continue                                 # a move backwards, not an advance
             if delta in seen or delta == 0:
                 continue
             seen.add(delta)
@@ -878,7 +887,7 @@ def find_br_gadgets_aarch64(data: bytes):
     out = []
     for insn, base in (("br", 0xD61F0000), ("blr", 0xD63F0000)):
         for n in range(31):                              # x0..x30 (x31 is xzr/sp, not a br target)
-            va = _find_exec(data, struct.pack("<I", base | (n << 5)))
+            va = _find_exec(data, struct.pack("<I", base | (n << 5)), 4)
             if va is not None:
                 out.append({"insn": insn, "reg": f"x{n}", "va": va})
     out.sort(key=lambda g: (int(g["reg"][1:]), g["insn"]))
@@ -1076,7 +1085,7 @@ def find_bx_gadgets_arm(data: bytes):
     out = []
     for insn, base in (("bx", 0xE12FFF10), ("blx", 0xE12FFF30)):
         for n in range(15):                              # r0..r14 (r15 is pc, not a bx source here)
-            va = _find_exec(data, struct.pack("<I", base | n))
+            va = _find_exec(data, struct.pack("<I", base | n), 4)
             if va is not None:
                 out.append({"insn": insn, "reg": f"r{n}", "va": va})
     out.sort(key=lambda g: (int(g["reg"][1:]), g["insn"]))
@@ -1205,7 +1214,7 @@ def find_jr_gadgets_riscv64(data: bytes):
     out = []
     for n in range(1, 32):                               # x1..x31 (x0 holds no address)
         for insn, enc in (("jr", 0x00000067 | (n << 15)), ("jalr", 0x000000E7 | (n << 15))):
-            va = _find_exec(data, enc.to_bytes(4, "little"))
+            va = _find_exec(data, enc.to_bytes(4, "little"), 2)
             if va is not None:
                 out.append({"insn": insn, "reg": f"x{n}", "va": va})
     return out
@@ -1557,11 +1566,14 @@ def find_magic_gates(data: bytes):
                 continue
             disp = _s8(seg[base - 1])
             magic = int.from_bytes(seg[base:base + 4], "little")
-            if magic > 0x1000 and disp < 0 and _jcc_at(seg, base + 4):
+            # A local sits BELOW rbp (negative disp) but ABOVE rsp (non-negative disp): requiring
+            # disp < 0 of the rsp form dropped every frame-pointer-less (-O1+) gate.
+            if magic > 0x1000 and (disp < 0 if rbp else disp >= 0) and _jcc_at(seg, base + 4):
                 key = (va + hit, magic)
                 if key not in seen:
                     seen.add(key)
-                    out.append({"va": va + hit, "magic": magic, "disp": disp, "width": 4})
+                    out.append({"va": va + hit, "magic": magic, "disp": disp, "width": 4,
+                                "base": "rbp" if rbp else "rsp"})
         # (b) load a local into eax, then compare eax to an immediate: mov eax,[rbp+disp8] (8b 45
         #     <disp8>) followed within a few bytes by cmp eax,imm32 (3d <imm32>) then a jcc.
         i = 0
@@ -1604,6 +1616,9 @@ def find_magic_gates(data: bytes):
             if key not in seen:
                 seen.add(key)
                 out.append({"va": va + mv, "magic": imm, "disp": disp, "width": 8})
+    # rbp-relative gates first (stable): they carry a frame-computed seed and were the only form
+    # recognised before, so the rsp form only ever adds sweeps AFTER them, never delays them.
+    out.sort(key=lambda g: g.get("base") == "rsp")
     return out
 
 

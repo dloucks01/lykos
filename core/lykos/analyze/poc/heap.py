@@ -636,6 +636,12 @@ def smallbin_stash_guard(libc_data: bytes) -> dict:
         return {"sites": None, "unchecked": None, "glibc": ver,
                 "reason": "the error string's reference could not be located, so the guard sites "
                           "cannot be counted"}
+    if sites == 0:
+        # The error string IS present, so the check exists; zero counted references means the
+        # count failed (the error block reached by fall-through, not a jcc) -- not "unchecked".
+        return {"sites": 0, "unchecked": None, "glibc": ver,
+                "reason": "the guard's error string is present but no reference to it was "
+                          "counted, so the guard sites cannot be counted"}
     unchecked = sites < 2
     return {"sites": sites, "unchecked": unchecked, "glibc": ver,
             "reason": (f"glibc {ver}: {sites} guard site -- only the first smallbin unlink is "
@@ -747,7 +753,7 @@ def fastbins_present(libc_data: bytes) -> dict:
                           "whose first step is 'reach the fastbin' has nothing to reach"}
     return {"present": None, "glibc": ver,
             "reason": f"glibc {ver}: the evidence disagrees (fasttop check: {fasttop}, mxfast "
-                      "knob: {mxfast}) -- measure where a freed chunk actually lands with "
+                      f"knob: {mxfast}) -- measure where a freed chunk actually lands with "
                       "`post_tcache_destination` before relying on either answer"}
 
 
@@ -869,6 +875,12 @@ def large_bin_guard(libc_data: bytes) -> dict:
         return {"sites": None, "arbitrary": None, "glibc": ver,
                 "reason": "the error string's reference could not be located, so the guard sites "
                           "cannot be counted"}
+    if sites == 0:
+        # The error string IS present, so the check exists; zero counted references means the
+        # count failed (the error block reached by fall-through, not a jcc) -- not "unchecked".
+        return {"sites": 0, "arbitrary": None, "glibc": ver,
+                "reason": "the guard's error string is present but no reference to it was "
+                          "counted, so the guard sites cannot be counted"}
     arbitrary = sites < 2
     return {"sites": sites, "arbitrary": arbitrary, "glibc": ver,
             "reason": (f"glibc {ver}: {sites} guard site(s) -- the short insertion branch writes "

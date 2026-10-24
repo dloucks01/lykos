@@ -125,7 +125,7 @@ def drive_cross_ret2libc(
     breakpoint with the first-argument register == &"/bin/sh"), pass a negative control, then raise
     the first that holds to a demonstrated effect via `shell_effect` and file the identical L3 PoC
     bundle + finding. Returns the stage result dict on success, else None. `cap` is a
-    make_qemu_capture callable; `shell_effect(exe, target, payload, timeout)` returns truthy when a
+    make_qemu_capture callable; `shell_effect(exe, target, payload, timeout, base_argv=...)` returns truthy when a
     real shell ran.
 
     `technique`/`finisher`/`site_name` describe the mechanism in the finding and progress text. They
@@ -158,7 +158,7 @@ def drive_cross_ret2libc(
             continue
         # raise the register-confirmed chain to a DEMONSTRATED EFFECT: run it live and drive the
         # shell system("/bin/sh") spawns with a forgery-proof marker (qemu relays execve to the host).
-        shelled = shell_effect(exe, target, c.payload, timeout)
+        shelled = shell_effect(exe, target, c.payload, timeout, base_argv=base_argv)
         proof = ("a shell spawned under qemu-user and EVALUATED a forgery-proof marker" if shelled else
                  f"reached {site_name} with {model.arg0_label}=&\"/bin/sh\" under the qemu debugger, "
                  f"passing a negative control (register-state proof; a live shell did not come up "

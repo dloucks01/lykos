@@ -231,7 +231,12 @@ def trace(exe, argv, stdin_file, timeout, *, max_writes=4000, max_bytes=65536):
             continue
         if event == (signal.SIGTRAP | (PTRACE_EVENT_EXEC << 8)):
             # in-place execve: same pid, still the target's lineage (a shell replacing it stays).
-            insys[wpid] = False
+            # The kernel's order is syscall-ENTRY stop -> PTRACE_EVENT_EXEC stop -> syscall-EXIT
+            # stop: the process is still INSIDE execve here. Resetting to "not in a syscall" made
+            # the exit stop read as an entry, flipping every later stop of the exec'd process
+            # (the shell that prints the marker) -- writes were then recorded at their exit and a
+            # write that never returned was lost.
+            insys[wpid] = True
             libc.ptrace(PTRACE_SYSCALL, wpid, 0, 0)
             continue
 

