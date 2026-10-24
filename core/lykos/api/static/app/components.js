@@ -7,7 +7,7 @@ import { useState, useRef, useEffect } from "preact/hooks";
 import htm from "htm";
 import {
   STATE_LABEL, STATE_GLOSS, isDemonstrated, fmtBytes, shortHash, runTone, stageLabel, fmtElapsed,
-  SEV_ORDER, maxPocLevel, histogram,
+  SEV_ORDER, maxPocLevel, histogram, CURATION_STATUSES, CURATION_LABEL, CURATION_FILTERS,
 } from "./util.js";
 
 const html = htm.bind(h);
@@ -618,7 +618,74 @@ function faultClassOf(rootCause) {
 // One finding, results-first. The exploitation section is the payload: the exploitability
 // rating, the mechanism (root cause), how the crash is reached, where it faults, and the
 // downloadable verified reproducer. This is "how the binary can actually be exploited."
-export function FindingCard({ finding, pocs, reportUrl, artifactUrl, onViewCode, mitigations, onInspect }) {
+// The operator's triage of a finding (doc 47 P3): false positive / true positive / needs review,
+// plus a note. Hook-free on purpose (the note editor is an uncontrolled form read on submit), so the
+// card stays a pure function of its props. It sits BESIDE the tool's own state badge and never
+// replaces it -- the tool's evidence and L-level are unchanged by anything the operator marks here.
+const CURATION_TIP = {
+  false_positive: "Mark as a false positive: hidden from the default findings list (the tool's evidence and level are kept)",
+  true_positive: "Mark as a real issue you have reviewed (operator judgement, separate from the tool's 'confirmed' state)",
+  needs_review: "Flag for follow-up",
+};
+export function CurationChip({ curation }) {
+  const st = curation && curation.status;
+  if (!st && !(curation && curation.note)) return null;
+  return html`<span class=${`cur-chip cur-${st || "note"}`}
+    title=${`operator triage${curation.note ? ": " + curation.note : ""}`}>
+    ${st ? CURATION_LABEL[st] || st : "note"}</span>`;
+}
+export function CurationBar({ finding, onCurate }) {
+  if (!onCurate) return null;
+  const cur = finding.curation || null;
+  const status = cur && cur.status;
+  const note = (cur && cur.note) || "";
+  // Clicking the active status clears it (the note is kept).
+  const set = (st) => onCurate(finding, st === status ? null : st, note);
+  const n = finding.group_count > 1 ? finding.group_count : 0;
+  return html`
+    <div class="curation">
+      <span class="cur-lbl">Triage${n ? html` <span class="cur-grp" title="this card folds several findings; the triage applies to all of them">(${n})</span>` : null}</span>
+      ${CURATION_STATUSES.map((st) => html`<button type="button" key=${st}
+        class=${`cur-btn cur-${st}${status === st ? " on" : ""}`} aria-pressed=${status === st ? "true" : "false"}
+        title=${status === st ? "click again to clear" : CURATION_TIP[st]} onClick=${() => set(st)}>
+        ${CURATION_LABEL[st]}</button>`)}
+      <details class="cur-note">
+        <summary>${note ? "✎ edit note" : "+ note"}</summary>
+        <form key=${(cur && cur.updated_at) || 0} onSubmit=${(e) => {
+          e.preventDefault();
+          const el = e.currentTarget && e.currentTarget.elements && e.currentTarget.elements.note;
+          onCurate(finding, status, el ? el.value : note);
+        }}>
+          <textarea name="note" rows="3" maxlength="4000" aria-label="triage note"
+            placeholder="why — e.g. unreachable from input, test-only code, reproduced manually…"
+            defaultValue=${note}></textarea>
+          <button class="btn xsmall" type="submit">Save note</button>
+        </form>
+      </details>
+      ${note ? html`<div class="cur-note-text">${note}</div>` : null}
+    </div>`;
+}
+
+// Operator-triage filter for the findings list, with what each choice hides counted, so a hidden
+// false positive is never invisible -- the count says it is there and one click shows it.
+export function CurationFilter({ mode, onChange, counts }) {
+  const c = counts || {};
+  const hidden = mode === "hide_fp" ? (c.false_positive || 0) : 0;
+  return html`
+    <div class="cur-filter">
+      <label>Triage
+        <select value=${mode} onChange=${(e) => onChange && onChange(e.target.value)} aria-label="filter findings by triage">
+          ${CURATION_FILTERS.map(([v, lbl]) => html`<option key=${v} value=${v}>${lbl}${
+            v === "false_positive" || v === "true_positive" || v === "needs_review" ? ` (${c[v] || 0})`
+            : v === "uncurated" ? ` (${c.uncurated || 0})` : ""}</option>`)}
+        </select>
+      </label>
+      ${hidden ? html`<button type="button" class="btn xsmall ghost" onClick=${() => onChange && onChange("all")}>
+        ${hidden} marked false positive hidden — show</button>` : null}
+    </div>`;
+}
+
+export function FindingCard({ finding, pocs, reportUrl, artifactUrl, onViewCode, mitigations, onInspect, onCurate, onShowInGraph }) {
   const inspect = (ch) => onInspect && onInspect(finding, ch);
   const demo = isDemonstrated(finding);
   const evRaw = finding.evidence;
@@ -640,7 +707,7 @@ export function FindingCard({ finding, pocs, reportUrl, artifactUrl, onViewCode,
   const site = fmtAddr(finding.site_addr) || fmtAddr(finding.function_addr);
   const bundle = (pocs || []).find((p) => p.verified) || (pocs || [])[0];
   return html`
-    <div class=${`card finding${demo ? " demo" : ""}`}>
+    <div class=${`card finding${demo ? " demo" : ""}${finding.curation && finding.curation.status === "false_positive" ? " cur-dim" : ""}`}>
       <div class="find-top">
         <${SevDot} severity=${finding.severity} />
         <div class="find-id">
@@ -652,6 +719,7 @@ export function FindingCard({ finding, pocs, reportUrl, artifactUrl, onViewCode,
             ${finding.group_count > 1 ? html`<span class="sites">${finding.group_count} occurrences</span>` : (finding.site_count ? html`<span class="sites">${finding.site_count} site${finding.site_count === 1 ? "" : "s"}${finding.proven_sites ? ` · ${finding.proven_sites} proven` : ""}</span>` : null)}
           </div>
         </div>
+        <${CurationChip} curation=${finding.curation} />
         <${Badge} state=${finding.state} />
       </div>
       <div class="find-gloss">${STATE_GLOSS[finding.state] || ""}</div>
@@ -712,11 +780,15 @@ export function FindingCard({ finding, pocs, reportUrl, artifactUrl, onViewCode,
         ` : null}
         ${inputPoc && inputPoc.input_sha
           ? html`<a class="btn small ghost" href=${artifactUrl(inputPoc.input_sha)} download title="the exact input that triggers the crash">⬇ Crashing input</a>` : null}
-        ${finding.function_addr && onViewCode
+        ${(finding.function_addr || finding.site_addr) && onViewCode
           ? html`<button class="btn small ghost" onClick=${() => onViewCode(finding)}>⟨⟩ View code</button>` : null}
+        ${(finding.function_addr || finding.site_addr) && onShowInGraph
+          ? html`<button class="btn small ghost" title="show this finding's function in the target's call graph"
+              onClick=${() => onShowInGraph(finding)}>◎ Call graph</button>` : null}
         ${onInspect ? html`<button class="btn small ghost" onClick=${() => inspect(null)}>🔍 Inspect evidence</button>` : null}
         ${finding.verification ? html`<${VerifyBadge} v=${finding.verification} />` : null}
       </div>
+      <${CurationBar} finding=${finding} onCurate=${onCurate} />
     </div>`;
 }
 
@@ -733,7 +805,7 @@ export function VerifyBadge({ v }) {
 // Click any piece of evidence -> the full trail, uncut. Every channel's complete detail, the end
 // effects with their proof artifacts, the PoC bundle and crashing input, and a raw-JSON view for
 // the power user -- so "why do you say this?" is always one click from an answer.
-export function EvidenceModal({ finding, pocs, artifactUrl, onViewCode, onClose, focus }) {
+export function EvidenceModal({ finding, pocs, artifactUrl, onViewCode, onClose, focus, onShowInGraph }) {
   if (!finding) return null;
   const [raw, setRaw] = useState(false);
   const evList = Array.isArray(finding.evidence) ? finding.evidence : [];
@@ -755,7 +827,8 @@ export function EvidenceModal({ finding, pocs, artifactUrl, onViewCode, onClose,
               ${finding.cwe_name ? html`<span class="cwe-name">${finding.cwe_name}</span>` : null}
               ${finding.detector ? html`<span class="det">via ${finding.detector}</span>` : null}
               ${site ? html`<span class="at">at <code>${site}</code></span>` : null}
-              <${Badge} state=${finding.state} /></div>
+              <${Badge} state=${finding.state} /> <${CurationChip} curation=${finding.curation} /></div>
+            ${finding.curation && finding.curation.note ? html`<div class="cur-note-text">Triage note: ${finding.curation.note}</div>` : null}
           </div>
           <button class="btn ghost small" onClick=${onClose}>✕ Close</button>
         </div>
@@ -787,7 +860,8 @@ export function EvidenceModal({ finding, pocs, artifactUrl, onViewCode, onClose,
         <div class="ev-sec ev-artifacts">
           ${bundle && bundle.bundle_sha ? html`<a class="btn small" href=${artifactUrl(bundle.bundle_sha)} download>⬇ PoC bundle${bundle.verified ? " (verified)" : ""}</a>` : null}
           ${inputPoc && inputPoc.input_sha ? html`<a class="btn small ghost" href=${artifactUrl(inputPoc.input_sha)} download>⬇ Crashing input</a>` : null}
-          ${finding.function_addr && onViewCode ? html`<button class="btn small ghost" onClick=${() => { onClose(); onViewCode(finding); }}>⟨⟩ View code at ${site || "site"}</button>` : null}
+          ${(finding.function_addr || finding.site_addr) && onViewCode ? html`<button class="btn small ghost" onClick=${() => { onClose(); onViewCode(finding); }}>⟨⟩ View code at ${site || "site"}</button>` : null}
+          ${(finding.function_addr || finding.site_addr) && onShowInGraph ? html`<button class="btn small ghost" onClick=${() => { onClose(); onShowInGraph(finding); }}>◎ Show in call graph</button>` : null}
           <button class="btn small ghost" onClick=${() => setRaw((v) => !v)}>${raw ? "Hide" : "Show"} raw JSON</button>
         </div>
         ${raw ? html`<pre class="ev-raw">${JSON.stringify(finding, null, 2)}</pre>` : null}

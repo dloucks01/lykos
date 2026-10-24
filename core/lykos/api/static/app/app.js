@@ -7,9 +7,9 @@ import { useState, useEffect, useRef, useCallback } from "preact/hooks";
 import { api, waitForRun } from "./api.js";
 import { isFolderPick, folderArchive } from "./archive.js";
 import { runAutopilotCase, newController, cancel as cancelAutopilot, coverageOf } from "./autopilot.js";
-import { rankFindings, pocsForFinding, fmtTime, progressText, stageLabel, dedupeFindings, buildRunLog, buildVerdicts, filterByViz } from "./util.js";
+import { rankFindings, pocsForFinding, fmtTime, progressText, stageLabel, dedupeFindings, buildRunLog, buildVerdicts, filterByViz, filterByCuration, curationCounts, containingFunction } from "./util.js";
 import {
-  html, DropZone, TargetSummary, ProgressLog, ConsolePanel, FuzzConsole, RunHeader, FuzzHealthPanel, AttemptLogModal, AttemptLogsList, DynamicCoverageBanner, FindingCard, EmptyResults, Spinner, UnavailablePanel, RunScorecard, SystemMap, CoveragePanel, CodeView, PipelinePlan, EvidenceModal, FunctionsModal, VerdictStrip, VerdictCard, AnalysisDrawer, ShellVerdict, ExploitsPanel, DrawerFacts, TargetBar, FunctionsPanel, StringsPanel, DisasmPanel, DiffPanel, CrashesPanel, CallGraphCanvas, CaseOverview,
+  html, DropZone, TargetSummary, ProgressLog, ConsolePanel, FuzzConsole, RunHeader, FuzzHealthPanel, AttemptLogModal, AttemptLogsList, DynamicCoverageBanner, FindingCard, EmptyResults, Spinner, UnavailablePanel, RunScorecard, SystemMap, CoveragePanel, CodeView, PipelinePlan, EvidenceModal, FunctionsModal, VerdictStrip, VerdictCard, AnalysisDrawer, ShellVerdict, ExploitsPanel, DrawerFacts, TargetBar, FunctionsPanel, StringsPanel, DisasmPanel, DiffPanel, CrashesPanel, CallGraphCanvas, CaseOverview, CurationFilter,
 } from "./components.js";
 
 let _conSeq = 0;
@@ -108,6 +108,26 @@ function fuzzSummary(type, p) {
 const RUNOPTS_KEY = "lykos-runopts";
 function loadRunOpts() { try { return JSON.parse(localStorage.getItem(RUNOPTS_KEY) || "{}") || {}; } catch { return {}; } }
 
+// The findings-list triage filter (doc 47 P3) is a per-operator view preference, remembered.
+const CURFILTER_KEY = "lykos-curfilter";
+function loadCurFilter() { try { return localStorage.getItem(CURFILTER_KEY) || "hide_fp"; } catch { return "hide_fp"; } }
+
+// A curation the operator just saved, re-applied over a findings read that was already in flight
+// when it was saved (the background poll re-reads findings every few seconds, and a response that
+// left the server before the POST would otherwise flip the card back for one tick). Dropped as
+// soon as the server's copy agrees.
+function applyLocalCuration(fs, local) {
+  if (!local.size) return fs;
+  const same = (a, b) => (a ? `${a.status}|${a.note}` : "") === (b ? `${b.status}|${b.note}` : "");
+  return (fs || []).map((f) => {
+    if (!local.has(f.id)) return f;
+    const mine = local.get(f.id);
+    if (same(f.curation, mine.value)) { local.delete(f.id); return f; }
+    if (f.curation && f.curation.updated_at && f.curation.updated_at > mine.at) { local.delete(f.id); return f; }
+    return { ...f, curation: mine.value };
+  });
+}
+
 function App() {
   const _ro = loadRunOpts();
   const [caseId, setCaseId] = useState(null);
@@ -178,6 +198,9 @@ function App() {
   const [fuzzState, setFuzzState] = useState(null);   // live Running/Converging/Stalled badge (U2)
   const fuzzTrendRef = useRef({ cov: null, grewAt: 0, seenAt: 0 }); // coverage-growth trend
   const [invChosen, setInvChosen] = useState(null);   // auto-discovered invocation (R2: "driving as")
+  const [curFilter, setCurFilter] = useState(loadCurFilter); // findings-list operator-triage filter
+  const [cgFocus, setCgFocus] = useState(null);       // {targetId, addr, title}: finding shown in the call graph
+  useEffect(() => { try { localStorage.setItem(CURFILTER_KEY, curFilter); } catch {} }, [curFilter]);
   // The effective theme: an explicit choice (data-theme, set pre-paint from localStorage) wins,
   // else the OS preference. The toggle flips it, applies it to <html>, and persists the choice.
   const [theme, setTheme] = useState(() => {
@@ -198,6 +221,29 @@ function App() {
   const lastFocus = useRef(null);   // the element to restore focus to when a modal closes
   const bgPollRef = useRef(0);
   const bgEventsAfter = useRef(-1);   // last case-event id logged for the background run (-1 = seed)
+  // The CURRENT target list, for long-lived async loops. The background poller is a chain of
+  // setTimeout ticks that outlives the render it was created in; reading `targets` from its closure
+  // gave it the list from when the poll STARTED -- [] when a case is reopened from the landing page
+  // -- so every tick re-read PoCs for zero targets and wiped them (and the system map) from view.
+  const targetsRef = useRef(targets);
+  targetsRef.current = targets;
+  const curLocal = useRef(new Map());  // finding id -> {value, at}: curations saved, not yet re-read
+
+  // Everything that belongs to ONE case. Switching case (reopen / new upload / New analysis) must
+  // clear all of it: the previous case's engine-health verdict, attempt logs, focused target,
+  // scorecard, console and open modals used to survive into the next case and read as its own.
+  const resetCaseView = useCallback(() => {
+    setLog([]); setFindings([]); setPocs([]); setAdvice(null); setUnavailable([]); setSysmap(null);
+    setCoverage({}); setVerifications({}); setScorecard([]); setFuzzHealth(null); setAttemptLogs([]);
+    setOpenLog(null); setFuzzLive(null); setFuzzState(null); setInvChosen(null); setBgActivity(null);
+    setConsoleLines([]); consoleSeen.current = new Set();
+    setActiveTid(null); setTab("findings"); setViz(null); setCgFocus(null);
+    setCodeFn(null); setEvidence(null); setFuncBrowse(null);
+    setDisasmFn(null); setDisasmSel({}); setDiffVerify(null); setPatchDiff(null); setHarnessRun(null);
+    fuzzTrendRef.current = { cov: null, grewAt: 0, seenAt: 0 };
+    curLocal.current = new Map();
+    setBg(null); bgPollRef.current++; bgEventsAfter.current = -1;
+  }, []);
 
 
   // Follow a call to the function it names -- in the SAME binary, or, when the symbol is an
@@ -275,7 +321,9 @@ function App() {
     try {
       const fns = await api.functions(finding.target_id).catch(() => []);
       const match = (fns || []).find((f) => addrMatch(f.addr, finding.function_addr))
-        || (fns || []).find((f) => addrMatch(f.addr, finding.site_addr));
+        || (fns || []).find((f) => addrMatch(f.addr, finding.site_addr))
+        // a finding that knows only its fault/sink site: the function whose range holds it
+        || containingFunction(fns, finding.site_addr || finding.function_addr);
       if (!match) { setError("Could not locate the function for this finding."); return; }
       const detail = await api.getFunction(match.id);
       const tgt = targets.find((t) => t.id === finding.target_id);
@@ -368,6 +416,10 @@ function App() {
     if (evId != null) {
       if (consoleSeen.current.has(key)) return;
       consoleSeen.current.add(key);
+      // The de-dupe set must not grow for the life of a long fuzzing run (the lines are capped at
+      // 500; the set of ids seen was not). Duplicates only ever arrive for RECENT events, so keep
+      // the newest ids (a Set iterates in insertion order).
+      if (consoleSeen.current.size > 4000) consoleSeen.current = new Set([...consoleSeen.current].slice(-2000));
     }
     setConsoleLines((cur) => {
       const next = [...cur, { id: key, ...payload }];
@@ -389,14 +441,14 @@ function App() {
   // each target and merged -- a bundle belongs to the finding it proves, wherever it lives.
   const refreshResults = useCallback(async (cid, tlist) => {
     const id = cid || caseId;
-    const ts = tlist || targets;
+    const ts = tlist || targetsRef.current;
     if (!id) return;
     const [fs, psArrays, sm] = await Promise.all([
       api.caseFindings(id).catch(() => []),
       Promise.all((ts || []).map((t) => api.pocs(t.id).catch(() => []))),
       (ts || []).length > 1 ? api.systemmap(id).catch(() => null) : Promise.resolve(null),
     ]);
-    setFindings(fs || []);
+    setFindings(applyLocalCuration(fs || [], curLocal.current));
     setPocs((psArrays || []).flat());
     setSysmap(sm);
     api.attemptLogs(id).then((l) => setAttemptLogs(Array.isArray(l) ? l : [])).catch(() => {});
@@ -487,15 +539,22 @@ function App() {
       } catch { /* transient; retry next tick */ }
     };
     if (bgEventsAfter.current < 0) {
-      try { const seed = await api.events(cid, 0); bgEventsAfter.current = seed.reduce((m, e) => Math.max(m, e.id), 0); }
+      // Seed past the case's NEWEST event. `events(cid, 0)` is the OLDEST page (500 rows), so on a
+      // long case the cursor landed 500 events in and the poller then replayed the whole earlier
+      // history into the log and console as if it were happening live.
+      try { const seed = await api.eventsTail(cid, 1); bgEventsAfter.current = seed.reduce((m, e) => Math.max(m, e.id), 0); }
       catch { bgEventsAfter.current = 0; }
     }
     const tick = async () => {
       if (token !== bgPollRef.current) return;      // superseded by a newer poll
       let st;
       try { st = await api.backgroundStatus(cid); } catch { st = null; }
+      // Re-check after the await: a reset / reopen while the request was in flight bumps the
+      // token, and this (old case's) status must not land on the new case's screen.
+      if (token !== bgPollRef.current) return;
       setBg(st && st.state && st.state !== "none" ? st : null);
       await tailEvents();
+      if (token !== bgPollRef.current) return;
       if (st && st.running) {
         // U2 stalled detection: a campaign was heartbeating (seenAt set) but has gone quiet for a
         // while -- the target wedged / afl hung -- which is the ABSENCE of a `.progress`, so it is
@@ -505,14 +564,14 @@ function App() {
         if (tr.seenAt && Date.now() - tr.seenAt > 15000) {
           setFuzzState({ label: "stalled — no heartbeat", tone: "bad" });
         }
-        refreshResults(cid, targets);
+        refreshResults(cid, targetsRef.current);
         setTimeout(tick, 2500);
       } else if (st && (st.state === "done" || st.state === "cancelled" || st.state === "error")) {
         setBgActivity(null);
         setFuzzLive(null);
         setFuzzState(null);
         fuzzTrendRef.current = { cov: null, grewAt: 0, seenAt: 0 };
-        refreshResults(cid, targets);
+        refreshResults(cid, targetsRef.current);
       } else {
         // st === null (a transient status-fetch failure: timeout/ECONNRESET under fuzzing load) or a
         // not-yet-terminal state -> KEEP POLLING. Without this one blip froze the live UI for the
@@ -521,12 +580,12 @@ function App() {
       }
     };
     tick();
-  }, [refreshResults, targets, pushLog, pushConsole]);
+  }, [refreshResults, pushLog, pushConsole]);
 
   // Reopen a previous analysis: its targets, findings and PoCs are all still on the server.
   const reopenCase = useCallback(async (cid) => {
     setError(null); setUploading(true);
-    setLog([]); setUnavailable([]);
+    resetCaseView();
     try {
       const ts = await api.listTargets(cid).catch(() => []);
       // Re-attach each target's triage detail from its triage run, so a reopened case shows the
@@ -550,7 +609,9 @@ function App() {
       // work that was done rather than an empty panel (live commands still stream on top).
       consoleSeen.current = new Set();
       try {
-        const evs = await api.events(cid, 0);
+        // The case's NEWEST events: `events(cid, 0)` returned the oldest 500, so a long case
+        // "backfilled" the console with its first commands, not the last run's.
+        const evs = await api.eventsTail(cid, 2000);
         const execs = (evs || []).filter((e) => e.type === "job.exec").slice(-250);
         setConsoleLines(execs.map((e) => {
           consoleSeen.current.add(`e${e.id}`);
@@ -592,10 +653,12 @@ function App() {
       }
       setCoverage(cov);
       pollBackground(cid);   // pick up a background run still going for this case
+    } catch (e) {
+      setError(`could not reopen the case: ${e.message || e}`);
     } finally {
       setUploading(false);
     }
-  }, [pollBackground]);
+  }, [pollBackground, resetCaseView]);
 
   const onBackground = useCallback(async () => {
     if (!caseId || !targets.length) return;
@@ -657,7 +720,7 @@ function App() {
       setError(`could not pack the folder: ${e.message || e}`);
       return;
     }
-    if (!append) { setLog([]); setFindings([]); setPocs([]); setAdvice(null); setRan(false); setUnavailable([]); setSysmap(null); setCoverage({}); setVerifications({}); setScorecard([]); setFuzzHealth(null); setAttemptLogs([]); setOpenLog(null); setFuzzState(null); setInvChosen(null); fuzzTrendRef.current = { cov: null, grewAt: 0, seenAt: 0 }; setBg(null); bgPollRef.current++; bgEventsAfter.current = -1; }
+    if (!append) { resetCaseView(); setRan(false); }
     try {
       const cid = await ensureCase();
       const got = append ? [...targets] : [];
@@ -691,7 +754,7 @@ function App() {
     } finally {
       setUploading(false);
     }
-  }, [ensureCase, pushLog, targets, advice]);
+  }, [ensureCase, pushLog, targets, advice, resetCaseView]);
 
   // Remove an uploaded file from the left rail. The server (DELETE /targets/<id>) cascades the
   // target's rows and component edges; here we drop it from the list and move focus off it.
@@ -788,11 +851,43 @@ function App() {
   const onReset = useCallback(() => {
     if (running) return;
     setCaseId(null);   // the next upload starts a fresh case; this one stays on the server
-    setTargets([]); setAdvice(null); setFindings([]); setPocs([]);
-    setLog([]); setRan(false); setError(null); setUnavailable([]); setSysmap(null); setCoverage({}); setVerifications({});
-    setBg(null); bgPollRef.current++; bgEventsAfter.current = -1;
+    setTargets([]); resetCaseView(); setRan(false); setError(null);
     loadRecent();      // the analysis just finished now appears in the recent list
-  }, [running, loadRecent]);
+  }, [running, loadRecent, resetCaseView]);
+
+  // Operator triage (doc 47 P3): record the verdict server-side, then update the card in place.
+  // A card that folds several findings (dedupe group) curates every one of them, so the verdict
+  // cannot silently leave its siblings behind to resurface as an uncurated card.
+  const curate = useCallback(async (finding, status, note) => {
+    const ids = (finding.group_ids && finding.group_ids.length) ? finding.group_ids : [finding.id];
+    try {
+      const out = await Promise.all(ids.map((id) => api.setCuration(id, status, note)));
+      const byId = new Map(out.map((r) => [r.finding_id,
+        r.cleared ? null : { status: r.status, note: r.note, updated_at: r.updated_at }]));
+      const now = Math.floor(Date.now() / 1000);
+      for (const [id, value] of byId) curLocal.current.set(id, { value, at: now });
+      setFindings((cur) => cur.map((f) => (byId.has(f.id) ? { ...f, curation: byId.get(f.id) } : f)));
+      setEvidence((ev) => (ev && byId.has(ev.finding.id)
+        ? { ...ev, finding: { ...ev.finding, curation: byId.get(ev.finding.id) } } : ev));
+    } catch (e) {
+      setError(`could not save the triage: ${e.message || e}`);
+    }
+  }, []);
+
+  // Cross-link (doc 49 2b): a finding -> its function's node in the target's call graph.
+  const showInGraph = useCallback((finding) => {
+    setActiveTid(finding.target_id);
+    setTab("functions");
+    setFnView("graph");
+    setCgFocus({ targetId: finding.target_id, addr: finding.function_addr || finding.site_addr,
+                 title: finding.title || finding.cwe || "finding" });
+  }, []);
+
+  // A background-run control (pause/resume/stop) that fails must say so; the bare promise was
+  // dropped and a refused click looked exactly like one that worked.
+  const bgControl = useCallback((fn) => {
+    Promise.resolve().then(fn).catch((e) => setError(`background run: ${e.message || e}`));
+  }, []);
 
   // Select a function to disassemble in the Disassembly tab: remember it per target, load its detail.
   const selectDisasm = useCallback(async (fn) => {
@@ -889,7 +984,8 @@ function App() {
     finding=${verByFinding[f.id] ? { ...f, verification: verByFinding[f.id] } : f}
     pocs=${pocsFor(f)} mitigations=${mitOf(f)}
     reportUrl=${api.reportUrl} artifactUrl=${api.artifactUrl} onViewCode=${viewCode}
-    onInspect=${(finding, focus) => setEvidence({ finding, focus })} />`;
+    onInspect=${(finding, focus) => setEvidence({ finding, focus })}
+    onCurate=${curate} onShowInGraph=${showInGraph} />`;
   const multi = targets.length > 1;
   // finding -> its false-positive review (via the PoC that carries the crashing input's sha)
   const verByFinding = {};
@@ -908,7 +1004,10 @@ function App() {
   const activeRanked = activeTarget ? ranked.filter((f) => f.target_id === activeTarget.id) : [];
   // The findings LIST honours a Case Overview click-filter; the overview itself always sees the
   // full set (so its donut/bars reflect the whole target, not the filtered subset).
-  const vizRanked = filterByViz(activeRanked, viz);
+  // ...and the operator's triage filter (default: hide what they marked false positive; the
+  // filter bar counts what it hides, so a hidden finding is never invisible).
+  const curCounts = curationCounts(activeRanked);
+  const vizRanked = filterByCuration(filterByViz(activeRanked, viz), curFilter);
   const activeNotable = vizRanked.filter((f) => f.state !== "candidate");
   const activeCandidates = vizRanked.filter((f) => f.state === "candidate");
   const activePocs = activeTarget ? pocs.filter((p) => p.finding_id && activeRanked.some((f) => f.id === p.finding_id)) : [];
@@ -928,10 +1027,10 @@ function App() {
         : `Background — ${bg.stage ? stageLabelSafe(bg.stage) : "starting"}`} /></div>
       ${bg.paused
         ? html`<button class="btn small primary" title="resume the run from where it paused"
-                 onClick=${() => api.resumeBackground(caseId)}>▶ Resume</button>`
+                 onClick=${() => bgControl(() => api.resumeBackground(caseId))}>▶ Resume</button>`
         : html`<button class="btn ghost small" title="pause between stages — the current stage finishes, then it waits (no work lost) until you resume"
-                 onClick=${() => api.pauseBackground(caseId)}>⏸ Pause</button>`}
-      <button class="btn ghost small" onClick=${() => api.cancelBackground(caseId)}>■ Stop background</button>
+                 onClick=${() => bgControl(() => api.pauseBackground(caseId))}>⏸ Pause</button>`}
+      <button class="btn ghost small" onClick=${() => bgControl(() => api.cancelBackground(caseId))}>■ Stop background</button>
     ` : !running ? html`
       <button class="btn primary" onClick=${onBackground}
               title=${bg && bg.state === "cancelled"
@@ -1022,6 +1121,14 @@ function App() {
   const activeFuncs = _atid ? funcsByT[_atid] : null;
   const activeStrings = _atid ? stringsByT[_atid] : null;
   const activeCrashes = _atid ? (dynByT[_atid] || []).filter((d) => d.crashed) : [];
+  // Which function the call graph highlights: a finding the operator sent here ("◎ Call graph"),
+  // else the demonstrated finding. Resolved to its CONTAINING function, so a finding that only
+  // knows its fault/sink address still lands on a node.
+  const focusActive = !!(cgFocus && cgFocus.targetId === _atid);
+  const _hlAddr = focusActive ? cgFocus.addr
+    : (topDemoFinding && (topDemoFinding.function_addr || topDemoFinding.site_addr));
+  const cgHighlightFn = containingFunction(activeFuncs, _hlAddr);
+  const cgHighlight = cgHighlightFn ? cgHighlightFn.addr : _hlAddr;
   // Category subsets for the conditional tabs (each appears only when it has content).
   const _heapDet = new Set(["heap_trace", "heap_check"]);
   const _taintDet = new Set(["tainted_deref", "cross_taint", "dynamic_taint"]);
@@ -1122,7 +1229,7 @@ function App() {
                 <div class="rail-sec-h">Pipeline</div>
                 <div class="rail-pipe">
                   ${bg.plan.map((s) => html`<div class=${`rail-step rs-${s.state || "pending"}`} key=${s.stage}>
-                    <span class="rs-ico">${s.state === "done" ? "✓" : s.state === "running" ? "◆" : s.state === "error" ? "✕" : (s.state === "skipped" || s.state === "cancelled") ? "–" : "·"}</span>
+                    <span class="rs-ico" title=${s.state || "pending"}>${s.state === "done" ? "✓" : s.state === "running" ? "◆" : s.state === "error" ? "✕" : s.state === "declined" ? "!" : s.state === "timeout" ? "⏱" : (s.state === "skipped" || s.state === "cancelled") ? "–" : "·"}</span>
                     <span>${s.label || s.stage}</span>
                   </div>`)}
                 </div>
@@ -1196,6 +1303,8 @@ function App() {
                 <${DynamicCoverageBanner} health=${fuzzHealth} ran=${ran} />
                 ${activeRanked.length ? html`<${CaseOverview} findings=${activeRanked}
                   pocs=${activePocs} filter=${viz} onFilter=${setViz} />` : null}
+                ${activeRanked.length ? html`<${CurationFilter} mode=${curFilter} onChange=${setCurFilter} counts=${curCounts} />` : null}
+                ${activeRanked.length && !vizRanked.length ? html`<div class="card empty">No finding matches this filter — ${activeRanked.length} in total.</div>` : null}
                 ${activeRanked.length ? html`
                   ${activeNotable.map(cardFor)}
                   ${activeCandidates.length ? html`
@@ -1243,10 +1352,15 @@ function App() {
                     </button>
                   </div>
                 </div>
+                ${focusActive ? html`<div class="cg-focus">
+                    ${cgHighlightFn
+                      ? html`Highlighting <code>${cgHighlightFn.name || cgHighlightFn.addr}</code> — the function behind “${cgFocus.title}”.`
+                      : html`“${cgFocus.title}” is at <code>${cgFocus.addr}</code>, which is not inside any recovered function${activeFuncs ? "" : " (functions still loading)"}.`}
+                    <button class="btn xsmall ghost" onClick=${() => setCgFocus(null)}>clear</button></div>` : null}
                 ${fnView === "graph"
                   ? html`<${CallGraphCanvas} functions=${activeFuncs} edges=${_atid ? cgByT[_atid] : null}
                       onOpen=${(fn) => openFunction(fn, _atid)}
-                      highlightAddr=${topDemoFinding && (topDemoFinding.function_addr || topDemoFinding.site_addr)} />`
+                      highlightAddr=${cgHighlight} />`
                   : html`<${FunctionsPanel} functions=${activeFuncs} onOpen=${(fn) => openFunction(fn, _atid)} />`}
               </div>
             ` : tab === "disasm" ? html`
@@ -1314,7 +1428,7 @@ function App() {
 
       ${evidence ? html`<${EvidenceModal} finding=${evidence.finding} focus=${evidence.focus}
         pocs=${pocsFor(evidence.finding)} artifactUrl=${api.artifactUrl}
-        onViewCode=${viewCode} onClose=${() => setEvidence(null)} />` : null}
+        onViewCode=${viewCode} onShowInGraph=${showInGraph} onClose=${() => setEvidence(null)} />` : null}
 
       ${funcBrowse ? html`<${FunctionsModal} name=${funcBrowse.name} functions=${funcBrowse.functions}
         onOpen=${(fn) => openFunction(fn, funcBrowse.targetId)} onClose=${() => setFuncBrowse(null)} />` : null}

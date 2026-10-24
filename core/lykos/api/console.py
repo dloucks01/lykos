@@ -29,6 +29,7 @@ from . import ws
 _log = logging.getLogger(__name__)
 
 _HARD_CAP = 600.0        # overall wall-clock ceiling for one console session
+_SEED_CAP = 4 << 20      # bytes of operator input kept for "save as seed" (bounded memory)
 
 
 def _build_cmd(exe, argv, arch, endianness, bits):
@@ -102,9 +103,17 @@ def serve(sock, exe, *, argv=(), arch=None, endianness=None, bits=None, cwd=None
                     continue
                 t = msg.get("t")
                 if t == "in":
-                    b = base64.b64decode(msg["b64"]) if msg.get("b64") is not None \
-                        else str(msg.get("s", "")).encode("utf-8", "ignore")
-                    sent += b
+                    try:
+                        b = base64.b64decode(msg["b64"], validate=True) \
+                            if msg.get("b64") is not None \
+                            else str(msg.get("s", "")).encode("utf-8", "ignore")
+                    except (ValueError, TypeError):
+                        # bad base64 raised out of the loop and killed the session (and then
+                        # the handler wrote an HTTP 500 into the upgraded socket)
+                        _send(sock, {"t": "info", "msg": "ignored input: invalid base64"})
+                        continue
+                    if len(sent) < _SEED_CAP:          # the seed is bounded; the target is not
+                        sent += b[:_SEED_CAP - len(sent)]
                     try:
                         os.write(mfd, b)
                     except OSError:
@@ -167,10 +176,13 @@ def _send(sock, obj):
 
 
 def _parse(data):
+    """A client message, or None. Only a JSON OBJECT is a message: `[]`/`3`/`"x"` used to reach
+    `msg.get(...)` and raise out of the proxy loop."""
     try:
-        return json.loads(data.decode("utf-8", "ignore"))
+        msg = json.loads(data.decode("utf-8", "ignore"))
     except ValueError:
         return None
+    return msg if isinstance(msg, dict) else None
 
 
 def _killpg(proc, sig):

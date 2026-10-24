@@ -314,6 +314,37 @@
   .poc-sig { font-family: var(--mono); font-size: .76rem; color: var(--warn); }
   .empty { color: var(--muted); font-size: .9rem; }
 
+  /* Operator triage (doc 47 P3). Sits BESIDE the tool's state badge; a false positive dims the
+     card but keeps every piece of the tool's evidence readable. */
+  .curation { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 10px;
+    padding-top: 8px; border-top: 1px dashed var(--line); font-size: .78rem; }
+  .cur-lbl { font-size: .7rem; text-transform: uppercase; letter-spacing: .4px; color: var(--faint); margin-right: 2px; }
+  .cur-grp { text-transform: none; letter-spacing: 0; }
+  .cur-btn { font: inherit; font-size: .74rem; padding: 2px 9px; border-radius: 12px; cursor: pointer;
+    background: transparent; color: var(--muted); border: 1px solid var(--line); }
+  .cur-btn:hover { color: var(--ink); border-color: var(--muted); }
+  .cur-btn.on.cur-false_positive { color: var(--muted); background: color-mix(in srgb, var(--muted) 18%, transparent); border-color: var(--muted); font-weight: 600; }
+  .cur-btn.on.cur-true_positive { color: var(--bad); background: color-mix(in srgb, var(--bad) 14%, transparent); border-color: color-mix(in srgb, var(--bad) 50%, transparent); font-weight: 600; }
+  .cur-btn.on.cur-needs_review { color: var(--warn); background: color-mix(in srgb, var(--warn) 14%, transparent); border-color: color-mix(in srgb, var(--warn) 50%, transparent); font-weight: 600; }
+  .cur-note summary { cursor: pointer; color: var(--muted); font-size: .74rem; list-style: none; padding: 2px 6px; }
+  .cur-note summary::-webkit-details-marker { display: none; }
+  .cur-note[open] { flex-basis: 100%; }
+  .cur-note form { display: flex; flex-direction: column; gap: 6px; margin-top: 6px; align-items: flex-start; }
+  .cur-note textarea { width: 100%; box-sizing: border-box; font: inherit; font-size: .82rem; color: var(--ink);
+    background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; resize: vertical; }
+  .cur-note-text { flex-basis: 100%; font-size: .82rem; color: var(--ink); white-space: pre-wrap;
+    background: var(--panel-2); border-left: 2px solid var(--line); border-radius: 4px; padding: 5px 9px; margin-top: 4px; }
+  .cur-chip { font-size: .7rem; padding: 2px 8px; border-radius: 12px; white-space: nowrap; border: 1px dashed var(--line); color: var(--muted); }
+  .cur-chip.cur-true_positive { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 50%, transparent); }
+  .cur-chip.cur-needs_review { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 50%, transparent); }
+  .cur-chip.cur-false_positive { text-decoration: line-through; }
+  .finding.cur-dim { opacity: .62; }
+  .finding.cur-dim:hover, .finding.cur-dim:focus-within { opacity: 1; }
+  .cur-filter { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 10px 0 4px; font-size: .8rem; color: var(--muted); }
+  .cur-filter select { margin-left: 6px; font: inherit; color: var(--ink); background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px; padding: 2px 6px; }
+  .cg-focus { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 6px 0; font-size: .82rem; color: var(--muted); }
+  .cg-focus code { font-family: var(--mono); color: var(--accent-2); }
+
   .modal-back { position: fixed; inset: 0; background: rgba(0,0,0,.6); display: flex;
     align-items: flex-start; justify-content: center; padding: 40px 16px; z-index: 50; overflow: auto; }
   .modal { background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
@@ -608,6 +639,8 @@
   .rail-step.rs-running .rs-ico { color: var(--run); }
   .rail-step.rs-error .rs-ico { color: var(--bad); }
   .rail-step.rs-skipped, .rail-step.rs-cancelled, .rail-step.rs-declined { color: var(--faint); }
+  /* a stage that declined or timed out did NOT do its work: never the pending dot or a check */
+  .rail-step.rs-declined .rs-ico, .rail-step.rs-timeout .rs-ico { color: var(--warn); }
   .rail-run { margin-top: auto; }
   .rail-run .btn { width: 100%; justify-content: center; }
   /* The primary run controls, as a full-width horizontal bar at the top of the main content

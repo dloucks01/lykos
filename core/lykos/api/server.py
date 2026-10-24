@@ -145,6 +145,7 @@ from .routes import (  # route table + traversal-safe static reader (extracted f
     _CASE_AUTOPILOT_CANCEL,
     _CASE_AUTOPILOT_PAUSE,
     _CASE_AUTOPILOT_RESUME,
+    _CASE_CURATION,
     _CASE_EVENTS,
     _CASE_EXPORT,
     _CASE_FIND,
@@ -155,6 +156,7 @@ from .routes import (  # route table + traversal-safe static reader (extracted f
     _CASE_SYSMAP,
     _CASE_TARGETS,
     _CASE_VERIFS,
+    _FIND_CURATION,
     _FIND_ID,
     _FUNC_ID,
     _RUN_CANCEL,
@@ -329,10 +331,17 @@ class Handler(EndpointsMixin, AutopilotMixin, BaseHTTPRequestHandler):
             self._json({"error": "request body too large or malformed"}, 413, close=True)
             return None
         try:
-            return json.loads(raw or b"{}")
+            body = json.loads(raw or b"{}")
         except ValueError:
             self._json({"error": "invalid JSON body"}, 400)
             return None
+        # Every handler reads the body with `.get(...)`. A valid-JSON NON-object (`[]`, `"x"`,
+        # `3`, `null`) used to pass straight through and raise AttributeError in the handler --
+        # a 500 for what is plainly a malformed request.
+        if not isinstance(body, dict):
+            self._json({"error": "JSON body must be an object"}, 400)
+            return None
+        return body
 
     def _store(self) -> CaseStore:
         return CaseStore(self.server.case_dir)
@@ -475,14 +484,21 @@ class Handler(EndpointsMixin, AutopilotMixin, BaseHTTPRequestHandler):
                     fs = fd.list_by_target(m.group(1))
                     counts = fd.site_counts(m.group(1))
                     prov = fd.proven_sites(m.group(1))
-                    return self._json([_finding(x, site_count=counts.get(x.id, 0),
-                                                proven=prov.get(x.id, 0))
-                                       for x in fs])
+                    cur = self._curation_map(s, fs[0].case_id) if fs else {}
+                    return self._json([self._with_curation(
+                        _finding(x, site_count=counts.get(x.id, 0), proven=prov.get(x.id, 0)), cur)
+                        for x in fs])
                 finally:
                     s.close()
             m = _CASE_FIND.match(path)
             if m:
                 return self._get_case_findings(m.group(1))
+            m = _CASE_CURATION.match(path)
+            if m:
+                return self._get_case_curation(m.group(1))
+            m = _FIND_CURATION.match(path)
+            if m:
+                return self._get_finding_curation(m.group(1))
             m = _CASE_REPORT.match(path)
             if m:
                 return self._get_report(m.group(1), qs)
@@ -509,7 +525,8 @@ class Handler(EndpointsMixin, AutopilotMixin, BaseHTTPRequestHandler):
                     f = fd.get(m.group(1))
                     if not f:
                         return self._json({"error": "no finding"}, 404)
-                    return self._json(_finding(f, sites=fd.sites(f.id)))
+                    return self._json(self._with_curation(_finding(f, sites=fd.sites(f.id)),
+                                                          self._curation_map(s, f.case_id)))
                 finally:
                     s.close()
             m = _TARGET_DYN.match(path)
@@ -593,7 +610,7 @@ class Handler(EndpointsMixin, AutopilotMixin, BaseHTTPRequestHandler):
             m = _CASE_EVENTS.match(path)
             if m:
                 after = _int_param(qs, "after", 0)
-                return self._get_events(m.group(1), after)
+                return self._get_events(m.group(1), after, max(0, _int_param(qs, "tail", 0)))
             self._json({"error": "not found"}, 404)
         except _TruncatedBody as e:
             self._json({"error": f"request body truncated: {e}"}, 400, close=True)
@@ -622,6 +639,9 @@ class Handler(EndpointsMixin, AutopilotMixin, BaseHTTPRequestHandler):
             m = _TARGET_REPLAY.match(path)
             if m:
                 return self._replay_input(m.group(1))
+            m = _FIND_CURATION.match(path)
+            if m:
+                return self._set_finding_curation(m.group(1))
             if path == "/format/analyze":
                 return self._format_analyze()
             if path == "/import":

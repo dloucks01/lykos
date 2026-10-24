@@ -39,7 +39,11 @@ def close_frame() -> bytes:
 
 
 def pong_frame(payload: bytes = b"") -> bytes:
-    return bytes([0x8A, len(payload) & 0x7f]) + payload
+    # A control frame carries at most 125 bytes (RFC 6455 5.5). A larger ping payload was
+    # echoed with its length masked to 7 bits -- a header that disagrees with the body, which
+    # desyncs the client's framing. Echo the first 125 bytes instead.
+    payload = bytes(payload[:125])
+    return bytes([0x8A, len(payload)]) + payload
 
 
 def _recvn(sock, n: int) -> bytes:

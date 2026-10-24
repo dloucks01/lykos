@@ -11,6 +11,7 @@ should follow to finish decomposing the God-object.
 from __future__ import annotations
 
 import copy
+import math
 import threading
 import time
 
@@ -53,9 +54,22 @@ class AutopilotMixin:
         try:
             if not s.cases.get(cid):
                 return self._json({"error": "no case"}, 404)
-            target_ids = body.get("target_ids") or [t.id for t in s.targets.list_by_case(cid)]
+            in_case = [t.id for t in s.targets.list_by_case(cid)]
         finally:
             s.close()
+        target_ids = body.get("target_ids")
+        if target_ids:
+            # A string here was iterated per CHARACTER into "target ids", and an id from ANOTHER
+            # case was run and its findings/events filed under this one. Both are refused.
+            if not (isinstance(target_ids, list) and all(isinstance(t, str) for t in target_ids)):
+                return self._json({"error": "target_ids must be a list of target ids"}, 400)
+            foreign = [t for t in target_ids if t not in set(in_case)]
+            if foreign:
+                return self._json({"error": "target_ids not in this case",
+                                   "unknown": foreign[:20]}, 400)
+            target_ids = list(dict.fromkeys(target_ids))           # de-dupe, keep order
+        else:
+            target_ids = in_case
         if not target_ids:
             return self._json({"error": "no targets to analyse"}, 400)
         with AutopilotMixin._AUTOPILOTS_LOCK:
@@ -70,6 +84,10 @@ class AutopilotMixin:
             try:
                 secs = float(body.get("budget_seconds")) if body.get("budget_seconds") else None
             except (TypeError, ValueError):
+                secs = None
+            # NaN / inf / <= 0 parse as floats but are not budgets: a NaN budget compares false
+            # against every deadline, so the run never thought it was out of time.
+            if secs is not None and not (math.isfinite(secs) and secs > 0):
                 secs = None
             over = body.get("overrides") if isinstance(body.get("overrides"), dict) else None
             if over:

@@ -122,6 +122,71 @@ def _hexdump(data: bytes, limit: int = 1024) -> str:
 
 
 class EndpointsMixin:
+    # ---- operator curation (doc 47 P3) -- see api/curation.py for the event-sourced model ----
+    @staticmethod
+    def _curation_map(s, case_id) -> dict:
+        """{finding_id: curation} for a case. Best-effort: a curation read that fails must never
+        take the findings list down with it, so it degrades to "nothing curated" and is logged."""
+        from . import curation
+        try:
+            return curation.current_for_case(s.conn, case_id) if case_id else {}
+        except Exception:
+            observe.absorbed(_log, "serving findings without curation")
+            return {}
+
+    @staticmethod
+    def _with_curation(d: dict, cur: dict) -> dict:
+        """Attach the operator's verdict BESIDE the tool's own fields (never over `state`)."""
+        c = cur.get(d.get("id"))
+        d["curation"] = ({"status": c["status"], "note": c["note"],
+                          "updated_at": c["updated_at"]} if c else None)
+        return d
+
+    def _get_case_curation(self, cid):
+        from . import curation
+        s = self._store()
+        try:
+            if not s.cases.get(cid):
+                return self._json({"error": "no case"}, 404)
+            return self._json({"curation": curation.current_for_case(s.conn, cid),
+                               "statuses": list(curation.STATUSES),
+                               "labels": curation.STATUS_LABEL})
+        finally:
+            s.close()
+
+    def _get_finding_curation(self, fid):
+        from . import curation
+        s = self._store()
+        try:
+            f = FindingDAO(s.conn).get(fid)
+            if not f:
+                return self._json({"error": "no finding"}, 404)
+            cur = curation.current_for_case(s.conn, f.case_id).get(fid)
+            return self._json({"finding_id": fid, "current": cur,
+                               "history": curation.history_for_finding(s.conn, f.case_id, fid)})
+        finally:
+            s.close()
+
+    def _set_finding_curation(self, fid):
+        """POST {status: false_positive|true_positive|needs_review|null, note: str}. Records the
+        operator's verdict as an append-only case event; the finding row itself is untouched."""
+        from . import curation
+        body = self._json_body()
+        if body is None:
+            return
+        try:
+            status, note = curation.validate(body)
+        except curation.CurationError as e:
+            return self._json({"error": str(e), "statuses": list(curation.STATUSES)}, 400)
+        s = self._store()
+        try:
+            f = FindingDAO(s.conn).get(fid)
+            if not f:
+                return self._json({"error": "no finding"}, 404)
+            return self._json(curation.record(s, f, status, note))
+        finally:
+            s.close()
+
     def _get_capabilities(self, tid):
         """What this target can and cannot have done to it, and why not.
 
@@ -184,6 +249,11 @@ class EndpointsMixin:
         body = self._json_body()
         if body is None:
             return
+        _argv = body.get("argv")
+        if _argv is not None and not (isinstance(_argv, list)
+                                      and all(isinstance(a, str) for a in _argv)):
+            # a STRING argv was iterated character by character into the sandbox command line
+            return self._json({"error": "argv must be a list of strings"}, 400)
         try:                                             # a bad value is a 400, not a 500
             _tmo = float(body.get("timeout", 15))
             _sample = (base64.b64decode(body["sample_b64"])
@@ -395,9 +465,10 @@ class EndpointsMixin:
             for tid in tmap:
                 counts.update(fd.site_counts(tid))
                 proven.update(fd.proven_sites(tid))
+            cur = self._curation_map(s, cid)
             for f in fd.list_by_case(cid):
-                d = _finding(f, site_count=counts.get(f.id, 0),
-                             proven=proven.get(f.id, 0))
+                d = self._with_curation(_finding(f, site_count=counts.get(f.id, 0),
+                                                 proven=proven.get(f.id, 0)), cur)
                 t = tmap.get(f.target_id)
                 d["target_name"] = t.filename if t else None
                 d["target_arch"] = t.arch if t else None
@@ -694,6 +765,16 @@ class EndpointsMixin:
         path = self.server.content.path(sha)
         if not path.exists():
             return self._json({"error": "no artifact"}, 404)
+        # Only parse an artifact the store KNOWS is an attempt log. read_log() slurps the whole
+        # file, and any sha reaches this route -- pointed at a target binary or firmware image it
+        # read (and utf-8-decoded) up to 1 GiB per request before deciding it was not a log.
+        s = self._store()
+        try:
+            art = s.artifacts.get(sha)
+        finally:
+            s.close()
+        if art is None or art.kind != _attempts.LOG_KIND:
+            return self._json({"error": "not a fuzz attempt log"}, 415)
 
         def _list(name):
             v = (qs.get(name) or [""])[0]
@@ -715,6 +796,9 @@ class EndpointsMixin:
         from ..db.dao import ArtifactDAO
         s = self._store()
         try:
+            # an unknown case is a 404, like every other case reader -- not "no logs"
+            if not s.cases.get(case_id):
+                return self._json({"error": "no case"}, 404)
             arts = [a for a in ArtifactDAO(s.conn).list_by_case(case_id) if a.kind == LOG_KIND]
         finally:
             s.close()
@@ -727,18 +811,19 @@ class EndpointsMixin:
         meta/primitive, small text files (README, meta.json, PRIMITIVE.txt, runner.sh, exploit.py)
         inlined, and a hexdump preview of the payload (input.bin) -- so the UI can show the exploit,
         not just offer a download. Binary members give size + a note, never their raw bytes here."""
-        import io
         import json
         import tarfile
 
         path = self.server.content.path(sha)
         if not path.exists():
             return self._json({"error": "no artifact"}, 404)
-        raw = path.read_bytes()
+        # Open from DISK: any artifact sha reaches this route, and reading the blob into memory
+        # first (as this did) loaded a near-1 GiB firmware image per request just to find out it
+        # is not a tarball. tarfile streams the gzip and fails fast on the magic.
         try:
-            tf = tarfile.open(fileobj=io.BytesIO(raw),           # noqa: SIM115 -- closed in
-                              mode="r:gz")                      # the finally below; a `with`
-                                                                # cannot span the 415 return
+            tf = tarfile.open(path, mode="r:gz")            # noqa: SIM115 -- closed in the
+                                                             # finally below; a `with` cannot
+                                                             # span the 415 return
         except Exception:                                    # noqa: BLE001 -- not a tar.gz bundle
             return self._json({"error": "not a poc bundle"}, 415)
         TEXT = {"README.txt", "meta.json", "PRIMITIVE.txt", "runner.sh", "exploit.py", "recipe.json",
@@ -776,9 +861,20 @@ class EndpointsMixin:
                            "meta": meta, "run_cmd": run_cmd,
                            "files": files, "download": f"/artifacts/{sha}"})
 
-    def _get_events(self, cid, after):
+    def _get_events(self, cid, after, tail=0):
+        """Events after a cursor (oldest first, 500 a page) -- or, with `tail=N`, the case's
+        NEWEST N events (still oldest first). The GUI needs the tail to seed its live-log cursor
+        and to backfill the console on reopen: `after=0` returns the OLDEST 500, so a case with a
+        long history seeded the cursor 500 events in and then replayed the rest as if live."""
         s = self._store()
         try:
+            if tail > 0:
+                from ..db.dao import EventDAO
+                rows = s.conn.execute(
+                    "SELECT * FROM (SELECT * FROM event WHERE case_id = ? ORDER BY id DESC "
+                    "LIMIT ?) ORDER BY id ASC", (cid, min(int(tail), 2000))).fetchall()
+                ed = EventDAO(s.conn)
+                return self._json([_event(ed._row(r)) for r in rows])
             evs = s.events.list(case_id=cid, after_id=after, limit=500)
             return self._json([_event(e) for e in evs])
         finally:
@@ -788,9 +884,18 @@ class EndpointsMixin:
         body = self._json_body()
         if body is None:
             return
+        name = body.get("name", "case")
+        if name is None or name == "":
+            name = "case"
+        # A non-string name/notes was stored as-is and broke every later reader that formats it
+        # (the export filename does `.replace`), so refuse it here instead.
+        if not isinstance(name, str) or any(
+                body.get(k) is not None and not isinstance(body.get(k), str)
+                for k in ("notes", "engagement_ref")):
+            return self._json({"error": "name, notes and engagement_ref must be strings"}, 400)
         s = self._store()
         try:
-            c = s.cases.create(body.get("name", "case"), notes=body.get("notes"),
+            c = s.cases.create(name[:200], notes=body.get("notes"),
                                engagement_ref=body.get("engagement_ref"))
             return self._json(_case(c), 201)
         finally:
@@ -877,6 +982,13 @@ class EndpointsMixin:
             stage = body.get("stage", _INGEST)
             target_id = body.get("target_id")
             params = body.get("params")
+            # Shape checks at the edge: a list/number here reached the stage code (or a dict
+            # lookup with an unhashable key) and surfaced as a 500.
+            if not isinstance(stage, str) or (target_id is not None
+                                              and not isinstance(target_id, str)):
+                return self._json({"error": "stage and target_id must be strings"}, 400)
+            if params is not None and not isinstance(params, dict):
+                return self._json({"error": "params must be an object"}, 400)
 
             if stage in self._CASE_STAGES:            # case-scoped: no target needed
                 cid = body.get("case_id")
@@ -885,6 +997,12 @@ class EndpointsMixin:
                     if _t is None:                    # a bad target_id is a 404, not a 500
                         return self._json({"error": "no target"}, 404)
                     cid = _t.case_id
+                # Neither a case nor a target: enqueueing with case_id=None created a run no
+                # case owns (or failed in the FK as a 500). Say what is missing instead.
+                if not cid or not isinstance(cid, str):
+                    return self._json({"error": f"stage {stage!r} requires a case_id"}, 400)
+                if not s.cases.get(cid):
+                    return self._json({"error": "no case"}, 404)
                 fn = self._enqueue_fn(self._CASE_STAGES[stage])
                 run = fn(q, cid) if stage in ("link_case", "ipc_model", "cross_taint") \
                     else fn(q, cid, params=params)

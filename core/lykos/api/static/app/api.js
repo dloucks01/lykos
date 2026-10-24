@@ -82,6 +82,16 @@ export const api = {
   getFunction: (id) => _req("GET", `/functions/${id}`),
   getFinding: (id) => _req("GET", `/findings/${id}`),
 
+  // ---- operator curation (doc 47 P3) ----
+  // The operator's verdict on a finding -- status false_positive | true_positive | needs_review
+  // (or null to clear) plus a free-text note. Stored server-side per case as an append-only
+  // audit trail; it never changes the tool's own state / L-level for the finding.
+  setCuration: (findingId, status, note) => _req("POST", `/findings/${findingId}/curation`, {
+    body: { status: status || null, note: note || "" },
+  }),
+  findingCuration: (findingId) => _req("GET", `/findings/${findingId}/curation`),
+  caseCuration: (caseId) => _req("GET", `/cases/${caseId}/curation`),
+
   // Propose (and optionally verify by running) a command line for the target.
   invocation: (id, opts = {}) => _req("POST", `/targets/${id}/invocation`, { body: opts }),
 
@@ -136,6 +146,9 @@ export const api = {
   pauseBackground: (caseId) => _req("POST", `/cases/${caseId}/autopilot/pause`),
   resumeBackground: (caseId) => _req("POST", `/cases/${caseId}/autopilot/resume`),
   events: (caseId, after = 0) => _req("GET", `/cases/${caseId}/events?after=${after}`),
+  // The case's NEWEST n events (oldest first). `events(cid, 0)` is the OLDEST page, so it cannot
+  // seed a live-tail cursor or backfill "the last run's commands" on a long case.
+  eventsTail: (caseId, n = 500) => _req("GET", `/cases/${caseId}/events?tail=${n}`),
   reportUrl: (caseId, fmt = "html") => `/cases/${caseId}/report?format=${fmt}`,
   artifactUrl: (sha) => `/artifacts/${sha}`,
   // Inner contents of a PoC bundle (.tar.gz): { level, exploit, meta, run_cmd, files:[{name,

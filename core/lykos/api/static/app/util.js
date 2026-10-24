@@ -130,11 +130,12 @@ export function dedupeFindings(findings) {
     const key = `${f.cwe}|${f.state}|${f.detector || ""}`;
     const rep = byKey.get(key);
     if (!rep) {
-      const clone = { ...f, group_count: 1, site_count: f.site_count || 1 };
+      const clone = { ...f, group_count: 1, site_count: f.site_count || 1, group_ids: [f.id] };
       byKey.set(key, clone);
       out.push(clone);
     } else {
       rep.group_count += 1;
+      rep.group_ids.push(f.id);   // so a curation of the CARD covers every finding folded into it
       rep.site_count = (rep.site_count || 1) + (f.site_count || 1);
       rep.proven_sites = (rep.proven_sites || 0) + (f.proven_sites || 0);
     }
@@ -349,4 +350,60 @@ export function histogram(findings, field) {
     m.set(k, (m.get(k) || 0) + 1);
   }
   return [...m.entries()].map(([key, count]) => ({ key, count })).sort((a, b) => b.count - a.count);
+}
+
+// --- Operator curation (doc 47 P3) ---------------------------------------------------------
+// The operator's verdict on a finding, carried by the server as `finding.curation` = {status,
+// note, updated_at} (or null). It is the OPERATOR's judgement and is shown BESIDE the tool's state
+// badge, never in place of it: marking a poc-backed finding a false positive does not lower the
+// tool's L-level, and "true positive" is deliberately not called "confirmed" (the tool's two-source
+// state). Labels, the list filter, and the per-status counts live here so they are unit-testable.
+export const CURATION_STATUSES = ["false_positive", "true_positive", "needs_review"];
+export const CURATION_LABEL = {
+  false_positive: "False positive", true_positive: "True positive", needs_review: "Needs review",
+};
+export const CURATION_FILTERS = [
+  ["hide_fp", "Hide false positives"], ["all", "All findings"], ["needs_review", "Needs review"],
+  ["true_positive", "True positives"], ["false_positive", "False positives only"],
+  ["uncurated", "Not yet triaged"],
+];
+export const curationStatus = (f) => (f && f.curation && f.curation.status) || null;
+
+export function filterByCuration(findings, mode) {
+  const list = findings || [];
+  switch (mode) {
+    case "all": return list;
+    case "uncurated": return list.filter((f) => !curationStatus(f));
+    case "false_positive": case "true_positive": case "needs_review":
+      return list.filter((f) => curationStatus(f) === mode);
+    case "hide_fp": default: return list.filter((f) => curationStatus(f) !== "false_positive");
+  }
+}
+
+export function curationCounts(findings) {
+  const c = { false_positive: 0, true_positive: 0, needs_review: 0, uncurated: 0 };
+  for (const f of findings || []) {
+    const s = curationStatus(f);
+    if (s && s in c) c[s] += 1; else c.uncurated += 1;
+  }
+  return c;
+}
+
+// The function a finding lives in, from the target's recovered functions: an exact start-address
+// match, else the function whose [addr, addr+size) range holds the address (a finding that only
+// knows its fault / sink site). Addresses arrive as ints or hex strings; null when none contains it.
+// Used to land a finding on its call-graph node and to open its code.
+export function containingFunction(functions, addr) {
+  const num = (x) => (x == null || x === "" ? null
+    : typeof x === "number" ? x : (Number.isNaN(parseInt(x, 16)) ? null : parseInt(x, 16)));
+  const a = num(addr);
+  if (!functions || !functions.length || a == null) return null;
+  let best = null;
+  for (const f of functions) {
+    const s = num(f.addr);
+    if (s == null) continue;
+    if (s === a) return f;
+    if (f.size > 0 && s <= a && a < s + f.size && (!best || s > num(best.addr))) best = f;
+  }
+  return best;
 }
