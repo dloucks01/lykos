@@ -1,5 +1,10 @@
 # Current state — what lykos does today (2026-10-22)
 
+> **Update 2026-10-24 (doc 51):** the large-binary items below are addressed — size-tiered,
+> checkpointed rizin recovery (≥16 MB) keeps a real function list + call graph under a deadline;
+> taint ranks top-N reachable functions instead of returning zero above 6000; mmap replaces the
+> whole-file reads. PE exports + TLS callbacks are now parsed. The rest of this doc stands.
+
 The single "what is true now" internal reference. The dated planning/strategy/audit series that
 preceded this (docs 01–46) is **archived** under `archive/`; this doc supersedes it as the start
 point, and the forward plan for the gaps named here is `49-next-build-vision`. When this doc and the

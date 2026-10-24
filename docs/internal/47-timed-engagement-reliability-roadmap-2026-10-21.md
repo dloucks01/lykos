@@ -100,7 +100,7 @@ found by running the machinery on a REAL daemon (asterisk), not building it from
       case (no `--help` obtainable). `from_optstring` UNIONS matches (asterisk → 50 bogus flags) and
       `discover`'s `<=12` cap drops the real `BC:cde:FfG:...`. Pick the single best getopt string and
       trust one well-formed optstring past 12. **Precision-sensitive** → needs the conformance guard.
-- [ ] **R2.d · Daemon runtime needs (overlaps P5).** A plausible config *with content* (not an empty
+- [~] **R2.d · Daemon runtime needs (overlaps P5).** *(2026-10-24: `analyze/runtime_env.py` discovers + confirms + stages config-with-content / dirs / env (889c237); NOT yet wired into `sandbox.run` / `fuzz/stage._discover_argv` — see doc 51 "Open".)* A plausible config *with content* (not an empty
       `-C` file), a working/data dir, and env vars the target reads — asterisk needs a config + runtime
       dir to fully initialize, which `materialize`'s single-file synth misses.
 - [x] **Surface the chosen invocation in the GUI** — a "DRIVING AS `<target> <argv>` · operator /
@@ -173,7 +173,7 @@ become the **safety ceiling** and the search runs until coverage plateaus. Non-f
       caught by the orchestrator's stage-deadline reaper. ADDITIVE (fires only for `converge=True`),
       so existing conformance (all `converge=False`) is unchanged; unit-tested (the flag is set iff
       converge) + afl/coverage tests green.
-- [ ] **U1-engine (remaining) · plateau for the non-AFL campaigns + a live "Converged/Stalled"
+- [x] **U1-engine (remaining) · plateau for the non-AFL campaigns + a live "Converged/Stalled"
       badge.** The blind/`directed_fuzz` sandbox campaigns run to the ceiling in convergence mode
       (no AFL plateau signal there); a coverage-growth monitor could stop them too. Surface the
       live Running/Converged/Stalled state in the GUI (overlaps U2).
@@ -204,7 +204,7 @@ execs, rate, coverage blocks_hit/known, crashes).
 - [x] **ETA honesty in convergence mode** — when `converge` is on the console labels the ETA
       `ceiling ~Xm` (the hard cap, not a real countdown) and the live badge carries the true state
       (coverage steady = plateauing); in time-boxed mode it stays `~Xm left`.
-- [ ] **Server-authoritative stall → auto-skip in Thorough** — the badge now SHOWS stalled; wiring a
+- [x] **Server-authoritative stall → auto-skip in Thorough** *(6cd5719: `<prefix>.converged` / `<prefix>.stalled`, budget handed back)* — the badge now SHOWS stalled; wiring a
       Stalled campaign to a short-grace auto-skip belongs with the U1-engine (AFL already self-skips
       a hung target; this is for the non-AFL campaigns).
 
@@ -354,28 +354,28 @@ resource-exhaustion); P9 multi-binary (`CaseOverview` + link_case/cross_taint/wh
 tab-close + persists; true mid-campaign resume is the gap, low value), P8 bundle/version freshness
 warning, P10 BinDiff/patch-diff.
 
-- [ ] **P1 · Crash triage & exploitability ranking.** A run that yields many crashes should
+- [x] **P1 · Crash triage & exploitability ranking.** *(04b91c7: `/targets/{id}/crash-triage` + ranked CrashesPanel)* A run that yields many crashes should
       auto-dedup by root cause and rank by exploitability so the operator sees the few that matter,
       not fifty. (Partly exists — unique-sig dedup, `distinctCrashes`; confirm + surface a ranked
       view in the GUI.)
 - [ ] **P2 · Run resume / checkpointing.** Resume an interrupted or long Thorough run from the case
       DB instead of restarting the search from zero — matters most for convergence runs and if the
       environment kills a background run (which it does here).
-- [ ] **P3 · Operator curation of findings.** In the GUI: mark false-positive / confirm / annotate,
+- [x] **P3 · Operator curation of findings.** *(4984123 GUI/API, bc8a916 reports)* In the GUI: mark false-positive / confirm / annotate,
       feeding the engagement report. Precision is the standing bar, so the operator must be able to
       triage and the tool must remember it.
 - [ ] **P4 · Comprehensive auto-corpus seeding from the target.** Mine strings, embedded samples,
       format magic, and companion files for valid seeds so fuzzing starts from real inputs, not
       noise. (Partly exists — strings/format models; make it exhaustive + show what was seeded.)
-- [ ] **P5 · Environment & filesystem setup discovery.** Beyond config/param (R2): env vars the
+- [~] **P5 · Environment & filesystem setup discovery.** *(module landed 889c237; live wiring open)* Beyond config/param (R2): env vars the
       target reads (getenv), files it opens at fixed paths, a required CWD / data dir — detect and
       supply so the target runs at all.
 - [ ] **P6 · Stateful / interactive / menu-driven driving.** Detect op-sequence protocols (a
       handshake, a numbered menu) and drive them; many real daemons need a sequence to reach the
       bug. (Overlaps harness T6.)
-- [ ] **P7 · Target hang / DoS capture.** A target that hangs on an input is itself a finding
+- [x] **P7 · Target hang / DoS capture.** *(757191e capture, 2d431be verified L1 bundle, 5c61b0a proved in the prove phase)* A target that hangs on an input is itself a finding
       (CWE-835 / CWE-400), not a discarded timeout — capture and reproduce it.
-- [ ] **P8 · Bundle / version freshness check.** The GUI warns when the running air-gap disc lags
+- [x] **P8 · Bundle / version freshness check.** *(04b91c7 `/version` + footer, f0d62b8 BUILD_INFO.json stamp)* The GUI warns when the running air-gap disc lags
       main (missing fixes) — "it didn't work" has partly been stale discs (memory notes several
       fixes landed after the 20261021 disc).
 - [ ] **P9 · Multi-binary engagement view.** An engagement is many binaries; a cross-target queue +

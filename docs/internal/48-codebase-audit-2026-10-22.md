@@ -31,7 +31,13 @@ that burned the budget, and a cluster of sandbox-hardening gaps in the secondary
 | 8 | LOW-MED | libfuzzer | source-tree extraction naive name check (misses symlink escape) | `extractall(filter="data")` |
 | 9 | MED | patchdiff | fingerprint ignored the callee set → a call-target swap (memcpy→wrapper) hashed "unchanged", hiding the patched fn | fold callees into the hash |
 
-## FOLLOW-UPS (recorded, not yet fixed) — prioritized
+## FOLLOW-UPS — status 2026-10-24
+
+**All follow-ups below were fixed in the 2026-10-24 audit (see doc 51).**
+One correction: `variant.similarity` does NOT catch an immediate-only edit (its
+profile is P-Code op names only); the fix landed in `patchdiff` operand hashing instead (5735eea).
+
+## FOLLOW-UPS (as recorded 2026-10-22) — prioritized
 
 ### Precision (fabrication / FP) — do first
 - **leak.py: finish the confirm hardening** — the echo-reflection guard removes the identified

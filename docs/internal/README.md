@@ -10,6 +10,9 @@ build.
 
 ## Current docs
 
+- **[`51-full-audit-2026-10-24.md`](51-full-audit-2026-10-24.md)** — the 2026-10-24 full audit +
+  improvement pass: highest-impact defects fixed (AFL ran ~1 s; large binaries strings-only;
+  reports calling unexecuted targets clean), new capabilities, and the prioritized open list.
 - **[`50-current-state-2026-10-22.md`](50-current-state-2026-10-22.md) — start here.** What lykos
   actually does today: the L0→L3 capability matrix across architectures, the Windows/PE depth and its
   L2/L3 wall, the large-binary (100 MB+) ceiling, and the honest-degradation posture. Supersedes the
