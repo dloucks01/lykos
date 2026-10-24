@@ -424,10 +424,10 @@ export function FuzzConsole({ live, state, converge, compact }) {
 // alert that a static-only result here is a tooling outcome, not a clean binary. Fed by the
 // server's `fuzz.health` event / scorecard, so the GUI never silently presents an empty run.
 const _FH_COLOR = { ok: "#2ec28a", failed: "#e5534b", error: "#e5534b", noprogress: "#d9a441",
-                    starved: "#d9a441", no_gain: "#d9a441", declined: "#8a94a6", skipped: "#8a94a6",
+                    starved: "#d9a441", no_gain: "#d9a441", stalled: "#d9a441", declined: "#8a94a6", skipped: "#8a94a6",
                     not_run: "#8a94a6" };
 const _FH_LABEL = { ok: "ran", failed: "FAILED", error: "error", noprogress: "no progress",
-                    starved: "starved", no_gain: "no gain", declined: "n/a", skipped: "skipped",
+                    starved: "starved", no_gain: "no gain", stalled: "stalled", declined: "n/a", skipped: "skipped",
                     not_run: "—" };
 
 // "Did it earn its time": coverage the seeds reached vs. what mutation added, and when it last grew.

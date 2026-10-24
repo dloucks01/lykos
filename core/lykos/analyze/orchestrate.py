@@ -1919,9 +1919,9 @@ def run_case_autopilot(case_dir, case_id: str, target_ids, status: dict,
                 # Run-to-convergence (doc 47 U1): the budget is a SAFETY CEILING, not a target -- the
                 # operator's intent is "keep going until coverage plateaus". The slider's minutes are
                 # that ceiling when given; with none, use a high default (6h) so a long campaign is
-                # bounded but not cut short. (The coverage-plateau auto-stop + stalled-engine auto-skip
-                # is the next increment; today the run uses the ceiling and the live coverage/health
-                # panel shows the plateau for the operator to stop on.)
+                # bounded but not cut short. The campaigns stop themselves on a coverage plateau
+                # (`<prefix>.converged`) or a stall (`<prefix>.stalled`), and the unused time comes
+                # back to this budget for the stages after them.
                 if converge and budget_seconds is None:
                     eff_budget = _CONVERGENCE_CEILING_SECONDS
                 bud = budget_mod.CaseBudget(eff_budget, overrides=overrides, skip_stages=skip_stages,

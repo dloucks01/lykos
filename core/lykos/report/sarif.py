@@ -203,7 +203,7 @@ def _fingerprint(t: dict, f: dict) -> str:
 
 #: engine status -> SARIF notification level
 _NOTE_LEVEL = {"failed": "error", "error": "error", "noprogress": "warning",
-               "starved": "warning", "no_gain": "note", "declined": "note", "skipped": "note"}
+               "starved": "warning", "stalled": "warning", "no_gain": "note", "declined": "note", "skipped": "note"}
 
 
 def _target_notifications(t: dict, a_idx: int, uri: str) -> tuple:

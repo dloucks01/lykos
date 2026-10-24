@@ -27,7 +27,7 @@ _CURATION_COLOR = {"false_positive": "#8b8d98", "true_positive": "#46a758",
                    "needs_review": "#d29922"}
 #: Engine-health status colours: a failure is a fix-this signal, a decline is not a fault.
 _HEALTH_COLOR = {"ok": "#46a758", "no_gain": "#d29922", "idle": "#d29922",
-                 "noprogress": "#f76808", "starved": "#f76808", "degraded": "#f76808",
+                 "noprogress": "#f76808", "starved": "#f76808", "stalled": "#f76808", "degraded": "#f76808",
                  "failed": "#e5484d", "error": "#e5484d", "none": "#e5484d",
                  "declined": "#8b8d98", "skipped": "#8b8d98", "not_run": "#8b8d98",
                  "unrecorded": "#8b8d98"}

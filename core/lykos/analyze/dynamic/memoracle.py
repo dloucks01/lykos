@@ -238,10 +238,18 @@ def runtime_tokens(exe, data: bytes, *, mode: str = "stdin", base_argv=(), timeo
             argv = [(tmp if a == "@@" else a) for a in argv] if "@@" in argv else argv + [tmp]
         cmd = _confined(argv, exe, rw=[d], setenv={"LD_PRELOAD": env["LD_PRELOAD"],
                                                    "AFL_TOKEN_FILE": str(out)})
+        # Own process group, killed whole on timeout: a wedged target (or a child it forked)
+        # must not outlive the probe, and a bare subprocess.run timeout kills only the child.
+        from . import sandbox as _sandbox
         try:
-            subprocess.run(cmd, input=stdin_data, capture_output=True, timeout=timeout, env=env)
-        except (OSError, subprocess.SubprocessError):
+            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL, env=env, start_new_session=True)
+        except OSError:
             return []
+        try:
+            proc.communicate(input=stdin_data, timeout=timeout)
+        except (OSError, subprocess.SubprocessError):
+            _sandbox.kill_quietly(proc)
         try:
             return parse_token_file(out.read_bytes())
         except OSError:

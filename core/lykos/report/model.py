@@ -195,7 +195,7 @@ CURATION_LABEL = {"false_positive": "False positive (operator)",
 _HEALTH_ORDER = ("none", "degraded", "unrecorded", "idle", "ok")
 #: Per-engine statuses that mean the engine could not do its job (a FIX-THIS signal).
 _ENGINE_BAD = ("failed", "error")
-_ENGINE_WEAK = ("noprogress", "starved")
+_ENGINE_WEAK = ("noprogress", "starved", "stalled")
 
 
 def _ts_iso(v) -> Optional[str]:
