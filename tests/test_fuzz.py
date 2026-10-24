@@ -748,7 +748,10 @@ def test_the_bare_env_runner_backstops_a_shared_object():
     import inspect
 
     from lykos.analyze.fuzz import envfuzz
-    src = inspect.getsource(envfuzz._run_with_env)
+    # `_run_with_env` delegates to `_run_with_env_detail` (which also returns the attempt's
+    # stderr/timing for the attempt log); the guard lives in the one that spawns.
+    assert "_run_with_env_detail" in inspect.getsource(envfuzz._run_with_env)
+    src = inspect.getsource(envfuzz._run_with_env_detail)
     assert "_is_elf_shared_object" in src
     head = src[:src.index("_is_elf_shared_object")]
     assert "Popen" not in head, "the guard must come before the subprocess is spawned"
