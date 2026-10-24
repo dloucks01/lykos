@@ -173,6 +173,16 @@ def _file_oob_index_candidates(ctx, target, arrays, why) -> int:
             "function_addr": None, "site_addr": None, "site_detail": arr["name"],
             "evidence": [{"channel": "oob-index-static", "detail": detail}]})
         n += 1
+        # The weaponization needs no execution either: the index that lands on a GOT slot is
+        # (slot - base) / stride. File the concrete index/value recipe against this candidate.
+        try:
+            from ..poc import oob_recipe
+            lead = next((f for f in fd.list_by_target(target.id)
+                         if f.dedup_key == f"CWE-129:oobindex:{arr['name']}"), None)
+            if lead is not None:
+                oob_recipe.file_oob_index_recipe(ctx, target, lead, why=why, arrays=[arr])
+        except Exception:                                # noqa: BLE001 -- the candidate stands
+            observe.absorbed(_log, "static index recipe not filed")
     return n
 
 
@@ -189,12 +199,17 @@ def _static_arrays(ctx, target):
         arrs = []
     if arrs:
         return arrs
+    d = None
     try:
-        exe = Path(tempfile.mkdtemp(prefix="lykos-oobstat-")) / "t.bin"
+        d = Path(tempfile.mkdtemp(prefix="lykos-oobstat-"))
+        exe = d / "t.bin"
         exe.write_bytes(tb)
         return _array_candidates_symfree(exe)
     except Exception:                                    # noqa: BLE001
         return []
+    finally:
+        if d is not None:                                # a copy of the target per call, never kept
+            shutil.rmtree(d, ignore_errors=True)
 
 
 def oob_index_stage(ctx) -> dict:

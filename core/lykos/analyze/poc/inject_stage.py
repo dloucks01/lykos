@@ -180,6 +180,22 @@ def synthesize_injection_stage(ctx) -> dict:
     if not confirmed:
         _file_injection_recipes(ctx, target, applicable, channels, len(navs or []))
 
+    # THE FORMAT-STRING WRITE, statically. A %p probe -- confirmed or not -- only ever demonstrates
+    # the READ half of CWE-134; the %hhn write-what-where is the half that reaches L3, and its every
+    # number (the buffer's varargs index, the GOT slot, the win / system@plt value) is a literal fact
+    # of the recovered frame and image. Compute and file it as concrete payload bytes for each
+    # CWE-134 site, whether or not this sandbox could run the target (additive: a demonstrated
+    # format exploit from build_exploit suppresses it).
+    if "format-string" in applicable:
+        fmt_ok = any(c.get("cwe") == "CWE-134" for c in confirmed)
+        from . import fmt_recipe
+        fmt_recipe.file_format_write_recipes(
+            ctx, target, target_bytes=target_bytes,
+            why=("the format-string read was demonstrated by a %p probe here, but the %hhn write "
+                 "itself was not executed" if fmt_ok else
+                 "no format-string probe confirmed in this sandbox (air-gap / unreachable sink / "
+                 "target could not run); the write plan is computed from the recovered frame"))
+
     ctx.emit("inject.done", payload={"ok": True, "confirmed": len(confirmed),
              # input_sha + resolved_base are the HANDOFF to build_exploit: a CWE-134 leak that
              # already resolved a PIE/libc base is a measured disclosure recipe, so L3's leak recon
@@ -209,16 +225,15 @@ def _file_injection_recipes(ctx, target, applicable, channels, n_navs) -> None:
     """For each applicable injection probe that did not confirm, file a corroborated recipe carrying
     the concrete marked payload + delivery channel. Honest: state via recipe.file_recipe (never
     poc-backed, no verified PoC row), effect reported as a candidate ceiling, not demonstrated."""
-    leads = {}
-    try:
-        for f in FindingDAO(ctx.conn).list_by_target(target.id):
-            if f.cwe and f.cwe not in leads and (f.detector or "") in ("dangerous_api", "lang_sinks"):
-                leads[f.cwe] = f
-    except Exception:                                    # noqa: BLE001 -- lead linkage is best-effort
-        observe.absorbed(_log, "no leads")
+    leads = _recipe_leads(ctx, target)
     chan = (channels or ["stdin"])[0]
     for name, spec in applicable.items():
         cwe = spec.get("cwe", "")
+        if cwe not in leads:
+            # An IMPORT is not a weakness: nearly every C binary imports printf, many call
+            # system("clear"). Filing a corroborated "Exploitation recipe" because the sink symbol
+            # exists invents a defect -- the recipe must hang off a detected one.
+            continue
         try:
             payloads = spec["payloads"](_marker())
         except Exception:                                # noqa: BLE001
@@ -240,6 +255,37 @@ def _file_injection_recipes(ctx, target, applicable, channels, n_navs) -> None:
                      f"over {chan} is built to trigger it"),
             why_not_executed=why, lead=leads.get(cwe),
             input_bytes=pb, input_mode=chan)
+
+
+def _recipe_leads(ctx, target) -> dict:
+    """{cwe: the detected finding an injection recipe may hang off}. Any detector counts, ranked so
+    a precise one wins (the CWE-134 `format_string` detector, then taint-backed rows, then by
+    confidence). One deliberate exclusion: `dangerous_api`'s CWE-134 row at LOW severity with no
+    taint evidence is the catalog's "printf -- check the format string is not tainted" reminder,
+    filed for EVERY printf call; it names a call, not a defect, so it does not license a recipe."""
+    out = {}
+    try:
+        rows = FindingDAO(ctx.conn).list_by_target(target.id)
+    except Exception:                                    # noqa: BLE001 -- lead linkage is best-effort
+        observe.absorbed(_log, "no leads")
+        return out
+
+    def _tainted(f):
+        return any("taint" in str(e.get("channel", "")) for e in (f.evidence or []))
+
+    def _rank(f):
+        return ((f.detector or "") == "format_string", _tainted(f), f.confidence or 0.0)
+
+    for f in rows:
+        if not f.cwe or (f.title or "").startswith("Exploitation recipe"):
+            continue
+        if (f.cwe == "CWE-134" and (f.detector or "") == "dangerous_api"
+                and (f.severity or "") == "low" and not _tainted(f)):
+            continue
+        cur = out.get(f.cwe)
+        if cur is None or _rank(f) > _rank(cur):
+            out[f.cwe] = f
+    return out
 
 
 _HEXWORD = re.compile(rb"0x[0-9a-f]{4,}|\(nil\)|\(null\)")

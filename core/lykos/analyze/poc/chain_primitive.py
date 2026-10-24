@@ -58,6 +58,8 @@ _VCLASS = {"CWE-415": "double_free", "CWE-416": "uaf", "CWE-122": "heap_overflow
 #: lead still goes first and the only cost on a target with no real primitive is the searches'
 #: own attempt caps.
 _LEAD_DETECTORS = ("heap_trace", "oob_index", "tainted_deref", "heap_fptr_call")
+#: Rows this stage / the recipe helpers file themselves -- never re-consumed as a lead.
+_RECIPE_DETECTORS = ("chain_primitive", "oob_recipe", "recipe")
 
 
 def _p64(v: int) -> bytes:
@@ -90,8 +92,11 @@ def _lead_finding(conn, target):
     one (see `_LEAD_DETECTORS`). A DYNAMIC lead outranks a static one at equal confidence, because
     a traced use-after-free is a fact about this run and a pattern match is a fact about the code."""
     from ...db.dao import FindingDAO
+    # Any detector's CWE-129 also counts: an array-index finding NAMES the indexed-write primitive
+    # whoever found it (a static array-index detector included). Recipe rows are never leads.
     leads = [f for f in FindingDAO(conn).list_by_target(target.id)
-             if f.detector in _LEAD_DETECTORS and f.cwe in _VCLASS]
+             if f.cwe in _VCLASS and f.detector not in _RECIPE_DETECTORS
+             and (f.detector in _LEAD_DETECTORS or f.cwe == "CWE-129")]
     return max(leads, key=lambda f: (f.confidence, f.detector in ("heap_trace", "oob_index")),
                default=None)
 
@@ -132,7 +137,11 @@ def chain_primitive_stage(ctx) -> dict:
     why = (substrate.foreign_cpu_reason(target.arch, target.file_type, host, _what)
            or substrate.native_only_reason(target.file_type, _what))
     if why:
-        ctx.emit("chain.done", payload={"applicable": False, "note": why})
+        # Cannot RUN the target here -- but an indexed write's weaponization is arithmetic over the
+        # image (array base/stride, GOT slots, win), not a search. File it rather than nothing.
+        filed = _static_index_recipe(ctx, target, _lead_finding(ctx.conn, target), why)
+        ctx.emit("chain.done", payload={"applicable": False, "note": why,
+                                        "static_recipes": len(filed)})
         return {}
 
     lead = _lead_finding(ctx.conn, target)
@@ -283,7 +292,8 @@ def chain_primitive_stage(ctx) -> dict:
                 return got
         recipe = _recipe(vclass, win, target_bytes, glibc=_glibc)
         _file_recipe(ctx, target, lead, vclass, win, recipe,
-                     f"drove {vclass} but control never reached {win_name}")
+                     f"drove {vclass} but control never reached {win_name}",
+                     seq_for=_index_seq_builder(opts, model, width))
         ctx.emit("chain.done", payload={"applicable": True, "confirmed": False,
                  "vclass": vclass, "win": win_name})
         ctx.progress(pct=100, msg=f"{vclass} chain to {win_name} not confirmed (L2 recipe)")
@@ -1392,9 +1402,32 @@ def _annotate_lead_ceiling(ctx, target, lead, *, level, why) -> None:
         observe.absorbed(_log, "leaving the lead alone")
 
 
-def _file_recipe(ctx, target, lead, vclass, win, recipe, why) -> None:
-    """L2 guidance: the concrete technique + target to finish the chain by hand."""
+def _index_seq_builder(opts, model, width):
+    """`seq_for(index, value)` driving the crawl's index-taking WRITE option (the same option choice
+    `_oob_write_hijack` makes), or None when the crawl learned no such option."""
+    writers = [o for o in (opts or []) if o in (model or {}) and "idx" in model[o]
+               and len(model[o]) >= 2]
+    if not writers:
+        return None
+    w = writers[0]
+    return lambda i, v: _oob_write_seq(w, model[w], i, v, None, model, width)
+
+
+def _static_index_recipe(ctx, target, lead, why, seq_for=None) -> list:
+    """The CWE-129 index-write recipe with its NUMBERS (index, value, target slot) -- see
+    `oob_recipe`. Only for a lead that names an indexed write (oob_write vclass)."""
+    if lead is None or _VCLASS.get(lead.cwe) != "oob_write":
+        return []
+    from . import oob_recipe
+    return oob_recipe.file_oob_index_recipe(ctx, target, lead, why=why, seq_for=seq_for)
+
+
+def _file_recipe(ctx, target, lead, vclass, win, recipe, why, seq_for=None) -> None:
+    """L2 guidance: the concrete technique + target to finish the chain by hand. For an indexed
+    write the exact index/value pair is filed alongside (`_static_index_recipe`)."""
     from ...db.dao import FindingDAO
+    if vclass == "oob_write":
+        _static_index_recipe(ctx, target, lead, why, seq_for=seq_for)
     tech = recipe.get("technique", "heap-technique")
     tgt = f" -> {win[0]} (0x{win[1]:x})" if win else ""
     detail = (f"{vclass} primitive can be chained via {tech}{tgt}, but a live hijack was not "
