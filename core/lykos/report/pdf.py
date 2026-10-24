@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+from . import model as _model
+
 # US Letter, points
 PAGE_W, PAGE_H = 612.0, 792.0
 MARGIN = 54.0
@@ -110,6 +112,25 @@ def _report_lines(report: dict[str, Any]) -> list[_Line]:
         f'{summ.get("findings", 0)} findings across {summ.get("targets", 0)} targets  ·  '
         f'{summ.get("confirmed", 0)} confirmed  ·  {summ.get("poc_backed", 0)} PoC-backed',
         "H", 10, 0, 4)
+    # Impact first, and never a level-less result without WHY: the same verdicts the HTML leads
+    # with (`model.target_verdict`), so the two deliverables cannot disagree about a level.
+    targets = report.get("targets", [])
+    verdicts = [(t, t.get("verdict") or _model.target_verdict(t)) for t in targets]
+    top = max((v["level"] for _t, v in verdicts if v.get("level")), default="")
+    L += _flow("Highest demonstrated impact: " + (top or "none (no verified PoC)"),
+               "HB", 10, 0, 4)
+    n_dark = sum(1 for _t, v in verdicts if v.get("nothing_executed"))
+    if n_dark and not top:
+        L += _flow(f"No dynamic engine executed {n_dark} of {len(targets)} target(s), so nothing "
+                   "there could escalate past L0 -- a tooling/setup outcome, not a clean result.",
+                   "HB", 9, 0, 2, (0.75, 0.3, 0.2))
+    for t, v in verdicts:
+        L += _flow(f'- {t.get("filename") or "(target)"}: {v.get("label")}', "H", 9, 8, 1)
+    cur = summ.get("curation") or {}
+    if cur:
+        L += _flow("Operator triage: " + ", ".join(
+            f"{_model.CURATION_LABEL.get(k, k)} {n}" for k, n in cur.items())
+            + " (the tool's counts above are unchanged)", "HO", 9, 0, 4, (0.4, 0.4, 0.45))
     bysev = summ.get("by_severity", {})
     if bysev:
         L.append(_Line("By severity:", "HB", 9, 0, 6))
@@ -166,8 +187,20 @@ def _report_lines(report: dict[str, Any]) -> list[_Line]:
             L += _flow(f'Analysis ceiling - {rt.get("ceiling")}. {rt["ceiling_why"]}',
                        "HO", 8.5, 0, 2, (0.35, 0.35, 0.4))
         ex = t.get("execution") or {}
-        if ex.get("did_not_run_count") or ex.get("failed_stages"):
+        v = t.get("verdict") or _model.target_verdict(t)
+        L += _flow(f'Verdict: {v.get("label")}', "HB", 9, 0, 3,
+                   _SEV_RGB.get(v.get("tone")) if v.get("tone") in _SEV_RGB else None)
+        base = ex.get("baseline")
+        never_ran = base is not None and not base.get("ran")
+        skipped = ex.get("stages_skipped_for_budget") or []
+        if ex.get("did_not_run_count") or ex.get("failed_stages") or never_ran or skipped:
             bits = []
+            if never_ran:
+                bits.append("the baseline execution never started this target ("
+                            + str(base.get("note") or base.get("isolation") or "no reason given")
+                            + ")")
+            if skipped:
+                bits.append("ran out of time before: " + ", ".join(map(str, skipped[:8])))
             if ex.get("did_not_run_count"):
                 why = "; ".join((d.get("reason") or d.get("isolation") or "").strip()
                                 for d in ex.get("did_not_run", [])[:2] if d)
@@ -177,29 +210,83 @@ def _report_lines(report: dict[str, Any]) -> list[_Line]:
             L += _flow("Execution gaps - " + ". ".join(bits)
                        + ". An absent result from these is not evidence of absence.",
                        "HO", 8.5, 0, 3, (0.5, 0.35, 0.3))
+        for d in (ex.get("diagnostics") or [])[:6]:
+            L += _flow(f'Why {d.get("stage")} did little: {d.get("note")}', "HO", 8.5, 0, 1,
+                       (0.5, 0.35, 0.3))
+        L += _health_lines(t)
 
-        findings = t.get("findings", [])
+        findings = t.get("findings") or []
         if not findings:
             # "No reportable findings" is the sentence a reader takes as CLEAN, so it must not
-            # be printed bare when part of the analysis never executed.
-            _bare = not (ex.get("did_not_run_count") or ex.get("failed_stages"))
+            # be printed bare when part of the analysis never executed -- the same test the HTML
+            # uses (`model.has_execution_gaps`), which this renderer used to apply only in part.
+            gaps = ex.get("has_gaps")
+            if gaps is None:
+                gaps = _model.has_execution_gaps(t)
+            _bare = not (gaps or v.get("nothing_executed"))
             L += _flow("No reportable findings for this target." if _bare else
-                       "No reportable findings for this target -- but see the execution gaps "
-                       "above: this is not a clean result.", "HO", 9, 0, 6,
+                       "No reportable findings for this target -- but see the execution gaps / "
+                       "engine health above: this is not a clean result.", "HO", 9, 0, 6,
                        (0.4, 0.4, 0.45))
             continue
+        fp = [f for f in findings if (f.get("curation") or {}).get("status") == "false_positive"]
+        fp_ids = {id(f) for f in fp}
         for f in findings:
-            L += _finding_lines(f)
+            if id(f) not in fp_ids:
+                L += _finding_lines(f)
+        if fp:
+            L.append(_Line(f"Dismissed by the operator as false positive ({len(fp)})", "HB", 10,
+                           0, 14, (0.45, 0.45, 0.5)))
+            L += _flow("Shown for audit; the tool's state, severity and level are unchanged.",
+                       "HO", 8.5, 0, 1, (0.45, 0.45, 0.5))
+            for f in fp:
+                L += _finding_lines(f)
+    return L
+
+
+def _health_lines(t: dict) -> list[_Line]:
+    """The per-engine dynamic verdict, as in the HTML's engine-health block."""
+    eh = t.get("engine_health") or _model.engine_health(t.get("execution") or {})
+    L: list[_Line] = []
+    hv = eh.get("verdict") or "unrecorded"
+    col = (0.75, 0.3, 0.2) if hv in ("none", "degraded") else (0.4, 0.4, 0.45)
+    L += _flow(f"Dynamic engine health: {hv}. {eh.get('note') or ''}".strip(), "HB", 8.5, 0, 4,
+               col)
+    for e in (eh.get("engines") or [])[:12]:
+        bits = [str(e.get("engine")), str(e.get("status"))]
+        if e.get("execs"):
+            bits.append(f"{e['execs']} execs")
+        if e.get("coverage"):
+            bits.append(str(e["coverage"]))
+        line = "  ".join(bits) + (f" -- {e['reason']}" if e.get("reason") else "")
+        L += _flow("- " + line, "H", 8, 8, 1, col if e.get("status") in ("failed", "error")
+                   else None)
+    for d in ((t.get("execution") or {}).get("declined") or [])[:8]:
+        if isinstance(d, dict):
+            tag = {"ours": " [our defect]", "unknown": " [unclassified]"}.get(d.get("kind"), "")
+            L += _flow(f'- declined {d.get("stage")}: {d.get("reason")}{tag}', "H", 8, 8, 1)
     return L
 
 
 def _finding_lines(f: dict) -> list[_Line]:
     L: list[_Line] = []
-    sev = f.get("severity", "info")
-    state = f.get("state", "candidate")
+    sev = f.get("severity") or "info"
+    state = f.get("state") or "candidate"
     L += _flow(f.get("title") or f.get("cwe") or "finding", "HB", 11, 0, 12)
-    L.append(_Line(f"[{sev}]  [{state}]  confidence {f.get('confidence')}", "HB", 8.5, 0, 2,
-                   _SEV_RGB.get(sev)))
+    lvl = f.get("level") or _model.best_verified_level(f)
+    built = _model.best_unverified_level(f)
+    lvl_txt = (f"  [{lvl}]" if lvl else
+               f"  [{built} built, NOT verified]" if built else "")
+    L.append(_Line(f"[{sev}]  [{state}]{lvl_txt}  confidence {f.get('confidence')}", "HB", 8.5,
+                   0, 2, _SEV_RGB.get(sev)))
+    cur = f.get("curation") or {}
+    if cur.get("status") or cur.get("note"):
+        L += _flow("Operator triage: "
+                   + (cur.get("label") or _model.CURATION_LABEL.get(cur.get("status"), "")
+                      or str(cur.get("status") or "note"))
+                   + (f" ({cur['updated_at']})" if cur.get("updated_at") else "")
+                   + (f" -- {cur['note']}" if cur.get("note") else ""),
+                   "HO", 8.5, 0, 2, (0.55, 0.42, 0.1))
     if f.get("cwe"):
         L += _flow(f'{f["cwe"]} - {f.get("cwe_name")}', "H", 9, 0, 2)
     loc = []

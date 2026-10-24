@@ -147,7 +147,7 @@ def run_corpus(cases=None, *, workdir=None, gcc="gcc", workers=2, stage_timeout=
             exe = compile_case(c, tmp, gcc)
             if exe is None:
                 outcomes.append(Outcome(c.name, c.cwe, c.verdict, set(),
-                                        note="compile failed (skipped)"))
+                                        note="compile failed (skipped)", scored=False))
                 continue
             label = f"{c.cwe}__{c.name}__{c.verdict}"     # store label only, not embedded
             target = ingest(store, case_row.id, exe, filename=label)
@@ -175,9 +175,12 @@ def run_corpus(cases=None, *, workdir=None, gcc="gcc", workers=2, stage_timeout=
             # a slow-but-correct run score as a clean miss.
             note = (f"{c.note}; " if c.note else "") + "stage timed out (indeterminate)" \
                 if timed_out else c.note
+            _hit = matches(c.cwe, found)
             outcomes.append(Outcome(c.name, c.cwe, c.verdict, found,
                                     state=_best_state(findings, c.cwe),
-                                    matched=matches(c.cwe, found), note=note))
+                                    matched=_hit, note=note,
+                                    # unfinished AND nothing found: indeterminate, not a negative
+                                    scored=not (timed_out and not _hit)))
     finally:
         pool.stop(grace=3.0)
         store.close()
@@ -220,7 +223,7 @@ def run_dynamic_corpus(cases=None, *, workdir=None, gcc="gcc", workers=2, max_ex
             exe = compile_case(c, tmp, gcc)
             if exe is None:
                 outcomes.append(Outcome(c.name, c.cwe, c.verdict, set(),
-                                        note="compile failed (skipped)"))
+                                        note="compile failed (skipped)", scored=False))
                 continue
             target = ingest(store, case_row.id, exe, filename=f"{c.cwe}__{c.name}__{c.verdict}")
             timed_out = not pool.wait_idle(stage_timeout)
@@ -240,7 +243,8 @@ def run_dynamic_corpus(cases=None, *, workdir=None, gcc="gcc", workers=2, max_ex
                 note = (f"{c.note}; " if c.note else "") + "stage timed out (indeterminate)"
             else:
                 note = c.note
-            outcomes.append(Outcome(c.name, c.cwe, c.verdict, found, state=state, note=note))
+            outcomes.append(Outcome(c.name, c.cwe, c.verdict, found, state=state, note=note,
+                                    scored=bool(confirmed) or not timed_out))
     finally:
         pool.stop(grace=3.0)
         store.close()

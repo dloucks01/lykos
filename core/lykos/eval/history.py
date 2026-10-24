@@ -32,7 +32,10 @@ def _git_rev():
 
 def record(path, report, *, stage: str, min_state=None, label=None, ts=None) -> dict:
     """Append one run's scored metrics to the history file; returns the stored record."""
-    backend = ({"ghidra": bool(report.meta.get("ghidra"))} if stage == "static"
+    # Both static backends: a run on the no-JVM native backend (rizin+pypcode) was recorded as
+    # `ghidra: false` and nothing else, i.e. as a run with NO backend.
+    backend = ({"ghidra": bool(report.meta.get("ghidra")),
+                "native": bool(report.meta.get("native"))} if stage == "static"
                else {"fuzz_execs": report.meta.get("max_execs")})
     rec = {
         "ts": int(ts if ts is not None else time.time()),
@@ -42,7 +45,7 @@ def record(path, report, *, stage: str, min_state=None, label=None, ts=None) -> 
         "per_cwe": report.metrics.get("per_cwe", {}),
     }
     p = Path(path)
-    with p.open("a") as f:
+    with p.open("a", encoding="utf-8") as f:
         f.write(json.dumps(rec, sort_keys=True) + "\n")
     return rec
 
@@ -53,7 +56,7 @@ def load(path) -> list:
     if not p.exists():
         return []
     out = []
-    for line in p.read_text().splitlines():
+    for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
         line = line.strip()
         if not line:
             continue

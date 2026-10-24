@@ -230,3 +230,13 @@ def test_the_html_drops_the_meaningless_cpu_row_for_a_jar():
          "runtime": _runtime(_T(file_type="elf", arch="x86-64", bits=64, linking="static"))}
     hn = _target_html(n)
     assert "x86-64/64" in hn and "Analysis ceiling" not in hn
+
+
+
+def test_an_unknown_report_filter_is_a_400_not_a_500(srv):
+    """build_report refuses an unknown min_state instead of silently widening the report to every
+    candidate; the endpoint surfaces that as the caller's error, not a server fault."""
+    port, cs = srv
+    cid = _seed(cs)
+    st, _, body = _get(port, f"/cases/{cid}/report?format=html&min_state=bogus")
+    assert st == 400 and b"bogus" in body

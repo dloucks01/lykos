@@ -36,7 +36,16 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     http = None
     if args.http:
         host, _, port = args.http.rpartition(":")
-        http = (host or "127.0.0.1", int(port))
+        # A malformed bind ("localhost", "127.0.0.1:http") died in a traceback; say what is wrong.
+        try:
+            http = (host or "127.0.0.1", int(port))
+        except ValueError:
+            print(f"--http needs HOST:PORT (e.g. 127.0.0.1:8787), got {args.http!r}",
+                  file=sys.stderr)
+            return 2
+        if not 0 < http[1] < 65536:
+            print(f"--http port out of range: {http[1]}", file=sys.stderr)
+            return 2
     if not args.socket and not http:
         print("serve needs --socket and/or --http", file=sys.stderr)
         return 2
@@ -135,9 +144,10 @@ def _cmd_analyze(args) -> int:
         # wherever the operator is standing, and print the command that runs one.
         _export_pocs(store, t, Path(args.out or ".").resolve())
         if args.report:
-            from .report.html import to_html
-            from .report.model import build_report
-            Path(args.report).write_text(to_html(build_report(store, case.id)))
+            # Format follows the file suffix (.pdf/.sarif/.json, else HTML), and the file is
+            # written as UTF-8 explicitly -- the HTML carries non-ASCII ("—", "·") and a
+            # non-UTF-8 locale on an offline box raised UnicodeEncodeError after the whole run.
+            _write_report(store, case.id, Path(args.report), None)
             print(f"\nreport   {args.report}")
         # Exit code says whether anything was DEMONSTRATED, not whether anything was printed.
         rc = 0 if any(f.state in ("confirmed", "poc-backed") for f in findings) else 1
@@ -316,16 +326,17 @@ def _print_scorecard(card: dict) -> None:
     else:
         print("  baseline     not attempted")
     rate = ex.get("per_second")
-    print(f"  executions   {ex.get('total', 0):,}" + (f"  ({rate:g}/s)" if rate else ""))
+    print(f"  executions   {_fmt_n(ex.get('total'))}" + (f"  ({_fmt_g(rate)}/s)" if rate else ""))
     by = ex.get("by_engine") or {}
-    for k, v in sorted(by.items(), key=lambda kv: -kv[1]):
-        print(f"               {k:<14} {v:,}")
+    for k, v in sorted(by.items(), key=lambda kv: -(kv[1] if isinstance(kv[1], (int, float))
+                                                    else 0)):
+        print(f"               {k:<14} {_fmt_n(v)}")
     st = card.get("stages") or {}
     print("  stages       " + ", ".join(f"{k} {v}" for k, v in sorted(st.items())))
     if card.get("stages_skipped_for_budget"):
         print("  out of time  " + ", ".join(card["stages_skipped_for_budget"][:8]))
     if bud.get("total"):
-        print(f"  budget       {bud.get('elapsed', 0):g}s of {bud['total']:g}s")
+        print(f"  budget       {_fmt_g(bud.get('elapsed'))}s of {_fmt_g(bud['total'])}s")
         # What that clock was WORTH here. 2,761 executions is a good result at 5 exec/s and a
         # near-total failure at 580, and the count alone cannot tell them apart.
         _adv = bud.get("advice") or {}
@@ -450,6 +461,104 @@ def _print_scorecard(card: dict) -> None:
                   + " -- nobody has judged whether that reason is the target's or ours")
 
 
+def _fmt_n(v) -> str:
+    """A count with separators; a missing (None) or odd value prints instead of raising -- the
+    scorecard is printed AFTER a long run, and one null field used to lose all of it."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return "0" if v is None else str(v)
+    return f"{v:,}" if isinstance(v, int) else f"{v:,.1f}"
+
+
+def _fmt_g(v) -> str:
+    return f"{v:g}" if isinstance(v, (int, float)) and not isinstance(v, bool) else str(v or 0)
+
+
+_REPORT_FORMATS = ("html", "pdf", "sarif", "json")
+
+
+def _report_format(path: Path, fmt) -> str:
+    if fmt:
+        return fmt
+    suf = path.suffix.lower().lstrip(".")
+    return {"htm": "html", "sarif": "sarif", "json": "json", "pdf": "pdf"}.get(suf, "html")
+
+
+def _render_report(rep: dict, fmt: str) -> bytes:
+    import json as _json
+    if fmt == "pdf":
+        from .report.pdf import to_pdf
+        return to_pdf(rep)
+    if fmt == "sarif":
+        from .report.sarif import to_sarif
+        return _json.dumps(to_sarif(rep), indent=2).encode("utf-8")
+    if fmt == "json":
+        from .report.casejson import to_case_json_bytes
+        return to_case_json_bytes(rep)
+    from .report.html import to_html
+    return to_html(rep).encode("utf-8")
+
+
+def _write_report(store, case_id: str, path: Path, fmt, **kw) -> str:
+    from .report.model import build_report
+    fmt = _report_format(path, fmt)
+    rep = build_report(store, case_id, embed_pocs=kw.pop("embed_pocs", fmt in ("html", "json")),
+                       **kw)
+    path.write_bytes(_render_report(rep, fmt))
+    return fmt
+
+
+def _cmd_report(args: argparse.Namespace) -> int:
+    """Render a kept case's report offline -- the CLI twin of the web GUI's report builder
+    (`GET /cases/{id}/report`). Before this the only CLI report was `analyze --report`, written
+    once at the end of a run; a case curated or re-run afterwards could not be re-reported
+    without the server."""
+    case_dir = Path(args.case_store)
+    if not (case_dir / "case.db").is_file():
+        # CaseStore.open would CREATE an empty store here and report on nothing.
+        print(f"no case store at {case_dir} (expected {case_dir / 'case.db'})", file=sys.stderr)
+        return 2
+    store = CaseStore.open(case_dir)
+    try:
+        cases = list(store.cases.list())
+        if args.case:
+            hit = [c for c in cases if c.id == args.case or c.id.startswith(args.case)
+                   or c.name == args.case]
+        else:
+            hit = cases if len(cases) == 1 else []
+        if len(hit) != 1:
+            why = ("no case matches " + repr(args.case) if args.case and not hit
+                   else "several cases match; pass --case <id>" if hit
+                   else "this store holds no case" if not cases
+                   else "this store holds several cases; pass --case <id>")
+            print(why, file=sys.stderr)
+            for c in cases[:20]:
+                print(f"  {c.id}  {c.name}", file=sys.stderr)
+            return 2
+        states = [x.strip() for x in (args.states or "").split(",") if x.strip()] or None
+        out = Path(args.out) if args.out else None
+        fmt = args.format or (_report_format(out, None) if out else "html")
+        kw = dict(min_severity=args.min_severity, min_state=args.min_state, states=states)
+        try:
+            if out is None:
+                from .report.model import build_report
+                rep = build_report(store, hit[0].id, embed_pocs=args.embed_pocs, **kw)
+                data = _render_report(rep, fmt)
+                if fmt == "pdf":
+                    sys.stdout.buffer.write(data)
+                else:
+                    sys.stdout.write(data.decode("utf-8"))
+                return 0
+            _write_report(store, hit[0].id, out, fmt,
+                          embed_pocs=args.embed_pocs or fmt in ("html", "json"), **kw)
+        except ValueError as e:                          # an unknown --states value
+            print(f"report: {e}", file=sys.stderr)
+            return 2
+        print(f"{fmt} report written to {out}", file=sys.stderr)
+        return 0
+    finally:
+        store.close()
+
+
 def _print_findings(findings) -> None:
     print("\n-- findings " + "-" * 64)
     if not findings:
@@ -458,7 +567,9 @@ def _print_findings(findings) -> None:
         return
     order = {"poc-backed": 0, "confirmed": 1, "corroborated": 2, "candidate": 3}
     for f in sorted(findings, key=lambda f: (order.get(f.state, 9), f.cwe or "")):
-        print(f"  [{f.state:<12}] {f.severity:<8} {f.cwe or '-':<10} "
+        # str(): a finding row with a NULL state/severity raised TypeError in the format spec
+        # and lost the whole findings list at the end of a long run.
+        print(f"  [{str(f.state or '?'):<12}] {str(f.severity or '?'):<8} {f.cwe or '-':<10} "
               f"{(f.title or '')[:52]:<52} {f.detector or ''}")
     demod = [f for f in findings if f.state in ("confirmed", "poc-backed")]
     print(f"\n  {len(demod)} demonstrated, {len(findings) - len(demod)} detected only.")
@@ -574,12 +685,32 @@ def build_parser() -> argparse.ArgumentParser:
     an.add_argument("--case-store", default=None,
                     help="case directory to keep (default: a temporary one)")
     an.add_argument("--name", default=None, help="case name")
-    an.add_argument("--report", default=None, help="write an HTML report here")
+    an.add_argument("--report", default=None,
+                    help="write the report here; the format follows the suffix (.pdf, .sarif, "
+                         ".json, else HTML)")
     an.add_argument("--out", default=None,
                     help="where to write verified PoC bundles (default: the current directory)")
     an.add_argument("--workers", type=int, default=3, help="worker threads (default 3)")
     an.add_argument("-q", "--quiet", action="store_true", help="no per-stage progress")
     an.set_defaults(func=_cmd_analyze)
+
+    rp = sub.add_parser("report",
+                        help="render a kept case's report (html | pdf | sarif | json) offline")
+    rp.add_argument("--case-store", required=True, help="the case directory")
+    rp.add_argument("--case", default=None,
+                    help="case id (prefix) or name (default: the store's only case)")
+    rp.add_argument("--format", choices=list(_REPORT_FORMATS), default=None,
+                    help="default: from the --out suffix, else html")
+    rp.add_argument("--out", default=None, help="output file (default: stdout)")
+    rp.add_argument("--min-severity", choices=["info", "low", "medium", "high", "critical"],
+                    default=None, help="drop findings below this severity")
+    rp.add_argument("--min-state", choices=["candidate", "corroborated", "confirmed", "poc-backed"],
+                    default="candidate", help="drop findings below this state (default candidate)")
+    rp.add_argument("--states", default=None,
+                    help="keep only these states (comma-separated)")
+    rp.add_argument("--embed-pocs", action="store_true",
+                    help="embed PoC bundles (always on for html/json written to a file)")
+    rp.set_defaults(func=_cmd_report)
 
     fl = sub.add_parser("fuzz-log",
                         help="show a fuzz engine's per-attempt log: every execution and how it ended")
@@ -710,7 +841,9 @@ def _cmd_weggli_scan(args: argparse.Namespace) -> int:
     r = weggli.scan(args.path, cpp=args.cpp, timeout=args.timeout)
     if args.json:
         print(json.dumps(r, indent=2, default=list))
-        return 0
+        # The same exit status as the text form: an unsupported scan (no weggli) is not a clean
+        # one, and a script reading --json was told 0 for a scan that never happened.
+        return 0 if r.get("supported", True) else 3
     if not r["supported"]:
         print(r["note"], file=sys.stderr)
         return 3
@@ -756,6 +889,10 @@ def _cmd_variant_scan(args: argparse.Namespace) -> int:
         funcs = native_re.analyze(p, timeout=args.timeout).get("functions") or []
         hits = variant.variant_scan(sig, funcs, threshold=args.threshold)
         results.append({"binary": str(p), "hits": hits})
+    if not results:
+        # Every corpus path was missing: "hunting across 0 binaries" then exit 0 read as clean.
+        print("no corpus binary exists; nothing was scanned", file=sys.stderr)
+        return 2
     if args.json:
         print(json.dumps({"function": args.target_func, "reference": str(ref), "results": results},
                          indent=2, default=list))
@@ -891,7 +1028,7 @@ def _cmd_dashboard(args: argparse.Namespace) -> int:
     hist = histmod.load(path)
     print(dashmod.render_text(hist))
     if args.html:
-        Path(args.html).write_text(dashmod.render_html(hist))
+        Path(args.html).write_text(dashmod.render_html(hist), encoding="utf-8")
         print(f"\nHTML dashboard written to {args.html}", file=sys.stderr)
     regs = histmod.regressions(hist)
     if args.fail_on_regression and regs:
@@ -915,6 +1052,10 @@ def _run_benchmark(args: argparse.Namespace, cases) -> int:
     from .eval import harness
     from .eval import history as histmod
 
+    # `--lava` loads LAVA-M PROGRAMS into `cases`; those are scored by the lava leg below, not
+    # by the static one (which scored them as if they were CWE corpus cases).
+    if getattr(args, "lava", None):
+        cases = None
     static_cases = cases if cases is not None else corpusmod.benchmark()
     hist_path = args.history or histmod.DEFAULT_PATH
     print("BENCHMARK (tracked, non-gating)\n")
@@ -1041,6 +1182,10 @@ def _cmd_eval(args: argparse.Namespace) -> int:
     rep = harness.run(cases, **kw)
     for w in rep.meta.get("warnings", []):
         print(f"warning: {w}", file=sys.stderr)
+    if rep.metrics.get("n_unscored"):
+        print(f"warning: {rep.metrics['n_unscored']} case(s) could not be evaluated (compile "
+              "failure or a stage that never finished); counted conservatively -- a bad one as "
+              "a miss, a good one NOT as a true negative", file=sys.stderr)
     print(rep.table())
     backend = (f"backend={'ghidra' if rep.meta.get('ghidra') else ('native' if rep.meta.get('native') else 'NONE')}"
                f", min_state={args.min_state}"

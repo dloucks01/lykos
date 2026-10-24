@@ -108,6 +108,9 @@ class Outcome:
     state: str = ""                # best finding state for `cwe` (candidate/…/confirmed)
     note: str = ""
     matched: bool = None           # set by the harness (family-aware); else exact membership
+    # False when the case could not be evaluated (compile failure, or a pipeline that never went
+    # idle and found nothing). See `score` for how an unscored case is counted.
+    scored: bool = True
 
     @property
     def flagged(self) -> bool:
@@ -133,9 +136,22 @@ def _round(x):
 def score(outcomes: list[Outcome]) -> dict:
     """Confusion matrix + metrics per CWE class and overall (micro-averaged)."""
     by_cwe: dict[str, dict] = {}
+    n_unscored = 0
     for o in outcomes:
         c = by_cwe.setdefault(o.cwe, {"tp": 0, "fp": 0, "fn": 0, "tn": 0,
                                       "bad": 0, "good": 0})
+        if not getattr(o, "scored", True):
+            # A case that never ran proves nothing either way, so it is counted CONSERVATIVELY:
+            # an unevaluated bad case is a miss (detection was not demonstrated), and an
+            # unevaluated good case is NOT a true negative. It used to be scored as a clean
+            # result -- a `good` case that failed to compile counted as a TN, deflating the
+            # FP-rate and inflating precision over a corpus the platform never saw.
+            n_unscored += 1
+            c["unscored"] = c.get("unscored", 0) + 1
+            if o.verdict == "bad":
+                c["bad"] += 1
+                c["fn"] += 1
+            continue
         if o.verdict == "bad":
             c["bad"] += 1
             c["tp" if o.flagged else "fn"] += 1
@@ -161,6 +177,7 @@ def score(outcomes: list[Outcome]) -> dict:
         "overall": {**agg, **{k: _round(v) for k, v in overall.items()},
                     "fp_rate": _round(overall_fpr)},
         "n_cases": len(outcomes),
+        "n_unscored": n_unscored,
         "n_cwe_classes": len(by_cwe),
     }
 
@@ -178,7 +195,8 @@ class Report:
             "metrics": self.metrics,
             "outcomes": [{"name": o.name, "cwe": o.cwe, "verdict": o.verdict,
                           "flagged": o.flagged, "state": o.state,
-                          "found_cwes": sorted(o.found_cwes), "note": o.note}
+                          "found_cwes": sorted(o.found_cwes), "note": o.note,
+                          "scored": getattr(o, "scored", True)}
                          for o in self.outcomes],
         }
 

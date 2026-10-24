@@ -51,9 +51,13 @@ def render_text(history) -> str:
         lines.append("")
         lines.append(f"== {key} ==  ({len(runs)} run{'s' if len(runs) != 1 else ''})")
         lines.append("  when              git       recall  prec  fp_rate   Δrecall Δfp")
-        for i, r in enumerate(runs[-8:]):
-            o = r.get("overall", {})
-            prev = runs[runs.index(r) - 1].get("overall", {}) if runs.index(r) > 0 else {}
+        # Position, not `runs.index(r)`: two runs with identical records (same ts/git/metrics,
+        # e.g. a re-recorded run) compare equal, so index() found the FIRST one and every later
+        # twin was diffed against the wrong predecessor.
+        base = max(len(runs) - 8, 0)
+        for i, r in enumerate(runs[-8:], start=base):
+            o = r.get("overall", {}) or {}
+            prev = (runs[i - 1].get("overall", {}) or {}) if i > 0 else {}
             lines.append(
                 f"  {_short_ts(r.get('ts')):<17} {(r.get('git') or '-'):<8} "
                 f"{_pct(o.get('recall'))} {_pct(o.get('precision'))} {_pct(o.get('fp_rate'))}"
@@ -128,14 +132,14 @@ per benchmark series (doc 14).</p>"""]
         for i, r in enumerate(runs[-12:]):
             o = r.get("overall", {})
             def cell(v):
-                return _pct(v).strip()
+                return esc(_pct(v).strip())
             rows.append(
                 f"<tr><td>{esc(_short_ts(r.get('ts')))}</td>"
                 f"<td><code>{esc(r.get('git') or '-')}</code></td>"
                 f"<td>{cell(o.get('recall'))}</td><td>{cell(o.get('precision'))}</td>"
                 f"<td>{cell(o.get('f1'))}</td><td>{cell(o.get('fp_rate'))}</td>"
-                f"<td class='mut'>{o.get('tp',0)}/{o.get('fp',0)}/"
-                f"{o.get('fn',0)}/{o.get('tn',0)}</td></tr>")
+                f"<td class='mut'>{esc(str(o.get('tp', 0)))}/{esc(str(o.get('fp', 0)))}/"
+                f"{esc(str(o.get('fn', 0)))}/{esc(str(o.get('tn', 0)))}</td></tr>")
         parts.append(f"""<div class="card">
 <div style="display:flex;justify-content:space-between;align-items:center">
 <b>{esc(key)}</b>{flag}<span class="mut">{len(runs)} runs</span></div>

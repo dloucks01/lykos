@@ -11,6 +11,8 @@ from __future__ import annotations
 import html as _html
 from typing import Any
 
+from . import model as _model
+
 _SEV_COLOR = {
     "critical": "#e5484d", "high": "#f76808", "medium": "#ffb224",
     "low": "#46a758", "info": "#8b8d98",
@@ -21,6 +23,14 @@ _STATE_COLOR = {
 }
 
 _LEVEL_COLOR = {"L0": "#8b8d98", "L1": "#5b9dd9", "L2": "#f76808", "L3": "#e5484d"}
+_CURATION_COLOR = {"false_positive": "#8b8d98", "true_positive": "#46a758",
+                   "needs_review": "#d29922"}
+#: Engine-health status colours: a failure is a fix-this signal, a decline is not a fault.
+_HEALTH_COLOR = {"ok": "#46a758", "no_gain": "#d29922", "idle": "#d29922",
+                 "noprogress": "#f76808", "starved": "#f76808", "degraded": "#f76808",
+                 "failed": "#e5484d", "error": "#e5484d", "none": "#e5484d",
+                 "declined": "#8b8d98", "skipped": "#8b8d98", "not_run": "#8b8d98",
+                 "unrecorded": "#8b8d98"}
 #: What each rung MEANS, in one line -- the impact ladder, so a reader who does not live in it
 #: can read the verdict. Canonical source: bundle._LEVEL_MEANING.
 _LEVEL_GLOSS = {
@@ -115,41 +125,39 @@ def _finding_level(f: dict) -> tuple:
 
 
 def _target_verdict(t: dict) -> dict:
-    """A one-line verdict for a target, derived from its findings: the strongest outcome and the
-    severity that frames it. The whole report leads with this -- impact first, counts second."""
-    findings = t.get("findings") or []
-    ex = t.get("execution") or {}
-    best_lvl = ""
-    worst_sev = None
-    sev_order = {"critical": 5, "high": 4, "medium": 3, "low": 2, "info": 1}
-    for f in findings:
-        lvl, _ = _finding_level(f)
-        if lvl and (best_lvl == "" or lvl > best_lvl):
-            best_lvl = lvl
-        s = f.get("severity")
-        if s and (worst_sev is None or sev_order.get(s, 0) > sev_order.get(worst_sev, 0)):
-            worst_sev = s
-    base = ex.get("baseline")
-    never_ran = base is not None and not base.get("ran")
-    if best_lvl == "L3":
-        return {"label": "Exploited — working exploit demonstrated (L3)", "level": "L3",
-                "tone": "critical"}
-    if best_lvl == "L2":
-        return {"label": "Exploitation primitive established (L2)", "level": "L2", "tone": "high"}
-    if best_lvl == "L1":
-        return {"label": "Reproduced crash — verified reproducer (L1)", "level": "L1",
-                "tone": "high"}
-    if findings:
-        return {"label": f"Static findings only — {len(findings)} not yet demonstrated dynamically",
-                "level": "", "tone": worst_sev or "medium"}
-    if never_ran:
-        return {"label": "Inconclusive — the target never executed (see execution gaps)",
-                "level": "", "tone": "medium"}
-    return {"label": "No defects demonstrated", "level": "", "tone": "info"}
+    """The target's verdict -- the model's own (`model.target_verdict`), so HTML, PDF and SARIF
+    can never disagree about a level. Recomputed only for a report dict built before the model
+    carried it. Only a VERIFIED PoC sets the level: an unverified one used to headline "Exploited
+    (L3)" here while the summary's verified-only `poc_levels` said otherwise."""
+    return t.get("verdict") or _model.target_verdict(t)
 
 
 def esc(s: Any) -> str:
     return _html.escape("" if s is None else str(s))
+
+
+def _num(v: Any) -> float:
+    """A sort key for a count that might be missing or non-numeric."""
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) else 0
+
+
+def _n(v: Any) -> str:
+    """A count with thousands separators, tolerant of None/str -- `f"{v:,}"` on a missing field
+    raised and took the whole report down with it."""
+    if isinstance(v, bool) or v is None:
+        return "?" if v is None else str(v)
+    if isinstance(v, int):
+        return f"{v:,}"
+    if isinstance(v, float):
+        return f"{v:,.0f}" if v.is_integer() else f"{v:,.1f}"
+    return str(v)
+
+
+def _g(v: Any) -> str:
+    """A float in `:g` form, tolerant of None/str."""
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return f"{v:g}"
+    return "0" if v is None else str(v)
 
 
 def _badge(text: str, color: str) -> str:
@@ -208,6 +216,18 @@ def to_html(report: dict[str, Any]) -> str:
     else:
         headline = "No defects were demonstrated on the targets in scope."
         htone = "info"
+    # Qualify a level-less headline with WHY nothing escalated. "No defects demonstrated" and
+    # "static findings only" both read as a property of the binary; when no dynamic engine could
+    # execute the target they are a property of the run, and the reader must be told first.
+    n_dark = sum(1 for _t, v in verdicts if v.get("nothing_executed"))
+    if not top_level and targets and n_dark:
+        headline += (f" No dynamic engine executed {n_dark} of {len(targets)} target(s), so "
+                     "nothing there could escalate past L0 — a tooling/setup outcome, not a clean "
+                     "result. See each target's engine health.")
+        if htone == "info":
+            htone = "medium"
+    elif not top_level and any(v.get("engine_health") == "degraded" for _t, v in verdicts):
+        headline += " Dynamic analysis was degraded on at least one target (an engine failed)."
     parts.append('<section class="card"><h2>Executive summary</h2>')
     parts.append(f'<p class="headline tone-{htone}">{esc(headline)}</p>')
     parts.append('<div class="stats">')
@@ -222,6 +242,12 @@ def to_html(report: dict[str, Any]) -> str:
         parts.append('<div class="chips">' + "".join(
             _badge(f"{k} · {v}", _SEV_COLOR.get(k, "#8b8d98")) for k, v in bysev.items())
             + '</div>')
+    cur = summ.get("curation") or {}
+    if cur:
+        # The operator's triage, stated beside the tool's counts (which it never changes).
+        parts.append('<div class="chips">' + "".join(
+            _badge(f'{_model.CURATION_LABEL.get(k, k)} · {v}', _CURATION_COLOR.get(k, "#8b8d98"))
+            for k, v in cur.items()) + '</div>')
     # Per-target verdict at a glance -- the reader sees which binary is the problem before scrolling.
     if len(targets) >= 1:
         parts.append('<table class="verdicts"><tbody>')
@@ -322,35 +348,37 @@ def _target_html(t: dict) -> str:
     # times, and the two reports read identically.
     base = ex.get("baseline")
     if base is not None:
-        why = esc(str(base.get("note") or base.get("isolation") or "no reason given"))
+        # NOT pre-escaped: `_kv` escapes every value, and escaping here too rendered a reason
+        # like "needs <config>" as the literal text "needs &lt;config&gt;".
+        why = str(base.get("note") or base.get("isolation") or "no reason given")
         rows.append(("Baseline execution",
                      "ran, exited normally" if base.get("ran") and not base.get("crashed")
                      else "ran, FAULTED" if base.get("ran")
                      else "DID NOT RUN — " + why))
     if ex.get("executions_attempted") is not None:
         rate = ex.get("executions_per_second")
-        rows.append(("Executions", f'{ex["executions_attempted"]:,}'
-                     + (f' ({rate:g}/s)' if rate else "")))
+        rows.append(("Executions", _n(ex["executions_attempted"])
+                     + (f' ({_g(rate)}/s)' if rate else "")))
         by = ex.get("executions_by_engine") or {}
         if by:
-            rows.append(("By engine", esc(", ".join(f"{k} {v:,}" for k, v in
-                                                    sorted(by.items(), key=lambda kv: -kv[1])))))
+            rows.append(("By engine", ", ".join(
+                f"{k} {_n(v)}" for k, v in sorted(by.items(), key=lambda kv: -_num(kv[1])))))
     ip = ex.get("in_process") or {}
     if ip.get("doors"):
         # WHICH DOORS. In-process fuzzing goes through one harness at a time, so naming the entry
         # points is the difference between "2,501 executions" meaning the parser and meaning one
         # string helper.
-        rows.append(("Entry points", esc("; ".join(
-            f"{d.get('entry')} ({d['execs']:,} execs"
+        rows.append(("Entry points", "; ".join(
+            f"{d.get('entry')} ({_n(d.get('execs'))} execs"
             + (f", {d['findings']} finding(s)" if d.get("findings") else "") + ")"
             if d.get("built") else f"{d.get('entry')} (not built)"
-            for d in ip["doors"][:8]))))
+            for d in ip["doors"][:8] if isinstance(d, dict))))
     bg = ex.get("budget") or {}
     if bg.get("total"):
-        rows.append(("Time budget", f'{bg.get("elapsed", 0):g}s of {bg["total"]:g}s used'))
+        rows.append(("Time budget", f'{_g(bg.get("elapsed"))}s of {_g(bg["total"])}s used'))
     _adv = bg.get("advice") or {}
     if _adv.get("note"):
-        rows.append(("Execution rate", esc(_adv["note"])))
+        rows.append(("Execution rate", _adv["note"]))
     # Errors the run absorbed on purpose. The card already separates "ran and found nothing" from
     # "never ran"; this is the third reading it could not express -- "ran, and steps inside it
     # failed quietly" -- and a reader weighing a null result needs it. Nothing absorbed is the
@@ -364,8 +392,8 @@ def _target_html(t: dict) -> str:
         if n:
             top = "; ".join(f'{r.get("count")}x {r.get("site")}' for r in (ab.get("top") or [])[:3])
             rows.append(("Absorbed errors",
-                         esc(f"{n} best-effort step(s) failed quietly at {sites} site(s)"
-                             + (f" — {top}" if top else ""))))
+                         f"{n} best-effort step(s) failed quietly at {sites} site(s)"
+                         + (f" — {top}" if top else "")))
         else:
             rows.append(("Absorbed errors", "none — no step failed quietly in this run"))
     p.append(_kv(rows))
@@ -400,28 +428,80 @@ def _target_html(t: dict) -> str:
             p.append(f'<li><span class="diag-stage">{esc(d.get("stage"))}</span> '
                      f'{esc(d.get("note"))}</li>')
         p.append('</ul></div>')
+    p.append(_engine_health_html(t))
     if rt.get("ceiling_why"):
         p.append(f'<p class="ceiling"><b>Analysis ceiling — {esc(rt.get("ceiling"))}.</b> '
                  f'{esc(rt["ceiling_why"])}</p>')
-    findings = t.get("findings", [])
+    findings = t.get("findings") or []
     if not findings:
         # "No reportable findings" is the sentence a reader takes as CLEAN, so it must not stand
-        # alone when part of the analysis never executed.
-        if ex.get("did_not_run_count") or ex.get("failed_stages") or skipped or never_ran:
+        # alone when part of the analysis never executed -- including when no dynamic ENGINE
+        # executed it (engine health `none`), which the gap test above did not cover.
+        gaps = ex.get("has_gaps")
+        if gaps is None:
+            gaps = _model.has_execution_gaps(t)
+        if gaps or v.get("nothing_executed"):
             p.append('<p class="muted">No reportable findings for this target — but see the '
-                     'execution gaps above: this is not a clean result.</p></section>')
+                     'execution gaps / engine health above: this is not a clean result.</p>'
+                     '</section>')
         else:
             p.append('<p class="muted">No reportable findings for this target.</p></section>')
         return "".join(p)
+    # Operator-dismissed false positives are DEMOTED, not dropped: listed after the rest under
+    # their own heading, with the tool's evidence intact, so a reader can audit the dismissal.
+    fp = [f for f in findings if (f.get("curation") or {}).get("status") == "false_positive"]
+    fp_ids = {id(f) for f in fp}
     for f in findings:
-        p.append(_finding_html(f))
+        if id(f) not in fp_ids:
+            p.append(_finding_html(f))
+    if fp:
+        p.append(f'<h3 class="fp-head">Dismissed by the operator as false positive ({len(fp)})'
+                 '</h3><p class="muted fp-note">Shown for audit. The tool\'s state, severity and '
+                 'level are unchanged; the dismissal is the operator\'s judgement, not the '
+                 'tool\'s.</p>')
+        for f in fp:
+            p.append(_finding_html(f))
     p.append('</section>')
     return "".join(p)
 
 
+def _engine_health_html(t: dict) -> str:
+    """The run's per-engine dynamic verdict (`analyze.fuzz.health`): which engines executed the
+    target, which failed / declined / gained nothing, and why. This is what makes a static-only
+    result readable as "the fuzzers could not run here" rather than as a clean binary."""
+    eh = t.get("engine_health") or _model.engine_health(t.get("execution") or {})
+    hv = eh.get("verdict") or "unrecorded"
+    p = [f'<div class="health"><b>Dynamic engine health — '
+         f'{_badge(hv, _HEALTH_COLOR.get(hv, "#8b8d98"))}</b>']
+    if eh.get("note"):
+        p.append(f'<p class="hnote">{esc(eh["note"])}</p>')
+    rows = []
+    for e in eh.get("engines") or []:
+        st = e.get("status") or "?"
+        cov = e.get("coverage")
+        rows.append(f'<tr><td class="mono">{esc(e.get("engine"))}</td>'
+                    f'<td>{_badge(st, _HEALTH_COLOR.get(st, "#8b8d98"))}</td>'
+                    f'<td class="num">{esc(_n(e.get("execs")) if e.get("execs") else "—")}</td>'
+                    f'<td class="mono">{esc(cov or "—")}</td>'
+                    f'<td>{esc(e.get("reason") or "")}</td></tr>')
+    if rows:
+        p.append('<table class="htab"><thead><tr><th>engine</th><th>status</th><th>execs</th>'
+                 '<th>coverage</th><th>why</th></tr></thead><tbody>' + "".join(rows)
+                 + '</tbody></table>')
+    dec = [d for d in ((t.get("execution") or {}).get("declined") or []) if isinstance(d, dict)]
+    if dec:
+        mark = {"ours": " [our defect — this run's null results are unproven]",
+                "unknown": " [unclassified]"}
+        p.append('<div class="hdec"><b>Declined stages</b><ul>' + "".join(
+            f'<li><span class="mono">{esc(d.get("stage"))}</span> {esc(d.get("reason"))}'
+            f'{esc(mark.get(d.get("kind"), ""))}</li>' for d in dec[:12]) + '</ul></div>')
+    p.append('</div>')
+    return "".join(p)
+
+
 def _finding_html(f: dict) -> str:
-    sev = f.get("severity", "info")
-    state = f.get("state", "candidate")
+    sev = f.get("severity") or "info"
+    state = f.get("state") or "candidate"
     # Severity rides on the article as a class so the stylesheet can colour a left border -- a
     # reader scans the report by severity at a glance instead of reading every badge.
     p = [f'<article class="finding sev-{esc(sev)}">']
@@ -435,14 +515,28 @@ def _finding_html(f: dict) -> str:
         p.append(_badge(f'{lvl}{"" if lvl_ver else " (unverified)"}',
                         _LEVEL_COLOR.get(lvl, "#8b8d98")))
     p.append(_badge(state, _STATE_COLOR.get(state, "#8b8d98")))
+    cur = f.get("curation") or {}
+    if cur.get("status"):
+        p.append(_badge(cur.get("label") or _model.CURATION_LABEL.get(cur["status"], cur["status"]),
+                        _CURATION_COLOR.get(cur["status"], "#8b8d98")))
     v = f.get("verification")
     if v and v.get("runs"):
         ok = v.get("crashed") == v.get("runs")
         p.append(_badge(f'{"verified" if ok else "flaky"} {v.get("crashed")}/{v.get("runs")}',
                         "#3fb950" if ok else "#d29922"))
     p.append('</div>')
-    if lvl:
+    if lvl and lvl_ver:
         p.append(f'<div class="fimpact">Impact: {esc(_LEVEL_GLOSS.get(lvl, ""))}</div>')
+    elif lvl:
+        # An unverified PoC demonstrates nothing; printing the rung's gloss ("working exploit --
+        # the attacker's end goal was realised") next to it overstated the result.
+        p.append(f'<div class="fimpact">Impact: not demonstrated — a PoC was built at {esc(lvl)} '
+                 'but its reproducer did not verify, so that level is not claimed.</div>')
+    if cur.get("note") or cur.get("status"):
+        p.append(f'<div class="fcur"><b>Operator triage'
+                 f'{" — " + esc(cur.get("label") or cur.get("status")) if cur.get("status") else ""}'
+                 f'</b>{" · " + esc(cur.get("updated_at")) if cur.get("updated_at") else ""}'
+                 f'{"<br>" + esc(cur.get("note")) if cur.get("note") else ""}</div>')
     cwe = f.get("cwe")
     p.append(_kv([
         ("CWE", f'{cwe} — {f.get("cwe_name")}' if cwe else None),
@@ -477,7 +571,7 @@ def _finding_html(f: dict) -> str:
             if pc.get("bundle_b64"):
                 fn = f'poc-{(pc.get("bundle_sha") or lvl)[:12]}.tar.gz'
                 dl = (f' <a class="dl" download="{esc(fn)}" '
-                      f'href="data:application/gzip;base64,{pc["bundle_b64"]}">download bundle</a>')
+                      f'href="data:application/gzip;base64,{esc(pc["bundle_b64"])}">download bundle</a>')
             elif pc.get("bundle_same_as"):
                 # the same PoC backs several findings; the bundle is embedded once above
                 dl = (f' <span class="muted mono">same bundle as above '
@@ -604,6 +698,18 @@ ul.ev li{margin:2px 0}
 a.dl{color:var(--accent);text-decoration:none;font-size:12px;border:1px solid var(--accent);
   padding:1px 8px;border-radius:6px}
 a.dl:hover{background:color-mix(in srgb,var(--accent) 14%,transparent)}
+.health{margin:10px 0 0;padding:8px 10px;border-left:3px solid var(--accent);
+  background:var(--surface-2);font-size:12.5px}
+.health .hnote{margin:4px 0 6px;line-height:1.45}
+.htab{width:100%;border-collapse:collapse;font-size:12px;margin-top:4px}
+.htab th{text-align:left;color:var(--faint);font-weight:600;font-size:11px;padding:3px 6px}
+.htab td{padding:4px 6px;border-top:1px solid var(--border);vertical-align:top;word-break:break-word}
+.htab td.num{text-align:right;white-space:nowrap}
+.hdec ul{margin:2px 0 0;padding-left:16px}
+.fcur{margin:6px 0 2px;padding:6px 10px;border-left:3px solid #d29922;font-size:12.5px;
+  background:color-mix(in srgb,#d29922 7%,transparent);word-break:break-word}
+.fp-head{font-size:13px;margin:22px 0 2px;color:var(--muted)}
+.fp-note{font-size:12px;margin:0 0 4px}
 .rpt-foot{margin-top:28px;padding-top:16px;border-top:1px solid var(--border);
   text-align:center;font-size:11px}
 @media print{

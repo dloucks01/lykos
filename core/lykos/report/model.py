@@ -182,6 +182,196 @@ _SUBSTRATE_LABELS = {
 }
 
 
+#: Operator curation statuses (written by `api.curation`), in report order. The OPERATOR's
+#: judgement, kept strictly beside the tool's evidence: it never changes a finding's state, severity
+#: or L-level. A false positive is DEMOTED (listed separately), never dropped.
+CURATION_STATUSES = ("true_positive", "needs_review", "false_positive")
+CURATION_LABEL = {"false_positive": "False positive (operator)",
+                  "true_positive": "True positive (operator)",
+                  "needs_review": "Needs review (operator)"}
+
+#: Engine-health verdicts (`analyze.fuzz.health.summarize`), worst first, plus `unrecorded` for a
+#: target the autopilot never produced a health record for. Used to roll targets up to one case verdict.
+_HEALTH_ORDER = ("none", "degraded", "unrecorded", "idle", "ok")
+#: Per-engine statuses that mean the engine could not do its job (a FIX-THIS signal).
+_ENGINE_BAD = ("failed", "error")
+_ENGINE_WEAK = ("noprogress", "starved")
+
+
+def _ts_iso(v) -> Optional[str]:
+    """An epoch int, or an already-ISO string, as ISO-8601 (curation stores epoch seconds)."""
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return _iso(int(v))
+    return v if isinstance(v, str) and v else None
+
+
+def _norm_curation(c) -> Optional[dict]:
+    """A curation entry in the report's shape, or None. Tolerant of partial/foreign input: an
+    unknown status is kept verbatim (never silently mapped to a known one) but carries no label."""
+    if not isinstance(c, dict):
+        return None
+    status = c.get("status") or None
+    note = (c.get("note") or "").strip() if isinstance(c.get("note"), str) else ""
+    if status is None and not note:
+        return None
+    return {"status": status, "label": CURATION_LABEL.get(status) if status else None,
+            "note": note, "updated_at": _ts_iso(c.get("updated_at") or c.get("at"))}
+
+
+def _load_curation(store, case_id: str) -> dict:
+    """{finding_id: curation} for the case, from the API's event-sourced curation store.
+
+    Reuses `api.curation.current_for_case` so "latest event wins, a cleared verdict is gone" has
+    one definition. If that module is unavailable the same fold is done here over the
+    `finding.curation` events, so a report never silently drops the operator's triage."""
+    try:
+        from ..api import curation as _cur
+        return dict(_cur.current_for_case(store.conn, case_id) or {})
+    except Exception:                                    # noqa: BLE001 -- fall back to the raw fold
+        observe.absorbed(_log, "folding curation events directly")
+    out: dict = {}
+    try:
+        from ..db.dao import EventDAO
+        for p in EventDAO(store.conn).payloads_of_type("finding.curation", case_id=case_id):
+            fid = p.get("finding_id")
+            if not fid:
+                continue
+            if not p.get("status") and not (p.get("note") or "").strip():
+                out.pop(fid, None)
+            else:
+                out[fid] = {"status": p.get("status"), "note": p.get("note") or "",
+                            "updated_at": p.get("at")}
+    except Exception:                                    # noqa: BLE001 -- the report must render
+        observe.absorbed(_log, "reporting without curation")
+    return out
+
+
+def best_verified_level(f: dict) -> str:
+    """The highest L-level a VERIFIED PoC of this finding reached, '' if none.
+
+    The one definition every renderer uses for a finding's demonstrated rung. An unverified PoC
+    (built, but its reproducer did not re-fire) does not demonstrate anything, so it never sets
+    the level a verdict or headline claims -- the summary's `poc_levels` already counted only
+    verified PoCs while the HTML verdict counted any, so the two disagreed about the same case."""
+    best = ""
+    for p in f.get("pocs") or []:
+        lvl = p.get("level") or ""
+        if p.get("verified") and lvl and lvl > best:
+            best = lvl
+    return best
+
+
+def best_unverified_level(f: dict) -> str:
+    """The highest L-level any PoC was BUILT at, verified or not ('' if none)."""
+    best = ""
+    for p in f.get("pocs") or []:
+        lvl = p.get("level") or ""
+        if lvl and lvl > best:
+            best = lvl
+    return best
+
+
+def engine_health(execution: dict) -> dict:
+    """The run's dynamic-engine health for one target, normalised for every renderer.
+
+    Read from the scorecard's `fuzz_health` (`analyze.fuzz.health.summarize`, the same verdict the
+    CLI and web GUI show). A target with no record is `unrecorded` -- NOT `ok`: absent evidence that
+    anything executed must never read as a clean dynamic pass."""
+    fh = (execution or {}).get("fuzz_health")
+    if not isinstance(fh, dict) or not fh:
+        return {"verdict": "unrecorded", "recorded": False, "engines": [],
+                "note": ("No engine-health record for this target: the autopilot never "
+                         "finished a pass over it, so this report cannot claim that any dynamic "
+                         "engine executed it."),
+                "failed": [], "weak": [], "declined": [], "no_gain": [], "ran": []}
+    engines = [e for e in (fh.get("engines") or []) if isinstance(e, dict)]
+
+    def _names(statuses):
+        return [e.get("engine") for e in engines if e.get("status") in statuses]
+    return {"verdict": fh.get("verdict") or "unrecorded", "recorded": True,
+            "note": fh.get("note") or "", "engines": engines,
+            "failed": _names(_ENGINE_BAD), "weak": _names(_ENGINE_WEAK),
+            "declined": _names(("declined",)), "no_gain": _names(("no_gain",)),
+            "ran": [e.get("engine") for e in engines
+                    if e.get("status") == "ok" and (e.get("execs") or 0) > 0]}
+
+
+def target_verdict(t: dict) -> dict:
+    """A one-line verdict for a target: the strongest DEMONSTRATED outcome, framed so a static-only
+    or never-executed result can never read as a clean binary. Shared by HTML, PDF and SARIF.
+
+    Only a verified PoC sets the level. With no level, the dynamic-engine health decides how the
+    absence reads: "no defects demonstrated" is printed only when an engine really executed the
+    target; otherwise the verdict says why nothing could escalate past L0."""
+    findings = t.get("findings") or []
+    ex = t.get("execution") or {}
+    eh = t.get("engine_health") or engine_health(ex)
+    sev_order = {"critical": 5, "high": 4, "medium": 3, "low": 2, "info": 1}
+    best_lvl, built_lvl, worst_sev = "", "", None
+    for f in findings:
+        lvl = best_verified_level(f)
+        if lvl > best_lvl:
+            best_lvl = lvl
+        ulvl = best_unverified_level(f)
+        if ulvl > built_lvl:
+            built_lvl = ulvl
+        s = f.get("severity")
+        if s and (worst_sev is None or sev_order.get(s, 0) > sev_order.get(worst_sev, 0)):
+            worst_sev = s
+    base = ex.get("baseline")
+    never_ran = base is not None and not base.get("ran")
+    hv = eh.get("verdict")
+    nothing_executed = never_ran or hv == "none" or (
+        hv == "unrecorded" and not ex.get("executions_recorded")
+        and not ex.get("executions_attempted"))
+    out = {"level": best_lvl, "built_level": built_lvl if built_lvl > best_lvl else "",
+           "engine_health": hv, "nothing_executed": bool(nothing_executed)}
+    if best_lvl == "L3":
+        out.update(label="Exploited — working exploit demonstrated (L3)", tone="critical")
+    elif best_lvl == "L2":
+        out.update(label="Exploitation primitive established (L2)", tone="high")
+    elif best_lvl == "L1":
+        out.update(label="Reproduced crash — verified reproducer (L1)", tone="high")
+    elif findings:
+        lab = f"Static findings only — {len(findings)} not yet demonstrated dynamically"
+        if nothing_executed:
+            lab += ("; no dynamic engine executed the target, so nothing could escalate past L0 "
+                    "(a tooling outcome, not evidence the findings are false)")
+        elif hv == "degraded":
+            lab += "; dynamic analysis was degraded (see engine health)"
+        out.update(label=lab, tone=worst_sev or "medium")
+    elif never_ran:
+        out.update(label="Inconclusive — the target never executed (see execution gaps)",
+                   tone="medium")
+    elif nothing_executed:
+        out.update(label=("Inconclusive — no dynamic engine executed the target; static review "
+                          "only, not a clean result"), tone="medium")
+    elif hv == "degraded":
+        out.update(label=("No defects demonstrated — but dynamic analysis was degraded (an "
+                          "engine failed; see engine health)"), tone="medium")
+    elif hv == "idle":
+        out.update(label=("No defects demonstrated — fuzzing executed the target but reached "
+                          "nothing beyond its seeds"), tone="low")
+    else:
+        out.update(label="No defects demonstrated", tone="info")
+    if out["built_level"]:
+        out["label"] += (f" (a PoC was built at {out['built_level']} but did not verify, so "
+                         f"that level is not claimed)")
+    return out
+
+
+def has_execution_gaps(t: dict) -> bool:
+    """True when part of the analysis never executed or failed -- the condition under which "no
+    findings" must NOT be read as clean. One definition, so HTML and PDF cannot disagree."""
+    ex = t.get("execution") or {}
+    base = ex.get("baseline")
+    eh = t.get("engine_health") or engine_health(ex)
+    return bool(ex.get("did_not_run_count") or ex.get("failed_stages")
+                or ex.get("stages_skipped_for_budget")
+                or (base is not None and not base.get("ran"))
+                or eh.get("verdict") in ("none", "degraded") or eh.get("failed"))
+
+
 def build_report(
     store,
     case_id: str,
@@ -191,6 +381,7 @@ def build_report(
     states: Optional[list[str]] = None,
     finding_ids: Optional[list[str]] = None,
     embed_pocs: bool = False,
+    curation: Optional[dict] = None,
 ) -> dict[str, Any]:
     """Build the report model for one case.
 
@@ -199,13 +390,26 @@ def build_report(
       * min_state     -- drop findings below this confidence state
       * states        -- keep only findings whose state is in this explicit set
       * finding_ids   -- keep only these findings (report-builder selection)
+    An UNKNOWN severity/state raises ValueError: it used to rank as the lowest value, so a typo
+    like `min_state=confirmd` silently widened the report to every candidate.
     `embed_pocs` base64-embeds each PoC bundle into the model so an HTML/JSON report
     is fully self-contained (bounded by _MAX_EMBED_BUNDLE per bundle).
+    `curation` is an optional {finding_id: {status, note, updated_at}} map of operator verdicts;
+    when None it is read from the case's curation store. Curation never filters a finding out.
     """
+    if min_severity and min_severity not in SEVERITIES:
+        raise ValueError(f"unknown severity {min_severity!r} (one of {SEVERITIES})")
+    if min_state and min_state not in FINDING_STATES:
+        raise ValueError(f"unknown finding state {min_state!r} (one of {FINDING_STATES})")
+    bad_states = [s for s in (states or []) if s not in FINDING_STATES]
+    if bad_states:
+        raise ValueError(f"unknown finding state(s) {bad_states} (one of {FINDING_STATES})")
     conn = store.conn
     case = store.cases.get(case_id)
     if not case:
         raise KeyError(f"no case {case_id!r}")
+    cur_map = curation if curation is not None else _load_curation(store, case_id)
+    cur_counts: dict[str, int] = {}
 
     tdao = TargetDAO(conn)
     fdao = FindingDAO(conn)
@@ -335,6 +539,9 @@ def build_report(
                     break
 
             _ev_prose, _ev_struct = _split_evidence(f.evidence or [])
+            _cur = _norm_curation((cur_map or {}).get(f.id))
+            if _cur and _cur.get("status"):
+                cur_counts[_cur["status"]] = cur_counts.get(_cur["status"], 0) + 1
             findings_out.append({
                 "id": f.id, "cwe": f.cwe, "cwe_name": catalog.name(f.cwe) if f.cwe else None,
                 "cwe_desc": catalog.describe(f.cwe) if f.cwe else None,
@@ -346,6 +553,10 @@ def build_report(
                 # of the blob and nothing has to re-parse a string.
                 "effects": _ev_struct.get("effects") or [],
                 "pocs": f_pocs, "crashes": f_crashes, "verification": fv,
+                # The highest rung a VERIFIED PoC reached -- the level every renderer claims.
+                "level": best_verified_level({"pocs": f_pocs}) or None,
+                # The operator's verdict, beside (never instead of) the tool's evidence.
+                "curation": _cur,
                 "created_at": _iso(f.created_at), "updated_at": _iso(f.updated_at),
             })
             tot_findings += 1
@@ -356,7 +567,7 @@ def build_report(
                     poc_levels[p["level"]] = poc_levels.get(p["level"], 0) + 1
 
         if findings_out or finding_ids is None:
-            targets_out.append({
+            tout = {
                 "id": t.id, "filename": t.filename, "sha256": t.sha256, "md5": t.md5,
                 "sha1": t.sha1, "size": t.size, "file_type": t.file_type, "arch": t.arch,
                 "bits": t.bits, "endianness": t.endianness, "linking": t.linking,
@@ -365,11 +576,22 @@ def build_report(
                 "entropy": t.entropy, "ingested_at": _iso(t.ingested_at),
                 "fuzz_coverage": _best_coverage(store, _target_runs),
                 "execution": execution,
+                # WHY each dynamic engine did or did not contribute -- the run's own verdict, so
+                # a static-only result is never presented as a clean binary.
+                "engine_health": engine_health(execution),
                 "exploited_build": _exploited_build(store, case_id, t.id),
                 "findings": findings_out,
-            })
+            }
+            tout["execution"]["has_gaps"] = has_execution_gaps(tout)
+            tout["verdict"] = target_verdict(tout)
+            targets_out.append(tout)
 
     engines = _engines(rdao, case_id)
+    # Case-level rollups the executive summary leads with: the WORST engine-health verdict across
+    # targets, and the strongest verified level.
+    _hv = [t["engine_health"]["verdict"] for t in targets_out]
+    _health = next((v for v in _HEALTH_ORDER if v in _hv), None) if _hv else None
+    _levels = [t["verdict"]["level"] for t in targets_out if t["verdict"]["level"]]
 
     return {
         "schema": "lykos.report/1",
@@ -394,6 +616,18 @@ def build_report(
             "confirmed": by_state.get("confirmed", 0) + by_state.get("poc-backed", 0),
             "poc_backed": by_state.get("poc-backed", 0),
             "poc_levels": poc_levels,
+            # The strongest VERIFIED rung across the case ('' when nothing was demonstrated).
+            "highest_level": max(_levels) if _levels else "",
+            "engine_health": {
+                "verdict": _health,
+                "targets_nothing_executed": sum(
+                    1 for t in targets_out if t["verdict"]["nothing_executed"]),
+                "targets_with_failed_engines": sum(
+                    1 for t in targets_out if t["engine_health"]["failed"]),
+            },
+            # Operator triage counts. `findings` above stays the TOOL's count: a false positive
+            # is demoted in presentation, never subtracted from what the tool reported.
+            "curation": {s: cur_counts[s] for s in CURATION_STATUSES if cur_counts.get(s)},
         },
         "targets": targets_out,
     }
@@ -502,7 +736,32 @@ def _scorecard(store, case_id: str, target_id: str) -> dict:
         # is a FLOOR rather than a total. A reader weighing "0 executions" has to know which they
         # are looking at: that is precisely how a wrong zero gets believed.
         "settled": best.get("settled", True),
+        # The per-engine dynamic health verdict (R1, `analyze.fuzz.health.summarize`). The card
+        # has carried it since R1 and the CLI and GUI both print it -- this whitelist dropped it,
+        # so the deliverable was the one surface that could not say "no fuzzer could execute this
+        # target" next to a static-only result.
+        "fuzz_health": best.get("fuzz_health") or {},
+        # Which capabilities did their job / declined / errored / were never scheduled, and WHY
+        # each decline happened -- classified "target" (its nature) vs "ours" (our defect), the
+        # same split the CLI prints as [OUR DEFECT].
+        "capability": best.get("capability") or {},
+        "declined": _classified_declines(best.get("declined") or {}),
     }
+
+
+def _classified_declines(declined: dict) -> list:
+    """[{stage, reason, kind}] with kind "target" | "ours" | "unknown" (`classify_decline`)."""
+    if not isinstance(declined, dict):
+        return []
+    try:
+        from ..analyze.capabilities import classify_decline
+    except Exception:                                    # noqa: BLE001 -- still report the reasons
+        observe.absorbed(_log, "declines left unclassified")
+
+        def classify_decline(_why):                      # noqa: E306 -- local fallback
+            return "unknown"
+    return [{"stage": s, "reason": str(why or ""), "kind": classify_decline(str(why or ""))}
+            for s, why in sorted(declined.items())]
 
 
 def _crash_dict(d) -> dict:

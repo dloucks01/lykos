@@ -511,12 +511,17 @@ class EndpointsMixin:
         try:
             if not s.cases.get(cid):
                 return self._json({"error": "no case"}, 404)
-            report = build_report(
-                s, cid,
-                min_severity=qs.get("min_severity", [None])[0],
-                min_state=qs.get("min_state", [DEFAULT_MIN_STATE])[0],
-                states=states, finding_ids=finding_ids, embed_pocs=embed,
-            )
+            try:
+                report = build_report(
+                    s, cid,
+                    min_severity=qs.get("min_severity", [None])[0],
+                    min_state=qs.get("min_state", [DEFAULT_MIN_STATE])[0],
+                    states=states, finding_ids=finding_ids, embed_pocs=embed,
+                )
+            except ValueError as e:
+                # An unknown min_state / min_severity / state is the caller's typo; refusing it
+                # beats the old behaviour (ranked 0 -> silently widened to every candidate).
+                return self._json({"error": str(e)}, 400)
         finally:
             s.close()
         name = (report["case"].get("name") or "case").replace(" ", "_")[:40]

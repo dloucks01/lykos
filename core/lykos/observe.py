@@ -58,6 +58,8 @@ def configure(level: str | int | None = None, *, stream=None, force: bool = Fals
         return
     if level is None:
         level = os.environ.get(LEVEL_VAR, "warning")
+    if isinstance(level, str) and level.strip().isdigit():
+        level = int(level.strip())                       # LYKOS_LOG=10, as documented
     if isinstance(level, str):
         level = logging.getLevelName(level.strip().upper())
         if not isinstance(level, int):                   # getLevelName returns a str on a miss
